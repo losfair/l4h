@@ -24,16 +24,17 @@ at that address was copied past the end of RAM.  It also rounds the start
 up to a page: multiboot2 memory regions need not be page aligned, and a
 module block starting mid-page lost its first page to no Untyped.
 
-A module whose end is not above its start is ignored: the 32-bit
-difference passed the loader checks, and the 64-bit size wrapped.
+A module whose end is below its start is ignored: the parsers reject
+empty modules by their 32-bit difference, which for an inverted module
+zero-extends to a positive value, and its 64-bit size wrapped.
 ---
  include/arch/x86/arch/kernel/boot.h           |   3 +-
  include/arch/x86/arch/kernel/boot_sys.h       |   1 +
  .../x86/sel4/arch/bootinfo_types.h            |  19 +++
  libsel4/include/sel4/bootinfo_types.h         |   1 +
  src/arch/x86/kernel/boot.c                    |  17 ++-
- src/arch/x86/kernel/boot_sys.c                | 124 +++++++++++++++++-
- 6 files changed, 161 insertions(+), 4 deletions(-)
+ src/arch/x86/kernel/boot_sys.c                | 126 +++++++++++++++++-
+ 6 files changed, 163 insertions(+), 4 deletions(-)
 
 diff --git a/include/arch/x86/arch/kernel/boot.h b/include/arch/x86/arch/kernel/boot.h
 index a4f7fa057..e88efb4ee 100644
@@ -143,7 +144,7 @@ index 93b320964..8f8216b1e 100644
      /* set up sched control for each core */
      init_sched_control(root_cnode_cap, CONFIG_MAX_NUM_NODES);
 diff --git a/src/arch/x86/kernel/boot_sys.c b/src/arch/x86/kernel/boot_sys.c
-index 039330de9..344b5aa61 100644
+index 039330de9..a35c1006d 100644
 --- a/src/arch/x86/kernel/boot_sys.c
 +++ b/src/arch/x86/kernel/boot_sys.c
 @@ -64,8 +64,19 @@ BOOT_CODE static paddr_t find_load_paddr(paddr_t min_paddr, word_t image_size)
@@ -167,7 +168,7 @@ index 039330de9..344b5aa61 100644
          word_t region_size = end - start;
  
          if (region_size >= image_size) {
-@@ -76,6 +87,104 @@ BOOT_CODE static paddr_t find_load_paddr(paddr_t min_paddr, word_t image_size)
+@@ -76,6 +87,106 @@ BOOT_CODE static paddr_t find_load_paddr(paddr_t min_paddr, word_t image_size)
      return 0;
  }
  
@@ -175,10 +176,12 @@ index 039330de9..344b5aa61 100644
 +BOOT_CODE static void add_extra_module(paddr_t start, paddr_t end, char const *name)
 +{
 +    seL4_X86_BootModules_t *mods = &boot_state.extra_mods;
-+    /* The boot loader's (32-bit) addresses: with end > start, the sizes and
-+     * their sum cannot wrap. */
-+    if (end <= start) {
-+        printf("Empty or inverted extra boot module: ignoring '%s'\n", name ? name : "");
++    /* The parsers reject empty modules, but not inverted ones: their 32-bit
++     * difference looks positive, and the 64-bit size would wrap.  With the
++     * boot loader's 32-bit addresses in order, the sizes and their sum
++     * cannot wrap. */
++    if (end < start) {
++        printf("Extra boot module ends before it starts: ignoring '%s'\n", name ? name : "");
 +        return;
 +    }
 +    if (mods->count == SEL4_X86_MAX_BOOT_MODULES) {
@@ -272,7 +275,7 @@ index 039330de9..344b5aa61 100644
  BOOT_CODE static paddr_t load_boot_module(word_t boot_module_start, paddr_t load_paddr)
  {
      v_region_t v_reg;
-@@ -180,7 +289,8 @@ static BOOT_CODE bool_t try_boot_sys_node(cpu_id_t cpu_id)
+@@ -180,7 +291,8 @@ static BOOT_CODE bool_t try_boot_sys_node(cpu_id_t cpu_id)
              &boot_state.acpi_rsdp,
              &boot_state.vbe_info,
              &boot_state.mb_mmap_info,
@@ -282,7 +285,7 @@ index 039330de9..344b5aa61 100644
          )) {
          return false;
      }
-@@ -460,6 +570,10 @@ static BOOT_CODE bool_t try_boot_sys(void)
+@@ -460,6 +572,10 @@ static BOOT_CODE bool_t try_boot_sys(void)
          return false;
      }
  
@@ -293,7 +296,7 @@ index 039330de9..344b5aa61 100644
      /* calculate final location of userland images */
      ui_p_regs.start = boot_state.ki_p_reg.end;
      ui_p_regs.end = ui_p_regs.start + load_paddr - mods_end_paddr;
-@@ -549,6 +663,9 @@ static BOOT_CODE bool_t try_boot_sys_mbi1(
+@@ -549,6 +665,9 @@ static BOOT_CODE bool_t try_boot_sys_mbi1(
          if (boot_state.mods_end_paddr < modules[i].end) {
              boot_state.mods_end_paddr = modules[i].end;
          }
@@ -303,7 +306,7 @@ index 039330de9..344b5aa61 100644
      }
  
      /* initialize the memory. We track two kinds of memory regions. Physical memory
-@@ -660,6 +777,9 @@ static BOOT_CODE bool_t try_boot_sys_mbi2(
+@@ -660,6 +779,9 @@ static BOOT_CODE bool_t try_boot_sys_mbi2(
              if (boot_state.mods_end_paddr < module->end) {
                  boot_state.mods_end_paddr = module->end;
              }

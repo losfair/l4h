@@ -370,8 +370,8 @@ We need no IOMMU, since no device is passed into a guest.
   module as the root task and ignores the rest, and their memory is not
   safe: the root task's image is moved over wherever the loader put them,
   and what survives becomes ordinary Untypeds, cleared on retype. The
-  kernel now copies each later module (up to 8; it ignores more, and empty
-  or inverted ones, with a warning) to page-aligned memory above the root task's loaded image and
+  kernel now copies each later module (up to 8; it ignores more, and
+  ones that end before they start, with a warning) to page-aligned memory above the root task's loaded image and
   below 4 GiB, or stops if there is not enough, leaves that memory out of
   the RAM it
   manages, so it reaches the root task as device Untypeds that retype
@@ -1724,8 +1724,14 @@ Rules that keep the port cheap:
     62.5 MHz counter and Apple M4 HVF's 24 MHz counter.
   - Patch 0018 passes ID_AA64ISAR0/1/2_EL1 and ID_AA64PFR0/1_EL1 to the
     root task as an extra bootinfo chunk, for the guests' HWCAPs (§5).
-    They are the boot core's: on CPUs with cores of differing features,
-    the guest's conservative HWCAP allowlist is what keeps them safe.
+    They are the boot core's alone, and the guest advertises optional
+    instructions from them (CRC32, AES, SHA, atomics, DotProd, LRCPC and
+    others): on a CPU whose cores differ in these, a guest process may use
+    an instruction that faults on another core it runs on. The HWCAP
+    allowlist only leaves out state that seL4 does not save. l4h therefore
+    requires cores with the same features; others need the fields
+    intersected across the cores guests run on, or guests kept off the
+    cores that lack a feature.
 - **Boot.** rust-sel4's kernel loader only entered EL2 kernels.
   `third_party/patches/rust-sel4/0001` adds the EL1 path: it drops from EL2
   with the EL1 translation regime set up and no traps. Both EL1 paths set
