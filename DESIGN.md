@@ -200,11 +200,11 @@ E3 adds a deadline timer to each TCB:
   (TSC on x86, generic timer counter on aarch64).
 - At the deadline the kernel signals the badge on the TCB's bound
   notification, if any, and disarms the timer. It never signals before
-  the deadline: the timer precision that the MCS scheduler allows budgets
-  and releases is not applied to these timers, and the hardware is
-  programmed for the deadline itself. (Signalling up to 1 µs early let a
-  guest wake, see its clock still short of the deadline, and wait again
-  with no timer armed.) In APIC countdown mode the count rounds up for
+  the deadline, and the hardware is programmed for the deadline itself,
+  not one timer precision (1 µs on x86) earlier as the MCS scheduler does
+  for budget and release events, whose checks are exact. (Signalling up
+  to that precision early let a guest wake, see its clock still short of
+  the deadline, and wait again with no timer armed.) In APIC countdown mode the count rounds up for
   the same reason.
 - TCBs with armed timers sit in a per-core red-black tree ordered by
   deadline, whose first node is cached. The kernel programs the hardware

@@ -9,11 +9,12 @@ kept in a per-core red-black tree ordered by deadline, and its first node
 is taken into account when programming the MCS kernel's one-shot timer, so
 no additional hardware timer is needed.
 
-A timer is never signalled before its deadline: the timer precision that
-the scheduler subtracts when it programs the hardware, and allows when it
-releases budgets, is not applied to deadline timers.  (Signalling up to a
+A timer is never signalled before its deadline, and the hardware is
+programmed for the deadline itself, not one timer precision earlier as
+for budget and release events (whose checks are exact: an interrupt that
+comes too early for them is raised again at once).  Signalling a
 precision early let a user that checks the time on wakeup see no expired
-timer and wait again, with nothing armed.)  Because timers fire from the
+timer and wait again, with nothing armed.  Because timers fire from the
 scheduler, the thread signalled may have blocked in the same kernel entry
 and still hold the current scheduling context: sendSignal() already skips
 the refill check then, and no longer asserts that it cannot happen.
