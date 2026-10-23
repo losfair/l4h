@@ -11,16 +11,16 @@ this removes most timer writes, which trap when seL4 is virtualised
 (IA32_TSC_DEADLINE): ~16x faster trapped syscalls under nested KVM.
 ---
  include/model/statedata.h |  1 +
- src/kernel/thread.c       | 13 ++++++++++++-
+ src/kernel/thread.c       | 10 ++++++++++
  src/model/statedata.c     |  2 ++
  src/object/interrupt.c    |  1 +
- 4 files changed, 16 insertions(+), 1 deletion(-)
+ 4 files changed, 14 insertions(+)
 
 diff --git a/include/model/statedata.h b/include/model/statedata.h
-index 64f3de48f..135109370 100644
+index 7b53a8d4d..d3cd5fec7 100644
 --- a/include/model/statedata.h
 +++ b/include/model/statedata.h
-@@ -69,6 +69,7 @@ NODE_STATE_DECLARE(tcb_t *, ksTimerQueue);
+@@ -70,6 +70,7 @@ NODE_STATE_DECLARE(tcb_t *, ksTimerRoot);
  NODE_STATE_DECLARE(ticks_t, ksConsumed);
  NODE_STATE_DECLARE(ticks_t, ksCurTime);
  NODE_STATE_DECLARE(bool_t, ksReprogram);
@@ -29,15 +29,13 @@ index 64f3de48f..135109370 100644
  NODE_STATE_DECLARE(sched_context_t, *ksIdleSC);
  #endif
 diff --git a/src/kernel/thread.c b/src/kernel/thread.c
-index 4435fff24..32dfe6a4d 100644
+index f4f3af0ec..06489d57d 100644
 --- a/src/kernel/thread.c
 +++ b/src/kernel/thread.c
-@@ -631,7 +631,18 @@ void setNextInterrupt(void)
-        we are further subtracting getTimerPrecision(), so we may be setting a
-        deadline in the past. If that is the case, we assume the IRQ will be
-        raised immediately after we leave the kernel. */
--    setDeadline(next_interrupt - getTimerPrecision());
-+    ticks_t deadline = next_interrupt - getTimerPrecision();
+@@ -636,7 +636,17 @@ void setNextInterrupt(void)
+     if (timer_head != NULL) {
+         deadline = MIN(deadline, timer_head->tcbTimerDeadline);
+     }
 +
 +    /* Keep an earlier deadline that is still pending: the interrupt then
 +       comes early, which only causes a reprogram.  Most context switches
@@ -47,16 +45,16 @@ index 4435fff24..32dfe6a4d 100644
 +    if (armed > NODE_STATE(ksCurTime) && armed <= deadline) {
 +        return;
 +    }
-+    setDeadline(deadline);
+     setDeadline(deadline);
 +    NODE_STATE(ksArmedDeadline) = deadline;
  }
  
  void chargeBudget(ticks_t consumed, bool_t canTimeoutFault)
 diff --git a/src/model/statedata.c b/src/model/statedata.c
-index 568548723..5d89e4acc 100644
+index 8ec232be0..4a8a1c775 100644
 --- a/src/model/statedata.c
 +++ b/src/model/statedata.c
-@@ -53,6 +53,8 @@ UP_STATE_DEFINE(tcb_t *, ksCurFPUOwner);
+@@ -55,6 +55,8 @@ UP_STATE_DEFINE(tcb_t *, ksCurFPUOwner);
  UP_STATE_DEFINE(ticks_t, ksConsumed);
  /* whether we need to reprogram the timer before exiting the kernel */
  UP_STATE_DEFINE(bool_t, ksReprogram);

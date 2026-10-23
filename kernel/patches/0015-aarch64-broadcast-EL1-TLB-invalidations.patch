@@ -1,8 +1,7 @@
 From f9277addcc1450f8618e78f728fac4241e96d667 Mon Sep 17 00:00:00 2001
 From: l4h <l4h@localhost>
 Date: Sun, 18 Oct 2026 14:13:52 -0700
-Subject: [PATCH] aarch64: broadcast EL1 TLB invalidations in the SMP
- domain
+Subject: [PATCH] aarch64: broadcast EL1 TLB invalidations in the SMP domain
 
 Use the architectural inner-shareable TLBI operations, bracketed by DSB and ISB, for the global EL1 invalidation APIs. Page mapping, unmapping and ASID eviction otherwise rendezvous with every CPU through software IPIs, causing severe latency under emulation. Preserve local operations and the existing EL2 and AArch32 paths.
 
@@ -11,11 +10,17 @@ ASIDs. The ASID invalidation helpers took an 8-bit hw_asid_t, which
 truncated them: they now take asid_t. And the kernel now refuses to boot
 unless TCR_EL1.AS is set: with 8-bit ASIDs the hardware ignores the upper
 8 bits, so address spaces whose ASIDs differ only there would share TLB
-entries, and context switches flush nothing.
+entries, and context switches flush nothing.  Secondary cores
+check it too: they no longer ignore a failed init_cpu(), and stop rather
+than join the kernel half initialised.
+
+The broadcasts reach only TLB entries of the issuing core's VMID, which
+tags EL1&0 entries whenever EL2 is enabled, even without stage 2: a boot
+loader that drops to EL1 must give every core the same VMID (VTTBR_EL2 0).
 ---
  include/arch/arm/arch/machine/tlb.h | 30 +++++++++++++++++++++++++++--
- src/arch/arm/kernel/boot.c          | 12 ++++++++++++
- 2 files changed, 40 insertions(+), 2 deletions(-)
+ src/arch/arm/kernel/boot.c          | 19 ++++++++++++++++--
+ 2 files changed, 45 insertions(+), 4 deletions(-)
 
 diff --git a/include/arch/arm/arch/machine/tlb.h b/include/arch/arm/arch/machine/tlb.h
 index 7235672db..f0e45f5b5 100644
@@ -78,7 +83,7 @@ index 7235672db..f0e45f5b5 100644
  }
  
 diff --git a/src/arch/arm/kernel/boot.c b/src/arch/arm/kernel/boot.c
-index 139f620b3..fd5183037 100644
+index 139f620b3..70b0729f8 100644
 --- a/src/arch/arm/kernel/boot.c
 +++ b/src/arch/arm/kernel/boot.c
 @@ -186,6 +186,18 @@ BOOT_CODE static bool_t init_cpu(void)
@@ -100,6 +105,20 @@ index 139f620b3..fd5183037 100644
      }
  #endif
  
+@@ -271,8 +283,11 @@ BOOT_CODE static bool_t try_init_kernel_secondary_core(void)
+     /* need to first wait until some kernel init has been done */
+     while (!node_boot_lock);
+ 
+-    /* Perform cpu init */
+-    init_cpu();
++    /* Perform cpu init: a core that fails it (16-bit ASIDs unavailable,
++     * for instance) must not join the kernel. */
++    if (!init_cpu()) {
++        return false;
++    }
+ 
+     for (unsigned int i = 0; i < NUM_PPI; i++) {
+         maskInterrupt(true, CORE_IRQ_TO_IRQT(getCurrentCPUIndex(), i));
 -- 
 2.43.0
 

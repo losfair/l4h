@@ -1,8 +1,26 @@
+diff --git a/crates/sel4-kernel-loader/asm/aarch64/head.S b/crates/sel4-kernel-loader/asm/aarch64/head.S
+index 6fe8f6d1..357c4396 100644
+--- a/crates/sel4-kernel-loader/asm/aarch64/head.S
++++ b/crates/sel4-kernel-loader/asm/aarch64/head.S
+@@ -61,6 +61,13 @@ BEGIN_LOCAL_FUNC(init_core_state)
+ 
+     disable_mmu sctlr_el2, x8
+ 
++    /* EL2 without VHE (HCR_EL2.E2H clear), which the EL2 translation set
++     * up below and enter_kernel_el1 assume: firmware may leave E2H set.
++     * Nothing is trapped or routed to EL2 yet. */
++    mov     x8, #(1 << 31)
++    msr     hcr_el2, x8
++    isb
++
+     bl      invalidate_icache
+ 
+     /*
 diff --git a/crates/sel4-kernel-loader/asm/aarch64/tail.S b/crates/sel4-kernel-loader/asm/aarch64/tail.S
-index b56f077c..06327053 100644
+index b56f077c..1797f1ae 100644
 --- a/crates/sel4-kernel-loader/asm/aarch64/tail.S
 +++ b/crates/sel4-kernel-loader/asm/aarch64/tail.S
-@@ -46,3 +46,62 @@ BEGIN_FUNC(switch_translation_tables_el2)
+@@ -46,3 +46,93 @@ BEGIN_FUNC(switch_translation_tables_el2)
      ret
  
  END_FUNC(switch_translation_tables_el2)
@@ -52,6 +70,37 @@ index b56f077c..06327053 100644
 +    mov     x8, #0x33ff
 +    msr     cptr_el2, x8
 +    msr     hstr_el2, xzr
++    /* VMID 0 on every core: while EL2 is enabled, EL1&0 TLB entries are
++     * tagged with VTTBR_EL2.VMID even without stage 2, and the kernel's
++     * broadcast TLB invalidations reach only the issuing core's VMID.
++     * VTTBR_EL2 resets to an UNKNOWN value. */
++    msr     vttbr_el2, xzr
++    /* No debug or PMU traps (MDCR_EL2 resets to UNKNOWN values), and every
++     * PMU counter for EL1: HPMN = PMCR_EL0.N, if there is a PMUv3. */
++    mov     x8, xzr
++    mrs     x9, id_aa64dfr0_el1
++    ubfx    x9, x9, #8, #4
++    cbz     x9, 6f
++    cmp     x9, #0xf
++    b.eq    6f
++    mrs     x8, pmcr_el0
++    ubfx    x8, x8, #11, #5
++6:
++    msr     mdcr_el2, x8
++    /* With a GICv3 CPU interface, let EL1 use its system registers
++     * (ICC_SRE_EL2.SRE and Enable), and leave the virtual interface off. */
++    mrs     x9, id_aa64pfr0_el1
++    ubfx    x9, x9, #24, #4
++    cbz     x9, 7f
++    mrs     x9, S3_4_C12_C9_5
++    orr     x9, x9, #0x1
++    orr     x9, x9, #0x8
++    msr     S3_4_C12_C9_5, x9
++    isb
++    mrs     x9, S3_4_C12_C9_5
++    tbz     x9, #0, 7f
++    msr     S3_4_C12_C11_0, xzr
++7:
 +    /* SCTLR_EL1: RES1 bits, MMU, data and instruction caches. */
 +    ldr     x8, =0x30d01805
 +    msr     sctlr_el1, x8
@@ -66,7 +115,7 @@ index b56f077c..06327053 100644
 +    eret
 +END_FUNC(enter_kernel_el1)
 diff --git a/crates/sel4-kernel-loader/src/arch/arm/arch/aarch64/mod.rs b/crates/sel4-kernel-loader/src/arch/arm/arch/aarch64/mod.rs
-index dd11fca6..4d3904bb 100644
+index dd11fca6..67e1bb2a 100644
 --- a/crates/sel4-kernel-loader/src/arch/arm/arch/aarch64/mod.rs
 +++ b/crates/sel4-kernel-loader/src/arch/arm/arch/aarch64/mod.rs
 @@ -18,6 +18,17 @@ pub(crate) mod exception_handler;
@@ -87,13 +136,19 @@ index dd11fca6..4d3904bb 100644
  }
  
  #[unsafe(no_mangle)]
-@@ -63,6 +74,22 @@ impl Arch for ArchImpl {
+@@ -63,6 +74,28 @@ impl Arch for ArchImpl {
              set_tpidr(core_id);
          }
  
 +        // A kernel built for EL1: drop from EL2 into the EL1 translation
 +        // regime (no hardware virtualization is used).
 +        if !sel4_config::sel4_cfg_bool!(ARM_HYPERVISOR_SUPPORT) {
++            // enter_kernel_el1 writes EL1 registers from EL2: with
++            // HCR_EL2.E2H set (RES1 on CPUs without FEAT_E2H0) they would
++            // be redirected to EL2's own.
++            let hcr: usize;
++            unsafe { asm!("mrs {}, hcr_el2", out(reg) hcr) };
++            assert!(hcr & (1 << 34) == 0, "HCR_EL2.E2H cannot be cleared: VHE-only CPUs are not supported");
 +            unsafe { clean_and_invalideate_dcache() };
 +            unsafe { enter_kernel_el1(
 +                payload_info.user_image.ui_p_reg_start.to_usize(),

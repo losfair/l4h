@@ -95,7 +95,7 @@ index ec8880760..dc17ee69f 100644
      if (w == SysDebugPutChar) {
          kernel_putchar(getRegister(NODE_STATE(ksCurThread), capRegister));
 diff --git a/src/arch/arm/c_traps.c b/src/arch/arm/c_traps.c
-index 8104d73df..ba14e9169 100644
+index 8104d73df..0bea0047b 100644
 --- a/src/arch/arm/c_traps.c
 +++ b/src/arch/arm/c_traps.c
 @@ -101,7 +101,8 @@ void VISIBLE NORETURN c_handle_interrupt(void)
@@ -108,38 +108,38 @@ index 8104d73df..ba14e9169 100644
  #ifdef TRACK_KERNEL_ENTRIES
          ksKernelEntry.path = Entry_UnknownSyscall;
          /* ksKernelEntry.word word is already set to syscall */
-@@ -142,6 +143,9 @@ void VISIBLE c_handle_fastpath_call(word_t cptr, word_t msgInfo)
-     NODE_LOCK_SYS;
- 
-     c_entry_hook();
+@@ -146,6 +147,9 @@ void VISIBLE c_handle_fastpath_call(word_t cptr, word_t msgInfo)
+     benchmark_debug_syscall_start(cptr, msgInfo, SysCall);
+     ksKernelEntry.is_fastpath = 1;
+ #endif /* DEBUG */
 +    if (unlikely(threadTrapsSyscalls(NODE_STATE(ksCurThread)))) {
 +        slowpath(SysCall);
 +    }
- #ifdef TRACK_KERNEL_ENTRIES
+ 
+     fastpath_call(cptr, msgInfo);
+     UNREACHABLE();
+@@ -163,6 +167,9 @@ void VISIBLE c_handle_fastpath_signal(word_t cptr, word_t msgInfo)
      benchmark_debug_syscall_start(cptr, msgInfo, SysCall);
      ksKernelEntry.is_fastpath = 1;
-@@ -159,6 +163,9 @@ void VISIBLE c_handle_fastpath_signal(word_t cptr, word_t msgInfo)
-     NODE_LOCK_SYS;
- 
-     c_entry_hook();
+ #endif /* DEBUG */
 +    if (unlikely(threadTrapsSyscalls(NODE_STATE(ksCurThread)))) {
 +        slowpath(SysSend);
 +    }
- #ifdef TRACK_KERNEL_ENTRIES
-     benchmark_debug_syscall_start(cptr, msgInfo, SysCall);
+     fastpath_signal(cptr, msgInfo);
+     UNREACHABLE();
+ }
+@@ -183,6 +190,9 @@ void VISIBLE c_handle_fastpath_reply_recv(word_t cptr, word_t msgInfo)
+     benchmark_debug_syscall_start(cptr, msgInfo, SysReplyRecv);
      ksKernelEntry.is_fastpath = 1;
-@@ -179,6 +186,9 @@ void VISIBLE c_handle_fastpath_reply_recv(word_t cptr, word_t msgInfo)
-     NODE_LOCK_SYS;
- 
-     c_entry_hook();
+ #endif /* DEBUG */
 +    if (unlikely(threadTrapsSyscalls(NODE_STATE(ksCurThread)))) {
 +        slowpath(SysReplyRecv);
 +    }
- #ifdef TRACK_KERNEL_ENTRIES
-     benchmark_debug_syscall_start(cptr, msgInfo, SysReplyRecv);
-     ksKernelEntry.is_fastpath = 1;
+ 
+ #ifdef CONFIG_KERNEL_MCS
+     fastpath_reply_recv(cptr, msgInfo, reply);
 diff --git a/src/arch/riscv/c_traps.c b/src/arch/riscv/c_traps.c
-index bae151662..e6609fdf9 100644
+index bae151662..224e62374 100644
 --- a/src/arch/riscv/c_traps.c
 +++ b/src/arch/riscv/c_traps.c
 @@ -141,7 +141,8 @@ void VISIBLE NORETURN c_handle_exception(void)
@@ -152,26 +152,26 @@ index bae151662..e6609fdf9 100644
  #ifdef TRACK_KERNEL_ENTRIES
          ksKernelEntry.path = Entry_UnknownSyscall;
  #endif /* TRACK_KERNEL_ENTRIES */
-@@ -171,6 +172,9 @@ void VISIBLE c_handle_fastpath_reply_recv(word_t cptr, word_t msgInfo)
-     NODE_LOCK_SYS;
- 
-     c_entry_hook();
+@@ -175,6 +176,9 @@ void VISIBLE c_handle_fastpath_reply_recv(word_t cptr, word_t msgInfo)
+     benchmark_debug_syscall_start(cptr, msgInfo, SysReplyRecv);
+     ksKernelEntry.is_fastpath = 1;
+ #endif /* DEBUG */
 +    if (unlikely(threadTrapsSyscalls(NODE_STATE(ksCurThread)))) {
 +        slowpath(SysReplyRecv);
 +    }
- #ifdef TRACK_KERNEL_ENTRIES
-     benchmark_debug_syscall_start(cptr, msgInfo, SysReplyRecv);
+ #ifdef CONFIG_KERNEL_MCS
+     fastpath_reply_recv(cptr, msgInfo, reply);
+ #else
+@@ -193,6 +197,9 @@ void VISIBLE c_handle_fastpath_call(word_t cptr, word_t msgInfo)
+     benchmark_debug_syscall_start(cptr, msgInfo, SysCall);
      ksKernelEntry.is_fastpath = 1;
-@@ -189,6 +193,9 @@ void VISIBLE c_handle_fastpath_call(word_t cptr, word_t msgInfo)
-     NODE_LOCK_SYS;
- 
-     c_entry_hook();
+ #endif /* DEBUG */
 +    if (unlikely(threadTrapsSyscalls(NODE_STATE(ksCurThread)))) {
 +        slowpath(SysCall);
 +    }
- #ifdef TRACK_KERNEL_ENTRIES
-     benchmark_debug_syscall_start(cptr, msgInfo, SysCall);
-     ksKernelEntry.is_fastpath = 1;
+ 
+     fastpath_call(cptr, msgInfo);
+ 
 diff --git a/src/arch/x86/c_traps.c b/src/arch/x86/c_traps.c
 index 99ffc2a61..d69edc1e5 100644
 --- a/src/arch/x86/c_traps.c

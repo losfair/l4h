@@ -1,8 +1,7 @@
 From 54935e92195556be320cbb227baffa85892cdf88 Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Sun, 18 Oct 2026 06:49:04 -0700
-Subject: [PATCH] x86, mcs: measure the TSC and APIC timer rates once,
- robustly
+Subject: [PATCH] x86, mcs: measure the TSC and APIC timer rates once, robustly
 
 Every core measured the TSC and APIC timer rates again in apic_init()
 and overwrote the shared x86KStscMhz and x86KSapicRatio, so the clock
@@ -27,20 +26,22 @@ timers fire up to twice as late (a 2.99 GHz TSC and a 1 GHz APIC timer
 gave a ratio of 2) and, below 1, was 0, the value that means TSC deadline
 mode. A delay longer than the 32-bit count holds now fires early and is
 programmed again, instead of wrapping (to 0, which stops the timer, for
-exact multiples of 2^32).
+exact multiples of 2^32).  The conversion rounds up, so the count does not
+run out before the deadline: deadline timers fire only once it has
+passed, and an early interrupt would find nothing due.
 ---
- include/arch/x86/arch/machine/timer.h   | 15 +++++--
+ include/arch/x86/arch/machine/timer.h   | 17 ++++++--
  include/arch/x86/arch/model/statedata.h |  3 +-
  src/arch/x86/kernel/apic.c              | 57 ++++++++++++++++---------
  src/arch/x86/model/statedata.c          |  5 ++-
  src/plat/pc99/machine/hardware.c        | 41 ++++++++++++++++--
- 5 files changed, 92 insertions(+), 29 deletions(-)
+ 5 files changed, 94 insertions(+), 29 deletions(-)
 
 diff --git a/include/arch/x86/arch/machine/timer.h b/include/arch/x86/arch/machine/timer.h
-index 3367f7d33..8b5bc9cee 100644
+index 3367f7d33..7562294c8 100644
 --- a/include/arch/x86/arch/machine/timer.h
 +++ b/include/arch/x86/arch/machine/timer.h
-@@ -62,13 +62,19 @@ static inline PURE time_t ticksToUs(ticks_t ticks)
+@@ -62,13 +62,21 @@ static inline PURE time_t ticksToUs(ticks_t ticks)
  
  static inline void setDeadline(ticks_t deadline)
  {
@@ -57,13 +58,15 @@ index 3367f7d33..8b5bc9cee 100644
 +        deadline = MIN(deadline, x86KSapicMaxDelta);
 +        /* Convert deadline from TSC ticks to APIC timer ticks (with the
 +         * exact rates, not their truncated ratio, which made timers fire
-+         * up to twice as late). Must be at least 1 tick. */
++         * up to twice as late), rounding up: the count must not run out
++         * before the deadline, or the interrupt finds nothing due. Must be
++         * at least 1 tick. */
 +        apic_write_reg(APIC_TIMER_COUNT,
-+                       MAX(1, div64(deadline * x86KSapicKhz, x86KStscMhz * 1000u)));
++                       MAX(1, div64(deadline * x86KSapicKhz + x86KStscMhz * 1000u - 1, x86KStscMhz * 1000u)));
      }
  }
  
-@@ -78,7 +84,7 @@ static inline void setDeadline(ticks_t deadline)
+@@ -78,7 +86,7 @@ static inline void setDeadline(ticks_t deadline)
   * exits to the hypervisor when the kernel runs virtualised. */
  static inline bool_t timerArmed(void)
  {
@@ -72,17 +75,17 @@ index 3367f7d33..8b5bc9cee 100644
          return x86_rdmsr(IA32_TSC_DEADLINE_MSR) != 0;
      }
      return apic_read_reg(APIC_TIMER_CURRENT) != 0;
-@@ -92,4 +98,5 @@ static inline void resetTimer(void)
+@@ -92,4 +100,5 @@ static inline void resetTimer(void)
  
  
  BOOT_CODE uint32_t tsc_init(void);
 +BOOT_CODE uint32_t median_khz(uint32_t *s, int n);
  
 diff --git a/include/arch/x86/arch/model/statedata.h b/include/arch/x86/arch/model/statedata.h
-index 01656dbb3..2b4327eab 100644
+index 9c58af7ef..0783dcabf 100644
 --- a/include/arch/x86/arch/model/statedata.h
 +++ b/include/arch/x86/arch/model/statedata.h
-@@ -90,6 +90,7 @@ extern x86_irq_state_t x86KSIRQState[];
+@@ -91,6 +91,7 @@ extern x86_irq_state_t x86KSIRQState[];
  extern word_t x86KSAllocatedIOPorts[NUM_IO_PORTS / CONFIG_WORD_SIZE];
  #ifdef CONFIG_KERNEL_MCS
  extern uint32_t x86KStscMhz;
@@ -197,10 +200,10 @@ index 290ec5745..e1a377bf0 100644
  #else
      uint32_t timer_mode = 1;
 diff --git a/src/arch/x86/model/statedata.c b/src/arch/x86/model/statedata.c
-index 9af5acfb1..1ff31f008 100644
+index 217d0ca87..78b40fbb5 100644
 --- a/src/arch/x86/model/statedata.c
 +++ b/src/arch/x86/model/statedata.c
-@@ -71,5 +71,8 @@ x86_irq_state_t x86KSIRQState[maxIRQ + 1];
+@@ -74,5 +74,8 @@ x86_irq_state_t x86KSIRQState[maxIRQ + 1];
  word_t x86KSAllocatedIOPorts[NUM_IO_PORTS / CONFIG_WORD_SIZE];
  #ifdef CONFIG_KERNEL_MCS
  uint32_t x86KStscMhz;

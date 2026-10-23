@@ -194,7 +194,13 @@ int l4h_tcb_sched(unsigned long tcb, unsigned long authority, int prio, unsigned
 
 int l4h_tcb_set_flags(unsigned long tcb, unsigned long clear, unsigned long set)
 {
-	return seL4_TCB_SetFlags(tcb, clear, set).error;
+	seL4_TCB_SetFlags_t r = seL4_TCB_SetFlags(tcb, clear, set);
+
+	if (r.error)
+		return r.error;
+	/* The kernel ignores flags it does not support (trapSyscalls with the
+	 * x86 SKIM window). */
+	return (r.flags & set) == set ? 0 : seL4_IllegalOperation;
 }
 
 int l4h_tcb_resume(unsigned long tcb)

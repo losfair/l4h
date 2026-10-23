@@ -9,6 +9,15 @@ kept in a per-core red-black tree ordered by deadline, and its first node
 is taken into account when programming the MCS kernel's one-shot timer, so
 no additional hardware timer is needed.
 
+A timer is never signalled before its deadline: the timer precision that
+the scheduler subtracts when it programs the hardware, and allows when it
+releases budgets, is not applied to deadline timers.  (Signalling up to a
+precision early let a user that checks the time on wakeup see no expired
+timer and wait again, with nothing armed.)  Because timers fire from the
+scheduler, the thread signalled may have blocked in the same kernel entry
+and still hold the current scheduling context: sendSignal() already skips
+the refill check then, and no longer asserts that it cannot happen.
+
 User level chooses how many timers are armed: any TCB it can retype can
 hold one. Arming and disarming therefore take O(log n) time, and at most
 32 timers fire per kernel entry; due timers beyond those fire on the next
@@ -23,12 +32,13 @@ device such as cloud VMs without HPET.
  include/kernel/thread.h                   |   4 +
  include/model/statedata.h                 |   2 +
  include/object/structures.h               |  11 +
- libsel4/include/interfaces/object-api.xml |  21 ++
- src/kernel/thread.c                       | 286 ++++++++++++++++++++++
+ libsel4/include/interfaces/object-api.xml |  22 ++
+ src/kernel/thread.c                       | 293 +++++++++++++++++++++-
  src/model/statedata.c                     |   4 +
+ src/object/notification.c                 |  20 +-
  src/object/objecttype.c                   |   1 +
  src/object/tcb.c                          |  24 ++
- 8 files changed, 353 insertions(+)
+ 9 files changed, 368 insertions(+), 13 deletions(-)
 
 diff --git a/include/kernel/thread.h b/include/kernel/thread.h
 index 4a828f6bc..da4ce5bbc 100644
@@ -81,10 +91,10 @@ index 340f24e60..840fc9584 100644
      /* Timeslice remaining, 1 word */
      word_t tcbTimeSlice;
 diff --git a/libsel4/include/interfaces/object-api.xml b/libsel4/include/interfaces/object-api.xml
-index 1f433596e..705c27010 100644
+index 1f433596e..6a69d48cf 100644
 --- a/libsel4/include/interfaces/object-api.xml
 +++ b/libsel4/include/interfaces/object-api.xml
-@@ -916,6 +916,27 @@
+@@ -916,6 +916,28 @@
                  </description>
              </error>
          </method>
@@ -95,7 +105,8 @@ index 1f433596e..705c27010 100644
 +            </brief>
 +            <description>
 +                When the kernel's timer reaches <texttt text="deadline"/> the given badge is signalled
-+                to the notification bound to the target TCB (if any) and the timer is disarmed. The
++                to the notification bound to the target TCB (if any) and the timer is disarmed; it is
++                never signalled before the deadline. The
 +                deadline is absolute and expressed in the kernel timer's ticks, which on x86 is the
 +                TSC and on Arm the generic timer counter, so it can be computed from a user-level
 +                read of the same counter. Re-arming replaces any previous deadline; a deadline of
@@ -113,22 +124,29 @@ index 1f433596e..705c27010 100644
  
      <interface name="seL4_CNode" manual_name="CNode">
 diff --git a/src/kernel/thread.c b/src/kernel/thread.c
-index 581327f64..af8cb337c 100644
+index 581327f64..f4f3af0ec 100644
 --- a/src/kernel/thread.c
 +++ b/src/kernel/thread.c
-@@ -619,6 +619,11 @@ void setNextInterrupt(void)
-         next_interrupt = MIN(rlq_head_refill.rTime, next_interrupt);
-     }
- 
+@@ -626,7 +626,17 @@ void setNextInterrupt(void)
+        we are further subtracting getTimerPrecision(), so we may be setting a
+        deadline in the past. If that is the case, we assume the IRQ will be
+        raised immediately after we leave the kernel. */
+-    setDeadline(next_interrupt - getTimerPrecision());
++    ticks_t deadline = next_interrupt - getTimerPrecision();
++
++    /* Deadline timers fire at their deadline, never before it (see
++       fireTimers()): the precision subtracted above is for budgets and
++       releases only. A timer that is already due sets a deadline in the
++       past, and the IRQ is raised at once. */
 +    tcb_t *timer_head = NODE_STATE(ksTimerQueue);
 +    if (timer_head != NULL) {
-+        next_interrupt = MIN(next_interrupt, MAX(timer_head->tcbTimerDeadline, NODE_STATE(ksCurTime)));
++        deadline = MIN(deadline, timer_head->tcbTimerDeadline);
 +    }
-+
-     /* We should never be attempting to schedule anything earlier than ksCurTime */
-     assert(next_interrupt >= NODE_STATE(ksCurTime));
++    setDeadline(deadline);
+ }
  
-@@ -743,8 +748,289 @@ static void tcbReleaseDequeue(void)
+ void chargeBudget(ticks_t consumed, bool_t canTimeoutFault)
+@@ -743,8 +753,289 @@ static void tcbReleaseDequeue(void)
      possibleSwitchTo(awakened);
  }
  
@@ -400,7 +418,7 @@ index 581327f64..af8cb337c 100644
 +    for (word_t i = 0; i < TIMER_FIRE_BATCH; i++) {
 +        tcb_t *tcb = NODE_STATE(ksTimerQueue);
 +        if (tcb == NULL ||
-+            tcb->tcbTimerDeadline > NODE_STATE(ksCurTime) + getTimerPrecision()) {
++            tcb->tcbTimerDeadline > NODE_STATE(ksCurTime)) {
 +            return;
 +        }
 +        word_t badge = tcb->tcbTimerBadge;
@@ -433,6 +451,44 @@ index 6b238fb90..8ec232be0 100644
  #endif
  
  /* Current thread TCB pointer */
+diff --git a/src/object/notification.c b/src/object/notification.c
+index cf3a6a3c0..f3f7f1172 100644
+--- a/src/object/notification.c
++++ b/src/object/notification.c
+@@ -76,12 +76,10 @@ void sendSignal(notification_t *ntfnPtr, word_t badge)
+                 })
+ #ifdef CONFIG_KERNEL_MCS
+                 if (sc_sporadic(tcb->tcbSchedContext)) {
+-                    /* We know that the tcb can't have the current SC
+-                     * as its own SC as this point as it should still be
+-                     * associated with the current thread, or no thread.
+-                     * This check is added here to reduce the cost of
+-                     * proving this to be true as a short-term stop-gap. */
+-                    assert(tcb->tcbSchedContext != NODE_STATE(ksCurSC));
++                    /* The tcb can have the current SC as its own SC when
++                     * a deadline timer signals it (fireTimers()) after it
++                     * blocked in this kernel entry: its refills are then
++                     * still those of the running SC. */
+                     if (tcb->tcbSchedContext != NODE_STATE(ksCurSC)) {
+                         refill_unblock_check(tcb->tcbSchedContext);
+                     }
+@@ -165,12 +163,10 @@ void sendSignal(notification_t *ntfnPtr, word_t badge)
+ 
+ #ifdef CONFIG_KERNEL_MCS
+         if (sc_sporadic(dest->tcbSchedContext)) {
+-            /* We know that the receiver can't have the current SC
+-             * as its own SC as this point as it should still be
+-             * associated with the current thread.
+-             * This check is added here to reduce the cost of
+-             * proving this to be true as a short-term stop-gap. */
+-            assert(dest->tcbSchedContext != NODE_STATE(ksCurSC));
++            /* The receiver can have the current SC as its own SC when a
++             * deadline timer signals it (fireTimers()) after it blocked in
++             * this kernel entry: its refills are then still those of the
++             * running SC. */
+             if (dest->tcbSchedContext != NODE_STATE(ksCurSC)) {
+                 refill_unblock_check(dest->tcbSchedContext);
+             }
 diff --git a/src/object/objecttype.c b/src/object/objecttype.c
 index e6c603623..82ea3041c 100644
 --- a/src/object/objecttype.c
@@ -446,10 +502,10 @@ index e6c603623..82ea3041c 100644
              if (sc) {
                  schedContext_unbindTCB(sc);
 diff --git a/src/object/tcb.c b/src/object/tcb.c
-index 3e8c44b28..3d94d5023 100644
+index 508a93a60..199b1f802 100644
 --- a/src/object/tcb.c
 +++ b/src/object/tcb.c
-@@ -933,6 +933,25 @@ static exception_t decodeFPUTransfer(cap_t cap, word_t length, word_t *buffer, b
+@@ -934,6 +934,25 @@ static exception_t decodeFPUTransfer(cap_t cap, word_t length, word_t *buffer, b
  }
  #endif /* CONFIG_HAVE_FPU */
  
@@ -475,7 +531,7 @@ index 3e8c44b28..3d94d5023 100644
  /* The following functions sit in the syscall error monad, but include the
   * exception cases for the preemptible bottom end, as they call the invoke
   * functions directly.  This is a significant deviation from the Haskell
-@@ -1029,6 +1048,11 @@ exception_t decodeTCBInvocation(word_t invLabel, word_t length, cap_t cap,
+@@ -1030,6 +1049,11 @@ exception_t decodeTCBInvocation(word_t invLabel, word_t length, cap_t cap,
      case TCBSetFlags:
          return decodeSetFlags(cap, length, call, buffer);
  

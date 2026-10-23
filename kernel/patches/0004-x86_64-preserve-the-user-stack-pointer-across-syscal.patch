@@ -13,14 +13,18 @@ Save the user RSP into the user context on 'syscall' entry (through a
 per-node scratch slot) and restore it on sysret, from both the slow path
 and the fastpath.  This makes the RSP of
 syscall-entered threads accurate in fault messages and ReadRegisters.
-Only supported without the SKIM window.
+Only supported without the SKIM window, whose sysret path still clears
+RSP: with it, seL4_TCB_SetFlags ignores seL4_TCBFlag_trapSyscalls (and so
+returns flags without it), rather than letting such threads return from
+their first syscall with RSP 0.
 ---
  .../arch/x86/arch/64/mode/fastpath/fastpath.h  |  5 +++++
  include/arch/x86/arch/64/mode/model/smp.h      |  7 ++++++-
+ libsel4/include/sel4/constants.h               |  4 ++++
  src/arch/x86/64/c_traps.c                      |  5 +++++
  src/arch/x86/64/model/statedata.c              |  5 +++++
  src/arch/x86/64/traps.S                        | 18 ++++++++++++++++++
- 5 files changed, 39 insertions(+), 1 deletion(-)
+ 6 files changed, 43 insertions(+), 1 deletion(-)
 
 diff --git a/include/arch/x86/arch/64/mode/fastpath/fastpath.h b/include/arch/x86/arch/64/mode/fastpath/fastpath.h
 index 8bb3c349f..ffabec752 100644
@@ -59,6 +63,22 @@ index 76d6421ac..61a420d87 100644
  compile_assert(nodeInfoIsCacheSized, (sizeof(nodeInfo_t) % L1_CACHE_LINE_SIZE) == 0)
  
  extern nodeInfo_t node_info[CONFIG_MAX_NUM_NODES] ALIGN(L1_CACHE_LINE_SIZE);
+diff --git a/libsel4/include/sel4/constants.h b/libsel4/include/sel4/constants.h
+index c8237b5df..e37ba8f23 100644
+--- a/libsel4/include/sel4/constants.h
++++ b/libsel4/include/sel4/constants.h
+@@ -91,7 +91,11 @@ typedef enum {
+ 
+     SEL4_FORCE_LONG_ENUM(seL4_TCBFlag),
+     seL4_TCBFlag_MASK = seL4_TCBFlag_NoFlag
++#if !(defined(CONFIG_ARCH_X86_64) && defined(CONFIG_KERNEL_SKIM_WINDOW))
++                        /* The SKIM window's sysret clears the user RSP,
++                         * which trapping threads must get back. */
+                         | seL4_TCBFlag_trapSyscalls
++#endif
+ #ifdef CONFIG_HAVE_FPU
+                         | seL4_TCBFlag_fpuDisabled
+ #endif
 diff --git a/src/arch/x86/64/c_traps.c b/src/arch/x86/64/c_traps.c
 index 9f359db32..46745e1ea 100644
 --- a/src/arch/x86/64/c_traps.c

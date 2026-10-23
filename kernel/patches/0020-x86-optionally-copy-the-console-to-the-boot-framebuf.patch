@@ -1,8 +1,7 @@
 From ba11df0d16c4d647f8e0a15d9636b2c3d129996c Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Tue, 20 Oct 2026 09:29:04 -0700
-Subject: [PATCH] x86: optionally copy the console to the boot
- framebuffer
+Subject: [PATCH] x86: optionally copy the console to the boot framebuffer
 
 The fb_console command-line option draws everything the kernel prints,
 its own messages and user debug output, on the lower half of the
@@ -13,15 +12,16 @@ Latitude.sh servers, whose BMC offers only a graphical console through
 its web proxy.
 
 Only a direct-RGB, 32 bpp framebuffer below 4 GiB whose pitch holds a
-row of pixels is used, and drawing is clipped to the console area, even
+row of pixels, and that overlaps no usable RAM (checked once the whole
+memory map has been read), is used, and drawing is clipped to the console area, even
 when cores that do not hold the kernel lock (panics) race on the cursor.
 ---
  include/arch/x86/arch/kernel/cmdline.h |   3 +
  include/plat/pc99/plat/machine/io.h    |   4 +
- src/arch/x86/kernel/boot_sys.c         |   7 +
+ src/arch/x86/kernel/boot_sys.c         |  15 +++
  src/arch/x86/kernel/cmdline.c          |   6 +
- src/plat/pc99/machine/io.c             | 171 +++++++++++++++++++++++++
- 5 files changed, 191 insertions(+)
+ src/plat/pc99/machine/io.c             | 180 +++++++++++++++++++++++++
+ 5 files changed, 208 insertions(+)
 
 diff --git a/include/arch/x86/arch/kernel/cmdline.h b/include/arch/x86/arch/kernel/cmdline.h
 index 47fbb2a0a..523d7d7ac 100644
@@ -38,7 +38,7 @@ index 47fbb2a0a..523d7d7ac 100644
  
  void cmdline_parse(const char *cmdline, cmdline_opt_t *cmdline_opt);
 diff --git a/include/plat/pc99/plat/machine/io.h b/include/plat/pc99/plat/machine/io.h
-index bc6e8cd09..efa674651 100644
+index bc6e8cd09..fce2d0be7 100644
 --- a/include/plat/pc99/plat/machine/io.h
 +++ b/include/plat/pc99/plat/machine/io.h
 @@ -25,5 +25,9 @@ uint32_t in32(uint16_t port);
@@ -46,13 +46,13 @@ index bc6e8cd09..efa674651 100644
  #if defined(CONFIG_DEBUG_BUILD) || defined(CONFIG_PRINTING)
  void serial_init(uint16_t port);
 +#ifdef CONFIG_PRINTING
-+void fbcon_init(uint64_t paddr, uint32_t pitch, uint32_t width, uint32_t height, uint8_t bpp,
-+                uint8_t type);
++bool_t fbcon_init(uint64_t paddr, uint32_t pitch, uint32_t width, uint32_t height, uint8_t bpp,
++                  uint8_t type, p_region_t const *ram, word_t ram_count);
 +#endif
  #endif
  
 diff --git a/src/arch/x86/kernel/boot_sys.c b/src/arch/x86/kernel/boot_sys.c
-index 35b5c894a..a0c2db23c 100644
+index 35b5c894a..039330de9 100644
 --- a/src/arch/x86/kernel/boot_sys.c
 +++ b/src/arch/x86/kernel/boot_sys.c
 @@ -8,6 +8,7 @@
@@ -63,19 +63,27 @@ index 35b5c894a..a0c2db23c 100644
  #include <arch/machine.h>
  #include <arch/kernel/apic.h>
  #include <arch/kernel/cmdline.h>
-@@ -686,6 +687,12 @@ static BOOT_CODE bool_t try_boot_sys_mbi2(
-             printf("Got framebuffer info in multiboot2. Current video mode is at physical address=%llx pitch=%u resolution=%ux%u@%u type=%u\n",
-                    fb->addr, fb->pitch, fb->width, fb->height, fb->bpp, fb->type);
-             boot_state.fb_info = *fb;
-+#ifdef CONFIG_PRINTING
-+            if (cmdline_opt.fb_console) {
-+                fbcon_init(fb->addr, fb->pitch, fb->width, fb->height, fb->bpp, fb->type);
-+                printf("Boot config: console copied to the framebuffer\n");
-+            }
-+#endif
-         }
- 
+@@ -691,6 +692,20 @@ static BOOT_CODE bool_t try_boot_sys_mbi2(
          tag = (multiboot2_tag_t const *)((word_t)tag + ROUND_UP(tag->size, 3));
+     }
+ 
++#ifdef CONFIG_PRINTING
++    /* After the memory map, which may come later: the framebuffer must not
++     * be memory that the kernel or user level is given. */
++    if (cmdline_opt.fb_console && boot_state.fb_info.addr != 0) {
++        multiboot2_fb_t const *fb = &boot_state.fb_info;
++        if (fbcon_init(fb->addr, fb->pitch, fb->width, fb->height, fb->bpp, fb->type,
++                       boot_state.mem_p_regs.list, boot_state.mem_p_regs.count)) {
++            printf("Boot config: console copied to the framebuffer\n");
++        } else {
++            printf("Boot config: framebuffer not usable as a console\n");
++        }
++    }
++#endif
++
+     printf("Detected %d boot module(s):\n", mod_count);
+ 
+     if (mod_count < 1) {
 diff --git a/src/arch/x86/kernel/cmdline.c b/src/arch/x86/kernel/cmdline.c
 index 3dc26c2ec..211cf84ea 100644
 --- a/src/arch/x86/kernel/cmdline.c
@@ -101,10 +109,10 @@ index 3dc26c2ec..211cf84ea 100644
      printf("Boot config: disable_iommu = %s\n", cmdline_opt->disable_iommu ? "true" : "false");
  }
 diff --git a/src/plat/pc99/machine/io.c b/src/plat/pc99/machine/io.c
-index 83a53bac5..8dae0c994 100644
+index 83a53bac5..ef618063b 100644
 --- a/src/plat/pc99/machine/io.c
 +++ b/src/plat/pc99/machine/io.c
-@@ -31,12 +31,183 @@ void serial_init(uint16_t port)
+@@ -31,12 +31,192 @@ void serial_init(uint16_t port)
  
  #ifdef CONFIG_PRINTING
  
@@ -219,15 +227,23 @@ index 83a53bac5..8dae0c994 100644
 +/* Multiboot2 framebuffer type: direct RGB colour */
 +#define FB_TYPE_RGB 1
 +
-+BOOT_CODE void fbcon_init(uint64_t paddr, uint32_t pitch, uint32_t width, uint32_t height, uint8_t bpp,
-+                          uint8_t type)
++BOOT_CODE bool_t fbcon_init(uint64_t paddr, uint32_t pitch, uint32_t width, uint32_t height, uint8_t bpp,
++                            uint8_t type, p_region_t const *ram, word_t ram_count)
 +{
 +    /* The boot page tables and the kernel window both map the low 4 GiB at
 +     * PPTR_BASE. */
 +    if (type != FB_TYPE_RGB || bpp != 32 || width < 640 || height < 400 ||
 +        pitch < (uint64_t)width * 4 || paddr >= 0x100000000ull ||
 +        (uint64_t)pitch * height > 0x100000000ull - paddr) {
-+        return;
++        return false;
++    }
++    /* Drawing into RAM would corrupt the kernel, the root task, or memory
++     * later given to user level. */
++    uint64_t end = paddr + (uint64_t)pitch * height;
++    for (word_t i = 0; i < ram_count; i++) {
++        if (paddr < ram[i].end && ram[i].start < end) {
++            return false;
++        }
 +    }
 +    fbcon.base = (uint32_t *)(PPTR_BASE + (word_t)paddr);
 +    fbcon.pitch = pitch;
@@ -236,6 +252,7 @@ index 83a53bac5..8dae0c994 100644
 +    fbcon.rows = height / 16 - fbcon.top;
 +    fbcon.row = 0;
 +    fbcon.col = 0;
++    return true;
 +}
 +
 +static void fbcon_glyph(word_t row, word_t col, unsigned char c)

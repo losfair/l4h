@@ -174,10 +174,12 @@ E2 adds `seL4_TCB_ReadFPU(tcb, frame_cap, offset)` and
 `seL4_TCB_WriteFPU(tcb, frame_cap, offset)`. They copy the arch FPU save area
 (`XSAVE` format on x86, `V0–V31+FPSR/FPCR` on arm64) to or from a frame the
 caller owns. The kernel validates the frame, offset and alignment, and on
-write sanitises the XSAVE header and MXCSR so that loading the image cannot
-fault in the kernel. A target that is running (the caller itself, or a
-thread on another core) gets its FPU reloaded, since it returns to user
-level without passing through the scheduler.
+write sanitises the XSAVE header, and masks MXCSR with the CPU's
+MXCSR_MASK (read with `fxsave` at boot), so that loading the image cannot
+fault in the kernel. A caller that targets itself gets its FPU reloaded,
+since it returns to user level without passing through the scheduler; a
+target running on another core is stalled off it first, as for every TCB
+invocation.
 
 Fallback if upstream objects: user-mode trampolines in the guest vDSO run
 `xsave`/`xrstor` on the thread's behalf. This needs no kernel change, but it
@@ -197,7 +199,13 @@ E3 adds a deadline timer to each TCB:
   deadline disarms it. The absolute deadline uses the kernel timer's ticks
   (TSC on x86, generic timer counter on aarch64).
 - At the deadline the kernel signals the badge on the TCB's bound
-  notification, if any, and disarms the timer.
+  notification, if any, and disarms the timer. It never signals before
+  the deadline: the timer precision that the MCS scheduler allows budgets
+  and releases is not applied to these timers, and the hardware is
+  programmed for the deadline itself. (Signalling up to 1 µs early let a
+  guest wake, see its clock still short of the deadline, and wait again
+  with no timer armed.) In APIC countdown mode the count rounds up for
+  the same reason.
 - TCBs with armed timers sit in a per-core red-black tree ordered by
   deadline, whose first node is cached. The kernel programs the hardware
   with the minimum of the next budget event and that first node.
@@ -208,6 +216,16 @@ E3 adds a deadline timer to each TCB:
   milliseconds per call.
 - A timer fires on the core it was last armed on. Migrated vCPUs re-arm on
   their new core.
+- Timers fire from the scheduler, so the thread a timer wakes may have
+  blocked in the same kernel entry and still hold the current scheduling
+  context. `sendSignal()` already skips the refill check then; its
+  debug assertion that this cannot happen is removed.
+- The kernel time of firing timers is charged to whatever runs on the core
+  then, as for any interrupt. A guest that arms many timers for one
+  deadline (each from its own memory, each a syscall it pays for) can
+  make a co-located vCPU absorb about N/32 back-to-back entries. Kept, as
+  each entry stays bounded; root could cap guests' TCB counts if this
+  matters.
 
 The guest clockevent invokes `seL4_TCB_SetTimer` on its vCPU's kTCB, so
 there is **no user-level timer server** and no IPC hop. No separate Timer
@@ -305,7 +323,9 @@ We need no IOMMU, since no device is passed into a guest.
   mitigation. The CPUs l4h targets, such as GCP N2 (Cascade Lake and Ice
   Lake), C3/N4/C4 (Sapphire Rapids and later) and recent AMD parts, are not
   affected by Meltdown. Neither the kernel nor `l4h-root` checks this at
-  boot (see the configuration above).
+  boot (see the configuration above). A kernel built with the SKIM window
+  ignores `seL4_TCBFlag_trapSyscalls`, and the guest then panics rather
+  than run Linux processes untrapped.
 - **0005, SMP IPI barrier.** `ipi_wait()` reset its arrival counter and
   released waiters with two unordered plain stores, and GCC emits them in
   the wrong order. A following remote call (TLB shootdown, remote TCB stall)
@@ -332,7 +352,9 @@ We need no IOMMU, since no device is passed into a guest.
   hypervisor that backs memory on demand, that backs memory nobody uses,
   including memory l4h reported free (§15.4). The reset now reads each
   page (or reset chunk) and clears it only if a word is non-zero; reading
-  unbacked memory maps the host's zero page.
+  unbacked memory maps the host's zero page. A reset's duration therefore
+  shows roughly how much of the memory was non-zero, not what it held:
+  a guest that resets a block another guest used learns only that.
 - **0020, framebuffer console (x86).** With the command-line option
   `fb_console`, everything the kernel prints (its own messages and host
   components' debug output) is also drawn on the lower half of the
@@ -341,13 +363,15 @@ We need no IOMMU, since no device is passed into a guest.
   doubled vertically, wrapping instead of scrolling so the framebuffer is
   never read. For machines whose serial port is out of reach but whose
   screen is not, such as Latitude.sh servers behind their BMC's web proxy
-  (§10.1); the `fb_console` setting adds it (§10).
+  (§10.1); the `fb_console` setting adds it (§10). The framebuffer is
+  checked once the whole memory map has been read, and refused if it
+  overlaps usable RAM.
 - **0021, extra boot modules (x86).** seL4 loads the first multiboot
   module as the root task and ignores the rest, and their memory is not
   safe: the root task's image is moved over wherever the loader put them,
   and what survives becomes ordinary Untypeds, cleared on retype. The
-  kernel now copies each later module (up to 8; it ignores more, with a
-  warning) to page-aligned memory above the root task's loaded image and
+  kernel now copies each later module (up to 8; it ignores more, and empty
+  or inverted ones, with a warning) to page-aligned memory above the root task's loaded image and
   below 4 GiB, or stops if there is not enough, leaves that memory out of
   the RAM it
   manages, so it reaches the root task as device Untypeds that retype
@@ -1691,16 +1715,26 @@ Rules that keep the port cheap:
   - Patch 0015 uses inner-shareable broadcast TLB maintenance at EL1, on
     full 16-bit ASIDs. The kernel refuses to boot unless the loader has
     set `TCR_EL1.AS` (16-bit ASIDs): with 8-bit ASIDs, address spaces whose
-    seL4 ASIDs differ only in the upper 8 bits share TLB entries.
+    seL4 ASIDs differ only in the upper 8 bits share TLB entries. Secondary
+    cores check it too, and stop if they fail it. The broadcasts reach only
+    the issuing core's VMID, which tags EL1&0 TLB entries whenever EL2 is
+    enabled: the loader gives every core VMID 0.
     Patch 0016 reads the architectural counter frequency at boot for MCS
     budget and consumed-time conversions; the same image handles TCG's
     62.5 MHz counter and Apple M4 HVF's 24 MHz counter.
   - Patch 0018 passes ID_AA64ISAR0/1/2_EL1 and ID_AA64PFR0/1_EL1 to the
     root task as an extra bootinfo chunk, for the guests' HWCAPs (§5).
+    They are the boot core's: on CPUs with cores of differing features,
+    the guest's conservative HWCAP allowlist is what keeps them safe.
 - **Boot.** rust-sel4's kernel loader only entered EL2 kernels.
   `third_party/patches/rust-sel4/0001` adds the EL1 path: it drops from EL2
   with the EL1 translation regime set up and no traps. Both EL1 paths set
   `TCR_EL1.AS` when `ID_AA64MMFR0_EL1.ASIDBits` reports 16-bit ASIDs.
+  At EL2 the loader clears `HCR_EL2.E2H` before setting up its own
+  translation (firmware may leave VHE on; CPUs where E2H is RES1 are
+  refused), and the drop to EL1 sets `VTTBR_EL2` (VMID 0), `MDCR_EL2`
+  (no debug or PMU traps, all counters to EL1) and, with a GICv3,
+  `ICC_SRE_EL2`, all of which reset to UNKNOWN values.
   `tools/build-loader-aarch64.sh` applies the patch and builds the loader.
   Patch 0002 also supports direct EL1 entry, initializes the EL1 translation
   regime and selects QEMU's HVC PSCI conduit when EL2 is unavailable.

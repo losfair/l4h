@@ -1,6 +1,8 @@
+diff --git a/crates/sel4-kernel-loader/asm/aarch64/head.S b/crates/sel4-kernel-loader/asm/aarch64/head.S
+index 357c4396..be277e40 100644
 --- a/crates/sel4-kernel-loader/asm/aarch64/head.S
 +++ b/crates/sel4-kernel-loader/asm/aarch64/head.S
-@@ -59,6 +59,10 @@
+@@ -59,6 +59,10 @@ BEGIN_LOCAL_FUNC(init_core_state)
  
      bl      clean_and_invalideate_dcache
  
@@ -10,11 +12,13 @@
 +
      disable_mmu sctlr_el2, x8
  
-     bl      invalidate_icache
-@@ -106,4 +110,50 @@
+     /* EL2 without VHE (HCR_EL2.E2H clear), which the EL2 translation set
+@@ -111,6 +115,52 @@ BEGIN_LOCAL_FUNC(init_core_state)
+     dsb     ish
+     isb
  
-     ldp     x29, x30, [sp], #16
-     ret
++    ldp     x29, x30, [sp], #16
++    ret
 +/* EL1 entry, including secondary CPUs started through PSCI at EL1. */
 +init_core_state_el1:
 +    mov     x8, #(3 << 20)
@@ -59,12 +63,14 @@
 +    ic      ialluis
 +    dsb     ish
 +    isb
-+    ldp     x29, x30, [sp], #16
-+    ret
+     ldp     x29, x30, [sp], #16
+     ret
  END_FUNC(init_core_state)
+diff --git a/crates/sel4-kernel-loader/asm/aarch64/tail.S b/crates/sel4-kernel-loader/asm/aarch64/tail.S
+index 1797f1ae..88cc281e 100644
 --- a/crates/sel4-kernel-loader/asm/aarch64/tail.S
 +++ b/crates/sel4-kernel-loader/asm/aarch64/tail.S
-@@ -55,6 +55,11 @@
+@@ -55,6 +55,11 @@ END_FUNC(switch_translation_tables_el2)
   * the data cache.
   */
  BEGIN_FUNC(enter_kernel_el1)
@@ -76,7 +82,7 @@
      ldr     x8, =MAIR(0x00, MT_DEVICE_nGnRnE) | \
                   MAIR(0x04, MT_DEVICE_nGnRE) | \
                   MAIR(0x0c, MT_DEVICE_GRE) | \
-@@ -82,6 +87,9 @@
+@@ -82,6 +87,9 @@ BEGIN_FUNC(enter_kernel_el1)
      msr     tcr_el1, x8
      msr     ttbr0_el1, x7
      msr     ttbr1_el1, x7
@@ -86,15 +92,15 @@
      /* EL1 is AArch64; no stage 2, no traps of timers, FP or system
       * registers. */
      mov     x8, #(1 << 31)
-@@ -92,6 +100,7 @@
-     mov     x8, #0x33ff
-     msr     cptr_el2, x8
-     msr     hstr_el2, xzr
+@@ -123,6 +131,7 @@ BEGIN_FUNC(enter_kernel_el1)
+     tbz     x9, #0, 7f
+     msr     S3_4_C12_C11_0, xzr
+ 7:
 +2:
      /* SCTLR_EL1: RES1 bits, MMU, data and instruction caches. */
      ldr     x8, =0x30d01805
      msr     sctlr_el1, x8
-@@ -99,6 +108,11 @@
+@@ -130,6 +139,11 @@ BEGIN_FUNC(enter_kernel_el1)
      tlbi    vmalle1is
      dsb     ish
      isb
@@ -106,52 +112,11 @@
      /* EL1h with interrupts masked. */
      mov     x8, #0x3c5
      msr     spsr_el2, x8
---- a/crates/sel4-kernel-loader/src/arch/arm/arch/aarch64/mod.rs
-+++ b/crates/sel4-kernel-loader/src/arch/arm/arch/aarch64/mod.rs
-@@ -68,7 +68,9 @@
-         };
- 
-         let current_el = get_current_el();
--        assert!(current_el == Some(CurrentEL::EL::Value::EL2));
-+        assert!(current_el == Some(CurrentEL::EL::Value::EL2)
-+            || (!sel4_config::sel4_cfg_bool!(ARM_HYPERVISOR_SUPPORT)
-+                && current_el == Some(CurrentEL::EL::Value::EL1)));
- 
-         unsafe {
-             set_tpidr(core_id);
-@@ -127,7 +129,7 @@
- 
- #[inline(never)]
- pub(crate) unsafe fn reset_cntvoff() {
--    unsafe {
--        asm!("msr cntvoff_el2, xzr");
-+    if get_current_el() == Some(CurrentEL::EL::Value::EL2) {
-+        unsafe { asm!("msr cntvoff_el2, xzr"); }
-     }
- }
---- a/crates/sel4-kernel-loader/src/arch/arm/arch/aarch64/exception_handler.rs
-+++ b/crates/sel4-kernel-loader/src/arch/arm/arch/aarch64/exception_handler.rs
-@@ -20,8 +20,15 @@
-     let mut far;
-     let mut tpidr_el1;
-     unsafe {
--        asm!("mrs {}, esr_el2", out(reg) esr);
--        asm!("mrs {}, far_el2", out(reg) far);
-+        let el: usize;
-+        asm!("mrs {}, CurrentEL", out(reg) el);
-+        if el == 4 {
-+            asm!("mrs {}, esr_el1", out(reg) esr);
-+            asm!("mrs {}, far_el1", out(reg) far);
-+        } else {
-+            asm!("mrs {}, esr_el2", out(reg) esr);
-+            asm!("mrs {}, far_el2", out(reg) far);
-+        }
-         asm!("mrs {}, tpidr_el1", out(reg) tpidr_el1);
-     }
-     let exception = Exception {
+diff --git a/crates/sel4-kernel-loader/src/arch/arm/arch/aarch64/drivers/psci.rs b/crates/sel4-kernel-loader/src/arch/arm/arch/aarch64/drivers/psci.rs
+index ff4ab44b..254abb8f 100644
 --- a/crates/sel4-kernel-loader/src/arch/arm/arch/aarch64/drivers/psci.rs
 +++ b/crates/sel4-kernel-loader/src/arch/arm/arch/aarch64/drivers/psci.rs
-@@ -8,12 +8,14 @@
+@@ -8,12 +8,14 @@ use core::arch::global_asm;
  
  pub(crate) fn start_secondary_core(core_id: usize, sp: usize) {
      let start = psci_secondary_entry as *const PsciSecondaryEntryFn as usize;
@@ -172,3 +137,65 @@
  }
  
  type PsciSecondaryEntryFn = extern "C" fn() -> !;
+diff --git a/crates/sel4-kernel-loader/src/arch/arm/arch/aarch64/exception_handler.rs b/crates/sel4-kernel-loader/src/arch/arm/arch/aarch64/exception_handler.rs
+index 75da18c9..c3c6800e 100644
+--- a/crates/sel4-kernel-loader/src/arch/arm/arch/aarch64/exception_handler.rs
++++ b/crates/sel4-kernel-loader/src/arch/arm/arch/aarch64/exception_handler.rs
+@@ -20,8 +20,15 @@ unsafe extern "C" fn exception_handler(vector_table_index: usize) {
+     let mut far;
+     let mut tpidr_el1;
+     unsafe {
+-        asm!("mrs {}, esr_el2", out(reg) esr);
+-        asm!("mrs {}, far_el2", out(reg) far);
++        let el: usize;
++        asm!("mrs {}, CurrentEL", out(reg) el);
++        if el == 4 {
++            asm!("mrs {}, esr_el1", out(reg) esr);
++            asm!("mrs {}, far_el1", out(reg) far);
++        } else {
++            asm!("mrs {}, esr_el2", out(reg) esr);
++            asm!("mrs {}, far_el2", out(reg) far);
++        }
+         asm!("mrs {}, tpidr_el1", out(reg) tpidr_el1);
+     }
+     let exception = Exception {
+diff --git a/crates/sel4-kernel-loader/src/arch/arm/arch/aarch64/mod.rs b/crates/sel4-kernel-loader/src/arch/arm/arch/aarch64/mod.rs
+index 67e1bb2a..27ab6d07 100644
+--- a/crates/sel4-kernel-loader/src/arch/arm/arch/aarch64/mod.rs
++++ b/crates/sel4-kernel-loader/src/arch/arm/arch/aarch64/mod.rs
+@@ -68,7 +68,9 @@ impl Arch for ArchImpl {
+         };
+ 
+         let current_el = get_current_el();
+-        assert!(current_el == Some(CurrentEL::EL::Value::EL2));
++        assert!(current_el == Some(CurrentEL::EL::Value::EL2)
++            || (!sel4_config::sel4_cfg_bool!(ARM_HYPERVISOR_SUPPORT)
++                && current_el == Some(CurrentEL::EL::Value::EL1)));
+ 
+         unsafe {
+             set_tpidr(core_id);
+@@ -80,9 +82,11 @@ impl Arch for ArchImpl {
+             // enter_kernel_el1 writes EL1 registers from EL2: with
+             // HCR_EL2.E2H set (RES1 on CPUs without FEAT_E2H0) they would
+             // be redirected to EL2's own.
+-            let hcr: usize;
+-            unsafe { asm!("mrs {}, hcr_el2", out(reg) hcr) };
+-            assert!(hcr & (1 << 34) == 0, "HCR_EL2.E2H cannot be cleared: VHE-only CPUs are not supported");
++            if current_el == Some(CurrentEL::EL::Value::EL2) {
++                let hcr: usize;
++                unsafe { asm!("mrs {}, hcr_el2", out(reg) hcr) };
++                assert!(hcr & (1 << 34) == 0, "HCR_EL2.E2H cannot be cleared: VHE-only CPUs are not supported");
++            }
+             unsafe { clean_and_invalideate_dcache() };
+             unsafe { enter_kernel_el1(
+                 payload_info.user_image.ui_p_reg_start.to_usize(),
+@@ -133,7 +137,7 @@ unsafe fn set_tpidr(tpidr: usize) {
+ 
+ #[inline(never)]
+ pub(crate) unsafe fn reset_cntvoff() {
+-    unsafe {
+-        asm!("msr cntvoff_el2, xzr");
++    if get_current_el() == Some(CurrentEL::EL::Value::EL2) {
++        unsafe { asm!("msr cntvoff_el2, xzr"); }
+     }
+ }

@@ -9,18 +9,34 @@ needed by user-level OS personalities (signal frames, ptrace, fork) that
 manage threads running foreign code.
 
 Any live copy of the state is flushed (possibly from a remote core) before
-the transfer, and loaded again afterwards if the thread is running (the
-caller itself, or a thread on another core): it returns to user level
-without passing through switchToThread(), which is where the FPU is
-loaded, and would otherwise fault on its next FPU instruction. Images
-written by user level are sanitised so that loading them cannot fault in
-the kernel.
+the transfer, and loaded again afterwards if the target is the caller
+itself: it returns to user level without passing through switchToThread(),
+which is where the FPU is loaded, and would otherwise fault on its next
+FPU instruction. (A target running on another core has been stalled off
+it, as for every TCB invocation.) Images written by user level are
+sanitised so that loading them cannot fault in the kernel; on x86, MXCSR
+is masked with the CPU's MXCSR_MASK, read with FXSAVE at boot.
 ---
+ include/arch/x86/arch/model/statedata.h   |   1 +
  libsel4/include/interfaces/object-api.xml |  56 ++++++++++++
  libsel4/include/sel4/constants.h          |  11 +++
- src/object/tcb.c                          | 100 ++++++++++++++++++++++
- 3 files changed, 167 insertions(+)
+ src/arch/x86/machine/fpu.c                |  10 +++
+ src/arch/x86/model/statedata.c            |   3 +
+ src/object/tcb.c                          | 101 ++++++++++++++++++++++
+ 6 files changed, 182 insertions(+)
 
+diff --git a/include/arch/x86/arch/model/statedata.h b/include/arch/x86/arch/model/statedata.h
+index 01656dbb3..9c58af7ef 100644
+--- a/include/arch/x86/arch/model/statedata.h
++++ b/include/arch/x86/arch/model/statedata.h
+@@ -69,6 +69,7 @@ extern x86_arch_global_state_t x86KSGlobalState[CONFIG_MAX_NUM_NODES] ALIGN(L1_C
+ extern asid_pool_t *x86KSASIDTable[];
+ extern uint32_t x86KScacheLineSizeBits;
+ extern user_fpu_state_t x86KSnullFpuState ALIGN(MIN_FPU_ALIGNMENT);
++extern uint32_t x86KSmxcsrMask;
+ 
+ #ifdef CONFIG_IOMMU
+ extern uint32_t x86KSnumDrhu;
 diff --git a/libsel4/include/interfaces/object-api.xml b/libsel4/include/interfaces/object-api.xml
 index 37885cbb0..1f433596e 100644
 --- a/libsel4/include/interfaces/object-api.xml
@@ -110,11 +126,46 @@ index c356a1395..c8237b5df 100644
  /* Flags to be used with seL4_TCB_Set_Flags */
  typedef enum {
      seL4_TCBFlag_NoFlag = 0x0,
+diff --git a/src/arch/x86/machine/fpu.c b/src/arch/x86/machine/fpu.c
+index 4b92d546c..cef881ed8 100644
+--- a/src/arch/x86/machine/fpu.c
++++ b/src/arch/x86/machine/fpu.c
+@@ -33,6 +33,16 @@ BOOT_CODE bool_t Arch_initFpu(void)
+     /* Initialize the fpu state */
+     finit();
+ 
++    /* FXSAVE stores the supported MXCSR bits (MXCSR_MASK) at byte 28 of its
++     * image; 0 means the default of every bit but DAZ. */
++    {
++        BOOT_BSS static uint8_t fxsave_image[512] ALIGN(16);
++        uint32_t mxcsr_mask;
++        asm volatile("fxsave %0" : "=m"(fxsave_image));
++        memcpy(&mxcsr_mask, fxsave_image + 28, sizeof(mxcsr_mask));
++        x86KSmxcsrMask = mxcsr_mask ? mxcsr_mask : 0xffbf;
++    }
++
+     if (config_set(CONFIG_XSAVE)) {
+         uint64_t xsave_features;
+         uint32_t xsave_instruction;
+diff --git a/src/arch/x86/model/statedata.c b/src/arch/x86/model/statedata.c
+index 9af5acfb1..217d0ca87 100644
+--- a/src/arch/x86/model/statedata.c
++++ b/src/arch/x86/model/statedata.c
+@@ -42,6 +42,9 @@ uint32_t x86KScacheLineSizeBits;
+ /* A valid initial FPU state, copied to every new thread. */
+ user_fpu_state_t x86KSnullFpuState ALIGN(MIN_FPU_ALIGNMENT);
+ 
++/* The MXCSR bits that the CPU supports: setting any other faults. */
++uint32_t x86KSmxcsrMask;
++
+ /* Number of IOMMUs (DMA Remapping Hardware Units) */
+ uint32_t x86KSnumDrhu;
+ 
 diff --git a/src/object/tcb.c b/src/object/tcb.c
-index 521e33bd6..3e8c44b28 100644
+index 521e33bd6..508a93a60 100644
 --- a/src/object/tcb.c
 +++ b/src/object/tcb.c
-@@ -841,6 +841,98 @@ static exception_t decodeSetFlags(cap_t cap, word_t length, bool_t call, word_t
+@@ -841,6 +841,99 @@ static exception_t decodeSetFlags(cap_t cap, word_t length, bool_t call, word_t
      return EXCEPTION_NONE;
  }
  
@@ -132,9 +183,9 @@ index 521e33bd6..3e8c44b28 100644
 +    uint8_t *raw = (uint8_t *)state;
 +    uint32_t mxcsr;
 +    memcpy(&mxcsr, raw + XSAVE_LEGACY_MXCSR_OFFSET, sizeof(mxcsr));
-+    /* Bits above 15 are reserved and fault on load. DAZ (bit 6) is
-+     * supported by every CPU that seL4 runs on. */
-+    mxcsr &= 0xffff;
++    /* Unsupported bits (all above 15, and DAZ on some CPUs) fault on
++     * load. */
++    mxcsr &= x86KSmxcsrMask;
 +    memcpy(raw + XSAVE_LEGACY_MXCSR_OFFSET, &mxcsr, sizeof(mxcsr));
 +#ifdef CONFIG_XSAVE
 +    uint64_t header[XSAVE_HEADER_SIZE / sizeof(uint64_t)];
@@ -199,12 +250,13 @@ index 521e33bd6..3e8c44b28 100644
 +        memcpy(&thread->tcbArch.tcbContext.fpuState, frame, sizeof(user_fpu_state_t));
 +        sanitiseFpuState(&thread->tcbArch.tcbContext.fpuState);
 +    }
-+    /* A thread that is running (the caller itself, or a thread on another
-+     * core) returns to user level without passing through switchToThread(),
-+     * which is the only place that loads the FPU: load it again, or its
-+     * next FPU instruction faults. */
-+    if (owned && thread == NODE_STATE_ON_CORE(ksCurThread, SMP_TERNARY(thread->tcbAffinity, 0))) {
-+        switchFpuOwner(thread, SMP_TERNARY(thread->tcbAffinity, 0));
++    /* The caller returns to user level without passing through
++     * switchToThread(), which is the only place that loads the FPU: load it
++     * again if the caller is the target, or its next FPU instruction faults.
++     * A target running on another core has already been stalled off it by
++     * remoteTCBStall() and reloads its FPU when it is switched to again. */
++    if (owned && thread == NODE_STATE(ksCurThread)) {
++        switchFpuOwner(thread, CURRENT_CPU_INDEX());
 +    }
 +    return EXCEPTION_NONE;
 +}
@@ -213,7 +265,7 @@ index 521e33bd6..3e8c44b28 100644
  /* The following functions sit in the syscall error monad, but include the
   * exception cases for the preemptible bottom end, as they call the invoke
   * functions directly.  This is a significant deviation from the Haskell
-@@ -937,6 +1029,14 @@ exception_t decodeTCBInvocation(word_t invLabel, word_t length, cap_t cap,
+@@ -937,6 +1030,14 @@ exception_t decodeTCBInvocation(word_t invLabel, word_t length, cap_t cap,
      case TCBSetFlags:
          return decodeSetFlags(cap, length, call, buffer);
  
