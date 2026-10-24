@@ -109,7 +109,7 @@ static struct page *pin_user_page(unsigned long virt, int is_write)
 {
 	struct mm_struct *mm = current->mm;
 	bool atomic = faulthandler_disabled();
-	int tries, dummy_code;
+	int tries;
 
 	/* Interrupts can arrive with this vCPU holding the PTE lock. */
 	if (mm == NULL || in_interrupt())
@@ -129,7 +129,7 @@ static struct page *pin_user_page(unsigned long virt, int is_write)
 		if (page)
 			return page;
 		/* Checks the VMA's permissions; fails when atomic. */
-		if (handle_page_fault(virt, 0, is_write, 0, 1, &dummy_code))
+		if (handle_uaccess_fault(virt, is_write))
 			return NULL;
 	}
 	/* Unmapped again after every fault: give up. */

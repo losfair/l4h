@@ -329,6 +329,16 @@ router with a firewall, tagged VLANs, XFS and FAT) and its sandboxes
 \texttt{iptables-nft}, the NFS client), so that the shipped kernel serves
 both.
 
+It also has what Android's userspace needs from a kernel: Binder and
+binderfs, SELinux, PSI, bootconfig, userfaultfd, an RTC with alarms,
+dma-buf heaps, evdev and uinput, zram, the legacy iptables that netd uses,
+fs-verity and fscrypt. Those that would change other guests are off unless
+the command line asks for them (Section~\ref{sec:kparams}): an Android
+guest boots with \texttt{lsm=selinux psi=1 bootconfig}. Binder devices
+appear only in a mounted binderfs. Android itself has not been booted yet;
+the kernel has no display, no suspend and no 32-bit compatibility, so
+Android needs a 64-bit-only build (DESIGN.md \S5.8).
+
 Every guest runs this kernel: the one in the host's UEFI application
 (Chapter~\ref{ch:dom0}), or the one appended to \texttt{l4h-root} under
 QEMU. Guests cannot bring their own, because a guest kernel calls seL4
@@ -907,6 +917,10 @@ boot; the host's current time anchor and guest Linux clocks keep their
 existing values. Run NTP in guests as usual. No automatic RTC write-back
 is performed.
 
+Each guest also has \texttt{/dev/rtc0}, which reads the host's clock.
+Setting it (\texttt{hwclock -w}) changes only that guest's RTC, and only
+until the guest stops.
+
 On x86\_64, dates from 1970 through 2099 are supported when firmware
 advertises a century register, and 2000 through 2099 otherwise. On
 AArch64 QEMU \texttt{virt}, the PL031 accepts seconds from 0 through
@@ -1286,6 +1300,7 @@ What does not work:
 \end{itemize}
 
 \section{Kernel parameters}
+\label{sec:kparams}
 
 Besides the standard ones (\texttt{root=}, \texttt{init=}, \ldots), the
 guest kernel accepts:
@@ -1297,6 +1312,16 @@ guest kernel accepts:
     Very verbose; for debugging the guest kernel.
   \item[\texttt{l4h\_debug\_user}] Print the faults and exceptions of user
     processes.
+\end{description}
+For Android guests, these standard parameters turn on what is off by
+default:
+\begin{description}[style=nextline]
+  \item[\texttt{lsm=selinux}] Run SELinux, which Android's \texttt{init}
+    needs.
+  \item[\texttt{psi=1}] Pressure stall information, for lmkd.
+  \item[\texttt{bootconfig}] Read the bootconfig appended to the
+    initramfs, where Android's boot images put their
+    \texttt{androidboot.*} settings.
 \end{description}
 
 \section{Attestation}

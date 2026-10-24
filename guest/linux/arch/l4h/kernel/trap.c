@@ -139,17 +139,17 @@ fail:
 
 /*
  * Note this is constrained to return 0, -EFAULT, -EACCES, -ENOMEM by
- * segv().
+ * segv().  is_user lets the fault wait for mmap_lock and the OOM killer;
+ * FAULT_FLAG_USER in flags says that user code made the access.
  */
-int handle_page_fault(unsigned long address, unsigned long ip,
-		      int is_write, int is_exec, int is_user, int *code_out)
+static int do_page_fault(unsigned long address, int is_write, int is_exec,
+			 int is_user, unsigned int flags, int *code_out)
 {
 	struct mm_struct *mm = current->mm;
 	struct vm_area_struct *vma;
 	pmd_t *pmd;
 	pte_t *pte;
 	int err = -EFAULT;
-	unsigned int flags = FAULT_FLAG_DEFAULT;
 
 	*code_out = SEGV_MAPERR;
 
@@ -160,8 +160,6 @@ int handle_page_fault(unsigned long address, unsigned long ip,
 	if (faulthandler_disabled())
 		goto out_nosemaphore;
 
-	if (is_user)
-		flags |= FAULT_FLAG_USER;
 retry:
 	vma = um_lock_mm_and_find_vma(mm, address, is_user);
 	if (!vma)
@@ -189,6 +187,12 @@ retry:
 
 		if ((fault & VM_FAULT_RETRY) && fatal_signal_pending(current))
 			goto out_nosemaphore;
+		/* A user fault that a signal interrupted (a userfaultfd
+		 * wait): the signal is delivered, and the access faults
+		 * again after its handler, as on other architectures. */
+		if ((fault & VM_FAULT_RETRY) && (flags & FAULT_FLAG_USER) &&
+		    signal_pending(current))
+			return 0;
 
 		/* The fault is fully completed (including releasing mmap lock) */
 		if (fault & VM_FAULT_COMPLETED)
@@ -242,6 +246,29 @@ out_of_memory:
 		goto out_nosemaphore;
 	pagefault_out_of_memory();
 	return 0;
+}
+
+int handle_page_fault(unsigned long address, unsigned long ip,
+		      int is_write, int is_exec, int is_user, int *code_out)
+{
+	unsigned int flags = FAULT_FLAG_DEFAULT;
+
+	if (is_user)
+		flags |= FAULT_FLAG_USER;
+	return do_page_fault(address, is_write, is_exec, is_user, flags, code_out);
+}
+
+/*
+ * A fault of the kernel's own access to user memory (skas/uaccess.c).  It
+ * waits for mmap_lock as a user fault does, but is not one: a userfaultfd
+ * opened with UFFD_USER_MODE_ONLY, all that vm.unprivileged_userfaultfd=0
+ * leaves unprivileged users, must not hold up the kernel's copies.
+ */
+int handle_uaccess_fault(unsigned long address, int is_write)
+{
+	int code;
+
+	return do_page_fault(address, is_write, 0, 1, FAULT_FLAG_DEFAULT, &code);
 }
 
 static void show_segv_info(struct uml_pt_regs *regs)

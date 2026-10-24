@@ -11,6 +11,10 @@ extern void __init uml_dtb_init(void);
 static inline void uml_dtb_init(void) { }
 #endif
 
-extern int __init read_initrd(void);
+#ifdef CONFIG_BLK_DEV_INITRD
+extern void __init l4h_initrd_setup(void);
+#else
+static inline void l4h_initrd_setup(void) { }
+#endif
 
 #endif

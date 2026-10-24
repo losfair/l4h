@@ -1,0 +1,7 @@
+#!/bin/sh
+/bin/busybox mount -t proc proc /proc
+/bin/busybox mount -t sysfs sys /sys
+/bin/busybox mount -t tmpfs tmp /tmp
+/bin/busybox mount -t devtmpfs dev /dev
+/bin/androidtest
+/bin/busybox poweroff -f

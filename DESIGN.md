@@ -989,6 +989,77 @@ through the JIT, and the verifier, JIT, direct tail calls and XDP (generic)
 and tcx attachment through `tests/guest/bpftest.c`. On x86_64 the guest has
 2 GiB.
 
+### 5.8 Android guests
+
+Android's userspace needs kernel features that other guests do not use.
+The shipped kernel has them, so an Android guest runs the same kernel as
+every other guest (§5.6). What would change the others stays off until a
+guest's command line asks for it:
+
+| Feature | Android's user | In other guests |
+|---------|----------------|-----------------|
+| Binder and binderfs | all IPC (servicemanager, HALs, apps) | no device until a binderfs is mounted (`ANDROID_BINDER_DEVICES=""`) |
+| SELinux, with audit | `init`, which stops without it | off without `lsm=selinux`; audit is disabled until an audit daemon (logd) enables it |
+| PSI | lmkd's memory pressure triggers | off without `psi=1` |
+| bootconfig | `androidboot.*` settings appended to the ramdisk | ignored without `bootconfig` |
+| userfaultfd, `MREMAP_DONTUNMAP`, `UFFDIO_MOVE` | ART's default (concurrent compacting) garbage collector | unused |
+| `/dev/rtc0` with alarms | the `CLOCK_*_ALARM` clocks | present |
+| dma-buf heaps, `sync_file` | gralloc buffers and fences | unused |
+| evdev, uinput | input | no input devices |
+| zram with LZ4 | swap | unconfigured |
+| legacy iptables with the matches and targets netd uses, policy routing, `SOCK_DESTROY`, XFRM | netd | empty tables |
+| fs-verity, fscrypt, quotas, dm-verity FEC | APKs, file-based encryption, storage accounting, verified partitions | per filesystem |
+
+The base stays mainline 6.18 LTS, not Android's `android17-6.18`
+branch: that branch lags the stable releases (6.18.32 against l4h's
+6.18.58 in October 2026), and the user ABI is upstream's either way.
+Android's own additions are therefore missing: `xt_quota2` (netd's data
+usage alerts), incremental-fs (incremental app installs), fuse-bpf
+(MediaProvider; mainline has FUSE passthrough), dm-default-key (metadata
+encryption), dm-user (virtual A/B snapshots) and ashmem (libcutils uses
+memfd instead).
+
+- **RTC.** `drivers/rtc_l4h.c` is `/dev/rtc0`: the host's wall clock
+  (`L4H_HC_GET_TIME`) plus an offset that setting it changes, which is the
+  guest's own and lasts until the guest stops. Alarms are hrtimers. The
+  device may wake the system, which alarm timers require of an RTC:
+  without one, `timerfd` works on the alarm clocks but `clock_gettime`,
+  `clock_nanosleep` and POSIX timers on them fail. The system clock still
+  comes from the host at boot, to the nanosecond, so `RTC_HCTOSYS` and
+  `RTC_SYSTOHC` are off.
+- **Kernel copies are not user faults.** uaccess faulted with
+  `FAULT_FLAG_USER`, as in UML. With userfaultfd that let a userfaultfd
+  opened with `UFFD_USER_MODE_ONLY`, all that
+  `vm.unprivileged_userfaultfd=0` leaves an unprivileged user, hold up the
+  kernel's own copies, which is what that mode exists to prevent
+  (`handle_uaccess_fault()`). They still wait for `mmap_lock` as user
+  faults do.
+- **Signals during a userfaultfd wait.** A user fault that a signal
+  interrupted gave up only for a fatal signal; for any other it retried at
+  once, so the thread spun in the kernel and took no signal until its page
+  arrived. ART suspends threads with signals, and the thread that would
+  fill the page may wait for them. The fault now returns, the signal is
+  delivered, and the access faults again, as `fault_signal_pending()` does
+  on other architectures.
+- **bootconfig.** `start_kernel()` looks for a bootconfig at the end of
+  the initramfs right after `setup_arch()`, which now records the
+  initramfs (it was an `early_initcall`).
+- **Not yet.** There is no display: DRM, and with it vkms, needs
+  `HAS_IOMEM`, which l4h does not have. No suspend (`PM_SLEEP`, so no
+  wakeup sources), no virtio-vsock and no 32-bit compat, so Android runs
+  as a 64-bit-only build. Each guest has 64 process VSpaces (§5.3), which
+  Android's hundred and more processes cycle through.
+
+`tests/run-androidtest.sh` boots `tests/guest/androidtest.c` with
+Android's command line and a bootconfig: Binder transactions of up to
+four pages and a file descriptor passed back, userfaultfd faults from
+user code and from kernel copies, signals during such a fault,
+`MREMAP_DONTUNMAP` filled back through userfaultfd, `UFFDIO_MOVE`, RTC
+alarms and setting, the alarm clocks, code written through one memfd
+mapping and run through another, a dma-buf heap, a PSI trigger, zram
+swap, SELinux, bootconfig and uinput. A second boot without those
+parameters checks that SELinux, PSI and bootconfig stay off.
+
 ---
 
 ## 6. SMP guests
@@ -1429,6 +1500,7 @@ NAT, DHCP and firewalling belong in a VM.
   root reads the ring for `console_read`. Console input and power requests
   use the shared console device page.
 - **Control.** `l4hctl`, dom0 only (§9.1).
+- **RTC.** `/dev/rtc0`, with alarms, on the host's wall clock (§5.8).
 - **Future devices.** virtio-rng, virtio-vsock and virtio-balloon.
 
 ### 8.5 IOMMU (AMD-Vi and Intel VT-d)

@@ -379,6 +379,7 @@ void __init setup_arch(char **cmdline_p)
 	u8 rng_seed[32];
 
 	setup_physmem(uml_physmem, uml_reserved, physmem_size);
+	l4h_initrd_setup();
 #ifdef CONFIG_SMP
 	l4h_smp_setup();
 #endif

@@ -146,6 +146,16 @@ config L4H_KMOD
 	  kernel's /lib/modules, with its modules and the tree to build
 	  external modules against, which the host shares with every guest.
 
+config L4H_RTC
+	bool "l4h real-time clock"
+	default y
+	depends on RTC_CLASS
+	help
+	  /dev/rtc0, on the host's wall clock, with alarms, which the alarm
+	  clocks (CLOCK_REALTIME_ALARM, CLOCK_BOOTTIME_ALARM) need beyond
+	  timerfd.  Setting it lasts until the guest stops and changes no
+	  other guest.
+
 endmenu
 
 config ARCH_SUSPEND_POSSIBLE

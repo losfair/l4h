@@ -32,6 +32,7 @@ extern unsigned long segv(struct faultinfo fi, unsigned long ip,
 			  void *mc);
 extern int handle_page_fault(unsigned long address, unsigned long ip,
 			     int is_write, int is_exec, int is_user, int *code_out);
+extern int handle_uaccess_fault(unsigned long address, int is_write);
 
 extern unsigned int do_IRQ(int irq, struct uml_pt_regs *regs);
 extern void initial_thread_cb(void (*proc)(void *), void *arg);
