@@ -4,9 +4,11 @@
  * exercises what Android userspace relies on: Binder through binderfs,
  * userfaultfd with MREMAP_DONTUNMAP and UFFDIO_MOVE (ART's garbage
  * collector), alarm timers and the RTC, memfd code mapped twice (ART's
- * JIT), dma-buf heaps, PSI triggers (lmkd), SELinux, bootconfig, uinput
- * and zram swap.  Booted with androidtest=default, it checks that a guest
- * which does not ask for them sees none of SELinux, PSI or bootconfig.
+ * JIT), dma-buf heaps, a vkms display with what it composes read back
+ * through writeback, PSI triggers (lmkd), SELinux, bootconfig, uinput and
+ * zram swap.  Booted with androidtest=default, it checks that a guest
+ * which does not ask for them sees none of SELinux, PSI, bootconfig or a
+ * display.
  * Prints "ANDROIDTEST: PASS" or "ANDROIDTEST: FAIL".
  */
 #define _GNU_SOURCE
@@ -30,6 +32,8 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <drm/drm.h>
+#include <drm/drm_mode.h>
 #include <linux/android/binder.h>
 #include <linux/android/binderfs.h>
 #include <linux/dma-buf.h>
@@ -685,6 +689,180 @@ static void test_dma_heap(void)
 	close(heap);
 }
 
+/* ---- the display: vkms, from the module tree (/dev/l4hkmod).  It has
+ * no output, but its writeback connector returns what it composed. */
+
+struct dumb {
+	uint32_t handle, fb, pitch;
+	uint64_t size;
+	uint32_t *map;
+};
+
+static int dumb_create(int fd, struct dumb *d, uint32_t w, uint32_t h, uint32_t seed)
+{
+	struct drm_mode_create_dumb cd = { .width = w, .height = h, .bpp = 32 };
+	struct drm_mode_fb_cmd fc = { .width = w, .height = h, .bpp = 32, .depth = 24 };
+	struct drm_mode_map_dumb md = { 0 };
+
+	if (ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &cd))
+		return -1;
+	fc.pitch = cd.pitch;
+	fc.handle = cd.handle;
+	md.handle = cd.handle;
+	if (ioctl(fd, DRM_IOCTL_MODE_ADDFB, &fc) || ioctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &md))
+		return -1;
+	d->map = mmap(NULL, cd.size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, md.offset);
+	if (d->map == MAP_FAILED)
+		return -1;
+	/* XRGB8888: the X byte is not composed. */
+	for (uint64_t i = 0; i < cd.size / 4; i++)
+		d->map[i] = (seed * 0x9e3779b9u ^ (uint32_t)i * 0x85ebca6bu) & 0xffffff;
+	d->handle = cd.handle;
+	d->fb = fc.fb_id;
+	d->pitch = cd.pitch;
+	d->size = cd.size;
+	return 0;
+}
+
+/* The id of an object's property, by name; 0 if it has none. */
+static uint32_t prop_id(int fd, uint32_t obj, uint32_t type, const char *name)
+{
+	uint32_t ids[64];
+	uint64_t vals[64];
+	struct drm_mode_obj_get_properties op = { .obj_id = obj, .obj_type = type };
+
+	if (ioctl(fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &op) || op.count_props > 64)
+		return 0;
+	op.props_ptr = (uintptr_t)ids;
+	op.prop_values_ptr = (uintptr_t)vals;
+	if (ioctl(fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &op))
+		return 0;
+	for (uint32_t i = 0; i < op.count_props; i++) {
+		struct drm_mode_get_property gp = { .prop_id = ids[i] };
+
+		if (!ioctl(fd, DRM_IOCTL_MODE_GETPROPERTY, &gp) && !strcmp(gp.name, name))
+			return ids[i];
+	}
+	return 0;
+}
+
+/* Writes back one composed frame into out; 0 once its fence signals. */
+static int writeback(int fd, uint32_t conn, uint32_t crtc, const struct dumb *out)
+{
+	uint32_t props[3] = {
+		prop_id(fd, conn, DRM_MODE_OBJECT_CONNECTOR, "CRTC_ID"),
+		prop_id(fd, conn, DRM_MODE_OBJECT_CONNECTOR, "WRITEBACK_FB_ID"),
+		prop_id(fd, conn, DRM_MODE_OBJECT_CONNECTOR, "WRITEBACK_OUT_FENCE_PTR"),
+	};
+	int32_t fence = -1;
+	uint64_t vals[3] = { crtc, out->fb, (uintptr_t)&fence };
+	uint32_t count = 3;
+	struct drm_mode_atomic req = {
+		.flags = DRM_MODE_ATOMIC_ALLOW_MODESET,
+		.count_objs = 1,
+		.objs_ptr = (uintptr_t)&conn,
+		.count_props_ptr = (uintptr_t)&count,
+		.props_ptr = (uintptr_t)props,
+		.prop_values_ptr = (uintptr_t)vals,
+	};
+	struct pollfd p;
+	int r;
+
+	if (!props[0] || !props[1] || !props[2] || ioctl(fd, DRM_IOCTL_MODE_ATOMIC, &req) || fence < 0)
+		return -1;
+	/* The fence is a sync_file. */
+	p = (struct pollfd){ fence, POLLIN, 0 };
+	r = poll(&p, 1, 2000) == 1 ? 0 : -1;
+	close(fence);
+	return r;
+}
+
+static int same_pixels(const struct dumb *a, const struct dumb *b)
+{
+	for (uint64_t i = 0; i < a->size / 4; i++)
+		if ((a->map[i] ^ b->map[i]) & 0xffffff)
+			return 0;
+	return 1;
+}
+
+static void test_display(void)
+{
+	struct drm_mode_card_res res = { 0 };
+	uint32_t crtcs[8], conns[8], fbs[8], encs[8], out = 0, wb = 0;
+	struct drm_mode_modeinfo modes[64];
+	struct drm_mode_crtc crtc = { 0 };
+	union drm_wait_vblank vb;
+	struct dumb fb[2], cap;
+	double t0;
+	int fd;
+
+	CHECK(system("modprobe vkms") == 0, "modprobe vkms");
+	fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
+	CHECK(fd >= 0, "/dev/dri/card0");
+	CHECK(ioctl(fd, DRM_IOCTL_SET_CLIENT_CAP, &(struct drm_set_client_cap){ DRM_CLIENT_CAP_ATOMIC, 1 }) == 0 &&
+	      ioctl(fd, DRM_IOCTL_SET_CLIENT_CAP,
+		    &(struct drm_set_client_cap){ DRM_CLIENT_CAP_WRITEBACK_CONNECTORS, 1 }) == 0,
+	      "atomic and writeback capabilities");
+	CHECK(ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &res) == 0 && res.count_crtcs &&
+	      res.count_crtcs <= 8 && res.count_connectors <= 8 && res.count_fbs <= 8 &&
+	      res.count_encoders <= 8, "%u CRTCs, %u connectors", res.count_crtcs, res.count_connectors);
+	res.crtc_id_ptr = (uintptr_t)crtcs;
+	res.connector_id_ptr = (uintptr_t)conns;
+	res.fb_id_ptr = (uintptr_t)fbs;
+	res.encoder_id_ptr = (uintptr_t)encs;
+	CHECK(ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &res) == 0, "GETRESOURCES");
+	for (uint32_t i = 0; i < res.count_connectors; i++) {
+		struct drm_mode_get_connector c = { .connector_id = conns[i] };
+
+		CHECK(ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &c) == 0, "GETCONNECTOR");
+		if (c.connector_type == DRM_MODE_CONNECTOR_WRITEBACK) {
+			wb = conns[i];
+		} else if (!out && c.count_modes) {
+			CHECK(c.count_modes <= 64, "%u modes", c.count_modes);
+			c.modes_ptr = (uintptr_t)modes;
+			c.count_props = c.count_encoders = 0;
+			CHECK(ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &c) == 0, "connector modes");
+			out = conns[i];
+		}
+	}
+	CHECK(out && wb, "connectors: output %u, writeback %u", out, wb);
+
+	/* A mode on the output, then page flips and vblanks at its rate. */
+	for (int i = 0; i < 2; i++)
+		CHECK(dumb_create(fd, &fb[i], modes[0].hdisplay, modes[0].vdisplay, i + 1) == 0,
+		      "dumb buffer %d", i);
+	CHECK(dumb_create(fd, &cap, modes[0].hdisplay, modes[0].vdisplay, 0) == 0, "writeback buffer");
+	crtc.crtc_id = crtcs[0];
+	crtc.fb_id = fb[0].fb;
+	crtc.set_connectors_ptr = (uintptr_t)&out;
+	crtc.count_connectors = 1;
+	crtc.mode = modes[0];
+	crtc.mode_valid = 1;
+	CHECK(ioctl(fd, DRM_IOCTL_MODE_SETCRTC, &crtc) == 0, "SETCRTC %ux%u", modes[0].hdisplay,
+	      modes[0].vdisplay);
+	CHECK(writeback(fd, wb, crtcs[0], &cap) == 0 && same_pixels(&cap, &fb[0]),
+	      "writeback differs from the first buffer");
+	for (int i = 1; i <= 11; i++) {
+		struct drm_mode_crtc_page_flip pf = {
+			.crtc_id = crtcs[0], .fb_id = fb[i & 1].fb,
+			.flags = DRM_MODE_PAGE_FLIP_EVENT, .user_data = i,
+		};
+		struct drm_event_vblank ev;
+
+		CHECK(ioctl(fd, DRM_IOCTL_MODE_PAGE_FLIP, &pf) == 0, "PAGE_FLIP %d", i);
+		CHECK(read(fd, &ev, sizeof(ev)) == sizeof(ev) && ev.base.type == DRM_EVENT_FLIP_COMPLETE &&
+		      ev.user_data == (uint64_t)i, "flip event %d", i);
+	}
+	CHECK(writeback(fd, wb, crtcs[0], &cap) == 0 && same_pixels(&cap, &fb[1]),
+	      "writeback differs from the buffer flipped to");
+	vb = (union drm_wait_vblank){ .request = { .type = _DRM_VBLANK_RELATIVE, .sequence = 30 } };
+	t0 = now(CLOCK_MONOTONIC);
+	CHECK(ioctl(fd, DRM_IOCTL_WAIT_VBLANK, &vb) == 0, "WAIT_VBLANK");
+	t0 = now(CLOCK_MONOTONIC) - t0;
+	CHECK(t0 > 0.3 && t0 < 1.5, "30 vblanks in %.3f s at %u Hz", t0, modes[0].vrefresh);
+	close(fd);
+}
+
 /* ---- lmkd: memory pressure triggers and zram swap */
 
 static void test_psi(void)
@@ -759,6 +937,7 @@ static void test_defaults(void)
 	char buf[256];
 
 	CHECK(access("/proc/pressure", F_OK) < 0, "PSI is on without psi=1");
+	CHECK(access("/dev/dri", F_OK) < 0, "a display without vkms loaded");
 	CHECK(read_file("/proc/bootconfig", buf, sizeof(buf)) == 0,
 	      "bootconfig without the bootconfig parameter: %s", buf);
 }
@@ -841,6 +1020,7 @@ int main(void)
 		run("alarm_timers", test_alarm_timers);
 		run("memfd_jit", test_memfd_jit);
 		run("dma_heap", test_dma_heap);
+		run("display", test_display);
 		run("psi", test_psi);
 		run("zram", test_zram);
 		run("selinux", test_selinux_android);

@@ -198,10 +198,16 @@ CONFIG_RTC_CLASS=y
 # CONFIG_RTC_HCTOSYS is not set
 # CONFIG_RTC_SYSTOHC is not set
 # Graphics buffers and fences, for gralloc and the compositor; evdev and
-# uinput.  There is no display yet: DRM needs HAS_IOMEM.
+# uinput.  The display is vkms, which composes in software and has no
+# output but its writeback connector.  It is a module: loaded, it adds a
+# display to the guest.
 CONFIG_DMABUF_HEAPS=y
 CONFIG_DMABUF_HEAPS_SYSTEM=y
 CONFIG_SYNC_FILE=y
+CONFIG_DRM=m
+CONFIG_DRM_VKMS=m
+# CONFIG_USB_SUPPORT is not set
+# CONFIG_HWMON is not set
 CONFIG_INPUT_EVDEV=y
 # CONFIG_INPUT_KEYBOARD is not set
 # CONFIG_INPUT_MOUSE is not set

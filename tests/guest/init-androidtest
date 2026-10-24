@@ -3,5 +3,8 @@
 /bin/busybox mount -t sysfs sys /sys
 /bin/busybox mount -t tmpfs tmp /tmp
 /bin/busybox mount -t devtmpfs dev /dev
+# The kernel's module tree, for vkms.
+/bin/busybox mkdir -p /lib/modules
+/bin/busybox mount -t erofs -o ro /dev/l4hkmod /lib/modules
 /bin/androidtest
 /bin/busybox poweroff -f

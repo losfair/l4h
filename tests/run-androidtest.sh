@@ -3,7 +3,7 @@
 # command line of an Android guest (lsm=selinux psi=1 bootconfig) and a
 # bootconfig appended to its initramfs, as Android's boot images do; then
 # with androidtest=default, which checks that a guest that asks for none
-# of it gets none of it.
+# of it gets none of it.  Both have the kernel's module tree, for vkms.
 # Usage: run-androidtest.sh [vcpus]
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -32,7 +32,7 @@ for mode in android default; do
         initrd=$out/androidtest.cpio.gz
         cmdline="console=hvc0 androidtest=default"
     fi
-    L4H_DOM0_VCPUS=${1:-2} "$root/tools/run-dom0.sh" "$initrd" "$cmdline" "$tmo" \
+    L4H_KMODS=1 L4H_DOM0_VCPUS=${1:-2} "$root/tools/run-dom0.sh" "$initrd" "$cmdline" "$tmo" \
         | sed -n '/ANDROIDTEST: start/,/ANDROIDTEST: \(PASS\|FAIL\)/p'
     cp "$root/build/qemu.log" "$root/build/androidtest-$mode.log"
     grep -q "ANDROIDTEST: PASS" "$root/build/qemu.log"

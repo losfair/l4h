@@ -1005,6 +1005,7 @@ guest's command line asks for it:
 | userfaultfd, `MREMAP_DONTUNMAP`, `UFFDIO_MOVE` | ART's default (concurrent compacting) garbage collector | unused |
 | `/dev/rtc0` with alarms | the `CLOCK_*_ALARM` clocks | present |
 | dma-buf heaps, `sync_file` | gralloc buffers and fences | unused |
+| DRM with vkms, a module | the display SurfaceFlinger composes for | no display until vkms is loaded |
 | evdev, uinput | input | no input devices |
 | zram with LZ4 | swap | unconfigured |
 | legacy iptables with the matches and targets netd uses, policy routing, `SOCK_DESTROY`, XFRM | netd | empty tables |
@@ -1044,11 +1045,21 @@ memfd instead).
 - **bootconfig.** `start_kernel()` looks for a bootconfig at the end of
   the initramfs right after `setup_arch()`, which now records the
   initramfs (it was an `early_initcall`).
-- **Not yet.** There is no display: DRM, and with it vkms, needs
-  `HAS_IOMEM`, which l4h does not have. No suspend (`PM_SLEEP`, so no
-  wakeup sources), no virtio-vsock and no 32-bit compat, so Android runs
-  as a 64-bit-only build. Each guest has 64 process VSpaces (§5.3), which
-  Android's hundred and more processes cycle through.
+- **Display.** The graphics menu, DRM included, is only offered with
+  `HAS_IOMEM`, which `NO_IOMEM` took away. A guest has no device memory,
+  only pages it shares with the host, so `ioremap()` returns NULL
+  (`asm/io.h`, as on UML) and `NO_IOMEM` is now off: what needs no device
+  memory builds, and a driver that maps some fails its probe. The display
+  is vkms, which composes planes in software, raises vblanks from an
+  hrtimer and has no output but its writeback connector; SurfaceFlinger
+  composes onto it, and screen capture over adb (scrcpy, `screenrecord`)
+  shows it. DRM and vkms are modules, from the module tree or Android's
+  ramdisk: vkms adds a display as soon as it is loaded. A display the host
+  can show would be a virtio-gpu device in l4h-vmm.
+- **Not yet.** No suspend (`PM_SLEEP`, so no wakeup sources), no
+  virtio-vsock and no 32-bit compat, so Android runs as a 64-bit-only
+  build. Each guest has 64 process VSpaces (§5.3), which Android's
+  hundred and more processes cycle through.
 
 `tests/run-androidtest.sh` boots `tests/guest/androidtest.c` with
 Android's command line and a bootconfig: Binder transactions of up to
@@ -1056,9 +1067,11 @@ four pages and a file descriptor passed back, userfaultfd faults from
 user code and from kernel copies, signals during such a fault,
 `MREMAP_DONTUNMAP` filled back through userfaultfd, `UFFDIO_MOVE`, RTC
 alarms and setting, the alarm clocks, code written through one memfd
-mapping and run through another, a dma-buf heap, a PSI trigger, zram
-swap, SELinux, bootconfig and uinput. A second boot without those
-parameters checks that SELinux, PSI and bootconfig stay off.
+mapping and run through another, a dma-buf heap, vkms (a mode, page
+flips and vblanks, and frames written back that match the buffer
+shown), a PSI trigger, zram swap, SELinux, bootconfig and uinput. A
+second boot without those parameters checks that SELinux, PSI,
+bootconfig and a display stay off.
 
 ---
 

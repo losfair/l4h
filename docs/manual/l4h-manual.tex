@@ -335,9 +335,12 @@ dma-buf heaps, evdev and uinput, zram, the legacy iptables that netd uses,
 fs-verity and fscrypt. Those that would change other guests are off unless
 the command line asks for them (Section~\ref{sec:kparams}): an Android
 guest boots with \texttt{lsm=selinux psi=1 bootconfig}. Binder devices
-appear only in a mounted binderfs. Android itself has not been booted yet;
-the kernel has no display, no suspend and no 32-bit compatibility, so
-Android needs a 64-bit-only build (DESIGN.md \S5.8).
+appear only in a mounted binderfs. The display is vkms, a module
+(\texttt{modprobe vkms}, Section~\ref{sec:kmods}): it composes in
+software and has no output of its own, so you see it through screen
+capture in the guest, such as scrcpy over adb. Android itself has not
+been booted yet; the kernel has no suspend and no 32-bit compatibility,
+so Android needs a 64-bit-only build (DESIGN.md \S5.8).
 
 Every guest runs this kernel: the one in the host's UEFI application
 (Chapter~\ref{ch:dom0}), or the one appended to \texttt{l4h-root} under

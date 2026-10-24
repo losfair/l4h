@@ -36,8 +36,8 @@ Third-party components, including the submodules in `kernel/seL4` and
     image of `/lib/modules`).
   - The kernel has what Android's userspace needs from it (Binder,
     SELinux, PSI, bootconfig, userfaultfd, an RTC with alarms, dma-buf
-    heaps), off for other guests unless their command line asks. Android
-    itself does not boot yet: there is no display.
+    heaps, a vkms display as a module), off for other guests unless they
+    ask. Android itself has not been booted yet.
 - **Block.** Passed-through virtio-blk, virtio-scsi and NVMe disks, or read-only and
   partial (LBA window) slices of them. I/O is zero-copy: devices DMA
   straight into guest memory.

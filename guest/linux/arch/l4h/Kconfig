@@ -53,8 +53,11 @@ config MMU
 	bool
 	default y
 
+# There is no device memory in a guest, only pages it shares with the
+# host: ioremap() returns NULL (asm/io.h), as on UML.  Without NO_IOMEM,
+# what needs none can be built, DRM and vkms among them.
 config NO_IOMEM
-	def_bool y
+	def_bool n
 
 config ISA
 	bool
