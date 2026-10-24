@@ -256,7 +256,10 @@ guest. Where there is an AMD IOMMU, root drives it itself (§8.5).
   `mmap`/`mprotect` execute permissions are enforced. As on x86 and arm64,
   the heap (`brk`), `.bss` and the stack are executable only with
   `READ_IMPLIES_EXEC` or an executable `PT_GNU_STACK`; arch/um's default,
-  inherited at first, made every heap writable and executable.
+  inherited at first, made every heap writable and executable. On a CPU
+  without NX, or whose firmware hides it (`IA32_MISC_ENABLE.XD_DISABLE`,
+  which seL4 leaves alone), the attribute is dropped silently and every
+  readable page is executable.
 - **0010, SMP remote calls.** `handleIPI()` read a remote call's operation
   and arguments before checking that the call was pending for this core.
   A late hardware IPI for a call already handled from the lock's wait loop
@@ -349,6 +352,13 @@ guest. Where there is an AMD IOMMU, root drives it itself (§8.5).
   - Stale entries only grant rights the same frame cap had at the same
     address. Unmapping, the only way to reuse the frame, still invalidates
     at once.
+  - After a raise, another core can keep the lower rights cached and take
+    a spurious fault. A user thread resumes once Linux finds its PTE
+    already allows the access, but any fault of a guest kernel thread
+    stops the guest, so the guest must never raise rights in place in its
+    kernel VSpace. It does not today: `PAGE_KERNEL` is dirty (no write
+    emulation), arch/l4h has no `set_memory_*`, and `os_protect_memory`
+    does nothing.
   - The 16 MiB fork now takes 6 ms, and the copy-on-write fault after it
     7.7 µs/page instead of 47.
 - **0019, Untyped resets skip memory that is already zero.** Resetting an
@@ -371,7 +381,9 @@ guest. Where there is an AMD IOMMU, root drives it itself (§8.5).
   write-back kernel window too, which the architecture does not support,
   but x86 CPUs snoop their caches on such accesses in practice. Flushing
   every line on every reset would cost about as much as the clear it
-  saves.
+  saves. Device writes cannot leave stale lines either: l4h's AMD-Vi
+  page tables set force-coherent (FC), so even PCIe No Snoop writes are
+  snooped, and without an IOMMU devices can already reach all memory.
 - **0020, framebuffer console (x86).** With the command-line option
   `fb_console`, everything the kernel prints (its own messages and host
   components' debug output) is also drawn on the lower half of the
@@ -382,7 +394,8 @@ guest. Where there is an AMD IOMMU, root drives it itself (§8.5).
   screen is not, such as Latitude.sh servers behind their BMC's web proxy
   (§10.1); the `fb_console` setting adds it (§10). The framebuffer is
   checked once the whole memory map has been read, and refused if it
-  overlaps usable RAM.
+  overlaps usable RAM or starts below 1 MiB, which the memory map leaves
+  out and where the APs' boot code goes.
 - **0021, extra boot modules (x86).** seL4 loads the first multiboot
   module as the root task and ignores the rest, and their memory is not
   safe: the root task's image is moved over wherever the loader put them,
@@ -415,11 +428,14 @@ guest. Where there is an AMD IOMMU, root drives it itself (§8.5).
   hardware updates to other bits, including x86's dirty bit.
 
   Clearing does not invalidate TLBs: a cached A=1/AF=1 translation can delay
-  the next sample, as with native x86 Linux aging. On AArch64 without
-  hardware AF updates, a later walk faults with AF=0. seL4 handles this
-  access-flag fault for an EL0 4 KiB mapping by setting AF and restarting
-  the instruction, without fault IPC to Linux. AF=0 translations cannot
-  be cached, so setting AF needs no invalidation. Permission and other
+  the next sample, as with native x86 Linux aging. On x86 a remap also
+  writes A=0, and after one that 0017 leaves to the TLBs, other cores'
+  cached translations keep the frame's use from showing until they are
+  evicted. On AArch64 without hardware AF updates, a later walk faults
+  with AF=0. seL4 handles this access-flag fault for an EL0 4 KiB mapping
+  by setting AF and restarting the instruction, without fault IPC to
+  Linux. AF=0 translations cannot be cached, so setting AF needs no
+  invalidation. Permission and other
   faults still go to the VSpace owner. The loader leaves `TCR_EL1.HA` off;
   enabling hardware AF updates on FEAT_HAFDBS CPUs is a future optimization.
 - E1 (`trapSyscalls`) is our fix for seL4 issue #477, which is still open
@@ -1947,8 +1963,14 @@ Rules that keep the port cheap:
   At EL2 the loader clears `HCR_EL2.E2H` before setting up its own
   translation (firmware may leave VHE on; CPUs where E2H is RES1 are
   refused), and the drop to EL1 sets `VTTBR_EL2` (VMID 0), `MDCR_EL2`
-  (no debug or PMU traps, all counters to EL1) and, with a GICv3,
-  `ICC_SRE_EL2`, all of which reset to UNKNOWN values.
+  (no debug or PMU traps, all counters to EL1), `VPIDR_EL2` and
+  `VMPIDR_EL2` (what EL1 reads as `MIDR_EL1` and `MPIDR_EL1`) and, with a
+  GICv3, `ICC_SRE_EL2`, all of which reset to UNKNOWN values. The
+  fine-grained trap registers (FEAT_FGT) and `HCRX_EL2` are left to the
+  firmware to initialize for a lower EL, as TF-A does; QEMU resets them to
+  zero, which traps none of the registers seL4 uses. Both paths
+  invalidate EL1's TLB before turning its MMU on, which matters when the
+  loader ran at EL1 with its own tables.
   `tools/build-loader-aarch64.sh` applies the patch and builds the loader.
   Patch 0002 also supports direct EL1 entry, initializes the EL1 translation
   regime and selects QEMU's HVC PSCI conduit when EL2 is unavailable.

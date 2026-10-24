@@ -144,7 +144,7 @@ index 93b320964..8f8216b1e 100644
      /* set up sched control for each core */
      init_sched_control(root_cnode_cap, CONFIG_MAX_NUM_NODES);
 diff --git a/src/arch/x86/kernel/boot_sys.c b/src/arch/x86/kernel/boot_sys.c
-index 039330de9..a35c1006d 100644
+index f28719432..f6f0ec464 100644
 --- a/src/arch/x86/kernel/boot_sys.c
 +++ b/src/arch/x86/kernel/boot_sys.c
 @@ -64,8 +64,19 @@ BOOT_CODE static paddr_t find_load_paddr(paddr_t min_paddr, word_t image_size)

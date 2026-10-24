@@ -166,8 +166,7 @@ static int as_map_page(struct l4h_as *as, unsigned long va, unsigned long phys, 
 	if (e && entry_pfn(e) == pfn) {
 		/* Same frame.  The entry mirrors the VSpace: a mapping with the
 		 * same rights is already there (the sync and the fault path
-		 * both install it after a fault).  Every seL4 map flushes the
-		 * address space on all the cores it ran on, so skip it. */
+		 * both install it after a fault), so skip it. */
 		unsigned long lowered = entry_prot(e) & ~eff_prot(prot);
 
 		if (entry_prot(e) == eff_prot(prot))
