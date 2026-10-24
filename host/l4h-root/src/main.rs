@@ -445,10 +445,7 @@ impl Host {
             if g.devices.len() >= guest::MAX_GUEST_DEVICES {
                 return Err(ctl::ENOSPC);
             }
-            if !g.reserve(&mut h.alloc, bytes) {
-                return Err(ctl::ENOMEM);
-            }
-            let backend = gpu::attach(g, &mut h.alloc, width, height);
+            let backend = gpu::attach(g, &mut h.alloc, width, height)?;
             let d = g.add_device(&mut h.alloc, guest::DevKind::Virtio(16)).expect("guest device room checked");
             g.backends.must_push((d, backend));
             Ok(())

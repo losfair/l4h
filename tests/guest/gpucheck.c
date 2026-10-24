@@ -1,7 +1,8 @@
 /*
  * dom0 side of tests/run-gputest.sh: check that a screenshot (a binary
- * PPM from l4hctl screenshot) is image SEED (gpu-pattern.h) of WxH.
- * Usage: gpucheck FILE W H SEED
+ * PPM from l4hctl screenshot) of WxH shows image SEED (gpu-pattern.h) in
+ * its top left DWxDH pixels (default: all) and black elsewhere.
+ * Usage: gpucheck FILE W H SEED [DW DH]
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,14 +10,16 @@
 
 int main(int argc, char **argv)
 {
-	unsigned int w, h, max, seed, bad = 0;
+	unsigned int w, h, max, seed, dw, dh, bad = 0;
 	FILE *f;
 
-	if (argc != 5 || !(f = fopen(argv[1], "rb"))) {
-		printf("GPUCHECK: usage: gpucheck FILE W H SEED\n");
+	if ((argc != 5 && argc != 7) || !(f = fopen(argv[1], "rb"))) {
+		printf("GPUCHECK: usage: gpucheck FILE W H SEED [DW DH]\n");
 		return 2;
 	}
 	seed = atoi(argv[4]);
+	dw = argc == 7 ? (unsigned)atoi(argv[5]) : (unsigned)atoi(argv[2]);
+	dh = argc == 7 ? (unsigned)atoi(argv[6]) : (unsigned)atoi(argv[3]);
 	if (fscanf(f, "P6 %u %u %u", &w, &h, &max) != 3 || fgetc(f) == EOF || max != 255) {
 		printf("GPUCHECK: %s: not a binary PPM\n", argv[1]);
 		return 1;
@@ -27,7 +30,7 @@ int main(int argc, char **argv)
 	}
 	for (unsigned int y = 0; y < h; y++)
 		for (unsigned int x = 0; x < w; x++) {
-			unsigned int c = gpu_pattern(x, y, seed);
+			unsigned int c = x < dw && y < dh ? gpu_pattern(x, y, seed) : 0;
 			int r = fgetc(f), g = fgetc(f), b = fgetc(f);
 
 			if (b == EOF) {

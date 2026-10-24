@@ -12,10 +12,10 @@ use l4h_abi as abi;
 use l4h_host as host;
 use l4h_host::gpu::{DisplayHeader, IMAGE_OFFSET, STATE_PAGES, display_pages, image_bytes};
 
-use crate::ctl::{EAGAIN, EINVAL};
+use crate::ctl::{EAGAIN, EINVAL, ENOMEM};
 use crate::guest::{Guest, abs};
 use crate::layout;
-use crate::mem::{Alloc, Dest};
+use crate::mem::{ARENA_TAIL, Alloc, Dest};
 use crate::vmm::Backend;
 use crate::vspace::FRAME_BP;
 
@@ -50,23 +50,34 @@ pub fn attach_bytes(width: u32, height: u32) -> usize {
     n * PAGE + 2 * (32 << radix)
 }
 
+/// Frames retyped at once: what Arena::reserve guarantees will fit
+/// however fragmented the arena is.
+const FRAME_BATCH: usize = ARENA_TAIL / PAGE;
+
 /// Page tables for mapping `pages` consecutive pages, at any alignment.
 pub fn table_bytes(pages: usize) -> usize {
     (pages / 512 + 2) * PAGE
 }
 
 /// The frames of a GPU with one scanout of `width` x `height`, its display
-/// area mapped in l4h-root.  The arena must hold attach_bytes().
-pub fn attach(g: &mut Guest, alloc: &mut Alloc, width: u32, height: u32) -> Backend {
+/// area mapped in l4h-root.  ENOMEM if the host has too little memory;
+/// what was allocated by then stays in the guest's arena until destroy.
+pub fn attach(g: &mut Guest, alloc: &mut Alloc, width: u32, height: u32) -> Result<Backend, i64> {
     let (n, radix) = frames(width, height);
-    let frames = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: radix });
-    let keep = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: radix });
+    // The CNodes are larger than reserve guarantees: they may not fit.
+    let mut cnode = || {
+        let s = g.arena.try_object(alloc, ObjectBlueprint::CNode { size_bits: radix }).ok_or(ENOMEM)?;
+        Ok::<_, i64>(sel4::init_thread::Slot::<cap_type::CNode>::from_index(s).cap())
+    };
+    let frames = cnode()?;
+    let keep = cnode()?;
+    if !g.reserve(alloc, n * PAGE) {
+        return Err(ENOMEM);
+    }
     let mut i = 0;
     while i < n {
-        // A 2 MiB block at most at a time: the arena need not have more
-        // contiguous.
-        let k = (n - i).min(512);
-        g.arena.retype(alloc, &FRAME_BP, k, Dest { cnode: abs(frames), offset: i }).expect("GPU frames");
+        let k = (n - i).min(FRAME_BATCH);
+        g.arena.retype(alloc, &FRAME_BP, k, Dest { cnode: abs(frames), offset: i }).ok_or(ENOMEM)?;
         i += k;
     }
     let pages = display_pages(width, height);
@@ -80,7 +91,7 @@ pub fn attach(g: &mut Guest, alloc: &mut Alloc, width: u32, height: u32) -> Back
         core::ptr::addr_of_mut!((*hdr).height).write_volatile(height);
     }
     g.gpu = Some((width, height));
-    Backend::Gpu { frames, keep, radix, display_pages: pages, width, height }
+    Ok(Backend::Gpu { frames, keep, radix, display_pages: pages, width, height })
 }
 
 /// CTL_GPU_READ: copy the image of guest `g` from byte `offset` into `to`
@@ -96,18 +107,10 @@ pub fn read(g: &Guest, offset: u64, to: *mut u8) -> Result<[u64; 6], i64> {
     }
     let format = unsafe { core::ptr::addr_of!(hdr.format).read_volatile() };
     let total = image_bytes(width, height) as u64;
-    // Whole words, of which the image has a whole number (width >= 64).
-    if offset % 8 != 0 {
-        return Err(EINVAL);
-    }
     let off = offset.min(total);
     let n = (total - off).min(abi::CTL_LOAD_MAX) as usize;
     // l4h-vmm may be writing meanwhile: the frame counter tells.
-    let src = (base + IMAGE_OFFSET + off as usize) as *const u64;
-    let dst = to as *mut u64;
-    for i in 0..n / 8 {
-        unsafe { dst.add(i).write_volatile(src.add(i).read_volatile()) };
-    }
+    unsafe { host::gpu::copy_volatile((base + IMAGE_OFFSET + off as usize) as *const u8, to, n) };
     fence(Ordering::Acquire);
     if hdr.frame.load(Ordering::Relaxed) != frame {
         return Err(EAGAIN);

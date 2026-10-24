@@ -697,7 +697,7 @@ const ARENA_REGIONS: usize = 96;
 /// What alignment may leave unusable at the end of a region, for
 /// Arena::reserve: the largest object allocated in quantity (a 16 KiB RAM
 /// CNode) and the space before it.
-const ARENA_TAIL: usize = 32 << 10;
+pub const ARENA_TAIL: usize = 32 << 10;
 const ARENA_OWNED: usize = ARENA_REGIONS + 1 + crate::guest::MAX_GUEST_DEVICES;
 
 /// Untyped memory dedicated to one guest (or host component).

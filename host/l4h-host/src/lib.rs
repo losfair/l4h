@@ -201,6 +201,7 @@ pub struct ConsoleRing {
 pub const fn vmm_chan_va(d: usize) -> usize {
     SHARED_VA + 0x1000_0000 + d * 0x100_0000
 }
+const _: () = assert!(gpu::SHARED_VA == SHARED_VA && vmm_chan_va(VMM_MAX_DEVICES) <= gpu::VMM_DISPLAY_VA);
 
 /// Badges of the VMM's bound notification: bit d = kick from guest device d,
 /// bit 32 + d = completion from the backend of device d.

@@ -10,7 +10,7 @@
 use core::sync::atomic::{Ordering, fence};
 
 use l4h_rt::host::fixed::ArrayVec;
-use l4h_rt::host::gpu::{DisplayHeader, IMAGE_OFFSET, STATE_PAGES, VMM_GPU_STATE_VA, display_pages, image_bytes};
+use l4h_rt::host::gpu::{DisplayHeader, IMAGE_OFFSET, STATE_PAGES, VMM_GPU_STATE_VA, display_pages, image_bytes, resource_bytes};
 
 use crate::dev::Backend;
 use crate::guest::GuestMem;
@@ -309,7 +309,7 @@ impl Gpu {
                     return (RESP_ERR_INVALID_RESOURCE_ID, 0);
                 }
                 if !FORMATS.contains(&format) || width == 0 || height == 0
-                    || width as u64 * height as u64 * 4 > MAX_RESOURCE_BYTES
+                    || resource_bytes(width, height).is_none_or(|n| n > MAX_RESOURCE_BYTES)
                 {
                     return (RESP_ERR_INVALID_PARAMETER, 0);
                 }
@@ -370,7 +370,8 @@ impl Gpu {
                     total += len as u64;
                 }
                 let r = &mut self.t.res[i];
-                if total < r.width as u64 * r.height as u64 * 4 {
+                // Its size was checked at creation.
+                if total < resource_bytes(r.width, r.height).unwrap_or(u64::MAX) {
                     return (RESP_ERR_INVALID_PARAMETER, 0);
                 }
                 r.first = start as u32;

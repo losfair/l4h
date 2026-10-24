@@ -23,10 +23,12 @@ echo "GPUTEST: created vm $id"
 l4hctl screenshot "$id" /tmp/none.ppm 2>/dev/null && fail "a screenshot before the guest shows anything"
 l4hctl console "$id" --until "GPUVM: showing 1" --timeout "$((90 * slow))" > /tmp/out || { cat /tmp/out; fail "no image 1"; }
 grep "GPUVM: FAIL" /tmp/out && fail "guest"
-# The last flush may still be on its way.
+# The last flush may still be on its way.  The guest draws the size of its
+# preferred mode, which may be a little smaller than the display.
 shot() {
+    drawn=$(sed -n 's/.*GPUVM: showing 1 \([0-9]*\)x\([0-9]*\).*/\1 \2/p' /tmp/out)
     for i in 1 2 3 4 5; do
-        l4hctl screenshot "$id" /tmp/s.ppm && /bin/gpucheck /tmp/s.ppm "$w" "$h" "$1" && return 0
+        l4hctl screenshot "$id" /tmp/s.ppm && /bin/gpucheck /tmp/s.ppm "$w" "$h" "$1" $drawn && return 0
         sleep 1
     done
     return 1
@@ -37,6 +39,15 @@ shot 2 || fail "image 2"
 l4hctl send "$id" --wait "GPUVM: off" --timeout "$((30 * slow))" off > /dev/null || fail "off"
 l4hctl screenshot "$id" /tmp/s.ppm 2>/dev/null && fail "a screenshot of a display that is off"
 l4hctl destroy "$id" || fail "destroy"
+
+# An odd number of pixels, so not a whole number of words: the guest
+# draws 64x65, and the last pixel, read last, must be black.
+w=65 h=65
+id=$(l4hctl create odd --initrd /bin/gpuvm.cpio.gz --mem 128 --gpu ${w}x$h \
+    --cmdline "console=hvc0 gpusize=${w}x$h") || fail "create ${w}x$h"
+l4hctl console "$id" --until "GPUVM: showing 1" --timeout "$((90 * slow))" > /tmp/out || { cat /tmp/out; fail "no ${w}x$h image"; }
+shot 1 || fail "${w}x$h image"
+l4hctl destroy "$id" || fail "destroy ${w}x$h"
 free=$(l4hctl info | sed -n 's/memory: \([0-9]*\) MiB free.*/\1/p')
 [ "$free" = "$free0" ] || fail "memory leak: $free0 -> $free MiB"
 echo "GPUTEST: PASS"

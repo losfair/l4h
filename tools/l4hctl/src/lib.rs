@@ -235,46 +235,108 @@ impl Ctl {
     /// is returned, which may mix two frames).
     pub fn screenshot(&self, vm: u64) -> Result<Screen> {
         let mut chunk = vec![0u8; CTL_LOAD_MAX];
-        let mut last = None;
-        for _ in 0..20 {
-            let mut s = Screen { width: 0, height: 0, stride: 0, format: 0, frame: 0, data: Vec::new() };
-            let mut torn = false;
-            loop {
-                let off = s.data.len() as u64;
-                let r = self.call_out(CTL_GPU_READ, &[vm, off], &mut chunk)?;
-                if r.status == -11 {
-                    torn = true;
-                    break;
-                }
-                if r.status < 0 {
-                    return err(format!("screenshot: {}", errno_name(-r.status)));
-                }
-                let v = r.vals;
-                let n = v[0] as usize;
-                if off == 0 {
-                    (s.width, s.height, s.stride, s.format, s.frame) = (v[1] as u32, v[2] as u32, v[3] as u32, v[4] as u32, v[5]);
-                } else if v[5] != s.frame {
-                    torn = true;
-                    break;
-                }
-                if n > chunk.len() {
-                    return err("screenshot: bad length");
-                }
-                s.data.extend_from_slice(&chunk[..n]);
-                if n == 0 || s.data.len() >= s.stride as usize * s.height as usize {
-                    break;
-                }
-            }
-            if s.format == 0 {
-                return err("screenshot: the VM shows nothing");
-            }
-            if !torn {
-                return Ok(s);
-            }
-            last = Some(s);
+        read_screen(&mut chunk, |off, buf| {
+            let r = self.call_out(CTL_GPU_READ, &[vm, off], buf)?;
+            Ok((r.status, r.vals))
+        })
+    }
+}
+
+/// [`Ctl::screenshot`] on `read`, which makes CTL_GPU_READ from an offset
+/// into `chunk` and returns its status and values.
+fn read_screen(chunk: &mut [u8], mut read: impl FnMut(u64, &mut [u8]) -> Result<(i64, [u64; 6])>) -> Result<Screen> {
+    const EAGAIN: i64 = 11;
+    let mut last = None;
+    for attempt in 0..20 {
+        if attempt > 0 {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        last.filter(|s| s.data.len() >= s.stride as usize * s.height as usize).ok_or(Error("screenshot: the display keeps changing".into()))
+        let mut s = Screen { width: 0, height: 0, stride: 0, format: 0, frame: 0, data: Vec::new() };
+        let mut torn = false;
+        loop {
+            let off = s.data.len() as u64;
+            let (status, v) = read(off, chunk)?;
+            if status == -EAGAIN {
+                torn = true;
+                break;
+            }
+            if status < 0 {
+                return err(format!("screenshot: {}", errno_name(-status)));
+            }
+            let n = v[0] as usize;
+            if off == 0 {
+                (s.width, s.height, s.stride, s.format, s.frame) = (v[1] as u32, v[2] as u32, v[3] as u32, v[4] as u32, v[5]);
+            } else if v[5] != s.frame {
+                torn = true;
+                break;
+            }
+            if n > chunk.len() {
+                return err("screenshot: bad length");
+            }
+            s.data.extend_from_slice(&chunk[..n]);
+            if n == 0 || s.data.len() >= s.stride as usize * s.height as usize {
+                break;
+            }
+        }
+        // A torn read says nothing yet, not even whether anything is shown.
+        if torn {
+            if s.format != 0 && s.data.len() >= s.stride as usize * s.height as usize {
+                last = Some(s);
+            }
+            continue;
+        }
+        if s.format == 0 {
+            return err("screenshot: the VM shows nothing");
+        }
+        return Ok(s);
+    }
+    last.ok_or(Error("screenshot: the display keeps changing".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A 2 x 2 display of format 2, frame 4, served 8 bytes at a time.
+    fn display(off: u64, buf: &mut [u8], frame: u64) -> Result<(i64, [u64; 6])> {
+        let img: Vec<u8> = (0..16).collect();
+        let n = (16 - off as usize).min(8);
+        buf[..n].copy_from_slice(&img[off as usize..off as usize + n]);
+        Ok((0, [n as u64, 2, 2, 8, 2, frame]))
+    }
+
+    #[test]
+    fn first_read_torn_is_read_again() {
+        let mut chunk = [0u8; 8];
+        let mut calls = 0;
+        let s = read_screen(&mut chunk, |off, buf| {
+            calls += 1;
+            if calls == 1 { Ok((-11, [0; 6])) } else { display(off, buf, 4) }
+        })
+        .unwrap();
+        assert_eq!((s.width, s.height, s.format, s.frame), (2, 2, 2, 4));
+        assert_eq!(s.data, (0..16).collect::<Vec<u8>>());
+    }
+
+    #[test]
+    fn frames_must_match_across_chunks() {
+        let mut chunk = [0u8; 8];
+        let mut calls = 0;
+        let s = read_screen(&mut chunk, |off, buf| {
+            calls += 1;
+            // The second chunk of the first read is of a later frame.
+            display(off, buf, if calls == 2 { 6 } else { 4 + 2 * (calls > 2) as u64 })
+        })
+        .unwrap();
+        assert_eq!(s.frame, 6);
+        assert_eq!(calls, 4);
+    }
+
+    #[test]
+    fn nothing_shown_is_an_error() {
+        let mut chunk = [0u8; 8];
+        let e = read_screen(&mut chunk, |_, _| Ok((0, [0, 2, 2, 8, 0, 2]))).err().unwrap();
+        assert!(e.0.contains("shows nothing"), "{}", e.0);
     }
 }
 

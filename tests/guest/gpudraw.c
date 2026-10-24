@@ -2,7 +2,8 @@
  * A guest of tests/run-gputest.sh: shows image 1 (gpu-pattern.h) on its
  * virtio-gpu, then on each line of console input the next step: "flip"
  * flips to image 2, "off" turns the display off.  Usage: gpudraw WxH,
- * the size the host gave the display, which must be the preferred mode.
+ * the size the host gave the display.  The preferred mode is that size,
+ * or the driver's CVT mode a little smaller (its width a multiple of 8).
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -99,8 +100,10 @@ int main(int argc, char **argv)
 	for (uint32_t i = 0; i < conn.count_modes; i++)
 		if (modes[i].type & DRM_MODE_TYPE_PREFERRED)
 			mode = &modes[i];
-	if (!mode || mode->hdisplay != w || mode->vdisplay != h)
-		DIE("preferred mode %ux%u, not %ux%u", mode ? mode->hdisplay : 0, mode ? mode->vdisplay : 0, w, h);
+	if (!mode || mode->hdisplay > w || mode->hdisplay + 16 < w || mode->vdisplay > h || mode->vdisplay + 16 < h)
+		DIE("preferred mode %ux%u for a %ux%u display", mode ? mode->hdisplay : 0, mode ? mode->vdisplay : 0, w, h);
+	w = mode->hdisplay;
+	h = mode->vdisplay;
 
 	fb1 = make_fb(fd, w, h, 1);
 	fb2 = make_fb(fd, w, h, 2);
