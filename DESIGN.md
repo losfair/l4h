@@ -116,11 +116,15 @@ Configuration:
   enable.
 - `KernelSkimWindow=OFF`, required by patch 0004's preservation of user
   RSP across syscalls. l4h targets CPUs unaffected by Meltdown (see below).
-  **Nothing checks this at boot.** On a CPU affected by Meltdown
-  (`IA32_ARCH_CAPABILITIES.RDCL_NO` clear: most Intel parts before Cascade
-  Lake, such as GCE N1 and E2 on Skylake or Broadwell hosts) any guest
-  thread can read the kernel window, which maps all RAM, including other
-  guests' memory. Do not deploy l4h on such CPUs.
+  On a CPU affected by Meltdown (`IA32_ARCH_CAPABILITIES.RDCL_NO` clear:
+  most Intel parts before Cascade Lake, such as GCE N1 and E2 on Skylake
+  or Broadwell hosts) any guest thread could read the kernel window, which
+  maps all RAM, including other guests' memory. The kernel refuses to boot
+  there: seL4 already did when the MSR reports the CPU vulnerable, and
+  patch 0024 also does on Intel CPUs that do not enumerate the MSR, which
+  cannot report RDCL_NO. AMD CPUs, which are not affected, need no MSR.
+  KVM always provides the MSR to `-cpu host` guests (`tools/run-qemu.sh`),
+  with RDCL_NO set unless the host is affected.
 
 Release builds turn the debug syscalls off but keep kernel printing on, for
 the host components' serial log: `seL4_DebugPutChar` and
@@ -335,8 +339,8 @@ guest. Where there is an AMD IOMMU, root drives it itself (§8.5).
   path and the fastpath. It requires `KernelSkimWindow=OFF`, the Meltdown
   mitigation. The CPUs l4h targets, such as GCP N2 (Cascade Lake and Ice
   Lake), C3/N4/C4 (Sapphire Rapids and later) and recent AMD parts, are not
-  affected by Meltdown. Neither the kernel nor `l4h-root` checks this at
-  boot (see the configuration above). A kernel built with the SKIM window
+  affected by Meltdown. On the others the kernel refuses to boot (0024 and
+  the configuration above). A kernel built with the SKIM window
   ignores `seL4_TCBFlag_trapSyscalls`, and the guest then panics rather
   than run Linux processes untrapped.
 - **0005, SMP IPI barrier.** `ipi_wait()` reset its arrival counter and
@@ -447,6 +451,12 @@ guest. Where there is an AMD IOMMU, root drives it itself (§8.5).
   invalidation. Permission and other
   faults still go to the VSpace owner. The loader leaves `TCR_EL1.HA` off;
   enabling hardware AF updates on FEAT_HAFDBS CPUs is a future optimization.
+- **0024, no boot without RDCL_NO (x86).** seL4 refused to boot without
+  the SKIM window when `IA32_ARCH_CAPABILITIES` reports the CPU vulnerable
+  to Meltdown, but only warned when an Intel CPU does not enumerate the
+  MSR. Intel CPUs that are not vulnerable report RDCL_NO, which needs the
+  MSR, so such a CPU is vulnerable (Linux treats it so too), and l4h runs
+  without the SKIM window (0004). It now refuses to boot there as well.
 - E1 (`trapSyscalls`) is our fix for seL4 issue #477, which is still open
   upstream. Without it, Linux syscalls whose syscall-number register
   happens to hold a valid seL4 syscall number are executed as seL4

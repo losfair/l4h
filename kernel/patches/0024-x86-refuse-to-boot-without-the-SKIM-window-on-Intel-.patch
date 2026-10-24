@@ -1,0 +1,53 @@
+From d93b5fc4612f4f7a752e0ddac80dc63287063582 Mon Sep 17 00:00:00 2001
+From: l4h <z@univalence.me>
+Date: Sat, 24 Oct 2026 06:06:02 +0000
+Subject: [PATCH] x86: refuse to boot without the SKIM window on Intel CPUs
+ without RDCL_NO
+
+seL4 refuses to boot without the SKIM window when IA32_ARCH_CAPABILITIES
+reports that the CPU is vulnerable to Rogue Data Cache Load (Meltdown),
+but only warns when an Intel CPU does not enumerate that MSR at all.
+Intel CPUs that are not vulnerable report RDCL_NO, which needs the MSR,
+so one without it is vulnerable (Linux treats it so too): every user
+thread could read all of memory through the kernel window.  Refuse to
+boot in that case as well.
+
+Also end the existing refusal's message with a newline.
+---
+ src/arch/x86/kernel/boot_sys.c | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/src/arch/x86/kernel/boot_sys.c b/src/arch/x86/kernel/boot_sys.c
+index f6f0ec464..744f4b983 100644
+--- a/src/arch/x86/kernel/boot_sys.c
++++ b/src/arch/x86/kernel/boot_sys.c
+@@ -479,7 +479,7 @@ static BOOT_CODE bool_t try_boot_sys(void)
+                    "yet SKIM window is enabled. Performance is needlessly being impacted, consider disabling.\n");
+         } else if (!ia32_arch_capabilities_msr_get_rdcl_no(cap_msr) && !config_set(CONFIG_KERNEL_SKIM_WINDOW)) {
+             printf("CPU reports vulnerable to Rogue Data Cache Load (aka Meltdown https://meltdownattack.com) "
+-                   "yet SKIM window is *not* enabled. Please re-build with SKIM window enabled.");
++                   "yet SKIM window is *not* enabled. Please re-build with SKIM window enabled.\n");
+             return false;
+         }
+     } else {
+@@ -489,9 +489,15 @@ static BOOT_CODE bool_t try_boot_sys(void)
+                    "not necessary for AMD and performance is being needlessly affected, "
+                    "consider disabling\n");
+         }
++        /* Intel CPUs that are not vulnerable report RDCL_NO, which needs
++         * IA32_ARCH_CAPABILITIES: one without it is treated as vulnerable,
++         * as Linux does.  Without the SKIM window any user thread could
++         * then read all of memory through the kernel window. */
+         if (!config_set(CONFIG_KERNEL_SKIM_WINDOW) && x86_cpuid_get_identity()->vendor == X86_VENDOR_INTEL) {
+-            printf("***WARNING*** SKIM window not enabled, this machine is probably vulnerable "
+-                   "to Meltdown (https://www.meltdownattack.com), consider enabling\n");
++            printf("CPU does not report RDCL_NO (no IA32_ARCH_CAPABILITIES), so is probably vulnerable "
++                   "to Rogue Data Cache Load (aka Meltdown https://meltdownattack.com), "
++                   "yet SKIM window is *not* enabled. Please re-build with SKIM window enabled.\n");
++            return false;
+         }
+     }
+ 
+-- 
+2.47.3
+
