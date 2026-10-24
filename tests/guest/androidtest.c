@@ -487,7 +487,8 @@ static void test_mremap_dontunmap(void)
 	CHECK(heap != MAP_FAILED, "mmap");
 	for (int i = 0; i < 8; i++)
 		fill(heap + i * PAGE, PAGE, 50 + i);
-	moved = mremap(heap, 8 * PAGE, 8 * PAGE, MREMAP_MAYMOVE | MREMAP_DONTUNMAP);
+	/* With MREMAP_DONTUNMAP the new address is read, as a hint. */
+	moved = mremap(heap, 8 * PAGE, 8 * PAGE, MREMAP_MAYMOVE | MREMAP_DONTUNMAP, NULL);
 	CHECK(moved != MAP_FAILED && moved != heap, "MREMAP_DONTUNMAP");
 	for (int i = 0; i < 8; i++)
 		CHECK(filled(moved + i * PAGE, PAGE, 50 + i), "moved page %d", i);
