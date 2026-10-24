@@ -7,6 +7,8 @@
  * come from a user buffer: they are staged in the device's data area, a
  * host-owned region (l4h-root never reads guest RAM). VM_LOAD uses offset
  * zero; BLK_WRITE uses the staged bytes only when its zero flag is clear.
+ * GPU_READ goes the other way: l4h-root leaves the bytes there, and they
+ * are copied to the user buffer.
  */
 #include <linux/fs.h>
 #include <linux/init.h>
@@ -75,6 +77,18 @@ static long l4hctl_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 	}
 	memset(resp, 0, sizeof(*resp));
 	l4h_hypercall(L4H_HC_CTL, &mr, 0, 1);
+	if (req->op == L4H_CTL_GPU_READ && !resp->status) {
+		unsigned long n = resp->vals[0];
+
+		if (n > stage_size || n > call.len) {
+			ret = -EINVAL;
+			goto out;
+		}
+		if (copy_to_user(u64_to_user_ptr(call.buf), stage, n)) {
+			ret = -EFAULT;
+			goto out;
+		}
+	}
 	if (copy_to_user(u64_to_user_ptr(call.resp), resp, sizeof(*resp)))
 		ret = -EFAULT;
 out:

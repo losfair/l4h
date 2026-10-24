@@ -76,6 +76,8 @@ jobs:
         run: tests/run-bpftest.sh
       - name: Android kernel features
         run: tests/run-androidtest.sh
+      - name: Display (virtio-gpu)
+        run: tests/run-gputest.sh
       - name: Block pass-through (virtio-blk)
         run: tests/run-blktest.sh
       - name: Block pass-through (NVMe)
@@ -220,6 +222,8 @@ jobs:
         run: L4H_QEMU_CPU=max tests/run-bpftest.sh
       - name: Android kernel features
         run: tests/run-androidtest.sh
+      - name: Display (virtio-gpu)
+        run: tests/run-gputest.sh
       - name: Block pass-through (virtio-blk and NVMe)
         run: tests/run-blktest.sh && BLKTEST_DEV=nvme tests/run-blktest.sh
       - name: Control API

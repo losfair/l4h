@@ -102,10 +102,14 @@ regions! {
     /// The IOMMUs' device table, I/O page tables, command buffers and
     /// event logs, in 2 MiB chunks (amdvi.rs, vtd.rs): page tables for 4 TiB.
     IOMMU_TABLES = 0x7900_0000_0000, 8 * GIB;
+    /// Each guest's virtio-gpu display area, DISPLAY_STRIDE apart (gpu.rs).
+    DISPLAY = 0x7a00_0000_0000, crate::MAX_GUESTS * DISPLAY_STRIDE;
 }
 
 /// Distance between two guests' pages in GUEST_PAGES.
 pub const GUEST_STRIDE: usize = MIB;
+/// Distance between two guests' display areas in DISPLAY.
+pub const DISPLAY_STRIDE: usize = 16 * MIB;
 
 /// Check that what seL4 mapped for the root task (image, IPC buffer, boot
 /// info) lies in IMAGE.

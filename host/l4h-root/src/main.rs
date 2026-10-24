@@ -27,6 +27,7 @@ mod dashboard;
 mod devmem;
 mod elf;
 mod font;
+mod gpu;
 mod guest;
 mod iommu;
 mod kimage;
@@ -374,7 +375,8 @@ impl Host {
             if g.state != State::Created || g.vmm.is_some() {
                 return Err(ctl::EBUSY);
             }
-            if !g.reserve(&mut h.alloc, vmm::start_bytes(g.pool.size, g.vcpus.len(), g.devices.len())) {
+            let maps: usize = g.backends.iter().map(|(_, b)| b.map_bytes()).sum();
+            if !g.reserve(&mut h.alloc, vmm::start_bytes(g.pool.size, g.vcpus.len(), g.devices.len()) + maps) {
                 return Err(ctl::ENOMEM);
             }
             if let Some(t) = &mut h.trustd {
@@ -414,6 +416,42 @@ impl Host {
             g.backends.must_push((d, backend));
             g.ports.must_push(p);
             Ok(mac)
+        })
+        .ok_or(ctl::ENOENT)?
+    }
+
+    /// Give guest `id` (before it starts) a virtio-gpu device with one
+    /// scanout of `width` x `height` pixels.
+    pub fn attach_gpu(&mut self, id: usize, width: u64, height: u64) -> Result<(), i64> {
+        if !gpu::valid_size(width, height) {
+            return Err(ctl::EINVAL);
+        }
+        let (width, height) = (width as u32, height as u32);
+        let bytes = gpu::attach_bytes(width, height);
+        let pages = host::gpu::display_pages(width, height);
+        // The display area's mappings in the root task: a slot and page
+        // tables, from the global allocator.
+        if !self.can_afford(bytes + gpu::table_bytes(pages), 0, pages) {
+            return Err(ctl::ENOMEM);
+        }
+        self.with_guest(id, |h, g| {
+            if g.state != State::Created || g.vmm.is_some() || g.gpu.is_some() {
+                return Err(ctl::EBUSY);
+            }
+            // The guest's buffers bounce through the pool.
+            if g.pool.size < l4h_abi::GPU_POOL_IMAGES * host::gpu::image_bytes(width, height) {
+                return Err(ctl::EINVAL);
+            }
+            if g.devices.len() >= guest::MAX_GUEST_DEVICES {
+                return Err(ctl::ENOSPC);
+            }
+            if !g.reserve(&mut h.alloc, bytes) {
+                return Err(ctl::ENOMEM);
+            }
+            let backend = gpu::attach(g, &mut h.alloc, width, height);
+            let d = g.add_device(&mut h.alloc, guest::DevKind::Virtio(16)).expect("guest device room checked");
+            g.backends.must_push((d, backend));
+            Ok(())
         })
         .ok_or(ctl::ENOENT)?
     }

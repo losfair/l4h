@@ -6,6 +6,7 @@
 
 pub mod blk;
 pub mod fixed;
+pub mod gpu;
 pub mod iopool;
 pub mod memd;
 pub mod net;
@@ -122,6 +123,10 @@ pub const VDEV_CONSOLE: u32 = 0;
 pub const VDEV_BLK: u32 = 1;
 pub const VDEV_NET: u32 = 2;
 pub const VDEV_CTL: u32 = 3;
+/// virtio-gpu: chan_va is its display area (gpu::VMM_DISPLAY_VA, chan_size
+/// bytes), its tables are at gpu::VMM_GPU_STATE_VA, and width and height
+/// are its scanout's.
+pub const VDEV_GPU: u32 = 4;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -144,6 +149,9 @@ pub struct VmmDevice {
     pub capacity: u64,
     pub read_only: u32,
     pub reserved1: u32,
+    /// VDEV_GPU: the scanout's size in pixels.
+    pub width: u32,
+    pub height: u32,
 }
 
 #[repr(C)]

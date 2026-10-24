@@ -423,7 +423,25 @@ enum l4h_ctl_op {
 	 * version in UTF-8, without a terminating NUL (e.g. v2026.10.1).
 	 * This is independent of L4H_CTL_VERSION, the control ABI version. */
 	L4H_CTL_HOST_VERSION = 25,
+	/* args: vm, width, height.  Before VM_START: give the VM a virtio-gpu
+	 * device (2D, one scanout of width x height pixels, each from
+	 * L4H_GPU_MIN to L4H_GPU_MAX_WIDTH / L4H_GPU_MAX_HEIGHT) whose image
+	 * GPU_READ returns.  One per VM; its I/O pool must hold
+	 * L4H_GPU_POOL_IMAGES images, since the guest's buffers live there. */
+	L4H_CTL_GPU_ATTACH = 26,
+	/* args: vm, byte offset -> the VM's scanout image from that offset in
+	 * the control data area, up to L4H_CTL_LOAD_MAX bytes; vals: bytes,
+	 * width, height, stride (bytes from one row to the next), format (a
+	 * VIRTIO_GPU_FORMAT_*, 4 bytes a pixel; 0 while nothing is shown),
+	 * frame (it changes with every update).  -EAGAIN if the guest updated
+	 * the image while it was copied. */
+	L4H_CTL_GPU_READ = 27,
 };
+
+#define L4H_GPU_MIN             64
+#define L4H_GPU_MAX_WIDTH       1920
+#define L4H_GPU_MAX_HEIGHT      1200
+#define L4H_GPU_POOL_IMAGES     4
 
 #define L4H_IOMMU_NONE          0 /* none found, or none l4h drives */
 #define L4H_IOMMU_OFF           1 /* iommu=0 */

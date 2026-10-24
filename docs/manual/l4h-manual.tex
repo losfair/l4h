@@ -809,6 +809,7 @@ l4hctl create NAME [--initrd FILE] [--mem MB] [--vcpus N]
        [--cmdline STRING] [--io-pool MB]
        [--disk DISK[,ro][,start=SECTOR][,sectors=N]]...
        [--nic SWITCH[,mac=MAC][,nolock][,isolated]]...
+       [--gpu WxH]
 \end{lstlisting}
 
 \cmd{create} builds a VM, attaches its devices, loads its initramfs from
@@ -844,6 +845,9 @@ fails, it destroys the half-built VM.
   \item[\texttt{--nic ...}] Add a vNIC on a switch
     (Chapter~\ref{ch:network}). Repeat it for more vNICs; they appear as
     \texttt{eth0}, \texttt{eth1}, \ldots{} in the order given.
+  \item[\texttt{--gpu WxH}] A display of W by H pixels (64 to 1920 by 64
+    to 1200), Section~\ref{sec:display}. Without \texttt{--io-pool}, the
+    pool is sized for it.
 \end{description}
 
 A VM has at most 16 devices, counting its console.
@@ -905,6 +909,29 @@ l4hctl send VM [--wait PATTERN [--timeout SECS]] TEXT...
 
 The console of every guest is also copied to the host's serial port, which
 helps when you debug a guest that dom0 cannot reach.
+
+\section{Displays}
+\label{sec:display}
+
+A VM created with \texttt{--gpu WxH} has a virtio-gpu device with one
+display of that size, which it reports as its preferred mode. The guest
+needs the \texttt{virtio\_gpu} module, from the module tree
+(Section~\ref{sec:kmods}):
+\begin{lstlisting}
+modprobe virtio_gpu
+\end{lstlisting}
+It is a 2D device: guests draw in software, and there is no cursor plane,
+input device or EDID. The guest's buffers live in its I/O pool, which
+must hold four images of the display (for 1024x768, 16~MiB);
+\cmd{create} picks such a pool unless \texttt{--io-pool} is given.
+
+dom0 reads what a VM shows with
+\begin{lstlisting}
+l4hctl screenshot VM FILE
+\end{lstlisting}
+which writes a binary PPM image. It fails while the VM shows nothing. The
+host keeps one image per display, about 10~MiB for the largest; nothing
+yet shows it live.
 
 \section{Setting the machine's real-time clock}
 

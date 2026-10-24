@@ -41,6 +41,9 @@ pub const CTL_HOST_REBOOT: u32 = 22;
 pub const CTL_RTC_SET: u32 = 23;
 pub const CTL_IOMMU_INFO: u32 = 24;
 pub const CTL_HOST_VERSION: u32 = 25;
+pub const CTL_GPU_ATTACH: u32 = 26;
+pub const CTL_GPU_READ: u32 = 27;
+pub const GPU_POOL_IMAGES: u64 = 4;
 pub const IOMMU_NONE: u64 = 0;
 pub const IOMMU_OFF: u64 = 1;
 pub const IOMMU_ON: u64 = 2;
@@ -133,6 +136,7 @@ pub fn errno_name(e: i64) -> &'static str {
         1 => "operation not permitted",
         2 => "no such VM or device",
         5 => "I/O error",
+        11 => "try again",
         12 => "out of memory",
         16 => "busy",
         22 => "invalid argument",
@@ -153,24 +157,124 @@ impl Ctl {
     }
 
     pub fn call(&self, op: u32, args: &[u64], data: &[u8], buf: &[u8]) -> Result<Box<Resp>> {
-        let mut req = Box::new(Req { op, version: CTL_VERSION, args: [0; 6], data: [0; CTL_DATA_MAX] });
-        req.args[..args.len()].copy_from_slice(args);
-        req.data[..data.len()].copy_from_slice(data);
-        let mut resp = Box::new(Resp { status: 0, vals: [0; 6], data: [0; CTL_DATA_MAX] });
-        let call = Call {
-            req: &*req as *const Req as u64,
-            resp: &mut *resp as *mut Resp as u64,
-            buf: buf.as_ptr() as u64,
-            len: buf.len() as u64,
-        };
-        let r = unsafe { ioctl(self.dev.as_raw_fd(), L4HCTL_IOC_CALL, &call as *const Call) };
-        if r < 0 {
-            return err(format!("ioctl: {}", io::Error::last_os_error()));
-        }
+        self.call_buf(op, args, data, buf.as_ptr() as u64, buf.len())
+    }
+
+    /// A call whose response bytes the driver copies into `out`
+    /// (CTL_GPU_READ); the call's status, which may be an error.
+    pub fn call_out(&self, op: u32, args: &[u64], out: &mut [u8]) -> Result<Box<Resp>> {
+        let ptr = out.as_mut_ptr() as u64;
+        self.raw_call(op, args, &[], ptr, out.len())
+    }
+
+    fn call_buf(&self, op: u32, args: &[u64], data: &[u8], buf: u64, len: usize) -> Result<Box<Resp>> {
+        let resp = self.raw_call(op, args, data, buf, len)?;
         if resp.status < 0 {
             return err(format!("request {op} failed: {}", errno_name(-resp.status)));
         }
         Ok(resp)
+    }
+
+    fn raw_call(&self, op: u32, args: &[u64], data: &[u8], buf: u64, len: usize) -> Result<Box<Resp>> {
+        let mut req = Box::new(Req { op, version: CTL_VERSION, args: [0; 6], data: [0; CTL_DATA_MAX] });
+        req.args[..args.len()].copy_from_slice(args);
+        req.data[..data.len()].copy_from_slice(data);
+        let mut resp = Box::new(Resp { status: 0, vals: [0; 6], data: [0; CTL_DATA_MAX] });
+        let call = Call { req: &*req as *const Req as u64, resp: &mut *resp as *mut Resp as u64, buf, len: len as u64 };
+        let r = unsafe { ioctl(self.dev.as_raw_fd(), L4HCTL_IOC_CALL, &call as *const Call) };
+        if r < 0 {
+            return err(format!("ioctl: {}", io::Error::last_os_error()));
+        }
+        Ok(resp)
+    }
+}
+
+/// A VM's display, from [`Ctl::screenshot`]: `width` x `height` pixels,
+/// each 4 bytes of `format` (a VIRTIO_GPU_FORMAT_*), rows `stride` apart.
+pub struct Screen {
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub format: u32,
+    /// Changes with every update of the display.
+    pub frame: u64,
+    pub data: Vec<u8>,
+}
+
+impl Screen {
+    /// Pixel (x, y) as (r, g, b).
+    pub fn rgb(&self, x: u32, y: u32) -> Option<(u8, u8, u8)> {
+        // Byte positions of red, green and blue in each format.
+        let (r, g, b) = match self.format {
+            1 | 2 => (2, 1, 0),     // B8G8R8A8, B8G8R8X8
+            3 | 4 => (1, 2, 3),     // A8R8G8B8, X8R8G8B8
+            67 | 134 => (0, 1, 2),  // R8G8B8A8, R8G8B8X8
+            68 | 121 => (3, 2, 1),  // X8B8G8R8, A8B8G8R8
+            _ => return None,
+        };
+        let p = &self.data[y as usize * self.stride as usize + x as usize * 4..][..4];
+        Some((p[r], p[g], p[b]))
+    }
+
+    /// As a binary PPM (P6).
+    pub fn ppm(&self) -> Result<Vec<u8>> {
+        let mut out = format!("P6\n{} {}\n255\n", self.width, self.height).into_bytes();
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let (r, g, b) = self.rgb(x, y).ok_or(Error(format!("unknown pixel format {}", self.format)))?;
+                out.extend_from_slice(&[r, g, b]);
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl Ctl {
+    /// The VM's display, read whole from one frame: a read that the VM
+    /// updated meanwhile is read again (a few times; then the last read
+    /// is returned, which may mix two frames).
+    pub fn screenshot(&self, vm: u64) -> Result<Screen> {
+        let mut chunk = vec![0u8; CTL_LOAD_MAX];
+        let mut last = None;
+        for _ in 0..20 {
+            let mut s = Screen { width: 0, height: 0, stride: 0, format: 0, frame: 0, data: Vec::new() };
+            let mut torn = false;
+            loop {
+                let off = s.data.len() as u64;
+                let r = self.call_out(CTL_GPU_READ, &[vm, off], &mut chunk)?;
+                if r.status == -11 {
+                    torn = true;
+                    break;
+                }
+                if r.status < 0 {
+                    return err(format!("screenshot: {}", errno_name(-r.status)));
+                }
+                let v = r.vals;
+                let n = v[0] as usize;
+                if off == 0 {
+                    (s.width, s.height, s.stride, s.format, s.frame) = (v[1] as u32, v[2] as u32, v[3] as u32, v[4] as u32, v[5]);
+                } else if v[5] != s.frame {
+                    torn = true;
+                    break;
+                }
+                if n > chunk.len() {
+                    return err("screenshot: bad length");
+                }
+                s.data.extend_from_slice(&chunk[..n]);
+                if n == 0 || s.data.len() >= s.stride as usize * s.height as usize {
+                    break;
+                }
+            }
+            if s.format == 0 {
+                return err("screenshot: the VM shows nothing");
+            }
+            if !torn {
+                return Ok(s);
+            }
+            last = Some(s);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        last.filter(|s| s.data.len() >= s.stride as usize * s.height as usize).ok_or(Error("screenshot: the display keeps changing".into()))
     }
 }
 
@@ -209,6 +313,14 @@ pub struct VmSpec<'a> {
     pub io_pool: u64,
     /// (switch, MAC or 0, NIC_* flags)
     pub nics: Vec<(u64, u64, u64)>,
+    /// A virtio-gpu with one scanout of (width, height).
+    pub gpu: Option<(u64, u64)>,
+}
+
+/// The I/O pool a VM with a GPU of `width` x `height` gets by default: its
+/// buffers, CTL_GPU_POOL_IMAGES images, and 4 MiB for its other devices.
+pub fn gpu_io_pool(width: u64, height: u64) -> u64 {
+    (GPU_POOL_IMAGES * width * height * 4 + (4 << 20)).next_power_of_two()
 }
 
 /// A VM as listed by [`Ctl::vm_list`].
@@ -298,7 +410,11 @@ impl Ctl {
         let mut name = [0u8; CTL_NAME_MAX];
         let n = o.name.len().min(CTL_NAME_MAX - 1);
         name[..n].copy_from_slice(&o.name.as_bytes()[..n]);
-        let resp = self.call(CTL_VM_CREATE, &[o.mem, o.vcpus, 0, 0, o.io_pool], &name, &[])?;
+        let io_pool = match (o.io_pool, o.gpu) {
+            (0, Some((w, h))) => gpu_io_pool(w, h),
+            (p, _) => p,
+        };
+        let resp = self.call(CTL_VM_CREATE, &[o.mem, o.vcpus, 0, 0, io_pool], &name, &[])?;
         let (vm, initrd_gpa) = (resp.vals[0], resp.vals[1]);
         let r = (|| {
             for &(disk, ro, start, sectors) in &o.disks {
@@ -307,6 +423,9 @@ impl Ctl {
             let mut macs = Vec::new();
             for &(sw, mac, flags) in &o.nics {
                 macs.push(self.call(CTL_NIC_CREATE, &[vm, sw, mac, flags], &[], &[])?.vals[0]);
+            }
+            if let Some((w, h)) = o.gpu {
+                self.call(CTL_GPU_ATTACH, &[vm, w, h], &[], &[])?;
             }
             if !o.initrd.is_empty() {
                 load(self, vm, initrd_gpa, o.initrd)?;

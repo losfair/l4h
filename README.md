@@ -38,6 +38,8 @@ Third-party components, including the submodules in `kernel/seL4` and
     SELinux, PSI, bootconfig, userfaultfd, an RTC with alarms, dma-buf
     heaps, a vkms display as a module), off for other guests unless they
     ask. Android itself has not been booted yet.
+  - A virtio-gpu display (2D) for VMs, `l4hctl create --gpu WxH`, which dom0
+    reads with `l4hctl screenshot`.
 - **Block.** Passed-through virtio-blk, virtio-scsi and NVMe disks, or read-only and
   partial (LBA window) slices of them. I/O is zero-copy: devices DMA
   straight into guest memory.

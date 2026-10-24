@@ -262,6 +262,9 @@ pub struct Guest {
     pub launch: Option<[u8; 32]>,
     /// Bytes of the module image mapped at KMOD_VA (kimage.rs), 0 if none.
     pub kmod_size: usize,
+    /// Its virtio-gpu's scanout size, if it has one; the display area is
+    /// mapped at gpu::root_display_va(id).
+    pub gpu: Option<(u32, u32)>,
 }
 
 pub(crate) fn abs(c: impl sel4::HasCPtrWithDepth) -> sel4::AbsoluteCPtr {
@@ -459,8 +462,13 @@ impl Guest {
     /// Map (a copy of) one of our frames into the root task.  The paging
     /// structures are global: the root region is reused by later guests.
     fn map_in_root(&mut self, alloc: &mut Alloc, frame: cap::Granule, va: usize) {
+        self.map_abs_in_root(alloc, &abs(frame), va);
+    }
+
+    /// map_in_root for a frame in any CNode.
+    pub(crate) fn map_abs_in_root(&mut self, alloc: &mut Alloc, frame: &sel4::AbsoluteCPtr, va: usize) {
         let copy = alloc.slots.alloc();
-        abs(root_cap::<cap_type::Null>(copy)).copy(&abs(frame), CapRights::all()).expect("root map copy");
+        abs(root_cap::<cap_type::Null>(copy)).copy(frame, CapRights::all()).expect("root map copy");
         alloc.global(|alloc| {
             map_frame(&mut ObjCtx::global(alloc), slot::VSPACE.cap(), root_cap::<cap_type::Granule>(copy), va, CapRights::read_write(), VmAttributes::DEFAULT);
         });
@@ -846,6 +854,7 @@ pub fn create(
         loaded: Ranges::default(),
         launch: None,
         kmod_size: 0,
+        gpu: None,
     };
 
     let Some(cnodes) = vmm::Cnodes::new(&mut g.arena, alloc, cfg.io_pool) else {

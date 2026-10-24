@@ -7,6 +7,7 @@
 
 mod blk;
 mod dev;
+mod gpu;
 mod guest;
 mod mem;
 mod net;
@@ -24,6 +25,7 @@ use crate::guest::{GuestMem, Vcpus};
 enum Dev {
     Blk(Device<blk::Blk>),
     Net(Device<net::Net>),
+    Gpu(Device<gpu::Gpu>),
 }
 
 impl Dev {
@@ -31,6 +33,7 @@ impl Dev {
         match self {
             Dev::Blk(d) => d.op(mem, vcpus, op, a, b),
             Dev::Net(d) => d.op(mem, vcpus, op, a, b),
+            Dev::Gpu(d) => d.op(mem, vcpus, op, a, b),
         }
     }
 
@@ -38,6 +41,7 @@ impl Dev {
         match self {
             Dev::Blk(d) => d.poll(mem, vcpus, 0),
             Dev::Net(d) => d.poll(mem, vcpus, 0),
+            Dev::Gpu(d) => d.poll(mem, vcpus, 0),
         }
     }
 
@@ -45,6 +49,7 @@ impl Dev {
         match self {
             Dev::Blk(d) => d.complete(mem, vcpus),
             Dev::Net(d) => d.complete(mem, vcpus),
+            Dev::Gpu(d) => d.complete(mem, vcpus),
         }
     }
 }
@@ -141,6 +146,11 @@ fn main(info: &'static Info) -> ! {
                     d.mac[..6].try_into().unwrap(),
                     rx_queue,
                 ),
+            )),
+            host::VDEV_GPU => Dev::Gpu(Device::new(
+                d.page_va as usize,
+                d.event,
+                gpu::Gpu::new(d.chan_va as usize, d.chan_size, d.width, d.height),
             )),
             k => panic!("l4h-vmm: unsupported device kind {}", k),
         };

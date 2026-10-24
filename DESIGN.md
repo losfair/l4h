@@ -1054,8 +1054,9 @@ memfd instead).
   hrtimer and has no output but its writeback connector; SurfaceFlinger
   composes onto it, and screen capture over adb (scrcpy, `screenrecord`)
   shows it. DRM and vkms are modules, from the module tree or Android's
-  ramdisk: vkms adds a display as soon as it is loaded. A display the host
-  can show would be a virtio-gpu device in l4h-vmm.
+  ramdisk: vkms adds a display as soon as it is loaded. The display the
+  host can show is l4h-vmm's virtio-gpu (§8.6), with the `virtio_gpu`
+  module.
 - **Not yet.** No suspend (`PM_SLEEP`, so no wakeup sources), no
   virtio-vsock and no 32-bit compat, so Android runs as a 64-bit-only
   build. Each guest has 64 process VSpaces (§5.3), which Android's
@@ -1514,6 +1515,7 @@ NAT, DHCP and firewalling belong in a VM.
   use the shared console device page.
 - **Control.** `l4hctl`, dom0 only (§9.1).
 - **RTC.** `/dev/rtc0`, with alarms, on the host's wall clock (§5.8).
+- **Display.** virtio-gpu, 2D (§8.6).
 - **Future devices.** virtio-rng, virtio-vsock and virtio-balloon.
 
 ### 8.5 IOMMU (AMD-Vi and Intel VT-d)
@@ -1713,6 +1715,47 @@ outside their mapped memory. It checks interrupt-abort traces for an
 unrelated requester's attempt to use the group's index and a group
 member's attempt to use an unallocated index.
 
+### 8.6 Display: virtio-gpu
+
+`l4h-vmm` serves a virtio-gpu device (2D, one scanout; `gpu.rs`), which
+dom0 gives a VM before it starts (`gpu_attach`, `l4hctl create --gpu
+WxH`), with the size its display reports as the preferred mode. The
+guest uses Linux's `virtio_gpu` driver, a module.
+
+- **The guest's buffers stay in its I/O pool.** As every virtio-l4h
+  device, it requires `VIRTIO_F_ACCESS_PLATFORM`, so a resource's backing
+  is the I/O pool pages the guest's DMA layer bounced the buffer into,
+  and the driver syncs the whole buffer there before every
+  `TRANSFER_TO_HOST_2D`. The backing therefore holds what the host
+  should show, and the VMM keeps no copy of any resource: a transfer only
+  checks its bounds. The I/O pool must hold four images of the scanout
+  (`GPU_POOL_IMAGES`); `l4hctl` sizes it so by default.
+- **The display area.** `RESOURCE_FLUSH` of the resource on the scanout
+  copies the flushed rectangle into the display area: a header (frame
+  counter, size, format) and the image, host frames that the VMM and root
+  both map. It is the one image the host keeps. The VMM writes it under
+  a seqlock (the frame counter is odd during an update), so root's reader
+  (`gpu_read`, 1 MiB per call into dom0's control data area) can tell a
+  torn copy, which it reports as `-EAGAIN`; `l4hctl screenshot` reads
+  again, and writes a PPM. Root takes the image's size from its own
+  record, not from the header the VMM writes.
+- **The VMM's tables** of resources and their backing (1024 resources,
+  65536 pieces of backing, merged where they are contiguous) live in
+  host frames of their own, mapped only in that VMM, so VMMs without a
+  GPU pay nothing for them. Commands complete at once and in order, so
+  a fence is done with its command. There is no cursor plane (the cursor
+  queue's commands are dropped), no EDID, no 3D, and no blob resources.
+- **Memory.** The display area and tables come from the guest's arena,
+  which destroy returns; root maps the display area at
+  `layout::DISPLAY`. A 1920 x 1200 display is about 10 MiB.
+
+`tests/run-gputest.sh` has a VM draw with DRM dumb buffers, then flip,
+then turn its display off, and checks every pixel of dom0's screenshots
+(`gpucheck`), and that the host refuses a display too small or an I/O
+pool too small for it, and that destroy returns the memory. Still to
+come: something that shows the display live (a VNC server in dom0 on
+`gpu_read`, or the host's own framebuffer), input, and a cursor.
+
 ---
 
 ## 9. Host components
@@ -1852,6 +1895,7 @@ little-endian structs defined in `include/l4h/abi.h` and mirrored in
 | Block | `blk_attach`: disk, read-only flag and LBA window; `disk_info`: PCI address, owner, failed flag and kind |
 | Network | `switch_create`, `switch_attach_uplink`, `nic_create` (MAC, MAC lock, isolation), `switch_info` (ports and counters), `nic_info` (PCI address, switch, MAC) |
 | Console | `console_read` (offset, bytes and lost-byte count), `console_write` |
+| Display | `gpu_attach` (scanout size), `gpu_read` (the image, 1 MiB at a time, its size, format and frame; §8.6) |
 
 Devices are attached before start and removed on destroy. Pause/resume,
 hotplug, switch deletion, I/O limits and asynchronous event queues remain

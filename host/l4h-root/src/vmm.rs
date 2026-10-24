@@ -77,6 +77,29 @@ pub enum Backend {
         /// CNode (radix 10) for the VMM's mapping capabilities of the port.
         keep: cap::CNode,
     },
+    /// virtio-gpu (gpu.rs): frame i < display_pages is page i of the
+    /// display area, the others are the VMM's tables.
+    Gpu {
+        frames: cap::CNode,
+        /// For the VMM's mapping capabilities, slot i = frame i.
+        keep: cap::CNode,
+        radix: usize,
+        display_pages: usize,
+        width: u32,
+        height: u32,
+    },
+}
+
+impl Backend {
+    /// Host memory, besides start_bytes, mapping it in the VMM takes.
+    pub fn map_bytes(&self) -> usize {
+        match self {
+            Backend::Gpu { display_pages, .. } => {
+                crate::gpu::table_bytes(*display_pages) + crate::gpu::table_bytes(host::gpu::STATE_PAGES)
+            }
+            _ => 0,
+        }
+    }
 }
 
 const SLOT_KICK_BASE: u64 = 32;
@@ -143,6 +166,13 @@ fn create(
                 dev.chan_size = (chan.len() * PAGE) as u64;
                 dev.chan_kick_slot = SLOT_KICK_BASE + d as u64;
                 dev.mac[..6].copy_from_slice(mac);
+            }
+            Backend::Gpu { display_pages, width, height, .. } => {
+                dev.kind = host::VDEV_GPU;
+                dev.chan_va = host::gpu::VMM_DISPLAY_VA as u64;
+                dev.chan_size = (display_pages * PAGE) as u64;
+                dev.width = *width;
+                dev.height = *height;
             }
         }
     }
@@ -218,6 +248,17 @@ fn map(g: &mut Guest, comp: &Component, backends: &[(usize, Backend)], alloc: &m
                     comp.map_copy(alloc, &mut g.arena, &fc, host::vmm_chan_va(d) + i * PAGE, CapRights::read_write(), attrs, dst);
                 }
                 comp.give(SLOT_KICK_BASE + d as u64, *kick, CapRights::write_only());
+            }
+            Backend::Gpu { frames, keep, radix, display_pages, .. } => {
+                for i in 0..display_pages + host::gpu::STATE_PAGES {
+                    let va = match i.checked_sub(*display_pages) {
+                        None => host::gpu::VMM_DISPLAY_VA + i * PAGE,
+                        Some(j) => host::gpu::VMM_GPU_STATE_VA + j * PAGE,
+                    };
+                    let f = frames.absolute_cptr_from_bits_with_depth(i as u64, *radix);
+                    let dst = keep.absolute_cptr_from_bits_with_depth(i as u64, *radix);
+                    comp.map_copy(alloc, &mut g.arena, &f, va, CapRights::read_write(), attrs, dst);
+                }
             }
         }
     }

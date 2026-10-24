@@ -17,6 +17,7 @@ struct CreateOpts {
     disks: Vec<(u64, bool, u64, u64)>,
     io_pool: u64,
     nics: Vec<(u64, u64, u64)>,
+    gpu: Option<(u64, u64)>,
 }
 
 fn cmd_create(ctl: &Ctl, o: &CreateOpts) -> Result<u64> {
@@ -33,6 +34,7 @@ fn cmd_create(ctl: &Ctl, o: &CreateOpts) -> Result<u64> {
         disks: o.disks.clone(),
         io_pool: o.io_pool,
         nics: o.nics.clone(),
+        gpu: o.gpu,
     })?;
     for (&(sw, _, _), mac) in o.nics.iter().zip(macs) {
         eprintln!("vm {vm}: nic on switch {sw}, mac {}", fmt_mac(mac));
@@ -95,7 +97,8 @@ const USAGE: &str = "usage: l4hctl <command>
                                host's kernel; prints its id
          [--nic SWITCH[,mac=MAC][,nolock][,isolated]]...
          [--io-pool MB]        device I/O buffer pool (power of two, 1-256;
-                               default 4)
+                               default 4, or room for the GPU's buffers)
+         [--gpu WxH]           a virtio-gpu display of W x H pixels
   shutdown VM [--reboot]       ask the VM to shut down (or reboot) cleanly
   destroy VM                   stop a VM and free its resources
   sched VM CAP                 cap each vCPU of VM at CAP% of a core (0: none)
@@ -107,6 +110,7 @@ const USAGE: &str = "usage: l4hctl <command>
   switch SWITCH                ports and counters of SWITCH
   console VM [--follow] [--until STR] [--timeout SECS]
                                print the VM's console output
+  screenshot VM FILE           save the VM's display as a PPM image
   send VM [--wait PAT [--timeout SECS]] TEXT
                                type TEXT (plus newline) on the VM's console;
                                with --wait, print the time until PAT appears
@@ -286,6 +290,7 @@ fn run(args: &[String]) -> Result<i32> {
                 disks: Vec::new(),
                 io_pool: 0,
                 nics: Vec::new(),
+                gpu: None,
             };
             let mut it = args[2..].iter();
             while let Some(a) = it.next() {
@@ -333,6 +338,11 @@ fn run(args: &[String]) -> Result<i32> {
                             }
                         }
                         o.nics.push((sw, mac, flags));
+                    }
+                    "--gpu" => {
+                        let v = val()?;
+                        let (w, h) = v.split_once('x').ok_or(Error(format!("--gpu: {v}: not WxH")))?;
+                        o.gpu = Some((parse_num(w)?, parse_num(h)?));
                     }
                     _ => return err(format!("create: unknown option {a}")),
                 }
@@ -447,6 +457,13 @@ fn run(args: &[String]) -> Result<i32> {
                 eprintln!("l4hctl: timed out");
                 return Ok(1);
             }
+        }
+        "screenshot" => {
+            let vm = parse_num(args.get(1).ok_or(Error("screenshot: missing VM".into()))?)?;
+            let path = args.get(2).ok_or(Error("screenshot: missing FILE".into()))?;
+            let s = ctl.screenshot(vm)?;
+            std::fs::write(path, s.ppm()?).map_err(|e| Error(format!("{path}: {e}")))?;
+            eprintln!("vm {vm}: {}x{}, frame {}", s.width, s.height, s.frame);
         }
         "send" => {
             let vm = parse_num(args.get(1).ok_or(Error("send: missing VM".into()))?)?;

@@ -13,6 +13,7 @@ use crate::{Host, MAX_GUESTS};
 pub const EPERM: i64 = 1;
 pub const ENOENT: i64 = 2;
 pub const EIO: i64 = 5;
+pub const EAGAIN: i64 = 11;
 pub const ENOMEM: i64 = 12;
 pub const EBUSY: i64 = 16;
 pub const EINVAL: i64 = 22;
@@ -248,6 +249,20 @@ fn execute(h: &mut Host, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlRe
                 resp.data[i] = unsafe { addr_of!((*ring).data[idx]).read_volatile() };
             }
             resp.vals = [start + n as u64, n as u64, start - off, 0, 0, 0];
+            Ok(())
+        }
+        abi::CTL_GPU_ATTACH => {
+            let id = vm_arg(a[0])?;
+            if id == caller {
+                return Err(EINVAL);
+            }
+            h.attach_gpu(id, a[1], a[2])
+        }
+        abi::CTL_GPU_READ => {
+            // Into dom0's control data area, which belongs to the host.
+            let to = h.guest(caller).and_then(|d0| d0.ctl_data()).ok_or(EINVAL)? as *mut u8;
+            let g = h.guest(vm_arg(a[0])?).ok_or(ENOENT)?;
+            resp.vals = crate::gpu::read(g, a[1], to)?;
             Ok(())
         }
         abi::CTL_CONSOLE_WRITE => {
