@@ -8,7 +8,7 @@ mod dmar;
 mod format;
 #[path = "../host/l4h-root/src/vtd/requester.rs"]
 mod requester;
-#[path = "../host/l4h-root/src/vtd/mappings.rs"]
+#[path = "../host/l4h-root/src/iommu/mappings.rs"]
 mod mappings;
 use dmar::Dmar;
 

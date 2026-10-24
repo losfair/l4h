@@ -24,13 +24,13 @@ impl<const N: usize> Mappings<N> {
         if len == 0 { return false; }
         for r in self.ranges.iter_mut().filter(|r| r.domain == domain) {
             if r.pa == pa && r.len == len {
-                assert_eq!(r.write, write, "VT-d: shared DMA permissions changed");
-                r.users = r.users.checked_add(1).expect("VT-d: DMA reference overflow");
+                assert_eq!(r.write, write, "IOMMU: shared DMA permissions changed");
+                r.users = r.users.checked_add(1).expect("IOMMU: DMA reference overflow");
                 return false;
             }
-            assert!(pa >= r.pa + r.len || r.pa >= pa + len, "VT-d: DMA allocations partially overlap");
+            assert!(pa >= r.pa + r.len || r.pa >= pa + len, "IOMMU: DMA allocations partially overlap");
         }
-        assert!(self.ranges.push(Mapping { domain, pa, len, users: 1, write }).is_ok(), "VT-d: DMA mapping table full");
+        assert!(self.ranges.push(Mapping { domain, pa, len, users: 1, write }).is_ok(), "IOMMU: DMA mapping table full");
         true
     }
 
@@ -38,7 +38,7 @@ impl<const N: usize> Mappings<N> {
     pub fn release(&mut self, domain: u32, pa: usize, len: usize) -> bool {
         if len == 0 { return false; }
         let i = self.ranges.iter().position(|r| r.domain == domain && r.pa == pa && r.len == len)
-            .expect("VT-d: unmap of unknown DMA allocation");
+            .expect("IOMMU: unmap of unknown DMA allocation");
         self.ranges[i].users -= 1;
         if self.ranges[i].users != 0 { return false; }
         self.ranges.swap_remove(i);

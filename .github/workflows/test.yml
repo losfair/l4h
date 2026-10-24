@@ -84,6 +84,12 @@ jobs:
         run: tests/run-nettest.sh
       - name: Intel VT-d DMA and interrupt remapping
         run: tests/run-vtdtest.sh --qemu
+      - name: AMD-Vi shared PCI requester groups
+        run: |
+          python3 tests/vtd-net-qemu.py --iommu amd --topology pci
+          python3 tests/vtd-net-qemu.py --iommu amd --topology pci --no-intremap
+          python3 tests/vtd-net-qemu.py --iommu amd --topology pci --controllers 17
+          python3 tests/amdvi-qemu.py
       - name: dom0 restart, CPU caps, steal time
         run: tests/run-m6test.sh
       - name: SMT discovery, placement and migration

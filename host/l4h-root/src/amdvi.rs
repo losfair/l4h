@@ -1,8 +1,8 @@
 //! The AMD IOMMU (AMD-Vi), driven by the root task itself rather than by
 //! seL4 (DESIGN.md §8.5).  Only root gives devices memory, so it builds
 //! the IOMMU's tables itself: a device table that blocks every device,
-//! and for each device root enables an I/O page table that maps exactly
-//! the memory it was given, at its physical address.  Drivers see no
+//! and for each requester group root enables an I/O page table that maps
+//! the memory its devices were given, at its physical address. Drivers see no
 //! difference; a device that strays faults instead of reaching memory.
 //!
 //! Interrupts are remapped too: a device root drives has a table of the
@@ -20,12 +20,14 @@ use l4h_abi as abi;
 
 use crate::mem::Alloc;
 use crate::pci;
+use crate::iommu::{mappings::Mappings, MAX_MAPPINGS};
 
 const PAGE: usize = 4096;
 /// IOMMUs driven, at most (an EPYC has one per root complex, up to 8).
 const MAX_UNITS: usize = 16;
 /// Device IDs: PCI segment 0's bus/device/function numbers.
 const DEVICES: usize = 1 << 16;
+const MAX_ATTACHED: usize = pci::MAX_DISK_CTRLS + l4h_host::net::MAX_NICS + 1;
 /// I/O page table levels: 48-bit I/O addresses, which every IOMMU
 /// supports (EFR.HATS) and which cover all physical memory.
 const LEVELS: u64 = 4;
@@ -96,9 +98,9 @@ const DTE_BLOCKED: u64 = DTE_V | DTE_TV;
 // and arbitrated interrupts remapped (IntCtl 10b; 00b: dropped).
 const DTE_IV: u64 = 1 << 0;
 const DTE_INTCTL_REMAP: u64 = 2 << 60;
-/// Interrupt table entries per device: 16 (IntTabLen 4).  Root uses
-/// one per vector it gives a device; the rest stay invalid.
-const IRT_LEN: u64 = 4;
+/// A requester group may contain many controllers. Allow every CPU
+/// vector in its shared table (still less than one allocated page).
+const IRT_LEN: u64 = 8;
 const IRT_ENTRIES: usize = 1 << IRT_LEN;
 // Interrupt table entries (32-bit format): remapping enabled, fixed
 // delivery (IntType 0), physical destination APIC ID in bits 15:8, the
@@ -114,14 +116,14 @@ const PTE_IW: u64 = 1 << 62;
 const PTE_ADDR: u64 = 0x000f_ffff_ffff_f000;
 
 /// An I/O address space: a domain ID and its page table, shared by the
-/// device IDs of one device.  `Domain::NONE` is no domain: without an
+/// device IDs of one requester group. `Domain::NONE` is no domain: without an
 /// IOMMU, every call taking one does nothing.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Domain {
     id: u16,
     root: usize,
-    /// The interrupt table of a device root drives (else 0), and the
-    /// device IDs that use it.
+    /// The group's interrupt table (else 0), and this attachment's
+    /// device ID and firmware alias.
     irt: usize,
     dev: [u16; 2],
 }
@@ -148,6 +150,10 @@ impl Unity {
 
     fn covers(&self, id: u16) -> bool {
         (self.first..=self.last).contains(&id)
+    }
+
+    fn covers_group(&self, alias: u16, dev: &DevInfo) -> bool {
+        self.covers(alias) || (self.first..=self.last).any(|id| dev.alias[id as usize] == alias)
     }
 }
 
@@ -177,6 +183,11 @@ struct DevInfo {
     /// programs them in the compatibility format.
     special: [u64; DEVICES / 64],
     alias: [u16; DEVICES],
+    /// Driven devices only, separate from the firmware's boot domains.
+    /// Aliases share a page table and an interrupt table, even when
+    /// interrupt remapping is disabled.
+    attached: ArrayVec<Domain, MAX_ATTACHED>,
+    mappings: Mappings<MAX_MAPPINGS>,
     chunks: ArrayVec<(usize, usize), MAX_CHUNKS>,
 }
 
@@ -186,6 +197,8 @@ static mut DEV_INFO: DevInfo =
     covered: [0; DEVICES / 64],
     special: [0; DEVICES / 64],
     alias: [0; DEVICES],
+    attached: ArrayVec::new(),
+    mappings: Mappings::new(),
     chunks: ArrayVec::new(),
 };
 static DEV_INFO_TAKEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -533,7 +546,8 @@ impl AmdVi {
                     if !self.covered(id) {
                         continue;
                     }
-                    let d = match (self.domain_of(id), own) {
+                    let alias = self.dev.as_ref().unwrap().alias[id as usize];
+                    let d = match (self.domain_of(alias), own) {
                         (Some(d), _) if all || Some(d) != self.shared => d,
                         (_, Some(d)) => d,
                         _ => *own.insert(self.unity_domain(phys.alloc, id, |u| u.all())),
@@ -546,6 +560,9 @@ impl AmdVi {
                         let _ = given.push(d.id);
                     }
                     self.set_dte(id, d);
+                    if alias != id {
+                        self.set_dte(alias, d);
+                    }
                 }
             }
         }
@@ -561,6 +578,23 @@ impl AmdVi {
             if which(&u) {
                 self.map_range(alloc, d, u.start, u.end - u.start, u.write);
             }
+        }
+        d
+    }
+
+    /// A driven group gets all its members' firmware ranges, including
+    /// devices without a driver. Boot-only domains may also contain
+    /// unrelated requesters, so never reuse those for driver DMA.
+    fn group_domain(&mut self, alloc: &mut Alloc, alias: u16) -> Domain {
+        let mut d = self.new_domain(alloc, alias);
+        for i in 0..self.unity.len() {
+            let u = self.unity[i];
+            if u.covers_group(alias, self.dev.as_ref().unwrap()) {
+                self.map_range(alloc, d, u.start, u.end - u.start, u.write);
+            }
+        }
+        if self.intremap {
+            d.irt = self.page(alloc).1;
         }
         d
     }
@@ -680,10 +714,16 @@ impl AmdVi {
             let e = unsafe { table.add(i).read_volatile() };
             e == entry || e & IRTE_REMAP_EN == 0
         });
-        let i = free.expect("l4h-root: iommu: device interrupt table full");
+        let i = free.expect("l4h-root: iommu: requester interrupt table full");
         unsafe { table.add(i).write_volatile(entry) };
-        for id in d.dev {
-            self.command([id as u32, CMD_INV_INT_TABLE, 0, 0]);
+        // Every attached BDF and the bridge alias can cache this table.
+        // Handles returned before a sibling attached must invalidate it too.
+        self.command([d.dev[1] as u32, CMD_INV_INT_TABLE, 0, 0]);
+        for n in 0..self.dev.as_ref().unwrap().attached.len() {
+            let member = self.dev.as_ref().unwrap().attached[n];
+            if member.id == d.id && member.dev[0] != d.dev[1] {
+                self.command([member.dev[0] as u32, CMD_INV_INT_TABLE, 0, 0]);
+            }
         }
         self.sync();
         i as u32
@@ -706,8 +746,8 @@ impl AmdVi {
         d
     }
 
-    /// A domain of its own for device `d`, with the unity ranges the
-    /// firmware gives it, and nothing else until root maps its memory.
+    /// Join device `d` to its requester's domain, with the unity ranges
+    /// of every member, and nothing else until root maps its memory.
     /// Without an IOMMU, Domain::NONE.
     pub fn attach(&mut self, alloc: &mut Alloc, d: &pci::Device) -> Domain {
         if !self.active() {
@@ -723,15 +763,14 @@ impl AmdVi {
             return Domain::NONE;
         }
         let alias = self.dev.as_ref().unwrap().alias[id as usize];
-        let mut dom = self.unity_domain(alloc, id, |u| u.covers(id) || u.covers(alias));
-        if self.intremap {
-            dom.irt = self.page(alloc).1;
-            dom.dev = [id, alias];
-        }
+        let existing = self.dev.as_ref().unwrap().attached.iter().find(|d| d.dev[1] == alias).copied();
+        let mut dom = existing.unwrap_or_else(|| self.group_domain(alloc, alias));
+        dom.dev = [id, alias];
         self.set_dte(id, dom);
-        if alias != id {
+        if alias != id && existing.is_none() {
             self.set_dte(alias, dom);
         }
+        assert!(self.dev.as_mut().unwrap().attached.push(dom).is_ok(), "iommu: too many attached devices");
         self.sync();
         self.confined += 1;
         dom
@@ -743,6 +782,12 @@ impl AmdVi {
         if d == Domain::NONE {
             return;
         }
+        assert!(pa % PAGE == 0 && len % PAGE == 0);
+        let end = pa.checked_add(len).expect("iommu: invalid DMA range");
+        // Permanent firmware mappings cannot also be recyclable DMA pools.
+        assert!(!self.unity.iter().any(|u| u.covers_group(d.dev[1], self.dev.as_ref().unwrap())
+            && pa < u.end && u.start < end), "iommu: allocated DMA memory overlaps an IVMD range");
+        if !self.dev.as_mut().unwrap().mappings.acquire(d.id as u32, pa, len, write) { return; }
         self.map_range(alloc, d, pa, len, write);
         // An IOMMU may cache missing entries (NpCache).
         self.flush(d);
@@ -754,16 +799,18 @@ impl AmdVi {
         let leaf = PTE_PR | PTE_FC | PTE_IR | if write { PTE_IW } else { 0 };
         for at in (pa..pa + len).step_by(PAGE) {
             let pte = self.walk(Some(alloc), d, at).unwrap();
-            unsafe { pte.write_volatile(at as u64 | leaf) };
+            // Overlapping firmware ranges retain the union of permissions.
+            unsafe { pte.write_volatile(pte.read_volatile() | at as u64 | leaf) };
         }
     }
 
-    /// Take [pa, pa + len) away from domain `d`.  When this returns, the
-    /// device can no longer reach it.
+    /// Release one owner's mapping. Only the final owner removes the
+    /// translation, after which the requester can no longer reach it.
     pub fn unmap(&mut self, d: Domain, pa: usize, len: usize) {
         if d == Domain::NONE {
             return;
         }
+        if !self.dev.as_mut().unwrap().mappings.release(d.id as u32, pa, len) { return; }
         for at in (pa..pa + len).step_by(PAGE) {
             if let Some(pte) = self.walk(None, d, at) {
                 unsafe { pte.write_volatile(0) };

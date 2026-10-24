@@ -9,13 +9,13 @@
 
 mod dmar;
 mod format;
-mod mappings;
 mod requester;
 
 use core::sync::atomic::{Ordering, compiler_fence};
 use l4h_host::fixed::{ArrayVec, StaticCell};
 use l4h_abi as abi;
 use crate::{mem::Alloc, pci};
+use crate::iommu::{mappings, MAX_MAPPINGS};
 use dmar::{Dmar, MAX_IOAPICS, MAX_UNITS};
 use format::{ADDR, PRESENT, READ, WRITE};
 
@@ -25,10 +25,6 @@ const CHUNK_PAGES: usize = 1 << (CHUNK_BITS - 12);
 const MAX_CHUNKS: usize = crate::layout::IOMMU_TABLES.size >> CHUNK_BITS;
 const MMIO_STRIDE: usize = 1 << 16;
 const EVENTS_PER_POLL: usize = 8;
-// One pool per guest device, one DMA allocation per controller/NIC, and
-// the balloon. Keep these records out of root's stack.
-const MAX_MAPPINGS: usize = crate::MAX_GUESTS * crate::guest::MAX_GUEST_DEVICES
-    + pci::MAX_DISK_CTRLS + l4h_host::net::MAX_NICS + 1;
 
 const VER: usize = 0x00;
 const CAP: usize = 0x08;

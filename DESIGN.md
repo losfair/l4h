@@ -1447,28 +1447,33 @@ in l4h needs: root alone gives devices memory.
   invalidates whatever the firmware left cached. The IVHDs give each
   device ID's interrupt pass-through and SysMgt bits, and its alias
   behind a PCI bridge.
-- **Domains.** Each device root enables gets a domain of its own: a domain
-  ID and a 4-level I/O page table, set in the device's entry and its
-  alias's. The table maps exactly the memory the device was given, at its
+- **Domains.** Each requester group root enables gets a domain ID and a
+  4-level I/O page table. Devices with the same IVHD alias share that
+  domain; attaching a sibling preserves the alias's existing DMA and
+  interrupt tables. Each attached device's entry and its alias point to
+  these tables. They map the memory the group's devices were given, at its
   physical address, so drivers are unchanged. The virtio drivers accept
   `VIRTIO_F_ACCESS_PLATFORM`.
+  Devices sharing a requester can reach each other's mapped buffers and
+  raise each other's permitted interrupts: the bridge prevents the IOMMU
+  from distinguishing them. Other requester groups remain isolated.
   - A NIC (netd) gets its 4 MiB of DMA memory.
   - A disk controller (blkd) gets blkd's 4 MiB, and each client's I/O
     pool while it is attached. `blkd::remove` unmaps the pool after the
-    drain, or after a quarantine, so a device that does not reset no
-    longer pins the pool. blkd's own DMA memory stays out of use as
-    before.
+    drain, or after a quarantine. Shared pools are reference-counted per
+    domain and allocation, so only the final release removes their
+    translations. blkd's own DMA memory stays out of use as before.
   - The balloon (memd) gets its DMA pages. Free page reports name memory
     the device is never given. A balloon that translates them (QEMU's
     `iommu_platform=on`) cannot report.
 - **AMD interrupts.** Root remaps them too (`iommu_intremap`, on by default).
-  A device root enables gets a table of 16 interrupt entries (32-bit
-  format), named in its device table entry with IntCtl "remapped".
+  A requester group root enables gets a table of 256 interrupt entries
+  (32-bit format), named in its device table entries with IntCtl "remapped".
   `AmdVi::msi_data` fills one entry per vector (fixed delivery to APIC ID
   0, the vector `pci::msi_data` gives) and returns its index. Root puts
   the index in blkd's and netd's MSI data in place of the vector, so the
   drivers write the MSI-X table unchanged. The device can then raise only
-  its own vectors: any other MSI data selects an invalid entry, and the
+  its group's vectors: any other MSI data selects an invalid entry, and the
   IOMMU drops the interrupt. Devices root does not drive get IV set and
   no table, so their MSIs are dropped. The I/O APICs and HPETs (IVHD
   special devices) keep IV 0: seL4 programs them in the compatibility
@@ -1476,16 +1481,24 @@ in l4h needs: root alone gives devices memory.
   requester ID can still inject any vector; root does not turn on ACS
   source validation. The entries use the 32-bit format, so destinations
   are APIC IDs below 256 (no x2APIC XTEn or GA mode).
+  Updates invalidate the interrupt-table cache for every attached group
+  member and the alias, including members attached after a handle was issued.
 - **AMD unity ranges.** IVMD ranges stay mapped for the devices they name:
   ranges for all devices in one shared domain, others in a domain per
-  range. A device root enables also gets the ranges that name it.
+  range. Aliased requests use the alias's entry at boot too. A driven
+  group gets the ranges of all its members, including devices without a
+  driver. Its new domain is separate from boot-only domains that can
+  contain unrelated requesters. Recyclable DMA allocations cannot overlap
+  these permanent ranges; overlapping unity ranges retain the union of
+  their permissions.
 - **AMD tables.** The device table, I/O page tables, command buffers and event
   logs come from 2 MiB chunks of root memory, mapped in root
   (`layout::IOMMU_TABLES`) and kept until reboot. Unmapping clears the
   leaf entries and keeps the tables, so a pool slot that is attached again
-  reuses them. Every map and unmap ends with INVALIDATE_IOMMU_PAGES for
-  the domain and a COMPLETION_WAIT. A map does this too, since an IOMMU
-  may cache missing entries (NpCache). Root stops if an IOMMU does not
+  reuses them. Installing a mapping or removing its final owner ends with
+  INVALIDATE_IOMMU_PAGES for the domain and a COMPLETION_WAIT. A new map
+  does this too, since an IOMMU may cache missing entries (NpCache).
+  Root stops if an IOMMU does not
   complete a command within a second, since it could then no longer
   confine anything.
 - **AMD faults.** Root reads the event logs every 100 ms (its balance tick)
@@ -1594,6 +1607,26 @@ logs no page fault event, so the event log reader is untested there.
 vector. Given an index whose entry is invalid, the controller's
 interrupts are aborted (`RemapEn is disabled`) and its I/O stalls, while
 the I/O APIC's pass unremapped.
+
+`python3 tests/vtd-net-qemu.py --iommu amd` runs the two-NIC, two-controller
+bridge regression on AMD-Vi: root bus, conventional PCI, PCIe-to-PCI and
+nested PCI bridges, with translated and bypass virtio NIC DMA. Both NICs
+must pass traffic after all devices attach, and a second guest must read
+and write both disks across repeated create/destroy cycles. Add
+`--no-intremap` to check domain sharing with interrupt remapping disabled,
+`--controllers 17` to exceed the former 16-entry interrupt-table limit,
+or `--tap TAP0 TAP1` to use vhost-net. Logs go in `build/amdvitest`.
+The AMD-Vi PCIe-to-PCI case needs QEMU 10.2 or later: QEMU 10.0 caches
+the secondary bus number before firmware assigns it, so its DMA arrives
+as requester 00:00.0 instead of the alias in IVRS. CI uses conventional
+PCI bridges with Debian 13's QEMU 10.0, including remapping disabled and
+17 disk controllers sharing an interrupt table.
+`python3 tests/amdvi-qemu.py` inspects the devices' and alias's shared
+tables, checks that every vector survives, and uses EDU devices to verify
+that both an unrelated requester and an aliased sibling cannot write
+outside their mapped memory. It checks interrupt-abort traces for an
+unrelated requester's attempt to use the group's index and a group
+member's attempt to use an unallocated index.
 
 ---
 

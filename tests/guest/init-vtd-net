@@ -25,7 +25,9 @@ done
 ping -c 3 -W 2 10.0.2.2 || fail "first NIC after peer destruction"
 l4hctl iommu > /tmp/iommu
 cat /tmp/iommu
-grep -q 'interrupts: remapped' /tmp/iommu || fail "interrupt remapping disabled"
+expected=$(cat /bin/iommu-expected) || fail "missing IOMMU expectation"
+grep -q "interrupts: $expected" /tmp/iommu || fail "unexpected interrupt remapping state"
+grep -q '0 behind no IOMMU' /tmp/iommu || fail "unconfined devices"
 grep -q 'events: *0$' /tmp/iommu || fail "IOMMU faults"
 echo 'VTDNET: PASS'
 poweroff -f
