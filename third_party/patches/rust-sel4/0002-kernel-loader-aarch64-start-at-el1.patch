@@ -67,7 +67,7 @@ index 357c4396..be277e40 100644
      ret
  END_FUNC(init_core_state)
 diff --git a/crates/sel4-kernel-loader/asm/aarch64/tail.S b/crates/sel4-kernel-loader/asm/aarch64/tail.S
-index 1797f1ae..88cc281e 100644
+index 31f1249e..ac211db9 100644
 --- a/crates/sel4-kernel-loader/asm/aarch64/tail.S
 +++ b/crates/sel4-kernel-loader/asm/aarch64/tail.S
 @@ -55,6 +55,11 @@ END_FUNC(switch_translation_tables_el2)
@@ -92,17 +92,20 @@ index 1797f1ae..88cc281e 100644
      /* EL1 is AArch64; no stage 2, no traps of timers, FP or system
       * registers. */
      mov     x8, #(1 << 31)
-@@ -123,6 +131,7 @@ BEGIN_FUNC(enter_kernel_el1)
+@@ -129,7 +137,9 @@ BEGIN_FUNC(enter_kernel_el1)
      tbz     x9, #0, 7f
      msr     S3_4_C12_C11_0, xzr
  7:
+-    /* Drop EL1's old translations before its MMU uses the new tables. */
 +2:
-     /* SCTLR_EL1: RES1 bits, MMU, data and instruction caches. */
-     ldr     x8, =0x30d01805
-     msr     sctlr_el1, x8
-@@ -130,6 +139,11 @@ BEGIN_FUNC(enter_kernel_el1)
++    /* Drop EL1's old translations (at EL1, the loader's own) before its
++     * MMU uses the new tables. */
+     isb
      tlbi    vmalle1is
      dsb     ish
+@@ -138,6 +148,11 @@ BEGIN_FUNC(enter_kernel_el1)
+     ldr     x8, =0x30d01805
+     msr     sctlr_el1, x8
      isb
 +    mrs     x8, CurrentEL
 +    cmp     x8, #4

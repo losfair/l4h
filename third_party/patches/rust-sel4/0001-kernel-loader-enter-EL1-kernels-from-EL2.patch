@@ -17,10 +17,10 @@ index 6fe8f6d1..357c4396 100644
  
      /*
 diff --git a/crates/sel4-kernel-loader/asm/aarch64/tail.S b/crates/sel4-kernel-loader/asm/aarch64/tail.S
-index b56f077c..1797f1ae 100644
+index b56f077c..31f1249e 100644
 --- a/crates/sel4-kernel-loader/asm/aarch64/tail.S
 +++ b/crates/sel4-kernel-loader/asm/aarch64/tail.S
-@@ -46,3 +46,93 @@ BEGIN_FUNC(switch_translation_tables_el2)
+@@ -46,3 +46,101 @@ BEGIN_FUNC(switch_translation_tables_el2)
      ret
  
  END_FUNC(switch_translation_tables_el2)
@@ -70,6 +70,12 @@ index b56f077c..1797f1ae 100644
 +    mov     x8, #0x33ff
 +    msr     cptr_el2, x8
 +    msr     hstr_el2, xzr
++    /* EL1 reads MIDR_EL1 and MPIDR_EL1 from VPIDR_EL2 and VMPIDR_EL2,
++     * which reset to UNKNOWN values. */
++    mrs     x8, midr_el1
++    msr     vpidr_el2, x8
++    mrs     x8, mpidr_el1
++    msr     vmpidr_el2, x8
 +    /* VMID 0 on every core: while EL2 is enabled, EL1&0 TLB entries are
 +     * tagged with VTTBR_EL2.VMID even without stage 2, and the kernel's
 +     * broadcast TLB invalidations reach only the issuing core's VMID.
@@ -101,12 +107,14 @@ index b56f077c..1797f1ae 100644
 +    tbz     x9, #0, 7f
 +    msr     S3_4_C12_C11_0, xzr
 +7:
-+    /* SCTLR_EL1: RES1 bits, MMU, data and instruction caches. */
-+    ldr     x8, =0x30d01805
-+    msr     sctlr_el1, x8
++    /* Drop EL1's old translations before its MMU uses the new tables. */
 +    isb
 +    tlbi    vmalle1is
 +    dsb     ish
++    isb
++    /* SCTLR_EL1: RES1 bits, MMU, data and instruction caches. */
++    ldr     x8, =0x30d01805
++    msr     sctlr_el1, x8
 +    isb
 +    /* EL1h with interrupts masked. */
 +    mov     x8, #0x3c5
