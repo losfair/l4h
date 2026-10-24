@@ -1,7 +1,7 @@
-From 62a5e39417ffad935576160405b0a0b9205554b8 Mon Sep 17 00:00:00 2001
+From efc55746712e100709dc1218295f12fcd7232e3a Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Sat, 17 Oct 2026 08:29:02 -0700
-Subject: [PATCH 1/7] tcb: add seL4_TCBFlag_trapSyscalls
+Subject: [PATCH] tcb: add seL4_TCBFlag_trapSyscalls
 
 When set on a TCB, every syscall instruction executed by that thread is
 delivered to its fault handler as seL4_Fault_UnknownSyscall, regardless of
@@ -13,6 +13,12 @@ an arbitrary user value.
 The check is done on the slowpath and before dispatching to any fastpath on
 x86, Arm and RISC-V (on x86 with VT-x, also before SysVMEnter). Debug and
 benchmark syscalls are not interpreted for trapping threads.
+
+On x86 the trap vectors seL4 opens to user level (int $N above its IRQ
+vectors) are not system calls of such a thread either: they are reported
+as the user exception #GP that int $N raises where the gate is closed,
+with the vector in the error code, rather than as an unknown syscall
+indistinguishable from the syscall instruction.
 ---
  include/api/syscall.h                     |  3 +++
  libsel4/include/interfaces/object-api.xml |  6 +++++-
@@ -20,8 +26,8 @@ benchmark syscalls are not interpreted for trapping threads.
  src/api/syscall.c                         | 10 ++++++++++
  src/arch/arm/c_traps.c                    | 12 +++++++++++-
  src/arch/riscv/c_traps.c                  |  9 ++++++++-
- src/arch/x86/c_traps.c                    | 10 +++++++---
- 7 files changed, 49 insertions(+), 6 deletions(-)
+ src/arch/x86/c_traps.c                    | 22 +++++++++++++++++++---
+ 7 files changed, 61 insertions(+), 6 deletions(-)
 
 diff --git a/include/api/syscall.h b/include/api/syscall.h
 index 42cb8fb5e..ab818621b 100644
@@ -173,10 +179,29 @@ index bae151662..224e62374 100644
      fastpath_call(cptr, msgInfo);
  
 diff --git a/src/arch/x86/c_traps.c b/src/arch/x86/c_traps.c
-index 99ffc2a61..d69edc1e5 100644
+index 99ffc2a61..173b545a2 100644
 --- a/src/arch/x86/c_traps.c
 +++ b/src/arch/x86/c_traps.c
-@@ -98,7 +98,8 @@ void NORETURN slowpath(syscall_t syscall)
+@@ -82,6 +82,18 @@ void VISIBLE NORETURN c_handle_interrupt(int irq, int syscall)
+          * instruction by subtracting 2 */
+         int sys_num;
+         NODE_STATE(ksCurThread)->tcbArch.tcbContext.registers[FaultIP] -= 2;
++        if (unlikely(threadTrapsSyscalls(NODE_STATE(ksCurThread)))) {
++            /* Such a thread's system calls are its syscall instructions:
++             * report the #GP that int $N raises where the gate is closed
++             * to user level, with the IDT vector as its error code. */
++#ifdef TRACK_KERNEL_ENTRIES
++            ksKernelEntry.path = Entry_UserLevelFault;
++            ksKernelEntry.word = int_gp_fault;
++#endif
++            handleUserLevelFault(int_gp_fault, ((word_t)irq << 3) | 2);
++            restore_user_context();
++            UNREACHABLE();
++        }
+         /* trap number is MSBs of the syscall number and the LSBS of EAX */
+         sys_num = (irq << 24) | (syscall & 0x00ffffff);
+ #ifdef TRACK_KERNEL_ENTRIES
+@@ -98,7 +110,8 @@ void NORETURN slowpath(syscall_t syscall)
  {
  
  #ifdef CONFIG_VTX
@@ -186,7 +211,7 @@ index 99ffc2a61..d69edc1e5 100644
          vcpu_update_state_sysvmenter(NODE_STATE(ksCurThread)->tcbArch.tcbVCPU);
          if (NODE_STATE(ksCurThread)->tcbBoundNotification
              && notification_ptr_get_state(NODE_STATE(ksCurThread)->tcbBoundNotification) == NtfnState_Active) {
-@@ -115,7 +116,8 @@ void NORETURN slowpath(syscall_t syscall)
+@@ -115,7 +128,8 @@ void NORETURN slowpath(syscall_t syscall)
      }
  #endif
      /* check for undefined syscall */
@@ -196,7 +221,7 @@ index 99ffc2a61..d69edc1e5 100644
  #ifdef TRACK_KERNEL_ENTRIES
          ksKernelEntry.path = Entry_UnknownSyscall;
          /* ksKernelEntry.word word is already set to syscall */
-@@ -167,7 +169,9 @@ void VISIBLE NORETURN c_handle_syscall(word_t cptr, word_t msgInfo, syscall_t sy
+@@ -167,7 +181,9 @@ void VISIBLE NORETURN c_handle_syscall(word_t cptr, word_t msgInfo, syscall_t sy
  #endif /* TRACK_KERNEL_ENTRIES */
  
  #ifdef CONFIG_FASTPATH

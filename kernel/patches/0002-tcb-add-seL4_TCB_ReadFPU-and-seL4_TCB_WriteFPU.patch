@@ -1,7 +1,7 @@
-From c24e2a3b2b69af9082514aa9bbb89eb0b6701450 Mon Sep 17 00:00:00 2001
+From 54d19b3358a25cc4b8e5c14da285c9bcc3f7c934 Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Sat, 17 Oct 2026 08:30:23 -0700
-Subject: [PATCH 2/7] tcb: add seL4_TCB_ReadFPU and seL4_TCB_WriteFPU
+Subject: [PATCH] tcb: add seL4_TCB_ReadFPU and seL4_TCB_WriteFPU
 
 Allow a holder of a TCB capability to read or replace the thread's
 floating point / vector register state via a frame it owns. This is
@@ -19,11 +19,11 @@ is masked with the CPU's MXCSR_MASK, read with FXSAVE at boot.
 ---
  include/arch/x86/arch/model/statedata.h   |   1 +
  libsel4/include/interfaces/object-api.xml |  56 ++++++++++++
- libsel4/include/sel4/constants.h          |  11 +++
+ libsel4/include/sel4/constants.h          |  15 ++++
  src/arch/x86/machine/fpu.c                |  10 +++
  src/arch/x86/model/statedata.c            |   3 +
- src/object/tcb.c                          | 101 ++++++++++++++++++++++
- 6 files changed, 182 insertions(+)
+ src/object/tcb.c                          | 104 ++++++++++++++++++++++
+ 6 files changed, 189 insertions(+)
 
 diff --git a/include/arch/x86/arch/model/statedata.h b/include/arch/x86/arch/model/statedata.h
 index 01656dbb3..9c58af7ef 100644
@@ -105,10 +105,10 @@ index 37885cbb0..1f433596e 100644
  
      <interface name="seL4_CNode" manual_name="CNode">
 diff --git a/libsel4/include/sel4/constants.h b/libsel4/include/sel4/constants.h
-index c356a1395..c8237b5df 100644
+index c356a1395..1b8741089 100644
 --- a/libsel4/include/sel4/constants.h
 +++ b/libsel4/include/sel4/constants.h
-@@ -69,6 +69,17 @@ typedef enum {
+@@ -69,6 +69,21 @@ typedef enum {
      SEL4_FORCE_LONG_ENUM(seL4_LookupFailureType),
  } seL4_LookupFailureType;
  
@@ -117,8 +117,12 @@ index c356a1395..c8237b5df 100644
 +#define seL4_FPUStateSize CONFIG_XSAVE_SIZE
 +#elif defined(CONFIG_ARCH_AARCH64)
 +#define seL4_FPUStateSize (64 * 8 + 8)
-+#elif defined(CONFIG_ARCH_RISCV)
++#elif defined(CONFIG_ARCH_AARCH32)
 +#define seL4_FPUStateSize (32 * 8 + 4 + 4)
++#elif defined(CONFIG_ARCH_RISCV) && defined(CONFIG_RISCV_EXT_D)
++#define seL4_FPUStateSize (32 * 8 + 4 + 4)
++#elif defined(CONFIG_ARCH_RISCV)
++#define seL4_FPUStateSize (32 * 4 + 4)
 +#else
 +#define seL4_FPUStateSize 0
 +#endif
@@ -162,10 +166,10 @@ index 9af5acfb1..217d0ca87 100644
  uint32_t x86KSnumDrhu;
  
 diff --git a/src/object/tcb.c b/src/object/tcb.c
-index 521e33bd6..508a93a60 100644
+index 521e33bd6..4a19d3742 100644
 --- a/src/object/tcb.c
 +++ b/src/object/tcb.c
-@@ -841,6 +841,99 @@ static exception_t decodeSetFlags(cap_t cap, word_t length, bool_t call, word_t
+@@ -841,6 +841,102 @@ static exception_t decodeSetFlags(cap_t cap, word_t length, bool_t call, word_t
      return EXCEPTION_NONE;
  }
  
@@ -205,6 +209,9 @@ index 521e33bd6..508a93a60 100644
 +    (void)state;
 +#endif
 +}
++
++/* What libsel4 tells callers is what the kernel copies. */
++compile_assert(fpu_state_size_matches_libsel4, seL4_FPUStateSize == sizeof(user_fpu_state_t))
 +
 +static exception_t decodeFPUTransfer(cap_t cap, word_t length, word_t *buffer, bool_t toFrame)
 +{
@@ -265,7 +272,7 @@ index 521e33bd6..508a93a60 100644
  /* The following functions sit in the syscall error monad, but include the
   * exception cases for the preemptible bottom end, as they call the invoke
   * functions directly.  This is a significant deviation from the Haskell
-@@ -937,6 +1030,14 @@ exception_t decodeTCBInvocation(word_t invLabel, word_t length, cap_t cap,
+@@ -937,6 +1033,14 @@ exception_t decodeTCBInvocation(word_t invLabel, word_t length, cap_t cap,
      case TCBSetFlags:
          return decodeSetFlags(cap, length, call, buffer);
  

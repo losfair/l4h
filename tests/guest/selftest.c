@@ -271,6 +271,23 @@ static void test_segv(void)
 	munmap(p, 4096);
 }
 
+#ifndef __aarch64__
+/* int $N is no system call: seL4's user trap vectors raise #GP, as the
+ * closed gates do natively, instead of running the call in eax. */
+static void test_int_gate(void)
+{
+	struct sigaction sa = { .sa_sigaction = segv_handler, .sa_flags = SA_SIGINFO };
+	long r = SYS_getpid;
+
+	sigaction(SIGSEGV, &sa, NULL);
+	if (sigsetjmp(segv_jmp, 1) == 0) {
+		asm volatile("int $0xa0" : "+a"(r) : : "rcx", "r11", "memory");
+		CHECK(0, "int $0xa0 returned %ld", r);
+	}
+	signal(SIGSEGV, SIG_DFL);
+}
+#endif
+
 /* Data pages are not executable; mprotect(PROT_EXEC) makes them so. */
 static void test_nx(void)
 {
@@ -1282,6 +1299,9 @@ static const struct test tests[] = {
 	{ "mmap", test_mmap },
 	{ "segv", test_segv },
 	{ "nx", test_nx },
+#ifndef __aarch64__
+	{ "int_gate", test_int_gate },
+#endif
 	{ "uaccess_prot", test_uaccess_prot },
 	{ "fork", test_fork },
 	{ "many_forks", test_many_forks },

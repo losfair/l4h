@@ -162,6 +162,12 @@ SP, FLAGS and the argument registers (all GPRs on x86_64; X0–X7 on aarch64,
 plus X8 with patch 0007). The check goes in `c_handle_syscall` and the fastpath
 entry on each arch, before the `SYSCALL_MIN..MAX` range test. The patch is
 roughly 30 lines per arch, and the semantics do not depend on the ISA.
+On x86, seL4 also opens its spare IDT vectors (above the IRQs) to user
+level and reports `int $N` on them as an unknown syscall, which a trapping
+thread's handler could not tell from `syscall`: Linux would run the call
+in `eax`. For a trapping thread they raise the user exception #GP instead,
+with the vector in the error code, as closed gates do natively, and the
+guest delivers SIGSEGV.
 
 ### E2. TCB FPU state access (required)
 
@@ -418,7 +424,10 @@ guest. Where there is an AMD IOMMU, root drives it itself (§8.5).
   where 0x15 leaves the crystal out) now take it from there, rounded to
   the nearest MHz. With TSC-deadline mode, which all of them have, the
   PIT is then not used at all. QEMU/KVM and Hyper-V report leaf 0x15 as
-  zero, so VMs keep measuring with the PIT.
+  zero, so VMs keep measuring with the PIT. A rate rounded up would make
+  APIC countdowns (0014, used only without TSC-deadline mode) end up to
+  about 250 ppm early: one extra timer interrupt that finds nothing due,
+  or a timeslice a few µs short, never a timer signalled early.
 - **0023, accessed bits of native 4 KiB frames (x86_64 and aarch64).**
   `seL4_X86_Page_TestAndClearAccessed` / `seL4_ARM_Page_TestAndClearAccessed`
   resolves a frame cap's mapped ASID and address, verifies the physical
