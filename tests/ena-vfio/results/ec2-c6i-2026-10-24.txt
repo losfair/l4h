@@ -1,0 +1,172 @@
+EC2 ENA hardware test, 2026-10-24
+Result: FAIL during initialization; packet and interrupt checks not reached.
+
+Driver source revision: 2d1621adbf7d7f750e24400ebeaaa58583ab66ad
+Production host/l4h-netd/src/ena.rs is unchanged from that revision.
+SHA-256 hashes (source and tested binary):
+6f4f1bb8b387ae285dbef01d0838a7c9d0c051d6240c045a6b782eebd52f2f33  host/l4h-netd/src/ena.rs
+4a54d1b8bd386c9e345a6b2291db8d66f19cbe217fdd5710f42fa0651dee4ef5  tests/ena-vfio/target/release/ena-vfio
+
+EC2: c6i.large, us-west-2a
+AMI: ami-08cf17e3856f70154 (Canonical Ubuntu 24.04, 2026-10-23)
+Kernel: 7.0.0-1014-aws
+Dedicated secondary ENI: PCI 0000:00:06.0, Amazon 1d0f:ec20 revision 0
+Transport: Linux VFIO no-IOMMU with a contiguous locked 2 MiB hugepage
+BAR 2: 256 KiB; resource2_wc mapping available
+Management SSH remained on the primary ENI (ens5).
+
+FINAL UNMODIFIED-DRIVER RUNS
+Commands on the dedicated test instance:
+  sudo ./run-on-host.sh 0000:00:06.0 172.31.37.175 172.31.34.249
+  sudo ./run-on-host.sh 0000:00:06.0 172.31.37.175 172.31.34.249 --host-queue
+Output:
+4a54d1b8bd386c9e345a6b2291db8d66f19cbe217fdd5710f42fa0651dee4ef5  ena-vfio
+normal exit status: 101
+LLQ mapping: write-combining resource2_wc
+VFIO: 0000:00:06.0, revision 0, no IOMMU, contiguous hugepage, DMA 0x27c00000 + 0x200000
+netd: NIC 0: ENA refuses the host attributes: status 5
+
+thread 'main' (24407) panicked at src/../../../host/l4h-netd/src/ena.rs:663:34:
+netd: NIC 0: ENA admin command 'create CQ' failed: status 6
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+restored 0000:00:06.0 to ena
+host_queue exit status: 101
+VFIO: 0000:00:06.0, revision 0, no IOMMU, contiguous hugepage, DMA 0x27c00000 + 0x200000
+netd: NIC 0: ENA refuses the host attributes: status 5
+
+thread 'main' (24456) panicked at src/../../../host/l4h-netd/src/ena.rs:663:34:
+netd: NIC 0: ENA admin command 'create CQ' failed: status 6
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+restored 0000:00:06.0 to ena
+driver: ena
+version: 7.0.0-1014-aws
+firmware-version:
+expansion-rom-version:
+bus-info: 0000:00:06.0
+supports-statistics: yes
+supports-test: no
+supports-eeprom-access: no
+supports-register-dump: no
+supports-priv-flags: no
+
+LINUX INITIALIZATION BASELINE (same ENI)
+Commands:
+  sudo ethtool -G ens6 tx 256 rx 512
+  sudo ethtool -g ens6
+Output after setting the queue depths:
+Ring parameters for ens6:
+Pre-set maximums:
+RX:			2048
+RX Mini:		n/a
+RX Jumbo:		n/a
+TX:			1024
+TX push buff len:	224
+Current hardware settings:
+RX:			512
+RX Mini:		n/a
+RX Jumbo:		n/a
+TX:			256
+RX Buf Len:		n/a
+CQE Size:		n/a
+TX Push:		on
+RX Push:		off
+TX push buff len:	96
+TCP data split:		n/a
+
+DPDK INITIALIZATION BASELINE (same ENI, VFIO no-IOMMU)
+Version: 23.11.4-0ubuntu0.24.04.2
+Command (wrapper binds VFIO and restores Linux afterward):
+  dpdk-testpmd -l 0,1 --no-telemetry --iova-mode=pa \
+    --huge-dir=/var/lib/l4h-ena/huge --file-prefix=l4h-ena -m 64 \
+    -a 0000:00:06.0 -- --no-numa --rxq=1 --txq=1 \
+    --rxd=512 --txd=256 --forward-mode=rxonly --total-num-mbufs=4096 -i
+Input: show port info all; quit
+This baseline verifies initialization only, not packet forwarding.
+Output:
+EAL: Detected CPU lcores: 2
+EAL: Detected NUMA nodes: 1
+EAL: Detected shared linkage of DPDK
+EAL: Multi-process socket /var/run/dpdk/l4h-ena/mp_socket
+EAL: Selected IOVA mode 'PA'
+EAL: VFIO support initialized
+EAL: Using IOMMU type 8 (No-IOMMU)
+EAL: Probe PCI driver: net_ena (1d0f:ec20) device: 0000:00:06.0 (socket -1)
+Set rxonly packet forwarding mode
+Interactive-mode selected
+
+Port 0: link state change event
+Configuring Port 0 (socket 0)
+Port 0: 06:FF:EC:2C:9A:0F
+Checking link statuses...
+testpmd> show port info all
+testpmd> quit
+ena_get_metrics_entries(): 0x6 customer metrics are supported
+testpmd: create a new mbuf pool <mb_pool_0>: n=4096, size=2176, socket=0
+testpmd: preferred mempool ops selected: ring_mp_mc
+
+Warning! port-topology=paired and odd forward ports number, the last port will pair with itself.
+
+Error during enabling promiscuous mode for port 0: Operation not supported - ignore
+Done
+
+********************* Infos for port 0  *********************
+MAC address: 06:FF:EC:2C:9A:0F
+Device name: 0000:00:06.0
+Driver name: net_ena
+Firmware-version: not available
+Devargs:
+Connect to socket: 0
+memory allocation on the socket: 0
+Link status: up
+Link speed: None
+Link duplex: full-duplex
+Autoneg status: Off
+MTU: 1500
+Promiscuous mode: disabled
+Allmulticast mode: disabled
+Maximum number of MAC addresses: 1
+Maximum number of MAC addresses of hash filtering: 0
+VLAN offload:
+  strip off, filter off, extend off, qinq strip off
+Hash key size in bytes: 40
+Redirection table size: 128
+Supported RSS offload flow types:
+  ipv4-tcp  ipv4-udp  ipv6-tcp  ipv6-udp
+Minimum size of RX buffer: 64
+Maximum configurable length of RX packet: 9234
+Maximum configurable size of LRO aggregated packet: 0
+Current number of RX queues: 1
+Max possible RX queues: 2
+Max possible number of RXDs per queue: 8192
+Min possible number of RXDs per queue: 128
+RXDs number alignment: 1
+Current number of TX queues: 1
+Max possible TX queues: 2
+Max possible number of TXDs per queue: 1024
+Min possible number of TXDs per queue: 128
+TXDs number alignment: 1
+Max segment number per packet: 17
+Max segment number per MTU/TSO: 17
+Device capabilities: 0x0( )
+Device error handling mode: passive
+Device private info:
+  none
+
+Stopping port 0...
+Stopping ports...
+Done
+
+Shutting down port 0...
+Closing ports...
+Port 0 is closed
+Done
+
+Bye...
+ena_rx_queue_release(): Rx queue 0:0 released
+ena_tx_queue_release(): Tx queue 0:0 released
+restored 0000:00:06.0 to ena
+
+RESOURCE CLEANUP
+Verified complete at 2026-10-24T08:04:53.958945+00:00
+Temporary instance terminated; both ENIs, root volume, security group
+and AWS key pair removed. Pre-existing VPC and subnet preserved.

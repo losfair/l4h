@@ -443,10 +443,16 @@ impl Ena {
         // What this driver is.  The device may refuse it: Linux carries on.
         let (info_va, info_pa) = dma.alloc(4096, 4096);
         let mut info = [0u8; 196];
-        // Unknown OS type 0 (Linux is 1), driver version 1.0.0.
+        // ENA has no generic OS ID. Use its userspace-driver class (DPDK)
+        // and identify l4h in the strings; ID 0 is rejected by Nitro.
+        put32(&mut info, 0, 3);
         info[4..7].copy_from_slice(b"l4h");
         info[136..139].copy_from_slice(b"l4h");
-        put32(&mut info, 172, 1);
+        // This is the ENA driver generation, not l4h's release number.
+        // Nitro accepts generation 1's host info but rejects this driver's
+        // completion-queue format with UNKNOWN_ERROR (status 6).
+        put32(&mut info, 172, 2);
+        put16(&mut info, 184, 0x0200); // ENA specification 2.0.
         put16(&mut info, 186, c.pci_bdf as u16);
         put16(&mut info, 188, 1);
         wr(info_va, &info);

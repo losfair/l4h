@@ -1,0 +1,93 @@
+#!/bin/sh
+# EC2 dom0: networking, SMP guests, NVMe data integrity and VM lifecycle.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mkdir -p /work
+export TMPDIR=/work
+cd / && mv /bin/*.cpio.gz / 2>/dev/null
+good=0; bad=0
+pass() { echo "EC2TEST: ok: $*"; good=$((good + 1)); }
+fail() { echo "EC2TEST: FAIL: $*"; bad=$((bad + 1)); }
+echo "EC2TEST: dom0 up, Linux $(uname -r)"
+l4hctl version
+l4hctl info
+l4hctl disks
+l4hctl nics
+cores=$(l4hctl info | sed -n 's/^cores: *//p')
+peer=$(sed -n 's/.*ec2_peer=\([^ ]*\).*/\1/p' /proc/cmdline)
+
+ip link set lo up
+ip link set eth0 up
+if udhcpc -i eth0 -n -q -t 10 -s /bin/udhcpc.script; then
+    pass "DHCP: $(ip -4 -o addr show eth0 | awk '{print $4}')"
+    ip route
+    # BusyBox wget cannot PUT: request an IMDSv2 token over a TCP socket.
+    token=$(printf 'PUT /latest/api/token HTTP/1.1\r\nHost: 169.254.169.254\r\nX-aws-ec2-metadata-token-ttl-seconds: 60\r\nContent-Length: 0\r\nConnection: close\r\n\r\n' \
+        | nc -w 5 169.254.169.254 80 | tr -d '\r' | tail -1)
+    identity=$(wget -q -T 10 -O - --header "X-aws-ec2-metadata-token: $token" \
+        http://169.254.169.254/latest/meta-data/instance-id)
+    case "$identity" in i-*) pass "IMDSv2: $identity" ;; *) fail 'IMDSv2' ;; esac
+    if wget -q -T 30 -O /work/release http://deb.debian.org/debian/dists/trixie/Release; then
+        pass "DNS and internet HTTP: $(wc -c < /work/release) bytes"
+    else
+        fail 'DNS and internet HTTP'
+    fi
+    if [ -n "$peer" ]; then
+        ip link set eth0 mtu 9001
+        ping -c 5 -W 3 -s 8973 "$peer" && pass 'jumbo ICMP' || fail 'jumbo ICMP'
+        if wget -q -T 60 -O /work/payload "http://$peer:8000/payload" &&
+           wget -q -T 10 -O /work/payload.sha256 "http://$peer:8000/payload.sha256" &&
+           (cd /work && sha256sum -c payload.sha256); then
+            pass "TCP download with SHA-256: $(wc -c < /work/payload) bytes"
+        else
+            fail 'TCP download or checksum'
+        fi
+        rm -f /work/payload
+    fi
+else
+    fail 'DHCP'
+fi
+
+if vm=$(l4hctl create selftest --initrd /selftest.cpio.gz --mem 512 --vcpus "$cores"); then
+    l4hctl console "$vm" --until 'reboot: Power down' --timeout 900 > /work/selftest.log
+    sleep 1
+    l4hctl console "$vm" > /work/selftest.log
+    grep -E '^  |SELFTEST' /work/selftest.log
+    grep -q 'SELFTEST: PASS' /work/selftest.log && pass "self-test on $cores vCPUs" || fail 'self-test'
+    l4hctl destroy "$vm" || fail 'destroy self-test VM'
+else
+    fail 'create self-test VM'
+fi
+
+# Host disk 0 is the boot disk. The test runner attaches one blank EBS disk.
+if vm=$(l4hctl create disk --initrd /disk.cpio.gz --mem 256 --disk 1); then
+    l4hctl console "$vm" --until 'reboot: Power down' --timeout 180 > /work/disk.log
+    sleep 1
+    l4hctl console "$vm" > /work/disk.log
+    grep EC2DISK /work/disk.log
+    grep -q 'EC2DISK: PASS' /work/disk.log && pass 'NVMe EBS data integrity' || fail 'NVMe data test'
+    l4hctl destroy "$vm" || fail 'destroy disk VM'
+else
+    fail 'create disk VM'
+fi
+
+ids=''
+for n in 1 2 3 4; do
+    if vm=$(l4hctl create small$n --initrd /vm.cpio.gz --mem 128); then
+        ids="$ids $vm"
+    else
+        fail "create small VM $n"
+    fi
+done
+up=0
+for vm in $ids; do
+    l4hctl console "$vm" --until 'GUEST: ready' --timeout 120 >/dev/null && up=$((up + 1))
+done
+[ "$up" = 4 ] && pass 'four concurrent guests' || fail "only $up small guests ready"
+l4hctl list
+for vm in $ids; do l4hctl destroy "$vm" || fail "destroy small VM $vm"; done
+l4hctl info
+echo "EC2TEST: done, $good passed, $bad failed"
+[ "$bad" = 0 ] && echo 'EC2TEST: PASS' || echo 'EC2TEST: FAIL'
+exec sleep 1000000

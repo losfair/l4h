@@ -1340,9 +1340,17 @@ NAT, DHCP and firewalling belong in a VM.
   a second later, so netd releases only a registered one.
 - **ENA.** `l4h-netd/src/ena.rs` follows Linux `ena` for the Elastic
   Network Adapter of Nitro EC2 instances (1d0f:ec20 and the other IDs
-  Linux takes). **It has not run on EC2 yet**: QEMU has no ENA, so it was
-  checked only by building it and against the Linux driver. It resets the
-  device, reads registers readless (the device writes them to DMA memory)
+  Linux takes). Tested on a c6i.large's secondary ENI through Linux/VFIO
+  (`tests/ena-vfio`, compiling the production driver unchanged), and in
+  a full UEFI/seL4 boot on c6i.xlarge (`tests/ec2-test.py`). Both LLQ and
+  host-memory TX pass packet/checksum/GSO tests, 65,600 checked UDP echoes
+  across the 16-bit index wrap, and fresh MSI-X delivery. Host information
+  must name a recognized OS class and ENA specification version: l4h uses
+  the userspace class, its own strings and spec 2.0. It reports driver
+  version 2.0.0; Nitro accepts 1.0.0's host info but rejects CQ creation
+  with status 6. See `tests/ec2.md` and the recorded hardware results.
+  It resets the device, reads registers readless (the device writes them
+  to DMA memory)
   unless the PCI revision says otherwise, and configures it through an
   admin queue of 64-byte commands, polled. One TX and one RX queue, each
   a submission queue with its completion queue, both on MSI-X entry 1;
@@ -1996,9 +2004,15 @@ a locality, so a command only runs if trustd ran the `_DSM`.
      private storage network (a tagged VLAN, which l4h passes through).
    - `fb_console=1` (GRUB, seL4, l4h-root): GRUB and the seL4 console
      (patch 0020) on the screen; the dashboard keeps to the upper half.
-4. Later targets: AWS (ENA and NVMe) and Azure (MANA and NVMe), each mainly
-   adding one NIC driver. netd's ENA driver is written (§8.3) but has not
-   run on EC2; an AMI builder and an EC2 test are still to come.
+4. **AWS EC2:** c6i.xlarge boots the generic UEFI image with ENA and NVMe
+   EBS. `tools/ec2-image.py` imports a raw disk through the EBS direct API
+   and registers a private UEFI/ENA AMI. `tests/build-ec2.sh` and
+   `tests/ec2-test.py` cover DHCP, IMDSv2, internet HTTP, jumbo frames, a
+   checked 32 MiB TCP download, a four-vCPU self-test, 64 MiB of EBS
+   write/readback and four concurrent guests. The runner terminates the
+   instance and its volumes; AMIs/snapshots are explicitly retained for
+   reuse or deletion. See `tests/ec2.md`. Azure (MANA and NVMe) remains a
+   later target.
 
 **Status (v1).**
 

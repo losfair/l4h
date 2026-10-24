@@ -390,7 +390,7 @@ fn run(args: &[String]) -> Result<i32> {
                 let bdf = r.vals[0];
                 let sw = if r.vals[1] == u64::MAX { "-".to_string() } else { format!("switch {}", r.vals[1]) };
                 println!(
-                    "nic {i}: pci {:02x}:{:02x}.{} virtio-net, mac {}, uplink of {sw}",
+                    "nic {i}: pci {:02x}:{:02x}.{}, mac {}, uplink of {sw}",
                     bdf >> 8, (bdf >> 3) & 0x1f, bdf & 7, fmt_mac(r.vals[2])
                 );
             }

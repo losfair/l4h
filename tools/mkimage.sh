@@ -15,6 +15,9 @@
 # sizes the partition (default: the payload plus 64 MiB, room for larger
 # dom0 images later).
 set -euo pipefail
+# sfdisk is commonly installed outside an unprivileged user's PATH.
+export PATH="$PATH:/usr/sbin:/sbin"
+for tool in mformat mmd mcopy sfdisk; do command -v "$tool" >/dev/null; done
 root=$(cd "$(dirname "$0")/.." && pwd)
 efi= dom0_initrd= config=
 while getopts e:i:c: o; do

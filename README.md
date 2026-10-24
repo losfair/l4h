@@ -40,7 +40,7 @@ Third-party components, including the submodules in `kernel/seL4` and
 - **Network.**
   - L2 virtual switches with MAC learning and MAC lock.
   - Multiple vNICs per VM, and a physical NIC as a switch's uplink:
-    virtio-net, or gVNIC on GCE C3, N4, C4 and later.
+    virtio-net, gVNIC on GCE C3, N4, C4 and later, or ENA on AWS EC2.
   - Checksum and TSO offloads.
   - Routing and NAT are done by a VM, for example Debian with nftables.
 - **Control.** dom0, the first guest, controls the host through
@@ -55,7 +55,9 @@ Third-party components, including the submodules in `kernel/seL4` and
   the guest kernel in it, that loads dom0's initramfs and the settings from
   the EFI system partition; a UEFI disk
   image for GCE (`tools/mkimage.sh`, `tools/gce-image.sh`; tested on N2 and
-  C3 with `tests/gce-test.sh`). On a host with a display
+  C3 with `tests/gce-test.sh`), and a private UEFI/ENA AMI for AWS EC2
+  (`tools/ec2-image.py`; tested on c6i.xlarge with ENA, NVMe and four-vCPU
+  guests; see [the EC2 workflow](tests/ec2.md)). On a host with a display
   the UEFI image shows a read-only status dashboard.
 - **Attestation.** On a host with a TPM 2.0 (FIFO, CRB, AMD fTPM through
   the firmware's ACPI `_DSM`, or Pluton), `l4h-trustd` has the TPM

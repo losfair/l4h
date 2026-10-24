@@ -1,0 +1,15 @@
+[package]
+name = "ena-vfio"
+edition = "2024"
+license = "GPL-2.0-only"
+version = "0.1.0"
+description = "Exercise netd's ENA driver unchanged on an EC2 ENI through VFIO"
+
+[dependencies]
+l4h-host = { path = "../../host/l4h-host" }
+l4h-virtio = { path = "../../host/l4h-virtio" }
+libc = "0.2"
+
+[profile.release]
+debug-assertions = true
+overflow-checks = true

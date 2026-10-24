@@ -1,0 +1,18 @@
+#!/bin/sh
+# Run only on a disposable blank EBS data volume, passed as /dev/vda.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mkdir -p /work
+fail() { echo "EC2DISK: FAIL: $*"; poweroff -f; exit 1; }
+[ -b /dev/vda ] || fail 'no passed-through disk'
+if dd if=/dev/vda bs=512 skip=1 count=1 2>/dev/null | grep -q 'EFI PART'; then
+    fail 'refusing a GPT disk'
+fi
+echo "EC2DISK: $(cat /sys/block/vda/size) sectors, logical block $(cat /sys/block/vda/queue/logical_block_size)"
+dd if=/dev/urandom of=/work/pattern bs=1M count=64 2>/dev/null || fail 'pattern'
+dd if=/work/pattern of=/dev/vda bs=1M conv=fsync 2>/dev/null || fail 'write'
+echo 3 > /proc/sys/vm/drop_caches
+dd if=/dev/vda bs=1M count=64 2>/dev/null | cmp - /work/pattern || fail 'readback'
+echo 'EC2DISK: PASS (64 MiB written and verified)'
+poweroff -f

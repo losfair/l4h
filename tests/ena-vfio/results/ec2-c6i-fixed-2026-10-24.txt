@@ -1,0 +1,123 @@
+EC2 ENA hardware test, 2026-10-24 — fixed driver
+Result: PASS on LLQ and host-memory TX queues.
+
+Base revision: 2d1621adbf7d7f750e24400ebeaaa58583ab66ad
+Fix: ENA host OS class 3, specification 2.0, driver version 2.0.0.
+Production source compiled unchanged into the VFIO harness; no tracing,
+LD_PRELOAD substitutions or diagnostic edits in these final runs.
+
+EC2: c6i.large, us-west-2, Ubuntu 24.04, Linux 7.0.0-1014-aws.
+Secondary ENI: 0000:00:06.0, Amazon 1d0f:ec20 revision 0.
+VFIO no-IOMMU: locked, physically contiguous 2 MiB hugepage.
+LLQ: write-combining resource2_wc mapping. TX 256 / RX 512.
+SSH and the UDP/TCP peer used the primary ENI. No temporary files in /tmp.
+
+SHA-256:
+7e7c19eab4794734b4ab73f49419019b9050a4f00af436e822f9f29fb6ba341a  host/l4h-netd/src/ena.rs
+ff9cf176d99c7c57728809579c9359d28eed6d9ecef645af99f3a681c08de09b  tests/ena-vfio/target/release/ena-vfio
+
+LLQ — --packets=65600, exit 0
+LLQ mapping: write-combining resource2_wc
+VFIO: 0000:00:06.0, revision 0, no IOMMU, contiguous hugepage, DMA 0x2a600000 + 0x200000
+init completed in 204.425168ms
+PASS ENA initialization and hardware checksum capability
+PASS ARP to the test peer
+PASS ICMP echo
+PASS UDP echo: 1 payload bytes, TX software checksum, RX DATA_VALID
+PASS UDP echo: 1 payload bytes, TX hardware checksum, RX DATA_VALID
+PASS UDP echo: 18 payload bytes, TX software checksum, RX DATA_VALID
+PASS UDP echo: 18 payload bytes, TX hardware checksum, RX DATA_VALID
+PASS UDP echo: 53 payload bytes, TX software checksum, RX DATA_VALID
+PASS UDP echo: 53 payload bytes, TX hardware checksum, RX DATA_VALID
+PASS UDP echo: 54 payload bytes, TX software checksum, RX DATA_VALID
+PASS UDP echo: 54 payload bytes, TX hardware checksum, RX DATA_VALID
+PASS UDP echo: 55 payload bytes, TX software checksum, RX DATA_VALID
+PASS UDP echo: 55 payload bytes, TX hardware checksum, RX DATA_VALID
+PASS UDP echo: 96 payload bytes, TX software checksum, RX DATA_VALID
+PASS UDP echo: 96 payload bytes, TX hardware checksum, RX DATA_VALID
+PASS UDP echo: 128 payload bytes, TX software checksum, RX DATA_VALID
+PASS UDP echo: 128 payload bytes, TX hardware checksum, RX DATA_VALID
+PASS UDP echo: 1400 payload bytes, TX software checksum, RX DATA_VALID
+PASS UDP echo: 1400 payload bytes, TX hardware checksum, RX DATA_VALID
+netd: NIC 0: 00:06.0 ENA 0.10 ctrl 0x1000001 rev 0, mac 06:ff:df:ef:3f:21, mtu 9216, tx 256 (llq) rx 512, csum v4 true v6 false
+netd: NIC 0: ENA link up
+PASS UDP echo: 2000 payload bytes, TX software checksum, RX DATA_VALID
+PASS UDP echo: 2000 payload bytes, TX hardware checksum, RX DATA_VALID
+PASS UDP echo: 4000 payload bytes, TX software checksum, RX DATA_VALID
+PASS UDP echo: 4000 payload bytes, TX hardware checksum, RX DATA_VALID
+PASS UDP echo: 8973 payload bytes, TX software checksum, RX DATA_VALID
+PASS UDP echo: 8973 payload bytes, TX hardware checksum, RX DATA_VALID
+PASS queue wraparound: 65600/65600 checked UDP echoes in 455.694553ms
+PASS 4000-byte TCP GSO via netd software segmentation
+PASS 60000-byte TCP GSO via netd software segmentation
+PASS fresh MSI-X I/O event without RX polling
+PASS management MSI-X events
+TX 65674 RX 65631 RX checksum-valid 65629; MSI-X management 19 I/O 18884
+ENATEST: PASS (0 failures)
+restored 0000:00:06.0 to ena
+
+HOST QUEUE — --host-queue --packets=65600, exit 0
+VFIO: 0000:00:06.0, revision 0, no IOMMU, contiguous hugepage, DMA 0x28a00000 + 0x200000
+init completed in 204.016581ms
+PASS ENA initialization and hardware checksum capability
+PASS ARP to the test peer
+PASS ICMP echo
+PASS UDP echo: 1 payload bytes, TX software checksum, RX DATA_VALID
+PASS UDP echo: 1 payload bytes, TX hardware checksum, RX DATA_VALID
+PASS UDP echo: 18 payload bytes, TX software checksum, RX DATA_VALID
+PASS UDP echo: 18 payload bytes, TX hardware checksum, RX DATA_VALID
+PASS UDP echo: 53 payload bytes, TX software checksum, RX DATA_VALID
+PASS UDP echo: 53 payload bytes, TX hardware checksum, RX DATA_VALID
+PASS UDP echo: 54 payload bytes, TX software checksum, RX DATA_VALID
+PASS UDP echo: 54 payload bytes, TX hardware checksum, RX DATA_VALID
+PASS UDP echo: 55 payload bytes, TX software checksum, RX DATA_VALID
+PASS UDP echo: 55 payload bytes, TX hardware checksum, RX DATA_VALID
+PASS UDP echo: 96 payload bytes, TX software checksum, RX DATA_VALID
+PASS UDP echo: 96 payload bytes, TX hardware checksum, RX DATA_VALID
+PASS UDP echo: 128 payload bytes, TX software checksum, RX DATA_VALID
+PASS UDP echo: 128 payload bytes, TX hardware checksum, RX DATA_VALID
+PASS UDP echo: 1400 payload bytes, TX software checksum, RX DATA_VALID
+PASS UDP echo: 1400 payload bytes, TX hardware checksum, RX DATA_VALID
+PASS UDP echo: 2000 payload bytes, TX software checksum, RX DATA_VALID
+PASS UDP echo: 2000 payload bytes, TX hardware checksum, RX DATA_VALID
+netd: NIC 0: 00:06.0 ENA 0.10 ctrl 0x1000001 rev 0, mac 06:ff:df:ef:3f:21, mtu 9216, tx 256 (host) rx 512, csum v4 true v6 false
+netd: NIC 0: ENA link up
+PASS UDP echo: 4000 payload bytes, TX software checksum, RX DATA_VALID
+PASS UDP echo: 4000 payload bytes, TX hardware checksum, RX DATA_VALID
+PASS UDP echo: 8973 payload bytes, TX software checksum, RX DATA_VALID
+PASS UDP echo: 8973 payload bytes, TX hardware checksum, RX DATA_VALID
+PASS queue wraparound: 65600/65600 checked UDP echoes in 726.23126ms
+PASS 4000-byte TCP GSO via netd software segmentation
+PASS 60000-byte TCP GSO via netd software segmentation
+PASS fresh MSI-X I/O event without RX polling
+PASS management MSI-X events
+TX 65674 RX 65633 RX checksum-valid 65630; MSI-X management 16 I/O 9684
+ENATEST: PASS (0 failures)
+restored 0000:00:06.0 to ena
+
+PEER LOG (includes earlier diagnostic passes)
+TCP sink ready on 172.31.44.88:9001
+UDP echo ready on 172.31.44.88:9000
+TCP ('172.31.43.242', 40001): 4000 bytes, pattern PASS
+TCP ('172.31.43.242', 40002): 60000 bytes, pattern PASS
+TCP ('172.31.43.242', 40001): 4000 bytes, pattern PASS
+TCP ('172.31.43.242', 40002): 60000 bytes, pattern PASS
+TCP ('172.31.43.242', 40001): 4000 bytes, pattern PASS
+TCP ('172.31.43.242', 40002): 60000 bytes, pattern PASS
+TCP ('172.31.43.242', 40001): 4000 bytes, pattern PASS
+TCP ('172.31.43.242', 40002): 60000 bytes, pattern PASS
+TCP ('172.31.43.242', 40001): 4000 bytes, pattern PASS
+TCP ('172.31.43.242', 40002): 60000 bytes, pattern PASS
+ff9cf176d99c7c57728809579c9359d28eed6d9ecef645af99f3a681c08de09b  /home/ubuntu/ena-test/ena-version2
+ens5             UP             06:ff:f3:ef:03:a7 <BROADCAST,MULTICAST,UP,LOWER_UP>
+../../../bus/pci/drivers/ena
+
+The earlier failing revision and Linux/DPDK baselines are recorded in
+ec2-c6i-2026-10-24.txt. Full l4h boot results are in
+../../results/ec2-c6i-2026-10-24.txt.
+
+RESOURCE CLEANUP
+Verified at 2026-10-24T08:35:37.126239+00:00
+All temporary instances terminated; EBS volumes, ENIs, AMIs, snapshots,
+security group and key pair removed. Pre-existing VPC/subnet preserved.
+The validated local image is build/ec2/image-03.raw (also l4h.raw).

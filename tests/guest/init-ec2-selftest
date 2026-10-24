@@ -1,0 +1,8 @@
+#!/bin/sh
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mkdir -p /work
+export TMPDIR=/work
+/bin/selftest
+poweroff -f

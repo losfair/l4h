@@ -695,6 +695,35 @@ NIC, and dom0 gets the instance's address by DHCP. Put other guests on
 internal switches and let dom0, or another router VM with that MAC, route
 for them (Section~\ref{sec:router}).
 
+\section{Amazon EC2}
+
+l4h boots on \texttt{c6i.xlarge} with UEFI, ENA networking and NVMe EBS
+disks. The hardware test covers DHCP, IMDSv2, internet access, jumbo frames,
+a checked 32 MiB TCP download, a four-vCPU guest self-test, EBS
+write/readback and four concurrent guests. Nested virtualization is not
+needed; Secure Boot must be off.
+
+\cmd{tools/ec2-image.py DISK.raw --region REGION --name NAME --state STATE.json}
+imports a disk from \file{tools/mkimage.sh} through the EBS direct API and
+registers a private UEFI/ENA AMI. It requires Python \texttt{boto3}
+(\texttt{boto3[crt]} for AWS CLI login profiles), AWS credentials, and
+EC2 image/snapshot and EBS direct API permissions. No S3 bucket or VM
+Import/Export role is needed. Resource IDs are written to the state file;
+the AMI and snapshot remain until explicitly deleted.
+
+\file{tests/build-ec2.sh} builds the automated test dom0 and
+\file{tests/ec2-test.py} launches it on a fresh instance with a disposable
+data disk, saves the serial log, and terminates the instance and its
+volumes. See \file{tests/ec2.md} for the commands and optional network
+peer. Build scratch files use \file{build/ec2/work}.
+
+For a normal dom0, supply its initramfs and configuration to
+\file{tools/mkimage.sh} and import that image. dom0's uplink vNIC uses
+the ENI's MAC and obtains its address with DHCP; route or NAT other
+guests through internal switches. l4h does not yet handle EC2's ACPI
+shutdown request, so the test runner uses EC2's \texttt{SkipOsShutdown}
+option after the disposable test guests have finished.
+
 %======================================================================
 \chapter{Managing VMs with l4hctl}
 \label{ch:l4hctl}

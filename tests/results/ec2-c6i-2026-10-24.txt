@@ -1,0 +1,94 @@
+l4h EC2 UEFI boot test, 2026-10-24
+Result: PASS — 8 passed, 0 failed.
+
+EC2 c6i.xlarge (4 vCPUs, 8 GiB), us-west-2, UEFI, IMDSv2 required.
+Generic x2APIC/PCID seL4 build, Linux 6.18.58-l4h, ENA and NVMe EBS.
+Base revision: 2d1621adbf7d7f750e24400ebeaaa58583ab66ad plus working-tree fixes.
+
+Test instance: i-01a07b3757397e497 (terminated)
+AMI used: ami-015575f2063457080
+Snapshot used: snap-0a74a3ebb0ada3607
+Raw image SHA-256: 361140d15752f8ab405efcbe73bf59964e8e4eb3a34386ad0c37229963cc7444
+Serial log SHA-256: 1a1b187d6b903348a832390ba357174a6b996d45f5ab89fe0691e798aeb32373
+ENA source SHA-256: 7e7c19eab4794734b4ab73f49419019b9050a4f00af436e822f9f29fb6ba341a
+
+Build: L4H_EC2_PEER=172.31.44.88 tests/build-ec2.sh
+Import: tools/ec2-image.py, then tests/ec2-test.py (defaults to c6i.xlarge).
+The runner attached a fresh 1 GiB data volume; the boot and data volumes
+were DeleteOnTermination. Both were exposed as NVMe devices.
+Scratch files: build/ec2/work locally, /work inside the test guests.
+
+SERIAL EXCERPTS
+Booting all finished, dropped to user space
+netd: NIC 0: 00:05.0 ENA 0.10 ctrl 0x1000001 rev 0, mac 06:ff:f7:a9:a3:f7, mtu 9216, tx 256 (llq) rx 512, csum v4 true v6 false
+netd: 1 uplink NIC(s)
+netd: NIC 0: ENA link up
+  Normal   [mem 0x0000000000000000-0x00000000903fffff]
+  node   0: [mem 0x0000000000000000-0x00000000303fffff]
+EC2TEST: dom0 up, Linux 6.18.58-l4h
+disk 0: pci 00:04.0 nvme, owner -, sectors 2097152, attachments 0
+disk 1: pci 00:1f.0 nvme, owner -, sectors 2097152, attachments 0
+EC2TEST: ok: DHCP: 172.31.36.122/20
+EC2TEST: ok: IMDSv2: i-01a07b3757397e497
+EC2TEST: ok: DNS and internet HTTP: 138612 bytes
+EC2TEST: ok: jumbo ICMP
+EC2TEST: ok: TCP download with SHA-256: 33554432 bytes
+  Normal   [mem 0x0000000000000000-0x00000000803fffff]
+  node   0: [mem 0x0000000000000000-0x00000000203fffff]
+SELFTEST: start (4 CPUs online)
+  syscall_regs   ok (0.000 s)
+  mmap           ok (0.022 s)
+  segv           ok (0.000 s)
+  nx             ok (0.000 s)
+  int_gate       ok (0.000 s)
+  uaccess_prot   ok (0.000 s)
+  fork           ok (0.003 s)
+  many_forks     ok (0.050 s)
+  ptrace         ok (0.000 s)
+  signals_fpu    ok (0.000 s)
+  ptrace_fpregs  ok (0.000 s)
+  signal_regs    ok (0.050 s)
+  timers         ok (0.070 s)
+  syscall_restart ok (0.041 s)
+  syscall_restart_hi ok (0.041 s)
+  seccomp_trap   ok (0.000 s)
+  threads        ok (0.049 s)
+  futex          ok (0.010 s)
+  futex_wake_op  ok (0.062 s)
+  getcpu         ok (0.000 s)
+  smp_migrate_exit ok (0.097 s)
+  files          ok (0.001 s)
+  smp_mm_stress  ok (1.061 s)
+  smp_unmap_vis  ok (0.010 s)
+  uaccess_race   ok (0.167 s)
+  smp_fork_storm ok (0.059 s)
+  vspace_evict   ok (0.038 s)
+  page_aging: hardware sampling skipped (no test module)
+  page_aging     ok (0.075 s)
+SELFTEST: PASS
+EC2TEST: ok: self-test on 4 vCPUs
+EC2DISK: 2097152 sectors, logical block 512
+EC2DISK: PASS (64 MiB written and verified)
+EC2TEST: ok: NVMe EBS data integrity
+EC2TEST: ok: four concurrent guests
+EC2TEST: done, 8 passed, 0 failed
+EC2TEST: PASS
+
+VFIO coverage in ../ena-vfio/results/ec2-c6i-fixed-2026-10-24.txt:
+  LLQ and host-memory TX, each with 65,600 checked UDP echoes.
+  Software/hardware IPv4 checksums, RX DATA_VALID, frames through MTU9001.
+  4,000- and 60,000-byte TCP GSO; peer verified payload patterns.
+  Fresh I/O MSI-X event without receive polling, plus management events.
+
+Scope: this validates c6i (ENA revision 0). Other instance families and
+IPv6 hardware checksum offload were not tested. ENA watchdog/reset
+recovery remains unimplemented, as described in DESIGN.md.
+
+Full logs and the validated raw image remain in build/ec2/ (Git-ignored).
+See ../ec2.md for the reproducible build/import/test workflow.
+
+RESOURCE CLEANUP
+Verified at 2026-10-24T08:35:37.126239+00:00
+All temporary instances terminated; EBS volumes, ENIs, AMIs, snapshots,
+security group and key pair removed. Pre-existing VPC/subnet preserved.
+The validated local image is build/ec2/image-03.raw (also l4h.raw).

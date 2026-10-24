@@ -1009,10 +1009,15 @@ static void test_futex(void)
 static void test_files(void)
 {
 	char buf[4096];
-	int fd = open("/tmp/selftest", O_CREAT | O_RDWR | O_TRUNC, 0644);
+	char *path;
+	const char *dir = getenv("TMPDIR");
+	CHECK(asprintf(&path, "%s/selftest.XXXXXX", dir ? dir : "/tmp") >= 0, "file path");
+	int fd = mkstemp(path);
 	int i;
 
 	CHECK(fd >= 0, "open: %s", strerror(errno));
+	unlink(path);
+	free(path);
 	memset(buf, 'x', sizeof(buf));
 	for (i = 0; i < 256; i++)
 		CHECK(write(fd, buf, sizeof(buf)) == sizeof(buf), "write");
@@ -1020,7 +1025,6 @@ static void test_files(void)
 	for (i = 0; i < 256; i++)
 		CHECK(read(fd, buf, sizeof(buf)) == sizeof(buf) && buf[17] == 'x', "read");
 	close(fd);
-	unlink("/tmp/selftest");
 }
 
 /* ---- SMP stress: concurrent faults, mmap/munmap and forks */
