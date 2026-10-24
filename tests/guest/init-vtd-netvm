@@ -1,0 +1,20 @@
+#!/bin/sh
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mount -t tmpfs tmp /tmp
+fail() { echo "VTDNET-PEER: FAIL: $*"; echo 'VTDNET-PEER: done'; sleep 1000; }
+ip link set lo up
+ip link set eth0 up
+ip addr add 10.0.2.16/24 dev eth0
+ping -c 3 -W 2 10.0.2.2 || fail "second NIC"
+echo 'VT-d shared requester disk data' > /tmp/data
+dd if=/dev/zero bs=4096 count=8 >> /tmp/data 2>/dev/null
+for disk in vda vdb; do
+    dd if=/tmp/data of=/dev/$disk conv=fsync 2>/dev/null || fail "write $disk"
+    head -c "$(wc -c < /tmp/data)" /dev/$disk > /tmp/read || fail "read $disk"
+    cmp /tmp/data /tmp/read || fail "data mismatch on $disk"
+done
+echo 'VTDNET-PEER: PASS'
+echo 'VTDNET-PEER: done'
+while :; do sleep 1000; done

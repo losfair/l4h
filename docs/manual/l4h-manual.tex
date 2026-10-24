@@ -773,7 +773,7 @@ on a host whose AMD-Vi or Intel VT-d IOMMU l4h drives, \texttt{off} with \texttt
 \texttt{none} without one (e.g.\ cloud VMs without a vIOMMU, aarch64), and
 \texttt{failed} if the firmware's description of it cannot be used (the
 serial log says why). With it on, \texttt{interrupts} says whether each
-device can raise only its own interrupts (\texttt{iommu\_intremap}), a
+requester can raise only its assigned interrupts (\texttt{iommu\_intremap}), a
 device \texttt{behind no IOMMU} reaches all memory, and \texttt{events}
 counts the faults and errors the IOMMU logged since boot, which the serial
 log shows. With VT-d interrupt remapping the serial monitor uses a remapped
@@ -781,6 +781,13 @@ I/O APIC interrupt. If firmware omits the I/O APIC's routing information,
 the monitor is disabled and the serial log explains why. If the
 hardware cannot remap interrupts, DMA confinement still works and
 \texttt{interrupts} reports that remapping is unavailable.
+
+With Intel VT-d, devices behind a conventional PCI bridge can share one
+requester ID. Root reports the shared requester in the serial log and
+places those devices in one DMA domain. They can access the group's DMA
+buffers and interrupt entries; the bridge does not let the IOMMU isolate
+them from one another. PCIe ports that preserve requester IDs retain
+separate domains.
 
 \section{Creating a VM}
 

@@ -1,0 +1,31 @@
+#!/bin/sh
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mount -t tmpfs tmp /tmp
+fail() { echo "VTDNET: FAIL: $*"; poweroff -f; sleep 1000; }
+l4hctl nics
+ip link set lo up
+ip link set eth0 up
+ip addr add 10.0.2.15/24 dev eth0
+ping -c 3 -W 2 10.0.2.2 || fail "first NIC"
+echo 'VTDNET: first NIC works after both NICs were attached'
+sw=$(l4hctl switch-create) || fail "create switch"
+l4hctl uplink "$sw" 1 || fail "second uplink"
+# Both controllers map this guest's one I/O pool into the same domain
+# behind a PCI bridge. Destroy/recreate checks mapping ownership/reuse.
+for round in 1 2; do
+    vm=$(l4hctl create peer --mem 96 --initrd /bin/netvm.cpio.gz --nic "$sw" \
+        --disk 0 --disk 1) || fail "create peer"
+    l4hctl console "$vm" --until 'VTDNET-PEER: done' --timeout 60 > /tmp/peer || fail "peer timed out"
+    cat /tmp/peer
+    grep -q 'VTDNET-PEER: PASS' /tmp/peer || fail "peer NIC/disk I/O"
+    l4hctl destroy "$vm" || fail "destroy peer"
+done
+ping -c 3 -W 2 10.0.2.2 || fail "first NIC after peer destruction"
+l4hctl iommu > /tmp/iommu
+cat /tmp/iommu
+grep -q 'interrupts: remapped' /tmp/iommu || fail "interrupt remapping disabled"
+grep -q 'events: *0$' /tmp/iommu || fail "IOMMU faults"
+echo 'VTDNET: PASS'
+poweroff -f

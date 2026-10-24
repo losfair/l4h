@@ -9,6 +9,8 @@
 
 mod dmar;
 mod format;
+mod mappings;
+mod requester;
 
 use core::sync::atomic::{Ordering, compiler_fence};
 use l4h_host::fixed::{ArrayVec, StaticCell};
@@ -23,6 +25,10 @@ const CHUNK_PAGES: usize = 1 << (CHUNK_BITS - 12);
 const MAX_CHUNKS: usize = crate::layout::IOMMU_TABLES.size >> CHUNK_BITS;
 const MMIO_STRIDE: usize = 1 << 16;
 const EVENTS_PER_POLL: usize = 8;
+// One pool per guest device, one DMA allocation per controller/NIC, and
+// the balloon. Keep these records out of root's stack.
+const MAX_MAPPINGS: usize = crate::MAX_GUESTS * crate::guest::MAX_GUEST_DEVICES
+    + pci::MAX_DISK_CTRLS + l4h_host::net::MAX_NICS + 1;
 
 const VER: usize = 0x00;
 const CAP: usize = 0x08;
@@ -55,6 +61,10 @@ pub struct Domain {
     id: u16,
     sid: u16,
     root: usize,
+}
+
+impl Domain {
+    fn key(self) -> u32 { (self.unit as u32) << 16 | self.id as u32 }
 }
 
 struct Unit {
@@ -93,9 +103,12 @@ impl Unit {
 // Too large for root's stack; the only active IOMMU backend owns it.
 static CHUNKS: StaticCell<ArrayVec<(usize, usize), MAX_CHUNKS>> = StaticCell::new(ArrayVec::new());
 static DMAR: StaticCell<Dmar> = StaticCell::new(Dmar::empty());
+static MAPPINGS: StaticCell<mappings::Mappings<MAX_MAPPINGS>> = StaticCell::new(mappings::Mappings::new());
 
 pub struct Vtd {
     dmar: &'static mut Dmar,
+    requesters: requester::Requesters,
+    mappings: &'static mut mappings::Mappings<MAX_MAPPINGS>,
     ioapic_ids: ArrayVec<u8, MAX_IOAPICS>,
     units: ArrayVec<Unit, MAX_UNITS>,
     chunks: Option<&'static mut ArrayVec<(usize, usize), MAX_CHUNKS>>,
@@ -118,7 +131,9 @@ impl Vtd {
         let mut buf = [0u8; 32 << 10];
         let table = crate::acpi::find(bootinfo, phys, b"DMAR", &mut buf)?;
         let mut me = Self {
-            dmar: DMAR.take(), ioapic_ids: ArrayVec::new(), units: ArrayVec::new(), chunks: None, used: CHUNK_PAGES,
+            dmar: DMAR.take(), requesters: requester::Requesters::empty(), ioapic_ids: ArrayVec::new(),
+            mappings: MAPPINGS.take(),
+            units: ArrayVec::new(), chunks: None, used: CHUNK_PAGES,
             coherent: true, cache_line: 64, ticks_per_ms, intremap: false, state: abi::IOMMU_FAILED,
             confined: 0, unconfined: 0, events: 0,
         };
@@ -127,6 +142,11 @@ impl Vtd {
             return Some(me);
         };
         *me.dmar = dmar;
+        let Some(requesters) = requester::Requesters::discover(|b, d, f, o| pci.read32(b, d, f, o)) else {
+            sel4::debug_println!("l4h-root: VT-d: malformed PCI bridge topology: DMA is not confined");
+            return Some(me);
+        };
+        me.requesters = requesters;
         if let Some(ids) = crate::acpi::find(bootinfo, phys, b"APIC", &mut buf).and_then(dmar::madt_ioapics) {
             me.ioapic_ids = ids;
         }
@@ -341,6 +361,9 @@ impl Vtd {
     }
 
     fn domain(&mut self, alloc: &mut Alloc, unit: usize, sid: u16) -> Domain {
+        // Devices behind a conventional PCI bridge share its requester
+        // and therefore one domain. Never replace a sibling's mappings.
+        let sid = self.requesters.requester(sid);
         let root = unsafe { self.table(self.units[unit].root as u64).add((sid >> 8) as usize * 2) };
         let mut entry = unsafe { root.read_volatile() };
         if entry & PRESENT == 0 {
@@ -372,6 +395,10 @@ impl Vtd {
             return None;
         };
         let d = self.domain(alloc, unit, sid);
+        if sid != d.sid {
+            info!("l4h-root: VT-d: {:02x}:{:02x}.{} uses shared requester {:02x}:{:02x}.{}",
+                device.bus, device.dev, device.func, d.sid >> 8, d.sid >> 3 & 31, d.sid & 7);
+        }
         // Global context + IOTLB invalidation also evicts cached misses
         // tagged with domain zero (CAP.CM), not just the new domain ID.
         self.invalidate(unit, true, None);
@@ -407,18 +434,22 @@ impl Vtd {
         let range = format::range(pa, len, self.units[d.unit].width).expect("VT-d: invalid DMA range");
         // Firmware-reserved memory must never become a recyclable pool:
         // its permanent mapping would defeat unmap's isolation guarantee.
-        assert!(!self.dmar.reserved.iter().any(|r| r.scope.contains(d.sid)
+        assert!(!self.dmar.reserved.iter().any(|r| self.requesters.scope_contains(r.scope, d.sid)
             && range.start < r.end && r.start < range.end), "VT-d: allocated DMA memory overlaps an RMRR");
+        if !self.mappings.acquire(d.key(), pa, len, write) { return; }
         self.map_range(alloc, d, pa, len, write);
         self.invalidate(d.unit, false, Some(d.id));
     }
 
-    /// Synchronous invalidation drains DMA before the caller reuses RAM.
+    /// The final unmap drains DMA before the caller reuses RAM.
     /// RMRRs remain mapped for the lifetime of their firmware requester.
     pub fn unmap(&mut self, d: Domain, pa: usize, len: usize) {
         let range = format::range(pa, len, self.units[d.unit].width).expect("VT-d: invalid DMA range");
+        if !self.mappings.release(d.key(), pa, len) { return; }
+        let reserved: ArrayVec<_, { dmar::MAX_RESERVED }> = self.dmar.reserved.iter()
+            .filter(|r| self.requesters.scope_contains(r.scope, d.sid)).map(|r| (r.start, r.end)).collect();
         for at in range.step_by(PAGE) {
-            if self.dmar.reserved.iter().any(|r| r.scope.contains(d.sid) && (r.start..r.end).contains(&at)) { continue; }
+            if reserved.iter().any(|&(start, end)| (start..end).contains(&at)) { continue; }
             if let Some(pte) = self.walk(None, d, at) { self.store(pte, 0); }
         }
         self.invalidate(d.unit, false, Some(d.id));

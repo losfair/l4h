@@ -7,6 +7,7 @@ QEMU 10 passes compatibility MSIs through regardless of CFIS, so only
 the disable bit's programming can be checked for that interrupt format.
 EDU registers: https://www.qemu.org/docs/master/specs/edu.html
 """
+import argparse
 import os
 from pathlib import Path
 import socket
@@ -50,8 +51,8 @@ class Qtest:
     def write(self, addr, value):
         self.command(f"writel {addr:#x} {value:#x}")
 
-    def config(self, dev, off, value=None):
-        self.command(f"outl 0xcf8 {0x80000000 | dev << 11 | (off & ~3):#x}")
+    def config(self, dev, off, value=None, bus=0):
+        self.command(f"outl 0xcf8 {0x80000000 | bus << 16 | dev << 11 | (off & ~3):#x}")
         if value is not None:
             self.command(f"outl 0xcfc {value:#x}")
         else:
@@ -59,6 +60,9 @@ class Qtest:
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--bridge", choices=("pci", "pcie-pci"))
+    args = parser.parse_args()
     OUT.mkdir(parents=True, exist_ok=True)
     initrd = OUT / "isolation.cpio.gz"
     subprocess.run([ROOT / "tools/mkinitramfs.sh", initrd, ROOT / "tests/guest/init-vtd"], check=True)
@@ -69,14 +73,25 @@ def main():
     config.write_text("dom0_mem_mb=128\ndom0_vcpus=1\nwatchdog_secs=0\niommu=1\niommu_intremap=1\n")
     env = dict(os.environ, L4H_QEMU_IOMMU="intel", L4H_DOM0_INITRD=str(initrd), L4H_CONFIG=str(config))
     env.setdefault("L4H_GUEST_KERNEL", str(ROOT / "build/linux-l4h/vmlinux.stripped"))
-    log = OUT / "isolation.log"
+    log = OUT / (f"isolation-{args.bridge}.log" if args.bridge else "isolation.log")
+    bridges = []
+    disk_bus = "pcie.0"
+    if args.bridge == "pci":
+        bridges = ["-device", "i82801b11-bridge,id=br,bus=pcie.0,addr=0x1e"]
+        disk_bus, alias, secondary = "br", "00:1e.0", 1
+    elif args.bridge == "pcie-pci":
+        bridges = ["-device", "pcie-root-port,id=rp,addr=8", "-device", "pcie-pci-bridge,id=br,bus=rp"]
+        disk_bus, alias, secondary = "br", "02:00.0", 2
+    if args.bridge:
+        bridges += ["-device", "edu,bus=br,addr=6,dma_mask=0xffffffffffffffff"]
     with tempfile.TemporaryDirectory(prefix="l4h-vtd-") as tmp, log.open("w") as output:
         sock = Path(tmp) / "qtest.sock"
         command = [str(ROOT / "tools/run-qemu.sh"),
             str(ROOT / "host/target/x86_64-sel4-roottask/debug/l4h-root.elf"),
             "-qtest", f"unix:{sock},server=on,wait=off", "-qtest-log", "/dev/null",
+            *bridges,
             "-drive", f"file={disk},if=none,id=vtdtest,format=raw",
-            "-device", "virtio-blk-pci,drive=vtdtest,disable-legacy=on,addr=5",
+            "-device", f"virtio-blk-pci,drive=vtdtest,disable-legacy=on,addr=5,bus={disk_bus}",
             "-device", "edu,addr=6,dma_mask=0xffffffffffffffff"]
         proc = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
         try:
@@ -85,9 +100,10 @@ def main():
             assert "serial monitor on port 0x3f8 (remapped interrupts" in log.read_text()
             q = Qtest(sock)
             fault_counts = {}
-            def fault(reason, name):
-                fault_counts[reason] = fault_counts.get(reason, 0) + 1
-                wait_for(lambda: log.read_text().count(f"00:06.0: fault {reason:#x},") >= fault_counts[reason], name)
+            def fault(reason, name, requester="00:06.0"):
+                key = (requester, reason)
+                fault_counts[key] = fault_counts.get(key, 0) + 1
+                wait_for(lambda: log.read_text().count(f"{requester}: fault {reason:#x},") >= fault_counts[key], name)
                 # Root prints before clearing F. Injecting the next fault
                 # in that interval would legitimately be compressed away.
                 wait_for(lambda: q.read(0xfed90034) & 2 == 0, "fault acknowledgement")
@@ -120,6 +136,22 @@ def main():
             fault(0x2, "DMA context fault")
             print("VTDTEST: unattached DMA blocked", flush=True)
 
+            if args.bridge:
+                # This EDU shares the disk's requester, so its context is
+                # present. It still cannot write outside the group's pool.
+                assert q.config(6, 0, bus=secondary) == 0x11e81234
+                shared_bar = q.config(6, 0x10, bus=secondary) & ~15
+                assert shared_bar != 0
+                q.config(6, 4, (q.config(6, 4, bus=secondary) & 0xffff) | 0x406, bus=secondary)
+                q.write(shared_bar + 0x80, 0x40000)
+                q.write(shared_bar + 0x88, scratch)
+                q.write(shared_bar + 0x90, 4)
+                q.write(shared_bar + 0x98, 3)
+                wait_for(lambda: q.read(shared_bar + 0x98) & 1 == 0, "shared requester DMA completion")
+                assert q.read(scratch) == 0xa55a5aa5, "shared requester wrote outside its domain"
+                fault(0x5, "shared requester DMA write fault", alias)
+                print("VTDTEST: shared requester DMA remains confined", flush=True)
+
             cap = q.config(6, 0x34) & 255
             for _ in range(48):
                 header = q.config(6, cap)
@@ -134,8 +166,8 @@ def main():
                 q.config(6, cap + 8, 0)
             q.config(6, cap, header | (1 << 16))  # MSI enable
 
-            # Entry zero belongs to the disk (00:05.0). Even a valid
-            # table index must fail when another requester sends it.
+            # Entry zero belongs to the disk's requester (its bridge alias
+            # when present). Another requester cannot use even a valid entry.
             for address, data, reason, name in [
                 (0xfee00010, 0, 0x26, "another device's IRTE"),
                 (0xfee00010 | ((uart_index & 0x7fff) << 5) | ((uart_index >> 15) << 2),

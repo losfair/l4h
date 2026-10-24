@@ -18,9 +18,12 @@ if [ "${1:-}" = --qemu ]; then
     cp "$root/build/qemu.log" "$out/ctl.log"
     "$root/tests/run-nettest.sh"
     cp "$root/build/qemu.log" "$out/net.log"
+    python3 "$root/tests/vtd-net-qemu.py"
     "$root/tests/run-monitor.sh"
     cp "$root/build/qemu-monitor.log" "$out/monitor.log"
     python3 "$root/tests/vtd-qemu.py"
+    python3 "$root/tests/vtd-qemu.py" --bridge pci
+    python3 "$root/tests/vtd-qemu.py" --bridge pcie-pci
     for setting in iommu_intremap=0 iommu=0; do
         printf '%s\n' "$setting" > "$out/disabled.conf"
         L4H_CONFIG="$out/disabled.conf" "$root/tests/run-blktest.sh"

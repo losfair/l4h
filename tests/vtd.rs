@@ -6,7 +6,131 @@ pub mod fixed;
 mod dmar;
 #[path = "../host/l4h-root/src/vtd/format.rs"]
 mod format;
+#[path = "../host/l4h-root/src/vtd/requester.rs"]
+mod requester;
+#[path = "../host/l4h-root/src/vtd/mappings.rs"]
+mod mappings;
 use dmar::Dmar;
+
+#[test]
+fn shared_dma_pool_is_unmapped_only_after_its_last_user() {
+    let mut m = mappings::Mappings::<2>::new();
+    assert!(m.acquire(1, 0x1000, 0x4000, true));
+    assert!(!m.acquire(1, 0x1000, 0x4000, true));
+    assert!(m.acquire(2, 0x1000, 0x4000, true));
+    assert!(!m.release(1, 0x1000, 0x4000));
+    assert!(m.release(2, 0x1000, 0x4000));
+    assert!(!m.acquire(1, 0x1000, 0x4000, true));
+    assert!(!m.release(1, 0x1000, 0x4000));
+    assert!(m.release(1, 0x1000, 0x4000));
+    assert!(m.acquire(1, 0x1000, 0x4000, false)); // reusable after final release
+    assert!(m.release(1, 0x1000, 0x4000));
+    assert!(!m.acquire(1, 0x1000, 0, true));
+    assert!(!m.release(1, 0x1000, 0));
+}
+
+#[test]
+fn shared_dma_tracking_rejects_ambiguous_ranges_and_permissions() {
+    for (pa, len, write) in [(0x2000, 0x4000, true), (0x1000, 0x4000, false)] {
+        let result = std::panic::catch_unwind(|| {
+            let mut m = mappings::Mappings::<2>::new();
+            m.acquire(1, 0x1000, 0x4000, true);
+            m.acquire(1, pa, len, write);
+        });
+        assert!(result.is_err());
+    }
+}
+
+fn bridge_config(sid: u16, secondary: u8, subordinate: u8, pcie_type: Option<u8>) -> (u16, [u32; 64]) {
+    let mut c = [0; 64];
+    c[0] = 0x1234_8086;
+    c[2] = 0x0604_0000;
+    c[3] = 1 << 16;
+    c[6] = (sid as u32 >> 8) | (secondary as u32) << 8 | (subordinate as u32) << 16;
+    if let Some(kind) = pcie_type {
+        c[1] = 1 << 20;
+        c[0x34 / 4] = 0x80;
+        c[0x80 / 4] = 0x10 | (kind as u32) << 20;
+    }
+    (sid, c)
+}
+
+fn requesters(config: &[(u16, [u32; 64])]) -> Option<requester::Requesters> {
+    requester::Requesters::discover(|b, d, f, o| {
+        let sid = (b as u16) << 8 | (d as u16) << 3 | f as u16;
+        config.iter().find(|(s, _)| *s == sid).map_or(u32::MAX, |(_, c)| c[o as usize / 4])
+    })
+}
+
+#[test]
+fn pcie_ports_preserve_requester_ids() {
+    let r = requesters(&[
+        bridge_config(0x28, 1, 3, Some(4)),
+        bridge_config(0x100, 2, 3, Some(5)),
+        bridge_config(0x200, 3, 3, Some(6)),
+    ]).unwrap();
+    for sid in [0x18, 0x118, 0x200, 0x318, 0x319, 0xfff8] { assert_eq!(r.requester(sid), sid); }
+}
+
+#[test]
+fn conventional_bridges_share_the_outer_bridge_requester() {
+    let r = requesters(&[
+        bridge_config(0xf0, 1, 2, None),
+        bridge_config(0x110, 2, 2, None),
+    ]).unwrap();
+    for sid in [0x110, 0x118, 0x119, 0x218, 0x2ff] { assert_eq!(r.requester(sid), 0xf0); }
+    assert_eq!(r.requester(0xf0), 0xf0);
+    assert_eq!(r.requester(0x318), 0x318);
+}
+
+#[test]
+fn pcie_to_pci_uses_secondary_bus_zero_devfn() {
+    let r = requesters(&[
+        bridge_config(0x28, 1, 3, Some(4)),
+        bridge_config(0x100, 2, 3, Some(7)),
+        bridge_config(0x210, 3, 3, None),
+    ]).unwrap();
+    for sid in [0x200, 0x210, 0x218, 0x219, 0x318] { assert_eq!(r.requester(sid), 0x200); }
+    assert_eq!(r.requester(0x100), 0x100);
+    assert_eq!(r.requester(0x28), 0x28);
+}
+
+#[test]
+fn bridge_on_a_nonzero_function_is_discovered() {
+    let mut f0 = [0; 64];
+    f0[0] = 0x1234_8086;
+    f0[3] = 1 << 23;
+    let r = requesters(&[(0xe8, f0), bridge_config(0xe9, 1, 1, None)]).unwrap();
+    assert_eq!(r.requester(0x118), 0xe9);
+}
+
+#[test]
+fn reserved_memory_follows_requester_groups() {
+    let r = requesters(&[bridge_config(0xf0, 1, 1, None)]).unwrap();
+    let reserved = dmar::Scope { first: 0x118, last: 0x118 };
+    assert!(r.scope_contains(reserved, r.requester(0x120)));
+    assert!(!r.scope_contains(reserved, 0x218));
+    let reserved = dmar::Scope { first: 0x200, last: 0x2ff };
+    assert!(r.scope_contains(reserved, 0x218));
+    assert!(!r.scope_contains(reserved, 0xf0));
+}
+
+#[test]
+fn rejects_bad_bridge_topology_and_capability_loops() {
+    for config in [
+        vec![bridge_config(0x28, 1, 1, None), bridge_config(0x30, 1, 1, None)],
+        vec![bridge_config(0x128, 1, 1, None)],
+        vec![bridge_config(0x28, 2, 1, None)],
+        vec![bridge_config(0x128, 2, 2, None), bridge_config(0x228, 1, 2, None)],
+    ] { assert!(requesters(&config).is_none()); }
+    let (sid, mut c) = bridge_config(0x28, 1, 1, Some(4));
+    c[0x80 / 4] |= 0x80 << 8;
+    assert!(requesters(&[(sid, c)]).is_none());
+    c[0x34 / 4] = 0x20;
+    assert!(requesters(&[(sid, c)]).is_none());
+    let r = requesters(&[bridge_config(0x28, 0, 0, None)]).unwrap();
+    assert_eq!(r.requester(0x118), 0x118);
+}
 
 fn table(blocks: &[Vec<u8>]) -> Vec<u8> {
     let mut b = vec![0; 48];

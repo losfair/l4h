@@ -1501,7 +1501,7 @@ in l4h needs: root alone gives devices memory.
   DMA confined but passes every interrupt unremapped. Hosts without a
   supported IOMMU include cloud VMs without a vIOMMU and aarch64. A
   device that no firmware scope covers is reported at enable and left untranslated.
-  Root blocks devices it does not drive. An integrated GPU that scans out
+  Root blocks requesters with no attached devices. An integrated GPU that scans out
   of system RAM therefore loses its picture: use `iommu=0` there.
 
 Intel VT-d uses the same driver-facing operations, with these differences:
@@ -1516,8 +1516,17 @@ Intel VT-d uses the same driver-facing operations, with these differences:
   48-bit second-level page table and domain ID. Contexts reject translated
   requests and ATS. RMRR ranges are identity mapped for their devices before
   translation is enabled and remain mapped after attach/unmap. Mapping
-  beyond the unit's address width is rejected. PCI requester aliases behind
-  conventional PCI bridges and phantom functions are not enabled.
+  beyond the unit's address width is rejected. Root walks PCI bridge
+  headers to resolve requester aliases: a conventional bridge uses its
+  own BDF, a PCIe-to-PCI bridge uses secondary-bus:00.0, and PCIe ports
+  preserve IDs. The outermost alias wins across nested bridges. Devices
+  sharing that requester share one domain; attaching another member adds
+  its buffers without replacing existing mappings. Shared guest I/O pools
+  are reference counted: detaching one disk leaves the pool mapped until
+  the last user releases it, then invalidation drains DMA before reuse.
+  RMRRs of any member
+  remain reserved for the whole group. Phantom functions and device-specific
+  requester quirks are not supported.
 - **Invalidation.** Units with queued invalidation get a page of 128-bit
   descriptors and a completion word. Maps invalidate cached misses; unmaps
   invalidate the domain's IOTLB and wait for DMA reads and writes to drain.
@@ -1526,7 +1535,12 @@ Intel VT-d uses the same driver-facing operations, with these differences:
   allocated until reboot. Command errors or a one-second timeout stop root.
 - **Interrupts.** When firmware and every unit support it, root enables
   interrupt remapping with a 256-entry table per unit. Each IRTE permits
-  exactly one requester ID and vector, delivered to APIC ID 0. The common
+  exactly one requester ID and vector, delivered to APIC ID 0. PCI bridge
+  aliases apply here too, even when virtio bypasses DMA translation
+  (`iommu_platform=off`). Members of a shared requester group can reach
+  the group's DMA memory and interrupt entries; hardware cannot isolate
+  them from one another. Root logs each device's shared requester at attach.
+  The common
   `Iommu::msi` interface returns both address and data: VT-d puts the table
   index in the remappable MSI address (SHV=0), while AMD-Vi uses MSI data.
   Compatibility interrupts are blocked globally, so they cannot bypass
@@ -1552,9 +1566,17 @@ and caching mode enabled, so cached missing translations must be invalidated.
 source validation and command encodings on the host; `--qemu` also runs
 virtio-blk, NVMe, VM lifecycle/unmapping, NIC and serial-monitor tests,
 including boot with interrupt remapping or the whole IOMMU disabled.
+`tests/vtd-net-qemu.py` checks two NICs and two disks on the root bus,
+behind conventional and PCIe-to-PCI bridges, and behind nested bridges. It exercises both
+`iommu_platform` settings and repeatedly creates/destroys a second guest
+to check packet delivery, disk I/O and shared pool mappings. Its optional
+`--tap TAP0 TAP1` uses vhost-net with existing TAP interfaces instead of QEMU's userspace backend;
+both interfaces need access to a gateway at 10.0.2.2/24.
 An unattached QEMU EDU device also attempts DMA and forged MSIs: its DMA,
 another device's valid IRTE, the UART I/O APIC's IRTE, and a non-present
-IRTE must all fault. The UART's redirection entry must use remappable
+IRTE must all fault. The `--bridge pci|pcie-pci` variants also verify that
+an EDU sharing the disk's requester cannot DMA outside the group's buffers.
+The UART's redirection entry must use remappable
 format, and serial commands must arrive through interrupts. QEMU
 10 passes compatibility-format interrupts through regardless of CFIS
 (`hw/i386/intel_iommu.c`, `vtd_interrupt_remap_msi`), so that test checks

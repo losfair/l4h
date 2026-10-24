@@ -4,7 +4,7 @@ use l4h_host::fixed::ArrayVec;
 
 pub const MAX_UNITS: usize = 16;
 const MAX_SCOPES: usize = 256;
-const MAX_RESERVED: usize = 128;
+pub const MAX_RESERVED: usize = 128;
 pub const MAX_IOAPICS: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
