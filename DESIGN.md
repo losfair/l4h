@@ -90,7 +90,8 @@ components and device drivers are written in Rust on rust-sel4.**
 
 Each `l4h-blkd` drives one attached disk. `l4h-netd` combines all switches
 and uplink NIC drivers in one component. The drivers are Rust: virtio-net,
-and gVNIC after Linux `gve`.
+gVNIC after Linux `gve`, ENA after Linux `ena` and the X550 after Linux
+`ixgbe`.
 
 Trust: the seL4 kernel, `l4h-root`, `l4h-memd`, `l4h-blkd`, `l4h-netd`
 and, with a TPM, `l4h-trustd` form the host TCB, which a TPM can attest (§9.2). dom0 is trusted for control-plane decisions (§9.1) but cannot
@@ -1270,7 +1271,7 @@ NAT, DHCP and firewalling belong in a VM.
 - **Path.** Guest `virtio_net` → `l4h-vmm` → shared net port rings →
   `l4h-netd` → destination port or uplink NIC. netd combines all switches
   and the uplink NIC drivers in one Rust component: modern and legacy
-  virtio-net, gVNIC and the Intel X550 (below).
+  virtio-net, gVNIC, Amazon ENA and the Intel X550 (below).
 - **Multiple vNICs.** Each vNIC is on one switch and appears as a separate
   `ethN`. It shares the guest's limit of 16 devices with the console,
   disks and, in dom0, control device. There are 48 guest ports in all.
@@ -1337,6 +1338,36 @@ NAT, DHCP and firewalling belong in a VM.
   coalescing (RSC) is off. On the revision 0 device of C3, releasing an
   admin queue that is not registered makes the device reset itself about
   a second later, so netd releases only a registered one.
+- **ENA.** `l4h-netd/src/ena.rs` follows Linux `ena` for the Elastic
+  Network Adapter of Nitro EC2 instances (1d0f:ec20 and the other IDs
+  Linux takes). **It has not run on EC2 yet**: QEMU has no ENA, so it was
+  checked only by building it and against the Linux driver. It resets the
+  device, reads registers readless (the device writes them to DMA memory)
+  unless the PCI revision says otherwise, and configures it through an
+  admin queue of 64-byte commands, polled. One TX and one RX queue, each
+  a submission queue with its completion queue, both on MSI-X entry 1;
+  entry 0 is the management vector (admin completions and the AENQ's
+  events; netd logs link changes and errors, and acknowledges
+  keep-alives). Both
+  carry netd's one vector. The device masks the I/O vector when it fires;
+  netd unmasks it through the TX CQ's register (as Linux, with 20 µs RX
+  and 64 µs TX coalescing) after draining RX, and while frames wait. An
+  RSS table sends every frame to the RX queue. Transmit: as Linux, the
+  low-latency queue (LLQ) in BAR 2, which root maps write-combining when
+  it fits netd's 16 MiB window: one 128-byte entry per frame with the
+  metadata and buffer descriptors and the frame's first 96 bytes, written
+  in 64-bit stores, `sfence`, then the doorbell, at most the device's
+  burst between doorbells. Without the BAR or Linux's LLQ layout, the
+  descriptors go to a ring in host memory. Every frame has a metadata
+  descriptor (meta caching off); partial L4 checksums over IPv4/IPv6 are
+  left to the device when it offers them. ENA does no TSO here: netd
+  segments. TX buffers hold frames up to the device's MTU, which netd
+  sets to its maximum; longer frames are dropped. Receive: 2 KiB buffers,
+  a frame spanning several (jumbo frames); an L4 checksum the device
+  checked and found good, on an unfragmented frame without an IPv4 header
+  error, becomes `DATA_VALID`. Not done: the keep-alive watchdog and
+  device reset on errors, which Linux has (netd has no timer), and
+  ENA Express.
 - **Learning and security.** MAC entries age after 300 s, with at most
   1024 per switch and 8192 in all. A full table drops expired entries and
   then stops learning; unknown unicast, broadcast and multicast are
@@ -1488,7 +1519,7 @@ the host keeps that dynamic plumbing simple.
 | `l4h-root` | 1 | Allocates I/O pools, host objects and vCPU scheduling contexts, from memory it gets from memd. Builds guest CSpaces, kernel VSpaces and boot info, loads dom0's images (modules) and copies runtime image uploads. Runs lifecycle, control, balancing, monitor and dashboard; authorizes disk and NIC attachments. |
 | `l4h-vmm` | 1 per guest | Serves virtio backends, console and hypercalls using the guest's I/O pool and host-owned shared pages. Never maps guest RAM. Forwards control requests from dom0 to root. |
 | `l4h-blkd` | 1 per attached disk | Validates pool addresses and LBA windows and drives a virtio-blk, virtio-scsi or NVMe PCI disk. |
-| `l4h-netd` | 1 | Runs all L2 switches, dynamic guest ports and the virtio-net, gVNIC and X550 uplink drivers. |
+| `l4h-netd` | 1 | Runs all L2 switches, dynamic guest ports and the virtio-net, gVNIC, ENA and X550 uplink drivers. |
 | `l4h-trustd` | 0 or 1 | With a TPM: has the TPM quote its signing key, and signs guests' reports with it (§9.2). |
 | `l4h-memd` | 1 | Owns the free memory and every guest's RAM blocks; gives root memory for host objects; reports free memory to the hypervisor (§16). |
 
@@ -1966,7 +1997,8 @@ a locality, so a command only runs if trustd ran the `_DSM`.
    - `fb_console=1` (GRUB, seL4, l4h-root): GRUB and the seL4 console
      (patch 0020) on the screen; the dashboard keeps to the upper half.
 4. Later targets: AWS (ENA and NVMe) and Azure (MANA and NVMe), each mainly
-   adding one NIC driver.
+   adding one NIC driver. netd's ENA driver is written (§8.3) but has not
+   run on EC2; an AMI builder and an EC2 test are still to come.
 
 **Status (v1).**
 

@@ -1,8 +1,8 @@
 //! netd: L2 virtual switches (DESIGN.md §8.3) and the uplink NIC drivers.
 //!
 //! Every port belongs to one switch.  A port is either a guest vNIC (a
-//! channel to that guest's l4h-vmm) or an uplink NIC (virtio-net or gVNIC
-//! PCI, driven here).  Switches learn source MACs, forward known unicast to one
+//! channel to that guest's l4h-vmm) or an uplink NIC (virtio-net, gVNIC,
+//! ENA or X550 PCI, driven here).  Switches learn source MACs, forward known unicast to one
 //! port and flood everything else within the switch.  Guest ports can be
 //! locked to their configured MAC.  Nothing above L2 is looked at.
 //!
@@ -13,6 +13,7 @@
 #![no_std]
 #![no_main]
 
+mod ena;
 mod gvnic;
 mod ixgbe;
 mod nic;

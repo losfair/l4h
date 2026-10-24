@@ -1,5 +1,5 @@
-//! netd: the L2 virtual switches and the uplink NIC drivers (virtio-net
-//! and Google gVNIC).
+//! netd: the L2 virtual switches and the uplink NIC drivers (virtio-net,
+//! Google gVNIC, Amazon ENA and Intel X550).
 //!
 //! A port channel is one shared region between netd and a client (a
 //! guest's l4h-vmm, one per virtio-net device) with a TX ring (client ->
@@ -104,12 +104,14 @@ pub const NETD_NIC_MAC: u64 = 5;
 pub const NIC_VIRTIO: u32 = 0;
 pub const NIC_GVNIC: u32 = 1;
 pub const NIC_IXGBE: u32 = 2;
+pub const NIC_ENA: u32 = 3;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct NicConfig {
     pub kind: u32,
-    /// PCI revision ID (gVNIC: 0 takes the admin queue by page frame).
+    /// PCI revision ID (gVNIC: 0 takes the admin queue by page frame; ENA:
+    /// bit 0 has registers read directly).
     pub revision: u32,
     pub pci_bdf: u32,
     pub msi_data: u32,
@@ -124,7 +126,9 @@ pub struct NicConfig {
     pub isr: crate::blk::PciRegion,
     pub device: crate::blk::PciRegion,
     pub msix_table: crate::blk::PciRegion,
-    /// gVNIC: register BAR 0 and doorbell BAR 2; X550: register BAR 0.
+    /// gVNIC: register BAR 0 and doorbell BAR 2; X550: register BAR 0;
+    /// ENA: register BAR 0 and, if netd can use it, the LLQ memory in BAR 2,
+    /// mapped write-combining.
     pub regs: crate::blk::PciRegion,
     pub doorbells: crate::blk::PciRegion,
     pub dma_paddr: u64,

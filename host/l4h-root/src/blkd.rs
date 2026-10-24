@@ -36,9 +36,18 @@ pub const WINDOW_ALIGN: u64 = 8;
 pub const DEVICE_ATTRS: VmAttributes = VmAttributes::CACHE_DISABLED;
 #[cfg(target_arch = "aarch64")]
 pub const DEVICE_ATTRS: VmAttributes = VmAttributes::EXECUTE_NEVER;
+
+/// Mapping attributes for device memory written in bursts (ENA's LLQ):
+/// write-combining where the architecture has it.
+fn wc_attrs() -> VmAttributes {
+    #[cfg(target_arch = "x86_64")]
+    return VmAttributes::from_inner(sel4::sys::seL4_X86_VMAttributes::seL4_X86_WriteCombining);
+    #[cfg(target_arch = "aarch64")]
+    return DEVICE_ATTRS;
+}
 const DMA_BITS: usize = 22;
 /// Each BAR is mapped at MMIO_VA + bar * BAR_STRIDE.
-const BAR_STRIDE: usize = 0x100_0000;
+pub const BAR_STRIDE: usize = 0x100_0000;
 
 const VIRTIO_VENDOR: u16 = 0x1af4;
 const VIRTIO_PCI_CAP_COMMON_CFG: u8 = 1;
@@ -319,7 +328,7 @@ pub fn start(
     };
 
     // ---- Device BARs (uncached).
-    map_bar_mask(&comp, alloc, &mut arena, devmem, d, &mut disk.bars, bars, bar_va, &mut keep_slot);
+    map_bar_mask(&comp, alloc, &mut arena, devmem, d, &mut disk.bars, bars, 0, bar_va, &mut keep_slot);
     for i in 0..n_dma {
         let f = sel4::init_thread::Slot::<cap_type::Granule>::from_index(dma_frames.start + i).cap();
         comp.map_copy(alloc, &mut arena, &abs_of(f), host::DMA_VA + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep_slot());
@@ -609,8 +618,9 @@ pub fn keep_bits(pages: usize) -> usize {
 /// BAR.
 pub type BarCache = [Option<Range<Slot>>; 6];
 
-/// Map BARs `bars` (bit b for BAR b) of `d` into `comp`, uncached.  BAR
-/// frames are carved once and cached in `cache`.
+/// Map BARs `bars` (bit b for BAR b) of `d` into `comp`, uncached, or
+/// write-combining for those in `wc`.  BAR frames are carved once and
+/// cached in `cache`.
 #[allow(clippy::too_many_arguments)]
 pub fn map_bar_mask(
     comp: &Component,
@@ -620,11 +630,13 @@ pub fn map_bar_mask(
     d: &pci::Device,
     cache: &mut BarCache,
     bars: u8,
+    wc: u8,
     bar_va: impl Fn(u8) -> usize,
     keep: &mut impl FnMut() -> sel4::AbsoluteCPtr,
 ) {
     for b in (0..6).filter(|b| bars & 1 << b != 0) {
         let frames = bar_frames(alloc, devmem, d, cache, b);
+        let attrs = if wc & 1 << b != 0 { wc_attrs() } else { DEVICE_ATTRS };
         for (i, f) in frames.map(crate::devmem::granule).enumerate() {
             comp.map_copy(
                 alloc,
@@ -632,7 +644,7 @@ pub fn map_bar_mask(
                 &abs_of(f),
                 bar_va(b) + i * PAGE,
                 CapRights::read_write(),
-                DEVICE_ATTRS,
+                attrs,
                 keep(),
             );
         }

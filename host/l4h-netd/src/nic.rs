@@ -1,11 +1,12 @@
-//! Uplink NICs: a virtio-net, gVNIC or Intel X550 device, and the frames waiting for
-//! one of its TX buffers.
+//! Uplink NICs: a virtio-net, gVNIC, Amazon ENA or Intel X550 device, and the
+//! frames waiting for one of its TX buffers.
 
 use core::ptr::addr_of_mut;
 
 use l4h_rt::host::fixed::ArrayVec;
 use l4h_rt::host::net::{self, NicConfig};
 
+use crate::ena::Ena;
 use crate::gvnic::Gvnic;
 use crate::ixgbe::Ixgbe;
 use crate::pool::{Fifo, Pool};
@@ -17,7 +18,7 @@ const HDR: usize = net::HDR_SIZE;
 const TX_BACKLOG_FRAMES: usize = 512;
 const TX_BACKLOG_CHUNKS: usize = (4 << 20) / crate::pool::CHUNK;
 
-/// A frame that spans receive buffers, while they arrive (gVNIC, X550):
+/// A frame that spans receive buffers, while they arrive (gVNIC, ENA, X550):
 /// one per NIC, too large for the stack.
 pub type Partial = ArrayVec<u8, { net::MAX_FRAME }>;
 static mut RX_PARTIAL: [Partial; net::MAX_NICS] = [const { Partial::new() }; net::MAX_NICS];
@@ -25,6 +26,7 @@ static mut RX_PARTIAL: [Partial; net::MAX_NICS] = [const { Partial::new() }; net
 enum Dev {
     Virtio(VirtioNet),
     Gvnic(Gvnic),
+    Ena(Ena),
     Ixgbe(Ixgbe),
 }
 
@@ -34,6 +36,7 @@ macro_rules! dev {
         match &mut $self.dev {
             Dev::Virtio($d) => $e,
             Dev::Gvnic($d) => $e,
+            Dev::Ena($d) => $e,
             Dev::Ixgbe($d) => $e,
         }
     };
@@ -60,6 +63,11 @@ impl Nic {
                 let (mac, csum, tso) = (g.mac, g.csum, g.tso);
                 (Dev::Gvnic(g), mac, csum, tso)
             }
+            net::NIC_ENA => {
+                let e = Ena::new(n, c, tsc_hz, partial);
+                let (mac, csum, tso) = (e.mac, e.csum, e.tso);
+                (Dev::Ena(e), mac, csum, tso)
+            }
             net::NIC_IXGBE => {
                 let x = Ixgbe::new(n, c, tsc_hz, partial);
                 let (mac, csum, tso) = (x.mac, x.csum, x.tso);
@@ -79,6 +87,7 @@ impl Nic {
         match &self.dev {
             Dev::Virtio(_) => self.tso,
             Dev::Gvnic(g) => g.takes_gso(hdr),
+            Dev::Ena(_) => false,
             Dev::Ixgbe(x) => x.takes_gso(hdr),
         }
     }

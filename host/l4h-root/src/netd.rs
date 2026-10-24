@@ -8,7 +8,7 @@ use l4h_abi as abi;
 use l4h_host::fixed::ArrayVec;
 use l4h_host::{self as host, net};
 
-use crate::blkd::{VirtioRegions, bar_pages, is_legacy_virtio, keep_bits, map_bar_mask, virtio_bar_mask, virtio_regions};
+use crate::blkd::{BAR_STRIDE, VirtioRegions, bar_pages, is_legacy_virtio, keep_bits, map_bar_mask, virtio_bar_mask, virtio_regions};
 use crate::component::{self, Component, SpawnArgs, abs_of};
 use crate::devmem::DevMem;
 use crate::guest::Guest;
@@ -62,9 +62,27 @@ pub fn is_ixgbe(d: &pci::Device) -> bool {
         && d.msix.is_some_and(|m| m.table_size >= 2)
 }
 
+/// Amazon Elastic Network Adapter (Linux ena), as on every Nitro EC2
+/// instance: registers in BAR 0, MSI-X with the management entry and one
+/// for the I/O queues.
+pub fn is_ena(d: &pci::Device) -> bool {
+    d.vendor == 0x1d0f
+        && matches!(d.device, 0x0ec2 | 0x1ec2 | 0xec20 | 0xec21 | 0x0051)
+        && !d.bars[0].is_io
+        && d.bars[0].size != 0
+        && d.msix.is_some_and(|m| m.table_size >= 2)
+}
+
+/// ENA's low-latency queue memory, BAR 2, if netd's window for it holds
+/// it.  Without it, TX descriptors are in host memory.
+fn ena_llq(d: &pci::Device) -> bool {
+    let b = d.bars[2];
+    is_ena(d) && !b.is_io && b.size != 0 && b.size as usize <= BAR_STRIDE
+}
+
 /// NICs netd can drive as an uplink.
 pub fn is_uplink(d: &pci::Device) -> bool {
-    is_virtio_net(d) || is_gvnic(d) || is_ixgbe(d)
+    is_virtio_net(d) || is_gvnic(d) || is_ena(d) || is_ixgbe(d)
 }
 
 pub struct Nic {
@@ -104,6 +122,8 @@ fn call(ep: cap::Endpoint, label: u64, args: &[u64]) -> u64 {
 fn used_bars(d: &pci::Device) -> u8 {
     if is_gvnic(d) {
         1 | 1 << 2 | 1 << d.msix.unwrap().table_bar
+    } else if is_ena(d) {
+        1 | (ena_llq(d) as u8) << 2 | 1 << d.msix.unwrap().table_bar
     } else if is_ixgbe(d) {
         1 | 1 << d.msix.unwrap().table_bar
     } else {
@@ -133,8 +153,9 @@ pub fn spawn(
         let bar_region = |b: u8| l4h_host::blk::PciRegion { va: bar_va(b) as u64, len: d.bars[b as usize].size };
         let none = l4h_host::blk::PciRegion { va: 0, len: 0 };
         let gvnic = is_gvnic(d);
+        let ena = is_ena(d);
         let ixgbe = is_ixgbe(d);
-        let VirtioRegions { common, notify, notify_mult, isr, device, msix_table } = if is_legacy(d) || gvnic || ixgbe {
+        let VirtioRegions { common, notify, notify_mult, isr, device, msix_table } = if is_legacy(d) || gvnic || ena || ixgbe {
             let msix = d.msix.unwrap();
             VirtioRegions {
                 common: none,
@@ -164,6 +185,8 @@ pub fn spawn(
         cfg.nics[n] = net::NicConfig {
             kind: if gvnic {
                 net::NIC_GVNIC
+            } else if ena {
+                net::NIC_ENA
             } else if ixgbe {
                 net::NIC_IXGBE
             } else {
@@ -180,8 +203,8 @@ pub fn spawn(
             isr,
             device,
             msix_table,
-            regs: if gvnic || ixgbe { bar_region(0) } else { none },
-            doorbells: if gvnic { bar_region(2) } else { none },
+            regs: if gvnic || ena || ixgbe { bar_region(0) } else { none },
+            doorbells: if gvnic || ena_llq(d) { bar_region(2) } else { none },
             dma_paddr: paddr as u64,
             dma_size: 1 << NIC_DMA_BITS,
         };
@@ -218,7 +241,9 @@ pub fn spawn(
     let mut nic_list = ArrayVec::new();
     for (n, d) in nics.into_iter().take(nr_nics).enumerate() {
         let mut bars = [const { None }; 6];
-        map_bar_mask(&comp, alloc, &mut arena, devmem, &d, &mut bars, used_bars(&d), |b| net::nic_bar_va(n, b as usize), &mut keep_slot);
+        // ENA's LLQ is written in 128-byte bursts.
+        let wc = (ena_llq(&d) as u8) << 2;
+        map_bar_mask(&comp, alloc, &mut arena, devmem, &d, &mut bars, used_bars(&d), wc, |b| net::nic_bar_va(n, b as usize), &mut keep_slot);
         for (i, s) in dma[n].clone().enumerate() {
             let f = sel4::init_thread::Slot::<cap_type::Granule>::from_index(s).cap();
             comp.map_copy(alloc, &mut arena, &abs_of(f), net::nic_dma_va(n) + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep_slot());
