@@ -11,7 +11,7 @@
 #include <l4h_uctx.h>
 
 #define KEMU_ARCH_VECTOR_CACHE 1
-void kemu_arch_read_xmm(u64 xmm[8][2]);
+u32 kemu_arch_read_fpu(u64 xmm[8][2]);
 
 /*
  * l4h keeps registers in an array and the syscall number separately.

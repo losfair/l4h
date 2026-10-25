@@ -5,7 +5,7 @@
 /bin/busybox mount -t devtmpfs dev /dev
 /bin/busybox ln -sf busybox /bin/true
 echo 'KEMUTEST: start'
-if /bin/kemu-abi && /bin/kemu-vectors; then
+if /bin/kemu-abi && /bin/kemu-vectors && /bin/kemu-fp-status; then
     echo 'KEMUTEST: PASS'
 else
     echo 'KEMUTEST: FAIL'

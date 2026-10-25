@@ -17,10 +17,11 @@
 void kemu_svc(struct pt_regs *regs);
 void kemu_op(struct pt_regs *regs, unsigned long op);
 
-void kemu_arch_read_xmm(u64 xmm[8][2])
+u32 kemu_arch_read_fpu(u64 xmm[8][2])
 {
 	const struct _xstate *fp = (void *)current->thread.regs.regs.fp;
 	unsigned long flags;
+	u32 mxcsr;
 
 	/* User SIMD state belongs to its seL4 TCB, not the kernel TCB.
 	 * Keep the per-vCPU ReadFPU scratch area stable while fetching it;
@@ -29,11 +30,15 @@ void kemu_arch_read_xmm(u64 xmm[8][2])
 	l4h_fpu_fetch(current);
 	/* XSAVE may leave stale bytes for a component in its init state. */
 	if (host_fp_size > sizeof(fp->fpstate) &&
-	    !(fp->xstate_hdr.xfeatures & XFEATURE_MASK_SSE))
+	    !(fp->xstate_hdr.xfeatures & XFEATURE_MASK_SSE)) {
 		memset(xmm, 0, 8 * 16);
-	else
+		mxcsr = 0x1f80;
+	} else {
 		memcpy(xmm, fp->fpstate.xmm_space, 8 * 16);
+		mxcsr = fp->fpstate.mxcsr;
+	}
 	local_irq_restore(flags);
+	return mxcsr;
 }
 
 bool kemu_do_syscall(struct pt_regs *regs, int nr)

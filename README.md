@@ -139,8 +139,9 @@ to run AArch64 Linux userspace directly. `tools/build-linux.sh` imports its
 patches and source overlay, then applies l4h's kernel patches.
 `CONFIG_KEMU=y` and `CONFIG_RUST=y` are enabled by default on x86_64.
 AArch64 guest kernels continue to execute AArch64 programs natively.
-`tests/run-kemutest.sh` checks the emulated ABI, tagged addresses, and vector
-state across threads and signals (requires `gcc-aarch64-linux-gnu` and cross libc headers);
+`tests/run-kemutest.sh` checks the emulated ABI, tagged addresses, vector
+state across threads and signals, and FP exception flags in signal contexts
+(requires `gcc-aarch64-linux-gnu` and cross libc headers);
 `KEMU_CMDLINE=kemu.jit=0` checks the interpreter instead.
 
 An assembled `build/l4h-aarch64.img` also boots directly on Apple Silicon
@@ -184,7 +185,7 @@ without it, the host reports `unknown`.
 | `tests/run-alloctest.sh` | host allocator growth under fragmentation, reclaim and fixed-container panic safety |
 | `tests/run-abitest.sh` | guest ABI and seL4 extensions, from a module built against the module tree |
 | `tests/run-selftest.sh [vcpus]` | syscalls, memory, signals, fork, threads, futex, SMP stress |
-| `tests/run-kemutest.sh [vcpus]` | AArch64 userspace on x86_64: kemu syscalls, signals, TLS, threads, fork/exec, ptrace, single-step and vector state |
+| `tests/run-kemutest.sh [vcpus]` | AArch64 userspace on x86_64: kemu syscalls, signals, TLS, threads, fork/exec, ptrace, single-step, vector state and FP exception flags |
 | `tests/run-reclaimtest.sh [secs]` | 128 MiB checking workload in a 64 MiB memcg, with 32 MiB read-only hot data and swap; `RECLAIM_SWAP_DIR=/dev/shm` puts swap in host RAM |
 | `tests/run-objtest.sh [vcpus]` | object memory growth under fragmentation, block conversion, SMP memory stress, OOM recovery |
 | `tests/run-cryptotest.sh [vcpus] [secs] [MiB]` | dm-crypt with AES-NI (x86_64) or the ARMv8 Crypto Extensions (aarch64) vs generic C (cross-check, throughput), user SIMD state under concurrent kernel crypto |
