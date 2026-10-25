@@ -20,9 +20,12 @@ case " $(cat /proc/cmdline) " in
     while :; do sleep 10; done ;;
 *" l4htest=dmacheck "*)
     # Fill most of RAM with zeros and watch for disk data appearing in it:
-    # DMA of the destroyed dmaload guest landing in reused memory.
+    # DMA of the destroyed dmaload guest landing in reused memory.  All
+    # that is available but 20 MiB, which the kernel's size does not
+    # change.
+    fill=$(($(sed -n 's/^MemAvailable: *\([0-9]*\) kB/\1/p' /proc/meminfo) / 1024 - 20))
     mkdir -p /tmp/z && mount -t tmpfs -o size=100m tmp /tmp/z
-    dd if=/dev/zero of=/tmp/z/fill bs=1M count=80 2>/dev/null
+    dd if=/dev/zero of=/tmp/z/fill bs=1M count="$fill" 2>/dev/null
     echo "GUEST: dma check start"
     for i in $(seq 1 10); do
         sleep 2

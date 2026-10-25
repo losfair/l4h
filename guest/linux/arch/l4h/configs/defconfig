@@ -190,6 +190,8 @@ CONFIG_ASHMEM=y
 # and system_server reads the maps of: software perf events and event
 # tracing, with the GPU memory tracepoints.
 CONFIG_PERF_EVENTS=y
+# The host's PMU is not the guest's (asm/perf_event.h).
+# CONFIG_ARM_PMU is not set
 CONFIG_ENABLE_DEFAULT_TRACERS=y
 CONFIG_TRACE_GPU_MEM=y
 # AF_VSOCK, with no transport to a host but loopback: Cuttlefish's HALs
