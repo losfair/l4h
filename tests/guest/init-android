@@ -1,0 +1,31 @@
+#!/bin/sh
+# dom0 of tests/run-android.sh: it runs Android in a VM, with Android's
+# disk (host disk 1) and a virtio-gpu display, waits for Android to
+# complete its boot, and writes a screenshot of the display to its own
+# disk (host disk 0) for the host to look at.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mount -t tmpfs tmp /tmp
+fail() { echo "ANDROIDVM: FAIL $*"; poweroff -f; exit 1; }
+arg() { sed -n "s/.*$1=\([^ ]*\).*/\1/p" /proc/cmdline; }
+slow=$(arg L4H_TEST_SLOW)
+slow=${slow:-1}
+size=$(arg android_gpu)
+id=$(l4hctl create android --initrd /bin/initrd.img --mem "$(arg android_mem)" \
+    --vcpus "$(arg android_vcpus)" --io-pool 256 --disk 1 --gpu "$size" \
+    --cmdline "console=hvc0 lsm=selinux psi=1 bootconfig printk.devkmsg=on loop.max_part=7") \
+    || fail "create"
+echo "ANDROIDVM: created vm $id"
+l4hctl console "$id" --until "processing action (sys.boot_completed=1" \
+    --timeout "$((900 * slow))" >/dev/null || fail "Android did not complete its boot"
+echo "ANDROIDVM: boot completed"
+# What the home screen shows once it has drawn.
+sleep "$((60 * slow))"
+echo "ANDROIDVM: taking a screenshot"
+l4hctl screenshot "$id" /tmp/screen.ppm || fail "screenshot"
+cat /tmp/screen.ppm > /dev/vda && sync
+echo "ANDROIDVM: screenshot of $size"
+l4hctl destroy "$id" || fail "destroy"
+echo "ANDROIDVM: PASS"
+poweroff -f

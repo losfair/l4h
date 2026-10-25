@@ -1047,7 +1047,7 @@ guest's command line asks for it:
 | userfaultfd, `MREMAP_DONTUNMAP`, `UFFDIO_MOVE` | ART's default (concurrent compacting) garbage collector | unused |
 | `/dev/rtc0` with alarms | the `CLOCK_*_ALARM` clocks | present |
 | dma-buf heaps, `sync_file` | gralloc buffers and fences | unused |
-| DRM with vkms, a module | the display SurfaceFlinger composes for | no display until vkms is loaded |
+| DRM with virtio-gpu (dumb buffers on render nodes, patch 0012; its 32-bit formats, patch 0013) or vkms, modules | the display SurfaceFlinger composes for | no display until a driver is loaded |
 | evdev, uinput | input | no input devices |
 | zram with LZ4 | swap | unconfigured |
 | legacy iptables with the matches and targets netd uses, policy routing, `SOCK_DESTROY`, XFRM | netd | empty tables |
@@ -1139,21 +1139,27 @@ A/B snapshots) and the ashmem ioctls on memfds.
 
 #### Booting Android
 
-`tests/run-android.sh` boots Android 17 as dom0, from the images of
+Android runs in a VM, which dom0 creates, as any other guest: never as
+dom0. `tests/run-android.sh` boots Android 17 so, from the images of
 Cuttlefish's 64-bit-only x86_64 build (`aosp_cf_x86_64_only_phone`,
 ci.android.com), which `tools/mkandroid.sh` turns into an initramfs and a
-disk. The emulator's system images were tried first: they render only
-through the emulator's host (goldfish pipes, gfxstream), where Cuttlefish
-has a software renderer in the guest. Nothing of Cuttlefish is changed
-but what a bootloader and Cuttlefish's launcher would give it:
+disk. dom0 (`tests/guest/init-android`) creates the VM with the disk
+(host disk 1), a virtio-gpu display of 720x1200 and a 256 MiB I/O pool,
+waits on its console for `init` to run the actions of
+`sys.boot_completed=1`, and takes a screenshot (`l4hctl screenshot`),
+which must not be blank. The emulator's system images were tried first:
+they render only through the emulator's host (goldfish pipes,
+gfxstream), where Cuttlefish has a software renderer in the guest.
+Nothing of Cuttlefish is changed but what a bootloader and Cuttlefish's
+launcher would give it:
 
 - **The initramfs** is the vendor ramdisk and the generic one, then an
   archive of l4h's and a bootconfig. Both ramdisks are legacy LZ4, which
   ends only with the data or a zero frame length: four zero bytes end it
   before l4h's archive. That archive replaces the first-stage fstab (the
   same partitions, without AVB: the device is unlocked) and the modules
-  first-stage init loads, built for another kernel, with l4h's vkms and
-  what it depends on.
+  first-stage init loads, built for another kernel, with l4h's
+  `virtio_gpu` and what it depends on.
 - **The disk** is one GPT, whose partitions first-stage init finds by
   name, on the platform device all virtio-l4h disks hang off
   (`androidboot.boot_devices=virtio-l4h`): misc, frp (the persistent data
@@ -1164,19 +1170,29 @@ but what a bootloader and Cuttlefish's launcher would give it:
   platform's policy labels `/odm`, with an init script of l4h's: a
   logcat of errors and boot progress on the console (Cuttlefish logs
   everything to `/dev/hvc2`, which is too much for the console, and l4h
-  has no hvc2), and an empty sensors list mounted over the vendor's.
-- **The boot properties** are those of a guest that renders in software:
-  ANGLE on SwiftShader, minigbm buffers, and drm_hwcomposer on vkms
-  (Cuttlefish's ranchu composer drives only virtio-gpu); KeyMint and
+  has no hvc2, so that logcat is disabled), and an empty sensors list
+  mounted over the vendor's.
+- **The boot properties** are those of Cuttlefish's `guest_swiftshader`
+  mode: ANGLE on SwiftShader, minigbm buffers, and Cuttlefish's ranchu
+  composer on the virtio-gpu, its framebuffers BGRA; KeyMint and
   Gatekeeper in the guest; a vsock port above 1024 for the lights HAL.
-  The HALs that talk to Cuttlefish's host over serial ports (OemLock,
-  UWB, NFC, Bluetooth) are left out: naming an APEX in
+  The HALs that talk to Cuttlefish's host (OemLock, UWB, NFC, Bluetooth,
+  the radio, Thread) are left out: naming an APEX in
   `androidboot.vendor.apex.<name>` with no file of that name keeps apexd
   from activating it, and `system_server` would wait for the services
-  they declare. Sensors are none for the same reason.
+  they declare, or they would start and stop again for good, which fills
+  the console. Sensors are none for the same reason.
+- **The display.** minigbm allocates the buffers of a virtio-gpu without
+  3D as dumb buffers, through the render node (the composer is the DRM
+  master on the primary node), which mainline does not allow: patch 0012
+  allows it, as the Android kernels do. The composer commits ARGB8888
+  framebuffers, which mainline's virtio-gpu plane does not take (XRGB8888
+  only): patch 0013 offers the eight 32-bit formats of the virtio-gpu
+  protocol, which l4h-vmm has, as the Android kernels do. Every buffer
+  is mapped through the VM's I/O pool, hence its size.
 
-The test passes once `init` runs the actions of `sys.boot_completed=1`,
-about 90 s after the boot on four vCPUs and 3 GiB.
+Android completes its boot about 150 s after the VM starts, on four
+vCPUs and 3 GiB, and shows its lock screen (`build/android/screen.png`).
 
 `tests/run-androidtest.sh` boots `tests/guest/androidtest.c` with
 Android's command line and a bootconfig: Binder transactions of up to

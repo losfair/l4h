@@ -38,10 +38,10 @@ Third-party components, including the submodules in `kernel/seL4` and
     SELinux, PSI, bootconfig, userfaultfd, an RTC with alarms, dma-buf
     heaps, ashmem, metadata encryption, BPF on tracepoints, a vkms display
     as a module), off for other guests unless they ask.
-  - Android 17 boots as dom0 to `sys.boot_completed`: Cuttlefish's 64-bit-only
+  - Android 17 boots in a VM to its lock screen: Cuttlefish's 64-bit-only
     x86_64 build, unchanged but for its boot properties and ODM partition
     (`tools/mkandroid.sh`, `tests/run-android.sh`), rendering in software
-    (SwiftShader) onto vkms.
+    (SwiftShader) onto the VM's virtio-gpu display.
   - A virtio-gpu display (2D) for VMs, `l4hctl create --gpu WxH`, which dom0
     reads with `l4hctl screenshot`.
 - **Block.** Passed-through virtio-blk, virtio-scsi and NVMe disks, or read-only and

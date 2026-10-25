@@ -23,7 +23,7 @@
 #     verified: the device is unlocked);
 #   - the modules first-stage init loads, built for another kernel, with
 #     those of the kernel in <modules dir> (lib/modules/<release>) that
-#     the display needs: vkms and what it depends on;
+#     the display needs: virtio_gpu (l4h-vmm's) and what it depends on;
 # and a bootconfig with the vendor's androidboot.* and what Cuttlefish's
 # launcher adds for a guest that renders in software (SwiftShader).
 # Usage: mkandroid.sh <image dir> <modules dir> <out dir>
@@ -55,8 +55,8 @@ vendor_dlkm /vendor_dlkm erofs ro wait,logical,first_stage_mount,slotselect
 odm_dlkm    /odm_dlkm    erofs ro wait,logical,first_stage_mount,slotselect
 system_dlkm /system_dlkm erofs ro wait,logical,first_stage_mount,slotselect
 EOF
-# vkms and its dependencies, in the order modprobe would load them.
-python3 - "$mods" "$dir/l4h/lib/modules" vkms <<'PY'
+# virtio_gpu and its dependencies, in the order modprobe would load them.
+python3 - "$mods" "$dir/l4h/lib/modules" virtio_gpu <<'PY'
 import os, shutil, sys
 src, dst, want = sys.argv[1], sys.argv[2], sys.argv[3:]
 deps = {}
@@ -101,18 +101,21 @@ props = {
     'console': 'hvc0',
     'serialno': 'l4h0',
     # Rendering in the guest: ANGLE on SwiftShader (pastel), buffers from
-    # minigbm, shown on DRM (vkms) by drm_hwcomposer: Cuttlefish's ranchu
-    # composer drives only virtio-gpu.
+    # minigbm, shown on the virtio-gpu (DRM), as Cuttlefish's
+    # guest_swiftshader mode does; its framebuffers are BGRA, all that
+    # virtio-gpu takes.
     'hardware.gralloc': 'minigbm',
-    'hardware.hwcomposer': 'drm',
+    'hardware.hwcomposer': 'ranchu',
+    'hardware.hwcomposer.display_finder_mode': 'drm',
+    'hardware.hwcomposer.display_framebuffer_format': 'bgra',
     'hardware.egl': 'angle',
     'hardware.vulkan': 'pastel',
     'hardware.guest_hwui_renderer': 'skiagl',
     'opengles.version': '196609',
     'cpuvulkan.version': '4202496',
-    'lcd_density': '160',
+    'lcd_density': '320',
     'vendor.apex.com.android.hardware.graphics.composer':
-        'com.android.hardware.graphics.composer.drm_hwcomposer',
+        'com.android.hardware.graphics.composer.ranchu',
     # KeyMint and Gatekeeper in the guest: there is no host to keep keys.
     'vendor.apex.com.android.hardware.keymint': 'com.android.hardware.keymint.rust_nonsecure',
     'vendor.apex.com.android.hardware.gatekeeper': 'com.android.hardware.gatekeeper.nonsecure',
@@ -126,11 +129,11 @@ props = {
     'vendor.apex.com.android.hardware.uwb': 'none',
     'vendor.apex.com.google.cf.nfc': 'none',
     'vendor.apex.com.google.cf.bt': 'none',
+    'vendor.apex.com.google.cf.rild': 'none',
+    'vendor.apex.com.android.hardware.threadnetwork': 'none',
     # What Cuttlefish's launcher gives HALs that would serve its host: a
-    # vsock port for the lights HAL's (below 1024 it may not bind) and
-    # the Thread simulation's node.
+    # vsock port for the lights HAL's (below 1024 it may not bind).
     'vsock_lights_port': '6900',
-    'openthread_node_id': '1',
     'setupwizard_mode': 'DISABLED',
     'enable_bootanimation': '0',
     'hw_timeout_multiplier': '3',
@@ -202,6 +205,15 @@ service l4h_logcat /system/bin/logcat -b main,system,crash,events -v brief *:E D
 # stops without one; with no sub-HAL to load, the multi-HAL has none.
 on init
     mount none /odm/etc/l4h/no-sensors /vendor/etc/sensors/hals.conf bind
+
+# Cuttlefish's logcat to /dev/hvc2, which an l4h guest does not have: it
+# would stop at once, and start again, for good.
+service seriallogging /system/bin/logcat -b all -v threadtime -f /dev/hvc2 *:V
+    override
+    disabled
+    user logd
+    group root logd
+    seclabel u:r:logpersist:s0
 
 # Of each crash dump, what crashed and why.
 service l4h_crashes /system/bin/logcat -b crash -v brief -e "Cmdline:|Abort message:|panicked at|signal [0-9]|#0[0-5] pc|Cause:" *:V
