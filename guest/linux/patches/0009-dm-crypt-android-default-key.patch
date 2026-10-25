@@ -1,0 +1,56 @@
+--- a/drivers/md/dm-crypt.c	2026-10-24 23:45:45.994691645 -0700
++++ b/drivers/md/dm-crypt.c	2026-10-24 23:45:47.934691659 -0700
+@@ -3788,7 +3788,52 @@
+ 	.iterate_devices = crypt_iterate_devices,
+ 	.io_hints = crypt_io_hints,
+ };
+-module_dm(crypt);
++
++/*
++ * Android's metadata encryption (vold) maps its userdata partition with
++ * the target "default-key" of the Android kernels, whose table is
++ * dm-crypt's: <cipher> <key> <iv_offset> <dev_path> <start> and the
++ * options allow_discards, sector_size:<n> and iv_large_sectors.  Here it
++ * is dm-crypt under that name.  The Android target lets through the bios
++ * of file contents that fscrypt has encrypted already; this one encrypts
++ * them again.  Version 2 is the table above (vold uses an older syntax
++ * below it).
++ */
++static struct target_type default_key_target = {
++	.name   = "default-key",
++	.version = {2, 1, 0},
++	.module = THIS_MODULE,
++	.ctr    = crypt_ctr,
++	.dtr    = crypt_dtr,
++	.map    = crypt_map,
++	.status = crypt_status,
++	.postsuspend = crypt_postsuspend,
++	.preresume = crypt_preresume,
++	.resume = crypt_resume,
++	.message = crypt_message,
++	.iterate_devices = crypt_iterate_devices,
++	.io_hints = crypt_io_hints,
++};
++
++static int __init dm_crypt_init(void)
++{
++	int r = dm_register_target(&crypt_target);
++
++	if (r)
++		return r;
++	r = dm_register_target(&default_key_target);
++	if (r)
++		dm_unregister_target(&crypt_target);
++	return r;
++}
++module_init(dm_crypt_init);
++
++static void __exit dm_crypt_exit(void)
++{
++	dm_unregister_target(&default_key_target);
++	dm_unregister_target(&crypt_target);
++}
++module_exit(dm_crypt_exit);
+ 
+ MODULE_AUTHOR("Jana Saout <jana@saout.de>");
+ MODULE_DESCRIPTION(DM_NAME " target for transparent encryption / decryption");

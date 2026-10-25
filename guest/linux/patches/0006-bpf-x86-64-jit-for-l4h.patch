@@ -10,6 +10,11 @@ code without int3.  What the JIT needs and l4h does not have:
 - %gs-based per-CPU data: no per-CPU instructions or private stacks;
 - bpf_timed_may_goto.S, whose headers assume x86 per-CPU assembly.
 
+The address of a callback (BPF_PSEUDO_FUNC) is loaded with a movabs
+whatever its value: the verifier's stand-in for it, MODULES_VADDR, is
+above all of RAM, the images below the kernel, and an instruction that
+shrank in the last pass failed the program ("bpf_jit: fatal error").
+
 --- a/arch/x86/net/Makefile
 +++ b/arch/x86/net/Makefile
 @@ -6,5 +6,8 @@
@@ -86,7 +91,32 @@ code without int3.  What the JIT needs and l4h does not have:
  				/* add <dst>, gs:[<off>] */
  				EMIT2(0x65, add_2mod(0x48, 0, dst_reg));
  				EMIT3(0x03, add_2reg(0x04, 0, dst_reg), 0x25);
-@@ -2144,6 +2150,10 @@
+@@ -1837,6 +1843,24 @@
+ 			break;
+ 
+ 		case BPF_LD | BPF_IMM | BPF_DW:
++#ifdef CONFIG_L4H
++			/*
++			 * The address of a callback is known only in the last
++			 * pass: the passes before have MODULES_VADDR, which
++			 * may fit in fewer bytes than an l4h image does (they
++			 * are below the kernel, vmalloc above all of RAM), and
++			 * the image must not change size.
++			 */
++			if (insn->src_reg == BPF_PSEUDO_FUNC) {
++				/* movabsq rax, imm64 */
++				EMIT2(add_1mod(0x48, dst_reg), add_1reg(0xB8, dst_reg));
++				EMIT(insn[0].imm, 4);
++				EMIT(insn[1].imm, 4);
++				insn++;
++				i++;
++				break;
++			}
++#endif
+ 			emit_mov_imm64(&prog, dst_reg, insn[1].imm, insn[0].imm);
+ 			insn++;
+ 			i++;
+@@ -2144,6 +2168,10 @@
  				emit_stx_r12(&prog, BPF_SIZE(insn->code), dst_reg, src_reg, insn->off);
  			}
  populate_extable:
@@ -97,7 +127,7 @@ code without int3.  What the JIT needs and l4h does not have:
  			{
  				struct exception_table_entry *ex;
  				u8 *_insn = image + proglen + (start_of_ldx - temp);
-@@ -2197,6 +2207,7 @@
+@@ -2197,6 +2225,7 @@
  				ex->data |= FIELD_PREP(DATA_ARENA_OFFSET_MASK, insn->off);
  			}
  			break;
@@ -105,7 +135,7 @@ code without int3.  What the JIT needs and l4h does not have:
  
  			/* LDX: dst_reg = *(u8*)(src_reg + off) */
  		case BPF_LDX | BPF_MEM | BPF_B:
-@@ -2218,6 +2229,15 @@
+@@ -2218,6 +2247,15 @@
  
  			if (BPF_MODE(insn->code) == BPF_PROBE_MEM ||
  			    BPF_MODE(insn->code) == BPF_PROBE_MEMSX) {
@@ -121,7 +151,7 @@ code without int3.  What the JIT needs and l4h does not have:
  				/* Conservatively check that src_reg + insn->off is a kernel address:
  				 *   src_reg + insn->off > TASK_SIZE_MAX + PAGE_SIZE
  				 *   and
-@@ -2264,12 +2284,14 @@
+@@ -2264,12 +2302,14 @@
  				/* populate jmp_offset for JAE above to jump to start_of_ldx */
  				start_of_ldx = prog;
  				end_of_jmp[-1] = start_of_ldx - end_of_jmp;
@@ -136,7 +166,7 @@ code without int3.  What the JIT needs and l4h does not have:
  			if (BPF_MODE(insn->code) == BPF_PROBE_MEM ||
  			    BPF_MODE(insn->code) == BPF_PROBE_MEMSX) {
  				struct exception_table_entry *ex;
-@@ -2315,6 +2337,7 @@
+@@ -2315,6 +2355,7 @@
  				ex->fixup = FIELD_PREP(FIXUP_INSN_LEN_MASK, prog - start_of_ldx) |
  					    FIELD_PREP(FIXUP_REG_MASK, reg2pt_regs[dst_reg]);
  			}
@@ -144,7 +174,7 @@ code without int3.  What the JIT needs and l4h does not have:
  			break;
  
  		case BPF_STX | BPF_ATOMIC | BPF_B:
-@@ -3875,7 +3898,8 @@
+@@ -3875,7 +3916,8 @@
  
  bool bpf_jit_supports_percpu_insn(void)
  {
@@ -154,7 +184,7 @@ code without int3.  What the JIT needs and l4h does not have:
  }
  
  void bpf_jit_free(struct bpf_prog *prog)
-@@ -3924,7 +3948,7 @@
+@@ -3924,7 +3966,7 @@
  
  bool bpf_jit_supports_private_stack(void)
  {
@@ -163,7 +193,7 @@ code without int3.  What the JIT needs and l4h does not have:
  }
  
  void arch_bpf_stack_walk(bool (*consume_fn)(void *cookie, u64 ip, u64 sp, u64 bp), void *cookie)
-@@ -3991,7 +4015,8 @@
+@@ -3991,7 +4033,8 @@
  
  bool bpf_jit_supports_arena(void)
  {
@@ -173,7 +203,7 @@ code without int3.  What the JIT needs and l4h does not have:
  }
  
  bool bpf_jit_supports_insn(struct bpf_insn *insn, bool in_arena)
-@@ -4022,5 +4047,6 @@
+@@ -4022,5 +4065,6 @@
  
  bool bpf_jit_supports_timed_may_goto(void)
  {

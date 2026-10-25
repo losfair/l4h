@@ -47,7 +47,6 @@ CONFIG_SYSFS=y
 CONFIG_TMPFS=y
 CONFIG_EXT4_FS=y
 # CONFIG_VT is not set
-# CONFIG_HW_RANDOM is not set
 CONFIG_MAGIC_SYSRQ=y
 CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y
 CONFIG_FRAME_POINTER=y
@@ -74,6 +73,8 @@ CONFIG_CGROUP_SCHED=y
 CONFIG_CGROUP_PIDS=y
 CONFIG_CGROUP_FREEZER=y
 CONFIG_CPUSETS=y
+# Android mounts cpuset as a cgroup v1 hierarchy (cgroups.json).
+CONFIG_CPUSETS_V1=y
 CONFIG_CGROUP_DEVICE=y
 CONFIG_CGROUP_CPUACCT=y
 CONFIG_BLK_CGROUP=y
@@ -177,10 +178,24 @@ CONFIG_NFS_V4_2=y
 # Android guests (DESIGN.md §5.8).  What only Android uses is off until an
 # Android guest asks for it on its command line, so other guests run as
 # before: SELinux with lsm=selinux, PSI with psi=1, bootconfig with
-# bootconfig; Binder devices exist only in a mounted binderfs.
+# bootconfig; Binder devices exist only in a mounted binderfs, which has
+# Android's three (init.rc links them to /dev).
 CONFIG_ANDROID_BINDER_IPC=y
 CONFIG_ANDROID_BINDERFS=y
-CONFIG_ANDROID_BINDER_DEVICES=""
+CONFIG_ANDROID_BINDER_DEVICES="binder,hwbinder,vndbinder"
+# libcutils' shared memory (patch 0010).
+CONFIG_STAGING=y
+CONFIG_ASHMEM=y
+# BPF programs on tracepoints (patch 0011), which Android's bpfloader loads
+# and system_server reads the maps of: software perf events and event
+# tracing, with the GPU memory tracepoints.
+CONFIG_PERF_EVENTS=y
+CONFIG_ENABLE_DEFAULT_TRACERS=y
+CONFIG_TRACE_GPU_MEM=y
+# AF_VSOCK, with no transport to a host but loopback: Cuttlefish's HALs
+# listen on vsock ports for their host, and stop if they cannot.
+CONFIG_VSOCKETS=y
+CONFIG_VSOCKETS_LOOPBACK=y
 CONFIG_SECURITY=y
 CONFIG_SECURITY_NETWORK=y
 CONFIG_SECURITY_SELINUX=y
@@ -193,6 +208,8 @@ CONFIG_BOOT_CONFIG=y
 CONFIG_USERFAULTFD=y
 CONFIG_ZRAM=y
 CONFIG_ZRAM_BACKEND_LZ4=y
+# /dev/hw_random (arch/l4h/drivers/rng_l4h.c), for prng_seeder.
+CONFIG_HW_RANDOM=y
 # /dev/rtc0 with alarms (arch/l4h/drivers/rtc_l4h.c), for the alarm clocks.
 # The system clock comes from the host at boot, to the nanosecond, so the
 # RTC does not set it, and NTP does not write the RTC.
@@ -221,12 +238,17 @@ CONFIG_INPUT_UINPUT=y
 # CONFIG_HID_SUPPORT is not set
 # Android's partitions: dynamic partitions (dm-linear), APEXes (loop and
 # dm-verity), verity with error correction, file-based encryption,
-# fs-verity, and quotas for storage accounting.
+# fs-verity, and quotas for storage accounting.  Android's init waits for
+# the uevents of the dm devices it makes.
+CONFIG_DM_UEVENT=y
 CONFIG_DM_VERITY_FEC=y
 CONFIG_FS_ENCRYPTION=y
 CONFIG_FS_VERITY=y
 CONFIG_QUOTA=y
 CONFIG_QUOTACTL=y
+CONFIG_QFMT_V2=y
+# Case-insensitive directories, which Android uses on /data.
+CONFIG_UNICODE=y
 # netd: policy routing, socket destruction, IPsec, and legacy iptables,
 # which Android's iptables uses (Docker's iptables-nft does not).
 CONFIG_IP_MULTIPLE_TABLES=y

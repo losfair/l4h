@@ -1,0 +1,19 @@
+bpf: programs on tracepoints for l4h, without kprobes or uprobes
+
+BPF_EVENTS, which BPF programs on tracepoints, kprobes and uprobes need,
+also needs kprobe or uprobe events, which l4h has neither of (no int3
+patching, no uprobes).  Android's bpfloader loads programs on
+tracepoints (gpu_mem, sched, power, vmscan), and system_server stops when
+the maps they would fill are missing.  With l4h, event tracing is enough.
+
+--- a/kernel/trace/Kconfig
++++ b/kernel/trace/Kconfig
+@@ -809,7 +809,7 @@
+ 
+ config BPF_EVENTS
+ 	depends on BPF_SYSCALL
+-	depends on (KPROBE_EVENTS || UPROBE_EVENTS) && PERF_EVENTS
++	depends on (KPROBE_EVENTS || UPROBE_EVENTS || (L4H && EVENT_TRACING)) && PERF_EVENTS
+ 	bool
+ 	default y
+ 	help

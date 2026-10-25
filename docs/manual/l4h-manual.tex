@@ -343,9 +343,20 @@ guest boots with \texttt{lsm=selinux psi=1 bootconfig}. Binder devices
 appear only in a mounted binderfs. The display is vkms, a module
 (\texttt{modprobe vkms}, Section~\ref{sec:kmods}): it composes in
 software and has no output of its own, so you see it through screen
-capture in the guest, such as scrcpy over adb. Android itself has not
-been booted yet; the kernel has no suspend and no 32-bit compatibility,
-so Android needs a 64-bit-only build (DESIGN.md \S5.8).
+capture in the guest, such as scrcpy over adb. The kernel has no suspend
+and no 32-bit compatibility, so Android needs a 64-bit-only build
+(DESIGN.md \S5.8).
+
+Android 17 boots as dom0 from the images of Cuttlefish's 64-bit-only
+x86\_64 build (\texttt{aosp\_cf\_x86\_64\_only\_phone-userdebug} on
+ci.android.com). Unpack its \texttt{-img-} archive into
+\texttt{build/cf17/img} and run \texttt{tests/run-android.sh}:
+\texttt{tools/mkandroid.sh} makes the initramfs (Cuttlefish's ramdisks,
+a first-stage fstab without verified boot, the vkms modules, and the
+boot properties of a guest that renders in software) and one disk with
+its partitions, and the test passes once Android reports its boot
+complete. Android's errors are on the console with the kernel's
+messages.
 
 On x86\_64, \texttt{CONFIG\_KEMU=y} and \texttt{CONFIG\_RUST=y} build
 \href{https://github.com/losfair/kemu}{kemu} into the guest kernel, so

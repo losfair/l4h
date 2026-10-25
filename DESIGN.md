@@ -1034,7 +1034,13 @@ guest's command line asks for it:
 
 | Feature | Android's user | In other guests |
 |---------|----------------|-----------------|
-| Binder and binderfs | all IPC (servicemanager, HALs, apps) | no device until a binderfs is mounted (`ANDROID_BINDER_DEVICES=""`) |
+| Binder and binderfs | all IPC (servicemanager, HALs, apps) | no device until a binderfs is mounted, which has Android's `binder`, `hwbinder` and `vndbinder` |
+| ashmem (patch 0010) | libcutils' shared memory: `system_server` stops without it | `/dev/ashmem`, unused |
+| dm `default-key` (patch 0009) | vold's metadata encryption of `/data` | unused |
+| BPF on tracepoints (patch 0011), software perf events, event tracing | bpfloader's programs, whose maps `system_server` reads | tracefs and perf, no events enabled |
+| `/dev/hw_random` | `prng_seeder` | present (x86_64) |
+| AF_VSOCK, loopback only | Cuttlefish HALs that listen for their host | no transport to a host |
+| cgroup v1 `cpuset` | `cgroups.json` | mounted by no one else |
 | SELinux, with audit | `init`, which stops without it | off without `lsm=selinux`; audit is disabled until an audit daemon (logd) enables it |
 | PSI | lmkd's memory pressure triggers | off without `psi=1` |
 | bootconfig | `androidboot.*` settings appended to the ramdisk | ignored without `bootconfig` |
@@ -1050,11 +1056,11 @@ guest's command line asks for it:
 The base stays mainline 6.18 LTS, not Android's `android17-6.18`
 branch: that branch lags the stable releases (6.18.32 against l4h's
 6.18.58 in October 2026), and the user ABI is upstream's either way.
-Android's own additions are therefore missing: `xt_quota2` (netd's data
-usage alerts), incremental-fs (incremental app installs), fuse-bpf
-(MediaProvider; mainline has FUSE passthrough), dm-default-key (metadata
-encryption), dm-user (virtual A/B snapshots) and ashmem (libcutils uses
-memfd instead).
+Android's own additions are therefore missing but for two that Android
+17 cannot boot without, ashmem and dm-default-key (below): `xt_quota2`
+(netd's data usage alerts), incremental-fs (incremental app installs),
+fuse-bpf (MediaProvider; mainline has FUSE passthrough), dm-user (virtual
+A/B snapshots) and the ashmem ioctls on memfds.
 
 - **RTC.** `drivers/rtc_l4h.c` is `/dev/rtc0`: the host's wall clock
   (`L4H_HC_GET_TIME`) plus an offset that setting it changes, which is the
@@ -1093,10 +1099,84 @@ memfd instead).
   ramdisk: vkms adds a display as soon as it is loaded. The display the
   host can show is l4h-vmm's virtio-gpu (§8.6), with the `virtio_gpu`
   module.
-- **Not yet.** No suspend (`PM_SLEEP`, so no wakeup sources), no
-  virtio-vsock and no 32-bit compat, so Android runs as a 64-bit-only
-  build. Each guest has 64 process VSpaces (§5.3), which Android's
-  hundred and more processes cycle through.
+- **ashmem.** Android 17's libcutils allocates shared memory from
+  `/dev/ashmem`: from memfds only with `sys.use_memfd`, which is off, and
+  only on a kernel that takes ashmem's ioctls on a memfd, which mainline
+  does not. Mainline removed the driver in 5.18; patch 0010 is the C
+  driver of the Android kernels' `android15-6.6` branch (`android17-6.18`
+  has a Rust one, on Android's own Rust bindings), with what changed since
+  (`mm_get_unmapped_area()`, an allocated shrinker).
+- **Metadata encryption.** A `keydirectory` in the fstab of `/data` makes
+  vold map the partition through Android's `default-key` target, whose
+  table is dm-crypt's: `<cipher> <key> <iv_offset> <dev> <start>` and the
+  options `allow_discards`, `sector_size:<n>` and `iv_large_sectors`.
+  Patch 0009 registers dm-crypt again under that name, at version 2 (vold
+  writes an older table below it). Android's target lets through the bios
+  of file contents that fscrypt has encrypted already; this one encrypts
+  them a second time.
+- **mmap layout.** l4h mapped bottom-up from `TASK_UNMAPPED_BASE` with no
+  randomization, and had no `vm.mmap_rnd_bits`, which Android's `init`
+  stops without (it sets 32 bits on x86_64). mmap now goes below the
+  stack, at a random offset of 28 to 32 bits of pages, as on x86_64 and
+  arm64 (`ARCH_WANT_DEFAULT_TOPDOWN_MMAP_LAYOUT`): user space spans 47
+  bits on both ISAs.
+- **BPF on tracepoints.** bpfloader loads programs on tracepoints
+  (`gpu_mem`, `sched`, `power`, `vmscan`), and `system_server` aborts when
+  the maps they fill are missing (`ReadProcessGpuUsageKb()`). Programs on
+  tracepoints need `BPF_EVENTS`, which needs perf events and kprobe or
+  uprobe events. l4h has software perf events (`HAVE_PERF_EVENTS`, no
+  PMU: `asm/perf_event.h` hides the host architecture's) and event
+  tracing, but no kprobes or uprobes, and patch 0011 lets event tracing
+  be enough. The x86-64 JIT failed programs with callbacks ("bpf_jit:
+  fatal error"): the verifier gives the JIT `MODULES_VADDR` for a
+  callback's address before the last pass, which is above all of RAM
+  while l4h's images are below the kernel, so the `mov` shrank in the last
+  pass. On l4h it is always a `movabs` (patch 0006).
+- **Not yet.** No suspend (`PM_SLEEP`, so no wakeup sources), no vsock
+  transport to a host and no 32-bit compat, so Android runs as a
+  64-bit-only build. Each guest has 64 process VSpaces (§5.3), which
+  Android's hundred and more processes cycle through.
+
+#### Booting Android
+
+`tests/run-android.sh` boots Android 17 as dom0, from the images of
+Cuttlefish's 64-bit-only x86_64 build (`aosp_cf_x86_64_only_phone`,
+ci.android.com), which `tools/mkandroid.sh` turns into an initramfs and a
+disk. The emulator's system images were tried first: they render only
+through the emulator's host (goldfish pipes, gfxstream), where Cuttlefish
+has a software renderer in the guest. Nothing of Cuttlefish is changed
+but what a bootloader and Cuttlefish's launcher would give it:
+
+- **The initramfs** is the vendor ramdisk and the generic one, then an
+  archive of l4h's and a bootconfig. Both ramdisks are legacy LZ4, which
+  ends only with the data or a zero frame length: four zero bytes end it
+  before l4h's archive. That archive replaces the first-stage fstab (the
+  same partitions, without AVB: the device is unlocked) and the modules
+  first-stage init loads, built for another kernel, with l4h's vkms and
+  what it depends on.
+- **The disk** is one GPT, whose partitions first-stage init finds by
+  name, on the platform device all virtio-l4h disks hang off
+  (`androidboot.boot_devices=virtio-l4h`): misc, frp (the persistent data
+  block `system_server` keeps OEM unlocking in without an OemLock HAL),
+  metadata, odm, super and userdata. vold encrypts `/data` in place on
+  the first boot.
+- **odm** is Cuttlefish's ODM partition, its files labelled as the
+  platform's policy labels `/odm`, with an init script of l4h's: a
+  logcat of errors and boot progress on the console (Cuttlefish logs
+  everything to `/dev/hvc2`, which is too much for the console, and l4h
+  has no hvc2), and an empty sensors list mounted over the vendor's.
+- **The boot properties** are those of a guest that renders in software:
+  ANGLE on SwiftShader, minigbm buffers, and drm_hwcomposer on vkms
+  (Cuttlefish's ranchu composer drives only virtio-gpu); KeyMint and
+  Gatekeeper in the guest; a vsock port above 1024 for the lights HAL.
+  The HALs that talk to Cuttlefish's host over serial ports (OemLock,
+  UWB, NFC, Bluetooth) are left out: naming an APEX in
+  `androidboot.vendor.apex.<name>` with no file of that name keeps apexd
+  from activating it, and `system_server` would wait for the services
+  they declare. Sensors are none for the same reason.
+
+The test passes once `init` runs the actions of `sys.boot_completed=1`,
+about 90 s after the boot on four vCPUs and 3 GiB.
 
 `tests/run-androidtest.sh` boots `tests/guest/androidtest.c` with
 Android's command line and a bootconfig: Binder transactions of up to

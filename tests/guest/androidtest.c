@@ -247,7 +247,7 @@ static void binder_server(int ready)
 static void test_binder(void)
 {
 	static unsigned char req[4 * PAGE];
-	struct binderfs_device dev = { .name = "binder" };
+	struct binderfs_device dev = { .name = "l4htest" };
 	struct binder_transaction_data tr;
 	const struct binder_fd_object *obj;
 	int ctl, fd, ready[2], status;
@@ -258,6 +258,10 @@ static void test_binder(void)
 	CHECK(access("/dev/binder", F_OK) < 0, "/dev/binder exists without binderfs");
 	mkdir("/dev/binderfs", 0755);
 	CHECK(mount("binder", "/dev/binderfs", "binder", 0, NULL) == 0, "mount binderfs");
+	/* The devices Android's init.rc links to /dev, made by the mount. */
+	CHECK(access("/dev/binderfs/binder", F_OK) == 0 &&
+	      access("/dev/binderfs/hwbinder", F_OK) == 0 &&
+	      access("/dev/binderfs/vndbinder", F_OK) == 0, "binderfs has no default devices");
 	ctl = open("/dev/binderfs/binder-control", O_RDWR | O_CLOEXEC);
 	CHECK(ctl >= 0 && ioctl(ctl, BINDER_CTL_ADD, &dev) == 0, "BINDER_CTL_ADD");
 	close(ctl);

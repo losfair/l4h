@@ -42,6 +42,13 @@ config UML
 	select GENERIC_SMP_IDLE_THREAD
 	select ARCH_USE_QUEUED_SPINLOCKS
 	select ARCH_USE_QUEUED_RWLOCKS
+	# mmap below the stack, at a random offset, as on x86_64 and arm64.
+	# Android's init stops unless it can set vm.mmap_rnd_bits to 32.
+	select ARCH_WANT_DEFAULT_TOPDOWN_MMAP_LAYOUT
+	select HAVE_ARCH_MMAP_RND_BITS
+	# Software perf events, without a PMU: what BPF programs on
+	# tracepoints are attached through (Android's bpfloader).
+	select HAVE_PERF_EVENTS
 
 config L4H
 	def_bool y
@@ -71,6 +78,13 @@ config ARCH_FORCE_MAX_ORDER
 config MMU
 	bool
 	default y
+
+# User space spans 47 bits on both ISAs (L4H_TASK_SIZE): x86_64's range.
+config ARCH_MMAP_RND_BITS_MIN
+	default 28
+
+config ARCH_MMAP_RND_BITS_MAX
+	default 32
 
 # There is no device memory in a guest, only pages it shares with the
 # host: ioremap() returns NULL (asm/io.h), as on UML.  Without NO_IOMEM,
@@ -185,6 +199,14 @@ config L4H_RTC
 	  clocks (CLOCK_REALTIME_ALARM, CLOCK_BOOTTIME_ALARM) need beyond
 	  timerfd.  Setting it lasts until the guest stops and changes no
 	  other guest.
+
+config L4H_RNG
+	bool "l4h hardware random number generator"
+	default y
+	depends on HW_RANDOM=y
+	help
+	  /dev/hw_random on the CPU's random number generator (RDRAND on
+	  x86_64), which Android's prng_seeder needs.
 
 endmenu
 
