@@ -11,6 +11,7 @@
  * the DMA API (restricted DMA, see drivers/virtio_l4h.c).
  */
 
+#include <linux/build_bug.h>
 #include <linux/module.h>
 #include <linux/memblock.h>
 #include <linux/mm.h>
@@ -23,6 +24,15 @@
 #include <kern_util.h>
 #include <mem_user.h>
 #include <os.h>
+
+static_assert(L4H_LDS_BLOCK_SIZE == L4H_BLOCK_SIZE);
+
+/*
+ * The empty sections of contents that the padding after text and rodata
+ * starts with (asm/common.lds.S).
+ */
+asm(".pushsection .l4h.pad.text, \"a\", %progbits\n\t.popsection\n\t"
+    ".pushsection .l4h.pad.rodata, \"a\", %progbits\n\t.popsection");
 
 /* Changed during early boot */
 unsigned long high_physmem;

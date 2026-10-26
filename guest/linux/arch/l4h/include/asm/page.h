@@ -11,6 +11,13 @@
 
 #include <vdso/page.h>
 
+/*
+ * The host's RAM block (L4H_BLOCK_SIZE of l4h/abi.h, which a linker
+ * script cannot include), at which the kernel's rodata ends
+ * (common.lds.S).  physmem.c checks that the two agree.
+ */
+#define L4H_LDS_BLOCK_SIZE 0x200000
+
 #ifndef __ASSEMBLER__
 
 struct page;

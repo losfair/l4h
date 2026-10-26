@@ -9,15 +9,17 @@
    * Text and rodata fill whole pages of their segments, and rodata ends
    * at a RAM block (L4H_BLOCK_SIZE): the host shares only pages that a
    * read-only segment's file data covers, and saves memory only for
-   * blocks of them.
+   * blocks of them.  Each pad starts with an empty section of contents
+   * (physmem.c): of a section of padding alone ld makes writable memory
+   * without file data.  A pad already aligned takes nothing.
    */
-  .text.l4h_pad : { BYTE(0) . = ALIGN(4096); } =0
+  .text.l4h_pad : { KEEP(*(.l4h.pad.text)) . = ALIGN(4096); } =0
   _sdata = .;
   PROVIDE (sdata = .);
 
   RO_DATA(4096)
 
-  .rodata.l4h_pad : { BYTE(0) . = ALIGN(0x200000); } =0
+  .rodata.l4h_pad : { KEEP(*(.l4h.pad.rodata)) . = ALIGN(L4H_LDS_BLOCK_SIZE); } =0
 
   .unprotected : { *(.unprotected) }
   . = ALIGN(4096);
