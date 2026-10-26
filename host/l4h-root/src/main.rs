@@ -511,7 +511,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
             .inspect_err(|e| sel4::debug_println!("l4h-root: the guest kernel cannot be loaded: {}", e))
             .ok()
     });
-    let kmods = module("guest-kmods").and_then(|m| kimage::Kmods::new(&modules, m));
+    let kmods = module("guest-kmods").and_then(|m| kimage::Kmods::new(&modules, &mut wins.a, m));
     let dom0_initrd = module("dom0-initrd").unwrap_or(&[]);
     // ACPI table frames are shared by RTC discovery, reset and trustd.
     #[cfg(target_arch = "x86_64")]

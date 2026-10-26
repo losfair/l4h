@@ -16,7 +16,7 @@
 //!
 //! Either way each page of a module is a frame root holds a capability
 //! to, so guests can map read-only copies of a module's pages instead of
-//! copies of its bytes (`Modules::frames`, kimage.rs).
+//! copies of its bytes (`ModuleFrames`, kimage.rs).
 
 use l4h_host::fixed::{ArrayVec, StaticCell};
 
@@ -37,9 +37,13 @@ pub struct Module {
 pub const MAX_MODULES: usize = 16;
 
 /// Runs of module pages whose frames are in consecutive root slots, at
-/// most: one per carved chunk of a boot loader module, one for the
-/// appended segment.  Pages past them have no known frame.
-const MAX_RUNS: usize = 128;
+/// most.  A boot loader module is carved in aligned chunks of at most
+/// RETYPE_FAN_OUT frames (64 MiB), each a run unless it continues the
+/// last: the MODULES region holds 1024 whole chunks, and the unaligned
+/// ends of each module add a few dozen more.  The appended segment is one
+/// run.  Pages past them have no known frame, and guests get no shared
+/// copy of them.
+const MAX_RUNS: usize = 2048;
 
 /// Pages [va, va + 4096 * pages) of the root task, whose frames are root
 /// slots [slot, slot + pages).
@@ -53,25 +57,41 @@ struct Run {
 /// In .bss: the root task's stack, where `Modules` is, has no room.
 static RUNS: StaticCell<ArrayVec<Run, MAX_RUNS>> = StaticCell::new(ArrayVec::new());
 
-/// The modules found, in order, and the frames of their pages.
-pub struct Modules {
-    list: [Option<Module>; MAX_MODULES],
-    runs: &'static mut ArrayVec<Run, MAX_RUNS>,
-}
-
-impl Modules {
-    fn add_run(&mut self, va: usize, slot: Slot, pages: usize) {
-        if self.runs.push(Run { va, slot, pages }).is_err() {
-            sel4::debug_println!("l4h-root: module frames past {:#x} not recorded", va);
+fn add_run(runs: &mut ArrayVec<Run, MAX_RUNS>, va: usize, slot: Slot, pages: usize) {
+    if let Some(r) = runs.last_mut() {
+        if r.va + r.pages * 4096 == va && r.slot + r.pages == slot {
+            r.pages += pages;
+            return;
         }
     }
+    if runs.push(Run { va, slot, pages }).is_err() {
+        sel4::debug_println!("l4h-root: module frames past {:#x} not recorded, guests get no shared copy", va);
+    }
+}
 
+/// The frames of the modules' pages, for as long as root runs.
+#[derive(Clone, Copy)]
+pub struct ModuleFrames(&'static ArrayVec<Run, MAX_RUNS>);
+
+impl ModuleFrames {
     /// The root slot of the frame of the module page at `va` (page
     /// aligned), if it is known.  The frame is mapped read-only in the
     /// root task; guests can map copies of it.
-    pub fn frame(&self, va: usize) -> Option<Slot> {
-        let r = self.runs.iter().find(|r| r.va <= va && va < r.va + r.pages * 4096)?;
+    pub fn get(&self, va: usize) -> Option<Slot> {
+        let r = self.0.iter().find(|r| r.va <= va && va < r.va + r.pages * 4096)?;
         Some(r.slot + (va - r.va) / 4096)
+    }
+}
+
+/// The modules found, in order, and the frames of their pages.
+pub struct Modules {
+    list: [Option<Module>; MAX_MODULES],
+    frames: Option<ModuleFrames>,
+}
+
+impl Modules {
+    pub fn frames(&self) -> ModuleFrames {
+        self.frames.expect("module frames")
     }
 
     fn push(&mut self, m: Module) {
@@ -107,9 +127,11 @@ const ENTRY: usize = NAME_LEN + 16;
 
 /// All modules: the boot loader's, then root's appended ones.
 pub fn load(bootinfo: &sel4::BootInfoPtr, alloc: &mut Alloc, devmem: &mut DevMem) -> Modules {
-    let mut out = Modules { list: [None; MAX_MODULES], runs: RUNS.take() };
-    loader_modules(bootinfo, alloc, devmem, &mut out);
-    appended(bootinfo, &mut out);
+    let runs = RUNS.take();
+    let mut out = Modules { list: [None; MAX_MODULES], frames: None };
+    loader_modules(bootinfo, alloc, devmem, &mut out, runs);
+    appended(bootinfo, &mut out, runs);
+    out.frames = Some(ModuleFrames(runs));
     for m in out.iter() {
         info!("l4h-root: module '{}', {} KiB", m.name, m.data.len() >> 10);
     }
@@ -118,7 +140,7 @@ pub fn load(bootinfo: &sel4::BootInfoPtr, alloc: &mut Alloc, devmem: &mut DevMem
 
 /// The modules appended to root's image.  Their frames are among the
 /// image frames seL4 gives the root task (layout::image_base).
-fn appended(bootinfo: &sel4::BootInfoPtr, out: &mut Modules) {
+fn appended(bootinfo: &sel4::BootInfoPtr, out: &mut Modules, runs: &mut ArrayVec<Run, MAX_RUNS>) {
     // Volatile: the file is edited after the build.
     let (va, size) = unsafe {
         (core::ptr::read_volatile(&ANCHOR.va) as usize, core::ptr::read_volatile(&ANCHOR.size) as usize)
@@ -135,7 +157,7 @@ fn appended(bootinfo: &sel4::BootInfoPtr, out: &mut Modules) {
     let frames = bootinfo.user_image_frames();
     let (first, pages) = ((va - crate::layout::image_base()) / 4096, size.div_ceil(4096));
     if va % 4096 == 0 && first + pages <= frames.len() {
-        out.add_run(va, frames.start() + first, pages);
+        add_run(runs, va, frames.start() + first, pages);
     }
     let count = word(8).min((size - 16) / ENTRY);
     for i in 0..count {
@@ -175,11 +197,24 @@ pub fn extra_chunk(bootinfo: &sel4::BootInfoPtr, id: u64) -> Option<&'static [u8
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn loader_modules(_bootinfo: &sel4::BootInfoPtr, _alloc: &mut Alloc, _devmem: &mut DevMem, _out: &mut Modules) {}
+fn loader_modules(
+    _bootinfo: &sel4::BootInfoPtr,
+    _alloc: &mut Alloc,
+    _devmem: &mut DevMem,
+    _out: &mut Modules,
+    _runs: &mut ArrayVec<Run, MAX_RUNS>,
+) {
+}
 
 /// Map the boot loader's modules listed in the bootinfo.
 #[cfg(target_arch = "x86_64")]
-fn loader_modules(bootinfo: &sel4::BootInfoPtr, alloc: &mut Alloc, devmem: &mut DevMem, out: &mut Modules) {
+fn loader_modules(
+    bootinfo: &sel4::BootInfoPtr,
+    alloc: &mut Alloc,
+    devmem: &mut DevMem,
+    out: &mut Modules,
+    runs: &mut ArrayVec<Run, MAX_RUNS>,
+) {
     use sel4::init_thread::slot;
     use sel4::{CapRights, VmAttributes};
 
@@ -212,7 +247,7 @@ fn loader_modules(bootinfo: &sel4::BootInfoPtr, alloc: &mut Alloc, devmem: &mut 
         // The frames are mapped as they are carved, a chunk at a time.
         let mut at = va;
         let carved = devmem.frames_range(alloc, paddr, pages * 4096, |alloc, frames| {
-            out.add_run(at, frames.start, frames.len());
+            add_run(runs, at, frames.start, frames.len());
             alloc.global(|alloc| {
                 for s in frames {
                     let f = crate::devmem::granule(s);

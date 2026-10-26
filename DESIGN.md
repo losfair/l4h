@@ -933,7 +933,11 @@ including pool addresses, device indices and lifecycle state.
   with the page tables mapping them for a 9 MiB image. Root knows the
   frame of each module page (`bootmod.rs`): it carved a boot loader's
   modules into frames itself, and modules appended to its image are in
-  the image frames seL4 gives it. `drivers/kmod.c` makes the image the
+  the image frames seL4 gives it. Guests map the image's last page
+  whole, so root clears what follows the image in it before any guest
+  exists: a boot loader leaves whatever memory held there, which would
+  reach every guest. It refuses an image that shares that page with
+  another module. `drivers/kmod.c` makes the image the
   read-only block device `/dev/l4hkmod`, and `mount -t erofs -o ro
   /dev/l4hkmod /lib/modules` gives modprobe the modules and module
   builds the tree.
@@ -957,7 +961,7 @@ including pool addresses, device indices and lifecycle state.
 - **Side channel.** Guests share the physical pages of kernel code, as
   with the module image, so one guest can time its access to them to
   learn which kernel code another runs (Flush+Reload). Pages shared this
-  way are never written, so the kernel's data and other guests' memory
+  way are never written once guests exist, so the kernel's data and other guests' memory
   stay out of reach.
 - **Modules may use the l4h ABI.** A module comes from the kernel's own
   build, so it can call seL4 and use the ABI directly. The kernel exports

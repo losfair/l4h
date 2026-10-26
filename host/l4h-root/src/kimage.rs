@@ -12,51 +12,21 @@
 use sel4::{CapRights, ObjectBlueprint, VmAttributes, cap_type};
 
 use l4h_abi as abi;
-use l4h_host::fixed::ArrayVec;
 
-use crate::bootmod::Modules;
+use crate::bootmod::{ModuleFrames, Modules};
 use crate::elf::Elf;
 use crate::guest::{BLOCK, Guest, abs, root_cap};
 use crate::mem::{Alloc, Slot};
 use crate::vspace::map_frame;
+use crate::window::Window;
 
 const PAGE: usize = 4096;
 
-/// Runs of pages whose frames are in consecutive root slots, at most: one
-/// for an appended module, a few per carved chunk of a boot loader's
-/// (bootmod.rs).  Small: `Host`, which holds them, is on the root task's
-/// stack.
-const MAX_RUNS: usize = 32;
-
-/// The frames of an image's pages: runs of (offset, root slot, pages).
-struct Frames(ArrayVec<(usize, Slot, usize), MAX_RUNS>);
-
-impl Frames {
-    /// Add the page at `off`, after every page added so far.  False if
-    /// there are too many runs.
-    fn push(&mut self, off: usize, slot: Slot) -> bool {
-        if let Some((o, s, n)) = self.0.last_mut() {
-            if *o + *n * PAGE == off && *s + *n == slot {
-                *n += 1;
-                return true;
-            }
-        }
-        self.0.push((off, slot, 1)).is_ok()
-    }
-
-    /// The root slot of the frame of the page at `off`.
-    fn get(&self, off: usize) -> Option<Slot> {
-        let &(o, s, _) = self.0.iter().find(|&&(o, _, n)| o <= off && off < o + n * PAGE)?;
-        Some(s + (off - o) / PAGE)
-    }
-
-    /// Copy the frame of the page at `off`, read-only, into root slot `to`.
-    fn copy(&self, off: usize, to: Slot) {
-        let from = self.get(off).expect("shared page without a frame");
-        abs(root_cap::<cap_type::Null>(to))
-            .copy(&abs(root_cap::<cap_type::Granule>(from)), CapRights::read_only())
-            .expect("shared frame copy");
-    }
+/// Copy module frame `from`, read-only, into root slot `to`.
+fn copy_read_only(from: Slot, to: Slot) {
+    abs(root_cap::<cap_type::Null>(to))
+        .copy(&abs(root_cap::<cap_type::Granule>(from)), CapRights::read_only())
+        .expect("shared frame copy");
 }
 
 pub struct Kernel {
@@ -68,8 +38,7 @@ pub struct Kernel {
     /// Blocks of the image every guest shares (bit b: GPA block b): all
     /// their pages are boot module pages in read-only segments.
     pub shared: u64,
-    /// The frames of the pages of the shared blocks, by GPA.
-    frames: Frames,
+    frames: ModuleFrames,
 }
 
 impl Kernel {
@@ -81,8 +50,8 @@ impl Kernel {
         }
         let ram_base = lo as usize & !(PAGE - 1);
         let end = (hi as usize - ram_base).next_multiple_of(PAGE);
-        let mut k = Self { elf, ram_base, end, shared: 0, frames: Frames(ArrayVec::new()) };
-        k.share(modules);
+        let mut k = Self { elf, ram_base, end, shared: 0, frames: modules.frames() };
+        k.share();
         Ok(k)
     }
 
@@ -90,7 +59,7 @@ impl Kernel {
     /// if that page lies in the file data of a read-only segment.  Pages
     /// a segment covers only in part keep the zeros around it private, as
     /// a guest loads them.
-    fn module_frame(&self, gpa: usize, modules: &Modules) -> Option<Slot> {
+    fn module_frame(&self, gpa: usize) -> Option<Slot> {
         let va = self.ram_base + gpa;
         let seg = self.elf.segments().find(|s| {
             let at = s.vaddr as usize;
@@ -100,28 +69,15 @@ impl Kernel {
         if file % PAGE != 0 {
             return None;
         }
-        modules.frame(file)
+        self.frames.get(file)
     }
 
-    /// Find the blocks guests can share, and their frames.
-    fn share(&mut self, modules: &Modules) {
+    /// Find the blocks guests can share.
+    fn share(&mut self) {
         let blocks = (self.end / BLOCK).min(u64::BITS as usize);
         for b in 0..blocks {
-            let (runs, last) = (self.frames.0.len(), self.frames.0.last().copied());
-            let all = (0..BLOCK / PAGE).all(|i| {
-                let gpa = b * BLOCK + i * PAGE;
-                self.module_frame(gpa, modules).is_some_and(|s| self.frames.push(gpa, s))
-            });
-            if all {
+            if (0..BLOCK / PAGE).all(|i| self.module_frame(b * BLOCK + i * PAGE).is_some()) {
                 self.shared |= 1 << b;
-            } else {
-                // The block stays private: forget its pages.
-                while self.frames.0.len() > runs {
-                    self.frames.0.pop();
-                }
-                if let (Some(l), Some(r)) = (last, self.frames.0.last_mut()) {
-                    *r = l;
-                }
             }
         }
         info!(
@@ -134,7 +90,7 @@ impl Kernel {
     /// Copy the frame of shared guest-physical page `gpa` into root slot
     /// `to`, read-only.
     pub fn copy_frame(&self, gpa: usize, to: Slot) {
-        self.frames.copy(gpa, to);
+        copy_read_only(self.module_frame(gpa).expect("shared page without a frame"), to);
     }
 
     /// The lowest guest-physical address of an initrd.
@@ -146,30 +102,48 @@ impl Kernel {
 /// The module image: its boot module's pages, which each guest maps
 /// copies of.
 pub struct Kmods {
-    frames: Frames,
-    size: usize,
+    data: &'static [u8],
+    frames: ModuleFrames,
 }
 
 impl Kmods {
-    pub fn new(modules: &Modules, data: &[u8]) -> Option<Self> {
+    /// The image in boot module `data`.  Guests map its last page whole,
+    /// so root clears what follows the image in it (a boot loader leaves
+    /// whatever was in memory there) before any guest exists.
+    pub fn new(modules: &Modules, win: &mut Window, data: &'static [u8]) -> Option<Self> {
         if data.is_empty() || data.len() as u64 > abi::KMOD_MAX {
             sel4::debug_println!("l4h-root: module image of {} bytes ignored", data.len());
             return None;
         }
-        let mut frames = Frames(ArrayVec::new());
-        let start = data.as_ptr() as usize;
-        for off in (0..data.len()).step_by(PAGE) {
-            let ok = start % PAGE == 0 && modules.frame(start + off).is_some_and(|s| frames.push(off, s));
-            if !ok {
-                sel4::debug_println!("l4h-root: module image at {:#x}: no frames to share, ignored", start);
+        let frames = modules.frames();
+        let (start, end) = (data.as_ptr() as usize, data.as_ptr() as usize + data.len());
+        if start % PAGE != 0 || (start..end).step_by(PAGE).any(|va| frames.get(va).is_none()) {
+            sel4::debug_println!("l4h-root: module image at {:#x}: not in whole pages of its boot module, ignored", start);
+            return None;
+        }
+        let rest = end.next_multiple_of(PAGE) - end;
+        // Mapped in the root task with the rest of the module's last page.
+        let tail = unsafe { core::slice::from_raw_parts(end as *const u8, rest) };
+        if tail.iter().any(|&b| b != 0) {
+            // Another module there would be lost, or leak to every guest.
+            let there = modules.iter().any(|m| {
+                let p = m.data.as_ptr() as usize;
+                p < end + rest && end < p + m.data.len()
+            });
+            if there {
+                sel4::debug_println!("l4h-root: module image at {:#x} shares its last page, ignored", start);
                 return None;
             }
+            let last = frames.get(end & !(PAGE - 1)).expect("module image frame");
+            win.with_frame(&abs(root_cap::<cap_type::Granule>(last)), |p| unsafe {
+                core::ptr::write_bytes(p.add(PAGE - rest), 0, rest)
+            });
         }
-        Some(Self { frames, size: data.len() })
+        Some(Self { data, frames })
     }
 
     fn pages(&self) -> usize {
-        self.size.div_ceil(PAGE)
+        self.data.len().div_ceil(PAGE)
     }
 
     fn radix(&self) -> usize {
@@ -190,13 +164,14 @@ impl Kmods {
         let keep = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: radix });
         let tmp = alloc.slots.alloc();
         for i in 0..self.pages() {
-            self.frames.copy(i * PAGE, tmp);
+            let from = self.frames.get(self.data.as_ptr() as usize + i * PAGE).expect("module image frame");
+            copy_read_only(from, tmp);
             let frame = root_cap::<cap_type::Granule>(tmp);
             let (vspace, va) = (g.vspace, abi::KMOD_VA as usize + i * PAGE);
             map_frame(&mut g.ctx(alloc), vspace, frame, va, CapRights::read_only(), VmAttributes::DEFAULT);
             keep.absolute_cptr_from_bits_with_depth(i as u64, radix).move_(&abs(frame)).expect("keep module image mapping");
         }
         alloc.slots.free(tmp);
-        g.kmod_size = self.size;
+        g.kmod_size = self.data.len();
     }
 }
