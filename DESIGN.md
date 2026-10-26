@@ -3240,11 +3240,20 @@ through `l4h-root`.
   offlining skips them. Unplug: `offline_and_remove_memory`, then
   revoking the copy of block 63 deletes the page tables and RAM CNodes
   (and with them every frame), then the other copies, then
-  `L4H_HC_MEM(UNPLUG)`. A guest that skips that only harms itself.
+  `L4H_HC_MEM(UNPLUG)`. A guest that skips that only harms itself. When
+  memd is too busy to take a block back (`EBUSY`), it stays pending, and
+  the driver retries every second until memd has it, whether or not the
+  target changes again. If a failed plug's rollback finds that Linux will
+  not let go of the block, the block stays plugged and in use: nothing
+  Linux may still use is unmapped or given back.
 - **Zones.** The guest boots with `memory_hotplug.memmap_on_memory=1` in
   front of its command line, and memory is added offline
   (`MHP_DEFAULT_ONLINE_TYPE_OFFLINE`): the driver onlines every hotplug
-  block to `ZONE_MOVABLE`, which can always be offlined. The design had
+  block to `ZONE_MOVABLE`, which can always be offlined. Linux may online
+  a block itself as it is added (`auto_online_blocks`,
+  `memhp_default_state=`, a udev rule): a block found online in another
+  zone is offlined and onlined again to `ZONE_MOVABLE`, or, if it cannot
+  be offlined, left where it is. The design had
   the kernel's `auto-movable` policy (movable up to three times boot RAM,
   then `ZONE_NORMAL`), for the kernel memory a bigger VM's processes
   need. That policy put every block in `ZONE_NORMAL` here; with the driver

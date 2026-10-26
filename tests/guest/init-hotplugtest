@@ -49,9 +49,21 @@ echo "HOTPLUGTEST: shrunk: $m2; host free $free2 MiB"
 [ "$(field "$m2" total)" -le 600 ] || fail "MemTotal $(field "$m2" total) MiB after shrinking to 512"
 [ $((free2 - free1)) -ge 1400 ] || fail "the host got only $((free2 - free1)) MiB back"
 
-# Again, then destroy: everything comes back.
-l4hctl mem "$id" 1024 --wait=60 || fail "grow again to 1024 MiB"
-echo "HOTPLUGTEST: regrown: $(mem)"
+# Again, by more than the host lets a guest plug at once, with Linux
+# onlining memory itself as it is added, to a kernel zone: the driver
+# must still end up with every block in ZONE_MOVABLE.
+ask "autoonline online_kernel" "HPVM: autoonline"
+l4hctl mem "$id" 3072 --wait=60 || fail "grow again to 3072 MiB"
+m3=$(mem)
+echo "HOTPLUGTEST: regrown, auto-onlined: $m3"
+[ "$(field "$m3" total)" -ge 2900 ] || fail "MemTotal $(field "$m3" total) MiB after growing to 3072"
+[ "$(field "$m3" movable)" -ge 2700 ] || fail "only $(field "$m3" movable) MiB in ZONE_MOVABLE"
+# And all the way down at once: unplugs beyond the host's rate are
+# deferred, and must still be taken back without another event.
+l4hctl mem "$id" 256 --wait=120 || fail "shrink to 256 MiB"
+free4=$(free_mib)
+echo "HOTPLUGTEST: back to boot RAM: $(mem); host free $free4 MiB"
+[ $((free0 - free4)) -le 300 ] || fail "the host has only $free4 MiB free with the VM at boot RAM (was $free0)"
 l4hctl destroy "$id" || fail "destroy"
 free3=$(free_mib)
 echo "HOTPLUGTEST: destroyed: host free $free3 MiB (was $free0)"

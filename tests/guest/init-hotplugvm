@@ -1,14 +1,16 @@
 #!/bin/sh
 # Guest of tests/guest/init-hotplugtest: report memory when asked (a line
 # "mem" on the console), fill and check tmpfs ("fill N", "check"), empty it
-# ("free").
+# ("free"), have Linux online memory as it is added ("autoonline TYPE").
 mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
 mkdir -p /tmp/t && mount -t tmpfs -o size=3g tmp /tmp/t
 kib() { sed -n "s/^$1: *\([0-9]*\) kB/\1/p" /proc/meminfo; }
+# Pages present in ZONE_MOVABLE, in MiB.
+movable() { awk '/zone *Movable/ { z = 1 } z && $1 == "present" { print int($2 / 256); exit } END { if (!z) print 0 }' /proc/zoneinfo; }
 report() {
-    echo "HPVM: mem total $(( $(kib MemTotal) >> 10 )) objects $(( $(kib L4hObjects) >> 10 )) blocks $(ls -d /sys/devices/system/memory/memory* | wc -l)"
+    echo "HPVM: mem total $(( $(kib MemTotal) >> 10 )) objects $(( $(kib L4hObjects) >> 10 )) movable $(movable) blocks $(ls -d /sys/devices/system/memory/memory* | wc -l)"
 }
 report
 echo "HPVM: ready"
@@ -24,5 +26,8 @@ while read -r cmd arg; do
     free)
         rm -f /tmp/t/fill
         echo "HPVM: freed" ;;
+    autoonline)
+        echo "$arg" > /sys/devices/system/memory/auto_online_blocks
+        echo "HPVM: autoonline $(cat /sys/devices/system/memory/auto_online_blocks)" ;;
     esac
 done

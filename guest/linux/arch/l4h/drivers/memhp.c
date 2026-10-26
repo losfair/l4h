@@ -106,10 +106,38 @@ static struct notifier_block memhp_nb = {
 	.notifier_call = memhp_notify,
 };
 
+/* Did hotplug block m go to ZONE_MOVABLE?  (Its block 0 is its memmap.) */
+static bool is_movable(unsigned int m)
+{
+	struct page *p = pfn_to_online_page(PFN_DOWN(block_gpa(m) + L4H_BLOCK_SIZE));
+
+	return p && page_zonenum(p) == ZONE_MOVABLE;
+}
+
+/*
+ * Linux may have onlined the block already: when memory is onlined as it is
+ * added (auto_online_blocks, memhp_default_state=) or by a udev rule, maybe
+ * to a kernel zone.  Such a block is moved to ZONE_MOVABLE if it can be
+ * offlined; if not, it stays where it is.
+ */
 static int online_block(struct memory_block *mem, void *arg)
 {
+	unsigned int m = *(unsigned int *)arg;
+	int ret;
+
+	if (!mem->dev.offline) {
+		if (is_movable(m))
+			return 0;
+		ret = device_offline(&mem->dev);
+		if (ret) {
+			pr_warn("l4h-memhp: block %u: onlined to a kernel zone, and stays there: %d\n", m, ret);
+			return 0;
+		}
+	}
 	mem->online_type = MMOP_ONLINE_MOVABLE;
-	return device_online(&mem->dev);
+	ret = device_online(&mem->dev);
+	/* 1: onlined meanwhile by someone else. */
+	return ret == 1 ? 0 : ret;
 }
 
 /*
@@ -125,7 +153,7 @@ static int online(unsigned int m)
 	int ret;
 
 	lock_device_hotplug();
-	ret = walk_memory_blocks(block_gpa(m), L4H_HP_SIZE, NULL, online_block);
+	ret = walk_memory_blocks(block_gpa(m), L4H_HP_SIZE, &m, online_block);
 	unlock_device_hotplug();
 	return ret;
 }
@@ -141,14 +169,20 @@ static int plug(unsigned int m)
 		return ret;
 	ret = l4h_hp_map(m);
 	if (!ret) {
-		/* Added offline (CONFIG_MHP_DEFAULT_ONLINE_TYPE_OFFLINE): we
-		 * choose its zone. */
+		/* Normally added offline (CONFIG_MHP_DEFAULT_ONLINE_TYPE_OFFLINE),
+		 * and we choose its zone. */
 		ret = add_memory_driver_managed(0, block_gpa(m), L4H_HP_SIZE, "System RAM (l4h)",
 						MHP_MEMMAP_ON_MEMORY);
 		if (!ret) {
 			ret = online(m);
-			if (ret)
-				remove_memory(block_gpa(m), L4H_HP_SIZE);
+			/* Nothing Linux may be using goes back: if it will not
+			 * let go of the block, it keeps it. */
+			if (ret && offline_and_remove_memory(block_gpa(m), L4H_HP_SIZE)) {
+				pr_warn("l4h-memhp: block %u: cannot online it as asked, nor remove it: kept as it is: %ld\n",
+					m, ret);
+				__set_bit(m, added);
+				return 0;
+			}
 		}
 		if (ret) {
 			pr_err("l4h-memhp: block %u: cannot add it: %ld\n", m, ret);
@@ -249,6 +283,10 @@ static void memhp_work_fn(struct work_struct *w)
 		n--;
 	}
 out:
+	/* Blocks out of Linux that the host was too busy to take back:
+	 * retry, even with the target met and no event to come. */
+	if (!delay && !bitmap_empty(pending, region_count))
+		delay = RETRY_BUSY;
 	mutex_unlock(&memhp_mutex);
 	if (delay)
 		schedule_delayed_work(&memhp_work, delay);
