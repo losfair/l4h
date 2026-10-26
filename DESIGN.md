@@ -1185,6 +1185,8 @@ bootconfig and a display stay off.
   (x86 leaves 1F/0B, or AMD topology extensions on Zen and later), then
   returns to its boot CPU. This maps actual CPU IDs, including gaps and
   multiple sockets, without assuming seL4 CPU numbering describes siblings.
+  Missing or inconsistent topology falls back to independent CPUs; AArch64
+  currently uses that flat topology.
 
   *Revised:* on x86_64 every CPU a VSpace has run on stays in its TLB
   bitmap until a flush of the VSpace's whole PCID clears the CPUs not
@@ -1197,9 +1199,9 @@ bootconfig and a display stay off.
   13 to 48 s instead of 0.2 s, and boots looked hung. Root now flushes
   its VSpace (`seL4_X64_PML4_Flush`, patch 0017) once back on its boot
   CPU, which drops the others (`vspace::flush_tlb_bitmap`).
-  Missing or inconsistent topology falls back to independent CPUs; AArch64
-  currently uses that flat topology. Every 100 ms `l4h-root` reads
-  `SchedContext_Consumed` for both SCs of every vCPU.
+
+  Every 100 ms `l4h-root` reads `SchedContext_Consumed` for both SCs of
+  every vCPU.
   - A vCPU is *busy* if it got at least half of its fair share among the
     vCPUs active on its core. Measuring this way still counts a starved
     vCPU on a crowded core.
