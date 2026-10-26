@@ -1047,7 +1047,7 @@ guest's command line asks for it:
 | userfaultfd, `MREMAP_DONTUNMAP`, `UFFDIO_MOVE` | ART's default (concurrent compacting) garbage collector | unused |
 | `/dev/rtc0` with alarms | the `CLOCK_*_ALARM` clocks | present |
 | dma-buf heaps, `sync_file` | gralloc buffers and fences | unused |
-| DRM with virtio-gpu (dumb buffers on render nodes, patch 0012; its 32-bit formats, patch 0013) or vkms, modules | the display SurfaceFlinger composes for | no display until a driver is loaded |
+| DRM with virtio-gpu (dumb buffers on render nodes, patch 0012; ARGB8888 on its plane, patch 0013) or vkms, modules | the display SurfaceFlinger composes for | no display until a driver is loaded |
 | evdev, uinput | input | no input devices |
 | zram with LZ4 | swap | unconfigured |
 | legacy iptables with the matches and targets netd uses, policy routing, `SOCK_DESTROY`, XFRM | netd | empty tables |
@@ -1187,8 +1187,11 @@ launcher would give it:
   master on the primary node), which mainline does not allow: patch 0012
   allows it, as the Android kernels do. The composer commits ARGB8888
   framebuffers, which mainline's virtio-gpu plane does not take (XRGB8888
-  only): patch 0013 offers the eight 32-bit formats of the virtio-gpu
-  protocol, which l4h-vmm has, as the Android kernels do. Every buffer
+  only): patch 0013 offers ARGB8888 too. The Android kernels offer all
+  eight 32-bit formats of the virtio-gpu protocol, but without blob
+  scanouts l4h-vmm shows a resource in the format it was created with,
+  and dumb buffers are always B8G8R8X8, so the other six would show
+  with their bytes in the wrong order. Every buffer
   is mapped through the VM's I/O pool, hence its size.
 
 Android completes its boot about 150 s after the VM starts, on four

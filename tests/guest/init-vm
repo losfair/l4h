@@ -22,10 +22,15 @@ case " $(cat /proc/cmdline) " in
     # Fill most of RAM with zeros and watch for disk data appearing in it:
     # DMA of the destroyed dmaload guest landing in reused memory.  All
     # that is available but 20 MiB, which the kernel's size does not
-    # change.
+    # change; less than 32 MiB checks too little, and fails.
     fill=$(($(sed -n 's/^MemAvailable: *\([0-9]*\) kB/\1/p' /proc/meminfo) / 1024 - 20))
-    mkdir -p /tmp/z && mount -t tmpfs -o size=100m tmp /tmp/z
-    dd if=/dev/zero of=/tmp/z/fill bs=1M count="$fill" 2>/dev/null
+    echo "GUEST: dma check fill $fill MiB"
+    mkdir -p /tmp/z && mount -t tmpfs -o size="$((fill > 32 ? fill : 32))m" tmp /tmp/z
+    if [ "$fill" -lt 32 ] || ! dd if=/dev/zero of=/tmp/z/fill bs=1M count="$fill" 2>/dev/null; then
+        echo "GUEST: stale bytes unchecked"
+        echo "GUEST: dma check done"
+        while :; do sleep 10; done
+    fi
     echo "GUEST: dma check start"
     for i in $(seq 1 10); do
         sleep 2

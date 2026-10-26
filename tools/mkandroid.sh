@@ -14,7 +14,8 @@
 #             replaces)
 #   userdata  ext4, mapped by vold through dm-default-key
 # which first-stage init finds by name (androidboot.boot_devices).  The
-# disk of an earlier run is kept, but for its odm: DATA=0 makes a new one.
+# disk of an earlier run is kept, but for its odm, unless super.img has
+# changed: DATA=0 makes a new one.
 #
 # The initramfs is what a bootloader loads: the vendor ramdisk
 # (vendor_boot.img), the generic one (init_boot.img), then an archive of
@@ -82,7 +83,10 @@ with open(os.path.join(dst, 'modules.load'), 'w') as f:
 for name in ('modules.alias', 'modules.softdep', 'modules.options', 'modules.blocklist'):
     open(os.path.join(dst, name), 'w').close()
 PY
-(cd "$dir/l4h" && find . -mindepth 1 | cpio -o -H newc --quiet | gzip -9) > "$dir/l4h.cpio.gz"
+# Owned by root, as the ramdisks it overlays are: the kernel applies the
+# owner and mode of a directory that is already there too.
+chmod -R u=rwX,go=rX "$dir/l4h"
+(cd "$dir/l4h" && find . -mindepth 1 | cpio -o -H newc -R 0:0 --quiet | gzip -9) > "$dir/l4h.cpio.gz"
 
 # androidboot.* in a bootconfig: its text, size and checksum
 # (little-endian), then the magic, at the end of the initramfs.
@@ -152,17 +156,23 @@ PY
 { cat "$dir/vendor/ramdisk" "$dir/generic.ramdisk"; printf '\0\0\0\0'
   cat "$dir/l4h.cpio.gz" "$dir/bootconfig"; } > "$out/initrd.img"
 
+# A new disk is made under another name and renamed once complete, so an
+# interrupted run does not leave half a disk to be kept; and made again
+# when super.img is not the one it was made from.
 disk=$out/disk.img
-if [ "${DATA:-1}" = 0 ] || [ ! -f "$disk" ]; then
-    rm -f "$disk"
+src=$(stat -c '%s %Y' "$img/super.img")
+if [ "${DATA:-1}" = 0 ] || [ ! -f "$disk" ] || [ "$(cat "$disk.src" 2>/dev/null)" != "$src" ]; then
+    rm -f "$disk" "$disk.src"
+    new=$disk.new
+    rm -f "$new"
     super=$(( $("$root/tools/android-image.py" size "$img/super.img") / 512 ))
     data=$(( $(numfmt --from=iec "${L4H_ANDROID_DATA:-8G}") / 512 ))
     # 1 MiB of misc and of frp, 16 MiB of metadata and of odm, from 1 MiB;
     # 1 MiB at the end for the backup GPT.
     misc=2048 frp=$((misc + 2048)) meta=$((frp + 2048)) odm=$((meta + 32768)) sup=$((odm + 32768))
     ud=$((sup + super))
-    truncate -s $(( (ud + data + 2048) * 512 )) "$disk"
-    sfdisk -q -X gpt "$disk" <<EOF
+    truncate -s $(( (ud + data + 2048) * 512 )) "$new"
+    sfdisk -q -X gpt "$new" <<EOF
 start=$misc, size=2048, name="misc"
 start=$frp, size=2048, name="frp"
 start=$meta, size=32768, name="metadata"
@@ -170,9 +180,11 @@ start=$odm, size=32768, name="odm"
 start=$sup, size=$super, name="super"
 start=$ud, size=$data, name="userdata"
 EOF
-    mkfs.ext4 -q -L metadata -E offset=$((meta * 512)) "$disk" 16M
-    "$root/tools/android-image.py" unsparse "$img/super.img" "$disk" $((sup * 512))
-    mkfs.ext4 -q -L userdata -O encrypt,quota,verity -E offset=$((ud * 512)) "$disk" $((data / 2))k
+    mkfs.ext4 -q -L metadata -E offset=$((meta * 512)) "$new" 16M
+    "$root/tools/android-image.py" unsparse "$img/super.img" "$new" $((sup * 512))
+    mkfs.ext4 -q -L userdata -O encrypt,quota,verity -E offset=$((ud * 512)) "$new" $((data / 2))k
+    mv "$new" "$disk"
+    echo "$src" > "$disk.src"
 fi
 
 # l4h's odm: Cuttlefish's files, labelled as the platform's policy labels
