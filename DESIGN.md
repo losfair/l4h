@@ -2006,14 +2006,45 @@ build. The one heap is trustd's, for the third-party AML interpreter of the TPM
 start method: its size (`aml::HEAP`) is bounded by the firmware's
 tables, which trustd checks first, never by a guest.
 
-The shared crates are `l4h-abi` (guest ABI), `l4h-host` (host component
-protocols), `l4h-task` (task construction and memory management), `l4h-rt`
-(component runtime) and `l4h-virtio` (PCI transport). Root and vmmgr depend
-on `l4h-task` for their allocator, memd grant client, ELF loading, component
-spawning, topology and VSpace/scratch mappings. Each supplies its own
-CNode, allocator table storage, scratch addresses, memory-service endpoint
-and mailbox, and spawning capabilities. ASID assignment and placement
-policies stay in the executables; neither imports the other's source.
+**Shared crate boundaries.** `l4h-abi` defines the guest ABI and
+`l4h-virtio` implements the shared virtio PCI transport. Host infrastructure
+is divided by responsibility:
+
+| Crate | Responsibility | Boundary |
+|-------|----------------|----------|
+| `l4h-host` | Component protocols, address-space and CSpace layouts, shared data structures, bounded containers, and pure validation helpers. | Independent of seL4 calls, runtime initialization, and task ownership. |
+| `l4h-rt` | Component entry, TLS and IPC-buffer setup, panic handling, keeper threads, optional heap, and common runtime conveniences. | Runs a component using the resources its parent provisioned. Task construction and the memd grant allocator belong in `l4h-task`. |
+| `l4h-task` | Kernel-object and CSpace allocation, memd grant client, ELF loading, component spawning, CPU topology, and VSpace/scratch mappings. | Callers supply capabilities, storage, mappings, and ASID assignment. Boot setup, resource authorization, and placement policy stay in the executables. |
+
+Both `l4h-rt` and `l4h-task` depend on `l4h-host`; they are independent of
+each other. Shared implementation belongs in a library imported through
+Cargo. Executables must not import another executable's source files.
+Embedding a component's ELF to start it is a separate deployment concern.
+
+Root and vmmgr currently use `l4h-task`: both allocate kernel objects,
+construct address spaces, and spawn components. Each supplies its own
+CNode, allocator table storage, scratch VSpace and addresses, memory-service
+endpoint and exchange slots, and spawning capabilities. Their ASID-pool
+ownership and assignment policies remain local.
+
+Other components reuse the library when they need those mechanisms:
+
+- **blkd, netd and trustd** use capabilities and mappings installed by their
+  parent. Their runtime needs are covered by `l4h-rt`. Netd's fixed packet
+  buffer pool and trustd's bounded AML heap do not allocate kernel objects.
+- **l4h-vmm** accesses its mapped I/O pool and relays guest memory-hotplug
+  requests. Its memd capability permits only the guest's hotplug operations;
+  `l4h-task::memd::MemdLink` serves clients that receive and return Untyped
+  grants through exchange slots.
+- **l4h-memd** provides the memory service. Its allocator tracks physical
+  blocks, ownership, retained capabilities for revocation, and free-page
+  reporting. That state belongs to memd; the client allocator in `l4h-task`
+  manages objects and arenas made from grants.
+
+Add a `l4h-task` dependency when a component needs its allocation, mapping,
+or loading mechanisms. Ordinary IPC and access to already provisioned
+resources use `l4h-rt` and seL4. Extract further shared mechanisms when their
+semantics match, keeping service-specific policy and accounting local.
 
 Serial output uses seL4's printing syscall; root drives COM1 input for the
 monitor. There is no separate serial virtualiser. A kernel print is a

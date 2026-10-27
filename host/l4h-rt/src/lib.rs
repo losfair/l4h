@@ -1,10 +1,16 @@
-//! Runtime for l4h host components spawned by l4h-root.
+//! Runtime for l4h host components spawned by root or vmmgr.
 //!
 //! A component provides `fn component_main(info: &'static Info) -> !` and
 //! invokes `l4h_rt::component!(component_main, no_heap)` (or `heap_size = N`
-//! where an allocator is truly needed, DESIGN.md §9).  l4h-root starts the
+//! where an allocator is truly needed, DESIGN.md §9).  Its parent starts the
 //! component at its ELF entry with the stack set up (see l4h-host for the
 //! address-space layout).
+//!
+//! This crate owns entry, TLS and IPC-buffer setup, panic handling, keeper
+//! threads, the optional heap, and common runtime conveniences. Protocols
+//! and layouts belong in `l4h-host`. Components that allocate kernel objects,
+//! construct address spaces, or load tasks can also use `l4h-task`; the two
+//! libraries are independent. See DESIGN.md §9 for the shared crate boundaries.
 
 #![no_std]
 

@@ -1,6 +1,12 @@
 //! Definitions shared by l4h-root and the host components it spawns
 //! (l4h-vmmgr, l4h-vmm, blkd, netd, trustd, memd): the component address-space and CSpace layout,
 //! the component info page, and the inter-component queue formats.
+//!
+//! This crate owns component protocols, shared data structures, bounded
+//! containers, and pure helpers. It stays independent of seL4 calls and
+//! runtime initialization. Component runtime support belongs in `l4h-rt`;
+//! kernel-object allocation and task construction belong in `l4h-task`.
+//! See DESIGN.md §9 for the shared crate boundaries.
 
 #![no_std]
 
