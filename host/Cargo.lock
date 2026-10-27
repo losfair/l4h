@@ -345,6 +345,7 @@ version = "0.1.0"
 dependencies = [
  "l4h-abi",
  "l4h-host",
+ "l4h-task",
  "l4h-virtio",
  "sel4",
  "sel4-root-task",
@@ -364,6 +365,14 @@ dependencies = [
  "sel4-panicking-env",
  "sel4-phdrs",
  "sel4-runtime-common",
+]
+
+[[package]]
+name = "l4h-task"
+version = "0.1.0"
+dependencies = [
+ "l4h-host",
+ "sel4",
 ]
 
 [[package]]
@@ -397,6 +406,7 @@ dependencies = [
  "l4h-abi",
  "l4h-host",
  "l4h-rt",
+ "l4h-task",
  "sel4",
  "sha2",
 ]

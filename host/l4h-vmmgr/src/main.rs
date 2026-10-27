@@ -17,27 +17,7 @@ macro_rules! info {
     };
 }
 
-// What vmmgr and root both do: allocate, map, spawn components.  The files
-// are root's, written against `crate::slot`, `crate::layout` and the like;
-// some of what they have only root uses.
-#[path = "../../l4h-root/src/component.rs"]
-#[allow(dead_code)]
 mod component;
-#[path = "../../l4h-root/src/elf.rs"]
-mod elf;
-#[path = "../../l4h-root/src/mem.rs"]
-#[allow(dead_code)]
-mod mem;
-#[path = "../../l4h-root/src/topology.rs"]
-#[allow(dead_code)]
-mod topology;
-#[path = "../../l4h-root/src/vspace.rs"]
-#[allow(dead_code)]
-mod vspace;
-#[path = "../../l4h-root/src/window.rs"]
-#[allow(dead_code)]
-mod window;
-
 mod ctl;
 mod gpu;
 mod guest;
@@ -57,6 +37,7 @@ use l4h_host as host;
 use l4h_host::fixed::{ArrayVec, StaticCell};
 use l4h_host::vmmgr::{self as proto, VmmgrConfig};
 use l4h_rt::Info;
+use l4h_task::{elf, mem, topology, vspace, window};
 
 use crate::component::ROOT_BADGE_COMPONENT;
 use crate::guest::{Guest, GuestConfig, State, hyp_badge_guest, hyp_badge_vcpu};
@@ -77,7 +58,9 @@ pub mod slot {
 }
 
 pub const CNODE_SLOTS: usize = 1 << proto::CNODE_BITS;
-pub const RETYPE_FAN_OUT: usize = 16384;
+static SLOT_STORAGE: StaticCell<mem::SlotStorage<{ CNODE_SLOTS / 64 }, CNODE_SLOTS>> =
+    StaticCell::new(mem::SlotStorage::new());
+static ALLOC_STORAGE: StaticCell<mem::AllocStorage> = StaticCell::new(mem::AllocStorage::new());
 pub const MAX_GUESTS: usize = 64;
 const _: () = assert!(MAX_GUESTS <= host::memd::MAX_GUESTS);
 /// The guests, by id: too large for a stack.
@@ -107,6 +90,15 @@ pub struct HostInfo {
 }
 
 impl HostInfo {
+    pub fn spawn_context(&self, core: usize) -> component::SpawnContext {
+        component::SpawnContext {
+            authority: slot::TCB.cap(),
+            sched_control: self.sched_control(core),
+            parent_ep: self.hyp_ep,
+            tsc_hz: self.tsc_hz,
+        }
+    }
+
     /// CPU for the next vCPU, visiting physical cores before SMT siblings.
     pub fn next_core(&self) -> usize {
         let c = self.placement.get();
@@ -403,11 +395,15 @@ fn module(r: &proto::ModuleRange) -> Option<&'static [u8]> {
 
 fn main(info: &'static Info) -> ! {
     let cfg: &'static VmmgrConfig = unsafe { info.config() };
-    let mut alloc = Alloc::empty(Slots::new(proto::SLOT_DYN_BASE as usize..CNODE_SLOTS));
+    let slots = Slots::new(slot::CNODE.cap(), SLOT_STORAGE.take(), proto::SLOT_DYN_BASE as usize..CNODE_SLOTS);
+    let mut alloc = Alloc::empty(slots, ALLOC_STORAGE.take());
     alloc.memd = Some(memd::link());
     alloc.refill();
     let reply = ReplySlot::new(&mut alloc);
-    let wins = Windows { a: Window::new(&mut alloc, 0), b: Window::new(&mut alloc, 1) };
+    let wins = Windows {
+        a: Window::new(&mut alloc, slot::VSPACE.cap(), layout::WINDOWS.base),
+        b: Window::new(&mut alloc, slot::VSPACE.cap(), layout::WINDOWS.base + 4096),
+    };
     let mut pools = ArrayVec::new();
     for i in 0..cfg.asid_pools as usize {
         pools.must_push((sel4::Cap::from_bits(proto::SLOT_ASID_POOL + i as u64), cfg.asids_used[i] as usize));
@@ -555,7 +551,7 @@ impl ReplySlot {
 
     fn make(&self) {
         self.ut
-            .untyped_retype(&ObjectBlueprint::Reply, &mem::root_cnode_dest(), self.reply.bits() as usize, 1)
+            .untyped_retype(&ObjectBlueprint::Reply, &mem::cnode_dest(slot::CNODE.cap()), self.reply.bits() as usize, 1)
             .expect("reply object");
     }
 

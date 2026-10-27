@@ -8,65 +8,20 @@ use sel4::{CapRights, cap, cap_type};
 
 use l4h_host::memd::{self, MAILBOX_BCN, MAILBOX_HCN, MAILBOX_RADIX, MAILBOX_XCHG, Status};
 use l4h_host::vmmgr as proto;
+use l4h_task::memd::MemdLink;
 
 use crate::component::abs_of;
 use crate::mem::{Alloc, Slot};
-use crate::{mr, set_mr};
+use crate::mr;
 
-/// memd's endpoint and our mailbox.
-#[derive(Clone, Copy)]
-pub struct MemdLink {
-    ep: cap::Endpoint,
-    mailbox: cap::CNode,
-}
-
+/// memd's endpoint, mailbox, and status mapping, installed by root.
 pub fn link() -> MemdLink {
-    MemdLink { ep: sel4::Cap::from_bits(proto::SLOT_MEMD_EP), mailbox: sel4::Cap::from_bits(proto::SLOT_MEMD_MAILBOX) }
-}
-
-impl MemdLink {
-    fn slot(&self, i: u64) -> sel4::AbsoluteCPtr {
-        self.mailbox.absolute_cptr_from_bits_with_depth(i, MAILBOX_RADIX)
-    }
-
-    fn xchg(&self, i: usize) -> sel4::AbsoluteCPtr {
-        self.slot(MAILBOX_XCHG + i as u64)
-    }
-
-    fn call(&self, label: u64, args: &[u64]) -> u64 {
-        for (i, &a) in args.iter().enumerate() {
-            set_mr(i, a);
-        }
-        self.ep.call(sel4::MessageInfo::new(label, 0, 0, args.len()));
-        mr(0)
-    }
-
-    pub fn status(&self) -> Status {
-        unsafe { (proto::MEMD_STATUS_VA as *const Status).read_volatile() }
-    }
-
-    /// An untouched Untyped of 2^bits bytes, into our slot `slot`: its
-    /// physical address.
-    pub fn alloc(&self, bits: usize, slot: Slot) -> Option<usize> {
-        if self.call(memd::MEMD_ALLOC, &[bits as u64, 1]) != 0 {
-            return None;
-        }
-        let paddr = mr(1) as usize;
-        abs_of(sel4::Cap::<cap_type::Null>::from_bits(slot as u64)).move_(&self.xchg(0)).expect("memd: take grant");
-        Some(paddr)
-    }
-
-    /// Return untouched grants (at most XCHG_SLOTS): (capability, physical
-    /// address, size bits).  Their slots are left empty.
-    pub fn free(&self, blocks: &[(cap::Untyped, usize, usize)]) {
-        assert!(blocks.len() <= memd::XCHG_SLOTS);
-        let mut args = [0; 1 + 2 * memd::XCHG_SLOTS];
-        args[0] = blocks.len() as u64;
-        for (i, &(ut, paddr, bits)) in blocks.iter().enumerate() {
-            self.xchg(i).move_(&abs_of(ut)).expect("memd: return block");
-            (args[1 + 2 * i], args[2 + 2 * i]) = (paddr as u64, bits as u64);
-        }
-        assert_eq!(self.call(memd::MEMD_FREE, &args[..1 + 2 * blocks.len()]), 0, "memd: free");
+    // Root maps the read-only status record for this task's lifetime.
+    unsafe {
+        MemdLink::new(
+            sel4::Cap::from_bits(proto::SLOT_MEMD_EP), crate::slot::CNODE.cap(),
+            sel4::Cap::from_bits(proto::SLOT_MEMD_MAILBOX), MAILBOX_RADIX, MAILBOX_XCHG, proto::MEMD_STATUS_VA,
+        )
     }
 }
 

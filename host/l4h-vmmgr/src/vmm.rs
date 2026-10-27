@@ -188,7 +188,6 @@ fn create(
         id: g.id as u32,
         kind: host::KIND_VMM,
         elf: VMM_ELF,
-        core,
         prio: abi::PRIO_KERNEL + 1,
         budget_us: host_info.timeslice_us,
         period_us: host_info.timeslice_us,
@@ -198,7 +197,10 @@ fn create(
         cnode: Some(g.vmm_cnodes.as_ref().expect("VMM CNodes").cspace),
         cnode_bits: None,
     };
-    component::create(&args, alloc, &mut g.arena, win, asids, host_info)
+    component::create(
+        &args, alloc, &mut g.arena, win, &mut |alloc, vspace| asids.assign(alloc, vspace),
+        &host_info.spawn_context(core),
+    )
 }
 
 /// Map the guest's I/O pool, event, device and channel pages into its VMM.

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["l4h-abi", "l4h-host", "l4h-rt", "l4h-root", "l4h-vmmgr", "l4h-vmm", "l4h-blkd", "l4h-netd", "l4h-trustd", "l4h-memd", "l4h-virtio"]
+members = ["l4h-abi", "l4h-host", "l4h-task", "l4h-rt", "l4h-root", "l4h-vmmgr", "l4h-vmm", "l4h-blkd", "l4h-netd", "l4h-trustd", "l4h-memd", "l4h-virtio"]
 default-members = ["l4h-root"]
 
 [workspace.package]

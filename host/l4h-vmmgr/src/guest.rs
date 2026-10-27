@@ -59,7 +59,7 @@ pub const BOOT_SLACK: usize = 1;
 const BLOCK_FRAMES_BYTES: usize = 2 * (32 << abi::RAM_L2_BITS);
 const BLOCK_FRAMES_SLOTS: usize = 3;
 /// Devices a guest can have (console, control, virtio).
-pub const MAX_GUEST_DEVICES: usize = 16;
+pub use l4h_host::MAX_GUEST_DEVICES;
 /// VSpaces of a guest's processes (the guest's VSpace pool), at most.
 pub const MAX_VSPACES: usize = 64;
 
@@ -945,7 +945,7 @@ pub fn create(
     // Guest root CNode.
     let cnode_slot = alloc.slots.alloc();
     arena
-        .retype(alloc, &ObjectBlueprint::CNode { size_bits: abi::ROOT_CNODE_BITS }, 1, Dest::root(cnode_slot))
+        .retype(alloc, &ObjectBlueprint::CNode { size_bits: abi::ROOT_CNODE_BITS }, 1, Dest::new(crate::slot::CNODE.cap(), cnode_slot))
         .expect("guest CNode");
     let vspace_slot = arena.object(alloc, PML4_BP);
     let vspace = self_cap::<cap_type::VSpace>(vspace_slot);

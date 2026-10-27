@@ -26,7 +26,7 @@ static VMMGR_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/l4h-vmmgr.el
 
 const PAGE: usize = 4096;
 /// Devices a guest can have (console, control, virtio).
-pub const MAX_GUEST_DEVICES: usize = 16;
+pub use l4h_host::MAX_GUEST_DEVICES;
 /// Bounds of a guest's I/O pool (a power of two).
 const IO_POOL_MIN: usize = 1 << 20;
 const IO_POOL_MAX: usize = 256 << 20;
@@ -199,7 +199,6 @@ pub fn spawn(h: &mut Host, modules: &Modules, plan: &Dom0Plan) -> Vmmgr {
             id: proto::VMMGR_ID,
             kind: host::KIND_VMMGR,
             elf: VMMGR_ELF,
-            core: 0,
             // Above the guests and their VMMs, which it configures.
             prio: abi::PRIO_KERNEL + 2,
             budget_us: h.info.timeslice_us,
@@ -210,7 +209,10 @@ pub fn spawn(h: &mut Host, modules: &Modules, plan: &Dom0Plan) -> Vmmgr {
             cnode: None,
             cnode_bits: Some(bits),
         };
-        component::create(&args, &mut h.alloc, &mut arena, &mut h.wins.a, &mut h.asids, &h.info)
+        component::create(
+            &args, &mut h.alloc, &mut arena, &mut h.wins.a,
+            &mut |alloc, vspace| h.asids.assign(alloc, vspace), &h.info.spawn_context(0),
+        )
     });
 
     for core in 0..h.info.cores {

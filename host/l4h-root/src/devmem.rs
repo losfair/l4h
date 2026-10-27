@@ -79,7 +79,7 @@ impl DevMem {
             let half = r.size_bits - 1;
             let s = slots.alloc_range(2);
             r.cap
-                .untyped_retype(&ObjectBlueprint::Untyped { size_bits: half }, &Dest::root(s.start).cnode, s.start, 2)
+                .untyped_retype(&ObjectBlueprint::Untyped { size_bits: half }, &Dest::new(crate::slot::CNODE.cap(), s.start).cnode, s.start, 2)
                 .expect("split device untyped");
             let lo = Region { cap: slot_cap(s.start), paddr: r.paddr, size_bits: half };
             let hi = Region { cap: slot_cap(s.start + 1), paddr: r.paddr + (1 << half), size_bits: half };
@@ -93,7 +93,7 @@ impl DevMem {
         // The kernel caps fan-out per call (a framebuffer can be larger).
         for at in (0..n).step_by(crate::RETYPE_FAN_OUT) {
             let k = (n - at).min(crate::RETYPE_FAN_OUT);
-            r.cap.untyped_retype(&FRAME_BP, &Dest::root(s.start).cnode, s.start + at, k).expect("device frames");
+            r.cap.untyped_retype(&FRAME_BP, &Dest::new(crate::slot::CNODE.cap(), s.start).cnode, s.start + at, k).expect("device frames");
         }
         Some(s)
     }

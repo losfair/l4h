@@ -27,34 +27,30 @@ mod config;
 mod ctl;
 mod dashboard;
 mod devmem;
-mod elf;
 mod font;
 mod iommu;
 mod layout;
-mod mem;
 mod memd;
 mod monitor;
 mod netd;
 mod pci;
 mod reset;
 mod rtc;
-mod topology;
 mod trustd;
 mod vmmgr;
 #[cfg(target_arch = "x86_64")]
 mod vtd;
-mod vspace;
-mod window;
 
 use l4h_host::fixed::StaticCell;
 
-/// The root task's own capabilities, for the files it shares with vmmgr.
+/// The root task's own capabilities.
 pub use sel4::init_thread::slot;
 use sel4::{ObjectBlueprint, cap, cap_type};
 use sel4_root_task::{Never, root_task};
 
 use l4h_host as host;
 use l4h_host::fixed::ArrayVec;
+use l4h_task::{mem, topology, vspace, window};
 
 use crate::blkd::{Controller, Disk};
 use crate::component::ROOT_BADGE_COMPONENT;
@@ -65,7 +61,10 @@ use crate::window::{Window, Windows};
 pub use crate::vmmgr::MAX_GUEST_DEVICES;
 
 pub const CNODE_SLOTS: usize = 1 << sel4::sel4_cfg_usize!(ROOT_CNODE_SIZE_BITS);
-pub const RETYPE_FAN_OUT: usize = 16384;
+pub use l4h_task::mem::RETYPE_FAN_OUT;
+static SLOT_STORAGE: StaticCell<mem::SlotStorage<{ CNODE_SLOTS / 64 }, CNODE_SLOTS>> =
+    StaticCell::new(mem::SlotStorage::new());
+static ALLOC_STORAGE: StaticCell<mem::AllocStorage> = StaticCell::new(mem::AllocStorage::new());
 pub const MAX_GUESTS: usize = 64;
 /// Badge bit of a component's fault on the root endpoint.
 pub const HYP_BADGE_FAULT: u64 = host::BADGE_FAULT;
@@ -106,6 +105,15 @@ pub struct HostInfo {
 }
 
 impl HostInfo {
+    pub fn spawn_context(&self, core: usize) -> component::SpawnContext {
+        component::SpawnContext {
+            authority: slot::TCB.cap(),
+            sched_control: self.sched_control(core),
+            parent_ep: self.hyp_ep,
+            tsc_hz: self.tsc_hz,
+        }
+    }
+
     pub fn sched_control(&self, core: usize) -> cap::SchedControl {
         sel4::init_thread::Slot::<cap_type::SchedControl>::from_index(self.sched_control_base + core).cap()
     }
@@ -310,9 +318,13 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     layout::guard_stack(bootinfo);
     layout::check_image(bootinfo);
     let cores = bootinfo.inner().numNodes as usize;
-    let topology = topology::discover(bootinfo);
+    let topology = topology::discover(
+        cores, bootinfo.inner().nodeID as usize, slot::SC.cap(), slot::VSPACE.cap(),
+        bootinfo.sched_control().range().start,
+    );
     info!("l4h-root: CPU physical cores {:?}", topology.physical());
-    let mut alloc = Alloc::new(Slots::new(bootinfo.empty().range()), bootinfo);
+    let slots = Slots::new(slot::CNODE.cap(), SLOT_STORAGE.take(), bootinfo.empty().range());
+    let mut alloc = Alloc::new(slots, ALLOC_STORAGE.take(), bootinfo);
     let total_bytes = alloc.free_bytes();
     info!("l4h-root: {} core(s), {} MiB free memory", cores, total_bytes >> 20);
 
@@ -322,7 +334,10 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     let wd_ntfn = alloc.object_cap::<cap_type::Notification>(ObjectBlueprint::Notification);
     slot::TCB.cap().tcb_bind_notification(wd_ntfn).expect("bind watchdog notification");
     let reply = ReplySlot::new(&mut alloc);
-    let mut wins = Windows { a: Window::new(&mut alloc, 0), b: Window::new(&mut alloc, 1) };
+    let mut wins = Windows {
+        a: Window::new(&mut alloc, slot::VSPACE.cap(), layout::WINDOWS.base),
+        b: Window::new(&mut alloc, slot::VSPACE.cap(), layout::WINDOWS.base + 4096),
+    };
     let mut devmem = devmem::DevMem::from_bootinfo(bootinfo);
     let modules = bootmod::load(bootinfo, &mut alloc, &mut devmem);
     let module = |name: &str| modules.iter().find(|m| m.name == name).map(|m| m.data);
@@ -603,7 +618,7 @@ impl ReplySlot {
 
     fn make(&self) {
         self.ut
-            .untyped_retype(&ObjectBlueprint::Reply, &mem::root_cnode_dest(), self.reply.bits() as usize, 1)
+            .untyped_retype(&ObjectBlueprint::Reply, &mem::cnode_dest(slot::CNODE.cap()), self.reply.bits() as usize, 1)
             .expect("reply object");
     }
 

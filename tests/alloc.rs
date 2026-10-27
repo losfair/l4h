@@ -1,4 +1,4 @@
-//! Run with tests/run-alloctest.sh.  Exercise root's real allocator and
+//! Run with tests/run-alloctest.sh.  Exercise the shared task allocator and
 //! fixed containers on the host; only seL4 capability operations are stubs.
 #![allow(dead_code)]
 
@@ -7,14 +7,15 @@ extern crate self as sel4;
 
 #[path = "../host/l4h-host/src/fixed.rs"]
 pub mod fixed;
-#[path = "../host/l4h-root/src/mem.rs"]
+#[path = "../host/l4h-task/src/mem.rs"]
 mod mem;
 
-pub const MAX_GUESTS: usize = 64;
-pub const RETYPE_FAN_OUT: usize = 16384;
 pub const MAX_GUEST_DEVICES: usize = 16;
 pub const CNODE_SLOTS: usize = 1 << 19;
 pub use init_thread::slot;
+static SLOT_STORAGE: fixed::StaticCell<mem::SlotStorage<{ CNODE_SLOTS / 64 }, CNODE_SLOTS>> =
+    fixed::StaticCell::new(mem::SlotStorage::new());
+static ALLOC_STORAGE: fixed::StaticCell<mem::AllocStorage> = fixed::StaticCell::new(mem::AllocStorage::new());
 
 pub const NUM_MESSAGE_REGISTERS: usize = 120;
 
@@ -66,9 +67,10 @@ pub struct Cap<T>(u64, core::marker::PhantomData<T>);
 impl<T> Cap<T> {
     pub fn from_bits(bits: u64) -> Self { Self(bits, core::marker::PhantomData) }
     pub fn bits(&self) -> u64 { self.0 }
-    pub fn absolute_cptr<U>(&self, _: U) -> AbsoluteCPtr { AbsoluteCPtr }
-    pub fn absolute_cptr_for_self(&self) -> AbsoluteCPtr { AbsoluteCPtr }
-    pub fn untyped_retype(&self, _: &ObjectBlueprint, _: &AbsoluteCPtr, _: usize, _: usize) -> Result<(), ()> {
+    pub fn absolute_cptr<U>(&self, _: U) -> AbsoluteCPtr { AbsoluteCPtr { cnode: self.0 } }
+    pub fn absolute_cptr_for_self(&self) -> AbsoluteCPtr { AbsoluteCPtr { cnode: self.0 } }
+    pub fn untyped_retype(&self, _: &ObjectBlueprint, dest: &AbsoluteCPtr, _: usize, _: usize) -> Result<(), ()> {
+        RETYPES.with_borrow_mut(|v| v.push(dest.cnode));
         // Kernel invocations marshal their arguments into the IPC buffer.
         with_ipc_buffer_mut(|b| b.msg_regs_mut()[..6].fill(0xdead_beef));
         Ok(())
@@ -81,10 +83,15 @@ pub mod cap {
 }
 
 #[derive(Clone, Copy)]
-pub struct AbsoluteCPtr;
+pub struct AbsoluteCPtr { cnode: u64 }
+
+thread_local! {
+    static RETYPES: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+    static DELETES: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
 
 impl AbsoluteCPtr {
-    pub fn delete(&self) -> Result<(), ()> { Ok(()) }
+    pub fn delete(&self) -> Result<(), ()> { DELETES.with_borrow_mut(|v| v.push(self.cnode)); Ok(()) }
     pub fn revoke(&self) -> Result<(), ()> { Ok(()) }
     pub fn move_(&self, _: &Self) -> Result<(), ()> { Ok(()) }
 }
@@ -180,18 +187,20 @@ fn arena_growth_on_fragmented_memory_and_reclaim() {
     // Disjoint 2 MiB blocks with occupied holes between them; no buddies
     // can merge.  Slots and allocator tables are taken only once.
     let boot = BootInfo((0..48).map(|i| Desc { paddr: (64 << 20) + i * (4 << 20), bits: 21 }).collect());
-    let mut alloc = mem::Alloc::new(mem::Slots::new(1024..mem::ROOT_SLOTS), &boot);
+    let mut alloc = mem::Alloc::new(
+        mem::Slots::new(slot::CNODE.cap(), SLOT_STORAGE.take(), 1024..CNODE_SLOTS), ALLOC_STORAGE.take(), &boot,
+    );
     let mut arena = alloc.arena(32 << 20).unwrap();
     let block = ObjectBlueprint::Untyped { size_bits: 21 };
     for i in 0..16 {
-        assert!(arena.retype(&mut alloc, &block, 1, mem::Dest::root(512 + i)).is_some());
+        assert!(arena.retype(&mut alloc, &block, 1, mem::Dest::new(slot::CNODE.cap(), 512 + i)).is_some());
     }
     assert_eq!(alloc.free_bytes(), 64 << 20);
 
     // A 4 MiB request really cannot fit: do not fall back below its size
     // or consume any memory or slots on failure.
     let slots = alloc.slots.available();
-    assert!(arena.retype(&mut alloc, &ObjectBlueprint::Untyped { size_bits: 22 }, 1, mem::Dest::root(528)).is_none());
+    assert!(arena.retype(&mut alloc, &ObjectBlueprint::Untyped { size_bits: 22 }, 1, mem::Dest::new(slot::CNODE.cap(), 528)).is_none());
     assert_eq!(alloc.free_bytes(), 64 << 20);
     assert_eq!(alloc.slots.available(), slots);
 
@@ -205,16 +214,16 @@ fn arena_growth_on_fragmented_memory_and_reclaim() {
     // Exhaustion still fails cleanly and gives back the attempted slot.
     let mut arena = alloc.arena(96 << 20).unwrap();
     for i in 0..48 {
-        assert!(arena.retype(&mut alloc, &block, 1, mem::Dest::root(512 + i)).is_some());
+        assert!(arena.retype(&mut alloc, &block, 1, mem::Dest::new(slot::CNODE.cap(), 512 + i)).is_some());
     }
     let slots = alloc.slots.available();
-    assert!(arena.retype(&mut alloc, &ObjectBlueprint::Frame, 1, mem::Dest::root(560)).is_none());
+    assert!(arena.retype(&mut alloc, &ObjectBlueprint::Frame, 1, mem::Dest::new(slot::CNODE.cap(), 560)).is_none());
     assert_eq!(alloc.free_bytes(), 0);
     assert_eq!(alloc.slots.available(), slots);
     alloc.reclaim(arena);
     assert_eq!(alloc.free_bytes(), 96 << 20);
 
-    // Reuse the singleton slot and allocator tables for a larger
+    // Reuse the slot and allocator tables for a larger
     // fragmented fixture.
     // VM_LOAD reserves one block's CNode and paging overhead before
     // making objects: a full arena must refuse despite free host RAM.
@@ -304,4 +313,37 @@ fn arena_growth_on_fragmented_memory_and_reclaim() {
         assert_eq!(alloc.pool.free_bytes(), if grant.is_some() { 16 << 20 } else { 0 });
         memd::GRANTS.with_borrow(|g| assert!(g.is_empty()));
     }
+}
+
+#[test]
+fn independent_allocators_use_their_own_cnodes_and_storage() {
+    let mut root = mem::Alloc::new(
+        mem::Slots::new(Cap::from_bits(1), Box::leak(Box::new(mem::SlotStorage::<2, 128>::new())), 64..128),
+        Box::leak(Box::new(mem::AllocStorage::new())),
+        &BootInfo(vec![Desc { paddr: 1 << 30, bits: 25 }]),
+    );
+    let mut manager = mem::Alloc::empty(
+        mem::Slots::new(Cap::from_bits(11), Box::leak(Box::new(mem::SlotStorage::<4, 256>::new())), 128..256),
+        Box::leak(Box::new(mem::AllocStorage::new())),
+    );
+    manager.memd = Some(memd::MemdLink);
+    memd::GRANTS.with_borrow_mut(|g| *g = vec![Some(2 << 30)]);
+    manager.refill();
+    let (root_slots, manager_slots) = (root.slots.available(), manager.slots.available());
+    root.slots.track(3);
+    manager.slots.track(3);
+    RETYPES.with_borrow_mut(Vec::clear);
+    let r = root.object(ObjectBlueprint::Frame);
+    let m = manager.object(ObjectBlueprint::Frame);
+    assert!((64..128).contains(&r));
+    assert!((128..256).contains(&m));
+    RETYPES.with_borrow(|v| assert_eq!(v, &[1, 11]));
+
+    root.slots.free_owned(3);
+    assert_eq!(root.slots.available(), root_slots);
+    assert_eq!(manager.slots.available(), manager_slots - 1);
+    DELETES.with_borrow(|v| assert_eq!(v, &[1]));
+    manager.slots.free_owned(3);
+    assert_eq!(manager.slots.available(), manager_slots);
+    DELETES.with_borrow(|v| assert_eq!(v, &[1, 11]));
 }

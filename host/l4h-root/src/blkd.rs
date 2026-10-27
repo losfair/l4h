@@ -270,7 +270,7 @@ pub fn start(
     let n_dma = (1 << DMA_BITS) / PAGE;
     let dma_frames = alloc.slots.alloc_range(n_dma);
     dma_region
-        .retype(&FRAME_BP, n_dma, Dest::root(dma_frames.start))
+        .retype(&FRAME_BP, n_dma, Dest::new(crate::slot::CNODE.cap(), dma_frames.start))
         .expect("blkd DMA frames");
     arena.own(dma_slot, dma_paddr, DMA_BITS);
     // The device reaches this memory, and the pools of attached clients.
@@ -305,7 +305,6 @@ pub fn start(
         id,
         kind: host::KIND_BLKD,
         elf: BLKD_ELF,
-        core: 0,
         prio: abi::PRIO_KERNEL + 2,
         budget_us: host_info.timeslice_us,
         period_us: host_info.timeslice_us,
@@ -315,7 +314,10 @@ pub fn start(
         cnode: None,
         cnode_bits: None,
     };
-    let comp = component::create(&args, alloc, &mut arena, win, asids, host_info);
+    let comp = component::create(
+        &args, alloc, &mut arena, win, &mut |alloc, vspace| asids.assign(alloc, vspace),
+        &host_info.spawn_context(0),
+    );
 
     // Mapping caps are kept in a CNode of the arena, sized for the BARs.
     let keep_bits = keep_bits(n_dma + bar_pages(d, bars));

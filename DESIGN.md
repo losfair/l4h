@@ -2007,7 +2007,14 @@ start method: its size (`aml::HEAP`) is bounded by the firmware's
 tables, which trustd checks first, never by a guest.
 
 The shared crates are `l4h-abi` (guest ABI), `l4h-host` (host component
-protocols), `l4h-rt` (component runtime) and `l4h-virtio` (PCI transport).
+protocols), `l4h-task` (task construction and memory management), `l4h-rt`
+(component runtime) and `l4h-virtio` (PCI transport). Root and vmmgr depend
+on `l4h-task` for their allocator, memd grant client, ELF loading, component
+spawning, topology and VSpace/scratch mappings. Each supplies its own
+CNode, allocator table storage, scratch addresses, memory-service endpoint
+and mailbox, and spawning capabilities. ASID assignment and placement
+policies stay in the executables; neither imports the other's source.
+
 Serial output uses seL4's printing syscall; root drives COM1 input for the
 monitor. There is no separate serial virtualiser. A kernel print is a
 synchronous serial write with interrupts off, which stalls its core for the

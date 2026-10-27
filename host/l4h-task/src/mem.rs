@@ -1,6 +1,6 @@
-//! Untyped memory and CSpace slot management for the root task, and for
-//! l4h-vmmgr, which includes this file: `crate::slot` names the task's own
-//! CNode, in which every slot is reached at depth 64 (one level, guarded).
+//! Untyped memory and CSpace slot management for seL4 tasks. The caller
+//! supplies its CNode and table storage; slots are reached at depth 64
+//! in that CNode (one level, guarded).
 //!
 //! All kernel objects are carved out of Untyped capabilities.  We keep our
 //! own copy of each Untyped's watermark so that we know the physical address
@@ -10,9 +10,8 @@
 
 use core::ops::Range;
 
-use l4h_host::fixed::{ArrayVec, StaticCell};
+use l4h_host::fixed::ArrayVec;
 
-use crate::slot;
 use l4h_host::memd::BLOCK_BITS;
 use sel4::{ObjectBlueprint, cap};
 
@@ -20,24 +19,27 @@ use crate::memd::MemdLink;
 
 pub type Slot = usize;
 
-/// Slots of the task's CNode.
-pub const ROOT_SLOTS: usize = crate::CNODE_SLOTS;
-const WORDS: usize = ROOT_SLOTS / 64;
+/// Maximum objects retyped by one kernel invocation.
+pub const RETYPE_FAN_OUT: usize = 16384;
 
 /// Owner of the slots of global objects (`Slots::global`).
 pub const GLOBAL: u8 = u8::MAX;
-const _: () = assert!(crate::MAX_GUESTS < GLOBAL as usize);
 
-/// Which slots are free, and who owns each of the others.
-struct SlotTables {
-    /// Bit s % 64 of word s / 64: slot s is free.
+/// Caller-owned storage for a task's CSpace bitmap and ownership table.
+/// Put this in static storage: the largest CSpaces do not fit on a stack.
+pub struct SlotStorage<const WORDS: usize, const SLOTS: usize> {
     free: [u64; WORDS],
-    owner: [u8; ROOT_SLOTS],
+    owner: [u8; SLOTS],
 }
 
-static SLOT_TABLES: StaticCell<SlotTables> = StaticCell::new(SlotTables { free: [0; WORDS], owner: [GLOBAL; ROOT_SLOTS] });
+impl<const WORDS: usize, const SLOTS: usize> SlotStorage<WORDS, SLOTS> {
+    pub const fn new() -> Self {
+        assert!(WORDS * 64 == SLOTS);
+        Self { free: [0; WORDS], owner: [GLOBAL; SLOTS] }
+    }
+}
 
-/// Allocator for slots in the root task's own CNode: a bitmap of the free
+/// Allocator for slots in the caller's own CNode: a bitmap of the free
 /// ones, so that ranges freed by destroyed guests (vNIC ports, disk DMA
 /// buffers) can be allocated again as ranges.
 ///
@@ -46,7 +48,9 @@ static SLOT_TABLES: StaticCell<SlotTables> = StaticCell::new(SlotTables { free: 
 /// guest's capabilities are cleaned up and reused when it is destroyed
 /// (`free_owned`).
 pub struct Slots {
-    t: &'static mut SlotTables,
+    cnode: cap::CNode,
+    free: &'static mut [u64],
+    owners: &'static mut [u8],
     count: usize,
     /// No slot below this is free.
     low: usize,
@@ -54,17 +58,28 @@ pub struct Slots {
 }
 
 impl Slots {
-    pub fn new(range: Range<usize>) -> Self {
-        assert!(range.end <= ROOT_SLOTS);
-        let t = SLOT_TABLES.take();
+    pub fn new<const WORDS: usize, const SLOTS: usize>(
+        cnode: cap::CNode,
+        storage: &'static mut SlotStorage<WORDS, SLOTS>,
+        range: Range<usize>,
+    ) -> Self {
+        assert!(range.start <= range.end && range.end <= SLOTS);
+        assert_eq!(WORDS * 64, SLOTS);
+        let SlotStorage { free, owner } = storage;
+        free.fill(0);
+        owner.fill(GLOBAL);
         for s in range.clone() {
-            t.free[s / 64] |= 1 << (s % 64);
+            free[s / 64] |= 1 << (s % 64);
         }
-        Self { t, count: range.len(), low: range.start, owner: GLOBAL }
+        Self { cnode, free, owners: owner, count: range.len(), low: range.start, owner: GLOBAL }
+    }
+
+    pub fn cnode(&self) -> cap::CNode {
+        self.cnode
     }
 
     fn is_free(&self, s: Slot) -> bool {
-        self.t.free[s / 64] & (1 << (s % 64)) != 0
+        self.free[s / 64] & (1 << (s % 64)) != 0
     }
 
     pub fn alloc(&mut self) -> Slot {
@@ -73,15 +88,15 @@ impl Slots {
 
     /// Allocate `n` consecutive slots (the lowest range that fits).
     pub fn alloc_range(&mut self, n: usize) -> Range<Slot> {
-        self.try_alloc_range(n).expect("root CNode full")
+        self.try_alloc_range(n).expect("task CNode full")
     }
 
     /// `alloc_range`, or None if no range of `n` slots is free.
     pub fn try_alloc_range(&mut self, n: usize) -> Option<Range<Slot>> {
         let start = self.find_range(n)?;
         for s in start..start + n {
-            self.t.free[s / 64] &= !(1 << (s % 64));
-            self.t.owner[s] = self.owner;
+            self.free[s / 64] &= !(1 << (s % 64));
+            self.owners[s] = self.owner;
         }
         self.count -= n;
         if start == self.low {
@@ -97,8 +112,8 @@ impl Slots {
         }
         let (mut start, mut len) = (self.low, 0);
         let mut s = self.low;
-        while s < ROOT_SLOTS {
-            let w = self.t.free[s / 64];
+        while s < self.owners.len() {
+            let w = self.free[s / 64];
             // Whole words at a time where they are all used or all free.
             if s % 64 == 0 && w == 0 {
                 s += 64;
@@ -125,8 +140,8 @@ impl Slots {
 
     pub fn free(&mut self, s: Slot) {
         assert!(!self.is_free(s), "slot {} freed twice", s);
-        self.t.free[s / 64] |= 1 << (s % 64);
-        self.t.owner[s] = GLOBAL;
+        self.free[s / 64] |= 1 << (s % 64);
+        self.owners[s] = GLOBAL;
         self.count += 1;
         self.low = self.low.min(s);
     }
@@ -139,7 +154,7 @@ impl Slots {
     /// The longest range `alloc_range` can return.
     pub fn largest_range(&self) -> usize {
         let (mut best, mut len) = (0, 0);
-        for &w in self.t.free.iter() {
+        for &w in self.free.iter() {
             if w == u64::MAX {
                 len += 64;
                 continue;
@@ -166,6 +181,7 @@ impl Slots {
     /// Record allocations as guest `owner`'s, until `untrack`.
     pub fn track(&mut self, owner: usize) {
         assert!(self.owner == GLOBAL, "nested slot tracking");
+        assert!(owner < GLOBAL as usize, "slot owner out of range");
         self.owner = owner as u8;
     }
 
@@ -175,9 +191,10 @@ impl Slots {
 
     /// Delete the capabilities in all slots of guest `owner`, and free them.
     pub fn free_owned(&mut self, owner: usize) {
-        for s in 0..ROOT_SLOTS {
-            if self.t.owner[s] == owner as u8 && !self.is_free(s) {
-                let _ = slot::CNODE.cap().absolute_cptr(sel4::init_thread::Slot::<sel4::cap_type::Null>::from_index(s).cap()).delete();
+        assert!(owner < GLOBAL as usize, "slot owner out of range");
+        for s in 0..self.owners.len() {
+            if self.owners[s] == owner as u8 && !self.is_free(s) {
+                let _ = self.cnode.absolute_cptr(sel4::Cap::<sel4::cap_type::Null>::from_bits(s as u64)).delete();
                 self.free(s);
             }
         }
@@ -236,7 +253,7 @@ impl UtRegion {
         // The kernel caps fan-out per call; split large requests.
         let mut done = 0;
         while done < count {
-            let n = (count - done).min(crate::RETYPE_FAN_OUT);
+            let n = (count - done).min(RETYPE_FAN_OUT);
             self.cap
                 .untyped_retype(bp, &dest.cnode, dest.offset + done, n)
                 .unwrap_or_else(|e| panic!("retype {:?} x{} failed: {:?}", bp.ty(), n, e));
@@ -247,27 +264,27 @@ impl UtRegion {
     }
 }
 
-pub fn root_cnode_dest() -> sel4::AbsoluteCPtr {
-    slot::CNODE.cap().absolute_cptr_for_self()
+pub fn cnode_dest(cnode: cap::CNode) -> sel4::AbsoluteCPtr {
+    cnode.absolute_cptr_for_self()
 }
 
 /// Where a retype should place its result.
 #[derive(Clone, Copy)]
 pub struct Dest {
-    /// CNode the objects are placed in (as seen from the root CSpace).
+    /// CNode the objects are placed in (as seen from the caller's CSpace).
     pub cnode: sel4::AbsoluteCPtr,
     /// First slot index within that CNode.
     pub offset: usize,
 }
 
 impl Dest {
-    pub fn root(slot: Slot) -> Self {
-        Dest { cnode: root_cnode_dest(), offset: slot }
+    pub fn new(cnode: cap::CNode, slot: Slot) -> Self {
+        Dest { cnode: cnode_dest(cnode), offset: slot }
     }
 }
 
 /// A pool of at most N Untyped regions that objects are allocated from:
-/// the global pool of the root task's own objects, and per-guest arenas
+/// the global pool of the task's own objects, and per-guest arenas
 /// of regions split off the free blocks, so that a guest can be torn down
 /// by revoking a handful of capabilities.
 pub struct UtPool<const N: usize> {
@@ -310,7 +327,7 @@ impl<const N: usize> UtPool<N> {
     }
 }
 
-/// Global allocation state of the root task.
+/// Global allocation state of a task.
 ///
 /// Free memory is kept as untouched power-of-two Untyped *blocks*, buddy
 /// style: a request takes the smallest block that fits and splits it in
@@ -330,7 +347,7 @@ impl<const N: usize> UtPool<N> {
 /// overflow one fails as out of memory.
 pub struct Alloc {
     pub slots: Slots,
-    /// Small objects of the root task itself.
+    /// Small objects of the task itself.
     pub pool: UtPool<POOL_REGIONS>,
     blocks: &'static mut ArrayVec<UtRegion, ALLOC_BLOCKS>,
     /// Split blocks: (paddr, size bits, slot of their Untyped), sorted.
@@ -340,16 +357,19 @@ pub struct Alloc {
     grants: &'static mut ArrayVec<(usize, usize), ALLOC_GRANTS>,
 }
 
-/// The allocator's tables, in .bss: about 240 KiB, too large for the root
-/// task's stack, where `Alloc` is.
-struct AllocTables {
+/// Caller-owned allocator tables: about 240 KiB, so keep them in static
+/// storage to avoid overflowing a task's stack.
+pub struct AllocStorage {
     blocks: ArrayVec<UtRegion, ALLOC_BLOCKS>,
     parents: ArrayVec<(usize, usize, Slot), ALLOC_BLOCKS>,
     grants: ArrayVec<(usize, usize), ALLOC_GRANTS>,
 }
 
-static ALLOC_TABLES: StaticCell<AllocTables> =
-    StaticCell::new(AllocTables { blocks: ArrayVec::new(), parents: ArrayVec::new(), grants: ArrayVec::new() });
+impl AllocStorage {
+    pub const fn new() -> Self {
+        Self { blocks: ArrayVec::new(), parents: ArrayVec::new(), grants: ArrayVec::new() }
+    }
+}
 
 const SMALL_POOL_BITS: usize = 24;
 /// Regions of the global pool: SMALL_POOL_BITS each, refilled when it has
@@ -367,25 +387,24 @@ const GRANT_BITS: usize = 24;
 const LOCAL_KEEP: usize = 32 << 20;
 
 fn untyped_at(s: Slot) -> cap::Untyped {
-    sel4::init_thread::Slot::<sel4::cap_type::Untyped>::from_index(s).cap()
+    sel4::Cap::<sel4::cap_type::Untyped>::from_bits(s as u64)
 }
 
 impl Alloc {
-    pub fn new(slots: Slots, bootinfo: &sel4::BootInfo) -> Self {
-        let AllocTables { blocks, parents, grants } = ALLOC_TABLES.take();
+    pub fn new(slots: Slots, storage: &'static mut AllocStorage, bootinfo: &sel4::BootInfo) -> Self {
+        let AllocStorage { blocks, parents, grants } = storage;
         Self::with_tables(Alloc { slots, pool: UtPool::empty(), blocks, parents, memd: None, grants }, bootinfo)
     }
 
     /// An allocator with no memory until it is given a link to memd
     /// (vmmgr's: all it has are grants).
-    pub fn empty(slots: Slots) -> Self {
-        let AllocTables { blocks, parents, grants } = ALLOC_TABLES.take();
+    pub fn empty(slots: Slots, storage: &'static mut AllocStorage) -> Self {
+        let AllocStorage { blocks, parents, grants } = storage;
         Alloc { slots, pool: UtPool::empty(), blocks, parents, memd: None, grants }
     }
 
     /// A new allocator for `bootinfo`, with this one's slots and tables:
-    /// both are statics taken once (tests/alloc.rs makes several).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// storage is reused without allocating another set of tables.
     pub fn renew(self, bootinfo: &sel4::BootInfo) -> Self {
         let Alloc { slots, blocks, parents, grants, .. } = self;
         blocks.clear();
@@ -487,7 +506,7 @@ impl Alloc {
         false
     }
 
-    /// An untouched Untyped of exactly 2^bits bytes, in root slot `slot`.
+    /// An untouched Untyped of exactly 2^bits bytes, in local slot `slot`.
     pub fn split(&mut self, bits: usize, slot: Slot) -> Option<UtRegion> {
         if !self.has_block(bits) {
             self.merge_up_to(bits);
@@ -511,7 +530,7 @@ impl Alloc {
             let half = b.size_bits - 1;
             let s = self.slots.global(|s| s.alloc_range(2));
             b.cap
-                .untyped_retype(&ObjectBlueprint::Untyped { size_bits: half }, &root_cnode_dest(), s.start, 2)
+                .untyped_retype(&ObjectBlueprint::Untyped { size_bits: half }, &cnode_dest(self.slots.cnode()), s.start, 2)
                 .expect("split block");
             // The parent is kept, to merge the halves again when both
             // are free.
@@ -520,25 +539,25 @@ impl Alloc {
             self.blocks.must_push(UtRegion::fresh(untyped_at(s.start + 1), b.paddr + (1 << half), half));
             b = UtRegion::fresh(untyped_at(s.start), b.paddr, half);
         }
-        let dst = slot::CNODE.cap().absolute_cptr(untyped_at(slot));
-        dst.move_(&slot::CNODE.cap().absolute_cptr(b.cap)).expect("move block");
+        let dst = self.slots.cnode().absolute_cptr(untyped_at(slot));
+        dst.move_(&self.slots.cnode().absolute_cptr(b.cap)).expect("move block");
         self.slots.global(|s| s.free(b.cap.bits() as Slot));
         Some(UtRegion::fresh(untyped_at(slot), b.paddr, bits))
     }
 
-    /// Allocate a single object into a fresh root slot.
+    /// Allocate a single object into a fresh local slot.
     pub fn object(&mut self, bp: ObjectBlueprint) -> Slot {
         self.refill();
         let s = self.slots.alloc();
         self.pool
-            .retype(&bp, 1, Dest::root(s))
+            .retype(&bp, 1, Dest::new(self.slots.cnode(), s))
             .unwrap_or_else(|| panic!("out of memory allocating {:?}", bp.ty()));
         s
     }
 
     pub fn object_cap<T: sel4::CapType>(&mut self, bp: ObjectBlueprint) -> sel4::Cap<T> {
         let s = self.object(bp);
-        sel4::init_thread::Slot::<T>::from_index(s).cap()
+        sel4::Cap::<T>::from_bits(s as u64)
     }
 
     /// Destroy every object of `arena` and return its memory as blocks.
@@ -560,19 +579,19 @@ impl Alloc {
         let mut pinned = 0;
         for &(slot, paddr, bits) in arena.owned.iter() {
             let cap = untyped_at(slot);
-            slot::CNODE.cap().absolute_cptr(cap).revoke().expect("revoke arena untyped");
+            self.slots.cnode().absolute_cptr(cap).revoke().expect("revoke arena untyped");
             if self.blocks.is_full() {
                 self.merge_up_to(usize::MAX);
             }
             if pin(paddr) || self.blocks.is_full() {
                 if !pin(paddr) {
-                    sel4::debug_println!("l4h-root: free block table full, {} KiB lost", (1usize << bits) >> 10);
+                    sel4::debug_println!("l4h-task: free block table full, {} KiB lost", (1usize << bits) >> 10);
                 }
                 pinned += 1 << bits;
                 continue;
             }
             let s = self.slots.global(|s| s.alloc());
-            slot::CNODE.cap().absolute_cptr(untyped_at(s)).move_(&slot::CNODE.cap().absolute_cptr(cap)).expect("move block");
+            self.slots.cnode().absolute_cptr(untyped_at(s)).move_(&self.slots.cnode().absolute_cptr(cap)).expect("move block");
             self.blocks.must_push(UtRegion::fresh(untyped_at(s), paddr, bits));
             if free_slots {
                 self.slots.free(slot);
@@ -606,7 +625,7 @@ impl Alloc {
                 let (x, y) = (self.blocks.swap_remove(i.max(j)), self.blocks.swap_remove(i.min(j)));
                 for half in [x.cap, y.cap] {
                     let s = half.bits() as Slot;
-                    slot::CNODE.cap().absolute_cptr(half).delete().expect("delete merged half");
+                    self.slots.cnode().absolute_cptr(half).delete().expect("delete merged half");
                     self.slots.global(|sl| sl.free(s));
                 }
                 let (_, _, pslot) = self.parents.remove(p);
@@ -628,7 +647,7 @@ impl Alloc {
 
     /// Give memd every free block of 2 MiB or more, once it runs: from
     /// then on, memory comes from it.  Smaller blocks (boot Untypeds next
-    /// to reserved memory) stay here, for the root task's own objects.
+    /// to reserved memory) stay here, for the task's own objects.
     /// The parents of blocks split here stay here, so memd cannot merge
     /// those blocks with their buddies; only the blocks root split at boot
     /// are concerned.
@@ -743,7 +762,7 @@ const ARENA_REGIONS: usize = 96;
 /// Arena::reserve: the largest object allocated in quantity (a 16 KiB RAM
 /// CNode) and the space before it.
 pub const ARENA_TAIL: usize = 32 << 10;
-const ARENA_OWNED: usize = ARENA_REGIONS + 1 + crate::MAX_GUEST_DEVICES;
+const ARENA_OWNED: usize = ARENA_REGIONS + 1 + l4h_host::MAX_GUEST_DEVICES;
 
 /// Untyped memory dedicated to one guest (or host component).
 ///
@@ -832,7 +851,7 @@ impl Arena {
     /// Allocate one object, or leave its slot free if it cannot fit.
     pub fn try_object(&mut self, alloc: &mut Alloc, bp: ObjectBlueprint) -> Option<Slot> {
         let s = alloc.slots.alloc();
-        if self.retype(alloc, &bp, 1, Dest::root(s)).is_none() {
+        if self.retype(alloc, &bp, 1, Dest::new(alloc.slots.cnode(), s)).is_none() {
             alloc.slots.free(s);
             return None;
         }
@@ -847,12 +866,12 @@ impl Arena {
 
     pub fn object_cap<T: sel4::CapType>(&mut self, alloc: &mut Alloc, bp: ObjectBlueprint) -> sel4::Cap<T> {
         let s = self.object(alloc, bp);
-        sel4::init_thread::Slot::<T>::from_index(s).cap()
+        sel4::Cap::<T>::from_bits(s as u64)
     }
 }
 
 /// Something objects can be allocated from: an arena (which grows from the
-/// allocator), or the root task's global pool.
+/// allocator), or the task's global pool.
 pub struct ObjCtx<'a> {
     pub alloc: &'a mut Alloc,
     pub arena: Option<&'a mut Arena>,
@@ -877,6 +896,6 @@ impl<'a> ObjCtx<'a> {
 
     pub fn cap<T: sel4::CapType>(&mut self, bp: ObjectBlueprint) -> sel4::Cap<T> {
         let s = self.object(bp);
-        sel4::init_thread::Slot::<T>::from_index(s).cap()
+        sel4::Cap::<T>::from_bits(s as u64)
     }
 }

@@ -3,7 +3,7 @@ extern crate alloc;
 
 #[path = "../host/l4h-vmmgr/src/sched/policy.rs"]
 mod policy;
-#[path = "../host/l4h-root/src/topology.rs"]
+#[path = "../host/l4h-task/src/topology.rs"]
 mod topology;
 
 use policy::{Migration, Sample, choose};

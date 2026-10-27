@@ -324,7 +324,6 @@ fn create(
         id: TRUSTD_ID,
         kind: host::KIND_TRUSTD,
         elf: TRUSTD_ELF,
-        core: info.cores - 1,
         prio: abi::PRIO_KERNEL + 1,
         // At most a quarter of a core, whatever the TPM or its firmware's
         // AML does (trustd sleeps between polls of the TPM).
@@ -336,7 +335,10 @@ fn create(
         cnode: None,
         cnode_bits: None,
     };
-    let comp = component::create(&args, alloc, &mut arena, win, asids, info);
+    let comp = component::create(
+        &args, alloc, &mut arena, win, &mut |alloc, vspace| asids.assign(alloc, vspace),
+        &info.spawn_context(info.cores - 1),
+    );
     let keep = arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: KEEP_BITS });
     Some((comp, arena, keep))
 }

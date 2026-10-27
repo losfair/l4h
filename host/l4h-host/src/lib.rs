@@ -22,6 +22,9 @@ pub const VERBOSE: bool = match option_env!("L4H_RELEASE") {
     None => true,
 };
 
+/// Maximum devices attached to one guest.
+pub const MAX_GUEST_DEVICES: usize = 16;
+
 /// Component address-space layout.
 pub const INFO_VA: usize = 0x1000_0000;
 pub const INFO_SIZE: usize = 0x4000;

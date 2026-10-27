@@ -121,24 +121,17 @@ fn physical_id_from(cpuid: impl Fn(u32, u32) -> core::arch::x86_64::CpuidResult)
 /// interrupts them all, and on a loaded hypervisor, whose vCPUs wait to
 /// be scheduled, a guest's boot slowed from 0.2 s to tens of seconds.
 #[cfg(all(target_arch = "x86_64", not(test)))]
-pub fn discover(bootinfo: &sel4::BootInfoPtr) -> Topology {
-    use sel4::{
-        cap_type,
-        init_thread::{Slot, slot},
-    };
-
-    let cpus = bootinfo.inner().numNodes as usize;
-    let boot_cpu = bootinfo.inner().nodeID as usize;
-    let base = bootinfo.sched_control().range().start;
+pub fn discover(
+    cpus: usize,
+    boot_cpu: usize,
+    sched_context: sel4::cap::SchedContext,
+    vspace: sel4::cap::VSpace,
+    sched_control_base: usize,
+) -> Topology {
+    assert!(cpus <= MAX_CPUS);
     let move_to = |cpu| {
-        Slot::<cap_type::SchedControl>::from_index(base + cpu).cap().sched_control_configure_flags(
-            slot::SC.cap(),
-            5000,
-            5000,
-            0,
-            0,
-            0,
-        )
+        crate::cap_at::<sel4::cap_type::SchedControl>(sched_control_base + cpu)
+            .sched_control_configure_flags(sched_context, 5000, 5000, 0, 0, 0)
     };
     if physical_id().is_none() {
         return Topology::flat(cpus);
@@ -159,23 +152,30 @@ pub fn discover(bootinfo: &sel4::BootInfoPtr) -> Topology {
         n += 1;
     }
     move_to(boot_cpu).expect("restore root CPU after topology discovery");
-    crate::vspace::flush_tlb_bitmap(slot::VSPACE.cap());
+    crate::vspace::flush_tlb_bitmap(vspace);
     if n == cpus {
         Topology::from_ids(&ids[..n])
     } else {
-        sel4::debug_println!("l4h-root: CPU topology unavailable; using flat placement");
+        sel4::debug_println!("l4h-task: CPU topology unavailable; using flat placement");
         Topology::flat(cpus)
     }
 }
 
 #[cfg(all(target_arch = "aarch64", not(test)))]
-pub fn discover(bootinfo: &sel4::BootInfoPtr) -> Topology {
-    Topology::flat(bootinfo.inner().numNodes as usize)
+pub fn discover(
+    cpus: usize,
+    _boot_cpu: usize,
+    _sched_context: sel4::cap::SchedContext,
+    _vspace: sel4::cap::VSpace,
+    _sched_control_base: usize,
+) -> Topology {
+    Topology::flat(cpus)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::vec::Vec;
 
     #[test]
     fn placement_spreads_before_using_siblings() {

@@ -176,7 +176,7 @@ pub fn spawn(
         let paddr = region.paddr;
         let frames = alloc.slots.alloc_range((1 << NIC_DMA_BITS) / PAGE);
         region
-            .retype(&FRAME_BP, frames.len(), Dest::root(frames.start))
+            .retype(&FRAME_BP, frames.len(), Dest::new(crate::slot::CNODE.cap(), frames.start))
             .expect("NIC DMA frames");
         let _ = dma.push(frames);
         // The NIC reaches its DMA memory only.
@@ -217,7 +217,6 @@ pub fn spawn(
         id: NETD_ID,
         kind: host::KIND_NETD,
         elf: NETD_ELF,
-        core: 0,
         prio: abi::PRIO_KERNEL + 2,
         budget_us: info.timeslice_us,
         period_us: info.timeslice_us,
@@ -227,7 +226,10 @@ pub fn spawn(
         cnode: None,
         cnode_bits: None,
     };
-    let comp = component::create(&args, alloc, &mut arena, win, asids, info);
+    let comp = component::create(
+        &args, alloc, &mut arena, win, &mut |alloc, vspace| asids.assign(alloc, vspace),
+        &info.spawn_context(0),
+    );
 
     // Mapping caps of every NIC page: DMA buffers and BARs.
     let pages = nics[..nr_nics].iter().map(|d| (1 << NIC_DMA_BITS) / PAGE + bar_pages(d, used_bars(d))).sum();
@@ -358,7 +360,7 @@ impl Netd {
         let mut pool = region;
         // CNodes keeping netd's mappings of the port, and its frames.
         let cnodes = alloc.slots.alloc_range(2);
-        pool.retype(&ObjectBlueprint::CNode { size_bits: PORT_KEEP_BITS }, 2, Dest::root(cnodes.start)).expect("port CNodes");
+        pool.retype(&ObjectBlueprint::CNode { size_bits: PORT_KEEP_BITS }, 2, Dest::new(crate::slot::CNODE.cap(), cnodes.start)).expect("port CNodes");
         let keep = sel4::init_thread::Slot::<cap_type::CNode>::from_index(cnodes.start).cap();
         let chan = sel4::init_thread::Slot::<cap_type::CNode>::from_index(cnodes.start + 1).cap();
         pool.retype(&FRAME_BP, net::PORT_PAGES, Dest { cnode: abs_of(chan), offset: 0 }).expect("port frames");

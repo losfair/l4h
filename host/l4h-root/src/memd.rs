@@ -10,7 +10,8 @@
 
 use l4h_abi as abi;
 use l4h_host as host;
-use l4h_host::memd::{self, BalloonConfig, MemdConfig, Status};
+use l4h_host::memd::{self, BalloonConfig, MemdConfig};
+use l4h_task::memd::MemdLink;
 use sel4::{CapRights, ObjectBlueprint, VmAttributes, cap, cap_type};
 
 use crate::component::{self, Component, SpawnArgs, abs_of};
@@ -45,69 +46,6 @@ fn root_cap<T: sel4::CapType>(s: Slot) -> sel4::Cap<T> {
     sel4::init_thread::Slot::<T>::from_index(s).cap()
 }
 
-fn mr(i: usize) -> u64 {
-    sel4::with_ipc_buffer(|b| b.msg_regs()[i])
-}
-
-fn set_mr(i: usize, v: u64) {
-    sel4::with_ipc_buffer_mut(|b| b.msg_regs_mut()[i] = v)
-}
-
-/// What the allocator needs of memd: its endpoint, its CNode (for the
-/// exchange slots) and its status page.
-#[derive(Clone, Copy)]
-pub struct MemdLink {
-    ep: cap::Endpoint,
-    cnode: cap::CNode,
-    cnode_bits: usize,
-}
-
-impl MemdLink {
-    fn slot(&self, i: u64) -> sel4::AbsoluteCPtr {
-        self.cnode.absolute_cptr_from_bits_with_depth(i, self.cnode_bits)
-    }
-
-    fn xchg(&self, i: usize) -> sel4::AbsoluteCPtr {
-        self.slot(memd::SLOT_XCHG + i as u64)
-    }
-
-    fn call(&self, label: u64, args: &[u64]) -> u64 {
-        for (i, &a) in args.iter().enumerate() {
-            set_mr(i, a);
-        }
-        self.ep.call(sel4::MessageInfo::new(label, 0, 0, args.len()));
-        mr(0)
-    }
-
-    pub fn status(&self) -> Status {
-        unsafe { (STATUS_VA as *const Status).read_volatile() }
-    }
-
-    /// An untouched Untyped of 2^bits bytes, into root slot `slot`: its
-    /// physical address.
-    pub fn alloc(&self, bits: usize, slot: Slot) -> Option<usize> {
-        if self.call(memd::MEMD_ALLOC, &[bits as u64, 1]) != 0 {
-            return None;
-        }
-        let paddr = mr(1) as usize;
-        abs_of(root_cap::<cap_type::Null>(slot)).move_(&self.xchg(0)).expect("memd: take grant");
-        Some(paddr)
-    }
-
-    /// Return untouched Untypeds (at most XCHG_SLOTS): (capability,
-    /// physical address, size bits).  Their slots are left empty.
-    pub fn free(&self, blocks: &[(cap::Untyped, usize, usize)]) {
-        assert!(blocks.len() <= memd::XCHG_SLOTS);
-        let mut args = [0; 1 + 2 * memd::XCHG_SLOTS];
-        args[0] = blocks.len() as u64;
-        for (i, &(ut, paddr, bits)) in blocks.iter().enumerate() {
-            self.xchg(i).move_(&abs_of(ut)).expect("memd: return block");
-            (args[1 + 2 * i], args[2 + 2 * i]) = (paddr as u64, bits as u64);
-        }
-        assert_eq!(self.call(memd::MEMD_FREE, &args[..1 + 2 * blocks.len()]), 0, "memd: free");
-    }
-}
-
 fn link(alloc: &Alloc) -> MemdLink {
     alloc.memd.expect("memd is not running")
 }
@@ -119,9 +57,9 @@ pub fn give_vmmgr(alloc: &mut Alloc, arena: &mut Arena, vmmgr: &Component) {
     use l4h_host::vmmgr as proto;
     let m = link(alloc);
     let call = sel4::CapRightsBuilder::none().write(true).grant_reply(true).build();
-    vmmgr.give_badged(proto::SLOT_MEMD_EP, m.ep, call.clone(), memd::BADGE_VMMGR);
+    vmmgr.give_badged(proto::SLOT_MEMD_EP, m.endpoint(), call.clone(), memd::BADGE_VMMGR);
     for g in 0..memd::MAX_GUESTS {
-        vmmgr.give_badged(proto::SLOT_VMM_MEMD_EP + g as u64, m.ep, call.clone(), memd::BADGE_VMM | g as u64);
+        vmmgr.give_badged(proto::SLOT_VMM_MEMD_EP + g as u64, m.endpoint(), call.clone(), memd::BADGE_VMM | g as u64);
     }
     let mailbox = arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: memd::MAILBOX_RADIX });
     vmmgr.give(proto::SLOT_MEMD_MAILBOX, mailbox, CapRights::all());
@@ -211,7 +149,7 @@ impl Memd {
             cfg.notify_mult = notify.notify_off_multiplier as u64;
         }
         let frames = alloc.slots.global(|s| s.alloc_range(memd::DMA_PAGES));
-        let Some(paddr) = self.arena.retype(alloc, &FRAME_BP, memd::DMA_PAGES, Dest::root(frames.start)) else {
+        let Some(paddr) = self.arena.retype(alloc, &FRAME_BP, memd::DMA_PAGES, Dest::new(crate::slot::CNODE.cap(), frames.start)) else {
             return;
         };
         for (i, s) in frames.enumerate() {
@@ -256,7 +194,6 @@ pub fn spawn(alloc: &mut Alloc, win: &mut Window, asids: &mut AsidPools, info: &
         id: MEMD_ID,
         kind: host::KIND_MEMD,
         elf: MEMD_ELF,
-        core: 0,
         // Above every guest: l4h-root waits for it.
         prio: abi::PRIO_KERNEL + 2,
         budget_us: info.timeslice_us,
@@ -267,7 +204,10 @@ pub fn spawn(alloc: &mut Alloc, win: &mut Window, asids: &mut AsidPools, info: &
         cnode: None,
         cnode_bits: Some(bits),
     };
-    let comp = component::create(&args, alloc, &mut arena, win, asids, info);
+    let comp = component::create(
+        &args, alloc, &mut arena, win, &mut |alloc, vspace| asids.assign(alloc, vspace),
+        &info.spawn_context(0),
+    );
     // Mapping capabilities: the table's, the status page, the balloon's
     // BARs and DMA.
     let keep_bits = (table_pages + KEEP_OTHERS).next_power_of_two().trailing_zeros() as usize;
@@ -296,7 +236,10 @@ pub fn spawn(alloc: &mut Alloc, win: &mut Window, asids: &mut AsidPools, info: &
     m.comp.map_copy(alloc, &mut m.arena, &abs_of(status), memd::STATUS_VA, CapRights::read_write(), VmAttributes::DEFAULT, keep);
 
     component::start(&m.comp);
-    let link = MemdLink { ep: m.comp.service_ep, cnode: m.comp.cnode, cnode_bits: bits };
+    // The status mapping above remains readable for the root task's life.
+    let link = unsafe {
+        MemdLink::new(m.comp.service_ep, crate::slot::CNODE.cap(), m.comp.cnode, bits, memd::SLOT_XCHG, STATUS_VA)
+    };
     alloc.hand_over(link);
     info!(
         "l4h-root: memd holds {} MiB, {} KiB of CNode, {} KiB of table",
