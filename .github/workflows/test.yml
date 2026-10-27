@@ -68,7 +68,7 @@ jobs:
           grep -c ^processor /proc/cpuinfo; free -g
       - name: Host version metadata
         run: tests/run-versiontest.sh
-      - name: Host unit tests (allocator, I/O pool, display)
+      - name: Host unit tests (allocator, memd grants, I/O pool, display)
         run: tests/run-alloctest.sh
       - name: Taint/seal service and verifier policy
         run: tests/run-trusttest.sh
