@@ -1,5 +1,6 @@
 % l4h user manual.  Build with `make -C docs/manual` (needs TeX Live and
-% latexmk); the PDF is a build product and is not committed.
+% latexmk); the PDF is a build product and is not committed.  The Makefile
+% writes the l4h version to version.tex.
 \documentclass[11pt,a4paper]{report}
 
 \usepackage[T1]{fontenc}
@@ -40,7 +41,8 @@
 
 \title{\Huge l4h User Manual\\[0.5em]\Large A paravirtual hypervisor for Linux on seL4}
 \author{The l4h project}
-\date{Version 0.1 (\today)}
+\InputIfFileExists{version.tex}{}{\newcommand{\lfourhversion}{unknown}}
+\date{Version \lfourhversion\ (\today)}
 
 \begin{document}
 \maketitle
@@ -178,7 +180,7 @@ and a guest kernel that does not accept
 
 \section{Status and limitations}
 
-This is version 0.1. Before you depend on it, note the following.
+This manual describes l4h \lfourhversion, an early release. Before you depend on it, note the following.
 \begin{itemize}
   \item Linux guests run on x86\_64 and AArch64. The AArch64 platform
         is QEMU \texttt{virt} with GICv2m, including SMP, PCI virtio disks

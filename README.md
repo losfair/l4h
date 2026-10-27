@@ -7,7 +7,8 @@ and address spaces. l4h therefore runs anywhere seL4 runs, including cloud
 VMs without nested virtualization.
 
 The user manual is in [docs/manual](docs/manual/l4h-manual.tex); render it
-with `make -C docs/manual`. See [DESIGN.md](DESIGN.md) for the design, the decisions behind it and the
+with `make -C docs/manual`, or download `l4h-manual.pdf` from a
+[release](https://github.com/losfair/l4h/releases). See [DESIGN.md](DESIGN.md) for the design, the decisions behind it and the
 current status of each part.
 
 ## License
