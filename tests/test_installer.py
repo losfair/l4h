@@ -256,8 +256,10 @@ class InstallerTests(Harness):
         self.machine.blocks[2]["type"] = "lvm"
         self.rejected("plain disks")
         self.machine.blocks[2]["type"] = "part"
-        self.machine.mounts[0]["fstype"] = "btrfs"
-        self.rejected("ext4 or XFS")
+        for fstype in ("ext2", "ext3", "btrfs"):
+            with self.subTest(fstype=fstype):
+                self.machine.mounts[0]["fstype"] = fstype
+                self.rejected("ext4 or XFS")
 
     def test_sata_and_legacy_virtio(self):
         self.machine.pci("00:04.0", 0x8086, 0x2922, 0x010601)
@@ -583,11 +585,15 @@ class BiosInstallerTests(Harness):
         self.machine.mounts.append(dict(source="/dev/vda3", target="/boot", fstype="xfs", options="rw",
                                         **{"maj:min": "252:3"}))
         self.machine.fstab.append(dict(source="UUID=5678-boot", target="/boot", fstype="xfs", options="defaults"))
-        plan = self.check()
-        self.assertEqual((plan["boot_uuid"], plan["boot_fstype"], plan["grub_dir"]), ("5678-boot", "xfs", "/l4h"))
-        entry = installer.grub_entry(plan, False)
-        self.assertIn("insmod xfs\n", entry)
-        self.assertIn("search --no-floppy --fs-uuid --set=root 5678-boot\n    set l4h=($root)/l4h\n", entry)
+        for fstype, module in (("ext2", "ext2"), ("ext3", "ext2"), ("ext4", "ext2"), ("xfs", "xfs")):
+            with self.subTest(fstype=fstype):
+                for table in (self.machine.blocks, self.machine.mounts, self.machine.fstab):
+                    table[-1]["fstype"] = fstype
+                plan = self.check()
+                self.assertEqual((plan["boot_uuid"], plan["boot_fstype"], plan["grub_dir"]), ("5678-boot", fstype, "/l4h"))
+                entry = installer.grub_entry(plan, False)
+                self.assertIn("insmod {}\n".format(module), entry)
+                self.assertIn("search --no-floppy --fs-uuid --set=root 5678-boot\n    set l4h=($root)/l4h\n", entry)
 
     def test_boot_filesystem_must_be_readable_and_writable_by_grub(self):
         self.machine.mounts.append(dict(self.machine.mounts[0], target="/boot", fstype="vfat"))

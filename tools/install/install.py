@@ -275,7 +275,8 @@ class Preflight:
                 need(self.path(spec).is_file() and self.mount(spec)["maj:min"] == root_mount["maj:min"],
                      "swap file must be on root: " + spec)
                 continue
-            need(kind in ("ext4", "xfs", "vfat", "swap"), "unsupported fstab filesystem: " + kind)
+            # The guest's ext4 driver also mounts ext2/3, including BIOS /boot.
+            need(kind in ("ext2", "ext3", "ext4", "xfs", "vfat", "swap"), "unsupported fstab filesystem: " + kind)
             block = self.stable_device(spec)
             self.disk(block)
             need(block.get("fstype") == kind, "fstab filesystem differs from the disk: " + spec)
