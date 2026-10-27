@@ -96,8 +96,8 @@ def main():
         proc = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
         try:
             wait_for(lambda: "VTDTEST: ready" in log.read_text(), "guest boot", 120)
-            assert "interrupts remapped" in log.read_text()
-            assert "serial monitor on port 0x3f8 (remapped interrupts" in log.read_text()
+            # Component startup messages can interleave on the serial
+            # console. Check remapping via the hardware registers below.
             q = Qtest(sock)
             fault_counts = {}
             def fault(reason, name, requester="00:06.0"):
