@@ -44,7 +44,7 @@ Third-party components, including the submodules in `kernel/seL4` and
     (SwiftShader) onto the VM's virtio-gpu display.
   - A virtio-gpu display (2D) for VMs, `l4hctl create --gpu WxH`, which dom0
     reads with `l4hctl screenshot`.
-- **Block.** Passed-through virtio-blk, virtio-scsi and NVMe disks, or read-only and
+- **Block.** Passed-through virtio-blk, virtio-scsi (modern or legacy virtio) and NVMe disks, or read-only and
   partial (LBA window) slices of them. I/O is zero-copy: devices DMA
   straight into guest memory.
 - **Network.**
@@ -274,9 +274,9 @@ without it, the host reports `unknown`.
 | `tests/run-nodetest.sh /path/to/node [vcpus]` | Node startup/JIT, string internalization, worker threads and concurrent GC |
 | `tests/run-modtest.sh` | external kernel module relocation, load and unload |
 | `tests/run-bpftest.sh [vcpus]` | BPF JIT: the kernel's BPF test vectors, verified XDP and tc programs, direct tail calls patched in and out, XDP (generic) and tcx on lo |
-| `tests/run-blktest.sh` (`BLKTEST_DEV=nvme`, `scsi`, `scsi-legacy`, `scsi-luns`) | disk pass-through, data integrity |
+| `tests/run-blktest.sh` (`BLKTEST_DEV=nvme`, `scsi`, `scsi-legacy`, `scsi-luns`, `virtio-legacy`) | disk pass-through, data integrity |
 | `tests/run-ctltest.sh` | VM lifecycle, console, clean shutdown, disk re-attach, windows, reclaim |
-| `tests/run-nettest.sh`, `tests/run-router.sh` | switches, uplink, multi-NIC, isolation, MAC lock, NAT router VM |
+| `tests/run-nettest.sh`, `tests/run-router.sh` | switches, uplink, multi-NIC, isolation, MAC lock, NAT router VM (`NETTEST_LEGACY=1`: legacy virtio-net uplink) |
 | `tests/run-density.sh 30 256` | 30 guests on 4 cores stay responsive |
 | `tests/run-m6test.sh` | dom0 restart, CPU caps, steal time |
 | `tests/run-vtdtest.sh [--qemu]` | VT-d DMAR parsing, table/interrupt formats and address bounds; with QEMU, DMA, lifecycle, NIC and serial tests |
@@ -288,7 +288,7 @@ without it, the host reports `unknown`.
 | `tests/run-captest.sh [cap%] [rounds]` | self-test and fork loops in a guest capped from boot |
 | `tests/run-capperf.sh [caps]` | fork/exec and CPU-bound timings, uncapped and under each cap (use a release seL4) |
 | `tests/run-limits.sh` | the root task refuses what it cannot afford and recovers |
-| `tests/run-balloontest.sh` | free memory reported to QEMU (virtio-balloon) is dropped: QEMU's memory use idle, with a guest and after destroying it |
+| `tests/run-balloontest.sh` | free memory reported to QEMU (virtio-balloon; `BALLOONTEST_LEGACY=1`: a legacy one) is dropped: QEMU's memory use idle, with a guest and after destroying it |
 | `tests/run-hotplugtest.sh` | memory hotplug: a VM grows from 256 MiB to 2 GiB and shrinks again under `l4hctl mem`, falling short while its data needs the memory; host memory comes back |
 | `tests/run-hotplugstress.sh [rounds]` | memory hotplug under stress: three VMs under memory load resized at random, oversubscribing the host, destroyed mid-resize; data checked, all memory back |
 | `tests/run-monitor.sh` | serial monitor (`list`, `restart-dom0`), continued operation with an absent UART |

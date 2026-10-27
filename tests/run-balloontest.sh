@@ -5,6 +5,7 @@
 # QEMU's resident memory, which must stay low while idle, rise with the
 # guest and fall again once the guest is gone.
 # BALLOONTEST_BASELINE=1 runs without the balloon device and only reports.
+# BALLOONTEST_LEGACY=1 makes the balloon a legacy-only device.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 source "$root/tools/guest-env.sh"
@@ -25,7 +26,9 @@ L4H_DOM0_MEM_MB=256 L4H_DOM0_VCPUS=1 L4H_WATCHDOG_SECS=0 \
 baseline=${BALLOONTEST_BASELINE:-0}
 log=$root/build/qemu.log
 rm -f "$log"
-L4H_BALLOON=$((1 - baseline)) L4H_MEM=${L4H_MEM:-4G} \
+balloon=$((1 - baseline))
+[ "${BALLOONTEST_LEGACY:-0}" = 1 ] && [ "$baseline" = 0 ] && balloon=legacy
+L4H_BALLOON=$balloon L4H_MEM=${L4H_MEM:-4G} \
     "$l4h_qemu" "$root/host/target/$l4h_target/debug/l4h-root.elf" </dev/null >"$log" 2>&1 &
 qemu=$!
 trap 'kill $qemu 2>/dev/null || true' EXIT
@@ -52,7 +55,11 @@ grep -a "balloon:" "$log" | tr -d '\r' | sed -n '1p;$p'
 fail=0
 check() { if ! eval "$1"; then echo "balloontest: FAIL: $2"; fail=1; fi; }
 if [ "$baseline" = 0 ]; then
-    check "grep -aq 'balloon: free page reporting on queue' '$log'" "no balloon device"
+    if [ "$balloon" = legacy ]; then
+        check "grep -aq 'balloon: free page reporting on legacy queue' '$log'" "no legacy balloon device"
+    else
+        check "grep -aq 'balloon: free page reporting on queue' '$log'" "no balloon device"
+    fi
     check "[ ${mib[idle]} -lt 1024 ]" "idle uses ${mib[idle]} MiB"
     for r in 1 2; do
         check "[ ${mib[filled$r]} -ge $((mib[idle] + 600)) ]" "the guest's data is not resident in round $r"

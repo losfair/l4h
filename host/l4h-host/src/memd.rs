@@ -12,10 +12,14 @@
 //! entry per 2 MiB of physical address space (TABLE_VA), which l4h-root
 //! maps when it spawns memd, and memd never handles less than 2 MiB.
 
+/// The I/O ports of a legacy balloon (BalloonConfig::legacy_io), which
+/// l4h-root puts here before MEMD_BALLOON.
+pub const SLOT_BALLOON_IOPORT: u64 = crate::SLOT_FIRST_FREE;
 /// Slot of guest g's block CNode (L4H_SLOT_BLOCKS of the guest), which
 /// l4h-root puts there before MEMD_GUEST_CREATE and memd deletes at
 /// MEMD_GUEST_DESTROY.
 pub const SLOT_GUEST_BCN: u64 = 32;
+const _: () = assert!(SLOT_BALLOON_IOPORT < SLOT_GUEST_BCN);
 pub const MAX_GUESTS: usize = 64;
 /// Slot of guest g's hotplug CNode (L4H_SLOT_HP of the guest, without its
 /// guard), SLOT_GUEST_HCN + g, which l4h-root puts there before
@@ -62,7 +66,7 @@ pub const MEMD_GUEST_GIVE: u64 = 5;
 /// made of them (its frames and objects, l4h-root's frames of its boot
 /// blocks), and free them.  A guest memd does not know is no error.
 pub const MEMD_GUEST_DESTROY: u64 = 6;
-/// MR0..MR4 = the free page reporting device (BalloonConfig), which
+/// MR0..MR5 = the free page reporting device (BalloonConfig), which
 /// l4h-root has mapped: drive it.  Reply MR0 = 0, or ENODEV if it cannot
 /// report.
 pub const MEMD_BALLOON: u64 = 7;
@@ -177,15 +181,18 @@ pub struct BalloonConfig {
     pub device: u64,
     pub notify_mult: u64,
     pub dma_paddr: u64,
+    /// A legacy device: the base of its I/O ports, in
+    /// SLOT_BALLOON_IOPORT (the others are then 0); 0 for a modern one.
+    pub legacy_io: u64,
 }
 
 impl BalloonConfig {
-    pub fn to_mrs(&self) -> [u64; 5] {
-        [self.common, self.notify, self.device, self.notify_mult, self.dma_paddr]
+    pub fn to_mrs(&self) -> [u64; 6] {
+        [self.common, self.notify, self.device, self.notify_mult, self.dma_paddr, self.legacy_io]
     }
 
-    pub fn from_mrs(m: [u64; 5]) -> Self {
-        BalloonConfig { common: m[0], notify: m[1], device: m[2], notify_mult: m[3], dma_paddr: m[4] }
+    pub fn from_mrs(m: [u64; 6]) -> Self {
+        BalloonConfig { common: m[0], notify: m[1], device: m[2], notify_mult: m[3], dma_paddr: m[4], legacy_io: m[5] }
     }
 
     pub fn va(packed: u64) -> usize {

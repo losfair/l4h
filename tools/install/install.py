@@ -217,12 +217,13 @@ class Preflight:
         name = Path(block["name"]).name
         pci = self.pci("/sys/class/block/" + name)
         vendor, device = pci["vendor"], pci["device"]
+        # Modern, or legacy (0.9.5) with only the transitional device ID.
         virtio = vendor == 0x1AF4 and (
-            device in (0x1001, 0x1042) and pci["modern"] or
+            device in (0x1001, 0x1042) and (pci["modern"] or device == 0x1001 and pci["legacy"]) or
             device in (0x1004, 0x1048) and (pci["modern"] or device == 0x1004 and pci["legacy"]))
         nvme = pci["cls"] == 0x010802 and pci["bars"][0][0] >= 0x2000
         need(pci["msix"] and (virtio or nvme), block["name"] +
-             ": L4H needs NVMe, modern virtio-blk or virtio-scsi with MSI-X; SATA/SAS/USB are unsupported")
+             ": L4H needs NVMe, virtio-blk or virtio-scsi with MSI-X; SATA/SAS/USB are unsupported")
         if nvme:
             need(self.read("/sys/class/block/" + name + "/nsid") == "1",
                  block["name"] + ": L4H supports only NVMe namespace 1")

@@ -187,37 +187,57 @@ impl Memd {
     }
 
     /// Have memd report free memory through `d`, a virtio-balloon: map its
-    /// BARs and DMA pages into memd, and enable it.
+    /// BARs (or give it its I/O ports, if it is a legacy device) and DMA
+    /// pages into memd, and enable it.
     /// Free page reports name memory the balloon never reads, so it is
     /// given its DMA pages only: one that translates them through the
     /// IOMMU (QEMU's `iommu_platform=on`) cannot report.
     pub fn attach_balloon(&mut self, d: &pci::Device, pci: &Pci, iommu: &mut Iommu, alloc: &mut Alloc, devmem: &mut DevMem) {
-        let cap = |t: u8| d.virtio_caps.iter().find(|c| c.cfg_type == t).copied();
-        let (Some(common), Some(notify), Some(device)) =
-            (cap(VIRTIO_PCI_CAP_COMMON_CFG), cap(VIRTIO_PCI_CAP_NOTIFY_CFG), cap(VIRTIO_PCI_CAP_DEVICE_CFG))
-        else {
-            return;
-        };
-        // BARs mapped, one bit each.
-        let mut mapped = 0u8;
-        for c in [common, notify, device] {
-            if mapped & (1 << c.bar) != 0 {
-                continue;
-            }
-            let bar = d.bars[c.bar as usize];
-            let pages = (bar.size as usize).div_ceil(PAGE);
-            if bar.is_io || bar.size == 0 || bar.size as usize > memd::BAR_STRIDE || pages + memd::DMA_PAGES > self.keep_left() {
+        let mut cfg = BalloonConfig::default();
+        let legacy = crate::blkd::is_legacy_virtio(d);
+        if legacy {
+            let bar = d.bars[0];
+            if self.keep_left() < memd::DMA_PAGES {
                 return;
             }
-            let Some(frames) = alloc.slots.global(|s| devmem.frames(s, bar.addr as usize, bar.size as usize)) else {
+            let Some(io) = pci::io_ports(alloc, bar.addr as u16, bar.size as u16) else {
                 return;
             };
-            for (i, f) in frames.map(crate::devmem::granule).enumerate() {
-                let va = memd::BALLOON_VA + c.bar as usize * memd::BAR_STRIDE + i * PAGE;
-                let keep = self.keep_slot();
-                self.comp.map_copy(alloc, &mut self.arena, &abs_of(f), va, CapRights::read_write(), crate::blkd::DEVICE_ATTRS, keep);
+            self.comp.give(memd::SLOT_BALLOON_IOPORT, io, CapRights::all());
+            cfg.legacy_io = bar.addr;
+        } else {
+            let cap = |t: u8| d.virtio_caps.iter().find(|c| c.cfg_type == t).copied();
+            let (Some(common), Some(notify), Some(device)) =
+                (cap(VIRTIO_PCI_CAP_COMMON_CFG), cap(VIRTIO_PCI_CAP_NOTIFY_CFG), cap(VIRTIO_PCI_CAP_DEVICE_CFG))
+            else {
+                return;
+            };
+            // BARs mapped, one bit each.
+            let mut mapped = 0u8;
+            for c in [common, notify, device] {
+                if mapped & (1 << c.bar) != 0 {
+                    continue;
+                }
+                let bar = d.bars[c.bar as usize];
+                let pages = (bar.size as usize).div_ceil(PAGE);
+                if bar.is_io || bar.size == 0 || bar.size as usize > memd::BAR_STRIDE || pages + memd::DMA_PAGES > self.keep_left() {
+                    return;
+                }
+                let Some(frames) = alloc.slots.global(|s| devmem.frames(s, bar.addr as usize, bar.size as usize)) else {
+                    return;
+                };
+                for (i, f) in frames.map(crate::devmem::granule).enumerate() {
+                    let va = memd::BALLOON_VA + c.bar as usize * memd::BAR_STRIDE + i * PAGE;
+                    let keep = self.keep_slot();
+                    self.comp.map_copy(alloc, &mut self.arena, &abs_of(f), va, CapRights::read_write(), crate::blkd::DEVICE_ATTRS, keep);
+                }
+                mapped |= 1 << c.bar;
             }
-            mapped |= 1 << c.bar;
+            let packed = |c: pci::VirtioCap| ((c.bar as u64) << 32) | c.offset as u64;
+            cfg.common = packed(common);
+            cfg.notify = packed(notify);
+            cfg.device = packed(device);
+            cfg.notify_mult = notify.notify_off_multiplier as u64;
         }
         let frames = alloc.slots.global(|s| s.alloc_range(memd::DMA_PAGES));
         let Some(paddr) = self.arena.retype(alloc, &FRAME_BP, memd::DMA_PAGES, Dest::root(frames.start)) else {
@@ -228,16 +248,12 @@ impl Memd {
             let f = abs_of(root_cap::<cap_type::Granule>(s));
             self.comp.map_copy(alloc, &mut self.arena, &f, memd::DMA_VA + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep);
         }
-        let packed = |c: pci::VirtioCap| ((c.bar as u64) << 32) | c.offset as u64;
-        let cfg = BalloonConfig {
-            common: packed(common),
-            notify: packed(notify),
-            device: packed(device),
-            notify_mult: notify.notify_off_multiplier as u64,
-            dma_paddr: paddr as u64,
-        };
+        cfg.dma_paddr = paddr as u64;
         let dom = iommu.attach(alloc, d);
         iommu.map(alloc, dom, paddr, memd::DMA_PAGES * PAGE, true);
+        if legacy {
+            pci.enable_io(d);
+        }
         pci.enable(d);
         if link(alloc).call(memd::MEMD_BALLOON, &cfg.to_mrs()) != 0 {
             pci.disable(d);
@@ -245,10 +261,12 @@ impl Memd {
     }
 }
 
+/// A virtio-balloon, modern or legacy.
 pub fn is_balloon(d: &pci::Device) -> bool {
     d.vendor == VIRTIO_VENDOR
         && (d.device == DEVICE_MODERN || d.device == DEVICE_TRANSITIONAL)
-        && d.virtio_caps.iter().any(|c| c.cfg_type == VIRTIO_PCI_CAP_COMMON_CFG)
+        && (d.virtio_caps.iter().any(|c| c.cfg_type == VIRTIO_PCI_CAP_COMMON_CFG)
+            || d.device == DEVICE_TRANSITIONAL && crate::blkd::is_legacy_virtio(d))
 }
 
 /// Spawn memd and hand it all free memory.

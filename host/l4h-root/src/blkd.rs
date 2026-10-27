@@ -169,15 +169,17 @@ impl Controller {
     }
 }
 
+/// A virtio-blk device, modern or legacy.
 pub fn is_virtio_blk(d: &pci::Device) -> bool {
     d.vendor == VIRTIO_VENDOR
         && (d.device == 0x1042 || d.device == 0x1001)
-        && d.virtio_caps.iter().any(|c| c.cfg_type == VIRTIO_PCI_CAP_COMMON_CFG)
+        && (d.virtio_caps.iter().any(|c| c.cfg_type == VIRTIO_PCI_CAP_COMMON_CFG) || (d.device == 0x1001 && is_legacy_virtio(d)))
         && d.msix.is_some()
 }
 
 /// A virtio 0.9.5 ("legacy") device: registers in I/O BAR 0, no virtio
-/// capabilities.  GCE's virtio-net and virtio-scsi are legacy devices.
+/// capabilities.  GCE's virtio-net and virtio-scsi are legacy devices, and
+/// so are all of a hypervisor's whose virtio predates 1.0.
 pub fn is_legacy_virtio(d: &pci::Device) -> bool {
     cfg!(target_arch = "x86_64") && d.virtio_caps.is_empty() && d.bars[0].is_io && d.bars[0].size >= 0x20
 }

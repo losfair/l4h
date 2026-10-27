@@ -3,7 +3,8 @@
 # Usage: run-blktest.sh [vcpus]
 # BLKTEST_DEV=nvme uses an NVMe controller, BLKTEST_DEV=scsi a virtio-scsi
 # controller (scsi-legacy: a legacy-only one, as on GCE), instead of
-# virtio-blk; BLKTEST_LBA=4096 gives either 4 KiB blocks.  scsi-luns adds
+# virtio-blk (virtio-legacy: a legacy-only one, as under hypervisors whose
+# virtio predates 1.0); BLKTEST_LBA=4096 gives either 4 KiB blocks.  scsi-luns adds
 # a second disk as another LUN of the same target, behind a CD-ROM.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -27,6 +28,8 @@ scsi|scsi-legacy)
       # Target 1, as GCE places its boot disk.
       if [ "$BLKTEST_DEV" = scsi ]; then mode=disable-legacy=on; else mode=disable-modern=on; fi
       dev="-device virtio-scsi-pci,id=s0,$mode -device scsi-hd,drive=d0,bus=s0.0,scsi-id=1,logical_block_size=$lba,physical_block_size=$lba" ;;
+virtio-legacy)
+      dev="-device virtio-blk-pci,drive=d0,disable-modern=on" ;;
 *)    dev="-device virtio-blk-pci,drive=d0,disable-legacy=on" ;;
 esac
 "$root/tools/mkinitramfs.sh" "$out/blktest.cpio.gz" "$root/tests/guest/init-blktest" >/dev/null

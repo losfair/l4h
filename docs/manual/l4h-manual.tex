@@ -542,8 +542,8 @@ be installed. The checks cover:
         override the allocation; the default is up to four vCPUs;
   \item on UEFI, a writable mounted FAT ESP on a plain GPT disk, selected
         with \texttt{--esp PATH} if more than one is mounted;
-  \item a plain ext4 or XFS root on NVMe namespace 1, modern virtio-blk,
-        or virtio-scsi, with MSI-X. Required fstab volumes must also be
+  \item a plain ext4 or XFS root on NVMe namespace 1, virtio-blk, or
+        virtio-scsi (modern or legacy), with MSI-X. Required fstab volumes must also be
         supported and use UUIDs, PARTUUIDs or unique labels. The shipped
         initramfs does not assemble LVM, RAID or encrypted volumes;
   \item a headless systemd userspace, with \file{/usr}, \file{/etc},
@@ -822,7 +822,8 @@ tools/run-qemu.sh host/target/x86_64-sel4-roottask/debug/l4h-root.elf \
         \texttt{scsi-hd} (up to 16) is a disk; \cmd{l4hctl disks} shows
         its target and LUN. NICs must
         be \texttt{virtio-net-pci}. Use \texttt{disable-legacy=on} for
-        virtio devices. A host supports up to 4 NICs.
+        virtio devices; \texttt{disable-modern=on} makes a legacy (0.9.5)
+        one, which l4h drives too. A host supports up to 4 NICs.
   \item The script adds a \texttt{virtio-balloon-pci} device with
         \texttt{free-page-reporting=on}. \texttt{l4h-root} reports the
         memory it has not given to guests to QEMU, which then drops it,
@@ -1741,11 +1742,13 @@ Test & What it checks \\
   under page-table pressure and SMP stress; guest OOM \\
 \cmd{run-blktest.sh} & disk pass-through and data integrity
   (\texttt{BLKTEST\_DEV=nvme} for NVMe, \texttt{scsi} or
-  \texttt{scsi-legacy} for virtio-scsi) \\
+  \texttt{scsi-legacy} for virtio-scsi, \texttt{virtio-legacy} for a
+  legacy virtio-blk) \\
 \cmd{run-ctltest.sh} & VM lifecycle, console, clean shutdown, disk windows,
   memory reclaim, destroying VMs during disk I/O (virtio-blk and NVMe) \\
 \cmd{run-nettest.sh} & DHCP over the uplink, switches, several vNICs,
-  isolation, MAC lock \\
+  isolation, MAC lock (\texttt{NETTEST\_LEGACY=1}: over a legacy
+  virtio-net uplink) \\
 \cmd{run-router.sh} & a Debian NAT router VM between an internal switch and
   the uplink \\
 \cmd{run-density.sh 30 256} & 30 guests of 256 MiB on 4 cores stay

@@ -75,7 +75,7 @@ class Machine:
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.symlink_to(target)
 
-    def pci(self, bdf, vendor, device, cls, msix=True, modern=True):
+    def pci(self, bdf, vendor, device, cls, msix=True, modern=True, io_bar=False):
         base = "/sys/devices/pci0000:00/0000:" + bdf
         for name, value in (("vendor", vendor), ("device", device), ("class", cls)):
             self.write(base + "/" + name, hex(value))
@@ -84,7 +84,10 @@ class Machine:
         config[0x40:0x44] = bytes([0x11 if msix else 1, 0x50, 3, 0])
         config[0x50:0x54] = bytes([9 if modern else 1, 0, 16, 1])
         self.write(base + "/config", config)
-        self.write(base + "/resource", "0x1000 0x5fff 0x200\n" * 6)
+        bars = "0x1000 0x5fff 0x200\n" * 6
+        if io_bar:  # A legacy virtio device's registers in I/O BAR 0.
+            bars = "0xc000 0xc03f 0x101\n" + bars.split("\n", 1)[1]
+        self.write(base + "/resource", bars)
 
     def nic(self, name, bdf, mac):
         self.pci(bdf, 0x1AF4, 0x1041, 0x020000)
@@ -256,11 +259,25 @@ class InstallerTests(Harness):
         self.machine.mounts[0]["fstype"] = "btrfs"
         self.rejected("ext4 or XFS")
 
-    def test_sata_and_legacy_virtio_blk(self):
+    def test_sata_and_legacy_virtio(self):
         self.machine.pci("00:04.0", 0x8086, 0x2922, 0x010601)
         self.rejected("SATA")
-        self.machine.pci("00:04.0", 0x1AF4, 0x1001, 0x010000, modern=False)
-        self.rejected("modern virtio-blk")
+        # Legacy (0.9.5) virtio-blk and virtio-scsi: registers in I/O BAR 0.
+        for device in (0x1001, 0x1004):
+            with self.subTest(device=hex(device)):
+                self.machine.pci("00:04.0", 0x1AF4, device, 0x010000, modern=False, io_bar=True)
+                self.check()
+                self.machine.pci("00:04.0", 0x1AF4, device, 0x010000, modern=False)
+                self.rejected("NVMe, virtio-blk or virtio-scsi")
+        # A modern-only device ID has no legacy interface.
+        self.machine.pci("00:04.0", 0x1AF4, 0x1042, 0x010000, modern=False, io_bar=True)
+        self.rejected("NVMe, virtio-blk or virtio-scsi")
+
+    def test_legacy_virtio_net(self):
+        self.machine.pci("00:05.0", 0x1AF4, 0x1000, 0x020000, modern=False, io_bar=True)
+        self.check()
+        self.machine.pci("00:05.0", 0x1AF4, 0x1000, 0x020000, modern=False)
+        self.rejected("supported uplinks")
 
     def test_msix_required(self):
         self.machine.pci("00:04.0", 0x1AF4, 0x1042, 0x010000, msix=False)

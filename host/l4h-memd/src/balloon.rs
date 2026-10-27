@@ -12,10 +12,16 @@
 //! them anyway when it hands them out again.
 //!
 //! There is no interrupt: memd's timer polls for the end of a report, and
-//! an allocation that needs a block in flight waits for it.
+//! an allocation that needs a block in flight waits for it.  So a legacy
+//! (0.9.5) device, whose registers are I/O ports, runs without MSI-X, and
+//! has no vector registers.
 
-use l4h_rt::host::memd::{BalloonConfig, DMA_PAGES, DMA_VA};
-use l4h_virtio::{self as virtio, DESC_F_NEXT, DESC_F_WRITE, Dma, Mmio, NO_VECTOR, Virtq};
+use l4h_rt::host::memd::{BalloonConfig, DMA_PAGES, DMA_VA, SLOT_BALLOON_IOPORT};
+use l4h_rt::ioport::Ports;
+use l4h_virtio::{
+    self as virtio, DESC_F_NEXT, DESC_F_WRITE, Dma, Mmio, NO_VECTOR, STATUS_ACK, STATUS_DRIVER, STATUS_DRIVER_OK, STATUS_FAILED, Virtq,
+    legacy, legacy_ring_size,
+};
 
 const F_STATS_VQ: u64 = 1 << 1;
 const F_FREE_PAGE_HINT: u64 = 1 << 3;
@@ -33,8 +39,19 @@ pub const QUEUE_SIZE: usize = 32;
 /// Longest wait for the device to return a report.
 const WAIT_MS: u64 = 2000;
 
+/// Queues: inflate, deflate, then the statistics and free page hinting
+/// queues if the device has them, then reporting.  QEMU numbers its queues
+/// by what it offers, whatever is negotiated; the statistics queue is
+/// negotiated too, so that a device that numbers them by what is
+/// negotiated agrees.
+fn reporting_queue(offered: u64) -> u16 {
+    2 + (offered & F_STATS_VQ != 0) as u16 + (offered & F_FREE_PAGE_HINT != 0) as u16
+}
+
 pub struct Balloon {
     vq: Virtq,
+    /// Legacy devices are notified through I/O ports.
+    ports: Option<Ports>,
     busy: bool,
     ticks_per_ms: u64,
 }
@@ -43,14 +60,18 @@ impl Balloon {
     /// Set up the device for free page reporting.  None if it cannot
     /// report (the hypervisor did not enable it), or is unusable.
     pub fn new(cfg: &BalloonConfig, ticks_per_ms: u64) -> Option<Self> {
+        let mut dma = Dma::new(DMA_VA, cfg.dma_paddr, DMA_PAGES * PAGE);
+        if cfg.legacy_io != 0 {
+            let p = Ports { cap: SLOT_BALLOON_IOPORT, base: cfg.legacy_io as u16 };
+            let vq = Self::legacy(&p, &mut dma)?;
+            return Some(Balloon { vq, ports: Some(p), busy: false, ticks_per_ms });
+        }
         let dev = virtio::Device {
             common: Mmio(BalloonConfig::va(cfg.common)),
             notify: Mmio(BalloonConfig::va(cfg.notify)),
             notify_mult: cfg.notify_mult as u32,
             device: Mmio(BalloonConfig::va(cfg.device)),
         };
-        let mut dma = Dma::new(DMA_VA, cfg.dma_paddr, DMA_PAGES * PAGE);
-
         dev.reset();
         let offered = dev.features();
         if offered & virtio::F_VERSION_1 == 0 || offered & F_REPORTING == 0 {
@@ -62,19 +83,44 @@ impl Balloon {
             dev.fail();
             return None;
         }
-        // Queues: inflate, deflate, then the statistics and free page
-        // hinting queues if the device has them, then reporting.  QEMU
-        // numbers its queues by what it offers, whatever is negotiated;
-        // the statistics queue is negotiated too, so that a device that
-        // numbers them by what is negotiated agrees.
-        let idx = 2 + (offered & F_STATS_VQ != 0) as u16 + (offered & F_FREE_PAGE_HINT != 0) as u16;
+        let idx = reporting_queue(offered);
         let Some(vq) = dev.setup_queue(&mut dma, idx, QUEUE_SIZE as u16, NO_VECTOR) else {
             dev.fail();
             return None;
         };
         dev.driver_ok();
         l4h_rt::info!("memd: balloon: free page reporting on queue {}, {} buffers", idx, vq.num);
-        Some(Balloon { vq, busy: false, ticks_per_ms })
+        Some(Balloon { vq, ports: None, busy: false, ticks_per_ms })
+    }
+
+    /// The reporting queue of a legacy device.
+    fn legacy(p: &Ports, dma: &mut Dma) -> Option<Virtq> {
+        p.out8(legacy::STATUS, 0);
+        p.out8(legacy::STATUS, STATUS_ACK | STATUS_DRIVER);
+        let offered = p.in32(legacy::DEVICE_FEATURES) as u64;
+        if offered & F_REPORTING == 0 {
+            l4h_rt::info!("memd: balloon: no free page reporting (legacy, features {:#x})", offered);
+            p.out8(legacy::STATUS, STATUS_FAILED);
+            return None;
+        }
+        p.out32(legacy::GUEST_FEATURES, (F_REPORTING | (offered & F_STATS_VQ)) as u32);
+        let idx = reporting_queue(offered);
+        p.out16(legacy::QUEUE_SELECT, idx);
+        // A legacy queue has the device's size, and a 32-bit page number.
+        let num = p.in16(legacy::QUEUE_SIZE);
+        if num == 0 || legacy_ring_size(num) > dma.remaining() {
+            p.out8(legacy::STATUS, STATUS_FAILED);
+            return None;
+        }
+        let (va, pa) = dma.alloc(legacy_ring_size(num), PAGE);
+        if pa >> 12 > u32::MAX as u64 {
+            p.out8(legacy::STATUS, STATUS_FAILED);
+            return None;
+        }
+        p.out32(legacy::QUEUE_PFN, (pa >> 12) as u32);
+        p.out8(legacy::STATUS, STATUS_ACK | STATUS_DRIVER | STATUS_DRIVER_OK);
+        l4h_rt::info!("memd: balloon: free page reporting on legacy queue {}, {} entries", idx, num);
+        Some(Virtq::legacy(idx, num, va))
     }
 
     /// Buffers one report can hold.
@@ -99,6 +145,9 @@ impl Balloon {
         }
         self.vq.submit(0);
         self.vq.notify();
+        if let Some(p) = &self.ports {
+            p.out16(legacy::QUEUE_NOTIFY, self.vq.idx);
+        }
         self.busy = true;
     }
 

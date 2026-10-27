@@ -10,9 +10,13 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 rootserver=$("$root/tools/dom0-modules.sh" "$1"); shift
 objcopy -O elf32-i386 "$root/build/sel4/bin/kernel.elf" "$root/build/kernel32.elf"
 # l4h reports its free memory to QEMU, which then drops it
-# (L4H_BALLOON=0 leaves the device out).
+# (L4H_BALLOON=0 leaves the device out, L4H_BALLOON=legacy makes it a
+# legacy-only device).
 balloon=()
-[ "${L4H_BALLOON:-1}" = 1 ] && balloon=(-device virtio-balloon-pci,free-page-reporting=on,disable-legacy=on)
+case "${L4H_BALLOON:-1}" in
+    1) balloon=(-device virtio-balloon-pci,free-page-reporting=on,disable-legacy=on) ;;
+    legacy) balloon=(-device virtio-balloon-pci,free-page-reporting=on,disable-modern=on) ;;
+esac
 # L4H_QEMU_IOMMU=amd|intel adds an IOMMU, which needs the q35 machine and
 # must come before the devices it translates.  NVMe always goes through
 # it; virtio disks and NICs are made to (iommu_platform), not the

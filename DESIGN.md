@@ -1488,6 +1488,16 @@ volume starting at sector zero. There is no image format, host filesystem,
 thin provisioning or copy-on-write.
 
 - Guest `virtio_blk` → l4h-vmm → per-client shared queue → blkd → device.
+- **Legacy devices.** Every virtio device the host drives (virtio-blk,
+  virtio-scsi, virtio-net and the balloon) may also be a legacy (0.9.5)
+  one: transitional device ID, registers in I/O BAR 0, no virtio
+  capabilities, as on GCE N2 or under a hypervisor whose virtio predates
+  1.0. Root gives the driver an IOPort capability for the BAR instead of
+  mapping BARs; the driver programs a legacy queue (its size is the
+  device's, at a 32-bit page number) and notifies through `QUEUE_NOTIFY`.
+  A transitional device that has virtio capabilities is driven as a
+  modern one. The disk and NIC drivers still need MSI-X; the balloon,
+  which is polled, has none, and so no vector registers.
 - Each client has its own immutable pool/window/permission configuration,
   channel and completion notification. The controller supports 512
   clients; blkd's submit loop visits only attached ones.
@@ -3279,7 +3289,8 @@ not given to a guest should not occupy the hypervisor's RAM.
   deflation, no statistics. QEMU numbers its queues by the features it
   offers, so the reporting queue is 2, plus one for the statistics queue
   and one for free page hinting if offered. `l4h-root` finds it on PCI,
-  enables it and maps its BARs and three DMA pages into memd. The device
+  enables it and maps its BARs and three DMA pages into memd; a legacy
+  balloon (§8.2) gets its I/O ports instead of BAR mappings. The device
   has no interrupt: memd's 100 ms timer polls it (`l4h-memd/src/balloon.rs`).
 - **What is reported.** The allocator's free blocks (§15.2) of 2 MiB or
   more, once free for 2 s (as Linux does), so that memory freed and
