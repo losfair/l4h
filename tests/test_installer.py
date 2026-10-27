@@ -630,6 +630,16 @@ class BiosInstallerTests(Harness):
         self.assertFalse(any(c[0] in ("efibootmgr", "reboot", "grub-install", "update-grub", "grub-mkconfig")
                              for c in self.machine.calls))
 
+    def test_rerun_after_a_trial_boot(self):
+        self.commit()
+        # GRUB's 00_header consumes next_entry with save_env, leaving it empty.
+        self.machine.grubenv["next_entry"] = ""
+        self.commit(default=True)
+        self.assertIn("set default=l4h", self.custom())
+        self.assertEqual(self.machine.grubenv["next_entry"], "")
+        self.machine.grubenv["next_entry"] = "1"
+        self.rejected("next_entry is already set")
+
     def test_xapic_variant_kernel(self):
         cpu = self.machine.path("/proc/cpuinfo")
         cpu.write_text(cpu.read_text().replace("pcid", ""))

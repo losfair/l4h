@@ -442,7 +442,8 @@ class Preflight:
         else:
             need(saved is None and not self.path(BIOS_DIR).exists(),
                  "unmanaged L4H files exist; preserve or remove them before installing")
-        need(plan["grub_env"].get("next_entry", GRUB_ENTRY) == GRUB_ENTRY,
+        # GRUB consumes next_entry by saving it empty.
+        need(plan["grub_env"].get("next_entry") in (None, "", GRUB_ENTRY),
              "GRUB next_entry is already set for another entry; clear it before installing")
         return dict(default=bool(saved and saved.get("default")))
 

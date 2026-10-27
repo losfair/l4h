@@ -168,9 +168,9 @@ else
         if grep -q '^BootNext:' returned-boot.txt; then false; fi
         [[ $(sed -n 's/^BootOrder: //p' returned-boot.txt) == "$(cat native-boot-order)" ]]
     else
-        # GRUB consumed next_entry before it booted L4H.
+        # GRUB consumed next_entry (saving it empty) before it booted L4H.
         grub-editenv /boot/grub/grubenv list | tee returned-boot.txt
-        if grep -q '^next_entry=' returned-boot.txt; then false; fi
+        if grep -q '^next_entry=.' returned-boot.txt; then false; fi
     fi
     sha256sum --check native-files.sha256
     echo 'INSTALLVM: PASS (native -> L4H dom0 -> native)'
