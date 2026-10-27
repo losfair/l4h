@@ -504,16 +504,19 @@ Variable & Meaning & Default \\
 \file{tools/install.sh} installs a tagged x86\_64 release on a running
 Linux machine. The existing root filesystem and userspace become dom0;
 the distribution's kernel is replaced for that boot by the paravirtual
-kernel in the L4H EFI application. Native Linux remains available through
-its original firmware boot entry.
+kernel in the L4H EFI application or, on a BIOS machine, in L4H's BIOS
+files (Section~\ref{sec:bios}). Native Linux remains available through
+its original firmware boot entry or GRUB menu entry.
 
 \begin{lstlisting}
 curl -fsSL https://raw.githubusercontent.com/losfair/l4h/main/tools/install.sh | bash
 \end{lstlisting}
 
 The script elevates through \cmd{sudo} if necessary and installs missing
-dependencies with apt, dnf or yum: Python 3.9 or later, curl, efibootmgr,
-util-linux and iproute2 (iproute on RPM distributions). It resolves the
+dependencies with apt, dnf or yum: Python 3.9 or later, curl, efibootmgr
+(UEFI) or \cmd{grub-editenv} (BIOS; \cmd{grub2-editenv} with
+\file{/boot/grub2}), util-linux and iproute2 (iproute on RPM
+distributions). It resolves the
 latest tagged release once, verifies downloads against that release's
 \file{SHA256SUMS}, and uses its installer and static initramfs. Releases
 from before this installer was added are rejected. No compiler is needed.
@@ -522,11 +525,13 @@ download integrity; their authenticity relies on HTTPS and the GitHub
 release account.
 
 \texttt{--check} runs the same compatibility probes without installing
-packages, publishing files or writing EFI variables. It still downloads
+packages, publishing files or writing EFI variables or GRUB's
+environment. It still downloads
 the installer into a temporary directory; the dependencies must already
 be installed. The checks cover:
 \begin{itemize}
-  \item 64-bit UEFI with writable efivarfs, Secure Boot disabled, and ACPI;
+  \item 64-bit UEFI with writable efivarfs and Secure Boot disabled, or
+        BIOS with the distribution's GRUB (below); and ACPI;
   \item Intel or AMD CPUs with the seL4 release's required features
         (including FSGSBASE, XSAVEOPT, AVX and 1 GiB pages), unaffected by
         Meltdown, and APIC IDs below 256. VMX/SVM and an IOMMU are not
@@ -535,8 +540,8 @@ be installed. The checks cover:
         dom0 gets half the RAM, capped at 8192 MiB, while leaving at least
         2 GiB for L4H. \texttt{--memory MiB} and \texttt{--vcpus N}
         override the allocation; the default is up to four vCPUs;
-  \item a writable mounted FAT ESP on a plain GPT disk, selected with
-        \texttt{--esp PATH} if more than one is mounted;
+  \item on UEFI, a writable mounted FAT ESP on a plain GPT disk, selected
+        with \texttt{--esp PATH} if more than one is mounted;
   \item a plain ext4 or XFS root on NVMe namespace 1, modern virtio-blk,
         or virtio-scsi, with MSI-X. Required fstab volumes must also be
         supported and use UUIDs, PARTUUIDs or unique labels. The shipped
@@ -571,7 +576,7 @@ not a guarantee of compatibility with every application or firmware.
 
 After preflight and download verification, the installer writes
 \file{EFI/L4H/l4h.efi}, \file{l4h/dom0/initrd}, and \file{l4h/l4h.conf} on
-the ESP, and \file{/usr/local/bin/l4hctl} with its license on root. It
+the ESP (on BIOS: \file{/boot/l4h}, below), and \file{/usr/local/bin/l4hctl} with its license on root. It
 does not format partitions or replace the native EFI loaders, including
 \file{EFI/BOOT/BOOTX64.EFI}. Replaced files and EFI settings are backed
 up under \file{/var/lib/l4h/backups}; errors trigger rollback. Each backup
@@ -595,6 +600,42 @@ menu. From native Linux, \cmd{efibootmgr --delete-bootnext} cancels a
 pending trial; \cmd{efibootmgr --bootnum XXXX --delete-bootnum} removes
 the L4H entry (substitute its number). EFI-variable management must run
 under native Linux; dom0 does not expose the firmware's EFI runtime.
+
+\subsection*{BIOS machines}
+
+Many smaller clouds boot their VMs with BIOS only (SeaBIOS), such as
+DigitalOcean. There the installer uses the distribution's own BIOS GRUB
+instead of NVRAM; it needs:
+\begin{itemize}
+  \item native Linux booted by GRUB (\texttt{BOOT\_IMAGE=} on its command
+        line), with GRUB's boot sector in the MBR of the disk holding
+        \file{/boot};
+  \item one \file{grub.cfg}, in \file{/boot/grub} or \file{/boot/grub2},
+        made by \cmd{grub-mkconfig} (\cmd{update-grub}): its
+        \texttt{00\_header} consumes a one-time \texttt{next\_entry}
+        and its \texttt{41\_custom} sources \file{custom.cfg}; and its
+        \file{grubenv};
+  \item \file{/boot} on ext2/3/4 or XFS (on root or its own partition),
+        where GRUB can rewrite \file{grubenv}; no existing
+        \file{custom.cfg} that the installer did not write.
+\end{itemize}
+It downloads \file{l4h-bios-x86\_64.tar.xz} and writes the selected
+variant's kernel and the rest of the BIOS files to \file{/boot/l4h/bios},
+dom0's initramfs and settings to \file{/boot/l4h/dom0/initrd} and
+\file{/boot/l4h/l4h.conf}, then an \texttt{L4H} menu entry
+(\texttt{--id l4h}) in \file{custom.cfg} next to \file{grub.cfg}. It does
+not run \cmd{grub-install} or \cmd{update-grub}, and leaves the native
+entries and \texttt{GRUB\_DEFAULT} alone. The trial is
+\cmd{grub-editenv grubenv set next\_entry=l4h}: GRUB clears it before it
+boots L4H, so the next reset returns to the native default.
+\texttt{--make-default} instead has \file{custom.cfg} make L4H the default
+entry, except on a boot that consumes another \texttt{next\_entry}. From
+native Linux or dom0 (it mounts the same \file{/boot}),
+\cmd{grub-reboot 0} followed by \cmd{l4hctl host-reboot} boots native
+Linux once; \cmd{grub-editenv /boot/grub/grubenv unset next\_entry}
+cancels a pending trial, and removing \file{custom.cfg} removes the entry.
+If a boot hangs, the provider's recovery console or rescue system can do
+the same. There is no measured boot on BIOS (Section~\ref{sec:bios}).
 
 \section{dom0 on the EFI system partition}
 \label{sec:esp}
@@ -641,6 +682,9 @@ Each tagged release on GitHub carries, for x86\_64:
 \begin{itemize}
   \item both applications, built in release mode, with the guest kernel
         and its module tree in them;
+  \item \file{l4h-bios-x86\_64.tar.xz}: the same for BIOS machines
+        (Section~\ref{sec:bios}), with each variant's kernel as
+        \file{kernel-VARIANT.elf};
   \item \file{l4h-dom0-x86\_64.tar.xz}: a static \cmd{l4hctl} and an
         example \file{l4h.conf}. Add an initramfs or a root filesystem of
         your choice, with \cmd{l4hctl} in it (Sections on busybox and Debian
@@ -665,6 +709,36 @@ At boot, \texttt{l4h-root}:
 \end{enumerate}
 dom0 sees its disks as \file{/dev/vda}, \file{/dev/vdb}, \ldots{} in host
 disk order, and its vNICs as \texttt{eth0}, \texttt{eth1}, \ldots
+
+\section{BIOS machines}
+\label{sec:bios}
+
+BIOS GRUB cannot carry l4h in its core image, which must fit in a few
+hundred KiB, so on BIOS l4h's files live on a filesystem GRUB reads.
+\cmd{tools/mkbios.sh OUTDIR [l4h-root.elf] [kernel.elf]} builds them:
+\file{kernel.elf} (seL4), \file{l4h-root.elf}, \file{vmlinux},
+\file{kmods.erofs} and \file{grub.cfg}, the GRUB script that boots them
+with multiboot2. They go in \file{bios/} of one directory, which holds
+dom0's files too:
+\begin{lstlisting}
+bios/           tools/mkbios.sh's files
+dom0/initrd     dom0's initramfs (optional)
+l4h.conf        host settings (optional)
+\end{lstlisting}
+The GRUB that runs \file{bios/grub.cfg} first sets \texttt{l4h} to that
+directory: the core image of the disk image (Section~\ref{sec:image}),
+whose directory is \file{l4h/} on the EFI system partition, or the
+installer's menu entry, whose directory is \file{/boot/l4h}.
+\file{l4h.conf} works as on UEFI, \texttt{serial\_port} and
+\texttt{fb\_console} included. GRUB sets up the framebuffer the kernel asks
+for through VBE, so the dashboard shows on the VM's screen (on DigitalOcean,
+its recovery console).
+
+\begin{caveat}
+BIOS GRUB has no TPM support, so nothing measures l4h or dom0's files:
+attestation reports from a BIOS host do not show what it booted.
+\texttt{L4H\_ACPI\_TABLES} does not apply either.
+\end{caveat}
 
 \section{A minimal busybox dom0}
 
@@ -770,13 +844,20 @@ initramfs to \texttt{l4h-root} as dom0, and boots it with output in \file{build/
 all guests have stopped or after \texttt{TIMEOUT} seconds (default 60).
 Extra QEMU arguments go in \texttt{L4H\_QEMU\_ARGS}.
 
-\section{UEFI disk image}
+\section{Disk image}
+\label{sec:image}
 
-\cmd{tools/mkimage.sh [-e l4h.efi] [-i initrd] [-c l4h.conf] OUT.raw
-[l4h-root.elf]} builds a GPT disk image whose EFI system partition holds
+\cmd{tools/mkimage.sh [-e l4h.efi] [-b biosdir] [-i initrd] [-c l4h.conf] OUT.raw
+[l4h-root.elf]} builds a GPT disk image that boots under UEFI and BIOS.
+Its EFI system partition holds
 l4h's UEFI application (built from \texttt{l4h-root} and the guest kernel,
-or the one given with \texttt{-e}) and, with \texttt{-i} and \texttt{-c},
-dom0's initramfs and \file{l4h.conf} (Section~\ref{sec:esp}). GRUB boots seL4 with
+or the one given with \texttt{-e}), l4h's BIOS files in \file{l4h/bios}
+(built by \cmd{tools/mkbios.sh}, or the directory given with
+\texttt{-b}; with \texttt{-e} and no \texttt{-b}, the image boots only
+under UEFI) and, with \texttt{-i} and \texttt{-c},
+dom0's initramfs and \file{l4h.conf} (Section~\ref{sec:esp}). For BIOS,
+the MBR holds GRUB's boot sector and a 1 MiB BIOS boot partition after
+the ESP its core image, which finds the ESP by its volume serial number. GRUB boots seL4 with
 multiboot2 and the serial port set explicitly
 (\texttt{console\_port=0x3f8 debug\_port=0x3f8}, or \texttt{serial\_port}).
 The partition has 64 MiB to spare for larger dom0 images
@@ -789,7 +870,12 @@ virtio-net):
 tools/mkimage.sh build/l4h.raw
 tools/run-uefi.sh build/l4h.raw
 \end{lstlisting}
-The boot disk is itself an NVMe disk, so it shows up as host disk 0. Unless
+To boot it the way a BIOS-only cloud such as DigitalOcean would (i440fx,
+SeaBIOS, virtio-blk boot disk, virtio-net), use
+\cmd{tools/run-bios.sh build/l4h.raw}. On DigitalOcean, upload the image
+(compressed with gzip, for example) as a custom image. On a provider
+without custom images, write it to the VM's disk from its rescue system.
+Either way the boot disk is itself a disk l4h drives, so it shows up as host disk 0. Unless
 you set \texttt{dom0\_disks=0}, dom0 receives it. dom0 can use the space
 after the EFI partition. In the partition itself it may replace the files
 in \file{l4h/}, but nothing else.
@@ -1680,6 +1766,8 @@ Test & What it checks \\
 \cmd{run-monitor.sh} & the serial monitor \\
 \cmd{run-uefitest.sh} & the UEFI image with NVMe boot disk and virtio-net,
   as on GCE \\
+\cmd{run-biostest.sh} & the same image under SeaBIOS, with virtio-blk boot
+  disk, virtio-net and a VBE framebuffer, as on DigitalOcean \\
 \cmd{run-attesttest.sh} & attestation with a software TPM (swtpm), over
   CRB, FIFO and the ACPI start method of AMD fTPMs (which needs
   \cmd{iasl}): reports on dom0 and a guest verify against the host

@@ -84,7 +84,7 @@ elif [[ ! -f phase ]]; then
     fi
     # Remember the native EFI payloads and distribution configuration.
     find /boot/efi/EFI -type f -print0 | sort -z | xargs -0 sha256sum > native-files.sha256
-    sha256sum /etc/fstab >> native-files.sha256
+    sha256sum /etc/fstab /boot/grub/grub.cfg >> native-files.sha256
     for directory in /etc/systemd/network /etc/NetworkManager /etc/network; do
         if [[ -d $directory ]]; then
             find "$directory" -type f -exec sha256sum '{}' + >> native-files.sha256
@@ -104,8 +104,12 @@ elif [[ ! -f phase ]]; then
     # /usr/sbin precedes /usr/bin; package installation cannot replace this shim.
     install -m 755 curl-fixture /usr/sbin/curl
     # Dependency bootstrap may run, but a corrupt release must never change
-    # the ESP or firmware. Also exercise the download cleanup on failure.
-    sha256sum /sys/firmware/efi/efivars/BootOrder-* > native-order.sha256
+    # the ESP, firmware or GRUB. Also exercise the download cleanup on failure.
+    if [[ -d /sys/firmware/efi ]]; then
+        sha256sum /sys/firmware/efi/efivars/BootOrder-* > native-order.sha256
+    else
+        sha256sum /boot/grub/grubenv > native-order.sha256
+    fi
     cp release/SHA256SUMS release/SHA256SUMS.good
     sed -i 's/^[0-9a-f]/x/' release/SHA256SUMS
     # shellcheck disable=SC2002
@@ -115,8 +119,9 @@ elif [[ ! -f phase ]]; then
     fi
     sha256sum --check native-order.sha256
     sha256sum --check native-files.sha256
+    [[ ! -e /boot/grub/custom.cfg && ! -e /boot/l4h ]]
     mv release/SHA256SUMS.good release/SHA256SUMS
-    echo 'INSTALLVM: corrupt release rejected before EFI changes'
+    echo 'INSTALLVM: corrupt release rejected before boot changes'
     # Exercise curl | bash's unprivileged entry point and sudo re-execution.
     command -v sudo >/dev/null || apt-get install -y sudo
     useradd --no-create-home --shell /bin/bash l4h-install-test
@@ -126,6 +131,19 @@ elif [[ ! -f phase ]]; then
     # shellcheck disable=SC2002
     cat install.sh | bash -s -- --check --release v0-install-test --memory 2048 --vcpus 2
     sha256sum --check native-files.sha256
+    if [[ ! -d /sys/firmware/efi ]]; then
+        # BIOS: an L4H entry in custom.cfg, selected once through next_entry.
+        grub-editenv /boot/grub/grubenv list | tee installed-boot.txt
+        grep -qx 'next_entry=l4h' installed-boot.txt
+        grep -q "^menuentry 'L4H' --id l4h" /boot/grub/custom.cfg
+        test -s /boot/l4h/bios/kernel.elf
+        test -s /boot/l4h/dom0/initrd
+        echo installed > phase
+        echo 'INSTALLVM: installed; rebooting through GRUB next_entry'
+        sync
+        systemctl reboot
+        exit
+    fi
     efibootmgr --verbose | tee installed-boot.txt
     python3 - <<'PY'
 import json
@@ -145,9 +163,15 @@ PY
 else
     echo "INSTALLVM: returned to native kernel $(uname -r)"
     [[ $(cat phase) == dom0 && $(cat marker) == l4h-dom0 ]]
-    efibootmgr | tee returned-boot.txt
-    if grep -q '^BootNext:' returned-boot.txt; then false; fi
-    [[ $(sed -n 's/^BootOrder: //p' returned-boot.txt) == "$(cat native-boot-order)" ]]
+    if [[ -d /sys/firmware/efi ]]; then
+        efibootmgr | tee returned-boot.txt
+        if grep -q '^BootNext:' returned-boot.txt; then false; fi
+        [[ $(sed -n 's/^BootOrder: //p' returned-boot.txt) == "$(cat native-boot-order)" ]]
+    else
+        # GRUB consumed next_entry before it booted L4H.
+        grub-editenv /boot/grub/grubenv list | tee returned-boot.txt
+        if grep -q '^next_entry=' returned-boot.txt; then false; fi
+    fi
     sha256sum --check native-files.sha256
     echo 'INSTALLVM: PASS (native -> L4H dom0 -> native)'
     sync

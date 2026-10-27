@@ -17,7 +17,7 @@ pkgs=(git ca-certificates curl xz-utils bzip2 wget sudo procps kmod
     libxml2-utils device-tree-compiler clang libclang-dev
     flex bison bc libelf-dev libssl-dev cpio rsync ccache
     busybox-static e2fsprogs erofs-utils
-    qemu-system-x86 qemu-utils ovmf grub-efi-amd64-bin mtools fdisk
+    qemu-system-x86 qemu-utils ovmf grub-efi-amd64-bin grub-pc-bin mtools fdisk
     gcc-aarch64-linux-gnu libc6-dev-arm64-cross
     swtpm swtpm-tools python3-cryptography acpica-tools)
 [[ $want == *" aarch64 "* ]] && pkgs+=(qemu-system-arm)

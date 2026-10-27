@@ -1,6 +1,7 @@
 # Build what l4h ships for x86_64 and keep it as workflow artifacts:
 # - the UEFI applications, one per seL4 variant, with the guest kernel and
 #   its module tree (tools/build-efi.sh);
+# - l4h-bios-x86_64.tar.xz, the same for BIOS machines (tools/mkbios.sh);
 # - l4h-debug-x86_64.tar.xz, the same build unstripped, for decoding fault
 #   addresses and computing launch digests;
 # - l4h-dom0-x86_64.tar.xz, the dom0 userspace tools (tools/build-dom0.sh);
@@ -87,6 +88,7 @@ jobs:
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
               --title "l4h $GITHUB_REF_NAME" --generate-notes \
               build/efi/l4h-generic.efi build/efi/l4h-xapic-nopcid.efi \
+              build/efi/l4h-bios-x86_64.tar.xz \
               build/efi/l4h-dom0-x86_64.tar.xz build/efi/l4h-debug-x86_64.tar.xz \
               build/efi/l4h-attest.py build/efi/SHA256SUMS
       - name: Upload logs

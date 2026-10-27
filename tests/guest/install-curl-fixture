@@ -12,7 +12,7 @@ while (($#)); do
 done
 if [[ -n $url && -n $out ]]; then
     case ${url##*/} in
-        SHA256SUMS|l4h-dom0-x86_64.tar.xz|l4h-generic.efi)
+        SHA256SUMS|l4h-dom0-x86_64.tar.xz|l4h-generic.efi|l4h-bios-x86_64.tar.xz)
             cp "/opt/l4h-install-test/release/${url##*/}" "$out" ;;
         *) exit 22 ;;
     esac

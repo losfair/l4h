@@ -14,14 +14,16 @@ l4h_install() {
 Usage: curl -fsSL https://raw.githubusercontent.com/losfair/l4h/main/tools/install.sh | bash -s -- [options]
   --check                 Check compatibility only; do not install packages or change boot
   --release TAG           Install a specific GitHub release (default: latest)
-  --esp PATH              Mounted EFI system partition (otherwise auto-detect)
+  --esp PATH              Mounted EFI system partition (UEFI; otherwise auto-detect)
   --memory MiB            dom0 RAM (default: half of physical RAM, capped at 8192 MiB)
   --vcpus N               dom0 CPUs (default: up to 4)
   --variant NAME          generic or xapic-nopcid (otherwise select from CPU features)
-  --make-default          Put L4H first in BootOrder (default: one-time BootNext)
+  --make-default          Make L4H the default boot entry (default: one-time
+                          BootNext on UEFI, GRUB next_entry on BIOS)
   --help                  Show this help
 
-Requires x86_64 Linux booted with 64-bit UEFI and Secure Boot disabled.
+Requires x86_64 Linux booted with 64-bit UEFI and Secure Boot disabled, or
+booted by BIOS GRUB (grub-pc) from /boot on ext2/3/4 or XFS.
 Supports a plain ext4/XFS root, supported PCI disks and one supported physical NIC.
 The existing userspace boots with L4H's kernel. No automatic reboot.
 Run --check first; see the README and docs/manual/l4h-manual.tex for limits and recovery.
@@ -45,19 +47,31 @@ HELP
             --release "$release" "${args[@]}" </dev/null
         return
     fi
-    [[ $(uname -s) == Linux && $(uname -m) == x86_64 &&
-       -d /sys/firmware/efi && $(cat /sys/firmware/efi/fw_platform_size) == 64 ]] || {
-        echo 'l4h: requires x86_64 Linux booted with 64-bit UEFI' >&2; return 1;
+    [[ $(uname -s) == Linux && $(uname -m) == x86_64 ]] || {
+        echo 'l4h: requires x86_64 Linux' >&2; return 1;
     }
+    # UEFI selects L4H through an NVRAM entry, BIOS through GRUB's environment.
+    local boot_tool=efibootmgr
+    if [[ -d /sys/firmware/efi ]]; then
+        [[ $(cat /sys/firmware/efi/fw_platform_size) == 64 ]] || {
+            echo 'l4h: requires 64-bit UEFI' >&2; return 1;
+        }
+    elif [[ -f /boot/grub2/grub.cfg ]]; then
+        boot_tool=grub2-editenv
+    else
+        boot_tool=grub-editenv
+    fi
     local missing=0 tool
     local -a packages=(ca-certificates)
-    for tool in curl python3 efibootmgr lsblk findmnt blkid ip; do
+    for tool in curl python3 "$boot_tool" lsblk findmnt blkid ip; do
         if ! command -v "$tool" >/dev/null; then
             echo "l4h: dependency needed: $tool" >&2; missing=1
             case "$tool" in
                 lsblk|findmnt|blkid) packages+=(util-linux) ;;
                 ip)
                     if command -v apt-get >/dev/null; then packages+=(iproute2); else packages+=(iproute); fi ;;
+                grub-editenv) packages+=(grub-common) ;;
+                grub2-editenv) packages+=(grub2-tools-minimal) ;;
                 *) packages+=("$tool") ;;
             esac
         fi

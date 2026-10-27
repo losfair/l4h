@@ -1,17 +1,17 @@
 #!/bin/sh
-# dom0 init for tests/run-uefitest.sh.
+# dom0 init for tests/run-uefitest.sh and tests/run-biostest.sh.
 mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
-echo "UEFITEST: dom0 up"
-echo "UEFITEST: cmdline $(cat /proc/cmdline)"
+echo "IMAGETEST: dom0 up"
+echo "IMAGETEST: cmdline $(cat /proc/cmdline)"
 l4hctl info
 l4hctl disks
 l4hctl nics
 ip link set lo up
 ip link set eth0 up
 if udhcpc -i eth0 -n -q -t 5 -s /bin/udhcpc.script >/dev/null 2>&1 && ping -c 2 -W 2 10.0.2.2 >/dev/null; then
-    echo "UEFITEST: network ok"
+    echo "IMAGETEST: network ok"
 fi
-echo "UEFITEST: done"
+echo "IMAGETEST: done"
 poweroff -f

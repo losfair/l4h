@@ -125,6 +125,8 @@ jobs:
         run: tests/run-monitor.sh
       - name: UEFI boot image
         run: tests/run-uefitest.sh
+      - name: BIOS boot of the same image
+        run: tests/run-biostest.sh
       - name: Attestation (software TPM)
         run: tests/run-attesttest.sh
       - name: Virtqueue fuzzing

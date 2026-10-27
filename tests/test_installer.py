@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Installer safety tests; fake sysfs, block topology and firmware, no root needed."""
+"""Installer safety tests; fake sysfs, block topology, firmware and GRUB, no root needed."""
 import copy
 import importlib.util
 import io
 import json
 import os
 from pathlib import Path
+import shutil
+import struct
 import subprocess
 import sys
 import tarfile
@@ -101,7 +103,9 @@ class Machine:
                 if target == "/sys/firmware/efi/efivars":
                     rows = [dict(target=target, source="efivarfs", fstype="efivarfs", options="rw")]
                 else:
-                    rows = [next((m for m in self.mounts if m["target"] == target), self.mounts[0])]
+                    # The filesystem holding the path: the longest mount point above it.
+                    above = [m for m in self.mounts if (target + "/").startswith(m["target"].rstrip("/") + "/")]
+                    rows = [max(above, key=lambda m: len(m["target"]))]
             else:
                 rows = self.mounts
             return json.dumps(dict(filesystems=rows))
@@ -134,10 +138,39 @@ class Machine:
                 self.fail = None  # Model failure after firmware changed state.
                 raise installer.Incompatible("injected firmware failure")
             return ""
+        if args[0] in ("grub-editenv", "grub2-editenv"):
+            assert args[1] == "/boot/grub/grubenv", args
+            if args[2] == "list":
+                return "\n".join("{}={}".format(k, v) for k, v in self.grubenv.items())
+            if args[2] == "set":
+                key, value = args[3].split("=", 1)
+                self.grubenv[key] = value
+            elif args[2] == "unset":
+                self.grubenv.pop(args[3], None)
+            else:
+                raise AssertionError(args)
+            if self.fail and self.fail in args:
+                self.fail = None
+                raise installer.Incompatible("injected GRUB failure")
+            return ""
         raise AssertionError(args)
 
+    def bios(self):
+        """The same machine booted by BIOS GRUB (e.g. a DigitalOcean droplet)."""
+        shutil.rmtree(self.path("/sys/firmware/efi"), ignore_errors=True)
+        self.write("/proc/cmdline", "BOOT_IMAGE=/boot/vmlinuz root=UUID=1234-abcd ro console=ttyS0")
+        self.write("/boot/grub/grub.cfg",
+                   "if [ \"${next_entry}\" ] ; then\n   set default=\"${next_entry}\"\nfi\n"
+                   "if [ -f  ${config_directory}/custom.cfg ]; then\n  source ${config_directory}/custom.cfg\nfi\n")
+        self.write("/boot/grub/grubenv", "# GRUB Environment Block\n" + "#" * 998)
+        self.grubenv = {"saved_entry": "0"}
+        mbr = bytearray(512)
+        mbr[0x188:0x18d] = b"GRUB "
+        mbr[510:] = b"\x55\xaa"
+        self.write("/dev/vda", bytes(mbr))
 
-class InstallerTests(unittest.TestCase):
+
+class Harness(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -169,6 +202,8 @@ class InstallerTests(unittest.TestCase):
         installer.commit(plan or self.check(), self.package(), self.root / "new.efi", "vtest", default,
                          root=self.root, command=self.machine.command)
 
+
+class InstallerTests(Harness):
     def test_supported_machine_and_read_only_preflight(self):
         before = sorted(str(p) for p in self.root.rglob("*"))
         plan = self.check()
@@ -477,6 +512,238 @@ class InstallerTests(unittest.TestCase):
         self.assertIn(b"BootNext", result.stdout)
         result = subprocess.run(["bash", "-s", "--", "--unknown"], input=script, capture_output=True)
         self.assertEqual(result.returncode, 2)
+
+
+def elf(multiboot2=False):
+    header = bytearray(4096)
+    header[:6] = b"\x7fELF\x02\x01"
+    struct.pack_into("<H", header, 18, 0x3E)
+    if multiboot2:
+        struct.pack_into("<I", header, 0x1000 - 32, 0xE85250D6)
+    return bytes(header)
+
+
+class BiosInstallerTests(Harness):
+    def setUp(self):
+        super().setUp()
+        self.machine.bios()
+
+    def bios_package(self):
+        bios = self.root / "bios"
+        for name in ("grub.cfg", "kmods.erofs"):
+            self.machine.write("/bios/" + name, "release " + name)
+        for name in ("l4h-root.elf", "vmlinux"):
+            self.machine.write("/bios/" + name, elf())
+        for variant in ("generic", "xapic-nopcid"):
+            self.machine.write("/bios/kernel-" + variant + ".elf", elf(True) + variant.encode())
+        return bios
+
+    def commit(self, plan=None, default=False, command=None):
+        installer.commit(plan or self.check(), self.package(), self.bios_package(), "vtest", default,
+                         root=self.root, command=command or self.machine.command)
+
+    def rejected(self, message):
+        before = dict(self.machine.grubenv)
+        super().rejected(message)
+        self.assertEqual(self.machine.grubenv, before)
+
+    def custom(self):
+        return self.machine.path("/boot/grub/custom.cfg").read_text()
+
+    def test_supported_bios_machine_and_read_only_preflight(self):
+        before = sorted(str(p) for p in self.root.rglob("*"))
+        plan = self.check()
+        self.assertEqual((plan["firmware"], plan["grubdir"], plan["grub_tool"]), ("bios", "/boot/grub", "grub-editenv"))
+        self.assertEqual((plan["boot_uuid"], plan["boot_fstype"], plan["grub_dir"]), ("1234-abcd", "ext4", "/boot/l4h"))
+        self.assertNotIn("esp", plan)
+        self.assertIn("root=UUID=1234-abcd", installer.configuration(plan))
+        self.assertFalse(any(c[0] == "efibootmgr" for c in self.machine.calls))
+        self.assertEqual(before, sorted(str(p) for p in self.root.rglob("*")))
+
+    def test_separate_boot_partition(self):
+        self.machine.blocks.append(dict(name="/dev/vda3", type="part", pkname="/dev/vda", fstype="xfs",
+                                        uuid="5678-boot", **{"maj:min": "252:3"}))
+        self.machine.mounts.append(dict(source="/dev/vda3", target="/boot", fstype="xfs", options="rw",
+                                        **{"maj:min": "252:3"}))
+        self.machine.fstab.append(dict(source="UUID=5678-boot", target="/boot", fstype="xfs", options="defaults"))
+        plan = self.check()
+        self.assertEqual((plan["boot_uuid"], plan["boot_fstype"], plan["grub_dir"]), ("5678-boot", "xfs", "/l4h"))
+        entry = installer.grub_entry(plan, False)
+        self.assertIn("insmod xfs\n", entry)
+        self.assertIn("search --no-floppy --fs-uuid --set=root 5678-boot\n    set l4h=($root)/l4h\n", entry)
+
+    def test_boot_filesystem_must_be_readable_and_writable_by_grub(self):
+        self.machine.mounts.append(dict(self.machine.mounts[0], target="/boot", fstype="vfat"))
+        self.rejected("ext2/3/4 or XFS")
+
+    def test_grub_must_be_in_the_mbr_and_boot_linux(self):
+        self.machine.write("/dev/vda", bytes(510) + b"\x55\xaa")
+        self.rejected("MBR does not hold GRUB")
+        self.machine.bios()
+        self.machine.write("/proc/cmdline", "root=UUID=1234-abcd ro")
+        self.rejected("booted by GRUB")
+
+    def test_grub_configuration_must_come_from_grub_mkconfig(self):
+        self.machine.write("/boot/grub/grub.cfg", "linux /vmlinuz\n")
+        self.rejected("grub-mkconfig")
+        self.machine.bios()
+        self.machine.write("/boot/grub2/grub.cfg", "")
+        self.rejected("exactly one")
+        self.machine.path("/boot/grub2/grub.cfg").unlink()
+        self.machine.path("/boot/grub/grubenv").unlink()
+        self.rejected("environment block")
+
+    def test_unmanaged_custom_cfg_and_pending_next_entry(self):
+        self.machine.write("/boot/grub/custom.cfg", "menuentry 'Mine' {}\n")
+        self.rejected("custom.cfg exists")
+        self.machine.path("/boot/grub/custom.cfg").unlink()
+        self.machine.grubenv["next_entry"] = "1"
+        self.rejected("next_entry is already set")
+
+    def test_unmanaged_files(self):
+        self.machine.write("/boot/l4h/l4h.conf", "")
+        self.rejected("unmanaged L4H files")
+
+    def test_esp_is_not_needed(self):
+        self.machine.mounts.append(dict(self.machine.mounts[1], target="/efi"))
+        self.check()  # BIOS GRUB does not use an ESP.
+
+    def test_install_selects_l4h_once_and_preserves_native_files(self):
+        self.machine.write("/boot/vmlinuz", "native kernel")
+        self.commit()
+        self.assertEqual(self.machine.grubenv, {"saved_entry": "0", "next_entry": "l4h"})
+        self.assertEqual(self.machine.path("/boot/vmlinuz").read_text(), "native kernel")
+        bios = self.machine.path("/boot/l4h/bios")
+        self.assertEqual(sorted(p.name for p in bios.iterdir()),
+                         ["grub.cfg", "kernel.elf", "kmods.erofs", "l4h-root.elf", "vmlinux"])
+        self.assertTrue((bios / "kernel.elf").read_bytes().endswith(b"generic"))
+        self.assertEqual(self.machine.path("/boot/l4h/dom0/initrd").read_text(), "release install/initrd")
+        self.assertIn("dom0_mem_mb=", self.machine.path("/boot/l4h/l4h.conf").read_text())
+        custom = self.custom()
+        self.assertTrue(custom.startswith(installer.GENERATED))
+        self.assertIn("menuentry 'L4H' --id l4h {\n", custom)
+        self.assertIn("search --no-floppy --fs-uuid --set=root 1234-abcd\n    set l4h=($root)/boot/l4h\n", custom)
+        self.assertIn('source "$l4h/bios/grub.cfg"\n', custom)
+        self.assertNotIn("set default", custom)
+        state = json.loads(self.machine.path(installer.STATE).read_text())
+        self.assertEqual(state, dict(firmware="bios", grubdir="/boot/grub", default=False, release="vtest"))
+        self.assertFalse(any(c[0] in ("efibootmgr", "reboot", "grub-install", "update-grub", "grub-mkconfig")
+                             for c in self.machine.calls))
+
+    def test_xapic_variant_kernel(self):
+        cpu = self.machine.path("/proc/cpuinfo")
+        cpu.write_text(cpu.read_text().replace("pcid", ""))
+        self.commit()
+        self.assertTrue(self.machine.path("/boot/l4h/bios/kernel.elf").read_bytes().endswith(b"xapic-nopcid"))
+
+    def test_update_reuses_entry_and_backup(self):
+        self.commit()
+        self.commit()
+        self.assertEqual(self.machine.grubenv["next_entry"], "l4h")
+        self.assertEqual(len(list(self.machine.path("/var/lib/l4h/backups").iterdir())), 2)
+
+    def test_entry_without_state(self):
+        self.commit()
+        self.machine.path(installer.STATE).unlink()
+        self.rejected("not managed by this installer")
+
+    def test_make_default_and_a_later_trial(self):
+        self.commit(default=True)
+        self.assertEqual(self.machine.grubenv, {"saved_entry": "0"})
+        self.assertIn('if [ -z "$boot_once" ]; then set default=l4h; fi\n', self.custom())
+        # A later installation without --make-default keeps L4H the default,
+        # as BootOrder does; next_entry would add nothing.
+        self.commit()
+        self.assertIn("set default=l4h", self.custom())
+        self.assertEqual(self.machine.grubenv, {"saved_entry": "0"})
+
+    def test_grub_env_failure_rolls_back_and_allows_retry(self):
+        original = dict(self.machine.grubenv)
+        self.machine.fail = "set"
+        with self.assertRaisesRegex(installer.Incompatible, "injected"):
+            self.commit()
+        self.assertEqual(self.machine.grubenv, original)
+        self.assertFalse(self.machine.path(installer.STATE).exists())
+        self.assertFalse(self.machine.path("/boot/l4h").exists())
+        self.assertFalse(self.machine.path("/boot/grub/custom.cfg").exists())
+        self.check()
+
+    def test_update_failure_restores_existing_payload(self):
+        self.commit()
+        before = self.custom()
+        self.machine.write("/boot/l4h/l4h.conf", "old configuration")
+        self.machine.fail = "set"
+        with self.assertRaises(installer.Incompatible):
+            self.commit()
+        self.assertEqual(self.machine.path("/boot/l4h/l4h.conf").read_text(), "old configuration")
+        self.assertEqual(self.custom(), before)
+        self.assertEqual(self.machine.grubenv["next_entry"], "l4h")
+
+    def test_disk_full_before_grub(self):
+        plan = self.check()
+        with patch.object(installer.shutil, "disk_usage") as usage:
+            usage.return_value.free = 0
+            with self.assertRaisesRegex(installer.Incompatible, "free space on /boot"):
+                self.commit(plan)
+        self.assertNotIn("next_entry", self.machine.grubenv)
+        self.assertFalse(self.machine.path("/var/lib/l4h").exists())
+
+    def test_file_copy_failure_before_grub(self):
+        real_copy = installer.atomic_copy
+        def copy_or_fail(source, dest, mode):
+            if dest.name == "initrd":
+                raise OSError("disk full")
+            real_copy(source, dest, mode)
+        with patch.object(installer, "atomic_copy", side_effect=copy_or_fail):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                self.commit()
+        self.assertNotIn("next_entry", self.machine.grubenv)
+        self.assertFalse(self.machine.path("/boot/l4h").exists())
+        self.assertFalse(self.machine.path("/boot/grub/custom.cfg").exists())
+
+    def test_changed_grub_env_before_commit(self):
+        plan = self.check()
+        self.machine.grubenv["next_entry"] = "1"
+        with self.assertRaisesRegex(installer.Incompatible, "changed during"):
+            self.commit(plan)
+        self.assertFalse(self.machine.path("/boot/l4h").exists())
+
+    def test_bad_download_checksum(self):
+        self.args.release = "vtest"
+        self.args.checksums = self.root / "SHA256SUMS"
+        self.args.checksums.write_text("0" * 64 + "  l4h-bios-x86_64.tar.xz\n")
+        with patch.object(installer, "run", return_value=""):
+            with self.assertRaisesRegex(installer.Incompatible, "checksum mismatch"):
+                (self.root / "l4h-bios-x86_64.tar.xz").write_text("corrupt")
+                installer.download_bios(self.args, self.check(), self.root)
+
+    def test_bios_package_unpacking(self):
+        bios = self.bios_package()
+        for kind in ("good", "traversal", "symlink", "no-kernel", "no-multiboot"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as temp:
+                work = Path(temp)
+                archive = work / "l4h-bios-x86_64.tar.xz"
+                with tarfile.open(archive, "w:xz") as tar:
+                    for file in sorted(bios.iterdir()):
+                        if kind == "no-kernel" and file.name == "kernel-generic.elf":
+                            continue
+                        data = elf() if kind == "no-multiboot" and file.name.startswith("kernel-") else file.read_bytes()
+                        info = tarfile.TarInfo("l4h-bios-x86_64/" + file.name)
+                        info.size = len(data)
+                        tar.addfile(info, io.BytesIO(data))
+                    if kind in ("traversal", "symlink"):
+                        info = tarfile.TarInfo("l4h-bios-x86_64/../escape" if kind == "traversal" else "l4h-bios-x86_64/link")
+                        if kind == "symlink":
+                            info.type = tarfile.SYMTYPE
+                            info.linkname = "/etc/passwd"
+                        tar.addfile(info, io.BytesIO(b""))
+                if kind == "good":
+                    out = installer.unpack_bios(archive, work, "generic")
+                    self.assertEqual((out / "vmlinux").read_bytes(), elf())
+                else:
+                    with self.assertRaisesRegex(installer.Incompatible, "unsafe|lacks|multiboot2"):
+                        installer.unpack_bios(archive, work, "generic")
+                    self.assertFalse((work / "escape").exists())
 
 
 if __name__ == "__main__":

@@ -2037,7 +2037,8 @@ named modules (`guest-kernel`, `guest-kmods`, `dom0-initrd`,
   ships as one UEFI application per seL4 variant (§10), the same for every
   host. GRUB passes the guest kernel and its module tree from its memdisk,
   and `/l4h/dom0/initrd` and `/l4h/l4h.conf` from the partition, as boot
-  modules. seL4 keeps them intact (patch 0021); root maps them for good,
+  modules. On BIOS, GRUB passes the same files from a directory on a
+  filesystem (§10). seL4 keeps them intact (patch 0021); root maps them for good,
   since restarting dom0 loads them again. QEMU's multiboot `-initrd` can
   pass the same modules.
 - **Root's own ELF** (x86_64 and aarch64; aarch64 has no boot loader
@@ -2202,7 +2203,9 @@ The chain has four links.
    (§10), so one digest covers the whole host. GRUB's `tpm` module measures
    dom0's kernel, initramfs and `l4h.conf` into PCR 9, and its commands
    into PCR 8. Secure Boot is not needed: nothing is checked at boot, the
-   verifier checks afterwards.
+   verifier checks afterwards. A BIOS boot (§10) measures none of this:
+   BIOS GRUB has no `tpm` module, so such a host's quotes say nothing
+   about what it booted.
 2. **The host key.** `l4h-trustd` is the only component that maps the
    TPM. Root finds the TPM in the ACPI `TPM2` table (see **TPM interfaces**
    below); trustd polls it at locality 0, sleeping on its kernel timer
@@ -2493,6 +2496,30 @@ The TPM enables signing; it does not decide whether seals work (§9.2).
   `$cmdpath` is empty under OVMF, the first partition with
   `/l4h/dom0/initrd` (§9.1). Initramfs images for other guests come
   through the dom0 API.
+- **BIOS.** BIOS → GRUB (i386-pc) → multiboot2, for clouds whose VMs boot
+  only with BIOS (SeaBIOS), such as DigitalOcean. BIOS GRUB's core image is
+  read through the BIOS into conventional memory and must stay within a
+  few hundred KiB, so it cannot hold l4h as the UEFI application's memdisk
+  does. `tools/mkbios.sh` builds l4h's files instead: the seL4 kernel,
+  `l4h-root`, the guest kernel, its module tree and `grub.cfg`, which
+  boots them like the UEFI application's script. They live in `bios/` of
+  a directory `$l4h` that also holds `dom0/initrd` and `l4h.conf`, and the
+  GRUB that runs `grub.cfg` sets `$l4h` first. Two GRUBs do:
+  - the disk image's own (`tools/mkimage.sh`): its boot sector is in the
+    MBR and its core image, with every module `grub.cfg` needs, in a BIOS
+    boot partition. The core image finds the ESP by its volume serial
+    and uses its `/l4h`. mkimage.sh writes the boot sector and the core
+    image's block list itself, as `grub-bios-setup` would, so that it
+    needs no loop device.
+  - the distribution's, through a `custom.cfg` menu entry that the Linux
+    installer writes, with `$l4h` at `/boot/l4h` (§9.1, the manual).
+
+  `grub.cfg` loads `vbe`, so multiboot2 sets up the framebuffer the kernel
+  asks for (patch 0011) for the dashboard and `fb_console`. seL4 finds the
+  ACPI tables in GRUB's multiboot2 tags, and the serial port is passed
+  explicitly as on UEFI. Nothing else differs: the kernel, root and the
+  components do not depend on the firmware. There is no measured boot
+  (§9.2).
 - **Variants.** The application is the same for every host except for
   seL4 options fixed at build time. `tools/build-efi.sh` builds the
   shipped ones into `build/efi/`: `l4h-generic.efi` (x2APIC, PCID: QEMU,
@@ -2503,6 +2530,8 @@ The TPM enables signing; it does not decide whether seals work (§9.2).
   only, and attaches to the GitHub release of each pushed `v*` tag, with
   `SHA256SUMS`:
   - both applications, in release mode;
+  - `l4h-bios-x86_64.tar.xz`: l4h's BIOS files (`tools/mkbios.sh`), with
+    each variant's kernel as `kernel-VARIANT.elf`, for the installer;
   - `l4h-dom0-x86_64.tar.xz` (`tools/build-dom0.sh`): the `ARCH=l4h`
     kernel without debug information, its config, a static `l4hctl` and
     an example `l4h.conf`, for a dom0 of any distribution;
@@ -2572,20 +2601,26 @@ The TPM enables signing; it does not decide whether seals work (§9.2).
 
 **Status (v1).**
 
-- **Image.** `tools/mkimage.sh` builds a GPT disk image. Its EFI system
+- **Image.** `tools/mkimage.sh` builds a GPT disk image that boots under
+  UEFI and BIOS: the ESP from 1 MiB, then a 1 MiB BIOS boot partition with
+  BIOS GRUB's core image, and its boot sector in the MBR. The EFI system
   partition holds:
   - `EFI/BOOT/BOOTX64.EFI`, the l4h application (`tools/mkefi.sh`): GRUB
     with the seL4 kernel, loaded with `multiboot2` and
     `console_port=0x3f8 debug_port=0x3f8` (or `serial_port`), because
     UEFI firmware need not fill in the BIOS data area that seL4 otherwise
     reads the port from, and `l4h-root` as the first `module2`;
+  - `/l4h/bios`, l4h's BIOS files (`tools/mkbios.sh`);
   - optionally `/l4h/dom0/initrd` and `/l4h/l4h.conf` (`-i`, `-c`), the
-    later `module2`s.
+    later `module2`s of both boot paths.
 - **Local test.** `tests/run-uefitest.sh` boots that image the way GCE
   would, under OVMF on a q35 machine: NVMe boot disk, virtio-net NIC, KVM
   without VMX. dom0's initramfs and an `l4h.conf` (which
   sets dom0's command line and keeps the boot disk from it) come from the
   EFI partition. dom0 gets DHCP through the virtio-net uplink.
+  `tests/run-biostest.sh` boots the same image as a DigitalOcean droplet
+  would: SeaBIOS on an i440fx machine, a transitional virtio-blk boot disk
+  and virtio-net NIC; it also checks the dashboard's VBE framebuffer.
 - **Deployment.** `tools/gce-image.sh` packages the image as
   `disk.raw.tar.gz` and prints the `gcloud` import and instance commands
   (N2, `nic-type=VIRTIO_NET`; `nic-type=GVNIC` on C3 and later; image
@@ -2820,7 +2855,7 @@ l4h/
   host/              Rust workspace: l4h-abi, l4h-host, l4h-rt, l4h-root, l4h-vmm, l4h-blkd, l4h-netd, l4h-trustd, l4h-virtio
   tools/l4hctl/      dom0 userspace CLI and library for the control API
   third_party/sddf/  submodule (design reference; no linked C drivers)
-  tools/             build-kernel.sh, build-linux.sh, build-kmods.sh (the guest kernel's module tree), build-host.sh, mkefi.sh (UEFI application), build-efi.sh (its variants), add-modules.py (the guest kernel and dom0 into a built root), mkimage.sh (UEFI disk), run-qemu.sh, mkinitramfs.sh, l4h-attest.py (attestation verifier), swtpm.sh (a software TPM for QEMU)
+  tools/             build-kernel.sh, build-linux.sh, build-kmods.sh (the guest kernel's module tree), build-host.sh, mkefi.sh (UEFI application), build-efi.sh (its variants), add-modules.py (the guest kernel and dom0 into a built root), mkbios.sh (BIOS files), mkimage.sh (UEFI and BIOS disk), run-qemu.sh, run-uefi.sh, run-bios.sh, mkinitramfs.sh, l4h-attest.py (attestation verifier), swtpm.sh (a software TPM for QEMU)
   tests/             host-level integration tests driven by QEMU + expect-style console scripting
 ```
 

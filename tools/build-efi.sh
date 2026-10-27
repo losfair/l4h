@@ -8,6 +8,9 @@
 #   xapic-nopcid  xAPIC, no PCID: machines whose firmware leaves x2APIC off
 #                 and CPUs without PCID (Latitude.sh m4.metal.small)
 # L4H_RELEASE=1 builds release kernels and host components.
+# build/efi/l4h-bios-x86_64.tar.xz holds l4h's files for BIOS machines
+# (tools/mkbios.sh), with each variant's kernel as kernel-VARIANT.elf; the
+# Linux installer installs one as kernel.elf.
 # build/efi/l4h-debug-x86_64.tar.xz holds the same build unstripped (root,
 # the components, each variant's kernel and the guest kernel, vmlinux), to
 # decode fault addresses from a shipped application; verifiers compute
@@ -45,4 +48,14 @@ for v in "${variants[@]}"; do
     cp "$root/build/sel4-$name/bin/kernel.elf" "$debug/l4h-debug-x86_64/kernel-$name.elf"
 done
 tar -C "$debug" -cJf "$out/l4h-debug-x86_64.tar.xz" l4h-debug-x86_64
-echo "$out/l4h-debug-x86_64.tar.xz: $(( $(stat -c %s "$out/l4h-debug-x86_64.tar.xz") >> 10 )) KiB"
+bios=$debug/l4h-bios-x86_64
+"$root/tools/mkbios.sh" "$bios" "$root/host/target/x86_64-sel4-roottask/debug/l4h-root.elf" >/dev/null
+rm "$bios/kernel.elf"
+for v in "${variants[@]}"; do
+    read -r name _ <<<"$v"
+    cp "$root/build/sel4-$name/bin/kernel.elf" "$bios/kernel-$name.elf"
+done
+tar -C "$debug" -cJf "$out/l4h-bios-x86_64.tar.xz" l4h-bios-x86_64
+for f in l4h-debug-x86_64.tar.xz l4h-bios-x86_64.tar.xz; do
+    echo "$out/$f: $(( $(stat -c %s "$out/$f") >> 10 )) KiB"
+done

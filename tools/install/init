@@ -4,8 +4,9 @@ export PATH=/bin:/sbin:/usr/bin:/usr/sbin
 fail() {
     echo "l4h: $*; rebooting in 20 seconds (a one-time trial returns to native Linux)" >&2
     sleep 20
-    # reboot(2) restarts only dom0. Reset the host to consume the trial's
-    # BootNext selection and return to the native firmware boot order.
+    # reboot(2) restarts only dom0. Reset the host: the trial's one-time
+    # selection (BootNext, or GRUB's next_entry) is consumed, so the machine
+    # returns to native Linux.
     l4hctl host-reboot || echo 'l4h: automatic host reset failed; reset the machine manually' >&2
     while :; do sleep 60; done
 }

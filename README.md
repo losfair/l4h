@@ -70,8 +70,11 @@ Third-party components, including the submodules in `kernel/seL4` and
   image for GCE (`tools/mkimage.sh`, `tools/gce-image.sh`; tested on N2 and
   C3 with `tests/gce-test.sh`), and a private UEFI/ENA AMI for AWS EC2
   (`tools/ec2-image.py`; tested on c6i.xlarge with ENA, NVMe and four-vCPU
-  guests; see [the EC2 workflow](tests/ec2.md)). On a host with a display
-  the UEFI image shows a read-only status dashboard.
+  guests; see [the EC2 workflow](tests/ec2.md)). The same disk image boots
+  under BIOS too, for BIOS-only clouds such as DigitalOcean: BIOS GRUB loads
+  l4h's files (`tools/mkbios.sh`) from the EFI system partition
+  (`tools/run-bios.sh`, `tests/run-biostest.sh`). On a host with a display
+  the image shows a read-only status dashboard.
 - **Attestation.** On a host with a TPM 2.0 (FIFO, CRB, AMD fTPM through
   the firmware's ACPI `_DSM`, or Pluton), `l4h-trustd` has the TPM
   quote its signing key along with the measured boot (the l4h application,
@@ -101,8 +104,9 @@ third_party/         rust-sel4, sDDF, kemu submodules; patches/ for rust-sel4
 
 ## Installing under an existing Linux
 
-On a supported **x86_64, 64-bit UEFI** machine, the installer boots your
-existing Linux userspace as dom0 with L4H's paravirtual kernel:
+On a supported **x86_64** machine, booted with **64-bit UEFI or BIOS
+GRUB** (as on DigitalOcean and many smaller VPS providers), the installer
+boots your existing Linux userspace as dom0 with L4H's paravirtual kernel:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/losfair/l4h/main/tools/install.sh | bash
@@ -113,8 +117,8 @@ yum, and downloads a tagged GitHub release with SHA-256 verification.
 The release must include the installer (older releases are rejected).
 No source build or hardware virtualization extensions are needed.
 
-Preflight checks CPU features, Meltdown status, Secure Boot, EFI variables,
-the ESP, storage, network and userspace. Automatic migration currently
+Preflight checks CPU features, Meltdown status, Secure Boot, EFI variables
+and the ESP (UEFI) or GRUB (BIOS), storage, network and userspace. Automatic migration currently
 supports headless systemd installations with a plain ext4/XFS root,
 NVMe namespace 1 or supported virtio disks, and one or two physical
 virtio-net, gVNIC, ENA or Intel X550 NICs. Each NIC becomes the uplink of its
@@ -146,7 +150,18 @@ curl -fsSL https://raw.githubusercontent.com/losfair/l4h/main/tools/install.sh |
     bash -s -- --release vYYYY.MM.N --esp /boot/efi --memory 2048 --vcpus 2
 ```
 
-For recovery, select native Linux in the firmware boot menu. From native
+On a **BIOS** machine the installer writes L4H's files to `/boot/l4h`
+and an `L4H` entry to the distribution's GRUB `custom.cfg`, and selects it
+once with GRUB's `next_entry` (`grub-editenv`); it does not run
+`grub-install` or `update-grub`. GRUB clears `next_entry` before it boots
+L4H, so the next reset returns to native Linux. `--make-default` makes the
+entry the default instead. From native Linux or dom0, `sudo grub-reboot 0`
+followed by `sudo l4hctl host-reboot` boots native Linux once; deleting
+`/boot/grub/custom.cfg` removes the entry. It needs `/boot` on ext2/3/4 or
+XFS and a `grub.cfg` from `grub-mkconfig`. BIOS hosts have no measured
+boot, so their attestation reports do not cover what booted.
+
+For recovery on UEFI, select native Linux in the firmware boot menu. From native
 Linux, `sudo efibootmgr` shows the L4H entry; cancel its pending trial with
 `sudo efibootmgr --delete-bootnext`, or remove its entry with
 `sudo efibootmgr --bootnum XXXX --delete-bootnum` (substitute the L4H entry
@@ -165,7 +180,8 @@ The host needs:
   kemu in the x86_64 guest kernel (`rustup component add rust-src` and
   `cargo install --locked bindgen-cli --version 0.71.1`);
 - busybox, e2fsprogs and erofs-utils;
-- for the UEFI image: GRUB EFI, mtools, sfdisk and OVMF;
+- for the disk image: GRUB EFI and BIOS (`grub-efi-amd64-bin`,
+  `grub-pc-bin`), mtools, sfdisk and OVMF;
 - for aarch64: `gcc-aarch64-linux-gnu`, cross libc headers,
   `qemu-system-arm` and a static AArch64 BusyBox for guest initramfs images.
   `tools/ci-setup.sh aarch64` prepares these on Debian 13 (run as root).
@@ -277,6 +293,7 @@ without it, the host reports `unknown`.
 | `tests/run-hotplugstress.sh [rounds]` | memory hotplug under stress: three VMs under memory load resized at random, oversubscribing the host, destroyed mid-resize; data checked, all memory back |
 | `tests/run-monitor.sh` | serial monitor (`list`, `restart-dom0`), continued operation with an absent UART |
 | `tests/run-uefitest.sh` | UEFI/GRUB boot image with NVMe and virtio-net, as on GCE |
+| `tests/run-biostest.sh` | the same image under SeaBIOS with virtio-blk, virtio-net and a VBE framebuffer, as on DigitalOcean |
 | `tests/run-xentest.sh` | two l4h partitions as Xen HVM guests, nested in KVM, each with a passed-through NIC, ping each other (DESIGN.md §10.2) |
 | `tests/run-attesttest.sh` | attestation with swtpm over CRB, FIFO and the AMD fTPM ACPI start method: reports on dom0 and a guest, host evidence, AK credential |
 | `tests/run-debian.sh`, `tests/run-workload.sh` | Debian + systemd, fio verify, parallel build, fsck (`tests/mkdebian.sh` first) |
