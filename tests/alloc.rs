@@ -16,6 +16,31 @@ pub const MAX_GUEST_DEVICES: usize = 16;
 pub const CNODE_SLOTS: usize = 1 << 19;
 pub use init_thread::slot;
 
+pub const NUM_MESSAGE_REGISTERS: usize = 120;
+
+pub struct IpcBuffer {
+    msg: [u64; NUM_MESSAGE_REGISTERS],
+}
+
+impl IpcBuffer {
+    pub fn msg_regs(&self) -> &[u64] { &self.msg }
+    pub fn msg_regs_mut(&mut self) -> &mut [u64] { &mut self.msg }
+}
+
+thread_local! {
+    static IPC_BUFFER: std::cell::RefCell<IpcBuffer> = const {
+        std::cell::RefCell::new(IpcBuffer { msg: [0; NUM_MESSAGE_REGISTERS] })
+    };
+}
+
+pub fn with_ipc_buffer<R>(f: impl FnOnce(&IpcBuffer) -> R) -> R {
+    IPC_BUFFER.with_borrow(f)
+}
+
+pub fn with_ipc_buffer_mut<R>(f: impl FnOnce(&mut IpcBuffer) -> R) -> R {
+    IPC_BUFFER.with_borrow_mut(f)
+}
+
 #[macro_export]
 macro_rules! debug_println {
     ($($arg:tt)*) => { println!($($arg)*) };
@@ -43,7 +68,11 @@ impl<T> Cap<T> {
     pub fn bits(&self) -> u64 { self.0 }
     pub fn absolute_cptr<U>(&self, _: U) -> AbsoluteCPtr { AbsoluteCPtr }
     pub fn absolute_cptr_for_self(&self) -> AbsoluteCPtr { AbsoluteCPtr }
-    pub fn untyped_retype(&self, _: &ObjectBlueprint, _: &AbsoluteCPtr, _: usize, _: usize) -> Result<(), ()> { Ok(()) }
+    pub fn untyped_retype(&self, _: &ObjectBlueprint, _: &AbsoluteCPtr, _: usize, _: usize) -> Result<(), ()> {
+        // Kernel invocations marshal their arguments into the IPC buffer.
+        with_ipc_buffer_mut(|b| b.msg_regs_mut()[..6].fill(0xdead_beef));
+        Ok(())
+    }
 }
 
 pub mod cap {
@@ -121,6 +150,10 @@ pub mod memd {
     pub const BLOCK_BITS: usize = 21;
     pub const XCHG_SLOTS: usize = 32;
 
+    thread_local! {
+        pub static GRANTS: std::cell::RefCell<Vec<Option<usize>>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
     #[derive(Clone, Copy)]
     pub struct MemdLink;
     pub struct Status {
@@ -131,7 +164,13 @@ pub mod memd {
 
     impl MemdLink {
         pub fn status(&self) -> Status { panic!("no memd in this test") }
-        pub fn alloc(&self, _: usize, _: usize) -> Option<usize> { panic!("no memd in this test") }
+        pub fn alloc(&self, _: usize, _: usize) -> Option<usize> {
+            let paddr = GRANTS.with_borrow_mut(|g| g.pop().expect("unexpected memd allocation"));
+            crate::with_ipc_buffer_mut(|b| {
+                b.msg_regs_mut()[..2].copy_from_slice(&[if paddr.is_some() { 0 } else { u64::MAX }, paddr.unwrap_or(0) as u64]);
+            });
+            paddr
+        }
         pub fn free(&self, _: &[(crate::cap::Untyped, usize, usize)]) { panic!("no memd in this test") }
     }
 }
@@ -241,4 +280,28 @@ fn arena_growth_on_fragmented_memory_and_reclaim() {
     assert!(arena.pool.regions.len() < 48);
     alloc.reclaim(arena);
     assert_eq!(alloc.free_bytes(), 512 << 20);
+
+    // Root and vmmgr refill after receiving a request or fault, before
+    // reading its registers.  Keep a nonzero guest id and POWER_OFF in
+    // the request, plus a full payload, across local splitting and memd
+    // calls (including both failed grant attempts).
+    let mut request: [u64; NUM_MESSAGE_REGISTERS] = core::array::from_fn(|i| 0x1234_0000 + i as u64);
+    request[0] = 7;
+    request[1] = 0;
+    with_ipc_buffer_mut(|b| b.msg_regs_mut().copy_from_slice(&request));
+    let boot = BootInfo(vec![Desc { paddr: 1 << 30, bits: 25 }]);
+    let mut alloc = alloc.renew(&boot);
+    with_ipc_buffer(|b| assert_eq!(b.msg_regs(), &request));
+    assert_eq!(alloc.pool.free_bytes(), 16 << 20);
+
+    for grant in [Some(1 << 30), None] {
+        alloc = alloc.renew(&BootInfo(vec![]));
+        alloc.memd = Some(memd::MemdLink);
+        memd::GRANTS.with_borrow_mut(|g| *g = if grant.is_some() { vec![grant] } else { vec![None, None] });
+        with_ipc_buffer_mut(|b| b.msg_regs_mut().copy_from_slice(&request));
+        alloc.refill();
+        with_ipc_buffer(|b| assert_eq!(b.msg_regs(), &request));
+        assert_eq!(alloc.pool.free_bytes(), if grant.is_some() { 16 << 20 } else { 0 });
+        memd::GRANTS.with_borrow(|g| assert!(g.is_empty()));
+    }
 }

@@ -404,11 +404,15 @@ impl Alloc {
         a
     }
 
-    /// Keep the small-object pool stocked.
+    /// Keep the small-object pool stocked, preserving message registers.
     pub fn refill(&mut self) {
         if self.pool.free_bytes() >= 1 << (SMALL_POOL_BITS - 1) {
             return;
         }
+        // Root and vmmgr refill before dispatching received calls and
+        // faults.  Both kernel invocations and calls to memd overwrite
+        // the IPC buffer, so keep the incoming message across this work.
+        let regs: [u64; sel4::NUM_MESSAGE_REGISTERS] = sel4::with_ipc_buffer(|b| b.msg_regs().try_into().unwrap());
         // Regions too full to be of use leave the pool; their objects
         // stay, as global objects do.
         self.pool.regions.retain(|r| r.size() - r.used >= 4096);
@@ -423,6 +427,7 @@ impl Alloc {
             }
             None => self.slots.global(|sl| sl.free(s)),
         }
+        sel4::with_ipc_buffer_mut(|b| b.msg_regs_mut().copy_from_slice(&regs));
     }
 
     fn local_bytes(&self) -> usize {
