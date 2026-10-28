@@ -106,7 +106,7 @@ const _: Option<ObjectBlueprintArch> = None;
 pub fn flush_tlb_bitmap(vspace: cap::VSpace) {
     let err = sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_X64_PML4_Flush(vspace.bits()));
     if err != 0 {
-        sel4::debug_println!("l4h-task: PML4_Flush({:#x}) failed: {}", vspace.bits(), err);
+        log!("l4h-task: PML4_Flush({:#x}) failed: {}", vspace.bits(), err);
     }
 }
 

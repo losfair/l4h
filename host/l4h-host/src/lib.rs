@@ -14,6 +14,7 @@ pub mod blk;
 pub mod fixed;
 pub mod gpu;
 pub mod iopool;
+pub mod log;
 pub mod memd;
 pub mod net;
 pub mod trust;
@@ -23,6 +24,7 @@ pub mod vmmgr;
 /// synchronous serial write by the seL4 kernel, which stalls the core for
 /// the whole message, so release builds (`L4H_RELEASE=1` when the host is
 /// built) print critical errors only; informational messages use `info!`.
+/// Both kinds are retained in the shared host log ring in every build.
 pub const VERBOSE: bool = match option_env!("L4H_RELEASE") {
     Some(v) => !matches!(v.as_bytes(), [b'1']),
     None => true,

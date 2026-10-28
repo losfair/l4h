@@ -585,7 +585,7 @@ impl Alloc {
             }
             if pin(paddr) || self.blocks.is_full() {
                 if !pin(paddr) {
-                    sel4::debug_println!("l4h-task: free block table full, {} KiB lost", (1usize << bits) >> 10);
+                    log!("l4h-task: free block table full, {} KiB lost", (1usize << bits) >> 10);
                 }
                 pinned += 1 << bits;
                 continue;

@@ -440,7 +440,7 @@ impl Mem {
         }
         if !dev.done(wait) {
             if wait {
-                sel4::debug_println!("memd: balloon: the device holds a free page report too long");
+                l4h_rt::log!("memd: balloon: the device holds a free page report too long");
             }
             return;
         }

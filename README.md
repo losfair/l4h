@@ -287,6 +287,7 @@ Inside dom0, `l4hctl help` lists the control commands, for example:
 
 ```sh
 l4hctl version                       # running host's version, e.g. v2026.10.1
+l4hctl logs --follow                 # retained host diagnostics and VM stop reasons
 l4hctl create web --initrd /web.cpio.gz --mem 512 --vcpus 2 \
     --disk 0 --nic 0
 l4hctl console 1 --follow
@@ -308,7 +309,8 @@ without it, the host reports `unknown`.
 | `tests/run-flagstest.sh` | focused flags-only boot: console/display seals, kernel taints, userspace gates and instance reuse, on either architecture |
 | `tests/run-trusttest.sh` | taint/seal permissions, atomic gates, instances, seqlock snapshots and verifier policy |
 | `tests/run-alloctest.sh` | host allocator growth under fragmentation, reclaim, fixed-container panic safety and memd grant validation |
-| `tests/run-devicetest.sh [--qemu]` | console ordering, bounded sequence gaps, cursor wrap, draining and writer wakeups; memory-hotplug completion and retry scheduling; control completions after manager failure; with QEMU, hypercalls under continuous console output |
+| `tests/run-devicetest.sh [--qemu]` | console ordering, bounded sequence gaps, cursor wrap, draining and writer wakeups; memory-hotplug completion and retry scheduling; control completions after manager failure; block replies across nested calls; host log wraparound and concurrent writers; with QEMU, hypercalls under continuous console output |
+| `tests/run-logtest.sh` | kernel faults, panics and shutdowns retained after VM destruction and queried/followed with l4hctl; also works with `L4H_RELEASE=1` |
 | `tests/run-abitest.sh` | guest ABI and seL4 extensions, from a module built against the module tree |
 | `python3 tests/bootmem-qemu.py` | boot RAM clearing, initial untyped watermarks, root-task entry and AArch64 TLS capture before the kernel lock; built debug kernel/root and GDB required, `L4H_ARCH=aarch64` also needs the loader and gdb-multiarch |
 | `tests/run-selftest.sh [vcpus]` | syscalls, memory, signals, fork, threads, futex, SMP stress |

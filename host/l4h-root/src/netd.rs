@@ -388,7 +388,7 @@ impl Netd {
         // netd answered free_port: a failure now is a fault since, which
         // leaves this port (reclaimed with the guest) as dead as the rest.
         if call(self.comp.service_ep, net::NETD_ADD_PORT, &[p as u64, switch as u64, mac, flags]) == u64::MAX {
-            sel4::debug_println!("l4h-root: netd failed adding port {}", p);
+            log!("l4h-root: netd failed adding port {}", p);
         }
         self.ports[p] = Some(PortInfo { vm: g.id, switch, mac });
         (chan, kick)

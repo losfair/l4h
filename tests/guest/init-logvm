@@ -1,0 +1,12 @@
+#!/bin/sh
+mount -t proc proc /proc
+mount -t devtmpfs dev /dev
+echo "LOGVM: ready"
+read -r action
+case "$action" in
+    fault) insmod /bin/l4h_log_fault.ko ;;
+    panic) insmod /bin/l4h_log_fault.ko panic_test=1 ;;
+    off) poweroff -f ;;
+esac
+echo "LOGVM: FAIL: action returned"
+while :; do sleep 10; done

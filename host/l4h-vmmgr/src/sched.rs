@@ -21,7 +21,7 @@ const COOLDOWN: u32 = 10;
 pub fn consumed(sc: sel4::cap::SchedContext) -> u64 {
     let r = sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_SchedContext_Consumed(sc.bits()));
     if r.error != 0 {
-        sel4::debug_println!("l4h-vmmgr: SchedContext_Consumed({:#x}) failed: {}", sc.bits(), r.error);
+        l4h_rt::log!("l4h-vmmgr: SchedContext_Consumed({:#x}) failed: {}", sc.bits(), r.error);
         return 0;
     }
     r.consumed
@@ -103,7 +103,7 @@ pub fn configure(info: &HostInfo, gid: usize, v: usize, vcpu: &Vcpu, cap_pct: u3
         .sched_control_configure_flags(vcpu.sc_k, budget_k, period, EXTRA_REFILLS, 0, 0)
         .and_then(|_| sc.sched_control_configure_flags(vcpu.sc_u, budget_u, period, EXTRA_REFILLS, 0, 0));
     if let Err(e) = r {
-        sel4::debug_println!("l4h-vmmgr: configure guest {} vCPU {} on core {}: {:?}", gid, v, core, e);
+        l4h_rt::log!("l4h-vmmgr: configure guest {} vCPU {} on core {}: {:?}", gid, v, core, e);
     }
     r.is_ok()
 }

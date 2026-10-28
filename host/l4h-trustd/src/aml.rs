@@ -216,7 +216,7 @@ impl acpi::Handler for Hw {
     }
     fn release(&self, _mutex: Handle) {}
     fn handle_fatal_error(&self, fatal_type: u8, fatal_code: u32, fatal_arg: u64) {
-        sel4::debug_println!("l4h-trustd: AML Fatal ({:#x}, {:#x}, {:#x})", fatal_type, fatal_code, fatal_arg);
+        l4h_rt::log!("l4h-trustd: AML Fatal ({:#x}, {:#x}, {:#x})", fatal_type, fatal_code, fatal_arg);
     }
 }
 
@@ -229,7 +229,7 @@ impl log::Log for Log {
     }
     fn log(&self, r: &log::Record) {
         if self.enabled(r.metadata()) {
-            sel4::debug_println!("l4h-trustd: aml: {}", r.args());
+            l4h_rt::log!("l4h-trustd: aml: {}", r.args());
         }
     }
     fn flush(&self) {}
@@ -276,7 +276,7 @@ fn tables(all: &[u8]) -> impl Iterator<Item = Result<&[u8], &'static str>> {
 
 fn aml_err(what: &'static str) -> impl FnOnce(AmlError) -> &'static str {
     move |e| {
-        sel4::debug_println!("l4h-trustd: {}: {:?}", what, e);
+        l4h_rt::log!("l4h-trustd: {}: {:?}", what, e);
         what
     }
 }

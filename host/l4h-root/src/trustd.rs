@@ -129,7 +129,7 @@ fn find_tpm(bootinfo: &sel4::BootInfoPtr, phys: &mut crate::acpi::Phys) -> Optio
     let method = u32::from_le_bytes(t[48..52].try_into().unwrap());
     let mut l = Layout::default();
     let unusable = |why: &str| -> Option<Layout> {
-        sel4::debug_println!("l4h-root: TPM (start method {}) unusable, no attestation: {}", method, why);
+        log!("l4h-root: TPM (start method {}) unusable, no attestation: {}", method, why);
         None
     };
     if method == 6 {
@@ -208,7 +208,7 @@ pub fn spawn(
         // The pages of each range, which stay in `frames`.
         for &(base, size) in &l.ranges {
             if (0..size / PAGE).any(|p| phys.frame(base + p * PAGE).is_none()) {
-                sel4::debug_println!("l4h-root: TPM at {:#x} is not device memory, no attestation", base);
+                log!("l4h-root: TPM at {:#x} is not device memory, no attestation", base);
                 return flags_only(alloc, win, asids, info, frames);
             }
         }
@@ -222,7 +222,7 @@ pub fn spawn(
                 match crate::acpi::aml_tables(bootinfo, &mut phys, touch) {
                     Some(n) => n,
                     None => {
-                        sel4::debug_println!("l4h-root: cannot read the ACPI tables for the TPM, no attestation");
+                        log!("l4h-root: cannot read the ACPI tables for the TPM, no attestation");
                         return flags_only(alloc, win, asids, info, frames);
                     }
                 }
@@ -278,7 +278,7 @@ pub fn spawn(
             };
             let mut phys = crate::acpi::Phys::new(alloc, devmem, win, &mut frames);
             if crate::acpi::aml_tables(bootinfo, &mut phys, copy) != Some(aml_size) {
-                sel4::debug_println!("l4h-root: cannot copy the ACPI tables for the TPM, no attestation");
+                log!("l4h-root: cannot copy the ACPI tables for the TPM, no attestation");
                 alloc.reclaim(arena);
                 return flags_only(alloc, win, asids, info, frames);
             }
@@ -469,7 +469,7 @@ impl Trustd {
             });
             done(h, id);
         }
-        sel4::debug_println!("l4h-root: trustd failed, no attestation");
+        log!("l4h-root: trustd failed, no attestation");
     }
 }
 

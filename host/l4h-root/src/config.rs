@@ -163,7 +163,7 @@ impl Config {
         };
         let Some(text) = text else { return c };
         let Ok(text) = core::str::from_utf8(text) else {
-            sel4::debug_println!("l4h-root: config: not UTF-8, ignored");
+            log!("l4h-root: config: not UTF-8, ignored");
             return c;
         };
         for (n, line) in text.lines().enumerate() {
@@ -176,7 +176,7 @@ impl Config {
                 None => false,
             };
             if !ok {
-                sel4::debug_println!("l4h-root: config line {}: '{}' ignored", n + 1, line);
+                log!("l4h-root: config line {}: '{}' ignored", n + 1, line);
             }
         }
         c

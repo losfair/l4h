@@ -51,7 +51,7 @@ impl DevMem {
             if desc.is_device() {
                 let r = Region { cap: bootinfo.untyped().index(i).cap(), paddr: desc.paddr(), size_bits: desc.size_bits() };
                 if free.push(r).is_err() {
-                    sel4::debug_println!("l4h-root: more than {} device untypeds, ignoring the rest", DEVMEM_REGIONS);
+                    log!("l4h-root: more than {} device untypeds, ignoring the rest", DEVMEM_REGIONS);
                     break;
                 }
             }
@@ -71,7 +71,7 @@ impl DevMem {
             .position(|r| r.paddr <= paddr && paddr + size <= r.paddr + (1 << r.size_bits))?;
         // Each halving leaves one free half.
         if self.free.len() - 1 + (self.free[i].size_bits - bits) > DEVMEM_REGIONS {
-            sel4::debug_println!("l4h-root: device memory table full, cannot carve {:#x}+{:#x}", paddr, size);
+            log!("l4h-root: device memory table full, cannot carve {:#x}+{:#x}", paddr, size);
             return None;
         }
         let mut r = self.free.swap_remove(i);

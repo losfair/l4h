@@ -135,7 +135,7 @@ impl Kmods {
     pub fn new(modules: &Modules, data: &'static [u8]) -> Option<Self> {
         let start = data.as_ptr() as usize;
         if data.is_empty() || data.len() as u64 > abi::KMOD_MAX || (start..start + data.len()).step_by(PAGE).any(|va| modules.get(va).is_none()) {
-            sel4::debug_println!("l4h-vmmgr: module image at {:#x} of {} bytes ignored", start, data.len());
+            l4h_rt::log!("l4h-vmmgr: module image at {:#x} of {} bytes ignored", start, data.len());
             return None;
         }
         Some(Self { data, frames: *modules })

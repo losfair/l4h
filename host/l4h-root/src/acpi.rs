@@ -87,7 +87,7 @@ impl<'a> Phys<'a> {
         if pages.is_full() {
             if !self.frames.full {
                 self.frames.full = true;
-                sel4::debug_println!("l4h-root: {} ACPI device pages in use, refusing more", TRUSTD_MAX_PAGES);
+                log!("l4h-root: {} ACPI device pages in use, refusing more", TRUSTD_MAX_PAGES);
             }
             return None;
         }

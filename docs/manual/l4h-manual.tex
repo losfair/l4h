@@ -1034,6 +1034,19 @@ with status 1 (Section~\ref{sec:errors}).
 
 \section{Host information}
 
+\cmd{l4hctl logs} prints retained host diagnostics, including guest kernel
+faults, host component faults, and power-off, reboot or panic requests.
+\cmd{l4hctl logs --follow} prints the retained messages and follows new
+ones. Messages include seconds since host start and the emitting component
+id; they are retained in release builds too. Reads do not consume messages,
+and destroying a VM leaves its diagnostics available.
+
+The bounded ring holds 256 records. Long records are marked truncated;
+overwritten or incomplete records are reported as unavailable. The ring
+does not survive a host reboot. Use \cmd{l4hctl console VM} for Linux console
+output and panic details. Querying host logs requires dom0 and its manager
+to be working; seL4's own debug output remains on the host serial console.
+
 \begin{lstlisting}
 # l4hctl version
 v2026.10.1
@@ -1789,7 +1802,9 @@ Message & Usual cause \\
     it waits for a core. On a host that is itself a nested VM, every
     cross-core wake-up is expensive, which hurts network latency.
   \item[A guest panics in its kernel.] Its console holds the panic message
-    (\cmd{l4hctl console VM}). Rebuilding the host with
+    (\cmd{l4hctl console VM}). Use \cmd{l4hctl logs} to distinguish a
+    kernel fault, panic request, reboot or power off when a VM unexpectedly
+    becomes stopped. Rebuilding the host with
     \texttt{L4H\_WATCHDOG\_SECS} set prints every vCPU's registers
     periodically, which helps with hangs.
 \end{description}

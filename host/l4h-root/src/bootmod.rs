@@ -65,7 +65,7 @@ fn add_run(runs: &mut ArrayVec<Run, MAX_RUNS>, va: usize, slot: Slot, pages: usi
         }
     }
     if runs.push(Run { va, slot, pages }).is_err() {
-        sel4::debug_println!("l4h-root: module frames past {:#x} not recorded, guests get no shared copy", va);
+        log!("l4h-root: module frames past {:#x} not recorded, guests get no shared copy", va);
     }
 }
 
@@ -97,7 +97,7 @@ impl Modules {
     fn push(&mut self, m: Module) {
         match self.list.iter_mut().find(|s| s.is_none()) {
             Some(s) => *s = Some(m),
-            None => sel4::debug_println!("l4h-root: more than {} modules, '{}' ignored", MAX_MODULES, m.name),
+            None => log!("l4h-root: more than {} modules, '{}' ignored", MAX_MODULES, m.name),
         }
     }
 
@@ -151,7 +151,7 @@ fn appended(bootinfo: &sel4::BootInfoPtr, out: &mut Modules, runs: &mut ArrayVec
     let seg = unsafe { core::slice::from_raw_parts(va as *const u8, size) };
     let word = |i: usize| u64::from_le_bytes(seg[i..i + 8].try_into().unwrap()) as usize;
     if &seg[..8] != TABLE_MAGIC {
-        sel4::debug_println!("l4h-root: appended modules: bad table, ignored");
+        log!("l4h-root: appended modules: bad table, ignored");
         return;
     }
     let frames = bootinfo.user_image_frames();
@@ -167,7 +167,7 @@ fn appended(bootinfo: &sel4::BootInfoPtr, out: &mut Modules, runs: &mut ArrayVec
         let (off, len) = (word(e + NAME_LEN), word(e + NAME_LEN + 8));
         let (Ok(name), Some(end)) = (core::str::from_utf8(raw), off.checked_add(len)) else { continue };
         if end > size {
-            sel4::debug_println!("l4h-root: appended module '{}' out of bounds, ignored", name);
+            log!("l4h-root: appended module '{}' out of bounds, ignored", name);
             continue;
         }
         out.push(Module { name, data: &seg[off..end] });
@@ -241,7 +241,7 @@ fn loader_modules(
         // Each page keeps a root slot: the modules may take at most half
         // of the root CNode, the rest is for guests and components.
         if va + pages * 4096 > region.end() || alloc.slots.available() < pages + crate::CNODE_SLOTS / 2 {
-            sel4::debug_println!("l4h-root: boot module '{}' of {} MiB does not fit, ignored", name, size >> 20);
+            log!("l4h-root: boot module '{}' of {} MiB does not fit, ignored", name, size >> 20);
             continue;
         }
         // The frames are mapped as they are carved, a chunk at a time.
@@ -257,7 +257,7 @@ fn loader_modules(
             })
         });
         if carved.is_none() {
-            sel4::debug_println!("l4h-root: boot module '{}' at {:#x} is not device memory, ignored", name, paddr);
+            log!("l4h-root: boot module '{}' at {:#x} is not device memory, ignored", name, paddr);
             // Past whatever of it was mapped before carving failed.
             va = at;
             continue;

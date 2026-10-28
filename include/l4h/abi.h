@@ -566,6 +566,13 @@ enum l4h_ctl_op {
 	L4H_CTL_VM_MEM_INFO = 29,
 	/* vm -> taint bits 0-63, seal bits 0-63 (host actions only) */
 	L4H_CTL_VM_TRUST = 30,
+	/* Host diagnostics, readable only by dom0. args: sequence cursor (0
+	 * starts at boot), snapshot end (0 selects current head). vals: next
+	 * cursor, data bytes, lost records, snapshot end. Data is whole UTF-8
+	 * lines with seconds since host start and component id (root: 0).
+	 * Reads do not consume records. Lost includes overwritten, dropped or
+	 * concurrently publishing records. A future cursor returns EINVAL. */
+	L4H_CTL_LOG_READ = 31,
 };
 
 #define L4H_GPU_MIN             64

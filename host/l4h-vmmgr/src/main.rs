@@ -7,13 +7,10 @@
 #![no_std]
 #![no_main]
 
-/// An informational message: printed only when `host::VERBOSE` (not in
-/// release builds).  Use `sel4::debug_println!` for critical errors only.
+/// Always retained; printed to serial only in verbose builds.
 macro_rules! info {
     ($($arg:tt)*) => {
-        if l4h_host::VERBOSE {
-            sel4::debug_println!($($arg)*);
-        }
+        l4h_rt::info!($($arg)*)
     };
 }
 
@@ -100,6 +97,7 @@ impl HostInfo {
             sched_control: self.sched_control(core),
             parent_ep: self.hyp_ep,
             tsc_hz: self.tsc_hz,
+            log_frames: proto::SLOT_LOG_FRAMES,
         }
     }
 
@@ -428,7 +426,7 @@ fn main(info: &'static Info) -> ! {
     let modules = kimage::Modules::new(cfg.modules_radix as usize, cfg.modules_pages as usize);
     let kernel = module(&cfg.kernel).and_then(|k| {
         kimage::Kernel::parse(k, &modules)
-            .inspect_err(|e| sel4::debug_println!("l4h-vmmgr: the guest kernel cannot be loaded: {}", e))
+            .inspect_err(|e| l4h_rt::log!("l4h-vmmgr: the guest kernel cannot be loaded: {}", e))
             .ok()
     });
     let kmods = module(&cfg.kmods).and_then(|m| kimage::Kmods::new(&modules, m));
@@ -445,7 +443,7 @@ fn main(info: &'static Info) -> ! {
         flags: root::Flags::new(cfg),
     };
     if h.kernel.is_none() {
-        sel4::debug_println!("l4h-vmmgr: no guest kernel, nothing to do");
+        l4h_rt::log!("l4h-vmmgr: no guest kernel, nothing to do");
     } else {
         boot_dom0(&mut h);
     }
@@ -469,12 +467,12 @@ pub fn boot_dom0(h: &mut Vmmgr) {
     // disk, a vNIC dom0 cannot have (netd has failed: EIO) is left out.
     for d in &h.cfg.dom0_disk[..h.cfg.dom0_disks as usize] {
         if let Err(e) = h.attach_disk(id, d.disk as usize, false, 0, d.sectors) {
-            sel4::debug_println!("l4h-vmmgr: cannot give disk {} to dom0: error {}", d.disk, e);
+            l4h_rt::log!("l4h-vmmgr: cannot give disk {} to dom0: error {}", d.disk, e);
         }
     }
     for n in &h.cfg.dom0_nic[..h.cfg.dom0_nics as usize] {
         if let Err(e) = h.create_nic(id, n.switch as u32, n.mac, true, false) {
-            sel4::debug_println!("l4h-vmmgr: cannot give dom0 a NIC on switch {}: error {}", n.switch, e);
+            l4h_rt::log!("l4h-vmmgr: cannot give dom0 a NIC on switch {}: error {}", n.switch, e);
         }
     }
     let cmdline = &h.cfg.dom0_cmdline;
@@ -492,7 +490,7 @@ pub fn boot_dom0(h: &mut Vmmgr) {
 /// dom0 rebooted or crashed: replace it.  Other guests keep running; the
 /// new dom0 finds them with the control API.
 pub fn restart_dom0(h: &mut Vmmgr, id: usize) {
-    sel4::debug_println!("l4h-vmmgr: restarting dom0");
+    l4h_rt::log!("l4h-vmmgr: restarting dom0");
     let _ = h.destroy_guest(id);
     boot_dom0(h);
 }
@@ -515,11 +513,11 @@ fn watchdog_dump(h: &Vmmgr) {
         }
         for (v, vcpu) in g.vcpus.iter().enumerate() {
             match vcpu.ktcb.tcb_read_all_registers(false) {
-                Ok(r) => sel4::debug_println!(
+                Ok(r) => l4h_rt::log!(
                     "l4h-vmmgr: watchdog: guest {} vCPU {} rip={:#x} rsp={:#x}",
                     g.id, v, *r.pc(), *r.sp()
                 ),
-                Err(e) => sel4::debug_println!("l4h-vmmgr: watchdog: guest {} vCPU {}: {:?}", g.id, v, e),
+                Err(e) => l4h_rt::log!("l4h-vmmgr: watchdog: guest {} vCPU {}: {:?}", g.id, v, e),
             }
         }
     }
@@ -605,7 +603,7 @@ fn serve(h: &mut Vmmgr, reply_slot: ReplySlot) -> ! {
             let gid = hyp_badge_guest(badge);
             let vcpu = hyp_badge_vcpu(badge);
             let fault = sel4::with_ipc_buffer(|b| sel4::Fault::new(b, &info));
-            sel4::debug_println!("l4h-vmmgr: guest {} vCPU {} kernel fault: {:x?}", gid, vcpu, fault);
+            l4h_rt::log!("l4h-vmmgr: guest {} vCPU {} kernel fault: {:x?}", gid, vcpu, fault);
             if h.guest(gid).is_some_and(|g| g.dom0) {
                 restart_dom0(h, gid);
             } else if let Some(Some(g)) = h.guests.get_mut(gid) {
@@ -613,7 +611,7 @@ fn serve(h: &mut Vmmgr, reply_slot: ReplySlot) -> ! {
             }
             None
         } else {
-            sel4::debug_println!("l4h-vmmgr: unexpected message, badge {:#x} label {}", badge, info.label());
+            l4h_rt::log!("l4h-vmmgr: unexpected message, badge {:#x} label {}", badge, info.label());
             None
         };
         h.publish();
@@ -656,7 +654,7 @@ fn root_events(h: &mut Vmmgr) {
             None if h.kernel.is_some() => boot_dom0(h),
             None => {}
         },
-        _ => sel4::debug_println!("l4h-vmmgr: monitor command {:#x} refused", cmd),
+        _ => l4h_rt::log!("l4h-vmmgr: monitor command {:#x} refused", cmd),
     }
 }
 
@@ -666,12 +664,12 @@ fn component_call(h: &mut Vmmgr, badge: u64, info: &sel4::MessageInfo) -> Option
     let id = (badge & 0xffff) as usize;
     if badge & HYP_BADGE_FAULT != 0 {
         let fault = sel4::with_ipc_buffer(|b| sel4::Fault::new(b, info));
-        sel4::debug_println!("l4h-vmmgr: guest {:#x}'s l4h-vmm fault: {:x?}", id, fault);
+        l4h_rt::log!("l4h-vmmgr: guest {:#x}'s l4h-vmm fault: {:x?}", id, fault);
         return None;
     }
     // The VMMs' component ids are their guests'.
     if id >= MAX_GUESTS {
-        sel4::debug_println!("l4h-vmmgr: component {:#x}: unknown", id);
+        l4h_rt::log!("l4h-vmmgr: component {:#x}: unknown", id);
         return Some(u64::MAX);
     }
     match info.label() {
@@ -681,7 +679,13 @@ fn component_call(h: &mut Vmmgr, badge: u64, info: &sel4::MessageInfo) -> Option
         }
         host::ROOT_CALL_GUEST_POWER => {
             let how = mr(1);
-            info!("l4h-vmmgr: guest {} power request {}", id, how);
+            let reason = match how {
+                abi::POWER_OFF => "power off",
+                abi::POWER_REBOOT => "reboot",
+                abi::POWER_CRASH => "kernel panic",
+                _ => "unknown",
+            };
+            info!("l4h-vmmgr: guest {} power request {} ({})", id, how, reason);
             if how != abi::POWER_OFF && h.guest(id).is_some_and(|g| g.dom0) {
                 // The caller (dom0's VMM) is destroyed: no reply.
                 restart_dom0(h, id);
@@ -699,7 +703,7 @@ fn component_call(h: &mut Vmmgr, badge: u64, info: &sel4::MessageInfo) -> Option
             Some(0)
         }
         other => {
-            sel4::debug_println!("l4h-vmmgr: guest {}'s l4h-vmm: unknown call {}", id, other);
+            l4h_rt::log!("l4h-vmmgr: guest {}'s l4h-vmm: unknown call {}", id, other);
             Some(u64::MAX)
         }
     }

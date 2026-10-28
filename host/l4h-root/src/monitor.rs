@@ -183,11 +183,11 @@ fn run(h: &mut Host, line: &str) {
     // Root's own, which work whatever state vmmgr is in.
     match cmd {
         "help" => {
-            sel4::debug_println!("monitor: help | list | info | destroy <vm> | restart-dom0 | reboot");
+            log!("monitor: help | list | info | destroy <vm> | restart-dom0 | reboot");
             return;
         }
         "info" => {
-            sel4::debug_println!(
+            log!(
                 "monitor: {} cores, {} MiB free of {} MiB ({} MiB reported to the hypervisor), {} disk(s), {} NIC(s)",
                 h.info.cores, h.alloc.free_bytes() >> 20, h.total_bytes >> 20, h.alloc.reported_bytes() >> 20,
                 h.disks.len(), h.netd.nics.len()
@@ -198,22 +198,22 @@ fn run(h: &mut Host, line: &str) {
         // dom0, no longer answers.
         "reboot" => {
             let e = crate::reset::reboot(h, "monitor");
-            sel4::debug_println!("monitor: reboot failed: error {}", e);
+            log!("monitor: reboot failed: error {}", e);
             return;
         }
         _ => {}
     }
     let Some(v) = &h.vmmgr else {
-        sel4::debug_println!("monitor: vmmgr is not running");
+        log!("monitor: vmmgr is not running");
         return;
     };
     // Guests are vmmgr's: it runs what changes them.
-    let send = |cmd, arg| if !v.monitor(cmd, arg) { sel4::debug_println!("monitor: vmmgr is busy, try again") };
+    let send = |cmd, arg| if !v.monitor(cmd, arg) { log!("monitor: vmmgr is busy, try again") };
     match cmd {
         "list" => {
             for id in 0..crate::MAX_GUESTS {
                 let Some(g) = v.guest(id) else { continue };
-                sel4::debug_println!(
+                log!(
                     "monitor: vm {} '{}': {}, {} vCPU(s), {} MiB{}",
                     id, name(&g), state_name(g.state), g.vcpus, g.ram_mb,
                     if g.dom0 != 0 { ", dom0" } else { "" }
@@ -222,9 +222,9 @@ fn run(h: &mut Host, line: &str) {
         }
         "destroy" => match words.next().and_then(|w| w.parse::<u32>().ok()) {
             Some(id) if v.guest(id as usize).is_some_and(|g| g.dom0 == 0) => send(l4h_host::vmmgr::MONITOR_DESTROY, id),
-            _ => sel4::debug_println!("monitor: destroy <vm> (not dom0; use restart-dom0)"),
+            _ => log!("monitor: destroy <vm> (not dom0; use restart-dom0)"),
         },
         "restart-dom0" => send(l4h_host::vmmgr::MONITOR_RESTART_DOM0, 0),
-        _ => sel4::debug_println!("monitor: unknown command '{}' (try 'help')", cmd),
+        _ => log!("monitor: unknown command '{}' (try 'help')", cmd),
     }
 }

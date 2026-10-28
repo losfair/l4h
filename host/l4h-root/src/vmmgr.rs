@@ -215,6 +215,10 @@ pub fn spawn(h: &mut Host, modules: &Modules, plan: &Dom0Plan) -> Vmmgr {
         )
     });
 
+    for i in 0..host::log::PAGES {
+        comp.give(proto::SLOT_LOG_FRAMES + i as u64,
+            cap::Granule::from_bits(h.info.log_frames + i as u64), CapRights::read_write());
+    }
     for core in 0..h.info.cores {
         comp.give(proto::SLOT_SCHED_CONTROL + core as u64, h.info.sched_control(core), CapRights::all());
     }
@@ -288,13 +292,13 @@ pub fn spawn(h: &mut Host, modules: &Modules, plan: &Dom0Plan) -> Vmmgr {
 /// memory there) before any guest exists.
 fn kmods_shareable(modules: &Modules, win: &mut crate::window::Window, data: &'static [u8]) -> bool {
     if data.len() as u64 > abi::KMOD_MAX {
-        sel4::debug_println!("l4h-root: module image of {} bytes ignored", data.len());
+        log!("l4h-root: module image of {} bytes ignored", data.len());
         return false;
     }
     let frames = modules.frames();
     let (start, end) = (data.as_ptr() as usize, data.as_ptr() as usize + data.len());
     if start % PAGE != 0 {
-        sel4::debug_println!("l4h-root: module image at {:#x}: not in whole pages of its boot module, ignored", start);
+        log!("l4h-root: module image at {:#x}: not in whole pages of its boot module, ignored", start);
         return false;
     }
     let rest = end.next_multiple_of(PAGE) - end;
@@ -307,7 +311,7 @@ fn kmods_shareable(modules: &Modules, win: &mut crate::window::Window, data: &'s
             p < end + rest && end < p + m.data.len()
         });
         if there {
-            sel4::debug_println!("l4h-root: module image at {:#x} shares its last page, ignored", start);
+            log!("l4h-root: module image at {:#x} shares its last page, ignored", start);
             return false;
         }
         let last = frames.get(end & !(PAGE - 1)).expect("module image frame");

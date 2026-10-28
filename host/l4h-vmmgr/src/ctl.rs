@@ -79,6 +79,12 @@ fn cstr(data: &[u8]) -> &[u8] {
 fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlResp) -> Result<(), i64> {
     let a = &req.args;
     match req.op {
+        abi::CTL_LOG_READ => {
+            let ring = unsafe { &*(host::log::VA as *const host::log::Ring) };
+            let r = ring.read(a[0], a[1], &mut resp.data).ok_or(EINVAL)?;
+            resp.vals = [r.next, r.len as u64, r.lost, r.end, 0, 0];
+            Ok(())
+        }
         abi::CTL_HOST_VERSION => {
             let version = HOST_VERSION.as_bytes();
             resp.vals[0] = version.len() as u64;

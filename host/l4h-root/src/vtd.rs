@@ -134,12 +134,12 @@ impl Vtd {
             confined: 0, unconfined: 0, events: 0,
         };
         let Some(dmar) = Dmar::parse(table, |b, d, f, off| pci.read32(b, d, f, off)) else {
-            sel4::debug_println!("l4h-root: VT-d: malformed or unsupported DMAR: DMA is not confined");
+            log!("l4h-root: VT-d: malformed or unsupported DMAR: DMA is not confined");
             return Some(me);
         };
         *me.dmar = dmar;
         let Some(requesters) = requester::Requesters::discover(|b, d, f, o| pci.read32(b, d, f, o)) else {
-            sel4::debug_println!("l4h-root: VT-d: malformed PCI bridge topology: DMA is not confined");
+            log!("l4h-root: VT-d: malformed PCI bridge topology: DMA is not confined");
             return Some(me);
         };
         me.requesters = requesters;
@@ -147,11 +147,11 @@ impl Vtd {
             me.ioapic_ids = ids;
         }
         if me.dmar.units.is_empty() {
-            sel4::debug_println!("l4h-root: VT-d: no unit on PCI segment 0: DMA is not confined");
+            log!("l4h-root: VT-d: no unit on PCI segment 0: DMA is not confined");
             return Some(me);
         }
         if let Err(reason) = me.prepare(phys, intremap) {
-            sel4::debug_println!("l4h-root: VT-d: {}: DMA is not confined", reason);
+            log!("l4h-root: VT-d: {}: DMA is not confined", reason);
             return Some(me);
         }
         me.chunks = Some(CHUNKS.take());
@@ -210,7 +210,7 @@ impl Vtd {
         }
         self.intremap = intremap && self.dmar.interrupt_remapping && self.units.iter().all(|u| u.ecap & 8 != 0 && u.qi());
         if intremap && !self.intremap {
-            sel4::debug_println!("l4h-root: VT-d: interrupt remapping unavailable; confining DMA only");
+            log!("l4h-root: VT-d: interrupt remapping unavailable; confining DMA only");
         }
         if !self.intremap && self.units.iter().any(|u| u.ecap & (1 << 62) != 0) {
             return Err("hardware requires interrupt remapping");
@@ -385,7 +385,7 @@ impl Vtd {
         if self.state != abi::IOMMU_ON { return None; }
         let sid = crate::amdvi::device_id(device);
         let Some(unit) = self.dmar.owner(sid) else {
-            sel4::debug_println!("l4h-root: VT-d: {:02x}:{:02x}.{} is behind no IOMMU: DMA is not confined",
+            log!("l4h-root: VT-d: {:02x}:{:02x}.{} is behind no IOMMU: DMA is not confined",
                 device.bus, device.dev, device.func);
             self.unconfined += 1;
             return None;
@@ -544,18 +544,18 @@ impl Vtd {
                 let addr = u.r64(off);
                 self.events = self.events.saturating_add(1);
                 if shown < EVENTS_PER_POLL {
-                    sel4::debug_println!("l4h-root: VT-d {}: {:02x}:{:02x}.{}: fault {:#x}, info {:#x}",
+                    log!("l4h-root: VT-d {}: {:02x}:{:02x}.{}: fault {:#x}, info {:#x}",
                         n, hi >> 8 & 255, hi >> 3 & 31, hi & 7, hi >> 32 & 255, addr);
                     shown += 1;
                 } else { dropped += 1; }
                 u.w64(off + 8, 1 << 63); // F is W1C
             }
             if status & 1 != 0 {
-                sel4::debug_println!("l4h-root: VT-d {}: fault records overflowed", n);
+                log!("l4h-root: VT-d {}: fault records overflowed", n);
                 self.events = self.events.saturating_add(1);
                 u.w32(FSTS, 1); // PFO is W1C; PPF follows the fault records
             }
         }
-        if dropped != 0 { sel4::debug_println!("l4h-root: VT-d: {} more faults not shown", dropped); }
+        if dropped != 0 { log!("l4h-root: VT-d: {} more faults not shown", dropped); }
     }
 }

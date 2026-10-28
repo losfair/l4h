@@ -80,6 +80,8 @@ jobs:
         run: tools/build-linux.sh vmlinux && ccache -s
       - name: Console rings, hotplug scheduling and hypercalls under console load
         run: tests/run-devicetest.sh --qemu
+      - name: Retained host faults and logs in release mode
+        run: L4H_RELEASE=1 tests/run-logtest.sh
       - name: Guest ABI and seL4 extensions (module), module tree
         run: tests/run-abitest.sh
       - name: Boot RAM clearing and initial user context

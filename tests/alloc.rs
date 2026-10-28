@@ -5,6 +5,8 @@
 extern crate self as l4h_host;
 extern crate self as sel4;
 
+macro_rules! log { ($($arg:tt)*) => { println!($($arg)*) }; }
+
 #[path = "../host/l4h-host/src/fixed.rs"]
 pub mod fixed;
 #[path = "../host/l4h-task/src/mem.rs"]
@@ -40,11 +42,6 @@ pub fn with_ipc_buffer<R>(f: impl FnOnce(&IpcBuffer) -> R) -> R {
 
 pub fn with_ipc_buffer_mut<R>(f: impl FnOnce(&mut IpcBuffer) -> R) -> R {
     IPC_BUFFER.with_borrow_mut(f)
-}
-
-#[macro_export]
-macro_rules! debug_println {
-    ($($arg:tt)*) => { println!($($arg)*) };
 }
 
 pub mod cap_type {

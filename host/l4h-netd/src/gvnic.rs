@@ -21,7 +21,6 @@ use core::sync::atomic::Ordering;
 
 use l4h_rt::host::fixed::ArrayVec;
 use l4h_rt::host::{self, net::{self, NicConfig}};
-use l4h_rt::sel4;
 use l4h_virtio::{Dma, Mmio, dma_fence};
 
 use crate::nic::Partial;
@@ -475,7 +474,7 @@ impl Gvnic {
             while self.r32(REG_DEVICE_STATUS) & DEVICE_STATUS_IS_RESET == 0 {
                 if host::ticks::now() > end {
                     // Setting up the admin queue fails if this mattered.
-                    sel4::debug_println!("netd: NIC {}: gVNIC reports no reset (status {:#x})", self.n, self.r32(REG_DEVICE_STATUS));
+                    l4h_rt::log!("netd: NIC {}: gVNIC reports no reset (status {:#x})", self.n, self.r32(REG_DEVICE_STATUS));
                     return;
                 }
             }

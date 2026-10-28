@@ -374,7 +374,7 @@ fn main(info: &'static Info) -> ! {
         match init(cfg, hz) {
             Ok(s) => Some(s),
             Err((what, e)) => {
-                sel4::debug_println!("l4h-trustd: TPM unusable, no attestation: {}: {}", what, e);
+                l4h_rt::log!("l4h-trustd: TPM unusable, no attestation: {}: {}", what, e);
                 None
             }
         }

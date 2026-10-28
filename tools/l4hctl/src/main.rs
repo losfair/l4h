@@ -81,8 +81,30 @@ fn cmd_console(ctl: &Ctl, vm: u64, follow: bool, until: Option<&str>, timeout: O
     }
 }
 
+fn cmd_logs(ctl: &Ctl, follow: bool) -> Result<()> {
+    let (mut cursor, mut end) = (0, 0);
+    let out = io::stdout();
+    loop {
+        let (next, data, lost, snapshot) = ctl.logs_read(cursor, end)?;
+        if lost != 0 {
+            eprintln!("[l4hctl: {lost} host log records unavailable (overwritten or incomplete)]");
+        }
+        let mut o = out.lock();
+        o.write_all(&data).and_then(|_| o.flush()).map_err(|e| Error(e.to_string()))?;
+        drop(o);
+        cursor = next;
+        if !follow {
+            if cursor == snapshot { return Ok(()); }
+            end = snapshot;
+        } else if cursor == snapshot {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
 const USAGE: &str = "usage: l4hctl <command>
   version                      running host's build version
+  logs [--follow]              retained host diagnostics, faults and VM stops
   info                         host resources
   iommu                        IOMMU state: DMA and interrupts confined,
                                devices, logged faults
@@ -199,6 +221,14 @@ fn run(args: &[String]) -> Result<i32> {
     let ctl = Ctl::open()?;
     match cmd.as_str() {
         "version" => println!("{}", ctl.host_version()?),
+        "logs" => {
+            let follow = match &args[1..] {
+                [] => false,
+                [arg] if arg == "--follow" => true,
+                _ => return err("logs [--follow]"),
+            };
+            cmd_logs(&ctl, follow)?;
+        }
         "info" => {
             let r = ctl.call(CTL_HOST_INFO, &[], &[], &[])?;
             println!("cores:  {}", r.vals[0]);

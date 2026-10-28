@@ -2088,6 +2088,32 @@ whole message and breaks timing, so prints are kept rare:
   verbose. They always go to the console rings that `console_read` serves.
 - The serial monitor's replies and the opt-in watchdog dumps always print.
 
+Host diagnostics from root, vmmgr, VMMs and device services also go to a
+shared, bounded log ring (`l4h_host::log`), including `info!` in release
+builds, Rust panics and keeper fault reports. `l4hctl logs` reads a snapshot;
+`l4hctl logs --follow` polls for new records. `CTL_LOG_READ` is an additive
+control operation available only to dom0, with independent sequence cursors
+and an explicit count of unavailable records. Guest kernel faults include
+the VM id, vCPU and fault registers; guest power requests distinguish power
+off, reboot and kernel panic. Guest console text remains in its own rings.
+
+The host ring retains 256 records in 132 KiB, with elapsed host time and
+component id on each line. Root owns page-aligned image storage, shares only
+those frames with its components, and gives vmmgr frame capabilities to map
+into VMMs. Mapping capabilities belong to each component's arena; destroying
+a VM neither revokes the shared frames nor clears its diagnostics. Records
+are at most 480 bytes including the prefix and newline, with an explicit
+truncation marker. Logs are volatile and do not survive a host reboot.
+
+Logging formats on the writer's stack and publishes through atomic memory
+operations, without allocating, making an IPC or touching message registers.
+Writers never wait on a lock: if a writer is preempted or faults in a slot,
+other writers use the remaining slots. Readers validate the slot generation
+around atomic payload reads and report overwritten, dropped and incomplete
+records as unavailable. No reader can consume another reader's history or
+block host progress. Querying requires a functioning dom0 and vmmgr; this
+does not capture seL4's own debug stream or make a crashed host queryable.
+
 **Guest boot protocol.** The guest boots without firmware or a bootloader.
 vmmgr parses the guest kernel's ELF (§9.1). For runtime guests, the dom0
 `l4hctl` client parses the ELF and vmmgr copies uploaded segments and

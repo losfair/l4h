@@ -26,7 +26,6 @@ use core::sync::atomic::Ordering;
 
 use l4h_rt::host::fixed::ArrayVec;
 use l4h_rt::host::{self, net::{self, NicConfig}};
-use l4h_rt::sel4;
 use l4h_virtio::{Dma, Mmio, dma_fence};
 
 use crate::nic::Partial;
@@ -579,7 +578,7 @@ impl Ena {
         let mtu = (max_frame - 18) as u32;
         if e.has(FEAT_MTU) {
             if let Err(st) = e.try_exec(Cmd::feature(AQ_SET_FEATURE, FEAT_MTU, 0).u32(20, mtu)) {
-                sel4::debug_println!("netd: NIC {}: ENA refuses MTU {}: status {}", n, mtu, st);
+                l4h_rt::log!("netd: NIC {}: ENA refuses MTU {}: status {}", n, mtu, st);
             }
         }
         for id in 0..e.rx_bufs.len() as u16 {
@@ -729,7 +728,7 @@ impl Ena {
             .u16(42, LLQ_MULTIPLE_DESCS_PER_ENTRY)
             .u16(48, LLQ_ACCEL_DISABLE_META_CACHING | LLQ_ACCEL_LIMIT_TX_BURST);
         if let Err(st) = self.try_exec(set) {
-            sel4::debug_println!("netd: NIC {}: ENA refuses the LLQ layout: status {}: TX descriptors in host memory", self.n, st);
+            l4h_rt::log!("netd: NIC {}: ENA refuses the LLQ layout: status {}: TX descriptors in host memory", self.n, st);
             return None;
         }
         let burst = if accel & LLQ_ACCEL_LIMIT_TX_BURST != 0 { burst_bytes / LLQ_ENTRY as u16 } else { 0 };
@@ -786,7 +785,7 @@ impl Ena {
             .u16(24, log)
             .u32(28, u32::MAX);
         if let Err(st) = self.try_exec(set) {
-            sel4::debug_println!("netd: NIC {}: ENA refuses the RSS table: status {}", self.n, st);
+            l4h_rt::log!("netd: NIC {}: ENA refuses the RSS table: status {}", self.n, st);
         }
     }
 
@@ -809,8 +808,8 @@ impl Ena {
                     let up = rd32(e + 16) & 1 != 0;
                     l4h_rt::info!("netd: NIC {}: ENA link {}", self.n, if up { "up" } else { "down" });
                 }
-                AENQ_FATAL_ERROR => sel4::debug_println!("netd: NIC {}: ENA reports a fatal error ({})", self.n, rd16(e + 2)),
-                AENQ_WARNING => sel4::debug_println!("netd: NIC {}: ENA warning {}", self.n, rd16(e + 2)),
+                AENQ_FATAL_ERROR => l4h_rt::log!("netd: NIC {}: ENA reports a fatal error ({})", self.n, rd16(e + 2)),
+                AENQ_WARNING => l4h_rt::log!("netd: NIC {}: ENA warning {}", self.n, rd16(e + 2)),
                 _ => {}
             }
             self.aenq_ring.advance();
@@ -1008,7 +1007,7 @@ impl Ena {
         if len > self.tx_buf {
             // Longer than the device's MTU: it cannot be sent.
             if !core::mem::replace(&mut self.tx_too_long, true) {
-                sel4::debug_println!("netd: NIC {}: ENA drops frames longer than {} bytes ({})", self.n, self.tx_buf, len);
+                l4h_rt::log!("netd: NIC {}: ENA drops frames longer than {} bytes ({})", self.n, self.tx_buf, len);
             }
             return true;
         }

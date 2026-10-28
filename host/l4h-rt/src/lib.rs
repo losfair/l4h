@@ -48,21 +48,30 @@ impl ErrorLimit {
     pub fn allow(&mut self) -> bool {
         self.0 = self.0.saturating_add(1);
         if self.0 == Self::MAX {
-            sel4::debug_println!("(further errors of this kind are not printed)");
+            log!("(further errors of this kind are not printed)");
         }
         self.0 <= Self::MAX
     }
 }
 
-/// An informational message: printed only when `host::VERBOSE` (not in
-/// release builds).  Use `sel4::debug_println!` for critical errors only.
+/// An informational message: always retained, printed only when verbose.
 #[macro_export]
 macro_rules! info {
     ($($arg:tt)*) => {
-        if $crate::host::VERBOSE {
-            $crate::sel4::debug_println!($($arg)*);
-        }
+        $crate::print_log(format_args!($($arg)*), $crate::host::VERBOSE)
     };
+}
+
+/// A critical diagnostic: retained and also printed to serial.
+#[macro_export]
+macro_rules! log {
+    ($($arg:tt)*) => { $crate::print_log(format_args!($($arg)*), true) };
+}
+
+#[doc(hidden)]
+pub fn print_log(args: core::fmt::Arguments<'_>, serial: bool) {
+    host::log::record(args);
+    if serial { sel4::debug_println!("{}", args); }
 }
 
 use l4h_host::{CONFIG_OFFSET, INFO_MAGIC, INFO_VA, IPCBUF_VA, InfoHeader};
@@ -94,6 +103,8 @@ pub fn init() -> &'static Info {
         sel4::set_ipc_buffer((IPCBUF_VA as *mut sel4::IpcBuffer).as_mut().unwrap());
     }
     assert_eq!(INFO.header().magic, INFO_MAGIC, "bad component info page");
+    host::log::init(unsafe { &*(host::log::VA as *const host::log::Ring) }, INFO.header().id);
+    sel4_panicking::set_hook(&|info| log!("l4h-rt: component {:#x}: {}", INFO.header().id, info));
     if host::has_keeper(INFO.header().kind) {
         start_keeper();
     }
@@ -152,7 +163,7 @@ extern "C" fn keeper() -> ! {
     let reply = cap::<sel4::cap_type::Reply>(host::SLOT_KEEPER_REPLY);
     let (info, _) = cap::<sel4::cap_type::Endpoint>(host::SLOT_FAULT_EP).recv(reply);
     let fault = sel4::with_ipc_buffer(|b| sel4::Fault::new(b, &info));
-    sel4::debug_println!("l4h-rt: component {:#x} fault: {:x?}", INFO.header().id, fault);
+    log!("l4h-rt: component {:#x} fault: {:x?}", INFO.header().id, fault);
     failure::answer_failed(host::SLOT_KEEPER)
 }
 
@@ -168,6 +179,7 @@ pub fn cap<T: sel4::CapType>(slot: u64) -> sel4::Cap<T> {
 #[doc(hidden)]
 pub fn abort_trap() -> ! {
     let h = INFO.header();
+    log!("l4h-rt: component {:#x} aborted", h.id);
     if h.magic == INFO_MAGIC && host::has_keeper(h.kind) {
         failure::answer_failed(host::SLOT_TCB);
     }

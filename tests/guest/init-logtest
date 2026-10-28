@@ -1,0 +1,50 @@
+#!/bin/sh
+# Save results to disk as well: release builds suppress guest serial output.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mount -t tmpfs tmp /tmp
+mount /dev/vda /mnt || { echo "LOGTEST: FAIL: mount"; poweroff -f; }
+finish() {
+    echo "LOGTEST: $*" | tee /mnt/result
+    sync
+    l4hctl host-reboot 2>/dev/null || poweroff -f
+    while :; do sleep 10; done
+}
+fail() { finish "FAIL: $*"; }
+echo "LOGTEST: start"
+l4hctl logs >/mnt/boot-logs || fail "read logs"
+grep -q 'l4h-root: .*core(s)' /mnt/boot-logs || fail "root boot logs"
+grep -q 'l4h-vmmgr:' /mnt/boot-logs || fail "vmmgr logs"
+l4hctl logs --follow >/mnt/follow-logs 2>/mnt/follow-errors &
+follower=$!
+for action in fault panic off; do
+    id=$(l4hctl create "log-$action" --initrd /bin/logvm.cpio.gz --mem 128) || fail "create $action"
+    l4hctl console "$id" --until 'LOGVM: ready' --timeout 60 >/dev/null || fail "boot $action"
+    l4hctl send "$id" "$action" || fail "trigger $action"
+    i=0
+    until l4hctl list | grep -q "log-$action .* stopped"; do
+        i=$((i + 1)); [ "$i" -lt 100 ] || fail "$action did not stop"
+        sleep 0.1
+    done
+    case "$action" in
+        fault) pattern="guest $id vCPU 0 kernel fault:" ;;
+        panic) pattern="guest $id power request 2 (kernel panic)" ;;
+        off) pattern="guest $id power request 0 (power off)" ;;
+    esac
+    l4hctl logs >/mnt/host-logs || fail "logs after $action"
+    grep -Fq "$pattern" /mnt/host-logs || fail "missing $action reason"
+    # Destroying the guest must leave the diagnostic available to all readers.
+    l4hctl destroy "$id" || fail "destroy $action"
+    l4hctl logs >/mnt/host-logs || fail "logs after destroy"
+    grep -Fq "$pattern" /mnt/host-logs || fail "lost $action reason after destroy"
+    i=0
+    until grep -Fq "$pattern" /mnt/follow-logs; do
+        i=$((i + 1)); [ "$i" -lt 100 ] || fail "follow missed $action"
+        sleep 0.1
+    done
+    echo "LOGTEST: $action retained after destroy and followed"
+done
+kill "$follower"
+wait "$follower" 2>/dev/null
+finish PASS

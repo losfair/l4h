@@ -46,6 +46,7 @@ pub const CTL_GPU_READ: u32 = 27;
 pub const CTL_VM_SET_MEM: u32 = 28;
 pub const CTL_VM_MEM_INFO: u32 = 29;
 pub const CTL_VM_TRUST: u32 = 30;
+pub const CTL_LOG_READ: u32 = 31;
 pub const GPU_POOL_IMAGES: u64 = 4;
 pub const IOMMU_NONE: u64 = 0;
 pub const IOMMU_OFF: u64 = 1;
@@ -602,6 +603,16 @@ impl Ctl {
     pub fn console_read(&self, vm: u64, off: u64) -> Result<(u64, Vec<u8>, u64)> {
         let r = self.call(CTL_CONSOLE_READ, &[vm, off], &[], &[])?;
         Ok((r.vals[0], r.data[..r.vals[1] as usize].to_vec(), r.vals[2]))
+    }
+
+    /// Host diagnostics from `cursor`; `end == 0` selects a new snapshot.
+    /// Returns (next cursor, text, lost records, snapshot end).
+    pub fn logs_read(&self, cursor: u64, end: u64) -> Result<(u64, Vec<u8>, u64, u64)> {
+        let r = self.call(CTL_LOG_READ, &[cursor, end], &[], &[])?;
+        if r.vals[1] > CTL_DATA_MAX as u64 || r.vals[0] < cursor || r.vals[0] > r.vals[3] {
+            return err("invalid host log response");
+        }
+        Ok((r.vals[0], r.data[..r.vals[1] as usize].to_vec(), r.vals[2], r.vals[3]))
     }
 
     pub fn switch_create(&self) -> Result<u64> {

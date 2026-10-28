@@ -8,7 +8,6 @@ use core::sync::atomic::Ordering;
 
 use l4h_rt::host::blk::{self, BlkdConfig};
 use l4h_rt::host::fixed::ArrayVec;
-use l4h_rt::sel4;
 use l4h_virtio::{dma_fence, Dma, Mmio};
 
 use crate::{DevInfo, Driver, MAX_PIECES, Seg};
@@ -410,7 +409,7 @@ impl Driver for Nvme {
             let req = &mut self.reqs[r];
             if status != 0 {
                 if self.io_errors.allow() {
-                    sel4::debug_println!("nvme {:#x}: command {} failed: status {:#x}", self.id, cid, status);
+                    l4h_rt::log!("nvme {:#x}: command {} failed: status {:#x}", self.id, cid, status);
                 }
                 req.status = blk::STATUS_IOERR;
             }

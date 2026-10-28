@@ -59,9 +59,9 @@ fn xchg(c: Client, i: usize) -> AbsoluteCPtr {
 }
 
 #[macro_export]
-macro_rules! debug_println { ($($a:tt)*) => { println!($($a)*); }; }
-#[macro_export]
 macro_rules! info { ($($a:tt)*) => { println!($($a)*); }; }
+#[macro_export]
+macro_rules! log { ($($a:tt)*) => { println!($($a)*); }; }
 
 pub mod cap_type {
     #[derive(Clone, Copy)] pub struct Null;

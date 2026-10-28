@@ -316,7 +316,7 @@ impl AmdVi {
             return me;
         };
         if ivrs.len() < 48 || (u32_at(ivrs, 4) as usize) > ivrs.len() {
-            sel4::debug_println!("l4h-root: iommu: IVRS unreadable or over {} bytes: DMA is not confined", buf.len());
+            log!("l4h-root: iommu: IVRS unreadable or over {} bytes: DMA is not confined", buf.len());
             me.state = abi::IOMMU_FAILED;
             return me;
         }
@@ -329,7 +329,7 @@ impl AmdVi {
         }
         let ivrs = &ivrs[..u32_at(ivrs, 4) as usize];
         let Some(units) = me.parse(ivrs, dev) else {
-            sel4::debug_println!("l4h-root: iommu: IVRS malformed: DMA is not confined");
+            log!("l4h-root: iommu: IVRS malformed: DMA is not confined");
             me.state = abi::IOMMU_FAILED;
             return me;
         };
@@ -368,7 +368,7 @@ impl AmdVi {
                 Some(_) => {}
                 None => {
                     if units.push(h).is_err() {
-                        sel4::debug_println!("l4h-root: iommu: more than {} IOMMUs", MAX_UNITS);
+                        log!("l4h-root: iommu: more than {} IOMMUs", MAX_UNITS);
                         return None;
                     }
                 }
@@ -396,7 +396,7 @@ impl AmdVi {
                     let u = Unity { first, last, start: start & !(PAGE - 1), end, write: write || exclusion };
                     info!("l4h-root: iommu: unity range {:#x}..{:#x} for devices {:#06x}..={:#06x}", u.start, u.end, first, last);
                     if self.unity.push(u).is_err() {
-                        sel4::debug_println!("l4h-root: iommu: more than {} unity ranges", MAX_UNITY);
+                        log!("l4h-root: iommu: more than {} unity ranges", MAX_UNITY);
                         return None;
                     }
                 }
@@ -465,7 +465,7 @@ impl AmdVi {
         let mut mmio = ArrayVec::<usize, MAX_UNITS>::new();
         for (n, u) in units.iter().enumerate() {
             let Some(frames) = phys.alloc.slots.global(|s| phys.devmem.frames(s, u.base, MMIO_BYTES)) else {
-                sel4::debug_println!("l4h-root: iommu at {:#x}: registers not in device memory: DMA is not confined", u.base);
+                log!("l4h-root: iommu at {:#x}: registers not in device memory: DMA is not confined", u.base);
                 self.state = abi::IOMMU_FAILED;
                 return;
             };
@@ -755,7 +755,7 @@ impl AmdVi {
         }
         let id = device_id(d);
         if !self.covered(id) {
-            sel4::debug_println!(
+            log!(
                 "l4h-root: iommu: {:02x}:{:02x}.{} is behind no IOMMU: its DMA is not confined",
                 d.bus, d.dev, d.func
             );
@@ -892,7 +892,7 @@ impl AmdVi {
         let mut printed = 0;
         for u in 0..self.units.len() {
             if self.r64(u, STATUS) & STATUS_EVT_OVERFLOW != 0 {
-                sel4::debug_println!("l4h-root: iommu {}: event log overflowed, restarted", u);
+                log!("l4h-root: iommu {}: event log overflowed, restarted", u);
                 let ctrl = self.r64(u, CONTROL);
                 self.w64(u, CONTROL, ctrl & !CTRL_EVT_LOG);
                 self.w64(u, EVT_HEAD, 0);
@@ -921,7 +921,7 @@ impl AmdVi {
                         8 => "invalid device request",
                         _ => "event",
                     };
-                    sel4::debug_println!(
+                    log!(
                         "l4h-root: iommu: {:02x}:{:02x}.{}: {} at {:#x} (domain {}, flags {:#x})",
                         id >> 8, (id >> 3) & 0x1f, id & 7, what, (e[3] as u64) << 32 | e[2] as u64,
                         e[1] & 0xffff, (e[1] >> 16) & 0xfff
@@ -934,7 +934,7 @@ impl AmdVi {
             self.w64(u, EVT_HEAD, tail as u64);
         }
         if printed == EVENTS_PER_POLL && self.dropped != 0 {
-            sel4::debug_println!("l4h-root: iommu: {} more events not shown", self.dropped);
+            log!("l4h-root: iommu: {} more events not shown", self.dropped);
             self.dropped = 0;
         }
     }

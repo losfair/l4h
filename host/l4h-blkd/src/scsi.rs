@@ -12,7 +12,6 @@
 use l4h_rt::host::blk::{self, BlkdConfig};
 use l4h_rt::host::fixed::ArrayVec;
 use l4h_rt::ioport::Ports;
-use l4h_rt::sel4;
 use l4h_virtio::{
     DESC_F_INDIRECT, DESC_F_NEXT, DESC_F_WRITE, Device, Dma, F_ACCESS_PLATFORM, F_INDIRECT_DESC, F_VERSION_1, Mmio, NO_VECTOR,
     STATUS_ACK, STATUS_DRIVER, STATUS_DRIVER_OK, STATUS_FAILED, Virtq, legacy, legacy_ring_size,
@@ -337,7 +336,7 @@ impl VirtioScsi {
             }
             for &lun in luns.iter() {
                 if self.units.len() == blk::MAX_UNITS {
-                    sel4::debug_println!("blkd {:#x}: more than {} disks, ignoring target {} LUN {}", self.id, blk::MAX_UNITS, target, lun);
+                    l4h_rt::log!("blkd {:#x}: more than {} disks, ignoring target {} LUN {}", self.id, blk::MAX_UNITS, target, lun);
                     return;
                 }
                 if let Some(u) = self.probe(target, lun, buf) {
@@ -377,14 +376,14 @@ impl VirtioScsi {
         } else {
             let o = self.exec(lun, &rc16, Some((buf.1, 32)));
             if o.response != S_OK || o.status != GOOD {
-                sel4::debug_println!("blkd {:#x}: target {} LUN {}: READ CAPACITY failed: response {} status {:#x}",
+                l4h_rt::log!("blkd {:#x}: target {} LUN {}: READ CAPACITY failed: response {} status {:#x}",
                     id, target, number, o.response, o.status);
                 return None;
             }
             (be(0, 8), be(8, 4))
         };
         if !matches!(block_size, 512 | 4096) {
-            sel4::debug_println!("blkd {:#x}: target {} LUN {}: unsupported block size {}", id, target, number, block_size);
+            l4h_rt::log!("blkd {:#x}: target {} LUN {}: unsupported block size {}", id, target, number, block_size);
             return None;
         }
         let mut u = Unit {
@@ -655,7 +654,7 @@ impl Driver for VirtioScsi {
             if status == blk::STATUS_UNSUPP {
                 l4h_rt::info!("blkd {:#x}: virtio-scsi command unsupported by the device", self.id);
             } else if status != blk::STATUS_OK && self.io_errors.allow() {
-                sel4::debug_println!(
+                l4h_rt::log!(
                     "blkd {:#x}: virtio-scsi command failed: response {} status {:#x} sense key {:?} residual {}",
                     self.id, o.response, o.status, o.sense_key, o.residual
                 );

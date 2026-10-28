@@ -156,7 +156,7 @@ pub fn discover(
     if n == cpus {
         Topology::from_ids(&ids[..n])
     } else {
-        sel4::debug_println!("l4h-task: CPU topology unavailable; using flat placement");
+        log!("l4h-task: CPU topology unavailable; using flat placement");
         Topology::flat(cpus)
     }
 }

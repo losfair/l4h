@@ -16,6 +16,16 @@
 #[cfg(test)]
 extern crate std;
 
+macro_rules! log {
+    ($($arg:tt)*) => { crate::print_log(format_args!($($arg)*), true) };
+}
+
+/// Retain a host diagnostic, with optional synchronous serial output.
+pub fn print_log(args: core::fmt::Arguments<'_>, serial: bool) {
+    l4h_host::log::record(args);
+    if serial { sel4::debug_println!("{}", args); }
+}
+
 pub mod component;
 pub mod elf;
 pub mod mem;

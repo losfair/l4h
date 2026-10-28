@@ -80,9 +80,9 @@ pub fn reboot(h: &mut Host, by: &str) -> i64 {
     if cfg!(not(target_arch = "x86_64")) {
         return crate::ctl::ENOSYS;
     }
-    sel4::debug_println!("l4h-root: host reboot ({})", by);
+    log!("l4h-root: host reboot ({})", by);
     reset(h);
-    sel4::debug_println!("l4h-root: host reboot failed: the machine did not reset");
+    log!("l4h-root: host reboot failed: the machine did not reset");
     crate::ctl::EIO
 }
 

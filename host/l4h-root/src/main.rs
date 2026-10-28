@@ -7,14 +7,15 @@
 #![no_std]
 #![no_main]
 
-/// An informational message: printed only when `host::VERBOSE` (not in
-/// release builds).  Use `sel4::debug_println!` for critical errors only.
+/// Always retained; printed to serial only in verbose builds.
 macro_rules! info {
     ($($arg:tt)*) => {
-        if l4h_host::VERBOSE {
-            sel4::debug_println!($($arg)*);
-        }
+        l4h_task::print_log(format_args!($($arg)*), l4h_host::VERBOSE)
     };
+}
+
+macro_rules! log {
+    ($($arg:tt)*) => { l4h_task::print_log(format_args!($($arg)*), true) };
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -65,6 +66,7 @@ pub use l4h_task::mem::RETYPE_FAN_OUT;
 static SLOT_STORAGE: StaticCell<mem::SlotStorage<{ CNODE_SLOTS / 64 }, CNODE_SLOTS>> =
     StaticCell::new(mem::SlotStorage::new());
 static ALLOC_STORAGE: StaticCell<mem::AllocStorage> = StaticCell::new(mem::AllocStorage::new());
+static LOG: host::log::Ring = host::log::Ring::new();
 pub const MAX_GUESTS: usize = 64;
 /// Badge bit of a component's fault on the root endpoint.
 pub const HYP_BADGE_FAULT: u64 = host::BADGE_FAULT;
@@ -93,6 +95,7 @@ pub struct HostInfo {
     pub cores: usize,
     pub topology: topology::Topology,
     pub tsc_hz: u64,
+    log_frames: u64,
     /// AArch64 feature ID registers for the guests' bootinfo (`cpu_id`).
     pub cpu_id: [u64; 5],
     pub hyp_ep: cap::Endpoint,
@@ -111,6 +114,7 @@ impl HostInfo {
             sched_control: self.sched_control(core),
             parent_ep: self.hyp_ep,
             tsc_hz: self.tsc_hz,
+            log_frames: self.log_frames,
         }
     }
 
@@ -284,7 +288,7 @@ impl Host {
         let add = |disks: &mut ArrayVec<Disk, MAX_DISKS>, d: Disk| {
             let (unit, ctrl) = (d.unit, d.ctrl);
             if disks.push(d).is_err() {
-                sel4::debug_println!("l4h-root: more than {} disks, unit {} of controller {} ignored", MAX_DISKS, unit, ctrl);
+                log!("l4h-root: more than {} disks, unit {} of controller {} ignored", MAX_DISKS, unit, ctrl);
             }
         };
         for c in 0..self.ctrls.len() {
@@ -315,6 +319,10 @@ pub const ROOT_STACK: usize = 1024 * 1024;
 
 #[root_task(stack_size = ROOT_STACK)]
 fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
+    let tsc_hz = tsc_hz(bootinfo);
+    LOG.set_clock(rdtsc(), tsc_hz);
+    host::log::init(&LOG, 0);
+    sel4_root_task::panicking::set_hook(&|info| log!("l4h-root: {}", info));
     layout::guard_stack(bootinfo);
     layout::check_image(bootinfo);
     let cores = bootinfo.inner().numNodes as usize;
@@ -352,7 +360,13 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     let info = HostInfo {
         cores,
         topology,
-        tsc_hz: tsc_hz(bootinfo),
+        tsc_hz,
+        log_frames: {
+            let first = (&raw const LOG) as usize;
+            let i = (first - layout::image_base()) / 4096;
+            assert!(i + host::log::PAGES <= bootinfo.user_image_frames().len());
+            bootinfo.user_image_frames().index(i).cap().bits()
+        },
         cpu_id: cpu_id(bootinfo),
         hyp_ep,
         sched_control_base: bootinfo.sched_control().range().start,
@@ -373,7 +387,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         let mut phys = acpi::Phys::new(&mut alloc, &mut devmem, &mut wins.a, &mut acpi_frames);
         iommu::Iommu::init(bootinfo, &mut phys, &pci, info.tsc_hz / 1000, cfg.iommu_intremap)
     } else {
-        sel4::debug_println!("l4h-root: iommu=0: DMA is not confined");
+        log!("l4h-root: iommu=0: DMA is not confined");
         iommu::Iommu::off()
     };
     #[cfg(not(target_arch = "x86_64"))]
@@ -398,7 +412,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         }
         if blkd::is_disk(&d) {
             if ctrls.len() == pci::MAX_DISK_CTRLS {
-                sel4::debug_println!("l4h-root: more than {} disk controllers, ignoring this one", pci::MAX_DISK_CTRLS);
+                log!("l4h-root: more than {} disk controllers, ignoring this one", pci::MAX_DISK_CTRLS);
                 continue;
             }
             // Stop whatever the firmware left running: no DMA at all (the
@@ -414,7 +428,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         } else if netd::is_uplink(&d) {
             pci.disable(&d);
             if nics.push(d).is_err() {
-                sel4::debug_println!("l4h-root: more than {} NICs, ignoring {:02x}:{:02x}.{}", host::net::MAX_NICS, d.bus, d.dev, d.func);
+                log!("l4h-root: more than {} NICs, ignoring {:02x}:{:02x}.{}", host::net::MAX_NICS, d.bus, d.dev, d.func);
             }
         } else if memd::is_balloon(&d) && balloon.is_none() {
             balloon = Some(d);
@@ -424,7 +438,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     if let Some(bdf) = cfg.boot_disk {
         match ctrls.iter().position(|c: &Controller| netd::bdf(&c.pci) == bdf) {
             Some(i) => ctrls[..=i].rotate_right(1),
-            None => sel4::debug_println!("l4h-root: no boot disk at {:02x}:{:02x}.{}", bdf >> 8, (bdf >> 3) & 0x1f, bdf & 7),
+            None => log!("l4h-root: no boot disk at {:02x}:{:02x}.{}", bdf >> 8, (bdf >> 3) & 0x1f, bdf & 7),
         }
     }
     if let Some(d) = balloon {
@@ -469,7 +483,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     h.dashboard = dashboard::Dashboard::new(bootinfo, &mut h.alloc, &mut h.devmem, h.cfg.fb_console);
 
     if module("guest-kernel").is_none() {
-        sel4::debug_println!("l4h-root: no guest kernel, nothing to do");
+        log!("l4h-root: no guest kernel, nothing to do");
     } else {
         let plan = dom0_plan(&mut h);
         h.vmmgr = Some(vmmgr::spawn(&mut h, &modules, &plan));
@@ -497,7 +511,7 @@ fn dom0_plan(h: &mut Host) -> Dom0Plan {
             if n < h.disks[d].capacity { sectors = n; }
         }
         if plan.disks.push(l4h_host::vmmgr::Dom0Disk { disk: d as u64, sectors }).is_err() {
-            sel4::debug_println!("l4h-root: dom0 gets the first {} disks only", l4h_host::vmmgr::DOM0_MAX_DISKS);
+            log!("l4h-root: dom0 gets the first {} disks only", l4h_host::vmmgr::DOM0_MAX_DISKS);
             break;
         }
     }
@@ -510,19 +524,19 @@ fn dom0_plan(h: &mut Host) -> Dom0Plan {
         Some(bdf) => {
             let n = h.netd.nics.iter().position(|n| netd::bdf(&n.pci) == bdf);
             if n.is_none() {
-                sel4::debug_println!("l4h-root: no uplink NIC at {:02x}:{:02x}.{}", bdf >> 8, (bdf >> 3) & 0x1f, bdf & 7);
+                log!("l4h-root: no uplink NIC at {:02x}:{:02x}.{}", bdf >> 8, (bdf >> 3) & 0x1f, bdf & 7);
             }
             n
         }
     };
     if let Some(nic) = nic {
         if let Err(e) = h.netd.attach_uplink(sw, nic) {
-            sel4::debug_println!("l4h-root: no uplink on switch {}: error {}", sw, e);
+            log!("l4h-root: no uplink on switch {}: error {}", sw, e);
         }
     }
     let mut add_nic = |switch: u32, mac: u64| {
         if plan.nics.push(l4h_host::vmmgr::Dom0Nic { switch: switch as u64, mac }).is_err() {
-            sel4::debug_println!("l4h-root: dom0 gets {} vNICs only", l4h_host::vmmgr::DOM0_MAX_NICS);
+            log!("l4h-root: dom0 gets {} vNICs only", l4h_host::vmmgr::DOM0_MAX_NICS);
         }
     };
     // dom0's first vNIC takes the uplink NIC's MAC address: networks
@@ -538,14 +552,14 @@ fn dom0_plan(h: &mut Host) -> Dom0Plan {
     let uplink2 = h.cfg.uplink2_nic.and_then(|bdf| {
         let n = h.netd.nics.iter().position(|n| netd::bdf(&n.pci) == bdf);
         if n.is_none() {
-            sel4::debug_println!("l4h-root: no second uplink NIC at {:02x}:{:02x}.{}", bdf >> 8, (bdf >> 3) & 0x1f, bdf & 7);
+            log!("l4h-root: no second uplink NIC at {:02x}:{:02x}.{}", bdf >> 8, (bdf >> 3) & 0x1f, bdf & 7);
         }
         n
     });
     if let Some(nic) = uplink2 {
         h.netd.create_switch();
         if let Err(e) = h.netd.attach_uplink(1, nic) {
-            sel4::debug_println!("l4h-root: no uplink on switch 1: error {}", e);
+            log!("l4h-root: no uplink on switch 1: error {}", e);
         }
         add_nic(1, h.netd.nic_mac(nic).unwrap_or(0));
     }
@@ -563,7 +577,7 @@ fn dom0_plan(h: &mut Host) -> Dom0Plan {
 pub fn sched_consumed(sc: sel4::cap::SchedContext) -> u64 {
     let r = sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_SchedContext_Consumed(sc.bits()));
     if r.error != 0 {
-        sel4::debug_println!("l4h-root: SchedContext_Consumed({:#x}) failed: {}", sc.bits(), r.error);
+        log!("l4h-root: SchedContext_Consumed({:#x}) failed: {}", sc.bits(), r.error);
         return 0;
     }
     r.consumed
@@ -585,7 +599,7 @@ fn arm_timer(info: &HostInfo) {
 /// Root's part of the watchdog dump (vmmgr dumps the guests' vCPUs).
 fn watchdog_dump(h: &Host) {
     let ms = |ticks: u64| ticks * 1000 / h.info.tsc_hz.max(1);
-    sel4::debug_println!(
+    log!(
         "l4h-root: watchdog: netd used {} ms, vmmgr {} ms since the last dump",
         ms(h.netd.consumed()), ms(h.vmmgr.as_ref().map_or(0, |v| v.consumed()))
     );
@@ -659,7 +673,7 @@ fn serve(h: &mut Host, reply_slot: ReplySlot) -> ! {
         } else if badge & ROOT_BADGE_COMPONENT != 0 {
             component_call(h, badge, &info)
         } else {
-            sel4::debug_println!("l4h-root: unexpected message, badge {:#x} label {}", badge, info.label());
+            log!("l4h-root: unexpected message, badge {:#x} label {}", badge, info.label());
             None
         };
         match resp {
@@ -684,7 +698,7 @@ fn component_call(h: &mut Host, badge: u64, info: &sel4::MessageInfo) -> Option<
     let id = (badge & 0xffff) as u32;
     if badge & HYP_BADGE_FAULT != 0 {
         let fault = sel4::with_ipc_buffer(|b| sel4::Fault::new(b, info));
-        sel4::debug_println!("l4h-root: component {:#x} fault: {:x?}", id, fault);
+        log!("l4h-root: component {:#x} fault: {:x?}", id, fault);
         trustd::fault(h, id);
         return None;
     }
@@ -700,7 +714,7 @@ fn component_call(h: &mut Host, badge: u64, info: &sel4::MessageInfo) -> Option<
         }
         label if id == l4h_host::vmmgr::VMMGR_ID => Some(vmmgr::call(h, label)),
         other => {
-            sel4::debug_println!("l4h-root: component {:#x}: unknown call {}", id, other);
+            log!("l4h-root: component {:#x}: unknown call {}", id, other);
             reply(u64::MAX)
         }
     }
