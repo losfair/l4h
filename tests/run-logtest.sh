@@ -8,8 +8,11 @@ source "$root/tools/guest-env.sh"
 out=$root/build/logtest
 mkdir -p "$out/mod"
 cp "$root"/tests/guest/log-fault/* "$out/mod/"
-"$root/tools/build-linux.sh" vmlinux >"$out/kernel-build.log" 2>&1
-"$root/tools/build-linux.sh" M="$out/mod" modules >"$out/module-build.log" 2>&1
+# External modules need Module.symvers, produced by the modules target.
+"$root/tools/build-linux.sh" vmlinux modules >"$out/kernel-build.log" 2>&1 \
+    || { cat "$out/kernel-build.log"; exit 1; }
+"$root/tools/build-linux.sh" M="$out/mod" modules >"$out/module-build.log" 2>&1 \
+    || { cat "$out/module-build.log"; exit 1; }
 "$root/tools/build-l4hctl.sh"
 "$root/tools/mkinitramfs.sh" "$out/logvm.cpio.gz" "$root/tests/guest/init-logvm" \
     "$out/mod/l4h_log_fault.ko" >/dev/null
