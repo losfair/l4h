@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Fault/panic/shutdown diagnostics through l4hctl, including quiet builds.
 set -euo pipefail
+# e2fsprogs installs mkfs.ext4 and debugfs outside an ordinary user's PATH.
+export PATH="$PATH:/usr/sbin:/sbin"
 root=$(cd "$(dirname "$0")/.." && pwd)
 source "$root/tools/guest-env.sh"
 out=$root/build/logtest
