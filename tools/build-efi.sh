@@ -7,6 +7,7 @@
 #   generic       x2APIC, PCID: QEMU/KVM and GCE
 #   xapic-nopcid  xAPIC, no PCID: machines whose firmware leaves x2APIC off
 #                 and CPUs without PCID (Latitude.sh m4.metal.small)
+#   skim-xapic-nopcid  SKIM, xAPIC, no PCID: Meltdown-affected CPUs
 # L4H_RELEASE=1 builds release kernels and host components.
 # build/efi/l4h-bios-x86_64.tar.xz holds l4h's files for BIOS machines
 # (tools/mkbios.sh), with each variant's kernel as kernel-VARIANT.elf; the
@@ -20,12 +21,13 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 out=$root/build/efi
 mkdir -p "$out"
 variants=(
-    "generic X2APIC ON"
-    "xapic-nopcid XAPIC OFF"
+    "generic X2APIC ON OFF"
+    "xapic-nopcid XAPIC OFF OFF"
+    "skim-xapic-nopcid XAPIC OFF ON"
 )
 for v in "${variants[@]}"; do
-    read -r name lapic pcid <<<"$v"
-    L4H_KERNEL_VARIANT=$name L4H_LAPIC_MODE=$lapic L4H_PCID=$pcid \
+    read -r name lapic pcid skim <<<"$v"
+    L4H_KERNEL_VARIANT=$name L4H_LAPIC_MODE=$lapic L4H_PCID=$pcid L4H_SKIM_WINDOW=$skim \
         "$root/tools/build-kernel.sh" >"$out/kernel-$name.log" 2>&1 \
         || { tail -20 "$out/kernel-$name.log"; exit 1; }
 done

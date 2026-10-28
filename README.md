@@ -119,6 +119,11 @@ yum, and downloads a tagged GitHub release with SHA-256 verification.
 The release must include the installer (older releases are rejected).
 No source build or hardware virtualization extensions are needed.
 
+Preflight selects `skim-xapic-nopcid` (SKIM isolation, xAPIC, no PCID) for
+Meltdown-affected CPUs or when immunity cannot be established. Unaffected
+CPUs use `generic` (x2APIC, PCID and INVPCID) or `xapic-nopcid`.
+All variants still require FSGSBASE, XSAVEOPT, AVX and 1 GiB pages.
+
 Preflight checks CPU features, Meltdown status, Secure Boot, EFI variables
 and the ESP (UEFI) or GRUB (BIOS), storage, network and userspace. Automatic migration currently
 supports headless systemd installations with a plain ext4/XFS root,
@@ -169,7 +174,8 @@ The installer recognizes its record in `/var/lib/l4h/install.json`; older
 records identify the variant by matching the installed boot file against
 the previous release (use `--variant` if that release is unavailable).
 `--check` also works for updates. The selected release must include update
-support.
+support. Switching from SKIM to a variant without it requires native Linux
+so the installer can check the host CPU.
 
 Native Linux updates recreate missing EFI entries; BIOS updates recreate
 missing generated GRUB entries. Missing boot payloads are restored when the

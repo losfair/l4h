@@ -552,9 +552,10 @@ be installed. The checks cover:
   \item 64-bit UEFI with writable efivarfs and Secure Boot disabled, or
         BIOS with the distribution's GRUB (below); and ACPI;
   \item Intel or AMD CPUs with the seL4 release's required features
-        (including FSGSBASE, XSAVEOPT, AVX and 1 GiB pages), unaffected by
-        Meltdown, and APIC IDs below 256. VMX/SVM and an IOMMU are not
-        required;
+        (including FSGSBASE, XSAVEOPT, AVX and 1 GiB pages), and APIC IDs
+        below 256. Meltdown-affected CPUs, or CPUs whose immunity cannot
+        be established, use the \texttt{skim-xapic-nopcid} variant.
+        VMX/SVM and an IOMMU are not required;
   \item at least 768 MiB usable RAM (normally 1 GiB installed). By default
         dom0 gets half the usable RAM, clamped to 512--8192 MiB.
         \texttt{--memory MiB} accepts 512--61440 MiB while leaving at least
@@ -599,10 +600,11 @@ MACs to restore the original Linux interface names, including when the
 names need to be exchanged. The existing distribution configuration
 supplies addresses, routes and DNS on both networks.
 
-The installer chooses the generic application when PCID and x2APIC are
-available, otherwise xapic-nopcid. \texttt{--variant NAME} overrides this
-choice. CPU capabilities cannot prove the firmware's APIC state at the
-next boot: test the selected variant before making it permanent.
+The installer chooses \texttt{skim-xapic-nopcid} when Meltdown isolation
+is needed. Otherwise it chooses generic when PCID, INVPCID and x2APIC
+are available, or xapic-nopcid. \texttt{--variant NAME} overrides this
+choice subject to the same CPU checks. CPU capabilities cannot prove the
+firmware's APIC state at the next boot: test the selected variant before making it permanent.
 Likewise, applications depending on native devices or kernel features,
 and network profiles matching a PCI path or native driver rather than
 an interface name or MAC, may need adaptation. A passing preflight is
@@ -743,16 +745,20 @@ dom0_cmdline="console=hvc0 root=/dev/vda2 rw"
 
 \begin{caveat}
 Some seL4 options cannot be set at boot, so there is one application per
-variant. \cmd{tools/build-efi.sh} builds both into \file{build/efi}:
-\file{l4h-generic.efi} (x2APIC, PCID) for QEMU and GCE, and
-\file{l4h-xapic-nopcid.efi} for machines whose firmware leaves x2APIC off
-or whose CPU lacks PCID, such as Latitude.sh's m4.metal.small. The generic
-variant stops early in boot on those machines.
+variant. \cmd{tools/build-efi.sh} builds three into \file{build/efi}:
+\file{l4h-generic.efi} (x2APIC, PCID and INVPCID),
+\file{l4h-xapic-nopcid.efi} (xAPIC, no PCID), and
+\file{l4h-skim-xapic-nopcid.efi} (SKIM isolation, xAPIC, no PCID).
+The first two require CPUs unaffected by Meltdown; the third supports
+otherwise compatible affected CPUs, with additional page-table switching
+cost on kernel entry and return. The installer selects the appropriate
+variant. Updates preserve it; switching away from SKIM requires native
+Linux to check the host CPU.
 \end{caveat}
 
 Each tagged release on GitHub carries, for x86\_64:
 \begin{itemize}
-  \item both applications, built in release mode, with the guest kernel
+  \item all three applications, built in release mode, with the guest kernel
         and its module tree in them;
   \item \file{l4h-bios-x86\_64.tar.xz}: the same for BIOS machines
         (Section~\ref{sec:bios}), with each variant's kernel as

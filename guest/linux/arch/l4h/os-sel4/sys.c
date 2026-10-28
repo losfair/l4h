@@ -209,8 +209,7 @@ int l4h_tcb_set_flags(unsigned long tcb, unsigned long clear, unsigned long set)
 
 	if (r.error)
 		return r.error;
-	/* The kernel ignores flags it does not support (trapSyscalls with the
-	 * x86 SKIM window). */
+	/* The kernel ignores flags it does not support. */
 	return (r.flags & set) == set ? 0 : seL4_IllegalOperation;
 }
 

@@ -25,6 +25,7 @@ user_prog:
 3:	mov	x8, #172
 	mov	x7, x13
 	svc	#0
+	sub	sp, sp, #16
 	sub	x13, x13, #1
 	cmn	x13, #64
 	b.ge	3b
@@ -66,6 +67,7 @@ user_prog:
 	movq	%rbx, %r8
 	movq	%rbx, %r9
 	syscall
+	subq	$16, %rsp
 	decq	%rbx
 	cmpq	$-64, %rbx
 	jge	3b

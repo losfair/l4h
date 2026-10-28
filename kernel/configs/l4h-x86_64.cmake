@@ -15,12 +15,9 @@ set(KernelSupportPCID ON CACHE BOOL "")
 set(KernelLAPICMode "X2APIC" CACHE STRING "")
 set(KernelIOMMU OFF CACHE BOOL "")
 set(KernelVTX OFF CACHE BOOL "")
-# The Meltdown "skim window" is incompatible with preserving user RSP across
-# syscalls (patch 0004); l4h targets CPUs that are not affected by Meltdown.
-# On an affected CPU (IA32_ARCH_CAPABILITIES.RDCL_NO clear, or an Intel CPU
-# without the MSR, e.g. Intel before Cascade Lake) any guest could read all
-# RAM through the kernel window, so the kernel refuses to boot there
-# (patch 0024, DESIGN.md §4).
+# The default variants require a CPU unaffected by Meltdown (patch 0024).
+# The skim-xapic-nopcid variant enables isolation for affected CPUs;
+# patch 0027 preserves Linux syscall RSP across SKIM's CR3 switches.
 set(KernelSkimWindow OFF CACHE BOOL "")
 set(KernelRootCNodeSizeBits "19" CACHE STRING "")
 set(KernelMaxNumBootinfoUntypedCaps "230" CACHE STRING "")

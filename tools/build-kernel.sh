@@ -5,6 +5,7 @@
 # (default X2APIC, faster under virtualization).  L4H_PCID=OFF builds for
 # CPUs without process-context identifiers (CPUID.1:ECX.PCID), such as the
 # AMD EPYC 4004 series; seL4 otherwise stops in its first boot checks.
+# L4H_SKIM_WINDOW=ON isolates kernel mappings on Meltdown-affected CPUs.
 # L4H_KERNEL_VARIANT=NAME builds in build/kernel-NAME and installs to
 # build/sel4-NAME instead, leaving the default build alone
 # (tools/build-efi.sh builds the shipped variants so).
@@ -28,6 +29,7 @@ cmake -G Ninja -S "$src" -B "$out" \
     -DKernelDebugBuild=$debug \
     -DKernelLAPICMode="${L4H_LAPIC_MODE:-X2APIC}" \
     -DKernelSupportPCID="${L4H_PCID:-ON}" \
+    -DKernelSkimWindow="${L4H_SKIM_WINDOW:-OFF}" \
     -DCMAKE_INSTALL_PREFIX="$prefix" \
     -DCROSS_COMPILER_PREFIX= >/dev/null
 ninja -C "$out" all

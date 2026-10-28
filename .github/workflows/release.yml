@@ -98,6 +98,7 @@ jobs:
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
               --title "l4h $GITHUB_REF_NAME" --generate-notes \
               build/efi/l4h-generic.efi build/efi/l4h-xapic-nopcid.efi \
+              build/efi/l4h-skim-xapic-nopcid.efi \
               build/efi/l4h-bios-x86_64.tar.xz \
               build/efi/l4h-dom0-x86_64.tar.xz build/efi/l4h-debug-x86_64.tar.xz \
               build/efi/l4h-attest.py build/efi/l4h-manual.pdf build/efi/SHA256SUMS

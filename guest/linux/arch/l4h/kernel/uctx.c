@@ -136,8 +136,7 @@ static int uctx_create(struct task_struct *t)
 	u->fault_ep_vcpu = -1;
 	u->sc_vcpu = -1;
 	u->vspace = 0;
-	/* Only a kernel without trapSyscalls (an x86 one with the SKIM window)
-	 * refuses: not an allocation failure to retry. */
+	/* Missing syscall-trap support is not an allocation failure to retry. */
 	if (l4h_tcb_set_flags(u->tcb, 1 /* fpuDisabled */, 2 /* trapSyscalls */))
 		panic("l4h: the seL4 kernel cannot trap user syscalls\n");
 	u->state = L4H_UCTX_FRESH;

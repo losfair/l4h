@@ -13,6 +13,7 @@
 # tools/mkimage.sh, or the menu entry of the Linux installer
 # (tools/install) in the distribution's GRUB.
 # There is no measured boot: GRUB's tpm module works only on UEFI.
+# L4H_KERNEL_VARIANT selects a built seL4 variant when kernel.elf is omitted.
 # Usage: mkbios.sh <outdir> [l4h-root.elf] [kernel.elf]
 # L4H_GUEST_KERNEL, L4H_GUEST_KMODS, L4H_SERIAL_PORT and L4H_FB_CONSOLE are
 # as for tools/mkefi.sh.
@@ -20,7 +21,7 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 out=$1
 rootserver=${2:-$root/host/target/x86_64-sel4-roottask/debug/l4h-root.elf}
-kernel=${3:-$root/build/sel4/bin/kernel.elf}
+kernel=${3:-$root/build/sel4${L4H_KERNEL_VARIANT:+-$L4H_KERNEL_VARIANT}/bin/kernel.elf}
 guest_kernel=${L4H_GUEST_KERNEL:-$root/build/linux-l4h/vmlinux}
 guest_kmods=${L4H_GUEST_KMODS-$(dirname "$guest_kernel")/kmods.erofs}
 mkdir -p "$out"

@@ -90,6 +90,8 @@ jobs:
         run: tests/run-selftest.sh 1
       - name: Linux self-test, 4 vCPUs
         run: tests/run-selftest.sh 4
+      - name: SKIM isolation and Linux ABI on Meltdown-affected CPU profiles
+        run: tests/run-skimtest.sh
       - name: AArch64 userspace on x86_64 (kemu)
         run: tests/run-kemutest.sh 4
       - name: Guest RAM blocks (conversion, smp_mm_stress, OOM)

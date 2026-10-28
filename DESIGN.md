@@ -120,17 +120,17 @@ Configuration:
 - `KernelXSave=XSAVEOPT`, with `KernelXSaveFeatureSet=7` covering x87,
   SSE and AVX. The guest hides AVX-512, AMX and PKU, which seL4 does not
   enable.
-- `KernelSkimWindow=OFF`, required by patch 0004's preservation of user
-  RSP across syscalls. l4h targets CPUs unaffected by Meltdown (see below).
-  On a CPU affected by Meltdown (`IA32_ARCH_CAPABILITIES.RDCL_NO` clear:
-  most Intel parts before Cascade Lake, such as GCE N1 and E2 on Skylake
-  or Broadwell hosts) any guest thread could read the kernel window, which
-  maps all RAM, including other guests' memory. The kernel refuses to boot
-  there: seL4 already did when the MSR reports the CPU vulnerable, and
-  patch 0024 also does on Intel CPUs that do not enumerate the MSR, which
-  cannot report RDCL_NO. AMD CPUs, which are not affected, need no MSR.
-  KVM always provides the MSR to `-cpu host` guests (`tools/run-qemu.sh`),
-  with RDCL_NO set unless the host is affected.
+- `KernelSkimWindow=OFF` for the default variants, which require a CPU
+  unaffected by Meltdown. The `skim-xapic-nopcid` variant sets it `ON`,
+  uses xAPIC and disables PCID. SKIM removes the full kernel/RAM window
+  from user page tables, protecting against Meltdown on affected CPUs.
+  Patch 0027 preserves the user RSP across SKIM's page-table switches,
+  so Linux syscall trapping works with either configuration.
+  Builds without SKIM refuse to boot when `IA32_ARCH_CAPABILITIES.RDCL_NO`
+  is clear, or on Intel CPUs that do not enumerate that MSR (patch 0024).
+  The installer chooses SKIM for affected/unknown CPUs, preserves the
+  installed variant on updates, and requires native Linux to validate a
+  switch away from SKIM. The PCID variant requires INVPCID as well as PCID.
 
 Release builds turn the debug syscalls off but keep kernel printing on, for
 the host components' serial log: `seL4_DebugPutChar` and
@@ -342,13 +342,12 @@ guest. Where there is an AMD-Vi or Intel VT-d IOMMU, root drives it itself (§8.
   libsel4 convention of keeping RSP in RBX made this work. Trapped Linux
   threads returned with RSP = 0. The patch saves RSP on entry, through a
   per-node scratch slot, and restores it on `sysretq`, on both the slow
-  path and the fastpath. It requires `KernelSkimWindow=OFF`, the Meltdown
-  mitigation. The CPUs l4h targets, such as GCP N2 (Cascade Lake and Ice
-  Lake), C3/N4/C4 (Sapphire Rapids and later) and recent AMD parts, are not
-  affected by Meltdown. On the others the kernel refuses to boot (0024 and
-  the configuration above). A kernel built with the SKIM window
-  ignores `seL4_TCBFlag_trapSyscalls`, and the guest then panics rather
-  than run Linux processes untrapped.
+  path and the fastpath. Patch 0027 extends this to SKIM: save RSP before
+  loading the kernel CR3, and carry the return RSP through the existing
+  per-CPU SKIM scratch word (a global word for UP). The scratch word is
+  cleared after each read, including interrupt return's RCX. No user-stack
+  memory is accessed and no TCB or full kernel mapping is added to SKIM.
+  `trapSyscalls` is now supported in both configurations.
 - **0005, SMP IPI barrier.** `ipi_wait()` reset its arrival counter and
   released waiters with two unordered plain stores, and GCC emits them in
   the wrong order. A following remote call (TLB shootdown, remote TCB stall)
@@ -459,8 +458,9 @@ guest. Where there is an AMD-Vi or Intel VT-d IOMMU, root drives it itself (§8.
   the SKIM window when `IA32_ARCH_CAPABILITIES` reports the CPU vulnerable
   to Meltdown, but only warned when an Intel CPU does not enumerate the
   MSR. Intel CPUs that are not vulnerable report RDCL_NO, which needs the
-  MSR, so such a CPU is vulnerable (Linux treats it so too), and l4h runs
-  without the SKIM window (0004). It now refuses to boot there as well.
+  MSR, so such a CPU is treated as vulnerable. Builds without SKIM
+  now refuse to boot there as well; the
+  SKIM variant supports those CPUs through patch 0027.
 - **0025, remapped I/O APIC handlers (x86).** `GetIOAPICRemapped` adds a
   16-bit interrupt-remapping table index to the ordinary I/O APIC handler
   arguments. Root publishes the matching VT-d IRTE before invoking it.
@@ -2737,13 +2737,14 @@ The TPM enables signing; it does not decide whether seals work (§9.2).
 - **Variants.** The application is the same for every host except for
   seL4 options fixed at build time. `tools/build-efi.sh` builds the
   shipped ones into `build/efi/`: `l4h-generic.efi` (x2APIC, PCID: QEMU,
-  GCE) and `l4h-xapic-nopcid.efi` (Latitude.sh, below). The host
+  GCE), `l4h-xapic-nopcid.efi` (Latitude.sh, below), and
+  `l4h-skim-xapic-nopcid.efi` (Meltdown isolation, xAPIC, no PCID). The host
   components do not depend on these options, so all variants share one
   `l4h-root`.
 - **Releases.** CI (`.github/workflows/release.yml`) builds, for x86_64
   only, and attaches to the GitHub release of each pushed `v*` tag, with
   `SHA256SUMS`:
-  - both applications, in release mode;
+  - all three applications, in release mode;
   - `l4h-bios-x86_64.tar.xz`: l4h's BIOS files (`tools/mkbios.sh`), with
     each variant's kernel as `kernel-VARIANT.elf`, for the installer;
   - `l4h-dom0-x86_64.tar.xz` (`tools/build-dom0.sh`): the `ARCH=l4h`

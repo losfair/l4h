@@ -12,6 +12,7 @@
 # Measured boot: the firmware measures this application, with everything
 # in it, into PCR 4; GRUB's tpm module measures what it reads (the files
 # above) into PCR 9 and its commands into PCR 8 (DESIGN.md §9.2).
+# L4H_KERNEL_VARIANT selects a built seL4 variant when kernel.elf is omitted.
 # Usage: mkefi.sh <out.efi> [l4h-root.elf] [kernel.elf]
 # L4H_GUEST_KERNEL is the guest kernel (default: build/linux-l4h/vmlinux)
 # and L4H_GUEST_KMODS its module tree (default: kmods.erofs next to it,
@@ -26,7 +27,7 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 out=$1
 rootserver=${2:-$root/host/target/x86_64-sel4-roottask/debug/l4h-root.elf}
-kernel=${3:-$root/build/sel4/bin/kernel.elf}
+kernel=${3:-$root/build/sel4${L4H_KERNEL_VARIANT:+-$L4H_KERNEL_VARIANT}/bin/kernel.elf}
 guest_kernel=${L4H_GUEST_KERNEL:-$root/build/linux-l4h/vmlinux}
 guest_kmods=${L4H_GUEST_KMODS-$(dirname "$guest_kernel")/kmods.erofs}
 work=$(mktemp -d)

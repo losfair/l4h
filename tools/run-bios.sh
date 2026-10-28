@@ -10,7 +10,7 @@ disk=$1; shift
 balloon=()
 [ "${L4H_BALLOON:-1}" = 1 ] && balloon=(-device virtio-balloon-pci,free-page-reporting=on,disable-legacy=on)
 exec qemu-system-x86_64 \
-    -enable-kvm -cpu host,-vmx,+invtsc \
+    -enable-kvm -cpu "${L4H_QEMU_CPU:-host,-vmx,+invtsc}" \
     -smp "${L4H_SMP:-4}" -m "${L4H_MEM:-4G}" \
     -machine pc \
     -nographic -serial mon:stdio -no-reboot \

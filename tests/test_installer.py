@@ -35,7 +35,7 @@ class Machine:
         self.write("/sys/firmware/efi/efivars/SecureBoot-" + installer.EFI_GLOBAL, b"\x07\0\0\0\0")
         self.write("/sys/firmware/acpi/tables/APIC", "MADT")
         self.write("/proc/cpuinfo", "processor: 0\nvendor_id: GenuineIntel\napicid: 0\nflags: " +
-                   " ".join(installer.CPU_FLAGS | {"arch_capabilities", "pcid", "x2apic"}))
+                   " ".join(installer.CPU_FLAGS | {"arch_capabilities", "pcid", "invpcid", "x2apic"}))
         self.write("/proc/meminfo", "MemTotal: 8388608 kB")
         self.write("/proc/1/comm", "systemd")
         self.write("/sys/devices/system/cpu/vulnerabilities/meltdown", "Not affected")
@@ -242,6 +242,30 @@ class UpdateChecks:
         directory = state["esp"] + "/l4h" if state["firmware"] == "uefi" else "/boot/l4h"
         return self.machine.path(directory + "/l4h.conf")
 
+    def test_skim_install_and_native_dom0_updates(self):
+        self.machine.write("/sys/devices/system/cpu/vulnerabilities/meltdown", "Mitigation: PTI")
+        self.commit()
+        self.assertEqual(self.check()["variant"], "skim-xapic-nopcid")
+        self.commit()
+        self.args.variant = "xapic-nopcid"
+        self.machine.calls.clear()
+        self.rejected("requires the skim-xapic-nopcid")
+        self.args.variant = None
+        self.machine.dom0()
+        self.assertEqual(self.check()["variant"], "skim-xapic-nopcid")
+        self.commit()
+        for variant in ("generic", "xapic-nopcid"):
+            self.args.variant = variant
+            self.rejected("requires native Linux")
+
+    def test_dom0_can_enable_skim(self):
+        self.commit()
+        self.machine.dom0()
+        self.args.variant = "skim-xapic-nopcid"
+        self.commit()
+        self.args.variant = None
+        self.assertEqual(self.check()["variant"], "skim-xapic-nopcid")
+
     def test_native_update_preserves_config_and_variant(self):
         self.args.variant = "xapic-nopcid"
         self.commit()
@@ -373,9 +397,40 @@ class InstallerTests(UpdateChecks, Harness):
         self.machine.write(name, b"\x07\0\0\0")
         self.rejected("Secure Boot")
 
-    def test_mitigated_meltdown_is_not_unaffected(self):
-        self.machine.write("/sys/devices/system/cpu/vulnerabilities/meltdown", "Mitigation: PTI")
-        self.rejected("unaffected by Meltdown")
+    def test_affected_or_unknown_cpu_selects_skim(self):
+        path = "/sys/devices/system/cpu/vulnerabilities/meltdown"
+        for status in ("Mitigation: PTI", "Vulnerable", "Unknown", ""):
+            with self.subTest(status=status):
+                self.machine.write(path, status)
+                self.args.variant = None
+                self.assertEqual(self.check()["variant"], "skim-xapic-nopcid")
+                for variant in ("generic", "xapic-nopcid"):
+                    self.args.variant = variant
+                    self.rejected("requires the skim-xapic-nopcid")
+        self.args.variant = None
+        self.machine.path(path).unlink()
+        self.assertEqual(self.check()["variant"], "skim-xapic-nopcid")
+
+    def test_intel_without_arch_capabilities_selects_skim(self):
+        cpu = self.machine.path("/proc/cpuinfo")
+        cpu.write_text(cpu.read_text().replace("arch_capabilities", ""))
+        self.assertEqual(self.check()["variant"], "skim-xapic-nopcid")
+        self.args.variant = "generic"
+        self.rejected("requires the skim-xapic-nopcid")
+        self.args.variant = None
+        cpu.write_text(cpu.read_text().replace("GenuineIntel", "AuthenticAMD"))
+        self.assertEqual(self.check()["variant"], "generic")
+
+    def test_explicit_skim_on_unaffected_cpu(self):
+        self.args.variant = "skim-xapic-nopcid"
+        self.assertEqual(self.check()["variant"], "skim-xapic-nopcid")
+
+    def test_pcid_without_invpcid_uses_fallback(self):
+        cpu = self.machine.path("/proc/cpuinfo")
+        cpu.write_text(cpu.read_text().replace("invpcid", ""))
+        self.assertEqual(self.check()["variant"], "xapic-nopcid")
+        self.args.variant = "generic"
+        self.rejected("INVPCID")
 
     def test_missing_cpu_feature(self):
         cpu = self.machine.path("/proc/cpuinfo")
@@ -836,12 +891,14 @@ class InstallerTests(UpdateChecks, Harness):
     def test_legacy_efi_variant_matches_release_checksum(self):
         self.package()
         checksum = installer.digest(self.root / "new.efi")
-        def download(*args):
-            Path(args[args.index("--output") + 1]).write_text(checksum + "  l4h-xapic-nopcid.efi\n")
-        with patch.object(installer, "run", side_effect=download):
-            self.assertEqual(installer.installed_variant("vold", "uefi", checksum), "xapic-nopcid")
-            with self.assertRaisesRegex(installer.Incompatible, "specify --variant"):
-                installer.installed_variant("vold", "uefi", "0" * 64)
+        for variant in installer.KERNEL_VARIANTS:
+            with self.subTest(variant=variant):
+                def download(*args):
+                    Path(args[args.index("--output") + 1]).write_text(checksum + "  l4h-" + variant + ".efi\n")
+                with patch.object(installer, "run", side_effect=download):
+                    self.assertEqual(installer.installed_variant("vold", "uefi", checksum), variant)
+                    with self.assertRaisesRegex(installer.Incompatible, "specify --variant"):
+                        installer.installed_variant("vold", "uefi", "0" * 64)
 
     def test_disk_full_before_efi(self):
         plan = self.check()
@@ -953,7 +1010,7 @@ class BiosInstallerTests(UpdateChecks, Harness):
             self.machine.write("/bios/" + name, "release " + name)
         for name in ("l4h-root.elf", "vmlinux"):
             self.machine.write("/bios/" + name, elf())
-        for variant in ("generic", "xapic-nopcid"):
+        for variant in installer.KERNEL_VARIANTS:
             self.machine.write("/bios/kernel-" + variant + ".elf", elf(True) + variant.encode())
         return bios
 
@@ -1160,7 +1217,10 @@ class BiosInstallerTests(UpdateChecks, Harness):
             else:
                 shutil.copyfile(archive, dest)
         with patch.object(installer, "run", side_effect=download):
-            self.assertEqual(installer.installed_variant("vold", "bios", installer.digest(bios / "kernel-generic.elf")), "generic")
+            for variant in installer.KERNEL_VARIANTS:
+                with self.subTest(variant=variant):
+                    checksum = installer.digest(bios / ("kernel-" + variant + ".elf"))
+                    self.assertEqual(installer.installed_variant("vold", "bios", checksum), variant)
 
     def test_disk_full_before_grub(self):
         plan = self.check()

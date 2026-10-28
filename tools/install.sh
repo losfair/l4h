@@ -17,7 +17,7 @@ Usage: curl -fsSL https://raw.githubusercontent.com/losfair/l4h/main/tools/insta
   --esp PATH              Mounted EFI system partition (UEFI; otherwise auto-detect)
   --memory MiB            dom0 RAM (default: half of usable RAM, clamped to 512..8192 MiB)
   --vcpus N               dom0 CPUs (default: up to 4)
-  --variant NAME          generic or xapic-nopcid (otherwise select from CPU features)
+  --variant NAME          generic, xapic-nopcid, or skim-xapic-nopcid (otherwise auto-select)
   --assume-stable-tsc      Allow missing constant_tsc for experimental installs;
                           assume the TSC is stable without verifying it
   --make-default          Make L4H the default boot entry (default: one-time

@@ -8,7 +8,9 @@
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 rootserver=$("$root/tools/dom0-modules.sh" "$1"); shift
-objcopy -O elf32-i386 "$root/build/sel4/bin/kernel.elf" "$root/build/kernel32.elf"
+# Test a shipped kernel variant with the same host and guest binaries.
+sel4=$root/build/sel4${L4H_KERNEL_VARIANT:+-$L4H_KERNEL_VARIANT}
+objcopy -O elf32-i386 "$sel4/bin/kernel.elf" "$root/build/kernel32.elf"
 # l4h reports its free memory to QEMU, which then drops it
 # (L4H_BALLOON=0 leaves the device out, L4H_BALLOON=legacy makes it a
 # legacy-only device).
@@ -36,7 +38,7 @@ if [ ${#iommu[@]} -ne 0 ]; then
         -global virtio-net-pci.iommu_platform=on)
 fi
 exec qemu-system-x86_64 \
-    -enable-kvm -cpu host,-vmx,+invtsc \
+    -enable-kvm -cpu "${L4H_QEMU_CPU:-host,-vmx,+invtsc}" \
     -smp "${L4H_SMP:-4}" -m "${L4H_MEM:-4G}" \
     -nographic -serial mon:stdio -no-reboot "${iommu[@]}" \
     -kernel "$root/build/kernel32.elf" \

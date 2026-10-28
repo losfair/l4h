@@ -65,6 +65,7 @@ static inline uint64_t rdtsc(void)
 #define SYS_getpid		172
 #define SYS_exit		93
 /* Linux syscall number (x8; patch 0007) and the seL4 one (x7). */
+#define MR_SP		seL4_UnknownSyscall_SP
 #define MR_SYSNO		seL4_UnknownSyscall_Syscall
 #define MR_SEL4NO		seL4_UnknownSyscall_X7
 #define MR_RET			seL4_UnknownSyscall_X0
@@ -79,6 +80,7 @@ static inline uint64_t rdtsc(void)
 #else
 #define SYS_getpid		39
 #define SYS_exit		60
+#define MR_SP		seL4_UnknownSyscall_SP
 #define MR_SYSNO		seL4_UnknownSyscall_RAX
 #define MR_SEL4NO		seL4_UnknownSyscall_RDX
 #define MR_RET			seL4_UnknownSyscall_RAX
@@ -211,6 +213,8 @@ static int user_test(void)
 	seL4_UserContext regs = { 0 };
 	seL4_MessageInfo_t info;
 	seL4_Word badge;
+	/* Deliberately unmapped: entry/return must not touch the user stack. */
+	unsigned long user_sp = 0x7f0000000000;
 	int err;
 
 	CHECK(prog_frame, "no program frame copy", 0);
@@ -236,9 +240,9 @@ static int user_test(void)
 	seL4_TCB_SetFlags_t fl = seL4_TCB_SetFlags(utcb, seL4_TCBFlag_fpuDisabled, seL4_TCBFlag_trapSyscalls);
 	CHECK(fl.error == 0 && fl.flags == seL4_TCBFlag_trapSyscalls, "setflags=", fl.flags);
 #ifdef __aarch64__
-	regs.sp = 0x7f0000000000;
+	regs.sp = user_sp;
 #else
-	regs.rsp = 0x7f0000000000;
+	regs.rsp = user_sp;
 #endif
 	err = write_pc(&regs, ABITEST_USER_VA);
 	CHECK(err == 0, "write regs err=", err);
@@ -260,6 +264,8 @@ static int user_test(void)
 	ar = frame_accessed(prog_frame);
 	CHECK(ar.error == 0 && ar.accessed == 0, "instruction access counted twice=", ar.accessed);
 
+	CHECK(sysregs[MR_SP] == user_sp, "syscall SP=", sysregs[MR_SP]);
+
 	/* E2: the user thread's xmm0 / d0 is visible through ReadFPU. */
 	err = seL4_TCB_ReadFPU(utcb, L4H_CPTR(vcpu_caps + L4H_VCPU_IPCBUF), L4H_FPU_SCRATCH_OFFSET);
 	CHECK(err == 0, "readfpu err=", err);
@@ -269,6 +275,9 @@ static int user_test(void)
 
 	/* Return pid 777 and step over the syscall instruction. */
 	sysregs[MR_RET] = 777;
+	/* Return a different SP, then let user code change it on every call. */
+	user_sp -= 128;
+	sysregs[MR_SP] = user_sp;
 	sysregs[seL4_UnknownSyscall_FaultIP] += SYSCALL_INSN_LEN;
 	for (int i = 0; i < MR_COUNT; i++)
 		seL4_SetMR(i, sysregs[i]);
@@ -302,6 +311,8 @@ static int user_test(void)
 		seL4_Word r[MR_COUNT];
 		for (int i = 0; i < MR_COUNT; i++)
 			r[i] = seL4_GetMR(i);
+		CHECK(r[MR_SP] == user_sp, "sweep SP=", r[MR_SP]);
+		user_sp -= 16;
 		if (n == -1) {
 			/* On Cortex-A57 AF=0 caused a kernel-only data abort:
 			 * the next delivered event must still be this syscall. */
@@ -323,6 +334,7 @@ static int user_test(void)
 	CHECK(seL4_MessageInfo_get_label(info) == seL4_Fault_UnknownSyscall, "label3=",
 	      seL4_MessageInfo_get_label(info));
 	CHECK(seL4_GetMR(MR_SYSNO) == SYS_exit, "sysno3=", seL4_GetMR(MR_SYSNO));
+	CHECK(seL4_GetMR(MR_SP) == user_sp, "exit SP=", seL4_GetMR(MR_SP));
 	CHECK(seL4_GetMR(MR_ARG0) == 777, "exit code=", seL4_GetMR(MR_ARG0));
 	say("syscall return value reached user mode");
 	seL4_TCB_Suspend(utcb);
