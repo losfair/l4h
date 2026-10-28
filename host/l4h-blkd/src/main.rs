@@ -155,14 +155,15 @@ impl Client {
 }
 
 impl Blkd {
-    fn reap(&mut self) -> bool {
+    fn reap(&mut self) -> Option<u32> {
         let Blkd { drv, pending, clients, .. } = self;
-        let mut provision = false;
+        let mut provision = None;
         drv.reap(&mut |tag, status| {
             if tag == u64::MAX {
-                provision = true;
-                // Provisioning is serialized by l4h-root.
-                set_mr(1, status as u64);
+                // Provisioning is serialized by l4h-root. Keep its result
+                // outside the IPC buffer: the driver may still invoke the
+                // kernel after this callback (e.g. a legacy SCSI retry).
+                provision = Some(status);
                 return;
             }
             if let Some(p) = pending.get_mut(tag as usize).and_then(|p| p.take()) {
@@ -261,7 +262,7 @@ impl Blkd {
         if let Err(status) = result { return status as u64; }
         self.drv.kick();
         loop {
-            if self.reap() { return mr(1); }
+            if let Some(status) = self.reap() { return status as u64; }
             if host::ticks::now() > end { return u64::MAX; }
             core::hint::spin_loop();
         }
@@ -306,14 +307,15 @@ fn main(info: &'static Info) -> ! {
             (msg, badge) = ep.recv(reply);
             continue;
         }
+        let mut response = [0; 5];
         let result = match msg.label() {
             blk::BLKD_INFO => {
-                set_mr(3, b.dev.len() as u64);
+                response[3] = b.dev.len() as u64;
                 match b.dev.get(mr(0) as usize) {
                     Some(d) => {
-                        set_mr(1, d.block_size as u64);
-                        set_mr(2, d.read_only as u64);
-                        set_mr(4, d.address);
+                        response[1] = d.block_size as u64;
+                        response[2] = d.read_only as u64;
+                        response[4] = d.address;
                         d.capacity
                     }
                     None => u64::MAX,
@@ -353,10 +355,13 @@ fn main(info: &'static Info) -> ! {
             blk::BLKD_FLUSH => b.provision(cfg, mr(0) as usize, 0, 0, true),
             _ => u64::MAX,
         };
-        set_mr(0, result);
+        response[0] = result;
         // Service calls can have reaped completions while polling. A kick
         // may have been coalesced, so always revisit all pending channels.
         b.submit();
+        // Legacy virtio kicks invoke IOPort capabilities and overwrite MRs.
+        // Marshal the whole reply only after that work has finished.
+        for (i, v) in response.into_iter().enumerate() { set_mr(i, v); }
         (msg, badge) = ep.reply_recv(sel4::MessageInfo::new(0, 0, 0, 5), reply);
     }
 }

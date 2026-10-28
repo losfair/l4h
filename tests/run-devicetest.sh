@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Production console rings, memory-hotplug scheduling and control failure
-# replies. --qemu also checks hypercalls under sustained console kicks.
+# replies, and block-service replies across nested invocations. --qemu
+# also checks hypercalls under sustained console kicks.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 out=$root/build/devicetest
@@ -23,6 +24,11 @@ for signature in ['static long mem_call(', 'static void memhp_work_fn(struct wor
     end = driver.index('\n}', start) + 2
     parts.append(driver[start:end])
 (out / 'memhp-driver.inc').write_text('\n\n'.join(parts) + '\n')
+# Use the complete block-service loop and handlers with mock hardware and
+# IPC. Only the bare-metal entry attributes and driver declarations differ.
+blkd = (root / 'host/l4h-blkd/src/main.rs').read_text()
+start = blkd.index('use core::ops::{Deref, DerefMut};')
+(out / 'blkd-main.inc').write_text(blkd[start:])
 PY
 cc -std=c11 -O2 -Wall -Wextra -Werror -I "$root/include" -I "$out" \
     -c "$root/tests/console-guest.c" -o "$out/console-guest.o"
@@ -42,6 +48,10 @@ rustc +stable --edition=2024 --test -L dependency="$out" \
     --extern l4h_abi="$out/libl4h_abi.rlib" --extern l4h_host="$out/libl4h_host.rlib" \
     "$root/tests/control-failure.rs" -o "$out/control-failure-tests"
 "$out/control-failure-tests"
+L4H_BLKD_TEST_SRC="$out/blkd-main.inc" rustc +stable --edition=2024 --test -L dependency="$out" \
+    --extern l4h_host="$out/libl4h_host.rlib" \
+    "$root/tests/blk-ipc.rs" -o "$out/blk-ipc-tests"
+"$out/blk-ipc-tests"
 if [ "${1:-}" = --qemu ]; then
     # shellcheck source=tools/guest-env.sh
     source "$root/tools/guest-env.sh"
