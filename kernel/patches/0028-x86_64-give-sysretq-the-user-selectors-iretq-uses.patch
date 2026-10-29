@@ -1,0 +1,78 @@
+From 18459ac7ee9389222444b0fa5984e15efe4d26d3 Mon Sep 17 00:00:00 2001
+From: l4h <l4h@localhost>
+Date: Thu, 29 Oct 2026 08:18:01 -0700
+Subject: [PATCH] x86_64: give sysretq the user selectors iretq uses
+
+seL4 set STAR[63:48] to its user code selector, 0x2b, so sysretq returned
+to user level with CS 0x3b (STAR + 16, the GDT's FS slot) and SS 0x33,
+while iretq returned with CS 0x2b.  A thread that read %cs after a system
+call and later reloaded it with iretq, as .NET's RtlRestoreContext does,
+took a general protection fault on the FS data segment.
+
+With the syscall method, lay out the user segments as Linux does, data at
+5 (0x2b) and code at 6 (0x33), and set STAR[63:48] to 0x23 so that
+sysretq loads the same selectors as iretq.  The sysenter layout is
+unchanged.  The selectors now also match the x86_64 Linux ABI, which
+l4h's guest kernel reports in signal frames and ptrace.
+---
+ .../arch/x86/arch/64/mode/object/structures.h | 19 +++++++++++++++----
+ src/arch/x86/64/kernel/vspace.c               |  7 ++++++-
+ 2 files changed, 21 insertions(+), 5 deletions(-)
+
+diff --git a/include/arch/x86/arch/64/mode/object/structures.h b/include/arch/x86/arch/64/mode/object/structures.h
+index 287820321..f7d465aa2 100644
+--- a/include/arch/x86/arch/64/mode/object/structures.h
++++ b/include/arch/x86/arch/64/mode/object/structures.h
+@@ -8,16 +8,27 @@
+ 
+ #include <sel4/macros.h>
+ /* x86-64 specific object types */
+-/* sysexitq (64-bit) user code = cs + 32, user data = cs + 40.
+- * sysexit user code = cs + 16, user data = cs + 24, so we need to arrange
+- * user CS and DS as 5 and 6.
+- * */
+ #define GDT_NULL    0
+ #define GDT_CS_0    1
+ #define GDT_DS_0    2
+ #define GDT_TSS     3 //TSS is two slots in x86-64
++#ifdef CONFIG_SYSCALL
++/* sysretq (64-bit) user data = STAR[63:48] + 8, user code = STAR[63:48] + 16,
++ * so user DS and CS are 5 and 6: Linux's layout, giving the selectors 0x2b
++ * (data) and 0x33 (code).  With CS before DS, sysretq would load a code
++ * selector of 0x3b, the FS slot, which runs but faults when user code
++ * reloads it with iretq (as .NET's RtlRestoreContext does), and differs
++ * from the 0x2b that iretq returns from the kernel with. */
++#define GDT_DS_3    5
++#define GDT_CS_3    6
++#else
++/* sysexitq (64-bit) user code = cs + 32, user data = cs + 40.
++ * sysexit user code = cs + 16, user data = cs + 24, so we need to arrange
++ * user CS and DS as 5 and 6.
++ * */
+ #define GDT_CS_3    5
+ #define GDT_DS_3    6
++#endif
+ #define GDT_FS      7
+ #define GDT_GS      8
+ #define GDT_ENTRIES 9
+diff --git a/src/arch/x86/64/kernel/vspace.c b/src/arch/x86/64/kernel/vspace.c
+index 843dfa1c9..54e448e57 100644
+--- a/src/arch/x86/64/kernel/vspace.c
++++ b/src/arch/x86/64/kernel/vspace.c
+@@ -334,7 +334,12 @@ void init_syscall_msrs(void)
+     // also mask bit 8, which is the Trap Flag, to prevent the kernel
+     // from single stepping
+     x86_wrmsr(IA32_FMASK_MSR, FLAGS_TF | FLAGS_IF);
+-    x86_wrmsr(IA32_STAR_MSR, ((uint64_t)SEL_CS_0 << 32) | ((uint64_t)SEL_CS_3 << 48));
++    /* sysretq loads SS from STAR[63:48] + 8 and CS from STAR[63:48] + 16,
++     * which must be the selectors iretq returns to user level with. */
++#ifdef CONFIG_SYSCALL
++    compile_assert(sysret_selectors, SEL_CS_3 == SEL_DS_3 + 8)
++#endif
++    x86_wrmsr(IA32_STAR_MSR, ((uint64_t)SEL_CS_0 << 32) | ((uint64_t)(SEL_DS_3 - 8) << 48));
+ }
+ 
+ BOOT_CODE void init_gdt(gdt_entry_t *gdt, tss_t *tss)
+-- 
+2.47.3
+

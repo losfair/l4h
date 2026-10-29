@@ -10,9 +10,10 @@ extern int host_gdt_entry_tls_min;
 
 /*
  * The user selectors of the x86_64 Linux ABI, which ptrace and sigcontext
- * report (gdb takes CS 0x33 for a 64-bit inferior).  They are not loaded:
- * seL4's own user selectors are 0x2b (code) and 0x33 (stack), which is
- * what user code reading %cs or %ss sees.
+ * report (gdb takes CS 0x33 for a 64-bit inferior).  The guest kernel loads
+ * none: seL4 does, and its patch 0028 lays out its user segments as Linux
+ * does, so these are what user code reading %cs or %ss sees, and what it
+ * may reload with iretq.
  */
 #define __USER_CS 0x33
 #define __USER_DS 0x2b

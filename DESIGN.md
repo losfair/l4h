@@ -879,8 +879,12 @@ rewound PC and no syscall.
 seL4 clears TF in user flags and l4h builds it without the hardware debug
 API, so `PTRACE_SINGLESTEP` and enabling debug-register breakpoints fail
 with EIO; debuggers use software breakpoints (`int3`). CS and SS read as
-Linux's 64-bit user selectors (0x33, 0x2b; seL4's own are 0x2b and 0x33),
-which is how gdb tells a 64-bit inferior, and `NT_X86_XSTATE` carries XCR0
+Linux's 64-bit user selectors (0x33, 0x2b), which is how gdb tells a
+64-bit inferior. They are the selectors user code runs with: patch 0028
+lays out seL4's user segments as Linux does, so that `sysretq` and `iretq`
+both return with them (before it, `sysretq` returned with CS 0x3b, a data
+slot, which faulted when user code reloaded it with `iretq`, as .NET's
+`RtlRestoreContext` does). And `NT_X86_XSTATE` carries XCR0
 in its software bytes, as on x86.
 Seccomp filters and `SIGSYS` see the user instruction pointer
 (`KSTK_EIP`, which UML takes from the kernel context switch), and
