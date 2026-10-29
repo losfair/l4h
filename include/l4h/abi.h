@@ -573,6 +573,16 @@ enum l4h_ctl_op {
 	 * Reads do not consume records. Lost includes overwritten, dropped or
 	 * concurrently publishing records. A future cursor returns EINVAL. */
 	L4H_CTL_LOG_READ = 31,
+	/* x86_64 host kexec. LOAD streams one file at a time through the control
+	 * data area: args are file (0 EFI, 1 dom0 initrd, 2 l4h.conf), byte
+	 * offset, total file size, chunk length (the driver fills this from the
+	 * ioctl), then two zero words. Files are sequential; the optional files
+	 * may be omitted. A call with file 3 and every other argument zero
+	 * commits a complete set. LOAD stops nothing and never touches the TPM.
+	 * EXEC discards an incomplete transaction and enters the committed
+	 * image; it does not return on success. -ENOENT if none is staged. */
+	L4H_CTL_HOST_KEXEC_LOAD = 32,
+	L4H_CTL_HOST_KEXEC_EXEC = 33,
 };
 
 #define L4H_GPU_MIN             64

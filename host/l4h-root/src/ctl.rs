@@ -10,8 +10,10 @@ use crate::Host;
 pub const EPERM: i64 = 1;
 pub const ENOENT: i64 = 2;
 pub const EIO: i64 = 5;
+pub const EAGAIN: i64 = 11;
 pub const ENOMEM: i64 = 12;
 pub const EBUSY: i64 = 16;
+pub const ENODEV: i64 = 19;
 pub const EINVAL: i64 = 22;
 pub const ENOSPC: i64 = 28;
 pub const ENOSYS: i64 = 38;
@@ -51,8 +53,12 @@ pub fn host_op(h: &mut Host, op: u32, a: &[u64; 6], data: &mut [u8; abi::CTL_DAT
             h.ensure_disk(disk)?;
             // dom0's control data area, which root maps read-only.
             let from = (zero == 0).then_some(crate::vmmgr::CTL_DATA_VA as *const u8);
-            let dk = &h.disks[disk];
-            crate::blkd::write(&mut h.ctrls[dk.ctrl], disk, dk, sector, len, from, &h.pci, &mut h.wins.a)?;
+            if len == 0 {
+                crate::blkd::flush(h, disk)?;
+            } else {
+                let dk = &h.disks[disk];
+                crate::blkd::write(&mut h.ctrls[dk.ctrl], disk, dk, sector, len, from, &h.pci, &mut h.wins.a)?;
+            }
         }
         abi::CTL_BLK_INFO => {
             let disk = h.disks.get(a[0] as usize).ok_or(ENOENT)?;
@@ -91,6 +97,16 @@ pub fn host_op(h: &mut Host, op: u32, a: &[u64; 6], data: &mut [u8; abi::CTL_DAT
             }
             vals[0] = n as u64;
             vals[1] = h.netd.nics.iter().position(|n| n.switch == Some(sw)).map_or(u64::MAX, |i| i as u64);
+        }
+        #[cfg(target_arch = "x86_64")]
+        abi::CTL_HOST_KEXEC_LOAD => crate::kexec::load(h, a)?,
+        #[cfg(target_arch = "x86_64")]
+        abi::CTL_HOST_KEXEC_EXEC => {
+            match a[0] {
+                l4h_host::vmmgr::KEXEC_PREFLIGHT => crate::kexec::preflight(h)?,
+                l4h_host::vmmgr::KEXEC_FAIL => crate::kexec::fail(h),
+                _ => crate::kexec::exec(h)?,
+            }
         }
         // Returns only on failure.
         abi::CTL_HOST_REBOOT => return Err(crate::reset::reboot(h, "dom0")),

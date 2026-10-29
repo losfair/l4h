@@ -88,6 +88,13 @@ pub const BLKD_SLOT_IRQ: u64 = 16;
 pub const BLKD_SLOT_IOPORT: u64 = 17;
 /// Notification of the client, badged with its "done" bit.
 pub const BLKD_SLOT_CLIENT_DONE: u64 = 32;
+/// Root's notification, badged BLKD_FLUSH_DONE: a flush was answered.
+pub const BLKD_SLOT_FLUSH_DONE: u64 = 18;
+pub const BLKD_FLUSH_REQUEST: u64 = 1 << 54;
+pub const BLKD_FLUSH_DONE: u64 = 1 << 55;
+/// Root's flush requests: the unit, answered with blkd's status.
+pub const FLUSH_VA: usize = crate::SHARED_VA + 0x600_0000;
+pub type FlushState = crate::handoff::Mailbox<u64>;
 /// Attachments per disk: a node's sandboxes each take one or two windows of
 /// a disk, and read-only windows may be shared by many.
 pub const MAX_CLIENTS: usize = 512;

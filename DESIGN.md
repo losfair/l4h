@@ -475,6 +475,21 @@ guest. Where there is an AMD-Vi or Intel VT-d IOMMU, root drives it itself (§8.
   just after exec. The boot regression checks a user-written thread
   pointer in the saved context at the first C syscall entry, before the
   lock can handle a stall.
+- **0026, host kexec handoff (x86_64).** `seL4_X86_Kexec`, an IRQControl
+  invocation on core 0, takes one physical control-page address. Root supplies
+  an identity map, segment list and the libsel4 trampoline and parking code,
+  with all copy sources and control memory outside every destination; a
+  sentinel source zero-fills a run instead. APs acknowledge only after switching
+  to the new page tables and parking code. seL4 masks interrupts and enters
+  the trampoline, which copies or zero-fills the segments and enters the new
+  kernel in 32-bit multiboot2 state with PSE set and SMEP/SMAP clear
+  for its user-mapped 2 MiB boot pages. This is the kernel primitive;
+  `kexec.rs` stages the UEFI image and builds its control pages. Before
+  tearing down devices it measures the new image and passes the kexec log
+  to the next trustd (§9.2). `tests/run-kernel-kexectest.sh`
+  uses a minimal root task to test rejected invocations and the handoff while
+  overwriting the old kernel's memory, and `tests/run-kexec-handofftest.sh`
+  boots a complete second host from a staged EFI.
 - E1 (`trapSyscalls`) is our fix for seL4 issue #477, which is still open
   upstream. Without it, Linux syscalls whose syscall-number register
   happens to hold a valid seL4 syscall number are executed as seL4
@@ -485,7 +500,8 @@ guest. Where there is an AMD-Vi or Intel VT-d IOMMU, root drives it itself (§8.
 **Decision:** l4h carries E1–E3 and the fixes above as patches in
 `kernel/patches/`, and proposes them upstream through the seL4 RFC process. They are designed as independent
 commits. They have no sel4test cases yet: l4h's integration tests
-(`tests/`, e.g. `tests/guest/abitest`) exercise them through the guest.
+(`tests/`, e.g. `tests/guest/abitest`) exercise them through guest workloads
+and focused root tasks.
 
 **Verification note:** the MCS SMP x86_64 configuration is not covered by the
 seL4 proofs today, with or without E1–E3. l4h still benefits from seL4's
@@ -2195,7 +2211,7 @@ little-endian structs defined in `include/l4h/abi.h` and mirrored in
 
 | Area | Implemented operations |
 |------|------------------------|
-| Host | `host_version`: running host's build version (the tag for a release); `host_info`: cores, free/total bytes, disk, VM and NIC counts; `host_reboot`; `rtc_set`: machine RTC in UTC epoch seconds; `iommu_info`: IOMMU state, interrupt remapping, confined and unconfined devices, events logged (§8.5) |
+| Host | `host_version`: running host's build version (the tag for a release); `host_info`: cores, free/total bytes, disk, VM and NIC counts; `host_reboot`; `host_kexec_load` and `host_kexec_exec` (x86_64); `rtc_set`: machine RTC in UTC epoch seconds; `iommu_info`: IOMMU state, interrupt remapping, confined and unconfined devices, events logged (§8.5) |
 | Guests | `vm_create`, `vm_load`, `vm_start`, `vm_shutdown`, `vm_destroy`, `vm_list`, `vm_info` (cores for the first six vCPUs), `vm_stats` (CPU use and cap), `vm_set_sched` |
 | Block | `blk_attach`: disk, read-only flag and LBA window; `disk_info`: PCI address, owner, failed flag and kind |
 | Network | `switch_create`, `switch_attach_uplink`, `nic_create` (MAC, MAC lock, isolation), `switch_info` (ports and counters), `nic_info` (PCI address, switch, MAC) |
@@ -2217,11 +2233,13 @@ external orchestration can run in dom0.
   task sleeps meanwhile, and the vCPU runs others. Image loads are
   bounded at 1 MiB per call.
 - `/dev/l4hctl` takes one ioctl that carries a request, its response and,
-  for `VM_LOAD`, a user buffer. The driver stages it in the control
-  device's data area, 1 MiB of host-owned frames mapped into dom0, and
-  sets the request's source offset to 0 and length to the ioctl buffer
-  length: vmmgr never reads dom0's RAM.  The data area is root's memory,
-  made once and mapped into every dom0.
+- `/dev/l4hctl` takes one ioctl that carries a request, its response and,
+  for `VM_LOAD`, `BLK_WRITE` and `HOST_KEXEC_LOAD`, a user buffer. The driver
+  stages it in the control device's data area, 1 MiB of host-owned frames
+  mapped into dom0: vmmgr never reads dom0's RAM. The data area is root's
+  memory, made once and mapped into every dom0. `VM_LOAD` sets the source
+  offset to 0; kexec keeps its file offset and total size; both paths set
+  the length from the ioctl buffer.
 - `l4hctl` loads the initramfs with raw `VM_LOAD(vm, gpa, bytes)` writes,
   from the GPA `vm_create` returns. vmmgr copies page by page from the
   data area to the new guest's frames and never parses what guests load.
@@ -2250,6 +2268,57 @@ external orchestration can run in dom0.
   guest's flush reaches the disk before it completes, so dom0 syncs what it
   wrote first, and root's serve loop does not block on disks while the
   machine is about to go down.
+- **Host kexec (x86_64).** `l4hctl host-kexec [--efi PATH] [--initrd PATH]
+  [--conf PATH]` reads the same `EFI/BOOT/BOOTX64.EFI` and optional ESP files
+  as a cold boot (default root `/boot/efi`), streams them to root, runs `sync`,
+  and invokes EXEC; `--load-only` stops after staging. LOAD uses ops 32/33
+  without changing `L4H_CTL_VERSION`. Each chunk names file 0 (EFI), 1
+  (initrd) or 2 (config), its offset and total size; the driver fills its
+  length from the ioctl buffer. Files are sequential, optional files may be
+  omitted, and file 3 with no other arguments commits. The EFI and initrd are
+  limited to 64 MiB each and config to 1 MiB. A failed transaction leaves any
+  previously committed image intact; EXEC discards an incomplete transaction
+  and boots the committed image, or reports ENOENT when nothing is staged.
+  Root stages each byte once in private frames and temporarily maps those
+  frames to parse the PE, GRUB `mimg` and tar, seL4 ELF and the exact
+  `# l4h-boot 1` GRUB script, whose fixed lines come from the same
+  `tools/l4h-grub-fixed.cfg` template as `mkefi.sh`. `mkefi.sh` emits that
+  version line and an ELF note with the kernel's x2APIC/PCID variant; a missing
+  note, a different variant, ACPI commands or unknown boot files fail LOAD
+  before anything stops. Root computes the Authenticode and ESP-file digests
+  but takes no TPM action. It hashes each chunk as it arrives, including the
+  Authenticode ranges described by the PE prefix, so COMMIT never re-hashes
+  a file. It checks every seL4 PT_LOAD destination
+  against firmware RAM (usable, ACPI-reclaim and ACPI-NVS entries), places kernel and
+  module destinations in firmware RAM gaps that miss every source and control
+  page, builds the MBI and identity map, retains frame caps until each source
+  block is complete, and marks the control block reserved so parked APs and
+  their page tables cannot be reclaimed by the next seL4. The next seL4
+  loads its root task at the first RAM above the last module and then moves
+  it down to the end of its kernel without checking the memory map, so root
+  requires RAM right after the modules and puts the control block above
+  that load range. It also checks that RAM below 4 GiB has room for seL4 to
+  copy the other modules above the root task, so the next kernel cannot
+  fail to boot after the point of no return. The next handoff makes the previous
+  control block usable again using its address in the latest log event and
+  coalesces adjacent usable entries, so reservations and map entries do not
+  accumulate across a chain. That address is operational metadata outside the
+  measured event digest; the verifier exposes it in each JSON event.
+  EXEC moves root to CPU 0 and destroys guests with dom0 last. It flushes
+  every namespace, gives NVMe a bounded normal shutdown and disables the
+  controller, resets the other disks and every NIC with a bounded wait, then
+  quiesces type-0 PCI endpoints. It masks their MSI/MSI-X and clears bus
+  mastering without disabling bridge routing or display memory decode, turns
+  off the IOMMUs (interrupt remapping last) and invokes patch 0026. Once guest
+  destruction starts, any failure resets the machine rather than returning to
+  a partially torn-down host. trustd first extends PCR 14 with root's event
+  digest and is then suspended. `tests/run-kexec-loadtest.sh`
+  commits and replaces an image from the ESP; `tests/run-kexec-handofftest.sh`
+  boots a second host whose staged config changes dom0's command line;
+  `tests/run-kexec-uefitest.sh` checks a second build, DHCP and disk readback
+  with no IOMMU and with emulated Intel VT-d and AMD-Vi;
+  `tests/run-kexec-attesttest.sh` checks two kexecs with swtpm, log replay
+  and tamper rejection.
 - Console output goes into a per-guest ring that `l4h-vmm` writes and
   vmmgr reads for `console_read`. It is also copied to the serial port
   with a `[vmN]` line prefix. Console input is a ring in the guest's
@@ -2358,7 +2427,7 @@ The chain has four links.
      vmmgr is in the host TCB for this: whoever builds a guest can make
      it run anything.
    - Root writes {instance, RAM, vCPUs, dom0, digest} into a registry page
-     that trustd maps read-only. Root never waits for trustd's main
+     that trustd maps read-only. Guest control operations never wait for trustd's main
      thread, whose TPM commands can take seconds; its passive flags
      thread answers root independently (below).
    - Each guest gets an attestation device (`L4H_DEV_ATTEST`). Requests are
@@ -2369,7 +2438,7 @@ The chain has four links.
         the guest's id, so trustd knows who asks, and trustd only answers
         a guest about itself.
      2. trustd answers in the page, sets `done` to the sequence number,
-        and asks root (`ROOT_CALL_ATTEST_DONE`) to raise the device's
+        then updates vmmgr's events page and signals vmmgr directly to raise the device's
         event on the guest's vCPU 0. Meanwhile, Linux sleeps the caller.
    - trustd owns the 64 request pages, one per guest id, and root lends
      one to each guest. A page therefore stays mapped in trustd while
@@ -2396,7 +2465,8 @@ The chain has four links.
    - the AK is a fixedTPM restricted signing key, and the quote verifies
      under it;
    - the quote's qualifying data is K's hash;
-   - the PCR values match the quote's digest, and PCR 15 is zero;
+   - the PCR values match the quote's digest, PCR 15 is zero on a cold
+     boot, and a kexec chain has one recorded key extension per event;
    - the PCRs have the expected values (`--pcr`);
    - the EK certificate chains to the manufacturer's CA (`--ek-ca`);
    - the report verifies under K and carries the verifier's nonce and the
@@ -2410,6 +2480,44 @@ The chain has four links.
    PolicySecret(endorsement) session for the EK, and only the TPM that holds
    both keys can do it. The verifier then pins the AK's name (`--ak-name`),
    which stays the same across boots.
+
+   **Kexec.** Before EXEC, root writes the event digest into a private
+   root/trustd state page and kicks trustd's main thread. trustd extends PCR
+   14 with `SHA-256("l4h-kexec-v1" ‖ the new EFI's Authenticode digest ‖
+   initrd digest ‖ config digest ‖ boot-string digest ‖ flags) and publishes
+   the response; root waits with a 10 s bound in its normal endpoint receive
+   loop, serving `ROOT_CALL_HW`, faults and timer badges, then suspends trustd
+   before any device is touched. trustd's main thread signals guest completions
+   directly to vmmgr, never root, so this wait cannot form a root/flags/main
+   deadlock or starve trustd on one core. Guest attestation pages never carry
+   this operation or either key-chain value. Instead, trustd publishes its
+   public PCR 15 extension value once at init and LOAD reads it directly.
+   `STARTING` makes LOAD and EXEC preflight return EAGAIN without blocking root
+   or destroying guests. LOAD preserves the complete upload on EAGAIN, and
+   `l4hctl` retries only COMMIT for up to 30 s rather than streaming it again. Only a host whose firmware describes no TPM may skip measurement; a
+   described TPM that trustd cannot use, a failed trustd or none at all
+   makes LOAD and EXEC fail with ENODEV, never an unmeasured handoff
+   disguised as the original cold boot. A kexec does not reset the TPM, so
+   after the extend trustd flushes its AK and EK; otherwise each host in a
+   chain would keep one of the TPM's few object slots. The
+   boot-string digest covers the seL4 command line and module strings, not the
+   kexec log. LOAD builds a `kexec-log` module with the previous key, the new
+   event and all earlier events. The new trustd includes the event
+   count and log in its evidence; reports do not change. After n kexecs,
+   PCR 14 records n new images and PCR 15 records the n earlier host keys,
+   so the next quote, before that host's own extension, still establishes
+   freshness. The verifier requires every EFI, initrd and `l4h.conf` in the
+   chain to be trusted with `--trusted-efi`, `--trusted-initrd` and
+   `--trusted-config`, replays PCR 14 and PCR 15, and rejects missing or extra
+   events, key substitutions and count mismatches. Its JSON output includes
+   each event's file and previous-key digests for relying-party policy.
+   `--require-cold-boot` rejects any chain. `measure-efi` computes the
+   Authenticode digest used for those pins. A chain with a missing or
+   unusable TPM is not accepted as an attested kexec chain. The log holds at
+   most 97 events in 16 KiB; a later COMMIT reports that a cold boot is
+   required. An oversized or malformed incoming history produces an
+   explicitly invalid empty `klog` with count 1 rather than disabling trustd
+   or presenting a false cold boot.
 
    **Rate limit.** ActivateCredential is the only request that uses the
    TPM (about 80 ms each on a discrete Infineon TPM), and trustd answers
@@ -3572,8 +3680,9 @@ Behaviour is unchanged.
   order are on lists linked through their entries: those not reported to
   the hypervisor in the order they were freed, and those reported. So
   taking, freeing and finding a buddy are O(1), taking a block of order k
-  is O(orders), and nothing scans the free blocks except a merge (below)
-  and the report timer, which reads only the blocks it reports.
+  is O(orders), and free-block scans are limited to merging (below),
+  address-constrained allocation and the report timer, which reads only the
+  blocks it reports.
 - **memd's CSpace** is one CNode (`SpawnArgs::cnode_bits`) with a slot
   for every block of every order that fits in the table, at a fixed
   place (`l4h_host::memd::block_slots`): two slots per 2 MiB unit, to
@@ -3586,7 +3695,10 @@ Behaviour is unchanged.
 - **Root's memory** comes in *grants*: when root's free blocks cannot
   meet a request, it takes an untouched Untyped of 16 MiB (or exactly the
   request, if larger; or 2 MiB, if memd has no 16 MiB block) from memd
-  (`MEMD_ALLOC`) and splits it as before.
+  (`MEMD_ALLOC`) and splits it as before. A request confined to a physical
+  window (kexec blocks above its fixed seL4 destinations, and its control
+  block between the next root task's load range and 4 GiB) skips root's blocks outside it and passes it to memd,
+  which selects and splits a block inside it.
   Grants are never merged with each other. When a destroy or a failed
   create leaves root more than 48 MiB of free blocks, it merges them and
   returns whole grants (`MEMD_FREE`) beyond 32 MiB (`Alloc::trim`).

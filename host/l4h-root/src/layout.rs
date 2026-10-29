@@ -82,19 +82,25 @@ regions! {
     UART = 0x6000_0200_0000, PAGE;
     /// The two windows on frames of guests and components (window.rs).
     WINDOWS = 0x7000_0000_0000, 2 * PAGE;
-    /// The events, status and result pages root shares with vmmgr
-    /// (vmmgr.rs).
-    VMMGR_PAGES = 0x7100_0000_0000, 3 * PAGE;
+    /// The events, status, result and attestation pages root shares with
+    /// vmmgr (vmmgr.rs).
+    VMMGR_PAGES = 0x7100_0000_0000, 4 * PAGE;
     /// dom0's control data area (CTL_BLK_WRITE source), read-only.
     CTL_DATA = 0x7180_0000_0000, l4h_abi::CTL_LOAD_MAX as usize;
     /// The boot framebuffer (dashboard.rs).
     FRAMEBUFFER = 0x7200_0000_0000, GIB;
     /// The boot loader's modules, one after another (bootmod.rs).
     MODULES = 0x7300_0000_0000, 64 * GIB;
+    /// Temporary contiguous views of the files staged for host kexec.
+    KEXEC_LOAD = 0x7400_0000_0000, 129 * MIB;
     /// trustd's guest registry (trustd.rs).
     TRUSTD_REGISTRY = 0x7500_0000_0000, PAGE;
     /// trustd flags, read-only in root.
     TRUSTD_FLAGS = 0x7500_0001_0000, l4h_host::trust::FLAGS_SIZE;
+    /// trustd's private kexec state, shared only with root.
+    TRUSTD_KEXEC = 0x7500_0002_0000, PAGE;
+    /// One asynchronous disk flush request page per controller.
+    BLKD_FLUSH = 0x7500_0003_0000, crate::pci::MAX_DISK_CTRLS * PAGE;
     /// memd's status page (memd.rs).
     MEMD_STATUS = 0x7700_0000_0000, PAGE;
     /// IOMMU registers: 16 KiB per AMD-Vi unit, 64 KiB per VT-d unit.

@@ -348,6 +348,8 @@ without it, the host reports `unknown`.
 | `tests/run-monitor.sh` | serial monitor (`list`, `restart-dom0`), continued operation with an absent UART |
 | `tests/run-uefitest.sh` | UEFI/GRUB boot image with NVMe and virtio-net, as on GCE |
 | `tests/run-biostest.sh` | the same image under SeaBIOS with virtio-blk, virtio-net and a VBE framebuffer, as on DigitalOcean |
+| `tests/run-kexec-uefitest.sh` | host kexec with a second build, NVMe, networking and optional Intel/AMD IOMMU |
+| `tests/run-kexec-attesttest.sh` | two kexecs with swtpm: event-log and PCR-chain verification, tamper rejection |
 | `tests/run-xentest.sh` | two l4h partitions as Xen HVM guests, nested in KVM, each with a passed-through NIC, ping each other (DESIGN.md §10.2) |
 | `tests/run-attesttest.sh` | attestation with swtpm over CRB, FIFO and the AMD fTPM ACPI start method: reports on dom0 and a guest, host evidence, AK credential |
 | `tests/run-debian.sh`, `tests/run-workload.sh` | Debian + systemd, fio verify, parallel build, fsck (`tests/mkdebian.sh` first) |

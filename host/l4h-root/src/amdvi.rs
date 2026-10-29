@@ -302,6 +302,20 @@ impl AmdVi {
         !self.units.is_empty()
     }
 
+    /// Drain commands and events, then disable translation, logging and
+    /// command processing. False if a unit does not complete in time.
+    pub fn shutdown(&mut self) -> bool {
+        let ok = self.try_sync();
+        self.poll();
+        for n in 0..self.units.len() {
+            self.w64(n, CONTROL, 0);
+        }
+        if self.state == abi::IOMMU_ON {
+            self.state = abi::IOMMU_OFF;
+        }
+        ok
+    }
+
     /// Find the IOMMUs (IVRS), block every device and enable them.  None
     /// found, or one that cannot be used, leaves devices unconfined.
     #[cfg(target_arch = "x86_64")]
@@ -851,12 +865,13 @@ impl AmdVi {
         }
     }
 
-    fn command_to(&mut self, u: usize, cmd: [u32; 4]) {
+    fn try_command_to(&mut self, u: usize, cmd: [u32; 4]) -> bool {
         let next = (self.units[u].tail + 16) % RING_BYTES;
         let end = l4h_host::ticks::now() + 1000 * self.ticks_per_ms;
         while self.r64(u, CMD_HEAD) & RING_MASK == next as u64 {
-            // Commands are not carried out: DMA can no longer be confined.
-            assert!(l4h_host::ticks::now() < end, "l4h-root: iommu {}: command buffer stuck", u);
+            if l4h_host::ticks::now() >= end {
+                return false;
+            }
             core::hint::spin_loop();
         }
         let at = (self.units[u].cmd + self.units[u].tail) as *mut u32;
@@ -866,24 +881,37 @@ impl AmdVi {
         compiler_fence(Ordering::SeqCst);
         self.units[u].tail = next;
         self.w64(u, CMD_TAIL, next as u64);
+        true
+    }
+
+    fn command_to(&mut self, u: usize, cmd: [u32; 4]) {
+        assert!(self.try_command_to(u, cmd), "l4h-root: iommu {}: command buffer stuck", u);
     }
 
     /// Wait until every IOMMU has carried out the commands before.
-    fn sync(&mut self) {
+    fn try_sync(&mut self) -> bool {
+        let mut ok = true;
         for u in 0..self.units.len() {
             self.units[u].seq += 1;
             let (pa, seq) = (self.units[u].sem_pa as u64, self.units[u].seq);
-            // Store `seq` at the unit's own semaphore.
-            self.command_to(u, [pa as u32 | 1, (pa >> 32) as u32 | CMD_COMPLETION_WAIT, seq as u32, (seq >> 32) as u32]);
+            ok &= self.try_command_to(u, [pa as u32 | 1, (pa >> 32) as u32 | CMD_COMPLETION_WAIT, seq as u32, (seq >> 32) as u32]);
         }
         for u in 0..self.units.len() {
             let sem = self.units[u].sem as *const u64;
             let end = l4h_host::ticks::now() + 1000 * self.ticks_per_ms;
             while unsafe { sem.read_volatile() } != self.units[u].seq {
-                assert!(l4h_host::ticks::now() < end, "l4h-root: iommu {}: commands not completed", u);
+                if l4h_host::ticks::now() >= end {
+                    ok = false;
+                    break;
+                }
                 core::hint::spin_loop();
             }
         }
+        ok
+    }
+
+    fn sync(&mut self) {
+        assert!(self.try_sync(), "l4h-root: iommu: commands not completed");
     }
 
     /// Print what the IOMMUs logged: faults of devices that reached for

@@ -49,7 +49,9 @@ const _: () = assert!(SLOT_XCHG as usize + XCHG_SLOTS <= SLOT_DYN_BASE as usize)
 ///
 /// MR0 = size bits (BLOCK_BITS..=MAX_BITS), MR1 = count (<= XCHG_SLOTS): `count` Untypeds of
 /// 2^bits bytes without children, in the exchange slots; MR1.. of the
-/// reply = their physical addresses.
+/// reply = their physical addresses. Optional MR2..MR3 = a physical window
+/// [start, end) that each returned block must lie in; a larger free block
+/// can be split to meet it.
 pub const MEMD_ALLOC: u64 = 1;
 /// MR0 = count (<= XCHG_SLOTS), MR1.. = (physical address, size bits) of
 /// each: Untypeds without children that the caller put in its exchange

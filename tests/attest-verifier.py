@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 from pathlib import Path
 import unittest
+import struct
 import sys
 
 sys.dont_write_bytecode = True
@@ -35,6 +36,16 @@ def bitmap(*bits, size=32):
     for bit in bits:
         b[bit // 8] |= 1 << (bit % 8)
     return bytes(b)
+
+
+def kexec_event(auth, previous, flags=3, control=0):
+    initrd = hashlib.sha256(b"initrd" if flags & 1 else b"").digest()
+    config = hashlib.sha256(b"config" if flags & 2 else b"").digest()
+    return previous + auth + initrd + config + hashlib.sha256(b"boot").digest() + struct.pack("<II", flags, control)
+
+
+def kexec_log(events):
+    return a.KEXEC_LOG_MAGIC + struct.pack("<II", a.KEXEC_LOG_VERSION, len(events)) + b"".join(events)
 
 
 class Verify(unittest.TestCase):
@@ -96,6 +107,71 @@ class Verify(unittest.TestCase):
         rep[2][2] = encode(c)
         with self.assertRaisesRegex(a.Fail, "signature"):
             self.check(rep)
+    def test_kexec_log_replay_and_tampering(self):
+        auth1, auth2 = b"\x11" * 32, b"\x22" * 32
+        key1, key2 = b"\x33" * 32, b"\x44" * 32
+        initrd, config = hashlib.sha256(b"initrd").digest(), hashlib.sha256(b"config").digest()
+        event1, event2 = kexec_event(auth1, key1, control=0x8600000), kexec_event(auth2, key2)
+        log = kexec_log([event1, event2])
+        count, pcr14, pcr15, events = a.replay_kexec_log(log, {auth1, auth2}, {initrd}, {config})
+        self.assertEqual(count, 2)
+        self.assertEqual(pcr14, a.pcr_extend(a.pcr_extend(bytes(32), a.kexec_event_digest(event1)), a.kexec_event_digest(event2)))
+        self.assertEqual(pcr15, a.pcr_extend(a.pcr_extend(bytes(32), key1), key2))
+        self.assertEqual(events[0]["control"], 0x8600000)
+        self.assertEqual(events[0]["initrd"], initrd.hex())
+        self.assertEqual(events[1]["config"], config.hex())
+        with self.assertRaisesRegex(a.Fail, "untrusted EFI"):
+            a.replay_kexec_log(log, {auth1}, {initrd}, {config})
+        with self.assertRaisesRegex(a.Fail, "missing a host key"):
+            a.replay_kexec_log(kexec_log([kexec_event(auth1, bytes(32))]), {auth1}, {initrd}, {config})
+        with self.assertRaisesRegex(a.Fail, "count"):
+            a.replay_kexec_log(log + event2, {auth1, auth2}, {initrd}, {config})
+        with self.assertRaisesRegex(a.Fail, "count"):
+            a.replay_kexec_log(log[:-1], {auth1, auth2}, {initrd}, {config})
+
+    def test_kexec_initrd_and_config_policy(self):
+        auth, key = b"\x11" * 32, b"\x33" * 32
+        initrd, config = hashlib.sha256(b"initrd").digest(), hashlib.sha256(b"config").digest()
+        event = kexec_event(auth, key)
+        for offset, name in ((64, "initrd"), (96, "l4h.conf")):
+            bad = bytearray(event)
+            bad[offset] ^= 1
+            with self.assertRaisesRegex(a.Fail, "untrusted " + name):
+                a.replay_kexec_log(kexec_log([bytes(bad)]), {auth}, {initrd}, {config})
+        with self.assertRaisesRegex(a.Fail, "untrusted initrd"):
+            a.replay_kexec_log(kexec_log([event]), {auth})
+        with self.assertRaisesRegex(a.Fail, "missing a trusted initrd"):
+            a.replay_kexec_log(kexec_log([kexec_event(auth, key, flags=2)]), {auth}, {initrd}, {config})
+        bad = bytearray(kexec_event(auth, key, flags=2))
+        bad[64] ^= 1
+        with self.assertRaisesRegex(a.Fail, "absent initrd"):
+            a.replay_kexec_log(kexec_log([bytes(bad)]), {auth}, set(), {config})
+
+    def test_authenticode_gapped_sections(self):
+        data = bytearray(0x200)
+        data[:2] = b"MZ"
+        struct.pack_into("<I", data, 0x3c, 0x80)
+        data[0x80:0x84] = b"PE\0\0"
+        struct.pack_into("<H", data, 0x84, 0x8664)
+        struct.pack_into("<H", data, 0x86, 2)
+        struct.pack_into("<H", data, 0x94, 0xf0)
+        optional = 0x98
+        struct.pack_into("<H", data, optional, 0x20b)
+        struct.pack_into("<I", data, optional + 60, 0x200)
+        struct.pack_into("<I", data, optional + 108, 16)
+        section = optional + 0xf0
+        struct.pack_into("<II", data, section + 16, 0x80, 0x200)
+        struct.pack_into("<II", data, section + 40 + 16, 0x40, 0x300)
+        data.extend(bytes(i % 251 for i in range(0x80)))
+        data.extend(b"\x5a" * 0x80)
+        data.extend(bytes(0x80 + i for i in range(0x40)))
+
+        checksum = optional + 64
+        security = optional + 112 + 4 * 8
+        hashed_size = 0x200 + 0x80 + 0x40
+        expected = (data[:checksum] + data[checksum + 4:security] + data[security + 8:0x200]
+                    + data[0x200:0x280] + data[0x300:0x340] + data[hashed_size:])
+        self.assertEqual(a.authenticode_digest(bytes(data)), hashlib.sha256(expected).digest())
 
 
 if __name__ == "__main__":

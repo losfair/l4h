@@ -479,6 +479,17 @@ impl Alloc {
         self.blocks.iter().any(|b| b.size_bits >= bits)
     }
 
+    /// Whether splitting `b` down to 2^bits bytes gives a block in `window`:
+    /// a split keeps the region's lowest block.
+    fn fits(b: &UtRegion, bits: usize, window: &Range<usize>) -> bool {
+        b.size_bits >= bits && b.paddr >= window.start
+            && b.paddr.checked_add(1 << bits).is_some_and(|end| end <= window.end)
+    }
+
+    fn has_block_in(&self, bits: usize, window: &Range<usize>) -> bool {
+        self.blocks.iter().any(|b| Self::fits(b, bits, window))
+    }
+
     fn is_grant(&self, paddr: usize, bits: usize) -> bool {
         self.grants.contains(&(paddr, bits))
     }
@@ -487,16 +498,16 @@ impl Alloc {
         self.parents.binary_search_by_key(&(paddr, bits), |&(p, b, _)| (p, b))
     }
 
-    /// Take a grant from memd for a request of 2^bits bytes: GRANT_BITS,
-    /// or exactly what is asked if memd has no larger block.
-    fn grant(&mut self, bits: usize) -> bool {
+    /// Take a grant from memd for a request of 2^bits bytes in `window`:
+    /// GRANT_BITS, or exactly what is asked if memd has no larger block.
+    fn grant(&mut self, bits: usize, window: &Range<usize>) -> bool {
         let Some(memd) = self.memd else { return false };
         if self.grants.is_full() || self.blocks.is_full() {
             return false;
         }
         for gbits in [bits.max(GRANT_BITS), bits.max(BLOCK_BITS)] {
             let s = self.slots.global(|s| s.alloc());
-            if let Some(paddr) = memd.alloc(gbits, s) {
+            if let Some(paddr) = memd.alloc_in(gbits, s, window.clone()) {
                 self.blocks.must_push(UtRegion::fresh(untyped_at(s), paddr, gbits));
                 self.grants.must_push((paddr, gbits));
                 return true;
@@ -508,17 +519,23 @@ impl Alloc {
 
     /// An untouched Untyped of exactly 2^bits bytes, in local slot `slot`.
     pub fn split(&mut self, bits: usize, slot: Slot) -> Option<UtRegion> {
-        if !self.has_block(bits) {
+        self.split_in(bits, slot, 0..usize::MAX)
+    }
+
+    /// `split`, with the block in the physical `window`; local regions
+    /// outside it are left untouched, and memd applies it to grants.
+    pub fn split_in(&mut self, bits: usize, slot: Slot, window: Range<usize>) -> Option<UtRegion> {
+        if !self.has_block_in(bits, &window) {
             self.merge_up_to(bits);
         }
-        if !self.has_block(bits) && !self.grant(bits) {
+        if !self.has_block_in(bits, &window) && !self.grant(bits, &window) {
             return None;
         }
         let (i, _) = self
             .blocks
             .iter()
             .enumerate()
-            .filter(|(_, b)| b.size_bits >= bits)
+            .filter(|(_, b)| Self::fits(b, bits, &window))
             .min_by_key(|(_, b)| (b.size_bits, b.paddr))?;
         // Every level split keeps a parent and frees a half.
         let levels = self.blocks[i].size_bits - bits;
@@ -711,8 +728,8 @@ impl Alloc {
         }
     }
 
-    /// Undo a partly built arena: reclaim its memory and free its slots.
-    fn release(&mut self, arena: Arena) {
+    /// Undo a private arena: reclaim its memory and free its slots.
+    pub fn release(&mut self, arena: Arena) {
         self.reclaim_inner(arena, |_| false, true);
     }
 

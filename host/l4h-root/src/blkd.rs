@@ -14,12 +14,12 @@ use l4h_host::{self as host, blk};
 use crate::component::{self, Component, SpawnArgs, abs_of};
 use crate::devmem::DevMem;
 use crate::iommu::{Iommu, Domain};
-use crate::mem::{Alloc, Arena, Dest, Slot};
+use crate::mem::{Alloc, Arena, Dest, ObjCtx, Slot};
 use crate::pci::{self, Pci};
 use crate::vmmgr::RootGuest;
-use crate::vspace::FRAME_BP;
+use crate::vspace::{FRAME_BP, map_frame};
 use crate::window::Window;
-use crate::{AsidPools, HostInfo};
+use crate::{AsidPools, Host, HostInfo};
 
 static BLKD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/l4h-blkd.elf"));
 
@@ -74,6 +74,10 @@ pub struct Controller {
     /// issued once.
     io: Option<cap::Null>,
     driver: Option<Blkd>,
+    /// Root's mapping of this controller's private flush request page.
+    flush_va: usize,
+    flush_state: *mut blk::FlushState,
+    flush_kick: cap::Notification,
     /// The device's IOMMU domain: blkd's DMA memory and its clients'
     /// I/O pools.
     dom: Domain,
@@ -118,7 +122,20 @@ impl Controller {
         assert!(row < pci::MAX_DISK_CTRLS, "more than {} disk controllers", pci::MAX_DISK_CTRLS);
         // Each row is handed out once, so this is its only reference.
         let clients = unsafe { &mut (*addr_of_mut!(CLIENTS))[row] };
-        Controller { pci, kind, vector, bars: [const { None }; 6], clients, failed: false, io: None, driver: None, dom: Domain::NONE }
+        Controller {
+            pci,
+            kind,
+            vector,
+            bars: [const { None }; 6],
+            clients,
+            failed: false,
+            io: None,
+            driver: None,
+            flush_va: crate::layout::BLKD_FLUSH.base + row * PAGE,
+            flush_state: core::ptr::null_mut(),
+            flush_kick: cap::Notification::from_bits(0),
+            dom: Domain::NONE,
+        }
     }
 
     /// The attachments of disk `disk`, with their client indices.
@@ -319,8 +336,9 @@ pub fn start(
         &host_info.spawn_context(0),
     );
 
-    // Mapping caps are kept in a CNode of the arena, sized for the BARs.
-    let keep_bits = keep_bits(n_dma + bar_pages(d, bars));
+    // Mapping caps are kept in a CNode of the arena, sized for the BARs,
+    // the DMA frames and the flush page.
+    let keep_bits = keep_bits(n_dma + bar_pages(d, bars) + 1);
     let keep = arena.object_cap::<cap_type::CNode>(alloc, sel4::ObjectBlueprint::CNode { size_bits: keep_bits });
     let mut keep_next = 0u64;
     let mut keep_slot = || {
@@ -350,6 +368,16 @@ pub fn start(
     }
     pci.enable(d);
     pci.enable_msix(d);
+    let flush = alloc.object_cap::<cap_type::Granule>(FRAME_BP);
+    map_frame(&mut ObjCtx::global(alloc), sel4::init_thread::slot::VSPACE.cap(), flush,
+        disk.flush_va, CapRights::read_write(), VmAttributes::DEFAULT);
+    comp.map_copy(alloc, &mut arena, &abs_of(flush), blk::FLUSH_VA, CapRights::read_write(), VmAttributes::DEFAULT, keep_slot());
+    let slot = alloc.slots.alloc();
+    let flush_kick = sel4::init_thread::Slot::<cap_type::Notification>::from_index(slot).cap();
+    abs_of(flush_kick).mint(&abs_of(comp.ntfn), CapRights::write_only(), blk::BLKD_FLUSH_REQUEST).expect("flush request notification");
+    comp.give_badged(blk::BLKD_SLOT_FLUSH_DONE, host_info.events, CapRights::write_only(), blk::BLKD_FLUSH_DONE);
+    disk.flush_state = disk.flush_va as *mut blk::FlushState;
+    disk.flush_kick = flush_kick;
     component::start(&comp);
 
     let staging = dma_frames.start + n_dma - blk::STAGING_SIZE / PAGE..dma_frames.end;
@@ -444,22 +472,43 @@ pub fn remove(disk: &mut Controller, i: usize, pci: &Pci, iommu: &mut Iommu) -> 
     quiet || disk.dom != Domain::NONE
 }
 
+/// Flush one unit through blkd's asynchronous completion path. A dead or
+/// wedged driver reaches the deadline instead of blocking root's endpoint.
+fn flush_async(h: &mut Host, controller: usize, unit: u64) -> u64 {
+    let state = h.ctrls[controller].flush_state;
+    let seq = unsafe { blk::FlushState::post(state, unit) };
+    h.ctrls[controller].flush_kick.signal();
+    let end = l4h_host::ticks::now() + 10 * h.info.tsc_hz;
+    crate::handoff_wait(h, None, end, |badge| {
+        (badge & blk::BLKD_FLUSH_DONE != 0).then(|| unsafe { blk::FlushState::answer(state, seq) }).flatten()
+    })
+    .unwrap_or(u64::MAX)
+}
+
+/// Flush host disk `index`'s volatile write cache.
+pub fn flush(h: &mut Host, index: usize) -> Result<(), i64> {
+    let dk = &h.disks[index];
+    let (ctrl, unit) = (dk.ctrl, dk.unit);
+    if h.ctrls[ctrl].failed { return Err(crate::ctl::EIO); }
+    if dk.read_only { return Err(crate::ctl::EPERM); }
+    let status = flush_async(h, ctrl, unit);
+    if status == 0 { return Ok(()); }
+    if status == u64::MAX {
+        quarantine(&mut h.ctrls[ctrl], &h.pci);
+    }
+    Err(crate::ctl::EIO)
+}
+
 /// Provision an unattached range of host disk `index`. Data copies occur
-/// only during seeding. A zero-length request flushes the disk. Never
-/// trust discard to zero.
-#[allow(clippy::too_many_arguments)]
+/// only during seeding. Never trust discard to zero.
 pub fn write(ctrl: &mut Controller, index: usize, dk: &Disk, sector: u64, len: usize, from: Option<*const u8>,
     pci: &Pci, win: &mut Window) -> Result<(), i64> {
     if ctrl.failed { return Err(crate::ctl::EIO); }
     if dk.read_only { return Err(crate::ctl::EPERM); }
-    if len > blk::STAGING_SIZE { return Err(crate::ctl::EINVAL); }
-    if len != 0 {
-        let w = blk::DiskWindow::new(sector, (len / 512) as u64, dk.capacity).ok_or(crate::ctl::EINVAL)?;
-        if len % 4096 != 0 { return Err(crate::ctl::EINVAL); }
-        if ctrl.attachments(index).any(|(_, a)| a.window.overlaps(w)) { return Err(crate::ctl::EBUSY); }
-    }
-    let disk = ctrl;
-    let driver = disk.driver.as_ref().unwrap();
+    if len == 0 || len > blk::STAGING_SIZE || len % 4096 != 0 { return Err(crate::ctl::EINVAL); }
+    let w = blk::DiskWindow::new(sector, (len / 512) as u64, dk.capacity).ok_or(crate::ctl::EINVAL)?;
+    if ctrl.attachments(index).any(|(_, a)| a.window.overlaps(w)) { return Err(crate::ctl::EBUSY); }
+    let driver = ctrl.driver.as_ref().unwrap();
     for (i, s) in driver.staging.clone().take(len.div_ceil(PAGE)).enumerate() {
         let f = sel4::init_thread::Slot::<cap_type::Granule>::from_index(s).cap();
         win.with_frame(&abs_of(f), |p| unsafe {
@@ -467,14 +516,10 @@ pub fn write(ctrl: &mut Controller, index: usize, dk: &Disk, sector: u64, len: u
             else { core::ptr::write_bytes(p, 0, PAGE); }
         });
     }
-    let status = if len == 0 {
-        call(driver.comp.service_ep, blk::BLKD_FLUSH, &[dk.unit])
-    } else {
-        call(driver.comp.service_ep, blk::BLKD_WRITE, &[sector, len as u64, dk.unit])
-    };
+    let status = call(driver.comp.service_ep, blk::BLKD_WRITE, &[sector, len as u64, dk.unit]);
     if status == 0 { return Ok(()); }
     if status == u64::MAX {
-        quarantine(disk, pci);
+        quarantine(ctrl, pci);
     }
     Err(crate::ctl::EIO)
 }
@@ -498,8 +543,23 @@ const VIRTIO_RESET_MS: u64 = 2000;
 /// finishes while resetting lands in memory that is still the client's.
 /// On failure, marks the disk failed and returns false.
 pub fn reset(disk: &mut Controller, pci: &Pci, alloc: &mut Alloc, devmem: &mut DevMem, win: &mut Window, ticks_per_ms: u64) -> bool {
+    reset_impl(disk, pci, alloc, devmem, win, ticks_per_ms, false)
+}
+
+/// Flush has completed: stop blkd, ask NVMe for a normal shutdown, then
+/// disable the controller. Other devices use their ordinary reset.
+pub fn shutdown(disk: &mut Controller, pci: &Pci, alloc: &mut Alloc, devmem: &mut DevMem, win: &mut Window, ticks_per_ms: u64) -> bool {
+    if let Some(driver) = &disk.driver {
+        let _ = driver.comp.tcb.tcb_suspend();
+    }
+    reset_impl(disk, pci, alloc, devmem, win, ticks_per_ms, true)
+}
+
+fn reset_impl(disk: &mut Controller, pci: &Pci, alloc: &mut Alloc, devmem: &mut DevMem, win: &mut Window, ticks_per_ms: u64, shutdown: bool) -> bool {
     if disk.failed {
-        return false;
+        // Quarantine has already suspended blkd and disabled the controller,
+        // so it is safe for a host handoff but not for ordinary reuse.
+        return shutdown;
     }
     if let Some(base) = disk.legacy_io() {
         let ok = match disk.io_cap(alloc) {
@@ -546,13 +606,29 @@ pub fn reset(disk: &mut Controller, pci: &Pci, alloc: &mut Alloc, devmem: &mut D
         };
         if nvme {
             if r32(NVME_CSTS) == u32::MAX {
+                log!("l4h-root: NVMe CSTS reads all ones: CC {:#x}", r32(NVME_CC));
                 return false;
             }
             // CAP.TO: the worst-case time to become (not) ready, in 500 ms.
             let to_ms = ((r32(NVME_CAP) >> 24) & 0xff).max(1) as u64 * 500;
+            if shutdown && r32(NVME_CC) & 1 != 0 {
+                // SHN=01: complete a normal shutdown before disabling. EN
+                // stays set until the shutdown status reaches SHST=10.
+                w32(NVME_CC, (r32(NVME_CC) & !(3 << 14)) | (1 << 14));
+                if !wait(10_000, &|| (r32(NVME_CSTS) >> 2) & 3 == 2) {
+                    // The flush completed, so a controller that never
+                    // reports SHST is still disabled below, not allowed to
+                    // prevent the handoff. A failed disable is fatal.
+                    log!("l4h-root: NVMe normal shutdown timed out: CC {:#x}, CSTS {:#x}", r32(NVME_CC), r32(NVME_CSTS));
+                }
+            }
             // Clear EN and any shutdown request.
             w32(NVME_CC, r32(NVME_CC) & !(1 | (3 << 14)));
-            wait(to_ms, &|| r32(NVME_CSTS) & 1 == 0)
+            let ready = wait(to_ms, &|| r32(NVME_CSTS) & 1 == 0);
+            if !ready {
+                log!("l4h-root: NVMe disable timed out: CC {:#x}, CSTS {:#x}", r32(NVME_CC), r32(NVME_CSTS));
+            }
+            ready
         } else {
             let status = page.add(off % PAGE);
             status.write_volatile(0);

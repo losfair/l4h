@@ -1,11 +1,12 @@
 //! l4h-trustd: the attestation service (DESIGN.md §9.2).  Each guest has
 //! an attestation device (L4H_DEV_ATTEST): a request page, which trustd
 //! maps at page_va(guest), and the kick notification, badged with
-//! kick_badge(guest).  trustd answers in the page and has root raise the
-//! device's event (ROOT_CALL_ATTEST_DONE).  l4h-root tells trustd about
-//! guests through the registry page, which it writes and trustd only
-//! reads. Root waits only for trustd's passive flags thread, never for
-//! its main thread, whose TPM commands can take seconds.
+//! kick_badge(guest). trustd answers in the page, then updates vmmgr's
+//! attestation page and signals vmmgr directly to raise the device's event.
+//! l4h-root tells trustd about guests through the registry page, which it
+//! writes and trustd only reads. Root's kexec state is a separate private
+//! page: init publishes the key extension there, and measurement uses a
+//! sequence-numbered request with a bounded wait, never a synchronous call.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 use l4h_abi as abi;
@@ -58,6 +59,9 @@ pub struct TrustdConfig {
     /// START_ACPI: the firmware's ACPI tables at AML_VA, back to back with
     /// their headers: the FADT, the DSDT, then the SSDTs.
     pub aml_size: u64,
+    /// The previous kexec event log, read-only in trustd (0 if absent).
+    pub kexec_log_va: u64,
+    pub kexec_log_size: u64,
 }
 
 pub const TPM_VA: usize = crate::MMIO_VA;
@@ -77,6 +81,9 @@ pub const SLOT_FLAGS_EP: u64 = SLOT_KICK + 1;
 pub const SLOT_FLAGS_CALL: u64 = SLOT_KICK + 2;
 pub const SLOT_FLAGS_TCB: u64 = SLOT_KICK + 3;
 pub const SLOT_FLAGS_REPLY: u64 = SLOT_KICK + 4;
+pub const SLOT_ATTEST_EVENTS: u64 = SLOT_KICK + 5;
+pub const SLOT_VMMGR_NTFN: u64 = SLOT_KICK + 6;
+pub const SLOT_MEASURE_DONE: u64 = SLOT_KICK + 7;
 pub const FLAGS_IPCBUF_VA: usize = crate::KEEPER_IPCBUF_VA;
 pub const FLAGS_STACK_TOP: usize = crate::KEEPER_STACK_TOP;
 pub const FLAGS_STACK_SIZE: usize = crate::KEEPER_STACK_SIZE;
@@ -94,6 +101,60 @@ pub const fn kick_badge(guest: usize) -> u64 {
 }
 /// Most ACPI table bytes root gives trustd.
 pub const AML_MAX: usize = 4 << 20;
+/// The kexec event log passed to the next host as `kexec-log`.
+pub const KEXEC_LOG_MAGIC: [u8; 8] = *b"L4HKXLOG";
+pub const KEXEC_LOG_VERSION: u32 = 1;
+pub const KEXEC_LOG_HEADER: usize = 16;
+pub const KEXEC_LOG_EVENT: usize = 168;
+/// TrustdConfig.kexec_log_size sentinel: an oversized/invalid history. The
+/// evidence includes an empty klog with count 1, so verification fails closed
+/// instead of disabling trustd or accepting a false cold boot.
+pub const KEXEC_LOG_INVALID: u64 = u64::MAX;
+
+/// Number of events in a log, checking its complete encoded size. An empty
+/// slice is the cold-boot history; a present log has at least one event.
+pub fn kexec_log_count(bytes: &[u8]) -> Result<u32, &'static str> {
+    if bytes.is_empty() {
+        return Ok(0);
+    }
+    if bytes.len() < KEXEC_LOG_HEADER || bytes[..8] != KEXEC_LOG_MAGIC ||
+        u32::from_le_bytes(bytes[8..12].try_into().unwrap()) != KEXEC_LOG_VERSION
+    {
+        return Err("bad kexec log header");
+    }
+    let count = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+    if count == 0 || bytes.len() != KEXEC_LOG_HEADER + count as usize * KEXEC_LOG_EVENT {
+        return Err("kexec log event count does not match its size");
+    }
+    Ok(count)
+}
+
+/// The kexec event log, up to 16 KiB.
+pub const KEXEC_LOG_MAX: usize = 16 << 10;
+pub const KEXEC_LOG_VA: usize = AML_VA + AML_MAX;
+/// Root and trustd's private state, never mapped into a guest. The flags
+/// thread is not involved in these requests.
+pub const KEXEC_STATE_VA: usize = KEXEC_LOG_VA + KEXEC_LOG_MAX;
+/// vmmgr's attestation page, writable by trustd for guest completions.
+pub const ATTEST_EVENTS_VA: usize = KEXEC_STATE_VA + 4096;
+
+pub const KEXEC_STARTING: u32 = 0;
+pub const KEXEC_READY: u32 = 1;
+pub const KEXEC_UNAVAILABLE: u32 = 2;
+pub use crate::handoff::MEASURE_DONE_BADGE;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct KexecState {
+    /// KEXEC_STARTING, KEXEC_READY or KEXEC_UNAVAILABLE, written once after init.
+    pub status: u32,
+    /// This host's public PCR 15 extension value, valid when status is READY.
+    pub key_extension: [u8; 32],
+    /// The event digest root asks trustd to extend into PCR 14, answered
+    /// with zero or a positive errno.
+    pub measure: crate::handoff::Mailbox<[u8; 32]>,
+}
+const _: () = assert!(core::mem::size_of::<KexecState>() <= 4096);
 
 /// The record of guest `id` at REGISTRY_VA + id * size_of::<GuestRecord>().
 /// root fills it before the guest starts and writes `instance` last

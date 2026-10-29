@@ -1,0 +1,18 @@
+#!/bin/sh
+# dom0 init for tests/run-kexec-loadtest.sh.
+fail() {
+    echo "KEXECTEST: FAIL $*"
+    poweroff -f
+    exit 1
+}
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mkdir -p /boot/efi
+mount -t vfat /dev/vda1 /boot/efi || fail "mount ESP"
+echo "KEXECTEST: first LOAD"
+l4hctl host-kexec --load-only || fail "first LOAD"
+echo "KEXECTEST: replacement LOAD"
+l4hctl host-kexec --load-only || fail "replacement LOAD"
+echo "KEXECTEST: load ok"
+poweroff -f

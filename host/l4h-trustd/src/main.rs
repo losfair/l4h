@@ -7,8 +7,8 @@
 //! then extends PCR 15 with the same hash: the quote shows PCR 15 zero,
 //! so it is the first and only key trustd issued in this boot.  The key
 //! signs guests' reports; the quote, the attestation key and the EK
-//! certificate make the host evidence.  The TPM is only used at start,
-//! and for ActivateCredential.
+//! certificate make the host evidence.  The TPM is used at start, for
+//! ActivateCredential, and for root-only kexec measurement.
 //!
 //! Guests ask through their attestation device (l4h_attest_page): a kick,
 //! then the answer in the page and an event, so that a vCPU never waits
@@ -65,12 +65,13 @@ const ACTIVATE_INTERVAL_MS: u64 = 1000;
 const QUOTE_PCRS: u32 = 0xffff;
 /// Extended with the key's hash once it is quoted.
 const KEY_PCR: u32 = 15;
+/// Records each new image before a host kexec.
+const KEXEC_PCR: u32 = 14;
 const KEY_DOMAIN: &[u8] = b"l4h-trustd-key-v1";
 
-/// The host evidence's room: the AK's public area, the key, 16 PCRs, the
-/// quote and its signature take about 1 KiB, the rest is for the EK
-/// certificate.
-const EVIDENCE_MAX: usize = 8192;
+/// The host evidence's room: the complete kexec log, the largest EK
+/// certificate, and 2 KiB for keys, PCRs, quote and encoding overhead.
+const EVIDENCE_MAX: usize = trust::KEXEC_LOG_MAX + EK_CERT_MAX + 2048;
 /// The largest EK certificate we put in the evidence (a few hundred bytes
 /// to 2 KiB in practice).  A larger one is left out: the evidence is
 /// still usable, without the certificate a verifier can check the TPM by.
@@ -103,6 +104,8 @@ struct State {
     key: SigningKey,
     /// SHA-256 of the key's SEC1 point.
     key_id: [u8; 32],
+    /// The public value this host extends into PCR 15 after its quote.
+    key_extension: [u8; 32],
     /// The attestation key's handle.
     ak: u32,
     /// The EK, created on first use (ActivateCredential), RSA unless the
@@ -124,7 +127,32 @@ fn step<T>(what: &'static str, r: Result<T, Error>) -> Result<T, (&'static str, 
     r.map_err(|e| (what, e))
 }
 
+fn kexec_log(cfg: &TrustdConfig) -> Result<Option<(&'static [u8], u64)>, (&'static str, Error)> {
+    let invalid = || -> Result<Option<(&'static [u8], u64)>, (&'static str, Error)> {
+        Ok(Some((&[], 1)))
+    };
+    if cfg.kexec_log_size == trust::KEXEC_LOG_INVALID {
+        return invalid();
+    }
+    let size = match usize::try_from(cfg.kexec_log_size) {
+        Ok(size) => size,
+        Err(_) => return invalid(),
+    };
+    if size == 0 {
+        return Ok(None);
+    }
+    if cfg.kexec_log_va == 0 || size < trust::KEXEC_LOG_HEADER {
+        return invalid();
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(cfg.kexec_log_va as *const u8, size) };
+    match trust::kexec_log_count(bytes) {
+        Ok(count) => Ok(Some((bytes, count as u64))),
+        Err(_) => invalid(),
+    }
+}
+
 fn init(cfg: &TrustdConfig, hz: u64) -> Result<State, (&'static str, Error)> {
+    let klog = kexec_log(cfg)?;
     let t0 = host::ticks::now();
     let mut tpm = step("interface", Tpm::new(cfg, hz))?;
     step("Startup", tpm2::startup(&mut tpm))?;
@@ -158,16 +186,22 @@ fn init(cfg: &TrustdConfig, hz: u64) -> Result<State, (&'static str, Error)> {
     // encodings (RFC 8949 §4.2.1).
     let mut evidence = [0u8; EVIDENCE_MAX];
     let mut e = Enc::new(&mut evidence);
-    e.map(6 + ek_cert.is_some() as usize);
+    e.map(6 + ek_cert.is_some() as usize + 2 * klog.is_some() as usize);
     e.text("v").uint(1);
     let (ak, ak_public) = step("CreatePrimary (AK)", tpm2::create_primary(&mut tpm, tpm2::RH_ENDORSEMENT, Template::Ak))?;
     e.text("ak").bytes(ak_public);
     // A COSE_Key (EC2, P-256).
     e.text("key").map(4).uint(1).uint(2).nint(0).uint(1).nint(1).bytes(&p[1..33]).nint(2).bytes(&p[33..]);
+    if let Some((log, _)) = klog {
+        e.text("klog").bytes(log);
+    }
     let pcrs = step("PCR_Read", tpm2::pcr_read(&mut tpm, QUOTE_PCRS))?;
     e.text("pcrs").map(pcrs.len());
     for (i, v) in &pcrs {
         e.uint(*i as u64).bytes(v);
+    }
+    if let Some((_, count)) = klog {
+        e.text("kexec").uint(count);
     }
     let (quote, sig) = step("Quote", tpm2::quote(&mut tpm, ak, &bound, QUOTE_PCRS))?;
     e.text("quote").bytes(quote);
@@ -187,7 +221,7 @@ fn init(cfg: &TrustdConfig, hz: u64) -> Result<State, (&'static str, Error)> {
             (Some(_), false) => "an RSA",
         }
     );
-    Ok(State { tpm, key, key_id, ak, ek: None, ek_ecc, evidence, evidence_len })
+    Ok(State { tpm, key, key_id, key_extension: bound, ak, ek: None, ek_ecc, evidence, evidence_len })
 }
 
 /// Guest `id`'s record, if it runs.
@@ -360,8 +394,37 @@ fn answer(id: usize, seq: u32, result: Result<&[u8], i64>) {
         fence(Ordering::Release);
         addr_of_mut!((*p).done).write_volatile(seq);
     }
-    sel4::with_ipc_buffer_mut(|b| b.msg_regs_mut()[0] = id as u64);
-    cap::<cap_type::Endpoint>(host::SLOT_ROOT_EP).call(sel4::MessageInfo::new(host::ROOT_CALL_ATTEST_DONE, 0, 0, 1));
+    let attest = unsafe { &*(trust::ATTEST_EVENTS_VA as *const host::vmmgr::AttestEvents) };
+    attest.done.fetch_or(1 << id, Ordering::AcqRel);
+    cap::<cap_type::Notification>(trust::SLOT_VMMGR_NTFN).signal();
+}
+
+/// Measure one private root request. Root waits for the answer with a timeout;
+/// this thread never calls root and never waits for a response from it.
+fn measure_request(state: &mut Option<State>) {
+    let p = trust::KEXEC_STATE_VA as *mut trust::KexecState;
+    let mailbox = unsafe { addr_of_mut!((*p).measure) };
+    let Some((seq, digest)) = (unsafe { host::handoff::Mailbox::pending(mailbox) }) else {
+        return;
+    };
+    // This host's TPM work ends here. A kexec does not reset the TPM, so
+    // its transient keys are flushed, or each host in a chain would hold
+    // one of the few object slots until the next cold boot.
+    let status = match state.take() {
+        Some(mut s) => {
+            let status = tpm2::pcr_extend(&mut s.tpm, KEXEC_PCR, &digest).map_or_else(|e| {
+                l4h_rt::log!("l4h-trustd: kexec PCR extend failed: {}", e);
+                EIO as u64
+            }, |_| 0);
+            for handle in core::iter::once(s.ak).chain(s.ek) {
+                tpm2::flush(&mut s.tpm, handle);
+            }
+            status
+        }
+        None => ENODEV as u64,
+    };
+    unsafe { host::handoff::Mailbox::complete(mailbox, seq, status) };
+    cap::<cap_type::Notification>(trust::SLOT_MEASURE_DONE).signal();
 }
 
 fn main(info: &'static Info) -> ! {
@@ -379,6 +442,14 @@ fn main(info: &'static Info) -> ! {
             }
         }
     };
+    unsafe {
+        let p = trust::KEXEC_STATE_VA as *mut trust::KexecState;
+        if let Some(s) = &state {
+            addr_of_mut!((*p).key_extension).write_volatile(s.key_extension);
+        }
+        fence(Ordering::Release);
+        addr_of_mut!((*p).status).write_volatile(if state.is_some() { trust::KEXEC_READY } else { trust::KEXEC_UNAVAILABLE });
+    }
     if state.is_none() {
         for id in 0..trust::MAX_RECORDS {
             unsafe { addr_of_mut!((*page(id)).state).write_volatile(abi::ATTEST_NO_REPORTS) };
@@ -392,6 +463,7 @@ fn main(info: &'static Info) -> ! {
     let mut out = [0u8; ANSWER_MAX];
     loop {
         let (_, mut kicked) = kick.wait();
+        measure_request(&mut state);
         while kicked != 0 {
             let id = kicked.trailing_zeros() as usize;
             kicked &= kicked - 1;

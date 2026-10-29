@@ -17,7 +17,7 @@ use crate::pci::{self, Pci};
 use crate::vmmgr::RootGuest;
 use crate::vspace::FRAME_BP;
 use crate::window::Window;
-use crate::{AsidPools, HostInfo, ctl, mr, set_mr};
+use crate::{AsidPools, Host, HostInfo, ctl, mr, set_mr};
 
 static NETD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/l4h-netd.elf"));
 
@@ -30,6 +30,8 @@ const _: () = assert!(net::PORT_PAGES <= 1 << PORT_KEEP_BITS);
 /// MSI vectors of NICs start here.
 const NIC_MSI_BASE: u64 = crate::pci::VECTOR_NIC_BASE;
 const NETD_ID: u32 = 0x200;
+/// Four ENA controllers can take 24.8 seconds at their maximum reset timeouts.
+const NETD_RESET_TIMEOUT_MS: u64 = 30_000;
 
 pub fn is_virtio_net(d: &pci::Device) -> bool {
     d.vendor == 0x1af4
@@ -104,6 +106,7 @@ pub struct Netd {
     pub ports: [Option<PortInfo>; net::MAX_PORTS],
     /// Switches 0..switches exist (they are never deleted).
     pub switches: u32,
+    reset_kick: cap::Notification,
 }
 
 pub fn bdf(d: &pci::Device) -> u32 {
@@ -275,8 +278,40 @@ pub fn spawn(
         pci.enable_msix(&d);
         let _ = nic_list.push(Nic { pci: *d, switch: None });
     }
+    let reset_done = info.events;
+    comp.give_badged(net::NETD_SLOT_RESET_OK, reset_done, CapRights::write_only(), net::NETD_RESET_OK);
+    comp.give_badged(net::NETD_SLOT_RESET_ERROR, reset_done, CapRights::write_only(), net::NETD_RESET_ERROR);
+    let slot = alloc.slots.alloc();
+    let reset_kick = sel4::init_thread::Slot::<cap_type::Notification>::from_index(slot).cap();
+    abs_of(reset_kick)
+        .mint(&abs_of(comp.ntfn), CapRights::write_only(), 1u64 << net::NETD_BADGE_RESET)
+        .expect("netd reset notification");
     component::start(&comp);
-    Netd { comp, arena, nics: nic_list, ports: [const { None }; net::MAX_PORTS], switches: 0 }
+    Netd { comp, arena, nics: nic_list, ports: [const { None }; net::MAX_PORTS], switches: 0, reset_kick }
+}
+
+/// Reset every uplink and stop netd before the host changes hands. Root
+/// uses the shared dispatcher while waiting for the result.
+pub fn reset(h: &mut Host) -> Result<(), i64> {
+    let mut result = Ok(());
+    if !h.netd.nics.is_empty() {
+        let end = host::ticks::now() + NETD_RESET_TIMEOUT_MS * (h.info.tsc_hz / 1000).max(1);
+        h.netd.reset_kick.signal();
+        result = crate::handoff_wait(h, None, end, |badge| {
+            if badge & (net::NETD_RESET_OK | net::NETD_RESET_ERROR) == 0 {
+                return None;
+            }
+            Some(if badge & net::NETD_RESET_ERROR != 0 { Err(ctl::EIO) } else { Ok(()) })
+        })
+        .unwrap_or_else(|| {
+            log!("l4h-root: netd reset timed out");
+            Err(ctl::EIO)
+        });
+    }
+    if h.netd.comp.tcb.tcb_suspend().is_err() {
+        result = Err(ctl::EIO);
+    }
+    result
 }
 
 impl Netd {

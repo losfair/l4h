@@ -3,11 +3,28 @@
 // placeholders when unset.  dom0 is not built in: it comes as boot
 // modules, or appended to the built ELF by tools/add-modules.py.  The other variables are the settings' defaults
 // (src/config.rs).
-use std::{env, fs, path::PathBuf};
+use std::{env, fs, path::PathBuf, process::Command};
 
 fn main() {
     println!("cargo:rerun-if-env-changed=L4H_VERSION");
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
+    if env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64") {
+        // rust-sel4 makes raw syscalls and does not link libsel4 itself.
+        // Patch 0026 installs the relocation-free blobs root copies into
+        // its kexec control pages; compile that one source into root.
+        println!("cargo:rerun-if-env-changed=SEL4_PREFIX");
+        let prefix = PathBuf::from(env::var("SEL4_PREFIX").expect("SEL4_PREFIX for kexec blobs"));
+        let source = prefix.join("libsel4/src/arch/x86_64/kexec.S");
+        println!("cargo:rerun-if-changed={}", source.display());
+        let object = out.join("kexec-blobs.o");
+        let status = Command::new("cc")
+            .arg("-c").arg("-ffreestanding")
+            .arg("-I").arg(prefix.join("libsel4/include"))
+            .arg(&source).arg("-o").arg(&object)
+            .status().unwrap_or_else(|e| panic!("compile {}: {e}", source.display()));
+        assert!(status.success(), "compile {} failed", source.display());
+        println!("cargo:rustc-link-arg={}", object.display());
+    }
     for (var, file) in [
         ("L4H_VMMGR_ELF", "l4h-vmmgr.elf"),
         ("L4H_BLKD_ELF", "l4h-blkd.elf"),

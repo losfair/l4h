@@ -63,6 +63,10 @@ pub const MAX_PORTS: usize = 48;
 /// Uplink NICs; NIC n interrupts with badge bit NETD_BADGE_IRQ_SHIFT + n.
 pub const MAX_NICS: usize = 4;
 pub const NETD_BADGE_IRQ_SHIFT: u32 = 48;
+/// Reset every uplink before a host ownership handoff, requested by this
+/// notification bit and answered with NETD_RESET_OK or NETD_RESET_ERROR.
+pub const NETD_BADGE_RESET: u32 = NETD_BADGE_IRQ_SHIFT + MAX_NICS as u32;
+pub use crate::handoff::{NETD_RESET_ERROR, NETD_RESET_OK};
 /// Switches: one per port and NIC is the most that can carry traffic at
 /// once.  Root refuses to create more, so netd keeps a fixed table of them
 /// indexed by switch number.
@@ -85,6 +89,8 @@ pub const NETD_SLOT_IRQ_BASE: u64 = 32;
 /// I/O port capability of a legacy virtio NIC n (NicConfig::legacy_io).
 pub const NETD_SLOT_IOPORT_BASE: u64 = 40;
 pub const NETD_SLOT_CLIENT_BASE: u64 = 64;
+pub const NETD_SLOT_RESET_OK: u64 = NETD_SLOT_CLIENT_BASE + MAX_PORTS as u64;
+pub const NETD_SLOT_RESET_ERROR: u64 = NETD_SLOT_RESET_OK + 1;
 
 /// Calls from l4h-root to netd's service endpoint.
 /// MR0 = port, MR1 = switch, MR2 = MAC (low 48 bits), MR3 = flags.

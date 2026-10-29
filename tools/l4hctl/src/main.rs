@@ -20,6 +20,14 @@ struct CreateOpts {
     gpu: Option<(u64, u64)>,
 }
 
+fn read_optional(path: &str) -> Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(data) => Ok(Some(data)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => err(format!("{path}: {e}")),
+    }
+}
+
 fn cmd_create(ctl: &Ctl, o: &CreateOpts) -> Result<u64> {
     let initrd = match &o.initrd {
         Some(p) => read_file(p)?,
@@ -110,6 +118,9 @@ const USAGE: &str = "usage: l4hctl <command>
                                devices, logged faults
   host-reboot                  reset the machine (every guest stops; sync
                                dom0's disks first)
+  host-kexec [--efi F] [--initrd F] [--conf F] [--load-only]
+                               stage an l4h EFI from the ESP, sync, then boot
+                               it without a firmware reset (every guest stops)
   rtc-set [UNIX_SECONDS]       set the machine RTC in UTC (default: dom0's
                                current time, e.g. after NTP synchronizes)
   disks                        host disks, owners, capacities and attachments
@@ -253,6 +264,45 @@ fn run(args: &[String]) -> Result<i32> {
         }
         "host-reboot" => {
             ctl.host_reboot()?;
+        }
+        "host-kexec" => {
+            let (mut efi, mut initrd, mut conf) = (
+                "/boot/efi/EFI/BOOT/BOOTX64.EFI".to_string(),
+                "/boot/efi/l4h/dom0/initrd".to_string(),
+                "/boot/efi/l4h/l4h.conf".to_string(),
+            );
+            let mut load_only = false;
+            let mut initrd_explicit = false;
+            let mut conf_explicit = false;
+            let mut it = args[1..].iter();
+            while let Some(a) = it.next() {
+                let mut value = || it.next().cloned().ok_or(Error(format!("{a}: missing value")));
+                match a.as_str() {
+                    "--efi" => efi = value()?,
+                    "--initrd" => {
+                        initrd = value()?;
+                        initrd_explicit = true;
+                    }
+                    "--conf" => {
+                        conf = value()?;
+                        conf_explicit = true;
+                    }
+                    "--load-only" => load_only = true,
+                    _ => return err(format!("host-kexec: unknown option {a}")),
+                }
+            }
+            let initrd_data = if initrd_explicit { Some(read_file(&initrd)?) } else { read_optional(&initrd)? };
+            let conf_data = if conf_explicit { Some(read_file(&conf)?) } else { read_optional(&conf)? };
+            ctl.host_kexec_load(&read_file(&efi)?, initrd_data.as_deref(), conf_data.as_deref())?;
+            if load_only {
+                eprintln!("kexec image staged");
+                return Ok(0);
+            }
+            let status = std::process::Command::new("sync").status().map_err(|e| Error(format!("sync: {e}")))?;
+            if !status.success() {
+                return err(format!("sync failed: {status}"));
+            }
+            ctl.host_kexec_exec()?;
         }
         "rtc-set" => {
             let seconds = match &args[1..] {

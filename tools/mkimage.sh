@@ -18,9 +18,10 @@
 #   -i, -c  dom0's initramfs and the settings, copied to /l4h/dom0/initrd
 #       and /l4h/l4h.conf
 # L4H_SERIAL_PORT, L4H_FB_CONSOLE=1, L4H_GUEST_KERNEL and L4H_GUEST_KMODS
-# go to tools/mkefi.sh and tools/mkbios.sh.  L4H_ESP_MB
-# sizes the partition (default: the payload plus 64 MiB, room for larger
-# dom0 images later).
+# go to tools/mkefi.sh and tools/mkbios.sh. L4H_ESP_MB sizes the partition
+# (default: the payload plus 64 MiB, room for larger dom0 images later).
+# L4H_ESP_FILES is a space-separated list of additional
+# /absolute/dest/on/esp=source/file pairs to copy.
 set -euo pipefail
 # sfdisk is commonly installed outside an unprivileged user's PATH.
 export PATH="$PATH:/usr/sbin:/sbin"
@@ -76,6 +77,9 @@ if [ -n "$bios" ]; then
 fi
 [ -n "$dom0_initrd" ] && mcopy -i "$work/esp.img" "$dom0_initrd" ::/l4h/dom0/initrd
 [ -n "$config" ] && mcopy -i "$work/esp.img" "$config" ::/l4h/l4h.conf
+for spec in ${L4H_ESP_FILES:-}; do
+    mcopy -i "$work/esp.img" "${spec#*=}" "::${spec%%=*}"
+done
 
 # GPT disk: ESP from 1 MiB, then a 1 MiB BIOS boot partition; GCE wants
 # a whole number of GiB.

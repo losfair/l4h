@@ -12,6 +12,7 @@
 
 pub mod blk;
 pub mod fixed;
+pub mod handoff;
 pub mod gpu;
 pub mod iopool;
 pub mod log;
@@ -144,8 +145,6 @@ pub const ROOT_CALL_LOG: u64 = 2;
 pub const ROOT_CALL_VMM_READY: u64 = 3;
 /// trustd: a hardware access for the firmware's AML (trust::HW_*).
 pub const ROOT_CALL_HW: u64 = 5;
-/// trustd: it answered guest MR0's request; raise its device's event.
-pub const ROOT_CALL_ATTEST_DONE: u64 = 6;
 
 /// Badge bit set on every endpoint capability l4h-root gives to a guest
 /// for l4h-vmm's service endpoint; notification badges never have it.

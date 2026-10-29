@@ -30,6 +30,8 @@ mod dashboard;
 mod devmem;
 mod font;
 mod iommu;
+#[cfg(target_arch = "x86_64")]
+mod kexec;
 mod layout;
 mod memd;
 mod monitor;
@@ -51,6 +53,7 @@ use sel4_root_task::{Never, root_task};
 
 use l4h_host as host;
 use l4h_host::fixed::ArrayVec;
+use l4h_host::trust;
 use l4h_task::{mem, topology, vspace, window};
 
 use crate::blkd::{Controller, Disk};
@@ -79,6 +82,9 @@ const RESERVE_SLOTS: usize = 32768;
 const RESERVE_RANGE: usize = 4096;
 
 const TIMER_BADGE: u64 = 1 << 40;
+const HANDOFF_BADGES: u64 = TIMER_BADGE | monitor::MONITOR_BADGE | trust::MEASURE_DONE_BADGE |
+    l4h_host::net::NETD_RESET_OK | l4h_host::net::NETD_RESET_ERROR |
+    l4h_host::blk::BLKD_FLUSH_DONE;
 
 /// Host disks, at most: the units of all controllers (a virtio-scsi
 /// controller reports its own number).  Units beyond are reported and
@@ -99,6 +105,8 @@ pub struct HostInfo {
     /// AArch64 feature ID registers for the guests' bootinfo (`cpu_id`).
     pub cpu_id: [u64; 5],
     pub hyp_ep: cap::Endpoint,
+    /// Root's TCB-bound notification: timer, monitor and handoff completions.
+    pub events: cap::Notification,
     sched_control_base: usize,
     pub timeslice_us: u64,
     /// Wall clock at boot (ns since the epoch, 0 if unknown) and the tick
@@ -251,6 +259,8 @@ pub struct Host {
     pub next_instance: u64,
     pub memd: memd::Memd,
     pub reset: reset::Reset,
+    #[cfg(target_arch = "x86_64")]
+    pub kexec: kexec::Kexec,
     pub rtc: rtc::Rtc,
     pub vmmgr: Option<vmmgr::Vmmgr>,
 }
@@ -350,6 +360,9 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     let modules = bootmod::load(bootinfo, &mut alloc, &mut devmem);
     let module = |name: &str| modules.iter().find(|m| m.name == name).map(|m| m.data);
     let cfg = config::Config::new(module("l4h-config"));
+    let kexec_log = module("kexec-log");
+    let warm_boot = kexec_log.is_some();
+    let kexec_log = kexec_log.unwrap_or(&[]);
     // ACPI table frames are shared by RTC discovery, reset and trustd.
     #[cfg(target_arch = "x86_64")]
     let mut acpi_frames = acpi::Frames::new();
@@ -369,6 +382,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         },
         cpu_id: cpu_id(bootinfo),
         hyp_ep,
+        events: wd_ntfn,
         sched_control_base: bootinfo.sched_control().range().start,
         timeslice_us: 5000,
         epoch_ns: rtc.read_ns(&mut wins.a),
@@ -452,6 +466,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         bootinfo, &mut alloc, &mut devmem, &mut wins.a, &mut asids, &info,
         #[cfg(target_arch = "x86_64")]
         acpi_frames,
+        Some(kexec_log).filter(|log| !log.is_empty()),
     );
     let netd = netd::spawn(&nics, &pci, &mut iommu, &mut devmem, &mut alloc, &mut wins.a, &mut asids, &info);
 
@@ -475,12 +490,14 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         next_instance: 1,
         memd,
         reset,
+        #[cfg(target_arch = "x86_64")]
+        kexec: kexec::Kexec::new(bootinfo, kexec_log),
         rtc,
         vmmgr: None,
     };
     h.scan_disks();
     h.monitor = monitor::Monitor::new(&mut h.alloc, &mut h.devmem, wd_ntfn, h.cfg.serial_port, h.cfg.serial_irq, &mut h.iommu);
-    h.dashboard = dashboard::Dashboard::new(bootinfo, &mut h.alloc, &mut h.devmem, h.cfg.fb_console);
+    h.dashboard = dashboard::Dashboard::new(bootinfo, &mut h.alloc, &mut h.devmem, h.cfg.fb_console, warm_boot);
 
     if module("guest-kernel").is_none() {
         log!("l4h-root: no guest kernel, nothing to do");
@@ -616,6 +633,7 @@ pub fn set_mr(i: usize, v: u64) {
 /// Serve calls from host components and faults of guest kernels.
 /// The serve loop's reply object, made from an Untyped of its own so that
 /// one left unanswered can be replaced without using more memory.
+#[derive(Clone, Copy)]
 struct ReplySlot {
     ut: cap::Untyped,
     reply: cap::Reply,
@@ -645,50 +663,109 @@ impl ReplySlot {
     }
 }
 
+/// Handle one root event without receiving another. Returns whether this was
+/// a notification and the optional component reply length.
+fn handle_event(h: &mut Host, info: &sel4::MessageInfo, badge: u64, next_watchdog: &mut u64) -> (bool, Option<usize>) {
+    h.alloc.refill();
+    let notified = badge & HANDOFF_BADGES != 0;
+    if badge & monitor::MONITOR_BADGE != 0 {
+        monitor::Monitor::interrupt(h);
+    }
+    let resp = if notified {
+        if badge & TIMER_BADGE != 0 {
+            dashboard::Dashboard::tick(h);
+            h.iommu.poll();
+            if h.cfg.watchdog_secs != 0 && rdtsc() >= *next_watchdog {
+                watchdog_dump(h);
+                *next_watchdog = rdtsc() + h.info.tsc_hz * h.cfg.watchdog_secs as u64;
+            }
+            arm_timer(&h.info);
+        }
+        None
+    } else if badge & ROOT_BADGE_COMPONENT != 0 {
+        component_call(h, badge, info)
+    } else {
+        log!("l4h-root: unexpected message, badge {:#x} label {}", badge, info.label());
+        None
+    };
+    (notified, resp)
+}
+
+/// Receive root's next event: calls and notifications on the endpoint with
+/// a reply slot, otherwise notifications only.
+fn receive(h: &Host, reply_slot: Option<&ReplySlot>) -> (sel4::MessageInfo, u64) {
+    match reply_slot {
+        Some(slot) => h.info.hyp_ep.recv(slot.reply),
+        None => h.info.events.wait(),
+    }
+}
+
+/// Handle one root event and receive the next. Nested handoff waits use the
+/// same dispatch as the main loop, with an optional reply slot.
+fn dispatch(
+    h: &mut Host,
+    reply_slot: Option<&ReplySlot>,
+    info: sel4::MessageInfo,
+    badge: u64,
+    next_watchdog: &mut u64,
+) -> (sel4::MessageInfo, u64) {
+    let (notified, resp) = handle_event(h, &info, badge, next_watchdog);
+    match (resp, reply_slot) {
+        (Some(len), Some(slot)) => h.info.hyp_ep.reply_recv(sel4::MessageInfo::new(0, 0, 0, len), slot.reply),
+        (Some(_), None) => unreachable!("handoff wait received a component call without a reply slot"),
+        (None, slot) => {
+            // A reply object left unanswered (a faulted or stopped
+            // thread) stays bound to its caller: make it afresh.
+            if !notified {
+                if let Some(slot) = slot {
+                    slot.renew();
+                }
+            }
+            receive(h, slot)
+        }
+    }
+}
+
+/// Wait for a matching handoff notification. Other messages, including
+/// stale completions rejected by `stop`, are dispatched before timeout checks.
+/// Return None at the deadline; a stop notification's other bits are handled.
+/// A notification received as the deadline passes is handled too, so a
+/// timeout cannot lose root's one-shot timer. A call received then is left
+/// unanswered: only the measurement wait receives calls, and its timeout
+/// ends in a cold reset.
+fn handoff_wait<T>(
+    h: &mut Host,
+    reply_slot: Option<&ReplySlot>,
+    deadline: u64,
+    mut stop: impl FnMut(u64) -> Option<T>,
+) -> Option<T> {
+    let (mut info, mut badge) = receive(h, reply_slot);
+    let mut next_watchdog = u64::MAX;
+    loop {
+        if badge & HANDOFF_BADGES != 0 {
+            if let Some(result) = stop(badge) {
+                let _ = handle_event(h, &info, badge, &mut next_watchdog);
+                return Some(result);
+            }
+        }
+        (info, badge) = dispatch(h, reply_slot, info, badge, &mut next_watchdog);
+        if rdtsc() >= deadline {
+            if badge & HANDOFF_BADGES != 0 {
+                let _ = handle_event(h, &info, badge, &mut next_watchdog);
+            }
+            return None;
+        }
+    }
+}
+
 /// Serve calls and faults of host components, and the timer and serial
 /// interrupts.
 fn serve(h: &mut Host, reply_slot: ReplySlot) -> ! {
-    let reply = reply_slot.reply;
-    let hyp_ep = h.info.hyp_ep;
     arm_timer(&h.info);
     let mut next_watchdog = rdtsc() + h.info.tsc_hz * h.cfg.watchdog_secs as u64;
-    let (mut info, mut badge) = hyp_ep.recv(reply);
+    let (mut info, mut badge) = receive(h, Some(&reply_slot));
     loop {
-        h.alloc.refill();
-        let notified = badge & (TIMER_BADGE | monitor::MONITOR_BADGE) != 0;
-        if badge & monitor::MONITOR_BADGE != 0 {
-            monitor::Monitor::interrupt(h);
-        }
-        let resp = if notified {
-            if badge & TIMER_BADGE != 0 {
-                dashboard::Dashboard::tick(h);
-                h.iommu.poll();
-                if h.cfg.watchdog_secs != 0 && rdtsc() >= next_watchdog {
-                    watchdog_dump(h);
-                    next_watchdog = rdtsc() + h.info.tsc_hz * h.cfg.watchdog_secs as u64;
-                }
-                arm_timer(&h.info);
-            }
-            None
-        } else if badge & ROOT_BADGE_COMPONENT != 0 {
-            component_call(h, badge, &info)
-        } else {
-            log!("l4h-root: unexpected message, badge {:#x} label {}", badge, info.label());
-            None
-        };
-        match resp {
-            Some(len) => {
-                (info, badge) = hyp_ep.reply_recv(sel4::MessageInfo::new(0, 0, 0, len), reply);
-            }
-            None => {
-                // A reply object left unanswered (a faulted or stopped
-                // thread) stays bound to its caller: make it afresh.
-                if !notified {
-                    reply_slot.renew();
-                }
-                (info, badge) = hyp_ep.recv(reply);
-            }
-        }
+        (info, badge) = dispatch(h, Some(&reply_slot), info, badge, &mut next_watchdog);
     }
 }
 
@@ -708,10 +785,6 @@ fn component_call(h: &mut Host, badge: u64, info: &sel4::MessageInfo) -> Option<
     };
     match info.label() {
         host::ROOT_CALL_HW if id == trustd::TRUSTD_ID => reply(trustd::hw(h)),
-        host::ROOT_CALL_ATTEST_DONE if id == trustd::TRUSTD_ID => {
-            trustd::done(h, mr(0) as usize);
-            reply(0)
-        }
         label if id == l4h_host::vmmgr::VMMGR_ID => Some(vmmgr::call(h, label)),
         other => {
             log!("l4h-root: component {:#x}: unknown call {}", id, other);

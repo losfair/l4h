@@ -38,6 +38,8 @@ pub struct Device {
     pub prog_if: u8,
     pub revision: u8,
     pub bars: [Bar; 6],
+    /// MSI capability's configuration offset, if present.
+    pub msi: Option<u8>,
     /// MSI-X capability: config offset, table BAR/offset, table size.
     pub msix: Option<Msix>,
     /// Vendor-specific capabilities (virtio): (cap offset, cfg_type, bar, offset, length, notify multiplier).
@@ -279,17 +281,19 @@ impl Pci {
         bars
     }
 
-    fn caps(&self, bus: u8, dev: u8, func: u8) -> (Option<Msix>, VirtioCaps) {
+    fn caps(&self, bus: u8, dev: u8, func: u8) -> (Option<Msix>, VirtioCaps, Option<u8>) {
         let mut msix = None;
+        let mut msi = None;
         let mut virtio = VirtioCaps::new();
         if self.read16(bus, dev, func, 6) & 0x10 == 0 {
-            return (msix, virtio);
+            return (msix, virtio, msi);
         }
         let mut ptr = self.read8(bus, dev, func, 0x34) & !3;
         let mut guard = 0;
         while ptr != 0 && guard < 48 {
             let id = self.read8(bus, dev, func, ptr);
             match id {
+                0x05 => msi = Some(ptr),
                 0x11 => {
                     let ctrl = self.read16(bus, dev, func, ptr + 2);
                     let table = self.read32(bus, dev, func, ptr + 4);
@@ -313,26 +317,33 @@ impl Pci {
             ptr = self.read8(bus, dev, func, ptr + 1) & !3;
             guard += 1;
         }
-        (msix, virtio)
+        (msix, virtio, msi)
     }
 
     /// Every PCI function, in bus, device, function order, each probed as
     /// the iterator reaches it.
     pub fn enumerate(&self) -> Devices<'_> {
-        Devices { pci: self, next: 0, multi: false }
+        Devices { pci: self, next: 0, multi: false, bars: true }
     }
 
-    /// The function at bus:dev.func, if there is one.
-    fn probe(&self, bus: u8, dev: u8, func: u8) -> Option<Device> {
+    /// Every function, without its BARs: sizing them stops decoding
+    /// meanwhile, which a running display must not see.
+    pub fn functions(&self) -> Devices<'_> {
+        Devices { pci: self, next: 0, multi: false, bars: false }
+    }
+
+    /// The function at bus:dev.func, if there is one, with its BARs sized
+    /// if `size_bars`.
+    fn probe(&self, bus: u8, dev: u8, func: u8, size_bars: bool) -> Option<Device> {
         let id = self.read32(bus, dev, func, 0);
         if id & 0xffff == 0xffff {
             return None;
         }
         let class = self.read32(bus, dev, func, 8);
         let header = self.read8(bus, dev, func, 0xe) & 0x7f;
-        let (msix, virtio_caps) = self.caps(bus, dev, func);
+        let (msix, virtio_caps, msi) = self.caps(bus, dev, func);
         #[allow(unused_mut)]
-        let mut bars = if header == 0 { self.probe_bars(bus, dev, func) } else { [Bar::default(); 6] };
+        let mut bars = if header == 0 && size_bars { self.probe_bars(bus, dev, func) } else { [Bar::default(); 6] };
         #[cfg(target_arch = "aarch64")]
         for (n, b) in bars.iter_mut().enumerate() {
             if b.size == 0 || b.is_io { continue; }
@@ -356,6 +367,7 @@ impl Pci {
             prog_if: (class >> 8) as u8,
             revision: class as u8,
             bars,
+            msi,
             msix,
             virtio_caps,
         })
@@ -379,14 +391,48 @@ impl Pci {
         self.write16(d.bus, d.dev, d.func, 4, cmd | 0x2 | 0x400);
     }
 
+    fn mask_msi_vectors(&self, d: &Device, m: u8, ctrl: u16) {
+        if ctrl & 0x100 != 0 {
+            // Per-vector masking: Mask Bits follows the message data, not
+            // the read-only Pending Bits at the next offset.
+            let off = if ctrl & 0x80 != 0 { m + 0x10 } else { m + 0x0c };
+            self.write32(d.bus, d.dev, d.func, off, u32::MAX);
+        }
+    }
+
     /// Stop the device: no DMA, no memory decoding, MSI-X off.  This alone
     /// does not quiesce a device that has commands (blkd::reset does).
     pub fn disable(&self, d: &Device) {
         let cmd = self.read16(d.bus, d.dev, d.func, 4);
         self.write16(d.bus, d.dev, d.func, 4, (cmd & !0x6) | 0x400);
+        if let Some(m) = d.msi {
+            let ctrl = self.read16(d.bus, d.dev, d.func, m + 2);
+            self.write16(d.bus, d.dev, d.func, m + 2, ctrl & !0x71);
+            self.mask_msi_vectors(d, m, ctrl);
+        }
         if let Some(m) = d.msix {
             let ctrl = self.read16(d.bus, d.dev, d.func, m.cap + 2);
-            self.write16(d.bus, d.dev, d.func, m.cap + 2, ctrl & !0x8000);
+            self.write16(d.bus, d.dev, d.func, m.cap + 2, ctrl & !0xc000);
+        }
+    }
+
+    /// Quiesce an endpoint for a host handoff, leaving memory and I/O decoding
+    /// intact for the next host's drivers and display. Bridges and IOMMUs are
+    /// untouched: their command registers and table walks still work.
+    pub fn quiesce(&self, d: &Device) {
+        if self.read8(d.bus, d.dev, d.func, 0xe) & 0x7f != 0 || (d.class == 0x08 && d.subclass == 0x06) {
+            return;
+        }
+        let cmd = self.read16(d.bus, d.dev, d.func, 4) | 0x400;
+        self.write16(d.bus, d.dev, d.func, 4, cmd & !0x4);
+        if let Some(m) = d.msi {
+            let ctrl = self.read16(d.bus, d.dev, d.func, m + 2);
+            self.write16(d.bus, d.dev, d.func, m + 2, ctrl & !1);
+            self.mask_msi_vectors(d, m, ctrl);
+        }
+        if let Some(m) = d.msix {
+            let ctrl = self.read16(d.bus, d.dev, d.func, m.cap + 2);
+            self.write16(d.bus, d.dev, d.func, m.cap + 2, (ctrl | 0x4000) & !0x8000);
         }
     }
 
@@ -406,6 +452,8 @@ pub struct Devices<'a> {
     next: u32,
     /// Its device has several functions.
     multi: bool,
+    /// Size each function's BARs.
+    bars: bool,
 }
 
 impl Iterator for Devices<'_> {
@@ -424,7 +472,7 @@ impl Iterator for Devices<'_> {
             }
             // Functions 1-7 only of a multi-function device.
             self.next += if self.multi { 1 } else { 8 };
-            if let Some(d) = self.pci.probe(bus, dev, func) {
+            if let Some(d) = self.pci.probe(bus, dev, func, self.bars) {
                 return Some(d);
             }
         }

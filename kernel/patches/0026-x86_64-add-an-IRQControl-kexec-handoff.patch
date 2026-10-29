@@ -1,0 +1,690 @@
+From: l4h <l4h@localhost>
+Date: Mon, 26 Oct 2026 23:53:24 -0700
+Subject: [PATCH] x86_64: add an IRQControl kexec handoff
+
+Provide seL4_X86_Kexec (the IRQControl Kexec invocation) on core zero.
+Root supplies a physical control page, identity page tables, parking code
+and a trampoline, after staging the image and quiescing devices. The
+kernel validates scalar fields before stopping any CPUs; image parsing,
+copy planning, DMA shutdown and APIC-variant checks remain root's job.
+
+Park APs through the remote-call IPI so CPUs waiting on the big kernel
+lock also respond. Acknowledge from the parking page under the new CR3,
+not from the old kernel's IPI barrier. Preserve the kernel mapping only
+for the CR3 transition, flush global/PCID translations, mask LAPIC timers,
+drain in-service interrupts and mask every IOAPIC pin before jumping.
+Keep pic_disable in runtime text because kexec runs after boot memory is
+reclaimed.
+
+Supply relocation-free libsel4 blobs for root to copy into its control
+pages. The trampoline copies or zero-fills segments on its own stack, loads a
+private GDT, leaves long mode and enters the new kernel with the multiboot2
+registers. Clear PCIDE before PG, then LME and PAE. Set PSE and clear
+SMEP/SMAP for seL4's user-mapped 2 MiB boot pages, as GRUB leaves them.
+APs stay in a stackless halt loop until the next kernel starts them with
+INIT-SIPI-SIPI.
+
+Preserve the firmware memory map in root's extra bootinfo on multiboot2
+boots, and mark a map truncated on either boot protocol. Root needs the
+complete firmware map, not its own free-memory view, to build the next MBI.
+
+This grants the IRQControl holder arbitrary privileged execution. It is
+an unverified x86_64 extension; the caller must keep all control memory,
+page tables and sources outside every destination.
+---
+ include/arch/x86/arch/smp/ipi.h                    |    3 +
+ include/plat/pc99/plat/machine/ioapic.h            |    1
+ libsel4/CMakeLists.txt                             |    4 +
+ .../x86/interfaces/object-api-arch.xml             |   31 ++++++
+ libsel4/include/sel4/sel4.h                        |    4 +
+ src/arch/x86/64/config.cmake                       |    3 -
+ src/arch/x86/object/interrupt.c                    |    8 +
+ src/arch/x86/smp/ipi.c                             |    7 +
+ src/plat/pc99/machine/ioapic.c                     |   13 ++
+ src/plat/pc99/machine/pic.c                        |    2
+ include/arch/x86/arch/64/mode/kernel/kexec.h       |   12 ++
+ .../x86_64/sel4/sel4_arch/kexec.h                  |   90 ++++++++++++++++
+ libsel4/src/arch/x86_64/kexec.S                    |  111 ++++++++++++++++++++
+ src/arch/x86/64/kernel/kexec.c                     |  108 ++++++++++++++++++++
+ src/arch/x86/64/kexec.S                            |   28 +++++
+ .../arch_include/x86/sel4/arch/bootinfo_types.h    |    2
+ src/arch/x86/kernel/boot_sys.c                     |   20 ++++
+ 17 files changed, 443 insertions(+), 4 deletions(-)
+
+diff --git a/include/arch/x86/arch/smp/ipi.h b/include/arch/x86/arch/smp/ipi.h
+index eee60ee8b..7a801b63a 100644
+--- a/include/arch/x86/arch/smp/ipi.h
++++ b/include/arch/x86/arch/smp/ipi.h
+@@ -19,6 +19,9 @@ typedef enum {
+     IpiRemoteCall_InvalidateTranslationSingleASID,
+     IpiRemoteCall_InvalidateTranslationAll,
+     IpiRemoteCall_switchFpuOwner,
++#ifdef CONFIG_ARCH_X86_64
++    IpiRemoteCall_Kexec,
++#endif
+     IpiNumArchRemoteCall
+ } IpiRemoteCall_t;
+ 
+diff --git a/include/plat/pc99/plat/machine/ioapic.h b/include/plat/pc99/plat/machine/ioapic.h
+index f0a25a1d2..9ba3acbaa 100644
+--- a/include/plat/pc99/plat/machine/ioapic.h
++++ b/include/plat/pc99/plat/machine/ioapic.h
+@@ -12,6 +12,7 @@
+ 
+ void ioapic_init(uint32_t num_nodes, cpu_id_t *cpu_list, uint32_t num_ioapic);
+ void ioapic_mask(bool_t mask, uint32_t ioapic, uint32_t pin);
++void ioapic_mask_all(void);
+ 
+ /* Checks if a pin can be mapped to an interrupt vector, returning
+  * a suitable exception */
+diff --git a/libsel4/CMakeLists.txt b/libsel4/CMakeLists.txt
+index 3ff854a73..2d6015960 100644
+--- a/libsel4/CMakeLists.txt
++++ b/libsel4/CMakeLists.txt
+@@ -174,6 +174,10 @@ add_custom_target(
+ )
+ 
+ add_library(sel4 src/sel4_bootinfo.c)
++if(KernelSel4ArchX86_64)
++    enable_language(ASM)
++    target_sources(sel4 PRIVATE src/arch/x86_64/kexec.S)
++endif()
+ target_link_libraries(sel4 PRIVATE kernel_Config sel4_Config sel4_autoconf)
+ target_include_directories(
+     sel4
+diff --git a/libsel4/arch_include/x86/interfaces/object-api-arch.xml b/libsel4/arch_include/x86/interfaces/object-api-arch.xml
+index ecdbbeff7..8e28bee68 100644
+--- a/libsel4/arch_include/x86/interfaces/object-api-arch.xml
++++ b/libsel4/arch_include/x86/interfaces/object-api-arch.xml
+@@ -939,6 +939,37 @@
+                 </description>
+             </error>
+         </method>
++        <method id="X86IRQControlKexec" name="Kexec" manual_name="Kexec">
++            <condition><config var="CONFIG_ARCH_X86_64"/></condition>
++            <brief>
++                Stop the system and boot another multiboot2 kernel without a firmware reset.
++            </brief>
++            <description>
++                Invoke on core zero. The caller quiesces devices and supplies a control
++                page, identity map, parking code and trampoline as described by
++                <texttt text="seL4_X86_KexecControl_t"/> in sel4/sel4_arch/kexec.h.
++                The kernel parks every other core, masks interrupts, and enters the
++                trampoline. On success it does not return. The IRQControl holder is
++                trusted to supply valid physical memory and executable code.
++            </description>
++            <param dir="in" name="control" type="seL4_Word"
++                description='Physical address of a page containing seL4_X86_KexecControl_t, page aligned and below 4 GiB.'/>
++            <error name="seL4_IllegalOperation">
++                <description>
++                    The <texttt text="_service"/> is a CPtr to a capability of the wrong type.
++                    Or, the caller does not run on the boot processor.
++                </description>
++            </error>
++            <error name="seL4_InvalidArgument">
++                <description>
++                    The control version, address, alignment, or other scalar fields are invalid.
++                    The control, PML4, trampoline, parking and stack pages must be distinct.
++                </description>
++            </error>
++            <error name="seL4_TruncatedMessage">
++                <description>The control argument is missing.</description>
++            </error>
++        </method>
+     </interface>
+     <interface name="seL4_TCB" manual_name="TCB" cap_description="Capability to the TCB which is being operated on.">
+         <method id="TCBSetEPTRoot" name="SetEPTRoot" manual_name="Set EPT Root" manual_label="set_eptroot">
+diff --git a/libsel4/include/sel4/sel4.h b/libsel4/include/sel4/sel4.h
+index 28b305ec4..955bf46f8 100644
+--- a/libsel4/include/sel4/sel4.h
++++ b/libsel4/include/sel4/sel4.h
+@@ -27,4 +27,6 @@
+ #include <sel4/arch/constants.h>
+ #include <sel4/plat/api/constants.h>
+ 
+-
++#ifdef CONFIG_ARCH_X86_64
++#include <sel4/sel4_arch/kexec.h>
++#endif
+diff --git a/src/arch/x86/64/config.cmake b/src/arch/x86/64/config.cmake
+index 90c9ae497..0240878b2 100644
+--- a/src/arch/x86/64/config.cmake
++++ b/src/arch/x86/64/config.cmake
+@@ -12,9 +12,10 @@ add_sources(
+          kernel/thread.c
+          kernel/vspace.c
+          kernel/elf.c
++         kernel/kexec.c
+          model/statedata.c
+          model/smp.c
+          machine/capdl.c
+          machine/registerset.c
+          smp/ipi.c
+-  ASMFILES machine_asm.S traps.S head.S)
++  ASMFILES machine_asm.S traps.S head.S kexec.S)
+diff --git a/src/arch/x86/object/interrupt.c b/src/arch/x86/object/interrupt.c
+index 0a79d5653..da320949c 100644
+--- a/src/arch/x86/object/interrupt.c
++++ b/src/arch/x86/object/interrupt.c
+@@ -11,6 +11,9 @@
+ #include <linker.h>
+ #include <plat/machine/hardware.h>
+ #include <plat/machine/pci.h>
++#ifdef CONFIG_ARCH_X86_64
++#include <mode/kernel/kexec.h>
++#endif
+ 
+ void Arch_irqStateInit(void)
+ {
+@@ -72,6 +75,11 @@ static exception_t invokeIssueIRQHandlerIOAPIC(irq_t irq, word_t ioapic, word_t
+ 
+ exception_t Arch_decodeIRQControlInvocation(word_t invLabel, word_t length, cte_t *srcSlot, word_t *buffer)
+ {
++#ifdef CONFIG_ARCH_X86_64
++    if (invLabel == X86IRQControlKexec) {
++        return decodeX86Kexec(length, buffer);
++    }
++#endif
+     word_t index, depth;
+     cte_t *destSlot;
+     cap_t cnodeCap;
+diff --git a/src/arch/x86/smp/ipi.c b/src/arch/x86/smp/ipi.c
+index b67248941..d8dbbfb89 100644
+--- a/src/arch/x86/smp/ipi.c
++++ b/src/arch/x86/smp/ipi.c
+@@ -8,6 +8,9 @@
+ #include <mode/smp/ipi.h>
+ #include <smp/ipi.h>
+ #include <smp/lock.h>
++#ifdef CONFIG_ARCH_X86_64
++#include <mode/kernel/kexec.h>
++#endif
+ 
+ #ifdef ENABLE_SMP_SUPPORT
+ 
+@@ -17,6 +20,10 @@ void handleRemoteCall(IpiRemoteCall_t call, word_t arg0, word_t arg1, word_t arg
+      * in lock while hardware IPI is pending. Guard against spurious IPIs! */
+     if (clh_is_ipi_pending(getCurrentCPUIndex())) {
+         switch (call) {
++#ifdef CONFIG_ARCH_X86_64
++        case IpiRemoteCall_Kexec:
++            x86KexecPark(arg0);
++#endif
+         case IpiRemoteCall_Stall:
+             ipiStallCoreCallback(irqPath);
+             break;
+diff --git a/src/plat/pc99/machine/ioapic.c b/src/plat/pc99/machine/ioapic.c
+index 049f79c22..53cec21ee 100644
+--- a/src/plat/pc99/machine/ioapic.c
++++ b/src/plat/pc99/machine/ioapic.c
+@@ -134,6 +134,19 @@ void ioapic_mask(bool_t mask, uint32_t ioapic, uint32_t pin)
+     ioapic_write(ioapic, IOAPIC_WINDOW, ioredtbl_state[index]);
+ }
+ 
++void ioapic_mask_all(void)
++{
++    for (uint32_t ioapic = 0; ioapic < num_ioapics; ioapic++) {
++        for (uint32_t pin = 0; pin < ioapic_nirqs[ioapic]; pin++) {
++            /* Read the hardware, including pins with no IRQHandler cap. */
++            ioapic_write(ioapic, IOAPIC_REGSEL, IOREDTBL_LOW(pin));
++            uint32_t low = ioapic_read(ioapic, IOAPIC_WINDOW) | IOREDTBL_LOW_INTERRUPT_MASK;
++            ioredtbl_state[ioapic * IOAPIC_IRQ_LINES + pin] = low;
++            ioapic_write(ioapic, IOAPIC_WINDOW, low);
++        }
++    }
++}
++
+ exception_t ioapic_decode_map_pin_to_vector(word_t ioapic, word_t pin, word_t level,
+                                             word_t polarity, word_t vector)
+ {
+diff --git a/src/plat/pc99/machine/pic.c b/src/plat/pc99/machine/pic.c
+index 0238f099c..263c0dae3 100644
+--- a/src/plat/pc99/machine/pic.c
++++ b/src/plat/pc99/machine/pic.c
+@@ -28,7 +28,7 @@ BOOT_CODE void pic_remap_irqs(interrupt_t interrupt)
+     out8(PIC2_BASE + 1, 0x0);
+ }
+
+-BOOT_CODE void pic_disable(void)
++void pic_disable(void)
+ {
+     /* We assume that pic_remap_irqs has already been called and
+      * just mask all the irqs */
+diff --git a/include/arch/x86/arch/64/mode/kernel/kexec.h b/include/arch/x86/arch/64/mode/kernel/kexec.h
+new file mode 100644
+index 000000000..5fe60daca
+--- /dev/null
++++ b/include/arch/x86/arch/64/mode/kernel/kexec.h
+@@ -0,0 +1,12 @@
++/*
++ * Copyright 2026, l4h contributors
++ *
++ * SPDX-License-Identifier: GPL-2.0-only
++ */
++
++#pragma once
++#include <types.h>
++
++exception_t decodeX86Kexec(word_t length, word_t *buffer);
++void NORETURN x86KexecPark(paddr_t control);
++void NORETURN x86KexecEnter(paddr_t control, paddr_t entry, paddr_t pml4, word_t cpu);
+diff --git a/libsel4/sel4_arch_include/x86_64/sel4/sel4_arch/kexec.h b/libsel4/sel4_arch_include/x86_64/sel4/sel4_arch/kexec.h
+new file mode 100644
+index 000000000..035fd9563
+--- /dev/null
++++ b/libsel4/sel4_arch_include/x86_64/sel4/sel4_arch/kexec.h
+@@ -0,0 +1,90 @@
++/*
++ * Copyright 2026, l4h contributors
++ *
++ * SPDX-License-Identifier: BSD-2-Clause
++ */
++
++#pragma once
++
++/* Offsets shared with the relocatable assembly below. All addresses are physical. */
++#define SEL4_X86_KEXEC_VERSION 1
++#define SEL4_X86_KEXEC_STACK 32
++#define SEL4_X86_KEXEC_SEGMENTS 40
++#define SEL4_X86_KEXEC_SEGMENT_COUNT 48
++#define SEL4_X86_KEXEC_ENTRY 56
++#define SEL4_X86_KEXEC_MBI 64
++#define SEL4_X86_KEXEC_PARKED 72
++
++#ifndef __ASSEMBLER__
++#include <sel4/macros.h>
++
++typedef struct {
++    seL4_Word src;
++    seL4_Word dst;
++    seL4_Word len;
++} seL4_X86_KexecSegment_t;
++#define SEL4_X86_KEXEC_ZERO (~(seL4_Word)0)
++
++/*
++ * One page, owned by the caller. The caller must stop other users of these
++ * buffers, quiesce devices/DMA and disable IOMMUs before invoking Kexec.
++ *
++ * Control, trampoline, parking, stack, page tables, segment list and MBI must
++ * be in RAM below 4 GiB, outside ALL destinations. Every copy source must also
++ * miss ALL destinations (including other segments' destinations). A run with
++ * src == SEL4_X86_KEXEC_ZERO zero-fills its destination instead. The kernel
++ * trusts the IRQControl holder to supply valid RAM and code; it checks scalar
++ * arguments, not the image/plan.
++ *
++ * pml4 is a private four-level identity map covering every source, destination
++ * and control allocation. Use supervisor, writable mappings and executable
++ * trampoline/parking pages. PML4 slot 511 is reserved: the kernel fills it
++ * with its own mapping for the CR3 transition. No code may use that mapping
++ * after entering the trampoline/parking page. Page tables must survive until
++ * the new kernel starts the APs with INIT-SIPI-SIPI.
++ *
++ * Copy [seL4_X86_KexecTrampoline, seL4_X86_KexecTrampolineEnd) to trampoline,
++ * and [seL4_X86_KexecPark, seL4_X86_KexecParkEnd) to parking. Each fits in one
++ * page and needs no relocations. Alternatively supply code with the same ABI:
++ * long mode, interrupts disabled, PCID/PGE off, RDI = control physical address,
++ * RSI = logical CPU index. Parking code must acknowledge in parked only AFTER
++ * leaving all old kernel code, stack and page tables. It must never return.
++ *
++ * The supplied trampoline uses one stack page, copies or zero-fills the runs
++ * in order, and enters entry in 32-bit protected mode with paging off and the
++ * multiboot2 EAX/EBX values. The caller must match the new kernel's APIC mode
++ * to this one.
++ * Kexec neither resets devices nor measures the image. It never returns on
++ * success; errors occur before any core is stopped.
++ */
++typedef struct {
++    seL4_Word version;
++    seL4_Word pml4;
++    seL4_Word trampoline;
++    seL4_Word parking;
++    seL4_Word stack;            /* Page base, not stack top. */
++    seL4_Word segments;
++    seL4_Word segment_count;
++    seL4_Word entry;
++    seL4_Word multiboot_info;
++    seL4_Word parked;           /* Kernel clears; APs atomically set their bits. */
++} seL4_X86_KexecControl_t;
++
++SEL4_COMPILE_ASSERT(kexec_control_size, sizeof(seL4_X86_KexecControl_t) == 80);
++SEL4_COMPILE_ASSERT(kexec_segment_size, sizeof(seL4_X86_KexecSegment_t) == 24);
++#define SEL4_KEXEC_OFFSET(field, offset) \
++    SEL4_COMPILE_ASSERT(kexec_offset_##field, __builtin_offsetof(seL4_X86_KexecControl_t, field) == offset)
++SEL4_KEXEC_OFFSET(stack, SEL4_X86_KEXEC_STACK);
++SEL4_KEXEC_OFFSET(segments, SEL4_X86_KEXEC_SEGMENTS);
++SEL4_KEXEC_OFFSET(segment_count, SEL4_X86_KEXEC_SEGMENT_COUNT);
++SEL4_KEXEC_OFFSET(entry, SEL4_X86_KEXEC_ENTRY);
++SEL4_KEXEC_OFFSET(multiboot_info, SEL4_X86_KEXEC_MBI);
++SEL4_KEXEC_OFFSET(parked, SEL4_X86_KEXEC_PARKED);
++#undef SEL4_KEXEC_OFFSET
++
++extern const unsigned char seL4_X86_KexecTrampoline[], seL4_X86_KexecTrampolineEnd[];
++extern const unsigned char seL4_X86_KexecPark[], seL4_X86_KexecParkEnd[];
++
++/* The generated invocation takes an IRQControl capability and one physical address. */
++#define seL4_X86_Kexec seL4_IRQControl_Kexec
++#endif
+diff --git a/libsel4/src/arch/x86_64/kexec.S b/libsel4/src/arch/x86_64/kexec.S
+new file mode 100644
+index 000000000..a8487a65d
+--- /dev/null
++++ b/libsel4/src/arch/x86_64/kexec.S
+@@ -0,0 +1,111 @@
++/*
++ * Copyright 2026, l4h contributors
++ *
++ * SPDX-License-Identifier: BSD-2-Clause
++ */
++
++#include <sel4/sel4_arch/kexec.h>
++
++/* These blobs are copied by root into separate, writable control pages.
++ * All internal references are relative; there are no link-time relocations. */
++.section .rodata.kexec,"a",@progbits
++.balign 16
++.code64
++.global seL4_X86_KexecTrampoline, seL4_X86_KexecTrampolineEnd
++seL4_X86_KexecTrampoline:
++    cli
++    cld
++    movq %rdi, %rbp
++    movq SEL4_X86_KEXEC_STACK(%rbp), %rsp
++    addq $4096, %rsp
++    movq SEL4_X86_KEXEC_SEGMENTS(%rbp), %r12
++    movq SEL4_X86_KEXEC_SEGMENT_COUNT(%rbp), %r13
++1:
++    testq %r13, %r13
++    jz 2f
++    movq 0(%r12), %rsi
++    movq 8(%r12), %rdi
++    movq 16(%r12), %rcx
++    cmpq $-1, %rsi
++    je 3f
++    rep movsb
++    jmp 4f
++3:
++    xorl %eax, %eax
++    rep stosb
++4:
++    addq $24, %r12
++    decq %r13
++    jmp 1b
++2:
++    /* Serialize instruction fetch after copying the new kernel. */
++    xorl %eax, %eax
++    cpuid
++    movl SEL4_X86_KEXEC_MBI(%rbp), %ebx
++    movl SEL4_X86_KEXEC_ENTRY(%rbp), %edi
++
++    leaq .Lkexec_gdt(%rip), %rax
++    movq %rax, .Lkexec_gdtr+2(%rip)
++    lgdt .Lkexec_gdtr(%rip)
++    movl $0x10, %eax
++    movw %ax, %ds
++    movw %ax, %es
++    movw %ax, %ss
++    movw %ax, %fs
++    movw %ax, %gs
++    leaq .Lkexec_32(%rip), %rax
++    pushq $0x08
++    pushq %rax
++    lretq
++
++.code32
++.Lkexec_32:
++    /* PCIDE was cleared before entering this blob: clearing PG while PCIDE
++     * is set would #GP. Leave IA-32e before clearing EFER.LME and CR4.PAE. */
++    movl %cr0, %eax
++    andl $0x7fffffff, %eax
++    movl %eax, %cr0
++    movl $0xc0000080, %ecx
++    rdmsr
++    andl $~(1 << 8), %eax
++    wrmsr
++    movl %cr4, %eax
++    /* GRUB leaves SMEP/SMAP clear: seL4's boot pages are user mappings.
++     * Leave PSE set for its 2 MiB pages, but leave PAE and PCIDE clear. */
++    andl $~((1 << 5) | (1 << 17) | (1 << 20) | (1 << 21)), %eax
++    orl $(1 << 4), %eax
++    movl %eax, %cr4
++    /* Multiboot2 specifies flat segments, PE=1, PG=0, IF=0 and VM=0.
++     * Other GPRs are unspecified; clear flags (including DF) explicitly. */
++    pushl $2
++    popfl
++    movl $0x36d76289, %eax
++    jmp *%edi
++
++.balign 8
++.Lkexec_gdt:
++    .quad 0
++    .quad 0x00cf9a000000ffff  /* 32-bit code, base 0, limit 4 GiB. */
++    .quad 0x00cf92000000ffff  /* 32-bit data, base 0, limit 4 GiB. */
++.Lkexec_gdtr:
++    .word 23
++    .quad 0
++seL4_X86_KexecTrampolineEnd:
++/* An oversized blob makes .org fail, even with relaxed branches. */
++.org seL4_X86_KexecTrampoline + 4096
++
++.balign 16
++.code64
++.global seL4_X86_KexecPark, seL4_X86_KexecParkEnd
++seL4_X86_KexecPark:
++    cli
++    /* No stack accesses, calls, or references to old kernel memory, including
++     * its IPI barrier. SMI/RSM resumes here under the new identity map. */
++    lock btsq %rsi, SEL4_X86_KEXEC_PARKED(%rdi)
++1:
++    hlt
++    jmp 1b
++seL4_X86_KexecParkEnd:
++.org seL4_X86_KexecPark + 4096
++
++.section .note.GNU-stack,"",@progbits
+diff --git a/src/arch/x86/64/kernel/kexec.c b/src/arch/x86/64/kernel/kexec.c
+new file mode 100644
+index 000000000..c262b3528
+--- /dev/null
++++ b/src/arch/x86/64/kernel/kexec.c
+@@ -0,0 +1,108 @@
++/*
++ * Copyright 2026, l4h contributors
++ *
++ * SPDX-License-Identifier: GPL-2.0-only
++ */
++
++#include <machine.h>
++#include <api/syscall.h>
++#include <arch/kernel/apic.h>
++#include <mode/kernel/kexec.h>
++#include <mode/machine.h>
++#include <plat/machine/ioapic.h>
++#include <plat/machine/pic.h>
++#include <sel4/sel4_arch/kexec.h>
++#include <smp/lock.h>
++
++static bool_t kexec_low_page(paddr_t paddr)
++{
++    return paddr != 0 && paddr < BIT(32) && IS_ALIGNED(paddr, seL4_PageBits);
++}
++
++static void kexec_mask_lapic(void)
++{
++    /* Keep the APIC enabled in its existing mode for the next kernel. */
++    apic_write_reg(APIC_LVT_TIMER, apic_read_reg(APIC_LVT_TIMER) | BIT(16));
++    apic_write_reg(APIC_LVT_LINT0, apic_read_reg(APIC_LVT_LINT0) | BIT(16));
++    apic_write_reg(APIC_LVT_LINT1, apic_read_reg(APIC_LVT_LINT1) | BIT(16));
++    /* EOIs retire the highest in-service vector. Drain every ISR bank. */
++    word_t stride = config_set(CONFIG_X2APIC) ? 1 : 16;
++    for (int bank = 7; bank >= 0; bank--) {
++        while (apic_read_reg(APIC_ISR_BASE + bank * stride)) {
++            apic_ack_active_interrupt();
++        }
++    }
++}
++
++void NORETURN x86KexecPark(paddr_t control)
++{
++    seL4_X86_KexecControl_t *c = paddr_to_pptr(control);
++    kexec_mask_lapic();
++    x86KexecEnter(control, c->parking, c->pml4, CURRENT_CPU_INDEX());
++}
++
++exception_t decodeX86Kexec(word_t length, word_t *buffer)
++{
++    /* Check the core before touching caller-supplied physical memory. */
++    if (CURRENT_CPU_INDEX() != 0) {
++        current_syscall_error.type = seL4_IllegalOperation;
++        return EXCEPTION_SYSCALL_ERROR;
++    }
++    if (length < 1) {
++        current_syscall_error.type = seL4_TruncatedMessage;
++        return EXCEPTION_SYSCALL_ERROR;
++    }
++    paddr_t control = getSyscallArg(0, buffer);
++    current_syscall_error.invalidArgumentNumber = 0;
++    current_syscall_error.type = seL4_InvalidArgument;
++    if (!kexec_low_page(control)) {
++        return EXCEPTION_SYSCALL_ERROR;
++    }
++    seL4_X86_KexecControl_t *c = paddr_to_pptr(control);
++    if (c->version != SEL4_X86_KEXEC_VERSION ||
++        !kexec_low_page(c->pml4) || !kexec_low_page(c->trampoline) ||
++        !kexec_low_page(c->parking) || !kexec_low_page(c->stack) ||
++        c->entry == 0 || c->entry >= BIT(32) ||
++        c->multiboot_info == 0 || c->multiboot_info >= BIT(32) ||
++        !IS_ALIGNED(c->multiboot_info, 3) ||
++        c->segments == 0 || c->segments >= BIT(32) || !IS_ALIGNED(c->segments, 3) ||
++        c->segment_count > (BIT(32) - c->segments) / sizeof(seL4_X86_KexecSegment_t)) {
++        return EXCEPTION_SYSCALL_ERROR;
++    }
++    paddr_t pages[] = { control, c->pml4, c->trampoline, c->parking, c->stack };
++    for (unsigned int i = 0; i < ARRAY_SIZE(pages); i++) {
++        for (unsigned int j = 0; j < i; j++) {
++            if (pages[i] == pages[j]) {
++                return EXCEPTION_SYSCALL_ERROR;
++            }
++        }
++    }
++
++    /* No failure/return from here. Root owns the page tables and all memory
++     * they describe. Keep our high mapping just until each CPU jumps low. */
++    pml4e_t *pml4 = paddr_to_pptr(c->pml4);
++    pml4[GET_PML4_INDEX(PPTR_BASE)] = x64KSKernelPML4[GET_PML4_INDEX(PPTR_BASE)];
++    __atomic_store_n(&c->parked, 0, __ATOMIC_RELEASE);
++#ifdef ENABLE_SMP_SUPPORT
++    word_t mask = MASK(ksNumCPUs - 1) << 1;
++    if (mask) {
++        /* Use the remote-call IPI so CPUs waiting on the big lock service it.
++         * The normal IPI barrier is in memory about to be overwritten, and
++         * cannot acknowledge that a CPU has LEFT the kernel. Parked APs never
++         * return to handleRemoteCall; the parking page supplies the ack. */
++        big_kernel_lock.ipi.remoteCall = IpiRemoteCall_Kexec;
++        big_kernel_lock.ipi.args[0] = control;
++        big_kernel_lock.ipi.args[1] = 0;
++        big_kernel_lock.ipi.args[2] = 0;
++        __atomic_thread_fence(__ATOMIC_RELEASE);
++        ipi_send_mask(irq_remote_call_ipi, mask, true);
++        while (__atomic_load_n(&c->parked, __ATOMIC_ACQUIRE) != mask) {
++            arch_pause();
++        }
++    }
++#endif
++    kexec_mask_lapic();
++    ioapic_mask_all();
++    pic_disable();
++    x86KexecEnter(control, c->trampoline, c->pml4, 0);
++}
+diff --git a/src/arch/x86/64/kexec.S b/src/arch/x86/64/kexec.S
+new file mode 100644
+index 000000000..9e63c2661
+--- /dev/null
++++ b/src/arch/x86/64/kexec.S
+@@ -0,0 +1,28 @@
++/*
++ * Copyright 2026, l4h contributors
++ *
++ * SPDX-License-Identifier: GPL-2.0-only
++ */
++
++#include <machine/assembler.h>
++
++.text
++.code64
++BEGIN_FUNC(x86KexecEnter)
++    /* RDI = control, RSI = entry, RDX = PML4, RCX = CPU index.
++     * The supplied PML4 now also maps the kernel for this short transition.
++     * Do not touch the old stack or return after switching CR3. */
++    cli
++    movq %rsi, %r8
++    movq %rcx, %rsi
++    movq %cr4, %rax
++    andq $~(1 << 7), %rax
++    orq $(1 << 4), %rax
++    movq %rax, %cr4           /* Flush global translations; leave PGE off and PSE on. */
++    movq %rdx, %cr3           /* Switch to the identity map with PCID zero. */
++    andq $~(1 << 17), %rax
++    movq %rax, %cr4           /* Flush all PCIDs and permit later PG=0. */
++    jmp *%r8
++END_FUNC(x86KexecEnter)
++
++.section .note.GNU-stack,"",@progbits
+diff --git a/libsel4/arch_include/x86/sel4/arch/bootinfo_types.h b/libsel4/arch_include/x86/sel4/arch/bootinfo_types.h
+index 313859d72..5d6e7b3c1 100644
+--- a/libsel4/arch_include/x86/sel4/arch/bootinfo_types.h
++++ b/libsel4/arch_include/x86/sel4/arch/bootinfo_types.h
+@@ -7,6 +7,8 @@
+ #pragma once
+
+ #define SEL4_MULTIBOOT_MAX_MMAP_ENTRIES 50
++/* Set in mmap_length when the firmware map did not fit in mmap[]. */
++#define SEL4_MULTIBOOT_MMAP_TRUNCATED (1u << 31)
+ #define SEL4_MULTIBOOT_RAM_REGION_TYPE 1
+
+ typedef struct seL4_VBEInfoBlock {
+diff --git a/src/arch/x86/kernel/boot_sys.c b/src/arch/x86/kernel/boot_sys.c
+index 744f4b983..03bf7dfc4 100644
+--- a/src/arch/x86/kernel/boot_sys.c
++++ b/src/arch/x86/kernel/boot_sys.c
+@@ -687,15 +687,17 @@ static BOOT_CODE bool_t try_boot_sys_mbi1(
+             return false;
+         }
+         uint32_t multiboot_mmap_length = mbi->part2.mmap_length;
++        uint32_t multiboot_mmap_truncated = 0;
+         if (multiboot_mmap_length > (SEL4_MULTIBOOT_MAX_MMAP_ENTRIES * sizeof(seL4_X86_mb_mmap_t))) {
+             printf("Warning: Multiboot has reported more memory map entries, %zd, "
+                    "than the max amount that will be passed in the bootinfo, %d. "
+                    "These extra regions will still be turned into untyped caps.",
+                    multiboot_mmap_length / sizeof(seL4_X86_mb_mmap_t), SEL4_MULTIBOOT_MAX_MMAP_ENTRIES);
+             multiboot_mmap_length = SEL4_MULTIBOOT_MAX_MMAP_ENTRIES * sizeof(seL4_X86_mb_mmap_t);
++            multiboot_mmap_truncated = SEL4_MULTIBOOT_MMAP_TRUNCATED;
+         }
+         memcpy(&boot_state.mb_mmap_info.mmap, (void *)(word_t)mbi->part2.mmap_addr, multiboot_mmap_length);
+-        boot_state.mb_mmap_info.mmap_length = multiboot_mmap_length;
++        boot_state.mb_mmap_info.mmap_length = multiboot_mmap_length | multiboot_mmap_truncated;
+     } else {
+         /* calculate memory the old way */
+         p_region_t avail;
+@@ -810,6 +812,22 @@ static BOOT_CODE bool_t try_boot_sys_mbi2(
+                     return false;
+                 }
+             }
++            /* Root needs the firmware's original map to kexec another host.
++             * Preserve it in the multiboot1-shaped extra bootinfo as well. */
++            word_t count = ((word_t)e - (word_t)s) / sizeof(*s);
++            word_t copied = MIN(count, (word_t)SEL4_MULTIBOOT_MAX_MMAP_ENTRIES);
++            for (word_t i = 0; i < copied; i++) {
++                boot_state.mb_mmap_info.mmap[i].size = sizeof(boot_state.mb_mmap_info.mmap[i]) - sizeof(uint32_t);
++                boot_state.mb_mmap_info.mmap[i].base_addr = s[i].addr;
++                boot_state.mb_mmap_info.mmap[i].length = s[i].size;
++                boot_state.mb_mmap_info.mmap[i].type = s[i].type;
++            }
++            boot_state.mb_mmap_info.mmap_length = copied * sizeof(seL4_X86_mb_mmap_t);
++            if (count != copied) {
++                printf("Warning: truncating the multiboot2 memory map passed to root from %ld to %d entries\n",
++                       (long)count, SEL4_MULTIBOOT_MAX_MMAP_ENTRIES);
++                boot_state.mb_mmap_info.mmap_length |= SEL4_MULTIBOOT_MMAP_TRUNCATED;
++            }
+         } else if (tag->type == MULTIBOOT2_TAG_FB) {
+             multiboot2_fb_t const *fb = (multiboot2_fb_t const *)behind_tag;
+             printf("Got framebuffer info in multiboot2. Current video mode is at physical address=%llx pitch=%u resolution=%ux%u@%u type=%u\n",

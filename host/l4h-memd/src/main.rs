@@ -421,8 +421,9 @@ fn main(info: &'static Info) -> ! {
         let resp = match msg.label() {
             memd::MEMD_ALLOC => {
                 let count = mr(1) as usize;
+                let window = if msg.length() >= 4 { mr(2) as usize..mr(3) as usize } else { 0..usize::MAX };
                 len += count;
-                d.alloc(client, mr(0) as usize, count)
+                d.alloc_in(client, mr(0) as usize, count, window)
             }
             memd::MEMD_FREE => d.free(client, mr(0) as usize),
             memd::MEMD_GUEST_CREATE if vmmgr => d.guest_create(mr(0) as usize, mr(1) as usize, mr(2) as usize, mr(3) as usize),

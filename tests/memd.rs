@@ -186,7 +186,7 @@ impl Fixture {
     }
 
     fn grant(&mut self, c: Client, order: usize) -> (u32, u64) {
-        assert_eq!(self.d.alloc(c, BLOCK_BITS + order, 1), 0);
+        assert_eq!(self.d.alloc_in(c, BLOCK_BITS + order, 1, 0..usize::MAX), 0);
         let i = (mr(1) >> BLOCK_BITS) as u32;
         let slot = self.next_slot;
         self.next_slot += 1;
@@ -199,6 +199,15 @@ impl Fixture {
             set_mr(1 + 2 * n, (i as u64) << BLOCK_BITS);
             set_mr(2 + 2 * n, bits as u64);
         }
+    }
+
+    fn give(&mut self, i: u32, order: usize) {
+        kernel(|k| {
+            assert!(k.caps.insert(xchg(Client::Root, 0).0,
+                ((i as usize) << BLOCK_BITS, mem::bytes(order))).is_none());
+        });
+        self.request(&[(i, BLOCK_BITS + order)]);
+        assert_eq!(self.d.free(Client::Root, 1), 0);
     }
 
     fn reject(&mut self, c: Client, blocks: &[(u32, usize)]) {
@@ -270,7 +279,31 @@ fn duplicate_and_invalid_batches_are_atomic() {
     // All of the returned memory must still merge into one usable block.
     assert_eq!(f.grant(Client::Vmmgr, 2).0, 8);
     assert_eq!(f.d.mem.free_bytes(), 0);
-    assert_eq!(f.d.alloc(Client::Vmmgr, BLOCK_BITS, 1), ENOMEM);
+    assert_eq!(f.d.alloc_in(Client::Vmmgr, BLOCK_BITS, 1, 0..usize::MAX), ENOMEM);
+}
+
+#[test]
+fn constrained_allocations_select_low_memory() {
+    let mut f = Fixture::new();
+    // Two equal-order 4 MiB blocks; the high one was freed last and would be
+    // chosen without a constraint. The initial 8 MiB block is also high.
+    f.give(0, 1);
+    f.give(16, 1);
+    assert_eq!(f.d.alloc_in(Client::Root, BLOCK_BITS, 1, 0..4 << BLOCK_BITS), 0);
+    let i = (mr(1) >> BLOCK_BITS) as u32;
+    assert_eq!(i, 0);
+    let slot = f.next_slot;
+    f.next_slot += 1;
+    abs(slot).move_(&xchg(Client::Root, 0)).unwrap();
+
+    // A window with no suitable block fails instead of returning other RAM:
+    // block 1, free since block 0 was split off, starts below this one.
+    assert_eq!(f.d.alloc_in(Client::Root, BLOCK_BITS, 1, 0..1), ENOMEM);
+    assert_eq!(f.d.alloc_in(Client::Root, BLOCK_BITS, 1, 2 << BLOCK_BITS..4 << BLOCK_BITS), ENOMEM);
+    xchg(Client::Root, 0).move_(&abs(slot)).unwrap();
+    f.request(&[(i, BLOCK_BITS)]);
+    assert_eq!(f.d.free(Client::Root, 1), 0);
+    assert_eq!(f.d.mem.free_bytes(), 16 << 20);
 }
 
 #[test]

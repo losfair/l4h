@@ -196,6 +196,8 @@ pub struct Ixgbe {
     pub csum: bool,
     pub tso: bool,
     regs: Mmio,
+    n: usize,
+    tsc_hz: u64,
 
     rx_ring: usize,
     rx_bufs: [(usize, u64); RX_BUFS],
@@ -218,68 +220,70 @@ pub struct Ixgbe {
     tx_kick: bool,
 }
 
+fn wait_us(us: u64, tsc_hz: u64) {
+    let end = host::ticks::now() + us * tsc_hz / 1_000_000;
+    while host::ticks::now() < end {
+        core::hint::spin_loop();
+    }
+}
+
+fn poll(regs: &Mmio, reg: usize, mask: u32, want: u32, ms: u64, tsc_hz: u64) -> bool {
+    for _ in 0..ms * 10 {
+        if regs.r32(reg) & mask == want {
+            return true;
+        }
+        wait_us(100, tsc_hz);
+    }
+    regs.r32(reg) & mask == want
+}
+
+/// Stop and reset an X550, returning its MAC address. `handoff` leaves the
+/// port unowned by a driver until the next host starts netd.
+fn reset(n: usize, regs: Mmio, tsc_hz: u64, handoff: bool) -> Option<[u8; 6]> {
+    regs.w32(EIMC, 0x7fff_ffff);
+    regs.r32(EICR);
+    regs.w32(RXCTRL, regs.r32(RXCTRL) & !RXCTRL_RXEN);
+    for q in 0..128 {
+        regs.w32(txdctl(q), TXDCTL_SWFLSH);
+        regs.w32(rxdctl(q), (regs.r32(rxdctl(q)) & !RXDCTL_ENABLE) | RXDCTL_SWFLSH);
+    }
+    wait_us(2000, tsc_hz);
+    regs.w32(CTRL, regs.r32(CTRL) | CTRL_GIO_DIS);
+    if !poll(&regs, STATUS, STATUS_GIO, 0, 100, tsc_hz) {
+        l4h_rt::info!("netd: NIC {}: GIO primary still enabled; resetting anyway", n);
+    }
+    let lan = (regs.r32(STATUS) >> 2) & 3;
+    let phy_sm = GSSR_PHY0_SM << lan.min(1);
+    let held = swfw_acquire(&regs, phy_sm, &|us| wait_us(us, tsc_hz));
+    regs.w32(CTRL, regs.r32(CTRL) | CTRL_RST);
+    regs.r32(STATUS);
+    if held {
+        swfw_release(&regs, phy_sm, &|us| wait_us(us, tsc_hz));
+    }
+    wait_us(1000, tsc_hz);
+    if !poll(&regs, CTRL, CTRL_RST | CTRL_LNK_RST, 0, 10, tsc_hz) {
+        l4h_rt::info!("netd: NIC {}: reset does not complete", n);
+        return None;
+    }
+    wait_us(100_000, tsc_hz);
+    if !poll(&regs, RDRXCTL, RDRXCTL_DMAIDONE, RDRXCTL_DMAIDONE, 100, tsc_hz) {
+        l4h_rt::info!("netd: NIC {}: DMA init not done after reset", n);
+    }
+    regs.w32(EIMC, 0x7fff_ffff);
+    regs.r32(EICR);
+    regs.w32(RXPBSIZE0, 384 << 10);
+    let (ral, rah) = (regs.r32(RAL0), regs.r32(RAH0));
+    let mac = [ral as u8, (ral >> 8) as u8, (ral >> 16) as u8, (ral >> 24) as u8, rah as u8, (rah >> 8) as u8];
+    regs.w32(RAH0, (rah & 0xffff) | RAH_AV);
+    let ctrl_ext = regs.r32(CTRL_EXT) | CTRL_EXT_NS_DIS;
+    regs.w32(CTRL_EXT, if handoff { ctrl_ext & !CTRL_EXT_DRV_LOAD } else { ctrl_ext | CTRL_EXT_DRV_LOAD });
+    Some(mac)
+}
+
 impl Ixgbe {
     pub fn new(n: usize, c: &NicConfig, tsc_hz: u64, rx_partial: &'static mut ArrayVec<u8, { net::MAX_FRAME }>) -> Self {
         let regs = Mmio(c.regs.va as usize);
-        let wait_us = |us: u64| {
-            let end = host::ticks::now() + us * tsc_hz / 1_000_000;
-            while host::ticks::now() < end {
-                core::hint::spin_loop();
-            }
-        };
-        let poll = |reg: usize, mask: u32, want: u32, ms: u64| -> bool {
-            for _ in 0..ms * 10 {
-                if regs.r32(reg) & mask == want {
-                    return true;
-                }
-                wait_us(100);
-            }
-            regs.r32(reg) & mask == want
-        };
-
-        // Stop the device as Linux's stop_adapter: no interrupts, no
-        // receive, queues flushed, then no more DMA from this function.
-        regs.w32(EIMC, 0x7fff_ffff);
-        regs.r32(EICR);
-        regs.w32(RXCTRL, regs.r32(RXCTRL) & !RXCTRL_RXEN);
-        for q in 0..128 {
-            regs.w32(txdctl(q), TXDCTL_SWFLSH);
-            regs.w32(rxdctl(q), (regs.r32(rxdctl(q)) & !RXDCTL_ENABLE) | RXDCTL_SWFLSH);
-        }
-        wait_us(2000);
-        regs.w32(CTRL, regs.r32(CTRL) | CTRL_GIO_DIS);
-        if !poll(STATUS, STATUS_GIO, 0, 100) {
-            l4h_rt::info!("netd: NIC {}: GIO primary still enabled; resetting anyway", n);
-        }
-
-        // MAC reset, holding this function's PHY semaphore as Linux does
-        // (firmware may be using the PHY).  The PHY keeps its link.
-        let lan = (regs.r32(STATUS) >> 2) & 3;
-        let phy_sm = GSSR_PHY0_SM << lan.min(1);
-        let held = swfw_acquire(&regs, phy_sm, &wait_us);
-        regs.w32(CTRL, regs.r32(CTRL) | CTRL_RST);
-        regs.r32(STATUS);
-        if held {
-            swfw_release(&regs, phy_sm, &wait_us);
-        }
-        wait_us(1000);
-        if !poll(CTRL, CTRL_RST | CTRL_LNK_RST, 0, 10) {
-            panic!("netd: NIC {}: reset does not complete", n);
-        }
-        wait_us(100_000);
-        if !poll(RDRXCTL, RDRXCTL_DMAIDONE, RDRXCTL_DMAIDONE, 100) {
-            l4h_rt::info!("netd: NIC {}: DMA init not done after reset", n);
-        }
-        regs.w32(EIMC, 0x7fff_ffff);
-        regs.r32(EICR);
-        // One packet buffer, as reset_hw_X540.
-        regs.w32(RXPBSIZE0, 384 << 10);
-
-        let (ral, rah) = (regs.r32(RAL0), regs.r32(RAH0));
-        let mac = [ral as u8, (ral >> 8) as u8, (ral >> 16) as u8, (ral >> 24) as u8, rah as u8, (rah >> 8) as u8];
-        regs.w32(RAH0, (rah & 0xffff) | RAH_AV);
-        regs.w32(CTRL_EXT, regs.r32(CTRL_EXT) | CTRL_EXT_NS_DIS | CTRL_EXT_DRV_LOAD);
-
+        let mac = reset(n, regs, tsc_hz, false).expect("netd: X550 reset");
         let mut dma = Dma::new(net::nic_dma_va(n), c.dma_paddr, c.dma_size as usize);
 
         // Receive: CRC stripped, frames up to MAX_FRAME accepted (they span
@@ -306,7 +310,7 @@ impl Ixgbe {
         regs.w32(rdt(0), 0);
         regs.w32(srrctl(0), (RX_BUF >> 10) as u32 | SRRCTL_DESCTYPE_ADV_ONEBUF | SRRCTL_DROP_EN);
         regs.w32(rxdctl(0), RXDCTL_ENABLE);
-        if !poll(rxdctl(0), RXDCTL_ENABLE, RXDCTL_ENABLE, 10) {
+        if !poll(&regs, rxdctl(0), RXDCTL_ENABLE, RXDCTL_ENABLE, 10, tsc_hz) {
             panic!("netd: NIC {}: RX queue does not enable", n);
         }
         dma_fence(Ordering::Release);
@@ -328,7 +332,7 @@ impl Ixgbe {
         regs.w32(tdt(0), 0);
         // WTHRESH 1, HTHRESH 1, PTHRESH 32, as Linux.
         regs.w32(txdctl(0), TXDCTL_ENABLE | 1 << 16 | 1 << 8 | 32);
-        if !poll(txdctl(0), TXDCTL_ENABLE, TXDCTL_ENABLE, 10) {
+        if !poll(&regs, txdctl(0), TXDCTL_ENABLE, TXDCTL_ENABLE, 10, tsc_hz) {
             panic!("netd: NIC {}: TX queue does not enable", n);
         }
 
@@ -351,7 +355,7 @@ impl Ixgbe {
 
         // The MAC reset restarts autonegotiation, which takes a few seconds
         // on 10GBASE-T.
-        let up = poll(LINKS, LINKS_UP, LINKS_UP, 15_000);
+        let up = poll(&regs, LINKS, LINKS_UP, LINKS_UP, 15_000, tsc_hz);
         let links = regs.r32(LINKS);
         let speed = match (links >> 28) & 3 {
             3 => "10G",
@@ -368,6 +372,8 @@ impl Ixgbe {
 
         Ixgbe {
             mac,
+            n,
+            tsc_hz,
             csum: TX_OFFLOADS,
             tso: TX_OFFLOADS,
             regs,
@@ -391,6 +397,10 @@ impl Ixgbe {
             tx_sent: ArrayVec::new(),
             tx_kick: false,
         }
+    }
+
+    pub fn reset(&mut self) -> bool {
+        reset(self.n, self.regs, self.tsc_hz, true).is_some()
     }
 
     // ---- receive

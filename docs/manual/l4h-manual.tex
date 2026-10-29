@@ -729,6 +729,24 @@ the first partition with \file{l4h/dom0/initrd}, or else with
 \texttt{l4h-root}. To change dom0, replace the files and
 reboot the host. dom0 itself may do so when it holds the boot disk.
 
+\cmd{l4hctl host-kexec [--efi PATH] [--initrd PATH] [--conf PATH]} boots the
+same application without a firmware reset. The defaults are
+\file{/boot/efi/EFI/BOOT/BOOTX64.EFI}, \file{/boot/efi/l4h/dom0/initrd}
+and \file{/boot/efi/l4h/l4h.conf}; missing optional files are omitted as on
+a cold boot. Use \cmd{--load-only} to stage without executing. Every guest
+stops, then root flushes and shuts down disks, resets NICs, disables PCI
+masters and IOMMUs, and jumps to the new host. The new kernel's x2APIC/PCID
+variant and the generated GRUB script version must match; images that change
+ACPI tables need a cold boot. The command runs \cmd{sync} before EXEC.
+
+A kexec chain carries a log and count in the host evidence. The verifier
+replays PCR 14 and PCR 15 and requires every EFI, initrd and configuration in
+the chain to be pinned with \cmd{--trusted-efi DIGEST},
+\cmd{--trusted-initrd DIGEST} and \cmd{--trusted-config DIGEST}. Repeat an
+option to allow upgrades. Use \cmd{l4h-attest.py measure-efi EFI} for the EFI
+digest and \cmd{sha256sum} for the other files. The JSON output exposes each
+event's digests. Use \cmd{--require-cold-boot} to reject all kexec chains.
+
 \file{l4h.conf} has one \texttt{key=value} per line (Table~\ref{tab:settings})
 and \texttt{\#} comments. GRUB also reads it, as a script, so write no
 spaces around \texttt{=} and put values with spaces in double quotes:

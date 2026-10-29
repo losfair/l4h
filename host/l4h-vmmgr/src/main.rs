@@ -635,7 +635,8 @@ fn serve(h: &mut Vmmgr, reply_slot: ReplySlot) -> ! {
 /// What root signalled: trustd answered guests, or a monitor command.
 fn root_events(h: &mut Vmmgr) {
     let ev = unsafe { &*(proto::EVENTS_VA as *const proto::Events) };
-    let done = ev.attest_done.swap(0, Ordering::AcqRel);
+    let attest = unsafe { &*(proto::ATTEST_EVENTS_VA as *const proto::AttestEvents) };
+    let done = attest.done.swap(0, Ordering::AcqRel);
     for id in (0..MAX_GUESTS).filter(|&i| done & (1 << i) != 0) {
         let Some(g) = h.guests[id].as_ref() else { continue };
         if let Some(d) = g.devices.iter().position(|d| d.kind == guest::DevKind::Attest) {

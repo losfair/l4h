@@ -6,7 +6,7 @@
 # build.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
-export L4H_VERSION=$("$root/tools/version.sh")
+export L4H_VERSION=${L4H_VERSION:-$("$root/tools/version.sh")}
 cd "$root/host"
 out=$root/host/target/x86_64-sel4/debug
 mkdir -p "$out/stripped"

@@ -315,6 +315,8 @@ pub const CTL_VM_SET_MEM: u32 = 28;
 pub const CTL_VM_MEM_INFO: u32 = 29;
 pub const CTL_VM_TRUST: u32 = 30;
 pub const CTL_LOG_READ: u32 = 31;
+pub const CTL_HOST_KEXEC_LOAD: u32 = 32;
+pub const CTL_HOST_KEXEC_EXEC: u32 = 33;
 /// CTL_GPU_ATTACH: scanout sizes, and the I/O pool a VM with a GPU needs
 /// (in images of its scanout).
 pub const GPU_MIN: u32 = 64;

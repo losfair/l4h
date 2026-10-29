@@ -555,7 +555,16 @@ fn main(info: &'static Info) -> ! {
     let (mut msg, mut badge) = ep.recv(reply);
     loop {
         if badge != 0 {
-            // Notification: port kicks and NIC interrupts.
+            // Notification: port kicks, NIC interrupts and host handoff reset.
+            if badge & (1u64 << net::NETD_BADGE_RESET) != 0 {
+                let mut ok = true;
+                for nic in &mut d.nics {
+                    ok &= nic.reset();
+                }
+                cap::<cap_type::Notification>(if ok { net::NETD_SLOT_RESET_OK } else { net::NETD_SLOT_RESET_ERROR }).signal();
+                // Do not touch a reset NIC while root finishes the handoff.
+                cap::<cap_type::Tcb>(host::SLOT_TCB).tcb_suspend().expect("netd reset stop");
+            }
             for i in 0..net::MAX_PORTS {
                 if badge & (1 << i) != 0 {
                     d.port_tx(i);

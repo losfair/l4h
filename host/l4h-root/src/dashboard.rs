@@ -118,7 +118,7 @@ fn parse_fb(c: &[u8]) -> Option<(u64, usize, usize, usize, u8, u8)> {
 
 impl Dashboard {
     #[cfg(not(target_arch = "x86_64"))]
-    pub fn new(_bootinfo: &sel4::BootInfoPtr, _alloc: &mut Alloc, _devmem: &mut DevMem, _fb_console: bool) -> Option<Self> {
+    pub fn new(_bootinfo: &sel4::BootInfoPtr, _alloc: &mut Alloc, _devmem: &mut DevMem, _fb_console: bool, _warm_boot: bool) -> Option<Self> {
         let _ = (parse_fb, map_frame::<>, FB_VA);
         None
     }
@@ -127,7 +127,7 @@ impl Dashboard {
     /// With `fb_console` (the fb_console setting), the kernel copies its
     /// console to the screen and the dashboard keeps to the upper half.
     #[cfg(target_arch = "x86_64")]
-    pub fn new(bootinfo: &sel4::BootInfoPtr, alloc: &mut Alloc, devmem: &mut DevMem, fb_console: bool) -> Option<Self> {
+    pub fn new(bootinfo: &sel4::BootInfoPtr, alloc: &mut Alloc, devmem: &mut DevMem, fb_console: bool, warm_boot: bool) -> Option<Self> {
         let extra = bootinfo.extra().find(|e| e.id == sel4::BootInfoExtraId::X86FrameBuffer)?;
         let (addr, pitch, width, height, bpp, ty) = parse_fb(extra.content())?;
         if addr == 0 || bpp != 32 || ty != 1 || width < 640 || height < 400 {
@@ -156,8 +156,12 @@ impl Dashboard {
             }
         });
         let fb = (FB_VA + (addr & 4095)) as *mut u8;
+        let full_height = height;
         // The kernel's copy of the console (fb_console) has the lower half.
         let height = if fb_console { height / 2 } else { height };
+        // A warm boot clears the previous host's display, including its
+        // console; a cold boot preserves the current kernel's boot log.
+        let clear_height = if warm_boot { full_height } else { height };
         let sx = if width >= 1280 { 2 } else { 1 };
         let sy = 2;
         let (cols, rows) = ((width / (8 * sx)).min(MAX_COLS), (height / (8 * sy)).min(MAX_ROWS));
@@ -167,8 +171,7 @@ impl Dashboard {
         shown.fill(Cell { ch: 0, ..BLANK });
         next.fill(BLANK);
         let mut d = Dashboard { fb, pitch, sx, sy, cols, rows, shown, next, ticks: REFRESH_TICKS };
-        // Clear the margins the cell grid does not cover.
-        for y in 0..height {
+        for y in 0..clear_height {
             for x in 0..width {
                 d.put(x, y, BG.rgb());
             }

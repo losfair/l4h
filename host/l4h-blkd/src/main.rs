@@ -298,9 +298,17 @@ fn main(info: &'static Info) -> ! {
     let ep = cap::<cap_type::Endpoint>(host::SLOT_SERVICE_EP);
     let reply = cap::<cap_type::Reply>(host::SLOT_REPLY);
     let irq = cap::<cap_type::IrqHandler>(blk::BLKD_SLOT_IRQ);
+    let flush = blk::FLUSH_VA as *mut blk::FlushState;
     let (mut msg, mut badge) = ep.recv(reply);
     loop {
         if badge != 0 {
+            if badge & blk::BLKD_FLUSH_REQUEST != 0 {
+                if let Some((seq, unit)) = unsafe { blk::FlushState::pending(flush) } {
+                    let status = b.provision(cfg, unit as usize, 0, 0, true);
+                    unsafe { blk::FlushState::complete(flush, seq, status) };
+                    cap::<cap_type::Notification>(blk::BLKD_SLOT_FLUSH_DONE).signal();
+                }
+            }
             b.reap();
             b.submit();
             if badge & blk::BLKD_BADGE_IRQ != 0 { irq.irq_handler_ack().expect("blkd IRQ ack"); }

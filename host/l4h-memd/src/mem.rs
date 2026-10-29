@@ -23,6 +23,8 @@
 //! Blocks that stay free are reported to the hypervisor, if it takes free
 //! page reports (`balloon`), so that it can drop their memory.
 
+use core::ops::Range;
+
 use l4h_rt::host::memd::{BLOCK_BITS, ORDERS, SLOT_DYN_BASE, TABLE_VA, UNIT_BYTES};
 use l4h_rt::{cap, host, sel4};
 use sel4::{ObjectBlueprint, cap_type};
@@ -308,20 +310,28 @@ impl Mem {
         (k..ORDERS).any(|j| self.free[j].len + self.reported[j].len != 0)
     }
 
-    /// An untouched Untyped of order k: its unit, whose state is now
-    /// `state`; the Untyped is in `slot(i, k)`, the caller's until it
-    /// gives it back with `add`.
-    pub fn take(&mut self, k: usize, state: State) -> Option<u32> {
-        if !self.has_block(k) {
-            self.finish_report(true);
+    /// The last block on `list` whose first order-k block lies in `window`.
+    /// Splitting never moves the selected block's lower half.
+    fn last_in(&self, list: List, k: usize, window: &Range<usize>) -> Option<u32> {
+        self.iter(list).filter(|&i| {
+            let start = (i as usize) << BLOCK_BITS;
+            start >= window.start && start.checked_add(bytes(k)).is_some_and(|end| end <= window.end)
+        }).last()
+    }
+
+    fn find_in(&self, k: usize, window: &Range<usize>) -> Option<(u32, usize)> {
+        for j in k..ORDERS {
+            if let Some(i) = self.last_in(self.free[j], k, window)
+                .or_else(|| self.last_in(self.reported[j], k, window))
+            {
+                return Some((i, j));
+            }
         }
-        if !self.has_block(k) {
-            self.merge_up_to(k);
-        }
-        // The smallest block that fits; of those, one not reported (its
-        // memory is there), the most recently freed.
-        let j = (k..ORDERS).find(|&j| self.free[j].len + self.reported[j].len != 0)?;
-        let i = if self.free[j].len != 0 { self.free[j].tail } else { self.reported[j].tail };
+        None
+    }
+
+    /// Take unit i, splitting its order-j block down to order k.
+    fn take_at(&mut self, k: usize, j: usize, i: u32, state: State) -> u32 {
         let (hint, since) = (self.state(i), self.table[i as usize].since);
         self.unput(i, j);
         for o in (k..j).rev() {
@@ -341,7 +351,44 @@ impl Mem {
         let u = &mut self.table[i as usize];
         u.state = state;
         u.order = k as u8;
-        Some(i)
+        i
+    }
+
+    /// An untouched Untyped of order k: its unit, whose state is now
+    /// `state`; the Untyped is in `slot(i, k)`, the caller's until it
+    /// gives it back with `add`.
+    pub fn take(&mut self, k: usize, state: State) -> Option<u32> {
+        if !self.has_block(k) {
+            self.finish_report(true);
+        }
+        if !self.has_block(k) {
+            self.merge_up_to(k);
+        }
+        // The smallest block that fits; of those, one not reported (its
+        // memory is there), the most recently freed.
+        let j = (k..ORDERS).find(|&j| self.free[j].len + self.reported[j].len != 0)?;
+        let i = if self.free[j].len != 0 { self.free[j].tail } else { self.reported[j].tail };
+        Some(self.take_at(k, j, i, state))
+    }
+
+    /// `take`, with the allocated order-k block entirely in `window`. Only
+    /// constrained requests scan the free lists; ordinary allocations
+    /// retain their O(ORDERS) behavior.
+    pub fn take_in(&mut self, k: usize, state: State, window: Range<usize>) -> Option<u32> {
+        if window == (0..usize::MAX) {
+            return self.take(k, state);
+        }
+        let mut found = self.find_in(k, &window);
+        if found.is_none() {
+            self.finish_report(true);
+            found = self.find_in(k, &window);
+        }
+        if found.is_none() {
+            self.merge_up_to(k);
+            found = self.find_in(k, &window);
+        }
+        let (i, j) = found?;
+        Some(self.take_at(k, j, i, state))
     }
 
     /// Merge free buddies, smallest first, into blocks of up to order k,

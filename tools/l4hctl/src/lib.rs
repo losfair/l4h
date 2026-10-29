@@ -47,6 +47,8 @@ pub const CTL_VM_SET_MEM: u32 = 28;
 pub const CTL_VM_MEM_INFO: u32 = 29;
 pub const CTL_VM_TRUST: u32 = 30;
 pub const CTL_LOG_READ: u32 = 31;
+pub const CTL_HOST_KEXEC_LOAD: u32 = 32;
+pub const CTL_HOST_KEXEC_EXEC: u32 = 33;
 pub const GPU_POOL_IMAGES: u64 = 4;
 pub const IOMMU_NONE: u64 = 0;
 pub const IOMMU_OFF: u64 = 1;
@@ -134,6 +136,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub fn err<T>(msg: impl Into<String>) -> Result<T> {
     Err(Error(msg.into()))
 }
+
+/// The status of a call to retry later.
+const EAGAIN: i64 = 11;
 
 pub fn errno_name(e: i64) -> &'static str {
     match e {
@@ -253,7 +258,6 @@ impl Ctl {
 /// [`Ctl::screenshot`] on `read`, which makes CTL_GPU_READ from an offset
 /// into `chunk` and returns its status and values.
 fn read_screen(chunk: &mut [u8], mut read: impl FnMut(u64, &mut [u8]) -> Result<(i64, [u64; 6])>) -> Result<Screen> {
-    const EAGAIN: i64 = 11;
     let mut last = None;
     for attempt in 0..20 {
         if attempt > 0 {
@@ -568,6 +572,43 @@ impl Ctl {
     /// not reset.
     pub fn host_reboot(&self) -> Result<()> {
         self.call(CTL_HOST_REBOOT, &[], &[], &[]).map(|_| ())
+    }
+
+    /// Stream an l4h EFI and its optional ESP modules to root, then commit
+    /// the complete set. Empty optional files are treated as absent.
+    pub fn host_kexec_load(&self, efi: &[u8], initrd: Option<&[u8]>, config: Option<&[u8]>) -> Result<()> {
+        if efi.is_empty() {
+            return err("empty EFI application");
+        }
+        for (file, data) in [(0, Some(efi)), (1, initrd), (2, config)] {
+            let Some(data) = data.filter(|data| !data.is_empty()) else { continue };
+            let total = data.len() as u64;
+            for (i, chunk) in data.chunks(CTL_LOAD_MAX).enumerate() {
+                let offset = (i * CTL_LOAD_MAX) as u64;
+                self.call(CTL_HOST_KEXEC_LOAD, &[file, offset, total, 0], &[], chunk)?;
+            }
+        }
+        // trustd may still be publishing its initial state. Root preserves
+        // the complete transaction on EAGAIN, so retry only the commit.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let resp = self.raw_call(CTL_HOST_KEXEC_LOAD, &[3, 0, 0, 0], &[], 0, 0)?;
+            if resp.status == 0 {
+                return Ok(());
+            }
+            if resp.status != -EAGAIN {
+                return err(format!("kexec COMMIT failed: {}", errno_name(-resp.status)));
+            }
+            if std::time::Instant::now() >= deadline {
+                return err("kexec COMMIT timed out waiting for trustd");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    /// Enter the image committed by host_kexec_load. Returns only on failure.
+    pub fn host_kexec_exec(&self) -> Result<()> {
+        self.call(CTL_HOST_KEXEC_EXEC, &[], &[], &[]).map(|_| ())
     }
 
     /// Set the machine RTC to UTC seconds since the Unix epoch (dom0

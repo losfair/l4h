@@ -230,6 +230,63 @@ impl Config {
     }
 }
 
+/// Values GRUB itself uses from l4h.conf. Kexec accepts any literal
+/// key=value assignment except a GRUB control variable, which could change
+/// the boot root is reproducing.
+pub struct KexecOverrides<'a> {
+    pub serial_port: Option<&'a str>,
+    pub fb_console: Option<&'a str>,
+}
+
+pub fn kexec_overrides(text: Option<&[u8]>) -> Result<KexecOverrides<'_>, &'static str> {
+    let mut out = KexecOverrides { serial_port: None, fb_console: None };
+    let Some(text) = text else { return Ok(out) };
+    let text = core::str::from_utf8(text).map_err(|_| "l4h.conf is not UTF-8")?;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (key, value) = line.split_once('=').ok_or("l4h.conf is not limited to key=value lines")?;
+        if key != key.trim() || value != value.trim() {
+            return Err("l4h.conf has a setting kexec cannot reproduce");
+        }
+        if value.bytes().any(|b| matches!(b, 0 | b'$' | b'`' | b'\\' | b';' | b'&' | b'|' | b'<' | b'>')) {
+            return Err("l4h.conf has shell syntax kexec cannot reproduce");
+        }
+        let value = kexec_value(value)?;
+        if !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') || !key.bytes().next().is_some_and(|b| b.is_ascii_alphabetic() || b == b'_') {
+            return Err("l4h.conf has a setting kexec cannot reproduce");
+        }
+        if matches!(key, "esp" | "fbcon" | "root" | "prefix" | "cmdpath" | "timeout" | "default" | "fallback" | "next_entry" | "check_signatures" | "debug" | "pager") {
+            return Err("l4h.conf assigns a GRUB control variable");
+        }
+        match key {
+            "serial_port" => out.serial_port = Some(value),
+            "fb_console" => out.fb_console = Some(value),
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+/// A kexec value is one literal word or one quoted string. Unquoted
+/// whitespace and unmatched or embedded quotes are not literal config.
+fn kexec_value(v: &str) -> Result<&str, &'static str> {
+    if !v.is_empty() && (v.starts_with('"') || v.starts_with('\'')) {
+        let q = v.as_bytes()[0];
+        if v.len() < 2 || v.as_bytes()[v.len() - 1] != q || v.as_bytes()[1..v.len() - 1].contains(&q) {
+            return Err("l4h.conf has shell syntax kexec cannot reproduce");
+        }
+        Ok(&v[1..v.len() - 1])
+    } else {
+        if v.bytes().any(|b| b.is_ascii_whitespace() || b == b'"' || b == b'\'') {
+            return Err("l4h.conf has shell syntax kexec cannot reproduce");
+        }
+        Ok(v)
+    }
+}
+
 /// The value without one pair of surrounding quotes.
 fn unquote(v: &str) -> &str {
     for q in ['"', '\''] {

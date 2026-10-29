@@ -35,6 +35,7 @@ const _: () = assert!(TX_BUFS <= u32::BITS as u16);
 
 pub struct VirtioNet {
     pub mac: [u8; 6],
+    device: Option<Device>,
     /// The device takes NEEDS_CSUM frames / TSO frames.
     pub csum: bool,
     pub tso: bool,
@@ -86,7 +87,7 @@ impl VirtioNet {
         msix.w32(4, (c.msi_address >> 32) as u32);
         msix.w32(8, c.msi_data);
         msix.w32(12, 0);
-        let (mut rxq, txq, want, mac, ports, hdr_len) = if c.legacy_io != 0 {
+        let (mut rxq, txq, want, mac, ports, hdr_len, device) = if c.legacy_io != 0 {
             let p = Ports { cap: net::NETD_SLOT_IOPORT_BASE + n as u64, base: c.legacy_io as u16 };
             p.out8(legacy::STATUS, 0);
             p.out8(legacy::STATUS, STATUS_ACK | STATUS_DRIVER);
@@ -111,7 +112,7 @@ impl VirtioNet {
             let (rxq, txq) = (queue(0), queue(1));
             let mac: [u8; 6] = core::array::from_fn(|i| p.in8(legacy::DEVICE_CONFIG + i as u16));
             // A legacy header has num_buffers only with MRG_RXBUF.
-            (rxq, txq, want, mac, Some(p), if want & VIRTIO_NET_F_MRG_RXBUF != 0 { HDR } else { LEGACY_HDR })
+            (rxq, txq, want, mac, Some(p), if want & VIRTIO_NET_F_MRG_RXBUF != 0 { HDR } else { LEGACY_HDR }, None)
         } else {
             let dev = modern_device(c);
             dev.reset();
@@ -124,7 +125,7 @@ impl VirtioNet {
             let rxq = dev.setup_queue(&mut dma, 0, RX_QUEUE, 0).expect("netd: rx queue");
             let txq = dev.setup_queue(&mut dma, 1, RX_QUEUE, 0).expect("netd: tx queue");
             let mac: [u8; 6] = core::array::from_fn(|i| dev.device.r8(i));
-            (rxq, txq, want, mac, None, HDR)
+            (rxq, txq, want, mac, None, HDR, Some(dev))
         };
         // A legacy queue has the device's size: post at most RX_QUEUE.
         let (mut rx_bufs, mut tx_bufs, mut tx_free) = (ArrayVec::new(), ArrayVec::new(), ArrayVec::new());
@@ -141,6 +142,7 @@ impl VirtioNet {
         }
         let nic = VirtioNet {
             mac,
+            device,
             csum: want & VIRTIO_NET_F_CSUM != 0,
             tso: want & (VIRTIO_NET_F_HOST_TSO4 | VIRTIO_NET_F_HOST_TSO6) == (VIRTIO_NET_F_HOST_TSO4 | VIRTIO_NET_F_HOST_TSO6),
             mrg: want & VIRTIO_NET_F_MRG_RXBUF != 0,
@@ -175,6 +177,17 @@ impl VirtioNet {
             if nic.mrg { " mrg" } else { "" },
         );
         nic
+    }
+
+    /// Stop the device before an ownership handoff.
+    pub fn reset(&mut self) -> bool {
+        if let Some(device) = &self.device {
+            device.reset();
+        }
+        if let Some(ports) = &self.ports {
+            ports.out8(legacy::STATUS, 0);
+        }
+        true
     }
 
     fn kick(&self, q: &Virtq) {

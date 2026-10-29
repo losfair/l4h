@@ -82,6 +82,11 @@ impl Nic {
         Nic { switch: None, mac, csum, tso, dev, tx_backlog: Fifo::EMPTY, tx_drops: 0 }
     }
 
+    /// Stop this uplink before the host changes hands; false on hardware failure.
+    pub fn reset(&mut self) -> bool {
+        dev!(self, d => d.reset())
+    }
+
     /// Whether the device takes this GSO frame whole.
     pub fn takes_gso(&self, hdr: &[u8; HDR]) -> bool {
         match &self.dev {

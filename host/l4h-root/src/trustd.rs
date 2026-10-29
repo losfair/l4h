@@ -40,8 +40,14 @@ pub struct Trustd {
     #[allow(dead_code)]
     arena: Arena,
     registry: *mut GuestRecord,
+    kexec_state: *mut trust::KexecState,
+    measure_kick: cap::Notification,
+    measure_reply: crate::ReplySlot,
     flags_ep: cap::Endpoint,
     no_reports: bool,
+    /// The firmware describes a TPM, so a kexec must be measured even
+    /// when trustd cannot use it.
+    tpm_found: bool,
     failed: bool,
     /// The request page of each guest id, mapped in trustd.
     pages: [cap::Granule; trust::MAX_RECORDS],
@@ -107,6 +113,8 @@ impl Layout {
             start_va: va(self.start_bell),
             reply_va: va(self.reply_bell),
             aml_size: aml_size as u64,
+            kexec_log_va: 0,
+            kexec_log_size: 0,
         }
     }
 }
@@ -194,6 +202,7 @@ pub fn spawn(
     info: &HostInfo,
     #[cfg(target_arch = "x86_64")]
     frames: crate::acpi::Frames,
+    kexec_log: Option<&[u8]>,
 ) -> Option<Trustd> {
     if TRUSTD_ELF.is_empty() {
         return None;
@@ -202,14 +211,15 @@ pub fn spawn(
     {
         let mut frames = frames;
         let mut phys = crate::acpi::Phys::new(alloc, devmem, win, &mut frames);
+        let tpm_found = crate::acpi::find(bootinfo, &mut phys, b"TPM2", &mut [0; 76]).is_some();
         let Some(l) = find_tpm(bootinfo, &mut phys) else {
-            return flags_only(alloc, win, asids, info, frames);
+            return flags_only(alloc, win, asids, info, tpm_found, frames);
         };
         // The pages of each range, which stay in `frames`.
         for &(base, size) in &l.ranges {
             if (0..size / PAGE).any(|p| phys.frame(base + p * PAGE).is_none()) {
                 log!("l4h-root: TPM at {:#x} is not device memory, no attestation", base);
-                return flags_only(alloc, win, asids, info, frames);
+                return flags_only(alloc, win, asids, info, true, frames);
             }
         }
         // The AML's size.  Its pages are carved now, so that copying it
@@ -223,7 +233,7 @@ pub fn spawn(
                     Some(n) => n,
                     None => {
                         log!("l4h-root: cannot read the ACPI tables for the TPM, no attestation");
-                        return flags_only(alloc, win, asids, info, frames);
+                        return flags_only(alloc, win, asids, info, true, frames);
                     }
                 }
             }
@@ -239,7 +249,11 @@ pub fn spawn(
             },
             l.ranges[0].0
         );
-        let cfg = l.config(aml_size);
+        let mut cfg = l.config(aml_size);
+        cfg.kexec_log_va = kexec_log.filter(|log| log.len() <= trust::KEXEC_LOG_MAX).map_or(0, |_| trust::KEXEC_LOG_VA as u64);
+        cfg.kexec_log_size = kexec_log.map_or(0, |log| {
+            if log.len() > trust::KEXEC_LOG_MAX { trust::KEXEC_LOG_INVALID } else { log.len() as u64 }
+        });
         let (comp, arena, keep) = create(&cfg, alloc, win, asids, info, aml_size)?;
         let mut keep_next = 0;
         let mut keep_slot = || {
@@ -280,30 +294,32 @@ pub fn spawn(
             if crate::acpi::aml_tables(bootinfo, &mut phys, copy) != Some(aml_size) {
                 log!("l4h-root: cannot copy the ACPI tables for the TPM, no attestation");
                 alloc.reclaim(arena);
-                return flags_only(alloc, win, asids, info, frames);
+                return flags_only(alloc, win, asids, info, true, frames);
             }
         }
-        finish(comp, arena, alloc, &mut keep_slot, info, false, frames)
+        finish(comp, arena, alloc, win, &mut keep_slot, info, false, frames, kexec_log)
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
         let _ = (bootinfo, devmem);
-        flags_only(alloc, win, asids, info)
+        flags_only(alloc, win, asids, info, false)
     }
 }
 
 /// The same flags service on machines with no usable TPM.
 fn flags_only(
-    alloc: &mut Alloc, win: &mut Window, asids: &mut AsidPools, info: &HostInfo,
+    alloc: &mut Alloc, win: &mut Window, asids: &mut AsidPools, info: &HostInfo, tpm_found: bool,
     #[cfg(target_arch = "x86_64")] frames: crate::acpi::Frames,
 ) -> Option<Trustd> {
     let (comp, arena, keep) = create(&Layout::default().config(0), alloc, win, asids, info, 0)?;
     let mut next = 0;
-    finish(comp, arena, alloc, &mut || {
+    let mut t = finish(comp, arena, alloc, win, &mut || {
         let slot = keep.absolute_cptr_from_bits_with_depth(next, KEEP_BITS);
         next += 1;
         slot
-    }, info, true, #[cfg(target_arch = "x86_64")] frames)
+    }, info, true, #[cfg(target_arch = "x86_64")] frames, None)?;
+    t.tpm_found = tpm_found;
+    Some(t)
 }
 
 /// Create trustd with configuration `cfg`, and the CNode that keeps its
@@ -349,11 +365,13 @@ fn finish(
     comp: Component,
     mut arena: Arena,
     alloc: &mut Alloc,
+    win: &mut Window,
     keep: &mut impl FnMut() -> sel4::AbsoluteCPtr,
     info: &HostInfo,
     no_reports: bool,
     #[cfg(target_arch = "x86_64")]
     frames: crate::acpi::Frames,
+    kexec_log: Option<&[u8]>,
 ) -> Option<Trustd> {
     let registry = alloc.object_cap::<cap_type::Granule>(FRAME_BP);
     alloc.global(|alloc| {
@@ -365,6 +383,10 @@ fn finish(
         map_frame(&mut ObjCtx::global(alloc), sel4::init_thread::slot::VSPACE.cap(), f, REGISTRY_VA, CapRights::read_write(), VmAttributes::DEFAULT);
     });
     comp.map_copy(alloc, &mut arena, &abs_of(registry), trust::REGISTRY_VA, CapRights::read_only(), VmAttributes::DEFAULT, keep());
+    let kexec = alloc.object_cap::<cap_type::Granule>(FRAME_BP);
+    map_frame(&mut ObjCtx::global(alloc), sel4::init_thread::slot::VSPACE.cap(), kexec,
+        crate::layout::TRUSTD_KEXEC.base, CapRights::read_write(), VmAttributes::DEFAULT);
+    comp.map_copy(alloc, &mut arena, &abs_of(kexec), trust::KEXEC_STATE_VA, CapRights::read_write(), VmAttributes::DEFAULT, keep());
     let pages = core::array::from_fn(|g| {
         let f = arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP);
         comp.map_copy(alloc, &mut arena, &abs_of(f), trust::page_va(g), CapRights::read_write(), VmAttributes::DEFAULT, keep());
@@ -372,6 +394,10 @@ fn finish(
     });
     let kick = arena.object_cap::<cap_type::Notification>(alloc, ObjectBlueprint::Notification);
     comp.give(trust::SLOT_KICK, kick, CapRights::all());
+    let slot = alloc.slots.alloc();
+    let measure_kick = sel4::init_thread::Slot::<cap_type::Notification>::from_index(slot).cap();
+    abs_of(measure_kick).mint(&abs_of(kick), CapRights::write_only(), trust::kick_badge(0)).expect("kexec measurement notification");
+    comp.give_badged(trust::SLOT_MEASURE_DONE, info.events, CapRights::write_only(), trust::MEASURE_DONE_BADGE);
     let flags = core::array::from_fn(|p| {
         let f = arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP);
         comp.map_copy(alloc, &mut arena, &abs_of(f), trust::FLAGS_VA + p * PAGE, CapRights::read_only(), VmAttributes::DEFAULT, keep());
@@ -387,6 +413,18 @@ fn finish(
     let slot = alloc.slots.alloc();
     let flags_ep = sel4::init_thread::Slot::<cap_type::Endpoint>::from_index(slot).cap();
     abs_of(flags_ep).mint(&abs_of(ep), call_rights, trust::FLAGS_ROOT).expect("root flags endpoint");
+    for (page, chunk) in kexec_log
+        .filter(|log| log.len() <= trust::KEXEC_LOG_MAX)
+        .unwrap_or(&[])
+        .chunks(PAGE)
+        .enumerate()
+    {
+        let f = arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP);
+        win.with_frame(&abs_of(f), |p| unsafe {
+            core::ptr::copy_nonoverlapping(chunk.as_ptr(), p, chunk.len());
+        });
+        comp.map_copy(alloc, &mut arena, &abs_of(f), trust::KEXEC_LOG_VA + page * PAGE, CapRights::read_only(), VmAttributes::DEFAULT, keep());
+    }
     let bootstrap = flags_thread(&comp, alloc, &mut arena, info);
     component::start(&comp);
     // reply_recv puts the worker back on the endpoint before returning
@@ -395,8 +433,38 @@ fn finish(
     flags_ep.call(sel4::MessageInfo::new(0, 0, 0, 8));
     bootstrap.unbind().expect("passive flags server");
     Some(Trustd { comp, arena, registry: REGISTRY_VA as *mut GuestRecord,
-        flags_ep, no_reports, failed: false, pages, kick, flags,
+        kexec_state: crate::layout::TRUSTD_KEXEC.base as *mut trust::KexecState,
+        measure_kick, measure_reply: crate::ReplySlot::new(alloc), flags_ep, no_reports, tpm_found: !no_reports, failed: false, pages, kick, flags,
         #[cfg(target_arch = "x86_64")] frames })
+}
+
+/// Extend PCR 14 with a new image's event, then stop trustd. Root services
+/// its normal endpoint while waiting, including trustd's own AML accesses.
+pub fn measure(h: &mut Host, digest: [u8; 32]) -> Result<(), i64> {
+    if h.trustd.as_ref().ok_or(crate::ctl::ENODEV)?.kexec_key()?.is_none() {
+        return Ok(());
+    }
+    let t = h.trustd.as_ref().unwrap();
+    let (p, reply_slot) = (t.kexec_state, t.measure_reply);
+    let mailbox = unsafe { core::ptr::addr_of_mut!((*p).measure) };
+    let seq = unsafe { host::handoff::Mailbox::post(mailbox, digest) };
+    t.measure_kick.signal();
+    let end = l4h_host::ticks::now() + 10 * h.info.tsc_hz;
+    let result = crate::handoff_wait(h, Some(&reply_slot), end, |badge| {
+        if badge & trust::MEASURE_DONE_BADGE != 0 {
+            if let Some(status) = unsafe { host::handoff::Mailbox::answer(mailbox, seq) } {
+                return Some(if status == 0 { Ok(()) } else { Err(status as i64) });
+            }
+        }
+        let status = unsafe { core::ptr::addr_of!((*p).status).read_volatile() };
+        (status == trust::KEXEC_UNAVAILABLE).then_some(Err(crate::ctl::ENODEV))
+    })
+    .unwrap_or_else(|| {
+        log!("l4h-root: trustd kexec measurement timed out");
+        Err(crate::ctl::EIO)
+    });
+    let _ = h.trustd.as_ref().unwrap().comp.tcb.tcb_suspend();
+    result
 }
 
 impl Trustd {
@@ -406,6 +474,33 @@ impl Trustd {
         vmmgr.give(l4h_host::vmmgr::SLOT_FLAGS_EP, self.flags_ep, CapRights::all());
         for (p, &f) in self.flags.iter().enumerate() {
             vmmgr.map_copy(alloc, arena, &abs_of(f), l4h_host::vmmgr::FLAGS_VA + p * PAGE, CapRights::read_only(), VmAttributes::DEFAULT, keep());
+        }
+    }
+
+    /// Let trustd publish guest completions directly to vmmgr. This keeps its
+    /// main thread independent of root while root waits for a measurement.
+    /// It gets only vmmgr's attestation page, not root's events page.
+    pub fn connect_completions(&mut self, vmmgr: &Component, attest: &sel4::AbsoluteCPtr, alloc: &mut Alloc) {
+        let keep = self.comp.slot(trust::SLOT_ATTEST_EVENTS);
+        self.comp.map_copy(alloc, &mut self.arena, attest, trust::ATTEST_EVENTS_VA, CapRights::read_write(), VmAttributes::DEFAULT, keep);
+        self.comp.give_badged(trust::SLOT_VMMGR_NTFN, vmmgr.ntfn, CapRights::write_only(), l4h_host::vmmgr::BADGE_ROOT_EVENT);
+    }
+
+    /// The public PCR 15 extension value trustd published at init, or None
+    /// when the firmware describes no TPM. EAGAIN while trustd is starting.
+    /// ENODEV when a TPM exists but trustd cannot measure with it:
+    /// bypassing it would let a kexec masquerade as the original cold boot.
+    pub fn kexec_key(&self) -> Result<Option<[u8; 32]>, i64> {
+        if self.no_reports || self.failed {
+            return if self.tpm_found { Err(crate::ctl::ENODEV) } else { Ok(None) };
+        }
+        match unsafe { core::ptr::addr_of!((*self.kexec_state).status).read_volatile() } {
+            trust::KEXEC_STARTING => Err(crate::ctl::EAGAIN),
+            trust::KEXEC_READY => {
+                core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+                Ok(Some(unsafe { core::ptr::addr_of!((*self.kexec_state).key_extension).read_volatile() }))
+            }
+            _ => Err(crate::ctl::ENODEV),
         }
     }
 
@@ -450,6 +545,9 @@ impl Trustd {
     /// so that no guest waits for good.  New guests get no attestation.
     fn fail(&mut self, h: &mut Host) {
         self.failed = true;
+        unsafe {
+            core::ptr::addr_of_mut!((*self.kexec_state).status).write_volatile(trust::KEXEC_UNAVAILABLE);
+        }
         let _ = self.comp.tcb.tcb_suspend();
         let kick = abs_of(self.kick);
         let _ = kick.revoke();
@@ -484,8 +582,8 @@ pub fn fault(h: &mut Host, id: u32) {
     }
 }
 
-/// ROOT_CALL_ATTEST_DONE: trustd answered guest `id`; vmmgr raises the
-/// event of its attestation device.
+/// Raise a failed guest request's event through vmmgr. Normal trustd
+/// completions use the shared attestation page directly and do not call root.
 pub fn done(h: &mut Host, id: usize) {
     if h.guests.get(id).and_then(|g| g.as_ref()).is_some_and(|g| g.attest) {
         if let Some(v) = &h.vmmgr {

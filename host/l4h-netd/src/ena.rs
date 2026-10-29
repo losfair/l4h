@@ -292,6 +292,7 @@ pub struct Ena {
     pub tso: bool,
     regs: Mmio,
     tsc_hz: u64,
+    resp_pa: u64,
     /// The readless response (struct ena_admin_ena_mmio_req_read_less_resp),
     /// if registers are read so.
     readless: Option<usize>,
@@ -359,6 +360,7 @@ impl Ena {
             tso: false,
             regs,
             tsc_hz,
+            resp_pa,
             readless: (c.revision & REVISION_NO_READLESS == 0).then_some(resp),
             mmio_seq: 0,
             admin_timeout_ms: ADMIN_TIMEOUT_MS,
@@ -403,7 +405,7 @@ impl Ena {
         // Where readless reads land, set again after the reset.
         regs.w32(REG_MMIO_RESP_LO, resp_pa as u32);
         regs.w32(REG_MMIO_RESP_HI, (resp_pa >> 32) as u32);
-        e.reset(resp_pa);
+        assert!(e.reset(), "netd: NIC {}: ENA reset failed", n);
         // MSI-X, as Linux after the reset: the management and I/O vectors
         // on netd's vector, any others masked.
         let msix = Mmio(c.msix_table.va as usize);
@@ -632,33 +634,41 @@ impl Ena {
 
     /// Reset the device, which firmware may have used (Linux
     /// ena_com_dev_reset).
-    fn reset(&mut self, resp_pa: u64) {
+    pub fn reset(&mut self) -> bool {
         let sts = self.r32(REG_DEV_STS);
         if sts & DEV_STS_READY == 0 {
-            panic!("netd: NIC {}: ENA not ready (status {:#x})", self.n, sts);
+            l4h_rt::log!("netd: NIC {}: ENA not ready (status {:#x})", self.n, sts);
+            return false;
         }
         let caps = self.r32(REG_CAPS);
         // In 100 ms.
         let timeout = ((caps >> 1) & 0x1f).max(1) as u64 * 100_000;
         self.regs.w32(REG_DEV_CTL, DEV_CTL_RESET);
-        self.regs.w32(REG_MMIO_RESP_LO, resp_pa as u32);
-        self.regs.w32(REG_MMIO_RESP_HI, (resp_pa >> 32) as u32);
-        self.wait_reset(timeout, true);
+        self.regs.w32(REG_MMIO_RESP_LO, self.resp_pa as u32);
+        self.regs.w32(REG_MMIO_RESP_HI, (self.resp_pa >> 32) as u32);
+        if !self.wait_reset(timeout, true) {
+            return false;
+        }
         self.regs.w32(REG_DEV_CTL, 0);
-        self.wait_reset(timeout, false);
+        if !self.wait_reset(timeout, false) {
+            return false;
+        }
         let admin = (caps >> 16) & 0xf;
         if admin != 0 {
             self.admin_timeout_ms = admin as u64 * 100;
         }
+        true
     }
 
-    fn wait_reset(&mut self, timeout_us: u64, on: bool) {
+    fn wait_reset(&mut self, timeout_us: u64, on: bool) -> bool {
         let end = self.deadline_us(timeout_us);
         while (self.r32(REG_DEV_STS) & DEV_STS_RESET_IN_PROGRESS != 0) != on {
             if host::ticks::now() > end {
-                panic!("netd: NIC {}: ENA reset indication did not turn {}", self.n, if on { "on" } else { "off" });
+                l4h_rt::log!("netd: NIC {}: ENA reset indication did not turn {}", self.n, if on { "on" } else { "off" });
+                return false;
             }
         }
+        true
     }
 
     /// Run one admin command and wait for its completion; a failure is

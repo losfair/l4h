@@ -28,12 +28,16 @@
 
 """Verifier side of l4h attestation (DESIGN.md §9.2).
 
+  l4h-attest.py measure-efi EFI
+      The Authenticode digest of an EFI application, for --trusted-efi.
   l4h-attest.py measure KERNEL [--initrd F] [--cmdline S]
       The launch digest of a guest booted with these files: what its
       reports carry as "launch".
   l4h-attest.py verify REPORT EVIDENCE [--data HEX] [--launch HEX]
                 [--pcr N=HEX]... [--ak-name HEX] [--ek-ca PEM]
                 [--deny-taint SPEC] [--require-seal SPEC]
+                [--trusted-efi HEX]... [--trusted-initrd HEX]...
+                [--trusted-config HEX]... [--require-cold-boot]
       Check a report (l4hctl attest report -o) against the host evidence
       (l4hctl attest evidence -o), and print what they claim as JSON.
       Without --ak-name the attestation key is not known to be a TPM's.
@@ -244,6 +248,70 @@ def point(key):
     return key.public_bytes(serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)
 
 
+def authenticode_digest(data):
+    """SHA-256 of a PE/COFF file's Authenticode byte stream."""
+    if len(data) < 64 or data[:2] != b"MZ":
+        raise Fail("not a PE application")
+    pe = struct.unpack_from("<I", data, 0x3c)[0]
+    if data[pe:pe + 4] != b"PE\0\0" or struct.unpack_from("<H", data, pe + 4)[0] != 0x8664:
+        raise Fail("not an x86_64 PE application")
+    count, optional_size = struct.unpack_from("<HH", data, pe + 6)[0], struct.unpack_from("<H", data, pe + 20)[0]
+    optional = pe + 24
+    if optional_size < 72 or struct.unpack_from("<H", data, optional)[0] != 0x20b:
+        raise Fail("not a PE32+ application")
+    checksum = optional + 64
+    directory_count = struct.unpack_from("<I", data, optional + 108)[0] if optional_size >= 112 else 0
+    if directory_count > max(0, optional_size - 112) // 8:
+        raise Fail("bad PE data directories")
+    security = optional + 112 + 4 * 8 if directory_count > 4 else None
+    certificate = None
+    if security is not None:
+        offset, size = struct.unpack_from("<II", data, security)
+        if (offset == 0) != (size == 0):
+            raise Fail("bad PE certificate table")
+        if offset:
+            if offset + size > len(data):
+                raise Fail("PE certificate table outside the file")
+            certificate = (offset, offset + size)
+    headers_size = struct.unpack_from("<I", data, optional + 60)[0]
+    section_table = optional + optional_size
+    if headers_size < section_table + count * 40 or headers_size > len(data):
+        raise Fail("bad PE header size")
+    sections = []
+    for i in range(count):
+        at = section_table + i * 40
+        if at + 40 > len(data):
+            raise Fail("truncated PE section table")
+        size, offset = struct.unpack_from("<II", data, at + 16)[0], struct.unpack_from("<I", data, at + 20)[0]
+        if size and (offset < headers_size or offset + size > len(data)):
+            raise Fail("bad PE section bounds")
+        if size:
+            sections.append((offset, size))
+    sections.sort()
+    h = hashlib.sha256()
+    h.update(data[:checksum])
+    if security is None:
+        h.update(data[checksum + 4:headers_size])
+    else:
+        h.update(data[checksum + 4:security])
+        h.update(data[security + 8:headers_size])
+    end = headers_size
+    for offset, size in sections:
+        if offset < end:
+            raise Fail("overlapping PE sections")
+        if certificate and offset < certificate[1] and certificate[0] < offset + size:
+            raise Fail("PE certificate table overlaps a section")
+        h.update(data[offset:offset + size])
+        end = offset + size
+    if certificate and certificate[0] < end:
+        raise Fail("PE certificate table is not after the sections")
+    hashed_size = headers_size + sum(size for _offset, size in sections)
+    h.update(data[hashed_size:certificate[0] if certificate else len(data)])
+    if certificate:
+        h.update(data[certificate[1]:])
+    return h.digest()
+
+
 # ---- measure
 
 
@@ -282,7 +350,68 @@ def launch_digest(kernel, initrd, cmdline):
 # ---- verify
 
 
-def check_evidence(ev, pins, ak_name, ek_ca):
+KEXEC_PCR = 14
+KEXEC_LOG_MAGIC = b"L4HKXLOG"
+KEXEC_LOG_VERSION = 1
+KEXEC_LOG_HEADER = 16
+KEXEC_LOG_EVENT = 168
+
+
+def pcr_extend(pcr, digest):
+    return hashlib.sha256(pcr + digest).digest()
+
+
+def kexec_event_digest(event):
+    flags, _control = struct.unpack_from("<II", event, 160)
+    if flags & ~3:
+        raise Fail("invalid kexec event flags")
+    return hashlib.sha256(b"l4h-kexec-v1" + event[32:160] + struct.pack("<I", flags)).digest()
+
+
+def replay_kexec_log(log, trusted_efi, trusted_initrd=(), trusted_config=()):
+    if len(log) < KEXEC_LOG_HEADER or log[:8] != KEXEC_LOG_MAGIC:
+        raise Fail("bad kexec log header")
+    if struct.unpack_from("<I", log, 8)[0] != KEXEC_LOG_VERSION:
+        raise Fail("unknown kexec log version")
+    count = struct.unpack_from("<I", log, 12)[0]
+    if len(log) != KEXEC_LOG_HEADER + count * KEXEC_LOG_EVENT:
+        raise Fail("kexec log event count does not match its size")
+    trusted_efi, trusted_initrd, trusted_config = set(trusted_efi), set(trusted_initrd), set(trusted_config)
+    empty = hashlib.sha256(b"").digest()
+    pcr14 = pcr15 = bytes(32)
+    events = []
+    for i in range(count):
+        event = log[KEXEC_LOG_HEADER + i * KEXEC_LOG_EVENT:KEXEC_LOG_HEADER + (i + 1) * KEXEC_LOG_EVENT]
+        previous_key = event[:32]
+        if previous_key == bytes(32):
+            raise Fail("kexec chain is missing a host key extension")
+        if event[32:64] not in trusted_efi:
+            raise Fail("untrusted EFI image in kexec chain")
+        digest = kexec_event_digest(event)
+        flags = struct.unpack_from("<I", event, 160)[0]
+        for name, offset, flag, pins in (("initrd", 64, 1, trusted_initrd), ("l4h.conf", 96, 2, trusted_config)):
+            value = event[offset:offset + 32]
+            if not flags & flag:
+                if value != empty:
+                    raise Fail("absent %s has a nonempty digest" % name)
+                if pins:
+                    raise Fail("kexec chain is missing a trusted %s" % name)
+            elif value not in pins:
+                raise Fail("untrusted %s in kexec chain" % name)
+        events.append({
+            "efi": event[32:64].hex(),
+            "initrd": event[64:96].hex() if flags & 1 else None,
+            "config": event[96:128].hex() if flags & 2 else None,
+            "boot_strings": event[128:160].hex(),
+            "previous_key": previous_key.hex(),
+            "control": struct.unpack_from("<I", event, 164)[0],
+        })
+        pcr14 = pcr_extend(pcr14, digest)
+        pcr15 = pcr_extend(pcr15, previous_key)
+    return count, pcr14, pcr15, events
+
+
+def check_evidence(ev, pins, ak_name, ek_ca, trusted_efi=(), require_cold_boot=False, trusted_initrd=(), trusted_config=()):
     """The host's signing key and what the evidence shows about it."""
     if ev.get("v") != 1:
         raise Fail("unknown evidence version")
@@ -309,9 +438,29 @@ def check_evidence(ev, pins, ak_name, ek_ca):
         raise Fail("quoted PCRs differ from the evidence's")
     if hashlib.sha256(b"".join(pcrs[i] for i in sorted(pcrs))).digest() != q["digest"]:
         raise Fail("PCR values do not match the quote")
-    # Quoted before trustd extended it: the first key since TPM reset.
-    if pcrs.get(KEY_PCR) != bytes(32):
-        raise Fail("PCR %d is not zero: not the first host key of this boot" % KEY_PCR)
+    count = ev.get("kexec", 0)
+    if not isinstance(count, int) or count < 0:
+        raise Fail("invalid kexec count")
+    if require_cold_boot and count:
+        raise Fail("host was kexeced; a cold boot is required")
+    if count == 0:
+        if "klog" in ev:
+            raise Fail("kexec log present for a cold-booted host")
+        if pcrs.get(KEXEC_PCR) != bytes(32):
+            raise Fail("PCR %d is not zero: not a cold boot" % KEXEC_PCR)
+        if pcrs.get(KEY_PCR) != bytes(32):
+            raise Fail("PCR %d is not zero: not the first host key of this boot" % KEY_PCR)
+        events = []
+    else:
+        if "klog" not in ev:
+            raise Fail("kexeced host has no event log")
+        logged, pcr14, pcr15, events = replay_kexec_log(ev["klog"], trusted_efi, trusted_initrd, trusted_config)
+        if logged != count:
+            raise Fail("evidence kexec count differs from its log")
+        if pcrs.get(KEXEC_PCR) != pcr14:
+            raise Fail("PCR 14 does not match the kexec event log")
+        if pcrs.get(KEY_PCR) != pcr15:
+            raise Fail("PCR 15 does not match the kexec key chain")
     for i, want in pins.items():
         if pcrs.get(i) != want:
             raise Fail("PCR %d is %s, not %s" % (i, pcrs.get(i, b"").hex(), want.hex()))
@@ -334,6 +483,8 @@ def check_evidence(ev, pins, ak_name, ek_ca):
         "ak_pinned": ak_name is not None,
         "reset_count": q["reset_count"],
         "restart_count": q["restart_count"],
+        "kexec": count,
+        "kexec_events": events,
         "pcrs": {str(i): pcrs[i].hex() for i in sorted(pcrs)},
         "ek_cert": ek,
     }
@@ -469,6 +620,8 @@ def main():
     m.add_argument("kernel")
     m.add_argument("--initrd")
     m.add_argument("--cmdline", default="")
+    efi = sub.add_parser("measure-efi")
+    efi.add_argument("efi")
     v = sub.add_parser("verify")
     v.add_argument("report")
     v.add_argument("evidence")
@@ -479,6 +632,10 @@ def main():
     v.add_argument("--deny-taint", default="console-in", help="deny host names, bit numbers or ranges (default: console-in; '' disables)")
     v.add_argument("--require-seal", default="", help="require sealed host names, bit numbers or ranges")
     v.add_argument("--ek-ca", help="CA certificate (PEM) that issued the EK certificate")
+    v.add_argument("--trusted-efi", action="append", default=[], help="trusted Authenticode digest for every image in a kexec chain (repeat for upgrades)")
+    v.add_argument("--trusted-initrd", action="append", default=[], help="trusted SHA-256 digest for every initrd in a kexec chain (repeat for upgrades)")
+    v.add_argument("--trusted-config", action="append", default=[], help="trusted SHA-256 digest for every l4h.conf in a kexec chain (repeat for upgrades)")
+    v.add_argument("--require-cold-boot", action="store_true", help="reject any host reached by kexec")
     c = sub.add_parser("make-credential")
     c.add_argument("evidence")
     c.add_argument("secret", help="hex, at most 32 bytes")
@@ -489,6 +646,8 @@ def main():
         if a.cmd == "measure":
             initrd = open(a.initrd, "rb").read() if a.initrd else b""
             print(launch_digest(open(a.kernel, "rb").read(), initrd, a.cmdline).hex())
+        elif a.cmd == "measure-efi":
+            print(authenticode_digest(open(a.efi, "rb").read()).hex())
         elif a.cmd == "verify":
             pins = {}
             for p in a.pcr:
@@ -496,7 +655,9 @@ def main():
                 pins[int(i)] = bytes.fromhex(val)
             ev = cbor_decode(open(a.evidence, "rb").read())
             ak_name = bytes.fromhex(a.ak_name) if a.ak_name else None
-            key, host = check_evidence(ev, pins, ak_name, a.ek_ca)
+            key, host = check_evidence(ev, pins, ak_name, a.ek_ca,
+                {bytes.fromhex(x) for x in a.trusted_efi}, a.require_cold_boot,
+                {bytes.fromhex(x) for x in a.trusted_initrd}, {bytes.fromhex(x) for x in a.trusted_config})
             data = bytes.fromhex(a.data) if a.data is not None else None
             launch = bytes.fromhex(a.launch) if a.launch else None
             guest = check_report(cbor_decode(open(a.report, "rb").read()), key, data, launch, a.deny_taint, a.require_seal)

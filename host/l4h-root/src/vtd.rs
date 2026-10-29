@@ -220,19 +220,30 @@ impl Vtd {
 
     fn deadline(&self) -> u64 { l4h_host::ticks::now().saturating_add(self.ticks_per_ms.max(1) * 1000) }
 
-    fn wait_for(&self, u: usize, what: &str, mut done: impl FnMut(&Unit) -> bool) {
+    fn try_wait_for(&self, u: usize, mut done: impl FnMut(&Unit) -> bool) -> bool {
         let end = self.deadline();
         while !done(&self.units[u]) {
-            assert!(l4h_host::ticks::now() < end, "l4h-root: VT-d {}: {} timed out", u, what);
+            if l4h_host::ticks::now() >= end {
+                return false;
+            }
             core::hint::spin_loop();
         }
+        true
     }
 
-    fn set_control(&mut self, u: usize, bit: u32, enabled: bool) {
+    fn wait_for(&self, u: usize, what: &str, done: impl FnMut(&Unit) -> bool) {
+        assert!(self.try_wait_for(u, done), "l4h-root: VT-d {}: {} timed out", u, what);
+    }
+
+    fn try_set_control(&mut self, u: usize, bit: u32, enabled: bool) -> bool {
         let unit = &mut self.units[u];
         if enabled { unit.control |= bit; } else { unit.control &= !bit; }
         unit.w32(GCMD, unit.control);
-        self.wait_for(u, "global command", |u| (u.r32(GSTS) & bit != 0) == enabled);
+        self.try_wait_for(u, |u| (u.r32(GSTS) & bit != 0) == enabled)
+    }
+
+    fn set_control(&mut self, u: usize, bit: u32, enabled: bool) {
+        assert!(self.try_set_control(u, bit, enabled), "l4h-root: VT-d {}: global command timed out", u);
     }
 
     fn command(&self, u: usize, bit: u32, status_set: bool) {
@@ -305,6 +316,26 @@ impl Vtd {
                 self.dmar.units[n].base, self.units[n].width, if self.intremap { "remapped" } else { "not remapped" });
         }
         self.state = abi::IOMMU_ON;
+    }
+
+    /// Disable translation and, last, interrupt remapping before kexec.
+    /// False if any unit failed to acknowledge a bounded shutdown step.
+    pub fn shutdown(&mut self) -> bool {
+        let mut ok = true;
+        for n in 0..self.units.len() {
+            ok &= self.try_set_control(n, TE, false);
+            if self.units[n].control & EAFL != 0 { ok &= self.try_set_control(n, EAFL, false); }
+            if self.units[n].control & QIE != 0 {
+                ok &= self.try_wait_for(n, |u| u.r64(IQH) == u.r64(IQT));
+                ok &= self.try_set_control(n, QIE, false);
+            }
+            if self.units[n].control & CFI != 0 { ok &= self.try_set_control(n, CFI, false); }
+            if self.units[n].control & IRE != 0 { ok &= self.try_set_control(n, IRE, false); }
+        }
+        if self.state == abi::IOMMU_ON {
+            self.state = abi::IOMMU_OFF;
+        }
+        ok
     }
 
     fn flush_cpu(&self, ptr: usize, len: usize) {

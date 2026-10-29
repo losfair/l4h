@@ -187,6 +187,7 @@ pub struct Gvnic {
     regs: Mmio,
     doorbells: Mmio,
     tsc_hz: u64,
+    revision: u32,
     adminq: (usize, u64),
     adminq_prod: u32,
     /// Interrupt doorbell index of each notification block.
@@ -247,6 +248,7 @@ impl Gvnic {
             regs,
             doorbells,
             tsc_hz,
+            revision: c.revision,
             adminq: dma.alloc(ADMINQ_SIZE, 4096),
             adminq_prod: 0,
             irq_db: [0; 2],
@@ -278,7 +280,13 @@ impl Gvnic {
         for &b in b"GVE-l4h\n" {
             regs.w8(REG_DRIVER_VERSION, b);
         }
-        g.reset(c.revision);
+        if g.revision < 1 {
+            assert!(g.reset(), "netd: NIC {}: gVNIC reset failed", n);
+        } else {
+            // Some revision 1 firmware never reports the reset. This was
+            // non-fatal at boot before kexec used the same routine.
+            let _ = g.reset();
+        }
         // Admin queue.
         let (_, aq_pa) = g.adminq;
         if c.revision < 1 {
@@ -454,31 +462,34 @@ impl Gvnic {
     /// the device.  Only then: on C3 (revision 0), releasing when no queue
     /// is registered makes the device reset itself about a second later,
     /// dropping the admin queue registered meanwhile.
-    fn reset(&self, revision: u32) {
+    pub fn reset(&self) -> bool {
         let end = self.deadline(5);
-        if revision < 1 {
+        if self.revision < 1 {
             if self.r32(REG_ADMINQ_PFN) == 0 {
-                return;
+                return true;
             }
             self.w32(REG_ADMINQ_PFN, 0);
             while self.r32(REG_ADMINQ_PFN) != 0 {
                 if host::ticks::now() > end {
-                    panic!("netd: NIC {}: gVNIC does not release its admin queue", self.n);
+                    l4h_rt::log!("netd: NIC {}: gVNIC does not release its admin queue", self.n);
+                    return false;
                 }
             }
         } else {
             if self.r32(REG_ADMINQ_BASE_HI) | self.r32(REG_ADMINQ_BASE_LO) == 0 {
-                return;
+                return true;
             }
             self.w32(REG_DRIVER_STATUS, DRIVER_STATUS_RESET);
             while self.r32(REG_DEVICE_STATUS) & DEVICE_STATUS_IS_RESET == 0 {
                 if host::ticks::now() > end {
-                    // Setting up the admin queue fails if this mattered.
+                    // Some firmware never reports this reset; boot proceeds
+                    // with the admin queue, and handoff proceeds the same way.
                     l4h_rt::log!("netd: NIC {}: gVNIC reports no reset (status {:#x})", self.n, self.r32(REG_DEVICE_STATUS));
-                    return;
+                    return true;
                 }
             }
         }
+        true
     }
 
     /// Run one admin command and wait for it; a failure is fatal, as for a

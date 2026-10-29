@@ -13,7 +13,10 @@
 # in it, into PCR 4; GRUB's tpm module measures what it reads (the files
 # above) into PCR 9 and its commands into PCR 8 (DESIGN.md §9.2).
 # L4H_KERNEL_VARIANT selects a built seL4 variant when kernel.elf is omitted.
-# Usage: mkefi.sh <out.efi> [l4h-root.elf] [kernel.elf]
+# Usage: mkefi.sh <out.efi> [l4h-root.elf] [kernel.elf] [kernel-build]
+# kernel-build is the CMake build directory for kernel.elf (default: the
+# variant's build/kernel); its APIC and PCID settings go into a kexec
+# variant note.
 # L4H_GUEST_KERNEL is the guest kernel (default: build/linux-l4h/vmlinux)
 # and L4H_GUEST_KMODS its module tree (default: kmods.erofs next to it,
 # from tools/build-kmods.sh; empty for none).
@@ -27,11 +30,24 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 out=$1
 rootserver=${2:-$root/host/target/x86_64-sel4-roottask/debug/l4h-root.elf}
-kernel=${3:-$root/build/sel4${L4H_KERNEL_VARIANT:+-$L4H_KERNEL_VARIANT}/bin/kernel.elf}
+variant=${L4H_KERNEL_VARIANT:+-$L4H_KERNEL_VARIANT}
+kernel=${3:-$root/build/sel4$variant/bin/kernel.elf}
+kernel_build=${4:-${L4H_KERNEL_BUILD:-$root/build/kernel$variant}}
 guest_kernel=${L4H_GUEST_KERNEL:-$root/build/linux-l4h/vmlinux}
 guest_kmods=${L4H_GUEST_KMODS-$(dirname "$guest_kernel")/kmods.erofs}
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
+
+lapic=$(sed -n 's/^KernelLAPICMode:STRING=//p' "$kernel_build/CMakeCache.txt")
+pcid=$(sed -n 's/^KernelSupportPCID:BOOL=//p' "$kernel_build/CMakeCache.txt")
+case $lapic in X2APIC) flags=1 ;; XAPIC) flags=0 ;; *) echo "$kernel_build: unknown LAPIC mode '$lapic'" >&2; exit 1 ;; esac
+case $pcid in ON) flags=$((flags | 2)) ;; OFF) ;; *) echo "$kernel_build: unknown PCID setting '$pcid'" >&2; exit 1 ;; esac
+# A standard ELF note: name "l4h", type 1, one u64 of VARIANT_* flags.
+printf '\x04\x00\x00\x00\x08\x00\x00\x00\x01\x00\x00\x00l4h\x00' >"$work/variant-note"
+printf '%b' "\\x0$flags\\x00\\x00\\x00\\x00\\x00\\x00\\x00" >>"$work/variant-note"
+objcopy --add-section ".note.l4h-kexec=$work/variant-note" \
+    --set-section-flags .note.l4h-kexec=readonly \
+    "$kernel" "$work/kernel.elf"
 
 acpi_cmd= acpi_files=()
 if [ -n "${L4H_ACPI_TABLES:-}" ]; then
@@ -45,47 +61,21 @@ if [ -n "${L4H_ACPI_TABLES:-}" ]; then
 fi
 
 # l4h.conf is key=value lines, which GRUB sources as variable assignments:
-# it reads serial_port and fb_console itself.
+# it reads serial_port and fb_console itself. The fixed command sequence is
+# shared with root's kexec parser; only these two optional lines expand here.
 cat > "$work/grub.cfg" <<CFG
+# l4h-boot 1
 set timeout=0
 serial_port=${L4H_SERIAL_PORT:-0x3f8}
 fb_console=${L4H_FB_CONSOLE:-0}
-# The partition this application was loaded from, when GRUB knows it
-# (\$cmdpath is empty under OVMF), else the first one with l4h's files.
-esp=
-regexp --set=1:esp '^\(([^)]*)\)' "\$cmdpath"
-if [ -z "\$esp" ]; then search --no-floppy --set=esp --file /l4h/dom0/initrd; fi
-if [ -z "\$esp" ]; then search --no-floppy --set=esp --file /l4h/l4h.conf; fi
-if [ -n "\$esp" ]; then
-    if [ -f "(\$esp)/l4h/l4h.conf" ]; then source "(\$esp)/l4h/l4h.conf"; fi
-fi
-serial --port=\$serial_port --speed=115200
-terminal_input serial
-fbcon=
-if [ "\$fb_console" = 1 ]; then
-    terminal_output serial console
-    fbcon=" fb_console"
-else
-    terminal_output serial
-fi
-$acpi_cmd
-# GRUB 2.12 grows its heap through the firmware's boot services, even after
-# multiboot2 has exited them: booting then faults if the relocator's last
-# allocations no longer fit (it did under OvmfXen).  Have GRUB grow the
-# heap now by reading a large file whole, which load_env does before it
-# rejects the file and frees the buffer.
-if load_env --file (memdisk)/boot/vmlinux; then true; fi
-multiboot2 (memdisk)/boot/kernel.elf console_port=\$serial_port debug_port=\$serial_port\$fbcon
-module2 (memdisk)/boot/l4h-root.elf
-module2 (memdisk)/boot/vmlinux guest-kernel
-${guest_kmods:+module2 (memdisk)/boot/kmods.erofs guest-kmods}
-if [ -n "\$esp" ]; then
-    if [ -f "(\$esp)/l4h/dom0/initrd" ]; then module2 "(\$esp)/l4h/dom0/initrd" dom0-initrd; fi
-    if [ -f "(\$esp)/l4h/l4h.conf" ]; then module2 "(\$esp)/l4h/l4h.conf" l4h-config; fi
-fi
-boot
-echo "l4h: boot failed"
 CFG
+while IFS= read -r line; do
+    case $line in
+        @ACPI@) [ -z "$acpi_cmd" ] || printf '%s\n' "$acpi_cmd" ;;
+        @KMODS@) [ -z "$guest_kmods" ] || printf '%s\n' 'module2 (memdisk)/boot/kmods.erofs guest-kmods' ;;
+        *) printf '%s\n' "$line" ;;
+    esac
+done >> "$work/grub.cfg" < "$root/tools/l4h-grub-fixed.cfg"
 # seL4 and root load only the segments: drop the debug information.
 objcopy --strip-debug "$rootserver" "$work/l4h-root.elf"
 objcopy --strip-debug "$guest_kernel" "$work/vmlinux"
@@ -95,6 +85,6 @@ grub-mkstandalone -O x86_64-efi -o "$out" --compress=xz \
     --modules="part_gpt fat search search_fs_file multiboot2 serial terminal normal configfile test regexp echo loadenv efi_gop video video_fb tpm${acpi_cmd:+ acpi}" \
     --locales= --fonts= --themes= \
     "boot/grub/grub.cfg=$work/grub.cfg" \
-    "boot/kernel.elf=$kernel" \
+    "boot/kernel.elf=$work/kernel.elf" \
     "boot/l4h-root.elf=$work/l4h-root.elf" "${memdisk[@]}" "${acpi_files[@]}"
 echo "$out: $(( $(stat -c %s "$out") >> 10 )) KiB"

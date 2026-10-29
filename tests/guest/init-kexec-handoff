@@ -1,0 +1,20 @@
+#!/bin/sh
+# dom0 init for tests/run-kexec-handofftest.sh.
+fail() {
+    echo "KEXECTEST: FAIL $*"
+    poweroff -f
+    exit 1
+}
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+case "$(cat /proc/cmdline)" in
+    *kexec_boot=done*)
+        echo "KEXECTEST: handoff ok"
+        poweroff -f
+        exit 0
+        ;;
+esac
+echo "KEXECTEST: first boot"
+l4hctl host-kexec --efi /bin/target.efi --initrd /bin/target-initrd --conf /bin/target.conf || fail "kexec command"
+fail "EXEC returned"

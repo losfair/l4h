@@ -107,6 +107,15 @@ impl Iommu {
         }
     }
 
+    /// Stop DMA translation and interrupt remapping before kexec.
+    pub fn shutdown(&mut self) -> bool {
+        match self {
+            Self::Amd(a) => a.shutdown(),
+            #[cfg(target_arch = "x86_64")]
+            Self::Intel(i) => i.shutdown(),
+        }
+    }
+
     pub fn poll(&mut self) {
         match self {
             Self::Amd(a) => a.poll(),

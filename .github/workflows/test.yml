@@ -139,8 +139,18 @@ jobs:
         run: tests/run-uefitest.sh
       - name: BIOS boot of the same image
         run: tests/run-biostest.sh
+      - name: Host kexec image parsing, LOAD and handoff
+        run: |
+          tests/run-kexecimagetest.sh
+          tests/run-kexec-loadtest.sh
+          tests/run-kexec-handofftest.sh
+          tests/run-kexec-uefitest.sh
+          KEXEC_UEFI_IOMMU=intel tests/run-kexec-uefitest.sh
+          KEXEC_UEFI_IOMMU=amd tests/run-kexec-uefitest.sh
       - name: Attestation (software TPM)
         run: tests/run-attesttest.sh
+      - name: Kexec attestation (two kexecs)
+        run: tests/run-kexec-attesttest.sh
       - name: Virtqueue fuzzing
         run: tests/run-fuzz.sh
       - name: Upload logs

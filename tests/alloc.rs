@@ -9,6 +9,8 @@ macro_rules! log { ($($arg:tt)*) => { println!($($arg)*) }; }
 
 #[path = "../host/l4h-host/src/fixed.rs"]
 pub mod fixed;
+#[path = "../host/l4h-host/src/handoff.rs"]
+pub mod handoff;
 #[path = "../host/l4h-task/src/mem.rs"]
 mod mem;
 
@@ -156,6 +158,7 @@ pub mod memd {
 
     thread_local! {
         pub static GRANTS: std::cell::RefCell<Vec<Option<usize>>> = const { std::cell::RefCell::new(Vec::new()) };
+        pub static WINDOWS: std::cell::RefCell<Vec<core::ops::Range<usize>>> = const { std::cell::RefCell::new(Vec::new()) };
     }
 
     #[derive(Clone, Copy)]
@@ -168,14 +171,22 @@ pub mod memd {
 
     impl MemdLink {
         pub fn status(&self) -> Status { panic!("no memd in this test") }
-        pub fn alloc(&self, _: usize, _: usize) -> Option<usize> {
+        pub fn alloc(&self, bits: usize, slot: usize) -> Option<usize> {
+            self.alloc_in(bits, slot, 0..usize::MAX)
+        }
+        pub fn alloc_in(&self, _: usize, _: usize, window: core::ops::Range<usize>) -> Option<usize> {
+            WINDOWS.with_borrow_mut(|w| w.push(window));
             let paddr = GRANTS.with_borrow_mut(|g| g.pop().expect("unexpected memd allocation"));
             crate::with_ipc_buffer_mut(|b| {
                 b.msg_regs_mut()[..2].copy_from_slice(&[if paddr.is_some() { 0 } else { u64::MAX }, paddr.unwrap_or(0) as u64]);
             });
             paddr
         }
-        pub fn free(&self, _: &[(crate::cap::Untyped, usize, usize)]) { panic!("no memd in this test") }
+        pub fn free(&self, batch: &[(crate::cap::Untyped, usize, usize)]) {
+            for &(_, paddr, _) in batch {
+                GRANTS.with_borrow_mut(|g| g.push(Some(paddr)));
+            }
+        }
     }
 }
 
@@ -309,6 +320,58 @@ fn arena_growth_on_fragmented_memory_and_reclaim() {
         with_ipc_buffer(|b| assert_eq!(b.msg_regs(), &request));
         assert_eq!(alloc.pool.free_bytes(), if grant.is_some() { 16 << 20 } else { 0 });
         memd::GRANTS.with_borrow(|g| assert!(g.is_empty()));
+    }
+}
+
+#[test]
+fn constrained_splits_pass_their_window_to_memd() {
+    let mut alloc = mem::Alloc::empty(
+        mem::Slots::new(Cap::from_bits(1), Box::leak(Box::new(mem::SlotStorage::<2, 128>::new())), 64..128),
+        Box::leak(Box::new(mem::AllocStorage::new())),
+    );
+    alloc.memd = Some(memd::MemdLink);
+    let window = (16 << 20)..(1usize << 32);
+    // memd has no GRANT_BITS block in the window, then a 2 MiB one.
+    memd::GRANTS.with_borrow_mut(|g| *g = vec![Some(1 << 30), None]);
+    memd::WINDOWS.with_borrow_mut(|w| w.clear());
+    let low = alloc.split_in(21, 64, window.clone()).expect("granted block");
+    assert_eq!(low.paddr, 1 << 30);
+    memd::WINDOWS.with_borrow(|w| assert_eq!(w.as_slice(), &[window.clone(), window.clone()]));
+
+    // A large grant's remainder stays local, but outside a later window it
+    // is not used: memd is asked instead.
+    memd::GRANTS.with_borrow_mut(|g| *g = vec![None, None, Some(4 << 30)]);
+    assert_eq!(alloc.split_in(21, 65, 0..usize::MAX).expect("large grant").paddr, 4 << 30);
+    assert!(alloc.split_in(21, 66, window.clone()).is_none());
+    memd::GRANTS.with_borrow(|g| assert!(g.is_empty()));
+    assert_eq!(alloc.split(21, 67).expect("local remainder").paddr, (4 << 30) + (1 << 21));
+}
+
+#[test]
+fn handoff_badges_are_above_component_ids() {
+    for badge in [handoff::MEASURE_DONE_BADGE, handoff::NETD_RESET_OK, handoff::NETD_RESET_ERROR] {
+        assert_eq!(badge & 0xffff, 0);
+        assert!(badge >= 1 << 40);
+    }
+    assert_ne!(handoff::NETD_RESET_OK, handoff::NETD_RESET_ERROR);
+}
+
+#[test]
+fn stale_completion_does_not_answer_handoff_request() {
+    let mut mailbox = handoff::Mailbox::<u64>::default();
+    let m: *mut handoff::Mailbox<u64> = &mut mailbox;
+    unsafe {
+        assert_eq!(handoff::Mailbox::pending(m), None);
+        let first = handoff::Mailbox::post(m, 3);
+        assert_eq!(handoff::Mailbox::pending(m), Some((first, 3)));
+        // The server answers the first request after root posted another.
+        let second = handoff::Mailbox::post(m, 4);
+        handoff::Mailbox::complete(m, first, 5);
+        assert_eq!(handoff::Mailbox::answer(m, second), None);
+        assert_eq!(handoff::Mailbox::pending(m), Some((second, 4)));
+        handoff::Mailbox::complete(m, second, 0);
+        assert_eq!(handoff::Mailbox::answer(m, second), Some(0));
+        assert_eq!(handoff::Mailbox::pending(m), None);
     }
 }
 

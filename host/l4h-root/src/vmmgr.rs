@@ -37,6 +37,7 @@ pub const IO_POOL_DEFAULT: usize = 4 << 20;
 const EVENTS_VA: usize = crate::layout::VMMGR_PAGES.base;
 const STATUS_VA: usize = EVENTS_VA + PAGE;
 const RESULT_VA: usize = EVENTS_VA + 2 * PAGE;
+const ATTEST_EVENTS_VA: usize = EVENTS_VA + 3 * PAGE;
 /// dom0's control data area (the source of CTL_BLK_WRITE).
 pub const CTL_DATA_VA: usize = crate::layout::CTL_DATA.base;
 
@@ -83,7 +84,8 @@ impl Vmmgr {
 
     /// trustd answered guest `id`: vmmgr raises its device's event.
     pub fn attest_done(&self, id: usize) {
-        self.events().attest_done.fetch_or(1 << id, Ordering::AcqRel);
+        let attest = unsafe { &*(ATTEST_EVENTS_VA as *const proto::AttestEvents) };
+        attest.done.fetch_or(1 << id, Ordering::AcqRel);
         self.signal.signal();
     }
 
@@ -253,16 +255,25 @@ pub fn spawn(h: &mut Host, modules: &Modules, plan: &Dom0Plan) -> Vmmgr {
     }
     h.memd.map_status(&comp, &mut h.alloc, &mut arena, keep_slot());
     // The events page (both write), the status page (vmmgr writes), the
-    // result page (root writes), all host memory of root's.
+    // result page (root writes), the attestation page (root, trustd and
+    // vmmgr write), all host memory of root's.
+    let mut attest_frame = None;
     for (root_va, va, rights) in [
         (EVENTS_VA, proto::EVENTS_VA, CapRights::read_write()),
         (STATUS_VA, proto::STATUS_VA, CapRights::read_write()),
         (RESULT_VA, proto::RESULT_VA, CapRights::read_only()),
+        (ATTEST_EVENTS_VA, proto::ATTEST_EVENTS_VA, CapRights::read_write()),
     ] {
         let f = h.alloc.object_cap::<cap_type::Granule>(FRAME_BP);
+        if root_va == ATTEST_EVENTS_VA {
+            attest_frame = Some(f);
+        }
         let root_rights = if va == proto::STATUS_VA { CapRights::read_only() } else { CapRights::read_write() };
         map_in_root(h, f, root_va, root_rights);
         comp.map_copy(&mut h.alloc, &mut arena, &abs_of(f), va, rights, VmAttributes::DEFAULT, keep_slot());
+    }
+    if let Some(t) = &mut h.trustd {
+        t.connect_completions(&comp, &abs_of(attest_frame.unwrap()), &mut h.alloc);
     }
     // dom0's control data area: vmmgr maps it into every dom0.
     let ctl_cn = arena.object_cap::<cap_type::CNode>(&mut h.alloc, ObjectBlueprint::CNode { size_bits: proto::CTL_DATA_RADIX });

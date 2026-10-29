@@ -76,6 +76,17 @@ fn cstr(data: &[u8]) -> &[u8] {
     &data[..n]
 }
 
+fn exec_failed(op: u32, a: &[u64; 6]) -> ! {
+    let mut fail = *a;
+    fail[0] = host::vmmgr::KEXEC_FAIL;
+    let _ = root::host_op(op, &fail);
+    // root's reset path does not return. Never write a response through a
+    // destroyed dom0's control page if reset itself cannot complete.
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
 fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlResp) -> Result<(), i64> {
     let a = &req.args;
     match req.op {
@@ -96,6 +107,37 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
             // Root's free memory and memd's, and ours; the guests are ours.
             resp.vals[1] += h.alloc.local_free_bytes() as u64;
             resp.vals[4] = h.guests.iter().flatten().count() as u64;
+            Ok(())
+        }
+        abi::CTL_HOST_KEXEC_EXEC => {
+            let mut preflight = *a;
+            preflight[0] = host::vmmgr::KEXEC_PREFLIGHT;
+            resp.vals = root::host_op(req.op, &preflight)?;
+            let dom0 = h.guests.iter().flatten().find(|g| g.dom0).map(|g| g.id);
+            let teardown: Result<(), i64> = (|| {
+                for id in 0..MAX_GUESTS {
+                    if Some(id) != dom0 && h.guests[id].is_some() {
+                        h.destroy_guest(id)?;
+                    }
+                }
+                if let Some(id) = dom0 {
+                    h.destroy_guest(id)?;
+                }
+                Ok(())
+            })();
+            if teardown.is_err() {
+                exec_failed(req.op, a);
+            }
+            let mut exec = *a;
+            exec[0] = host::vmmgr::KEXEC_EXEC;
+            // Any return from EXEC is a failure to hand off, never a result
+            // to write through dom0's destroyed control page.
+            let _ = root::host_op(req.op, &exec);
+            exec_failed(req.op, a)
+        }
+        abi::CTL_HOST_KEXEC_LOAD => {
+            if h.guest(caller).and_then(|g| g.ctl_data()).is_none() { return Err(EINVAL); }
+            resp.vals = root::host_op(req.op, a)?;
             Ok(())
         }
         abi::CTL_IOMMU_INFO | abi::CTL_DISK_INFO | abi::CTL_BLK_INFO | abi::CTL_SWITCH_CREATE | abi::CTL_SWITCH_ATTACH_UPLINK

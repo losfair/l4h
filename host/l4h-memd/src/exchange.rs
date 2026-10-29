@@ -7,16 +7,16 @@ use crate::mem::{State, abs};
 use crate::{Client, EINVAL, ENOMEM, Memd, mr, set_mr, xchg};
 
 impl Memd {
-    /// MEMD_ALLOC: `count` blocks of 2^bits bytes into the exchange slots.
-    /// Root gets them, vmmgr copies.
-    pub(super) fn alloc(&mut self, c: Client, bits: usize, count: usize) -> u64 {
+    /// MEMD_ALLOC, each block in the physical `window`. Root gets the
+    /// blocks, vmmgr gets copies.
+    pub(super) fn alloc_in(&mut self, c: Client, bits: usize, count: usize, window: core::ops::Range<usize>) -> u64 {
         let k = match bits.checked_sub(BLOCK_BITS) {
             Some(k) if k < memd::ORDERS && count <= XCHG_SLOTS => k,
             _ => return EINVAL,
         };
         let mut got = [0u32; XCHG_SLOTS];
         for n in 0..count {
-            match self.mem.take(k, if c == Client::Root { State::Root } else { State::Vmmgr }) {
+            match self.mem.take_in(k, if c == Client::Root { State::Root } else { State::Vmmgr }, window.clone()) {
                 Some(i) => got[n] = i,
                 None => {
                     for &i in &got[..n] {

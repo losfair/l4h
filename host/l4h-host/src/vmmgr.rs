@@ -76,11 +76,14 @@ pub const STATUS_VA: usize = 0x5100_0030_0000;
 /// The result page: root writes a host op's data (`HOST_OP`), vmmgr
 /// reads it.
 pub const RESULT_VA: usize = 0x5100_0040_0000;
+/// The attestation page (`AttestEvents`), read-write: root and trustd
+/// set, vmmgr clears.
+pub const ATTEST_EVENTS_VA: usize = 0x5100_0050_0000;
 /// dom0's control data area, CTL_DATA_PAGES pages.
 pub const CTL_DATA_VA: usize = 0x5100_0100_0000;
 
-/// Badge of root's signals on vmmgr's bound notification: the events page
-/// has news.
+/// Badge of root's and trustd's signals on vmmgr's bound notification: the
+/// events or attestation page has news.
 pub const BADGE_ROOT_EVENT: u64 = 1 << 42;
 
 /// Calls from vmmgr to l4h-root, on its SLOT_ROOT_EP.  The reply's MR0 is
@@ -116,6 +119,12 @@ pub const VMMGR_TRUST_REGISTER: u64 = 0x104;
 /// vals; its data is in the result page.  The data area of dom0's control
 /// device is the source of CTL_BLK_WRITE.
 pub const VMMGR_HOST_OP: u64 = 0x105;
+/// VMMGR_HOST_OP's CTL_HOST_KEXEC_EXEC: vmmgr replaces dom0's first
+/// argument with its step. Check a staged image before destroying guests,
+/// hand off after, or reset when teardown failed.
+pub const KEXEC_EXEC: u64 = 0;
+pub const KEXEC_PREFLIGHT: u64 = 1;
+pub const KEXEC_FAIL: u64 = 2;
 
 /// Radix of the CNode of a netd port's frames.
 pub const PORT_RADIX: usize = 10;
@@ -123,10 +132,16 @@ pub const PORT_RADIX: usize = 10;
 /// What root has for vmmgr, on the events page.
 #[repr(C)]
 pub struct Events {
-    /// Bit g: trustd answered guest g, raise its attestation device's event.
-    pub attest_done: core::sync::atomic::AtomicU64,
     /// A serial monitor command (MONITOR_*), 0 once vmmgr took it.
     pub monitor: core::sync::atomic::AtomicU64,
+}
+
+/// Attestation completions, on a page of their own: trustd writes it too,
+/// and must not reach root's monitor commands.
+#[repr(C)]
+pub struct AttestEvents {
+    /// Bit g: trustd answered guest g, raise its attestation device's event.
+    pub done: core::sync::atomic::AtomicU64,
 }
 
 /// Monitor commands, (cmd << 32) | arg.

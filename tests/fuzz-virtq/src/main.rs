@@ -41,6 +41,10 @@ extern crate self as l4h_rt;
 
 #[path = "../../../host/l4h-host/src/blk.rs"]
 pub mod host_blk;
+/// What blk.rs uses from l4h_host's root.
+#[path = "../../../host/l4h-host/src/handoff.rs"]
+pub mod handoff;
+pub const SHARED_VA: usize = 0x2000_0000_0000;
 pub mod host {
     pub use crate::host_blk as blk;
     pub use crate::host_fixed as fixed;

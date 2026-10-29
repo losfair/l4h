@@ -46,7 +46,7 @@ for v in "${variants[@]}"; do
     read -r name _ <<<"$v"
     "$root/tools/mkefi.sh" "$out/l4h-$name.efi" \
         "$root/host/target/x86_64-sel4-roottask/debug/l4h-root.elf" \
-        "$root/build/sel4-$name/bin/kernel.elf"
+        "$root/build/sel4-$name/bin/kernel.elf" "$root/build/kernel-$name"
     cp "$root/build/sel4-$name/bin/kernel.elf" "$debug/l4h-debug-x86_64/kernel-$name.elf"
 done
 tar -C "$debug" -cJf "$out/l4h-debug-x86_64.tar.xz" l4h-debug-x86_64

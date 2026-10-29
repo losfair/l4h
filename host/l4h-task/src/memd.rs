@@ -60,7 +60,12 @@ impl MemdLink {
     /// An untouched Untyped of 2^bits bytes in local `slot`: its physical
     /// address, or None when the service cannot supply it.
     pub fn alloc(&self, bits: usize, slot: Slot) -> Option<usize> {
-        if self.call(memd::MEMD_ALLOC, &[bits as u64, 1]) != 0 {
+        self.alloc_in(bits, slot, 0..usize::MAX)
+    }
+
+    /// `alloc`, with the whole block in the physical `window`.
+    pub fn alloc_in(&self, bits: usize, slot: Slot, window: core::ops::Range<usize>) -> Option<usize> {
+        if self.call(memd::MEMD_ALLOC, &[bits as u64, 1, window.start as u64, window.end as u64]) != 0 {
             return None;
         }
         let paddr = sel4::with_ipc_buffer(|b| b.msg_regs()[1]) as usize;
