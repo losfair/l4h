@@ -163,3 +163,128 @@ fn dom0_partition_windows_preserve_offsets_and_reject_unsafe_ranges() {
     req.sector = w[0].sectors;
     assert_eq!(w[0].check_request(&req, pool(), 512, false), Err(STATUS_IOERR));
 }
+
+// Who may use which sectors: blk::Reservations with the attached clients,
+// as blkd decides it (formerly l4h-root's attachment_slot).
+
+const UNKNOWN: u64 = u64::MAX & !7;
+fn hold(unit: usize, start: u64, sectors: u64, read_only: bool) -> Hold {
+    Hold { unit, window: DiskWindow::new(start, sectors, UNKNOWN).unwrap(), read_only }
+}
+fn none(_: usize) -> Option<Hold> { None }
+
+#[test]
+fn an_unusable_whole_disk_reservation_keeps_every_range() {
+    let mut r = Reservations::<1>::new();
+    assert_eq!(r.reserve(&none, hold(0, 0, 0, false)), Ok(0));
+    for start in [0, 8, UNKNOWN - 8] {
+        for ro in [false, true] {
+            assert_eq!(r.slot(&none, &hold(0, start, 8, ro), false), Err(EBUSY));
+        }
+        assert!(!r.unattached(&none, 0, hold(0, start, 8, false).window));
+    }
+}
+
+#[test]
+fn only_dom0_can_claim_the_exact_reserved_range_even_when_table_is_full() {
+    let mut r = Reservations::<1>::new();
+    let w = hold(0, 8, 16, false);
+    assert_eq!(r.reserve(&none, w), Ok(0));
+    assert_eq!(r.slot(&none, &w, true), Ok(0));
+    for ro in [false, true] {
+        assert_eq!(r.slot(&none, &Hold { read_only: ro, ..w }, false), Err(EBUSY));
+        for other in [hold(0, 8, 8, ro), hold(0, 0, 32, ro)] {
+            assert_eq!(r.slot(&none, &other, true), Err(EBUSY));
+        }
+    }
+    // Another unit's same range is no claim, and the only slot is taken.
+    assert_eq!(r.slot(&none, &Hold { unit: 1, ..w }, true), Err(ENOSPC));
+}
+
+#[test]
+fn an_active_dom0_window_cannot_be_claimed_twice_and_returns_on_detach() {
+    let mut r = Reservations::<1>::new();
+    let w = hold(0, 8, 16, false);
+    r.reserve(&none, w).unwrap();
+    let active = |i: usize| (i == 0).then_some(w);
+    assert_eq!(r.slot(&active, &w, true), Err(EBUSY));
+    assert!(!r.unattached(&active, 0, w.window));
+    // Detached: the reservation still holds the range for dom0 alone.
+    assert_eq!(r.slot(&none, &w, false), Err(EBUSY));
+    assert_eq!(r.slot(&none, &w, true), Ok(0));
+    assert!(!r.unattached(&none, 0, w.window));
+}
+
+#[test]
+fn reservations_conflict_like_windows() {
+    let mut r = Reservations::<4>::new();
+    r.reserve(&none, hold(0, 0, 16, true)).unwrap();
+    // Read-only ranges may share sectors; a writable one may not.
+    assert_eq!(r.reserve(&none, hold(0, 8, 16, true)), Ok(1));
+    assert_eq!(r.reserve(&none, hold(0, 8, 8, false)), Err(EBUSY));
+    assert_eq!(r.reserve(&none, hold(1, 8, 8, false)), Ok(2));
+    assert_eq!(r.slot(&none, &hold(0, 24, 8, false), false), Ok(3));
+    assert!(r.unattached(&none, 0, hold(0, 24, 8, false).window));
+    assert!(!r.unattached(&none, 0, hold(0, 16, 8, false).window));
+}
+
+/// Random reserve, attach, detach and provisioning against a model that
+/// tracks the holders of each 4 KiB block.
+#[test]
+fn randomized_decisions_match_a_per_block_model() {
+    const N: usize = 6;
+    const BLOCKS: u64 = 12;
+    let mut state = 0x2545f4914f6cdd1du64;
+    let mut next = move |n: u64| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state % n
+    };
+    for _ in 0..2000 {
+        let mut r = Reservations::<N>::new();
+        let mut active: [Option<Hold>; N] = [None; N];
+        for _ in 0..40 {
+            let first = next(BLOCKS);
+            let want = Hold {
+                unit: next(2) as usize,
+                window: DiskWindow { start: first * 8, sectors: (1 + next(BLOCKS - first)) * 8 },
+                read_only: next(2) == 0,
+            };
+            let dom0 = next(2) == 0;
+            let blocks = |h: &Hold| h.window.start / 8..(h.window.start + h.window.sectors) / 8;
+            let shares = |h: &Hold| h.unit == want.unit && blocks(h).any(|b| blocks(&want).contains(&b));
+            let expect = |dom0: bool| {
+                let claimable = |i: usize| dom0 && active[i].is_none()
+                    && r.slots[i].is_some_and(|h| h.unit == want.unit && h.window == want.window);
+                // Holders of the wanted blocks that exclude it: clients, and
+                // reservations that are neither claimed nor claimable now.
+                let excluded = (0..N).any(|i| {
+                    let holder = active[i].or(r.slots[i].filter(|_| !claimable(i)));
+                    holder.is_some_and(|h| shares(&h) && !(h.read_only && want.read_only))
+                });
+                if excluded { return Err(EBUSY); }
+                (0..N).find(|&i| claimable(i))
+                    .or_else(|| (0..N).find(|&i| active[i].is_none() && r.slots[i].is_none())).ok_or(ENOSPC)
+            };
+            let lookup = |i: usize| active[i];
+            match next(4) {
+                0 => {
+                    let expected = expect(false);
+                    assert_eq!(r.reserve(&lookup, want), expected);
+                    if let Ok(i) = expected { assert_eq!(r.slots[i], Some(want)); }
+                }
+                1 => {
+                    let got = r.slot(&lookup, &want, dom0);
+                    assert_eq!(got, expect(dom0));
+                    if let Ok(i) = got { active[i] = Some(want); }
+                }
+                2 => active[next(N as u64) as usize] = None,
+                _ => {
+                    let held = (0..N).flat_map(|i| [active[i], r.slots[i]]).flatten().any(|h| shares(&h));
+                    assert_eq!(r.unattached(&lookup, want.unit, want.window), !held);
+                }
+            }
+        }
+    }
+}

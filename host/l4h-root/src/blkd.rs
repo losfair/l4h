@@ -81,7 +81,8 @@ pub struct Controller {
     /// Frames of the BARs the driver uses, carved once.
     bars: BarCache,
     /// blkd's client channels, shared by the controller's disks: this
-    /// controller's row of CLIENTS.
+    /// controller's row of CLIENTS.  What root attached and reserved, for
+    /// teardown and reports; blkd decides who may use which sectors.
     pub clients: &'static mut [Option<Attachment>; blk::MAX_CLIENTS],
     /// Reset, provisioning or drain failed: the device may still access
     /// its DMA targets, so it is quarantined until host reboot.
@@ -148,10 +149,38 @@ impl Controller {
     }
 
     /// Keep boot ranges owned even when dom0 has no live disk channel.
-    pub fn reserve_dom0(&mut self, disk: usize, window: blk::DiskWindow, read_only: bool) {
-        let i = attachment_slot(self.clients, disk, window, read_only, false)
-            .expect("conflicting or excessive dom0 disk reservations");
+    /// blkd holds the reservation; a failed controller, which serves
+    /// nothing, only lists it.
+    pub fn reserve_dom0(&mut self, disk: usize, unit: u64, window: blk::DiskWindow, read_only: bool) {
+        let i = match self.driver.as_ref().filter(|_| !self.failed) {
+            Some(driver) => call(driver.comp.service_ep, blk::BLKD_RESERVE,
+                &[unit, window.start, window.sectors, read_only as u64]) as usize,
+            None => self.clients.iter().position(Option::is_none).unwrap_or(usize::MAX),
+        };
+        assert!(i < blk::MAX_CLIENTS && self.clients[i].is_none(), "conflicting or excessive dom0 disk reservations");
         self.clients[i] = Some(Attachment { vm: 0, disk, window, read_only, reserved: true, pool: None });
+    }
+
+    /// Ask blkd whether `unit` can attach `start`, `sectors` (0: to the
+    /// end) for a guest, dom0 or not: the slot to attach in and the
+    /// window (and whether it is read-only), or the errno it refuses with.
+    /// EIO if blkd has failed or names a slot root cannot use (the
+    /// controller is then quarantined).
+    pub fn check(&mut self, unit: u64, start: u64, sectors: u64, read_only: bool, dom0: bool, pci: &Pci)
+        -> Result<(usize, blk::DiskWindow, bool), i64> {
+        let ep = self.driver.as_ref().expect("started blkd").comp.service_ep;
+        let r = call(ep, blk::BLKD_CHECK, &[unit, start, sectors, read_only as u64, dom0 as u64]);
+        let i = crate::mr(1) as usize;
+        // A slot that is free, or a reservation without a client.
+        let usable = i < blk::MAX_CLIENTS && self.clients[i].as_ref().is_none_or(|a| a.pool.is_none());
+        match r {
+            0 if usable => Ok((i, blk::DiskWindow { start, sectors: crate::mr(2) }, crate::mr(3) != 0)),
+            0 | u64::MAX => {
+                quarantine(self, pci);
+                Err(crate::ctl::EIO)
+            }
+            errno => Err(errno as i64),
+        }
     }
 
     /// Ask blkd about `unit`: (disk geometry, number of units), None if
@@ -233,24 +262,6 @@ pub struct Attachment {
     reserved: bool,
     /// The active client's I/O pool; None for an unattached reservation.
     pool: Option<(usize, usize)>,
-}
-
-impl Attachment {
-    fn claimable(&self, disk: usize, window: blk::DiskWindow, dom0: bool) -> bool {
-        dom0 && self.reserved && self.pool.is_none() && self.disk == disk && self.window == window
-    }
-}
-
-/// A reservation can only be claimed by dom0 for exactly its planned range.
-/// Other attachments and provisioning still see it as an occupied window.
-pub fn attachment_slot(clients: &[Option<Attachment>], disk: usize, window: blk::DiskWindow,
-    read_only: bool, dom0: bool) -> Result<usize, i64> {
-    if clients.iter().flatten().any(|a| a.disk == disk
-        && window.conflicts(read_only, a.window, a.read_only) && !a.claimable(disk, window, dom0)) {
-        return Err(crate::ctl::EBUSY);
-    }
-    clients.iter().position(|a| a.as_ref().is_some_and(|a| a.claimable(disk, window, dom0)))
-        .or_else(|| clients.iter().position(Option::is_none)).ok_or(crate::ctl::ENOSPC)
 }
 
 struct Blkd {
@@ -407,14 +418,13 @@ fn call(ep: cap::Endpoint, label: u64, args: &[u64]) -> u64 {
     crate::mr(0)
 }
 
-/// Attach a checked window of host disk `disk` to one client of its
-/// running shared controller.  Returns the client, the channel frames (the
-/// client's) and a kick capability (in a slot of its own) for the client's
-/// l4h-vmm.
+/// Attach a window of host disk `disk` that blkd allowed in slot `i`
+/// (Controller::check) to one client of its running shared controller.
+/// Returns the channel frames (the client's) and a kick capability (in a
+/// slot of its own) for the client's l4h-vmm.
 #[allow(clippy::too_many_arguments)]
-pub fn attach(ctrl: &mut Controller, disk: usize, client: &mut RootGuest,
-    window: blk::DiskWindow, read_only: bool, alloc: &mut Alloc, iommu: &mut Iommu) -> (usize, Channel, cap::Notification) {
-    let i = attachment_slot(ctrl.clients, disk, window, read_only, client.dom0).expect("checked block client");
+pub fn attach(ctrl: &mut Controller, i: usize, disk: usize, client: &mut RootGuest,
+    window: blk::DiskWindow, read_only: bool, alloc: &mut Alloc, iommu: &mut Iommu) -> (Channel, cap::Notification) {
     let reserved = ctrl.clients[i].as_ref().is_some_and(|a| a.reserved);
     let driver = ctrl.driver.as_mut().expect("started blkd");
     let chan: Channel = (0..blk::CHANNEL_PAGES)
@@ -435,7 +445,7 @@ pub fn attach(ctrl: &mut Controller, disk: usize, client: &mut RootGuest,
     let pool = (client.pool.paddr, client.pool.size);
     iommu.map(alloc, ctrl.dom, pool.0, pool.1, true);
     ctrl.clients[i] = Some(Attachment { vm: client.id, disk, window, read_only, reserved, pool: Some(pool) });
-    (i, chan, kick)
+    (chan, kick)
 }
 
 /// The frames of a client's channel.
@@ -456,7 +466,8 @@ pub fn activate(ctrl: &mut Controller, unit: u64, i: usize, client: &RootGuest, 
             gpa: client.pool.gpa as u64, paddr: client.pool.paddr as u64, size: client.pool.size as u64,
         });
     });
-    if call(ctrl.driver.as_ref().unwrap().comp.service_ep, blk::BLKD_ADD, &[i as u64, unit]) != 0 {
+    let dom0 = client.dom0 as u64;
+    if call(ctrl.driver.as_ref().unwrap().comp.service_ep, blk::BLKD_ADD, &[i as u64, unit, dom0]) != 0 {
         quarantine(ctrl, pci);
         return Err(crate::ctl::EIO);
     }
@@ -489,20 +500,14 @@ pub fn remove(disk: &mut Controller, i: usize, pci: &Pci, iommu: &mut Iommu) -> 
     quiet || disk.dom != Domain::NONE
 }
 
-/// Provision an unattached range of host disk `index`. Data copies occur
+/// Provision an unattached range of host disk `dk`. Data copies occur
 /// only during seeding. A zero-length request flushes the disk. Never
-/// trust discard to zero.
-#[allow(clippy::too_many_arguments)]
-pub fn write(ctrl: &mut Controller, index: usize, dk: &Disk, sector: u64, len: usize, from: Option<*const u8>,
+/// trust discard to zero. blkd refuses ranges anything holds.
+pub fn write(ctrl: &mut Controller, dk: &Disk, sector: u64, len: usize, from: Option<*const u8>,
     pci: &Pci, win: &mut Window) -> Result<(), i64> {
     if ctrl.failed { return Err(crate::ctl::EIO); }
-    if dk.read_only { return Err(crate::ctl::EPERM); }
+    // The staging buffer's size bounds the copy.
     if len > blk::STAGING_SIZE { return Err(crate::ctl::EINVAL); }
-    if len != 0 {
-        let w = blk::DiskWindow::new(sector, (len / 512) as u64, dk.capacity).ok_or(crate::ctl::EINVAL)?;
-        if len % 4096 != 0 { return Err(crate::ctl::EINVAL); }
-        if ctrl.attachments(index).any(|(_, a)| a.window.overlaps(w)) { return Err(crate::ctl::EBUSY); }
-    }
     let disk = ctrl;
     let driver = disk.driver.as_ref().unwrap();
     for (i, s) in driver.staging.clone().take(len.div_ceil(PAGE)).enumerate() {
@@ -518,6 +523,7 @@ pub fn write(ctrl: &mut Controller, index: usize, dk: &Disk, sector: u64, len: u
         call(driver.comp.service_ep, blk::BLKD_WRITE, &[sector, len as u64, dk.unit])
     };
     if status == 0 { return Ok(()); }
+    if status == blk::BLKD_REFUSED { return Err(crate::mr(1) as i64); }
     if status == u64::MAX {
         quarantine(disk, pci);
     }

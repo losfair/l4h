@@ -470,26 +470,23 @@ fn guest_del(h: &mut Host, id: usize) -> Result<Vals, i64> {
 
 /// VMMGR_DISK_ATTACH: pass host disk `disk` (or sectors [lba_start,
 /// lba_start + lba_count) of it; 0 = to the end) through to the guest.
-/// The window must be aligned to blkd::WINDOW_ALIGN sectors.
+/// blkd decides whether the window may attach, and in which slot.
 fn disk_attach(h: &mut Host, a: [u64; 8]) -> Result<Vals, i64> {
     let id = guest_arg(a[0])?;
     let (dev, disk, read_only, lba_start, lba_count) = (a[1] as usize, a[2] as usize, a[3] != 0, a[4], a[5]);
-    if dev >= MAX_GUEST_DEVICES || lba_start % crate::blkd::WINDOW_ALIGN != 0 || lba_count % crate::blkd::WINDOW_ALIGN != 0 {
+    if dev >= MAX_GUEST_DEVICES {
         return Err(ctl::EINVAL);
     }
     h.ensure_disk(disk)?;
     let (c, unit) = (h.disks[disk].ctrl, h.disks[disk].unit);
-    let ctrl = &h.ctrls[c];
-    let window = l4h_host::blk::DiskWindow::new(lba_start, lba_count, h.disks[disk].capacity).ok_or(ctl::EINVAL)?;
-    let read_only = read_only || h.disks[disk].read_only;
     let dom0 = h.guests[id].as_ref().ok_or(ctl::ENOENT)?.dom0;
-    crate::blkd::attachment_slot(ctrl.clients, disk, window, read_only, dom0)?;
+    let (client, window, read_only) = h.ctrls[c].check(unit, lba_start, lba_count, read_only, dom0, &h.pci)?;
     if !h.can_afford(1 << 20, 0, 0) { return Err(ctl::ENOMEM); }
     with_guest(h, id, |h, g| {
         if g.disks.is_full() {
             return Err(ctl::ENOSPC);
         }
-        let (client, chan, kick) = crate::blkd::attach(&mut h.ctrls[c], disk, g, window, read_only, &mut h.alloc, &mut h.iommu);
+        let (chan, kick) = crate::blkd::attach(&mut h.ctrls[c], client, disk, g, window, read_only, &mut h.alloc, &mut h.iommu);
         g.disks.must_push((c, client));
         crate::blkd::activate(&mut h.ctrls[c], unit, client, g, &chan, &mut h.wins.a, &h.pci)?;
         for (i, f) in chan.iter().enumerate() {
