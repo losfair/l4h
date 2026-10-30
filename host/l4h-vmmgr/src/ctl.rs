@@ -32,6 +32,13 @@ const _: () = assert!(!HOST_VERSION.is_empty() && HOST_VERSION.len() <= abi::CTL
 pub fn handle(h: &mut Vmmgr, caller: usize) {
     let Some(page) = h.guest(caller).and_then(|g| g.ctl_page()) else { return };
     let mut req = unsafe { (page as *const abi::CtlReq).read_volatile() };
+    // These are the data-bearing operations in this ABI. Unknown ops and
+    // versions still erase data, so future secret-bearing calls default safe.
+    let wipe_data = req.version != abi::CTL_VERSION || match req.op {
+        abi::CTL_VM_CREATE | abi::CTL_VM_START | abi::CTL_BLK_ATTACH | abi::CTL_CONSOLE_WRITE => true,
+        abi::CTL_HOST_INFO..=abi::CTL_LOG_READ => false,
+        _ => true,
+    };
     let mut resp = abi::CtlResp { status: 0, vals: [0; 6], data: [0; abi::CTL_DATA_MAX] };
     resp.status = if req.version != abi::CTL_VERSION {
         -EINVAL
@@ -42,11 +49,12 @@ pub fn handle(h: &mut Vmmgr, caller: usize) {
         }
     };
     host::wipe::words(&mut req.args);
-    host::wipe::bytes(&mut req.data);
-    // Clear every request's arguments/data, including errors. The guest
+    if wipe_data { host::wipe::bytes(&mut req.data); }
+    // Always clear arguments, and data when present, including errors. The guest
     // driver still reads the public op header after completion (GPU_READ).
     let args_off = core::mem::offset_of!(abi::CtlReq, args);
-    unsafe { host::wipe::raw(page.add(args_off), core::mem::size_of::<abi::CtlReq>() - args_off); }
+    let bytes = core::mem::size_of_val(&req.args) + if wipe_data { abi::CTL_DATA_MAX } else { 0 };
+    unsafe { host::wipe::raw(page.add(args_off), bytes); }
     unsafe { (page.add(abi::CTL_RESP_OFF) as *mut abi::CtlResp).write_volatile(resp) };
 }
 

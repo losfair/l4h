@@ -167,3 +167,30 @@ fn bounce_exhaustion_fragmentation_and_completion_reuse() {
     assert_eq!(b.alloc(3 << 20).unwrap().offset(), 0);
     b.free(runs[3]);
 }
+
+#[test]
+fn bounce_word_runs_match_first_fit_across_boundaries_and_fragmentation() {
+    let mut b = bounce::Bounce::new();
+    let mut used = vec![false; bounce::SIZE / 4096];
+    let mut live = Vec::new();
+    let mut seed = 13u32;
+    for step in 0..8000 {
+        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        if !live.is_empty() && seed & 3 == 0 {
+            let (run, pages) = live.swap_remove(seed as usize % live.len());
+            b.free(run);
+            used[run.offset() / 4096..run.offset() / 4096 + pages].fill(false);
+        } else {
+            let pages = match step % 8 { 0 => 1, 1 => 63, 2 => 64, 3 => 65, _ => seed as usize % 1024 + 1 };
+            let expected = used.windows(pages).position(|run| run.iter().all(|&v| !v));
+            let result = b.alloc(pages * 4096 - (step % 4096));
+            assert_eq!(result.map(|r| r.offset() / 4096), expected, "step {step}, {pages} pages");
+            if let Some(run) = result {
+                used[run.offset() / 4096..run.offset() / 4096 + pages].fill(true);
+                live.push((run, pages));
+            }
+        }
+    }
+    for (run, _) in live { b.free(run); }
+    assert_eq!(b.alloc(bounce::SIZE).unwrap().offset(), 0);
+}

@@ -30,6 +30,9 @@ for signature in ['static long mem_call(', 'static void memhp_work_fn(struct wor
 blkd = (root / 'host/l4h-blkd/src/main.rs').read_text()
 start = blkd.index('use core::ops::{Deref, DerefMut};')
 (out / 'blkd-main.inc').write_text(blkd[start:])
+start = blkd.index('/// A physically contiguous piece of a request\'s data.')
+end = blkd.index('/// The controller\'s driver.')
+(out / 'blk-driver.inc').write_text(blkd[start:end])
 # Keep the production boot sequence and reservation lifecycle intact.
 vmmgr = (root / 'host/l4h-vmmgr/src/main.rs').read_text()
 start = vmmgr.index('pub fn boot_dom0(')
@@ -57,7 +60,7 @@ end = guest.index('    let ram_base = cfg.ram_base;', start)
 (out / 'guest-pool-config.inc').write_text('fn validate(cfg: &GuestConfig, kernel: &Kernel) -> Result<(), Option<()>> {\n' + guest[start:end] + 'Ok(())\n}\n')
 cli = (root / 'tools/l4hctl/src/lib.rs').read_text()
 parts = []
-for signature in ['    pub fn call(&self, op:', '    fn call_buf(', '    fn raw_call(', '    pub fn blk_attach(', '    fn attach_disk(', '    pub fn vm_destroy(', '    pub fn create_vm_with_keys(']:
+for signature in ['    pub fn call(&self, op:', '    fn call_buf(', '    fn raw_call(', '    pub fn blk_attach(', '    fn require_disk_encryption(', '    fn attach_disk(', '    pub fn vm_destroy(', '    pub fn create_vm_with_keys(']:
     start = cli.index(signature)
     end = cli.index('\n    }', start) + 6
     parts.append(cli[start:end])
@@ -106,6 +109,12 @@ L4H_BLKD_TEST_SRC="$out/blkd-main.inc" rustc +stable --edition=2024 --test -L de
     --extern l4h_host="$out/libl4h_host.rlib" \
     "$root/tests/blk-ipc.rs" -o "$out/blk-ipc-tests"
 "$out/blk-ipc-tests"
+rustc +stable --edition=2024 --crate-name l4h_virtio --crate-type rlib \
+    "$root/host/l4h-virtio/src/lib.rs" -o "$out/libl4h_virtio.rlib"
+L4H_BLK_DRIVER_TEST_SRC="$out/blk-driver.inc" rustc +stable --edition=2024 --test -L dependency="$out" \
+    --extern l4h_host="$out/libl4h_host.rlib" --extern l4h_virtio="$out/libl4h_virtio.rlib" \
+    "$root/tests/virtio-blk-limits.rs" -o "$out/virtio-blk-limits-tests"
+"$out/virtio-blk-limits-tests"
 L4H_GUEST_POOL_TEST_SRC="$out/guest-pool-config.inc" rustc +stable --edition=2024 --test -L dependency="$out" \
     --extern l4h_abi="$out/libl4h_abi.rlib" --extern l4h_host="$out/libl4h_host.rlib" \
     "$root/tests/guest-pool-layout.rs" -o "$out/guest-pool-tests"

@@ -51,6 +51,7 @@ unsafe fn ioctl(_: i32, _: u64, call: *const Call) -> i32 {
                 resp.vals[0] = s.applied.unwrap_or(req.args[2] & s.flags.unwrap_or(0));
             }
             CTL_VM_CREATE => resp.vals[0] = 1,
+            CTL_VM_START => {},
             CTL_VM_DESTROY => {
                 assert_eq!(req.args[0], 1);
                 resp.status = s.destroy_error;
@@ -109,7 +110,7 @@ fn unconfirmed_attach_destroys_the_vm_once_and_reports_cleanup_failure() {
             if destroy_error != 0 { assert!(error.0.contains("failed to destroy VM 1")); }
             else if !creating { assert!(error.0.contains("VM 1 destroyed")); }
             SERVER.with_borrow(|s| {
-                let expected = if creating { vec![CTL_VM_CREATE, CTL_HOST_VERSION, CTL_BLK_ATTACH, CTL_VM_DESTROY] }
+                let expected = if creating { vec![CTL_HOST_VERSION, CTL_VM_CREATE, CTL_BLK_ATTACH, CTL_VM_DESTROY] }
                     else { vec![CTL_HOST_VERSION, CTL_BLK_ATTACH, CTL_VM_DESTROY] };
                 assert_eq!(s.calls, expected, "cleanup belongs to exactly one caller, and must precede any VM start");
                 assert_eq!(s.attached, usize::from(destroy_error != 0));
@@ -125,4 +126,24 @@ fn rejected_standalone_attach_does_not_destroy_the_vm() {
     let c = Ctl { dev: Dev };
     assert!(c.blk_attach(1, 2, 0, 8, 16, Some(&[0x5a; 64])).is_err());
     SERVER.with_borrow(|s| { assert_eq!(s.calls, [CTL_HOST_VERSION, CTL_BLK_ATTACH]); assert_eq!(s.attached, 0); });
+}
+
+#[test]
+fn creation_checks_support_once_before_allocating_a_vm() {
+    let c = Ctl { dev: Dev };
+    let spec = VmSpec { name: "test", mem: 256 << 20, vcpus: 1, initrd: &[], cmdline: "",
+        disks: vec![(2, 0, 8, 16), (3, 0, 8, 16), (4, 0, 8, 16)], io_pool: 0, nics: vec![], gpu: None };
+    let keys = [Some(DiskKey([0x5a; 64])), None, Some(DiskKey([0x5b; 64]))];
+    for flags in [None, Some(0)] {
+        SERVER.set(Server { flags, ..Default::default() });
+        assert!(c.create_vm_with_keys(&spec, &keys).is_err());
+        SERVER.with_borrow(|s| assert_eq!(s.calls, [CTL_HOST_VERSION], "unsupported hosts must not allocate a VM"));
+    }
+    SERVER.set(Server { flags: Some(BLK_ENCRYPT), ..Default::default() });
+    c.create_vm_with_keys(&spec, &keys).unwrap();
+    SERVER.with_borrow(|s| assert_eq!(s.calls,
+        [CTL_HOST_VERSION, CTL_VM_CREATE, CTL_BLK_ATTACH, CTL_BLK_ATTACH, CTL_BLK_ATTACH, CTL_VM_START]));
+    SERVER.set(Server::default());
+    c.create_vm_with_keys(&spec, &[]).unwrap();
+    SERVER.with_borrow(|s| assert_eq!(s.calls, [CTL_VM_CREATE, CTL_BLK_ATTACH, CTL_BLK_ATTACH, CTL_BLK_ATTACH, CTL_VM_START]));
 }

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # AES-XTS and bounce writes through virtio-blk, NVMe (512/4Kn) or SCSI.
 # CRYPTBLK_DEV=virtio|nvme|scsi, CRYPTBLK_LBA=512|4096; both architectures.
+# CRYPTBLK_QUEUE_SIZE sets the virtio queue size to exercise segment limits.
 # L4H_TEST_KERNEL may supply an already-built compatible guest kernel.
 # CRYPTBLK_NOAES=1 checks EOPNOTSUPP on a CPU with AES masked out.
 set -euo pipefail
@@ -49,7 +50,7 @@ case "${CRYPTBLK_DEV:-virtio}" in
     nvme) dev=(-device "nvme,drive=d0,serial=crypt,logical_block_size=$lba,physical_block_size=$lba") ;;
     scsi) dev=(-device "virtio-scsi-pci,id=s0,disable-legacy=on"
                -device "scsi-hd,drive=d0,bus=s0.0,logical_block_size=$lba,physical_block_size=$lba") ;;
-    virtio) dev=(-device "virtio-blk-pci,drive=d0,disable-legacy=on,logical_block_size=$lba,physical_block_size=$lba") ;;
+    virtio) dev=(-device "virtio-blk-pci,drive=d0,disable-legacy=on,logical_block_size=$lba,physical_block_size=$lba${CRYPTBLK_QUEUE_SIZE:+,queue-size=$CRYPTBLK_QUEUE_SIZE}") ;;
     *) echo 'unsupported CRYPTBLK_DEV' >&2; exit 1 ;;
 esac
 "$l4h_qemu" "$root/host/target/$l4h_target/debug/l4h-root.elf" \

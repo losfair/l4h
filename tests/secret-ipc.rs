@@ -138,8 +138,10 @@ mod control {
     }
     include!(env!("L4H_CONTROL_HANDLE_TEST_SRC"));
     #[test]
-    fn every_control_payload_is_erased_without_touching_header_sync_or_response() {
-        for op in [abi::CTL_BLK_ATTACH, abi::CTL_GPU_READ, 999] {
+    fn control_cleanup_skips_unused_data_and_preserves_header_sync_and_response() {
+        for (op, has_data) in [(abi::CTL_BLK_ATTACH, true), (abi::CTL_VM_CREATE, true), (abi::CTL_VM_START, true),
+            (abi::CTL_CONSOLE_WRITE, true), (abi::CTL_HOST_INFO, false), (abi::CTL_VM_LIST, false),
+            (abi::CTL_CONSOLE_READ, false), (abi::CTL_GPU_READ, false), (999, true)] {
             for (version, fail) in [(abi::CTL_VERSION, false), (abi::CTL_VERSION, true), (abi::CTL_VERSION + 1, false)] {
                 let mut page = Box::new([0xabababababababab_u64; 512]);
                 let ptr = page.as_mut_ptr().cast::<u8>();
@@ -148,7 +150,10 @@ mod control {
                 let bytes = unsafe { std::slice::from_raw_parts(ptr, abi::CTL_RESP_OFF) };
                 assert_eq!(&bytes[..4], &op.to_ne_bytes(), "the guest driver reads op after completion");
                 assert_eq!(&bytes[4..8], &version.to_ne_bytes());
-                assert!(bytes[8..abi::CTL_SYNC_OFF].iter().all(|&b| b == 0));
+                let data_off = core::mem::offset_of!(abi::CtlReq, data);
+                assert!(bytes[8..data_off].iter().all(|&b| b == 0));
+                let expected = if has_data || version != abi::CTL_VERSION { 0 } else { 0x5a };
+                assert!(bytes[data_off..abi::CTL_SYNC_OFF].iter().all(|&b| b == expected));
                 assert!(bytes[abi::CTL_SYNC_OFF..].iter().all(|&b| b == 0xab));
                 let resp = unsafe { &*ptr.add(abi::CTL_RESP_OFF).cast::<abi::CtlResp>() };
                 assert_eq!(resp.status, if version != abi::CTL_VERSION { -22 } else if fail { -95 } else { 0 });

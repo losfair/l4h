@@ -5,6 +5,20 @@ use blk::*;
 
 fn pool() -> Pool { Pool { gpa: 0x8000000, paddr: 0x10000000, size: 4 << 20 } }
 fn window() -> DiskWindow { DiskWindow::new(2048, 16384, 131072).unwrap() }
+
+#[test]
+fn to_end_windows_reject_partial_encryption_units_after_resolving_capacity() {
+    for capacity in [1_000_005, 1025, 7] {
+        for start in [0, 8, 2048] {
+            assert!(DiskWindow::new(start, 0, capacity).is_none());
+        }
+    }
+    let w = DiskWindow::new(8, 0, 1_000_000).unwrap();
+    assert_eq!(w.sectors, 999_992);
+    assert_eq!(w.sectors % 8, 0);
+    // The caller can explicitly select an aligned range on an odd-sized disk.
+    assert_eq!(DiskWindow::new(8, 999_992, 1_000_005), Some(w));
+}
 fn request() -> Req {
     let mut req = Req { op: OP_READ, nr_segs: 1, ..Default::default() };
     req.segs[0] = Seg { gpa: pool().gpa, len: 4096, flags: SEG_WRITE };

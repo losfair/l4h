@@ -8,6 +8,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use l4hctl::*;
 
+fn set_disk_key(key: &mut Option<DiskKey>, path: &str) -> Result<()> {
+    if key.is_some() { return err("a key was already specified for this disk"); }
+    *key = Some(DiskKey::read(path)?);
+    Ok(())
+}
+
 struct CreateOpts {
     name: String,
     mem: u64,
@@ -346,7 +352,7 @@ fn run(args: &[String]) -> Result<i32> {
                 match a.as_str() {
                     "--start" => start = parse_num(val)?,
                     "--sectors" => sectors = parse_num(val)?,
-                    "--key-file" => key = Some(DiskKey::read(val)?),
+                    "--key-file" => set_disk_key(&mut key, val)?,
                     _ => return err(format!("blk-attach: unknown option {a}")),
                 }
             }
@@ -444,7 +450,7 @@ fn run(args: &[String]) -> Result<i32> {
                     }
                     "--key-file" => {
                         let key = o.disk_keys.last_mut().ok_or(Error("--key-file must follow --disk".into()))?;
-                        *key = Some(DiskKey::read(&val()?)?);
+                        set_disk_key(key, &val()?)?;
                     }
                     "--nic" => {
                         // SWITCH[,mac=MAC][,nolock][,isolated]
@@ -709,6 +715,16 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_second_key_cannot_replace_the_preceding_disks_key() {
+        let mut key = Some(DiskKey(core::array::from_fn(|i| i as u8)));
+        // Reject before trying to read the replacement, regardless of
+        // whether the first key came from key-file= or --key-file.
+        let e = set_disk_key(&mut key, "/nonexistent/second-key").unwrap_err();
+        assert!(e.0.contains("already specified"));
+        assert_eq!(key.unwrap().0, core::array::from_fn(|i| i as u8));
+    }
 
     #[test]
     fn disk_key_paths_are_not_options_or_read_only_suffixes() {

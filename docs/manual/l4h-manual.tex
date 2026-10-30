@@ -1393,11 +1393,15 @@ identifies \texttt{aes-ni} or \texttt{armv8-ce}. Read-only shared encrypted
 windows must use the same starting sector and key. Destroy drains I/O
 and erases the driver's expanded keys.
 The CLI checks the host's encryption support before attaching a keyed disk.
-On older hosts it fails without adding a disk to the VM.
+Creation checks once for all keyed disks, before allocating the VM.
+On older hosts it fails without adding a disk or creating a VM.
 If the host advertises support but does not confirm encryption on a
 successful attach, the CLI destroys the unstarted VM and reports the
 failure. This also removes its other attachments; there is no per-disk
 detach operation.
+A second key option for the same disk is rejected. A window extending to
+the end of a disk must still resolve to a multiple of eight sectors;
+otherwise attach fails. Select an explicit aligned size on such disks.
 
 The on-disk format is raw AES-256-XTS, with 4 KiB data units and
 little-endian unit numbers relative to the window. To open the same

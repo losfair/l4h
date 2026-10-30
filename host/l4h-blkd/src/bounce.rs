@@ -13,21 +13,40 @@ impl Bounce {
         if bytes == 0 || bytes > SIZE { return None; }
         let pages = bytes.div_ceil(PAGE);
         let mut free = 0;
-        for i in 0..SIZE / PAGE {
-            if self.used[i / 64] & (1 << (i % 64)) != 0 { free = 0; continue; }
-            free += 1;
-            if free == pages {
-                let first = i + 1 - pages;
-                for p in first..=i { self.used[p / 64] |= 1 << (p % 64); }
-                return Some(Run { first: first as u16, pages: pages as u16 });
+        for word in 0..self.used.len() {
+            let mut bit = 0;
+            while bit < 64 {
+                let tail = self.used[word] >> bit;
+                if tail & 1 != 0 {
+                    free = 0;
+                    bit += (tail.trailing_ones() as usize).min(64 - bit);
+                } else {
+                    let n = (tail.trailing_zeros() as usize).min(64 - bit);
+                    free += n;
+                    bit += n;
+                    if free >= pages {
+                        let run = Run { first: (word * 64 + bit - free) as u16, pages: pages as u16 };
+                        self.mark(run, true);
+                        return Some(run);
+                    }
+                }
             }
         }
         None
     }
     pub fn free(&mut self, run: Run) {
-        for p in run.first as usize..(run.first + run.pages) as usize {
-            debug_assert_ne!(self.used[p / 64] & (1 << (p % 64)), 0);
-            self.used[p / 64] &= !(1 << (p % 64));
+        self.mark(run, false);
+    }
+    fn mark(&mut self, run: Run, used: bool) {
+        let first = run.first as usize;
+        let end = first + run.pages as usize;
+        for word in first / 64..end.div_ceil(64) {
+            let lo = first.saturating_sub(word * 64);
+            let hi = (end - word * 64).min(64);
+            let mask = (u64::MAX << lo) & (u64::MAX >> (64 - hi));
+            debug_assert_eq!(self.used[word] & mask, if used { 0 } else { mask });
+            if used { self.used[word] |= mask; }
+            else { self.used[word] &= !mask; }
         }
     }
 }

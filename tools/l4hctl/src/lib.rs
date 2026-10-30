@@ -539,6 +539,7 @@ impl Ctl {
     /// Omitted entries attach plain disks. Keys never enter the VM.
     pub fn create_vm_with_keys(&self, o: &VmSpec, keys: &[Option<DiskKey>]) -> Result<(u64, Vec<u64>)> {
         if keys.len() > o.disks.len() { return err("more disk keys than disks"); }
+        if keys.iter().any(Option::is_some) { self.require_disk_encryption()?; }
         let mut name = [0u8; CTL_NAME_MAX];
         let n = o.name.len().min(CTL_NAME_MAX - 1);
         name[..n].copy_from_slice(&o.name.as_bytes()[..n]);
@@ -704,16 +705,22 @@ impl Ctl {
     /// If a successful attach does not confirm encryption, destroy the VM
     /// so the unconfirmed disk cannot be started accidentally.
     pub fn blk_attach(&self, vm: u64, disk: u64, flags: u64, start: u64, sectors: u64, key: Option<&[u8; 64]>) -> Result<()> {
+        if key.is_some() { self.require_disk_encryption()?; }
         self.attach_disk(vm, disk, flags, start, sectors, key, true)
     }
 
-    fn attach_disk(&self, vm: u64, disk: u64, flags: u64, start: u64, sectors: u64, key: Option<&[u8; 64]>, destroy_on_mismatch: bool) -> Result<()> {
-        let encrypt = if key.is_some() { BLK_ENCRYPT } else { 0 };
+    fn require_disk_encryption(&self) -> Result<()> {
         // Older hosts have no per-disk detach operation, and the oldest
-        // ignore unknown flags. Check support before attaching.
-        if encrypt != 0 && self.call(CTL_HOST_VERSION, &[], &[], &[])?.vals[1] & encrypt != encrypt {
+        // ignore unknown flags. Check before creating or attaching.
+        if self.call(CTL_HOST_VERSION, &[], &[], &[])?.vals[1] & BLK_ENCRYPT == 0 {
             return err("host does not support disk encryption; no disk attached");
         }
+        Ok(())
+    }
+
+    /// Callers check encryption support once before changing the host.
+    fn attach_disk(&self, vm: u64, disk: u64, flags: u64, start: u64, sectors: u64, key: Option<&[u8; 64]>, destroy_on_mismatch: bool) -> Result<()> {
+        let encrypt = if key.is_some() { BLK_ENCRYPT } else { 0 };
         let r = self.call(CTL_BLK_ATTACH, &[vm, disk, flags | encrypt, start, sectors], key.map_or(&[][..], |k| &k[..]), &[])?;
         // Also require the host to confirm that this attach applied the flags.
         if r.vals[0] & encrypt != encrypt {
