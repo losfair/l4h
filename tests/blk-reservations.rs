@@ -5,6 +5,8 @@ use l4h_host::MAX_GUEST_DEVICES;
 
 mod ctl { pub const EIO: i64 = 5; pub const EBUSY: i64 = 16; pub const ENOSPC: i64 = 28; pub const EOPNOTSUPP: i64 = 95; }
 
+macro_rules! log { ($($args:tt)*) => { LOGS.with_borrow_mut(|l| l.push(format!($($args)*))) }; }
+
 include!(env!("L4H_BLK_RESERVATIONS_TEST_SRC"));
 
 pub struct Pci;
@@ -26,6 +28,7 @@ pub struct Controller {
     clients: Vec<Option<Attachment>>, driver: Option<Driver>, failed: bool, dom: Domain,
 }
 thread_local! {
+    static LOGS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
     static APPLIED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static MRS: std::cell::RefCell<[u64; 16]> = const { std::cell::RefCell::new([0; 16]) };
 }
@@ -38,9 +41,9 @@ fn call(ep: u64, label: u64, args: &[u64]) -> u64 {
 }
 fn quarantine(c: &mut Controller, _: &Pci) { c.failed = true; }
 
-pub struct RootGuest { pool: blk::Pool, disks: Vec<(usize, usize)>, ports: Vec<usize> }
+pub struct RootGuest { id: usize, pool: blk::Pool, disks: Vec<(usize, usize)>, ports: Vec<usize> }
 fn guest() -> RootGuest {
-    RootGuest { pool: blk::Pool { gpa: 0, paddr: 0x100000, size: 0x400000 }, disks: vec![(0, 0)], ports: Vec::new() }
+    RootGuest { id: 7, pool: blk::Pool { gpa: 0, paddr: 0x100000, size: 0x400000 }, disks: vec![(0, 0)], ports: Vec::new() }
 }
 pub type Channel = Vec<usize>;
 pub struct Window { page: Box<blk::Channel> }
@@ -84,6 +87,10 @@ fn quarantined_disk_attaches_count_against_the_shared_root_device_budget() {
             g.ports.push(port);
         }
         assert_eq!(g.check_device_room(), Err(ctl::ENOSPC), "retained disks and ports share one root budget");
+        LOGS.with_borrow(|logs| {
+            let message = logs.last().unwrap();
+            assert!(message.contains("guest 7") && message.contains("retained failed attaches"), "{message}");
+        });
         assert!(g.disks.len() - 1 + g.ports.len() < MAX_GUEST_DEVICES, "successful disk/port attaches alone miss the retained disk");
         g.disks.pop();
         assert_eq!(g.check_device_room(), Ok(()), "a fully released attach gives its slot back");

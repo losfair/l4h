@@ -21,24 +21,44 @@ struct CreateOpts {
     gpu: Option<(u64, u64)>,
 }
 
+enum DiskOption<'a> { ReadOnly, Volatile, Start(&'a str), Sectors(&'a str), KeyFile }
+
+/// One classifier for parsing options and detecting ambiguous key paths.
+fn disk_option(value: &str) -> Option<DiskOption<'_>> {
+    if value == "ro" { return Some(DiskOption::ReadOnly); }
+    if value == "volatile" { return Some(DiskOption::Volatile); }
+    match value.split_once('=')? {
+        ("start", n) => Some(DiskOption::Start(n)),
+        ("sectors", n) => Some(DiskOption::Sectors(n)),
+        ("key-file", _) => Some(DiskOption::KeyFile),
+        _ => None,
+    }
+}
+
 /// key-file is last; reject paths that could be trailing disk options.
 fn parse_disk(value: &str) -> Result<((u64, u64, u64, u64), Option<&str>)> {
-    let (options, key) = value.split_once(",key-file=").map_or((value, None), |(v, p)| (v, Some(p)));
-    if key.is_some_and(|path| path.split(',').skip(1).any(|opt|
-        opt == "ro" || opt == "volatile" || opt.starts_with("start=") || opt.starts_with("sectors=") || opt.starts_with("key-file="))) {
-        return err("--disk: suboptions must precede key-file=; use --key-file FILE for paths containing option-like text");
-    }
-    let mut it = options.split(',');
-    let disk = it.next().unwrap();
+    let (disk, mut options) = value.split_once(',').map_or((value, None), |(d, rest)| (d, Some(rest)));
     let (disk, mut flags) = disk.strip_suffix(":ro").map_or((disk, 0), |d| (d, BLK_RO));
     let disk = parse_num(disk)?;
-    let (mut start, mut sectors) = (0, 0);
-    for opt in it {
-        if opt == "ro" { flags |= BLK_RO; }
-        else if opt == "volatile" { flags |= BLK_VOLATILE; }
-        else if let Some(n) = opt.strip_prefix("start=") { start = parse_num(n)?; }
-        else if let Some(n) = opt.strip_prefix("sectors=") { sectors = parse_num(n)?; }
-        else { return err(format!("--disk: unknown option {opt}")); }
+    let (mut start, mut sectors, mut key) = (0, 0, None);
+    while let Some(rest) = options {
+        let (opt, next) = rest.split_once(',').map_or((rest, None), |(o, tail)| (o, Some(tail)));
+        match disk_option(opt) {
+            Some(DiskOption::ReadOnly) => flags |= BLK_RO,
+            Some(DiskOption::Volatile) => flags |= BLK_VOLATILE,
+            Some(DiskOption::Start(n)) => start = parse_num(n)?,
+            Some(DiskOption::Sectors(n)) => sectors = parse_num(n)?,
+            Some(DiskOption::KeyFile) => {
+                let path = rest.split_once('=').unwrap().1;
+                if path.ends_with(":ro") || path.split(',').skip(1).any(|part| disk_option(part).is_some()) {
+                    return err("--disk: suboptions must precede key-file=; use --key-file FILE for paths containing option-like text or ending in :ro");
+                }
+                key = Some(path);
+                break;
+            }
+            None => return err(format!("--disk: unknown option {opt}")),
+        }
+        options = next;
     }
     Ok(((disk, flags, start, sectors), key))
 }
@@ -687,7 +707,7 @@ mod tests {
 
     #[test]
     fn disk_key_paths_are_not_options_or_read_only_suffixes() {
-        for path in ["/keys/a:root.key", "/keys/a,b.key", "/keys/a:ro", "/keys/a,root.key"] {
+        for path in ["/keys/a:root.key", "/keys/a,b.key", "/keys/a,root.key", "/keys/a:ro/key"] {
             let value = format!("1:ro,start=8,sectors=16,key-file={path}");
             assert_eq!(parse_disk(&value).unwrap(), ((1, BLK_RO, 8, 16), Some(path)));
         }
@@ -705,5 +725,9 @@ mod tests {
             assert!(error.0.contains("--key-file FILE"));
         }
         assert_eq!(parse_disk("1,ro,start=8,sectors=16,key-file=/k").unwrap(), ((1, BLK_RO, 8, 16), Some("/k")));
+        for value in ["1,key-file=/keys/a:ro", "1,ro,key-file=/keys/a:ro", "1,key-file=/keys/a,b:ro"] {
+            let error = parse_disk(value).unwrap_err();
+            assert!(error.0.contains("--key-file FILE"), "{}", error.0);
+        }
     }
 }

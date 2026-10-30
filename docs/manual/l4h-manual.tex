@@ -1318,8 +1318,8 @@ whose suboptions are:
     the tweak key). Keys are never command-line values. Alternatively,
     put \texttt{--key-file FILE} after its \texttt{--disk} argument.
     The \texttt{key-file=} suboption must be last: its remaining text,
-    including commas and \texttt{:ro}, is the file path.
-    A comma followed by a known disk suboption is rejected as ambiguous;
+    including commas and embedded \texttt{:ro}, is the file path.
+    A trailing \texttt{:ro} or a comma followed by a known disk suboption is rejected as ambiguous;
     put disk options first, or use \texttt{--key-file FILE} for such paths.
   \item[\texttt{ro}] The guest may read but not write; writes fail with an
     I/O error. \texttt{DISK:ro} is accepted too.
@@ -1435,8 +1435,10 @@ and the pool with swiotlb. Each controller reserves 4 MiB for bounced
 writes at boot; a write waits in its queue when no contiguous run fits.
 Waiting writers get FIFO priority so that smaller writes cannot keep
 a larger request waiting indefinitely.
-Completion-queue back-pressure preserves a writer's place; clients must
-drain their completions for waiting writes to proceed.
+Completion-queue back-pressure preserves a writer's place but reserves no
+bounce space, allowing other guests' writes to proceed. The writer regains
+priority when it drains its completions. Malformed submission rings lose
+their place in the waiting queue.
 Reads and flushes from other clients can still proceed.
 
 Flushes reach the device, so filesystems keep their crash-consistency

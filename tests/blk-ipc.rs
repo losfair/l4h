@@ -312,26 +312,85 @@ mod production {
         let before = drv.commands.len();
         drv.completed.extend(drv.commands[..4].iter().map(|c| (c.0, blk::STATUS_OK)));
         b.reap(); // All bounce memory is now free.
-        for _ in 0..3 {
+        for n in 0..3 {
+            enqueue(1, blk::OP_WRITE, 256 << 10);
             b.submit();
-            assert_eq!(&*b.waiting, [0, 1], "back-pressure must preserve the oldest writer");
+            assert_eq!(&*b.waiting, [0], "CQ back-pressure preserves rank without reserving bounce space");
             let Drv::Virtio(drv) = &b.drv else { unreachable!() };
-            assert_eq!(drv.commands.len(), before, "later writers must not reuse the freed space");
+            assert_eq!(drv.commands.len(), before + n + 2, "another writer keeps making progress while the head is paused");
         }
+        // These four small writes now hold 1 MiB. A second large writer
+        // waits behind the CQ-blocked client, which still has its old rank.
+        enqueue(1, blk::OP_WRITE, 14 * 256 * 1024);
         enqueue(2, blk::OP_READ, 4096);
         enqueue(2, blk::OP_FLUSH, 0);
         b.submit();
         let Drv::Virtio(drv) = &b.drv else { unreachable!() };
-        assert_eq!(drv.commands.len(), before + 2, "other clients' reads and flushes still run");
+        assert_eq!(drv.commands.len(), before + 6, "other clients' reads and flushes still run");
+        assert_eq!(&*b.waiting, [0, 1]);
         unsafe {
             let c = &mut *crate::channel();
             c.cq.tail = c.cq.head;
         }
         b.submit();
+        assert_eq!(&*b.waiting, [0, 1]);
+        let Drv::Virtio(drv) = &mut b.drv else { unreachable!() };
+        drv.completed.extend(drv.commands[before..before + 4].iter().map(|c| (c.0, blk::STATUS_OK)));
+        b.reap(); b.submit();
+        assert_eq!(&*b.waiting, [1], "the resumed writer gets the first large run");
+        let Drv::Virtio(drv) = &mut b.drv else { unreachable!() };
+        assert_eq!(drv.commands.last().unwrap().2, 16);
+        drv.completed.push((drv.commands.last().unwrap().0, blk::STATUS_OK));
+        b.reap(); b.submit();
         assert!(b.waiting.is_empty());
         let Drv::Virtio(drv) = &b.drv else { unreachable!() };
-        let writes: Vec<_> = drv.commands[before + 2..].iter().map(|c| (c.1, c.2)).collect();
+        let writes: Vec<_> = drv.commands[before + 6..].iter().map(|c| (c.1, c.2)).collect();
         assert_eq!(writes, [(blk::OP_WRITE, 16), (blk::OP_WRITE, 16384)], "large write keeps priority after the CQ drains");
+    }
+
+    pub fn malformed_waiter(info: &'static crate::Info, distance: u32) {
+        let mut b = service(info);
+        for i in 0..3 { assert_eq!(b.add(i, 0, 0, &[0; 64], 11), 0); }
+        for _ in 0..4 { enqueue(2, blk::OP_WRITE, 256 << 10); }
+        b.submit();
+        enqueue(0, blk::OP_WRITE, 14 * 256 * 1024);
+        enqueue(1, blk::OP_WRITE, 256 << 10);
+        b.next = 0;
+        b.submit();
+        assert_eq!(&*b.waiting, [0, 1]);
+        unsafe {
+            let c = &mut *crate::channel();
+            c.sq.head = c.sq.tail.wrapping_add(distance);
+        }
+        b.next = 1; // Other writers are visited before the malformed head.
+        b.submit();
+        assert!(b.waiting.is_empty(), "malformed indices must lose their reservation");
+        enqueue(2, blk::OP_WRITE, 256 << 10);
+        b.submit();
+        let Drv::Virtio(drv) = &b.drv else { unreachable!() };
+        assert_eq!(drv.commands.len(), 6, "both peer writers progress while the malicious head remains malformed");
+    }
+
+    pub fn priority_change_wakes_parked_writers(info: &'static crate::Info, invalid: bool) {
+        let mut b = service(info);
+        for i in 0..3 { assert_eq!(b.add(i, 0, 0, &[0; 64], 11), 0); }
+        for _ in 0..4 { enqueue(2, blk::OP_WRITE, 1 << 20); }
+        b.submit();
+        enqueue(0, blk::OP_WRITE, 14 * 256 * 1024);
+        for i in 1..3 { enqueue(i, blk::OP_WRITE, 4096); }
+        b.next = 0;
+        b.submit();
+        assert_eq!(&*b.waiting, [0, 1, 2]);
+        if invalid { unsafe { (*crate::channel()).reqs[0].nr_segs = 0; } }
+        let Drv::Virtio(drv) = &mut b.drv else { unreachable!() };
+        drv.completed.extend(drv.commands.iter().map(|c| (c.0, blk::STATUS_OK)));
+        b.reap();
+        b.next = 1; // Park both peers before visiting the priority writer.
+        b.submit();
+        assert!(b.waiting.is_empty(), "priority changes must wake peers within the same pass");
+        let Drv::Virtio(drv) = &b.drv else { unreachable!() };
+        let sectors: Vec<_> = drv.commands[4..].iter().map(|c| c.2).collect();
+        assert_eq!(sectors, if invalid { vec![16384, 32768] } else { vec![16, 16384, 32768] });
     }
 
     pub fn blocked_writers_checked_once(info: &'static crate::Info) {
@@ -342,12 +401,29 @@ mod production {
         enqueue(0, blk::OP_WRITE, 14 * 256 * 1024);
         for i in 1..3 { enqueue(i, blk::OP_WRITE, 256 << 10); }
         b.next = 0;
-        let Drv::Virtio(drv) = &b.drv else { unreachable!() };
-        drv.can_start_calls.set(0);
         b.submit();
         assert_eq!(&*b.waiting, [0, 1, 2]);
-        let Drv::Virtio(drv) = &b.drv else { unreachable!() };
-        assert_eq!(drv.can_start_calls.get(), 3, "writers behind a failed allocation must be skipped for the rest of the pass");
+        for cq_blocked in [false, true] {
+            if cq_blocked {
+                unsafe {
+                    let c = &mut *crate::channel();
+                    c.cq.tail = c.cq.head.wrapping_sub(blk::RING_SIZE as u32);
+                    // The next runnable waiter also needs a large run.
+                    let c = &mut *(blk::channel_va(1) as *mut Channel);
+                    c.reqs[c.sq.tail as usize % blk::RING_SIZE].segs[0].len = 14 * 256 * 1024;
+                }
+            }
+            for next in 0..3 {
+                let Drv::Virtio(drv) = &b.drv else { unreachable!() };
+                drv.can_start_calls.set(0);
+                b.next = next;
+                b.submit();
+                assert_eq!(&*b.waiting, [0, 1, 2]);
+                let Drv::Virtio(drv) = &b.drv else { unreachable!() };
+                assert_eq!(drv.can_start_calls.get(), if cq_blocked { 2 } else { 3 },
+                    "blocked writers are checked at most once regardless of rotation and CQ state");
+            }
+        }
     }
 
 }
@@ -517,7 +593,19 @@ fn deferred_writers_get_fifo_priority_while_reads_and_flushes_run() { with_pools
 fn withdrawn_waiters_do_not_block_other_writers() { with_pools(3, production::abandoned_waiter); }
 
 #[test]
-fn cq_backpressure_preserves_fifo_priority_until_drained() { with_pools(3, production::cq_blocked_waiter); }
+fn cq_backpressure_preserves_rank_but_allows_peer_writes() { with_pools(3, production::cq_blocked_waiter); }
+
+#[test]
+fn malformed_waiters_cannot_stall_peer_writes() {
+    for distance in [blk::RING_SIZE as u32 + 1, u32::MAX] {
+        with_pools(3, |info| production::malformed_waiter(info, distance));
+    }
+}
+
+#[test]
+fn parked_writers_wake_after_the_head_is_submitted_or_rejected() {
+    for invalid in [false, true] { with_pools(3, |info| production::priority_change_wakes_parked_writers(info, invalid)); }
+}
 
 #[test]
 fn writers_blocked_by_a_failed_allocation_are_checked_once_per_pass() { with_pools(3, production::blocked_writers_checked_once); }

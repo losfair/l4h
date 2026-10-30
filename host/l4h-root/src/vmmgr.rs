@@ -73,7 +73,11 @@ impl RootGuest {
         // Quarantined disk attaches retain their memory without adding a
         // vmmgr device. Count all root-owned disks and ports together so
         // they cannot exhaust Arena::owned even if vmmgr still has room.
-        if self.disks.len() + self.ports.len() >= MAX_GUEST_DEVICES { return Err(ctl::ENOSPC); }
+        if self.disks.len() + self.ports.len() >= MAX_GUEST_DEVICES {
+            log!("l4h-root: guest {}: root disk/NIC limit {} reached ({} disks, {} NICs); retained failed attaches count until VM destruction",
+                self.id, MAX_GUEST_DEVICES, self.disks.len(), self.ports.len());
+            return Err(ctl::ENOSPC);
+        }
         Ok(())
     }
 }
@@ -527,6 +531,7 @@ fn disk_attach(h: &mut Host, a: [u64; 8], key: &[u8; 64]) -> Result<Vals, i64> {
                 chan.release(&mut h.alloc);
             } else {
                 chan.keep(&mut g.arena);
+                log!("l4h-root: guest {}: failed disk {} attach retained after controller {} quarantine; it uses a root disk/NIC slot until VM destruction", id, disk, c);
             }
             return Err(e);
         }

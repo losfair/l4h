@@ -115,6 +115,18 @@ struct Client {
     outstanding: usize,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QueueState { Empty, Malformed, CqBlocked, Ready }
+
+fn select_writer(waiting: &[usize], states: &[QueueState; blk::MAX_CLIENTS],
+    first: &mut Option<usize>, parked: &mut [bool; blk::MAX_CLIENTS]) {
+    let next = waiting.iter().copied().find(|&i| states[i] == QueueState::Ready);
+    if next != *first {
+        *first = next;
+        parked.fill(false);
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Pending {
     client: usize,
@@ -131,8 +143,8 @@ struct Blkd {
     /// Indices of the attached clients, in attach order: the submit loop
     /// visits only these.
     active: ArrayVec<usize, { blk::MAX_CLIENTS }>,
-    /// FIFO of clients waiting for write space. Only its head may
-    /// allocate, so smaller writes cannot continually fragment the area.
+    /// FIFO of clients waiting for write space. Only its first runnable
+    /// member reserves space; CQ-blocked clients keep rank without blocking peers.
     waiting: ArrayVec<usize, { blk::MAX_CLIENTS }>,
     // Tags are allocated here, never taken from a client. Slots are not
     // reusable until the hardware has completed every command of a request.
@@ -146,6 +158,21 @@ struct Blkd {
 }
 
 impl Client {
+    fn queue_state(&self) -> (u32, QueueState) {
+        unsafe {
+            let tail = addr_of!((*self.chan).sq.tail).read_volatile();
+            let head = addr_of!((*self.chan).sq.head).read_volatile();
+            let cq_used = addr_of!((*self.chan).cq.head).read_volatile()
+                .wrapping_sub(addr_of!((*self.chan).cq.tail).read_volatile()) as usize;
+            let state = if head == tail { QueueState::Empty }
+                else if head.wrapping_sub(tail) as usize > blk::RING_SIZE { QueueState::Malformed }
+                // Reserve completion space for every in-flight request.
+                else if cq_used.saturating_add(self.outstanding) >= blk::RING_SIZE { QueueState::CqBlocked }
+                else { QueueState::Ready };
+            (tail, state)
+        }
+    }
+
     fn respond(&self, id: u64, status: u32) {
         unsafe {
             let h = addr_of!((*self.chan).cq.head).read_volatile();
@@ -204,35 +231,48 @@ impl Blkd {
         // No completions are reaped inside this pass, so a failed
         // allocation cannot succeed until the next submit call.
         let mut no_space = [false; blk::MAX_CLIENTS];
+        let mut parked = [false; blk::MAX_CLIENTS];
+        let mut states = [QueueState::Empty; blk::MAX_CLIENTS];
+        // Select priority before round-robin visits, including when the
+        // oldest waiter comes last. Ineligible clients cannot reserve space.
+        for &i in &self.active {
+            states[i] = self.clients[i].as_ref().unwrap().queue_state().1;
+        }
+        self.waiting.retain(|&i| matches!(states[i], QueueState::Ready | QueueState::CqBlocked));
+        let mut first = None;
+        select_writer(&self.waiting, &states, &mut first, &mut parked);
         // Bounded work per client and round-robin starting point. A busy
         // ring cannot occupy every hardware slot before others get a turn.
         let n = self.active.len();
         for _round in 0..blk::RING_SIZE / 4 {
             for off in 0..n {
                 let i = self.active[(self.next + off) % n];
-                if no_space[i] { continue; }
+                if states[i] != QueueState::Ready || no_space[i] || parked[i] { continue; }
                 let Some(c) = self.clients[i].as_mut() else { continue };
                 for _ in 0..4 {
                     if !self.drv.can_start() { break; }
                     let Some(tag) = self.pending.iter().position(Option::is_none) else { break };
-                    let (tail, req) = unsafe {
-                        let tail = addr_of!((*c.chan).sq.tail).read_volatile();
-                        let head = addr_of!((*c.chan).sq.head).read_volatile();
-                        let cq_used = addr_of!((*c.chan).cq.head).read_volatile()
-                            .wrapping_sub(addr_of!((*c.chan).cq.tail).read_volatile()) as usize;
-                        // Reserve completion space for every in-flight request.
-                        if head == tail {
-                            // Only withdrawal gives up a waiting writer's
-                            // place; CQ back-pressure preserves FIFO order.
+                    let (tail, state) = c.queue_state();
+                    states[i] = state;
+                    if state != QueueState::Ready {
+                        if state != QueueState::CqBlocked {
                             self.waiting.retain(|&w| w != i);
-                            break;
                         }
-                        if head.wrapping_sub(tail) as usize > blk::RING_SIZE
-                            || cq_used.saturating_add(c.outstanding) >= blk::RING_SIZE { break; }
+                        select_writer(&self.waiting, &states, &mut first, &mut parked);
+                        break;
+                    }
+                    let req = unsafe {
                         fence(Ordering::Acquire);
-                        let req = addr_of!((*c.chan).reqs[tail as usize % blk::RING_SIZE]).read_volatile();
-                        (tail, req)
+                        addr_of!((*c.chan).reqs[tail as usize % blk::RING_SIZE]).read_volatile()
                     };
+                    if req.op == blk::OP_WRITE && first.is_some_and(|w| w != i) {
+                        if !self.waiting.contains(&i) { self.waiting.must_push(i); }
+                        // Retry only when priority changes. This avoids
+                        // validating/translating the same blocked request in
+                        // every round, even before the first writer is visited.
+                        parked[i] = true;
+                        break;
+                    }
                     let dev = &self.dev[c.unit];
                     let mut run = None;
                     let mut deferred = false;
@@ -243,16 +283,9 @@ impl Blkd {
                         }
                         if req.op == blk::OP_WRITE {
                             let bytes: usize = pieces.iter().map(|s| s.len as usize).sum();
-                            if let Some(&first) = self.waiting.first().filter(|&&w| w != i) {
-                                if !self.waiting.contains(&i) { self.waiting.must_push(i); }
-                                // A failed head allocation cannot be retried
-                                // this pass, so neither can those behind it.
-                                no_space[i] = no_space[first];
-                                deferred = true;
-                                return Err(blk::STATUS_OK);
-                            }
                             let Some(r) = self.bounce.alloc(bytes) else {
-                                if self.waiting.is_empty() { self.waiting.must_push(i); }
+                                if !self.waiting.contains(&i) { self.waiting.must_push(i); }
+                                first = Some(i);
                                 no_space[i] = true;
                                 deferred = true;
                                 return Err(blk::STATUS_OK);
@@ -273,6 +306,7 @@ impl Blkd {
                     // available. Other clients' reads/flushes still run.
                     if deferred { break; }
                     self.waiting.retain(|&w| w != i);
+                    select_writer(&self.waiting, &states, &mut first, &mut parked);
                     unsafe { addr_of_mut!((*c.chan).sq.tail).write_volatile(tail.wrapping_add(1)); }
                     match result {
                         Ok(()) => {
