@@ -26,7 +26,7 @@ fn call(ep: u64, _: u64, _: &[u64]) -> u64 { ep }
 fn quarantine(c: &mut Controller, _: &Pci) { c.failed = true; }
 
 fn reservation() -> Attachment {
-    Attachment { vm: 0, disk: 0, window: DiskWindow::new(8, 16, 1024).unwrap(),
+    Attachment { vm: 0, disk: 0, window: DiskWindow::new(8, 16, 1024).unwrap(), extents: 0,
         read_only: false, reserved: true, pool: None }
 }
 

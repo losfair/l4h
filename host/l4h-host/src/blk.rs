@@ -97,7 +97,9 @@ pub const STAGING_SIZE: usize = 1 << 20;
 /// unit -> capacity (u64::MAX if no such unit), block size, read-only,
 /// number of units, unit address (blkd_scsi_addr for virtio-scsi, else 0).
 pub const BLKD_INFO: u64 = 1;
-/// client, unit, dom0 -> 0: the window BLKD_CHECK allowed in that slot
+/// client, unit, dom0, n -> 0: what BLKD_CHECK allowed in that slot, the
+/// channel's window (n = 0) or the n extents in staging.  blkd builds the
+/// client's ExtentTable at extent_va(client).
 pub const BLKD_ADD: u64 = 2;
 /// client -> 0, or u64::MAX if it did not drain
 pub const BLKD_REMOVE: u64 = 3;
@@ -108,10 +110,15 @@ pub const BLKD_FLUSH: u64 = 5;
 /// unit, start, sectors, read-only -> slot of the dom0 boot range, or
 /// u64::MAX (conflicting or no slot).  Before anything attaches.
 pub const BLKD_RESERVE: u64 = 6;
-/// unit, start, sectors (0 = to the end), read-only, dom0 -> 0 or an
+/// unit, start, sectors (0 = to the end), read-only, dom0, n -> 0 or an
 /// errno (EINVAL, EBUSY, ENOSPC); then the slot BLKD_ADD must use, the
-/// sectors and whether the window is read-only.  Changes nothing.
+/// guest disk's sectors and whether it is read-only.  With n > 0 the disk
+/// is the n extents in staging, (start, sectors) pairs in guest order,
+/// instead of the window.  Changes nothing.
 pub const BLKD_CHECK: u64 = 7;
+/// client, k -> 0 and the start and sectors of its kth extent in guest
+/// order, or u64::MAX if it has none.
+pub const BLKD_EXTENT: u64 = 8;
 /// BLKD_WRITE and BLKD_FLUSH refused the range: MR1 is the errno.
 pub const BLKD_REFUSED: u64 = u64::MAX - 1;
 
@@ -272,10 +279,179 @@ impl DiskWindow {
     }
 }
 
-/// A range of a unit that a slot holds: a client's window, or a dom0 boot
-/// range.
+/// A 4 KiB aligned physical range of a unit, in 512-byte sectors, and
+/// where it starts in its guest's disk.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Extent {
+    pub start: u64,
+    pub sectors: u64,
+    pub offset: u64,
+}
+
+impl Extent {
+    fn end(&self) -> u64 { self.start + self.sectors }
+}
+
+/// Extents of one guest disk.  LVM has no small limit: a long-lived LV
+/// that was extended many times has hundreds of segments.
+pub const MAX_EXTENTS: usize = 4096;
+/// Every extent of a disk with more than one is at least this long (4 MiB,
+/// LVM's default physical extent).  A request is at most 3.5 MiB
+/// (l4h-vmm's SEG_MAX * SEG_SIZE_LIMIT), so it crosses at most one
+/// boundary.
+pub const MIN_EXTENT_SECTORS: u64 = 8192;
+
+/// A client's extent table, built by blkd at extent_va(client) in frames
+/// only blkd maps: the extents sorted by start, and their indices in guest
+/// order.  Only the pages holding the first n entries of each are mapped
+/// (table_pages).
+#[repr(C)]
+pub struct ExtentTable {
+    pub n: u32,
+    pub reserved: u32,
+    pub order: [u16; MAX_EXTENTS],
+    pub extents: [Extent; MAX_EXTENTS],
+}
+
+pub const EXTENT_VA: usize = 0x2c00_0000_0000;
+pub const EXTENT_STRIDE: usize = 0x20000;
+const _: () = assert!(core::mem::size_of::<ExtentTable>() <= EXTENT_STRIDE);
+
+pub const fn extent_va(client: usize) -> usize {
+    EXTENT_VA + client * EXTENT_STRIDE
+}
+
+/// The pages of an ExtentTable that hold n entries: two runs, the second
+/// starting where the first ends at the earliest.
+pub fn table_pages(n: usize) -> [core::ops::Range<usize>; 2] {
+    let order = core::mem::offset_of!(ExtentTable, order) + 2 * n;
+    let extents = core::mem::offset_of!(ExtentTable, extents);
+    let first = 0..order.div_ceil(4096);
+    let second = (extents / 4096).max(first.end)..(extents + 24 * n).div_ceil(4096);
+    [first, second]
+}
+
+/// Up to two pieces of one request, in different extents: (device sector,
+/// bytes), and how many there are.
+pub type Pieces = ([(u64, u64); 2], usize);
+
+/// A guest disk: `extents` sorted by start, `order` their indices in guest
+/// order.  Checked with `check` before anything reads it as a disk.
+#[derive(Clone, Copy)]
+pub struct Volume<'a> {
+    pub order: &'a [u16],
+    pub extents: &'a [Extent],
+}
+
+impl<'a> Volume<'a> {
+    /// The table at `p`, with `n` entries: none beyond them is read.
+    ///
+    /// # Safety
+    /// The pages table_pages(n) of `p` are mapped and stay so for 'a.
+    pub unsafe fn at(p: *const ExtentTable, n: usize) -> Self {
+        unsafe {
+            Volume {
+                order: core::slice::from_raw_parts(core::ptr::addr_of!((*p).order).cast(), n),
+                extents: core::slice::from_raw_parts(core::ptr::addr_of!((*p).extents).cast(), n),
+            }
+        }
+    }
+
+    /// Fill `order` and `extents` (as long as `raw`) from `raw`, (start,
+    /// sectors) in guest order, and check them against a unit of `capacity`
+    /// sectors.  EINVAL if they are no disk.
+    pub fn build(raw: impl Iterator<Item = (u64, u64)>, order: &'a mut [u16], extents: &'a mut [Extent],
+        capacity: u64) -> Result<Volume<'a>, u64> {
+        let mut offset = 0u64;
+        for ((e, o), (i, (start, sectors))) in extents.iter_mut().zip(order.iter_mut()).zip(raw.enumerate()) {
+            *e = Extent { start, sectors, offset };
+            *o = i as u16;
+            offset = offset.checked_add(sectors).ok_or(EINVAL)?;
+        }
+        extents.sort_unstable_by_key(|e| e.start);
+        // `order` holds 0..n: sorted by offset, it is the guest order.
+        order.sort_unstable_by_key(|&o| extents[o as usize].offset);
+        let v = Volume { order, extents };
+        v.check(capacity)?;
+        Ok(v)
+    }
+
+    /// Whether this is a disk on a unit of `capacity` sectors: 1 to
+    /// MAX_EXTENTS extents, each a valid window and, if there are several,
+    /// at least MIN_EXTENT_SECTORS; sorted and disjoint; and each extent in
+    /// `order` starting where the one before it ends.
+    pub fn check(&self, capacity: u64) -> Result<(), u64> {
+        let (n, e) = (self.extents.len(), self.extents);
+        let ok = (1..=MAX_EXTENTS).contains(&n) && self.order.len() == n
+            && e.iter().all(|x| DiskWindow::new(x.start, x.sectors, capacity).is_some_and(|w| w.sectors == x.sectors)
+                && (n == 1 || x.sectors >= MIN_EXTENT_SECTORS))
+            && e.windows(2).all(|w| w[0].end() <= w[1].start)
+            && self.order.iter().all(|&o| (o as usize) < n)
+            && e[self.order[0] as usize].offset == 0
+            && self.order.windows(2).all(|w| {
+                let (a, b) = (&e[w[0] as usize], &e[w[1] as usize]);
+                a.offset.checked_add(a.sectors) == Some(b.offset)
+            });
+        // Offsets grow strictly along `order`, so no index repeats.
+        if ok && self.last().offset.checked_add(self.last().sectors).is_some() { Ok(()) } else { Err(EINVAL) }
+    }
+
+    fn last(&self) -> &Extent { &self.extents[self.order[self.order.len() - 1] as usize] }
+
+    /// Guest sectors.
+    pub fn sectors(&self) -> u64 { self.last().offset + self.last().sectors }
+
+    /// The extent that is `k`th in guest order.
+    pub fn nth(&self, k: usize) -> Option<Extent> {
+        self.order.get(k).map(|&o| self.extents[o as usize])
+    }
+
+    /// Validate a snapshotted request (as DiskWindow::check_request) and
+    /// map it to the device: one piece, or two if it crosses an extent
+    /// boundary.  A request that would need more fails.  A flush has none.
+    pub fn map(&self, req: &Req, pool: Pool, block_size: u32, read_only: bool) -> Result<Pieces, u32> {
+        let whole = DiskWindow { start: 0, sectors: self.sectors() };
+        let g = whole.check_request(req, pool, block_size, read_only)?;
+        if req.op == OP_FLUSH { return Ok(([(0, 0); 2], 0)); }
+        let bytes: u64 = req.segs[..req.nr_segs as usize].iter().map(|s| s.len as u64).sum();
+        let k = self.order.partition_point(|&o| self.extents[o as usize].offset <= g) - 1;
+        let e = self.nth(k).unwrap();
+        let first = bytes.min((e.offset + e.sectors - g) * 512);
+        let mut pieces = ([(e.start + (g - e.offset), first), (0, 0)], 1);
+        if first < bytes {
+            let next = self.nth(k + 1).ok_or(STATUS_IOERR)?;
+            if bytes - first > next.sectors * 512 { return Err(STATUS_IOERR); }
+            pieces.0[1] = (next.start, bytes - first);
+            pieces.1 = 2;
+        }
+        Ok(pieces)
+    }
+}
+
+/// Whether two lists of extents, each sorted and disjoint, share a sector.
+pub fn overlap(a: &[Extent], b: &[Extent]) -> bool {
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i].end() <= b[j].start { i += 1 }
+        else if b[j].end() <= a[i].start { j += 1 }
+        else { return true }
+    }
+    false
+}
+
+/// What a slot holds of a unit: a client's extents (sorted), or a dom0
+/// boot range.
+#[derive(Clone, Copy, Debug)]
+pub struct Hold<'a> {
+    pub unit: usize,
+    pub extents: &'a [Extent],
+    pub read_only: bool,
+}
+
+/// A dom0 boot range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Hold {
+pub struct Reserved {
     pub unit: usize,
     pub window: DiskWindow,
     pub read_only: bool,
@@ -289,7 +465,9 @@ pub struct Hold {
 /// provisioning.  Slots are shared with clients: a claim attaches in the
 /// reservation's slot.
 pub struct Reservations<const N: usize> {
-    pub slots: [Option<Hold>; N],
+    pub slots: [Option<Reserved>; N],
+    /// The slots' ranges as extents, for overlap.
+    ranges: [Extent; N],
 }
 
 impl<const N: usize> Default for Reservations<N> {
@@ -297,21 +475,27 @@ impl<const N: usize> Default for Reservations<N> {
 }
 
 impl<const N: usize> Reservations<N> {
-    pub const fn new() -> Self { Self { slots: [None; N] } }
+    pub const fn new() -> Self {
+        Self { slots: [None; N], ranges: [Extent { start: 0, sectors: 0, offset: 0 }; N] }
+    }
 
-    fn claimable(&self, i: usize, active: &impl Fn(usize) -> Option<Hold>, want: &Hold, dom0: bool) -> bool {
-        dom0 && active(i).is_none() && self.slots[i].is_some_and(|r| r.unit == want.unit && r.window == want.window)
+    fn hold(&self, i: usize) -> Option<Hold<'_>> {
+        self.slots[i].map(|r| Hold { unit: r.unit, extents: core::slice::from_ref(&self.ranges[i]), read_only: r.read_only })
+    }
+
+    fn claimable<'a>(&self, i: usize, active: &impl Fn(usize) -> Option<Hold<'a>>, want: &Hold, dom0: bool) -> bool {
+        dom0 && active(i).is_none() && want.extents.len() == 1 && self.slots[i].is_some_and(|r| r.unit == want.unit
+            && (r.window.start, r.window.sectors) == (want.extents[0].start, want.extents[0].sectors))
     }
 
     /// The slot `want` may attach in: EBUSY if it conflicts with a client
     /// or with a reservation it cannot claim, ENOSPC if no slot is free.
-    pub fn slot(&self, active: &impl Fn(usize) -> Option<Hold>, want: &Hold, dom0: bool) -> Result<usize, u64> {
-        let conflicts = |h: &Hold| h.unit == want.unit && want.window.conflicts(want.read_only, h.window, h.read_only);
+    pub fn slot<'a>(&self, active: &impl Fn(usize) -> Option<Hold<'a>>, want: &Hold, dom0: bool) -> Result<usize, u64> {
+        let conflicts = |h: &Hold| h.unit == want.unit && !(want.read_only && h.read_only) && overlap(want.extents, h.extents);
         // A claimed reservation is represented by its client.
-        let busy = (0..N).any(|i| match (active(i), self.slots[i]) {
-            (Some(a), _) => conflicts(&a),
-            (None, Some(r)) => conflicts(&r) && !self.claimable(i, active, want, dom0),
-            (None, None) => false,
+        let busy = (0..N).any(|i| match active(i) {
+            Some(a) => conflicts(&a),
+            None => self.hold(i).is_some_and(|r| conflicts(&r) && !self.claimable(i, active, want, dom0)),
         });
         if busy { return Err(EBUSY); }
         (0..N).find(|&i| self.claimable(i, active, want, dom0))
@@ -319,16 +503,20 @@ impl<const N: usize> Reservations<N> {
             .ok_or(ENOSPC)
     }
 
-    /// Keep `hold` (a range of dom0's boot plan) from other users.
-    pub fn reserve(&mut self, active: &impl Fn(usize) -> Option<Hold>, hold: Hold) -> Result<usize, u64> {
-        let i = self.slot(active, &hold, false)?;
-        self.slots[i] = Some(hold);
+    /// Keep `r` (a range of dom0's boot plan) from other users.
+    pub fn reserve<'a>(&mut self, active: &impl Fn(usize) -> Option<Hold<'a>>, r: Reserved) -> Result<usize, u64> {
+        let range = Extent { start: r.window.start, sectors: r.window.sectors, offset: 0 };
+        let want = Hold { unit: r.unit, extents: core::slice::from_ref(&range), read_only: r.read_only };
+        let i = self.slot(active, &want, false)?;
+        self.slots[i] = Some(r);
+        self.ranges[i] = range;
         Ok(i)
     }
 
     /// Whether provisioning may write `window` of `unit`: no client and no
     /// reservation touches it, read-only or not.
-    pub fn unattached(&self, active: &impl Fn(usize) -> Option<Hold>, unit: usize, window: DiskWindow) -> bool {
-        !(0..N).flat_map(|i| [active(i), self.slots[i]]).flatten().any(|h| h.unit == unit && h.window.overlaps(window))
+    pub fn unattached<'a>(&self, active: &impl Fn(usize) -> Option<Hold<'a>>, unit: usize, window: DiskWindow) -> bool {
+        let w = [Extent { start: window.start, sectors: window.sectors, offset: 0 }];
+        !(0..N).flat_map(|i| [active(i), self.hold(i)]).flatten().any(|h| h.unit == unit && overlap(&w, h.extents))
     }
 }

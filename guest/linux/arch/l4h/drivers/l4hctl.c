@@ -3,9 +3,10 @@
  * /dev/l4hctl: dom0's access to the l4h control API (DESIGN.md §9.1).
  *
  * ioctl(L4HCTL_IOC_CALL) passes a struct l4h_ctl_req to l4h-root and
- * returns the struct l4h_ctl_resp. For VM_LOAD and BLK_WRITE, source bytes
- * come from a user buffer: they are staged in the device's data area, a
- * host-owned region (l4h-root never reads guest RAM). VM_LOAD uses offset
+ * returns the struct l4h_ctl_resp. For VM_LOAD, BLK_WRITE and
+ * BLK_ATTACH_EXTENTS, source bytes come from a user buffer: they are staged
+ * in the device's data area, a host-owned region (l4h-root never reads
+ * guest RAM). VM_LOAD and BLK_ATTACH_EXTENTS (the extent list) use offset
  * zero; BLK_WRITE uses the staged bytes only when its zero flag is clear.
  * GPU_READ goes the other way: l4h-root leaves the bytes there, and they
  * are copied to the user buffer.
@@ -28,7 +29,7 @@
 struct l4hctl_call {
 	__u64 req;      /* struct l4h_ctl_req * */
 	__u64 resp;     /* struct l4h_ctl_resp * */
-	__u64 buf;      /* VM_LOAD / BLK_WRITE: source bytes */
+	__u64 buf;      /* VM_LOAD / BLK_WRITE / BLK_ATTACH_EXTENTS: source bytes */
 	__u64 len;
 };
 
@@ -108,6 +109,17 @@ static long l4hctl_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 			ret = -EFAULT;
 			goto out;
 		}
+	} else if (req->op == L4H_CTL_BLK_ATTACH_EXTENTS) {
+		if (req->args[4] > stage_size / sizeof(struct l4h_ctl_extent) ||
+		    call.len != req->args[4] * sizeof(struct l4h_ctl_extent)) {
+			ret = -EINVAL;
+			goto out;
+		}
+		if (copy_from_user(stage, u64_to_user_ptr(call.buf), call.len)) {
+			ret = -EFAULT;
+			goto out;
+		}
+		req->args[3] = 0;
 	}
 	ret = ctl_call();
 	if (ret)

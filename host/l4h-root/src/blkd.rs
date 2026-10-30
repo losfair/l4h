@@ -158,18 +158,21 @@ impl Controller {
             None => self.clients.iter().position(Option::is_none).unwrap_or(usize::MAX),
         };
         assert!(i < blk::MAX_CLIENTS && self.clients[i].is_none(), "conflicting or excessive dom0 disk reservations");
-        self.clients[i] = Some(Attachment { vm: 0, disk, window, read_only, reserved: true, pool: None });
+        self.clients[i] = Some(Attachment { vm: 0, disk, window, extents: 0, read_only, reserved: true, pool: None });
     }
 
     /// Ask blkd whether `unit` can attach `start`, `sectors` (0: to the
-    /// end) for a guest, dom0 or not: the slot to attach in and the
-    /// window (and whether it is read-only), or the errno it refuses with.
-    /// EIO if blkd has failed or names a slot root cannot use (the
-    /// controller is then quarantined).
-    pub fn check(&mut self, unit: u64, start: u64, sectors: u64, read_only: bool, dom0: bool, pci: &Pci)
-        -> Result<(usize, blk::DiskWindow, bool), i64> {
+    /// end), or the `n` extents at `list`, for a guest, dom0 or not: the
+    /// slot to attach in and the disk's window (its sectors, and whether it
+    /// is read-only), or the errno it refuses with.  EIO if blkd has failed
+    /// or names a slot root cannot use (the controller is then quarantined).
+    #[allow(clippy::too_many_arguments)]
+    pub fn check(&mut self, unit: u64, start: u64, sectors: u64, n: usize, list: *const u8, read_only: bool, dom0: bool,
+        win: &mut Window, pci: &Pci) -> Result<(usize, blk::DiskWindow, bool), i64> {
+        // blkd reads the list from staging, where BLKD_ADD finds it too.
+        self.stage(Some(list), 16 * n, win);
         let ep = self.driver.as_ref().expect("started blkd").comp.service_ep;
-        let r = call(ep, blk::BLKD_CHECK, &[unit, start, sectors, read_only as u64, dom0 as u64]);
+        let r = call(ep, blk::BLKD_CHECK, &[unit, start, sectors, read_only as u64, dom0 as u64, n as u64]);
         let i = crate::mr(1) as usize;
         // A slot that is free, or a reservation without a client.
         let usable = i < blk::MAX_CLIENTS && self.clients[i].as_ref().is_none_or(|a| a.pool.is_none());
@@ -180,6 +183,26 @@ impl Controller {
                 Err(crate::ctl::EIO)
             }
             errno => Err(errno as i64),
+        }
+    }
+
+    /// The `k`th extent (start, sectors) of client `i`'s disk, or None if
+    /// blkd cannot say.
+    pub fn extent(&self, i: usize, k: usize) -> Option<(u64, u64)> {
+        let driver = self.driver.as_ref().filter(|_| !self.failed)?;
+        (call(driver.comp.service_ep, blk::BLKD_EXTENT, &[i as u64, k as u64]) == 0).then(|| (crate::mr(1), crate::mr(2)))
+    }
+
+    /// Copy `len` bytes from `from`, or zeros, into blkd's staging buffer.
+    fn stage(&self, from: Option<*const u8>, len: usize, win: &mut Window) {
+        let driver = self.driver.as_ref().unwrap();
+        for (i, s) in driver.staging.clone().take(len.div_ceil(PAGE)).enumerate() {
+            let f = sel4::init_thread::Slot::<cap_type::Granule>::from_index(s).cap();
+            let n = PAGE.min(len - i * PAGE);
+            win.with_frame(&abs_of(f), |p| unsafe {
+                if let Some(from) = from { core::ptr::copy_nonoverlapping(from.add(i * PAGE), p, n); }
+                else { core::ptr::write_bytes(p, 0, n); }
+            });
         }
     }
 
@@ -256,7 +279,10 @@ pub struct Attachment {
     pub vm: usize,
     /// Host disk index.
     pub disk: usize,
+    /// The disk's first sector (of a window) and its sectors.
     pub window: blk::DiskWindow,
+    /// Extents of a disk made of them (blkd has them), else 0.
+    pub extents: usize,
     pub read_only: bool,
     /// A dom0 boot range survives failed attachment and dom0 restart.
     reserved: bool,
@@ -418,13 +444,13 @@ fn call(ep: cap::Endpoint, label: u64, args: &[u64]) -> u64 {
     crate::mr(0)
 }
 
-/// Attach a window of host disk `disk` that blkd allowed in slot `i`
-/// (Controller::check) to one client of its running shared controller.
-/// Returns the channel frames (the client's) and a kick capability (in a
-/// slot of its own) for the client's l4h-vmm.
+/// Attach a disk of host disk `disk` that blkd allowed in slot `i`
+/// (Controller::check), a window or `extents` extents, to one client of its
+/// running shared controller.  Returns the channel frames (the client's)
+/// and a kick capability (in a slot of its own) for the client's l4h-vmm.
 #[allow(clippy::too_many_arguments)]
-pub fn attach(ctrl: &mut Controller, i: usize, disk: usize, client: &mut RootGuest,
-    window: blk::DiskWindow, read_only: bool, alloc: &mut Alloc, iommu: &mut Iommu) -> (Channel, cap::Notification) {
+pub fn attach(ctrl: &mut Controller, i: usize, disk: usize, client: &mut RootGuest, window: blk::DiskWindow,
+    extents: usize, read_only: bool, alloc: &mut Alloc, iommu: &mut Iommu) -> (Channel, cap::Notification) {
     let reserved = ctrl.clients[i].as_ref().is_some_and(|a| a.reserved);
     let driver = ctrl.driver.as_mut().expect("started blkd");
     let chan: Channel = (0..blk::CHANNEL_PAGES)
@@ -436,6 +462,14 @@ pub fn attach(ctrl: &mut Controller, i: usize, disk: usize, client: &mut RootGue
             CapRights::read_write(), VmAttributes::DEFAULT,
             keep.absolute_cptr_from_bits_with_depth(page as u64, 10)));
     }
+    // The pages of the disk's extent table that blkd builds; no one else
+    // maps them.
+    for (k, page) in blk::table_pages(extents.max(1)).into_iter().flatten().enumerate() {
+        let f = client.arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP);
+        alloc.global(|alloc| driver.comp.map_copy(alloc, &mut driver.arena, &abs_of(f), blk::extent_va(i) + page * PAGE,
+            CapRights::read_write(), VmAttributes::DEFAULT,
+            keep.absolute_cptr_from_bits_with_depth((blk::CHANNEL_PAGES + k) as u64, 10)));
+    }
     driver.comp.give_badged(blk::BLKD_SLOT_CLIENT_DONE + i as u64, client.vmm_ntfn,
         CapRights::write_only(), host::VMM_BADGE_DONE);
     let kick_slot = alloc.slots.alloc();
@@ -444,7 +478,7 @@ pub fn attach(ctrl: &mut Controller, i: usize, disk: usize, client: &mut RootGue
     // Reads write the pool, writes read it.
     let pool = (client.pool.paddr, client.pool.size);
     iommu.map(alloc, ctrl.dom, pool.0, pool.1, true);
-    ctrl.clients[i] = Some(Attachment { vm: client.id, disk, window, read_only, reserved, pool: Some(pool) });
+    ctrl.clients[i] = Some(Attachment { vm: client.id, disk, window, extents, read_only, reserved, pool: Some(pool) });
     (chan, kick)
 }
 
@@ -466,8 +500,8 @@ pub fn activate(ctrl: &mut Controller, unit: u64, i: usize, client: &RootGuest, 
             gpa: client.pool.gpa as u64, paddr: client.pool.paddr as u64, size: client.pool.size as u64,
         });
     });
-    let dom0 = client.dom0 as u64;
-    if call(ctrl.driver.as_ref().unwrap().comp.service_ep, blk::BLKD_ADD, &[i as u64, unit, dom0]) != 0 {
+    let (dom0, n) = (client.dom0 as u64, a.extents as u64);
+    if call(ctrl.driver.as_ref().unwrap().comp.service_ep, blk::BLKD_ADD, &[i as u64, unit, dom0, n]) != 0 {
         quarantine(ctrl, pci);
         return Err(crate::ctl::EIO);
     }
@@ -509,14 +543,8 @@ pub fn write(ctrl: &mut Controller, dk: &Disk, sector: u64, len: usize, from: Op
     // The staging buffer's size bounds the copy.
     if len > blk::STAGING_SIZE { return Err(crate::ctl::EINVAL); }
     let disk = ctrl;
+    disk.stage(from, len, win);
     let driver = disk.driver.as_ref().unwrap();
-    for (i, s) in driver.staging.clone().take(len.div_ceil(PAGE)).enumerate() {
-        let f = sel4::init_thread::Slot::<cap_type::Granule>::from_index(s).cap();
-        win.with_frame(&abs_of(f), |p| unsafe {
-            if let Some(from) = from { core::ptr::copy_nonoverlapping(from.add(i * PAGE), p, PAGE); }
-            else { core::ptr::write_bytes(p, 0, PAGE); }
-        });
-    }
     let status = if len == 0 {
         call(driver.comp.service_ep, blk::BLKD_FLUSH, &[dk.unit])
     } else {

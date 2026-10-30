@@ -469,24 +469,29 @@ fn guest_del(h: &mut Host, id: usize) -> Result<Vals, i64> {
 }
 
 /// VMMGR_DISK_ATTACH: pass host disk `disk` (or sectors [lba_start,
-/// lba_start + lba_count) of it; 0 = to the end) through to the guest.
-/// blkd decides whether the window may attach, and in which slot.
+/// lba_start + lba_count) of it, 0 = to the end; or the n extents at
+/// `list` in dom0's control data area) through to the guest.  blkd
+/// decides whether the disk may attach, and in which slot.
 fn disk_attach(h: &mut Host, a: [u64; 8]) -> Result<Vals, i64> {
     let id = guest_arg(a[0])?;
     let (dev, disk, read_only, lba_start, lba_count) = (a[1] as usize, a[2] as usize, a[3] != 0, a[4], a[5]);
-    if dev >= MAX_GUEST_DEVICES {
+    let (n, list) = (a[6] as usize, a[7]);
+    if dev >= MAX_GUEST_DEVICES || n > l4h_host::blk::MAX_EXTENTS
+        || list.checked_add(16 * n as u64).is_none_or(|end| end > l4h_abi::CTL_LOAD_MAX) {
         return Err(ctl::EINVAL);
     }
     h.ensure_disk(disk)?;
     let (c, unit) = (h.disks[disk].ctrl, h.disks[disk].unit);
     let dom0 = h.guests[id].as_ref().ok_or(ctl::ENOENT)?.dom0;
-    let (client, window, read_only) = h.ctrls[c].check(unit, lba_start, lba_count, read_only, dom0, &h.pci)?;
+    let list = (CTL_DATA_VA + list as usize) as *const u8;
+    let (client, window, read_only) =
+        h.ctrls[c].check(unit, lba_start, lba_count, n, list, read_only, dom0, &mut h.wins.a, &h.pci)?;
     if !h.can_afford(1 << 20, 0, 0) { return Err(ctl::ENOMEM); }
     with_guest(h, id, |h, g| {
         if g.disks.is_full() {
             return Err(ctl::ENOSPC);
         }
-        let (chan, kick) = crate::blkd::attach(&mut h.ctrls[c], client, disk, g, window, read_only, &mut h.alloc, &mut h.iommu);
+        let (chan, kick) = crate::blkd::attach(&mut h.ctrls[c], client, disk, g, window, n, read_only, &mut h.alloc, &mut h.iommu);
         g.disks.must_push((c, client));
         crate::blkd::activate(&mut h.ctrls[c], unit, client, g, &chan, &mut h.wins.a, &h.pci)?;
         for (i, f) in chan.iter().enumerate() {

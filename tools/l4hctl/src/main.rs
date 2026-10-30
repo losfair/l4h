@@ -15,9 +15,20 @@ struct CreateOpts {
     initrd: Option<String>,
     cmdline: String,
     disks: Vec<(u64, bool, u64, u64)>,
+    volumes: Vec<(u64, bool, Vec<(u64, u64)>)>,
     io_pool: u64,
     nics: Vec<(u64, u64, u64)>,
     gpu: Option<(u64, u64)>,
+}
+
+/// Where the PV on `disk` starts: dom0's only window on it, which holds
+/// the PV's label and metadata.
+fn dom0_pv_start(ctl: &Ctl, disk: u64) -> Result<u64> {
+    let windows: Vec<_> = ctl.disk_attachments(disk)?.into_iter().filter(|a| a.vm == 0).collect();
+    match &windows[..] {
+        [w] => Ok(w.start),
+        _ => err(format!("disk {disk}: dom0 has {} windows on it; give the PV's start (pv-start=)", windows.len())),
+    }
 }
 
 fn cmd_create(ctl: &Ctl, o: &CreateOpts) -> Result<u64> {
@@ -32,6 +43,7 @@ fn cmd_create(ctl: &Ctl, o: &CreateOpts) -> Result<u64> {
         initrd: &initrd,
         cmdline: &o.cmdline,
         disks: o.disks.clone(),
+        volumes: o.volumes.clone(),
         io_pool: o.io_pool,
         nics: o.nics.clone(),
         gpu: o.gpu,
@@ -115,11 +127,20 @@ const USAGE: &str = "usage: l4hctl <command>
   disks                        host disks, owners, capacities and attachments
   disk-zero DISK START SECTORS zero an unattached region
   disk-write DISK START FILE   seed an unattached region, then flush
+  lv-extents DISK VG/LV [--pv-start SECTOR]
+                               extents of a linear LVM volume on DISK, whose
+                               PV starts at SECTOR (default: dom0's only
+                               window on DISK, the PV's metadata)
   list (or vms)                VMs and their host seals
   create NAME [--initrd F] [--mem MB] [--vcpus N]
          [--cmdline S] [--disk I[,ro][,start=SECTOR][,sectors=N]]...
                                create and start a VM, which runs the
                                host's kernel; prints its id
+         [--disk I[,ro],extents=START:N+START:N...]...
+                               a disk made of extents of disk I, in order
+         [--lv I:VG/LV[,ro][,pv-start=SECTOR]]...
+                               a linear LVM volume on disk I (see
+                               lv-extents); disks of extents come last
          [--nic SWITCH[,mac=MAC][,nolock][,isolated]]...
          [--io-pool MB]        device I/O buffer pool (power of two, 1-256;
                                default 4, or room for the GPU's buffers)
@@ -217,6 +238,20 @@ fn run(args: &[String]) -> Result<i32> {
     };
     if cmd == "attest" {
         return cmd_attest(&args[1..]);
+    }
+    if cmd == "lv-extents" {
+        // Only the default PV start needs the host.
+        let (disk, lv, pv_start) = match &args[1..] {
+            [d, lv] => (parse_num(d)?, lv, None),
+            [d, lv, flag, p] if flag == "--pv-start" => (parse_num(d)?, lv, Some(parse_num(p)?)),
+            _ => return err("lv-extents DISK VG/LV [--pv-start SECTOR]"),
+        };
+        let pv_start = match pv_start {
+            Some(p) => p,
+            None => dom0_pv_start(&Ctl::open()?, disk)?,
+        };
+        println!("{}", fmt_extents(&lv_extents(lv, pv_start)?));
+        return Ok(0);
     }
     let ctl = Ctl::open()?;
     match cmd.as_str() {
@@ -348,6 +383,7 @@ fn run(args: &[String]) -> Result<i32> {
                 initrd: None,
                 cmdline: "console=hvc0".into(),
                 disks: Vec::new(),
+                volumes: Vec::new(),
                 io_pool: 0,
                 nics: Vec::new(),
                 gpu: None,
@@ -362,11 +398,12 @@ fn run(args: &[String]) -> Result<i32> {
                     "--io-pool" => o.io_pool = parse_mib(&val()?)?,
                     "--cmdline" => o.cmdline = val()?,
                     "--disk" => {
-                        // DISK[,ro][,start=SECTOR][,sectors=N] (or DISK:ro)
+                        // DISK[,ro][,start=SECTOR][,sectors=N] (or DISK:ro),
+                        // or DISK[,ro],extents=START:N+...
                         let v = val()?.replace(":ro", ",ro");
                         let mut it = v.split(',');
                         let d = parse_num(it.next().unwrap())?;
-                        let (mut ro, mut start, mut sectors) = (false, 0, 0);
+                        let (mut ro, mut start, mut sectors, mut extents) = (false, 0, 0, None);
                         for opt in it {
                             if opt == "ro" {
                                 ro = true;
@@ -374,11 +411,40 @@ fn run(args: &[String]) -> Result<i32> {
                                 start = parse_num(n)?;
                             } else if let Some(n) = opt.strip_prefix("sectors=") {
                                 sectors = parse_num(n)?;
+                            } else if let Some(e) = opt.strip_prefix("extents=") {
+                                extents = Some(parse_extents(e)?);
                             } else {
                                 return err(format!("--disk: unknown option {opt}"));
                             }
                         }
-                        o.disks.push((d, ro, start, sectors));
+                        match extents {
+                            Some(_) if start != 0 || sectors != 0 => return err("--disk: extents= or start=/sectors="),
+                            Some(e) => o.volumes.push((d, ro, e)),
+                            None => o.disks.push((d, ro, start, sectors)),
+                        }
+                    }
+                    "--lv" => {
+                        // DISK:VG/LV[,ro][,pv-start=SECTOR]
+                        let v = val()?;
+                        let (d, rest) = v.split_once(':').ok_or(Error("--lv DISK:VG/LV".into()))?;
+                        let d = parse_num(d)?;
+                        let mut it = rest.split(',');
+                        let lv = it.next().unwrap().to_string();
+                        let (mut ro, mut pv_start) = (false, None);
+                        for opt in it {
+                            if opt == "ro" {
+                                ro = true;
+                            } else if let Some(n) = opt.strip_prefix("pv-start=") {
+                                pv_start = Some(parse_num(n)?);
+                            } else {
+                                return err(format!("--lv: unknown option {opt}"));
+                            }
+                        }
+                        let pv_start = match pv_start {
+                            Some(p) => p,
+                            None => dom0_pv_start(&ctl, d)?,
+                        };
+                        o.volumes.push((d, ro, lv_extents(&lv, pv_start)?));
                     }
                     "--nic" => {
                         // SWITCH[,mac=MAC][,nolock][,isolated]

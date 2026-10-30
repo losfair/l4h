@@ -47,6 +47,11 @@ pub const CTL_VM_SET_MEM: u32 = 28;
 pub const CTL_VM_MEM_INFO: u32 = 29;
 pub const CTL_VM_TRUST: u32 = 30;
 pub const CTL_LOG_READ: u32 = 31;
+pub const CTL_BLK_ATTACH_EXTENTS: u32 = 32;
+/// Extents of a disk made of them, and the least sectors of each when
+/// there are several.
+pub const BLK_MAX_EXTENTS: usize = 4096;
+pub const BLK_MIN_EXTENT_SECTORS: u64 = 8192;
 pub const GPU_POOL_IMAGES: u64 = 4;
 pub const IOMMU_NONE: u64 = 0;
 pub const IOMMU_OFF: u64 = 1;
@@ -355,6 +360,90 @@ pub fn load(ctl: &Ctl, vm: u64, gpa: u64, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// The host's rules for a disk made of extents, with errors that name the
+/// extent: 1 to BLK_MAX_EXTENTS, 4 KiB aligned, each at least
+/// BLK_MIN_EXTENT_SECTORS if there are several.  The host also refuses
+/// extents that overlap each other or another VM's disk.
+pub fn check_extents(extents: &[(u64, u64)]) -> Result<()> {
+    if extents.is_empty() || extents.len() > BLK_MAX_EXTENTS {
+        return err(format!("{} extents: a disk has 1 to {BLK_MAX_EXTENTS}", extents.len()));
+    }
+    for (k, &(start, sectors)) in extents.iter().enumerate() {
+        if start % 8 != 0 || sectors % 8 != 0 || sectors == 0 {
+            return err(format!("extent {k} ({start}:{sectors}) is not 4 KiB aligned"));
+        }
+        if extents.len() > 1 && sectors < BLK_MIN_EXTENT_SECTORS {
+            return err(format!("extent {k} ({start}:{sectors}) is shorter than {BLK_MIN_EXTENT_SECTORS} sectors (4 MiB)"));
+        }
+    }
+    Ok(())
+}
+
+/// Extents as START:SECTORS+START:SECTORS..., in 512-byte sectors.
+pub fn parse_extents(s: &str) -> Result<Vec<(u64, u64)>> {
+    s.split('+').map(|e| {
+        let (start, sectors) = e.split_once(':').ok_or(Error(format!("bad extent {e}: START:SECTORS")))?;
+        Ok((parse_num(start)?, parse_num(sectors)?))
+    }).collect()
+}
+
+pub fn fmt_extents(extents: &[(u64, u64)]) -> String {
+    extents.iter().map(|(s, n)| format!("{s}:{n}")).collect::<Vec<_>>().join("+")
+}
+
+/// Rows of an `lvm` report, in 512-byte sectors.
+fn lvm(args: &[&str]) -> Result<Vec<Vec<String>>> {
+    let out = std::process::Command::new("lvm")
+        .args(args)
+        .args(["--noheadings", "--nosuffix", "--units", "s", "--separator", "|"])
+        .output()
+        .map_err(|e| Error(format!("lvm: {e}")))?;
+    if !out.status.success() {
+        return err(format!("lvm {}: {}", args[0], String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).lines().filter(|l| !l.trim().is_empty())
+        .map(|l| l.split('|').map(|f| f.trim().to_string()).collect()).collect())
+}
+
+/// The extents of LVM logical volume `lv` (VG/LV) on host disk sectors,
+/// in guest order, whose single PV starts at sector `pv_start` of the host
+/// disk.  Only linear LVs on one PV qualify: no thin, snapshot, origin,
+/// mirror, RAID or cache volumes.  Physically adjacent runs are joined.
+pub fn lv_extents(lv: &str, pv_start: u64) -> Result<Vec<(u64, u64)>> {
+    let (vg, _) = lv.split_once('/').ok_or(Error(format!("{lv}: not VG/LV")))?;
+    let field = |rows: &[Vec<String>], what: &str| -> Result<u64> {
+        let v = rows.first().and_then(|r| r.first()).ok_or(Error(format!("{lv}: no {what}")))?;
+        parse_num(v.split('.').next().unwrap())
+    };
+    let vgs = lvm(&["vgs", "-o", "pv_count", vg])?;
+    if field(&vgs, "PV count")? != 1 {
+        return err(format!("{vg}: only a volume group on one PV qualifies"));
+    }
+    let extent_size = field(&lvm(&["vgs", "-o", "vg_extent_size", vg])?, "extent size")?;
+    let pe_start = field(&lvm(&["pvs", "-S", &format!("vg_name={vg}"), "-o", "pe_start"])?, "PV")?;
+    let mut segs = Vec::new();
+    for row in lvm(&["lvs", "--segments", "-o", "lv_attr,segtype,seg_start_pe,seg_pe_ranges", lv])? {
+        let [attr, segtype, start_pe, ranges] = &row[..] else { return err(format!("{lv}: unexpected lvs output")) };
+        if !attr.starts_with('-') || segtype != "linear" {
+            return err(format!("{lv}: a {segtype} volume (attributes {attr}); only plain linear volumes qualify"));
+        }
+        let (_, range) = ranges.rsplit_once(':').ok_or(Error(format!("{lv}: bad PE range {ranges}")))?;
+        let (a, b) = range.split_once('-').ok_or(Error(format!("{lv}: bad PE range {ranges}")))?;
+        segs.push((parse_num(start_pe)?, parse_num(a)?, parse_num(b)?));
+    }
+    segs.sort();
+    let mut extents: Vec<(u64, u64)> = Vec::new();
+    for (_, a, b) in segs {
+        let (start, sectors) = (pv_start + pe_start + a * extent_size, (b - a + 1) * extent_size);
+        match extents.last_mut() {
+            Some(last) if last.0 + last.1 == start => last.1 += sectors,
+            _ => extents.push((start, sectors)),
+        }
+    }
+    check_extents(&extents).map_err(|e| Error(format!("{lv}: {}", e.0)))?;
+    Ok(extents)
+}
+
 pub fn read_file(path: &str) -> Result<Vec<u8>> {
     std::fs::read(path).map_err(|e| Error(format!("{path}: {e}")))
 }
@@ -402,6 +491,10 @@ pub struct VmSpec<'a> {
     pub cmdline: &'a str,
     /// (disk, read-only, first sector, sectors)
     pub disks: Vec<(u64, bool, u64, u64)>,
+    /// (disk, read-only, extents): disks made of extents (start, sectors)
+    /// of a host disk, in guest order, such as LVM logical volumes
+    /// ([`lv_extents`]).  They come after `disks`.
+    pub volumes: Vec<(u64, bool, Vec<(u64, u64)>)>,
     /// I/O pool in bytes (0: default, 4 MiB; a power of two, 1-256 MiB).
     pub io_pool: u64,
     /// (switch, MAC or 0, NIC_* flags)
@@ -512,6 +605,9 @@ impl Ctl {
         let r = (|| {
             for &(disk, ro, start, sectors) in &o.disks {
                 self.call(CTL_BLK_ATTACH, &[vm, disk, ro as u64, start, sectors], &[], &[])?;
+            }
+            for (disk, ro, extents) in &o.volumes {
+                self.attach_extents(vm, *disk, *ro, extents)?;
             }
             let mut macs = Vec::new();
             for &(sw, mac, flags) in &o.nics {
@@ -661,6 +757,16 @@ impl Ctl {
             failed: r.vals[2] != 0, kind: r.vals[3], sectors: r.vals[4], attachments: r.vals[5] })
     }
 
+    /// Give `vm` a disk made of `extents` (start, sectors) of host disk
+    /// `disk`, in guest order.
+    pub fn attach_extents(&self, vm: u64, disk: u64, read_only: bool, extents: &[(u64, u64)]) -> Result<()> {
+        check_extents(extents)?;
+        let list: Vec<u8> = extents.iter().flat_map(|&(s, n)| [s.to_le_bytes(), n.to_le_bytes()]).flatten().collect();
+        self.call(CTL_BLK_ATTACH_EXTENTS, &[vm, disk, read_only as u64, 0, extents.len() as u64], &[], &list)?;
+        Ok(())
+    }
+
+    /// One entry per window, or per extent of a disk made of them.
     pub fn disk_attachments(&self, disk: u64) -> Result<Vec<DiskAttachment>> {
         let mut out = Vec::new();
         let mut first = 0;
