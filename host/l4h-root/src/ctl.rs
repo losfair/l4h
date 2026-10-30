@@ -7,7 +7,6 @@ use l4h_abi as abi;
 
 use crate::Host;
 
-pub const EPERM: i64 = 1;
 pub const ENOENT: i64 = 2;
 pub const EIO: i64 = 5;
 pub const ENOMEM: i64 = 12;
@@ -52,13 +51,23 @@ pub fn host_op(h: &mut Host, op: u32, a: &[u64; 6], data: &mut [u8; abi::CTL_DAT
             // dom0's control data area, which root maps read-only.
             let from = (zero == 0).then_some(crate::vmmgr::CTL_DATA_VA as *const u8);
             let dk = &h.disks[disk];
-            crate::blkd::write(&mut h.ctrls[dk.ctrl], disk, dk, sector, len, from, &h.pci, &mut h.wins.a)?;
+            crate::blkd::write(&mut h.ctrls[dk.ctrl], dk, sector, len, from, &h.pci, &mut h.wins.a)?;
         }
         abi::CTL_BLK_INFO => {
             let disk = h.disks.get(a[0] as usize).ok_or(ENOENT)?;
+            // Row k of attachment i: one per extent, MAX_EXTENTS at most.
             let first = usize::try_from(a[1]).map_err(|_| EINVAL)?;
-            if let Some((i, att)) = h.ctrls[disk.ctrl].attachments(a[0] as usize).find(|&(i, _)| i >= first) {
-                vals = [i as u64 + 1, att.vm as u64, att.window.start, att.window.sectors, att.read_only as u64, 0];
+            let (slot, k) = (first >> 12, first & 0xfff);
+            let ctrl = &h.ctrls[disk.ctrl];
+            let row = ctrl.attachments(a[0] as usize)
+                .map(|(i, att)| (i, att, if i == slot { k } else { 0 }))
+                .find(|&(i, att, k)| i >= slot && k < att.extents.max(1));
+            if let Some((i, att, k)) = row {
+                let (start, sectors) = match att.extents {
+                    0 => (att.window.start, att.window.sectors),
+                    _ => ctrl.extent(i, k).unwrap_or((u64::MAX, 0)),
+                };
+                vals = [((i << 12 | k) + 1) as u64, att.vm as u64, start, sectors, att.read_only as u64, k as u64];
             }
         }
         abi::CTL_SWITCH_CREATE => vals[0] = h.netd.try_create_switch()? as u64,

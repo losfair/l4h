@@ -1,10 +1,13 @@
 //! blkd: drives one disk controller (virtio-blk, virtio-scsi or NVMe PCI
 //! device) for multiple clients (a guest's l4h-vmm).  A virtio-scsi
-//! controller has a unit per logical unit; the others have one.  Requests carry guest-physical segments, which are
-//! validated against the client's I/O pool and its LBA window and handed to
-//! the device by physical address: the device reads and writes the pool
-//! directly, never guest RAM (the guest bounces through the pool with
-//! swiotlb).  See DESIGN.md §8.2.
+//! controller has a unit per logical unit; the others have one.  A client's
+//! disk is a window of a unit or a list of extents of one (blk::Volume).
+//! Requests carry guest-physical segments, which are validated against the
+//! client's I/O pool and its disk, mapped to one or two device requests and
+//! handed to the device by physical address: the device reads and writes
+//! the pool directly, never guest RAM (the guest bounces through the pool
+//! with swiotlb).  blkd alone decides which clients may use which sectors
+//! (blk::Reservations); l4h-root asks with BLKD_CHECK.  See DESIGN.md §8.2.
 
 #![no_std]
 #![no_main]
@@ -100,33 +103,79 @@ struct Client {
     chan: *mut Channel,
     unit: usize,
     pool: Pool,
-    window: blk::DiskWindow,
+    /// In the client's table at extent_va(i), which only blkd maps.
+    vol: blk::Volume<'static>,
     read_only: bool,
     done: sel4::cap::Notification,
     outstanding: usize,
 }
 
+/// A request in flight: its pieces have tags `t << 1` and `t << 1 | 1`
+/// for pending slot t.
 #[derive(Clone, Copy)]
 struct Pending {
     client: usize,
     id: u64,
+    /// Pieces not yet completed.
+    left: u8,
+    /// The first error of a piece.
+    status: u32,
+}
+
+/// The second piece of a split request, started as soon as the device has
+/// room and before any new request.
+struct Carry {
+    t: usize,
+    unit: usize,
+    op: u32,
+    sector: u64,
+    segs: ArrayVec<Seg, MAX_PIECES>,
+}
+
+/// A piece of pending request `t` completed with `status`: the client gets
+/// the first error once all pieces have.
+fn finish(pending: &mut [Option<Pending>], clients: &mut [Option<Client>], t: usize, status: u32) {
+    let Some(slot) = pending.get_mut(t) else { return };
+    let Some(p) = slot.as_mut() else { return };
+    if p.status == blk::STATUS_OK { p.status = status; }
+    p.left -= 1;
+    if p.left == 0 {
+        let p = slot.take().unwrap();
+        if let Some(c) = clients[p.client].as_mut() {
+            c.outstanding -= 1;
+            c.respond(p.id, p.status);
+        }
+    }
 }
 
 /// Client slots, in .bss: too large for the stack.
 static mut CLIENTS: [Option<Client>; blk::MAX_CLIENTS] = [const { None }; blk::MAX_CLIENTS];
+/// dom0's boot ranges, in the same slots.
+static mut RESERVED: blk::Reservations<{ blk::MAX_CLIENTS }> = blk::Reservations::new();
+/// Where BLKD_CHECK builds the disk it checks.
+static mut SCRATCH_ORDER: [u16; blk::MAX_EXTENTS] = [0; blk::MAX_EXTENTS];
+static mut SCRATCH_EXTENTS: [blk::Extent; blk::MAX_EXTENTS] =
+    [blk::Extent { start: 0, sectors: 0, offset: 0 }; blk::MAX_EXTENTS];
 
 struct Blkd {
     clients: &'static mut [Option<Client>; blk::MAX_CLIENTS],
+    reserved: &'static mut blk::Reservations<{ blk::MAX_CLIENTS }>,
     /// Indices of the attached clients, in attach order: the submit loop
     /// visits only these.
     active: ArrayVec<usize, { blk::MAX_CLIENTS }>,
     // Tags are allocated here, never taken from a client. Slots are not
     // reusable until the hardware has completed every command of a request.
     pending: [Option<Pending>; MAX_INFLIGHT],
+    carry: Option<Carry>,
     drv: Drv,
     dev: ArrayVec<DevInfo, { blk::MAX_UNITS }>,
     next: usize,
     ticks_per_sec: u64,
+}
+
+/// What each slot's client holds, for blk::Reservations.
+fn holds(clients: &[Option<Client>]) -> impl Fn(usize) -> Option<blk::Hold<'static>> + '_ {
+    |i| clients[i].as_ref().map(|c| blk::Hold { unit: c.unit, extents: c.vol.extents, read_only: c.read_only })
 }
 
 impl Client {
@@ -141,16 +190,28 @@ impl Client {
         self.done.signal();
     }
 
-    fn prepare(&self, req: &blk::Req, block_size: u32, pieces: &mut ArrayVec<Seg, MAX_PIECES>) -> Result<u64, u32> {
-        let sector = self.window.check_request(req, self.pool, block_size, self.read_only)?;
-        pieces.clear();
-        if req.op != blk::OP_FLUSH {
-            // check_request allows at most MAX_SEGS segments.
-            for s in &req.segs[..req.nr_segs as usize] {
-                let _ = pieces.push(Seg { pa: self.pool.translate(s.gpa, s.len as u64).unwrap(), len: s.len });
+    /// Map a request to its device requests: their sectors and segments,
+    /// and how many there are (none for a flush).
+    fn prepare(&self, req: &blk::Req, block_size: u32, groups: &mut [ArrayVec<Seg, MAX_PIECES>; 2])
+        -> Result<([u64; 2], usize), u32> {
+        let (pieces, n) = self.vol.map(req, self.pool, block_size, self.read_only)?;
+        groups.iter_mut().for_each(|g| g.clear());
+        // map allows at most MAX_SEGS segments; splitting the one that
+        // crosses the boundary leaves each piece at most MAX_SEGS.
+        let (mut k, mut left) = (0, pieces[0].1);
+        for s in &req.segs[..req.nr_segs as usize] {
+            let (mut pa, mut len) = (self.pool.translate(s.gpa, s.len as u64).unwrap(), s.len as u64);
+            while len > 0 {
+                let take = len.min(left);
+                let _ = groups[k].push(Seg { pa, len: take as u32 });
+                (pa, len, left) = (pa + take, len - take, left - take);
+                if left == 0 && k + 1 < n {
+                    k += 1;
+                    left = pieces[k].1;
+                }
             }
         }
-        Ok(sector)
+        Ok(([pieces[0].0, pieces[1].0], n))
     }
 }
 
@@ -166,19 +227,23 @@ impl Blkd {
                 provision = Some(status);
                 return;
             }
-            if let Some(p) = pending.get_mut(tag as usize).and_then(|p| p.take()) {
-                if let Some(c) = clients[p.client].as_mut() {
-                    c.outstanding -= 1;
-                    c.respond(p.id, status);
-                }
-            }
+            finish(&mut pending[..], &mut clients[..], (tag >> 1) as usize, status);
         });
         provision
     }
 
+    /// Start the carried piece if the device has room: whether it did.
+    fn start_carry(&mut self) -> bool {
+        if self.carry.is_none() || !self.drv.can_start() { return false; }
+        let c = self.carry.take().unwrap();
+        let r = self.drv.start((c.t as u64) << 1 | 1, c.unit, c.op, c.sector, &c.segs);
+        if let Err(status) = r { finish(&mut self.pending[..], &mut self.clients[..], c.t, status); }
+        r.is_ok()
+    }
+
     fn submit(&mut self) {
-        let mut pieces = ArrayVec::new();
-        let mut started = false;
+        let mut groups = [ArrayVec::new(), ArrayVec::new()];
+        let mut started = self.start_carry();
         // Bounded work per client and round-robin starting point. A busy
         // ring cannot occupy every hardware slot before others get a turn.
         let n = self.active.len();
@@ -187,8 +252,8 @@ impl Blkd {
                 let i = self.active[(self.next + off) % n];
                 let Some(c) = self.clients[i].as_mut() else { continue };
                 for _ in 0..4 {
-                    if !self.drv.can_start() { break; }
-                    let Some(tag) = self.pending.iter().position(Option::is_none) else { break };
+                    if self.carry.is_some() || !self.drv.can_start() { break; }
+                    let Some(t) = self.pending.iter().position(Option::is_none) else { break };
                     let req = unsafe {
                         let tail = addr_of!((*c.chan).sq.tail).read_volatile();
                         let head = addr_of!((*c.chan).sq.head).read_volatile();
@@ -203,20 +268,35 @@ impl Blkd {
                         req
                     };
                     let dev = &self.dev[c.unit];
-                    let result = c.prepare(&req, dev.block_size, &mut pieces).and_then(|sector| {
-                        if req.op == blk::OP_FLUSH {
-                            pieces.clear();
-                            if !dev.flush { return Err(blk::STATUS_OK); }
+                    let (sectors, n) = match c.prepare(&req, dev.block_size, &mut groups) {
+                        Ok((_, 0)) if !dev.flush => {
+                            c.respond(req.id, blk::STATUS_OK);
+                            continue;
                         }
-                        self.drv.start(tag as u64, c.unit, req.op, sector, &pieces)
-                    });
-                    match result {
-                        Ok(()) => {
-                            self.pending[tag] = Some(Pending { client: i, id: req.id });
-                            c.outstanding += 1;
-                            started = true;
+                        Ok(p) => p,
+                        Err(status) => {
+                            c.respond(req.id, status);
+                            continue;
                         }
-                        Err(status) => c.respond(req.id, status),
+                    };
+                    // A flush is one device request without data.
+                    if let Err(status) = self.drv.start((t as u64) << 1, c.unit, req.op, sectors[0], &groups[0]) {
+                        c.respond(req.id, status);
+                        continue;
+                    }
+                    self.pending[t] = Some(Pending { client: i, id: req.id, left: n.max(1) as u8, status: blk::STATUS_OK });
+                    c.outstanding += 1;
+                    started = true;
+                    if n == 2 {
+                        let segs = core::mem::replace(&mut groups[1], ArrayVec::new());
+                        let carry = Carry { t, unit: c.unit, op: req.op, sector: sectors[1], segs };
+                        if !self.drv.can_start() {
+                            self.carry = Some(carry);
+                        } else if let Err(status) = self.drv.start((t as u64) << 1 | 1, c.unit, req.op, carry.sector, &carry.segs) {
+                            // The first piece is still in flight.
+                            let p = self.pending[t].as_mut().unwrap();
+                            (p.status, p.left) = (status, 1);
+                        }
                     }
                 }
             }
@@ -233,6 +313,7 @@ impl Blkd {
         // only submitted work; no controller reset disrupts other clients.
         let end = self.deadline();
         while self.clients[i].as_ref().is_some_and(|c| c.outstanding != 0) {
+            if self.start_carry() { self.drv.kick(); }
             self.reap();
             if host::ticks::now() > end { return u64::MAX; }
             core::hint::spin_loop();
@@ -242,30 +323,56 @@ impl Blkd {
         0
     }
 
-    fn provision(&mut self, cfg: &BlkdConfig, unit: usize, sector: u64, len: usize, flush: bool) -> u64 {
-        let Some(&dev) = self.dev.get(unit) else { return u64::MAX };
-        if dev.read_only { return blk::STATUS_IOERR as u64; }
+    /// A blk::STATUS_* (u64::MAX: the device failed), or the errno the
+    /// range is refused with.
+    fn provision(&mut self, cfg: &BlkdConfig, unit: usize, sector: u64, len: usize, flush: bool) -> Result<u64, u64> {
+        let Some(&dev) = self.dev.get(unit) else { return Ok(u64::MAX) };
+        if dev.read_only { return Err(blk::EPERM); }
         if !flush {
-            let Some(w) = blk::DiskWindow::new(sector, (len / 512) as u64, dev.capacity) else { return u64::MAX };
-            if len == 0 || len > blk::STAGING_SIZE || len % dev.block_size as usize != 0
-                || self.clients.iter().flatten().any(|c| c.unit == unit && c.window.overlaps(w)) { return u64::MAX; }
+            // Whole 4 KiB blocks, which every block size divides.
+            let w = blk::DiskWindow::new(sector, (len / 512) as u64, dev.capacity)
+                .filter(|_| len != 0 && len <= blk::STAGING_SIZE && len % 4096 == 0).ok_or(blk::EINVAL)?;
+            if !self.reserved.unattached(&holds(&self.clients[..]), unit, w) { return Err(blk::EBUSY); }
         }
-        if flush && !dev.flush { return blk::STATUS_OK as u64; }
+        if flush && !dev.flush { return Ok(blk::STATUS_OK as u64); }
         let end = self.deadline();
         while !self.drv.can_start() {
             self.reap();
-            if host::ticks::now() > end { return u64::MAX; }
+            if host::ticks::now() > end { return Ok(u64::MAX); }
         }
         let data = [Seg { pa: cfg.dma_paddr + cfg.dma_size, len: len as u32 }];
         let result = self.drv.start(u64::MAX, unit, if flush { blk::OP_FLUSH } else { blk::OP_WRITE },
             sector, if flush { &[] } else { &data });
-        if let Err(status) = result { return status as u64; }
+        if let Err(status) = result { return Ok(status as u64); }
         self.drv.kick();
         loop {
-            if let Some(status) = self.reap() { return status as u64; }
-            if host::ticks::now() > end { return u64::MAX; }
+            if let Some(status) = self.reap() { return Ok(status as u64); }
+            if host::ticks::now() > end { return Ok(u64::MAX); }
             core::hint::spin_loop();
         }
+    }
+
+    /// Build the disk a client of `unit` would get, the window `start`,
+    /// `sectors` (0: to the end) or the n extents in staging, into `order`
+    /// and `extents`: the slot it may attach in, the disk and whether it is
+    /// read-only, or the errno it is refused with.
+    #[allow(clippy::too_many_arguments)]
+    fn check<'a>(&self, cfg: &BlkdConfig, unit: usize, start: u64, sectors: u64, n: usize, read_only: bool, dom0: bool,
+        order: &'a mut [u16], extents: &'a mut [blk::Extent]) -> Result<(usize, blk::Volume<'a>, bool), u64> {
+        let dev = self.dev.get(unit).ok_or(blk::EINVAL)?;
+        let read_only = read_only || dev.read_only;
+        let vol = if n == 0 {
+            let w = blk::DiskWindow::new(start, sectors, dev.capacity).ok_or(blk::EINVAL)?;
+            blk::Volume::build(core::iter::once((w.start, w.sectors)), &mut order[..1], &mut extents[..1], dev.capacity)?
+        } else {
+            if n > blk::MAX_EXTENTS { return Err(blk::EINVAL); }
+            // Each pair is read once, into `extents`, before it is checked.
+            let staging = (cfg.dma_va + cfg.dma_size) as *const [u64; 2];
+            let raw = (0..n).map(|k| unsafe { staging.add(k).read_volatile() }).map(|[s, c]| (s, c));
+            blk::Volume::build(raw, &mut order[..n], &mut extents[..n], dev.capacity)?
+        };
+        let hold = blk::Hold { unit, extents: vol.extents, read_only };
+        Ok((self.reserved.slot(&holds(&self.clients[..]), &hold, dom0)?, vol, read_only))
     }
 }
 
@@ -291,10 +398,16 @@ fn main(info: &'static Info) -> ! {
     let mut b = Blkd {
         // The only reference to CLIENTS.
         clients: unsafe { &mut *addr_of_mut!(CLIENTS) },
+        // The only reference to RESERVED.
+        reserved: unsafe { &mut *addr_of_mut!(RESERVED) },
         active: ArrayVec::new(),
         pending: [None; MAX_INFLIGHT],
+        carry: None,
         drv, dev, next: 0, ticks_per_sec: info.header().tsc_hz,
     };
+    // The only references to the scratch table.
+    let scratch_order = unsafe { &mut *addr_of_mut!(SCRATCH_ORDER) };
+    let scratch_extents = unsafe { &mut *addr_of_mut!(SCRATCH_EXTENTS) };
     let ep = cap::<cap_type::Endpoint>(host::SLOT_SERVICE_EP);
     let reply = cap::<cap_type::Reply>(host::SLOT_REPLY);
     let irq = cap::<cap_type::IrqHandler>(blk::BLKD_SLOT_IRQ);
@@ -322,23 +435,31 @@ fn main(info: &'static Info) -> ! {
                 }
             }
             blk::BLKD_ADD => {
-                let (i, unit) = (mr(0) as usize, mr(1) as usize);
-                if i >= blk::MAX_CLIENTS || b.clients[i].is_some() || unit >= b.dev.len() { u64::MAX } else {
+                let (i, unit, dom0, n) = (mr(0) as usize, mr(1) as usize, mr(2) != 0, mr(3) as usize);
+                if i >= blk::MAX_CLIENTS || b.clients[i].is_some() || unit >= b.dev.len() || n > blk::MAX_EXTENTS { u64::MAX } else {
                     let dev = b.dev[unit];
                     let chan = blk::channel_va(i) as *mut Channel;
                     let (start, count, ro, pool) = unsafe {
                         (addr_of!((*chan).lba_start).read_volatile(), addr_of!((*chan).capacity_sectors).read_volatile(),
                          addr_of!((*chan).read_only).read_volatile(), addr_of!((*chan).pool).read_volatile())
                     };
-                    let read_only = ro != 0 || dev.read_only;
-                    match blk::DiskWindow::new(start, count, dev.capacity) {
-                        Some(window) if !b.clients.iter().flatten()
-                            .any(|c| c.unit == unit && window.conflicts(read_only, c.window, c.read_only)) => {
-                            b.clients[i] = Some(Client { chan, unit, pool, window, read_only,
+                    // Root mapped table_pages(n.max(1)) of the client's
+                    // table for blkd alone; they stay until BLKD_REMOVE.
+                    let table = blk::extent_va(i) as *mut blk::ExtentTable;
+                    let (order, extents) = unsafe {
+                        (core::slice::from_raw_parts_mut(addr_of_mut!((*table).order).cast(), n.max(1)),
+                         core::slice::from_raw_parts_mut(addr_of_mut!((*table).extents).cast(), n.max(1)))
+                    };
+                    // Exactly what BLKD_CHECK allowed: root serializes
+                    // checks and attachments.
+                    match b.check(cfg, unit, start, count, n, ro != 0, dom0, order, extents) {
+                        Ok((slot, vol, read_only)) if slot == i => {
+                            b.clients[i] = Some(Client { chan, unit, pool, vol, read_only,
                                 done: cap::<cap_type::Notification>(blk::BLKD_SLOT_CLIENT_DONE + i as u64), outstanding: 0 });
                             // Not attached yet, so not in active.
                             let _ = b.active.push(i);
                             unsafe {
+                                addr_of_mut!((*chan).capacity_sectors).write_volatile(vol.sectors());
                                 addr_of_mut!((*chan).read_only).write_volatile(read_only as u32);
                                 addr_of_mut!((*chan).block_size).write_volatile(dev.block_size);
                                 fence(Ordering::Release);
@@ -351,8 +472,46 @@ fn main(info: &'static Info) -> ! {
                 }
             }
             blk::BLKD_REMOVE => b.remove(mr(0) as usize),
-            blk::BLKD_WRITE => b.provision(cfg, mr(2) as usize, mr(0), mr(1) as usize, false),
-            blk::BLKD_FLUSH => b.provision(cfg, mr(0) as usize, 0, 0, true),
+            blk::BLKD_RESERVE => {
+                // Boot ranges may lie beyond an unknown or unaligned
+                // capacity: they keep sectors from others, never address them.
+                match blk::DiskWindow::new(mr(1), mr(2), u64::MAX & !7) {
+                    Some(window) if mr(2) != 0 && (mr(0) as usize) < blk::MAX_UNITS => {
+                        let r = blk::Reserved { unit: mr(0) as usize, window, read_only: mr(3) != 0 };
+                        b.reserved.reserve(&holds(&b.clients[..]), r).map_or(u64::MAX, |i| i as u64)
+                    }
+                    _ => u64::MAX,
+                }
+            }
+            blk::BLKD_CHECK => {
+                let (order, extents) = (&mut *scratch_order, &mut *scratch_extents);
+                match b.check(cfg, mr(0) as usize, mr(1), mr(2), mr(5) as usize, mr(3) != 0, mr(4) != 0, order, extents) {
+                    Ok((slot, vol, read_only)) => {
+                        response[1] = slot as u64;
+                        response[2] = vol.sectors();
+                        response[3] = read_only as u64;
+                        0
+                    }
+                    Err(errno) => errno,
+                }
+            }
+            blk::BLKD_EXTENT => match b.clients.get(mr(0) as usize).and_then(|c| c.as_ref()?.vol.nth(mr(1) as usize)) {
+                Some(e) => {
+                    response[1] = e.start;
+                    response[2] = e.sectors;
+                    0
+                }
+                None => u64::MAX,
+            },
+            blk::BLKD_WRITE | blk::BLKD_FLUSH => {
+                let flush = msg.label() == blk::BLKD_FLUSH;
+                let r = if flush { b.provision(cfg, mr(0) as usize, 0, 0, true) }
+                    else { b.provision(cfg, mr(2) as usize, mr(0), mr(1) as usize, false) };
+                r.unwrap_or_else(|errno| {
+                    response[1] = errno;
+                    blk::BLKD_REFUSED
+                })
+            }
             _ => u64::MAX,
         };
         response[0] = result;

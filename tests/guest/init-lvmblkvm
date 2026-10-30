@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+fail() { echo "LVMVM: FAIL: $*"; poweroff -f; }
+[ "$(cat /sys/block/vda/size)" = "$(($(wc -c < /bin/pattern) / 512))" ] || fail "capacity $(cat /sys/block/vda/size)"
+# 768 KiB requests: some cross the boundaries at 8 and 20 MiB.
+dd if=/bin/pattern of=/dev/vda bs=768k oflag=direct 2>/dev/null || fail write
+dd if=/dev/vda bs=1536k iflag=direct 2>/dev/null | cmp - /bin/pattern || fail readback
+echo "LVMVM: ok"
+while :; do sleep 10; done

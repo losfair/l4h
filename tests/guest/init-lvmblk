@@ -1,0 +1,28 @@
+#!/bin/sh
+set -eu
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mount -t tmpfs tmp /tmp
+fail() { echo "LVMBLK: FAIL: $*"; poweroff -f; }
+extents=$(cat /bin/extents)
+second=$(echo "$extents" | cut -d+ -f2 | cut -d: -f1)
+third=$(echo "$extents" | cut -d+ -f3 | cut -d: -f1)
+echo "LVMBLK: start, extents $extents"
+vm=$(l4hctl create lv --initrd /bin/lvmvm.cpio.gz --mem 128 --disk "0,extents=$extents" --cmdline "console=hvc0 quiet") \
+    || fail create
+l4hctl console "$vm" --until 'LVMVM: ok' --timeout 120 > /tmp/console || { cat /tmp/console; fail guest; }
+if grep -q 'LVMVM: FAIL' /tmp/console; then cat /tmp/console; fail guest; fi
+echo "LVMBLK: guest wrote and read back its volume across extent boundaries"
+# The volume's sectors are taken; the gap before its second extent is not.
+if l4hctl create over --initrd /bin/lvmvm.cpio.gz --disk "0,start=$((second + 8)),sectors=8" > /tmp/id 2>/tmp/err; then
+    fail overlap
+fi
+grep -q busy /tmp/err || { cat /tmp/err; fail overlap-error; }
+if l4hctl disk-zero 0 "$third" 8 2>/tmp/err; then fail provision-over-volume; fi
+grep -q busy /tmp/err || { cat /tmp/err; fail provision-error; }
+l4hctl disk-zero 0 $((second - 8)) 8 || fail provision-gap
+echo "LVMBLK: overlap and provisioning refused, gap free"
+l4hctl destroy "$vm" || fail destroy
+echo "LVMBLK: PASS"
+poweroff -f

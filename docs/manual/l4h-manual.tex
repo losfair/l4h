@@ -1113,6 +1113,8 @@ separate domains.
 l4hctl create NAME [--initrd FILE] [--mem MB] [--vcpus N]
        [--cmdline STRING] [--io-pool MB]
        [--disk DISK[,ro][,start=SECTOR][,sectors=N]]...
+       [--disk DISK[,ro],extents=START:N+START:N...]...
+       [--lv DISK:VG/LV[,ro][,pv-start=SECTOR]]...
        [--nic SWITCH[,mac=MAC][,nolock][,isolated]]...
        [--gpu WxH]
 \end{lstlisting}
@@ -1147,6 +1149,9 @@ fails, it destroys the half-built VM.
   \item[\texttt{--disk ...}] Pass a host disk through
     (Chapter~\ref{ch:storage}). Repeat it for more disks; they appear as
     \file{/dev/vda}, \file{/dev/vdb}, \ldots{} in the order given.
+  \item[\texttt{--lv ...}, \texttt{--disk ...,extents=}] A disk made of
+    extents of a host disk, such as an LVM logical volume
+    (Section~\ref{sec:lvm}). These disks come after the others.
   \item[\texttt{--nic ...}] Add a vNIC on a switch
     (Chapter~\ref{ch:network}). Repeat it for more vNICs; they appear as
     \texttt{eth0}, \texttt{eth1}, \ldots{} in the order given.
@@ -1375,6 +1380,55 @@ at once: a device is never given guest RAM.
 dom0 decides which guest gets which disk, and can attach any free disk to
 any guest. The host does not check what is on a disk.
 \end{caveat}
+
+\section{LVM logical volumes}
+\label{sec:lvm}
+
+A guest disk can be an LVM2 linear logical volume: the guest sees one
+disk whose sectors are the volume's, wherever they lie on one host disk.
+The disk stays an ordinary LVM physical volume (PV); booted on Linux, the
+same volume group (VG) shows the volume with what the guest wrote. The host
+does not read LVM metadata: dom0 does, with stock LVM2, and passes the
+volume's extents.
+\begin{lstlisting}
+--lv DISK:VG/LV[,ro][,pv-start=SECTOR]
+--disk DISK[,ro],extents=START:SECTORS+START:SECTORS...
+\end{lstlisting}
+\texttt{--lv} reads the extents from \cmd{lvm}'s reports; \cmd{l4hctl
+lv-extents DISK VG/LV [--pv-start SECTOR]} prints them in the form
+\texttt{extents=} takes. \texttt{pv-start} is the PV's first sector on
+host disk \texttt{DISK}: 0 for a PV on the whole disk, its partition's start
+otherwise. By default it is the start of dom0's only window on the disk,
+the PV's head (below).
+
+Only linear volumes on a VG with one PV qualify: thin, snapshot, origin,
+mirror, RAID and cache volumes are refused. A volume has at most 4096
+extents (runs of physical extents that are adjacent on disk count as one),
+each 4\,KiB aligned and, if there are several, at least 4\,MiB long. LVM's
+default physical extent is 4\,MiB; with a smaller one, every run must
+still be 4\,MiB. Ownership works extent by extent: a writable volume
+overlaps nothing else, read-only volumes may share sectors, and
+\cmd{disk-zero} and \cmd{disk-write} refuse every attached extent. So if
+you remove or reduce a volume while a guest uses it, its extents cannot
+be given to another guest until that guest is destroyed.
+
+\paragraph{Managing the VG from dom0.} dom0 must not hold the volumes'
+data, which guests use. Give it only the PV's head, from sector 0 of the PV
+to \texttt{pe\_start} (1\,MiB by default), as a boot window, for example
+\texttt{dom0\_disk0\_windows=...,P:2048} for a PV at sector
+\texttt{P}. \cmd{l4h-lvm-pv /dev/vdX} then makes
+\file{/dev/mapper/l4h-pv-vdX}, a device as large as the PV that reads and
+writes the head and fails everything after it. Run LVM on it with automatic
+activation off and without touching new volumes' data:
+\begin{lstlisting}
+devices    { global_filter = [ "a|^/dev/mapper/l4h-pv-|", "r|.*|" ] }
+activation { auto_activation_volume_list = [] }
+\end{lstlisting}
+and create volumes with \cmd{lvcreate -Zn -Wn}. Keep one metadata copy per
+PV (the default): a second one sits at the PV's end, outside dom0's
+window. To zero or seed a new volume, run \cmd{l4hctl disk-zero} or
+\cmd{disk-write} on each of its extents before attaching it.
+\cmd{pvmove} and other commands that move data do not work from dom0.
 
 \section{Performance and semantics}
 
@@ -1960,6 +2014,9 @@ Op & Name & Arguments & Results \\
 6 & \texttt{VM\_LIST} & first VM id & count; \texttt{struct l4h\_ctl\_vm}
   entries in data \\
 7 & \texttt{BLK\_ATTACH} & VM, disk, read-only, first sector, sectors & -- \\
+32 & \texttt{BLK\_ATTACH\_\allowbreak EXTENTS} & VM, disk, read-only, data
+  area offset, count; \texttt{struct l4h\_ctl\_extent} entries in the data
+  area & -- \\
 8 & \texttt{CONSOLE\_READ} & VM, offset & next offset, bytes, bytes lost;
   output in data \\
 9 & \texttt{CONSOLE\_WRITE} & VM, length; input in data & bytes accepted \\
@@ -1986,6 +2043,9 @@ Op & Name & Arguments & Results \\
 A \texttt{VM\_LOAD} ioctl supplies its bytes through
 \texttt{l4hctl\_call.buf} and \texttt{len}; the driver stages them and sets
 the request's source offset to 0 and length to the ioctl buffer length.
+A \texttt{BLK\_ATTACH\_EXTENTS} ioctl supplies the extent list the same
+way, as many bytes as its count of \texttt{struct l4h\_ctl\_extent}; the
+driver stages it at offset 0.
 
 A VM is built in this order: \texttt{VM\_CREATE}, then any
 \texttt{BLK\_ATTACH}, \texttt{NIC\_CREATE} and \texttt{VM\_LOAD} requests,

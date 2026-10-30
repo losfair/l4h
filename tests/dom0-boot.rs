@@ -57,7 +57,8 @@ impl Vmmgr {
         g.devices.push(());
         Ok(())
     }
-    fn attach_disk(&mut self, _: usize, disk: usize, ro: bool, start: u64, sectors: u64) -> Result<(), i64> {
+    fn attach_disk(&mut self, _: usize, disk: usize, ro: bool, start: u64, sectors: u64, extents: (u64, u64)) -> Result<(), i64> {
+        assert_eq!(extents, (0, 0), "boot disks are windows");
         assert!(!ro);
         let attempt = self.disk_attempts.len();
         self.disk_attempts.push((disk, start, sectors));

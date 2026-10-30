@@ -236,7 +236,15 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
             if id == caller {
                 return Err(EINVAL);
             }
-            h.attach_disk(id, a[1] as usize, a[2] != 0, a[3], a[4])
+            h.attach_disk(id, a[1] as usize, a[2] != 0, a[3], a[4], (0, 0))
+        }
+        abi::CTL_BLK_ATTACH_EXTENTS => {
+            let id = vm_arg(a[0])?;
+            if id == caller {
+                return Err(EINVAL);
+            }
+            // Root reads the list from the data area.
+            h.attach_disk(id, a[1] as usize, a[2] != 0, 0, 0, (a[4], a[3]))
         }
         abi::CTL_CONSOLE_READ => {
             let g = h.guest(vm_arg(a[0])?).ok_or(ENOENT)?;

@@ -99,7 +99,9 @@ pub const VMMGR_GUEST_NEW: u64 = 0x100;
 /// kept out of use (a disk could not be stopped).
 pub const VMMGR_GUEST_DEL: u64 = 0x101;
 /// MR0 = guest, MR1 = its device index, MR2 = host disk, MR3 = read-only,
-/// MR4 = first sector, MR5 = sectors (0: to the end).  Exchange slots
+/// MR4 = first sector, MR5 = sectors (0: to the end); or, if MR6 (n) is
+/// not 0, the n extents (start, sectors) at offset MR7 of dom0's control
+/// data area, which blkd reads (root copies them unread).  Exchange slots
 /// [0, blk::CHANNEL_PAGES) = the channel frames, the next = blkd's kick.
 pub const VMMGR_DISK_ATTACH: u64 = 0x102;
 /// MR0 = guest, MR1 = its device index, MR2 = switch, MR3 = MAC (0:
