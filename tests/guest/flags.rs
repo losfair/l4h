@@ -116,7 +116,7 @@ fn dom0(no_tpm: bool) {
     let sealed_cmd = cmd("sealed");
     let fresh_cmd = cmd("fresh");
     let spec = |mode| VmSpec { name: "flags", mem: 128 << 20, vcpus: 2, initrd: &initrd,
-        cmdline: mode, disks: vec![], nics: vec![], io_pool: 0, gpu: Some((64, 64)) };
+        cmdline: mode, disks: vec![], volumes: vec![], nics: vec![], io_pool: 0, gpu: Some((64, 64)) };
     // A separate clean instance avoids racing its report against input:
     // dom0 cannot observe completion through a sealed output console.
     let (id, _) = c.create_vm(&spec(&clean_cmd)).unwrap();
