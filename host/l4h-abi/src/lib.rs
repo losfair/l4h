@@ -338,6 +338,8 @@ pub const NIC_ISOLATED: u64 = 1 << 1;
 /// power failure, for disks whose contents do not outlive the VM.
 pub const BLK_RO: u64 = 1 << 0;
 pub const BLK_VOLATILE: u64 = 1 << 1;
+/// AES-256-XTS with the 64-byte key in the request data.
+pub const BLK_ENCRYPT: u64 = 1 << 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]

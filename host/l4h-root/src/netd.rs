@@ -181,7 +181,7 @@ pub fn spawn(
         let _ = dma.push(frames);
         // The NIC reaches its DMA memory only.
         let dom = iommu.attach(alloc, d);
-        iommu.map(alloc, dom, paddr, 1 << NIC_DMA_BITS, true);
+        iommu.map(alloc, dom, paddr, 1 << NIC_DMA_BITS, crate::iommu::Access::ReadWrite);
         let (msi_address, msi_data) = iommu.msi(dom, NIC_MSI_BASE + n as u64);
         cfg.nics[n] = net::NicConfig {
             kind: if gvnic {

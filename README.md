@@ -29,7 +29,8 @@ on top:
 - trustd: One per host. Owns the host TPM, gives out signed attestations
   to VMs, and manages VM taint/seal flags.
 - blkd: One per host disk. Multiplexes host NVMe/virtio-blk disks and
-  provides block devices to VMs.
+  provides block devices to VMs, optionally encrypted with AES-256-XTS
+  (AES-NI or ARMv8 Crypto Extensions).
 - netd: One per host. Provides virtual switches to VMs and attaches physical
   NICs to virtual switches. NIC drivers run here. Supports virtio-net and
   Intel X550 NICs.

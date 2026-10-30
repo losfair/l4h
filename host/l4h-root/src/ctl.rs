@@ -15,6 +15,7 @@ pub const EBUSY: i64 = 16;
 pub const EINVAL: i64 = 22;
 pub const ENOSPC: i64 = 28;
 pub const ENOSYS: i64 = 38;
+pub const EOPNOTSUPP: i64 = 95;
 
 /// Execute control op `op` with `a`: its vals, and its data into `data`.
 pub fn host_op(h: &mut Host, op: u32, a: &[u64; 6], data: &mut [u8; abi::CTL_DATA_MAX]) -> Result<[u64; 6], i64> {
@@ -58,7 +59,7 @@ pub fn host_op(h: &mut Host, op: u32, a: &[u64; 6], data: &mut [u8; abi::CTL_DAT
             let disk = h.disks.get(a[0] as usize).ok_or(ENOENT)?;
             let first = usize::try_from(a[1]).map_err(|_| EINVAL)?;
             if let Some((i, att)) = h.ctrls[disk.ctrl].attachments(a[0] as usize).find(|&(i, _)| i >= first) {
-                vals = [i as u64 + 1, att.vm as u64, att.window.start, att.window.sectors, att.read_only as u64, 0];
+                vals = [i as u64 + 1, att.vm as u64, att.window.start, att.window.sectors, att.read_only as u64, att.encrypted as u64];
             }
         }
         abi::CTL_SWITCH_CREATE => vals[0] = h.netd.try_create_switch()? as u64,

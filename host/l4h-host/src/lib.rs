@@ -75,6 +75,14 @@ pub const DMA_VA: usize = 0x3800_0000_0000;
 /// The guest's I/O pool (l4h-vmm): GPA g in the pool is mapped at
 /// IO_POOL_VA + (g - io_pool_gpa).  l4h-vmm never maps guest RAM.
 pub const IO_POOL_VA: usize = 0x4000_0000_0000;
+// Blkd's CPU mappings must not collide with BAR0 (notably NVMe), DMA
+// queues, or the complete client-channel range.
+const _: () = assert!(blk::CHANNEL_VA + blk::MAX_CLIENTS * blk::CHANNEL_STRIDE <= blk::BOUNCE_VA
+    && blk::BOUNCE_VA + blk::BOUNCE_SIZE <= MMIO_VA
+    && MMIO_VA + 6 * 0x100_0000 <= DMA_VA
+    && DMA_VA + (8 << 20) <= blk::POOL_VA
+    && blk::POOL_VA + blk::MAX_CLIENTS * blk::POOL_STRIDE <= 1 << 47);
+
 
 /// Component CSpace: one CNode of 2^CNODE_BITS slots resolving the whole
 /// CPtr, so a CPtr is simply a slot number.

@@ -13,7 +13,7 @@ use l4h_host::{self as host, blk};
 
 use crate::component::{self, Component, SpawnArgs, abs_of};
 use crate::devmem::DevMem;
-use crate::iommu::{Iommu, Domain};
+use crate::iommu::{Access, Iommu, Domain};
 use crate::mem::{Alloc, Arena, Dest, Slot};
 use crate::pci::{self, Pci};
 use crate::vmmgr::RootGuest;
@@ -60,7 +60,7 @@ fn wc_attrs() -> VmAttributes {
     #[cfg(target_arch = "aarch64")]
     return DEVICE_ATTRS;
 }
-const DMA_BITS: usize = 22;
+const DMA_BITS: usize = 23;
 /// Each BAR is mapped at MMIO_VA + bar * BAR_STRIDE.
 pub const BAR_STRIDE: usize = 0x100_0000;
 
@@ -90,6 +90,7 @@ pub struct Controller {
     /// issued once.
     io: Option<cap::Null>,
     driver: Option<Blkd>,
+    pub features: u64,
     /// The device's IOMMU domain: blkd's DMA memory and its clients'
     /// I/O pools.
     dom: Domain,
@@ -134,7 +135,7 @@ impl Controller {
         assert!(row < pci::MAX_DISK_CTRLS, "more than {} disk controllers", pci::MAX_DISK_CTRLS);
         // Each row is handed out once, so this is its only reference.
         let clients = unsafe { &mut (*addr_of_mut!(CLIENTS))[row] };
-        Controller { pci, kind, vector, bars: [const { None }; 6], clients, failed: false, io: None, driver: None, dom: Domain::NONE }
+        Controller { pci, kind, vector, bars: [const { None }; 6], clients, failed: false, io: None, driver: None, features: 0, dom: Domain::NONE }
     }
 
     /// The attachments of disk `disk`, with their client indices.
@@ -151,7 +152,7 @@ impl Controller {
     pub fn reserve_dom0(&mut self, disk: usize, window: blk::DiskWindow, read_only: bool) {
         let i = attachment_slot(self.clients, disk, window, read_only, false)
             .expect("conflicting or excessive dom0 disk reservations");
-        self.clients[i] = Some(Attachment { vm: 0, disk, window, read_only, volatile: false, reserved: true, pool: None });
+        self.clients[i] = Some(Attachment { vm: 0, disk, window, read_only, volatile: false, encrypted: false, reserved: true, pool: None, mappings: None });
     }
 
     /// Ask blkd about `unit`: (disk geometry, number of units), None if
@@ -231,6 +232,9 @@ pub struct Attachment {
     pub read_only: bool,
     /// Flushes complete at once and the guest is offered none (abi::BLK_VOLATILE).
     pub volatile: bool,
+    pub encrypted: bool,
+    /// Channel and pool mapping caps, removed only after draining.
+    mappings: Option<cap::CNode>,
     /// A dom0 boot range survives failed attachment and dom0 restart.
     reserved: bool,
     /// The active client's I/O pool; None for an unattached reservation.
@@ -320,7 +324,9 @@ pub fn start(
     arena.own(dma_slot, dma_paddr, DMA_BITS);
     // The device reaches this memory, and the pools of attached clients.
     let dom = iommu.attach(alloc, d);
-    iommu.map(alloc, dom, dma_paddr, 1 << DMA_BITS, true);
+    iommu.map(alloc, dom, dma_paddr, blk::QUEUE_SIZE, Access::ReadWrite);
+    iommu.map(alloc, dom, dma_paddr + blk::QUEUE_SIZE, blk::BOUNCE_SIZE, Access::Read);
+    iommu.map(alloc, dom, dma_paddr + blk::QUEUE_SIZE + blk::BOUNCE_SIZE, blk::STAGING_SIZE, Access::Read);
 
     // Plain integers: all zeroes is a valid (empty) configuration.
     let mut cfg: blk::BlkdConfig = unsafe { core::mem::zeroed() };
@@ -340,8 +346,18 @@ pub fn start(
     cfg.msix_table = msix_table;
     cfg.dma_va = host::DMA_VA as u64;
     cfg.dma_paddr = dma_paddr as u64;
-    // Keep a 1 MiB scratch buffer beyond the driver's queue allocator.
-    cfg.dma_size = (1 << DMA_BITS) - blk::STAGING_SIZE as u64;
+    cfg.dma_size = blk::QUEUE_SIZE as u64;
+    cfg.bounce_va = blk::BOUNCE_VA as u64;
+    cfg.bounce_paddr = dma_paddr as u64 + blk::QUEUE_SIZE as u64;
+    cfg.bounce_size = blk::BOUNCE_SIZE as u64;
+    cfg.staging_paddr = cfg.bounce_paddr + cfg.bounce_size;
+    cfg.pool_va = blk::POOL_VA as u64;
+    #[cfg(target_arch = "x86_64")]
+    let aes = core::arch::x86_64::__cpuid(1).ecx & (1 << 25) != 0;
+    #[cfg(target_arch = "aarch64")]
+    let aes = matches!((host_info.cpu_id[0] >> 4) & 15, 1 | 2);
+    cfg.features = if aes { blk::FEATURE_AES } else { 0 };
+    disk.features = cfg.features;
     let cfg_bytes = unsafe {
         core::slice::from_raw_parts(&cfg as *const blk::BlkdConfig as *const u8, core::mem::size_of::<blk::BlkdConfig>())
     };
@@ -378,7 +394,9 @@ pub fn start(
     map_bar_mask(&comp, alloc, &mut arena, devmem, d, &mut disk.bars, bars, 0, bar_va, &mut keep_slot);
     for i in 0..n_dma {
         let f = sel4::init_thread::Slot::<cap_type::Granule>::from_index(dma_frames.start + i).cap();
-        comp.map_copy(alloc, &mut arena, &abs_of(f), host::DMA_VA + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep_slot());
+        comp.map_copy(alloc, &mut arena, &abs_of(f), if (blk::QUEUE_SIZE..blk::QUEUE_SIZE + blk::BOUNCE_SIZE).contains(&(i * PAGE)) {
+            blk::BOUNCE_VA + i * PAGE - blk::QUEUE_SIZE
+        } else { host::DMA_VA + i * PAGE }, CapRights::read_write(), VmAttributes::DEFAULT, keep_slot());
     }
     // ---- Interrupt, notifications.
     let irq_slot = alloc.slots.global(|s| s.alloc());
@@ -415,28 +433,44 @@ fn call(ep: cap::Endpoint, label: u64, args: &[u64]) -> u64 {
 /// l4h-vmm.
 #[allow(clippy::too_many_arguments)]
 pub fn attach(ctrl: &mut Controller, disk: usize, client: &mut RootGuest,
-    window: blk::DiskWindow, read_only: bool, volatile: bool, alloc: &mut Alloc, iommu: &mut Iommu) -> (usize, Channel, cap::Notification) {
+    window: blk::DiskWindow, read_only: bool, volatile: bool, encrypted: bool, alloc: &mut Alloc, iommu: &mut Iommu) -> (usize, Channel, cap::Notification) {
     let i = attachment_slot(ctrl.clients, disk, window, read_only, client.dom0).expect("checked block client");
     let reserved = ctrl.clients[i].as_ref().is_some_and(|a| a.reserved);
     let driver = ctrl.driver.as_mut().expect("started blkd");
     let chan: Channel = (0..blk::CHANNEL_PAGES)
         .map(|_| client.arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP)).collect();
-    let keep = client.arena.object_cap::<cap_type::CNode>(alloc, sel4::ObjectBlueprint::CNode { size_bits: 10 });
+    let frame_bits = blk::pool_frame_bits(client.pool.size);
+    let frames = client.pool.size >> frame_bits;
+    let radix = (client.pool.size.trailing_zeros() as usize - frame_bits).max(1);
+    let keep_bits = (frames + blk::CHANNEL_PAGES).next_power_of_two().trailing_zeros() as usize;
+    let keep = client.arena.object_cap::<cap_type::CNode>(alloc, sel4::ObjectBlueprint::CNode { size_bits: keep_bits });
     // Initial values are delivered via the service call, not guest-chosen IDs.
     for (page, f) in chan.iter().enumerate() {
         alloc.global(|alloc| driver.comp.map_copy(alloc, &mut driver.arena, &abs_of(*f), blk::channel_va(i) + page * PAGE,
             CapRights::read_write(), VmAttributes::DEFAULT,
-            keep.absolute_cptr_from_bits_with_depth(page as u64, 10)));
+            keep.absolute_cptr_from_bits_with_depth(page as u64, keep_bits)));
     }
     driver.comp.give_badged(blk::BLKD_SLOT_CLIENT_DONE + i as u64, client.vmm_ntfn,
         CapRights::write_only(), host::VMM_BADGE_DONE);
     let kick_slot = alloc.slots.alloc();
     let kick = sel4::init_thread::Slot::<cap_type::Notification>::from_index(kick_slot).cap();
     abs_of(kick).mint(&abs_of(driver.comp.ntfn), CapRights::write_only(), blk::BLKD_BADGE_KICK).expect("blkd kick");
-    // Reads write the pool, writes read it.
+    for page in 0..frames {
+        let frame = client.pool.frames.absolute_cptr_from_bits_with_depth(page as u64, radix);
+        let dst = keep.absolute_cptr_from_bits_with_depth((blk::CHANNEL_PAGES + page) as u64, keep_bits);
+        let va = blk::pool_va(i, client.pool.size) + (page << frame_bits);
+        alloc.global(|alloc| {
+            if frame_bits == 21 {
+                driver.comp.map_large_copy(alloc, &mut driver.arena, &frame, va, dst);
+            } else {
+                driver.comp.map_copy(alloc, &mut driver.arena, &frame, va, CapRights::read_write(), VmAttributes::DEFAULT, dst);
+            }
+        });
+    }
+    // Only disk reads DMA into the pool. Writes use blkd's private bounce area.
     let pool = (client.pool.paddr, client.pool.size);
-    iommu.map(alloc, ctrl.dom, pool.0, pool.1, true);
-    ctrl.clients[i] = Some(Attachment { vm: client.id, disk, window, read_only, volatile, reserved, pool: Some(pool) });
+    iommu.map(alloc, ctrl.dom, pool.0, pool.1, Access::Write);
+    ctrl.clients[i] = Some(Attachment { vm: client.id, disk, window, read_only, volatile, encrypted, reserved, pool: Some(pool), mappings: Some(keep) });
     (i, chan, kick)
 }
 
@@ -446,7 +480,7 @@ pub type Channel = l4h_host::fixed::ArrayVec<cap::Granule, { blk::CHANNEL_PAGES 
 /// Publish root-owned client configuration, then activate the channel.
 /// EIO if blkd has failed (the controller is then quarantined).
 pub fn activate(ctrl: &mut Controller, unit: u64, i: usize, client: &RootGuest, chan: &Channel, win: &mut Window,
-    pci: &Pci) -> Result<(), i64> {
+    pci: &Pci, key: &[u8; 64]) -> Result<(), i64> {
     let a = ctrl.clients[i].as_ref().unwrap();
     let (read_only, volatile) = (a.read_only, a.volatile);
     win.with_frame(&abs_of(chan[0]), |p| unsafe {
@@ -459,10 +493,17 @@ pub fn activate(ctrl: &mut Controller, unit: u64, i: usize, client: &RootGuest, 
             gpa: client.pool.gpa as u64, paddr: client.pool.paddr as u64, size: client.pool.size as u64,
         });
     });
-    if call(ctrl.driver.as_ref().unwrap().comp.service_ep, blk::BLKD_ADD, &[i as u64, unit]) != 0 {
+    let mut args = [0; 11];
+    args[..3].copy_from_slice(&[i as u64, unit, if a.encrypted { blk::ENCRYPT } else { 0 }]);
+    for (i, bytes) in key.chunks_exact(8).enumerate() { args[3 + i] = u64::from_le_bytes(bytes.try_into().unwrap()); }
+    let result = call(ctrl.driver.as_ref().unwrap().comp.service_ep, blk::BLKD_ADD, &args);
+    for word in &mut args { unsafe { core::ptr::write_volatile(word, 0) }; }
+    for i in 0..11 { crate::set_mr(i, 0); }
+    if result == u64::MAX {
         quarantine(ctrl, pci);
         return Err(crate::ctl::EIO);
     }
+    if result != 0 { return Err(result as i64); }
     Ok(())
 }
 
@@ -486,6 +527,7 @@ pub fn remove(disk: &mut Controller, i: usize, pci: &Pci, iommu: &mut Iommu) -> 
     }
     let _ = disk.driver.as_ref().unwrap().comp.slot(blk::BLKD_SLOT_CLIENT_DONE + i as u64).delete();
     if let Some(mut a) = disk.clients[i].take() {
+        if let Some(keep) = a.mappings.take() { abs_of(keep).delete().expect("unmap blkd client"); }
         if let Some((pa, len)) = a.pool.take() { iommu.unmap(disk.dom, pa, len); }
         if a.reserved { disk.clients[i] = Some(a); }
     }

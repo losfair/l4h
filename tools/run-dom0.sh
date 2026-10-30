@@ -19,9 +19,14 @@ fi
 log=$root/build/qemu.log
 # Never let a failed build leave the previous run's log to be checked.
 rm -f "$log"
-"$root/tools/build-linux.sh" vmlinux >"$root/build/linux-build.log" 2>&1 \
-    || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
-"$l4h_objcopy" --strip-debug "$l4h_linux_out/vmlinux" "$l4h_linux_out/vmlinux.stripped"
+if [ -n "${L4H_TEST_KERNEL:-}" ]; then
+    mkdir -p "$l4h_linux_out"
+    "$l4h_objcopy" --strip-debug "$L4H_TEST_KERNEL" "$l4h_linux_out/vmlinux.stripped"
+else
+    "$root/tools/build-linux.sh" vmlinux >"$root/build/linux-build.log" 2>&1 \
+        || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
+    "$l4h_objcopy" --strip-debug "$l4h_linux_out/vmlinux" "$l4h_linux_out/vmlinux.stripped"
+fi
 export L4H_GUEST_KERNEL="$l4h_linux_out/vmlinux.stripped" L4H_DOM0_INITRD="$initrd" L4H_GUEST_KMODS=
 if [ "${L4H_KMODS:-0}" = 1 ]; then
     "$root/tools/build-kmods.sh" >/dev/null

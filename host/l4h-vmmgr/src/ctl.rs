@@ -31,7 +31,7 @@ const _: () = assert!(!HOST_VERSION.is_empty() && HOST_VERSION.len() <= abi::CTL
 /// Execute the request in the control page of guest `caller` (dom0).
 pub fn handle(h: &mut Vmmgr, caller: usize) {
     let Some(page) = h.guest(caller).and_then(|g| g.ctl_page()) else { return };
-    let req = unsafe { (page as *const abi::CtlReq).read_volatile() };
+    let mut req = unsafe { (page as *const abi::CtlReq).read_volatile() };
     let mut resp = abi::CtlResp { status: 0, vals: [0; 6], data: [0; abi::CTL_DATA_MAX] };
     resp.status = if req.version != abi::CTL_VERSION {
         -EINVAL
@@ -41,6 +41,12 @@ pub fn handle(h: &mut Vmmgr, caller: usize) {
             Err(e) => -e,
         }
     };
+    if req.op == abi::CTL_BLK_ATTACH {
+        for b in &mut req.data { unsafe { core::ptr::write_volatile(b, 0); } }
+        // Clear the shared request too, including on errors.
+        let data = unsafe { addr_of_mut!((*(page as *mut abi::CtlReq)).data).cast::<u8>() };
+        for i in 0..abi::CTL_DATA_MAX { unsafe { data.add(i).write_volatile(0); } }
+    }
     unsafe { (page.add(abi::CTL_RESP_OFF) as *mut abi::CtlResp).write_volatile(resp) };
 }
 
@@ -236,10 +242,12 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
             if id == caller {
                 return Err(EINVAL);
             }
-            if a[2] & !(abi::BLK_RO | abi::BLK_VOLATILE) != 0 {
+            if a[2] & !(abi::BLK_RO | abi::BLK_VOLATILE | abi::BLK_ENCRYPT) != 0 {
                 return Err(EINVAL);
             }
-            h.attach_disk(id, a[1] as usize, a[2], a[3], a[4])
+            h.attach_disk(id, a[1] as usize, a[2], a[3], a[4], req.data[..64].try_into().unwrap())?;
+            resp.vals[0] = a[2];
+            Ok(())
         }
         abi::CTL_CONSOLE_READ => {
             let g = h.guest(vm_arg(a[0])?).ok_or(ENOENT)?;

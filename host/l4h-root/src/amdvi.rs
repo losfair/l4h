@@ -20,7 +20,7 @@ use l4h_abi as abi;
 
 use crate::mem::Alloc;
 use crate::pci;
-use crate::iommu::{mappings::Mappings, MAX_MAPPINGS};
+use crate::iommu::{Access, mappings::Mappings, MAX_MAPPINGS};
 
 const PAGE: usize = 4096;
 /// IOMMUs driven, at most (an EPYC has one per root complex, up to 8).
@@ -556,7 +556,7 @@ impl AmdVi {
                         self.shared = Some(d);
                     }
                     if !given.contains(&d.id) {
-                        self.map_range(phys.alloc, d, u.start, u.end - u.start, u.write);
+                        self.map_range(phys.alloc, d, u.start, u.end - u.start, if u.write { Access::ReadWrite } else { Access::Read });
                         let _ = given.push(d.id);
                     }
                     self.set_dte(id, d);
@@ -576,7 +576,7 @@ impl AmdVi {
         for i in 0..self.unity.len() {
             let u = self.unity[i];
             if which(&u) {
-                self.map_range(alloc, d, u.start, u.end - u.start, u.write);
+                self.map_range(alloc, d, u.start, u.end - u.start, if u.write { Access::ReadWrite } else { Access::Read });
             }
         }
         d
@@ -590,7 +590,7 @@ impl AmdVi {
         for i in 0..self.unity.len() {
             let u = self.unity[i];
             if u.covers_group(alias, self.dev.as_ref().unwrap()) {
-                self.map_range(alloc, d, u.start, u.end - u.start, u.write);
+                self.map_range(alloc, d, u.start, u.end - u.start, if u.write { Access::ReadWrite } else { Access::Read });
             }
         }
         if self.intremap {
@@ -776,9 +776,8 @@ impl AmdVi {
         dom
     }
 
-    /// Let domain `d` reach [pa, pa + len) at its physical address, read
-    /// and, with `write`, written.
-    pub fn map(&mut self, alloc: &mut Alloc, d: Domain, pa: usize, len: usize, write: bool) {
+    /// Let domain `d` reach [pa, pa + len) with device-side `access`.
+    pub fn map(&mut self, alloc: &mut Alloc, d: Domain, pa: usize, len: usize, access: Access) {
         if d == Domain::NONE {
             return;
         }
@@ -787,16 +786,16 @@ impl AmdVi {
         // Permanent firmware mappings cannot also be recyclable DMA pools.
         assert!(!self.unity.iter().any(|u| u.covers_group(d.dev[1], self.dev.as_ref().unwrap())
             && pa < u.end && u.start < end), "iommu: allocated DMA memory overlaps an IVMD range");
-        if !self.dev.as_mut().unwrap().mappings.acquire(d.id as u32, pa, len, write) { return; }
-        self.map_range(alloc, d, pa, len, write);
+        if !self.dev.as_mut().unwrap().mappings.acquire(d.id as u32, pa, len, access) { return; }
+        self.map_range(alloc, d, pa, len, access);
         // An IOMMU may cache missing entries (NpCache).
         self.flush(d);
         self.sync();
     }
 
-    fn map_range(&mut self, alloc: &mut Alloc, d: Domain, pa: usize, len: usize, write: bool) {
+    fn map_range(&mut self, alloc: &mut Alloc, d: Domain, pa: usize, len: usize, access: Access) {
         assert!(pa % PAGE == 0 && len % PAGE == 0);
-        let leaf = PTE_PR | PTE_FC | PTE_IR | if write { PTE_IW } else { 0 };
+        let leaf = PTE_PR | PTE_FC | if access.read() { PTE_IR } else { 0 } | if access.write() { PTE_IW } else { 0 };
         for at in (pa..pa + len).step_by(PAGE) {
             let pte = self.walk(Some(alloc), d, at).unwrap();
             // Overlapping firmware ranges retain the union of permissions.

@@ -20,7 +20,7 @@ pkgs=(git ca-certificates curl xz-utils bzip2 wget sudo procps kmod
     qemu-system-x86 qemu-utils gdb ovmf grub-efi-amd64-bin grub-pc-bin mtools fdisk
     gcc-aarch64-linux-gnu libc6-dev-arm64-cross
     swtpm swtpm-tools python3-cryptography acpica-tools)
-[[ $want == *" aarch64 "* ]] && pkgs+=(qemu-system-arm gdb-multiarch)
+[[ $want == *" aarch64 "* ]] && pkgs+=(qemu-system-arm qemu-user gdb-multiarch)
 [[ $want == *" debian "* ]] && pkgs+=(debootstrap debian-archive-keyring)
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -q

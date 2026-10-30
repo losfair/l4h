@@ -11,6 +11,12 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 
 pub use production::{DevInfo, Driver, Seg};
+#[path = "../host/l4h-blkd/src/crypt.rs"]
+mod crypt;
+#[path = "../host/l4h-blkd/src/data.rs"]
+mod data;
+#[path = "../host/l4h-blkd/src/bounce.rs"]
+mod bounce;
 
 #[macro_export]
 macro_rules! info { ($($a:tt)*) => {{ let _ = format_args!($($a)*); }}; }
@@ -43,6 +49,7 @@ pub mod sel4 {
     impl MessageInfo {
         pub fn new(label: u64, _: u64, _: u64, length: usize) -> Self { Self { label, length } }
         pub fn label(&self) -> u64 { self.label }
+        pub fn length(&self) -> usize { self.length }
     }
     pub struct IpcBuffer(pub [u64; 120]);
     impl IpcBuffer {
@@ -83,14 +90,85 @@ pub mod sel4 {
 }
 
 mod production {
-    use crate::{nvme, scsi, virtio};
+    use crate::{bounce, crypt, data, nvme, scsi, virtio};
     include!(env!("L4H_BLKD_TEST_SRC"));
 
     pub fn run(info: &'static crate::Info) -> ! {
         // Tests serialize access, and the previous loop has unwound.
-        unsafe { CLIENTS = [const { None }; blk::MAX_CLIENTS]; }
+        unsafe { CLIENTS = [const { None }; blk::MAX_CLIENTS]; PENDING = [None; MAX_INFLIGHT]; }
         main(info)
     }
+    pub fn pipeline(info: &'static crate::Info) {
+        unsafe { CLIENTS = [const { None }; blk::MAX_CLIENTS]; PENDING = [None; MAX_INFLIGHT]; }
+        let cfg = &info.config;
+        let drv = crate::MockDriver::new(1, cfg);
+        let dev = [drv.info(0)].into_iter().collect();
+        let mut b = Blkd { clients: unsafe { &mut *addr_of_mut!(CLIENTS) },
+            pending: unsafe { &mut *addr_of_mut!(PENDING) }, active: ArrayVec::new(),
+            bounce: bounce::Bounce::new(), cfg, drv: Drv::Virtio(drv), dev, next: 0, ticks_per_sec: 1_000_000_000 };
+        let key = core::array::from_fn(|i| i as u8);
+        assert_eq!(b.add(0, 0, blk::ENCRYPT, &key, 11), 0);
+        assert_eq!(b.add(1, 0, 0, &[0; 64], 11), 0);
+        b.submit();
+        unsafe {
+            assert_eq!((*crate::channel()).sq.tail, 1, "second write remains queued while bounce space is full");
+            let peer = blk::channel_va(1) as *mut Channel;
+            assert_eq!((*peer).sq.tail, 2, "other client's read and flush bypass the deferred write");
+            assert_eq!((*crate::channel()).block_size, 4096);
+        }
+        let Drv::Virtio(drv) = &mut b.drv else { unreachable!() };
+        assert_eq!(drv.commands.len(), 3);
+        let (tag, op, sector, segs) = &drv.commands[0];
+        assert_eq!((*op, *sector), (blk::OP_WRITE, 16));
+        assert_eq!(segs[0].pa, cfg.bounce_paddr);
+        let snapshot = unsafe { core::slice::from_raw_parts(cfg.bounce_va as *const u8, 4096) }.to_vec();
+        unsafe { core::ptr::write_bytes(blk::pool_va(0, 4 << 20) as *mut u8, 0xab, 14 * 256 * 1024); }
+        assert_eq!(snapshot, unsafe { core::slice::from_raw_parts(cfg.bounce_va as *const u8, 4096) });
+        assert!(snapshot.iter().any(|&b| b != 0x5a));
+        let mut plain = [0; 4096];
+        unsafe { b.clients[0].as_ref().unwrap().keys.decrypt(snapshot.as_ptr(), plain.as_mut_ptr(), 0); }
+        assert_eq!(plain, [0x5a; 4096], "tweak is relative to window start");
+        drv.completed.push((*tag, blk::STATUS_IOERR));
+        b.reap(); b.submit();
+        unsafe { assert_eq!((*crate::channel()).sq.tail, 2, "failed completion also frees its run"); }
+        let Drv::Virtio(drv) = &mut b.drv else { unreachable!() };
+        for (tag, ..) in &drv.commands[1..] { drv.completed.push((*tag, blk::STATUS_OK)); }
+        b.reap();
+        assert_eq!(b.clients[0].as_ref().unwrap().outstanding, 0);
+        // A rejected hardware submission must also release the reserved run.
+        let Drv::Virtio(drv) = &mut b.drv else { unreachable!() };
+        drv.fail_start = true;
+        unsafe { (*crate::channel()).reqs[2] = (*crate::channel()).reqs[0]; (*crate::channel()).sq.head = 3; }
+        b.submit();
+        let run = b.bounce.alloc(bounce::SIZE).expect("failed start leaked bounce memory");
+        b.bounce.free(run);
+        assert_eq!(b.remove(0), 0);
+        assert!(b.clients[0].is_none());
+        // Plain and encrypted reuse of the same channel, including
+        // unsupported feature flags and malformed key rejection.
+        assert_eq!(b.add(0, 0, blk::ENCRYPT, &[0; 64], 11), 22);
+        assert_eq!(b.add(0, 0, 2, &key, 11), 22);
+        assert_eq!(b.add(0, 0, 0, &[0; 64], 11), 0);
+        let Drv::Virtio(drv) = &mut b.drv else { unreachable!() };
+        drv.fail_start = false;
+        unsafe {
+            core::ptr::write_bytes(blk::pool_va(0, 4 << 20) as *mut u8, 0x3c, 14 * 256 * 1024);
+            (*crate::channel()).reqs[3] = (*crate::channel()).reqs[0];
+            (*crate::channel()).sq.head = 4;
+        }
+        b.submit();
+        let Drv::Virtio(drv) = &mut b.drv else { unreachable!() };
+        let (tag, op, _, segs) = drv.commands.last().unwrap();
+        assert_eq!(*op, blk::OP_WRITE);
+        assert_eq!(segs[0].pa, cfg.bounce_paddr, "plain writes also use private DMA memory");
+        unsafe { core::ptr::write_bytes(blk::pool_va(0, 4 << 20) as *mut u8, 0xa7, 14 * 256 * 1024); }
+        let snapshot = unsafe { core::slice::from_raw_parts(cfg.bounce_va as *const u8, 14 * 256 * 1024) };
+        assert!(snapshot.iter().all(|&b| b == 0x3c), "guest mutation must not reach an in-flight plain write");
+        drv.completed.push((*tag, blk::STATUS_OK));
+        b.reap();
+        assert_eq!(b.remove(0), 0);
+    }
+
 }
 
 mod nvme { pub type Nvme = crate::MockDriver; }
@@ -99,7 +177,7 @@ mod virtio { pub type VirtioBlk = crate::MockDriver; }
 
 struct Kernel {
     ipc: sel4::IpcBuffer,
-    requests: VecDeque<(u64, [u64; 3], bool)>,
+    requests: VecDeque<(u64, Vec<u64>, bool)>,
     replies: Vec<[u64; 5]>,
     retry: bool,
     status: u32,
@@ -112,10 +190,14 @@ thread_local! {
     });
 }
 
-pub struct MockDriver { legacy_io: u32, queue: u16, provisioning: bool }
+pub struct MockDriver {
+    legacy_io: u32, queue: u16, provisioning: bool,
+    commands: Vec<(u64, u32, u64, Vec<Seg>)>,
+    completed: Vec<(u64, u32)>, fail_start: bool,
+}
 impl MockDriver {
     pub fn new(_: u32, cfg: &BlkdConfig) -> Self {
-        Self { legacy_io: cfg.legacy_io, queue: if cfg.kind == blk::BLKD_VIRTIO_SCSI { 2 } else { 0 }, provisioning: false }
+        Self { legacy_io: cfg.legacy_io, queue: if cfg.kind == blk::BLKD_VIRTIO_SCSI { 2 } else { 0 }, provisioning: false, commands: Vec::new(), completed: Vec::new(), fail_start: false }
     }
     fn notify(&self) {
         KERNEL.with_borrow_mut(|k| {
@@ -134,12 +216,15 @@ impl Driver for MockDriver {
         DevInfo { capacity: 131072, block_size: 512, read_only: false, flush: true, address: 0x301 }
     }
     fn can_start(&self) -> bool { true }
-    fn start(&mut self, tag: u64, _: usize, _: u32, _: u64, _: &[Seg]) -> Result<(), u32> {
+    fn start(&mut self, tag: u64, _: usize, op: u32, sector: u64, data: &[Seg]) -> Result<(), u32> {
+        if self.fail_start { return Err(blk::STATUS_IOERR); }
+        if tag != u64::MAX { self.commands.push((tag, op, sector, data.to_vec())); }
         self.provisioning |= tag == u64::MAX;
         Ok(())
     }
     fn kick(&mut self) { self.notify(); }
     fn reap(&mut self, done: &mut dyn FnMut(u64, u32)) {
+        for (tag, status) in self.completed.drain(..) { done(tag, status); }
         if core::mem::take(&mut self.provisioning) {
             let (status, retry) = KERNEL.with_borrow(|k| (k.status, k.retry));
             done(u64::MAX, status);
@@ -171,7 +256,7 @@ fn run(kind: u32, legacy: bool, label: u64, pending_io: bool, retry: bool, statu
     }
     KERNEL.with_borrow_mut(|k| {
         k.ipc.0.fill(0);
-        k.requests = [(blk::BLKD_ADD, [0; 3], false), (label, [0; 3], pending_io)].into();
+        k.requests = [(blk::BLKD_ADD, vec![0; 11], false), (label, vec![0; 3], pending_io)].into();
         k.replies.clear();
         k.retry = retry;
         k.status = status;
@@ -179,6 +264,7 @@ fn run(kind: u32, legacy: bool, label: u64, pending_io: bool, retry: bool, statu
     });
     // BlkdConfig consists entirely of integer fields.
     let mut config: BlkdConfig = unsafe { core::mem::zeroed() };
+    config.bounce_size = blk::BOUNCE_SIZE as u64;
     config.kind = kind;
     config.legacy_io = if legacy { 0xc000 } else { 0 };
     let info = Box::leak(Box::new(Info { header: Header { id: 1, tsc_hz: 1_000_000_000 }, config }));
@@ -215,4 +301,39 @@ fn provisioning_status_survives_scsi_retry() {
     for status in [blk::STATUS_OK, blk::STATUS_IOERR] {
         assert_eq!(run(blk::BLKD_VIRTIO_SCSI, true, blk::BLKD_FLUSH, false, true, status)[0], status as u64);
     }
+}
+
+#[test]
+fn production_bounce_defer_completion_errors_and_reuse() {
+    if !std::is_x86_feature_detected!("aes") { eprintln!("SKIP: no AES-NI"); return; }
+    let _lock = LOCK.lock().unwrap();
+    let mut mappings = Vec::new();
+    for i in 0..2 {
+        for (va, len) in [(blk::channel_va(i), blk::CHANNEL_PAGES * 4096), (blk::pool_va(i, 4 << 20), 4 << 20)] {
+            assert_eq!(unsafe { mmap(va, len, 3, 0x100022, -1, 0) }, va);
+            mappings.push((va, len));
+        }
+        unsafe {
+            let c = &mut *(blk::channel_va(i) as *mut Channel);
+            c.lba_start = if i == 0 { 16 } else { 16384 };
+            c.capacity_sectors = 8192;
+            c.pool = blk::Pool { gpa: 0, paddr: 0x10000000 + i as u64 * (4 << 20), size: 4 << 20 };
+            c.reqs[0] = blk::Req { op: if i == 0 { blk::OP_WRITE } else { blk::OP_READ }, nr_segs: 1, ..Default::default() };
+            c.reqs[0].segs[0] = blk::Seg { gpa: 0, len: if i == 0 { 14 * 256 * 1024 } else { 4096 }, flags: if i == 0 { 0 } else { blk::SEG_WRITE } };
+            c.reqs[1] = if i == 0 { c.reqs[0] } else { blk::Req { op: blk::OP_FLUSH, ..Default::default() } };
+            c.sq.head = 2;
+            core::ptr::write_bytes(blk::pool_va(i, 4 << 20) as *mut u8, 0x5a, 4 << 20);
+        }
+    }
+    assert_eq!(unsafe { mmap(blk::BOUNCE_VA, blk::BOUNCE_SIZE, 3, 0x100022, -1, 0) }, blk::BOUNCE_VA);
+    mappings.push((blk::BOUNCE_VA, blk::BOUNCE_SIZE));
+    let mut config: BlkdConfig = unsafe { core::mem::zeroed() };
+    config.features = blk::FEATURE_AES;
+    config.pool_va = blk::POOL_VA as u64;
+    config.bounce_va = blk::BOUNCE_VA as u64;
+    config.bounce_paddr = 0x20000000;
+    config.bounce_size = blk::BOUNCE_SIZE as u64;
+    let info = Box::leak(Box::new(Info { header: Header { id: 1, tsc_hz: 1_000_000_000 }, config }));
+    production::pipeline(info);
+    for (va, len) in mappings { assert_eq!(unsafe { munmap(va, len) }, 0); }
 }

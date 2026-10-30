@@ -490,7 +490,11 @@ enum l4h_ctl_op {
 	/* args: first vm -> data: struct l4h_ctl_vm[], vals[0] = count */
 	L4H_CTL_VM_LIST = 6,
 	/* args: vm, disk index, flags (L4H_BLK_*), first sector, sectors
-	 * (0 = to the end of the disk); sectors are 512 bytes */
+	 * (0 = to the end of the disk); sectors are 512 bytes.
+	 * With ENCRYPT, data[0..64] is the raw AES-256-XTS key (K1 || K2).
+	 * Equal halves: EINVAL; no hardware AES: EOPNOTSUPP. Logical blocks
+	 * are 4096 bytes and tweaks count units from the window start.
+	 * vals[0] returns the applied flags (old hosts return 0). */
 	L4H_CTL_BLK_ATTACH = 7,
 	/* args: vm, offset -> vals[0] = next offset, vals[1] = len,
 	 * vals[2] = bytes lost; data: console output */
@@ -530,7 +534,7 @@ enum l4h_ctl_op {
      * Writes the control data buffer or zeros to an UNATTACHED range.
      * Sector and length must be 4 KiB aligned. */
     L4H_CTL_BLK_WRITE = 20,
-    /* disk, first attachment -> vals: next (0 = end), vm, start, sectors, read-only */
+    /* disk, first attachment -> vals: next (0 = end), vm, start, sectors, read-only, encrypted */
     L4H_CTL_BLK_INFO = 21,
 	/* Reset the machine (ACPI reset register, then 0xcf9, then the
 	 * keyboard controller); dom0 syncs its disks first.  Returns only if
@@ -597,6 +601,7 @@ enum l4h_ctl_op {
 
 #define L4H_BLK_RO              (1ull << 0) /* read-only */
 #define L4H_BLK_VOLATILE        (1ull << 1) /* no flush: the guest sees no write cache */
+#define L4H_BLK_ENCRYPT         (1ull << 2) /* AES-256-XTS, key in data[0..64] */
 
 struct l4h_ctl_port {
 	l4h_u32 vm;

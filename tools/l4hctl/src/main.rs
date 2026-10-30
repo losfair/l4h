@@ -15,6 +15,7 @@ struct CreateOpts {
     initrd: Option<String>,
     cmdline: String,
     disks: Vec<(u64, u64, u64, u64)>,
+    disk_keys: Vec<Option<DiskKey>>,
     io_pool: u64,
     nics: Vec<(u64, u64, u64)>,
     gpu: Option<(u64, u64)>,
@@ -25,7 +26,7 @@ fn cmd_create(ctl: &Ctl, o: &CreateOpts) -> Result<u64> {
         Some(p) => read_file(p)?,
         None => Vec::new(),
     };
-    let (vm, macs) = ctl.create_vm(&VmSpec {
+    let (vm, macs) = ctl.create_vm_with_keys(&VmSpec {
         name: &o.name,
         mem: o.mem,
         vcpus: o.vcpus,
@@ -35,7 +36,7 @@ fn cmd_create(ctl: &Ctl, o: &CreateOpts) -> Result<u64> {
         io_pool: o.io_pool,
         nics: o.nics.clone(),
         gpu: o.gpu,
-    })?;
+    }, &o.disk_keys)?;
     for (&(sw, _, _), mac) in o.nics.iter().zip(macs) {
         eprintln!("vm {vm}: nic on switch {sw}, mac {}", fmt_mac(mac));
     }
@@ -113,14 +114,17 @@ const USAGE: &str = "usage: l4hctl <command>
   rtc-set [UNIX_SECONDS]       set the machine RTC in UTC (default: dom0's
                                current time, e.g. after NTP synchronizes)
   disks                        host disks, owners, capacities and attachments
+  blk-attach VM DISK [--read-only] [--start SECTOR] [--sectors N]
+         [--key-file FILE]     attach to a created VM; exactly 64 raw key bytes
   disk-zero DISK START SECTORS zero an unattached region
   disk-write DISK START FILE   seed an unattached region, then flush
   list (or vms)                VMs and their host seals
   create NAME [--initrd F] [--mem MB] [--vcpus N]
-         [--cmdline S] [--disk I[,ro][,volatile][,start=SECTOR][,sectors=N]]...
+         [--cmdline S] [--disk I[,ro][,volatile][,start=SECTOR][,sectors=N][,key-file=FILE]]...
                                create and start a VM, which runs the
                                host's kernel; prints its id (volatile: the
                                guest sees no write cache and never flushes)
+         [--key-file FILE]    encrypt the preceding --disk (64 raw bytes)
          [--nic SWITCH[,mac=MAC][,nolock][,isolated]]...
          [--io-pool MB]        device I/O buffer pool (power of two, 1-256;
                                default 4, or room for the GPU's buffers)
@@ -278,7 +282,28 @@ fn run(args: &[String]) -> Result<i32> {
                 };
                 let failed = if r.vals[2] != 0 { ", failed (quarantined)" } else { "" };
                 println!("disk {d}: pci {:02x}:{:02x}.{} {kind}, owner {owner}{failed}, sectors {}, attachments {}", bdf >> 8, (bdf >> 3) & 0x1f, bdf & 7, r.vals[4], r.vals[5]);
+                for a in ctl.disk_attachments(d)? {
+                    println!("  vm {}: start {}, sectors {}{}{}", a.vm, a.start, a.sectors,
+                        if a.read_only { ", read-only" } else { "" }, if a.encrypted { ", encrypted" } else { "" });
+                }
             }
+        }
+        "blk-attach" => {
+            if args.len() < 3 { return err("blk-attach VM DISK [--read-only] [--start SECTOR] [--sectors N] [--key-file FILE]"); }
+            let (vm, disk) = (parse_num(&args[1])?, parse_num(&args[2])?);
+            let (mut ro, mut start, mut sectors, mut key) = (false, 0, 0, None);
+            let mut it = args[3..].iter();
+            while let Some(a) = it.next() {
+                if a == "--read-only" { ro = true; continue; }
+                let val = it.next().ok_or(Error(format!("{a}: missing value")))?;
+                match a.as_str() {
+                    "--start" => start = parse_num(val)?,
+                    "--sectors" => sectors = parse_num(val)?,
+                    "--key-file" => key = Some(DiskKey::read(val)?),
+                    _ => return err(format!("blk-attach: unknown option {a}")),
+                }
+            }
+            ctl.blk_attach(vm, disk, if ro { BLK_RO } else { 0 }, start, sectors, key.as_ref().map(|k| &k.0))?;
         }
         "disk-zero" => {
             if args.len() != 4 { return err("disk-zero DISK START SECTORS"); }
@@ -349,6 +374,7 @@ fn run(args: &[String]) -> Result<i32> {
                 initrd: None,
                 cmdline: "console=hvc0".into(),
                 disks: Vec::new(),
+                disk_keys: Vec::new(),
                 io_pool: 0,
                 nics: Vec::new(),
                 gpu: None,
@@ -363,11 +389,11 @@ fn run(args: &[String]) -> Result<i32> {
                     "--io-pool" => o.io_pool = parse_mib(&val()?)?,
                     "--cmdline" => o.cmdline = val()?,
                     "--disk" => {
-                        // DISK[,ro][,volatile][,start=SECTOR][,sectors=N] (or DISK:ro)
+                        // DISK[,ro][,volatile][,start=SECTOR][,sectors=N][,key-file=FILE] (or DISK:ro)
                         let v = val()?.replace(":ro", ",ro");
                         let mut it = v.split(',');
                         let d = parse_num(it.next().unwrap())?;
-                        let (mut flags, mut start, mut sectors) = (0, 0, 0);
+                        let (mut flags, mut start, mut sectors, mut key) = (0, 0, 0, None);
                         for opt in it {
                             if opt == "ro" {
                                 flags |= BLK_RO;
@@ -377,11 +403,18 @@ fn run(args: &[String]) -> Result<i32> {
                                 start = parse_num(n)?;
                             } else if let Some(n) = opt.strip_prefix("sectors=") {
                                 sectors = parse_num(n)?;
+                            } else if let Some(path) = opt.strip_prefix("key-file=") {
+                                key = Some(DiskKey::read(path)?);
                             } else {
                                 return err(format!("--disk: unknown option {opt}"));
                             }
                         }
                         o.disks.push((d, flags, start, sectors));
+                        o.disk_keys.push(key);
+                    }
+                    "--key-file" => {
+                        let key = o.disk_keys.last_mut().ok_or(Error("--key-file must follow --disk".into()))?;
+                        *key = Some(DiskKey::read(&val()?)?);
                     }
                     "--nic" => {
                         // SWITCH[,mac=MAC][,nolock][,isolated]

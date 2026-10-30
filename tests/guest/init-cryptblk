@@ -1,0 +1,72 @@
+#!/bin/sh
+set -eu
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mount -t tmpfs tmp /tmp
+fail() { echo "CRYPTBLK: FAIL: $*"; poweroff -f; }
+# These keys are reproducible test data, never deployment keys.
+cp /bin/cryptblk.key /tmp/key
+cp /bin/cryptblk-wrong.key /tmp/wrong
+head -c 64 /dev/zero > /tmp/zero
+create() {
+    l4hctl create crypt --mem 128 --initrd /bin/cryptblkvm.cpio.gz --disk "$1" \
+        --cmdline "console=hvc0 quiet mode=$2 ${3:-}"
+}
+waitfor() {
+    l4hctl console "$1" --until "${2:-CRYPTVM: ready}" --timeout 180 > /tmp/console || { cat /tmp/console; fail console; }
+    if grep -q 'CRYPTVM: FAIL' /tmp/console; then cat /tmp/console; fail guest; fi
+}
+enc='0,start=2048,sectors=16384,key-file=/tmp/key'
+plain='0,start=18432,sectors=16384'
+ro='0,ro,start=2048,sectors=16384,key-file=/tmp/key'
+# An invalid key must be rejected without consuming a controller/client.
+if create '0,start=2048,sectors=16384,key-file=/tmp/zero' write > /tmp/id 2>/tmp/error; then fail equal-halves; fi
+grep -q 'invalid argument' /tmp/error || { cat /tmp/error; fail key-error; }
+head -c 63 /dev/zero > /tmp/short
+if create '0,key-file=/tmp/short' write > /tmp/id 2>/tmp/error; then fail short-key; fi
+head -c 65 /dev/zero > /tmp/long
+if create '0,key-file=/tmp/long' write > /tmp/id 2>/tmp/error; then fail long-key; fi
+# Optional boot without CPU AES: plain I/O must still work.
+if grep -q 'noaes=1' /proc/cmdline; then
+    if create "$enc" write > /tmp/id 2>/tmp/error; then fail no-aes; fi
+    grep -q 'not supported' /tmp/error || { cat /tmp/error; fail no-aes-error; }
+    p=$(create "$plain" write plain=1) || fail plain
+    waitfor "$p"; l4hctl destroy "$p"
+    echo 'CRYPTBLK: NOAES PASS'
+    poweroff -f
+fi
+a=$(create "$enc" write) || fail encrypted
+p=$(create "$plain" write plain=1) || fail plain
+waitfor "$a"; waitfor "$p"
+l4hctl disks > /tmp/disks
+cat /tmp/disks
+grep -q 'start 2048, sectors 16384, encrypted' /tmp/disks || fail info
+l4hctl destroy "$a"; l4hctl destroy "$p"
+# Wrong keys produce different bytes; they cannot pass the readback check.
+a=$(create '0,ro,start=2048,sectors=16384,key-file=/tmp/wrong' wrong) || fail wrong-key
+waitfor "$a"; l4hctl destroy "$a"
+# Sharing encrypted read-only data requires the same window origin and key.
+a=$(create "$ro" check) || fail reopen
+b=$(create "$ro" check) || fail share
+waitfor "$a"; waitfor "$b"
+for bad in '0,ro,start=2048,sectors=16384,key-file=/tmp/wrong' \
+    '0,ro,start=2056,sectors=16376,key-file=/tmp/key' '0,ro,start=2048,sectors=16384'; do
+    if create "$bad" check > /tmp/id 2>/tmp/error; then fail shared-key; fi
+    grep -q busy /tmp/error || { cat /tmp/error; fail shared-key-error; }
+done
+if l4hctl disk-zero 0 2048 8 2>/tmp/error; then fail live-provision; fi
+l4hctl destroy "$a"; l4hctl destroy "$b"
+# Destroy with repeated encrypted I/O, then reuse the same slots and pool.
+a=$(create "$enc" hammer) || fail hammer
+waitfor "$a" 'CRYPTVM: data ok'
+l4hctl destroy "$a"
+a=$(create "$enc" check) || fail reuse
+waitfor "$a"; l4hctl destroy "$a"
+for pool in 1 4 1 8; do
+    a=$(l4hctl create pool-reuse --mem 128 --io-pool "$pool" --initrd /bin/cryptblkvm.cpio.gz \
+        --disk "$ro" --cmdline 'console=hvc0 quiet mode=probe') || fail pool-reuse
+    waitfor "$a"; l4hctl destroy "$a"
+done
+echo 'CRYPTBLK: PASS'
+poweroff -f

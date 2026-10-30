@@ -76,9 +76,15 @@ pub fn guest_del(id: usize) {
 }
 
 /// A window of host disk `disk` for guest `id`'s device `d`: its channel.
-/// `flags`: abi::BLK_*.
-pub fn disk_attach(alloc: &mut Alloc, id: usize, d: usize, disk: usize, flags: u64, lba_start: u64, lba_count: u64) -> Result<Backend, i64> {
-    call(VMMGR_DISK_ATTACH, &[id as u64, d as u64, disk as u64, flags, lba_start, lba_count])?;
+/// `flags`: abi::BLK_*; `key` is used with abi::BLK_ENCRYPT.
+pub fn disk_attach(alloc: &mut Alloc, id: usize, d: usize, disk: usize, flags: u64, lba_start: u64, lba_count: u64, key: &[u8; 64]) -> Result<Backend, i64> {
+    let mut args = [0; 14];
+    args[..6].copy_from_slice(&[id as u64, d as u64, disk as u64, flags, lba_start, lba_count]);
+    for (i, bytes) in key.chunks_exact(8).enumerate() { args[6 + i] = u64::from_le_bytes(bytes.try_into().unwrap()); }
+    let result = call(VMMGR_DISK_ATTACH, &args);
+    for word in &mut args { unsafe { core::ptr::write_volatile(word, 0); } }
+    for i in 0..14 { set_mr(i, 0); }
+    result?;
     let mut chan = ArrayVec::new();
     for i in 0..host::blk::CHANNEL_PAGES {
         chan.must_push(take(alloc, i));

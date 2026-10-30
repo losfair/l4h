@@ -47,6 +47,7 @@ pub struct Pool {
     pub gpa: usize,
     pub paddr: usize,
     pub size: usize,
+    pub frames: cap::CNode,
 }
 
 /// What root made for a guest of vmmgr's.
@@ -339,12 +340,22 @@ fn xchg(h: &Host, i: usize) -> sel4::AbsoluteCPtr {
 
 /// A call from vmmgr (label `label`): its reply's length.
 pub fn call(h: &mut Host, label: u64) -> usize {
-    let a: [u64; 8] = core::array::from_fn(mr);
+    let a: [u64; 8] = core::array::from_fn(|i| {
+        // This call alone has key words beyond the usual argument array.
+        if label == proto::VMMGR_DISK_ATTACH && i >= 6 { 0 } else { mr(i) }
+    });
     let mut len = 1;
     let r = match label {
         proto::VMMGR_GUEST_NEW => guest_new(h, a),
         proto::VMMGR_GUEST_DEL => guest_del(h, a[0] as usize),
-        proto::VMMGR_DISK_ATTACH => disk_attach(h, a),
+        proto::VMMGR_DISK_ATTACH => {
+            let mut key = [0u8; 64];
+            for i in 0..8 { key[8 * i..8 * i + 8].copy_from_slice(&mr(6 + i).to_le_bytes()); }
+            for i in 0..14 { set_mr(i, 0); }
+            let result = disk_attach(h, a, &key);
+            for byte in &mut key { unsafe { core::ptr::write_volatile(byte, 0); } }
+            result
+        },
         proto::VMMGR_NIC_ADD => nic_add(h, a),
         proto::VMMGR_TRUST_REGISTER => trust_register(h, a),
         proto::VMMGR_HOST_OP => {
@@ -390,11 +401,12 @@ fn with_guest<R>(h: &mut Host, id: usize, f: impl FnOnce(&mut Host, &mut RootGue
 fn guest_new(h: &mut Host, a: [u64; 8]) -> Result<Vals, i64> {
     let id = guest_arg(a[0])?;
     let (size, gpa, dom0) = (a[1] as usize, a[2] as usize, a[3] != 0);
-    if h.guests[id].is_some() || !size.is_power_of_two() || !(IO_POOL_MIN..=IO_POOL_MAX).contains(&size) || gpa % PAGE != 0 {
+    if h.guests[id].is_some() || !size.is_power_of_two() || !(IO_POOL_MIN..=IO_POOL_MAX).contains(&size) || gpa % (1 << host::blk::pool_frame_bits(size)) != 0 {
         return Err(ctl::EINVAL);
     }
     let bits = size.trailing_zeros() as usize;
-    let radix = bits - 12;
+    let frame_bits = host::blk::pool_frame_bits(size);
+    let radix = (bits - frame_bits).max(1);
     if !h.can_afford(size + (32 << radix) + PAGE, 0, 4) {
         return Err(ctl::ENOMEM);
     }
@@ -414,7 +426,8 @@ fn guest_new(h: &mut Host, a: [u64; 8]) -> Result<Vals, i64> {
         let paddr = region.paddr;
         arena.own(pool_slot, paddr, bits);
         let frames = arena.object_cap::<cap_type::CNode>(&mut h.alloc, ObjectBlueprint::CNode { size_bits: radix });
-        region.retype(&FRAME_BP, size / PAGE, Dest { cnode: abs_of(frames), offset: 0 }).expect("I/O pool frames");
+        let blueprint = if frame_bits == 21 { crate::vspace::LARGE_PAGE_BP } else { FRAME_BP };
+        region.retype(&blueprint, size >> frame_bits, Dest { cnode: abs_of(frames), offset: 0 }).expect("I/O pool frames");
         xchg(h, 0).copy(&abs_of(frames), CapRights::all()).expect("vmmgr pool frames");
         xchg(h, 3).copy(&abs_of(vmm_ntfn), CapRights::all()).expect("vmmgr VMM notification");
         let (page, kick) = (xchg(h, 1), xchg(h, 2));
@@ -429,7 +442,7 @@ fn guest_new(h: &mut Host, a: [u64; 8]) -> Result<Vals, i64> {
             instance,
             dom0,
             arena,
-            pool: Pool { gpa, paddr, size },
+            pool: Pool { gpa, paddr, size, frames },
             vmm_ntfn,
             disks: ArrayVec::new(),
             ports: ArrayVec::new(),
@@ -472,16 +485,18 @@ fn guest_del(h: &mut Host, id: usize) -> Result<Vals, i64> {
 /// lba_start + lba_count) of it; 0 = to the end) through to the guest,
 /// with abi::BLK_* flags.
 /// The window must be aligned to blkd::WINDOW_ALIGN sectors.
-fn disk_attach(h: &mut Host, a: [u64; 8]) -> Result<Vals, i64> {
+fn disk_attach(h: &mut Host, a: [u64; 8], key: &[u8; 64]) -> Result<Vals, i64> {
     let id = guest_arg(a[0])?;
     let (dev, disk, flags, lba_start, lba_count) = (a[1] as usize, a[2] as usize, a[3], a[4], a[5]);
-    let (read_only, volatile) = (flags & abi::BLK_RO != 0, flags & abi::BLK_VOLATILE != 0);
-    if dev >= MAX_GUEST_DEVICES || flags & !(abi::BLK_RO | abi::BLK_VOLATILE) != 0 || lba_start % crate::blkd::WINDOW_ALIGN != 0 || lba_count % crate::blkd::WINDOW_ALIGN != 0 {
+    let (read_only, volatile, encrypted) = (flags & abi::BLK_RO != 0, flags & abi::BLK_VOLATILE != 0, flags & abi::BLK_ENCRYPT != 0);
+    if encrypted && !host::blk::valid_xts_key(key) { return Err(ctl::EINVAL); }
+    if dev >= MAX_GUEST_DEVICES || flags & !(abi::BLK_RO | abi::BLK_VOLATILE | abi::BLK_ENCRYPT) != 0 || lba_start % crate::blkd::WINDOW_ALIGN != 0 || lba_count % crate::blkd::WINDOW_ALIGN != 0 {
         return Err(ctl::EINVAL);
     }
     h.ensure_disk(disk)?;
     let (c, unit) = (h.disks[disk].ctrl, h.disks[disk].unit);
     let ctrl = &h.ctrls[c];
+    if encrypted && ctrl.features & host::blk::FEATURE_AES == 0 { return Err(ctl::EOPNOTSUPP); }
     let window = l4h_host::blk::DiskWindow::new(lba_start, lba_count, h.disks[disk].capacity).ok_or(ctl::EINVAL)?;
     let read_only = read_only || h.disks[disk].read_only;
     let dom0 = h.guests[id].as_ref().ok_or(ctl::ENOENT)?.dom0;
@@ -491,9 +506,19 @@ fn disk_attach(h: &mut Host, a: [u64; 8]) -> Result<Vals, i64> {
         if g.disks.is_full() {
             return Err(ctl::ENOSPC);
         }
-        let (client, chan, kick) = crate::blkd::attach(&mut h.ctrls[c], disk, g, window, read_only, volatile, &mut h.alloc, &mut h.iommu);
+        let (client, chan, kick) = crate::blkd::attach(&mut h.ctrls[c], disk, g, window, read_only, volatile, encrypted, &mut h.alloc, &mut h.iommu);
         g.disks.must_push((c, client));
-        crate::blkd::activate(&mut h.ctrls[c], unit, client, g, &chan, &mut h.wins.a, &h.pci)?;
+        if let Err(e) = crate::blkd::activate(&mut h.ctrls[c], unit, client, g, &chan, &mut h.wins.a, &h.pci, key) {
+            abs_of(kick).delete().expect("drop unused blkd kick");
+            h.alloc.slots.free(kick.bits() as Slot);
+            // Rejected shared-key/flag checks have no outstanding I/O.
+            // Failed controllers stay on the destroy/quarantine path.
+            if !h.ctrls[c].failed {
+                crate::blkd::remove(&mut h.ctrls[c], client, &h.pci, &mut h.iommu);
+                g.disks.pop();
+            }
+            return Err(e);
+        }
         for (i, f) in chan.iter().enumerate() {
             xchg(h, i).copy(&abs_of(*f), CapRights::all()).expect("vmmgr channel frame");
         }

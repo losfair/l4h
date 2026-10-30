@@ -14,6 +14,8 @@ pub struct Iommu { unmapped: Vec<(usize, usize)> }
 impl Iommu {
     fn unmap(&mut self, _: Domain, pa: usize, len: usize) { self.unmapped.push((pa, len)); }
 }
+mod cap { pub type CNode = usize; }
+fn abs_of(_: usize) -> Slot { Slot }
 struct Slot;
 impl Slot { fn delete(&self) -> Result<(), ()> { Ok(()) } }
 struct Component { service_ep: u64 }
@@ -27,7 +29,7 @@ fn quarantine(c: &mut Controller, _: &Pci) { c.failed = true; }
 
 fn reservation() -> Attachment {
     Attachment { vm: 0, disk: 0, window: DiskWindow::new(8, 16, 1024).unwrap(),
-        read_only: false, volatile: false, reserved: true, pool: None }
+        read_only: false, volatile: false, encrypted: false, reserved: true, pool: None, mappings: None }
 }
 
 #[test]

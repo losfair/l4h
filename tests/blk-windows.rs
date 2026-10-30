@@ -163,3 +163,27 @@ fn dom0_partition_windows_preserve_offsets_and_reject_unsafe_ranges() {
     req.sector = w[0].sectors;
     assert_eq!(w[0].check_request(&req, pool(), 512, false), Err(STATUS_IOERR));
 }
+
+#[test]
+fn crypto_work_and_bounce_use_are_bounded_by_the_advertised_maximum() {
+    let pool = Pool { gpa: 0, paddr: 0x10000000, size: 256 << 20 };
+    let window = DiskWindow::new(0, pool.size / 512, pool.size / 512).unwrap();
+    for op in [OP_READ, OP_WRITE] {
+        let mut req = Req { op, nr_segs: 1, ..Default::default() };
+        req.segs[0] = Seg { gpa: 0, len: MAX_REQUEST_BYTES as u32, flags: if op == OP_READ { SEG_WRITE } else { 0 } };
+        assert_eq!(window.check_request(&req, pool, 4096, false), Ok(0));
+        req.segs[0].len += 4096;
+        assert_eq!(window.check_request(&req, pool, 4096, false), Err(STATUS_IOERR));
+    }
+}
+
+#[test]
+fn xts_key_halves_must_differ() {
+    assert!(!valid_xts_key(&[0; 64]));
+    assert!(!valid_xts_key(&[0xa5; 64]));
+    for i in 0..64 {
+        let mut key = [0xa5; 64];
+        key[i] ^= 1;
+        assert!(valid_xts_key(&key));
+    }
+}

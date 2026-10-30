@@ -37,6 +37,17 @@ pub struct Component {
 }
 
 impl Component {
+    /// Copy and map a 2 MiB frame, retaining its mapping capability.
+    pub fn map_large_copy(&self, alloc: &mut Alloc, arena: &mut Arena,
+        frame: &sel4::AbsoluteCPtr, va: usize, keep: sel4::AbsoluteCPtr) {
+        let s = alloc.slots.alloc();
+        let f = cap_at::<cap_type::LargePage>(s);
+        self.local_cnode.absolute_cptr(f).copy(frame, CapRights::all()).expect("copy large frame");
+        crate::vspace::map_large_page(&mut ObjCtx::arena(alloc, arena), self.vspace, f, va, CapRights::read_write());
+        keep.move_(&self.local_cnode.absolute_cptr(f)).expect("keep large mapping cap");
+        alloc.slots.free(s);
+    }
+
     /// Destination for a capability in the component's CNode.
     pub fn slot(&self, idx: u64) -> sel4::AbsoluteCPtr {
         self.cnode.absolute_cptr_from_bits_with_depth(idx, self.cnode_bits)

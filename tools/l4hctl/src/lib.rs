@@ -34,6 +34,7 @@ pub const NIC_ISOLATED: u64 = 2;
 /// CTL_BLK_ATTACH flags.
 pub const BLK_RO: u64 = 1;
 pub const BLK_VOLATILE: u64 = 2;
+pub const BLK_ENCRYPT: u64 = 4;
 pub const CTL_VM_SET_SCHED: u32 = 16;
 pub const CTL_VM_INFO: u32 = 17;
 pub const CTL_VM_STATS: u32 = 18;
@@ -148,7 +149,7 @@ pub fn errno_name(e: i64) -> &'static str {
         16 => "busy",
         22 => "invalid argument",
         28 => "no space for devices",
-        38 => "not supported",
+        38 | 95 => "not supported",
         _ => "error",
     }
 }
@@ -193,6 +194,9 @@ impl Ctl {
         let mut resp = Box::new(Resp { status: 0, vals: [0; 6], data: [0; CTL_DATA_MAX] });
         let call = Call { req: &*req as *const Req as u64, resp: &mut *resp as *mut Resp as u64, buf, len: len as u64 };
         let r = unsafe { ioctl(self.dev.as_raw_fd(), L4HCTL_IOC_CALL, &call as *const Call) };
+        if op == CTL_BLK_ATTACH {
+            for byte in &mut req.data { unsafe { std::ptr::write_volatile(byte, 0); } }
+        }
         if r < 0 {
             return err(format!("ioctl: {}", io::Error::last_os_error()));
         }
@@ -394,6 +398,28 @@ impl Ctl {
     }
 }
 
+/// A raw disk key read from a file, erased when no longer needed. No
+/// Debug implementation: diagnostic output must never contain the key.
+pub struct DiskKey(pub [u8; 64]);
+impl Drop for DiskKey {
+    fn drop(&mut self) {
+        for byte in &mut self.0 { unsafe { std::ptr::write_volatile(byte, 0); } }
+    }
+}
+impl DiskKey {
+    pub fn read(path: &str) -> Result<Self> {
+        use std::io::Read;
+        let mut f = File::open(path).map_err(|e| Error(format!("{path}: {e}")))?;
+        let mut key = Self([0; 64]);
+        f.read_exact(&mut key.0).map_err(|_| Error("disk key file must contain exactly 64 raw bytes".into()))?;
+        let mut extra = [0; 1];
+        let n = f.read(&mut extra).map_err(|e| Error(e.to_string()))?;
+        unsafe { std::ptr::write_volatile(&mut extra[0], 0); }
+        if n != 0 { return err("disk key file must contain exactly 64 raw bytes"); }
+        Ok(key)
+    }
+}
+
 /// A VM to create and start with [`Ctl::create_vm`].
 pub struct VmSpec<'a> {
     pub name: &'a str,
@@ -503,6 +529,13 @@ impl Ctl {
     /// Returns the VM id and the MAC of each NIC.  On failure the VM is
     /// destroyed again.
     pub fn create_vm(&self, o: &VmSpec) -> Result<(u64, Vec<u64>)> {
+        self.create_vm_with_keys(o, &[])
+    }
+
+    /// Create a VM with optional raw keys, in the same order as `o.disks`.
+    /// Omitted entries attach plain disks. Keys never enter the VM.
+    pub fn create_vm_with_keys(&self, o: &VmSpec, keys: &[Option<DiskKey>]) -> Result<(u64, Vec<u64>)> {
+        if keys.len() > o.disks.len() { return err("more disk keys than disks"); }
         let mut name = [0u8; CTL_NAME_MAX];
         let n = o.name.len().min(CTL_NAME_MAX - 1);
         name[..n].copy_from_slice(&o.name.as_bytes()[..n]);
@@ -513,8 +546,8 @@ impl Ctl {
         let resp = self.call(CTL_VM_CREATE, &[o.mem, o.vcpus, 0, 0, io_pool], &name, &[])?;
         let (vm, initrd_gpa) = (resp.vals[0], resp.vals[1]);
         let r = (|| {
-            for &(disk, flags, start, sectors) in &o.disks {
-                self.call(CTL_BLK_ATTACH, &[vm, disk, flags, start, sectors], &[], &[])?;
+            for (i, &(disk, flags, start, sectors)) in o.disks.iter().enumerate() {
+                self.blk_attach(vm, disk, flags, start, sectors, keys.get(i).and_then(Option::as_ref).map(|k| &k.0))?;
             }
             let mut macs = Vec::new();
             for &(sw, mac, flags) in &o.nics {
@@ -655,9 +688,21 @@ pub struct DiskAttachment {
     pub start: u64,
     pub sectors: u64,
     pub read_only: bool,
+    pub encrypted: bool,
 }
 
 impl Ctl {
+    /// Attach a window to a created VM. Encrypted windows require a
+    /// 64-byte AES-256-XTS key and expose 4096-byte logical blocks.
+    /// `flags`: BLK_RO and BLK_VOLATILE; a key adds BLK_ENCRYPT.
+    pub fn blk_attach(&self, vm: u64, disk: u64, flags: u64, start: u64, sectors: u64, key: Option<&[u8; 64]>) -> Result<()> {
+        let encrypt = if key.is_some() { BLK_ENCRYPT } else { 0 };
+        let r = self.call(CTL_BLK_ATTACH, &[vm, disk, flags | encrypt, start, sectors], key.map_or(&[][..], |k| &k[..]), &[])?;
+        // Never start a VM believing a plain attachment is encrypted.
+        if r.vals[0] & encrypt != encrypt { return err("host did not confirm disk encryption; do not start this VM"); }
+        Ok(())
+    }
+
     pub fn disk_info(&self, index: u64) -> Result<DiskInfo> {
         let r = self.call(CTL_DISK_INFO, &[index], &[], &[])?;
         Ok(DiskInfo { index, bdf: r.vals[0] & 0xffff, address: r.vals[0] >> 16, owner: (r.vals[1] != u64::MAX).then_some(r.vals[1]),
@@ -672,7 +717,7 @@ impl Ctl {
             if r.vals[0] == 0 { return Ok(out); }
             if r.vals[0] <= first { return err("invalid attachment cursor"); }
             first = r.vals[0];
-            out.push(DiskAttachment { vm: r.vals[1], start: r.vals[2], sectors: r.vals[3], read_only: r.vals[4] != 0 });
+            out.push(DiskAttachment { vm: r.vals[1], start: r.vals[2], sectors: r.vals[3], read_only: r.vals[4] != 0, encrypted: r.vals[5] != 0 });
         }
     }
 
