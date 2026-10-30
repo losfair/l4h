@@ -107,6 +107,56 @@ static inline int update_pte_range(pmd_t pmdv, unsigned long addr,
 	return ret;
 }
 
+static int sync_one_pmd(pmd_t *pmd, unsigned long addr, unsigned long end,
+			struct vm_ops *ops)
+{
+	for (;;) {
+		pmd_t v = READ_ONCE(*pmd);
+		int ret;
+
+		if (pmd_trans_huge(v)) {
+			pte_t leaf = __pte(pmd_val(v));
+			int prot = 0;
+
+			if (!pmd_needsync(v))
+				return 0;
+			/* NEEDSYNC describes the whole leaf, even when the flush
+			 * covers only part of it.  Retry this whole range if the
+			 * PMD changes to a PTE table while we map it. */
+			addr &= PMD_MASK;
+			end = addr + PMD_SIZE;
+			/* pmd_present() also accepts the temporarily invalid leaf
+			 * used by splitting.  It must have no seL4 mappings. */
+			if (pmd_val(v) & _PAGE_PRESENT) {
+				if (pte_read(leaf))
+					prot |= UM_PROT_READ;
+				if (pte_write(leaf) && pte_dirty(leaf))
+					prot |= UM_PROT_WRITE;
+				if (pte_exec(leaf))
+					prot |= UM_PROT_EXEC;
+			}
+			if (prot)
+				ret = ops->mmap(ops->mm_idp, addr, PMD_SIZE, prot,
+						pmd_val(v) & PAGE_MASK);
+			else
+				ret = ops->unmap(ops->mm_idp, addr, PMD_SIZE);
+		} else if (!pmd_present(v)) {
+			if (!pmd_needsync(v))
+				return 0;
+			ret = ops->unmap(ops->mm_idp, addr, end - addr);
+		} else {
+			return update_pte_range(v, addr, end, ops);
+		}
+		if (ret)
+			return ret;
+		/* As for PTEs, do not acknowledge a concurrent replacement.
+		 * In particular, a split/collapse flush must wait until every
+		 * old base-page mapping is gone before it can free memory. */
+		if (try_cmpxchg(&pmd_val(*pmd), &pmd_val(v), pmd_val(v) & ~_PAGE_NEEDSYNC))
+			return 0;
+	}
+}
+
 static inline int update_pmd_range(pud_t pudv, unsigned long addr,
 				   unsigned long end,
 				   struct vm_ops *ops)
@@ -117,17 +167,8 @@ static inline int update_pmd_range(pud_t pudv, unsigned long addr,
 
 	pmd = pud_pgtable(pudv) + pmd_index(addr);
 	do {
-		pmd_t v = READ_ONCE(*pmd);
-
 		next = pmd_addr_end(addr, end);
-		if (!pmd_present(v)) {
-			if (pmd_needsync(v)) {
-				ret = ops->unmap(ops->mm_idp, addr,
-						 next - addr);
-				pmd_mkuptodate(*pmd);
-			}
-		}
-		else ret = update_pte_range(v, addr, next, ops);
+		ret = sync_one_pmd(pmd, addr, next, ops);
 	} while (pmd++, addr = next, ((addr < end) && !ret));
 	return ret;
 }

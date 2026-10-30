@@ -18,6 +18,11 @@
  */
 #define L4H_LDS_BLOCK_SIZE 0x200000
 
+/* The software PMD leaf size, on both ISAs. */
+#define HPAGE_SHIFT 21
+#define HPAGE_SIZE (_AC(1, UL) << HPAGE_SHIFT)
+#define HPAGE_MASK (~(HPAGE_SIZE - 1))
+
 #ifndef __ASSEMBLER__
 
 struct page;

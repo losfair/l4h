@@ -6,6 +6,13 @@
 mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
+# The 256 MiB boot size makes Linux disable THP even with the boot option.
+case "$(cat /proc/cmdline)" in
+    *transparent_hugepage=always*)
+        echo always > /sys/kernel/mm/transparent_hugepage/enabled
+        echo madvise > /sys/kernel/mm/transparent_hugepage/defrag
+        echo 1 > /sys/kernel/mm/transparent_hugepage/use_zero_page ;;
+esac
 mkdir -p /tmp/t && mount -t tmpfs -o size=2g tmp /tmp/t
 /bin/hpstress &
 hp=$!
@@ -33,6 +40,7 @@ while read -r cmd; do
         sleep 0.2
         kill -0 $hp 2>/dev/null || echo "HPVM: HPSTRESS DIED"
         bad=$(dmesg | grep -cE 'BUG:|Oops|WARNING:|Kernel panic|deadlocked')
-        echo "HPVM: status total $(( $(sed -n 's/^MemTotal: *\([0-9]*\) kB/\1/p' /proc/meminfo) >> 10 )) kernel-bad $bad" ;;
+        huge=$(sed -n 's/^AnonHugePages: *\([0-9]*\) kB/\1/p' /proc/meminfo)
+        echo "HPVM: status total $(( $(sed -n 's/^MemTotal: *\([0-9]*\) kB/\1/p' /proc/meminfo) >> 10 )) kernel-bad $bad anon-huge-kb ${huge:-0}" ;;
     esac
 done

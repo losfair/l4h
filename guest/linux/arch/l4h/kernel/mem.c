@@ -242,9 +242,9 @@ void mark_rodata_ro(void)
 }
 
 /*
- * set_ptes() with nr > 1 must map consecutive pages.  Without THP this
- * kernel has no large folios, so nothing calls it with nr > 1 at run time:
- * check the stride once at boot instead.  A scratch mm takes the sync mark.
+ * set_ptes() with nr > 1 must map consecutive pages (large folios and
+ * splitting huge PMDs). Check the stride at boot, including builds without
+ * THP. A scratch mm takes the sync mark.
  */
 static struct mm_struct set_ptes_mm __initdata;
 

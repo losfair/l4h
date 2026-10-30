@@ -11,10 +11,13 @@ mount -t tmpfs tmp /tmp
 fail() { echo "HOTPLUGSTRESS: FAIL: $*"; poweroff -f; }
 arg() { sed -n "s/.* $1=\([0-9]*\).*/\1/p" /proc/cmdline; }
 rounds=$(arg HS_ROUNDS)
+guest_cmdline=console=hvc0
+[ "$(arg HS_THP)" = 1 ] && guest_cmdline="$guest_cmdline transparent_hugepage=always"
 rand() { echo $(( $(od -An -N2 -tu2 /dev/urandom) % $1 )); }
 free_mib() { l4hctl info | sed -n 's/^memory: *\([0-9]*\) MiB free.*/\1/p'; }
 create() {
-    id=$(l4hctl create "hs$1" --initrd /bin/hpstressvm.cpio.gz --mem 256 --vcpus 2) || fail "create hs$1"
+    id=$(l4hctl create "hs$1" --initrd /bin/hpstressvm.cpio.gz --mem 256 --vcpus 2 \
+        --cmdline "$guest_cmdline") || fail "create hs$1"
     l4hctl console "$id" --until "HPVM: ready" --timeout 120 >/dev/null || fail "hs$1 did not boot"
     echo "$id"
 }

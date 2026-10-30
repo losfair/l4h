@@ -217,8 +217,18 @@ retry:
 		}
 
 		pmd = pmd_off(mm, address);
-		pte = pte_offset_kernel(pmd, address);
-	} while (!pte_present(*pte));
+		if (pmd_trans_huge(READ_ONCE(*pmd)))
+			break;
+		/* A concurrent collapse can remove the PTE table. */
+		pte = pte_offset_map(pmd, address);
+		if (pte) {
+			bool present = pte_present(ptep_get(pte));
+
+			pte_unmap(pte);
+			if (present)
+				break;
+		}
+	} while (1);
 	err = 0;
 	/*
 	 * The below warning was added in place of

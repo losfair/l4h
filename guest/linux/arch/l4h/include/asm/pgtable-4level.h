@@ -79,7 +79,7 @@ static inline int pgd_needsync(pgd_t pgd)
 
 #define pgd_mkuptodate(pgd) clear_bit(1, (unsigned long *)&pgd_val(pgd))
 
-#define set_pmd(pmdptr, pmdval) (*(pmdptr) = (pmdval))
+#define set_pmd(pmdptr, pmdval) WRITE_ONCE(*(pmdptr), (pmdval))
 
 static inline void pud_clear (pud_t *pud)
 {

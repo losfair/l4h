@@ -18,6 +18,7 @@
 #define _PAGE_USER	0x040
 #define _PAGE_ACCESSED	0x080
 #define _PAGE_DIRTY	0x100
+#define _PAGE_HUGE	0x200	/* a software PMD leaf; seL4 still maps 4 KiB */
 /* If _PAGE_PRESENT is clear, we use these: */
 #define _PAGE_PROTNONE	0x010	/* if the user mapped it with PROT_NONE;
 				   pte_present gives true */
@@ -92,10 +93,11 @@ extern unsigned long end_iomem;
 #define pte_clear(mm, addr, xp) pte_set_val(*(xp), (phys_t) 0, __pgprot(_PAGE_NEEDSYNC))
 
 #define pmd_none(x)	(!((unsigned long)pmd_val(x) & ~_PAGE_NEEDSYNC))
-#define	pmd_bad(x)	((pmd_val(x) & (~PAGE_MASK & ~_PAGE_USER)) != _KERNPG_TABLE)
+#define	pmd_bad(x)	((pmd_val(x) & (~PAGE_MASK & ~(_PAGE_USER | _PAGE_NEEDSYNC))) != _KERNPG_TABLE)
 
-#define pmd_present(x)	(pmd_val(x) & _PAGE_PRESENT)
-#define pmd_clear(xp)	do { pmd_val(*(xp)) = _PAGE_NEEDSYNC; } while (0)
+/* An invalidated huge PMD remains a leaf while split_huge_pmd() fills PTEs. */
+#define pmd_present(x)	(pmd_val(x) & (_PAGE_PRESENT | _PAGE_PROTNONE | _PAGE_HUGE))
+#define pmd_clear(xp)	do { WRITE_ONCE(pmd_val(*(xp)), _PAGE_NEEDSYNC); } while (0)
 
 #define pmd_needsync(x)   (pmd_val(x) & _PAGE_NEEDSYNC)
 /* Atomic: other vCPUs may update the entry concurrently (bit 1 == _PAGE_NEEDSYNC). */
@@ -303,6 +305,82 @@ static inline pte_t pte_modify(pte_t pte, pgprot_t newprot)
 	return pte;
 }
 
+/* Linux's THP page tables are software-only.  The TLB sync expands each
+ * huge leaf into base-page mappings, including permission downgrades. */
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+static inline int pmd_trans_huge(pmd_t pmd)
+{
+	return !!(pmd_val(pmd) & _PAGE_HUGE);
+}
+
+#define pmd_leaf pmd_trans_huge
+#define pmd_write(pmd) pte_write(__pte(pmd_val(pmd)))
+#define pmd_dirty(pmd) pte_dirty(__pte(pmd_val(pmd)))
+#define pmd_young(pmd) pte_young(__pte(pmd_val(pmd)))
+
+static inline pmd_t pmd_mkhuge(pmd_t pmd)
+{
+	return __pmd(pmd_val(pmd) | _PAGE_HUGE);
+}
+
+static inline pmd_t pmd_mkinvalid(pmd_t pmd)
+{
+	return __pmd(pmd_val(pmd) & ~(_PAGE_PRESENT | _PAGE_PROTNONE));
+}
+
+static inline pmd_t pmd_modify(pmd_t pmd, pgprot_t prot)
+{
+	return __pmd((pmd_val(pmd) & (_PAGE_CHG_MASK | _PAGE_HUGE)) | pgprot_val(prot));
+}
+
+#define pmd_mkold(pmd) __pmd(pte_val(pte_mkold(__pte(pmd_val(pmd)))))
+#define pmd_mkyoung(pmd) __pmd(pte_val(pte_mkyoung(__pte(pmd_val(pmd)))))
+#define pmd_mkclean(pmd) __pmd(pte_val(pte_mkclean(__pte(pmd_val(pmd)))))
+#define pmd_mkdirty(pmd) __pmd(pte_val(pte_mkdirty(__pte(pmd_val(pmd)))))
+#define pmd_wrprotect(pmd) __pmd(pte_val(pte_wrprotect(__pte(pmd_val(pmd)))))
+#define pmd_mkwrite_novma(pmd) __pmd(pte_val(pte_mkwrite_novma(__pte(pmd_val(pmd)))))
+
+#define __HAVE_ARCH_PMD_SAME
+static inline int pmd_same(pmd_t a, pmd_t b)
+{
+	return !((pmd_val(a) ^ pmd_val(b)) & ~_PAGE_NEEDSYNC);
+}
+
+static inline void set_pmd_at(struct mm_struct *mm, unsigned long addr,
+			      pmd_t *pmdp, pmd_t pmd)
+{
+	WRITE_ONCE(pmd_val(*pmdp), pmd_val(pmd) | _PAGE_NEEDSYNC);
+	um_tlb_mark_sync(mm, addr & PMD_MASK, (addr & PMD_MASK) + PMD_SIZE);
+}
+
+#define __HAVE_ARCH_PMDP_HUGE_GET_AND_CLEAR
+static inline pmd_t pmdp_huge_get_and_clear(struct mm_struct *mm,
+					  unsigned long addr, pmd_t *pmdp)
+{
+	pmd_t old = __pmd(xchg(&pmd_val(*pmdp), _PAGE_NEEDSYNC));
+
+	/* Once cleared, the sync walker cannot tell this was a huge leaf. */
+	um_tlb_mark_sync(mm, addr & PMD_MASK, (addr & PMD_MASK) + PMD_SIZE);
+	return old;
+}
+
+#define pmdp_establish pmdp_establish
+static inline pmd_t pmdp_establish(struct vm_area_struct *vma,
+				 unsigned long addr, pmd_t *pmdp, pmd_t pmd)
+{
+	pmd_t old = __pmd(xchg(&pmd_val(*pmdp), pmd_val(pmd) | _PAGE_NEEDSYNC));
+	um_tlb_mark_sync(vma->vm_mm, addr & PMD_MASK, (addr & PMD_MASK) + PMD_SIZE);
+	return old;
+}
+
+#define __HAVE_ARCH_PMDP_TEST_AND_CLEAR_YOUNG
+int pmdp_test_and_clear_young(struct vm_area_struct *vma, unsigned long addr,
+			    pmd_t *pmdp);
+#define __HAVE_ARCH_PMDP_CLEAR_YOUNG_FLUSH
+#define pmdp_clear_flush_young pmdp_test_and_clear_young
+#define update_mmu_cache_pmd(vma, address, pmdp) do {} while (0)
+#endif
+
 /*
  * the pmd page can be thought of an array like this: pmd_t[PTRS_PER_PMD]
  *
@@ -312,7 +390,6 @@ static inline pte_t pte_modify(pte_t pte, pgprot_t newprot)
 #define pmd_page_vaddr(pmd) ((unsigned long) __va(pmd_val(pmd) & PAGE_MASK))
 
 struct mm_struct;
-extern pte_t *virt_to_pte(struct mm_struct *mm, unsigned long addr);
 
 #define update_mmu_cache(vma,address,ptep) do {} while (0)
 #define update_mmu_cache_range(vmf, vma, address, ptep, nr) do {} while (0)

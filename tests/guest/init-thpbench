@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+# Override Linux's small-machine boot policy for this 512 MiB guest.
+echo madvise > /sys/kernel/mm/transparent_hugepage/enabled
+echo madvise > /sys/kernel/mm/transparent_hugepage/defrag
+echo 1 > /sys/kernel/mm/transparent_hugepage/use_zero_page
+echo "THPBENCH: kernel=$(uname -r) vcpus=$(nproc)"
+cat /sys/kernel/mm/transparent_hugepage/enabled
+# Isolate fault-time THP from background collapsing/splitting between trials.
+echo 0 > /sys/kernel/mm/transparent_hugepage/shrink_underused
+echo 600000 > /sys/kernel/mm/transparent_hugepage/khugepaged/scan_sleep_millisecs
+/bin/thpbench || echo 'THPBENCH: FAIL (worker exit)'
+poweroff -f

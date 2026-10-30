@@ -14,46 +14,18 @@
 #include <asm/futex.h>
 #include <os.h>
 
-pte_t *virt_to_pte(struct mm_struct *mm, unsigned long addr)
-{
-	pgd_t *pgd;
-	p4d_t *p4d;
-	pud_t *pud;
-	pmd_t *pmd;
-
-	if (mm == NULL)
-		return NULL;
-
-	pgd = pgd_offset(mm, addr);
-	if (!pgd_present(*pgd))
-		return NULL;
-
-	p4d = p4d_offset(pgd, addr);
-	if (!p4d_present(*p4d))
-		return NULL;
-
-	pud = pud_offset(p4d, addr);
-	if (!pud_present(*pud))
-		return NULL;
-
-	pmd = pmd_offset(pud, addr);
-	if (!pmd_present(*pmd))
-		return NULL;
-
-	return pte_offset_kernel(pmd, addr);
-}
-
 /*
- * The page mapped at user address @virt, with a reference, if its PTE allows
+ * The page mapped at user address @virt, with a reference, if its leaf allows
  * the access: present, readable (not PROT_NONE) or writable.  The caller
  * holds mmap_lock and has checked that a VMA covers @virt, so the page
  * tables stay in place (munmap frees them only after removing the VMA); the
- * PTE lock keeps the entry stable while we check it, take the reference and
+ * leaf lock keeps the entry stable while we check it, take the reference and
  * mark it accessed (and dirty).
  */
-static struct page *get_mapped_page(struct mm_struct *mm, unsigned long virt,
+static struct page *get_mapped_page(struct vm_area_struct *vma, unsigned long virt,
 				    int is_write)
 {
+	struct mm_struct *mm = vma->vm_mm;
 	struct page *page = NULL;
 	spinlock_t *ptl;
 	pte_t *ptep, pte;
@@ -74,6 +46,24 @@ static struct page *get_mapped_page(struct mm_struct *mm, unsigned long virt,
 	pmd = pmd_offset(pud, virt);
 	if (!pmd_present(*pmd))
 		return NULL;
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+	ptl = pmd_trans_huge_lock(pmd, vma);
+	if (ptl) {
+		pmd_t entry = *pmd;
+		pte_t leaf = __pte(pmd_val(entry));
+
+		if ((pmd_val(entry) & _PAGE_PRESENT) &&
+		    (is_write ? pte_write(leaf) : pte_read(leaf))) {
+			page = pmd_page(entry) + ((virt & ~PMD_MASK) >> PAGE_SHIFT);
+			get_page(page);
+			if (is_write ? !pmd_dirty(entry) || !pmd_young(entry) : !pmd_young(entry))
+				set_pmd_at(mm, virt, pmd, is_write ? pmd_mkdirty(pmd_mkyoung(entry)) :
+								   pmd_mkyoung(entry));
+		}
+		spin_unlock(ptl);
+		return page;
+	}
+#endif
 	ptep = pte_offset_map_lock(mm, pmd, virt, &ptl);
 	if (!ptep)
 		return NULL;
@@ -116,6 +106,7 @@ static struct page *pin_user_page(unsigned long virt, int is_write)
 		return NULL;
 	for (tries = 0; tries < 4; tries++) {
 		struct page *page = NULL;
+		struct vm_area_struct *vma;
 
 		if (atomic) {
 			if (!mmap_read_trylock(mm))
@@ -123,8 +114,9 @@ static struct page *pin_user_page(unsigned long virt, int is_write)
 		} else {
 			mmap_read_lock(mm);
 		}
-		if (vma_lookup(mm, virt))
-			page = get_mapped_page(mm, virt, is_write);
+		vma = vma_lookup(mm, virt);
+		if (vma)
+			page = get_mapped_page(vma, virt, is_write);
 		mmap_read_unlock(mm);
 		if (page)
 			return page;

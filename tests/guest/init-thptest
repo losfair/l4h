@@ -1,0 +1,31 @@
+#!/bin/sh
+set -eu
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t tmpfs tmp /tmp
+mount -t devtmpfs dev /dev
+# Linux disables THP at boot when usable RAM is below 512 MiB.
+echo madvise > /sys/kernel/mm/transparent_hugepage/enabled
+echo madvise > /sys/kernel/mm/transparent_hugepage/defrag
+echo 1 > /sys/kernel/mm/transparent_hugepage/use_zero_page
+insmod /bin/l4h_page_aging.ko
+echo advise > /sys/kernel/mm/transparent_hugepage/shmem_enabled
+echo 10 > /sys/kernel/mm/transparent_hugepage/khugepaged/scan_sleep_millisecs
+echo 10 > /sys/kernel/mm/transparent_hugepage/khugepaged/alloc_sleep_millisecs
+mkswap /dev/vda
+swapon /dev/vda
+if ! /bin/thptest; then
+    grep '^thp_' /proc/vmstat
+    cat /proc/buddyinfo
+    cat /sys/kernel/mm/transparent_hugepage/enabled
+    echo 'THPTEST: FAIL (worker exit)'
+fi
+mkdir -p /sys/fs/cgroup
+mount -t cgroup2 none /sys/fs/cgroup
+echo +memory > /sys/fs/cgroup/cgroup.subtree_control
+mkdir /sys/fs/cgroup/fallback
+echo 1048576 > /sys/fs/cgroup/fallback/memory.max
+echo 0 > /sys/fs/cgroup/fallback/memory.swap.max
+sh -c 'echo $$ > /sys/fs/cgroup/fallback/cgroup.procs; exec /bin/thptest --fallback' \
+    || echo 'THPTEST: FAIL (fallback exit)'
+poweroff -f

@@ -12,8 +12,8 @@
  * In UML, we need to sync the TLB over by using mmap/munmap syscalls from
  * the process handling the MM (which can be the kernel itself).
  *
- * To track updates, we can hook into set_ptes and flush_tlb_*. With set_ptes
- * we catch all PTE transitions where memory that was unusable becomes usable.
+ * To track updates, we hook into set_ptes, set_pmd_at and flush_tlb_*.
+ * The setters catch leaf transitions where unusable memory becomes usable.
  * While with flush_tlb_* we can track any memory that becomes unusable and
  * even if a higher layer of the page table was modified.
  *

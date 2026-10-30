@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Test-only access to the reclaim hook: smaps reads the software PTE and
- * cannot observe a hardware access.  Loaded only by run-selftest.sh. */
+ * cannot observe a hardware access. Loaded only by the test runners. */
 #include <linux/mm.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
@@ -25,8 +25,8 @@ static long aging_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	if (!range.size || range.size > SZ_64M || end < addr ||
 	    !PAGE_ALIGNED(addr) || !PAGE_ALIGNED(end))
 		return -EINVAL;
-	/* l4h has no highmem or huge PTEs.  The write lock keeps the leaf
-	 * table alive for pte_offset_kernel(), including against munmap. */
+	/* The write lock excludes collapse and keeps the hierarchy alive.
+	 * Leaf locks also exclude splitting and reclaim. */
 	mmap_write_lock(mm);
 	vma = vma_lookup(mm, addr);
 	if (!vma || end > vma->vm_end) {
@@ -50,6 +50,19 @@ static long aging_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		if (pud_none(*pud) || pud_bad(*pud))
 			continue;
 		pmd = pmd_offset(pud, addr);
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+		ptl = pmd_lock(mm, pmd);
+		if (pmd_trans_huge(*pmd)) {
+			unsigned long next = pmd_addr_end(addr, end);
+
+			if (pmdp_clear_flush_young(vma, addr & PMD_MASK, pmd))
+				young += (next - addr) >> PAGE_SHIFT;
+			spin_unlock(ptl);
+			addr = next - PAGE_SIZE;
+			continue;
+		}
+		spin_unlock(ptl);
+#endif
 		if (pmd_none(*pmd) || pmd_bad(*pmd))
 			continue;
 		pte = pte_offset_kernel(pmd, addr);

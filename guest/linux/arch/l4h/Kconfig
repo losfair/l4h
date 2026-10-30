@@ -52,6 +52,8 @@ config UML
 
 config L4H
 	def_bool y
+	# Huge Linux PMDs are mirrored into ordinary 4 KiB seL4 mappings.
+	select HAVE_ARCH_TRANSPARENT_HUGEPAGE
 	# Object memory grows by isolating and migrating whole RAM blocks.
 	select COMPACTION
 	select MEMORY_ISOLATION

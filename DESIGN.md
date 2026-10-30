@@ -719,8 +719,35 @@ virtio-l4h code. The Linux base is 6.18; patches outside arch/l4h are in
   chunk table: devices see only the host-owned I/O pool. Running out of
   RAM for objects is a guest-local OOM. Destroy revokes the original
   block Untypeds to reclaim everything the guest made.
-- Huge pages are not in v1. A later version can back hugetlb/THP regions with
-  2 MiB frame caps from dedicated chunks.
+- **Transparent huge pages.** Linux can allocate 2 MiB anonymous THPs and
+  collapse base pages through `khugepaged` or `MADV_COLLAPSE`. The default is
+  `transparent_hugepage=madvise`; Linux still disables THP at boot below
+  512 MiB of usable RAM, where it can be enabled explicitly through
+  `/sys/kernel/mm/transparent_hugepage/enabled`. These are software PMD
+  leaves: each is still mirrored into 512 ordinary 4 KiB seL4 frame mappings.
+  This batches guest faults but retains base-page hardware TLB coverage and capability
+  costs. No host ABI or seL4 change is needed. Linux's smaller PTE-mapped
+  THP sizes remain disabled by default.
+
+  The TLB sync recognizes a huge leaf and applies its entire 2 MiB range,
+  even for a partial flush, before clearing `NEEDSYNC` with a compare and
+  exchange. A split's temporarily invalid PMD retains its huge marker but
+  has all its seL4 mappings removed. Faults, kernel user copies and futexes
+  take the PMD lock and resolve the correct tail page. Aging combines the
+  software PMD's young bit with the accessed bits of all 512 mappings.
+  Ordinary folio splitting and migration handle reclaim and object-block
+  conversion; native PMD migration and whole-THP swap are not enabled.
+
+  `tests/run-thptest.sh` covers allocation, COW, user copies, futexes,
+  VSpace eviction, splitting with pinned pages, partial protection/unmap/discard,
+  explicit and background collapse, moving mappings, concurrent writes,
+  hardware aging, swap, execute permissions, shared memory and allocation
+  fallback. `HPSTRESS_THP=1 tests/run-hotplugstress.sh 15` exercises memory
+  hotplug with THP enabled in the workload guests. `tests/run-thpbench.sh` compares
+  advised THP with `MADV_NOHUGEPAGE` on the same kernel, in fresh processes
+  with alternating trial order. Real 2 MiB seL4 mappings remain future
+  work: they need a capability representation that also permits individual
+  subpages to be mapped without retyping live memory.
 
 ### 5.4 Execution model: vCPUs, tasks, syscalls and interrupts
 
@@ -3101,6 +3128,47 @@ Next steps for I/O latency:
 The design prioritizes I/O and idle density, the cloud workload, over
 syscall-heavy microbenchmarks. Benchmarks: lmbench lat_syscall/lat_ctx/
 lat_pagefault, fio, iperf3, kernel compile, and a 30-guest idle-density test.
+
+**Guest THP using existing backing, measured 2026-10-30.**
+`tests/run-thpbench.sh 1` and `tests/run-thpbench.sh 4` compare
+`MADV_NOHUGEPAGE` with `MADV_HUGEPAGE` on the same Linux 6.18.58-l4h kernel.
+Each mode/trial uses a fresh process, alternating order; the table gives
+medians of five trials after one warmup pair. The guest has 512 MiB of RAM.
+QEMU 10.0.13 uses KVM with four host vCPUs and 4 GiB, on an i7-13700H
+exposed through an eight-vCPU Hyper-V development VM. Builds and other QEMU
+tests were stopped during measurement; these remain nested, shared-host results.
+The benchmark explicitly enables `madvise` policy and defrag, and disables
+background underused splitting while delaying `khugepaged` scanning.
+
+| Operation | 1 vCPU, base | 1 vCPU, THP | 4 vCPUs, base | 4 vCPUs, THP |
+|-----------|--------------|-------------|---------------|--------------|
+| Dense 64 MiB first-touch, ms | 65.212 | 26.226 | 68.487 | 28.034 |
+| Minor faults during first-touch | 16,387 | 35 | 16,387 | 35 |
+| Random page-stride read, ns/access | 17.64 | 16.81 | 18.21 | 15.78 |
+| Fork + exit + wait, ms | 4.546 | 1.487 | 4.910 | 1.949 |
+| Fork + COW-write 64 MiB + wait, ms | 95.372 | 128.847 | 98.050 | 152.392 |
+| Partial protection changes in 32 PMDs, ms | 0.186 | 25.753 | 0.299 | 26.434 |
+| Unmap after protection changes, ms | 12.206 | 10.768 | 13.090 | 10.862 |
+| Sparse 64 MiB first-touch, ms | 0.196 | 18.962 | 3.446 | 24.641 |
+| Sparse RSS, KiB | 128 | 65,536 | 128 | 65,536 |
+| Dense `VmPTE`, KiB | 1,102 | 1,102 | 1,102 | 1,102 |
+
+Dense first-touch writes one byte per 4 KiB; sparse first-touch writes one
+per 2 MiB. Protection changes make one 4 KiB page in each PMD read-only,
+then writable. Each fork measurement averages eight forks of the populated
+mapping. The COW child writes and verifies every base page; its parent checks
+that the original data remains intact. All THP trials verify full huge-page
+coverage. The counters include three minor faults outside the data mapping.
+
+First-touch is about 2.5 times faster, and fork about 2.5–3 times faster.
+COW is 35–55% slower, and partial operations pay for splitting and synchronizing
+the 512 base mappings. Sparse writes allocate 512 times as much resident data.
+These costs support the opt-in default. There is no hardware huge-page TLB
+benefit: random-read ranges overlap, and `VmPTE` (including seL4 mapping costs
+and Linux's deposited PTE tables) is unchanged. For example, one-vCPU dense
+first-touch ranges were 63.972–68.207 ms with base pages and 23.143–27.728 ms
+with THP. Full ranges, raw trials, environment and correctness checks are in
+[`tests/results/thp-nested-kvm-2026-10-30.txt`](tests/results/thp-nested-kvm-2026-10-30.txt).
 
 ---
 

@@ -4,6 +4,7 @@
 # random targets every few seconds, oversubscribing the host, with VMs
 # destroyed in the middle of a resize (tests/guest/init-hotplugstress).
 # Usage: run-hotplugstress.sh [rounds]
+# HPSTRESS_THP=1 enables THP throughout the workload guests.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 source "$root/tools/guest-env.sh"
@@ -21,7 +22,7 @@ rounds=${1:-90}
 "$root/tools/mkinitramfs.sh" "$out/hotplugstress.cpio.gz" "$root/tests/guest/init-hotplugstress" \
     "$l4h_ctl" "$out/hpstressvm.cpio.gz" >/dev/null
 L4H_DOM0_MEM_MB=256 L4H_MEM=${L4H_MEM:-4G} \
-    "$root/tools/run-dom0.sh" "$out/hotplugstress.cpio.gz" "console=hvc0 HS_ROUNDS=$rounds" \
+    "$root/tools/run-dom0.sh" "$out/hotplugstress.cpio.gz" "console=hvc0 HS_ROUNDS=$rounds HS_THP=${HPSTRESS_THP:-0}" \
     $(((300 + 6 * rounds) * l4h_test_slow)) \
     | grep -aE "HOTPLUGSTRESS|HPSTRESS|HPVM: (status|TMPFS|SELFTEST|HPSTRESS)|panic|BUG|WARNING|kernel fault" || true
 grep -aq "HOTPLUGSTRESS: PASS" "$root/build/qemu.log"

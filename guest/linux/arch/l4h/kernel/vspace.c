@@ -718,8 +718,51 @@ int ptep_test_and_clear_young(struct vm_area_struct *vma, unsigned long addr,
 }
 EXPORT_SYMBOL_GPL(ptep_test_and_clear_young);
 
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+/* A software huge PMD has up to 512 independently accessed seL4 frames.
+ * Sample and clear all of them, including when the software bit was set.
+ * The caller holds the PMD lock; m->lock also excludes VSpace eviction. */
+int pmdp_test_and_clear_young(struct vm_area_struct *vma, unsigned long addr,
+			    pmd_t *pmdp)
+{
+	struct l4h_mm *m = mm_l4h(vma->vm_mm);
+	unsigned long flags, off, pfn = pmd_pfn(READ_ONCE(*pmdp));
+	int young = test_and_clear_bit(7, &pmd_val(*pmdp));
+
+	addr &= PMD_MASK;
+	raw_spin_lock_irqsave(&m->lock, flags);
+	if (m->vs >= 0) {
+		for (off = 0; off < PMD_SIZE; off += PAGE_SIZE) {
+			void *e = xa_load(&vs_pool[m->vs].as.pages, (addr + off) >> PAGE_SHIFT);
+			int accessed = 0;
+
+			if (e && entry_pfn(e) == pfn + (off >> PAGE_SHIFT))
+				WARN_ON_ONCE(l4h_page_test_and_clear_accessed(entry_slot(e), &accessed));
+			young |= accessed;
+		}
+	}
+	raw_spin_unlock_irqrestore(&m->lock, flags);
+	return young;
+}
+EXPORT_SYMBOL_GPL(pmdp_test_and_clear_young);
+#endif
+
+static int map_fault_entry(struct mm_struct *mm, unsigned long va,
+			   unsigned long len, pte_t entry)
+{
+	int prot = UM_PROT_READ;
+
+	if (!(pte_val(entry) & _PAGE_PRESENT) || !pte_read(entry))
+		return 0;
+	if (pte_exec(entry))
+		prot |= UM_PROT_EXEC;
+	if (pte_write(entry) && pte_dirty(entry))
+		prot |= UM_PROT_WRITE;
+	return map_pages(&mm->context.id, va, len, prot, pte_val(entry) & PAGE_MASK, false);
+}
+
 /*
- * After a successful page fault, install the PTE for `address` directly,
+ * After a successful page fault, install the leaf for `address` directly,
  * with the protection the TLB sync uses: clean pages are read-only to
  * emulate the dirty bit.  Returns -ENOMEM if there was no memory for the
  * seL4 objects the mapping needs.
@@ -731,9 +774,10 @@ int l4h_map_fault(struct mm_struct *mm, unsigned long address)
 	p4d_t *p4d;
 	pud_t *pud;
 	pmd_t *pmd;
-	pte_t *pte, entry;
+	pte_t *pte;
+	struct vm_area_struct *vma;
 	spinlock_t *ptl;
-	int prot, err = 0;
+	int err = 0;
 
 	/* handle_page_fault() releases mmap_lock before returning to segv(),
 	 * so a concurrent munmap() may be freeing the page tables of `va`.
@@ -744,7 +788,8 @@ int l4h_map_fault(struct mm_struct *mm, unsigned long address)
 	 * protects only the leaf entry.)
 	 */
 	mmap_read_lock(mm);
-	if (!vma_lookup(mm, va))
+	vma = vma_lookup(mm, va);
+	if (!vma)
 		goto out_unlock;
 	pgd = pgd_offset(mm, va);
 	if (!pgd_present(*pgd))
@@ -758,20 +803,20 @@ int l4h_map_fault(struct mm_struct *mm, unsigned long address)
 	pmd = pmd_offset(pud, va);
 	if (!pmd_present(*pmd))
 		goto out_unlock;
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+	ptl = pmd_trans_huge_lock(pmd, vma);
+	if (ptl) {
+		err = map_fault_entry(mm, va & PMD_MASK, PMD_SIZE, __pte(pmd_val(*pmd)));
+		spin_unlock(ptl);
+		goto out_unlock;
+	}
+#endif
 	/* Hold the PTE lock so that a concurrent unmap on another vCPU cannot
 	 * complete (and sync) between reading the PTE and installing it. */
 	pte = pte_offset_map_lock(mm, pmd, va, &ptl);
 	if (!pte)
 		goto out_unlock;
-	entry = *pte;
-	if (pte_present(entry) && pte_read(entry)) {
-		prot = UM_PROT_READ;
-		if (pte_exec(entry))
-			prot |= UM_PROT_EXEC;
-		if (pte_write(entry) && pte_dirty(entry))
-			prot |= UM_PROT_WRITE;
-		err = map_pages(&mm->context.id, va, PAGE_SIZE, prot, pte_val(entry) & PAGE_MASK, false);
-	}
+	err = map_fault_entry(mm, va, PAGE_SIZE, *pte);
 	pte_unmap_unlock(pte, ptl);
 out_unlock:
 	mmap_read_unlock(mm);
