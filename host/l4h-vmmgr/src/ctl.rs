@@ -245,7 +245,9 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
             if a[2] & !(abi::BLK_RO | abi::BLK_VOLATILE | abi::BLK_ENCRYPT) != 0 {
                 return Err(EINVAL);
             }
-            resp.vals[0] = h.attach_disk(id, a[1] as usize, a[2], a[3], a[4], req.data[..64].try_into().unwrap())?;
+            h.attach_disk(id, a[1] as usize, a[2], a[3], a[4], req.data[..64].try_into().unwrap())?;
+            // Root rejects success unless blkd confirms these flags.
+            resp.vals[0] = a[2];
             Ok(())
         }
         abi::CTL_CONSOLE_READ => {

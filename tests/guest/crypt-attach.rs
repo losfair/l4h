@@ -27,7 +27,7 @@ fn main() {
         assert!(c.host_info().unwrap().free >= free, "failed attaches retained memory in the live VM");
         assert!(c.disk_attachments(0).unwrap().iter().all(|a| a.vm != id));
         let r = c.call(CTL_BLK_ATTACH, &[id, 0, BLK_RO | BLK_ENCRYPT, 2048, 16384], &key.0, &[]).unwrap();
-        assert_eq!(r.vals[0], BLK_RO | BLK_ENCRYPT, "applied flags must survive blkd/root/vmmgr IPC");
+        assert_eq!(r.vals[0], BLK_RO | BLK_ENCRYPT, "successful attach must confirm root-validated flags");
         assert!(c.disk_attachments(0).unwrap().iter().any(|a| a.vm == id && a.encrypted));
         c.vm_destroy(id).unwrap();
     }

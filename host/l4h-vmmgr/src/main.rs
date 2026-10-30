@@ -234,9 +234,8 @@ impl Vmmgr {
 
     /// Pass host disk `disk` (or sectors [lba_start, lba_start + lba_count)
     /// of it; 0 = to the end) through to guest `id` before it starts.
-    /// `flags`: abi::BLK_*; `key` is used with abi::BLK_ENCRYPT.  Returns
-    /// the flags applied.
-    pub fn attach_disk(&mut self, id: usize, disk: usize, flags: u64, lba_start: u64, lba_count: u64, key: &[u8; 64]) -> Result<u64, i64> {
+    /// `flags`: abi::BLK_*; `key` is used with abi::BLK_ENCRYPT.
+    pub fn attach_disk(&mut self, id: usize, disk: usize, flags: u64, lba_start: u64, lba_count: u64, key: &[u8; 64]) -> Result<(), i64> {
         if !self.can_afford(1 << 20, 0, 0) { return Err(ctl::ENOMEM); }
         self.with_guest(id, |h, g| {
             if g.state != State::Created {
@@ -248,11 +247,11 @@ impl Vmmgr {
             // Root checks the window and the disk's other users, and makes
             // the channel; the device is added once it has.
             let d = g.devices.len();
-            let (backend, applied) = root::disk_attach(&mut h.alloc, id, d, disk, flags, lba_start, lba_count, key)?;
+            let backend = root::disk_attach(&mut h.alloc, id, d, disk, flags, lba_start, lba_count, key)?;
             let added = g.add_device(&mut h.alloc, guest::DevKind::Virtio(2));
             assert_eq!(added, Some(d), "guest device room checked");
             g.backends.must_push((d, backend));
-            Ok(applied)
+            Ok(())
         })
         .ok_or(ctl::ENOENT)?
     }

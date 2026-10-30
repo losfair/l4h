@@ -68,6 +68,16 @@ pub struct RootGuest {
     pub attest: bool,
 }
 
+impl RootGuest {
+    fn check_device_room(&self) -> Result<(), i64> {
+        // Quarantined disk attaches retain their memory without adding a
+        // vmmgr device. Count all root-owned disks and ports together so
+        // they cannot exhaust Arena::owned even if vmmgr still has room.
+        if self.disks.len() + self.ports.len() >= MAX_GUEST_DEVICES { return Err(ctl::ENOSPC); }
+        Ok(())
+    }
+}
+
 /// vmmgr, as root keeps it.
 pub struct Vmmgr {
     comp: Component,
@@ -503,36 +513,30 @@ fn disk_attach(h: &mut Host, a: [u64; 8], key: &[u8; 64]) -> Result<Vals, i64> {
     crate::blkd::attachment_slot(ctrl.clients, disk, window, read_only, dom0)?;
     if !h.can_afford(1 << 20, 0, 0) { return Err(ctl::ENOMEM); }
     with_guest(h, id, |h, g| {
-        if g.disks.is_full() {
-            return Err(ctl::ENOSPC);
-        }
+        g.check_device_room()?;
         let (client, chan, kick) = crate::blkd::attach(&mut h.ctrls[c], disk, g, window, read_only, volatile, encrypted, &mut h.alloc, &mut h.iommu)?;
         g.disks.must_push((c, client));
-        let applied = match crate::blkd::activate(&mut h.ctrls[c], unit, client, g, &chan, &mut h.wins.a, &h.pci, key) {
-            Ok(applied) => applied,
-            Err(e) => {
-                abs_of(kick).delete().expect("drop unused blkd kick");
-                h.alloc.slots.free(kick.bits() as Slot);
-                // Rejected shared-key/flag checks have no outstanding I/O.
-                // Failed controllers stay on the destroy/quarantine path.
-                if !h.ctrls[c].failed {
-                    crate::blkd::remove(&mut h.ctrls[c], client, &h.pci, &mut h.iommu);
-                    g.disks.pop();
-                    chan.release(&mut h.alloc);
-                } else {
-                    chan.keep(&mut g.arena);
-                }
-                return Err(e);
+        if let Err(e) = crate::blkd::activate(&mut h.ctrls[c], unit, client, g, &chan, &mut h.wins.a, &h.pci, key) {
+            abs_of(kick).delete().expect("drop unused blkd kick");
+            h.alloc.slots.free(kick.bits() as Slot);
+            // Rejected shared-key/flag checks have no outstanding I/O.
+            // Failed controllers stay on the destroy/quarantine path.
+            if !h.ctrls[c].failed {
+                crate::blkd::remove(&mut h.ctrls[c], client, &h.pci, &mut h.iommu);
+                g.disks.pop();
+                chan.release(&mut h.alloc);
+            } else {
+                chan.keep(&mut g.arena);
             }
-        };
+            return Err(e);
+        }
         for (i, f) in chan.iter().enumerate() {
             xchg(h, i).copy(&abs_of(*f), CapRights::all()).expect("vmmgr channel frame");
         }
         xchg(h, chan.len()).move_(&abs_of(kick)).expect("vmmgr blkd kick");
         h.alloc.slots.free(kick.bits() as Slot);
         chan.keep(&mut g.arena);
-        let applied = applied | if read_only { abi::BLK_RO } else { 0 } | if volatile { abi::BLK_VOLATILE } else { 0 };
-        Ok([applied].into_iter().collect())
+        Ok(Vals::new())
     })
 }
 
@@ -547,9 +551,7 @@ fn nic_add(h: &mut Host, a: [u64; 8]) -> Result<Vals, i64> {
         return Err(ctl::ENOMEM);
     }
     with_guest(h, id, |h, g| {
-        if g.ports.is_full() {
-            return Err(ctl::ENOSPC);
-        }
+        g.check_device_room()?;
         let p = h.netd.free_port(switch)?;
         let mac = if mac == 0 { 0x02_4c_34_00_00_00 | ((id as u64) << 8) | p as u64 } else { mac & 0xffff_ffff_ffff };
         if mac >> 40 & 1 != 0 {

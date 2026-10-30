@@ -43,7 +43,11 @@ end = blkd.index('\n}', start) + 2
 reservations += blkd[start:end]
 start = blkd.index('pub fn activate(')
 end = blkd.index('\n}', start) + 2
-(out / 'blk-reservations.inc').write_text(reservations + blkd[start:end])
+reservations += blkd[start:end]
+vmmgr = (root / 'host/l4h-root/src/vmmgr.rs').read_text()
+start = vmmgr.index('impl RootGuest {')
+end = vmmgr.index('\n}', start) + 2
+(out / 'blk-reservations.inc').write_text(reservations + vmmgr[start:end])
 PY
 cc -std=c11 -O2 -Wall -Wextra -Werror -I "$root/include" -I "$out" \
     -c "$root/tests/console-guest.c" -o "$out/console-guest.o"

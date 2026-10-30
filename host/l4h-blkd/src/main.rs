@@ -221,13 +221,14 @@ impl Blkd {
                         let cq_used = addr_of!((*c.chan).cq.head).read_volatile()
                             .wrapping_sub(addr_of!((*c.chan).cq.tail).read_volatile()) as usize;
                         // Reserve completion space for every in-flight request.
-                        if head == tail || head.wrapping_sub(tail) as usize > blk::RING_SIZE
-                            || cq_used.saturating_add(c.outstanding) >= blk::RING_SIZE {
-                            // A withdrawn request or a client that stops
-                            // draining its CQ must not block other writers.
+                        if head == tail {
+                            // Only withdrawal gives up a waiting writer's
+                            // place; CQ back-pressure preserves FIFO order.
                             self.waiting.retain(|&w| w != i);
                             break;
                         }
+                        if head.wrapping_sub(tail) as usize > blk::RING_SIZE
+                            || cq_used.saturating_add(c.outstanding) >= blk::RING_SIZE { break; }
                         fence(Ordering::Acquire);
                         let req = addr_of!((*c.chan).reqs[tail as usize % blk::RING_SIZE]).read_volatile();
                         (tail, req)
@@ -242,8 +243,11 @@ impl Blkd {
                         }
                         if req.op == blk::OP_WRITE {
                             let bytes: usize = pieces.iter().map(|s| s.len as usize).sum();
-                            if self.waiting.first().is_some_and(|&w| w != i) {
+                            if let Some(&first) = self.waiting.first().filter(|&&w| w != i) {
                                 if !self.waiting.contains(&i) { self.waiting.must_push(i); }
+                                // A failed head allocation cannot be retried
+                                // this pass, so neither can those behind it.
+                                no_space[i] = no_space[first];
                                 deferred = true;
                                 return Err(blk::STATUS_OK);
                             }
@@ -378,6 +382,7 @@ fn set_mr(i: usize, v: u64) { sel4::with_ipc_buffer_mut(|b| b.msg_regs_mut()[i] 
 
 fn main(info: &'static Info) -> ! {
     let cfg: &BlkdConfig = unsafe { info.config() };
+    assert_eq!(cfg.bounce_size as usize, bounce::SIZE);
     let id = info.header().id;
     let drv = match cfg.kind {
         blk::BLKD_NVME => Drv::Nvme(nvme::Nvme::new(id, cfg)),

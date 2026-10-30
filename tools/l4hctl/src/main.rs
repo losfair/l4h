@@ -21,9 +21,13 @@ struct CreateOpts {
     gpu: Option<(u64, u64)>,
 }
 
-/// key-file is last: its entire remainder is a path, including commas.
+/// key-file is last; reject paths that could be trailing disk options.
 fn parse_disk(value: &str) -> Result<((u64, u64, u64, u64), Option<&str>)> {
     let (options, key) = value.split_once(",key-file=").map_or((value, None), |(v, p)| (v, Some(p)));
+    if key.is_some_and(|path| path.split(',').skip(1).any(|opt|
+        opt == "ro" || opt == "volatile" || opt.starts_with("start=") || opt.starts_with("sectors=") || opt.starts_with("key-file="))) {
+        return err("--disk: suboptions must precede key-file=; use --key-file FILE for paths containing option-like text");
+    }
     let mut it = options.split(',');
     let disk = it.next().unwrap();
     let (disk, mut flags) = disk.strip_suffix(":ro").map_or((disk, 0), |d| (d, BLK_RO));
@@ -683,7 +687,7 @@ mod tests {
 
     #[test]
     fn disk_key_paths_are_not_options_or_read_only_suffixes() {
-        for path in ["/keys/a:root.key", "/keys/a,b.key", "/keys/a:ro", "/keys/a,key-file=b,ro"] {
+        for path in ["/keys/a:root.key", "/keys/a,b.key", "/keys/a:ro", "/keys/a,root.key"] {
             let value = format!("1:ro,start=8,sectors=16,key-file={path}");
             assert_eq!(parse_disk(&value).unwrap(), ((1, BLK_RO, 8, 16), Some(path)));
         }
@@ -691,5 +695,15 @@ mod tests {
         assert_eq!(parse_disk("2:ro").unwrap(), ((2, BLK_RO, 0, 0), None));
         assert!(parse_disk("2:root").is_err());
         assert!(parse_disk("2,start=8,unknown=1").is_err());
+    }
+
+    #[test]
+    fn disk_options_after_key_file_fail_instead_of_changing_access() {
+        for suffix in ["ro", "volatile", "start=8", "sectors=16", "key-file=/other", "ro,start=8,sectors=16", "name,ro", "name,start=8", "name,sectors=16"] {
+            let error = parse_disk(&format!("1,key-file=/k,{suffix}")).unwrap_err();
+            assert!(error.0.contains("suboptions must precede key-file="), "{}", error.0);
+            assert!(error.0.contains("--key-file FILE"));
+        }
+        assert_eq!(parse_disk("1,ro,start=8,sectors=16,key-file=/k").unwrap(), ((1, BLK_RO, 8, 16), Some("/k")));
     }
 }

@@ -274,23 +274,80 @@ mod production {
         for i in 0..3 { assert_eq!(b.add(i, 0, 0, &[0; 64], 11), 0); }
         for _ in 0..4 { enqueue(2, blk::OP_WRITE, 256 << 10); }
         b.submit(); // 1 MiB in flight prevents a 3.5 MiB allocation.
-        for withdrawn in [true, false] {
-            enqueue(0, blk::OP_WRITE, 14 * 256 * 1024);
-            enqueue(1, blk::OP_WRITE, 256 << 10);
-            b.next = 0;
-            b.submit();
-            assert_eq!(&*b.waiting, [0, 1]);
-            unsafe {
-                let c = &mut *crate::channel();
-                if withdrawn { c.sq.head = c.sq.tail; }
-                else { c.cq.head = blk::RING_SIZE as u32; }
-            }
-            b.submit();
-            assert!(b.waiting.is_empty(), "an ineligible waiter cannot reserve space indefinitely");
+        enqueue(0, blk::OP_WRITE, 14 * 256 * 1024);
+        enqueue(1, blk::OP_WRITE, 256 << 10);
+        b.next = 0;
+        b.submit();
+        assert_eq!(&*b.waiting, [0, 1]);
+        unsafe {
+            let c = &mut *crate::channel();
+            c.sq.head = c.sq.tail;
         }
+        b.submit();
+        assert!(b.waiting.is_empty(), "a withdrawn request cannot reserve space indefinitely");
         let Drv::Virtio(drv) = &b.drv else { unreachable!() };
-        assert_eq!(drv.commands.len(), 6, "both smaller writes made progress");
+        assert_eq!(drv.commands.len(), 5, "the smaller write made progress");
         assert_eq!(b.remove(0), 0);
+    }
+
+    pub fn cq_blocked_waiter(info: &'static crate::Info) {
+        let mut b = service(info);
+        for i in 0..3 { assert_eq!(b.add(i, 0, 0, &[0; 64], 11), 0); }
+        for _ in 0..4 { enqueue(2, blk::OP_WRITE, 256 << 10); }
+        b.submit(); // 1 MiB prevents the large write from finding space.
+        for _ in 0..blk::RING_SIZE - 1 { enqueue(0, blk::OP_READ, 4096); }
+        b.submit();
+        assert_eq!(b.clients[0].as_ref().unwrap().outstanding, blk::RING_SIZE - 1);
+        enqueue(0, blk::OP_WRITE, 14 * 256 * 1024);
+        enqueue(1, blk::OP_WRITE, 256 << 10);
+        b.next = 0;
+        b.submit();
+        assert_eq!(&*b.waiting, [0, 1]);
+        // Inject transient CQ back-pressure with 127 reads in flight.
+        unsafe {
+            let c = &mut *crate::channel();
+            c.cq.tail = c.cq.head.wrapping_sub(1);
+        }
+        let Drv::Virtio(drv) = &mut b.drv else { unreachable!() };
+        let before = drv.commands.len();
+        drv.completed.extend(drv.commands[..4].iter().map(|c| (c.0, blk::STATUS_OK)));
+        b.reap(); // All bounce memory is now free.
+        for _ in 0..3 {
+            b.submit();
+            assert_eq!(&*b.waiting, [0, 1], "back-pressure must preserve the oldest writer");
+            let Drv::Virtio(drv) = &b.drv else { unreachable!() };
+            assert_eq!(drv.commands.len(), before, "later writers must not reuse the freed space");
+        }
+        enqueue(2, blk::OP_READ, 4096);
+        enqueue(2, blk::OP_FLUSH, 0);
+        b.submit();
+        let Drv::Virtio(drv) = &b.drv else { unreachable!() };
+        assert_eq!(drv.commands.len(), before + 2, "other clients' reads and flushes still run");
+        unsafe {
+            let c = &mut *crate::channel();
+            c.cq.tail = c.cq.head;
+        }
+        b.submit();
+        assert!(b.waiting.is_empty());
+        let Drv::Virtio(drv) = &b.drv else { unreachable!() };
+        let writes: Vec<_> = drv.commands[before + 2..].iter().map(|c| (c.1, c.2)).collect();
+        assert_eq!(writes, [(blk::OP_WRITE, 16), (blk::OP_WRITE, 16384)], "large write keeps priority after the CQ drains");
+    }
+
+    pub fn blocked_writers_checked_once(info: &'static crate::Info) {
+        let mut b = service(info);
+        for i in 0..3 { assert_eq!(b.add(i, 0, 0, &[0; 64], 11), 0); }
+        for _ in 0..4 { enqueue(2, blk::OP_WRITE, 256 << 10); }
+        b.submit();
+        enqueue(0, blk::OP_WRITE, 14 * 256 * 1024);
+        for i in 1..3 { enqueue(i, blk::OP_WRITE, 256 << 10); }
+        b.next = 0;
+        let Drv::Virtio(drv) = &b.drv else { unreachable!() };
+        drv.can_start_calls.set(0);
+        b.submit();
+        assert_eq!(&*b.waiting, [0, 1, 2]);
+        let Drv::Virtio(drv) = &b.drv else { unreachable!() };
+        assert_eq!(drv.can_start_calls.get(), 3, "writers behind a failed allocation must be skipped for the rest of the pass");
     }
 
 }
@@ -318,10 +375,11 @@ pub struct MockDriver {
     legacy_io: u32, queue: u16, provisioning: bool,
     commands: Vec<(u64, u32, u64, Vec<Seg>)>,
     completed: Vec<(u64, u32)>, fail_start: bool,
+    can_start_calls: std::cell::Cell<usize>,
 }
 impl MockDriver {
     pub fn new(_: u32, cfg: &BlkdConfig) -> Self {
-        Self { legacy_io: cfg.legacy_io, queue: if cfg.kind == blk::BLKD_VIRTIO_SCSI { 2 } else { 0 }, provisioning: false, commands: Vec::new(), completed: Vec::new(), fail_start: false }
+        Self { legacy_io: cfg.legacy_io, queue: if cfg.kind == blk::BLKD_VIRTIO_SCSI { 2 } else { 0 }, provisioning: false, commands: Vec::new(), completed: Vec::new(), fail_start: false, can_start_calls: std::cell::Cell::new(0) }
     }
     fn notify(&self) {
         KERNEL.with_borrow_mut(|k| {
@@ -339,7 +397,7 @@ impl Driver for MockDriver {
     fn info(&self, _: usize) -> DevInfo {
         DevInfo { capacity: 131072, block_size: 512, read_only: false, flush: true, address: 0x301 }
     }
-    fn can_start(&self) -> bool { true }
+    fn can_start(&self) -> bool { self.can_start_calls.set(self.can_start_calls.get() + 1); true }
     fn start(&mut self, tag: u64, _: usize, op: u32, sector: u64, data: &[Seg]) -> Result<(), u32> {
         if self.fail_start { return Err(blk::STATUS_IOERR); }
         if tag != u64::MAX { self.commands.push((tag, op, sector, data.to_vec())); }
@@ -456,7 +514,13 @@ fn sub_block_segments_pack_into_one_aligned_4kn_write() { with_pools(1, producti
 fn deferred_writers_get_fifo_priority_while_reads_and_flushes_run() { with_pools(4, production::fair_writes); }
 
 #[test]
-fn withdrawn_or_cq_blocked_waiters_do_not_block_other_writers() { with_pools(3, production::abandoned_waiter); }
+fn withdrawn_waiters_do_not_block_other_writers() { with_pools(3, production::abandoned_waiter); }
+
+#[test]
+fn cq_backpressure_preserves_fifo_priority_until_drained() { with_pools(3, production::cq_blocked_waiter); }
+
+#[test]
+fn writers_blocked_by_a_failed_allocation_are_checked_once_per_pass() { with_pools(3, production::blocked_writers_checked_once); }
 
 #[test]
 fn applied_encryption_flags_survive_legacy_driver_ipc() {

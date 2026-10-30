@@ -756,7 +756,7 @@ impl Alloc {
 /// regions stay few.  Smaller blocks can still serve it under fragmentation.
 const ARENA_GROW_BITS: usize = 20;
 /// Regions of an arena, and the Untypeds it owns besides (the I/O pool,
-/// netd ports: at most one per device).
+/// disk channels and netd ports: at most one per root-counted device).
 const ARENA_REGIONS: usize = 96;
 /// What alignment may leave unusable at the end of a region, for
 /// Arena::reserve: the largest object allocated in quantity (a 16 KiB RAM

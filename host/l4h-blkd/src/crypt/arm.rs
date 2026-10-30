@@ -94,6 +94,7 @@ unsafe fn unit<const DECRYPT: bool>(keys: *const u8, tweak: *const u8, src: *con
                 vst1q_u8(dst.add(batch * 128 + i * 16), veorq_u8(veorq_u8(b, round[1]), ts[i]));
             }
         }
+        // These clears cover named scratch, not compiler-generated spills.
         for v in ts.iter_mut().chain(&mut blocks).chain(&mut round).chain(core::iter::once(&mut t)) {
             core::ptr::write_volatile(v, vdupq_n_u8(0));
         }

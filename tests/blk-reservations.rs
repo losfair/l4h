@@ -1,6 +1,7 @@
 //! Production reservation selection and detach, with mocked driver/IOMMU calls.
 #![allow(dead_code)]
 use l4h_host::blk::{self, DiskWindow};
+use l4h_host::MAX_GUEST_DEVICES;
 
 mod ctl { pub const EIO: i64 = 5; pub const EBUSY: i64 = 16; pub const ENOSPC: i64 = 28; pub const EOPNOTSUPP: i64 = 95; }
 
@@ -37,7 +38,10 @@ fn call(ep: u64, label: u64, args: &[u64]) -> u64 {
 }
 fn quarantine(c: &mut Controller, _: &Pci) { c.failed = true; }
 
-pub struct RootGuest { pool: blk::Pool }
+pub struct RootGuest { pool: blk::Pool, disks: Vec<(usize, usize)>, ports: Vec<usize> }
+fn guest() -> RootGuest {
+    RootGuest { pool: blk::Pool { gpa: 0, paddr: 0x100000, size: 0x400000 }, disks: vec![(0, 0)], ports: Vec::new() }
+}
 pub type Channel = Vec<usize>;
 pub struct Window { page: Box<blk::Channel> }
 impl Window {
@@ -45,19 +49,44 @@ impl Window {
 }
 
 #[test]
-fn activation_returns_applied_flags_and_rejects_missing_acknowledgment() {
+fn activation_requires_blkd_to_confirm_exactly_the_requested_flags() {
     for (encrypted, applied, expected) in [
-        (false, 0, Ok(0)), (true, blk::ENCRYPT, Ok(blk::ENCRYPT)),
+        (false, 0, Ok(())), (true, blk::ENCRYPT, Ok(())),
         (true, 0, Err(ctl::EOPNOTSUPP)), (false, blk::ENCRYPT, Err(ctl::EOPNOTSUPP)),
+        (true, blk::ENCRYPT | 2, Err(ctl::EOPNOTSUPP)),
     ] {
         let mut c = Controller { clients: vec![Some(Attachment { encrypted, ..reservation() })],
             driver: Some(Driver { comp: Component { service_ep: 0 } }), failed: false, dom: Domain(1) };
-        let g = RootGuest { pool: blk::Pool { gpa: 0, paddr: 0x100000, size: 0x400000 } };
+        let g = guest();
         let mut win = Window { page: Box::new(unsafe { core::mem::zeroed() }) };
         APPLIED.set(applied);
         assert_eq!(activate(&mut c, 0, 0, &g, &vec![0], &mut win, &Pci, &[0x12; 64]), expected);
         assert!(!c.failed, "a rejected acknowledgment must use normal attach cleanup");
         for i in 0..11 { assert_eq!(mr(i), 0, "transient key words must be cleared"); }
+    }
+}
+
+#[test]
+fn quarantined_disk_attaches_count_against_the_shared_root_device_budget() {
+    for disk_count in [1, MAX_GUEST_DEVICES / 2, MAX_GUEST_DEVICES] {
+        let mut c = Controller { clients: vec![Some(reservation())], failed: false, dom: Domain(1),
+            driver: Some(Driver { comp: Component { service_ep: u64::MAX } }) };
+        let mut g = guest();
+        let mut win = Window { page: Box::new(unsafe { core::mem::zeroed() }) };
+        assert_eq!(activate(&mut c, 0, 0, &g, &vec![0], &mut win, &Pci, &[0; 64]), Err(ctl::EIO));
+        assert!(c.failed); // Root retains this disk; vmmgr has no device for it.
+        while g.disks.len() < disk_count {
+            g.check_device_room().unwrap();
+            g.disks.push((g.disks.len(), 0));
+        }
+        for port in 0..MAX_GUEST_DEVICES - disk_count {
+            g.check_device_room().unwrap();
+            g.ports.push(port);
+        }
+        assert_eq!(g.check_device_room(), Err(ctl::ENOSPC), "retained disks and ports share one root budget");
+        assert!(g.disks.len() - 1 + g.ports.len() < MAX_GUEST_DEVICES, "successful disk/port attaches alone miss the retained disk");
+        g.disks.pop();
+        assert_eq!(g.check_device_room(), Ok(()), "a fully released attach gives its slot back");
     }
 }
 
