@@ -64,18 +64,23 @@ pub struct RootGuest {
     pub disks: ArrayVec<(usize, usize), MAX_GUEST_DEVICES>,
     /// netd ports of its virtio-net devices.
     pub ports: ArrayVec<usize, MAX_GUEST_DEVICES>,
+    /// Report resource exhaustion once per guest, even if dom0 retries.
+    device_limit_logged: bool,
     /// It has an attestation device (trustd.rs).
     pub attest: bool,
 }
 
 impl RootGuest {
-    fn check_device_room(&self) -> Result<(), i64> {
+    fn check_device_room(&mut self) -> Result<(), i64> {
         // Quarantined disk attaches retain their memory without adding a
         // vmmgr device. Count all root-owned disks and ports together so
         // they cannot exhaust Arena::owned even if vmmgr still has room.
         if self.disks.len() + self.ports.len() >= MAX_GUEST_DEVICES {
-            log!("l4h-root: guest {}: root disk/NIC limit {} reached ({} disks, {} NICs); retained failed attaches count until VM destruction",
-                self.id, MAX_GUEST_DEVICES, self.disks.len(), self.ports.len());
+            if !self.device_limit_logged {
+                log!("l4h-root: guest {}: root disk/NIC limit {} reached ({} disks, {} NICs)",
+                    self.id, MAX_GUEST_DEVICES, self.disks.len(), self.ports.len());
+                self.device_limit_logged = true;
+            }
             return Err(ctl::ENOSPC);
         }
         Ok(())
@@ -460,6 +465,7 @@ fn guest_new(h: &mut Host, a: [u64; 8]) -> Result<Vals, i64> {
             vmm_ntfn,
             disks: ArrayVec::new(),
             ports: ArrayVec::new(),
+            device_limit_logged: false,
             attest,
         });
         Ok([instance, attest as u64].into_iter().collect())

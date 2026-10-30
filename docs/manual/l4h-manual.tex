@@ -1319,7 +1319,8 @@ whose suboptions are:
     put \texttt{--key-file FILE} after its \texttt{--disk} argument.
     The \texttt{key-file=} suboption must be last: its remaining text,
     including commas and embedded \texttt{:ro}, is the file path.
-    A trailing \texttt{:ro} or a comma followed by a known disk suboption is rejected as ambiguous;
+    A \texttt{:ro} suffix on any comma-separated part, or a comma followed
+    by a known disk suboption, is rejected as ambiguous;
     put disk options first, or use \texttt{--key-file FILE} for such paths.
   \item[\texttt{ro}] The guest may read but not write; writes fail with an
     I/O error. \texttt{DISK:ro} is accepted too.

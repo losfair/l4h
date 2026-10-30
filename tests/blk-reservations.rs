@@ -41,9 +41,9 @@ fn call(ep: u64, label: u64, args: &[u64]) -> u64 {
 }
 fn quarantine(c: &mut Controller, _: &Pci) { c.failed = true; }
 
-pub struct RootGuest { id: usize, pool: blk::Pool, disks: Vec<(usize, usize)>, ports: Vec<usize> }
+pub struct RootGuest { id: usize, pool: blk::Pool, disks: Vec<(usize, usize)>, ports: Vec<usize>, device_limit_logged: bool }
 fn guest() -> RootGuest {
-    RootGuest { id: 7, pool: blk::Pool { gpa: 0, paddr: 0x100000, size: 0x400000 }, disks: vec![(0, 0)], ports: Vec::new() }
+    RootGuest { id: 7, pool: blk::Pool { gpa: 0, paddr: 0x100000, size: 0x400000 }, disks: vec![(0, 0)], ports: Vec::new(), device_limit_logged: false }
 }
 pub type Channel = Vec<usize>;
 pub struct Window { page: Box<blk::Channel> }
@@ -89,11 +89,26 @@ fn quarantined_disk_attaches_count_against_the_shared_root_device_budget() {
         assert_eq!(g.check_device_room(), Err(ctl::ENOSPC), "retained disks and ports share one root budget");
         LOGS.with_borrow(|logs| {
             let message = logs.last().unwrap();
-            assert!(message.contains("guest 7") && message.contains("retained failed attaches"), "{message}");
+            assert!(message.contains("guest 7") && message.contains("root disk/NIC limit"), "{message}");
         });
         assert!(g.disks.len() - 1 + g.ports.len() < MAX_GUEST_DEVICES, "successful disk/port attaches alone miss the retained disk");
         g.disks.pop();
         assert_eq!(g.check_device_room(), Ok(()), "a fully released attach gives its slot back");
+    }
+}
+
+#[test]
+fn device_limit_log_is_neutral_and_emitted_once_per_guest() {
+    for id in [7, 8] {
+        let mut g = guest();
+        g.id = id;
+        g.disks.resize(MAX_GUEST_DEVICES, (0, 0)); // All healthy attachments.
+        LOGS.with_borrow_mut(Vec::clear);
+        for _ in 0..512 { assert_eq!(g.check_device_room(), Err(ctl::ENOSPC)); }
+        LOGS.with_borrow(|logs| {
+            assert_eq!(logs.len(), 1, "retries must not flood the root log");
+            assert_eq!(logs[0], format!("l4h-root: guest {id}: root disk/NIC limit {MAX_GUEST_DEVICES} reached ({MAX_GUEST_DEVICES} disks, 0 NICs)"));
+        });
     }
 }
 

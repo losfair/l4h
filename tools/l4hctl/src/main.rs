@@ -50,8 +50,8 @@ fn parse_disk(value: &str) -> Result<((u64, u64, u64, u64), Option<&str>)> {
             Some(DiskOption::Sectors(n)) => sectors = parse_num(n)?,
             Some(DiskOption::KeyFile) => {
                 let path = rest.split_once('=').unwrap().1;
-                if path.ends_with(":ro") || path.split(',').skip(1).any(|part| disk_option(part).is_some()) {
-                    return err("--disk: suboptions must precede key-file=; use --key-file FILE for paths containing option-like text or ending in :ro");
+                if path.split(',').enumerate().any(|(i, part)| part.ends_with(":ro") || (i != 0 && disk_option(part).is_some())) {
+                    return err("--disk: suboptions must precede key-file=; use --key-file FILE for paths containing option-like text");
                 }
                 key = Some(path);
                 break;
@@ -707,7 +707,7 @@ mod tests {
 
     #[test]
     fn disk_key_paths_are_not_options_or_read_only_suffixes() {
-        for path in ["/keys/a:root.key", "/keys/a,b.key", "/keys/a,root.key", "/keys/a:ro/key"] {
+        for path in ["/keys/a:root.key", "/keys/a,b.key", "/keys/a,root.key", "/keys/a:ro/key", "/keys/a,b,", "/keys/a:ro/key,b:root.key,"] {
             let value = format!("1:ro,start=8,sectors=16,key-file={path}");
             assert_eq!(parse_disk(&value).unwrap(), ((1, BLK_RO, 8, 16), Some(path)));
         }
@@ -725,9 +725,14 @@ mod tests {
             assert!(error.0.contains("--key-file FILE"));
         }
         assert_eq!(parse_disk("1,ro,start=8,sectors=16,key-file=/k").unwrap(), ((1, BLK_RO, 8, 16), Some("/k")));
-        for value in ["1,key-file=/keys/a:ro", "1,ro,key-file=/keys/a:ro", "1,key-file=/keys/a,b:ro"] {
-            let error = parse_disk(value).unwrap_err();
-            assert!(error.0.contains("--key-file FILE"), "{}", error.0);
+        for prefix in ["1,key-file=", "1,ro,key-file="] {
+            for path in ["/keys/a:ro", "/keys/a,b:ro"] {
+                for suffix in ["", ",", ",,", ",name", ",name,"] {
+                    let value = format!("{prefix}{path}{suffix}");
+                    let error = parse_disk(&value).unwrap_err();
+                    assert!(error.0.contains("--key-file FILE"), "{value}: {}", error.0);
+                }
+            }
         }
     }
 }

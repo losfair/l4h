@@ -116,13 +116,14 @@ struct Client {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum QueueState { Empty, Malformed, CqBlocked, Ready }
+enum QueueState { Ineligible, CqBlocked, Ready }
 
 fn select_writer(waiting: &[usize], states: &[QueueState; blk::MAX_CLIENTS],
-    first: &mut Option<usize>, parked: &mut [bool; blk::MAX_CLIENTS]) {
+    first: &mut Option<usize>, first_no_space: &mut bool, parked: &mut [bool; blk::MAX_CLIENTS]) {
     let next = waiting.iter().copied().find(|&i| states[i] == QueueState::Ready);
     if next != *first {
         *first = next;
+        *first_no_space = false;
         parked.fill(false);
     }
 }
@@ -164,8 +165,9 @@ impl Client {
             let head = addr_of!((*self.chan).sq.head).read_volatile();
             let cq_used = addr_of!((*self.chan).cq.head).read_volatile()
                 .wrapping_sub(addr_of!((*self.chan).cq.tail).read_volatile()) as usize;
-            let state = if head == tail { QueueState::Empty }
-                else if head.wrapping_sub(tail) as usize > blk::RING_SIZE { QueueState::Malformed }
+            // Empty queues and malformed SQ/CQ indices lose FIFO rank.
+            let state = if head == tail || head.wrapping_sub(tail) as usize > blk::RING_SIZE
+                || cq_used > blk::RING_SIZE { QueueState::Ineligible }
                 // Reserve completion space for every in-flight request.
                 else if cq_used.saturating_add(self.outstanding) >= blk::RING_SIZE { QueueState::CqBlocked }
                 else { QueueState::Ready };
@@ -228,39 +230,40 @@ impl Blkd {
     fn submit(&mut self) {
         let mut pieces = ArrayVec::new();
         let mut started = false;
-        // No completions are reaped inside this pass, so a failed
-        // allocation cannot succeed until the next submit call.
-        let mut no_space = [false; blk::MAX_CLIENTS];
+        // No completions are reaped inside this pass. Remember a failed
+        // allocation until priority changes or the next submit call.
+        let mut first_no_space = false;
         let mut parked = [false; blk::MAX_CLIENTS];
-        let mut states = [QueueState::Empty; blk::MAX_CLIENTS];
+        let mut states = [QueueState::Ineligible; blk::MAX_CLIENTS];
         // Select priority before round-robin visits, including when the
         // oldest waiter comes last. Ineligible clients cannot reserve space.
-        for &i in &self.active {
+        for &i in &self.waiting {
             states[i] = self.clients[i].as_ref().unwrap().queue_state().1;
         }
-        self.waiting.retain(|&i| matches!(states[i], QueueState::Ready | QueueState::CqBlocked));
+        self.waiting.retain(|&i| states[i] != QueueState::Ineligible);
         let mut first = None;
-        select_writer(&self.waiting, &states, &mut first, &mut parked);
+        select_writer(&self.waiting, &states, &mut first, &mut first_no_space, &mut parked);
         // Bounded work per client and round-robin starting point. A busy
         // ring cannot occupy every hardware slot before others get a turn.
         let n = self.active.len();
         for _round in 0..blk::RING_SIZE / 4 {
             for off in 0..n {
                 let i = self.active[(self.next + off) % n];
-                if states[i] != QueueState::Ready || no_space[i] || parked[i] { continue; }
+                if (first_no_space && first == Some(i)) || parked[i] { continue; }
                 let Some(c) = self.clients[i].as_mut() else { continue };
                 for _ in 0..4 {
-                    if !self.drv.can_start() { break; }
-                    let Some(tag) = self.pending.iter().position(Option::is_none) else { break };
+                    // Recheck empty/CQ-blocked clients each round: a guest
+                    // may publish work or drain completions during this pass.
                     let (tail, state) = c.queue_state();
-                    states[i] = state;
-                    if state != QueueState::Ready {
-                        if state != QueueState::CqBlocked {
+                    if states[i] != state {
+                        states[i] = state;
+                        if state == QueueState::Ineligible {
                             self.waiting.retain(|&w| w != i);
                         }
-                        select_writer(&self.waiting, &states, &mut first, &mut parked);
-                        break;
+                        select_writer(&self.waiting, &states, &mut first, &mut first_no_space, &mut parked);
                     }
+                    if state != QueueState::Ready || !self.drv.can_start() { break; }
+                    let Some(tag) = self.pending.iter().position(Option::is_none) else { break };
                     let req = unsafe {
                         fence(Ordering::Acquire);
                         addr_of!((*c.chan).reqs[tail as usize % blk::RING_SIZE]).read_volatile()
@@ -286,7 +289,7 @@ impl Blkd {
                             let Some(r) = self.bounce.alloc(bytes) else {
                                 if !self.waiting.contains(&i) { self.waiting.must_push(i); }
                                 first = Some(i);
-                                no_space[i] = true;
+                                first_no_space = true;
                                 deferred = true;
                                 return Err(blk::STATUS_OK);
                             };
@@ -306,7 +309,7 @@ impl Blkd {
                     // available. Other clients' reads/flushes still run.
                     if deferred { break; }
                     self.waiting.retain(|&w| w != i);
-                    select_writer(&self.waiting, &states, &mut first, &mut parked);
+                    select_writer(&self.waiting, &states, &mut first, &mut first_no_space, &mut parked);
                     unsafe { addr_of_mut!((*c.chan).sq.tail).write_volatile(tail.wrapping_add(1)); }
                     match result {
                         Ok(()) => {

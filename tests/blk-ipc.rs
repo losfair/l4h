@@ -348,7 +348,7 @@ mod production {
         assert_eq!(writes, [(blk::OP_WRITE, 16), (blk::OP_WRITE, 16384)], "large write keeps priority after the CQ drains");
     }
 
-    pub fn malformed_waiter(info: &'static crate::Info, distance: u32) {
+    pub fn malformed_waiter(info: &'static crate::Info, distance: u32, cq: bool) {
         let mut b = service(info);
         for i in 0..3 { assert_eq!(b.add(i, 0, 0, &[0; 64], 11), 0); }
         for _ in 0..4 { enqueue(2, blk::OP_WRITE, 256 << 10); }
@@ -360,7 +360,8 @@ mod production {
         assert_eq!(&*b.waiting, [0, 1]);
         unsafe {
             let c = &mut *crate::channel();
-            c.sq.head = c.sq.tail.wrapping_add(distance);
+            if cq { c.cq.tail = c.cq.head.wrapping_sub(distance); }
+            else { c.sq.head = c.sq.tail.wrapping_add(distance); }
         }
         b.next = 1; // Other writers are visited before the malformed head.
         b.submit();
@@ -369,6 +370,65 @@ mod production {
         b.submit();
         let Drv::Virtio(drv) = &b.drv else { unreachable!() };
         assert_eq!(drv.commands.len(), 6, "both peer writers progress while the malicious head remains malformed");
+        enqueue(1, blk::OP_WRITE, 14 * 256 * 1024);
+        b.submit();
+        assert_eq!(&*b.waiting, [1]);
+        unsafe {
+            let c = &mut *crate::channel();
+            if cq { c.cq.tail = c.cq.head; }
+            else { c.sq.head = c.sq.tail.wrapping_add(1); }
+        }
+        let Drv::Virtio(drv) = &mut b.drv else { unreachable!() };
+        drv.completed.extend(drv.commands.iter().map(|c| (c.0, blk::STATUS_OK)));
+        b.reap();
+        b.next = 0; // Visit the repaired client before the older valid waiter.
+        b.submit();
+        assert_eq!(&*b.waiting, [0], "repairing indices must not restore the malformed client's old rank");
+        let Drv::Virtio(drv) = &mut b.drv else { unreachable!() };
+        assert_eq!(drv.commands.last().unwrap().2, 16384, "the older valid waiter runs first");
+        drv.completed.push((drv.commands.last().unwrap().0, blk::STATUS_OK));
+        b.reap(); b.submit();
+        assert!(b.waiting.is_empty());
+        let Drv::Virtio(drv) = &b.drv else { unreachable!() };
+        assert_eq!(drv.commands.last().unwrap().2, 16, "the repaired client can run at its new rank");
+    }
+
+    pub fn wake_during_submit(info: &'static crate::Info, cq_blocked: bool) {
+        let mut b = service(info);
+        for i in 0..3 { assert_eq!(b.add(i, 0, 0, &[0; 64], 11), 0); }
+        if cq_blocked {
+            for _ in 0..3 { enqueue(2, blk::OP_WRITE, 1 << 20); }
+            b.submit();
+            enqueue(0, blk::OP_WRITE, 1536 << 10);
+            b.submit();
+            assert_eq!(&*b.waiting, [0]);
+            unsafe {
+                let c = &mut *crate::channel();
+                c.cq.tail = c.cq.head.wrapping_sub(blk::RING_SIZE as u32);
+            }
+            let Drv::Virtio(drv) = &mut b.drv else { unreachable!() };
+            drv.completed.push((drv.commands[2].0, blk::STATUS_OK));
+            b.reap(); // 2 MiB contiguous: enough for client 0, but not client 1.
+            enqueue(1, blk::OP_WRITE, 14 * 256 * 1024);
+        }
+        enqueue(2, blk::OP_FLUSH, 0);
+        let Drv::Virtio(drv) = &mut b.drv else { unreachable!() };
+        let before = drv.commands.len();
+        drv.on_start = Some(Box::new(move || {
+            if cq_blocked {
+                unsafe { (*crate::channel()).cq.tail = (*crate::channel()).cq.head; }
+            } else {
+                enqueue(0, blk::OP_WRITE, 1536 << 10);
+            }
+        }));
+        b.next = 0; // Visit client 0 before the flush makes it runnable.
+        b.submit();
+        let Drv::Virtio(drv) = &b.drv else { unreachable!() };
+        let commands: Vec<_> = drv.commands[before..].iter().map(|c| (c.1, c.2)).collect();
+        assert_eq!(commands, [(blk::OP_FLUSH, 0), (blk::OP_WRITE, 16)],
+            "new work and drained CQs must be noticed without another IRQ or kick");
+        assert_eq!(&*b.waiting, if cq_blocked { &[1][..] } else { &[][..] },
+            "a resumed older waiter can run even after the previous head failed allocation");
     }
 
     pub fn priority_change_wakes_parked_writers(info: &'static crate::Info, invalid: bool) {
@@ -452,10 +512,11 @@ pub struct MockDriver {
     commands: Vec<(u64, u32, u64, Vec<Seg>)>,
     completed: Vec<(u64, u32)>, fail_start: bool,
     can_start_calls: std::cell::Cell<usize>,
+    on_start: Option<Box<dyn FnOnce()>>,
 }
 impl MockDriver {
     pub fn new(_: u32, cfg: &BlkdConfig) -> Self {
-        Self { legacy_io: cfg.legacy_io, queue: if cfg.kind == blk::BLKD_VIRTIO_SCSI { 2 } else { 0 }, provisioning: false, commands: Vec::new(), completed: Vec::new(), fail_start: false, can_start_calls: std::cell::Cell::new(0) }
+        Self { legacy_io: cfg.legacy_io, queue: if cfg.kind == blk::BLKD_VIRTIO_SCSI { 2 } else { 0 }, provisioning: false, commands: Vec::new(), completed: Vec::new(), fail_start: false, can_start_calls: std::cell::Cell::new(0), on_start: None }
     }
     fn notify(&self) {
         KERNEL.with_borrow_mut(|k| {
@@ -477,6 +538,7 @@ impl Driver for MockDriver {
     fn start(&mut self, tag: u64, _: usize, op: u32, sector: u64, data: &[Seg]) -> Result<(), u32> {
         if self.fail_start { return Err(blk::STATUS_IOERR); }
         if tag != u64::MAX { self.commands.push((tag, op, sector, data.to_vec())); }
+        if let Some(f) = self.on_start.take() { f(); }
         self.provisioning |= tag == u64::MAX;
         Ok(())
     }
@@ -596,10 +658,17 @@ fn withdrawn_waiters_do_not_block_other_writers() { with_pools(3, production::ab
 fn cq_backpressure_preserves_rank_but_allows_peer_writes() { with_pools(3, production::cq_blocked_waiter); }
 
 #[test]
-fn malformed_waiters_cannot_stall_peer_writes() {
-    for distance in [blk::RING_SIZE as u32 + 1, u32::MAX] {
-        with_pools(3, |info| production::malformed_waiter(info, distance));
+fn malformed_waiters_lose_rank_until_repaired_and_requeued() {
+    for cq in [false, true] {
+        for distance in [blk::RING_SIZE as u32 + 1, u32::MAX] {
+            with_pools(3, |info| production::malformed_waiter(info, distance, cq));
+        }
     }
+}
+
+#[test]
+fn empty_or_cq_blocked_clients_can_resume_within_a_submit_pass() {
+    for cq_blocked in [false, true] { with_pools(3, |info| production::wake_during_submit(info, cq_blocked)); }
 }
 
 #[test]
