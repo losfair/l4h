@@ -44,6 +44,7 @@ extern int os_unmap_memory(void *addr, int len);
 int map(struct mm_id *mm_idp, unsigned long virt, unsigned long len, int prot,
 	unsigned long phys);
 int unmap(struct mm_id *mm_idp, unsigned long addr, unsigned long len);
+void unmap_large(struct mm_id *mm_idp, unsigned long addr);
 
 /* time (kernel/time.c) */
 extern long long os_nsecs(void);

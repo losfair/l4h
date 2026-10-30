@@ -438,8 +438,9 @@ guest. Where there is an AMD-Vi or Intel VT-d IOMMU, root drives it itself (§8.
 - **0023, accessed bits of native frames (x86_64 and aarch64).**
   `seL4_X86_Page_TestAndClearAccessed` / `seL4_ARM_Page_TestAndClearAccessed`
   resolves a frame cap's mapped ASID and address, verifies the physical
-  frame, atomically clears its A/AF bit, and returns the old bit. Unmapped
-  caps and non-native mappings are refused; stale mappings
+  frame, atomically clears its A/AF bit, and returns the old bit. 0023
+  itself takes 4 KiB frames; 0029 adds 2 MiB. Unmapped caps, non-native
+  mappings and 1 GiB frames are refused; stale mappings
   return `InvalidCapability`. The atomic operation preserves concurrent
   hardware updates to other bits, including x86's dirty bit.
 
@@ -768,7 +769,11 @@ virtio-l4h code. The Linux base is 6.18; patches outside arch/l4h are in
   The TLB sync recognizes a huge leaf and applies its entire 2 MiB range,
   even for a partial flush, before clearing `NEEDSYNC` with a compare and
   exchange. A split's temporarily invalid PMD retains its huge marker but
-  has all its seL4 mappings removed. Faults, kernel user copies and futexes
+  has all its seL4 mappings removed. Under a PMD that points to a PTE
+  table, the sync also drops any 2 MiB leaf left there: a zapped huge PMD
+  loses `NEEDSYNC` if another thread's fault installs a table before the
+  zap's flush, and the new table may not have a PTE to sync yet.
+  Faults, kernel user copies and futexes
   take the PMD lock and resolve the correct tail page. Aging combines the
   software PMD's young bit with its large leaf's A/AF bit, or all 512
   small leaves in the fallback.
@@ -3208,7 +3213,8 @@ with THP. Full ranges, raw trials, environment and correctness checks are in
 [`tests/results/thp-nested-kvm-2026-10-30.txt`](tests/results/thp-nested-kvm-2026-10-30.txt).
 
 **Native seL4 2 MiB backing, measured 2026-10-30.**
-The same paired benchmark at `ad54855` now verifies 32 native large leaves
+The same paired benchmark at `c53b9e6` (the results file records `ad54855`,
+a hash rewritten before publication) now verifies 32 native large leaves
 for each dense THP trial and zero for base-page trials. The environment,
 policy and five-trial method are the same as above. A monitor sampled every
 half second during QEMU execution and observed no other QEMU or compiler

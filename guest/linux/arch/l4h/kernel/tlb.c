@@ -26,6 +26,8 @@ struct vm_ops {
 		    unsigned long phys);
 	int (*unmap)(struct mm_id *mm_idp,
 		     unsigned long virt, unsigned long len);
+	/* User syncs: remove a 2 MiB leaf left under a PTE table. */
+	void (*unmap_large)(struct mm_id *mm_idp, unsigned long virt);
 	/* Kernel syncs: a map ran out of seL4 objects (see um_tlb_sync()). */
 	bool enomem;
 };
@@ -146,6 +148,13 @@ static int sync_one_pmd(pmd_t *pmd, unsigned long addr, unsigned long end,
 				return 0;
 			ret = ops->unmap(ops->mm_idp, addr, end - addr);
 		} else {
+			/* No 2 MiB leaf is valid under a PTE table.  A zapped huge
+			 * PMD loses its NEEDSYNC when another thread's fault
+			 * installs a table before the zap's flush, and that table
+			 * may hold no PTE to sync yet: drop the old leaf here,
+			 * before the flush lets the zap free its folio. */
+			if (ops->unmap_large)
+				ops->unmap_large(ops->mm_idp, addr);
 			return update_pte_range(v, addr, end, ops);
 		}
 		if (ret)
@@ -275,6 +284,8 @@ int um_tlb_sync(struct mm_struct *mm)
 	} else {
 		ops.mmap = map;
 		ops.unmap = unmap;
+		if (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE))
+			ops.unmap_large = unmap_large;
 	}
 
 	pgd = pgd_offset(mm, addr);

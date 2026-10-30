@@ -795,6 +795,23 @@ int unmap(struct mm_id *mm_idp, unsigned long addr, unsigned long len)
 	return 0;
 }
 
+/* tlb.c: the PMD of `addr` points to a PTE table.  Remove any 2 MiB leaf
+ * still mapped there; its small neighbors are left alone. */
+void unmap_large(struct mm_id *mm_idp, unsigned long addr)
+{
+	struct mm_struct *mm = idp_mm(mm_idp);
+	struct l4h_mm *m = mm_l4h(mm);
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&m->lock, flags);
+	if (m->vs >= 0 && xa_load(&vs_pool[m->vs].as.large, addr >> PMD_SHIFT)) {
+		mm_flush_moved(m);
+		as_drop_large(&vs_pool[m->vs].as, addr);
+		as_charge(&vs_pool[m->vs].as, mm);
+	}
+	raw_spin_unlock_irqrestore(&m->lock, flags);
+}
+
 /*
  * The caller holds the PTE lock.  m->lock keeps the VSpace and frame cap
  * alive against mapping changes and pool eviction.  Clear both bits even

@@ -1,5 +1,7 @@
 Guest THP with native seL4 2 MiB backing, 2026-10-30
 Implementation revision: ad54855c563c80333c5df713c6447de0974e3f28
+(Pre-publication hash, not in the repository history; the published
+implementation commit is c53b9e6.)
 Guest: Linux 6.18.58-l4h, x86_64, 512 MiB, 1 or 4 guest vCPUs.
 QEMU: 10.0.13 (Debian 1:10.0.13+ds-0+deb13u1), KVM, 4 host vCPUs, 4 GiB.
 QEMU CPU: host,-vmx,+invtsc. Host Linux: 6.12.113+deb13-amd64.
