@@ -1112,7 +1112,7 @@ separate domains.
 \begin{lstlisting}
 l4hctl create NAME [--initrd FILE] [--mem MB] [--vcpus N]
        [--cmdline STRING] [--io-pool MB]
-       [--disk DISK[,ro][,start=SECTOR][,sectors=N]]...
+       [--disk DISK[,ro][,volatile][,start=SECTOR][,sectors=N]]...
        [--nic SWITCH[,mac=MAC][,nolock][,isolated]]...
        [--gpu WxH]
 \end{lstlisting}
@@ -1308,13 +1308,20 @@ for that (Chapter~\ref{ch:recovery}).
 
 A host disk is attached to one guest at a time, with the option
 \begin{lstlisting}
---disk DISK[,ro][,start=SECTOR][,sectors=N]
+--disk DISK[,ro][,volatile][,start=SECTOR][,sectors=N]
 \end{lstlisting}
 whose suboptions are:
 
 \begin{description}[style=nextline]
   \item[\texttt{ro}] The guest may read but not write; writes fail with an
     I/O error. \texttt{DISK:ro} is accepted too.
+  \item[\texttt{volatile}] The guest is offered no cache flush: Linux
+    treats the disk as write-through (\file{/sys/block/vda/queue/write\_cache}
+    reads \texttt{write through}), so \texttt{fsync} returns without
+    waiting for the device, and any flush that still arrives completes at
+    once. Data the device has cached is lost on power failure. Use it for
+    disks whose contents are discarded with the VM, where a slow device
+    flush would otherwise dominate \texttt{fsync}-heavy work.
   \item[\texttt{start=SECTOR}, \texttt{sectors=N}] The guest sees only the
     window of \texttt{N} sectors from \texttt{SECTOR}, as a disk of its own
     starting at sector 0. Without \texttt{sectors}, the window extends to the

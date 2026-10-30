@@ -333,6 +333,11 @@ pub const IOMMU_ON: u64 = 2;
 pub const IOMMU_FAILED: u64 = 3;
 pub const NIC_NO_MAC_LOCK: u64 = 1 << 0;
 pub const NIC_ISOLATED: u64 = 1 << 1;
+/// CTL_BLK_ATTACH flags. A volatile attachment offers the guest no flush
+/// and completes flushes at once: data the device caches can be lost on
+/// power failure, for disks whose contents do not outlive the VM.
+pub const BLK_RO: u64 = 1 << 0;
+pub const BLK_VOLATILE: u64 = 1 << 1;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]

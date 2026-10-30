@@ -42,7 +42,7 @@ case " $(cat /proc/cmdline) " in
     while :; do sleep 10; done ;;
 esac
 if [ -b /dev/vda ]; then
-    echo "GUEST: vda size $(cat /sys/block/vda/size) ro $(cat /sys/block/vda/ro)"
+    echo "GUEST: vda size $(cat /sys/block/vda/size) ro $(cat /sys/block/vda/ro) cache $(cat /sys/block/vda/queue/write_cache)"
     mount -t ext4 /dev/vda /mnt || echo "GUEST: mount failed"
     n=$(cat /mnt/count 2>/dev/null || echo 0)
     echo "GUEST: disk count $n"

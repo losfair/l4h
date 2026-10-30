@@ -27,7 +27,7 @@ fn quarantine(c: &mut Controller, _: &Pci) { c.failed = true; }
 
 fn reservation() -> Attachment {
     Attachment { vm: 0, disk: 0, window: DiskWindow::new(8, 16, 1024).unwrap(),
-        read_only: false, reserved: true, pool: None }
+        read_only: false, volatile: false, reserved: true, pool: None }
 }
 
 #[test]

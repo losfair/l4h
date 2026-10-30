@@ -1620,6 +1620,17 @@ thin provisioning or copy-on-write.
   so identical IDs from different clients cannot collide.
 - Submission runs round-robin, with bounded work per client and reserved
   completion capacity for outstanding requests.
+- **Volatile attachments.** `BLK_ATTACH` takes flags: `BLK_RO`, and
+  `BLK_VOLATILE` for a disk whose contents need not survive a power
+  failure, such as the scratch disk of a VM that is discarded with it. Its
+  VMM does not offer `VIRTIO_BLK_F_FLUSH`, so the guest treats the disk as
+  write-through and turns `fsync`, journal commits and barriers into
+  no-ops; blkd completes any flush from that client at once, as it does
+  for a device without a volatile write cache. Writes the device has
+  cached may be lost. A flush on a consumer SSD or a virtualized disk can
+  take tens of milliseconds, and per-commit `fsync` dominates package
+  installs and builds there. Other attachments of the disk, and dom0's
+  provisioning flush, still flush the device.
 - Destroy stops the client's VMM, drains that client's submitted work, then
   releases its mapping and pool. It does not reset a shared controller.
   On a five-second timeout, root suspends the driver and quarantines the
@@ -2338,7 +2349,7 @@ little-endian structs defined in `include/l4h/abi.h` and mirrored in
 |------|------------------------|
 | Host | `host_version`: running host's build version (the tag for a release); `host_info`: cores, free/total bytes, disk, VM and NIC counts; `host_reboot`; `rtc_set`: machine RTC in UTC epoch seconds; `iommu_info`: IOMMU state, interrupt remapping, confined and unconfined devices, events logged (§8.5) |
 | Guests | `vm_create`, `vm_load`, `vm_start`, `vm_shutdown`, `vm_destroy`, `vm_list`, `vm_info` (cores for the first six vCPUs), `vm_stats` (CPU use and cap), `vm_set_sched` |
-| Block | `blk_attach`: disk, read-only flag and LBA window; `disk_info`: PCI address, owner, failed flag and kind |
+| Block | `blk_attach`: disk, read-only and volatile flags and LBA window; `disk_info`: PCI address, owner, failed flag and kind |
 | Network | `switch_create`, `switch_attach_uplink`, `nic_create` (MAC, MAC lock, isolation), `switch_info` (ports and counters), `nic_info` (PCI address, switch, MAC) |
 | Console | `console_read` (offset, bytes and lost-byte count), `console_write` |
 | Display | `gpu_attach` (scanout size), `gpu_read` (the image, 1 MiB at a time, its size, format and frame; §8.6) |
@@ -2388,7 +2399,8 @@ external orchestration can run in dom0.
   keyboard controller. It returns `EIO` only if the machine did not reset;
   aarch64 has no reset yet (`ENOSYS`). Every guest stops without notice:
   dom0 shuts them down first if they matter. Root flushes nothing: a
-  guest's flush reaches the disk before it completes, so dom0 syncs what it
+  guest's flush reaches the disk before it completes (except on a volatile
+  attachment), so dom0 syncs what it
   wrote first, and root's serve loop does not block on disks while the
   machine is about to go down.
 - Console output goes into a per-guest ring that `l4h-vmm` writes and

@@ -36,10 +36,15 @@ free=$(l4hctl info | sed -n 's/memory: \([0-9]*\) MiB free.*/\1/p')
 [ "$free" = "$free0" ] || fail "large I/O pool memory leak: $free0 -> $free MiB"
 echo "CTLTEST: large I/O pool started and reclaimed"
 # Disk pass-through to a guest, twice: the second sees the first's write.
+# The second attachment is volatile: offered no flush, the guest treats
+# the disk as write-through and its writes still reach the disk.
 for i in 1 2; do
-    id=$(l4hctl create disk$i --initrd /bin/vm.cpio.gz --mem 128 --disk 0) || fail "create disk$i"
+    flags=; cache="write back"
+    [ $i = 2 ] && { flags=,volatile; cache="write through"; }
+    id=$(l4hctl create disk$i --initrd /bin/vm.cpio.gz --mem 128 --disk 0$flags) || fail "create disk$i"
     l4hctl console "$id" --until "GUEST: disk ok" --timeout "$((60 * slow))" > /tmp/out || fail "disk vm $i"
     grep -q "GUEST: disk count $((i - 1))" /tmp/out || { cat /tmp/out; fail "disk count"; }
+    grep -q "GUEST: vda size .* cache $cache" /tmp/out || { cat /tmp/out; fail "disk $i cache"; }
     l4hctl disks > /tmp/disks && grep -q "owner vm $id" /tmp/disks || fail "disk owner"
     l4hctl destroy "$id" || fail "destroy disk$i"
 done

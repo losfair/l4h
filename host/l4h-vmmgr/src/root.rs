@@ -76,8 +76,9 @@ pub fn guest_del(id: usize) {
 }
 
 /// A window of host disk `disk` for guest `id`'s device `d`: its channel.
-pub fn disk_attach(alloc: &mut Alloc, id: usize, d: usize, disk: usize, read_only: bool, lba_start: u64, lba_count: u64) -> Result<Backend, i64> {
-    call(VMMGR_DISK_ATTACH, &[id as u64, d as u64, disk as u64, read_only as u64, lba_start, lba_count])?;
+/// `flags`: abi::BLK_*.
+pub fn disk_attach(alloc: &mut Alloc, id: usize, d: usize, disk: usize, flags: u64, lba_start: u64, lba_count: u64) -> Result<Backend, i64> {
+    call(VMMGR_DISK_ATTACH, &[id as u64, d as u64, disk as u64, flags, lba_start, lba_count])?;
     let mut chan = ArrayVec::new();
     for i in 0..host::blk::CHANNEL_PAGES {
         chan.must_push(take(alloc, i));
