@@ -51,7 +51,7 @@ fn parse_disk(value: &str) -> Result<((u64, u64, u64, u64), Option<&str>)> {
             Some(DiskOption::KeyFile) => {
                 let path = rest.split_once('=').unwrap().1;
                 if path.split(',').enumerate().any(|(i, part)| part.ends_with(":ro") || (i != 0 && disk_option(part).is_some())) {
-                    return err("--disk: suboptions must precede key-file=; use --key-file FILE for paths containing option-like text");
+                    return err("--disk: suboptions must precede key-file=; use --key-file FILE for paths containing option-like text or a :ro suffix");
                 }
                 key = Some(path);
                 break;

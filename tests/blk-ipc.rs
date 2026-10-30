@@ -480,10 +480,48 @@ mod production {
                 b.submit();
                 assert_eq!(&*b.waiting, [0, 1, 2]);
                 let Drv::Virtio(drv) = &b.drv else { unreachable!() };
-                assert_eq!(drv.can_start_calls.get(), if cq_blocked { 2 } else { 3 },
-                    "blocked writers are checked at most once regardless of rotation and CQ state");
+                assert_eq!(drv.can_start_calls.get(), blk::RING_SIZE / 4 + if cq_blocked { 2 } else { 3 },
+                    "apart from per-round capacity checks, blocked writers are checked once regardless of rotation and CQ state");
             }
         }
+    }
+
+    pub fn saturated_queues(info: &'static crate::Info, tags_full: bool) {
+        let mut b = service(info);
+        for i in 0..3 { assert_eq!(b.add(i, 0, 0, &[0; 64], 11), 0); }
+        if tags_full {
+            for i in 1..3 { for _ in 0..blk::RING_SIZE { enqueue(i, blk::OP_READ, 4096); } }
+            b.submit();
+            assert!(b.pending.iter().all(Option::is_some));
+        } else {
+            let Drv::Virtio(drv) = &mut b.drv else { unreachable!() };
+            drv.max_commands = 0;
+        }
+        for _ in 0..2 { enqueue(0, blk::OP_READ, 4096); }
+        let Drv::Virtio(drv) = &b.drv else { unreachable!() };
+        let before = drv.commands.len();
+        drv.can_start_calls.set(0);
+        b.submit();
+        let Drv::Virtio(drv) = &mut b.drv else { unreachable!() };
+        assert_eq!(drv.can_start_calls.get(), 1, "a saturated service must stop at its first capacity check");
+        assert_eq!(drv.commands.len(), before);
+        assert_eq!(unsafe { (*crate::channel()).sq.tail }, 0, "unsubmitted work stays queued");
+        if tags_full {
+            drv.completed.push((drv.commands[0].0, blk::STATUS_OK));
+        } else {
+            drv.max_commands = 1;
+        }
+        b.reap();
+        let kicks = crate::KERNEL.with_borrow(|k| k.kicks);
+        b.submit(); // One free slot is consumed, then the pass stops early.
+        let Drv::Virtio(drv) = &mut b.drv else { unreachable!() };
+        assert_eq!(drv.commands.len(), before + 1);
+        assert_eq!(unsafe { (*crate::channel()).sq.tail }, 1);
+        assert_eq!(crate::KERNEL.with_borrow(|k| k.kicks), kicks + 1, "an early exit must still kick submitted I/O");
+        drv.max_commands = usize::MAX;
+        drv.completed.push((drv.commands.last().unwrap().0, blk::STATUS_OK));
+        b.reap(); b.submit();
+        assert_eq!(unsafe { (*crate::channel()).sq.tail }, 2, "submission resumes when capacity returns");
     }
 
 }
@@ -511,12 +549,13 @@ pub struct MockDriver {
     legacy_io: u32, queue: u16, provisioning: bool,
     commands: Vec<(u64, u32, u64, Vec<Seg>)>,
     completed: Vec<(u64, u32)>, fail_start: bool,
+    max_commands: usize,
     can_start_calls: std::cell::Cell<usize>,
     on_start: Option<Box<dyn FnOnce()>>,
 }
 impl MockDriver {
     pub fn new(_: u32, cfg: &BlkdConfig) -> Self {
-        Self { legacy_io: cfg.legacy_io, queue: if cfg.kind == blk::BLKD_VIRTIO_SCSI { 2 } else { 0 }, provisioning: false, commands: Vec::new(), completed: Vec::new(), fail_start: false, can_start_calls: std::cell::Cell::new(0), on_start: None }
+        Self { legacy_io: cfg.legacy_io, queue: if cfg.kind == blk::BLKD_VIRTIO_SCSI { 2 } else { 0 }, provisioning: false, commands: Vec::new(), completed: Vec::new(), fail_start: false, max_commands: usize::MAX, can_start_calls: std::cell::Cell::new(0), on_start: None }
     }
     fn notify(&self) {
         KERNEL.with_borrow_mut(|k| {
@@ -534,7 +573,10 @@ impl Driver for MockDriver {
     fn info(&self, _: usize) -> DevInfo {
         DevInfo { capacity: 131072, block_size: 512, read_only: false, flush: true, address: 0x301 }
     }
-    fn can_start(&self) -> bool { self.can_start_calls.set(self.can_start_calls.get() + 1); true }
+    fn can_start(&self) -> bool {
+        self.can_start_calls.set(self.can_start_calls.get() + 1);
+        self.commands.len() < self.max_commands
+    }
     fn start(&mut self, tag: u64, _: usize, op: u32, sector: u64, data: &[Seg]) -> Result<(), u32> {
         if self.fail_start { return Err(blk::STATUS_IOERR); }
         if tag != u64::MAX { self.commands.push((tag, op, sector, data.to_vec())); }
@@ -678,6 +720,11 @@ fn parked_writers_wake_after_the_head_is_submitted_or_rejected() {
 
 #[test]
 fn writers_blocked_by_a_failed_allocation_are_checked_once_per_pass() { with_pools(3, production::blocked_writers_checked_once); }
+
+#[test]
+fn full_hardware_or_tag_queues_stop_polling_and_resume_after_completion() {
+    for tags_full in [false, true] { with_pools(3, |info| production::saturated_queues(info, tags_full)); }
+}
 
 #[test]
 fn applied_encryption_flags_survive_legacy_driver_ipc() {

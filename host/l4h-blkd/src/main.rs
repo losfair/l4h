@@ -246,7 +246,10 @@ impl Blkd {
         // Bounded work per client and round-robin starting point. A busy
         // ring cannot occupy every hardware slot before others get a turn.
         let n = self.active.len();
-        for _round in 0..blk::RING_SIZE / 4 {
+        'rounds: for _round in 0..blk::RING_SIZE / 4 {
+            // Capacity only returns when reap runs between submit passes.
+            // Stop before polling client rings if no request can start.
+            if !self.drv.can_start() || !self.pending.iter().any(Option::is_none) { break; }
             for off in 0..n {
                 let i = self.active[(self.next + off) % n];
                 if (first_no_space && first == Some(i)) || parked[i] { continue; }
@@ -262,8 +265,9 @@ impl Blkd {
                         }
                         select_writer(&self.waiting, &states, &mut first, &mut first_no_space, &mut parked);
                     }
-                    if state != QueueState::Ready || !self.drv.can_start() { break; }
-                    let Some(tag) = self.pending.iter().position(Option::is_none) else { break };
+                    if state != QueueState::Ready { break; }
+                    if !self.drv.can_start() { break 'rounds; }
+                    let Some(tag) = self.pending.iter().position(Option::is_none) else { break 'rounds };
                     let req = unsafe {
                         fence(Ordering::Acquire);
                         addr_of!((*c.chan).reqs[tail as usize % blk::RING_SIZE]).read_volatile()
