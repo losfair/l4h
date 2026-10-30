@@ -886,7 +886,9 @@ pub fn create(
     if cfg.vspaces > MAX_VSPACES {
         return Err(None);
     }
-    if cfg.ram_base % PAGE != 0 || cfg.ram_base != kernel.ram_base {
+    // The pool's GPA is 2 MiB aligned; its direct-map VA must also
+    // satisfy the frame size root uses for this pool.
+    if cfg.ram_base % (1 << host::blk::pool_frame_bits(cfg.io_pool)) != 0 || cfg.ram_base != kernel.ram_base {
         return Err(None);
     }
     if !cfg.io_pool.is_power_of_two() || cfg.io_pool < IO_POOL_MIN || cfg.io_pool > IO_POOL_MAX {

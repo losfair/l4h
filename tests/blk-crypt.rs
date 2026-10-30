@@ -1,6 +1,8 @@
 //! Hardware backends cross-checked against OpenSSL's EVP XTS implementation.
 //! `openssl enc` does not support XTS; the EVP API does.
 #![allow(dead_code)]
+#[path = "../host/l4h-host/src/wipe.rs"]
+mod wipe;
 #[path = "../host/l4h-host/src/blk.rs"]
 mod blk;
 #[path = "../host/l4h-blkd/src/crypt.rs"]

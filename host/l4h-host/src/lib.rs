@@ -19,6 +19,7 @@ pub mod memd;
 pub mod net;
 pub mod trust;
 pub mod vmmgr;
+pub mod wipe;
 
 /// Whether host components print informational messages.  Every print is a
 /// synchronous serial write by the seL4 kernel, which stalls the core for

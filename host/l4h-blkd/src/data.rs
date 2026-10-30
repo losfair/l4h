@@ -60,6 +60,6 @@ impl Data<'_> {
             output += crypt::UNIT;
             unit = unit.wrapping_add(1);
         }
-        for b in &mut scratch { unsafe { core::ptr::write_volatile(b, 0); } }
+        crate::wipe::bytes(&mut scratch);
     }
 }

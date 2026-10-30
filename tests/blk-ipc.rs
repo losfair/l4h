@@ -4,6 +4,7 @@
 
 extern crate self as l4h_rt;
 pub use l4h_host as host;
+pub use host::wipe;
 
 use host::blk::{self, BlkdConfig, Channel};
 use std::cell::RefCell;
@@ -95,11 +96,11 @@ mod production {
 
     pub fn run(info: &'static crate::Info) -> ! {
         // Tests serialize access, and the previous loop has unwound.
-        unsafe { CLIENTS = [const { None }; blk::MAX_CLIENTS]; PENDING = [None; MAX_INFLIGHT]; }
+        unsafe { CLIENTS = [const { None }; blk::MAX_CLIENTS]; PENDING = [const { None }; MAX_INFLIGHT]; }
         main(info)
     }
     fn service(info: &'static crate::Info) -> Blkd {
-        unsafe { CLIENTS = [const { None }; blk::MAX_CLIENTS]; PENDING = [None; MAX_INFLIGHT]; }
+        unsafe { CLIENTS = [const { None }; blk::MAX_CLIENTS]; PENDING = [const { None }; MAX_INFLIGHT]; }
         let cfg = &info.config;
         let drv = crate::MockDriver::new(1, cfg);
         let dev = [drv.info(0)].into_iter().collect();
@@ -213,6 +214,59 @@ mod production {
             }
             assert_eq!(b.remove(0), 0);
         }
+    }
+
+    pub fn encrypted_read_completion(info: &'static crate::Info, status: u32) {
+        let mut b = service(info);
+        let key = core::array::from_fn(|i| i as u8);
+        assert_eq!(b.add(0, 0, blk::ENCRYPT, &key, 11), 0);
+        let plain: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+        let mut cipher = vec![0; 4096];
+        unsafe { b.clients[0].as_ref().unwrap().keys.encrypt(plain.as_ptr(), cipher.as_mut_ptr(), 1); }
+        unsafe {
+            let c = &mut *crate::channel();
+            c.reqs[0] = blk::Req { id: 123, op: blk::OP_READ, sector: 8, nr_segs: 2, ..Default::default() };
+            c.reqs[0].segs[0] = blk::Seg { gpa: 4096, len: 17, flags: blk::SEG_WRITE };
+            c.reqs[0].segs[1] = blk::Seg { gpa: 12288, len: 4079, flags: blk::SEG_WRITE };
+            c.sq.head = 1;
+        }
+        b.submit();
+        let Drv::Virtio(drv) = &mut b.drv else { unreachable!() };
+        assert_eq!(drv.commands.len(), 1);
+        assert_eq!((drv.commands[0].1, drv.commands[0].2), (blk::OP_READ, 24));
+        let pool = blk::pool_va(0, 4 << 20) as *mut u8;
+        unsafe {
+            core::ptr::copy_nonoverlapping(cipher.as_ptr(), pool.add(4096), 17);
+            core::ptr::copy_nonoverlapping(cipher.as_ptr().add(17), pool.add(12288), 4079);
+            // A recycled request slot must not change completion metadata.
+            (*crate::channel()).reqs[0] = blk::Req::default();
+        }
+        drv.completed.push((drv.commands[0].0, status));
+        b.reap();
+        let actual = unsafe { [core::slice::from_raw_parts(pool.add(4096), 17), core::slice::from_raw_parts(pool.add(12288), 4079)].concat() };
+        assert_eq!(actual, if status == blk::STATUS_OK { plain } else { cipher });
+        unsafe { assert_eq!(((*crate::channel()).resps[0].id, (*crate::channel()).resps[0].status), (123, status)); }
+        assert_eq!(b.remove(0), 0);
+    }
+
+    pub fn rejected_shared_key_is_not_published(info: &'static crate::Info) {
+        let mut b = service(info);
+        for i in 0..2 { unsafe {
+            let c = &mut *(blk::channel_va(i) as *mut Channel);
+            c.lba_start = 16;
+            c.read_only = 1;
+        } }
+        let key = core::array::from_fn(|i| i as u8);
+        let mut wrong = key;
+        wrong[0] ^= 0x40;
+        assert_eq!(b.add(0, 0, blk::ENCRYPT, &key, 11), 0);
+        assert_eq!(b.add(1, 0, blk::ENCRYPT, &wrong, 11), 16);
+        assert!(b.clients[1].is_none());
+        assert_eq!(&*b.active, [0]);
+        assert_eq!(unsafe { (*(blk::channel_va(1) as *mut Channel)).ready }, 0);
+        assert_eq!(b.add(1, 0, blk::ENCRYPT, &key, 11), 0);
+        assert_eq!(&*b.active, [0, 1]);
+        for i in 0..2 { assert_eq!(b.remove(i), 0); }
     }
 
     fn enqueue(i: usize, op: u32, bytes: u32) {
@@ -689,6 +743,18 @@ fn production_bounce_defer_completion_errors_and_reuse() {
 
 #[test]
 fn sub_block_segments_pack_into_one_aligned_4kn_write() { with_pools(1, production::split_writes); }
+
+#[test]
+fn encrypted_read_completion_uses_the_submitted_segments_and_tweak() {
+    if !std::is_x86_feature_detected!("aes") { return; }
+    for status in [blk::STATUS_OK, blk::STATUS_IOERR] { with_pools(1, |info| production::encrypted_read_completion(info, status)); }
+}
+
+#[test]
+fn a_rejected_shared_key_leaves_the_client_slot_reusable() {
+    if !std::is_x86_feature_detected!("aes") { return; }
+    with_pools(2, production::rejected_shared_key_is_not_published);
+}
 
 #[test]
 fn deferred_writers_get_fifo_priority_while_reads_and_flushes_run() { with_pools(4, production::fair_writes); }

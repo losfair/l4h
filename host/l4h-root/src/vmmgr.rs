@@ -359,24 +359,22 @@ fn xchg(h: &Host, i: usize) -> sel4::AbsoluteCPtr {
 
 /// A call from vmmgr (label `label`): its reply's length.
 pub fn call(h: &mut Host, label: u64) -> usize {
-    let a: [u64; 8] = core::array::from_fn(|i| {
-        // This call alone has key words beyond the usual argument array.
-        if label == proto::VMMGR_DISK_ATTACH && i >= 6 { 0 } else { mr(i) }
-    });
+    // Snapshot the longest request and clear IPC storage before nested calls.
+    let mut a: [u64; 15] = core::array::from_fn(mr);
+    sel4::with_ipc_buffer_mut(|b| host::wipe::words(b.msg_regs_mut()));
     let mut len = 1;
     let r = match label {
-        proto::VMMGR_GUEST_NEW => guest_new(h, a),
+        proto::VMMGR_GUEST_NEW => guest_new(h, &a),
         proto::VMMGR_GUEST_DEL => guest_del(h, a[0] as usize),
         proto::VMMGR_DISK_ATTACH => {
             let mut key = [0u8; 64];
-            for i in 0..8 { key[8 * i..8 * i + 8].copy_from_slice(&mr(6 + i).to_le_bytes()); }
-            for i in 0..14 { set_mr(i, 0); }
-            let result = disk_attach(h, a, &key);
-            for byte in &mut key { unsafe { core::ptr::write_volatile(byte, 0); } }
+            for i in 0..8 { key[8 * i..8 * i + 8].copy_from_slice(&a[6 + i].to_le_bytes()); }
+            let result = disk_attach(h, &a, &key);
+            host::wipe::bytes(&mut key);
             result
         },
-        proto::VMMGR_NIC_ADD => nic_add(h, a),
-        proto::VMMGR_TRUST_REGISTER => trust_register(h, a),
+        proto::VMMGR_NIC_ADD => nic_add(h, &a),
+        proto::VMMGR_TRUST_REGISTER => trust_register(h, &a),
         proto::VMMGR_HOST_OP => {
             let data = unsafe { &mut *(RESULT_VA as *mut [u8; abi::CTL_DATA_MAX]) };
             data.fill(0);
@@ -385,6 +383,8 @@ pub fn call(h: &mut Host, label: u64) -> usize {
         }
         _ => Err(ctl::ENOSYS),
     };
+    host::wipe::words(&mut a);
+    sel4::with_ipc_buffer_mut(|b| host::wipe::words(b.msg_regs_mut()));
     match r {
         Ok(vals) => {
             set_mr(0, 0);
@@ -417,7 +417,7 @@ fn with_guest<R>(h: &mut Host, id: usize, f: impl FnOnce(&mut Host, &mut RootGue
 }
 
 /// VMMGR_GUEST_NEW: the pool, and the attestation device.
-fn guest_new(h: &mut Host, a: [u64; 8]) -> Result<Vals, i64> {
+fn guest_new(h: &mut Host, a: &[u64]) -> Result<Vals, i64> {
     let id = guest_arg(a[0])?;
     let (size, gpa, dom0) = (a[1] as usize, a[2] as usize, a[3] != 0);
     if h.guests[id].is_some() || !size.is_power_of_two() || !(IO_POOL_MIN..=IO_POOL_MAX).contains(&size) || gpa % (1 << host::blk::pool_frame_bits(size)) != 0 {
@@ -505,7 +505,7 @@ fn guest_del(h: &mut Host, id: usize) -> Result<Vals, i64> {
 /// lba_start + lba_count) of it; 0 = to the end) through to the guest,
 /// with abi::BLK_* flags.
 /// The window must be aligned to blkd::WINDOW_ALIGN sectors.
-fn disk_attach(h: &mut Host, a: [u64; 8], key: &[u8; 64]) -> Result<Vals, i64> {
+fn disk_attach(h: &mut Host, a: &[u64], key: &[u8; 64]) -> Result<Vals, i64> {
     let id = guest_arg(a[0])?;
     let (dev, disk, flags, lba_start, lba_count) = (a[1] as usize, a[2] as usize, a[3], a[4], a[5]);
     let (read_only, volatile, encrypted) = (flags & abi::BLK_RO != 0, flags & abi::BLK_VOLATILE != 0, flags & abi::BLK_ENCRYPT != 0);
@@ -529,16 +529,7 @@ fn disk_attach(h: &mut Host, a: [u64; 8], key: &[u8; 64]) -> Result<Vals, i64> {
         if let Err(e) = crate::blkd::activate(&mut h.ctrls[c], unit, client, g, &chan, &mut h.wins.a, &h.pci, key) {
             abs_of(kick).delete().expect("drop unused blkd kick");
             h.alloc.slots.free(kick.bits() as Slot);
-            // Rejected shared-key/flag checks have no outstanding I/O.
-            // Failed controllers stay on the destroy/quarantine path.
-            if !h.ctrls[c].failed {
-                crate::blkd::remove(&mut h.ctrls[c], client, &h.pci, &mut h.iommu);
-                g.disks.pop();
-                chan.release(&mut h.alloc);
-            } else {
-                chan.keep(&mut g.arena);
-                log!("l4h-root: guest {}: failed disk {} attach retained after controller {} quarantine; it uses a root disk/NIC slot until VM destruction", id, disk, c);
-            }
+            rollback_disk_attach(h, g, disk, chan);
             return Err(e);
         }
         for (i, f) in chan.iter().enumerate() {
@@ -551,8 +542,21 @@ fn disk_attach(h: &mut Host, a: [u64; 8], key: &[u8; 64]) -> Result<Vals, i64> {
     })
 }
 
+/// Roll back the last attachment only after proving the device cannot
+/// reach its pool. Otherwise guest_del must retain the pool-pinning record.
+fn rollback_disk_attach(h: &mut Host, g: &mut RootGuest, disk: usize, chan: crate::blkd::Channel) {
+    let &(c, client) = g.disks.last().unwrap();
+    if !h.ctrls[c].failed && crate::blkd::remove(&mut h.ctrls[c], client, &h.pci, &mut h.iommu) {
+        g.disks.pop();
+        chan.release(&mut h.alloc);
+    } else {
+        chan.keep(&mut g.arena);
+        log!("l4h-root: guest {}: failed disk {} attach retained after controller {} quarantine; it uses a root disk/NIC slot until VM destruction", g.id, disk, c);
+    }
+}
+
 /// VMMGR_NIC_ADD: a port of `switch` for the guest.  Returns the MAC.
-fn nic_add(h: &mut Host, a: [u64; 8]) -> Result<Vals, i64> {
+fn nic_add(h: &mut Host, a: &[u64]) -> Result<Vals, i64> {
     let id = guest_arg(a[0])?;
     let (dev, switch, mac, lock, isolated) = (a[1] as usize, a[2] as u32, a[3], a[4] != 0, a[5] != 0);
     if dev >= MAX_GUEST_DEVICES {
@@ -579,7 +583,7 @@ fn nic_add(h: &mut Host, a: [u64; 8]) -> Result<Vals, i64> {
 }
 
 /// VMMGR_TRUST_REGISTER: the guest starts.
-fn trust_register(h: &mut Host, a: [u64; 8]) -> Result<Vals, i64> {
+fn trust_register(h: &mut Host, a: &[u64]) -> Result<Vals, i64> {
     let id = guest_arg(a[0])?;
     let g = h.guests[id].as_ref().ok_or(ctl::ENOENT)?;
     if !g.attest {

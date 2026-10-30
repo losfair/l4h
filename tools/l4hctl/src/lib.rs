@@ -9,6 +9,10 @@ use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd;
 
+// Also used by the host; keep standalone guest clients dependency-free.
+#[path = "../../../host/l4h-host/src/wipe.rs"]
+mod wipe;
+
 pub const CTL_VERSION: u32 = 3;
 pub const CTL_DATA_MAX: usize = 1984;
 pub const CTL_LOAD_MAX: usize = 1 << 20;
@@ -194,9 +198,8 @@ impl Ctl {
         let mut resp = Box::new(Resp { status: 0, vals: [0; 6], data: [0; CTL_DATA_MAX] });
         let call = Call { req: &*req as *const Req as u64, resp: &mut *resp as *mut Resp as u64, buf, len: len as u64 };
         let r = unsafe { ioctl(self.dev.as_raw_fd(), L4HCTL_IOC_CALL, &call as *const Call) };
-        if op == CTL_BLK_ATTACH {
-            for byte in &mut req.data { unsafe { std::ptr::write_volatile(byte, 0); } }
-        }
+        wipe::words(&mut req.args);
+        wipe::bytes(&mut req.data);
         if r < 0 {
             return err(format!("ioctl: {}", io::Error::last_os_error()));
         }
@@ -403,7 +406,7 @@ impl Ctl {
 pub struct DiskKey(pub [u8; 64]);
 impl Drop for DiskKey {
     fn drop(&mut self) {
-        for byte in &mut self.0 { unsafe { std::ptr::write_volatile(byte, 0); } }
+        wipe::bytes(&mut self.0);
     }
 }
 impl DiskKey {
@@ -414,7 +417,7 @@ impl DiskKey {
         f.read_exact(&mut key.0).map_err(|_| Error("disk key file must contain exactly 64 raw bytes".into()))?;
         let mut extra = [0; 1];
         let n = f.read(&mut extra).map_err(|e| Error(e.to_string()))?;
-        unsafe { std::ptr::write_volatile(&mut extra[0], 0); }
+        wipe::bytes(&mut extra);
         if n != 0 { return err("disk key file must contain exactly 64 raw bytes"); }
         Ok(key)
     }
@@ -697,8 +700,13 @@ impl Ctl {
     /// `flags`: BLK_RO and BLK_VOLATILE; a key adds BLK_ENCRYPT.
     pub fn blk_attach(&self, vm: u64, disk: u64, flags: u64, start: u64, sectors: u64, key: Option<&[u8; 64]>) -> Result<()> {
         let encrypt = if key.is_some() { BLK_ENCRYPT } else { 0 };
+        // Older hosts have no per-disk detach operation, and the oldest
+        // ignore unknown flags. Check support before attaching.
+        if encrypt != 0 && self.call(CTL_HOST_VERSION, &[], &[], &[])?.vals[1] & encrypt != encrypt {
+            return err("host does not support disk encryption; no disk attached");
+        }
         let r = self.call(CTL_BLK_ATTACH, &[vm, disk, flags | encrypt, start, sectors], key.map_or(&[][..], |k| &k[..]), &[])?;
-        // Never start a VM believing a plain attachment is encrypted.
+        // Also require the host to confirm that this attach applied the flags.
         if r.vals[0] & encrypt != encrypt { return err("host did not confirm disk encryption; do not start this VM"); }
         Ok(())
     }

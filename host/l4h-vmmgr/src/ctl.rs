@@ -41,12 +41,10 @@ pub fn handle(h: &mut Vmmgr, caller: usize) {
             Err(e) => -e,
         }
     };
-    if req.op == abi::CTL_BLK_ATTACH {
-        for b in &mut req.data { unsafe { core::ptr::write_volatile(b, 0); } }
-        // Clear the shared request too, including on errors.
-        let data = unsafe { addr_of_mut!((*(page as *mut abi::CtlReq)).data).cast::<u8>() };
-        for i in 0..abi::CTL_DATA_MAX { unsafe { data.add(i).write_volatile(0); } }
-    }
+    host::wipe::words(&mut req.args);
+    host::wipe::bytes(&mut req.data);
+    // Clear every shared request, including unknown operations and errors.
+    unsafe { host::wipe::raw(page, core::mem::size_of::<abi::CtlReq>()); }
     unsafe { (page.add(abi::CTL_RESP_OFF) as *mut abi::CtlResp).write_volatile(resp) };
 }
 
@@ -94,6 +92,7 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
         abi::CTL_HOST_VERSION => {
             let version = HOST_VERSION.as_bytes();
             resp.vals[0] = version.len() as u64;
+            resp.vals[1] = abi::BLK_ENCRYPT;
             resp.data[..version.len()].copy_from_slice(version);
             Ok(())
         }

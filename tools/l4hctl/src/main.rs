@@ -43,6 +43,11 @@ fn parse_disk(value: &str) -> Result<((u64, u64, u64, u64), Option<&str>)> {
     let (mut start, mut sectors, mut key) = (0, 0, None);
     while let Some(rest) = options {
         let (opt, next) = rest.split_once(',').map_or((rest, None), |(o, tail)| (o, Some(tail)));
+        // Legacy :ro suffixes also follow numeric suboptions. Key-file
+        // paths keep their own ambiguity checks and must stay verbatim.
+        let opt = if !matches!(disk_option(opt), Some(DiskOption::KeyFile)) {
+            opt.strip_suffix(":ro").map_or(opt, |value| { flags |= BLK_RO; value })
+        } else { opt };
         match disk_option(opt) {
             Some(DiskOption::ReadOnly) => flags |= BLK_RO,
             Some(DiskOption::Volatile) => flags |= BLK_VOLATILE,
@@ -713,6 +718,11 @@ mod tests {
         }
         assert_eq!(parse_disk("2,ro,start=8").unwrap(), ((2, BLK_RO, 8, 0), None));
         assert_eq!(parse_disk("2:ro").unwrap(), ((2, BLK_RO, 0, 0), None));
+        for value in ["1,start=8,sectors=16:ro", "1,start=8:ro,sectors=16", "1:ro,start=8:ro,sectors=16:ro"] {
+            assert_eq!(parse_disk(value).unwrap(), ((1, BLK_RO, 8, 16), None));
+            let with_key = format!("{value},key-file=/key");
+            assert_eq!(parse_disk(&with_key).unwrap(), ((1, BLK_RO, 8, 16), Some("/key")));
+        }
         assert!(parse_disk("2:root").is_err());
         assert!(parse_disk("2,start=8,unknown=1").is_err());
     }

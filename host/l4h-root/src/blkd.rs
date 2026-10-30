@@ -537,8 +537,8 @@ pub fn activate(ctrl: &mut Controller, unit: u64, i: usize, client: &RootGuest, 
     let result = call(ctrl.driver.as_ref().unwrap().comp.service_ep, blk::BLKD_ADD, &args);
     let applied = crate::mr(1);
     let requested = args[2];
-    for word in &mut args { unsafe { core::ptr::write_volatile(word, 0) }; }
-    for i in 0..11 { crate::set_mr(i, 0); }
+    l4h_host::wipe::words(&mut args);
+    sel4::with_ipc_buffer_mut(|b| l4h_host::wipe::words(b.msg_regs_mut()));
     if result == u64::MAX {
         quarantine(ctrl, pci);
         return Err(crate::ctl::EIO);

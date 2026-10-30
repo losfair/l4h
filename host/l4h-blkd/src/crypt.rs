@@ -53,9 +53,8 @@ impl Xts {
 
     pub fn clear(&mut self) {
         for keys in [&mut self.enc, &mut self.dec, &mut self.tweak] {
-            for byte in keys.iter_mut().flatten() { unsafe { core::ptr::write_volatile(byte, 0); } }
+            crate::wipe::bytes(keys.as_flattened_mut());
         }
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     }
 }
 

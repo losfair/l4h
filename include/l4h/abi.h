@@ -494,7 +494,9 @@ enum l4h_ctl_op {
 	 * With ENCRYPT, data[0..64] is the raw AES-256-XTS key (K1 || K2).
 	 * Equal halves: EINVAL; no hardware AES: EOPNOTSUPP. Logical blocks
 	 * are 4096 bytes and tweaks count units from the window start.
-	 * vals[0] returns the applied flags (old hosts return 0). */
+	 * vals[0] returns the applied flags (old hosts return 0). Before a
+	 * keyed attach, require HOST_VERSION vals[1] to advertise ENCRYPT:
+	 * older hosts may ignore or reject it and cannot detach a single disk. */
 	L4H_CTL_BLK_ATTACH = 7,
 	/* args: vm, offset -> vals[0] = next offset, vals[1] = len,
 	 * vals[2] = bytes lost; data: console output */
@@ -550,7 +552,8 @@ enum l4h_ctl_op {
 	 * boot.  AMD-Vi or Intel VT-d (DESIGN.md §9.5).  dom0 only, like every
 	 * control call. */
 	L4H_CTL_IOMMU_INFO = 24,
-	/* -> vals[0] = byte length (<= L4H_CTL_DATA_MAX); data: host build
+	/* -> vals[0] = byte length (<= L4H_CTL_DATA_MAX);
+	 * vals[1] = supported BLK_ATTACH flags (0 on older hosts); data: host build
 	 * version in UTF-8, without a terminating NUL (e.g. v2026.10.1).
 	 * This is independent of L4H_CTL_VERSION, the control ABI version. */
 	L4H_CTL_HOST_VERSION = 25,

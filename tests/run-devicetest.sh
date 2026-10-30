@@ -47,7 +47,30 @@ reservations += blkd[start:end]
 vmmgr = (root / 'host/l4h-root/src/vmmgr.rs').read_text()
 start = vmmgr.index('impl RootGuest {')
 end = vmmgr.index('\n}', start) + 2
+reservations += vmmgr[start:end]
+start = vmmgr.index('fn rollback_disk_attach(')
+end = vmmgr.index('\n}', start) + 2
 (out / 'blk-reservations.inc').write_text(reservations + vmmgr[start:end])
+guest = (root / 'host/l4h-vmmgr/src/guest.rs').read_text()
+start = guest.index('    // Every value comes from the control API:')
+end = guest.index('    let ram_base = cfg.ram_base;', start)
+(out / 'guest-pool-config.inc').write_text('fn validate(cfg: &GuestConfig, kernel: &Kernel) -> Result<(), Option<()>> {\n' + guest[start:end] + 'Ok(())\n}\n')
+cli = (root / 'tools/l4hctl/src/lib.rs').read_text()
+parts = []
+for signature in ['    pub fn call(&self, op:', '    fn call_buf(', '    fn raw_call(', '    pub fn blk_attach(']:
+    start = cli.index(signature)
+    end = cli.index('\n    }', start) + 6
+    parts.append(cli[start:end])
+(out / 'ctl-encryption.inc').write_text('impl Ctl {\n' + '\n'.join(parts) + '\n}\n')
+for source, signature, name in [
+    ('host/l4h-root/src/vmmgr.rs', 'pub fn call(h:', 'root-server'),
+    ('host/l4h-vmmgr/src/root.rs', 'fn call(label:', 'root-client'),
+    ('host/l4h-vmmgr/src/ctl.rs', 'pub fn handle(', 'control-handle'),
+]:
+    text = (root / source).read_text()
+    start = text.index(signature)
+    end = text.index('\n}', start) + 2
+    (out / (name + '.inc')).write_text(text[start:end])
 PY
 cc -std=c11 -O2 -Wall -Wextra -Werror -I "$root/include" -I "$out" \
     -c "$root/tests/console-guest.c" -o "$out/console-guest.o"
@@ -77,6 +100,18 @@ L4H_BLKD_TEST_SRC="$out/blkd-main.inc" rustc +stable --edition=2024 --test -L de
     --extern l4h_host="$out/libl4h_host.rlib" \
     "$root/tests/blk-ipc.rs" -o "$out/blk-ipc-tests"
 "$out/blk-ipc-tests"
+L4H_GUEST_POOL_TEST_SRC="$out/guest-pool-config.inc" rustc +stable --edition=2024 --test -L dependency="$out" \
+    --extern l4h_abi="$out/libl4h_abi.rlib" --extern l4h_host="$out/libl4h_host.rlib" \
+    "$root/tests/guest-pool-layout.rs" -o "$out/guest-pool-tests"
+"$out/guest-pool-tests"
+L4H_CTL_ENCRYPT_TEST_SRC="$out/ctl-encryption.inc" rustc +stable --edition=2024 --test -L dependency="$out" \
+    --extern l4h_abi="$out/libl4h_abi.rlib" "$root/tests/ctl-encryption.rs" -o "$out/ctl-encryption-tests"
+"$out/ctl-encryption-tests"
+L4H_ROOT_SERVER_TEST_SRC="$out/root-server.inc" L4H_ROOT_CLIENT_TEST_SRC="$out/root-client.inc" \
+    L4H_CONTROL_HANDLE_TEST_SRC="$out/control-handle.inc" rustc +stable --edition=2024 --test -L dependency="$out" \
+    --extern l4h_abi="$out/libl4h_abi.rlib" --extern l4h_host="$out/libl4h_host.rlib" \
+    "$root/tests/secret-ipc.rs" -o "$out/secret-ipc-tests"
+"$out/secret-ipc-tests"
 rustc +stable --edition=2024 --test --crate-name l4h_host -L dependency="$out" \
     --extern l4h_abi="$out/libl4h_abi.rlib" \
     "$root/host/l4h-host/src/lib.rs" -o "$out/host-tests"

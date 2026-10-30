@@ -34,6 +34,13 @@ thread_local! {
 }
 fn mr(i: usize) -> u64 { MRS.with_borrow(|m| m[i]) }
 fn set_mr(i: usize, v: u64) { MRS.with_borrow_mut(|m| m[i] = v); }
+mod sel4 {
+    pub struct IpcBuffer<'a>(&'a mut [u64]);
+    impl IpcBuffer<'_> { pub fn msg_regs_mut(&mut self) -> &mut [u64] { self.0 } }
+    pub fn with_ipc_buffer_mut<R>(f: impl FnOnce(&mut IpcBuffer<'_>) -> R) -> R {
+        super::MRS.with_borrow_mut(|m| f(&mut IpcBuffer(m)))
+    }
+}
 fn call(ep: u64, label: u64, args: &[u64]) -> u64 {
     for (i, &a) in args.iter().enumerate() { set_mr(i, a); }
     if label == blk::BLKD_ADD { set_mr(1, APPLIED.get()); }
@@ -41,14 +48,48 @@ fn call(ep: u64, label: u64, args: &[u64]) -> u64 {
 }
 fn quarantine(c: &mut Controller, _: &Pci) { c.failed = true; }
 
-pub struct RootGuest { id: usize, pool: blk::Pool, disks: Vec<(usize, usize)>, ports: Vec<usize>, device_limit_logged: bool }
+pub struct RootGuest { id: usize, pool: blk::Pool, disks: Vec<(usize, usize)>, ports: Vec<usize>, device_limit_logged: bool, arena: Vec<usize> }
 fn guest() -> RootGuest {
-    RootGuest { id: 7, pool: blk::Pool { gpa: 0, paddr: 0x100000, size: 0x400000 }, disks: vec![(0, 0)], ports: Vec::new(), device_limit_logged: false }
+    RootGuest { id: 7, pool: blk::Pool { gpa: 0, paddr: 0x100000, size: 0x400000 }, disks: vec![(0, 0)], ports: Vec::new(), device_limit_logged: false, arena: Vec::new() }
 }
 pub type Channel = Vec<usize>;
+mod blkd { pub use super::{Channel, remove}; }
+struct Alloc { released: usize }
+struct Host { ctrls: Vec<Controller>, pci: Pci, iommu: Iommu, alloc: Alloc }
+trait ChannelMemory { fn keep(self, arena: &mut Vec<usize>); fn release(self, alloc: &mut Alloc); }
+impl ChannelMemory for Channel {
+    fn keep(self, arena: &mut Vec<usize>) { arena.extend(self); }
+    fn release(self, alloc: &mut Alloc) { alloc.released += self.len(); }
+}
 pub struct Window { page: Box<blk::Channel> }
 impl Window {
     fn with_frame(&mut self, _: &Slot, f: impl FnOnce(*mut u8)) { f((&mut *self.page as *mut blk::Channel).cast()); }
+}
+
+#[test]
+fn failed_rollback_retains_the_record_needed_to_pin_the_pool() {
+    for dom in [Domain::NONE, Domain(1)] {
+        let mut g = guest();
+        let mut c = Controller { clients: vec![Some(Attachment { encrypted: true,
+            pool: Some((g.pool.paddr as usize, g.pool.size as usize)), ..reservation() })],
+            driver: Some(Driver { comp: Component { service_ep: 0 } }), failed: false, dom };
+        let mut win = Window { page: Box::new(unsafe { core::mem::zeroed() }) };
+        APPLIED.set(0);
+        assert_eq!(activate(&mut c, 0, 0, &g, &vec![0], &mut win, &Pci, &[0x12; 64]), Err(ctl::EOPNOTSUPP));
+        assert!(!c.failed);
+        c.driver.as_mut().unwrap().comp.service_ep = u64::MAX; // REMOVE now times out.
+        let mut h = Host { ctrls: vec![c], pci: Pci, iommu: Iommu { unmapped: Vec::new() }, alloc: Alloc { released: 0 } };
+        rollback_disk_attach(&mut h, &mut g, 0, vec![0]);
+        assert!(h.ctrls[0].failed);
+        assert_eq!(g.disks.len(), usize::from(dom == Domain::NONE));
+        assert_eq!(g.arena.len(), usize::from(dom == Domain::NONE));
+        assert_eq!(h.alloc.released, usize::from(dom != Domain::NONE));
+        // guest_del drains these retained records before deciding whether
+        // the pool can return to the allocator, even after remove took its mapping.
+        let mut quiet = true;
+        for &(ctrl, client) in &g.disks { quiet &= remove(&mut h.ctrls[ctrl], client, &h.pci, &mut h.iommu); }
+        assert_eq!(quiet, dom != Domain::NONE, "an unconfined failed controller must keep the pool pinned");
+    }
 }
 
 #[test]

@@ -1323,7 +1323,8 @@ whose suboptions are:
     by a known disk suboption, is rejected as ambiguous;
     put disk options first, or use \texttt{--key-file FILE} for such paths.
   \item[\texttt{ro}] The guest may read but not write; writes fail with an
-    I/O error. \texttt{DISK:ro} is accepted too.
+    I/O error. Legacy \texttt{:ro} suffixes on the disk number or numeric
+    suboptions are accepted too, such as \texttt{DISK,start=8,sectors=16:ro}.
   \item[\texttt{volatile}] The guest is offered no cache flush: Linux
     treats the disk as write-through (\file{/sys/block/vda/queue/write\_cache}
     reads \texttt{write through}), so \texttt{fsync} returns without
@@ -1391,6 +1392,8 @@ to the data. \cmd{l4hctl disks} marks encrypted attachments; the host log
 identifies \texttt{aes-ni} or \texttt{armv8-ce}. Read-only shared encrypted
 windows must use the same starting sector and key. Destroy drains I/O
 and erases the driver's expanded keys.
+The CLI checks the host's encryption support before attaching a keyed disk.
+On older hosts it fails without adding a disk to the VM.
 
 The on-disk format is raw AES-256-XTS, with 4 KiB data units and
 little-endian unit numbers relative to the window. To open the same
@@ -2042,7 +2045,8 @@ Op & Name & Arguments & Results \\
 18 & \texttt{VM\_STATS} & VM & CPU use in tenths of a percent, cap \\
 19 & \texttt{VM\_SHUTDOWN} & VM, 0 power off / 1 reboot & -- \\
 25 & \texttt{HOST\_VERSION} & -- & byte length in \texttt{vals[0]}; UTF-8
-  build version in data, without a terminating NUL \\
+  build version in data, without a terminating NUL; supported
+  \texttt{BLK\_ATTACH} flags in \texttt{vals[1]} (0 on older hosts) \\
 \bottomrule
 \end{longtable}
 

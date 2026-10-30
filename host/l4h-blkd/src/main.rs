@@ -21,6 +21,7 @@ use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{Ordering, fence};
 
 use l4h_rt::host;
+use l4h_rt::host::wipe;
 use l4h_rt::host::blk::{self, BlkdConfig, Channel, Pool};
 use l4h_rt::host::fixed::ArrayVec;
 use l4h_rt::sel4;
@@ -128,15 +129,17 @@ fn select_writer(waiting: &[usize], states: &[QueueState; blk::MAX_CLIENTS],
     }
 }
 
-#[derive(Clone, Copy)]
 struct Pending {
     client: usize,
-    req: blk::Req,
+    id: u64,
+    unit: u64,
+    /// Translated segments only for reads that need completion decryption.
+    read: ArrayVec<Seg, MAX_PIECES>,
     bounce: Option<bounce::Run>,
 }
 
 /// Client slots, in .bss: too large for the stack.
-static mut PENDING: [Option<Pending>; MAX_INFLIGHT] = [None; MAX_INFLIGHT];
+static mut PENDING: [Option<Pending>; MAX_INFLIGHT] = [const { None }; MAX_INFLIGHT];
 static mut CLIENTS: [Option<Client>; blk::MAX_CLIENTS] = [const { None }; blk::MAX_CLIENTS];
 
 struct Blkd {
@@ -209,18 +212,16 @@ impl Blkd {
         });
         // Drivers finish their bookkeeping (including legacy retry I/O)
         // before any decryption, notification or client response occurs.
-        let mut pieces = ArrayVec::new();
         for &(tag, status) in &completed {
             if let Some(p) = self.pending.get_mut(tag as usize).and_then(|p| p.take()) {
                 if let Some(run) = p.bounce { self.bounce.free(run); }
                 if let Some(c) = self.clients[p.client].as_mut() {
-                    if status == blk::STATUS_OK && p.req.op == blk::OP_READ && c.encrypted {
-                        c.prepare(&p.req, c.block_size, &mut pieces).expect("validated read");
-                        unsafe { data::Data { segs: &pieces, pool_pa: c.pool.paddr, pool_va: c.pool_va }
-                            .crypt(&c.keys, p.req.sector / 8, None); }
+                    if status == blk::STATUS_OK && !p.read.is_empty() {
+                        unsafe { data::Data { segs: &p.read, pool_pa: c.pool.paddr, pool_va: c.pool_va }
+                            .crypt(&c.keys, p.unit, None); }
                     }
                     c.outstanding -= 1;
-                    c.respond(p.req.id, status);
+                    c.respond(p.id, status);
                 }
             }
         }
@@ -312,12 +313,16 @@ impl Blkd {
                     // Do not consume a write until a contiguous run is
                     // available. Other clients' reads/flushes still run.
                     if deferred { break; }
-                    self.waiting.retain(|&w| w != i);
-                    select_writer(&self.waiting, &states, &mut first, &mut first_no_space, &mut parked);
+                    if self.waiting.contains(&i) {
+                        self.waiting.retain(|&w| w != i);
+                        select_writer(&self.waiting, &states, &mut first, &mut first_no_space, &mut parked);
+                    }
                     unsafe { addr_of_mut!((*c.chan).sq.tail).write_volatile(tail.wrapping_add(1)); }
                     match result {
                         Ok(()) => {
-                            self.pending[tag] = Some(Pending { client: i, req, bounce: run });
+                            self.pending[tag] = Some(Pending { client: i, id: req.id, unit: req.sector / 8,
+                                read: if req.op == blk::OP_READ && c.encrypted { pieces.clone() } else { ArrayVec::new() },
+                                bounce: run });
                             c.outstanding += 1;
                             started = true;
                         }
@@ -348,11 +353,9 @@ impl Blkd {
         };
         let read_only = ro != 0 || dev.read_only;
         let Some(window) = blk::DiskWindow::new(start, count, dev.capacity) else { return 22 };
-        let mut keys = crypt::Xts::empty();
-        if encrypted { unsafe { keys.init(key); } }
         if self.clients.iter().flatten().any(|c| c.unit == unit && window.overlaps(c.window)
             && (window.conflicts(read_only, c.window, c.read_only)
-                || ((encrypted || c.encrypted) && (encrypted != c.encrypted || window.start != c.window.start || !keys.same_key(&c.keys))))) {
+                || ((encrypted || c.encrypted) && (encrypted != c.encrypted || window.start != c.window.start)))) {
             return 16;
         }
         let block_size = if encrypted { crypt::UNIT as u32 } else { dev.block_size };
@@ -360,9 +363,14 @@ impl Blkd {
             pool_va: self.cfg.pool_va as usize + blk::pool_offset(i, pool.size as usize),
             encrypted, keys: crypt::Xts::empty(),
             done: cap::<cap_type::Notification>(blk::BLKD_SLOT_CLIENT_DONE + i as u64), outstanding: 0 });
-        // Expanded key state lives only in the client table after return.
-        // Re-expand directly there; the comparison scratch is wiped on drop.
+        // Expand once, in the final slot. A rejected shared key is wiped
+        // there by Drop before publishing the client or marking it ready.
         if encrypted { unsafe { self.clients[i].as_mut().unwrap().keys.init(key); } }
+        if encrypted && self.clients.iter().enumerate().any(|(other, c)| other != i && c.as_ref().is_some_and(|c|
+            c.unit == unit && window.overlaps(c.window) && !self.clients[i].as_ref().unwrap().keys.same_key(&c.keys))) {
+            self.clients[i] = None;
+            return 16;
+        }
         self.active.must_push(i);
         unsafe {
             addr_of_mut!((*chan).read_only).write_volatile(read_only as u32);
@@ -478,12 +486,12 @@ fn main(info: &'static Info) -> ! {
                 let mut key = [0u8; 64];
                 for n in 0..8 { key[8 * n..8 * n + 8].copy_from_slice(&mr(3 + n).to_le_bytes()); }
                 // Clear incoming key words before any other IPC can use them.
-                for n in 0..11 { set_mr(n, 0); }
+                sel4::with_ipc_buffer_mut(|b| wipe::words(b.msg_regs_mut()));
                 let result = b.add(i, unit, flags, &key, msg.length());
                 if result == 0 {
                     response[1] = if b.clients[i].as_ref().unwrap().encrypted { blk::ENCRYPT } else { 0 };
                 }
-                for byte in &mut key { unsafe { core::ptr::write_volatile(byte, 0); } }
+                wipe::bytes(&mut key);
                 if result == 0 && flags & blk::ENCRYPT != 0 {
                     l4h_rt::info!("blkd {:#x}: unit {} client {}: aes-256-xts ({})", id, unit, i, crypt::BACKEND);
                 }
@@ -500,6 +508,7 @@ fn main(info: &'static Info) -> ! {
         b.submit();
         // Legacy virtio kicks invoke IOPort capabilities and overwrite MRs.
         // Marshal the whole reply only after that work has finished.
+        sel4::with_ipc_buffer_mut(|b| wipe::words(b.msg_regs_mut()));
         for (i, v) in response.into_iter().enumerate() { set_mr(i, v); }
         (msg, badge) = ep.reply_recv(sel4::MessageInfo::new(0, 0, 0, 5), reply);
     }
