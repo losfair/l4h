@@ -1144,7 +1144,7 @@ guest's command line asks for it:
 
 The base stays mainline 6.18 LTS, not Android's `android17-6.18`
 branch: that branch lags the stable releases (6.18.32 against l4h's
-6.18.58 in October 2026), and the user ABI is upstream's either way.
+6.18.60 in October 2026), and the user ABI is upstream's either way.
 Android's own additions are therefore missing but for two that Android
 17 cannot boot without, ashmem and dm-default-key (below): `xt_quota2`
 (netd's data usage alerts), incremental-fs (incremental app installs),

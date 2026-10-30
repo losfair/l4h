@@ -6,8 +6,8 @@
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 # Downloads are pinned by checksum.
-LINUX_VERSION=6.18.58
-LINUX_SHA256=069b19f9032c4dac8149ae4b6520c35debca0f42a9f6d52ee55ba6ca9b818013
+LINUX_VERSION=6.18.60
+LINUX_SHA256=3c2f44ef6acc021a7ad444d9a2e6ec1ef488ff09368793d0004a6080f69d621e
 RUSTUP_VERSION=1.29.1
 RUSTUP_SHA256=dda7234360b7f578ca8b0ddcb80145646fa61a67c1720a5abc7051b35c9fcb71
 want=" ${*:-x86_64} "
