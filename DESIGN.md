@@ -765,8 +765,10 @@ virtio-l4h code. The Linux base is 6.18; patches outside arch/l4h are in
   replacement; unaffected pages can refault. This demotion needs no
   allocation. Promotion removes the old leaf table, invalidating its
   translations once, before deleting its small caps and mapping the large
-  frame. Table coverage is tracked explicitly on both ISAs. Accounting,
-  eviction, teardown and failed TLB-sync mappings include both sizes;
+  frame. Table coverage is tracked explicitly on both ISAs, indexed by
+  level and address, so neither adding a table nor promotion scans the
+  address space's tables. Accounting, eviction, teardown and failed
+  TLB-sync mappings include both sizes;
   a failed remap leaves the affected range unmapped. ARM executable
   mappings synchronize the instruction cache over the full frame size.
 
@@ -785,7 +787,7 @@ virtio-l4h code. The Linux base is 6.18; patches outside arch/l4h are in
   conversion; native PMD migration and whole-THP swap are not enabled.
 
   `tests/run-thptest.sh` covers allocation, COW, user copies, futexes,
-  VSpace eviction, splitting with pinned pages, partial protection/unmap/discard,
+  VSpace eviction, promotion among thousands of page tables, splitting with pinned pages, partial protection/unmap/discard,
   explicit and background collapse, moving mappings, concurrent writes,
   hardware aging, swap, execute permissions, shared memory and allocation
   fallback. `HPSTRESS_THP=1 tests/run-hotplugstress.sh 15` exercises memory

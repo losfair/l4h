@@ -13,6 +13,7 @@
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
+#include <time.h>
 
 static long large_mappings(struct area a)
 {
@@ -359,6 +360,55 @@ static void concurrent_split(void)
 	area_free(a);
 }
 
+static double now_ns(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec * 1e9 + ts.tv_nsec;
+}
+
+/* Thousands of seL4 page tables in one VSpace, then promotions that must
+ * find and remove existing leaf tables among them.  The per-table times
+ * show whether adding tables still scales with how many there are. */
+static void many_tables(void)
+{
+	enum { TABLES = 2048, PROMOTE = 8 };
+	size_t size = (size_t)TABLES * HUGE;
+	unsigned char *base = mmap(NULL, size + HUGE, PROT_READ | PROT_WRITE,
+				   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+	unsigned char *p = (void *)(((uintptr_t)base + HUGE - 1) & ~(HUGE - 1));
+	double t0, t1, t2;
+
+	CHECK(base != MAP_FAILED, "sparse mmap: %s", strerror(errno));
+	CHECK(!madvise(p, size, MADV_NOHUGEPAGE), "sparse nohugepage: %s", strerror(errno));
+	/* One 4 KiB page per 2 MiB: one new leaf table per fault. */
+	t0 = now_ns();
+	for (size_t i = 0; i < TABLES / 2; i++)
+		p[i * HUGE + 8] = i & 0xff;
+	t1 = now_ns();
+	for (size_t i = TABLES / 2; i < TABLES; i++)
+		p[i * HUGE + 8] = i & 0xff;
+	t2 = now_ns();
+	printf("THPTEST: many_tables: %d tables, %.0f then %.0f ns per table\n", TABLES,
+	       (t1 - t0) / (TABLES / 2), (t2 - t1) / (TABLES / 2));
+	/* Promote ranges spread over the space: each replaces a leaf table. */
+	for (size_t k = 0; k < PROMOTE; k++) {
+		struct area a = { .base = base, .p = p + (k * (TABLES / PROMOTE) + 3) * HUGE, .size = HUGE };
+		size_t i = (a.p - p) / HUGE;
+
+		CHECK(!madvise(a.p, HUGE, MADV_HUGEPAGE), "range hugepage: %s", strerror(errno));
+		for (size_t off = PAGE; off < HUGE; off += PAGE)
+			a.p[off] = 0x5a;
+		CHECK(!madvise(a.p, HUGE, MADV_COLLAPSE), "collapse among tables: %s", strerror(errno));
+		require_native(a);
+		CHECK(a.p[8] == (i & 0xff) && a.p[HUGE - PAGE] == 0x5a, "collapsed range %zu data", i);
+	}
+	for (size_t i = 0; i < TABLES; i++)
+		CHECK(p[i * HUGE + 8] == (i & 0xff), "sparse page %zu", i);
+	CHECK(!munmap(base, size + HUGE), "sparse munmap: %s", strerror(errno));
+}
+
 static int sample(int fd, struct area a)
 {
 	struct aging_range r = { .start = (uintptr_t)a.p, .size = a.size };
@@ -420,6 +470,7 @@ int main(int argc, char **argv)
 	RUN(fault_and_cow);
 	RUN(zero_and_uaccess);
 	RUN(vspace_eviction);
+	RUN(many_tables);
 	RUN(split_and_collapse);
 	RUN(move_and_background_collapse);
 	RUN(concurrent_split);

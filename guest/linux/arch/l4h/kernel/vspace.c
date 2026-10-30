@@ -72,13 +72,15 @@ struct table {
 	struct list_head link;
 	struct l4h_obj obj;
 	int level;		/* index into l4h_pt_level_obj[] */
-	unsigned long base;	/* virtual coverage of this table */
 };
 
 /* One seL4 address space: a VSpace root plus the page tables we added. */
 struct l4h_as {
 	unsigned long root;
-	struct list_head tables;
+	struct list_head tables;	/* newest first */
+	/* User roots: the table of each level covering an address, indexed
+	 * by the address >> l4h_pt_level_shift[level]. */
+	struct xarray table_at[L4H_NR_PT_LEVELS];
 	struct xarray pages;	/* 4 KiB leaves, indexed by VPN */
 	struct xarray large;	/* 2 MiB leaves, indexed by PMD number */
 	unsigned long nr_pages, nr_tables;
@@ -88,8 +90,12 @@ struct l4h_as {
 
 static void as_init(struct l4h_as *as, unsigned long root)
 {
+	int level;
+
 	as->root = root;
 	INIT_LIST_HEAD(&as->tables);
+	for (level = 0; level < L4H_NR_PT_LEVELS; level++)
+		xa_init(&as->table_at[level]);
 	xa_init(&as->pages);
 	xa_init(&as->large);
 	as->nr_pages = as->nr_tables = 0;
@@ -121,6 +127,8 @@ static void as_charge(struct l4h_as *as, struct mm_struct *mm)
 
 static int as_add_table(struct l4h_as *as, int level, unsigned long va)
 {
+	bool user = as->root != L4H_CPTR(L4H_SLOT_VSPACE);
+	unsigned long index = 0;
 	struct table *t;
 	int err;
 
@@ -129,25 +137,30 @@ static int as_add_table(struct l4h_as *as, int level, unsigned long va)
 	/* User roots start empty. Install top down so ARM's first-missing-
 	 * level API also gives us exact coverage for promotion. The kernel
 	 * root has pre-existing boot/direct-map tables and uses lazy lookup. */
-	if (as->root != L4H_CPTR(L4H_SLOT_VSPACE)) {
-		unsigned long base = va & ~((1ul << l4h_pt_level_shift[level]) - 1);
-
-		list_for_each_entry(t, &as->tables, link)
-			if (t->level == level && t->base == base)
-				return 0;
+	if (user) {
+		index = va >> l4h_pt_level_shift[level];
+		if (xa_load(&as->table_at[level], index))
+			return 0;
 		if (level + 1 < L4H_NR_PT_LEVELS) {
 			err = as_add_table(as, level + 1, va);
 			if (err)
 				return err;
 		}
+		/* Reserve the entry first: recording the mapped table then
+		 * cannot fail. */
+		err = xa_reserve(&as->table_at[level], index, GFP_ATOMIC);
+		if (err)
+			return err;
 	}
 	t = kzalloc(sizeof(*t), GFP_ATOMIC);
-	if (!t)
-		return -ENOMEM;
+	if (!t) {
+		err = -ENOMEM;
+		goto release;
+	}
 	err = l4h_obj_alloc(l4h_pt_level_obj[level], 0, &t->obj);
 	if (err) {
 		kfree(t);
-		return err;
+		goto release;
 	}
 	for (;;) {
 		err = l4h_pt_map(l4h_pt_level_obj[level], t->obj.cptr, as->root, va);
@@ -161,15 +174,20 @@ static int as_add_table(struct l4h_as *as, int level, unsigned long va)
 		l4h_obj_free(&t->obj);
 		kfree(t);
 		/* A parent's -ENOMEM must reach the callers that wait for memory. */
-		if (err < 0)
-			return err;
-		return err == L4H_ERR_DELETE_FIRST ? 0 : -EFAULT;
+		if (err > 0)
+			err = err == L4H_ERR_DELETE_FIRST ? 0 : -EFAULT;
+		goto release;
 	}
 	t->level = level;
-	t->base = va & ~((1ul << l4h_pt_level_shift[level]) - 1);
 	list_add(&t->link, &as->tables);
 	as->nr_tables++;
+	if (user)
+		xa_store(&as->table_at[level], index, t, GFP_ATOMIC);
 	return 0;
+release:
+	if (user)
+		xa_release(&as->table_at[level], index);
+	return err;
 }
 
 /* A partial update drops the whole hardware large leaf. The unchanged
@@ -272,7 +290,7 @@ static int as_map_large(struct l4h_as *as, unsigned long va, unsigned long phys,
 {
 	unsigned long index = va >> PMD_SHIFT, pfn = phys >> PAGE_SHIFT, slot;
 	void *e = xa_load(&as->large, index);
-	struct table *t, *n;
+	struct table *t;
 	int err;
 
 	if (e && entry_pfn(e) == pfn) {
@@ -287,13 +305,12 @@ static int as_map_large(struct l4h_as *as, unsigned long va, unsigned long phys,
 	}
 	/* Removing the leaf table first flushes its 512 translations once.
 	 * seL4 rejects a large leaf while that table remains installed. */
-	list_for_each_entry_safe(t, n, &as->tables, link) {
-		if (t->level == 0 && t->base == va) {
-			list_del(&t->link);
-			l4h_obj_free(&t->obj);
-			kfree(t);
-			as->nr_tables--;
-		}
+	t = xa_erase(&as->table_at[0], va >> l4h_pt_level_shift[0]);
+	if (t) {
+		list_del(&t->link);
+		l4h_obj_free(&t->obj);
+		kfree(t);
+		as->nr_tables--;
 	}
 	as_unmap_range(as, va, va + PMD_SIZE);
 	slot = l4h_cap_copy(frame, L4H_RIGHTS_ALL);
@@ -336,6 +353,7 @@ static void as_reset(struct l4h_as *as, bool may_sleep)
 {
 	struct table *t, *n;
 	unsigned long vpn;
+	int level;
 	void *e;
 
 	list_for_each_entry_safe_reverse(t, n, &as->tables, link) {
@@ -343,6 +361,8 @@ static void as_reset(struct l4h_as *as, bool may_sleep)
 		l4h_obj_free(&t->obj);
 		kfree(t);
 	}
+	for (level = 0; level < L4H_NR_PT_LEVELS; level++)
+		xa_destroy(&as->table_at[level]);
 	as->nr_tables = 0;
 	/* Covered by those invalidations too. */
 	as->flush_pending = false;
