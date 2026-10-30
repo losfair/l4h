@@ -53,6 +53,9 @@ pub struct Blk {
     kick: Option<sel4::cap::Notification>,
     capacity: u64,
     read_only: bool,
+    /// Offer no flush: the guest treats the disk as write-through
+    /// (l4h_abi::BLK_VOLATILE).
+    volatile: bool,
     /// Logical block size of the disk: the guest aligns requests to it.
     block_size: u32,
     /// Largest data segment (see size_max).
@@ -77,7 +80,7 @@ impl Blk {
     /// every request locally with an I/O error, without touching hardware.
     pub fn unavailable(pool: u64) -> Self {
         Blk {
-            chan: core::ptr::null_mut(), kick: None, capacity: 0, read_only: true,
+            chan: core::ptr::null_mut(), kick: None, capacity: 0, read_only: true, volatile: false,
             block_size: 512, size_max: size_max(pool),
             inflight: [[None; QUEUE_SIZE as usize]; MAX_QUEUES], nr_queues: 1,
             outstanding: 0, generation: 0, stalled: [None; MAX_QUEUES],
@@ -89,11 +92,12 @@ impl Blk {
     /// pool.
     pub fn new(chan_va: usize, kick: sel4::cap::Notification, pool: u64) -> Self {
         let chan = chan_va as *mut Channel;
-        let (capacity, read_only, block_size) = unsafe {
+        let (capacity, read_only, volatile, block_size) = unsafe {
             fence(Ordering::Acquire);
             (
                 addr_of!((*chan).capacity_sectors).read_volatile(),
                 addr_of!((*chan).read_only).read_volatile() != 0,
+                addr_of!((*chan).volatile).read_volatile() != 0,
                 addr_of!((*chan).block_size).read_volatile().max(512),
             )
         };
@@ -102,6 +106,7 @@ impl Blk {
             kick: Some(kick),
             capacity,
             read_only,
+            volatile,
             block_size,
             size_max: size_max(pool).max(block_size),
             inflight: [[None; QUEUE_SIZE as usize]; MAX_QUEUES],
@@ -283,7 +288,8 @@ impl Backend for Blk {
     }
 
     fn features(&self) -> u64 {
-        let mut f = VIRTIO_BLK_F_SIZE_MAX | VIRTIO_BLK_F_SEG_MAX | VIRTIO_BLK_F_BLK_SIZE | VIRTIO_BLK_F_FLUSH | VIRTIO_RING_F_INDIRECT_DESC;
+        let mut f = VIRTIO_BLK_F_SIZE_MAX | VIRTIO_BLK_F_SEG_MAX | VIRTIO_BLK_F_BLK_SIZE | VIRTIO_RING_F_INDIRECT_DESC;
+        if !self.volatile { f |= VIRTIO_BLK_F_FLUSH; }
         if self.read_only { f |= VIRTIO_BLK_F_RO; }
         if !self.chan.is_null() { f |= VIRTIO_BLK_F_MQ; }
         f

@@ -69,7 +69,10 @@ pub struct Channel {
     pub ready: u32,
     /// Logical block size in bytes (512 or 4096); requests must be aligned.
     pub block_size: u32,
-    pub reserved: [u32; 11],
+    /// Written by l4h-root before BLKD_ADD: blkd completes flushes at once
+    /// and the VMM offers the guest none (l4h_abi::BLK_VOLATILE).
+    pub volatile: u32,
+    pub reserved: [u32; 10],
     /// Written by l4h-root before BLKD_ADD; copied into private driver state.
     pub lba_start: u64,
     pub pool: Pool,

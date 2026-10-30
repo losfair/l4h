@@ -234,7 +234,8 @@ impl Vmmgr {
 
     /// Pass host disk `disk` (or sectors [lba_start, lba_start + lba_count)
     /// of it; 0 = to the end) through to guest `id` before it starts.
-    pub fn attach_disk(&mut self, id: usize, disk: usize, read_only: bool, lba_start: u64, lba_count: u64) -> Result<(), i64> {
+    /// `flags`: abi::BLK_*.
+    pub fn attach_disk(&mut self, id: usize, disk: usize, flags: u64, lba_start: u64, lba_count: u64) -> Result<(), i64> {
         if !self.can_afford(1 << 20, 0, 0) { return Err(ctl::ENOMEM); }
         self.with_guest(id, |h, g| {
             if g.state != State::Created {
@@ -246,7 +247,7 @@ impl Vmmgr {
             // Root checks the window and the disk's other users, and makes
             // the channel; the device is added once it has.
             let d = g.devices.len();
-            let backend = root::disk_attach(&mut h.alloc, id, d, disk, read_only, lba_start, lba_count)?;
+            let backend = root::disk_attach(&mut h.alloc, id, d, disk, flags, lba_start, lba_count)?;
             let added = g.add_device(&mut h.alloc, guest::DevKind::Virtio(2));
             assert_eq!(added, Some(d), "guest device room checked");
             g.backends.must_push((d, backend));
@@ -483,7 +484,7 @@ pub fn boot_dom0(h: &mut Vmmgr) {
     // Root keeps every boot disk range reserved, even if its driver cannot
     // attach. Preserve the disk's position so later devices keep their names.
     for d in &h.cfg.dom0_disk[..h.cfg.dom0_disks as usize] {
-        if let Err(e) = h.attach_disk(id, d.disk as usize, false, d.start, d.sectors) {
+        if let Err(e) = h.attach_disk(id, d.disk as usize, 0, d.start, d.sectors) {
             l4h_rt::log!("l4h-vmmgr: disk {} window {}:{} unavailable to dom0: error {}; using zero-capacity device",
                 d.disk, d.start, d.sectors, e);
             h.attach_dummy_disk(id).expect("cannot create dom0 disk placeholder");

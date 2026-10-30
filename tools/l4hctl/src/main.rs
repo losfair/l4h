@@ -14,7 +14,7 @@ struct CreateOpts {
     vcpus: u64,
     initrd: Option<String>,
     cmdline: String,
-    disks: Vec<(u64, bool, u64, u64)>,
+    disks: Vec<(u64, u64, u64, u64)>,
     io_pool: u64,
     nics: Vec<(u64, u64, u64)>,
     gpu: Option<(u64, u64)>,
@@ -117,9 +117,10 @@ const USAGE: &str = "usage: l4hctl <command>
   disk-write DISK START FILE   seed an unattached region, then flush
   list (or vms)                VMs and their host seals
   create NAME [--initrd F] [--mem MB] [--vcpus N]
-         [--cmdline S] [--disk I[,ro][,start=SECTOR][,sectors=N]]...
+         [--cmdline S] [--disk I[,ro][,volatile][,start=SECTOR][,sectors=N]]...
                                create and start a VM, which runs the
-                               host's kernel; prints its id
+                               host's kernel; prints its id (volatile: the
+                               guest sees no write cache and never flushes)
          [--nic SWITCH[,mac=MAC][,nolock][,isolated]]...
          [--io-pool MB]        device I/O buffer pool (power of two, 1-256;
                                default 4, or room for the GPU's buffers)
@@ -362,14 +363,16 @@ fn run(args: &[String]) -> Result<i32> {
                     "--io-pool" => o.io_pool = parse_mib(&val()?)?,
                     "--cmdline" => o.cmdline = val()?,
                     "--disk" => {
-                        // DISK[,ro][,start=SECTOR][,sectors=N] (or DISK:ro)
+                        // DISK[,ro][,volatile][,start=SECTOR][,sectors=N] (or DISK:ro)
                         let v = val()?.replace(":ro", ",ro");
                         let mut it = v.split(',');
                         let d = parse_num(it.next().unwrap())?;
-                        let (mut ro, mut start, mut sectors) = (false, 0, 0);
+                        let (mut flags, mut start, mut sectors) = (0, 0, 0);
                         for opt in it {
                             if opt == "ro" {
-                                ro = true;
+                                flags |= BLK_RO;
+                            } else if opt == "volatile" {
+                                flags |= BLK_VOLATILE;
                             } else if let Some(n) = opt.strip_prefix("start=") {
                                 start = parse_num(n)?;
                             } else if let Some(n) = opt.strip_prefix("sectors=") {
@@ -378,7 +381,7 @@ fn run(args: &[String]) -> Result<i32> {
                                 return err(format!("--disk: unknown option {opt}"));
                             }
                         }
-                        o.disks.push((d, ro, start, sectors));
+                        o.disks.push((d, flags, start, sectors));
                     }
                     "--nic" => {
                         // SWITCH[,mac=MAC][,nolock][,isolated]

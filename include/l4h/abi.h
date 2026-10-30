@@ -489,8 +489,8 @@ enum l4h_ctl_op {
 	L4H_CTL_VM_DESTROY = 5,
 	/* args: first vm -> data: struct l4h_ctl_vm[], vals[0] = count */
 	L4H_CTL_VM_LIST = 6,
-	/* args: vm, disk index, read-only, first sector, sectors (0 = to the
-	 * end of the disk); sectors are 512 bytes */
+	/* args: vm, disk index, flags (L4H_BLK_*), first sector, sectors
+	 * (0 = to the end of the disk); sectors are 512 bytes */
 	L4H_CTL_BLK_ATTACH = 7,
 	/* args: vm, offset -> vals[0] = next offset, vals[1] = len,
 	 * vals[2] = bytes lost; data: console output */
@@ -594,6 +594,9 @@ enum l4h_ctl_op {
 
 #define L4H_NIC_NO_MAC_LOCK     (1ull << 0) /* allow any source MAC */
 #define L4H_NIC_ISOLATED        (1ull << 1) /* no frames to or from other isolated ports */
+
+#define L4H_BLK_RO              (1ull << 0) /* read-only */
+#define L4H_BLK_VOLATILE        (1ull << 1) /* no flush: the guest sees no write cache */
 
 struct l4h_ctl_port {
 	l4h_u32 vm;

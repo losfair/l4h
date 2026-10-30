@@ -151,7 +151,7 @@ impl Controller {
     pub fn reserve_dom0(&mut self, disk: usize, window: blk::DiskWindow, read_only: bool) {
         let i = attachment_slot(self.clients, disk, window, read_only, false)
             .expect("conflicting or excessive dom0 disk reservations");
-        self.clients[i] = Some(Attachment { vm: 0, disk, window, read_only, reserved: true, pool: None });
+        self.clients[i] = Some(Attachment { vm: 0, disk, window, read_only, volatile: false, reserved: true, pool: None });
     }
 
     /// Ask blkd about `unit`: (disk geometry, number of units), None if
@@ -229,6 +229,8 @@ pub struct Attachment {
     pub disk: usize,
     pub window: blk::DiskWindow,
     pub read_only: bool,
+    /// Flushes complete at once and the guest is offered none (abi::BLK_VOLATILE).
+    pub volatile: bool,
     /// A dom0 boot range survives failed attachment and dom0 restart.
     reserved: bool,
     /// The active client's I/O pool; None for an unattached reservation.
@@ -413,7 +415,7 @@ fn call(ep: cap::Endpoint, label: u64, args: &[u64]) -> u64 {
 /// l4h-vmm.
 #[allow(clippy::too_many_arguments)]
 pub fn attach(ctrl: &mut Controller, disk: usize, client: &mut RootGuest,
-    window: blk::DiskWindow, read_only: bool, alloc: &mut Alloc, iommu: &mut Iommu) -> (usize, Channel, cap::Notification) {
+    window: blk::DiskWindow, read_only: bool, volatile: bool, alloc: &mut Alloc, iommu: &mut Iommu) -> (usize, Channel, cap::Notification) {
     let i = attachment_slot(ctrl.clients, disk, window, read_only, client.dom0).expect("checked block client");
     let reserved = ctrl.clients[i].as_ref().is_some_and(|a| a.reserved);
     let driver = ctrl.driver.as_mut().expect("started blkd");
@@ -434,7 +436,7 @@ pub fn attach(ctrl: &mut Controller, disk: usize, client: &mut RootGuest,
     // Reads write the pool, writes read it.
     let pool = (client.pool.paddr, client.pool.size);
     iommu.map(alloc, ctrl.dom, pool.0, pool.1, true);
-    ctrl.clients[i] = Some(Attachment { vm: client.id, disk, window, read_only, reserved, pool: Some(pool) });
+    ctrl.clients[i] = Some(Attachment { vm: client.id, disk, window, read_only, volatile, reserved, pool: Some(pool) });
     (i, chan, kick)
 }
 
@@ -446,12 +448,13 @@ pub type Channel = l4h_host::fixed::ArrayVec<cap::Granule, { blk::CHANNEL_PAGES 
 pub fn activate(ctrl: &mut Controller, unit: u64, i: usize, client: &RootGuest, chan: &Channel, win: &mut Window,
     pci: &Pci) -> Result<(), i64> {
     let a = ctrl.clients[i].as_ref().unwrap();
-    let read_only = a.read_only;
+    let (read_only, volatile) = (a.read_only, a.volatile);
     win.with_frame(&abs_of(chan[0]), |p| unsafe {
         let c = p as *mut blk::Channel;
         core::ptr::addr_of_mut!((*c).capacity_sectors).write(a.window.sectors);
         core::ptr::addr_of_mut!((*c).lba_start).write(a.window.start);
         core::ptr::addr_of_mut!((*c).read_only).write(read_only as u32);
+        core::ptr::addr_of_mut!((*c).volatile).write(volatile as u32);
         core::ptr::addr_of_mut!((*c).pool).write(blk::Pool {
             gpa: client.pool.gpa as u64, paddr: client.pool.paddr as u64, size: client.pool.size as u64,
         });

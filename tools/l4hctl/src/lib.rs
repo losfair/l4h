@@ -31,6 +31,9 @@ pub const CTL_SWITCH_INFO: u32 = 14;
 pub const CTL_NIC_INFO: u32 = 15;
 pub const NIC_NO_MAC_LOCK: u64 = 1;
 pub const NIC_ISOLATED: u64 = 2;
+/// CTL_BLK_ATTACH flags.
+pub const BLK_RO: u64 = 1;
+pub const BLK_VOLATILE: u64 = 2;
 pub const CTL_VM_SET_SCHED: u32 = 16;
 pub const CTL_VM_INFO: u32 = 17;
 pub const CTL_VM_STATS: u32 = 18;
@@ -400,8 +403,8 @@ pub struct VmSpec<'a> {
     /// The initramfs (several concatenated archives are fine); may be empty.
     pub initrd: &'a [u8],
     pub cmdline: &'a str,
-    /// (disk, read-only, first sector, sectors)
-    pub disks: Vec<(u64, bool, u64, u64)>,
+    /// (disk, BLK_* flags, first sector, sectors)
+    pub disks: Vec<(u64, u64, u64, u64)>,
     /// I/O pool in bytes (0: default, 4 MiB; a power of two, 1-256 MiB).
     pub io_pool: u64,
     /// (switch, MAC or 0, NIC_* flags)
@@ -510,8 +513,8 @@ impl Ctl {
         let resp = self.call(CTL_VM_CREATE, &[o.mem, o.vcpus, 0, 0, io_pool], &name, &[])?;
         let (vm, initrd_gpa) = (resp.vals[0], resp.vals[1]);
         let r = (|| {
-            for &(disk, ro, start, sectors) in &o.disks {
-                self.call(CTL_BLK_ATTACH, &[vm, disk, ro as u64, start, sectors], &[], &[])?;
+            for &(disk, flags, start, sectors) in &o.disks {
+                self.call(CTL_BLK_ATTACH, &[vm, disk, flags, start, sectors], &[], &[])?;
             }
             let mut macs = Vec::new();
             for &(sw, mac, flags) in &o.nics {

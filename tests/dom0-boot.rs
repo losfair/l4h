@@ -57,8 +57,8 @@ impl Vmmgr {
         g.devices.push(());
         Ok(())
     }
-    fn attach_disk(&mut self, _: usize, disk: usize, ro: bool, start: u64, sectors: u64) -> Result<(), i64> {
-        assert!(!ro);
+    fn attach_disk(&mut self, _: usize, disk: usize, flags: u64, start: u64, sectors: u64) -> Result<(), i64> {
+        assert_eq!(flags, 0);
         let attempt = self.disk_attempts.len();
         self.disk_attempts.push((disk, start, sectors));
         if self.fail_disks.contains(&attempt) { return Err(5); }

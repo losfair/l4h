@@ -102,6 +102,8 @@ struct Client {
     pool: Pool,
     window: blk::DiskWindow,
     read_only: bool,
+    /// Flushes complete at once (l4h_abi::BLK_VOLATILE).
+    volatile: bool,
     done: sel4::cap::Notification,
     outstanding: usize,
 }
@@ -206,7 +208,7 @@ impl Blkd {
                     let result = c.prepare(&req, dev.block_size, &mut pieces).and_then(|sector| {
                         if req.op == blk::OP_FLUSH {
                             pieces.clear();
-                            if !dev.flush { return Err(blk::STATUS_OK); }
+                            if !dev.flush || c.volatile { return Err(blk::STATUS_OK); }
                         }
                         self.drv.start(tag as u64, c.unit, req.op, sector, &pieces)
                     });
@@ -326,15 +328,16 @@ fn main(info: &'static Info) -> ! {
                 if i >= blk::MAX_CLIENTS || b.clients[i].is_some() || unit >= b.dev.len() { u64::MAX } else {
                     let dev = b.dev[unit];
                     let chan = blk::channel_va(i) as *mut Channel;
-                    let (start, count, ro, pool) = unsafe {
+                    let (start, count, ro, volatile, pool) = unsafe {
                         (addr_of!((*chan).lba_start).read_volatile(), addr_of!((*chan).capacity_sectors).read_volatile(),
-                         addr_of!((*chan).read_only).read_volatile(), addr_of!((*chan).pool).read_volatile())
+                         addr_of!((*chan).read_only).read_volatile(), addr_of!((*chan).volatile).read_volatile() != 0,
+                         addr_of!((*chan).pool).read_volatile())
                     };
                     let read_only = ro != 0 || dev.read_only;
                     match blk::DiskWindow::new(start, count, dev.capacity) {
                         Some(window) if !b.clients.iter().flatten()
                             .any(|c| c.unit == unit && window.conflicts(read_only, c.window, c.read_only)) => {
-                            b.clients[i] = Some(Client { chan, unit, pool, window, read_only,
+                            b.clients[i] = Some(Client { chan, unit, pool, window, read_only, volatile,
                                 done: cap::<cap_type::Notification>(blk::BLKD_SLOT_CLIENT_DONE + i as u64), outstanding: 0 });
                             // Not attached yet, so not in active.
                             let _ = b.active.push(i);
