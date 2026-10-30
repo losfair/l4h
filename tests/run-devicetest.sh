@@ -40,6 +40,9 @@ reservations = blkd[blkd.index('pub const WINDOW_ALIGN:'):blkd.index('/// Mappin
 reservations += blkd[blkd.index('pub struct Attachment {'):blkd.index('struct Blkd {')]
 start = blkd.index('pub fn remove(')
 end = blkd.index('\n}', start) + 2
+reservations += blkd[start:end]
+start = blkd.index('pub fn activate(')
+end = blkd.index('\n}', start) + 2
 (out / 'blk-reservations.inc').write_text(reservations + blkd[start:end])
 PY
 cc -std=c11 -O2 -Wall -Wextra -Werror -I "$root/include" -I "$out" \

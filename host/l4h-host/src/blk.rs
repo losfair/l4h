@@ -107,7 +107,8 @@ pub const POOL_VA: usize = 0x4000_0000_0000;
 // frames: retained last-level tables must never block a later large map.
 pub const POOL_STRIDE: usize = 512 << 20;
 pub const FEATURE_AES: u64 = 1;
-pub const ENCRYPT: u64 = 1;
+/// BLKD_ADD flag; the same bit as l4h_abi::BLK_ENCRYPT.
+pub const ENCRYPT: u64 = 1 << 2;
 
 /// XTS requires distinct key halves. Inspect every byte without an
 /// early-exit comparison of secret data.
@@ -127,7 +128,7 @@ pub const fn pool_va(client: usize, size: usize) -> usize { POOL_VA + pool_offse
 /// unit -> capacity (u64::MAX if no such unit), block size, read-only,
 /// number of units, unit address (blkd_scsi_addr for virtio-scsi, else 0).
 pub const BLKD_INFO: u64 = 1;
-/// client, unit, flags, key[8] -> 0 or a positive errno.
+/// client, unit, flags, key[8] -> 0 or a positive errno, applied flags.
 /// The key is little-endian words; u64::MAX means a failed driver.
 pub const BLKD_ADD: u64 = 2;
 /// client -> 0, or u64::MAX if it did not drain

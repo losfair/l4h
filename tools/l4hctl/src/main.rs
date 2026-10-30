@@ -21,6 +21,24 @@ struct CreateOpts {
     gpu: Option<(u64, u64)>,
 }
 
+/// key-file is last: its entire remainder is a path, including commas.
+fn parse_disk(value: &str) -> Result<((u64, u64, u64, u64), Option<&str>)> {
+    let (options, key) = value.split_once(",key-file=").map_or((value, None), |(v, p)| (v, Some(p)));
+    let mut it = options.split(',');
+    let disk = it.next().unwrap();
+    let (disk, mut flags) = disk.strip_suffix(":ro").map_or((disk, 0), |d| (d, BLK_RO));
+    let disk = parse_num(disk)?;
+    let (mut start, mut sectors) = (0, 0);
+    for opt in it {
+        if opt == "ro" { flags |= BLK_RO; }
+        else if opt == "volatile" { flags |= BLK_VOLATILE; }
+        else if let Some(n) = opt.strip_prefix("start=") { start = parse_num(n)?; }
+        else if let Some(n) = opt.strip_prefix("sectors=") { sectors = parse_num(n)?; }
+        else { return err(format!("--disk: unknown option {opt}")); }
+    }
+    Ok(((disk, flags, start, sectors), key))
+}
+
 fn cmd_create(ctl: &Ctl, o: &CreateOpts) -> Result<u64> {
     let initrd = match &o.initrd {
         Some(p) => read_file(p)?,
@@ -390,27 +408,10 @@ fn run(args: &[String]) -> Result<i32> {
                     "--cmdline" => o.cmdline = val()?,
                     "--disk" => {
                         // DISK[,ro][,volatile][,start=SECTOR][,sectors=N][,key-file=FILE] (or DISK:ro)
-                        let v = val()?.replace(":ro", ",ro");
-                        let mut it = v.split(',');
-                        let d = parse_num(it.next().unwrap())?;
-                        let (mut flags, mut start, mut sectors, mut key) = (0, 0, 0, None);
-                        for opt in it {
-                            if opt == "ro" {
-                                flags |= BLK_RO;
-                            } else if opt == "volatile" {
-                                flags |= BLK_VOLATILE;
-                            } else if let Some(n) = opt.strip_prefix("start=") {
-                                start = parse_num(n)?;
-                            } else if let Some(n) = opt.strip_prefix("sectors=") {
-                                sectors = parse_num(n)?;
-                            } else if let Some(path) = opt.strip_prefix("key-file=") {
-                                key = Some(DiskKey::read(path)?);
-                            } else {
-                                return err(format!("--disk: unknown option {opt}"));
-                            }
-                        }
-                        o.disks.push((d, flags, start, sectors));
-                        o.disk_keys.push(key);
+                        let v = val()?;
+                        let (disk, key) = parse_disk(&v)?;
+                        o.disks.push(disk);
+                        o.disk_keys.push(key.map(DiskKey::read).transpose()?);
                     }
                     "--key-file" => {
                         let key = o.disk_keys.last_mut().ok_or(Error("--key-file must follow --disk".into()))?;
@@ -673,5 +674,22 @@ fn main() {
             eprintln!("l4hctl: {e}");
             exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disk_key_paths_are_not_options_or_read_only_suffixes() {
+        for path in ["/keys/a:root.key", "/keys/a,b.key", "/keys/a:ro", "/keys/a,key-file=b,ro"] {
+            let value = format!("1:ro,start=8,sectors=16,key-file={path}");
+            assert_eq!(parse_disk(&value).unwrap(), ((1, BLK_RO, 8, 16), Some(path)));
+        }
+        assert_eq!(parse_disk("2,ro,start=8").unwrap(), ((2, BLK_RO, 8, 0), None));
+        assert_eq!(parse_disk("2:ro").unwrap(), ((2, BLK_RO, 0, 0), None));
+        assert!(parse_disk("2:root").is_err());
+        assert!(parse_disk("2,start=8,unknown=1").is_err());
     }
 }

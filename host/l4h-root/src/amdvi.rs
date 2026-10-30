@@ -140,7 +140,7 @@ struct Unity {
     last: u16,
     start: usize,
     end: usize,
-    write: bool,
+    access: Access,
 }
 
 impl Unity {
@@ -393,7 +393,8 @@ impl AmdVi {
                     };
                     let (start, len) = (u64_at(b, 16) as usize, u64_at(b, 24) as usize);
                     let end = start.checked_add(len)?.next_multiple_of(PAGE);
-                    let u = Unity { first, last, start: start & !(PAGE - 1), end, write: write || exclusion };
+                    let u = Unity { first, last, start: start & !(PAGE - 1), end,
+                        access: if write || exclusion { Access::ReadWrite } else { Access::Read } };
                     info!("l4h-root: iommu: unity range {:#x}..{:#x} for devices {:#06x}..={:#06x}", u.start, u.end, first, last);
                     if self.unity.push(u).is_err() {
                         log!("l4h-root: iommu: more than {} unity ranges", MAX_UNITY);
@@ -556,7 +557,7 @@ impl AmdVi {
                         self.shared = Some(d);
                     }
                     if !given.contains(&d.id) {
-                        self.map_range(phys.alloc, d, u.start, u.end - u.start, if u.write { Access::ReadWrite } else { Access::Read });
+                        self.map_range(phys.alloc, d, u.start, u.end - u.start, u.access);
                         let _ = given.push(d.id);
                     }
                     self.set_dte(id, d);
@@ -576,7 +577,7 @@ impl AmdVi {
         for i in 0..self.unity.len() {
             let u = self.unity[i];
             if which(&u) {
-                self.map_range(alloc, d, u.start, u.end - u.start, if u.write { Access::ReadWrite } else { Access::Read });
+                self.map_range(alloc, d, u.start, u.end - u.start, u.access);
             }
         }
         d
@@ -590,7 +591,7 @@ impl AmdVi {
         for i in 0..self.unity.len() {
             let u = self.unity[i];
             if u.covers_group(alias, self.dev.as_ref().unwrap()) {
-                self.map_range(alloc, d, u.start, u.end - u.start, if u.write { Access::ReadWrite } else { Access::Read });
+                self.map_range(alloc, d, u.start, u.end - u.start, u.access);
             }
         }
         if self.intremap {

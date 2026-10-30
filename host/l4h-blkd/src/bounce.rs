@@ -1,7 +1,8 @@
 //! First-fit contiguous runs in the controller's fixed 4 MiB write area.
 //! A run stays owned until the hardware completes the request.
 const PAGE: usize = 4096;
-pub const SIZE: usize = 4 << 20;
+pub const SIZE: usize = crate::blk::BOUNCE_SIZE;
+const _: () = assert!(crate::blk::MAX_REQUEST_BYTES <= SIZE as u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Run { first: u16, pages: u16 }
 impl Run { pub fn offset(self) -> usize { self.first as usize * PAGE } }

@@ -60,3 +60,7 @@ impl Xts {
 }
 
 impl Drop for Xts { fn drop(&mut self) { self.clear(); } }
+
+#[cfg(all(test, target_arch = "aarch64"))]
+#[path = "../../../tests/blk-crypt-arm.rs"]
+mod arm_tests;

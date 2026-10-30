@@ -131,6 +131,9 @@ struct Blkd {
     /// Indices of the attached clients, in attach order: the submit loop
     /// visits only these.
     active: ArrayVec<usize, { blk::MAX_CLIENTS }>,
+    /// FIFO of clients waiting for write space. Only its head may
+    /// allocate, so smaller writes cannot continually fragment the area.
+    waiting: ArrayVec<usize, { blk::MAX_CLIENTS }>,
     // Tags are allocated here, never taken from a client. Slots are not
     // reusable until the hardware has completed every command of a request.
     pending: &'static mut [Option<Pending>; MAX_INFLIGHT],
@@ -198,12 +201,16 @@ impl Blkd {
     fn submit(&mut self) {
         let mut pieces = ArrayVec::new();
         let mut started = false;
+        // No completions are reaped inside this pass, so a failed
+        // allocation cannot succeed until the next submit call.
+        let mut no_space = [false; blk::MAX_CLIENTS];
         // Bounded work per client and round-robin starting point. A busy
         // ring cannot occupy every hardware slot before others get a turn.
         let n = self.active.len();
         for _round in 0..blk::RING_SIZE / 4 {
             for off in 0..n {
                 let i = self.active[(self.next + off) % n];
+                if no_space[i] { continue; }
                 let Some(c) = self.clients[i].as_mut() else { continue };
                 for _ in 0..4 {
                     if !self.drv.can_start() { break; }
@@ -215,7 +222,12 @@ impl Blkd {
                             .wrapping_sub(addr_of!((*c.chan).cq.tail).read_volatile()) as usize;
                         // Reserve completion space for every in-flight request.
                         if head == tail || head.wrapping_sub(tail) as usize > blk::RING_SIZE
-                            || cq_used.saturating_add(c.outstanding) >= blk::RING_SIZE { break; }
+                            || cq_used.saturating_add(c.outstanding) >= blk::RING_SIZE {
+                            // A withdrawn request or a client that stops
+                            // draining its CQ must not block other writers.
+                            self.waiting.retain(|&w| w != i);
+                            break;
+                        }
                         fence(Ordering::Acquire);
                         let req = addr_of!((*c.chan).reqs[tail as usize % blk::RING_SIZE]).read_volatile();
                         (tail, req)
@@ -230,8 +242,14 @@ impl Blkd {
                         }
                         if req.op == blk::OP_WRITE {
                             let bytes: usize = pieces.iter().map(|s| s.len as usize).sum();
-                            if bytes > bounce::SIZE { return Err(blk::STATUS_IOERR); }
+                            if self.waiting.first().is_some_and(|&w| w != i) {
+                                if !self.waiting.contains(&i) { self.waiting.must_push(i); }
+                                deferred = true;
+                                return Err(blk::STATUS_OK);
+                            }
                             let Some(r) = self.bounce.alloc(bytes) else {
+                                if self.waiting.is_empty() { self.waiting.must_push(i); }
+                                no_space[i] = true;
                                 deferred = true;
                                 return Err(blk::STATUS_OK);
                             };
@@ -242,14 +260,15 @@ impl Blkd {
                                 if c.encrypted { data.crypt(&c.keys, req.sector / 8, Some(dst)); }
                                 else { data.copy_to(dst); }
                             }
-                            let mut pa = self.cfg.bounce_paddr + r.offset() as u64;
-                            for piece in pieces.iter_mut() { piece.pa = pa; pa += piece.len as u64; }
+                            pieces.clear();
+                            pieces.must_push(Seg { pa: self.cfg.bounce_paddr + r.offset() as u64, len: bytes as u32 });
                         }
                         self.drv.start(tag as u64, c.unit, req.op, sector, &pieces)
                     });
                     // Do not consume a write until a contiguous run is
                     // available. Other clients' reads/flushes still run.
                     if deferred { break; }
+                    self.waiting.retain(|&w| w != i);
                     unsafe { addr_of_mut!((*c.chan).sq.tail).write_volatile(tail.wrapping_add(1)); }
                     match result {
                         Ok(()) => {
@@ -313,6 +332,7 @@ impl Blkd {
 
     fn remove(&mut self, i: usize) -> u64 {
         if i >= self.clients.len() { return u64::MAX; }
+        self.waiting.retain(|&w| w != i);
         // Stop consuming this channel first. Polling the hardware drains
         // only submitted work; no controller reset disrupts other clients.
         let end = self.deadline();
@@ -359,7 +379,6 @@ fn set_mr(i: usize, v: u64) { sel4::with_ipc_buffer_mut(|b| b.msg_regs_mut()[i] 
 fn main(info: &'static Info) -> ! {
     let cfg: &BlkdConfig = unsafe { info.config() };
     let id = info.header().id;
-    assert_eq!(cfg.bounce_size as usize, bounce::SIZE);
     let drv = match cfg.kind {
         blk::BLKD_NVME => Drv::Nvme(nvme::Nvme::new(id, cfg)),
         blk::BLKD_VIRTIO_SCSI => Drv::Scsi(scsi::VirtioScsi::new(id, cfg)),
@@ -377,6 +396,7 @@ fn main(info: &'static Info) -> ! {
         // The only reference to CLIENTS.
         clients: unsafe { &mut *addr_of_mut!(CLIENTS) },
         active: ArrayVec::new(),
+        waiting: ArrayVec::new(),
         pending: unsafe { &mut *addr_of_mut!(PENDING) },
         bounce: bounce::Bounce::new(), cfg,
         drv, dev, next: 0, ticks_per_sec: info.header().tsc_hz,
@@ -414,6 +434,9 @@ fn main(info: &'static Info) -> ! {
                 // Clear incoming key words before any other IPC can use them.
                 for n in 0..11 { set_mr(n, 0); }
                 let result = b.add(i, unit, flags, &key, msg.length());
+                if result == 0 {
+                    response[1] = if b.clients[i].as_ref().unwrap().encrypted { blk::ENCRYPT } else { 0 };
+                }
                 for byte in &mut key { unsafe { core::ptr::write_volatile(byte, 0); } }
                 if result == 0 && flags & blk::ENCRYPT != 0 {
                     l4h_rt::info!("blkd {:#x}: unit {} client {}: aes-256-xts ({})", id, unit, i, crypt::BACKEND);

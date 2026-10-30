@@ -1317,6 +1317,8 @@ whose suboptions are:
     The file must contain exactly 64 raw bytes (the data key followed by
     the tweak key). Keys are never command-line values. Alternatively,
     put \texttt{--key-file FILE} after its \texttt{--disk} argument.
+    The \texttt{key-file=} suboption must be last: its remaining text,
+    including commas and \texttt{:ro}, is the file path.
   \item[\texttt{ro}] The guest may read but not write; writes fail with an
     I/O error. \texttt{DISK:ro} is accepted too.
   \item[\texttt{volatile}] The guest is offered no cache flush: Linux
@@ -1429,6 +1431,8 @@ writes are encrypted into this buffer, and encrypted reads are decrypted
 in place before completion. The guest kernel also copies between its RAM
 and the pool with swiotlb. Each controller reserves 4 MiB for bounced
 writes at boot; a write waits in its queue when no contiguous run fits.
+Waiting writers get FIFO priority so that smaller writes cannot keep
+a larger request waiting indefinitely.
 Reads and flushes from other clients can still proceed.
 
 Flushes reach the device, so filesystems keep their crash-consistency

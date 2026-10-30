@@ -56,6 +56,7 @@ for bad in '0,ro,start=2048,sectors=16384,key-file=/tmp/wrong' \
     grep -q busy /tmp/error || { cat /tmp/error; fail shared-key-error; }
 done
 if l4hctl disk-zero 0 2048 8 2>/tmp/error; then fail live-provision; fi
+crypt-attach-test || fail rejected-attach-reclaim
 l4hctl destroy "$a"; l4hctl destroy "$b"
 # Destroy with repeated encrypted I/O, then reuse the same slots and pool.
 a=$(create "$enc" hammer) || fail hammer

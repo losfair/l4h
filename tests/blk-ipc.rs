@@ -98,14 +98,19 @@ mod production {
         unsafe { CLIENTS = [const { None }; blk::MAX_CLIENTS]; PENDING = [None; MAX_INFLIGHT]; }
         main(info)
     }
-    pub fn pipeline(info: &'static crate::Info) {
+    fn service(info: &'static crate::Info) -> Blkd {
         unsafe { CLIENTS = [const { None }; blk::MAX_CLIENTS]; PENDING = [None; MAX_INFLIGHT]; }
         let cfg = &info.config;
         let drv = crate::MockDriver::new(1, cfg);
         let dev = [drv.info(0)].into_iter().collect();
-        let mut b = Blkd { clients: unsafe { &mut *addr_of_mut!(CLIENTS) },
-            pending: unsafe { &mut *addr_of_mut!(PENDING) }, active: ArrayVec::new(),
-            bounce: bounce::Bounce::new(), cfg, drv: Drv::Virtio(drv), dev, next: 0, ticks_per_sec: 1_000_000_000 };
+        Blkd { clients: unsafe { &mut *addr_of_mut!(CLIENTS) },
+            pending: unsafe { &mut *addr_of_mut!(PENDING) }, active: ArrayVec::new(), waiting: ArrayVec::new(),
+            bounce: bounce::Bounce::new(), cfg, drv: Drv::Virtio(drv), dev, next: 0, ticks_per_sec: 1_000_000_000 }
+    }
+
+    pub fn pipeline(info: &'static crate::Info) {
+        let mut b = service(info);
+        let cfg = b.cfg;
         let key = core::array::from_fn(|i| i as u8);
         assert_eq!(b.add(0, 0, blk::ENCRYPT, &key, 11), 0);
         assert_eq!(b.add(1, 0, 0, &[0; 64], 11), 0);
@@ -166,6 +171,125 @@ mod production {
         assert!(snapshot.iter().all(|&b| b == 0x3c), "guest mutation must not reach an in-flight plain write");
         drv.completed.push((*tag, blk::STATUS_OK));
         b.reap();
+        assert_eq!(b.remove(0), 0);
+    }
+
+    pub fn split_writes(info: &'static crate::Info) {
+        let mut b = service(info);
+        b.dev[0].block_size = 4096;
+        let key = core::array::from_fn(|i| i as u8);
+        for flags in [0, blk::ENCRYPT] {
+            if flags != 0 && !std::is_x86_feature_detected!("aes") { continue; }
+            assert_eq!(b.add(0, 0, flags, &key, 11), 0);
+            for lengths in [&[512, 3584][..], &[1, 4095], &[4095, 1], &[1, 4094, 1]] {
+                let mut plain = Vec::new();
+                unsafe {
+                    let c = &mut *crate::channel();
+                    let mut req = blk::Req { op: blk::OP_WRITE, nr_segs: lengths.len() as u32, ..Default::default() };
+                    for (i, &len) in lengths.iter().enumerate() {
+                        req.segs[i] = blk::Seg { gpa: (i * 4096) as u64, len, flags: 0 };
+                        let byte = 0x40 + i as u8;
+                        core::ptr::write_bytes((blk::pool_va(0, 4 << 20) + i * 4096) as *mut u8, byte, len as usize);
+                        plain.extend(core::iter::repeat_n(byte, len as usize));
+                    }
+                    c.reqs[c.sq.head as usize % blk::RING_SIZE] = req;
+                    c.sq.head += 1;
+                }
+                b.submit();
+                let Drv::Virtio(drv) = &mut b.drv else { unreachable!() };
+                let (tag, op, sector, segs) = drv.commands.last().unwrap();
+                assert_eq!((*op, *sector), (blk::OP_WRITE, 16));
+                assert_eq!(segs.len(), 1, "packed writes must not become sub-LBA NVMe commands");
+                assert_eq!((segs[0].pa, segs[0].len), (b.cfg.bounce_paddr, 4096));
+                let source = b.cfg.bounce_va as *const u8;
+                let mut actual = [0; 4096];
+                unsafe {
+                    if flags != 0 { b.clients[0].as_ref().unwrap().keys.decrypt(source, actual.as_mut_ptr(), 0); }
+                    else { core::ptr::copy_nonoverlapping(source, actual.as_mut_ptr(), 4096); }
+                }
+                assert_eq!(actual.as_slice(), plain);
+                drv.completed.push((*tag, blk::STATUS_OK));
+                b.reap();
+            }
+            assert_eq!(b.remove(0), 0);
+        }
+    }
+
+    fn enqueue(i: usize, op: u32, bytes: u32) {
+        unsafe {
+            let c = &mut *(blk::channel_va(i) as *mut Channel);
+            let mut req = blk::Req { op, nr_segs: if op == blk::OP_FLUSH { 0 } else { 1 }, ..Default::default() };
+            req.segs[0] = blk::Seg { gpa: 0, len: bytes, flags: if op == blk::OP_READ { blk::SEG_WRITE } else { 0 } };
+            c.reqs[c.sq.head as usize % blk::RING_SIZE] = req;
+            c.sq.head += 1;
+            c.cq.tail = c.cq.head;
+        }
+    }
+
+    pub fn fair_writes(info: &'static crate::Info) {
+        let mut b = service(info);
+        for i in 0..4 { assert_eq!(b.add(i, 0, 0, &[0; 64], 11), 0); }
+        for _ in 0..8 { enqueue(1, blk::OP_WRITE, 256 << 10); enqueue(2, blk::OP_WRITE, 256 << 10); }
+        b.submit(); // Small writes occupy all 4 MiB.
+        enqueue(0, blk::OP_WRITE, 14 * 256 * 1024);
+        enqueue(0, blk::OP_WRITE, 14 * 256 * 1024);
+        enqueue(1, blk::OP_WRITE, 256 << 10);
+        enqueue(2, blk::OP_WRITE, 256 << 10);
+        enqueue(3, blk::OP_READ, 4096);
+        enqueue(3, blk::OP_FLUSH, 0);
+        b.next = 0;
+        b.submit();
+        assert_eq!(&*b.waiting, [0, 1, 2]);
+        let Drv::Virtio(drv) = &b.drv else { unreachable!() };
+        assert_eq!(drv.commands.len(), 18, "reads and flushes must bypass waiting writers");
+        let old: Vec<_> = drv.commands[..16].iter().map(|c| c.0).collect();
+        for (n, &tag) in old[..14].iter().enumerate() {
+            let Drv::Virtio(drv) = &mut b.drv else { unreachable!() };
+            drv.completed.push((tag, blk::STATUS_OK));
+            b.reap(); b.submit();
+            let Drv::Virtio(drv) = &b.drv else { unreachable!() };
+            assert_eq!(drv.commands.len(), if n == 13 { 19 } else { 18 },
+                "small writes must not keep consuming the space the oldest writer needs");
+        }
+        let Drv::Virtio(drv) = &mut b.drv else { unreachable!() };
+        assert_eq!(drv.commands[18].2, 16, "the large write must run first");
+        assert_eq!(&*b.waiting, [1, 2, 0], "a second large write joins the back of the queue");
+        drv.completed.push((drv.commands[18].0, blk::STATUS_OK));
+        b.reap(); b.submit();
+        let Drv::Virtio(drv) = &b.drv else { unreachable!() };
+        assert_eq!(drv.commands.len(), 21);
+        let sectors: Vec<_> = drv.commands[19..].iter().map(|c| c.2).collect();
+        assert_eq!(sectors, [16384, 32768], "both smaller waiters run before another large write");
+        assert_eq!(&*b.waiting, [0]);
+        assert_eq!(b.remove(0), 0); // A destroyed waiter cannot keep reserving space.
+        enqueue(1, blk::OP_WRITE, 256 << 10);
+        b.submit();
+        assert!(b.waiting.is_empty());
+        let Drv::Virtio(drv) = &b.drv else { unreachable!() };
+        assert_eq!(drv.commands.len(), 22);
+    }
+
+    pub fn abandoned_waiter(info: &'static crate::Info) {
+        let mut b = service(info);
+        for i in 0..3 { assert_eq!(b.add(i, 0, 0, &[0; 64], 11), 0); }
+        for _ in 0..4 { enqueue(2, blk::OP_WRITE, 256 << 10); }
+        b.submit(); // 1 MiB in flight prevents a 3.5 MiB allocation.
+        for withdrawn in [true, false] {
+            enqueue(0, blk::OP_WRITE, 14 * 256 * 1024);
+            enqueue(1, blk::OP_WRITE, 256 << 10);
+            b.next = 0;
+            b.submit();
+            assert_eq!(&*b.waiting, [0, 1]);
+            unsafe {
+                let c = &mut *crate::channel();
+                if withdrawn { c.sq.head = c.sq.tail; }
+                else { c.cq.head = blk::RING_SIZE as u32; }
+            }
+            b.submit();
+            assert!(b.waiting.is_empty(), "an ineligible waiter cannot reserve space indefinitely");
+        }
+        let Drv::Virtio(drv) = &b.drv else { unreachable!() };
+        assert_eq!(drv.commands.len(), 6, "both smaller writes made progress");
         assert_eq!(b.remove(0), 0);
     }
 
@@ -243,7 +367,7 @@ unsafe extern "C" {
 }
 fn channel() -> *mut Channel { blk::channel_va(0) as *mut Channel }
 
-fn run(kind: u32, legacy: bool, label: u64, pending_io: bool, retry: bool, status: u32) -> [u64; 5] {
+fn run(kind: u32, legacy: bool, label: u64, pending_io: bool, retry: bool, status: u32, flags: u64) -> [u64; 5] {
     let _lock = LOCK.lock().unwrap();
     let len = blk::CHANNEL_PAGES * 4096;
     // MAP_FIXED_NOREPLACE: never overwrite an unrelated mapping.
@@ -252,11 +376,14 @@ fn run(kind: u32, legacy: bool, label: u64, pending_io: bool, retry: bool, statu
         (*channel()).capacity_sectors = 8;
         (*channel()).pool = blk::Pool { gpa: 0x8000000, paddr: 0x10000000, size: 4096 };
         (*channel()).reqs[0] = blk::Req { op: blk::OP_READ, nr_segs: 1, ..Default::default() };
-        (*channel()).reqs[0].segs[0] = blk::Seg { gpa: 0x8000000, len: 512, flags: blk::SEG_WRITE };
+        (*channel()).reqs[0].segs[0] = blk::Seg { gpa: 0x8000000, len: if flags == 0 { 512 } else { 4096 }, flags: blk::SEG_WRITE };
     }
     KERNEL.with_borrow_mut(|k| {
         k.ipc.0.fill(0);
-        k.requests = [(blk::BLKD_ADD, vec![0; 11], false), (label, vec![0; 3], pending_io)].into();
+        let mut add = vec![0; 11];
+        add[2] = flags;
+        for i in 0..8 { add[3 + i] = i as u64; }
+        k.requests = [(blk::BLKD_ADD, add, pending_io), (label, vec![0; 3], pending_io)].into();
         k.replies.clear();
         k.retry = retry;
         k.status = status;
@@ -265,6 +392,7 @@ fn run(kind: u32, legacy: bool, label: u64, pending_io: bool, retry: bool, statu
     // BlkdConfig consists entirely of integer fields.
     let mut config: BlkdConfig = unsafe { core::mem::zeroed() };
     config.bounce_size = blk::BOUNCE_SIZE as u64;
+    config.features = blk::FEATURE_AES;
     config.kind = kind;
     config.legacy_io = if legacy { 0xc000 } else { 0 };
     let info = Box::leak(Box::new(Info { header: Header { id: 1, tsc_hz: 1_000_000_000 }, config }));
@@ -274,6 +402,7 @@ fn run(kind: u32, legacy: bool, label: u64, pending_io: bool, retry: bool, statu
     KERNEL.with_borrow(|k| {
         assert_eq!(k.replies.len(), 2);
         assert_eq!(k.replies[0][0], 0, "client must attach successfully");
+        assert_eq!(k.replies[0][1], flags, "applied flags must survive nested IPC while submitting work");
         assert!(k.kicks > 0, "the clobbering driver path must run");
         k.replies[1]
     })
@@ -283,7 +412,7 @@ fn run(kind: u32, legacy: bool, label: u64, pending_io: bool, retry: bool, statu
 fn disk_info_survives_pending_io() {
     for kind in [blk::BLKD_VIRTIO, blk::BLKD_VIRTIO_SCSI] {
         for legacy in [false, true] {
-            assert_eq!(run(kind, legacy, blk::BLKD_INFO, true, false, 0), [131072, 512, 0, 1, 0x301]);
+            assert_eq!(run(kind, legacy, blk::BLKD_INFO, true, false, 0, 0), [131072, 512, 0, 1, 0x301]);
         }
     }
 }
@@ -291,37 +420,63 @@ fn disk_info_survives_pending_io() {
 #[test]
 fn service_status_survives_pending_io() {
     for kind in [blk::BLKD_VIRTIO, blk::BLKD_VIRTIO_SCSI] {
-        assert_eq!(run(kind, true, blk::BLKD_FLUSH, true, false, 0)[0], 0);
-        assert_eq!(run(kind, true, u64::MAX, true, false, 0)[0], u64::MAX);
+        assert_eq!(run(kind, true, blk::BLKD_FLUSH, true, false, 0, 0)[0], 0);
+        assert_eq!(run(kind, true, u64::MAX, true, false, 0, 0)[0], u64::MAX);
     }
 }
 
 #[test]
 fn provisioning_status_survives_scsi_retry() {
     for status in [blk::STATUS_OK, blk::STATUS_IOERR] {
-        assert_eq!(run(blk::BLKD_VIRTIO_SCSI, true, blk::BLKD_FLUSH, false, true, status)[0], status as u64);
+        assert_eq!(run(blk::BLKD_VIRTIO_SCSI, true, blk::BLKD_FLUSH, false, true, status, 0)[0], status as u64);
     }
 }
 
 #[test]
 fn production_bounce_defer_completion_errors_and_reuse() {
     if !std::is_x86_feature_detected!("aes") { eprintln!("SKIP: no AES-NI"); return; }
+    with_pools(2, |info| {
+        for i in 0..2 {
+            unsafe {
+                let c = &mut *(blk::channel_va(i) as *mut Channel);
+                c.reqs[0] = blk::Req { op: if i == 0 { blk::OP_WRITE } else { blk::OP_READ }, nr_segs: 1, ..Default::default() };
+                c.reqs[0].segs[0] = blk::Seg { gpa: 0, len: if i == 0 { 14 * 256 * 1024 } else { 4096 }, flags: if i == 0 { 0 } else { blk::SEG_WRITE } };
+                c.reqs[1] = if i == 0 { c.reqs[0] } else { blk::Req { op: blk::OP_FLUSH, ..Default::default() } };
+                c.sq.head = 2;
+            }
+        }
+        production::pipeline(info);
+    });
+}
+
+#[test]
+fn sub_block_segments_pack_into_one_aligned_4kn_write() { with_pools(1, production::split_writes); }
+
+#[test]
+fn deferred_writers_get_fifo_priority_while_reads_and_flushes_run() { with_pools(4, production::fair_writes); }
+
+#[test]
+fn withdrawn_or_cq_blocked_waiters_do_not_block_other_writers() { with_pools(3, production::abandoned_waiter); }
+
+#[test]
+fn applied_encryption_flags_survive_legacy_driver_ipc() {
+    if !std::is_x86_feature_detected!("aes") { return; }
+    run(blk::BLKD_VIRTIO_SCSI, true, blk::BLKD_INFO, true, false, 0, blk::ENCRYPT);
+}
+
+fn with_pools(clients: usize, test: impl FnOnce(&'static Info)) {
     let _lock = LOCK.lock().unwrap();
     let mut mappings = Vec::new();
-    for i in 0..2 {
+    for i in 0..clients {
         for (va, len) in [(blk::channel_va(i), blk::CHANNEL_PAGES * 4096), (blk::pool_va(i, 4 << 20), 4 << 20)] {
             assert_eq!(unsafe { mmap(va, len, 3, 0x100022, -1, 0) }, va);
             mappings.push((va, len));
         }
         unsafe {
             let c = &mut *(blk::channel_va(i) as *mut Channel);
-            c.lba_start = if i == 0 { 16 } else { 16384 };
+            c.lba_start = if i == 0 { 16 } else { i as u64 * 16384 };
             c.capacity_sectors = 8192;
             c.pool = blk::Pool { gpa: 0, paddr: 0x10000000 + i as u64 * (4 << 20), size: 4 << 20 };
-            c.reqs[0] = blk::Req { op: if i == 0 { blk::OP_WRITE } else { blk::OP_READ }, nr_segs: 1, ..Default::default() };
-            c.reqs[0].segs[0] = blk::Seg { gpa: 0, len: if i == 0 { 14 * 256 * 1024 } else { 4096 }, flags: if i == 0 { 0 } else { blk::SEG_WRITE } };
-            c.reqs[1] = if i == 0 { c.reqs[0] } else { blk::Req { op: blk::OP_FLUSH, ..Default::default() } };
-            c.sq.head = 2;
             core::ptr::write_bytes(blk::pool_va(i, 4 << 20) as *mut u8, 0x5a, 4 << 20);
         }
     }
@@ -334,6 +489,6 @@ fn production_bounce_defer_completion_errors_and_reuse() {
     config.bounce_paddr = 0x20000000;
     config.bounce_size = blk::BOUNCE_SIZE as u64;
     let info = Box::leak(Box::new(Info { header: Header { id: 1, tsc_hz: 1_000_000_000 }, config }));
-    production::pipeline(info);
+    test(info);
     for (va, len) in mappings { assert_eq!(unsafe { munmap(va, len) }, 0); }
 }

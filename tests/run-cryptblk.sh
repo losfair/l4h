@@ -17,6 +17,12 @@ else
 fi
 "$root/tools/build-l4hctl.sh"
 "$l4h_cc" -O2 -static -Wall -Wextra -Werror "$root/tests/guest/cryptblk.c" -o "$out/cryptblk"
+rust_args=()
+if [ "${L4H_ARCH:-x86_64}" = aarch64 ]; then
+    rust_args=(--target aarch64-unknown-linux-gnu -C linker=aarch64-linux-gnu-gcc)
+fi
+rustc +stable --edition=2024 -O -C target-feature=+crt-static "${rust_args[@]}" \
+    "$root/tests/guest/crypt-attach.rs" -o "$out/crypt-attach-test"
 python3 - "$out" <<'PY'
 from pathlib import Path
 import sys
@@ -26,7 +32,7 @@ out = Path(sys.argv[1])
 PY
 "$root/tools/mkinitramfs.sh" "$out/cryptblkvm.cpio.gz" "$root/tests/guest/init-cryptblkvm" "$out/cryptblk" >/dev/null
 "$root/tools/mkinitramfs.sh" "$out/dom0.cpio.gz" "$root/tests/guest/init-cryptblk" \
-    "$l4h_ctl" "$out/cryptblkvm.cpio.gz" "$out/cryptblk.key" "$out/cryptblk-wrong.key" >/dev/null
+    "$l4h_ctl" "$out/cryptblkvm.cpio.gz" "$out/cryptblk.key" "$out/cryptblk-wrong.key" "$out/crypt-attach-test" >/dev/null
 export L4H_GUEST_KERNEL="$out/vmlinux" L4H_DOM0_INITRD="$out/dom0.cpio.gz" L4H_GUEST_KMODS=
 cmdline='console=hvc0'
 if [ "${CRYPTBLK_NOAES:-0}" = 1 ]; then

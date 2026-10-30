@@ -506,25 +506,33 @@ fn disk_attach(h: &mut Host, a: [u64; 8], key: &[u8; 64]) -> Result<Vals, i64> {
         if g.disks.is_full() {
             return Err(ctl::ENOSPC);
         }
-        let (client, chan, kick) = crate::blkd::attach(&mut h.ctrls[c], disk, g, window, read_only, volatile, encrypted, &mut h.alloc, &mut h.iommu);
+        let (client, chan, kick) = crate::blkd::attach(&mut h.ctrls[c], disk, g, window, read_only, volatile, encrypted, &mut h.alloc, &mut h.iommu)?;
         g.disks.must_push((c, client));
-        if let Err(e) = crate::blkd::activate(&mut h.ctrls[c], unit, client, g, &chan, &mut h.wins.a, &h.pci, key) {
-            abs_of(kick).delete().expect("drop unused blkd kick");
-            h.alloc.slots.free(kick.bits() as Slot);
-            // Rejected shared-key/flag checks have no outstanding I/O.
-            // Failed controllers stay on the destroy/quarantine path.
-            if !h.ctrls[c].failed {
-                crate::blkd::remove(&mut h.ctrls[c], client, &h.pci, &mut h.iommu);
-                g.disks.pop();
+        let applied = match crate::blkd::activate(&mut h.ctrls[c], unit, client, g, &chan, &mut h.wins.a, &h.pci, key) {
+            Ok(applied) => applied,
+            Err(e) => {
+                abs_of(kick).delete().expect("drop unused blkd kick");
+                h.alloc.slots.free(kick.bits() as Slot);
+                // Rejected shared-key/flag checks have no outstanding I/O.
+                // Failed controllers stay on the destroy/quarantine path.
+                if !h.ctrls[c].failed {
+                    crate::blkd::remove(&mut h.ctrls[c], client, &h.pci, &mut h.iommu);
+                    g.disks.pop();
+                    chan.release(&mut h.alloc);
+                } else {
+                    chan.keep(&mut g.arena);
+                }
+                return Err(e);
             }
-            return Err(e);
-        }
+        };
         for (i, f) in chan.iter().enumerate() {
             xchg(h, i).copy(&abs_of(*f), CapRights::all()).expect("vmmgr channel frame");
         }
         xchg(h, chan.len()).move_(&abs_of(kick)).expect("vmmgr blkd kick");
         h.alloc.slots.free(kick.bits() as Slot);
-        Ok(Vals::new())
+        chan.keep(&mut g.arena);
+        let applied = applied | if read_only { abi::BLK_RO } else { 0 } | if volatile { abi::BLK_VOLATILE } else { 0 };
+        Ok([applied].into_iter().collect())
     })
 }
 

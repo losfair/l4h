@@ -2,7 +2,7 @@
 #![allow(dead_code)]
 use l4h_host::blk::{self, DiskWindow};
 
-mod ctl { pub const EBUSY: i64 = 16; pub const ENOSPC: i64 = 28; }
+mod ctl { pub const EIO: i64 = 5; pub const EBUSY: i64 = 16; pub const ENOSPC: i64 = 28; pub const EOPNOTSUPP: i64 = 95; }
 
 include!(env!("L4H_BLK_RESERVATIONS_TEST_SRC"));
 
@@ -24,8 +24,42 @@ struct Driver { comp: Component }
 pub struct Controller {
     clients: Vec<Option<Attachment>>, driver: Option<Driver>, failed: bool, dom: Domain,
 }
-fn call(ep: u64, _: u64, _: &[u64]) -> u64 { ep }
+thread_local! {
+    static APPLIED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static MRS: std::cell::RefCell<[u64; 16]> = const { std::cell::RefCell::new([0; 16]) };
+}
+fn mr(i: usize) -> u64 { MRS.with_borrow(|m| m[i]) }
+fn set_mr(i: usize, v: u64) { MRS.with_borrow_mut(|m| m[i] = v); }
+fn call(ep: u64, label: u64, args: &[u64]) -> u64 {
+    for (i, &a) in args.iter().enumerate() { set_mr(i, a); }
+    if label == blk::BLKD_ADD { set_mr(1, APPLIED.get()); }
+    ep
+}
 fn quarantine(c: &mut Controller, _: &Pci) { c.failed = true; }
+
+pub struct RootGuest { pool: blk::Pool }
+pub type Channel = Vec<usize>;
+pub struct Window { page: Box<blk::Channel> }
+impl Window {
+    fn with_frame(&mut self, _: &Slot, f: impl FnOnce(*mut u8)) { f((&mut *self.page as *mut blk::Channel).cast()); }
+}
+
+#[test]
+fn activation_returns_applied_flags_and_rejects_missing_acknowledgment() {
+    for (encrypted, applied, expected) in [
+        (false, 0, Ok(0)), (true, blk::ENCRYPT, Ok(blk::ENCRYPT)),
+        (true, 0, Err(ctl::EOPNOTSUPP)), (false, blk::ENCRYPT, Err(ctl::EOPNOTSUPP)),
+    ] {
+        let mut c = Controller { clients: vec![Some(Attachment { encrypted, ..reservation() })],
+            driver: Some(Driver { comp: Component { service_ep: 0 } }), failed: false, dom: Domain(1) };
+        let g = RootGuest { pool: blk::Pool { gpa: 0, paddr: 0x100000, size: 0x400000 } };
+        let mut win = Window { page: Box::new(unsafe { core::mem::zeroed() }) };
+        APPLIED.set(applied);
+        assert_eq!(activate(&mut c, 0, 0, &g, &vec![0], &mut win, &Pci, &[0x12; 64]), expected);
+        assert!(!c.failed, "a rejected acknowledgment must use normal attach cleanup");
+        for i in 0..11 { assert_eq!(mr(i), 0, "transient key words must be cleared"); }
+    }
+}
 
 fn reservation() -> Attachment {
     Attachment { vm: 0, disk: 0, window: DiskWindow::new(8, 16, 1024).unwrap(),

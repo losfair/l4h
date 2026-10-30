@@ -433,17 +433,31 @@ fn call(ep: cap::Endpoint, label: u64, args: &[u64]) -> u64 {
 /// l4h-vmm.
 #[allow(clippy::too_many_arguments)]
 pub fn attach(ctrl: &mut Controller, disk: usize, client: &mut RootGuest,
-    window: blk::DiskWindow, read_only: bool, volatile: bool, encrypted: bool, alloc: &mut Alloc, iommu: &mut Iommu) -> (usize, Channel, cap::Notification) {
+    window: blk::DiskWindow, read_only: bool, volatile: bool, encrypted: bool, alloc: &mut Alloc, iommu: &mut Iommu) -> Result<(usize, Channel, cap::Notification), i64> {
     let i = attachment_slot(ctrl.clients, disk, window, read_only, client.dom0).expect("checked block client");
     let reserved = ctrl.clients[i].as_ref().is_some_and(|a| a.reserved);
     let driver = ctrl.driver.as_mut().expect("started blkd");
-    let chan: Channel = (0..blk::CHANNEL_PAGES)
-        .map(|_| client.arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP)).collect();
     let frame_bits = blk::pool_frame_bits(client.pool.size);
     let frames = client.pool.size >> frame_bits;
     let radix = (client.pool.size.trailing_zeros() as usize - frame_bits).max(1);
     let keep_bits = (frames + blk::CHANNEL_PAGES).next_power_of_two().trailing_zeros() as usize;
-    let keep = client.arena.object_cap::<cap_type::CNode>(alloc, sel4::ObjectBlueprint::CNode { size_bits: keep_bits });
+    // A rejected activation must return its objects immediately, without
+    // rewinding (or retaining allocations in) the guest's shared arena.
+    let keep_bp = sel4::ObjectBlueprint::CNode { size_bits: keep_bits };
+    let bytes = (blk::CHANNEL_PAGES * PAGE + (1 << keep_bp.physical_size_bits())).next_power_of_two();
+    let bits = bytes.trailing_zeros() as usize;
+    let slot = alloc.slots.alloc();
+    let Some(mut memory) = alloc.split(bits, slot) else {
+        alloc.slots.free(slot);
+        return Err(crate::ctl::ENOMEM);
+    };
+    let keep_slot = alloc.slots.alloc();
+    memory.retype(&keep_bp, 1, Dest::new(crate::slot::CNODE.cap(), keep_slot)).expect("block mapping CNode");
+    let keep = sel4::init_thread::Slot::<cap_type::CNode>::from_index(keep_slot).cap();
+    let channel_slots = alloc.slots.alloc_range(blk::CHANNEL_PAGES);
+    memory.retype(&FRAME_BP, blk::CHANNEL_PAGES, Dest::new(crate::slot::CNODE.cap(), channel_slots.start)).expect("block channel frames");
+    let chan = Channel { frames: channel_slots.map(|s| sel4::init_thread::Slot::<cap_type::Granule>::from_index(s).cap()).collect(),
+        memory: (slot, memory.paddr, bits), mappings: keep };
     // Initial values are delivered via the service call, not guest-chosen IDs.
     for (page, f) in chan.iter().enumerate() {
         alloc.global(|alloc| driver.comp.map_copy(alloc, &mut driver.arena, &abs_of(*f), blk::channel_va(i) + page * PAGE,
@@ -471,16 +485,39 @@ pub fn attach(ctrl: &mut Controller, disk: usize, client: &mut RootGuest,
     let pool = (client.pool.paddr, client.pool.size);
     iommu.map(alloc, ctrl.dom, pool.0, pool.1, Access::Write);
     ctrl.clients[i] = Some(Attachment { vm: client.id, disk, window, read_only, volatile, encrypted, reserved, pool: Some(pool), mappings: Some(keep) });
-    (i, chan, kick)
+    Ok((i, chan, kick))
 }
 
-/// The frames of a client's channel.
-pub type Channel = l4h_host::fixed::ArrayVec<cap::Granule, { blk::CHANNEL_PAGES }>;
+/// Channel and mapping objects, committed to the guest only on activation.
+pub struct Channel {
+    frames: l4h_host::fixed::ArrayVec<cap::Granule, { blk::CHANNEL_PAGES }>,
+    memory: (Slot, usize, usize),
+    mappings: cap::CNode,
+}
+
+impl core::ops::Deref for Channel {
+    type Target = [cap::Granule];
+    fn deref(&self) -> &Self::Target { &self.frames }
+}
+
+impl Channel {
+    pub fn keep(self, arena: &mut Arena) { arena.own(self.memory.0, self.memory.1, self.memory.2); }
+
+    /// After remove has drained/unmapped the client (or suspended blkd).
+    pub fn release(self, alloc: &mut Alloc) {
+        let mut arena = Arena::new();
+        arena.own(self.memory.0, self.memory.1, self.memory.2);
+        alloc.reclaim(arena);
+        for f in &self.frames { alloc.slots.free(f.bits() as Slot); }
+        alloc.slots.free(self.mappings.bits() as Slot);
+        alloc.slots.free(self.memory.0);
+    }
+}
 
 /// Publish root-owned client configuration, then activate the channel.
 /// EIO if blkd has failed (the controller is then quarantined).
 pub fn activate(ctrl: &mut Controller, unit: u64, i: usize, client: &RootGuest, chan: &Channel, win: &mut Window,
-    pci: &Pci, key: &[u8; 64]) -> Result<(), i64> {
+    pci: &Pci, key: &[u8; 64]) -> Result<u64, i64> {
     let a = ctrl.clients[i].as_ref().unwrap();
     let (read_only, volatile) = (a.read_only, a.volatile);
     win.with_frame(&abs_of(chan[0]), |p| unsafe {
@@ -497,6 +534,8 @@ pub fn activate(ctrl: &mut Controller, unit: u64, i: usize, client: &RootGuest, 
     args[..3].copy_from_slice(&[i as u64, unit, if a.encrypted { blk::ENCRYPT } else { 0 }]);
     for (i, bytes) in key.chunks_exact(8).enumerate() { args[3 + i] = u64::from_le_bytes(bytes.try_into().unwrap()); }
     let result = call(ctrl.driver.as_ref().unwrap().comp.service_ep, blk::BLKD_ADD, &args);
+    let applied = crate::mr(1);
+    let requested = args[2];
     for word in &mut args { unsafe { core::ptr::write_volatile(word, 0) }; }
     for i in 0..11 { crate::set_mr(i, 0); }
     if result == u64::MAX {
@@ -504,7 +543,8 @@ pub fn activate(ctrl: &mut Controller, unit: u64, i: usize, client: &RootGuest, 
         return Err(crate::ctl::EIO);
     }
     if result != 0 { return Err(result as i64); }
-    Ok(())
+    if applied != requested { return Err(crate::ctl::EOPNOTSUPP); }
+    Ok(applied)
 }
 
 /// Stop using controller `disk` until host reboot: its blkd is suspended
