@@ -1,0 +1,144 @@
+Guest THP with native seL4 2 MiB backing, 2026-10-30
+Implementation revision: ad54855c563c80333c5df713c6447de0974e3f28
+Guest: Linux 6.18.58-l4h, x86_64, 512 MiB, 1 or 4 guest vCPUs.
+QEMU: 10.0.13 (Debian 1:10.0.13+ds-0+deb13u1), KVM, 4 host vCPUs, 4 GiB.
+QEMU CPU: host,-vmx,+invtsc. Host Linux: 6.12.113+deb13-amd64.
+Host CPU: Intel Core i7-13700H exposed through an 8-vCPU Microsoft Hyper-V VM.
+Compiler: GCC 14.2.0 (Debian 14.2.0-19), -O2 -Wall -Wextra -static.
+Nested KVM on a shared development host; not a bare-metal measurement.
+No other QEMU tests or compiler jobs were observed during measurement
+(sampled every 0.5 seconds while the benchmark QEMU process was alive).
+
+Commands:
+  tests/run-thpbench.sh 1
+  tests/run-thpbench.sh 4
+
+Method:
+  Same kernel and backing allocator, MADV_NOHUGEPAGE versus MADV_HUGEPAGE.
+  Fresh process per mode/trial, alternating order, trial 0 excluded as warmup.
+  Five measured trials per mode; no CPU affinity pinning.
+  THP/defrag explicitly set to madvise; shrink_underused=0;
+  khugepaged scan_sleep_millisecs=600000 to isolate fault-time allocation.
+  Dense: write one byte per 4 KiB over an aligned 64 MiB mapping.
+  Random: 1,000,000 deterministic LCG page-stride reads in that mapping.
+  Fork: average of eight fork/exit/wait operations after populating it.
+  COW: fork, child writes every 4 KiB, verifies, exits, parent waits.
+  Protect: make one 4 KiB page read-only then writable in each of 32 PMDs.
+  Unmap: release that mapping after the protection/split phase.
+  Sparse: write one 4 KiB page per 2 MiB in a fresh 64 MiB mapping.
+  Huge coverage and COW data integrity are asserted.
+  The test module independently reports native seL4 large leaves: exactly
+  32 for dense THP trials, zero for base-page trials, also asserted.
+  VmPTE includes the seL4 mapping/object charge plus Linux page tables.
+  The kernel direct map retains 4 KiB aliases. Only process mappings in
+  this test use native large leaves. Host-created boot RAM uses fallback.
+
+Correctness validation:
+  ABI tests: x86_64/KVM and AArch64 Cortex-A57/TCG, 4 guest vCPUs: PASS.
+    Includes alias bounds, rights, sibling revocation isolation, large
+    execution/accessed bits, stale caps, parent deletion, Untyped revoke
+    and zeroing at both ends of reused backing.
+  THP tests: x86_64 1/4 vCPUs and AArch64 4 vCPUs: PASS.
+    Includes native leaf counts, COW, zero pages, user copies, futexes,
+    VSpace eviction, pinned-page splits, partial protect/unmap/discard,
+    collapse, mremap, concurrent writes, aging, swap, NX and shmem.
+  Existing selftests: x86_64 1/4 vCPUs and AArch64 4 vCPUs: PASS.
+  Object memory stress: 4 vCPUs, migration, OOM and recovery: PASS.
+  THP-enabled memory hotplug stress: 15 rounds: PASS.
+    Three 2-vCPU guests, 256-1536 MiB resize targets, including destroy/
+    recreate during resize. Survivors retained 49152 KiB AnonHugePages;
+    data errors, mapping failures and kernel errors were zero. Host free
+    RAM returned to exactly 3707 MiB, its starting value.
+  arch/l4h build with CONFIG_TRANSPARENT_HUGEPAGE=n: PASS.
+
+Summary: median [minimum, maximum]; times in ms except random_ns.
+
+1 guest vCPU(s)
+  dense.dense_ms: base: 70.462 [65.010, 73.383]; huge: 5.620 [5.349, 8.215]
+  dense.minflt: base: 16387.000 [16387.000, 16387.000]; huge: 35.000 [35.000, 35.000]
+  dense.anon_huge_kb: base: 0.000 [0.000, 0.000]; huge: 65536.000 [65536.000, 65536.000]
+  dense.rss_kb: base: 65536.000 [65536.000, 65536.000]; huge: 65536.000 [65536.000, 65536.000]
+  dense.pgtables_kb: base: 1110.000 [1110.000, 1110.000]; huge: 216.000 [216.000, 216.000]
+  dense.native_2m: base: 0.000 [0.000, 0.000]; huge: 32.000 [32.000, 32.000]
+  dense.random_ns: base: 17.290 [17.200, 20.650]; huge: 14.070 [11.240, 17.770]
+  dense.fork_ms: base: 4.658 [4.507, 5.056]; huge: 0.421 [0.379, 0.445]
+  dense.cow_ms: base: 102.358 [96.656, 109.356]; huge: 132.368 [122.318, 133.422]
+  dense.protect_ms: base: 0.208 [0.186, 0.225]; huge: 15.703 [14.816, 16.613]
+  dense.unmap_ms: base: 12.679 [12.193, 13.201]; huge: 11.401 [10.796, 11.772]
+  sparse.sparse_ms: base: 0.164 [0.142, 0.210]; huge: 6.241 [5.316, 7.886]
+  sparse.minflt: base: 32.000 [32.000, 32.000]; huge: 32.000 [32.000, 32.000]
+  sparse.anon_huge_kb: base: 0.000 [0.000, 0.000]; huge: 65536.000 [65536.000, 65536.000]
+  sparse.rss_kb: base: 128.000 [128.000, 128.000]; huge: 65536.000 [65536.000, 65536.000]
+
+Raw serial records (including warmup trial 0):
+THPBENCH: kernel=6.18.58-l4h vcpus=1
+THPBENCH: trial=0 mode=base dense_ms=363.061 minflt=16387 anon_huge_kb=0 rss_kb=65536 pgtables_kb=1110 native_2m=0 random_ns=20.24 fork_ms=5.173 cow_ms=417.220 protect_ms=0.221 unmap_ms=14.951
+THPBENCH: trial=0 mode=base sparse_ms=0.175 minflt=32 anon_huge_kb=0 rss_kb=128
+THPBENCH: trial=0 mode=huge dense_ms=8.254 minflt=35 anon_huge_kb=65536 rss_kb=65536 pgtables_kb=216 native_2m=32 random_ns=18.23 fork_ms=0.707 cow_ms=141.567 protect_ms=16.362 unmap_ms=11.151
+THPBENCH: trial=0 mode=huge sparse_ms=5.675 minflt=32 anon_huge_kb=65536 rss_kb=65536
+THPBENCH: trial=1 mode=huge dense_ms=5.357 minflt=35 anon_huge_kb=65536 rss_kb=65536 pgtables_kb=216 native_2m=32 random_ns=15.81 fork_ms=0.428 cow_ms=126.302 protect_ms=14.873 unmap_ms=11.058
+THPBENCH: trial=1 mode=huge sparse_ms=6.241 minflt=32 anon_huge_kb=65536 rss_kb=65536
+THPBENCH: trial=1 mode=base dense_ms=69.268 minflt=16387 anon_huge_kb=0 rss_kb=65536 pgtables_kb=1110 native_2m=0 random_ns=18.29 fork_ms=4.573 cow_ms=98.094 protect_ms=0.190 unmap_ms=12.193
+THPBENCH: trial=1 mode=base sparse_ms=0.210 minflt=32 anon_huge_kb=0 rss_kb=128
+THPBENCH: trial=2 mode=base dense_ms=65.010 minflt=16387 anon_huge_kb=0 rss_kb=65536 pgtables_kb=1110 native_2m=0 random_ns=17.25 fork_ms=4.658 cow_ms=109.356 protect_ms=0.225 unmap_ms=12.313
+THPBENCH: trial=2 mode=base sparse_ms=0.164 minflt=32 anon_huge_kb=0 rss_kb=128
+THPBENCH: trial=2 mode=huge dense_ms=5.620 minflt=35 anon_huge_kb=65536 rss_kb=65536 pgtables_kb=216 native_2m=32 random_ns=11.24 fork_ms=0.380 cow_ms=133.422 protect_ms=16.194 unmap_ms=11.772
+THPBENCH: trial=2 mode=huge sparse_ms=6.820 minflt=32 anon_huge_kb=65536 rss_kb=65536
+THPBENCH: trial=3 mode=huge dense_ms=7.195 minflt=35 anon_huge_kb=65536 rss_kb=65536 pgtables_kb=216 native_2m=32 random_ns=17.77 fork_ms=0.421 cow_ms=133.414 protect_ms=15.703 unmap_ms=10.796
+THPBENCH: trial=3 mode=huge sparse_ms=7.886 minflt=32 anon_huge_kb=65536 rss_kb=65536
+THPBENCH: trial=3 mode=base dense_ms=73.383 minflt=16387 anon_huge_kb=0 rss_kb=65536 pgtables_kb=1110 native_2m=0 random_ns=20.65 fork_ms=4.906 cow_ms=102.358 protect_ms=0.208 unmap_ms=12.679
+THPBENCH: trial=3 mode=base sparse_ms=0.168 minflt=32 anon_huge_kb=0 rss_kb=128
+THPBENCH: trial=4 mode=base dense_ms=70.462 minflt=16387 anon_huge_kb=0 rss_kb=65536 pgtables_kb=1110 native_2m=0 random_ns=17.29 fork_ms=4.507 cow_ms=96.656 protect_ms=0.186 unmap_ms=13.071
+THPBENCH: trial=4 mode=base sparse_ms=0.142 minflt=32 anon_huge_kb=0 rss_kb=128
+THPBENCH: trial=4 mode=huge dense_ms=8.215 minflt=35 anon_huge_kb=65536 rss_kb=65536 pgtables_kb=216 native_2m=32 random_ns=14.07 fork_ms=0.445 cow_ms=122.318 protect_ms=14.816 unmap_ms=11.424
+THPBENCH: trial=4 mode=huge sparse_ms=5.316 minflt=32 anon_huge_kb=65536 rss_kb=65536
+THPBENCH: trial=5 mode=huge dense_ms=5.349 minflt=35 anon_huge_kb=65536 rss_kb=65536 pgtables_kb=216 native_2m=32 random_ns=13.80 fork_ms=0.379 cow_ms=132.368 protect_ms=16.613 unmap_ms=11.401
+THPBENCH: trial=5 mode=huge sparse_ms=5.330 minflt=32 anon_huge_kb=65536 rss_kb=65536
+THPBENCH: trial=5 mode=base dense_ms=71.174 minflt=16387 anon_huge_kb=0 rss_kb=65536 pgtables_kb=1110 native_2m=0 random_ns=17.20 fork_ms=5.056 cow_ms=108.796 protect_ms=0.223 unmap_ms=13.201
+THPBENCH: trial=5 mode=base sparse_ms=0.160 minflt=32 anon_huge_kb=0 rss_kb=128
+THPBENCH: PASS
+
+4 guest vCPU(s)
+  dense.dense_ms: base: 75.183 [72.536, 75.844]; huge: 6.420 [5.981, 7.241]
+  dense.minflt: base: 16387.000 [16387.000, 16387.000]; huge: 35.000 [35.000, 35.000]
+  dense.anon_huge_kb: base: 0.000 [0.000, 0.000]; huge: 65536.000 [65536.000, 65536.000]
+  dense.rss_kb: base: 65536.000 [65536.000, 65536.000]; huge: 65536.000 [65536.000, 65536.000]
+  dense.pgtables_kb: base: 1094.000 [1094.000, 1094.000]; huge: 200.000 [200.000, 200.000]
+  dense.native_2m: base: 0.000 [0.000, 0.000]; huge: 32.000 [32.000, 32.000]
+  dense.random_ns: base: 19.030 [15.890, 19.880]; huge: 16.150 [13.710, 17.320]
+  dense.fork_ms: base: 4.982 [4.941, 5.318]; huge: 1.038 [0.626, 1.445]
+  dense.cow_ms: base: 110.642 [104.039, 129.599]; huge: 136.517 [134.261, 157.446]
+  dense.protect_ms: base: 0.309 [0.188, 0.384]; huge: 16.160 [15.454, 17.303]
+  dense.unmap_ms: base: 14.584 [13.594, 16.012]; huge: 10.887 [10.565, 11.565]
+  sparse.sparse_ms: base: 3.309 [2.816, 4.131]; huge: 8.831 [8.642, 15.687]
+  sparse.minflt: base: 32.000 [32.000, 32.000]; huge: 32.000 [32.000, 32.000]
+  sparse.anon_huge_kb: base: 0.000 [0.000, 0.000]; huge: 65536.000 [65536.000, 65536.000]
+  sparse.rss_kb: base: 128.000 [128.000, 128.000]; huge: 65536.000 [65536.000, 65536.000]
+
+Raw serial records (including warmup trial 0):
+THPBENCH: kernel=6.18.58-l4h vcpus=4
+THPBENCH: trial=0 mode=base dense_ms=420.476 minflt=16387 anon_huge_kb=0 rss_kb=65536 pgtables_kb=1094 native_2m=0 random_ns=18.72 fork_ms=5.714 cow_ms=343.859 protect_ms=0.255 unmap_ms=14.128
+THPBENCH: trial=0 mode=base sparse_ms=1.826 minflt=32 anon_huge_kb=0 rss_kb=128
+THPBENCH: trial=0 mode=huge dense_ms=16.521 minflt=35 anon_huge_kb=65536 rss_kb=65536 pgtables_kb=200 native_2m=32 random_ns=16.95 fork_ms=1.625 cow_ms=142.778 protect_ms=18.085 unmap_ms=11.404
+THPBENCH: trial=0 mode=huge sparse_ms=10.209 minflt=32 anon_huge_kb=65536 rss_kb=65536
+THPBENCH: trial=1 mode=huge dense_ms=5.981 minflt=35 anon_huge_kb=65536 rss_kb=65536 pgtables_kb=200 native_2m=32 random_ns=16.68 fork_ms=1.374 cow_ms=134.261 protect_ms=15.721 unmap_ms=10.887
+THPBENCH: trial=1 mode=huge sparse_ms=15.687 minflt=32 anon_huge_kb=65536 rss_kb=65536
+THPBENCH: trial=1 mode=base dense_ms=75.279 minflt=16387 anon_huge_kb=0 rss_kb=65536 pgtables_kb=1094 native_2m=0 random_ns=19.79 fork_ms=4.969 cow_ms=115.017 protect_ms=0.188 unmap_ms=13.594
+THPBENCH: trial=1 mode=base sparse_ms=3.309 minflt=32 anon_huge_kb=0 rss_kb=128
+THPBENCH: trial=2 mode=base dense_ms=72.536 minflt=16387 anon_huge_kb=0 rss_kb=65536 pgtables_kb=1094 native_2m=0 random_ns=15.89 fork_ms=4.941 cow_ms=129.599 protect_ms=0.354 unmap_ms=16.012
+THPBENCH: trial=2 mode=base sparse_ms=4.131 minflt=32 anon_huge_kb=0 rss_kb=128
+THPBENCH: trial=2 mode=huge dense_ms=6.968 minflt=35 anon_huge_kb=65536 rss_kb=65536 pgtables_kb=200 native_2m=32 random_ns=17.32 fork_ms=1.038 cow_ms=134.904 protect_ms=16.160 unmap_ms=10.714
+THPBENCH: trial=2 mode=huge sparse_ms=8.708 minflt=32 anon_huge_kb=65536 rss_kb=65536
+THPBENCH: trial=3 mode=huge dense_ms=6.041 minflt=35 anon_huge_kb=65536 rss_kb=65536 pgtables_kb=200 native_2m=32 random_ns=15.27 fork_ms=0.626 cow_ms=157.446 protect_ms=17.178 unmap_ms=10.565
+THPBENCH: trial=3 mode=huge sparse_ms=8.642 minflt=32 anon_huge_kb=65536 rss_kb=65536
+THPBENCH: trial=3 mode=base dense_ms=75.844 minflt=16387 anon_huge_kb=0 rss_kb=65536 pgtables_kb=1094 native_2m=0 random_ns=15.92 fork_ms=4.982 cow_ms=110.642 protect_ms=0.384 unmap_ms=13.750
+THPBENCH: trial=3 mode=base sparse_ms=2.816 minflt=32 anon_huge_kb=0 rss_kb=128
+THPBENCH: trial=4 mode=base dense_ms=75.183 minflt=16387 anon_huge_kb=0 rss_kb=65536 pgtables_kb=1094 native_2m=0 random_ns=19.88 fork_ms=5.318 cow_ms=105.581 protect_ms=0.265 unmap_ms=14.584
+THPBENCH: trial=4 mode=base sparse_ms=3.972 minflt=32 anon_huge_kb=0 rss_kb=128
+THPBENCH: trial=4 mode=huge dense_ms=6.420 minflt=35 anon_huge_kb=65536 rss_kb=65536 pgtables_kb=200 native_2m=32 random_ns=13.71 fork_ms=1.035 cow_ms=136.517 protect_ms=17.303 unmap_ms=11.565
+THPBENCH: trial=4 mode=huge sparse_ms=8.831 minflt=32 anon_huge_kb=65536 rss_kb=65536
+THPBENCH: trial=5 mode=huge dense_ms=7.241 minflt=35 anon_huge_kb=65536 rss_kb=65536 pgtables_kb=200 native_2m=32 random_ns=16.15 fork_ms=1.445 cow_ms=144.359 protect_ms=15.454 unmap_ms=11.226
+THPBENCH: trial=5 mode=huge sparse_ms=9.880 minflt=32 anon_huge_kb=65536 rss_kb=65536
+THPBENCH: trial=5 mode=base dense_ms=73.454 minflt=16387 anon_huge_kb=0 rss_kb=65536 pgtables_kb=1094 native_2m=0 random_ns=19.03 fork_ms=5.098 cow_ms=104.039 protect_ms=0.309 unmap_ms=15.739
+THPBENCH: trial=5 mode=base sparse_ms=3.177 minflt=32 anon_huge_kb=0 rss_kb=128
+THPBENCH: PASS

@@ -18,7 +18,7 @@
 #define _PAGE_USER	0x040
 #define _PAGE_ACCESSED	0x080
 #define _PAGE_DIRTY	0x100
-#define _PAGE_HUGE	0x200	/* a software PMD leaf; seL4 still maps 4 KiB */
+#define _PAGE_HUGE	0x200	/* a Linux PMD leaf, mirrored into seL4 */
 /* If _PAGE_PRESENT is clear, we use these: */
 #define _PAGE_PROTNONE	0x010	/* if the user mapped it with PROT_NONE;
 				   pte_present gives true */
@@ -305,8 +305,8 @@ static inline pte_t pte_modify(pte_t pte, pgprot_t newprot)
 	return pte;
 }
 
-/* Linux's THP page tables are software-only.  The TLB sync expands each
- * huge leaf into base-page mappings, including permission downgrades. */
+/* Linux's page tables are software-only. The TLB sync mirrors huge leaves
+ * with native large frames, or small aliases for host-created boot RAM. */
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
 static inline int pmd_trans_huge(pmd_t pmd)
 {

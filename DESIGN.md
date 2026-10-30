@@ -484,8 +484,8 @@ guest. Where there is an AMD-Vi or Intel VT-d IOMMU, root drives it itself (§8.
   large cap leaves its aliases valid; revoking the backing Untyped removes
   all aliases and mappings before the allocation can be reused. Ordinary
   copies and subframe aliases keep seL4's non-revocable-copy semantics:
-  deriving an alias does not grant authority to revoke sibling aliases. Device frames
-  and other source sizes are refused.
+  deriving an alias does not grant authority to revoke sibling aliases.
+  Device frames and other source sizes are refused.
 
   The patch also extends 0023 to x86 PDE leaves and AArch64 level-2 blocks,
   checking the mapped size and physical address before clearing A/AF. On
@@ -3206,6 +3206,41 @@ and Linux's deposited PTE tables) is unchanged. For example, one-vCPU dense
 first-touch ranges were 63.972–68.207 ms with base pages and 23.143–27.728 ms
 with THP. Full ranges, raw trials, environment and correctness checks are in
 [`tests/results/thp-nested-kvm-2026-10-30.txt`](tests/results/thp-nested-kvm-2026-10-30.txt).
+
+**Native seL4 2 MiB backing, measured 2026-10-30.**
+The same paired benchmark at `ad54855` now verifies 32 native large leaves
+for each dense THP trial and zero for base-page trials. The environment,
+policy and five-trial method are the same as above. A monitor sampled every
+half second during QEMU execution and observed no other QEMU or compiler
+jobs. These are still measurements on a shared, nested Hyper-V/KVM host.
+
+| Operation | 1 vCPU, base | 1 vCPU, THP | 4 vCPUs, base | 4 vCPUs, THP |
+|-----------|--------------|-------------|---------------|--------------|
+| Dense 64 MiB first-touch, ms | 70.462 | 5.620 | 75.183 | 6.420 |
+| Minor faults during first-touch | 16,387 | 35 | 16,387 | 35 |
+| Random page-stride read, ns/access | 17.29 | 14.07 | 19.03 | 16.15 |
+| Fork + exit + wait, ms | 4.658 | 0.421 | 4.982 | 1.038 |
+| Fork + COW-write 64 MiB + wait, ms | 102.358 | 132.368 | 110.642 | 136.517 |
+| Partial protection changes in 32 PMDs, ms | 0.208 | 15.703 | 0.309 | 16.160 |
+| Unmap after protection changes, ms | 12.679 | 11.401 | 14.584 | 10.887 |
+| Sparse 64 MiB first-touch, ms | 0.164 | 6.241 | 3.309 | 8.831 |
+| Sparse RSS, KiB | 128 | 65,536 | 128 | 65,536 |
+| Dense `VmPTE`, KiB | 1,110 | 216 | 1,094 | 200 |
+| Native seL4 2 MiB leaves in dense mapping | 0 | 32 | 0 | 32 |
+
+Dense first-touch is 11.7–12.5 times faster with THP, and fork is 4.8–11.1
+times faster. Reported `VmPTE` drops by about 81%: a PMD uses one mapped
+frame cap instead of 512 and needs no seL4 leaf page table. Linux still
+keeps its deposited PTE table, and the kernel direct map retains small
+aliases. The absolute `VmPTE` value also includes unrelated process mappings.
+
+COW remains 23–29% slower than base pages. Linux splits a shared PMD for
+base-page COW, and the backend still pays for installing the small mappings.
+Partial protection changes also retain substantial split costs. Sparse RSS
+remains 128 KiB versus 64 MiB, a normal Linux THP allocation tradeoff. These
+results support keeping the `madvise` default. Full ranges, raw trials and
+validation are in
+[`tests/results/thp-native-backing-nested-kvm-2026-10-30.txt`](tests/results/thp-native-backing-nested-kvm-2026-10-30.txt).
 
 ---
 
