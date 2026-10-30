@@ -1521,7 +1521,14 @@ thin provisioning or copy-on-write.
 - Descriptor buffers must lie in that client's host-owned I/O pool. The
   driver translates pool GPAs to physical addresses; the device never sees
   guest RAM. Guest swiotlb performs the remaining payload copy.
-- l4h-root and blkd both enforce the overlap rule (`DiskWindow::conflicts`). Request validation uses
+- blkd alone decides who may use which sectors: the overlap rule
+  (`DiskWindow::conflicts`), dom0's boot reservations and provisioning
+  exclusion (`blk::Reservations`). l4h-root only asks: `BLKD_CHECK` gives
+  the errno or the slot to attach in before root allocates anything, and
+  `BLKD_ADD` repeats the check. Root parses no ranges of dom0's and keeps
+  its attachment records only for teardown and reports. A blkd sends the
+  commands, so a second check in root could not stop a faulty one.
+  Request validation uses
   checked arithmetic and verifies block alignment, direction, permissions,
   operation and pool bounds. Hardware request tags are allocated by blkd,
   so identical IDs from different clients cannot collide.
@@ -2198,15 +2205,16 @@ normal order after these devices.
 The complete dom0 device plan must fit within 64 slots, including console,
 control, memory-hotplug and attestation devices, all disk windows and NICs.
 Oversized plans stop boot; neither the disk nor NIC lists are truncated.
-Root reserves every boot disk range before attaching it and retains those
-reservations across dom0 restarts. If an attachment fails, dom0 receives a
+Root has blkd reserve every boot disk range before attaching it
+(`BLKD_RESERVE`); blkd retains those reservations across dom0 restarts. If an attachment fails, dom0 receives a
 zero-capacity, read-only virtio-blk device in that position. It completes all
 I/O with errors without a driver channel or DMA mappings, so other disks
 keep their names and dom0 can still boot from healthy storage or an initramfs.
 The reserved range remains unavailable to provisioning and conflicting guest
 attachments. When a failed disk cannot report its capacity, root checks the
-configured ranges for alignment, overflow and overlap and reserves them;
-a whole-disk reservation covers all aligned sectors until host reboot.
+configured ranges for alignment, overflow and overlap and lists them as
+dom0's (its controller serves nothing); a whole-disk reservation covers
+all aligned sectors until host reboot.
 The same reservation and dummy device apply to an automatically selected
 whole disk whose capacity is not a multiple of eight sectors. This does not
 relax validation of explicit windows against a known capacity.

@@ -97,7 +97,7 @@ pub const STAGING_SIZE: usize = 1 << 20;
 /// unit -> capacity (u64::MAX if no such unit), block size, read-only,
 /// number of units, unit address (blkd_scsi_addr for virtio-scsi, else 0).
 pub const BLKD_INFO: u64 = 1;
-/// client, unit -> 0
+/// client, unit, dom0 -> 0: the window BLKD_CHECK allowed in that slot
 pub const BLKD_ADD: u64 = 2;
 /// client -> 0, or u64::MAX if it did not drain
 pub const BLKD_REMOVE: u64 = 3;
@@ -105,6 +105,21 @@ pub const BLKD_REMOVE: u64 = 3;
 pub const BLKD_WRITE: u64 = 4;
 /// unit -> blk::STATUS_*, or u64::MAX
 pub const BLKD_FLUSH: u64 = 5;
+/// unit, start, sectors, read-only -> slot of the dom0 boot range, or
+/// u64::MAX (conflicting or no slot).  Before anything attaches.
+pub const BLKD_RESERVE: u64 = 6;
+/// unit, start, sectors (0 = to the end), read-only, dom0 -> 0 or an
+/// errno (EINVAL, EBUSY, ENOSPC); then the slot BLKD_ADD must use, the
+/// sectors and whether the window is read-only.  Changes nothing.
+pub const BLKD_CHECK: u64 = 7;
+/// BLKD_WRITE and BLKD_FLUSH refused the range: MR1 is the errno.
+pub const BLKD_REFUSED: u64 = u64::MAX - 1;
+
+/// Errnos of blkd's range decisions, as the control API returns them.
+pub const EPERM: u64 = 1;
+pub const EBUSY: u64 = 16;
+pub const EINVAL: u64 = 22;
+pub const ENOSPC: u64 = 28;
 /// Units per controller, at most.
 pub const MAX_UNITS: usize = 16;
 
@@ -254,5 +269,66 @@ impl DiskWindow {
             }
         }
         Ok(sector)
+    }
+}
+
+/// A range of a unit that a slot holds: a client's window, or a dom0 boot
+/// range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hold {
+    pub unit: usize,
+    pub window: DiskWindow,
+    pub read_only: bool,
+}
+
+/// blkd's record of dom0's boot ranges.  With the attached clients
+/// (`active`: what slot i's client holds), it is the one place that
+/// decides who may use which sectors; l4h-root only asks.  A reservation
+/// lives until host reboot.  Only dom0 can claim it, and only for exactly
+/// its range; while unclaimed it occupies its sectors for attachments and
+/// provisioning.  Slots are shared with clients: a claim attaches in the
+/// reservation's slot.
+pub struct Reservations<const N: usize> {
+    pub slots: [Option<Hold>; N],
+}
+
+impl<const N: usize> Default for Reservations<N> {
+    fn default() -> Self { Self::new() }
+}
+
+impl<const N: usize> Reservations<N> {
+    pub const fn new() -> Self { Self { slots: [None; N] } }
+
+    fn claimable(&self, i: usize, active: &impl Fn(usize) -> Option<Hold>, want: &Hold, dom0: bool) -> bool {
+        dom0 && active(i).is_none() && self.slots[i].is_some_and(|r| r.unit == want.unit && r.window == want.window)
+    }
+
+    /// The slot `want` may attach in: EBUSY if it conflicts with a client
+    /// or with a reservation it cannot claim, ENOSPC if no slot is free.
+    pub fn slot(&self, active: &impl Fn(usize) -> Option<Hold>, want: &Hold, dom0: bool) -> Result<usize, u64> {
+        let conflicts = |h: &Hold| h.unit == want.unit && want.window.conflicts(want.read_only, h.window, h.read_only);
+        // A claimed reservation is represented by its client.
+        let busy = (0..N).any(|i| match (active(i), self.slots[i]) {
+            (Some(a), _) => conflicts(&a),
+            (None, Some(r)) => conflicts(&r) && !self.claimable(i, active, want, dom0),
+            (None, None) => false,
+        });
+        if busy { return Err(EBUSY); }
+        (0..N).find(|&i| self.claimable(i, active, want, dom0))
+            .or_else(|| (0..N).find(|&i| active(i).is_none() && self.slots[i].is_none()))
+            .ok_or(ENOSPC)
+    }
+
+    /// Keep `hold` (a range of dom0's boot plan) from other users.
+    pub fn reserve(&mut self, active: &impl Fn(usize) -> Option<Hold>, hold: Hold) -> Result<usize, u64> {
+        let i = self.slot(active, &hold, false)?;
+        self.slots[i] = Some(hold);
+        Ok(i)
+    }
+
+    /// Whether provisioning may write `window` of `unit`: no client and no
+    /// reservation touches it, read-only or not.
+    pub fn unattached(&self, active: &impl Fn(usize) -> Option<Hold>, unit: usize, window: DiskWindow) -> bool {
+        !(0..N).flat_map(|i| [active(i), self.slots[i]]).flatten().any(|h| h.unit == unit && h.window.overlaps(window))
     }
 }
