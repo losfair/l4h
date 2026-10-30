@@ -95,7 +95,7 @@ fn failed_rollback_retains_the_record_needed_to_pin_the_pool() {
 #[test]
 fn activation_requires_blkd_to_confirm_exactly_the_requested_flags() {
     for (encrypted, applied, expected) in [
-        (false, 0, Ok(())), (true, blk::ENCRYPT, Ok(())),
+        (false, 0, Ok(0)), (true, blk::ENCRYPT, Ok(blk::ENCRYPT)),
         (true, 0, Err(ctl::EOPNOTSUPP)), (false, blk::ENCRYPT, Err(ctl::EOPNOTSUPP)),
         (true, blk::ENCRYPT | 2, Err(ctl::EOPNOTSUPP)),
     ] {

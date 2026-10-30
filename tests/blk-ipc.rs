@@ -106,6 +106,7 @@ mod production {
         let dev = [drv.info(0)].into_iter().collect();
         Blkd { clients: unsafe { &mut *addr_of_mut!(CLIENTS) },
             pending: unsafe { &mut *addr_of_mut!(PENDING) }, active: ArrayVec::new(), waiting: ArrayVec::new(),
+            free_tags: (0..MAX_INFLIGHT).rev().collect(),
             bounce: bounce::Bounce::new(), cfg, drv: Drv::Virtio(drv), dev, next: 0, ticks_per_sec: 1_000_000_000 }
     }
 
@@ -142,12 +143,14 @@ mod production {
         b.reap();
         assert_eq!(b.clients[0].as_ref().unwrap().outstanding, 0);
         // A rejected hardware submission must also release the reserved run.
+        assert_eq!(b.free_tags.len(), MAX_INFLIGHT);
         let Drv::Virtio(drv) = &mut b.drv else { unreachable!() };
         drv.fail_start = true;
         unsafe { (*crate::channel()).reqs[2] = (*crate::channel()).reqs[0]; (*crate::channel()).sq.head = 3; }
         b.submit();
         let run = b.bounce.alloc(bounce::SIZE).expect("failed start leaked bounce memory");
         b.bounce.free(run);
+        assert_eq!(b.free_tags.len(), MAX_INFLIGHT, "failed start leaked a tag");
         assert_eq!(b.remove(0), 0);
         assert!(b.clients[0].is_none());
         // Plain and encrypted reuse of the same channel, including
@@ -547,6 +550,10 @@ mod production {
             for i in 1..3 { for _ in 0..blk::RING_SIZE { enqueue(i, blk::OP_READ, 4096); } }
             b.submit();
             assert!(b.pending.iter().all(Option::is_some));
+            assert!(b.free_tags.is_empty());
+            let Drv::Virtio(drv) = &b.drv else { unreachable!() };
+            let tags: std::collections::HashSet<_> = drv.commands.iter().map(|c| c.0).collect();
+            assert_eq!(tags.len(), MAX_INFLIGHT, "in-flight requests need distinct tags");
         } else {
             let Drv::Virtio(drv) = &mut b.drv else { unreachable!() };
             drv.max_commands = 0;
@@ -562,14 +569,21 @@ mod production {
         assert_eq!(unsafe { (*crate::channel()).sq.tail }, 0, "unsubmitted work stays queued");
         if tags_full {
             drv.completed.push((drv.commands[0].0, blk::STATUS_OK));
+            drv.completed.push((drv.commands[0].0, blk::STATUS_OK)); // Duplicate must not free another tag.
+            drv.completed.push((MAX_INFLIGHT as u64, blk::STATUS_IOERR));
         } else {
             drv.max_commands = 1;
         }
         b.reap();
+        if tags_full { assert_eq!(b.free_tags.len(), 1); }
         let kicks = crate::KERNEL.with_borrow(|k| k.kicks);
         b.submit(); // One free slot is consumed, then the pass stops early.
         let Drv::Virtio(drv) = &mut b.drv else { unreachable!() };
         assert_eq!(drv.commands.len(), before + 1);
+        if tags_full {
+            assert_eq!(drv.commands.last().unwrap().0, drv.commands[0].0, "reuse the only completed tag");
+            assert!(b.free_tags.is_empty());
+        }
         assert_eq!(unsafe { (*crate::channel()).sq.tail }, 1);
         assert_eq!(crate::KERNEL.with_borrow(|k| k.kicks), kicks + 1, "an early exit must still kick submitted I/O");
         drv.max_commands = usize::MAX;

@@ -518,7 +518,7 @@ impl Channel {
 /// EIO if blkd has failed (the controller is then quarantined).
 /// Success confirms that blkd applied exactly the requested flags.
 pub fn activate(ctrl: &mut Controller, unit: u64, i: usize, client: &RootGuest, chan: &Channel, win: &mut Window,
-    pci: &Pci, key: &[u8; 64]) -> Result<(), i64> {
+    pci: &Pci, key: &[u8; 64]) -> Result<u64, i64> {
     let a = ctrl.clients[i].as_ref().unwrap();
     let (read_only, volatile) = (a.read_only, a.volatile);
     win.with_frame(&abs_of(chan[0]), |p| unsafe {
@@ -538,14 +538,14 @@ pub fn activate(ctrl: &mut Controller, unit: u64, i: usize, client: &RootGuest, 
     let applied = crate::mr(1);
     let requested = args[2];
     l4h_host::wipe::words(&mut args);
-    sel4::with_ipc_buffer_mut(|b| l4h_host::wipe::words(b.msg_regs_mut()));
+    sel4::with_ipc_buffer_mut(|b| l4h_host::wipe::words(&mut b.msg_regs_mut()[..args.len()]));
     if result == u64::MAX {
         quarantine(ctrl, pci);
         return Err(crate::ctl::EIO);
     }
     if result != 0 { return Err(result as i64); }
     if applied != requested { return Err(crate::ctl::EOPNOTSUPP); }
-    Ok(())
+    Ok(applied)
 }
 
 /// Stop using controller `disk` until host reboot: its blkd is suspended

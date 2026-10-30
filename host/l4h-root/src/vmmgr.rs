@@ -358,12 +358,15 @@ fn xchg(h: &Host, i: usize) -> sel4::AbsoluteCPtr {
 }
 
 /// A call from vmmgr (label `label`): its reply's length.
-pub fn call(h: &mut Host, label: u64) -> usize {
-    // Snapshot the longest request and clear IPC storage before nested calls.
-    let mut a: [u64; 15] = core::array::from_fn(mr);
-    sel4::with_ipc_buffer_mut(|b| host::wipe::words(b.msg_regs_mut()));
+pub fn call(h: &mut Host, label: u64, request_len: usize) -> usize {
+    // Snapshot only this request and erase it before nested calls.
+    // Words beyond its length are stale IPC storage, not arguments.
+    let mut a = [0; 14];
+    for (i, v) in a.iter_mut().take(request_len).enumerate() { *v = mr(i); }
+    sel4::with_ipc_buffer_mut(|b| host::wipe::words(&mut b.msg_regs_mut()[..request_len]));
     let mut len = 1;
     let r = match label {
+        _ if request_len > a.len() => Err(ctl::EINVAL),
         proto::VMMGR_GUEST_NEW => guest_new(h, &a),
         proto::VMMGR_GUEST_DEL => guest_del(h, a[0] as usize),
         proto::VMMGR_DISK_ATTACH => {
@@ -383,8 +386,8 @@ pub fn call(h: &mut Host, label: u64) -> usize {
         }
         _ => Err(ctl::ENOSYS),
     };
-    host::wipe::words(&mut a);
-    sel4::with_ipc_buffer_mut(|b| host::wipe::words(b.msg_regs_mut()));
+    let n = request_len.min(a.len());
+    host::wipe::words(&mut a[..n]);
     match r {
         Ok(vals) => {
             set_mr(0, 0);
@@ -526,19 +529,23 @@ fn disk_attach(h: &mut Host, a: &[u64], key: &[u8; 64]) -> Result<Vals, i64> {
         g.check_device_room()?;
         let (client, chan, kick) = crate::blkd::attach(&mut h.ctrls[c], disk, g, window, read_only, volatile, encrypted, &mut h.alloc, &mut h.iommu)?;
         g.disks.must_push((c, client));
-        if let Err(e) = crate::blkd::activate(&mut h.ctrls[c], unit, client, g, &chan, &mut h.wins.a, &h.pci, key) {
-            abs_of(kick).delete().expect("drop unused blkd kick");
-            h.alloc.slots.free(kick.bits() as Slot);
-            rollback_disk_attach(h, g, disk, chan);
-            return Err(e);
-        }
+        let applied = match crate::blkd::activate(&mut h.ctrls[c], unit, client, g, &chan, &mut h.wins.a, &h.pci, key) {
+            Ok(applied) => applied,
+            Err(e) => {
+                abs_of(kick).delete().expect("drop unused blkd kick");
+                h.alloc.slots.free(kick.bits() as Slot);
+                rollback_disk_attach(h, g, disk, chan);
+                return Err(e);
+            }
+        };
         for (i, f) in chan.iter().enumerate() {
             xchg(h, i).copy(&abs_of(*f), CapRights::all()).expect("vmmgr channel frame");
         }
         xchg(h, chan.len()).move_(&abs_of(kick)).expect("vmmgr blkd kick");
         h.alloc.slots.free(kick.bits() as Slot);
         chan.keep(&mut g.arena);
-        Ok(Vals::new())
+        let applied = applied | if read_only { abi::BLK_RO } else { 0 } | if volatile { abi::BLK_VOLATILE } else { 0 };
+        Ok([applied].into_iter().collect())
     })
 }
 

@@ -43,8 +43,10 @@ pub fn handle(h: &mut Vmmgr, caller: usize) {
     };
     host::wipe::words(&mut req.args);
     host::wipe::bytes(&mut req.data);
-    // Clear every shared request, including unknown operations and errors.
-    unsafe { host::wipe::raw(page, core::mem::size_of::<abi::CtlReq>()); }
+    // Clear every request's arguments/data, including errors. The guest
+    // driver still reads the public op header after completion (GPU_READ).
+    let args_off = core::mem::offset_of!(abi::CtlReq, args);
+    unsafe { host::wipe::raw(page.add(args_off), core::mem::size_of::<abi::CtlReq>() - args_off); }
     unsafe { (page.add(abi::CTL_RESP_OFF) as *mut abi::CtlResp).write_volatile(resp) };
 }
 
@@ -244,9 +246,7 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
             if a[2] & !(abi::BLK_RO | abi::BLK_VOLATILE | abi::BLK_ENCRYPT) != 0 {
                 return Err(EINVAL);
             }
-            h.attach_disk(id, a[1] as usize, a[2], a[3], a[4], req.data[..64].try_into().unwrap())?;
-            // Root rejects success unless blkd confirms these flags.
-            resp.vals[0] = a[2];
+            resp.vals[0] = h.attach_disk(id, a[1] as usize, a[2], a[3], a[4], req.data[..64].try_into().unwrap())?;
             Ok(())
         }
         abi::CTL_CONSOLE_READ => {

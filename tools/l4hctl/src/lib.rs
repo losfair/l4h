@@ -548,9 +548,10 @@ impl Ctl {
         };
         let resp = self.call(CTL_VM_CREATE, &[o.mem, o.vcpus, 0, 0, io_pool], &name, &[])?;
         let (vm, initrd_gpa) = (resp.vals[0], resp.vals[1]);
-        let r = (|| {
+        let r: Result<_> = (|| {
             for (i, &(disk, flags, start, sectors)) in o.disks.iter().enumerate() {
-                self.blk_attach(vm, disk, flags, start, sectors, keys.get(i).and_then(Option::as_ref).map(|k| &k.0))?;
+                // This create operation owns cleanup of the VM on any error.
+                self.attach_disk(vm, disk, flags, start, sectors, keys.get(i).and_then(Option::as_ref).map(|k| &k.0), false)?;
             }
             let mut macs = Vec::new();
             for &(sw, mac, flags) in &o.nics {
@@ -567,8 +568,10 @@ impl Ctl {
             self.call(CTL_VM_START, &[vm, initrd_gpa, o.initrd.len() as u64], &cmdline, &[])?;
             Ok((vm, macs))
         })();
-        if r.is_err() {
-            let _ = self.call(CTL_VM_DESTROY, &[vm], &[], &[]);
+        if let Err(e) = &r {
+            if let Err(cleanup) = self.vm_destroy(vm) {
+                return err(format!("{}; failed to destroy VM {vm}: {}; do not start this VM", e.0, cleanup.0));
+            }
         }
         r
     }
@@ -698,7 +701,13 @@ impl Ctl {
     /// Attach a window to a created VM. Encrypted windows require a
     /// 64-byte AES-256-XTS key and expose 4096-byte logical blocks.
     /// `flags`: BLK_RO and BLK_VOLATILE; a key adds BLK_ENCRYPT.
+    /// If a successful attach does not confirm encryption, destroy the VM
+    /// so the unconfirmed disk cannot be started accidentally.
     pub fn blk_attach(&self, vm: u64, disk: u64, flags: u64, start: u64, sectors: u64, key: Option<&[u8; 64]>) -> Result<()> {
+        self.attach_disk(vm, disk, flags, start, sectors, key, true)
+    }
+
+    fn attach_disk(&self, vm: u64, disk: u64, flags: u64, start: u64, sectors: u64, key: Option<&[u8; 64]>, destroy_on_mismatch: bool) -> Result<()> {
         let encrypt = if key.is_some() { BLK_ENCRYPT } else { 0 };
         // Older hosts have no per-disk detach operation, and the oldest
         // ignore unknown flags. Check support before attaching.
@@ -707,7 +716,13 @@ impl Ctl {
         }
         let r = self.call(CTL_BLK_ATTACH, &[vm, disk, flags | encrypt, start, sectors], key.map_or(&[][..], |k| &k[..]), &[])?;
         // Also require the host to confirm that this attach applied the flags.
-        if r.vals[0] & encrypt != encrypt { return err("host did not confirm disk encryption; do not start this VM"); }
+        if r.vals[0] & encrypt != encrypt {
+            if !destroy_on_mismatch { return err("host did not confirm disk encryption"); }
+            return match self.vm_destroy(vm) {
+                Ok(()) => err(format!("host did not confirm disk encryption; VM {vm} destroyed")),
+                Err(e) => err(format!("host did not confirm disk encryption; failed to destroy VM {vm}: {}; do not start this VM", e.0)),
+            };
+        }
         Ok(())
     }
 

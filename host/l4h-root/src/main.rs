@@ -740,7 +740,7 @@ fn component_call(h: &mut Host, badge: u64, info: &sel4::MessageInfo) -> Option<
             trustd::done(h, mr(0) as usize);
             reply(0)
         }
-        label if id == l4h_host::vmmgr::VMMGR_ID => Some(vmmgr::call(h, label)),
+        label if id == l4h_host::vmmgr::VMMGR_ID => Some(vmmgr::call(h, label, info.length())),
         other => {
             log!("l4h-root: component {:#x}: unknown call {}", id, other);
             reply(u64::MAX)

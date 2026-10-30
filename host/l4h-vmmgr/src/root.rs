@@ -26,12 +26,13 @@ fn call(label: u64, args: &[u64]) -> Result<[u64; 6], i64> {
     for (i, &a) in args.iter().enumerate() {
         set_mr(i, a);
     }
-    ep().call(sel4::MessageInfo::new(label, 0, 0, args.len()));
-    let result = match mr(0) {
-        0 => Ok(core::array::from_fn(|i| mr(1 + i))),
-        e => Err(e as i64),
+    let reply = ep().call(sel4::MessageInfo::new(label, 0, 0, args.len()));
+    let result = match (reply.length(), mr(0)) {
+        (0, _) => Err(ctl::EIO),
+        (_, 0) => Ok(core::array::from_fn(|i| if 1 + i < reply.length() { mr(1 + i) } else { 0 })),
+        (_, e) => Err(e as i64),
     };
-    sel4::with_ipc_buffer_mut(|b| host::wipe::words(b.msg_regs_mut()));
+    sel4::with_ipc_buffer_mut(|b| host::wipe::words(&mut b.msg_regs_mut()[..args.len().max(reply.length())]));
     result
 }
 
@@ -78,20 +79,21 @@ pub fn guest_del(id: usize) {
 }
 
 /// A window of host disk `disk` for guest `id`'s device `d`: its channel.
-/// `flags`: abi::BLK_*; `key` is used with abi::BLK_ENCRYPT.
-pub fn disk_attach(alloc: &mut Alloc, id: usize, d: usize, disk: usize, flags: u64, lba_start: u64, lba_count: u64, key: &[u8; 64]) -> Result<Backend, i64> {
+/// `flags`: abi::BLK_*; `key` is used with abi::BLK_ENCRYPT.  Returns
+/// the flags applied.
+pub fn disk_attach(alloc: &mut Alloc, id: usize, d: usize, disk: usize, flags: u64, lba_start: u64, lba_count: u64, key: &[u8; 64]) -> Result<(Backend, u64), i64> {
     let mut args = [0; 14];
     args[..6].copy_from_slice(&[id as u64, d as u64, disk as u64, flags, lba_start, lba_count]);
     for (i, bytes) in key.chunks_exact(8).enumerate() { args[6 + i] = u64::from_le_bytes(bytes.try_into().unwrap()); }
     let result = call(VMMGR_DISK_ATTACH, &args);
     host::wipe::words(&mut args);
-    result?;
+    let applied = result?[0];
     let mut chan = ArrayVec::new();
     for i in 0..host::blk::CHANNEL_PAGES {
         chan.must_push(take(alloc, i));
     }
     let kick = take(alloc, host::blk::CHANNEL_PAGES);
-    Ok(Backend::Blk { chan, kick })
+    Ok((Backend::Blk { chan, kick }, applied))
 }
 
 /// A port of netd's `switch` for guest `id`'s device `d`.  The VMM's

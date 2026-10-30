@@ -1394,6 +1394,10 @@ windows must use the same starting sector and key. Destroy drains I/O
 and erases the driver's expanded keys.
 The CLI checks the host's encryption support before attaching a keyed disk.
 On older hosts it fails without adding a disk to the VM.
+If the host advertises support but does not confirm encryption on a
+successful attach, the CLI destroys the unstarted VM and reports the
+failure. This also removes its other attachments; there is no per-disk
+detach operation.
 
 The on-disk format is raw AES-256-XTS, with 4 KiB data units and
 little-endian unit numbers relative to the window. To open the same

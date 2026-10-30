@@ -153,6 +153,7 @@ struct Blkd {
     // Tags are allocated here, never taken from a client. Slots are not
     // reusable until the hardware has completed every command of a request.
     pending: &'static mut [Option<Pending>; MAX_INFLIGHT],
+    free_tags: ArrayVec<usize, MAX_INFLIGHT>,
     bounce: bounce::Bounce,
     cfg: &'static BlkdConfig,
     drv: Drv,
@@ -214,6 +215,7 @@ impl Blkd {
         // before any decryption, notification or client response occurs.
         for &(tag, status) in &completed {
             if let Some(p) = self.pending.get_mut(tag as usize).and_then(|p| p.take()) {
+                self.free_tags.must_push(tag as usize);
                 if let Some(run) = p.bounce { self.bounce.free(run); }
                 if let Some(c) = self.clients[p.client].as_mut() {
                     if status == blk::STATUS_OK && !p.read.is_empty() {
@@ -250,7 +252,7 @@ impl Blkd {
         'rounds: for _round in 0..blk::RING_SIZE / 4 {
             // Capacity only returns when reap runs between submit passes.
             // Stop before polling client rings if no request can start.
-            if !self.drv.can_start() || !self.pending.iter().any(Option::is_none) { break; }
+            if !self.drv.can_start() || self.free_tags.is_empty() { break; }
             for off in 0..n {
                 let i = self.active[(self.next + off) % n];
                 if (first_no_space && first == Some(i)) || parked[i] { continue; }
@@ -268,7 +270,7 @@ impl Blkd {
                     }
                     if state != QueueState::Ready { break; }
                     if !self.drv.can_start() { break 'rounds; }
-                    let Some(tag) = self.pending.iter().position(Option::is_none) else { break 'rounds };
+                    let Some(&tag) = self.free_tags.last() else { break 'rounds };
                     let req = unsafe {
                         fence(Ordering::Acquire);
                         addr_of!((*c.chan).reqs[tail as usize % blk::RING_SIZE]).read_volatile()
@@ -320,6 +322,7 @@ impl Blkd {
                     unsafe { addr_of_mut!((*c.chan).sq.tail).write_volatile(tail.wrapping_add(1)); }
                     match result {
                         Ok(()) => {
+                            self.free_tags.pop();
                             self.pending[tag] = Some(Pending { client: i, id: req.id, unit: req.sector / 8,
                                 read: if req.op == blk::OP_READ && c.encrypted { pieces.clone() } else { ArrayVec::new() },
                                 bounce: run });
@@ -452,6 +455,7 @@ fn main(info: &'static Info) -> ! {
         active: ArrayVec::new(),
         waiting: ArrayVec::new(),
         pending: unsafe { &mut *addr_of_mut!(PENDING) },
+        free_tags: (0..MAX_INFLIGHT).rev().collect(),
         bounce: bounce::Bounce::new(), cfg,
         drv, dev, next: 0, ticks_per_sec: info.header().tsc_hz,
     };
@@ -484,9 +488,11 @@ fn main(info: &'static Info) -> ! {
             blk::BLKD_ADD => {
                 let (i, unit, flags) = (mr(0) as usize, mr(1) as usize, mr(2));
                 let mut key = [0u8; 64];
-                for n in 0..8 { key[8 * n..8 * n + 8].copy_from_slice(&mr(3 + n).to_le_bytes()); }
+                if msg.length() == 11 {
+                    for n in 0..8 { key[8 * n..8 * n + 8].copy_from_slice(&mr(3 + n).to_le_bytes()); }
+                }
                 // Clear incoming key words before any other IPC can use them.
-                sel4::with_ipc_buffer_mut(|b| wipe::words(b.msg_regs_mut()));
+                sel4::with_ipc_buffer_mut(|b| wipe::words(&mut b.msg_regs_mut()[..msg.length()]));
                 let result = b.add(i, unit, flags, &key, msg.length());
                 if result == 0 {
                     response[1] = if b.clients[i].as_ref().unwrap().encrypted { blk::ENCRYPT } else { 0 };
@@ -508,7 +514,6 @@ fn main(info: &'static Info) -> ! {
         b.submit();
         // Legacy virtio kicks invoke IOPort capabilities and overwrite MRs.
         // Marshal the whole reply only after that work has finished.
-        sel4::with_ipc_buffer_mut(|b| wipe::words(b.msg_regs_mut()));
         for (i, v) in response.into_iter().enumerate() { set_mr(i, v); }
         (msg, badge) = ep.reply_recv(sel4::MessageInfo::new(0, 0, 0, 5), reply);
     }
