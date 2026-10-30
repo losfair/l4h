@@ -477,9 +477,13 @@ guest. Where there is an AMD-Vi or Intel VT-d IOMMU, root drives it itself (§8.
   pointer in the saved context at the first C syscall entry, before the
   lock can handle a stall.
 - **0029, large-frame aliases and accessed bits (x86_64 and aarch64).**
-  `Page_DeriveSubframe` derives an unmapped 4 KiB capability from a
+  `Page_DeriveSubframe` derives unmapped 4 KiB capabilities from a
   RAM-backed 2 MiB frame, with a checked aligned offset and intersected
-  rights. It allocates no physical object and never clears live memory.
+  rights. One call derives up to all 512, consecutive from the offset, into
+  a window of consecutive CNode slots that it checks as `Untyped_Retype`
+  checks its destination, all before deriving any. The guest makes a RAM
+  block's aliases with one call, as it made its frames with one retype.
+  It allocates no physical object and never clears live memory.
   The subframe is a smaller region in the capability derivation tree;
   the original Untyped remains an ancestor of both sizes. Deleting the
   large cap leaves its aliases valid; revoking the backing Untyped removes
@@ -492,9 +496,9 @@ guest. Where there is an AMD-Vi or Intel VT-d IOMMU, root drives it itself (§8.
   checking the mapped size and physical address before clearing A/AF. On
   ARM, level-2 access-flag faults are repaired inside seL4, just like the
   existing level-3 faults; permissions are preserved. `run-abitest.sh`
-  checks bounds, destination validation, rights attenuation, simultaneous
-  aliases, large-page execution and aging, stale caps, parent deletion,
-  revocation and zeroing on subsequent reuse.
+  checks bounds, destination validation, full and failed windows, rights
+  attenuation, simultaneous aliases, large-page execution and aging, stale
+  caps, parent deletion, revocation and zeroing on subsequent reuse.
 - E1 (`trapSyscalls`) is our fix for seL4 issue #477, which is still open
   upstream. Without it, Linux syscalls whose syscall-number register
   happens to hold a valid seL4 syscall number are executed as seL4

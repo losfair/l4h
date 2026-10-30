@@ -66,7 +66,10 @@ int l4h_cnode_revoke(unsigned long cap, int depth);
 /* Native 2 MiB leaf; also selects the ARM instruction-cache range. */
 #define L4H_PROT_LARGE		16
 int l4h_page_map(unsigned long frame, unsigned long vspace, unsigned long va, int prot);
-int l4h_page_derive_subframe(unsigned long frame, unsigned long offset, unsigned long dst);
+/* `n` 4 KiB aliases of large `frame` from byte `offset`, into slots like
+ * l4h_retype()'s. */
+int l4h_page_derive_subframes(unsigned long frame, unsigned long offset, unsigned long node_index,
+			      int node_depth, unsigned long node_offset, unsigned long n);
 int l4h_page_unmap(unsigned long frame);
 int l4h_page_test_and_clear_accessed(unsigned long frame, int *accessed);
 int l4h_vspace_flush(unsigned long vspace);

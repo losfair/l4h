@@ -142,12 +142,15 @@ int l4h_page_map(unsigned long frame, unsigned long vspace, unsigned long va, in
 #endif
 }
 
-int l4h_page_derive_subframe(unsigned long frame, unsigned long offset, unsigned long dst)
+int l4h_page_derive_subframes(unsigned long frame, unsigned long offset, unsigned long node_index,
+			      int node_depth, unsigned long node_offset, unsigned long n)
 {
 #ifdef __aarch64__
-	return seL4_ARM_Page_DeriveSubframe(frame, L4H_CNODE_CPTR, dst, 64, offset, seL4_AllRights);
+	return seL4_ARM_Page_DeriveSubframe(frame, L4H_CNODE_CPTR, node_index, node_depth,
+					    node_offset, offset, n, seL4_AllRights);
 #else
-	return seL4_X86_Page_DeriveSubframe(frame, L4H_CNODE_CPTR, dst, 64, offset, seL4_AllRights);
+	return seL4_X86_Page_DeriveSubframe(frame, L4H_CNODE_CPTR, node_index, node_depth,
+					    node_offset, offset, n, seL4_AllRights);
 #endif
 }
 

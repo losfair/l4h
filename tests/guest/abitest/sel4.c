@@ -425,6 +425,20 @@ static int user_test(void)
 	return 0;
 }
 
+/* `n` aliases of large frame `src` from byte `offset`, into slot `dst` on. */
+static int derive(seL4_CPtr src, seL4_CPtr dst, seL4_Word offset, seL4_Word n,
+		  seL4_CapRights_t rights)
+{
+	return frame_derive(src, L4H_CNODE_CPTR, node_index(dst), L4H_ROOT_DEPTH, node_offset(dst),
+			    offset, n, rights);
+}
+
+/* Copy slot `i` of the radix-9 CNode `window` to `dst`: whether it holds a cap. */
+static int window_copy(seL4_CPtr window, seL4_Word i, seL4_CPtr dst)
+{
+	return seL4_CNode_Copy(L4H_CNODE_CPTR, dst, 64, window, i, 9, seL4_AllRights);
+}
+
 /* Native large leaves and subframe aliases, including MDB lifetime. */
 static int large_frame_test(void)
 {
@@ -439,23 +453,52 @@ static int large_frame_test(void)
 	CHECK(!retype(t->large_ut, LARGE_FRAME_TYPE, 0, &large), "large retype", 0);
 	alias = copy_cap(large);
 	CHECK(alias, "large copy", 0);
-	CHECK(frame_derive(large, L4H_CNODE_CPTR, first, 64, 1, seL4_AllRights) == seL4_InvalidArgument,
+	CHECK(derive(large, first, 1, 1, seL4_AllRights) == seL4_InvalidArgument,
 	      "unaligned subframe accepted", 0);
-	CHECK(frame_derive(large, L4H_CNODE_CPTR, first, 64, 1ul << 21, seL4_AllRights) == seL4_InvalidArgument,
+	CHECK(derive(large, first, 1ul << 21, 1, seL4_AllRights) == seL4_InvalidArgument,
 	      "out-of-range subframe accepted", 0);
-	CHECK(frame_derive(large, L4H_CNODE_CPTR, first, 64, ~0ul, seL4_AllRights) == seL4_InvalidArgument,
+	CHECK(derive(large, first, ~0ul, 1, seL4_AllRights) == seL4_InvalidArgument,
 	      "overflow subframe accepted", 0);
-	CHECK(frame_derive(large, ep, first, 64, 0, seL4_AllRights) != 0, "non-CNode destination accepted", 0);
-	CHECK(!frame_derive(large, L4H_CNODE_CPTR, first, 64, 0, seL4_AllRights), "first subframe", 0);
-	CHECK(!frame_derive(alias, L4H_CNODE_CPTR, last, 64, tail, seL4_AllRights), "last subframe through copy", 0);
-	CHECK(frame_derive(large, L4H_CNODE_CPTR, first, 64, 0, seL4_AllRights) == seL4_DeleteFirst,
+	CHECK(frame_derive(large, ep, node_index(first), L4H_ROOT_DEPTH, node_offset(first), 0, 1,
+			   seL4_AllRights) != 0, "non-CNode destination accepted", 0);
+	CHECK(!derive(large, first, 0, 1, seL4_AllRights), "first subframe", 0);
+	CHECK(!derive(alias, last, tail, 1, seL4_AllRights), "last subframe through copy", 0);
+	CHECK(derive(large, first, 0, 1, seL4_AllRights) == seL4_DeleteFirst,
 	      "occupied subframe slot accepted", 0);
-	CHECK(frame_derive(first, L4H_CNODE_CPTR, extra, 64, 0, seL4_AllRights) == seL4_IllegalOperation,
+	CHECK(derive(first, extra, 0, 1, seL4_AllRights) == seL4_IllegalOperation,
 	      "small source accepted", 0);
 	CHECK(frame_address(last).paddr == frame_address(large).paddr + tail, "subframe physical offset", 0);
+	/* One call fills a CNode window, as the guest does per RAM block, and
+	 * derives nothing unless the whole window is valid and empty. */
+	seL4_CPtr window = abitest_obj(L4H_OBJ_CNODE, 9), probe = abitest_slot();
+	static const seL4_Word picks[] = { 0, 1, 300, 511 };
+
+	CHECK(window && probe, "alias window allocation", 0);
+	CHECK(frame_derive(large, L4H_CNODE_CPTR, window, 64, 0, 0, 0, seL4_AllRights) == seL4_RangeError,
+	      "zero aliases accepted", 0);
+	CHECK(frame_derive(large, L4H_CNODE_CPTR, window, 64, 0, tail, 2, seL4_AllRights) == seL4_RangeError,
+	      "aliases past the large frame accepted", 0);
+	CHECK(frame_derive(large, L4H_CNODE_CPTR, window, 64, 1, 0, 512, seL4_AllRights) == seL4_RangeError,
+	      "window overrun accepted", 0);
+	CHECK(frame_derive(large, L4H_CNODE_CPTR, window, 64, 512, 0, 1, seL4_AllRights) == seL4_RangeError,
+	      "window offset past the CNode accepted", 0);
+	CHECK(!frame_derive(large, L4H_CNODE_CPTR, window, 64, 300, 0, 1, seL4_AllRights),
+	      "one alias in the window", 0);
+	CHECK(frame_derive(large, L4H_CNODE_CPTR, window, 64, 0, 0, 512, seL4_AllRights) == seL4_DeleteFirst,
+	      "occupied window slot accepted", 0);
+	CHECK(window_copy(window, 0, probe) == seL4_FailedLookup, "failed window derived an alias", 0);
+	CHECK(!seL4_CNode_Delete(window, 300, 9), "empty the window", 0);
+	CHECK(!frame_derive(large, L4H_CNODE_CPTR, window, 64, 0, 0, 512, seL4_AllRights),
+	      "512 aliases in one call", 0);
+	for (unsigned int i = 0; i < sizeof(picks) / sizeof(picks[0]); i++) {
+		CHECK(!window_copy(window, picks[i], probe), "window alias missing", picks[i]);
+		CHECK(frame_address(probe).paddr == frame_address(large).paddr + picks[i] * 4096,
+		      "window alias physical offset", picks[i]);
+		CHECK(!seL4_CNode_Delete(L4H_CNODE_CPTR, probe, 64), "delete window probe", picks[i]);
+	}
 	CHECK(!seL4_CNode_Copy(L4H_CNODE_CPTR, ro, 64, L4H_CNODE_CPTR, large, 64, seL4_CanRead),
 	      "read-only parent", 0);
-	CHECK(!frame_derive(ro, L4H_CNODE_CPTR, ro_child, 64, 0, seL4_AllRights), "derive read-only", 0);
+	CHECK(!derive(ro, ro_child, 0, 1, seL4_AllRights), "derive read-only", 0);
 	seL4_CPtr ro_copy = copy_cap(ro_child);
 	CHECK(ro_copy, "copy read-only subframe", 0);
 	/* Narrowing a read-only large copy must not grant revocation power
@@ -503,7 +546,8 @@ static int large_frame_test(void)
 	CHECK(!seL4_CNode_Revoke(L4H_CNODE_CPTR, large, 64), "revoke large", 0);
 	CHECK(frame_address(first).error && frame_address(last).error && frame_address(alias).error &&
 	      frame_address(ro_child).error, "large revoke left aliases", 0);
-	CHECK(!frame_derive(large, L4H_CNODE_CPTR, extra, 64, 0, seL4_AllRights), "derive after revoke", 0);
+	CHECK(window_copy(window, 511, probe) == seL4_FailedLookup, "large revoke left window aliases", 0);
+	CHECK(!derive(large, extra, 0, 1, seL4_AllRights), "derive after revoke", 0);
 	seL4_CPtr survivor = copy_cap(extra);
 	volatile uint64_t *q = abitest_map(survivor, 6);
 	CHECK(q && *q == 0x12345678, "derivation or revoke changed contents", 0);
@@ -514,14 +558,14 @@ static int large_frame_test(void)
 	CHECK(!seL4_CNode_Revoke(L4H_CNODE_CPTR, t->large_ut, 64), "revoke alias backing", 0);
 	CHECK(frame_address(extra).error && frame_address(survivor).error, "untyped revoke left alias", 0);
 	CHECK(!retype(t->large_ut, LARGE_FRAME_TYPE, 0, &large), "reuse large backing", 0);
-	CHECK(!frame_derive(large, L4H_CNODE_CPTR, extra, 64, 0, seL4_AllRights), "derive reused backing", 0);
+	CHECK(!derive(large, extra, 0, 1, seL4_AllRights), "derive reused backing", 0);
 	q = abitest_map(extra, 7);
 	CHECK(q && !*q, "reused backing not zeroed", 0);
-	CHECK(!frame_derive(large, L4H_CNODE_CPTR, last, 64, tail, seL4_AllRights), "derive reused tail", 0);
+	CHECK(!derive(large, last, tail, 1, seL4_AllRights), "derive reused tail", 0);
 	q = abitest_map(last, 6);
 	CHECK(q && !*q, "reused tail not zeroed", 0);
 	CHECK(!seL4_CNode_Revoke(L4H_CNODE_CPTR, t->large_ut, 64), "final backing revoke", 0);
-	say("2 MiB leaves: alias bounds/rights, tail execution, AF, demotion, parent deletion and Untyped revoke: ok");
+	say("2 MiB leaves: alias bounds/rights/windows, tail execution, AF, demotion, parent deletion and Untyped revoke: ok");
 	return 0;
 }
 

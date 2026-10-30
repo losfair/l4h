@@ -1,41 +1,52 @@
-From 421c8293a1bc9575d1e7ac428ac0540538eb7ea7 Mon Sep 17 00:00:00 2001
+From 33c59e6ea6109520dc57f2e3d947ee01696db792 Mon Sep 17 00:00:00 2001
 From: Heyang Zhou <hello@su3.io>
 Date: Fri, 30 Oct 2026 09:40:18 -0700
 Subject: [PATCH] vspace: derive 4 KiB aliases of 2 MiB RAM frames and sample
  large leaves
 
 ---
- .../arm/interfaces/object-api-arch.xml        | 25 +++++-
- .../x86/interfaces/object-api-arch.xml        | 25 +++++-
- src/arch/arm/64/kernel/vspace.c               | 57 +++++++++++--
- src/arch/x86/kernel/vspace.c                  | 83 ++++++++++++++++---
- 4 files changed, 167 insertions(+), 23 deletions(-)
+ .../arm/interfaces/object-api-arch.xml        |  36 ++++-
+ .../x86/interfaces/object-api-arch.xml        |  36 ++++-
+ src/arch/arm/64/kernel/vspace.c               |  97 +++++++++++++-
+ src/arch/x86/kernel/vspace.c                  | 123 ++++++++++++++++--
+ 4 files changed, 269 insertions(+), 23 deletions(-)
 
 diff --git a/libsel4/arch_include/arm/interfaces/object-api-arch.xml b/libsel4/arch_include/arm/interfaces/object-api-arch.xml
-index 59faf2c99..90f9cbfc3 100644
+index 59faf2c..ae4e70d 100644
 --- a/libsel4/arch_include/arm/interfaces/object-api-arch.xml
 +++ b/libsel4/arch_include/arm/interfaces/object-api-arch.xml
-@@ -408,21 +408,40 @@
+@@ -408,21 +408,51 @@
                  </description>
              </error>
          </method>
 +        <method id="ARMPageDeriveSubframe" name="DeriveSubframe" manual_name="Derive Subframe">
 +            <condition><config var="CONFIG_ARCH_AARCH64"/></condition>
-+            <brief>Derive a 4 KiB alias of a RAM-backed 2 MiB frame.</brief>
++            <brief>Derive 4 KiB aliases of a RAM-backed 2 MiB frame.</brief>
 +            <description>
-+                Offset must be 4 KiB aligned and below 2 MiB. The destination
-+                must be empty. Rights are intersected with the source's rights.
-+                Memory is neither allocated nor cleared. The result is unmapped
-+                and remains in the source Untyped's derivation tree, so revoking
-+                that Untyped deletes both sizes of aliases before memory reuse.
-+                Deleting the source leaves its aliases alive. Derived aliases
-+                and ordinary copies retain non-revocable frame-copy semantics:
-+                an alias does not gain authority to revoke other aliases.
++                Derives count consecutive aliases, starting at offset, into
++                consecutive slots of a destination CNode. The destination
++                CNode, window and empty-slot checks are those of
++                Untyped_Retype; nothing is derived unless every check passes.
++                Offset must be 4 KiB aligned, and offset + count * 4 KiB
++                must not exceed 2 MiB. Rights are intersected with the
++                source's rights. Memory is neither allocated nor cleared. The
++                results are unmapped and remain in the source Untyped's
++                derivation tree, so revoking that Untyped deletes both sizes
++                of aliases before memory reuse. Deleting the source leaves its
++                aliases alive. Derived aliases and ordinary copies retain
++                non-revocable frame-copy semantics: an alias does not gain
++                authority to revoke other aliases.
 +            </description>
-+            <param dir="in" name="root" type="seL4_CNode" description="Destination CSpace root."/>
-+            <param dir="in" name="index" type="seL4_Word" description="Destination CPtr."/>
-+            <param dir="in" name="depth" type="seL4_Word" description="Destination lookup depth."/>
-+            <param dir="in" name="offset" type="seL4_Word" description="Byte offset in the large frame."/>
++            <param dir="in" name="root" type="seL4_CNode"
++                description="CPtr to the CNode at the root of the destination CSpace."/>
++            <param dir="in" name="node_index" type="seL4_Word"
++                description="CPtr to the destination CNode, resolved relative to the root parameter."/>
++            <param dir="in" name="node_depth" type="seL4_Word"
++                description="Number of bits of node_index to translate; zero uses the root CNode itself."/>
++            <param dir="in" name="node_offset" type="seL4_Word"
++                description="Slot of the destination CNode for the first alias."/>
++            <param dir="in" name="offset" type="seL4_Word" description="Byte offset in the large frame of the first alias."/>
++            <param dir="in" name="count" type="seL4_Word" description="Number of aliases to derive."/>
 +            <param dir="in" name="rights" type="seL4_CapRights_t" description="Maximum derived rights."/>
 +        </method>
          <method id="ARMPageTestAndClearAccessed" name="TestAndClearAccessed"
@@ -60,30 +71,41 @@ index 59faf2c99..90f9cbfc3 100644
              <error name="seL4_InvalidCapability">
                  <description>The capability's mapping is stale.</description>
 diff --git a/libsel4/arch_include/x86/interfaces/object-api-arch.xml b/libsel4/arch_include/x86/interfaces/object-api-arch.xml
-index ecdbbeff7..23ade4165 100644
+index ecdbbef..b122975 100644
 --- a/libsel4/arch_include/x86/interfaces/object-api-arch.xml
 +++ b/libsel4/arch_include/x86/interfaces/object-api-arch.xml
-@@ -393,21 +393,40 @@
+@@ -393,21 +393,51 @@
                  </description>
              </error>
          </method>
 +        <method id="X86PageDeriveSubframe" name="DeriveSubframe" manual_name="Derive Subframe">
 +            <condition><config var="CONFIG_ARCH_X86_64"/></condition>
-+            <brief>Derive a 4 KiB alias of a RAM-backed 2 MiB frame.</brief>
++            <brief>Derive 4 KiB aliases of a RAM-backed 2 MiB frame.</brief>
 +            <description>
-+                Offset must be 4 KiB aligned and below 2 MiB. The destination
-+                must be empty. Rights are intersected with the source's rights.
-+                Memory is neither allocated nor cleared. The result is unmapped
-+                and remains in the source Untyped's derivation tree, so revoking
-+                that Untyped deletes both sizes of aliases before memory reuse.
-+                Deleting the source leaves its aliases alive. Derived aliases
-+                and ordinary copies retain non-revocable frame-copy semantics:
-+                an alias does not gain authority to revoke other aliases.
++                Derives count consecutive aliases, starting at offset, into
++                consecutive slots of a destination CNode. The destination
++                CNode, window and empty-slot checks are those of
++                Untyped_Retype; nothing is derived unless every check passes.
++                Offset must be 4 KiB aligned, and offset + count * 4 KiB
++                must not exceed 2 MiB. Rights are intersected with the
++                source's rights. Memory is neither allocated nor cleared. The
++                results are unmapped and remain in the source Untyped's
++                derivation tree, so revoking that Untyped deletes both sizes
++                of aliases before memory reuse. Deleting the source leaves its
++                aliases alive. Derived aliases and ordinary copies retain
++                non-revocable frame-copy semantics: an alias does not gain
++                authority to revoke other aliases.
 +            </description>
-+            <param dir="in" name="root" type="seL4_CNode" description="Destination CSpace root."/>
-+            <param dir="in" name="index" type="seL4_Word" description="Destination CPtr."/>
-+            <param dir="in" name="depth" type="seL4_Word" description="Destination lookup depth."/>
-+            <param dir="in" name="offset" type="seL4_Word" description="Byte offset in the large frame."/>
++            <param dir="in" name="root" type="seL4_CNode"
++                description="CPtr to the CNode at the root of the destination CSpace."/>
++            <param dir="in" name="node_index" type="seL4_Word"
++                description="CPtr to the destination CNode, resolved relative to the root parameter."/>
++            <param dir="in" name="node_depth" type="seL4_Word"
++                description="Number of bits of node_index to translate; zero uses the root CNode itself."/>
++            <param dir="in" name="node_offset" type="seL4_Word"
++                description="Slot of the destination CNode for the first alias."/>
++            <param dir="in" name="offset" type="seL4_Word" description="Byte offset in the large frame of the first alias."/>
++            <param dir="in" name="count" type="seL4_Word" description="Number of aliases to derive."/>
 +            <param dir="in" name="rights" type="seL4_CapRights_t" description="Maximum derived rights."/>
 +        </method>
          <method id="X86PageTestAndClearAccessed" name="TestAndClearAccessed"
@@ -108,7 +130,7 @@ index ecdbbeff7..23ade4165 100644
              <error name="seL4_InvalidCapability">
                  <description>The capability's mapping is stale.</description>
 diff --git a/src/arch/arm/64/kernel/vspace.c b/src/arch/arm/64/kernel/vspace.c
-index 8d78d3f0b..0386dd1c8 100644
+index 8d78d3f..d744adf 100644
 --- a/src/arch/arm/64/kernel/vspace.c
 +++ b/src/arch/arm/64/kernel/vspace.c
 @@ -712,11 +712,12 @@ static pte_t makeUserPagePTE(paddr_t paddr, vm_rights_t vm_rights, vm_attributes
@@ -158,17 +180,19 @@ index 8d78d3f0b..0386dd1c8 100644
          pte_get_page_base_address(*lu_ret.ptSlot) !=
          pptr_to_paddr((void *)cap_frame_cap_get_capFBasePtr(cap))) {
          goto stale;
-@@ -1593,10 +1596,52 @@ stale:
+@@ -1593,10 +1596,92 @@ stale:
  }
  #endif
  
-+/* Derive an alias, not a new object: no retype, zeroing, or ownership
++/* Derive aliases, not new objects: no retype, zeroing, or ownership
 + * transfer. The Untyped remains the ancestor of every alias. Like a
-+ * frame copy, the alias is non-revocable: deriving a narrower region
-+ * must not give its holder authority to revoke a sibling alias. */
++ * frame copy, each alias is non-revocable: deriving a narrower region
++ * must not give its holder authority to revoke a sibling alias.
++ * The destination window is checked as Untyped_Retype checks it, so one
++ * call fills a CNode with all 512 aliases of a large frame. */
 +static exception_t decodePageDeriveSubframe(word_t length, cte_t *src, cap_t cap, word_t *buffer)
 +{
-+    if (length < 4 || current_extra_caps.excaprefs[0] == NULL) {
++    if (length < 6 || current_extra_caps.excaprefs[0] == NULL) {
 +        current_syscall_error.type = seL4_TruncatedMessage;
 +        return EXCEPTION_SYSCALL_ERROR;
 +    }
@@ -176,29 +200,67 @@ index 8d78d3f0b..0386dd1c8 100644
 +        current_syscall_error.type = seL4_IllegalOperation;
 +        return EXCEPTION_SYSCALL_ERROR;
 +    }
-+    word_t offset = getSyscallArg(2, buffer);
++    word_t nodeIndex = getSyscallArg(0, buffer);
++    word_t nodeDepth = getSyscallArg(1, buffer);
++    word_t nodeOffset = getSyscallArg(2, buffer);
++    word_t offset = getSyscallArg(3, buffer);
++    word_t count = getSyscallArg(4, buffer);
 +    if (offset >= BIT(21) || !IS_ALIGNED(offset, 12)) {
 +        current_syscall_error.type = seL4_InvalidArgument;
-+        current_syscall_error.invalidArgumentNumber = 2;
++        current_syscall_error.invalidArgumentNumber = 3;
 +        return EXCEPTION_SYSCALL_ERROR;
 +    }
-+    lookupSlot_ret_t lu = lookupTargetSlot(current_extra_caps.excaprefs[0]->cap,
-+                                           getSyscallArg(0, buffer), getSyscallArg(1, buffer));
-+    if (lu.status != EXCEPTION_NONE) {
-+        return lu.status;
++    if (count < 1 || count > (BIT(21) - offset) >> 12) {
++        current_syscall_error.type = seL4_RangeError;
++        current_syscall_error.rangeErrorMin = 1;
++        current_syscall_error.rangeErrorMax = (BIT(21) - offset) >> 12;
++        return EXCEPTION_SYSCALL_ERROR;
 +    }
-+    exception_t status = ensureEmptySlot(lu.slot);
-+    if (status != EXCEPTION_NONE) {
-+        return status;
++    cap_t nodeCap = current_extra_caps.excaprefs[0]->cap;
++    if (nodeDepth != 0) {
++        lookupSlot_ret_t lu = lookupTargetSlot(nodeCap, nodeIndex, nodeDepth);
++        if (lu.status != EXCEPTION_NONE) {
++            return lu.status;
++        }
++        nodeCap = lu.slot->cap;
 +    }
-+    cap = cap_frame_cap_set_capFBasePtr(cap, cap_frame_cap_get_capFBasePtr(cap) + offset);
++    if (cap_get_capType(nodeCap) != cap_cnode_cap) {
++        current_syscall_error.type = seL4_FailedLookup;
++        current_syscall_error.failedLookupWasSource = 0;
++        current_lookup_fault = lookup_fault_missing_capability_new(nodeDepth);
++        return EXCEPTION_SYSCALL_ERROR;
++    }
++    word_t nodeSize = BIT(cap_cnode_cap_get_capCNodeRadix(nodeCap));
++    if (nodeOffset > nodeSize - 1) {
++        current_syscall_error.type = seL4_RangeError;
++        current_syscall_error.rangeErrorMin = 0;
++        current_syscall_error.rangeErrorMax = nodeSize - 1;
++        return EXCEPTION_SYSCALL_ERROR;
++    }
++    if (count > nodeSize - nodeOffset) {
++        current_syscall_error.type = seL4_RangeError;
++        current_syscall_error.rangeErrorMin = 1;
++        current_syscall_error.rangeErrorMax = nodeSize - nodeOffset;
++        return EXCEPTION_SYSCALL_ERROR;
++    }
++    cte_t *dest = CTE_PTR(cap_cnode_cap_get_capCNodePtr(nodeCap)) + nodeOffset;
++    for (word_t i = 0; i < count; i++) {
++        exception_t status = ensureEmptySlot(dest + i);
++        if (status != EXCEPTION_NONE) {
++            return status;
++        }
++    }
++    word_t base = cap_frame_cap_get_capFBasePtr(cap) + offset;
 +    cap = cap_frame_cap_set_capFSize(cap, ARMSmallPage);
 +    cap = cap_frame_cap_set_capFVMRights(cap, maskVMRights(cap_frame_cap_get_capFVMRights(cap),
-+                                                        rightsFromWord(getSyscallArg(3, buffer))));
++                                                        rightsFromWord(getSyscallArg(5, buffer))));
 +    cap = cap_frame_cap_set_capFMappedASID(cap, asidInvalid);
 +    cap = cap_frame_cap_set_capFMappedAddress(cap, 0);
 +    setThreadState(NODE_STATE(ksCurThread), ThreadState_Restart);
-+    cteInsert(cap, src, lu.slot);
++    /* At most 512 inserts, like a Retype within the fan-out limit. */
++    for (word_t i = 0; i < count; i++) {
++        cteInsert(cap_frame_cap_set_capFBasePtr(cap, base + (i << 12)), src, dest + i);
++    }
 +    return EXCEPTION_NONE;
 +}
 +
@@ -212,7 +274,7 @@ index 8d78d3f0b..0386dd1c8 100644
          vptr_t vaddr;
          paddr_t base;
 diff --git a/src/arch/x86/kernel/vspace.c b/src/arch/x86/kernel/vspace.c
-index f9f4d6d30..37da8aca3 100644
+index f9f4d6d..4677614 100644
 --- a/src/arch/x86/kernel/vspace.c
 +++ b/src/arch/x86/kernel/vspace.c
 @@ -6,6 +6,8 @@
@@ -272,18 +334,20 @@ index f9f4d6d30..37da8aca3 100644
      tcb_t *thread = NODE_STATE(ksCurThread);
      if (call) {
          word_t *ipcBuffer = lookupIPCBuffer(true, thread);
-@@ -1025,6 +1038,50 @@ stale:
+@@ -1025,6 +1038,90 @@ stale:
  }
  #endif
  
 +#ifdef CONFIG_ARCH_X86_64
-+/* Derive an alias, not a new object: no retype, zeroing, or ownership
++/* Derive aliases, not new objects: no retype, zeroing, or ownership
 + * transfer. The Untyped remains the ancestor of every alias. Like a
-+ * frame copy, the alias is non-revocable: deriving a narrower region
-+ * must not give its holder authority to revoke a sibling alias. */
++ * frame copy, each alias is non-revocable: deriving a narrower region
++ * must not give its holder authority to revoke a sibling alias.
++ * The destination window is checked as Untyped_Retype checks it, so one
++ * call fills a CNode with all 512 aliases of a large frame. */
 +static exception_t decodePageDeriveSubframe(word_t length, cte_t *src, cap_t cap, word_t *buffer)
 +{
-+    if (length < 4 || current_extra_caps.excaprefs[0] == NULL) {
++    if (length < 6 || current_extra_caps.excaprefs[0] == NULL) {
 +        current_syscall_error.type = seL4_TruncatedMessage;
 +        return EXCEPTION_SYSCALL_ERROR;
 +    }
@@ -291,30 +355,68 @@ index f9f4d6d30..37da8aca3 100644
 +        current_syscall_error.type = seL4_IllegalOperation;
 +        return EXCEPTION_SYSCALL_ERROR;
 +    }
-+    word_t offset = getSyscallArg(2, buffer);
++    word_t nodeIndex = getSyscallArg(0, buffer);
++    word_t nodeDepth = getSyscallArg(1, buffer);
++    word_t nodeOffset = getSyscallArg(2, buffer);
++    word_t offset = getSyscallArg(3, buffer);
++    word_t count = getSyscallArg(4, buffer);
 +    if (offset >= BIT(21) || !IS_ALIGNED(offset, 12)) {
 +        current_syscall_error.type = seL4_InvalidArgument;
-+        current_syscall_error.invalidArgumentNumber = 2;
++        current_syscall_error.invalidArgumentNumber = 3;
 +        return EXCEPTION_SYSCALL_ERROR;
 +    }
-+    lookupSlot_ret_t lu = lookupTargetSlot(current_extra_caps.excaprefs[0]->cap,
-+                                           getSyscallArg(0, buffer), getSyscallArg(1, buffer));
-+    if (lu.status != EXCEPTION_NONE) {
-+        return lu.status;
++    if (count < 1 || count > (BIT(21) - offset) >> 12) {
++        current_syscall_error.type = seL4_RangeError;
++        current_syscall_error.rangeErrorMin = 1;
++        current_syscall_error.rangeErrorMax = (BIT(21) - offset) >> 12;
++        return EXCEPTION_SYSCALL_ERROR;
 +    }
-+    exception_t status = ensureEmptySlot(lu.slot);
-+    if (status != EXCEPTION_NONE) {
-+        return status;
++    cap_t nodeCap = current_extra_caps.excaprefs[0]->cap;
++    if (nodeDepth != 0) {
++        lookupSlot_ret_t lu = lookupTargetSlot(nodeCap, nodeIndex, nodeDepth);
++        if (lu.status != EXCEPTION_NONE) {
++            return lu.status;
++        }
++        nodeCap = lu.slot->cap;
 +    }
-+    cap = cap_frame_cap_set_capFBasePtr(cap, cap_frame_cap_get_capFBasePtr(cap) + offset);
++    if (cap_get_capType(nodeCap) != cap_cnode_cap) {
++        current_syscall_error.type = seL4_FailedLookup;
++        current_syscall_error.failedLookupWasSource = 0;
++        current_lookup_fault = lookup_fault_missing_capability_new(nodeDepth);
++        return EXCEPTION_SYSCALL_ERROR;
++    }
++    word_t nodeSize = BIT(cap_cnode_cap_get_capCNodeRadix(nodeCap));
++    if (nodeOffset > nodeSize - 1) {
++        current_syscall_error.type = seL4_RangeError;
++        current_syscall_error.rangeErrorMin = 0;
++        current_syscall_error.rangeErrorMax = nodeSize - 1;
++        return EXCEPTION_SYSCALL_ERROR;
++    }
++    if (count > nodeSize - nodeOffset) {
++        current_syscall_error.type = seL4_RangeError;
++        current_syscall_error.rangeErrorMin = 1;
++        current_syscall_error.rangeErrorMax = nodeSize - nodeOffset;
++        return EXCEPTION_SYSCALL_ERROR;
++    }
++    cte_t *dest = CTE_PTR(cap_cnode_cap_get_capCNodePtr(nodeCap)) + nodeOffset;
++    for (word_t i = 0; i < count; i++) {
++        exception_t status = ensureEmptySlot(dest + i);
++        if (status != EXCEPTION_NONE) {
++            return status;
++        }
++    }
++    word_t base = cap_frame_cap_get_capFBasePtr(cap) + offset;
 +    cap = cap_frame_cap_set_capFSize(cap, X86_SmallPage);
 +    cap = cap_frame_cap_set_capFVMRights(cap, maskVMRights(cap_frame_cap_get_capFVMRights(cap),
-+                                                        rightsFromWord(getSyscallArg(3, buffer))));
++                                                        rightsFromWord(getSyscallArg(5, buffer))));
 +    cap = cap_frame_cap_set_capFMappedASID(cap, asidInvalid);
 +    cap = cap_frame_cap_set_capFMappedAddress(cap, 0);
 +    cap = cap_frame_cap_set_capFMapType(cap, X86_MappingNone);
 +    setThreadState(NODE_STATE(ksCurThread), ThreadState_Restart);
-+    cteInsert(cap, src, lu.slot);
++    /* At most 512 inserts, like a Retype within the fan-out limit. */
++    for (word_t i = 0; i < count; i++) {
++        cteInsert(cap_frame_cap_set_capFBasePtr(cap, base + (i << 12)), src, dest + i);
++    }
 +    return EXCEPTION_NONE;
 +}
 +
@@ -323,7 +425,7 @@ index f9f4d6d30..37da8aca3 100644
  exception_t decodeX86FrameInvocation(
      word_t invLabel,
      word_t length,
-@@ -1035,6 +1092,10 @@ exception_t decodeX86FrameInvocation(
+@@ -1035,6 +1132,10 @@ exception_t decodeX86FrameInvocation(
  )
  {
      switch (invLabel) {
@@ -335,5 +437,5 @@ index f9f4d6d30..37da8aca3 100644
          word_t          vaddr;
          word_t          vtop;
 -- 
-2.47.3
+2.43.0
 

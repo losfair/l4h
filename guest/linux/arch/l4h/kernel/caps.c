@@ -700,15 +700,17 @@ void __init l4h_map_kernel_early(unsigned long frame, unsigned long va)
  * allocation. Revoking the block Untyped tears down both sizes. */
 static int make_block_frames(unsigned long ut, unsigned long gpa, unsigned long *large)
 {
-	unsigned long slot = l4h_slot_alloc(), i;
+	unsigned long slot = l4h_slot_alloc();
 	int err;
 
 	if (!slot)
 		return -ENOMEM;
 	err = l4h_retype(ut, L4H_OBJ_LARGE_FRAME, 0, slot >> L4H_L2_INDEX_BITS,
 			 L4H_ROOT_DEPTH, slot & (L2_SLOTS - 1), 1);
-	for (i = 0; !err && i < RAM_BLOCK_PAGES; i++)
-		err = l4h_page_derive_subframe(slot, i * PAGE_SIZE, L4H_FRAME_CPTR(gpa + i * PAGE_SIZE));
+	/* All 512 in one call, into the block's RAM CNode. */
+	if (!err)
+		err = l4h_page_derive_subframes(slot, 0, L4H_FRAME_CPTR(gpa) >> L4H_RAM_L2_BITS,
+						L4H_ROOT_DEPTH + L4H_RAM_L2_BITS, 0, RAM_BLOCK_PAGES);
 	if (err) {
 		WARN_ON(l4h_cnode_revoke(ut, 64));
 		l4h_slot_free(slot);
