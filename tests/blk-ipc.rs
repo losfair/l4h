@@ -88,7 +88,10 @@ mod production {
 
     pub fn run(info: &'static crate::Info) -> ! {
         // Tests serialize access, and the previous loop has unwound.
-        unsafe { CLIENTS = [const { None }; blk::MAX_CLIENTS]; }
+        unsafe {
+            CLIENTS = [const { None }; blk::MAX_CLIENTS];
+            RESERVED = blk::Reservations::new();
+        }
         main(info)
     }
 }
@@ -215,4 +218,11 @@ fn provisioning_status_survives_scsi_retry() {
     for status in [blk::STATUS_OK, blk::STATUS_IOERR] {
         assert_eq!(run(blk::BLKD_VIRTIO_SCSI, true, blk::BLKD_FLUSH, false, true, status)[0], status as u64);
     }
+}
+
+#[test]
+fn refused_provisioning_reports_its_errno() {
+    // Sector 0, length 0: not a flush, so not a valid range.
+    let r = run(blk::BLKD_VIRTIO, true, blk::BLKD_WRITE, true, false, 0);
+    assert_eq!(r[..2], [blk::BLKD_REFUSED, blk::EINVAL]);
 }

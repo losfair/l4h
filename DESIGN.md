@@ -1665,9 +1665,15 @@ thin provisioning or copy-on-write.
   identical IDs from different clients cannot collide.
 - **Validation.** Descriptor buffers must lie in the client's I/O pool; blkd
   translates pool GPAs to physical addresses, and the device never sees
-  guest RAM. Root and blkd both enforce the overlap rule
-  (`DiskWindow::conflicts`). Requests are checked with checked arithmetic
-  for block alignment, direction, permissions, operation and pool bounds.
+  guest RAM. Requests are checked with checked arithmetic for block
+  alignment, direction, permissions, operation and pool bounds.
+- **Who may use which sectors.** blkd alone decides: the overlap rule
+  (`DiskWindow::conflicts`), dom0's boot reservations and provisioning
+  exclusion (`blk::Reservations`). Root only asks: `BLKD_CHECK` gives the
+  errno or the slot to attach in before root allocates anything, and
+  `BLKD_ADD` repeats the check. Root parses no ranges of dom0's and keeps
+  its attachment records only for teardown and reports. blkd sends the
+  commands, so a second check in root could not stop a faulty one.
 - **Volatile attachments.** `BLK_ATTACH` takes flags: `BLK_RO`, and
   `BLK_VOLATILE` for a disk whose contents need not survive a power failure,
   such as the scratch disk of a VM discarded with it. Its VMM does not offer
@@ -2346,15 +2352,15 @@ settings.
 - dom0's whole device plan must fit in 64 slots, including console, control,
   memory and attestation devices, all disk windows and NICs; oversized plans
   stop boot, and neither list is truncated.
-- Root reserves every boot disk range before attaching it and keeps those
-  reservations across dom0 restarts. If an attachment fails, dom0 gets a
+- Root has blkd reserve every boot disk range before attaching it
+  (`BLKD_RESERVE`); blkd keeps those reservations across dom0 restarts. If an attachment fails, dom0 gets a
   zero-capacity, read-only virtio-blk device in that position, which fails
   all I/O without a driver channel or DMA mappings, so other disks keep their
   names and dom0 can still boot. The range stays reserved against
   provisioning and conflicting attachments. When a failed disk cannot report
   its capacity, root checks the configured ranges for alignment, overflow
-  and overlap and reserves them; a whole-disk reservation covers all aligned
-  sectors. The same applies to an automatically selected whole disk whose
+  and overlap and lists them as dom0's (its controller serves nothing); a
+  whole-disk reservation covers all aligned sectors. The same applies to an automatically selected whole disk whose
   capacity is not a multiple of eight sectors.
 - dom0 sees filesystem devices, not the physical partition table: GRUB reads
   the physical GPT before l4h starts, and both GPT headers stay intact.
