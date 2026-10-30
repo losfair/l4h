@@ -6,6 +6,7 @@
 #include <linux/module.h>
 #include <linux/sizes.h>
 #include <linux/uaccess.h>
+#include <l4h_vspace.h>
 #include "page-aging.h"
 
 static long aging_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
@@ -16,7 +17,7 @@ static long aging_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	unsigned long addr, end;
 	long young = 0;
 
-	if (cmd != L4H_AGING_SAMPLE)
+	if (cmd != L4H_AGING_SAMPLE && cmd != L4H_LARGE_MAPPINGS)
 		return -ENOTTY;
 	if (copy_from_user(&range, (void __user *)arg, sizeof(range)))
 		return -EFAULT;
@@ -25,6 +26,8 @@ static long aging_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	if (!range.size || range.size > SZ_64M || end < addr ||
 	    !PAGE_ALIGNED(addr) || !PAGE_ALIGNED(end))
 		return -EINVAL;
+	if (cmd == L4H_LARGE_MAPPINGS)
+		return l4h_mm_large_mappings(mm, addr, end);
 	/* The write lock excludes collapse and keeps the hierarchy alive.
 	 * Leaf locks also exclude splitting and reclaim. */
 	mmap_write_lock(mm);

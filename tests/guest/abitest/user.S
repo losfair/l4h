@@ -2,7 +2,7 @@
 /* The user program of the ABI test, copied to a page of its own. */
 	.section .rodata, "a"
 	.balign 16
-	.globl user_prog, user_debug, user_write, user_end
+	.globl user_prog, user_debug, user_write, user_large, user_large_write, user_end
 #ifdef __aarch64__
 user_prog:
 	/* d0 = 0x1122334455667788 to check FPU state transfer. */
@@ -45,6 +45,15 @@ user_write:
 	mov	x1, #0x500000
 	str	x1, [x1]
 	brk	#0
+user_large:
+	mov	x1, #0x1000000
+	ldr	x0, [x1]
+	mov	x8, #172
+	svc	#0
+user_large_write:
+	mov	x1, #0x1000000
+	str	x1, [x1]
+	brk	#0
 #else
 user_prog:
 	/* xmm0 = 0x1122334455667788 to check FPU state transfer. */
@@ -85,6 +94,15 @@ user_debug:
 4:	jmp	4b
 user_write:
 	movq	$0x500000, %rbx
+	movq	%rbx, (%rbx)
+	ud2
+user_large:
+	movq	$0x1000000, %rbx
+	movq	(%rbx), %rdi
+	movq	$39, %rax
+	syscall
+user_large_write:
+	movq	$0x1000000, %rbx
 	movq	%rbx, (%rbx)
 	ud2
 #endif

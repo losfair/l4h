@@ -74,6 +74,9 @@ static inline uint64_t rdtsc(void)
 #define SYSCALL_INSN_LEN	4
 #define FPU_V0_OFFSET		0
 #define FRAME_TYPE		seL4_ARM_SmallPageObject
+#define LARGE_FRAME_TYPE	seL4_ARM_LargePageObject
+#define frame_derive		seL4_ARM_Page_DeriveSubframe
+#define frame_address		seL4_ARM_Page_GetAddress
 #define frame_unmap		seL4_ARM_Page_Unmap
 #define frame_accessed		seL4_ARM_Page_TestAndClearAccessed
 #define accessed_result		seL4_ARM_Page_TestAndClearAccessed_t
@@ -89,6 +92,9 @@ static inline uint64_t rdtsc(void)
 #define SYSCALL_INSN_LEN	2
 #define FPU_V0_OFFSET		160
 #define FRAME_TYPE		seL4_X86_4K
+#define LARGE_FRAME_TYPE	seL4_X86_LargePageObject
+#define frame_derive		seL4_X86_Page_DeriveSubframe
+#define frame_address		seL4_X86_Page_GetAddress
 #define frame_unmap		seL4_X86_Page_Unmap
 #define frame_accessed		seL4_X86_Page_TestAndClearAccessed
 #define accessed_result		seL4_X86_Page_TestAndClearAccessed_t
@@ -151,7 +157,7 @@ static int pt_map(int level, seL4_CPtr pt, seL4_Word va)
 }
 
 /* Map `frame` at `va` in the test's VSpace. */
-static int map_user_page(seL4_CPtr frame, seL4_Word va, seL4_CapRights_t rights)
+static int map_user_frame(seL4_CPtr frame, seL4_Word va, seL4_CapRights_t rights, int lowest)
 {
 	static const int levels[L4H_NR_PT_LEVELS] = { L4H_OBJ_PT, L4H_OBJ_PD, L4H_OBJ_PDPT };
 
@@ -165,7 +171,7 @@ static int map_user_page(seL4_CPtr frame, seL4_Word va, seL4_CapRights_t rights)
 			return 0;
 		CHECK(err == seL4_FailedLookup, "page map err=", err);
 		/* Add the missing paging structure: the lowest level that maps. */
-		for (int l = 0; l < L4H_NR_PT_LEVELS; l++) {
+		for (int l = lowest; l < L4H_NR_PT_LEVELS; l++) {
 			seL4_CPtr pt = abitest_obj(levels[l], 0);
 
 			CHECK(pt, "no page table", l);
@@ -177,6 +183,11 @@ static int map_user_page(seL4_CPtr frame, seL4_Word va, seL4_CapRights_t rights)
 	}
 	CHECK(0, "map_user_page va=", va);
 	return -1;
+}
+
+static int map_user_page(seL4_CPtr frame, seL4_Word va, seL4_CapRights_t rights)
+{
+	return map_user_frame(frame, va, rights, 0);
 }
 
 /* Receive from the test's endpoint.  The vCPU's notification is bound to
@@ -411,6 +422,106 @@ static int user_test(void)
 	ar = frame_accessed(replacement);
 	CHECK(ar.error == seL4_IllegalOperation, "accessed after unmap=", ar.error);
 	say("accessed bits track reads and instruction fetches without guest faults; invalid mappings rejected");
+	return 0;
+}
+
+/* Native large leaves and subframe aliases, including MDB lifetime. */
+static int large_frame_test(void)
+{
+	const seL4_Word va = 0x1000000, tail = (1ul << 21) - 4096;
+	seL4_CPtr large, alias, first = abitest_slot(), last = abitest_slot();
+	seL4_CPtr extra = abitest_slot(), ro = abitest_slot(), ro_child = abitest_slot(), x;
+	seL4_UserContext regs = { 0 };
+	seL4_Word badge;
+	int err;
+
+	CHECK(t->large_ut && first && last && extra && ro && ro_child, "large test allocation", 0);
+	CHECK(!retype(t->large_ut, LARGE_FRAME_TYPE, 0, &large), "large retype", 0);
+	alias = copy_cap(large);
+	CHECK(alias, "large copy", 0);
+	CHECK(frame_derive(large, L4H_CNODE_CPTR, first, 64, 1, seL4_AllRights) == seL4_InvalidArgument,
+	      "unaligned subframe accepted", 0);
+	CHECK(frame_derive(large, L4H_CNODE_CPTR, first, 64, 1ul << 21, seL4_AllRights) == seL4_InvalidArgument,
+	      "out-of-range subframe accepted", 0);
+	CHECK(frame_derive(large, L4H_CNODE_CPTR, first, 64, ~0ul, seL4_AllRights) == seL4_InvalidArgument,
+	      "overflow subframe accepted", 0);
+	CHECK(frame_derive(large, ep, first, 64, 0, seL4_AllRights) != 0, "non-CNode destination accepted", 0);
+	CHECK(!frame_derive(large, L4H_CNODE_CPTR, first, 64, 0, seL4_AllRights), "first subframe", 0);
+	CHECK(!frame_derive(alias, L4H_CNODE_CPTR, last, 64, tail, seL4_AllRights), "last subframe through copy", 0);
+	CHECK(frame_derive(large, L4H_CNODE_CPTR, first, 64, 0, seL4_AllRights) == seL4_DeleteFirst,
+	      "occupied subframe slot accepted", 0);
+	CHECK(frame_derive(first, L4H_CNODE_CPTR, extra, 64, 0, seL4_AllRights) == seL4_IllegalOperation,
+	      "small source accepted", 0);
+	CHECK(frame_address(last).paddr == frame_address(large).paddr + tail, "subframe physical offset", 0);
+	CHECK(!seL4_CNode_Copy(L4H_CNODE_CPTR, ro, 64, L4H_CNODE_CPTR, large, 64, seL4_CanRead),
+	      "read-only parent", 0);
+	CHECK(!frame_derive(ro, L4H_CNODE_CPTR, ro_child, 64, 0, seL4_AllRights), "derive read-only", 0);
+	seL4_CPtr ro_copy = copy_cap(ro_child);
+	CHECK(ro_copy, "copy read-only subframe", 0);
+	/* Narrowing a read-only large copy must not grant revocation power
+	 * over a neighboring, independently derived read-write alias. */
+	CHECK(!seL4_CNode_Revoke(L4H_CNODE_CPTR, ro_child, 64), "revoke subframe alias", 0);
+	CHECK(!frame_address(first).error && !frame_address(ro_copy).error,
+	      "subframe gained revocation authority", 0);
+	volatile unsigned char *code = abitest_map(last, 4);
+	volatile uint64_t *data = abitest_map(first, 5);
+	CHECK(code && data && !*data, "large allocation zeroed", 0);
+	*data = 0x12345678;
+	for (unsigned long i = 0; i < (unsigned long)(user_end - user_large); i++)
+		code[i] = user_large[i];
+	CHECK(!map_user_frame(large, va, seL4_CanRead, 1), "large map", 0);
+#ifdef __aarch64__
+	CHECK(!seL4_ARM_Page_Unify_Instruction(large, 0, 1ul << 21), "large icache", 0);
+#endif
+	CHECK(!frame_accessed(large).error, "large clear accessed", 0);
+	CHECK(!frame_accessed(large).accessed, "large accessed cleared", 0);
+	CHECK(!seL4_TCB_SetFlags(utcb, 0, seL4_TCBFlag_trapSyscalls).error, "large trap flag", 0);
+	CHECK(!write_pc(&regs, va + tail), "large test PC", 0);
+	seL4_MessageInfo_t info = recv(&badge);
+	CHECK(seL4_MessageInfo_get_label(info) == seL4_Fault_UnknownSyscall,
+	      "large AF fault escaped kernel", seL4_MessageInfo_get_label(info));
+	CHECK(seL4_GetMR(MR_ARG0) == *data, "large/small alias data mismatch", seL4_GetMR(MR_ARG0));
+	CHECK(frame_accessed(large).accessed == 1, "large access not observed", 0);
+	CHECK(!frame_accessed(large).accessed, "large access counted twice", 0);
+	seL4_TCB_Suspend(utcb);
+	CHECK(!write_pc(&regs, va + tail + (user_large_write - user_large)), "large write PC", 0);
+	info = recv(&badge);
+	CHECK(seL4_MessageInfo_get_label(info) == seL4_Fault_VMFault &&
+	      seL4_GetMR(seL4_VMFault_Addr) == va, "large read-only mapping writable", 0);
+	seL4_TCB_Suspend(utcb);
+	CHECK(!map_user_page(ro_child, 0x500000, seL4_ReadWrite), "derived RO map", 0);
+	CHECK(!write_pc(&regs, ABITEST_USER_VA + (user_write - user_prog)), "subframe write PC", 0);
+	info = recv(&badge);
+	CHECK(seL4_MessageInfo_get_label(info) == seL4_Fault_VMFault &&
+	      seL4_GetMR(seL4_VMFault_Addr) == 0x500000, "subframe escalated rights", 0);
+	seL4_TCB_Suspend(utcb);
+	CHECK(!map_user_frame(alias, va, seL4_CanRead, 1), "replacement large alias", 0);
+	CHECK(!frame_unmap(alias), "unmap replacement large", 0);
+	CHECK(frame_accessed(large).error == seL4_InvalidCapability, "stale large mapping accepted", 0);
+	CHECK(!map_user_page(first, va, seL4_CanRead), "small leaf after large unmap", 0);
+	CHECK(frame_accessed(large).error == seL4_InvalidCapability, "large cap accepted a small leaf", 0);
+	CHECK(!seL4_CNode_Revoke(L4H_CNODE_CPTR, large, 64), "revoke large", 0);
+	CHECK(frame_address(first).error && frame_address(last).error && frame_address(alias).error &&
+	      frame_address(ro_child).error, "large revoke left aliases", 0);
+	CHECK(!frame_derive(large, L4H_CNODE_CPTR, extra, 64, 0, seL4_AllRights), "derive after revoke", 0);
+	seL4_CPtr survivor = copy_cap(extra);
+	volatile uint64_t *q = abitest_map(survivor, 6);
+	CHECK(q && *q == 0x12345678, "derivation or revoke changed contents", 0);
+	CHECK(!seL4_CNode_Delete(L4H_CNODE_CPTR, large, 64), "delete large parent", 0);
+	CHECK(*q == 0x12345678 && !frame_address(extra).error, "parent deletion killed alias", 0);
+	err = retype(t->large_ut, FRAME_TYPE, 0, &x);
+	CHECK(err == seL4_NotEnoughMemory, "untyped reused with surviving subframe", err);
+	CHECK(!seL4_CNode_Revoke(L4H_CNODE_CPTR, t->large_ut, 64), "revoke alias backing", 0);
+	CHECK(frame_address(extra).error && frame_address(survivor).error, "untyped revoke left alias", 0);
+	CHECK(!retype(t->large_ut, LARGE_FRAME_TYPE, 0, &large), "reuse large backing", 0);
+	CHECK(!frame_derive(large, L4H_CNODE_CPTR, extra, 64, 0, seL4_AllRights), "derive reused backing", 0);
+	q = abitest_map(extra, 7);
+	CHECK(q && !*q, "reused backing not zeroed", 0);
+	CHECK(!frame_derive(large, L4H_CNODE_CPTR, last, 64, tail, seL4_AllRights), "derive reused tail", 0);
+	q = abitest_map(last, 6);
+	CHECK(q && !*q, "reused tail not zeroed", 0);
+	CHECK(!seL4_CNode_Revoke(L4H_CNODE_CPTR, t->large_ut, 64), "final backing revoke", 0);
+	say("2 MiB leaves: alias bounds/rights, tail execution, AF, demotion, parent deletion and Untyped revoke: ok");
 	return 0;
 }
 
@@ -717,6 +828,7 @@ int abitest_run(struct abitest *test)
 	__sel4_ipc_buffer = (seL4_IPCBuffer *)L4H_VCPU_IPCBUF_VA(t->cpu);
 	say("vCPU %d, ABI version %lu", t->cpu, (unsigned long)bi->abi_version);
 	err = user_test();
+	err = err ?: large_frame_test();
 	/* Give back the user scheduling context before Linux needs it. */
 	if (utcb) {
 		seL4_TCB_Suspend(utcb);

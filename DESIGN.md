@@ -435,11 +435,11 @@ guest. Where there is an AMD-Vi or Intel VT-d IOMMU, root drives it itself (§8.
   APIC countdowns (0014, used only without TSC-deadline mode) end up to
   about 250 ppm early: one extra timer interrupt that finds nothing due,
   or a timeslice a few µs short, never a timer signalled early.
-- **0023, accessed bits of native 4 KiB frames (x86_64 and aarch64).**
+- **0023, accessed bits of native frames (x86_64 and aarch64).**
   `seL4_X86_Page_TestAndClearAccessed` / `seL4_ARM_Page_TestAndClearAccessed`
   resolves a frame cap's mapped ASID and address, verifies the physical
   frame, atomically clears its A/AF bit, and returns the old bit. Unmapped
-  caps, non-native mappings and larger frames are refused; stale mappings
+  caps and non-native mappings are refused; stale mappings
   return `InvalidCapability`. The atomic operation preserves concurrent
   hardware updates to other bits, including x86's dirty bit.
 
@@ -448,7 +448,7 @@ guest. Where there is an AMD-Vi or Intel VT-d IOMMU, root drives it itself (§8.
   writes A=0, and after one that 0017 leaves to the TLBs, other cores'
   cached translations keep the frame's use from showing until they are
   evicted. On AArch64 without hardware AF updates, a later walk faults
-  with AF=0. seL4 handles this access-flag fault for an EL0 4 KiB mapping
+  with AF=0. seL4 handles this access-flag fault for an EL0 mapping
   by setting AF and restarting the instruction, without fault IPC to
   Linux. AF=0 translations cannot be cached, so setting AF needs no
   invalidation. Permission and other
@@ -475,6 +475,25 @@ guest. Where there is an AMD-Vi or Intel VT-d IOMMU, root drives it itself (§8.
   just after exec. The boot regression checks a user-written thread
   pointer in the saved context at the first C syscall entry, before the
   lock can handle a stall.
+- **0029, large-frame aliases and accessed bits (x86_64 and aarch64).**
+  `Page_DeriveSubframe` derives an unmapped 4 KiB capability from a
+  RAM-backed 2 MiB frame, with a checked aligned offset and intersected
+  rights. It allocates no physical object and never clears live memory.
+  The subframe is a smaller region in the capability derivation tree;
+  the original Untyped remains an ancestor of both sizes. Deleting the
+  large cap leaves its aliases valid; revoking the backing Untyped removes
+  all aliases and mappings before the allocation can be reused. Ordinary
+  copies and subframe aliases keep seL4's non-revocable-copy semantics:
+  deriving an alias does not grant authority to revoke sibling aliases. Device frames
+  and other source sizes are refused.
+
+  The patch also extends 0023 to x86 PDE leaves and AArch64 level-2 blocks,
+  checking the mapped size and physical address before clearing A/AF. On
+  ARM, level-2 access-flag faults are repaired inside seL4, just like the
+  existing level-3 faults; permissions are preserved. `run-abitest.sh`
+  checks bounds, destination validation, rights attenuation, simultaneous
+  aliases, large-page execution and aging, stale caps, parent deletion,
+  revocation and zeroing on subsequent reuse.
 - E1 (`trapSyscalls`) is our fix for seL4 issue #477, which is still open
   upstream. Without it, Linux syscalls whose syscall-number register
   happens to hold a valid seL4 syscall number are executed as seL4
@@ -723,18 +742,36 @@ virtio-l4h code. The Linux base is 6.18; patches outside arch/l4h are in
   collapse base pages through `khugepaged` or `MADV_COLLAPSE`. The default is
   `transparent_hugepage=madvise`; Linux still disables THP at boot below
   512 MiB of usable RAM, where it can be enabled explicitly through
-  `/sys/kernel/mm/transparent_hugepage/enabled`. These are software PMD
-  leaves: each is still mirrored into 512 ordinary 4 KiB seL4 frame mappings.
-  This batches guest faults but retains base-page hardware TLB coverage and capability
-  costs. No host ABI or seL4 change is needed. Linux's smaller PTE-mapped
+  `/sys/kernel/mm/transparent_hugepage/enabled` (including `always` in a
+  user-supplied initramfs after mounting sysfs). Linux's smaller PTE-mapped
   THP sizes remain disabled by default.
+
+  Guest-owned and hotplug RAM blocks have one canonical 2 MiB seL4 frame
+  plus 512 derived 4 KiB aliases. The direct map and base-page mappings
+  use those aliases; a huge Linux PMD uses a copy of the large cap, giving
+  it one native 2 MiB leaf. Host-created boot-image blocks retain their
+  original small caps and use the 512-mapping fallback. The host ABI and
+  `L4H_FRAME_CPTR` layout are unchanged. A block still needs its small
+  master capabilities, so the savings are in per-process mappings and
+  leaf tables, not a 512-fold reduction of all capability storage.
+
+  User VSpaces track small and large leaves separately. A partial update
+  drops the whole overlapping large leaf before installing any small
+  replacement; unaffected pages can refault. This demotion needs no
+  allocation. Promotion removes the old leaf table, invalidating its
+  translations once, before deleting its small caps and mapping the large
+  frame. Table coverage is tracked explicitly on both ISAs. Accounting,
+  eviction, teardown and failed TLB-sync mappings include both sizes;
+  a failed remap leaves the affected range unmapped. ARM executable
+  mappings synchronize the instruction cache over the full frame size.
 
   The TLB sync recognizes a huge leaf and applies its entire 2 MiB range,
   even for a partial flush, before clearing `NEEDSYNC` with a compare and
   exchange. A split's temporarily invalid PMD retains its huge marker but
   has all its seL4 mappings removed. Faults, kernel user copies and futexes
   take the PMD lock and resolve the correct tail page. Aging combines the
-  software PMD's young bit with the accessed bits of all 512 mappings.
+  software PMD's young bit with its large leaf's A/AF bit, or all 512
+  small leaves in the fallback.
   Ordinary folio splitting and migration handle reclaim and object-block
   conversion; native PMD migration and whole-THP swap are not enabled.
 
@@ -745,9 +782,9 @@ virtio-l4h code. The Linux base is 6.18; patches outside arch/l4h are in
   fallback. `HPSTRESS_THP=1 tests/run-hotplugstress.sh 15` exercises memory
   hotplug with THP enabled in the workload guests. `tests/run-thpbench.sh` compares
   advised THP with `MADV_NOHUGEPAGE` on the same kernel, in fresh processes
-  with alternating trial order. Real 2 MiB seL4 mappings remain future
-  work: they need a capability representation that also permits individual
-  subpages to be mapped without retyping live memory.
+  with alternating trial order. The test module reports the actual native
+  large-leaf count, independently of `AnonHugePages`, and both the
+  correctness suite and benchmark check it.
 
 ### 5.4 Execution model: vCPUs, tasks, syscalls and interrupts
 
@@ -2992,7 +3029,7 @@ Rules that keep the port cheap:
    virtio-l4h, host block and net queues. Fields are fixed-width and little-endian.
 3. No use of x86-only seL4 features such as I/O ports outside drivers, EPT or
    `GetStatusBits`.
-4. Guest RAM uses 4 KiB frames, which every ISA supports.
+4. Guest RAM has 4 KiB aliases and optional 2 MiB process mappings on both ISAs.
 5. CI builds both ISAs from day one, even before arm64 boots.
 
 **Status (v1).**
@@ -3129,7 +3166,7 @@ The design prioritizes I/O and idle density, the cloud workload, over
 syscall-heavy microbenchmarks. Benchmarks: lmbench lat_syscall/lat_ctx/
 lat_pagefault, fio, iperf3, kernel compile, and a 30-guest idle-density test.
 
-**Guest THP using existing backing, measured 2026-10-30.**
+**Stage 1 baseline: guest THP using small-frame backing, measured 2026-10-30.**
 `tests/run-thpbench.sh 1` and `tests/run-thpbench.sh 4` compare
 `MADV_NOHUGEPAGE` with `MADV_HUGEPAGE` on the same Linux 6.18.58-l4h kernel.
 Each mode/trial uses a fresh process, alternating order; the table gives
@@ -3420,13 +3457,16 @@ memory the guest can retype.
   only the boot blocks. The guest marks some non-boot blocks as object
   blocks, creates its first capability CNode and the user CSpace from
   them, then for every other block retypes its level-2 RAM CNode (into its
-  level-1 slot) and 512 frames, and maps them at `ram_base_va + GPA`
+  level-1 slot), one 2 MiB frame and its 512 subframe aliases, and maps
+  the aliases at `ram_base_va + GPA`
   (read-write, execute-never), adding page tables from object blocks. Each
   block is added to memblock once mapped; object blocks are added and
   reserved, so they have struct pages.
 - **Objects.** `l4h_obj_alloc` takes objects from Untyped *chunks* of 16,
   64 or 128 KiB (by object size, as the old quota allocator did) that it
-  carves out of object blocks, one open block per class. seL4 reuses an
+  carves out of object blocks, one open block per class. Whole-block
+  Untypeds and large frames use a separate 2 MiB class, also exercised by
+  the capability lifetime tests. seL4 reuses an
   Untyped's memory only when all its children are gone; with whole 2 MiB
   blocks as the unit, a few long-lived objects (TCBs, a process's page
   tables) pinned each block, freed page tables were never reused, and
@@ -3508,7 +3548,7 @@ memory the guest can retype.
   CNode), plus the reserve; everything else starts as frames. A
   4-vCPU 256 MiB dom0 boots with 6 object blocks (12 MiB), of which
   2.6 MiB is used.
-- **Classes.** Objects come from chunks of four classes, each with its
+- **Classes.** Ordinary objects come from chunks of four classes, each with its
   own open block: small objects, 4 KiB objects (TCBs), page tables, and
   CNodes. Page tables have a class of their own because they die
   together when a process exits or loses its VSpace; mixed with TCBs,

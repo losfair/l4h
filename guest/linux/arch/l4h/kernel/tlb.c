@@ -16,6 +16,7 @@
 #include <kern_util.h>
 #include <l4h_vspace.h>
 #include <l4h_caps.h>
+#include <l4h_sys.h>
 
 struct vm_ops {
 	struct mm_id *mm_idp;
@@ -136,7 +137,7 @@ static int sync_one_pmd(pmd_t *pmd, unsigned long addr, unsigned long end,
 					prot |= UM_PROT_EXEC;
 			}
 			if (prot)
-				ret = ops->mmap(ops->mm_idp, addr, PMD_SIZE, prot,
+				ret = ops->mmap(ops->mm_idp, addr, PMD_SIZE, prot | L4H_PROT_LARGE,
 						pmd_val(v) & PAGE_MASK);
 			else
 				ret = ops->unmap(ops->mm_idp, addr, PMD_SIZE);

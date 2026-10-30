@@ -13,4 +13,7 @@ struct aging_range {
 /* Test and clear young for the caller's range; return the young page count. */
 #define L4H_AGING_SAMPLE _IOW('A', 0, struct aging_range)
 
+/* Count actual seL4 2 MiB leaves overlapping the range. */
+#define L4H_LARGE_MAPPINGS _IOW('A', 1, struct aging_range)
+
 #endif

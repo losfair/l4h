@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* PMD THP over l4h's base-page seL4 mappings. Run with run-thptest.sh. */
+/* PMD THP with native seL4 large leaves and small-page fallback. Run with run-thptest.sh. */
 #define _GNU_SOURCE
 #include "thp.h"
 #include "page-aging/page-aging.h"
@@ -13,6 +13,27 @@
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
+
+static long large_mappings(struct area a)
+{
+	struct aging_range r = { .start = (uintptr_t)a.p, .size = a.size };
+	int fd = open("/dev/l4h_page_aging", O_RDONLY);
+	long n;
+
+	CHECK(fd >= 0, "missing mapping query module");
+	n = ioctl(fd, L4H_LARGE_MAPPINGS, &r);
+	close(fd);
+	CHECK(n >= 0, "large mapping query: %s", strerror(errno));
+	return n;
+}
+
+static void require_native(struct area a)
+{
+	for (size_t i = 0; i < a.size; i += HUGE)
+		(void)*(volatile unsigned char *)(a.p + i);
+	CHECK(large_mappings(a) == (long)(a.size / HUGE),
+	      "expected %zu native 2 MiB leaves, got %ld", a.size / HUGE, large_mappings(a));
+}
 
 static void child_ok(pid_t pid)
 {
@@ -44,6 +65,7 @@ static void fault_and_cow(void)
 	fill(a);
 	getrusage(RUSAGE_SELF, &after);
 	require_huge(a);
+	require_native(a);
 	CHECK(after.ru_minflt - before.ru_minflt < 16, "THP faulted %ld times",
 	      after.ru_minflt - before.ru_minflt);
 	pid = fork();
@@ -62,6 +84,7 @@ static void fault_and_cow(void)
 	}
 	child_ok(pid);
 	verify(a);
+	require_native(a);
 	area_free(a);
 }
 
@@ -83,6 +106,7 @@ static void zero_and_uaccess(void)
 	CHECK(p[0] == 0 && p[2 * PAGE] == 0 && p[PAGE] == 17, "zero alias changed");
 	CHECK(!madvise(a.p, a.size, MADV_COLLAPSE), "collapse zero mapping: %s", strerror(errno));
 	require_huge(a);
+	require_native(a);
 	memset(buf, 0xa5, sizeof(buf));
 	CHECK(!pipe(fds), "pipe");
 	CHECK(write(fds[1], buf, PAGE) == PAGE, "write pipe");
@@ -94,6 +118,7 @@ static void zero_and_uaccess(void)
 		      FUTEX_OP(FUTEX_OP_ADD, 1, FUTEX_OP_CMP_EQ, 0)) >= 0, "futex wake op: %s", strerror(errno));
 	CHECK(*word == 1, "futex tail-page write");
 	require_huge(a);
+	require_native(a);
 	/* Pin a tail through the pipe, then split its PMD without moving data. */
 	struct iovec iov = { .iov_base = a.p + HUGE - PAGE / 2, .iov_len = PAGE };
 	CHECK(vmsplice(fds[1], &iov, 1, 0) == PAGE, "vmsplice: %s", strerror(errno));
@@ -116,15 +141,18 @@ static void vspace_eviction(void)
 
 	fill(a);
 	require_huge(a);
+	require_native(a);
 	CHECK(!pipe(ready) && !pipe(wake), "eviction pipes");
 	for (int i = 0; i < CHILDREN; i++) {
 		pids[i] = fork();
 		CHECK(pids[i] >= 0, "eviction fork: %s", strerror(errno));
 		if (!pids[i]) {
 			verify(a);
+			require_native(a);
 			CHECK(write(ready[1], &token, 1) == 1, "child ready");
 			CHECK(read(wake[0], &token, 1) == 1, "child wake");
 			verify(a);
+			require_native(a);
 			_exit(0);
 		}
 		CHECK(read(ready[0], &token, 1) == 1, "parent ready");
@@ -151,8 +179,10 @@ static void split_and_collapse(void)
 	CHECK(!madvise(a.p, a.size, MADV_HUGEPAGE), "advise");
 	CHECK(!madvise(a.p, a.size, MADV_COLLAPSE), "collapse: %s", strerror(errno));
 	require_huge(a);
+	require_native(a);
 	verify(a);
 	CHECK(!mprotect(a.p + 277 * PAGE, PAGE, PROT_NONE), "partial PROT_NONE");
+	CHECK(large_mappings(a) == 1, "partial protect failed to demote one leaf");
 	pid = fork();
 	if (!pid) {
 		volatile unsigned char byte = a.p[277 * PAGE];
@@ -187,6 +217,7 @@ static void move_and_background_collapse(void)
 	for (int i = 0; i < 2000 && area_kb(a, "AnonHugePages:") < a.size / 1024; i++)
 		usleep(10000);
 	require_huge(a);
+	require_native(a);
 	CHECK(mremap(a.p, a.size, a.size, MREMAP_MAYMOVE | MREMAP_FIXED, b.p) == b.p,
 	      "move huge mapping: %s", strerror(errno));
 	require_huge(b);
@@ -202,6 +233,7 @@ static void swap_roundtrip(void)
 
 	fill(a);
 	require_huge(a);
+	require_native(a);
 	CHECK(!madvise(a.p, a.size, MADV_PAGEOUT), "pageout: %s", strerror(errno));
 	/* Let asynchronous swap writes complete before checking residency. */
 	for (int i = 0; i < 200 && !area_kb(a, "Swap:"); i++)
@@ -233,8 +265,15 @@ static void execute_permissions(void)
 
 	memcpy(code, insns, sizeof(insns));
 	require_huge(a);
+	require_native(a);
+	pid = fork();
+	if (!pid)
+		_exit(fn());
+	CHECK(pid > 0 && waitpid(pid, &status, 0) == pid && WIFSIGNALED(status) &&
+	      WTERMSIG(status) == SIGSEGV, "large NX mapping executable: %#x", status);
 	CHECK(!mprotect(a.p, a.size, PROT_READ | PROT_EXEC), "executable PMD");
 	CHECK(fn() == 42, "execute from tail page");
+	require_native(a);
 	CHECK(!mprotect(code, PAGE, PROT_READ), "remove execute from tail");
 	pid = fork();
 	if (!pid)
@@ -257,6 +296,7 @@ static void shared_memory(void)
 	fill(a);
 	CHECK(!madvise(a.p, a.size, MADV_COLLAPSE), "shared collapse: %s", strerror(errno));
 	CHECK(area_kb(a, "ShmemPmdMapped:") == a.size / 1024, "shared PMD mapping missing");
+	require_native(a);
 	pid = fork();
 	if (!pid) {
 		*(unsigned long *)(a.p + 271 * PAGE) = 99;
@@ -300,6 +340,7 @@ static void concurrent_split(void)
 
 	memset(a.p, 0, a.size);
 	require_huge(a);
+	require_native(a);
 	for (int i = 0; i < 2; i++)
 		CHECK(!pthread_create(&threads[i], NULL, write_worker, &writers[i]), "pthread_create");
 	for (int round = 0; round < 40; round++) {
@@ -314,6 +355,7 @@ static void concurrent_split(void)
 		      "writer %d lost updates: %lu / %lu", i, *writers[i].word, writers[i].count);
 	}
 	require_huge(a);
+	require_native(a);
 	area_free(a);
 }
 
@@ -326,19 +368,22 @@ static int sample(int fd, struct area a)
 static void aging(void)
 {
 	struct area a = area_new(HUGE, MADV_HUGEPAGE);
-	struct area churn = area_new(32 * HUGE, MADV_NOHUGEPAGE);
 	int fd = open("/dev/l4h_page_aging", O_RDONLY);
 	volatile unsigned long sum = 0;
 	struct rusage before, after;
 
 	CHECK(fd >= 0, "missing page-aging module");
-	fill(churn);
 	fill(a);
 	require_huge(a);
+	require_native(a);
 	CHECK(sample(fd, a) == HUGE / PAGE, "initial PMD young bit");
 	CHECK(sample(fd, a) == 0, "PMD access counted twice");
-	for (size_t i = 0; i < churn.size; i += PAGE)
-		sum += *(volatile unsigned long *)(churn.p + i);
+	/* A/AF clearing intentionally permits cached translations to delay
+	 * the next sample. Invalidate this translation without accessing it:
+	 * churning 4 KiB mappings need not evict a separate huge-page TLB. */
+	CHECK(!mprotect(a.p, a.size, PROT_READ), "aging write protect");
+	CHECK(!mprotect(a.p, a.size, PROT_READ | PROT_WRITE), "aging restore rights");
+	CHECK(sample(fd, a) >= 0 && sample(fd, a) == 0, "aging rearm");
 	getrusage(RUSAGE_SELF, &before);
 	sum += *(volatile unsigned long *)(a.p + 409 * PAGE);
 	getrusage(RUSAGE_SELF, &after);
@@ -353,7 +398,6 @@ static void aging(void)
 	CHECK(a.p[203 * PAGE] == 71 && !a.p[311 * PAGE], "dirty tracking lost a write");
 	close(zero);
 	close(fd);
-	area_free(churn);
 	area_free(a);
 }
 
@@ -367,6 +411,7 @@ int main(int argc, char **argv)
 
 		a.p[17 * PAGE] = 42;
 		CHECK(a.p[17 * PAGE] == 42 && !area_kb(a, "AnonHugePages:"), "allocation fallback");
+		CHECK(!large_mappings(a), "fallback installed a large leaf");
 		area_free(a);
 		puts("THPTEST: fallback PASS");
 		return 0;

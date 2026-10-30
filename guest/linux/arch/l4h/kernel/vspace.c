@@ -44,6 +44,7 @@
  * write-only mappings). */
 static inline unsigned long eff_prot(int prot)
 {
+	prot &= PROT_MASK;
 	return (prot & L4H_PROT_WRITE) ? prot | L4H_PROT_READ : prot;
 }
 
@@ -71,13 +72,15 @@ struct table {
 	struct list_head link;
 	struct l4h_obj obj;
 	int level;		/* index into l4h_pt_level_obj[] */
+	unsigned long base;	/* virtual coverage of this table */
 };
 
 /* One seL4 address space: a VSpace root plus the page tables we added. */
 struct l4h_as {
 	unsigned long root;
 	struct list_head tables;
-	struct xarray pages;
+	struct xarray pages;	/* 4 KiB leaves, indexed by VPN */
+	struct xarray large;	/* 2 MiB leaves, indexed by PMD number */
 	unsigned long nr_pages, nr_tables;
 	long charged;		/* as_cost() last added to the owner mm */
 	bool flush_pending;	/* rights lowered with L4H_PROT_DEFER_FLUSH */
@@ -88,6 +91,7 @@ static void as_init(struct l4h_as *as, unsigned long root)
 	as->root = root;
 	INIT_LIST_HEAD(&as->tables);
 	xa_init(&as->pages);
+	xa_init(&as->large);
 	as->nr_pages = as->nr_tables = 0;
 	as->charged = 0;
 	as->flush_pending = false;
@@ -122,6 +126,21 @@ static int as_add_table(struct l4h_as *as, int level, unsigned long va)
 
 	if (level >= L4H_NR_PT_LEVELS)
 		return -EFAULT;
+	/* User roots start empty. Install top down so ARM's first-missing-
+	 * level API also gives us exact coverage for promotion. The kernel
+	 * root has pre-existing boot/direct-map tables and uses lazy lookup. */
+	if (as->root != L4H_CPTR(L4H_SLOT_VSPACE)) {
+		unsigned long base = va & ~((1ul << l4h_pt_level_shift[level]) - 1);
+
+		list_for_each_entry(t, &as->tables, link)
+			if (t->level == level && t->base == base)
+				return 0;
+		if (level + 1 < L4H_NR_PT_LEVELS) {
+			err = as_add_table(as, level + 1, va);
+			if (err)
+				return err;
+		}
+	}
 	t = kzalloc(sizeof(*t), GFP_ATOMIC);
 	if (!t)
 		return -ENOMEM;
@@ -147,9 +166,24 @@ static int as_add_table(struct l4h_as *as, int level, unsigned long va)
 		return err == L4H_ERR_DELETE_FIRST ? 0 : -EFAULT;
 	}
 	t->level = level;
+	t->base = va & ~((1ul << l4h_pt_level_shift[level]) - 1);
 	list_add(&t->link, &as->tables);
 	as->nr_tables++;
 	return 0;
+}
+
+/* A partial update drops the whole hardware large leaf. The unchanged
+ * neighbors remain valid Linux mappings and refault as small pages. This
+ * also makes demotion allocation-free when a TLB sync runs out of memory. */
+static void as_drop_large(struct l4h_as *as, unsigned long va)
+{
+	void *e = xa_load(&as->large, va >> PMD_SHIFT);
+
+	if (e) {
+		xa_erase(&as->large, va >> PMD_SHIFT);
+		l4h_slot_delete(entry_slot(e));
+		as->nr_pages--;
+	}
 }
 
 /*
@@ -162,10 +196,12 @@ static int as_map_page(struct l4h_as *as, unsigned long va, unsigned long phys, 
 		       bool defer)
 {
 	unsigned long vpn = va >> PAGE_SHIFT, pfn = phys >> PAGE_SHIFT;
-	void *e = xa_load(&as->pages, vpn);
+	void *e;
 	unsigned long slot;
 	int err;
 
+	as_drop_large(as, va);
+	e = xa_load(&as->pages, vpn);
 	if (e && entry_pfn(e) == pfn) {
 		/* Same frame.  The entry mirrors the VSpace: a mapping with the
 		 * same rights is already there (the sync and the fault path
@@ -217,6 +253,11 @@ static void as_unmap_range(struct l4h_as *as, unsigned long start, unsigned long
 	unsigned long vpn;
 	void *e;
 
+	xa_for_each_range(&as->large, vpn, e, start >> PMD_SHIFT, (end - 1) >> PMD_SHIFT) {
+		xa_erase(&as->large, vpn);
+		l4h_slot_delete(entry_slot(e));
+		as->nr_pages--;
+	}
 	xa_for_each_range(&as->pages, vpn, e, start >> PAGE_SHIFT, (end - 1) >> PAGE_SHIFT) {
 		xa_erase(&as->pages, vpn);
 		/* Deleting the frame capability removes the mapping. */
@@ -225,13 +266,63 @@ static void as_unmap_range(struct l4h_as *as, unsigned long start, unsigned long
 	}
 }
 
+/* Promote only a Linux huge PMD backed by a canonical large frame. */
+static int as_map_large(struct l4h_as *as, unsigned long va, unsigned long phys,
+			int prot, unsigned long frame)
+{
+	unsigned long index = va >> PMD_SHIFT, pfn = phys >> PAGE_SHIFT, slot;
+	void *e = xa_load(&as->large, index);
+	struct table *t, *n;
+	int err;
+
+	if (e && entry_pfn(e) == pfn) {
+		if (entry_prot(e) == eff_prot(prot))
+			return 0;
+		/* One flush per PMD is cheap; no deferred large-page remaps. */
+		err = l4h_page_map(entry_slot(e), as->root, va, prot | L4H_PROT_LARGE);
+		if (err)
+			return -EFAULT;
+		xa_store(&as->large, index, mk_entry(entry_slot(e), pfn, prot), GFP_ATOMIC);
+		return 0;
+	}
+	/* Removing the leaf table first flushes its 512 translations once.
+	 * seL4 rejects a large leaf while that table remains installed. */
+	list_for_each_entry_safe(t, n, &as->tables, link) {
+		if (t->level == 0 && t->base == va) {
+			list_del(&t->link);
+			l4h_obj_free(&t->obj);
+			kfree(t);
+			as->nr_tables--;
+		}
+	}
+	as_unmap_range(as, va, va + PMD_SIZE);
+	slot = l4h_cap_copy(frame, L4H_RIGHTS_ALL);
+	if (!slot)
+		return -ENOMEM;
+	for (;;) {
+		err = l4h_page_map(slot, as->root, va, prot | L4H_PROT_LARGE);
+		if (err != L4H_ERR_FAILED_LOOKUP)
+			break;
+		err = as_add_table(as, 1, va);
+		if (err)
+			break;
+	}
+	if (!err)
+		err = xa_err(xa_store(&as->large, index, mk_entry(slot, pfn, prot), GFP_ATOMIC));
+	if (err) {
+		l4h_slot_delete(slot);
+		return err < 0 ? err : -EFAULT;
+	}
+	as->nr_pages++;
+	return 0;
+}
+
 /*
  * Remove every mapping and page table, leaving an empty VSpace root.
  *
  * The tables go first, the highest level first: oldest first, as a table is
  * always mapped after the ones above it (as_add_table() maps the missing
- * parents first on x86_64; on aarch64 seL4 maps a table at the first
- * missing level, so each is recorded as level 0).  Unmapping one invalidates
+ * parents first for user roots on both ISAs).  Unmapping one invalidates
  * the whole ASID once (x86_64 flushPDPT()/flushPD(), aarch64
  * unmapPageTable()) and takes everything below it out of the VSpace; the
  * lower tables and the frames then find no mapping from the root and are
@@ -255,6 +346,12 @@ static void as_reset(struct l4h_as *as, bool may_sleep)
 	as->nr_tables = 0;
 	/* Covered by those invalidations too. */
 	as->flush_pending = false;
+	xa_for_each(&as->large, vpn, e) {
+		xa_erase(&as->large, vpn);
+		l4h_slot_delete(entry_slot(e));
+		if (!(--as->nr_pages % 1024) && may_sleep)
+			cond_resched();
+	}
 	xa_for_each(&as->pages, vpn, e) {
 		xa_erase(&as->pages, vpn);
 		l4h_slot_delete(entry_slot(e));
@@ -620,19 +717,27 @@ static int map_pages(struct mm_id *mm_idp, unsigned long virt, unsigned long len
 {
 	struct mm_struct *mm = idp_mm(mm_idp);
 	struct l4h_mm *m = mm_l4h(mm);
-	unsigned long flags, off;
+	unsigned long flags, off, frame = 0;
 	int err = 0;
 
+	if ((prot & L4H_PROT_LARGE) && len == PMD_SIZE && IS_ALIGNED(virt, PMD_SIZE))
+		frame = l4h_large_frame(phys);
+	prot &= ~L4H_PROT_LARGE;
 	raw_spin_lock_irqsave(&m->lock, flags);
 	if (m->vs >= 0) {
 		struct l4h_as *as = &vs_pool[m->vs].as;
 
-		/* A sync can replace and remove mappings; the fault path only
-		 * adds them (and may raise rights). */
-		if (!prot || from_sync)
+		/* Size changes can remove mappings on the fault path too. */
+		if (!prot || from_sync || frame || xa_load(&as->large, virt >> PMD_SHIFT))
 			mm_flush_moved(m);
 		if (!prot) {
 			as_unmap_range(as, virt, virt + len);
+		} else if (frame) {
+			err = as_map_large(as, virt, phys, prot, frame);
+			if (err && from_sync) {
+				as_unmap_range(as, virt, virt + len);
+				err = 0;
+			}
 		} else {
 			for (off = 0; off < len && !err; off += PAGE_SIZE) {
 				err = as_map_page(as, virt + off, phys + off, prot, from_sync);
@@ -719,8 +824,8 @@ int ptep_test_and_clear_young(struct vm_area_struct *vma, unsigned long addr,
 EXPORT_SYMBOL_GPL(ptep_test_and_clear_young);
 
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
-/* A software huge PMD has up to 512 independently accessed seL4 frames.
- * Sample and clear all of them, including when the software bit was set.
+/* Sample a native large leaf, or all small aliases in the boot-block
+ * fallback, including when the software bit was already set.
  * The caller holds the PMD lock; m->lock also excludes VSpace eviction. */
 int pmdp_test_and_clear_young(struct vm_area_struct *vma, unsigned long addr,
 			    pmd_t *pmdp)
@@ -732,7 +837,14 @@ int pmdp_test_and_clear_young(struct vm_area_struct *vma, unsigned long addr,
 	addr &= PMD_MASK;
 	raw_spin_lock_irqsave(&m->lock, flags);
 	if (m->vs >= 0) {
-		for (off = 0; off < PMD_SIZE; off += PAGE_SIZE) {
+		void *large = xa_load(&vs_pool[m->vs].as.large, addr >> PMD_SHIFT);
+		int accessed = 0;
+
+		if (large && entry_pfn(large) == pfn) {
+			WARN_ON_ONCE(l4h_page_test_and_clear_accessed(entry_slot(large), &accessed));
+			young |= accessed;
+		}
+		for (off = 0; !large && off < PMD_SIZE; off += PAGE_SIZE) {
 			void *e = xa_load(&vs_pool[m->vs].as.pages, (addr + off) >> PAGE_SHIFT);
 			int accessed = 0;
 
@@ -747,6 +859,26 @@ int pmdp_test_and_clear_young(struct vm_area_struct *vma, unsigned long addr,
 EXPORT_SYMBOL_GPL(pmdp_test_and_clear_young);
 #endif
 
+/* Used by the regression module to distinguish hardware large leaves
+ * from Linux's software AnonHugePages accounting. */
+unsigned long l4h_mm_large_mappings(struct mm_struct *mm, unsigned long start, unsigned long end)
+{
+	struct l4h_mm *m = mm_l4h(mm);
+	unsigned long flags, index, count = 0;
+	void *e;
+
+	if (end <= start)
+		return 0;
+	raw_spin_lock_irqsave(&m->lock, flags);
+	if (m->vs >= 0)
+		xa_for_each_range(&vs_pool[m->vs].as.large, index, e,
+				  start >> PMD_SHIFT, (end - 1) >> PMD_SHIFT)
+			count++;
+	raw_spin_unlock_irqrestore(&m->lock, flags);
+	return count;
+}
+EXPORT_SYMBOL_GPL(l4h_mm_large_mappings);
+
 static int map_fault_entry(struct mm_struct *mm, unsigned long va,
 			   unsigned long len, pte_t entry)
 {
@@ -758,6 +890,8 @@ static int map_fault_entry(struct mm_struct *mm, unsigned long va,
 		prot |= UM_PROT_EXEC;
 	if (pte_write(entry) && pte_dirty(entry))
 		prot |= UM_PROT_WRITE;
+	if (len == PMD_SIZE)
+		prot |= L4H_PROT_LARGE;
 	return map_pages(&mm->context.id, va, len, prot, pte_val(entry) & PAGE_MASK, false);
 }
 

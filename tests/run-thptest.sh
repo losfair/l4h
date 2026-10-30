@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PMD THP correctness, including the 512 underlying seL4 mappings.
+# PMD THP correctness, including native 2 MiB leaves and demotion.
 # Usage: run-thptest.sh [vcpus=4]
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)

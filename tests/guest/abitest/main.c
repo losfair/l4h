@@ -22,7 +22,7 @@
 #include "abitest.h"
 
 #define MAX_OBJS	64
-#define MAX_SLOTS	64
+#define MAX_SLOTS	128
 
 static struct l4h_obj objs[MAX_OBJS];
 static unsigned long slots[MAX_SLOTS];
@@ -99,6 +99,7 @@ static int __init abitest_init(void)
 	t.dma = dma;
 	t.dma_gpa = dma_gpa;
 	t.vspace = l4h_vspace_get();
+	t.large_ut = abitest_obj(L4H_OBJ_UNTYPED, L4H_BLOCK_SHIFT);
 
 	preempt_disable();
 	local_irq_save(flags);

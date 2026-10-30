@@ -22,6 +22,7 @@ enum l4h_obj_type {
 	L4H_OBJ_PT,	/* last-level page table */
 	L4H_OBJ_PD,	/* x86_64: page directory */
 	L4H_OBJ_PDPT,	/* x86_64: page directory pointer table */
+	L4H_OBJ_LARGE_FRAME,	/* 2 MiB RAM frame */
 	L4H_OBJ_NR,
 };
 
@@ -62,7 +63,10 @@ int l4h_cnode_revoke(unsigned long cap, int depth);
 /* With lowered rights for a frame already mapped there: leave the TLBs to
  * l4h_vspace_flush() (x86_64; elsewhere the map flushes them itself). */
 #define L4H_PROT_DEFER_FLUSH	8
+/* Native 2 MiB leaf; also selects the ARM instruction-cache range. */
+#define L4H_PROT_LARGE		16
 int l4h_page_map(unsigned long frame, unsigned long vspace, unsigned long va, int prot);
+int l4h_page_derive_subframe(unsigned long frame, unsigned long offset, unsigned long dst);
 int l4h_page_unmap(unsigned long frame);
 int l4h_page_test_and_clear_accessed(unsigned long frame, int *accessed);
 int l4h_vspace_flush(unsigned long vspace);

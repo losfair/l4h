@@ -3,6 +3,7 @@ set -eu
 mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
+insmod /bin/l4h_page_aging.ko
 # Override Linux's small-machine boot policy for this 512 MiB guest.
 echo madvise > /sys/kernel/mm/transparent_hugepage/enabled
 echo madvise > /sys/kernel/mm/transparent_hugepage/defrag

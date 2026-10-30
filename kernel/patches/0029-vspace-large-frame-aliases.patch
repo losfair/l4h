@@ -1,0 +1,339 @@
+From 421c8293a1bc9575d1e7ac428ac0540538eb7ea7 Mon Sep 17 00:00:00 2001
+From: Heyang Zhou <hello@su3.io>
+Date: Fri, 30 Oct 2026 09:40:18 -0700
+Subject: [PATCH] vspace: derive 4 KiB aliases of 2 MiB RAM frames and sample
+ large leaves
+
+---
+ .../arm/interfaces/object-api-arch.xml        | 25 +++++-
+ .../x86/interfaces/object-api-arch.xml        | 25 +++++-
+ src/arch/arm/64/kernel/vspace.c               | 57 +++++++++++--
+ src/arch/x86/kernel/vspace.c                  | 83 ++++++++++++++++---
+ 4 files changed, 167 insertions(+), 23 deletions(-)
+
+diff --git a/libsel4/arch_include/arm/interfaces/object-api-arch.xml b/libsel4/arch_include/arm/interfaces/object-api-arch.xml
+index 59faf2c99..90f9cbfc3 100644
+--- a/libsel4/arch_include/arm/interfaces/object-api-arch.xml
++++ b/libsel4/arch_include/arm/interfaces/object-api-arch.xml
+@@ -408,21 +408,40 @@
+                 </description>
+             </error>
+         </method>
++        <method id="ARMPageDeriveSubframe" name="DeriveSubframe" manual_name="Derive Subframe">
++            <condition><config var="CONFIG_ARCH_AARCH64"/></condition>
++            <brief>Derive a 4 KiB alias of a RAM-backed 2 MiB frame.</brief>
++            <description>
++                Offset must be 4 KiB aligned and below 2 MiB. The destination
++                must be empty. Rights are intersected with the source's rights.
++                Memory is neither allocated nor cleared. The result is unmapped
++                and remains in the source Untyped's derivation tree, so revoking
++                that Untyped deletes both sizes of aliases before memory reuse.
++                Deleting the source leaves its aliases alive. Derived aliases
++                and ordinary copies retain non-revocable frame-copy semantics:
++                an alias does not gain authority to revoke other aliases.
++            </description>
++            <param dir="in" name="root" type="seL4_CNode" description="Destination CSpace root."/>
++            <param dir="in" name="index" type="seL4_Word" description="Destination CPtr."/>
++            <param dir="in" name="depth" type="seL4_Word" description="Destination lookup depth."/>
++            <param dir="in" name="offset" type="seL4_Word" description="Byte offset in the large frame."/>
++            <param dir="in" name="rights" type="seL4_CapRights_t" description="Maximum derived rights."/>
++        </method>
+         <method id="ARMPageTestAndClearAccessed" name="TestAndClearAccessed"
+             manual_name="Test and Clear Accessed">
+             <condition><and><config var="CONFIG_ARCH_AARCH64"/><not><config var="CONFIG_ARM_HYPERVISOR_SUPPORT"/></not></and></condition>
+-            <brief>Test and clear the accessed bit of a mapped 4 KiB frame.</brief>
++            <brief>Test and clear the accessed bit of a mapped 4 KiB or 2 MiB frame.</brief>
+             <description>
+                 The mapping is located using the capability's ASID and address,
+                 and must still refer to the same frame. Clearing is atomic and
+                 does not invalidate the TLB: a cached translation can delay the
+                 observation of a later access. Permissions and dirty state are
+-                unchanged. Larger pages and non-native mappings are unsupported.
++                unchanged. Other sizes and non-native mappings are unsupported.
+             </description>
+             <param dir="out" name="accessed" type="seL4_Word"
+                 description="One if the accessed bit was set, otherwise zero."/>
+             <error name="seL4_IllegalOperation">
+-                <description>The frame is not a mapped native 4 KiB page.</description>
++                <description>The frame is not a mapped native 4 KiB or 2 MiB page.</description>
+             </error>
+             <error name="seL4_InvalidCapability">
+                 <description>The capability's mapping is stale.</description>
+diff --git a/libsel4/arch_include/x86/interfaces/object-api-arch.xml b/libsel4/arch_include/x86/interfaces/object-api-arch.xml
+index ecdbbeff7..23ade4165 100644
+--- a/libsel4/arch_include/x86/interfaces/object-api-arch.xml
++++ b/libsel4/arch_include/x86/interfaces/object-api-arch.xml
+@@ -393,21 +393,40 @@
+                 </description>
+             </error>
+         </method>
++        <method id="X86PageDeriveSubframe" name="DeriveSubframe" manual_name="Derive Subframe">
++            <condition><config var="CONFIG_ARCH_X86_64"/></condition>
++            <brief>Derive a 4 KiB alias of a RAM-backed 2 MiB frame.</brief>
++            <description>
++                Offset must be 4 KiB aligned and below 2 MiB. The destination
++                must be empty. Rights are intersected with the source's rights.
++                Memory is neither allocated nor cleared. The result is unmapped
++                and remains in the source Untyped's derivation tree, so revoking
++                that Untyped deletes both sizes of aliases before memory reuse.
++                Deleting the source leaves its aliases alive. Derived aliases
++                and ordinary copies retain non-revocable frame-copy semantics:
++                an alias does not gain authority to revoke other aliases.
++            </description>
++            <param dir="in" name="root" type="seL4_CNode" description="Destination CSpace root."/>
++            <param dir="in" name="index" type="seL4_Word" description="Destination CPtr."/>
++            <param dir="in" name="depth" type="seL4_Word" description="Destination lookup depth."/>
++            <param dir="in" name="offset" type="seL4_Word" description="Byte offset in the large frame."/>
++            <param dir="in" name="rights" type="seL4_CapRights_t" description="Maximum derived rights."/>
++        </method>
+         <method id="X86PageTestAndClearAccessed" name="TestAndClearAccessed"
+             manual_name="Test and Clear Accessed">
+             <condition><config var="CONFIG_ARCH_X86_64"/></condition>
+-            <brief>Test and clear the accessed bit of a mapped 4 KiB frame.</brief>
++            <brief>Test and clear the accessed bit of a mapped 4 KiB or 2 MiB frame.</brief>
+             <description>
+                 The mapping is located using the capability's ASID and address,
+                 and must still refer to the same frame. Clearing is atomic and
+                 does not invalidate the TLB: a cached translation can delay the
+                 observation of a later access. Permissions and dirty state are
+-                unchanged. Larger pages and non-native mappings are unsupported.
++                unchanged. Other sizes and non-native mappings are unsupported.
+             </description>
+             <param dir="out" name="accessed" type="seL4_Word"
+                 description="One if the accessed bit was set, otherwise zero."/>
+             <error name="seL4_IllegalOperation">
+-                <description>The frame is not a mapped native 4 KiB page.</description>
++                <description>The frame is not a mapped native 4 KiB or 2 MiB page.</description>
+             </error>
+             <error name="seL4_InvalidCapability">
+                 <description>The capability's mapping is stale.</description>
+diff --git a/src/arch/arm/64/kernel/vspace.c b/src/arch/arm/64/kernel/vspace.c
+index 8d78d3f0b..0386dd1c8 100644
+--- a/src/arch/arm/64/kernel/vspace.c
++++ b/src/arch/arm/64/kernel/vspace.c
+@@ -712,11 +712,12 @@ static pte_t makeUserPagePTE(paddr_t paddr, vm_rights_t vm_rights, vm_attributes
+ 
+ #ifndef CONFIG_ARM_HYPERVISOR_SUPPORT
+ /* Without hardware AF updates, repair access-flag faults in seL4, without
+- * fault IPC to the VSpace owner.  Only native EL0 4 KiB mappings qualify.
++ * fault IPC to the VSpace owner.  Only native EL0 4 KiB and 2 MiB mappings qualify.
+  * An AF already set by another core is also a successfully handled fault. */
+ static bool_t handleAccessFlagFault(tcb_t *thread, vptr_t addr, word_t fault)
+ {
+-    if ((fault & MASK(6)) != 0xb || addr > USER_TOP) {
++    word_t fsc = fault & MASK(6);
++    if ((fsc != 0xb && fsc != 0xa) || addr > USER_TOP) {
+         return false;
+     }
+     cap_t root = TCB_PTR_CTE_PTR(thread, tcbVTable)->cap;
+@@ -729,9 +730,9 @@ static bool_t handleAccessFlagFault(tcb_t *thread, vptr_t addr, word_t fault)
+         return false;
+     }
+     lookupPTSlot_ret_t lu_ret = lookupPTSlot(find_ret.vspace_root, addr);
+-    if (lu_ret.ptBitsLeft != seL4_PageBits ||
++    if (lu_ret.ptBitsLeft != (fsc == 0xa ? 21 : 12) ||
+         !pte_is_page_type(*lu_ret.ptSlot) ||
+-        !(pte_pte_4k_page_get_AP(*lu_ret.ptSlot) & 1)) {
++        !(lu_ret.ptSlot->words[0] & BIT(6))) {
+         return false;
+     }
+     __atomic_fetch_or(&lu_ret.ptSlot->words[0], BIT(10), __ATOMIC_RELAXED);
+@@ -1552,7 +1553,8 @@ static inline bool_t CONST checkVPAlignment(vm_page_size_t sz, word_t w)
+ static exception_t decodePageTestAndClearAccessed(cap_t cap, bool_t call)
+ {
+     asid_t asid = cap_frame_cap_get_capFMappedASID(cap);
+-    if (cap_frame_cap_get_capFSize(cap) != ARMSmallPage || asid == asidInvalid) {
++    if ((cap_frame_cap_get_capFSize(cap) != ARMSmallPage &&
++         cap_frame_cap_get_capFSize(cap) != ARMLargePage) || asid == asidInvalid) {
+         current_syscall_error.type = seL4_IllegalOperation;
+         return EXCEPTION_SYSCALL_ERROR;
+     }
+@@ -1563,7 +1565,8 @@ static exception_t decodePageTestAndClearAccessed(cap_t cap, bool_t call)
+     }
+     lookupPTSlot_ret_t lu_ret = lookupPTSlot(find_ret.vspace_root,
+                                            cap_frame_cap_get_capFMappedAddress(cap));
+-    if (lu_ret.ptBitsLeft != seL4_PageBits || !pte_is_page_type(*lu_ret.ptSlot) ||
++    if (lu_ret.ptBitsLeft != pageBitsForSize(cap_frame_cap_get_capFSize(cap)) ||
++        !pte_is_page_type(*lu_ret.ptSlot) ||
+         pte_get_page_base_address(*lu_ret.ptSlot) !=
+         pptr_to_paddr((void *)cap_frame_cap_get_capFBasePtr(cap))) {
+         goto stale;
+@@ -1593,10 +1596,52 @@ stale:
+ }
+ #endif
+ 
++/* Derive an alias, not a new object: no retype, zeroing, or ownership
++ * transfer. The Untyped remains the ancestor of every alias. Like a
++ * frame copy, the alias is non-revocable: deriving a narrower region
++ * must not give its holder authority to revoke a sibling alias. */
++static exception_t decodePageDeriveSubframe(word_t length, cte_t *src, cap_t cap, word_t *buffer)
++{
++    if (length < 4 || current_extra_caps.excaprefs[0] == NULL) {
++        current_syscall_error.type = seL4_TruncatedMessage;
++        return EXCEPTION_SYSCALL_ERROR;
++    }
++    if (cap_frame_cap_get_capFSize(cap) != ARMLargePage || cap_frame_cap_get_capFIsDevice(cap)) {
++        current_syscall_error.type = seL4_IllegalOperation;
++        return EXCEPTION_SYSCALL_ERROR;
++    }
++    word_t offset = getSyscallArg(2, buffer);
++    if (offset >= BIT(21) || !IS_ALIGNED(offset, 12)) {
++        current_syscall_error.type = seL4_InvalidArgument;
++        current_syscall_error.invalidArgumentNumber = 2;
++        return EXCEPTION_SYSCALL_ERROR;
++    }
++    lookupSlot_ret_t lu = lookupTargetSlot(current_extra_caps.excaprefs[0]->cap,
++                                           getSyscallArg(0, buffer), getSyscallArg(1, buffer));
++    if (lu.status != EXCEPTION_NONE) {
++        return lu.status;
++    }
++    exception_t status = ensureEmptySlot(lu.slot);
++    if (status != EXCEPTION_NONE) {
++        return status;
++    }
++    cap = cap_frame_cap_set_capFBasePtr(cap, cap_frame_cap_get_capFBasePtr(cap) + offset);
++    cap = cap_frame_cap_set_capFSize(cap, ARMSmallPage);
++    cap = cap_frame_cap_set_capFVMRights(cap, maskVMRights(cap_frame_cap_get_capFVMRights(cap),
++                                                        rightsFromWord(getSyscallArg(3, buffer))));
++    cap = cap_frame_cap_set_capFMappedASID(cap, asidInvalid);
++    cap = cap_frame_cap_set_capFMappedAddress(cap, 0);
++    setThreadState(NODE_STATE(ksCurThread), ThreadState_Restart);
++    cteInsert(cap, src, lu.slot);
++    return EXCEPTION_NONE;
++}
++
+ static exception_t decodeARMFrameInvocation(word_t invLabel, word_t length,
+                                             cte_t *cte, cap_t cap, bool_t call, word_t *buffer)
+ {
+     switch (invLabel) {
++    case ARMPageDeriveSubframe:
++        return decodePageDeriveSubframe(length, cte, cap, buffer);
+     case ARMPageMap: {
+         vptr_t vaddr;
+         paddr_t base;
+diff --git a/src/arch/x86/kernel/vspace.c b/src/arch/x86/kernel/vspace.c
+index f9f4d6d30..37da8aca3 100644
+--- a/src/arch/x86/kernel/vspace.c
++++ b/src/arch/x86/kernel/vspace.c
+@@ -6,6 +6,8 @@
+ 
+ #include <config.h>
+ #include <api/syscall.h>
++#include <kernel/cspace.h>
++#include <object/cnode.h>
+ #include <machine/io.h>
+ #include <kernel/boot.h>
+ #include <model/statedata.h>
+@@ -986,7 +988,8 @@ static create_mapping_pde_return_t createSafeMappingEntries_PDE(paddr_t base, wo
+ static exception_t decodePageTestAndClearAccessed(cap_t cap, bool_t call)
+ {
+     asid_t asid = cap_frame_cap_get_capFMappedASID(cap);
+-    if (cap_frame_cap_get_capFSize(cap) != X86_SmallPage ||
++    if ((cap_frame_cap_get_capFSize(cap) != X86_SmallPage &&
++         cap_frame_cap_get_capFSize(cap) != X86_LargePage) ||
+         asid == asidInvalid || cap_frame_cap_get_capFMapType(cap) != X86_MappingVSpace) {
+         current_syscall_error.type = seL4_IllegalOperation;
+         return EXCEPTION_SYSCALL_ERROR;
+@@ -996,17 +999,27 @@ static exception_t decodePageTestAndClearAccessed(cap_t cap, bool_t call)
+     if (find_ret.status != EXCEPTION_NONE) {
+         goto stale;
+     }
+-    lookupPTSlot_ret_t lu_ret = lookupPTSlot(find_ret.vspace_root,
+-                                           cap_frame_cap_get_capFMappedAddress(cap));
+-    if (lu_ret.status != EXCEPTION_NONE || !pte_ptr_get_present(lu_ret.ptSlot) ||
+-        pte_ptr_get_page_base_address(lu_ret.ptSlot) !=
+-        pptr_to_paddr((void *)cap_frame_cap_get_capFBasePtr(cap))) {
+-        goto stale;
++    uint64_t *entry;
++    vptr_t va = cap_frame_cap_get_capFMappedAddress(cap);
++    paddr_t pa = pptr_to_paddr((void *)cap_frame_cap_get_capFBasePtr(cap));
++    if (cap_frame_cap_get_capFSize(cap) == X86_LargePage) {
++        lookupPDSlot_ret_t lu = lookupPDSlot(find_ret.vspace_root, va);
++        if (lu.status != EXCEPTION_NONE || pde_ptr_get_page_size(lu.pdSlot) != pde_pde_large ||
++            !pde_pde_large_ptr_get_present(lu.pdSlot) ||
++            pde_pde_large_ptr_get_page_base_address(lu.pdSlot) != pa) {
++            goto stale;
++        }
++        entry = &lu.pdSlot->words[0];
++    } else {
++        lookupPTSlot_ret_t lu = lookupPTSlot(find_ret.vspace_root, va);
++        if (lu.status != EXCEPTION_NONE || !pte_ptr_get_present(lu.ptSlot) ||
++            pte_ptr_get_page_base_address(lu.ptSlot) != pa) {
++            goto stale;
++        }
++        entry = &lu.ptSlot->words[0];
+     }
+-
+-    /* The CPU can set A/D on another core even under the kernel lock.
+-     * Clear only A, atomically, preserving in particular the dirty bit. */
+-    word_t old = __atomic_fetch_and(&lu_ret.ptSlot->words[0], ~BIT(5), __ATOMIC_RELAXED);
++    /* A/D can change on another core even under the kernel lock. */
++    word_t old = __atomic_fetch_and(entry, ~BIT(5), __ATOMIC_RELAXED);
+     tcb_t *thread = NODE_STATE(ksCurThread);
+     if (call) {
+         word_t *ipcBuffer = lookupIPCBuffer(true, thread);
+@@ -1025,6 +1038,50 @@ stale:
+ }
+ #endif
+ 
++#ifdef CONFIG_ARCH_X86_64
++/* Derive an alias, not a new object: no retype, zeroing, or ownership
++ * transfer. The Untyped remains the ancestor of every alias. Like a
++ * frame copy, the alias is non-revocable: deriving a narrower region
++ * must not give its holder authority to revoke a sibling alias. */
++static exception_t decodePageDeriveSubframe(word_t length, cte_t *src, cap_t cap, word_t *buffer)
++{
++    if (length < 4 || current_extra_caps.excaprefs[0] == NULL) {
++        current_syscall_error.type = seL4_TruncatedMessage;
++        return EXCEPTION_SYSCALL_ERROR;
++    }
++    if (cap_frame_cap_get_capFSize(cap) != X86_LargePage || cap_frame_cap_get_capFIsDevice(cap)) {
++        current_syscall_error.type = seL4_IllegalOperation;
++        return EXCEPTION_SYSCALL_ERROR;
++    }
++    word_t offset = getSyscallArg(2, buffer);
++    if (offset >= BIT(21) || !IS_ALIGNED(offset, 12)) {
++        current_syscall_error.type = seL4_InvalidArgument;
++        current_syscall_error.invalidArgumentNumber = 2;
++        return EXCEPTION_SYSCALL_ERROR;
++    }
++    lookupSlot_ret_t lu = lookupTargetSlot(current_extra_caps.excaprefs[0]->cap,
++                                           getSyscallArg(0, buffer), getSyscallArg(1, buffer));
++    if (lu.status != EXCEPTION_NONE) {
++        return lu.status;
++    }
++    exception_t status = ensureEmptySlot(lu.slot);
++    if (status != EXCEPTION_NONE) {
++        return status;
++    }
++    cap = cap_frame_cap_set_capFBasePtr(cap, cap_frame_cap_get_capFBasePtr(cap) + offset);
++    cap = cap_frame_cap_set_capFSize(cap, X86_SmallPage);
++    cap = cap_frame_cap_set_capFVMRights(cap, maskVMRights(cap_frame_cap_get_capFVMRights(cap),
++                                                        rightsFromWord(getSyscallArg(3, buffer))));
++    cap = cap_frame_cap_set_capFMappedASID(cap, asidInvalid);
++    cap = cap_frame_cap_set_capFMappedAddress(cap, 0);
++    cap = cap_frame_cap_set_capFMapType(cap, X86_MappingNone);
++    setThreadState(NODE_STATE(ksCurThread), ThreadState_Restart);
++    cteInsert(cap, src, lu.slot);
++    return EXCEPTION_NONE;
++}
++
++#endif
++
+ exception_t decodeX86FrameInvocation(
+     word_t invLabel,
+     word_t length,
+@@ -1035,6 +1092,10 @@ exception_t decodeX86FrameInvocation(
+ )
+ {
+     switch (invLabel) {
++#ifdef CONFIG_ARCH_X86_64
++    case X86PageDeriveSubframe:
++        return decodePageDeriveSubframe(length, cte, cap, buffer);
++#endif
+     case X86PageMap: { /* Map */
+         word_t          vaddr;
+         word_t          vtop;
+-- 
+2.47.3
+

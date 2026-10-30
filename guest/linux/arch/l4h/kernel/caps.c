@@ -132,6 +132,7 @@ struct block {
 	u8 reserve;		/* a free object block kept for emergencies */
 	u32 busy;		/* chunks with live objects (BLK_OBJECTS) */
 	u32 used;		/* our view of the Untyped's watermark */
+	unsigned long large;	/* canonical 2 MiB frame (BLK_FRAMES) */
 	struct list_head chunks;	/* chunks carved from it */
 };
 
@@ -140,9 +141,9 @@ struct block {
  * they die together when a process exits or loses its VSpace, while
  * TCBs and slot CNodes live long, and must not pin their chunks.  TCBs
  * are PAGE; CNodes (slot CNodes, RAM CNodes) are CNODE. */
-enum { CLASS_SMALL, CLASS_PAGE, CLASS_CNODE, CLASS_PT, NR_CLASSES };
-static const int class_obj_bits[NR_CLASSES] = { 10, 12, 17, 12 };
-static const int class_chunk_bits[NR_CLASSES] = { 14, 16, 17, 16 };
+enum { CLASS_SMALL, CLASS_PAGE, CLASS_CNODE, CLASS_PT, CLASS_LARGE, NR_CLASSES };
+static const int class_obj_bits[NR_CLASSES] = { 10, 12, 17, 12, 21 };
+static const int class_chunk_bits[NR_CLASSES] = { 14, 16, 17, 16, 21 };
 
 struct chunk {
 	struct list_head link;		/* in chunks[class] */
@@ -159,7 +160,7 @@ static struct block *blocks;
 static unsigned int nr_blocks, boot_blocks;
 static struct list_head chunks[NR_CLASSES];
 /* The open object block of each class, -1 if none. */
-static int open_block[NR_CLASSES] = { -1, -1, -1, -1 };
+static int open_block[NR_CLASSES] = { [0 ... NR_CLASSES - 1] = -1 };
 /* Counts (under caps_lock): object blocks, free ones in the reserve, and
  * other free ones (spare).  Targets: reserve blocks, and spare blocks kept
  * before giving them back to the page allocator (the watermark). */
@@ -176,6 +177,8 @@ static int obj_class(int type, int bits)
 
 	if (type == L4H_OBJ_PT || type == L4H_OBJ_PD || type == L4H_OBJ_PDPT)
 		return CLASS_PT;
+	if (bits == L4H_BLOCK_SHIFT && (type == L4H_OBJ_UNTYPED || type == L4H_OBJ_LARGE_FRAME))
+		return CLASS_LARGE;
 	for (c = 0; c < CLASS_PT; c++)
 		if (bits <= class_obj_bits[c])
 			return c;
@@ -693,8 +696,30 @@ void __init l4h_map_kernel_early(unsigned long frame, unsigned long va)
 		panic("l4h: cannot map %#lx at boot\n", va);
 }
 
+/* A canonical large frame and its 512 direct-map aliases share one
+ * allocation. Revoking the block Untyped tears down both sizes. */
+static int make_block_frames(unsigned long ut, unsigned long gpa, unsigned long *large)
+{
+	unsigned long slot = l4h_slot_alloc(), i;
+	int err;
+
+	if (!slot)
+		return -ENOMEM;
+	err = l4h_retype(ut, L4H_OBJ_LARGE_FRAME, 0, slot >> L4H_L2_INDEX_BITS,
+			 L4H_ROOT_DEPTH, slot & (L2_SLOTS - 1), 1);
+	for (i = 0; !err && i < RAM_BLOCK_PAGES; i++)
+		err = l4h_page_derive_subframe(slot, i * PAGE_SIZE, L4H_FRAME_CPTR(gpa + i * PAGE_SIZE));
+	if (err) {
+		WARN_ON(l4h_cnode_revoke(ut, 64));
+		l4h_slot_free(slot);
+		return err < 0 ? err : -EFAULT;
+	}
+	*large = slot;
+	return 0;
+}
+
 /* Give block `b` (BLK_BUSY; its Untyped has no children) its frames: its
- * RAM CNode, 512 frames, mapped in the direct map. */
+ * RAM CNode, canonical large frame, and 512 direct-map aliases. */
 static int block_make_frames(unsigned int b)
 {
 	struct block *bl = &blocks[b];
@@ -713,8 +738,7 @@ static int block_make_frames(unsigned int b)
 			return err;
 		bl->has_l2 = 1;
 	}
-	err = l4h_retype(block_cptr(b), L4H_OBJ_FRAME, 0, L4H_FRAME_CPTR(gpa) >> L4H_RAM_L2_BITS,
-			 L4H_ROOT_DEPTH + L4H_RAM_L2_BITS, 0, RAM_BLOCK_PAGES);
+	err = make_block_frames(block_cptr(b), gpa, &bl->large);
 	if (err) {
 		pr_err("l4h: block %u: frames: %d\n", b, err);
 		return -ENOMEM;
@@ -724,6 +748,8 @@ static int block_make_frames(unsigned int b)
 		if (err) {
 			/* Back to an Untyped without children. */
 			WARN_ON(l4h_cnode_revoke(block_cptr(b), 64));
+			l4h_slot_free(bl->large);
+			bl->large = 0;
 			return err;
 		}
 	}
@@ -749,6 +775,7 @@ static DECLARE_BITMAP(hp_l2_made, L4H_HP_MAX);
 static DECLARE_BITMAP(ram_l1_made, L4H_MAX_RAM_L1);
 /* Slots of the direct-map page tables of each mapped hotplug block. */
 static unsigned long *hp_tables[L4H_HP_MAX];
+static unsigned long *hp_large[L4H_HP_MAX];
 static DEFINE_MUTEX(hp_mutex);
 
 static_assert(L4H_HP_SHIFT == SECTION_SIZE_BITS);
@@ -826,14 +853,19 @@ int l4h_hp_map(unsigned int m)
 	unsigned long gpa = hp_gpa(m), base = gpa >> L4H_BLOCK_SHIFT;
 	unsigned long objs = L4H_HP_BLOCK_CPTR(m, HP_OBJ_BLOCK);
 	unsigned long l1 = L4H_SLOT_RAM_L1_BASE + (gpa >> 30);
-	unsigned long *tables, i, k, flags;
+	unsigned long *tables, *large, i, k, flags;
 	int err = 0;
 
 	tables = kcalloc(HP_OBJ_BLOCK, sizeof(*tables), GFP_KERNEL);
-	if (!tables)
+	large = kcalloc(HP_OBJ_BLOCK, sizeof(*large), GFP_KERNEL);
+	if (!tables || !large) {
+		kfree(tables);
+		kfree(large);
 		return -ENOMEM;
+	}
 	mutex_lock(&hp_mutex);
 	hp_tables[m] = tables;
+	hp_large[m] = large;
 	/* All the CNodes first, then the page tables: interleaved, each CNode
 	 * would skip 12 KiB to its alignment. */
 	for (i = 0; i < HP_OBJ_BLOCK && !err; i++) {
@@ -842,9 +874,7 @@ int l4h_hp_map(unsigned int m)
 		err = l4h_retype(objs, L4H_OBJ_CNODE, L4H_RAM_L2_BITS, l1, L4H_ROOT_DEPTH,
 				 b & ((1u << L4H_RAM_L2_BITS) - 1), 1);
 		if (!err)
-			err = l4h_retype(L4H_HP_BLOCK_CPTR(m, i), L4H_OBJ_FRAME, 0,
-					 L4H_FRAME_CPTR(bgpa) >> L4H_RAM_L2_BITS,
-					 L4H_ROOT_DEPTH + L4H_RAM_L2_BITS, 0, RAM_BLOCK_PAGES);
+			err = make_block_frames(L4H_HP_BLOCK_CPTR(m, i), bgpa, &large[i]);
 	}
 	for (i = 0; i < HP_OBJ_BLOCK && !err; i++) {
 		unsigned long bgpa = gpa + i * RAM_BLOCK, va = uml_physmem + bgpa;
@@ -887,7 +917,7 @@ int l4h_hp_map(unsigned int m)
  */
 void l4h_hp_unmap(unsigned int m)
 {
-	unsigned long *tables, i;
+	unsigned long *tables, *large, i;
 
 	mutex_lock(&hp_mutex);
 	WRITE_ONCE(hp_state[m], HP_BUSY);
@@ -897,15 +927,38 @@ void l4h_hp_unmap(unsigned int m)
 		WARN_ON(l4h_cnode_revoke(L4H_HP_BLOCK_CPTR(m, i), 64));
 	tables = hp_tables[m];
 	hp_tables[m] = NULL;
+	large = hp_large[m];
+	hp_large[m] = NULL;
 	for (i = 0; tables && i < HP_OBJ_BLOCK; i++) {
 		/* The revoke deleted the tables: only the slots are left. */
 		if (tables[i])
 			l4h_slot_free(tables[i]);
 	}
+	for (i = 0; large && i < HP_OBJ_BLOCK; i++)
+		if (large[i])
+			l4h_slot_free(large[i]);
+	kfree(large);
 	kfree(tables);
 	WRITE_ONCE(hp_state[m], HP_ABSENT);
 	mutex_unlock(&hp_mutex);
 }
+
+/* The caller's page/folio reference excludes conversion and hot-unplug.
+ * Boot-image RAM has only the host's small frame caps: use the fallback. */
+unsigned long l4h_large_frame(unsigned long gpa)
+{
+	unsigned long b = gpa >> L4H_BLOCK_SHIFT, m;
+
+	if (!IS_ALIGNED(gpa, RAM_BLOCK))
+		return 0;
+	if (b < nr_blocks)
+		return READ_ONCE(blocks[b].state) == BLK_FRAMES ? blocks[b].large : 0;
+	if (!hp_block_mapped(b))
+		return 0;
+	m = (b - hp_first) >> L4H_HP_BITS;
+	return hp_large[m][b & (L4H_HP_BLOCKS - 1)];
+}
+EXPORT_SYMBOL_GPL(l4h_large_frame);
 
 /*
  * Are the direct-map pages of guest-physical [gpa, gpa+size) there?  Object
@@ -985,11 +1038,15 @@ static void block_to_objects(unsigned int b, int origin)
 {
 	unsigned long flags;
 
-	/* Deletes the 512 frames and every mapping and copy of them: the
+	/* Deletes the large frame, its 512 aliases and every mapping: the
 	 * direct map, the RAM CNode slots, any process mapping left.  Nothing
 	 * outside the guest has them: devices only see the I/O pool. */
 	wait_nofault_accesses();
 	WARN_ON(l4h_cnode_revoke(block_cptr(b), 64));
+	if (blocks[b].large) {
+		l4h_slot_free(blocks[b].large);
+		blocks[b].large = 0;
+	}
 	raw_spin_lock_irqsave(&caps_lock, flags);
 	blocks[b].state = BLK_OBJECTS;
 	blocks[b].origin = origin;

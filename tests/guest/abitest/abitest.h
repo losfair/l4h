@@ -12,6 +12,7 @@
 
 struct abitest {
 	int cpu;		/* the vCPU the tests run on, interrupts off */
+	unsigned long large_ut;	/* independent 2 MiB allocation for alias lifetime tests */
 	unsigned long vspace;	/* an empty process VSpace */
 	unsigned long user_gpa;	/* a page with a copy of user_prog */
 	unsigned long zero_gpa;	/* a zeroed page */
@@ -22,14 +23,14 @@ struct abitest {
 };
 
 /* The user program (user.S) and its position-independent fault helpers. */
-extern char user_prog[], user_debug[], user_write[], user_end[];
+extern char user_prog[], user_debug[], user_write[], user_large[], user_large_write[], user_end[];
 
 /* main.c: objects, slots and mappings, deleted when the tests are done. */
 unsigned long abitest_obj(int type, int size_bits);	/* L4H_OBJ_*; 0 if none */
 unsigned long abitest_slot(void);			/* an empty slot, or 0 */
 /* Map `frame` at page `i` (< ABITEST_KPAGES) of a range of the kernel's
  * VSpace; NULL on failure. */
-#define ABITEST_KPAGES		4
+#define ABITEST_KPAGES		8
 volatile void *abitest_map(unsigned long frame, int i);
 
 /* sel4.c: 0 if every test passed. */

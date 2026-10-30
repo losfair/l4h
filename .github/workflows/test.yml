@@ -92,6 +92,8 @@ jobs:
         run: tests/run-selftest.sh 4
       - name: Transparent huge pages, 1 and 4 vCPUs
         run: tests/run-thptest.sh 1 && tests/run-thptest.sh 4
+      - name: THP memory hotplug and revocation
+        run: HPSTRESS_THP=1 tests/run-hotplugstress.sh 15
       - name: SKIM isolation and Linux ABI on Meltdown-affected CPU profiles
         run: tests/run-skimtest.sh
       - name: AArch64 userspace on x86_64 (kemu)

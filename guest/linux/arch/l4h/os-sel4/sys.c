@@ -33,11 +33,13 @@ static const seL4_Word obj_type[L4H_OBJ_NR] = {
 	[L4H_OBJ_REPLY] = seL4_ReplyObject,
 #ifdef __aarch64__
 	[L4H_OBJ_FRAME] = seL4_ARM_SmallPageObject,
+	[L4H_OBJ_LARGE_FRAME] = seL4_ARM_LargePageObject,
 	[L4H_OBJ_PT] = seL4_ARM_PageTableObject,
 	[L4H_OBJ_PD] = seL4_ARM_PageTableObject,
 	[L4H_OBJ_PDPT] = seL4_ARM_PageTableObject,
 #else
 	[L4H_OBJ_FRAME] = seL4_X86_4K,
+	[L4H_OBJ_LARGE_FRAME] = seL4_X86_LargePageObject,
 	[L4H_OBJ_PT] = seL4_X86_PageTableObject,
 	[L4H_OBJ_PD] = seL4_X86_PageDirectoryObject,
 	[L4H_OBJ_PDPT] = seL4_X86_PDPTObject,
@@ -61,6 +63,8 @@ int l4h_obj_bits(int type, int size_bits)
 		return size_bits;
 	case L4H_OBJ_REPLY:
 		return seL4_ReplyBits;
+	case L4H_OBJ_LARGE_FRAME:
+		return 21;
 	case L4H_OBJ_FRAME:
 	case L4H_OBJ_PT:
 	case L4H_OBJ_PD:
@@ -126,7 +130,7 @@ int l4h_page_map(unsigned long frame, unsigned long vspace, unsigned long va, in
 	int err = seL4_ARM_Page_Map(frame, vspace, va, r, seL4_ARM_Default_VMAttributes |
 		((prot & L4H_PROT_EXEC) ? 0 : seL4_ARM_ExecuteNever));
 	if (!err && (prot & L4H_PROT_EXEC))
-		err = seL4_ARM_Page_Unify_Instruction(frame, 0, 4096);
+		err = seL4_ARM_Page_Unify_Instruction(frame, 0, (prot & L4H_PROT_LARGE) ? 1ul << 21 : 4096);
 	return err;
 #else
 	seL4_X86_VMAttributes attr = (prot & L4H_PROT_EXEC) ? seL4_X86_Default_VMAttributes :
@@ -135,6 +139,15 @@ int l4h_page_map(unsigned long frame, unsigned long vspace, unsigned long va, in
 	if (prot & L4H_PROT_DEFER_FLUSH)
 		attr |= seL4_X86_DeferFlush;
 	return seL4_X86_Page_Map(frame, vspace, va, r, attr);
+#endif
+}
+
+int l4h_page_derive_subframe(unsigned long frame, unsigned long offset, unsigned long dst)
+{
+#ifdef __aarch64__
+	return seL4_ARM_Page_DeriveSubframe(frame, L4H_CNODE_CPTR, dst, 64, offset, seL4_AllRights);
+#else
+	return seL4_X86_Page_DeriveSubframe(frame, L4H_CNODE_CPTR, dst, 64, offset, seL4_AllRights);
 #endif
 }
 

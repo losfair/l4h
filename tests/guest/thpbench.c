@@ -3,6 +3,9 @@
 #define _GNU_SOURCE
 #define THP_TAG "THPBENCH"
 #include "thp.h"
+#include "page-aging/page-aging.h"
+#include <fcntl.h>
+#include <sys/ioctl.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -35,6 +38,21 @@ static unsigned long pgtables_kb(void)
 	return kb;
 }
 
+static long native_leaves(struct area a)
+{
+	struct aging_range r = { .start = (uintptr_t)a.p, .size = a.size };
+	int fd = open("/dev/l4h_page_aging", O_RDONLY);
+	long n;
+
+	/* Keep the same binary usable as a native Linux comparison. */
+	if (fd < 0)
+		return -1;
+	n = ioctl(fd, L4H_LARGE_MAPPINGS, &r);
+	close(fd);
+	CHECK(n >= 0, "native leaf query");
+	return n;
+}
+
 static void dense(int trial, int huge)
 {
 	const size_t size = 64UL << 20, reads = 1000000;
@@ -42,6 +60,7 @@ static void dense(int trial, int huge)
 	struct rusage before, after;
 	double t, touch, walk, fork_ms, cow, protect, unmap;
 	unsigned long anon, rss, pgtables;
+	long native;
 	uint32_t state = 1;
 	unsigned long sum = 0;
 	pid_t pid;
@@ -55,6 +74,8 @@ static void dense(int trial, int huge)
 	anon = area_kb(a, "AnonHugePages:");
 	rss = area_kb(a, "Rss:");
 	pgtables = pgtables_kb();
+	native = native_leaves(a);
+	CHECK(native < 0 || native == (huge ? (long)(size / HUGE) : 0), "native large leaf coverage %ld", native);
 	if (huge)
 		require_huge(a);
 	else
@@ -98,9 +119,9 @@ static void dense(int trial, int huge)
 	area_free(a);
 	unmap = (now() - t) * 1000;
 	printf("THPBENCH: trial=%d mode=%s dense_ms=%.3f minflt=%ld anon_huge_kb=%lu rss_kb=%lu "
-	       "pgtables_kb=%lu random_ns=%.2f fork_ms=%.3f cow_ms=%.3f protect_ms=%.3f unmap_ms=%.3f\n",
+	       "pgtables_kb=%lu native_2m=%ld random_ns=%.2f fork_ms=%.3f cow_ms=%.3f protect_ms=%.3f unmap_ms=%.3f\n",
 	       trial, huge ? "huge" : "base", touch, after.ru_minflt - before.ru_minflt,
-	       anon, rss, pgtables, walk, fork_ms, cow, protect, unmap);
+	       anon, rss, pgtables, native, walk, fork_ms, cow, protect, unmap);
 }
 
 static void sparse(int trial, int huge)
