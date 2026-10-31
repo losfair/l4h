@@ -662,8 +662,9 @@ static int __add_kernel_table(int level, unsigned long va)
 }
 
 /* Map frame `frame` read-write (not executable) at `va` in the kernel
- * VSpace; page tables are added under caps_lock, when missing. */
-static int map_kernel(unsigned long frame, unsigned long va)
+ * VSpace; page tables are added under caps_lock, when missing: from
+ * `level` up (0 under a 4 KiB frame, 1 under a 2 MiB one). */
+static int map_kernel_at(unsigned long frame, unsigned long va, int level)
 {
 	unsigned long flags;
 	int err;
@@ -674,11 +675,16 @@ static int map_kernel(unsigned long frame, unsigned long va)
 		if (err != L4H_ERR_FAILED_LOOKUP)
 			return err ? -EFAULT : 0;
 		raw_spin_lock_irqsave(&caps_lock, flags);
-		err = __add_kernel_table(0, va);
+		err = __add_kernel_table(level, va);
 		raw_spin_unlock_irqrestore(&caps_lock, flags);
 		if (err)
 			return err;
 	}
+}
+
+static int map_kernel(unsigned long frame, unsigned long va)
+{
+	return map_kernel_at(frame, va, 0);
 }
 
 /*
@@ -721,13 +727,22 @@ static int make_block_frames(unsigned long ut, unsigned long gpa, unsigned long 
 	return 0;
 }
 
-/* Give block `b` (BLK_BUSY; its Untyped has no children) its frames: its
- * RAM CNode, canonical large frame, and 512 direct-map aliases. */
+/*
+ * Give block `b` (BLK_BUSY; its Untyped has no children) its frames: its
+ * RAM CNode, canonical large frame, and 512 aliases, and map it in the
+ * direct map.  That takes one 2 MiB leaf of the canonical frame: one
+ * system call and no page table, instead of 512 calls, one per alias.  A
+ * mapped frame cap still copies unmapped, so THP leaves (copies of it)
+ * are unaffected, and revoking the Untyped removes the leaf with the
+ * rest.  Where a 4 KiB page table already covers the block, or the direct
+ * map is not 2 MiB aligned, the aliases are mapped one by one instead.
+ */
 static int block_make_frames(unsigned int b)
 {
 	struct block *bl = &blocks[b];
 	unsigned long l1 = L4H_SLOT_RAM_L1_BASE + (b >> L4H_RAM_L2_BITS);
 	unsigned long gpa = (unsigned long)b << L4H_BLOCK_SHIFT, i, flags;
+	unsigned long va = uml_physmem + gpa;
 	int err;
 
 	if (!bl->has_l2) {
@@ -746,8 +761,10 @@ static int block_make_frames(unsigned int b)
 		pr_err("l4h: block %u: frames: %d\n", b, err);
 		return -ENOMEM;
 	}
+	if (IS_ALIGNED(va, RAM_BLOCK) && !map_kernel_at(bl->large, va, 1))
+		return 0;
 	for (i = 0; i < RAM_BLOCK_PAGES; i++) {
-		err = map_kernel(L4H_FRAME_CPTR(gpa + i * PAGE_SIZE), uml_physmem + gpa + i * PAGE_SIZE);
+		err = map_kernel(L4H_FRAME_CPTR(gpa + i * PAGE_SIZE), va + i * PAGE_SIZE);
 		if (err) {
 			/* Back to an Untyped without children. */
 			WARN_ON(l4h_cnode_revoke(block_cptr(b), 64));
@@ -1358,7 +1375,8 @@ void __init l4h_caps_init(void)
 			 bi->hp_gpa + (u64)hp_count * L4H_HP_SIZE > L4H_GPA_END))
 		panic("l4h: bad hotplug region %#llx, %u blocks\n", bi->hp_gpa, hp_count);
 	bitmap_set(ram_l1_made, 0, DIV_ROUND_UP(nr_blocks, 1u << L4H_RAM_L2_BITS));
-	/* A 16 KiB RAM CNode and a 4 KiB page table per frame block, in
+	/* A 16 KiB RAM CNode and a 4 KiB page table per frame block (the
+	 * direct map needs one only where it falls back to 4 KiB leaves), in
 	 * blocks of their classes, a capability CNode, and the reserve. */
 	want = DIV_ROUND_UP(rest * (16ul << 10) + (256ul << 10), RAM_BLOCK) +
 	       DIV_ROUND_UP(rest * (4ul << 10) + (64ul << 10), RAM_BLOCK) + reserve_target;

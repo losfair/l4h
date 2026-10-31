@@ -469,10 +469,15 @@ hooks (§10.2) and the Android features of §5.8.
   512 MiB of RAM; sysfs can enable it). Smaller PTE-mapped THP sizes are
   disabled by default.
   - Guest-owned and hotplug RAM blocks have one canonical 2 MiB seL4 frame
-    plus 512 derived 4 KiB aliases (patch 0029). The direct map and
-    base-page mappings use the aliases; a huge Linux PMD uses a copy of the
-    large cap, giving one native 2 MiB leaf. Boot-image blocks the host
-    fills keep their small caps and use the 512-mapping fallback.
+    plus 512 derived 4 KiB aliases (patch 0029). Base-page mappings use
+    the aliases; a huge Linux PMD uses a copy of the large cap, giving one
+    native 2 MiB leaf. The direct map maps a guest-owned block with the
+    canonical large cap itself, one leaf and one system call instead of
+    512 (a mapped cap still copies unmapped), and falls back to the
+    aliases where a 4 KiB page table already covers the block. Hotplug
+    blocks map the aliases under page tables of their own, which unplug
+    deletes. Boot-image blocks the host fills keep their small caps and use
+    the 512-mapping fallback.
   - User VSpaces track small and large leaves separately, with table
     coverage indexed by level and address, so neither adding a table nor
     promotion scans the address space. A partial update drops the whole
@@ -3142,7 +3147,7 @@ checks its data. The fault counts include three faults outside the mapping.
 Dense first-touch is 11.7–12.5 times faster with THP and fork 4.8–11.1
 times. `VmPTE` drops by about 81%: a PMD uses one mapped frame cap instead
 of 512 and needs no seL4 leaf page table (Linux still keeps its deposited
-PTE table, and the direct map keeps small aliases). COW is 23–29% slower,
+PTE table). COW is 23–29% slower,
 since Linux splits a shared PMD for base-page COW and the backend installs
 the small mappings, and partial protection changes pay for splitting.
 Sparse RSS is 64 MiB instead of 128 KiB, the usual THP tradeoff. These
