@@ -1243,10 +1243,18 @@ pool, and host components map only host-owned pages.
   maps at most RAM/16 + 256 MiB beyond the host's boot prefix. This leaves
   room for the memmap (RAM/64), hash tables, initramfs unpacking and early
   allocations without zeroing and mapping all RAM before `time_init`.
-  For each initial frame block it retypes its level-2 RAM
-  CNode (into its level-1 slot), one 2 MiB frame and its 512 subframe
-  aliases (patch 0029), and maps the aliases at `ram_base_va + GPA`
-  (read-write, execute-never), adding page tables from object blocks. Each
+  For every non-boot block it prepares the level-2 RAM CNode (into its
+  level-1 slot), required direct-map parent tables and a permanent capability
+  slot for the large frame. Temporary mappings probe which tables are
+  needed, once per 1 GiB for aligned RAM, borrowing one block from the
+  initial frame budget; preparing leaf tables everywhere would prevent
+  2 MiB mappings. Small-page fallback
+  tables are prepared only where needed. These objects let later conversion
+  run without allocating memory or capability slots under pressure. Only the
+  initial frame blocks get their permanent 2 MiB frame and 512 subframe aliases
+  (patch 0029). The canonical frame maps at `ram_base_va + GPA` with one
+  2 MiB leaf (read-write, execute-never), falling back to aliases where
+  a leaf page table already exists or the address is unaligned. Each
   block is added to memblock once mapped; the remaining blocks are added
   and reserved, so they have struct pages but cannot be allocated yet.
   The early counter measures this setup separately from printk's clock.
@@ -1268,14 +1276,15 @@ pool, and host components map only host-owned pages.
 ### 8.3 Object memory: converting blocks between frames and objects
 
 - **At boot** object blocks hold what onlining needs (a 16 KiB RAM CNode
-  and a 4 KiB page table per frame block, and a slot CNode), plus the
-  reserve and any RAM beyond the initial mapping budget (§8.2). The latter
-  starts as spare object blocks with `ORIG_RESERVED`. The late initcall
+  per block, parent page tables, leaf tables for small-page fallbacks and
+  slot CNodes), plus the reserve and any RAM beyond the initial mapping
+  budget (§8.2). The latter starts as spare object blocks with
+  `ORIG_RESERVED`. The late initcall
   starts the existing worker, which converts them to frames one block at
   a time with `cond_resched()` and releases their reserved pages. Small
   guests retain the eager layout. Larger guests initially have less free
-  memory until conversion catches up; the configured RAM remains available
-  for either frames or seL4 objects.
+  memory until conversion catches up; reclaim can also convert blocks
+  synchronously when allocations outpace the worker.
 - **Chunks and classes.** `l4h_obj_alloc` takes objects from Untyped
   *chunks* of 16, 64 or 128 KiB (by object size) carved out of object
   blocks. seL4 reuses an Untyped's memory only when all its children are
@@ -1312,11 +1321,31 @@ pool, and host components map only host-owned pages.
   deletes its 512 frames with every mapping and copy; the pages stay
   allocated, out of the page allocator.
 - **Object → frame** (`objects_to_frames`): the highest spare block is
-  revoked, gets its 512 frames back in its (kept) RAM CNode, is mapped
-  again, and its pages go back to the page allocator (`__free_pages`,
+  revoked, gets its large frame and 512 aliases back, and is mapped with
+  one 2 MiB leaf (or its small-page fallback). Its pages go back to the
+  page allocator (`__free_pages`,
   `free_contig_range` for isolated ranges, which hold one reference per
   page, or `free_reserved_page` for blocks that were object blocks since
-  boot).
+  boot). The direct-map page tables, RAM CNode and large-frame slot were
+  prepared at boot and survive mode changes, so this path allocates no
+  Linux memory, capability slots or paging objects. It publishes
+  `BLK_FRAMES` before releasing any page. A failed conversion restores the
+  spare block and stops the current batch rather than spinning without progress.
+- **Memory pressure.** A global shrinker converts spare blocks, preserving
+  the reserve and spare watermarks. An OOM notifier returns one block
+  before global OOM selects a victim, reporting only pages actually freed
+  so Linux can retry the allocation. Both are registered at subsys init,
+  before even synchronous initramfs unpacking. They serialize conversion
+  with `frame_mutex`, which is never held across Linux allocation, and never
+  take `objmem_mutex`: that mutex's owner may itself be reclaiming or migrating
+  pages. The worker also takes `frame_mutex` for each object-to-frame
+  conversion. The initial RAM budget still bootstraps the allocator;
+  memblock does not grow RAM on demand. Once convertible spare blocks are
+  exhausted, ordinary reclaim/OOM behavior applies; cgroup limits are
+  unchanged. Pending boot blocks remain excluded from `MemTotal` until
+  converted, so overcommit modes 0 and 2 still use the current managed
+  capacity when admitting mappings. With `overcommit_memory=1`, large
+  mappings can be admitted and their page faults drive conversion.
 - **Kernel mappings** (vmap, vmalloc, percpu) cannot be left to fault again,
   since a guest-kernel fault stops the guest. A kernel TLB sync that finds
   no memory leaves those PTEs unsynced and marks the range again, and
@@ -1333,7 +1362,8 @@ pool, and host components map only host-owned pages.
 - **Accounting.** `/proc/meminfo` has `L4hObjects` (RAM in object blocks)
   and `L4hObjectsUsed` (in chunks with live objects); `/proc/l4h_objmem`
   shows block counts, targets and conversions, with `contig_attempts` and
-  `contig_successes` for the migration fallback.
+  `contig_successes` for the migration fallback, and `reclaim_blocks` and
+  `oom_blocks` for pressure-driven object-to-frame conversions.
 - **Test** (`tests/run-objtest.sh`). A fragmentation regression fills most
   free RAM, keeps one movable page per 2 MiB block and discards the rest,
   then (with compaction thresholds raised) touches a page every 2 MiB of a
@@ -1349,6 +1379,13 @@ pool, and host components map only host-owned pages.
   managed memory, and retain data across allocations larger than the
   initial frame budget. `RAMBOOT_MEM_MB` selects the guest size (1024 by
   default); `RAMBOOT_PAD_MB` selects the unpacked padding (64 by default).
+  `tests/run-rampressuretest.sh` blacklists the background initcall to
+  force demand conversion. Four threads touch and verify an overcommitted
+  mapping larger than the initially managed RAM; a second boot also
+  blacklists the shrinker to exercise the OOM notifier alone. A third
+  boot synchronously unpacks an initramfs larger than the initial budget
+  before running the allocation test. The tests use ramfs to avoid a
+  separate tmpfs size limit derived from the initial `MemTotal`.
 - **Fragmentation.** Long-lived objects can still pin partly empty chunks,
   and unmovable Linux pages can prevent a frame block from being isolated.
   There is no compaction of object memory (rebuilding VSpace mirrors into
