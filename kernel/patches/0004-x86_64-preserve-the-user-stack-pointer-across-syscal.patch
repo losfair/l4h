@@ -1,7 +1,7 @@
-From efee42ce0302736fba146ea39e8e844ef472d764 Mon Sep 17 00:00:00 2001
+From 212c3a056fb69cb4295cc540b9c5c26d4c19e729 Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Sat, 17 Oct 2026 10:16:20 -0700
-Subject: [PATCH 4/7] x86_64: preserve the user stack pointer across syscalls
+Subject: [PATCH] x86_64: preserve the user stack pointer across syscalls
 
 The fast syscall path never saved the user RSP and the sysret path
 cleared it, relying on the libsel4 calling convention (RSP kept in RBX).
@@ -27,7 +27,7 @@ their first syscall with RSP 0.
  6 files changed, 43 insertions(+), 1 deletion(-)
 
 diff --git a/include/arch/x86/arch/64/mode/fastpath/fastpath.h b/include/arch/x86/arch/64/mode/fastpath/fastpath.h
-index 8bb3c349f..ffabec752 100644
+index 9b64c365e..ae851a334 100644
 --- a/include/arch/x86/arch/64/mode/fastpath/fastpath.h
 +++ b/include/arch/x86/arch/64/mode/fastpath/fastpath.h
 @@ -245,8 +245,13 @@ static inline void NORETURN FORCE_INLINE fastpath_restore(word_t badge, word_t m
@@ -64,10 +64,10 @@ index 76d6421ac..61a420d87 100644
  
  extern nodeInfo_t node_info[CONFIG_MAX_NUM_NODES] ALIGN(L1_CACHE_LINE_SIZE);
 diff --git a/libsel4/include/sel4/constants.h b/libsel4/include/sel4/constants.h
-index c8237b5df..e37ba8f23 100644
+index 1b8741089..831db07f9 100644
 --- a/libsel4/include/sel4/constants.h
 +++ b/libsel4/include/sel4/constants.h
-@@ -91,7 +91,11 @@ typedef enum {
+@@ -95,7 +95,11 @@ typedef enum {
  
      SEL4_FORCE_LONG_ENUM(seL4_TCBFlag),
      seL4_TCBFlag_MASK = seL4_TCBFlag_NoFlag
@@ -80,7 +80,7 @@ index c8237b5df..e37ba8f23 100644
                          | seL4_TCBFlag_fpuDisabled
  #endif
 diff --git a/src/arch/x86/64/c_traps.c b/src/arch/x86/64/c_traps.c
-index 9f359db32..46745e1ea 100644
+index 0f4b5e73c..a1c4e5ea8 100644
 --- a/src/arch/x86/64/c_traps.c
 +++ b/src/arch/x86/64/c_traps.c
 @@ -361,8 +361,13 @@ void VISIBLE NORETURN restore_user_context(void)
@@ -111,10 +111,10 @@ index 7460595e3..1fb6935a7 100644
 +word_t x64KSSyscallUserRSP VISIBLE;
 +#endif
 diff --git a/src/arch/x86/64/traps.S b/src/arch/x86/64/traps.S
-index f477325ec..ce11edfad 100644
+index 7bcc07f2a..3ead5c93a 100644
 --- a/src/arch/x86/64/traps.S
 +++ b/src/arch/x86/64/traps.S
-@@ -596,7 +596,25 @@ END_FUNC(kernel_exception)
+@@ -602,7 +602,25 @@ END_FUNC(kernel_exception)
  BEGIN_FUNC(handle_fastsyscall)
      LOAD_KERNEL_AS(rsp)
      MAYBE_SWAPGS
@@ -141,5 +141,5 @@ index f477325ec..ce11edfad 100644
      push    %rcx            # save NextIP
      push    %r11            # save RFLAGS
 -- 
-2.43.0
+2.47.3
 

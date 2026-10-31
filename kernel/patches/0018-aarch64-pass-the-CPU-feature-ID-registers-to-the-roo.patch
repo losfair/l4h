@@ -1,4 +1,4 @@
-From a173d061fac66bc346b63219702899ce0f86e7c3 Mon Sep 17 00:00:00 2001
+From 1c298113d25fcad251ed8a655d2512a108f34af7 Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Mon, 19 Oct 2026 07:32:33 -0700
 Subject: [PATCH] aarch64: pass the CPU feature ID registers to the root task
@@ -42,10 +42,10 @@ index 66c97aa51..8f9d2db36 100644
      invalid_seL4_BootInfoHeader,
      sizeof(seL4_BootInfoHeader) == 2 * sizeof(seL4_Word));
 diff --git a/src/arch/arm/kernel/boot.c b/src/arch/arm/kernel/boot.c
-index 139f620b3..eb6db7c9b 100644
+index e5f0c4a9a..467a7bd98 100644
 --- a/src/arch/arm/kernel/boot.c
 +++ b/src/arch/arm/kernel/boot.c
-@@ -412,6 +412,11 @@ static BOOT_CODE bool_t try_init_kernel(
+@@ -438,6 +438,11 @@ static BOOT_CODE bool_t try_init_kernel(
          };
      }
  
@@ -57,7 +57,7 @@ index 139f620b3..eb6db7c9b 100644
      /* The region of the initial thread is the user image + ipcbuf and boot info */
      word_t extra_bi_size_bits = calculate_extra_bi_size_bits(extra_bi_size);
      v_region_t it_v_reg = {
-@@ -470,6 +475,23 @@ static BOOT_CODE bool_t try_init_kernel(
+@@ -496,6 +501,23 @@ static BOOT_CODE bool_t try_init_kernel(
          extra_bi_offset += dtb_size;
      }
  

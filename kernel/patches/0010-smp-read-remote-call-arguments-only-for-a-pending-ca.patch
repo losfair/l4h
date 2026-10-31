@@ -1,7 +1,7 @@
-From 73f169d510d2028f34e822659d20a9aa60d2c500 Mon Sep 17 00:00:00 2001
+From 35be43a4e4aa5261d4bc49a6dcacec120a64f5d7 Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Sun, 18 Oct 2026 00:16:05 -0700
-Subject: [PATCH 10/10] smp: read remote call arguments only for a pending call
+Subject: [PATCH] smp: read remote call arguments only for a pending call
 
 handleIPI() passed ipi->remoteCall and ipi->args to handleRemoteCall(),
 which then checks that this core's ipi flag is set, ignoring spurious
@@ -22,10 +22,10 @@ Check the flag, with acquire ordering, before reading the call.
  1 file changed, 10 insertions(+)
 
 diff --git a/src/smp/ipi.c b/src/smp/ipi.c
-index 9bf9c7f61..6245fc15b 100644
+index 538f91323..63606b523 100644
 --- a/src/smp/ipi.c
 +++ b/src/smp/ipi.c
-@@ -126,6 +126,16 @@ void handleIPI(irq_t irq, bool_t irqPath)
+@@ -123,6 +123,16 @@ void handleIPI(irq_t irq, bool_t irqPath)
      ipi_state_t *ipi = &big_kernel_lock.ipi;
  
      if (IRQT_TO_IRQ(irq) == irq_remote_call_ipi) {

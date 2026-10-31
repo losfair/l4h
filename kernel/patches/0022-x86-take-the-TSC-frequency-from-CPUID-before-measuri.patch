@@ -1,4 +1,4 @@
-From 61344ff577945bec6f9ca8a78832f22d3719bf2b Mon Sep 17 00:00:00 2001
+From ec076ca037624530c3832a198547f2f4ed738776 Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Fri, 23 Oct 2026 10:04:32 -0700
 Subject: [PATCH] x86: take the TSC frequency from CPUID before measuring it

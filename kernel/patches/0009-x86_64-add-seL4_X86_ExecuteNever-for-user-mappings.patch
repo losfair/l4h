@@ -1,7 +1,7 @@
-From e96871203c9a51a16959c935f7e8a1bc7eab8af4 Mon Sep 17 00:00:00 2001
+From 2917e4144fd27ceb840235bf587c40d66fb6dff8 Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Sat, 17 Oct 2026 23:08:26 -0700
-Subject: [PATCH 9/9] x86_64: add seL4_X86_ExecuteNever for user mappings
+Subject: [PATCH] x86_64: add seL4_X86_ExecuteNever for user mappings
 
 seL4 on x86 maps every readable user page executable: there is no way to
 map data without execute permission, so a system that runs untrusted code
@@ -63,7 +63,7 @@ index c8e2de6c5..8fb8635eb 100644
  } seL4_X86_VMAttributes;
  
 diff --git a/src/arch/x86/64/head.S b/src/arch/x86/64/head.S
-index 7853351c6..af5c5196a 100644
+index f489757fb..cf3e85ed0 100644
 --- a/src/arch/x86/64/head.S
 +++ b/src/arch/x86/64/head.S
 @@ -231,11 +231,21 @@ BEGIN_FUNC(enable_x64_mode)
@@ -90,10 +90,10 @@ index 7853351c6..af5c5196a 100644
      movl %cr0, %eax
      orl $0x80000000, %eax
 diff --git a/src/arch/x86/64/kernel/vspace.c b/src/arch/x86/64/kernel/vspace.c
-index 574392677..96d60209c 100644
+index bab7edd57..9bdde4b3b 100644
 --- a/src/arch/x86/64/kernel/vspace.c
 +++ b/src/arch/x86/64/kernel/vspace.c
-@@ -843,6 +843,17 @@ static pml4e_t CONST makeUserPML4E(paddr_t paddr, vm_attributes_t vm_attr)
+@@ -841,6 +841,17 @@ static pml4e_t CONST makeUserPML4E(paddr_t paddr, vm_attributes_t vm_attr)
             );
  }
  
@@ -111,7 +111,7 @@ index 574392677..96d60209c 100644
  static pml4e_t CONST makeUserPML4EInvalid(void)
  {
      return pml4e_new(
-@@ -860,7 +871,7 @@ static pml4e_t CONST makeUserPML4EInvalid(void)
+@@ -858,7 +869,7 @@ static pml4e_t CONST makeUserPML4EInvalid(void)
  static pdpte_t CONST makeUserPDPTEHugePage(paddr_t paddr, vm_attributes_t vm_attr, vm_rights_t vm_rights)
  {
      return pdpte_pdpte_1g_new(
@@ -120,7 +120,7 @@ index 574392677..96d60209c 100644
                 paddr,      /* physical address */
                 0,          /* PAT              */
                 0,          /* global           */
-@@ -905,7 +916,7 @@ static pdpte_t CONST makeUserPDPTEInvalid(void)
+@@ -903,7 +914,7 @@ static pdpte_t CONST makeUserPDPTEInvalid(void)
  pde_t CONST makeUserPDELargePage(paddr_t paddr, vm_attributes_t vm_attr, vm_rights_t vm_rights)
  {
      return pde_pde_large_new(
@@ -129,7 +129,7 @@ index 574392677..96d60209c 100644
                 paddr,                                          /* page_base_address    */
                 vm_attributes_get_x86PATBit(vm_attr),          /* pat                  */
                 0,                                              /* global               */
-@@ -954,7 +965,7 @@ pde_t CONST makeUserPDEInvalid(void)
+@@ -952,7 +963,7 @@ pde_t CONST makeUserPDEInvalid(void)
  pte_t CONST makeUserPTE(paddr_t paddr, vm_attributes_t vm_attr, vm_rights_t vm_rights)
  {
      return pte_new(

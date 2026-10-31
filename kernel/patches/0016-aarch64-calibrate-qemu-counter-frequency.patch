@@ -1,4 +1,4 @@
-From 2b1fd22f7d154c4f13c2a7b7425c6105171ecd3c Mon Sep 17 00:00:00 2001
+From 0c409118f1a8a519dba0486ff96d0185b28e3f81 Mon Sep 17 00:00:00 2001
 From: l4h <l4h@localhost>
 Date: Sun, 18 Oct 2026 14:17:47 -0700
 Subject: [PATCH] aarch64, qemu: use the architectural counter rate for MCS
@@ -99,7 +99,7 @@ index 553d85291..71fdba998 100644
      return usToTicks(TIMER_PRECISION) + TIMER_OVERHEAD_TICKS;
  }
 diff --git a/src/drivers/timer/generic_timer.c b/src/drivers/timer/generic_timer.c
-index 208950a40..c3d67d08c 100644
+index ab6cacdd6..855b32f6a 100644
 --- a/src/drivers/timer/generic_timer.c
 +++ b/src/drivers/timer/generic_timer.c
 @@ -6,8 +6,24 @@

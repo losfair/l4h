@@ -1,7 +1,7 @@
-From 9aabc67551d3dcdc2bd77707e8537fc7f82cadda Mon Sep 17 00:00:00 2001
+From f87657ac882c920e82b6942b9dd158107bbe2877 Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Sat, 17 Oct 2026 08:32:05 -0700
-Subject: [PATCH 3/7] mcs: add per-TCB deadline timers (seL4_TCB_SetTimer)
+Subject: [PATCH] mcs: add per-TCB deadline timers (seL4_TCB_SetTimer)
 
 Allow user level to arm a one-shot, absolute deadline timer that signals a
 badge to the TCB's bound notification when it expires. Armed timers are
@@ -92,7 +92,7 @@ index 340f24e60..840fc9584 100644
      /* Timeslice remaining, 1 word */
      word_t tcbTimeSlice;
 diff --git a/libsel4/include/interfaces/object-api.xml b/libsel4/include/interfaces/object-api.xml
-index 1f433596e..6a69d48cf 100644
+index 5362400fe..e4e9a2b85 100644
 --- a/libsel4/include/interfaces/object-api.xml
 +++ b/libsel4/include/interfaces/object-api.xml
 @@ -916,6 +916,28 @@
@@ -438,7 +438,7 @@ index 581327f64..f4f3af0ec 100644
          tcbReleaseDequeue();
      }
 diff --git a/src/model/statedata.c b/src/model/statedata.c
-index 6b238fb90..8ec232be0 100644
+index fa034587a..7bb794fa0 100644
 --- a/src/model/statedata.c
 +++ b/src/model/statedata.c
 @@ -28,6 +28,10 @@ compile_assert(ksReadyQueuesL1BitmapBigEnough, (L2_BITMAP_SIZE - 1) <= wordBits)
@@ -503,10 +503,10 @@ index e6c603623..82ea3041c 100644
              if (sc) {
                  schedContext_unbindTCB(sc);
 diff --git a/src/object/tcb.c b/src/object/tcb.c
-index 508a93a60..199b1f802 100644
+index 65eff2fe3..b2955d387 100644
 --- a/src/object/tcb.c
 +++ b/src/object/tcb.c
-@@ -934,6 +934,25 @@ static exception_t decodeFPUTransfer(cap_t cap, word_t length, word_t *buffer, b
+@@ -940,6 +940,25 @@ static exception_t decodeFPUTransfer(cap_t cap, word_t length, word_t *buffer, b
  }
  #endif /* CONFIG_HAVE_FPU */
  
@@ -532,7 +532,7 @@ index 508a93a60..199b1f802 100644
  /* The following functions sit in the syscall error monad, but include the
   * exception cases for the preemptible bottom end, as they call the invoke
   * functions directly.  This is a significant deviation from the Haskell
-@@ -1030,6 +1049,11 @@ exception_t decodeTCBInvocation(word_t invLabel, word_t length, cap_t cap,
+@@ -1036,6 +1055,11 @@ exception_t decodeTCBInvocation(word_t invLabel, word_t length, cap_t cap,
      case TCBSetFlags:
          return decodeSetFlags(cap, length, call, buffer);
  
@@ -545,5 +545,5 @@ index 508a93a60..199b1f802 100644
      case TCBReadFPU:
          return decodeFPUTransfer(cap, length, buffer, true);
 -- 
-2.43.0
+2.47.3
 

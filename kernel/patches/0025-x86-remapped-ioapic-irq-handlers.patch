@@ -1,4 +1,4 @@
-From 71c25cab2280a2ccbc6ab4ed285e3b7893a44fc5 Mon Sep 17 00:00:00 2001
+From ca1e5acdb424d2a16764a102862ae1672197cec8 Mon Sep 17 00:00:00 2001
 From: l4h <l4h@localhost>
 Date: Sat, 24 Oct 2026 03:43:38 -0700
 Subject: [PATCH] x86: expose remapped I/O APIC IRQ handlers to root
@@ -24,10 +24,10 @@ index b89017192..f0a25a1d2 100644
 +                              word_t vector, word_t handle);
 +
 diff --git a/libsel4/arch_include/x86/interfaces/object-api-arch.xml b/libsel4/arch_include/x86/interfaces/object-api-arch.xml
-index 835927d7b..ecdbbeff7 100644
+index 1d821c88c..697cc2954 100644
 --- a/libsel4/arch_include/x86/interfaces/object-api-arch.xml
 +++ b/libsel4/arch_include/x86/interfaces/object-api-arch.xml
-@@ -878,6 +878,67 @@
+@@ -886,6 +886,67 @@
                  </description>
              </error>
          </method>
@@ -171,10 +171,10 @@ index 464591efd..0a79d5653 100644
      break;
      case X86IRQIssueIRQHandlerMSI: {
 diff --git a/src/plat/pc99/machine/ioapic.c b/src/plat/pc99/machine/ioapic.c
-index cfe5232dc..049f79c22 100644
+index 306a93298..e18ba960c 100644
 --- a/src/plat/pc99/machine/ioapic.c
 +++ b/src/plat/pc99/machine/ioapic.c
-@@ -182,7 +182,8 @@ void ioapic_map_pin_to_vector(word_t ioapic, word_t pin, word_t level,
+@@ -174,7 +174,8 @@ void ioapic_map_pin_to_vector(word_t ioapic, word_t pin, word_t level,
  
      index = ioapic * IOAPIC_IRQ_LINES + pin;
      ioapic_write(ioapic, IOAPIC_REGSEL, IOREDTBL_HIGH(pin));
@@ -184,7 +184,7 @@ index cfe5232dc..049f79c22 100644
      /* delivery mode: physical mode only, using APIC ID */
      ioredtbl_high |= (ioapic_target_cpu << IOREDTBL_HIGH_RESERVED_BITS);
      ioapic_write(ioapic, IOAPIC_WINDOW, ioredtbl_high);
-@@ -197,3 +198,22 @@ void ioapic_map_pin_to_vector(word_t ioapic, word_t pin, word_t level,
+@@ -189,3 +190,22 @@ void ioapic_map_pin_to_vector(word_t ioapic, word_t pin, word_t level,
      ioredtbl_state[index] |= ioapic_read(ioapic, IOAPIC_WINDOW) & ~MASK(16);
      ioapic_write(ioapic, IOAPIC_WINDOW, ioredtbl_state[index]);
  }

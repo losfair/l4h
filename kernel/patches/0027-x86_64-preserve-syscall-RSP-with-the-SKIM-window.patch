@@ -1,4 +1,4 @@
-From 21d35056ddcdb7fcb3feab8f96643e7d916041ec Mon Sep 17 00:00:00 2001
+From f03bb30c84c9ed6962878562d3655cdae4a96bb7 Mon Sep 17 00:00:00 2001
 From: l4h <l4h@localhost>
 Date: Wed, 28 Oct 2026 10:15:58 -0700
 Subject: [PATCH] x86_64: preserve syscall RSP with the SKIM window
@@ -22,7 +22,7 @@ user stack.
  7 files changed, 74 insertions(+), 19 deletions(-)
 
 diff --git a/include/arch/x86/arch/64/mode/fastpath/fastpath.h b/include/arch/x86/arch/64/mode/fastpath/fastpath.h
-index ffabec752..39defd007 100644
+index ae851a334..8ae202bd3 100644
 --- a/include/arch/x86/arch/64/mode/fastpath/fastpath.h
 +++ b/include/arch/x86/arch/64/mode/fastpath/fastpath.h
 @@ -150,6 +150,14 @@ static inline void NORETURN FORCE_INLINE fastpath_restore(word_t badge, word_t m
@@ -123,7 +123,7 @@ index 831db07f9..1b8741089 100644
                          | seL4_TCBFlag_fpuDisabled
  #endif
 diff --git a/src/arch/x86/64/c_traps.c b/src/arch/x86/64/c_traps.c
-index 46745e1ea..2435b3ccd 100644
+index a1c4e5ea8..cdb4f08e5 100644
 --- a/src/arch/x86/64/c_traps.c
 +++ b/src/arch/x86/64/c_traps.c
 @@ -238,6 +238,14 @@ void VISIBLE NORETURN restore_user_context(void)
@@ -203,10 +203,10 @@ index 1fb6935a7..b012565fb 100644
 +word_t x64KSSyscallUserRSP VISIBLE SKIM_BSS;
  #endif
 diff --git a/src/arch/x86/64/traps.S b/src/arch/x86/64/traps.S
-index ce11edfad..ea061677f 100644
+index 3ead5c93a..4c79efdc3 100644
 --- a/src/arch/x86/64/traps.S
 +++ b/src/arch/x86/64/traps.S
-@@ -594,9 +594,26 @@ END_FUNC(kernel_exception)
+@@ -600,9 +600,26 @@ END_FUNC(kernel_exception)
  # the current RFLAGS (after saving) have been masked
  # with IA32_FMASK.
  BEGIN_FUNC(handle_fastsyscall)
@@ -235,7 +235,7 @@ index ce11edfad..ea061677f 100644
      /* Save the user RSP, which 'syscall' leaves untouched, into the RSP
       * slot of the user context so that the thread's stack pointer is
       * known to fault handlers and restored on return (threads that do
-@@ -612,8 +629,6 @@ BEGIN_FUNC(handle_fastsyscall)
+@@ -618,8 +635,6 @@ BEGIN_FUNC(handle_fastsyscall)
      addq    $8, %rsp
      pushq   x64KSSyscallUserRSP
  #endif

@@ -1,4 +1,4 @@
-From 7f15fc4b351c754804ce85fdcd6057d1aeb35444 Mon Sep 17 00:00:00 2001
+From b5e0a4b11a287e6c0c394000cae9163c32223e9a Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Mon, 19 Oct 2026 03:30:42 -0700
 Subject: [PATCH] x86_64: batch the TLB flushes of frame remaps
@@ -79,10 +79,10 @@ index 080ee5b9d..fa89973b7 100644
          <method id="X86PDPTMap" name="Map">
              <brief>
 diff --git a/src/arch/x86/64/kernel/vspace.c b/src/arch/x86/64/kernel/vspace.c
-index 96d60209c..843dfa1c9 100644
+index 9bdde4b3b..1eade79b9 100644
 --- a/src/arch/x86/64/kernel/vspace.c
 +++ b/src/arch/x86/64/kernel/vspace.c
-@@ -1425,6 +1425,21 @@ exception_t decodeX86ModeMMUInvocation(
+@@ -1423,6 +1423,21 @@ exception_t decodeX86ModeMMUInvocation(
      switch (cap_get_capType(cap)) {
  
      case cap_pml4_cap:
@@ -205,5 +205,5 @@ index 8ca477b79..81d41b332 100644
  
          /* PDE mappings */
 -- 
-2.43.0
+2.47.3
 

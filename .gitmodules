@@ -1,7 +1,7 @@
 [submodule "kernel/seL4"]
 	path = kernel/seL4
 	url = https://github.com/seL4/seL4.git
-	# Pinned to the 16.0.0 release.
+	# Pinned to the 17.0.0 release.
 	# pip leaves build metadata in tools/python-deps.
 	ignore = untracked
 [submodule "third_party/sddf"]

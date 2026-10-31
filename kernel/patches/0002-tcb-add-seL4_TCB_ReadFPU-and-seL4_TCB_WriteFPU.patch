@@ -1,4 +1,4 @@
-From 54d19b3358a25cc4b8e5c14da285c9bcc3f7c934 Mon Sep 17 00:00:00 2001
+From 3a9046f0f8d751ba07acffe5e01ffc8942b740a0 Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Sat, 17 Oct 2026 08:30:23 -0700
 Subject: [PATCH] tcb: add seL4_TCB_ReadFPU and seL4_TCB_WriteFPU
@@ -26,10 +26,10 @@ is masked with the CPU's MXCSR_MASK, read with FXSAVE at boot.
  6 files changed, 189 insertions(+)
 
 diff --git a/include/arch/x86/arch/model/statedata.h b/include/arch/x86/arch/model/statedata.h
-index 01656dbb3..9c58af7ef 100644
+index 478c3344e..1474abcd2 100644
 --- a/include/arch/x86/arch/model/statedata.h
 +++ b/include/arch/x86/arch/model/statedata.h
-@@ -69,6 +69,7 @@ extern x86_arch_global_state_t x86KSGlobalState[CONFIG_MAX_NUM_NODES] ALIGN(L1_C
+@@ -71,6 +71,7 @@ extern x86_arch_global_state_t x86KSGlobalState[CONFIG_MAX_NUM_NODES] ALIGN(L1_C
  extern asid_pool_t *x86KSASIDTable[];
  extern uint32_t x86KScacheLineSizeBits;
  extern user_fpu_state_t x86KSnullFpuState ALIGN(MIN_FPU_ALIGNMENT);
@@ -38,7 +38,7 @@ index 01656dbb3..9c58af7ef 100644
  #ifdef CONFIG_IOMMU
  extern uint32_t x86KSnumDrhu;
 diff --git a/libsel4/include/interfaces/object-api.xml b/libsel4/include/interfaces/object-api.xml
-index 37885cbb0..1f433596e 100644
+index b0590847e..5362400fe 100644
 --- a/libsel4/include/interfaces/object-api.xml
 +++ b/libsel4/include/interfaces/object-api.xml
 @@ -860,6 +860,62 @@
@@ -152,7 +152,7 @@ index 4b92d546c..cef881ed8 100644
          uint64_t xsave_features;
          uint32_t xsave_instruction;
 diff --git a/src/arch/x86/model/statedata.c b/src/arch/x86/model/statedata.c
-index 9af5acfb1..217d0ca87 100644
+index 96d606761..b5f276425 100644
 --- a/src/arch/x86/model/statedata.c
 +++ b/src/arch/x86/model/statedata.c
 @@ -42,6 +42,9 @@ uint32_t x86KScacheLineSizeBits;
@@ -166,10 +166,10 @@ index 9af5acfb1..217d0ca87 100644
  uint32_t x86KSnumDrhu;
  
 diff --git a/src/object/tcb.c b/src/object/tcb.c
-index 521e33bd6..4a19d3742 100644
+index 6bfcdd7fa..65eff2fe3 100644
 --- a/src/object/tcb.c
 +++ b/src/object/tcb.c
-@@ -841,6 +841,102 @@ static exception_t decodeSetFlags(cap_t cap, word_t length, bool_t call, word_t
+@@ -844,6 +844,102 @@ static exception_t decodeSetFlags(cap_t cap, word_t length, bool_t call, word_t
      return EXCEPTION_NONE;
  }
  
@@ -272,7 +272,7 @@ index 521e33bd6..4a19d3742 100644
  /* The following functions sit in the syscall error monad, but include the
   * exception cases for the preemptible bottom end, as they call the invoke
   * functions directly.  This is a significant deviation from the Haskell
-@@ -937,6 +1033,14 @@ exception_t decodeTCBInvocation(word_t invLabel, word_t length, cap_t cap,
+@@ -940,6 +1036,14 @@ exception_t decodeTCBInvocation(word_t invLabel, word_t length, cap_t cap,
      case TCBSetFlags:
          return decodeSetFlags(cap, length, call, buffer);
  
@@ -288,5 +288,5 @@ index 521e33bd6..4a19d3742 100644
          /* Haskell: "throw IllegalOperation" */
          userError("TCB: Illegal operation.");
 -- 
-2.43.0
+2.47.3
 

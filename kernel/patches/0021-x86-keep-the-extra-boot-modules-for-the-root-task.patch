@@ -1,4 +1,4 @@
-From a61923f4c1a70a5ea7bb2a4325d67ab658321bdd Mon Sep 17 00:00:00 2001
+From 9aa06df1313db3c7b47d686a4b2d20d941ca5196 Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Tue, 20 Oct 2026 23:27:25 -0700
 Subject: [PATCH] x86: keep the extra boot modules for the root task
@@ -51,10 +51,10 @@ index a4f7fa057..e88efb4ee 100644
  
  bool_t init_cpu(
 diff --git a/include/arch/x86/arch/kernel/boot_sys.h b/include/arch/x86/arch/kernel/boot_sys.h
-index dac433033..e674341f6 100644
+index ccaef6660..d53402c25 100644
 --- a/include/arch/x86/arch/kernel/boot_sys.h
 +++ b/include/arch/x86/arch/kernel/boot_sys.h
-@@ -29,6 +29,7 @@ typedef struct boot_state {
+@@ -30,6 +30,7 @@ typedef struct boot_state {
      seL4_X86_BootInfo_VBE vbe_info; /* Potential VBE information from multiboot */
      seL4_X86_BootInfo_mmap_t mb_mmap_info; /* memory map information from multiboot */
      seL4_X86_BootInfo_fb_t fb_info; /* framebuffer information as set by bootloader */
@@ -144,7 +144,7 @@ index 93b320964..8f8216b1e 100644
      /* set up sched control for each core */
      init_sched_control(root_cnode_cap, CONFIG_MAX_NUM_NODES);
 diff --git a/src/arch/x86/kernel/boot_sys.c b/src/arch/x86/kernel/boot_sys.c
-index f28719432..f6f0ec464 100644
+index f386fa39a..140ac24cc 100644
 --- a/src/arch/x86/kernel/boot_sys.c
 +++ b/src/arch/x86/kernel/boot_sys.c
 @@ -64,8 +64,19 @@ BOOT_CODE static paddr_t find_load_paddr(paddr_t min_paddr, word_t image_size)
@@ -272,7 +272,7 @@ index f28719432..f6f0ec464 100644
 +    });
 +}
 +
- BOOT_CODE static paddr_t load_boot_module(word_t boot_module_start, paddr_t load_paddr)
+ BOOT_CODE static paddr_t load_boot_module(word_t boot_module_start, word_t boot_module_end, paddr_t load_paddr)
  {
      v_region_t v_reg;
 @@ -180,7 +291,8 @@ static BOOT_CODE bool_t try_boot_sys_node(cpu_id_t cpu_id)
@@ -306,7 +306,7 @@ index f28719432..f6f0ec464 100644
      }
  
      /* initialize the memory. We track two kinds of memory regions. Physical memory
-@@ -660,6 +779,9 @@ static BOOT_CODE bool_t try_boot_sys_mbi2(
+@@ -662,6 +781,9 @@ static BOOT_CODE bool_t try_boot_sys_mbi2(
              if (boot_state.mods_end_paddr < module->end) {
                  boot_state.mods_end_paddr = module->end;
              }
@@ -317,5 +317,5 @@ index f28719432..f6f0ec464 100644
              multiboot2_memory_t const *s = (multiboot2_memory_t *)(behind_tag + 8);
              multiboot2_memory_t const *e = (multiboot2_memory_t *)((word_t)tag + tag->size);
 -- 
-2.43.0
+2.47.3
 

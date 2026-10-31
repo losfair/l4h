@@ -1,4 +1,4 @@
-From 18459ac7ee9389222444b0fa5984e15efe4d26d3 Mon Sep 17 00:00:00 2001
+From 2664000672c2d772d46a9729ad5bcb37eb12c608 Mon Sep 17 00:00:00 2001
 From: l4h <l4h@localhost>
 Date: Thu, 29 Oct 2026 08:18:01 -0700
 Subject: [PATCH] x86_64: give sysretq the user selectors iretq uses
@@ -56,13 +56,13 @@ index 287820321..f7d465aa2 100644
  #define GDT_GS      8
  #define GDT_ENTRIES 9
 diff --git a/src/arch/x86/64/kernel/vspace.c b/src/arch/x86/64/kernel/vspace.c
-index 843dfa1c9..54e448e57 100644
+index 1eade79b9..20b860a47 100644
 --- a/src/arch/x86/64/kernel/vspace.c
 +++ b/src/arch/x86/64/kernel/vspace.c
-@@ -334,7 +334,12 @@ void init_syscall_msrs(void)
-     // also mask bit 8, which is the Trap Flag, to prevent the kernel
-     // from single stepping
-     x86_wrmsr(IA32_FMASK_MSR, FLAGS_TF | FLAGS_IF);
+@@ -332,7 +332,12 @@ void init_syscall_msrs(void)
+     x86_wrmsr(IA32_LSTAR_MSR, (uint64_t)&handle_fastsyscall);
+     /* Mask all user-controllable flags on kernel entry for well-defined kernel state. */
+     x86_wrmsr(IA32_FMASK_MSR, FLAGS_SYSCALL_MASK);
 -    x86_wrmsr(IA32_STAR_MSR, ((uint64_t)SEL_CS_0 << 32) | ((uint64_t)SEL_CS_3 << 48));
 +    /* sysretq loads SS from STAR[63:48] + 8 and CS from STAR[63:48] + 16,
 +     * which must be the selectors iretq returns to user level with. */

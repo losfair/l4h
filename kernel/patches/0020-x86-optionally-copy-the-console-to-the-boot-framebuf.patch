@@ -1,4 +1,4 @@
-From cd63464763bab9bf90a2a5aa6dedd772ec1704bc Mon Sep 17 00:00:00 2001
+From 394d1b3c7a01eae7db6de0ef80a0b4835c6f0981 Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Tue, 20 Oct 2026 09:29:04 -0700
 Subject: [PATCH] x86: optionally copy the console to the boot framebuffer
@@ -54,7 +54,7 @@ index bc6e8cd09..fce2d0be7 100644
  #endif
  
 diff --git a/src/arch/x86/kernel/boot_sys.c b/src/arch/x86/kernel/boot_sys.c
-index 35b5c894a..f28719432 100644
+index 51665e6f1..f386fa39a 100644
 --- a/src/arch/x86/kernel/boot_sys.c
 +++ b/src/arch/x86/kernel/boot_sys.c
 @@ -8,6 +8,7 @@
@@ -65,7 +65,7 @@ index 35b5c894a..f28719432 100644
  #include <arch/machine.h>
  #include <arch/kernel/apic.h>
  #include <arch/kernel/cmdline.h>
-@@ -691,6 +692,23 @@ static BOOT_CODE bool_t try_boot_sys_mbi2(
+@@ -693,6 +694,23 @@ static BOOT_CODE bool_t try_boot_sys_mbi2(
          tag = (multiboot2_tag_t const *)((word_t)tag + ROUND_UP(tag->size, 3));
      }
  

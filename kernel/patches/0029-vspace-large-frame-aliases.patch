@@ -1,4 +1,4 @@
-From 33c59e6ea6109520dc57f2e3d947ee01696db792 Mon Sep 17 00:00:00 2001
+From e6ffc90f168db634db81121d2ecd6c7438a3658d Mon Sep 17 00:00:00 2001
 From: Heyang Zhou <hello@su3.io>
 Date: Fri, 30 Oct 2026 09:40:18 -0700
 Subject: [PATCH] vspace: derive 4 KiB aliases of 2 MiB RAM frames and sample
@@ -12,10 +12,10 @@ Subject: [PATCH] vspace: derive 4 KiB aliases of 2 MiB RAM frames and sample
  4 files changed, 269 insertions(+), 23 deletions(-)
 
 diff --git a/libsel4/arch_include/arm/interfaces/object-api-arch.xml b/libsel4/arch_include/arm/interfaces/object-api-arch.xml
-index 59faf2c..ae4e70d 100644
+index 36420301b..a02bfb6c2 100644
 --- a/libsel4/arch_include/arm/interfaces/object-api-arch.xml
 +++ b/libsel4/arch_include/arm/interfaces/object-api-arch.xml
-@@ -408,21 +408,51 @@
+@@ -417,21 +417,51 @@
                  </description>
              </error>
          </method>
@@ -71,10 +71,10 @@ index 59faf2c..ae4e70d 100644
              <error name="seL4_InvalidCapability">
                  <description>The capability's mapping is stale.</description>
 diff --git a/libsel4/arch_include/x86/interfaces/object-api-arch.xml b/libsel4/arch_include/x86/interfaces/object-api-arch.xml
-index ecdbbef..b122975 100644
+index 697cc2954..cfccbfdbd 100644
 --- a/libsel4/arch_include/x86/interfaces/object-api-arch.xml
 +++ b/libsel4/arch_include/x86/interfaces/object-api-arch.xml
-@@ -393,21 +393,51 @@
+@@ -398,21 +398,51 @@
                  </description>
              </error>
          </method>
@@ -130,10 +130,10 @@ index ecdbbef..b122975 100644
              <error name="seL4_InvalidCapability">
                  <description>The capability's mapping is stale.</description>
 diff --git a/src/arch/arm/64/kernel/vspace.c b/src/arch/arm/64/kernel/vspace.c
-index 8d78d3f..d744adf 100644
+index 3645ed683..4903c783b 100644
 --- a/src/arch/arm/64/kernel/vspace.c
 +++ b/src/arch/arm/64/kernel/vspace.c
-@@ -712,11 +712,12 @@ static pte_t makeUserPagePTE(paddr_t paddr, vm_rights_t vm_rights, vm_attributes
+@@ -814,11 +814,12 @@ static pte_t makeUserPagePTE(paddr_t paddr, vm_rights_t vm_rights, bool_t cap_re
  
  #ifndef CONFIG_ARM_HYPERVISOR_SUPPORT
  /* Without hardware AF updates, repair access-flag faults in seL4, without
@@ -148,7 +148,7 @@ index 8d78d3f..d744adf 100644
          return false;
      }
      cap_t root = TCB_PTR_CTE_PTR(thread, tcbVTable)->cap;
-@@ -729,9 +730,9 @@ static bool_t handleAccessFlagFault(tcb_t *thread, vptr_t addr, word_t fault)
+@@ -831,9 +832,9 @@ static bool_t handleAccessFlagFault(tcb_t *thread, vptr_t addr, word_t fault)
          return false;
      }
      lookupPTSlot_ret_t lu_ret = lookupPTSlot(find_ret.vspace_root, addr);
@@ -160,7 +160,7 @@ index 8d78d3f..d744adf 100644
          return false;
      }
      __atomic_fetch_or(&lu_ret.ptSlot->words[0], BIT(10), __ATOMIC_RELAXED);
-@@ -1552,7 +1553,8 @@ static inline bool_t CONST checkVPAlignment(vm_page_size_t sz, word_t w)
+@@ -1666,7 +1667,8 @@ static inline bool_t CONST checkVPAlignment(vm_page_size_t sz, word_t w)
  static exception_t decodePageTestAndClearAccessed(cap_t cap, bool_t call)
  {
      asid_t asid = cap_frame_cap_get_capFMappedASID(cap);
@@ -170,7 +170,7 @@ index 8d78d3f..d744adf 100644
          current_syscall_error.type = seL4_IllegalOperation;
          return EXCEPTION_SYSCALL_ERROR;
      }
-@@ -1563,7 +1565,8 @@ static exception_t decodePageTestAndClearAccessed(cap_t cap, bool_t call)
+@@ -1677,7 +1679,8 @@ static exception_t decodePageTestAndClearAccessed(cap_t cap, bool_t call)
      }
      lookupPTSlot_ret_t lu_ret = lookupPTSlot(find_ret.vspace_root,
                                             cap_frame_cap_get_capFMappedAddress(cap));
@@ -180,7 +180,7 @@ index 8d78d3f..d744adf 100644
          pte_get_page_base_address(*lu_ret.ptSlot) !=
          pptr_to_paddr((void *)cap_frame_cap_get_capFBasePtr(cap))) {
          goto stale;
-@@ -1593,10 +1596,92 @@ stale:
+@@ -1707,10 +1710,92 @@ stale:
  }
  #endif
  
@@ -274,7 +274,7 @@ index 8d78d3f..d744adf 100644
          vptr_t vaddr;
          paddr_t base;
 diff --git a/src/arch/x86/kernel/vspace.c b/src/arch/x86/kernel/vspace.c
-index f9f4d6d..4677614 100644
+index f9f4d6d30..467761435 100644
 --- a/src/arch/x86/kernel/vspace.c
 +++ b/src/arch/x86/kernel/vspace.c
 @@ -6,6 +6,8 @@
@@ -437,5 +437,5 @@ index f9f4d6d..4677614 100644
          word_t          vaddr;
          word_t          vtop;
 -- 
-2.43.0
+2.47.3
 

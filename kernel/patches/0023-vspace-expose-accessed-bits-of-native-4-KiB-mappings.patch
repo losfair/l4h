@@ -1,4 +1,4 @@
-From 10c2cfcad7a8ab177062191367e5b7bde74ffcd7 Mon Sep 17 00:00:00 2001
+From 53f217d2d59ac35d42927e4f1801f00897ec2ef8 Mon Sep 17 00:00:00 2001
 From: l4h <l4h@localhost>
 Date: Fri, 23 Oct 2026 13:02:35 -0700
 Subject: [PATCH] vspace: expose accessed bits of native 4 KiB mappings
@@ -12,10 +12,10 @@ Subject: [PATCH] vspace: expose accessed bits of native 4 KiB mappings
  5 files changed, 189 insertions(+)
 
 diff --git a/libsel4/arch_include/arm/interfaces/object-api-arch.xml b/libsel4/arch_include/arm/interfaces/object-api-arch.xml
-index cf528709d..59faf2c99 100644
+index 5c54f31df..36420301b 100644
 --- a/libsel4/arch_include/arm/interfaces/object-api-arch.xml
 +++ b/libsel4/arch_include/arm/interfaces/object-api-arch.xml
-@@ -408,6 +408,26 @@
+@@ -417,6 +417,26 @@
                  </description>
              </error>
          </method>
@@ -43,10 +43,10 @@ index cf528709d..59faf2c99 100644
              <brief>
                  Get the physical address of the underlying frame.
 diff --git a/libsel4/arch_include/x86/interfaces/object-api-arch.xml b/libsel4/arch_include/x86/interfaces/object-api-arch.xml
-index c2a9c074f..835927d7b 100644
+index db5b20a01..1d821c88c 100644
 --- a/libsel4/arch_include/x86/interfaces/object-api-arch.xml
 +++ b/libsel4/arch_include/x86/interfaces/object-api-arch.xml
-@@ -393,6 +393,26 @@
+@@ -398,6 +398,26 @@
                  </description>
              </error>
          </method>
@@ -74,10 +74,10 @@ index c2a9c074f..835927d7b 100644
              manual_label='page_getaddress'>
              <brief>
 diff --git a/src/arch/arm/64/kernel/vspace.c b/src/arch/arm/64/kernel/vspace.c
-index 7334c1d77..8d78d3f0b 100644
+index a68631936..3645ed683 100644
 --- a/src/arch/arm/64/kernel/vspace.c
 +++ b/src/arch/arm/64/kernel/vspace.c
-@@ -710,6 +710,39 @@ static pte_t makeUserPagePTE(paddr_t paddr, vm_rights_t vm_rights, vm_attributes
+@@ -812,6 +812,39 @@ static pte_t makeUserPagePTE(paddr_t paddr, vm_rights_t vm_rights, bool_t cap_re
      }
  }
  
@@ -117,7 +117,7 @@ index 7334c1d77..8d78d3f0b 100644
  exception_t handleVMFault(tcb_t *thread, vm_fault_type_t vm_faultType)
  {
      switch (vm_faultType) {
-@@ -718,6 +751,11 @@ exception_t handleVMFault(tcb_t *thread, vm_fault_type_t vm_faultType)
+@@ -820,6 +853,11 @@ exception_t handleVMFault(tcb_t *thread, vm_fault_type_t vm_faultType)
  
          addr = getFAR();
          fault = getDFSR();
@@ -129,7 +129,7 @@ index 7334c1d77..8d78d3f0b 100644
  
  #ifdef CONFIG_ARM_HYPERVISOR_SUPPORT
          /* use the IPA */
-@@ -734,6 +772,11 @@ exception_t handleVMFault(tcb_t *thread, vm_fault_type_t vm_faultType)
+@@ -836,6 +874,11 @@ exception_t handleVMFault(tcb_t *thread, vm_fault_type_t vm_faultType)
  
          pc = getRestartPC(thread);
          fault = getIFSR();
@@ -141,7 +141,7 @@ index 7334c1d77..8d78d3f0b 100644
  
  #ifdef CONFIG_ARM_HYPERVISOR_SUPPORT
          if (ARCH_NODE_STATE(armHSVCPUActive)) {
-@@ -1505,6 +1548,51 @@ static inline bool_t CONST checkVPAlignment(vm_page_size_t sz, word_t w)
+@@ -1619,6 +1662,51 @@ static inline bool_t CONST checkVPAlignment(vm_page_size_t sz, word_t w)
      return (w & MASK(pageBitsForSize(sz))) == 0;
  }
  
@@ -193,8 +193,8 @@ index 7334c1d77..8d78d3f0b 100644
  static exception_t decodeARMFrameInvocation(word_t invLabel, word_t length,
                                              cte_t *cte, cap_t cap, bool_t call, word_t *buffer)
  {
-@@ -1602,6 +1690,11 @@ static exception_t decodeARMFrameInvocation(word_t invLabel, word_t length,
-                                         makeUserPagePTE(base, vmRights, attributes, frameSize), lu_ret.ptSlot);
+@@ -1718,6 +1806,11 @@ static exception_t decodeARMFrameInvocation(word_t invLabel, word_t length,
+         return performPageInvocationMap(asid, cap, cte, pte, lu_ret.ptSlot);
      }
  
 +#ifndef CONFIG_ARM_HYPERVISOR_SUPPORT
@@ -272,10 +272,10 @@ index 81d41b332..f9f4d6d30 100644
          setThreadState(NODE_STATE(ksCurThread), ThreadState_Restart);
          return performX86FrameInvocationUnmap(cap, cte);
 diff --git a/src/fastpath/fastpath.c b/src/fastpath/fastpath.c
-index 358fa7730..842eedd1d 100644
+index f03f19ea9..e25bd8fb8 100644
 --- a/src/fastpath/fastpath.c
 +++ b/src/fastpath/fastpath.c
-@@ -730,6 +730,14 @@ void NORETURN fastpath_vm_fault(vm_fault_type_t type)
+@@ -754,6 +754,14 @@ void NORETURN fastpath_vm_fault(vm_fault_type_t type)
      pde_t stored_hw_asid;
      dom_t dom;
  

@@ -1,8 +1,7 @@
-From f7721b16c2b60a31a101d1f21f0035253f95071f Mon Sep 17 00:00:00 2001
+From 6e53f0404721149d3bd3857a1e4281bd08965a0c Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Sat, 17 Oct 2026 22:58:58 -0700
-Subject: [PATCH 8/8] api: restrict debug syscalls to threads with a minimum
- MCP
+Subject: [PATCH] api: restrict debug syscalls to threads with a minimum MCP
 
 Debug and benchmark system calls need no capability, and several of them
 (SysDebugHalt, error paths of SysDebugNameThread and SysDebugSendIPI) halt
@@ -38,10 +37,10 @@ privileged thread).
  6 files changed, 57 insertions(+), 10 deletions(-)
 
 diff --git a/config.cmake b/config.cmake
-index 750ab9b19..ac5d49823 100644
+index 8338d84c3..f52b1021d 100644
 --- a/config.cmake
 +++ b/config.cmake
-@@ -103,6 +103,17 @@ config_string(
+@@ -150,6 +150,17 @@ config_string(
    DEFAULT 12
    UNQUOTE)
  
@@ -202,5 +201,5 @@ index 6e34398eb..55fb27899 100644
      len += (add / sizeof(word_t)) + 1;
  #endif
 -- 
-2.43.0
+2.47.3
 
