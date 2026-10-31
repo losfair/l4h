@@ -8,6 +8,9 @@
 
 pub const MAX_SEGS: usize = 16;
 pub const RING_SIZE: usize = 128;
+/// The advertised maximum: 14 data segments of 256 KiB. Bound work even
+/// for a hostile guest that ignores virtio size_max/seg_max.
+pub const MAX_REQUEST_BYTES: u64 = (MAX_SEGS as u64 - 2) * (256 << 10);
 
 pub const OP_READ: u32 = 0;
 pub const OP_WRITE: u32 = 1;
@@ -96,11 +99,37 @@ pub const BLKD_SLOT_CLIENT_DONE: u64 = 32;
 pub const MAX_CLIENTS: usize = 512;
 pub const CHANNEL_PAGES: usize = core::mem::size_of::<Channel>().div_ceil(4096);
 pub const STAGING_SIZE: usize = 1 << 20;
+pub const QUEUE_SIZE: usize = 3 << 20;
+pub const BOUNCE_SIZE: usize = 4 << 20;
+pub const BOUNCE_VA: usize = 0x2900_0000_0000;
+pub const POOL_VA: usize = 0x4000_0000_0000;
+// Separate subranges for 2 MiB frames and the 1 MiB pool's 4 KiB
+// frames: retained last-level tables must never block a later large map.
+pub const POOL_STRIDE: usize = 512 << 20;
+pub const FEATURE_AES: u64 = 1;
+/// BLKD_ADD flag; the same bit as l4h_abi::BLK_ENCRYPT.
+pub const ENCRYPT: u64 = 1 << 2;
+
+/// XTS requires distinct key halves. Inspect every byte without an
+/// early-exit comparison of secret data.
+pub fn valid_xts_key(key: &[u8; 64]) -> bool {
+    key[..32].iter().zip(&key[32..]).fold(0, |diff, (a, b)| diff | (a ^ b)) != 0
+}
+
+/// Pools are powers of two, physically aligned, and never handed to the
+/// guest as capabilities. Use large frames wherever the whole pool fits.
+pub const fn pool_frame_bits(size: usize) -> usize { if size >= 1 << 21 { 21 } else { 12 } }
+
+pub const fn pool_offset(client: usize, size: usize) -> usize {
+    client * POOL_STRIDE + if pool_frame_bits(size) == 12 { POOL_STRIDE / 2 } else { 0 }
+}
+pub const fn pool_va(client: usize, size: usize) -> usize { POOL_VA + pool_offset(client, size) }
 /// Service calls of blkd (message registers; the result is in MR 0).
 /// unit -> capacity (u64::MAX if no such unit), block size, read-only,
 /// number of units, unit address (blkd_scsi_addr for virtio-scsi, else 0).
 pub const BLKD_INFO: u64 = 1;
-/// client, unit -> 0
+/// client, unit, flags, key[8] -> 0 or a positive errno, applied flags.
+/// The key is little-endian words; u64::MAX means a failed driver.
 pub const BLKD_ADD: u64 = 2;
 /// client -> 0, or u64::MAX if it did not drain
 pub const BLKD_REMOVE: u64 = 3;
@@ -162,7 +191,12 @@ pub struct BlkdConfig {
     pub dma_va: u64,
     pub dma_paddr: u64,
     pub dma_size: u64,
-
+    pub features: u64,
+    pub bounce_va: u64,
+    pub bounce_paddr: u64,
+    pub bounce_size: u64,
+    pub pool_va: u64,
+    pub staging_paddr: u64,
 }
 
 /// The data region of a client: segments must lie in its I/O pool, and are
@@ -246,7 +280,7 @@ impl DiskWindow {
         let segs = &req.segs[..req.nr_segs as usize];
         let bytes: u64 = segs.iter().map(|s| s.len as u64).sum();
         let sector = self.start.checked_add(req.sector).ok_or(STATUS_IOERR)?;
-        if bytes == 0 || bytes % block_size as u64 != 0 || sector % (block_size as u64 / 512) != 0
+        if bytes == 0 || bytes > MAX_REQUEST_BYTES || bytes % block_size as u64 != 0 || sector % (block_size as u64 / 512) != 0
             || req.sector.checked_add(bytes / 512).is_none_or(|end| end > self.sectors) {
             return Err(STATUS_IOERR);
         }

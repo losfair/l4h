@@ -159,7 +159,7 @@ impl Memd {
         }
         cfg.dma_paddr = paddr as u64;
         let dom = iommu.attach(alloc, d);
-        iommu.map(alloc, dom, paddr, memd::DMA_PAGES * PAGE, true);
+        iommu.map(alloc, dom, paddr, memd::DMA_PAGES * PAGE, crate::iommu::Access::ReadWrite);
         if legacy {
             pci.enable_io(d);
         }

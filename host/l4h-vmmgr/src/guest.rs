@@ -191,8 +191,10 @@ impl IoPool {
     }
 
     pub fn pages(&self) -> usize {
-        self.size / PAGE
+        self.size >> self.frame_bits()
     }
+
+    pub fn frame_bits(&self) -> usize { host::blk::pool_frame_bits(self.size) }
 }
 
 pub struct Vcpu {
@@ -884,7 +886,9 @@ pub fn create(
     if cfg.vspaces > MAX_VSPACES {
         return Err(None);
     }
-    if cfg.ram_base % PAGE != 0 || cfg.ram_base != kernel.ram_base {
+    // The pool's GPA is 2 MiB aligned; its direct-map VA must also
+    // satisfy the frame size root uses for this pool.
+    if cfg.ram_base % (1 << host::blk::pool_frame_bits(cfg.io_pool)) != 0 || cfg.ram_base != kernel.ram_base {
         return Err(None);
     }
     if !cfg.io_pool.is_power_of_two() || cfg.io_pool < IO_POOL_MIN || cfg.io_pool > IO_POOL_MAX {
@@ -1055,7 +1059,8 @@ pub fn create(
     // map after RAM in the direct map.  The guest gets these mappings
     // only, never a capability to the pool.  And the VMM's notification,
     // which root's backends signal: root's too.
-    let pool_radix = cfg.io_pool.trailing_zeros() as usize - 12;
+    let frame_bits = host::blk::pool_frame_bits(cfg.io_pool);
+    let pool_radix = (cfg.io_pool.trailing_zeros() as usize - frame_bits).max(1);
     let new = match root::guest_new(alloc, id, cfg.io_pool, pool_gpa, cfg.dom0) {
         Ok(new) => new,
         Err(_) => return Err(Some(g)),
@@ -1067,11 +1072,16 @@ pub fn create(
     g.pool = IoPool { gpa: pool_gpa, size: cfg.io_pool, frames: new.pool_frames, radix: pool_radix };
     let tmp = alloc.slots.alloc();
     let keep = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: pool_radix });
-    for i in 0..pool_pages {
+    for i in 0..g.pool.pages() {
         abs(self_cap::<cap_type::Null>(tmp)).copy(&g.pool.frame(i), CapRights::all()).expect("pool frame copy");
         let frame = self_cap::<cap_type::Granule>(tmp);
         let vspace = g.vspace;
-        map_frame(&mut g.ctx(alloc), vspace, frame, ram_base + pool_gpa + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT);
+        let va = ram_base + pool_gpa + (i << frame_bits);
+        if frame_bits == 21 {
+            crate::vspace::map_large_page(&mut g.ctx(alloc), vspace, frame.cast(), va, CapRights::read_write());
+        } else {
+            map_frame(&mut g.ctx(alloc), vspace, frame, va, CapRights::read_write(), VmAttributes::DEFAULT);
+        }
         keep.absolute_cptr_from_bits_with_depth(i as u64, pool_radix).move_(&abs(frame)).expect("keep pool mapping");
     }
     alloc.slots.free(tmp);

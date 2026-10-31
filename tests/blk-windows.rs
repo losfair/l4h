@@ -5,6 +5,20 @@ use blk::*;
 
 fn pool() -> Pool { Pool { gpa: 0x8000000, paddr: 0x10000000, size: 4 << 20 } }
 fn window() -> DiskWindow { DiskWindow::new(2048, 16384, 131072).unwrap() }
+
+#[test]
+fn to_end_windows_reject_partial_encryption_units_after_resolving_capacity() {
+    for capacity in [1_000_005, 1025, 7] {
+        for start in [0, 8, 2048] {
+            assert!(DiskWindow::new(start, 0, capacity).is_none());
+        }
+    }
+    let w = DiskWindow::new(8, 0, 1_000_000).unwrap();
+    assert_eq!(w.sectors, 999_992);
+    assert_eq!(w.sectors % 8, 0);
+    // The caller can explicitly select an aligned range on an odd-sized disk.
+    assert_eq!(DiskWindow::new(8, 999_992, 1_000_005), Some(w));
+}
 fn request() -> Req {
     let mut req = Req { op: OP_READ, nr_segs: 1, ..Default::default() };
     req.segs[0] = Seg { gpa: pool().gpa, len: 4096, flags: SEG_WRITE };
@@ -162,4 +176,28 @@ fn dom0_partition_windows_preserve_offsets_and_reject_unsafe_ranges() {
     assert_eq!(w[0].check_request(&req, pool(), 512, false), Ok(2099200));
     req.sector = w[0].sectors;
     assert_eq!(w[0].check_request(&req, pool(), 512, false), Err(STATUS_IOERR));
+}
+
+#[test]
+fn crypto_work_and_bounce_use_are_bounded_by_the_advertised_maximum() {
+    let pool = Pool { gpa: 0, paddr: 0x10000000, size: 256 << 20 };
+    let window = DiskWindow::new(0, pool.size / 512, pool.size / 512).unwrap();
+    for op in [OP_READ, OP_WRITE] {
+        let mut req = Req { op, nr_segs: 1, ..Default::default() };
+        req.segs[0] = Seg { gpa: 0, len: MAX_REQUEST_BYTES as u32, flags: if op == OP_READ { SEG_WRITE } else { 0 } };
+        assert_eq!(window.check_request(&req, pool, 4096, false), Ok(0));
+        req.segs[0].len += 4096;
+        assert_eq!(window.check_request(&req, pool, 4096, false), Err(STATUS_IOERR));
+    }
+}
+
+#[test]
+fn xts_key_halves_must_differ() {
+    assert!(!valid_xts_key(&[0; 64]));
+    assert!(!valid_xts_key(&[0xa5; 64]));
+    for i in 0..64 {
+        let mut key = [0xa5; 64];
+        key[i] ^= 1;
+        assert!(valid_xts_key(&key));
+    }
 }

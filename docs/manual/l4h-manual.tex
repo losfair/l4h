@@ -156,9 +156,9 @@ are seL4 user-level programs; only the seL4 kernel runs privileged.
   \item[l4h-vmm] runs once per guest. It serves the guest's hypercalls and
     virtio devices. It maps only its own guest's I/O pool (below), never its
     RAM, so a compromised VMM can harm only that guest.
-  \item[l4h-blkd] runs once per attached disk. It drives the disk (virtio-blk,
+  \item[l4h-blkd] runs once per disk controller. It drives the disk (virtio-blk,
     virtio-scsi or NVMe), checks every request against the guest's I/O pool and its
-    sector window, and lets the device DMA straight into the pool.
+    sector window. Reads DMA into the pool; writes use a private host buffer.
   \item[l4h-netd] holds every switch and drives the uplink NICs.
 \end{description}
 
@@ -1112,7 +1112,7 @@ separate domains.
 \begin{lstlisting}
 l4hctl create NAME [--initrd FILE] [--mem MB] [--vcpus N]
        [--cmdline STRING] [--io-pool MB]
-       [--disk DISK[,ro][,volatile][,start=SECTOR][,sectors=N]]...
+       [--disk DISK[,ro][,volatile][,start=SECTOR][,sectors=N][,key-file=FILE]]...
        [--nic SWITCH[,mac=MAC][,nolock][,isolated]]...
        [--gpu WxH]
 \end{lstlisting}
@@ -1306,15 +1306,25 @@ for that (Chapter~\ref{ch:recovery}).
 
 \section{Disk pass-through}
 
-A host disk is attached to one guest at a time, with the option
+A window of a host disk is attached with the option
 \begin{lstlisting}
---disk DISK[,ro][,volatile][,start=SECTOR][,sectors=N]
+--disk DISK[,ro][,volatile][,start=SECTOR][,sectors=N][,key-file=FILE]
 \end{lstlisting}
 whose suboptions are:
 
 \begin{description}[style=nextline]
+  \item[\texttt{key-file=FILE}] Encrypt the window with AES-256-XTS.
+    The file must contain exactly 64 raw bytes (the data key followed by
+    the tweak key). Keys are never command-line values. Alternatively,
+    put \texttt{--key-file FILE} after its \texttt{--disk} argument.
+    The \texttt{key-file=} suboption must be last: its remaining text,
+    including commas and embedded \texttt{:ro}, is the file path.
+    A \texttt{:ro} suffix on any comma-separated part, or a comma followed
+    by a known disk suboption, is rejected as ambiguous;
+    put disk options first, or use \texttt{--key-file FILE} for such paths.
   \item[\texttt{ro}] The guest may read but not write; writes fail with an
-    I/O error. \texttt{DISK:ro} is accepted too.
+    I/O error. Legacy \texttt{:ro} suffixes on the disk number or numeric
+    suboptions are accepted too, such as \texttt{DISK,start=8,sectors=16:ro}.
   \item[\texttt{volatile}] The guest is offered no cache flush: Linux
     treats the disk as write-through (\file{/sys/block/vda/queue/write\_cache}
     reads \texttt{write through}), so \texttt{fsync} returns without
@@ -1366,17 +1376,60 @@ An automatically selected whole disk whose capacity is not a multiple of
 eight sectors also becomes a dummy device, with the whole disk reserved.
 Explicit windows must still be aligned and fit within the known capacity.
 
-\paragraph{Failed disks.}\label{sec:disk-failed} When its owner is
-destroyed, a disk is reset before it becomes free. If the device does not
-complete the reset (an NVMe controller that stays ready past its timeout,
-up to two minutes, or a virtio device that does not reset within two
-seconds), the serial log shows \texttt{device did not reset}, \cmd{l4hctl
-disks} marks it \texttt{failed}, and attaching it fails with \texttt{I/O
-error}. The driver's DMA memory stays out of use, since the device may still
-write to it, and so does the destroyed VM's I/O pool unless a supported IOMMU cuts
-the device off from it; \cmd{l4hctl info} then shows less free memory.
-Reboot the host to recover it. The VM's RAM is reused
-at once: a device is never given guest RAM.
+\paragraph{Encrypted windows.} dom0 supplies the key; the guest sees an
+ordinary virtio-blk disk with 4096-byte logical blocks and never receives
+the key. Equal key halves are rejected. AES-NI on x86 or ARMv8 Crypto
+Extensions on AArch64 are required; attach reports \texttt{not supported}
+when the CPU lacks them. There is no software fallback. For example:
+\begin{lstlisting}
+# umask 077
+# head -c 64 /dev/urandom > disk.key
+# l4hctl create private --initrd guest.cpio.gz \
+      --disk 0,start=2048,sectors=16384 --key-file disk.key
+\end{lstlisting}
+Keep the key securely outside the encrypted disk. Losing it loses access
+to the data. \cmd{l4hctl disks} marks encrypted attachments; the host log
+identifies \texttt{aes-ni} or \texttt{armv8-ce}. Read-only shared encrypted
+windows must use the same starting sector and key. Destroy drains I/O
+and erases the driver's expanded keys.
+The CLI checks the host's encryption support before attaching a keyed disk.
+Creation checks once for all keyed disks, before allocating the VM.
+On older hosts it fails without adding a disk or creating a VM.
+If the host advertises support but does not confirm encryption on a
+successful attach, the CLI destroys the unstarted VM and reports the
+failure. This also removes its other attachments; there is no per-disk
+detach operation.
+A second key option for the same disk is rejected. A window extending to
+the end of a disk must still resolve to a multiple of eight sectors;
+otherwise attach fails. Select an explicit aligned size on such disks.
+
+The on-disk format is raw AES-256-XTS, with 4 KiB data units and
+little-endian unit numbers relative to the window. To open the same
+window offline:
+\begin{lstlisting}
+cryptsetup open --type plain --cipher aes-xts-plain64 --key-size 512 \
+  --sector-size 4096 --iv-large-sectors --key-file disk.key \
+  --offset 2048 --size 16384 /dev/DEVICE private
+\end{lstlisting}
+The \texttt{--iv-large-sectors} flag is required for the same tweak
+numbering. \texttt{disk-write} and \texttt{disk-zero} remain raw operations
+on unattached ranges; they do not encrypt provisioning data. The control
+API also exposes \texttt{blk-attach VM DISK --key-file FILE} for a VM
+created but not yet started.
+
+This protects data on the disk and in snapshots, including a detached
+or retired disk. It provides no integrity or rollback detection. dom0
+knows the key, and trusted host components can access it. Encryption of
+dom0's boot windows, rekeying and TPM-sealed keys are not implemented.
+
+\paragraph{Failed disks.}\label{sec:disk-failed} Destroy drains that
+client's submitted requests before releasing its pool. Other clients on
+the controller keep running. A five-second drain timeout quarantines the
+controller until host reboot: \cmd{l4hctl disks} marks it \texttt{failed},
+and attachment or provisioning fails with \texttt{I/O error}. The driver's
+DMA memory stays allocated, and affected guest pools remain out of use
+unless a supported IOMMU cuts the device off. Guest RAM is reused at
+once: a disk controller is never given guest RAM.
 
 \begin{caveat}
 dom0 decides which guest gets which disk, and can attach any free disk to
@@ -1385,13 +1438,27 @@ any guest. The host does not check what is on a disk.
 
 \section{Performance and semantics}
 
-Requests are checked and then sent to the device, which reads and writes
-the guest's I/O pool directly; the guest kernel copies the data between the
-pool and its own pages, which costs guest CPU (one \texttt{memcpy} per
-byte). Flushes reach the device, so filesystems keep their
-crash-consistency guarantees. The guest sees the device's logical block
-size, for example 4~KiB on 4Kn NVMe namespaces. Each disk has one queue, and
-discard (TRIM) is not offered.
+Reads DMA directly into the guest's I/O pool. Every write is copied once
+into a private host bounce buffer before reaching the device; subsequent
+guest changes to the pool cannot change that submitted write. Encrypted
+writes are encrypted into this buffer, and encrypted reads are decrypted
+in place before completion. The guest kernel also copies between its RAM
+and the pool with swiotlb. Each controller reserves 4 MiB for bounced
+writes at boot; a write waits in its queue when no contiguous run fits.
+Waiting writers get FIFO priority so that smaller writes cannot keep
+a larger request waiting indefinitely.
+Completion-queue back-pressure preserves a writer's place but reserves no
+bounce space, allowing other guests' writes to proceed. The writer regains
+priority when it drains its completions. Malformed submission rings lose
+their place in the waiting queue.
+Reads and flushes from other clients can still proceed.
+
+Flushes reach the device, so filesystems keep their crash-consistency
+guarantees. Plain windows expose the device's logical block size;
+encrypted windows always expose 4 KiB. Each guest disk has one queue,
+and discard (TRIM) is not offered. With a supported IOMMU, disk controllers
+can write to guest pools but cannot read them. Encryption consumes CPU on
+the controller's blkd thread, shared by its clients.
 
 %======================================================================
 \chapter{Networking}
@@ -1966,7 +2033,7 @@ Op & Name & Arguments & Results \\
 5 & \texttt{VM\_DESTROY} & VM & -- \\
 6 & \texttt{VM\_LIST} & first VM id & count; \texttt{struct l4h\_ctl\_vm}
   entries in data \\
-7 & \texttt{BLK\_ATTACH} & VM, disk, read-only, first sector, sectors & -- \\
+7 & \texttt{BLK\_ATTACH} & VM, disk, flags (\texttt{L4H\_BLK\_*}), first sector, sectors;\newline 64-byte key in data with \texttt{L4H\_BLK\_ENCRYPT} & applied flags \\
 8 & \texttt{CONSOLE\_READ} & VM, offset & next offset, bytes, bytes lost;
   output in data \\
 9 & \texttt{CONSOLE\_WRITE} & VM, length; input in data & bytes accepted \\
@@ -1986,7 +2053,8 @@ Op & Name & Arguments & Results \\
 18 & \texttt{VM\_STATS} & VM & CPU use in tenths of a percent, cap \\
 19 & \texttt{VM\_SHUTDOWN} & VM, 0 power off / 1 reboot & -- \\
 25 & \texttt{HOST\_VERSION} & -- & byte length in \texttt{vals[0]}; UTF-8
-  build version in data, without a terminating NUL \\
+  build version in data, without a terminating NUL; supported
+  \texttt{BLK\_ATTACH} flags in \texttt{vals[1]} (0 on older hosts) \\
 \bottomrule
 \end{longtable}
 

@@ -1655,7 +1655,43 @@ thin provisioning or copy-on-write.
   guest RAM. Root and blkd both enforce the overlap rule
   (`DiskWindow::conflicts`). Requests are checked with checked arithmetic
   for block alignment, direction, permissions, operation and pool bounds.
-- **Volatile attachments.** `BLK_ATTACH` takes flags: `BLK_RO`, and
+- **Pool mappings.** Root maps every pool into blkd at
+  `POOL_VA + client * POOL_STRIDE`, with 2 MiB frames for pools of at least
+  2 MiB; a 1 MiB pool uses 4 KiB frames in the upper half of the slot, so its
+  retained page tables cannot block a later large-frame attachment in the
+  same slot. The guest and its VMM use the same frame geometry, and guest
+  creation rejects a direct-map base not aligned to the pool's frame size.
+  Channel frames and their mapping CNode are a separate allocation, released
+  as soon as a rejected attach is safely removed, even while the VM lives. If
+  removal fails without IOMMU confinement, the attachment record stays, so
+  destroying the guest still pins the pool. Root counts such retained disk
+  attachments and quarantined netd ports against one device budget, logs
+  each with the guest ID, and reports budget exhaustion once per guest.
+- **All writes bounce**, plain windows included. Root reserves 4 MiB of
+  contiguous bounce memory per controller at boot. blkd snapshots each write
+  into one contiguous run before submitting it, so later guest writes cannot
+  change what the device reads or bypass encryption, and guest segment
+  boundaries cannot split a physical block. Runs are freed only after the
+  hardware completes, failed I/O included. If no run fits, the request stays
+  in its ring until a completion. Waiting writers are served FIFO: only the
+  oldest runnable waiter reserves space, so small writes cannot keep
+  fragmenting the area. A client blocked on its completion queue keeps its
+  place but reserves nothing; empty rings, malformed indices and removed
+  clients lose it. Other writers park until the priority changes, while
+  reads and flushes keep flowing through the four-request round-robin.
+  Requests larger than the area fail instead of waiting forever (the guest's
+  maximum is 14 × 256 KiB).
+- **Reads DMA straight into the pool.** Encrypted reads are decrypted in
+  place before their response is posted. Completions are collected before
+  leaving `drv.reap`, so cryptography never runs in a driver callback; the
+  pending record keeps the translated segments and tweak unit, so completion
+  repeats no validation or translation.
+- **virtio-blk limits.** blkd negotiates segment size and count, splits
+  large requests into whole-block commands, caps indirect chains by the
+  queue size, and continues in the same slot after each command. The tag
+  and bounce run stay owned until the final completion or an error.
+- **Volatile attachments.** `BLK_ATTACH` takes flags: `BLK_RO`, `BLK_ENCRYPT`
+  (below), and
   `BLK_VOLATILE` for a disk whose contents need not survive a power failure,
   such as the scratch disk of a VM discarded with it. Its VMM does not offer
   `VIRTIO_BLK_F_FLUSH`, so the guest treats the disk as write-through and
@@ -1703,15 +1739,66 @@ thin provisioning or copy-on-write.
   virtio writes 0 to `device_status` and waits until it reads back 0. It
   then starts every
   controller's blkd at boot and learns the virtio-scsi units there. Each
-  needs 4 MiB of physically contiguous DMA memory, and the host fails to boot
-  without it, so a disk never lacks its driver later. A controller whose
+  needs 8 MiB of physically contiguous DMA memory (3 MiB of queues, 4 MiB
+  for bounced writes, 1 MiB for provisioning), and the host fails to boot
+  without it, so a disk never lacks its driver or bounce memory later. A controller whose
   reset failed is not started and stays disabled: its disks fail with `EIO`,
   and the host boots without them. Clients and quarantine are per
   controller.
 - **Queries.** `DISK_INFO` returns the PCI address, kind, failed flag,
   capacity and attachment count (the owner field names the first
   attachment, or -1); `BLK_INFO` enumerates `(vm, start, sectors,
-  read-only)` with a cursor.
+  read-only, encrypted)` with a cursor.
+
+**Encrypted windows.** `CTL_BLK_ATTACH` takes `L4H_BLK_ENCRYPT` in its
+flags argument and a raw 64-byte AES-256-XTS key (K1 then K2) in the request
+data. Root rejects a mismatch between requested and blkd's applied flags
+with `EOPNOTSUPP`; vmmgr returns the applied flags in `vals[0]`. Before a
+keyed attach, `l4hctl` requires `CTL_HOST_VERSION.vals[1]` to advertise
+`BLK_ENCRYPT`, since older hosts would attach the window in plain text and
+cannot detach one disk; `create` checks once before allocating the VM, and
+destroys the unstarted VM if an attach is not confirmed. Keys come from
+`--disk ...,key-file=FILE` (last suboption: the rest is the path) or
+`--key-file FILE`, exactly 64 bytes; a second key for one disk, or a path
+that looks like it carries disk options or `:ro`, is rejected as ambiguous.
+Equal key halves fail with `EINVAL`, and a CPU without hardware AES with
+`EOPNOTSUPP`.
+
+Encrypted windows always expose 4096-byte logical blocks, even on 512-byte
+devices. The XTS tweak is the 128-bit little-endian 4 KiB unit number
+relative to the window (`guest sector / 8`), so moving a raw window keeps
+its ciphertext valid. Read-only windows that overlap an encrypted one need
+the same start and key; plain and encrypted views never overlap. For offline
+access:
+
+```sh
+cryptsetup open --type plain --cipher aes-xts-plain64 --key-size 512 \
+  --sector-size 4096 --iv-large-sectors --key-file key \
+  --offset <window-start-in-512-byte-sectors> --size <window-sectors> <dev> name
+```
+
+Without `--iv-large-sectors`, dm-crypt counts IVs in 512-byte sectors.
+Provisioning (`BLK_WRITE`, `disk-write`, `disk-zero`) stays raw: seeding an
+encrypted image means encrypting it in userspace in this format. Encryption
+protects contents, snapshots and retired media; it does not authenticate
+sectors or stop tampering and rollback, and it does not protect against
+dom0, which supplies the key, or a compromised host. Dom0's boot disk,
+TPM-sealed keys, rekeying and discard are out of scope.
+
+Root detects AES-NI (CPUID) or `ID_AA64ISAR0_EL1.AES` and passes it in
+`BlkdConfig::features`; there is no software fallback. On x86 the soft-float
+host target cannot compile AES intrinsics, so blkd uses `global_asm!`
+routines (`aeskeygenassist`/`aesimc`, eight blocks interleaved) that clear
+XMM registers and scratch before returning. AArch64 uses NEON intrinsics
+with the Crypto Extensions and volatile writes to clear its key-expansion,
+tweak and block scratch; compiler stack spills are not erased there. Attach
+logs name `aes-256-xts (aes-ni)` or `(armv8-ce)`, never key bytes. blkd
+keeps 720 bytes of expanded keys per client, erased on rejection, drain and
+removal. `l4h-host::wipe` provides volatile erasure: root and vmmgr erase
+IPC request words and control arguments on every operation, and control
+data for data-bearing, failed and unknown operations; the CLI erases its
+request copies and keys. Crypto runs on the controller's blkd thread, so
+its cost is shared by that controller's guests.
 
 `tests/run-sharedblk.sh` checks concurrent clients, overlap and bounds
 rejection, provisioning exclusion, destroy during I/O, read-only windows
@@ -1719,7 +1806,13 @@ shared by several guests, more than 64 attachments of one disk,
 flush/readback and repeated reuse, on virtio-blk, virtio-scsi (also with
 both disks as LUNs of one controller) and NVMe (512 and 4096 byte blocks).
 `tests/blk-windows.rs` exercises the production validator on malformed
-requests and window/pool boundaries.
+requests and window/pool boundaries. `tests/run-blkcrypt-test.sh` checks
+IEEE 1619 vectors on both backends, random units against OpenSSL EVP, units
+split across segments, snapshot isolation and bounce fragmentation;
+`tests/blk-ipc.rs` changes the guest pool between driver submission and
+completion to verify the snapshot. `tests/run-cryptblk.sh` runs full VMs
+with virtio-blk, NVMe (512/4Kn) and virtio-scsi, compares every written raw
+unit to EVP, and checks keys, sharing, errors and destroy/reuse.
 
 ### 9.3 Network: L2 virtual switches only
 
@@ -1916,8 +2009,11 @@ Common behaviour:
   physical address, so drivers are unchanged. The virtio drivers accept
   `VIRTIO_F_ACCESS_PLATFORM`.
   - A NIC (netd) gets its 4 MiB of DMA memory.
-  - A disk controller (blkd) gets blkd's 4 MiB, and each client's I/O pool
-    while it is attached. The pool is unmapped after the drain, or after a
+  - A disk controller (blkd) gets 3 MiB of queues read/write, 4 MiB of
+    bounce memory and 1 MiB of staging read-only, and each client's I/O
+    pool **write-only** while it is attached (AMD: IR clear, IW set; Intel:
+    R clear, W set). Rings, headers and PRP lists live in blkd memory, so
+    the disk never reads a pool. The pool is unmapped after the drain, or after a
     quarantine. Shared pools are reference-counted per domain and
     allocation, so only the final release removes their translations.
   - The balloon (memd) gets its DMA pages.
@@ -2321,7 +2417,7 @@ none. dom0 runs no host hardware drivers.
 |------|------------|
 | Host | `host_version` (the build version; the tag for a release); `host_info` (cores, free/total bytes, disk, VM and NIC counts); `host_reboot`; `rtc_set`; `iommu_info` (§9.5); `log_read` (§10) |
 | Guests | `vm_create`, `vm_load`, `vm_start`, `vm_shutdown`, `vm_destroy`, `vm_list`, `vm_info` (cores of the first six vCPUs), `vm_stats` (CPU use and cap), `vm_set_sched`, `vm_set_mem`, `vm_mem_info` (§8.5), `vm_trust` (flags, §10.2) |
-| Block | `blk_attach` (disk, read-only and volatile flags, LBA window), `blk_write` (provisioning), `blk_info`, `disk_info` |
+| Block | `blk_attach` (disk, read-only, volatile and encrypt flags, LBA window, key), `blk_write` (provisioning), `blk_info`, `disk_info` |
 | Network | `switch_create`, `switch_attach_uplink`, `nic_create` (MAC, MAC lock, isolation), `switch_info` (ports with VM and MAC, counters), `nic_info` (PCI address, switch, MAC) |
 | Console | `console_read` (offset, bytes and lost-byte count), `console_write` |
 | Display | `gpu_attach` (scanout size), `gpu_read` (the image, 1 MiB at a time, with size, format and frame; §9.6) |
@@ -3285,6 +3381,8 @@ machine and guests of 256–512 MiB.
 | `tests/run-android.sh`, `tests/run-androidtest.sh` | Android 17 boot to the lock screen; Android's kernel features (§5.8) |
 | `tests/run-blktest.sh` (`BLKTEST_DEV=nvme`, `scsi`, `scsi-legacy`, `scsi-luns`, `virtio-legacy`) | disk pass-through, data integrity |
 | `tests/run-sharedblk.sh` | shared controllers: concurrent clients, windows, provisioning, destroy during I/O |
+| `tests/run-blkcrypt-test.sh` | AES-XTS known answers and OpenSSL EVP comparisons, split units, bounce allocation and snapshots; ARM backend under QEMU |
+| `tests/run-cryptblk.sh` | encrypted and adjacent plain windows, raw ciphertext, wrong keys, read-only sharing and reuse (`CRYPTBLK_DEV=nvme` or `scsi`, `CRYPTBLK_LBA=4096`, `CRYPTBLK_NOAES=1`) |
 | `tests/run-ctltest.sh` | VM lifecycle, console, clean shutdown, disk re-attach, windows, reclaim |
 | `tests/run-devicelimit.sh` | 64 devices per guest |
 | `tests/run-gputest.sh` | virtio-gpu drawing, screenshots, size checks and reclaim |
@@ -3309,7 +3407,7 @@ machine and guests of 256–512 MiB.
 | `tests/run-xentest.sh` | two l4h partitions as Xen HVM guests, nested in KVM, each with a passed-through NIC, ping each other (§11.2) |
 | `tests/run-attesttest.sh` | attestation with swtpm over CRB, FIFO and the AMD fTPM ACPI start method: reports on dom0 and a guest, host evidence, AK credential |
 | `tests/run-debian.sh`, `tests/run-workload.sh` | Debian + systemd, fio verify, parallel build, fsck (`tests/mkdebian.sh` first) |
-| `tests/run-bench.sh`, `tests/run-vmbench.sh`, `tests/run-startbench.sh` | micro-benchmarks, guest cost, start latency |
+| `tests/run-bench.sh`, `tests/run-vmbench.sh`, `tests/run-startbench.sh` | micro-benchmarks (plain and encrypted sequential disk I/O; `L4H_BENCH_BASELINE_ROOT` compares a pre-bounce ELF), guest cost, start latency |
 | `tests/run-fuzz.sh` | hostile-guest virtqueue fuzzing of l4h-vmm |
 | `tests/run-skimtest.sh` | the skim-xapic-nopcid variant on a Meltdown-affected CPU without PCID/x2APIC: SKIM mappings and syscall state at the user/kernel boundary (`tests/skim-qemu.py`, GDB) |
 | `python3 tests/blkmq-qemu.py` | block multiqueue and fsync suites under local QEMU (`--suite blkmq\|fsync`, `--guest-queues`, `--scsi-queues`); run by hand |

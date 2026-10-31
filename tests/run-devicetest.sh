@@ -30,6 +30,9 @@ for signature in ['static long mem_call(', 'static void memhp_work_fn(struct wor
 blkd = (root / 'host/l4h-blkd/src/main.rs').read_text()
 start = blkd.index('use core::ops::{Deref, DerefMut};')
 (out / 'blkd-main.inc').write_text(blkd[start:])
+start = blkd.index('/// A physically contiguous piece of a request\'s data.')
+end = blkd.index('/// The controller\'s driver.')
+(out / 'blk-driver.inc').write_text(blkd[start:end])
 # Keep the production boot sequence and reservation lifecycle intact.
 vmmgr = (root / 'host/l4h-vmmgr/src/main.rs').read_text()
 start = vmmgr.index('pub fn boot_dom0(')
@@ -40,7 +43,43 @@ reservations = blkd[blkd.index('pub const WINDOW_ALIGN:'):blkd.index('/// Mappin
 reservations += blkd[blkd.index('pub struct Attachment {'):blkd.index('struct Blkd {')]
 start = blkd.index('pub fn remove(')
 end = blkd.index('\n}', start) + 2
-(out / 'blk-reservations.inc').write_text(reservations + blkd[start:end])
+reservations += blkd[start:end]
+start = blkd.index('pub fn activate(')
+end = blkd.index('\n}', start) + 2
+reservations += blkd[start:end]
+vmmgr = (root / 'host/l4h-root/src/vmmgr.rs').read_text()
+start = vmmgr.index('impl RootGuest {')
+end = vmmgr.index('\n}', start) + 2
+reservations += vmmgr[start:end]
+start = vmmgr.index('fn rollback_disk_attach(')
+end = vmmgr.index('\n}', start) + 2
+(out / 'blk-reservations.inc').write_text(reservations + vmmgr[start:end])
+guest = (root / 'host/l4h-vmmgr/src/guest.rs').read_text()
+start = guest.index('    // Every value comes from the control API:')
+end = guest.index('    let ram_base = cfg.ram_base;', start)
+(out / 'guest-pool-config.inc').write_text('fn validate(cfg: &GuestConfig, kernel: &Kernel) -> Result<(), Option<()>> {\n' + guest[start:end] + 'Ok(())\n}\n')
+cli = (root / 'tools/l4hctl/src/lib.rs').read_text()
+parts = []
+for signature in ['    pub fn call(&self, op:', '    fn call_buf(', '    fn raw_call(', '    pub fn blk_attach(', '    fn require_disk_encryption(', '    fn attach_disk(', '    pub fn vm_destroy(', '    pub fn create_vm_with_keys(']:
+    start = cli.index(signature)
+    end = cli.index('\n    }', start) + 6
+    parts.append(cli[start:end])
+(out / 'ctl-encryption.inc').write_text('impl Ctl {\n' + '\n'.join(parts) + '\n}\n')
+for source, signature, name in [
+    ('host/l4h-root/src/vmmgr.rs', 'pub fn call(h:', 'root-server'),
+    ('host/l4h-vmmgr/src/root.rs', 'fn call(label:', 'root-client'),
+    ('host/l4h-vmmgr/src/root.rs', 'pub fn disk_attach(', 'root-client-attach'),
+    ('host/l4h-vmmgr/src/ctl.rs', 'pub fn handle(', 'control-handle'),
+]:
+    text = (root / source).read_text()
+    start = text.index(signature)
+    end = text.index('\n}', start) + 2
+    (out / (name + '.inc')).write_text(text[start:end])
+path = out / 'root-client.inc'
+path.write_text(path.read_text() + '\n' + (out / 'root-client-attach.inc').read_text())
+control = (root / 'host/l4h-vmmgr/src/ctl.rs').read_text()
+arm = control[control.index('        abi::CTL_BLK_ATTACH => {'):control.index('        abi::CTL_CONSOLE_READ => {')]
+(out / 'control-attach.inc').write_text('fn execute_attach(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlResp) -> Result<(), i64> {\nlet a = &req.args;\nmatch req.op {\n' + arm + '_ => unreachable!(),\n}\n}\n')
 PY
 cc -std=c11 -O2 -Wall -Wextra -Werror -I "$root/include" -I "$out" \
     -c "$root/tests/console-guest.c" -o "$out/console-guest.o"
@@ -70,6 +109,25 @@ L4H_BLKD_TEST_SRC="$out/blkd-main.inc" rustc +stable --edition=2024 --test -L de
     --extern l4h_host="$out/libl4h_host.rlib" \
     "$root/tests/blk-ipc.rs" -o "$out/blk-ipc-tests"
 "$out/blk-ipc-tests"
+rustc +stable --edition=2024 --crate-name l4h_virtio --crate-type rlib \
+    "$root/host/l4h-virtio/src/lib.rs" -o "$out/libl4h_virtio.rlib"
+L4H_BLK_DRIVER_TEST_SRC="$out/blk-driver.inc" rustc +stable --edition=2024 --test -L dependency="$out" \
+    --extern l4h_host="$out/libl4h_host.rlib" --extern l4h_virtio="$out/libl4h_virtio.rlib" \
+    "$root/tests/virtio-blk-limits.rs" -o "$out/virtio-blk-limits-tests"
+"$out/virtio-blk-limits-tests"
+L4H_GUEST_POOL_TEST_SRC="$out/guest-pool-config.inc" rustc +stable --edition=2024 --test -L dependency="$out" \
+    --extern l4h_abi="$out/libl4h_abi.rlib" --extern l4h_host="$out/libl4h_host.rlib" \
+    "$root/tests/guest-pool-layout.rs" -o "$out/guest-pool-tests"
+"$out/guest-pool-tests"
+L4H_CTL_ENCRYPT_TEST_SRC="$out/ctl-encryption.inc" rustc +stable --edition=2024 --test -L dependency="$out" \
+    --extern l4h_abi="$out/libl4h_abi.rlib" "$root/tests/ctl-encryption.rs" -o "$out/ctl-encryption-tests"
+"$out/ctl-encryption-tests"
+L4H_ROOT_SERVER_TEST_SRC="$out/root-server.inc" L4H_ROOT_CLIENT_TEST_SRC="$out/root-client.inc" \
+    L4H_CONTROL_ATTACH_TEST_SRC="$out/control-attach.inc" \
+    L4H_CONTROL_HANDLE_TEST_SRC="$out/control-handle.inc" rustc +stable --edition=2024 --test -L dependency="$out" \
+    --extern l4h_abi="$out/libl4h_abi.rlib" --extern l4h_host="$out/libl4h_host.rlib" \
+    "$root/tests/secret-ipc.rs" -o "$out/secret-ipc-tests"
+"$out/secret-ipc-tests"
 rustc +stable --edition=2024 --test --crate-name l4h_host -L dependency="$out" \
     --extern l4h_abi="$out/libl4h_abi.rlib" \
     "$root/host/l4h-host/src/lib.rs" -o "$out/host-tests"

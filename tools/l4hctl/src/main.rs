@@ -8,6 +8,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use l4hctl::*;
 
+fn set_disk_key(key: &mut Option<DiskKey>, path: &str) -> Result<()> {
+    if key.is_some() { return err("a key was already specified for this disk"); }
+    *key = Some(DiskKey::read(path)?);
+    Ok(())
+}
+
 struct CreateOpts {
     name: String,
     mem: u64,
@@ -15,9 +21,57 @@ struct CreateOpts {
     initrd: Option<String>,
     cmdline: String,
     disks: Vec<(u64, u64, u64, u64)>,
+    disk_keys: Vec<Option<DiskKey>>,
     io_pool: u64,
     nics: Vec<(u64, u64, u64)>,
     gpu: Option<(u64, u64)>,
+}
+
+enum DiskOption<'a> { ReadOnly, Volatile, Start(&'a str), Sectors(&'a str), KeyFile }
+
+/// One classifier for parsing options and detecting ambiguous key paths.
+fn disk_option(value: &str) -> Option<DiskOption<'_>> {
+    if value == "ro" { return Some(DiskOption::ReadOnly); }
+    if value == "volatile" { return Some(DiskOption::Volatile); }
+    match value.split_once('=')? {
+        ("start", n) => Some(DiskOption::Start(n)),
+        ("sectors", n) => Some(DiskOption::Sectors(n)),
+        ("key-file", _) => Some(DiskOption::KeyFile),
+        _ => None,
+    }
+}
+
+/// key-file is last; reject paths that could be trailing disk options.
+fn parse_disk(value: &str) -> Result<((u64, u64, u64, u64), Option<&str>)> {
+    let (disk, mut options) = value.split_once(',').map_or((value, None), |(d, rest)| (d, Some(rest)));
+    let (disk, mut flags) = disk.strip_suffix(":ro").map_or((disk, 0), |d| (d, BLK_RO));
+    let disk = parse_num(disk)?;
+    let (mut start, mut sectors, mut key) = (0, 0, None);
+    while let Some(rest) = options {
+        let (opt, next) = rest.split_once(',').map_or((rest, None), |(o, tail)| (o, Some(tail)));
+        // Legacy :ro suffixes also follow numeric suboptions. Key-file
+        // paths keep their own ambiguity checks and must stay verbatim.
+        let opt = if !matches!(disk_option(opt), Some(DiskOption::KeyFile)) {
+            opt.strip_suffix(":ro").map_or(opt, |value| { flags |= BLK_RO; value })
+        } else { opt };
+        match disk_option(opt) {
+            Some(DiskOption::ReadOnly) => flags |= BLK_RO,
+            Some(DiskOption::Volatile) => flags |= BLK_VOLATILE,
+            Some(DiskOption::Start(n)) => start = parse_num(n)?,
+            Some(DiskOption::Sectors(n)) => sectors = parse_num(n)?,
+            Some(DiskOption::KeyFile) => {
+                let path = rest.split_once('=').unwrap().1;
+                if path.split(',').enumerate().any(|(i, part)| part.ends_with(":ro") || (i != 0 && disk_option(part).is_some())) {
+                    return err("--disk: suboptions must precede key-file=; use --key-file FILE for paths containing option-like text or a :ro suffix");
+                }
+                key = Some(path);
+                break;
+            }
+            None => return err(format!("--disk: unknown option {opt}")),
+        }
+        options = next;
+    }
+    Ok(((disk, flags, start, sectors), key))
 }
 
 fn cmd_create(ctl: &Ctl, o: &CreateOpts) -> Result<u64> {
@@ -25,7 +79,7 @@ fn cmd_create(ctl: &Ctl, o: &CreateOpts) -> Result<u64> {
         Some(p) => read_file(p)?,
         None => Vec::new(),
     };
-    let (vm, macs) = ctl.create_vm(&VmSpec {
+    let (vm, macs) = ctl.create_vm_with_keys(&VmSpec {
         name: &o.name,
         mem: o.mem,
         vcpus: o.vcpus,
@@ -35,7 +89,7 @@ fn cmd_create(ctl: &Ctl, o: &CreateOpts) -> Result<u64> {
         io_pool: o.io_pool,
         nics: o.nics.clone(),
         gpu: o.gpu,
-    })?;
+    }, &o.disk_keys)?;
     for (&(sw, _, _), mac) in o.nics.iter().zip(macs) {
         eprintln!("vm {vm}: nic on switch {sw}, mac {}", fmt_mac(mac));
     }
@@ -113,14 +167,17 @@ const USAGE: &str = "usage: l4hctl <command>
   rtc-set [UNIX_SECONDS]       set the machine RTC in UTC (default: dom0's
                                current time, e.g. after NTP synchronizes)
   disks                        host disks, owners, capacities and attachments
+  blk-attach VM DISK [--read-only] [--start SECTOR] [--sectors N]
+         [--key-file FILE]     attach to a created VM; exactly 64 raw key bytes
   disk-zero DISK START SECTORS zero an unattached region
   disk-write DISK START FILE   seed an unattached region, then flush
   list (or vms)                VMs and their host seals
   create NAME [--initrd F] [--mem MB] [--vcpus N]
-         [--cmdline S] [--disk I[,ro][,volatile][,start=SECTOR][,sectors=N]]...
+         [--cmdline S] [--disk I[,ro][,volatile][,start=SECTOR][,sectors=N][,key-file=FILE]]...
                                create and start a VM, which runs the
                                host's kernel; prints its id (volatile: the
                                guest sees no write cache and never flushes)
+         [--key-file FILE]    encrypt the preceding --disk (64 raw bytes)
          [--nic SWITCH[,mac=MAC][,nolock][,isolated]]...
          [--io-pool MB]        device I/O buffer pool (power of two, 1-256;
                                default 4, or room for the GPU's buffers)
@@ -278,7 +335,28 @@ fn run(args: &[String]) -> Result<i32> {
                 };
                 let failed = if r.vals[2] != 0 { ", failed (quarantined)" } else { "" };
                 println!("disk {d}: pci {:02x}:{:02x}.{} {kind}, owner {owner}{failed}, sectors {}, attachments {}", bdf >> 8, (bdf >> 3) & 0x1f, bdf & 7, r.vals[4], r.vals[5]);
+                for a in ctl.disk_attachments(d)? {
+                    println!("  vm {}: start {}, sectors {}{}{}", a.vm, a.start, a.sectors,
+                        if a.read_only { ", read-only" } else { "" }, if a.encrypted { ", encrypted" } else { "" });
+                }
             }
+        }
+        "blk-attach" => {
+            if args.len() < 3 { return err("blk-attach VM DISK [--read-only] [--start SECTOR] [--sectors N] [--key-file FILE]"); }
+            let (vm, disk) = (parse_num(&args[1])?, parse_num(&args[2])?);
+            let (mut ro, mut start, mut sectors, mut key) = (false, 0, 0, None);
+            let mut it = args[3..].iter();
+            while let Some(a) = it.next() {
+                if a == "--read-only" { ro = true; continue; }
+                let val = it.next().ok_or(Error(format!("{a}: missing value")))?;
+                match a.as_str() {
+                    "--start" => start = parse_num(val)?,
+                    "--sectors" => sectors = parse_num(val)?,
+                    "--key-file" => set_disk_key(&mut key, val)?,
+                    _ => return err(format!("blk-attach: unknown option {a}")),
+                }
+            }
+            ctl.blk_attach(vm, disk, if ro { BLK_RO } else { 0 }, start, sectors, key.as_ref().map(|k| &k.0))?;
         }
         "disk-zero" => {
             if args.len() != 4 { return err("disk-zero DISK START SECTORS"); }
@@ -349,6 +427,7 @@ fn run(args: &[String]) -> Result<i32> {
                 initrd: None,
                 cmdline: "console=hvc0".into(),
                 disks: Vec::new(),
+                disk_keys: Vec::new(),
                 io_pool: 0,
                 nics: Vec::new(),
                 gpu: None,
@@ -363,25 +442,15 @@ fn run(args: &[String]) -> Result<i32> {
                     "--io-pool" => o.io_pool = parse_mib(&val()?)?,
                     "--cmdline" => o.cmdline = val()?,
                     "--disk" => {
-                        // DISK[,ro][,volatile][,start=SECTOR][,sectors=N] (or DISK:ro)
-                        let v = val()?.replace(":ro", ",ro");
-                        let mut it = v.split(',');
-                        let d = parse_num(it.next().unwrap())?;
-                        let (mut flags, mut start, mut sectors) = (0, 0, 0);
-                        for opt in it {
-                            if opt == "ro" {
-                                flags |= BLK_RO;
-                            } else if opt == "volatile" {
-                                flags |= BLK_VOLATILE;
-                            } else if let Some(n) = opt.strip_prefix("start=") {
-                                start = parse_num(n)?;
-                            } else if let Some(n) = opt.strip_prefix("sectors=") {
-                                sectors = parse_num(n)?;
-                            } else {
-                                return err(format!("--disk: unknown option {opt}"));
-                            }
-                        }
-                        o.disks.push((d, flags, start, sectors));
+                        // DISK[,ro][,volatile][,start=SECTOR][,sectors=N][,key-file=FILE] (or DISK:ro)
+                        let v = val()?;
+                        let (disk, key) = parse_disk(&v)?;
+                        o.disks.push(disk);
+                        o.disk_keys.push(key.map(DiskKey::read).transpose()?);
+                    }
+                    "--key-file" => {
+                        let key = o.disk_keys.last_mut().ok_or(Error("--key-file must follow --disk".into()))?;
+                        set_disk_key(key, &val()?)?;
                     }
                     "--nic" => {
                         // SWITCH[,mac=MAC][,nolock][,isolated]
@@ -639,6 +708,57 @@ fn main() {
         Err(Error(e)) => {
             eprintln!("l4hctl: {e}");
             exit(1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_second_key_cannot_replace_the_preceding_disks_key() {
+        let mut key = Some(DiskKey(core::array::from_fn(|i| i as u8)));
+        // Reject before trying to read the replacement, regardless of
+        // whether the first key came from key-file= or --key-file.
+        let e = set_disk_key(&mut key, "/nonexistent/second-key").unwrap_err();
+        assert!(e.0.contains("already specified"));
+        assert_eq!(key.unwrap().0, core::array::from_fn(|i| i as u8));
+    }
+
+    #[test]
+    fn disk_key_paths_are_not_options_or_read_only_suffixes() {
+        for path in ["/keys/a:root.key", "/keys/a,b.key", "/keys/a,root.key", "/keys/a:ro/key", "/keys/a,b,", "/keys/a:ro/key,b:root.key,"] {
+            let value = format!("1:ro,start=8,sectors=16,key-file={path}");
+            assert_eq!(parse_disk(&value).unwrap(), ((1, BLK_RO, 8, 16), Some(path)));
+        }
+        assert_eq!(parse_disk("2,ro,start=8").unwrap(), ((2, BLK_RO, 8, 0), None));
+        assert_eq!(parse_disk("2:ro").unwrap(), ((2, BLK_RO, 0, 0), None));
+        for value in ["1,start=8,sectors=16:ro", "1,start=8:ro,sectors=16", "1:ro,start=8:ro,sectors=16:ro"] {
+            assert_eq!(parse_disk(value).unwrap(), ((1, BLK_RO, 8, 16), None));
+            let with_key = format!("{value},key-file=/key");
+            assert_eq!(parse_disk(&with_key).unwrap(), ((1, BLK_RO, 8, 16), Some("/key")));
+        }
+        assert!(parse_disk("2:root").is_err());
+        assert!(parse_disk("2,start=8,unknown=1").is_err());
+    }
+
+    #[test]
+    fn disk_options_after_key_file_fail_instead_of_changing_access() {
+        for suffix in ["ro", "volatile", "start=8", "sectors=16", "key-file=/other", "ro,start=8,sectors=16", "name,ro", "name,start=8", "name,sectors=16"] {
+            let error = parse_disk(&format!("1,key-file=/k,{suffix}")).unwrap_err();
+            assert!(error.0.contains("suboptions must precede key-file="), "{}", error.0);
+            assert!(error.0.contains("--key-file FILE"));
+        }
+        assert_eq!(parse_disk("1,ro,start=8,sectors=16,key-file=/k").unwrap(), ((1, BLK_RO, 8, 16), Some("/k")));
+        for prefix in ["1,key-file=", "1,ro,key-file="] {
+            for path in ["/keys/a:ro", "/keys/a,b:ro"] {
+                for suffix in ["", ",", ",,", ",name", ",name,"] {
+                    let value = format!("{prefix}{path}{suffix}");
+                    let error = parse_disk(&value).unwrap_err();
+                    assert!(error.0.contains("--key-file FILE"), "{value}: {}", error.0);
+                }
+            }
         }
     }
 }
