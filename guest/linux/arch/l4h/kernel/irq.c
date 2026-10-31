@@ -43,11 +43,29 @@ static void l4h_event_noop(struct irq_data *d)
 {
 }
 
+static int l4h_event_set_affinity(struct irq_data *data,
+				  const struct cpumask *mask, bool force)
+{
+	struct l4h_irq_route *route = irq_data_get_irq_chip_data(data);
+	unsigned int cpu = force ? cpumask_first(mask) :
+			   cpumask_first_and(mask, cpu_online_mask);
+	int err;
+
+	if (!route || !route->set_affinity || cpu >= nr_cpu_ids)
+		return -EINVAL;
+	err = route->set_affinity(route->data, cpu);
+	if (err)
+		return err;
+	irq_data_update_effective_affinity(data, cpumask_of(cpu));
+	return IRQ_SET_MASK_OK;
+}
+
 static struct irq_chip l4h_event_chip = {
 	.name		= "l4h-event",
 	.irq_mask	= l4h_event_noop,
 	.irq_unmask	= l4h_event_noop,
 	.irq_ack	= l4h_event_noop,
+	.irq_set_affinity = l4h_event_set_affinity,
 };
 
 static int event_domain_map(struct irq_domain *d, unsigned int virq, irq_hw_number_t hw)

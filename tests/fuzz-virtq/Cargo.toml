@@ -6,6 +6,7 @@ version = "0.1.0"
 description = "Randomised test of l4h-vmm's virtqueue parsing against hostile guests"
 
 [dependencies]
+l4h-abi = { path = "../../host/l4h-abi" }
 
 [profile.release]
 debug-assertions = true

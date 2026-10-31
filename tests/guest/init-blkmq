@@ -1,0 +1,47 @@
+#!/bin/sh
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+fail() { echo "BLKMQ: FAIL: $*"; poweroff -f; }
+echo "BLKMQ: start $(uname -r)"
+[ -b /dev/vda ] || fail 'no disk'
+# All writes target the disposable test disk.
+dd if=/dev/zero of=/dev/vda bs=1M count=64 oflag=direct 2>/dev/null || fail seed
+for c in 0 1; do
+    blkbench read /dev/vda 1 1 3 "$c" || fail read
+done
+irq=$(awk '/virtio0-q0/ {q=$1} /virtio0$/ {s=$1} END {gsub(":", "", q); gsub(":", "", s); print q ? q : s}' /proc/interrupts)
+[ -n "$irq" ] || fail 'no block IRQ'
+old=$(cat /proc/irq/$irq/smp_affinity_list)
+if echo 1 > /proc/irq/$irq/smp_affinity_list; then
+    echo "BLKMQ: IRQ affinity accepted"
+    before=$(awk -v irq="$irq:" '$1 == irq {print $3}' /proc/interrupts)
+    blkbench read /dev/vda 1 1 3 0 || fail 'affinity read'
+    after=$(awk -v irq="$irq:" '$1 == irq {print $3}' /proc/interrupts)
+    [ "$after" -gt "$before" ] || fail 'IRQ did not move to CPU1'
+    blkbench read /dev/vda 4 8 3 0 > /tmp/live &
+    live=$!
+    for cpu in 0 1 2 3 0; do
+        echo "$cpu" > /proc/irq/$irq/smp_affinity_list || fail 'live IRQ move'
+        usleep 10000
+    done
+    wait "$live" || fail 'I/O during IRQ moves'
+    echo "BLKMQ: live IRQ moves: ok"
+    echo "$old" > /proc/irq/$irq/smp_affinity_list || fail 'restore IRQ'
+else
+    echo "BLKMQ: IRQ affinity unsupported"
+fi
+blkbench read /dev/vda 4 8 3 0 > /tmp/warmup || fail warmup
+for op in read write; do
+    blkbench "$op" /dev/vda 2 32 3 0 || fail "$op 2 jobs"
+    blkbench "$op" /dev/vda 4 16 3 0 || fail "$op 4 jobs"
+done
+blkbench check /dev/vda || fail 'parallel data check'
+cat /proc/interrupts
+ls /sys/block/vda/mq
+# Reset the device, then verify the data after the driver binds again.
+echo virtio0 > /sys/bus/virtio/drivers/virtio_blk/unbind || fail unbind
+echo virtio0 > /sys/bus/virtio/drivers/virtio_blk/bind || fail bind
+blkbench verify /dev/vda || fail 'data after reset'
+echo "BLKMQ: PASS"
+poweroff -f

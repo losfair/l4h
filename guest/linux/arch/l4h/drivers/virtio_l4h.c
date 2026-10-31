@@ -16,6 +16,7 @@
 
 #include <linux/init.h>
 #include <linux/interrupt.h>
+#include <linux/irq.h>
 #include <linux/io.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
@@ -29,6 +30,16 @@
 #include <irq_kern.h>
 #include <l4h_sys.h>
 
+struct virtio_l4h_device;
+struct virtio_l4h_queue_irq {
+	struct virtio_l4h_device *device;
+	struct virtqueue *vq;
+	unsigned int index;
+	int irq;
+	struct l4h_irq_route route;
+	char name[32];
+};
+
 struct virtio_l4h_device {
 	struct virtio_device vdev;
 	unsigned int index;			/* boot info device index */
@@ -36,6 +47,8 @@ struct virtio_l4h_device {
 	void *config;
 	unsigned long kick_cap;
 	int irq;
+	struct l4h_irq_route irq_route;
+	struct virtio_l4h_queue_irq queue_irq[L4H_VIRTIO_QUEUE_IRQS];
 };
 
 #define to_vl4h(_vdev) container_of(_vdev, struct virtio_l4h_device, vdev)
@@ -51,6 +64,30 @@ static unsigned long vl4h_op(struct virtio_l4h_device *d, unsigned long op, unsi
 	/* Make the register writes visible to the backend first. */
 	smp_wmb();
 	return l4h_hypercall(L4H_HC_DEV_WRITE, mrs, 4, 1);
+}
+
+static int vl4h_set_irq_cpu(void *data, unsigned int cpu)
+{
+	struct virtio_l4h_device *d = data;
+
+	WRITE_ONCE(d->regs->irq_vcpu, cpu);
+	return vl4h_op(d, L4H_VIRTIO_OP_IRQ_VCPU, 0, 0) ? -EINVAL : 0;
+}
+
+static int vl4h_set_queue_cpu(void *data, unsigned int cpu)
+{
+	struct virtio_l4h_queue_irq *q = data;
+	struct virtio_l4h_device *d = q->device;
+
+	WRITE_ONCE(d->regs->queue_irq_vcpu[q->index], cpu);
+	return vl4h_op(d, L4H_VIRTIO_OP_IRQ_VCPU, q->index + 1, 0) ? -EINVAL : 0;
+}
+
+static irqreturn_t vl4h_queue_interrupt(int irq, void *data)
+{
+	struct virtio_l4h_queue_irq *q = data;
+
+	return vring_interrupt(irq, q->vq);
 }
 
 static u64 vl4h_get_features(struct virtio_device *vdev)
@@ -165,6 +202,17 @@ static void vl4h_del_vq(struct virtqueue *vq)
 
 	WRITE_ONCE(q->ready, 0);
 	vl4h_op(d, L4H_VIRTIO_OP_QUEUE, vq->index, 0);
+	if (vq->index < L4H_VIRTIO_QUEUE_IRQS) {
+		struct virtio_l4h_queue_irq *irq = &d->queue_irq[vq->index];
+
+		if (irq->irq >= 0) {
+			irq_update_affinity_hint(irq->irq, NULL);
+			free_irq(irq->irq, irq);
+			irq_set_chip_data(irq->irq, NULL);
+			irq->irq = -1;
+			irq->vq = NULL;
+		}
+	}
 	vring_del_virtqueue(vq);
 }
 
@@ -182,7 +230,13 @@ static void vl4h_del_vqs(struct virtio_device *vdev)
 
 static void vl4h_synchronize_cbs(struct virtio_device *vdev)
 {
-	synchronize_irq(to_vl4h(vdev)->irq);
+	struct virtio_l4h_device *d = to_vl4h(vdev);
+	unsigned int q;
+
+	synchronize_irq(d->irq);
+	for (q = 0; q < L4H_VIRTIO_QUEUE_IRQS; q++)
+		if (d->queue_irq[q].irq >= 0)
+			synchronize_irq(d->queue_irq[q].irq);
 }
 
 static struct virtqueue *vl4h_setup_vq(struct virtio_device *vdev, unsigned int index,
@@ -192,7 +246,8 @@ static struct virtqueue *vl4h_setup_vq(struct virtio_device *vdev, unsigned int 
 	struct virtio_l4h_device *d = to_vl4h(vdev);
 	struct l4h_virtq_regs *q;
 	struct virtqueue *vq;
-	unsigned int num;
+	unsigned int num, base;
+	int err;
 
 	if (!name)
 		return NULL;
@@ -223,7 +278,44 @@ static struct virtqueue *vl4h_setup_vq(struct virtio_device *vdev, unsigned int 
 		vring_del_virtqueue(vq);
 		return ERR_PTR(-EINVAL);
 	}
+	base = READ_ONCE(d->regs->queue_event_base);
+	if (base && callback) {
+		struct virtio_l4h_queue_irq *irq;
+		unsigned int cpu;
+
+		if (index >= L4H_VIRTIO_QUEUE_IRQS || base >= L4H_NR_EVENTS ||
+		    index >= L4H_NR_EVENTS - base) {
+			err = -EINVAL;
+			goto fail;
+		}
+		irq = &d->queue_irq[index];
+		irq->device = d;
+		irq->vq = vq;
+		irq->index = index;
+		irq->irq = l4h_event_irq(base + index);
+		if (irq->irq < 0) {
+			err = irq->irq;
+			goto fail;
+		}
+		irq->route.set_affinity = vl4h_set_queue_cpu;
+		irq->route.data = irq;
+		irq_set_chip_data(irq->irq, &irq->route);
+		snprintf(irq->name, sizeof(irq->name), "%s-q%u", dev_name(&vdev->dev), index);
+		err = request_irq(irq->irq, vl4h_queue_interrupt, 0, irq->name, irq);
+		if (err) {
+			irq_set_chip_data(irq->irq, NULL);
+			irq->irq = -1;
+			goto fail;
+		}
+		cpu = cpumask_nth(index % num_online_cpus(), cpu_online_mask);
+		err = irq_set_affinity_and_hint(irq->irq, cpumask_of(cpu));
+		if (err)
+			goto fail;
+	}
 	return vq;
+fail:
+	vl4h_del_vq(vq);
+	return ERR_PTR(err);
 }
 
 static int vl4h_find_vqs(struct virtio_device *vdev, unsigned int nvqs, struct virtqueue *vqs[],
@@ -257,20 +349,30 @@ static const char *vl4h_bus_name(struct virtio_device *vdev)
 	return "l4h";
 }
 
-static int vl4h_set_vq_affinity(struct virtqueue *vq, const struct cpumask *cpu_mask)
+static int vl4h_vq_irq(struct virtio_l4h_device *d, unsigned int index)
+{
+	if (index < L4H_VIRTIO_QUEUE_IRQS && d->queue_irq[index].irq >= 0)
+		return d->queue_irq[index].irq;
+	return d->irq;
+}
+
+static int vl4h_set_vq_affinity(struct virtqueue *vq, const struct cpumask *mask)
 {
 	struct virtio_l4h_device *d = to_vl4h(vq->vdev);
-	unsigned int cpu;
+	int irq = vl4h_vq_irq(d, vq->index);
 
-	/* NULL clears the hint (virtio-net when it removes its queues). */
-	if (!cpu_mask)
-		return irq_update_affinity_hint(d->irq, NULL);
-	cpu = cpumask_first(cpu_mask);
-	if (cpu >= nr_cpu_ids)
-		return 0;
-	WRITE_ONCE(d->regs->irq_vcpu, cpu);
-	vl4h_op(d, L4H_VIRTIO_OP_IRQ_VCPU, 0, 0);
-	return irq_set_affinity_hint(d->irq, cpumask_of(cpu));
+	if (!mask)
+		return irq_update_affinity_hint(irq, NULL);
+	return irq_set_affinity_and_hint(irq, mask);
+}
+
+static const struct cpumask *vl4h_get_vq_affinity(struct virtio_device *vdev, int index)
+{
+	struct virtio_l4h_device *d = to_vl4h(vdev);
+
+	if (index < 0)
+		return NULL;
+	return irq_get_affinity_mask(vl4h_vq_irq(d, index));
 }
 
 static const struct virtio_config_ops virtio_l4h_config_ops = {
@@ -286,14 +388,17 @@ static const struct virtio_config_ops virtio_l4h_config_ops = {
 	.finalize_features = vl4h_finalize_features,
 	.bus_name	= vl4h_bus_name,
 	.set_vq_affinity = vl4h_set_vq_affinity,
+	.get_vq_affinity = vl4h_get_vq_affinity,
 	.synchronize_cbs = vl4h_synchronize_cbs,
 };
 
 static void vl4h_release_dev(struct device *dev)
 {
 	struct virtio_device *vdev = dev_to_virtio(dev);
+	struct virtio_l4h_device *d = to_vl4h(vdev);
 
-	kfree(to_vl4h(vdev));
+	irq_set_chip_data(d->irq, NULL);
+	kfree(d);
 }
 
 /* The parent of all virtio-l4h devices: their DMA goes through the pool. */
@@ -347,11 +452,16 @@ static int __init virtio_l4h_init(void)
 		d->config = (void *)desc->page_va + L4H_VIRTIO_CONFIG_OFF;
 		d->kick_cap = L4H_CPTR2(L4H_SLOT_DEV_CNODE, desc->kick_slot);
 		d->irq = irq;
+		for (unsigned int q = 0; q < L4H_VIRTIO_QUEUE_IRQS; q++)
+			d->queue_irq[q].irq = -1;
 		if (READ_ONCE(d->regs->magic) != L4H_VIRTIO_MAGIC) {
 			pr_err("virtio-l4h: device %u: bad magic\n", i);
 			kfree(d);
 			continue;
 		}
+		d->irq_route.set_affinity = vl4h_set_irq_cpu;
+		d->irq_route.data = d;
+		irq_set_chip_data(d->irq, &d->irq_route);
 		d->vdev.id.device = READ_ONCE(d->regs->device_id);
 		d->vdev.id.vendor = READ_ONCE(d->regs->vendor_id);
 		d->vdev.config = &virtio_l4h_config_ops;

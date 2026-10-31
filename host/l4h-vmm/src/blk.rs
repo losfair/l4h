@@ -19,6 +19,8 @@ const VIRTIO_BLK_F_SEG_MAX: u64 = 1 << 2;
 const VIRTIO_BLK_F_RO: u64 = 1 << 5;
 const VIRTIO_BLK_F_BLK_SIZE: u64 = 1 << 6;
 const VIRTIO_BLK_F_FLUSH: u64 = 1 << 9;
+const VIRTIO_BLK_F_MQ: u64 = 1 << 12;
+pub const MAX_QUEUES: usize = l4h_abi::VIRTIO_QUEUE_IRQS;
 
 const VIRTIO_BLK_S_OK: u8 = 0;
 const VIRTIO_BLK_S_IOERR: u8 = 1;
@@ -55,14 +57,19 @@ pub struct Blk {
     block_size: u32,
     /// Largest data segment (see size_max).
     size_max: u32,
-    /// Requests submitted to blkd, by chain head: at most one per head.
-    inflight: [Option<Inflight>; QUEUE_SIZE as usize],
+    /// Requests submitted to blkd, by queue and chain head.
+    inflight: [[Option<Inflight>; QUEUE_SIZE as usize]; MAX_QUEUES],
+    nr_queues: usize,
     /// Requests of this generation blkd has not completed yet.
     outstanding: usize,
     /// Bumped on reset, so completions of earlier requests are dropped.
     generation: u32,
-    /// A chain popped from the queue that did not fit in the channel.
-    stalled: Option<u16>,
+    /// A popped chain per queue that waits for channel space or a flush.
+    stalled: [Option<u16>; MAX_QUEUES],
+    /// A flush waits for earlier requests, then excludes later requests.
+    fence: Option<usize>,
+    flush_inflight: bool,
+    deferred: u64,
 }
 
 impl Blk {
@@ -72,7 +79,9 @@ impl Blk {
         Blk {
             chan: core::ptr::null_mut(), kick: None, capacity: 0, read_only: true,
             block_size: 512, size_max: size_max(pool),
-            inflight: [None; QUEUE_SIZE as usize], outstanding: 0, generation: 0, stalled: None,
+            inflight: [[None; QUEUE_SIZE as usize]; MAX_QUEUES], nr_queues: 1,
+            outstanding: 0, generation: 0, stalled: [None; MAX_QUEUES],
+            fence: None, flush_inflight: false, deferred: 0,
         }
     }
 
@@ -95,10 +104,11 @@ impl Blk {
             read_only,
             block_size,
             size_max: size_max(pool).max(block_size),
-            inflight: [None; QUEUE_SIZE as usize],
+            inflight: [[None; QUEUE_SIZE as usize]; MAX_QUEUES],
+            nr_queues: MAX_QUEUES,
             outstanding: 0,
             generation: 0,
-            stalled: None,
+            stalled: [None; MAX_QUEUES], fence: None, flush_inflight: false, deferred: 0,
         }
     }
 
@@ -118,31 +128,34 @@ impl Blk {
 
     /// The response `id` of this generation arrived: the request it
     /// identifies, if it was in flight.
-    fn retire(&mut self, id: u64) -> Option<(u16, Inflight)> {
-        if (id >> 32) as u32 != self.generation {
-            return None;
-        }
+    fn retire(&mut self, id: u64) -> Option<(usize, u16, Inflight)> {
+        if (id >> 32) as u32 != self.generation { return None; }
+        let q = ((id >> 16) & 0xffff) as usize;
         let h = id as u16;
-        let inf = self.inflight.get_mut(h as usize).and_then(|i| i.take())?;
+        let inf = self.inflight.get_mut(q)?.get_mut(h as usize)?.take()?;
         self.outstanding -= 1;
-        Some((h, inf))
+        if self.flush_inflight && self.fence == Some(q) {
+            self.flush_inflight = false;
+            self.fence = None;
+        }
+        Some((q, h, inf))
     }
 
     /// Handle one chain.  Returns false if it must wait for channel space.
-    fn submit(&mut self, mem: &GuestMem, q: &mut Queue, head: u16) -> bool {
+    fn submit(&mut self, mem: &GuestMem, q: &mut Queue, qi: usize, head: u16) -> bool {
         // The driver offered a chain blkd still owns.  Requests are known
         // by their head, so drop this one: the head returns to the driver
         // once, when the first request completes.  A correct driver never
         // does this.
-        if self.inflight.get(head as usize).is_some_and(|i| i.is_some()) {
+        if self.inflight[qi].get(head as usize).is_some_and(|i| i.is_some()) {
             return true;
         }
         let mut bufs = ArrayVec::<Buf, { QUEUE_SIZE as usize }>::new();
         let ok = q.chain(mem, head, &mut bufs).is_ok();
-        self.submit_bufs(mem, q, head, ok, &bufs)
+        self.submit_bufs(mem, q, qi, head, ok, &bufs)
     }
 
-    fn submit_bufs(&mut self, mem: &GuestMem, q: &mut Queue, head: u16, ok: bool, bufs: &[Buf]) -> bool {
+    fn submit_bufs(&mut self, mem: &GuestMem, q: &mut Queue, qi: usize, head: u16, ok: bool, bufs: &[Buf]) -> bool {
         // Header first (16 bytes, readable), status byte last (writable).
         let last = bufs.last();
         let valid = ok
@@ -217,7 +230,7 @@ impl Blk {
                     None
                 }
             }
-            blk::OP_FLUSH => None,
+            blk::OP_FLUSH => if req.nr_segs == 0 { None } else { Some(VIRTIO_BLK_S_IOERR) },
             blk::OP_GET_ID => {
                 if fits && req.nr_segs == 1 && req.segs[0].flags & blk::SEG_WRITE != 0 {
                     None
@@ -231,12 +244,15 @@ impl Blk {
             Self::finish(mem, q, head, status_gpa, s, 1);
             return true;
         }
-        if self.sq_full() {
-            return false;
+        if ty == blk::OP_FLUSH {
+            self.fence = Some(qi);
+            if self.outstanding != 0 { return false; }
         }
-        req.id = ((self.generation as u64) << 32) | head as u64;
+        if self.sq_full() { return false; }
+        req.id = ((self.generation as u64) << 32) | ((qi as u64) << 16) | head as u64;
         let written = u32::try_from(written).unwrap_or(u32::MAX);
-        self.inflight[head as usize] = Some(Inflight { status_gpa, written });
+        self.inflight[qi][head as usize] = Some(Inflight { status_gpa, written });
+        if ty == blk::OP_FLUSH { self.flush_inflight = true; }
         self.outstanding += 1;
         unsafe {
             let h = addr_of!((*self.chan).sq.head).read_volatile();
@@ -245,6 +261,19 @@ impl Blk {
             addr_of_mut!((*self.chan).sq.head).write_volatile(h.wrapping_add(1));
         }
         true
+    }
+
+    fn response(&mut self, mem: &GuestMem, queues: &mut [Queue], resp: blk::Resp, drop_queue: Option<usize>) -> u64 {
+        let Some((q, head, inf)) = self.retire(resp.id) else { return 0; };
+        if drop_queue == Some(q) || !queues[q].ready { return 0; }
+        let status = match resp.status {
+            blk::STATUS_OK => VIRTIO_BLK_S_OK,
+            blk::STATUS_UNSUPP => VIRTIO_BLK_S_UNSUPP,
+            _ => VIRTIO_BLK_S_IOERR,
+        };
+        let written = if status == VIRTIO_BLK_S_OK { inf.written } else { 1 };
+        Self::finish(mem, &mut queues[q], head, inf.status_gpa, status, written);
+        1 << q
     }
 }
 
@@ -255,14 +284,17 @@ impl Backend for Blk {
 
     fn features(&self) -> u64 {
         let mut f = VIRTIO_BLK_F_SIZE_MAX | VIRTIO_BLK_F_SEG_MAX | VIRTIO_BLK_F_BLK_SIZE | VIRTIO_BLK_F_FLUSH | VIRTIO_RING_F_INDIRECT_DESC;
-        if self.read_only {
-            f |= VIRTIO_BLK_F_RO;
-        }
+        if self.read_only { f |= VIRTIO_BLK_F_RO; }
+        if !self.chan.is_null() { f |= VIRTIO_BLK_F_MQ; }
         f
     }
 
-    fn num_queues(&self) -> usize {
-        1
+    fn num_queues(&self) -> usize { self.nr_queues }
+
+    fn queue_irqs(&self) -> bool { !self.chan.is_null() }
+
+    fn features_accepted(&mut self, features: u64) {
+        self.nr_queues = if features & VIRTIO_BLK_F_MQ != 0 { MAX_QUEUES } else { 1 };
     }
 
     fn queue_max(&self, _q: usize) -> u32 {
@@ -275,14 +307,22 @@ impl Backend for Blk {
         config[12..16].copy_from_slice(&SEG_MAX.to_le_bytes());
 
         config[20..24].copy_from_slice(&self.block_size.to_le_bytes());
+        if !self.chan.is_null() { config[34..36].copy_from_slice(&(MAX_QUEUES as u16).to_le_bytes()); }
     }
 
     fn kick(&mut self, mem: &GuestMem, queues: &mut [Queue], q: usize) -> bool {
+        let bit = 1 << q;
+        if !queues[q].ready { self.deferred &= !bit; return false; }
+        if self.flush_inflight || self.fence.is_some_and(|owner| owner != q) {
+            self.deferred |= bit;
+            return false;
+        }
+        self.deferred &= !bit;
         let queue = &mut queues[q];
         let mut returned = false;
         let mut submitted = false;
         loop {
-            let head = match self.stalled.take() {
+            let head = match self.stalled[q].take() {
                 Some(h) => h,
                 None => match queue.pop(mem) {
                     Some(h) => h,
@@ -290,8 +330,8 @@ impl Backend for Blk {
                 },
             };
             let used_before = queue_used_count(queue);
-            if !self.submit(mem, queue, head) {
-                self.stalled = Some(head);
+            if !self.submit(mem, queue, q, head) {
+                self.stalled[q] = Some(head);
                 break;
             }
             if queue_used_count(queue) != used_before {
@@ -299,6 +339,7 @@ impl Backend for Blk {
             } else {
                 submitted = true;
             }
+            if self.fence.is_some() { self.deferred |= bit; break; }
         }
         if submitted {
             self.kick.as_ref().expect("live block backend").signal();
@@ -308,44 +349,37 @@ impl Backend for Blk {
 
     fn complete(&mut self, mem: &GuestMem, queues: &mut [Queue]) -> bool {
         if self.chan.is_null() { return false; }
-        let queue = &mut queues[0];
-        let mut returned = false;
+        let mut returned = 0;
         unsafe {
             loop {
                 let tail = addr_of!((*self.chan).cq.tail).read_volatile();
                 let head = addr_of!((*self.chan).cq.head).read_volatile();
-                if tail == head {
-                    break;
-                }
+                if tail == head { break; }
                 fence(Ordering::Acquire);
                 let resp = addr_of!((*self.chan).resps[tail as usize % blk::RING_SIZE]).read_volatile();
                 addr_of_mut!((*self.chan).cq.tail).write_volatile(tail.wrapping_add(1));
-                let Some((h, inf)) = self.retire(resp.id) else {
-                    continue;
-                };
-                if !queue.ready {
-                    continue;
-                }
-                let status = match resp.status {
-                    blk::STATUS_OK => VIRTIO_BLK_S_OK,
-                    blk::STATUS_UNSUPP => VIRTIO_BLK_S_UNSUPP,
-                    _ => VIRTIO_BLK_S_IOERR,
-                };
-                let written = if status == VIRTIO_BLK_S_OK { inf.written } else { 1 };
-                Self::finish(mem, queue, h, inf.status_gpa, status, written);
-                returned = true;
+                returned |= self.response(mem, queues, resp, None);
             }
         }
-        returned
+        returned != 0
     }
 
     fn pending(&self) -> bool {
-        !self.chan.is_null() && (self.stalled.is_some()
+        !self.chan.is_null() && (self.deferred != 0 || self.stalled.iter().any(Option::is_some)
             || unsafe { addr_of!((*self.chan).cq.tail).read_volatile() != addr_of!((*self.chan).cq.head).read_volatile() })
     }
 
+    fn retry_queues(&self) -> u64 {
+        self.stalled.iter().enumerate().fold(self.deferred, |mask, (q, head)| {
+            if head.is_some() { mask | (1 << q) } else { mask }
+        })
+    }
+
     fn drain(&mut self) {
-        self.stalled = None;
+        self.stalled = [None; MAX_QUEUES];
+        self.fence = None;
+        self.flush_inflight = false;
+        self.deferred = 0;
         while self.outstanding != 0 {
             unsafe {
                 let tail = addr_of!((*self.chan).cq.tail).read_volatile();
@@ -365,11 +399,37 @@ impl Backend for Blk {
         self.generation = self.generation.wrapping_add(1);
     }
 
+    fn drain_queue(&mut self, mem: &GuestMem, queues: &mut [Queue], q: usize) -> u64 {
+        self.stalled[q] = None;
+        self.deferred &= !(1 << q);
+        let mut completed = 0;
+        while self.outstanding != 0 {
+            unsafe {
+                let tail = addr_of!((*self.chan).cq.tail).read_volatile();
+                if tail == addr_of!((*self.chan).cq.head).read_volatile() {
+                    sel4::r#yield();
+                    continue;
+                }
+                fence(Ordering::Acquire);
+                let resp = addr_of!((*self.chan).resps[tail as usize % blk::RING_SIZE]).read_volatile();
+                addr_of_mut!((*self.chan).cq.tail).write_volatile(tail.wrapping_add(1));
+                completed |= self.response(mem, queues, resp, Some(q));
+            }
+        }
+        if self.fence == Some(q) { self.fence = None; self.flush_inflight = false; }
+        self.generation = self.generation.wrapping_add(1);
+        completed
+    }
+
     fn reset(&mut self) {
         self.generation = self.generation.wrapping_add(1);
-        self.inflight = [None; QUEUE_SIZE as usize];
+        self.inflight = [[None; QUEUE_SIZE as usize]; MAX_QUEUES];
         self.outstanding = 0;
-        self.stalled = None;
+        self.nr_queues = if self.chan.is_null() { 1 } else { MAX_QUEUES };
+        self.stalled = [None; MAX_QUEUES];
+        self.fence = None;
+        self.flush_inflight = false;
+        self.deferred = 0;
     }
 }
 

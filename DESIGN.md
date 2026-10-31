@@ -1546,7 +1546,7 @@ bootconfig and a display stay off.
 
 ## 8. Devices
 
-### 8.1 Transport: `virtio-l4h` (guest side, about 600 LOC)
+### 8.1 Transport: `virtio-l4h` (guest side)
 
 Linux virtio already allows custom transports; `virtio_mmio`, `virtio_ccw`
 and `vdpa` are existing examples. `virtio-l4h` provides `virtio_config_ops`
@@ -1563,7 +1563,15 @@ for each device, with no trapped accesses:
   avoided.
 - **Device interrupt.** The VMM sets an event bit in the target vCPU's event
   page, then signals `N_v`. The `l4h-irq` irqchip maps event bits to Linux
-  IRQs. Interrupt affinity is set through the same `seL4_Call`.
+  IRQs. Virtio event owners implement `irq_set_affinity`, so standard Linux
+  IRQ affinity writes update the VMM route and effective CPU mask.
+- **Queue interrupts.** Virtio block queues have separate events and CPU targets. The transport
+  reports these masks to Linux's block queue mapper. Other devices retain
+  their device event and CPU target.
+  Queue events occupy `80 + 4 * device_index` through that value plus three.
+  The 64 device slots therefore use at most event 335 of the existing 512.
+  The device page uses reserved fields for the queue event base and four
+  CPU targets. A queue target of `UINT32_MAX` retains the device event.
 - Discovery happens through the boot-info device table, not PCI or DT
   probing. Vrings and every buffer live in the guest's host-owned I/O
   pool and are addressed by GPA (§15.1). `VIRTIO_F_ACCESS_PLATFORM` is
@@ -1580,6 +1588,16 @@ volume starting at sector zero. There is no image format, host filesystem,
 thin provisioning or copy-on-write.
 
 - Guest `virtio_blk` → l4h-vmm → per-client shared queue → blkd → device.
+- **Guest queues.** Writable and read-only volumes offer four request queues
+  through `VIRTIO_BLK_F_MQ`. Linux can select fewer queues for fewer CPUs.
+  Requests include the queue, chain head and generation. Completions return
+  only to that queue. The VMM visits queues in round-robin order and signals
+  only queues whose used ring changed. Completion retries visit blocked
+  queues, without reading every idle queue's shared available ring.
+- **Flush and reset.** A flush waits for accepted requests from every queue.
+  Later requests wait until the flush completes. Reset drains all accepted
+  work before buffers can be reused. Reset of one queue returns completions
+  to other queues and drops only the reset queue's completions.
 - **Legacy devices.** Every virtio device the host drives (virtio-blk,
   virtio-scsi, virtio-net and the balloon) may also be a legacy (0.9.5)
   one: transitional device ID, registers in I/O BAR 0, no virtio
@@ -1624,7 +1642,11 @@ thin provisioning or copy-on-write.
   disks fail with `EIO`, and the host boots without them.
   blkd clients and quarantine are per controller: a drain
   timeout fails every disk of it. Requests become
-  READ/WRITE(10 or 16) and SYNCHRONIZE CACHE commands, split when they
+  READ/WRITE(10 or 16) and SYNCHRONIZE CACHE commands. The driver uses up to
+  four offered request queues, with one bounded slot table and MSI-X vector.
+  Submission batches rotate between queues, with one notification per batch.
+  Each command retains its queue for
+  completion and retry. Provisioning uses queue zero. Requests split when they
   exceed the device's `seg_max` or `max_sectors`. Write protection and the
   write cache come from MODE SENSE; unit attentions and busy statuses are
   retried. Indirect descriptors are used when offered; otherwise each

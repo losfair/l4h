@@ -323,11 +323,15 @@ struct l4h_bootinfo {
  * then committed with L4H_HC_DEV_WRITE(device index, L4H_VIRTIO_OP_*).
  * Queue notifications: the guest atomically sets bit q in `kick` and then
  * signals the device's kick notification (L4H_SLOT_DEV_CNODE[kick_slot]).
- * Interrupts: the host atomically sets bits in `isr` and raises the
- * device's event line on the vCPU in `irq_vcpu`.
+ * Device interrupts set `isr` and raise the boot-info event on `irq_vcpu`.
+ * A valid queue_irq_vcpu[q] instead routes queue q to queue_event_base + q.
+ * Such queue events do not use the shared `isr`. IRQ_VCPU commits a route.
+ * Queue event slots are separate from all boot-info device event slots.
  */
 #define L4H_VIRTIO_MAGIC        0x7634686cu /* "lh4v" */
 #define L4H_VIRTIO_MAX_QUEUES   16
+#define L4H_VIRTIO_QUEUE_IRQS    4
+#define L4H_VIRTIO_QUEUE_EVENT_BASE (16 + L4H_MAX_DEVICES)
 #define L4H_VIRTIO_CONFIG_OFF   2048
 #define L4H_VIRTIO_CONFIG_SIZE  2048
 
@@ -357,8 +361,11 @@ struct l4h_virtio_regs {
 	l4h_u32 isr;
 	l4h_u64 kick;
 	l4h_u32 irq_vcpu;
-	l4h_u32 reserved0;
-	l4h_u64 reserved[3];
+	/* Zero uses the device IRQ. Otherwise each queue has its own event. */
+	l4h_u32 queue_event_base;
+	/* UINT32_MAX uses irq_vcpu and the device IRQ for this queue. */
+	l4h_u32 queue_irq_vcpu[L4H_VIRTIO_QUEUE_IRQS];
+	l4h_u64 reserved;
 	struct l4h_virtq_regs queues[L4H_VIRTIO_MAX_QUEUES];
 };
 
@@ -367,7 +374,7 @@ enum l4h_virtio_op {
 	L4H_VIRTIO_OP_FEATURES = 2,     /* driver_features written */
 	L4H_VIRTIO_OP_QUEUE = 3,        /* MR2 = queue index: ready/num/addresses */
 	L4H_VIRTIO_OP_CONFIG = 4,       /* MR2 = offset, MR3 = length written */
-	L4H_VIRTIO_OP_IRQ_VCPU = 5,     /* irq_vcpu written */
+	L4H_VIRTIO_OP_IRQ_VCPU = 5,     /* MR2=0: device, MR2=q+1: queue */
 };
 
 /* ------------------------------------------------------------------------

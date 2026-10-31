@@ -180,6 +180,9 @@ pub const BOOT_DOM0: u64 = 1 << 0;
 
 pub const VIRTIO_MAGIC: u32 = 0x7634_686c;
 pub const VIRTIO_MAX_QUEUES: usize = 16;
+pub const VIRTIO_QUEUE_IRQS: usize = 4;
+pub const VIRTIO_QUEUE_EVENT_BASE: usize = 16 + MAX_DEVICES;
+const _: () = assert!(VIRTIO_QUEUE_EVENT_BASE + MAX_DEVICES * VIRTIO_QUEUE_IRQS <= NR_EVENTS);
 pub const VIRTIO_CONFIG_OFF: usize = 2048;
 pub const VIRTIO_CONFIG_SIZE: usize = 2048;
 pub const VIRTIO_ISR_VRING: u32 = 1;
@@ -211,8 +214,9 @@ pub struct VirtioRegs {
     pub isr: u32,
     pub kick: u64,
     pub irq_vcpu: u32,
-    pub reserved0: u32,
-    pub reserved: [u64; 3],
+    pub queue_event_base: u32,
+    pub queue_irq_vcpu: [u32; VIRTIO_QUEUE_IRQS],
+    pub reserved: u64,
     pub queues: [VirtqRegs; VIRTIO_MAX_QUEUES],
 }
 

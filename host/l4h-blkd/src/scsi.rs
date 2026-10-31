@@ -21,6 +21,8 @@ use crate::{DevInfo, Driver, MAX_PIECES, Seg};
 
 /// The request queue; 0 and 1 are the control and event queues, unused.
 const REQUEST_QUEUE: u16 = 2;
+const MAX_QUEUES: usize = 4;
+const CFG_NUM_QUEUES: usize = 0;
 /// Commands in flight.
 const MAX_SLOTS: usize = blk::RING_SIZE;
 /// Descriptors of a command: header, data pieces, response.
@@ -116,6 +118,7 @@ struct Slot {
     /// Request this command belongs to.
     req: u16,
     busy: bool,
+    queue: usize,
     retries: u8,
     /// Head descriptor in the ring.
     head: u16,
@@ -165,7 +168,9 @@ pub struct VirtioScsi {
     id: u32,
     io_errors: l4h_rt::ErrorLimit,
     t: Transport,
-    vq: Virtq,
+    vqs: ArrayVec<Virtq, MAX_QUEUES>,
+    next_queue: usize,
+    kick_queues: u8,
     indirect: bool,
     slots: ArrayVec<Slot, MAX_SLOTS>,
     free: ArrayVec<u16, MAX_SLOTS>,
@@ -239,6 +244,31 @@ impl VirtioScsi {
                 .expect("blkd: virtio-scsi request queue");
             (Transport::Modern(dev), indirect, vq)
         };
+        let mut vqs = ArrayVec::new();
+        let _ = vqs.push(vq);
+        let count = (t.cfg32(CFG_NUM_QUEUES) as usize).clamp(1, MAX_QUEUES);
+        for q in 1..count {
+            let index = REQUEST_QUEUE + q as u16;
+            let queue = match &t {
+                Transport::Modern(dev) => dev.setup_queue(&mut dma, index, vqs[0].num, 0),
+                Transport::Legacy(p) => {
+                    p.out16(legacy::QUEUE_SELECT, index);
+                    let num = p.in16(legacy::QUEUE_SIZE);
+                    if num == 0 { break; }
+                    let (va, pa) = dma.alloc(legacy_ring_size(num), 4096);
+                    p.out32(legacy::QUEUE_PFN, (pa >> 12) as u32);
+                    p.out16(legacy::QUEUE_VECTOR, 0);
+                    if p.in16(legacy::QUEUE_VECTOR) != 0 {
+                        p.out32(legacy::QUEUE_PFN, 0);
+                        break;
+                    }
+                    Some(Virtq::legacy(index, num, va))
+                }
+            };
+            let Some(queue) = queue else { break; };
+            let _ = vqs.push(queue);
+        }
+        l4h_rt::info!("blkd {:#x}: virtio-scsi {} request queues", id, vqs.len());
         t.set_cfg32(CFG_CDB_SIZE, CDB_SIZE);
         t.set_cfg32(CFG_SENSE_SIZE, SENSE_SIZE);
         let (cdb_size, sense_size) = (t.cfg32(CFG_CDB_SIZE), t.cfg32(CFG_SENSE_SIZE));
@@ -256,14 +286,15 @@ impl VirtioScsi {
         let max_target = t.cfg16(CFG_MAX_TARGET).min(255) as u8;
 
         // Without indirect descriptors, each slot owns MAX_DESCS ring entries.
-        let nslots = if indirect { vq.num as usize } else { vq.num as usize / MAX_DESCS }.min(MAX_SLOTS);
-        assert!(nslots > 0, "blkd {:#x}: virtio-scsi queue of {} entries too small", id, vq.num);
+        let num = vqs.iter().map(|q| q.num as usize).min().unwrap();
+        let nslots = if indirect { num } else { num / MAX_DESCS }.min(MAX_SLOTS);
+        assert!(nslots > 0, "blkd {:#x}: virtio-scsi queue of {} entries too small", id, num);
         let (mut slots, mut free, mut free_reqs) = (ArrayVec::new(), ArrayVec::new(), ArrayVec::new());
         for s in 0..nslots {
             let (table_va, table_pa) = if indirect { dma.alloc(MAX_DESCS * 16, 16) } else { (0, 0) };
             let (hdr_va, hdr_pa) = dma.alloc(HDR_BYTES + RESP_BYTES, 64);
             let head = if indirect { s } else { s * MAX_DESCS } as u16;
-            let _ = slots.push(Slot { req: 0, busy: false, retries: 0, head, table_va, table_pa, hdr_va, hdr_pa });
+            let _ = slots.push(Slot { req: 0, busy: false, queue: 0, retries: 0, head, table_va, table_pa, hdr_va, hdr_pa });
             let _ = free.push((nslots - 1 - s) as u16);
             let _ = free_reqs.push((nslots - 1 - s) as u16);
         }
@@ -273,7 +304,7 @@ impl VirtioScsi {
         }
         let (buf_va, buf_pa) = dma.alloc(4096, 4096);
         let mut s = VirtioScsi {
-            id, t, vq, indirect,
+            id, t, vqs, next_queue: 0, kick_queues: 0, indirect,
             io_errors: l4h_rt::ErrorLimit::new(),
             free,
             slots,
@@ -421,10 +452,10 @@ impl VirtioScsi {
         let data = data_in.map(|(pa, len)| Seg { pa, len });
         self.fill(s, lun, cdb, data.as_slice(), data_in.is_some());
         self.slots[s as usize].busy = true;
-        self.vq.submit(self.slots[s as usize].head);
-        self.t.notify(&self.vq);
+        self.vqs[0].submit(self.slots[s as usize].head);
+        self.t.notify(&self.vqs[0]);
         let head = self.slots[s as usize].head as u32;
-        let vq = &mut self.vq;
+        let vq = &mut self.vqs[0];
         spin_until("probe command", || matches!(vq.pop_used(), Some((id, _)) if id == head));
         self.slots[s as usize].busy = false;
         let _ = self.free.push(s);
@@ -452,7 +483,7 @@ impl VirtioScsi {
 
         let n = data.len() + 2;
         let (indirect, head, table_va) = (self.indirect, slot.head, slot.table_va);
-        let vq = &self.vq;
+        let vq = &self.vqs[slot.queue];
         let desc = |i: usize, addr: u64, len: u32, flags: u16| {
             let last = i + 1 == n;
             let flags = if last { flags } else { flags | DESC_F_NEXT };
@@ -481,7 +512,7 @@ impl VirtioScsi {
             desc(n - 1, slot.hdr_pa + HDR_BYTES as u64, resp_len, DESC_F_WRITE);
         }
         if indirect {
-            self.vq.set_desc(head, slot.table_pa, (16 * n) as u32, DESC_F_INDIRECT, 0);
+            self.vqs[slot.queue].set_desc(head, slot.table_pa, (16 * n) as u32, DESC_F_INDIRECT, 0);
         }
     }
 
@@ -498,7 +529,7 @@ impl VirtioScsi {
     }
 
     /// Fill a free slot with a READ or WRITE of `data` at `lba` of `unit`.
-    fn rw(&mut self, r: u16, unit: usize, write: bool, lba: u64, data: &[Seg], bytes: u64) -> u16 {
+    fn rw(&mut self, r: u16, unit: usize, queue: usize, write: bool, lba: u64, data: &[Seg], bytes: u64) -> u16 {
         let blocks = bytes / self.units[unit].block_size as u64;
         let mut cdb = [0u8; 16];
         let len = if lba + blocks <= 1 << 32 && blocks <= 0xffff {
@@ -513,6 +544,7 @@ impl VirtioScsi {
             16
         };
         let s = self.free.pop().unwrap();
+        self.slots[s as usize].queue = queue;
         self.fill(s, self.units[unit].lun, &cdb[..len], data, !write);
         self.slots[s as usize].req = r;
         s
@@ -544,11 +576,13 @@ impl Driver for VirtioScsi {
             return Err(blk::STATUS_IOERR);
         }
         let r = self.free_reqs.pop().unwrap();
+        let queue = if tag == u64::MAX { 0 } else { self.next_queue };
         let mut issued = [0u16; MAX_SLOTS];
         let mut n_issued = 0;
         let result = (|| {
             if op == blk::OP_FLUSH {
                 let s = self.free.pop().unwrap();
+                self.slots[s as usize].queue = queue;
                 self.fill(s, self.units[unit].lun, &[SYNCHRONIZE_CACHE_10, 0, 0, 0, 0, 0, 0, 0, 0, 0], &[], false);
                 self.slots[s as usize].req = r;
                 issued[0] = s;
@@ -580,7 +614,7 @@ impl Driver for VirtioScsi {
                     }
                     cmd[n - 1].len -= excess as u32;
                     let tail = Seg { pa: cmd[n - 1].pa + cmd[n - 1].len as u64, len: excess as u32 };
-                    issued[n_issued] = self.rw(r, unit, write, lba, &cmd[..n], bytes - excess);
+                    issued[n_issued] = self.rw(r, unit, queue, write, lba, &cmd[..n], bytes - excess);
                     n_issued += 1;
                     lba += (bytes - excess) / bs;
                     (n, bytes) = (0, 0);
@@ -611,67 +645,73 @@ impl Driver for VirtioScsi {
         self.reqs[r as usize] = Request { tag, pending: n_issued as u16, status: blk::STATUS_OK };
         for &s in &issued[..n_issued] {
             self.slots[s as usize].busy = true;
-            self.vq.submit(self.slots[s as usize].head);
+            self.vqs[queue].submit(self.slots[s as usize].head);
+            self.kick_queues |= 1 << queue;
         }
         Ok(())
     }
 
     fn kick(&mut self) {
-        self.t.notify(&self.vq);
+        let queues = core::mem::take(&mut self.kick_queues);
+        if queues != 0 { self.next_queue = (self.next_queue + 1) % self.vqs.len(); }
+        for q in 0..self.vqs.len() {
+            if queues & (1 << q) != 0 { self.t.notify(&self.vqs[q]); }
+        }
     }
 
     fn reap(&mut self, done: &mut dyn FnMut(u64, u32)) {
         let mut resubmitted = false;
-        while let Some((head, _len)) = self.vq.pop_used() {
-            let s = if self.indirect { head as usize } else { head as usize / MAX_DESCS };
-            let Some(slot) = self.slots.get(s) else { continue };
-            if !slot.busy || slot.head as u32 != head {
-                continue;
-            }
-            let o = self.outcome(s as u16);
-            let retry = match (o.response, o.status) {
-                (S_RESET | S_BUSY, _) => true,
-                (S_OK, BUSY | TASK_SET_FULL) => true,
-                (S_OK, CHECK_CONDITION) => matches!(o.sense_key, Some(UNIT_ATTENTION | NOT_READY)),
-                _ => false,
-            };
-            let slot = &mut self.slots[s];
-            if retry && slot.retries < RETRIES {
-                slot.retries += 1;
-                Mmio(slot.hdr_va).w8(HDR_BYTES + RESP_RESPONSE, 0xff);
-                self.vq.submit(slot.head);
-                resubmitted = true;
-                continue;
-            }
-            slot.busy = false;
-            let r = slot.req as usize;
-            let status = match (o.response, o.status) {
-                (S_OK, GOOD) if o.residual == 0 => blk::STATUS_OK,
-                (S_OK, CHECK_CONDITION) if o.sense_key == Some(ILLEGAL_REQUEST) => blk::STATUS_UNSUPP,
-                _ => blk::STATUS_IOERR,
-            };
-            // Unsupported commands come from guests: not an error of the host.
-            if status == blk::STATUS_UNSUPP {
-                l4h_rt::info!("blkd {:#x}: virtio-scsi command unsupported by the device", self.id);
-            } else if status != blk::STATUS_OK && self.io_errors.allow() {
-                l4h_rt::log!(
-                    "blkd {:#x}: virtio-scsi command failed: response {} status {:#x} sense key {:?} residual {}",
-                    self.id, o.response, o.status, o.sense_key, o.residual
-                );
-            }
-            let _ = self.free.push(s as u16);
-            let req = &mut self.reqs[r];
-            if req.status == blk::STATUS_OK {
-                req.status = status;
-            }
-            req.pending -= 1;
-            if req.pending == 0 {
-                done(req.tag, req.status);
-                let _ = self.free_reqs.push(r as u16);
+        for q in 0..self.vqs.len() {
+            while let Some((head, _len)) = self.vqs[q].pop_used() {
+                let s = if self.indirect { head as usize } else { head as usize / MAX_DESCS };
+                let Some(slot) = self.slots.get(s) else { continue };
+                if !slot.busy || slot.queue != q || slot.head as u32 != head {
+                    continue;
+                }
+                let o = self.outcome(s as u16);
+                let retry = match (o.response, o.status) {
+                    (S_RESET | S_BUSY, _) => true,
+                    (S_OK, BUSY | TASK_SET_FULL) => true,
+                    (S_OK, CHECK_CONDITION) => matches!(o.sense_key, Some(UNIT_ATTENTION | NOT_READY)),
+                    _ => false,
+                };
+                let slot = &mut self.slots[s];
+                if retry && slot.retries < RETRIES {
+                    slot.retries += 1;
+                    Mmio(slot.hdr_va).w8(HDR_BYTES + RESP_RESPONSE, 0xff);
+                    self.vqs[q].submit(slot.head);
+                    self.kick_queues |= 1 << q;
+                    resubmitted = true;
+                    continue;
+                }
+                slot.busy = false;
+                let r = slot.req as usize;
+                let status = match (o.response, o.status) {
+                    (S_OK, GOOD) if o.residual == 0 => blk::STATUS_OK,
+                    (S_OK, CHECK_CONDITION) if o.sense_key == Some(ILLEGAL_REQUEST) => blk::STATUS_UNSUPP,
+                    _ => blk::STATUS_IOERR,
+                };
+                // Unsupported commands come from guests: not an error of the host.
+                if status == blk::STATUS_UNSUPP {
+                    l4h_rt::info!("blkd {:#x}: virtio-scsi command unsupported by the device", self.id);
+                } else if status != blk::STATUS_OK && self.io_errors.allow() {
+                    l4h_rt::log!(
+                        "blkd {:#x}: virtio-scsi command failed: response {} status {:#x} sense key {:?} residual {}",
+                        self.id, o.response, o.status, o.sense_key, o.residual
+                    );
+                }
+                let _ = self.free.push(s as u16);
+                let req = &mut self.reqs[r];
+                if req.status == blk::STATUS_OK {
+                    req.status = status;
+                }
+                req.pending -= 1;
+                if req.pending == 0 {
+                    done(req.tag, req.status);
+                    let _ = self.free_reqs.push(r as u16);
+                }
             }
         }
-        if resubmitted {
-            self.t.notify(&self.vq);
-        }
+        if resubmitted { self.kick(); }
     }
 }

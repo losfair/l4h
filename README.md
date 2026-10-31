@@ -46,8 +46,9 @@ Third-party components, including the submodules in `kernel/seL4` and
   - A virtio-gpu display (2D) for VMs, `l4hctl create --gpu WxH`, which dom0
     reads with `l4hctl screenshot`.
 - **Block.** Passed-through virtio-blk, virtio-scsi (modern or legacy virtio) and NVMe disks, or read-only and
-  partial (LBA window) slices of them. I/O is zero-copy: devices DMA
-  straight into guest memory.
+  partial (LBA window) slices of them. Devices DMA into each guest's
+  host-owned I/O pool. Block volumes support four request queues with
+  separate interrupt routes.
 - **Network.**
   - L2 virtual switches with MAC learning and MAC lock.
   - Multiple vNICs per VM, and a physical NIC as a switch's uplink:

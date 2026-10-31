@@ -5,3 +5,10 @@ version = 4
 [[package]]
 name = "fuzz-virtq"
 version = "0.1.0"
+dependencies = [
+ "l4h-abi",
+]
+
+[[package]]
+name = "l4h-abi"
+version = "0.1.0"
