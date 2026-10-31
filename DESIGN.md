@@ -1233,14 +1233,18 @@ pool, and host components map only host-owned pages.
   The host installs the level-2 CNodes of boot blocks; the guest retypes
   its own for the others. Boot info carries `nr_blocks` and `boot_blocks`.
 - **Guest early boot** (`kernel/caps.c`, `l4h_caps_init`). memblock knows
-  only the boot blocks. The guest marks the non-boot blocks that onlining
-  needs as object blocks, creates its first capability CNode and the user
-  CSpace from them, then for every other block retypes its level-2 RAM
+  only the boot blocks. The guest reserves object blocks for onlining,
+  creates its first capability CNode and the user CSpace from them, then
+  maps at most RAM/16 + 256 MiB beyond the host's boot prefix. This leaves
+  room for the memmap (RAM/64), hash tables, initramfs unpacking and early
+  allocations without zeroing and mapping all RAM before `time_init`.
+  For each initial frame block it retypes its level-2 RAM
   CNode (into its level-1 slot), one 2 MiB frame and its 512 subframe
   aliases (patch 0029), and maps the aliases at `ram_base_va + GPA`
   (read-write, execute-never), adding page tables from object blocks. Each
-  block is added to memblock once mapped; object blocks are added and
-  reserved, so they have struct pages.
+  block is added to memblock once mapped; the remaining blocks are added
+  and reserved, so they have struct pages but cannot be allocated yet.
+  The early counter measures this setup separately from printk's clock.
 - **Host accounting.** A host-object arena starts with an estimate of what
   its owner needs and grows from free blocks, by at least 1 MiB
   and preferably an eighth of the arena (`Arena::retype`, `Arena::reserve`).
@@ -1258,11 +1262,15 @@ pool, and host components map only host-owned pages.
 
 ### 8.3 Object memory: converting blocks between frames and objects
 
-- **At boot** the guest makes object blocks only of what onlining needs (a
-  16 KiB RAM CNode and a 4 KiB page table per frame block, and a slot
-  CNode), plus the reserve; everything else starts as frames. A 4-vCPU
-  256 MiB dom0 boots with 6 object blocks (12 MiB), of which 2.6 MiB is
-  used.
+- **At boot** object blocks hold what onlining needs (a 16 KiB RAM CNode
+  and a 4 KiB page table per frame block, and a slot CNode), plus the
+  reserve and any RAM beyond the initial mapping budget (§8.2). The latter
+  starts as spare object blocks with `ORIG_RESERVED`. The late initcall
+  starts the existing worker, which converts them to frames one block at
+  a time with `cond_resched()` and releases their reserved pages. Small
+  guests retain the eager layout. Larger guests initially have less free
+  memory until conversion catches up; the configured RAM remains available
+  for either frames or seL4 objects.
 - **Chunks and classes.** `l4h_obj_alloc` takes objects from Untyped
   *chunks* of 16, 64 or 128 KiB (by object size) carved out of object
   blocks. seL4 reuses an Untyped's memory only when all its children are
@@ -1331,6 +1339,11 @@ pool, and host components map only host-owned pages.
   object blocks grow and go back when they exit. Finally a process maps
   sparse memory until RAM is exhausted: the OOM killer kills it, the guest
   carries on, and conversions work afterwards. Passes with 1 and 4 vCPUs.
+  `tests/run-ramboottest.sh` checks that large guests defer most RAM, unpack
+  a padded initramfs, allocate while conversion runs, recover the expected
+  managed memory, and retain data across allocations larger than the
+  initial frame budget. `RAMBOOT_MEM_MB` selects the guest size (1024 by
+  default); `RAMBOOT_PAD_MB` selects the unpacked padding (64 by default).
 - **Fragmentation.** Long-lived objects can still pin partly empty chunks,
   and unmovable Linux pages can prevent a frame block from being isolated.
   There is no compaction of object memory (rebuilding VSpace mirrors into
