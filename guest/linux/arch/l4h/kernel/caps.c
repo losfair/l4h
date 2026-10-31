@@ -55,6 +55,8 @@
 #include <linux/uaccess.h>
 #include <linux/gfp.h>
 #include <linux/oom.h>
+#include <linux/shrinker.h>
+#include <linux/swap.h>
 #include <linux/sched/signal.h>
 #include <linux/sched/mm.h>
 #include <linux/workqueue.h>
@@ -128,12 +130,11 @@ enum block_origin {
 struct block {
 	u8 state;
 	u8 class;		/* chunk class (BLK_OBJECTS) */
-	u8 has_l2;		/* its level-2 RAM CNode exists */
 	u8 origin;		/* enum block_origin (BLK_OBJECTS) */
 	u8 reserve;		/* a free object block kept for emergencies */
 	u32 busy;		/* chunks with live objects (BLK_OBJECTS) */
 	u32 used;		/* our view of the Untyped's watermark */
-	unsigned long large;	/* canonical 2 MiB frame (BLK_FRAMES) */
+	unsigned long large;	/* permanent slot; frame cap only in BLK_FRAMES */
 	struct list_head chunks;	/* chunks carved from it */
 };
 
@@ -169,6 +170,7 @@ static unsigned int nr_object_blocks, nr_reserve, nr_spare;
 static unsigned int reserve_target, spare_watermark;
 static unsigned long conversions_to_objects, conversions_to_frames, conversion_failures;
 static unsigned long contig_attempts, contig_successes;
+static unsigned long reclaim_blocks, oom_blocks;
 
 static void objmem_kick(void);
 
@@ -705,13 +707,10 @@ void __init l4h_map_kernel_early(unsigned long frame, unsigned long va)
 
 /* A canonical large frame and its 512 direct-map aliases share one
  * allocation. Revoking the block Untyped tears down both sizes. */
-static int make_block_frames(unsigned long ut, unsigned long gpa, unsigned long *large)
+static int retype_block_frames(unsigned long ut, unsigned long gpa, unsigned long slot)
 {
-	unsigned long slot = l4h_slot_alloc();
 	int err;
 
-	if (!slot)
-		return -ENOMEM;
 	err = l4h_retype(ut, L4H_OBJ_LARGE_FRAME, 0, slot >> L4H_L2_INDEX_BITS,
 			 L4H_ROOT_DEPTH, slot & (L2_SLOTS - 1), 1);
 	/* All 512 in one call, into the block's RAM CNode. */
@@ -720,57 +719,132 @@ static int make_block_frames(unsigned long ut, unsigned long gpa, unsigned long 
 						L4H_ROOT_DEPTH + L4H_RAM_L2_BITS, 0, RAM_BLOCK_PAGES);
 	if (err) {
 		WARN_ON(l4h_cnode_revoke(ut, 64));
-		l4h_slot_free(slot);
 		return err < 0 ? err : -EFAULT;
 	}
-	*large = slot;
 	return 0;
 }
 
-/*
- * Give block `b` (BLK_BUSY; its Untyped has no children) its frames: its
- * RAM CNode, canonical large frame, and 512 aliases, and map it in the
- * direct map.  That takes one 2 MiB leaf of the canonical frame: one
- * system call and no page table, instead of 512 calls, one per alias.  A
- * mapped frame cap still copies unmapped, so THP leaves (copies of it)
- * are unaffected, and revoking the Untyped removes the leaf with the
- * rest.  Where a 4 KiB page table already covers the block, or the direct
- * map is not 2 MiB aligned, the aliases are mapped one by one instead.
- */
-static int block_make_frames(unsigned int b)
+/* Hotplug owns and frees its slots separately from the boot RAM pool. */
+static int make_block_frames(unsigned long ut, unsigned long gpa, unsigned long *large)
+{
+	unsigned long slot = l4h_slot_alloc();
+	int err;
+
+	if (!slot)
+		return -ENOMEM;
+	err = retype_block_frames(ut, gpa, slot);
+	if (err)
+		l4h_slot_free(slot);
+	else
+		*large = slot;
+	return err;
+}
+
+/* Reserve the block's RAM CNode (16 KiB) and large-frame slot. These and
+ * the direct-map tables prepared below persist across mode changes. */
+static int __init block_prepare_frames(unsigned int b)
 {
 	struct block *bl = &blocks[b];
 	unsigned long l1 = L4H_SLOT_RAM_L1_BASE + (b >> L4H_RAM_L2_BITS);
-	unsigned long gpa = (unsigned long)b << L4H_BLOCK_SHIFT, i, flags;
+	unsigned long flags;
+	int err;
+
+	raw_spin_lock_irqsave(&caps_lock, flags);
+	err = __obj_retype(L4H_OBJ_CNODE, L4H_RAM_L2_BITS, l1, L4H_ROOT_DEPTH,
+			   b & ((1u << L4H_RAM_L2_BITS) - 1)) ? 0 : -ENOMEM;
+	if (!err) {
+		bl->large = __slot_alloc();
+		err = bl->large ? 0 : -ENOMEM;
+	}
+	raw_spin_unlock_irqrestore(&caps_lock, flags);
+	return err;
+}
+
+/* Prepare just the tables each mapping actually needs. Installing leaf
+ * tables everywhere would prevent the 2 MiB direct-map fast path; on ARM,
+ * even an upper-level table map can install a leaf table if its parents
+ * already exist. Probe with temporary frame mappings instead, before any
+ * non-boot RAM is given to memblock. A large probe borrows the first block
+ * of the initial frame budget, then revokes it for normal initialization.
+ * Without an initial frame block, use a boot-frame copy and small leaves. */
+static int __init prepare_direct_map(bool large_probe)
+{
+	unsigned long small, large = 0;
+	unsigned int b, i;
+	int err = 0;
+
+	small = l4h_cap_copy(L4H_FRAME_CPTR(0), L4H_RIGHTS_ALL);
+	if (!small)
+		return -ENOMEM;
+	if (large_probe) {
+		large = blocks[boot_blocks].large;
+		err = l4h_retype(block_cptr(boot_blocks), L4H_OBJ_LARGE_FRAME, 0,
+				 large >> L4H_L2_INDEX_BITS, L4H_ROOT_DEPTH,
+				 large & (L2_SLOTS - 1), 1);
+		if (err)
+			goto out;
+	}
+	for (b = boot_blocks; b < nr_blocks; b++) {
+		unsigned long va = uml_physmem + ((unsigned long)b << L4H_BLOCK_SHIFT);
+
+		/* Aligned blocks share a 1 GiB parent table. Probe each parent
+		 * once; any existing leaf table already supplies the fallback. */
+		if (large && IS_ALIGNED(va, RAM_BLOCK) && b != boot_blocks &&
+		    !IS_ALIGNED(va, 1ul << l4h_pt_level_shift[1]))
+			continue;
+		if (large && IS_ALIGNED(va, RAM_BLOCK) && !map_kernel_at(large, va, 1)) {
+			err = l4h_page_unmap(large);
+		} else {
+			/* An unaligned block can straddle two leaf page tables. */
+			for (i = 0; i < 2; i++) {
+				err = map_kernel(small, va + (i ? RAM_BLOCK - PAGE_SIZE : 0));
+				if (!err)
+					err = l4h_page_unmap(small);
+				if (err)
+					break;
+			}
+		}
+		if (err)
+			break;
+	}
+out:
+	l4h_slot_delete(small);
+	if (large) {
+		int ret = l4h_cnode_revoke(block_cptr(boot_blocks), 64);
+
+		if (!err)
+			err = ret;
+	}
+	return err > 0 ? -EFAULT : err;
+}
+
+/* Give block `b` (BLK_BUSY; its Untyped has no children) its frames.
+ * No Linux memory, capability slots or paging objects may be allocated:
+ * reclaim and the OOM notifier use this path with the allocator exhausted. */
+static int block_make_frames(unsigned int b)
+{
+	struct block *bl = &blocks[b];
+	unsigned long gpa = (unsigned long)b << L4H_BLOCK_SHIFT, i;
 	unsigned long va = uml_physmem + gpa;
 	int err;
 
-	if (!bl->has_l2) {
-		/* The level-2 RAM CNode goes straight into its L1 slot.  It is
-		 * kept when the block becomes an object block. */
-		raw_spin_lock_irqsave(&caps_lock, flags);
-		err = __obj_retype(L4H_OBJ_CNODE, L4H_RAM_L2_BITS, l1, L4H_ROOT_DEPTH,
-				   b & ((1u << L4H_RAM_L2_BITS) - 1)) ? 0 : -ENOMEM;
-		raw_spin_unlock_irqrestore(&caps_lock, flags);
-		if (err)
-			return err;
-		bl->has_l2 = 1;
-	}
-	err = make_block_frames(block_cptr(b), gpa, &bl->large);
-	if (err) {
-		pr_err("l4h: block %u: frames: %d\n", b, err);
-		return -ENOMEM;
-	}
-	if (IS_ALIGNED(va, RAM_BLOCK) && !map_kernel_at(bl->large, va, 1))
+	err = retype_block_frames(block_cptr(b), gpa, bl->large);
+	if (err)
+		return err;
+	/* Map one 2 MiB leaf. Probing prepared the parent tables without
+	 * occupying this slot with a small-page table. */
+	if (IS_ALIGNED(va, RAM_BLOCK) &&
+	    !l4h_page_map(bl->large, L4H_CPTR(L4H_SLOT_VSPACE), va,
+			  L4H_PROT_READ | L4H_PROT_WRITE))
 		return 0;
 	for (i = 0; i < RAM_BLOCK_PAGES; i++) {
-		err = map_kernel(L4H_FRAME_CPTR(gpa + i * PAGE_SIZE), va + i * PAGE_SIZE);
+		err = l4h_page_map(L4H_FRAME_CPTR(gpa + i * PAGE_SIZE),
+				   L4H_CPTR(L4H_SLOT_VSPACE), va + i * PAGE_SIZE,
+				   L4H_PROT_READ | L4H_PROT_WRITE);
 		if (err) {
 			/* Back to an Untyped without children. */
 			WARN_ON(l4h_cnode_revoke(block_cptr(b), 64));
-			l4h_slot_free(bl->large);
-			bl->large = 0;
-			return err;
+			return err < 0 ? err : -EFAULT;
 		}
 	}
 	return 0;
@@ -1042,6 +1116,9 @@ static void wait_nofault_accesses(void)
 /* ---- conversion between frame blocks and object blocks */
 
 static DEFINE_MUTEX(objmem_mutex);
+/* Unlike objmem_mutex, this lock is never held across page allocation or
+ * migration. Reclaim can take it even from frames_to_objects(). */
+static DEFINE_MUTEX(frame_mutex);
 static void objmem_work_fn(struct work_struct *w);
 static DECLARE_WORK(objmem_work, objmem_work_fn);
 static bool objmem_ready;
@@ -1063,10 +1140,7 @@ static void block_to_objects(unsigned int b, int origin)
 	 * outside the guest has them: devices only see the I/O pool. */
 	wait_nofault_accesses();
 	WARN_ON(l4h_cnode_revoke(block_cptr(b), 64));
-	if (blocks[b].large) {
-		l4h_slot_free(blocks[b].large);
-		blocks[b].large = 0;
-	}
+	/* The revoked frame's empty slot stays reserved for conversion back. */
 	raw_spin_lock_irqsave(&caps_lock, flags);
 	blocks[b].state = BLK_OBJECTS;
 	blocks[b].origin = origin;
@@ -1176,14 +1250,32 @@ static int frames_to_objects(void)
 	return -ENOMEM;
 }
 
-/* Object -> frame, for the highest spare block (objects low in RAM). */
-static void objects_to_frames(void)
+/* Spare blocks available after covering both object watermarks. caps_lock
+ * protects this calculation and the subsequent selection of a block. */
+static unsigned int reclaimable_blocks(void)
+{
+	unsigned int keep = spare_watermark;
+
+	lockdep_assert_held(&caps_lock);
+	if (nr_reserve < reserve_target)
+		keep += reserve_target - nr_reserve;
+	return nr_spare > keep ? nr_spare - keep : 0;
+}
+
+/* Object -> frame, for the highest spare block (objects low in RAM).
+ * The caller holds frame_mutex. Return only pages actually released. */
+static unsigned long objects_to_frames(void)
 {
 	unsigned long flags, pfn;
 	unsigned int i;
-	int b = -1, err;
+	int b = -1, err, origin;
 
+	lockdep_assert_held(&frame_mutex);
 	raw_spin_lock_irqsave(&caps_lock, flags);
+	if (!reclaimable_blocks()) {
+		raw_spin_unlock_irqrestore(&caps_lock, flags);
+		return 0;
+	}
 	for (i = nr_blocks; i-- > boot_blocks;) {
 		if (is_spare(i)) {
 			b = i;
@@ -1195,36 +1287,38 @@ static void objects_to_frames(void)
 	}
 	raw_spin_unlock_irqrestore(&caps_lock, flags);
 	if (b < 0)
-		return;
+		return 0;
 	/* A free block has no chunks: the revoke deletes nothing, and the
 	 * retype into frames starts afresh. */
 	WARN_ON(l4h_cnode_revoke(block_cptr(b), 64));
 	err = block_make_frames(b);
 	raw_spin_lock_irqsave(&caps_lock, flags);
 	if (err) {
-		/* No room for its RAM CNode or a page table: it stays an
-		 * object block. */
+		/* Leave the block available for a later attempt. */
 		blocks[b].state = BLK_OBJECTS;
 		blocks[b].used = 0;
 		nr_spare++;
 		nr_object_blocks++;
+		conversion_failures++;
 		raw_spin_unlock_irqrestore(&caps_lock, flags);
-		return;
+		return 0;
 	}
+	origin = blocks[b].origin;
+	/* Publish the mappings before any CPU can allocate these pages. */
+	blocks[b].state = BLK_FRAMES;
+	conversions_to_frames++;
 	raw_spin_unlock_irqrestore(&caps_lock, flags);
 	pfn = (unsigned long)b << RAM_BLOCK_ORDER;
-	if (blocks[b].origin == ORIG_ALLOC) {
+	if (origin == ORIG_ALLOC) {
 		__free_pages(pfn_to_page(pfn), RAM_BLOCK_ORDER);
-	} else if (blocks[b].origin == ORIG_CONTIG) {
+	} else if (origin == ORIG_CONTIG) {
 		free_contig_range(pfn, RAM_BLOCK_PAGES);
 	} else {
 		for (i = 0; i < RAM_BLOCK_PAGES; i++)
 			free_reserved_page(pfn_to_page(pfn + i));
 	}
-	raw_spin_lock_irqsave(&caps_lock, flags);
-	blocks[b].state = BLK_FRAMES;
-	conversions_to_frames++;
-	raw_spin_unlock_irqrestore(&caps_lock, flags);
+	mm_account_reclaimed_pages(RAM_BLOCK_PAGES);
+	return RAM_BLOCK_PAGES;
 }
 
 /* Convert blocks until the reserve is full and the spare blocks are within
@@ -1262,7 +1356,13 @@ static bool objmem_balance(void)
 				break;
 			}
 		} else if (spare > spare_watermark) {
-			objects_to_frames();
+			unsigned long freed;
+
+			mutex_lock(&frame_mutex);
+			freed = objects_to_frames();
+			mutex_unlock(&frame_mutex);
+			if (!freed)
+				break;
 		} else {
 			break;
 		}
@@ -1276,6 +1376,81 @@ static void objmem_work_fn(struct work_struct *w)
 {
 	objmem_balance();
 }
+
+/* Convert a bounded batch without running the frame -> object half of
+ * objmem_balance(). In particular, do not take objmem_mutex: its owner
+ * may be allocating pages or migrating a folio held by the reclaim caller.
+ * frame_mutex only covers allocation-free conversion and page release. */
+static unsigned long objmem_reclaim(unsigned long nr_pages, bool oom)
+{
+	unsigned long freed = 0, flags;
+	unsigned int n = min_t(unsigned long, DIV_ROUND_UP(nr_pages, RAM_BLOCK_PAGES), 8);
+
+	mutex_lock(&frame_mutex);
+	while (n--) {
+		unsigned long pages = objects_to_frames();
+
+		if (!pages)
+			break;
+		freed += pages;
+	}
+	mutex_unlock(&frame_mutex);
+	raw_spin_lock_irqsave(&caps_lock, flags);
+	if (oom)
+		oom_blocks += freed / RAM_BLOCK_PAGES;
+	else
+		reclaim_blocks += freed / RAM_BLOCK_PAGES;
+	raw_spin_unlock_irqrestore(&caps_lock, flags);
+	return freed;
+}
+
+static unsigned long objmem_shrinker_count(struct shrinker *shrinker,
+					  struct shrink_control *sc)
+{
+	unsigned long flags, pages;
+
+	raw_spin_lock_irqsave(&caps_lock, flags);
+	pages = (unsigned long)reclaimable_blocks() * RAM_BLOCK_PAGES;
+	raw_spin_unlock_irqrestore(&caps_lock, flags);
+	return pages;
+}
+
+static unsigned long objmem_shrinker_scan(struct shrinker *shrinker,
+					 struct shrink_control *sc)
+{
+	/* Conversion is in whole blocks and each callback does at most 16 MiB. */
+	sc->nr_scanned = min_t(unsigned long, ALIGN(sc->nr_to_scan, RAM_BLOCK_PAGES),
+			      8 * RAM_BLOCK_PAGES);
+	return objmem_reclaim(sc->nr_scanned, false);
+}
+
+static int objmem_oom_notify(struct notifier_block *nb, unsigned long action, void *data)
+{
+	unsigned long *freed = data;
+
+	*freed += objmem_reclaim(RAM_BLOCK_PAGES, true);
+	return NOTIFY_OK;
+}
+
+static struct notifier_block objmem_oom_nb = {
+	.notifier_call = objmem_oom_notify,
+};
+
+static int __init objmem_shrinker_init(void)
+{
+	struct shrinker *shrinker = shrinker_alloc(0, "l4h-objmem");
+
+	if (!shrinker)
+		return -ENOMEM;
+	shrinker->count_objects = objmem_shrinker_count;
+	shrinker->scan_objects = objmem_shrinker_scan;
+	shrinker->seeks = 0;
+	shrinker->batch = RAM_BLOCK_PAGES;
+	shrinker_register(shrinker);
+	return 0;
+}
+/* Before rootfs_initcall: even synchronous initramfs unpacking can reclaim. */
+subsys_initcall(objmem_shrinker_init);
 
 /**
  * l4h_objmem_wait() - make room for seL4 objects, waiting if needed
@@ -1363,10 +1538,8 @@ void __init l4h_caps_init(void)
 		INIT_LIST_HEAD(&chunks[b]);
 	for (b = 0; b < nr_blocks; b++)
 		INIT_LIST_HEAD(&blocks[b].chunks);
-	for (b = 0; b < boot_blocks; b++) {
+	for (b = 0; b < boot_blocks; b++)
 		blocks[b].state = BLK_BOOT;
-		blocks[b].has_l2 = 1;
-	}
 	rest = nr_blocks - boot_blocks;
 	reserve_target = spare_watermark = default_target();
 	hp_first = bi->hp_gpa >> L4H_BLOCK_SHIFT;
@@ -1408,6 +1581,14 @@ void __init l4h_caps_init(void)
 	if (!__obj_retype(L4H_OBJ_CNODE, 1, L4H_SLOT_META, L4H_ROOT_DEPTH, L4H_META_DYN_BASE))
 		panic("l4h: cannot create the user CSpace\n");
 	raw_spin_unlock_irqrestore(&caps_lock, flags);
+	for (b = boot_blocks; b < nr_blocks; b++) {
+		err = block_prepare_frames(b);
+		if (err)
+			panic("l4h: cannot prepare RAM block %u: %d\n", b, err);
+	}
+	err = prepare_direct_map(early_frames != 0);
+	if (err)
+		panic("l4h: cannot prepare the direct map: %d\n", err);
 	for (b = boot_blocks; b < nr_blocks; b++) {
 		if (blocks[b].state != BLK_BUSY)
 			continue;
@@ -1482,15 +1663,21 @@ static int objmem_stats_show(struct seq_file *m, void *v)
 		   conversions_to_frames, conversion_failures);
 	seq_printf(m, "contig_attempts %lu contig_successes %lu\n", contig_attempts,
 		   contig_successes);
+	seq_printf(m, "reclaim_blocks %lu oom_blocks %lu\n", reclaim_blocks, oom_blocks);
 	raw_spin_unlock_irqrestore(&caps_lock, flags);
 	return 0;
 }
 
-/* Conversion starts once workqueues are up: spare boot-time object blocks
- * beyond the watermark then go to the page allocator. */
-static int __init objmem_init(void)
+static int __init objmem_reclaim_init(void)
 {
 	proc_create_single("l4h_objmem", 0444, NULL, objmem_stats_show);
+	return register_oom_notifier(&objmem_oom_nb);
+}
+subsys_initcall(objmem_reclaim_init);
+
+/* Background conversion starts after the pressure callbacks are available. */
+static int __init objmem_init(void)
+{
 	objmem_ready = true;
 	objmem_kick();
 	return 0;

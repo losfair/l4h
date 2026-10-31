@@ -102,6 +102,8 @@ jobs:
         run: tests/run-objtest.sh
       - name: Deferred boot RAM, 1 and 2 vCPUs
         run: tests/run-ramboottest.sh 1 && tests/run-ramboottest.sh 2
+      - name: Demand RAM conversion, 1 and 2 vCPUs
+        run: tests/run-rampressuretest.sh 1 && tests/run-rampressuretest.sh 2
       - name: BPF JIT
         run: tests/run-bpftest.sh
       - name: Android kernel features
