@@ -1,4 +1,4 @@
-//! A guest's virtio-gpu (DESIGN.md §8.6).  l4h-vmm serves the device; here
+//! A guest's virtio-gpu (DESIGN.md §9.6).  l4h-vmm serves the device; here
 //! is the host memory it needs: the display area, which l4h-vmm writes and
 //! vmmgr maps too, to copy the image out for dom0 (CTL_GPU_READ), and
 //! l4h-vmm's tables of the guest's resources.  The guest's buffers stay in

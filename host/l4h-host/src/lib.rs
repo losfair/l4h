@@ -6,7 +6,7 @@
 //! containers, and pure helpers. It stays independent of seL4 calls and
 //! runtime initialization. Component runtime support belongs in `l4h-rt`;
 //! kernel-object allocation and task construction belong in `l4h-task`.
-//! See DESIGN.md §9 for the shared crate boundaries.
+//! See DESIGN.md §10 for the shared crate boundaries.
 
 #![no_std]
 
@@ -220,7 +220,7 @@ pub struct VmmConfig {
     /// epoch_ticks.
     pub epoch_ns: u64,
     pub epoch_ticks: u64,
-    /// The guest's memory device (DESIGN.md §17): its boot info index plus
+    /// The guest's memory device (DESIGN.md §8.5): its boot info index plus
     /// one (0: none); its page is at vmm_device_page_va(index).  Hotplug
     /// calls go to memd on VMM_SLOT_MEMD_EP.
     pub mem_dev: u32,

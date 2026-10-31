@@ -58,7 +58,7 @@ config L4H
 	select COMPACTION
 	select MEMORY_ISOLATION
 	# Memory hotplug in 128 MiB blocks, each with its memmap in its
-	# first 2 MiB (DESIGN.md §17).
+	# first 2 MiB (DESIGN.md §8.5).
 	select ARCH_ENABLE_MEMORY_HOTPLUG
 	select ARCH_ENABLE_MEMORY_HOTREMOVE
 	select ARCH_MHP_MEMMAP_ON_MEMORY_ENABLE
@@ -72,7 +72,7 @@ config ARCH_SPARSEMEM_ENABLE
 
 # The largest buddy order, and the pageblock, is a RAM block (2 MiB): a
 # hotplug block's memmap (2 MiB) must be whole pageblocks to go in the
-# block itself, and object blocks are order-9 pages (§15.3).
+# block itself, and object blocks are order-9 pages (§8.3).
 config ARCH_FORCE_MAX_ORDER
 	int
 	default 9

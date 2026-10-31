@@ -45,7 +45,7 @@ pub struct Port {
     pub link_up: u32,
     /// Set by the client: its guest accepts frames with checksum offload
     /// (NEEDS_CSUM) and TSO (GSO types); otherwise netd completes the
-    /// checksum and drops TSO frames for it.
+    /// checksum and segments TSO frames for it.
     pub rx_csum: u32,
     pub rx_gso: u32,
     /// Set by netd while it holds frames for a full RX ring: the client

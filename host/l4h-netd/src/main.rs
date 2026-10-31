@@ -1,4 +1,4 @@
-//! netd: L2 virtual switches (DESIGN.md §8.3) and the uplink NIC drivers.
+//! netd: L2 virtual switches (DESIGN.md §9.3) and the uplink NIC drivers.
 //!
 //! Every port belongs to one switch.  A port is either a guest vNIC (a
 //! channel to that guest's l4h-vmm) or an uplink NIC (virtio-net, gVNIC,
@@ -6,7 +6,7 @@
 //! port and flood everything else within the switch.  Guest ports can be
 //! locked to their configured MAC.  Nothing above L2 is looked at.
 //!
-//! netd has no heap (DESIGN.md §9): its tables are fixed arrays, its frame
+//! netd has no heap (DESIGN.md §10): its tables are fixed arrays, its frame
 //! buffers statics, and the frames it holds take chunks of a fixed pool
 //! (pool.rs).
 

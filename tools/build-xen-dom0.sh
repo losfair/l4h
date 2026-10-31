@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build Xen and a minimal Linux dom0 that partition a large machine into l4h
 # instances, each an HVM guest with its own passed-through NIC (DESIGN.md
-# §10.2).  Everything comes from Debian 13 packages, downloaded into
+# §11.2).  Everything comes from Debian 13 packages, downloaded into
 # build/xen/debs; libraries the packages need but do not ship are taken from
 # this machine, which must therefore run Debian 13 too.  Outputs, in
 # build/xen:

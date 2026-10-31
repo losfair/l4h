@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-2-Clause
 
-//! l4hctl: dom0 client library of the l4h control API (DESIGN.md §9.1), on
+//! l4hctl: dom0 client library of the l4h control API (DESIGN.md §10.1), on
 //! /dev/l4hctl.  The request layouts mirror `include/l4h/abi.h`.  The
 //! `l4hctl` binary is a command-line front end; other dom0 programs (such
 //! as an orchestration agent) link this library.
@@ -705,7 +705,7 @@ impl Ctl {
     }
 }
 
-/// Attestation by the host (DESIGN.md §9.2) on /dev/l4h-attest, in any
+/// Attestation by the host (DESIGN.md §10.2) on /dev/l4h-attest, in any
 /// guest. ACT/SEAL work without a TPM.
 pub mod attest {
     use super::*;

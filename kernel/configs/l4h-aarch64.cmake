@@ -1,4 +1,4 @@
-# seL4 kernel configuration for l4h on aarch64 (QEMU virt; see DESIGN.md §11).
+# seL4 kernel configuration for l4h on aarch64 (QEMU virt; see DESIGN.md §12).
 # EL1 kernel: no hardware virtualization, like x86_64 without VT-x.
 set(KernelPlatform "qemu-arm-virt" CACHE STRING "")
 set(KernelSel4Arch "aarch64" CACHE STRING "")

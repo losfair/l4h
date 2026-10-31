@@ -1,5 +1,5 @@
 //! The AMD IOMMU (AMD-Vi), driven by the root task itself rather than by
-//! seL4 (DESIGN.md §8.5).  Only root gives devices memory, so it builds
+//! seL4 (DESIGN.md §9.5).  Only root gives devices memory, so it builds
 //! the IOMMU's tables itself: a device table that blocks every device,
 //! and for each requester group root enables an I/O page table that maps
 //! the memory its devices were given, at its physical address. Drivers see no

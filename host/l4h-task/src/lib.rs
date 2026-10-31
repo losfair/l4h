@@ -9,7 +9,7 @@
 //! This crate is independent of `l4h-rt`. Executables retain boot setup,
 //! authorization, ASID assignment policy, and placement decisions. Memd's
 //! memory-service accounting remains in memd, separate from the grant client
-//! here. See DESIGN.md §9 for the shared crate boundaries.
+//! here. See DESIGN.md §10 for the shared crate boundaries.
 
 #![no_std]
 

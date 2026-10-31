@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# l4h partitions as Xen HVM guests (DESIGN.md §10.2), nested in QEMU/KVM:
+# l4h partitions as Xen HVM guests (DESIGN.md §11.2), nested in QEMU/KVM:
 # Xen and a minimal Linux dom0 (tools/build-xen-dom0.sh) boot two l4h UEFI
 # images under OVMF, each with its own virtio-net NIC passed through.  The
 # two NICs share one QEMU hub, and each l4h's dom0 pings the other's

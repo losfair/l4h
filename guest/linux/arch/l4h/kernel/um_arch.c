@@ -392,7 +392,7 @@ void __init l4h_linux_main(void)
 }
 
 /*
- * Hotplugged memory (drivers/memhp.c) carries its memmap (DESIGN.md §17).
+ * Hotplugged memory (drivers/memhp.c) carries its memmap (DESIGN.md §8.5).
  * The option goes first: the command line can override it.
  */
 static void __init hotplug_options(void)

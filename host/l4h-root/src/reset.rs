@@ -1,4 +1,4 @@
-//! Host reboot, for dom0's L4H_CTL_HOST_REBOOT (DESIGN.md §9.1): reset the
+//! Host reboot, for dom0's L4H_CTL_HOST_REBOOT (DESIGN.md §10.1): reset the
 //! machine as Linux does: the FADT's reset register, then the PCI reset
 //! control register (0xcf9), then the keyboard controller.  Nothing is
 //! flushed: a guest's flush reaches the disk before it completes, so what

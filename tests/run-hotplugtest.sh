@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Memory hotplug (DESIGN.md §17): dom0 grows a 256 MiB VM to 2 GiB, fills
+# Memory hotplug (DESIGN.md §8.5): dom0 grows a 256 MiB VM to 2 GiB, fills
 # it, shrinks it (short of the target while the data is there, without
 # losing it), empties and shrinks it, grows it again and destroys it,
 # checking the VM's memory and the host's after each step

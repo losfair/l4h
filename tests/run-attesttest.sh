@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Attestation (DESIGN.md §9.2) end to end: UEFI boot with a software TPM
+# Attestation (DESIGN.md §10.2) end to end: UEFI boot with a software TPM
 # (swtpm), dom0 and a guest it starts get reports, tools/l4h-attest.py
 # verifies them against the host evidence and makes a credential for the
 # attestation key, which dom0 decrypts on a second boot (TIS this time,

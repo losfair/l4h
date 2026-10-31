@@ -1,5 +1,5 @@
 //! l4h-memd: the owner of the host's free memory and of every guest's RAM
-//! (DESIGN.md §16).
+//! (DESIGN.md §8.4).
 //!
 //! At boot, l4h-root moves every free RAM Untyped of 2 MiB or more here.
 //! From then on it asks for memory for its own objects (MEMD_ALLOC) and
@@ -11,11 +11,11 @@
 //! reports free memory to the hypervisor l4h runs in (balloon.rs).
 //!
 //! Guest RAM also comes and goes while the guest runs, in hotplug blocks
-//! of 128 MiB (DESIGN.md §17): l4h-root sets each guest's target, and the
+//! of 128 MiB (DESIGN.md §8.5): l4h-vmmgr sets each guest's target, and the
 //! guest's l4h-vmm asks to plug and unplug hotplug blocks, which memd
 //! checks against the target and its own state only.
 //!
-//! memd serves l4h-root and the VMMs, one call at a time, and never calls
+//! memd serves l4h-root, l4h-vmmgr and the VMMs, one call at a time, and never calls
 //! anyone.  It cannot read memory: every Untyped it has handed out has a child, so it
 //! cannot retype it, and revoking it first makes seL4 clear the memory
 //! before it is used again.

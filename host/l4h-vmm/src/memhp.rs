@@ -1,4 +1,4 @@
-//! The memory device (L4H_DEV_MEM, DESIGN.md §17): the guest's hotplug
+//! The memory device (L4H_DEV_MEM, DESIGN.md §8.5): the guest's hotplug
 //! target and state in its device page, and its plug and unplug requests
 //! (in the page too), which go to l4h-memd.  memd checks every request against
 //! its own state; this only relays them.

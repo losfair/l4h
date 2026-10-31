@@ -1,7 +1,7 @@
 //! Host and dom0 settings.  The defaults are fixed when root is built
 //! ($L4H_* variables); the `l4h-config` boot module, a file of `key=value`
 //! lines on the EFI system partition, overrides them at boot (DESIGN.md
-//! §10).  GRUB sources the same file, so it is also valid GRUB script: no
+//! §10.1).  GRUB sources the same file, so it is also valid GRUB script: no
 //! spaces around `=`, and values with spaces in double quotes.
 
 
@@ -103,7 +103,7 @@ pub struct Config {
     /// the control API.
     pub dom0_disks: usize,
     /// Of host disk 0 (the boot disk), dom0 gets only the first n MiB; the
-    /// rest is free for the control API, as windows (§8.2).  0, or more than
+    /// rest is free for the control API, as windows (§9.2).  0, or more than
     /// the disk: all of it.
     pub dom0_disk0_mb: usize,
     /// Explicit disk 0 ranges, each exposed as a separate filesystem device.
@@ -135,7 +135,7 @@ pub struct Config {
     pub fb_console: bool,
     /// Seconds between watchdog dumps of guest vCPU state; 0 disables.
     pub watchdog_secs: usize,
-    /// Confine devices with the platform IOMMU, if there is one (§8.5).
+    /// Confine devices with the platform IOMMU, if there is one (§9.5).
     pub iommu: bool,
     /// With it, remap their interrupts too.
     pub iommu_intremap: bool,

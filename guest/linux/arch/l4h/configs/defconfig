@@ -158,7 +158,7 @@ CONFIG_PPP_MULTILINK=y
 CONFIG_PPPOE=y
 CONFIG_PPTP=y
 CONFIG_PPPOL2TP=y
-# A router VM (DESIGN.md §8.3) needs NAT.
+# A router VM (DESIGN.md §9.3) needs NAT.
 CONFIG_NETFILTER=y
 CONFIG_NF_CONNTRACK=y
 CONFIG_NF_CONNTRACK_EVENTS=y
@@ -317,7 +317,7 @@ CONFIG_DMABUF_HEAPS_SYSTEM=y
 CONFIG_SYNC_FILE=y
 CONFIG_DRM=m
 CONFIG_DRM_VKMS=m
-# The host's display (l4h-vmm's virtio-gpu, DESIGN.md §8.6).
+# The host's display (l4h-vmm's virtio-gpu, DESIGN.md §9.6).
 CONFIG_DRM_VIRTIO_GPU=m
 # CONFIG_USB_SUPPORT is not set
 # CONFIG_HWMON is not set

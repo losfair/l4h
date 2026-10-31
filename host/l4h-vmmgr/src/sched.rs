@@ -29,8 +29,8 @@ pub fn consumed(sc: sel4::cap::SchedContext) -> u64 {
 
 /// seL4's minimum budget is a few times the kernel WCET; stay well above.
 const MIN_BUDGET_US: u64 = 200;
-/// Size of a vCPU's scheduling contexts: room for 1 + EXTRA_REFILLS
-/// refills (the smallest holds only seL4's minimum of 2).  With few
+/// Size of a vCPU's scheduling contexts: room for seL4's minimum of 2
+/// refills plus EXTRA_REFILLS, 16 in all.  With few
 /// refills, a budget used in many short pieces, as a vCPU that is
 /// preempted and blocks often uses it, is merged into later refills and
 /// lost to the vCPU.

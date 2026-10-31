@@ -2,7 +2,7 @@
 //! components, l4h-vmmgr last, which builds and runs the guests (vmmgr.rs).
 //! Root makes what devices reach for guests when vmmgr asks: their I/O
 //! pools, disk channels and netd ports.  Memory is l4h-memd's once it runs
-//! (memd.rs).  See DESIGN.md §9.
+//! (memd.rs).  See DESIGN.md §10.
 
 #![no_std]
 #![no_main]
@@ -560,7 +560,7 @@ fn dom0_plan(h: &mut Host) -> Dom0Plan {
     };
     // dom0's first vNIC takes the uplink NIC's MAC address: networks
     // like GCE's only deliver frames for the instance's own address, so
-    // dom0 is then the host's router (DESIGN.md §8.3).
+    // dom0 is then the host's router (DESIGN.md §9.3).
     let uplink = h.netd.nics.iter().position(|n| n.switch == Some(sw));
     for i in 0..h.cfg.dom0_nics {
         let mac = if i == 0 { uplink.and_then(|n| h.netd.nic_mac(n)).unwrap_or(0) } else { 0 };

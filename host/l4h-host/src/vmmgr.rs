@@ -1,4 +1,4 @@
-//! l4h-vmmgr, the guest manager (DESIGN.md §9.3): its CSpace, its
+//! l4h-vmmgr, the guest manager (DESIGN.md §10.3): its CSpace, its
 //! configuration, its calls to l4h-root, and the pages the two share.
 //!
 //! vmmgr builds guests and runs their lifecycle, schedules their vCPUs and

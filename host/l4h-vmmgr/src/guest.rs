@@ -9,7 +9,7 @@
 //! makes it when vmmgr asks (root.rs), and takes it back after `destroy`.
 //!
 //! Guest RAM is a list of 2 MiB blocks, each its own Untyped from any free
-//! 2 MiB of host memory (DESIGN.md §15.2).  l4h-memd keeps the original
+//! 2 MiB of host memory (DESIGN.md §8.2).  l4h-memd keeps the original
 //! Untyped of every block (memd.rs); the guest gets a copy of those it may
 //! retype (all but the boot blocks, of which vmmgr gets a copy to fill
 //! with frames for the image).  memd revokes the originals at destroy,
@@ -21,7 +21,7 @@
 //! given.  Guest block b is memd's block b less the shared blocks below
 //! it (`memd_block`).
 //!
-//! Above the I/O pool, every guest has a hotplug region (DESIGN.md §17):
+//! Above the I/O pool, every guest has a hotplug region (DESIGN.md §8.5):
 //! guest-physical space up to abi::GPA_END in hotplug blocks of 128 MiB,
 //! which its l4h-vmm plugs and unplugs with memd while it runs.  All the
 //! host makes for it is the level-1 hotplug CNode (16 KiB).
@@ -276,7 +276,7 @@ pub struct Guest {
     /// Guest RAM ranges loaded before boot: the image, which must lie in
     /// what the launch digest covers.
     loaded: Ranges,
-    /// The launch digest, set at boot (DESIGN.md §9.2).
+    /// The launch digest, set at boot (DESIGN.md §10.2).
     pub launch: Option<[u8; 32]>,
     /// Bytes of the module image mapped at KMOD_VA (kimage.rs), 0 if none.
     pub kmod_size: usize,
@@ -781,7 +781,7 @@ impl Guest {
         }
     }
 
-    /// The launch digest (DESIGN.md §9.2): SHA-256 over the image as it is
+    /// The launch digest (DESIGN.md §10.2): SHA-256 over the image as it is
     /// in guest RAM, the boot parameters that locate it, and the command
     /// line.
     fn measure(&self, win: &mut Window, entry: u64, kernel_end: usize, initrd: (usize, usize), cmdline: &[u8]) -> [u8; 32] {

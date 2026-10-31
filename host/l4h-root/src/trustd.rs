@@ -1,4 +1,4 @@
-//! The attestation service, l4h-trustd (DESIGN.md §9.2): finding the TPM,
+//! The attestation service, l4h-trustd (DESIGN.md §10.2): finding the TPM,
 //! starting trustd with it, making guests' attestation devices (vmmgr adds
 //! them to guests), the registry page through which trustd learns about
 //! guests, and what trustd asks root for: raising a device's event when it
@@ -111,7 +111,7 @@ impl Layout {
     }
 }
 
-/// The TPM, from its ACPI table (DESIGN.md §9.2).
+/// The TPM, from its ACPI table (DESIGN.md §10.2).
 #[cfg(target_arch = "x86_64")]
 fn find_tpm(bootinfo: &sel4::BootInfoPtr, phys: &mut crate::acpi::Phys) -> Option<Layout> {
     use crate::blkd::DEVICE_ATTRS;

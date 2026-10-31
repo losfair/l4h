@@ -26,7 +26,7 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-"""Verifier side of l4h attestation (DESIGN.md §9.2).
+"""Verifier side of l4h attestation (DESIGN.md §10.2).
 
   l4h-attest.py measure KERNEL [--initrd F] [--cmdline S]
       The launch digest of a guest booted with these files: what its

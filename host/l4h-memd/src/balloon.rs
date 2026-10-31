@@ -1,4 +1,4 @@
-//! virtio-balloon free page reporting (DESIGN.md §15.4).  When l4h runs in
+//! virtio-balloon free page reporting (DESIGN.md §8.6).  When l4h runs in
 //! a VM whose hypervisor offers it (QEMU's `free-page-reporting=on`), memd
 //! tells the hypervisor which memory is free, so that the hypervisor can
 //! drop it and back it again only when it is used.

@@ -1,4 +1,4 @@
-//! Sizing a guest's I/O pool (DESIGN.md §15.1).  Every buffer a guest's
+//! Sizing a guest's I/O pool (DESIGN.md §8.1).  Every buffer a guest's
 //! virtio devices use bounces through the pool, and a virtio-net driver
 //! keeps its receive ring full: those buffers stay allocated, and must not
 //! leave the pool too small or too fragmented for a disk request, which

@@ -3,7 +3,7 @@
  * Guest-physical memory of the l4h guest, mapped at uml_physmem (GPA 0).
  * The host has mapped the boot blocks (kernel, initrd, a little slack) and
  * the I/O pool; here memblock learns about those.  l4h_caps_init() maps
- * the rest of RAM itself and adds it (DESIGN.md §15.2).
+ * the rest of RAM itself and adds it (DESIGN.md §8.2).
  *
  * The host's I/O pool follows RAM (bootinfo.io_pool_gpa).  It is in the
  * direct map and has struct pages (swiotlb hands out its pages for

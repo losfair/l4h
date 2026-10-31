@@ -1,7 +1,7 @@
 //! A minimal monitor on the serial console (COM1, the GCE serial port, or
 //! the serial_port and serial_irq settings, e.g. COM2 for Supermicro
 //! serial-over-LAN),
-//! for when dom0 is not usable (DESIGN.md §9.1): list, destroy,
+//! for when dom0 is not usable (DESIGN.md §10.1): list, destroy,
 //! restart-dom0 (which vmmgr runs), and reboot.  The kernel keeps printing to the same port; we only take
 //! its receive side.
 

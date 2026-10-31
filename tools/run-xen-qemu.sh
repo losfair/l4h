@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Boot Xen and the dom0 from tools/build-xen-dom0.sh in QEMU/KVM: a stand-in
-# for a large machine partitioned into l4h HVM guests (DESIGN.md §10.2).
+# for a large machine partitioned into l4h HVM guests (DESIGN.md §11.2).
 # Unlike tools/run-qemu.sh, VMX is exposed, for Xen.  The machine has an
 # Intel IOMMU, which Xen needs to pass devices through; devices given to
 # guests must translate through it (iommu_platform=on for virtio).

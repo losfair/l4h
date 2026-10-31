@@ -8,7 +8,7 @@
 # - l4h-attest.py, the verifier of attestation reports;
 # - l4h-manual.pdf, the user manual, showing the tag it was built for.
 # A pushed v* tag also publishes them, with their checksums, as a GitHub
-# release.  aarch64 has no shipped artifacts yet (DESIGN.md §10).
+# release.  aarch64 has no shipped artifacts yet (DESIGN.md §11).
 name: release
 
 on:

@@ -1,4 +1,4 @@
-//! l4h-trustd: attestation for guests (DESIGN.md §9.2).
+//! l4h-trustd: attestation for guests (DESIGN.md §10.2).
 //!
 //! At start, trustd generates a P-256 signing key and has the TPM quote
 //! the PCRs, which hold the measurements of what booted (the UEFI
@@ -16,7 +16,7 @@
 //! ActivateCredential calls are rate limited, so that no guest keeps the
 //! TPM busy for the others.
 //!
-//! Nothing here allocates (DESIGN.md §9): requests are copied, and answers
+//! Nothing here allocates (DESIGN.md §10): requests are copied, and answers
 //! built, in fixed buffers, and the evidence is made once into one.  The
 //! heap is the AML interpreter's (aml::HEAP).
 

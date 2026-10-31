@@ -34,7 +34,7 @@ const START_UUID: [u8; 16] = [
 const START_REVISION: u64 = 1;
 const START_FUNCTION: u64 = 1;
 
-/// trustd's heap, which only the interpreter uses (DESIGN.md §9: the one
+/// trustd's heap, which only the interpreter uses (DESIGN.md §10: the one
 /// allocator in trustd, as the `acpi` crate allocates and cannot do
 /// otherwise).  It holds the namespace the firmware's AML builds at start,
 /// where each method keeps a copy of its bytecode and each named object

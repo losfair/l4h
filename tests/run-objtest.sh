@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Guest RAM blocks converting between frame mode and seL4 object mode
-# (DESIGN.md §15.3): page-table pressure, smp_mm_stress during
+# (DESIGN.md §8.3): page-table pressure, smp_mm_stress during
 # conversions, guest OOM when no 2 MiB block is left.
 # Usage: run-objtest.sh [vcpus]
 set -euo pipefail

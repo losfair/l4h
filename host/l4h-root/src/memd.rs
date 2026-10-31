@@ -1,4 +1,4 @@
-//! l4h-memd (DESIGN.md §16), the owner of the host's free memory and of
+//! l4h-memd (DESIGN.md §8.4), the owner of the host's free memory and of
 //! every guest's RAM: spawning it and handing it the free memory, the free
 //! page reporting device it drives, the calls l4h-root makes to it, and
 //! vmmgr's capabilities to it.
@@ -6,7 +6,7 @@
 //! memd runs before any guest.  The root task's own objects come from
 //! grants of memd's (mem.rs).  Guests' RAM is between vmmgr and memd
 //! (l4h-vmmgr's memd.rs), and memory a guest plugs while it runs (DESIGN.md
-//! §17) between its l4h-vmm and memd.
+//! §8.5) between its l4h-vmm and memd.
 
 use l4h_abi as abi;
 use l4h_host as host;

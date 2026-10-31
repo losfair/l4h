@@ -3,7 +3,7 @@
 //! sized here, each frame a chain of chunks; a backlog is a FIFO of such
 //! frames.  Every backlog takes from the same pool, so its limits are
 //! checks against it, and running out drops a frame instead of growing a
-//! heap (DESIGN.md §9).  Free of seL4 dependencies, like offload.rs.
+//! heap (DESIGN.md §10).  Free of seL4 dependencies, like offload.rs.
 
 use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicBool, Ordering};

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Memory hotplug from the l4h host (DESIGN.md §17), through the memory
+ * Memory hotplug from the l4h host (DESIGN.md §8.5), through the memory
  * device (L4H_DEV_MEM, struct l4h_mem_page).  dom0 sets a target; we plug
  * and unplug hotplug blocks of 128 MiB (one Linux memory block each) until
  * we have that many.  A plugged block brings its own metadata:

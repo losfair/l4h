@@ -84,7 +84,7 @@ typedef int64_t l4h_s64;
 #define L4H_VCPU_EVENT          7   /* frame: event page */
 
 /* Guest RAM is a list of 2 MiB blocks; block b covers GPA
- * [b * L4H_BLOCK_SIZE, (b + 1) * L4H_BLOCK_SIZE).  See DESIGN.md §15.2.
+ * [b * L4H_BLOCK_SIZE, (b + 1) * L4H_BLOCK_SIZE).  See DESIGN.md §8.2.
  *
  * Boot blocks, [0, bootinfo.boot_blocks), hold the kernel image and initrd:
  * the host retyped them into frames and mapped them in the direct map, and
@@ -122,7 +122,7 @@ typedef int64_t l4h_s64;
  * names L4H_HP_BLOCK_CPTR(m, i).  Unplugging m revokes them.  Frames of
  * hotplugged memory are named by L4H_FRAME_CPTR, like the rest of RAM: the
  * guest makes the level-1 RAM CNodes of the region (root slots
- * L4H_SLOT_RAM_L1_BASE + n) itself.  See DESIGN.md §17. */
+ * L4H_SLOT_RAM_L1_BASE + n) itself.  See DESIGN.md §8.5. */
 #define L4H_HP_SHIFT            27
 #define L4H_HP_SIZE             (1ull << L4H_HP_SHIFT)
 #define L4H_HP_BITS             (L4H_HP_SHIFT - L4H_BLOCK_SHIFT)
@@ -436,7 +436,7 @@ enum l4h_mem_op {
  * response, then done = seq, and raises the device's event line.  Bulk
  * data (images) is passed in the device's data area (l4h_dev_desc.data_va),
  * which belongs to the host: the host never reads dom0's RAM.  See
- * DESIGN.md §9.1.
+ * DESIGN.md §10.1.
  *
  * l4h-root refuses every request whose version is not its own, so a bump
  * makes l4hctl of one release unable to talk to the host of another, in
@@ -483,7 +483,7 @@ enum l4h_ctl_op {
 	L4H_CTL_VM_LOAD = 3,
 	/* args: vm, initrd gpa, initrd size; data: cmdline.  The host loads
 	 * its guest kernel and starts it.  Everything VM_LOAD wrote must lie
-	 * in the initrd, which the launch digest covers (DESIGN.md §9.2). */
+	 * in the initrd, which the launch digest covers (DESIGN.md §10.2). */
 	L4H_CTL_VM_START = 4,
 	/* args: vm */
 	L4H_CTL_VM_DESTROY = 5,
@@ -543,7 +543,7 @@ enum l4h_ctl_op {
 	L4H_CTL_RTC_SET = 23,
 	/* -> vals: state (L4H_IOMMU_*), interrupts remapped (0/1), IOMMUs,
 	 * devices confined, devices behind no IOMMU, events logged since
-	 * boot.  AMD IOMMUs only (DESIGN.md §8.5).  dom0 only, like every
+	 * boot.  AMD-Vi or Intel VT-d (DESIGN.md §9.5).  dom0 only, like every
 	 * control call. */
 	L4H_CTL_IOMMU_INFO = 24,
 	/* -> vals[0] = byte length (<= L4H_CTL_DATA_MAX); data: host build
@@ -566,7 +566,7 @@ enum l4h_ctl_op {
 	/* args: vm, target bytes: plug or unplug memory until the VM has this
 	 * much.  The part above its boot RAM is rounded up to whole hotplug
 	 * blocks (L4H_HP_SIZE) and clamped to its region; returns at once, the
-	 * guest plugs and unplugs as it can (DESIGN.md §17). */
+	 * guest plugs and unplugs as it can (DESIGN.md §8.5). */
 	L4H_CTL_VM_SET_MEM = 28,
 	/* args: vm -> vals: boot bytes, region bytes, target bytes, plugged
 	 * bytes (all host memory: a hotplug block counts L4H_HP_SIZE) */
@@ -636,7 +636,7 @@ enum l4h_hypercall {
  * Attestation/flags device (L4H_DEV_ATTEST, flags work without a TPM): requests to
  * l4h-trustd in the device page.  The host proves what it booted with a
  * TPM quote over its signing key, and signs reports about the guest with
- * that key (DESIGN.md §9.2).  Requests are asynchronous:
+ * that key (DESIGN.md §10.2).  Requests are asynchronous:
  *
  * 1. The guest writes op, offset, in_len, blob_len and data, then a new
  *    seq (the previous one plus one), and signals the device's kick

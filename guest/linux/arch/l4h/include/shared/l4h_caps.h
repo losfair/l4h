@@ -25,7 +25,7 @@ bool l4h_ram_mapped(unsigned long gpa, unsigned long size);
 /* Caller pins the whole aligned RAM block. Zero for boot-image blocks. */
 unsigned long l4h_large_frame(unsigned long gpa);
 void l4h_map_kernel_early(unsigned long frame, unsigned long va);
-/* Hotplug blocks (DESIGN.md §17, drivers/memhp.c). */
+/* Hotplug blocks (DESIGN.md §8.5, drivers/memhp.c). */
 bool l4h_hp_contains(unsigned long gpa, unsigned long size);
 int l4h_hp_prepare(unsigned int m);
 int l4h_hp_map(unsigned int m);

@@ -2,7 +2,7 @@
 /*
  * Capability slots, seL4 kernel objects and the RAM of the l4h guest.
  *
- * Guest RAM is a list of 2 MiB blocks (DESIGN.md §15).  The host prepares
+ * Guest RAM is a list of 2 MiB blocks (DESIGN.md §8).  The host prepares
  * the boot blocks [0, bootinfo.boot_blocks): frames, mapped in the direct
  * map.  For every other block the guest holds a copy of its Untyped
  * (L4H_BLOCK_CPTR) and decides what it is:
@@ -20,7 +20,7 @@
  * still pin a part of the block.  A block whose chunks are all empty is
  * free; it forgets its chunks.
  *
- * Blocks change mode as the demand for objects changes (§15.3).  Free
+ * Blocks change mode as the demand for objects changes (§8.3).  Free
  * object blocks beyond a watermark go back to frame mode.  When an object
  * block is taken, a worker keeps a reserve of free ones: it takes a
  * 2 MiB-aligned range from the page allocator, falling back to isolation
@@ -31,7 +31,7 @@
  * is gone (l4h_objmem_wait()), and call the OOM killer if no 2 MiB range can be
  * found, or no capability slot is left (l4h_objmem_oom()).
  *
- * Hotplug blocks (DESIGN.md §17) are 64 blocks above the I/O pool that the
+ * Hotplug blocks (DESIGN.md §8.5) are 64 blocks above the I/O pool that the
  * host plugs while the guest runs (drivers/memhp.c).  Their blocks are
  * never object blocks of the allocator: the last one holds the seL4
  * objects that map the other 63 (l4h_hp_map()), and goes with them.

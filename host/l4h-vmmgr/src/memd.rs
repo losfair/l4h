@@ -1,7 +1,7 @@
-//! vmmgr's calls to l4h-memd (DESIGN.md §16): grants for its own objects,
+//! vmmgr's calls to l4h-memd (DESIGN.md §8.4): grants for its own objects,
 //! and guests' RAM.  Capabilities cross in the mailbox CNode the two
 //! share; memd keeps the originals of what it grants us.  Memory a guest
-//! plugs while it runs (DESIGN.md §17) is between its l4h-vmm and memd:
+//! plugs while it runs (DESIGN.md §8.5) is between its l4h-vmm and memd:
 //! vmmgr only sets the target.
 
 use sel4::{CapRights, cap, cap_type};

@@ -72,7 +72,7 @@ void __init paging_init(void)
  * The vmemmap: struct pages at VMEMMAP_START + pfn, in kernel page tables
  * that the kernel TLB sync mirrors into seL4 like vmalloc's.  The memmap
  * of a hotplug block lives in the block itself (the altmap, DESIGN.md
- * §17); that of boot RAM comes from memblock.
+ * §8.5); that of boot RAM comes from memblock.
  */
 static_assert((1UL << (MAX_PHYSMEM_BITS - PAGE_SHIFT)) * sizeof(struct page) <= VMEMMAP_SIZE);
 

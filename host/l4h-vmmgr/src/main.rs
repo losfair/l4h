@@ -1,4 +1,4 @@
-//! l4h-vmmgr: the guest manager (DESIGN.md §9.3).  Builds guests and their
+//! l4h-vmmgr: the guest manager (DESIGN.md §10.3).  Builds guests and their
 //! l4h-vmm, runs their lifecycle and schedules their vCPUs, serves their
 //! VMMs, their kernels' faults and dom0's control API.  l4h-root spawns it
 //! and keeps the hardware: what guests get of disks, NICs, I/O pools and

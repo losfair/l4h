@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Attestation by the l4h host (l4h-trustd, DESIGN.md §9.2), through the
+ * Attestation by the l4h host (l4h-trustd, DESIGN.md §10.2), through the
  * attestation device (L4H_DEV_ATTEST, struct l4h_attest_page) on hosts
  * (flags work without a TPM):
  *

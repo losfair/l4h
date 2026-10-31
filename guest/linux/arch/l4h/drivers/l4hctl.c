@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * /dev/l4hctl: dom0's access to the l4h control API (DESIGN.md §9.1).
+ * /dev/l4hctl: dom0's access to the l4h control API (DESIGN.md §10.1).
  *
  * ioctl(L4HCTL_IOC_CALL) passes a struct l4h_ctl_req to l4h-root and
  * returns the struct l4h_ctl_resp. For VM_LOAD and BLK_WRITE, source bytes

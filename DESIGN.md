@@ -171,8 +171,9 @@ capabilities.
 E1 adds a flag to `seL4_TCB_SetFlags`. When it is set, *every* syscall
 instruction from that thread raises `seL4_Fault_UnknownSyscall`, which
 carries FaultIP, SP, FLAGS and the argument registers (all GPRs on x86_64;
-X0–X7 on aarch64, plus X8 with patch 0007). The check is in
-`c_handle_syscall` and the fastpath entry, before the syscall range test.
+X0–X7 on aarch64, where patch 0007 puts x8, Linux's syscall number, in
+the Syscall word instead of seL4's). The check sits with the syscall range
+test in the slowpath, and before any fastpath dispatch.
 
 On x86, seL4 opens its spare IDT vectors (above the IRQs) to user level and
 reports `int $N` on them as an unknown syscall, which a trapping thread's
@@ -223,8 +224,8 @@ enforcement, so E3 lets user level share it:
 - A timer fires on the core it was last armed on; migrated vCPUs re-arm.
 - Timers fire from the scheduler, so the woken thread may have blocked in
   the same kernel entry and still hold the current scheduling context.
-  `sendSignal()` already skips the refill check then; its debug assertion
-  that this cannot happen is removed.
+  `sendSignal()` already skips the refill check then; its two debug
+  assertions that this cannot happen are removed.
 
 The guest clockevent invokes `seL4_TCB_SetTimer` on its vCPU's kernel TCB:
 there is no user-level timer server and no IPC hop.
@@ -241,8 +242,8 @@ support, since no device is passed into a guest.
 | 0004 | x86_64 `syscall` entry never saved the user RSP and `sysretq` cleared it (libsel4 keeps RSP in RBX, which hid this). RSP is now saved through a per-node scratch slot and restored on both the slow path and the fastpath. 0027 does the same with SKIM: RSP is saved before loading the kernel CR3 and carried through the per-CPU SKIM scratch word, cleared after each read, with no user-stack access and no extra SKIM mappings. |
 | 0005 | `ipi_wait()` reset its arrival counter and released waiters with two unordered plain stores, which GCC emits in the wrong order; a following remote call could lose arrivals and every core spun forever. |
 | 0010 | `handleIPI()` read a remote call's arguments before checking the call was pending for this core, so a late IPI could replay the previous call: skipped TLB invalidations or invalidation of a reused VSpace root. |
-| 0012 | (x86, MCS) The LAPIC latches a timer interrupt that fires while a core waits for the kernel lock; it was then handled as a new event after the next deadline was armed, meaning another lock wait. Under host load every core looped on stale interrupts and user threads never ran. A timer interrupt that finds the timer still armed is now acknowledged and dropped before the lock (checking 0006's `ksArmedDeadline` first). The aarch64 timer is level-triggered and unaffected. |
-| 0013 | `SchedControl_ConfigureFlags` on an SC whose runnable thread is on another core could enqueue a postponed thread in the remote ready queue too. Only a schedulable thread is enqueued now. The balancer hits this whenever it changes a capped vCPU's budget. |
+| 0012 | (x86, MCS) The LAPIC latches a timer interrupt that fires while a core waits for the kernel lock; it was then handled as a new event after the next deadline was armed, meaning another lock wait. Under host load every core looped on stale interrupts and user threads never ran. A timer interrupt that finds the timer still armed is now acknowledged and dropped before the lock (checking 0006's `ksArmedDeadline` first). The patch is x86-only. |
+| 0013 | `SchedControl_ConfigureFlags` on an SC whose runnable thread is on another core could enqueue a postponed thread in the remote ready queue too. Only a schedulable thread is enqueued now. The balancer can hit this when it changes the budget of a capped vCPU that is running on another core and has used up its budget. |
 | 0014 | (x86, MCS) Every core re-measured the TSC and APIC timer rates from one PIT wraparound and overwrote the shared values; a virtualised PIT can end that wait early (about one GCE boot in three). Rates are measured once, on the boot core, as the median of 5 wraparounds. Countdown conversion from TSC to APIC ticks uses both rates rather than their truncated ratio, and a delay too long for the 32-bit count fires early and is reprogrammed. |
 | 0026 | (aarch64) `TPIDR_EL0`/`TPIDRRO_EL0` are saved in the entry assembly, not in the C entry hook, which a remote stall handled while waiting for the lock can skip. |
 | 0028 | (x86_64) seL4's user segments are laid out as Linux's, so `sysretq` and `iretq` both return with CS 0x33 / SS 0x2b. `sysretq` previously returned with a data-slot CS that faulted when user code reloaded it with `iretq` (.NET's `RtlRestoreContext`). |
@@ -251,7 +252,7 @@ support, since no device is passed into a guest.
 
 | Patch | Change |
 |-------|--------|
-| 0006 | `setNextInterrupt()` no longer rewrites IA32_TSC_DEADLINE when the new deadline is later than one still pending; the interrupt fires early at most once and reprograms. Each write is a VM exit when seL4 runs virtualised; trapped syscalls are 16× faster under nested KVM. |
+| 0006 | `setNextInterrupt()` no longer reprograms the timer when a deadline still pending (`ksArmedDeadline`) is not later than the new one; the interrupt fires early at most once and reprograms. On x86 each reprogram is a write to IA32_TSC_DEADLINE, a VM exit when seL4 runs virtualised; trapped syscalls are 16× faster under nested KVM. |
 | 0017 | (x86_64) Maps into a not-present entry invalidate nothing; remaps that only raise rights invalidate on the current core only; a remap with `seL4_X86_DeferFlush` that only lowers rights (same frame, same memory type) leaves TLBs alone, and `seL4_X64_PML4_Flush` flushes the ASID once afterwards. Stale entries can only grant rights the same frame cap had at the same address; unmapping still invalidates at once. After a raise another core can take a spurious fault, which a user thread survives but a guest kernel thread does not, so the guest never raises rights in place in its kernel VSpace. A 16 MiB fork with three busy threads takes 6 ms instead of 140. |
 | 0019 | At boot, before any user code runs, the kernel scans the free RAM it hands out as Untypeds and clears only pages with a non-zero word, then issues them with a zero free index so their first use does not clear them again. Under a hypervisor, unbacked memory then stays unbacked until written. Device regions and recycled boot memory are excluded; runtime Untyped reset is unchanged and clears unconditionally. On Arm the secondaries switch to the kernel's tables before the scan, and the scan cleans and invalidates the cache range first. |
 
@@ -259,7 +260,7 @@ support, since no device is passed into a guest.
 
 | Patch | Feature |
 |-------|---------|
-| 0007 | (aarch64) UnknownSyscall faults of trapping threads also carry x8, Linux's syscall number. |
+| 0007 | (aarch64) UnknownSyscall faults of trapping threads report x8, Linux's syscall number, in the Syscall word. |
 | 0009 | `seL4_X86_ExecuteNever`: sets XD on 4 KiB, 2 MiB and 1 GiB mappings; boot enables EFER.NXE. The guest maps non-`PROT_EXEC` pages with it, and heap, `.bss` and stack are executable only with `READ_IMPLIES_EXEC` or an executable `PT_GNU_STACK`. Without NX (or with `IA32_MISC_ENABLE.XD_DISABLE`) the attribute is dropped silently. |
 | 0011 | (x86) The multiboot2 header requests a linear framebuffer, for the dashboard (§7.7). |
 | 0015 | (aarch64) Inner-shareable broadcast TLB maintenance at EL1 on 16-bit ASIDs. The kernel refuses to boot unless `TCR_EL1.AS` is set (with 8-bit ASIDs, address spaces differing only in the upper bits would share TLB entries); secondaries check too. The loader gives every core VMID 0, since broadcasts reach only the issuer's VMID. |
@@ -268,7 +269,7 @@ support, since no device is passed into a guest.
 | 0020 | (x86) `fb_console`: kernel output is also drawn on the lower half of a 32-bpp direct-RGB multiboot2 framebuffer below 4 GiB, 8x8 glyphs doubled vertically, wrapping rather than scrolling so the framebuffer is never read. Refused if it overlaps usable RAM or starts below 1 MiB. For machines whose screen is reachable but not their serial port. |
 | 0021 | (x86) Multiboot modules after the root task (up to 8) are copied to page-aligned memory above the root task's image and below 4 GiB, kept out of managed RAM so they reach root as device Untypeds (frames without clearing), and listed with their loader strings in a bootinfo chunk (`SEL4_BOOTINFO_HEADER_X86_BOOT_MODULES`). This is how dom0's files are loaded (§10.1). |
 | 0022 | (x86) Intel CPUs that enumerate the TSC rate in CPUID 0x15 (or 0x16) take it from there, rounded to the nearest MHz; with TSC-deadline the PIT is then unused. Alder Lake and later may gate the 8254, so the PIT wait never ended. VMs (leaf 0x15 zero) still measure with the PIT. |
-| 0023, 0029 | `Page_TestAndClearAccessed` (x86 and ARM) atomically clears and returns the A/AF bit of a frame cap's mapping, for 4 KiB and 2 MiB frames, after verifying the mapped ASID, address, size and physical frame. It does not invalidate TLBs, as with native x86 aging. On ARM without hardware AF updates, seL4 repairs EL0 access-flag faults itself (setting AF and restarting) without fault IPC; `TCR_EL1.HA` stays off. 0029 also adds `Page_DeriveSubframe`, which derives up to 512 consecutive unmapped 4 KiB capabilities from a RAM-backed 2 MiB frame into a validated window of CNode slots, with intersected rights, allocating nothing. Aliases are smaller regions in the derivation tree: deleting the large cap leaves them valid, and revoking the backing Untyped removes all of them and their mappings. |
+| 0023, 0029 | `Page_TestAndClearAccessed` (x86_64, and AArch64 without hypervisor support) atomically clears and returns the A/AF bit of a frame cap's mapping, for 4 KiB frames (0023) and 2 MiB frames (0029), after verifying the mapped ASID, address, size and physical frame. It does not invalidate TLBs, as with native x86 aging. On AArch64 without hardware AF updates (and without hypervisor support), seL4 repairs EL0 access-flag faults itself (setting AF and restarting) without fault IPC; `TCR_EL1.HA` stays off. 0029 also adds `Page_DeriveSubframe` (x86_64 and AArch64), which derives up to 512 consecutive unmapped 4 KiB capabilities from a RAM-backed 2 MiB frame into a validated window of CNode slots, with intersected rights, allocating nothing. Aliases are smaller regions in the derivation tree: deleting the large cap leaves them valid, and revoking the backing Untyped removes all of them and their mappings. |
 | 0024 | (x86) No boot without SKIM unless the CPU reports RDCL_NO (above). |
 | 0025 | (x86) `GetIOAPICRemapped` adds a 16-bit interrupt-remapping table index to the I/O APIC handler arguments and writes the remappable RTE format. Root publishes the matching VT-d IRTE first; seL4 keeps pin masking, acknowledgement and capability lifecycle and does not manage the IOMMU. |
 
@@ -304,7 +305,7 @@ VAES/AVX2 XTS for dm-crypt) is built for l4h. AArch64 does the same in
 also asks; the rest of the kernel is built with `-mgeneral-regs-only`.
 `arch/arm64/crypto` (ARMv8 Crypto Extensions AES, bit-sliced NEON without
 them) is built with a small `asm/assembler.h`. EL0 cannot read the ID
-registers, so root copies those of patch 0018 into each guest's
+registers, so root reads those of patch 0018 and vmmgr copies them into each guest's
 `l4h_bootinfo.cpu_id`, the guest derives `AT_HWCAP` from them, and the AES
 drivers bind through `module_cpu_feature_match()`.
 
@@ -313,9 +314,10 @@ drivers bind through `module_cpu_feature_match()`.
 ```
 arch/l4h/
   kernel/   boot, setup, irq, time, smp, process (switch_to), signal glue, ptrace glue
-  kernel/skas/   software page tables, uaccess and process/syscall glue
+  kernel/   also the software page tables, TLB sync and VSpace mirror (tlb.c, vspace.c)
+  kernel/skas/   uaccess, mm context and process/syscall glue
   os-sel4/  freestanding boot, event and user-thread operations against libsel4
-  drivers/  virtio_l4h transport, hvc console, l4hctl, attestation, memory hotplug, RTC, kmod
+  drivers/  virtio_l4h transport, hvc console, l4hctl, attestation, memory hotplug, RTC, RNG, kmod
   include/  kernel, shared and UAPI headers
   x86/      x86_64 signal frames, TLS, syscall table, vDSO and register glue
   arm64/    native AArch64 ABI, atomics, context switching and module relocations
@@ -392,8 +394,9 @@ hooks (§10.2) and the Android features of §5.8.
   1. A user access to an unmapped address raises an seL4 VMFault, which
      reaches the vCPU's kernel TCB.
   2. The kernel runs `handle_mm_fault`.
-  3. It copies the frame cap into a slot of that mm's CNode and maps it
-     with the rights from the PTE, under the PTE lock.
+  3. It copies the frame cap into a free slot of the guest's slot CNodes
+     (`l4h_cap_copy`) and maps it with the rights from the PTE, under the
+     PTE lock.
   4. It replies to the fault.
 - **Accessed and dirty bits.** Dirty is software: clean writable pages are
   mapped read-only until the first write, whose fault sets `pte_dirty`
@@ -414,13 +417,16 @@ hooks (§10.2) and the Android features of §5.8.
   - MGLRU, DAMON, idle-page tracking and NUMA balancing are disabled; they
     would need hardware-bit support.
 - **Cap-slot tracking.** Every seL4 mapping needs its own frame-cap copy.
-  PTE pages are allocated at order 1, and the second 4 KiB holds a parallel
-  512-entry array of CNode slot indices, so unmapping is O(1).
-- **Bulk operations.** Exit, `exec` teardown, `fork` COW downgrade and large
-  `munmap`/`mprotect` (above a threshold) delete the mm's seL4 VSpace and
-  CNode instead of unmapping page by page, and let faults repopulate it;
-  fork followed by exec stays cheap. A VSpace that leaves its mm (exit, or
-  eviction from the pool) is emptied after the entry is detached, outside
+  Each address space records every mapping's slot in an xarray (virtual
+  page → slot | rights | pfn; a second xarray, `as->large`, for 2 MiB
+  leaves), so an unmap deletes the slot without a search and a remap with
+  unchanged rights is skipped.
+- **Emptying a VSpace.** When the last user leaves an mm (exit, or exec
+  replacing it), `arch_exit_mmap()` → `l4h_mm_release()` empties its pool
+  VSpace rather than unmapping page by page; `munmap` and `mprotect` sync
+  per page, and fork's write-protect remaps are batched with `DeferFlush`
+  (below). A VSpace that leaves its mm (exit, or eviction from the pool) is
+  emptied after the entry is detached, outside
   the pool lock, so other vCPUs keep running. Its page tables go first,
   highest level first: unmapping one invalidates the ASID once and removes
   everything below it, so the frame capabilities are then deleted without a
@@ -510,7 +516,8 @@ at priority `P_U < P_K`:
 - its VSpace is the mm's VSpace and its CSpace is empty;
 - `trapSyscalls` (E1) is set;
 - its fault handler is a badged copy of `EP_v` for the vCPU it runs on,
-  the badge being the task ID;
+  the badge identifying the user context (`L4H_EP_BADGE_TASK` plus a
+  per-context ID);
 - it has its own MCS reply object, into which the kTCB receives its
   faults.
 
@@ -528,7 +535,7 @@ context switch never copies FPU state.
 **Return to user, switching from task A to task B:**
 
 ```
-seL4_TCB_SetSchedParams(uTCB_A, …, SC=null)
+seL4_SchedContext_UnbindObject(SC_U, uTCB_A)
 seL4_TCB_SetSchedParams(uTCB_B, …, SC=SC_U, fault_ep=EP_v[badge B])
 seL4_ReplyRecv(B's reply object, …)   (or seL4_Recv if B was preempted)
 ```
@@ -584,8 +591,8 @@ mapped to signals: #GP to SIGSEGV, #UD to SIGILL, #DE to SIGFPE, `int3` to
 SIGTRAP. `int 0x80` is rejected (no 32-bit compat). The legacy vsyscall
 page is not supported (`vsyscall=none`).
 
-**TLS and FS/GS.** `arch_prctl(ARCH_SET_FS)` maps to `seL4_TCB_SetTLSBase`
-or WriteRegisters `fs_base`. With `KernelFSGSBase=inst`, userspace
+**TLS and FS/GS.** `arch_prctl(ARCH_SET_FS)` updates the saved `fs_base`,
+marked dirty, which reaches the uTCB through WriteRegisters. With `KernelFSGSBase=inst`, userspace
 `wrfsbase` works natively, and HWCAP2_FSGSBASE is advertised.
 
 **Time.**
@@ -911,13 +918,15 @@ cross libc headers); `KEMU_CMDLINE=kemu.jit=0` checks the interpreter.
 
 - vCPU *v* consists of `kTCB_v`, `SC_K,v`, `SC_U,v`, `EP_v` and `N_v`. The
   boot vCPU starts at the ELF entry, and secondaries start at
-  `l4h_secondary_entry` when the host resumes them at the guest's request.
+  `l4h_secondary_entry`: the guest starts each by writing its kTCB's
+  registers and resuming it (`l4h_start_vcpu()`).
   CPU hotplug is not supported (`HOTPLUG_CPU` is off).
 - **IPIs.** The sender sets a reason bit in the target's IPI word and
   signals `N_target` with the IPI badge. seL4 delivers the signal across
   cores with a hardware IPI when needed.
 - **TLB shootdown for guest mms** is seL4's job (§5.3), so
-  `flush_tlb_mm_range` only updates the mirror and never IPIs other vCPUs.
+  `flush_tlb_range`/`flush_tlb_mm` only update the mirror and never IPI
+  other vCPUs.
 - **Moved threads.** When Linux moves a thread to another vCPU, the mm is
   marked `moved` (by `prepare_user()` when the thread's fault endpoint
   changes vCPU), and its next TLB sync or unmap flushes its VSpace first
@@ -1071,8 +1080,9 @@ top: a guest capped at 25% sees about 75% steal (`tests/run-m6test.sh`).
 - x86_64 seL4 has 4096 ASIDs, and a guest holds 66: its kernel VSpace, 64
   process VSpaces and its VMM. That allows about 61 guests;
   `MAX_GUESTS` is 64.
-- Free root CNode slots are coalesced ranges, so the slot ranges of vNIC
-  ports and disk DMA buffers are reused after destroy.
+- Free root CNode slots are kept in a bitmap, so the slot ranges of vNIC
+  ports and disk DMA buffers can be allocated again as ranges after
+  destroy.
 - Interrupt vectors are split: NICs 0–3, the serial monitor 8, disks 16–79.
 - `tests/run-limits.sh` fills the host and checks that it recovers.
 - **Density.** `tests/run-density.sh` runs 30 guests of 256 MiB on 4 cores
@@ -1231,9 +1241,10 @@ pool, and host components map only host-owned pages.
   block is added to memblock once mapped; object blocks are added and
   reserved, so they have struct pages.
 - **Host accounting.** A host-object arena starts with an estimate of what
-  its owner needs and grows from free blocks, 1 MiB at a time
-  (`Arena::retype`). The VMM's estimate is what it maps (image and 512 KiB
-  stack; it has no heap).
+  its owner needs and grows from free blocks, by at least 1 MiB
+  and preferably an eighth of the arena (`Arena::retype`, `Arena::reserve`).
+  The VMM's estimate is what it maps (image and 1 MiB stack; it has no
+  heap).
 - **Buddy merging.** Guest RAM comes back in 2 MiB blocks, so free memory
   would end up in 2 MiB pieces and an I/O pool could no longer be found.
   The allocators keep the Untyped of every block they split and merge two
@@ -1363,10 +1374,11 @@ grow and shrink without going through `l4h-root`.
   hotplug operations only (§8.5); root mints those endpoints, since vmmgr's
   own badged one cannot be minted again.
 - **Grants.** When a client's free blocks cannot meet a request, it takes an
-  untouched Untyped of 16 MiB (or exactly the request, if larger; or 2 MiB,
-  if memd has no 16 MiB block) from memd (`MEMD_ALLOC`) and splits it.
+  untouched Untyped of 16 MiB, or the request if larger (if memd has none
+  that large, exactly the request, at least 2 MiB), from memd (`MEMD_ALLOC`) and splits it.
   Grants are never merged with each other. When a destroy or failed create
-  leaves root more than 48 MiB of free blocks, it merges them and returns
+  leaves a client (root or vmmgr) with 48 MiB or more of free blocks, it
+  merges them and returns
   whole grants beyond 32 MiB (`MEMD_FREE`, `Alloc::trim`); merging after
   every destroy would make creates a fifth slower (§8.2). Host objects,
   arenas, I/O pools and ASID pools come from these blocks.
@@ -1385,14 +1397,15 @@ grow and shrink without going through `l4h-root`.
   VSpace roots gone first, deleting the frames unmaps nothing; the other
   way round, each frame was unmapped with a TLB shootdown (585 ms instead of
   about 120 for a stopped 128 MiB guest).
-- **Free memory** for `host_info`, the monitor and the dashboard is the
-  clients' free blocks plus memd's, which memd publishes in a status page
-  (`l4h_host::memd::Status`).
+- **Free memory.** memd publishes its free blocks in a status page
+  (`l4h_host::memd::Status`). `host_info` reports root's, vmmgr's and
+  memd's free blocks; the monitor and dashboard show root's and memd's.
 - **Trust.** memd is in the host TCB. It cannot read memory: every Untyped
   it has handed out has a child, so it cannot retype it, and revoking it
   first makes seL4 clear the memory before reuse. It can revoke what it
-  handed out, and if it faults, root's next call never returns: the host
-  stops.
+  handed out, and if it faults, a keeper thread answers its callers with
+  an error, so memory requests (grants, guest creation, hotplug) fail from
+  then on.
 - **Scheduling.** memd runs on core 0 at `PRIO_KERNEL + 2`, above every
   guest, with a full budget: root waits for it.
 - **Limits.** Only the table: its size follows the host's memory, and no
@@ -1470,11 +1483,11 @@ Untypeds reclaims everything it made. Plugging does not involve
   |---|---|
   | 0 | its memmap (`MHP_MEMMAP_ON_MEMORY`) |
   | 1–62 | RAM |
-  | 63 | the level-2 RAM CNodes of blocks 0–62 and the page tables mapping them in the direct map (1.26 MiB), retyped straight from its Untyped; its pages stay `PageOffline` |
+  | 63 | the level-2 RAM CNodes of blocks 0–62 and the page tables mapping them in the direct map (about 1.23 MiB), retyped straight from its Untyped; its pages stay `PageOffline` |
 
   The guest sees 124 MiB of each block. A plug takes from its other memory
-  only the 2 KiB level-2 hotplug CNode, a level-1 RAM CNode per new GiB, a
-  1 KiB table of page-table slots, and the vmemmap's page tables (a Linux
+  only the 2 KiB level-2 hotplug CNode, a level-1 RAM CNode per new GiB, two
+  small tables (about 1 KiB together) of page-table and large-frame slots, and the vmemmap's page tables (a Linux
   and an seL4 page table per hotplug block, kept for the next plug there).
   - Plug: those CNodes, a plug request, map, `add_memory_driver_managed`.
     Block 63's pages are skipped by an online page callback, and a memory
@@ -1542,8 +1555,9 @@ occupy the hypervisor's RAM.
   2 GiB of one, at most 32; one report is in flight at a time. Each free
   block is *free* (since a time), *reporting* or *reported*. Splitting
   passes the state to the halves, and merging two reported halves gives a
-  reported parent. Clients' cached free blocks (at most 32 MiB beyond use)
-  are not reported.
+  reported parent. Clients' cached free blocks (up to about 48 MiB per
+  client: 32 MiB kept after a trim, plus up to one grant before one) are not
+  reported.
 - **Reuse.** A block being reported is not used until the device returns
   it: allocation skips such blocks, and waits (up to 2 s) when nothing else
   fits. Reported blocks are used like others: their contents read as zero,
@@ -1577,13 +1591,15 @@ device, with no trapped accesses:
 
 - **Device page.** A shared 4 KiB frame laid out like the virtio-mmio
   register file plus the device config space. Reads are plain loads.
-- **Synchronous register writes** (status, feature select, queue setup,
-  `QueueReady`, reset) go through `seL4_Call(vmm_ep, op, args)`. They are
-  rare.
-- **Queue kick.** The guest sets a bit in the device page, then calls
-  `seL4_Signal(vmm_notif)`. This is asynchronous, and the guest honours
-  `VRING_AVAIL_F_NO_NOTIFY` and event-idx suppression, so most kicks are
-  avoided.
+- **Writes with side effects** (status including reset, driver features,
+  queue setup and ready, config writes, IRQ routes) are written to the page
+  and committed with an `L4H_HC_DEV_WRITE` hypercall, a `seL4_Call` to the
+  VMM. They are rare.
+- **Queue kick.** The guest atomically sets the queue's bit in the device
+  page's `kick` word and calls `seL4_Signal` on the device's kick
+  notification only if the bit was clear, so kicks issued before the VMM
+  collects the bits cost no further signal. The VMM offers no event-idx or
+  used-ring notification suppression.
 - **Device interrupt.** The VMM sets an event bit in the target vCPU's
   event page, then signals `N_v`. The `l4h-irq` irqchip maps event bits to
   Linux IRQs. Virtio event owners implement `irq_set_affinity`, so standard
@@ -1722,8 +1738,8 @@ firewalling belong in a VM.
   the uplink of one switch; a switch without one is internal. VLAN tags pass
   through untouched. VLAN-aware switching, jumbo MTUs on guest ports, static
   MAC entries and port rate limits are not implemented.
-- **Ports and copies.** A vNIC has TX and RX rings of 2 KiB frame slots
-  shared by its VMM and netd, in memory of the guest's root arena; root adds
+- **Ports and copies.** A vNIC has TX and RX rings of 24 frame slots of
+  68 KiB each, so a slot holds a whole 64 KiB TSO frame, shared by its VMM and netd, in memory of the guest's root arena; root adds
   and removes ports with `NETD_ADD_PORT`/`NETD_REMOVE_PORT`. The guest
   bounces buffers through its I/O pool, the VMM copies between pool and
   port slots, and netd copies slot to slot or slot to NIC DMA buffer.
@@ -1880,7 +1896,9 @@ to the outside.
 - **Memory hotplug.** `L4H_DEV_MEM`, every guest (§8.5).
 - **RTC.** `/dev/rtc0`, with alarms, on the host's wall clock (§5.8).
 - **Display.** virtio-gpu, 2D (§9.6).
-- **Not implemented:** virtio-rng, virtio-vsock and a guest virtio-balloon.
+- **Random numbers.** `/dev/hw_random` uses RDRAND (`drivers/rng_l4h.c`);
+  there is no virtio-rng.
+- **Not implemented:** virtio-vsock and a guest virtio-balloon.
 
 ### 9.5 IOMMU (AMD-Vi and Intel VT-d)
 
@@ -1910,9 +1928,10 @@ Common behaviour:
   mapped buffers and permitted interrupts, since the IOMMU cannot tell them
   apart; root logs each device's shared requester at attach. Other groups
   stay isolated.
-- **Interrupt remapping** (`iommu_intremap`, on by default). Each group gets
-  an interrupt table, and each entry permits exactly one vector, delivered
-  to APIC ID 0. The common `Iommu::msi` interface returns the MSI address and
+- **Interrupt remapping** (`iommu_intremap`, on by default). Each entry
+  permits exactly one vector, delivered to APIC ID 0: AMD-Vi gives each
+  group its own table, and VT-d has one table per remapping unit whose
+  entries each also name one requester ID. The common `Iommu::msi` interface returns the MSI address and
   data: VT-d puts the table index in the remappable MSI address, AMD-Vi in
   the MSI data. Root programs blkd's and netd's MSI-X with them, so drivers
   write the MSI-X table unchanged, and a device can raise only its group's
@@ -2109,8 +2128,8 @@ queue sizes) or from the host (memd's table), and lives in fixed arrays and
 tables. Where allocation is truly needed, it is bounded by a stated limit
 checked before the allocation, fails as an error rather than a panic, and is
 never made per request on a path whose size a guest or client controls. A
-component without a heap says so (`component!(main, no_heap)`) and does not
-link `alloc`: root, vmmgr, memd, netd, blkd and the VMM have none, and keep
+component without a heap says so (`component!(main, no_heap)`, or for root
+a `#[root_task]` without `heap_size`) and does not link `alloc`: root, vmmgr, memd, netd, blkd and the VMM have none, and keep
 state too large for a stack in statics (`l4h_host::fixed::{StaticCell,
 Scratch}`). The one heap is trustd's, for the third-party AML interpreter of
 the TPM start method; its size (`aml::HEAP`) is bounded by the firmware's
@@ -2186,13 +2205,17 @@ into the guest's boot blocks, builds the kernel VSpace and
 `struct l4h_bootinfo`, then starts vCPU0 at the entry point with `rdi`
 (`x0` on aarch64) pointing at boot info. It holds:
 
-- the guest ABI version (`L4H_ABI_VERSION`, currently 6);
-- RAM size, direct-map base, block and boot-block counts;
-- the I/O pool's GPA and size, and the hotplug region's;
+- a magic number and the guest ABI version (`L4H_ABI_VERSION`, currently 6);
+- the guest id;
+- RAM size, direct-map base (`ram_base_va`), block and boot-block counts;
+- the kernel's end and the initramfs's GPA and size;
+- the I/O pool's and the hotplug region's GPA and size;
 - the vCPU count and pre-assigned VSpace count;
-- the device table and the module image's address;
+- the time-counter frequency (`tsc_hz`);
+- boot flags (`L4H_BOOT_DOM0`);
+- the device table;
+- the kernel module image's address and size (`kmod_va`, `kmod_size`);
 - the command line;
-- the time-counter frequency and flags;
 - on aarch64, the CPU feature ID registers.
 
 Capability slots and special mappings, including event-page addresses, are
@@ -2448,7 +2471,8 @@ The chain has four links.
    - the quote's qualifying data is K's hash;
    - the PCR values match the quote's digest, and PCR 15 is zero;
    - the PCRs have the expected values (`--pcr`);
-   - the EK certificate chains to the manufacturer's CA (`--ek-ca`);
+   - the EK certificate is issued directly by the CA certificate given with
+     `--ek-ca` (no chain building);
    - the report verifies under K and carries the verifier's nonce and the
      expected launch digest. `measure` computes the digest from the kernel
      (`vmlinux` in a release's debug archive), initramfs and command line.
@@ -2558,7 +2582,8 @@ command failure returns `-EIO`.
 
 **TPM interfaces**, following Linux's `tpm_crb` and `tpm_tis`:
 
-- **FIFO (TIS)**, start method 6: locality 0's registers at 0xfed40000.
+- **FIFO (TIS)**, start method 6: locality 0's registers at the TPM2
+  table's address, or 0xfed40000 if it gives none.
 - **CRB**, start method 7: the locality registers, the control area at 0x40
   in their page, and the command and response buffers it names. Buffer
   sizes come from the CRB registers; Linux also clips them to the device's
@@ -2708,7 +2733,8 @@ root.
   kernel, `l4h-root` (with the service ELFs), the guest kernel and its
   module tree (§5.6). GRUB loads dom0's initramfs and `l4h.conf` from the
   EFI partition it was loaded from or, since `$cmdpath` is empty under OVMF,
-  the first partition with `/l4h/dom0/initrd` (§10.1). It passes
+  the first partition with `/l4h/dom0/initrd` (or else `/l4h/l4h.conf`)
+  (§10.1). It passes
   `console_port`/`debug_port` (0x3f8 or `serial_port`) explicitly, because
   UEFI firmware need not fill in the BIOS data area seL4 otherwise reads.
   Initramfs images for other guests come through the dom0 API. QEMU can also
@@ -2752,12 +2778,15 @@ root.
     without debug information;
   - `l4h-bios-x86_64.tar.xz`: l4h's BIOS files, with each variant's kernel as
     `kernel-VARIANT.elf`, for the installer;
-  - `l4h-dom0-x86_64.tar.xz` (`tools/build-dom0.sh`): the `ARCH=l4h` kernel
-    without debug information, its config, a static `l4hctl` and an example
-    `l4h.conf`, for a dom0 of any distribution;
+  - `l4h-dom0-x86_64.tar.xz` (`tools/build-dom0.sh`): the dom0 userspace
+    package, a static `l4hctl`, an example `l4h.conf` and the installer
+    (`install.py` and its static initramfs), for a dom0 of any distribution;
+    the kernel is in the UEFI application;
   - `l4h-debug-x86_64.tar.xz`: the unstripped build (root, components, each
-    variant's kernel), for `addr2line` on fault addresses;
-  - `l4h-attest.py`, the attestation verifier (§10.2).
+    variant's kernel and the guest kernel `vmlinux`), for `addr2line` on
+    fault addresses;
+  - `l4h-attest.py`, the attestation verifier (§10.2);
+  - `l4h-manual.pdf`, the user manual.
 
   No aarch64 binaries are published.
 - **Version.** Host builds use `L4H_VERSION` when set, otherwise `git
@@ -2811,7 +2840,7 @@ root.
    instance and volumes and keeps AMIs and snapshots. See `tests/ec2.md`.
 4. **Bare metal: Latitude.sh m4.metal.small** (Supermicro H13SRE-F, AMD
    EPYC 4244P, Intel X550, Micron 7500 NVMe; UEFI), deployed with
-   l4h-sandbox (`deployments/latitude-sh-l4es`). It needs the
+   the separate l4h-sandbox repository (its `deployments/latitude-sh-l4es`). It needs the
    `xapic-nopcid` variant and these settings (`l4h.conf` keys, §10.1):
    - The variant: the firmware leaves x2APIC off (`L4H_LAPIC_MODE=XAPIC`),
      and the CPU has no PCID (`L4H_PCID=OFF`; seL4 otherwise stops in its
@@ -2953,7 +2982,7 @@ curl -fsSL https://raw.githubusercontent.com/losfair/l4h/main/tools/install.sh |
 | FaultIP | advance by 2 | advance by 4 |
 | FPU access (E2) | XSAVE area | V-regs + FPSR/FPCR |
 | Guest VA | 47-bit | 48-bit TTBR0, user space limited to 47 bits |
-| TLS | `fs_base` | `TPIDR_EL0` (`seL4_TCB_SetTLSBase`) |
+| TLS | `fs_base` | `TPIDR_EL0`, in the saved user registers |
 | Timer (E3) | LAPIC TSC-deadline or countdown | ARM generic timer |
 | vDSO clock | `rdtsc` | none yet (syscall) |
 | Drivers | Rust virtio-net/blk/scsi PCI, NVMe, gVNIC, ENA, X550 | the same drivers; ECAM, BAR assignment and GICv2m MSI-X |
@@ -3035,7 +3064,7 @@ syscall-heavy microbenchmarks.
 | page fault (anon) | 5–6.5 µs | Fault IPC, `handle_mm_fault` and `Page_Map`. |
 | context switch | | Two `SetSchedParams` and a reply; no FPU copying. |
 | `clock_gettime` | ~40 ns | vDSO on x86_64; a syscall on aarch64. |
-| fork | | Lazy refault of parent and child; whole-VSpace deletion instead of per-page downgrades. |
+| fork | | Lazy refault of the child; the parent's write-protect remaps batched with one ASID flush (patch 0017). |
 | disk I/O | | One bounce copy by the guest through its I/O pool, plus two host queue hops. |
 | network | | The guest bounces through its I/O pool; the VMM and netd copy between pool, port and NIC buffers (§9.3). |
 
@@ -3209,7 +3238,8 @@ tools/mkinitramfs.sh build/my.cpio.gz my-init-script
 tools/run-dom0.sh build/my.cpio.gz "console=hvc0" 600   # output in build/qemu.log
 ```
 
-Inside dom0, `l4hctl help` lists the control commands, for example:
+Inside dom0, `l4hctl` with no arguments prints the control commands, for
+example:
 
 ```sh
 l4hctl version                       # running host's version, e.g. v2026.10.1
@@ -3281,3 +3311,5 @@ machine and guests of 256–512 MiB.
 | `tests/run-debian.sh`, `tests/run-workload.sh` | Debian + systemd, fio verify, parallel build, fsck (`tests/mkdebian.sh` first) |
 | `tests/run-bench.sh`, `tests/run-vmbench.sh`, `tests/run-startbench.sh` | micro-benchmarks, guest cost, start latency |
 | `tests/run-fuzz.sh` | hostile-guest virtqueue fuzzing of l4h-vmm |
+| `tests/run-skimtest.sh` | the skim-xapic-nopcid variant on a Meltdown-affected CPU without PCID/x2APIC: SKIM mappings and syscall state at the user/kernel boundary (`tests/skim-qemu.py`, GDB) |
+| `python3 tests/blkmq-qemu.py` | block multiqueue and fsync suites under local QEMU (`--suite blkmq\|fsync`, `--guest-queues`, `--scsi-queues`); run by hand |

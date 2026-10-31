@@ -1,5 +1,5 @@
 //! l4h-memd, the owner of the host's free memory and of every guest's RAM
-//! (DESIGN.md §16): its CSpace, the calls l4h-root and l4h-vmmgr make to
+//! (DESIGN.md §8.4): its CSpace, the calls l4h-root and l4h-vmmgr make to
 //! it, and the status page it keeps for them.
 //!
 //! memd's CSpace is one CNode of 2^cnode_bits slots (MemdConfig), with a
@@ -81,7 +81,7 @@ pub const MEMD_BALLOON: u64 = 7;
 /// MR0 = guest, MR1 = hotplug blocks: its target, clamped to its region.
 pub const MEMD_SET_TARGET: u64 = 8;
 
-/// From a guest's l4h-vmm (the guest is the badge's), DESIGN.md §17.  The
+/// From a guest's l4h-vmm (the guest is the badge's), DESIGN.md §8.5.  The
 /// reply's MR0 is 0 or an errno: EINVAL, ENOSPC, EBUSY.
 /// MR0 = m: plug hotplug block m, copying the Untypeds of its 64 blocks
 /// into the guest's level-2 hotplug CNode in slot m of its hotplug CNode.

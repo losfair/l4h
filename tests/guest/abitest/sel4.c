@@ -765,7 +765,7 @@ static int io_pool_test(void)
 	return 0;
 }
 
-/* ---- seL4 semantics of Untyped copies (DESIGN.md §15.2)
+/* ---- seL4 semantics of Untyped copies (DESIGN.md §8.2)
  *
  * l4h-root keeps the original Untyped of each 2 MiB block of guest RAM and
  * gives the guest a copy.  Check, on a 64 KiB Untyped `orig` with a copy

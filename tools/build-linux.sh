@@ -12,7 +12,7 @@ case "$arch" in
     *) echo "unsupported L4H_ARCH: $arch" >&2; exit 1 ;;
 esac
 if [ ! -d "$src" ]; then
-    echo "missing $src: extract linux-6.18.y there (see DESIGN.md §13)" >&2
+    echo "missing $src: extract linux-6.18.y there (see DESIGN.md §14)" >&2
     exit 1
 fi
 if [ ! -f "$kemu/overlay/kernel/kemu/Kconfig" ]; then

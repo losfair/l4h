@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build a disk image that boots under UEFI and BIOS (DESIGN.md §10): GPT
+# Build a disk image that boots under UEFI and BIOS (DESIGN.md §11): GPT
 # with an EFI system partition and a BIOS boot partition.  The ESP holds
 # l4h as one UEFI application (tools/mkefi.sh), with the guest kernel in
 # it, l4h's BIOS files in /l4h/bios (tools/mkbios.sh) and, optionally,

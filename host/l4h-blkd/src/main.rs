@@ -4,7 +4,7 @@
 //! validated against the client's I/O pool and its LBA window and handed to
 //! the device by physical address: the device reads and writes the pool
 //! directly, never guest RAM (the guest bounces through the pool with
-//! swiotlb).  See DESIGN.md §8.2.
+//! swiotlb).  See DESIGN.md §9.2.
 
 #![no_std]
 #![no_main]

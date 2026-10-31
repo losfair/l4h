@@ -1,4 +1,4 @@
-//! l4h-vmmgr, the guest manager (DESIGN.md §9.3): spawning it with what it
+//! l4h-vmmgr, the guest manager (DESIGN.md §10.3): spawning it with what it
 //! needs, and serving its calls (l4h_host::vmmgr).
 //!
 //! vmmgr builds and runs the guests.  Root keeps what devices reach: each

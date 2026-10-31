@@ -1,4 +1,4 @@
-//! The part of the control API (DESIGN.md §9.1) that root serves: the
+//! The part of the control API (DESIGN.md §10.1) that root serves: the
 //! host's disks, switches and NICs, its IOMMU, clock and reset.  vmmgr
 //! parses dom0's requests and passes these on as integers
 //! (l4h_host::vmmgr::VMMGR_HOST_OP); root reads no request of dom0's.

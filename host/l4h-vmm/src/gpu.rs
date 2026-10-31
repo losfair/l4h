@@ -1,4 +1,4 @@
-//! virtio-gpu, 2D, one scanout (DESIGN.md §8.6).  A resource's content is
+//! virtio-gpu, 2D, one scanout (DESIGN.md §9.6).  A resource's content is
 //! its backing, which lies in the guest's I/O pool like every buffer of a
 //! virtio-l4h device: the guest's DMA layer copies a buffer there when the
 //! driver transfers it to the host, so TRANSFER_TO_HOST_2D has nothing

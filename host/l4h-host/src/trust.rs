@@ -1,4 +1,4 @@
-//! l4h-trustd: the attestation service (DESIGN.md §9.2).  Each guest has
+//! l4h-trustd: the attestation service (DESIGN.md §10.2).  Each guest has
 //! an attestation device (L4H_DEV_ATTEST): a request page, which trustd
 //! maps at page_va(guest), and the kick notification, badged with
 //! kick_badge(guest).  trustd answers in the page and has root raise the
@@ -107,7 +107,7 @@ pub struct GuestRecord {
     pub ram: u64,
     pub vcpus: u32,
     pub flags: u32,
-    /// The launch digest (DESIGN.md §9.2): SHA-256 of the kernel image,
+    /// The launch digest (DESIGN.md §10.2): SHA-256 of the kernel image,
     /// initramfs and command line the guest booted with.
     pub launch: [u8; 32],
     pub reserved: u64,

@@ -1,5 +1,5 @@
 //! Fixed-capacity containers for host components, which do not allocate
-//! (DESIGN.md §9): their storage is inline, sized by a constant, and a
+//! (DESIGN.md §10): their storage is inline, sized by a constant, and a
 //! push beyond it fails instead of growing.
 
 use core::mem::MaybeUninit;

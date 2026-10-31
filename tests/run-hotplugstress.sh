@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Memory hotplug under stress (DESIGN.md §17): three 2-vCPU VMs under
+# Memory hotplug under stress (DESIGN.md §8.5): three 2-vCPU VMs under
 # memory load (tests/guest/hpstress.c, smp_mm_stress, tmpfs) resized to
 # random targets every few seconds, oversubscribing the host, with VMs
 # destroyed in the middle of a resize (tests/guest/init-hotplugstress).

@@ -2,7 +2,7 @@
 # Build l4h's files for BIOS (non-UEFI) machines: the seL4 kernel,
 # l4h-root (with the service ELFs), the guest kernel and its module tree,
 # and grub.cfg, the GRUB script that boots them with multiboot2 (DESIGN.md
-# §10).  BIOS GRUB cannot carry these in its core image as the UEFI
+# §11).  BIOS GRUB cannot carry these in its core image as the UEFI
 # application does in its memdisk (tools/mkefi.sh): the core image must fit
 # in a few hundred KiB.  They live on a filesystem GRUB reads instead, in
 # one directory $l4h:

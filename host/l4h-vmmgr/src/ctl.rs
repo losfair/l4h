@@ -1,4 +1,4 @@
-//! The control API for dom0 (DESIGN.md §9.1): requests arrive in dom0's
+//! The control API for dom0 (DESIGN.md §10.1): requests arrive in dom0's
 //! control page (struct l4h_ctl_req), the response is written next to it.
 //! vmmgr serves the guests' ops; root those on the host's disks, switches
 //! and NICs, which vmmgr passes on as integers (root.rs, VMMGR_HOST_OP).

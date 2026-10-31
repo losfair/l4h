@@ -1,6 +1,6 @@
 //! l4h-vmm: the per-guest virtual machine monitor.  Serves the guest's
 //! hypercalls and implements its virtio-l4h devices on top of the host
-//! drivers (blkd, netd).  See DESIGN.md §8.
+//! drivers (blkd, netd).  See DESIGN.md §9.
 
 #![no_std]
 #![no_main]

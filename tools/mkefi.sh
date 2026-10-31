@@ -3,7 +3,7 @@
 # the seL4 kernel, l4h-root, the guest kernel that dom0 and every VM run
 # and its module tree (DESIGN.md §5.6).  dom0's initramfs and the settings
 # come from the EFI system partition the application was loaded from
-# (DESIGN.md §10):
+# (DESIGN.md §11):
 #   /l4h/dom0/initrd    dom0's initramfs (optional)
 #   /l4h/l4h.conf       host and dom0 settings (optional; see the manual)
 # GRUB passes these to l4h-root as boot modules.  The partition is the
@@ -11,7 +11,7 @@
 # with /l4h/dom0/initrd (or /l4h/l4h.conf).
 # Measured boot: the firmware measures this application, with everything
 # in it, into PCR 4; GRUB's tpm module measures what it reads (the files
-# above) into PCR 9 and its commands into PCR 8 (DESIGN.md §9.2).
+# above) into PCR 9 and its commands into PCR 8 (DESIGN.md §10.2).
 # L4H_KERNEL_VARIANT selects a built seL4 variant when kernel.elf is omitted.
 # Usage: mkefi.sh <out.efi> [l4h-root.elf] [kernel.elf]
 # L4H_GUEST_KERNEL is the guest kernel (default: build/linux-l4h/vmlinux)

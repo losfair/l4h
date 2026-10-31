@@ -1,5 +1,5 @@
 // Guest-owned memory: conversion of RAM blocks between frame mode and
-// seL4 object mode (DESIGN.md §15.3), run inside an l4h guest by
+// seL4 object mode (DESIGN.md §8.3), run inside an l4h guest by
 // tests/run-objtest.sh.
 //  1. Page-table pressure: processes touch one page every 2 MiB of a large
 //     sparse mapping, so that each touch needs a page table; object blocks
