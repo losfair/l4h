@@ -1,0 +1,75 @@
+From 09b5e0a3ccdc92e2e44b85c1881951d00f520b1e Mon Sep 17 00:00:00 2001
+From: Indan Zupancic <indan@nul.nu>
+Date: Fri, 30 Oct 2026 22:47:21 +0000
+Subject: [PATCH] Speed up memory zeroing for UT resets
+
+Currently resetUntypedCap() resets memory in chunks of 256 bytes
+and calls preemptionpoint() a hundred times by default. This is
+a very inefficient way of zeroing 25 kb of memory.
+
+Instead zero one chunk and then preempt immediately if we're not done.
+
+Increase the default chunk size at last a factor of hundred. That
+would be almost 15 bits, but because the new way has less overhead,
+we can increase it to 16 without increasing WCET.
+
+Cherry-picked from https://github.com/seL4/seL4/pull/1842, open upstream.
+
+Signed-off-by: Indan Zupancic <indan@nul.nu>
+---
+ config.cmake         |  6 ++----
+ src/object/untyped.c | 14 +++++---------
+ 2 files changed, 7 insertions(+), 13 deletions(-)
+
+diff --git a/config.cmake b/config.cmake
+index f52b1021d..a01fae60f 100644
+--- a/config.cmake
++++ b/config.cmake
+@@ -179,10 +179,8 @@ config_string(
+     pending interrupts (and preempts the currently running syscall if interrupts are pending)."
+   DEFAULT 100
+   UNQUOTE)
+-config_string(
+-  KernelResetChunkBits RESET_CHUNK_BITS
+-  "Maximum size in bits of chunks of memory to zero before checking a preemption point." DEFAULT 8
+-  UNQUOTE)
++config_string(KernelResetChunkBits RESET_CHUNK_BITS
++              "Maximum size in bits of memory to zero before preempting." DEFAULT 16 UNQUOTE)
+ config_string(KernelMaxNumBootinfoUntypedCaps MAX_NUM_BOOTINFO_UNTYPED_CAPS
+               "Max number of bootinfo untyped caps" DEFAULT 230 UNQUOTE)
+ config_option(KernelFastpath FASTPATH "Enable IPC fastpath" DEFAULT ON)
+diff --git a/src/object/untyped.c b/src/object/untyped.c
+index 6de789a0c..c164c306e 100644
+--- a/src/object/untyped.c
++++ b/src/object/untyped.c
+@@ -238,7 +238,6 @@ static exception_t resetUntypedCap(cte_t *srcSlot)
+     void *regionBase = WORD_PTR(cap_untyped_cap_get_capPtr(prev_cap));
+     int chunk = CONFIG_RESET_CHUNK_BITS;
+     word_t offset = FREE_INDEX_TO_OFFSET(cap_untyped_cap_get_capFreeIndex(prev_cap));
+-    exception_t status;
+     bool_t deviceMemory = cap_untyped_cap_get_capIsDevice(prev_cap);
+ 
+     if (offset == 0) {
+@@ -256,14 +255,11 @@ static exception_t resetUntypedCap(cte_t *srcSlot)
+         }
+         srcSlot->cap = cap_untyped_cap_set_capFreeIndex(prev_cap, 0);
+     } else {
+-        for (offset = ROUND_DOWN(offset - 1, chunk);
+-             offset != - BIT(chunk); offset -= BIT(chunk)) {
+-            clearMemory(GET_OFFSET_FREE_PTR(regionBase, offset), chunk);
+-            srcSlot->cap = cap_untyped_cap_set_capFreeIndex(prev_cap, OFFSET_TO_FREE_INDEX(offset));
+-            status = preemptionPoint();
+-            if (status != EXCEPTION_NONE) {
+-                return status;
+-            }
++        offset = ROUND_DOWN(offset - 1, chunk);
++        clearMemory(GET_OFFSET_FREE_PTR(regionBase, offset), chunk);
++        srcSlot->cap = cap_untyped_cap_set_capFreeIndex(prev_cap, OFFSET_TO_FREE_INDEX(offset));
++        if (offset) {
++            return EXCEPTION_PREEMPTED;
+         }
+     }
+     Arch_postResetUntyped(deviceMemory, block_size);
+-- 
+2.47.3
+
