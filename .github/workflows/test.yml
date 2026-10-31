@@ -100,8 +100,6 @@ jobs:
         run: tests/run-kemutest.sh 4
       - name: Guest RAM blocks (conversion, smp_mm_stress, OOM)
         run: tests/run-objtest.sh
-      - name: Deferred boot RAM, 1 and 2 vCPUs
-        run: tests/run-ramboottest.sh 1 && tests/run-ramboottest.sh 2
       - name: BPF JIT
         run: tests/run-bpftest.sh
       - name: Android kernel features

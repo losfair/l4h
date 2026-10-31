@@ -48,7 +48,6 @@
 #include <linux/bitmap.h>
 #include <linux/list.h>
 #include <linux/memblock.h>
-#include <linux/math64.h>
 #include <linux/mm.h>
 #include <linux/seq_file.h>
 #include <linux/mutex.h>
@@ -1336,18 +1335,16 @@ static unsigned int __init default_target(void)
 
 /*
  * Early boot: blocks, the first capability CNode, the user CSpace, and
- * enough mapped RAM to reach the page allocator and the conversion worker.
- * memblock only knows the host's boot blocks so far. Keep room for the
- * RAM CNodes, direct-map page tables, a capability CNode and the reserve
- * in object blocks at the top of RAM. Large guests also leave the rest
- * of their RAM there, reserved but not yet retyped or mapped. The worker
- * returns spare blocks to the page allocator once late initcalls run.
+ * every RAM block, mapped.  memblock only knows the boot blocks so far.
+ * Object blocks at boot, from the top of RAM: room for the RAM CNodes and
+ * direct-map page tables of the other blocks, a capability CNode, and the
+ * reserve.  The rest starts in frame mode; spare object blocks go back to
+ * the page allocator once the worker runs.
  */
 void __init l4h_caps_init(void)
 {
 	const struct l4h_bootinfo *bi = l4h_bootinfo;
-	u64 start = l4h_rdtsc();
-	unsigned int b, rest, want, early_frames;
+	unsigned int b, rest, want;
 	unsigned long flags;
 	int err;
 
@@ -1381,15 +1378,6 @@ void __init l4h_caps_init(void)
 	want = DIV_ROUND_UP(rest * (16ul << 10) + (256ul << 10), RAM_BLOCK) +
 	       DIV_ROUND_UP(rest * (4ul << 10) + (64ul << 10), RAM_BLOCK) + reserve_target;
 	want = min(want, rest);
-	/* Bound synchronous zeroing and mapping. The memmap alone needs
-	 * RAM/64; allow RAM/16 plus 256 MiB for it, the hash tables, initramfs
-	 * unpacking and early allocations. This is in addition to the host's
-	 * boot prefix, which may be occupied by a large kernel or initrd.
-	 * Small guests keep the same frame/object split as before. */
-	early_frames = min_t(unsigned int, rest - want,
-			     DIV_ROUND_UP(nr_blocks, 16) + (256ul << 20) / RAM_BLOCK);
-	want = rest - early_frames;
-
 	for (b = boot_blocks; b < nr_blocks; b++) {
 		bool obj = b >= nr_blocks - want;
 
@@ -1440,10 +1428,6 @@ void __init l4h_caps_init(void)
 	pr_info("l4h: %u MiB of RAM in %u blocks: %u boot, %u object, %u frame; reserve %u\n",
 		nr_blocks * (unsigned int)(RAM_BLOCK >> 20), nr_blocks, boot_blocks,
 		nr_object_blocks, rest - nr_object_blocks, reserve_target);
-	/* sched_clock is not running yet; use the host-provided counter. */
-	if (l4h_tsc_hz)
-		pr_info("l4h: initial RAM setup took %llu ms\n",
-			div64_u64((l4h_rdtsc() - start) * 1000, l4h_tsc_hz));
 }
 
 /* /proc/meminfo: guest RAM holding seL4 objects (not in the page
