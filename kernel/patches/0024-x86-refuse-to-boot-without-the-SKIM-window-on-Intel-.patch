@@ -1,4 +1,4 @@
-From d93b5fc4612f4f7a752e0ddac80dc63287063582 Mon Sep 17 00:00:00 2001
+From 2d973ec7260e75b678c2950fbae42ec12ca172ae Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Sat, 24 Oct 2026 06:06:02 +0000
 Subject: [PATCH] x86: refuse to boot without the SKIM window on Intel CPUs
@@ -18,7 +18,7 @@ Also end the existing refusal's message with a newline.
  1 file changed, 9 insertions(+), 3 deletions(-)
 
 diff --git a/src/arch/x86/kernel/boot_sys.c b/src/arch/x86/kernel/boot_sys.c
-index f6f0ec464..744f4b983 100644
+index 140ac24cc..fc76a77a1 100644
 --- a/src/arch/x86/kernel/boot_sys.c
 +++ b/src/arch/x86/kernel/boot_sys.c
 @@ -479,7 +479,7 @@ static BOOT_CODE bool_t try_boot_sys(void)

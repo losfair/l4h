@@ -1,7 +1,7 @@
-From 890a60da97d63c9dd333a0488971aecd4b3629e8 Mon Sep 17 00:00:00 2001
+From e06d31c894ed3c34c3e4d0d7a5542d299d27cd48 Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Sat, 17 Oct 2026 17:13:04 -0700
-Subject: [PATCH 6/7] mcs: do not reprogram the timer for a later deadline
+Subject: [PATCH] mcs: do not reprogram the timer for a later deadline
 
 setNextInterrupt() wrote the deadline on every scheduling-context
 change.  Keep the armed deadline when it is still pending and not later
@@ -51,7 +51,7 @@ index f4f3af0ec..06489d57d 100644
  
  void chargeBudget(ticks_t consumed, bool_t canTimeoutFault)
 diff --git a/src/model/statedata.c b/src/model/statedata.c
-index 8ec232be0..4a8a1c775 100644
+index 7bb794fa0..5154c1c9e 100644
 --- a/src/model/statedata.c
 +++ b/src/model/statedata.c
 @@ -55,6 +55,8 @@ UP_STATE_DEFINE(tcb_t *, ksCurFPUOwner);

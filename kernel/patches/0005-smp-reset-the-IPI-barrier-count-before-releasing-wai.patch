@@ -1,7 +1,7 @@
-From b62eca6ed66e0fa9eb1ccc17c886b863f0ea0f2b Mon Sep 17 00:00:00 2001
+From 6aa0af4bf3e1c880ef8fdb9a6a55f1ec12c57efd Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Sat, 17 Oct 2026 14:11:59 -0700
-Subject: [PATCH 5/7] smp: reset the IPI barrier count before releasing waiters
+Subject: [PATCH] smp: reset the IPI barrier count before releasing waiters
 
 ipi_wait() resets the arrival counter and bumps globalsense with plain
 stores followed by a release fence.  Nothing orders the two stores with
@@ -18,10 +18,10 @@ store (and read it with acquire loads).
  1 file changed, 10 insertions(+), 6 deletions(-)
 
 diff --git a/src/smp/ipi.c b/src/smp/ipi.c
-index 431c93782..9bf9c7f61 100644
+index b79610e79..538f91323 100644
 --- a/src/smp/ipi.c
 +++ b/src/smp/ipi.c
-@@ -86,18 +86,22 @@ void ipi_wait(void)
+@@ -83,18 +83,22 @@ void ipi_wait(void)
  {
      ipi_state_t *ipi = &big_kernel_lock.ipi;
      word_t cores = ipi->totalCoreBarrier;

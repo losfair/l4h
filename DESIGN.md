@@ -120,11 +120,13 @@ and the hypervisor never validates guest page tables.
 
 ## 4. seL4 kernel configuration and extensions
 
-The kernel is pinned to the seL4 16.0.0 release (`6e7c3b7`). l4h carries a
+The kernel is pinned to the seL4 17.0.0 release (`62e345c`). l4h carries a
 patch set in `kernel/patches/`, built as independent commits intended for
 upstreaming through the seL4 RFC process. They have no sel4test cases yet;
 l4h's integration tests (`tests/guest/abitest` and the rest of `tests/`)
-exercise them through the guest.
+exercise them through the guest. Patch numbers are stable: 0026 (aarch64,
+save TLS before taking the kernel lock) went upstream in 17.0.0 and was
+dropped without renumbering the rest.
 
 ### 4.1 Configuration
 
@@ -245,7 +247,6 @@ support, since no device is passed into a guest.
 | 0012 | (x86, MCS) The LAPIC latches a timer interrupt that fires while a core waits for the kernel lock; it was then handled as a new event after the next deadline was armed, meaning another lock wait. Under host load every core looped on stale interrupts and user threads never ran. A timer interrupt that finds the timer still armed is now acknowledged and dropped before the lock (checking 0006's `ksArmedDeadline` first). The patch is x86-only. |
 | 0013 | `SchedControl_ConfigureFlags` on an SC whose runnable thread is on another core could enqueue a postponed thread in the remote ready queue too. Only a schedulable thread is enqueued now. The balancer can hit this when it changes the budget of a capped vCPU that is running on another core and has used up its budget. |
 | 0014 | (x86, MCS) Every core re-measured the TSC and APIC timer rates from one PIT wraparound and overwrote the shared values; a virtualised PIT can end that wait early (about one GCE boot in three). Rates are measured once, on the boot core, as the median of 5 wraparounds. Countdown conversion from TSC to APIC ticks uses both rates rather than their truncated ratio, and a delay too long for the 32-bit count fires early and is reprogrammed. |
-| 0026 | (aarch64) `TPIDR_EL0`/`TPIDRRO_EL0` are saved in the entry assembly, not in the C entry hook, which a remote stall handled while waiting for the lock can skip. |
 | 0028 | (x86_64) seL4's user segments are laid out as Linux's, so `sysretq` and `iretq` both return with CS 0x33 / SS 0x2b. `sysretq` previously returned with a data-slot CS that faulted when user code reloaded it with `iretq` (.NET's `RtlRestoreContext`). |
 
 **Performance:**
@@ -3004,7 +3005,7 @@ Rules that keep the port cheap:
 **Kernel.** seL4 aarch64 (QEMU `virt`, MCS, SMP, EL1, no hypervisor
 support) builds with all l4h patches from `kernel/configs/l4h-aarch64.cmake`
 via `tools/build-kernel-aarch64.sh`. E1–E3 and patches 0005 and 0006 are
-ISA-neutral; 0007, 0015, 0016, 0018 and 0026 are aarch64-specific (§4.5).
+ISA-neutral; 0007, 0015, 0016 and 0018 are aarch64-specific (§4.5).
 The HWCAPs come from the boot core's ID registers alone, so l4h requires
 cores with the same features; heterogeneous CPUs would need the fields
 intersected across the cores guests run on.

@@ -1,7 +1,7 @@
-From 8c84ea36993042189b71e6d1682ce59a1f9709ab Mon Sep 17 00:00:00 2001
+From c07b441203ac26422fa0c8beb60c285de894a198 Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Sun, 18 Oct 2026 00:54:31 -0700
-Subject: [PATCH 11/11] x86: request the configured linear graphics mode in the
+Subject: [PATCH] x86: request the configured linear graphics mode in the
  multiboot2 header
 
 KernelMultibootGFXMode only affected the multiboot1 header, so a
@@ -14,7 +14,7 @@ with the configured width, height and depth.
  1 file changed, 10 insertions(+)
 
 diff --git a/src/arch/x86/multiboot.S b/src/arch/x86/multiboot.S
-index b204b563d..bfb268f4a 100644
+index 714a91aea..bad7295ae 100644
 --- a/src/arch/x86/multiboot.S
 +++ b/src/arch/x86/multiboot.S
 @@ -66,6 +66,16 @@

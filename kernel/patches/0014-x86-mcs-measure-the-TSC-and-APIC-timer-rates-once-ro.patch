@@ -1,4 +1,4 @@
-From 54935e92195556be320cbb227baffa85892cdf88 Mon Sep 17 00:00:00 2001
+From 96f5f8e4e5dad63ce7397d925d809118b6c231a7 Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Sun, 18 Oct 2026 06:49:04 -0700
 Subject: [PATCH] x86, mcs: measure the TSC and APIC timer rates once, robustly
@@ -82,10 +82,10 @@ index 3367f7d33..7562294c8 100644
 +BOOT_CODE uint32_t median_khz(uint32_t *s, int n);
  
 diff --git a/include/arch/x86/arch/model/statedata.h b/include/arch/x86/arch/model/statedata.h
-index 9c58af7ef..0783dcabf 100644
+index 1474abcd2..eeb488edd 100644
 --- a/include/arch/x86/arch/model/statedata.h
 +++ b/include/arch/x86/arch/model/statedata.h
-@@ -91,6 +91,7 @@ extern x86_irq_state_t x86KSIRQState[];
+@@ -93,6 +93,7 @@ extern x86_irq_state_t x86KSIRQState[];
  extern word_t x86KSAllocatedIOPorts[NUM_IO_PORTS / CONFIG_WORD_SIZE];
  #ifdef CONFIG_KERNEL_MCS
  extern uint32_t x86KStscMhz;
@@ -200,10 +200,10 @@ index 290ec5745..e1a377bf0 100644
  #else
      uint32_t timer_mode = 1;
 diff --git a/src/arch/x86/model/statedata.c b/src/arch/x86/model/statedata.c
-index 217d0ca87..78b40fbb5 100644
+index b5f276425..ecd3c6377 100644
 --- a/src/arch/x86/model/statedata.c
 +++ b/src/arch/x86/model/statedata.c
-@@ -74,5 +74,8 @@ x86_irq_state_t x86KSIRQState[maxIRQ + 1];
+@@ -75,5 +75,8 @@ x86_irq_state_t x86KSIRQState[maxIRQ + 1];
  word_t x86KSAllocatedIOPorts[NUM_IO_PORTS / CONFIG_WORD_SIZE];
  #ifdef CONFIG_KERNEL_MCS
  uint32_t x86KStscMhz;
@@ -296,5 +296,5 @@ index 3c3de243a..f71791f0c 100644
 +    return tsc_mhz;
 +}
 -- 
-2.43.0
+2.47.3
 

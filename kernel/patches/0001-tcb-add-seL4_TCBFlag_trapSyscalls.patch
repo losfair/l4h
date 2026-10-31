@@ -1,4 +1,4 @@
-From efc55746712e100709dc1218295f12fcd7232e3a Mon Sep 17 00:00:00 2001
+From 904fe8fca31872e922f9b55f2b3d22d1074b737a Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Sat, 17 Oct 2026 08:29:02 -0700
 Subject: [PATCH] tcb: add seL4_TCBFlag_trapSyscalls
@@ -44,7 +44,7 @@ index 42cb8fb5e..ab818621b 100644
  exception_t handleUnknownSyscall(word_t w);
  exception_t handleUserLevelFault(word_t w_a, word_t w_b);
 diff --git a/libsel4/include/interfaces/object-api.xml b/libsel4/include/interfaces/object-api.xml
-index c5b1f1267..37885cbb0 100644
+index cb4c00001..b0590847e 100644
 --- a/libsel4/include/interfaces/object-api.xml
 +++ b/libsel4/include/interfaces/object-api.xml
 @@ -840,7 +840,11 @@
@@ -145,10 +145,10 @@ index 8104d73df..0bea0047b 100644
  #ifdef CONFIG_KERNEL_MCS
      fastpath_reply_recv(cptr, msgInfo, reply);
 diff --git a/src/arch/riscv/c_traps.c b/src/arch/riscv/c_traps.c
-index bae151662..224e62374 100644
+index c2c199a91..b8344a0be 100644
 --- a/src/arch/riscv/c_traps.c
 +++ b/src/arch/riscv/c_traps.c
-@@ -141,7 +141,8 @@ void VISIBLE NORETURN c_handle_exception(void)
+@@ -143,7 +143,8 @@ void VISIBLE NORETURN c_handle_exception(void)
  
  void VISIBLE NORETURN slowpath(syscall_t syscall)
  {
@@ -158,7 +158,7 @@ index bae151662..224e62374 100644
  #ifdef TRACK_KERNEL_ENTRIES
          ksKernelEntry.path = Entry_UnknownSyscall;
  #endif /* TRACK_KERNEL_ENTRIES */
-@@ -175,6 +176,9 @@ void VISIBLE c_handle_fastpath_reply_recv(word_t cptr, word_t msgInfo)
+@@ -177,6 +178,9 @@ void VISIBLE c_handle_fastpath_reply_recv(word_t cptr, word_t msgInfo)
      benchmark_debug_syscall_start(cptr, msgInfo, SysReplyRecv);
      ksKernelEntry.is_fastpath = 1;
  #endif /* DEBUG */
@@ -168,7 +168,7 @@ index bae151662..224e62374 100644
  #ifdef CONFIG_KERNEL_MCS
      fastpath_reply_recv(cptr, msgInfo, reply);
  #else
-@@ -193,6 +197,9 @@ void VISIBLE c_handle_fastpath_call(word_t cptr, word_t msgInfo)
+@@ -195,6 +199,9 @@ void VISIBLE c_handle_fastpath_call(word_t cptr, word_t msgInfo)
      benchmark_debug_syscall_start(cptr, msgInfo, SysCall);
      ksKernelEntry.is_fastpath = 1;
  #endif /* DEBUG */
@@ -233,5 +233,5 @@ index 99ffc2a61..173b545a2 100644
          UNREACHABLE();
      } else if (syscall == (syscall_t)SysReplyRecv) {
 -- 
-2.43.0
+2.47.3
 

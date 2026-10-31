@@ -1,4 +1,4 @@
-From f9277addcc1450f8618e78f728fac4241e96d667 Mon Sep 17 00:00:00 2001
+From dc00753e8bf41db9f7e5d94f6cc141b07ceb7f40 Mon Sep 17 00:00:00 2001
 From: l4h <l4h@localhost>
 Date: Sun, 18 Oct 2026 14:13:52 -0700
 Subject: [PATCH] aarch64: broadcast EL1 TLB invalidations in the SMP domain
@@ -23,7 +23,7 @@ loader that drops to EL1 must give every core the same VMID (VTTBR_EL2 0).
  2 files changed, 45 insertions(+), 4 deletions(-)
 
 diff --git a/include/arch/arm/arch/machine/tlb.h b/include/arch/arm/arch/machine/tlb.h
-index 7235672db..f0e45f5b5 100644
+index 605416595..8c3407b41 100644
 --- a/include/arch/arm/arch/machine/tlb.h
 +++ b/include/arch/arm/arch/machine/tlb.h
 @@ -21,7 +21,9 @@ static inline void invalidateTranslationSingleLocal(vptr_t vptr)
@@ -83,7 +83,7 @@ index 7235672db..f0e45f5b5 100644
  }
  
 diff --git a/src/arch/arm/kernel/boot.c b/src/arch/arm/kernel/boot.c
-index 139f620b3..70b0729f8 100644
+index db8588dfa..e5f0c4a9a 100644
 --- a/src/arch/arm/kernel/boot.c
 +++ b/src/arch/arm/kernel/boot.c
 @@ -186,6 +186,18 @@ BOOT_CODE static bool_t init_cpu(void)
@@ -105,7 +105,7 @@ index 139f620b3..70b0729f8 100644
      }
  #endif
  
-@@ -271,8 +283,11 @@ BOOT_CODE static bool_t try_init_kernel_secondary_core(void)
+@@ -282,8 +294,11 @@ BOOT_CODE static bool_t try_init_kernel_secondary_core(void)
      /* need to first wait until some kernel init has been done */
      while (!node_boot_lock);
  
@@ -120,5 +120,5 @@ index 139f620b3..70b0729f8 100644
      for (unsigned int i = 0; i < NUM_PPI; i++) {
          maskInterrupt(true, CORE_IRQ_TO_IRQT(getCurrentCPUIndex(), i));
 -- 
-2.43.0
+2.47.3
 

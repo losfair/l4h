@@ -1,7 +1,7 @@
-From 186ae251d9f278b64d2091afcdd962aec69d6d27 Mon Sep 17 00:00:00 2001
+From 843793732e8ee7de1d0af763ecd942246918cf49 Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Sun, 18 Oct 2026 01:42:58 -0700
-Subject: [PATCH 13/13] mcs: do not enqueue a remote thread whose new budget is not
+Subject: [PATCH] mcs: do not enqueue a remote thread whose new budget is not
  ready
 
 SchedControl_ConfigureFlags on a scheduling context whose thread is

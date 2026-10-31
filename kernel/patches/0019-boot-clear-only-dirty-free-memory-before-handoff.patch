@@ -1,4 +1,4 @@
-From b80719ce579f4976435d790e5233a35b86f310e7 Mon Sep 17 00:00:00 2001
+From 982a69b925c2d45429c2f0df3be2eea098b8fdb9 Mon Sep 17 00:00:00 2001
 From: l4h <l4h@localhost>
 Date: Wed, 28 Oct 2026 06:50:14 -0700
 Subject: [PATCH] boot: clear only dirty free memory before handing out
@@ -29,10 +29,10 @@ and bootinfo under the BKL, before the initial thread can run.
  2 files changed, 65 insertions(+), 28 deletions(-)
 
 diff --git a/src/arch/arm/kernel/boot.c b/src/arch/arm/kernel/boot.c
-index 139f620..e4d00cf 100644
+index 467a7bd98..f770dcb48 100644
 --- a/src/arch/arm/kernel/boot.c
 +++ b/src/arch/arm/kernel/boot.c
-@@ -583,24 +583,10 @@ static BOOT_CODE bool_t try_init_kernel(
+@@ -631,24 +631,10 @@ static BOOT_CODE bool_t try_init_kernel(
  
      init_core_state(initial);
  
@@ -58,7 +58,7 @@ index 139f620..e4d00cf 100644
      cleanInvalidateL1Caches();
      invalidateLocalTLB();
      if (config_set(CONFIG_ARM_HYPERVISOR_SUPPORT)) {
-@@ -613,13 +599,24 @@ static BOOT_CODE bool_t try_init_kernel(
+@@ -661,13 +647,24 @@ static BOOT_CODE bool_t try_init_kernel(
      SMP_COND_STATEMENT(clh_lock_init());
      SMP_COND_STATEMENT(release_secondary_cpus());
  
@@ -89,10 +89,10 @@ index 139f620..e4d00cf 100644
  
      /* kernel successfully initialized */
 diff --git a/src/kernel/boot.c b/src/kernel/boot.c
-index 079edbe..57c4613 100644
+index 412e1b1db..7e1982959 100644
 --- a/src/kernel/boot.c
 +++ b/src/kernel/boot.c
-@@ -653,6 +653,31 @@ BOOT_CODE static bool_t pptr_in_kernel_window(pptr_t pptr)
+@@ -650,6 +650,31 @@ BOOT_CODE static bool_t pptr_in_kernel_window(pptr_t pptr)
      return pptr >= PPTR_BASE && pptr < PPTR_TOP;
  }
  
@@ -124,7 +124,7 @@ index 079edbe..57c4613 100644
  /**
   * Create an untyped cap, store it in a cnode and mark it in boot info.
   *
-@@ -661,6 +686,7 @@ BOOT_CODE static bool_t pptr_in_kernel_window(pptr_t pptr)
+@@ -658,6 +683,7 @@ BOOT_CODE static bool_t pptr_in_kernel_window(pptr_t pptr)
   *
   * @param root_cnode_cap cap to the cnode to store the untyped cap in
   * @param device_memory true if the cap to create is a device untyped
@@ -132,7 +132,7 @@ index 079edbe..57c4613 100644
   * @param pptr the kernel-virtual address of the untyped
   * @param size_bits the size of the untyped in bits
   * @param first_untyped_slot next available slot in the boot info structure
-@@ -669,6 +695,7 @@ BOOT_CODE static bool_t pptr_in_kernel_window(pptr_t pptr)
+@@ -666,6 +692,7 @@ BOOT_CODE static bool_t pptr_in_kernel_window(pptr_t pptr)
  BOOT_CODE static bool_t provide_untyped_cap(
      cap_t      root_cnode_cap,
      bool_t     device_memory,
@@ -140,7 +140,7 @@ index 079edbe..57c4613 100644
      pptr_t     pptr,
      word_t     size_bits,
      seL4_SlotPos first_untyped_slot
-@@ -676,6 +703,7 @@ BOOT_CODE static bool_t provide_untyped_cap(
+@@ -673,6 +700,7 @@ BOOT_CODE static bool_t provide_untyped_cap(
  {
      bool_t ret;
      cap_t ut_cap;
@@ -148,7 +148,7 @@ index 079edbe..57c4613 100644
  
      /* Since we are in boot code, we can do extensive error checking and
         return failure if anything unexpected happens. */
-@@ -716,7 +744,14 @@ BOOT_CODE static bool_t provide_untyped_cap(
+@@ -713,7 +741,14 @@ BOOT_CODE static bool_t provide_untyped_cap(
              .isDevice = device_memory,
              .padding  = {0}
          };
@@ -164,7 +164,7 @@ index 079edbe..57c4613 100644
                                       device_memory, size_bits, pptr);
          ret = provide_cap(root_cnode_cap, ut_cap);
      } else {
-@@ -737,6 +772,7 @@ BOOT_CODE static bool_t provide_untyped_cap(
+@@ -734,6 +769,7 @@ BOOT_CODE static bool_t provide_untyped_cap(
   *
   * @param root_cnode_cap Cap to the CNode to store the untypeds in.
   * @param device_memory  Whether the region is device memory.
@@ -172,7 +172,7 @@ index 079edbe..57c4613 100644
   * @param reg Region of kernel-virtual memory. May wrap around.
   * @param first_untyped_slot First available untyped boot info slot.
   * @return true on success, false on failure.
-@@ -744,6 +780,7 @@ BOOT_CODE static bool_t provide_untyped_cap(
+@@ -741,6 +777,7 @@ BOOT_CODE static bool_t provide_untyped_cap(
  BOOT_CODE static bool_t create_untypeds_for_region(
      cap_t      root_cnode_cap,
      bool_t     device_memory,
@@ -180,7 +180,7 @@ index 079edbe..57c4613 100644
      region_t   reg,
      seL4_SlotPos first_untyped_slot
  )
-@@ -778,7 +815,8 @@ BOOT_CODE static bool_t create_untypeds_for_region(
+@@ -775,7 +812,8 @@ BOOT_CODE static bool_t create_untypeds_for_region(
           * be used anyway.
           */
          if (size_bits >= seL4_MinUntypedBits) {
@@ -190,7 +190,7 @@ index 079edbe..57c4613 100644
                  return false;
              }
          }
-@@ -797,7 +835,7 @@ BOOT_CODE bool_t create_untypeds(cap_t root_cnode_cap)
+@@ -794,7 +832,7 @@ BOOT_CODE bool_t create_untypeds(cap_t root_cnode_cap)
              region_t reg = paddr_to_pptr_reg((p_region_t) {
                  start, ndks_boot.reserved[i].start
              });
@@ -199,7 +199,7 @@ index 079edbe..57c4613 100644
                  printf("ERROR: creation of untypeds for device region #%u at"
                         " [%"SEL4_PRIx_word"..%"SEL4_PRIx_word") failed\n",
                         (unsigned int)i, reg.start, reg.end);
-@@ -815,7 +853,7 @@ BOOT_CODE bool_t create_untypeds(cap_t root_cnode_cap)
+@@ -812,7 +850,7 @@ BOOT_CODE bool_t create_untypeds(cap_t root_cnode_cap)
              start, (paddr_t) CONFIG_PADDR_USER_DEVICE_TOP
          });
  
@@ -208,7 +208,7 @@ index 079edbe..57c4613 100644
              printf("ERROR: creation of untypeds for top device region"
                     " [%"SEL4_PRIx_word"..%"SEL4_PRIx_word") failed\n",
                     reg.start, reg.end);
-@@ -825,21 +863,23 @@ BOOT_CODE bool_t create_untypeds(cap_t root_cnode_cap)
+@@ -822,21 +860,23 @@ BOOT_CODE bool_t create_untypeds(cap_t root_cnode_cap)
  
      /* There is a part of the kernel (code/data) that is only needed for the
       * boot process. We can create UT objects for these frames, so the memory
