@@ -47,6 +47,13 @@ measurement from `trustd`, with full chain-of-trust rooted in the host TPM.
 blkd/netd are protected by IOMMU on supported Intel/AMD platforms. A device
 driver compromise does not let the attacker tamper with VMs.
 
+## Tested platforms
+
+- Generic QEMU/KVM with virtio-blk/virtio-scsi/nvme and virtio-net
+- AWS: c6i
+- GCP: n2, c3
+- Bare metal: Latitude m4.metal.small
+
 ## Features
 
 - Full support for x86\_64 multi-core guests
