@@ -211,7 +211,8 @@ fn be16(b: &[u8], i: usize) -> u16 {
 }
 
 /// Classify the Ethernet frame `frame` by `side`.  None unless it is an
-/// untagged IPv4 or IPv6 frame with a valid IP header.
+/// untagged IPv4 or IPv6 frame with a valid IP header.  IPv6 Neighbor
+/// Discovery stays on its link, including unicast reachability probes.
 pub fn classify(frame: &[u8], side: Side) -> Option<Flow> {
     if frame.len() < 14 {
         return None;
@@ -284,7 +285,7 @@ fn ip6(p: &[u8], side: Side, icmp: bool) -> Option<Flow> {
     });
     let mut f = Flow { v6: true, ip, proto: None, port: None };
     let (mut nh, mut off) = (p[6], 40);
-    let (mut opts, mut first) = (0, true);
+    let mut opts = 0;
     let mut frag = false;
     loop {
         match nh {
@@ -306,17 +307,27 @@ fn ip6(p: &[u8], side: Side, icmp: bool) -> Option<Flow> {
                     return Some(f);
                 }
                 frag = true;
-                first = be16(p, off + 2) >> 3 == 0;
+                let first = be16(p, off + 2) >> 3 == 0;
                 (nh, off) = (p[off], off + 8);
+                if !first {
+                    // Headers after Fragment occur only in the first
+                    // fragment.  Here the bytes are payload, even if Next
+                    // Header names an extension we normally skip.
+                    f.proto = (!matches!(nh, 0 | 43 | 44 | 60)).then_some(nh);
+                    return Some(f);
+                }
             }
             _ => break,
         }
     }
     f.proto = Some(nh);
-    if !first {
-        return Some(f);
-    }
     let l4 = &p[off..];
+    // The endpoint owner answers ND for the steered address.  Sending its
+    // unicast probes to a target with the address on lo breaks NUD; ND
+    // from a target must also retain its own link and MAC addresses.
+    if nh == IPPROTO_ICMPV6 && l4.first().is_some_and(|&kind| matches!(kind, 133..=137)) {
+        return None;
+    }
     f.port = port_of(nh, l4, side);
     // Destination unreachable, packet too big, time exceeded, parameter
     // problem.
