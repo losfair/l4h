@@ -522,6 +522,152 @@ mod tests {
         Match { v6: false, proto, port, ip: v4([203, 0, 113, 5]) }
     }
 
+    fn ipv6_packet(src: [u8; 16], dst: [u8; 16], nh: u8, payload: &[u8]) -> Vec<u8> {
+        let mut b = vec![0x60, 0, 0, 0];
+        b.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        b.extend_from_slice(&[nh, 255]);
+        b.extend_from_slice(&src);
+        b.extend_from_slice(&dst);
+        b.extend_from_slice(payload);
+        b
+    }
+
+    fn ipv6_checksum(src: [u8; 16], dst: [u8; 16], proto: u8, payload: &[u8]) -> u16 {
+        let mut b = src.to_vec();
+        b.extend_from_slice(&dst);
+        b.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        b.extend_from_slice(&[0, 0, 0, proto]);
+        b.extend_from_slice(payload);
+        if b.len() % 2 != 0 {
+            b.push(0);
+        }
+        let mut sum: u32 = b.chunks_exact(2).map(|w| u16::from_be_bytes([w[0], w[1]]) as u32).sum();
+        while sum > 0xffff {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    #[test]
+    fn ipv6_neighbor_discovery_stays_on_its_link() {
+        let mut s = setup();
+        let address = v6(1);
+        let peer = v6(0xfe);
+        let m = Match { v6: true, proto: 0, port: 0, ip: address };
+        assert!(s.rule_set(0, 0, m, 1 << 1, port_mac(1)));
+        assert!(s.rule_set(1, 0, Match { proto: 58, ..m }, 1 << 1, port_mac(1)));
+        for kind in 133..=137 {
+            for extensions in [false, true] {
+                for side in [Side::Dst, Side::Src] {
+                    let (src, dst) = if side == Side::Dst { (peer, address) } else { (address, peer) };
+                    let len = match kind { 133 => 8, 134 => 16, 135 | 136 => 24, _ => 40 };
+                    let mut nd = vec![0; len];
+                    nd[0] = kind;
+                    if kind >= 135 {
+                        nd[8..24].copy_from_slice(&address);
+                    }
+                    if kind == 137 {
+                        nd[24..40].copy_from_slice(&peer);
+                    }
+                    let csum = ipv6_checksum(src, dst, 58, &nd);
+                    nd[2..4].copy_from_slice(&csum.to_be_bytes());
+                    let (nh, payload) = if extensions {
+                        // Hop-by-hop, then destination options, then ICMPv6.
+                        let mut b = vec![60, 0, 0, 0, 0, 0, 0, 0, 58, 0, 0, 0, 0, 0, 0, 0];
+                        b.extend_from_slice(&nd);
+                        (0, b)
+                    } else {
+                        (58, nd)
+                    };
+                    let packet = ipv6_packet(src, dst, nh, &payload);
+                    let mut f = if side == Side::Dst {
+                        frame(ENDPOINTS[0].mac, PEER, true, &packet)
+                    } else {
+                        frame(OTHER, port_mac(1), true, &packet)
+                    };
+                    let before = f.clone();
+                    assert_eq!(classify(&f, side), None, "ND type {kind}, {side:?}, extensions {extensions}");
+                    if side == Side::Dst {
+                        assert_eq!(s.inbound(0, None, &mut f), None);
+                    } else {
+                        assert_eq!(s.outbound(1, &mut f), None);
+                    }
+                    assert_eq!(f, before);
+                }
+            }
+        }
+        for r in s.rules.iter().flatten() {
+            assert_eq!((r.in_frames, r.out_frames), (0, 0));
+        }
+        // Echo still belongs to the target, including the return path.
+        for kind in [128, 129] {
+            let echo = [kind, 0, 0, 0, 0, 0, 0, 1];
+            let packet = ipv6_packet(peer, address, 58, &echo);
+            assert_eq!(s.inbound(0, None, &mut frame(ENDPOINTS[0].mac, PEER, true, &packet)), Some(1));
+            let packet = ipv6_packet(address, peer, 58, &echo);
+            assert_eq!(s.outbound(1, &mut frame(OTHER, port_mac(1), true, &packet)), Some(ENDPOINTS[0]));
+        }
+    }
+
+    #[test]
+    fn ipv6_later_fragment_payload_cannot_select_tcp() {
+        let mut s = setup();
+        let m = Match { v6: true, proto: 0, port: 0, ip: v6(1) };
+        assert!(s.rule_set(0, 0, m, 1 << 1, port_mac(1)));
+        assert!(s.rule_set(1, 0, Match { proto: 6, ..m }, 1 << 2, port_mac(2)));
+        for side in [Side::Dst, Side::Src] {
+            let (src, dst) = if side == Side::Dst { (v6(0xfe), m.ip) } else { (m.ip, v6(0xfe)) };
+            // A complete UDP datagram with destination options. Split after
+            // the options, UDP header, and eight bytes of UDP payload.
+            let tail = [6, 0, 1, 4, 0, 0, 0, 0, 42, 42, 42, 42, 42, 42, 42, 42];
+            let mut udp = vec![0x9c, 0x40, 0, 53, 0, 32, 0, 0];
+            udp.extend_from_slice(&[0; 8]);
+            udp.extend_from_slice(&tail);
+            let csum = ipv6_checksum(src, dst, 17, &udp);
+            udp[6..8].copy_from_slice(&csum.to_be_bytes());
+            assert_eq!(ipv6_checksum(src, dst, 17, &udp), 0);
+            let mut first = vec![60, 0, 0, 1, 0, 0, 0, 1, 17, 0, 0, 0, 0, 0, 0, 0];
+            first.extend_from_slice(&udp[..16]);
+            let first = ipv6_packet(src, dst, 44, &first);
+            let first = frame(ENDPOINTS[0].mac, PEER, true, &first);
+            let port = if side == Side::Dst { 53 } else { 40000 };
+            assert_eq!(classify(&first, side), Some(Flow { v6: true, ip: m.ip, proto: Some(17), port: Some(port) }));
+
+            // Next Header still names destination options, but a later
+            // fragment carries UDP data here. Its first byte is not a protocol.
+            let mut later = vec![60, 0, 0, 24, 0, 0, 0, 1];
+            later.extend_from_slice(&tail);
+            let later = ipv6_packet(src, dst, 44, &later);
+            let mut f = frame(ENDPOINTS[0].mac, PEER, true, &later);
+            assert_eq!(classify(&f, side), Some(Flow { v6: true, ip: m.ip, proto: None, port: None }));
+            if side == Side::Dst {
+                assert_eq!(s.inbound(0, None, &mut first.clone()), Some(1));
+                assert_eq!(s.inbound(0, None, &mut f), Some(1));
+            } else {
+                let before = f.clone();
+                assert_eq!(s.outbound(2, &mut f), None);
+                assert_eq!(f, before);
+                assert_eq!(s.outbound(1, &mut f), Some(ENDPOINTS[0]));
+            }
+        }
+    }
+
+    #[test]
+    fn ipv6_later_fragments_keep_only_known_protocols() {
+        for nh in [0, 43, 44, 60, 6, 17, 50, 58] {
+            for len in 0..=16 {
+                let mut frag = vec![nh, 0, 0, 8, 0, 0, 0, 1];
+                frag.extend_from_slice(&[6, 0, 0, 0, 0, 0, 0, 0, 58, 0, 0, 0, 0, 0, 0, 0][..len]);
+                let packet = ipv6_packet(v6(0xfe), v6(1), 44, &frag);
+                let f = frame(ENDPOINTS[0].mac, PEER, true, &packet);
+                let proto = match nh { 6 | 17 | 50 | 58 => Some(nh), _ => None };
+                for (side, ip) in [(Side::Dst, v6(1)), (Side::Src, v6(0xfe))] {
+                    assert_eq!(classify(&f, side), Some(Flow { v6: true, ip, proto, port: None }), "next header {nh}, {len} bytes");
+                }
+            }
+        }
+    }
+
     #[test]
     fn match_words() {
         let ok = Match::from_words(4 | 6 << 8 | 443 << 16, 0, 0xcb00_7105).unwrap();

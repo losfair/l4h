@@ -1818,13 +1818,19 @@ dom0's external IP, or owns a cloud alias IP outright.
   leaves through the endpoint whose rule steered the request.
 - **What is classified.** Untagged IPv4 and IPv6 only; up to two IPv6
   hop-by-hop, routing or destination-options headers are skipped. Ports
-  only from a first fragment: later fragments match proto and IP rules. An
-  ICMP error (ICMPv4 3, 11, 12; ICMPv6 1–4) is classified as the packet it
-  quotes, mirrored, when that packet is the classified address's own, so
-  path-MTU discovery works for the target in both directions.
-- **Not steered.** Guests on the endpoint's switch send from their own MACs,
-  not the peer's, so they reach the owner as before; their replies would
-  otherwise go to the gateway. Port numbers are reused, so a removed port
+  only from a first fragment: later fragments match proto and IP rules
+  when the protocol is known. A later IPv6 fragment whose Next Header
+  requires further parsing matches only IP rules; its payload is never
+  parsed as headers. An ICMP error (ICMPv4 3, 11, 12; ICMPv6 1–4) is
+  classified as the packet it quotes, mirrored, when that packet is the
+  classified address's own, so path-MTU discovery works for the target in
+  both directions.
+- **Not steered.** IPv6 Neighbor Discovery (ICMPv6 133–137) stays on its
+  link in both directions, including unicast reachability probes, so the
+  endpoint owner keeps answering ND for the address. Guests on the
+  endpoint's switch send from their own MACs, not the peer's, so they
+  reach the owner as before; their replies would otherwise go to the
+  gateway. Port numbers are reused, so a removed port
   leaves every rule, and a rule left without a target is deleted. An
   endpoint outlives its owner: a VM recreated with the same MAC is steered
   again.
