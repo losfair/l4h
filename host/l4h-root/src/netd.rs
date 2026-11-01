@@ -96,6 +96,25 @@ pub struct PortInfo {
     pub mac: u64,
 }
 
+/// A steering endpoint (DESIGN.md §9.3): an address on a switch and the
+/// peer its steered traffic comes from and returns to.
+#[derive(Clone, Copy)]
+pub struct Endpoint {
+    pub switch: u32,
+    pub mac: u64,
+    pub peer: u64,
+}
+
+/// A steering rule: an endpoint's frames matching (IP, proto, port) go to
+/// a target port.  `matches` and `ip` as CTL_STEER_SET's args.
+#[derive(Clone, Copy)]
+pub struct SteerRule {
+    pub ep: usize,
+    pub matches: u64,
+    pub ip: (u64, u64),
+    pub targets: u64,
+}
+
 pub struct Netd {
     comp: Component,
     #[allow(dead_code)]
@@ -104,6 +123,9 @@ pub struct Netd {
     pub ports: [Option<PortInfo>; net::MAX_PORTS],
     /// Switches 0..switches exist (they are never deleted).
     pub switches: u32,
+    /// Mirrors of netd's steering tables, by id.
+    pub endpoints: [Option<Endpoint>; net::MAX_STEER_ENDPOINTS],
+    pub rules: [Option<SteerRule>; net::MAX_STEER_RULES],
 }
 
 pub fn bdf(d: &pci::Device) -> u32 {
@@ -276,7 +298,15 @@ pub fn spawn(
         let _ = nic_list.push(Nic { pci: *d, switch: None });
     }
     component::start(&comp);
-    Netd { comp, arena, nics: nic_list, ports: [const { None }; net::MAX_PORTS], switches: 0 }
+    Netd {
+        comp,
+        arena,
+        nics: nic_list,
+        ports: [const { None }; net::MAX_PORTS],
+        switches: 0,
+        endpoints: [None; net::MAX_STEER_ENDPOINTS],
+        rules: [None; net::MAX_STEER_RULES],
+    }
 }
 
 impl Netd {
@@ -397,6 +427,12 @@ impl Netd {
     /// Disconnect port `p`; netd stops using its memory.
     pub fn remove_port(&mut self, p: usize) {
         if self.ports.get_mut(p).and_then(|i| i.take()).is_some() {
+            // The port leaves every rule; netd does the same.
+            for r in self.rules.iter_mut() {
+                if r.is_some_and(|r| r.targets & (1 << p) != 0) {
+                    *r = None;
+                }
+            }
             call(self.comp.service_ep, net::NETD_REMOVE_PORT, &[p as u64]);
             let _ = self.comp.slot(net::NETD_SLOT_CLIENT_BASE + p as u64).delete();
         }
@@ -417,5 +453,120 @@ impl Netd {
     pub fn port_stats(&self, p: usize) -> Option<(u64, u64, u64)> {
         let rx = call(self.comp.service_ep, net::NETD_PORT_STATS, &[p as u64]);
         (rx != u64::MAX).then(|| (rx, mr(1), mr(2)))
+    }
+}
+
+fn is_unicast_mac(m: u64) -> bool {
+    m != 0 && m >> 48 == 0 && (m >> 40) & 1 == 0
+}
+
+/// An IP a rule may match: not unspecified, multicast or broadcast.
+fn steerable_ip(v6: bool, hi: u64, lo: u64) -> bool {
+    if v6 {
+        (hi, lo) != (0, 0) && hi >> 56 != 0xff
+    } else {
+        lo != 0 && lo != 0xffff_ffff && lo >> 28 != 0xe
+    }
+}
+
+impl Netd {
+    /// The MAC of switch `sw`'s uplink NIC, if it has one.
+    fn uplink_mac(&self, sw: u32) -> Option<u64> {
+        let n = self.nics.iter().position(|n| n.switch == Some(sw))?;
+        self.nic_mac(n)
+    }
+
+    /// Set the endpoint (switch, mac): a new one, or a new peer for an
+    /// existing one.  Returns its id.
+    pub fn ep_set(&mut self, switch: u32, mac: u64, peer: u64) -> Result<usize, i64> {
+        if switch >= self.switches {
+            return Err(ctl::ENOENT);
+        }
+        if !is_unicast_mac(mac) || !is_unicast_mac(peer) || mac == peer {
+            return Err(ctl::EINVAL);
+        }
+        // An address on the switch: never one behind its uplink.
+        let on_switch = self.ports.iter().flatten().any(|p| p.switch == switch && p.mac == mac);
+        if !on_switch && self.uplink_mac(switch) != Some(mac) {
+            return Err(ctl::EINVAL);
+        }
+        let id = match self.endpoints.iter().position(|e| e.is_some_and(|e| e.switch == switch && e.mac == mac)) {
+            Some(id) => id,
+            None => self.endpoints.iter().position(|e| e.is_none()).ok_or(ctl::ENOSPC)?,
+        };
+        if call(self.comp.service_ep, net::NETD_EP_SET, &[id as u64, switch as u64, mac, peer]) == u64::MAX {
+            return Err(ctl::EIO);
+        }
+        self.endpoints[id] = Some(Endpoint { switch, mac, peer });
+        Ok(id)
+    }
+
+    /// Delete endpoint `id` and its rules.
+    pub fn ep_del(&mut self, id: usize) -> Result<(), i64> {
+        self.endpoints.get(id).copied().flatten().ok_or(ctl::ENOENT)?;
+        call(self.comp.service_ep, net::NETD_EP_DEL, &[id as u64]);
+        self.endpoints[id] = None;
+        for r in self.rules.iter_mut() {
+            if r.is_some_and(|r| r.ep == id) {
+                *r = None;
+            }
+        }
+        Ok(())
+    }
+
+    /// Set the rule (ep, matches, ip): a new one, or new targets for an
+    /// existing one.  Returns its id.
+    pub fn steer_set(&mut self, ep: usize, matches: u64, ip: (u64, u64), targets: u64) -> Result<usize, i64> {
+        let e = self.endpoints.get(ep).copied().flatten().ok_or(ctl::ENOENT)?;
+        let (family, proto, port) = (matches as u8, (matches >> 8) as u8, (matches >> 16) as u16);
+        let v6 = match family {
+            4 if ip.0 == 0 && ip.1 >> 32 == 0 => false,
+            6 => true,
+            _ => return Err(ctl::EINVAL),
+        };
+        if matches >> 32 != 0 || (proto == 0 && port != 0) || (port != 0 && proto != 6 && proto != 17) {
+            return Err(ctl::EINVAL);
+        }
+        if !steerable_ip(v6, ip.0, ip.1) || targets.count_ones() != 1 {
+            return Err(ctl::EINVAL);
+        }
+        let t = targets.trailing_zeros() as usize;
+        let target = self.ports.get(t).and_then(|p| p.as_ref()).ok_or(ctl::ENOENT)?;
+        if target.mac == e.mac {
+            return Err(ctl::EINVAL);
+        }
+        let same = |r: &SteerRule| r.matches == matches && r.ip == ip;
+        // A target takes an address from one endpoint only: its frames
+        // from that address must leave through the endpoint whose rule
+        // steered the request in, which the most specific return match
+        // then always names.
+        let same_ip = |r: &SteerRule| r.matches as u8 == family && r.ip == ip;
+        if self.rules.iter().flatten().any(|r| same_ip(r) && r.ep != ep && r.targets & targets != 0) {
+            return Err(ctl::EEXIST);
+        }
+        let id = match self.rules.iter().position(|r| r.is_some_and(|r| r.ep == ep && same(&r))) {
+            Some(id) => id,
+            None => self.rules.iter().position(|r| r.is_none()).ok_or(ctl::ENOSPC)?,
+        };
+        let args = [id as u64, ep as u64, matches, ip.0, ip.1, targets];
+        if call(self.comp.service_ep, net::NETD_STEER_SET, &args) == u64::MAX {
+            return Err(ctl::EIO);
+        }
+        self.rules[id] = Some(SteerRule { ep, matches, ip, targets });
+        Ok(id)
+    }
+
+    pub fn steer_del(&mut self, id: usize) -> Result<(), i64> {
+        self.rules.get(id).copied().flatten().ok_or(ctl::ENOENT)?;
+        call(self.comp.service_ep, net::NETD_STEER_DEL, &[id as u64]);
+        self.rules[id] = None;
+        Ok(())
+    }
+
+    /// (inbound frames, return frames) of rule `id`, None if netd has
+    /// failed.
+    pub fn steer_stats(&self, id: usize) -> Option<(u64, u64)> {
+        let i = call(self.comp.service_ep, net::NETD_STEER_STATS, &[id as u64]);
+        (i != u64::MAX).then(|| (i, mr(1)))
     }
 }

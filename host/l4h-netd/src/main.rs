@@ -4,7 +4,9 @@
 //! channel to that guest's l4h-vmm) or an uplink NIC (virtio-net, gVNIC,
 //! ENA or X550 PCI, driven here).  Switches learn source MACs, forward known unicast to one
 //! port and flood everything else within the switch.  Guest ports can be
-//! locked to their configured MAC.  Nothing above L2 is looked at.
+//! locked to their configured MAC.  Nothing above L2 is looked at, except
+//! by steering rules dom0 sets (steer.rs), which pick a port by IP address,
+//! protocol and port and rewrite only MAC addresses.
 //!
 //! netd has no heap (DESIGN.md §10): its tables are fixed arrays, its frame
 //! buffers statics, and the frames it holds take chunks of a fixed pool
@@ -19,6 +21,7 @@ mod ixgbe;
 mod nic;
 mod offload;
 mod pool;
+mod steer;
 mod virtio_net;
 
 use core::mem::MaybeUninit;
@@ -34,6 +37,7 @@ use sel4::cap_type;
 use crate::nic::Nic;
 use crate::offload::{complete_csum, is_gso};
 use crate::pool::{Fifo, Frame, Pool};
+use crate::steer::Steer;
 
 /// Seconds after which a learned MAC is forgotten.
 const FDB_AGE_SECS: u64 = 300;
@@ -61,6 +65,7 @@ static mut SEG_BUF: [u8; net::MAX_FRAME] = [0; net::MAX_FRAME];
 /// would take its size in the image.
 static mut GRO: [MaybeUninit<offload::Gro>; net::MAX_NICS] = [const { MaybeUninit::uninit() }; net::MAX_NICS];
 static mut FDB_SLOTS_MEM: [FdbEntry; FDB_SLOTS] = [FdbEntry::FREE; FDB_SLOTS];
+static mut STEER: Steer = Steer::new();
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PortId {
@@ -204,6 +209,8 @@ struct Netd {
     /// Receive offload per NIC (taken out while it emits).
     gro: [Option<&'static mut offload::Gro>; net::MAX_NICS],
     fdb: Fdb,
+    /// Endpoints and steering rules.
+    steer: &'static mut Steer,
     /// The chunks of the frames all backlogs hold.
     pool: &'static mut Pool,
     tsc_hz: u64,
@@ -223,6 +230,12 @@ fn mac_of(v: u64) -> [u8; 6] {
 }
 
 const _: () = assert!(net::MAX_PORTS <= 0x80 && net::MAX_NICS <= 0x80);
+const _: () = assert!(
+    steer::MAX_ENDPOINTS == net::MAX_STEER_ENDPOINTS
+        && steer::MAX_RULES == net::MAX_STEER_RULES
+        && net::MAX_PORTS <= steer::MAX_TARGETS
+        && net::MAX_SWITCHES <= 64
+);
 
 impl PortId {
     /// The port as a forwarding table entry keeps it.
@@ -297,13 +310,12 @@ impl Netd {
         }
     }
 
-    /// Switch one frame that arrived on port `from`.
+    /// Switch (or steer) one frame that arrived on port `from`.
     fn forward(&mut self, from: PortId, frame: &mut [u8], hdr: &mut [u8; net::HDR_SIZE]) {
         if frame.len() < 14 {
             return;
         }
         let Some(switch) = self.switch_of(from) else { return };
-        let dst: [u8; 6] = frame[0..6].try_into().unwrap();
         let src: [u8; 6] = frame[6..12].try_into().unwrap();
         if let PortId::Guest(i) = from {
             let p = self.ports[i].as_mut().unwrap();
@@ -330,6 +342,40 @@ impl Netd {
                 }
             }
         }
+        let guest = match from {
+            PortId::Guest(i) => Some(i),
+            PortId::Uplink(_) => None,
+        };
+        if let Some(t) = self.steer.inbound(sw, guest, frame) {
+            self.deliver(PortId::Guest(t), frame, hdr);
+            return;
+        }
+        if let Some(ep) = guest.and_then(|i| self.steer.outbound(i, frame)) {
+            // Out through the endpoint's switch, never back to its owner;
+            // nothing is learned, and isolation does not apply.
+            let owner = self.fdb.find(ep.switch, &ep.mac).map(|i| PortId::of_code(self.fdb.slots[i].port));
+            self.switch_frame(owner, false, ep.switch as u32, frame, hdr);
+            return;
+        }
+        let isolated = self.is_isolated(from);
+        self.switch_frame(Some(from), isolated, switch, frame, hdr);
+    }
+
+    /// Send a frame on `switch` to the port its destination was learned
+    /// on, or flood it, but never to `exclude`.  An `isolated` sender
+    /// reaches no isolated port.
+    fn switch_frame(
+        &mut self,
+        exclude: Option<PortId>,
+        isolated: bool,
+        switch: u32,
+        frame: &mut [u8],
+        hdr: &mut [u8; net::HDR_SIZE],
+    ) {
+        let dst: [u8; 6] = frame[0..6].try_into().unwrap();
+        let now = rdtsc();
+        let age = FDB_AGE_SECS * self.tsc_hz;
+        let sw = switch as u8;
         let known = if dst[0] & 1 == 0 {
             match self.fdb.find(sw, &dst) {
                 Some(i) if now.wrapping_sub(self.fdb.slots[i].seen) < age => Some(PortId::of_code(self.fdb.slots[i].port)),
@@ -342,16 +388,15 @@ impl Netd {
         } else {
             None
         };
-        let from_isolated = self.is_isolated(from);
         match known {
-            Some(to) if to == from => {}
-            Some(to) if from_isolated && self.is_isolated(to) => {}
+            Some(to) if Some(to) == exclude => {}
+            Some(to) if isolated && self.is_isolated(to) => {}
             Some(to) if self.switch_of(to) == Some(switch) => self.deliver(to, frame, hdr),
             _ => {
                 // The switch's other ports, guests' then uplinks.
                 for k in 0..net::MAX_PORTS + self.nics.len() {
                     let to = if k < net::MAX_PORTS { PortId::Guest(k) } else { PortId::Uplink(k - net::MAX_PORTS) };
-                    if to != from && self.switch_of(to) == Some(switch) && !(from_isolated && self.is_isolated(to)) {
+                    if Some(to) != exclude && self.switch_of(to) == Some(switch) && !(isolated && self.is_isolated(to)) {
                         self.deliver(to, frame, hdr);
                     }
                 }
@@ -487,6 +532,7 @@ impl Netd {
             self.pool.clear(&mut p.backlog);
             let code = PortId::Guest(i).code();
             self.fdb.remove_if(|e| e.port == code);
+            self.steer.port_removed(i);
         }
     }
 }
@@ -538,6 +584,7 @@ fn main(info: &'static Info) -> ! {
             seed: rdtsc(),
             sweep_at: 0,
         },
+        steer: unsafe { &mut *addr_of_mut!(STEER) },
         pool: pool::take(),
         tsc_hz: info.header().tsc_hz,
         buf: unsafe { &mut *addr_of_mut!(BUF) },
@@ -631,6 +678,35 @@ fn main(info: &'static Info) -> ! {
                     set_mr(1, p.tx_frames);
                     set_mr(2, p.drops);
                     p.rx_frames
+                }
+                None => u64::MAX,
+            },
+            net::NETD_EP_SET => {
+                let ep = steer::Endpoint { switch: mr(1) as u8, mac: mac_of(mr(2)), peer: mac_of(mr(3)) };
+                if mr(1) < net::MAX_SWITCHES as u64 && d.steer.ep_set(mr(0) as usize, ep) { 0 } else { u64::MAX }
+            }
+            net::NETD_EP_DEL => {
+                d.steer.ep_del(mr(0) as usize);
+                0
+            }
+            net::NETD_STEER_SET => {
+                // One target, an existing port: its MAC is the rule's.
+                let targets = mr(5);
+                let t = targets.trailing_zeros() as usize;
+                let mac = (targets.count_ones() == 1).then(|| d.ports.get(t)).flatten().and_then(|p| p.as_ref()).map(|p| p.mac);
+                match (mac, steer::Match::from_words(mr(2), mr(3), mr(4))) {
+                    (Some(mac), Some(m)) if d.steer.rule_set(mr(0) as usize, mr(1) as usize, m, targets, mac) => 0,
+                    _ => u64::MAX,
+                }
+            }
+            net::NETD_STEER_DEL => {
+                d.steer.rule_del(mr(0) as usize);
+                0
+            }
+            net::NETD_STEER_STATS => match d.steer.rules.get(mr(0) as usize).and_then(|r| r.as_ref()) {
+                Some(r) => {
+                    set_mr(1, r.out_frames);
+                    r.in_frames
                 }
                 None => u64::MAX,
             },

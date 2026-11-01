@@ -28,7 +28,7 @@ with `make -C docs/manual`, or download `l4h-manual.pdf` from a
 |---|-------------|-------------------------|
 | R1 | No hardware virtualization. Paravirtualize, as Xen PV does. Avoid instruction emulation. | The guest kernel is a new Linux architecture, `ARCH=l4h`, that runs in ring 3 as an seL4 thread and calls seL4 directly. Guest user code runs unmodified. Its `syscall` instructions and exceptions reach the guest kernel as seL4 fault IPC. |
 | R2 | x86_64 first, but friendly to aarch64. | Each layer is split into ISA-independent and ISA-specific parts (§12). Nothing relies on an x86-only mechanism such as segmentation, rings 1/2 or Xen-style page-table validation. |
-| R3 | virtio-blk and virtio-net. Block devices are passed through. Network is multiplexed by virtual switches. | The guest runs stock Linux `virtio_blk`/`virtio_net` drivers over a paravirtual transport, `virtio-l4h`, with no trapped MMIO (§9). All device buffers live in a host-owned I/O pool (§8.1). The hypervisor provides **only L2 virtual switches**; a physical NIC is an uplink port on a switch, and routing and NAT are done by a VM. |
+| R3 | virtio-blk and virtio-net. Block devices are passed through. Network is multiplexed by virtual switches. | The guest runs stock Linux `virtio_blk`/`virtio_net` drivers over a paravirtual transport, `virtio-l4h`, with no trapped MMIO (§9). All device buffers live in a host-owned I/O pool (§8.1). The hypervisor provides **only L2 virtual switches**; a physical NIC is an uplink port on a switch, and routing and NAT are done by a VM. The one exception is stateless steering (§9.3): dom0 may have netd pick a port by IP address, protocol and port, rewriting only MAC addresses. |
 | R4 | SMP guests. | Each vCPU is an seL4 kernel-context thread with its own scheduling context. IPIs are seL4 notifications (§6). |
 | R5 | Many guests per host, e.g. 30 guests on 4 CPUs. | MCS scheduling contexts give each vCPU a budget. Idle guests consume no CPU: the guest kernel is tickless and idle means blocked in `seL4_Recv`. A balancer moves vCPUs between cores (§7). Each guest makes its kernel objects from its own RAM (§8). |
 | R6 | A runtime management API for "dom0", the first guest started at boot. | `l4h-vmmgr` serves a control API through an `l4hctl` device that only dom0 receives (§10.1). dom0 has no device-driver duties. |
@@ -1790,6 +1790,57 @@ firewalling belong in a VM.
   join internal switches and Linux provides NAT or routing. QEMU guests can
   also sit directly on the uplink switch.
 
+**Steering.** The one exception to "nothing above L2": dom0 can hand part
+of one address's traffic to a port on any switch, without a router VM in
+the path. For example, a web VM on an internal switch serves TCP 80/443 of
+dom0's external IP, or owns a cloud alias IP outright.
+- **Endpoints and rules.** An endpoint (`L4H_CTL_EP_SET`) is a switch, a MAC
+  on it and a peer MAC. The MAC must belong, when the endpoint is set, to a
+  port on the switch or to its uplink NIC: never to a host behind the
+  uplink. The peer is the gateway its steered traffic comes from. A rule
+  (`L4H_CTL_STEER_SET`) matches (IP, proto, port), where proto and port may
+  be wildcards and a port needs TCP or UDP, and names one target port. The
+  most specific rule wins: (IP, proto, port), then (IP, proto, \*), then
+  (IP, \*, \*). Up to 16 endpoints and 128 rules.
+- **Inbound.** A frame on the endpoint's switch, from the peer to the
+  endpoint MAC, that matches (dst IP, proto, dst port) and does not come
+  from the target, goes to the target with the target's MAC as destination.
+- **Return.** A frame from the target matching the mirrored tuple (src IP,
+  proto, src port) leaves on the endpoint's switch as endpoint MAC → peer.
+  It is never sent back to the endpoint's owner, nothing is learned from
+  it, and isolation does not apply. With an IP-wide rule the target owns
+  the address, outbound connections included.
+- **The invariant.** Both directions pass between the endpoint MAC and the
+  peer, and only the MAC fields change. So there is no state, no NAT, no
+  checksum fixup, offload metadata stays valid and the target sees the
+  client's address. Only the targets can send as the endpoint. A target
+  takes an address from one endpoint only (`-EEXIST`), so a reply always
+  leaves through the endpoint whose rule steered the request.
+- **What is classified.** Untagged IPv4 and IPv6 only; up to two IPv6
+  hop-by-hop, routing or destination-options headers are skipped. Ports
+  only from a first fragment: later fragments match proto and IP rules. An
+  ICMP error (ICMPv4 3, 11, 12; ICMPv6 1–4) is classified as the packet it
+  quotes, mirrored, when that packet is the classified address's own, so
+  path-MTU discovery works for the target in both directions.
+- **Not steered.** Guests on the endpoint's switch send from their own MACs,
+  not the peer's, so they reach the owner as before; their replies would
+  otherwise go to the gateway. Port numbers are reused, so a removed port
+  leaves every rule, and a rule left without a target is deleted. An
+  endpoint outlives its owner: a VM recreated with the same MAC is steered
+  again.
+- **Cost.** A frame on a switch without endpoints, from a port that is no
+  target, pays a bit test; on an endpoint's switch, a compare of its MACs;
+  a candidate, the parse and up to three probes of a 256-slot table. GRO
+  runs first, so a merged TCP run is classified once.
+- **Guest setup.** The target holds the steered address on `lo` (or with
+  `arp_ignore`) and needs a next hop through its vNIC, whose MAC netd
+  replaces: a permanent neighbour entry for any address will do. The owner
+  keeps the address for ARP/ND and must not use a steered port as a local
+  source port.
+- `l4hctl ep set SWITCH MAC|VM:NIC|uplink [--peer MAC|gw]`, `l4hctl steer
+  set EP IP[/PROTO[:PORT]] --to VM:NIC|PORT`, and `del`/`list`.
+  `tests/fuzz-steer` checks the classifier and tables against a model.
+
 **gVNIC.** `l4h-netd/src/gvnic.rs` follows Linux `gve` with the DQO queue
 format and raw DMA addressing (DQO RDA), which C3 and later offer; a device
 without it (GQI only) makes netd panic. It configures the device through a
@@ -2531,7 +2582,9 @@ checking taint alone leaves a session key exposed after its report.
   attestation-visible decision. Scheduling, shutdown, destruction and
   cooperative memory hotplug are dom0's availability decisions; host
   metadata queries disclose no guest state. Disk and network choices are
-  outside the launch measurement.
+  outside the launch measurement; guests treat the network as untrusted,
+  so steering rules (§9.3) take no bit, also on a sealed guest's MAC or
+  port.
 - **The flags service.** A passive thread in trustd is the sole writer of
   an 8 KiB flags area: 64 entries of 128 bytes, each with a seqlock,
   instance and the two bitmaps. Readers (the host actor and trustd's main

@@ -50,6 +50,12 @@ pub const CTL_VM_SET_MEM: u32 = 28;
 pub const CTL_VM_MEM_INFO: u32 = 29;
 pub const CTL_VM_TRUST: u32 = 30;
 pub const CTL_LOG_READ: u32 = 31;
+pub const CTL_EP_SET: u32 = 32;
+pub const CTL_EP_DEL: u32 = 33;
+pub const CTL_EP_LIST: u32 = 34;
+pub const CTL_STEER_SET: u32 = 35;
+pub const CTL_STEER_DEL: u32 = 36;
+pub const CTL_STEER_LIST: u32 = 37;
 pub const GPU_POOL_IMAGES: u64 = 4;
 pub const IOMMU_NONE: u64 = 0;
 pub const IOMMU_OFF: u64 = 1;
@@ -65,6 +71,112 @@ pub struct CtlPort {
     pub rx_frames: u64,
     pub tx_frames: u64,
     pub drops: u64,
+}
+
+/// A steering endpoint (CTL_EP_LIST).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct CtlEp {
+    pub id: u32,
+    pub sw: u32,
+    pub mac: u64,
+    pub peer: u64,
+}
+
+/// A steering rule (CTL_STEER_LIST).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct CtlSteer {
+    pub id: u32,
+    pub ep: u32,
+    /// family | proto << 8 | port << 16
+    pub matches: u64,
+    pub ip_hi: u64,
+    pub ip_lo: u64,
+    pub targets: u64,
+    pub in_frames: u64,
+    pub out_frames: u64,
+}
+
+/// What a steering rule matches: an address, and optionally a protocol
+/// and (TCP and UDP only) a port.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SteerMatch {
+    pub ip: std::net::IpAddr,
+    pub proto: u8,
+    pub port: u16,
+}
+
+impl SteerMatch {
+    /// `IP[/PROTO[:PORT]]`, PROTO being tcp, udp, icmp, icmpv6, esp or a
+    /// number.
+    pub fn parse(s: &str) -> Result<SteerMatch> {
+        let bad = || Error(format!("bad match: {s} (IP[/PROTO[:PORT]])"));
+        let (ip, rest) = s.split_once('/').map_or((s, None), |(a, b)| (a, Some(b)));
+        let ip = ip.parse().map_err(|_| bad())?;
+        let (mut proto, mut port) = (0, 0);
+        if let Some(rest) = rest {
+            let (p, n) = rest.split_once(':').map_or((rest, None), |(a, b)| (a, Some(b)));
+            proto = match p {
+                "tcp" => 6,
+                "udp" => 17,
+                "icmp" => 1,
+                "icmpv6" => 58,
+                "esp" => 50,
+                _ => p.parse().map_err(|_| bad())?,
+            };
+            if proto == 0 {
+                return Err(bad());
+            }
+            if let Some(n) = n {
+                port = n.parse().map_err(|_| bad())?;
+                if port == 0 || (proto != 6 && proto != 17) {
+                    return Err(bad());
+                }
+            }
+        }
+        Ok(SteerMatch { ip, proto, port })
+    }
+
+    /// CTL_STEER_SET's args 1-3.
+    pub fn words(&self) -> [u64; 3] {
+        let (family, hi, lo) = match self.ip {
+            std::net::IpAddr::V4(a) => (4, 0, u32::from(a) as u64),
+            std::net::IpAddr::V6(a) => {
+                let v = u128::from(a);
+                (6, (v >> 64) as u64, v as u64)
+            }
+        };
+        [family | (self.proto as u64) << 8 | (self.port as u64) << 16, hi, lo]
+    }
+
+    pub fn from_words(m: u64, hi: u64, lo: u64) -> SteerMatch {
+        let ip = if m as u8 == 6 {
+            std::net::IpAddr::V6((((hi as u128) << 64) | lo as u128).into())
+        } else {
+            std::net::IpAddr::V4((lo as u32).into())
+        };
+        SteerMatch { ip, proto: (m >> 8) as u8, port: (m >> 16) as u16 }
+    }
+}
+
+impl std::fmt::Display for SteerMatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}", self.ip)?;
+        match self.proto {
+            0 => return Ok(()),
+            6 => write!(f, "/tcp")?,
+            17 => write!(f, "/udp")?,
+            1 => write!(f, "/icmp")?,
+            58 => write!(f, "/icmpv6")?,
+            50 => write!(f, "/esp")?,
+            p => write!(f, "/{p}")?,
+        }
+        if self.port != 0 {
+            write!(f, ":{}", self.port)?;
+        }
+        Ok(())
+    }
 }
 
 pub fn fmt_mac(m: u64) -> String {
@@ -146,6 +258,7 @@ pub fn errno_name(e: i64) -> &'static str {
         11 => "try again",
         12 => "out of memory",
         16 => "busy",
+        17 => "already exists",
         22 => "invalid argument",
         28 => "no space for devices",
         38 => "not supported",
@@ -622,6 +735,57 @@ impl Ctl {
         Ok(self.call(CTL_SWITCH_CREATE, &[], &[], &[])?.vals[0])
     }
 
+    /// Set the steering endpoint (switch, mac) with gateway `peer`;
+    /// returns its id.
+    pub fn ep_set(&self, sw: u64, mac: u64, peer: u64) -> Result<u64> {
+        Ok(self.call(CTL_EP_SET, &[sw, mac, peer], &[], &[])?.vals[0])
+    }
+
+    pub fn ep_del(&self, ep: u64) -> Result<()> {
+        self.call(CTL_EP_DEL, &[ep], &[], &[]).map(|_| ())
+    }
+
+    pub fn ep_list(&self) -> Result<Vec<CtlEp>> {
+        self.list(CTL_EP_LIST, |e: &CtlEp| e.id)
+    }
+
+    /// Steer endpoint `ep`'s traffic matching `m` to guest port `port`;
+    /// returns the rule's id.
+    pub fn steer_set(&self, ep: u64, m: &SteerMatch, port: u64) -> Result<u64> {
+        if port >= 64 {
+            return err(format!("bad port: {port}"));
+        }
+        let [w, hi, lo] = m.words();
+        Ok(self.call(CTL_STEER_SET, &[ep, w, hi, lo, 1 << port], &[], &[])?.vals[0])
+    }
+
+    pub fn steer_del(&self, rule: u64) -> Result<()> {
+        self.call(CTL_STEER_DEL, &[rule], &[], &[]).map(|_| ())
+    }
+
+    pub fn steer_list(&self) -> Result<Vec<CtlSteer>> {
+        self.list(CTL_STEER_LIST, |r: &CtlSteer| r.id)
+    }
+
+    /// All entries of a list op that takes the first id and returns a
+    /// count and an array.
+    fn list<T: Copy>(&self, op: u32, id: impl Fn(&T) -> u32) -> Result<Vec<T>> {
+        let mut out = Vec::new();
+        let mut first = 0u64;
+        loop {
+            let r = self.call(op, &[first], &[], &[])?;
+            let n = (r.vals[0] as usize).min(CTL_DATA_MAX / std::mem::size_of::<T>());
+            if n == 0 {
+                return Ok(out);
+            }
+            for i in 0..n {
+                let e: T = unsafe { std::ptr::read_unaligned(r.data.as_ptr().add(i * std::mem::size_of::<T>()) as *const T) };
+                first = id(&e) as u64 + 1;
+                out.push(e);
+            }
+        }
+    }
+
     /// The ports of a switch and its uplink NIC, if any.
     pub fn switch_info(&self, sw: u64) -> Result<(Vec<CtlPort>, Option<u64>)> {
         let r = self.call(CTL_SWITCH_INFO, &[sw], &[], &[])?;
@@ -846,5 +1010,29 @@ pub mod attest {
         let blob = tpm2b(8)?;
         let secret = tpm2b(10 + blob.len())?;
         call(ACTIVATE, &[blob, secret].concat(), blob.len())
+    }
+}
+
+#[cfg(test)]
+mod steer_tests {
+    use super::*;
+
+    #[test]
+    fn matches_round_trip() {
+        for s in ["203.0.113.5/tcp:443", "10.128.0.9", "2001:db8::1/udp:4500", "198.51.100.1/esp", "192.0.2.1/132"] {
+            let m = SteerMatch::parse(s).unwrap();
+            let [w, hi, lo] = m.words();
+            assert_eq!(SteerMatch::from_words(w, hi, lo), m);
+            assert_eq!(m.to_string(), s);
+        }
+        let [w, hi, lo] = SteerMatch::parse("203.0.113.5/tcp:443").unwrap().words();
+        assert_eq!((w, hi, lo), (4 | 6 << 8 | 443 << 16, 0, 0xcb00_7105));
+    }
+
+    #[test]
+    fn bad_matches() {
+        for s in ["203.0.113.5/icmp:1", "203.0.113.5/tcp:0", "203.0.113.5/0", "nope", "1.2.3.4/tcp:70000"] {
+            assert!(SteerMatch::parse(s).is_err(), "{s}");
+        }
     }
 }

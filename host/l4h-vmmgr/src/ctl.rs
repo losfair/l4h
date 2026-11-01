@@ -99,7 +99,9 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
             Ok(())
         }
         abi::CTL_IOMMU_INFO | abi::CTL_DISK_INFO | abi::CTL_BLK_INFO | abi::CTL_SWITCH_CREATE | abi::CTL_SWITCH_ATTACH_UPLINK
-        | abi::CTL_NIC_INFO | abi::CTL_SWITCH_INFO | abi::CTL_HOST_REBOOT | abi::CTL_RTC_SET => {
+        | abi::CTL_NIC_INFO | abi::CTL_SWITCH_INFO | abi::CTL_HOST_REBOOT | abi::CTL_RTC_SET
+        | abi::CTL_EP_SET | abi::CTL_EP_DEL | abi::CTL_EP_LIST | abi::CTL_STEER_SET | abi::CTL_STEER_DEL
+        | abi::CTL_STEER_LIST => {
             resp.vals = root::host_op(req.op, a)?;
             resp.data = *root::result_data();
             Ok(())

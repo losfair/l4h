@@ -67,9 +67,47 @@ run g "" --nic "$sw1,isolated" --cmdline "console=hvc0 IP0=192.168.1.7/24 PING=1
 grep -q "ping 192.168.1.1 ok" /tmp/g || fail "isolated port -> normal port"
 grep -q "ping 192.168.1.6 failed" /tmp/g || fail "isolated ports reach each other"
 echo "NETTEST: isolated ports ok"
+
+# Steering (DESIGN.md §9.3).  A port rule: frames from X (the peer) to A's
+# 192.168.1.1, TCP 80, go to T on another switch, which serves them as
+# 192.168.1.1; Y on A's switch is no peer and reaches A, which serves
+# nothing.  ICMP is not matched: X's ping reaches A.
+sw3=$(l4hctl switch-create) || fail "switch-create"
+run t "" --nic "$sw3" --cmdline "console=hvc0 IP0=169.254.9.2/16 LO=192.168.1.1/32 ONLINK=1 HTTPD=steered-to-t"
+ep=$(l4hctl ep set "$sw1" "$vm_a:0" --peer 02:00:00:00:00:20) || fail "ep set"
+l4hctl steer set "$ep" 192.168.1.1/tcp:80 --to "$vm_t:0" >/dev/null || fail "steer set"
+l4hctl steer set "$ep" 192.168.1.1/tcp:80 --to 47 2>/dev/null && fail "steer to no port"
+run x "192.168.1.1" --nic "$sw1,mac=02:00:00:00:00:20" --cmdline "console=hvc0 IP0=192.168.1.20/24 PING=192.168.1.1 FETCH=http://192.168.1.1/"
+grep -q "ping 192.168.1.1 ok" /tmp/x || fail "x -> a (ICMP, not steered)"
+steer_debug() { l4hctl ep list; l4hctl steer list; l4hctl switch "$sw1"; l4hctl switch "$sw3"; l4hctl console "$vm_t" | grep NETVM; }
+grep -q "fetch http://192.168.1.1/ steered-to-t" /tmp/x || { cat /tmp/x; steer_debug; fail "port rule: x -> t"; }
+run y "" --nic "$sw1" --cmdline "console=hvc0 IP0=192.168.1.21/24 FETCH=http://192.168.1.1/"
+grep -q "fetch http://192.168.1.1/ failed" /tmp/y || { cat /tmp/y; fail "y is no peer, but was steered"; }
+l4hctl ep list
+l4hctl steer list | tee /tmp/steer
+awk '$3 == "192.168.1.1/tcp:80" && $6 > 0 && $7 > 0 { f = 1 } END { exit !f }' /tmp/steer || fail "steer counters"
+echo "NETTEST: port rule ok"
+# An IP-wide rule on dom0's uplink MAC, peer slirp's gateway: T2 owns
+# 10.0.2.16 outright and pings the gateway from it.  dom0 holds the
+# address only to answer ARP for it.
+ep0=$(l4hctl ep set 0 uplink) || fail "ep set uplink (peer gw)"
+ip addr add 10.0.2.16/32 dev eth0
+id=$(l4hctl create t2 $K --nic "$sw3" --cmdline "console=hvc0 IP0=169.254.9.3/16 LO=10.0.2.16/32 ONLINK=1 PING=10.0.2.2 DELAY=$((3 * slow))") || fail "create t2"
+l4hctl steer set "$ep0" 10.0.2.16 --to "$id:0" >/dev/null || fail "steer set ip-wide"
+l4hctl console "$id" --until "NETVM: done" --timeout "$((60 * slow))" > /tmp/t2 || fail "t2 did not finish"
+grep -q "ping 10.0.2.2 ok" /tmp/t2 || { cat /tmp/t2; fail "ip-wide rule: t2 -> slirp"; }
+ping -c 1 -W 2 10.0.2.2 >/dev/null || fail "dom0's own traffic after steering"
+ip addr del 10.0.2.16/32 dev eth0
+echo "NETTEST: ip-wide rule ok"
+# Destroying a target deletes its rules; endpoints stay until deleted.
+l4hctl destroy "$vm_t" && l4hctl destroy "$id" || fail "destroy t, t2"
+[ "$(l4hctl steer list | wc -l)" = 1 ] || { l4hctl steer list; fail "rules outlived their target"; }
+l4hctl ep del "$ep" && l4hctl ep del "$ep0" || fail "ep del"
+[ "$(l4hctl ep list | wc -l)" = 1 ] || fail "ep del"
+echo "NETTEST: steering ok"
 l4hctl switch "$sw1"
 l4hctl switch "$sw2"
 l4hctl list
-for v in $vm_b $vm_c $vm_d $vm_e $vm_f $vm_g; do l4hctl destroy "$v" || fail "destroy $v"; done
+for v in $vm_b $vm_c $vm_d $vm_e $vm_f $vm_g $vm_x $vm_y; do l4hctl destroy "$v" || fail "destroy $v"; done
 echo "NETTEST: rebooting dom0"
 reboot -f

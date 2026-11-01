@@ -1,0 +1,12 @@
+[package]
+name = "fuzz-steer"
+edition = "2024"
+license = "GPL-2.0-only"
+version = "0.1.0"
+description = "Randomised test of netd's steering classifier and tables"
+
+[dependencies]
+
+[profile.release]
+debug-assertions = true
+overflow-checks = true

@@ -5,6 +5,12 @@
 #   NEWMAC     MAC to set on eth0 before using it
 #   GW         default gateway
 #   PING PING2 addresses to ping
+#   LO         addresses for lo (steered to this VM), comma-separated
+#   ONLINK     default route through eth0 to a permanent dummy neighbour,
+#              from the first LO address: netd rewrites the MACs
+#   HTTPD      text to serve on port 80
+#   FETCH      URLs to fetch
+#   DELAY      seconds to wait before pinging and fetching
 mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
@@ -16,12 +22,31 @@ if [ -n "$IP0" ]; then
 fi
 if [ -n "$IP1" ]; then ip addr add "$IP1" dev eth1; ip link set eth1 up; fi
 if [ -n "$GW" ]; then ip route add default via "$GW"; fi
+if [ -n "$LO" ]; then
+    for a in $(echo "$LO" | tr , " "); do ip addr add "$a" dev lo; done
+fi
+if [ -n "$ONLINK" ]; then
+    # busybox ip has no "neigh add".
+    arp -i eth0 -s 169.254.0.1 02:00:00:00:00:01
+    ip route add default via 169.254.0.1 dev eth0 onlink src "${LO%%/*}"
+fi
+if [ -n "$HTTPD" ]; then
+    mkdir -p /www && echo "$HTTPD" > /www/index.html && httpd -p 80 -h /www
+fi
 echo "NETVM: ready"
+[ -n "$DELAY" ] && sleep "$DELAY"
 for t in $PING $PING2; do
     if ping -c 3 -W 2 "$t" >/dev/null 2>&1; then
         echo "NETVM: ping $t ok"
     else
         echo "NETVM: ping $t failed"
+    fi
+done
+for u in $FETCH; do
+    if t=$(wget -q -T 5 -O - "$u" 2>/wget.err); then
+        echo "NETVM: fetch $u $t"
+    else
+        echo "NETVM: fetch $u failed: $(cat /wget.err)"
     fi
 done
 echo "NETVM: done"
