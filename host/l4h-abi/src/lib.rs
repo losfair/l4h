@@ -319,6 +319,12 @@ pub const CTL_VM_SET_MEM: u32 = 28;
 pub const CTL_VM_MEM_INFO: u32 = 29;
 pub const CTL_VM_TRUST: u32 = 30;
 pub const CTL_LOG_READ: u32 = 31;
+pub const CTL_EP_SET: u32 = 32;
+pub const CTL_EP_DEL: u32 = 33;
+pub const CTL_EP_LIST: u32 = 34;
+pub const CTL_STEER_SET: u32 = 35;
+pub const CTL_STEER_DEL: u32 = 36;
+pub const CTL_STEER_LIST: u32 = 37;
 /// CTL_GPU_ATTACH: scanout sizes, and the I/O pool a VM with a GPU needs
 /// (in images of its scanout).
 pub const GPU_MIN: u32 = 64;
@@ -348,6 +354,28 @@ pub struct CtlPort {
     pub rx_frames: u64,
     pub tx_frames: u64,
     pub drops: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CtlEp {
+    pub id: u32,
+    pub sw: u32,
+    pub mac: u64,
+    pub peer: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CtlSteer {
+    pub id: u32,
+    pub ep: u32,
+    pub matches: u64,
+    pub ip_hi: u64,
+    pub ip_lo: u64,
+    pub targets: u64,
+    pub in_frames: u64,
+    pub out_frames: u64,
 }
 
 pub const VM_CREATED: u32 = 1;

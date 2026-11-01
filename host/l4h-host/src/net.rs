@@ -99,6 +99,24 @@ pub const NETD_ATTACH_UPLINK: u64 = 3;
 pub const NETD_PORT_STATS: u64 = 4;
 /// MR0 = NIC -> MR0 = its MAC address (low 48 bits).
 pub const NETD_NIC_MAC: u64 = 5;
+/// Steering (DESIGN.md §9.3).  Root allocates the ids and validates;
+/// netd checks bounds and that targets exist.  u64::MAX in MR0 is a
+/// failure.
+/// MR0 = endpoint, MR1 = switch, MR2 = MAC, MR3 = peer MAC.  Setting an
+/// endpoint with the same switch and MAC changes only its peer.
+pub const NETD_EP_SET: u64 = 6;
+/// MR0 = endpoint; deletes its rules too.
+pub const NETD_EP_DEL: u64 = 7;
+/// MR0 = rule, MR1 = endpoint, MR2 = match (abi::CTL_STEER_SET args[1]),
+/// MR3 = IP bits 127-64, MR4 = IP bits 63-0, MR5 = target port mask.
+pub const NETD_STEER_SET: u64 = 8;
+/// MR0 = rule.
+pub const NETD_STEER_DEL: u64 = 9;
+/// MR0 = rule -> MR0 = inbound frames, MR1 = return frames.
+pub const NETD_STEER_STATS: u64 = 10;
+/// Endpoints and rules netd holds.
+pub const MAX_STEER_ENDPOINTS: usize = 16;
+pub const MAX_STEER_RULES: usize = 128;
 
 /// NicConfig::kind.
 pub const NIC_VIRTIO: u32 = 0;

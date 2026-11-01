@@ -138,6 +138,16 @@ const USAGE: &str = "usage: l4hctl <command>
   switch-create                create an L2 switch; prints its id
   uplink SWITCH NIC            make host NIC the uplink of SWITCH
   switch SWITCH                ports and counters of SWITCH
+  ep set SWITCH MAC|VM:NIC|uplink [--peer MAC|gw]
+                               a steering endpoint: an address on SWITCH
+                               and the gateway (default: dom0's) its
+                               steered traffic comes from; prints its id
+  ep del EP | ep list
+  steer set EP IP[/PROTO[:PORT]] --to VM:NIC|PORT
+                               send EP's traffic for IP (PROTO: tcp, udp,
+                               icmp, esp or a number) to a guest port,
+                               rewriting only MACs; prints the rule's id
+  steer del RULE | steer list
   console VM [--follow] [--until STR] [--timeout SECS]
                                print the VM's console output
   screenshot VM FILE           save the VM's display as a PPM image
@@ -209,6 +219,132 @@ fn cmd_attest(args: &[String]) -> Result<i32> {
         None => println!("{}", hex(&result)),
     }
     Ok(0)
+}
+
+/// Every guest port: (port, vm, switch, MAC), by port.
+fn all_ports(ctl: &Ctl) -> Result<Vec<(u64, u64, u64, u64)>> {
+    let mut out = Vec::new();
+    // Switches are numbered from 0 and never deleted.
+    for sw in 0.. {
+        let Ok((ports, _)) = ctl.switch_info(sw) else { break };
+        out.extend(ports.iter().map(|p| (p.port as u64, p.vm as u64, sw, p.mac)));
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// `VM:NIC`: the VM's NIC-th port, in port order.
+fn vm_port(ctl: &Ctl, s: &str) -> Result<Option<(u64, u64, u64)>> {
+    let Some((vm, nic)) = s.split_once(':') else { return Ok(None) };
+    let (vm, nic) = (parse_num(vm)?, parse_num(nic)? as usize);
+    let ports: Vec<_> = all_ports(ctl)?.into_iter().filter(|p| p.1 == vm).collect();
+    let p = ports.get(nic).ok_or(Error(format!("{s}: vm {vm} has no nic {nic}")))?;
+    Ok(Some((p.0, p.2, p.3)))
+}
+
+/// The MAC of dom0's default gateway, on its interface with one of `macs`
+/// (from /proc/net/route and /proc/net/arp).
+fn gateway_mac(macs: &[u64]) -> Result<u64> {
+    let read = |f: &str| std::fs::read_to_string(f).map_err(|e| Error(format!("{f}: {e}")));
+    let route = read("/proc/net/route")?;
+    let arp = read("/proc/net/arp")?;
+    for l in route.lines().skip(1) {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        if f.len() < 3 || f[1] != "00000000" {
+            continue;
+        }
+        let ifmac = read(&format!("/sys/class/net/{}/address", f[0])).and_then(|m| parse_mac(m.trim()));
+        if !ifmac.is_ok_and(|m| macs.contains(&m)) {
+            continue;
+        }
+        let gw = u32::from_str_radix(f[2], 16).map_err(|_| Error("bad /proc/net/route".into()))?;
+        let gw = std::net::Ipv4Addr::from(gw.swap_bytes()).to_string();
+        for a in arp.lines().skip(1) {
+            let g: Vec<&str> = a.split_whitespace().collect();
+            if g.len() >= 6 && g[0] == gw && g[5] == f[0] && g[3] != "00:00:00:00:00:00" {
+                return parse_mac(g[3]);
+            }
+        }
+        return err(format!("no neighbour entry for gateway {gw} on {}: reach it once, or give --peer MAC", f[0]));
+    }
+    err("dom0 has no default route on that switch: give --peer MAC")
+}
+
+fn cmd_ep(ctl: &Ctl, args: &[String]) -> Result<()> {
+    match args.first().map(String::as_str) {
+        Some("set") if args.len() >= 3 => {
+            let sw = parse_num(&args[1])?;
+            let (ports, uplink) = ctl.switch_info(sw)?;
+            let uplink_mac = match uplink {
+                Some(n) => Some(ctl.call(CTL_NIC_INFO, &[n], &[], &[])?.vals[2]),
+                None => None,
+            };
+            let mac = match args[2].as_str() {
+                "uplink" => uplink_mac.ok_or(Error(format!("switch {sw} has no uplink")))?,
+                a if a.matches(':').count() == 1 => {
+                    let (_, psw, mac) = vm_port(ctl, a)?.unwrap();
+                    if psw != sw {
+                        return err(format!("{a} is on switch {psw}, not {sw}"));
+                    }
+                    mac
+                }
+                a => parse_mac(a)?,
+            };
+            let peer = match &args[3..] {
+                [] => None,
+                [p, v] if p == "--peer" && v == "gw" => None,
+                [p, v] if p == "--peer" => Some(parse_mac(v)?),
+                _ => return err("ep set SWITCH MAC|VM:NIC|uplink [--peer MAC|gw]"),
+            };
+            let peer = match peer {
+                Some(p) => p,
+                None => {
+                    let macs: Vec<u64> = ports.iter().map(|p| p.mac).chain(uplink_mac).collect();
+                    gateway_mac(&macs)?
+                }
+            };
+            println!("{}", ctl.ep_set(sw, mac, peer)?);
+        }
+        Some("del") if args.len() == 2 => ctl.ep_del(parse_num(&args[1])?)?,
+        Some("list") if args.len() == 1 => {
+            println!("{:>3} {:>6} {:<17} {:<17}", "EP", "SWITCH", "MAC", "PEER");
+            for e in ctl.ep_list()? {
+                println!("{:>3} {:>6} {:<17} {:<17}", e.id, e.sw, fmt_mac(e.mac), fmt_mac(e.peer));
+            }
+        }
+        _ => return err("ep set SWITCH MAC|VM:NIC|uplink [--peer MAC|gw] | ep del EP | ep list"),
+    }
+    Ok(())
+}
+
+fn cmd_steer(ctl: &Ctl, args: &[String]) -> Result<()> {
+    match args.first().map(String::as_str) {
+        Some("set") if args.len() == 5 && args[3] == "--to" => {
+            let ep = parse_num(&args[1])?;
+            let m = SteerMatch::parse(&args[2])?;
+            let port = match vm_port(ctl, &args[4])? {
+                Some((port, _, _)) => port,
+                None => parse_num(&args[4])?,
+            };
+            println!("{}", ctl.steer_set(ep, &m, port)?);
+        }
+        Some("del") if args.len() == 2 => ctl.steer_del(parse_num(&args[1])?)?,
+        Some("list") if args.len() == 1 => {
+            let ports = all_ports(ctl)?;
+            println!("{:>4} {:>3} {:<32} {:>4} {:>3} {:>10} {:>10}", "RULE", "EP", "MATCH", "PORT", "VM", "IN", "OUT");
+            for r in ctl.steer_list()? {
+                let port = r.targets.trailing_zeros() as u64;
+                let vm = ports.iter().find(|p| p.0 == port).map_or("-".to_string(), |p| p.1.to_string());
+                let m = SteerMatch::from_words(r.matches, r.ip_hi, r.ip_lo);
+                println!(
+                    "{:>4} {:>3} {:<32} {:>4} {:>3} {:>10} {:>10}",
+                    r.id, r.ep, m.to_string(), port, vm, r.in_frames, r.out_frames
+                );
+            }
+        }
+        _ => return err("steer set EP IP[/PROTO[:PORT]] --to VM:NIC|PORT | steer del RULE | steer list"),
+    }
+    Ok(())
 }
 
 fn run(args: &[String]) -> Result<i32> {
@@ -492,6 +628,8 @@ fn run(args: &[String]) -> Result<i32> {
                 println!("{:>4} {:>3} {:<17} {:>8} {:>8} {:>6}", p.port, p.vm, fmt_mac(p.mac), p.rx_frames, p.tx_frames, p.drops);
             }
         }
+        "ep" => cmd_ep(&ctl, &args[1..])?,
+        "steer" => cmd_steer(&ctl, &args[1..])?,
         "shutdown" => {
             let vm = parse_num(args.get(1).ok_or(Error("shutdown: missing VM".into()))?)?;
             let how = if args.get(2).map(|s| s.as_str()) == Some("--reboot") { 1 } else { 0 };

@@ -580,6 +580,35 @@ enum l4h_ctl_op {
 	 * Reads do not consume records. Lost includes overwritten, dropped or
 	 * concurrently publishing records. A future cursor returns EINVAL. */
 	L4H_CTL_LOG_READ = 31,
+	/* Steering (DESIGN.md §9.3): dom0 hands part of an address's traffic
+	 * to another port, rewriting only MAC addresses.
+	 *
+	 * args: switch, MAC, peer MAC (low 48 bits) -> vals[0] = endpoint.
+	 * MAC must be that of a port on the switch or of its uplink NIC; peer
+	 * is the gateway its steered traffic comes from and returns to.
+	 * Setting an existing (switch, MAC) changes its peer.  -ENOENT (no
+	 * switch), -EINVAL, -ENOSPC. */
+	L4H_CTL_EP_SET = 32,
+	/* args: endpoint; deletes its steering rules too */
+	L4H_CTL_EP_DEL = 33,
+	/* args: first endpoint -> vals[0] = count; data: struct l4h_ctl_ep[] */
+	L4H_CTL_EP_LIST = 34,
+	/* args: endpoint, family | proto << 8 | port << 16 (family 4 or 6;
+	 * proto 0 = any, then port 0; port 0 = any, and only for proto 6 or
+	 * 17), IP bits 127-64, IP bits 63-0 (IPv4 in bits 31-0), target port
+	 * mask (exactly one bit for now) -> vals[0] = rule.  Frames from the
+	 * peer to the endpoint MAC matching (dst IP, proto, dst port) go to the
+	 * target with its MAC; the target's frames matching (src IP, proto, src
+	 * port) leave as endpoint MAC -> peer.  Most specific match wins.
+	 * Setting an existing (endpoint, match) replaces its targets.  A rule
+	 * leaves a target port when that port is removed.  -ENOENT, -EINVAL,
+	 * -EEXIST (the target has rules for this IP under another endpoint),
+	 * -ENOSPC. */
+	L4H_CTL_STEER_SET = 35,
+	/* args: rule */
+	L4H_CTL_STEER_DEL = 36,
+	/* args: first rule -> vals[0] = count; data: struct l4h_ctl_steer[] */
+	L4H_CTL_STEER_LIST = 37,
 };
 
 #define L4H_GPU_MIN             64
@@ -605,6 +634,23 @@ struct l4h_ctl_port {
 	l4h_u64 rx_frames;
 	l4h_u64 tx_frames;
 	l4h_u64 drops;
+};
+
+struct l4h_ctl_ep {
+	l4h_u32 id;
+	l4h_u32 sw;
+	l4h_u64 mac;
+	l4h_u64 peer;
+};
+
+struct l4h_ctl_steer {
+	l4h_u32 id;
+	l4h_u32 ep;
+	l4h_u64 match;          /* as L4H_CTL_STEER_SET args[1] */
+	l4h_u64 ip_hi, ip_lo;
+	l4h_u64 targets;
+	l4h_u64 in_frames;
+	l4h_u64 out_frames;
 };
 
 enum l4h_vm_state {

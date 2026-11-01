@@ -12,6 +12,7 @@ pub const ENOENT: i64 = 2;
 pub const EIO: i64 = 5;
 pub const ENOMEM: i64 = 12;
 pub const EBUSY: i64 = 16;
+pub const EEXIST: i64 = 17;
 pub const EINVAL: i64 = 22;
 pub const ENOSPC: i64 = 28;
 pub const ENOSYS: i64 = 38;
@@ -92,10 +93,60 @@ pub fn host_op(h: &mut Host, op: u32, a: &[u64; 6], data: &mut [u8; abi::CTL_DAT
             vals[0] = n as u64;
             vals[1] = h.netd.nics.iter().position(|n| n.switch == Some(sw)).map_or(u64::MAX, |i| i as u64);
         }
+        abi::CTL_EP_SET => vals[0] = h.netd.ep_set(a[0].try_into().map_err(|_| ENOENT)?, a[1], a[2])? as u64,
+        abi::CTL_EP_DEL => h.netd.ep_del(a[0].try_into().map_err(|_| ENOENT)?)?,
+        abi::CTL_EP_LIST => {
+            let first = usize::try_from(a[0]).unwrap_or(usize::MAX);
+            let eps = h.netd.endpoints.iter().enumerate().skip(first).filter_map(|(id, e)| {
+                let e = e.as_ref()?;
+                Some(abi::CtlEp { id: id as u32, sw: e.switch, mac: e.mac, peer: e.peer })
+            });
+            vals[0] = put_list(data, eps) as u64;
+        }
+        abi::CTL_STEER_SET => {
+            let ep = a[0].try_into().map_err(|_| ENOENT)?;
+            vals[0] = h.netd.steer_set(ep, a[1], (a[2], a[3]), a[4])? as u64;
+        }
+        abi::CTL_STEER_DEL => h.netd.steer_del(a[0].try_into().map_err(|_| ENOENT)?)?,
+        abi::CTL_STEER_LIST => {
+            let first = usize::try_from(a[0]).unwrap_or(usize::MAX);
+            let mut rules = [abi::CtlSteer::default(); abi::CTL_DATA_MAX / core::mem::size_of::<abi::CtlSteer>()];
+            let mut n = 0;
+            for (id, r) in h.netd.rules.iter().enumerate().skip(first) {
+                let Some(r) = r else { continue };
+                if n == rules.len() {
+                    break;
+                }
+                let (in_frames, out_frames) = h.netd.steer_stats(id).ok_or(EIO)?;
+                rules[n] = abi::CtlSteer {
+                    id: id as u32,
+                    ep: r.ep as u32,
+                    matches: r.matches,
+                    ip_hi: r.ip.0,
+                    ip_lo: r.ip.1,
+                    targets: r.targets,
+                    in_frames,
+                    out_frames,
+                };
+                n += 1;
+            }
+            vals[0] = put_list(data, rules[..n].iter().copied()) as u64;
+        }
         // Returns only on failure.
         abi::CTL_HOST_REBOOT => return Err(crate::reset::reboot(h, "dom0")),
         abi::CTL_RTC_SET => h.rtc.set_secs(&mut h.wins.a, a[0])?,
         _ => return Err(ENOSYS),
     }
     Ok(vals)
+}
+
+/// Write as many of `items` as fit into `data`; returns how many.
+fn put_list<T: Copy>(data: &mut [u8; abi::CTL_DATA_MAX], items: impl Iterator<Item = T>) -> usize {
+    let sz = core::mem::size_of::<T>();
+    let mut n = 0;
+    for e in items.take(abi::CTL_DATA_MAX / sz) {
+        unsafe { core::ptr::write_unaligned(data.as_mut_ptr().add(n * sz) as *mut T, e) };
+        n += 1;
+    }
+    n
 }
