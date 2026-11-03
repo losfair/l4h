@@ -8,6 +8,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use l4hctl::*;
 
+mod mkcheck;
+
 struct CreateOpts {
     name: String,
     mem: u64,
@@ -109,7 +111,11 @@ const USAGE: &str = "usage: l4hctl <command>
   iommu                        IOMMU state: DMA and interrupts confined,
                                devices, logged faults
   host-reboot                  reset the machine (every guest stops; sync
-                               dom0's disks first)
+                               dom0's disks first); on a multikernel
+                               machine, partition 0's dom0 only
+  mk-check [L4H-MK.CONF]       check a multikernel split against this
+                               machine, from native Linux (default
+                               /boot/efi/l4h/l4h-mk.conf)
   rtc-set [UNIX_SECONDS]       set the machine RTC in UTC (default: dom0's
                                current time, e.g. after NTP synchronizes)
   disks                        host disks, owners, capacities and attachments
@@ -354,6 +360,9 @@ fn run(args: &[String]) -> Result<i32> {
     };
     if cmd == "attest" {
         return cmd_attest(&args[1..]);
+    }
+    if cmd == "mk-check" {
+        return mkcheck::run(&args[1..]);
     }
     let ctl = Ctl::open()?;
     match cmd.as_str() {
