@@ -30,7 +30,9 @@ pub const MAX_CHANNELS: usize = MAX_PARTITIONS - 1;
 /// Each kernel's slot: kernel K is linked at `SLOT_BASE + K * SLOT_STRIDE`
 /// (tools/build-kernel.sh, L4H_KERNEL_SLOT) and its root task image follows
 /// it there.
-pub const SLOT_BASE: u64 = 0x10_0000;
+/// Above 16 MiB: firmware keeps ranges below it (OVMF has ACPI NVS at 8 MiB),
+/// and the slots end where the shim is loaded (272 MiB).
+pub const SLOT_BASE: u64 = 16 << 20;
 pub const SLOT_STRIDE: u64 = 32 << 20;
 
 /// The page below 1 MiB where partition K's kernel starts its APs (and the

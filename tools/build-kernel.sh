@@ -10,8 +10,8 @@
 # build/sel4-NAME instead, leaving the default build alone
 # (tools/build-efi.sh builds the shipped variants so).
 # L4H_KERNEL_SLOT=K (0-7) links the kernel for multikernel slot K, at
-# physical 1 MiB + K * 32 MiB (tools/build-mkshim.sh; DESIGN.md §11.4); 0 is the
-# usual address.
+# physical 16 MiB + K * 32 MiB (tools/build-mkshim.sh; DESIGN.md §11.4)
+# instead of the usual 1 MiB.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 src=$root/build/seL4-src
@@ -24,6 +24,8 @@ source "$root/tools/prepare-kernel.sh"
 
 debug=ON
 [ "${L4H_RELEASE:-0}" = 1 ] && debug=OFF
+paddr=$((0x100000))
+[ -n "${L4H_KERNEL_SLOT:-}" ] && paddr=$((0x1000000 + L4H_KERNEL_SLOT * 0x2000000))
 config=$root/kernel/configs/l4h-x86_64.cmake
 # The config only seeds the cache: start afresh when it changed.
 [ "$config" -nt "$out/CMakeCache.txt" ] && rm -rf "$out"
@@ -33,7 +35,7 @@ cmake -G Ninja -S "$src" -B "$out" \
     -DKernelLAPICMode="${L4H_LAPIC_MODE:-X2APIC}" \
     -DKernelSupportPCID="${L4H_PCID:-ON}" \
     -DKernelSkimWindow="${L4H_SKIM_WINDOW:-OFF}" \
-    -DKernelX86ElfPaddrBase=$(printf '0x%x' $((0x100000 + ${L4H_KERNEL_SLOT:-0} * 0x2000000))) \
+    -DKernelX86ElfPaddrBase=$(printf '0x%x' "$paddr") \
     -DCMAKE_INSTALL_PREFIX="$prefix" \
     -DCROSS_COMPILER_PREFIX= >/dev/null
 ninja -C "$out" all
