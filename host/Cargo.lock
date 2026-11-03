@@ -335,6 +335,7 @@ dependencies = [
 name = "l4h-netd"
 version = "0.1.0"
 dependencies = [
+ "l4h-partition",
  "l4h-rt",
  "l4h-virtio",
 ]

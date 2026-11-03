@@ -51,6 +51,16 @@ if [ -n "${MKPEER:-}" ]; then
         [ "$i" -lt 90 ] || fail "ping p$MKPEER over the link"
     done
     say "link ok: $(ping -c 3 -W 2 "$peer" | grep 'packets transmitted')"
+    if [ "$P" = 1 ]; then
+        # Flood the link (busybox ping has no -f: pings that each send
+        # again on a reply) while control traffic crosses, the heartbeats
+        # and rtc-set below: frames have a channel of their own and must
+        # not overwrite it.
+        for j in 1 2 3 4 5 6 7 8; do
+            ping -q -A -s 8000 -w 10 "$peer" > "/tmp/flood$j" 2>&1 &
+        done
+        flooding=1
+    fi
 fi
 if [ -n "$MKIOMMU" ]; then
     # The host disk (dom0 took none) to VMs in turn: each attaches an
@@ -81,6 +91,13 @@ if [ "$P" != 0 ]; then
     say "host-reboot refused: $(cat /tmp/err)"
     # The RTC is partition 0's: setting it goes there.
     l4hctl rtc-set || fail "rtc-set"
+fi
+if [ -n "${flooding:-}" ]; then
+    wait
+    sum() { cat /tmp/flood* | sed -n "s/^\([0-9]*\) packets transmitted, \([0-9]*\) packets received.*/\\$1/p" | awk '{s += $1} END {print s + 0}'; }
+    tx=$(sum 1) rx=$(sum 2)
+    [ "$rx" -gt 0 ] || fail "flood: no replies"
+    say "flood ok: $rx of $tx pings of 8000 bytes answered"
 fi
 say done
 if [ "$P" = 0 ]; then

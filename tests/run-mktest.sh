@@ -5,7 +5,8 @@
 # address by DHCP over its own NIC, and runs a VM that no other dom0 sees;
 # a secondary's dom0 is refused host-reboot.  Partitions 0 and 1 are
 # linked (link.p0-p1): their dom0s ping each other over the link, with no
-# switch outside the machine.  Then partition 0's dom0 resets the whole
+# switch outside the machine, and partition 1's floods it while its
+# rtc-set and heartbeats must still reach partition 0.  Then partition 0's dom0 resets the whole
 # machine.  The other kernels' consoles reach the serial
 # port through partition 0 ("[pN]" lines).
 # MK_PARTITIONS=N (2..8) needs 2N CPUs; L4H_QEMU_IOMMU=intel|amd adds an
@@ -174,6 +175,12 @@ run_qemu() {
         [ "$k" = 0 ] || grep -aq "MKTEST p$k: host-reboot refused" "$log" || { echo "partition $k: host-reboot not refused"; ok=0; }
         [ "$k" = 0 ] || grep -aq "l4h-root: RTC set for partition $k" "$log" || { echo "partition $k: rtc-set did not reach partition 0"; ok=0; }
     done
+    # Partition 1 flooded the link during its rtc-set: control traffic
+    # has a channel of its own.
+    if [ "$n" -ge 2 ] && [ -z "${MK_UPLINK:-}" ]; then
+        grep -aq "MKTEST p1: flood ok" "$log" || { echo "partition 1: no flood over the link"; ok=0; }
+        ! grep -aq "partition 1 stopped: no heartbeat" "$log" || { echo "partition 1's heartbeats lost in the flood"; ok=0; }
+    fi
     grep -aqE "^l4h-root: host reboot \(dom0\)\s*$" "$log" || { echo "partition 0 did not reset the machine"; ok=0; }
     # One IOMMU for all: every partition's devices confined and interrupts
     # remapped, pools drained, and partition 0 (which gets every

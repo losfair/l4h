@@ -2,10 +2,6 @@
 //! that connect guests' virtio-net devices to it, and the links to other
 //! partitions' netds.
 
-use core::ptr::{addr_of, addr_of_mut};
-use core::sync::atomic::{Ordering, fence};
-
-use sel4::init_thread::slot;
 use sel4::{CapRights, ObjectBlueprint, VmAttributes, cap, cap_type};
 
 use l4h_abi as abi;
@@ -16,7 +12,7 @@ use crate::blkd::{BAR_STRIDE, VirtioRegions, bar_pages, is_legacy_virtio, keep_b
 use crate::component::{self, Component, SpawnArgs, abs_of};
 use crate::devmem::DevMem;
 use crate::iommu::Iommu;
-use crate::mem::{Alloc, Arena, Dest, ObjCtx, Slot, UtRegion};
+use crate::mem::{Alloc, Arena, Dest, Slot, UtRegion};
 use crate::pci::{self, Pci};
 use crate::vmmgr::RootGuest;
 use crate::vspace::FRAME_BP;
@@ -35,13 +31,10 @@ const _: () = assert!(net::PORT_PAGES <= 1 << PORT_KEEP_BITS);
 const NIC_MSI_BASE: u64 = crate::pci::VECTOR_NIC_BASE;
 const NETD_ID: u32 = 0x200;
 
-/// Badge on root's notification: netd put frames in a link port's RX ring,
-/// or wants room there.
-pub const LINK_BADGE: u64 = 1 << 43;
-/// `PortInfo::vm` of a link port, which belongs to no VM.
-pub const LINK_VM: usize = u32::MAX as usize;
-/// The largest frame a link carries: what channel.rs reads whole.
-const LINK_FRAME_MAX: usize = 9216;
+/// Badges on root's notification: netd asks root to ring the doorbell of
+/// link l's peer with bit LINK_BADGE_SHIFT + l.
+pub const LINK_BADGE_SHIFT: u32 = 44;
+pub const LINK_BADGES: u64 = ((1 << net::MAX_LINKS) - 1) << LINK_BADGE_SHIFT;
 
 pub fn is_virtio_net(d: &pci::Device) -> bool {
     d.vendor == 0x1af4
@@ -128,21 +121,15 @@ pub struct SteerRule {
 }
 
 /// A link to another partition (`link.pA-pB` in l4h-mk.conf, DESIGN.md
-/// §11.4): a netd port whose client is root, wired to the matching port of
-/// the peer's netd through their channel.  Root copies each frame once
-/// each way, between the port's slots and the channel's ring: only root
-/// can ring the peer's doorbell, and the channel's rings also carry
-/// root's control messages, so netd cannot own them.  The wire is lossy,
-/// like any L2 link: a frame that finds the channel or the port full is
-/// lost.
+/// §11.4): a channel of its own that the two netds write and read
+/// directly.  Root never touches the frames: it maps the channel into
+/// netd, points the receive doorbell at netd, and rings the peer's
+/// doorbell when netd asks (only root holds IRQControl), which netd does
+/// only when the peer's netd said it is going to sleep.
 pub struct Link {
     pub peer: u32,
-    pub port: usize,
-    chan: *mut net::Port,
-    kick: cap::Notification,
-    /// Frames put in the port's TX ring since netd was last kicked.
-    queued: bool,
-    pub drops: u64,
+    peer_slot: u32,
+    peer_vector: u32,
 }
 
 pub struct Netd {
@@ -156,7 +143,7 @@ pub struct Netd {
     /// Mirrors of netd's steering tables, by id.
     pub endpoints: [Option<Endpoint>; net::MAX_STEER_ENDPOINTS],
     pub rules: [Option<SteerRule>; net::MAX_STEER_RULES],
-    pub links: ArrayVec<Link, { l4h_partition::MAX_CHANNELS }>,
+    pub links: ArrayVec<Link, { net::MAX_LINKS }>,
 }
 
 pub fn bdf(d: &pci::Device) -> u32 {
@@ -470,37 +457,70 @@ impl Netd {
         }
     }
 
-    /// Connect a port on `switch` to the link to partition `peer`.  The
-    /// port's memory is root's and mapped in root too; netd signals `ntfn`
-    /// with LINK_BADGE.  Links last until the machine reboots.
-    pub fn add_link(&mut self, peer: u32, switch: u32, ntfn: cap::Notification, alloc: &mut Alloc) -> Result<usize, i64> {
-        let va = crate::layout::LINK_PORTS.base + self.links.len() * (1 << PORT_BITS);
-        if self.links.is_full() {
+    /// Put the link channel `ch` of partition `me` on `switch`, as netd's
+    /// link l (returned).  netd gets the channel mapped (by the CPU only:
+    /// no device reaches it), its doorbell's IRQ handler, and `ntfn`
+    /// badged for the link, to ask root to ring the peer's doorbell.
+    pub fn add_link(
+        &mut self,
+        ch: &l4h_partition::Channel,
+        me: u32,
+        switch: u32,
+        ntfn: cap::Notification,
+        alloc: &mut Alloc,
+        devmem: &mut DevMem,
+    ) -> Result<usize, i64> {
+        let l = self.links.len();
+        if l >= net::MAX_LINKS || switch >= self.switches {
             return Err(ctl::ENOSPC);
         }
-        let p = self.free_port(switch)?;
-        let (_, mut region) = Self::port_memory(alloc)?;
-        let frames = alloc.slots.alloc_range(net::PORT_PAGES);
-        region.retype(&FRAME_BP, net::PORT_PAGES, Dest::new(crate::slot::CNODE.cap(), frames.start)).expect("link port frames");
-        let keep = self.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: PORT_KEEP_BITS });
-        for (i, f) in frames.enumerate() {
-            let f = sel4::init_thread::Slot::<cap_type::Granule>::from_index(f).cap();
-            crate::vspace::map_frame(&mut ObjCtx::global(alloc), slot::VSPACE.cap(), f, va + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT);
-            let dst = keep.absolute_cptr_from_bits_with_depth(i as u64, PORT_KEEP_BITS);
-            self.comp.map_copy(alloc, &mut self.arena, &abs_of(f), net::port_va(p) + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, dst);
+        let size = ch.size as usize;
+        if size > net::LINK_CHANNEL_MAX || size % PAGE != 0 {
+            return Err(ctl::EINVAL);
         }
-        self.comp.give_badged(net::NETD_SLOT_CLIENT_BASE + p as u64, ntfn, CapRights::write_only(), LINK_BADGE);
-        let kick_slot = alloc.slots.alloc();
-        let kick = sel4::init_thread::Slot::<cap_type::Notification>::from_index(kick_slot).cap();
-        abs_of(kick).mint(&abs_of(self.comp.ntfn), CapRights::write_only(), 1 << p).expect("link port kick");
-        // The port's rx_csum and rx_gso stay 0: netd completes checksums
-        // and segments for it, so only plain Ethernet frames cross.
-        if call(self.comp.service_ep, net::NETD_ADD_PORT, &[p as u64, switch as u64, 0, 0]) == u64::MAX {
+        let bits = keep_bits(size / PAGE);
+        let keep = self.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: bits });
+        let (comp, arena) = (&self.comp, &mut self.arena);
+        let mut i = 0;
+        devmem
+            .frames_range(alloc, ch.paddr as usize, size, |alloc, frames| {
+                for s in frames {
+                    let dst = keep.absolute_cptr_from_bits_with_depth(i as u64, bits);
+                    let f = abs_of(crate::devmem::granule(s));
+                    comp.map_copy(alloc, arena, &f, net::link_va(l) + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, dst);
+                    i += 1;
+                }
+            })
+            .ok_or(ctl::ENOMEM)?;
+        // The doorbell wakes netd directly, badged as the link; netd acks
+        // it.  netd's kick to itself carries the same badge.
+        let badge = 1 << (net::NETD_BADGE_LINK_SHIFT as usize + l);
+        let badged = alloc.slots.alloc();
+        let badged = sel4::init_thread::Slot::<cap_type::Notification>::from_index(badged).cap();
+        abs_of(badged).mint(&abs_of(self.comp.ntfn), CapRights::write_only(), badge).expect("link doorbell badge");
+        match crate::channel::doorbell(alloc, ch.vector, badged) {
+            Some(irq) => self.comp.give(net::NETD_SLOT_LINK_IRQ_BASE + l as u64, irq, CapRights::all()),
+            None => log!("l4h-root: no doorbell from partition {} for the link", ch.peer),
+        }
+        self.comp.give_badged(net::NETD_SLOT_LINK_KICK_BASE + l as u64, self.comp.ntfn, CapRights::write_only(), badge);
+        self.comp.give_badged(net::NETD_SLOT_LINK_RING_BASE + l as u64, ntfn, CapRights::write_only(), 1 << (LINK_BADGE_SHIFT as usize + l));
+        let args = [l as u64, switch as u64, ch.size, me as u64, ch.peer as u64];
+        if call(self.comp.service_ep, net::NETD_ADD_LINK, &args) == u64::MAX {
             return Err(ctl::EIO);
         }
-        self.ports[p] = Some(PortInfo { vm: LINK_VM, switch, mac: 0 });
-        let _ = self.links.push(Link { peer, port: p, chan: va as *mut net::Port, kick, queued: false, drops: 0 });
-        Ok(p)
+        self.links.must_push(Link { peer: ch.peer, peer_slot: ch.peer_slot, peer_vector: ch.peer_vector });
+        Ok(l)
+    }
+
+    /// netd asked for the doorbells of the links in `badge` (root's
+    /// notification): ring them.  Constant work per link, however many
+    /// frames netd wrote, and the notification merges repeated asks.
+    pub fn link_ring(&self, badge: u64) {
+        for (l, k) in self.links.iter().enumerate() {
+            if badge & (1 << (LINK_BADGE_SHIFT as usize + l)) != 0 {
+                crate::channel::ring(k.peer_slot, k.peer_vector);
+            }
+        }
     }
 
     /// CPU time netd used since the last call, in timer ticks.
@@ -633,74 +653,5 @@ impl Netd {
     pub fn steer_stats(&self, id: usize) -> Option<(u64, u64)> {
         let i = call(self.comp.service_ep, net::NETD_STEER_STATS, &[id as u64]);
         (i != u64::MAX).then(|| (i, mr(1)))
-    }
-}
-
-/// Send what netd put in the link ports' RX rings to the peers (netd
-/// signalled LINK_BADGE).
-pub fn link_poll(h: &mut crate::Host) {
-    let Some(cs) = h.channels.as_ref() else { return };
-    for l in h.netd.links.iter_mut() {
-        let chan = l.chan;
-        let mut sent = false;
-        loop {
-            unsafe {
-                let tail = addr_of!((*chan).rx.tail).read_volatile();
-                if tail == addr_of!((*chan).rx.head).read_volatile() {
-                    break;
-                }
-                fence(Ordering::Acquire);
-                let slot = addr_of!((*chan).rx_slots[tail as usize % net::RING_SIZE]);
-                let len = addr_of!((*slot).len).read_volatile() as usize;
-                if (14..=LINK_FRAME_MAX).contains(&len) {
-                    let frame = core::slice::from_raw_parts(addr_of!((*slot).data) as *const u8, len);
-                    sent |= cs.push(l.peer, l4h_partition::MSG_FRAME, &[frame]);
-                } else {
-                    l.drops += 1;
-                }
-                fence(Ordering::Release);
-                addr_of_mut!((*chan).rx.tail).write_volatile(tail.wrapping_add(1));
-            }
-        }
-        // One doorbell for the lot.
-        if sent {
-            cs.notify(l.peer);
-        }
-        // netd holds frames until there is room: tell it there is.
-        fence(Ordering::SeqCst);
-        if unsafe { addr_of!((*chan).rx_wanted).read_volatile() } != 0 {
-            l.kick.signal();
-        }
-    }
-}
-
-/// A frame from partition `peer`'s netd over a link channel (channel.rs):
-/// into the link port's TX ring; netd is kicked by `link_kick`.
-pub fn link_frame(h: &mut crate::Host, peer: u32, msg: &[u8]) {
-    let Some(l) = h.netd.links.iter_mut().find(|l| l.peer == peer) else { return };
-    let chan = l.chan;
-    unsafe {
-        let head = addr_of!((*chan).tx.head).read_volatile();
-        let full = head.wrapping_sub(addr_of!((*chan).tx.tail).read_volatile()) as usize >= net::RING_SIZE;
-        if full || msg.len() < 14 || msg.len() > net::MAX_FRAME {
-            l.drops += 1;
-            return;
-        }
-        let slot = addr_of_mut!((*chan).tx_slots[head as usize % net::RING_SIZE]);
-        core::ptr::copy_nonoverlapping(msg.as_ptr(), addr_of_mut!((*slot).data) as *mut u8, msg.len());
-        addr_of_mut!((*slot).hdr).write_volatile([0; net::HDR_SIZE]);
-        addr_of_mut!((*slot).len).write_volatile(msg.len() as u32);
-        fence(Ordering::Release);
-        addr_of_mut!((*chan).tx.head).write_volatile(head.wrapping_add(1));
-    }
-    l.queued = true;
-}
-
-/// Kick netd for the frames `link_frame` queued: once per batch of
-/// channel messages.
-pub fn link_kick(h: &mut crate::Host) {
-    for l in h.netd.links.iter_mut().filter(|l| l.queued) {
-        l.queued = false;
-        l.kick.signal();
     }
 }

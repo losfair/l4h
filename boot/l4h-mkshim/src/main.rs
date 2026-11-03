@@ -47,9 +47,6 @@ const GIB: u64 = 1 << 30;
 const PADDR_TOP: u64 = 512 * GIB;
 const FOUR_GIB: u64 = 4 * GIB;
 
-/// User vector of the doorbell from partition p (pci.rs leaves 96.. free).
-const DOORBELL_VECTOR_BASE: u32 = 96;
-
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     println!("panic: {}", info);
@@ -127,7 +124,7 @@ struct Plan {
     block: u64,
     channels: Vec<part::Channel, { part::MAX_CHANNELS }>,
     /// APIC IDs for the kernel's peers= list.
-    peers: Vec<u32, { part::MAX_CHANNELS }>,
+    peers: Vec<u32, { MAX_PARTITIONS - 1 }>,
     /// The NUMA node of its boot CPU.
     node: u32,
     /// Other partitions' functions it may read (Descriptor::upstream).
@@ -210,36 +207,47 @@ extern "C" fn shim_main(magic: u32, info: u64) -> ! {
     collect_modules(&bi, &mut plans);
     println!("shared region {:#x}-{:#x}", out.start, out.end);
 
-    // Channels: the primary and each secondary, and the configured links
-    // (a link to the primary rides on the control channel).
+    // Channels: the links first (1 MiB each, so aligned), then a control
+    // channel between the primary and each secondary.  A link to the
+    // primary is a channel of its own too: frames never share a ring with
+    // control messages, and each has its own doorbell vector.
     let mut next_channel = out.start + part::IOMMU_REGION_SIZE + OUT_BLOCK * MAX_PARTITIONS as u64;
     let mut pairs: Vec<(usize, usize, u32), 64> = Vec::new();
-    for k in 1..n {
-        let link = conf.links.iter().find(|&&(a, b, _)| a == 0 && b as usize == k).map(|&(_, _, up)| link_kind(up));
-        pairs.must_push((0, k, part::CHANNEL_CONTROL | link.unwrap_or(0)));
-    }
     for &(a, b, up) in conf.links.iter() {
-        if a != 0 {
-            pairs.must_push((a as usize, b as usize, link_kind(up)));
-        }
+        pairs.must_push((a as usize, b as usize, link_kind(up)));
+    }
+    for k in 1..n {
+        pairs.must_push((0, k, part::CHANNEL_CONTROL));
     }
     for &(a, b, kind) in pairs.iter() {
+        let (size, base) = if kind & part::CHANNEL_LINK != 0 {
+            (part::LINK_CHANNEL_SIZE, part::LINK_VECTOR_BASE)
+        } else {
+            (part::CHANNEL_SIZE, part::CONTROL_VECTOR_BASE)
+        };
         let paddr = next_channel;
-        next_channel += part::CHANNEL_SIZE;
-        unsafe { phys_mut(paddr, part::CHANNEL_SIZE as usize).fill(0) };
+        next_channel += size;
+        unsafe { phys_mut(paddr, size as usize).fill(0) };
         for (me, peer) in [(a, b), (b, a)] {
             let peer_apic = cpus[plans[peer].cpus[0]].apic_id;
             let p = &mut plans[me];
-            let slot = p.peers.len() as u32;
-            p.peers.must_push(peer_apic);
+            // One peers= entry per peer: the vector tells the doorbells
+            // apart, and the kernel lists at most 8.
+            let slot = match p.peers.iter().position(|&a| a == peer_apic) {
+                Some(s) => s,
+                None => {
+                    p.peers.must_push(peer_apic);
+                    p.peers.len() - 1
+                }
+            } as u32;
             p.channels.must_push(part::Channel {
                 paddr,
-                size: part::CHANNEL_SIZE,
+                size,
                 peer: peer as u32,
                 kind,
-                vector: DOORBELL_VECTOR_BASE + peer as u32,
+                vector: base + peer as u32,
                 peer_slot: slot,
-                peer_vector: DOORBELL_VECTOR_BASE + me as u32,
+                peer_vector: base + me as u32,
                 _pad: 0,
             });
         }
@@ -663,7 +671,8 @@ fn place_memory(bi: &mut BootInfo, conf: &Conf, acpi: &acpi::Acpi, plans: &mut [
     }
     // The shared region: below 4 GiB, which the kernels' boot page tables
     // map (their console rings must be there).
-    let out_size = part::IOMMU_REGION_SIZE + OUT_BLOCK * MAX_PARTITIONS as u64 + 32 * part::CHANNEL_SIZE;
+    let channels = (n as u64 - 1) * part::CHANNEL_SIZE + conf.links.len() as u64 * part::LINK_CHANNEL_SIZE;
+    let out_size = part::IOMMU_REGION_SIZE + OUT_BLOCK * MAX_PARTITIONS as u64 + align_up(channels, MIB);
     let Some(out) = free.take(out_size, 2 * MIB, MIB, FOUR_GIB, true) else {
         fail(format_args!("no {} MiB below 4 GiB for the shared region", out_size >> 20))
     };

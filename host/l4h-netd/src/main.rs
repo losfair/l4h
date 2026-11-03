@@ -1,8 +1,9 @@
 //! netd: L2 virtual switches (DESIGN.md §9.3) and the uplink NIC drivers.
 //!
-//! Every port belongs to one switch.  A port is either a guest vNIC (a
-//! channel to that guest's l4h-vmm) or an uplink NIC (virtio-net, gVNIC,
-//! ENA or X550 PCI, driven here).  Switches learn source MACs, forward known unicast to one
+//! Every port belongs to one switch.  A port is a guest vNIC (a channel to
+//! that guest's l4h-vmm), an uplink NIC (virtio-net, gVNIC, ENA or X550
+//! PCI, driven here) or, on a multikernel machine, a link to another
+//! partition's netd (link.rs).  Switches learn source MACs, forward known unicast to one
 //! port and flood everything else within the switch.  Guest ports can be
 //! locked to their configured MAC.  Nothing above L2 is looked at, except
 //! by steering rules dom0 sets (steer.rs), which pick a port by IP address,
@@ -18,6 +19,7 @@
 mod ena;
 mod gvnic;
 mod ixgbe;
+mod link;
 mod nic;
 mod offload;
 mod pool;
@@ -56,6 +58,9 @@ const _: () = assert!(FDB_SLOTS.is_power_of_two() && net::MAX_SWITCHES <= u8::MA
 /// only its own backlog.
 const BACKLOG_FRAMES: usize = 512;
 const BACKLOG_CHUNKS: usize = (2 << 20) / pool::CHUNK;
+/// Frames read from a link before netd turns to its other work (and
+/// kicks itself to come back): a flooding peer cannot starve the rest.
+const LINK_BUDGET: usize = 256;
 
 /// The frame being switched, and the segments of a GSO frame for a port
 /// that cannot take it whole: too large for the stack.
@@ -71,6 +76,7 @@ static mut STEER: Steer = Steer::new();
 enum PortId {
     Guest(usize),
     Uplink(usize),
+    Link(usize),
 }
 
 struct GuestPort {
@@ -206,6 +212,7 @@ impl Fdb {
 struct Netd {
     ports: [Option<GuestPort>; net::MAX_PORTS],
     nics: ArrayVec<Nic, { net::MAX_NICS }>,
+    links: [Option<link::Link>; net::MAX_LINKS],
     /// Receive offload per NIC (taken out while it emits).
     gro: [Option<&'static mut offload::Gro>; net::MAX_NICS],
     fdb: Fdb,
@@ -229,7 +236,7 @@ fn mac_of(v: u64) -> [u8; 6] {
     [b[2], b[3], b[4], b[5], b[6], b[7]]
 }
 
-const _: () = assert!(net::MAX_PORTS <= 0x80 && net::MAX_NICS <= 0x80);
+const _: () = assert!(net::MAX_PORTS <= 0x40 && net::MAX_LINKS <= 0x40 && net::MAX_NICS <= 0x80);
 const _: () = assert!(
     steer::MAX_ENDPOINTS == net::MAX_STEER_ENDPOINTS
         && steer::MAX_RULES == net::MAX_STEER_RULES
@@ -242,12 +249,17 @@ impl PortId {
     fn code(self) -> u8 {
         match self {
             PortId::Guest(i) => i as u8,
+            PortId::Link(l) => 0x40 | l as u8,
             PortId::Uplink(n) => 0x80 | n as u8,
         }
     }
 
     fn of_code(c: u8) -> PortId {
-        if c & 0x80 == 0 { PortId::Guest(c as usize) } else { PortId::Uplink((c & 0x7f) as usize) }
+        match c {
+            0..0x40 => PortId::Guest(c as usize),
+            0x40..0x80 => PortId::Link((c & 0x3f) as usize),
+            _ => PortId::Uplink((c & 0x7f) as usize),
+        }
     }
 }
 
@@ -256,6 +268,7 @@ impl Netd {
         match p {
             PortId::Guest(i) => self.ports[i].as_ref().map(|g| g.switch),
             PortId::Uplink(n) => self.nics[n].switch,
+            PortId::Link(l) => self.links[l].as_ref().map(|k| k.switch),
         }
     }
 
@@ -266,6 +279,7 @@ impl Netd {
                 .as_ref()
                 .is_some_and(|p| unsafe { addr_of!((*p.chan).rx_gso).read_volatile() != 0 }),
             PortId::Uplink(n) => self.nics[n].takes_gso(hdr),
+            PortId::Link(_) => false,
         }
     }
 
@@ -307,6 +321,12 @@ impl Netd {
                 }
                 nic.send(frame, hdr, self.pool);
             }
+            PortId::Link(l) => {
+                let Some(k) = self.links[l].as_mut() else { return };
+                // The peer gets plain frames only.
+                complete_csum(frame, hdr);
+                k.send(frame);
+            }
         }
     }
 
@@ -344,7 +364,7 @@ impl Netd {
         }
         let guest = match from {
             PortId::Guest(i) => Some(i),
-            PortId::Uplink(_) => None,
+            PortId::Uplink(_) | PortId::Link(_) => None,
         };
         if let Some(t) = self.steer.inbound(sw, guest, frame) {
             self.deliver(PortId::Guest(t), frame, hdr);
@@ -393,9 +413,13 @@ impl Netd {
             Some(to) if isolated && self.is_isolated(to) => {}
             Some(to) if self.switch_of(to) == Some(switch) => self.deliver(to, frame, hdr),
             _ => {
-                // The switch's other ports, guests' then uplinks.
-                for k in 0..net::MAX_PORTS + self.nics.len() {
-                    let to = if k < net::MAX_PORTS { PortId::Guest(k) } else { PortId::Uplink(k - net::MAX_PORTS) };
+                // The switch's other ports: guests', uplinks, then links.
+                for k in 0..net::MAX_PORTS + self.nics.len() + net::MAX_LINKS {
+                    let to = match k.checked_sub(net::MAX_PORTS) {
+                        None => PortId::Guest(k),
+                        Some(n) if n < self.nics.len() => PortId::Uplink(n),
+                        Some(n) => PortId::Link(n - self.nics.len()),
+                    };
                     if Some(to) != exclude && self.switch_of(to) == Some(switch) && !(isolated && self.is_isolated(to)) {
                         self.deliver(to, frame, hdr);
                     }
@@ -407,8 +431,32 @@ impl Netd {
     fn is_isolated(&self, p: PortId) -> bool {
         match p {
             PortId::Guest(i) => self.ports[i].as_ref().is_some_and(|p| p.isolated),
-            PortId::Uplink(_) => false,
+            PortId::Uplink(_) | PortId::Link(_) => false,
         }
+    }
+
+    /// Switch what link `l`'s peer sent, up to LINK_BUDGET frames; then,
+    /// with the ring empty, ask for a doorbell (link.rs), or with frames
+    /// left, kick netd to come back after its other work.
+    fn link_rx(&mut self, l: usize) {
+        let frame = core::mem::take(&mut self.buf);
+        let mut budget = LINK_BUDGET;
+        while let Some(k) = self.links[l].as_mut() {
+            if budget == 0 {
+                k.kick();
+                break;
+            }
+            match k.recv(frame) {
+                Some(n) => {
+                    budget -= 1;
+                    let mut hdr = [0u8; net::HDR_SIZE];
+                    self.forward(PortId::Link(l), &mut frame[..n], &mut hdr);
+                }
+                None if k.sleep() => break,
+                None => {}
+            }
+        }
+        self.buf = frame;
     }
 
     /// Move port `i`'s backlog into its RX ring while there is room.  While
@@ -576,6 +624,7 @@ fn main(info: &'static Info) -> ! {
     let mut d = Netd {
         ports: [const { None }; net::MAX_PORTS],
         nics: ArrayVec::new(),
+        links: [const { None }; net::MAX_LINKS],
         gro: [const { None }; net::MAX_NICS],
         fdb: Fdb {
             slots: unsafe { &mut *addr_of_mut!(FDB_SLOTS_MEM) },
@@ -617,8 +666,20 @@ fn main(info: &'static Info) -> ! {
                         .expect("netd: IRQ ack");
                 }
             }
+            for l in 0..net::MAX_LINKS {
+                if badge & (1 << (net::NETD_BADGE_LINK_SHIFT as usize + l)) != 0 {
+                    if let Some(k) = d.links[l].as_ref() {
+                        k.ack();
+                    }
+                    d.link_rx(l);
+                }
+            }
             for nic in &mut d.nics {
                 nic.kick_tx();
+            }
+            // Once per batch, so a peer that sleeps is woken once for all.
+            for k in d.links.iter_mut().flatten() {
+                k.doorbell();
             }
             d.signal_clients();
             (msg, badge) = ep.recv(reply);
@@ -667,6 +728,17 @@ fn main(info: &'static Info) -> ! {
                         0
                     }
                     None => u64::MAX,
+                }
+            }
+            net::NETD_ADD_LINK => {
+                let (l, sw, size) = (mr(0) as usize, mr(1), mr(2));
+                let ok = l < net::MAX_LINKS && d.links[l].is_none() && sw < net::MAX_SWITCHES as u64
+                    && size as usize <= net::LINK_CHANNEL_MAX && size >= 4096;
+                if ok {
+                    d.links[l] = Some(link::Link::new(l, sw as u32, size, mr(3) as u32, mr(4) as u32));
+                    0
+                } else {
+                    u64::MAX
                 }
             }
             net::NETD_NIC_MAC => match d.nics.get(mr(0) as usize) {

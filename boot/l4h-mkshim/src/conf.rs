@@ -82,7 +82,8 @@ impl Conf {
             if let Some(l) = key.strip_prefix("link.") {
                 let Some((a, b)) = l.split_once('-') else { bad(line) };
                 let (Some(a), Some(b)) = (part_index(a), part_index(b)) else { bad(line) };
-                if a == b {
+                // One link per pair: its doorbell vector is the peer's.
+                if a == b || c.links.iter().any(|&(x, y, _)| (x, y) == (a.min(b) as u8, a.max(b) as u8)) {
                     bad(line);
                 }
                 match value {
