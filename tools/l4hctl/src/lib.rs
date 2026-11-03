@@ -548,17 +548,74 @@ pub fn lv_extents(lv: &str, pv_start: u64) -> Result<Vec<(u64, u64)>> {
         let (a, b) = range.split_once('-').ok_or(Error(format!("{lv}: bad PE range {ranges}")))?;
         segs.push((parse_num(start_pe)?, parse_num(a)?, parse_num(b)?));
     }
+    linear_extents(pv_start, pe_start, extent_size, segs).map_err(|e| Error(format!("{lv}: {}", e.0)))
+}
+
+/// Map LVM's (logical start, first PE, last PE) segments to host sectors.
+fn linear_extents(pv_start: u64, pe_start: u64, extent_size: u64, mut segs: Vec<(u64, u64, u64)>)
+    -> Result<Vec<(u64, u64)>> {
+    let invalid = || Error("invalid or overflowing physical extent range".into());
+    let base = pv_start.checked_add(pe_start).ok_or_else(invalid)?;
     segs.sort();
     let mut extents: Vec<(u64, u64)> = Vec::new();
     for (_, a, b) in segs {
-        let (start, sectors) = (pv_start + pe_start + a * extent_size, (b - a + 1) * extent_size);
+        let start = a.checked_mul(extent_size).and_then(|off| base.checked_add(off)).ok_or_else(invalid)?;
+        let sectors = b.checked_sub(a).and_then(|n| n.checked_add(1))
+            .and_then(|n| n.checked_mul(extent_size)).ok_or_else(invalid)?;
+        start.checked_add(sectors).ok_or_else(invalid)?;
         match extents.last_mut() {
-            Some(last) if last.0 + last.1 == start => last.1 += sectors,
+            Some(last) if last.0.checked_add(last.1) == Some(start) => {
+                last.1 = last.1.checked_add(sectors).ok_or_else(invalid)?;
+            }
             _ => extents.push((start, sectors)),
         }
     }
-    check_extents(&extents).map_err(|e| Error(format!("{lv}: {}", e.0)))?;
+    check_extents(&extents)?;
     Ok(extents)
+}
+
+#[cfg(test)]
+mod extent_tests {
+    use super::*;
+
+    #[test]
+    fn linear_segments_keep_guest_order_and_join_adjacent_runs() {
+        let segs = vec![(5, 7, 7), (0, 10, 11), (4, 4, 4), (2, 2, 3)];
+        assert_eq!(linear_extents(4096, 2048, 8192, segs).unwrap(),
+            [(88064, 16384), (22528, 24576), (63488, 8192)]);
+        // The last aligned end representable in u64 is still valid.
+        assert_eq!(linear_extents(u64::MAX - 8199, 0, 8192, vec![(0, 0, 0)]).unwrap(),
+            [(u64::MAX - 8199, 8192)]);
+    }
+
+    #[test]
+    fn linear_segments_reject_overflow_and_reversed_ranges() {
+        for (name, pv, head, size, segs) in [
+            ("PV start plus metadata", u64::MAX - 2047, 2048, 8192, vec![(0, 0, 0)]),
+            ("PE offset multiplication", 0, 0, 8, vec![(0, 1 << 61, 1 << 61)]),
+            ("PV base plus PE offset", u64::MAX - 8191, 0, 8192, vec![(0, 1, 1)]),
+            ("inclusive PE count", 0, 0, 8, vec![(0, 0, u64::MAX)]),
+            ("sector count multiplication", 0, 0, 8192, vec![(0, 0, 1 << 51)]),
+            ("reversed PE range", 0, 0, 8192, vec![(0, 2, 0)]),
+            ("extent end", u64::MAX - 4095, 0, 8192, vec![(0, 0, 0)]),
+            ("coalesced extent end", 0, 0, 8, vec![(0, 0, (1 << 61) - 2), (1, (1 << 61) - 1, (1 << 61) - 1)]),
+        ] {
+            let result = linear_extents(pv, head, size, segs);
+            assert!(result.is_err(), "{name}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn linear_segments_still_obey_volume_constraints() {
+        for (pv, size, segs) in [
+            (0, 8192, vec![]),
+            (1, 8192, vec![(0, 0, 0)]),
+            (0, 0, vec![(0, 0, 0)]),
+            (0, 8, vec![(0, 0, 0), (1, 2, 2)]),
+        ] {
+            assert!(linear_extents(pv, 0, size, segs).is_err());
+        }
+    }
 }
 
 pub fn read_file(path: &str) -> Result<Vec<u8>> {

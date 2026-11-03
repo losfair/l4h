@@ -41,6 +41,21 @@ reservations += blkd[blkd.index('pub struct Attachment {'):blkd.index('struct Bl
 start = blkd.index('pub fn remove(')
 end = blkd.index('\n}', start) + 2
 (out / 'blk-reservations.inc').write_text(reservations + blkd[start:end])
+# Exercise both public block-attachment operations before any backend call.
+ctl = (root / 'host/l4h-vmmgr/src/ctl.rs').read_text()
+start = ctl.index('fn vm_arg(')
+end = ctl.index('\n}', start) + 2
+vm_arg = ctl[start:end]
+start = ctl.index('        abi::CTL_BLK_ATTACH => {')
+end = ctl.index('        abi::CTL_CONSOLE_READ => {', start)
+(out / 'blk-attach.inc').write_text(vm_arg + '''
+fn execute(h: &mut Vmmgr, caller: usize, op: u32, a: &[u64; 6]) -> Result<(), i64> {
+    match op {
+''' + ctl[start:end] + '''
+        _ => unreachable!(),
+    }
+}
+''')
 PY
 cc -std=c11 -O2 -Wall -Wextra -Werror -I "$root/include" -I "$out" \
     -c "$root/tests/console-guest.c" -o "$out/console-guest.o"
@@ -66,6 +81,10 @@ L4H_DOM0_BOOT_TEST_SRC="$out/dom0-boot.inc" rustc +stable --edition=2024 --test 
 L4H_BLK_RESERVATIONS_TEST_SRC="$out/blk-reservations.inc" rustc +stable --edition=2024 --test -L dependency="$out" \
     --extern l4h_host="$out/libl4h_host.rlib" "$root/tests/blk-reservations.rs" -o "$out/blk-reservations-tests"
 "$out/blk-reservations-tests"
+L4H_BLK_ATTACH_TEST_SRC="$out/blk-attach.inc" rustc +stable --edition=2024 --test -L dependency="$out" \
+    --extern l4h_abi="$out/libl4h_abi.rlib" --extern l4h_host="$out/libl4h_host.rlib" \
+    "$root/tests/blk-attach.rs" -o "$out/blk-attach-tests"
+"$out/blk-attach-tests"
 L4H_BLKD_TEST_SRC="$out/blkd-main.inc" rustc +stable --edition=2024 --test -L dependency="$out" \
     --extern l4h_host="$out/libl4h_host.rlib" \
     "$root/tests/blk-ipc.rs" -o "$out/blk-ipc-tests"
