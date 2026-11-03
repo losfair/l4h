@@ -120,6 +120,8 @@ jobs:
         run: NETTEST_LEGACY=1 tests/run-nettest.sh
       - name: Intel VT-d DMA and interrupt remapping
         run: tests/run-vtdtest.sh --qemu
+      - name: Partition message rings
+        run: tests/run-ringtest.sh
       - name: AMD-Vi shared PCI requester groups
         run: |
           python3 tests/vtd-net-qemu.py --iommu amd --topology pci
