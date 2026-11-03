@@ -231,8 +231,10 @@ pub struct AmdVi {
     unity: ArrayVec<Unity, MAX_UNITY>,
     /// The domain of devices with only "all devices" unity ranges.
     shared: Option<Domain>,
-    /// Domain IDs not yet given out: this partition's share.
+    /// Domain IDs not yet given out, of this partition's share.
     domains: core::ops::Range<u32>,
+    /// The whole share: the domains that are ours to add to.
+    own_domains: core::ops::Range<u32>,
     ticks_per_ms: u64,
     /// Remap interrupts (`iommu_intremap`).
     intremap: bool,
@@ -285,6 +287,7 @@ impl AmdVi {
             unity: ArrayVec::new(),
             shared: None,
             domains: 1..1 << 16,
+            own_domains: 1..1 << 16,
             ticks_per_ms: 0,
             intremap: false,
             dropped: 0,
@@ -326,6 +329,7 @@ impl AmdVi {
         if let Some(s) = region {
             let p = s.part(1 << 16);
             me.domains = p.start.max(1)..p.end;
+            me.own_domains = me.domains.clone();
         }
         let mut buf = [0u8; 32 << 10];
         let Some(ivrs) = crate::acpi::find(bootinfo, phys, b"IVRS", &mut buf) else {
@@ -787,7 +791,7 @@ impl AmdVi {
         let e = self.dte(id);
         let (q0, q1) = unsafe { (e.read_volatile(), e.add(1).read_volatile()) };
         // Another partition's domain is not ours to add to.
-        (q0 & DTE_TV != 0 && q0 >> 9 & 7 != 0 && (self.region.is_none() || self.domains.contains(&(q1 as u16 as u32))))
+        (q0 & DTE_TV != 0 && q0 >> 9 & 7 != 0 && (self.region.is_none() || self.own_domains.contains(&(q1 as u16 as u32))))
             .then(|| Domain { id: q1 as u16, root: (q0 & PTE_ADDR) as usize, ..Domain::NONE })
     }
 
