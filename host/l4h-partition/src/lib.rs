@@ -115,6 +115,10 @@ pub const CHANNEL_CONTROL: u32 = 1;
 /// A virtual wire between the two partitions' netds (`link.pA-pB = 1` in
 /// l4h-mk.conf): MSG_FRAME messages.
 pub const CHANNEL_LINK: u32 = 2;
+/// With CHANNEL_LINK: the link joins both partitions' switch 0, where an
+/// uplink NIC is, instead of a switch of its own (`link.pA-pB = uplink`):
+/// a partition without a NIC of its own shares the other's.
+pub const CHANNEL_LINK_UPLINK: u32 = 4;
 
 /// The IOMMU state shared by all partitions (DESIGN.md §11.4): `size`
 /// bytes at `paddr`, laid out as the IOMMU_* constants say.  Of each

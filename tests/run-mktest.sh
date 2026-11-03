@@ -12,6 +12,9 @@
 # IOMMU the partitions share.  MK_BOOT=uefi or bios boots a disk image from
 # tools/mkimage.sh through GRUB (OVMF or SeaBIOS) instead of QEMU's
 # multiboot loader, with the configuration on the EFI system partition.
+# MK_UPLINK=1 gives partition 1 no NIC: the link is `uplink`, on both
+# partitions' switch 0, and partition 1's dom0 gets its address through
+# partition 0's NIC.
 # MK_BRIDGES=1 puts partition 1's disk behind a PCIe root port and its NIC
 # behind a root port and a PCIe-to-PCI bridge, whose requester ID it
 # borrows: with an IOMMU, partition 1 must read partition 0's bridges.
@@ -61,7 +64,7 @@ if [ -n "${L4H_QEMU_IOMMU:-}" ]; then
 fi
 conf=$out/l4h-mk.conf
 echo "partitions = $n" > "$conf"
-[ "$n" -lt 2 ] || echo "link.p0-p1 = 1" >> "$conf"
+[ "$n" -lt 2 ] || echo "link.p0-p1 = $([ -n "${MK_UPLINK:-}" ] && echo uplink || echo 1)" >> "$conf"
 devices=() cmdline=()
 mods="$out/l4h-root.elf l4h-root,$out/vmlinux guest-kernel,$out/dom0.cpio.gz dom0-initrd,$conf l4h-mk.conf"
 for k in $(seq 0 $((n - 1))); do
@@ -78,6 +81,10 @@ for k in $(seq 0 $((n - 1))); do
             -netdev "user,id=n$k"
             -device "virtio-net-pci,netdev=n$k,disable-legacy=on,bus=pb1,addr=1")
         disk_bdf=01:00.0 nic_bdf=03:01.0
+    elif [ "$k" = 1 ] && [ -n "${MK_UPLINK:-}" ]; then
+        devices+=(-drive "file=$out/disk$k.img,if=none,id=d$k,format=raw"
+            -device "virtio-blk-pci,drive=d$k,bus=pcie.0,addr=$(printf '%#x' $disk)")
+        nic_bdf=
     else
         devices+=(-drive "file=$out/disk$k.img,if=none,id=d$k,format=raw"
             -device "virtio-blk-pci,drive=d$k,bus=pcie.0,addr=$(printf '%#x' $disk)"
@@ -85,15 +92,15 @@ for k in $(seq 0 $((n - 1))); do
             -device "virtio-net-pci,netdev=n$k,disable-legacy=on,bus=pcie.0,addr=$(printf '%#x' $nic)")
     fi
     if [ "$k" != 0 ]; then
-        printf 'p%d.cpus = 2\np%d.mem = 1G\np%d.pci = %s, %s\n' "$k" "$k" "$k" "$disk_bdf" "$nic_bdf" >> "$conf"
+        printf 'p%d.cpus = 2\np%d.mem = 1G\np%d.pci = %s%s\n' "$k" "$k" "$k" "$disk_bdf" "${nic_bdf:+, $nic_bdf}" >> "$conf"
     fi
     # Partitions 0 and 1 know their peer over the link.
     peer=
-    [ "$k" -lt 2 ] && peer=" MKPEER=$((1 - k))"
+    [ "$k" -lt 2 ] && [ -z "${MK_UPLINK:-}" ] && peer=" MKPEER=$((1 - k))"
     # The attestation check measures this exact command line.
     cmdline[k]="console=hvc0 MKP=$k$peer${nonce:+ attest_nonce=$nonce}${mkiommu[*]:+ ${mkiommu[*]}}"
-    printf 'dom0_cmdline="%s"\ndom0_mem_mb=256\nboot_disk=%s\nuplink_nic=%s%s\n' \
-        "${cmdline[k]}" "$disk_bdf" "$nic_bdf" "$dom0_disks" > "$out/p$k.conf"
+    printf 'dom0_cmdline="%s"\ndom0_mem_mb=256\nboot_disk=%s\n%s%s\n' \
+        "${cmdline[k]}" "$disk_bdf" "${nic_bdf:+uplink_nic=$nic_bdf}" "$dom0_disks" > "$out/p$k.conf"
     mods+=",$out/p$k.conf p$k:l4h-config,$root/build/mkshim/kernel-s$k.elf kernel-s$k"
 done
 
@@ -163,7 +170,7 @@ run_qemu() {
     ok=1
     for k in $(seq 0 $((n - 1))); do
         grep -aq "MKTEST p$k: done" "$log" || { echo "partition $k did not finish"; ok=0; }
-        [ "$k" -ge 2 ] || grep -aq "MKTEST p$k: link ok" "$log" || { echo "partition $k: no ping over the link"; ok=0; }
+        [ "$k" -ge 2 ] || [ -n "${MK_UPLINK:-}" ] || grep -aq "MKTEST p$k: link ok" "$log" || { echo "partition $k: no ping over the link"; ok=0; }
         [ "$k" = 0 ] || grep -aq "MKTEST p$k: host-reboot refused" "$log" || { echo "partition $k: host-reboot not refused"; ok=0; }
         [ "$k" = 0 ] || grep -aq "l4h-root: RTC set for partition $k" "$log" || { echo "partition $k: rtc-set did not reach partition 0"; ok=0; }
     done

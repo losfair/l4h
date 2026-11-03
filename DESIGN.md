@@ -3135,6 +3135,7 @@ p1.cpus = node:1
 p1.mem  = 64G                # others: an even share by default
 p1.pci  = 0000:80:04.0, 0000:80:05.0
 link.p0-p1 = 1               # a virtual wire between the two netds
+                             # ("uplink": on their switch 0, sharing a NIC)
 ```
 
 Every PCI function no other partition lists is partition 0's, so
@@ -3236,6 +3237,14 @@ the channel as a message and rings the peer's doorbell once per batch; the
 peer's root copies arriving frames into its port's transmit ring and kicks
 its netd. The port leaves checksum offload and GSO off, so frames cross
 whole, up to 9216 bytes, and a full ring drops them, as a wire would.
+`link.pA-pB = uplink` instead puts the link port on both partitions'
+switch 0, with no switch or vNIC of its own: a partition without a NIC
+shares the network of the one whose switch 0 has the uplink NIC (a star of
+such links shares one NIC among all partitions). Every frame then crosses
+the NIC owner's root and the channel, without flow control, and the
+others lose the network if that partition stops. Networks that deliver
+only the instance's own MAC addresses (GCE, EC2) drop the other
+partitions' frames: there, route through the owner's dom0 instead.
 
 **Attestation.** Only partition 0 has the TPM. A secondary's trustd signs
 with a key of its own (from RDRAND) and asks partition 0's trustd, over
@@ -3260,8 +3269,9 @@ The partitions' dom0s ping each other over a link.
 GRUB from a `tools/mkimage.sh` disk, `L4H_QEMU_IOMMU=intel|amd` shares an
 IOMMU (VMs in every partition attach and drain I/O pools at once), and
 `MK_ATTEST=1` attests a VM in each partition through partition 0's swtpm,
-and `MK_BRIDGES=1` puts partition 1's devices behind root ports and a
-PCIe-to-PCI bridge.
+`MK_BRIDGES=1` puts partition 1's devices behind root ports and a
+PCIe-to-PCI bridge, and `MK_UPLINK=1` gives partition 1 no NIC but an
+`uplink` link to partition 0's.
 
 **Limits.** Partition 0's own output and the lines it relays share the
 serial port a character at a time, so they can interleave.

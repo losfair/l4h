@@ -57,7 +57,7 @@ fn size(v: &str) -> Option<u64> {
     num.trim().parse::<u64>().ok().map(|n| n << shift)
 }
 
-fn parse(text: &str) -> Result<(usize, Vec<Part>, Vec<(usize, usize)>)> {
+fn parse(text: &str) -> Result<(usize, Vec<Part>, Vec<(usize, usize, bool)>)> {
     let mut n = 1;
     let mut parts = vec![Part::default(); MAX_PARTITIONS];
     let mut links = Vec::new();
@@ -78,8 +78,11 @@ fn parse(text: &str) -> Result<(usize, Vec<Part>, Vec<(usize, usize)>)> {
             if a == b {
                 return Err(bad());
             }
-            if value == "1" {
-                links.push((a.min(b), a.max(b)));
+            match value {
+                "1" => links.push((a.min(b), a.max(b), false)),
+                "uplink" => links.push((a.min(b), a.max(b), true)),
+                "0" => {}
+                _ => return Err(bad()),
             }
         } else {
             let (p, field) = key.split_once('.').ok_or_else(bad)?;
@@ -269,12 +272,12 @@ pub fn run(args: &[String]) -> Result<i32> {
             println!("p{k}:   {} class {:06x}", fmt_bdf(f.bdf), f.class);
         }
     }
-    for (a, b) in &links {
+    for (a, b, uplink) in &links {
         if *b >= n {
             println!("link p{a}-p{b}: no partition {b}");
             ok = false;
         } else {
-            println!("link p{a}-p{b}");
+            println!("link p{a}-p{b}{}", if *uplink { " (on their uplink switches)" } else { "" });
         }
     }
     if ram != 0 && asked > ram {
