@@ -256,11 +256,16 @@ pub const CHANNEL_SIZE: u64 = 256 << 10;
 pub const IOMMU_REGION_SIZE: u64 = 8 << 20;
 
 /// Layout of the shared IOMMU region (DESIGN.md §11.4), from its start:
-/// the control page, then per unit (at most `IOMMU_MAX_UNITS`) the unit's
-/// tables at `IOMMU_UNIT_BASE + unit * IOMMU_UNIT_SIZE`.
-pub const IOMMU_MAX_UNITS: usize = 4;
-pub const IOMMU_UNIT_BASE: u64 = 2 << 20;
-pub const IOMMU_UNIT_SIZE: u64 = (IOMMU_REGION_SIZE - IOMMU_UNIT_BASE) / IOMMU_MAX_UNITS as u64;
+/// the control page; then for each unit (at most `IOMMU_MAX_UNITS`, in
+/// DMAR/IVRS order) `IOMMU_UNIT_SIZE` bytes at `IOMMU_UNIT_BASE + unit *
+/// IOMMU_UNIT_SIZE` for its command queue, event log, VT-d root table and
+/// interrupt remapping table; then from `IOMMU_TABLES_BASE` to the end the
+/// AMD device table (all units share one) or the VT-d context tables,
+/// which the primary hands out in order.
+pub const IOMMU_MAX_UNITS: usize = 16;
+pub const IOMMU_UNIT_BASE: u64 = 64 << 10;
+pub const IOMMU_UNIT_SIZE: u64 = 64 << 10;
+pub const IOMMU_TABLES_BASE: u64 = 2 << 20;
 
 /// The control page at the start of the shared IOMMU region.
 #[repr(C)]
@@ -268,13 +273,19 @@ pub struct IommuControl {
     /// IOMMU_READY_* once the primary initialized the IOMMUs (or found
     /// none); 0 before.
     pub ready: core::sync::atomic::AtomicU32,
+    /// The units the primary enabled, and whether it remaps interrupts
+    /// (every partition must then send remappable MSIs).
     pub units: core::sync::atomic::AtomicU32,
-    pub _pad: [u32; 14],
+    pub intremap: core::sync::atomic::AtomicU32,
+    pub _pad: [u32; 13],
     pub locks: [IommuLock; IOMMU_MAX_UNITS],
 }
 
 pub const IOMMU_READY_ON: u32 = 1;
 pub const IOMMU_READY_ABSENT: u32 = 2;
+/// There is an IOMMU, but the primary does not confine DMA with it
+/// (`iommu=0`, or it could not be used): neither does anyone else.
+pub const IOMMU_READY_OFF: u32 = 3;
 
 /// A ticket lock around one unit's command queue, in its own cache line.
 #[repr(C, align(64))]
@@ -312,3 +323,5 @@ pub const MSG_FRAME: u32 = 6;
 
 const _: () = assert!(core::mem::size_of::<Func>() == 160);
 const _: () = assert!(core::mem::size_of::<IommuControl>() <= 4096);
+const _: () = assert!(IOMMU_UNIT_BASE + IOMMU_MAX_UNITS as u64 * IOMMU_UNIT_SIZE <= IOMMU_TABLES_BASE);
+const _: () = assert!(IOMMU_TABLES_BASE + (2 << 20) <= IOMMU_REGION_SIZE);

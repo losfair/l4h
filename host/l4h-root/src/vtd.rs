@@ -4,6 +4,11 @@
 //! per requester. Untranslated requests are translated, ATS/translated
 //! requests are blocked. Interrupt entries validate the complete PCI
 //! requester ID; compatibility-format interrupts are disabled globally.
+//! With several partitions (iommu/shared.rs) the root, context and
+//! interrupt remapping tables and the invalidation queues are in the
+//! shared region: partition 0 sets them up, every partition fills in its
+//! own functions' context entries and its share of IRTEs, and takes the
+//! unit's lock around each batch of invalidations.
 //! See Intel VT-d Architecture Specification, rev. 5.0, §§6,8,9,11:
 //! https://cdrdv2-public.intel.com/831418/vt-directed-io-spec.pdf
 
@@ -15,7 +20,7 @@ use core::sync::atomic::{Ordering, compiler_fence};
 use l4h_host::fixed::{ArrayVec, StaticCell};
 use l4h_abi as abi;
 use crate::{mem::Alloc, pci};
-use crate::iommu::{mappings, MAX_MAPPINGS};
+use crate::iommu::{mappings, shared::Shared, MAX_MAPPINGS};
 use dmar::{Dmar, MAX_IOAPICS, MAX_UNITS};
 use format::{ADDR, PRESENT, READ, WRITE};
 
@@ -50,6 +55,10 @@ const SIRTP: u32 = 1 << 24;
 const CFI: u32 = 1 << 23;
 const EAFL: u32 = 1 << 28;
 const QI_ERRORS: u32 = (1 << 4) | (1 << 5) | (1 << 6);
+// A unit's pages in the shared region.
+const SHARED_ROOT: usize = 0;
+const SHARED_QUEUE: usize = 1;
+const SHARED_IRT: usize = 8;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Domain {
@@ -70,7 +79,8 @@ struct Unit {
     levels: u8,
     width: u8,
     root: usize,
-    next_domain: u32,
+    /// Domain IDs not yet given out: this partition's share.
+    domains: core::ops::Range<u32>,
     control: u32,
     queue: usize,
     tail: usize,
@@ -117,13 +127,18 @@ pub struct Vtd {
     confined: u64,
     unconfined: u64,
     events: u64,
+    shared: Option<Shared>,
+    /// The primary: the next context table in the shared region.
+    next_context: usize,
+    /// The interrupt remapping entries this partition may use.
+    irtes: core::ops::Range<usize>,
 }
 
 impl Vtd {
     /// None means no DMAR, so discovery may try AMD-Vi. A DMAR that
     /// cannot be used is reported as failed, never mistaken for absence.
     pub fn init(bootinfo: &sel4::BootInfoPtr, phys: &mut crate::acpi::Phys, pci: &pci::Pci,
-        ticks_per_ms: u64, intremap: bool) -> Option<Self> {
+        ticks_per_ms: u64, intremap: bool, shared: Option<Shared>) -> Option<Self> {
         let mut buf = [0u8; 32 << 10];
         let table = crate::acpi::find(bootinfo, phys, b"DMAR", &mut buf)?;
         let mut me = Self {
@@ -132,6 +147,7 @@ impl Vtd {
             units: ArrayVec::new(), chunks: None, used: CHUNK_PAGES,
             coherent: true, cache_line: 64, ticks_per_ms, intremap: false, state: abi::IOMMU_FAILED,
             confined: 0, unconfined: 0, events: 0,
+            shared, next_context: shared.map_or(0, |s| s.tables().start), irtes: 0..format::IR_ENTRIES,
         };
         let Some(dmar) = Dmar::parse(table, |b, d, f, off| pci.read32(b, d, f, off)) else {
             log!("l4h-root: VT-d: malformed or unsupported DMAR: DMA is not confined");
@@ -155,7 +171,10 @@ impl Vtd {
             return Some(me);
         }
         me.chunks = Some(CHUNKS.take());
-        me.enable(phys.alloc, pci);
+        match shared {
+            Some(s) if !s.primary => me.join(phys.alloc, pci),
+            _ => me.enable(phys.alloc, pci),
+        }
         Some(me)
     }
 
@@ -178,7 +197,7 @@ impl Vtd {
             };
             map_page(0)?;
             let mut u = Unit {
-                mmio, cap: 0, ecap: 0, levels: 0, width: 0, root: 0, next_domain: 1,
+                mmio, cap: 0, ecap: 0, levels: 0, width: 0, root: 0, domains: 1..1,
                 control: 0, queue: 0, tail: 0, sem: 0, sem_pa: 0, seq: 0, irt: 0,
             };
             u.cap = u.r64(CAP);
@@ -197,6 +216,16 @@ impl Vtd {
             if u.ecap & (1 << 61) != 0 { return Err("extended interrupt mode required"); }
             let bytes = (u.fault_offset() + u.fault_count() * 16).max(u.iotlb() + 8).max(PAGE);
             if bytes > MMIO_STRIDE { return Err("register aperture too large"); }
+            let ids = 1u32 << (4 + 2 * (u.cap & 7));
+            u.domains = match self.shared {
+                // Domain 0 is reserved with caching mode (CAP.CM).
+                Some(s) => { let p = s.part(ids); p.start.max(1)..p.end }
+                None => 1..ids,
+            };
+            if self.shared.is_some() {
+                if n >= l4h_partition::IOMMU_MAX_UNITS { return Err("more units than the shared region has room for"); }
+                if !u.qi() { return Err("a shared unit needs queued invalidation"); }
+            }
             for off in (PAGE..bytes.next_multiple_of(PAGE)).step_by(PAGE) { map_page(off)?; }
             self.coherent &= u.ecap & 1 != 0;
             self.units.push(u).ok().unwrap();
@@ -214,6 +243,13 @@ impl Vtd {
         }
         if !self.intremap && self.units.iter().any(|u| u.ecap & (1 << 62) != 0) {
             return Err("hardware requires interrupt remapping");
+        }
+        if let Some(s) = self.shared {
+            if !s.primary && s.control().units.load(Ordering::Relaxed) as usize != self.units.len() {
+                return Err("partition 0 enabled a different number of units");
+            }
+            let p = s.part(format::IR_SHARED_ENTRIES as u32);
+            self.irtes = p.start as usize..p.end as usize;
         }
         Ok(())
     }
@@ -253,7 +289,20 @@ impl Vtd {
             }
             if self.units[n].control & EAFL != 0 { self.set_control(n, EAFL, false); }
             if self.units[n].control & CFI != 0 { self.set_control(n, CFI, false); }
-            self.units[n].root = self.page(alloc).1;
+            self.units[n].root = match self.shared {
+                Some(s) => s.unit_page(n, SHARED_ROOT).1,
+                None => self.page(alloc).1,
+            };
+        }
+        // Every bus with a function, whichever partition has it, gets its
+        // context table now: no other partition ever adds one.
+        if let Some(d) = crate::partition::get().filter(|_| self.shared.is_some()) {
+            for o in d.owners() {
+                let sid = self.requesters.requester(o.bdf);
+                if let Some(unit) = self.dmar.owner(sid) {
+                    self.context_table(alloc, unit, sid);
+                }
+            }
         }
         // Firmware's reserved memory must be reachable when TE goes on,
         // including for devices that no l4h driver will ever attach.
@@ -273,8 +322,14 @@ impl Vtd {
             self.units[n].w64(RTADDR, root as u64); // legacy mode, TTM=00
             self.command(n, SRTP, true);
             if self.units[n].qi() {
-                let (queue, queue_pa) = self.page(alloc);
-                let (sem, sem_pa) = self.page(alloc);
+                let (queue, queue_pa) = match self.shared {
+                    Some(s) => s.unit_page(n, SHARED_QUEUE),
+                    None => self.page(alloc),
+                };
+                let (sem, sem_pa) = match self.shared {
+                    Some(s) => s.done(n),
+                    None => self.page(alloc),
+                };
                 let u = &mut self.units[n];
                 u.queue = queue;
                 u.sem = sem;
@@ -286,12 +341,14 @@ impl Vtd {
             }
             self.invalidate(n, true, None);
             if self.intremap {
-                let (irt, pa) = self.page(alloc);
+                let (irt, pa, size) = match self.shared {
+                    Some(s) => { let (va, pa) = s.unit_page(n, SHARED_IRT); (va, pa, format::IR_SHARED_SIZE) }
+                    None => { let (va, pa) = self.page(alloc); (va, pa, format::IR_SIZE) }
+                };
                 self.units[n].irt = irt;
-                self.units[n].w64(IRTA, pa as u64 | format::IR_SIZE);
+                self.units[n].w64(IRTA, pa as u64 | size);
                 self.command(n, SIRTP, true);
-                self.submit(n, format::invalidate_interrupts());
-                self.sync(n);
+                self.queue(n, &[format::invalidate_interrupts()]);
                 self.set_control(n, IRE, true);
                 // Never allow compatibility MSIs to bypass the IRTEs.
                 assert_eq!(self.units[n].r32(GSTS) & CFI, 0);
@@ -305,6 +362,38 @@ impl Vtd {
                 self.dmar.units[n].base, self.units[n].width, if self.intremap { "remapped" } else { "not remapped" });
         }
         self.state = abi::IOMMU_ON;
+    }
+
+    /// A secondary partition: partition 0 set the units up and keeps
+    /// them; take its tables and map our own firmware-reserved memory.
+    fn join(&mut self, alloc: &mut Alloc, pci: &pci::Pci) {
+        let s = self.shared.unwrap();
+        for n in 0..self.units.len() {
+            let (sem, sem_pa) = s.done(n);
+            let u = &mut self.units[n];
+            u.control = u.r32(GSTS);
+            assert!(u.control & TE != 0 && u.control & QIE != 0, "VT-d {}: partition 0 did not enable it", n);
+            u.root = s.unit_page(n, SHARED_ROOT).1;
+            u.queue = s.unit_page(n, SHARED_QUEUE).0;
+            (u.sem, u.sem_pa) = (sem, sem_pa);
+            u.irt = s.unit_page(n, SHARED_IRT).0;
+            info!("l4h-root: VT-d at {:#x}: shared, {}-bit DMA, interrupts {}",
+                self.dmar.units[n].base, u.width, if self.intremap { "remapped" } else { "not remapped" });
+        }
+        self.state = abi::IOMMU_ON;
+        // Our functions only: the others read as absent.
+        for r in 0..self.dmar.reserved.len() {
+            let reserved = self.dmar.reserved[r];
+            for sid in reserved.scope.first..=reserved.scope.last {
+                if pci.read32((sid >> 8) as u8, (sid >> 3 & 31) as u8, (sid & 7) as u8, 0) & 0xffff == 0xffff {
+                    continue;
+                }
+                let unit = self.dmar.owner(sid).expect("VT-d: RMRR device has no remapping unit");
+                let d = self.domain(alloc, unit, sid);
+                self.map_range(alloc, d, reserved.start, reserved.end - reserved.start, true);
+                self.invalidate(unit, false, Some(d.id));
+            }
+        }
     }
 
     fn flush_cpu(&self, ptr: usize, len: usize) {
@@ -350,6 +439,9 @@ impl Vtd {
 
     fn table(&self, pa: u64) -> *mut u64 {
         let pa = (pa & ADDR) as usize;
+        if let Some(va) = self.shared.and_then(|s| s.va_of(pa)) {
+            return va as *mut u64;
+        }
         let &(va, base) = self.chunks.as_ref().unwrap().iter()
             .find(|&&(_, base)| (base..base + (1 << CHUNK_BITS)).contains(&pa))
             .expect("VT-d: table outside chunks");
@@ -360,25 +452,49 @@ impl Vtd {
         // Devices behind a conventional PCI bridge share its requester
         // and therefore one domain. Never replace a sibling's mappings.
         let sid = self.requesters.requester(sid);
-        let root = unsafe { self.table(self.units[unit].root as u64).add((sid >> 8) as usize * 2) };
-        let mut entry = unsafe { root.read_volatile() };
-        if entry & PRESENT == 0 {
-            entry = self.page(alloc).1 as u64 | PRESENT;
-            self.store(root, entry);
-        }
-        let ctx = unsafe { self.table(entry).add((sid & 255) as usize * 2) };
+        let ctx = unsafe { self.context_table(alloc, unit, sid).add((sid & 255) as usize * 2) };
         let (lo, hi) = unsafe { (ctx.read_volatile(), ctx.add(1).read_volatile()) };
         if lo & PRESENT != 0 {
             return Domain { unit, sid, id: (hi >> 8) as u16, root: (lo & ADDR) as usize };
         }
-        let next = self.units[unit].next_domain;
-        assert!(next < 1 << (4 + 2 * (self.units[unit].cap & 7)), "VT-d: out of domain IDs");
-        self.units[unit].next_domain += 1;
+        let next = self.units[unit].domains.start;
+        assert!(next < self.units[unit].domains.end, "VT-d: out of domain IDs");
+        self.units[unit].domains.start += 1;
         let d = Domain { unit, sid, id: next as u16, root: self.page(alloc).1 };
         let [lo, hi] = format::context(d.root, d.id, self.units[unit].levels);
         self.store(unsafe { ctx.add(1) }, hi);
         self.store(ctx, lo); // present last
+        if self.shared.is_some() && self.state == abi::IOMMU_ON && self.units[unit].cap & (1 << 7) != 0 {
+            // Caching mode: the unit may hold this requester's entry as
+            // not present, tagged with domain 0. Drop just that.
+            self.queue(unit, &[format::invalidate_context_device(sid, 0), format::invalidate_iotlb(Some(0), 0)]);
+        }
         d
+    }
+
+    /// The context table of requester `sid`'s bus, made if missing. In a
+    /// shared IOMMU only the primary makes them, at init.
+    fn context_table(&mut self, alloc: &mut Alloc, unit: usize, sid: u16) -> *mut u64 {
+        let root = unsafe { self.table(self.units[unit].root as u64).add((sid >> 8) as usize * 2) };
+        let mut entry = unsafe { root.read_volatile() };
+        if entry & PRESENT == 0 {
+            let pa = match self.shared {
+                None => self.page(alloc).1,
+                Some(s) => {
+                    assert!(s.primary && self.state != abi::IOMMU_ON,
+                        "VT-d: bus {:#x} has no context table from partition 0", sid >> 8);
+                    assert!(self.next_context + PAGE <= s.tables().end, "VT-d: out of shared context tables");
+                    let (va, pa) = s.at(self.next_context);
+                    self.next_context += PAGE;
+                    // The shim zeroed the region.
+                    self.flush_cpu(va, PAGE);
+                    pa
+                }
+            };
+            entry = pa as u64 | PRESENT;
+            self.store(root, entry);
+        }
+        self.table(entry)
     }
 
     pub fn attach(&mut self, alloc: &mut Alloc, device: &pci::Device) -> Option<Domain> {
@@ -397,7 +513,10 @@ impl Vtd {
         }
         // Global context + IOTLB invalidation also evicts cached misses
         // tagged with domain zero (CAP.CM), not just the new domain ID.
-        self.invalidate(unit, true, None);
+        // A shared unit: domain() invalidated just this requester's.
+        if self.shared.is_none() {
+            self.invalidate(unit, true, None);
+        }
         self.confined += 1;
         Some(d)
     }
@@ -469,16 +588,20 @@ impl Vtd {
     fn interrupt(&mut self, unit: usize, sid: u16, data: u32) -> u16 {
         assert!(data <= 255);
         let table = self.units[unit].irt as *mut u64;
-        let entry = format::irte(sid, data as u8);
-        for index in 0..format::IR_ENTRIES {
+        let entry = format::irte(sid, data as u8, crate::partition::msi_dest());
+        for index in self.irtes.clone() {
             let ptr = unsafe { table.add(index * 2) };
             let old = unsafe { [ptr.read_volatile(), ptr.add(1).read_volatile()] };
             if old == entry { return index as u16; }
             if old[0] & PRESENT == 0 {
                 self.store(unsafe { ptr.add(1) }, entry[1]);
                 self.store(ptr, entry[0]);
-                self.submit(unit, format::invalidate_interrupts());
-                self.sync(unit);
+                let inv = if self.shared.is_some() {
+                    format::invalidate_interrupt(index as u16)
+                } else {
+                    format::invalidate_interrupts()
+                };
+                self.queue(unit, &[inv]);
                 return index as u16;
             }
         }
@@ -487,9 +610,12 @@ impl Vtd {
 
     fn invalidate(&mut self, n: usize, context: bool, domain: Option<u16>) {
         if self.units[n].qi() {
-            if context { self.submit(n, format::invalidate_context()); }
-            self.submit(n, format::invalidate_iotlb(domain, self.units[n].drain()));
-            self.sync(n);
+            let iotlb = format::invalidate_iotlb(domain, self.units[n].drain());
+            if context {
+                self.queue(n, &[format::invalidate_context(), iotlb]);
+            } else {
+                self.queue(n, &[iotlb]);
+            }
         } else {
             if self.units[n].cap & (1 << 4) != 0 { self.command(n, WBF, false); }
             if context {
@@ -504,6 +630,20 @@ impl Vtd {
             self.wait_for(n, "IOTLB invalidation", |u| u.r64(u.iotlb()) & (1 << 63) == 0);
             assert_ne!(self.units[n].r64(self.units[n].iotlb()) >> 57 & 3, 0, "VT-d: IOTLB invalidation failed");
         }
+    }
+
+    /// Submit `descs` and wait for them. A shared unit's queue is the
+    /// lock holder's: the tail and the last wait value are read anew.
+    fn queue(&mut self, n: usize, descs: &[[u64; 2]]) {
+        if let Some(s) = self.shared {
+            s.lock(n);
+            let u = &mut self.units[n];
+            u.tail = u.r64(IQT) as usize;
+            u.seq = unsafe { (u.sem as *const u32).read_volatile() };
+        }
+        for &d in descs { self.submit(n, d); }
+        self.sync(n);
+        if let Some(s) = self.shared { s.unlock(n); }
     }
 
     fn submit(&mut self, n: usize, desc: [u64; 2]) {
@@ -530,8 +670,9 @@ impl Vtd {
         compiler_fence(Ordering::SeqCst);
     }
 
+    /// Faults: with several partitions, partition 0 handles everyone's.
     pub fn poll(&mut self) {
-        if self.state != abi::IOMMU_ON { return; }
+        if self.state != abi::IOMMU_ON || self.shared.is_some_and(|s| !s.primary) { return; }
         let mut shown = 0;
         let mut dropped = 0;
         for (n, u) in self.units.iter().enumerate() {
@@ -544,8 +685,10 @@ impl Vtd {
                 let addr = u.r64(off);
                 self.events = self.events.saturating_add(1);
                 if shown < EVENTS_PER_POLL {
-                    log!("l4h-root: VT-d {}: {:02x}:{:02x}.{}: fault {:#x}, info {:#x}",
-                        n, hi >> 8 & 255, hi >> 3 & 31, hi & 7, hi >> 32 & 255, addr);
+                    log!("l4h-root: VT-d {}: {:02x}:{:02x}.{}: fault {:#x}, info {:#x}{}",
+                        n, hi >> 8 & 255, hi >> 3 & 31, hi & 7, hi >> 32 & 255, addr,
+                        crate::iommu::shared::OwnerNote(hi as u16));
+
                     shown += 1;
                 } else { dropped += 1; }
                 u.w64(off + 8, 1 << 63); // F is W1C
