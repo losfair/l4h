@@ -19,6 +19,9 @@
 # MK_BRIDGES=1 puts partition 1's disk behind a PCIe root port and its NIC
 # behind a root port and a PCIe-to-PCI bridge, whose requester ID it
 # borrows: with an IOMMU, partition 1 must read partition 0's bridges.
+# MK_STRESS=S: for S seconds partitions 0 and 1 flood the link both ways,
+# download a file from each other over it (checked against their own
+# copy), and make and destroy VMs one after another, all at once.
 # MK_ATTEST=1 adds a software TPM (swtpm), which only partition 0 sees:
 # every dom0 and VM gets a report, the other partitions' through partition
 # 0's trustd, and tools/l4h-attest.py verifies each against its
@@ -99,7 +102,7 @@ for k in $(seq 0 $((n - 1))); do
     peer=
     [ "$k" -lt 2 ] && [ -z "${MK_UPLINK:-}" ] && peer=" MKPEER=$((1 - k))"
     # The attestation check measures this exact command line.
-    cmdline[k]="console=hvc0 MKP=$k$peer${nonce:+ attest_nonce=$nonce}${mkiommu[*]:+ ${mkiommu[*]}}"
+    cmdline[k]="console=hvc0 MKP=$k$peer${MK_STRESS:+ MKSTRESS=$MK_STRESS}${nonce:+ attest_nonce=$nonce}${mkiommu[*]:+ ${mkiommu[*]}}"
     printf 'dom0_cmdline="%s"\ndom0_mem_mb=256\nboot_disk=%s\n%s%s\n' \
         "${cmdline[k]}" "$disk_bdf" "${nic_bdf:+uplink_nic=$nic_bdf}" "$dom0_disks" > "$out/p$k.conf"
     mods+=",$out/p$k.conf p$k:l4h-config,$root/build/mkshim/kernel-s$k.elf kernel-s$k"
@@ -156,7 +159,7 @@ run_qemu() {
         "${boot[@]}" \
         "${devices[@]}" </dev/null >"$log" 2>&1 &
     local qemu=$!
-    local end=$((SECONDS + ${MKTEST_TIMEOUT:-300}))
+    local end=$((SECONDS + ${MKTEST_TIMEOUT:-$((300 + ${MK_STRESS:-0}))}))
     while kill -0 "$qemu" 2>/dev/null; do
         if [ "$SECONDS" -ge "$end" ] || grep -aq "MKTEST p[0-9]*: FAIL\|cannot boot\|panic" "$log"; then
             sleep 1
@@ -167,7 +170,7 @@ run_qemu() {
     done
     wait "$qemu" 2>/dev/null || true
     grep -aE "l4h-mkshim|MKTEST|MKVM|partition|host reboot|trustd|TPM|\[p[0-9]\] .*(panic|fault|error)|panic" "$log" \
-        | grep -av "MKVM: report" | head -100
+        | grep -av "MKVM: report" | awk 'NR <= 100'
     ok=1
     for k in $(seq 0 $((n - 1))); do
         grep -aq "MKTEST p$k: done" "$log" || { echo "partition $k did not finish"; ok=0; }
@@ -177,7 +180,12 @@ run_qemu() {
     done
     # Partition 1 flooded the link during its rtc-set: control traffic
     # has a channel of its own.
-    if [ "$n" -ge 2 ] && [ -z "${MK_UPLINK:-}" ]; then
+    if [ "$n" -ge 2 ] && [ -n "${MK_STRESS:-}" ]; then
+        for k in 0 1; do
+            grep -aq "MKTEST p$k: stress ok" "$log" || { echo "partition $k: stress did not finish"; ok=0; }
+        done
+        ! grep -aq "stopped: no heartbeat" "$log" || { echo "heartbeats lost under stress"; ok=0; }
+    elif [ "$n" -ge 2 ] && [ -z "${MK_UPLINK:-}" ]; then
         grep -aq "MKTEST p1: flood ok" "$log" || { echo "partition 1: no flood over the link"; ok=0; }
         ! grep -aq "partition 1 stopped: no heartbeat" "$log" || { echo "partition 1's heartbeats lost in the flood"; ok=0; }
     fi
