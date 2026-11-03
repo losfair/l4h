@@ -81,6 +81,7 @@ ok=1
 for k in $(seq 0 $((n - 1))); do
     grep -aq "MKTEST p$k: done" "$log" || { echo "partition $k did not finish"; ok=0; }
     [ "$k" = 0 ] || grep -aq "MKTEST p$k: host-reboot refused" "$log" || { echo "partition $k: host-reboot not refused"; ok=0; }
+    [ "$k" = 0 ] || grep -aq "^l4h-root: RTC set for partition $k" "$log" || { echo "partition $k: rtc-set did not reach partition 0"; ok=0; }
 done
 grep -aqE "^l4h-root: host reboot \(dom0\)\s*$" "$log" || { echo "partition 0 did not reset the machine"; ok=0; }
 [ "$ok" = 1 ] && echo "MKTEST: PASS" || { echo "MKTEST: FAIL (log: $log)"; exit 1; }

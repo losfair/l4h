@@ -570,3 +570,6 @@ impl Netd {
         (i != u64::MAX).then(|| (i, mr(1)))
     }
 }
+
+/// A frame from another partition's netd over a link channel (channel.rs).
+pub fn link_frame(_h: &mut crate::Host, _peer: u32, _msg: &[u8]) {}
