@@ -195,25 +195,16 @@ extern "C" fn shim_main(magic: u32, info: u64) -> ! {
     println!("TSC {} kHz, APIC timer {}, wall clock {} s", tsc_khz,
         if apic_khz == 0 { 0 } else { apic_khz }, epoch_ns / 1_000_000_000);
 
-    // Modules for each partition.
-    let root = bi.module("l4h-root").unwrap_or_else(|| fail(format_args!("no l4h-root module")));
-    let root_memsz = elf_span(root.bytes()).1;
-    for (k, p) in plans.iter_mut().enumerate() {
-        p.mods.must_push((Str::from("l4h-root"), root.bytes()));
-        // The descriptor: its size now, its bytes once built.
-        p.mods.must_push((Str::from("l4h-partition"), &[]));
-        for role in ["guest-kernel", "guest-kmods", "dom0-initrd", "l4h-config"] {
-            let mut own: Str<32> = Str::new();
-            let _ = write!(own, "p{}:{}", k, role);
-            if let Some(m) = bi.module(own.as_str()).or_else(|| bi.module(role)) {
-                p.mods.must_push((Str::from(role), m.bytes()));
-            }
-        }
-    }
-
-    // Module bytes are taken before any module moves out of a slot:
-    // place_memory moves them before checking, so take them after.
+    // Modules for each partition: their sizes size the low chunks, and
+    // place_memory may move a module out of a kernel slot, so the bytes
+    // are taken again after it.
+    let root_memsz = {
+        let root = bi.module("l4h-root").unwrap_or_else(|| fail(format_args!("no l4h-root module")));
+        elf_span(root.bytes()).1
+    };
+    collect_modules(&bi, &mut plans);
     let out = place_memory(&mut bi, &conf, &acpi, &mut plans, root_memsz);
+    collect_modules(&bi, &mut plans);
     println!("shared region {:#x}-{:#x}", out.start, out.end);
 
     // Channels: the primary and each secondary, and the configured links
@@ -361,6 +352,24 @@ extern "C" fn shim_main(magic: u32, info: u64) -> ! {
     }
     println!("entering partition 0");
     unsafe { entry::enter_kernel(entries[0], mbis[0]) }
+}
+
+/// Each partition's modules, root first, then a placeholder for its
+/// descriptor, then the roles it has (its own `pN:ROLE` or the shared one).
+fn collect_modules(bi: &BootInfo, plans: &mut [Plan]) {
+    let Some(root) = bi.module("l4h-root") else { fail(format_args!("no l4h-root module")) };
+    for (k, p) in plans.iter_mut().enumerate() {
+        p.mods.clear();
+        p.mods.must_push((Str::from("l4h-root"), root.bytes()));
+        p.mods.must_push((Str::from("l4h-partition"), &[]));
+        for role in ["guest-kernel", "guest-kmods", "dom0-initrd", "l4h-config"] {
+            let mut own: Str<32> = Str::new();
+            let _ = write!(own, "p{}:{}", k, role);
+            if let Some(m) = bi.module(own.as_str()).or_else(|| bi.module(role)) {
+                p.mods.must_push((Str::from(role), m.bytes()));
+            }
+        }
+    }
 }
 
 /// The value of `key=` on a command line.
