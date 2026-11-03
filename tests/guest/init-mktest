@@ -3,14 +3,18 @@
 # With attest_nonce= (MK_ATTEST=1), dom0's report, the evidence, the VM's
 # report and (with /bin/cred) the credential's secret go to the start of
 # the partition's disk as a tar archive.
+# With MKSAVE=1 (MK_EFI=, a release build, whose host does not put dom0's
+# console on the serial port), this partition's MKTEST lines go there
+# instead, as mktest.log, once dom0 is done or fails.
 mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
 mount -t tmpfs tmp /tmp
 P=${MKP:-0}
 nonce=$(sed -n 's/.*attest_nonce=\([0-9a-f]*\).*/\1/p' /proc/cmdline)
-say() { echo "MKTEST p$P: $*"; }
-fail() { say "FAIL: $*"; sleep 100000; }
+say() { echo "MKTEST p$P: $*"; [ -z "${MKSAVE:-}" ] || echo "MKTEST p$P: $*" >> /tmp/mktest.log; }
+save() { [ -z "${MKSAVE:-}" ] || { tar -cf /dev/vda -C /tmp mktest.log && sync; }; }
+fail() { say "FAIL: $*"; save; sleep 100000; }
 say start
 l4hctl info || fail "l4hctl info"
 l4hctl disks
@@ -172,6 +176,7 @@ if [ -n "${flooding:-}" ]; then
     say "flood ok: $rx of $tx pings of 8000 bytes answered"
 fi
 say done
+save || fail "save the log"
 if [ "$P" = 0 ]; then
     # Let the other partitions finish, then reset the machine.
     sleep "${MKWAIT:-30}"

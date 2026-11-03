@@ -774,7 +774,8 @@ Each tagged release on GitHub carries, for x86\_64:
         dom0s below);
   \item \file{l4h-debug-x86\_64.tar.xz}: the same build with debug
         information, to turn fault addresses into source lines with
-        \cmd{addr2line}. Its \file{vmlinux} is the guest kernel, from
+        \cmd{addr2line}. A multikernel partition~$K$ runs
+        \file{kernel-VARIANT-sK.elf}, not \file{kernel-VARIANT.elf}. Its \file{vmlinux} is the guest kernel, from
         which verifiers compute launch digests
         (Section~\ref{sec:attest});
   \item \file{l4h-attest.py}, which verifies attestation reports

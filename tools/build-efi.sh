@@ -16,7 +16,8 @@
 # (tools/mkbios.sh), with each variant's kernel as kernel-VARIANT.elf; the
 # Linux installer installs one as kernel.elf.
 # build/efi/l4h-debug-x86_64.tar.xz holds the same build unstripped (root,
-# the components, each variant's kernel and the guest kernel, vmlinux), to
+# the components, each variant's kernel, its slot kernels as
+# kernel-VARIANT-sK.elf, the shim and the guest kernel, vmlinux), to
 # decode fault addresses from a shipped application; verifiers compute
 # launch digests from vmlinux (l4h-attest.py measure).
 set -euo pipefail
@@ -50,11 +51,22 @@ cp "$root/host/target/x86_64-sel4-roottask/debug/l4h-root.elf" \
     "$root/build/linux-l4h/vmlinux" "$debug/l4h-debug-x86_64/"
 for v in "${variants[@]}"; do
     read -r name _ <<<"$v"
-    "$root/tools/mkefi.sh" "$out/l4h-$name.efi" \
+    # mkefi.sh leaves multikernel boot out when the shim is missing: every
+    # shipped application has it, with all 8 slots.
+    mk=$root/build/mkshim-$name
+    for f in l4h-mkshim.elf kernel-s{0..7}.elf; do
+        [ -f "$mk/$f" ] || { echo "$mk/$f: missing" >&2; exit 1; }
+    done
+    L4H_MKSHIM=$mk "$root/tools/mkefi.sh" "$out/l4h-$name.efi" \
         "$root/host/target/x86_64-sel4-roottask/debug/l4h-root.elf" \
         "$root/build/sel4-$name/bin/kernel.elf"
     cp "$root/build/sel4-$name/bin/kernel.elf" "$debug/l4h-debug-x86_64/kernel-$name.elf"
+    for k in {0..7}; do
+        cp "$mk/kernel-s$k.elf" "$debug/l4h-debug-x86_64/kernel-$name-s$k.elf"
+    done
 done
+# The shim does not depend on the variant.
+cp "$root/build/mkshim-generic/l4h-mkshim.elf" "$debug/l4h-debug-x86_64/"
 tar -C "$debug" -cJf "$out/l4h-debug-x86_64.tar.xz" l4h-debug-x86_64
 bios=$debug/l4h-bios-x86_64
 # Multikernel boot is UEFI-only in the release (the installer's BIOS

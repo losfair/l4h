@@ -2942,8 +2942,9 @@ root.
     (`install.py` and its static initramfs), for a dom0 of any distribution;
     the kernel is in the UEFI application;
   - `l4h-debug-x86_64.tar.xz`: the unstripped build (root, components, each
-    variant's kernel and the guest kernel `vmlinux`), for `addr2line` on
-    fault addresses;
+    variant's kernel, its multikernel slot kernels `kernel-VARIANT-sK.elf`,
+    the shim and the guest kernel `vmlinux`), for `addr2line` on fault
+    addresses;
   - `l4h-attest.py`, the attestation verifier (§10.2);
   - `l4h-manual.pdf`, the user manual.
 

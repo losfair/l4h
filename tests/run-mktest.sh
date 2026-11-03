@@ -29,6 +29,12 @@
 # 0's trustd, and tools/l4h-attest.py verifies each against its
 # partition's evidence; a second boot activates a credential made for the
 # attestation key in every partition (DESIGN.md §10.2).
+# MK_EFI=app.efi boots that UEFI application (MK_BOOT=uefi), as shipped
+# (build/efi/l4h-generic.efi from tools/build-efi.sh): its shim, slot
+# kernels and root instead of the ones this script builds.  A release
+# build prints only critical errors and keeps dom0's console off the
+# serial port, so each dom0 saves its MKTEST lines to its disk (MKSAVE),
+# and how each root reaches PCI configuration goes unchecked.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 source "$root/tools/guest-env.sh"
@@ -37,6 +43,13 @@ machine=${MK_MACHINE:-q35}
 rootbus=pcie.0
 [ "$machine" = pc ] && rootbus=pci.0
 attest=${MK_ATTEST:-}
+efi=${MK_EFI:-}
+if [ -n "$efi" ]; then
+    [ -f "$efi" ] || { echo "$efi: missing" >&2; exit 1; }
+    [ -z "$attest" ] || { echo "MK_EFI does not take MK_ATTEST" >&2; exit 1; }
+    efi=$(realpath "$efi")
+    MK_BOOT=uefi
+fi
 out=$root/build/mktest
 log=$root/build/mktest.log
 mkdir -p "$out"
@@ -52,10 +65,12 @@ dom0_initramfs() {  # dom0_initramfs [extra files...]
         "$l4h_ctl" "$out/vm.cpio.gz" "$root/tests/guest/udhcpc.script" "$@" >/dev/null
 }
 dom0_initramfs
-"$root/tools/build-mkshim.sh" "$n" >/dev/null
-"$root/tools/build-host.sh"
-objcopy --strip-debug "$root/host/target/x86_64-sel4-roottask/debug/l4h-root.elf" "$out/l4h-root.elf"
-cp "$root/build/mkshim/l4h-mkshim.elf" "$out/"
+if [ -z "$efi" ]; then
+    "$root/tools/build-mkshim.sh" "$n" >/dev/null
+    "$root/tools/build-host.sh"
+    objcopy --strip-debug "$root/host/target/x86_64-sel4-roottask/debug/l4h-root.elf" "$out/l4h-root.elf"
+    cp "$root/build/mkshim/l4h-mkshim.elf" "$out/"
+fi
 
 nonce=
 if [ -n "$attest" ]; then
@@ -107,7 +122,7 @@ for k in $(seq 0 $((n - 1))); do
     peer=
     [ "$k" -lt 2 ] && [ -z "${MK_UPLINK:-}" ] && peer=" MKPEER=$((1 - k))"
     # The attestation check measures this exact command line.
-    cmdline[k]="console=hvc0 MKP=$k$peer${MK_STRESS:+ MKSTRESS=$MK_STRESS}${nonce:+ attest_nonce=$nonce}${mkiommu[*]:+ ${mkiommu[*]}}"
+    cmdline[k]="console=hvc0 MKP=$k$peer${MK_STRESS:+ MKSTRESS=$MK_STRESS}${nonce:+ attest_nonce=$nonce}${mkiommu[*]:+ ${mkiommu[*]}}${efi:+ MKSAVE=1}"
     printf 'dom0_cmdline="%s"\ndom0_mem_mb=256\nboot_disk=%s\n%s%s\n' \
         "${cmdline[k]}" "$disk_bdf" "${nic_bdf:+uplink_nic=$nic_bdf}" "$dom0_disks" > "$out/p$k.conf"
     mods+=",$out/p$k.conf p$k:l4h-config,$root/build/mkshim/kernel-s$k.elf kernel-s$k"
@@ -124,8 +139,12 @@ if [ -n "${MK_BOOT:-}" ]; then
         mkdir -p "$out/esp/p$k"
         cp "$out/p$k.conf" "$out/esp/p$k/l4h.conf"
     done
-    L4H_GUEST_KMODS= L4H_GUEST_KERNEL="$out/vmlinux" "$root/tools/mkimage.sh" -i "$out/dom0.cpio.gz" -m "$out/esp" \
-        "$out/mk.raw" "$out/l4h-root.elf" >/dev/null
+    if [ -n "$efi" ]; then
+        "$root/tools/mkimage.sh" -e "$efi" -i "$out/dom0.cpio.gz" -m "$out/esp" "$out/mk.raw" >/dev/null
+    else
+        L4H_GUEST_KMODS= L4H_GUEST_KERNEL="$out/vmlinux" "$root/tools/mkimage.sh" -i "$out/dom0.cpio.gz" -m "$out/esp" \
+            "$out/mk.raw" "$out/l4h-root.elf" >/dev/null
+    fi
     # On the chipset's AHCI controller, which no partition drives.
     boot=(-drive "file=$out/mk.raw,format=raw,if=none,id=boot" -device ide-hd,drive=boot,bus=ide.0,bootindex=0)
     case $MK_BOOT in
@@ -174,6 +193,16 @@ run_qemu() {
         sleep 1
     done
     wait "$qemu" 2>/dev/null || true
+    if [ -n "$efi" ]; then
+        # What each dom0 saved, as if it had reached the serial port.
+        for k in $(seq 0 $((n - 1))); do
+            rm -rf "$out/saved/p$k"
+            mkdir -p "$out/saved/p$k"
+            tar -xf "$out/disk$k.img" -C "$out/saved/p$k" 2>/dev/null \
+                && cat "$out/saved/p$k/mktest.log" >> "$log" \
+                || echo "partition $k saved no log"
+        done
+    fi
     grep -aE "l4h-mkshim|MKTEST|MKVM|partition|host reboot|trustd|TPM|\[p[0-9]\] .*(panic|fault|error)|panic" "$log" \
         | grep -av "MKVM: report" | awk 'NR <= 100'
     ok=1
@@ -196,19 +225,21 @@ run_qemu() {
     fi
     grep -aqE "^l4h-root: host reboot \(dom0\)\s*$" "$log" || { echo "partition 0 did not reset the machine"; ok=0; }
     # How PCI configuration is reached: the ports under the partitions'
-    # lock without MCFG (pc), else ECAM, by the shim and every root.
+    # lock without MCFG (pc), else ECAM, by the shim and every root (whose
+    # message a release build does not print).
     if [ "$machine" = pc ]; then
         grep -aq "l4h-mkshim: no MCFG: PCI configuration through ports" "$log" \
             || { echo "the shim did not scan PCI through the ports"; ok=0; }
-        [ "$(grep -ac "l4h-root: no ECAM: PCI configuration through ports" "$log")" = "$n" ] \
+        [ -n "$efi" ] || [ "$(grep -ac "l4h-root: no ECAM: PCI configuration through ports" "$log")" = "$n" ] \
             || { echo "not every partition shares the PCI configuration ports"; ok=0; }
     else
         grep -aq "l4h-mkshim: PCI configuration through ECAM" "$log" \
             || { echo "the shim did not scan PCI through ECAM"; ok=0; }
-        [ "$(grep -ac "l4h-root: PCI configuration through ECAM" "$log")" = "$n" ] \
+        [ -n "$efi" ] || [ "$(grep -ac "l4h-root: PCI configuration through ECAM" "$log")" = "$n" ] \
             || { echo "not every partition reaches PCI configuration through ECAM"; ok=0; }
         ! grep -aq "no ECAM" "$log" || { echo "a partition fell back to the PCI ports"; ok=0; }
     fi
+
     # One IOMMU for all: every partition's devices confined and interrupts
     # remapped, pools drained, and partition 0 (which gets every
     # partition's faults) saw none.
