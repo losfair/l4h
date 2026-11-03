@@ -609,6 +609,11 @@ enum l4h_ctl_op {
 	L4H_CTL_STEER_DEL = 36,
 	/* args: first rule -> vals[0] = count; data: struct l4h_ctl_steer[] */
 	L4H_CTL_STEER_LIST = 37,
+	/* -> vals[0] = this host's partition, vals[1] = partitions on the
+	 * machine (1: l4h has the machine to itself), vals[2] = APIC ID of
+	 * the partition's first CPU, vals[3] = partitions heard from
+	 * (a bit each; partition 0 only).  DESIGN.md §11.4. */
+	L4H_CTL_PARTITION_INFO = 38,
 };
 
 #define L4H_GPU_MIN             64
