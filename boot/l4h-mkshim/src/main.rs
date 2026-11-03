@@ -716,11 +716,16 @@ fn place_memory(bi: &mut BootInfo, conf: &Conf, acpi: &acpi::Acpi, plans: &mut [
             fail(format_args!("p{}.mem: at least {} MiB", k, have >> 20));
         }
         let want = target.saturating_sub(have);
+        // From each of the node's ranges in turn: free RAM is merged
+        // across node boundaries, so a free range can span nodes.
         let node = p.node;
-        let in_node = |r: Range| {
-            affinity.is_empty() || affinity.iter().any(|a| a.node == node && a.base <= r.start && r.end <= a.base + a.len)
-        };
-        let mut got = free.take_pieces(want, 2 * MIB, MIB, PADDR_TOP, &mut p.ram, in_node);
+        let mut got = 0;
+        for a in affinity.iter().filter(|a| a.node == node) {
+            let (lo, hi) = (a.base.max(MIB), (a.base + a.len).min(PADDR_TOP));
+            if got < want && lo < hi {
+                got += free.take_pieces(want - got, 2 * MIB, lo, hi, &mut p.ram, |_| true);
+            }
+        }
         if got < want {
             let more = free.take_pieces(want - got, 2 * MIB, MIB, PADDR_TOP, &mut p.ram, |_| true);
             if more > 0 && !affinity.is_empty() {
