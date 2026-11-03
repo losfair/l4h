@@ -234,6 +234,30 @@ class Harness(unittest.TestCase):
                          root=self.root, command=self.machine.command)
 
 
+class MultikernelConfig(unittest.TestCase):
+    """--partitions: l4h-mk.conf from the machine's nodes and devices."""
+
+    nvme = lambda self, bdf, node: dict(bdf=bdf, cls=0x010802, node=node)
+    nic = lambda self, bdf, node: dict(bdf=bdf, cls=0x020000, node=node)
+
+    def test_one_partition_per_node(self):
+        devices = [self.nvme("00:04.0", 0), self.nic("00:05.0", 0), self.nic("80:05.0", 1), self.nvme("80:04.0", 1)]
+        text = installer.mk_configuration(2, [0, 1], devices, {"00:04.0", "00:05.0"})
+        self.assertIn("partitions = 2\n", text)
+        self.assertIn("p0.cpus = node:0\n", text)
+        self.assertIn("p1.cpus = node:1\np1.pci = 0000:80:04.0, 0000:80:05.0\n", text)
+
+    def test_fewer_nodes_than_partitions(self):
+        devices = [self.nvme("00:0%d.0" % i, -1) for i in range(1, 4)] + [self.nic("01:0%d.0" % i, -1) for i in range(1, 4)]
+        text = installer.mk_configuration(3, [0], devices, {"00:01.0", "01:01.0"})
+        self.assertNotIn("cpus", text)
+        self.assertIn("p1.pci = 0000:00:02.0, 0000:01:02.0\np2.pci = 0000:00:03.0, 0000:01:03.0\n", text)
+
+    def test_needs_a_disk_and_nic_each(self):
+        with self.assertRaisesRegex(installer.Incompatible, "no NVMe controller left for partition 1"):
+            installer.mk_configuration(2, [0], [self.nic("00:05.0", 0)], set())
+
+
 class UpdateChecks:
     """The same update contract on both firmware layouts."""
 

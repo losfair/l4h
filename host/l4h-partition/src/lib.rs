@@ -1,5 +1,5 @@
 //! The multikernel partition descriptor and the memory shared between
-//! partitions (DESIGN.md §11.3).
+//! partitions (DESIGN.md §11.4).
 //!
 //! `l4h-mkshim` boots several seL4 kernels on one x86_64 machine, one per
 //! partition, and gives each partition's root task a [`Descriptor`] as the
@@ -112,7 +112,7 @@ pub const CHANNEL_CONTROL: u32 = 1;
 /// (`link.pA-pB = 1` in l4h-mk.conf).
 pub const CHANNEL_LINK: u32 = 2;
 
-/// The IOMMU state shared by all partitions (DESIGN.md §4.6): `size`
+/// The IOMMU state shared by all partitions (DESIGN.md §11.4): `size`
 /// bytes at `paddr`, laid out as the IOMMU_* constants say.  Of each
 /// unit's domain IDs and interrupt remapping entries, this partition owns
 /// part `share` of `shares` equal parts.
@@ -253,7 +253,7 @@ pub const CHANNEL_SIZE: u64 = 256 << 10;
 /// The size of the shared IOMMU region.
 pub const IOMMU_REGION_SIZE: u64 = 8 << 20;
 
-/// Layout of the shared IOMMU region (DESIGN.md §4.6), from its start:
+/// Layout of the shared IOMMU region (DESIGN.md §11.4), from its start:
 /// the control page, then per unit (at most `IOMMU_MAX_UNITS`) the unit's
 /// tables at `IOMMU_UNIT_BASE + unit * IOMMU_UNIT_SIZE`.
 pub const IOMMU_MAX_UNITS: usize = 4;

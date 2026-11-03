@@ -81,7 +81,7 @@ pub fn reboot(h: &mut Host, by: &str) -> i64 {
         return crate::ctl::ENOSYS;
     }
     // Resetting the machine stops every partition: that is partition 0's
-    // dom0's to do (DESIGN.md §8).
+    // dom0's to do (DESIGN.md §11.4).
     if let Some(d) = crate::partition::get().filter(|d| !d.is_primary()) {
         log!("l4h-root: host reboot ({}) refused: partition {} of {}; only partition 0's dom0 can reset the machine",
             by, d.index, d.count);

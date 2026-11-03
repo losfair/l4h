@@ -13,6 +13,9 @@
 # tools/mkimage.sh, or the menu entry of the Linux installer
 # (tools/install) in the distribution's GRUB.
 # There is no measured boot: GRUB's tpm module works only on UEFI.
+# With $l4h/l4h-mk.conf, GRUB boots the multikernel shim from $l4h/bios/mk
+# instead (tools/mkshim-grub.sh, DESIGN.md §11.4), when it was built
+# (L4H_MKSHIM, default build/mkshim[-VARIANT]).
 # L4H_KERNEL_VARIANT selects a built seL4 variant when kernel.elf is omitted.
 # Usage: mkbios.sh <outdir> [l4h-root.elf] [kernel.elf]
 # L4H_GUEST_KERNEL, L4H_GUEST_KMODS, L4H_SERIAL_PORT and L4H_FB_CONSOLE are
@@ -24,8 +27,16 @@ rootserver=${2:-$root/host/target/x86_64-sel4-roottask/debug/l4h-root.elf}
 kernel=${3:-$root/build/sel4${L4H_KERNEL_VARIANT:+-$L4H_KERNEL_VARIANT}/bin/kernel.elf}
 guest_kernel=${L4H_GUEST_KERNEL:-$root/build/linux-l4h/vmlinux}
 guest_kmods=${L4H_GUEST_KMODS-$(dirname "$guest_kernel")/kmods.erofs}
+mkshim=${L4H_MKSHIM-$root/build/mkshim${L4H_KERNEL_VARIANT:+-$L4H_KERNEL_VARIANT}}
+source "$root/tools/mkshim-grub.sh"
 mkdir -p "$out"
-rm -f "$out/kmods.erofs"
+rm -rf "$out/kmods.erofs" "$out/mk"
+mk_stanza=
+if [ -n "$mkshim" ] && [ -f "$mkshim/l4h-mkshim.elf" ]; then
+    mk_stanza=$(mkshim_grub '$l4h/bios/mk' '$l4h/bios/l4h-root.elf' '$l4h/bios/vmlinux' '$l4h/bios/kmods.erofs' '$l4h')
+    mkdir -p "$out/mk"
+    cp "$mkshim"/l4h-mkshim.elf "$mkshim"/kernel-s*.elf "$out/mk/"
+fi
 
 # Like tools/mkefi.sh's, but every path is under $l4h.  The insmods are
 # for the distribution's GRUB; the core image has these modules built in.
@@ -49,6 +60,7 @@ if [ "\$fb_console" = 1 ]; then
 else
     terminal_output serial
 fi
+$mk_stanza
 multiboot2 "\$l4h/bios/kernel.elf" console_port=\$serial_port debug_port=\$serial_port\$fbcon
 module2 "\$l4h/bios/l4h-root.elf"
 module2 "\$l4h/bios/vmlinux" guest-kernel

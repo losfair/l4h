@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build the multikernel boot shim and the seL4 kernels it loads, one per
-# slot (DESIGN.md §11.3): build/mkshim/l4h-mkshim.elf (32-bit, for QEMU's
+# slot (DESIGN.md §11.4): build/mkshim/l4h-mkshim.elf (32-bit, for QEMU's
 # -kernel and GRUB alike) and build/mkshim/kernel-sK.elf for slots
 # 0..N-1 (default 8).  Slot 0 is the usual kernel address, so
 # kernel-s0.elf is the default build (build/sel4, or the variant's).

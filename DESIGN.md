@@ -2936,8 +2936,8 @@ Azure (MANA and NVMe) is not supported.
 ### 11.2 Partitioning large machines with Xen
 
 seL4's big kernel lock limits how far one l4h scales across cores, so a
-machine with many cores runs several l4h instances side by side as Xen HVM
-guests. l4h needs no VT-x of its own, so an ordinary HVM guest suffices.
+machine with many cores runs several l4h instances side by side: directly,
+one seL4 kernel per partition (§11.4), or as Xen HVM guests. l4h needs no VT-x of its own, so an ordinary HVM guest suffices.
 Each instance gets a slice of the cores and memory and its own NIC, passed
 through whole (no SR-IOV).
 
@@ -3042,6 +3042,144 @@ curl -fsSL https://raw.githubusercontent.com/losfair/l4h/main/tools/install.sh |
   `tests/run-install-vm.sh` installs into a disposable UEFI or BIOS KVM VM
   with one or two uplinks and returns to native Linux. The user manual
   documents installation in full.
+
+### 11.4 Multikernel partitions
+
+A large x86_64 machine can also run several l4h instances ("partitions")
+directly, with no hypervisor beneath them: one seL4 kernel per partition,
+each statically given a set of CPUs, a set of RAM ranges and whole PCI
+functions, and each partition a full l4h host with its own root, memd,
+vmmgr, netd, blkd, trustd, dom0, control API and guests. There is no
+machine-wide control point: an operator manages each partition as a
+separate host. At most 8 partitions.
+
+**Trust.** Every partition's kernel and host components are trusted, as
+one kernel and its components are; nothing defends one partition against
+another beyond correct static assignment. Partitioning is for scaling past
+the big kernel lock (§11.2 is the Xen alternative) and to keep partitions
+from disturbing each other by accident, not a security boundary; guest
+isolation inside each partition is unchanged.
+
+**Boot shim.** `boot/l4h-mkshim` (built with `tools/build-mkshim.sh`) is a
+freestanding multiboot1/multiboot2 image that GRUB (or QEMU's `-kernel`)
+loads at 272 MiB with these modules, each named by its last word:
+`kernel-s0` … `kernel-s7`, `l4h-root`, `l4h-mk.conf`, and `guest-kernel`,
+`guest-kmods`, `dom0-initrd`, `l4h-config` for every partition, where
+`pN:ROLE` replaces ROLE for partition N. It runs once on the boot CPU:
+
+1. parses the boot information and ACPI (MADT, SRAT, MCFG, FADT), scans
+   and sizes every PCI function through ECAM, and checks `l4h-mk.conf`;
+2. masks the 8259 PIC and measures the TSC (CPUID leaf 0x15 or the PIT)
+   and, without TSC-deadline, the APIC timer, and reads the CMOS clock:
+   no kernel touches the PIT or RTC afterwards;
+3. per partition, loads its kernel at its slot, copies its modules into a
+   low chunk of its RAM, and builds an ACPI copy, a multiboot2 information
+   structure and a descriptor;
+4. starts each secondary partition's first CPU with INIT-SIPI-SIPI into a
+   real-mode page that enters the kernel in multiboot2 state, and enters
+   partition 0's kernel on the boot CPU.
+
+Without `l4h-mk.conf` GRUB boots one kernel as before: `tools/mkefi.sh` and
+`tools/mkbios.sh` add a stanza (`tools/mkshim-grub.sh`) that boots the
+shim when the boot partition has `/l4h/l4h-mk.conf`, taking each
+partition's `/l4h/pN/dom0/initrd` and `/l4h/pN/l4h.conf` (or the shared
+`/l4h/dom0/initrd` and `/l4h/l4h.conf`). `tools/build-efi.sh` builds the
+shim into every shipped UEFI application. The installer's `--partitions
+N` (UEFI only) writes a NUMA-aligned `l4h-mk.conf` that gives each other
+partition an NVMe controller and a NIC of its own; their dom0s need their
+own `pN/` files.
+
+**Configuration.** `/l4h/l4h-mk.conf`, `key = value` lines:
+
+```
+partitions = 2               # 1..8
+p0.cpus = node:0             # or: 4 (count), 0-15 (CPU numbers), apic:0,2,4
+p0.mem  = 60G                # partition 0 takes the rest by default
+p1.cpus = node:1
+p1.mem  = 64G                # others: an even share by default
+p1.pci  = 0000:80:04.0, 0000:80:05.0
+link.p0-p1 = 1               # a virtual wire between the two netds
+```
+
+Every PCI function no other partition lists is partition 0's, so
+`partitions = 1` behaves like one l4h. The shim refuses, rather than
+guesses: a BDF that does not exist or is in two partitions, a bridge, a
+partition without a disk controller, functions behind a PCI(-X) bridge
+(one requester ID) split between partitions, a partition 0 without the boot
+CPU, and machines without MCFG.
+
+**CPUs.** Each partition's MADT lists only its own LAPIC/x2APIC entries,
+its first CPU first, so seL4 starts exactly those. Partition 0 keeps the
+I/O APICs, interrupt source overrides and the PCAT_COMPAT flag; the others
+have none and use MSI/MSI-X only. Root programs every MSI (and IRTE) for
+the partition's first CPU (`partition::msi_dest`).
+
+**Memory.** seL4 x86_64 is linked at a physical address: kernel *k* is
+built for slot *k* at 1 MiB + *k* × 32 MiB (`L4H_KERNEL_SLOT`), where root's
+image follows it. Each partition's RAM is its slot, a low chunk below 4 GiB
+for its modules (seL4 loads root above them and copies them again), and
+its share of the rest, carved from its CPUs' NUMA node where it can. Its
+multiboot2 memory map lists only its own RAM as available; everyone else's
+RAM, and a 24 MiB shared region the shim keeps (IOMMU state, per-partition
+blocks, channels), are reserved. RAM above 512 GiB (seL4's kernel window)
+stays unused, as with one kernel. The boot loader's module copies become
+partition 0's RAM.
+
+**Kernel patches** (all inert unless their option is set):
+
+| Patch | Option | Why |
+|-------|--------|-----|
+| 0031 | `KernelX86ElfPaddrBase` | one kernel ELF per slot |
+| 0032 | `ap_boot_page=` | each partition starts its APs from its own page below 1 MiB (0x1000 × (k + 1)) |
+| 0033 | `no_legacy_irq` | boot without I/O APICs and leave the PIC alone |
+| 0034 | `tsc_mhz=`, `apic_khz=` | the shim's measurements: the PIT is global |
+| 0035 | `console_ring=paddr,size` | a secondary kernel prints to memory, not the serial port |
+| 0036 | `peers=`, `IRQControl_SendPeer` | a doorbell interrupt to another kernel's CPU |
+
+**Descriptor.** The boot module `l4h-partition` (`host/l4h-partition`)
+gives root its index and count, role, first CPU, PCI functions with the
+BARs the shim sized (root never sizes a BAR in a partition: sizing stops
+decoding), ECAM base, clock rates and boot wall clock, console ring,
+channels, its share of the IOMMU and, for partition 0, every partition's
+CPUs, RAM and console ring and the owner of every function. Root
+(`partition.rs`) then:
+
+- reaches its own functions through ECAM (`pci.rs`), never the shared
+  0xcf8/0xcfc pair, and walks the descriptor's list instead of all buses;
+- in partition 0 only: the RTC, reset, serial monitor, framebuffer
+  dashboard, balloon and TPM (a secondary's ACPI copy has no TPM2);
+- in partition 0, copies the other kernels' console rings to the serial
+  port, each line prefixed `[pN]`;
+- in a secondary, refuses `host-reboot` (`EPERM`): resetting the machine
+  stops every partition, so only partition 0's dom0 can; and forwards
+  `rtc-set` to partition 0.
+
+Generated MACs carry the partition index (`02:4c:34:P:G:N`), and
+`l4hctl info` shows the partition (`CTL_PARTITION_INFO`).
+
+**Channels** (`channel.rs`). The shim reserves 256 KiB per partition pair
+that needs one (partition 0 and each other; configured links) and lists it
+in both descriptors: two single-writer message rings and a doorbell each
+way (vector 96 + sender). A writer never waits: a header word counts the
+bytes ever written, and a reader that falls behind by a whole ring knows it
+lost messages; a crashed partition leaves a stale ring, never a blocked
+writer. The control channel carries heartbeats (secondary to primary, every
+second; partition 0 logs a partition silent for 5 s), the wall clock
+(primary to secondaries every 10 s and after an RTC change), forwarded RTC
+settings, and trustd's requests.
+
+**Lifecycle.** Partitions boot in parallel and run independently; a
+crashed secondary stays down until the machine reboots. There is no
+per-partition restart; partition 0's `l4hctl host-reboot` resets the whole
+machine. If partition 0 dies, the others keep running without its
+services (console relay, clock, attestation, IOMMU fault logging).
+
+**Test.** `tests/run-mktest.sh` boots two partitions on QEMU q35 (KVM),
+each with its own virtio disk and NIC: each dom0 gets an address by DHCP,
+runs a VM no other dom0 sees, and a secondary's `host-reboot` is refused
+and its `rtc-set` reaches partition 0, which then resets the machine.
+`MK_PARTITIONS=8` covers every slot, `MK_BOOT=uefi|bios` boots through
+GRUB from a `tools/mkimage.sh` disk.
 
 ---
 
@@ -3378,6 +3516,7 @@ machine and guests of 256–512 MiB.
 | `tests/run-monitor.sh` | serial monitor (`list`, `restart-dom0`), continued operation with an absent UART |
 | `tests/run-uefitest.sh` | UEFI/GRUB boot image with NVMe and virtio-net, as on GCE |
 | `tests/run-biostest.sh` | the same image under SeaBIOS with virtio-blk, virtio-net and a VBE framebuffer, as on DigitalOcean |
+| `tests/run-mktest.sh` | two (`MK_PARTITIONS`) multikernel partitions on q35: each dom0 boots, gets DHCP and runs a VM; a secondary's host-reboot is refused (§11.4) |
 | `tests/run-xentest.sh` | two l4h partitions as Xen HVM guests, nested in KVM, each with a passed-through NIC, ping each other (§11.2) |
 | `tests/run-attesttest.sh` | attestation with swtpm over CRB, FIFO and the AMD fTPM ACPI start method: reports on dom0 and a guest, host evidence, AK credential |
 | `tests/run-debian.sh`, `tests/run-workload.sh` | Debian + systemd, fio verify, parallel build, fsck (`tests/mkdebian.sh` first) |

@@ -377,6 +377,14 @@ fn run(args: &[String]) -> Result<i32> {
                 let irq = if i.state != IOMMU_ON { "" } else if i.intremap { ", interrupts remapped" } else { ", interrupts not remapped" };
                 println!("iommu:  {}{irq}", i.state_name());
             }
+            // One of several kernels on the machine (DESIGN.md §11.4); a
+            // host that predates CTL_PARTITION_INFO: no line.
+            if let Ok(r) = ctl.call(CTL_PARTITION_INFO, &[], &[], &[]) {
+                if r.vals[1] > 1 {
+                    let role = if r.vals[0] == 0 { "primary" } else { "secondary" };
+                    println!("partition: {} of {} ({role}, first CPU APIC ID {})", r.vals[0], r.vals[1], r.vals[2]);
+                }
+            }
         }
         "iommu" => {
             let i = ctl.iommu_info()?;

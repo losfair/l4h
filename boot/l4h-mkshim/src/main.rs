@@ -1,5 +1,5 @@
 //! l4h-mkshim: boots several seL4 kernels on one x86_64 machine, each
-//! with its own CPUs, RAM and PCI functions (DESIGN.md §11.3).
+//! with its own CPUs, RAM and PCI functions (DESIGN.md §11.4).
 //!
 //! The boot loader (GRUB, multiboot2; or QEMU's -kernel, multiboot1) loads
 //! the shim with these modules, each named by the last word of its string:
@@ -255,7 +255,7 @@ extern "C" fn shim_main(magic: u32, info: u64) -> ! {
     }
 
     // The shared IOMMU region starts zeroed: the primary's root marks it
-    // ready (DESIGN.md §4.6).
+    // ready (DESIGN.md §11.4).
     unsafe { phys_mut(out.start, part::IOMMU_REGION_SIZE as usize).fill(0) };
 
     // Descriptors.

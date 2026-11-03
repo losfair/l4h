@@ -518,7 +518,10 @@ fn nic_add(h: &mut Host, a: [u64; 8]) -> Result<Vals, i64> {
             return Err(ctl::ENOSPC);
         }
         let p = h.netd.free_port(switch)?;
-        let mac = if mac == 0 { 0x02_4c_34_00_00_00 | ((id as u64) << 8) | p as u64 } else { mac & 0xffff_ffff_ffff };
+        // Generated: 02:4c:34:<partition>:<guest>:<port>, unique across the
+        // partitions of a machine, which a link may put on one L2.
+        let part = crate::partition::get().map_or(0, |d| d.index as u64);
+        let mac = if mac == 0 { 0x02_4c_34_00_00_00 | part << 24 | ((id as u64) << 8) | p as u64 } else { mac & 0xffff_ffff_ffff };
         if mac >> 40 & 1 != 0 {
             return Err(ctl::EINVAL);
         }

@@ -6,7 +6,12 @@
 # (DESIGN.md §11):
 #   /l4h/dom0/initrd    dom0's initramfs (optional)
 #   /l4h/l4h.conf       host and dom0 settings (optional; see the manual)
-# GRUB passes these to l4h-root as boot modules.  The partition is the
+# GRUB passes these to l4h-root as boot modules.  With /l4h/l4h-mk.conf
+# on the partition, GRUB boots the multikernel shim instead, and each
+# partition N takes /l4h/pN/dom0/initrd and /l4h/pN/l4h.conf
+# (tools/mkshim-grub.sh, DESIGN.md §11.4); the shim and its slot kernels
+# come from L4H_MKSHIM (default build/mkshim[-VARIANT], tools/build-mkshim.sh),
+# when built.  The partition is the
 # one the application was loaded from or, when GRUB cannot tell, the first
 # with /l4h/dom0/initrd (or /l4h/l4h.conf).
 # Measured boot: the firmware measures this application, with everything
@@ -30,6 +35,17 @@ rootserver=${2:-$root/host/target/x86_64-sel4-roottask/debug/l4h-root.elf}
 kernel=${3:-$root/build/sel4${L4H_KERNEL_VARIANT:+-$L4H_KERNEL_VARIANT}/bin/kernel.elf}
 guest_kernel=${L4H_GUEST_KERNEL:-$root/build/linux-l4h/vmlinux}
 guest_kmods=${L4H_GUEST_KMODS-$(dirname "$guest_kernel")/kmods.erofs}
+mkshim=${L4H_MKSHIM-$root/build/mkshim${L4H_KERNEL_VARIANT:+-$L4H_KERNEL_VARIANT}}
+source "$root/tools/mkshim-grub.sh"
+mk_stanza= mk_files=()
+if [ -n "$mkshim" ] && [ -f "$mkshim/l4h-mkshim.elf" ]; then
+    mk_stanza=$(mkshim_grub "(memdisk)/boot/mk" "(memdisk)/boot/l4h-root.elf" "(memdisk)/boot/vmlinux" \
+        "${guest_kmods:+(memdisk)/boot/kmods.erofs}" '($esp)/l4h')
+    mk_files=("boot/mk/l4h-mkshim.elf=$mkshim/l4h-mkshim.elf")
+    for k in $(seq 0 7); do
+        [ -f "$mkshim/kernel-s$k.elf" ] && mk_files+=("boot/mk/kernel-s$k.elf=$mkshim/kernel-s$k.elf")
+    done
+fi
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
@@ -75,6 +91,9 @@ $acpi_cmd
 # heap now by reading a large file whole, which load_env does before it
 # rejects the file and frees the buffer.
 if load_env --file (memdisk)/boot/vmlinux; then true; fi
+if [ -n "\$esp" ]; then
+$mk_stanza
+fi
 multiboot2 (memdisk)/boot/kernel.elf console_port=\$serial_port debug_port=\$serial_port\$fbcon
 module2 (memdisk)/boot/l4h-root.elf
 module2 (memdisk)/boot/vmlinux guest-kernel
@@ -96,5 +115,5 @@ grub-mkstandalone -O x86_64-efi -o "$out" --compress=xz \
     --locales= --fonts= --themes= \
     "boot/grub/grub.cfg=$work/grub.cfg" \
     "boot/kernel.elf=$kernel" \
-    "boot/l4h-root.elf=$work/l4h-root.elf" "${memdisk[@]}" "${acpi_files[@]}"
+    "boot/l4h-root.elf=$work/l4h-root.elf" "${memdisk[@]}" "${acpi_files[@]}" "${mk_files[@]}"
 echo "$out: $(( $(stat -c %s "$out") >> 10 )) KiB"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Multikernel (DESIGN.md §11.3): l4h-mkshim boots MK_PARTITIONS (default 2)
+# Multikernel (DESIGN.md §11.4): l4h-mkshim boots MK_PARTITIONS (default 2)
 # seL4 kernels on one QEMU q35 machine, each partition with its own CPUs,
 # RAM, virtio disk and virtio NIC.  Each partition's dom0 boots, gets an
 # address by DHCP over its own NIC, and runs a VM that no other dom0 sees;
@@ -7,7 +7,9 @@
 # resets the whole machine.  The other kernels' consoles reach the serial
 # port through partition 0 ("[pN]" lines).
 # MK_PARTITIONS=N (2..8) needs 2N CPUs; L4H_QEMU_IOMMU=intel|amd adds an
-# IOMMU the partitions share.
+# IOMMU the partitions share.  MK_BOOT=uefi or bios boots a disk image from
+# tools/mkimage.sh through GRUB (OVMF or SeaBIOS) instead of QEMU's
+# multiboot loader, with the configuration on the EFI system partition.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 source "$root/tools/guest-env.sh"
@@ -50,6 +52,28 @@ for k in $(seq 0 $((n - 1))); do
     mods+=",$out/p$k.conf p$k:l4h-config,$root/build/mkshim/kernel-s$k.elf kernel-s$k"
 done
 
+boot=(-kernel "$out/l4h-mkshim.elf" -append "console_port=0x3f8" -initrd "$mods")
+if [ -n "${MK_BOOT:-}" ]; then
+    # The ESP's /l4h: l4h-mk.conf, pN/l4h.conf and the dom0 initramfs all
+    # partitions share.
+    rm -rf "$out/esp"
+    mkdir -p "$out/esp"
+    cp "$conf" "$out/esp/"
+    for k in $(seq 0 $((n - 1))); do
+        mkdir -p "$out/esp/p$k"
+        cp "$out/p$k.conf" "$out/esp/p$k/l4h.conf"
+    done
+    L4H_GUEST_KMODS= L4H_GUEST_KERNEL="$out/vmlinux" "$root/tools/mkimage.sh" -i "$out/dom0.cpio.gz" -m "$out/esp" \
+        "$out/mk.raw" "$out/l4h-root.elf" >/dev/null
+    # On the chipset's AHCI controller, which no partition drives.
+    boot=(-drive "file=$out/mk.raw,format=raw,if=none,id=boot" -device ide-hd,drive=boot,bus=ide.0,bootindex=0)
+    case $MK_BOOT in
+        uefi) boot+=(-bios /usr/share/ovmf/OVMF.fd) ;;
+        bios) ;;
+        *) echo "unsupported MK_BOOT: $MK_BOOT (use uefi or bios)" >&2; exit 1 ;;
+    esac
+fi
+
 iommu=()
 case "${L4H_QEMU_IOMMU:-}" in
     amd) iommu=(-machine kernel-irqchip=split -device amd-iommu,intremap=on) ;;
@@ -63,7 +87,7 @@ fi
 qemu-system-x86_64 -machine q35 -enable-kvm -cpu "${L4H_QEMU_CPU:-host,-vmx,+invtsc}" \
     -smp $((2 * n)) -m "${MK_MEM:-$((2 * n + 2))G}" -nographic -serial mon:stdio -no-reboot \
     "${iommu[@]}" \
-    -kernel "$out/l4h-mkshim.elf" -append "console_port=0x3f8" -initrd "$mods" \
+    "${boot[@]}" \
     "${devices[@]}" </dev/null >"$log" 2>&1 &
 qemu=$!
 end=$((SECONDS + ${MKTEST_TIMEOUT:-300}))
