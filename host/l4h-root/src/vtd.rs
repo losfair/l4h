@@ -311,9 +311,13 @@ impl Vtd {
             let reserved = self.dmar.reserved[r];
             for sid in reserved.scope.first..=reserved.scope.last {
                 // Partition 0 reads every partition's functions; each
-                // maps its own reserved memory (`join`).
+                // maps its own reserved memory (`join`), and a requester
+                // ID another partition's function shares (with a bridge of
+                // partition 0's) is that partition's domain.
+                let req = self.requesters.requester(sid);
                 if pci.read32((sid >> 8) as u8, (sid >> 3 & 31) as u8, (sid & 7) as u8, 0) & 0xffff == 0xffff
-                    || !pci::ours(sid) {
+                    || !pci::ours(sid)
+                    || crate::partition::foreign_requester(req, |b| self.requesters.requester(b)) {
                     continue;
                 }
                 let unit = self.dmar.owner(sid).expect("VT-d: RMRR device has no remapping unit");
