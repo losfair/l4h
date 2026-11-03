@@ -51,7 +51,52 @@ if [ -n "${MKPEER:-}" ]; then
         [ "$i" -lt 90 ] || fail "ping p$MKPEER over the link"
     done
     say "link ok: $(ping -c 3 -W 2 "$peer" | grep 'packets transmitted')"
-    if [ "$P" = 1 ]; then
+    if [ -n "${MKSTRESS:-}" ]; then
+        # MKSTRESS seconds of everything at once, both ways: floods of
+        # big pings, HTTP downloads of the VM's initramfs (the same file
+        # on both sides) checked against the local copy, and VMs made and
+        # destroyed one after another.
+        mkdir -p /tmp/www && cp /bin/vm.cpio.gz /tmp/www/blob
+        httpd -p 8080 -h /tmp/www
+        want=$(sha256sum < /bin/vm.cpio.gz)
+        for j in 1 2 3 4 5 6 7 8; do
+            ping -q -A -s 8000 -w "$MKSTRESS" "$peer" > "/tmp/flood$j" 2>&1 &
+        done
+        end=$(($(date +%s) + MKSTRESS))
+        (n=0 bad=0 err=0
+         while [ "$(date +%s)" -lt "$end" ]; do
+            rm -f /tmp/got
+            if ! wget -q -T 20 -O /tmp/got "http://$peer:8080/blob"; then
+                err=$((err + 1))
+            elif [ "$(sha256sum < /tmp/got)" = "$want" ]; then
+                n=$((n + 1))
+            else
+                bad=$((bad + 1))
+                say "corrupted download: $(wc -c < /tmp/got) of $(wc -c < /bin/vm.cpio.gz) bytes, $(cmp /tmp/got /bin/vm.cpio.gz 2>&1 | head -1)"
+            fi
+         done
+         echo "$n $bad $err" > /tmp/xfer) &
+        (n=0
+         while [ "$(date +%s)" -lt "$end" ]; do
+            v=$(l4hctl create "churn-p$P" --initrd /bin/vm.cpio.gz --mem 64 \
+                --cmdline "console=hvc0 quiet MKP=$P") || break
+            l4hctl console "$v" --until "MKVM: done" --timeout 60 > /dev/null || break
+            l4hctl destroy "$v" || break
+            n=$((n + 1))
+         done
+         [ "$(date +%s)" -ge "$end" ] && echo "$n" > /tmp/churn || echo "fail after $n" > /tmp/churn) &
+        wait
+        read n bad err < /tmp/xfer
+        [ "$bad" = 0 ] || fail "stress: $bad of $((n + bad)) downloads over the link corrupted"
+        [ "$n" -gt 0 ] || fail "stress: no download over the link ($err failed)"
+        case $(cat /tmp/churn) in fail*) fail "stress: VM churn: $(cat /tmp/churn)" ;; esac
+        tx=0 rx=0
+        for f in /tmp/flood*; do
+            set -- $(sed -n 's/^\([0-9]*\) packets transmitted, \([0-9]*\) packets received.*/\1 \2/p' "$f")
+            tx=$((tx + ${1:-0})) rx=$((rx + ${2:-0}))
+        done
+        say "stress ok: $n downloads intact ($err failed), $rx of $tx pings answered, $(cat /tmp/churn) VMs"
+    elif [ "$P" = 1 ]; then
         # Flood the link (busybox ping has no -f: pings that each send
         # again on a reply) while control traffic crosses, the heartbeats
         # and rtc-set below: frames have a channel of their own and must
