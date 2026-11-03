@@ -4,5 +4,5 @@
 ccflags-y += -I$(srctree)/arch
 asflags-y += -I$(srctree)/arch
 
-obj-y := csum-partial_64.o memcpy_64.o memmove_64.o memset_64.o
+obj-y := csum-partial_64.o memcpy_64.o memmove_64.o memset_64.o word-at-a-time.o
 obj-$(CONFIG_MODULES) += module.o

@@ -1,0 +1,39 @@
+x86: load_unaligned_zeropad() for l4h without a faulting page crossing
+
+x86's load_unaligned_zeropad() lets a word load cross into an unmapped
+next page and returns zeroes for the missing bytes from the exception
+table (EX_TYPE_ZEROPAD).  A fault in the l4h guest kernel goes to the
+host and stops the guest instead, and the direct map has holes where RAM
+blocks became seL4 objects, so on l4h a word that crosses a page is
+loaded by arch/l4h/x86/lib/word-at-a-time.c, which checks the next page
+first.  Changing this header rather than shadowing it from arch/l4h
+makes Kbuild and ccache rebuild everything that inlines the helper.
+
+--- a/arch/x86/include/asm/word-at-a-time.h
++++ b/arch/x86/include/asm/word-at-a-time.h
+@@ -67,10 +67,25 @@
+  * and the next page not being mapped, take the exception and
+  * return zeroes in the non-existing part.
+  */
++#ifdef CONFIG_L4H
++#include <asm/page.h>
++
++unsigned long l4h_load_unaligned_zeropad_cross(const void *addr);
++#endif
++
+ static inline unsigned long load_unaligned_zeropad(const void *addr)
+ {
+ 	unsigned long ret;
+ 
++#ifdef CONFIG_L4H
++	/*
++	 * A fault in the l4h guest kernel stops the guest instead of
++	 * reaching the exception table, so a word crossing into the next
++	 * page is loaded out of line (arch/l4h/x86/lib/word-at-a-time.c).
++	 */
++	if (unlikely(((unsigned long)addr & (PAGE_SIZE - 1)) > PAGE_SIZE - sizeof(long)))
++		return l4h_load_unaligned_zeropad_cross(addr);
++#endif
+ 	asm volatile(
+ 		"1:	mov %[mem], %[ret]\n"
+ 		"2:\n"
