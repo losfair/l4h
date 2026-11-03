@@ -102,23 +102,28 @@ mod virtio { pub type VirtioBlk = crate::MockDriver; }
 
 struct Kernel {
     ipc: sel4::IpcBuffer,
-    requests: VecDeque<(u64, [u64; 3], bool)>,
+    requests: VecDeque<(u64, [u64; 6], bool)>,
     replies: Vec<[u64; 5]>,
     retry: bool,
     status: u32,
     kicks: usize,
+    /// Requests the mock device holds at once.
+    room: usize,
+    /// Started requests: tag, sector, bytes.
+    started: Vec<(u64, u64, u64)>,
 }
 thread_local! {
     static KERNEL: RefCell<Kernel> = RefCell::new(Kernel {
         ipc: sel4::IpcBuffer([0; 120]), requests: VecDeque::new(), replies: Vec::new(),
-        retry: false, status: 0, kicks: 0,
+        retry: false, status: 0, kicks: 0, room: usize::MAX, started: Vec::new(),
     });
 }
 
-pub struct MockDriver { legacy_io: u32, queue: u16, provisioning: bool }
+pub struct MockDriver { legacy_io: u32, queue: u16, provisioning: bool, in_flight: Vec<u64> }
 impl MockDriver {
     pub fn new(_: u32, cfg: &BlkdConfig) -> Self {
-        Self { legacy_io: cfg.legacy_io, queue: if cfg.kind == blk::BLKD_VIRTIO_SCSI { 2 } else { 0 }, provisioning: false }
+        let queue = if cfg.kind == blk::BLKD_VIRTIO_SCSI { 2 } else { 0 };
+        Self { legacy_io: cfg.legacy_io, queue, provisioning: false, in_flight: Vec::new() }
     }
     fn notify(&self) {
         KERNEL.with_borrow_mut(|k| {
@@ -136,9 +141,14 @@ impl Driver for MockDriver {
     fn info(&self, _: usize) -> DevInfo {
         DevInfo { capacity: 131072, block_size: 512, read_only: false, flush: true, address: 0x301 }
     }
-    fn can_start(&self) -> bool { true }
-    fn start(&mut self, tag: u64, _: usize, _: u32, _: u64, _: &[Seg]) -> Result<(), u32> {
+    fn can_start(&self) -> bool { KERNEL.with_borrow(|k| self.in_flight.len() < k.room) }
+    fn start(&mut self, tag: u64, _: usize, _: u32, sector: u64, data: &[Seg]) -> Result<(), u32> {
         self.provisioning |= tag == u64::MAX;
+        if tag != u64::MAX {
+            self.in_flight.push(tag);
+            let bytes = data.iter().map(|s| s.len as u64).sum();
+            KERNEL.with_borrow_mut(|k| k.started.push((tag, sector, bytes)));
+        }
         Ok(())
     }
     fn kick(&mut self) { self.notify(); }
@@ -149,6 +159,9 @@ impl Driver for MockDriver {
             // VirtioScsi::reap notifies after all callbacks when another
             // completion in the batch needs retrying (BUSY/UNIT_ATTENTION).
             if retry { self.notify(); }
+        }
+        for tag in self.in_flight.drain(..) {
+            done(tag, blk::STATUS_OK);
         }
     }
 }
@@ -161,11 +174,23 @@ unsafe extern "C" {
 }
 fn channel() -> *mut Channel { blk::channel_va(0) as *mut Channel }
 
+/// Map client 0's channel and extent table, as root does.
+fn map_client() {
+    for (va, len) in [(channel() as usize, blk::CHANNEL_PAGES * 4096), (blk::extent_va(0), blk::EXTENT_STRIDE)] {
+        // MAP_FIXED_NOREPLACE: never overwrite an unrelated mapping.
+        assert_eq!(unsafe { mmap(va, len, 3, 0x100022, -1, 0) }, va);
+    }
+}
+
+fn unmap_client() {
+    for (va, len) in [(channel() as usize, blk::CHANNEL_PAGES * 4096), (blk::extent_va(0), blk::EXTENT_STRIDE)] {
+        assert_eq!(unsafe { munmap(va, len) }, 0);
+    }
+}
+
 fn run(kind: u32, legacy: bool, label: u64, pending_io: bool, retry: bool, status: u32) -> [u64; 5] {
     let _lock = LOCK.lock().unwrap();
-    let len = blk::CHANNEL_PAGES * 4096;
-    // MAP_FIXED_NOREPLACE: never overwrite an unrelated mapping.
-    assert_eq!(unsafe { mmap(channel() as usize, len, 3, 0x100022, -1, 0) }, channel() as usize);
+    map_client();
     unsafe {
         (*channel()).capacity_sectors = 8;
         (*channel()).pool = blk::Pool { gpa: 0x8000000, paddr: 0x10000000, size: 4096 };
@@ -174,11 +199,13 @@ fn run(kind: u32, legacy: bool, label: u64, pending_io: bool, retry: bool, statu
     }
     KERNEL.with_borrow_mut(|k| {
         k.ipc.0.fill(0);
-        k.requests = [(blk::BLKD_ADD, [0; 3], false), (label, [0; 3], pending_io)].into();
+        k.requests = [(blk::BLKD_ADD, [0; 6], false), (label, [0; 6], pending_io)].into();
         k.replies.clear();
         k.retry = retry;
         k.status = status;
         k.kicks = 0;
+        k.room = usize::MAX;
+        k.started.clear();
     });
     // BlkdConfig consists entirely of integer fields.
     let mut config: BlkdConfig = unsafe { core::mem::zeroed() };
@@ -186,7 +213,7 @@ fn run(kind: u32, legacy: bool, label: u64, pending_io: bool, retry: bool, statu
     config.legacy_io = if legacy { 0xc000 } else { 0 };
     let info = Box::leak(Box::new(Info { header: Header { id: 1, tsc_hz: 1_000_000_000 }, config }));
     let stopped = std::panic::catch_unwind(|| production::run(info)).unwrap_err();
-    assert_eq!(unsafe { munmap(channel() as usize, len) }, 0);
+    unmap_client();
     assert!(stopped.is::<Finished>(), "service failed before sending every reply");
     KERNEL.with_borrow(|k| {
         assert_eq!(k.replies.len(), 2);
@@ -225,4 +252,42 @@ fn refused_provisioning_reports_its_errno() {
     // Sector 0, length 0: not a flush, so not a valid range.
     let r = run(blk::BLKD_VIRTIO, true, blk::BLKD_WRITE, true, false, 0);
     assert_eq!(r[..2], [blk::BLKD_REFUSED, blk::EINVAL]);
+}
+
+#[test]
+fn a_split_request_waits_for_room_and_drains_on_remove() {
+    let _lock = LOCK.lock().unwrap();
+    map_client();
+    // Guest sectors 0..8192 are disk sectors 40960.., then 8192...
+    let staging: &'static [[u64; 2]] = Box::leak(Box::new([[40960, 8192], [8192, 8192]]));
+    unsafe {
+        (*channel()).pool = blk::Pool { gpa: 0x8000000, paddr: 0x10000000, size: 1 << 20 };
+        (*channel()).reqs[0] = blk::Req { id: 7, op: blk::OP_READ, nr_segs: 1, sector: 8184, ..Default::default() };
+        (*channel()).reqs[0].segs[0] = blk::Seg { gpa: 0x8000000, len: 8192, flags: blk::SEG_WRITE };
+    }
+    KERNEL.with_borrow_mut(|k| {
+        k.ipc.0.fill(0);
+        // Attach the two extents; the request arrives with BLKD_INFO; the
+        // device has room for one piece; then remove the client.
+        k.requests = [(blk::BLKD_ADD, [0, 0, 0, 2, 0, 0], false), (blk::BLKD_INFO, [0; 6], true),
+            (blk::BLKD_REMOVE, [0; 6], false)].into();
+        k.replies.clear();
+        (k.retry, k.status, k.kicks, k.room) = (false, 0, 0, 1);
+        k.started.clear();
+    });
+    let mut config: BlkdConfig = unsafe { core::mem::zeroed() };
+    config.dma_va = staging.as_ptr() as u64;
+    let info = Box::leak(Box::new(Info { header: Header { id: 1, tsc_hz: 1_000_000_000 }, config }));
+    let stopped = std::panic::catch_unwind(|| production::run(info)).unwrap_err();
+    let (cq, resp) = unsafe { ((*channel()).cq.head, (*channel()).resps[0]) };
+    unmap_client();
+    assert!(stopped.is::<Finished>(), "service failed before sending every reply");
+    KERNEL.with_borrow(|k| {
+        assert_eq!(k.replies[0][0], 0, "the extents attach");
+        assert_eq!(k.replies[2][0], 0, "remove drains the carried piece");
+        // Pending slot 0: piece 0 at the end of the first extent, piece 1
+        // at the start of the second, once the first completed.
+        assert_eq!(k.started, [(0, 49144, 4096), (1, 8192, 4096)]);
+    });
+    assert_eq!((cq, resp.id, resp.status), (1, 7, blk::STATUS_OK));
 }

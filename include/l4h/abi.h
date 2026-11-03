@@ -530,7 +530,10 @@ enum l4h_ctl_op {
      * Writes the control data buffer or zeros to an UNATTACHED range.
      * Sector and length must be 4 KiB aligned. */
     L4H_CTL_BLK_WRITE = 20,
-    /* disk, first attachment -> vals: next (0 = end), vm, start, sectors, read-only */
+    /* disk, cursor (0 = first) -> vals: next (0 = end), vm, start, sectors,
+     * read-only, extent: one row per window, or per extent (in guest order,
+     * extent 0 first) of a disk made of them.  start is ~0 if the host
+     * cannot tell (the disk's controller failed). */
     L4H_CTL_BLK_INFO = 21,
 	/* Reset the machine (ACPI reset register, then 0xcf9, then the
 	 * keyboard controller); dom0 syncs its disks first.  Returns only if
@@ -614,7 +617,24 @@ enum l4h_ctl_op {
 	 * the partition's first CPU, vals[3] = partitions heard from
 	 * (a bit each; partition 0 only).  DESIGN.md §11.4. */
 	L4H_CTL_PARTITION_INFO = 38,
+	/* args: vm, disk index, flags (L4H_BLK_*), offset in the control data area,
+	 * extent count (1..L4H_BLK_MAX_EXTENTS); data area: struct
+	 * l4h_ctl_extent[count] in guest order.  Like BLK_ATTACH, but the
+	 * guest's disk is the extents joined, e.g. an LVM linear LV.  Each
+	 * extent is 4 KiB aligned, and at least L4H_BLK_MIN_EXTENT_SECTORS
+	 * long if there are several.  -EINVAL: no such disk (bad alignment or
+	 * bounds, extents that overlap); -EBUSY: conflicts with another
+	 * attachment or a dom0 boot range. */
+	L4H_CTL_BLK_ATTACH_EXTENTS = 39,
 };
+
+struct l4h_ctl_extent {
+	l4h_u64 start;          /* 512-byte sectors */
+	l4h_u64 sectors;
+};
+
+#define L4H_BLK_MAX_EXTENTS        4096
+#define L4H_BLK_MIN_EXTENT_SECTORS 8192
 
 #define L4H_GPU_MIN             64
 #define L4H_GPU_MAX_WIDTH       1920
