@@ -22,6 +22,8 @@
 # MK_STRESS=S: for S seconds partitions 0 and 1 flood the link both ways,
 # download a file from each other over it (checked against their own
 # copy), and make and destroy VMs one after another, all at once.
+# MK_MACHINE=pc boots an i440FX machine, which has no MCFG (as on GCE): the
+# partitions share PCI configuration ports under a lock instead of ECAM.
 # MK_ATTEST=1 adds a software TPM (swtpm), which only partition 0 sees:
 # every dom0 and VM gets a report, the other partitions' through partition
 # 0's trustd, and tools/l4h-attest.py verifies each against its
@@ -31,6 +33,9 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 source "$root/tools/guest-env.sh"
 n=${MK_PARTITIONS:-2}
+machine=${MK_MACHINE:-q35}
+rootbus=pcie.0
+[ "$machine" = pc ] && rootbus=pci.0
 attest=${MK_ATTEST:-}
 out=$root/build/mktest
 log=$root/build/mktest.log
@@ -87,13 +92,13 @@ for k in $(seq 0 $((n - 1))); do
         disk_bdf=01:00.0 nic_bdf=03:01.0
     elif [ "$k" = 1 ] && [ -n "${MK_UPLINK:-}" ]; then
         devices+=(-drive "file=$out/disk$k.img,if=none,id=d$k,format=raw"
-            -device "virtio-blk-pci,drive=d$k,bus=pcie.0,addr=$(printf '%#x' $disk)")
+            -device "virtio-blk-pci,drive=d$k,bus=$rootbus,addr=$(printf '%#x' $disk)")
         nic_bdf=
     else
         devices+=(-drive "file=$out/disk$k.img,if=none,id=d$k,format=raw"
-            -device "virtio-blk-pci,drive=d$k,bus=pcie.0,addr=$(printf '%#x' $disk)"
+            -device "virtio-blk-pci,drive=d$k,bus=$rootbus,addr=$(printf '%#x' $disk)"
             -netdev "user,id=n$k"
-            -device "virtio-net-pci,netdev=n$k,disable-legacy=on,bus=pcie.0,addr=$(printf '%#x' $nic)")
+            -device "virtio-net-pci,netdev=n$k,disable-legacy=on,bus=$rootbus,addr=$(printf '%#x' $nic)")
     fi
     if [ "$k" != 0 ]; then
         printf 'p%d.cpus = 2\np%d.mem = 1G\np%d.pci = %s%s\n' "$k" "$k" "$k" "$disk_bdf" "${nic_bdf:+, $nic_bdf}" >> "$conf"
@@ -153,11 +158,11 @@ run_qemu() {
         tpm=(-chardev socket,id=tpm,path="$out/tpm/sock" -tpmdev emulator,id=tpm0,chardev=tpm -device tpm-crb,tpmdev=tpm0)
     fi
     rm -f "$log"
-    qemu-system-x86_64 -machine q35 -enable-kvm -cpu "${L4H_QEMU_CPU:-host,-vmx,+invtsc}" \
+    qemu-system-x86_64 -machine "$machine" -enable-kvm -cpu "${L4H_QEMU_CPU:-host,-vmx,+invtsc}" \
         -smp $((2 * n)) -m "${MK_MEM:-$((2 * n + 2))G}" -nographic -serial mon:stdio -no-reboot \
         "${iommu[@]}" "${tpm[@]}" \
         "${boot[@]}" \
-        "${devices[@]}" </dev/null >"$log" 2>&1 &
+        "${devices[@]}" ${MK_QEMU_ARGS:-} </dev/null >"$log" 2>&1 &
     local qemu=$!
     local end=$((SECONDS + ${MKTEST_TIMEOUT:-$((300 + ${MK_STRESS:-0}))}))
     while kill -0 "$qemu" 2>/dev/null; do
@@ -190,6 +195,10 @@ run_qemu() {
         ! grep -aq "partition 1 stopped: no heartbeat" "$log" || { echo "partition 1's heartbeats lost in the flood"; ok=0; }
     fi
     grep -aqE "^l4h-root: host reboot \(dom0\)\s*$" "$log" || { echo "partition 0 did not reset the machine"; ok=0; }
+    if [ "$machine" = pc ]; then
+        [ "$(grep -ac "l4h-root: no ECAM: PCI configuration through ports" "$log")" = "$n" ] \
+            || { echo "not every partition shares the PCI configuration ports"; ok=0; }
+    fi
     # One IOMMU for all: every partition's devices confined and interrupts
     # remapped, pools drained, and partition 0 (which gets every
     # partition's faults) saw none.
