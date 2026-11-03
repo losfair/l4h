@@ -6,9 +6,14 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 source "$root/tools/guest-env.sh"
 out=$root/build/guest
 mkdir -p "$out/ctlroot"
-"$root/tools/build-linux.sh" vmlinux >"$root/build/linux-build.log" 2>&1 \
-    || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
-"$l4h_objcopy" --strip-debug "$l4h_linux_out/vmlinux" "$l4h_linux_out/vmlinux.stripped"
+if [ -n "${L4H_TEST_KERNEL:-}" ]; then
+    mkdir -p "$l4h_linux_out"
+    "$l4h_objcopy" --strip-debug "$L4H_TEST_KERNEL" "$l4h_linux_out/vmlinux.stripped"
+else
+    "$root/tools/build-linux.sh" vmlinux >"$root/build/linux-build.log" 2>&1 \
+        || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
+    "$l4h_objcopy" --strip-debug "$l4h_linux_out/vmlinux" "$l4h_linux_out/vmlinux.stripped"
+fi
 "$root/tools/build-l4hctl.sh"
 "$root/tests/build-flagstest.sh"
 export L4H_VERSION=$("$root/tools/version.sh")

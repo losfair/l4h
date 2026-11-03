@@ -11,31 +11,32 @@ mod requester;
 #[path = "../host/l4h-root/src/iommu/mappings.rs"]
 mod mappings;
 use dmar::Dmar;
+use mappings::Access;
 
 #[test]
 fn shared_dma_pool_is_unmapped_only_after_its_last_user() {
     let mut m = mappings::Mappings::<2>::new();
-    assert!(m.acquire(1, 0x1000, 0x4000, true));
-    assert!(!m.acquire(1, 0x1000, 0x4000, true));
-    assert!(m.acquire(2, 0x1000, 0x4000, true));
+    assert!(m.acquire(1, 0x1000, 0x4000, Access::ReadWrite));
+    assert!(!m.acquire(1, 0x1000, 0x4000, Access::ReadWrite));
+    assert!(m.acquire(2, 0x1000, 0x4000, Access::ReadWrite));
     assert!(!m.release(1, 0x1000, 0x4000));
     assert!(m.release(2, 0x1000, 0x4000));
-    assert!(!m.acquire(1, 0x1000, 0x4000, true));
+    assert!(!m.acquire(1, 0x1000, 0x4000, Access::ReadWrite));
     assert!(!m.release(1, 0x1000, 0x4000));
     assert!(m.release(1, 0x1000, 0x4000));
-    assert!(m.acquire(1, 0x1000, 0x4000, false)); // reusable after final release
+    assert!(m.acquire(1, 0x1000, 0x4000, Access::Read)); // reusable after final release
     assert!(m.release(1, 0x1000, 0x4000));
-    assert!(!m.acquire(1, 0x1000, 0, true));
+    assert!(!m.acquire(1, 0x1000, 0, Access::Write));
     assert!(!m.release(1, 0x1000, 0));
 }
 
 #[test]
 fn shared_dma_tracking_rejects_ambiguous_ranges_and_permissions() {
-    for (pa, len, write) in [(0x2000, 0x4000, true), (0x1000, 0x4000, false)] {
+    for (pa, len, access) in [(0x2000, 0x4000, Access::ReadWrite), (0x1000, 0x4000, Access::Read), (0x1000, 0x4000, Access::Write)] {
         let result = std::panic::catch_unwind(|| {
             let mut m = mappings::Mappings::<2>::new();
-            m.acquire(1, 0x1000, 0x4000, true);
-            m.acquire(1, pa, len, write);
+            m.acquire(1, 0x1000, 0x4000, Access::ReadWrite);
+            m.acquire(1, pa, len, access);
         });
         assert!(result.is_err());
     }
@@ -416,4 +417,18 @@ fn dma_ranges_cannot_wrap_or_alias_upper_address_bits() {
     assert_eq!(format::PRESENT, format::READ);
     assert_eq!(format::WRITE, 2);
     assert_eq!(format::SNOOP, 1 << 11);
+}
+
+#[test]
+fn device_permissions_distinguish_bounce_pools_and_queues() {
+    assert!(Access::Read.read());
+    assert!(!Access::Read.write());
+    assert!(!Access::Write.read());
+    assert!(Access::Write.write());
+    assert!(Access::ReadWrite.read() && Access::ReadWrite.write());
+    let mut mappings = mappings::Mappings::<1>::new();
+    assert!(mappings.acquire(1, 0x1000, 4096, Access::Write));
+    assert!(!mappings.acquire(1, 0x1000, 4096, Access::Write));
+    assert!(!mappings.release(1, 0x1000, 4096));
+    assert!(mappings.release(1, 0x1000, 4096));
 }

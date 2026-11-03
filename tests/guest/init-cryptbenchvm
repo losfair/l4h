@@ -1,0 +1,26 @@
+#!/bin/sh
+# One benchmark VM: plain, blkd-encrypted, or guest dm-crypt over /dev/vda.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+kind=plain
+# shellcheck disable=SC2013
+for a in $(cat /proc/cmdline); do case "$a" in kind=*) kind=${a#kind=} ;; esac; done
+dev=/dev/vda
+tag="$kind/$(nproc)vcpu"
+echo "BENCHVM: lbs=$(cat /sys/block/vda/queue/logical_block_size) max_hw_kb=$(cat /sys/block/vda/queue/max_hw_sectors_kb) segs=$(cat /sys/block/vda/queue/max_segments)"
+case "$kind" in
+    dmcrypt*)
+        key=$(head -c 64 /dev/urandom | od -An -tx1 -v | tr -d ' \n')
+        opts=
+        [ "$kind" = dmcrypt-nowq ] && opts="no_read_workqueue no_write_workqueue"
+        # shellcheck disable=SC2086
+        dmcrypt-setup /dev/vda "$(cat /sys/block/vda/size)" "$key" $opts || { echo "BENCHVM: FAIL setup"; poweroff -f; }
+        sleep 1
+        dev=/dev/dm-0
+        grep -A4 'name *: xts(aes)' /proc/crypto | grep driver | head -1 | sed 's/^/BENCHVM: /'
+        ;;
+esac
+cryptbench "$dev" "$tag" || echo "BENCHVM: FAIL bench"
+echo "BENCHVM: done"
+while :; do sleep 10; done

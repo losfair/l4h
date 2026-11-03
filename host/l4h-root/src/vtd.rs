@@ -15,7 +15,7 @@ use core::sync::atomic::{Ordering, compiler_fence};
 use l4h_host::fixed::{ArrayVec, StaticCell};
 use l4h_abi as abi;
 use crate::{mem::Alloc, pci};
-use crate::iommu::{mappings, MAX_MAPPINGS};
+use crate::iommu::{Access, mappings, MAX_MAPPINGS};
 use dmar::{Dmar, MAX_IOAPICS, MAX_UNITS};
 use format::{ADDR, PRESENT, READ, WRITE};
 
@@ -265,7 +265,7 @@ impl Vtd {
                 }
                 let unit = self.dmar.owner(sid).expect("VT-d: RMRR device has no remapping unit");
                 let d = self.domain(alloc, unit, sid);
-                self.map_range(alloc, d, reserved.start, reserved.end - reserved.start, true);
+                self.map_range(alloc, d, reserved.start, reserved.end - reserved.start, Access::ReadWrite);
             }
         }
         for n in 0..self.units.len() {
@@ -416,9 +416,9 @@ impl Vtd {
         Some(unsafe { table.add(iova >> 12 & 511) })
     }
 
-    fn map_range(&mut self, alloc: &mut Alloc, d: Domain, pa: usize, len: usize, write: bool) {
+    fn map_range(&mut self, alloc: &mut Alloc, d: Domain, pa: usize, len: usize, access: Access) {
         let range = format::range(pa, len, self.units[d.unit].width).expect("VT-d: invalid DMA range");
-        let flags = READ | if write { WRITE } else { 0 }
+        let flags = (if access.read() { READ } else { 0 }) | if access.write() { WRITE } else { 0 }
             | if self.units[d.unit].ecap & (1 << 7) != 0 { format::SNOOP } else { 0 };
         for at in range.step_by(PAGE) {
             let pte = self.walk(Some(alloc), d, at).unwrap();
@@ -426,14 +426,14 @@ impl Vtd {
         }
     }
 
-    pub fn map(&mut self, alloc: &mut Alloc, d: Domain, pa: usize, len: usize, write: bool) {
+    pub fn map(&mut self, alloc: &mut Alloc, d: Domain, pa: usize, len: usize, access: Access) {
         let range = format::range(pa, len, self.units[d.unit].width).expect("VT-d: invalid DMA range");
         // Firmware-reserved memory must never become a recyclable pool:
         // its permanent mapping would defeat unmap's isolation guarantee.
         assert!(!self.dmar.reserved.iter().any(|r| self.requesters.scope_contains(r.scope, d.sid)
             && range.start < r.end && r.start < range.end), "VT-d: allocated DMA memory overlaps an RMRR");
-        if !self.mappings.acquire(d.key(), pa, len, write) { return; }
-        self.map_range(alloc, d, pa, len, write);
+        if !self.mappings.acquire(d.key(), pa, len, access) { return; }
+        self.map_range(alloc, d, pa, len, access);
         self.invalidate(d.unit, false, Some(d.id));
     }
 

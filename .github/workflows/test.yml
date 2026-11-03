@@ -110,8 +110,18 @@ jobs:
         run: tests/run-blktest.sh
       - name: Block pass-through (NVMe)
         run: BLKTEST_DEV=nvme tests/run-blktest.sh
+      - name: Encrypted attach without AES-NI
+        run: CRYPTBLK_NOAES=1 tests/run-cryptblk.sh
       - name: Legacy (virtio 0.9.5) virtio-blk and virtio-scsi
         run: BLKTEST_DEV=virtio-legacy tests/run-blktest.sh && BLKTEST_DEV=scsi-legacy tests/run-blktest.sh
+      - name: Hardware AES-XTS and bounce-buffer tests
+        run: tests/run-blkcrypt-test.sh
+      - name: Encrypted block windows and raw ciphertext
+        run: |
+          tests/run-cryptblk.sh
+          CRYPTBLK_DEV=nvme tests/run-cryptblk.sh
+          CRYPTBLK_DEV=nvme CRYPTBLK_LBA=4096 tests/run-cryptblk.sh
+          CRYPTBLK_DEV=scsi tests/run-cryptblk.sh
       - name: Control API
         run: tests/run-ctltest.sh
       - name: Network
@@ -264,6 +274,14 @@ jobs:
         run: tests/run-gputest.sh
       - name: Block pass-through (virtio-blk and NVMe)
         run: tests/run-blktest.sh && BLKTEST_DEV=nvme tests/run-blktest.sh
+      - name: Hardware AES-XTS and bounce-buffer tests
+        run: tests/run-blkcrypt-test.sh
+      - name: Encrypted block windows and raw ciphertext
+        run: |
+          tests/run-cryptblk.sh
+          CRYPTBLK_DEV=nvme tests/run-cryptblk.sh
+          CRYPTBLK_DEV=nvme CRYPTBLK_LBA=4096 tests/run-cryptblk.sh
+          CRYPTBLK_DEV=scsi tests/run-cryptblk.sh
       - name: Control API
         run: tests/run-ctltest.sh
       - name: Network

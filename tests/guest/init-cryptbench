@@ -1,0 +1,28 @@
+#!/bin/sh
+# dom0: run cryptbench VMs for each vCPU count and disk kind.
+set -eu
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mount -t tmpfs tmp /tmp
+head -c 64 /dev/urandom > /tmp/key
+reps=1; kinds="plain blkd dmcrypt dmcrypt-nowq"; cpus="1 4"
+# shellcheck disable=SC2013
+for a in $(cat /proc/cmdline); do case "$a" in reps=*) reps=${a#reps=} ;; kinds=*) kinds=$(echo "${a#kinds=}" | tr + " ") ;; cpus=*) cpus=$(echo "${a#cpus=}" | tr + " ") ;; esac; done
+r=0
+while [ "$r" -lt "$reps" ]; do
+    r=$((r + 1))
+    for vcpus in $cpus; do
+        for kind in $kinds; do
+            extra=
+            [ "$kind" = blkd ] && extra=,key-file=/tmp/key
+            id=$(l4hctl create bench --mem 256 --vcpus "$vcpus" --initrd /bin/cryptbenchvm.cpio.gz \
+                --disk "0,start=2048,sectors=122880$extra" --cmdline "console=hvc0 quiet kind=$kind") || { echo "DOM0: FAIL create $kind"; continue; }
+            l4hctl console "$id" --until 'BENCHVM: done' --timeout 300 > /tmp/console || true
+            grep -E 'RESULT|BENCHVM' /tmp/console || cat /tmp/console
+            l4hctl destroy "$id"
+        done
+    done
+done
+echo 'DOM0: ALL DONE'
+poweroff -f
