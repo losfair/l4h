@@ -2,5 +2,18 @@
 # A VM for tests/run-mktest.sh.
 mount -t proc proc /proc
 echo "MKVM: partition ${MKP:-?}, $(nproc) CPU(s), $(sed -n 's/MemTotal: *//p' /proc/meminfo)"
+# With an IOMMU the VM gets a host disk: its I/O pool is DMA the
+# partition's root confined.
+if [ -n "$MKDISK" ]; then
+    mount -t devtmpfs dev /dev
+    echo "partition ${MKP:-?} round $MKDISK" > /tmp/data
+    dd if=/dev/zero bs=4096 count=64 >> /tmp/data 2>/dev/null
+    if dd if=/tmp/data of=/dev/vda conv=fsync 2>/dev/null && head -c "$(wc -c < /tmp/data)" /dev/vda > /tmp/read \
+        && cmp -s /tmp/data /tmp/read; then
+        echo "MKVM: disk ok"
+    else
+        echo "MKVM: disk FAIL"
+    fi
+fi
 echo "MKVM: done"
 poweroff -f

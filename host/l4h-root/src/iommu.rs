@@ -5,6 +5,8 @@ use crate::{amdvi, mem::Alloc, pci};
 use crate::vtd;
 
 pub mod mappings;
+pub mod shared;
+
 
 // One pool per guest device, one DMA allocation per controller/NIC, and
 // the balloon. Backends keep these records out of root's stack.
@@ -34,14 +36,47 @@ impl Iommu {
     pub fn none() -> Self { Self::Amd(amdvi::AmdVi::none()) }
     pub fn off() -> Self { Self::Amd(amdvi::AmdVi::off()) }
 
+    /// `enabled` is `iommu`, `intremap` `iommu_intremap`. With several
+    /// partitions the primary decides both for all (shared.rs).
     #[cfg(target_arch = "x86_64")]
     pub fn init(bootinfo: &sel4::BootInfoPtr, phys: &mut crate::acpi::Phys, pci: &pci::Pci,
-        ticks_per_ms: u64, intremap: bool) -> Self {
-        if let Some(vtd) = vtd::Vtd::init(bootinfo, phys, pci, ticks_per_ms, intremap) {
+        ticks_per_ms: u64, enabled: bool, intremap: bool) -> Self {
+        let shared = shared::Shared::new(phys.alloc, phys.devmem, ticks_per_ms);
+        let (mut enabled, mut intremap) = (enabled, intremap);
+        if let Some(s) = shared.filter(|s| !s.primary) {
+            let (ready, units, remap) = s.wait_ready();
+            match ready {
+                l4h_partition::IOMMU_READY_ON => {
+                    if !enabled {
+                        log!("l4h-root: iommu=0 ignored: partition 0 enabled the IOMMU for every partition");
+                    }
+                    info!("l4h-root: partition 0 enabled {} IOMMU unit(s), interrupts {}remapped",
+                        units, if remap { "" } else { "not " });
+                    (enabled, intremap) = (true, remap);
+                }
+                l4h_partition::IOMMU_READY_ABSENT => {
+                    info!("l4h-root: no IOMMU (partition 0): DMA is not confined");
+                    return Self::Amd(amdvi::AmdVi::none());
+                }
+                _ => {
+                    log!("l4h-root: partition 0 left the IOMMU off: DMA is not confined");
+                    return Self::off();
+                }
+            }
+        }
+        let me = if !enabled {
+            log!("l4h-root: iommu=0: DMA is not confined");
+            Self::off()
+        } else if let Some(vtd) = vtd::Vtd::init(bootinfo, phys, pci, ticks_per_ms, intremap, shared) {
             Self::Intel(vtd)
         } else {
-            Self::Amd(amdvi::AmdVi::init(bootinfo, phys, pci, ticks_per_ms, intremap))
+            Self::Amd(amdvi::AmdVi::init(bootinfo, phys, pci, ticks_per_ms, intremap, shared))
+        };
+        if let Some(s) = shared.filter(|s| s.primary) {
+            let [state, remap, units, ..] = me.info();
+            s.set_ready(state, units as usize, remap != 0);
         }
+        me
     }
 
     pub fn info(&self) -> [u64; 6] {

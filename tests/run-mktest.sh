@@ -34,9 +34,15 @@ objcopy --strip-debug "$root/host/target/x86_64-sel4-roottask/debug/l4h-root.elf
 cp "$root/build/mkshim/l4h-mkshim.elf" "$out/"
 
 # Partition k has the PCI slots 4 + 2k (disk) and 5 + 2k (NIC), two CPUs
-# and 1 GiB; partition 0 the rest.
+# and 1 GiB; partition 0 the rest.  With an IOMMU, each dom0 leaves its
+# disk to VMs, whose I/O pools are attached and drained (init-mktest).
+mkiommu=() dom0_disks=""
+if [ -n "${L4H_QEMU_IOMMU:-}" ]; then
+    mkiommu=(MKIOMMU=1) dom0_disks=$'\ndom0_disks=0'
+fi
 conf=$out/l4h-mk.conf
-printf 'partitions = %d\nlink.p0-p1 = 1\n' "$n" > "$conf"
+echo "partitions = $n" > "$conf"
+[ "$n" -lt 2 ] || echo "link.p0-p1 = 1" >> "$conf"
 devices=()
 mods="$out/l4h-root.elf l4h-root,$out/vmlinux guest-kernel,$out/dom0.cpio.gz dom0-initrd,$conf l4h-mk.conf"
 for k in $(seq 0 $((n - 1))); do
@@ -52,8 +58,8 @@ for k in $(seq 0 $((n - 1))); do
     # Partitions 0 and 1 know their peer over the link.
     peer=
     [ "$k" -lt 2 ] && peer=" MKPEER=$((1 - k))"
-    printf 'dom0_cmdline=console=hvc0 MKP=%d%s\ndom0_mem_mb=256\nboot_disk=00:%02x.0\nuplink_nic=00:%02x.0\n' \
-        "$k" "$peer" "$disk" "$nic" > "$out/p$k.conf"
+    printf 'dom0_cmdline=console=hvc0 MKP=%d%s %s\ndom0_mem_mb=256\nboot_disk=00:%02x.0\nuplink_nic=00:%02x.0%s\n' \
+        "$k" "$peer" "${mkiommu[*]}" "$disk" "$nic" "$dom0_disks" > "$out/p$k.conf"
     mods+=",$out/p$k.conf p$k:l4h-config,$root/build/mkshim/kernel-s$k.elf kernel-s$k"
 done
 
@@ -86,7 +92,8 @@ case "${L4H_QEMU_IOMMU:-}" in
     '') ;;
 esac
 if [ ${#iommu[@]} -ne 0 ]; then
-    iommu+=(-global virtio-blk-pci.iommu_platform=on -global virtio-net-pci.iommu_platform=on)
+    iommu+=(-global virtio-blk-pci.iommu_platform=on -global virtio-blk-pci.disable-legacy=on
+        -global virtio-net-pci.iommu_platform=on)
 fi
 
 qemu-system-x86_64 -machine q35 -enable-kvm -cpu "${L4H_QEMU_CPU:-host,-vmx,+invtsc}" \
@@ -114,4 +121,19 @@ for k in $(seq 0 $((n - 1))); do
     [ "$k" = 0 ] || grep -aq "^l4h-root: RTC set for partition $k" "$log" || { echo "partition $k: rtc-set did not reach partition 0"; ok=0; }
 done
 grep -aqE "^l4h-root: host reboot \(dom0\)\s*$" "$log" || { echo "partition 0 did not reset the machine"; ok=0; }
+# One IOMMU for all: every partition's devices confined and interrupts
+# remapped, pools drained, and partition 0 (which gets every partition's
+# faults) saw none.
+if [ -n "${L4H_QEMU_IOMMU:-}" ]; then
+    for k in $(seq 0 $((n - 1))); do
+        grep -aq "MKTEST p$k: pool drained" "$log" || { echo "partition $k: no I/O pool drained"; ok=0; }
+        grep -aqE "MKTEST p$k: iommu state: *on" "$log" \
+            && grep -aqE "MKTEST p$k: iommu interrupts: *remapped" "$log" \
+            || { echo "partition $k: IOMMU not on and remapping"; ok=0; }
+    done
+    if grep -aE "l4h-root: (VT-d [0-9]+: .*fault|iommu: .*(fault|illegal|error|timeout))" "$log"; then
+        echo "IOMMU faults"; ok=0
+    fi
+fi
+
 [ "$ok" = 1 ] && echo "MKTEST: PASS" || { echo "MKTEST: FAIL (log: $log)"; exit 1; }

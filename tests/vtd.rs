@@ -372,13 +372,15 @@ fn remappable_msi_encodes_all_handle_bits_without_subhandles() {
         assert_eq!(data, 0);
     }
     assert_eq!(format::IR_ENTRIES, 1 << (format::IR_SIZE + 1));
+    assert_eq!(format::IR_SHARED_ENTRIES, 1 << (format::IR_SHARED_SIZE + 1));
 }
 
 #[test]
 fn interrupt_entries_require_exact_source_and_fixed_edge_delivery() {
     for (sid, vector) in [(0x1234, 0x40), (0xffff, 0x7f), (0, 0x30)] {
-        let [lo, hi] = format::irte(sid, vector);
+        let [lo, hi] = format::irte(sid, vector, 0);
         assert_eq!(lo, (vector as u64) << 16 | 1);
+        assert_eq!(format::irte(sid, vector, 2)[0], lo | 2 << 40); // xAPIC destination
         assert_eq!(hi & 0xffff, sid as u64);
         assert_eq!((hi >> 18) & 3, 1); // SVT: validate requester
         assert_eq!((hi >> 16) & 3, 0); // SQ: all 16 bits

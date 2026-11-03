@@ -52,6 +52,27 @@ pub fn msi_dest() -> u32 {
     get().map_or(0, |d| d.boot_apic)
 }
 
+/// The partition that owns PCI function `bdf`, as far as this partition
+/// knows: the primary has the whole table, a secondary only its own.
+pub fn owner(bdf: u16) -> Option<u32> {
+    let d = get()?;
+    if d.funcs().iter().any(|f| f.bdf == bdf) {
+        return Some(d.index);
+    }
+    d.owners().iter().find(|o| o.bdf == bdf).map(|o| o.partition as u32)
+}
+
+/// Whether this partition sets up the IOMMU entry of requester `bdf`: its
+/// own functions, and for the primary every ID no other partition owns
+/// (unassigned IDs, I/O APICs, firmware's).
+pub fn iommu_mine(bdf: u16) -> bool {
+    match get() {
+        None => true,
+        Some(d) if d.is_primary() => owner(bdf).is_none_or(|p| p == d.index),
+        Some(d) => d.funcs().iter().any(|f| f.bdf == bdf),
+    }
+}
+
 /// The wall clock at boot from the shim's reading, advanced to now.
 pub fn epoch_ns(tsc_hz: u64) -> u64 {
     let Some(d) = get() else { return 0 };

@@ -393,12 +393,9 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     // The IOMMU before any device is enabled: from here on, a device
     // reaches only memory root gives it (iommu.rs).
     #[cfg(target_arch = "x86_64")]
-    let mut iommu = if cfg.iommu {
+    let mut iommu = {
         let mut phys = acpi::Phys::new(&mut alloc, &mut devmem, &mut wins.a, &mut acpi_frames);
-        iommu::Iommu::init(bootinfo, &mut phys, &pci, info.tsc_hz / 1000, cfg.iommu_intremap)
-    } else {
-        log!("l4h-root: iommu=0: DMA is not confined");
-        iommu::Iommu::off()
+        iommu::Iommu::init(bootinfo, &mut phys, &pci, info.tsc_hz / 1000, cfg.iommu, cfg.iommu_intremap)
     };
     #[cfg(not(target_arch = "x86_64"))]
     let mut iommu = if cfg.iommu { iommu::Iommu::none() } else { iommu::Iommu::off() };

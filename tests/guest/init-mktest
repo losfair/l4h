@@ -39,6 +39,22 @@ if [ -n "${MKPEER:-}" ]; then
     done
     say "link ok: $(ping -c 3 -W 2 "$peer" | grep 'packets transmitted')"
 fi
+if [ -n "$MKIOMMU" ]; then
+    # The host disk (dom0 took none) to VMs in turn: each attaches an
+    # I/O pool to the controller's IOMMU domain and drains it at destroy,
+    # every partition at once on the shared command queues. Quiet: the
+    # consoles share one serial port a character at a time.
+    l4hctl destroy "$id" || fail "destroy the VM"
+    for round in 1 2; do
+        d=$(l4hctl create "disk-p$P" --initrd /bin/vm.cpio.gz --mem 96 --disk 0 \
+            --cmdline "console=hvc0 quiet MKP=$P MKDISK=$round") || fail "create a disk VM"
+        l4hctl console "$d" --until "MKVM: done" --timeout 60 > /tmp/vm || fail "the disk VM did not finish"
+        grep -q "MKVM: disk ok" /tmp/vm || fail "disk I/O through the IOMMU: $(grep MKVM /tmp/vm)"
+        l4hctl destroy "$d" || fail "destroy the disk VM"
+    done
+    say "pool drained"
+    l4hctl iommu | sed "s/^/MKTEST p$P: iommu /"
+fi
 if [ "$P" != 0 ]; then
     if l4hctl host-reboot 2>/tmp/err; then fail "host-reboot accepted"; fi
     say "host-reboot refused: $(cat /tmp/err)"

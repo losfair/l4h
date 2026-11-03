@@ -11,6 +11,12 @@
 //!
 //! No AMD IOMMU (no IVRS table, aarch64, `iommu=0`) leaves
 //! every operation a no-op: devices then reach all memory, as before.
+//!
+//! With several partitions (iommu/shared.rs) the device table, command
+//! buffers and event logs are in the shared region: partition 0 sets them
+//! up and handles the events, every partition writes its own functions'
+//! entries with its share of domain IDs, and takes a unit's lock from its
+//! first command to the completion wait that ends them.
 
 use core::sync::atomic::{Ordering, compiler_fence};
 
@@ -20,7 +26,7 @@ use l4h_abi as abi;
 
 use crate::mem::Alloc;
 use crate::pci;
-use crate::iommu::{mappings::Mappings, MAX_MAPPINGS};
+use crate::iommu::{mappings::Mappings, shared::Shared, MAX_MAPPINGS};
 
 const PAGE: usize = 4096;
 /// IOMMUs driven, at most (an EPYC has one per root complex, up to 8).
@@ -169,6 +175,8 @@ struct Unit {
     sem_pa: usize,
     seq: u64,
     inv_all: bool,
+    /// Holding the shared command buffer's lock, until the next sync.
+    locked: bool,
 }
 
 /// What the IVHDs say of each device ID: its DTE setting byte (interrupt
@@ -223,7 +231,8 @@ pub struct AmdVi {
     unity: ArrayVec<Unity, MAX_UNITY>,
     /// The domain of devices with only "all devices" unity ranges.
     shared: Option<Domain>,
-    next_domain: u16,
+    /// Domain IDs not yet given out: this partition's share.
+    domains: core::ops::Range<u32>,
     ticks_per_ms: u64,
     /// Remap interrupts (`iommu_intremap`).
     intremap: bool,
@@ -236,6 +245,8 @@ pub struct AmdVi {
     confined: u64,
     unconfined: u64,
     events: u64,
+    /// The IOMMU shared with other partitions.
+    region: Option<Shared>,
 }
 
 pub fn device_id(d: &pci::Device) -> u16 {
@@ -273,7 +284,7 @@ impl AmdVi {
             devtab: 0,
             unity: ArrayVec::new(),
             shared: None,
-            next_domain: 1,
+            domains: 1..1 << 16,
             ticks_per_ms: 0,
             intremap: false,
             dropped: 0,
@@ -282,6 +293,7 @@ impl AmdVi {
             confined: 0,
             unconfined: 0,
             events: 0,
+            region: None,
         }
     }
 
@@ -306,10 +318,15 @@ impl AmdVi {
     /// found, or one that cannot be used, leaves devices unconfined.
     #[cfg(target_arch = "x86_64")]
     pub fn init(bootinfo: &sel4::BootInfoPtr, phys: &mut crate::acpi::Phys, pci: &pci::Pci, ticks_per_ms: u64,
-        intremap: bool) -> Self {
+        intremap: bool, region: Option<Shared>) -> Self {
         let mut me = AmdVi::none();
         me.ticks_per_ms = ticks_per_ms;
         me.intremap = intremap;
+        me.region = region;
+        if let Some(s) = region {
+            let p = s.part(1 << 16);
+            me.domains = p.start.max(1)..p.end;
+        }
         let mut buf = [0u8; 32 << 10];
         let Some(ivrs) = crate::acpi::find(bootinfo, phys, b"IVRS", &mut buf) else {
             info!("l4h-root: no IOMMU (DMAR/IVRS): DMA is not confined");
@@ -336,6 +353,15 @@ impl AmdVi {
         if units.is_empty() {
             info!("l4h-root: IVRS lists no IOMMU on PCI segment 0: DMA is not confined");
             return me;
+        }
+        if let Some(s) = region {
+            if units.len() > l4h_partition::IOMMU_MAX_UNITS
+                || !s.primary && s.control().units.load(Ordering::Relaxed) as usize != units.len()
+            {
+                log!("l4h-root: iommu: {} units, not as partition 0 set them up: DMA is not confined", units.len());
+                me.state = abi::IOMMU_FAILED;
+                return me;
+            }
         }
         me.dev = Some(dev);
         me.enable(&units, phys, pci);
@@ -477,25 +503,51 @@ impl AmdVi {
             let _ = mmio.push(va);
         }
         // The device table: a whole chunk, 65536 entries of 32 bytes.
-        let (devtab, devtab_pa) = self.chunk(phys.alloc);
-        self.used = CHUNK_PAGES;
+        let (devtab, devtab_pa) = match self.region {
+            Some(s) => s.at(s.tables().start),
+            None => {
+                let c = self.chunk(phys.alloc);
+                self.used = CHUNK_PAGES;
+                c
+            }
+        };
         self.devtab = devtab;
-        for id in 0..=u16::MAX {
-            let irq = self.irq_dte(id, Domain::NONE);
-            self.write_dte(id, DTE_BLOCKED, 0, irq);
+        let primary = self.region.is_none_or(|s| s.primary);
+        if primary {
+            for id in 0..=u16::MAX {
+                let irq = self.irq_dte(id, Domain::NONE);
+                self.write_dte(id, DTE_BLOCKED, 0, irq);
+            }
         }
-        let (sems, sems_pa) = self.page(phys.alloc);
+        let (sems, sems_pa) = match self.region {
+            Some(_) => (0, 0),
+            None => self.page(phys.alloc),
+        };
         for (n, u) in units.iter().enumerate() {
-            let ((cmd, cmd_pa), (evt, evt_pa)) = (self.page(phys.alloc), self.page(phys.alloc));
+            let ((cmd, cmd_pa), (evt, evt_pa)) = match self.region {
+                Some(s) => (s.unit_page(n, 0), s.unit_page(n, 1)),
+                None => (self.page(phys.alloc), self.page(phys.alloc)),
+            };
+            let (sem, sem_pa) = match self.region {
+                Some(s) => s.done(n),
+                None => (sems + n * 8, sems_pa + n * 8),
+            };
             let header = pci.read32((u.id >> 8) as u8, ((u.id >> 3) & 0x1f) as u8, (u.id & 7) as u8, u.cap as u8);
             let base = mmio[n];
             let r = |off: usize| unsafe { ((base + off) as *const u64).read_volatile() };
             let w = |off: usize, v: u64| unsafe { ((base + off) as *mut u64).write_volatile(v) };
             let unit = Unit {
-                mmio: base, cmd, evt, tail: 0, head: 0,
-                sem: sems + n * 8, sem_pa: sems_pa + n * 8, seq: 0,
+                mmio: base, cmd, evt, tail: 0, head: 0, sem, sem_pa, seq: 0,
                 inv_all: header & CAP_EFR_SUP != 0 && r(EXT_FEATURES) & EFR_IA_SUP != 0,
+                locked: false,
             };
+            if !primary {
+                // Partition 0 enabled it and keeps it.
+                assert!(r(CONTROL) & CTRL_EN != 0, "l4h-root: iommu {}: partition 0 did not enable it", n);
+                info!("l4h-root: iommu {:02x}:{:02x}.{} at {:#x}: shared", u.id >> 8, (u.id >> 3) & 0x1f, u.id & 7, u.base);
+                let _ = self.units.push(unit);
+                continue;
+            }
             // Off, as firmware may have left it, while it is set up.
             w(CONTROL, 0);
             w(DEV_TABLE_BASE, devtab_pa as u64 | (CHUNK_PAGES as u64 - 1));
@@ -520,9 +572,9 @@ impl AmdVi {
         }
         self.state = abi::IOMMU_ON;
         // Whatever the firmware left cached.
-        if self.units.iter().all(|u| u.inv_all) {
+        if primary && self.units.iter().all(|u| u.inv_all) {
             self.command([0, CMD_INV_IOMMU_ALL, 0, 0]);
-        } else {
+        } else if primary {
             for id in 0..=u16::MAX {
                 self.command([id as u32, CMD_INV_DEVTAB_ENTRY, 0, 0]);
             }
@@ -543,7 +595,8 @@ impl AmdVi {
                 // but slow, once per device ID of an "all devices" range.
                 let mut given = ArrayVec::<u16, 64>::new();
                 for id in u.first..=u.last {
-                    if !self.covered(id) {
+                    // With several partitions, each sets up its own.
+                    if !self.covered(id) || self.region.is_some() && !crate::partition::iommu_mine(id) {
                         continue;
                     }
                     let alias = self.dev.as_ref().unwrap().alias[id as usize];
@@ -709,7 +762,7 @@ impl AmdVi {
             return data;
         }
         let table = self.table(d.irt as u64) as *mut u32;
-        let entry = (data & 0xff) << 16 | IRTE_REMAP_EN;
+        let entry = (data & 0xff) << 16 | (crate::partition::msi_dest() & 0xff) << 8 | IRTE_REMAP_EN;
         let free = (0..IRT_ENTRIES).find(|&i| {
             let e = unsafe { table.add(i).read_volatile() };
             e == entry || e & IRTE_REMAP_EN == 0
@@ -733,14 +786,16 @@ impl AmdVi {
     fn domain_of(&self, id: u16) -> Option<Domain> {
         let e = self.dte(id);
         let (q0, q1) = unsafe { (e.read_volatile(), e.add(1).read_volatile()) };
-        (q0 & DTE_TV != 0 && q0 >> 9 & 7 != 0).then(|| Domain { id: q1 as u16, root: (q0 & PTE_ADDR) as usize, ..Domain::NONE })
+        // Another partition's domain is not ours to add to.
+        (q0 & DTE_TV != 0 && q0 >> 9 & 7 != 0 && (self.region.is_none() || self.domains.contains(&(q1 as u16 as u32))))
+            .then(|| Domain { id: q1 as u16, root: (q0 & PTE_ADDR) as usize, ..Domain::NONE })
     }
 
     /// A new, empty domain, for device ID `id` (named if one runs out).
     fn new_domain(&mut self, alloc: &mut Alloc, id: u16) -> Domain {
-        assert!(self.next_domain != 0, "l4h-root: iommu: out of domain IDs at device {:#06x}", id);
-        let d = Domain { id: self.next_domain, root: self.page(alloc).1, ..Domain::NONE };
-        self.next_domain = self.next_domain.wrapping_add(1);
+        assert!(!self.domains.is_empty(), "l4h-root: iommu: out of domain IDs at device {:#06x}", id);
+        let d = Domain { id: self.domains.start as u16, root: self.page(alloc).1, ..Domain::NONE };
+        self.domains.start += 1;
         // Translations the firmware may have cached under this ID.
         self.flush(d);
         d
@@ -851,7 +906,23 @@ impl AmdVi {
         }
     }
 
+    /// A shared unit: take its lock until the next sync, and the command
+    /// buffer's tail and completion count as the last holder left them.
+    fn acquire(&mut self, u: usize) {
+        let Some(s) = self.region else { return };
+        if self.units[u].locked {
+            return;
+        }
+        s.lock(u);
+        let tail = (self.r64(u, CMD_TAIL) & RING_MASK) as usize;
+        let unit = &mut self.units[u];
+        unit.locked = true;
+        unit.tail = tail;
+        unit.seq = unsafe { (unit.sem as *const u64).read_volatile() };
+    }
+
     fn command_to(&mut self, u: usize, cmd: [u32; 4]) {
+        self.acquire(u);
         let next = (self.units[u].tail + 16) % RING_BYTES;
         let end = l4h_host::ticks::now() + 1000 * self.ticks_per_ms;
         while self.r64(u, CMD_HEAD) & RING_MASK == next as u64 {
@@ -871,6 +942,7 @@ impl AmdVi {
     /// Wait until every IOMMU has carried out the commands before.
     fn sync(&mut self) {
         for u in 0..self.units.len() {
+            self.acquire(u);
             self.units[u].seq += 1;
             let (pa, seq) = (self.units[u].sem_pa as u64, self.units[u].seq);
             // Store `seq` at the unit's own semaphore.
@@ -883,12 +955,20 @@ impl AmdVi {
                 assert!(l4h_host::ticks::now() < end, "l4h-root: iommu {}: commands not completed", u);
                 core::hint::spin_loop();
             }
+            if let Some(s) = self.region {
+                self.units[u].locked = false;
+                s.unlock(u);
+            }
         }
     }
 
     /// Print what the IOMMUs logged: faults of devices that reached for
     /// memory they were not given, and errors.
+    /// With several partitions, partition 0 handles everyone's events.
     pub fn poll(&mut self) {
+        if self.region.is_some_and(|s| !s.primary) {
+            return;
+        }
         let mut printed = 0;
         for u in 0..self.units.len() {
             if self.r64(u, STATUS) & STATUS_EVT_OVERFLOW != 0 {
@@ -922,10 +1002,11 @@ impl AmdVi {
                         _ => "event",
                     };
                     log!(
-                        "l4h-root: iommu: {:02x}:{:02x}.{}: {} at {:#x} (domain {}, flags {:#x})",
+                        "l4h-root: iommu: {:02x}:{:02x}.{}: {} at {:#x} (domain {}, flags {:#x}){}",
                         id >> 8, (id >> 3) & 0x1f, id & 7, what, (e[3] as u64) << 32 | e[2] as u64,
-                        e[1] & 0xffff, (e[1] >> 16) & 0xfff
+                        e[1] & 0xffff, (e[1] >> 16) & 0xfff, crate::iommu::shared::OwnerNote(id as u16)
                     );
+
                 } else {
                     self.dropped += 1;
                 }
