@@ -3149,7 +3149,10 @@ CPU, and machines without MCFG.
 its first CPU first, so seL4 starts exactly those. Partition 0 keeps the
 I/O APICs, interrupt source overrides and the PCAT_COMPAT flag; the others
 have none and use MSI/MSI-X only. Root programs every MSI (and IRTE) for
-the partition's first CPU (`partition::msi_dest`).
+the partition's first CPU (`partition::msi_dest`): the boot CPU in
+partition 0, the one with the lowest APIC ID in the others. MSI addresses
+and the IRTEs root writes have 8-bit destinations, so the shim refuses a
+partition whose first CPU has an APIC ID above 255.
 
 **Memory.** seL4 x86_64 is linked at a physical address: kernel *k* is
 built for slot *k* at 16 MiB + *k* × 32 MiB (`L4H_KERNEL_SLOT`), where root's

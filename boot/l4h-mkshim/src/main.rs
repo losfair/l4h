@@ -467,6 +467,17 @@ fn assign_cpus(conf: &Conf, cpus: &[acpi::Cpu], bsp: usize, plans: &mut [Plan]) 
             p.cpus.insert(0, c);
         } else if k == 0 {
             fail(format_args!("partition 0 does not have the boot CPU (APIC ID {})", cpus[bsp].apic_id));
+        } else {
+            let i = (0..p.cpus.len()).min_by_key(|&i| cpus[p.cpus[i]].apic_id).unwrap();
+            let c = p.cpus.remove(i);
+            p.cpus.insert(0, c);
+        }
+        // The first CPU takes the partition's device interrupts, whose
+        // destination (an MSI's address, a VT-d or AMD-Vi remapping
+        // entry as root writes them) has 8 bits.
+        let first = cpus[p.cpus[0]].apic_id;
+        if first > 0xff {
+            fail(format_args!("partition {}: its first CPU has APIC ID {}, but device interrupts reach APIC IDs up to 255 only", k, first));
         }
         p.node = cpus[p.cpus[0]].node;
     }
