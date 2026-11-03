@@ -298,9 +298,10 @@ impl Vtd {
         // context table now: no other partition ever adds one.
         if let Some(d) = crate::partition::get().filter(|_| self.shared.is_some()) {
             for o in d.owners() {
-                let sid = self.requesters.requester(o.bdf);
-                if let Some(unit) = self.dmar.owner(sid) {
-                    self.context_table(alloc, unit, sid);
+                // The unit by the function, as attach() and domain()
+                // choose it; the table by the requester it reaches it as.
+                if let Some(unit) = self.dmar.owner(o.bdf) {
+                    self.context_table(alloc, unit, self.requesters.requester(o.bdf));
                 }
             }
         }
@@ -384,11 +385,13 @@ impl Vtd {
                 self.dmar.units[n].base, u.width, if self.intremap { "remapped" } else { "not remapped" });
         }
         self.state = abi::IOMMU_ON;
-        // Our functions only: the others read as absent.
+        // Our functions only: others' read as absent, or, the bridges
+        // above ours, as present but partition 0's to map.
         for r in 0..self.dmar.reserved.len() {
             let reserved = self.dmar.reserved[r];
             for sid in reserved.scope.first..=reserved.scope.last {
-                if pci.read32((sid >> 8) as u8, (sid >> 3 & 31) as u8, (sid & 7) as u8, 0) & 0xffff == 0xffff {
+                if pci.read32((sid >> 8) as u8, (sid >> 3 & 31) as u8, (sid & 7) as u8, 0) & 0xffff == 0xffff
+                    || !pci::ours(sid) {
                     continue;
                 }
                 let unit = self.dmar.owner(sid).expect("VT-d: RMRR device has no remapping unit");
