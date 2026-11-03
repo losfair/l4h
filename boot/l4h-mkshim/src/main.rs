@@ -598,13 +598,20 @@ fn place_memory(bi: &mut BootInfo, conf: &Conf, acpi: &acpi::Acpi, plans: &mut [
             unsafe { core::ptr::copy(m.start as *const u8, dst as *mut u8, r.len() as usize) };
             m.start = dst;
             m.end = dst + r.len();
-            originals.add(Range::new(io::align_down(r.start, 4096), align_up(r.end, 4096)));
+            // Its old place is RAM again (the slot it was in).
+            free.add(Range::new(io::align_down(r.start, 4096), align_up(r.end, 4096)));
         } else {
             originals.add(Range::new(io::align_down(m.start, 4096), align_up(m.end, 4096)));
         }
     }
     for p in plans.iter() {
         if !free.contains(p.slot) {
+            for e in bi.mmap.iter().filter(|e| e.base < p.slot.end && p.slot.start < e.base + e.len) {
+                println!("memory map: {:#x}-{:#x} type {}", e.base, e.base + e.len, e.kind);
+            }
+            for m in bi.mods.iter().filter(|m| m.start < p.slot.end && p.slot.start < m.end) {
+                println!("module {} at {:#x}-{:#x}", m.name.as_str(), m.start, m.end);
+            }
             fail(format_args!("kernel slot {:#x}-{:#x} is not free RAM", p.slot.start, p.slot.end));
         }
         free.remove(p.slot);

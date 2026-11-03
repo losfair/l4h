@@ -3115,7 +3115,7 @@ have none and use MSI/MSI-X only. Root programs every MSI (and IRTE) for
 the partition's first CPU (`partition::msi_dest`).
 
 **Memory.** seL4 x86_64 is linked at a physical address: kernel *k* is
-built for slot *k* at 1 MiB + *k* × 32 MiB (`L4H_KERNEL_SLOT`), where root's
+built for slot *k* at 16 MiB + *k* × 32 MiB (`L4H_KERNEL_SLOT`), where root's
 image follows it. Each partition's RAM is its slot, a low chunk below 4 GiB
 for its modules (seL4 loads root above them and copies them again), and
 its share of the rest, carved from its CPUs' NUMA node where it can. Its
@@ -3135,6 +3135,7 @@ partition 0's RAM.
 | 0034 | `tsc_mhz=`, `apic_khz=` | the shim's measurements: the PIT is global |
 | 0035 | `console_ring=paddr,size` | a secondary kernel prints to memory, not the serial port |
 | 0036 | `peers=`, `IRQControl_SendPeer` | a doorbell interrupt to another kernel's CPU |
+| 0037 | — | APs load their GDT's whole base in real mode: a kernel linked above 16 MiB got the wrong GDT |
 
 **Descriptor.** The boot module `l4h-partition` (`host/l4h-partition`)
 gives root its index and count, role, first CPU, PCI functions with the

@@ -1,0 +1,27 @@
+From 473406a3a642651da6d4111b2deea09a8844db94 Mon Sep 17 00:00:00 2001
+From: l4h <l4h@localhost>
+Date: Tue, 3 Nov 2026 02:11:33 -0800
+Subject: [PATCH] x86_64: load the APs' whole GDT base in real mode
+
+---
+ src/arch/x86/64/head.S | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/arch/x86/64/head.S b/src/arch/x86/64/head.S
+index cf3e85e..0e89983 100644
+--- a/src/arch/x86/64/head.S
++++ b/src/arch/x86/64/head.S
+@@ -372,7 +372,9 @@ BEGIN_FUNC(boot_cpu_start)
+     /* Set DS equal to CS and load GDTR register with GDT pointer. */
+     movw %cs, %ax
+     movw %ax, %ds
+-    lgdt _boot_gdt_ptr - boot_cpu_start
++    /* lgdtl: without the operand-size prefix, real mode loads 24 bits
++     * of the base, and a kernel linked above 16 MiB gets the wrong GDT. */
++    lgdtl _boot_gdt_ptr - boot_cpu_start
+ 
+     /* Enable protected mode. */
+     movl %cr0, %eax
+-- 
+2.47.3
+
