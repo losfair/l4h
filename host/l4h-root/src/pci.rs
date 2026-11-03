@@ -260,6 +260,7 @@ impl Pci {
             }
             ECAM_MAPPED[bdf as usize / 64].fetch_or(1 << (bdf % 64), core::sync::atomic::Ordering::Relaxed);
         }
+        info!("l4h-root: PCI configuration through ECAM");
         Pci { port: s as u64, ecam: true, shared_ports: false }
     }
 

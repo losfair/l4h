@@ -161,8 +161,9 @@ extern "C" fn shim_main(magic: u32, info: u64) -> ! {
     // Without MCFG (GCE's i440FX), PCI configuration through ports: the
     // partitions' roots then share them under a lock (ecam_base 0).
     let pci = pci::Pci::new(acpi.ecam());
-    if acpi.ecam().is_none() {
-        println!("no MCFG: PCI configuration through ports 0xcf8/0xcfc");
+    match acpi.ecam() {
+        Some((base, start, end)) => println!("PCI configuration through ECAM at {:#x}, buses {}-{}", base, start, end),
+        None => println!("no MCFG: PCI configuration through ports 0xcf8/0xcfc"),
     }
     let funcs = pci.scan();
 

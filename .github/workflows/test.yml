@@ -122,6 +122,12 @@ jobs:
         run: tests/run-vtdtest.sh --qemu
       - name: Partition message rings
         run: tests/run-ringtest.sh
+      - name: Multikernel partitions (PCI through ECAM)
+        run: tests/run-mktest.sh
+      - name: Multikernel partitions without MCFG (shared PCI ports)
+        run: MK_MACHINE=pc tests/run-mktest.sh
+      - name: Multikernel partitions sharing VT-d
+        run: L4H_QEMU_IOMMU=intel tests/run-mktest.sh
       - name: AMD-Vi shared PCI requester groups
         run: |
           python3 tests/vtd-net-qemu.py --iommu amd --topology pci
