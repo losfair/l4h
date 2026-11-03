@@ -6,7 +6,8 @@
 //! p0.cpus = node:0             # or: 4 (a count), 0-15 (CPU numbers), apic:0,2,4
 //! p0.mem  = 60G                # or M; partition 0 takes the rest by default
 //! p1.pci  = 0000:80:04.0, 0000:80:05.0
-//! link.p0-p1 = 1               # a virtual wire between the two netds
+//! link.p0-p1 = 1               # a virtual wire between the two netds, or
+//!                              # "uplink": on their switch 0, to share a NIC
 //! ```
 
 use l4h_partition::MAX_PARTITIONS;
@@ -34,7 +35,9 @@ pub struct Part {
 pub struct Conf {
     pub partitions: usize,
     pub parts: [Part; MAX_PARTITIONS],
-    pub links: Vec<(u8, u8), 32>,
+    /// Linked partitions (lower first), and whether the link joins their
+    /// uplink switches (`uplink`) rather than a switch of its own (`1`).
+    pub links: Vec<(u8, u8, bool), 32>,
 }
 
 fn bad(line: &str) -> ! {
@@ -82,8 +85,11 @@ impl Conf {
                 if a == b {
                     bad(line);
                 }
-                if value == "1" {
-                    c.links.must_push((a.min(b) as u8, a.max(b) as u8));
+                match value {
+                    "1" => c.links.must_push((a.min(b) as u8, a.max(b) as u8, false)),
+                    "uplink" => c.links.must_push((a.min(b) as u8, a.max(b) as u8, true)),
+                    "0" => {}
+                    _ => bad(line),
                 }
                 continue;
             }
@@ -119,7 +125,7 @@ impl Conf {
                 _ => bad(line),
             }
         }
-        for &(a, b) in c.links.iter() {
+        for &(a, b, _) in c.links.iter() {
             if b as usize >= c.partitions {
                 crate::fail(format_args!("l4h-mk.conf: link p{}-p{} names a partition beyond {}", a, b, c.partitions));
             }

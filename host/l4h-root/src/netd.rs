@@ -128,7 +128,7 @@ pub struct SteerRule {
 }
 
 /// A link to another partition (`link.pA-pB` in l4h-mk.conf, DESIGN.md
-/// §7): a netd port whose client is root, wired to the matching port of
+/// §11.4): a netd port whose client is root, wired to the matching port of
 /// the peer's netd through their channel.  Root copies each frame once
 /// each way, between the port's slots and the channel's ring: only root
 /// can ring the peer's doorbell, and the channel's rings also carry

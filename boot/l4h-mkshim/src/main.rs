@@ -215,12 +215,12 @@ extern "C" fn shim_main(magic: u32, info: u64) -> ! {
     let mut next_channel = out.start + part::IOMMU_REGION_SIZE + OUT_BLOCK * MAX_PARTITIONS as u64;
     let mut pairs: Vec<(usize, usize, u32), 64> = Vec::new();
     for k in 1..n {
-        let link = conf.links.iter().any(|&(a, b)| a == 0 && b as usize == k);
-        pairs.must_push((0, k, part::CHANNEL_CONTROL | if link { part::CHANNEL_LINK } else { 0 }));
+        let link = conf.links.iter().find(|&&(a, b, _)| a == 0 && b as usize == k).map(|&(_, _, up)| link_kind(up));
+        pairs.must_push((0, k, part::CHANNEL_CONTROL | link.unwrap_or(0)));
     }
-    for &(a, b) in conf.links.iter() {
+    for &(a, b, up) in conf.links.iter() {
         if a != 0 {
-            pairs.must_push((a as usize, b as usize, part::CHANNEL_LINK));
+            pairs.must_push((a as usize, b as usize, link_kind(up)));
         }
     }
     for &(a, b, kind) in pairs.iter() {
@@ -377,6 +377,10 @@ fn collect_modules(bi: &BootInfo, plans: &mut [Plan]) {
             }
         }
     }
+}
+
+fn link_kind(uplink: bool) -> u32 {
+    part::CHANNEL_LINK | if uplink { part::CHANNEL_LINK_UPLINK } else { 0 }
 }
 
 /// The value of `key=` on a command line.

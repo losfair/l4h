@@ -219,9 +219,11 @@ impl Channels {
         true
     }
 
-    /// The peers with a link channel (CHANNEL_LINK).
-    pub fn links(&self) -> impl Iterator<Item = u32> + '_ {
-        self.chans.iter().filter(|c| c.desc.kind & part::CHANNEL_LINK != 0).map(|c| c.desc.peer)
+    /// The peers with a link channel (CHANNEL_LINK), and whether the link
+    /// joins switch 0 (CHANNEL_LINK_UPLINK).
+    pub fn links(&self) -> impl Iterator<Item = (u32, bool)> + '_ {
+        self.chans.iter().filter(|c| c.desc.kind & part::CHANNEL_LINK != 0)
+            .map(|c| (c.desc.peer, c.desc.kind & part::CHANNEL_LINK_UPLINK != 0))
     }
 
     /// The partitions heard from within the last few heartbeats, a bit

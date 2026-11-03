@@ -516,13 +516,14 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
 /// notification, which link ports signal.
 fn dom0_plan(h: &mut Host, ntfn: cap::Notification) -> Dom0Plan {
     let mut plan = Dom0Plan::default();
-    let mut links = ArrayVec::<u32, { l4h_partition::MAX_CHANNELS }>::new();
-    for peer in h.channels.iter().flat_map(|c| c.links()) {
-        links.must_push(peer);
+    let mut links = ArrayVec::<(u32, bool), { l4h_partition::MAX_CHANNELS }>::new();
+    for link in h.channels.iter().flat_map(|c| c.links()) {
+        links.must_push(link);
     }
     // By default, room for full receive rings on all of dom0's vNICs (one
     // per uplink switch it is given, one per internal switch, one per link).
-    let nics = h.cfg.dom0_nics + h.cfg.uplink2_nic.is_some() as usize + h.cfg.dom0_internal_switches + links.len();
+    let nics = h.cfg.dom0_nics + h.cfg.uplink2_nic.is_some() as usize + h.cfg.dom0_internal_switches
+        + links.iter().filter(|&&(_, uplink)| !uplink).count();
     plan.io_pool = match h.cfg.dom0_io_pool_mb {
         0 => l4h_host::iopool::for_nics(nics, vmmgr::IO_POOL_DEFAULT).min(256 << 20),
         mb => mb << 20,
@@ -615,14 +616,19 @@ fn dom0_plan(h: &mut Host, ntfn: cap::Notification) -> Dom0Plan {
     }
     // Each link to another partition gets a switch of its own, with a
     // vNIC of dom0's: partitions meet where their dom0s connect them,
-    // never on each other's uplink network.
-    for &peer in links.iter() {
-        let sw = h.netd.create_switch();
+    // never on each other's uplink network.  An `uplink` link instead
+    // joins switch 0 on both sides, where dom0's first vNIC (and the
+    // uplink NIC, on the side that has one) are: partitions without a NIC
+    // of their own share the network of one that has.
+    for &(peer, uplink) in links.iter() {
+        let sw = if uplink { 0 } else { h.netd.create_switch() };
         match h.netd.add_link(peer, sw, ntfn, &mut h.alloc) {
             Ok(p) => info!("l4h-root: link to partition {} on switch {} (port {})", peer, sw, p),
             Err(e) => log!("l4h-root: no link to partition {}: error {}", peer, e),
         }
-        add_nic(sw, 0);
+        if !uplink {
+            add_nic(sw, 0);
+        }
     }
     // Reserve the whole plan before vmmgr can attach anything. Reservations
     // also cover placeholders and survive dom0 restarts, so no system range
