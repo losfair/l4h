@@ -107,6 +107,9 @@ regions! {
     PARTITION_CHANNELS = 0x6200_0100_0000, 8 * 256 * 1024;
     /// The IOMMU state all partitions share (DESIGN.md §4.6).
     IOMMU_SHARED = 0x6200_0200_0000, 8 * MIB;
+    /// netd's ports for the links to other partitions, whose client is
+    /// root (netd.rs): one netd port's memory each.
+    LINK_PORTS = 0x6200_1000_0000, l4h_partition::MAX_CHANNELS * 4 * MIB;
     /// IOMMU registers: 16 KiB per AMD-Vi unit, 64 KiB per VT-d unit.
     IOMMU_MMIO = 0x7800_0000_0000, MIB;
     /// The IOMMUs' device table, I/O page tables, command buffers and

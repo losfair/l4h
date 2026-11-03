@@ -110,8 +110,8 @@ pub struct Channel {
 /// `Channel::kind`: control traffic (heartbeat, console, clock, RTC,
 /// TPM) between the primary and a secondary.
 pub const CHANNEL_CONTROL: u32 = 1;
-/// A virtual wire between the two partitions' netd switch 0
-/// (`link.pA-pB = 1` in l4h-mk.conf).
+/// A virtual wire between the two partitions' netds (`link.pA-pB = 1` in
+/// l4h-mk.conf): MSG_FRAME messages.
 pub const CHANNEL_LINK: u32 = 2;
 
 /// The IOMMU state shared by all partitions (DESIGN.md §11.4): `size`
