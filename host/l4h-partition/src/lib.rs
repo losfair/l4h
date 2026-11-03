@@ -310,6 +310,10 @@ pub struct IommuControl {
     pub intremap: core::sync::atomic::AtomicU32,
     pub _pad: [u32; 13],
     pub locks: [IommuLock; IOMMU_MAX_UNITS],
+    /// Around PCI configuration through ports 0xcf8/0xcfc, an address
+    /// then the data, on machines without ECAM (no MCFG, e.g. GCE's
+    /// i440FX): every partition's root takes it for each access.
+    pub pci: IommuLock,
 }
 
 pub const IOMMU_READY_ON: u32 = 1;

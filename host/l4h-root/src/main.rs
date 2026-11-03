@@ -388,6 +388,10 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     // From here on, memory comes from memd.
     let mut memd = memd::spawn(&mut alloc, &mut wins.a, &mut asids, &info);
 
+    // The region partitions share (IOMMU tables, locks): PCI configuration
+    // without ECAM takes a lock in it.
+    #[cfg(target_arch = "x86_64")]
+    iommu::shared::map(&mut alloc, &mut devmem, info.tsc_hz / 1000);
     // PCI devices: disks can be passed through to guests.
     let pci = pci::Pci::new(&mut alloc, &mut devmem);
     // The IOMMU before any device is enabled: from here on, a device
