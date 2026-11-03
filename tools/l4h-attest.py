@@ -37,6 +37,8 @@
       Check a report (l4hctl attest report -o) against the host evidence
       (l4hctl attest evidence -o), and print what they claim as JSON.
       Without --ak-name the attestation key is not known to be a TPM's.
+      A multikernel host's report and evidence name the partition the
+      guest runs in (version 2); verify prints it as "partition".
   l4h-attest.py make-credential EVIDENCE SECRET_HEX -o FILE [--ek PEM]
       A credential for the host's attestation key, encrypted to its EK
       (TPM2_MakeCredential; the format of tpm2_makecredential).  A guest
@@ -63,6 +65,9 @@ from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 KEY_DOMAIN = b"l4h-trustd-key-v1"
+# A multikernel partition's key: the domain, the partition (u32
+# little-endian), then the key.
+KEY_DOMAIN_PARTITION = b"l4h-trustd-key-v2"
 KEY_PCR = 15
 
 
@@ -282,10 +287,42 @@ def launch_digest(kernel, initrd, cmdline):
 # ---- verify
 
 
+def key_binding(point_bytes, partition):
+    """What the quote's qualifying data is for a host key."""
+    if partition is None:
+        return hashlib.sha256(KEY_DOMAIN + point_bytes).digest()
+    return hashlib.sha256(KEY_DOMAIN_PARTITION + struct.pack("<I", partition) + point_bytes).digest()
+
+
+def key_chain(ev, partition):
+    """PCR 15 as a multikernel partition's key was quoted: the keys the
+    primary's trustd extended before it, one per partition, the primary's
+    first (the primary quotes its own key before serving the others)."""
+    chain = ev.get("chain")
+    if not isinstance(chain, list):
+        raise Fail("multikernel evidence without its key chain")
+    pcr, seen = bytes(32), {partition}
+    for i, e in enumerate(chain):
+        if not (isinstance(e, list) and len(e) == 2 and isinstance(e[0], int) and isinstance(e[1], bytes)
+                and len(e[1]) == 65 and e[1][0] == 4):
+            raise Fail("malformed key chain")
+        k, pt = e
+        if k in seen:
+            raise Fail("key chain has two keys of partition %d" % k)
+        if i == 0 and k != 0:
+            raise Fail("key chain does not start with partition 0's key")
+        seen.add(k)
+        pcr = hashlib.sha256(pcr + key_binding(pt, k)).digest()
+    return pcr, [e[0] for e in chain]
+
+
 def check_evidence(ev, pins, ak_name, ek_ca):
     """The host's signing key and what the evidence shows about it."""
-    if ev.get("v") != 1:
+    if ev.get("v") not in (1, 2):
         raise Fail("unknown evidence version")
+    partition = ev.get("partition") if ev["v"] == 2 else None
+    if ev["v"] == 2 and not (isinstance(partition, int) and 0 <= partition < 8):
+        raise Fail("multikernel evidence without a valid partition")
     ak = ev["ak"]
     attrs, ak_key = parse_public(ak)
     # A restricted signing key of the TPM only signs what the TPM made.
@@ -302,16 +339,26 @@ def check_evidence(ev, pins, ak_name, ek_ca):
         raise Fail("quote signature does not verify")
     q = parse_quote(ev["quote"])
     key = cose_p256(ev["key"])
-    if q["extra"] != hashlib.sha256(KEY_DOMAIN + point(key)).digest():
+    if q["extra"] != key_binding(point(key), partition):
         raise Fail("the quote is not over this host key")
     pcrs = ev["pcrs"]
     if any(alg != 0x000B for alg, _ in q["pcrs"]) or [i for _, i in q["pcrs"]] != sorted(pcrs):
         raise Fail("quoted PCRs differ from the evidence's")
     if hashlib.sha256(b"".join(pcrs[i] for i in sorted(pcrs))).digest() != q["digest"]:
         raise Fail("PCR values do not match the quote")
-    # Quoted before trustd extended it: the first key since TPM reset.
-    if pcrs.get(KEY_PCR) != bytes(32):
-        raise Fail("PCR %d is not zero: not the first host key of this boot" % KEY_PCR)
+    # Quoted before trustd extended it: the first key since TPM reset, or
+    # on a multikernel host the first of this partition, after the keys
+    # the evidence lists.
+    if partition is None:
+        if pcrs.get(KEY_PCR) != bytes(32):
+            raise Fail("PCR %d is not zero: not the first host key of this boot" % KEY_PCR)
+        before = None
+    else:
+        want, before = key_chain(ev, partition)
+        if partition == 0 and before:
+            raise Fail("partition 0's key is not the first of this boot")
+        if pcrs.get(KEY_PCR) != want:
+            raise Fail("PCR %d is not the chain of the %d keys before partition %d's" % (KEY_PCR, len(before), partition))
     for i, want in pins.items():
         if pcrs.get(i) != want:
             raise Fail("PCR %d is %s, not %s" % (i, pcrs.get(i, b"").hex(), want.hex()))
@@ -330,6 +377,7 @@ def check_evidence(ev, pins, ak_name, ek_ca):
         raise Fail("no EK certificate in the evidence")
     host = {
         "key": hashlib.sha256(point(key)).hexdigest(),
+        **({} if partition is None else {"partition": partition, "keys_before": before}),
         "ak_name": name.hex(),
         "ak_pinned": ak_name is not None,
         "reset_count": q["reset_count"],
@@ -337,7 +385,7 @@ def check_evidence(ev, pins, ak_name, ek_ca):
         "pcrs": {str(i): pcrs[i].hex() for i in sorted(pcrs)},
         "ek_cert": ek,
     }
-    return key, host
+    return key, partition, host
 
 
 HOST_FLAGS = {"console-in": 0, "console-out": 1}
@@ -395,7 +443,7 @@ def check_flags(claims, deny_taint, require_seal):
     return {"taint_bits": flag_list(taint), "seal_bits": flag_list(seal)}
 
 
-def check_report(rep, key, data, launch, deny_taint="console-in", require_seal=""):
+def check_report(rep, key, data, launch, deny_taint="console-in", require_seal="", partition=None):
     if not (isinstance(rep, tuple) and rep[:2] == ("tag", 18)) or len(rep[2]) != 4:
         raise Fail("report is not a COSE_Sign1")
     protected, _unprotected, payload, sig = rep[2]
@@ -409,8 +457,11 @@ def check_report(rep, key, data, launch, deny_taint="console-in", require_seal="
     except InvalidSignature:
         raise Fail("report signature does not verify")
     c = cbor_decode(payload)
-    if c.get("v") != 1:
+    if c.get("v") not in (1, 2):
         raise Fail("unknown report version")
+    # Version 2: a multikernel partition's, as its evidence says.
+    if (c["v"] == 2) != (partition is not None) or c.get("partition") != partition:
+        raise Fail("report is for partition %s, the evidence for %s" % (c.get("partition"), partition))
     if c["host"] != hashlib.sha256(point(key)).digest():
         raise Fail("report names another host key")
     if data is not None and c["data"] != data.ljust(64, b"\0"):
@@ -496,10 +547,11 @@ def main():
                 pins[int(i)] = bytes.fromhex(val)
             ev = cbor_decode(open(a.evidence, "rb").read())
             ak_name = bytes.fromhex(a.ak_name) if a.ak_name else None
-            key, host = check_evidence(ev, pins, ak_name, a.ek_ca)
+            key, partition, host = check_evidence(ev, pins, ak_name, a.ek_ca)
             data = bytes.fromhex(a.data) if a.data is not None else None
             launch = bytes.fromhex(a.launch) if a.launch else None
-            guest = check_report(cbor_decode(open(a.report, "rb").read()), key, data, launch, a.deny_taint, a.require_seal)
+            guest = check_report(cbor_decode(open(a.report, "rb").read()), key, data, launch, a.deny_taint, a.require_seal,
+                                 partition)
             print(json.dumps({"host": host, "guest": guest}, indent=2))
             if ak_name is None:
                 print("l4h-attest: warning: attestation key not pinned (--ak-name)", file=sys.stderr)

@@ -153,6 +153,9 @@ pub const ROOT_CALL_VMM_READY: u64 = 3;
 pub const ROOT_CALL_HW: u64 = 5;
 /// trustd: it answered guest MR0's request; raise its device's event.
 pub const ROOT_CALL_ATTEST_DONE: u64 = 6;
+/// trustd: send its relay outbox (MR1 bytes) to partition MR0's trustd
+/// (trust::RELAY_*).  Returns 0, or u64::MAX if root cannot.
+pub const ROOT_CALL_RELAY: u64 = 7;
 
 /// Badge bit set on every endpoint capability l4h-root gives to a guest
 /// for l4h-vmm's service endpoint; notification badges never have it.

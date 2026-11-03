@@ -1,10 +1,14 @@
 #!/bin/sh
 # dom0 init for tests/run-mktest.sh: one per partition, MKP the partition.
+# With attest_nonce= (MK_ATTEST=1), dom0's report, the evidence, the VM's
+# report and (with /bin/cred) the credential's secret go to the start of
+# the partition's disk as a tar archive.
 mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
 mount -t tmpfs tmp /tmp
 P=${MKP:-0}
+nonce=$(sed -n 's/.*attest_nonce=\([0-9a-f]*\).*/\1/p' /proc/cmdline)
 say() { echo "MKTEST p$P: $*"; }
 fail() { say "FAIL: $*"; sleep 100000; }
 say start
@@ -24,8 +28,17 @@ if [ -n "${MKPEER:-}" ]; then
     ip link set "$lif" up
     ip addr add "192.168.100.$((10 + P))/24" dev "$lif" || fail "link address"
 fi
+if [ -n "$nonce" ]; then
+    mkdir -p /tmp/att
+    l4hctl attest report "$nonce" -o /tmp/att/dom0.report || fail "dom0 report"
+    l4hctl attest evidence -o /tmp/att/evidence || fail "evidence"
+    if [ -f /bin/cred ]; then
+        l4hctl attest activate /bin/cred > /tmp/att/secret || fail "activate the credential"
+    fi
+fi
 # A VM of its own, which only this partition's dom0 sees.
-id=$(l4hctl create "vm-p$P" --initrd /bin/vm.cpio.gz --mem 96 --cmdline "console=hvc0 MKP=$P") || fail "create a VM"
+id=$(l4hctl create "vm-p$P" --initrd /bin/vm.cpio.gz --mem 96 \
+    --cmdline "console=hvc0 MKP=$P${nonce:+ attest_nonce=$nonce}") || fail "create a VM"
 l4hctl console "$id" --until "MKVM: done" --timeout 60 > /tmp/vm || fail "the VM did not finish"
 [ "$(l4hctl list | grep -c vm-p)" = 1 ] || fail "dom0 sees another partition's VM"
 say "vm ok"
@@ -54,6 +67,14 @@ if [ -n "$MKIOMMU" ]; then
     done
     say "pool drained"
     l4hctl iommu | sed "s/^/MKTEST p$P: iommu /"
+fi
+if [ -n "$nonce" ]; then
+    # Through the disk: on the serial port other cores' output can
+    # interleave with a long line.
+    sed -n 's/^MKVM: report \([0-9a-f]*\).*/\1/p' /tmp/vm > /tmp/att/vm.report.hex
+    [ -s /tmp/att/vm.report.hex ] || fail "no report from the VM"
+    tar -cf /dev/vda -C /tmp/att . && sync || fail "save the attestation"
+    say "attestation saved"
 fi
 if [ "$P" != 0 ]; then
     if l4hctl host-reboot 2>/tmp/err; then fail "host-reboot accepted"; fi

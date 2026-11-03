@@ -5,7 +5,10 @@
 //! has answered (vmmgr raises it), and the hardware accesses of its AML
 //! interpreter.
 //!
-//! Only x86 finds a TPM (in ACPI) so far; other hosts run flags only.
+//! Only x86 finds a TPM (in ACPI) so far; other hosts run flags only.  In
+//! a multikernel secondary, which has no TPM, trustd has the primary's
+//! trustd quote its key and run its ActivateCredential, through the relay
+//! pages and the control channel (trust::RELAY_*).
 #![cfg_attr(not(target_arch = "x86_64"), allow(dead_code, unused_imports))]
 
 
@@ -43,6 +46,9 @@ pub struct Trustd {
     flags_ep: cap::Endpoint,
     no_reports: bool,
     failed: bool,
+    /// Multikernel: the kick, badged RELAY_BADGE, to tell trustd about a
+    /// message in its relay inbox.
+    relay: Option<cap::Notification>,
     /// The request page of each guest id, mapped in trustd.
     pages: [cap::Granule; trust::MAX_RECORDS],
     /// Guests signal it, badged with trust::kick_badge(id).
@@ -107,6 +113,8 @@ impl Layout {
             start_va: va(self.start_bell),
             reply_va: va(self.reply_bell),
             aml_size: aml_size as u64,
+            partition: crate::partition::get().map_or(0, |d| d.index),
+            partitions: crate::partition::get().map_or(1, |d| d.count),
         }
     }
 }
@@ -200,6 +208,13 @@ pub fn spawn(
     }
     #[cfg(target_arch = "x86_64")]
     {
+        // A secondary's TPM is the primary's, over the control channel.
+        let to_primary = crate::partition::get()
+            .is_some_and(|d| d.channels().iter().any(|c| c.peer == 0 && c.kind & l4h_partition::CHANNEL_CONTROL != 0));
+        if crate::partition::secondary() {
+            let iface = if to_primary { trust::TPM_REMOTE } else { trust::TPM_NONE };
+            return without_tpm(alloc, win, asids, info, frames, iface);
+        }
         let mut frames = frames;
         let mut phys = crate::acpi::Phys::new(alloc, devmem, win, &mut frames);
         let Some(l) = find_tpm(bootinfo, &mut phys) else {
@@ -297,13 +312,24 @@ fn flags_only(
     alloc: &mut Alloc, win: &mut Window, asids: &mut AsidPools, info: &HostInfo,
     #[cfg(target_arch = "x86_64")] frames: crate::acpi::Frames,
 ) -> Option<Trustd> {
-    let (comp, arena, keep) = create(&Layout::default().config(0), alloc, win, asids, info, 0)?;
+    without_tpm(alloc, win, asids, info, #[cfg(target_arch = "x86_64")] frames, trust::TPM_NONE)
+}
+
+/// trustd with no TPM of its own: flags only, or (TPM_REMOTE) the
+/// primary's TPM through the relay.
+fn without_tpm(
+    alloc: &mut Alloc, win: &mut Window, asids: &mut AsidPools, info: &HostInfo,
+    #[cfg(target_arch = "x86_64")] frames: crate::acpi::Frames,
+    iface: u32,
+) -> Option<Trustd> {
+    let cfg = TrustdConfig { iface, ..Layout::default().config(0) };
+    let (comp, arena, keep) = create(&cfg, alloc, win, asids, info, 0)?;
     let mut next = 0;
     finish(comp, arena, alloc, &mut || {
         let slot = keep.absolute_cptr_from_bits_with_depth(next, KEEP_BITS);
         next += 1;
         slot
-    }, info, true, #[cfg(target_arch = "x86_64")] frames)
+    }, info, iface == trust::TPM_NONE, #[cfg(target_arch = "x86_64")] frames)
 }
 
 /// Create trustd with configuration `cfg`, and the CNode that keeps its
@@ -372,6 +398,19 @@ fn finish(
     });
     let kick = arena.object_cap::<cap_type::Notification>(alloc, ObjectBlueprint::Notification);
     comp.give(trust::SLOT_KICK, kick, CapRights::all());
+    // The relay pages, shared with root, when there are other partitions.
+    let relay = crate::partition::get().filter(|d| d.count > 1).map(|_| {
+        for p in 0..trust::RELAY_PAGES {
+            let f = arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP);
+            comp.map_copy(alloc, &mut arena, &abs_of(f), trust::RELAY_VA + p * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep());
+            map_frame(&mut ObjCtx::global(alloc), sel4::init_thread::slot::VSPACE.cap(), f,
+                crate::layout::TRUSTD_RELAY.base + p * PAGE, CapRights::read_write(), VmAttributes::DEFAULT);
+        }
+        let slot = alloc.slots.alloc();
+        let badged = sel4::init_thread::Slot::<cap_type::Notification>::from_index(slot).cap();
+        abs_of(badged).mint(&abs_of(kick), CapRights::write_only(), trust::RELAY_BADGE).expect("relay kick");
+        badged
+    });
     let flags = core::array::from_fn(|p| {
         let f = arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP);
         comp.map_copy(alloc, &mut arena, &abs_of(f), trust::FLAGS_VA + p * PAGE, CapRights::read_only(), VmAttributes::DEFAULT, keep());
@@ -395,7 +434,7 @@ fn finish(
     flags_ep.call(sel4::MessageInfo::new(0, 0, 0, 8));
     bootstrap.unbind().expect("passive flags server");
     Some(Trustd { comp, arena, registry: REGISTRY_VA as *mut GuestRecord,
-        flags_ep, no_reports, failed: false, pages, kick, flags,
+        flags_ep, no_reports, failed: false, relay, pages, kick, flags,
         #[cfg(target_arch = "x86_64")] frames })
 }
 
@@ -603,5 +642,55 @@ fn flags_thread(c: &Component, alloc: &mut Alloc, arena: &mut Arena, info: &Host
     sc
 }
 
-/// A trustd message from another partition's root (channel.rs).
-pub fn channel_message(_h: &mut Host, _peer: u32, _ty: u32, _msg: &[u8]) {}
+/// The relay page at `off` in root.
+fn relay_va(off: usize) -> usize {
+    crate::layout::TRUSTD_RELAY.base + off
+}
+
+/// A trustd message from partition `peer` (channel.rs): requests reach
+/// the primary, replies the secondaries.  Into the peer's inbox slot,
+/// replacing what trustd has not read (a request is repeated until
+/// answered).
+pub fn channel_message(h: &mut Host, peer: u32, ty: u32, msg: &[u8]) {
+    let want = if crate::partition::secondary() { l4h_partition::MSG_TPM_REPLY } else { l4h_partition::MSG_TPM_REQUEST };
+    let Some(relay) = h.trustd.as_ref().filter(|t| !t.failed).and_then(|t| t.relay) else { return };
+    if ty != want || peer as usize >= trust::MAX_PARTITIONS || msg.len() > trust::RELAY_MSG_MAX {
+        return;
+    }
+    let va = relay_va(trust::relay_slot_va(peer as usize) - trust::RELAY_VA);
+    let slot = unsafe { &*(va as *const trust::RelaySlot) };
+    use core::sync::atomic::Ordering;
+    let seq = slot.seq.load(Ordering::Relaxed);
+    slot.seq.store(seq | 1, Ordering::Relaxed);
+    core::sync::atomic::fence(Ordering::Release);
+    unsafe {
+        core::ptr::copy_nonoverlapping(msg.as_ptr(), (va + trust::RELAY_SLOT_HEADER) as *mut u8, msg.len());
+    }
+    slot.len.store(msg.len() as u32, Ordering::Relaxed);
+    slot.seq.store((seq | 1) + 1, Ordering::Release);
+    relay.signal();
+}
+
+/// ROOT_CALL_RELAY from trustd: its outbox (MR1 bytes) to partition MR0.
+pub fn relay(h: &mut Host) -> u64 {
+    let (peer, len) = (mr(0) as u32, mr(1) as usize);
+    let secondary = crate::partition::secondary();
+    let ty = if secondary { l4h_partition::MSG_TPM_REQUEST } else { l4h_partition::MSG_TPM_REPLY };
+    // Secondaries ask only the primary, which answers only them.
+    let (Some(cs), true) = (h.channels.as_ref(), h.trustd.as_ref().is_some_and(|t| t.relay.is_some())) else { return u64::MAX };
+    if len > trust::RELAY_MSG_MAX || (secondary && peer != 0) || (!secondary && peer == 0) {
+        return u64::MAX;
+    }
+    let msg = unsafe { core::slice::from_raw_parts(relay_va(trust::RELAY_SLOT_HEADER) as *const u8, len) };
+    if cs.send(peer, ty, &[msg]) { 0 } else { u64::MAX }
+}
+
+/// Root's timer: kick trustd while it waits for an answer from another
+/// partition, so that it can ask again or give up.
+pub fn tick(h: &mut Host) {
+    let Some(relay) = h.trustd.as_ref().filter(|t| !t.failed).and_then(|t| t.relay) else { return };
+    let out = unsafe { &*(relay_va(0) as *const trust::RelaySlot) };
+    if out.wake.load(core::sync::atomic::Ordering::Relaxed) != 0 {
+        relay.signal();
+    }
+}

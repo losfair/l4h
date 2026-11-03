@@ -1,5 +1,6 @@
 #!/bin/sh
-# A VM for tests/run-mktest.sh.
+# A VM for tests/run-mktest.sh; with attest_nonce= (MK_ATTEST=1) it also
+# prints a report on itself.
 mount -t proc proc /proc
 echo "MKVM: partition ${MKP:-?}, $(nproc) CPU(s), $(sed -n 's/MemTotal: *//p' /proc/meminfo)"
 # With an IOMMU the VM gets a host disk: its I/O pool is DMA the
@@ -14,6 +15,12 @@ if [ -n "$MKDISK" ]; then
     else
         echo "MKVM: disk FAIL"
     fi
+fi
+nonce=$(sed -n 's/.*attest_nonce=\([0-9a-f]*\).*/\1/p' /proc/cmdline)
+if [ -n "$nonce" ]; then
+    mount -t sysfs sys /sys
+    mount -t devtmpfs dev /dev
+    echo "MKVM: report $(l4hctl attest report "$nonce")"
 fi
 echo "MKVM: done"
 poweroff -f

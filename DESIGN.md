@@ -2652,6 +2652,39 @@ configfs-tsm only when reports work; `l4hctl attest report` says `no TPM:
 flags only`. Local seals still work, but have no remote proof. A later TPM
 command failure returns `-EIO`.
 
+**Multikernel.** On a machine split into partitions (§11.3) only
+partition 0 has the TPM. Every partition's trustd still has its own key K;
+a secondary's comes from RDRAND, and partition 0's trustd quotes it and
+runs the secondary's ActivateCredential calls (the relay):
+
+- **Transport.** trustd writes a request into a relay page it shares with
+  root and calls root (`ROOT_CALL_RELAY`), which sends it over the control
+  channel (`MSG_TPM_REQUEST`); the other root writes it into the sender's
+  inbox slot there and kicks trustd (badge bit 63, also guest 63's kick,
+  which is only a hint). Answers go back as `MSG_TPM_REPLY`. Channels
+  never wait and can lose messages, so a request carries an id and is sent
+  again every second (key) or five seconds (ActivateCredential) until its
+  answer comes, for at most two minutes or 20 s; partition 0 answers a
+  repeated id from what it kept, without using the TPM again. A secondary
+  has one request out at a time and keeps serving other guests meanwhile
+  (root kicks it on its timer while it waits); only guests that need the
+  answer wait. If partition 0 is dead or has no TPM, the secondary ends up
+  flags only.
+- **PCR 15.** The binding becomes `SHA-256("l4h-trustd-key-v2" ‖
+  partition (u32 LE) ‖ K)`. Partition 0 quotes and extends its own key
+  first, then each secondary's once, in the order they ask (partitions
+  boot in parallel); a second, different key from a partition is refused.
+  A key's quote therefore shows PCR 15 as the chain of the keys extended
+  before it, and its evidence lists them (`chain`: [partition, K] pairs).
+  The verifier recomputes the chain and checks that it starts with
+  partition 0, has at most one key per partition and none of the
+  evidence's partition, so each partition's key is the only one it got in
+  this boot.
+- **Format.** Reports and evidence are version 2 and carry `partition`;
+  single-kernel hosts keep version 1. `l4h-attest.py` accepts both, checks
+  that a report's partition is its evidence's, and prints the partition and
+  the partitions whose keys came before.
+
 **TPM interfaces**, following Linux's `tpm_crb` and `tpm_tis`:
 
 - **FIFO (TIS)**, start method 6: locality 0's registers at the TPM2
@@ -2717,7 +2750,10 @@ boot GRUB replaces QEMU's TPM2 table with one for start method 2 and adds
 an SSDT (`tests/ftpm`) with an `MSFT0101` device whose `_DSM` does what the
 PSP firmware would: take the locality, start the command, wait for it, and
 count on QEMU's debug port. QEMU ignores the start bit without a locality,
-so a command only runs if trustd ran the `_DSM`. `tools/mkefi.sh` swaps the
+so a command only runs if trustd ran the `_DSM`. `MK_ATTEST=1
+tests/run-mktest.sh` boots two partitions with swtpm, verifies dom0's and
+a VM's reports in each against its partition's evidence, and activates a
+credential in each on a second boot. `tools/mkefi.sh` swaps the
 tables with `L4H_ACPI_TABLES` and `L4H_ACPI_EXCLUDE`, which can also work
 around broken firmware tables.
 

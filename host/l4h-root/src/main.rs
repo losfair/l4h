@@ -735,6 +735,7 @@ fn serve(h: &mut Host, reply_slot: ReplySlot) -> ! {
                     r.drain();
                 }
                 channel::tick(h);
+                trustd::tick(h);
                 h.iommu.poll();
                 if h.cfg.watchdog_secs != 0 && rdtsc() >= next_watchdog {
                     watchdog_dump(h);
@@ -781,6 +782,7 @@ fn component_call(h: &mut Host, badge: u64, info: &sel4::MessageInfo) -> Option<
     };
     match info.label() {
         host::ROOT_CALL_HW if id == trustd::TRUSTD_ID => reply(trustd::hw(h)),
+        host::ROOT_CALL_RELAY if id == trustd::TRUSTD_ID => reply(trustd::relay(h)),
         host::ROOT_CALL_ATTEST_DONE if id == trustd::TRUSTD_ID => {
             trustd::done(h, mr(0) as usize);
             reply(0)
