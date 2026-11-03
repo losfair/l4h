@@ -194,6 +194,15 @@ static ECAM_MAPPED: [core::sync::atomic::AtomicU64; 1024] = [const { core::sync:
 #[cfg(target_arch = "x86_64")]
 static ECAM_WRITABLE: [core::sync::atomic::AtomicU64; 1024] = [const { core::sync::atomic::AtomicU64::new(0) }; 1024];
 
+/// Whether function `bdf` is this partition's (always, with the machine
+/// to itself): another partition's may read as present but is not ours
+/// to program.
+#[cfg(target_arch = "x86_64")]
+pub fn ours(bdf: u16) -> bool {
+    crate::partition::get().is_none()
+        || ECAM_WRITABLE[bdf as usize / 64].load(core::sync::atomic::Ordering::Relaxed) & (1 << (bdf % 64)) != 0
+}
+
 #[cfg(target_arch = "x86_64")]
 impl Pci {
     pub fn new(alloc: &mut Alloc, _devmem: &mut crate::devmem::DevMem) -> Self {
@@ -214,15 +223,18 @@ impl Pci {
             ECAM_MAPPED[f.bdf as usize / 64].fetch_or(1 << (f.bdf % 64), core::sync::atomic::Ordering::Relaxed);
             ECAM_WRITABLE[f.bdf as usize / 64].fetch_or(1 << (f.bdf % 64), core::sync::atomic::Ordering::Relaxed);
         }
-        // Other partitions' bridges above ours, and the IOMMUs' functions:
-        // read-only, so that a stray write faults instead of reprogramming
-        // another partition's hardware.  The IOMMU code reads them like
-        // any function (device scopes, requester aliases).
-        for &bdf in d.upstream() {
+        // Other partitions' bridges above ours, and the IOMMUs' functions;
+        // in partition 0, which builds every unit's context tables, every
+        // other partition's function: read-only, so that a stray write
+        // faults instead of reprogramming another partition's hardware.
+        // The IOMMU code reads them like any function (device scopes,
+        // requester aliases).
+        let others = d.owners().iter().filter(|o| o.partition as u32 != d.index).map(|o| o.bdf);
+        for bdf in d.upstream().iter().copied().chain(others) {
             let paddr = d.ecam_base as usize + ((bdf as usize) << 12);
             if (bdf >> 8) as u8 > d.ecam_bus_end || crate::partition::map_rights(alloc, _devmem, paddr, 4096,
                 Self::ecam_va(bdf), sel4::CapRights::read_only()).is_none() {
-                log!("l4h-root: PCI function {:02x}:{:02x}.{} above ours: no ECAM page", bdf >> 8, (bdf >> 3) & 0x1f, bdf & 7);
+                log!("l4h-root: another partition's PCI function {:02x}:{:02x}.{}: no ECAM page", bdf >> 8, (bdf >> 3) & 0x1f, bdf & 7);
                 continue;
             }
             ECAM_MAPPED[bdf as usize / 64].fetch_or(1 << (bdf % 64), core::sync::atomic::Ordering::Relaxed);
@@ -523,7 +535,8 @@ impl Iterator for Devices<'_> {
 /// MSI target address, and data for a reserved interrupt slot.
 pub fn msi_address() -> u64 {
     // Physical destination mode, to the partition's first CPU (APIC ID 0
-    // when root has the machine to itself).
+    // when root has the machine to itself).  The shim gives no partition a
+    // first CPU above APIC ID 255.
     #[cfg(target_arch = "x86_64")] { 0xfee0_0000 | (crate::partition::msi_dest() as u64 & 0xff) << 12 }
     #[cfg(target_arch = "aarch64")] { 0x0802_0040 }
 }
