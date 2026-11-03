@@ -36,7 +36,7 @@ impl Cnodes {
             let s = arena.try_object(alloc, ObjectBlueprint::CNode { size_bits: bits })?;
             Some(sel4::init_thread::Slot::<cap_type::CNode>::from_index(s).cap())
         };
-        let pool_radix = ((io_pool / PAGE).trailing_zeros() as usize).max(1);
+        let pool_radix = (io_pool.trailing_zeros() as usize - host::blk::pool_frame_bits(io_pool)).max(1);
         Some(Self {
             cspace: make(host::CNODE_BITS)?,
             pool: make(pool_radix)?,
@@ -217,7 +217,12 @@ fn map(g: &mut Guest, comp: &Component, backends: &[(usize, Backend)], alloc: &m
     for i in 0..pages {
         let dst = keep.absolute_cptr_from_bits_with_depth(i as u64, radix);
         let frame = g.pool.frame(i);
-        comp.map_copy(alloc, &mut g.arena, &frame, host::IO_POOL_VA + i * PAGE, CapRights::read_write(), attrs, dst);
+        let va = host::IO_POOL_VA + (i << g.pool.frame_bits());
+        if g.pool.frame_bits() == 21 {
+            comp.map_large_copy(alloc, &mut g.arena, &frame, va, dst);
+        } else {
+            comp.map_copy(alloc, &mut g.arena, &frame, va, CapRights::read_write(), attrs, dst);
+        }
     }
 
     // ---- Event pages, notifications and device pages.

@@ -1,0 +1,23 @@
+#!/bin/sh
+set -eu
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mount -t tmpfs tmp /tmp
+fail() { echo "BLKBENCH: FAIL: $*"; poweroff -f; }
+for kind in plain encrypted; do
+    if [ "$kind" = encrypted ] && grep -q baseline=1 /proc/cmdline; then continue; fi
+    extra=
+    if [ "$kind" = encrypted ]; then
+        head -c 64 /dev/urandom > /tmp/key
+        extra=,key-file=/tmp/key
+    fi
+    id=$(l4hctl create bench --mem 128 --initrd /bin/cryptblkvm.cpio.gz \
+        --disk "0,start=2048,sectors=122880$extra" --cmdline "console=hvc0 quiet plain=1 mode=bench-$kind") || fail create
+    l4hctl console "$id" --until 'CRYPTVM: ready' --timeout 180 > /tmp/console || { cat /tmp/console; fail console; }
+    cat /tmp/console
+    if grep -q 'CRYPTVM: FAIL' /tmp/console; then fail data; fi
+    l4hctl destroy "$id"
+done
+echo 'BLKBENCH: PASS'
+poweroff -f

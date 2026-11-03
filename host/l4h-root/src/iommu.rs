@@ -5,11 +5,12 @@ use crate::{amdvi, mem::Alloc, pci};
 use crate::vtd;
 
 pub mod mappings;
+pub use mappings::Access;
 
-// One pool per guest device, one DMA allocation per controller/NIC, and
-// the balloon. Backends keep these records out of root's stack.
+// One pool per guest device, three DMA regions per disk controller,
+// one per NIC, and the balloon. Backends keep these records off the stack.
 pub const MAX_MAPPINGS: usize = crate::MAX_GUESTS * crate::vmmgr::MAX_GUEST_DEVICES
-    + pci::MAX_DISK_CTRLS + l4h_host::net::MAX_NICS + 1;
+    + 3 * pci::MAX_DISK_CTRLS + l4h_host::net::MAX_NICS + 1;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Domain {
@@ -72,12 +73,12 @@ impl Iommu {
         }
     }
 
-    pub fn map(&mut self, alloc: &mut Alloc, domain: Domain, pa: usize, len: usize, write: bool) {
+    pub fn map(&mut self, alloc: &mut Alloc, domain: Domain, pa: usize, len: usize, access: Access) {
         match (self, domain) {
             (_, Domain::None) => {},
-            (Self::Amd(a), Domain::Amd(d)) => a.map(alloc, d, pa, len, write),
+            (Self::Amd(a), Domain::Amd(d)) => a.map(alloc, d, pa, len, access),
             #[cfg(target_arch = "x86_64")]
-            (Self::Intel(i), Domain::Intel(d)) => i.map(alloc, d, pa, len, write),
+            (Self::Intel(i), Domain::Intel(d)) => i.map(alloc, d, pa, len, access),
             #[cfg(target_arch = "x86_64")]
             _ => panic!("IOMMU domain belongs to another backend"),
         }

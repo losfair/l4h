@@ -22,3 +22,6 @@ L4H_DOM0_VCPUS=${1:-1} L4H_DOM0_MEM_MB=512 \
 L4H_QEMU_ARGS="-drive file=$out/bench.img,if=none,id=d0,format=raw,cache=none,aio=native -device virtio-blk-pci,drive=d0,disable-legacy=on" \
     "$root/tools/run-dom0.sh" "$out/bench.cpio.gz" "console=hvc0" 600 | grep -a "BENCH" || true
 grep -aq "BENCH: done" "$root/build/qemu.log"
+# Disk throughput, including host encryption; set L4H_BENCH_BASELINE_ROOT
+# to an ELF from before bounce writes for a same-run plain-write baseline.
+"$root/tests/run-blkbench.sh"
