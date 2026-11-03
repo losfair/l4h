@@ -34,6 +34,7 @@ mod layout;
 mod memd;
 mod monitor;
 mod netd;
+mod partition;
 mod pci;
 mod reset;
 mod rtc;
@@ -253,6 +254,8 @@ pub struct Host {
     pub reset: reset::Reset,
     pub rtc: rtc::Rtc,
     pub vmmgr: Option<vmmgr::Vmmgr>,
+    /// Partition 0 of several: the other kernels' consoles.
+    pub relay: Option<partition::Relay>,
 }
 
 impl Host {
@@ -349,14 +352,18 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     let mut devmem = devmem::DevMem::from_bootinfo(bootinfo);
     let modules = bootmod::load(bootinfo, &mut alloc, &mut devmem);
     let module = |name: &str| modules.iter().find(|m| m.name == name).map(|m| m.data);
+    partition::init(module("l4h-partition"));
     let cfg = config::Config::new(module("l4h-config"));
     // ACPI table frames are shared by RTC discovery, reset and trustd.
     #[cfg(target_arch = "x86_64")]
     let mut acpi_frames = acpi::Frames::new();
+    // The RTC is partition 0's; the others start from the shim's reading.
     #[allow(unused_mut)]
-    let mut rtc = rtc::Rtc::new(&mut alloc, &mut devmem);
+    let mut rtc = if partition::secondary() { rtc::Rtc::none() } else { rtc::Rtc::new(&mut alloc, &mut devmem) };
     #[cfg(target_arch = "x86_64")]
-    rtc.find_century(bootinfo, &mut acpi::Phys::new(&mut alloc, &mut devmem, &mut wins.a, &mut acpi_frames));
+    if !partition::secondary() {
+        rtc.find_century(bootinfo, &mut acpi::Phys::new(&mut alloc, &mut devmem, &mut wins.a, &mut acpi_frames));
+    }
     let info = HostInfo {
         cores,
         topology,
@@ -371,7 +378,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         hyp_ep,
         sched_control_base: bootinfo.sched_control().range().start,
         timeslice_us: 5000,
-        epoch_ns: rtc.read_ns(&mut wins.a),
+        epoch_ns: if partition::secondary() { partition::epoch_ns(tsc_hz) } else { rtc.read_ns(&mut wins.a) },
         epoch_ticks: rdtsc(),
     };
     let mut asids = AsidPools { pools: [(slot::ASID_POOL.cap(), 1)].into_iter().collect(), in_use: 1 };
@@ -430,7 +437,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
             if nics.push(d).is_err() {
                 log!("l4h-root: more than {} NICs, ignoring {:02x}:{:02x}.{}", host::net::MAX_NICS, d.bus, d.dev, d.func);
             }
-        } else if memd::is_balloon(&d) && balloon.is_none() {
+        } else if memd::is_balloon(&d) && balloon.is_none() && !partition::secondary() {
             balloon = Some(d);
         }
     }
@@ -444,8 +451,13 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     if let Some(d) = balloon {
         memd.attach_balloon(&d, &pci, &mut iommu, &mut alloc, &mut devmem);
     }
+    // Only partition 0 resets the machine (DESIGN.md §8).
     #[cfg(target_arch = "x86_64")]
-    let reset = reset::Reset::find(bootinfo, &mut acpi::Phys::new(&mut alloc, &mut devmem, &mut wins.a, &mut acpi_frames));
+    let reset = if partition::secondary() {
+        reset::Reset::default()
+    } else {
+        reset::Reset::find(bootinfo, &mut acpi::Phys::new(&mut alloc, &mut devmem, &mut wins.a, &mut acpi_frames))
+    };
     #[cfg(not(target_arch = "x86_64"))]
     let reset = reset::Reset::default();
     let trustd = trustd::spawn(
@@ -477,9 +489,14 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         reset,
         rtc,
         vmmgr: None,
+        relay: None,
     };
     h.scan_disks();
-    h.monitor = monitor::Monitor::new(&mut h.alloc, &mut h.devmem, wd_ntfn, h.cfg.serial_port, h.cfg.serial_irq, &mut h.iommu);
+    // The serial port and its interrupt (an I/O APIC pin) are partition 0's.
+    if !partition::secondary() {
+        h.monitor = monitor::Monitor::new(&mut h.alloc, &mut h.devmem, wd_ntfn, h.cfg.serial_port, h.cfg.serial_irq, &mut h.iommu);
+    }
+    h.relay = partition::Relay::new(&mut h.alloc, &mut h.devmem);
     h.dashboard = dashboard::Dashboard::new(bootinfo, &mut h.alloc, &mut h.devmem, h.cfg.fb_console);
 
     if module("guest-kernel").is_none() {
@@ -690,6 +707,9 @@ fn serve(h: &mut Host, reply_slot: ReplySlot) -> ! {
         let resp = if notified {
             if badge & TIMER_BADGE != 0 {
                 dashboard::Dashboard::tick(h);
+                if let Some(r) = h.relay.as_mut() {
+                    r.drain();
+                }
                 h.iommu.poll();
                 if h.cfg.watchdog_secs != 0 && rdtsc() >= next_watchdog {
                     watchdog_dump(h);

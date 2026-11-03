@@ -1,0 +1,7 @@
+[package]
+name = "l4h-partition"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]

@@ -23,6 +23,15 @@ impl Rtc {
         { Self { frame: _devmem.frames(&mut alloc.slots, 0x0901_0000, 4096).map(|f| crate::devmem::granule(f.start)) } }
     }
 
+    /// No RTC: a multikernel partition other than 0, whose clock comes
+    /// from the shim's reading (partition.rs).
+    pub fn none() -> Self {
+        #[cfg(target_arch = "x86_64")]
+        { Self { port: None, century: None } }
+        #[cfg(target_arch = "aarch64")]
+        { Self { frame: None } }
+    }
+
     /// Only write a century register that firmware advertises: 0x32 can
     /// be ordinary battery-backed NVRAM on machines without one.
     #[cfg(target_arch = "x86_64")]

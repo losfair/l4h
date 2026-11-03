@@ -9,6 +9,9 @@
 # L4H_KERNEL_VARIANT=NAME builds in build/kernel-NAME and installs to
 # build/sel4-NAME instead, leaving the default build alone
 # (tools/build-efi.sh builds the shipped variants so).
+# L4H_KERNEL_SLOT=K (0-7) links the kernel for multikernel slot K, at
+# physical 1 MiB + K * 32 MiB (tools/mkshim.sh; DESIGN.md §11.3); 0 is the
+# usual address.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 src=$root/build/seL4-src
@@ -30,6 +33,7 @@ cmake -G Ninja -S "$src" -B "$out" \
     -DKernelLAPICMode="${L4H_LAPIC_MODE:-X2APIC}" \
     -DKernelSupportPCID="${L4H_PCID:-ON}" \
     -DKernelSkimWindow="${L4H_SKIM_WINDOW:-OFF}" \
+    -DKernelX86ElfPaddrBase=$(printf '0x%x' $((0x100000 + ${L4H_KERNEL_SLOT:-0} * 0x2000000))) \
     -DCMAKE_INSTALL_PREFIX="$prefix" \
     -DCROSS_COMPILER_PREFIX= >/dev/null
 ninja -C "$out" all

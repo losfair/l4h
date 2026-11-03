@@ -1,0 +1,54 @@
+From 44e38f83a45d594d561c1128db1726b5574b2f61 Mon Sep 17 00:00:00 2001
+From: l4h <l4h@localhost>
+Date: Tue, 3 Nov 2026 01:02:18 -0800
+Subject: [PATCH 31/36] x86: build option for the kernel image's physical
+ address
+
+---
+ include/plat/pc99/plat/64/plat_mode/machine/hardware.h | 9 +++++----
+ src/arch/x86/config.cmake                              | 9 +++++++++
+ 2 files changed, 14 insertions(+), 4 deletions(-)
+
+diff --git a/include/plat/pc99/plat/64/plat_mode/machine/hardware.h b/include/plat/pc99/plat/64/plat_mode/machine/hardware.h
+index e530a7e..bc44e4b 100644
+--- a/include/plat/pc99/plat/64/plat_mode/machine/hardware.h
++++ b/include/plat/pc99/plat/64/plat_mode/machine/hardware.h
+@@ -86,10 +86,11 @@
+  * within the top 2GiB of memory. This is (2^48 - 2 ^ 31) */
+ #define PPTR_TOP UL_CONST(0xffffffff80000000)
+ 
+-/* The physical memory address to use for mapping the kernel ELF */
+-#define KERNEL_ELF_PADDR_BASE UL_CONST(0x00100000)
+-/* For use by the linker (only integer constants allowed) */
+-#define KERNEL_ELF_PADDR_BASE_RAW KERNEL_ELF_PADDR_BASE
++/* The physical memory address to use for mapping the kernel ELF
++ * (KernelX86ElfPaddrBase, 1 MiB by default).  It must lie in the first GiB,
++ * which the kernel ELF window maps. */
++#define KERNEL_ELF_PADDR_BASE_RAW CONFIG_X86_ELF_PADDR_BASE
++#define KERNEL_ELF_PADDR_BASE UL_CONST(CONFIG_X86_ELF_PADDR_BASE)
+ 
+ /* Kernel mapping starts directly after the physical memory window */
+ #define KERNEL_ELF_BASE (PPTR_TOP + KERNEL_ELF_PADDR_BASE)
+diff --git a/src/arch/x86/config.cmake b/src/arch/x86/config.cmake
+index 8927c02..252684b 100644
+--- a/src/arch/x86/config.cmake
++++ b/src/arch/x86/config.cmake
+@@ -217,6 +217,15 @@ config_string(
+   DEPENDS "KernelMultibootGFXModeText OR KernelMultibootGFXModeLinear"
+   UNDEF_DISABLED UNQUOTE)
+ 
++config_string(
++  KernelX86ElfPaddrBase
++  X86_ELF_PADDR_BASE
++  "Physical address the kernel image is linked and loaded at. A multikernel boot \
++    shim loads one kernel per partition, each built for its own address."
++  DEFAULT 0x00100000
++  DEPENDS "KernelArchX86"
++  UNQUOTE)
++
+ config_option(
+   KernelMultiboot1Header
+   MULTIBOOT1_HEADER
+-- 
+2.47.3
+

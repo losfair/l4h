@@ -1,4 +1,5 @@
-//! PCI configuration: x86 I/O ports, or QEMU virt ECAM and GICv2m MSI.
+//! PCI configuration: x86 I/O ports (ECAM for a multikernel partition,
+//! partition.rs), or QEMU virt ECAM and GICv2m MSI.
 
 #[cfg(target_arch = "x86_64")]
 use sel4::cap_type;
@@ -15,6 +16,11 @@ pub struct Pci {
     /// IOPort capability for 0xcf8..0xcff (rust-sel4 has no IOPort type).
     #[cfg(target_arch = "x86_64")]
     port: u64,
+    /// A partition reaches its own functions through ECAM, each one's
+    /// page mapped at ECAM_X86 + bdf * 4096: the address-then-data ports
+    /// are shared with the other partitions' roots.
+    #[cfg(target_arch = "x86_64")]
+    ecam: bool,
     #[cfg(target_arch = "aarch64")]
     next_bar: core::cell::Cell<u64>,
 }
@@ -178,6 +184,10 @@ pub fn msi_irq(d: &Device, vector: u64, dst: &sel4::AbsoluteCPtr) {
     }
 }
 
+/// The functions whose ECAM pages a partition mapped, a bit per BDF.
+#[cfg(target_arch = "x86_64")]
+static ECAM_MAPPED: [core::sync::atomic::AtomicU64; 1024] = [const { core::sync::atomic::AtomicU64::new(0) }; 1024];
+
 #[cfg(target_arch = "x86_64")]
 impl Pci {
     pub fn new(alloc: &mut Alloc, _devmem: &mut crate::devmem::DevMem) -> Self {
@@ -187,7 +197,28 @@ impl Pci {
             .cap()
             .ioport_control_issue(CONFIG_ADDRESS as u64, CONFIG_DATA as u64 + 3, &dst)
             .expect("PCI config I/O ports");
-        Pci { port: s as u64 }
+        let Some(d) = crate::partition::get() else { return Pci { port: s as u64, ecam: false } };
+        for f in d.funcs() {
+            let paddr = d.ecam_base as usize + ((f.bdf as usize) << 12);
+            if (f.bdf >> 8) as u8 > d.ecam_bus_end
+                || crate::partition::map(alloc, _devmem, paddr, 4096, Self::ecam_va(f.bdf)).is_none()
+            {
+                panic!("PCI function {:02x}:{:02x}.{}: no ECAM page", f.bdf >> 8, (f.bdf >> 3) & 0x1f, f.bdf & 7);
+            }
+            ECAM_MAPPED[f.bdf as usize / 64].fetch_or(1 << (f.bdf % 64), core::sync::atomic::Ordering::Relaxed);
+        }
+        Pci { port: s as u64, ecam: true }
+    }
+
+    fn ecam_va(bdf: u16) -> usize {
+        crate::layout::ECAM_X86.base + (bdf as usize) * 4096
+    }
+
+    /// The function's ECAM page, if this partition has it.
+    fn ecam_page(&self, bus: u8, dev: u8, func: u8) -> Option<usize> {
+        let bdf = (bus as u16) << 8 | (dev as u16) << 3 | func as u16;
+        let mapped = ECAM_MAPPED[bdf as usize / 64].load(core::sync::atomic::Ordering::Relaxed) & (1 << (bdf % 64)) != 0;
+        mapped.then(|| Self::ecam_va(bdf))
     }
 
     /// A byte to one of the ports root holds, 0xcf8..0xcff, such as the
@@ -202,6 +233,11 @@ impl Pci {
     }
 
     pub fn read32(&self, bus: u8, dev: u8, func: u8, off: u8) -> u32 {
+        if self.ecam {
+            // Another partition's function, or none, reads as absent.
+            return self.ecam_page(bus, dev, func)
+                .map_or(u32::MAX, |p| unsafe { ((p + (off as usize & 0xfc)) as *const u32).read_volatile() });
+        }
         let port = self.port;
         sel4::with_ipc_buffer_mut(|ipc| {
             let ipc = ipc.inner_mut();
@@ -211,6 +247,12 @@ impl Pci {
     }
 
     pub fn write32(&self, bus: u8, dev: u8, func: u8, off: u8, val: u32) {
+        if self.ecam {
+            if let Some(p) = self.ecam_page(bus, dev, func) {
+                unsafe { ((p + (off as usize & 0xfc)) as *mut u32).write_volatile(val) };
+            }
+            return;
+        }
         let port = self.port;
         sel4::with_ipc_buffer_mut(|ipc| {
             let ipc = ipc.inner_mut();
@@ -319,7 +361,7 @@ impl Pci {
     /// Every PCI function, in bus, device, function order, each probed as
     /// the iterator reaches it.
     pub fn enumerate(&self) -> Devices<'_> {
-        Devices { pci: self, next: 0, multi: false }
+        Devices { pci: self, next: 0, multi: false, list: crate::partition::get().map(|d| d.funcs()) }
     }
 
     /// The function at bus:dev.func, if there is one.
@@ -331,8 +373,18 @@ impl Pci {
         let class = self.read32(bus, dev, func, 8);
         let header = self.read8(bus, dev, func, 0xe) & 0x7f;
         let (msix, virtio_caps) = self.caps(bus, dev, func);
+        // A partition never sizes a BAR: sizing stops the function
+        // decoding, and the shim sized them all before any kernel ran.
+        let bdf = (bus as u16) << 8 | (dev as u16) << 3 | func as u16;
         #[allow(unused_mut)]
-        let mut bars = if header == 0 { self.probe_bars(bus, dev, func) } else { [Bar::default(); 6] };
+        let mut bars = match crate::partition::get().and_then(|d| d.funcs().iter().find(|f| f.bdf == bdf)) {
+            Some(f) => core::array::from_fn(|i| {
+                let b = f.bars[i];
+                Bar { addr: b.addr, size: b.size, is_io: b.flags & l4h_partition::BAR_IO != 0 }
+            }),
+            None if header == 0 => self.probe_bars(bus, dev, func),
+            None => [Bar::default(); 6],
+        };
         #[cfg(target_arch = "aarch64")]
         for (n, b) in bars.iter_mut().enumerate() {
             if b.size == 0 || b.is_io { continue; }
@@ -406,12 +458,23 @@ pub struct Devices<'a> {
     next: u32,
     /// Its device has several functions.
     multi: bool,
+    /// A partition's functions, instead of a scan of every bus.
+    list: Option<&'static [l4h_partition::Func]>,
 }
 
 impl Iterator for Devices<'_> {
     type Item = Device;
 
     fn next(&mut self) -> Option<Device> {
+        if let Some(list) = self.list {
+            while let Some(f) = list.get(self.next as usize) {
+                self.next += 1;
+                if let Some(d) = self.pci.probe((f.bdf >> 8) as u8, (f.bdf >> 3 & 0x1f) as u8, (f.bdf & 7) as u8) {
+                    return Some(d);
+                }
+            }
+            return None;
+        }
         let end = if cfg!(target_arch = "aarch64") { 16 << 8 } else { 256 << 8 };
         while self.next < end {
             let (bus, dev, func) = ((self.next >> 8) as u8, (self.next >> 3 & 0x1f) as u8, (self.next & 7) as u8);
@@ -433,8 +496,10 @@ impl Iterator for Devices<'_> {
 }
 
 /// MSI target address, and data for a reserved interrupt slot.
-pub const fn msi_address() -> u64 {
-    #[cfg(target_arch = "x86_64")] { 0xfee0_0000 }
+pub fn msi_address() -> u64 {
+    // Physical destination mode, to the partition's first CPU (APIC ID 0
+    // when root has the machine to itself).
+    #[cfg(target_arch = "x86_64")] { 0xfee0_0000 | (crate::partition::msi_dest() as u64 & 0xff) << 12 }
     #[cfg(target_arch = "aarch64")] { 0x0802_0040 }
 }
 pub const fn msi_data(vector: u64) -> u32 {

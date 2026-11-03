@@ -80,6 +80,13 @@ pub fn reboot(h: &mut Host, by: &str) -> i64 {
     if cfg!(not(target_arch = "x86_64")) {
         return crate::ctl::ENOSYS;
     }
+    // Resetting the machine stops every partition: that is partition 0's
+    // dom0's to do (DESIGN.md §8).
+    if let Some(d) = crate::partition::get().filter(|d| !d.is_primary()) {
+        log!("l4h-root: host reboot ({}) refused: partition {} of {}; only partition 0's dom0 can reset the machine",
+            by, d.index, d.count);
+        return crate::ctl::EPERM;
+    }
     log!("l4h-root: host reboot ({})", by);
     reset(h);
     log!("l4h-root: host reboot failed: the machine did not reset");

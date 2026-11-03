@@ -1,0 +1,35 @@
+#!/bin/sh
+# dom0 init for tests/run-mktest.sh: one per partition, MKP the partition.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mount -t tmpfs tmp /tmp
+P=${MKP:-0}
+say() { echo "MKTEST p$P: $*"; }
+fail() { say "FAIL: $*"; sleep 100000; }
+say start
+l4hctl info || fail "l4hctl info"
+l4hctl disks
+ip link set lo up
+ip link set eth0 up
+udhcpc -i eth0 -n -q -t 5 -s /bin/udhcpc.script >/dev/null 2>&1 || fail "dhcp over the uplink"
+ping -c 2 -W 2 10.0.2.2 >/dev/null || fail "ping the uplink gateway"
+say "uplink ok: $(ip -4 addr show eth0 | sed -n 's/.*inet \([0-9.\/]*\).*/\1/p')"
+# A VM of its own, which only this partition's dom0 sees.
+id=$(l4hctl create "vm-p$P" --initrd /bin/vm.cpio.gz --mem 96 --cmdline "console=hvc0 MKP=$P") || fail "create a VM"
+l4hctl console "$id" --until "MKVM: done" --timeout 60 > /tmp/vm || fail "the VM did not finish"
+[ "$(l4hctl list | grep -c vm-p)" = 1 ] || fail "dom0 sees another partition's VM"
+say "vm ok"
+if [ "$P" != 0 ]; then
+    if l4hctl host-reboot 2>/tmp/err; then fail "host-reboot accepted"; fi
+    say "host-reboot refused: $(cat /tmp/err)"
+fi
+say done
+if [ "$P" = 0 ]; then
+    # Let the other partitions finish, then reset the machine.
+    sleep "${MKWAIT:-30}"
+    say "host-reboot"
+    l4hctl host-reboot
+    fail "host-reboot returned"
+fi
+sleep 100000

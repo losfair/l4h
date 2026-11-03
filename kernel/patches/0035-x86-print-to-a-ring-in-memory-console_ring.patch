@@ -1,0 +1,97 @@
+From 874973085f0e7e6fd75eea833ec0d1a6d5e0632a Mon Sep 17 00:00:00 2001
+From: l4h <l4h@localhost>
+Date: Tue, 3 Nov 2026 01:04:29 -0800
+Subject: [PATCH 35/36] x86: print to a ring in memory (console_ring=)
+
+---
+ include/plat/pc99/plat/machine/io.h |  2 ++
+ src/arch/x86/kernel/cmdline.c       |  9 ++++++++
+ src/plat/pc99/machine/io.c          | 33 +++++++++++++++++++++++++++++
+ 3 files changed, 44 insertions(+)
+
+diff --git a/include/plat/pc99/plat/machine/io.h b/include/plat/pc99/plat/machine/io.h
+index fce2d0b..8708c1a 100644
+--- a/include/plat/pc99/plat/machine/io.h
++++ b/include/plat/pc99/plat/machine/io.h
+@@ -26,6 +26,8 @@ uint32_t in32(uint16_t port);
+ #if defined(CONFIG_DEBUG_BUILD) || defined(CONFIG_PRINTING)
+ void serial_init(uint16_t port);
+ #ifdef CONFIG_PRINTING
++/* Print to a ring in memory instead of the serial port (console_ring=). */
++void console_ring_init(word_t paddr, word_t size);
+ bool_t fbcon_init(uint64_t paddr, uint32_t pitch, uint32_t width, uint32_t height, uint8_t bpp,
+                   uint8_t type, p_region_t const *ram, word_t ram_count);
+ #endif
+diff --git a/src/arch/x86/kernel/cmdline.c b/src/arch/x86/kernel/cmdline.c
+index f399d89..eb87670 100644
+--- a/src/arch/x86/kernel/cmdline.c
++++ b/src/arch/x86/kernel/cmdline.c
+@@ -153,6 +153,15 @@ void cmdline_parse(const char *cmdline, cmdline_opt_t *cmdline_opt)
+ #endif
+ 
+ #ifdef CONFIG_PRINTING
++    /* console_ring=paddr,size first, so that everything printed from here
++     * on goes to it. */
++    if (parse_opt(cmdline, "console_ring", cmdline_val, MAX_CMDLINE_VAL_LEN) != -1) {
++        word_t ring[2] = {0, 0};
++        if (parse_word_array(cmdline_val, ring, 2) == 2) {
++            console_ring_init(ring[0], ring[1]);
++        }
++    }
++
+     /* initialise to default or use BDA if available */
+     cmdline_opt->console_port = bda_ports_count && *bda_port ? *bda_port : 0x3f8;
+ 
+diff --git a/src/plat/pc99/machine/io.c b/src/plat/pc99/machine/io.c
+index ef61806..148cf7c 100644
+--- a/src/plat/pc99/machine/io.c
++++ b/src/plat/pc99/machine/io.c
+@@ -210,12 +210,45 @@ static void fbcon_putchar(unsigned char c)
+     fbcon_glyph(fbcon.row, fbcon.col++, c);
+ }
+ 
++/* The console ring (console_ring=paddr,size): kernels that share a machine
++ * with another, which owns the serial port, print here, and that one's
++ * root task copies what they print to the port.  A 64-byte header, whose
++ * first word counts the bytes ever written, then the bytes, as a circle;
++ * the reader keeps its own count and skips what was overwritten.  The
++ * ring must lie in the first 4 GiB, which the boot page tables map at
++ * PPTR_BASE too. */
++#define CONSOLE_RING_HEADER 64
++static struct {
++    volatile uint64_t *head;
++    volatile uint8_t *data;
++    word_t size;
++} console_ring;
++
++void console_ring_init(word_t paddr, word_t size)
++{
++    if (size <= CONSOLE_RING_HEADER || paddr + size > 0x100000000ull || !IS_ALIGNED(paddr, 6)) {
++        return;
++    }
++    console_ring.head = (volatile uint64_t *)(PPTR_BASE + paddr);
++    console_ring.data = (volatile uint8_t *)(PPTR_BASE + paddr + CONSOLE_RING_HEADER);
++    console_ring.size = size - CONSOLE_RING_HEADER;
++}
++
+ /* there is no UART driver at drivers/serial/... for the pc99 platform, but we
+  * implement parts of the API here, so we can reuse the generic code.
+  */
+ void uart_drv_putchar(
+     unsigned char c)
+ {
++    if (console_ring.head) {
++        uint64_t h = *console_ring.head;
++        console_ring.data[h % console_ring.size] = c;
++        /* The byte before the count that covers it (x86 keeps stores in
++         * order; this keeps the compiler from reordering them). */
++        __atomic_signal_fence(__ATOMIC_RELEASE);
++        *console_ring.head = h + 1;
++        return;
++    }
+     fbcon_putchar(c);
+     while (x86KSdebugPort && (in8(x86KSdebugPort + 5) & 0x20) == 0);
+     out8(x86KSdebugPort, c);
+-- 
+2.47.3
+

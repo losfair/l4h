@@ -1,0 +1,92 @@
+From a45d437802c6cb57d350416d24520d48f0d8baea Mon Sep 17 00:00:00 2001
+From: l4h <l4h@localhost>
+Date: Tue, 3 Nov 2026 01:03:36 -0800
+Subject: [PATCH 33/36] x86: boot without the legacy interrupt controllers
+ (no_legacy_irq)
+
+---
+ include/arch/x86/arch/kernel/cmdline.h |  3 +++
+ src/arch/x86/kernel/boot_sys.c         | 23 ++++++++++++++++-------
+ src/arch/x86/kernel/cmdline.c          |  4 ++++
+ 3 files changed, 23 insertions(+), 7 deletions(-)
+
+diff --git a/include/arch/x86/arch/kernel/cmdline.h b/include/arch/x86/arch/kernel/cmdline.h
+index 1d1e219..051bcc1 100644
+--- a/include/arch/x86/arch/kernel/cmdline.h
++++ b/include/arch/x86/arch/kernel/cmdline.h
+@@ -21,6 +21,9 @@ typedef struct cmdline_opt {
+      * BOOT_NODE_PADDR): kernels that share a machine boot their APs at
+      * once, each from a page of its own. */
+     word_t   ap_boot_page;
++    /* no_legacy_irq: another kernel on this machine owns the I/O APICs and
++     * the 8259 PIC; boot without them, with MSIs only. */
++    bool_t   no_legacy_irq;
+ } cmdline_opt_t;
+ 
+ void cmdline_parse(const char *cmdline, cmdline_opt_t *cmdline_opt);
+diff --git a/src/arch/x86/kernel/boot_sys.c b/src/arch/x86/kernel/boot_sys.c
+index fc76a77..e431cfc 100644
+--- a/src/arch/x86/kernel/boot_sys.c
++++ b/src/arch/x86/kernel/boot_sys.c
+@@ -517,12 +517,15 @@ static BOOT_CODE bool_t try_boot_sys(void)
+            (paddr_t)_start
+           );
+ 
+-    /* remapping legacy IRQs to their correct vectors */
+-    pic_remap_irqs(IRQ_INT_OFFSET);
+-    if (config_set(CONFIG_IRQ_IOAPIC)) {
+-        /* Disable the PIC so that it does not generate any interrupts. We need to
+-         * do this *before* we initialize the apic */
+-        pic_disable();
++    /* The PIC belongs to another kernel with no_legacy_irq: leave it be. */
++    if (!cmdline_opt.no_legacy_irq) {
++        /* remapping legacy IRQs to their correct vectors */
++        pic_remap_irqs(IRQ_INT_OFFSET);
++        if (config_set(CONFIG_IRQ_IOAPIC)) {
++            /* Disable the PIC so that it does not generate any interrupts. We need to
++             * do this *before* we initialize the apic */
++            pic_disable();
++        }
+     }
+ 
+     /* validate the ACPI table */
+@@ -556,7 +559,13 @@ static BOOT_CODE bool_t try_boot_sys(void)
+         return false;
+     }
+ 
+-    if (config_set(CONFIG_IRQ_IOAPIC)) {
++    if (cmdline_opt.no_legacy_irq) {
++        /* Another kernel's I/O APICs, if a firmware table still lists them. */
++        if (boot_state.num_ioapic > 0) {
++            printf("no_legacy_irq: ignoring %d IOAPICs\n", boot_state.num_ioapic);
++            boot_state.num_ioapic = 0;
++        }
++    } else if (config_set(CONFIG_IRQ_IOAPIC)) {
+         if (boot_state.num_ioapic == 0) {
+             printf("No IOAPICs detected\n");
+             return false;
+diff --git a/src/arch/x86/kernel/cmdline.c b/src/arch/x86/kernel/cmdline.c
+index 9b37720..72efaf7 100644
+--- a/src/arch/x86/kernel/cmdline.c
++++ b/src/arch/x86/kernel/cmdline.c
+@@ -25,6 +25,7 @@ char cmdline_val[MAX_CMDLINE_VAL_LEN];
+ const char cmdline_str_max_num_nodes[]  = {'m', 'a', 'x', '_', 'n', 'u', 'm', '_', 'n', 'o', 'd', 'e', 's', 0};
+ const char cmdline_str_num_sh_frames[]  = {'n', 'u', 'm', '_', 's', 'h', '_', 'f', 'r', 'a', 'm', 'e', 's', 0};
+ const char cmdline_str_disable_iommu[]  = {'d', 'i', 's', 'a', 'b', 'l', 'e', '_', 'i', 'o', 'm', 'm', 'u', 0};
++const char cmdline_str_no_legacy_irq[]  = {'n', 'o', '_', 'l', 'e', 'g', 'a', 'c', 'y', '_', 'i', 'r', 'q', 0};
+ #ifdef CONFIG_PRINTING
+ const char cmdline_str_fb_console[]  = {'f', 'b', '_', 'c', 'o', 'n', 's', 'o', 'l', 'e', 0};
+ #endif
+@@ -204,6 +205,9 @@ void cmdline_parse(const char *cmdline, cmdline_opt_t *cmdline_opt)
+     }
+     printf("Boot config: ap_boot_page = 0x%lx\n", cmdline_opt->ap_boot_page);
+ 
++    cmdline_opt->no_legacy_irq = parse_bool(cmdline, cmdline_str_no_legacy_irq);
++    printf("Boot config: no_legacy_irq = %s\n", cmdline_opt->no_legacy_irq ? "true" : "false");
++
+     cmdline_opt->disable_iommu = parse_bool(cmdline, cmdline_str_disable_iommu);
+     printf("Boot config: disable_iommu = %s\n", cmdline_opt->disable_iommu ? "true" : "false");
+ }
+-- 
+2.47.3
+

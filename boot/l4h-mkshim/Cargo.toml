@@ -1,0 +1,25 @@
+[package]
+name = "l4h-mkshim"
+edition = "2024"
+license = "GPL-2.0-only"
+version = "0.1.0"
+
+[dependencies]
+l4h-partition = { path = "../../host/l4h-partition" }
+
+[[bin]]
+name = "l4h-mkshim"
+path = "src/main.rs"
+test = false
+bench = false
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+debug = true
+
+[workspace]
