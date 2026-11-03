@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::path::Path;
 
 use l4hctl::{Error, Result};
 
@@ -25,8 +26,17 @@ struct Cpu {
 
 struct Func {
     bdf: u16,
+    vendor: u16,
+    device: u16,
     class: u32,
     bridge: bool,
+}
+
+impl Func {
+    fn is_disk(&self) -> bool {
+        // Match the shim: GCE's legacy virtio-scsi reports class 0.
+        self.class >> 16 == 0x01 || (self.vendor == 0x1af4 && matches!(self.device, 0x1001 | 0x1004 | 0x1042 | 0x1048))
+    }
 }
 
 fn fail<T>(msg: String) -> Result<T> {
@@ -105,8 +115,8 @@ fn parse(text: &str) -> Result<(usize, Vec<Part>, Vec<(usize, usize, bool)>)> {
 
 /// The enabled CPUs in MADT order (the first is the boot CPU), with their
 /// SRAT nodes.
-fn cpus() -> Result<Vec<Cpu>> {
-    let madt = fs::read("/sys/firmware/acpi/tables/APIC").map_err(|e| Error(format!("ACPI MADT: {e}")))?;
+fn cpus(root: &Path) -> Result<Vec<Cpu>> {
+    let madt = fs::read(root.join("sys/firmware/acpi/tables/APIC")).map_err(|e| Error(format!("ACPI MADT: {e}")))?;
     let u32_at = |b: &[u8], i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap());
     let mut out = Vec::new();
     let mut off = 44;
@@ -123,7 +133,7 @@ fn cpus() -> Result<Vec<Cpu>> {
         }
         off += len;
     }
-    if let Ok(srat) = fs::read("/sys/firmware/acpi/tables/SRAT") {
+    if let Ok(srat) = fs::read(root.join("sys/firmware/acpi/tables/SRAT")) {
         let mut off = 48;
         while off + 2 <= srat.len() {
             let (ty, len) = (srat[off], srat[off + 1] as usize);
@@ -145,40 +155,44 @@ fn cpus() -> Result<Vec<Cpu>> {
     Ok(out)
 }
 
-fn funcs() -> Result<Vec<Func>> {
+fn funcs(root: &Path) -> Result<Vec<Func>> {
     let mut out = Vec::new();
-    for e in fs::read_dir("/sys/bus/pci/devices").map_err(|e| Error(format!("PCI devices: {e}")))? {
+    for e in fs::read_dir(root.join("sys/bus/pci/devices")).map_err(|e| Error(format!("PCI devices: {e}")))? {
         let e = e.map_err(|e| Error(e.to_string()))?;
         let name = e.file_name().to_string_lossy().into_owned();
         let Some(rest) = name.strip_prefix("0000:") else { continue };
         let Some(b) = bdf(rest) else { continue };
-        let class = fs::read_to_string(e.path().join("class")).ok()
+        let hex = |name: &str| fs::read_to_string(e.path().join(name)).ok()
             .and_then(|c| u32::from_str_radix(c.trim().trim_start_matches("0x"), 16).ok()).unwrap_or(0);
-        out.push(Func { bdf: b, class, bridge: class >> 8 == 0x0604 });
+        let class = hex("class");
+        out.push(Func { bdf: b, vendor: hex("vendor") as u16, device: hex("device") as u16, class, bridge: class >> 8 == 0x0604 });
     }
     out.sort_by_key(|f| f.bdf);
     Ok(out)
 }
 
-fn ram_bytes() -> u64 {
-    fs::read_to_string("/proc/meminfo").ok()
+fn ram_bytes(root: &Path) -> u64 {
+    fs::read_to_string(root.join("proc/meminfo")).ok()
         .and_then(|m| m.lines().find_map(|l| l.strip_prefix("MemTotal:").map(|v| v.trim().trim_end_matches(" kB").parse::<u64>().ok())))
         .flatten().map_or(0, |kb| kb << 10)
 }
 
 pub fn run(args: &[String]) -> Result<i32> {
     let path = args.first().map_or("/boot/efi/l4h/l4h-mk.conf", |s| s.as_str());
+    check(Path::new("/"), path)
+}
+
+fn check(root: &Path, path: &str) -> Result<i32> {
     let text = fs::read_to_string(path).map_err(|e| Error(format!("{path}: {e}")))?;
     let (n, parts, links) = parse(&text)?;
-    if fs::metadata("/sys/kernel/l4h").is_ok() {
+    if fs::metadata(root.join("sys/kernel/l4h")).is_ok() {
         return fail("mk-check reads the machine's ACPI tables and PCI functions: run it from native Linux, not dom0".into());
     }
-    let cpus_v = cpus()?;
+    let cpus_v = cpus(root)?;
     let cpus = &cpus_v;
-    let funcs = funcs()?;
-    if n > 1 && fs::metadata("/sys/firmware/acpi/tables/MCFG").is_err() {
-        return fail("no MCFG: partitions need PCI ECAM".into());
-    }
+    let funcs = funcs(root)?;
+    // Without MCFG the shim and roots use shared PCI configuration ports;
+    // Linux exposes the functions through sysfs either way.
     // CPUs: explicit ones first, then counts and even shares in APIC ID
     // order, the boot CPU (the MADT's first) first.
     let mut owner: Vec<Option<usize>> = vec![None; cpus.len()];
@@ -249,7 +263,7 @@ pub fn run(args: &[String]) -> Result<i32> {
             }
         }
     }
-    let ram = ram_bytes();
+    let ram = ram_bytes(root);
     let mut asked = 0;
     let mut ok = true;
     for k in 0..n {
@@ -259,7 +273,7 @@ pub fn run(args: &[String]) -> Result<i32> {
             println!("p{k}: no CPU");
             ok = false;
         }
-        if !fs.iter().any(|f| f.class >> 16 == 0x01) {
+        if !fs.iter().any(|f| f.is_disk()) {
             println!("p{k}: no disk controller");
             ok = false;
         }
@@ -268,7 +282,7 @@ pub fn run(args: &[String]) -> Result<i32> {
         let nodes: std::collections::BTreeSet<u32> = c.iter().map(|&i| cpus[i].node).collect();
         println!("p{k}: {} CPU(s) (APIC IDs {}; node(s) {:?}), memory {}", c.len(), apics.join(" "), nodes,
             parts[k].mem.map_or(if k == 0 { "the rest".to_string() } else { "an even share".to_string() }, |m| format!("{} MiB", m >> 20)));
-        for f in fs.iter().filter(|f| k != 0 || matches!(f.class >> 16, 0x01 | 0x02)) {
+        for f in fs.iter().filter(|f| k != 0 || f.is_disk() || f.class >> 16 == 0x02) {
             println!("p{k}:   {} class {:06x}", fmt_bdf(f.bdf), f.class);
         }
     }
@@ -286,4 +300,109 @@ pub fn run(args: &[String]) -> Result<i32> {
     }
     println!("{}", if ok { "mk-check: ok (the shim checks memory placement again at boot)" } else { "mk-check: not bootable" });
     Ok(if ok { 0 } else { 1 })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Machine(PathBuf);
+
+    impl Machine {
+        fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let root = std::env::temp_dir().join(format!("l4h-mkcheck-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            fs::create_dir(&root).unwrap();
+            let m = Self(root);
+            let mut madt = vec![0u8; 44];
+            madt[..4].copy_from_slice(b"APIC");
+            madt[8] = 1;
+            madt[36..40].copy_from_slice(&0xfee0_0000u32.to_le_bytes());
+            madt[40] = 1;
+            for id in 0..4 {
+                madt.extend_from_slice(&[0, 8, id, id, 1, 0, 0, 0]);
+            }
+            let len = madt.len() as u32;
+            madt[4..8].copy_from_slice(&len.to_le_bytes());
+            madt[9] = 0u8.wrapping_sub(madt.iter().fold(0u8, |sum, &b| sum.wrapping_add(b)));
+            m.write("sys/firmware/acpi/tables/APIC", &madt);
+            m.write("proc/meminfo", b"MemTotal:       8388608 kB\n");
+            m.write("l4h-mk.conf", b"partitions = 2\np1.cpus = 2\np1.pci = 00:06.0\n");
+            m.pci("00:04.0", 0x010000, 0x1af4, 0x1042);
+            m.pci("00:06.0", 0x010802, 0x1b36, 0x0010);
+            m
+        }
+
+        fn write(&self, path: &str, data: &[u8]) {
+            let path = self.0.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, data).unwrap();
+        }
+
+        fn pci(&self, bdf: &str, class: u32, vendor: u16, device: u16) {
+            for (name, value) in [("class", class), ("vendor", vendor as u32), ("device", device as u32)] {
+                self.write(&format!("sys/bus/pci/devices/0000:{bdf}/{name}"), format!("0x{value:06x}\n").as_bytes());
+            }
+        }
+
+        fn check(&self) -> Result<i32> {
+            super::check(&self.0, self.0.join("l4h-mk.conf").to_str().unwrap())
+        }
+    }
+
+    impl Drop for Machine {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn accepts_partitions_without_mcfg() {
+        let m = Machine::new();
+        assert_eq!(m.check().unwrap(), 0);
+    }
+
+    #[test]
+    fn accepts_partitions_with_mcfg() {
+        let m = Machine::new();
+        m.write("sys/firmware/acpi/tables/MCFG", &[]);
+        assert_eq!(m.check().unwrap(), 0);
+    }
+
+    #[test]
+    fn accepts_unclassified_virtio_disks_without_mcfg() {
+        let m = Machine::new();
+        // GCE's boot disk controller is 1af4:1004 with class 0; the shim
+        // also recognizes the other legacy/modern virtio disk IDs.
+        for device in [0x1004, 0x1001, 0x1042, 0x1048] {
+            m.pci("00:04.0", 0, 0x1af4, device);
+            assert_eq!(m.check().unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn rejects_missing_disk_without_mcfg() {
+        let m = Machine::new();
+        // Neither an unrelated vendor nor a virtio NIC is a disk.
+        for (vendor, device) in [(0x1234, 0x1004), (0x1af4, 0x1000)] {
+            m.pci("00:06.0", 0, vendor, device);
+            assert_eq!(m.check().unwrap(), 1);
+        }
+    }
+
+    #[test]
+    fn rejects_missing_cpu_without_mcfg() {
+        let m = Machine::new();
+        m.write("l4h-mk.conf", b"partitions = 2\np1.cpus = 0\np1.pci = 00:06.0\n");
+        assert_eq!(m.check().unwrap(), 1);
+    }
+
+    #[test]
+    fn rejects_dom0_without_mcfg() {
+        let m = Machine::new();
+        m.write("sys/kernel/l4h/present", &[]);
+        assert!(m.check().unwrap_err().0.contains("run it from native Linux, not dom0"));
+    }
 }
