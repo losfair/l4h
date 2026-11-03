@@ -73,6 +73,17 @@ pub fn iommu_mine(bdf: u16) -> bool {
     }
 }
 
+/// In partition 0: whether another partition has a function that reaches
+/// the IOMMU as requester `req` (`alias` gives a function's requester).
+/// That requester's domain is the other partition's, even when partition
+/// 0 has a bridge behind the same aliasing bridge (bridges are always
+/// partition 0's, and the shim gives every function below an aliasing
+/// bridge to one partition).
+pub fn foreign_requester(req: u16, alias: impl Fn(u16) -> u16) -> bool {
+    get().filter(|d| d.is_primary())
+        .is_some_and(|d| d.owners().iter().any(|o| o.partition as u32 != d.index && alias(o.bdf) == req))
+}
+
 /// The wall clock at boot from the shim's reading, advanced to now.
 pub fn epoch_ns(tsc_hz: u64) -> u64 {
     let Some(d) = get() else { return 0 };

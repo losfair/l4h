@@ -604,6 +604,12 @@ impl AmdVi {
                         continue;
                     }
                     let alias = self.dev.as_ref().unwrap().alias[id as usize];
+                    // A requester another partition's function shares
+                    // (with a bridge of partition 0's) is its domain.
+                    let table = &self.dev.as_ref().unwrap().alias;
+                    if self.region.is_some() && crate::partition::foreign_requester(alias, |b| table[b as usize]) {
+                        continue;
+                    }
                     let d = match (self.domain_of(alias), own) {
                         (Some(d), _) if all || Some(d) != self.shared => d,
                         (_, Some(d)) => d,
