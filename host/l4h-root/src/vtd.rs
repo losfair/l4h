@@ -309,7 +309,10 @@ impl Vtd {
         for r in 0..self.dmar.reserved.len() {
             let reserved = self.dmar.reserved[r];
             for sid in reserved.scope.first..=reserved.scope.last {
-                if pci.read32((sid >> 8) as u8, (sid >> 3 & 31) as u8, (sid & 7) as u8, 0) & 0xffff == 0xffff {
+                // Partition 0 reads every partition's functions; each
+                // maps its own reserved memory (`join`).
+                if pci.read32((sid >> 8) as u8, (sid >> 3 & 31) as u8, (sid & 7) as u8, 0) & 0xffff == 0xffff
+                    || !pci::ours(sid) {
                     continue;
                 }
                 let unit = self.dmar.owner(sid).expect("VT-d: RMRR device has no remapping unit");
