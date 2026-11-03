@@ -642,6 +642,10 @@ fn flags_thread(c: &Component, alloc: &mut Alloc, arena: &mut Arena, info: &Host
     sc
 }
 
+// A relayed message fits a control channel's ring.
+const _: () = assert!(8 + trust::RELAY_MSG_MAX as u64
+    <= l4h_partition::MsgRing::max_room(l4h_partition::CHANNEL_SIZE / 2 - l4h_partition::MSG_RING_HEADER as u64));
+
 /// The relay page at `off` in root.
 fn relay_va(off: usize) -> usize {
     crate::layout::TRUSTD_RELAY.base + off

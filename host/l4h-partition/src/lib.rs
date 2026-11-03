@@ -336,7 +336,9 @@ pub struct IommuLock {
 /// more than the ring loses messages (and knows it).  Messages are
 /// `[u32 length][u32 type][payload]`, the length counting the 8 header
 /// bytes and the payload but not the padding to 8 bytes; a message never
-/// wraps: type 0 fills the rest of the ring instead.
+/// wraps: type 0 fills the rest of the ring instead.  A message takes at
+/// most an eighth of the ring (`MsgRing::max_room`), so that a reader can
+/// tell where the writer may be writing before it publishes.
 pub const MSG_RING_HEADER: usize = 64;
 pub const MSG_PAD: u32 = 0;
 /// Header words: the bytes ever written (u64, the writer's), and the
@@ -377,13 +379,27 @@ impl MsgRing {
         (self.va + MSG_RING_HEADER + off as usize) as *mut u8
     }
 
+    /// The most a message takes, padding included.
+    pub const fn max_room(cap: u64) -> u64 {
+        cap / 8 & !7
+    }
+
+    /// Whether a reader at `tail` may find its next message overwritten,
+    /// with the writer at `head`.  Before it publishes, the writer writes
+    /// up to `head` + the padding at the end of the ring (less than a
+    /// message) + its message: past `tail` + `cap` it is writing over
+    /// what is at `tail`.
+    fn overrun(&self, head: u64, tail: u64) -> bool {
+        head.wrapping_sub(tail) > self.cap - 2 * Self::max_room(self.cap)
+    }
+
     /// Write one message: never waits, never fails (a slow reader loses
     /// old messages instead).
     pub fn send(&self, ty: u32, payload: &[&[u8]]) {
         let n: usize = payload.iter().map(|p| p.len()).sum();
         let len = 8 + n as u64;
         let room = len.next_multiple_of(8);
-        assert!(room <= self.cap / 2, "channel message too large");
+        assert!(room <= Self::max_room(self.cap), "channel message too large");
         let mut head = self.head();
         let pos = head % self.cap;
         if pos + room > self.cap {
@@ -444,10 +460,12 @@ impl MsgReader {
     pub fn recv(&mut self, buf: &mut [u8], lost: &mut u64) -> Option<(u32, usize)> {
         loop {
             let head = self.ring.head();
+            // The head before the message it covers (x86 orders loads).
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
             if self.tail == head {
                 return None;
             }
-            if head.wrapping_sub(self.tail) > self.ring.cap {
+            if self.ring.overrun(head, self.tail) {
                 *lost += head.wrapping_sub(self.tail);
                 self.tail = head;
                 return None;
@@ -466,8 +484,10 @@ impl MsgReader {
             if ty != MSG_PAD {
                 unsafe { core::ptr::copy_nonoverlapping(self.ring.data(pos + 8), buf.as_mut_ptr(), n) };
             }
-            // Overwritten while it was copied: lost.
-            if self.ring.head().wrapping_sub(self.tail) > self.ring.cap {
+            // Overwritten while it was copied, or being overwritten: lost.
+            // The copy before the head that says so.
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+            if self.ring.overrun(self.ring.head(), self.tail) {
                 continue;
             }
             self.tail += room;
@@ -507,7 +527,7 @@ pub const LINK_FRAME_MAX: usize = 9216;
 
 const _: () = assert!(core::mem::size_of::<Func>() == 160);
 const _: () = assert!(LINK_VECTOR_BASE as usize + MAX_PARTITIONS <= CONTROL_VECTOR_BASE as usize);
-const _: () = assert!(8 + LINK_FRAME_MAX as u64 <= (LINK_CHANNEL_SIZE / 2 - MSG_RING_HEADER as u64) / 2);
+const _: () = assert!(8 + LINK_FRAME_MAX as u64 <= MsgRing::max_room(LINK_CHANNEL_SIZE / 2 - MSG_RING_HEADER as u64));
 const _: () = assert!(core::mem::size_of::<IommuControl>() <= 4096);
 const _: () = assert!(IOMMU_UNIT_BASE + IOMMU_MAX_UNITS as u64 * IOMMU_UNIT_SIZE <= IOMMU_TABLES_BASE);
 const _: () = assert!(IOMMU_TABLES_BASE + (2 << 20) <= IOMMU_REGION_SIZE);
