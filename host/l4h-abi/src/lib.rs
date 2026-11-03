@@ -325,6 +325,7 @@ pub const CTL_EP_LIST: u32 = 34;
 pub const CTL_STEER_SET: u32 = 35;
 pub const CTL_STEER_DEL: u32 = 36;
 pub const CTL_STEER_LIST: u32 = 37;
+pub const CTL_PARTITION_INFO: u32 = 38;
 /// CTL_GPU_ATTACH: scanout sizes, and the I/O pool a VM with a GPU needs
 /// (in images of its scanout).
 pub const GPU_MIN: u32 = 64;

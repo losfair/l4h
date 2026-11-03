@@ -8,6 +8,9 @@
 #   xapic-nopcid  xAPIC, no PCID: machines whose firmware leaves x2APIC off
 #                 and CPUs without PCID (Latitude.sh m4.metal.small)
 #   skim-xapic-nopcid  SKIM, xAPIC, no PCID: Meltdown-affected CPUs
+# Each application also holds the multikernel shim and the variant's
+# kernels for its 8 slots (tools/build-mkshim.sh), which GRUB boots when
+# the EFI system partition has /l4h/l4h-mk.conf (DESIGN.md §11.4).
 # L4H_RELEASE=1 builds release kernels and host components.
 # build/efi/l4h-bios-x86_64.tar.xz holds l4h's files for BIOS machines
 # (tools/mkbios.sh), with each variant's kernel as kernel-VARIANT.elf; the
@@ -30,6 +33,9 @@ for v in "${variants[@]}"; do
     L4H_KERNEL_VARIANT=$name L4H_LAPIC_MODE=$lapic L4H_PCID=$pcid L4H_SKIM_WINDOW=$skim \
         "$root/tools/build-kernel.sh" >"$out/kernel-$name.log" 2>&1 \
         || { tail -20 "$out/kernel-$name.log"; exit 1; }
+    L4H_KERNEL_VARIANT=$name L4H_LAPIC_MODE=$lapic L4H_PCID=$pcid L4H_SKIM_WINDOW=$skim \
+        "$root/tools/build-mkshim.sh" 8 >"$out/mkshim-$name.log" 2>&1 \
+        || { tail -20 "$out/mkshim-$name.log"; exit 1; }
 done
 # libsel4 does not depend on these options: build the host against the
 # default kernel build, as the other scripts do.
@@ -51,7 +57,9 @@ for v in "${variants[@]}"; do
 done
 tar -C "$debug" -cJf "$out/l4h-debug-x86_64.tar.xz" l4h-debug-x86_64
 bios=$debug/l4h-bios-x86_64
-"$root/tools/mkbios.sh" "$bios" "$root/host/target/x86_64-sel4-roottask/debug/l4h-root.elf" >/dev/null
+# Multikernel boot is UEFI-only in the release (the installer's BIOS
+# package has one kernel per variant).
+L4H_MKSHIM= "$root/tools/mkbios.sh" "$bios" "$root/host/target/x86_64-sel4-roottask/debug/l4h-root.elf" >/dev/null
 rm "$bios/kernel.elf"
 for v in "${variants[@]}"; do
     read -r name _ <<<"$v"

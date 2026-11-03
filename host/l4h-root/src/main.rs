@@ -454,7 +454,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     if let Some(d) = balloon {
         memd.attach_balloon(&d, &pci, &mut iommu, &mut alloc, &mut devmem);
     }
-    // Only partition 0 resets the machine (DESIGN.md §8).
+    // Only partition 0 resets the machine (DESIGN.md §11.4).
     #[cfg(target_arch = "x86_64")]
     let reset = if partition::secondary() {
         reset::Reset::default()

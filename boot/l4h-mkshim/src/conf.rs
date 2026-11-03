@@ -1,4 +1,4 @@
-//! l4h-mk.conf: how the machine is split (DESIGN.md §11.3), `key = value`
+//! l4h-mk.conf: how the machine is split (DESIGN.md §11.4), `key = value`
 //! lines like l4h.conf:
 //!
 //! ```text

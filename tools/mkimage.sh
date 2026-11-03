@@ -11,12 +11,14 @@
 # and what BIOS-only clouds (DigitalOcean custom images, or written to the
 # disk from a rescue system) boot.
 # Usage: mkimage.sh [-e l4h.efi] [-b biosdir] [-i initrd] [-c l4h.conf]
-#                   <out.raw> [l4h-root.elf]
+#                   [-m dir] <out.raw> [l4h-root.elf]
 #   -e  use this application instead of building one from l4h-root.elf;
 #       without -b, the image then boots only under UEFI
 #   -b  use this directory from tools/mkbios.sh instead of building one
 #   -i, -c  dom0's initramfs and the settings, copied to /l4h/dom0/initrd
 #       and /l4h/l4h.conf
+#   -m  a multikernel configuration, copied into /l4h: l4h-mk.conf and
+#       each partition's pN/l4h.conf and pN/dom0/initrd (DESIGN.md §11.4)
 # L4H_SERIAL_PORT, L4H_FB_CONSOLE=1, L4H_GUEST_KERNEL and L4H_GUEST_KMODS
 # go to tools/mkefi.sh and tools/mkbios.sh.  L4H_ESP_MB
 # sizes the partition (default: the payload plus 64 MiB, room for larger
@@ -26,9 +28,10 @@ set -euo pipefail
 export PATH="$PATH:/usr/sbin:/sbin"
 for tool in mformat mmd mcopy sfdisk; do command -v "$tool" >/dev/null; done
 root=$(cd "$(dirname "$0")/.." && pwd)
-efi= bios= dom0_initrd= config=
-while getopts e:b:i:c: o; do
+efi= bios= dom0_initrd= config= mk=
+while getopts e:b:i:c:m: o; do
     case $o in
+        m) mk=$OPTARG ;;
         e) efi=$OPTARG ;;
         b) bios=$OPTARG ;;
         i) dom0_initrd=$OPTARG ;;
@@ -60,8 +63,8 @@ fi
 
 # EFI system partition: FAT32, sized for the payload.
 payload=0
-for f in "$efi" $dom0_initrd $config ${bios:+"$bios"/*}; do
-    payload=$(( payload + $(stat -c %s "$f") ))
+for f in "$efi" $dom0_initrd $config ${bios:+"$bios"} ${mk:+"$mk"}; do
+    payload=$(( payload + $(du -sb "$f" | cut -f1) ))
 done
 esp_mb=${L4H_ESP_MB:-$(( payload / 1048576 + 64 ))}
 # The volume serial, for the BIOS core image's search.
@@ -72,10 +75,11 @@ mmd -i "$work/esp.img" ::/EFI ::/EFI/BOOT ::/l4h ::/l4h/dom0
 mcopy -i "$work/esp.img" "$efi" ::/EFI/BOOT/BOOTX64.EFI
 if [ -n "$bios" ]; then
     mmd -i "$work/esp.img" ::/l4h/bios
-    mcopy -i "$work/esp.img" "$bios"/* ::/l4h/bios/
+    mcopy -s -i "$work/esp.img" "$bios"/* ::/l4h/bios/
 fi
 [ -n "$dom0_initrd" ] && mcopy -i "$work/esp.img" "$dom0_initrd" ::/l4h/dom0/initrd
 [ -n "$config" ] && mcopy -i "$work/esp.img" "$config" ::/l4h/l4h.conf
+[ -n "$mk" ] && mcopy -s -i "$work/esp.img" "$mk"/* ::/l4h/
 
 # GPT disk: ESP from 1 MiB, then a 1 MiB BIOS boot partition; GCE wants
 # a whole number of GiB.

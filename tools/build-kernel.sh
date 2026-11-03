@@ -10,7 +10,7 @@
 # build/sel4-NAME instead, leaving the default build alone
 # (tools/build-efi.sh builds the shipped variants so).
 # L4H_KERNEL_SLOT=K (0-7) links the kernel for multikernel slot K, at
-# physical 1 MiB + K * 32 MiB (tools/mkshim.sh; DESIGN.md §11.3); 0 is the
+# physical 1 MiB + K * 32 MiB (tools/build-mkshim.sh; DESIGN.md §11.4); 0 is the
 # usual address.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)

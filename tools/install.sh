@@ -20,6 +20,8 @@ Usage: curl -fsSL https://raw.githubusercontent.com/losfair/l4h/main/tools/insta
   --variant NAME          generic, xapic-nopcid, or skim-xapic-nopcid (otherwise auto-select)
   --assume-stable-tsc      Allow missing constant_tsc for experimental installs;
                           assume the TSC is stable without verifying it
+  --partitions N          Split the machine into N l4h partitions (2-8, fresh installs;
+                          each other partition needs its own NVMe controller and NIC)
   --make-default          Make L4H the default boot entry (default: one-time
                           BootNext on UEFI, GRUB next_entry on BIOS)
   --help                  Show this help
@@ -40,7 +42,7 @@ HELP
                 return ;;
             --check) check=1; args+=("$arg") ;;
             --make-default|--assume-stable-tsc) args+=("$arg") ;;
-            --release|--esp|--memory|--vcpus|--variant)
+            --release|--esp|--memory|--vcpus|--variant|--partitions)
                 (($#)) || { echo "l4h: $arg needs a value" >&2; return 2; }
                 if [[ $arg == --release ]]; then release=$1; else args+=("$arg" "$1"); fi
                 shift ;;

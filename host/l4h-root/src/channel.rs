@@ -1,4 +1,4 @@
-//! Channels between multikernel partitions (DESIGN.md §7): memory the
+//! Channels between multikernel partitions (DESIGN.md §11.4): memory the
 //! shim reserved from every partition's RAM, two message rings in each,
 //! and a doorbell each way (seL4_IRQControl_SendPeer, kernel patch 0036).
 //!
@@ -10,7 +10,7 @@
 //! Control traffic between the primary and each secondary:
 //!
 //! - heartbeats, secondary to primary, every second; the primary logs a
-//!   partition that stops sending them (§8);
+//!   partition that stops sending them;
 //! - the wall clock, primary to secondary, every ten seconds and after
 //!   dom0 sets the RTC, which only the primary owns; and a secondary
 //!   dom0's RTC_SET, forwarded to the primary.
@@ -211,6 +211,12 @@ impl Channels {
     /// The peers with a link channel (CHANNEL_LINK).
     pub fn links(&self) -> impl Iterator<Item = u32> + '_ {
         self.chans.iter().filter(|c| c.desc.kind & part::CHANNEL_LINK != 0).map(|c| c.desc.peer)
+    }
+
+    /// The partitions heard from within the last few heartbeats, a bit
+    /// each.
+    pub fn alive(&self) -> u64 {
+        self.chans.iter().filter(|c| !c.reported).fold(0, |m, c| m | 1 << c.desc.peer)
     }
 
     pub fn has_peer(&self, peer: u32) -> bool {

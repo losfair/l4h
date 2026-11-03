@@ -33,6 +33,13 @@ pub fn host_op(h: &mut Host, op: u32, a: &[u64; 6], data: &mut [u8; abi::CTL_DAT
             ];
         }
         abi::CTL_IOMMU_INFO => vals = h.iommu.info(),
+        abi::CTL_PARTITION_INFO => {
+            let d = crate::partition::get();
+            vals[0] = d.map_or(0, |d| d.index as u64);
+            vals[1] = d.map_or(1, |d| d.count as u64);
+            vals[2] = d.map_or(0, |d| d.boot_apic as u64);
+            vals[3] = h.channels.as_ref().map_or(0, |c| c.alive());
+        }
         abi::CTL_DISK_INFO => {
             let i = a[0] as usize;
             if !h.ctrls[h.disks.get(i).ok_or(ENOENT)?.ctrl].failed { h.ensure_disk(i)?; }
@@ -134,7 +141,7 @@ pub fn host_op(h: &mut Host, op: u32, a: &[u64; 6], data: &mut [u8; abi::CTL_DAT
         }
         // Returns only on failure.
         abi::CTL_HOST_REBOOT => return Err(crate::reset::reboot(h, "dom0")),
-        // A secondary partition's RTC is the primary's (DESIGN.md §4.5).
+        // A secondary partition's RTC is the primary's (DESIGN.md §11.4).
         abi::CTL_RTC_SET if crate::partition::secondary() => crate::channel::rtc_set(h, a[0])?,
         abi::CTL_RTC_SET => h.rtc.set_secs(&mut h.wins.a, a[0])?,
         _ => return Err(ENOSYS),

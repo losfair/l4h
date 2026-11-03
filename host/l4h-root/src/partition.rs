@@ -1,4 +1,4 @@
-//! Multikernel partitions (DESIGN.md §11.3): when l4h-mkshim booted this
+//! Multikernel partitions (DESIGN.md §11.4): when l4h-mkshim booted this
 //! kernel as one of several on the machine, the `l4h-partition` boot
 //! module describes this partition, and root restricts itself to it:
 //! only its PCI functions (through ECAM, never the shared 0xcf8 ports),
