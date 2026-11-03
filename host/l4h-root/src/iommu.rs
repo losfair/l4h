@@ -41,7 +41,7 @@ impl Iommu {
     #[cfg(target_arch = "x86_64")]
     pub fn init(bootinfo: &sel4::BootInfoPtr, phys: &mut crate::acpi::Phys, pci: &pci::Pci,
         ticks_per_ms: u64, enabled: bool, intremap: bool) -> Self {
-        let shared = shared::Shared::new(phys.alloc, phys.devmem, ticks_per_ms);
+        let shared = shared::get();
         let (mut enabled, mut intremap) = (enabled, intremap);
         if let Some(s) = shared.filter(|s| !s.primary) {
             let (ready, units, remap) = s.wait_ready();

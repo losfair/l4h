@@ -31,12 +31,14 @@ pub struct Func {
 }
 
 impl Func {
+    /// By class, or a virtio device by its ID: GCE's legacy virtio-scsi
+    /// controller has class 0 ("unclassified").
     pub fn is_disk(&self) -> bool {
-        self.class >> 16 == 0x01
+        self.class >> 16 == 0x01 || (self.vendor == 0x1af4 && matches!(self.device, 0x1001 | 0x1004 | 0x1042 | 0x1048))
     }
 
     pub fn is_nic(&self) -> bool {
-        self.class >> 16 == 0x02
+        self.class >> 16 == 0x02 || (self.vendor == 0x1af4 && matches!(self.device, 0x1000 | 0x1041))
     }
 }
 

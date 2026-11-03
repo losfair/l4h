@@ -8,7 +8,11 @@
 //! its own RAM and its own share of domain IDs and interrupt entries. Only
 //! the command queues are written by all: a ticket lock per unit in the
 //! control page serializes "write commands, move the tail, wait for
-//! completion", the one step the drivers already take for it.
+//! completion", the one step the drivers already take for it.  On
+//! machines without ECAM the control page also holds the lock around PCI
+//! configuration through ports.
+// Partitions are x86_64 only; the types are shared with amdvi.rs.
+#![cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 
 use core::ops::Range;
 use core::sync::atomic::Ordering;
@@ -32,9 +36,24 @@ pub struct Shared {
     ticks_per_ms: u64,
 }
 
+/// The region, once mapped (`map`).
+static mut SHARED: Option<Shared> = None;
+
+/// Map the shared region, when this is one of several partitions: early,
+/// since PCI configuration without ECAM takes its lock.
+pub fn map(alloc: &mut Alloc, devmem: &mut DevMem, ticks_per_ms: u64) {
+    let s = Shared::new(alloc, devmem, ticks_per_ms);
+    unsafe { *core::ptr::addr_of_mut!(SHARED) = s };
+}
+
+/// The shared region, if `map` mapped one.
+pub fn get() -> Option<Shared> {
+    unsafe { *core::ptr::addr_of!(SHARED) }
+}
+
 impl Shared {
     /// The shared region, mapped, when this is one of several partitions.
-    pub fn new(alloc: &mut Alloc, devmem: &mut DevMem, ticks_per_ms: u64) -> Option<Shared> {
+    fn new(alloc: &mut Alloc, devmem: &mut DevMem, ticks_per_ms: u64) -> Option<Shared> {
         let d = crate::partition::get().filter(|d| d.count > 1)?;
         let (pa, size) = (d.iommu.paddr as usize, d.iommu.size as usize);
         let region = &crate::layout::IOMMU_SHARED;
@@ -85,26 +104,36 @@ impl Shared {
 
     /// Take unit `n`'s command queue lock.
     pub fn lock(&self, n: usize) {
-        let l: &IommuLock = &self.control().locks[n];
+        self.take(&self.control().locks[n], format_args!("iommu {}: command queue", n));
+    }
+
+    pub fn unlock(&self, n: usize) {
+        self.control().locks[n].serving.fetch_add(1, Ordering::Release);
+    }
+
+    /// Take the lock around PCI configuration through ports.
+    pub fn lock_pci(&self) {
+        self.take(&self.control().pci, format_args!("PCI configuration"));
+    }
+
+    pub fn unlock_pci(&self) {
+        self.control().pci.serving.fetch_add(1, Ordering::Release);
+    }
+
+    fn take(&self, l: &IommuLock, what: core::fmt::Arguments) {
         let ticket = l.next.fetch_add(1, Ordering::Relaxed);
         let second = self.ticks_per_ms.max(1) * 1000;
         let mut end = l4h_host::ticks::now() + second;
         while l.serving.load(Ordering::Acquire) != ticket {
             if l4h_host::ticks::now() > end {
-                // A partition that died holding it blocks every partition's
-                // IOMMU updates until the machine restarts (§4.6).
-                log!("l4h-root: iommu {}: command queue lock held by partition {} for over a second",
-                    n, l.holder.load(Ordering::Relaxed));
+                // A partition that died holding it blocks every partition
+                // until the machine restarts (§4.6).
+                log!("l4h-root: {} lock held by partition {} for over a second", what, l.holder.load(Ordering::Relaxed));
                 end = l4h_host::ticks::now() + second;
             }
             core::hint::spin_loop();
         }
         l.holder.store(self.index, Ordering::Relaxed);
-    }
-
-    pub fn unlock(&self, n: usize) {
-        let l = &self.control().locks[n];
-        l.serving.fetch_add(1, Ordering::Release);
     }
 
     /// The primary: the IOMMUs are set up (`state`, abi::IOMMU_*), with

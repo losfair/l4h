@@ -3142,8 +3142,9 @@ Every PCI function no other partition lists is partition 0's, so
 `partitions = 1` behaves like one l4h. The shim refuses, rather than
 guesses: a BDF that does not exist or is in two partitions, a bridge, a
 partition without a disk controller, functions behind a PCI(-X) bridge
-(one requester ID) split between partitions, a partition 0 without the boot
-CPU, and machines without MCFG.
+(one requester ID) split between partitions, and a partition 0 without the
+boot CPU. Without MCFG (GCE's i440FX machines) it scans through the ports
+0xcf8/0xcfc, and the descriptor's ECAM base is 0.
 
 **CPUs.** Each partition's MADT lists only its own LAPIC/x2APIC entries,
 its first CPU first, so seL4 starts exactly those. Partition 0 keeps the
@@ -3185,12 +3186,17 @@ channels, its share of the IOMMU and, for partition 0, every partition's
 CPUs, RAM and console ring and the owner of every function. Root
 (`partition.rs`) then:
 
-- reaches its own functions through ECAM (`pci.rs`), never the shared
-  0xcf8/0xcfc pair, and walks the descriptor's list instead of all buses;
-  it may also read, never write, the bridges above its functions and the
-  IOMMUs' functions (the descriptor's `upstream` list, mapped read-only),
-  which say which IOMMU unit's device scope covers a function and which
-  requester ID a function behind a PCIe-to-PCI bridge borrows;
+- reaches its own functions through ECAM (`pci.rs`), and walks the
+  descriptor's list instead of all buses; it may also read, never write,
+  the bridges above its functions and the IOMMUs' functions (the
+  descriptor's `upstream` list, mapped read-only), which say which IOMMU
+  unit's device scope covers a function and which requester ID a function
+  behind a PCIe-to-PCI bridge borrows; partition 0, which builds every
+  unit's context tables, reads every partition's functions. Without ECAM
+  the shared 0xcf8/0xcfc pair carries the same accesses, each address and
+  data under a ticket lock in the shared region's control page, and root
+  refuses the rest as ECAM would (reads of other functions return all
+  ones, writes are dropped);
 - in partition 0 only: the RTC, reset, serial monitor, framebuffer
   dashboard, balloon and TPM (a secondary's ACPI copy has no TPM2);
 - in partition 0, copies the other kernels' console rings to the serial

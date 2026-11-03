@@ -158,9 +158,11 @@ extern "C" fn shim_main(magic: u32, info: u64) -> ! {
     let Some(bsp_index) = cpus.iter().position(|c| c.apic_id == bsp) else {
         fail(format_args!("the boot CPU (APIC ID {}) is not in the MADT", bsp))
     };
+    // Without MCFG (GCE's i440FX), PCI configuration through ports: the
+    // partitions' roots then share them under a lock (ecam_base 0).
     let pci = pci::Pci::new(acpi.ecam());
-    if n > 1 && acpi.ecam().is_none() {
-        fail(format_args!("no MCFG: partitions need PCI ECAM"));
+    if acpi.ecam().is_none() {
+        println!("no MCFG: PCI configuration through ports 0xcf8/0xcfc");
     }
     let funcs = pci.scan();
 

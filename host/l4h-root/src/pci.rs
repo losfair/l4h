@@ -21,6 +21,11 @@ pub struct Pci {
     /// are shared with the other partitions' roots.
     #[cfg(target_arch = "x86_64")]
     ecam: bool,
+    /// A partition on a machine without ECAM (no MCFG): the ports, under
+    /// the partitions' lock (iommu/shared.rs), with the same reach as
+    /// ECAM would give it (ECAM_MAPPED, ECAM_WRITABLE).
+    #[cfg(target_arch = "x86_64")]
+    shared_ports: bool,
     #[cfg(target_arch = "aarch64")]
     next_bar: core::cell::Cell<u64>,
 }
@@ -212,7 +217,24 @@ impl Pci {
             .cap()
             .ioport_control_issue(CONFIG_ADDRESS as u64, CONFIG_DATA as u64 + 3, &dst)
             .expect("PCI config I/O ports");
-        let Some(d) = crate::partition::get() else { return Pci { port: s as u64, ecam: false } };
+        let Some(d) = crate::partition::get() else { return Pci { port: s as u64, ecam: false, shared_ports: false } };
+        let others = d.owners().iter().filter(|o| o.partition as u32 != d.index).map(|o| o.bdf);
+        if d.ecam_base == 0 {
+            // No ECAM: the ports, for what ECAM would reach.
+            let set = |map: &[core::sync::atomic::AtomicU64; 1024], bdf: u16| {
+                map[bdf as usize / 64].fetch_or(1 << (bdf % 64), core::sync::atomic::Ordering::Relaxed);
+            };
+            for f in d.funcs() {
+                set(&ECAM_MAPPED, f.bdf);
+                set(&ECAM_WRITABLE, f.bdf);
+            }
+            for bdf in d.upstream().iter().copied().chain(others) {
+                set(&ECAM_MAPPED, bdf);
+            }
+            assert!(d.count == 1 || crate::iommu::shared::get().is_some(), "l4h-root: PCI configuration needs the partitions' lock");
+            info!("l4h-root: no ECAM: PCI configuration through ports, under the partitions' lock");
+            return Pci { port: s as u64, ecam: false, shared_ports: true };
+        }
         for f in d.funcs() {
             let paddr = d.ecam_base as usize + ((f.bdf as usize) << 12);
             if (f.bdf >> 8) as u8 > d.ecam_bus_end
@@ -229,7 +251,6 @@ impl Pci {
         // faults instead of reprogramming another partition's hardware.
         // The IOMMU code reads them like any function (device scopes,
         // requester aliases).
-        let others = d.owners().iter().filter(|o| o.partition as u32 != d.index).map(|o| o.bdf);
         for bdf in d.upstream().iter().copied().chain(others) {
             let paddr = d.ecam_base as usize + ((bdf as usize) << 12);
             if (bdf >> 8) as u8 > d.ecam_bus_end || crate::partition::map_rights(alloc, _devmem, paddr, 4096,
@@ -239,7 +260,7 @@ impl Pci {
             }
             ECAM_MAPPED[bdf as usize / 64].fetch_or(1 << (bdf % 64), core::sync::atomic::Ordering::Relaxed);
         }
-        Pci { port: s as u64, ecam: true }
+        Pci { port: s as u64, ecam: true, shared_ports: false }
     }
 
     fn ecam_va(bdf: u16) -> usize {
@@ -270,12 +291,34 @@ impl Pci {
             return self.ecam_page(bus, dev, func)
                 .map_or(u32::MAX, |p| unsafe { ((p + (off as usize & 0xfc)) as *const u32).read_volatile() });
         }
+        let bdf = (bus as u16) << 8 | (dev as u16) << 3 | func as u16;
+        if self.shared_ports && !Self::bit(&ECAM_MAPPED, bdf) {
+            return u32::MAX;
+        }
         let port = self.port;
-        sel4::with_ipc_buffer_mut(|ipc| {
+        self.ports(|| sel4::with_ipc_buffer_mut(|ipc| {
             let ipc = ipc.inner_mut();
             ipc.seL4_X86_IOPort_Out32(port, CONFIG_ADDRESS as u64, Self::addr(bus, dev, func, off));
             ipc.seL4_X86_IOPort_In32(port, CONFIG_DATA).result
-        })
+        }))
+    }
+
+    fn bit(map: &[core::sync::atomic::AtomicU64; 1024], bdf: u16) -> bool {
+        map[bdf as usize / 64].load(core::sync::atomic::Ordering::Relaxed) & (1 << (bdf % 64)) != 0
+    }
+
+    /// An address-then-data access to the ports, under the partitions'
+    /// lock when others use them too.
+    fn ports<R>(&self, f: impl FnOnce() -> R) -> R {
+        let lock = if self.shared_ports { crate::iommu::shared::get() } else { None };
+        if let Some(s) = lock {
+            s.lock_pci();
+        }
+        let r = f();
+        if let Some(s) = lock {
+            s.unlock_pci();
+        }
+        r
     }
 
     pub fn write32(&self, bus: u8, dev: u8, func: u8, off: u8, val: u32) {
@@ -290,12 +333,16 @@ impl Pci {
             }
             return;
         }
+        if self.shared_ports && !Self::bit(&ECAM_WRITABLE, (bus as u16) << 8 | (dev as u16) << 3 | func as u16) {
+            log!("l4h-root: write to PCI function {:02x}:{:02x}.{}, which is not this partition's, refused", bus, dev, func);
+            return;
+        }
         let port = self.port;
-        sel4::with_ipc_buffer_mut(|ipc| {
+        self.ports(|| sel4::with_ipc_buffer_mut(|ipc| {
             let ipc = ipc.inner_mut();
             ipc.seL4_X86_IOPort_Out32(port, CONFIG_ADDRESS as u64, Self::addr(bus, dev, func, off));
             ipc.seL4_X86_IOPort_Out32(port, CONFIG_DATA as u64, val as u64);
-        });
+        }));
     }
 
 }
