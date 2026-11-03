@@ -59,7 +59,7 @@ fi
 conf=$out/l4h-mk.conf
 echo "partitions = $n" > "$conf"
 [ "$n" -lt 2 ] || echo "link.p0-p1 = 1" >> "$conf"
-devices=()
+devices=() cmdline=()
 mods="$out/l4h-root.elf l4h-root,$out/vmlinux guest-kernel,$out/dom0.cpio.gz dom0-initrd,$conf l4h-mk.conf"
 for k in $(seq 0 $((n - 1))); do
     disk=$((4 + 2 * k)) nic=$((5 + 2 * k))
@@ -73,8 +73,10 @@ for k in $(seq 0 $((n - 1))); do
     # Partitions 0 and 1 know their peer over the link.
     peer=
     [ "$k" -lt 2 ] && peer=" MKPEER=$((1 - k))"
-    printf 'dom0_cmdline="console=hvc0 MKP=%d%s%s %s"\ndom0_mem_mb=256\nboot_disk=00:%02x.0\nuplink_nic=00:%02x.0%s\n' \
-        "$k" "$peer" "${nonce:+ attest_nonce=$nonce}" "${mkiommu[*]}" "$disk" "$nic" "$dom0_disks" > "$out/p$k.conf"
+    # The attestation check measures this exact command line.
+    cmdline[k]="console=hvc0 MKP=$k$peer${nonce:+ attest_nonce=$nonce}${mkiommu[*]:+ ${mkiommu[*]}}"
+    printf 'dom0_cmdline="%s"\ndom0_mem_mb=256\nboot_disk=00:%02x.0\nuplink_nic=00:%02x.0%s\n' \
+        "${cmdline[k]}" "$disk" "$nic" "$dom0_disks" > "$out/p$k.conf"
     mods+=",$out/p$k.conf p$k:l4h-config,$root/build/mkshim/kernel-s$k.elf kernel-s$k"
 done
 
@@ -191,7 +193,7 @@ for k in $(seq 0 $((n - 1))); do
     vm_launch=$(python3 "$tool" measure "$out/vmlinux" --initrd "$out/vm.cpio.gz" \
         --cmdline "console=hvc0 MKP=$k attest_nonce=$nonce")
     dom0_launch=$(python3 "$tool" measure "$out/vmlinux" --initrd "$out/dom0.cpio.gz" \
-        --cmdline "console=hvc0 MKP=$k attest_nonce=$nonce")
+        --cmdline "${cmdline[k]}")
     python3 "$tool" verify "$a/vm.report" "$a/evidence" --data "$nonce" --launch "$vm_launch" --ek-ca "$ca" \
         > "$a/vm.json" 2>/dev/null || fail "partition $k: the VM's report"
     python3 "$tool" verify "$a/dom0.report" "$a/evidence" --data "$nonce" --launch "$dom0_launch" --ek-ca "$ca" \
