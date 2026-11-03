@@ -1635,7 +1635,7 @@ device, with no trapped accesses:
 checks block I/O and networking at high device indices alongside a GPU,
 rejects a 65th device, and restarts dom0 while a full guest survives.
 
-### 9.2 Block: shared controllers and LBA windows
+### 9.2 Block: shared controllers, LBA windows and extent volumes
 
 Each physical virtio-blk, virtio-scsi or NVMe PCI controller has one
 persistent `l4h-blkd`. `BLK_ATTACH` attaches a finite, 4 KiB aligned LBA
@@ -1645,6 +1645,43 @@ seeded image can back many guests. Every window is a separate virtio-blk
 volume starting at sector zero. There is no image format, host filesystem,
 thin provisioning or copy-on-write.
 
+**Extent volumes (LVM-compatible).** `BLK_ATTACH_EXTENTS` attaches instead
+a list of up to 4096 4 KiB aligned extents of one disk, joined in order
+into one guest disk: an LVM2 linear logical volume, among others. It takes
+the same flags as `BLK_ATTACH`. The host never reads LVM metadata. dom0
+runs stock LVM2, and `l4hctl lv-extents` / `--lv` turn a linear LV on one
+PV into extents from `lvm`'s own reports (segments in LV order, physical
+extents to host sectors, adjacent runs joined); thin, snapshot, origin,
+mirror, RAID and cache volumes are refused. The bytes the guest sees are
+those dm-linear maps from the same metadata, so the disk stays an ordinary
+LVM2 PV. With several extents each is at least 4 MiB (LVM's default extent
+size): a request is at most 3.5 MiB (14 segments of 256 KiB), so it crosses
+at most one boundary, and blkd splits such a request into two device
+requests. If the device has no room for the second when the first starts,
+it waits ("carry") and starts before any new request; the guest gets one
+completion, with the first error. The overlap rule applies extent by
+extent: dom0 can only reattach the physical extents of a removed LV once no
+guest holds them, and provisioning (`BLK_WRITE`) refuses every attached
+extent.
+
+- **Where the list goes.** dom0 writes the list into its control data area.
+  Root bounds its count and offset and copies the bytes, unread, into
+  blkd's staging buffer, as it does for `BLK_WRITE`. `BLKD_CHECK` builds and
+  checks the disk there; `BLKD_ADD` builds it again into the client's
+  extent table: frames root allocates per attachment (two pages for a
+  window, 27 for 4096 extents) and maps into blkd alone, at
+  `extent_va(client)`. The table holds the extents sorted by start, for
+  linear-time overlap checks, and their guest order, for a binary search per
+  request. blkd checks the sorted order, disjointness and that the guest
+  order chains from offset 0 before it uses a table. A window is a table of
+  one extent, so windows and volumes share one path.
+- **dom0's view of a PV.** dom0 never holds a PV's data area: its boot plan
+  gives it only the PV's head (label and metadata, up to `pe_start`). To
+  edit the VG, dom0 builds a device-mapper device of the PV's size from that
+  window and an `error` target for the rest, and runs LVM with activation
+  off and `lvcreate -Zn -Wn`; data written by mistake fails loudly.
+  `l4hctl disk-zero` and `disk-write` zero or seed an LV's extents while
+  it is unattached.
 - **Path.** Guest `virtio_blk` → l4h-vmm → per-client shared queue → blkd →
   device.
 - **Guest queues.** Volumes offer four request queues through
@@ -1728,9 +1765,11 @@ thin provisioning or copy-on-write.
   and the host boots without them. Clients and quarantine are per
   controller.
 - **Queries.** `DISK_INFO` returns the PCI address, kind, failed flag,
-  capacity and attachment count (the owner field names the first
-  attachment, or -1); `BLK_INFO` enumerates `(vm, start, sectors,
-  read-only)` with a cursor.
+  capacity and attachment count (volumes, not extents; the owner field
+  names the first attachment, or -1); `BLK_INFO` enumerates `(vm, start,
+  sectors, read-only, extent)` with a cursor: a row per window, or per
+  extent of a volume in guest order, which root asks blkd for
+  (`BLKD_EXTENT`; unknown once the controller is quarantined).
 
 `tests/run-sharedblk.sh` checks concurrent clients, overlap and bounds
 rejection, provisioning exclusion, destroy during I/O, read-only windows
@@ -1738,7 +1777,13 @@ shared by several guests, more than 64 attachments of one disk,
 flush/readback and repeated reuse, on virtio-blk, virtio-scsi (also with
 both disks as LUNs of one controller) and NVMe (512 and 4096 byte blocks).
 `tests/blk-windows.rs` exercises the production validator on malformed
-requests and window/pool boundaries.
+requests and window/pool boundaries, extent tables (building, tampering,
+splitting and a randomized byte-coverage check) and blkd's range decisions
+against a per-block model. `tests/run-lvmblk.sh` attaches an LV whose guest
+order differs from its disk order, as `l4hctl lv-extents` reads it from
+LVM2 on the build host, writes and reads it across extent boundaries in a
+guest, checks overlap and provisioning refusal, and then has the build
+host's dm-linear read back the same bytes.
 
 ### 9.3 Network: L2 virtual switches only
 
@@ -3621,6 +3666,7 @@ machine and guests of 256–512 MiB.
 | `tests/run-android.sh`, `tests/run-androidtest.sh` | Android 17 boot to the lock screen; Android's kernel features (§5.8) |
 | `tests/run-blktest.sh` (`BLKTEST_DEV=nvme`, `scsi`, `scsi-legacy`, `scsi-luns`, `virtio-legacy`) | disk pass-through, data integrity |
 | `tests/run-sharedblk.sh` | shared controllers: concurrent clients, windows, provisioning, destroy during I/O |
+| `tests/run-lvmblk.sh` | LVM linear volumes as extent disks: dm-linear agreement, split requests, overlap and provisioning refusal (needs `lvm2` on the build host) |
 | `tests/run-ctltest.sh` | VM lifecycle, console, clean shutdown, disk re-attach, windows, reclaim |
 | `tests/run-devicelimit.sh` | 64 devices per guest |
 | `tests/run-gputest.sh` | virtio-gpu drawing, screenshots, size checks and reclaim |

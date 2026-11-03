@@ -1,0 +1,28 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-2-Clause
+# l4h-lvm-pv DEVICE [NAME]: in dom0, make DEVICE, dom0's window of an LVM2
+# PV's head (its label and metadata, up to pe_start), look like the whole
+# PV to LVM: /dev/mapper/NAME (default l4h-pv-DEVICE), as large as the PV,
+# reads and writes DEVICE and fails every access after it. Guests hold the
+# PV's data. See the manual's "LVM logical volumes".
+set -eu
+dev=$1
+name=${2:-l4h-pv-$(basename "$dev")}
+head=$(blockdev --getsz "$dev")
+# The PV's size is in its label, in one of the first four sectors: the
+# label header's offset_xl (bytes 20-23) locates pv_header, whose
+# device_size_xl follows the 32-byte UUID.
+size=
+for s in 0 1 2 3; do
+    if [ "$(dd if="$dev" bs=512 skip=$s count=1 2>/dev/null | head -c 8)" = LABELONE ]; then
+        off=$(od -An -t u4 -j $((s * 512 + 20)) -N 4 "$dev" | tr -d ' ')
+        size=$(( $(od -An -t u8 -j $((s * 512 + off + 32)) -N 8 "$dev" | tr -d ' ') / 512 ))
+        break
+    fi
+done
+if [ -z "$size" ] || [ "$size" -le "$head" ]; then
+    echo "l4h-lvm-pv: $dev: no LVM2 label of a PV larger than it" >&2
+    exit 1
+fi
+printf '0 %s linear %s 0\n%s %s error\n' "$head" "$dev" "$head" "$((size - head))" | dmsetup create "$name"
+echo "/dev/mapper/$name"
