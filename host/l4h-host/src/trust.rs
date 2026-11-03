@@ -14,6 +14,9 @@ use l4h_abi as abi;
 pub const TPM_NONE: u32 = 0;
 pub const TPM_TIS: u32 = 1;
 pub const TPM_CRB: u32 = 2;
+/// A multikernel secondary: the primary's trustd has the TPM, and quotes
+/// this trustd's key and runs its ActivateCredential through the relay.
+pub const TPM_REMOTE: u32 = 3;
 
 /// How a CRB command starts (the ACPI TPM2 start method).
 /// The start register (7).
@@ -58,6 +61,10 @@ pub struct TrustdConfig {
     /// START_ACPI: the firmware's ACPI tables at AML_VA, back to back with
     /// their headers: the FADT, the DSDT, then the SSDTs.
     pub aml_size: u64,
+    /// Multikernel: this partition and how many there are; 1 partition
+    /// when root is the only kernel (no relay).
+    pub partition: u32,
+    pub partitions: u32,
 }
 
 pub const TPM_VA: usize = crate::MMIO_VA;
@@ -84,6 +91,73 @@ pub const FLAGS_VA: usize = crate::SHARED_VA + 0x8_0000;
 /// Only the flags thread uses this writable alias. All readers use FLAGS_VA.
 pub const FLAGS_WRITE_VA: usize = FLAGS_VA + FLAGS_SIZE;
 pub const FLAGS_SIZE: usize = 8192;
+
+/// The relay between partitions' trustds (multikernel only, DESIGN.md
+/// §10.2): the primary's trustd, which has the TPM, quotes each other
+/// partition's key and runs their ActivateCredential.  Root carries the
+/// messages over the control channels (MSG_TPM_REQUEST, MSG_TPM_REPLY),
+/// which may lose them: requests have ids, the requester retries, and the
+/// primary answers a repeated id again without using the TPM again.
+///
+/// The relay pages are slots of RELAY_SLOT_SIZE: a `RelaySlot` header,
+/// then a message.  trustd writes a message to the outbox, slot 0 at
+/// RELAY_VA, and calls root (ROOT_CALL_RELAY), which copies it to the
+/// channel.  Root writes what comes from partition k into inbox slot k
+/// (relay_slot_va(k), seqlocked) and signals the kick with RELAY_BADGE.
+/// While a secondary waits for an answer, it sets the outbox's `wake`, and
+/// root signals the kick on its timer too, so that trustd can send the
+/// request again or give up.
+pub const RELAY_VA: usize = crate::SHARED_VA + 0xa_0000;
+pub const RELAY_SLOT_SIZE: usize = 12 * 1024;
+pub const RELAY_PAGES: usize = (1 + MAX_PARTITIONS) * RELAY_SLOT_SIZE / 4096;
+/// Partition k's inbox slot (the outbox is at RELAY_VA).
+pub const fn relay_slot_va(partition: usize) -> usize {
+    RELAY_VA + (1 + partition) * RELAY_SLOT_SIZE
+}
+/// The partitions a relay serves (l4h_partition::MAX_PARTITIONS).
+pub const MAX_PARTITIONS: usize = 8;
+/// The largest message: a reply with the evidence (EVIDENCE_MAX in
+/// trustd) and its header; it fits a channel message.
+pub const RELAY_MSG_MAX: usize = 9216;
+/// Also guest 63's kick bit: kicks are only hints (trustd answers a guest
+/// whose page has a new seq), so trustd looks at both.
+pub const RELAY_BADGE: u64 = 1 << 63;
+const _: () = assert!(RELAY_BADGE == kick_badge(MAX_RECORDS - 1));
+const _: () = assert!(FLAGS_WRITE_VA + FLAGS_SIZE <= RELAY_VA && RELAY_VA + RELAY_PAGES * 4096 <= AML_VA);
+const _: () = assert!(RELAY_MSG_MAX + core::mem::size_of::<RelaySlot>() <= RELAY_SLOT_SIZE);
+
+/// A relay slot's header; the message follows.  In an inbox slot root
+/// makes `seq` odd while it writes the slot.  In the outbox, trustd sets
+/// `wake` while it waits for an answer.
+#[repr(C)]
+pub struct RelaySlot {
+    pub seq: AtomicU32,
+    pub len: AtomicU32,
+    pub wake: AtomicU32,
+    pub _pad: u32,
+}
+pub const RELAY_SLOT_HEADER: usize = core::mem::size_of::<RelaySlot>();
+
+/// A message: RelayHeader, then `len` bytes.  A request's `op` is
+/// RELAY_KEY or RELAY_ACTIVATE; a reply has the request's id and `op` and
+/// its status (0 or -errno) in `status`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct RelayHeader {
+    pub id: u64,
+    pub op: u32,
+    pub status: i32,
+    pub len: u32,
+    pub _pad: u32,
+}
+pub const RELAY_HEADER: usize = core::mem::size_of::<RelayHeader>();
+
+/// Quote this key (its SEC1 point, 65 bytes) and extend PCR 15 with it,
+/// once per partition; the reply is the partition's evidence.
+pub const RELAY_KEY: u32 = 1;
+/// ActivateCredential: u32 blob length, the blob, the secret; the reply
+/// is the credential.
+pub const RELAY_ACTIVATE: u32 = 2;
 pub const FLAGS_ROOT: u64 = 1;
 pub const FLAGS_TRUSTD: u64 = 2;
 pub const FLAGS_READY: u64 = 0;

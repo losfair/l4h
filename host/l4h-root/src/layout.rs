@@ -95,6 +95,8 @@ regions! {
     TRUSTD_REGISTRY = 0x7500_0000_0000, PAGE;
     /// trustd flags, read-only in root.
     TRUSTD_FLAGS = 0x7500_0001_0000, l4h_host::trust::FLAGS_SIZE;
+    /// trustd's relay to other partitions' trustds (trustd.rs).
+    TRUSTD_RELAY = 0x7500_0002_0000, l4h_host::trust::RELAY_PAGES * PAGE;
     /// memd's status page (memd.rs).
     MEMD_STATUS = 0x7700_0000_0000, PAGE;
     /// x86 multikernel partitions: each PCI function's ECAM page, by BDF
