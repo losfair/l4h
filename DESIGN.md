@@ -342,7 +342,8 @@ Patches outside `arch/l4h` (`guest/linux/patches`) cover kbuild's UML-style
 UAPI headers, restricted DMA pools without a device tree (§8.1), the
 HRTICK default, the x86 SIMD crypto menu, event polling in `cond_resched`
 (§5.4), the BPF JITs (§5.7), Rust targets for kemu, attestation taint
-hooks (§10.2) and the Android features of §5.8.
+hooks (§10.2), the Android features of §5.8 and x86's
+`load_unaligned_zeropad()` (§5.2).
 
 ### 5.2 Address spaces
 
@@ -385,7 +386,12 @@ hooks (§10.2) and the Android features of §5.8.
   checked block by block (`l4h_kernel_range_ok()`, used by `/dev/mem` and
   BPF `probe_read_kernel`). A block being converted is marked busy first,
   and its frames are revoked only once no access that found it mapped is
-  still between its check and its access.
+  still between its check and its access. For the same reason the x86_64
+  `load_unaligned_zeropad()` (checksum tails, dcache name hashing,
+  `strscpy`, siphash) cannot rely on x86's `EX_TYPE_ZEROPAD` fixup: a word
+  that crosses into the next page reads it only when that page passes the
+  same check, and otherwise loads the aligned word ending its own page and
+  shifts in zeroes.
 
 ### 5.3 Memory management: Linux page tables mirrored into seL4
 
