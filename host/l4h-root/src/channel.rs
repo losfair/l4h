@@ -23,6 +23,7 @@
 
 use l4h_partition::{self as part, Channel, MsgReader, MsgRing};
 use sel4::cap_type;
+#[cfg(target_arch = "x86_64")]
 use sel4::init_thread::slot;
 
 use crate::Host;
@@ -138,7 +139,13 @@ impl Channels {
 }
 
 /// An IRQ handler for doorbell `vector`, signalling `ntfn`; in a new root
-/// slot.
+/// slot.  Partitions are x86_64 only.
+#[cfg(not(target_arch = "x86_64"))]
+pub fn doorbell(_: &mut Alloc, _: u32, _: sel4::cap::Notification) -> Option<sel4::cap::IrqHandler> {
+    None
+}
+
+#[cfg(target_arch = "x86_64")]
 pub fn doorbell(alloc: &mut Alloc, vector: u32, ntfn: sel4::cap::Notification) -> Option<sel4::cap::IrqHandler> {
     let irq_slot = alloc.slots.alloc();
     let dst = crate::component::abs_of(sel4::init_thread::Slot::<cap_type::Null>::from_index(irq_slot).cap());
@@ -149,6 +156,10 @@ pub fn doorbell(alloc: &mut Alloc, vector: u32, ntfn: sel4::cap::Notification) -
 }
 
 /// Ring a peer's doorbell.
+#[cfg(not(target_arch = "x86_64"))]
+pub fn ring(_: u32, _: u32) {}
+
+#[cfg(target_arch = "x86_64")]
 pub fn ring(peer_slot: u32, vector: u32) {
     let ctl = slot::IRQ_CONTROL.cap();
     let err = sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_IRQControl_SendPeer(ctl.bits(), peer_slot as u64, vector as u64));
