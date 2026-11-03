@@ -245,7 +245,10 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
         }
         abi::CTL_BLK_ATTACH_EXTENTS => {
             let id = vm_arg(a[0])?;
-            if id == caller || a[2] & !(abi::BLK_RO | abi::BLK_VOLATILE) != 0 {
+            // Zero is the internal sentinel for a window, so forwarding an
+            // empty list would attach the whole disk instead.
+            if id == caller || a[2] & !(abi::BLK_RO | abi::BLK_VOLATILE) != 0
+                || !(1..=host::blk::MAX_EXTENTS as u64).contains(&a[4]) {
                 return Err(EINVAL);
             }
             // Root reads the list from the data area.
