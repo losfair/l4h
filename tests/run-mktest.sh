@@ -3,8 +3,10 @@
 # seL4 kernels on one QEMU q35 machine, each partition with its own CPUs,
 # RAM, virtio disk and virtio NIC.  Each partition's dom0 boots, gets an
 # address by DHCP over its own NIC, and runs a VM that no other dom0 sees;
-# a secondary's dom0 is refused host-reboot; then partition 0's dom0
-# resets the whole machine.  The other kernels' consoles reach the serial
+# a secondary's dom0 is refused host-reboot.  Partitions 0 and 1 are
+# linked (link.p0-p1): their dom0s ping each other over the link, with no
+# switch outside the machine.  Then partition 0's dom0 resets the whole
+# machine.  The other kernels' consoles reach the serial
 # port through partition 0 ("[pN]" lines).
 # MK_PARTITIONS=N (2..8) needs 2N CPUs; L4H_QEMU_IOMMU=intel|amd adds an
 # IOMMU the partitions share.  MK_BOOT=uefi or bios boots a disk image from
@@ -34,7 +36,7 @@ cp "$root/build/mkshim/l4h-mkshim.elf" "$out/"
 # Partition k has the PCI slots 4 + 2k (disk) and 5 + 2k (NIC), two CPUs
 # and 1 GiB; partition 0 the rest.
 conf=$out/l4h-mk.conf
-echo "partitions = $n" > "$conf"
+printf 'partitions = %d\nlink.p0-p1 = 1\n' "$n" > "$conf"
 devices=()
 mods="$out/l4h-root.elf l4h-root,$out/vmlinux guest-kernel,$out/dom0.cpio.gz dom0-initrd,$conf l4h-mk.conf"
 for k in $(seq 0 $((n - 1))); do
@@ -47,8 +49,11 @@ for k in $(seq 0 $((n - 1))); do
     if [ "$k" != 0 ]; then
         printf 'p%d.cpus = 2\np%d.mem = 1G\np%d.pci = 00:%02x.0, 00:%02x.0\n' "$k" "$k" "$k" "$disk" "$nic" >> "$conf"
     fi
-    printf 'dom0_cmdline=console=hvc0 MKP=%d\ndom0_mem_mb=256\nboot_disk=00:%02x.0\nuplink_nic=00:%02x.0\n' \
-        "$k" "$disk" "$nic" > "$out/p$k.conf"
+    # Partitions 0 and 1 know their peer over the link.
+    peer=
+    [ "$k" -lt 2 ] && peer=" MKPEER=$((1 - k))"
+    printf 'dom0_cmdline=console=hvc0 MKP=%d%s\ndom0_mem_mb=256\nboot_disk=00:%02x.0\nuplink_nic=00:%02x.0\n' \
+        "$k" "$peer" "$disk" "$nic" > "$out/p$k.conf"
     mods+=",$out/p$k.conf p$k:l4h-config,$root/build/mkshim/kernel-s$k.elf kernel-s$k"
 done
 
@@ -104,6 +109,7 @@ grep -aE "l4h-mkshim|MKTEST|MKVM|partition|host reboot|\[p[0-9]\] .*(panic|fault
 ok=1
 for k in $(seq 0 $((n - 1))); do
     grep -aq "MKTEST p$k: done" "$log" || { echo "partition $k did not finish"; ok=0; }
+    [ "$k" -ge 2 ] || grep -aq "MKTEST p$k: link ok" "$log" || { echo "partition $k: no ping over the link"; ok=0; }
     [ "$k" = 0 ] || grep -aq "MKTEST p$k: host-reboot refused" "$log" || { echo "partition $k: host-reboot not refused"; ok=0; }
     [ "$k" = 0 ] || grep -aq "^l4h-root: RTC set for partition $k" "$log" || { echo "partition $k: rtc-set did not reach partition 0"; ok=0; }
 done

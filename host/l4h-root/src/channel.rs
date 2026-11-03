@@ -202,8 +202,19 @@ impl Channels {
 
     /// Send a message to partition `peer` and ring its doorbell.
     pub fn send(&self, peer: u32, ty: u32, payload: &[&[u8]]) -> bool {
+        self.push(peer, ty, payload) && self.notify(peer)
+    }
+
+    /// Send a message to partition `peer` without ringing its doorbell
+    /// (`notify` rings it once for several).
+    pub fn push(&self, peer: u32, ty: u32, payload: &[&[u8]]) -> bool {
         let Some(c) = self.chans.iter().find(|c| c.desc.peer == peer) else { return false };
         c.tx.send(ty, payload);
+        true
+    }
+
+    pub fn notify(&self, peer: u32) -> bool {
+        let Some(c) = self.chans.iter().find(|c| c.desc.peer == peer) else { return false };
         ring(c.desc.peer_slot, c.desc.peer_vector);
         true
     }
@@ -257,6 +268,7 @@ pub fn poll(h: &mut Host) {
         }
     }
     h.channels = Some(cs);
+    crate::netd::link_kick(h);
 }
 
 fn u64_at(b: &[u8], i: usize) -> Option<u64> {

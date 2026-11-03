@@ -507,7 +507,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     if module("guest-kernel").is_none() {
         log!("l4h-root: no guest kernel, nothing to do");
     } else {
-        let plan = dom0_plan(&mut h);
+        let plan = dom0_plan(&mut h, wd_ntfn);
         h.vmmgr = Some(vmmgr::spawn(&mut h, &modules, &plan));
     }
     serve(&mut h, reply)
@@ -515,12 +515,17 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
 
 /// dom0's disks and vNICs, the same for every dom0 vmmgr starts: the
 /// first dom0_disks host disks, and vNICs on switch 0 (with the uplink
-/// NIC) and the other switches root makes now.
-fn dom0_plan(h: &mut Host) -> Dom0Plan {
+/// NIC) and the other switches root makes now.  `ntfn` is root's own
+/// notification, which link ports signal.
+fn dom0_plan(h: &mut Host, ntfn: cap::Notification) -> Dom0Plan {
     let mut plan = Dom0Plan::default();
+    let mut links = ArrayVec::<u32, { l4h_partition::MAX_CHANNELS }>::new();
+    for peer in h.channels.iter().flat_map(|c| c.links()) {
+        links.must_push(peer);
+    }
     // By default, room for full receive rings on all of dom0's vNICs (one
-    // per uplink switch it is given, one per internal switch).
-    let nics = h.cfg.dom0_nics + h.cfg.uplink2_nic.is_some() as usize + h.cfg.dom0_internal_switches;
+    // per uplink switch it is given, one per internal switch, one per link).
+    let nics = h.cfg.dom0_nics + h.cfg.uplink2_nic.is_some() as usize + h.cfg.dom0_internal_switches + links.len();
     plan.io_pool = match h.cfg.dom0_io_pool_mb {
         0 => l4h_host::iopool::for_nics(nics, vmmgr::IO_POOL_DEFAULT).min(256 << 20),
         mb => mb << 20,
@@ -610,6 +615,17 @@ fn dom0_plan(h: &mut Host) -> Dom0Plan {
     }
     for i in first..first + h.cfg.dom0_internal_switches {
         add_nic(i as u32, 0);
+    }
+    // Each link to another partition gets a switch of its own, with a
+    // vNIC of dom0's: partitions meet where their dom0s connect them,
+    // never on each other's uplink network.
+    for &peer in links.iter() {
+        let sw = h.netd.create_switch();
+        match h.netd.add_link(peer, sw, ntfn, &mut h.alloc) {
+            Ok(p) => info!("l4h-root: link to partition {} on switch {} (port {})", peer, sw, p),
+            Err(e) => log!("l4h-root: no link to partition {}: error {}", peer, e),
+        }
+        add_nic(sw, 0);
     }
     // Reserve the whole plan before vmmgr can attach anything. Reservations
     // also cover placeholders and survive dom0 restarts, so no system range
@@ -705,12 +721,15 @@ fn serve(h: &mut Host, reply_slot: ReplySlot) -> ! {
     let (mut info, mut badge) = hyp_ep.recv(reply);
     loop {
         h.alloc.refill();
-        let notified = badge & (TIMER_BADGE | monitor::MONITOR_BADGE | channel::CHANNEL_BADGE) != 0;
+        let notified = badge & (TIMER_BADGE | monitor::MONITOR_BADGE | channel::CHANNEL_BADGE | netd::LINK_BADGE) != 0;
         if badge & monitor::MONITOR_BADGE != 0 {
             monitor::Monitor::interrupt(h);
         }
         if badge & channel::CHANNEL_BADGE != 0 {
             channel::poll(h);
+        }
+        if badge & netd::LINK_BADGE != 0 {
+            netd::link_poll(h);
         }
         let resp = if notified {
             if badge & TIMER_BADGE != 0 {
