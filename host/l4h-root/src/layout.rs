@@ -97,6 +97,16 @@ regions! {
     TRUSTD_FLAGS = 0x7500_0001_0000, l4h_host::trust::FLAGS_SIZE;
     /// memd's status page (memd.rs).
     MEMD_STATUS = 0x7700_0000_0000, PAGE;
+    /// x86 multikernel partitions: each PCI function's ECAM page, by BDF
+    /// (pci.rs).
+    ECAM_X86 = 0x6100_0000_0000, 256 * MIB;
+    /// The primary partition's view of the other kernels' console rings
+    /// (partition.rs).
+    PARTITION_RINGS = 0x6200_0000_0000, 8 * 64 * 1024;
+    /// The partition's channels to the others, 256 KiB each (channel.rs).
+    PARTITION_CHANNELS = 0x6200_0100_0000, 8 * 256 * 1024;
+    /// The IOMMU state all partitions share (DESIGN.md §4.6).
+    IOMMU_SHARED = 0x6200_0200_0000, 8 * MIB;
     /// IOMMU registers: 16 KiB per AMD-Vi unit, 64 KiB per VT-d unit.
     IOMMU_MMIO = 0x7800_0000_0000, MIB;
     /// The IOMMUs' device table, I/O page tables, command buffers and

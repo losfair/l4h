@@ -1,0 +1,149 @@
+From d890fedd987786b7d721932df0e04d3742a14f30 Mon Sep 17 00:00:00 2001
+From: l4h <l4h@localhost>
+Date: Tue, 3 Nov 2026 01:03:20 -0800
+Subject: [PATCH 32/36] x86: choose the APs' boot page on the command line
+
+---
+ include/arch/x86/arch/kernel/cmdline.h |  7 +++++
+ src/arch/x86/kernel/cmdline.c          | 37 ++++++++++++++++++++++++++
+ src/arch/x86/kernel/smp_sys.c          | 17 +++++++++---
+ 3 files changed, 57 insertions(+), 4 deletions(-)
+
+diff --git a/include/arch/x86/arch/kernel/cmdline.h b/include/arch/x86/arch/kernel/cmdline.h
+index 523d7d7..1d1e219 100644
+--- a/include/arch/x86/arch/kernel/cmdline.h
++++ b/include/arch/x86/arch/kernel/cmdline.h
+@@ -17,7 +17,14 @@ typedef struct cmdline_opt {
+ #ifdef CONFIG_PRINTING
+     bool_t   fb_console;
+ #endif
++    /* Page below 1 MiB that the APs start in (ap_boot_page=, default
++     * BOOT_NODE_PADDR): kernels that share a machine boot their APs at
++     * once, each from a page of its own. */
++    word_t   ap_boot_page;
+ } cmdline_opt_t;
+ 
+ void cmdline_parse(const char *cmdline, cmdline_opt_t *cmdline_opt);
+ 
++/* The options the boot loader gave (boot_sys.c). */
++extern cmdline_opt_t cmdline_opt;
++
+diff --git a/src/arch/x86/kernel/cmdline.c b/src/arch/x86/kernel/cmdline.c
+index 211cf84..9b37720 100644
+--- a/src/arch/x86/kernel/cmdline.c
++++ b/src/arch/x86/kernel/cmdline.c
+@@ -9,6 +9,8 @@
+ #include <machine/io.h>
+ #include <arch/kernel/cmdline.h>
+ #include <arch/kernel/boot_sys.h>
++#include <arch/kernel/smp_sys.h>
++#include <plat/machine.h>
+ #include <linker.h>
+ #include <plat/machine/io.h>
+ 
+@@ -82,6 +84,29 @@ static int parse_bool(const char *cmdline, const char *opt)
+     }
+ }
+ 
++/* Up to array_size comma-separated numbers (decimal or 0x hex) into
++ * array; the rest of array is left alone.  Returns how many it read. */
++static int UNUSED parse_word_array(char *str, word_t *array, int array_size)
++{
++    int i = 0;
++    while (str && *str && i < array_size) {
++        char *last = str;
++        for (; *str && *str != ','; str++);
++        if (*str == 0) {
++            str = 0;
++        } else {
++            *str = 0;
++            str++;
++        }
++        long v = str_to_long(last);
++        if (v == -1) {
++            return i;
++        }
++        array[i++] = v;
++    }
++    return i;
++}
++
+ static void UNUSED parse_uint16_array(char *str, uint16_t *array, int array_size)
+ {
+     char *last;
+@@ -167,6 +192,18 @@ void cmdline_parse(const char *cmdline, cmdline_opt_t *cmdline_opt)
+ #ifdef CONFIG_PRINTING
+     cmdline_opt->fb_console = parse_bool(cmdline, cmdline_str_fb_console);
+ #endif
++    cmdline_opt->ap_boot_page = BOOT_NODE_PADDR;
++    if (parse_opt(cmdline, "ap_boot_page", cmdline_val, MAX_CMDLINE_VAL_LEN) != -1) {
++        word_t page = 0;
++        if (parse_word_array(cmdline_val, &page, 1) == 1 && page != 0 && IS_ALIGNED(page, PAGE_BITS)
++            && page < BIOS_PADDR_START) {
++            cmdline_opt->ap_boot_page = page;
++        } else {
++            printf("Boot config: ignoring ap_boot_page=%s\n", cmdline_val);
++        }
++    }
++    printf("Boot config: ap_boot_page = 0x%lx\n", cmdline_opt->ap_boot_page);
++
+     cmdline_opt->disable_iommu = parse_bool(cmdline, cmdline_str_disable_iommu);
+     printf("Boot config: disable_iommu = %s\n", cmdline_opt->disable_iommu ? "true" : "false");
+ }
+diff --git a/src/arch/x86/kernel/smp_sys.c b/src/arch/x86/kernel/smp_sys.c
+index 3e049f3..5e30a3c 100644
+--- a/src/arch/x86/kernel/smp_sys.c
++++ b/src/arch/x86/kernel/smp_sys.c
+@@ -9,6 +9,7 @@
+ #include <arch/machine/timer.h>
+ #include <arch/kernel/boot_sys.h>
+ #include <arch/kernel/smp_sys.h>
++#include <arch/kernel/cmdline.h>
+ #include <smp/lock.h>
+ 
+ #ifdef ENABLE_SMP_SUPPORT
+@@ -62,7 +63,7 @@ BOOT_CODE void start_boot_aps(void)
+          * as APIC ID are not continoius e.g. 0,2,1,3 for 4 cores with hyperthreading
+          * we need to store a mapping to translate the index to real APIC ID */
+         cpu_mapping.index_to_cpu_id[current_ap_index] = boot_state.cpus[current_ap_index];
+-        start_cpu(boot_state.cpus[current_ap_index], BOOT_NODE_PADDR);
++        start_cpu(boot_state.cpus[current_ap_index], cmdline_opt.ap_boot_page);
+ 
+         /* wait for current AP to boot up */
+         while (smp_aps_index == current_ap_index) {
+@@ -82,13 +83,21 @@ BOOT_CODE bool_t copy_boot_code_aps(uint32_t mem_lower)
+      * is free according to multiboot. As boot_cpu_end and boot_cpu_start are link time
+      * symbols (and not compile time) this cannot be a compile time check */
+     word_t boot_size = (word_t)(boot_cpu_end - boot_cpu_start);
+-    word_t boot_node_top = BOOT_NODE_PADDR + boot_size;
++    word_t page = cmdline_opt.ap_boot_page;
++    word_t boot_node_top = page + boot_size;
+     word_t mem_lower_bytes = mem_lower << 10;
+-    if (boot_node_top > BOOT_NODE_MAX_PADDR) {
++    /* The default page must stay below the boot sector at 0x7c00; another
++     * one (a partition's, from ap_boot_page=) only within conventional
++     * memory, which mem_lower bounds below. */
++    if (page == BOOT_NODE_PADDR && boot_node_top > BOOT_NODE_MAX_PADDR) {
+         printf("AP boot code does not fit in chosen memory hole. Can be at most %lu, is %lu\n",
+                (word_t)(BOOT_NODE_MAX_PADDR - BOOT_NODE_PADDR), boot_size);
+         return false;
+     }
++    if (boot_node_top > page + BIT(PAGE_BITS)) {
++        printf("AP boot code does not fit in a page: %lu bytes\n", boot_size);
++        return false;
++    }
+     if (mem_lower_bytes < boot_node_top) {
+         printf("Need lower physical memory up to %lu to be free. Multiboot reports only up to %lu\n",
+                boot_node_top, mem_lower_bytes);
+@@ -96,7 +105,7 @@ BOOT_CODE bool_t copy_boot_code_aps(uint32_t mem_lower)
+     }
+ 
+     /* copy CPU bootup code to lower memory */
+-    memcpy((void *)BOOT_NODE_PADDR, boot_cpu_start, boot_size);
++    memcpy((void *)page, boot_cpu_start, boot_size);
+     return true;
+ }
+ 
+-- 
+2.47.3
+

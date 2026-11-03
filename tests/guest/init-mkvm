@@ -1,0 +1,6 @@
+#!/bin/sh
+# A VM for tests/run-mktest.sh.
+mount -t proc proc /proc
+echo "MKVM: partition ${MKP:-?}, $(nproc) CPU(s), $(sed -n 's/MemTotal: *//p' /proc/meminfo)"
+echo "MKVM: done"
+poweroff -f

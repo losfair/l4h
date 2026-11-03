@@ -1,0 +1,161 @@
+From 7599af4b4c0093873ad52b6db91c6918bc76e878 Mon Sep 17 00:00:00 2001
+From: l4h <l4h@localhost>
+Date: Tue, 3 Nov 2026 01:05:31 -0800
+Subject: [PATCH 36/36] x86: IRQControl_SendPeer, an interrupt to another
+ kernel's CPU
+
+---
+ include/arch/x86/arch/model/statedata.h       |  5 ++++
+ .../x86/interfaces/object-api-arch.xml        | 29 +++++++++++++++++++
+ src/arch/x86/kernel/cmdline.c                 | 11 +++++++
+ src/arch/x86/model/statedata.c                |  2 ++
+ src/arch/x86/object/interrupt.c               | 28 ++++++++++++++++++
+ 5 files changed, 75 insertions(+)
+
+diff --git a/include/arch/x86/arch/model/statedata.h b/include/arch/x86/arch/model/statedata.h
+index eeb488e..76e62cc 100644
+--- a/include/arch/x86/arch/model/statedata.h
++++ b/include/arch/x86/arch/model/statedata.h
+@@ -86,6 +86,11 @@ extern uint16_t x86KSconsolePort;
+ #endif
+ #if defined(CONFIG_PRINTING) || defined(CONFIG_DEBUG_BUILD)
+ extern uint16_t x86KSdebugPort;
++/* APIC IDs of other kernels' CPUs that IRQControl_SendPeer may signal
++ * (peers= on the command line). */
++#define X86_MAX_PEERS 8
++extern word_t x86KSnumPeers;
++extern uint32_t x86KSpeerApicIds[X86_MAX_PEERS];
+ #endif
+ 
+ extern x86_irq_state_t x86KSIRQState[];
+diff --git a/libsel4/arch_include/x86/interfaces/object-api-arch.xml b/libsel4/arch_include/x86/interfaces/object-api-arch.xml
+index cfccbfd..8de4b1d 100644
+--- a/libsel4/arch_include/x86/interfaces/object-api-arch.xml
++++ b/libsel4/arch_include/x86/interfaces/object-api-arch.xml
+@@ -977,6 +977,35 @@
+                 </description>
+             </error>
+         </method>
++        <method id="X86IRQControlSendPeer" name="SendPeer" manual_name="Send Peer Doorbell">
++            <brief>
++                Send an interrupt to a CPU of another kernel on this machine.
++            </brief>
++            <description>
++                The kernel command line (peers=) lists the APIC IDs of the other
++                kernels' CPUs this kernel may signal. The interrupt arrives at that
++                CPU as an MSI with the given vector would, so the other kernel's
++                user level takes it with an MSI handler for the vector.
++            </description>
++            <param dir="in" name="peer" type="seL4_Word"
++                description='Zero based index into the peers= list of the command line.'/>
++            <param dir="in" name="vector" type="seL4_Word" description='Vector to send, as for GetMSI.'/>
++            <error name="seL4_IllegalOperation">
++                <description>
++                    The <texttt text="_service"/> is a CPtr to a capability of the wrong type.
++                </description>
++            </error>
++            <error name="seL4_RangeError">
++                <description>
++                    The <texttt text="peer"/> is not listed, or the <texttt text="vector"/> is invalid.
++                </description>
++            </error>
++            <error name="seL4_TruncatedMessage">
++                <description>
++                    The message is too short.
++                </description>
++            </error>
++        </method>
+     </interface>
+     <interface name="seL4_TCB" manual_name="TCB" cap_description="Capability to the TCB which is being operated on.">
+         <method id="TCBSetEPTRoot" name="SetEPTRoot" manual_name="Set EPT Root" manual_label="set_eptroot">
+diff --git a/src/arch/x86/kernel/cmdline.c b/src/arch/x86/kernel/cmdline.c
+index eb87670..29d84e8 100644
+--- a/src/arch/x86/kernel/cmdline.c
++++ b/src/arch/x86/kernel/cmdline.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include <config.h>
++#include <arch/model/statedata.h>
+ #include <util.h>
+ #include <machine/io.h>
+ #include <arch/kernel/cmdline.h>
+@@ -225,6 +226,16 @@ void cmdline_parse(const char *cmdline, cmdline_opt_t *cmdline_opt)
+         printf("Boot config: apic_khz = %lu\n", cmdline_opt->apic_khz);
+     }
+ 
++    if (parse_opt(cmdline, "peers", cmdline_val, MAX_CMDLINE_VAL_LEN) != -1) {
++        word_t peers[X86_MAX_PEERS];
++        int n = parse_word_array(cmdline_val, peers, X86_MAX_PEERS);
++        for (int i = 0; i < n; i++) {
++            x86KSpeerApicIds[i] = peers[i];
++            printf("Boot config: peer %d is APIC ID %lu\n", i, peers[i]);
++        }
++        x86KSnumPeers = n;
++    }
++
+     cmdline_opt->no_legacy_irq = parse_bool(cmdline, cmdline_str_no_legacy_irq);
+     printf("Boot config: no_legacy_irq = %s\n", cmdline_opt->no_legacy_irq ? "true" : "false");
+ 
+diff --git a/src/arch/x86/model/statedata.c b/src/arch/x86/model/statedata.c
+index ecd3c63..e30f57e 100644
+--- a/src/arch/x86/model/statedata.c
++++ b/src/arch/x86/model/statedata.c
+@@ -66,6 +66,8 @@ uint16_t x86KSconsolePort;
+ #endif
+ #if defined(CONFIG_PRINTING) || defined(CONFIG_DEBUG_BUILD)
+ uint16_t x86KSdebugPort;
++word_t x86KSnumPeers;
++uint32_t x86KSpeerApicIds[X86_MAX_PEERS];
+ #endif
+ 
+ /* State data tracking what IRQ source is related to each
+diff --git a/src/arch/x86/object/interrupt.c b/src/arch/x86/object/interrupt.c
+index 0a79d56..ca735e2 100644
+--- a/src/arch/x86/object/interrupt.c
++++ b/src/arch/x86/object/interrupt.c
+@@ -5,6 +5,8 @@
+  */
+ 
+ #include <kernel/boot.h>
++#include <arch/kernel/apic.h>
++#include <arch/model/statedata.h>
+ #include <model/statedata.h>
+ #include <arch/object/interrupt.h>
+ #include <arch/api/invocation.h>
+@@ -86,6 +88,32 @@ exception_t Arch_decodeIRQControlInvocation(word_t invLabel, word_t length, cte_
+         return EXCEPTION_SYSCALL_ERROR;
+     }
+ 
++    if (invLabel == X86IRQControlSendPeer) {
++        if (length < 2) {
++            userError("IRQControl: Truncated message");
++            current_syscall_error.type = seL4_TruncatedMessage;
++            return EXCEPTION_SYSCALL_ERROR;
++        }
++        word_t peer = getSyscallArg(0, buffer);
++        word_t v = getSyscallArg(1, buffer);
++        if (peer >= x86KSnumPeers) {
++            userError("IRQControl: no peer %lu", (long)peer);
++            current_syscall_error.type = seL4_RangeError;
++            current_syscall_error.rangeErrorMin = 0;
++            current_syscall_error.rangeErrorMax = x86KSnumPeers ? x86KSnumPeers - 1 : 0;
++            return EXCEPTION_SYSCALL_ERROR;
++        }
++        if (v > irq_user_max - irq_user_min) {
++            current_syscall_error.type = seL4_RangeError;
++            current_syscall_error.rangeErrorMin = 0;
++            current_syscall_error.rangeErrorMax = irq_user_max - irq_user_min;
++            return EXCEPTION_SYSCALL_ERROR;
++        }
++        setThreadState(NODE_STATE(ksCurThread), ThreadState_Restart);
++        apic_send_ipi_core(v + irq_user_min + IRQ_INT_OFFSET, x86KSpeerApicIds[peer]);
++        return EXCEPTION_NONE;
++    }
++
+     /* ensure we have a valid invocation before continuing any decoding */
+     if (invLabel != X86IRQIssueIRQHandlerIOAPIC && invLabel != X86IRQIssueIRQHandlerMSI &&
+         invLabel != X86IRQIssueIRQHandlerIOAPICRemapped) {
+-- 
+2.47.3
+

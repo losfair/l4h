@@ -1,0 +1,97 @@
+From 8d6fda44e259e32fe8d50af63bdb7bd393178a81 Mon Sep 17 00:00:00 2001
+From: l4h <l4h@localhost>
+Date: Tue, 3 Nov 2026 01:04:03 -0800
+Subject: [PATCH 34/36] x86: take the TSC and APIC timer rates from the command
+ line
+
+---
+ include/arch/x86/arch/kernel/cmdline.h |  5 +++++
+ src/arch/x86/kernel/apic.c             |  3 ++-
+ src/arch/x86/kernel/cmdline.c          | 11 +++++++++++
+ src/plat/pc99/machine/hardware.c       |  4 ++++
+ 4 files changed, 22 insertions(+), 1 deletion(-)
+
+diff --git a/include/arch/x86/arch/kernel/cmdline.h b/include/arch/x86/arch/kernel/cmdline.h
+index 051bcc1..9f3d83e 100644
+--- a/include/arch/x86/arch/kernel/cmdline.h
++++ b/include/arch/x86/arch/kernel/cmdline.h
+@@ -24,6 +24,11 @@ typedef struct cmdline_opt {
+     /* no_legacy_irq: another kernel on this machine owns the I/O APICs and
+      * the 8259 PIC; boot without them, with MSIs only. */
+     bool_t   no_legacy_irq;
++    /* tsc_mhz= and apic_khz=: the TSC and APIC timer rates, measured by
++     * whoever booted this kernel; 0 if not given.  The PIT is then left
++     * alone, as it must be when kernels share a machine. */
++    word_t   tsc_mhz;
++    word_t   apic_khz;
+ } cmdline_opt_t;
+ 
+ void cmdline_parse(const char *cmdline, cmdline_opt_t *cmdline_opt);
+diff --git a/src/arch/x86/kernel/apic.c b/src/arch/x86/kernel/apic.c
+index e1a377b..ad277dc 100644
+--- a/src/arch/x86/kernel/apic.c
++++ b/src/arch/x86/kernel/apic.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include <config.h>
++#include <arch/kernel/cmdline.h>
+ #include <machine/io.h>
+ #include <arch/machine.h>
+ #include <arch/kernel/apic.h>
+@@ -72,7 +73,7 @@ BOOT_CODE bool_t apic_init(bool_t mask_legacy_irqs)
+         uint32_t cpuid = x86_cpuid_ecx(0x1, 0x0);
+         if (!(cpuid & BIT(CPUID_TSC_DEADLINE_BIT))) {
+             /* 0 means TSC deadline mode */
+-            apic_khz = MAX(1, apic_measure_freq());
++            apic_khz = cmdline_opt.apic_khz ? cmdline_opt.apic_khz : MAX(1, apic_measure_freq());
+             x86KSapicKhz = apic_khz;
+             x86KSapicMaxDelta = div64(0xffffffffllu * x86KStscMhz * 1000llu, apic_khz);
+             printf("Apic Khz %lu, TSC Mhz %lu\n", (long) apic_khz, (long) x86KStscMhz);
+diff --git a/src/arch/x86/kernel/cmdline.c b/src/arch/x86/kernel/cmdline.c
+index 72efaf7..f399d89 100644
+--- a/src/arch/x86/kernel/cmdline.c
++++ b/src/arch/x86/kernel/cmdline.c
+@@ -205,6 +205,17 @@ void cmdline_parse(const char *cmdline, cmdline_opt_t *cmdline_opt)
+     }
+     printf("Boot config: ap_boot_page = 0x%lx\n", cmdline_opt->ap_boot_page);
+ 
++    cmdline_opt->tsc_mhz = 0;
++    if (parse_opt(cmdline, "tsc_mhz", cmdline_val, MAX_CMDLINE_VAL_LEN) != -1) {
++        parse_word_array(cmdline_val, &cmdline_opt->tsc_mhz, 1);
++        printf("Boot config: tsc_mhz = %lu\n", cmdline_opt->tsc_mhz);
++    }
++    cmdline_opt->apic_khz = 0;
++    if (parse_opt(cmdline, "apic_khz", cmdline_val, MAX_CMDLINE_VAL_LEN) != -1) {
++        parse_word_array(cmdline_val, &cmdline_opt->apic_khz, 1);
++        printf("Boot config: apic_khz = %lu\n", cmdline_opt->apic_khz);
++    }
++
+     cmdline_opt->no_legacy_irq = parse_bool(cmdline, cmdline_str_no_legacy_irq);
+     printf("Boot config: no_legacy_irq = %s\n", cmdline_opt->no_legacy_irq ? "true" : "false");
+ 
+diff --git a/src/plat/pc99/machine/hardware.c b/src/plat/pc99/machine/hardware.c
+index 05f98a6..c9b73b5 100644
+--- a/src/plat/pc99/machine/hardware.c
++++ b/src/plat/pc99/machine/hardware.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include <config.h>
++#include <arch/kernel/cmdline.h>
+ #include <machine/io.h>
+ #include <arch/kernel/apic.h>
+ #include <arch/model/statedata.h>
+@@ -199,6 +200,9 @@ BOOT_CODE uint32_t tsc_init(void)
+ {
+     static uint32_t tsc_mhz;
+ 
++    if (tsc_mhz == 0) {
++        tsc_mhz = cmdline_opt.tsc_mhz;
++    }
+     if (tsc_mhz == 0) {
+         tsc_mhz = tsc_measure_mhz();
+     }
+-- 
+2.47.3
+
