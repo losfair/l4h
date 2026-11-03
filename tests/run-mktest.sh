@@ -195,9 +195,19 @@ run_qemu() {
         ! grep -aq "partition 1 stopped: no heartbeat" "$log" || { echo "partition 1's heartbeats lost in the flood"; ok=0; }
     fi
     grep -aqE "^l4h-root: host reboot \(dom0\)\s*$" "$log" || { echo "partition 0 did not reset the machine"; ok=0; }
+    # How PCI configuration is reached: the ports under the partitions'
+    # lock without MCFG (pc), else ECAM, by the shim and every root.
     if [ "$machine" = pc ]; then
+        grep -aq "l4h-mkshim: no MCFG: PCI configuration through ports" "$log" \
+            || { echo "the shim did not scan PCI through the ports"; ok=0; }
         [ "$(grep -ac "l4h-root: no ECAM: PCI configuration through ports" "$log")" = "$n" ] \
             || { echo "not every partition shares the PCI configuration ports"; ok=0; }
+    else
+        grep -aq "l4h-mkshim: PCI configuration through ECAM" "$log" \
+            || { echo "the shim did not scan PCI through ECAM"; ok=0; }
+        [ "$(grep -ac "l4h-root: PCI configuration through ECAM" "$log")" = "$n" ] \
+            || { echo "not every partition reaches PCI configuration through ECAM"; ok=0; }
+        ! grep -aq "no ECAM" "$log" || { echo "a partition fell back to the PCI ports"; ok=0; }
     fi
     # One IOMMU for all: every partition's devices confined and interrupts
     # remapped, pools drained, and partition 0 (which gets every
