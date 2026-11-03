@@ -63,6 +63,13 @@ pub const MAX_PORTS: usize = 48;
 /// Uplink NICs; NIC n interrupts with badge bit NETD_BADGE_IRQ_SHIFT + n.
 pub const MAX_NICS: usize = 4;
 pub const NETD_BADGE_IRQ_SHIFT: u32 = 48;
+/// Links to other partitions' netds (multikernel, DESIGN.md §11.4): one
+/// to each other partition.  Link l's doorbell (and netd's own kick to
+/// read on later) signals badge bit NETD_BADGE_LINK_SHIFT + l.
+pub const MAX_LINKS: usize = 7;
+pub const NETD_BADGE_LINK_SHIFT: u32 = 52;
+/// A link's channel, at most (l4h_partition::LINK_CHANNEL_SIZE).
+pub const LINK_CHANNEL_MAX: usize = 1 << 20;
 /// Switches: one per port and NIC is the most that can carry traffic at
 /// once.  Root refuses to create more, so netd keeps a fixed table of them
 /// indexed by switch number.
@@ -71,6 +78,10 @@ pub const MAX_SWITCHES: usize = MAX_PORTS + MAX_NICS;
 /// netd address space: port p at port_va(p); NIC n's BARs and DMA memory.
 pub const fn port_va(p: usize) -> usize {
     crate::SHARED_VA + p * 0x40_0000
+}
+/// Link l's channel.
+pub const fn link_va(l: usize) -> usize {
+    crate::SHARED_VA + 0x1000_0000 + l * LINK_CHANNEL_MAX
 }
 pub const fn nic_bar_va(n: usize, bar: usize) -> usize {
     crate::MMIO_VA + n * 0x800_0000 + bar * 0x100_0000
@@ -84,7 +95,13 @@ pub const fn nic_dma_va(n: usize) -> usize {
 pub const NETD_SLOT_IRQ_BASE: u64 = 32;
 /// I/O port capability of a legacy virtio NIC n (NicConfig::legacy_io).
 pub const NETD_SLOT_IOPORT_BASE: u64 = 40;
+/// Link l: the IRQ handler of its doorbell; root's notification, badged
+/// for the link, which asks root to ring the peer's doorbell (netd cannot:
+/// only root holds IRQControl); and netd's own, badged as the doorbell.
+pub const NETD_SLOT_LINK_IRQ_BASE: u64 = 48;
+pub const NETD_SLOT_LINK_RING_BASE: u64 = 56;
 pub const NETD_SLOT_CLIENT_BASE: u64 = 64;
+pub const NETD_SLOT_LINK_KICK_BASE: u64 = NETD_SLOT_CLIENT_BASE + MAX_PORTS as u64;
 
 /// Calls from l4h-root to netd's service endpoint.
 /// MR0 = port, MR1 = switch, MR2 = MAC (low 48 bits), MR3 = flags.
@@ -114,6 +131,11 @@ pub const NETD_STEER_SET: u64 = 8;
 pub const NETD_STEER_DEL: u64 = 9;
 /// MR0 = rule -> MR0 = inbound frames, MR1 = return frames.
 pub const NETD_STEER_STATS: u64 = 10;
+/// MR0 = link, MR1 = switch, MR2 = channel size, MR3 = this partition,
+/// MR4 = the peer.  The channel is mapped at link_va(link) and the
+/// NETD_SLOT_LINK_* capabilities given.  Links last until the machine
+/// reboots.
+pub const NETD_ADD_LINK: u64 = 11;
 /// Endpoints and rules netd holds.
 pub const MAX_STEER_ENDPOINTS: usize = 16;
 pub const MAX_STEER_RULES: usize = 128;
@@ -161,3 +183,12 @@ pub struct NetdConfig {
 }
 
 const _: () = assert!(PORT_PAGES * 4096 <= 0x40_0000 - 0x1_0000);
+const _: () = assert!(port_va(MAX_PORTS) <= link_va(0) && link_va(MAX_LINKS) <= crate::MMIO_VA);
+const _: () = assert!(
+    NETD_BADGE_IRQ_SHIFT as usize + MAX_NICS <= NETD_BADGE_LINK_SHIFT as usize
+        && NETD_BADGE_LINK_SHIFT as usize + MAX_LINKS <= 64
+        && NETD_SLOT_IOPORT_BASE as usize + MAX_NICS <= NETD_SLOT_LINK_IRQ_BASE as usize
+        && NETD_SLOT_LINK_IRQ_BASE as usize + MAX_LINKS <= NETD_SLOT_LINK_RING_BASE as usize
+        && NETD_SLOT_LINK_RING_BASE as usize + MAX_LINKS <= NETD_SLOT_CLIENT_BASE as usize
+        && NETD_SLOT_LINK_KICK_BASE as usize + MAX_LINKS <= 1 << crate::CNODE_BITS
+);

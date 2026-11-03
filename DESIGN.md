@@ -3157,9 +3157,9 @@ image follows it. Each partition's RAM is its slot, a low chunk below 4 GiB
 for its modules (seL4 loads root above them and copies them again), and
 its share of the rest, carved from its CPUs' NUMA node where it can. Its
 multiboot2 memory map lists only its own RAM as available; everyone else's
-RAM, and a 24 MiB shared region the shim keeps (IOMMU state, per-partition
-blocks, channels), are reserved. RAM above 512 GiB (seL4's kernel window)
-stays unused, as with one kernel. The boot loader's module copies become
+RAM, and a shared region the shim keeps (8 MiB of IOMMU state, 8 MiB of
+per-partition blocks, and the channels), are reserved. RAM above 512 GiB
+(seL4's kernel window) stays unused, as with one kernel. The boot loader's module copies become
 partition 0's RAM.
 
 **Kernel patches** (all inert unless their option is set):
@@ -3199,16 +3199,19 @@ CPUs, RAM and console ring and the owner of every function. Root
 Generated MACs carry the partition index (`02:4c:34:P:G:N`), and
 `l4hctl info` shows the partition (`CTL_PARTITION_INFO`).
 
-**Channels** (`channel.rs`). The shim reserves 256 KiB per partition pair
-that needs one (partition 0 and each other; configured links) and lists it
-in both descriptors: two single-writer message rings and a doorbell each
-way (vector 96 + sender). A writer never waits: a header word counts the
+**Channels** (`channel.rs`). The shim reserves a control channel of 256 KiB
+between partition 0 and each other partition, and a channel of 1 MiB for
+each configured link, and lists each in both descriptors: two
+single-writer message rings and a doorbell each way (user vector 96 +
+sender for control, 88 + sender for a link; the kernel's `peers=` lists
+each other partition once). A writer never waits: a header word counts the
 bytes ever written, and a reader that falls behind by a whole ring knows it
 lost messages; a crashed partition leaves a stale ring, never a blocked
-writer. The control channel carries heartbeats (secondary to primary, every
-second; partition 0 logs a partition silent for 5 s), the wall clock
-(primary to secondaries every 10 s and after an RTC change), forwarded RTC
-settings, and trustd's requests.
+writer. Roots read and write the control channels: heartbeats (secondary
+to primary, every second; partition 0 logs a partition silent for 5 s),
+the wall clock (primary to secondaries every 10 s and after an RTC
+change), forwarded RTC settings, and trustd's requests. Frames never share
+a control channel's rings, so a busy link cannot overwrite them.
 
 **IOMMU** (`iommu/shared.rs`). Every partition's root drives the IOMMU
 for its own functions; only the command queue is truly shared. The shim
@@ -3229,19 +3232,31 @@ COMPLETION_WAIT); a waiter past 1 s logs the holding partition and keeps
 waiting. Invalidations are device- or domain-selective. Partition 0 alone
 reads the fault and event logs and names the owning partition.
 
-**Links** (`link.pA-pB = 1`). A link is a netd port whose client is root
-instead of a guest's VMM, on a switch root creates for it, with one more
-dom0 vNIC, so the partitions' uplink networks are never bridged. netd puts
-frames in the port's receive ring and signals root, which copies each into
-the channel as a message and rings the peer's doorbell once per batch; the
-peer's root copies arriving frames into its port's transmit ring and kicks
-its netd. The port leaves checksum offload and GSO off, so frames cross
-whole, up to 9216 bytes, and a full ring drops them, as a wire would.
+**Links** (`link.pA-pB = 1`, `l4h-netd/src/link.rs`). A link is a port of
+netd's, on a switch root creates for it, with one more dom0 vNIC, so the
+partitions' uplink networks are never bridged. The two netds move the
+frames themselves: root maps the link's channel into netd only (by the
+CPU; no device reaches it), and netd writes each frame for the link as a
+message into its outgoing ring and switches each message from the incoming
+one. Only whole frames cross, checksums completed and segmentation
+offloads undone, up to 9216 bytes; a reader a whole ring behind skips what
+was overwritten, as a wire drops frames. Doorbells: root binds the link's
+receive vector to a badged notification of netd's, which netd acks, so
+root takes no part in receiving. Ringing the peer takes IRQControl, which
+only root holds, so netd signals root (a badge per link) and root makes
+one `SendPeer` call: constant work, no data, and repeated signals merge.
+Even that stays off a busy link: each ring's header has a "wake me" word
+that its reader sets only when it found the ring empty and is about to
+sleep, then reads the ring once more (a frame published before the writer
+could see the word would otherwise wait); the writer, after a batch, rings
+only if the word is set, and clears it. A reader that keeps finding frames
+never sets it, so a busy link rings no doorbells, and after 256 frames netd
+kicks itself to serve its other ports before it reads on.
 `link.pA-pB = uplink` instead puts the link port on both partitions'
 switch 0, with no switch or vNIC of its own: a partition without a NIC
 shares the network of the one whose switch 0 has the uplink NIC (a star of
 such links shares one NIC among all partitions). Every frame then crosses
-the NIC owner's root and the channel, without flow control, and the
+the NIC owner's netd and the channel, without flow control, and the
 others lose the network if that partition stops. Networks that deliver
 only the instance's own MAC addresses (GCE, EC2) drop the other
 partitions' frames: there, route through the owner's dom0 instead.
@@ -3264,7 +3279,8 @@ services (console relay, clock, attestation, IOMMU fault logging).
 each with its own virtio disk and NIC: each dom0 gets an address by DHCP,
 runs a VM no other dom0 sees, and a secondary's `host-reboot` is refused
 and its `rtc-set` reaches partition 0, which then resets the machine.
-The partitions' dom0s ping each other over a link.
+The partitions' dom0s ping each other over a link, and partition 1's floods
+it while its heartbeats and `rtc-set` must still reach partition 0.
 `MK_PARTITIONS=8` covers every slot, `MK_BOOT=uefi|bios` boots through
 GRUB from a `tools/mkimage.sh` disk, `L4H_QEMU_IOMMU=intel|amd` shares an
 IOMMU (VMs in every partition attach and drain I/O pools at once), and

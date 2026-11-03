@@ -513,12 +513,12 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
 /// dom0's disks and vNICs, the same for every dom0 vmmgr starts: the
 /// first dom0_disks host disks, and vNICs on switch 0 (with the uplink
 /// NIC) and the other switches root makes now.  `ntfn` is root's own
-/// notification, which link ports signal.
+/// notification, which netd signals to have link doorbells rung.
 fn dom0_plan(h: &mut Host, ntfn: cap::Notification) -> Dom0Plan {
     let mut plan = Dom0Plan::default();
-    let mut links = ArrayVec::<(u32, bool), { l4h_partition::MAX_CHANNELS }>::new();
-    for link in h.channels.iter().flat_map(|c| c.links()) {
-        links.must_push(link);
+    let mut links = ArrayVec::<(l4h_partition::Channel, bool), { l4h_partition::MAX_PARTITIONS - 1 }>::new();
+    for ch in h.channels.iter().flat_map(|c| c.links()) {
+        links.must_push((*ch, ch.kind & l4h_partition::CHANNEL_LINK_UPLINK != 0));
     }
     // By default, room for full receive rings on all of dom0's vNICs (one
     // per uplink switch it is given, one per internal switch, one per link).
@@ -620,10 +620,12 @@ fn dom0_plan(h: &mut Host, ntfn: cap::Notification) -> Dom0Plan {
     // joins switch 0 on both sides, where dom0's first vNIC (and the
     // uplink NIC, on the side that has one) are: partitions without a NIC
     // of their own share the network of one that has.
-    for &(peer, uplink) in links.iter() {
+    let me = partition::get().map_or(0, |d| d.index);
+    for (ch, uplink) in links.iter() {
+        let (peer, uplink) = (ch.peer, *uplink);
         let sw = if uplink { 0 } else { h.netd.create_switch() };
-        match h.netd.add_link(peer, sw, ntfn, &mut h.alloc) {
-            Ok(p) => info!("l4h-root: link to partition {} on switch {} (port {})", peer, sw, p),
+        match h.netd.add_link(ch, me, sw, ntfn, &mut h.alloc, &mut h.devmem) {
+            Ok(l) => info!("l4h-root: link to partition {} on switch {} (netd link {})", peer, sw, l),
             Err(e) => log!("l4h-root: no link to partition {}: error {}", peer, e),
         }
         if !uplink {
@@ -724,15 +726,15 @@ fn serve(h: &mut Host, reply_slot: ReplySlot) -> ! {
     let (mut info, mut badge) = hyp_ep.recv(reply);
     loop {
         h.alloc.refill();
-        let notified = badge & (TIMER_BADGE | monitor::MONITOR_BADGE | channel::CHANNEL_BADGE | netd::LINK_BADGE) != 0;
+        let notified = badge & (TIMER_BADGE | monitor::MONITOR_BADGE | channel::CHANNEL_BADGE | netd::LINK_BADGES) != 0;
         if badge & monitor::MONITOR_BADGE != 0 {
             monitor::Monitor::interrupt(h);
         }
         if badge & channel::CHANNEL_BADGE != 0 {
             channel::poll(h);
         }
-        if badge & netd::LINK_BADGE != 0 {
-            netd::link_poll(h);
+        if badge & netd::LINK_BADGES != 0 {
+            h.netd.link_ring(badge);
         }
         let resp = if notified {
             if badge & TIMER_BADGE != 0 {

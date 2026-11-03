@@ -105,13 +105,11 @@ regions! {
     /// The primary partition's view of the other kernels' console rings
     /// (partition.rs).
     PARTITION_RINGS = 0x6200_0000_0000, 8 * 64 * 1024;
-    /// The partition's channels to the others, 256 KiB each (channel.rs).
-    PARTITION_CHANNELS = 0x6200_0100_0000, 8 * 256 * 1024;
+    /// The partition's control channels to the others, 256 KiB each
+    /// (channel.rs).  Link channels are mapped in netd only.
+    PARTITION_CHANNELS = 0x6200_0100_0000, (l4h_partition::MAX_PARTITIONS - 1) * l4h_partition::CHANNEL_SIZE as usize;
     /// The IOMMU state all partitions share (DESIGN.md §4.6).
     IOMMU_SHARED = 0x6200_0200_0000, 8 * MIB;
-    /// netd's ports for the links to other partitions, whose client is
-    /// root (netd.rs): one netd port's memory each.
-    LINK_PORTS = 0x6200_1000_0000, l4h_partition::MAX_CHANNELS * 4 * MIB;
     /// IOMMU registers: 16 KiB per AMD-Vi unit, 64 KiB per VT-d unit.
     IOMMU_MMIO = 0x7800_0000_0000, MIB;
     /// The IOMMUs' device table, I/O page tables, command buffers and

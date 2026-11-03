@@ -116,7 +116,10 @@ where
 }
 
 /// seL4 user interrupt vectors (CPU vector 0x30 + n, n <= 107 on x86),
-/// split between the users so that they never collide.
+/// split between the users so that they never collide: NICs from 0, the
+/// serial port 8, disk controllers 16..80; multikernel doorbells from
+/// partition P (l4h_partition) at 88 + P for its link (to netd) and
+/// 96 + P for its control channel (to root).
 pub const VECTOR_NIC_BASE: u64 = 0;
 #[cfg(target_arch = "x86_64")]
 pub const VECTOR_MONITOR: u64 = 8;
