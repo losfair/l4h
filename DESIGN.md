@@ -3205,6 +3205,42 @@ second; partition 0 logs a partition silent for 5 s), the wall clock
 (primary to secondaries every 10 s and after an RTC change), forwarded RTC
 settings, and trustd's requests.
 
+**IOMMU** (`iommu/shared.rs`). Every partition's root drives the IOMMU
+for its own functions; only the command queue is truly shared. The shim
+reserves 8 MiB for the units' shared state: a control page, then per unit
+the VT-d invalidation queue, root table and interrupt remapping table (or
+AMD's command buffer and event log), then the VT-d context tables or AMD
+device table. Partition 0 resets and enables the units, pre-allocates a
+context table for every bus that carries a function (from its table of
+owners, so no secondary ever allocates a shared table), blocks every
+entry, and sets a ready flag (on, absent, or off with `iommu=0`); a
+secondary joins without writing a register, waits for the flag before
+enabling any device, and then programs only its own functions' context
+entries or DTEs, with I/O page tables in its own RAM. Domain IDs and VT-d
+IRTEs are split statically: partition *k* uses part *k* of *n* of each
+unit's. A ticket lock per unit in the control page serializes "write
+commands, move the tail, wait for completion" (VT-d wait descriptors, AMD
+COMPLETION_WAIT); a waiter past 1 s logs the holding partition and keeps
+waiting. Invalidations are device- or domain-selective. Partition 0 alone
+reads the fault and event logs and names the owning partition.
+
+**Links** (`link.pA-pB = 1`). A link is a netd port whose client is root
+instead of a guest's VMM, on a switch root creates for it, with one more
+dom0 vNIC, so the partitions' uplink networks are never bridged. netd puts
+frames in the port's receive ring and signals root, which copies each into
+the channel as a message and rings the peer's doorbell once per batch; the
+peer's root copies arriving frames into its port's transmit ring and kicks
+its netd. The port leaves checksum offload and GSO off, so frames cross
+whole, up to 9216 bytes, and a full ring drops them, as a wire would.
+
+**Attestation.** Only partition 0 has the TPM. A secondary's trustd signs
+with a key of its own (from RDRAND) and asks partition 0's trustd, over
+the control channel relayed by the two roots, to quote and extend it into
+PCR 15 and to run ActivateCredential; requests carry ids, are resent until
+answered, and a dead or TPM-less partition 0 leaves the secondary
+unattested rather than stuck (§10.2). Reports and evidence name their
+partition.
+
 **Lifecycle.** Partitions boot in parallel and run independently; a
 crashed secondary stays down until the machine reboots. There is no
 per-partition restart; partition 0's `l4hctl host-reboot` resets the whole
@@ -3215,8 +3251,18 @@ services (console relay, clock, attestation, IOMMU fault logging).
 each with its own virtio disk and NIC: each dom0 gets an address by DHCP,
 runs a VM no other dom0 sees, and a secondary's `host-reboot` is refused
 and its `rtc-set` reaches partition 0, which then resets the machine.
+The partitions' dom0s ping each other over a link.
 `MK_PARTITIONS=8` covers every slot, `MK_BOOT=uefi|bios` boots through
-GRUB from a `tools/mkimage.sh` disk.
+GRUB from a `tools/mkimage.sh` disk, `L4H_QEMU_IOMMU=intel|amd` shares an
+IOMMU (VMs in every partition attach and drain I/O pools at once), and
+`MK_ATTEST=1` attests a VM in each partition through partition 0's swtpm.
+
+**Limits.** A secondary maps ECAM pages only for its own functions, so it
+does not walk bridges for DMAR device scopes or requester aliases (enough
+on q35, where everything is on bus 0; real machines with functions behind
+bridges need the bridges' pages). Partition 0's own output and the lines
+it relays share the serial port a character at a time, so they can
+interleave.
 
 ---
 
