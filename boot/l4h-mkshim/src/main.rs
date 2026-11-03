@@ -130,6 +130,8 @@ struct Plan {
     peers: Vec<u32, { part::MAX_CHANNELS }>,
     /// The NUMA node of its boot CPU.
     node: u32,
+    /// Other partitions' functions it may read (Descriptor::upstream).
+    upstream: Vec<u16, { part::MAX_UPSTREAM }>,
 }
 
 /// Per partition: [0, 64K) multiboot information, [64K, 192K) ACPI copy,
@@ -179,6 +181,7 @@ extern "C" fn shim_main(magic: u32, info: u64) -> ! {
             channels: Vec::new(),
             peers: Vec::new(),
             node: 0,
+            upstream: Vec::new(),
         }) {
             unreachable!();
         }
@@ -300,6 +303,10 @@ extern "C" fn shim_main(magic: u32, info: u64) -> ! {
             };
         }
         d.nfuncs = p.funcs.len() as u32;
+        for (i, &bdf) in p.upstream.iter().enumerate() {
+            d.upstream[i] = bdf;
+        }
+        d.nupstream = p.upstream.len() as u32;
         if k == 0 {
             let mut o = 0;
             for (kk, pp) in plans.iter().enumerate() {
@@ -502,6 +509,31 @@ fn assign_funcs(conf: &Conf, funcs: &[pci::Func], plans: &mut [Plan]) {
     }
     for (i, &k) in owner.iter().enumerate() {
         plans[k as usize].funcs.must_push(i);
+    }
+    // What each partition reads of the others': the bridges above its
+    // functions (and function 0 of their devices, which says whether a
+    // device has more), for its IOMMU's device scopes and requester IDs;
+    // and every IOMMU's own function (AMD-Vi's capability).
+    for k in 1..n {
+        let mut want: Vec<u16, 1024> = Vec::new();
+        for &i in plans[k].funcs.iter() {
+            let bus = (funcs[i].bdf >> 8) as u8;
+            for b in funcs.iter().filter(|b| b.header == 1 && b.secondary != 0 && b.secondary <= bus && bus <= b.subordinate) {
+                want.must_push(b.bdf);
+                want.must_push(b.bdf & !7);
+            }
+        }
+        for f in funcs.iter().filter(|f| f.class >> 8 == 0x0806) {
+            want.must_push(f.bdf);
+        }
+        want.sort_unstable();
+        for (j, &bdf) in want.iter().enumerate() {
+            let dup = j > 0 && want[j - 1] == bdf;
+            let i = funcs.iter().position(|f| f.bdf == bdf);
+            if !dup && i.is_some_and(|i| owner[i] as usize != k) && !plans[k].upstream.push(bdf) {
+                fail(format_args!("partition {}: more than {} bridges above its functions", k, part::MAX_UPSTREAM));
+            }
+        }
     }
     for (k, p) in plans.iter().enumerate() {
         if !p.funcs.iter().any(|&i| funcs[i].is_disk()) {

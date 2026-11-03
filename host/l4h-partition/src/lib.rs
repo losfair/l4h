@@ -24,6 +24,8 @@ pub const MAX_PARTITIONS: usize = 8;
 /// PCI functions of one partition, at most.  Partition 0 has every
 /// function no other partition lists, bridges included.
 pub const MAX_FUNCS: usize = 256;
+/// Functions a partition reads but does not own, at most (`upstream`).
+pub const MAX_UPSTREAM: usize = 64;
 /// Channels of one partition, at most: one to each other partition.
 pub const MAX_CHANNELS: usize = MAX_PARTITIONS - 1;
 
@@ -197,6 +199,14 @@ pub struct Descriptor {
     pub funcs: [Func; MAX_FUNCS],
     /// The primary only: the owner of every assigned function.
     pub owners: [Owner; MAX_PARTITIONS * MAX_FUNCS],
+    pub nupstream: u32,
+    pub _pad3: u32,
+    /// Functions another partition owns whose configuration space this
+    /// one may read, never write (bus << 8 | device << 3 | function): the
+    /// bridges above its own functions, and function 0 of their devices,
+    /// which say how its requester IDs reach an IOMMU and which IOMMU
+    /// unit's device scope covers them; and the IOMMUs' own functions.
+    pub upstream: [u16; MAX_UPSTREAM],
 }
 
 impl Descriptor {
@@ -221,7 +231,7 @@ impl Descriptor {
         (d.magic == MAGIC && d.version == VERSION && d.size as usize == core::mem::size_of::<Descriptor>()
             && d.count as usize <= MAX_PARTITIONS && d.index < d.count
             && d.nchannels as usize <= MAX_CHANNELS && d.nfuncs as usize <= MAX_FUNCS
-            && d.nowners as usize <= MAX_PARTITIONS * MAX_FUNCS)
+            && d.nowners as usize <= MAX_PARTITIONS * MAX_FUNCS && d.nupstream as usize <= MAX_UPSTREAM)
             .then_some(d)
     }
 
@@ -235,6 +245,10 @@ impl Descriptor {
 
     pub fn owners(&self) -> &[Owner] {
         &self.owners[..self.nowners as usize]
+    }
+
+    pub fn upstream(&self) -> &[u16] {
+        &self.upstream[..self.nupstream as usize]
     }
 
     pub fn parts(&self) -> &[PartInfo] {

@@ -12,6 +12,9 @@
 # IOMMU the partitions share.  MK_BOOT=uefi or bios boots a disk image from
 # tools/mkimage.sh through GRUB (OVMF or SeaBIOS) instead of QEMU's
 # multiboot loader, with the configuration on the EFI system partition.
+# MK_BRIDGES=1 puts partition 1's disk behind a PCIe root port and its NIC
+# behind a root port and a PCIe-to-PCI bridge, whose requester ID it
+# borrows: with an IOMMU, partition 1 must read partition 0's bridges.
 # MK_ATTEST=1 adds a software TPM (swtpm), which only partition 0 sees:
 # every dom0 and VM gets a report, the other partitions' through partition
 # 0's trustd, and tools/l4h-attest.py verifies each against its
@@ -63,20 +66,34 @@ devices=() cmdline=()
 mods="$out/l4h-root.elf l4h-root,$out/vmlinux guest-kernel,$out/dom0.cpio.gz dom0-initrd,$conf l4h-mk.conf"
 for k in $(seq 0 $((n - 1))); do
     disk=$((4 + 2 * k)) nic=$((5 + 2 * k))
-    devices+=(-drive "file=$out/disk$k.img,if=none,id=d$k,format=raw"
-        -device "virtio-blk-pci,drive=d$k,bus=pcie.0,addr=$(printf '%#x' $disk)"
-        -netdev "user,id=n$k"
-        -device "virtio-net-pci,netdev=n$k,disable-legacy=on,bus=pcie.0,addr=$(printf '%#x' $nic)")
+    disk_bdf=$(printf '00:%02x.0' $disk) nic_bdf=$(printf '00:%02x.0' $nic)
+    if [ "$k" = 1 ] && [ -n "${MK_BRIDGES:-}" ]; then
+        # The firmware numbers the buses depth first: root port 00:10.0
+        # gets bus 1, 00:11.0 bus 2, and the bridge on bus 2 bus 3.
+        devices+=(-device pcie-root-port,id=rp1,bus=pcie.0,addr=0x10,chassis=1,slot=1
+            -device pcie-root-port,id=rp2,bus=pcie.0,addr=0x11,chassis=2,slot=2
+            -device pcie-pci-bridge,id=pb1,bus=rp2,addr=0
+            -drive "file=$out/disk$k.img,if=none,id=d$k,format=raw"
+            -device "virtio-blk-pci,drive=d$k,bus=rp1,addr=0"
+            -netdev "user,id=n$k"
+            -device "virtio-net-pci,netdev=n$k,disable-legacy=on,bus=pb1,addr=1")
+        disk_bdf=01:00.0 nic_bdf=03:01.0
+    else
+        devices+=(-drive "file=$out/disk$k.img,if=none,id=d$k,format=raw"
+            -device "virtio-blk-pci,drive=d$k,bus=pcie.0,addr=$(printf '%#x' $disk)"
+            -netdev "user,id=n$k"
+            -device "virtio-net-pci,netdev=n$k,disable-legacy=on,bus=pcie.0,addr=$(printf '%#x' $nic)")
+    fi
     if [ "$k" != 0 ]; then
-        printf 'p%d.cpus = 2\np%d.mem = 1G\np%d.pci = 00:%02x.0, 00:%02x.0\n' "$k" "$k" "$k" "$disk" "$nic" >> "$conf"
+        printf 'p%d.cpus = 2\np%d.mem = 1G\np%d.pci = %s, %s\n' "$k" "$k" "$k" "$disk_bdf" "$nic_bdf" >> "$conf"
     fi
     # Partitions 0 and 1 know their peer over the link.
     peer=
     [ "$k" -lt 2 ] && peer=" MKPEER=$((1 - k))"
     # The attestation check measures this exact command line.
     cmdline[k]="console=hvc0 MKP=$k$peer${nonce:+ attest_nonce=$nonce}${mkiommu[*]:+ ${mkiommu[*]}}"
-    printf 'dom0_cmdline="%s"\ndom0_mem_mb=256\nboot_disk=00:%02x.0\nuplink_nic=00:%02x.0%s\n' \
-        "${cmdline[k]}" "$disk" "$nic" "$dom0_disks" > "$out/p$k.conf"
+    printf 'dom0_cmdline="%s"\ndom0_mem_mb=256\nboot_disk=%s\nuplink_nic=%s%s\n' \
+        "${cmdline[k]}" "$disk_bdf" "$nic_bdf" "$dom0_disks" > "$out/p$k.conf"
     mods+=",$out/p$k.conf p$k:l4h-config,$root/build/mkshim/kernel-s$k.elf kernel-s$k"
 done
 

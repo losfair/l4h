@@ -3183,6 +3183,10 @@ CPUs, RAM and console ring and the owner of every function. Root
 
 - reaches its own functions through ECAM (`pci.rs`), never the shared
   0xcf8/0xcfc pair, and walks the descriptor's list instead of all buses;
+  it may also read, never write, the bridges above its functions and the
+  IOMMUs' functions (the descriptor's `upstream` list, mapped read-only),
+  which say which IOMMU unit's device scope covers a function and which
+  requester ID a function behind a PCIe-to-PCI bridge borrows;
 - in partition 0 only: the RTC, reset, serial monitor, framebuffer
   dashboard, balloon and TPM (a secondary's ACPI copy has no TPM2);
 - in partition 0, copies the other kernels' console rings to the serial
@@ -3255,14 +3259,12 @@ The partitions' dom0s ping each other over a link.
 `MK_PARTITIONS=8` covers every slot, `MK_BOOT=uefi|bios` boots through
 GRUB from a `tools/mkimage.sh` disk, `L4H_QEMU_IOMMU=intel|amd` shares an
 IOMMU (VMs in every partition attach and drain I/O pools at once), and
-`MK_ATTEST=1` attests a VM in each partition through partition 0's swtpm.
+`MK_ATTEST=1` attests a VM in each partition through partition 0's swtpm,
+and `MK_BRIDGES=1` puts partition 1's devices behind root ports and a
+PCIe-to-PCI bridge.
 
-**Limits.** A secondary maps ECAM pages only for its own functions, so it
-does not walk bridges for DMAR device scopes or requester aliases (enough
-on q35, where everything is on bus 0; real machines with functions behind
-bridges need the bridges' pages). Partition 0's own output and the lines
-it relays share the serial port a character at a time, so they can
-interleave.
+**Limits.** Partition 0's own output and the lines it relays share the
+serial port a character at a time, so they can interleave.
 
 ---
 
