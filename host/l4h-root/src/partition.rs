@@ -86,6 +86,11 @@ pub fn epoch_ns(tsc_hz: u64) -> u64 {
 /// Map [paddr, paddr + len) (memory every partition's map reserves) at
 /// `va` in root, read-write and cached.
 pub fn map(alloc: &mut Alloc, devmem: &mut DevMem, paddr: usize, len: usize, va: usize) -> Option<()> {
+    map_rights(alloc, devmem, paddr, len, va, CapRights::read_write())
+}
+
+/// `map` with the given rights.
+pub fn map_rights(alloc: &mut Alloc, devmem: &mut DevMem, paddr: usize, len: usize, va: usize, rights: CapRights) -> Option<()> {
     let mut done = 0;
     while done < len {
         let at = paddr + done;
@@ -98,7 +103,7 @@ pub fn map(alloc: &mut Alloc, devmem: &mut DevMem, paddr: usize, len: usize, va:
         alloc.global(|alloc| {
             for (i, s) in frames.enumerate() {
                 crate::vspace::map_frame(&mut ObjCtx::global(alloc), slot::VSPACE.cap(), devmem::granule(s),
-                    va + done + i * 4096, CapRights::read_write(), VmAttributes::DEFAULT);
+                    va + done + i * 4096, rights.clone(), VmAttributes::DEFAULT);
             }
         });
         done += chunk;

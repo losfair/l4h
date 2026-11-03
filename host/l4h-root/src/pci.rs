@@ -187,6 +187,9 @@ pub fn msi_irq(d: &Device, vector: u64, dst: &sel4::AbsoluteCPtr) {
 /// The functions whose ECAM pages a partition mapped, a bit per BDF.
 #[cfg(target_arch = "x86_64")]
 static ECAM_MAPPED: [core::sync::atomic::AtomicU64; 1024] = [const { core::sync::atomic::AtomicU64::new(0) }; 1024];
+/// Of those, the partition's own: the only ones written.
+#[cfg(target_arch = "x86_64")]
+static ECAM_WRITABLE: [core::sync::atomic::AtomicU64; 1024] = [const { core::sync::atomic::AtomicU64::new(0) }; 1024];
 
 #[cfg(target_arch = "x86_64")]
 impl Pci {
@@ -206,6 +209,20 @@ impl Pci {
                 panic!("PCI function {:02x}:{:02x}.{}: no ECAM page", f.bdf >> 8, (f.bdf >> 3) & 0x1f, f.bdf & 7);
             }
             ECAM_MAPPED[f.bdf as usize / 64].fetch_or(1 << (f.bdf % 64), core::sync::atomic::Ordering::Relaxed);
+            ECAM_WRITABLE[f.bdf as usize / 64].fetch_or(1 << (f.bdf % 64), core::sync::atomic::Ordering::Relaxed);
+        }
+        // Other partitions' bridges above ours, and the IOMMUs' functions:
+        // read-only, so that a stray write faults instead of reprogramming
+        // another partition's hardware.  The IOMMU code reads them like
+        // any function (device scopes, requester aliases).
+        for &bdf in d.upstream() {
+            let paddr = d.ecam_base as usize + ((bdf as usize) << 12);
+            if (bdf >> 8) as u8 > d.ecam_bus_end || crate::partition::map_rights(alloc, _devmem, paddr, 4096,
+                Self::ecam_va(bdf), sel4::CapRights::read_only()).is_none() {
+                log!("l4h-root: PCI function {:02x}:{:02x}.{} above ours: no ECAM page", bdf >> 8, (bdf >> 3) & 0x1f, bdf & 7);
+                continue;
+            }
+            ECAM_MAPPED[bdf as usize / 64].fetch_or(1 << (bdf % 64), core::sync::atomic::Ordering::Relaxed);
         }
         Pci { port: s as u64, ecam: true }
     }
@@ -248,6 +265,11 @@ impl Pci {
 
     pub fn write32(&self, bus: u8, dev: u8, func: u8, off: u8, val: u32) {
         if self.ecam {
+            let bdf = (bus as u16) << 8 | (dev as u16) << 3 | func as u16;
+            if ECAM_WRITABLE[bdf as usize / 64].load(core::sync::atomic::Ordering::Relaxed) & (1 << (bdf % 64)) == 0 {
+                log!("l4h-root: write to PCI function {:02x}:{:02x}.{}, which is not this partition's, refused", bus, dev, func);
+                return;
+            }
             if let Some(p) = self.ecam_page(bus, dev, func) {
                 unsafe { ((p + (off as usize & 0xfc)) as *mut u32).write_volatile(val) };
             }
