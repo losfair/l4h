@@ -23,6 +23,8 @@ say "vm ok"
 if [ "$P" != 0 ]; then
     if l4hctl host-reboot 2>/tmp/err; then fail "host-reboot accepted"; fi
     say "host-reboot refused: $(cat /tmp/err)"
+    # The RTC is partition 0's: setting it goes there.
+    l4hctl rtc-set || fail "rtc-set"
 fi
 say done
 if [ "$P" = 0 ]; then

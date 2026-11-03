@@ -23,6 +23,7 @@ mod acpi;
 mod amdvi;
 mod blkd;
 mod bootmod;
+mod channel;
 mod component;
 mod config;
 mod ctl;
@@ -256,6 +257,8 @@ pub struct Host {
     pub vmmgr: Option<vmmgr::Vmmgr>,
     /// Partition 0 of several: the other kernels' consoles.
     pub relay: Option<partition::Relay>,
+    /// One of several partitions: the channels to the others.
+    pub channels: Option<channel::Channels>,
 }
 
 impl Host {
@@ -490,6 +493,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         rtc,
         vmmgr: None,
         relay: None,
+        channels: None,
     };
     h.scan_disks();
     // The serial port and its interrupt (an I/O APIC pin) are partition 0's.
@@ -497,6 +501,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         h.monitor = monitor::Monitor::new(&mut h.alloc, &mut h.devmem, wd_ntfn, h.cfg.serial_port, h.cfg.serial_irq, &mut h.iommu);
     }
     h.relay = partition::Relay::new(&mut h.alloc, &mut h.devmem);
+    h.channels = channel::Channels::new(&mut h.alloc, &mut h.devmem, wd_ntfn, h.info.tsc_hz);
     h.dashboard = dashboard::Dashboard::new(bootinfo, &mut h.alloc, &mut h.devmem, h.cfg.fb_console);
 
     if module("guest-kernel").is_none() {
@@ -700,9 +705,12 @@ fn serve(h: &mut Host, reply_slot: ReplySlot) -> ! {
     let (mut info, mut badge) = hyp_ep.recv(reply);
     loop {
         h.alloc.refill();
-        let notified = badge & (TIMER_BADGE | monitor::MONITOR_BADGE) != 0;
+        let notified = badge & (TIMER_BADGE | monitor::MONITOR_BADGE | channel::CHANNEL_BADGE) != 0;
         if badge & monitor::MONITOR_BADGE != 0 {
             monitor::Monitor::interrupt(h);
+        }
+        if badge & channel::CHANNEL_BADGE != 0 {
+            channel::poll(h);
         }
         let resp = if notified {
             if badge & TIMER_BADGE != 0 {
@@ -710,6 +718,7 @@ fn serve(h: &mut Host, reply_slot: ReplySlot) -> ! {
                 if let Some(r) = h.relay.as_mut() {
                     r.drain();
                 }
+                channel::tick(h);
                 h.iommu.poll();
                 if h.cfg.watchdog_secs != 0 && rdtsc() >= next_watchdog {
                     watchdog_dump(h);

@@ -134,6 +134,8 @@ pub fn host_op(h: &mut Host, op: u32, a: &[u64; 6], data: &mut [u8; abi::CTL_DAT
         }
         // Returns only on failure.
         abi::CTL_HOST_REBOOT => return Err(crate::reset::reboot(h, "dom0")),
+        // A secondary partition's RTC is the primary's (DESIGN.md §4.5).
+        abi::CTL_RTC_SET if crate::partition::secondary() => crate::channel::rtc_set(h, a[0])?,
         abi::CTL_RTC_SET => h.rtc.set_secs(&mut h.wins.a, a[0])?,
         _ => return Err(ENOSYS),
     }

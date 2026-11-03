@@ -602,3 +602,6 @@ fn flags_thread(c: &Component, alloc: &mut Alloc, arena: &mut Arena, info: &Host
     c.give(trust::SLOT_FLAGS_REPLY, reply, CapRights::all());
     sc
 }
+
+/// A trustd message from another partition's root (channel.rs).
+pub fn channel_message(_h: &mut Host, _peer: u32, _ty: u32, _msg: &[u8]) {}
