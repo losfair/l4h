@@ -20,10 +20,14 @@ macro_rules! log {
     ($($arg:tt)*) => { crate::print_log(format_args!($($arg)*), true) };
 }
 
-/// Retain a host diagnostic, with optional synchronous serial output.
+/// Retain a host diagnostic, and optionally print it on the serial port.
 pub fn print_log(args: core::fmt::Arguments<'_>, serial: bool) {
     l4h_host::log::record(args);
-    if serial { sel4::debug_println!("{}", args); }
+    if serial {
+        l4h_host::serial::record(args);
+        #[cfg(not(target_arch = "x86_64"))]
+        sel4::debug_println!("{}", args); // no logd here yet
+    }
 }
 
 pub mod component;

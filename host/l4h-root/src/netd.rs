@@ -4,7 +4,6 @@
 
 use sel4::{CapRights, ObjectBlueprint, VmAttributes, cap, cap_type};
 
-use l4h_abi as abi;
 use l4h_host::fixed::ArrayVec;
 use l4h_host::{self as host, net};
 
@@ -178,6 +177,11 @@ fn call(ep: cap::Endpoint, label: u64, args: &[u64]) -> u64 {
     mr(0)
 }
 
+/// Make netd panic, for tests/run-logdtest.sh. Its keeper answers.
+pub fn inject_panic(h: &crate::Host) {
+    call(h.netd.comp.service_ep, net::NETD_TEST_PANIC, &[]);
+}
+
 /// The BARs netd maps of NIC `d`, bit b for BAR b.
 fn used_bars(d: &pci::Device) -> u8 {
     if is_gvnic(d) {
@@ -281,7 +285,7 @@ pub fn spawn(
         id: NETD_ID,
         kind: host::KIND_NETD,
         elf: NETD_ELF,
-        prio: abi::PRIO_KERNEL + 2,
+        prio: host::PRIO_SERVICE,
         budget_us: info.timeslice_us,
         period_us: info.timeslice_us,
         config: cfg_bytes,

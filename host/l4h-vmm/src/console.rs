@@ -1,10 +1,12 @@
 //! Guest console output: the records in each vCPU's output ring
 //! (abi::ConsoleOut, in its event page), printed in seq order into the ring
-//! l4h-vmmgr reads and optionally to the serial port, each line prefixed
-//! with the guest id (except dom0).  The guest writes the rings and never
+//! l4h-vmmgr reads and optionally to the serial ring (`host::serial`) by
+//! lines, each marked as the guest's unless it is dom0's, which the serial
+//! port shows as a prefix.  The guest writes the rings and never
 //! waits for us; what it gave up on, it counts in `lost`, which we report.
 //! A missing sequence gets 100 ms to arrive before we report the gap and
 //! skip it. Records arriving after they were skipped are discarded.
+//! Part of a line goes out after the same 100 ms, so that prompts show.
 
 use core::fmt::Write;
 use core::ptr::{addr_of, addr_of_mut};
@@ -18,11 +20,21 @@ use crate::guest::Vcpus;
 const REC: usize = core::mem::size_of::<abi::ConsoleRec>();
 const SIZE: usize = abi::CONSOLE_OUT_SIZE;
 const WRAP: u32 = abi::CONSOLE_OUT_WRAP;
+/// A longer line goes to the serial ring in parts.
+const LINE_SIZE: usize = 1024;
 
 pub struct Console {
     ring: *mut host::ConsoleRing,
     serial: bool,
-    prefix: Option<u32>,
+    /// Whose console this is, in the serial ring.
+    source: u32,
+    /// The line on its way to the serial ring.
+    line: [u8; LINE_SIZE],
+    line_len: usize,
+    /// When what is in `line` goes out without an end of line.
+    line_deadline: Option<u64>,
+    /// What SetTimer last armed; 0: nothing.
+    armed: u64,
     line_start: bool,
     /// The console device's event, raised when a ring wanted room.
     event: u32,
@@ -35,6 +47,9 @@ pub struct Console {
     /// Deterministic publication between sampling two rings' heads.
     #[cfg(test)]
     pub after_head: Option<fn(usize)>,
+    /// Deterministic publication while printing.
+    #[cfg(test)]
+    pub after_put: Option<Box<dyn FnMut(u8)>>,
 }
 
 fn out(v: usize) -> *mut abi::ConsoleOut {
@@ -54,7 +69,11 @@ impl Console {
         Console {
             ring: host::VMM_CONSOLE_RING_VA as *mut host::ConsoleRing,
             serial,
-            prefix,
+            source: prefix.map_or(host::serial::SOURCE_DOM0, |id| host::serial::SOURCE_GUEST | id),
+            line: [0; LINE_SIZE],
+            line_len: 0,
+            line_deadline: None,
+            armed: 0,
             line_start: true,
             event,
             tail: [0; abi::MAX_VCPUS],
@@ -65,6 +84,8 @@ impl Console {
             gap_deadline: None,
             #[cfg(test)]
             after_head: None,
+            #[cfg(test)]
+            after_put: None,
         }
     }
 
@@ -76,14 +97,65 @@ impl Console {
             addr_of_mut!((*self.ring).head).write_volatile(head + 1);
         }
         if self.serial {
-            if self.line_start {
-                if let Some(id) = self.prefix {
-                    sel4::debug_print!("[vm{}] ", id);
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                // No logd here yet.
+                if self.line_start && self.source & host::serial::SOURCE_GUEST != 0 {
+                    sel4::debug_print!("[vm{}] ", self.source & !host::serial::SOURCE_GUEST);
+                }
+                sel4::debug_put_char(c);
+            }
+            if c == b'\n' {
+                // The serial port ends lines itself.
+                let n = self.line_len - (self.line_len != 0 && self.line[self.line_len - 1] == b'\r') as usize;
+                self.send_line(n, false);
+            } else {
+                self.line[self.line_len] = c;
+                self.line_len += 1;
+                if self.line_len == LINE_SIZE {
+                    self.send_line(LINE_SIZE, true);
                 }
             }
-            sel4::debug_put_char(c);
         }
         self.line_start = c == b'\n';
+        #[cfg(test)]
+        if let Some(f) = self.after_put.as_mut() {
+            f(c);
+        }
+    }
+
+    fn send_line(&mut self, n: usize, more: bool) {
+        host::serial::write(self.source, &self.line[..n], more);
+        self.line_len = 0;
+        self.line_deadline = None;
+    }
+
+    /// What has waited long enough goes out, and the next wait starts.
+    fn pace_line(&mut self, flush: bool) {
+        if self.line_len == 0 {
+            return;
+        }
+        let now = host::ticks::now();
+        let deadline = *self.line_deadline.get_or_insert_with(|| now.saturating_add(self.gap_ticks));
+        if flush || now >= deadline {
+            self.send_line(self.line_len, true);
+        }
+    }
+
+    /// The timer serves a missing record and a line in part.
+    fn deadline(&self) -> u64 {
+        match (self.gap_deadline, self.line_deadline) {
+            (Some(a), Some(b)) => a.min(b),
+            (a, b) => a.or(b).unwrap_or(0),
+        }
+    }
+
+    fn update_timer(&mut self) {
+        let deadline = self.deadline();
+        if deadline != self.armed {
+            self.armed = deadline;
+            self.timer(deadline);
+        }
     }
 
     /// Bytes from vCPU v's tail to its head, or None if there are none;
@@ -129,8 +201,10 @@ impl Console {
     /// SetTimer drops an expiry while the TCB's notification is unbound.
     /// Call after rebinding, before sleeping, even for an unchanged deadline.
     /// Like other TCB invocations, this clobbers the IPC buffer.
-    pub fn rearm_timer(&self) {
-        if let Some(deadline) = self.gap_deadline {
+    pub fn rearm_timer(&mut self) {
+        let deadline = self.deadline();
+        if deadline != 0 {
+            self.armed = deadline;
             self.timer(deadline);
         }
     }
@@ -155,13 +229,12 @@ impl Console {
     /// Still bounded if another vCPU continues writing while we print.
     pub fn flush(&mut self, vcpus: &Vcpus) {
         self.drain_limit(vcpus, SIZE * vcpus.n, true);
-        if self.gap_deadline.take().is_some() {
-            self.timer(0);
-        }
+        self.pace_line(true);
+        self.gap_deadline = None;
+        self.update_timer();
     }
 
     fn drain_limit(&mut self, vcpus: &Vcpus, mut budget: usize, flush: bool) -> bool {
-        let old_deadline = self.gap_deadline;
         let mut rechecked_gap = false;
         loop {
             let mut next: Option<(usize, u32, u32)> = None;
@@ -260,9 +333,8 @@ impl Console {
                 self.gap_deadline = None;
             }
         }
-        if self.gap_deadline != old_deadline {
-            self.timer(self.gap_deadline.unwrap_or(0));
-        }
+        self.pace_line(false);
+        self.update_timer();
         more
     }
 }

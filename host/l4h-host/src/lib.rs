@@ -12,6 +12,7 @@
 
 pub mod blk;
 pub mod fixed;
+pub mod font;
 pub mod gpu;
 pub mod iopool;
 pub mod log;
@@ -22,15 +23,28 @@ pub mod serial;
 pub mod trust;
 pub mod vmmgr;
 
-/// Whether host components print informational messages.  Every print is a
-/// synchronous serial write by the seL4 kernel, which stalls the core for
-/// the whole message, so release builds (`L4H_RELEASE=1` when the host is
+/// Whether host components print informational messages.  The serial port
+/// takes about 11 KB/s, so release builds (`L4H_RELEASE=1` when the host is
 /// built) print critical errors only; informational messages use `info!`.
 /// Both kinds are retained in the shared host log ring in every build.
 pub const VERBOSE: bool = match option_env!("L4H_RELEASE") {
     Some(v) => !matches!(v.as_bytes(), [b'1']),
     None => true,
 };
+
+/// Whether the host has the test-only fault injection tests/run-logdtest.sh
+/// uses (`L4H_TEST_INJECT=1` when the host is built).
+pub const TEST_INJECT: bool = match option_env!("L4H_TEST_INJECT") {
+    Some(v) => matches!(v.as_bytes(), [b'1']),
+    None => false,
+};
+
+/// Host priorities, around guest vCPUs' `PRIO_KERNEL`: logd above vCPUs,
+/// so that a busy guest cannot starve it, and below the VMMs, which it must
+/// not delay; then the services VMMs call, and which root waits for.
+pub const PRIO_LOGD: u64 = l4h_abi::PRIO_KERNEL + 1;
+pub const PRIO_VMM: u64 = l4h_abi::PRIO_KERNEL + 2;
+pub const PRIO_SERVICE: u64 = l4h_abi::PRIO_KERNEL + 3;
 
 /// Maximum devices attached to one guest.
 pub const MAX_GUEST_DEVICES: usize = l4h_abi::MAX_DEVICES;
@@ -114,6 +128,7 @@ pub const KIND_NETD: u32 = 3;
 pub const KIND_TRUSTD: u32 = 4;
 pub const KIND_MEMD: u32 = 5;
 pub const KIND_VMMGR: u32 = 6;
+pub const KIND_LOGD: u32 = 7;
 
 /// The kinds called synchronously: root calls blkd, netd and memd, guests'
 /// VMMs call vmmgr.  A caller could not wait for their faults to be

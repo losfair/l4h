@@ -5,14 +5,15 @@
 //! or the serial monitor.
 
 use core::fmt::{self, Display, Write};
+use core::ops::Range;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use l4h_host::fixed::ArrayString;
+use l4h_host::font;
 use sel4::{CapRights, VmAttributes};
 
 use crate::Host;
 use crate::devmem::DevMem;
-use crate::font;
 use crate::mem::{Alloc, ObjCtx};
 use crate::vspace::map_frame;
 
@@ -104,6 +105,21 @@ pub struct Dashboard {
     shown: &'static mut [Cell],
     next: &'static mut [Cell],
     ticks: u32,
+    /// With `fb_console`: the framebuffer's frames, the lower half's page
+    /// offset in them and where in the first of its pages it starts, and
+    /// the pitch and size of what the kernel's console would cover.
+    console: Option<(Range<usize>, usize, usize, usize)>,
+}
+
+/// How the framebuffer is mapped.
+#[cfg(target_arch = "x86_64")]
+pub fn write_combining() -> VmAttributes {
+    VmAttributes::from_inner(sel4::sys::seL4_X86_VMAttributes::seL4_X86_WriteCombining)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn write_combining() -> VmAttributes {
+    VmAttributes::DEFAULT
 }
 
 /// struct multiboot2_fb, as seL4 passes it in the bootinfo.
@@ -148,7 +164,7 @@ impl Dashboard {
             return None;
         }
         let frames = alloc.slots.global(|slots| devmem.frames(slots, base, size))?;
-        let wc = VmAttributes::from_inner(sel4::sys::seL4_X86_VMAttributes::seL4_X86_WriteCombining);
+        let wc = write_combining();
         alloc.global(|alloc| {
             for (i, s) in (frames.start + first..frames.start + first + pages).enumerate() {
                 let f = crate::devmem::granule(s);
@@ -156,7 +172,15 @@ impl Dashboard {
             }
         });
         let fb = (FB_VA + (addr & 4095)) as *mut u8;
-        // The kernel's copy of the console (fb_console) has the lower half.
+        // The console (fb_console) has the lower half: rows of 16 pixels, in
+        // the kernel's layout (patch 0020), for what logd draws of it.
+        let top = height / 2 / 16 * 16;
+        let console = fb_console.then(|| {
+            let at = (addr & 4095) + top * pitch;
+            let end = (addr & 4095) + (height / 16) * 16 * pitch;
+            let frames = frames.start + first + at / 4096..frames.start + first + end.div_ceil(4096);
+            (frames, at % 4096, width, (height / 16) * 16 - top)
+        });
         let height = if fb_console { height / 2 } else { height };
         let sx = if width >= 1280 { 2 } else { 1 };
         let sy = 2;
@@ -166,7 +190,7 @@ impl Dashboard {
         // No character is 0: every cell is drawn the first time.
         shown.fill(Cell { ch: 0, ..BLANK });
         next.fill(BLANK);
-        let mut d = Dashboard { fb, pitch, sx, sy, cols, rows, shown, next, ticks: REFRESH_TICKS };
+        let mut d = Dashboard { fb, pitch, sx, sy, cols, rows, shown, next, ticks: REFRESH_TICKS, console };
         // Clear the margins the cell grid does not cover.
         for y in 0..height {
             for x in 0..width {
@@ -175,6 +199,12 @@ impl Dashboard {
         }
         info!("l4h-root: dashboard on {}x{} framebuffer ({} columns)", width, height, cols);
         Some(d)
+    }
+
+    /// The part of the screen host output goes to, with `fb_console`.
+    pub fn console_area(&self) -> Option<crate::logd::FbArea> {
+        let (frames, offset, width, height) = self.console.clone()?;
+        Some(crate::logd::FbArea { frames, offset, pitch: self.pitch, width, height })
     }
 
     fn put(&mut self, x: usize, y: usize, rgb: u32) {

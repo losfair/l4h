@@ -52,6 +52,10 @@ impl<const W: usize> Record<W> {
         // Any bytes are valid u8s, and `get` clamped len to the words.
         unsafe { core::slice::from_raw_parts(self.text.as_ptr().cast(), self.len) }
     }
+
+    pub fn buf(&self) -> Buf<W> {
+        Buf(self.text)
+    }
 }
 
 /// What a reader finds at a sequence number.

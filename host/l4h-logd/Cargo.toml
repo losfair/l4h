@@ -1,0 +1,8 @@
+[package]
+name = "l4h-logd"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+l4h-rt = { path = "../l4h-rt" }

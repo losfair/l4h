@@ -57,6 +57,7 @@ pub fn start_bytes(io_pool: usize, vcpus: usize, devices: usize) -> usize {
 /// Untyped memory a guest's arena is expected to need for its l4h-vmm.
 pub fn arena_bytes(io_pool: usize, vcpus: usize, devices: usize) -> usize {
     start_bytes(io_pool, vcpus, devices) + io_pool / 128 + 2 * (32 << host::CNODE_BITS)
+        + (32 << host::serial::FRAME_RADIX)
 }
 
 /// A device's host-side backend.
@@ -191,7 +192,7 @@ fn create(
         id: g.id as u32,
         kind: host::KIND_VMM,
         elf: VMM_ELF,
-        prio: abi::PRIO_KERNEL + 1,
+        prio: host::PRIO_VMM,
         budget_us: host_info.timeslice_us,
         period_us: host_info.timeslice_us,
         config: cfg_bytes,

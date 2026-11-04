@@ -255,7 +255,9 @@ extern "C" fn shim_main(magic: u32, info: u64) -> ! {
             });
         }
     }
-    if next_channel > out.end {
+    // The secondaries' serial rings follow the channels.
+    let serial_base = out.end - (n as u64 - 1) * part::SERIAL_RING_SIZE;
+    if next_channel > serial_base {
         fail(format_args!("too many channels"));
     }
 
@@ -274,6 +276,13 @@ extern "C" fn shim_main(magic: u32, info: u64) -> ! {
             cpus: p.cpus.len() as u32,
             mem_mib: p.ram.total() >> 20,
             console: if k == 0 { part::Ring::default() } else { part::Ring { paddr: p.block + OUT_RING, size: part::CONSOLE_RING_SIZE } },
+            serial: if k == 0 {
+                part::Ring::default()
+            } else {
+                let paddr = serial_base + (k as u64 - 1) * part::SERIAL_RING_SIZE;
+                unsafe { phys_mut(paddr, part::SERIAL_RING_SIZE as usize).fill(0) };
+                part::Ring { paddr, size: part::SERIAL_RING_SIZE }
+            },
         };
     }
     for (k, p) in plans.iter().enumerate() {
@@ -294,6 +303,7 @@ extern "C" fn shim_main(magic: u32, info: u64) -> ! {
         d.ecam_bus_end = ecam.2;
         d.mem_base = p.ram.list[0].start;
         d.console = parts_info[k].console;
+        d.serial = parts_info[k].serial;
         d.iommu = part::Iommu { paddr: out.start, size: part::IOMMU_REGION_SIZE, share: k as u32, shares: n as u32, _pad: [0; 2] };
         for (i, c) in p.channels.iter().enumerate() {
             d.channels[i] = *c;
@@ -686,7 +696,8 @@ fn place_memory(bi: &mut BootInfo, conf: &Conf, acpi: &acpi::Acpi, plans: &mut [
     // The shared region: below 4 GiB, which the kernels' boot page tables
     // map (their console rings must be there).
     let channels = (n as u64 - 1) * part::CHANNEL_SIZE + conf.links.len() as u64 * part::LINK_CHANNEL_SIZE;
-    let out_size = part::IOMMU_REGION_SIZE + OUT_BLOCK * MAX_PARTITIONS as u64 + align_up(channels, MIB);
+    let out_size = part::IOMMU_REGION_SIZE + OUT_BLOCK * MAX_PARTITIONS as u64 + align_up(channels, MIB)
+        + (n as u64 - 1) * part::SERIAL_RING_SIZE;
     let Some(out) = free.take(out_size, 2 * MIB, MIB, FOUR_GIB, true) else {
         fail(format_args!("no {} MiB below 4 GiB for the shared region", out_size >> 20))
     };

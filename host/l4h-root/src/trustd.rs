@@ -350,7 +350,7 @@ fn create(
         id: TRUSTD_ID,
         kind: host::KIND_TRUSTD,
         elf: TRUSTD_ELF,
-        prio: abi::PRIO_KERNEL + 1,
+        prio: host::PRIO_VMM,
         // At most a quarter of a core, whatever the TPM or its firmware's
         // AML does (trustd sleeps between polls of the TPM).
         budget_us: info.timeslice_us,
