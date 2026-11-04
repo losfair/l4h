@@ -529,7 +529,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     if !partition::secondary() {
         let rings = partition::Rings::new(&mut h.alloc, &mut h.devmem);
         let fb = h.dashboard.as_ref().and_then(|d| d.console_area());
-        logd::spawn(&mut h, uart, &rings, fb);
+        logd::spawn(&mut h, &rings, fb);
     }
 
     if module("guest-kernel").is_none() {

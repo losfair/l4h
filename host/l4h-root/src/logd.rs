@@ -24,8 +24,11 @@ use crate::mem::{Arena, Slot};
 pub const LOGD_ID: u32 = 0x600;
 static LOGD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/l4h-logd.elf"));
 
+#[cfg(target_arch = "x86_64")]
 const COM1: u16 = 0x3f8;
+#[cfg(target_arch = "x86_64")]
 const LSR: u16 = 5;
+#[cfg(target_arch = "x86_64")]
 const LSR_THRE: u8 = 0x20;
 /// What a thread about to stop the machine prints of a ring, at most: about
 /// a second of the port, if the lines are short.
@@ -103,26 +106,40 @@ pub fn init_uart(_base: u16) -> Option<u64> {
     Some(0)
 }
 
-/// Print on the port directly, whatever else wants the CPU.
+/// Whether the port takes a byte now.
 #[cfg(target_arch = "x86_64")]
+fn ready() -> bool {
+    inb(PORT.load(Ordering::Relaxed), BASE.load(Ordering::Relaxed) + LSR) & LSR_THRE != 0
+}
+
+#[cfg(target_arch = "x86_64")]
+fn send(c: u8) {
+    outb(PORT.load(Ordering::Relaxed), BASE.load(Ordering::Relaxed), c);
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn ready() -> bool {
+    true
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn send(_c: u8) {}
+
+/// Print on the port directly, whatever else wants the CPU.
 fn put(bytes: &[u8]) {
-    let (port, base) = (PORT.load(Ordering::Relaxed), BASE.load(Ordering::Relaxed));
-    if port == 0 {
+    if PORT.load(Ordering::Relaxed) == 0 {
         return;
     }
     for &c in bytes {
         // A stuck UART must not stop what comes after printing.
         for _ in 0..100_000 {
-            if inb(port, base + LSR) & LSR_THRE != 0 {
+            if ready() {
                 break;
             }
         }
-        outb(port, base, c);
+        send(c);
     }
 }
-
-#[cfg(not(target_arch = "x86_64"))]
-fn put(_bytes: &[u8]) {}
 
 fn merge(grace: u64) -> Merge {
     let mut m = Merge::new(&crate::SERIAL, grace);
@@ -208,14 +225,15 @@ pub struct FbArea {
 }
 
 /// Spawn logd: partition 0's serial output from now on.
-pub fn spawn(h: &mut Host, port: Option<u64>, rings: &crate::partition::Rings, fb: Option<FbArea>) {
+pub fn spawn(h: &mut Host, rings: &crate::partition::Rings, fb: Option<FbArea>) {
     if !host::serial::LOGD || LOGD_ELF.is_empty() {
         return;
     }
-    let Some(port) = port else {
+    let port = PORT.load(Ordering::Relaxed);
+    if port == 0 {
         log!("l4h-root: no serial port: nothing prints the host's output");
         return;
-    };
+    }
     let fb_pages = fb.as_ref().map_or(0, |f| f.frames.len());
     let ring_pages = serial::MAX_RINGS * (serial::PAGES + l4h_partition::CONSOLE_RING_SIZE as usize / PAGE);
     let keep_bits = (fb_pages + ring_pages).next_power_of_two().trailing_zeros() as usize;
@@ -307,8 +325,10 @@ pub fn tick(h: &mut Host) {
                 return;
             }
         }
-        put(&t.line.bytes()[t.sent..t.sent + 1]);
-        t.sent += 1;
+        if ready() {
+            send(t.line.bytes()[t.sent]);
+            t.sent += 1;
+        }
     }
 }
 
