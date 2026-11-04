@@ -4,19 +4,21 @@
 //! only its PCI functions (through ECAM, never the shared 0xcf8 ports),
 //! MSIs to its own first CPU, and the machine-global devices (I/O APICs,
 //! serial port, RTC, reset, TPM, framebuffer, balloon) only in partition
-//! 0, the primary.  The primary also copies what the other kernels print
-//! to their console rings to the serial port (`Relay`).
+//! 0, the primary.  What other partitions print, their kernels included,
+//! reaches the serial port through rings the primary's logd reads (`Rings`).
 //!
 //! Without the module root is the only kernel on the machine.
 
+use core::ops::Range;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
-use l4h_partition::{CONSOLE_RING_HEADER, Descriptor};
+use l4h_host::serial;
+use l4h_partition::{Descriptor, MAX_PARTITIONS, Ring};
 use sel4::{CapRights, VmAttributes};
 use sel4::init_thread::slot;
 
 use crate::devmem::{self, DevMem};
-use crate::mem::{Alloc, ObjCtx};
+use crate::mem::{Alloc, ObjCtx, Slot};
 
 static DESC: AtomicPtr<Descriptor> = AtomicPtr::new(core::ptr::null_mut());
 
@@ -122,67 +124,75 @@ pub fn map_rights(alloc: &mut Alloc, devmem: &mut DevMem, paddr: usize, len: usi
     Some(())
 }
 
-/// A kernel console ring another partition's kernel prints to.
-struct RingReader {
-    partition: u32,
-    va: usize,
-    size: usize,
-    tail: u64,
-    line: [u8; 160],
-    len: usize,
+/// The rings partition 0 reads of the other partitions, as frames in
+/// consecutive root slots.
+pub struct Rings {
+    serial: [Option<Range<Slot>>; MAX_PARTITIONS],
+    kernel: [Option<Range<Slot>>; MAX_PARTITIONS],
 }
 
-/// The primary's copy of the other kernels' consoles to its own.
-pub struct Relay {
-    rings: [Option<RingReader>; l4h_partition::MAX_PARTITIONS],
-}
-
-impl Relay {
-    pub fn new(alloc: &mut Alloc, devmem: &mut DevMem) -> Option<Relay> {
-        let d = get().filter(|d| d.is_primary() && d.count > 1)?;
-        let mut r = Relay { rings: [const { None }; l4h_partition::MAX_PARTITIONS] };
-        let region = &crate::layout::PARTITION_RINGS;
+impl Rings {
+    /// Map them: root reads them when logd cannot.
+    pub fn new(alloc: &mut Alloc, devmem: &mut DevMem) -> Rings {
+        const NONE: Option<Range<Slot>> = None;
+        let mut r = Rings { serial: [NONE; MAX_PARTITIONS], kernel: [NONE; MAX_PARTITIONS] };
+        let Some(d) = get().filter(|d| d.is_primary() && d.count > 1) else { return r };
         for (k, p) in d.parts().iter().enumerate() {
-            if p.console.size == 0 {
-                continue;
+            if p.serial.size != 0 {
+                r.serial[k] = map_ring(alloc, devmem, p.serial, crate::layout::PARTITION_SERIAL.base + k * serial::PAGES * 4096);
+                if r.serial[k].is_none() {
+                    log!("l4h-root: cannot map partition {}'s serial ring", k);
+                }
             }
-            let va = region.base + k * l4h_partition::CONSOLE_RING_SIZE as usize;
-            if map(alloc, devmem, p.console.paddr as usize, p.console.size as usize, va).is_none() {
-                log!("l4h-root: cannot map partition {}'s console ring", k);
-                continue;
+            if p.console.size != 0 {
+                r.kernel[k] = map_ring(alloc, devmem, p.console, crate::layout::PARTITION_CONSOLES.base + k * serial::KERNEL_RING_STRIDE);
+                if r.kernel[k].is_none() {
+                    log!("l4h-root: cannot map partition {}'s console ring", k);
+                }
             }
-            r.rings[k] = Some(RingReader { partition: k as u32, va, size: p.console.size as usize, tail: 0, line: [0; 160], len: 0 });
         }
-        Some(r)
+        r
     }
 
-    /// Print what the other kernels printed since the last call, a line
-    /// at a time, each with its partition.
-    pub fn drain(&mut self) {
-        for r in self.rings.iter_mut().flatten() {
-            let head = unsafe { (r.va as *const u64).read_volatile() };
-            let cap = (r.size - CONSOLE_RING_HEADER) as u64;
-            if head.wrapping_sub(r.tail) > cap {
-                sel4::debug_println!("[p{}] ({} bytes lost)", r.partition, head - r.tail - cap);
-                r.tail = head - cap;
-            }
-            while r.tail < head {
-                let c = unsafe { ((r.va + CONSOLE_RING_HEADER + (r.tail % cap) as usize) as *const u8).read_volatile() };
-                r.tail += 1;
-                if c == b'\r' {
-                    continue;
-                }
-                if c == b'\n' || r.len == r.line.len() {
-                    let s = core::str::from_utf8(&r.line[..r.len]).unwrap_or("(not text)");
-                    sel4::debug_println!("[p{}] {}", r.partition, s);
-                    r.len = 0;
-                    if c == b'\n' {
-                        continue;
-                    }
-                }
-                r.line[r.len] = c;
-                r.len += 1;
-            }
-        }
+    pub fn serial(&self, k: usize) -> Option<Range<Slot>> {
+        self.serial[k].clone()
     }
+
+    pub fn kernel(&self, k: usize) -> Option<Range<Slot>> {
+        self.kernel[k].clone()
+    }
+
+    pub fn serial_mask(&self) -> u32 {
+        (0..MAX_PARTITIONS).filter(|&k| self.serial[k].is_some()).fold(0, |m, k| m | 1 << k)
+    }
+
+    pub fn kernel_mask(&self) -> u32 {
+        (0..MAX_PARTITIONS).filter(|&k| self.kernel[k].is_some()).fold(0, |m, k| m | 1 << k)
+    }
+}
+
+fn map_ring(alloc: &mut Alloc, devmem: &mut DevMem, ring: Ring, va: usize) -> Option<Range<Slot>> {
+    let frames = alloc.slots.global(|slots| devmem.frames(slots, ring.paddr as usize, ring.size as usize))?;
+    alloc.global(|alloc| {
+        for (i, s) in frames.clone().enumerate() {
+            let copy = alloc.slots.alloc();
+            let f = devmem::granule(copy);
+            crate::component::abs_of(f).copy(&crate::component::abs_of(devmem::granule(s)), CapRights::all()).expect("ring frame");
+            crate::vspace::map_frame(&mut ObjCtx::global(alloc), slot::VSPACE.cap(), f, va + i * 4096,
+                CapRights::read_write(), VmAttributes::DEFAULT);
+        }
+    });
+    Some(frames)
+}
+
+/// In a secondary partition: print to the ring partition 0 reads from now
+/// on, with what `early` holds, and return its frames.
+pub fn serial_ring(alloc: &mut Alloc, devmem: &mut DevMem, early: &'static serial::Ring) -> Option<Range<Slot>> {
+    let d = get().filter(|d| !d.is_primary() && d.serial.size != 0)?;
+    let frames = map_ring(alloc, devmem, d.serial, crate::layout::SERIAL.base)?;
+    // Mapped for good, and the shim cleared it.
+    let ring = unsafe { &*(crate::layout::SERIAL.base as *const serial::Ring) };
+    early.copy_to(ring);
+    serial::init(ring, 0);
+    Some(frames)
 }

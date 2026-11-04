@@ -200,7 +200,7 @@ pub fn spawn(h: &mut Host, modules: &Modules, plan: &Dom0Plan) -> Vmmgr {
             kind: host::KIND_VMMGR,
             elf: VMMGR_ELF,
             // Above the guests and their VMMs, which it configures.
-            prio: abi::PRIO_KERNEL + 2,
+            prio: host::PRIO_SERVICE,
             budget_us: h.info.timeslice_us,
             period_us: h.info.timeslice_us,
             config: cfg_bytes,
@@ -218,6 +218,12 @@ pub fn spawn(h: &mut Host, modules: &Modules, plan: &Dom0Plan) -> Vmmgr {
     for i in 0..host::log::PAGES {
         comp.give(proto::SLOT_LOG_FRAMES + i as u64,
             cap::Granule::from_bits(h.info.log_frames + i as u64), CapRights::read_write());
+    }
+    if host::serial::LOGD {
+        for i in 0..host::serial::PAGES {
+            comp.give(proto::SLOT_SERIAL_FRAMES + i as u64,
+                cap::Granule::from_bits(h.info.serial_frames() + i as u64), CapRights::read_write());
+        }
     }
     for core in 0..h.info.cores {
         comp.give(proto::SLOT_SCHED_CONTROL + core as u64, h.info.sched_control(core), CapRights::all());

@@ -8,7 +8,6 @@
 //! (l4h-vmmgr's memd.rs), and memory a guest plugs while it runs (DESIGN.md
 //! §8.5) between its l4h-vmm and memd.
 
-use l4h_abi as abi;
 use l4h_host as host;
 use l4h_host::memd::{self, BalloonConfig, MemdConfig};
 use l4h_task::memd::MemdLink;
@@ -195,7 +194,7 @@ pub fn spawn(alloc: &mut Alloc, win: &mut Window, asids: &mut AsidPools, info: &
         kind: host::KIND_MEMD,
         elf: MEMD_ELF,
         // Above every guest: l4h-root waits for it.
-        prio: abi::PRIO_KERNEL + 2,
+        prio: host::PRIO_SERVICE,
         budget_us: info.timeslice_us,
         period_us: info.timeslice_us,
         config: cfg_bytes,

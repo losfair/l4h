@@ -29,9 +29,9 @@ mod config;
 mod ctl;
 mod dashboard;
 mod devmem;
-mod font;
 mod iommu;
 mod layout;
+mod logd;
 mod memd;
 mod monitor;
 mod netd;
@@ -69,6 +69,8 @@ static SLOT_STORAGE: StaticCell<mem::SlotStorage<{ CNODE_SLOTS / 64 }, CNODE_SLO
     StaticCell::new(mem::SlotStorage::new());
 static ALLOC_STORAGE: StaticCell<mem::AllocStorage> = StaticCell::new(mem::AllocStorage::new());
 static LOG: host::log::Ring = host::log::Ring::new();
+/// Partition 0's serial ring. A secondary only starts on it.
+static SERIAL: host::serial::Ring = host::serial::Ring::new();
 pub const MAX_GUESTS: usize = 64;
 /// Badge bit of a component's fault on the root endpoint.
 pub const HYP_BADGE_FAULT: u64 = host::BADGE_FAULT;
@@ -98,6 +100,7 @@ pub struct HostInfo {
     pub topology: topology::Topology,
     pub tsc_hz: u64,
     log_frames: u64,
+    serial_frames: u64,
     /// AArch64 feature ID registers for the guests' bootinfo (`cpu_id`).
     pub cpu_id: [u64; 5],
     pub hyp_ep: cap::Endpoint,
@@ -117,7 +120,12 @@ impl HostInfo {
             parent_ep: self.hyp_ep,
             tsc_hz: self.tsc_hz,
             log_frames: self.log_frames,
+            serial_frames: self.serial_frames,
         }
+    }
+
+    pub fn serial_frames(&self) -> u64 {
+        self.serial_frames
     }
 
     pub fn sched_control(&self, core: usize) -> cap::SchedControl {
@@ -255,8 +263,8 @@ pub struct Host {
     pub reset: reset::Reset,
     pub rtc: rtc::Rtc,
     pub vmmgr: Option<vmmgr::Vmmgr>,
-    /// Partition 0 of several: the other kernels' consoles.
-    pub relay: Option<partition::Relay>,
+    /// Partition 0's writer to the serial port.
+    pub logd: Option<logd::Logd>,
     /// One of several partitions: the channels to the others.
     pub channels: Option<channel::Channels>,
 }
@@ -328,7 +336,11 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     let tsc_hz = tsc_hz(bootinfo);
     LOG.set_clock(rdtsc(), tsc_hz);
     host::log::init(&LOG, 0);
-    sel4_root_task::panicking::set_hook(&|info| log!("l4h-root: {}", info));
+    host::serial::init(&SERIAL, 0);
+    sel4_root_task::panicking::set_hook(&|info| {
+        log!("l4h-root: {}", info);
+        logd::panicked();
+    });
     layout::guard_stack(bootinfo);
     layout::check_image(bootinfo);
     let cores = bootinfo.inner().numNodes as usize;
@@ -337,7 +349,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         bootinfo.sched_control().range().start,
     );
     info!("l4h-root: CPU physical cores {:?}", topology.physical());
-    let slots = Slots::new(slot::CNODE.cap(), SLOT_STORAGE.take(), bootinfo.empty().range());
+    let slots = Slots::new(slot::CNODE.cap(), SLOT_STORAGE.take(), logd::reserve(bootinfo, bootinfo.empty().range()));
     let mut alloc = Alloc::new(slots, ALLOC_STORAGE.take(), bootinfo);
     let total_bytes = alloc.free_bytes();
     info!("l4h-root: {} core(s), {} MiB free memory", cores, total_bytes >> 20);
@@ -357,6 +369,16 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     let module = |name: &str| modules.iter().find(|m| m.name == name).map(|m| m.data);
     partition::init(module("l4h-partition"));
     let cfg = config::Config::new(module("l4h-config"));
+    // The serial port is partition 0's. From here a panic prints on it.
+    let uart = if partition::secondary() { None } else { logd::init_uart(cfg.serial_port) };
+    let image_frame = |va: usize| bootinfo.user_image_frames().index((va - layout::image_base()) / 4096).cap().bits();
+    let serial_frames = match partition::serial_ring(&mut alloc, &mut devmem, &SERIAL) {
+        Some(frames) => frames.start as u64,
+        None => {
+            assert!(((&raw const SERIAL) as usize - layout::image_base()) / 4096 + host::serial::PAGES <= bootinfo.user_image_frames().len());
+            image_frame((&raw const SERIAL) as usize)
+        }
+    };
     // ACPI table frames are shared by RTC discovery, reset and trustd.
     #[cfg(target_arch = "x86_64")]
     let mut acpi_frames = acpi::Frames::new();
@@ -377,6 +399,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
             assert!(i + host::log::PAGES <= bootinfo.user_image_frames().len());
             bootinfo.user_image_frames().index(i).cap().bits()
         },
+        serial_frames,
         cpu_id: cpu_id(bootinfo),
         hyp_ep,
         sched_control_base: bootinfo.sched_control().range().start,
@@ -493,17 +516,21 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         reset,
         rtc,
         vmmgr: None,
-        relay: None,
+        logd: None,
         channels: None,
     };
     h.scan_disks();
     // The serial port and its interrupt (an I/O APIC pin) are partition 0's.
     if !partition::secondary() {
-        h.monitor = monitor::Monitor::new(&mut h.alloc, &mut h.devmem, wd_ntfn, h.cfg.serial_port, h.cfg.serial_irq, &mut h.iommu);
+        h.monitor = uart.and_then(|port| monitor::Monitor::new(&mut h.alloc, &mut h.devmem, wd_ntfn, port, h.cfg.serial_port, h.cfg.serial_irq, &mut h.iommu));
     }
-    h.relay = partition::Relay::new(&mut h.alloc, &mut h.devmem);
     h.channels = channel::Channels::new(&mut h.alloc, &mut h.devmem, wd_ntfn, h.info.tsc_hz);
     h.dashboard = dashboard::Dashboard::new(bootinfo, &mut h.alloc, &mut h.devmem, h.cfg.fb_console);
+    if !partition::secondary() {
+        let rings = partition::Rings::new(&mut h.alloc, &mut h.devmem);
+        let fb = h.dashboard.as_ref().and_then(|d| d.console_area());
+        logd::spawn(&mut h, uart, &rings, fb);
+    }
 
     if module("guest-kernel").is_none() {
         log!("l4h-root: no guest kernel, nothing to do");
@@ -743,9 +770,7 @@ fn serve(h: &mut Host, reply_slot: ReplySlot) -> ! {
         let resp = if notified {
             if badge & TIMER_BADGE != 0 {
                 dashboard::Dashboard::tick(h);
-                if let Some(r) = h.relay.as_mut() {
-                    r.drain();
-                }
+                logd::tick(h);
                 channel::tick(h);
                 trustd::tick(h);
                 h.iommu.poll();
@@ -786,6 +811,7 @@ fn component_call(h: &mut Host, badge: u64, info: &sel4::MessageInfo) -> Option<
         let fault = sel4::with_ipc_buffer(|b| sel4::Fault::new(b, info));
         log!("l4h-root: component {:#x} fault: {:x?}", id, fault);
         trustd::fault(h, id);
+        logd::fault(h, id);
         return None;
     }
     let reply = |v: u64| {

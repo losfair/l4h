@@ -796,6 +796,7 @@ fn main(info: &'static Info) -> ! {
                 let ep = steer::Endpoint { switch: mr(1) as u8, mac: mac_of(mr(2)), peer: mac_of(mr(3)) };
                 if mr(1) < net::MAX_SWITCHES as u64 && d.steer.ep_set(mr(0) as usize, ep) { 0 } else { u64::MAX }
             }
+            net::NETD_TEST_PANIC if host::TEST_INJECT => panic!("injected panic"),
             net::NETD_EP_DEL => {
                 d.steer.ep_del(mr(0) as usize);
                 0

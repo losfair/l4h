@@ -50,9 +50,11 @@ pub const MAX_ASID_POOLS: usize = 8;
 pub const SLOT_VMM_MEMD_EP: u64 = SLOT_ASID_POOL + MAX_ASID_POOLS as u64;
 /// Shared log frames, also mapped into each guest's VMM.
 pub const SLOT_LOG_FRAMES: u64 = SLOT_VMM_MEMD_EP + memd::MAX_GUESTS as u64;
+/// Frames of the serial ring, also mapped into each guest's VMM.
+pub const SLOT_SERIAL_FRAMES: u64 = 256;
 /// vmmgr's own allocations start here.
-pub const SLOT_DYN_BASE: u64 = 256;
-const _: () = assert!(SLOT_LOG_FRAMES + crate::log::PAGES as u64 <= SLOT_DYN_BASE);
+pub const SLOT_DYN_BASE: u64 = SLOT_SERIAL_FRAMES + crate::serial::PAGES as u64;
+const _: () = assert!(SLOT_LOG_FRAMES + crate::log::PAGES as u64 <= SLOT_SERIAL_FRAMES);
 const _: () = assert!(SLOT_XCHG + XCHG_SLOTS as u64 <= SLOT_SCHED_CONTROL);
 
 /// Pages of dom0's control data area.

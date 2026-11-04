@@ -88,7 +88,9 @@ pub fn reboot(h: &mut Host, by: &str) -> i64 {
         return crate::ctl::EPERM;
     }
     log!("l4h-root: host reboot ({})", by);
+    crate::logd::before_reset();
     reset(h);
+    crate::logd::after_failed_reset(h);
     log!("l4h-root: host reboot failed: the machine did not reset");
     crate::ctl::EIO
 }

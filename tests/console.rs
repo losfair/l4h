@@ -11,7 +11,6 @@ pub mod host {
 
 use core::ptr::{addr_of, addr_of_mut};
 use l4h_abi as abi;
-use std::cell::RefCell;
 use std::sync::{Mutex, MutexGuard, Once};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -23,14 +22,8 @@ static TIMER: AtomicU64 = AtomicU64::new(0);
 static ARMS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 const VCPUS: usize = 2;
 const EVENT: u32 = 7;
-thread_local! {
-    static SERIAL: RefCell<Option<Box<dyn FnMut(u8)>>> = RefCell::new(None);
-}
 
-#[macro_export]
-macro_rules! debug_print { ($($a:tt)*) => {{ let _ = format_args!($($a)*); }}; }
 pub mod sel4 {
-    pub use crate::debug_print;
     pub mod cap_type { pub struct Tcb; }
     pub struct Cap<T>(pub u64, pub core::marker::PhantomData<T>);
     impl<T> Cap<T> { pub fn bits(&self) -> u64 { self.0 } }
@@ -46,11 +39,6 @@ pub mod sel4 {
         }
     }
     pub fn with_ipc_buffer_mut<R>(f: impl FnOnce(&mut IpcBuffer) -> R) -> R { f(&mut IpcBuffer) }
-    pub fn debug_put_char(c: u8) {
-        crate::SERIAL.with(|s| {
-            if let Some(f) = s.borrow_mut().as_mut() { f(c); }
-        });
-    }
 }
 pub fn cap<T>(bits: u64) -> sel4::Cap<T> { sel4::Cap(bits, core::marker::PhantomData) }
 mod guest {
@@ -115,14 +103,10 @@ impl Fixture {
         NOW.store(1000, Ordering::Relaxed);
         TIMER.store(0, Ordering::Relaxed);
         ARMS.lock().unwrap().clear();
-        Self { _lock: lock, console: console::Console::new(true, None, EVENT, 1000), vcpus: guest::Vcpus { n: VCPUS } }
+        Self { _lock: lock, console: console::Console::new(false, None, EVENT, 1000), vcpus: guest::Vcpus { n: VCPUS } }
     }
     fn drain(&mut self) -> bool { self.console.drain(&self.vcpus) }
 }
-impl Drop for Fixture {
-    fn drop(&mut self) { SERIAL.with(|s| *s.borrow_mut() = None); }
-}
-
 #[test]
 fn roundtrip_and_cursor_wrap_preserve_unread_records() {
     let mut f = Fixture::new();
@@ -151,17 +135,17 @@ fn continuous_producer_cannot_extend_a_drain_without_limit() {
     assert_eq!(write(0, &[0]), 1);
     assert_eq!(write(1, &[1]), 1);
     let mut printed = 0;
-    SERIAL.with(|s| *s.borrow_mut() = Some(Box::new(move |c| {
+    f.console.after_put = Some(Box::new(move |c| {
         printed += 1;
         // Stop eventually even on the old consumer, to fail instead of hang.
         if printed < 100_000 {
             let v = (1 - c) as usize;
             if head(v) == tail(v) { assert_eq!(write(v, &[v as u8]), 1); }
         }
-    })));
+    }));
     assert!(f.drain());
     assert!(output().len() <= abi::CONSOLE_OUT_SIZE / 9);
-    SERIAL.with(|s| *s.borrow_mut() = None);
+    f.console.after_put = None;
     f.console.flush(&f.vcpus);
     assert_eq!(head(0), tail(0));
     assert_eq!(head(1), tail(1));
@@ -174,12 +158,12 @@ fn refilled_nonempty_ring_is_carried_to_next_batch_without_a_kick() {
     assert_eq!(write(0, &vec![b'a'; n]), n);
     assert_eq!(write(0, &vec![b'b'; n]), n);
     let mut refilled = false;
-    SERIAL.with(|s| *s.borrow_mut() = Some(Box::new(move |c| {
+    f.console.after_put = Some(Box::new(move |c| {
         if c == b'b' && !refilled {
             refilled = true;
             assert_eq!(write(0, &vec![b'c'; n]), n);
         }
-    })));
+    }));
     assert!(f.drain());
     assert_eq!(unsafe { console_test_kicks() }, 1);
     assert!(!f.drain());
@@ -395,4 +379,97 @@ fn poweroff_flush_skips_a_gap_without_waiting() {
     assert_eq!(output(), b"[l4h: skipped 2 missing console records]\ncrash report");
     assert_eq!(TIMER.load(Ordering::Relaxed), 0);
     assert_eq!(head(1), tail(1));
+}
+
+/// What reaches the serial ring, as the port would show it.
+struct Serial(host::serial::Merge);
+
+impl Serial {
+    fn new() -> Self {
+        // Too large for a test thread's stack; all zeroes is Ring::new().
+        let ring: &'static host::serial::Ring =
+            unsafe { &*std::alloc::alloc_zeroed(std::alloc::Layout::new::<host::serial::Ring>()).cast() };
+        host::serial::init(ring, 0);
+        Self(host::serial::Merge::new(ring, 0))
+    }
+    fn read(&mut self) -> String {
+        let (mut s, mut line) = (String::new(), host::serial::Line::new());
+        self.0.begin_pass();
+        while self.0.next(u64::MAX, &mut line) {
+            s.push_str(std::str::from_utf8(line.bytes()).unwrap());
+            self.0.commit();
+        }
+        s
+    }
+}
+
+fn serial_fixture(prefix: Option<u32>) -> (Fixture, Serial) {
+    let mut f = Fixture::new();
+    f.console = console::Console::new(true, prefix, EVENT, 1000);
+    (f, Serial::new())
+}
+
+#[test]
+fn serial_gets_whole_lines_with_the_guest_marked() {
+    let (mut f, mut s) = serial_fixture(Some(3));
+    write(0, b"one\r\ntw");
+    write(1, b"o\nthree\n");
+    assert!(!f.drain());
+    assert_eq!(s.read(), "[vm3] one\r\n[vm3] two\r\n[vm3] three\r\n");
+    assert_eq!(*ARMS.lock().unwrap(), Vec::<u64>::new());
+}
+
+#[test]
+fn dom0_has_no_prefix() {
+    let (mut f, mut s) = serial_fixture(None);
+    write(0, b"dom0\n");
+    assert!(!f.drain());
+    assert_eq!(s.read(), "dom0\r\n");
+}
+
+#[test]
+fn part_of_a_line_goes_out_after_the_gap_timer_and_the_line_goes_on() {
+    let (mut f, mut s) = serial_fixture(Some(1));
+    write(0, b"login: ");
+    assert!(!f.drain());
+    assert_eq!(s.read(), "");
+    assert_eq!(TIMER.load(Ordering::Relaxed), 1100);
+    NOW.store(1100, Ordering::Relaxed);
+    assert!(!f.drain());
+    assert_eq!(s.read(), "[vm1] login: ");
+    assert_eq!(TIMER.load(Ordering::Relaxed), 0);
+    write(0, b"root\n");
+    assert!(!f.drain());
+    assert_eq!(s.read(), "root\r\n");
+}
+
+#[test]
+fn a_line_longer_than_the_buffer_stays_one_line() {
+    let (mut f, mut s) = serial_fixture(None);
+    let long = vec![b'x'; 1500];
+    write(0, &long);
+    write(0, b"\n");
+    assert!(!f.drain());
+    assert_eq!(s.read(), format!("{}\r\n", "x".repeat(1500)));
+}
+
+#[test]
+fn flush_sends_a_partial_line_and_cancels_its_timer() {
+    let (mut f, mut s) = serial_fixture(None);
+    write(0, b"last words");
+    assert!(!f.drain());
+    assert_eq!(TIMER.load(Ordering::Relaxed), 1100);
+    f.console.flush(&f.vcpus);
+    assert_eq!(s.read(), "last words");
+    assert_eq!(TIMER.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn a_rebound_notification_rearms_the_line_timer() {
+    let (mut f, _s) = serial_fixture(None);
+    write(0, b"part");
+    assert!(!f.drain());
+    TIMER.store(0, Ordering::Relaxed);
+    f.console.rearm_timer();
+    assert_eq!(TIMER.load(Ordering::Relaxed), 1100);
 }

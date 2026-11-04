@@ -17,7 +17,7 @@
 /// `Descriptor::magic`.
 pub const MAGIC: [u8; 8] = *b"L4HPART1";
 /// `Descriptor::version`: bumped on any incompatible change.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 /// Partitions on one machine, at most.
 pub const MAX_PARTITIONS: usize = 8;
@@ -155,6 +155,9 @@ pub struct PartInfo {
     pub mem_mib: u64,
     /// The partition's kernel console ring (none for the primary).
     pub console: Ring,
+    /// The partition's serial ring (none for the primary, whose ring is
+    /// its own).
+    pub serial: Ring,
 }
 
 /// Which partition owns a PCI function (the primary's table).
@@ -196,6 +199,9 @@ pub struct Descriptor {
     pub mem_base: u64,
     /// This partition's kernel console ring (none for the primary).
     pub console: Ring,
+    /// This partition's serial ring (none for the primary): what its host
+    /// code prints, which the primary's logd reads (`l4h_host::serial`).
+    pub serial: Ring,
     pub iommu: Iommu,
     pub nchannels: u32,
     pub nfuncs: u32,
@@ -270,6 +276,9 @@ impl Descriptor {
 /// overwrote.
 pub const CONSOLE_RING_HEADER: usize = 64;
 pub const CONSOLE_RING_SIZE: u64 = 64 << 10;
+
+/// Size of a serial ring, aligned to it.
+pub const SERIAL_RING_SIZE: u64 = 1 << 20;
 
 /// Size of a control channel: two message rings.
 pub const CHANNEL_SIZE: u64 = 256 << 10;

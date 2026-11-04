@@ -14,6 +14,8 @@
 
 #![no_std]
 
+use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+
 pub use l4h_host as host;
 pub use sel4;
 
@@ -34,7 +36,7 @@ pub mod ioport;
 pub use failure::{FailureHandler, set_failure_handler};
 
 /// Limits a recurring critical error (such as failed I/O) to its first few
-/// prints: each one is a synchronous kernel print (see `host::VERBOSE`).
+/// prints: the serial port is slow (see `host::VERBOSE`).
 pub struct ErrorLimit(u32);
 
 impl ErrorLimit {
@@ -71,7 +73,39 @@ macro_rules! log {
 #[doc(hidden)]
 pub fn print_log(args: core::fmt::Arguments<'_>, serial: bool) {
     host::log::record(args);
-    if serial { sel4::debug_println!("{}", args); }
+    if serial {
+        host::serial::record(args);
+        #[cfg(not(target_arch = "x86_64"))]
+        sel4::debug_println!("{}", args); // no logd here yet
+    }
+}
+
+/// Text panicking prints outside `log!`, gathered by line: a thread that
+/// panics while another does can only garble this text.
+static PANIC_LINE: [AtomicU8; 120] = [const { AtomicU8::new(0) }; 120];
+static PANIC_LEN: AtomicUsize = AtomicUsize::new(0);
+
+fn panic_flush() {
+    let n = PANIC_LEN.swap(0, Ordering::Relaxed).min(PANIC_LINE.len());
+    let line: [u8; 120] = core::array::from_fn(|i| PANIC_LINE[i].load(Ordering::Relaxed));
+    host::serial::write(INFO.header().id, &line[..n], false);
+}
+
+/// What the panic machinery prints with.
+#[doc(hidden)]
+pub fn panic_put_char(c: u8) {
+    #[cfg(not(target_arch = "x86_64"))]
+    sel4::debug_put_char(c); // no logd here yet
+    if c == b'\n' {
+        return panic_flush();
+    }
+    let n = PANIC_LEN.fetch_add(1, Ordering::Relaxed);
+    if n < PANIC_LINE.len() {
+        PANIC_LINE[n].store(c, Ordering::Relaxed);
+    }
+    if n + 1 >= PANIC_LINE.len() {
+        panic_flush();
+    }
 }
 
 use l4h_host::{CONFIG_OFFSET, INFO_MAGIC, INFO_VA, IPCBUF_VA, InfoHeader};
@@ -104,6 +138,7 @@ pub fn init() -> &'static Info {
     }
     assert_eq!(INFO.header().magic, INFO_MAGIC, "bad component info page");
     host::log::init(unsafe { &*(host::log::VA as *const host::log::Ring) }, INFO.header().id);
+    host::serial::init(unsafe { &*(host::serial::VA as *const host::serial::Ring) }, INFO.header().id);
     sel4_panicking::set_hook(&|info| log!("l4h-rt: component {:#x}: {}", INFO.header().id, info));
     if host::has_keeper(INFO.header().kind) {
         start_keeper();
@@ -179,6 +214,7 @@ pub fn cap<T: sel4::CapType>(slot: u64) -> sel4::Cap<T> {
 #[doc(hidden)]
 pub fn abort_trap() -> ! {
     let h = INFO.header();
+    panic_flush();
     log!("l4h-rt: component {:#x} aborted", h.id);
     if h.magic == INFO_MAGIC && host::has_keeper(h.kind) {
         failure::answer_failed(host::SLOT_TCB);
@@ -211,7 +247,7 @@ unsafe impl core::alloc::GlobalAlloc for NoHeap {
 #[macro_export]
 macro_rules! component {
     (@entry $main:path) => {
-        $crate::sel4_panicking_env::register_debug_put_char!($crate::sel4::debug_put_char);
+        $crate::sel4_panicking_env::register_debug_put_char!($crate::panic_put_char);
         $crate::sel4_panicking_env::register_abort_trap!($crate::abort_trap);
 
         // The stack l4h-root maps, with a guard below it, rather than one

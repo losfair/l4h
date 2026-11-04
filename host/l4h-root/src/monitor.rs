@@ -2,8 +2,8 @@
 //! the serial_port and serial_irq settings, e.g. COM2 for Supermicro
 //! serial-over-LAN),
 //! for when dom0 is not usable (DESIGN.md §10.1): list, destroy,
-//! restart-dom0 (which vmmgr runs), and reboot.  The kernel keeps printing to the same port; we only take
-//! its receive side.
+//! restart-dom0 (which vmmgr runs), and reboot.  We only take the port's
+//! receive side: the kernel and l4h-logd print to it.
 
 use sel4::cap_type;
 
@@ -33,12 +33,10 @@ pub struct Monitor {
 
 impl Monitor {
     #[cfg(target_arch = "x86_64")]
-    pub fn new(alloc: &mut Alloc, _devmem: &mut crate::devmem::DevMem, ntfn: sel4::cap::Notification, base: u16, irq: u64, iommu: &mut crate::iommu::Iommu) -> Option<Self> {
+    pub fn new(alloc: &mut Alloc, _devmem: &mut crate::devmem::DevMem, ntfn: sel4::cap::Notification, port: u64, base: u16, irq: u64, iommu: &mut crate::iommu::Iommu) -> Option<Self> {
         use sel4::init_thread::slot;
         let abs = |s: usize| slot::CNODE.cap().absolute_cptr(sel4::init_thread::Slot::<cap_type::Null>::from_index(s).cap());
-        let port = alloc.slots.alloc();
-        slot::IO_PORT_CONTROL.cap().ioport_control_issue(base as u64, base as u64 + 7, &abs(port)).ok()?;
-        let mut m = Self { port: port as u64, base, irq: None, line: [0; LINE_MAX], len: 0 };
+        let mut m = Self { port, base, irq: None, line: [0; LINE_MAX], len: 0 };
         // Unmapped I/O ports read as all ones. In particular, 0xff has
         // DR set, so never install a receive handler for an absent UART.
         if m.inb(5) == 0xff {
@@ -82,7 +80,7 @@ impl Monitor {
     }
 
     #[cfg(target_arch = "aarch64")]
-    pub fn new(alloc: &mut Alloc, devmem: &mut crate::devmem::DevMem, ntfn: sel4::cap::Notification, _base: u16, _irq: u64, _iommu: &mut crate::iommu::Iommu) -> Option<Self> {
+    pub fn new(alloc: &mut Alloc, devmem: &mut crate::devmem::DevMem, ntfn: sel4::cap::Notification, _port: u64, _base: u16, _irq: u64, _iommu: &mut crate::iommu::Iommu) -> Option<Self> {
         use sel4::init_thread::slot;
         use sel4::{CapRights, VmAttributes};
         use crate::mem::ObjCtx;
@@ -199,6 +197,15 @@ fn run(h: &mut Host, line: &str) {
         "reboot" => {
             let e = crate::reset::reboot(h, "monitor");
             log!("monitor: reboot failed: error {}", e);
+            return;
+        }
+        "inject" if l4h_host::TEST_INJECT => {
+            match words.next() {
+                Some("root") => panic!("injected panic"),
+                Some("logd") => crate::logd::inject_fault(h),
+                Some("netd") => crate::netd::inject_panic(h),
+                _ => log!("monitor: inject root | logd | netd"),
+            }
             return;
         }
         _ => {}

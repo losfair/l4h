@@ -8,7 +8,6 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use sel4::{CapRights, VmAttributes, cap, cap_type};
 
-use l4h_abi as abi;
 use l4h_host::{self as host, blk};
 
 use crate::component::{self, Component, SpawnArgs, abs_of};
@@ -387,7 +386,7 @@ pub fn start(
         id,
         kind: host::KIND_BLKD,
         elf: BLKD_ELF,
-        prio: abi::PRIO_KERNEL + 2,
+        prio: host::PRIO_SERVICE,
         budget_us: host_info.timeslice_us,
         period_us: host_info.timeslice_us,
         config: cfg_bytes,

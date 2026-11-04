@@ -38,6 +38,55 @@ const _: () = assert!(VA >= crate::log::VA + crate::log::PAGES * 4096
 
 /// Partitions on a machine (l4h_partition::MAX_PARTITIONS).
 pub const MAX_RINGS: usize = 8;
+
+/// logd's address space: partition k's ring and kernel console ring, and
+/// the part of the framebuffer it draws on.
+pub const RINGS_VA: usize = crate::SHARED_VA;
+pub const KERNEL_RINGS_VA: usize = crate::SHARED_VA + 0x1000_0000;
+pub const KERNEL_RING_STRIDE: usize = 1 << 20;
+pub const FB_VA: usize = crate::MMIO_VA;
+/// The capability to the UART's I/O ports (x86).
+pub const SLOT_UART: u64 = crate::SLOT_FIRST_FREE;
+
+/// What root tells logd.
+#[repr(C)]
+pub struct LogdConfig {
+    pub tsc_hz: u64,
+    pub uart_base: u16,
+    pub _pad: u16,
+    /// Bit k: partition k's serial ring, and its kernel's console ring.
+    pub rings: u32,
+    pub kernel_rings: u32,
+    pub kernel_ring_size: u32,
+    pub kernel_ring_header: u32,
+    /// The framebuffer console: a pitch of 0 means none. `fb_offset` is
+    /// the distance of its top left pixel from FB_VA.
+    pub fb_pitch: u32,
+    pub fb_width: u32,
+    pub fb_height: u32,
+    pub fb_offset: u64,
+}
+const _: () = assert!(crate::CONFIG_OFFSET + core::mem::size_of::<LogdConfig>() <= crate::INFO_SIZE);
+
+impl LogdConfig {
+    /// Add the partitions' rings to `merge`, as mapped at these addresses.
+    pub fn add_inputs(&self, merge: &mut Merge, rings_va: usize, kernel_va: usize) {
+        for k in 1..MAX_RINGS {
+            if self.rings & 1 << k != 0 {
+                // Root mapped it for good; it is only ever read as atomics.
+                let ring = unsafe { &*((rings_va + k * PAGES * 4096) as *const Ring) };
+                merge.add_ring(k, ring, Some(k as u32));
+            }
+            if self.kernel_rings & 1 << k != 0 {
+                merge.add_kernel(k, KernelRing {
+                    va: kernel_va + k * KERNEL_RING_STRIDE,
+                    size: self.kernel_ring_size as usize,
+                    header: self.kernel_ring_header as usize,
+                });
+            }
+        }
+    }
+}
 /// The longest message `record` keeps, as consecutive records.
 const MESSAGE_MAX: usize = 1024;
 /// What one ring can take of a pass: a ring that always claims to have
@@ -50,6 +99,8 @@ pub const LINE_MAX: usize = if TEXT_SIZE > KERNEL_LINE_MAX { TEXT_SIZE } else { 
 /// `source` bit: the record is guest N's console (N in the low bits), which
 /// prints as `[vmN] ` at the start of a line.
 pub const SOURCE_GUEST: u32 = 1 << 31;
+/// `source` of dom0's console, which has no prefix.
+pub const SOURCE_DOM0: u32 = 1 << 30;
 
 /// Meta bit: the line goes on in the next record.
 const MORE: u64 = 1;
@@ -89,6 +140,16 @@ impl Ring {
 
     pub fn head(&self) -> u64 {
         self.ring.head()
+    }
+
+    /// Copy every record to `to`, the ring its writers move to.
+    pub fn copy_to(&self, to: &Ring) {
+        for seq in 0..self.head() {
+            if let Entry::Ready(r) = self.ring.get(seq) {
+                let at = to.ring.claim(1);
+                to.ring.commit(at, r.ticks, r.meta, r.text().len(), &r.buf());
+            }
+        }
     }
 }
 

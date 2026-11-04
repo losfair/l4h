@@ -323,6 +323,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "l4h-logd"
+version = "0.1.0"
+dependencies = [
+ "l4h-rt",
+]
+
+[[package]]
 name = "l4h-memd"
 version = "0.1.0"
 dependencies = [

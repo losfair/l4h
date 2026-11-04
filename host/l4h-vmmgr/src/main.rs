@@ -98,6 +98,7 @@ impl HostInfo {
             parent_ep: self.hyp_ep,
             tsc_hz: self.tsc_hz,
             log_frames: proto::SLOT_LOG_FRAMES,
+            serial_frames: proto::SLOT_SERIAL_FRAMES,
         }
     }
 

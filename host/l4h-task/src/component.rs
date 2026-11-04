@@ -104,6 +104,8 @@ pub struct SpawnContext {
     pub tsc_hz: u64,
     /// First of the parent's contiguous capabilities to the log frames.
     pub log_frames: u64,
+    /// The same for the frames of the partition's serial ring.
+    pub serial_frames: u64,
 }
 
 /// Create a component, without starting it.  Objects come from `arena`.
@@ -158,6 +160,17 @@ pub fn create(
             CapRights::read_write(), VmAttributes::DEFAULT,
             keep.absolute_cptr_from_bits_with_depth(i as u64, host::log::FRAME_RADIX),
         );
+    }
+    if host::serial::LOGD {
+        let keep = arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: host::serial::FRAME_RADIX });
+        for i in 0..host::serial::PAGES {
+            let frame = cap::Granule::from_bits(context.serial_frames + i as u64);
+            c.map_copy(
+                alloc, arena, &local_cnode.absolute_cptr(frame), host::serial::VA + i * PAGE,
+                CapRights::read_write(), VmAttributes::DEFAULT,
+                keep.absolute_cptr_from_bits_with_depth(i as u64, host::serial::FRAME_RADIX),
+            );
+        }
     }
 
     // ---- Load the ELF image, one fresh frame per page; pages are writable

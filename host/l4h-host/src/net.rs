@@ -129,6 +129,8 @@ pub const NETD_NIC_MAC: u64 = 5;
 pub const NETD_EP_SET: u64 = 6;
 /// MR0 = endpoint; deletes its rules too.
 pub const NETD_EP_DEL: u64 = 7;
+/// `host::TEST_INJECT` only: panic.
+pub const NETD_TEST_PANIC: u64 = 0x7e57;
 /// MR0 = rule, MR1 = endpoint, MR2 = match (abi::CTL_STEER_SET args[1]),
 /// MR3 = IP bits 127-64, MR4 = IP bits 63-0, MR5 = target port mask.
 pub const NETD_STEER_SET: u64 = 8;
