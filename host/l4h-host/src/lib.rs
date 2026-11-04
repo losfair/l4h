@@ -17,6 +17,8 @@ pub mod iopool;
 pub mod log;
 pub mod memd;
 pub mod net;
+pub mod ring;
+pub mod serial;
 pub mod trust;
 pub mod vmmgr;
 
