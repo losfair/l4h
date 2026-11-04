@@ -578,13 +578,21 @@ be installed. The checks cover:
         or DKMS modules. An active SELinux mode is carried into dom0's
         command line;
   \item one or two physical Ethernet interfaces, driven by virtio-net,
-        gVNIC, ENA or Intel X550. Only interfaces with a backing device in
+        gVNIC, ENA, Intel X550 or ConnectX-5 (15b3:1017). Only interfaces with a backing device in
         sysfs are considered: software interfaces such as WireGuard, PPP,
         GRE and TUN/TAP do not become uplinks or count toward the limit.
         Existing userspace must recreate them in dom0; the guest kernel
         includes WireGuard. Automatic migration rejects physical NICs
-        enslaved to a master (such as a bond or bridge), changed or duplicate
-        MACs, and more than two physical NICs.
+        enslaved to a master, changed or duplicate
+        MACs, and more than two physical NICs by default.
+        For the initial installation, use \texttt{--uplink IFNAME} to select one physical interface.
+        Repeat the option to select a second interface. Other physical
+        interfaces do not enter the migration plan.
+        For an existing 802.3ad bond, use \texttt{--uplink-bond IFNAME} instead.
+        The bond must contain exactly two ConnectX-5 physical members. The installer
+        uses their saved permanent MACs and preserves the existing bond configuration.
+        The bond MAC must be one of its members' permanent MACs.
+        Other master devices, including bridges, remain unsupported.
         Dom0's 64 device slots include four built-in devices (console,
         control, memory hotplug and attestation), leaving room for at most
         59 disks with one NIC, or 58 disks with two.
@@ -604,6 +612,11 @@ switch, retaining that uplink's MAC address. The initramfs matches these
 MACs to restore the original Linux interface names, including when the
 names need to be exchanged. The existing distribution configuration
 supplies addresses, routes and DNS on both networks.
+Linux bonding can join the two dom0 interfaces. Both dom0 uplinks can
+send with either member's permanent MAC. Other source MACs
+remain locked. LACP frames pass only between each physical member and its
+dom0 interface. Ordinary guests cannot send or receive these frames.
+ConnectX-5 link changes update dom0's virtio carrier, speed and duplex.
 
 The installer chooses \texttt{skim-xapic-nopcid} when Meltdown isolation
 is needed. Otherwise it chooses generic when PCID, INVPCID and x2APIC

@@ -42,7 +42,9 @@ pub struct Port {
     pub tx: RingIdx,
     pub rx: RingIdx,
     pub mac: [u8; 8],
-    pub link_up: u32,
+    /// netd publishes one packed LinkState, so carrier, speed and duplex
+    /// change together. This field grants no port permissions.
+    pub link_state: u32,
     /// Set by the client: its guest accepts frames with checksum offload
     /// (NEEDS_CSUM) and TSO (GSO types); otherwise netd completes the
     /// checksum and segments TSO frames for it.
@@ -87,7 +89,7 @@ pub const fn nic_bar_va(n: usize, bar: usize) -> usize {
     crate::MMIO_VA + n * 0x800_0000 + bar * 0x100_0000
 }
 pub const fn nic_dma_va(n: usize) -> usize {
-    crate::DMA_VA + n * 0x100_0000
+    crate::DMA_VA + n * 0x200_0000
 }
 
 /// netd CSpace: IRQ handler of NIC n, notification of the client of port p
@@ -108,6 +110,9 @@ pub const NETD_SLOT_LINK_KICK_BASE: u64 = NETD_SLOT_CLIENT_BASE + MAX_PORTS as u
 pub const NETD_ADD_PORT: u64 = 1;
 pub const NETD_PORT_MAC_LOCK: u64 = 1 << 0;
 pub const NETD_PORT_ISOLATED: u64 = 1 << 1;
+/// Root-selected dom0 port of the physical uplink. MR4 is its one
+/// additional allowed source MAC (0: none). Ordinary guests cannot set it.
+pub const NETD_PORT_UPLINK: u64 = 1 << 2;
 /// MR0 = port.  netd no longer touches the port's memory when this returns.
 pub const NETD_REMOVE_PORT: u64 = 2;
 /// MR0 = NIC, MR1 = switch.
@@ -145,6 +150,27 @@ pub const NIC_VIRTIO: u32 = 0;
 pub const NIC_GVNIC: u32 = 1;
 pub const NIC_IXGBE: u32 = 2;
 pub const NIC_ENA: u32 = 3;
+pub const NIC_MLX5: u32 = 4;
+
+/// A single-word link snapshot. Speed 0 and duplex 0 mean unknown.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct LinkState(pub u32);
+
+impl LinkState {
+    pub const VIRTUAL: Self = Self(1);
+    pub const DOWN: Self = Self(0);
+    pub const fn ethernet(up: bool, speed_mbps: u32) -> Self {
+        Self(up as u32 | (speed_mbps << 1) | (2 << 29))
+    }
+    pub const fn up(self) -> bool { self.0 & 1 != 0 }
+    pub const fn speed(self) -> u32 {
+        let speed = (self.0 >> 1) & 0x0fff_ffff;
+        if speed == 0 { u32::MAX } else { speed }
+    }
+    pub const fn duplex(self) -> u8 {
+        match self.0 >> 29 & 3 { 1 => 0, 2 => 1, _ => 0xff }
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]

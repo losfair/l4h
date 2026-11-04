@@ -1,7 +1,7 @@
 //! netd: L2 virtual switches (DESIGN.md §9.3) and the uplink NIC drivers.
 //!
 //! Every port belongs to one switch.  A port is a guest vNIC (a channel to
-//! that guest's l4h-vmm), an uplink NIC (virtio-net, gVNIC, ENA or X550
+//! that guest's l4h-vmm), an uplink NIC (virtio-net, gVNIC, ENA, X550 or ConnectX-5
 //! PCI, driven here) or, on a multikernel machine, a link to another
 //! partition's netd (link.rs).  Switches learn source MACs, forward known unicast to one
 //! port and flood everything else within the switch.  Guest ports can be
@@ -20,6 +20,7 @@ mod ena;
 mod gvnic;
 mod ixgbe;
 mod link;
+mod mlx5;
 mod nic;
 mod offload;
 mod pool;
@@ -84,6 +85,8 @@ struct GuestPort {
     switch: u32,
     mac: [u8; 6],
     lock: bool,
+    alias: Option<[u8; 6]>,
+    uplink: bool,
     /// An isolated port exchanges frames only with ports that are not
     /// isolated (other guests' normal ports and the uplink).
     isolated: bool,
@@ -339,11 +342,30 @@ impl Netd {
         let src: [u8; 6] = frame[6..12].try_into().unwrap();
         if let PortId::Guest(i) = from {
             let p = self.ports[i].as_mut().unwrap();
-            if (p.lock && src != p.mac) || !offload::sanitize(hdr, frame) {
+            if (p.lock && src != p.mac && p.alias != Some(src)) || !offload::sanitize(hdr, frame) {
                 p.drops += 1;
                 return;
             }
             p.tx_frames += 1;
+        }
+        // Slow Protocols belong to one physical link. Do not learn,
+        // steer or flood LACP/Marker frames to ordinary guest ports.
+        if frame[..6] == [0x01, 0x80, 0xc2, 0, 0, 2] {
+            if frame[12..14] != [0x88, 0x09] { return; }
+            match from {
+                PortId::Guest(i) if self.ports[i].as_ref().is_some_and(|p| p.uplink) => {
+                    if let Some(n) = self.nics.iter().position(|n| n.switch == Some(switch)) {
+                        self.deliver(PortId::Uplink(n), frame, hdr);
+                    }
+                }
+                PortId::Uplink(_) => {
+                    if let Some(i) = self.ports.iter().position(|p| p.as_ref().is_some_and(|p| p.uplink && p.switch == switch)) {
+                        self.deliver(PortId::Guest(i), frame, hdr);
+                    }
+                }
+                _ => {}
+            }
+            return;
         }
         let now = rdtsc();
         let age = FDB_AGE_SECS * self.tsc_hz;
@@ -557,6 +579,20 @@ impl Netd {
         }
         self.buf = frame;
         self.nics[n].flush_tx(self.pool);
+        self.publish_links();
+    }
+
+    fn publish_links(&mut self) {
+        for p in self.ports.iter_mut().flatten().filter(|p| p.uplink) {
+            let link = self.nics.iter().find(|n| n.switch == Some(p.switch))
+                .map(|n| n.link()).unwrap_or(net::LinkState::DOWN);
+            unsafe {
+                if addr_of!((*p.chan).link_state).read_volatile() != link.0 {
+                    addr_of_mut!((*p.chan).link_state).write_volatile(link.0);
+                    p.signal = true;
+                }
+            }
+        }
     }
 
     /// Forward the TCP run NIC `n`'s receive offload has built.
@@ -695,7 +731,7 @@ fn main(info: &'static Info) -> ! {
                     let mac = mac_of(mr(2));
                     unsafe {
                         addr_of_mut!((*chan).mac).write_volatile([mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], 0, 0]);
-                        addr_of_mut!((*chan).link_up).write_volatile(1);
+                        addr_of_mut!((*chan).link_state).write_volatile(net::LinkState::VIRTUAL.0);
                         addr_of_mut!((*chan).rx_wanted).write_volatile(0);
                     }
                     d.ports[i] = Some(GuestPort {
@@ -703,6 +739,8 @@ fn main(info: &'static Info) -> ! {
                         switch: mr(1) as u32,
                         mac,
                         lock: mr(3) & net::NETD_PORT_MAC_LOCK != 0,
+                        alias: (mr(3) & net::NETD_PORT_UPLINK != 0 && mr(4) != 0).then(|| mac_of(mr(4))),
+                        uplink: mr(3) & net::NETD_PORT_UPLINK != 0,
                         isolated: mr(3) & net::NETD_PORT_ISOLATED != 0,
                         client: cap::<cap_type::Notification>(net::NETD_SLOT_CLIENT_BASE + i as u64),
                         signal: false,
@@ -711,6 +749,7 @@ fn main(info: &'static Info) -> ! {
                         drops: 0,
                         backlog: Fifo::EMPTY,
                     });
+                    d.publish_links();
                     0
                 } else {
                     u64::MAX

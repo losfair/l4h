@@ -26,6 +26,7 @@ class Machine:
     def __init__(self, root):
         self.root = root
         self.calls = []
+        self.permanent_macs = {}
         self.fail = None
         self.target = "multi-user.target"
         self.display_manager = "not-found"
@@ -90,6 +91,7 @@ class Machine:
         self.write(base + "/resource", bars)
 
     def nic(self, name, bdf, mac):
+        self.permanent_macs[name] = mac
         self.pci(bdf, 0x1AF4, 0x1041, 0x020000)
         self.link("/sys/class/net/" + name + "/device", self.path("/sys/devices/pci0000:00/0000:" + bdf))
         self.write("/sys/class/net/" + name + "/addr_assign_type", "0")
@@ -116,6 +118,8 @@ class Machine:
             return json.dumps(dict(blockdevices=self.blocks))
         if args[0] == "ip":
             return json.dumps(self.links)
+        if args[:2] == ("ethtool", "-P"):
+            return "Permanent address: " + self.permanent_macs[args[2]]
         if args[0] == "systemctl":
             return self.target if args[1] == "get-default" else self.display_manager
         if args == ("/usr/local/bin/l4hctl", "info"):
@@ -615,6 +619,47 @@ class InstallerTests(UpdateChecks, Harness):
         self.commit(plan)
         self.assertEqual(self.machine.path("/boot/efi/l4h/l4h.conf").read_text(), config)
 
+    def test_bond_migration_keeps_member_identities_and_existing_netplan(self):
+        self.machine.nic("ens2", "00:03.0", "52:54:00:12:34:57")
+        for bdf in ("00:03.0", "00:05.0"):
+            self.machine.pci(bdf, 0x15B3, 0x1017, 0x020000)
+        self.machine.links.append(dict(ifname="bond0", link_type="ether", address="52:54:00:12:34:56", linkinfo=dict(info_kind="bond")))
+        self.machine.write("/sys/class/net/bond0/bonding/mode", "802.3ad 4")
+        self.machine.write("/etc/netplan/50-cloud-init.yaml", "existing bond configuration\n")
+        for name, mac in [("ens3", "52:54:00:12:34:56"), ("ens2", "52:54:00:12:34:57")]:
+            link = next(link for link in self.machine.links if link["ifname"] == name)
+            link["master"] = "bond0"
+            self.machine.write("/sys/class/net/" + name + "/bonding_slave/perm_hwaddr", mac)
+            self.machine.write("/sys/class/net/" + name + "/addr_assign_type", "3")
+            self.machine.write("/sys/class/net/" + name + "/address", "52:54:00:12:34:56")
+        self.rejected("plain Ethernet")
+        self.args.uplink_bond = "bond0"
+        self.machine.write("/sys/class/net/ens2/bonding_slave/perm_hwaddr", "02:00:00:00:00:98")
+        self.rejected("hardware permanent MAC")
+        self.machine.write("/sys/class/net/ens2/bonding_slave/perm_hwaddr", "52:54:00:12:34:57")
+        plan = self.check()
+        self.assertEqual([nic["mac"] for nic in plan["uplinks"]],
+                         ["52:54:00:12:34:57", "52:54:00:12:34:56"])
+        self.machine.links[-1]["address"] = "52:54:00:12:34:57"
+        self.assertEqual(self.check()["uplinks"], plan["uplinks"])
+        self.machine.links[-1]["address"] = "02:00:00:00:00:99"
+        self.rejected("bond MAC")
+        self.machine.links[-1]["address"] = "52:54:00:12:34:56"
+        self.machine.pci("00:03.0", 0x1AF4, 0x1041, 0x020000)
+        self.rejected("two ConnectX-5")
+        self.machine.pci("00:03.0", 0x15B3, 0x1017, 0x020000)
+        self.commit(plan)
+        self.assertEqual(self.machine.path("/etc/netplan/50-cloud-init.yaml").read_text(), "existing bond configuration\n")
+
+    def test_bond_migration_rejects_other_modes_and_partial_membership(self):
+        self.args.uplink_bond = "bond0"
+        self.machine.links.append(dict(ifname="bond0", link_type="ether", linkinfo=dict(info_kind="bond")))
+        self.machine.write("/sys/class/net/bond0/bonding/mode", "active-backup 1")
+        self.rejected("802.3ad")
+        self.machine.write("/sys/class/net/bond0/bonding/mode", "802.3ad 4")
+        self.machine.links[1]["master"] = "bond0"
+        self.rejected("exactly two physical")
+
     def test_virtual_interfaces_do_not_change_uplink_plan(self):
         virtual = [
             dict(ifname="wg-obfs", link_type="none", linkinfo=dict(info_kind="wireguard")),
@@ -657,6 +702,25 @@ class InstallerTests(UpdateChecks, Harness):
         del self.machine.links[1]["master"]
         self.machine.write("/sys/class/net/ens3/addr_assign_type", "3")
         self.rejected("ens3: uplink MAC has been changed")
+
+    def test_explicit_connectx5_uplink_preserves_other_physical_nics(self):
+        self.machine.pci("00:05.0", 0x15B3, 0x1017, 0x020000)
+        for i in range(3):
+            self.machine.nic("unused" + str(i), "00:0" + str(6+i) + ".0", "52:54:00:12:34:6" + str(i))
+        self.args.uplink = ["ens3"]
+        plan = self.check()
+        self.assertEqual(plan["uplinks"], [dict(ifname="ens3", bdf="00:05.0", mac="52:54:00:12:34:56")])
+        self.assertIn("uplink_nic=00:05.0", installer.configuration(plan))
+        self.assertEqual(len(self.machine.links), 5)
+        for selected in (["ens3", "ens3"], ["lo"], ["absent"], ["ens3", "unused0", "unused1"]):
+            self.args.uplink = selected
+            self.rejected("physical|distinct")
+
+    def test_uplink_selection_cannot_change_an_installed_mapping(self):
+        self.commit()
+        self.machine.calls.clear()
+        self.args.uplink = ["ens3"]
+        self.rejected("initial installation")
 
     def test_zero_and_three_nics_rejected(self):
         self.machine.nic("ens4", "00:06.0", "52:54:00:12:34:57")
