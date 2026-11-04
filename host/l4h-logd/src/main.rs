@@ -89,10 +89,9 @@ impl Uart {
     }
 }
 
-/// The kernel's console on the lower half of the framebuffer (fb_console,
-/// kernel patch 0020), which the kernel can only keep up for what it prints
-/// itself: the same glyphs, wrapping to the top rather than scrolling, so
-/// that the framebuffer is never read.
+/// Host output on the lower half of the framebuffer (fb_console), as kernel
+/// patch 0020 draws what the kernel prints: the same glyphs, wrapping to the
+/// top rather than scrolling, so that the framebuffer is never read.
 struct Screen {
     base: *mut u8,
     pitch: usize,
