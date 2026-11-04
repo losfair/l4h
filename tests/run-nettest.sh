@@ -14,9 +14,12 @@ mkdir -p "$out"
     || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
 "$l4h_objcopy" --strip-debug "$l4h_linux_out/vmlinux" "$l4h_linux_out/vmlinux.stripped"
 "$root/tools/build-l4hctl.sh"
+"$l4h_cc" -O2 -static -Wall -Wextra -Werror "$root/tests/guest/slow-protocol.c" -o "$out/slow-protocol"
+"$root/tools/mkinitramfs.sh" "$out/slowvm.cpio.gz" "$root/tests/guest/init-slowvm" "$out/slow-protocol" >/dev/null
 "$root/tools/mkinitramfs.sh" "$out/netvm.cpio.gz" "$root/tests/guest/init-netvm" >/dev/null
 "$root/tools/mkinitramfs.sh" "$out/nettest.cpio.gz" "$root/tests/guest/init-nettest" \
     "$l4h_ctl" "$out/netvm.cpio.gz" \
+    "$out/slow-protocol" "$out/slowvm.cpio.gz" \
     "$root/tests/guest/udhcpc.script" >/dev/null
 mode=disable-legacy=on
 [ "${NETTEST_LEGACY:-0}" = 1 ] && mode=disable-modern=on

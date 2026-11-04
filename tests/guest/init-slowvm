@@ -1,0 +1,12 @@
+#!/bin/sh
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+ip link set eth0 up
+if slow-protocol eth0 probe 6; then
+    echo 'SLOWVM: PASS'
+else
+    echo 'SLOWVM: FAIL'
+fi
+echo 'SLOWVM: done'
+poweroff -f

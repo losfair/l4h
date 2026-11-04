@@ -22,7 +22,19 @@ use crate::{AsidPools, HostInfo, ctl, mr, set_mr};
 static NETD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/l4h-netd.elf"));
 
 const PAGE: usize = 4096;
-const NIC_DMA_BITS: usize = 22;
+fn nic_dma_bits(d: &pci::Device) -> usize {
+    if is_mlx5(d) { 25 } else { 22 }
+}
+
+// Map the init segment, MSI-X table and lower UAR aperture. An allocated
+// UAR beyond this mapping is rejected by the driver before any MMIO access.
+fn mapped_device(d: &pci::Device) -> pci::Device {
+    let mut mapped = *d;
+    if is_mlx5(d) {
+        mapped.bars[0].size = mapped.bars[0].size.min(BAR_STRIDE as u64);
+    }
+    mapped
+}
 /// Port memory: the channel plus the CNode keeping netd's mappings of it.
 const PORT_BITS: usize = 22;
 const PORT_KEEP_BITS: usize = l4h_host::vmmgr::PORT_RADIX;
@@ -85,9 +97,17 @@ fn ena_llq(d: &pci::Device) -> bool {
     is_ena(d) && !b.is_io && b.size != 0 && b.size as usize <= BAR_STRIDE
 }
 
+pub fn is_mlx5(d: &pci::Device) -> bool {
+    let aperture = d.bars[0].size.min(BAR_STRIDE as u64);
+    d.vendor == 0x15b3 && d.device == 0x1017 && !d.bars[0].is_io
+        && aperture >= 0x10000
+        && d.msix.is_some_and(|m| m.table_bar == 0 && m.table_size >= 1
+            && m.table_offset as u64 + m.table_size as u64 * 16 <= aperture)
+}
+
 /// NICs netd can drive as an uplink.
 pub fn is_uplink(d: &pci::Device) -> bool {
-    is_virtio_net(d) || is_gvnic(d) || is_ena(d) || is_ixgbe(d)
+    is_virtio_net(d) || is_gvnic(d) || is_ena(d) || is_ixgbe(d) || is_mlx5(d)
 }
 
 pub struct Nic {
@@ -164,7 +184,7 @@ fn used_bars(d: &pci::Device) -> u8 {
         1 | 1 << 2 | 1 << d.msix.unwrap().table_bar
     } else if is_ena(d) {
         1 | (ena_llq(d) as u8) << 2 | 1 << d.msix.unwrap().table_bar
-    } else if is_ixgbe(d) {
+    } else if is_ixgbe(d) || is_mlx5(d) {
         1 | 1 << d.msix.unwrap().table_bar
     } else {
         virtio_bar_mask(d)
@@ -195,7 +215,9 @@ pub fn spawn(
         let gvnic = is_gvnic(d);
         let ena = is_ena(d);
         let ixgbe = is_ixgbe(d);
-        let VirtioRegions { common, notify, notify_mult, isr, device, msix_table } = if is_legacy(d) || gvnic || ena || ixgbe {
+        let mlx5 = is_mlx5(d);
+        let dma_bits = nic_dma_bits(d);
+        let VirtioRegions { common, notify, notify_mult, isr, device, msix_table } = if is_legacy(d) || gvnic || ena || ixgbe || mlx5 {
             let msix = d.msix.unwrap();
             VirtioRegions {
                 common: none,
@@ -212,22 +234,24 @@ pub fn spawn(
             virtio_regions(d, bar_va)
         };
         let s = alloc.slots.alloc();
-        let mut region = alloc.split(NIC_DMA_BITS, s).expect("NIC DMA memory");
+        let mut region = alloc.split(dma_bits, s).expect("NIC DMA memory");
         let paddr = region.paddr;
-        let frames = alloc.slots.alloc_range((1 << NIC_DMA_BITS) / PAGE);
+        let frames = alloc.slots.alloc_range((1 << dma_bits) / PAGE);
         region
             .retype(&FRAME_BP, frames.len(), Dest::new(crate::slot::CNODE.cap(), frames.start))
             .expect("NIC DMA frames");
         let _ = dma.push(frames);
         // The NIC reaches its DMA memory only.
         let dom = iommu.attach(alloc, d);
-        iommu.map(alloc, dom, paddr, 1 << NIC_DMA_BITS, true);
+        iommu.map(alloc, dom, paddr, 1 << dma_bits, true);
         let (msi_address, msi_data) = iommu.msi(dom, NIC_MSI_BASE + n as u64);
         cfg.nics[n] = net::NicConfig {
             kind: if gvnic {
                 net::NIC_GVNIC
             } else if ena {
                 net::NIC_ENA
+            } else if mlx5 {
+                net::NIC_MLX5
             } else if ixgbe {
                 net::NIC_IXGBE
             } else {
@@ -244,10 +268,10 @@ pub fn spawn(
             isr,
             device,
             msix_table,
-            regs: if gvnic || ena || ixgbe { bar_region(0) } else { none },
+            regs: if gvnic || ena || ixgbe || mlx5 { l4h_host::blk::PciRegion { va: bar_va(0) as u64, len: mapped_device(d).bars[0].size } } else { none },
             doorbells: if gvnic || ena_llq(d) { bar_region(2) } else { none },
             dma_paddr: paddr as u64,
-            dma_size: 1 << NIC_DMA_BITS,
+            dma_size: 1 << dma_bits,
         };
     }
     let cfg_bytes = unsafe {
@@ -272,7 +296,7 @@ pub fn spawn(
     );
 
     // Mapping caps of every NIC page: DMA buffers and BARs.
-    let pages = nics[..nr_nics].iter().map(|d| (1 << NIC_DMA_BITS) / PAGE + bar_pages(d, used_bars(d))).sum();
+    let pages = nics[..nr_nics].iter().map(|d| (1 << nic_dma_bits(d)) / PAGE + bar_pages(&mapped_device(d), used_bars(d))).sum();
     let keep_bits = keep_bits(pages);
     let keep = arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: keep_bits });
     let mut keep_next = 0u64;
@@ -286,7 +310,7 @@ pub fn spawn(
         let mut bars = [const { None }; 6];
         // ENA's LLQ is written in 128-byte bursts.
         let wc = (ena_llq(&d) as u8) << 2;
-        map_bar_mask(&comp, alloc, &mut arena, devmem, &d, &mut bars, used_bars(&d), wc, |b| net::nic_bar_va(n, b as usize), &mut keep_slot);
+        map_bar_mask(&comp, alloc, &mut arena, devmem, &mapped_device(&d), &mut bars, used_bars(&d), wc, |b| net::nic_bar_va(n, b as usize), &mut keep_slot);
         for (i, s) in dma[n].clone().enumerate() {
             let f = sel4::init_thread::Slot::<cap_type::Granule>::from_index(s).cap();
             comp.map_copy(alloc, &mut arena, &abs_of(f), net::nic_dma_va(n) + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep_slot());
@@ -433,10 +457,21 @@ impl Netd {
         let kick_slot = alloc.slots.alloc();
         let kick = sel4::init_thread::Slot::<cap_type::Notification>::from_index(kick_slot).cap();
         abs_of(kick).mint(&abs_of(self.comp.ntfn), CapRights::write_only(), 1 << p).expect("port kick");
-        let flags = if lock { net::NETD_PORT_MAC_LOCK } else { 0 } | if isolated { net::NETD_PORT_ISOLATED } else { 0 };
+        // Only root grants a dom0 port the physical uplink's identity.
+        // A bond keeps both permanent MACs but can send with either
+        // member's MAC on either link. Do not unlock arbitrary sources.
+        let uplink = self.nics.iter().position(|n| n.switch == Some(switch));
+        let physical = g.dom0 && uplink.is_some_and(|n| self.nic_mac(n) == Some(mac))
+            && !self.ports.iter().flatten().any(|p| p.vm == g.id && p.switch == switch && p.mac == mac);
+        let alias = if physical && switch < 2 {
+            self.nics.iter().position(|n| n.switch == Some(1 - switch)).and_then(|n| self.nic_mac(n)).unwrap_or(0)
+        } else { 0 };
+        let flags = if lock { net::NETD_PORT_MAC_LOCK } else { 0 }
+            | if isolated { net::NETD_PORT_ISOLATED } else { 0 }
+            | if physical { net::NETD_PORT_UPLINK } else { 0 };
         // netd answered free_port: a failure now is a fault since, which
         // leaves this port (reclaimed with the guest) as dead as the rest.
-        if call(self.comp.service_ep, net::NETD_ADD_PORT, &[p as u64, switch as u64, mac, flags]) == u64::MAX {
+        if call(self.comp.service_ep, net::NETD_ADD_PORT, &[p as u64, switch as u64, mac, flags, alias]) == u64::MAX {
             log!("l4h-root: netd failed adding port {}", p);
         }
         self.ports[p] = Some(PortInfo { vm: g.id, switch, mac });

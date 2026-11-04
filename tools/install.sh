@@ -15,6 +15,9 @@ Usage: curl -fsSL https://raw.githubusercontent.com/losfair/l4h/main/tools/insta
   --check                 Check install/update compatibility; do not change the system
   --release TAG           Install a specific GitHub release (default: latest)
   --esp PATH              Mounted EFI system partition (UEFI; otherwise auto-detect)
+  --uplink IFNAME         Select a physical uplink for the initial installation;
+                          repeat to select a second independent uplink
+  --uplink-bond IFNAME    Preserve an existing 802.3ad bond with two ConnectX-5 members
   --memory MiB            dom0 RAM (default: half of usable RAM, clamped to 512..8192 MiB)
   --vcpus N               dom0 CPUs (default: up to 4)
   --variant NAME          generic, xapic-nopcid, or skim-xapic-nopcid (otherwise auto-select)
@@ -28,7 +31,7 @@ Usage: curl -fsSL https://raw.githubusercontent.com/losfair/l4h/main/tools/insta
 
 Requires x86_64 Linux booted with 64-bit UEFI and Secure Boot disabled, or
 booted by BIOS GRUB (grub-pc) from /boot on ext2/3/4 or XFS.
-Supports a plain ext4/XFS root, supported PCI disks and one supported physical NIC.
+Supports a plain ext4/XFS root, supported PCI disks and one or two supported physical NICs.
 Requires at least 768 MiB usable RAM; reserves at least 256 MiB for L4H.
 The existing userspace boots with L4H's kernel. No automatic reboot.
 Run --check first; see the README and docs/manual/l4h-manual.tex for limits and recovery.
@@ -42,7 +45,7 @@ HELP
                 return ;;
             --check) check=1; args+=("$arg") ;;
             --make-default|--assume-stable-tsc) args+=("$arg") ;;
-            --release|--esp|--memory|--vcpus|--variant|--partitions)
+            --release|--esp|--uplink|--uplink-bond|--memory|--vcpus|--variant|--partitions)
                 (($#)) || { echo "l4h: $arg needs a value" >&2; return 2; }
                 if [[ $arg == --release ]]; then release=$1; else args+=("$arg" "$1"); fi
                 shift ;;
@@ -92,6 +95,9 @@ HELP
         fi
     }
     l4h_require_tools curl python3 lsblk findmnt blkid ip
+    for arg in "${args[@]}"; do
+        [[ $arg != --uplink-bond ]] || l4h_require_tools ethtool
+    done
     python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else "l4h: Python 3.9 or later is required")'
     # Dom0 has no EFI runtime services, even when the host booted through UEFI.
     # Use the installation record, not dom0's /sys/firmware, to select tools.

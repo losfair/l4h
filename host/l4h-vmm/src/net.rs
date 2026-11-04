@@ -23,6 +23,7 @@ const VIRTIO_NET_F_GUEST_TSO6: u64 = 1 << 8;
 const VIRTIO_NET_F_HOST_TSO4: u64 = 1 << 11;
 const VIRTIO_NET_F_HOST_TSO6: u64 = 1 << 12;
 const VIRTIO_NET_F_STATUS: u64 = 1 << 16;
+const VIRTIO_NET_F_SPEED_DUPLEX: u64 = 1 << 63;
 const VIRTIO_NET_S_LINK_UP: u16 = 1;
 const HDR: usize = net::HDR_SIZE;
 const RX: usize = 0;
@@ -41,11 +42,21 @@ pub struct Net {
     /// Transmit stopped at a full port ring: netd frees slots, then
     /// signals.
     tx_blocked: bool,
+    link: net::LinkState,
 }
 
 impl Net {
     pub fn new(chan_va: usize, kick: sel4::cap::Notification, mac: [u8; 6], rx_queue: u32) -> Self {
-        Net { chan: chan_va as *mut Port, kick, mac, rx_queue: rx_queue.min(QUEUE_SIZE), tx_blocked: false }
+        let chan = chan_va as *mut Port;
+        let link = net::LinkState(unsafe { addr_of!((*chan).link_state).read_volatile() });
+        Net { chan, kick, mac, rx_queue: rx_queue.min(QUEUE_SIZE), tx_blocked: false, link }
+    }
+
+    fn link_config(&self, config: &mut [u8]) {
+        let status = if self.link.up() { VIRTIO_NET_S_LINK_UP } else { 0 };
+        config[6..8].copy_from_slice(&status.to_le_bytes());
+        config[12..16].copy_from_slice(&self.link.speed().to_le_bytes());
+        config[16] = self.link.duplex();
     }
 
     fn tx_full(&self) -> bool {
@@ -179,6 +190,7 @@ impl Backend for Net {
 
     fn features(&self) -> u64 {
         VIRTIO_NET_F_MAC
+            | VIRTIO_NET_F_SPEED_DUPLEX
             | VIRTIO_NET_F_STATUS
             | VIRTIO_NET_F_MTU
             | VIRTIO_NET_F_CSUM
@@ -199,8 +211,16 @@ impl Backend for Net {
 
     fn init_config(&self, config: &mut [u8]) {
         config[0..6].copy_from_slice(&self.mac);
-        config[6..8].copy_from_slice(&VIRTIO_NET_S_LINK_UP.to_le_bytes());
+        self.link_config(config);
         config[10..12].copy_from_slice(&((net::MTU_FRAME - 14) as u16).to_le_bytes());
+    }
+
+    fn update_config(&mut self, config: &mut [u8]) -> bool {
+        let link = net::LinkState(unsafe { addr_of!((*self.chan).link_state).read_volatile() });
+        if link == self.link { return false; }
+        self.link = link;
+        self.link_config(config);
+        true
     }
 
     fn features_accepted(&mut self, f: u64) {
