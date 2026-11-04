@@ -68,6 +68,8 @@ jobs:
           grep -c ^processor /proc/cpuinfo; free -g
       - name: Host version metadata
         run: tests/run-versiontest.sh
+      - name: No host code prints through the kernel
+        run: tests/check-debug-print.sh
       - name: Control client and multikernel preflight
         run: cargo +stable test --manifest-path tools/l4hctl/Cargo.toml
       - name: Host unit tests (allocator, memd grants, I/O pool, display)
@@ -84,6 +86,8 @@ jobs:
         run: tests/run-devicetest.sh --qemu
       - name: Retained host faults and logs in release mode
         run: L4H_RELEASE=1 tests/run-logtest.sh
+      - name: Serial output through failures of components, l4h-logd and root
+        run: tests/run-logdtest.sh
       - name: Guest ABI and seL4 extensions (module), module tree
         run: tests/run-abitest.sh
       - name: Boot RAM clearing and initial user context

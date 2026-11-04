@@ -99,11 +99,10 @@ impl Console {
         if self.serial {
             #[cfg(not(target_arch = "x86_64"))]
             {
-                // No logd here yet.
                 if self.line_start && self.source & host::serial::SOURCE_GUEST != 0 {
-                    sel4::debug_print!("[vm{}] ", self.source & !host::serial::SOURCE_GUEST);
+                    sel4::debug_print!("[vm{}] ", self.source & !host::serial::SOURCE_GUEST); // no logd here yet
                 }
-                sel4::debug_put_char(c);
+                sel4::debug_put_char(c); // no logd here yet
             }
             if c == b'\n' {
                 // The serial port ends lines itself.

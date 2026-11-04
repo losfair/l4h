@@ -206,6 +206,12 @@ run_qemu() {
     grep -aE "l4h-mkshim|MKTEST|MKVM|partition|host reboot|trustd|TPM|\[p[0-9]\] .*(panic|fault|error)|panic" "$log" \
         | grep -av "MKVM: report" | awk 'NR <= 100'
     ok=1
+    # Host output reaches the port line by line, through l4h-logd.
+    if grep -aE '.\[p[0-9]\] ' "$log" >"$out/split-lines"; then
+        echo "lines split on the serial port:"
+        head -5 "$out/split-lines"
+        ok=0
+    fi
     for k in $(seq 0 $((n - 1))); do
         grep -aq "MKTEST p$k: done" "$log" || { echo "partition $k did not finish"; ok=0; }
         [ "$k" -ge 2 ] || [ -n "${MK_UPLINK:-}" ] || grep -aq "MKTEST p$k: link ok" "$log" || { echo "partition $k: no ping over the link"; ok=0; }

@@ -155,8 +155,7 @@ if [ -n "$MKIOMMU" ]; then
     l4hctl iommu | sed "s/^/MKTEST p$P: iommu /"
 fi
 if [ -n "$nonce" ]; then
-    # Through the disk: on the serial port other cores' output can
-    # interleave with a long line.
+    # With the other files of the attestation, on the disk.
     sed -n 's/^MKVM: report \([0-9a-f]*\).*/\1/p' /tmp/vm > /tmp/att/vm.report.hex
     [ -s /tmp/att/vm.report.hex ] || fail "no report from the VM"
     tar -cf /dev/vda -C /tmp/att . && sync || fail "save the attestation"
