@@ -68,4 +68,14 @@ wait_for "monitor: 4 cores" 30
 printf 'inject root\r' >&3
 wait_for "injected panic" 30
 stop
+
+# Root panics early in its boot, before it starts anything but logd and memd.
+config=$out/logd-early.conf
+echo 'test_early_panic=1' > "$config"
+L4H_CONFIG="$config" "$l4h_qemu" "$root/host/target/$l4h_target/debug/l4h-root.elf" </dev/null >"$log" 2>&1 &
+qemu=$!
+wait_for "injected early panic" 60
+kill "$qemu" 2>/dev/null || true
+wait "$qemu" 2>/dev/null || true
+qemu=
 echo "logd: PASS"

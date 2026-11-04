@@ -407,8 +407,15 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         epoch_ticks: rdtsc(),
     };
     let mut asids = AsidPools { pools: [(slot::ASID_POOL.cap(), 1)].into_iter().collect(), in_use: 1 };
+    let dashboard = dashboard::Dashboard::new(bootinfo, &mut alloc, &mut devmem, cfg.fb_console);
+    let logd = uart.as_ref().and_then(|uart| {
+        let rings = partition::Rings::new(&mut alloc, &mut devmem);
+        let fb = dashboard.as_ref().and_then(|d| d.console_area());
+        logd::spawn(&mut alloc, &mut wins.a, &mut asids, &info, uart, &rings, fb)
+    });
     // From here on, memory comes from memd.
     let mut memd = memd::spawn(&mut alloc, &mut wins.a, &mut asids, &info);
+    assert!(!host::TEST_INJECT || !cfg.test_early_panic, "injected early panic");
 
     // The region partitions share (IOMMU tables, locks): PCI configuration
     // without ECAM takes a lock in it.
@@ -507,7 +514,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         guests: GUESTS.take(),
         total_bytes,
         monitor: None,
-        dashboard: None,
+        dashboard,
         cfg,
         trustd,
         next_instance: 1,
@@ -515,7 +522,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         reset,
         rtc,
         vmmgr: None,
-        logd: None,
+        logd,
         ntfn: wd_ntfn,
         channels: None,
     };
@@ -525,12 +532,6 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         h.monitor = uart.as_ref().and_then(|u| monitor::Monitor::new(&mut h.alloc, &mut h.devmem, wd_ntfn, u.monitor, h.cfg.serial_port, h.cfg.serial_irq, &mut h.iommu));
     }
     h.channels = channel::Channels::new(&mut h.alloc, &mut h.devmem, wd_ntfn, h.info.tsc_hz);
-    h.dashboard = dashboard::Dashboard::new(bootinfo, &mut h.alloc, &mut h.devmem, h.cfg.fb_console);
-    if !partition::secondary() {
-        let rings = partition::Rings::new(&mut h.alloc, &mut h.devmem);
-        let fb = h.dashboard.as_ref().and_then(|d| d.console_area());
-        logd::spawn(&mut h, uart, &rings, fb);
-    }
 
     if module("guest-kernel").is_none() {
         log!("l4h-root: no guest kernel, nothing to do");

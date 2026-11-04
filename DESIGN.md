@@ -2982,7 +2982,9 @@ a line.
   can overwrite a line.
 
 Root issues the UART's port capability and spawns logd, and holds no
-logging logic of its own:
+logging logic of its own. Root outranks logd on its core, so during root's
+boot logd prints only when root waits or stops; a panic is printed, a loop
+that never yields is not:
 
 | Failure | Result |
 |---|---|
@@ -2990,7 +2992,7 @@ logging logic of its own:
 | Root panics | Its text is in the ring; logd, a task of its own, prints it |
 | logd faults | Serial output stops. The host goes on, and `l4hctl logs` still works |
 | Partition 0 dies | Secondaries' output stops |
-| Before logd starts | Records wait in the ring. A root panic this early is not printed |
+| Before logd starts | Records wait in the ring. logd is the first component root starts, once it has the setting and memory for it; a root panic before that is not printed |
 | Hard hang or kernel panic | Undrained records are lost; the kernel's own message still prints |
 
 A host reset sleeps until logd has printed partition 0's ring, for at most 2

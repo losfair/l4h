@@ -9,9 +9,10 @@ use l4h_host as host;
 use l4h_host::serial::{self, LogdConfig};
 use sel4::cap_type;
 
-use crate::Host;
+use crate::{AsidPools, Host, HostInfo};
 use crate::component::{self, Component, SpawnArgs, abs_of, root_cap};
 use crate::mem::{Alloc, Arena, Slot};
+use crate::window::Window;
 
 pub const LOGD_ID: u32 = 0x600;
 static LOGD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/l4h-logd.elf"));
@@ -80,17 +81,29 @@ pub struct FbArea {
     pub height: usize,
 }
 
-/// Spawn logd: partition 0's serial output from now on.
-pub fn spawn(h: &mut Host, uart: Option<Uart>, rings: &crate::partition::Rings, fb: Option<FbArea>) {
-    let Some(uart) = uart.filter(|_| host::serial::LOGD && !LOGD_ELF.is_empty()) else { return };
+/// Spawn logd: partition 0's serial output from now on. This is the first
+/// component, so that a panic in the rest of root's boot is printed: root
+/// outranks it, and it runs once root stops or waits.
+pub fn spawn(
+    alloc: &mut Alloc,
+    win: &mut Window,
+    asids: &mut AsidPools,
+    info: &HostInfo,
+    uart: &Uart,
+    rings: &crate::partition::Rings,
+    fb: Option<FbArea>,
+) -> Option<Logd> {
+    if !host::serial::LOGD || LOGD_ELF.is_empty() {
+        return None;
+    }
     let fb_pages = fb.as_ref().map_or(0, |f| f.frames.len());
     let ring_pages = serial::MAX_RINGS * (serial::PAGES + l4h_partition::CONSOLE_RING_SIZE as usize / PAGE);
     let keep_bits = (fb_pages + ring_pages).next_power_of_two().trailing_zeros() as usize;
-    let mut arena = h.alloc
+    let mut arena = alloc
         .arena((4 << 20) + (32 << keep_bits) + ((fb_pages + ring_pages) / 512 + 8) * PAGE)
         .expect("memory for logd");
     let mut cfg = LogdConfig {
-        tsc_hz: h.info.tsc_hz,
+        tsc_hz: info.tsc_hz,
         uart_base: uart.out_base,
         _pad: 0,
         rings: rings.serial_mask(),
@@ -125,33 +138,33 @@ pub fn spawn(h: &mut Host, uart: Option<Uart>, rings: &crate::partition::Rings, 
         cnode_bits: None,
     };
     let comp = component::create(
-        &args, &mut h.alloc, &mut arena, &mut h.wins.a,
-        &mut |alloc, vspace| h.asids.assign(alloc, vspace), &h.info.spawn_context(0),
+        &args, alloc, &mut arena, win,
+        &mut |alloc, vspace| asids.assign(alloc, vspace), &info.spawn_context(0),
     );
     comp.give(serial::SLOT_UART, root_cap::<cap_type::Unspecified>(uart.out as usize), sel4::CapRights::all());
-    let keep = arena.object_cap::<cap_type::CNode>(&mut h.alloc, sel4::ObjectBlueprint::CNode { size_bits: keep_bits });
+    let keep = arena.object_cap::<cap_type::CNode>(alloc, sel4::ObjectBlueprint::CNode { size_bits: keep_bits });
     let mut next = 0;
-    let mut map = |h: &mut Host, arena: &mut Arena, frames: Range<Slot>, va: usize, attrs| {
+    let mut map = |alloc: &mut Alloc, arena: &mut Arena, frames: Range<Slot>, va: usize, attrs| {
         for (i, s) in frames.enumerate() {
             let k = keep.absolute_cptr_from_bits_with_depth(next, keep_bits);
             next += 1;
-            comp.map_copy(&mut h.alloc, arena, &abs_of(crate::devmem::granule(s)), va + i * PAGE,
+            comp.map_copy(alloc, arena, &abs_of(crate::devmem::granule(s)), va + i * PAGE,
                 sel4::CapRights::read_write(), attrs, k);
         }
     };
     for k in 1..serial::MAX_RINGS {
         if let Some(f) = rings.serial(k) {
-            map(h, &mut arena, f, serial::RINGS_VA + k * serial::PAGES * PAGE, sel4::VmAttributes::DEFAULT);
+            map(alloc, &mut arena, f, serial::RINGS_VA + k * serial::PAGES * PAGE, sel4::VmAttributes::DEFAULT);
         }
         if let Some(f) = rings.kernel(k) {
-            map(h, &mut arena, f, serial::KERNEL_RINGS_VA + k * serial::KERNEL_RING_STRIDE, sel4::VmAttributes::DEFAULT);
+            map(alloc, &mut arena, f, serial::KERNEL_RINGS_VA + k * serial::KERNEL_RING_STRIDE, sel4::VmAttributes::DEFAULT);
         }
     }
     if let Some(f) = fb {
-        map(h, &mut arena, f.frames, serial::FB_VA, crate::dashboard::write_combining());
+        map(alloc, &mut arena, f.frames, serial::FB_VA, crate::dashboard::write_combining());
     }
     component::start(&comp);
-    h.logd = Some(Logd { comp, _arena: arena });
+    Some(Logd { comp, _arena: arena })
 }
 
 /// The machine is about to reset: let logd finish what is in the ring. Root
