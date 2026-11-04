@@ -2972,8 +2972,7 @@ a line.
 - **Secondary partitions** have no logd. Their ring is in the shared region,
   cleared by the shim and described in the partition descriptor. Partition
   0 does not trust that memory: slots are indexed modulo their number,
-  lengths are clamped, a corrupt record is skipped and counted, `drained` is
-  clamped when read, and line ends in a record's text are replaced, so a
+  lengths are clamped, a corrupt record is skipped and counted, and line ends in a record's text are replaced, so a
   line cannot pass for another partition's. Root's first lines go to a
   private ring until the shared one is mapped.
 - **Framebuffer.** `fb_console` shows host output only if something draws
@@ -2982,19 +2981,22 @@ a line.
   keeps its own cursor there for what it still prints, so a kernel message
   can overwrite a line.
 
-| Failure | Handling |
+Root issues the UART's port capability and spawns logd, and holds no
+logging logic of its own:
+
+| Failure | Result |
 |---|---|
 | Component panics | The text is in the ring; logd prints it |
-| Root panics | Its hook suspends logd and prints up to 256 records of each ring past `drained`, then the panic, directly to the UART |
-| logd faults | Root, its fault handler, prints in its place for at most 1 ms of each 10 ms tick |
+| Root panics | Its text is in the ring; logd, a task of its own, prints it |
+| logd faults | Serial output stops. The host goes on, and `l4hctl logs` still works |
 | Partition 0 dies | Secondaries' output stops |
-| Before logd starts | Records wait in the ring; root's panic hook prints them. Before the setting is read, that is on COM1 |
+| Before logd starts | Records wait in the ring. A root panic this early is not printed |
 | Hard hang or kernel panic | Undrained records are lost; the kernel's own message still prints |
 
-A host reset flushes as a panic does, so that what preceded it is on the
-wire, and resumes logd if the reset fails. `tests/run-logdtest.sh` injects
-these failures in a host built with `L4H_TEST_INJECT=1`; `tests/run-mktest.sh`
-fails on a `[pN] ` that is not at the start of a line.
+A host reset sleeps until logd has printed partition 0's ring, for at most 2
+seconds, so that what preceded it is on the wire. `tests/run-logdtest.sh`
+injects these failures in a host built with `L4H_TEST_INJECT=1`;
+`tests/run-mktest.sh` fails on a `[pN] ` that is not at the start of a line.
 
 ---
 

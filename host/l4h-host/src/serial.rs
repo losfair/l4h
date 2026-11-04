@@ -3,9 +3,9 @@
 //!
 //! Every task of a partition writes whole lines to its partition's ring and
 //! makes no seL4 call, so that printing neither waits nor stalls a core.
-//! `Merge` reads the rings of all partitions, printing the oldest record
-//! first, and hands out text line by line: lines cannot mix, because one
-//! task prints them. It is used by logd, and by root when logd cannot.
+//! `Merge`, in logd, reads the rings of all partitions, oldest record first,
+//! and hands out text line by line: lines cannot mix, because one task
+//! prints them.
 //!
 //! This is separate from the log ring (`log`), so that console volume
 //! cannot push diagnostics out of `l4hctl logs`.
@@ -110,17 +110,15 @@ const SOURCE_SHIFT: u32 = 1;
 /// between partitions for a secondary's.
 #[repr(C, align(4096))]
 pub struct Ring {
-    /// The sequence after the last one printed whole, which root prints
-    /// from if logd cannot. Only readers write it.
+    /// The sequence after the last one printed whole, which tells root
+    /// when a reset can go ahead. Only the reader writes it.
     drained: AtomicU64,
-    /// Partition 0's ring only: `drained` for each kernel console ring.
-    kernel_drained: [AtomicU64; MAX_RINGS],
     ring: ring::Ring<CAPACITY, WORDS>,
 }
 
 impl Ring {
     pub const fn new() -> Self {
-        Self { drained: AtomicU64::new(0), kernel_drained: [const { AtomicU64::new(0) }; MAX_RINGS], ring: ring::Ring::new() }
+        Self { drained: AtomicU64::new(0), ring: ring::Ring::new() }
     }
 
     /// Write text as one line, or as the start of one if `more`: as
@@ -140,6 +138,11 @@ impl Ring {
 
     pub fn head(&self) -> u64 {
         self.ring.head()
+    }
+
+    /// Whether everything written so far has been printed.
+    pub fn is_drained(&self) -> bool {
+        self.drained.load(SeqCst) >= self.head()
     }
 
     /// Copy every record to `to`, the ring its writers move to.
@@ -303,13 +306,10 @@ impl Write for Line {
 enum Commit {
     None,
     Ring(usize, u64),
-    Kernel(usize, u64),
 }
 
-/// The reader of every ring on the machine. `home` is partition 0's own
-/// ring.
+/// The reader of every ring on the machine.
 pub struct Merge {
-    home: &'static Ring,
     inputs: [Option<Input>; MAX_RINGS],
     kernels: [Option<KernelInput>; MAX_RINGS],
     /// The input and source of a line that has no end on the port yet.
@@ -324,7 +324,6 @@ impl Merge {
     /// commit what it claimed.
     pub fn new(home: &'static Ring, grace: u64) -> Self {
         let mut m = Self {
-            home,
             inputs: [const { None }; MAX_RINGS],
             kernels: [const { None }; MAX_RINGS],
             open: None,
@@ -348,21 +347,6 @@ impl Merge {
         });
     }
 
-    /// Continue from what was printed whole, and at most `limit` records
-    /// back: someone else was reading, and whoever calls this has less time.
-    pub fn resume(&mut self, limit: u64) {
-        for i in self.inputs.iter_mut().flatten() {
-            let head = i.ring.head();
-            i.cursor = i.ring.drained.load(SeqCst).min(head).max(head.saturating_sub(limit));
-        }
-        for (k, i) in self.kernels.iter_mut().enumerate() {
-            if let Some(i) = i {
-                i.tail = self.home.kernel_drained[k].load(SeqCst);
-            }
-        }
-        self.open = None;
-    }
-
     /// Look at the rings again: each can have its share of what follows.
     pub fn begin_pass(&mut self) {
         for i in self.inputs.iter_mut().flatten() {
@@ -382,7 +366,6 @@ impl Merge {
                     i.ring.drained.store(seq, SeqCst);
                 }
             }
-            Commit::Kernel(k, tail) => self.home.kernel_drained[k].store(tail, SeqCst),
         }
     }
 
@@ -468,7 +451,6 @@ impl Merge {
                     out.push(&i.line[..i.len]);
                     out.push(b"\r\n");
                     i.len = 0;
-                    self.commit = Commit::Kernel(k, i.tail);
                     return true;
                 }
             }
@@ -772,37 +754,17 @@ mod tests {
     }
 
     #[test]
-    fn resume_starts_at_what_was_printed_whole_within_the_limit() {
+    fn a_ring_is_drained_once_its_last_line_is_printed_whole() {
         let home = ring();
         let mut m = Merge::new(home, GRACE);
-        for i in 0..3 {
-            home.write(1, 0, std::format!("line {i}").as_bytes(), false);
-        }
+        assert!(home.is_drained());
+        home.write(1, 0, b"line", false);
+        assert!(!home.is_drained());
         let mut line = Line::new();
         assert!(m.next(2, &mut line));
+        assert!(!home.is_drained());
         m.commit();
-        // Handed out, and not printed whole.
-        assert!(m.next(2, &mut line));
-        let mut root = Merge::new(home, 0);
-        root.resume(100);
-        assert_eq!(drain(&mut root, 3), "line 1\r\nline 2\r\n");
-        let mut root = Merge::new(home, 0);
-        home.drained.store(0, SeqCst);
-        root.resume(1);
-        assert_eq!(drain(&mut root, 3), "line 2\r\n");
-    }
-
-    #[test]
-    fn resume_clamps_a_secondary_drained_cursor() {
-        let (home, other) = (ring(), ring());
-        other.write(1, 0, b"one", false);
-        other.drained.store(u64::MAX, SeqCst);
-        let mut m = Merge::new(home, 0);
-        m.add_ring(1, other, Some(1));
-        m.resume(100);
-        assert_eq!(drain(&mut m, 2), "");
-        other.write(2, 0, b"two", false);
-        assert_eq!(drain(&mut m, 3), "[p1] two\r\n");
+        assert!(home.is_drained());
     }
 
     struct Kernel(Box<[u64; 32]>);
@@ -841,21 +803,6 @@ mod tests {
         k.print(b"\n");
         let text = drain(&mut m, 3);
         assert!(text.starts_with("[p2] (109 bytes lost)\r\n[p2] aaa"), "{text}");
-    }
-
-    #[test]
-    fn root_finds_where_the_kernel_ring_was_left() {
-        let home = ring();
-        let mut k = Kernel::new();
-        let mut m = Merge::new(home, GRACE);
-        m.add_kernel(1, k.ring());
-        k.print(b"one\ntw");
-        assert_eq!(drain(&mut m, 1), "[p1] one\r\n");
-        k.print(b"o\n");
-        let mut root = Merge::new(home, 0);
-        root.add_kernel(1, k.ring());
-        root.resume(10);
-        assert_eq!(drain(&mut root, 2), "[p1] two\r\n");
     }
 
     #[test]

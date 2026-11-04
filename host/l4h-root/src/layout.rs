@@ -102,11 +102,6 @@ regions! {
     /// x86 multikernel partitions: each PCI function's ECAM page, by BDF
     /// (pci.rs).
     ECAM_X86 = 0x6100_0000_0000, 256 * MIB;
-    /// The primary partition's view of the other kernels' console rings,
-    /// for printing when logd cannot (logd.rs).
-    PARTITION_CONSOLES = 0x6200_0000_0000, l4h_partition::MAX_PARTITIONS * l4h_host::serial::KERNEL_RING_STRIDE;
-    /// The same for the other partitions' serial rings.
-    PARTITION_SERIAL = 0x6300_0000_0000, l4h_partition::MAX_PARTITIONS * l4h_partition::SERIAL_RING_SIZE as usize;
     /// A secondary partition's own serial ring.
     SERIAL = 0x6400_0000_0000, l4h_partition::SERIAL_RING_SIZE as usize;
     /// The partition's control channels to the others, 256 KiB each

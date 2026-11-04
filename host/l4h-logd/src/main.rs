@@ -6,7 +6,7 @@
 //! It runs above guest vCPUs and below their VMMs, with a small budget, and
 //! sleeps while the UART sends a burst, so it neither starves nor spins.
 //! Root issues the port capability and keeps the receive side.  If this
-//! task faults, root prints from where it left off.
+//! task faults, serial output stops.
 
 #![no_std]
 #![no_main]

@@ -132,20 +132,20 @@ pub struct Rings {
 }
 
 impl Rings {
-    /// Map them: root reads them when logd cannot.
+    /// Frames for logd to map.
     pub fn new(alloc: &mut Alloc, devmem: &mut DevMem) -> Rings {
         const NONE: Option<Range<Slot>> = None;
         let mut r = Rings { serial: [NONE; MAX_PARTITIONS], kernel: [NONE; MAX_PARTITIONS] };
         let Some(d) = get().filter(|d| d.is_primary() && d.count > 1) else { return r };
         for (k, p) in d.parts().iter().enumerate() {
             if p.serial.size != 0 {
-                r.serial[k] = map_ring(alloc, devmem, p.serial, crate::layout::PARTITION_SERIAL.base + k * serial::PAGES * 4096);
+                r.serial[k] = ring_frames(alloc, devmem, p.serial);
                 if r.serial[k].is_none() {
                     log!("l4h-root: cannot map partition {}'s serial ring", k);
                 }
             }
             if p.console.size != 0 {
-                r.kernel[k] = map_ring(alloc, devmem, p.console, crate::layout::PARTITION_CONSOLES.base + k * serial::KERNEL_RING_STRIDE);
+                r.kernel[k] = ring_frames(alloc, devmem, p.console);
                 if r.kernel[k].is_none() {
                     log!("l4h-root: cannot map partition {}'s console ring", k);
                 }
@@ -171,25 +171,24 @@ impl Rings {
     }
 }
 
-fn map_ring(alloc: &mut Alloc, devmem: &mut DevMem, ring: Ring, va: usize) -> Option<Range<Slot>> {
-    let frames = alloc.slots.global(|slots| devmem.frames(slots, ring.paddr as usize, ring.size as usize))?;
-    alloc.global(|alloc| {
-        for (i, s) in frames.clone().enumerate() {
-            let copy = alloc.slots.alloc();
-            let f = devmem::granule(copy);
-            crate::component::abs_of(f).copy(&crate::component::abs_of(devmem::granule(s)), CapRights::all()).expect("ring frame");
-            crate::vspace::map_frame(&mut ObjCtx::global(alloc), slot::VSPACE.cap(), f, va + i * 4096,
-                CapRights::read_write(), VmAttributes::DEFAULT);
-        }
-    });
-    Some(frames)
+fn ring_frames(alloc: &mut Alloc, devmem: &mut DevMem, ring: Ring) -> Option<Range<Slot>> {
+    alloc.slots.global(|slots| devmem.frames(slots, ring.paddr as usize, ring.size as usize))
 }
 
 /// In a secondary partition: print to the ring partition 0 reads from now
 /// on, with what `early` holds, and return its frames.
 pub fn serial_ring(alloc: &mut Alloc, devmem: &mut DevMem, early: &'static serial::Ring) -> Option<Range<Slot>> {
     let d = get().filter(|d| !d.is_primary() && d.serial.size != 0)?;
-    let frames = map_ring(alloc, devmem, d.serial, crate::layout::SERIAL.base)?;
+    let frames = ring_frames(alloc, devmem, d.serial)?;
+    alloc.global(|alloc| {
+        for (i, s) in frames.clone().enumerate() {
+            let copy = alloc.slots.alloc();
+            let f = devmem::granule(copy);
+            crate::component::abs_of(f).copy(&crate::component::abs_of(devmem::granule(s)), CapRights::all()).expect("ring frame");
+            crate::vspace::map_frame(&mut ObjCtx::global(alloc), slot::VSPACE.cap(), f, crate::layout::SERIAL.base + i * 4096,
+                CapRights::read_write(), VmAttributes::DEFAULT);
+        }
+    });
     // Mapped for good, and the shim cleared it.
     let ring = unsafe { &*(crate::layout::SERIAL.base as *const serial::Ring) };
     early.copy_to(ring);
