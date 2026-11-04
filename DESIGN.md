@@ -1793,7 +1793,7 @@ firewalling belong in a VM.
 - **Path.** Guest `virtio_net` → `l4h-vmm` → shared net port rings →
   `l4h-netd` → destination port or uplink NIC. netd runs all switches and
   the uplink NIC drivers in one component: modern and legacy virtio-net,
-  gVNIC, Amazon ENA and the Intel X550.
+  gVNIC, Amazon ENA, Intel X550 and ConnectX-5.
 - **vNICs.** Each vNIC is on one switch and appears as a separate `ethN`.
   There are 48 guest ports in all. Guest vNICs have one RX/TX queue pair.
 - **Switches and uplinks.** The API creates switches dynamically, up to 52
@@ -1842,6 +1842,15 @@ firewalling belong in a VM.
   kick and ignores rings whose indices claim more. MAC lock is on by
   default. Isolated ports exchange no frames with each other but reach
   normal ports and the uplink (`--nic ...,isolated`).
+- **Dom0 bonding.** Each dom0 uplink keeps its physical MAC. Root permits
+  either member's permanent MAC on the two designated dom0 uplink ports.
+  Other source MACs remain locked. Linux bonding runs in dom0,
+  with one separate switch per physical member. Slow Protocol frames
+  (`01:80:c2:00:00:02`, EtherType `8809`) pass only between that member
+  and its designated dom0 port, before FDB learning or steering. Ordinary
+  guest ports cannot send or receive them. ConnectX-5 port events update
+  dom0's carrier, speed and duplex through virtio configuration interrupts,
+  including when no data arrives. Other guest ports keep virtual carrier.
 - **Router VMs.** dom0's first vNIC takes the uplink NIC's MAC by default,
   since a cloud VPC delivers frames only for it. A router VM's other vNICs
   join internal switches and Linux provides NAT or routing. QEMU guests can
@@ -1981,6 +1990,29 @@ uplink, internal switches, multiple vNICs, isolation and MAC lock
 (`NETTEST_LEGACY=1`: a legacy virtio-net uplink). `tests/run-router.sh`
 uses a Debian router with nftables masquerade to connect an internal guest
 to the outside.
+
+**ConnectX-5.** `l4h-netd/src/mlx5.rs` supports PCI device 15b3:1017.
+Each PF uses one RX queue, one TX queue and one MSI-X event queue.
+The command transport follows the NVIDIA Ethernet PRM and Linux mlx5.
+The official libmlx5 VFIO provider requires Linux VFIO and libibverbs.
+Netd has neither Linux syscalls nor a heap, so this driver uses firmware
+commands directly. The adapter stays in `mlx5.rs`. `tests/mlx5-vfio` runs
+that same command and queue code against a VFIO-bound PF on Linux.
+The PF has a 32 MiB DMA budget. A fixed 24 MiB pool supplies firmware
+pages and reuses returned pages without a heap. Firmware can return fewer
+pages than requested, including zero. The driver checks returned addresses
+against its outstanding pool pages before reuse. The lower 16 MiB of BAR 0
+contains the init segment, MSI-X table and allocated UAR. The driver rejects
+a UAR outside that aperture. Netd completes checksums and segments TCP in
+software. The TX path accepts Ethernet frames up to 1518 bytes, including a VLAN tag.
+RDMA, SR-IOV, RSS and hardware TSO are outside this driver.
+The installer accepts `--uplink IFNAME` once or twice to select physical
+interfaces on machines with more ports. Other interfaces stay outside the
+migration plan. Selected ports retain the existing PCI order and MAC rules.
+`--uplink-bond IFNAME` accepts an existing 802.3ad bond with exactly two
+ConnectX-5 members. It reads each member's saved permanent MAC and preserves
+the distribution's bond configuration. The bond MAC must be one of those
+permanent MACs. Other master devices remain unsupported.
 
 ### 9.4 Console and other devices
 
@@ -2237,7 +2269,7 @@ whose components assume a static, Microkit-shaped system.
 | `l4h-vmmgr` | 1 | Builds guest CSpaces, kernel VSpaces, vCPUs and boot info from memory it gets from memd; loads the guest kernel and images; measures launches; spawns guests' VMMs. Runs lifecycle, the control API and the balancer (§10.3). |
 | `l4h-vmm` | 1 per guest | Serves virtio backends, console, display and hypercalls using the guest's I/O pool and host-owned pages. Never maps guest RAM. |
 | `l4h-blkd` | 1 per disk controller | Validates pool addresses and LBA windows and drives a virtio-blk, virtio-scsi or NVMe PCI controller for all its clients. |
-| `l4h-netd` | 1 | Runs all L2 switches, guest ports and the virtio-net, gVNIC, ENA and X550 uplink drivers. |
+| `l4h-netd` | 1 | Runs all L2 switches, guest ports and the virtio-net, gVNIC, ENA, X550 and ConnectX-5 uplink drivers. |
 | `l4h-trustd` | 1 | Maintains taint/seal flags; with a TPM, quotes its signing key and signs guests' reports (§10.2). |
 | `l4h-memd` | 1 | Owns free memory and every guest's RAM blocks; gives root and vmmgr memory for host objects; serves memory hotplug; reports free memory to the hypervisor (§8.4). |
 
@@ -3083,7 +3115,7 @@ curl -fsSL https://raw.githubusercontent.com/losfair/l4h/main/tools/install.sh |
 - **Supported layouts.** Headless systemd installations with a plain
   ext4/XFS root on NVMe namespace 1 or a supported virtio disk, exposed to
   dom0 as partition windows (§10.1), and one or two physical virtio-net,
-  gVNIC, ENA or X550 NICs. Each NIC becomes the uplink of its own switch
+  gVNIC, ENA, X550 or ConnectX-5 NICs. Each NIC becomes the uplink of its own switch
   (switch 0, then 1, in PCI address order), and dom0 gets one interface on
   each with the original name and MAC, so existing address, route and DNS
   settings apply. Software interfaces (WireGuard, PPP, GRE, TUN/TAP and the

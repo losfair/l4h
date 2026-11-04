@@ -30,6 +30,8 @@ pub trait Backend {
     fn queue_max(&self, q: usize) -> u32;
     /// Write the device configuration space.
     fn init_config(&self, config: &mut [u8]);
+    /// Update changed device configuration, including without queue work.
+    fn update_config(&mut self, _config: &mut [u8]) -> bool { false }
     /// Process available buffers on queue `q`.  Returns true if buffers
     /// were returned to the driver.
     fn kick(&mut self, mem: &GuestMem, queues: &mut [Queue], q: usize) -> bool;
@@ -271,6 +273,21 @@ impl<B: Backend> Device<B> {
 
     /// A backend signalled completions, maybe this one.
     pub fn complete(&mut self, mem: &GuestMem, vcpus: &Vcpus) {
+        let config = unsafe { core::slice::from_raw_parts_mut(
+            (self.regs as usize + abi::VIRTIO_CONFIG_OFF) as *mut u8,
+            abi::VIRTIO_CONFIG_SIZE,
+        ) };
+        if self.backend.update_config(config) {
+            core::sync::atomic::fence(Ordering::Release);
+            unsafe {
+                let generation = addr_of!((*self.regs).config_generation).read_volatile();
+                addr_of_mut!((*self.regs).config_generation).write_volatile(generation.wrapping_add(1));
+            }
+            if self.status() & STATUS_DRIVER_OK != 0 {
+                self.isr().fetch_or(abi::VIRTIO_ISR_CONFIG, Ordering::SeqCst);
+                vcpus.raise(self.irq_vcpu().min(vcpus.n - 1), self.event);
+            }
+        }
         if !self.backend.pending() {
             return;
         }

@@ -1,4 +1,4 @@
-//! Uplink NICs: a virtio-net, gVNIC, Amazon ENA or Intel X550 device, and the
+//! Uplink NICs: virtio-net, gVNIC, Amazon ENA, Intel X550 or ConnectX-5, and the
 //! frames waiting for one of its TX buffers.
 
 use core::ptr::addr_of_mut;
@@ -9,6 +9,7 @@ use l4h_rt::host::net::{self, NicConfig};
 use crate::ena::Ena;
 use crate::gvnic::Gvnic;
 use crate::ixgbe::Ixgbe;
+use crate::mlx5::Mlx5;
 use crate::pool::{Fifo, Pool};
 use crate::virtio_net::VirtioNet;
 
@@ -28,6 +29,7 @@ enum Dev {
     Gvnic(Gvnic),
     Ena(Ena),
     Ixgbe(Ixgbe),
+    Mlx5(Mlx5),
 }
 
 /// Calls the same method on whichever device this is.
@@ -38,6 +40,7 @@ macro_rules! dev {
             Dev::Gvnic($d) => $e,
             Dev::Ena($d) => $e,
             Dev::Ixgbe($d) => $e,
+            Dev::Mlx5($d) => $e,
         }
     };
 }
@@ -54,6 +57,12 @@ pub struct Nic {
 }
 
 impl Nic {
+    pub fn link(&self) -> net::LinkState {
+        match &self.dev {
+            Dev::Mlx5(d) => d.link,
+            _ => net::LinkState::VIRTUAL,
+        }
+    }
     /// NIC `n` (< MAX_NICS), made once.
     pub fn new(n: usize, c: &NicConfig, tsc_hz: u64) -> Self {
         let partial = unsafe { &mut *addr_of_mut!(RX_PARTIAL[n]) };
@@ -67,6 +76,11 @@ impl Nic {
                 let e = Ena::new(n, c, tsc_hz, partial);
                 let (mac, csum, tso) = (e.mac, e.csum, e.tso);
                 (Dev::Ena(e), mac, csum, tso)
+            }
+            net::NIC_MLX5 => {
+                let x = Mlx5::new(n, c, tsc_hz);
+                let mac = x.mac;
+                (Dev::Mlx5(x), mac, false, false)
             }
             net::NIC_IXGBE => {
                 let x = Ixgbe::new(n, c, tsc_hz, partial);
@@ -89,6 +103,7 @@ impl Nic {
             Dev::Gvnic(g) => g.takes_gso(hdr),
             Dev::Ena(_) => false,
             Dev::Ixgbe(x) => x.takes_gso(hdr),
+            Dev::Mlx5(_) => false,
         }
     }
 
@@ -113,7 +128,7 @@ impl Nic {
     /// Send a frame, or hold it in `pool` until a TX buffer is free: a
     /// dropped frame costs TCP a retransmission timeout.
     pub fn send(&mut self, frame: &[u8], hdr: &[u8; HDR], pool: &mut Pool) {
-        if frame.len() > net::MAX_FRAME {
+        if frame.len() > net::MAX_FRAME || (matches!(&self.dev, Dev::Mlx5(_)) && !(14..=1518).contains(&frame.len())) {
             self.tx_drops += 1;
             return;
         }

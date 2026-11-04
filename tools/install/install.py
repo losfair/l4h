@@ -415,8 +415,28 @@ class Preflight:
         # Software interfaces have no backing device in sysfs. Their names,
         # types and count are irrelevant to host uplink selection; the
         # existing userspace recreates them in dom0.
-        links = json.loads(self.run("ip", "-json", "link", "show"))
+        links = json.loads(self.run("ip", "-details", "-json", "link", "show"))
+        bond = self.args.uplink_bond
+        if bond:
+            need(not self.args.uplink, "use --uplink-bond or --uplink, not both")
+            need(re.fullmatch(r"[A-Za-z0-9_-]{1,15}", bond), "invalid bond interface name")
+            master = next((link for link in links if link["ifname"] == bond), {})
+            need(master.get("linkinfo", {}).get("info_kind") == "bond" and
+                 self.read("/sys/class/net/" + bond + "/bonding/mode").split() == ["802.3ad", "4"],
+                 "--uplink-bond needs an existing 802.3ad bond")
+            members = [link for link in links if link.get("master") == bond]
+            need(len(members) == 2 and all(self.path("/sys/class/net/" + link["ifname"] + "/device").exists()
+                                          for link in members),
+                 "the bond needs exactly two physical members")
+            links = members
         links = [link for link in links if self.path("/sys/class/net/" + link["ifname"] + "/device").exists()]
+        if self.args.uplink:
+            selected = self.args.uplink
+            need(1 <= len(selected) <= 2 and len(set(selected)) == len(selected),
+                 "select one or two distinct physical uplinks")
+            present = {link["ifname"] for link in links}
+            need(all(name in present for name in selected), "selected uplink is not a physical interface")
+            links = [link for link in links if link["ifname"] in selected]
         need(1 <= len(links) <= 2,
              "automatic migration requires one or two physical NICs")
         uplinks = []
@@ -424,7 +444,7 @@ class Preflight:
             name = link["ifname"]
             need(re.fullmatch(r"[A-Za-z0-9_-]{1,15}", name), "unsupported interface name: " + name)
             base = "/sys/class/net/" + name
-            need(link.get("link_type") == "ether" and "master" not in link and
+            need(link.get("link_type") == "ether" and ("master" not in link or bond and link["master"] == bond) and
                  not link.get("linkinfo", {}).get("info_kind") and not self.path(base + "/wireless").exists(),
                  name + ": need a plain Ethernet uplink (no wireless or master device)")
             pci = self.pci(base + "/device")
@@ -435,17 +455,26 @@ class Preflight:
                 and (pci["modern"] or device == 0x1000 and pci["legacy"]) or
                 vendor == 0x1AE0 and device == 0x0042 and mem(0) and mem(2) and pci["msix"] >= 3 or
                 vendor == 0x8086 and device in (0x1563, 0x15D1) and mem(0) and pci["msix"] >= 2 or
-                vendor == 0x1D0F and device in (0x0EC2, 0x1EC2, 0xEC20, 0xEC21, 0x0051) and mem(0) and pci["msix"] >= 2)
-            need(supported, name + ": supported uplinks are virtio-net, gVNIC, ENA and Intel X550")
-            need(self.read(base + "/addr_assign_type") == "0",
+                vendor == 0x1D0F and device in (0x0EC2, 0x1EC2, 0xEC20, 0xEC21, 0x0051) and mem(0) and pci["msix"] >= 2 or
+                vendor == 0x15B3 and device == 0x1017 and mem(0) and pci["msix"] >= 1)
+            need(supported, name + ": supported uplinks are virtio-net, gVNIC, ENA, Intel X550 and ConnectX-5")
+            need(not bond or vendor == 0x15B3 and device == 0x1017,
+                 "bond migration currently needs two ConnectX-5 ports")
+            need(bond or self.read(base + "/addr_assign_type") == "0",
                  name + ": uplink MAC has been changed; restore its permanent MAC first")
-            mac = self.read(base + "/address").lower()
+            mac = self.read(base + ("/bonding_slave/perm_hwaddr" if bond else "/address")).lower()
+            if bond:
+                permanent = self.run("ethtool", "-P", name).removeprefix("Permanent address: ").lower()
+                need(mac == permanent, name + ": restore the hardware permanent MAC before creating the bond")
             need(re.fullmatch(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", mac) and
                  mac != "00:00:00:00:00:00" and not int(mac[:2], 16) & 1,
                  name + ": invalid Ethernet MAC")
             need(not any(n["mac"] == mac or n["bdf"] == pci["bdf"] for n in uplinks),
                  "uplinks need distinct MAC addresses and PCI devices")
             uplinks.append(dict(ifname=name, bdf=pci["bdf"], mac=mac))
+        if bond:
+            need(master.get("address", "").lower() in {nic["mac"] for nic in uplinks},
+                 "the bond MAC must be one of its members' permanent MACs")
         return sorted(uplinks, key=lambda n: n["bdf"])
 
     def check(self):
@@ -503,6 +532,8 @@ class Preflight:
 
     def update(self):
         """Update an existing deployment without reinterpreting dom0 as its host."""
+        need(not self.args.uplink and not self.args.uplink_bond,
+             "--uplink and --uplink-bond apply only to the initial installation")
         need(platform.system() == "Linux" and platform.machine() == "x86_64",
              "only x86_64 Linux is supported")
         safe_path(self.path(STATE))
@@ -1104,6 +1135,10 @@ def arguments(argv=None):
     parser.add_argument("--artifacts", type=Path,
                         help="read release artifacts from this directory instead of downloading them")
     parser.add_argument("--esp")
+    parser.add_argument("--uplink", action="append", metavar="IFNAME",
+                        help="select a physical uplink; repeat for a second independent uplink")
+    parser.add_argument("--uplink-bond", metavar="IFNAME",
+                        help="preserve an existing 802.3ad bond with two physical members")
     parser.add_argument("--memory", type=int)
     parser.add_argument("--vcpus", type=int)
     parser.add_argument("--variant", choices=KERNEL_VARIANTS)

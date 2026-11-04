@@ -27,6 +27,16 @@ run() { # name expect-pattern create-args...
     echo "NETTEST: $name ok"
     eval "vm_$name=$id"
 }
+# A normal port must not inject Slow Protocol frames into dom0 or the
+# physical link, even when it uses its own permitted source MAC.
+slow-protocol eth0 watch 6 >/tmp/slow-watch &
+watch=$!
+slowvm=$(l4hctl create slow --initrd /bin/slowvm.cpio.gz --mem 96 --nic 0) || fail "create slow protocol guest"
+l4hctl console "$slowvm" --until 'SLOWVM: done' --timeout 40 >/tmp/slowvm || fail "slow protocol guest timeout"
+grep -q 'SLOWVM: PASS' /tmp/slowvm || fail "Slow Protocol leaked into a guest"
+wait "$watch" || fail "guest Slow Protocol reached dom0"
+l4hctl destroy "$slowvm" || fail "destroy slow protocol guest"
+echo 'NETTEST: Slow Protocol isolation ok'
 # Second boot: A outlived a dom0 restart, so the ports dom0 did not make
 # must still be served.  netd's paging structures for them once came from
 # dom0's slots and were deleted with it.
