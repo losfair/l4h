@@ -43,13 +43,11 @@ if [ -f /bin/cred ]; then
     l4hctl attest activate /bin/cred >/dev/null && echo "ATTEST: activated after a pause"
 fi
 if [ -f /bin/vm.cpio.gz ]; then
-    # Its console, printed once it is done: the host also copies it to the
-    # serial port, and the two copies would interleave.
+    # The host copies its console to the serial port.
     id=$(l4hctl create attestvm --initrd /bin/vm.cpio.gz --mem 64 \
         --cmdline "console=hvc0 attest_nonce=$nonce") && \
-        l4hctl console "$id" --until "ATTESTVM: done" --timeout 60 > /tmp/vm.out
+        l4hctl console "$id" --until "ATTESTVM: done" --timeout 60 >/dev/null
     sleep 1
-    grep ATTESTVM /tmp/vm.out
 fi
 if [ -x /bin/flags-test ]; then
     /bin/flags-test dom0 || echo "FLAGS: FAIL"

@@ -53,8 +53,7 @@ boot() {  # boot <name> <tpm-crb|tpm-tis> [extra initramfs files...]
     grep -aE "ATTEST|trustd|TPM|panic" "$log" | cut -c1-160 || true
 }
 # The hex of the first line of a log that is "<what> <hex>" and nothing
-# else: prints from other cores (the serial copy of a guest's console,
-# "[vm1] ...") can interleave with a line, character by character.
+# else, whether or not it is the serial copy of a guest's console.
 field() {  # field <log> <what> <out file>
     sed -E 's/^\[vm[0-9]+\] //' "$1" | grep -a "^$2 [0-9a-f]*"$'\r'"*$" | head -1 | tr -d '\r' | sed "s/^$2 //" \
         | python3 -c "import sys; sys.stdout.buffer.write(bytes.fromhex(sys.stdin.read().strip()))" > "$3"
