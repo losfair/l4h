@@ -268,7 +268,7 @@ support, since no device is passed into a guest.
 | 0015 | (aarch64) Inner-shareable broadcast TLB maintenance at EL1 on 16-bit ASIDs. The kernel refuses to boot unless `TCR_EL1.AS` is set (with 8-bit ASIDs, address spaces differing only in the upper bits would share TLB entries); secondaries check too. The loader gives every core VMID 0, since broadcasts reach only the issuer's VMID. |
 | 0016 | (aarch64) The counter frequency is read at boot for MCS conversions (TCG's 62.5 MHz, Apple M4 HVF's 24 MHz). |
 | 0018 | (aarch64) ID_AA64ISAR0/1/2 and PFR0/1 of the boot CPU are passed to root as a bootinfo chunk, for guest HWCAPs (§5). |
-| 0020 | (x86) `fb_console`: kernel output is also drawn on the lower half of a 32-bpp direct-RGB multiboot2 framebuffer below 4 GiB, 8x8 glyphs doubled vertically, wrapping rather than scrolling so the framebuffer is never read. Refused if it overlaps usable RAM or starts below 1 MiB. For machines whose screen is reachable but not their serial port. |
+| 0020 | (x86) `fb_console`: kernel output (host output is logd's, §10.4) is also drawn on the lower half of a 32-bpp direct-RGB multiboot2 framebuffer below 4 GiB, 8x8 glyphs doubled vertically, wrapping rather than scrolling so the framebuffer is never read. Refused if it overlaps usable RAM or starts below 1 MiB. For machines whose screen is reachable but not their serial port. |
 | 0021 | (x86) Multiboot modules after the root task (up to 8) are copied to page-aligned memory above the root task's image and below 4 GiB, kept out of managed RAM so they reach root as device Untypeds (frames without clearing), and listed with their loader strings in a bootinfo chunk (`SEL4_BOOTINFO_HEADER_X86_BOOT_MODULES`). This is how dom0's files are loaded (§10.1). |
 | 0022 | (x86) Intel CPUs that enumerate the TSC rate in CPUID 0x15 (or 0x16) take it from there, rounded to the nearest MHz; with TSC-deadline the PIT is then unused. Alder Lake and later may gate the 8254, so the PIT wait never ended. VMs (leaf 0x15 zero) still measure with the PIT. |
 | 0023, 0029 | `Page_TestAndClearAccessed` (x86_64, and AArch64 without hypervisor support) atomically clears and returns the A/AF bit of a frame cap's mapping, for 4 KiB frames (0023) and 2 MiB frames (0029), after verifying the mapped ASID, address, size and physical frame. It does not invalidate TLBs, as with native x86 aging. On AArch64 without hardware AF updates (and without hypervisor support), seL4 repairs EL0 access-flag faults itself (setting AF and restarting) without fault IPC; `TCR_EL1.HA` stays off. 0029 also adds `Page_DeriveSubframe` (x86_64 and AArch64), which derives up to 512 consecutive unmapped 4 KiB capabilities from a RAM-backed 2 MiB frame into a validated window of CNode slots, with intersected rights, allocating nothing. Aliases are smaller regions in the derivation tree: deleting the large cap leaves them valid, and revoking the backing Untyped removes all of them and their mappings. |
@@ -967,12 +967,13 @@ Global on each core, with `P_K` = `PRIO_KERNEL` = 100:
 | Priority | Components |
 |----------|------------|
 | root task | l4h-root |
-| `P_K + 2` | l4h-netd (switches and NIC drivers), l4h-blkd (disk drivers), l4h-memd and l4h-vmmgr (both on core 0) |
-| `P_K + 1` | l4h-vmm instances; l4h-trustd (last core, at most 5 ms per 20 ms) |
+| `P_K + 3` | l4h-netd (switches and NIC drivers), l4h-blkd (disk drivers), l4h-memd and l4h-vmmgr (both on core 0) |
+| `P_K + 2` | l4h-vmm instances; l4h-trustd (last core, at most 5 ms per 20 ms) |
+| `P_K + 1` | l4h-logd (core 0, at most 1 ms per 5 ms): a busy guest must not starve it, and it must not delay a VMM |
 | `P_K` | guest kernel TCBs (`SC_K`) |
 | `P_U` = 99 | guest user TCBs (`SC_U`) |
 
-Host services run with full budgets; guests' vCPUs are bounded by their
+Other host services run with full budgets; guests' vCPUs are bounded by their
 SCs. Because `P_K > P_U` for every guest, one guest's kernel work can
 briefly preempt another guest's user work, bounded by `SC_K` budgets.
 
@@ -1121,7 +1122,7 @@ With a linear framebuffer from the boot loader (GRUB, which seL4 patch 0011
 asks for one), `l4h-root` draws a read-only status screen every second:
 host, VMs (from vmmgr's status page), disks, switches. It redraws changed
 character cells only, in an 8x8 public-domain font. With `fb_console` it
-keeps to the upper half.
+keeps to the upper half, and logd draws host output on the lower (§10.4).
 
 ---
 
@@ -1419,7 +1420,7 @@ grow and shrink without going through `l4h-root`.
   handed out, and if it faults, a keeper thread answers its callers with
   an error, so memory requests (grants, guest creation, hotplug) fail from
   then on.
-- **Scheduling.** memd runs on core 0 at `PRIO_KERNEL + 2`, above every
+- **Scheduling.** memd runs on core 0 at `PRIO_KERNEL + 3`, above every
   guest, with a full budget: root waits for it.
 - **Limits.** Only the table: its size follows the host's memory, and no
   request makes memd use more of anything. A 1 TiB host needs 12 MiB of
@@ -2272,6 +2273,7 @@ whose components assume a static, Microkit-shaped system.
 | `l4h-netd` | 1 | Runs all L2 switches, guest ports and the virtio-net, gVNIC, ENA, X550 and ConnectX-5 uplink drivers. |
 | `l4h-trustd` | 1 | Maintains taint/seal flags; with a TPM, quotes its signing key and signs guests' reports (§10.2). |
 | `l4h-memd` | 1 | Owns free memory and every guest's RAM blocks; gives root and vmmgr memory for host objects; serves memory hotplug; reports free memory to the hypervisor (§8.4). |
+| `l4h-logd` | 1 (x86_64) | The only host writer to the serial port: prints every partition's serial ring and the other kernels' console rings, whole lines in one order (§10.4). |
 
 **No dynamic allocation.** Nothing a guest, dom0 or a device does may
 exhaust a host component's memory: a component that runs out cannot
@@ -2282,7 +2284,7 @@ tables. Where allocation is truly needed, it is bounded by a stated limit
 checked before the allocation, fails as an error rather than a panic, and is
 never made per request on a path whose size a guest or client controls. A
 component without a heap says so (`component!(main, no_heap)`, or for root
-a `#[root_task]` without `heap_size`) and does not link `alloc`: root, vmmgr, memd, netd, blkd and the VMM have none, and keep
+a `#[root_task]` without `heap_size`) and does not link `alloc`: root, vmmgr, memd, netd, blkd, logd and the VMM have none, and keep
 state too large for a stack in statics (`l4h_host::fixed::{StaticCell,
 Scratch}`). The one heap is trustd's, for the third-party AML interpreter of
 the TPM start method; its size (`aml::HEAP`) is bounded by the firmware's
@@ -2316,9 +2318,9 @@ netd, trustd and the VMM use capabilities and mappings installed by their
 parent and need only `l4h-rt`. memd's allocator, which tracks physical
 blocks, ownership, retained originals and reporting, is memd's own.
 
-**Serial output** uses seL4's printing syscall; root drives COM1 input for
-the monitor. A kernel print is a synchronous serial write with interrupts
-off, which stalls its core for the whole message, so prints are rare:
+**Serial output** goes through shared memory to l4h-logd (§10.4), and root
+drives COM1 input for the monitor. The port takes about 11 KB/s, so prints
+are rare:
 
 - informational messages (device discovery, guest lifecycle, balancer
   moves) use `info!`, which prints only when `host::VERBOSE`, not in
@@ -2327,6 +2329,10 @@ off, which stalls its core for the whole message, so prints are rare:
 - guest consoles, dom0's included, are copied to the serial port only when
   verbose; they always go to the console rings `console_read` serves;
 - the serial monitor's replies and the opt-in watchdog dumps always print.
+
+aarch64 has no logd yet: host code there still prints through the kernel, a
+synchronous serial write for every byte. Those lines are marked, and
+`tests/check-debug-print.sh` keeps others from appearing.
 
 **Host log.** Diagnostics from root, vmmgr, VMMs and device services also go
 to a shared, bounded log ring (`l4h_host::log`), including `info!` in
@@ -2911,9 +2917,84 @@ root.
   those vCPUs stop. Nothing can then create, change or destroy guests,
   attestation answers no longer reach guests, and the balancer stops; the
   serial monitor's `reboot` resets the host (`tests/control-failure.rs`).
-- **Scheduling.** vmmgr runs on core 0 at `PRIO_KERNEL + 2`, above every
+- **Scheduling.** vmmgr runs on core 0 at `PRIO_KERNEL + 3`, above every
   guest and VMM, with a full budget and its own deadline timer for the
   balancer.
+
+### 10.4 Serial output: l4h-logd
+
+On x86_64, one task, l4h-logd, is the only host code that prints to the
+serial port. Lines cannot split, because one writer prints whole records.
+The kernel still prints boot messages and fatal errors to the port itself,
+so the guarantee covers host output only: a kernel message can land inside
+a line.
+
+```
+ partition 0                                 secondary partition k
+ root, vmmgr, netd, blkd, memd, trustd       the same
+ VMMs (guest console lines)
+        |                                           |
+        v                                           v
+ serial ring 0 (in root's image)             serial ring k (shared region)
+        |                                           |
+        +------------------+------------------------+
+                           v
+                      l4h-logd  ------> UART, framebuffer
+                           ^
+                           |
+             secondary kernels' console rings
+```
+
+- **Serial ring** (`l4h_host::serial`). 4095 slots of 232 bytes, 1 MiB,
+  separate from the log ring so that console volume cannot push diagnostics
+  out of `l4hctl logs`. The slots are the log ring's (`l4h_host::ring`):
+  writers format on their stack, claim, never wait and make no seL4 call. A
+  line that does not fit takes consecutive slots, flagged as going on, and
+  a reader prints them next to each other. Every task maps its partition's
+  ring at the same address.
+- **Writers.** `log!` and printing `info!` write this ring as well as the
+  log ring. A VMM gathers its guest's console by line, and sends what it has
+  of one after 100 ms, so that prompts show. Panic text is gathered by line.
+  Text on the port is what it always was: the ring's timestamps are not
+  printed, and `[vmN] ` and `[pN] ` are.
+- **logd** wakes on a 10 ms timer, since writers cannot wake it. `Merge`
+  (also in `l4h_host::serial`) prints the record with the lowest timestamp
+  of any ring, then lines of kernel console rings. A record claimed and not
+  committed gets 100 ms; `(N lines lost)` reports what was overwritten or
+  skipped. Each ring has 64 records of a pass, which bounds what a ring
+  claiming to hold the oldest record can do. logd turns on the 16550's FIFO,
+  which seL4 leaves off, and sends 15 bytes when it finds the FIFO empty,
+  leaving room for a byte of the kernel's, or one byte without a FIFO. It
+  sleeps on `seL4_TCB_SetTimer` while the UART sends, 1.4 ms at 115200 baud.
+  Root keeps the port's receive side and interrupt.
+- **Port.** logd uses the `serial_port` setting unless no UART answers
+  there: then COM1, where the kernel prints unless told otherwise.
+- **Secondary partitions** have no logd. Their ring is in the shared region,
+  cleared by the shim and described in the partition descriptor. Partition
+  0 does not trust that memory: slots are indexed modulo their number,
+  lengths are clamped, a corrupt record is skipped and counted, `drained` is
+  clamped when read, and line ends in a record's text are replaced, so a
+  line cannot pass for another partition's. Root's first lines go to a
+  private ring until the shared one is mapped.
+- **Framebuffer.** `fb_console` shows host output only if something draws
+  it, now that it does not go through the kernel. logd draws it on the lower
+  half of the screen, in the layout and glyphs of patch 0020. The kernel
+  keeps its own cursor there for what it still prints, so a kernel message
+  can overwrite a line.
+
+| Failure | Handling |
+|---|---|
+| Component panics | The text is in the ring; logd prints it |
+| Root panics | Its hook suspends logd and prints up to 256 records of each ring past `drained`, then the panic, directly to the UART |
+| logd faults | Root, its fault handler, prints in its place for at most 1 ms of each 10 ms tick |
+| Partition 0 dies | Secondaries' output stops |
+| Before logd starts | Records wait in the ring; root's panic hook prints them. Before the setting is read, that is on COM1 |
+| Hard hang or kernel panic | Undrained records are lost; the kernel's own message still prints |
+
+A host reset flushes as a panic does, so that what preceded it is on the
+wire, and resumes logd if the reset fails. `tests/run-logdtest.sh` injects
+these failures in a host built with `L4H_TEST_INJECT=1`; `tests/run-mktest.sh`
+fails on a `[pN] ` that is not at the start of a line.
 
 ---
 
@@ -3366,7 +3447,7 @@ partition.
 crashed secondary stays down until the machine reboots. There is no
 per-partition restart; partition 0's `l4hctl host-reboot` resets the whole
 machine. If partition 0 dies, the others keep running without its
-services (console relay, clock, attestation, IOMMU fault logging).
+services (serial output, clock, attestation, IOMMU fault logging).
 
 **Test.** `tests/run-mktest.sh` boots two partitions on QEMU q35 (KVM),
 each with its own virtio disk and NIC: each dom0 gets an address by DHCP,
@@ -3381,9 +3462,6 @@ IOMMU (VMs in every partition attach and drain I/O pools at once), and
 `MK_BRIDGES=1` puts partition 1's devices behind root ports and a
 PCIe-to-PCI bridge, and `MK_UPLINK=1` gives partition 1 no NIC but an
 `uplink` link to partition 0's.
-
-**Limits.** Partition 0's own output and the lines it relays share the
-serial port a character at a time, so they can interleave.
 
 ---
 
