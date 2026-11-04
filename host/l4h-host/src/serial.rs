@@ -24,13 +24,16 @@ use crate::ring::{self, Buf, Entry};
 /// still prints through the kernel.
 pub const LOGD: bool = cfg!(target_arch = "x86_64");
 
-/// Slots of `Ring`, which with its header makes exactly 1 MiB.
-pub const CAPACITY: usize = 4095;
+/// Slots of `Ring`, which with its header makes exactly 256 KiB. A dom0 boot
+/// prints a few hundred lines. A deeper ring only makes output later: a
+/// full one takes up to 20 s to print at 115200 baud, 30 s where each byte
+/// costs logd a slow VM exit, and everything else waits behind a flood.
+pub const CAPACITY: usize = 1023;
 pub const TEXT_SIZE: usize = 232;
 const WORDS: usize = TEXT_SIZE / 8;
 pub const PAGES: usize = core::mem::size_of::<Ring>() / 4096;
 pub const FRAME_RADIX: usize = PAGES.next_power_of_two().trailing_zeros() as usize;
-const _: () = assert!(PAGES == 1 << FRAME_RADIX && PAGES == 256);
+const _: () = assert!(PAGES == 1 << FRAME_RADIX && PAGES == 64);
 /// Where the ring is in every task of a partition.
 pub const VA: usize = 0x1010_0000;
 const _: () = assert!(VA >= crate::log::VA + crate::log::PAGES * 4096
@@ -808,7 +811,7 @@ mod tests {
     #[test]
     fn concurrent_writers_keep_their_lines_whole() {
         // Few enough records never to wrap, so that none may be lost.
-        const MESSAGES: usize = 300;
+        const MESSAGES: usize = 80;
         let home: Arc<&'static Ring> = Arc::new(ring());
         let writers: Vec<_> = (0..4u32).map(|id| {
             let ring = Arc::clone(&home);
