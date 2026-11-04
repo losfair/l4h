@@ -86,7 +86,7 @@ jobs:
         run: tests/run-devicetest.sh --qemu
       - name: Retained host faults and logs in release mode
         run: L4H_RELEASE=1 tests/run-logtest.sh
-      - name: Serial output through failures of components, l4h-logd and root
+      - name: Serial output when components, l4h-logd or root fail
         run: tests/run-logdtest.sh
       - name: Guest ABI and seL4 extensions (module), module tree
         run: tests/run-abitest.sh

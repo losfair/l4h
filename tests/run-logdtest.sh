@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# l4h-logd's failure paths (DESIGN.md §10.4): the last output before a
-# failure reaches the serial port when a component panics, logd faults or
-# root panics. The serial monitor injects them, in a host built with
-# L4H_TEST_INJECT=1.
+# l4h-logd and failures (DESIGN.md §10.4): logd prints the last output of a
+# component or of root that panics, and if logd itself faults, serial output
+# stops and the host goes on. The serial monitor injects them, in a host
+# built with L4H_TEST_INJECT=1.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 source "$root/tools/guest-env.sh"
@@ -46,15 +46,23 @@ wait_for "injected panic" 30
 wait_for "l4h-rt: component 0x200 aborted" 30
 printf 'help\r' >&3
 wait_for "monitor: help" 30
-# logd faults: root says so, and prints from then on.
+# logd faults: serial output stops, and the host goes on: a reset does not
+# wait for logd for ever. QEMU runs with -no-reboot, so the reset ends it.
 printf 'inject logd\r' >&3
-wait_for "l4h-root: component 0x600 fault" 30
+sleep 1
 printf 'info\r' >&3
-wait_for "monitor: 4 cores" 30
+sleep 2
+! grep -aq "monitor: 4 cores" "$log" || { echo "logd: output after logd faulted"; exit 1; }
+printf 'reboot\r' >&3
+end=$((SECONDS + 30))
+while kill -0 "$qemu" 2>/dev/null; do
+    [ "$SECONDS" -lt "$end" ] || { echo "logd: the host did not reset"; exit 1; }
+    sleep 0.5
+done
 stop
 
 boot
-# Root panics with logd running: it stops logd and prints what is left.
+# Root panics: it stops, and logd, a task of its own, prints its last words.
 printf 'info\r' >&3
 wait_for "monitor: 4 cores" 30
 printf 'inject root\r' >&3

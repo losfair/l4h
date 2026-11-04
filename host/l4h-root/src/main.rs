@@ -265,6 +265,8 @@ pub struct Host {
     pub vmmgr: Option<vmmgr::Vmmgr>,
     /// Partition 0's writer to the serial port.
     pub logd: Option<logd::Logd>,
+    /// The notification bound to root's TCB, which its timer signals.
+    pub ntfn: cap::Notification,
     /// One of several partitions: the channels to the others.
     pub channels: Option<channel::Channels>,
 }
@@ -337,10 +339,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     LOG.set_clock(rdtsc(), tsc_hz);
     host::log::init(&LOG, 0);
     host::serial::init(&SERIAL, 0);
-    sel4_root_task::panicking::set_hook(&|info| {
-        log!("l4h-root: {}", info);
-        logd::panicked();
-    });
+    sel4_root_task::panicking::set_hook(&|info| log!("l4h-root: {}", info));
     layout::guard_stack(bootinfo);
     layout::check_image(bootinfo);
     let cores = bootinfo.inner().numNodes as usize;
@@ -349,7 +348,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         bootinfo.sched_control().range().start,
     );
     info!("l4h-root: CPU physical cores {:?}", topology.physical());
-    let slots = Slots::new(slot::CNODE.cap(), SLOT_STORAGE.take(), logd::reserve(bootinfo, bootinfo.empty().range()));
+    let slots = Slots::new(slot::CNODE.cap(), SLOT_STORAGE.take(), bootinfo.empty().range());
     let mut alloc = Alloc::new(slots, ALLOC_STORAGE.take(), bootinfo);
     let total_bytes = alloc.free_bytes();
     info!("l4h-root: {} core(s), {} MiB free memory", cores, total_bytes >> 20);
@@ -369,8 +368,8 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     let module = |name: &str| modules.iter().find(|m| m.name == name).map(|m| m.data);
     partition::init(module("l4h-partition"));
     let cfg = config::Config::new(module("l4h-config"));
-    // The serial port is partition 0's. From here a panic prints on it.
-    let uart = if partition::secondary() { None } else { logd::init_uart(cfg.serial_port) };
+    // The serial port is partition 0's.
+    let uart = if partition::secondary() { None } else { logd::init_uart(&mut alloc, cfg.serial_port) };
     let image_frame = |va: usize| bootinfo.user_image_frames().index((va - layout::image_base()) / 4096).cap().bits();
     let serial_frames = match partition::serial_ring(&mut alloc, &mut devmem, &SERIAL) {
         Some(frames) => frames.start as u64,
@@ -517,19 +516,20 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         rtc,
         vmmgr: None,
         logd: None,
+        ntfn: wd_ntfn,
         channels: None,
     };
     h.scan_disks();
     // The serial port and its interrupt (an I/O APIC pin) are partition 0's.
     if !partition::secondary() {
-        h.monitor = uart.and_then(|port| monitor::Monitor::new(&mut h.alloc, &mut h.devmem, wd_ntfn, port, h.cfg.serial_port, h.cfg.serial_irq, &mut h.iommu));
+        h.monitor = uart.as_ref().and_then(|u| monitor::Monitor::new(&mut h.alloc, &mut h.devmem, wd_ntfn, u.monitor, h.cfg.serial_port, h.cfg.serial_irq, &mut h.iommu));
     }
     h.channels = channel::Channels::new(&mut h.alloc, &mut h.devmem, wd_ntfn, h.info.tsc_hz);
     h.dashboard = dashboard::Dashboard::new(bootinfo, &mut h.alloc, &mut h.devmem, h.cfg.fb_console);
     if !partition::secondary() {
         let rings = partition::Rings::new(&mut h.alloc, &mut h.devmem);
         let fb = h.dashboard.as_ref().and_then(|d| d.console_area());
-        logd::spawn(&mut h, &rings, fb);
+        logd::spawn(&mut h, uart, &rings, fb);
     }
 
     if module("guest-kernel").is_none() {
@@ -692,8 +692,12 @@ fn rdtsc() -> u64 {
 /// The root task's timer period: dashboard, IOMMU faults and watchdog.
 const TIMER_MS: u64 = 100;
 
-fn arm_timer(info: &HostInfo) {
-    let deadline = rdtsc() + info.tsc_hz * TIMER_MS / 1000;
+pub fn arm_timer(info: &HostInfo) {
+    set_timer(rdtsc() + info.tsc_hz * TIMER_MS / 1000);
+}
+
+/// Signal root's notification at `deadline`, replacing what was armed.
+pub fn set_timer(deadline: u64) {
     let tcb = slot::TCB.cap();
     sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_TCB_SetTimer(tcb.bits(), deadline, TIMER_BADGE));
 }
@@ -770,7 +774,6 @@ fn serve(h: &mut Host, reply_slot: ReplySlot) -> ! {
         let resp = if notified {
             if badge & TIMER_BADGE != 0 {
                 dashboard::Dashboard::tick(h);
-                logd::tick(h);
                 channel::tick(h);
                 trustd::tick(h);
                 h.iommu.poll();
@@ -811,7 +814,6 @@ fn component_call(h: &mut Host, badge: u64, info: &sel4::MessageInfo) -> Option<
         let fault = sel4::with_ipc_buffer(|b| sel4::Fault::new(b, info));
         log!("l4h-root: component {:#x} fault: {:x?}", id, fault);
         trustd::fault(h, id);
-        logd::fault(h, id);
         return None;
     }
     let reply = |v: u64| {
