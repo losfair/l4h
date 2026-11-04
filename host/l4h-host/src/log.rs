@@ -1,49 +1,32 @@
 //! Bounded host diagnostics shared by root and every host component.
 //!
-//! Writers format on their stack before claiming a slot. They never wait
-//! for another writer: a preempted or faulted writer can strand one slot,
-//! but cannot stop logging on the other slots. Readers skip unavailable
-//! records and report the gap. No allocation, IPC or seL4 invocation occurs.
+//! The slots are `ring`'s. Readers skip unavailable records and report the
+//! gap.
 
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering::SeqCst};
 
+use crate::ring::{self, Buf, Entry};
+
 pub const CAPACITY: usize = 256;
 pub const TEXT_SIZE: usize = 480;
+const WORDS: usize = TEXT_SIZE / 8;
 pub const VA: usize = 0x1002_0000;
 pub const PAGES: usize = core::mem::size_of::<Ring>() / 4096;
 pub const FRAME_RADIX: usize = PAGES.next_power_of_two().trailing_zeros() as usize;
-
-#[repr(C, align(64))]
-struct Slot {
-    // 0: unused; odd: being written; 2 * sequence + 2: committed.
-    state: AtomicU64,
-    len: AtomicU64,
-    text: [AtomicU64; TEXT_SIZE / 8],
-}
-
-impl Slot {
-    const fn new() -> Self {
-        Self { state: AtomicU64::new(0), len: AtomicU64::new(0), text: [const { AtomicU64::new(0) }; TEXT_SIZE / 8] }
-    }
-}
 
 /// Page-aligned so root can share these image frames without sharing any
 /// other root data. Its page-rounded size includes the final padding.
 #[repr(C, align(4096))]
 pub struct Ring {
-    head: AtomicU64,
     start_ticks: AtomicU64,
     hz: AtomicU64,
-    slots: [Slot; CAPACITY],
+    ring: ring::Ring<CAPACITY, WORDS>,
 }
 
 impl Ring {
     pub const fn new() -> Self {
-        Self {
-            head: AtomicU64::new(0), start_ticks: AtomicU64::new(0), hz: AtomicU64::new(0),
-            slots: [const { Slot::new() }; CAPACITY],
-        }
+        Self { start_ticks: AtomicU64::new(0), hz: AtomicU64::new(0), ring: ring::Ring::new() }
     }
 
     /// Root sets the common clock before starting any component.
@@ -58,24 +41,8 @@ impl Ring {
         let mut text = Text::new();
         let _ = write!(text, "[{:>6}.{:06}] [{:#x}] {}", us / 1_000_000, us % 1_000_000, source, args);
         text.finish();
-        let seq = self.head.fetch_add(1, SeqCst);
-        // Sequence exhaustion is not expected within a host's lifetime.
-        let Some(state) = seq.checked_add(1).and_then(|n| n.checked_mul(2)) else { return };
-        let slot = &self.slots[seq as usize % CAPACITY];
-        let old = slot.state.load(SeqCst);
-        if old & 1 != 0 || old >= state
-            || slot.state.compare_exchange(old, state - 1, SeqCst, SeqCst).is_err()
-        {
-            return;
-        }
-        // Atomic payload and sequential consistency make a reader's two
-        // state checks exclude torn records even on AArch64. A slot is
-        // never stolen from a writer that has not committed it yet.
-        for (dst, src) in slot.text.iter().zip(text.bytes.chunks_exact(8)) {
-            dst.store(u64::from_le_bytes(src.try_into().unwrap()), SeqCst);
-        }
-        slot.len.store(text.len as u64, SeqCst);
-        slot.state.store(state, SeqCst);
+        let seq = self.ring.claim(1);
+        self.ring.commit(seq, ticks, 0, text.len, &text.buf);
     }
 
     /// Read whole lines, without consuming them. `end == 0` snapshots the
@@ -83,30 +50,22 @@ impl Ring {
     /// that snapshot even while new messages arrive. Cursor 0 starts at
     /// boot; lost counts overwritten, dropped and not-yet-committed records.
     pub fn read(&self, cursor: u64, end: u64, out: &mut [u8]) -> Option<Read> {
-        let head = self.head.load(SeqCst);
+        let head = self.ring.head();
         let end = if end == 0 { head } else { end.min(head) };
         if cursor > end { return None; }
-        let mut next = cursor.max(head.saturating_sub(CAPACITY as u64)).min(end);
+        let mut next = cursor.max(self.ring.oldest()).min(end);
         let mut lost = next - cursor;
         let mut len = 0;
         while next < end {
-            let slot = &self.slots[next as usize % CAPACITY];
-            let state = (next + 1).checked_mul(2)?;
-            let mut bytes = [0; TEXT_SIZE];
-            let available = slot.state.load(SeqCst) == state;
-            let n = slot.len.load(SeqCst) as usize;
-            let available = available && n <= TEXT_SIZE;
-            if available {
-                for (dst, src) in bytes.chunks_exact_mut(8).zip(&slot.text) {
-                    dst.copy_from_slice(&src.load(SeqCst).to_le_bytes());
+            next.checked_add(1)?.checked_mul(2)?;
+            match self.ring.get(next) {
+                Entry::Ready(r) => {
+                    let text = r.text();
+                    if text.len() > out.len() - len { break; }
+                    out[len..len + text.len()].copy_from_slice(text);
+                    len += text.len();
                 }
-            }
-            if available && slot.state.load(SeqCst) == state {
-                if n > out.len() - len { break; }
-                out[len..len + n].copy_from_slice(&bytes[..n]);
-                len += n;
-            } else {
-                lost += 1;
+                _ => lost += 1,
             }
             next += 1;
         }
@@ -122,17 +81,17 @@ pub struct Read {
 }
 
 struct Text {
-    bytes: [u8; TEXT_SIZE],
+    buf: Buf<WORDS>,
     len: usize,
     truncated: bool,
 }
 
 impl Text {
     const SUFFIX: &str = " [truncated]\n";
-    fn new() -> Self { Self { bytes: [0; TEXT_SIZE], len: 0, truncated: false } }
+    fn new() -> Self { Self { buf: Buf::new(), len: 0, truncated: false } }
     fn finish(&mut self) {
         let suffix = if self.truncated { Self::SUFFIX.as_bytes() } else { b"\n" };
-        self.bytes[self.len..self.len + suffix.len()].copy_from_slice(suffix);
+        self.buf.bytes_mut()[self.len..self.len + suffix.len()].copy_from_slice(suffix);
         self.len += suffix.len();
     }
 }
@@ -142,7 +101,7 @@ impl Write for Text {
         if self.truncated { return Ok(()); }
         let mut n = s.len().min(TEXT_SIZE - Self::SUFFIX.len() - self.len);
         while !s.is_char_boundary(n) { n -= 1; }
-        self.bytes[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
+        self.buf.bytes_mut()[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
         self.len += n;
         self.truncated = n < s.len();
         Ok(())
@@ -244,8 +203,8 @@ mod tests {
     fn abandoned_writer_does_not_block_other_slots_or_readers() {
         let ring = ring();
         // Simulate a fault after claiming sequence 0 but before commit.
-        ring.head.store(1, SeqCst);
-        ring.slots[0].state.store(1, SeqCst);
+        ring.ring.head.store(1, SeqCst);
+        ring.ring.slots[0].state.store(1, SeqCst);
         for i in 1..=CAPACITY * 3 { ring.write(100, 0, format_args!("record {i}")); }
         let mut cursor = 0;
         let mut lost = 0;
@@ -259,7 +218,7 @@ mod tests {
         }
         assert_eq!(count, CAPACITY - 1);
         assert_eq!(lost + count as u64, (CAPACITY * 3 + 1) as u64);
-        assert_eq!(ring.slots[0].state.load(SeqCst), 1);
+        assert_eq!(ring.ring.slots[0].state.load(SeqCst), 1);
     }
 
     #[test]
@@ -290,7 +249,7 @@ mod tests {
             }
             cursor = r.next;
             lost += r.lost;
-            if writers.iter().all(|w| w.is_finished()) && cursor == ring.head.load(SeqCst) { break; }
+            if writers.iter().all(|w| w.is_finished()) && cursor == ring.ring.head() { break; }
             thread::yield_now();
         }
         for writer in writers { writer.join().unwrap(); }
