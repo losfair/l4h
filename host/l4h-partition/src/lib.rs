@@ -278,7 +278,7 @@ pub const CONSOLE_RING_HEADER: usize = 64;
 pub const CONSOLE_RING_SIZE: u64 = 64 << 10;
 
 /// Size of a serial ring, aligned to it.
-pub const SERIAL_RING_SIZE: u64 = 1 << 20;
+pub const SERIAL_RING_SIZE: u64 = 256 << 10;
 
 /// Size of a control channel: two message rings.
 pub const CHANNEL_SIZE: u64 = 256 << 10;

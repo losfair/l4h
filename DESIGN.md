@@ -2945,8 +2945,10 @@ a line.
              secondary kernels' console rings
 ```
 
-- **Serial ring** (`l4h_host::serial`). 4095 slots of 232 bytes, 1 MiB,
-  separate from the log ring so that console volume cannot push diagnostics
+- **Serial ring** (`l4h_host::serial`). 1023 slots of 232 bytes, 256 KiB,
+  room for a dom0 boot and no deeper, since a deep ring only makes output
+  later: a guest flood fills it, and everything waits behind that. Separate
+  from the log ring so that console volume cannot push diagnostics
   out of `l4hctl logs`. The slots are the log ring's (`l4h_host::ring`):
   writers format on their stack, claim, never wait and make no seL4 call. A
   line that does not fit takes consecutive slots, flagged as going on, and
