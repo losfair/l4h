@@ -2,7 +2,7 @@
 # l4h-logd and failures (DESIGN.md §10.4): logd prints the last output of a
 # component or of root that panics, and if logd itself faults, serial output
 # stops and the host goes on. The serial monitor injects them, in a host
-# built with L4H_TEST_INJECT=1.
+# built with L4H_TEST_INJECT=1. aarch64 has no reset to try.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 source "$root/tools/guest-env.sh"
@@ -53,12 +53,14 @@ sleep 1
 printf 'info\r' >&3
 sleep 2
 ! grep -aq "monitor: 4 cores" "$log" || { echo "logd: output after logd faulted"; exit 1; }
-printf 'reboot\r' >&3
-end=$((SECONDS + 30))
-while kill -0 "$qemu" 2>/dev/null; do
-    [ "$SECONDS" -lt "$end" ] || { echo "logd: the host did not reset"; exit 1; }
-    sleep 0.5
-done
+if [ "${L4H_ARCH:-x86_64}" != aarch64 ]; then
+    printf 'reboot\r' >&3
+    end=$((SECONDS + 30))
+    while kill -0 "$qemu" 2>/dev/null; do
+        [ "$SECONDS" -lt "$end" ] || { echo "logd: the host did not reset"; exit 1; }
+        sleep 0.5
+    done
+fi
 stop
 
 boot

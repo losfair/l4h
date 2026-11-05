@@ -1,7 +1,6 @@
 //! Spawning l4h-logd, the only host writer to the serial port (DESIGN.md
-//! §10.4): root issues the UART's port capability, hands it and the
-//! partitions' rings over, and prints nothing itself. If logd faults, serial
-//! output stops.
+//! §10.4): root hands it the UART and the partitions' rings, and prints
+//! nothing itself. If logd faults, serial output stops.
 
 use core::ops::Range;
 
@@ -10,7 +9,8 @@ use l4h_host::serial::{self, LogdConfig};
 use sel4::cap_type;
 
 use crate::{AsidPools, Host, HostInfo};
-use crate::component::{self, Component, SpawnArgs, abs_of, root_cap};
+use crate::component::{self, Component, SpawnArgs, abs_of};
+use crate::devmem::DevMem;
 use crate::mem::{Alloc, Arena, Slot};
 use crate::window::Window;
 
@@ -25,7 +25,8 @@ const PAGE: usize = 4096;
 const DRAIN_SECS: u64 = 2;
 const DRAIN_POLL_MS: u64 = 10;
 
-/// The port capabilities: the monitor's, and that of the port logd prints on.
+/// The UART: an I/O port capability each for the monitor and logd on x86,
+/// the frame of its registers on aarch64.
 pub struct Uart {
     pub monitor: u64,
     out: u64,
@@ -49,7 +50,7 @@ fn present(port: u64, base: u16) -> bool {
 /// kernel prints unless told otherwise: the setting is the monitor's too,
 /// and one can be wrong without losing the log.
 #[cfg(target_arch = "x86_64")]
-pub fn init_uart(alloc: &mut Alloc, base: u16) -> Option<Uart> {
+pub fn init_uart(alloc: &mut Alloc, _devmem: &mut DevMem, base: u16) -> Option<Uart> {
     const COM1: u16 = 0x3f8;
     let monitor = issue(alloc, base)?;
     if !present(monitor, base) && base != COM1 {
@@ -60,9 +61,12 @@ pub fn init_uart(alloc: &mut Alloc, base: u16) -> Option<Uart> {
     Some(Uart { monitor, out: monitor, out_base: base })
 }
 
-#[cfg(not(target_arch = "x86_64"))]
-pub fn init_uart(_alloc: &mut Alloc, _base: u16) -> Option<Uart> {
-    Some(Uart { monitor: 0, out: 0, out_base: 0 })
+/// The PL011 of QEMU's virt machine.
+#[cfg(target_arch = "aarch64")]
+pub fn init_uart(alloc: &mut Alloc, devmem: &mut DevMem, _base: u16) -> Option<Uart> {
+    const PL011: usize = 0x0900_0000;
+    let frame = devmem.frames(&mut alloc.slots, PL011, PAGE)?.start as u64;
+    Some(Uart { monitor: frame, out: frame, out_base: 0 })
 }
 
 /// logd as root keeps it.
@@ -93,14 +97,15 @@ pub fn spawn(
     rings: &crate::partition::Rings,
     fb: Option<FbArea>,
 ) -> Option<Logd> {
-    if !host::serial::LOGD || LOGD_ELF.is_empty() {
+    if LOGD_ELF.is_empty() {
         return None;
     }
     let fb_pages = fb.as_ref().map_or(0, |f| f.frames.len());
     let ring_pages = serial::MAX_RINGS * (serial::PAGES + l4h_partition::CONSOLE_RING_SIZE as usize / PAGE);
-    let keep_bits = (fb_pages + ring_pages).next_power_of_two().trailing_zeros() as usize;
+    let pages = fb_pages + ring_pages + 1;
+    let keep_bits = pages.next_power_of_two().trailing_zeros() as usize;
     let mut arena = alloc
-        .arena((4 << 20) + (32 << keep_bits) + ((fb_pages + ring_pages) / 512 + 8) * PAGE)
+        .arena((4 << 20) + (32 << keep_bits) + (pages / 512 + 8) * PAGE)
         .expect("memory for logd");
     let mut cfg = LogdConfig {
         tsc_hz: info.tsc_hz,
@@ -141,7 +146,8 @@ pub fn spawn(
         &args, alloc, &mut arena, win,
         &mut |alloc, vspace| asids.assign(alloc, vspace), &info.spawn_context(0),
     );
-    comp.give(serial::SLOT_UART, root_cap::<cap_type::Unspecified>(uart.out as usize), sel4::CapRights::all());
+    #[cfg(target_arch = "x86_64")]
+    comp.give(serial::SLOT_UART, crate::component::root_cap::<cap_type::Unspecified>(uart.out as usize), sel4::CapRights::all());
     let keep = arena.object_cap::<cap_type::CNode>(alloc, sel4::ObjectBlueprint::CNode { size_bits: keep_bits });
     let mut next = 0;
     let mut map = |alloc: &mut Alloc, arena: &mut Arena, frames: Range<Slot>, va: usize, attrs| {
@@ -163,6 +169,8 @@ pub fn spawn(
     if let Some(f) = fb {
         map(alloc, &mut arena, f.frames, serial::FB_VA, crate::dashboard::write_combining());
     }
+    #[cfg(target_arch = "aarch64")]
+    map(alloc, &mut arena, uart.out as Slot..uart.out as Slot + 1, serial::UART_VA, sel4::VmAttributes::EXECUTE_NEVER);
     component::start(&comp);
     Some(Logd { comp, _arena: arena })
 }

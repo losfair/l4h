@@ -33,7 +33,7 @@ pub struct Monitor {
 
 impl Monitor {
     #[cfg(target_arch = "x86_64")]
-    pub fn new(alloc: &mut Alloc, _devmem: &mut crate::devmem::DevMem, ntfn: sel4::cap::Notification, port: u64, base: u16, irq: u64, iommu: &mut crate::iommu::Iommu) -> Option<Self> {
+    pub fn new(alloc: &mut Alloc, ntfn: sel4::cap::Notification, port: u64, base: u16, irq: u64, iommu: &mut crate::iommu::Iommu) -> Option<Self> {
         use sel4::init_thread::slot;
         let abs = |s: usize| slot::CNODE.cap().absolute_cptr(sel4::init_thread::Slot::<cap_type::Null>::from_index(s).cap());
         let mut m = Self { port, base, irq: None, line: [0; LINE_MAX], len: 0 };
@@ -80,13 +80,12 @@ impl Monitor {
     }
 
     #[cfg(target_arch = "aarch64")]
-    pub fn new(alloc: &mut Alloc, devmem: &mut crate::devmem::DevMem, ntfn: sel4::cap::Notification, _port: u64, _base: u16, _irq: u64, _iommu: &mut crate::iommu::Iommu) -> Option<Self> {
+    pub fn new(alloc: &mut Alloc, ntfn: sel4::cap::Notification, frame: u64, _base: u16, _irq: u64, _iommu: &mut crate::iommu::Iommu) -> Option<Self> {
         use sel4::init_thread::slot;
         use sel4::{CapRights, VmAttributes};
         use crate::mem::ObjCtx;
         const UART_VA: usize = crate::layout::UART.base;
-        let frames = devmem.frames(&mut alloc.slots, 0x0900_0000, 4096)?;
-        crate::vspace::map_frame(&mut ObjCtx::global(alloc), slot::VSPACE.cap(), crate::devmem::granule(frames.start),
+        crate::vspace::map_frame(&mut ObjCtx::global(alloc), slot::VSPACE.cap(), crate::devmem::granule(frame as crate::mem::Slot),
             UART_VA, CapRights::read_write(), VmAttributes::EXECUTE_NEVER);
         let irq_slot = alloc.slots.alloc();
         let dst = crate::component::abs_of(sel4::init_thread::Slot::<cap_type::Null>::from_index(irq_slot).cap());

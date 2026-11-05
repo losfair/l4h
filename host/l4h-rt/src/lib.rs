@@ -75,8 +75,6 @@ pub fn print_log(args: core::fmt::Arguments<'_>, serial: bool) {
     host::log::record(args);
     if serial {
         host::serial::record(args);
-        #[cfg(not(target_arch = "x86_64"))]
-        sel4::debug_println!("{}", args); // no logd here yet
     }
 }
 
@@ -94,8 +92,6 @@ fn panic_flush() {
 /// What the panic machinery prints with.
 #[doc(hidden)]
 pub fn panic_put_char(c: u8) {
-    #[cfg(not(target_arch = "x86_64"))]
-    sel4::debug_put_char(c); // no logd here yet
     if c == b'\n' {
         return panic_flush();
     }

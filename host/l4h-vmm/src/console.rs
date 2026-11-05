@@ -97,13 +97,6 @@ impl Console {
             addr_of_mut!((*self.ring).head).write_volatile(head + 1);
         }
         if self.serial {
-            #[cfg(not(target_arch = "x86_64"))]
-            {
-                if self.line_start && self.source & host::serial::SOURCE_GUEST != 0 {
-                    sel4::debug_print!("[vm{}] ", self.source & !host::serial::SOURCE_GUEST); // no logd here yet
-                }
-                sel4::debug_put_char(c); // no logd here yet
-            }
             if c == b'\n' {
                 // The serial port ends lines itself.
                 let n = self.line_len - (self.line_len != 0 && self.line[self.line_len - 1] == b'\r') as usize;
