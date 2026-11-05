@@ -369,7 +369,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     partition::init(module("l4h-partition"));
     let cfg = config::Config::new(module("l4h-config"));
     // The serial port is partition 0's.
-    let uart = if partition::secondary() { None } else { logd::init_uart(&mut alloc, cfg.serial_port) };
+    let uart = if partition::secondary() { None } else { logd::init_uart(&mut alloc, &mut devmem, cfg.serial_port) };
     let image_frame = |va: usize| bootinfo.user_image_frames().index((va - layout::image_base()) / 4096).cap().bits();
     let serial_frames = match partition::serial_ring(&mut alloc, &mut devmem, &SERIAL) {
         Some(frames) => frames.start as u64,
@@ -529,7 +529,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     h.scan_disks();
     // The serial port and its interrupt (an I/O APIC pin) are partition 0's.
     if !partition::secondary() {
-        h.monitor = uart.as_ref().and_then(|u| monitor::Monitor::new(&mut h.alloc, &mut h.devmem, wd_ntfn, u.monitor, h.cfg.serial_port, h.cfg.serial_irq, &mut h.iommu));
+        h.monitor = uart.as_ref().and_then(|u| monitor::Monitor::new(&mut h.alloc, wd_ntfn, u.monitor, h.cfg.serial_port, h.cfg.serial_irq, &mut h.iommu));
     }
     h.channels = channel::Channels::new(&mut h.alloc, &mut h.devmem, wd_ntfn, h.info.tsc_hz);
 

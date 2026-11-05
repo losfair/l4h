@@ -284,6 +284,8 @@ jobs:
         run: tests/run-nettest.sh
       - name: Serial monitor
         run: tests/run-monitor.sh
+      - name: l4h-logd and failures
+        run: tests/run-logdtest.sh
       - name: CPU caps, steal time and dom0 restart
         run: tests/run-m6test.sh
       - name: Resource limits

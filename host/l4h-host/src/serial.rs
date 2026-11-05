@@ -20,10 +20,6 @@ use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering::SeqCst, comp
 
 use crate::ring::{self, Buf, Entry};
 
-/// Whether logd exists on this architecture; where it does not, host code
-/// still prints through the kernel.
-pub const LOGD: bool = cfg!(target_arch = "x86_64");
-
 /// Slots of `Ring`, which with its header makes exactly 256 KiB. A dom0 boot
 /// prints a few hundred lines. A deeper ring only makes output later: a
 /// full one takes up to 20 s to print at 115200 baud, 30 s where each byte
@@ -48,6 +44,8 @@ pub const RINGS_VA: usize = crate::SHARED_VA;
 pub const KERNEL_RINGS_VA: usize = crate::SHARED_VA + 0x1000_0000;
 pub const KERNEL_RING_STRIDE: usize = 1 << 20;
 pub const FB_VA: usize = crate::MMIO_VA;
+/// The UART's registers (aarch64).
+pub const UART_VA: usize = FB_VA + (1 << 30);
 /// The capability to the UART's I/O ports (x86).
 pub const SLOT_UART: u64 = crate::SLOT_FIRST_FREE;
 
@@ -55,6 +53,7 @@ pub const SLOT_UART: u64 = crate::SLOT_FIRST_FREE;
 #[repr(C)]
 pub struct LogdConfig {
     pub tsc_hz: u64,
+    /// The UART's first I/O port (x86).
     pub uart_base: u16,
     pub _pad: u16,
     /// Bit k: partition k's serial ring, and its kernel's console ring.
@@ -230,7 +229,7 @@ pub fn init(ring: &'static Ring, source: u32) {
 /// Print text of `source`, as `Ring::write`.
 pub fn write(source: u32, text: &[u8], more: bool) {
     let p = RING.load(SeqCst);
-    if LOGD && !p.is_null() {
+    if !p.is_null() {
         // init only accepts a mapping that lives for the process's lifetime.
         unsafe { &*p }.write(crate::ticks::now(), source, text, more);
     }
@@ -238,9 +237,6 @@ pub fn write(source: u32, text: &[u8], more: bool) {
 
 /// Print a message of this process as one line.
 pub fn record(args: fmt::Arguments<'_>) {
-    if !LOGD {
-        return;
-    }
     let mut m = Message { bytes: [0; MESSAGE_MAX], len: 0, truncated: false };
     let _ = m.write_fmt(args);
     write(SOURCE.load(SeqCst), m.finish(), false);

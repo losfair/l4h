@@ -5,28 +5,20 @@
 //!
 //! It runs above guest vCPUs and below their VMMs, with a small budget, and
 //! sleeps while the UART sends a burst, so it neither starves nor spins.
-//! Root issues the port capability and keeps the receive side.  If this
-//! task faults, serial output stops.
+//! Root gives it the port and keeps the receive side.  If this task faults,
+//! serial output stops.
 
 #![no_std]
 #![no_main]
 
+mod uart;
+
 use l4h_rt::host::font;
 use l4h_rt::host::serial::{self, LogdConfig, Merge, Ring};
-use l4h_rt::ioport::Ports;
 use l4h_rt::{Info, cap, host, sel4};
 
 l4h_rt::component!(main, no_heap);
 
-/// Line status register: the transmit FIFO, or holding register, is empty.
-const LSR: u16 = 5;
-const LSR_THRE: u8 = 0x20;
-/// FIFO control and interrupt identification registers.
-const FCR: u16 = 2;
-const IIR: u16 = 2;
-/// A 16550A's FIFO holds 16 bytes.  The kernel writes the port too, one
-/// byte at a time once it finds the FIFO empty: leave it room for that byte.
-const FIFO_BURST: usize = 15;
 /// A byte takes 87 us at 115200 baud.
 const BYTE_US: u64 = 90;
 /// How long to wait for a UART that does not get ready, in bursts.
@@ -45,43 +37,31 @@ fn sleep(ticks: u64) {
 }
 
 struct Uart {
-    ports: Ports,
-    present: bool,
-    burst: usize,
+    regs: uart::Regs,
+    /// None: the port is not there.
+    burst: Option<usize>,
     wait: u64,
 }
 
 impl Uart {
     fn new(cfg: &LogdConfig) -> Self {
-        let ports = Ports { cap: serial::SLOT_UART, base: cfg.uart_base };
-        // seL4 leaves the FIFO off. Unmapped ports read as all ones.
-        let present = ports.in8(LSR) != 0xff;
-        let mut burst = 1;
-        if present {
-            ports.out8(FCR, 0x07);
-            if ports.in8(IIR) & 0xc0 == 0xc0 {
-                burst = FIFO_BURST;
-            } else {
-                ports.out8(FCR, 0);
-            }
-        }
-        Uart { ports, present, burst, wait: BYTE_US * burst as u64 * (cfg.tsc_hz / 1_000_000) }
+        let regs = uart::Regs::new(cfg);
+        let burst = regs.open();
+        Uart { regs, burst, wait: BYTE_US * burst.unwrap_or(1) as u64 * (cfg.tsc_hz / 1_000_000) }
     }
 
     /// Send without spinning: a real UART takes 1.4 ms to send a burst,
     /// one in a VM often none at all.
     fn send(&self, bytes: &[u8]) {
-        if !self.present {
-            return;
-        }
-        for burst in bytes.chunks(self.burst) {
+        let Some(size) = self.burst else { return };
+        for burst in bytes.chunks(size) {
             let mut waits = 0;
-            while self.ports.in8(LSR) & LSR_THRE == 0 && waits < STUCK_WAITS {
+            while !self.regs.idle() && waits < STUCK_WAITS {
                 sleep(self.wait);
                 waits += 1;
             }
             for &c in burst {
-                self.ports.out8(0, c);
+                self.regs.put(c);
             }
         }
     }

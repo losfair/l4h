@@ -25,8 +25,6 @@ pub fn print_log(args: core::fmt::Arguments<'_>, serial: bool) {
     l4h_host::log::record(args);
     if serial {
         l4h_host::serial::record(args);
-        #[cfg(not(target_arch = "x86_64"))]
-        sel4::debug_println!("{}", args); // no logd here yet
     }
 }
 

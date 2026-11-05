@@ -2273,7 +2273,7 @@ whose components assume a static, Microkit-shaped system.
 | `l4h-netd` | 1 | Runs all L2 switches, guest ports and the virtio-net, gVNIC, ENA, X550 and ConnectX-5 uplink drivers. |
 | `l4h-trustd` | 1 | Maintains taint/seal flags; with a TPM, quotes its signing key and signs guests' reports (§10.2). |
 | `l4h-memd` | 1 | Owns free memory and every guest's RAM blocks; gives root and vmmgr memory for host objects; serves memory hotplug; reports free memory to the hypervisor (§8.4). |
-| `l4h-logd` | 1 (x86_64) | The only host writer to the serial port: prints every partition's serial ring and the other kernels' console rings, whole lines in one order (§10.4). |
+| `l4h-logd` | 1 | The only host writer to the serial port: prints every partition's serial ring and the other kernels' console rings, whole lines in one order (§10.4). |
 
 **No dynamic allocation.** Nothing a guest, dom0 or a device does may
 exhaust a host component's memory: a component that runs out cannot
@@ -2330,9 +2330,8 @@ are rare:
   verbose; they always go to the console rings `console_read` serves;
 - the serial monitor's replies and the opt-in watchdog dumps always print.
 
-aarch64 has no logd yet: host code there still prints through the kernel, a
-synchronous serial write for every byte. Those lines are marked, and
-`tests/check-debug-print.sh` keeps others from appearing.
+`tests/check-debug-print.sh` keeps host code from printing through the
+kernel, a synchronous serial write for every byte.
 
 **Host log.** Diagnostics from root, vmmgr, VMMs and device services also go
 to a shared, bounded log ring (`l4h_host::log`), including `info!` in
@@ -2923,8 +2922,7 @@ root.
 
 ### 10.4 Serial output: l4h-logd
 
-On x86_64, one task, l4h-logd, is the only host code that prints to the
-serial port. Lines cannot split, because one writer prints whole records.
+One task, l4h-logd, is the only host code that prints to the serial port. Lines cannot split, because one writer prints whole records.
 The kernel still prints boot messages and fatal errors to the port itself,
 so the guarantee covers host output only: a kernel message can land inside
 a line.
@@ -2951,8 +2949,10 @@ a line.
   from the log ring so that console volume cannot push diagnostics
   out of `l4hctl logs`. The slots are the log ring's (`l4h_host::ring`):
   writers format on their stack, claim, never wait and make no seL4 call. A
-  line that does not fit takes consecutive slots, flagged as going on, and
-  a reader prints them next to each other. Every task maps its partition's
+  writer that stalls in a commit keeps its slot until the writer of a later
+  lap takes it back, and then stops, at worst after one more store. A line
+  that does not fit takes consecutive slots, flagged as going on, and a
+  reader prints them next to each other. Every task maps its partition's
   ring at the same address.
 - **Writers.** `log!` and printing `info!` write this ring as well as the
   log ring. A VMM gathers its guest's console by line, and sends what it has
@@ -2963,14 +2963,20 @@ a line.
   (also in `l4h_host::serial`) prints the record with the lowest timestamp
   of any ring, then lines of kernel console rings. A record claimed and not
   committed gets 100 ms; `(N lines lost)` reports what was overwritten or
-  skipped. Each ring has 64 records of a pass, which bounds what a ring
-  claiming to hold the oldest record can do. logd turns on the 16550's FIFO,
-  which seL4 leaves off, and sends 15 bytes when it finds the FIFO empty,
-  leaving room for a byte of the kernel's, or one byte without a FIFO. It
-  sleeps on `seL4_TCB_SetTimer` while the UART sends, 1.4 ms at 115200 baud.
-  Root keeps the port's receive side and interrupt.
-- **Port.** logd uses the `serial_port` setting unless no UART answers
-  there: then COM1, where the kernel prints unless told otherwise.
+  skipped. Each ring has 64 records or reports of a pass, which bounds what
+  a ring claiming to hold the oldest record can do, and a pass ends only
+  when nothing is left to print. logd waits for the rest of a line only from
+  partition 0: a secondary could ask for 100 ms every time. logd turns on
+  the UART's FIFO, which seL4 leaves off on a 16550, and sends 15 bytes when
+  it finds the FIFO empty, leaving room for a byte of the kernel's, or one
+  byte without a FIFO. It sleeps on `seL4_TCB_SetTimer` while the UART
+  sends, 1.4 ms at 115200 baud. Root keeps the port's receive side and
+  interrupt.
+- **Port.** On x86_64, logd uses the `serial_port` setting unless no UART
+  answers there: then COM1, where the kernel prints unless told otherwise.
+  On aarch64 it is the PL011 of QEMU's virt machine, whose registers root
+  maps into logd as well as itself: MMIO needs no system call, and sending
+  and receiving use different registers.
 - **Secondary partitions** have no logd. Their ring is in the shared region,
   cleared by the shim and described in the partition descriptor. Partition
   0 does not trust that memory: slots are indexed modulo their number,
@@ -2983,8 +2989,8 @@ a line.
   keeps its own cursor there for what it still prints, so a kernel message
   can overwrite a line.
 
-Root issues the UART's port capability and spawns logd, and holds no
-logging logic of its own. Root outranks logd on its core, so during root's
+Root hands logd the UART and spawns it, and holds no logging logic of its
+own. Root outranks logd on its core, so during root's
 boot logd prints only when root waits or stops; a panic is printed, a loop
 that never yields is not:
 
