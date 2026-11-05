@@ -216,9 +216,9 @@ mod tests {
             cursor = r.next;
             if cursor == r.end { break; }
         }
-        assert_eq!(count, CAPACITY - 1);
+        // The next writer of that slot took it back.
+        assert_eq!(count, CAPACITY);
         assert_eq!(lost + count as u64, (CAPACITY * 3 + 1) as u64);
-        assert_eq!(ring.ring.slots[0].state.load(SeqCst), 1);
     }
 
     #[test]

@@ -2,9 +2,9 @@
 //! a bounded multi-writer ring of records, overwritten when full.
 //!
 //! Writers format on their stack before claiming a slot. They never wait
-//! for another writer: a preempted or faulted writer can strand one slot,
-//! but cannot stop logging on the other slots. Readers never block writers.
-//! No allocation, IPC or seL4 invocation occurs.
+//! for another writer: a preempted or faulted writer can lose its own
+//! record, and holds its slot for at most a lap of the ring. Readers never
+//! block writers. No allocation, IPC or seL4 invocation occurs.
 //!
 //! `Ring<N, W>` has N slots of W words of text. It lives in memory shared
 //! between tasks, and for `serial` between partitions that do not trust
@@ -103,27 +103,38 @@ impl<const N: usize, const W: usize> Ring<N, W> {
         self.head.fetch_add(n, SeqCst)
     }
 
-    /// Publish sequence `seq`, or drop the record if the slot is not ours
-    /// to take: a slot is never stolen from a writer that has not
-    /// committed it yet.
+    /// Publish sequence `seq`, or drop the record if a writer of the same
+    /// or a later lap has the slot. A writer of an earlier lap loses it, as
+    /// it would have if it had committed: its record is a lap old, and the
+    /// writer may be dead. If it is only slow, it sees that the slot is no
+    /// longer its own and stops; the worst it can do is one more store,
+    /// into a record that a reader will find whole but for that word.
     pub fn commit(&self, seq: u64, ticks: u64, meta: u64, len: usize, text: &Buf<W>) {
         // Sequence exhaustion is not expected within a host's lifetime.
         let Some(state) = seq.checked_add(1).and_then(|n| n.checked_mul(2)) else { return };
         let slot = &self.slots[(seq % N as u64) as usize];
-        let old = slot.state.load(SeqCst);
-        if old & 1 != 0 || old >= state
-            || slot.state.compare_exchange(old, state - 1, SeqCst, SeqCst).is_err()
-        {
+        let (mine, old) = (state - 1, slot.state.load(SeqCst));
+        if old >= mine || slot.state.compare_exchange(old, mine, SeqCst, SeqCst).is_err() {
             return;
         }
+        let ours = || slot.state.load(SeqCst) == mine;
         // Atomic payload and sequential consistency make a reader's two
         // state checks exclude torn records even on AArch64.
         for (dst, src) in slot.text.iter().zip(&text.0) {
+            if !ours() {
+                return;
+            }
             dst.store(*src, SeqCst);
         }
+        if !ours() {
+            return;
+        }
         slot.ticks.store(ticks, SeqCst);
+        if !ours() {
+            return;
+        }
         slot.meta.store(meta << 16 | len as u64, SeqCst);
-        slot.state.store(state, SeqCst);
+        let _ = slot.state.compare_exchange(mine, state, SeqCst, SeqCst);
     }
 
     /// Copy out the record of sequence `seq`, without consuming it.
