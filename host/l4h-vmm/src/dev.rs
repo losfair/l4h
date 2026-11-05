@@ -35,6 +35,8 @@ pub trait Backend {
     /// Process available buffers on queue `q`.  Returns true if buffers
     /// were returned to the driver.
     fn kick(&mut self, mem: &GuestMem, queues: &mut [Queue], q: usize) -> bool;
+    /// Notify the backend after all kicked queues have been submitted.
+    fn notify_submissions(&mut self) {}
     /// Backend completions arrived.  Returns true if buffers were returned.
     fn complete(&mut self, mem: &GuestMem, queues: &mut [Queue]) -> bool;
     /// Whether `complete` may have work: completions in the backend's
@@ -269,6 +271,7 @@ impl<B: Backend> Device<B> {
                 self.interrupt(mem, vcpus, q);
             }
         }
+        self.backend.notify_submissions();
     }
 
     /// A backend signalled completions, maybe this one.

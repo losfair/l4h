@@ -20,7 +20,7 @@
 #define JOBS 4
 static pthread_barrier_t barrier;
 static const char *device;
-static int depth, seconds, first_cpu, write_io;
+static int depth, seconds, first_cpu, write_io, submit_batch = 32;
 struct job { int id, error; uint64_t ops; double elapsed; };
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
 static void die(const char *s) { perror(s); exit(1); }
@@ -119,7 +119,9 @@ static void *run(void *arg) {
         }
         int submitted = 0;
         while (submitted < count) {
-            int n = io_submit(ctx, count - submitted, pending + submitted);
+            int batch = count - submitted;
+            if (batch > submit_batch) batch = submit_batch;
+            int n = io_submit(ctx, batch, pending + submitted);
             if (n <= 0) { fprintf(stderr, "io_submit: %d\n", n); exit(1); }
             submitted += n; active += n;
         }
@@ -140,7 +142,7 @@ static void *run(void *arg) {
     close(fd); free(data); free(requests); free(pending); free(events); return NULL;
 }
 int main(int argc, char **argv) {
-    if (argc < 3) { fprintf(stderr, "usage: blkbench read|write|check|verify PATH [jobs depth seconds first_cpu]\n       blkbench fsync|direct-fsync|fdatasync|metadata-fsync PATH seconds cpu\n"); return 2; }
+    if (argc < 3) { fprintf(stderr, "usage: blkbench read|write|check|verify PATH [jobs depth seconds first_cpu [submit_batch]]\n       blkbench fsync|direct-fsync|fdatasync|metadata-fsync PATH seconds cpu\n"); return 2; }
     device = argv[2];
     if (!strcmp(argv[1], "fsync") || !strcmp(argv[1], "direct-fsync") || !strcmp(argv[1], "fdatasync") || !strcmp(argv[1], "metadata-fsync")) {
         int duration = argc == 5 ? atoi(argv[3]) : 0;
@@ -151,16 +153,18 @@ int main(int argc, char **argv) {
     }
     int checking = !strcmp(argv[1], "check") || !strcmp(argv[1], "verify");
     write_io = !strcmp(argv[1], "write") || !strcmp(argv[1], "check");
-    int jobs = checking ? JOBS : argc == 7 ? atoi(argv[3]) : 0;
-    depth = checking ? 1 : argc == 7 ? atoi(argv[4]) : 0;
-    seconds = argc == 7 ? atoi(argv[5]) : 0;
-    first_cpu = argc == 7 ? atoi(argv[6]) : 0;
+    int jobs = checking ? JOBS : (argc == 7 || argc == 8) ? atoi(argv[3]) : 0;
+    depth = checking ? 1 : (argc == 7 || argc == 8) ? atoi(argv[4]) : 0;
+    seconds = (argc == 7 || argc == 8) ? atoi(argv[5]) : 0;
+    first_cpu = (argc == 7 || argc == 8) ? atoi(argv[6]) : 0;
+    if (argc == 8) submit_batch = atoi(argv[7]);
+    if (submit_batch < 1 || submit_batch > 32) return 2;
     if (jobs < 1 || jobs > JOBS || depth < 1 || depth > 32 || (!checking && (seconds < 1 || first_cpu < 0 || first_cpu + jobs > 4))) return 2;
     pthread_t threads[JOBS]; struct job state[JOBS] = {0};
     pthread_barrier_init(&barrier, NULL, jobs);
     for (int i = 0; i < jobs; i++) { state[i].id = i; if (pthread_create(&threads[i], NULL, checking ? check : run, &state[i])) die("pthread_create"); }
     double iops = 0;
     for (int i = 0; i < jobs; i++) { pthread_join(threads[i], NULL); if (state[i].error) { fprintf(stderr, "pattern mismatch job %d\n", i); return 1; } if (!checking) iops += state[i].ops / state[i].elapsed; }
-    printf("BLKBENCH: {\"op\":\"%s\",\"jobs\":%d,\"depth\":%d,\"cpu\":%d,\"iops\":%.1f,\"ok\":true}\n", argv[1], jobs, depth, first_cpu, iops);
+    printf("BLKBENCH: {\"op\":\"%s\",\"jobs\":%d,\"depth\":%d,\"submit_batch\":%d,\"cpu\":%d,\"iops\":%.1f,\"ok\":true}\n", argv[1], jobs, depth, submit_batch, first_cpu, iops);
     return 0;
 }

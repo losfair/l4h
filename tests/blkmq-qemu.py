@@ -20,7 +20,7 @@ parser.add_argument("--baseline", action="store_true")
 parser.add_argument("--guest-queues", type=int, choices=(1, 4), default=4)
 parser.add_argument("--scsi-queues", type=int, choices=(1, 4), default=4)
 parser.add_argument("--legacy", action="store_true")
-parser.add_argument("--suite", choices=("blkmq", "fsync"), default="blkmq")
+parser.add_argument("--suite", choices=("blkmq", "fsync", "crypt"), default="blkmq")
 parser.add_argument("--io-threads", type=int, choices=(0, 1, 4), default=0)
 parser.add_argument("--cache", choices=("writeback", "none"), default="writeback")
 parser.add_argument("--trace", type=Path)
@@ -33,7 +33,7 @@ env = dict(os.environ, L4H_MEM="2048", L4H_SMP="4", L4H_BALLOON="1")
 if args.fsync_hook:
     env["L4H_FSYNC_TRACE_LIBRARY"] = str(args.fsync_hook.resolve())
     env["L4H_FSYNC_TRACE_PATH"] = str(args.log.with_suffix(".host-fsync.jsonl").resolve())
-marker = "BLKMQ" if args.suite == "blkmq" else "FSYNC"
+marker = {"blkmq": "BLKMQ", "fsync": "FSYNC", "crypt": "CRYPT"}[args.suite]
 observations = []
 profile = None
 
@@ -85,7 +85,7 @@ with tempfile.TemporaryDirectory(prefix="l4h-blkmq-") as temp:
         vm = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT,
                               stdin=subprocess.DEVNULL)
         try:
-            deadline = time.monotonic() + (420 if args.suite == "fsync" else 240)
+            deadline = time.monotonic() + (420 if args.suite in ("fsync", "crypt") else 240)
             client = socket.socket(socket.AF_UNIX)
             while True:
                 try:
@@ -146,7 +146,17 @@ if not args.baseline:
         raise SystemExit("guest queue count regression")
     if args.guest_queues == 4 and f"virtio-scsi {args.scsi_queues} request queues" not in text:
         raise SystemExit("physical queue count regression")
-results = [json.loads(x) for x in re.findall(r"BLKBENCH: (\{[^\n]+\})", text)]
+results = []
+crypto_mode = None
+for line in text.splitlines():
+    if line.startswith("CRYPT_MODE: "):
+        crypto_mode = line.split(": ", 1)[1]
+    match = re.search(r"BLKBENCH: (\{[^\n]+\})", line)
+    if match:
+        row = json.loads(match[1])
+        if crypto_mode is not None:
+            row["crypto_mode"] = crypto_mode
+        results.append(row)
 args.log.with_suffix(".json").write_text(json.dumps(results, indent=2) + "\n")
 print(json.dumps({"pass": True, "suite": args.suite,
                   "affinity": any(x in text for x in ("BLKMQ: IRQ affinity accepted", "FSYNC: CPU1 IRQ affinity accepted")),

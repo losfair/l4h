@@ -110,6 +110,7 @@ struct Client {
     volatile: bool,
     done: sel4::cap::Notification,
     outstanding: usize,
+    notify_pending: bool,
 }
 
 /// A request in flight: its pieces have tags `t << 1` and `t << 1 | 1`
@@ -181,7 +182,7 @@ fn holds(clients: &[Option<Client>]) -> impl Fn(usize) -> Option<blk::Hold<'stat
 }
 
 impl Client {
-    fn respond(&self, id: u64, status: u32) {
+    fn respond(&mut self, id: u64, status: u32) {
         unsafe {
             let h = addr_of!((*self.chan).cq.head).read_volatile();
             addr_of_mut!((*self.chan).resps[h as usize % blk::RING_SIZE])
@@ -189,7 +190,7 @@ impl Client {
             fence(Ordering::Release);
             addr_of_mut!((*self.chan).cq.head).write_volatile(h.wrapping_add(1));
         }
-        self.done.signal();
+        self.notify_pending = true;
     }
 
     /// Map a request to its device requests: their sectors and segments,
@@ -218,6 +219,14 @@ impl Client {
 }
 
 impl Blkd {
+    fn notify_completions(&mut self) {
+        for &i in &self.active {
+            if let Some(c) = self.clients[i].as_mut() {
+                if core::mem::take(&mut c.notify_pending) { c.done.signal(); }
+            }
+        }
+    }
+
     fn reap(&mut self) -> Option<u32> {
         let Blkd { drv, pending, clients, .. } = self;
         let mut provision = None;
@@ -231,6 +240,7 @@ impl Blkd {
             }
             finish(&mut pending[..], &mut clients[..], (tag >> 1) as usize, status);
         });
+        self.notify_completions();
         provision
     }
 
@@ -250,6 +260,7 @@ impl Blkd {
         // ring cannot occupy every hardware slot before others get a turn.
         let n = self.active.len();
         for _round in 0..blk::RING_SIZE / 4 {
+            let mut progress = false;
             for off in 0..n {
                 let i = self.active[(self.next + off) % n];
                 let Some(c) = self.clients[i].as_mut() else { continue };
@@ -269,6 +280,7 @@ impl Blkd {
                         addr_of_mut!((*c.chan).sq.tail).write_volatile(tail.wrapping_add(1));
                         req
                     };
+                    progress = true;
                     let dev = &self.dev[c.unit];
                     let (sectors, n) = match c.prepare(&req, dev.block_size, &mut groups) {
                         // A flush the device or the attachment does not need.
@@ -303,9 +315,11 @@ impl Blkd {
                     }
                 }
             }
+            if !progress { break; }
         }
         self.next = if n == 0 { 0 } else { (self.next + 1) % n };
         if started { self.drv.kick(); }
+        self.notify_completions();
     }
 
     fn deadline(&self) -> u64 { host::ticks::now().saturating_add(5 * self.ticks_per_sec) }
@@ -459,7 +473,7 @@ fn main(info: &'static Info) -> ! {
                     match b.check(cfg, unit, start, count, n, ro != 0, dom0, order, extents) {
                         Ok((slot, vol, read_only)) if slot == i => {
                             b.clients[i] = Some(Client { chan, unit, pool, vol, read_only, volatile,
-                                done: cap::<cap_type::Notification>(blk::BLKD_SLOT_CLIENT_DONE + i as u64), outstanding: 0 });
+                                done: cap::<cap_type::Notification>(blk::BLKD_SLOT_CLIENT_DONE + i as u64), outstanding: 0, notify_pending: false });
                             // Not attached yet, so not in active.
                             let _ = b.active.push(i);
                             unsafe {

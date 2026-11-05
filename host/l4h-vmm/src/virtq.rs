@@ -28,6 +28,7 @@ pub struct Queue {
     used: u64,
     last_avail: u16,
     used_idx: u16,
+    published_used: u16,
 }
 
 #[derive(Debug)]
@@ -51,7 +52,7 @@ impl Queue {
         if !mem.valid(desc, 16 * n) || !mem.valid(avail, 6 + 2 * n) || !mem.valid(used, 6 + 8 * n) {
             return false;
         }
-        *self = Queue { ready: true, num: num as u16, desc, avail, used, last_avail: 0, used_idx: 0 };
+        *self = Queue { ready: true, num: num as u16, desc, avail, used, last_avail: 0, used_idx: 0, published_used: 0 };
         true
     }
 
@@ -123,12 +124,25 @@ impl Queue {
 
     /// Return a chain to the driver.
     pub fn push(&mut self, mem: &GuestMem, head: u16, written: u32) {
+        self.push_deferred(mem, head, written);
+        self.publish_used(mem);
+    }
+
+    /// Stage a completion; the caller publishes the whole batch before
+    /// checking interrupt suppression or returning to the event loop.
+    pub fn push_deferred(&mut self, mem: &GuestMem, head: u16, written: u32) {
         let slot = (self.used_idx % self.num) as u64;
         mem.write::<u32>(self.used + 4 + 8 * slot, head as u32);
         mem.write::<u32>(self.used + 8 + 8 * slot, written);
         self.used_idx = self.used_idx.wrapping_add(1);
-        fence(Ordering::Release);
-        mem.write::<u16>(self.used + 2, self.used_idx);
+    }
+
+    pub fn publish_used(&mut self, mem: &GuestMem) {
+        if self.published_used != self.used_idx {
+            fence(Ordering::Release);
+            mem.write::<u16>(self.used + 2, self.used_idx);
+            self.published_used = self.used_idx;
+        }
     }
 
     pub fn used_idx(&self) -> u16 {
