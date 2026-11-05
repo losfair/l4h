@@ -92,9 +92,13 @@ impl LogdConfig {
 /// The longest message `record` keeps, as consecutive records.
 const MESSAGE_MAX: usize = 1024;
 /// What one ring can take of a pass: a ring that always claims to have
-/// the oldest record delays others by this much, and no more. Reports of
-/// what it lost count too.
+/// the oldest record delays others by this much, and no more, apart from
+/// `LINE_RECORDS`. Reports of what it lost count too.
 const PASS_RECORDS: u32 = 64;
+/// What a ring keeps of its share for the rest of a line it has started:
+/// the records of the longest message. Longer lines can split where a pass
+/// ends, or a line without an end would have no bound.
+const LINE_RECORDS: u32 = MESSAGE_MAX.div_ceil(TEXT_SIZE) as u32;
 const KERNEL_LINE_MAX: usize = 160;
 /// A line handed out: its text and what `next` puts around it.
 pub const LINE_MAX: usize = if TEXT_SIZE > KERNEL_LINE_MAX { TEXT_SIZE } else { KERNEL_LINE_MAX } + 48;
@@ -337,7 +341,7 @@ impl Merge {
     /// Add secondary partition k's ring (`partition` is k), or partition
     /// 0's for k = 0.
     pub fn add_ring(&mut self, k: usize, ring: &'static Ring, partition: Option<u32>) {
-        self.inputs[k] = Some(Input { ring, partition, cursor: 0, lost: 0, deadline: None, budget: PASS_RECORDS });
+        self.inputs[k] = Some(Input { ring, partition, cursor: 0, lost: 0, deadline: None, budget: PASS_RECORDS + LINE_RECORDS });
     }
 
     /// Add the console ring of partition k's kernel.
@@ -366,7 +370,7 @@ impl Merge {
 
     fn begin_pass(&mut self) {
         for i in self.inputs.iter_mut().flatten() {
-            i.budget = PASS_RECORDS;
+            i.budget = PASS_RECORDS + LINE_RECORDS;
         }
         for i in self.kernels.iter_mut().flatten() {
             i.budget = PASS_RECORDS;
@@ -396,7 +400,7 @@ impl Merge {
         let (mut hold, mut continues) = (false, false);
         for (k, slot) in self.inputs.iter_mut().enumerate() {
             let Some(i) = slot else { continue };
-            if i.budget == 0 {
+            if i.budget <= if open == Some(k) { 0 } else { LINE_RECORDS } {
                 continue;
             }
             let peek = i.peek(now, self.grace);
@@ -414,6 +418,8 @@ impl Merge {
                     let rest = self.open == Some((k, (r.meta >> SOURCE_SHIFT) as u32));
                     if rest {
                         continues = true;
+                    } else if i.budget <= LINE_RECORDS {
+                        continue;
                     }
                     if rest || !continues && best.as_ref().is_none_or(|(_, b)| r.ticks < b.ticks) {
                         best = Some((k, r));
@@ -506,12 +512,14 @@ impl Input {
     /// The record at the cursor, skipping and counting what cannot be
     /// read: at most the ring's capacity, however wrong it is.
     fn peek(&mut self, now: u64, grace: u64) -> Peek {
+        // A secondary can change this at any time: everything below comes
+        // from this one read, which bounds the scan to the ring's capacity.
         let head = self.ring.head();
         // Only a secondary whose memory went wrong moves its head back.
         if self.cursor > head {
             self.cursor = head;
         }
-        let oldest = self.ring.ring.oldest();
+        let oldest = head.saturating_sub(CAPACITY as u64);
         if self.cursor < oldest {
             self.lost += oldest - self.cursor;
             self.cursor = oldest;
@@ -879,6 +887,83 @@ mod tests {
         home.ring.slots[0].state.store(2 * CAPACITY as u64 + 1, SeqCst);
         home.ring.commit(0, 1, 0, 0, &Buf::new());
         assert_eq!(home.ring.slots[0].state.load(SeqCst), 2 * CAPACITY as u64 + 1);
+    }
+
+    #[test]
+    fn a_head_that_changes_between_reads_cannot_stop_the_reader() {
+        let (home, other) = (ring(), ring());
+        let mut m = Merge::new(home, GRACE);
+        m.add_ring(1, other, Some(1));
+        home.write(5, 0, b"home", false);
+        let stop: &'static AtomicU64 = std::boxed::Box::leak(Box::new(AtomicU64::new(0)));
+        let attacker = thread::spawn(move || {
+            while stop.load(SeqCst) == 0 {
+                other.ring.head.store(u64::MAX, SeqCst);
+                other.ring.head.store((1 << 63) + 2 * CAPACITY as u64, SeqCst);
+            }
+        });
+        let (done, finished) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let start = std::time::Instant::now();
+            while start.elapsed().as_secs() < 1 {
+                m.pass(|| 0, |_| {});
+            }
+            let _ = done.send(());
+        });
+        let result = finished.recv_timeout(std::time::Duration::from_secs(20));
+        stop.store(1, SeqCst);
+        attacker.join().unwrap();
+        result.expect("the reader stopped");
+    }
+
+    #[test]
+    fn a_line_is_not_split_where_its_ring_runs_out_of_budget() {
+        let (home, other) = (ring(), ring());
+        let mut m = Merge::new(home, GRACE);
+        m.add_ring(1, other, Some(1));
+        for i in 0..PASS_RECORDS - 1 {
+            home.write(1, 0, std::format!("record {i}").as_bytes(), false);
+        }
+        let long = "x".repeat(TEXT_SIZE + 10);
+        home.write(2, 0, long.as_bytes(), false);
+        other.write(3, 0, b"other", false);
+        let text = drain(&mut m, 10);
+        assert!(text.contains(&std::format!("\n{long}\r\n")), "{text}");
+        assert!(text.ends_with("[p1] other\r\n"), "{text}");
+    }
+
+    #[test]
+    fn the_longest_message_is_not_split_where_its_ring_runs_out_of_budget() {
+        let (home, other) = (ring(), ring());
+        let mut m = Merge::new(home, GRACE);
+        m.add_ring(1, other, Some(1));
+        for i in 0..PASS_RECORDS - 1 {
+            home.write(1, 0, std::format!("record {i}").as_bytes(), false);
+        }
+        let long = "x".repeat(MESSAGE_MAX);
+        home.write(2, 0, long.as_bytes(), false);
+        other.write(3, 0, b"other", false);
+        assert!(drain(&mut m, 10).contains(&std::format!("\n{long}\r\n")));
+    }
+
+    #[test]
+    fn a_line_without_an_end_cannot_keep_a_ring_going_past_its_reserve() {
+        let (home, other) = (ring(), ring());
+        let mut m = Merge::new(home, GRACE);
+        m.add_ring(1, other, Some(1));
+        for _ in 0..1000 {
+            other.write(0, 0, b"x", true);
+        }
+        home.write(5, 0, b"home", false);
+        let (mut line, mut before) = (Line::new(), 0);
+        loop {
+            assert!(m.next(10, &mut line));
+            if line.bytes().ends_with(b"home\r\n") {
+                break;
+            }
+            before += 1;
+        }
+        assert_eq!(before, PASS_RECORDS + LINE_RECORDS);
     }
 
     #[test]
