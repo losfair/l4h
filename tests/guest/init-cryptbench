@@ -1,0 +1,49 @@
+#!/bin/sh
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mkdir -p /dev/mapper
+fail() { echo "CRYPT: FAIL: $*"; poweroff -f; }
+[ -b /dev/vda ] || fail 'no disposable disk'
+# Public fixture key, never used on a node or a user disk.
+key=$(printf '%0128d' 1234)
+sectors=$(cat /sys/block/vda/size)
+first=1
+for mode in default read write both; do
+    case "$mode" in
+        default) flags='' ;;
+        read) flags='1 no_read_workqueue' ;;
+        write) flags='1 no_write_workqueue' ;;
+        both) flags='2 no_read_workqueue no_write_workqueue' ;;
+    esac
+    printf '0 %s crypt aes-xts-plain64 %s 0 /dev/vda 0 %s\n' "$sectors" "$key" "$flags" |
+        dmsetup create cryptbench --noudevsync --noudevrules || fail mapping
+    dmsetup mknodes cryptbench || fail mknodes
+    if [ "$first" = 1 ]; then
+        /bin/mke2fs -q -t ext4 -F -b 4096 -E lazy_itable_init=0,lazy_journal_init=0 /dev/mapper/cryptbench || fail mkfs
+    fi
+    mount -t ext4 -o noatime /dev/mapper/cryptbench /mnt || fail mount
+    if [ "$first" = 1 ]; then
+        dd if=/dev/zero of=/mnt/io bs=1M count=32 conv=fsync 2>/dev/null || fail allocate
+        first=0
+    else
+        blkbench verify /mnt/io || fail 'data across workqueue changes'
+    fi
+    echo "CRYPT_MODE: $mode"
+    for op in read write; do
+        for batch in 1 32; do
+            echo "BLKPHASE: BEGIN $mode $op batch$batch"
+            blkbench "$op" /mnt/io 2 32 5 0 "$batch" || fail "$mode $op"
+            echo "BLKPHASE: END $mode $op batch$batch"
+        done
+    done
+    for cpu in 0 1; do
+        blkbench fsync /mnt/io 4 "$cpu" || fail "$mode fsync"
+    done
+    blkbench check /mnt/io || fail 'encrypted data check'
+    umount /mnt || fail unmount
+    dmsetup remove cryptbench --noudevsync --noudevrules || fail unmap
+done
+cat /proc/interrupts
+echo 'CRYPT: PASS'
+poweroff -f

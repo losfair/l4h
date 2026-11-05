@@ -13,6 +13,7 @@ use crate::guest::GuestMem;
 use crate::host::blk::{self as chan, Channel, Resp};
 use crate::virtq::Queue;
 
+thread_local! { pub static BACKEND_NOTIFICATIONS: RefCell<usize> = const { RefCell::new(0) }; }
 thread_local! { pub static IRQ_EVENTS: RefCell<Vec<(usize, u32)>> = const { RefCell::new(Vec::new()) }; }
 
 /// The fake blkd: the channel and the requests it took but has not
@@ -410,4 +411,26 @@ fn device_resumes_unpopped_queues_after_flush_without_another_guest_kick() {
     assert!(!f.device.backend.pending());
     for q in 0..3 { assert_eq!(f.mem.read::<u16>(POOL + q * 0x8000 + 0x2002), 1); }
     IRQ_EVENTS.with_borrow(|events| assert_eq!(events.as_slice(), &[(0, 96), (1, 97), (2, 98)]));
+}
+
+#[test]
+fn completion_batch_is_visible_even_when_one_queue_suppresses_interrupts() {
+    let mut f = DeviceFixture::new(&[chan::OP_READ, chan::OP_READ]);
+    f.mem.write::<u16>(POOL + 0x1000, 1); // VRING_AVAIL_F_NO_INTERRUPT
+    let ids = [f.channel.reqs[0].id, f.channel.reqs[1].id];
+    for id in ids { reply(&mut f.channel, id); }
+    f.device.complete(&f.mem, &f.vcpus);
+    for q in 0..2 {
+        assert_eq!(f.mem.read::<u16>(POOL + q * 0x8000 + 0x2002), 1);
+        assert_eq!(f.mem.read::<u32>(POOL + q * 0x8000 + 0x2004), 0);
+    }
+    IRQ_EVENTS.with_borrow(|events| assert_eq!(events.as_slice(), &[(1, 97)]));
+}
+
+#[test]
+fn polling_multiple_queues_notifies_the_backend_once() {
+    BACKEND_NOTIFICATIONS.with_borrow_mut(|n| *n = 0);
+    let f = DeviceFixture::new(&[chan::OP_READ, chan::OP_READ]);
+    assert_eq!(f.channel.sq.head, 2);
+    BACKEND_NOTIFICATIONS.with_borrow(|n| assert_eq!(*n, 1));
 }

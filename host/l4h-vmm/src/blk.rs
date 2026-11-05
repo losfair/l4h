@@ -63,6 +63,7 @@ pub struct Blk {
     /// Requests submitted to blkd, by queue and chain head.
     inflight: [[Option<Inflight>; QUEUE_SIZE as usize]; MAX_QUEUES],
     nr_queues: usize,
+    kick_pending: bool,
     /// Requests of this generation blkd has not completed yet.
     outstanding: usize,
     /// Bumped on reset, so completions of earlier requests are dropped.
@@ -82,7 +83,7 @@ impl Blk {
         Blk {
             chan: core::ptr::null_mut(), kick: None, capacity: 0, read_only: true, volatile: false,
             block_size: 512, size_max: size_max(pool),
-            inflight: [[None; QUEUE_SIZE as usize]; MAX_QUEUES], nr_queues: 1,
+            inflight: [[None; QUEUE_SIZE as usize]; MAX_QUEUES], nr_queues: 1, kick_pending: false,
             outstanding: 0, generation: 0, stalled: [None; MAX_QUEUES],
             fence: None, flush_inflight: false, deferred: 0,
         }
@@ -111,6 +112,7 @@ impl Blk {
             size_max: size_max(pool).max(block_size),
             inflight: [[None; QUEUE_SIZE as usize]; MAX_QUEUES],
             nr_queues: MAX_QUEUES,
+            kick_pending: false,
             outstanding: 0,
             generation: 0,
             stalled: [None; MAX_QUEUES], fence: None, flush_inflight: false, deferred: 0,
@@ -128,7 +130,7 @@ impl Blk {
     /// Complete a chain locally with `status`.
     fn finish(mem: &GuestMem, q: &mut Queue, head: u16, status_gpa: u64, status: u8, written: u32) {
         mem.write::<u8>(status_gpa, status);
-        q.push(mem, head, written);
+        q.push_deferred(mem, head, written);
     }
 
     /// The response `id` of this generation arrived: the request it
@@ -175,7 +177,7 @@ impl Blk {
                 Some(b) if ok && b.write && b.len >= 1 => {
                     Self::finish(mem, q, head, b.gpa + b.len as u64 - 1, VIRTIO_BLK_S_IOERR, 1)
                 }
-                _ => q.push(mem, head, 0),
+                _ => q.push_deferred(mem, head, 0),
             }
             return true;
         }
@@ -348,9 +350,16 @@ impl Backend for Blk {
             if self.fence.is_some() { self.deferred |= bit; break; }
         }
         if submitted {
+            self.kick_pending = true;
+        }
+        queue.publish_used(mem);
+        returned
+    }
+
+    fn notify_submissions(&mut self) {
+        if core::mem::take(&mut self.kick_pending) {
             self.kick.as_ref().expect("live block backend").signal();
         }
-        returned
     }
 
     fn complete(&mut self, mem: &GuestMem, queues: &mut [Queue]) -> bool {
@@ -367,6 +376,9 @@ impl Backend for Blk {
                 returned |= self.response(mem, queues, resp, None);
             }
         }
+        for (q, queue) in queues.iter_mut().enumerate().take(self.nr_queues) {
+            if returned & (1 << q) != 0 { queue.publish_used(mem); }
+        }
         returned != 0
     }
 
@@ -382,6 +394,7 @@ impl Backend for Blk {
     }
 
     fn drain(&mut self) {
+        self.notify_submissions();
         self.stalled = [None; MAX_QUEUES];
         self.fence = None;
         self.flush_inflight = false;
@@ -406,6 +419,7 @@ impl Backend for Blk {
     }
 
     fn drain_queue(&mut self, mem: &GuestMem, queues: &mut [Queue], q: usize) -> u64 {
+        self.notify_submissions();
         self.stalled[q] = None;
         self.deferred &= !(1 << q);
         let mut completed = 0;
@@ -423,6 +437,9 @@ impl Backend for Blk {
             }
         }
         if self.fence == Some(q) { self.fence = None; self.flush_inflight = false; }
+        for (q, queue) in queues.iter_mut().enumerate().take(self.nr_queues) {
+            if completed & (1 << q) != 0 { queue.publish_used(mem); }
+        }
         self.generation = self.generation.wrapping_add(1);
         completed
     }

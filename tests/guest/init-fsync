@@ -2,6 +2,7 @@
 mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
+duration=${BLKBENCH_SECONDS:-8}
 fail() { echo "FSYNC: FAIL: $*"; poweroff -f; }
 echo "FSYNC: start $(uname -r)"
 [ -b /dev/vda ] || fail 'no disposable disk'
@@ -11,14 +12,17 @@ for op in read write; do
     for spec in '2 32' '4 16'; do
         echo "BLKPHASE: BEGIN $op $spec"
         usleep 250000
-        blkbench "$op" /dev/vda $spec 8 0 || fail "$op $spec"
+        for batch in 1 32; do
+            echo "FSYNC_BATCH: $op $spec submit=$batch"
+            blkbench "$op" /dev/vda $spec "$duration" 0 "$batch" || fail "$op $spec batch$batch"
+        done
         echo "BLKPHASE: END $op $spec"
         usleep 250000
     done
 done
 for cpu in 0 1; do
     for op in fsync direct-fsync; do
-        blkbench "$op" /dev/vda 8 "$cpu" || fail "$op raw cpu$cpu"
+        blkbench "$op" /dev/vda "$duration" "$cpu" || fail "$op raw cpu$cpu"
     done
 done
 blkbench check /dev/vda || fail 'parallel data check'
@@ -30,10 +34,10 @@ mount -t ext4 -o noatime /dev/vda /mnt || fail mount
 dd if=/dev/zero of=/mnt/test.bin bs=1M count=16 conv=fsync 2>/dev/null || fail 'file allocation'
 grep ' /mnt ' /proc/mounts
 for cpu in 0 1; do
-    blkbench fsync /mnt/test.bin 8 "$cpu" || fail "fsync ext4 cpu$cpu"
+    blkbench fsync /mnt/test.bin "$duration" "$cpu" || fail "fsync ext4 cpu$cpu"
 done
-blkbench fdatasync /mnt/test.bin 8 1 || fail 'fdatasync ext4'
-blkbench metadata-fsync /mnt/test.bin 8 1 || fail 'metadata fsync ext4'
+blkbench fdatasync /mnt/test.bin "$duration" 1 || fail 'fdatasync ext4'
+blkbench metadata-fsync /mnt/test.bin "$duration" 1 || fail 'metadata fsync ext4'
 irq=$(awk '/virtio0-q1/ {q=$1} /virtio0$/ {s=$1} END {gsub(":", "", q); gsub(":", "", s); print q ? q : s}' /proc/interrupts)
 [ -n "$irq" ] || fail 'no block IRQ'
 old=$(cat /proc/irq/$irq/smp_affinity_list)
@@ -43,12 +47,12 @@ if echo 1 > /proc/irq/$irq/smp_affinity_list; then
     echo "FSYNC: CPU1 IRQ affinity accepted"
     mv /mnt/test.bin /mnt/affinity.bin || fail rename
     sync
-    blkbench fsync /mnt/affinity.bin 8 1 || fail 'fsync aligned IRQ'
+    blkbench fsync /mnt/affinity.bin "$duration" 1 || fail 'fsync aligned IRQ'
     awk -v irq="$irq:" '$1 == irq {print "FSYNC_IRQ:", $0}' /proc/interrupts
     echo "$old" > /proc/irq/$irq/smp_affinity_list || fail 'restore IRQ'
     mv /mnt/affinity.bin /mnt/restored.bin || fail rename
     sync
-    blkbench fsync /mnt/restored.bin 8 1 || fail 'fsync restored IRQ'
+    blkbench fsync /mnt/restored.bin "$duration" 1 || fail 'fsync restored IRQ'
     awk -v irq="$irq:" '$1 == irq {print "FSYNC_IRQ:", $0}' /proc/interrupts
 else
     echo "FSYNC: IRQ affinity unsupported"

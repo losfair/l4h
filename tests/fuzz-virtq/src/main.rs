@@ -61,7 +61,7 @@ pub mod sel4 {
     pub mod cap {
         pub struct Notification;
         impl Notification {
-            pub fn signal(&self) {}
+            pub fn signal(&self) { crate::blkcheck::BACKEND_NOTIFICATIONS.with_borrow_mut(|n| *n += 1); }
         }
     }
 }

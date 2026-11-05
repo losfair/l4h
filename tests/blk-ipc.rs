@@ -78,7 +78,7 @@ pub mod sel4 {
             self.recv(reply)
         }
     }
-    impl Cap<cap_type::Notification> { pub fn signal(self) {} }
+    impl Cap<cap_type::Notification> { pub fn signal(self) { crate::KERNEL.with_borrow_mut(|k| k.signals += 1); } }
     impl Cap<cap_type::IrqHandler> { pub fn irq_handler_ack(self) -> Result<(), ()> { Ok(()) } }
 }
 
@@ -107,6 +107,7 @@ struct Kernel {
     retry: bool,
     status: u32,
     kicks: usize,
+    signals: usize,
     /// Requests the mock device holds at once.
     room: usize,
     /// Started requests: tag, sector, bytes.
@@ -115,7 +116,7 @@ struct Kernel {
 thread_local! {
     static KERNEL: RefCell<Kernel> = RefCell::new(Kernel {
         ipc: sel4::IpcBuffer([0; 120]), requests: VecDeque::new(), replies: Vec::new(),
-        retry: false, status: 0, kicks: 0, room: usize::MAX, started: Vec::new(),
+        retry: false, status: 0, kicks: 0, signals: 0, room: usize::MAX, started: Vec::new(),
     });
 }
 
@@ -290,4 +291,35 @@ fn a_split_request_waits_for_room_and_drains_on_remove() {
         assert_eq!(k.started, [(0, 49144, 4096), (1, 8192, 4096)]);
     });
     assert_eq!((cq, resp.id, resp.status), (1, 7, blk::STATUS_OK));
+}
+
+#[test]
+fn completion_batch_wakes_the_client_once_and_returns_every_request() {
+    let _lock = LOCK.lock().unwrap();
+    map_client();
+    unsafe {
+        (*channel()).pool = blk::Pool { gpa: 0x8000000, paddr: 0x10000000, size: 4096 };
+        for i in 0..4 {
+            (*channel()).reqs[i] = blk::Req { id: i as u64, op: blk::OP_READ, nr_segs: 1, ..Default::default() };
+            (*channel()).reqs[i].segs[0] = blk::Seg { gpa: 0x8000000, len: 512, flags: blk::SEG_WRITE };
+        }
+        (*channel()).sq.head = 4;
+    }
+    KERNEL.with_borrow_mut(|k| {
+        k.ipc.0.fill(0);
+        k.requests = [(blk::BLKD_ADD, [0; 6], false), (blk::BLKD_REMOVE, [0; 6], false)].into();
+        k.replies.clear();
+        (k.retry, k.status, k.kicks, k.signals, k.room) = (false, 0, 0, 0, usize::MAX);
+        k.started.clear();
+    });
+    let config: BlkdConfig = unsafe { core::mem::zeroed() };
+    let info = Box::leak(Box::new(Info { header: Header { id: 1, tsc_hz: 1_000_000_000 }, config }));
+    let stopped = std::panic::catch_unwind(|| production::run(info)).unwrap_err();
+    assert!(stopped.is::<Finished>());
+    unsafe {
+        assert_eq!((*channel()).cq.head, 4);
+        for i in 0..4 { assert_eq!(((*channel()).resps[i].id, (*channel()).resps[i].status), (i as u64, blk::STATUS_OK)); }
+    }
+    unmap_client();
+    KERNEL.with_borrow(|k| { assert_eq!(k.started.len(), 4); assert_eq!(k.signals, 1); });
 }
