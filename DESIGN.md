@@ -2968,12 +2968,14 @@ a line.
   when nothing is left to print. It has 5 more for the rest of a line it
   has started, the length of the longest message; a longer line can split
   where a pass ends. logd waits for the rest of a line only from
-  partition 0: a secondary could ask for 100 ms every time. logd turns on
+  partition 0: a secondary could ask for 100 ms every time, and another
+  ring's `(N lines lost)` waits for the end of a line. logd turns on
   the UART's FIFO, which seL4 leaves off on a 16550, and sends 15 bytes when
   it finds the FIFO empty, leaving room for a byte of the kernel's, or one
   byte without a FIFO. It sleeps on `seL4_TCB_SetTimer` while the UART
-  sends, 1.4 ms at 115200 baud. Root keeps the port's receive side and
-  interrupt.
+  sends, 1.4 ms at 115200 baud, and a record only counts as printed once
+  its last byte has left the shift register. Root keeps the port's receive
+  side and interrupt.
 - **Port.** On x86_64, logd uses the `serial_port` setting unless no UART
   answers there: then COM1, where the kernel prints unless told otherwise.
   On aarch64 it is the PL011 of QEMU's virt machine, whose registers root

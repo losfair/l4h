@@ -1,6 +1,6 @@
 //! The registers of the port logd sends on. Root keeps the receive side.
 
-use l4h_rt::host::serial::{self, LogdConfig};
+use l4h_rt::host::serial::{self, LogdConfig, Port};
 
 /// A 16550A's FIFO, and an older PL011's, hold 16 bytes. The kernel writes
 /// the port too: leave it room for a byte.
@@ -11,9 +11,11 @@ pub struct Regs(l4h_rt::ioport::Ports);
 
 #[cfg(target_arch = "x86_64")]
 impl Regs {
-    /// Line status register: the transmit FIFO, or holding register, is empty.
+    /// Line status register: the transmit FIFO, or holding register, is
+    /// empty; and so is the shift register behind it.
     const LSR: u16 = 5;
     const LSR_THRE: u8 = 0x20;
+    const LSR_TEMT: u8 = 0x40;
     /// FIFO control and interrupt identification registers.
     const FCR: u16 = 2;
     const IIR: u16 = 2;
@@ -36,12 +38,19 @@ impl Regs {
         self.0.out8(Self::FCR, 0);
         Some(1)
     }
+}
 
-    pub fn idle(&self) -> bool {
+#[cfg(target_arch = "x86_64")]
+impl Port for Regs {
+    fn idle(&self) -> bool {
         self.0.in8(Self::LSR) & Self::LSR_THRE != 0
     }
 
-    pub fn put(&self, c: u8) {
+    fn sent(&self) -> bool {
+        self.0.in8(Self::LSR) & Self::LSR_TEMT != 0
+    }
+
+    fn put(&self, c: u8) {
         self.0.out8(0, c);
     }
 }
@@ -52,9 +61,10 @@ pub struct Regs(*mut u32);
 #[cfg(target_arch = "aarch64")]
 impl Regs {
     const DR: usize = 0x00;
-    /// Flag register: the transmit FIFO is empty.
+    /// Flag register: the transmit FIFO is empty; the UART is sending.
     const FR: usize = 0x18;
     const FR_TXFE: u32 = 1 << 7;
+    const FR_BUSY: u32 = 1 << 3;
     /// Line control register: FIFOs enabled.
     const LCR_H: usize = 0x2c;
     const LCR_FEN: u32 = 1 << 4;
@@ -81,12 +91,19 @@ impl Regs {
         }
         Some(FIFO_BURST)
     }
+}
 
-    pub fn idle(&self) -> bool {
+#[cfg(target_arch = "aarch64")]
+impl Port for Regs {
+    fn idle(&self) -> bool {
         self.read(Self::FR) & Self::FR_TXFE != 0
     }
 
-    pub fn put(&self, c: u8) {
+    fn sent(&self) -> bool {
+        self.read(Self::FR) & (Self::FR_TXFE | Self::FR_BUSY) == Self::FR_TXFE
+    }
+
+    fn put(&self, c: u8) {
         self.write(Self::DR, c as u32);
     }
 }

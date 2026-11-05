@@ -14,15 +14,13 @@
 mod uart;
 
 use l4h_rt::host::font;
-use l4h_rt::host::serial::{self, LogdConfig, Merge, Ring};
+use l4h_rt::host::serial::{self, LogdConfig, Merge, Ring, Sender};
 use l4h_rt::{Info, cap, host, sel4};
 
 l4h_rt::component!(main, no_heap);
 
 /// A byte takes 87 us at 115200 baud.
 const BYTE_US: u64 = 90;
-/// How long to wait for a UART that does not get ready, in bursts.
-const STUCK_WAITS: u32 = 32;
 const IDLE_MS: u64 = 10;
 
 const BADGE_TIMER: u64 = 1;
@@ -36,35 +34,11 @@ fn sleep(ticks: u64) {
     ntfn.wait();
 }
 
-struct Uart {
-    regs: uart::Regs,
-    /// None: the port is not there.
-    burst: Option<usize>,
-    wait: u64,
-}
-
-impl Uart {
-    fn new(cfg: &LogdConfig) -> Self {
-        let regs = uart::Regs::new(cfg);
-        let burst = regs.open();
-        Uart { regs, burst, wait: BYTE_US * burst.unwrap_or(1) as u64 * (cfg.tsc_hz / 1_000_000) }
-    }
-
-    /// Send without spinning: a real UART takes 1.4 ms to send a burst,
-    /// one in a VM often none at all.
-    fn send(&self, bytes: &[u8]) {
-        let Some(size) = self.burst else { return };
-        for burst in bytes.chunks(size) {
-            let mut waits = 0;
-            while !self.regs.idle() && waits < STUCK_WAITS {
-                sleep(self.wait);
-                waits += 1;
-            }
-            for &c in burst {
-                self.regs.put(c);
-            }
-        }
-    }
+/// The port, if it is there.
+fn open_port(cfg: &LogdConfig) -> Option<Sender<uart::Regs>> {
+    let port = uart::Regs::new(cfg);
+    let burst = port.open()?;
+    Some(Sender { port, burst, byte_ticks: BYTE_US * (cfg.tsc_hz / 1_000_000) })
 }
 
 /// Host output on the lower half of the framebuffer (fb_console), as kernel
@@ -146,14 +120,16 @@ fn main(info: &'static Info) -> ! {
     let hz = cfg.tsc_hz;
     let mut merge = Merge::new(home, hz / 10);
     cfg.add_inputs(&mut merge, serial::RINGS_VA, serial::KERNEL_RINGS_VA);
-    let uart = Uart::new(cfg);
+    let port = open_port(cfg);
     let mut screen = Screen::new(cfg);
     loop {
         let printed = merge.pass(host::ticks::now, |line| {
             if let Some(s) = &mut screen {
                 s.print(line);
             }
-            uart.send(line);
+            if let Some(p) = &port {
+                p.send(line, sleep);
+            }
         });
         if !printed {
             sleep(hz / 1000 * IDLE_MS);

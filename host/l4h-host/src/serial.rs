@@ -49,6 +49,53 @@ pub const UART_VA: usize = FB_VA + (1 << 30);
 /// The capability to the UART's I/O ports (x86).
 pub const SLOT_UART: u64 = crate::SLOT_FIRST_FREE;
 
+/// A UART, as logd uses it.
+pub trait Port {
+    /// The transmit FIFO, or holding register, is empty.
+    fn idle(&self) -> bool;
+    /// Everything written has left the port.
+    fn sent(&self) -> bool;
+    fn put(&self, c: u8);
+}
+
+/// How long to wait for a port that does not get ready, in sleeps.
+const STUCK_WAITS: u32 = 32;
+
+/// Sends without spinning: a real UART takes 1.4 ms to send a burst, one in
+/// a VM often none at all.
+pub struct Sender<P> {
+    pub port: P,
+    /// How many bytes the port takes once idle.
+    pub burst: usize,
+    /// How long a byte takes.
+    pub byte_ticks: u64,
+}
+
+impl<P: Port> Sender<P> {
+    fn wait(&self, ready: impl Fn(&P) -> bool, ticks: u64, sleep: &mut impl FnMut(u64)) {
+        let mut waits = 0;
+        while !ready(&self.port) && waits < STUCK_WAITS {
+            sleep(ticks);
+            waits += 1;
+        }
+    }
+
+    /// Send `bytes`, sleeping with `sleep` for a number of ticks, until the
+    /// last has left the port: a reset can follow as soon as `Merge` hears.
+    pub fn send(&self, bytes: &[u8], mut sleep: impl FnMut(u64)) {
+        for burst in bytes.chunks(self.burst) {
+            self.wait(P::idle, self.byte_ticks * self.burst as u64, &mut sleep);
+            for &c in burst {
+                self.port.put(c);
+            }
+        }
+        // What the last burst left in the FIFO, and the shift register.
+        // A record can be empty, and then so is what the reader hands out.
+        let left = bytes.len().saturating_sub(1) % self.burst + 2;
+        self.wait(P::sent, self.byte_ticks * left as u64, &mut sleep);
+    }
+}
+
 /// What root tells logd.
 #[repr(C)]
 pub struct LogdConfig {
@@ -398,20 +445,15 @@ impl Merge {
         // whatever the time on the records between.
         let open = self.open.map(|(k, _)| k);
         let (mut hold, mut continues) = (false, false);
+        let mut report = None;
         for (k, slot) in self.inputs.iter_mut().enumerate() {
             let Some(i) = slot else { continue };
             if i.budget <= if open == Some(k) { 0 } else { LINE_RECORDS } {
                 continue;
             }
             let peek = i.peek(now, self.grace);
-            if i.lost != 0 {
-                let lost = core::mem::take(&mut i.lost);
-                i.budget -= 1;
-                end_line(&mut self.open, out);
-                write_prefix(out, i.partition, 0);
-                let _ = write!(out, "({} lines lost)\r\n", lost);
-                self.commit = Commit::Ring(k, i.cursor);
-                return true;
+            if i.lost != 0 && (report.is_none() || open == Some(k)) {
+                report = Some(k);
             }
             match peek {
                 Peek::Ready(r) => {
@@ -430,6 +472,18 @@ impl Merge {
                 Peek::Pending => hold |= open == Some(k) && i.partition.is_none(),
                 Peek::Empty => {}
             }
+        }
+        // What a ring lost of the open line ends it. Another ring's loss
+        // can wait for the rest of the line, which costs the budget it has.
+        if let Some(k) = report.filter(|&k| open == Some(k) || !(hold || continues)) {
+            let Some(i) = &mut self.inputs[k] else { return false };
+            let lost = core::mem::take(&mut i.lost);
+            i.budget -= 1;
+            end_line(&mut self.open, out);
+            write_prefix(out, i.partition, 0);
+            let _ = write!(out, "({} lines lost)\r\n", lost);
+            self.commit = Commit::Ring(k, i.cursor);
+            return true;
         }
         if hold {
             return false;
@@ -595,7 +649,8 @@ impl KernelInput {
 mod tests {
     extern crate std;
     use super::*;
-    use std::{boxed::Box, string::String, sync::Arc, thread, vec::Vec};
+    use core::cell::{Cell, RefCell};
+    use std::{boxed::Box, collections::VecDeque, string::String, sync::Arc, thread, vec::Vec};
 
     const GRACE: u64 = 100;
 
@@ -964,6 +1019,134 @@ mod tests {
             before += 1;
         }
         assert_eq!(before, PASS_RECORDS + LINE_RECORDS);
+    }
+
+    #[test]
+    fn a_report_of_another_ring_waits_for_the_end_of_a_line() {
+        let (home, other) = (ring(), ring());
+        let mut m = Merge::new(home, GRACE);
+        m.add_ring(1, other, Some(1));
+        let long = "x".repeat(TEXT_SIZE + 10);
+        home.write(1, 0, long.as_bytes(), false);
+        let (mut text, mut first) = (String::new(), true);
+        // The other ring wraps while the port takes the first record.
+        m.pass(|| 10, |line| {
+            text.push_str(core::str::from_utf8(line).unwrap());
+            if core::mem::take(&mut first) {
+                for _ in 0..CAPACITY + 1 {
+                    other.write(5, 0, b"other", false);
+                }
+            }
+        });
+        assert!(text.starts_with(&std::format!("{long}\r\n[p1] (1 lines lost)\r\n")), "{text}");
+    }
+
+    #[test]
+    fn a_ring_reports_its_own_loss_before_going_on_with_a_line() {
+        let home = ring();
+        let mut m = Merge::new(home, GRACE);
+        home.write(1, 0, b"start", true);
+        assert_eq!(drain(&mut m, 2), "start");
+        for i in 0..CAPACITY + 1 {
+            home.write(3, 0, std::format!("record {i}").as_bytes(), true);
+        }
+        assert!(drain(&mut m, 4).starts_with("\r\n(1 lines lost)\r\nrecord 1"));
+    }
+
+    #[test]
+    fn a_report_of_another_ring_waits_while_partition_0_holds_a_line_open() {
+        let (home, other) = (ring(), ring());
+        let mut m = Merge::new(home, GRACE);
+        m.add_ring(1, other, Some(1));
+        let seq = home.ring.claim(2);
+        let mut buf = Buf::new();
+        buf.bytes_mut()[..3].copy_from_slice(b"one");
+        home.ring.commit(seq, 1, MORE, 3, &buf);
+        assert_eq!(drain(&mut m, 2), "one");
+        for _ in 0..CAPACITY + 1 {
+            other.write(5, 0, b"other", false);
+        }
+        assert_eq!(drain(&mut m, 3), "");
+        buf.bytes_mut()[..3].copy_from_slice(b"two");
+        home.ring.commit(seq + 1, 3, 0, 3, &buf);
+        assert!(drain(&mut m, 4).starts_with("two\r\n[p1] (1 lines lost)\r\n"));
+    }
+
+    /// A UART whose bytes leave at one a tick: a FIFO, then a shift register.
+    struct ModelPort {
+        fifo: RefCell<VecDeque<u8>>,
+        shift: Cell<Option<u8>>,
+        wire: RefCell<Vec<u8>>,
+        /// Nothing leaves: what a stuck port looks like.
+        stuck: bool,
+    }
+
+    impl ModelPort {
+        fn new(stuck: bool) -> Self {
+            Self { fifo: RefCell::new(VecDeque::new()), shift: Cell::new(None), wire: RefCell::new(Vec::new()), stuck }
+        }
+
+        fn run(&self, ticks: u64) {
+            for _ in 0..ticks {
+                if self.stuck {
+                    return;
+                }
+                self.wire.borrow_mut().extend(self.shift.take());
+                self.shift.set(self.fifo.borrow_mut().pop_front());
+            }
+        }
+    }
+
+    impl Port for &ModelPort {
+        fn idle(&self) -> bool {
+            self.fifo.borrow().is_empty()
+        }
+        fn sent(&self) -> bool {
+            self.fifo.borrow().is_empty() && self.shift.get().is_none()
+        }
+        fn put(&self, c: u8) {
+            self.fifo.borrow_mut().push_back(c);
+            if self.shift.get().is_none() {
+                self.shift.set(self.fifo.borrow_mut().pop_front());
+            }
+        }
+    }
+
+    #[test]
+    fn a_ring_is_drained_once_its_last_byte_has_left_the_port() {
+        let home = ring();
+        let mut m = Merge::new(home, GRACE);
+        let port = ModelPort::new(false);
+        let sender = Sender { port: &port, burst: 15, byte_ticks: 1 };
+        let text = b"l4h-root: host reboot (monitor)";
+        home.write(1, 0, text, false);
+        m.pass(|| 2, |line| sender.send(line, |ticks| port.run(ticks)));
+        assert!(home.is_drained());
+        assert_eq!(port.wire.borrow().as_slice(), [&text[..], b"\r\n"].concat());
+    }
+
+    #[test]
+    fn an_empty_continuation_of_a_line_sends_nothing() {
+        let home = ring();
+        let mut m = Merge::new(home, GRACE);
+        let port = ModelPort::new(false);
+        let sender = Sender { port: &port, burst: 15, byte_ticks: 1 };
+        home.write(1, 0, b"start", true);
+        home.write(2, 0, b"", true);
+        m.pass(|| 3, |line| sender.send(line, |ticks| port.run(ticks)));
+        assert!(home.is_drained());
+        assert_eq!(port.wire.borrow().as_slice(), b"start");
+    }
+
+    #[test]
+    fn a_stuck_port_only_costs_a_bounded_wait() {
+        let port = ModelPort::new(true);
+        let sender = Sender { port: &port, burst: 15, byte_ticks: 1 };
+        let mut sleeps = 0;
+        sender.send(b"line\r\n", |_| sleeps += 1);
+        assert_eq!(sleeps, STUCK_WAITS);
+        sender.send(b"line\r\n", |_| sleeps += 1);
+        assert_eq!(sleeps, 3 * STUCK_WAITS);
     }
 
     #[test]
