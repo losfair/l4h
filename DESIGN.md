@@ -2965,7 +2965,9 @@ a line.
   committed gets 100 ms; `(N lines lost)` reports what was overwritten or
   skipped. Each ring has 64 records or reports of a pass, which bounds what
   a ring claiming to hold the oldest record can do, and a pass ends only
-  when nothing is left to print. logd waits for the rest of a line only from
+  when nothing is left to print. It has 5 more for the rest of a line it
+  has started, the length of the longest message; a longer line can split
+  where a pass ends. logd waits for the rest of a line only from
   partition 0: a secondary could ask for 100 ms every time. logd turns on
   the UART's FIFO, which seL4 leaves off on a 16550, and sends 15 bytes when
   it finds the FIFO empty, leaving room for a byte of the kernel's, or one
