@@ -393,12 +393,8 @@ impl Serial {
         Self(host::serial::Merge::new(ring, 0))
     }
     fn read(&mut self) -> String {
-        let (mut s, mut line) = (String::new(), host::serial::Line::new());
-        self.0.begin_pass();
-        while self.0.next(u64::MAX, &mut line) {
-            s.push_str(std::str::from_utf8(line.bytes()).unwrap());
-            self.0.commit();
-        }
+        let mut s = String::new();
+        self.0.pass(|| u64::MAX, |line| s.push_str(std::str::from_utf8(line).unwrap()));
         s
     }
 }

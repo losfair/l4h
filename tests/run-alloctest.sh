@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Host-side allocator fragmentation, reclaim and container panic checks,
-# the I/O pool sizing rules (host/l4h-host/src/iopool.rs), and the
+# the I/O pool sizing rules (host/l4h-host/src/iopool.rs), l4h-host's rings, and the
 # virtio-gpu display's size arithmetic and copies (host/l4h-host/src/gpu.rs),
 # and memd's grant validation and capability revocation.
 set -euo pipefail
@@ -14,3 +14,10 @@ rustc +stable --edition=2024 --test "$root/host/l4h-host/src/iopool.rs" -o "$roo
 "$root/build/alloctest/iopool-tests"
 rustc +stable --edition=2024 --test "$root/host/l4h-host/src/gpu.rs" -o "$root/build/alloctest/gpu-tests"
 "$root/build/alloctest/gpu-tests"
+# The host and serial rings, and the reader logd runs (host/l4h-host/src).
+rustc +stable --edition=2024 --crate-name l4h_abi --crate-type rlib \
+    "$root/host/l4h-abi/src/lib.rs" -o "$root/build/alloctest/libl4h_abi.rlib"
+rustc +stable --edition=2024 --test --crate-name l4h_host -L dependency="$root/build/alloctest" \
+    --extern l4h_abi="$root/build/alloctest/libl4h_abi.rlib" \
+    "$root/host/l4h-host/src/lib.rs" -o "$root/build/alloctest/host-tests"
+"$root/build/alloctest/host-tests"

@@ -11,10 +11,8 @@
 #![no_std]
 #![no_main]
 
-use core::sync::atomic::{Ordering, compiler_fence};
-
 use l4h_rt::host::font;
-use l4h_rt::host::serial::{self, Line, LogdConfig, Merge, Ring};
+use l4h_rt::host::serial::{self, LogdConfig, Merge, Ring};
 use l4h_rt::ioport::Ports;
 use l4h_rt::{Info, cap, host, sel4};
 
@@ -170,19 +168,13 @@ fn main(info: &'static Info) -> ! {
     cfg.add_inputs(&mut merge, serial::RINGS_VA, serial::KERNEL_RINGS_VA);
     let uart = Uart::new(cfg);
     let mut screen = Screen::new(cfg);
-    let mut line = Line::new();
     loop {
-        merge.begin_pass();
-        let mut printed = false;
-        while merge.next(host::ticks::now(), &mut line) {
+        let printed = merge.pass(host::ticks::now, |line| {
             if let Some(s) = &mut screen {
-                s.print(line.bytes());
+                s.print(line);
             }
-            uart.send(line.bytes());
-            compiler_fence(Ordering::SeqCst);
-            merge.commit();
-            printed = true;
-        }
+            uart.send(line);
+        });
         if !printed {
             sleep(hz / 1000 * IDLE_MS);
         }

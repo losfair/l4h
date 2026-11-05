@@ -16,7 +16,7 @@
 //! a pass one ring can take.
 
 use core::fmt::{self, Write};
-use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering::SeqCst};
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering::SeqCst, compiler_fence};
 
 use crate::ring::{self, Buf, Entry};
 
@@ -93,7 +93,8 @@ impl LogdConfig {
 /// The longest message `record` keeps, as consecutive records.
 const MESSAGE_MAX: usize = 1024;
 /// What one ring can take of a pass: a ring that always claims to have
-/// the oldest record delays others by this much, and no more.
+/// the oldest record delays others by this much, and no more. Reports of
+/// what it lost count too.
 const PASS_RECORDS: u32 = 64;
 const KERNEL_LINE_MAX: usize = 160;
 /// A line handed out: its text and what `next` puts around it.
@@ -113,8 +114,8 @@ const SOURCE_SHIFT: u32 = 1;
 /// between partitions for a secondary's.
 #[repr(C, align(4096))]
 pub struct Ring {
-    /// The sequence after the last one printed whole, which tells root
-    /// when a reset can go ahead. Only the reader writes it.
+    /// The sequence after the last one printed whole or reported lost,
+    /// which tells root when a reset can go ahead. Only the reader writes it.
     drained: AtomicU64,
     ring: ring::Ring<CAPACITY, WORDS>,
 }
@@ -350,8 +351,24 @@ impl Merge {
         });
     }
 
-    /// Look at the rings again: each can have its share of what follows.
-    pub fn begin_pass(&mut self) {
+    /// Print what the rings have, each its share, until nothing is left
+    /// that can be printed; false if that was nothing at all. `now` reads
+    /// the clock. All of logd's reading goes through here: `next` only
+    /// returns false at the end of a pass, so budgets refill only then.
+    pub fn pass(&mut self, now: impl Fn() -> u64, mut print: impl FnMut(&[u8])) -> bool {
+        self.begin_pass();
+        let (mut line, mut printed) = (Line::new(), false);
+        while self.next(now(), &mut line) {
+            print(line.bytes());
+            // Printed means printed: the writes above come before this.
+            compiler_fence(SeqCst);
+            self.commit();
+            printed = true;
+        }
+        printed
+    }
+
+    fn begin_pass(&mut self) {
         for i in self.inputs.iter_mut().flatten() {
             i.budget = PASS_RECORDS;
         }
@@ -361,7 +378,7 @@ impl Merge {
     }
 
     /// Say that the line last handed out has been printed.
-    pub fn commit(&mut self) {
+    fn commit(&mut self) {
         match core::mem::replace(&mut self.commit, Commit::None) {
             Commit::None => {}
             Commit::Ring(k, seq) => {
@@ -374,7 +391,7 @@ impl Merge {
 
     /// The next line to print, into `out`: the oldest record of any ring,
     /// or else a line of a kernel's. False if there is nothing for now.
-    pub fn next(&mut self, now: u64, out: &mut Line) -> bool {
+    fn next(&mut self, now: u64, out: &mut Line) -> bool {
         out.len = 0;
         let mut best: Option<(usize, ring::Record<WORDS>)> = None;
         // The rest of an open line was claimed with it: it comes next,
@@ -389,9 +406,11 @@ impl Merge {
             let peek = i.peek(now, self.grace);
             if i.lost != 0 {
                 let lost = core::mem::take(&mut i.lost);
+                i.budget -= 1;
                 end_line(&mut self.open, out);
                 write_prefix(out, i.partition, 0);
                 let _ = write!(out, "({} lines lost)\r\n", lost);
+                self.commit = Commit::Ring(k, i.cursor);
                 return true;
             }
             match peek {
@@ -404,7 +423,9 @@ impl Merge {
                         best = Some((k, r));
                     }
                 }
-                Peek::Pending => hold |= open == Some(k),
+                // Only partition 0's tasks are worth waiting for: a
+                // secondary could ask for a grace period every time.
+                Peek::Pending => hold |= open == Some(k) && i.partition.is_none(),
                 Peek::Empty => {}
             }
         }
@@ -443,6 +464,7 @@ impl Merge {
             match i.line() {
                 KernelLine::None => {}
                 KernelLine::Lost(n) => {
+                    i.budget -= 1;
                     end_line(&mut self.open, out);
                     let _ = write!(out, "[p{}] ({} bytes lost)\r\n", k, n);
                     return true;
@@ -580,16 +602,9 @@ mod tests {
 
     /// Everything `m` prints at time `now`.
     fn drain(m: &mut Merge, now: u64) -> String {
-        let (mut s, mut line) = (String::new(), Line::new());
+        let mut s = String::new();
         for _ in 0..100_000 {
-            m.begin_pass();
-            let mut any = false;
-            while m.next(now, &mut line) {
-                any = true;
-                s.push_str(core::str::from_utf8(line.bytes()).unwrap());
-                m.commit();
-            }
-            if !any {
+            if !m.pass(|| now, |line| s.push_str(core::str::from_utf8(line).unwrap())) {
                 break;
             }
         }
@@ -756,6 +771,132 @@ mod tests {
         assert_eq!(before, PASS_RECORDS);
     }
 
+    /// Run logd's loop while `attack` acts before each pass, and say how
+    /// many passes went by until `home` printed.
+    fn passes_until_home(m: &mut Merge, mut attack: impl FnMut()) -> Option<usize> {
+        let mut now = 10;
+        for pass in 0..2000 {
+            attack();
+            let mut home = false;
+            let printed = m.pass(|| now, |line| home |= line.ends_with(b"home\r\n"));
+            if home {
+                return Some(pass);
+            }
+            if !printed {
+                now += 10;
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn a_secondary_cannot_hold_others_back_with_lines_it_never_ends() {
+        let (home, other) = (ring(), ring());
+        let mut m = Merge::new(home, GRACE);
+        m.add_ring(1, other, Some(1));
+        home.write(5, 0, b"home", false);
+        // The start of a line claiming to be the oldest, and never its rest.
+        let attack = || {
+            let seq = other.ring.claim(2);
+            let mut buf = Buf::new();
+            buf.bytes_mut()[0] = b'x';
+            other.ring.commit(seq, 0, MORE, 1, &buf);
+        };
+        assert_eq!(passes_until_home(&mut m, attack), Some(0));
+    }
+
+    #[test]
+    fn a_secondary_cannot_hold_others_back_with_lost_reports() {
+        let (home, other) = (ring(), ring());
+        let mut m = Merge::new(home, GRACE);
+        m.add_ring(1, other, Some(1));
+        home.write(5, 0, b"home", false);
+        // Each report needs a record to skip: one for every `next`.
+        let (mut line, mut before) = (Line::new(), 0);
+        for _ in 0..PASS_RECORDS * 2 {
+            other.ring.claim(1);
+            other.ring.slots[other.head() as usize - 1].state.store(u64::MAX, SeqCst);
+            assert!(m.next(10, &mut line));
+            if line.bytes() == b"home\r\n" {
+                break;
+            }
+            before += 1;
+        }
+        assert_eq!(before, PASS_RECORDS);
+    }
+
+    #[test]
+    fn a_kernel_ring_cannot_hold_others_back_with_lost_reports() {
+        let (mut bad, mut good) = (Kernel::new(), Kernel::new());
+        let mut m = Merge::new(ring(), GRACE);
+        m.add_kernel(1, bad.ring());
+        m.add_kernel(2, good.ring());
+        good.print(b"good\n");
+        let (mut line, mut before) = (Line::new(), 0);
+        loop {
+            bad.0[0] += 1000;
+            assert!(m.next(10, &mut line));
+            if line.bytes() == b"[p2] good\r\n" {
+                break;
+            }
+            before += 1;
+        }
+        assert_eq!(before, PASS_RECORDS);
+    }
+
+    #[test]
+    fn the_slot_of_a_writer_that_died_in_commit_is_taken_back() {
+        let home = ring();
+        let mut m = Merge::new(home, GRACE);
+        // Sequence 0 died between claiming the slot and committing it.
+        let seq = home.ring.claim(1);
+        home.ring.slots[seq as usize].state.store(1, SeqCst);
+        assert_eq!(drain(&mut m, GRACE), "");
+        assert_eq!(drain(&mut m, GRACE * 2), "(1 lines lost)\r\n");
+        let mut text = String::new();
+        for i in 1..=CAPACITY * 2 {
+            home.write(i as u64, 0, std::format!("record {i}").as_bytes(), false);
+            text += &drain(&mut m, GRACE * 3);
+        }
+        assert_eq!(text.lines().count(), CAPACITY * 2);
+        assert!(!text.contains("lost"), "{text}");
+    }
+
+    #[test]
+    fn a_writer_a_lap_behind_cannot_undo_its_slot_being_taken_back() {
+        let home = ring();
+        let seq = home.ring.claim(1);
+        home.ring.slots[seq as usize].state.store(1, SeqCst);
+        home.ring.head.store(CAPACITY as u64, SeqCst);
+        home.write(1, 0, b"new", false);
+        // The slot's old writer wakes up and tries again.
+        let mut buf = Buf::new();
+        buf.bytes_mut()[..3].copy_from_slice(b"old");
+        home.ring.commit(seq, 2, 0, 3, &buf);
+        let Entry::Ready(r) = home.ring.get(CAPACITY as u64) else { panic!("record gone") };
+        assert_eq!(r.text(), b"new");
+    }
+
+    #[test]
+    fn a_writer_leaves_a_slot_a_later_writer_is_in() {
+        let home = ring();
+        home.ring.slots[0].state.store(2 * CAPACITY as u64 + 1, SeqCst);
+        home.ring.commit(0, 1, 0, 0, &Buf::new());
+        assert_eq!(home.ring.slots[0].state.load(SeqCst), 2 * CAPACITY as u64 + 1);
+    }
+
+    #[test]
+    fn a_stranded_last_record_does_not_keep_a_ring_undrained() {
+        let home = ring();
+        let mut m = Merge::new(home, GRACE);
+        home.write(1, 0, b"line", false);
+        home.ring.claim(1);
+        assert_eq!(drain(&mut m, 10), "line\r\n");
+        assert!(!home.is_drained());
+        assert_eq!(drain(&mut m, 10 + GRACE), "(1 lines lost)\r\n");
+        assert!(home.is_drained());
+    }
+
     #[test]
     fn a_ring_is_drained_once_its_last_line_is_printed_whole() {
         let home = ring();
@@ -822,16 +963,10 @@ mod tests {
                 }
             })
         }).collect();
-        let (mut m, mut line, mut text) = (Merge::new(*home, u64::MAX / 2), Line::new(), Vec::new());
+        let (mut m, mut text) = (Merge::new(*home, u64::MAX / 2), Vec::new());
         loop {
             let finished = writers.iter().all(|w| w.is_finished());
-            m.begin_pass();
-            let mut any = false;
-            while m.next(0, &mut line) {
-                text.extend_from_slice(line.bytes());
-                m.commit();
-                any = true;
-            }
+            let any = m.pass(|| 0, |line| text.extend_from_slice(line));
             if !any && finished {
                 break;
             }
