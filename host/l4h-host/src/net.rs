@@ -71,7 +71,7 @@ pub const NETD_BADGE_IRQ_SHIFT: u32 = 48;
 pub const MAX_LINKS: usize = 7;
 pub const NETD_BADGE_LINK_SHIFT: u32 = 52;
 /// A link's channel, at most (l4h_partition::LINK_CHANNEL_SIZE).
-pub const LINK_CHANNEL_MAX: usize = 1 << 20;
+pub const LINK_CHANNEL_MAX: usize = 2 << 20;
 /// Switches: one per port and NIC is the most that can carry traffic at
 /// once.  Root refuses to create more, so netd keeps a fixed table of them
 /// indexed by switch number.

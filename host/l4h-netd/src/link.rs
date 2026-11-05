@@ -4,9 +4,8 @@
 //! ring each way (l4h_partition::MsgRing) that one netd writes and the
 //! other reads.  The writer never waits: a frame that finds the reader a
 //! whole ring behind overwrites what it did not read, which the reader
-//! notices and skips, as a wire drops frames.  Only whole Ethernet frames
-//! cross, checksums complete and at most LINK_FRAME_MAX bytes: the other
-//! netd may hand them to any port.
+//! notices and skips, as a wire drops frames. The other netd receives
+//! whole Ethernet frames or TCP GSO frames with their offload headers.
 //!
 //! Doorbells.  The peer's doorbell arrives as an interrupt whose handler
 //! signals netd directly.  Ringing the peer takes IRQControl, which only
@@ -15,15 +14,22 @@
 //! busy link: the reader sets the incoming ring's "wake me" flag only
 //! when it found the ring empty and is about to sleep, and then looks
 //! once more, since a frame published before the writer could see the
-//! flag would otherwise wait for the next one.  The writer, after a batch,
-//! checks the flag and only when it is set clears it and asks root to
-//! ring.  While frames keep coming the reader never sets the flag, and no
-//! doorbell rings at all.
+//! flag would otherwise wait for the next one. The writer checks the flag
+//! during large batches and at the end of each batch. If the flag is set,
+//! the writer clears it and asks root to ring. A busy reader does not set
+//! the flag, so no doorbell rings.
 
-use l4h_partition::{LINK_FRAME_MAX, MSG_FRAME, MsgReader, MsgRing};
+use l4h_partition::{LINK_FRAME_MAX, MSG_FRAME, MSG_FRAME_GSO, MsgReader, MsgRing};
 use l4h_rt::host::net;
 use l4h_rt::{cap, sel4};
 use sel4::cap_type;
+
+use crate::offload::{is_gso, sanitize_rx};
+
+const _: () = assert!(
+    8 + net::HDR_SIZE as u64 + net::MAX_FRAME as u64
+        <= MsgRing::max_room(l4h_partition::LINK_CHANNEL_SIZE / 2 - l4h_partition::MSG_RING_HEADER as u64)
+);
 
 pub struct Link {
     pub switch: u32,
@@ -34,8 +40,8 @@ pub struct Link {
     irq: sel4::cap::IrqHandler,
     ring: sel4::cap::Notification,
     kick: sel4::cap::Notification,
-    /// Frames written since the last look at the peer's flag.
-    sent: bool,
+    /// Message bytes written since the last look at the peer's flag.
+    pending_bytes: u64,
     pub rx_frames: u64,
     pub tx_frames: u64,
     pub drops: u64,
@@ -56,7 +62,7 @@ impl Link {
             irq: cap::<cap_type::IrqHandler>(net::NETD_SLOT_LINK_IRQ_BASE + l as u64),
             ring: cap::<cap_type::Notification>(net::NETD_SLOT_LINK_RING_BASE + l as u64),
             kick: cap::<cap_type::Notification>(net::NETD_SLOT_LINK_KICK_BASE + l as u64),
-            sent: false,
+            pending_bytes: 0,
             rx_frames: 0,
             tx_frames: 0,
             drops: 0,
@@ -66,32 +72,56 @@ impl Link {
         link
     }
 
-    /// Send a frame to the peer; the doorbell waits for `doorbell`.
+    /// Send a frame and check for a sleeping peer during long batches.
     pub fn send(&mut self, frame: &[u8]) {
         if frame.len() < 14 || frame.len() > LINK_FRAME_MAX {
             self.drops += 1;
             return;
         }
-        self.tx.send(MSG_FRAME, &[frame]);
+        self.send_record(MSG_FRAME, &[frame], frame.len());
+    }
+
+    pub fn can_send_gso(&self, len: usize) -> bool {
+        (8 + net::HDR_SIZE as u64 + len as u64).next_multiple_of(8) <= MsgRing::max_room(self.tx.cap)
+    }
+
+    pub fn send_gso(&mut self, frame: &[u8], hdr: &[u8; net::HDR_SIZE]) {
+        self.send_record(MSG_FRAME_GSO, &[hdr, frame], hdr.len() + frame.len());
+    }
+
+    fn send_record(&mut self, kind: u32, parts: &[&[u8]], len: usize) {
+        self.tx.send(kind, parts);
         self.tx_frames += 1;
-        self.sent = true;
+        self.pending_bytes += (8 + len as u64).next_multiple_of(8);
+        // A batch can exceed the ring size. Give a sleeping peer a
+        // chance to read before the batch can overwrite its messages.
+        if self.pending_bytes >= MsgRing::max_room(self.tx.cap) {
+            self.doorbell();
+        }
     }
 
     /// After a batch: ring the peer if it sleeps.
     pub fn doorbell(&mut self) {
-        if core::mem::take(&mut self.sent) && self.tx.take_wake() {
+        if core::mem::take(&mut self.pending_bytes) != 0 && self.tx.take_wake() {
             self.ring.signal();
         }
     }
 
-    /// The next frame from the peer, into `buf`: its length.  None when
-    /// the ring is empty.
-    pub fn recv(&mut self, buf: &mut [u8]) -> Option<usize> {
+    /// Receive a frame and its offload header. The buffer has an extra
+    /// byte so a truncated oversized record fails the length check.
+    pub fn recv<'a>(&mut self, buf: &'a mut [u8]) -> Option<(&'a mut [u8], [u8; net::HDR_SIZE])> {
         loop {
             let (ty, n) = self.rx.recv(buf, &mut self.lost)?;
             if ty == MSG_FRAME && (14..=LINK_FRAME_MAX).contains(&n) {
                 self.rx_frames += 1;
-                return Some(n);
+                return Some((&mut buf[..n], [0; net::HDR_SIZE]));
+            }
+            if ty == MSG_FRAME_GSO && (net::HDR_SIZE + 14..=net::HDR_SIZE + net::MAX_FRAME).contains(&n) {
+                let mut hdr = buf[..net::HDR_SIZE].try_into().unwrap();
+                if is_gso(&hdr) && sanitize_rx(&mut hdr, &buf[net::HDR_SIZE..n]) {
+                    self.rx_frames += 1;
+                    return Some((&mut buf[net::HDR_SIZE..n], hdr));
+                }
             }
             self.drops += 1;
         }

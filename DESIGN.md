@@ -3634,20 +3634,20 @@ partitions' uplink networks are never bridged. The two netds move the
 frames themselves: root maps the link's channel into netd only (by the
 CPU; no device reaches it), and netd writes each frame for the link as a
 message into its outgoing ring and switches each message from the incoming
-one. Only whole frames cross, checksums completed and segmentation
-offloads undone, up to 9216 bytes; a reader a whole ring behind skips what
-was overwritten, as a wire drops frames. Doorbells: root binds the link's
-receive vector to a badged notification of netd's, which netd acks, so
-root takes no part in receiving. Ringing the peer takes IRQControl, which
-only root holds, so netd signals root (a badge per link) and root makes
-one `SendPeer` call: constant work, no data, and repeated signals merge.
-Even that stays off a busy link: each ring's header has a "wake me" word
-that its reader sets only when it found the ring empty and is about to
-sleep, then reads the ring once more (a frame published before the writer
-could see the word would otherwise wait); the writer, after a batch, rings
-only if the word is set, and clears it. A reader that keeps finding frames
-never sets it, so a busy link rings no doorbells, and after 256 frames netd
-kicks itself to serve its other ports before it reads on.
+ring. Plain Ethernet frames carry complete checksums and have a limit of
+9216 bytes. TCP GSO frames carry their offload header in a separate record
+type. The receiving netd validates this header and segments the frame when
+the destination needs plain frames. Each direction has a 1 MiB ring.
+A reader that falls behind skips records that the writer can overwrite.
+
+Root binds the link's receive vector to netd's notification. Netd
+acknowledges the interrupt. Only root holds IRQControl, so the sending netd
+signals root to make one `SendPeer` call per pending link. A reader sets the
+wake flag only when its ring is empty, then checks the ring once more.
+The writer checks and clears the flag during large batches and at the end
+of each batch. Netd bounds each guest transmit turn on a linked switch by
+bytes and polls for control requests before it processes more slots.
+After 256 received records, netd gives its other ports a turn.
 `link.pA-pB = uplink` instead puts the link port on both partitions'
 switch 0, with no switch or vNIC of its own: a partition without a NIC
 shares the network of the one whose switch 0 has the uplink NIC (a star of

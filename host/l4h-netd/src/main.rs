@@ -62,10 +62,14 @@ const BACKLOG_CHUNKS: usize = (2 << 20) / pool::CHUNK;
 /// Frames read from a link before netd turns to its other work (and
 /// kicks itself to come back): a flooding peer cannot starve the rest.
 const LINK_BUDGET: usize = 256;
+/// Limit a guest's work per receive turn on a linked switch. The switch
+/// flushes link notifications before coming back for the remaining slots.
+const LINK_TX_BYTES: usize = 128 << 10;
 
 /// The frame being switched, and the segments of a GSO frame for a port
 /// that cannot take it whole: too large for the stack.
-static mut BUF: [u8; net::MAX_FRAME] = [0; net::MAX_FRAME];
+const FRAME_BUFFER_SIZE: usize = net::MAX_FRAME + net::HDR_SIZE + 1;
+static mut BUF: [u8; FRAME_BUFFER_SIZE] = [0; FRAME_BUFFER_SIZE];
 static mut SEG_BUF: [u8; net::MAX_FRAME] = [0; net::MAX_FRAME];
 /// Receive offload per NIC, made by main: a new Gro is not all zeros, and
 /// would take its size in the image.
@@ -276,18 +280,18 @@ impl Netd {
     }
 
     /// Whether port `to` takes this GSO frame whole.
-    fn takes_gso(&self, to: PortId, hdr: &[u8; net::HDR_SIZE]) -> bool {
+    fn takes_gso(&self, to: PortId, len: usize, hdr: &[u8; net::HDR_SIZE]) -> bool {
         match to {
             PortId::Guest(i) => self.ports[i]
                 .as_ref()
                 .is_some_and(|p| unsafe { addr_of!((*p.chan).rx_gso).read_volatile() != 0 }),
             PortId::Uplink(n) => self.nics[n].takes_gso(hdr),
-            PortId::Link(_) => false,
+            PortId::Link(l) => self.links[l].as_ref().is_some_and(|link| link.can_send_gso(len)),
         }
     }
 
     fn deliver(&mut self, to: PortId, frame: &mut [u8], hdr: &mut [u8; net::HDR_SIZE]) {
-        if is_gso(hdr) && !self.takes_gso(to, hdr) {
+        if is_gso(hdr) && !self.takes_gso(to, frame.len(), hdr) {
             let buf = core::mem::take(&mut self.seg_buf);
             offload::segment(frame, hdr, buf, |f, h| self.deliver_one(to, f, h));
             self.seg_buf = buf;
@@ -326,9 +330,12 @@ impl Netd {
             }
             PortId::Link(l) => {
                 let Some(k) = self.links[l].as_mut() else { return };
-                // The peer gets plain frames only.
-                complete_csum(frame, hdr);
-                k.send(frame);
+                if is_gso(hdr) {
+                    k.send_gso(frame, hdr);
+                } else {
+                    complete_csum(frame, hdr);
+                    k.send(frame);
+                }
             }
         }
     }
@@ -469,10 +476,9 @@ impl Netd {
                 break;
             }
             match k.recv(frame) {
-                Some(n) => {
+                Some((frame, mut hdr)) => {
                     budget -= 1;
-                    let mut hdr = [0u8; net::HDR_SIZE];
-                    self.forward(PortId::Link(l), &mut frame[..n], &mut hdr);
+                    self.forward(PortId::Link(l), frame, &mut hdr);
                 }
                 None if k.sleep() => break,
                 None => {}
@@ -507,10 +513,12 @@ impl Netd {
         }
     }
 
-    /// Take the frames a guest port has queued for transmission.
-    fn port_tx(&mut self, i: usize) {
-        let Some(p) = self.ports[i].as_ref() else { return };
+    /// Take the frames a guest port has queued for transmission. Return
+    /// whether the byte budget left any of this snapshot for the next turn.
+    fn port_tx(&mut self, i: usize) -> bool {
+        let Some(p) = self.ports[i].as_ref() else { return false };
         let chan = p.chan;
+        let limited = self.links.iter().flatten().any(|link| link.switch == p.switch);
         let frame = core::mem::take(&mut self.buf);
         // The indices are the client's: at most one ring's worth per kick,
         // and nothing at all from a ring that claims more.
@@ -520,9 +528,11 @@ impl Netd {
                 p.drops += 1;
             }
             self.buf = frame;
-            return;
+            return false;
         }
-        for _ in 0..pending {
+        let mut bytes = 0;
+        let mut more = false;
+        for index in 0..pending {
             let (n, mut hdr) = unsafe {
                 let tail = addr_of!((*chan).tx.tail).read_volatile();
                 if tail == addr_of!((*chan).tx.head).read_volatile() {
@@ -538,11 +548,17 @@ impl Netd {
                 (n, hdr)
             };
             self.forward(PortId::Guest(i), &mut frame[..n], &mut hdr);
+            bytes += n;
+            if limited && bytes >= LINK_TX_BYTES {
+                more = index + 1 < pending;
+                break;
+            }
         }
         self.buf = frame;
         if let Some(p) = self.ports[i].as_mut() {
             p.signal = true;
         }
+        more
     }
 
     fn nic_rx(&mut self, n: usize) {
@@ -550,7 +566,7 @@ impl Netd {
         self.nics[n].rx_begin();
         loop {
             let mut hdr = [0u8; net::HDR_SIZE];
-            while let Some(len) = self.nics[n].receive(frame, &mut hdr) {
+            while let Some(len) = self.nics[n].receive(&mut frame[..net::MAX_FRAME], &mut hdr) {
                 if self.nics[n].switch.is_none() {
                     continue;
                 }
@@ -708,12 +724,17 @@ fn main(info: &'static Info) -> ! {
     }
     published.ready.store(1, Ordering::Release);
     l4h_rt::mailbox::signal();
+    let mut deferred_tx = 0;
     let (_, mut badge) = ep.recv(reply);
     loop {
-        // Notification: port kicks and NIC interrupts.
+        // Notification: port kicks and NIC interrupts. Deferred slots and
+        // new client kicks use the same drain path.
+        let ports = badge | core::mem::take(&mut deferred_tx);
         for i in 0..net::MAX_PORTS {
-            if badge & (1 << i) != 0 {
-                d.port_tx(i);
+            if ports & (1 << i) != 0 {
+                if d.port_tx(i) {
+                    deferred_tx |= 1 << i;
+                }
                 d.rx_backlog(i);
             }
         }
@@ -842,7 +863,15 @@ fn main(info: &'static Info) -> ! {
         // Root handed out an added port's channel before netd added it:
         // its VMM may have kicked already, and read the page's link state,
         // DOWN.  Serve the port as if kicked, and signal it.
-        badge = if added != 0 { added } else { ep.recv(reply).1 };
+        // With slots deferred, poll for notifications (NBRecv returns badge
+        // zero when idle) and come back for the rest.
+        badge = if added != 0 {
+            added
+        } else if deferred_tx != 0 {
+            ep.nb_recv(reply).1
+        } else {
+            ep.recv(reply).1
+        };
     }
 }
 
