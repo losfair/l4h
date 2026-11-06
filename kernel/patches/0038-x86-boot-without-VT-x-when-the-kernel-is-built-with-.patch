@@ -1,4 +1,4 @@
-From 8df1c5dd32f9d8dde2c61d962b43d45cd118648c Mon Sep 17 00:00:00 2001
+From 9fa7a9f2817d32a6e091b8ddd3a2bced294f0421 Mon Sep 17 00:00:00 2001
 From: l4h <l4h@localhost>
 Date: Fri, 6 Nov 2026 21:22:54 +0000
 Subject: [PATCH] x86: boot without VT-x when the kernel is built with it
@@ -14,16 +14,22 @@ with it.  Without VT-x, Untyped_Retype refuses VCPU and EPT objects
 (seL4_InvalidArgument for the type), the only objects whose use
 executes VMX instructions; userspace probes for VT-x that way.
 
+With the SKIM window VT-x stays off.  SKIM serves Meltdown-affected
+CPUs, which are also L1TF-affected, and VM entry does not flush the
+L1D.  It is a runtime decision rather than a configuration one because
+KernelVTX changes the numbering of the x86 invocation labels after
+X86PageGetAddress: every build that shares a userspace must agree on it.
+
 The EPT capability checks move before vmxon, and a failed vmxon
 clears CR4.VMXE, so a core that cannot provide VT-x is never left in
 VMX operation (where INIT is blocked).
 ---
  include/arch/x86/arch/model/statedata.h   |  6 +++
- include/arch/x86/arch/object/objecttype.h | 17 +++++++
+ include/arch/x86/arch/object/objecttype.h | 17 ++++++
  src/arch/x86/model/statedata.c            |  1 +
- src/arch/x86/object/vcpu.c                | 56 +++++++++++++++--------
- src/object/untyped.c                      | 11 +++++
- 5 files changed, 72 insertions(+), 19 deletions(-)
+ src/arch/x86/object/vcpu.c                | 66 ++++++++++++++++-------
+ src/object/untyped.c                      | 11 ++++
+ 5 files changed, 81 insertions(+), 20 deletions(-)
 
 diff --git a/include/arch/x86/arch/model/statedata.h b/include/arch/x86/arch/model/statedata.h
 index 76e62cc..9a1aee2 100644
@@ -83,7 +89,7 @@ index e30f57e..da0b07c 100644
  
  #ifdef CONFIG_PRINTING
 diff --git a/src/arch/x86/object/vcpu.c b/src/arch/x86/object/vcpu.c
-index 4dd0d5c..0bf94af 100644
+index 4dd0d5c..92dd1df 100644
 --- a/src/arch/x86/object/vcpu.c
 +++ b/src/arch/x86/object/vcpu.c
 @@ -1175,7 +1175,9 @@ static inline void clear_bit(word_t *bitmap, word_t bit)
@@ -137,7 +143,7 @@ index 4dd0d5c..0bf94af 100644
          return false;
      }
      memset(&msr_bitmap_region, ~0, sizeof(msr_bitmap_region));
-@@ -1243,22 +1262,21 @@ BOOT_CODE bool_t vtx_init(void)
+@@ -1243,22 +1262,29 @@ BOOT_CODE bool_t vtx_init(void)
      clear_bit(msr_bitmap_region.high_msr_write.bitmap, MSR_BITMAP_MASK(IA32_GS_BASE_MSR));
      clear_bit(msr_bitmap_region.high_msr_write.bitmap, MSR_BITMAP_MASK(IA32_KERNEL_GS_BASE_MSR));
  #endif
@@ -151,24 +157,33 @@ index 4dd0d5c..0bf94af 100644
 -    if (!vmx_ept_vpid_cap_msr_get_ept_wb(vpid_capability)) {
 -        printf("vt-x: Expected wb attribute for EPT paging structure\n");
 -        return false;
+-    }
+-    if (!vmx_ept_vpid_cap_msr_get_ept_2m(vpid_capability)) {
+-        printf("vt-x: Expected supported for 2m pages\n");
+-        return false;
+-    }
 +    return true;
 +}
-+
+ 
 +BOOT_CODE bool_t vtx_init(void)
 +{
 +    if (CURRENT_CPU_INDEX() != 0) {
 +        /* Secondary cores follow the boot core, which runs first: none
 +         * uses VT-x without it, and each must match it when it does. */
 +        return !x86KSVTXEnabled || vtx_try_init();
-     }
--    if (!vmx_ept_vpid_cap_msr_get_ept_2m(vpid_capability)) {
--        printf("vt-x: Expected supported for 2m pages\n");
--        return false;
++    }
++    if (config_set(CONFIG_KERNEL_SKIM_WINDOW)) {
++        /* SKIM serves Meltdown-affected CPUs, which are also L1TF-affected,
++         * and VM entry does not flush the L1D: a VM could read other
++         * threads' data from it. */
++        printf("vt-x: off with the SKIM window\n");
++        x86KSVTXEnabled = false;
++        return true;
++    }
 +    x86KSVTXEnabled = vtx_try_init();
 +    if (!x86KSVTXEnabled) {
 +        printf("vt-x: unavailable; booting without it\n");
-     }
--
++    }
      return true;
  }
  
