@@ -1,0 +1,199 @@
+From 8df1c5dd32f9d8dde2c61d962b43d45cd118648c Mon Sep 17 00:00:00 2001
+From: l4h <l4h@localhost>
+Date: Fri, 6 Nov 2026 21:22:54 +0000
+Subject: [PATCH] x86: boot without VT-x when the kernel is built with it
+
+A kernel configured with KernelVTX refused to boot on a CPU without
+usable VT-x (no VMX, VMX disabled by firmware, or missing EPT
+features), so one image could not serve hosts with and without it.
+
+vtx_init() now records on the boot core whether VT-x is usable, in
+x86KSVTXEnabled, and boots either way.  Secondary cores skip VT-x when
+the boot core runs without it, and must still match it when it runs
+with it.  Without VT-x, Untyped_Retype refuses VCPU and EPT objects
+(seL4_InvalidArgument for the type), the only objects whose use
+executes VMX instructions; userspace probes for VT-x that way.
+
+The EPT capability checks move before vmxon, and a failed vmxon
+clears CR4.VMXE, so a core that cannot provide VT-x is never left in
+VMX operation (where INIT is blocked).
+---
+ include/arch/x86/arch/model/statedata.h   |  6 +++
+ include/arch/x86/arch/object/objecttype.h | 17 +++++++
+ src/arch/x86/model/statedata.c            |  1 +
+ src/arch/x86/object/vcpu.c                | 56 +++++++++++++++--------
+ src/object/untyped.c                      | 11 +++++
+ 5 files changed, 72 insertions(+), 19 deletions(-)
+
+diff --git a/include/arch/x86/arch/model/statedata.h b/include/arch/x86/arch/model/statedata.h
+index 76e62cc..9a1aee2 100644
+--- a/include/arch/x86/arch/model/statedata.h
++++ b/include/arch/x86/arch/model/statedata.h
+@@ -81,6 +81,12 @@ extern uint32_t x86KSnumIODomainIDBits;
+ extern uint32_t x86KSFirstValidIODomain;
+ #endif
+ 
++#ifdef CONFIG_VTX
++/* Whether every core runs in VMX operation.  When false (no VT-x, or VT-x
++ * without what seL4 requires), VCPU and EPT objects cannot be created. */
++extern bool_t x86KSVTXEnabled;
++#endif
++
+ #ifdef CONFIG_PRINTING
+ extern uint16_t x86KSconsolePort;
+ #endif
+diff --git a/include/arch/x86/arch/object/objecttype.h b/include/arch/x86/arch/object/objecttype.h
+index 01f66b2..6873706 100644
+--- a/include/arch/x86/arch/object/objecttype.h
++++ b/include/arch/x86/arch/object/objecttype.h
+@@ -25,6 +25,23 @@ exception_t Arch_decodeInvocation(word_t invLabel, word_t length, cptr_t cptr, c
+ void Arch_prepareThreadDelete(tcb_t *thread);
+ word_t Arch_getObjectSize(word_t t);
+ 
++#ifdef CONFIG_VTX
++/* Object types that only work in VMX operation (x86KSVTXEnabled). */
++static inline bool_t CONST Arch_isVTXObjectType(word_t type)
++{
++    switch (type) {
++    case seL4_X86_VCPUObject:
++    case seL4_X86_EPTPML4Object:
++    case seL4_X86_EPTPDPTObject:
++    case seL4_X86_EPTPDObject:
++    case seL4_X86_EPTPTObject:
++        return true;
++    default:
++        return false;
++    }
++}
++#endif
++
+ /* the following functions are specific to 32-bit and 64-bit */
+ 
+ deriveCap_ret_t Mode_deriveCap(cte_t *slot, cap_t cap);
+diff --git a/src/arch/x86/model/statedata.c b/src/arch/x86/model/statedata.c
+index e30f57e..da0b07c 100644
+--- a/src/arch/x86/model/statedata.c
++++ b/src/arch/x86/model/statedata.c
+@@ -59,6 +59,7 @@ uint32_t x86KSFirstValidIODomain;
+ #ifdef CONFIG_VTX
+ UP_STATE_DEFINE(vcpu_t *, x86KSCurrentVCPU);
+ UP_STATE_DEFINE(struct vmxon_region, x86KSVMXOnRegion);
++bool_t x86KSVTXEnabled;
+ #endif
+ 
+ #ifdef CONFIG_PRINTING
+diff --git a/src/arch/x86/object/vcpu.c b/src/arch/x86/object/vcpu.c
+index 4dd0d5c..0bf94af 100644
+--- a/src/arch/x86/object/vcpu.c
++++ b/src/arch/x86/object/vcpu.c
+@@ -1175,7 +1175,9 @@ static inline void clear_bit(word_t *bitmap, word_t bit)
+     bitmap[index] &= ~BIT(offset);
+ }
+ 
+-BOOT_CODE bool_t vtx_init(void)
++/* Set up VT-x on the current core, or return false, leaving it out of VMX
++ * operation, when the core cannot provide what seL4 requires. */
++static BOOT_CODE bool_t vtx_try_init(void)
+ {
+     if (!is_vtx_supported()) {
+         printf("vt-x: not supported\n");
+@@ -1213,17 +1215,34 @@ BOOT_CODE bool_t vtx_init(void)
+         printf("vt-x: cores have inconsistent features\n");
+         return false;
+     }
+-    write_cr4(read_cr4() | CR4_VMXE);
+-    /* we are required to set the VMCS region in the VMXON region */
+-    struct vmxon_region *vmxon_kptr = &ARCH_NODE_STATE(x86KSVMXOnRegion);
+-    vmxon_kptr->revision = vmcs_revision;
++    /* The VMX_EPT_VPID_CAP MSR exists if VMX supports EPT or VPIDs. Whilst
++     * VPID support is optional, EPT support is not and is already checked for,
++     * so we know that this MSR is safe to read.  Check it before vmxon, so
++     * that a core without these features is never left in VMX operation. */
++    vpid_capability.words[0] = x86_rdmsr_low(IA32_VMX_EPT_VPID_CAP_MSR);
++    vpid_capability.words[1] = x86_rdmsr_high(IA32_VMX_EPT_VPID_CAP_MSR);
++
++    /* check for supported EPT features */
++    if (!vmx_ept_vpid_cap_msr_get_ept_wb(vpid_capability)) {
++        printf("vt-x: Expected wb attribute for EPT paging structure\n");
++        return false;
++    }
++    if (!vmx_ept_vpid_cap_msr_get_ept_2m(vpid_capability)) {
++        printf("vt-x: Expected supported for 2m pages\n");
++        return false;
++    }
+     /* Before calling vmxon, we must check that CR0 and CR4 are not set to values
+      * that are unsupported by vt-x */
+-    if (!vtx_check_fixed_values(read_cr0(), read_cr4())) {
++    if (!vtx_check_fixed_values(read_cr0(), read_cr4() | CR4_VMXE)) {
+         return false;
+     }
++    /* we are required to set the VMCS region in the VMXON region */
++    struct vmxon_region *vmxon_kptr = &ARCH_NODE_STATE(x86KSVMXOnRegion);
++    vmxon_kptr->revision = vmcs_revision;
++    write_cr4(read_cr4() | CR4_VMXE);
+     if (vmxon(kpptr_to_paddr(vmxon_kptr))) {
+         printf("vt-x: vmxon failure\n");
++        write_cr4(read_cr4() & ~CR4_VMXE);
+         return false;
+     }
+     memset(&msr_bitmap_region, ~0, sizeof(msr_bitmap_region));
+@@ -1243,22 +1262,21 @@ BOOT_CODE bool_t vtx_init(void)
+     clear_bit(msr_bitmap_region.high_msr_write.bitmap, MSR_BITMAP_MASK(IA32_GS_BASE_MSR));
+     clear_bit(msr_bitmap_region.high_msr_write.bitmap, MSR_BITMAP_MASK(IA32_KERNEL_GS_BASE_MSR));
+ #endif
+-    /* The VMX_EPT_VPID_CAP MSR exists if VMX supports EPT or VPIDs. Whilst
+-     * VPID support is optional, EPT support is not and is already checked for,
+-     * so we know that this MSR is safe to read */
+-    vpid_capability.words[0] = x86_rdmsr_low(IA32_VMX_EPT_VPID_CAP_MSR);
+-    vpid_capability.words[1] = x86_rdmsr_high(IA32_VMX_EPT_VPID_CAP_MSR);
+ 
+-    /* check for supported EPT features */
+-    if (!vmx_ept_vpid_cap_msr_get_ept_wb(vpid_capability)) {
+-        printf("vt-x: Expected wb attribute for EPT paging structure\n");
+-        return false;
++    return true;
++}
++
++BOOT_CODE bool_t vtx_init(void)
++{
++    if (CURRENT_CPU_INDEX() != 0) {
++        /* Secondary cores follow the boot core, which runs first: none
++         * uses VT-x without it, and each must match it when it does. */
++        return !x86KSVTXEnabled || vtx_try_init();
+     }
+-    if (!vmx_ept_vpid_cap_msr_get_ept_2m(vpid_capability)) {
+-        printf("vt-x: Expected supported for 2m pages\n");
+-        return false;
++    x86KSVTXEnabled = vtx_try_init();
++    if (!x86KSVTXEnabled) {
++        printf("vt-x: unavailable; booting without it\n");
+     }
+-
+     return true;
+ }
+ 
+diff --git a/src/object/untyped.c b/src/object/untyped.c
+index c164c30..41f73bd 100644
+--- a/src/object/untyped.c
++++ b/src/object/untyped.c
+@@ -71,6 +71,17 @@ exception_t decodeUntypedInvocation(word_t invLabel, word_t length, cte_t *slot,
+         return EXCEPTION_SYSCALL_ERROR;
+     }
+ 
++#ifdef CONFIG_VTX
++    /* Without VT-x, VCPU and EPT objects do not exist: using them would
++     * execute VMX instructions. */
++    if (!x86KSVTXEnabled && Arch_isVTXObjectType(newType)) {
++        userError("Untyped Retype: VT-x is not available.");
++        current_syscall_error.type = seL4_InvalidArgument;
++        current_syscall_error.invalidArgumentNumber = 0;
++        return EXCEPTION_SYSCALL_ERROR;
++    }
++#endif
++
+     objectSize = getObjectSize(newType, userObjSize);
+ 
+     /* Exclude impossibly large object sizes. getObjectSize can overflow if userObjSize
+-- 
+2.43.0
+
