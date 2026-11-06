@@ -152,6 +152,7 @@ dropped without renumbering the rest.
   invocation labels (`X86PageMapEPT` after `X86PageGetAddress`, and VCPU
   register labels), renumbering the ones after them, and all variants
   share one root task and guest kernel.
+  Tested by `tests/run-vtxtest.sh` (§14.3).
 - `KernelSkimWindow=OFF` in the default variants, which require a CPU
   unaffected by Meltdown. The `skim-xapic-nopcid` variant sets it `ON`,
   uses xAPIC and disables PCID. Builds without SKIM refuse to boot when
@@ -3834,5 +3835,6 @@ machine and guests of 256–512 MiB.
 | `tests/run-debian.sh`, `tests/run-workload.sh` | Debian + systemd, fio verify, parallel build, fsck (`tests/mkdebian.sh` first) |
 | `tests/run-bench.sh`, `tests/run-vmbench.sh`, `tests/run-startbench.sh` | micro-benchmarks, guest cost, start latency |
 | `tests/run-fuzz.sh` | hostile-guest virtqueue fuzzing of l4h-vmm |
-| `tests/run-skimtest.sh` | the skim-xapic-nopcid variant on a Meltdown-affected CPU without PCID/x2APIC: SKIM mappings and syscall state at the user/kernel boundary (`tests/skim-qemu.py`, GDB) |
+| `tests/run-skimtest.sh` | the skim-xapic-nopcid variant on a Meltdown-affected CPU without PCID/x2APIC: SKIM mappings and syscall state at the user/kernel boundary (`tests/skim-qemu.py`, GDB); VT-x stays off (`run-vtxtest.sh skim`) |
+| `tests/run-vtxtest.sh off\|on\|skim` | VT-x below l4h-root (patch 0038), with `tests/vtxprobe.c` as the root task on 4 cores: `off` (`-cpu host,-vmx`) boots without VT-x and refuses VCPU and EPT objects; `on` (`-cpu host`, nested KVM on Intel) creates them and binds the VCPU to a TCB; `skim` keeps VT-x off. CI runs `off` always and `on`, with the 1-vCPU self-test, where the runner has nested VMX, and says in the job summary when it has not |
 | `python3 tests/blkmq-qemu.py` | block multiqueue and fsync suites under local QEMU (`--suite blkmq\|fsync`, `--guest-queues`, `--scsi-queues`); run by hand |
