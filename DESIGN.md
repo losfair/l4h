@@ -140,6 +140,14 @@ dropped without renumbering the rest.
 - `KernelIRQReporting=OFF`: the kernel never prints spurious interrupts
   (QEMU/HVF raises tens of thousands of them).
 - `KernelIOMMU=OFF`: root drives the IOMMU itself (§9.5).
+- `KernelVTX=ON`, `KernelX86_64VTX64BitGuests=ON`: seL4's VCPU and EPT
+  objects, for guests that will run KVM
+  ([#84](https://github.com/losfair/l4h/issues/84)). Every guest may create
+  them from its own RAM; there is no per-VM grant. On a CPU without usable
+  VT-x (no VMX, as under QEMU's `-cpu host,-vmx`, VMX locked off, or no EPT)
+  the kernel boots without it (patch 0038), so the same image serves both.
+  The SKIM variant builds without VT-x: Meltdown-affected CPUs are also
+  L1TF-affected, and seL4 does not flush the L1D on VM entry.
 - `KernelSkimWindow=OFF` in the default variants, which require a CPU
   unaffected by Meltdown. The `skim-xapic-nopcid` variant sets it `ON`,
   uses xAPIC and disables PCID. Builds without SKIM refuse to boot when
@@ -274,7 +282,7 @@ support, since no device is passed into a guest.
 | 0023, 0029 | `Page_TestAndClearAccessed` (x86_64, and AArch64 without hypervisor support) atomically clears and returns the A/AF bit of a frame cap's mapping, for 4 KiB frames (0023) and 2 MiB frames (0029), after verifying the mapped ASID, address, size and physical frame. It does not invalidate TLBs, as with native x86 aging. On AArch64 without hardware AF updates (and without hypervisor support), seL4 repairs EL0 access-flag faults itself (setting AF and restarting) without fault IPC; `TCR_EL1.HA` stays off. 0029 also adds `Page_DeriveSubframe` (x86_64 and AArch64), which derives up to 512 consecutive unmapped 4 KiB capabilities from a RAM-backed 2 MiB frame into a validated window of CNode slots, with intersected rights, allocating nothing. Aliases are smaller regions in the derivation tree: deleting the large cap leaves them valid, and revoking the backing Untyped removes all of them and their mappings. |
 | 0024 | (x86) No boot without SKIM unless the CPU reports RDCL_NO (above). |
 | 0025 | (x86) `GetIOAPICRemapped` adds a 16-bit interrupt-remapping table index to the I/O APIC handler arguments and writes the remappable RTE format. Root publishes the matching VT-d IRTE first; seL4 keeps pin masking, acknowledgement and capability lifecycle and does not manage the IOMMU. |
-| 0038 | (x86, `KernelVTX`) A kernel built with VT-x boots on a CPU without usable VT-x (no VMX, VMX locked off by firmware, or no EPT write-back or 2 MiB support) instead of halting. The boot core records the result in `x86KSVTXEnabled`; secondary cores skip VT-x when it is off and must match the boot core when it is on. Without VT-x, `Untyped_Retype` refuses VCPU and EPT objects (`seL4_InvalidArgument`), which is also how userspace probes for it. EPT checks run before `vmxon`, and a failed `vmxon` clears `CR4.VMXE`, so no core is left in VMX operation, where INIT is blocked. l4h still builds with `KernelVTX=OFF`; this lets one image serve hosts with and without VT-x once guests can use it ([KVM in guests](https://github.com/losfair/l4h/issues/84)). |
+| 0038 | (x86, `KernelVTX`) A kernel built with VT-x boots on a CPU without usable VT-x (no VMX, VMX locked off by firmware, or no EPT write-back or 2 MiB support) instead of halting. The boot core records the result in `x86KSVTXEnabled`; secondary cores skip VT-x when it is off and must match the boot core when it is on. Without VT-x, `Untyped_Retype` refuses VCPU and EPT objects (`seL4_InvalidArgument`), which is also how userspace probes for it. EPT checks run before `vmxon`, and a failed `vmxon` clears `CR4.VMXE`, so no core is left in VMX operation, where INIT is blocked. This lets one `KernelVTX` image (§4.1) serve hosts with and without VT-x. |
 
 **Verification.** The MCS SMP x86_64 configuration is not covered by the
 seL4 proofs, with or without these patches. l4h benefits from seL4's design
