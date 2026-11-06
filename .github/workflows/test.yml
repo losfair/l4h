@@ -78,6 +78,8 @@ jobs:
         run: tests/run-trusttest.sh
       - name: Build seL4
         run: tools/build-kernel.sh
+      - name: VT-x kernel on a CPU without VMX (boots, refuses VCPU and EPT objects)
+        run: tests/run-vtxtest.sh off
       - name: CPU topology and migration policy
         run: tests/run-schedtest.sh
       - name: Build Linux
@@ -96,6 +98,25 @@ jobs:
         run: tests/run-selftest.sh 1
       - name: Linux self-test, 4 vCPUs
         run: tests/run-selftest.sh 4
+      # Every core enters VMX operation only when the CPU has VT-x, which
+      # needs an Intel runner whose KVM allows nesting.  Hosted runners vary,
+      # so the step runs where it can and says so where it cannot.
+      - name: VT-x with VMX exposed (when the runner has nested VMX)
+        run: |
+          model=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs)
+          nested=$(cat /sys/module/kvm_intel/parameters/nested 2>/dev/null || echo absent)
+          echo "CPU: $model; kvm_intel nested: $nested"
+          if grep -qw vmx /proc/cpuinfo && [[ $nested == [Y1] ]]; then
+            tests/run-vtxtest.sh on
+            L4H_QEMU_CPU=host,+invtsc tests/run-selftest.sh 1
+            if grep -q 'vt-x: unavailable' build/qemu.log; then
+              echo "the self-test ran without VT-x"; exit 1
+            fi
+            echo "VT-x with VMX exposed: tested on $model" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::No nested VMX on this runner ($model, nested: $nested): the VT-x path was not tested"
+            echo "VT-x with VMX exposed: **not tested**, no nested VMX on this runner ($model, kvm_intel nested: $nested)" >> "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Transparent huge pages, 1 and 4 vCPUs
         run: tests/run-thptest.sh 1 && tests/run-thptest.sh 4
       - name: THP memory hotplug and revocation

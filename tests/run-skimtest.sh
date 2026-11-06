@@ -7,6 +7,7 @@ export L4H_KERNEL_VARIANT=skim-xapic-nopcid
 export L4H_RELEASE=0
 L4H_SKIM_WINDOW=ON L4H_LAPIC_MODE=XAPIC L4H_PCID=OFF "$root/tools/build-kernel.sh"
 export L4H_QEMU_CPU=host,vendor=GenuineIntel,-vmx,+invtsc,-arch-capabilities,-pcid,-invpcid,-x2apic
+"$root/tests/run-vtxtest.sh" skim
 python3 "$root/tests/skim-qemu.py"
 "$root/tests/run-abitest.sh"
 "$root/tests/run-selftest.sh" 1
