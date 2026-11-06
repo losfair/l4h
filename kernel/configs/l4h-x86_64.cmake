@@ -14,7 +14,10 @@ set(KernelXSaveSize "832" CACHE STRING "")
 set(KernelSupportPCID ON CACHE BOOL "")
 set(KernelLAPICMode "X2APIC" CACHE STRING "")
 set(KernelIOMMU OFF CACHE BOOL "")
-set(KernelVTX OFF CACHE BOOL "")
+# VT-x for guests that run KVM (DESIGN.md §4.1).  Patch 0038 boots without
+# it on CPUs that lack it; tools/build-kernel.sh turns it off with SKIM.
+set(KernelVTX ON CACHE BOOL "")
+set(KernelX86_64VTX64BitGuests ON CACHE BOOL "")
 # The default variants require a CPU unaffected by Meltdown (patch 0024).
 # The skim-xapic-nopcid variant enables isolation for affected CPUs;
 # patch 0027 preserves Linux syscall RSP across SKIM's CR3 switches.
