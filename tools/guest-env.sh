@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-only
+# shellcheck shell=bash
 # Source after setting root. Shared architecture selection for guest tests.
 l4h_test_slow=1
 case "${L4H_ARCH:-x86_64}" in

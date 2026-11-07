@@ -37,6 +37,8 @@ jobs:
         run: python3 tests/test_installer.py
       - name: Shell lint
         run: shellcheck tools/install.sh tools/install/init tests/run-install-vm.sh tests/guest/install-test tests/guest/install-curl-fixture
+      - name: Shell lint, every script (errors, and "!" checks that set -e ignores)
+        run: tools/lint-shell.sh
 
   x86_64:
     name: x86_64 (QEMU/KVM)
