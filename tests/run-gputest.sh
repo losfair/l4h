@@ -17,4 +17,4 @@ L4H_KMODS=1 L4H_DOM0_MEM_MB=512 "$root/tools/run-dom0.sh" "$out/gputest.cpio.gz"
     "console=hvc0 L4H_TEST_SLOW=$l4h_test_slow" "${L4H_TEST_TIMEOUT:-$((300 * l4h_test_slow))}" \
     | grep -aE "GPUTEST|GPUVM|GPUCHECK|vm [0-9]|panic|l4h-vmm" || true
 grep -q "GPUTEST: PASS" "$root/build/qemu.log"
-! grep -q "WARNING:\|BUG:" "$root/build/qemu.log"
+! grep -q "WARNING:\|BUG:" "$root/build/qemu.log" || exit 1

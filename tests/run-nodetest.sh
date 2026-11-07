@@ -29,4 +29,4 @@ L4H_DOM0_MEM_MB=${L4H_DOM0_MEM_MB:-2048} L4H_DOM0_VCPUS=${2:-4} \
     "$root/tools/run-dom0.sh" "$out/nodetest.cpio.gz" "console=hvc0" "${NODETEST_TIMEOUT:-300}" \
     | grep -E 'NODETEST|segfault|panic|SC failed|object not bound' || true
 grep -q 'NODETEST: PASS' "$root/build/qemu.log"
-! grep -q 'NODETEST: FAIL\|deschedule .* SC failed\|SchedContext UnbindObject: object not bound' "$root/build/qemu.log"
+! grep -q 'NODETEST: FAIL\|deschedule .* SC failed\|SchedContext UnbindObject: object not bound' "$root/build/qemu.log" || exit 1

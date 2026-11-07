@@ -24,5 +24,5 @@ cp "$root"/tests/guest/page-aging/* "$mod/"
 L4H_DOM0_VCPUS=${1:-1} "$root/tools/run-dom0.sh" "$out/selftest.cpio.gz" "console=hvc0" "${L4H_TEST_TIMEOUT:-${SELFTEST_TIMEOUT:-$test_timeout}}" \
     | sed -n '/SELFTEST: start/,/SELFTEST: \(PASS\|FAIL\)/p'
 grep -q "SELFTEST: PASS" "$root/build/qemu.log"
-! grep -q 'hardware sampling skipped' "$root/build/qemu.log"
-! grep -q 'deschedule .* SC failed\|SchedContext UnbindObject: object not bound' "$root/build/qemu.log"
+! grep -q 'hardware sampling skipped' "$root/build/qemu.log" || exit 1
+! grep -q 'deschedule .* SC failed\|SchedContext UnbindObject: object not bound' "$root/build/qemu.log" || exit 1

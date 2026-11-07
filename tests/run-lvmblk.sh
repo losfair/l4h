@@ -82,7 +82,7 @@ while kill -0 "$qemu" 2>/dev/null && [ "$SECONDS" -lt "$end" ]; do
 done
 sed -n '/l4h-root:/,$p' "$out/qemu.log"
 grep -aq 'LVMBLK: PASS' "$out/qemu.log"
-! grep -aqE 'LVMVM: FAIL|LVMBLK: FAIL' "$out/qemu.log"
+! grep -aqE 'LVMVM: FAIL|LVMBLK: FAIL' "$out/qemu.log" || exit 1
 kill "$qemu" 2>/dev/null || true
 wait "$qemu" 2>/dev/null || true
 
