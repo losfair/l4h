@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-only
+# shellcheck shell=bash
 # Source after setting root. seL4's ARM RAM map must match QEMU's RAM size.
 l4h_memory_stamp=$root/build/sel4-aarch64/.l4h-memory-mb
 l4h_memory=${L4H_MEM:-$(cat "$l4h_memory_stamp" 2>/dev/null || echo 2048)}

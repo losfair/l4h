@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-only
+# shellcheck shell=bash
 # Sourced by tools/mkefi.sh and tools/mkbios.sh: the GRUB lines that boot
 # l4h as several partitions (DESIGN.md §11.4) when the boot partition has
 # l4h-mk.conf, before the single-kernel lines.  The shim and its slot
