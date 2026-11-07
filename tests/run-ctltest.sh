@@ -39,7 +39,7 @@ grep -q "CTLTEST: PASS" "$root/build/qemu.log"
 grep -q "FLAGS: PASS no TPM" "$root/build/qemu.log"
 grep -q "FLAGVM: PASS no TPM" "$root/build/qemu.log"
 grep -q "l4h-attest: no TPM: flags only" "$root/build/qemu.log"
-! grep -q "FLAGVM: FAIL" "$root/build/qemu.log"
+! grep -q "FLAGVM: FAIL" "$root/build/qemu.log" || exit 1
 # l4hctl iommu: on and remapping with either emulated IOMMU, else none.
 if [[ "${L4H_QEMU_IOMMU:-}" = amd || "${L4H_QEMU_IOMMU:-}" = intel ]]; then
     grep -aq "CTLTEST: iommu state: *on" "$root/build/qemu.log" \

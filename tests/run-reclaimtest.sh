@@ -20,4 +20,4 @@ L4H_QEMU_ARGS="-drive file=$disk,if=none,id=swap,format=raw,cache=none -device v
     "$root/tools/run-dom0.sh" "$out/reclaimtest.cpio.gz" "console=hvc0 reclaim_seconds=$seconds" \
     "$((seconds + 180))" | tee "$out/run.log"
 grep -q 'RECLAIM: PASS' "$root/build/qemu.log"
-! grep -q 'RECLAIM: FAIL' "$root/build/qemu.log"
+! grep -q 'RECLAIM: FAIL' "$root/build/qemu.log" || exit 1

@@ -36,5 +36,5 @@ for mode in android default; do
         | sed -n '/ANDROIDTEST: start/,/ANDROIDTEST: \(PASS\|FAIL\)/p'
     cp "$root/build/qemu.log" "$root/build/androidtest-$mode.log"
     grep -q "ANDROIDTEST: PASS" "$root/build/qemu.log"
-    ! grep -q "WARNING:\|BUG:" "$root/build/qemu.log"
+    ! grep -q "WARNING:\|BUG:" "$root/build/qemu.log" || exit 1
 done

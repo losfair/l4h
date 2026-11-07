@@ -25,7 +25,7 @@ L4H_DOM0_MEM_MB=$mem L4H_DOM0_VCPUS=${1:-2} "$root/tools/run-dom0.sh" "$out/bpft
     console=hvc0 "${L4H_TEST_TIMEOUT:-$((300 * l4h_test_slow))}" \
     | grep -a "test_bpf: .*Summary\|BPFTEST" || true
 grep -q "BPFTEST: PASS" "$root/build/qemu.log"
-! grep -q "WARNING:\|BUG:" "$root/build/qemu.log"
-! grep -a "test_bpf: .*Summary" "$root/build/qemu.log" | grep -qv " 0 FAILED"
+! grep -q "WARNING:\|BUG:" "$root/build/qemu.log" || exit 1
+! grep -a "test_bpf: .*Summary" "$root/build/qemu.log" | grep -qv " 0 FAILED" || exit 1
 # Every test_bpf program was JIT-compiled.
-! grep -ao "\[[0-9]*/[0-9]* JIT'ed\]" "$root/build/qemu.log" | awk -F'[][/ ]' '$2 != $3' | grep -q .
+! grep -ao "\[[0-9]*/[0-9]* JIT'ed\]" "$root/build/qemu.log" | awk -F'[][/ ]' '$2 != $3' | grep -q . || exit 1

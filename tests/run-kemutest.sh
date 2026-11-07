@@ -23,4 +23,4 @@ L4H_DOM0_VCPUS=${1:-4} L4H_DOM0_MEM_MB=512 \
     "$root/tools/run-dom0.sh" "$out/kemu.cpio.gz" "console=hvc0 ${KEMU_CMDLINE:-}" \
     "${L4H_TEST_TIMEOUT:-180}" | sed -n '/KEMUTEST: start/,/KEMUTEST: \(PASS\|FAIL\)/p'
 grep -q 'KEMUTEST: PASS' "$root/build/qemu.log"
-! grep -q 'KEMUTEST: FAIL' "$root/build/qemu.log"
+! grep -q 'KEMUTEST: FAIL' "$root/build/qemu.log" || exit 1

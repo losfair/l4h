@@ -13,4 +13,4 @@ grep -aE 'FLAG|l4h-attest|panic|no TPM' "$out/run.log"
 grep -aq 'FLAGSTEST: PASS' "$out/run.log"
 grep -aq 'FLAGVM: PASS no TPM' "$out/run.log"
 grep -aq 'l4h-attest: no TPM: flags only' "$out/run.log"
-! grep -aq 'FAIL' "$out/run.log"
+! grep -aq 'FAIL' "$out/run.log" || exit 1

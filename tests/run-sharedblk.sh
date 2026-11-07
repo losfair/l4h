@@ -56,9 +56,9 @@ done
 sed -n '/l4h-root:/,$p' "$out/qemu.log"
 grep -q 'SHAREDBLK: PASS' "$out/qemu.log"
 grep -q '4 MiB of I/O pool kept out of use' "$out/qemu.log"
-! grep -qE 'SHAREDVM: FAIL|SHAREDBLK: FAIL' "$out/qemu.log"
+! grep -qE 'SHAREDVM: FAIL|SHAREDBLK: FAIL' "$out/qemu.log" || exit 1
 if [ "${SHARED_BLK_DEV:-}" = scsi-luns ]; then
     grep -aq '^disk 0: pci .* virtio-scsi 1:0,' "$out/qemu.log"
     grep -aq '^disk 1: pci .* virtio-scsi 1:5,' "$out/qemu.log"
-    ! grep -aq '^disk 2:' "$out/qemu.log"
+    ! grep -aq '^disk 2:' "$out/qemu.log" || exit 1
 fi

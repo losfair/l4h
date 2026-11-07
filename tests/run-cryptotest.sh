@@ -19,4 +19,4 @@ L4H_DOM0_VCPUS=${1:-2} "$root/tools/run-dom0.sh" "$out/cryptotest.cpio.gz" \
     "console=hvc0 cryptotest=$secs,$mib" "${L4H_TEST_TIMEOUT:-$(((secs * 4 + 180) * l4h_test_slow))}" \
     | sed -n '/CRYPTOTEST: start/,/CRYPTOTEST: \(PASS\|FAIL\)/p'
 grep -q "CRYPTOTEST: PASS" "$root/build/qemu.log"
-! grep -q "WARNING:\|BUG:" "$root/build/qemu.log"
+! grep -q "WARNING:\|BUG:" "$root/build/qemu.log" || exit 1

@@ -53,10 +53,10 @@ for case in fits overflow; do
     grep -aE 'DEVICELIMIT|panicked at|dom0 device plan needs|Caught cap fault' "$log" || true
     if [ "$case" = fits ]; then
         grep -aq 'DEVICELIMIT: PASS' "$log"
-        ! grep -aqE 'DEVICELIMIT: FAIL|panicked at|Caught cap fault' "$log"
+        ! grep -aqE 'DEVICELIMIT: FAIL|panicked at|Caught cap fault' "$log" || exit 1
     else
         grep -aq 'dom0 device plan needs 65 slots' "$log"
-        ! grep -aq "guest 0 'dom0' started" "$log"
+        ! grep -aq "guest 0 'dom0' started" "$log" || exit 1
     fi
 done
 echo 'DEVICELIMIT: PASS (QEMU, 64 accepted and 65 rejected)'

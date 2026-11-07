@@ -23,4 +23,4 @@ L4H_QEMU_ARGS="-drive file=$disk,if=none,id=swap,format=raw,cache=none -device v
     | tee "$out/run.log"
 grep -q 'THPTEST: PASS' "$root/build/qemu.log"
 grep -q 'THPTEST: fallback PASS' "$root/build/qemu.log"
-! grep -q 'THPTEST: FAIL\|WARNING:\|BUG:\|Kernel panic' "$root/build/qemu.log"
+! grep -q 'THPTEST: FAIL\|WARNING:\|BUG:\|Kernel panic' "$root/build/qemu.log" || exit 1

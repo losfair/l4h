@@ -17,4 +17,4 @@ L4H_DOM0_VCPUS=${1:-1} L4H_DOM0_MEM_MB=512 L4H_TEST_FAIL_PATTERN='THPBENCH: FAIL
     "$root/tools/run-dom0.sh" "$out/initrd.cpio.gz" 'console=hvc0' "${L4H_TEST_TIMEOUT:-900}" \
     | tee "$out/run-${1:-1}.log"
 grep -q 'THPBENCH: PASS' "$root/build/qemu.log"
-! grep -q 'THPBENCH: FAIL\|WARNING:\|BUG:\|Kernel panic' "$root/build/qemu.log"
+! grep -q 'THPBENCH: FAIL\|WARNING:\|BUG:\|Kernel panic' "$root/build/qemu.log" || exit 1

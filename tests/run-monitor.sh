@@ -49,7 +49,7 @@ else
         [ "$SECONDS" -lt "$end" ] || { echo "monitor: the host did not reset"; kill "$qemu"; exit 1; }
         sleep 0.5
     done
-    ! grep -aq "reboot failed" "$log"
+    ! grep -aq "reboot failed" "$log" || exit 1
 fi
 wait "$qemu" 2>/dev/null || true
 grep -aE "monitor:|restarting dom0|host reboot" "$log"
