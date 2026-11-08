@@ -1,0 +1,53 @@
+#!/bin/sh
+# Guest of tests/run-usbnetbench.sh, under l4h (usb-l4h) or natively in
+# QEMU (xhci-pci; modules in /lib/native in load order): a USB NIC on QEMU's
+# user network, against tests/usbnet-peer.py at 10.0.2.2.  Receive and send
+# throughput (netmb= MB each, timed here) and ping latency, netruns= times.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+say() { echo "USBNET: $*"; }
+fail() { say "FAIL: $*"; poweroff -f; }
+arg() { sed -n "s/.* $1=\([^ ]*\).*/\1/p" /proc/cmdline; }
+if [ -e /dev/l4hkmod ]; then
+    mkdir -p /lib/modules
+    mount -t erofs -o ro /dev/l4hkmod /lib/modules || fail "no module tree"
+    for m in usb_l4h usbnet cdc_ether rndis_host; do modprobe "$m" || fail "modprobe $m"; done
+else
+    for m in $(cat /lib/native/order); do insmod "/lib/native/$m" || fail "insmod $m"; done
+fi
+ifc=
+for _ in $(seq 100); do
+    # The one with a USB device under it (not bond0, sit0 and such).
+    for n in /sys/class/net/*; do
+        case $(readlink -f "$n/device" 2>/dev/null) in */usb*) ifc=${n##*/} ;; esac
+    done
+    [ -n "$ifc" ] && break
+    sleep 0.2
+done
+[ -n "$ifc" ] || fail "no USB NIC"
+drv=$(basename "$(readlink "/sys/class/net/$ifc/device/driver")")
+say "nic $ifc driver $drv"
+ip link set lo up
+ip link set "$ifc" up || fail "link up"
+ip addr add 10.0.2.15/24 dev "$ifc"
+ip route add default via 10.0.2.2
+sleep 1
+now() { cut -d' ' -f1 /proc/uptime; }
+rate() { awk -v b="$1" -v t0="$2" -v t1="$3" 'BEGIN { t = t1 - t0; if (t <= 0) t = 0.01; printf "%.1f", b / t }'; }
+mb=$(arg netmb)
+for i in $(seq "$(arg netruns)"); do
+    t0=$(now)
+    got=$(nc 10.0.2.2 "$(arg rxport)" </dev/null | wc -c)
+    t1=$(now)
+    [ "$got" -eq $((mb << 20)) ] || fail "received $got bytes, not $((mb << 20))"
+    say "run $i receive $(rate "$mb" "$t0" "$t1") MB/s"
+    t0=$(now)
+    dd if=/dev/zero bs=64k count=$((mb * 16)) 2>/dev/null | nc 10.0.2.2 "$(arg txport)"
+    t1=$(now)
+    say "run $i send $(rate "$mb" "$t0" "$t1") MB/s"
+done
+lat=$(ping -c 50 -i 0.1 -q 10.0.2.2 2>&1 | tail -1)
+say "ping 10.0.2.2: $lat"
+say "DONE"
+poweroff -f

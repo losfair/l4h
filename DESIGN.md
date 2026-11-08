@@ -3925,6 +3925,7 @@ pessimistic.
 | disk, 4 KiB read latency | 350–375 µs | Two cross-core wakeups each way (guest → VMM → blkd), plus the bounce; higher than the copy alone explains, not yet investigated. |
 | USB disk through usbd (§9.7), 1 MiB direct, 2 vCPUs | UAS: 470–1280 MB/s read, 430–510 MB/s write; BOT: 115–195 / 115–140 MB/s | QEMU's xHCI (`tests/run-usbstress.sh`, several runs on a host with other load: up to 2× run-to-run). The same devices under a plain Linux VM with `xhci-pci`: UAS 560–985 / 390–440, BOT 400–1070 / 320–410 MB/s. Requests are at most 256 KiB (64 pool segments, swiotlb's largest mapping) against native 512 KiB–1 MiB. |
 | USB disk, 4 KiB direct reads | UAS 1250–1740 IOPS, BOT 640–830 IOPS | Native 1590–1910 and 1580–2110. Each URB round trip (guest → usbd → controller → usbd → VMM → guest) costs a few hundred µs more, the cross-core wakeups of the disk path above; BOT takes three per command, UAS overlaps them. |
+| USB Ethernet through usbd (QEMU's `usb-net`, CDC Ethernet, on QEMU's user network) | 12.5–12.9 MB/s receive, 5–10 MB/s send; ping 1.2 ms | `tests/run-usbnetbench.sh`: 256 MB each way to a peer on the build host. A plain Linux VM on the same devices: 13.8 MB/s receive, 4–9 MB/s send, ping 0.35 ms. QEMU's emulation of the device sets the throughput for both; the extra 0.8 ms of ping is two URB round trips (§9.7 disks above). |
 | guest↔guest ping | 1.4 ms | Four component hops per direction, with cross-core wakeups. |
 | guest↔guest TCP | 670–710 MB/s | 1 vCPU each, sender ~70 % busy (`netbench`, 256 KiB writes, 1 MiB reads); checksum offload and TSO pass through the switch. |
 | dom0 ↔ host over a tap NIC (vhost) | 380–620 MB/s down, 410–490 MB/s up | 256 MiB with wget / a 256 KiB-write sender. A plain Linux VM on the same QEMU: 0.5–1.3 GB/s. |
@@ -4134,6 +4135,7 @@ machine and guests of 256–512 MiB.
 | `tests/run-devicelimit.sh` | 64 devices per guest |
 | `tests/run-gputest.sh` | virtio-gpu drawing, screenshots, size checks and reclaim |
 | `tests/run-usbstress.sh` (`STRESS_SECS`, `STRESS_CYCLES`, `USBSTRESS_NATIVE=1`) | USB stress and benchmark: all disks busy while one is pulled and put back, guests destroyed under load, data intact; per-disk throughput and IOPS, optionally against a plain Linux VM |
+| `tests/run-usbnetbench.sh` (`NETBENCH_MB`, `NETBENCH_RUNS`, `USBSTRESS_NATIVE=1`) | USB Ethernet (QEMU's `usb-net`) given whole to a guest: receive and send throughput and ping against a peer on the build host, optionally against a plain Linux VM |
 | `tests/run-usbtest.sh` (`USBTEST_HC=nec`) | whole xHCI controller assignment: left to the firmware until claimed, HID, BOT and UAS disks, a hub, driver reload, destroy during I/O, a second guest (§9.7) |
 | `tests/run-nettest.sh`, `tests/run-router.sh` | switches, uplink, multi-NIC, isolation, MAC lock, NAT router VM (`NETTEST_LEGACY=1`: legacy virtio-net uplink) |
 | `tests/run-density.sh 30 256` | 30 guests on 4 cores stay responsive |
