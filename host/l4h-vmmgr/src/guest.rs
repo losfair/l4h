@@ -253,6 +253,8 @@ pub struct Guest {
     pub dom0: bool,
     /// Its processes' VSpaces (the pool it recycles, abi::SLOT_VSPACE_POOL).
     vspaces: ArrayVec<cap::VSpace, MAX_VSPACES>,
+    /// EPT roots in its pool (abi::SLOT_EPT_POOL).
+    nr_ept_roots: usize,
     bootinfo: ArrayVec<cap::Granule, { abi::BOOTINFO_SIZE as usize / PAGE }>,
     entry: u64,
     /// Objects l4h-vmm serves the guest with: its endpoint (the guest's
@@ -727,6 +729,7 @@ impl Guest {
         bi.nr_blocks = self.nr_blocks as u64;
         bi.boot_blocks = self.boot_blocks as u64;
         bi.nr_vspaces = self.vspaces.len() as u64;
+        bi.nr_ept_roots = self.nr_ept_roots as u64;
         if self.kmod_size != 0 {
             bi.kmod_va = abi::KMOD_VA;
             bi.kmod_size = self.kmod_size as u64;
@@ -941,6 +944,7 @@ pub fn create(
         + (cfg.io_pool / 512 + 2 * PAGE)
         + cfg.vcpus * (16 << 10)
         + cfg.vspaces * PAGE
+        + if host_info.vtx { abi::MAX_EPT_ROOTS * PAGE } else { 0 }
         + abi::BOOTINFO_SIZE as usize
         + if cfg.dom0 { abi::CTL_LOAD_MAX as usize } else { 0 }
         + vmm::arena_bytes(cfg.io_pool, cfg.vcpus, MAX_GUEST_DEVICES);
@@ -977,6 +981,7 @@ pub fn create(
         state: State::Created,
         dom0: cfg.dom0,
         vspaces: ArrayVec::new(),
+        nr_ept_roots: 0,
         bootinfo: ArrayVec::new(),
         entry: 0,
         vmm_ep: cap::Endpoint::from_bits(0),
@@ -1089,6 +1094,23 @@ pub fn create(
             .expect("vspace pool copy");
     }
     g.give_badged(abi::SLOT_VSPACE_POOL, pool_cn, CapRights::all(), guard6);
+
+    // ---- EPT roots for the guest's KVM.
+    #[cfg(target_arch = "x86_64")]
+    if host_info.vtx {
+        let bp: ObjectBlueprint = sel4::ObjectBlueprintSeL4Arch::EPTPML4.into();
+        let ept_cn = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: abi::ROOT_CNODE_BITS });
+        for i in 0..abi::MAX_EPT_ROOTS {
+            let root = g.arena.object_cap::<cap_type::VSpace>(alloc, bp);
+            asids.assign(alloc, root);
+            ept_cn
+                .absolute_cptr_from_bits_with_depth(i as u64, abi::ROOT_CNODE_BITS)
+                .copy(&abs(root), CapRights::all())
+                .expect("EPT pool copy");
+        }
+        g.nr_ept_roots = abi::MAX_EPT_ROOTS;
+        g.give_badged(abi::SLOT_EPT_POOL, ept_cn, CapRights::all(), guard6);
+    }
     g.dev_cn = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: abi::ROOT_CNODE_BITS });
     g.give_badged(abi::SLOT_DEV_CNODE, g.dev_cn, CapRights::all(), guard6);
 

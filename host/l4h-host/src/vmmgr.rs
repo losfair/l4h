@@ -224,6 +224,8 @@ pub struct VmmgrConfig {
     pub watchdog_secs: u64,
     /// trustd runs: its flags are at FLAGS_VA, SLOT_FLAGS_EP acts on them.
     pub trust: u64,
+    /// The kernel makes VT-x objects: guests get EPT roots.
+    pub vtx: u64,
     /// ASID pools in its CSpace, and the ASIDs already used in each.
     pub asid_pools: u64,
     pub asids_used: [u64; MAX_ASID_POOLS],
