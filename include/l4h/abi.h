@@ -989,6 +989,7 @@ struct l4h_usb_xfer_req {
 #define L4H_USB_ST_MISSED       (-18)   /* -EXDEV: isoch packet not sent */
 #define L4H_USB_ST_NOSPC        (-28)   /* -ENOSPC: no slot, ring or bandwidth */
 #define L4H_USB_ST_IO           (-5)    /* -EIO: any other failure */
+#define L4H_USB_ST_AGAIN        (-11)   /* -EAGAIN: URB_CANCEL of an URB not taken yet */
 
 #define L4H_USB_CQ_CTL          1u      /* l4h_usb_cqe.kind: a control request */
 #define L4H_USB_CQ_XFER         2u      /* a transfer */

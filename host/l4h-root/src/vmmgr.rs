@@ -625,8 +625,8 @@ fn guest_del(h: &mut Host, id: usize) -> Result<Vals, i64> {
     for &(c, i) in &g.disks {
         cut &= blkd::cut_off(h, c, i);
     }
-    // A USB controller loses bus mastering and its mapping of the pool at
-    // once; its queue frames are root's, freed when usbd has let go.
+    // A USB controller is cut off from the pool (and the guest from its
+    // queue frames, root's) before the pool goes.
     for &u in &g.usbs {
         cut &= crate::usb::remove(h, u);
     }

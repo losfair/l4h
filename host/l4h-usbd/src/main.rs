@@ -10,7 +10,11 @@
 //! usbd never reads back what it published.  It accepts a request only
 //! while the guest's completion queue has room for it, so the CQ never
 //! overflows and a guest that does not consume completions stalls only
-//! itself.
+//! itself.  Each turn does a bounded amount of work.
+//!
+//! Root calls usbd once, to claim the controller.  After that the guest
+//! can keep usbd busy, so root only posts requests in the mailbox
+//! (proto::Mailbox) and is signalled when they are done.
 
 #![no_std]
 #![no_main]
@@ -31,9 +35,6 @@ use sel4::cap_type;
 use crate::ring::{NONE, Rings, Urbs};
 use crate::xhci::*;
 
-fn mr(i: usize) -> u64 {
-    sel4::with_ipc_buffer(|b| b.msg_regs()[i])
-}
 fn set_mr(i: usize, v: u64) {
     sel4::with_ipc_buffer_mut(|b| b.msg_regs_mut()[i] = v);
 }
@@ -41,6 +42,15 @@ fn set_mr(i: usize, v: u64) {
 const EINVAL: u64 = 22;
 const EIO: u64 = 5;
 const EBUSY: u64 = 16;
+
+/// CQ entries transfers leave free: a control request (an URB_CANCEL)
+/// always gets in once the guest has consumed its completions, even with
+/// every other entry reserved for transfers in flight.
+const CTL_RESERVE: u32 = 1;
+/// Records taken from each submission queue in one turn: then the event
+/// ring and the mailbox get their turn again.
+const CTL_BUDGET: u32 = abi::CTL_SQ_SIZE as u32;
+const XFER_BUDGET: u32 = abi::XFER_SQ_SIZE as u32;
 
 /// Isoch TDs in flight, at most: with every other URB's two events, the
 /// event ring (EVENT_TRBS) never fills.
@@ -84,6 +94,8 @@ impl Slot {
 
 /// The guest the controller is assigned to.
 struct Client {
+    /// Its area (proto::queue_va), and its notification's slot.
+    idx: usize,
     area: usize,
     pool: Pool,
     max_transfer: u32,
@@ -185,9 +197,11 @@ pub struct Usbd {
     pub urbs: Urbs,
     /// Endpoints whose halt is to be cleared: (slot, DCI, ring).
     recover: l4h_rt::host::fixed::ArrayVec<(u8, u8, u16), 256>,
+    /// Rings a completion made room on, to post their waiting URBs once
+    /// no command is running (refill).
+    refill: [u64; proto::USB_RINGS / 64],
     refused: u64,
     resets: u64,
-    tsc_hz: u64,
     dead: bool,
     errors: l4h_rt::ErrorLimit,
 }
@@ -418,12 +432,14 @@ impl Usbd {
             c.iso[..n].copy_from_slice(&urb.iso[..n]);
         }
         let iso_tds = if urb.xfer.ty == abi::XFER_ISOC { urb.ends.len() as u32 } else { 0 };
-        let next = self.rings.unlink(&mut self.urbs, r, u);
+        self.rings.unlink(&mut self.urbs, r, u);
         self.urbs.free(u);
         if halted && self.slots[slot].eps[dci].state != EpState::Disabled {
             self.slots[slot].eps[dci].state = EpState::Halted;
             let _ = self.recover.push((slot as u8, dci as u8, r));
-            let _ = next;
+        } else {
+            // Its TRBs are free: URBs waiting for room can go on.
+            self.refill[r as usize / 64] |= 1 << (r % 64);
         }
         if let Some(cl) = &mut self.client {
             cl.in_flight -= 1;
@@ -434,6 +450,21 @@ impl Usbd {
     }
 
     // ---- Rings.
+
+    /// Post what waits on the rings completions made room on.  Not while
+    /// a command runs: a doorbell would restart an endpoint being stopped.
+    fn refill(&mut self) {
+        for w in 0..self.refill.len() {
+            while self.refill[w] != 0 {
+                let b = self.refill[w].trailing_zeros() as usize;
+                self.refill[w] &= !(1 << b);
+                let r = (w * 64 + b) as u16;
+                if self.rings.get(r).used && self.rings.first_waiting(&self.urbs, r) != NONE {
+                    self.post(r);
+                }
+            }
+        }
+    }
 
     /// Put the URBs waiting on ring `r` on it, as far as there is room, and
     /// ring the doorbell.
@@ -651,10 +682,7 @@ impl Usbd {
             abi::OP_EP_RESET => self.ep_reset(r.slot, arg[0]),
             abi::OP_STREAMS_ALLOC => self.streams(r.slot, r.drop, arg[0]),
             abi::OP_STREAMS_FREE => self.streams(r.slot, r.drop, 0),
-            abi::OP_URB_CANCEL => {
-                self.cancel(arg[0]);
-                abi::ST_OK
-            }
+            abi::OP_URB_CANCEL => self.cancel(arg[0]),
             _ => abi::ST_INVALID,
         }
     }
@@ -785,9 +813,13 @@ impl Usbd {
         }
         let mut add = 0u32;
         for e in &eps[..n] {
+            // ep_ok first: the DCI is in 2..=31 then.
+            if !proto::ep_ok(e, speed) {
+                return abi::ST_INVALID;
+            }
             let bit = 1u32 << e.dci;
             let enabled = self.slots[s].eps[e.dci as usize].state != EpState::Disabled;
-            if !proto::ep_ok(e, speed) || add & bit != 0 || (enabled && r.drop & bit == 0) {
+            if add & bit != 0 || (enabled && r.drop & bit == 0) {
                 return abi::ST_INVALID;
             }
             add |= bit;
@@ -914,24 +946,49 @@ impl Usbd {
 
     /// Stop endpoint (slot, dci) if it runs.  Whether it is stopped.
     fn stop(&mut self, s: usize, dci: usize) -> bool {
-        match self.slots[s].eps[dci].state {
-            EpState::Running => {
-                let res = self.command(Trb { param: 0, status: 0, control: CMD_STOP_EP << 10 | (dci as u32) << 16 | (s as u32) << 24 });
-                // Context State Error: it had stopped of itself (halted).
-                if matches!(res, Some((CC_SUCCESS, _)) | Some((19, _))) {
-                    if self.slots[s].eps[dci].state == EpState::Running {
-                        self.slots[s].eps[dci].state = EpState::Stopped;
-                    }
-                    return true;
+        // A halted one is recovered first, which restarts it: Running,
+        // (CSE, halted) Halted, recovered Running again.
+        for _ in 0..3 {
+            match self.slots[s].eps[dci].state {
+                EpState::Running => {
+                    let res = self.command(Trb { param: 0, status: 0, control: CMD_STOP_EP << 10 | (dci as u32) << 16 | (s as u32) << 24 });
+                    // Context State Error: it had stopped of itself.
+                    return match res {
+                        Some((CC_SUCCESS, _)) => {
+                            if self.slots[s].eps[dci].state == EpState::Running {
+                                self.slots[s].eps[dci].state = EpState::Stopped;
+                            }
+                            true
+                        }
+                        Some((19, _)) if self.slots[s].eps[dci].state == EpState::Running => {
+                            self.slots[s].eps[dci].state = EpState::Stopped;
+                            true
+                        }
+                        // Halted meanwhile: its event came with the result.
+                        Some((19, _)) if self.slots[s].eps[dci].state == EpState::Halted => continue,
+                        _ => false,
+                    };
                 }
-                false
+                EpState::Stopped => return true,
+                EpState::Halted => self.recover_all(),
+                EpState::Disabled => return false,
             }
-            EpState::Stopped => true,
-            EpState::Halted => {
-                self.recover_all();
-                self.slots[s].eps[dci].state == EpState::Stopped
+        }
+        self.slots[s].eps[dci].state == EpState::Stopped
+    }
+
+    /// Restart every ring of endpoint (slot, dci) after a stop.
+    fn restart(&mut self, s: usize, dci: usize) {
+        let ep = self.slots[s].eps[dci];
+        if ep.state != EpState::Stopped {
+            return;
+        }
+        if ep.streams == 0 {
+            self.post_or_ring(s, dci, ep.ring);
+        } else {
+            for &r in &ep.stream_rings[1..ep.streams as usize] {
+                self.post_or_ring(s, dci, r);
             }
-            EpState::Disabled => false,
         }
     }
 
@@ -1045,21 +1102,32 @@ impl Usbd {
     }
 
     /// URB_CANCEL: complete the URB with CANCELLED once the controller can
-    /// no longer touch its buffers.
-    fn cancel(&mut self, tag: u32) {
-        let Some(u) = self.urbs.find(tag) else { return };
+    /// no longer touch its buffers.  An URB not found may still be in the
+    /// transfer SQ, submitted before the cancel: take what is there first.
+    /// One still not found has completed (OK), or waits behind a full CQ
+    /// (AGAIN: the guest asks again).
+    fn cancel(&mut self, tag: u32) -> i32 {
+        if self.urbs.find(tag).is_none() {
+            // Leave the entry for this request's own completion.
+            self.accept_transfers(XFER_BUDGET, 1);
+        }
+        let Some(u) = self.urbs.find(tag) else {
+            let cl = self.client.as_ref().unwrap();
+            let left = cl.xfer.avail(cl.guest(|c| &c.xfer_sq_head)).unwrap_or(0);
+            return if left == 0 { abi::ST_OK } else { abi::ST_AGAIN };
+        };
         let urb = self.urbs.get(u);
         let (s, d, r) = (urb.xfer.slot as usize, urb.xfer.dci as usize, urb.ring);
-        if urb.posted {
-            if !self.stop(s, d) {
-                // The controller is broken: its reset completes everything.
-                return;
-            }
-            // It may have completed while the endpoint stopped.
-            if self.urbs.find(tag) != Some(u) {
-                return;
-            }
-            let dma = self.hc().dma;
+        if !urb.posted {
+            self.complete_cancelled(u, s, d, r, 0);
+            return abi::ST_OK;
+        }
+        if !self.stop(s, d) {
+            // The controller is broken: its reset completes everything.
+            return abi::ST_OK;
+        }
+        // It may have completed while the endpoint stopped.
+        if self.urbs.find(tag) == Some(u) {
             if self.rings.get(r).head == u {
                 // The controller is on it, or about to be: move past it.
                 let actual = self.urbs.get(u).actual;
@@ -1067,20 +1135,14 @@ impl Usbd {
                 self.set_deq(s, d, r);
             } else {
                 // Later on the ring: the controller skips it as no-ops.
+                let dma = self.hc().dma;
                 self.rings.noop(dma, r, self.urbs.get(u).first, self.urbs.get(u).ntrbs);
                 self.complete_cancelled(u, s, d, r, 0);
             }
-            self.slots[s].eps[d].state = EpState::Stopped;
-            self.post_or_ring(s, d, r);
-            // No-ops left with nothing after them are consumed too.
-            if self.rings.get(r).head == NONE {
-                let target = d as u32 | (self.rings.get(r).stream as u32) << 16;
-                self.hc().ring_db(s as u32, target);
-                self.slots[s].eps[d].state = EpState::Running;
-            }
-        } else {
-            self.complete_cancelled(u, s, d, r, 0);
         }
+        // Stop Endpoint stopped every stream of it: restart them all.
+        self.restart(s, d);
+        abi::ST_OK
     }
 
     fn complete_cancelled(&mut self, u: u16, s: usize, d: usize, r: u16, actual: u32) {
@@ -1145,8 +1207,33 @@ impl Usbd {
         }
     }
 
-    /// Serve the client's queues: reset requests, control requests, then
-    /// transfers, as far as the CQ has room.
+    /// Take up to `budget` transfer records while the CQ has room beyond
+    /// `keep` entries (and CTL_RESERVE) and the isoch TDs allow.
+    fn accept_transfers(&mut self, budget: u32, keep: u32) {
+        for _ in 0..budget {
+            let Some(cl) = self.client.as_mut() else { return };
+            if self.dead {
+                return;
+            }
+            let head = cl.guest(|c| &c.xfer_sq_head);
+            let Some(n) = cl.xfer.avail(head) else { return };
+            if n == 0 {
+                return;
+            }
+            if cl.room() <= CTL_RESERVE + keep || cl.iso_tds + abi::MAX_ISO as u32 > MAX_ISO_TDS {
+                cl.blocked = true;
+                return;
+            }
+            let base = (cl.area + abi::XFER_SQ_OFF) as *const XferReq;
+            let req = unsafe { proto::read_record(base, abi::XFER_SQ_SIZE as u32, cl.xfer.tail) };
+            cl.xfer.tail = cl.xfer.tail.wrapping_add(1);
+            cl.publish(|i| &mut i.xfer_sq_tail, cl.xfer.tail);
+            self.transfer(&req);
+        }
+    }
+
+    /// Serve the client's queues: a reset request, control requests, then
+    /// transfers, as far as the CQ has room and this turn's budget goes.
     fn serve(&mut self) {
         let Some(cl) = &self.client else { return };
         let seq = cl.guest(|c| &c.reset_seq);
@@ -1162,8 +1249,9 @@ impl Usbd {
             return;
         }
         self.recover_all();
+        self.refill();
         // Control requests complete at once, in order.
-        loop {
+        for _ in 0..CTL_BUDGET {
             let cl = self.client.as_mut().unwrap();
             let head = cl.guest(|c| &c.ctl_sq_head);
             let Some(n) = cl.ctl.avail(head) else { break };
@@ -1179,25 +1267,11 @@ impl Usbd {
             if self.dead || self.client.is_none() {
                 return;
             }
+            self.refill();
         }
-        // Transfers, while the CQ and the event ring have room.
-        loop {
-            let cl = self.client.as_mut().unwrap();
-            let head = cl.guest(|c| &c.xfer_sq_head);
-            let Some(n) = cl.xfer.avail(head) else { break };
-            if n == 0 {
-                break;
-            }
-            if cl.room() == 0 || cl.iso_tds + abi::MAX_ISO as u32 > MAX_ISO_TDS {
-                cl.blocked = true;
-                break;
-            }
-            let base = (cl.area + abi::XFER_SQ_OFF) as *const XferReq;
-            let req = unsafe { proto::read_record(base, abi::XFER_SQ_SIZE as u32, cl.xfer.tail) };
-            cl.xfer.tail = cl.xfer.tail.wrapping_add(1);
-            cl.publish(|i| &mut i.xfer_sq_tail, cl.xfer.tail);
-            self.transfer(&req);
-        }
+        self.accept_transfers(XFER_BUDGET, 0);
+        self.recover_all();
+        self.refill();
     }
 
     /// Whether the client has something for us: a request, a reset, or CQ
@@ -1209,7 +1283,7 @@ impl Usbd {
         }
         cl.guest(|c| &c.reset_seq) != cl.reset_seen
             || cl.ctl.avail(cl.guest(|c| &c.ctl_sq_head)).is_some_and(|n| n > 0 && cl.room() > 0)
-            || cl.xfer.avail(cl.guest(|c| &c.xfer_sq_head)).is_some_and(|n| n > 0 && cl.room() > 0
+            || cl.xfer.avail(cl.guest(|c| &c.xfer_sq_head)).is_some_and(|n| n > 0 && cl.room() > CTL_RESERVE
                 && cl.iso_tds + abi::MAX_ISO as u32 <= MAX_ISO_TDS)
     }
 
@@ -1288,13 +1362,17 @@ impl Usbd {
     }
 
     /// Write the client's info page and start the controller.
-    fn attach(&mut self, pool: Pool, irq: sel4::cap::Notification) -> u64 {
-        let hc = self.hc.as_ref().unwrap();
+    fn attach(&mut self, idx: usize, pool: Pool) -> u64 {
+        if self.client.is_some() || idx >= proto::AREAS {
+            return EBUSY;
+        }
+        let Some(hc) = self.hc.as_ref() else { return EIO };
         // A 32-bit controller cannot reach a pool above 4 GiB.
         if !hc.caps.ac64 && pool.paddr.checked_add(pool.size).is_none_or(|e| e > 1 << 32) {
             return EINVAL;
         }
-        let area = proto::queue_va(0);
+        let area = proto::queue_va(idx);
+        let irq = cap::<cap_type::Notification>(proto::USBD_SLOT_CLIENT_IRQ + idx as u64);
         let c = &hc.caps;
         let info = area as *mut Info;
         unsafe {
@@ -1314,7 +1392,7 @@ impl Usbd {
         let max_transfer = ((pool.size / 4) as u32).min(proto::MAX_TRANSFER);
         unsafe { (*info).max_transfer = max_transfer };
         self.client = Some(Client {
-            area, pool, max_transfer,
+            idx, area, pool, max_transfer,
             ctl: Sq { tail: 0, size: abi::CTL_SQ_SIZE as u32 },
             xfer: Sq { tail: 0, size: abi::XFER_SQ_SIZE as u32 },
             cq_head: 0, eq_head: 0, in_flight: 0, iso_tds: 0, reset_seen: 0, irq, notify: false, lost: 0, blocked: false,
@@ -1332,26 +1410,70 @@ impl Usbd {
     }
 
     /// The client is going: stop the controller touching its pool.
-    fn remove(&mut self) -> u64 {
+    /// Root has already cut the controller off (bus mastering) and taken
+    /// the notification away; it frees the area once this is done.
+    fn remove(&mut self, idx: usize) -> u64 {
+        if self.client.as_ref().is_none_or(|c| c.idx != idx) {
+            return EINVAL;
+        }
         let ok = self.hc.as_mut().is_some_and(|h| h.halt_reset());
         self.forget_all(false);
         self.client = None;
         if ok { 0 } else { EIO }
     }
 
-    /// Before waiting: tell the guest to kick, then look once more.
-    fn prepare_wait(&mut self) {
-        loop {
-            let Some(c) = &self.client else { return };
-            c.publish(|i| &mut i.usbd_waiting, 1);
-            fence(Ordering::SeqCst);
-            if !self.has_work() {
-                return;
+    /// Do root's request, if it posted one.  Whether it did.
+    fn mailbox(&mut self) -> bool {
+        let m = proto::MBOX_VA as *mut proto::Mailbox;
+        unsafe {
+            write_volatile(addr_of_mut!((*m).refused), self.refused);
+            write_volatile(addr_of_mut!((*m).resets), self.resets);
+            let seq = read_volatile(addr_of!((*m).seq));
+            if seq == read_volatile(addr_of!((*m).done)) {
+                return false;
             }
-            c.publish(|i| &mut i.usbd_waiting, 0);
-            self.serve();
-            self.flush();
+            fence(Ordering::Acquire);
+            let r = read_volatile(m);
+            let idx = r.idx as usize;
+            let result = match r.op {
+                proto::MBOX_ATTACH => self.attach(idx, Pool { gpa: r.gpa, paddr: r.paddr, size: r.size }),
+                proto::MBOX_REMOVE => self.remove(idx),
+                _ => EINVAL,
+            };
+            write_volatile(addr_of_mut!((*m).result), result as u32);
+            write_volatile(addr_of_mut!((*m).resets), self.resets);
+            fence(Ordering::Release);
+            write_volatile(addr_of_mut!((*m).done), seq);
         }
+        cap::<cap_type::Notification>(proto::USBD_SLOT_ROOT_NTFN).signal();
+        true
+    }
+
+    /// Before waiting: tell the guest to kick, then look once more.
+    /// Whether there is work after all (another turn, not a wait).
+    fn prepare_wait(&mut self) -> bool {
+        let Some(c) = &self.client else { return false };
+        c.publish(|i| &mut i.usbd_waiting, 1);
+        fence(Ordering::SeqCst);
+        if !self.has_work() {
+            return false;
+        }
+        c.publish(|i| &mut i.usbd_waiting, 0);
+        true
+    }
+
+    /// One turn: events, root's request, the client's queues.
+    fn turn(&mut self) {
+        if self.hc.is_none() {
+            return;
+        }
+        self.events();
+        if self.hc.as_ref().is_some_and(|h| h.sts() & (STS_HSE | STS_HCE) != 0 || h.sts() == u32::MAX) {
+            self.hc_failed();
+        }
+        self.mailbox();
+        self.serve();
+        self.flush();
     }
 
     fn woken(&self) {
@@ -1368,7 +1490,8 @@ impl Usbd {
             }
             if c.notify {
                 c.notify = false;
-                c.irq.signal();
+                // NBSend: root may have emptied the slot (REMOVE).
+                c.irq.nb_send(sel4::MessageInfo::new(0, 0, 0, 0));
             }
         }
     }
@@ -1386,9 +1509,9 @@ fn main(info: &'static l4h_rt::Info) -> ! {
         rings: Rings::new(),
         urbs: Urbs::new(),
         recover: l4h_rt::host::fixed::ArrayVec::new(),
+        refill: [0; proto::USB_RINGS / 64],
         refused: 0,
         resets: 0,
-        tsc_hz,
         dead: false,
         errors: l4h_rt::ErrorLimit::new(),
     };
@@ -1398,23 +1521,21 @@ fn main(info: &'static l4h_rt::Info) -> ! {
     let (mut msg, mut badge) = ep.recv(reply);
     loop {
         if badge != 0 {
-            if u.hc.is_some() {
-                u.events();
-                if u.hc.as_ref().is_some_and(|h| h.sts() & (STS_HSE | STS_HCE) != 0 || h.sts() == u32::MAX) {
-                    u.hc_failed();
-                }
-                u.serve();
-                u.recover_all();
-                u.flush();
-            }
+            u.turn();
             if badge & proto::USBD_BADGE_IRQ != 0 {
                 irq.irq_handler_ack().expect("usbd IRQ ack");
             }
-            u.prepare_wait();
+            // More work: another bounded turn.  The guest kicks only once
+            // usbd_waiting is set, so its kicks never pile up.
+            if u.prepare_wait() {
+                badge = proto::USBD_BADGE_KICK;
+                continue;
+            }
             (msg, badge) = ep.recv(reply);
             u.woken();
             continue;
         }
+        // Root's one call.
         let mut resp = [0u64; 3];
         resp[0] = match msg.label() {
             proto::USBD_CLAIM => match Xhci::new(cfg.bar0_va as usize, cfg.bar0_len as usize, dma, tsc_hz) {
@@ -1428,7 +1549,7 @@ fn main(info: &'static l4h_rt::Info) -> ! {
                     if hc.halt_reset() {
                         let c = &hc.caps;
                         resp[1] = c.usb2 as u64 | (c.usb3 as u64) << 16 | (c.max_slots as u64) << 32;
-                        resp[2] = c.hci_version as u64;
+                        resp[2] = c.hci_version as u64 | (c.ac64 as u64) << 16;
                         l4h_rt::info!("l4h-usbd {:#x}: xHCI {:x}.{:02x}, {} slots, {} USB 2 and {} USB 3 ports, {}-byte contexts",
                             cfg.pci_bdf, c.hci_version >> 8, c.hci_version & 0xff, c.max_slots, c.usb2, c.usb3, c.ctx_size);
                         u.hc = Some(hc);
@@ -1438,20 +1559,8 @@ fn main(info: &'static l4h_rt::Info) -> ! {
                     }
                 }
             },
-            proto::USBD_ATTACH if u.hc.is_some() && u.client.is_none() && mr(0) == 0 => {
-                let pool = Pool { gpa: mr(1), paddr: mr(2), size: mr(3) };
-                u.attach(pool, cap::<cap_type::Notification>(proto::USBD_SLOT_CLIENT_IRQ))
-            }
-            proto::USBD_REMOVE if mr(0) == 0 => u.remove(),
-            proto::USBD_INFO => {
-                resp[1] = u.refused;
-                resp[2] = u.resets;
-                0
-            }
             _ => EINVAL,
         };
-        let _ = u.tsc_hz;
-        u.prepare_wait();
         for (i, v) in resp.into_iter().enumerate() {
             set_mr(i, v);
         }

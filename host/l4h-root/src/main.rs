@@ -807,6 +807,7 @@ fn serve(h: &mut Host, reply_slot: ReplySlot, modules: &bootmod::Modules) -> ! {
         // on a call: it would overwrite the caller's message registers.
         if notified {
             h.poll_drivers();
+            crate::usb::poll(h);
             if booting && h.drivers_ready() {
                 booting = false;
                 finish_boot(h, modules);

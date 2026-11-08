@@ -27,9 +27,6 @@ pub const USBD_ID_BASE: u32 = 0x700;
 /// may have.
 pub const MAX_USB_CTRLS: usize = 16;
 pub const MAX_GUEST_USB: usize = abi::MAX_GUEST_USB;
-/// Clients of one usbd: one in v1 (the controller is assigned whole).
-pub const MAX_CLIENTS: usize = 1;
-
 /// Device slots usbd enables (MaxSlotsEn): enough for a hub tree, and
 /// bounded tables.
 pub const MAX_SLOTS: u32 = 64;
@@ -63,38 +60,79 @@ pub fn dma_bytes(slots: u32, scratch: u32, page: u32) -> usize {
     total.next_power_of_two().max(4 << 20)
 }
 
-/// Service calls of usbd (root -> usbd, message registers; MR0 of the
-/// reply is 0 or an errno, u64::MAX if usbd failed).
+/// usbd's one service call (root -> usbd, message registers; MR0 of the
+/// reply is 0 or an errno, u64::MAX if usbd failed): take the controller
+/// from the firmware (legacy handoff, halt, reset, capability walk).
+/// -> MR1 = USB 2 ports | USB 3 ports << 16 | max slots << 32, MR2 =
+/// HCIVERSION | 64-bit addressing << 16.
 ///
-/// Take the controller from the firmware: legacy handoff, halt, reset,
-/// capability walk.  -> MR1 = USB 2 ports | USB 3 ports << 16 | max slots
-/// << 32, MR2 = HCIVERSION.
+/// Root makes it once, before any guest has the controller.  From then on
+/// a guest drives usbd and could keep it busy, so root never waits for it
+/// again: it posts requests in the mailbox (`Mailbox`) and signals
+/// USBD_BADGE_ROOT, and usbd signals root's notification
+/// (USBD_SLOT_ROOT_NTFN) when it has done one.
 pub const USBD_CLAIM: u64 = 1;
-/// client, pool GPA, pool physical address, pool bytes: root has mapped
-/// the client's queue area at queue_va(client) and given the VMM's
-/// notification at USBD_SLOT_CLIENT_IRQ + client.  Starts the controller.
-pub const USBD_ATTACH: u64 = 2;
-/// client: complete everything, disable every slot, halt and reset the
-/// controller.  0 once the controller can no longer touch the client's
-/// pool.
-pub const USBD_REMOVE: u64 = 3;
-/// -> MR1 = requests refused, MR2 = controller resets.
-pub const USBD_INFO: u64 = 4;
+
+/// Mailbox requests.  ATTACH: root has mapped client area `idx`'s frames at
+/// queue_va(idx), given the VMM's notification at USBD_SLOT_CLIENT_IRQ +
+/// idx and turned bus mastering on; start the controller for the pool.
+pub const MBOX_ATTACH: u32 = 1;
+/// REMOVE: root has turned bus mastering off and taken the notification
+/// away; forget everything, halt and reset the controller and let go of
+/// the area, which root then frees (the next guest gets fresh frames).
+/// Result 0 once the controller has nothing of the client's left.
+pub const MBOX_REMOVE: u32 = 2;
+
+/// A page root and usbd share (at MBOX_VA in usbd).  Root writes the
+/// request fields and then `seq`; usbd writes the result and then `done`
+/// (= seq).  Root posts a request only when the last one is done.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Mailbox {
+    pub seq: u32,
+    pub op: u32,
+    pub idx: u32,
+    pub reserved: u32,
+    pub gpa: u64,
+    pub paddr: u64,
+    pub size: u64,
+    /// usbd's.
+    pub done: u32,
+    /// 0 or an errno.
+    pub result: u32,
+    /// Requests refused, controller resets (CTL_USB_INFO).
+    pub refused: u64,
+    pub resets: u64,
+}
+
+/// Where usbd sees the mailbox.
+pub const MBOX_VA: usize = crate::SHARED_VA + 0x30_0000;
 
 /// Badges of usbd's bound notification.
 pub const USBD_BADGE_IRQ: u64 = 1 << 0;
-/// Client c kicked: USBD_BADGE_KICK << c.
+/// The client kicked.
 pub const USBD_BADGE_KICK: u64 = 1 << 1;
+/// Root posted a mailbox request.
+pub const USBD_BADGE_ROOT: u64 = 1 << 2;
 
 /// usbd's CSpace slots, beyond the common ones.
 pub const USBD_SLOT_IRQ: u64 = 16;
-/// The client's VMM notification (badged host::VMM_BADGE_USB(n)).
+/// Root's notification, for finished mailbox requests.
+pub const USBD_SLOT_ROOT_NTFN: u64 = 17;
+/// Client area idx's VMM notification (badged host::vmm_badge_usb(n)),
+/// idx < AREAS.  Root deletes it at REMOVE without waiting: usbd signals
+/// it with NBSend, which an empty slot ignores.
 pub const USBD_SLOT_CLIENT_IRQ: u64 = 32;
 
-/// Where root maps a client's queue area into usbd.
-pub const fn queue_va(client: usize) -> usize {
-    crate::SHARED_VA + client * 0x10_0000
+/// Client areas: one attached, and one draining (REMOVE still running)
+/// while the next guest's is already mapped.
+pub const AREAS: usize = 2;
+
+/// Where root maps client area `idx` into usbd.
+pub const fn queue_va(idx: usize) -> usize {
+    crate::SHARED_VA + idx * 0x10_0000
 }
+const _: () = assert!(abi::AREA_PAGES * 4096 <= 0x10_0000 && queue_va(AREAS) <= MBOX_VA);
 
 /// usbd's configuration (its info page).
 #[repr(C)]

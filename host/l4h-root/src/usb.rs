@@ -11,8 +11,18 @@
 //! Every DMA address the controller sees is written by usbd, into its own
 //! DMA region (which root allocates and the guest never maps) or the
 //! owner's I/O pool, whose addresses root gives usbd from its own table.
+//!
+//! Root calls usbd only to claim the controller.  An attached guest can
+//! keep usbd busy, so from then on root never waits for it: attach and
+//! remove are mailbox requests (usb::Mailbox), and at GUEST_DEL root cuts
+//! the controller off from the pool itself (bus mastering off, the IOMMU
+//! mapping gone) before usbd has even seen the request.  The queue area is
+//! root's until usbd has zeroed it (REMOVE done), when root frees it; the
+//! next guest meanwhile gets the other area, and its ATTACH is posted (bus
+//! mastering back on) once the REMOVE is done.
 
-use core::ptr::addr_of_mut;
+use core::ptr::{addr_of, addr_of_mut};
+use core::sync::atomic::{Ordering, fence};
 
 use sel4::{CapRights, ObjectBlueprint, VmAttributes, cap, cap_type};
 
@@ -44,9 +54,9 @@ const CAP_WAIT_MS: u64 = 1000;
 pub enum State {
     /// Not claimed: the firmware's.
     Firmware,
-    /// Claimed, halted, bus mastering off.
+    /// Claimed, no guest: halted, bus mastering off (or a REMOVE runs).
     Idle,
-    /// Guest `vm` has it.
+    /// Guest `vm` has it (its ATTACH may still wait for a REMOVE).
     Vm(usize),
     /// Claim, reset or drain failed: quarantined until reboot.
     Failed,
@@ -57,21 +67,50 @@ pub enum State {
 pub struct Ctrl {
     pub pci: pci::Device,
     pub state: State,
-    /// USB 2 and USB 3 ports, max slots, HCIVERSION: known once claimed.
+    /// USB 2 and USB 3 ports, 64-bit addressing: known once claimed.
     pub usb2: u16,
     pub usb3: u16,
+    ac64: bool,
     bars: BarCache,
     driver: Option<Usbd>,
     dom: Domain,
-    /// The owner's pool, while one is attached: (paddr, size).
-    pool: Option<(usize, usize)>,
+    /// The owner's pool, while one is attached: (GPA, paddr, size).
+    pool: Option<(usize, usize, usize)>,
 }
 
 struct Usbd {
     comp: Component,
-    #[allow(dead_code)]
     arena: Arena,
+    /// The mailbox page (usb::MBOX_VA in usbd), the last request and
+    /// whether usbd is still on it, and usbd's notification for requests.
+    mbox: cap::Granule,
+    seq: u32,
+    op: u32,
+    busy: bool,
+    kick: cap::Notification,
+    areas: [Option<Area>; usb::AREAS],
+    /// The attached guest's area (State::Vm).
+    idx: usize,
+    /// The area a REMOVE runs for.
+    draining: Option<usize>,
+    /// The attached guest's ATTACH waits for that REMOVE.
+    queued: bool,
 }
+
+/// A client's queue area: root's frames, mapped into usbd while the area
+/// lives, and the copies the guest's are made from.
+struct Area {
+    arena: Arena,
+    /// Copies of the frames (radix QUEUE_RADIX), vmmgr's to give the
+    /// guest: revoked at GUEST_DEL.
+    guest: cap::CNode,
+    /// Root's slots of the arena's CNodes (the frames, usbd's mapping
+    /// copies, `guest`): empty once the arena is released.
+    slots: [Slot; 3],
+}
+
+/// Root's notification badge for usbd's finished mailbox requests.
+pub const USB_BADGE: u64 = 1 << 43;
 
 /// The controllers, in .bss with the disk controllers.
 static mut CTRLS: ArrayVec<Ctrl, { usb::MAX_USB_CTRLS }> = ArrayVec::new();
@@ -123,7 +162,7 @@ pub fn found(d: pci::Device, pci: &pci::Pci) {
     };
     info!("l4h-root: xHCI {:02x}:{:02x}.{} {:04x}:{:04x}: left to the firmware{}", d.bus, d.dev, d.func,
         d.vendor, d.device, if let State::Unsupported(w) = state { w } else { "" });
-    cs.must_push(Ctrl { pci: d, state, usb2: 0, usb3: 0, bars: [const { None }; 6], driver: None, dom: Domain::NONE, pool: None });
+    cs.must_push(Ctrl { pci: d, state, usb2: 0, usb3: 0, bars: [const { None }; 6], driver: None, dom: Domain::NONE, pool: None, ac64: false });
 }
 
 /// A call to usbd.  One that has failed answers u64::MAX (its keeper).
@@ -287,7 +326,7 @@ fn claim(h: &mut Host, i: usize) -> Result<(), i64> {
         &h.info.spawn_context(0),
     );
     let bar_pages = (d.bars[0].size as usize).div_ceil(PAGE);
-    let kb = keep_bits(n_dma + bar_pages);
+    let kb = keep_bits(n_dma + bar_pages + 1);
     let keep = arena.object_cap::<cap_type::CNode>(&mut h.alloc, ObjectBlueprint::CNode { size_bits: kb });
     let mut next = 0u64;
     let mut keep_slot = || {
@@ -303,6 +342,12 @@ fn claim(h: &mut Host, i: usize) -> Result<(), i64> {
         let f = dma_cn.absolute_cptr_from_bits_with_depth(p as u64, bits - 12);
         comp.map_copy(&mut h.alloc, &mut arena, &f, host::DMA_VA + p * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep_slot());
     }
+    // The mailbox, and root's notification for what usbd has done of it.
+    let mbox = arena.object_cap::<cap_type::Granule>(&mut h.alloc, FRAME_BP);
+    comp.map_copy(&mut h.alloc, &mut arena, &abs_of(mbox), usb::MBOX_VA, CapRights::read_write(), VmAttributes::DEFAULT, keep_slot());
+    comp.give_badged(usb::USBD_SLOT_ROOT_NTFN, h.ntfn, CapRights::write_only(), USB_BADGE);
+    let kick = root_cap::<cap_type::Notification>(h.alloc.slots.alloc());
+    abs_of(kick).mint(&abs_of(comp.ntfn), CapRights::write_only(), usb::USBD_BADGE_ROOT).expect("usbd root badge");
     // The interrupt.
     let irq_slot = h.alloc.slots.global(|s| s.alloc());
     pci::msi_irq(&d, vector, &abs_of(root_cap::<cap_type::Null>(irq_slot)));
@@ -319,7 +364,9 @@ fn claim(h: &mut Host, i: usize) -> Result<(), i64> {
     h.pci.enable_memory(&c.pci);
     component::start(&comp);
     let ep = comp.service_ep;
-    c.driver = Some(Usbd { comp, arena });
+    c.driver = Some(Usbd {
+        comp, arena, mbox, seq: 0, op: 0, busy: false, kick, areas: [const { None }; usb::AREAS], idx: 0, draining: None, queued: false,
+    });
     let r = call(ep, usb::USBD_CLAIM, &[]);
     if r != 0 {
         log!("l4h-root: xHCI {:02x}:{:02x}.{}: claim failed ({:#x})", d.bus, d.dev, d.func, r);
@@ -328,6 +375,7 @@ fn claim(h: &mut Host, i: usize) -> Result<(), i64> {
     }
     let ports = crate::mr(1);
     (c.usb2, c.usb3) = (ports as u16, (ports >> 16) as u16);
+    c.ac64 = crate::mr(2) & (1 << 16) != 0;
     route_intel_ports(&d, &h.pci);
     h.pci.bus_master(&d, false);
     c.state = State::Idle;
@@ -353,9 +401,94 @@ pub fn ensure_claimed(h: &mut Host, i: usize) -> Result<(), i64> {
     }
 }
 
+/// Post a mailbox request to usbd; the last one is done.
+fn post(win: &mut crate::window::Window, d: &mut Usbd, op: u32, idx: usize, pool: (usize, usize, usize)) {
+    debug_assert!(!d.busy);
+    d.seq = d.seq.wrapping_add(1);
+    let seq = d.seq;
+    win.with_frame(&abs_of(d.mbox), |p| unsafe {
+        let m = p as *mut usb::Mailbox;
+        addr_of_mut!((*m).op).write_volatile(op);
+        addr_of_mut!((*m).idx).write_volatile(idx as u32);
+        addr_of_mut!((*m).gpa).write_volatile(pool.0 as u64);
+        addr_of_mut!((*m).paddr).write_volatile(pool.1 as u64);
+        addr_of_mut!((*m).size).write_volatile(pool.2 as u64);
+        fence(Ordering::Release);
+        addr_of_mut!((*m).seq).write_volatile(seq);
+    });
+    d.op = op;
+    d.busy = true;
+    d.kick.signal();
+}
+
+/// The owner's ATTACH, once no REMOVE runs: bus mastering back on.
+fn post_attach(h: &mut Host, i: usize) {
+    let c = &mut ctrls()[i];
+    let (Some(d), Some(pool)) = (c.driver.as_mut(), c.pool) else { return };
+    h.iommu.map(&mut h.alloc, c.dom, pool.1, pool.2, true);
+    h.pci.bus_master(&c.pci, true);
+    d.queued = false;
+    let idx = d.idx;
+    post(&mut h.wins.a, d, usb::MBOX_ATTACH, idx, pool);
+}
+
+/// Free area `idx`: usbd no longer uses it (REMOVE done, never attached,
+/// or usbd suspended).
+fn free_area(h: &mut Host, d: &mut Usbd, idx: usize) {
+    if let Some(a) = d.areas[idx].take() {
+        h.alloc.global(|alloc| {
+            alloc.release(a.arena);
+            a.slots.iter().for_each(|&s| alloc.slots.free(s));
+        });
+    }
+}
+
+/// Root's notification (USB_BADGE): what usbd has done of the requests.
+pub fn poll(h: &mut Host) {
+    for i in 0..ctrls().len() {
+        let c = &mut ctrls()[i];
+        let Some(d) = c.driver.as_mut() else { continue };
+        if !d.busy {
+            continue;
+        }
+        let (done, result) = h.wins.a.with_frame(&abs_of(d.mbox), |p| unsafe {
+            let m = p as *const usb::Mailbox;
+            let done = addr_of!((*m).done).read_volatile();
+            fence(Ordering::Acquire);
+            (done, addr_of!((*m).result).read_volatile())
+        });
+        if done != d.seq {
+            continue;
+        }
+        d.busy = false;
+        let p = c.pci;
+        match d.op {
+            usb::MBOX_REMOVE => {
+                let idx = d.draining.take().expect("a REMOVE runs");
+                if result != 0 {
+                    log!("l4h-root: xHCI {:02x}:{:02x}.{}: usbd could not stop it ({})", p.bus, p.dev, p.func, result);
+                    quarantine(c, &h.pci);
+                }
+                let d = ctrls()[i].driver.as_mut().unwrap();
+                free_area(h, d, idx);
+                if d.queued && ctrls()[i].state != State::Failed {
+                    post_attach(h, i);
+                }
+            }
+            _ if result != 0 => {
+                // The guest sees the controller dead.
+                log!("l4h-root: xHCI {:02x}:{:02x}.{}: usbd refused the attachment ({})", p.bus, p.dev, p.func, result);
+                quarantine(c, &h.pci);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// VMMGR_USB_ATTACH: give guest `g` controller `i`, claimed already
 /// (ensure_claimed).  The guest's USB device number is `g.usbs.len()`
-/// (its VMM's badge).
+/// (its VMM's badge).  usbd starts the controller when it gets to it
+/// (after the previous guest's REMOVE): the guest waits for the magic.
 pub fn attach(h: &mut Host, i: usize, g: &mut RootGuest) -> Result<Attached, i64> {
     let state = ctrls().get(i).ok_or(ctl::ENOENT)?.state;
     match state {
@@ -368,66 +501,98 @@ pub fn attach(h: &mut Host, i: usize, g: &mut RootGuest) -> Result<Attached, i64
     if g.usbs.len() >= usb::MAX_GUEST_USB {
         return Err(ctl::ENOSPC);
     }
-    if !h.can_afford((uabi::AREA_PAGES + 8) * PAGE, 0, 2 * (1 << QUEUE_RADIX)) {
+    let c = &mut ctrls()[i];
+    if !c.ac64 && g.pool.paddr.checked_add(g.pool.size).is_none_or(|e| e > 1 << 32) {
+        return Err(ctl::EINVAL);
+    }
+    let d = c.driver.as_mut().expect("claimed usbd");
+    let Some(idx) = (0..usb::AREAS).find(|&k| d.areas[k].is_none()) else { return Err(ctl::EBUSY) };
+    if !h.can_afford((uabi::AREA_PAGES + 8) * PAGE, 0, 2 * (1 << QUEUE_RADIX) + 8) {
         return Err(ctl::ENOMEM);
     }
+    // The queue area: root's frames, in an arena outside the guest's
+    // (usbd may use them after the guest is gone, until REMOVE is done).
+    let area = h.alloc.global(|alloc| -> Option<Area> {
+        let mut arena = alloc.arena((uabi::AREA_PAGES + 4) * PAGE)?;
+        let frames = arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: QUEUE_RADIX });
+        let keep = arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: QUEUE_RADIX });
+        let guest = arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: QUEUE_RADIX });
+        let ok = arena.retype(alloc, &FRAME_BP, uabi::AREA_PAGES, Dest { cnode: abs_of(frames), offset: 0 }).is_some();
+        if !ok {
+            alloc.release(arena);
+            [frames.bits(), keep.bits(), guest.bits()].iter().for_each(|&s| alloc.slots.free(s as Slot));
+            return None;
+        }
+        for p in 0..uabi::AREA_PAGES {
+            let at = |cn: cap::CNode| cn.absolute_cptr_from_bits_with_depth(p as u64, QUEUE_RADIX);
+            d.comp.map_copy(alloc, &mut d.arena, &at(frames), usb::queue_va(idx) + p * PAGE,
+                CapRights::read_write(), VmAttributes::DEFAULT, at(keep));
+            at(guest).copy(&at(frames), CapRights::all()).expect("USB queue frame copy");
+        }
+        let slots = [frames.bits() as Slot, keep.bits() as Slot, guest.bits() as Slot];
+        Some(Area { arena, guest, slots })
+    });
+    let area = area.ok_or(ctl::ENOMEM)?;
     let n = g.usbs.len();
-    let c = &mut ctrls()[i];
-    let driver = c.driver.as_mut().expect("claimed usbd");
-    // The queue area: host frames in the guest's arena, revoked at
-    // GUEST_DEL after usbd let go of them.
-    let frames = g.arena.object_cap::<cap_type::CNode>(&mut h.alloc, ObjectBlueprint::CNode { size_bits: QUEUE_RADIX });
-    g.arena.retype(&mut h.alloc, &FRAME_BP, uabi::AREA_PAGES, Dest { cnode: abs_of(frames), offset: 0 }).ok_or(ctl::ENOMEM)?;
-    let keep = g.arena.object_cap::<cap_type::CNode>(&mut h.alloc, ObjectBlueprint::CNode { size_bits: QUEUE_RADIX });
-    for p in 0..uabi::AREA_PAGES {
-        let f = frames.absolute_cptr_from_bits_with_depth(p as u64, QUEUE_RADIX);
-        let k = keep.absolute_cptr_from_bits_with_depth(p as u64, QUEUE_RADIX);
-        h.alloc.global(|alloc| driver.comp.map_copy(alloc, &mut driver.arena, &f, usb::queue_va(0) + p * PAGE,
-            CapRights::read_write(), VmAttributes::DEFAULT, k));
-    }
+    let guest_frames = area.guest;
+    d.areas[idx] = Some(area);
     // Completions go to the guest's VMM, which raises the device's event.
-    let _ = driver.comp.slot(usb::USBD_SLOT_CLIENT_IRQ).delete();
-    driver.comp.give_badged(usb::USBD_SLOT_CLIENT_IRQ, g.vmm_ntfn, CapRights::write_only(), host::vmm_badge_usb(n));
+    let irq_slot = usb::USBD_SLOT_CLIENT_IRQ + idx as u64;
+    let _ = d.comp.slot(irq_slot).delete();
+    d.comp.give_badged(irq_slot, g.vmm_ntfn, CapRights::write_only(), host::vmm_badge_usb(n));
     let kick = root_cap::<cap_type::Notification>(h.alloc.slots.alloc());
-    abs_of(kick).mint(&abs_of(driver.comp.ntfn), CapRights::write_only(), usb::USBD_BADGE_KICK).expect("usbd kick");
-    let pool = (g.pool.paddr, g.pool.size);
-    h.iommu.map(&mut h.alloc, c.dom, pool.0, pool.1, true);
-    h.pci.bus_master(&c.pci, true);
-    let ep = driver.comp.service_ep;
-    c.pool = Some(pool);
+    abs_of(kick).mint(&abs_of(d.comp.ntfn), CapRights::write_only(), usb::USBD_BADGE_KICK).expect("usbd kick");
+    d.idx = idx;
+    c.pool = Some((g.pool.gpa, g.pool.paddr, g.pool.size));
     c.state = State::Vm(g.id);
     g.usbs.must_push(i);
-    if call(ep, usb::USBD_ATTACH, &[0, g.pool.gpa as u64, pool.0 as u64, pool.1 as u64]) != 0 {
-        // Detach at GUEST_DEL as for any other: the guest has it now.
-        log!("l4h-root: xHCI {}: usbd refused the attachment", i);
-        quarantine(c, &h.pci);
-        return Err(ctl::EIO);
+    if d.draining.is_some() {
+        d.queued = true;
+    } else {
+        post_attach(h, i);
     }
-    Ok(Attached { frames, kick })
+    Ok(Attached { frames: guest_frames, kick })
 }
 
-/// GUEST_DEL: take controller `i` back from guest `vm` before its memory
-/// is reused.  Whether the controller can no longer reach the guest's
-/// pool: drained, or cut off by the IOMMU.
+/// GUEST_DEL: take controller `i` back from its guest before the guest's
+/// memory is reused, without waiting for usbd: the guest's queue frames
+/// are revoked, the controller loses bus mastering and its IOMMU mapping
+/// of the pool, and usbd's notification of the VMM goes.  Then REMOVE
+/// (usbd may be busy; poll frees the area when it is done).  Whether the
+/// controller can no longer reach the guest's pool.
 pub fn remove(h: &mut Host, i: usize) -> bool {
     let c = &mut ctrls()[i];
-    let quiet = match (&c.state, &c.driver) {
-        (State::Vm(_), Some(d)) => call(d.comp.service_ep, usb::USBD_REMOVE, &[0]) == 0,
-        _ => false,
-    };
-    if !quiet {
-        quarantine(c, &h.pci);
-    } else {
-        h.pci.bus_master(&c.pci, false);
-        c.state = State::Idle;
+    let attached = matches!(c.state, State::Vm(_));
+    let Some(d) = c.driver.as_mut() else { return c.dom != Domain::NONE };
+    let idx = d.idx;
+    if let Some(a) = &d.areas[idx] {
+        // vmmgr's copy of the CNode, then whatever was made of the frames.
+        let _ = abs_of(a.guest).revoke();
+        for p in 0..uabi::AREA_PAGES {
+            let _ = a.guest.absolute_cptr_from_bits_with_depth(p as u64, QUEUE_RADIX).revoke();
+        }
     }
-    if let Some(d) = &c.driver {
-        let _ = d.comp.slot(usb::USBD_SLOT_CLIENT_IRQ).delete();
-    }
-    if let Some((pa, len)) = c.pool.take() {
+    h.pci.bus_master(&c.pci, false);
+    let _ = d.comp.slot(usb::USBD_SLOT_CLIENT_IRQ + idx as u64).delete();
+    let pool = c.pool.take();
+    if let Some((_, pa, len)) = pool.filter(|_| !d.queued) {
         h.iommu.unmap(c.dom, pa, len);
     }
-    quiet || c.dom != Domain::NONE
+    if !attached {
+        // Quarantined: usbd is suspended.
+        free_area(h, d, idx);
+        return c.dom != Domain::NONE;
+    }
+    c.state = State::Idle;
+    if d.queued {
+        // usbd never saw it.
+        d.queued = false;
+        free_area(h, d, idx);
+    } else {
+        d.draining = Some(idx);
+        post(&mut h.wins.a, d, usb::MBOX_REMOVE, idx, (0, 0, 0));
+    }
+    true
 }
 
 /// Claim the controllers named by `dom0_usb` (BDFs) before dom0 starts:
@@ -448,7 +613,7 @@ pub fn dom0_ctrls(h: &Host) -> ArrayVec<u64, { usb::MAX_GUEST_USB }> {
 }
 
 /// CTL_USB_INFO for controller `i`.
-pub fn info(h: &Host, i: usize, data: &mut [u8; abi::CTL_DATA_MAX]) -> Result<[u64; 6], i64> {
+pub fn info(h: &mut Host, i: usize, data: &mut [u8; abi::CTL_DATA_MAX]) -> Result<[u64; 6], i64> {
     let c = ctrls().get(i).ok_or(ctl::ENOENT)?;
     let p = &c.pci;
     let (state, owner) = match c.state {
@@ -461,14 +626,11 @@ pub fn info(h: &Host, i: usize, data: &mut [u8; abi::CTL_DATA_MAX]) -> Result<[u
             (abi::USB_STATE_UNSUPPORTED, u64::MAX)
         }
     };
-    let refused = match (&c.driver, c.state) {
-        (Some(d), State::Idle | State::Vm(_)) => match call(d.comp.service_ep, usb::USBD_INFO, &[]) {
-            0 => crate::mr(1),
-            _ => 0,
-        },
-        _ => 0,
+    // What usbd last wrote: root does not wait for it.
+    let refused = match &c.driver {
+        Some(d) => h.wins.a.with_frame(&abs_of(d.mbox), |p| unsafe { addr_of!((*(p as *const usb::Mailbox)).refused).read_volatile() }),
+        None => 0,
     };
-    let _ = h;
     Ok([
         crate::netd::bdf(p) as u64,
         p.vendor as u64 | (p.device as u64) << 16,

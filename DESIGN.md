@@ -2434,17 +2434,27 @@ controller, one per claimed controller, and the guest forwards Linux's
   `host::usb::xcaps`), takes the controller from the firmware (OS Owned,
   then up to 1 s for BIOS Owned to clear, else it clears it, as Linux
   does; legacy SMIs off), halts and resets it. Root routes Intel PCH ports
-  to the xHCI. A controller once claimed stays with its usbd until reboot,
+  to the xHCI. `USBD_CLAIM` is the only call root makes to usbd: once a
+  guest has the controller it can keep usbd busy, so root never waits for
+  usbd again (it would hold up every guest's control requests). Attach and
+  release are requests in a mailbox page root and usbd share
+  (`host::usb::Mailbox`): root writes one and signals usbd, usbd does it
+  when it gets to it and signals root's notification (`USB_BADGE`), and
+  root acts on the result there. A controller once claimed stays with its usbd until reboot,
   `idle` (halted, bus mastering off, its DMA region kept) when no guest has
   it, and `failed` if a reset or drain fails. Renesas uPD72020x without a
   firmware ROM and controllers without MSI are `unsupported`.
 - **Attach.** `VMMGR_USB_ATTACH (guest, device, controller)`: vmmgr names
   both by number; root claims the controller if needed, makes the queue
-  area (101 host frames in the guest's root arena) and usbd's kick, mints
-  the guest's VMM notification (root's, from `GUEST_NEW`) for usbd with
-  badge `vmm_badge_usb(n)`, maps the pool into the controller's IOMMU
-  domain, turns bus mastering on and calls `USBD_ATTACH` with the pool's
-  addresses from its own table. vmmgr maps the area into the guest at
+  area (101 host frames in an arena of root's own, mapped into usbd, and
+  copies of them for the guest), usbd's kick, mints the guest's VMM
+  notification (root's, from `GUEST_NEW`) for usbd with badge
+  `vmm_badge_usb(n)`, maps the pool into the controller's IOMMU domain,
+  turns bus mastering on and posts `MBOX_ATTACH` with the pool's addresses
+  from its own table. usbd keeps two areas (`AREAS`): while the previous
+  guest's release still runs, the next guest gets the other, and its
+  attach (bus mastering with it) waits for the release; the guest's
+  driver waits for usbd to write the area's magic. vmmgr maps the area into the guest at
   `L4H_USB_AREA_VA(n)` (the pages usbd writes read-only) and adds an
   `L4H_DEV_USB` device (ABI 7). A guest has at most four
   (`L4H_MAX_GUEST_USB`); `l4hctl create --usb BDF` raises the default I/O
@@ -2484,7 +2494,11 @@ controller, one per claimed controller, and the guest forwards Linux's
   their speed and type; route strings at most five tiers; isoch packets
   inside the data; port writes only the bits the feature names. A request
   is accepted only while the CQ has room for it, so it never overflows and
-  a guest that does not consume completions stalls only itself.
+  a guest that does not consume completions stalls only itself; transfers
+  leave one entry for control requests, so an `URB_CANCEL` always gets in.
+  usbd's turns are bounded (one SQ's worth of each), so a guest refilling
+  its queues from another vCPU does not keep usbd from its events and the
+  mailbox.
 - **DMA without an IOMMU.** Every DMA pointer the controller reads is
   written by usbd into its own region, which no guest maps: registers,
   DCBAA, scratchpad, contexts, stream arrays, rings and Link TRBs. Every
@@ -2494,15 +2508,18 @@ controller, one per claimed controller, and the guest forwards Linux's
   controller's domain holds only usbd's region and the attached pool, and
   interrupt remapping confines its MSI. What remains without one is, as for
   blkd and netd, a bug in usbd or a controller erratum.
-- **Release.** `GUEST_DEL` calls `USBD_REMOVE` (halt and reset: the
-  controller fetches nothing), then root unmaps the pool from the domain,
-  revokes the queue frames and the VMM notification copy, and turns bus
-  mastering off; the controller is `idle` for the next guest, which
-  enumerates its devices again. If usbd fails or the reset does not
-  complete, root quarantines the controller (decoding, bus mastering and
-  MSI off); without an IOMMU the guest's pool then stays out of use until
-  reboot, as for a disk that does not drain. A reset does not reset USB
-  devices' firmware: a controller carries its devices with it.
+- **Release.** `GUEST_DEL` cuts the controller off without waiting for
+  usbd: root revokes the guest's copies of the queue frames, turns bus
+  mastering off (the controller can no longer reach memory, so the pool can
+  be reused at once, with or without an IOMMU), unmaps the pool from the
+  domain, deletes usbd's copy of the VMM notification (usbd signals it with
+  NBSend, which an empty slot ignores) and posts `MBOX_REMOVE`. usbd then
+  halts and resets the controller and forgets every URB; when it reports
+  done root frees the area, and the controller is `idle` for the next
+  guest, which enumerates its devices again. If the reset fails root
+  quarantines the controller (decoding, bus mastering and MSI off). A
+  reset does not reset USB devices' firmware: a controller carries its
+  devices with it.
 - **Guest.** `usb-l4h` (`arch/l4h/drivers/usb_l4h.c`) registers a USB 2 and
   a shared USB 3 HCD whose root hubs have the controller's ports; the
   stock USB core does enumeration, hubs, descriptors and class drivers, so

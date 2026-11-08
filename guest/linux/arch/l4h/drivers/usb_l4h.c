@@ -552,12 +552,13 @@ static void ul4h_ctl_done(struct ul4h *ul, const struct l4h_usb_cqe *c)
 
 		/*
 		 * The URB completes before its cancel does.  A cancel that
-		 * failed while the URB is still in flight raced with usbd
-		 * taking the URB's record: try again.
+		 * failed while the URB is still in flight is tried again:
+		 * without limit while usbd has yet to take the URB's record
+		 * (AGAIN: it waits behind a full CQ), a few times otherwise.
 		 */
 		tag &= ~UL4H_CANCEL_TAG;
 		if (u && u->tag == tag && u->cancel == UL4H_CANCEL_SENT && status &&
-		    u->cancel_tries++ < UL4H_CANCEL_TRIES) {
+		    (status == L4H_USB_ST_AGAIN || u->cancel_tries++ < UL4H_CANCEL_TRIES)) {
 			u->cancel = UL4H_CANCEL_QUEUED;
 			list_add_tail(&u->node, &ul->cancels);
 		}
@@ -2011,6 +2012,7 @@ static int ul4h_probe(struct platform_device *pdev)
 	struct device *sysdev;
 	struct usb_hcd *hcd;
 	struct ul4h *ul;
+	unsigned int ms;
 	void *area;
 	int err;
 
@@ -2026,6 +2028,13 @@ static int ul4h_probe(struct platform_device *pdev)
 		return -EINVAL;
 	area = (void *)(unsigned long)desc->page_va;
 	info = area;
+	/*
+	 * Root asks usbd to attach without waiting for it, and the previous
+	 * guest's removal may still be running: usbd writes the magic last.
+	 */
+	for (ms = 0; READ_ONCE(info->magic) != L4H_USB_MAGIC && ms < UL4H_RESET_TIMEOUT_MS; ms += 10)
+		msleep(10);
+	smp_rmb();	/* the fields usbd wrote before the magic */
 	if (READ_ONCE(info->magic) != L4H_USB_MAGIC || READ_ONCE(info->version) != L4H_USB_VERSION) {
 		dev_err(dev, "bad magic or version %u\n", READ_ONCE(info->version));
 		return -ENODEV;
