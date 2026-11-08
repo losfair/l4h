@@ -45,9 +45,10 @@ pub const RING_TRBS: usize = 256;
 /// TRBs of one URB: a TD (or the TDs of an isoch URB) never takes more of
 /// a ring, so a ring always has room for one more URB once it has this
 /// many free.
-pub const MAX_URB_TRBS: usize = 128;
+pub const MAX_URB_TRBS: usize = 192;
 /// The largest URB, whatever the pool: 32 x 64 KiB pieces, plus one TRB
-/// per segment boundary, fit MAX_URB_TRBS.
+/// per segment boundary, fit MAX_URB_TRBS (64 segments, each across a
+/// 64 KiB boundary, take 128).
 pub const MAX_TRANSFER: u32 = 2 << 20;
 
 /// Bytes of usbd's DMA region for a controller with `slots` device slots

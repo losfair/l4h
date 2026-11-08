@@ -744,9 +744,9 @@ struct l4h_ctl_vm {
  *   page 0       read-only   struct l4h_usb_info (usbd -> guest)
  *   page 1       read-write  struct l4h_usb_ctrl (guest -> usbd)
  *   pages 2-3    read-write  control SQ, L4H_USB_CTL_SQ_SIZE records
- *   pages 4-35   read-write  transfer SQ, L4H_USB_XFER_SQ_SIZE records
- *   pages 36-67  read-only   completion queue (CQ), shared by both SQs
- *   page 68      read-only   event queue (EQ)
+ *   pages 4-67   read-write  transfer SQ, L4H_USB_XFER_SQ_SIZE records
+ *   pages 68-99  read-only   completion queue (CQ), shared by both SQs
+ *   page 100     read-only   event queue (EQ)
  *
  * Indices are free-running u32s; entry i is at [i % size].  The producer
  * owns the head, the consumer the tail.  usbd copies a record before it
@@ -781,7 +781,7 @@ struct l4h_ctl_vm {
  */
 #define L4H_MAX_GUEST_USB       4
 #define L4H_USB_AREA_VA(n)      (L4H_SPECIAL_BASE + 0x28000000ull + (l4h_u64)(n) * 0x100000ull)
-#define L4H_USB_AREA_PAGES      69
+#define L4H_USB_AREA_PAGES      101
 #define L4H_USB_MAGIC           0x6273756cu /* "lusb" */
 #define L4H_USB_VERSION         1
 
@@ -791,9 +791,9 @@ struct l4h_ctl_vm {
 #define L4H_USB_EQ_SIZE         64
 #define L4H_USB_CTL_SQ_OFF      0x2000
 #define L4H_USB_XFER_SQ_OFF     0x4000
-#define L4H_USB_CQ_OFF          0x24000
-#define L4H_USB_EQ_OFF          0x44000
-#define L4H_USB_MAX_SEGS        16
+#define L4H_USB_CQ_OFF          0x44000
+#define L4H_USB_EQ_OFF          0x64000
+#define L4H_USB_MAX_SEGS        64   /* a 256 KiB request of 4 KiB pages */
 #define L4H_USB_MAX_ISO         48
 #define L4H_USB_MAX_PORTS       255
 #define L4H_USB_MAX_STREAMS     16
@@ -934,7 +934,7 @@ struct l4h_usb_ctl_req {
 	};
 };
 
-/* Transfer SQ records: one URB each. */
+/* Transfer SQ records (2 KiB): one URB each. */
 #define L4H_USB_XFER_CONTROL    0
 #define L4H_USB_XFER_BULK       1
 #define L4H_USB_XFER_INT        2
@@ -972,7 +972,7 @@ struct l4h_usb_xfer_req {
 	l4h_u32 reserved[6];
 	struct l4h_usb_seg segs[L4H_USB_MAX_SEGS];
 	struct l4h_usb_iso iso[L4H_USB_MAX_ISO];
-	l4h_u8 pad[1024 - 64 - 16 * L4H_USB_MAX_SEGS - 8 * L4H_USB_MAX_ISO];
+	l4h_u8 pad[2048 - 64 - 16 * L4H_USB_MAX_SEGS - 8 * L4H_USB_MAX_ISO];
 };
 
 /* Completion status: 0 or a negative errno, as Linux's USB core uses them. */

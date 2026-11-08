@@ -563,7 +563,7 @@ impl Guest {
         let mut first = None;
         for p in 0..abi::usb::AREA_PAGES {
             // Page 0 (usbd's info) and the CQ and EQ are usbd's to write.
-            let rw = matches!(p, 1..=35);
+            let rw = matches!(p, 1..=67);
             let rights = if rw { CapRights::read_write() } else { CapRights::read_only() };
             let mut ctx = self.ctx(alloc);
             let copy = ctx.alloc.slots.alloc();

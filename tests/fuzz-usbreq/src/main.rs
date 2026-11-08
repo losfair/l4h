@@ -90,7 +90,11 @@ fn record(rng: &mut Rng, p: &Pool) -> abi::XferReq {
     r.flags = if rng.chance(16) { rng.next() as u32 } else { rng.below(16) as u32 };
     r.stream = rng.below(20) as u32;
     r.start_frame = rng.next() as u32;
-    let n = if rng.chance(16) { rng.next() as u16 } else { rng.below(abi::MAX_SEGS as u64 + 1) as u16 };
+    let n = match rng.below(16) {
+        0 => rng.next() as u16,
+        1..=4 => rng.below(abi::MAX_SEGS as u64 + 1) as u16,
+        _ => rng.below(5) as u16,
+    };
     r.n_segs = n;
     let mut total = 0u32;
     for s in r.segs.iter_mut().take((n as usize).min(abi::MAX_SEGS)) {

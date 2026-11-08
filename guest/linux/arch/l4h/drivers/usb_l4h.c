@@ -416,10 +416,17 @@ static int ul4h_xfer_put(struct ul4h *ul, struct ul4h_urb *u)
 
 			if (!len)
 				break;
+			left -= len;
+			/* swiotlb often bounces consecutive entries next to each
+			 * other: one segment is fewer TRBs for usbd. */
+			if (n && r->segs[n - 1].gpa + r->segs[n - 1].len == sg_dma_address(sg) &&
+			    r->segs[n - 1].len <= U32_MAX - len) {
+				r->segs[n - 1].len += len;
+				continue;
+			}
 			r->segs[n].gpa = sg_dma_address(sg);
 			r->segs[n].len = len;
 			n++;
-			left -= len;
 		}
 	} else if (left) {
 		r->segs[0].gpa = urb->transfer_dma;

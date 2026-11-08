@@ -195,8 +195,8 @@ static int run(struct q *q)
 		}
 	}
 	r = bulk(q, 1, 2, p, 4096);
-	r.n_segs = 17;
-	check(xfer_status(q, &r) == L4H_USB_ST_INVALID, "17 segments");
+	r.n_segs = L4H_USB_MAX_SEGS + 1;
+	check(xfer_status(q, &r) == L4H_USB_ST_INVALID, "too many segments");
 	r = bulk(q, 1, 2, p, 4096);
 	r.length = 8192;
 	check(xfer_status(q, &r) == L4H_USB_ST_INVALID, "length beyond the segments");

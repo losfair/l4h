@@ -141,7 +141,7 @@ fn segments_must_lie_in_the_pool() {
     r.length = 1024;
     assert!(check_xfer(&r, &p, MAX_TRANSFER).is_err());
     let mut r = xfer(abi::XFER_BULK, 2, &[(p.gpa, 512)]);
-    r.n_segs = 17;
+    r.n_segs = abi::MAX_SEGS as u16 + 1;
     assert!(check_xfer(&r, &p, MAX_TRANSFER).is_err());
 }
 
@@ -256,9 +256,10 @@ fn isoch_tds() {
 
 #[test]
 fn too_many_trbs_refused() {
-    // 16 segments, each crossing 64 KiB boundaries, beyond MAX_URB_TRBS.
+    // 64 segments, each crossing several 64 KiB boundaries, beyond
+    // MAX_URB_TRBS.
     let p = Pool { gpa: 0, paddr: 0x10_0800, size: 64 << 20 };
-    let segs: Vec<(u64, u32)> = (0..16).map(|i| (i * 0x40_0000, 0x10_0000)).collect();
+    let segs: Vec<(u64, u32)> = (0..64).map(|i| (i * 0x10_0000, 0x3_0000)).collect();
     let x = check_xfer(&xfer(abi::XFER_BULK, 2, &segs), &p, 32 << 20).unwrap();
     let (mut t, mut e) = (Trbs::new(), TdEnds::new());
     assert_eq!(build_trbs(&x, &EP, &mut t, &mut e), Err(abi::ST_INVALID));

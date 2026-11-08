@@ -1,0 +1,38 @@
+#!/bin/sh
+# dom0 of tests/run-usbstress.sh: a benchmark guest, a stress guest, then
+# guests destroyed while every disk is busy, then one that checks the
+# stress guest's patterns survived them all.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+fail() { echo "USBSTRESS: FAIL: $*"; poweroff -f; }
+arg() { sed -n "s/.* $1=\([^ ]*\).*/\1/p" /proc/cmdline; }
+secs=$(arg stresssecs)
+cycles=$(arg stresscycles)
+run() { # name, cmdline, pattern to wait for, seconds
+    id=$(l4hctl create "$1" --initrd /bin/usbstressvm.cpio.gz --mem 512 --vcpus 2 --usb "$(arg usbbdf)" \
+        --cmdline "console=hvc0 $2") || fail "create $1"
+    l4hctl console "$id" --until "$3" --timeout "$4" > /tmp/out
+    ok=$?
+    grep -a 'USBSTRESS' /tmp/out | grep -v 'USBSTRESS: DONE'
+    [ $ok = 0 ] || fail "$1: no '$3'"
+    grep -q 'USBSTRESS: FAIL' /tmp/out && fail "$1 failed"
+}
+run bench usbbench=1 "USBSTRESS: DONE" 600
+l4hctl destroy "$id"
+run stress "usbstress=$secs" "USBSTRESS: DONE" $((secs + 300))
+grep -q 'STRESS PASS' /tmp/out || fail "stress"
+l4hctl destroy "$id"
+for i in $(seq "$cycles"); do
+    run "load$i" usbload=1 "USBSTRESS: loaded" 120
+    sleep 2
+    l4hctl destroy "$id" || fail "destroy load$i"
+    l4hctl usb | grep -q "usb 0: .*, idle" || fail "not idle after destroy $i"
+done
+echo "USBSTRESS: $cycles guests destroyed under load"
+run verify usbverify=1 "USBSTRESS: DONE" 300
+grep -q 'VERIFY PASS' /tmp/out || fail "verify"
+l4hctl destroy "$id"
+l4hctl usb
+echo "USBSTRESS: PASS"
+poweroff -f

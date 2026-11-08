@@ -2440,7 +2440,7 @@ controller, one per claimed controller, and the guest forwards Linux's
   firmware ROM and controllers without MSI are `unsupported`.
 - **Attach.** `VMMGR_USB_ATTACH (guest, device, controller)`: vmmgr names
   both by number; root claims the controller if needed, makes the queue
-  area (69 host frames in the guest's root arena) and usbd's kick, mints
+  area (101 host frames in the guest's root arena) and usbd's kick, mints
   the guest's VMM notification (root's, from `GUEST_NEW`) for usbd with
   badge `vmm_badge_usb(n)`, maps the pool into the controller's IOMMU
   domain, turns bus mastering on and calls `USBD_ATTACH` with the pool's
@@ -2454,8 +2454,8 @@ controller, one per claimed controller, and the guest forwards Linux's
   the guest's index page, a control SQ (32 records of 256 bytes: port
   get/set/clear, enable/disable slot, address, endpoint configuration, hub,
   ep0 max packet, device and endpoint reset, streams, URB cancel), a
-  transfer SQ (128 records of 1 KiB: one URB each, with up to 16 pool
-  segments and 48 isoch packets), a 256-entry completion queue shared by
+  transfer SQ (128 records of 2 KiB: one URB each, with up to 64 pool
+  segments, a 256 KiB request of 4 KiB pages, and 48 isoch packets), a 256-entry completion queue shared by
   both, and a 64-entry event queue (port changes, controller resets).
   Indices are free-running and each in its own cache line; the guest
   signals usbd's kick only when usbd said it is about to wait.
@@ -2515,6 +2515,12 @@ controller, one per claimed controller, and the guest forwards Linux's
   the Debug Capability (usbd never enables DbC), giving a controller back to
   the firmware.
 
+`tests/run-usbstress.sh` benchmarks each disk (against the same devices
+under a plain Linux VM with `USBSTRESS_NATIVE=1`, §13), runs writers,
+readers and verifiers on all of them for `STRESS_SECS` while one is
+deauthorized and authorized again every few seconds (its URBs cancelled
+under load), destroys `STRESS_CYCLES` guests while every disk is busy,
+and checks that the stress run's data survived.
 `tests/run-usbtest.sh` (QEMU's xHCI with MSI-X, `USBTEST_HC=nec` an NEC
 one with MSI only; `L4H_QEMU_IOMMU=intel|amd`) checks that the controller
 is the firmware's until a guest gets it; that a guest enumerates a
@@ -3917,6 +3923,8 @@ pessimistic.
 | fork+exit+wait | 340–450 µs | |
 | disk, 1 MiB direct, 1 vCPU | 430–510 MB/s write, 450–600 MB/s read | Measured on a heavily loaded host (load ~10 on 8 CPUs, up to 3× run-to-run variation); includes the swiotlb bounce. A quieter run gave 974 MB/s write and 750 MB/s read. |
 | disk, 4 KiB read latency | 350–375 µs | Two cross-core wakeups each way (guest → VMM → blkd), plus the bounce; higher than the copy alone explains, not yet investigated. |
+| USB disk through usbd (§9.7), 1 MiB direct, 2 vCPUs | UAS: 470–1280 MB/s read, 430–510 MB/s write; BOT: 115–195 / 115–140 MB/s | QEMU's xHCI (`tests/run-usbstress.sh`, several runs on a host with other load: up to 2× run-to-run). The same devices under a plain Linux VM with `xhci-pci`: UAS 560–985 / 390–440, BOT 400–1070 / 320–410 MB/s. Requests are at most 256 KiB (64 pool segments, swiotlb's largest mapping) against native 512 KiB–1 MiB. |
+| USB disk, 4 KiB direct reads | UAS 1250–1740 IOPS, BOT 640–830 IOPS | Native 1590–1910 and 1580–2110. Each URB round trip (guest → usbd → controller → usbd → VMM → guest) costs a few hundred µs more, the cross-core wakeups of the disk path above; BOT takes three per command, UAS overlaps them. |
 | guest↔guest ping | 1.4 ms | Four component hops per direction, with cross-core wakeups. |
 | guest↔guest TCP | 670–710 MB/s | 1 vCPU each, sender ~70 % busy (`netbench`, 256 KiB writes, 1 MiB reads); checksum offload and TSO pass through the switch. |
 | dom0 ↔ host over a tap NIC (vhost) | 380–620 MB/s down, 410–490 MB/s up | 256 MiB with wget / a 256 KiB-write sender. A plain Linux VM on the same QEMU: 0.5–1.3 GB/s. |
@@ -4125,6 +4133,7 @@ machine and guests of 256–512 MiB.
 | `tests/run-ctltest.sh` | VM lifecycle, console, clean shutdown, disk re-attach, windows, reclaim |
 | `tests/run-devicelimit.sh` | 64 devices per guest |
 | `tests/run-gputest.sh` | virtio-gpu drawing, screenshots, size checks and reclaim |
+| `tests/run-usbstress.sh` (`STRESS_SECS`, `STRESS_CYCLES`, `USBSTRESS_NATIVE=1`) | USB stress and benchmark: all disks busy while one is pulled and put back, guests destroyed under load, data intact; per-disk throughput and IOPS, optionally against a plain Linux VM |
 | `tests/run-usbtest.sh` (`USBTEST_HC=nec`) | whole xHCI controller assignment: left to the firmware until claimed, HID, BOT and UAS disks, a hub, driver reload, destroy during I/O, a second guest (§9.7) |
 | `tests/run-nettest.sh`, `tests/run-router.sh` | switches, uplink, multi-NIC, isolation, MAC lock, NAT router VM (`NETTEST_LEGACY=1`: legacy virtio-net uplink) |
 | `tests/run-density.sh 30 256` | 30 guests on 4 cores stay responsive |

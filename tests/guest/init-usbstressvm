@@ -1,0 +1,163 @@
+#!/bin/sh
+# Guest of tests/run-usbstress.sh, under l4h (usb-l4h) or, for the
+# baseline, natively in QEMU (xhci-pci; its modules in /lib/native in load
+# order).  usbbench=1 measures each disk; usbstress=SECS runs writers and
+# verifiers on every disk at once while a disk is deauthorized and
+# authorized again (URBs cancelled under load); usbload=1 keeps every disk
+# busy until the guest is destroyed; usbverify=1 checks the disks' pattern
+# regions, which the stress run left.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+say() { echo "USBSTRESS: $*"; }
+fail() { say "FAIL: $*"; poweroff -f; }
+on() { case " $(cat /proc/cmdline) " in *" $1 "*) return 0 ;; esac; return 1; }
+arg() { sed -n "s/.* $1=\([^ ]*\).*/\1/p" /proc/cmdline; }
+if [ -e /dev/l4hkmod ]; then
+    mkdir -p /lib/modules
+    mount -t erofs -o ro /dev/l4hkmod /lib/modules || fail "no module tree"
+    for m in usb_l4h sd_mod usb_storage uas; do modprobe "$m" || fail "modprobe $m"; done
+else
+    for m in $(cat /lib/native/order); do insmod "/lib/native/$m" || fail "insmod $m"; done
+fi
+for _ in $(seq 150); do
+    [ "$(ls -d /sys/block/sd* 2>/dev/null | wc -l)" -ge 3 ] && break
+    sleep 0.2
+done
+# Name the disks by how they are attached: uas, bot (BOT on a root port: SuperSpeed under QEMU) and
+# fs (full-speed BOT, behind the hub).
+for b in /sys/block/sd*; do
+    p=$(readlink -f "$b/device")
+    intf=$(echo "$p" | sed -n 's|.*/\([0-9]*-[0-9.]*:[0-9.]*\)/host.*|\1|p')
+    usb=${intf%%:*}
+    speed=$(cat "/sys/bus/usb/devices/$usb/speed")
+    drv=$(basename "$(readlink "/sys/bus/usb/devices/$intf/driver")")
+    if [ "$drv" = uas ]; then n=uas; elif [ "$speed" = 12 ]; then n=fs; else n=bot; fi
+    eval "dev_$n=/dev/${b##*/} usb_$n=$usb"
+    say "disk $n: /dev/${b##*/} usb $usb speed $speed driver $drv $(($(cat "$b/size") / 2048)) MiB"
+done
+for n in uas bot fs; do eval "[ -n \"\$dev_$n\" ]" || fail "no $n disk"; done
+now() { cut -d' ' -f1 /proc/uptime; }
+rate() { awk -v b="$1" -v t0="$2" -v t1="$3" 'BEGIN { t = t1 - t0; if (t <= 0) t = 0.01; printf "%.1f", b / t }'; }
+
+if on usbbench=1; then
+    for n in uas bot fs; do
+        eval "d=\$dev_$n"
+        # The full-speed disk moves about 1 MB/s: less of it.
+        mb=128; k4=2048
+        [ "$n" = fs ] && { mb=8; k4=256; }
+        q=/sys/block/${d#/dev/}/queue
+        say "bench $n queue: max_sectors_kb $(cat $q/max_sectors_kb), max_segments $(cat $q/max_segments), max_segment_size $(cat $q/max_segment_size)"
+        t0=$(now); dd if="$d" of=/dev/null bs=1M count=$mb iflag=direct 2>/dev/null || fail "read $n"; t1=$(now)
+        say "bench $n seq-read-1M $(rate "$mb" "$t0" "$t1") MB/s"
+        for kb in 64 256; do
+            c=$((mb * 1024 / kb))
+            t0=$(now); dd if="$d" of=/dev/null bs=${kb}k count=$c iflag=direct 2>/dev/null; t1=$(now)
+            say "bench $n seq-read-${kb}k $(rate "$mb" "$t0" "$t1") MB/s"
+        done
+        t0=$(now); dd if=/dev/zero of="$d" bs=1M count=$mb oflag=direct 2>/dev/null || fail "write $n"; t1=$(now)
+        say "bench $n seq-write-1M $(rate "$mb" "$t0" "$t1") MB/s"
+        t0=$(now); dd if="$d" of=/dev/null bs=4k count=$k4 iflag=direct 2>/dev/null || fail "4k $n"; t1=$(now)
+        say "bench $n read-4k $(rate "$k4" "$t0" "$t1") IOPS"
+    done
+    # All three at once.
+    t0=$(now)
+    for n in uas bot; do eval "dd if=\$dev_$n of=/dev/null bs=1M count=128 iflag=direct 2>/dev/null &"; done
+    dd if="$dev_fs" of=/dev/null bs=1M count=8 iflag=direct 2>/dev/null &
+    wait
+    t1=$(now)
+    say "bench all seq-read-1M $(rate 264 "$t0" "$t1") MB/s"
+    say "BENCH DONE"
+fi
+
+# Pattern regions: region r of each disk, 4 MiB at 8 MiB * (r + 1), holds
+# a file of seed r.
+pattern() { # disk name, region -> /tmp/p.$1.$2
+    [ -f "/tmp/p.$1.$2" ] || awk -v s="$1$2" 'BEGIN { srand(length(s) * 7919 + 13); for (i = 0; i < 4096; i++) { l = ""; for (j = 0; j < 32; j++) l = l sprintf("%c", 65 + int(rand() * 26)); print l } }' > "/tmp/p.$1.$2"
+}
+regions() { if [ "$1" = fs ]; then echo 0; else echo 0 1 2; fi; }
+writer() { # name, deadline[, regions]: write and read back its regions until then
+    eval "d=\$dev_$1"
+    rs=${3:-$(regions "$1")}
+    i=0
+    while [ "$(now | cut -d. -f1)" -lt "$2" ]; do
+        for r in $rs; do
+            pattern "$1" "$r"
+            dd if="/tmp/p.$1.$r" of="$d" bs=64k seek=$(((r + 1) * 128)) oflag=direct conv=notrunc 2>/dev/null || { echo "write $1 $r" >> /tmp/errors; return; }
+            dd if="$d" of="/tmp/b.$1.$r" bs=64k skip=$(((r + 1) * 128)) count=$(($(stat -c %s "/tmp/p.$1.$r") / 65536 + 1)) iflag=direct 2>/dev/null || { echo "read $1 $r" >> /tmp/errors; return; }
+            head -c "$(stat -c %s "/tmp/p.$1.$r")" "/tmp/b.$1.$r" | cmp -s - "/tmp/p.$1.$r" || { echo "mismatch $1 $r" >> /tmp/errors; return; }
+            i=$((i + 1))
+        done
+    done
+    echo "$1 $i" >> /tmp/rounds
+}
+reader() { # name, deadline: big direct reads, as fast as they go
+    eval "d=\$dev_$1"
+    while [ "$(now | cut -d. -f1)" -lt "$2" ]; do
+        dd if="$d" of=/dev/null bs=1M count=32 skip=64 iflag=direct 2>/dev/null
+    done
+}
+
+secs=$(arg usbstress)
+if [ -n "$secs" ]; then
+    rm -f /tmp/errors /tmp/rounds
+    end=$(($(now | cut -d. -f1) + secs))
+    for n in uas bot fs; do writer "$n" "$end" & done
+    for n in uas bot; do reader "$n" "$end" & reader "$n" "$end" & done
+    # Pull a disk out from under its I/O (its URBs are cancelled) and put it
+    # back, over and over.  Its writer may fail in the meantime; only the
+    # pattern check at the end counts for it.
+    cycles=0
+    while [ "$(now | cut -d. -f1)" -lt $((end - 10)) ]; do
+        sleep 3
+        echo 0 > "/sys/bus/usb/devices/$usb_bot/authorized"
+        sleep 1
+        echo 1 > "/sys/bus/usb/devices/$usb_bot/authorized"
+        cycles=$((cycles + 1))
+    done
+    wait
+    sleep 2
+    # The bot disk came back, perhaps under another name.
+    for b in /sys/block/sd*; do
+        case $(readlink -f "$b/device") in */$usb_bot:*) dev_bot=/dev/${b##*/} ;; esac
+    done
+    say "stress: $(tr '\n' ' ' < /tmp/rounds 2>/dev/null)rounds, $cycles deauthorize cycles"
+    grep -v '^\(write\|read\) bot' /tmp/errors 2>/dev/null | grep . && fail "stress: $(cat /tmp/errors | tr '\n' ' ')"
+    [ -f /tmp/errors ] && say "stress: bot errors while it was pulled: $(tr '\n' ' ' < /tmp/errors)"
+    # Every region holds its pattern.
+    for n in uas bot fs; do
+        eval "d=\$dev_$n"
+        for r in $(regions "$n"); do
+            pattern "$n" "$r"
+            sz=$(stat -c %s "/tmp/p.$n.$r")
+            dd if="$d" of=/tmp/v bs=64k skip=$(((r + 1) * 128)) count=$((sz / 65536 + 1)) iflag=direct 2>/dev/null
+            head -c "$sz" /tmp/v | cmp -s - "/tmp/p.$n.$r" || {
+                # The bot writer may have been cut off mid-write: write once more.
+                [ "$n" = bot ] && dd if="/tmp/p.$n.$r" of="$d" bs=64k seek=$(((r + 1) * 128)) oflag=direct conv=notrunc 2>/dev/null \
+                    && dd if="$d" of=/tmp/v bs=64k skip=$(((r + 1) * 128)) count=$((sz / 65536 + 1)) iflag=direct 2>/dev/null \
+                    && head -c "$sz" /tmp/v | cmp -s - "/tmp/p.$n.$r" || fail "region $n $r"
+            }
+        done
+    done
+    say "STRESS PASS"
+fi
+if on usbload=1; then
+    say "loaded"
+    # Regions 5 and 6, which the destroy may tear: usbverify checks 0-2.
+    for n in uas bot; do reader "$n" 999999 & writer "$n" 999999 "5 6" & done
+    reader fs 999999
+fi
+if on usbverify=1; then
+    for n in uas bot fs; do
+        eval "d=\$dev_$n"
+        for r in $(regions "$n"); do
+            pattern "$n" "$r"
+            sz=$(stat -c %s "/tmp/p.$n.$r")
+            dd if="$d" of=/tmp/v bs=64k skip=$(((r + 1) * 128)) count=$((sz / 65536 + 1)) iflag=direct 2>/dev/null
+            head -c "$sz" /tmp/v | cmp -s - "/tmp/p.$n.$r" || fail "region $n $r after destroy cycles"
+        done
+    done
+    say "VERIFY PASS"
+fi
+say "DONE"
+poweroff -f

@@ -497,7 +497,7 @@ pub mod usb {
     pub const fn area_va(n: usize) -> u64 {
         SPECIAL_BASE + 0x2800_0000 + n as u64 * 0x10_0000
     }
-    pub const AREA_PAGES: usize = 69;
+    pub const AREA_PAGES: usize = 101;
     pub const MAGIC: u32 = 0x6273_756c;
     pub const VERSION: u32 = 1;
 
@@ -507,9 +507,9 @@ pub mod usb {
     pub const EQ_SIZE: usize = 64;
     pub const CTL_SQ_OFF: usize = 0x2000;
     pub const XFER_SQ_OFF: usize = 0x4000;
-    pub const CQ_OFF: usize = 0x24000;
-    pub const EQ_OFF: usize = 0x44000;
-    pub const MAX_SEGS: usize = 16;
+    pub const CQ_OFF: usize = 0x44000;
+    pub const EQ_OFF: usize = 0x64000;
+    pub const MAX_SEGS: usize = 64;
     pub const MAX_ISO: usize = 48;
     pub const MAX_PORTS: usize = 255;
     pub const MAX_STREAMS: u32 = 16;
@@ -675,7 +675,7 @@ pub mod usb {
         pub reserved: [u32; 6],
         pub segs: [Seg; MAX_SEGS],
         pub iso: [Iso; MAX_ISO],
-        pub pad: [u8; 1024 - 64 - 16 * MAX_SEGS - 8 * MAX_ISO],
+        pub pad: [u8; 2048 - 64 - 16 * MAX_SEGS - 8 * MAX_ISO],
     }
 
     pub const ST_OK: i32 = 0;
@@ -736,11 +736,11 @@ pub mod usb {
     const _: () = assert!(core::mem::size_of::<Ctrl>() <= 4096);
     const _: () = assert!(core::mem::size_of::<Ep>() == 8);
     const _: () = assert!(core::mem::size_of::<CtlReq>() == 256);
-    const _: () = assert!(core::mem::size_of::<XferReq>() == 1024);
+    const _: () = assert!(core::mem::size_of::<XferReq>() == 2048);
     const _: () = assert!(core::mem::size_of::<Cqe>() == 512);
     const _: () = assert!(core::mem::size_of::<Event>() == 32);
     const _: () = assert!(CTL_SQ_OFF + CTL_SQ_SIZE * 256 == XFER_SQ_OFF);
-    const _: () = assert!(XFER_SQ_OFF + XFER_SQ_SIZE * 1024 == CQ_OFF);
+    const _: () = assert!(XFER_SQ_OFF + XFER_SQ_SIZE * 2048 == CQ_OFF);
     const _: () = assert!(CQ_OFF + CQ_SIZE * 512 == EQ_OFF);
     const _: () = assert!(EQ_OFF + EQ_SIZE * 32 <= AREA_PAGES * 4096);
     const _: () = assert!(area_va(MAX_GUEST_USB) <= super::KMOD_VA);
