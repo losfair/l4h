@@ -2491,7 +2491,8 @@ controller, one per claimed controller, and the guest forwards Linux's
   event ring (5 s timeout). An endpoint halted by an error is recovered
   with Reset Endpoint and Set TR Dequeue past the failed URB, as Linux
   does; a cancelled URB is skipped (dequeue moved, or its TRBs made
-  no-ops) and completed only once the endpoint has stopped, and every
+  no-ops, which stay reserved with the URB after them until the
+  controller is past them) and completed only once the endpoint has stopped, and every
   stream of the endpoint restarted. One whose record usbd has not taken
   (it waits behind a full CQ) is marked to be skipped and never completes
   (`ST_DROPPED`; the guest gives it back). A URB that

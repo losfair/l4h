@@ -582,8 +582,10 @@ impl Usbd {
             }
             // The no-ops of the padding stay the controller's until it is
             // past them: the URB's, from where they start.
-            let start = self.rings.get(r).enq;
+            let start = self.rings.get(r).hole;
+            let start = if start == NONE { self.rings.get(r).enq } else { start };
             let first = self.rings.write(dma, r, &trbs, pad);
+            self.rings.get_mut(r).hole = NONE;
             let next = urb.next;
             if urb.xfer.ty == abi::XFER_ISOC {
                 self.rings.get_mut(r).next_frame = proto::iso_next(&shape, urb.xfer.start_frame, urb.xfer.iso.len() as u32);
@@ -664,7 +666,11 @@ impl Usbd {
         let param = dma.pa(dma.ring(r as usize) + pos as usize * 16) | sct | cycle as u64;
         let trb = Trb { param, status: stream << 16, control: (CMD_SET_TR_DEQ << 10) | (dci as u32) << 16 | (slot as u32) << 24 };
         let _ = self.command(trb);
-        self.rings.get_mut(r).deq = pos;
+        if pos == self.rings.get(r).enq {
+            self.rings.passed_all(r);
+        } else {
+            self.rings.get_mut(r).deq = pos;
+        }
     }
 
     // ---- Requests.

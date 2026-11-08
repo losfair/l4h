@@ -28,6 +28,10 @@ pub struct Ring {
     pub deq: u16,
     /// Isoch: the start frame of an URB that follows those on the ring.
     pub next_frame: u32,
+    /// Where the no-ops of URBs cancelled after every posted URB begin
+    /// (NONE: none).  The controller has yet to pass them: they go with the
+    /// next URB posted.
+    pub hole: u16,
     /// URBs, oldest first.
     pub head: u16,
     pub tail: u16,
@@ -36,7 +40,7 @@ pub struct Ring {
     pub stream: u16,
 }
 
-const FREE_RING: Ring = Ring { used: false, enq: 0, cycle: 1, deq: 0, next_frame: 0, head: NONE, tail: NONE, slot: 0, dci: 0, stream: 0 };
+const FREE_RING: Ring = Ring { used: false, enq: 0, cycle: 1, deq: 0, next_frame: 0, hole: NONE, head: NONE, tail: NONE, slot: 0, dci: 0, stream: 0 };
 
 static mut RINGS: [Ring; USB_RINGS] = [FREE_RING; USB_RINGS];
 
@@ -92,7 +96,7 @@ impl Rings {
         link.w64(0, dma.pa(off));
         link.w32(12, (proto::TRB_LINK << 10) | proto::TRB_TC);
         let ring = &mut self.rings[r as usize];
-        (ring.enq, ring.cycle, ring.deq) = (0, 1, 0);
+        (ring.enq, ring.cycle, ring.deq, ring.hole) = (0, 1, 0, NONE);
     }
 
     /// Position `pos` as an offset from `first`, going round the ring.
@@ -210,8 +214,17 @@ impl Rings {
         u
     }
 
-    /// Take URB `u` off ring `r`; the controller is done with its TRBs.
-    /// Returns the URB after it.
+    /// The controller is at the enqueue pointer (Set TR Dequeue there):
+    /// it has passed everything on ring `r`.
+    pub fn passed_all(&mut self, r: u16) {
+        let ring = &mut self.rings[r as usize];
+        (ring.hole, ring.deq) = (NONE, ring.enq);
+    }
+
+    /// Take URB `u` off ring `r`: completed, or cancelled.  The TRBs of
+    /// one after the oldest posted URB (made no-ops) are the controller's
+    /// until it is past them, so they go to the posted URB after it, or to
+    /// the next one posted.  Returns the URB after it.
     pub fn unlink(&mut self, urbs: &mut Urbs, r: u16, u: u16) -> u16 {
         let ring = &mut self.rings[r as usize];
         let next = urbs.get(u).next;
@@ -228,12 +241,21 @@ impl Rings {
             ring.head = next;
         } else {
             urbs.get_mut(prev).next = next;
+            if urbs.get(u).posted {
+                let start = urbs.get(u).start;
+                // Any hole is after it: the no-ops now start earlier.
+                match next {
+                    n if n != NONE && urbs.get(n).posted => urbs.get_mut(n).start = start,
+                    _ => ring.hole = start,
+                }
+            }
         }
         if ring.tail == u {
             ring.tail = prev;
         }
         ring.deq = match ring.head {
             h if h != NONE && urbs.get(h).posted => urbs.get(h).start,
+            _ if ring.hole != NONE => ring.hole,
             _ => ring.enq,
         };
         next
