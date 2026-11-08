@@ -289,7 +289,7 @@ support, since no device is passed into a guest.
 | 0024 | (x86) No boot without SKIM unless the CPU reports RDCL_NO (above). |
 | 0025 | (x86) `GetIOAPICRemapped` adds a 16-bit interrupt-remapping table index to the I/O APIC handler arguments and writes the remappable RTE format. Root publishes the matching VT-d IRTE first; seL4 keeps pin masking, acknowledgement and capability lifecycle and does not manage the IOMMU. |
 | 0038 | (x86, `KernelVTX`) A kernel built with VT-x boots on a CPU without usable VT-x (no VMX, VMX locked off by firmware, or no EPT write-back or 2 MiB support) instead of halting. The boot core records the result in `x86KSVTXEnabled`; secondary cores skip VT-x when it is off and must match the boot core when it is on. Without VT-x, `Untyped_Retype` refuses VCPU and EPT objects (`seL4_InvalidArgument`), which is also how userspace probes for it. With the SKIM window VT-x stays off (§4.1). EPT checks run before `vmxon`, and a failed `vmxon` clears `CR4.VMXE`, so no core is left in VMX operation, where INIT is blocked. This lets one `KernelVTX` image (§4.1) serve hosts with and without VT-x. |
-| 0039 | (x86, `KernelVTX`) The VCPU interface KVM in a guest needs (§5.10), and VM exits and entries with only the VMCS and MSR accesses they need (each one is an exit when seL4 runs nested without VMCS shadowing): the syscall MSRs switch through the MSR-load lists, an exit reads only the fields its reason defines, VMEnter writes only what changed, and EPT maps do no `invept`. Userspace can turn on only listed VM-execution, exit and entry controls: the others use VMCS address fields nothing sets (virtual APIC, PML, posted interrupts, VMCS shadowing, #VE), which would point at host physical page 0. MOV-DR, RDPMC, MWAIT and MONITOR always exit. `VMEnter` returns one MR layout for faults and notifications, adding CR2 and the exit and IDT-vectoring information; when the VCPU did not run, the exit fields read 0 and `INTERRUPT_INFO_MR` keeps the undelivered event. The guest's CR2 survives exits (other threads' page faults overwrite it) and `WriteMSR(SEL4_VCPU_MSR_CR2)` sets it. `invept` reaches every core that has entered a VM, so no core keeps translations of an unmapped frame; `VCPU_FlushTLB` is that `invept` for guest TLB flushes. `WriteVMCS` takes the TSC offset and entry instruction length, `Read`/`WriteMSR` `KERNEL_GS_BASE`. The guest runs on the TCB's FPU state, without the two swaps per exit seL4 made into state userspace could not read. |
+| 0039 | (x86, `KernelVTX`) The VCPU interface KVM in a guest needs (§5.10), and VM exits and entries with only the VMCS and MSR accesses they need (each one is an exit when seL4 runs nested without VMCS shadowing): the syscall MSRs switch through the MSR-load lists, an exit reads only the fields its reason defines, VMEnter writes only what changed, and EPT maps do no `invept`, as they only fill not-present entries. Userspace can turn on only listed VM-execution, exit and entry controls: the others use VMCS address fields nothing sets (virtual APIC, PML, posted interrupts, VMCS shadowing, #VE), which would point at host physical page 0. MOV-DR, RDPMC, MWAIT and MONITOR always exit. `VMEnter` returns one MR layout for faults and notifications, adding CR2 and the exit and IDT-vectoring information; when the VCPU did not run, the exit fields read 0 and `INTERRUPT_INFO_MR` keeps the undelivered event. The guest's CR2 survives exits (other threads' page faults overwrite it) and `WriteMSR(SEL4_VCPU_MSR_CR2)` sets it. Unmapping an EPT page or table invalidates every core that has entered a VM, so no core keeps translations of an unmapped frame (upstream unmapped pages without any `invept`), and `invept` passes the whole EPTP, which nested KVM matches in full; `VCPU_FlushTLB` is that `invept` for guest TLB flushes. `WriteVMCS` takes the TSC offset and entry instruction length, `Read`/`WriteMSR` `KERNEL_GS_BASE`. The guest runs on the TCB's FPU state, without the two swaps per exit seL4 made into state userspace could not read. |
 
 **Verification.** The MCS SMP x86_64 configuration is not covered by the
 seL4 proofs, with or without these patches. l4h benefits from seL4's design
@@ -978,8 +978,11 @@ implements `kvm_x86_ops` on seL4 VCPU objects (patch 0039).
   faults are off (they change SPTEs without the hook); there are no
   accessed or dirty bits, so aging and dirty logging use write protection
   and access tracking. Revoking a block takes our capability copies, and
-  the nested guest refaults. seL4 invalidates the EPT on every core at each
-  change, so KVM's remote TLB flushes have nothing to do.
+  the nested guest refaults. seL4 invalidates the EPT on every core that
+  has entered a VM whenever it removes a leaf or table, and adding one
+  needs no invalidation (no TLB holds a not-present entry), so KVM's
+  remote TLB flushes have nothing to do. `kvmtest.c` checks that a
+  replaced memslot and a dirty-log write-protect take effect at once.
 - **FPU.** seL4 runs the guest on the kTCB's FPU registers. The guest's
   XSAVE state stays loaded across exits and is saved when kernel-mode SIMD
   needs the registers or the task leaves `KVM_RUN`. `KVM_SET_XSAVE`
@@ -1010,17 +1013,19 @@ implements `kvm_x86_ops` on seL4 VCPU objects (patch 0039).
 
   | | Linux L1 | l4h dom0 |
   |---|---|---|
-  | guest compute (10⁹ loop iterations) | 267 ms | 265 ms |
-  | CPUID exit (handled by KVM) | 54 µs | 48 µs |
-  | port I/O exit to the VMM | 72 µs | 63 µs |
-  | MMIO exit to the VMM (emulated) | 92 µs | 83 µs |
-  | first touch of a 4 KiB page (EPT fault) | 49 µs | 66 µs |
-  | boot under QEMU | 1.96 s | 2.36 s |
-  | boot under Firecracker | 1.51 s | 1.94 s |
-  | boot under cloud-hypervisor | 1.57 s | 1.85 s |
+  | guest compute (10⁹ loop iterations) | 267 ms | 263 ms |
+  | CPUID exit (handled by KVM) | 54 µs | 50 µs |
+  | port I/O exit to the VMM | 72 µs | 64 µs |
+  | MMIO exit to the VMM (emulated) | 92 µs | 84 µs |
+  | first touch of a 4 KiB page (EPT fault) | 49 µs | 64 µs |
+  | boot under QEMU | 1.96 s | 2.64 s |
+  | boot under Firecracker | 1.51 s | 2.29 s |
+  | boot under cloud-hypervisor | 1.57 s | 2.17 s |
 
   Before these changes an exit took about 155 µs and a Firecracker boot
-  13 s. An EPT fault costs a capability copy and a map on top of the exit.
+  13 s. An EPT fault costs a capability copy and a map on top of the exit,
+  and each unmap an `invept` on every core that has run a VM (about 0.3 s
+  of each boot; batching them is left to do).
   About 85% of an exit is the `seL4_VMEnter` call, almost all of it L0's
   emulation of the nested entry and exit.
 - **Test.** `tests/run-kvmtest.sh`, `tests/run-kvmbench.sh` (§14.3).

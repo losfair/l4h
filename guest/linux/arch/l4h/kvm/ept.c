@@ -18,8 +18,10 @@
  *    thinks is mapped, KVM calls it spurious, and calls us again.  That is
  *    the one path that repairs the EPT, and all that is needed.
  *
- * seL4 invalidates the EPT on every core at each change (patch 0039), so
- * KVM's TLB flushes for page table changes have nothing left to do.
+ * seL4 invalidates the EPT on every core that has entered a VM whenever it
+ * removes a leaf or a table (patch 0039), and adding one needs no
+ * invalidation, so KVM's TLB flushes for page table changes have nothing
+ * left to do.
  *
  * Every mapping needs its own copy of the frame capability, in a slot we
  * record to delete it again; deleting the copy removes the mapping.

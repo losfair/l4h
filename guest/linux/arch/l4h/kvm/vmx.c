@@ -624,7 +624,13 @@ static int l4h_get_feature_msr(u32 msr, u64 *data)
 
 /* ---- TLBs */
 
-/* Page table changes are flushed where they are made (ept.c). */
+/*
+ * Page table changes are flushed where they are made: seL4 invalidates every
+ * core that has entered a VM when it removes an EPT leaf or table (patch
+ * 0039), before ept.c returns.  Adding one needs nothing, as no TLB holds a
+ * not-present entry.  tests/guest/kvmtest.c checks both (slot_replace,
+ * dirty_log).
+ */
 static void l4h_flush_tlb_noop(struct kvm_vcpu *vcpu)
 {
 }

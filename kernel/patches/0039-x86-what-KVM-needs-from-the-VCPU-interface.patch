@@ -1,4 +1,4 @@
-From 2d788a24bccdeff998eff312edf5b69512c85334 Mon Sep 17 00:00:00 2001
+From 6b5b520817c2a00aba76247813fff154262329f2 Mon Sep 17 00:00:00 2001
 From: l4h <l4h@localhost>
 Date: Fri, 6 Nov 2026 23:22:24 -0800
 Subject: [PATCH] x86: what KVM needs from the VCPU interface
@@ -38,8 +38,13 @@ MSR.  So VM exits and entries do only what they need:
   the controls and the entry event only when they change.  RSP and CR3
   are for ReadVMCS (CR3_MR is not filled in), and CR0 is read back only
   when the guest owns some of it.
-- Mapping into an EPT does no invept: it only fills not-present entries,
-  which no TLB caches.  Unmapping still invalidates on every core.
+- Unmapping a page from an EPT invalidates every core that may hold its
+  translation; it invalidated none, so a guest kept reaching a frame
+  after it was unmapped (seen once mapping stopped invalidating).
+  Mapping does no invept: it only fills not-present entries, which no
+  TLB caches.  INVEPT gets the whole EPTP the VMCS has, not just the root's
+  address: the CPU ignores the other bits, but nested KVM compares them
+  and, with the address alone, invalidated nothing.
 ---
  include/arch/x86/arch/object/vcpu.h           |  28 +-
  include/arch/x86/arch/smp/ipi.h               |   1 +
@@ -48,10 +53,10 @@ MSR.  So VM exits and entries do only what they need:
  libsel4/arch_include/x86/sel4/arch/vmenter.h  |  13 +-
  src/arch/x86/64/c_traps.c                     |   4 +-
  src/arch/x86/c_traps.c                        |   5 +-
- src/arch/x86/kernel/ept.c                     |  10 +-
- src/arch/x86/object/vcpu.c                    | 288 ++++++++++++++----
+ src/arch/x86/kernel/ept.c                     |  14 +-
+ src/arch/x86/object/vcpu.c                    | 293 ++++++++++++++----
  src/arch/x86/smp/ipi.c                        |   3 +
- 10 files changed, 298 insertions(+), 75 deletions(-)
+ 10 files changed, 306 insertions(+), 76 deletions(-)
 
 diff --git a/include/arch/x86/arch/object/vcpu.h b/include/arch/x86/arch/object/vcpu.h
 index e97af45..b8b5a3a 100644
@@ -243,7 +248,7 @@ index 9ce8686..afc8e02 100644
          } else {
              setThreadState(NODE_STATE(ksCurThread), ThreadState_RunningVM);
 diff --git a/src/arch/x86/kernel/ept.c b/src/arch/x86/kernel/ept.c
-index 84e5737..95e5535 100644
+index 84e5737..557b4c9 100644
 --- a/src/arch/x86/kernel/ept.c
 +++ b/src/arch/x86/kernel/ept.c
 @@ -296,7 +296,7 @@ static exception_t performEPTPDPTInvocationMap(cap_t cap, cte_t *cte, ept_pml4e_
@@ -291,8 +296,20 @@ index 84e5737..95e5535 100644
  
      return EXCEPTION_NONE;
  }
+@@ -1042,7 +1042,11 @@ void unmapEPTPage(vm_page_size_t page_size, asid_t asid, vptr_t vptr, void *pptr
+          * so this should not happen. As we have no way to return an error
+          * all we can do is assert */
+         assert(!"Invalid page size for unmap");
++        return;
+     }
++    /* Every core that may hold the old translation, before the frame can
++     * be mapped again or reused: a guest must not reach it afterwards. */
++    invept(find_ret.ept);
+ }
+ 
+ #endif /* CONFIG_VTX */
 diff --git a/src/arch/x86/object/vcpu.c b/src/arch/x86/object/vcpu.c
-index 92dd1df..7c0fc50 100644
+index 92dd1df..0f3b99b 100644
 --- a/src/arch/x86/object/vcpu.c
 +++ b/src/arch/x86/object/vcpu.c
 @@ -49,6 +49,23 @@ static msr_bitmaps_t msr_bitmap_region ALIGN(BIT(seL4_PageBits));
@@ -776,7 +793,19 @@ index 92dd1df..7c0fc50 100644
  {
      if (vmx_ept_vpid_cap_msr_get_invept(vpid_capability)) {
          struct {
-@@ -1656,4 +1810,18 @@ void invept(ept_pml4e_t *ept_pml4)
+@@ -1645,7 +1799,10 @@ void invept(ept_pml4e_t *ept_pml4)
+             return;
+         }
+ 
+-        address.parts[0] = pptr_to_paddr((void *)ept_pml4);
++        /* The whole EPTP, as setEPTRoot() loads it.  The CPU looks only at
++         * the address, but a hypervisor emulating INVEPT for us (nested
++         * KVM) may compare the whole value with the EPTPs it knows. */
++        address.parts[0] = vmx_eptp_new(pptr_to_paddr((void *)ept_pml4), 0, 3, 6).words[0];
+         address.parts[1] = 0;
+         asm volatile(
+             "invept %0, %1"
+@@ -1656,4 +1813,18 @@ void invept(ept_pml4e_t *ept_pml4)
      }
  }
  

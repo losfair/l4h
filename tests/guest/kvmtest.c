@@ -21,7 +21,7 @@
 #define MEM_SIZE (64ul << 20)
 
 /* Guest code, assembled here and copied to guest address 0x1000. */
-extern const char rm_start[], rm_end[], lm_start[], lm_end[];
+extern const char rm_start[], rm_end[], lm_start[], lm_end[], probe_start[], probe_end[];
 __asm__(".pushsection .rodata\n"
 	/* Real mode: "OK" to port 0x3f8, then hlt. */
 	".code16\n"
@@ -67,6 +67,18 @@ __asm__(".pushsection .rodata\n"
 	"  mov %r8d, (%rbx)\n"
 	"  hlt\n"
 	"lm_end:\n"
+	/* Read the word at rdi and OUT it to port 0x20, over and over; with
+	 * rsi set, write rsi there first each time.  Each OUT stops it in
+	 * userspace, where the test changes the memory behind it. */
+	"probe_start:\n"
+	"1: test %rsi, %rsi\n"
+	"  jz 2f\n"
+	"  mov %esi, (%rdi)\n"
+	"2: mov (%rdi), %eax\n"
+	"  mov $0x20, %dx\n"
+	"  out %eax, %dx\n"
+	"  jmp 1b\n"
+	"probe_end:\n"
 	".popsection\n");
 
 static int failures;
@@ -175,33 +187,27 @@ static void seg64(struct kvm_segment *s, int code)
 	s->g = 1;
 }
 
-/* Fill `fill` bytes and spin `spin` times in long mode. */
-static int long_mode(int kvm, uint64_t fill, uint64_t spin, const char *what)
+/* Long mode at 0x1000 running [code, end), with rdi and rsi set; the first
+ * 4 GiB identity-mapped with 2 MiB pages. */
+static int enter_long_mode(struct vm *vm, const char *code, const char *end,
+			   uint64_t rdi, uint64_t rsi)
 {
 	struct kvm_sregs sregs;
 	struct kvm_regs regs;
-	uint64_t *pml4, *pdpt, *pd, sum = 0, i;
-	uint32_t port_val = 0, mmio_val = 0;
-	struct timespec t0, t1;
-	int got_mmio = 0;
-	struct vm vm;
+	uint64_t *pml4, *pdpt, *pd, i;
 
-	if (vm_create(&vm, kvm))
-		return -1;
-	memcpy(vm.mem + 0x1000, lm_start, lm_end - lm_start);
-	/* Identity map of the first GiB in 2 MiB pages at 0x10000. */
-	pml4 = (uint64_t *)(vm.mem + 0x10000);
-	pdpt = (uint64_t *)(vm.mem + 0x11000);
-	pd = (uint64_t *)(vm.mem + 0x12000);
+	memcpy(vm->mem + 0x1000, code, end - code);
+	pml4 = (uint64_t *)(vm->mem + 0x10000);
+	pdpt = (uint64_t *)(vm->mem + 0x11000);
+	pd = (uint64_t *)(vm->mem + 0x12000);
 	pml4[0] = 0x11000 | 3;
 	pdpt[0] = 0x12000 | 3;
 	pdpt[3] = 0x13000 | 3;		/* 3-4 GiB, for the MMIO address */
 	for (i = 0; i < 512; i++) {
 		pd[i] = (i << 21) | 0x83;
-		((uint64_t *)(vm.mem + 0x13000))[i] = (0xc0000000ul + (i << 21)) | 0x83;
+		((uint64_t *)(vm->mem + 0x13000))[i] = (0xc0000000ul + (i << 21)) | 0x83;
 	}
-
-	CHECK(ioctl(vm.vcpu, KVM_GET_SREGS, &sregs) == 0, "KVM_GET_SREGS");
+	CHECK(ioctl(vm->vcpu, KVM_GET_SREGS, &sregs) == 0, "KVM_GET_SREGS");
 	sregs.cr3 = 0x10000;
 	sregs.cr4 = 1 << 5;		/* PAE */
 	sregs.cr0 = 0x80000011;		/* PG, ET, PE */
@@ -209,13 +215,30 @@ static int long_mode(int kvm, uint64_t fill, uint64_t spin, const char *what)
 	seg64(&sregs.cs, 1);
 	seg64(&sregs.ds, 0);
 	sregs.es = sregs.fs = sregs.gs = sregs.ss = sregs.ds;
-	CHECK(ioctl(vm.vcpu, KVM_SET_SREGS, &sregs) == 0, "KVM_SET_SREGS");
+	CHECK(ioctl(vm->vcpu, KVM_SET_SREGS, &sregs) == 0, "KVM_SET_SREGS");
 	memset(&regs, 0, sizeof(regs));
 	regs.rip = 0x1000;
 	regs.rflags = 2;
-	regs.rdi = fill;
-	regs.rsi = spin;
-	CHECK(ioctl(vm.vcpu, KVM_SET_REGS, &regs) == 0, "KVM_SET_REGS");
+	regs.rdi = rdi;
+	regs.rsi = rsi;
+	CHECK(ioctl(vm->vcpu, KVM_SET_REGS, &regs) == 0, "KVM_SET_REGS");
+	return 0;
+}
+
+/* Fill `fill` bytes and spin `spin` times in long mode. */
+static int long_mode(int kvm, uint64_t fill, uint64_t spin, const char *what)
+{
+	struct kvm_regs regs;
+	uint64_t sum = 0, i;
+	uint32_t port_val = 0, mmio_val = 0;
+	struct timespec t0, t1;
+	int got_mmio = 0;
+	struct vm vm;
+
+	if (vm_create(&vm, kvm))
+		return -1;
+	if (enter_long_mode(&vm, lm_start, lm_end, fill, spin))
+		return -1;
 
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	for (;;) {
@@ -254,6 +277,94 @@ static int long_mode(int kvm, uint64_t fill, uint64_t spin, const char *what)
 	return 0;
 }
 
+#define PROBE_GPA (MEM_SIZE + (2ul << 20))
+
+/* Run the probe to its next OUT; returns the word it read. */
+static int probe_step(struct vm *vm, uint32_t *val)
+{
+	CHECK(ioctl(vm->vcpu, KVM_RUN, 0) == 0, "KVM_RUN");
+	CHECK(vm->run->exit_reason == KVM_EXIT_IO && vm->run->io.port == 0x20,
+	      "probe: exit %u", vm->run->exit_reason);
+	*val = *(uint32_t *)((char *)vm->run + vm->run->io.data_offset);
+	return 0;
+}
+
+static int set_slot1(struct vm *vm, void *mem, uint64_t size, uint32_t flags)
+{
+	struct kvm_userspace_memory_region r = {
+		.slot = 1, .flags = flags, .guest_phys_addr = PROBE_GPA,
+		.memory_size = size, .userspace_addr = (uintptr_t)mem,
+	};
+
+	CHECK(ioctl(vm->fd, KVM_SET_USER_MEMORY_REGION, &r) == 0, "slot 1 (size %lx)", size);
+	return 0;
+}
+
+/*
+ * A memslot replaced by another at the same address: the guest, which
+ * flushes nothing, must see the new memory at once.  An EPT translation of
+ * the old frame left in a TLB would let it keep the frame after KVM gave
+ * it back.
+ */
+static int slot_replace(int kvm)
+{
+	uint32_t *a = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	uint32_t *b = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	uint32_t val;
+	struct vm vm;
+	int round;
+
+	if (vm_create(&vm, kvm) || enter_long_mode(&vm, probe_start, probe_end, PROBE_GPA, 0))
+		return -1;
+	a[0] = 0x11111111;
+	b[0] = 0x22222222;
+	for (round = 0; round < 4; round++) {
+		uint32_t *cur = round & 1 ? b : a;
+
+		if (set_slot1(&vm, cur, 4096, 0) || probe_step(&vm, &val) || probe_step(&vm, &val))
+			return -1;
+		CHECK(val == cur[0], "slot replace %d: guest read %x, slot holds %x", round, val, cur[0]);
+		if (set_slot1(&vm, cur, 0, 0))
+			return -1;
+	}
+	vm_destroy(&vm);
+	munmap(a, 4096);
+	munmap(b, 4096);
+	printf("KVMTEST: slot replace ok\n");
+	return 0;
+}
+
+/*
+ * Dirty logging write-protects a page again each time the log is read: a
+ * write after that must fault and be logged, which a writable translation
+ * left in a TLB would let it skip.
+ */
+static int dirty_log(int kvm)
+{
+	uint32_t *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	uint64_t bitmap = 0;
+	struct kvm_dirty_log log = { .slot = 1, .dirty_bitmap = &bitmap };
+	uint32_t val;
+	struct vm vm;
+	int round;
+
+	if (vm_create(&vm, kvm) || enter_long_mode(&vm, probe_start, probe_end, PROBE_GPA, 0x33333333))
+		return -1;
+	if (set_slot1(&vm, p, 4096, KVM_MEM_LOG_DIRTY_PAGES))
+		return -1;
+	for (round = 0; round < 4; round++) {
+		if (probe_step(&vm, &val) || probe_step(&vm, &val))
+			return -1;
+		bitmap = 0;
+		CHECK(ioctl(vm.fd, KVM_GET_DIRTY_LOG, &log) == 0, "KVM_GET_DIRTY_LOG");
+		CHECK(bitmap & 1, "dirty log round %d: the guest's write was not logged", round);
+	}
+	vm_destroy(&vm);
+	munmap(p, 4096);
+	printf("KVMTEST: dirty log ok\n");
+	return 0;
+}
+
 struct job {
 	int kvm, ret;
 };
@@ -282,6 +393,8 @@ int main(void)
 	long_mode(kvm, 0, 0, "long mode");
 	long_mode(kvm, MEM_SIZE - (4ul << 20), 0, "62 MiB of EPT faults");
 	long_mode(kvm, 1 << 20, 2000000000, "long run");
+	slot_replace(kvm);
+	dirty_log(kvm);
 	for (i = 0; i < 2; i++) {
 		jobs[i].kvm = kvm;
 		pthread_create(&t[i], NULL, parallel_vm, &jobs[i]);
