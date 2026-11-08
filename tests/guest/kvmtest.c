@@ -25,6 +25,7 @@
 /* Guest code, assembled here and copied to guest address 0x1000. */
 extern const char rm_start[], rm_end[], lm_start[], lm_end[], probe_start[], probe_end[];
 extern const char fpu_start[], fpu_end[], xcr0_start[], xcr0_end[], smap_start[], smap_end[];
+extern const char state_start[], state_end[];
 __asm__(".pushsection .rodata\n"
 	/* Real mode: "OK" to port 0x3f8, then hlt. */
 	".code16\n"
@@ -157,6 +158,16 @@ __asm__(".pushsection .rodata\n"
 	"  hlt\n"
 	"smap_end:\n"
 	".code64\n"
+	/* Store what the CPU has of IDTR (at 0x3000) and CR4 (at 0x3010),
+	 * then OUT to port 0x40, over and over. */
+	"state_start:\n"
+	"1: sidt 0x3000\n"
+	"  mov %cr4, %rax\n"
+	"  mov %rax, 0x3010\n"
+	"  mov $0x40, %dx\n"
+	"  out %al, %dx\n"
+	"  jmp 1b\n"
+	"state_end:\n"
 	".popsection\n");
 
 static int failures;
@@ -303,6 +314,15 @@ static int enter_long_mode(struct vm *vm, const char *code, const char *end,
 	return 0;
 }
 
+/* EBX of CPUID leaf 0: "Genu" or "Auth". */
+static uint32_t host_vendor(void)
+{
+	uint32_t a = 0, b, c, d;
+
+	__asm__ volatile("cpuid" : "+a"(a), "=b"(b), "=c"(c), "=d"(d));
+	return b;
+}
+
 /* Fill `fill` bytes and spin `spin` times in long mode. */
 static int long_mode(int kvm, uint64_t fill, uint64_t spin, const char *what)
 {
@@ -346,8 +366,9 @@ static int long_mode(int kvm, uint64_t fill, uint64_t spin, const char *what)
 	CHECK(port_val == sum, "%s: port sum %x, wanted %lx", what, port_val, sum);
 	CHECK(got_mmio && mmio_val == sum, "%s: MMIO write %d %x", what, got_mmio, mmio_val);
 	CHECK(ioctl(vm.vcpu, KVM_GET_REGS, &regs) == 0, "KVM_GET_REGS");
-	/* rbx of the emulated CPUID went into the guest. */
-	CHECK(regs.rbx == 0xd0000000 && regs.r8 == sum && regs.r9 == 0x756e6547,
+	/* rbx of the emulated CPUID went into the guest: the host's vendor
+	 * (KVM_GET_SUPPORTED_CPUID). */
+	CHECK(regs.rbx == 0xd0000000 && regs.r8 == sum && regs.r9 == host_vendor(),
 	      "%s: registers after exit: rbx %llx r8 %llx r9 %llx", what, regs.rbx, regs.r8, regs.r9);
 	vm_destroy(&vm);
 	printf("KVMTEST: %s ok (%.3f s)\n", what,
@@ -575,6 +596,50 @@ static int fpu_migrate(int kvm)
 	return 0;
 }
 
+/*
+ * Guest state that KVM changes between runs must reach the CPU, which
+ * keeps VMCB fields across VMRUNs on one core unless told they changed
+ * (SVM's clean bits): IDTR and CR4, changed before each run, read by the
+ * guest itself, on one core and then moving between two.
+ */
+static int state_between_runs(int kvm)
+{
+	struct kvm_sregs sregs;
+	cpu_set_t set, old;
+	struct vm vm;
+	int round;
+
+	if (vm_create(&vm, kvm) || enter_long_mode(&vm, state_start, state_end, 0, 0))
+		return -1;
+	pthread_getaffinity_np(pthread_self(), sizeof(old), &old);
+	for (round = 0; round < 16; round++) {
+		uint64_t base = 0x100000 + round * 0x1000, cr4;
+
+		CPU_ZERO(&set);
+		CPU_SET(round < 8 ? 0 : round & 1, &set);
+		pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+		CHECK(ioctl(vm.vcpu, KVM_GET_SREGS, &sregs) == 0, "KVM_GET_SREGS");
+		sregs.idt.base = base;
+		sregs.idt.limit = 0xfff;
+		sregs.cr4 = (1 << 5) | (1 << 9) | (round & 1 ? 1 << 10 : 0);
+		cr4 = sregs.cr4;
+		CHECK(ioctl(vm.vcpu, KVM_SET_SREGS, &sregs) == 0, "KVM_SET_SREGS");
+		CHECK(ioctl(vm.vcpu, KVM_RUN, 0) == 0, "KVM_RUN");
+		CHECK(vm.run->exit_reason == KVM_EXIT_IO && vm.run->io.port == 0x40,
+		      "state between runs: exit %u", vm.run->exit_reason);
+		CHECK(*(uint64_t *)(vm.mem + 0x3002) == base && *(uint16_t *)(vm.mem + 0x3000) == 0xfff,
+		      "state between runs %d: guest IDTR %lx, set %lx", round,
+		      *(uint64_t *)(vm.mem + 0x3002), base);
+		CHECK(*(uint64_t *)(vm.mem + 0x3010) == cr4,
+		      "state between runs %d: guest CR4 %lx, set %lx", round,
+		      *(uint64_t *)(vm.mem + 0x3010), cr4);
+	}
+	pthread_setaffinity_np(pthread_self(), sizeof(old), &old);
+	vm_destroy(&vm);
+	printf("KVMTEST: state between runs ok\n");
+	return 0;
+}
+
 struct job {
 	int kvm, ret;
 };
@@ -608,6 +673,7 @@ int main(void)
 	fpu_migrate(kvm);
 	xcr0(kvm);
 	smap_paging(kvm);
+	state_between_runs(kvm);
 	for (i = 0; i < 2; i++) {
 		jobs[i].kvm = kvm;
 		pthread_create(&t[i], NULL, parallel_vm, &jobs[i]);

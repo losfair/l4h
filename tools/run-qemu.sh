@@ -38,7 +38,7 @@ if [ ${#iommu[@]} -ne 0 ]; then
         -global virtio-net-pci.iommu_platform=on)
 fi
 exec qemu-system-x86_64 \
-    -enable-kvm -cpu "${L4H_QEMU_CPU:-host,-vmx,+invtsc}" \
+    -enable-kvm -cpu "${L4H_QEMU_CPU:-host,-vmx,-svm,+invtsc}" \
     -smp "${L4H_SMP:-4}" -m "${L4H_MEM:-4G}" \
     -nographic -serial mon:stdio -no-reboot "${iommu[@]}" \
     -kernel "$root/build/kernel32.elf" \
