@@ -672,8 +672,15 @@ static void l4h_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
 	}
 }
 
+/*
+ * The task may be leaving this vCPU in the middle of KVM_RUN (a preemption,
+ * then a migration): its guest's registers must not stay in this kTCB, where
+ * the next vCPU would not find them, and from which a later save here would
+ * overwrite what the guest did since.
+ */
 static void l4h_vcpu_put(struct kvm_vcpu *vcpu)
 {
+	l4h_kvm_fpu_save();
 }
 
 static int l4h_vcpu_create(struct kvm_vcpu *vcpu)

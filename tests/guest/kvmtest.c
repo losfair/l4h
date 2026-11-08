@@ -5,7 +5,9 @@
  * faults on all their memory, long runs that seL4 preempts, and VMs made
  * and destroyed in a row.  Prints KVMTEST: PASS or KVMTEST: FAIL.
  */
+#define _GNU_SOURCE
 #include <errno.h>
+#include <sched.h>
 #include <fcntl.h>
 #include <linux/kvm.h>
 #include <pthread.h>
@@ -22,6 +24,7 @@
 
 /* Guest code, assembled here and copied to guest address 0x1000. */
 extern const char rm_start[], rm_end[], lm_start[], lm_end[], probe_start[], probe_end[];
+extern const char fpu_start[], fpu_end[];
 __asm__(".pushsection .rodata\n"
 	/* Real mode: "OK" to port 0x3f8, then hlt. */
 	".code16\n"
@@ -79,6 +82,24 @@ __asm__(".pushsection .rodata\n"
 	"  out %eax, %dx\n"
 	"  jmp 1b\n"
 	"probe_end:\n"
+	/* rdi CPUID exits, each handled in the kernel, adding 1 to xmm8 in
+	 * between; then xmm8 to port 0x30.  The count survives only if the
+	 * guest's vector registers follow the task when it migrates. */
+	"fpu_start:\n"
+	"  pxor %xmm8, %xmm8\n"
+	"  mov $1, %eax\n"
+	"  movq %rax, %xmm9\n"
+	"  mov %rdi, %r12\n"
+	"1: xor %eax, %eax\n"
+	"  cpuid\n"
+	"  paddq %xmm9, %xmm8\n"
+	"  dec %r12\n"
+	"  jnz 1b\n"
+	"  movq %xmm8, %rax\n"
+	"  mov $0x30, %dx\n"
+	"  out %eax, %dx\n"
+	"  hlt\n"
+	"fpu_end:\n"
 	".popsection\n");
 
 static int failures;
@@ -209,7 +230,7 @@ static int enter_long_mode(struct vm *vm, const char *code, const char *end,
 	}
 	CHECK(ioctl(vm->vcpu, KVM_GET_SREGS, &sregs) == 0, "KVM_GET_SREGS");
 	sregs.cr3 = 0x10000;
-	sregs.cr4 = 1 << 5;		/* PAE */
+	sregs.cr4 = (1 << 5) | (1 << 9) | (1 << 10);	/* PAE, OSFXSR, OSXMMEXCPT */
 	sregs.cr0 = 0x80000011;		/* PG, ET, PE */
 	sregs.efer = 0x500;		/* LME, LMA */
 	seg64(&sregs.cs, 1);
@@ -365,6 +386,61 @@ static int dirty_log(int kvm)
 	return 0;
 }
 
+struct mover {
+	pthread_t target;
+	volatile int stop;
+};
+
+/* Move the target between CPUs 0 and 1, every millisecond. */
+static void *mover(void *arg)
+{
+	struct mover *m = arg;
+	cpu_set_t set;
+	int cpu = 0;
+
+	while (!m->stop) {
+		CPU_ZERO(&set);
+		CPU_SET(cpu, &set);
+		pthread_setaffinity_np(m->target, sizeof(set), &set);
+		cpu ^= 1;
+		usleep(1000);
+	}
+	return NULL;
+}
+
+/*
+ * The guest's vector registers while its task migrates inside KVM_RUN: the
+ * exits are all handled in the kernel, so nothing returns to userspace to
+ * save them in between.
+ */
+static int fpu_migrate(int kvm)
+{
+	const unsigned long n = 100000;
+	struct mover m = { .target = pthread_self() };
+	pthread_t t;
+	uint32_t val = 0;
+	struct vm vm;
+
+	if (vm_create(&vm, kvm) || enter_long_mode(&vm, fpu_start, fpu_end, n, 0))
+		return -1;
+	pthread_create(&t, NULL, mover, &m);
+	for (;;) {
+		CHECK(ioctl(vm.vcpu, KVM_RUN, 0) == 0, "KVM_RUN");
+		if (vm.run->exit_reason == KVM_EXIT_IO && vm.run->io.port == 0x30) {
+			val = *(uint32_t *)((char *)vm.run + vm.run->io.data_offset);
+			continue;
+		}
+		break;
+	}
+	m.stop = 1;
+	pthread_join(t, NULL);
+	CHECK(vm.run->exit_reason == KVM_EXIT_HLT, "fpu migrate: exit %u", vm.run->exit_reason);
+	CHECK(val == n, "fpu migrate: xmm8 counted %u of %lu", val, n);
+	vm_destroy(&vm);
+	printf("KVMTEST: fpu across migration ok\n");
+	return 0;
+}
+
 struct job {
 	int kvm, ret;
 };
@@ -395,6 +471,7 @@ int main(void)
 	long_mode(kvm, 1 << 20, 2000000000, "long run");
 	slot_replace(kvm);
 	dirty_log(kvm);
+	fpu_migrate(kvm);
 	for (i = 0; i < 2; i++) {
 		jobs[i].kvm = kvm;
 		pthread_create(&t[i], NULL, parallel_vm, &jobs[i]);

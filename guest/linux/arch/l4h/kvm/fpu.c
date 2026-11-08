@@ -171,9 +171,8 @@ void fpu_free_guest_fpstate(struct fpu_guest *gfpu)
 	gfpu->fpstate = NULL;
 }
 
-/* Leaving KVM_RUN is the time to write them back; entering it, loading can
- * wait for the VM entry.  The saving side may run on any vCPU's stack, but
- * not before the task has this vCPU. */
+/* Leaving KVM_RUN writes them back, as does vcpu_put() whenever the task
+ * leaves the vCPU in between; loading waits for the VM entry. */
 int fpu_swap_kvm_fpstate(struct fpu_guest *gfpu, bool enter_guest)
 {
 	gfpu->fpstate->in_use = enter_guest;

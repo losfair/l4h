@@ -985,7 +985,8 @@ implements `kvm_x86_ops` on seL4 VCPU objects (patch 0039).
   replaced memslot and a dirty-log write-protect take effect at once.
 - **FPU.** seL4 runs the guest on the kTCB's FPU registers. The guest's
   XSAVE state stays loaded across exits and is saved when kernel-mode SIMD
-  needs the registers or the task leaves `KVM_RUN`. `KVM_SET_XSAVE`
+  needs the registers, when the task leaves `KVM_RUN`, and in `vcpu_put`,
+  when it is scheduled out of its vCPU in between and may migrate. `KVM_SET_XSAVE`
   refuses a state XRSTOR would fault on. XCR0 is seL4's (x87, SSE, AVX);
   guest XSETBV is emulated.
 - **What the common code would do in ring 0** (MSRs, debug registers,
@@ -3929,7 +3930,7 @@ machine and guests of 256–512 MiB.
 | `tests/run-fuzz.sh` | hostile-guest virtqueue fuzzing of l4h-vmm |
 | `tests/run-skimtest.sh` | the skim-xapic-nopcid variant on a Meltdown-affected CPU without PCID/x2APIC: SKIM mappings and syscall state at the user/kernel boundary (`tests/skim-qemu.py`, GDB); VT-x stays off (`run-vtxtest.sh skim`) |
 | `tests/run-kvmbench.sh l4h\|linux` | KVM exit, EPT fault and guest compute timings (`tests/guest/kvmbench.c`) and boot times under QEMU, Firecracker and cloud-hypervisor, with L1 l4h's dom0 or the host's Linux kernel in QEMU, both on nested KVM with two vCPUs (§5.10); `KVMBENCH_CMDLINE` adds to dom0's command line |
-| `tests/run-kvmtest.sh [vmm] [vcpus]` | KVM in dom0 (§5.10; needs nested VMX, `-cpu host` on Intel): `tests/guest/kvmtest.c` runs real- and long-mode VMs with port I/O, MMIO, 62 MiB of EPT faults, a run long enough to be preempted, two VMs at once and 20 in a row; `vmm` also boots the host's kernel (`KVMTEST_KERNEL`) with two vCPUs under the host's QEMU and the pinned Firecracker and cloud-hypervisor releases (`KVMTEST_VMMS`). CI runs it in the VT-x step where the runner has nested VMX |
-| `tests/run-vtxtest.sh off\|on\|skim` | VT-x below l4h-root (patch 0038), with `tests/vtxprobe.c` as the root task on 4 cores: `off` (`-cpu host,-vmx`) boots without VT-x and refuses VCPU and EPT objects; `on` (`-cpu host`, nested KVM on Intel) creates them and binds the VCPU to a TCB; `skim` keeps VT-x off. CI runs `off` always and `on`, with the 1-vCPU self-test, where the runner has nested VMX, and says in the job summary when it has not |
+| `tests/run-kvmtest.sh [vmm] [vcpus]` | KVM in dom0 (§5.10; needs nested VMX, `-cpu host` on Intel): `tests/guest/kvmtest.c` runs real- and long-mode VMs with port I/O, MMIO, 62 MiB of EPT faults, a run long enough to be preempted, a replaced memslot, dirty logging, vector registers across migrations inside `KVM_RUN`, two VMs at once and 20 in a row; `vmm` also boots the host's kernel (`KVMTEST_KERNEL`) with two vCPUs under the host's QEMU and the pinned Firecracker and cloud-hypervisor releases (`KVMTEST_VMMS`). CI runs it in the VT-x step where the runner has nested VMX |
+| `tests/run-vtxtest.sh off\|on\|skim` | VT-x below l4h-root (patch 0038), with `tests/vtxprobe.c` as the root task on 4 cores: `off` (`-cpu host,-vmx`) boots without VT-x and refuses VCPU and EPT objects; `on` (`-cpu host`, nested KVM on Intel) creates them, binds the VCPU to a TCB and checks that WriteMSR refuses a noncanonical KERNEL_GS_BASE; `skim` keeps VT-x off. CI runs `off` always and `on`, with the 1-vCPU self-test, where the runner has nested VMX, and says in the job summary when it has not |
 | `tools/lint-shell.sh [-a]` | ShellCheck over every tracked shell script (`*.sh`, and sh/bash shebangs such as the guest init scripts): fails on error-severity findings and on SC2251, a bare `! cmd` that `set -e` ignores; `-a` also prints warnings and notes without failing. CI runs it in the installer job |
 | `python3 tests/blkmq-qemu.py` | block multiqueue and fsync suites under local QEMU (`--suite blkmq\|fsync`, `--guest-queues`, `--scsi-queues`); run by hand |
