@@ -1,0 +1,32 @@
+#!/bin/sh
+# run-nested VMM: boot /nested's kernel and initramfs (tests/kvm-vmms.sh)
+# with two vCPUs under VMM (qemu, firecracker or cloud-hypervisor), its
+# console on stdout.
+args="console=ttyS0 panic=-1 quiet"
+case $1 in
+qemu)
+	exec /usr/bin/qemu-system-x86_64 -accel kvm -cpu host -m 256 -smp 2 \
+		-display none -vga none -nic none -no-reboot -monitor none -serial stdio \
+		-L /usr/share/seabios -L /usr/share/qemu \
+		-kernel /nested/vmlinuz -initrd /nested/initrd.cpio.gz \
+		-append "$args" </dev/null ;;
+firecracker)
+	cat >/tmp/fc.json <<JSON
+{
+  "boot-source": {
+    "kernel_image_path": "/nested/vmlinux",
+    "initrd_path": "/nested/initrd.cpio.gz",
+    "boot_args": "$args reboot=k pci=off"
+  },
+  "drives": [],
+  "machine-config": { "vcpu_count": 2, "mem_size_mib": 256 }
+}
+JSON
+	exec /usr/bin/firecracker --no-api --config-file /tmp/fc.json </dev/null ;;
+cloud-hypervisor)
+	exec /usr/bin/cloud-hypervisor --kernel /nested/vmlinux --initramfs /nested/initrd.cpio.gz \
+		--cmdline "$args" --cpus boot=2 --memory size=256M \
+		--serial tty --console off </dev/null ;;
+esac
+echo "run-nested: unknown VMM $1" >&2
+exit 2

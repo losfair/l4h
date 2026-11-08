@@ -289,7 +289,7 @@ support, since no device is passed into a guest.
 | 0024 | (x86) No boot without SKIM unless the CPU reports RDCL_NO (above). |
 | 0025 | (x86) `GetIOAPICRemapped` adds a 16-bit interrupt-remapping table index to the I/O APIC handler arguments and writes the remappable RTE format. Root publishes the matching VT-d IRTE first; seL4 keeps pin masking, acknowledgement and capability lifecycle and does not manage the IOMMU. |
 | 0038 | (x86, `KernelVTX`) A kernel built with VT-x boots on a CPU without usable VT-x (no VMX, VMX locked off by firmware, or no EPT write-back or 2 MiB support) instead of halting. The boot core records the result in `x86KSVTXEnabled`; secondary cores skip VT-x when it is off and must match the boot core when it is on. Without VT-x, `Untyped_Retype` refuses VCPU and EPT objects (`seL4_InvalidArgument`), which is also how userspace probes for it. With the SKIM window VT-x stays off (§4.1). EPT checks run before `vmxon`, and a failed `vmxon` clears `CR4.VMXE`, so no core is left in VMX operation, where INIT is blocked. This lets one `KernelVTX` image (§4.1) serve hosts with and without VT-x. |
-| 0039 | (x86, `KernelVTX`) The VCPU interface KVM in a guest needs (§5.10). Userspace can turn on only listed VM-execution, exit and entry controls: the others use VMCS address fields nothing sets (virtual APIC, PML, posted interrupts, VMCS shadowing, #VE), which would point at host physical page 0. MOV-DR, RDPMC, MWAIT and MONITOR always exit. `VMEnter` returns one MR layout for faults and notifications, adding RSP, CR2 and the exit and IDT-vectoring information; when the VCPU did not run, the exit fields read 0 and `INTERRUPT_INFO_MR` keeps the undelivered event. The guest's CR2 survives exits (other threads' page faults overwrite it) and `WriteMSR(SEL4_VCPU_MSR_CR2)` sets it. `invept` reaches every core that has entered a VM, so no core keeps translations of an unmapped frame; `VCPU_FlushTLB` is that `invept` for guest TLB flushes. `WriteVMCS` takes the TSC offset and entry instruction length, `Read`/`WriteMSR` `KERNEL_GS_BASE`. The guest runs on the TCB's FPU state, without the two swaps per exit seL4 made into state userspace could not read. |
+| 0039 | (x86, `KernelVTX`) The VCPU interface KVM in a guest needs (§5.10), and VM exits and entries with only the VMCS and MSR accesses they need (each one is an exit when seL4 runs nested without VMCS shadowing): the syscall MSRs switch through the MSR-load lists, an exit reads only the fields its reason defines, VMEnter writes only what changed, and EPT maps do no `invept`. Userspace can turn on only listed VM-execution, exit and entry controls: the others use VMCS address fields nothing sets (virtual APIC, PML, posted interrupts, VMCS shadowing, #VE), which would point at host physical page 0. MOV-DR, RDPMC, MWAIT and MONITOR always exit. `VMEnter` returns one MR layout for faults and notifications, adding CR2 and the exit and IDT-vectoring information; when the VCPU did not run, the exit fields read 0 and `INTERRUPT_INFO_MR` keeps the undelivered event. The guest's CR2 survives exits (other threads' page faults overwrite it) and `WriteMSR(SEL4_VCPU_MSR_CR2)` sets it. `invept` reaches every core that has entered a VM, so no core keeps translations of an unmapped frame; `VCPU_FlushTLB` is that `invept` for guest TLB flushes. `WriteVMCS` takes the TSC offset and entry instruction length, `Read`/`WriteMSR` `KERNEL_GS_BASE`. The guest runs on the TCB's FPU state, without the two swaps per exit seL4 made into state userspace could not read. |
 
 **Verification.** The MCS SMP x86_64 configuration is not covered by the
 seL4 proofs, with or without these patches. l4h benefits from seL4's design
@@ -959,8 +959,9 @@ implements `kvm_x86_ops` on seL4 VCPU objects (patch 0039).
 - **Running a vCPU.** `KVM_RUN` calls `seL4_VMEnter` on the kTCB of the
   L4H vCPU it runs on; `vcpu_load` binds the VCPU and the VM's EPT root to
   that kTCB when they are not already. The exit is the call returning,
-  with the guest's GPRs, RIP, RSP, RFLAGS, CR2, CR3, interruptibility and
-  exit and IDT-vectoring information in message registers. A notification
+  with the guest's GPRs, RIP, RFLAGS, CR2, interruptibility and the exit
+  and IDT-vectoring information in message registers; RSP and CR3 are
+  read when KVM needs them. A notification
   on N_v (timer, IPI, device event) ends the call too, and counts as an
   external-interrupt exit: the vCPU's events are delivered when KVM
   re-enables interrupts. Other VMCS reads are system calls, cached until
@@ -992,11 +993,37 @@ implements `kvm_x86_ops` on seL4 VCPU objects (patch 0039).
   RDTSCP/RDPID (seL4 does not switch `TSC_AUX`), hardware breakpoints in
   the guest, and the speculation-control MSRs (hidden from guests, which
   get no IBPB between nested VMs either). SMM is not built.
-- **Cost.** Every exit is an seL4 call and its return, and the exits KVM
-  handles in the guest kernel add a few VMCS calls; an EPT fault adds a
-  capability copy and a map. Under nested KVM on an i7-13700H, the host's
-  Debian 6.12 kernel boots to userspace in dom0 in about 1.5 s under QEMU.
-- **Test.** `tests/run-kvmtest.sh` (§14.3).
+- **Huge pages.** A new memslot asks for THP behind it (`MADV_HUGEPAGE`,
+  unless the VMM said `MADV_NOHUGEPAGE`), for 2 MiB EPT leaves: the guest
+  kernel's THP mode is `madvise`, and Firecracker, unlike QEMU, does not
+  ask. Its guests booted 2.5 times as slowly without.
+- **Cost.** Every exit is an seL4 call and its return; the VMCS reads KVM
+  needs beyond what the exit returns are calls too, cached until the next
+  entry. On a host without VMCS shadowing, which is the case for nested
+  KVM on this development machine, each VMREAD and VMWRITE seL4 does is
+  itself an exit to L0, so patch 0039 keeps them to what each exit needs,
+  switches the syscall MSRs through the VMCS MSR-load lists, and maps into
+  the EPT without `invept`. `tests/run-kvmbench.sh` compares l4h's dom0
+  as L1 with the same Linux kernel as L1, both with two vCPUs, under
+  nested KVM on an i7-13700H (best of 3; boots are QEMU 10.0, Firecracker
+  1.17 and cloud-hypervisor 54 booting Debian's 6.12 kernel on 2 vCPUs):
+
+  | | Linux L1 | l4h dom0 |
+  |---|---|---|
+  | guest compute (10⁹ loop iterations) | 267 ms | 265 ms |
+  | CPUID exit (handled by KVM) | 54 µs | 48 µs |
+  | port I/O exit to the VMM | 72 µs | 63 µs |
+  | MMIO exit to the VMM (emulated) | 92 µs | 83 µs |
+  | first touch of a 4 KiB page (EPT fault) | 49 µs | 66 µs |
+  | boot under QEMU | 1.96 s | 2.36 s |
+  | boot under Firecracker | 1.51 s | 1.94 s |
+  | boot under cloud-hypervisor | 1.57 s | 1.85 s |
+
+  Before these changes an exit took about 155 µs and a Firecracker boot
+  13 s. An EPT fault costs a capability copy and a map on top of the exit.
+  About 85% of an exit is the `seL4_VMEnter` call, almost all of it L0's
+  emulation of the nested entry and exit.
+- **Test.** `tests/run-kvmtest.sh`, `tests/run-kvmbench.sh` (§14.3).
 
 ---
 
@@ -3896,6 +3923,7 @@ machine and guests of 256–512 MiB.
 | `tests/run-bench.sh`, `tests/run-vmbench.sh`, `tests/run-startbench.sh` | micro-benchmarks, guest cost, start latency |
 | `tests/run-fuzz.sh` | hostile-guest virtqueue fuzzing of l4h-vmm |
 | `tests/run-skimtest.sh` | the skim-xapic-nopcid variant on a Meltdown-affected CPU without PCID/x2APIC: SKIM mappings and syscall state at the user/kernel boundary (`tests/skim-qemu.py`, GDB); VT-x stays off (`run-vtxtest.sh skim`) |
+| `tests/run-kvmbench.sh l4h\|linux` | KVM exit, EPT fault and guest compute timings (`tests/guest/kvmbench.c`) and boot times under QEMU, Firecracker and cloud-hypervisor, with L1 l4h's dom0 or the host's Linux kernel in QEMU, both on nested KVM with two vCPUs (§5.10); `KVMBENCH_CMDLINE` adds to dom0's command line |
 | `tests/run-kvmtest.sh [vmm] [vcpus]` | KVM in dom0 (§5.10; needs nested VMX, `-cpu host` on Intel): `tests/guest/kvmtest.c` runs real- and long-mode VMs with port I/O, MMIO, 62 MiB of EPT faults, a run long enough to be preempted, two VMs at once and 20 in a row; `vmm` also boots the host's kernel (`KVMTEST_KERNEL`) with two vCPUs under the host's QEMU and the pinned Firecracker and cloud-hypervisor releases (`KVMTEST_VMMS`). CI runs it in the VT-x step where the runner has nested VMX |
 | `tests/run-vtxtest.sh off\|on\|skim` | VT-x below l4h-root (patch 0038), with `tests/vtxprobe.c` as the root task on 4 cores: `off` (`-cpu host,-vmx`) boots without VT-x and refuses VCPU and EPT objects; `on` (`-cpu host`, nested KVM on Intel) creates them and binds the VCPU to a TCB; `skim` keeps VT-x off. CI runs `off` always and `on`, with the 1-vCPU self-test, where the runner has nested VMX, and says in the job summary when it has not |
 | `tools/lint-shell.sh [-a]` | ShellCheck over every tracked shell script (`*.sh`, and sh/bash shebangs such as the guest init scripts): fails on error-severity findings and on SC2251, a bare `! cmd` that `set -e` ignores; `-a` also prints warnings and notes without failing. CI runs it in the installer job |
