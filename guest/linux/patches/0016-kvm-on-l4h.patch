@@ -12,6 +12,7 @@ KVM's x86 code builds for ARCH=l4h with the backend in arch/l4h/kvm
   KVM finds spurious calls it too: the EPT may lack what the table has.
 - No fast page faults: they change SPTEs locklessly, behind that hook.
 - kvm_arch_free_vm() frees the EPT after KVM's last use of the MMU.
+- A new memslot asks for THP behind it, for 2 MiB EPT leaves.
 - Optional static calls left NULL return 0: without HAVE_STATIC_CALL a
   NULL static call is a call to address 0.
 - kvm_main.c's PIO page, which it keeps for CONFIG_X86 only.
@@ -242,6 +243,16 @@ diff -ruN -x '*.o' -x '.*.cmd' -x '*.a' -x modules.order pa/arch/x86/kvm/Makefil
  #if IS_ENABLED(CONFIG_HYPERV)
  	kfree(kvm->arch.hv_pa_pg);
  #endif
+@@ -12803,6 +12833,9 @@
+ 		if (kvm_is_gfn_alias(kvm, new->base_gfn + new->npages - 1))
+ 			return -EINVAL;
+ 
++#ifdef CONFIG_L4H
++		l4h_kvm_memslot_prepare(kvm, new);
++#endif
+ 		return kvm_alloc_memslot_metadata(kvm, new);
+ 	}
+ 
 --- a/virt/kvm/kvm_main.c
 +++ b/virt/kvm/kvm_main.c
 @@ -4081,7 +4081,7 @@

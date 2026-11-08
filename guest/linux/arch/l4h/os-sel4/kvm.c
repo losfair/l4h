@@ -86,15 +86,12 @@ void l4h_vcpu_enter(struct l4h_vmexit *x, unsigned long rip, unsigned long contr
 	x->gpa = seL4_GetMR(SEL4_VMENTER_FAULT_GUEST_PHYSICAL_MR);
 	x->rflags = seL4_GetMR(SEL4_VMENTER_FAULT_RFLAGS_MR);
 	x->interruptibility = seL4_GetMR(SEL4_VMENTER_FAULT_GUEST_INT_MR);
-	x->cr3 = seL4_GetMR(SEL4_VMENTER_FAULT_CR3_MR);
 	for (i = 0; i < 15; i++)
 		x->gp[i] = seL4_GetMR(SEL4_VMENTER_FAULT_EAX + i);
-	x->rsp = seL4_GetMR(SEL4_VMENTER_FAULT_RSP);
 	x->exit_intr_info = seL4_GetMR(SEL4_VMENTER_FAULT_EXIT_INTR_INFO);
 	x->exit_intr_error = seL4_GetMR(SEL4_VMENTER_FAULT_EXIT_INTR_ERROR);
 	x->idt_vector_info = seL4_GetMR(SEL4_VMENTER_FAULT_IDT_VECTOR_INFO);
 	x->idt_vector_error = seL4_GetMR(SEL4_VMENTER_FAULT_IDT_VECTOR_ERROR);
-	x->instr_info = seL4_GetMR(SEL4_VMENTER_FAULT_EXIT_INSTRUCTION_INFO);
 	x->cr2 = seL4_GetMR(SEL4_VMENTER_FAULT_CR2);
 }
 

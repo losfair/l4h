@@ -32,6 +32,8 @@
 #include <linux/slab.h>
 #include <linux/xarray.h>
 #include <linux/bitmap.h>
+#include <linux/mman.h>
+#include <linux/sched/mm.h>
 #include <l4h_sys.h>
 #include "mmu.h"
 #include "mmu/mmu_internal.h"
@@ -305,6 +307,39 @@ static void sync_leaf(struct l4h_ept *e, u64 spte, unsigned long gfn, int level)
 	/* The guest faults on it, which brings it back here. */
 	if (err)
 		pr_warn_ratelimited("no EPT mapping of gfn %lx: %d\n", gfn, err);
+}
+
+/*
+ * Guest RAM wants 2 MiB EPT leaves, which need THP behind the memslot.  The
+ * guest kernel's THP is "madvise" (DESIGN.md §5.3), and not every VMM asks
+ * for it as QEMU does: Firecracker's guests took 2.5 times as long to boot.
+ * So the memslot asks, for the mappings whose owner has not said no
+ * (MADV_NOHUGEPAGE).  Memory that cannot have THP stays as it is.
+ */
+void l4h_kvm_memslot_prepare(struct kvm *kvm, struct kvm_memory_slot *slot)
+{
+	unsigned long start = slot->userspace_addr, end = start + (slot->npages << PAGE_SHIFT);
+	struct mm_struct *mm = current->mm;
+	struct { unsigned long start, end; } ranges[8];
+	VMA_ITERATOR(vmi, mm, start);
+	struct vm_area_struct *vma;
+	int i, n = 0;
+
+	if (mm != kvm->mm || (slot->flags & KVM_MEM_GUEST_MEMFD))
+		return;
+	mmap_read_lock(mm);
+	for_each_vma_range(vmi, vma, end) {
+		if (vma->vm_flags & (VM_HUGEPAGE | VM_NOHUGEPAGE))
+			continue;
+		if (n == ARRAY_SIZE(ranges))
+			break;
+		ranges[n].start = max(vma->vm_start, start);
+		ranges[n].end = min(vma->vm_end, end);
+		n++;
+	}
+	mmap_read_unlock(mm);
+	for (i = 0; i < n; i++)
+		do_madvise(mm, ranges[i].start, ranges[i].end - ranges[i].start, MADV_HUGEPAGE);
 }
 
 void l4h_kvm_spte_changed(struct kvm *kvm, u64 *sptep, u64 gfn, int level)

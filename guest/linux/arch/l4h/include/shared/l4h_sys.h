@@ -201,13 +201,14 @@ enum {
 };
 
 /* What a VMEnter returned.  Without `fault` a notification ended it: there
- * was no exit to handle, and intr_info still holds an event not delivered. */
+ * was no exit to handle, and intr_info still holds an event not delivered.
+ * Fields an exit does not define are 0; RSP and CR3 are for l4h_vcpu_read(). */
 struct l4h_vmexit {
 	int fault;
-	unsigned int reason, instr_len, instr_info;
+	unsigned int reason, instr_len;
 	unsigned int intr_info, exit_intr_info, exit_intr_error;
 	unsigned int idt_vector_info, idt_vector_error, interruptibility;
-	unsigned long rip, rsp, rflags, cr2, cr3, qualification, gpa;
+	unsigned long rip, rflags, cr2, qualification, gpa;
 	unsigned long gp[L4H_VMX_NR_GP];	/* L4H_VMX_* */
 };
 

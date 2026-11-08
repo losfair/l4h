@@ -38,6 +38,7 @@
 
 #define VMCS_CACHE_SIZE 64
 
+
 struct vmcs_cached {
 	u32 field;
 	u32 gen;
@@ -62,8 +63,8 @@ struct vcpu_l4h {
 
 	struct l4h_vmexit x;
 	unsigned long rflags, hw_cr2;
-	/* What seL4 has of the registers. */
-	unsigned long hw_gp[L4H_VMX_NR_GP], hw_rsp;
+	/* What seL4 has of the general-purpose registers. */
+	unsigned long hw_gp[L4H_VMX_NR_GP];
 };
 
 static inline struct vcpu_l4h *to_l4h(struct kvm_vcpu *vcpu)
@@ -313,6 +314,12 @@ static void l4h_cache_reg(struct kvm_vcpu *vcpu, enum kvm_reg reg)
 
 	kvm_register_mark_available(vcpu, reg);
 	switch (reg) {
+	case VCPU_REGS_RSP:
+		vcpu->arch.regs[VCPU_REGS_RSP] = vmcs_rd(vcpu, GUEST_RSP);
+		break;
+	case VCPU_EXREG_CR3:
+		vcpu->arch.cr3 = vmcs_rd(vcpu, GUEST_CR3);
+		break;
 	case VCPU_EXREG_PDPTR:
 		mmu->pdptrs[0] = vmcs_rd(vcpu, GUEST_PDPTR0);
 		mmu->pdptrs[1] = vmcs_rd(vcpu, GUEST_PDPTR1);
@@ -781,10 +788,8 @@ static void sync_to_vcpu(struct kvm_vcpu *vcpu)
 		WARN_ON_ONCE(l4h_vcpu_write_regs(l->obj.cptr, gp));
 		memcpy(l->hw_gp, gp, sizeof(gp));
 	}
-	if (r[VCPU_REGS_RSP] != l->hw_rsp) {
+	if (kvm_register_is_dirty(vcpu, VCPU_REGS_RSP))
 		vmcs_wr(vcpu, GUEST_RSP, r[VCPU_REGS_RSP]);
-		l->hw_rsp = r[VCPU_REGS_RSP];
-	}
 	if (kvm_register_is_dirty(vcpu, VCPU_EXREG_CR3))
 		vmcs_wr(vcpu, GUEST_CR3, vcpu->arch.cr3);
 	if (kvm_register_is_dirty(vcpu, VCPU_EXREG_PDPTR) && is_pae_paging(vcpu)) {
@@ -822,11 +827,9 @@ static void sync_from_exit(struct kvm_vcpu *vcpu)
 	r[VCPU_REGS_R13] = x->gp[L4H_VMX_R13];
 	r[VCPU_REGS_R14] = x->gp[L4H_VMX_R14];
 	r[VCPU_REGS_R15] = x->gp[L4H_VMX_R15];
-	r[VCPU_REGS_RSP] = l->hw_rsp = x->rsp;
 	memcpy(l->hw_gp, x->gp, sizeof(l->hw_gp));
 	vcpu->arch.regs[VCPU_REGS_RIP] = x->rip;
 	l->rflags = x->rflags;
-	vcpu->arch.cr3 = x->cr3;
 	vcpu->arch.cr2 = l->hw_cr2 = x->cr2;
 
 	/* The VM ran: what we cached of the guest's state is gone. */
@@ -837,7 +840,9 @@ static void sync_from_exit(struct kvm_vcpu *vcpu)
 	c->gen = l->gen;
 	c->value = x->interruptibility;
 
-	vcpu->arch.regs_avail = ~0u & ~BIT(VCPU_EXREG_PDPTR);
+	/* Read when needed: most exits need neither RSP nor CR3. */
+	vcpu->arch.regs_avail = ~0u & ~(BIT(VCPU_REGS_RSP) | BIT(VCPU_EXREG_CR3) |
+					BIT(VCPU_EXREG_PDPTR));
 	vcpu->arch.regs_dirty = 0;
 }
 
@@ -1155,7 +1160,7 @@ static void l4h_get_exit_info(struct kvm_vcpu *vcpu, u32 *reason, u64 *info1, u6
 
 	*reason = x->reason;
 	*info1 = x->qualification;
-	*info2 = x->instr_info;
+	*info2 = 0;
 	*intr_info = x->exit_intr_info;
 	*error_code = x->exit_intr_error;
 }

@@ -388,6 +388,8 @@ static inline int l4h_kvm_wrmsr(u32 msr, u64 val)
 struct kvm;
 void l4h_kvm_spte_changed(struct kvm *kvm, u64 *sptep, u64 gfn, int level);
 void l4h_kvm_vm_free(struct kvm *kvm);
+struct kvm_memory_slot;
+void l4h_kvm_memslot_prepare(struct kvm *kvm, struct kvm_memory_slot *slot);
 /* Declared for CONFIG_GUEST_PERF_EVENTS only, which l4h has not. */
 struct kvm_vcpu;
 unsigned long kvm_arch_vcpu_get_ip(struct kvm_vcpu *vcpu);
