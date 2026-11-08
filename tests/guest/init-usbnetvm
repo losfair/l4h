@@ -9,10 +9,9 @@ mount -t devtmpfs dev /dev
 say() { echo "USBNET: $*"; }
 fail() { say "FAIL: $*"; poweroff -f; }
 arg() { sed -n "s/.* $1=\([^ ]*\).*/\1/p" /proc/cmdline; }
-if [ -e /dev/l4hkmod ]; then
-    mkdir -p /lib/modules
-    mount -t erofs -o ro /dev/l4hkmod /lib/modules || fail "no module tree"
-    for m in usb_l4h usbnet cdc_ether rndis_host; do modprobe "$m" || fail "modprobe $m"; done
+# usb-l4h and the class drivers are built into l4h's guest kernel.
+if [ -d /sys/bus/platform/drivers/usb-l4h ]; then
+    :
 else
     for m in $(cat /lib/native/order); do insmod "/lib/native/$m" || fail "insmod $m"; done
 fi

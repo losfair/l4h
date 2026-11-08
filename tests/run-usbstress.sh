@@ -58,7 +58,7 @@ if [ "${USBSTRESS_NATIVE:-0}" = 1 ]; then
 fi
 "$root/tools/mkinitramfs.sh" "$out/usbstress.cpio.gz" "$root/tests/guest/init-usbstress" \
     "$l4h_ctl" "$out/usbstressvm.cpio.gz" >/dev/null
-L4H_KMODS=1 L4H_DOM0_DISKS=0 L4H_DOM0_MEM_MB=512 \
+L4H_DOM0_DISKS=0 L4H_DOM0_MEM_MB=512 \
 L4H_TEST_FAIL_PATTERN='USBSTRESS: FAIL:' \
 L4H_QEMU_ARGS="$devs" \
     "$root/tools/run-dom0.sh" "$out/usbstress.cpio.gz" \

@@ -2507,8 +2507,14 @@ controller, one per claimed controller, and the guest forwards Linux's
   a shared USB 3 HCD whose root hubs have the controller's ports; the
   stock USB core does enumeration, hubs, descriptors and class drivers, so
   usbd never parses device data. Buffers bounce through the pool
-  (swiotlb), like virtio-l4h's. `USB_SUPPORT`, the HCD, HID and the
-  common class drivers are modules in the module tree (§5.6).
+  (swiotlb), like virtio-l4h's. The HCD, HID and the common class
+  drivers (storage, UAS, serial, audio, network) are built into the guest
+  kernel, not modules: every guest maps the kernel's text and rodata from
+  the same host frames, while a module would be copied into the RAM of each
+  guest that loads it (§5.6). Built in, they add 1.45 MiB of shared text
+  and rodata, and about 200 KiB to a guest's RAM whether it uses USB or not
+  (60 KiB of data, the rest slab from their initialization), against 0.6 to
+  1.6 MiB per guest that loads them as modules.
 - **Not in v1:** sharing a controller among guests or assigning single
   ports (the protocol is meant to allow it: an owner per root port and
   slot), hot attach and detach, EHCI and older, USB4, LPM and runtime PM,

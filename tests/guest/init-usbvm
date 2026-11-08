@@ -1,27 +1,25 @@
 #!/bin/sh
 # Init of the guests tests/guest/init-usbtest gives a whole xHCI
-# controller: load the drivers, wait for the devices QEMU puts behind it,
-# check them, and power off.  The expected digests come on the command
+# controller: wait for the devices QEMU puts behind it (usb-l4h and the
+# class drivers are built in), check them, and power off.  The expected digests come on the command
 # line (usbsha=, usbsha2=, usbsha3= for the UAS disk).
 mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
 fail() { echo "USBVM: FAIL: $*"; poweroff -f; }
-mkdir -p /lib/modules
-mount -t erofs -o ro /dev/l4hkmod /lib/modules || fail "no module tree"
 arg() { sed -n "s/.* $1=\([^ ]*\).*/\1/p" /proc/cmdline; }
 case " $(cat /proc/cmdline) " in
 *" usbabuse=1 "*)
-    # The hostile driver instead of usb-l4h: it runs on load.
+    # The hostile driver instead of usb-l4h, which lets go of the
+    # controller (and has usbd reset it) first.  It runs on load.
+    echo usb-l4h.0 > /sys/bus/platform/drivers/usb-l4h/unbind || fail "unbind usb-l4h"
     insmod /bin/usbabuse.ko 2>/dev/null
     dmesg | grep USBABUSE
     dmesg | grep -q "USBABUSE: PASS" || fail "usbabuse"
     echo "USBVM: PASS"
     poweroff -f ;;
 esac
-for m in usb_l4h sd_mod usb_storage uas usbhid hid_generic evdev; do
-    modprobe "$m" 2>/dev/null || [ "$m" = evdev ] || fail "modprobe $m"
-done
+[ -d /sys/bus/platform/drivers/usb-l4h/usb-l4h.0 ] || fail "usb-l4h has no controller"
 echo "USBVM: drivers loaded"
 # Every device QEMU attached: keyboard, tablet, a hub, a disk on the root
 # hub and one behind the hub, a UAS disk.
@@ -59,12 +57,12 @@ grep -q -i 'keyboard' /proc/bus/input/devices || fail "no USB keyboard"
 echo "USBVM: input devices ok"
 case " $(cat /proc/cmdline) " in
 *" usbreload=1 "*)
-    # The driver goes and comes back: usbd resets the controller, the
-    # devices enumerate again.
-    for m in uas usb_storage usbhid; do rmmod "$m" 2>/dev/null; done
-    rmmod usb_l4h || fail "rmmod usb_l4h"
-    modprobe usb_l4h || fail "reload usb_l4h"
-    modprobe usb_storage
+    # The driver lets go of the controller and takes it again: usbd
+    # resets it, the devices enumerate again.
+    echo usb-l4h.0 > /sys/bus/platform/drivers/usb-l4h/unbind || fail "unbind usb-l4h"
+    for _ in $(seq 25); do [ -b /dev/sda ] || break; sleep 0.2; done
+    [ -b /dev/sda ] && fail "a disk outlived the unbind"
+    echo usb-l4h.0 > /sys/bus/platform/drivers/usb-l4h/bind || fail "bind usb-l4h"
     for _ in $(seq 100); do [ -b /dev/sda ] && break; sleep 0.2; done
     [ -b /dev/sda ] || fail "no disk after reload"
     echo "USBVM: reload ok" ;;

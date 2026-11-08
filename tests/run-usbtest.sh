@@ -44,7 +44,7 @@ make -s -C "$kbuild" M="$out/mod" modules >"$out/build.log" 2>&1 || { cat "$out/
 "$root/tools/mkinitramfs.sh" "$out/usbvm.cpio.gz" "$root/tests/guest/init-usbvm" "$out/mod/usbabuse.ko" >/dev/null
 "$root/tools/mkinitramfs.sh" "$out/usbtest.cpio.gz" "$root/tests/guest/init-usbtest" \
     "$l4h_ctl" "$out/usbvm.cpio.gz" >/dev/null
-L4H_KMODS=1 L4H_DOM0_DISKS=0 L4H_DOM0_MEM_MB=512 \
+L4H_DOM0_DISKS=0 L4H_DOM0_MEM_MB=512 \
 L4H_TEST_FAIL_PATTERN='USBTEST: FAIL:' \
 L4H_QEMU_ARGS="$devs" \
     "$root/tools/run-dom0.sh" "$out/usbtest.cpio.gz" \
