@@ -77,6 +77,8 @@ pub struct HostInfo {
     pub cores: usize,
     pub topology: topology::Topology,
     pub tsc_hz: u64,
+    /// The kernel makes VT-x objects (VmmgrConfig::vtx).
+    pub vtx: bool,
     /// AArch64 feature ID registers for the guests' bootinfo.
     pub cpu_id: [u64; 5],
     /// vmmgr's endpoint: VMMs call it, guest kernels fault to it.
@@ -203,7 +205,7 @@ impl Vmmgr {
         let kernel = self.kernel.as_ref()?;
         let kmods = self.kmods.as_ref().map_or(0, |k| k.bytes());
         let bytes = cfg.ram.checked_add(cfg.io_pool)?.checked_add(kmods)?;
-        if !self.can_afford(bytes, cfg.vspaces + 4, 0) {
+        if !self.can_afford(bytes, cfg.vspaces + 4 + if self.info.vtx { abi::MAX_EPT_ROOTS } else { 0 }, 0) {
             return None;
         }
         let id = (0..MAX_GUESTS).find(|&i| self.guest(i).is_none())?;
@@ -430,6 +432,7 @@ fn main(info: &'static Info) -> ! {
         cores: cfg.cores as usize,
         topology: topology::Topology::from_raw(cfg.topo_cpus as usize, cfg.topo_physical, cfg.topo_order),
         tsc_hz: cfg.tsc_hz,
+        vtx: cfg.vtx != 0,
         cpu_id: cfg.cpu_id,
         hyp_ep: cap::Endpoint::from_bits(host::SLOT_SERVICE_EP),
         timeslice_us: cfg.timeslice_us,

@@ -114,6 +114,13 @@ jobs:
             if grep -q 'vt-x: unavailable' build/qemu.log; then
               echo "the self-test ran without VT-x"; exit 1
             fi
+            # KVM in dom0; QEMU, Firecracker and cloud-hypervisor too where
+            # there is a host kernel to boot.
+            if [ -r "/boot/vmlinuz-$(uname -r)" ]; then
+              tests/run-kvmtest.sh vmm
+            else
+              tests/run-kvmtest.sh
+            fi
             echo "VT-x with VMX exposed: tested on $model" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "::warning::No nested VMX on this runner ($model, nested: $nested): the VT-x path was not tested"

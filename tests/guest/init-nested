@@ -1,0 +1,20 @@
+#!/bin/sh
+# The guest each VMM boots inside dom0 (tests/run-kvmtest.sh vmm).
+/bin/busybox mount -t proc proc /proc
+/bin/busybox mount -t sysfs sys /sys
+/bin/busybox mount -t devtmpfs dev /dev
+/bin/busybox mount -t tmpfs tmp /tmp
+echo "NESTED: up, $(/bin/busybox uname -r), $(/bin/busybox nproc) CPUs"
+# Memory, both vCPUs and the timer: a page-touching job on each CPU.
+for cpu in 0 1; do
+	/bin/busybox taskset -c $cpu /bin/busybox dd if=/dev/zero of=/tmp/f$cpu bs=1M count=40 2>/dev/null &
+done
+wait
+/bin/busybox sleep 1
+echo "NESTED: $(/bin/busybox du -sm /tmp | /bin/busybox cut -f1) MiB written"
+echo "NESTED: done"
+# Firecracker stops on a keyboard-controller reset, the others on power off.
+case " $(/bin/busybox cat /proc/cmdline) " in
+*" reboot=k "*) /bin/busybox reboot -f ;;
+*) /bin/busybox poweroff -f ;;
+esac

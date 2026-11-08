@@ -60,6 +60,8 @@ pub const GPA_END: usize = MAX_RAM_L1 << 30;
 
 pub const SLOT_VSPACE_POOL: usize = 640;
 pub const SLOT_DEV_CNODE: usize = 641;
+pub const SLOT_EPT_POOL: usize = 644;
+pub const MAX_EPT_ROOTS: usize = 8;
 pub const SLOT_DYN_BASE: usize = 1024;
 
 pub const SPECIAL_BASE: u64 = 0x0000_7ff0_0000_0000;
@@ -171,7 +173,8 @@ pub struct BootInfo {
     pub kmod_size: u64,
     pub hp_gpa: u64,
     pub hp_count: u64,
-    pub reserved: [u64; 6],
+    pub nr_ept_roots: u64,
+    pub reserved: [u64; 5],
     pub devices: [DevDesc; MAX_DEVICES],
     pub cmdline: [u8; CMDLINE_SIZE],
 }

@@ -1,0 +1,20 @@
+#!/bin/sh
+/bin/busybox mount -t proc proc /proc
+/bin/busybox mount -t sysfs sys /sys
+/bin/busybox mount -t tmpfs tmp /tmp
+/bin/busybox mount -t devtmpfs dev /dev
+/bin/kvmtest
+# With VMMs in the initramfs (run-kvmtest.sh vmm): boot a Linux guest with
+# two vCPUs under each, on /dev/kvm.
+for vmm in qemu firecracker cloud-hypervisor; do
+	case $vmm in
+	qemu) bin=/usr/bin/qemu-system-x86_64 ;;
+	*) bin=/usr/bin/$vmm ;;
+	esac
+	[ -x $bin ] || continue
+	echo "KVMTEST: VMM $vmm"
+	{ /bin/run-nested $vmm 2>&1; echo "exit status $?"; } |
+		while IFS= read -r line; do echo "$vmm: $line"; done
+done
+echo "KVMTEST: VMMs done"
+/bin/busybox poweroff -f

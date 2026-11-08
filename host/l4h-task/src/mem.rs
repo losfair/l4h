@@ -545,6 +545,18 @@ impl Alloc {
         Some(UtRegion::fresh(untyped_at(slot), b.paddr, bits))
     }
 
+    /// Can the kernel create `bp`?  Types it refuses at runtime (VT-x objects
+    /// on a CPU without VT-x) would panic in the ordinary paths.  Costs the
+    /// page or so of the attempt for good, so this is for boot.
+    pub fn can_retype(&mut self, bp: &ObjectBlueprint) -> bool {
+        let ut = self.slots.alloc();
+        let dest = self.slots.alloc();
+        let Some(r) = self.split(bp.physical_size_bits(), ut) else {
+            return false;
+        };
+        r.cap.untyped_retype(bp, &cnode_dest(self.slots.cnode()), dest, 1).is_ok()
+    }
+
     /// Allocate a single object into a fresh local slot.
     pub fn object(&mut self, bp: ObjectBlueprint) -> Slot {
         self.refill();

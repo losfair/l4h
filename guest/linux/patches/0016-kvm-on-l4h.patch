@@ -1,0 +1,275 @@
+kvm: arch/x86/kvm in the l4h guest kernel
+
+KVM's x86 code builds for ARCH=l4h with the backend in arch/l4h/kvm
+(DESIGN.md §5.10), which needs a few changes here:
+
+- Every object includes arch/l4h/kvm/compat.h first, for what x86's
+  headers would give a ring-0 kernel.
+- The TDP MMU reports each leaf SPTE change to l4h_kvm_spte_changed(),
+  which keeps the seL4 EPT that the CPU walks in step with KVM's page
+  table: in handle_changed_spte(), which now gets the SPTE's address, and
+  where an SPTE changes without it (aging, dirty-bit clearing).  A fault
+  KVM finds spurious calls it too: the EPT may lack what the table has.
+- No fast page faults: they change SPTEs locklessly, behind that hook.
+- kvm_arch_free_vm() frees the EPT after KVM's last use of the MMU.
+- A new memslot asks for THP behind it, for 2 MiB EPT leaves.
+- Optional static calls left NULL return 0: without HAVE_STATIC_CALL a
+  NULL static call is a call to address 0.
+- kvm_main.c's PIO page, which it keeps for CONFIG_X86 only.
+- Steal time clears the guest's "preempted" byte without an xchg on its
+  user address, which the guest kernel cannot reach directly.
+
+diff -ruN -x '*.o' -x '.*.cmd' -x '*.a' -x modules.order pa/arch/x86/kvm/Makefile pb/arch/x86/kvm/Makefile
+--- a/arch/x86/kvm/Makefile
++++ b/arch/x86/kvm/Makefile
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0
+ 
+ ccflags-y += -I $(srctree)/arch/x86/kvm
++ccflags-$(CONFIG_L4H) += -I $(srctree)/arch/l4h/kvm -include $(srctree)/arch/l4h/kvm/compat.h
+ ccflags-$(CONFIG_KVM_WERROR) += -Werror
+ 
+ include $(srctree)/virt/kvm/Makefile.kvm
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -3558,6 +3558,10 @@
+ 
+ static bool page_fault_can_be_fast(struct kvm *kvm, struct kvm_page_fault *fault)
+ {
++	/* It changes SPTEs behind the back of arch/l4h/kvm/ept.c. */
++	if (IS_ENABLED(CONFIG_L4H))
++		return false;
++
+ 	/*
+ 	 * Page faults with reserved bits set, i.e. faults on MMIO SPTEs, only
+ 	 * reach the common page fault handler if the SPTE has an invalid MMIO
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@ -322,7 +322,7 @@
+ 
+ static void handle_changed_spte(struct kvm *kvm, int as_id, gfn_t gfn,
+ 				u64 old_spte, u64 new_spte, int level,
+-				bool shared);
++				bool shared, tdp_ptep_t sptep);
+ 
+ static void tdp_account_mmu_page(struct kvm *kvm, struct kvm_mmu_page *sp)
+ {
+@@ -476,7 +476,7 @@
+ 							  FROZEN_SPTE, level);
+ 		}
+ 		handle_changed_spte(kvm, kvm_mmu_page_as_id(sp), gfn,
+-				    old_spte, FROZEN_SPTE, level, shared);
++				    old_spte, FROZEN_SPTE, level, shared, sptep);
+ 
+ 		if (is_mirror_sp(sp)) {
+ 			KVM_BUG_ON(shared, kvm);
+@@ -563,6 +563,7 @@
+  * @shared: This operation may not be running under the exclusive use of
+  *	    the MMU lock and the operation must synchronize with other
+  *	    threads that might be modifying SPTEs.
++ * @sptep: the SPTE
+  *
+  * Handle bookkeeping that might result from the modification of a SPTE.  Note,
+  * dirty logging updates are handled in common code, not here (see make_spte()
+@@ -570,7 +571,7 @@
+  */
+ static void handle_changed_spte(struct kvm *kvm, int as_id, gfn_t gfn,
+ 				u64 old_spte, u64 new_spte, int level,
+-				bool shared)
++				bool shared, tdp_ptep_t sptep)
+ {
+ 	bool was_present = is_shadow_present_pte(old_spte);
+ 	bool is_present = is_shadow_present_pte(new_spte);
+@@ -578,6 +579,11 @@
+ 	bool is_leaf = is_present && is_last_spte(new_spte, level);
+ 	bool pfn_changed = spte_to_pfn(old_spte) != spte_to_pfn(new_spte);
+ 
++#ifdef CONFIG_L4H
++	if (was_leaf || is_leaf)
++		l4h_kvm_spte_changed(kvm, rcu_dereference(sptep), gfn, level);
++#endif
++
+ 	WARN_ON_ONCE(level > PT64_ROOT_MAX_LEVEL);
+ 	WARN_ON_ONCE(level < PG_LEVEL_4K);
+ 	WARN_ON_ONCE(gfn & (KVM_PAGES_PER_HPAGE(level) - 1));
+@@ -726,7 +732,7 @@
+ 		return ret;
+ 
+ 	handle_changed_spte(kvm, iter->as_id, iter->gfn, iter->old_spte,
+-			    new_spte, iter->level, true);
++			    new_spte, iter->level, true, iter->sptep);
+ 
+ 	return 0;
+ }
+@@ -760,7 +766,7 @@
+ 
+ 	old_spte = kvm_tdp_mmu_write_spte(sptep, old_spte, new_spte, level);
+ 
+-	handle_changed_spte(kvm, as_id, gfn, old_spte, new_spte, level, false);
++	handle_changed_spte(kvm, as_id, gfn, old_spte, new_spte, level, false, sptep);
+ 
+ 	/*
+ 	 * Users that do non-atomic setting of PTEs don't operate on mirror
+@@ -1186,6 +1192,10 @@
+ 	    (fault->prefetch || is_access_allowed(fault, iter->old_spte)) &&
+ 	    is_last_spte(iter->old_spte, iter->level)) {
+ 		WARN_ON_ONCE(fault->pfn != spte_to_pfn(iter->old_spte));
++#ifdef CONFIG_L4H
++		/* Not spurious to the CPU, which walks a cache of this table. */
++		l4h_kvm_spte_changed(vcpu->kvm, rcu_dereference(iter->sptep), iter->gfn, iter->level);
++#endif
+ 		return RET_PF_SPURIOUS;
+ 	}
+ 
+@@ -1196,9 +1206,12 @@
+ 				   fault->pfn, iter->old_spte, fault->prefetch,
+ 				   false, fault->map_writable, &new_spte);
+ 
+-	if (new_spte == iter->old_spte)
++	if (new_spte == iter->old_spte) {
+ 		ret = RET_PF_SPURIOUS;
+-	else if (tdp_mmu_set_spte_atomic(vcpu->kvm, iter, new_spte))
++#ifdef CONFIG_L4H
++		l4h_kvm_spte_changed(vcpu->kvm, rcu_dereference(iter->sptep), iter->gfn, iter->level);
++#endif
++	} else if (tdp_mmu_set_spte_atomic(vcpu->kvm, iter, new_spte))
+ 		return RET_PF_RETRY;
+ 	else if (is_shadow_present_pte(iter->old_spte) &&
+ 		 (!is_last_spte(iter->old_spte, iter->level) ||
+@@ -1392,6 +1405,11 @@
+ 	if (__tdp_mmu_set_spte_atomic(kvm, iter, new_spte))
+ 		return;
+ 
++#ifdef CONFIG_L4H
++	if (is_last_spte(new_spte, iter->level))
++		l4h_kvm_spte_changed(kvm, rcu_dereference(iter->sptep), iter->gfn, iter->level);
++#endif
++
+ 	trace_kvm_tdp_mmu_spte_changed(iter->as_id, iter->gfn, iter->level,
+ 				       iter->old_spte, new_spte);
+ }
+@@ -1743,6 +1761,9 @@
+ 		iter.old_spte = tdp_mmu_clear_spte_bits(iter.sptep,
+ 							iter.old_spte, dbit,
+ 							iter.level);
++#ifdef CONFIG_L4H
++		l4h_kvm_spte_changed(kvm, rcu_dereference(iter.sptep), iter.gfn, iter.level);
++#endif
+ 
+ 		trace_kvm_tdp_mmu_spte_changed(iter.as_id, iter.gfn, iter.level,
+ 					       iter.old_spte,
+--- a/arch/x86/kvm/pmu.c
++++ b/arch/x86/kvm/pmu.c
+@@ -98,7 +98,13 @@
+ 	static_call_update(kvm_x86_pmu_##func, kvm_pmu_ops.func);
+ #define KVM_X86_PMU_OP(func) \
+ 	WARN_ON(!kvm_pmu_ops.func); __KVM_X86_PMU_OP(func)
++#ifdef CONFIG_L4H
++#define KVM_X86_PMU_OP_OPTIONAL(func) \
++	static_call_update(kvm_x86_pmu_##func, (void *)kvm_pmu_ops.func ? : \
++					       (void *)__static_call_return0);
++#else
+ #define KVM_X86_PMU_OP_OPTIONAL __KVM_X86_PMU_OP
++#endif
+ #include <asm/kvm-x86-pmu-ops.h>
+ #undef __KVM_X86_PMU_OP
+ }
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -3468,6 +3468,19 @@
+ 	 */
+ 	if (guest_pv_has(vcpu, KVM_FEATURE_PV_TLB_FLUSH)) {
+ 		u8 st_preempted = 0;
++#ifdef CONFIG_L4H
++		/* User memory is not in the kernel's address space. */
++		static const u8 zero;
++		int r;
++
++		if (get_user(st_preempted, &st->preempted))
++			return;
++		do {
++			r = l4h_kvm_cmpxchg_user(&st->preempted, &st_preempted, &zero, 1);
++		} while (r > 0);
++		if (r < 0)
++			return;
++#else
+ 		int err = -EFAULT;
+ 
+ 		if (!user_access_begin(st, sizeof(*st)))
+@@ -3484,6 +3497,7 @@
+ 			goto out;
+ 
+ 		user_access_end();
++#endif
+ 
+ 		vcpu->arch.st.preempted = 0;
+ 
+@@ -9633,7 +9647,14 @@
+ 	static_call_update(kvm_x86_##func, kvm_x86_ops.func);
+ #define KVM_X86_OP(func) \
+ 	WARN_ON(!kvm_x86_ops.func); __KVM_X86_OP(func)
++#ifdef CONFIG_L4H
++/* Without HAVE_STATIC_CALL a NULL static call is a call to address 0. */
++#define KVM_X86_OP_OPTIONAL(func) \
++	static_call_update(kvm_x86_##func, (void *)kvm_x86_ops.func ? : \
++					   (void *)__static_call_return0);
++#else
+ #define KVM_X86_OP_OPTIONAL __KVM_X86_OP
++#endif
+ #define KVM_X86_OP_OPTIONAL_RET0(func) \
+ 	static_call_update(kvm_x86_##func, (void *)kvm_x86_ops.func ? : \
+ 					   (void *)__static_call_return0);
+@@ -9644,7 +9665,13 @@
+ 	static_call_update(kvm_x86_nested_##func, nested_ops->func);
+ #define KVM_X86_NESTED_OP(func) \
+ 	WARN_ON(!nested_ops->func); __KVM_X86_NESTED_OP(func)
++#ifdef CONFIG_L4H
++#define KVM_X86_NESTED_OP_OPTIONAL(func) \
++	static_call_update(kvm_x86_nested_##func, (void *)nested_ops->func ? : \
++						  (void *)__static_call_return0);
++#else
+ #define KVM_X86_NESTED_OP_OPTIONAL __KVM_X86_NESTED_OP
++#endif
+ #define KVM_X86_NESTED_OP_OPTIONAL_RET0(func) \
+ 	static_call_update(kvm_x86_nested_##func, (void *)nested_ops->func ? : \
+ 						  (void *)__static_call_return0);
+@@ -12440,6 +12467,9 @@
+ 
+ void kvm_arch_free_vm(struct kvm *kvm)
+ {
++#ifdef CONFIG_L4H
++	l4h_kvm_vm_free(kvm);
++#endif
+ #if IS_ENABLED(CONFIG_HYPERV)
+ 	kfree(kvm->arch.hv_pa_pg);
+ #endif
+@@ -12803,6 +12833,9 @@
+ 		if (kvm_is_gfn_alias(kvm, new->base_gfn + new->npages - 1))
+ 			return -EINVAL;
+ 
++#ifdef CONFIG_L4H
++		l4h_kvm_memslot_prepare(kvm, new);
++#endif
+ 		return kvm_alloc_memslot_metadata(kvm, new);
+ 	}
+ 
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -4081,7 +4081,7 @@
+ 
+ 	if (vmf->pgoff == 0)
+ 		page = virt_to_page(vcpu->run);
+-#ifdef CONFIG_X86
++#if defined(CONFIG_X86) || defined(CONFIG_L4H)
+ 	else if (vmf->pgoff == KVM_PIO_PAGE_OFFSET)
+ 		page = virt_to_page(vcpu->arch.pio_data);
+ #endif
+@@ -5564,7 +5564,7 @@
+ 		if (arg)
+ 			goto out;
+ 		r = PAGE_SIZE;     /* struct kvm_run */
+-#ifdef CONFIG_X86
++#if defined(CONFIG_X86) || defined(CONFIG_L4H)
+ 		r += PAGE_SIZE;    /* pio data page */
+ #endif
+ #ifdef CONFIG_KVM_MMIO

@@ -8,6 +8,7 @@ ifeq ($(SUBARCH),aarch64)
 obj-y := head-arm64.o sys.o boot.o events.o user.o
 endif
 
-SEL4_OBJS := sys.o boot.o events.o user.o
+obj-$(CONFIG_KVM) += kvm.o
+SEL4_OBJS := sys.o boot.o events.o user.o kvm.o
 
 include $(srctree)/arch/l4h/scripts/Makefile.rules

@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# KVM in the l4h guest kernel: arch/x86/kvm's common code with a backend
+# on seL4 VCPUs (arch/l4h/kvm).  See DESIGN.md §5.10.
+
+source "virt/kvm/Kconfig"
+
+config KVM
+	bool "KVM on seL4 VCPUs"
+	default y
+	depends on !UML_ARM64
+	select KVM_X86
+	help
+	  Provide /dev/kvm on hosts whose CPU has VT-x, for QEMU, Firecracker
+	  and cloud-hypervisor.  A kernel with this option boots everywhere:
+	  /dev/kvm only appears when the host hands out EPT roots.
+
+config KVM_X86
+	bool
+	select KVM_COMMON
+	select KVM_GENERIC_MMU_NOTIFIER
+	select HAVE_KVM_IRQCHIP
+	select HAVE_KVM_PFNCACHE
+	select HAVE_KVM_DIRTY_RING_TSO
+	select HAVE_KVM_DIRTY_RING_ACQ_REL
+	select HAVE_KVM_IRQ_ROUTING
+	select HAVE_KVM_IRQ_BYPASS
+	select HAVE_KVM_READONLY_MEM
+	select KVM_MMIO
+	select SCHED_INFO
+	select HAVE_KVM_MSI
+	select HAVE_KVM_CPU_RELAX_INTERCEPT
+	select HAVE_KVM_NO_POLL
+	select KVM_GENERIC_DIRTYLOG_READ_PROTECT
+	select KVM_GENERIC_HARDWARE_ENABLING
+	select KVM_GENERIC_PRE_FAULT_MEMORY
+	select VIRT_XFER_TO_GUEST_WORK
+	select KVM_ASYNC_PF
+	select VHOST_TASK
+
+config KVM_IOAPIC
+	def_bool KVM
+
+config KVM_MAX_NR_VCPUS
+	int
+	default 64
+
+config X86_LOCAL_APIC
+	def_bool KVM

@@ -46,6 +46,9 @@ void kernel_fpu_begin_mask(unsigned int kfpu_mask)
 
 	WARN_ON_ONCE(!irq_fpu_usable());
 	this_cpu_write(kernel_fpu_allowed, false);
+#ifdef CONFIG_KVM
+	l4h_kvm_fpu_save();
+#endif
 
 	if (likely(kfpu_mask & KFPU_MXCSR) && boot_cpu_has(X86_FEATURE_XMM)) {
 		u32 mxcsr = MXCSR_DEFAULT;

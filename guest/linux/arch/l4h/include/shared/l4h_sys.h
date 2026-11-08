@@ -23,6 +23,10 @@ enum l4h_obj_type {
 	L4H_OBJ_PD,	/* x86_64: page directory */
 	L4H_OBJ_PDPT,	/* x86_64: page directory pointer table */
 	L4H_OBJ_LARGE_FRAME,	/* 2 MiB RAM frame */
+	L4H_OBJ_VCPU,		/* x86_64 with VT-x */
+	L4H_OBJ_EPT_PT,
+	L4H_OBJ_EPT_PD,
+	L4H_OBJ_EPT_PDPT,
 	L4H_OBJ_NR,
 };
 
@@ -188,6 +192,40 @@ void l4h_user_deschedule(struct l4h_uctx *u);
 int l4h_fpu_read(struct l4h_uctx *u, void *buf, unsigned long size);
 int l4h_fpu_write(struct l4h_uctx *u, const void *buf, unsigned long size);
 unsigned long l4h_fpu_state_size(void);
+
+/* ---- seL4 VCPUs and EPT (x86_64, arch/l4h/kvm) */
+enum {
+	L4H_VMX_RAX, L4H_VMX_RBX, L4H_VMX_RCX, L4H_VMX_RDX, L4H_VMX_RSI, L4H_VMX_RDI,
+	L4H_VMX_RBP, L4H_VMX_R8, L4H_VMX_R9, L4H_VMX_R10, L4H_VMX_R11, L4H_VMX_R12,
+	L4H_VMX_R13, L4H_VMX_R14, L4H_VMX_R15, L4H_VMX_NR_GP,
+};
+
+/* What a VMEnter returned.  Without `fault` a notification ended it: there
+ * was no exit to handle, and intr_info still holds an event not delivered.
+ * Fields an exit does not define are 0; RSP and CR3 are for l4h_vcpu_read(). */
+struct l4h_vmexit {
+	int fault;
+	unsigned int reason, instr_len;
+	unsigned int intr_info, exit_intr_info, exit_intr_error;
+	unsigned int idt_vector_info, idt_vector_error, interruptibility;
+	unsigned long rip, rflags, cr2, qualification, gpa;
+	unsigned long gp[L4H_VMX_NR_GP];	/* L4H_VMX_* */
+};
+
+int l4h_vcpu_set_tcb(unsigned long vcpu, unsigned long tcb);
+int l4h_tcb_set_ept(unsigned long tcb, unsigned long ept);
+unsigned long l4h_vcpu_read(unsigned long vcpu, unsigned long field, int *err);
+int l4h_vcpu_write(unsigned long vcpu, unsigned long field, unsigned long value);
+int l4h_vcpu_read_msr(unsigned long vcpu, unsigned long msr, unsigned long *value);
+int l4h_vcpu_write_msr(unsigned long vcpu, unsigned long msr, unsigned long value);
+int l4h_vcpu_write_cr2(unsigned long vcpu, unsigned long value);
+int l4h_vcpu_write_xcr0(unsigned long vcpu, unsigned long long value);
+int l4h_vcpu_flush_tlb(unsigned long vcpu);
+int l4h_vcpu_write_regs(unsigned long vcpu, const unsigned long *gp);
+void l4h_vcpu_enter(struct l4h_vmexit *x, unsigned long rip, unsigned long controls,
+		    unsigned long intr_info);
+int l4h_ept_map_table(int level, unsigned long table, unsigned long ept, unsigned long gpa);
+int l4h_ept_map_frame(unsigned long frame, unsigned long ept, unsigned long gpa, int writable);
 
 /* ---- events, timers, idle */
 unsigned long long l4h_rdtsc(void);

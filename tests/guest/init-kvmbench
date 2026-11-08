@@ -1,0 +1,18 @@
+#!/bin/sh
+/bin/busybox mount -t proc proc /proc
+/bin/busybox mount -t sysfs sys /sys
+/bin/busybox mount -t tmpfs tmp /tmp
+/bin/busybox mount -t devtmpfs dev /dev
+# The Linux baseline (run-kvmbench.sh linux) has KVM as modules.
+for m in irqbypass kvm kvm-intel; do
+	[ -f /lib/kvm/$m.ko ] && /bin/busybox insmod /lib/kvm/$m.ko
+done
+echo "KVMBENCH: start on $(/bin/busybox uname -r)"
+/bin/kvmbench 3
+for vmm in qemu firecracker cloud-hypervisor; do
+	for i in 1 2 3; do
+		/bin/kvmbench time $vmm /bin/run-nested $vmm
+	done
+done
+echo "KVMBENCH: finished"
+/bin/busybox poweroff -f

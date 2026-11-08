@@ -43,6 +43,10 @@ static const seL4_Word obj_type[L4H_OBJ_NR] = {
 	[L4H_OBJ_PT] = seL4_X86_PageTableObject,
 	[L4H_OBJ_PD] = seL4_X86_PageDirectoryObject,
 	[L4H_OBJ_PDPT] = seL4_X86_PDPTObject,
+	[L4H_OBJ_VCPU] = seL4_X86_VCPUObject,
+	[L4H_OBJ_EPT_PT] = seL4_X86_EPTPTObject,
+	[L4H_OBJ_EPT_PD] = seL4_X86_EPTPDObject,
+	[L4H_OBJ_EPT_PDPT] = seL4_X86_EPTPDPTObject,
 #endif
 };
 
@@ -69,7 +73,14 @@ int l4h_obj_bits(int type, int size_bits)
 	case L4H_OBJ_PT:
 	case L4H_OBJ_PD:
 	case L4H_OBJ_PDPT:
+	case L4H_OBJ_EPT_PT:
+	case L4H_OBJ_EPT_PD:
+	case L4H_OBJ_EPT_PDPT:
 		return seL4_PageBits;
+#ifndef __aarch64__
+	case L4H_OBJ_VCPU:
+		return seL4_X86_VCPUBits;
+#endif
 	}
 	return -1;
 }

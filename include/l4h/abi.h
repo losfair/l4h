@@ -141,6 +141,11 @@ typedef int64_t l4h_s64;
 #define L4H_SLOT_VSPACE_POOL    640
 /* A CNode with device capabilities (indices from l4h_dev_desc). */
 #define L4H_SLOT_DEV_CNODE      641
+/* A CNode with bootinfo.nr_ept_roots pre-assigned EPT roots, one for each VM
+ * the guest's KVM runs at a time.  None where the host has no usable VT-x:
+ * nr_ept_roots is also how the guest learns whether it has. */
+#define L4H_SLOT_EPT_POOL       644
+#define L4H_MAX_EPT_ROOTS       8
 
 /* Root slots [L4H_SLOT_DYN_BASE, 4096) are free for the guest. */
 #define L4H_SLOT_DYN_BASE       1024
@@ -308,7 +313,8 @@ struct l4h_bootinfo {
 	 * from hp_gpa (128 MiB aligned, above the I/O pool). */
 	l4h_u64 hp_gpa;
 	l4h_u64 hp_count;
-	l4h_u64 reserved[6];
+	l4h_u64 nr_ept_roots;     /* L4H_SLOT_EPT_POOL */
+	l4h_u64 reserved[5];
 	struct l4h_dev_desc devices[L4H_MAX_DEVICES];
 	char cmdline[L4H_CMDLINE_SIZE];
 };
