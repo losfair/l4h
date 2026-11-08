@@ -45,10 +45,9 @@ pub const RING_BYTES: usize = RING_TRBS * 16;
 /// a ring, so a ring always has room for one more URB once it has this
 /// many free.
 pub const MAX_URB_TRBS: usize = 192;
-// An URB never crosses the Link TRB (a TD fragment there would have to
-// end on a packet boundary, xHCI 1.2 §4.11.7.1): one that does not fit
-// before it goes at the start after no-ops.  Even an empty ring has room
-// for the no-ops and the URB.
+// A TD crosses the Link TRB only where its data before it ends on a packet
+// boundary (xHCI 1.2 §4.11.7.1, `link_ok`); otherwise the URB goes at the
+// start after no-ops.  Even an empty ring has room for both.
 const _: () = assert!(2 * MAX_URB_TRBS + 1 < RING_TRBS - 1 && USB_RINGS % 64 == 0 && 65536 % RING_BYTES == 0);
 /// The largest URB, whatever the pool: 32 x 64 KiB pieces, plus one TRB
 /// per segment boundary, fit MAX_URB_TRBS (64 segments, each across a
@@ -515,6 +514,27 @@ pub struct EpShape {
     /// start_frame), and the service interval in microframes (2^Interval).
     pub full_speed: bool,
     pub period: u32,
+}
+
+/// Whether URB `trbs` (TDs ending at `ends`) may be written with the Link
+/// TRB after its first `before` TRBs: the TD the link falls in has a
+/// multiple of `max_packet` data bytes before it (none, or a TD boundary,
+/// also does).
+pub fn link_ok(trbs: &[Trb], ends: &[u16], before: usize, max_packet: u32) -> bool {
+    if before == 0 || before >= trbs.len() {
+        return true;
+    }
+    // The TD holding TRB `before`, and where it starts.
+    let td = ends.iter().position(|&e| e as usize >= before).unwrap_or(0);
+    let start = if td == 0 { 0 } else { ends[td - 1] as usize + 1 };
+    if start == before {
+        return true;
+    }
+    let data: u32 = trbs[start..before].iter()
+        .filter(|t| matches!(t.ty(), TRB_NORMAL | TRB_DATA | TRB_ISOCH))
+        .map(|t| t.len())
+        .fold(0, u32::wrapping_add);
+    max_packet != 0 && data % max_packet == 0
 }
 
 /// The Frame ID of isoch packet `k` of an URB scheduled from `start`, as

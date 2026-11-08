@@ -2478,10 +2478,10 @@ controller, one per claimed controller, and the guest forwards Linux's
   cannot change), a ring per endpoint or stream from the fixed pool, TDs
   laid out as Linux's `xhci-ring.c` does (64 KiB splits, TD Size, TBC and
   TLBPC for isoch, Frame IDs from the start frame, device speed and service
-  interval, ISP on IN data). An URB never crosses the Link TRB, where a TD
-  fragment would have to end on a packet boundary (xHCI §4.11.7.1): one
-  that does not fit before it goes at the start of the ring after no-ops,
-  which even an empty ring has room for. Commands run one at a time, polling the
+  interval, ISP on IN data). A TD crosses the Link TRB only where its data
+  before it ends on a packet boundary (xHCI §4.11.7.1); otherwise its URB
+  goes at the start of the ring after no-ops, which even an empty ring has
+  room for. Commands run one at a time, polling the
   event ring (5 s timeout). An endpoint halted by an error is recovered
   with Reset Endpoint and Set TR Dequeue past the failed URB, as Linux
   does; a cancelled URB is skipped (dequeue moved, or its TRBs made

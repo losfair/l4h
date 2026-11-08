@@ -279,6 +279,31 @@ fn isoch_frame_ids() {
 }
 
 #[test]
+fn link_alignment() {
+    // The reviewer's case: 64 + 448 bytes of one 512-byte packet.
+    let p = pool();
+    let x = check_xfer(&xfer(abi::XFER_BULK, 2, &[(p.gpa, 64), (p.gpa + 0x1000, 448)]), &p, MAX_TRANSFER).unwrap();
+    let (t, ends) = trbs(&x, &EP);
+    assert_eq!(t.len(), 2);
+    assert!(!link_ok(&t, &ends, 1, 512));
+    // Nothing, or all of it, before the link.
+    assert!(link_ok(&t, &ends, 0, 512) && link_ok(&t, &ends, 2, 512));
+    // Whole packets before the link.
+    let x = check_xfer(&xfer(abi::XFER_BULK, 2, &[(p.gpa, 1024), (p.gpa + 0x1000, 448)]), &p, MAX_TRANSFER).unwrap();
+    let (t, ends) = trbs(&x, &EP);
+    assert!(link_ok(&t, &ends, 1, 512));
+    // At a TD boundary of an isoch URB, whatever the bytes.
+    let mut i = xfer(abi::XFER_ISOC, 3, &[(p.gpa, 2 * 100)]);
+    i.flags = abi::XF_IN | abi::XF_ISO_ASAP;
+    i.n_iso = 2;
+    for k in 0..2 {
+        i.iso[k] = abi::Iso { offset: 100 * k as u32, len: 100 };
+    }
+    let (t, ends) = trbs(&check_xfer(&i, &p, MAX_TRANSFER).unwrap(), &EpShape { max_packet: 192, ..EP });
+    assert!(link_ok(&t, &ends, 1, 192));
+}
+
+#[test]
 fn too_many_trbs_refused() {
     // 64 segments, each crossing several 64 KiB boundaries, beyond
     // MAX_URB_TRBS.

@@ -500,10 +500,12 @@ impl Usbd {
                 // Checked when accepted: it fits MAX_URB_TRBS.
                 break;
             }
-            if !self.rings.room(r, trbs.len()) {
+            let to_end = self.rings.to_end(r);
+            let pad = trbs.len() > to_end && !proto::link_ok(&trbs, &ends, to_end, shape.max_packet);
+            if !self.rings.room(r, trbs.len(), pad) {
                 break;
             }
-            let first = self.rings.write(dma, r, &trbs);
+            let first = self.rings.write(dma, r, &trbs, pad);
             let next = urb.next;
             if self.rings.get(r).head == u {
                 self.rings.get_mut(r).deq = first;
