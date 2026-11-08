@@ -93,8 +93,11 @@ const OFF_SCRATCH_ARRAY: usize = PAGE;
 const OFF_ERST: usize = 3 * PAGE;
 const OFF_CMD_RING: usize = 4 * PAGE;
 const OFF_INPUT_CTX: usize = 5 * PAGE;
-const OFF_EVENT_RING: usize = 6 * PAGE;
-const _: () = assert!(OFF_EVENT_RING + proto::EVENT_TRBS * 16 <= proto::FIXED_BYTES);
+/// 64 KiB-aligned (the region is): an event ring segment may not cross a
+/// 64 KiB boundary (xHCI 1.2 §6, Table 6-1).
+const OFF_EVENT_RING: usize = 0x10000;
+const _: () = assert!(OFF_INPUT_CTX + PAGE <= OFF_EVENT_RING && OFF_EVENT_RING % 0x10000 == 0);
+const _: () = assert!(proto::EVENT_TRBS * 16 <= 0x10000 && OFF_EVENT_RING + proto::EVENT_TRBS * 16 <= proto::FIXED_BYTES);
 const CMD_TRBS: usize = PAGE / 16;
 
 /// Command timeout (xHCI drivers use 5 s).
@@ -141,6 +144,10 @@ pub struct Caps {
     pub ctx_size: usize,
     pub ac64: bool,
     pub hci_version: u32,
+    /// Isochronous Scheduling Threshold, in microframes; Contiguous Frame
+    /// ID Capability (Frame IDs are used only with it, as Linux does).
+    pub ist: u32,
+    pub cfc: bool,
     /// Streams per endpoint usbd offers (a power of two, at most 16; 0:
     /// none).
     pub max_streams: u32,
@@ -201,12 +208,14 @@ impl Xhci {
             ctx_size: if hcc1 & (1 << 2) != 0 { 64 } else { 32 },
             ac64: hcc1 & 1 != 0,
             hci_version: cap0 >> 16,
+            ist: if hcs2 & 8 != 0 { (hcs2 & 7) << 3 } else { hcs2 & 7 },
+            cfc: hcc1 & (1 << 11) != 0,
             max_streams: if max_psa == 0 { 0 } else { (2u32 << max_psa).min(l4h_abi::usb::MAX_STREAMS) },
             port_proto: [0; 256],
             usb2: 0,
             usb3: 0,
         };
-        if caps.max_slots == 0 || dma.scratch(page) + scratch as usize * page > dma.size {
+        if caps.max_slots == 0 || dma.pa & 0xffff != 0 || dma.scratch(page) + scratch as usize * page > dma.size {
             return None;
         }
         // Extended capabilities: a bounded walk inside BAR 0.

@@ -319,17 +319,38 @@ impl Usbd {
             return;
         }
         // The oldest URB on the ring: an event for an older one is stale.
-        let u = self.rings.get(r).head;
+        let mut u = self.rings.get(r).head;
         if u == NONE || !self.urbs.get(u).posted {
             return;
         }
-        let dist = self.rings.dist(r, self.urbs.get(u).first, pos);
+        let mut dist = self.rings.dist(r, self.urbs.get(u).first, pos);
         if dist >= self.urbs.get(u).ntrbs {
-            return;
+            // An isoch URB whose TD failed mid TD, with no event for its
+            // end: done once the controller is on the next URB.
+            let urb = self.urbs.get(u);
+            let n = urb.next;
+            if urb.xfer.ty != abi::XFER_ISOC || !urb.mid || n == NONE || !self.urbs.get(n).posted {
+                return;
+            }
+            let d = self.rings.dist(r, self.urbs.get(n).first, pos);
+            if d >= self.urbs.get(n).ntrbs {
+                return;
+            }
+            let len = self.urbs.get(u).ends.len();
+            self.iso_passed(u, len);
+            self.iso_done(u, r);
+            (u, dist) = (n, d);
         }
         if matches!(cc, CC_STOPPED | CC_STOPPED_LENGTH_INVALID | CC_STOPPED_SHORT) {
-            // A Stop Endpoint for a cancel: what it did of the TD.
-            let done = self.bytes(r, u, dist, if cc == CC_STOPPED_LENGTH_INVALID { None } else { Some(resid) });
+            // A Stop Endpoint for a cancel: what it did of the TD.  Stopped
+            // - Short Packet reports the TD's bytes, Stopped - Length
+            // Invalid none for its TRB (xHCI 1.2 §4.6.9).
+            let (before, at) = self.data_bytes(r, u, dist);
+            let done = match cc {
+                CC_STOPPED_SHORT => resid.min(before.saturating_add(at)),
+                CC_STOPPED_LENGTH_INVALID => before,
+                _ => before.saturating_add(at.saturating_sub(resid)),
+            };
             self.urbs.get_mut(u).actual = done;
             return;
         }
@@ -347,12 +368,12 @@ impl Usbd {
                     }
                     self.complete(u, st, actual, slot, dci, r, halts(cc));
                 } else if cc == CC_SHORT_PACKET {
-                    let done = self.bytes(r, u, dist, Some(resid));
+                    let done = self.bytes(r, u, dist, resid);
                     let urb = self.urbs.get_mut(u);
                     urb.actual = done;
                     urb.short = true;
                 } else if cc != CC_SUCCESS {
-                    let done = self.bytes(r, u, dist, Some(resid));
+                    let done = self.bytes(r, u, dist, resid);
                     self.complete(u, cc_status(cc), done, slot, dci, r, halts(cc));
                 }
             }
@@ -364,7 +385,7 @@ impl Usbd {
                 } else if cc == CC_SUCCESS {
                     // No IOC there: a controller reporting more than asked.
                 } else {
-                    let done = self.bytes(r, u, dist, Some(resid)).min(length);
+                    let done = self.bytes(r, u, dist, resid).min(length);
                     let mut st = cc_status(cc);
                     if cc == CC_SHORT_PACKET && flags & abi::XF_SHORT_NOT_OK != 0 {
                         st = abi::ST_SHORT;
@@ -376,9 +397,16 @@ impl Usbd {
     }
 
     /// Data bytes of URB `u` done when its TRB `dist` reported `resid`
-    /// bytes left (None: all of it done) — the data TRBs before it, from
-    /// the start of its TD for isoch.
-    fn bytes(&self, r: u16, u: u16, dist: u16, resid: Option<u32>) -> u32 {
+    /// bytes left — the data TRBs before it, from the start of its TD for
+    /// isoch.
+    fn bytes(&self, r: u16, u: u16, dist: u16, resid: u32) -> u32 {
+        let (before, at) = self.data_bytes(r, u, dist);
+        before.saturating_add(at.saturating_sub(resid))
+    }
+
+    /// Data bytes of URB `u`'s TRBs before its TRB `dist` (from the start
+    /// of its TD for isoch), and of TRB `dist`.
+    fn data_bytes(&self, r: u16, u: u16, dist: u16) -> (u32, u32) {
         let urb = self.urbs.get(u);
         let start = if urb.xfer.ty == abi::XFER_ISOC {
             let t = urb.ends.iter().position(|&e| e >= dist).unwrap_or(0);
@@ -386,14 +414,14 @@ impl Usbd {
         } else {
             0
         };
-        let mut n = 0u32;
+        let (mut before, mut at) = (0u32, 0u32);
         for k in start..=dist {
             let t = self.rings.trb(self.hc.as_ref().unwrap().dma, r, urb.first, k);
             if matches!(t.ty(), proto::TRB_NORMAL | proto::TRB_DATA | proto::TRB_ISOCH) {
-                n = n.saturating_add(if k == dist { t.len().saturating_sub(resid.unwrap_or(0)) } else { t.len() });
+                if k == dist { at = t.len() } else { before = before.saturating_add(t.len()) }
             }
         }
-        n
+        (before, at)
     }
 
     fn iso_event(&mut self, r: u16, u: u16, dist: u16, cc: u32, resid: u32) {
@@ -402,22 +430,58 @@ impl Usbd {
         if (t as u16) < urb.td {
             return;
         }
-        let (slot, dci) = (urb.xfer.slot as usize, urb.xfer.dci as usize);
-        let st = cc_status(cc);
-        let done = if cc == CC_SUCCESS { urb.xfer.iso[t].1 } else { self.bytes(r, u, dist, Some(resid)) };
-        let urb = self.urbs.get_mut(u);
-        // TDs the controller skipped (missed service) report nothing.
-        for k in urb.td as usize..t {
-            urb.iso[k] = abi::IsoStatus { status: abi::ST_MISSED, actual: 0 };
-            urb.errors += 1;
+        let end = dist == urb.ends[t];
+        if urb.mid && t as u16 == urb.td {
+            // More of the TD that failed: it is over at its last TRB.
+            if end {
+                self.iso_passed(u, t + 1);
+                self.iso_done(u, r);
+            }
+            return;
         }
+        let st = cc_status(cc);
+        let done = if cc == CC_SUCCESS { urb.xfer.iso[t].1 } else { self.bytes(r, u, dist, resid) };
+        self.iso_passed(u, t);
+        let urb = self.urbs.get_mut(u);
         urb.iso[t] = abi::IsoStatus { status: st, actual: if st == abi::ST_OK { done } else { 0 } };
         if st != abi::ST_OK {
             urb.errors += 1;
         }
+        if st != abi::ST_OK && !end && cc != CC_MISSED_SERVICE {
+            // An error before the TD's last TRB: the controller may still
+            // go through the rest of it (xHCI 1.2 §4.9.1), so its TRBs
+            // stay until an event shows it is past them.
+            urb.mid = true;
+            return;
+        }
         urb.td = t as u16 + 1;
-        if t + 1 == urb.ends.len() {
-            let actual = urb.iso[..urb.ends.len()].iter().map(|s| s.actual).sum();
+        self.iso_done(u, r);
+    }
+
+    /// Isoch URB `u`'s TDs before `to` are behind the controller: one that
+    /// failed mid TD keeps its error, the others it skipped (missed
+    /// service) report nothing.
+    fn iso_passed(&mut self, u: u16, to: usize) {
+        let urb = self.urbs.get_mut(u);
+        let mut k = urb.td as usize;
+        if urb.mid && k < to {
+            urb.mid = false;
+            k += 1;
+        }
+        for k in k..to {
+            urb.iso[k] = abi::IsoStatus { status: abi::ST_MISSED, actual: 0 };
+            urb.errors += 1;
+        }
+        urb.td = urb.td.max(to as u16);
+    }
+
+    /// Complete isoch URB `u` if all its TDs are done.
+    fn iso_done(&mut self, u: u16, r: u16) {
+        let urb = self.urbs.get(u);
+        let n = urb.ends.len();
+        if urb.td as usize == n && !urb.mid {
+            let (slot, dci) = (urb.xfer.slot as usize, urb.xfer.dci as usize);
+            let actual = urb.iso[..n].iter().map(|s| s.actual).sum();
             self.complete(u, abi::ST_OK, actual, slot, dci, r, false);
         }
     }
@@ -436,7 +500,8 @@ impl Usbd {
             c.error_count = urb.errors;
             c.iso[..n].copy_from_slice(&urb.iso[..n]);
         }
-        let iso_tds = if urb.xfer.ty == abi::XFER_ISOC { urb.ends.len() as u32 } else { 0 };
+        // What transfer() reserved, posted or not.
+        let iso_tds = if urb.xfer.ty == abi::XFER_ISOC { urb.xfer.iso.len() as u32 } else { 0 };
         self.rings.unlink(&mut self.urbs, r, u);
         self.urbs.free(u);
         if halted && self.slots[slot].eps[dci].state != EpState::Disabled {
@@ -487,6 +552,9 @@ impl Usbd {
             hci_1_0: self.hci_1_0(),
             full_speed: matches!(self.slots[slot].speed, abi::SPEED_LOW | abi::SPEED_FULL),
             period: 1 << (ep.ep.interval & 15),
+            mfindex: self.hc.as_ref().unwrap().mfindex(),
+            ist: self.hc.as_ref().unwrap().caps.ist,
+            cfc: self.hc.as_ref().unwrap().caps.cfc,
         };
         let shape = if dci == 1 { proto::EpShape { max_packet: self.ep0_mps(slot), ..shape } } else { shape };
         let dma = self.hc.as_ref().unwrap().dma;
@@ -495,6 +563,13 @@ impl Usbd {
         while u != NONE {
             let mut trbs = proto::Trbs::new();
             let mut ends = proto::TdEnds::new();
+            let head = self.rings.get(r).head;
+            if self.urbs.get(u).xfer.ty == abi::XFER_ISOC {
+                // Right after the URBs on the ring, or when the endpoint
+                // can next be served (the USB core leaves it to the HCD).
+                let start = if head != u { self.rings.get(r).next_frame } else { proto::iso_start(&shape) };
+                self.urbs.get_mut(u).xfer.start_frame = start;
+            }
             let urb = self.urbs.get(u);
             if proto::build_trbs(&urb.xfer, &shape, &mut trbs, &mut ends).is_err() {
                 // Checked when accepted: it fits MAX_URB_TRBS.
@@ -505,12 +580,19 @@ impl Usbd {
             if !self.rings.room(r, trbs.len(), pad) {
                 break;
             }
+            // The no-ops of the padding stay the controller's until it is
+            // past them: the URB's, from where they start.
+            let start = self.rings.get(r).enq;
             let first = self.rings.write(dma, r, &trbs, pad);
             let next = urb.next;
-            if self.rings.get(r).head == u {
-                self.rings.get_mut(r).deq = first;
+            if urb.xfer.ty == abi::XFER_ISOC {
+                self.rings.get_mut(r).next_frame = proto::iso_next(&shape, urb.xfer.start_frame, urb.xfer.iso.len() as u32);
+            }
+            if head == u {
+                self.rings.get_mut(r).deq = start;
             }
             let urb = self.urbs.get_mut(u);
+            urb.start = start;
             urb.first = first;
             urb.ntrbs = trbs.len() as u16;
             urb.ends = ends;
@@ -1211,6 +1293,7 @@ impl Usbd {
         // It must fit a ring: lay it out once now.
         let shape = proto::EpShape {
             max_packet: (ep.ep.max_packet as u32 & 0x7ff).max(8), burst: 1, mult: 1, hci_1_0: true, full_speed: false, period: 1,
+            mfindex: 0, ist: 0, cfc: false,
         };
         let (mut trbs, mut ends) = (proto::Trbs::new(), proto::TdEnds::new());
         if proto::build_trbs(&x, &shape, &mut trbs, &mut ends).is_err() {

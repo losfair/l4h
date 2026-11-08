@@ -2475,13 +2475,19 @@ controller, one per claimed controller, and the guest forwards Linux's
   capability from vmmgr.
 - **usbd** is a Rust xHCI driver in the shape of blkd's: one command ring,
   one event ring of 4096 TRBs (interrupter 0, IMOD 40 us, which the guest
-  cannot change), a ring per endpoint or stream from the fixed pool, TDs
-  laid out as Linux's `xhci-ring.c` does (64 KiB splits, TD Size, TBC and
-  TLBPC for isoch, Frame IDs from the start frame, device speed and service
-  interval, ISP on IN data). A TD crosses the Link TRB only where its data
+  cannot change; in one 64 KiB-aligned segment), a ring per endpoint or
+  stream from the fixed pool, TDs laid out as Linux's `xhci-ring.c` does
+  (64 KiB splits, TD Size, TBC and TLBPC for isoch, ISP on IN data, a bulk
+  zero-length packet as a TD of its own). usbd schedules isoch URBs, as
+  Linux's HCD does: right after the endpoint's previous URB, or past MFINDEX
+  plus the scheduling threshold for an idle one, reporting the start frame
+  in the CQE; with CFC, TDs carry Frame IDs from it, the device speed and
+  the service interval (SIA when it is out of the valid window, or ASAP).
+  An isoch TD that fails before its last TRB stays on the ring until an
+  event shows the controller past it. A TD crosses the Link TRB only where its data
   before it ends on a packet boundary (xHCI §4.11.7.1); otherwise its URB
   goes at the start of the ring after no-ops, which even an empty ring has
-  room for. Commands run one at a time, polling the
+  room for, and which stay reserved until the URB completes. Commands run one at a time, polling the
   event ring (5 s timeout). An endpoint halted by an error is recovered
   with Reset Endpoint and Set TR Dequeue past the failed URB, as Linux
   does; a cancelled URB is skipped (dequeue moved, or its TRBs made

@@ -35,7 +35,7 @@ fn xfer(ty: u8, dci: u8, segs: &[(u64, u32)]) -> abi::XferReq {
     r
 }
 
-const EP: EpShape = EpShape { max_packet: 512, burst: 1, mult: 1, hci_1_0: true, full_speed: false, period: 1 };
+const EP: EpShape = EpShape { max_packet: 512, burst: 1, mult: 1, hci_1_0: true, full_speed: false, period: 1, mfindex: 0, ist: 0, cfc: true };
 
 #[test]
 fn walk_ends_on_loops_and_out_of_bounds() {
@@ -234,8 +234,12 @@ fn control_and_zero_length_trbs() {
     assert_eq!(t[0].len(), 0);
     let mut z = xfer(abi::XFER_BULK, 2, &[(p.gpa, 1024)]);
     z.flags = abi::XF_ZERO_PACKET;
-    let (t, _) = trbs(&check_xfer(&z, &p, MAX_TRANSFER).unwrap(), &EP);
+    let (t, ends) = trbs(&check_xfer(&z, &p, MAX_TRANSFER).unwrap(), &EP);
     assert_eq!(t.iter().map(|t| t.len()).collect::<Vec<_>>(), [1024, 0]);
+    // A TD of its own: the data TD ends before it, the URB with it.
+    assert_eq!(&ends[..], &[0, 1]);
+    assert_eq!(t[0].control & (TRB_CH | TRB_IOC), 0);
+    assert_eq!(t[1].control & (TRB_CH | TRB_IOC), TRB_IOC);
 }
 
 #[test]
@@ -274,8 +278,36 @@ fn isoch_frame_ids() {
     for k in 0..2 {
         i.iso[k] = abi::Iso { offset: 192 * k as u32, len: 192 };
     }
-    let (t, _) = trbs(&check_xfer(&i, &p, MAX_TRANSFER).unwrap(), &hs);
+    let x = check_xfer(&i, &p, MAX_TRANSFER).unwrap();
+    let (t, _) = trbs(&x, &hs);
     assert_eq!(t.iter().map(|t| (t.control >> 20) & 0x7ff).collect::<Vec<_>>(), [10, 10]);
+    assert!(t.iter().all(|t| t.control & TRB_SIA == 0));
+    // Without CFC, or outside the valid window (MFINDEX 800: frames 101
+    // on), as soon as possible.
+    let (t, _) = trbs(&x, &EpShape { cfc: false, ..hs });
+    assert!(t.iter().all(|t| t.control & TRB_SIA != 0));
+    let (t, _) = trbs(&x, &EpShape { mfindex: 800, ..hs });
+    assert!(t.iter().all(|t| t.control & TRB_SIA != 0));
+}
+
+#[test]
+fn isoch_schedule() {
+    // High speed, IST 2 microframes, MFINDEX 100: 100 + 2 + 10 rounded up
+    // to a frame, then to the 32-microframe interval.
+    let hs = EpShape { max_packet: 192, period: 32, ist: 2, mfindex: 100, ..EP };
+    assert_eq!(iso_start(&hs), 128);
+    assert!(iso_frame_ok(&hs, iso_frame(&hs, iso_start(&hs), 0)));
+    // The next URB of 3 packets follows, wrapping at 2048 frames.
+    assert_eq!(iso_next(&hs, 128, 3), 224);
+    assert_eq!(iso_next(&hs, 0x3fe0, 1), 0);
+    // Full speed, every 4 frames, in frames.
+    let fs = EpShape { full_speed: true, period: 32, ..hs };
+    assert_eq!(iso_start(&fs), 16);
+    assert_eq!(iso_next(&fs, 2046, 1), 2);
+    // The window, across the wrap: MFINDEX in frame 2000 reaches 847.
+    let w = EpShape { mfindex: 2000 << 3, ist: 0, ..hs };
+    assert!(iso_frame_ok(&w, 2001) && iso_frame_ok(&w, 0) && iso_frame_ok(&w, 847));
+    assert!(!iso_frame_ok(&w, 2000) && !iso_frame_ok(&w, 848));
 }
 
 #[test]

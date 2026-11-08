@@ -261,6 +261,7 @@ pub struct Xfer {
     pub ty: u8,
     pub flags: u32,
     pub stream: u32,
+    /// Isoch: usbd's choice, set when it is posted (iso_start, iso_next).
     pub start_frame: u32,
     pub length: u32,
     pub setup: [u8; 8],
@@ -514,6 +515,13 @@ pub struct EpShape {
     /// start_frame), and the service interval in microframes (2^Interval).
     pub full_speed: bool,
     pub period: u32,
+    /// The controller when the URB is posted: MFINDEX, its Isochronous
+    /// Scheduling Threshold in microframes, and whether it has the
+    /// Contiguous Frame ID Capability (without it, or for a Frame ID out
+    /// of the valid window, a TD goes as soon as possible, as Linux does).
+    pub mfindex: u32,
+    pub ist: u32,
+    pub cfc: bool,
 }
 
 /// Whether URB `trbs` (TDs ending at `ends`) may be written with the Link
@@ -547,6 +555,44 @@ pub fn iso_frame(ep: &EpShape, start: u32, k: u32) -> u32 {
         start.wrapping_add(k.wrapping_mul(period)) >> 3
     };
     frame & 0x7ff
+}
+
+/// Where an isoch URB to an idle endpoint starts, as Linux's
+/// xhci_queue_isoc_tx_prepare: the next frame after the scheduling
+/// threshold and some slack, at a service interval boundary.  In the
+/// URB's units (iso_frame).
+pub fn iso_start(ep: &EpShape) -> u32 {
+    let period = ep.period.max(1);
+    let mf = ((ep.mfindex & 0x3fff) + ep.ist + 10).next_multiple_of(8);
+    if ep.full_speed {
+        (mf.next_multiple_of(period.max(8)) >> 3) & 0x7ff
+    } else {
+        mf.next_multiple_of(period) & 0x3fff
+    }
+}
+
+/// Where the URB after one of `n` packets from `start` starts.
+pub fn iso_next(ep: &EpShape, start: u32, n: u32) -> u32 {
+    let period = ep.period.max(1);
+    if ep.full_speed {
+        start.wrapping_add(n.wrapping_mul((period / 8).max(1))) & 0x7ff
+    } else {
+        start.wrapping_add(n.wrapping_mul(period)) & 0x3fff
+    }
+}
+
+/// Whether Frame ID `frame` may be scheduled now: between MFINDEX + IST
+/// + 1 microframe and MFINDEX + 895 ms, in whole frames (xHCI 1.2
+/// §4.11.2.5, as Linux's xhci_get_isoc_frame_id).
+pub fn iso_frame_ok(ep: &EpShape, frame: u32) -> bool {
+    let mf = ep.mfindex & 0x3fff;
+    let first = ((mf + ep.ist + 1).next_multiple_of(8) >> 3) & 0x7ff;
+    let last = ((mf + 895 * 8) >> 3) & 0x7ff;
+    match first.cmp(&last) {
+        core::cmp::Ordering::Less => (first..=last).contains(&frame),
+        core::cmp::Ordering::Greater => frame >= first || frame <= last,
+        core::cmp::Ordering::Equal => false,
+    }
 }
 
 /// TD Size of a TRB of `len` bytes after `done` bytes of a TD of `total`
@@ -586,7 +632,8 @@ fn pieces(x: &Xfer, off: u32, len: u32, mut f: impl FnMut(u64, u32) -> Result<()
 }
 
 /// Lay out transfer `x` to an endpoint shaped `ep` as TRBs: ISP on IN
-/// data TRBs, CH within each TD, IOC on the last TRB of each TD; for
+/// data TRBs, CH within each TD, IOC on the last TRB of each TD (not the
+/// data TD before a bulk zero-length packet's: the URB ends with that); for
 /// isoch, one TD per packet with BEI on all but the last.  The index of
 /// the last TRB of each TD goes to `ends` (a control transfer's stages
 /// are one TD, ending at its status stage).  Err(ST_INVALID) if it needs
@@ -632,6 +679,13 @@ pub fn build_trbs(x: &Xfer, ep: &EpShape, out: &mut Trbs, ends: &mut TdEnds) -> 
             })?;
             let zlp = x.flags & abi::XF_ZERO_PACKET != 0 && !dir_in && ep.max_packet != 0
                 && x.length > 0 && x.length % ep.max_packet == 0;
+            if zlp {
+                // The zero-length packet is a TD of its own (xHCI 1.2
+                // §4.9.1); the URB completes with it.
+                let last = out.last_mut().ok_or_else(full)?;
+                last.control &= !TRB_CH;
+                ends.must_push((out.len() - 1) as u16);
+            }
             if x.length == 0 || zlp {
                 push(out, Trb { param: 0, status: 0, control: TRB_CH | (TRB_NORMAL << 10) })?;
             }
@@ -649,10 +703,11 @@ pub fn build_trbs(x: &Xfer, ep: &EpShape, out: &mut Trbs, ends: &mut TdEnds) -> 
                 let burst = ep.burst.max(1);
                 let tbc = packets.div_ceil(burst) - 1;
                 let tlbpc = match packets % burst { 0 => burst - 1, r => r - 1 };
-                let frame = if x.flags & abi::XF_ISO_ASAP != 0 {
+                let id = iso_frame(ep, x.start_frame, k as u32);
+                let frame = if x.flags & abi::XF_ISO_ASAP != 0 || !ep.cfc || !iso_frame_ok(ep, id) {
                     TRB_SIA
                 } else {
-                    iso_frame(ep, x.start_frame, k as u32) << 20
+                    id << 20
                 };
                 let mut done = 0;
                 pieces(x, off, len, |pa, n| {

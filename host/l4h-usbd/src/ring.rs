@@ -23,8 +23,11 @@ pub struct Ring {
     /// Where the next TRB goes, and the cycle bit it gets.
     pub enq: u16,
     pub cycle: u32,
-    /// The first TRB the controller may still use: the oldest posted URB's.
+    /// The first TRB the controller may still use: where the oldest posted
+    /// URB's TRBs start, with any no-ops before them.
     pub deq: u16,
+    /// Isoch: the start frame of an URB that follows those on the ring.
+    pub next_frame: u32,
     /// URBs, oldest first.
     pub head: u16,
     pub tail: u16,
@@ -33,7 +36,7 @@ pub struct Ring {
     pub stream: u16,
 }
 
-const FREE_RING: Ring = Ring { used: false, enq: 0, cycle: 1, deq: 0, head: NONE, tail: NONE, slot: 0, dci: 0, stream: 0 };
+const FREE_RING: Ring = Ring { used: false, enq: 0, cycle: 1, deq: 0, next_frame: 0, head: NONE, tail: NONE, slot: 0, dci: 0, stream: 0 };
 
 static mut RINGS: [Ring; USB_RINGS] = [FREE_RING; USB_RINGS];
 
@@ -230,7 +233,7 @@ impl Rings {
             ring.tail = prev;
         }
         ring.deq = match ring.head {
-            h if h != NONE && urbs.get(h).posted => urbs.get(h).first,
+            h if h != NONE && urbs.get(h).posted => urbs.get(h).start,
             _ => ring.enq,
         };
         next
@@ -242,12 +245,18 @@ pub struct Urb {
     pub xfer: Xfer,
     pub ring: u16,
     pub posted: bool,
-    /// Its TRBs on the ring, and the last TRB of each TD.
+    /// Its TRBs on the ring, and the last TRB of each TD; `start`: where
+    /// the no-ops written before them (if any) begin, the controller's to
+    /// consume before `first`.
+    pub start: u16,
     pub first: u16,
     pub ntrbs: u16,
     pub ends: TdEnds,
-    /// The next isoch TD to complete.
+    /// The next isoch TD to complete; `mid`: it failed before its last
+    /// TRB, its status is set, and it ends when the controller is seen
+    /// past it.
     pub td: u16,
+    pub mid: bool,
     /// Bytes done so far (a control transfer's short data stage, a stopped
     /// TD).
     pub actual: u32,
@@ -278,7 +287,7 @@ impl Urbs {
     pub fn alloc(&mut self, xfer: Xfer, ring: u16) -> Option<u16> {
         let u = self.free.pop()?;
         self.urbs[u as usize] = Some(Urb {
-            xfer, ring, posted: false, first: 0, ntrbs: 0, ends: TdEnds::new(), td: 0, actual: 0, short: false,
+            xfer, ring, posted: false, start: 0, first: 0, ntrbs: 0, ends: TdEnds::new(), td: 0, mid: false, actual: 0, short: false,
             iso: [abi::IsoStatus::default(); abi::MAX_ISO], errors: 0, next: NONE,
         });
         Some(u)

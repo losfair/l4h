@@ -945,7 +945,7 @@ struct l4h_usb_ctl_req {
 #define L4H_USB_XF_IN           (1u << 0)  /* device to host */
 #define L4H_USB_XF_ZERO_PACKET  (1u << 1)  /* OUT: end with a zero-length packet */
 #define L4H_USB_XF_SHORT_NOT_OK (1u << 2)  /* IN: a short packet is an error */
-#define L4H_USB_XF_ISO_ASAP     (1u << 3)  /* start_frame ignored */
+#define L4H_USB_XF_ISO_ASAP     (1u << 3)  /* no Frame IDs: as soon as possible */
 
 struct l4h_usb_seg {
 	l4h_u64 gpa;            /* in the I/O pool */
@@ -965,7 +965,7 @@ struct l4h_usb_xfer_req {
 	l4h_u8 type;            /* L4H_USB_XFER_* */
 	l4h_u32 flags;          /* L4H_USB_XF_* */
 	l4h_u32 stream;         /* 0: none */
-	l4h_u32 start_frame;
+	l4h_u32 start_frame;    /* ignored: usbd schedules isoch URBs (the CQE says where) */
 	l4h_u32 length;         /* bytes: the segments together */
 	l4h_u16 n_segs;
 	l4h_u16 n_iso;
@@ -1003,7 +1003,8 @@ struct l4h_usb_cqe {
 	l4h_u32 kind;           /* L4H_USB_CQ_* */
 	l4h_s32 status;
 	l4h_u32 actual;         /* bytes transferred */
-	l4h_u32 start_frame;
+	l4h_u32 start_frame;    /* isoch: where usbd scheduled it (frames below high speed,
+	                         * microframes from it, as Linux's xHCI driver) */
 	l4h_u32 error_count;    /* isoch packets with errors */
 	l4h_u32 n_iso;
 	l4h_u32 val[2];

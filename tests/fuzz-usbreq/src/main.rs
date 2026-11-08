@@ -130,6 +130,9 @@ fn shape(rng: &mut Rng) -> EpShape {
         hci_1_0: rng.chance(2),
         full_speed: rng.chance(2),
         period: 1 << rng.below(16),
+        mfindex: rng.below(1 << 14) as u32,
+        ist: rng.below(16) as u32,
+        cfc: rng.chance(2),
     }
 }
 
@@ -159,14 +162,24 @@ fn check_trbs(x: &Xfer, p: &Pool, t: &[Trb], ends: &[u16]) {
     }
     if x.ty != abi::XFER_ISOC {
         assert_eq!(data, x.length as u64, "data TRBs do not add up");
-        assert_eq!(ends.len(), 1);
+        // Bulk or interrupt: a zero-length packet after the data is a TD
+        // of its own.
+        let zlp = ends.len() == 2 && x.ty != abi::XFER_CONTROL && x.flags & abi::XF_ZERO_PACKET != 0 && t[t.len() - 1].len() == 0;
+        assert!(ends.len() == 1 || zlp);
+        if zlp {
+            assert_eq!(ends[0] as usize, t.len() - 2);
+            assert_eq!(t[ends[0] as usize].control & (TRB_CH | TRB_IOC), 0, "data TD before the ZLP chained or with IOC");
+        }
     } else {
         assert_eq!(data, x.iso.iter().map(|&(_, l)| l as u64).sum::<u64>());
         assert_eq!(ends.len(), x.iso.len());
     }
     assert!(ends.windows(2).all(|w| w[0] < w[1]), "TD ends out of order");
     assert_eq!(*ends.last().unwrap() as usize, t.len() - 1);
-    for &e in ends {
+    for &e in &ends[ends.len() - 1..] {
+        assert_eq!(t[e as usize].control & (TRB_CH | TRB_IOC), TRB_IOC, "TD end chained or without IOC");
+    }
+    for &e in ends.iter().take(ends.len() - 1).filter(|_| x.ty == abi::XFER_ISOC) {
         assert_eq!(t[e as usize].control & (TRB_CH | TRB_IOC), TRB_IOC, "TD end chained or without IOC");
     }
 }

@@ -402,7 +402,8 @@ static int ul4h_xfer_put(struct ul4h *ul, struct ul4h_urb *u)
 		flags |= L4H_USB_XF_ISO_ASAP;
 	r->flags = flags;
 	r->stream = urb->stream_id;
-	r->start_frame = urb->start_frame;
+	/* usbd schedules isoch URBs (it reads MFINDEX); the CQE says where. */
+	r->start_frame = 0;
 	r->length = urb->transfer_buffer_length;
 	if (r->type == L4H_USB_XFER_CONTROL)
 		memcpy(r->setup, urb->setup_packet, sizeof(r->setup));

@@ -666,6 +666,7 @@ pub mod usb {
         pub ty: u8,
         pub flags: u32,
         pub stream: u32,
+        /// Ignored: usbd schedules isoch URBs (Cqe::start_frame).
         pub start_frame: u32,
         pub length: u32,
         pub n_segs: u16,
@@ -712,6 +713,8 @@ pub mod usb {
         pub kind: u32,
         pub status: i32,
         pub actual: u32,
+        /// Isoch: where usbd scheduled it (frames below high speed,
+        /// microframes from it, as Linux's xHCI driver).
         pub start_frame: u32,
         pub error_count: u32,
         pub n_iso: u32,
