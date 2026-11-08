@@ -1,5 +1,5 @@
 #!/bin/sh
-# The guest QEMU boots inside dom0 (tests/run-kvmtest.sh qemu).
+# The guest each VMM boots inside dom0 (tests/run-kvmtest.sh vmm).
 /bin/busybox mount -t proc proc /proc
 /bin/busybox mount -t sysfs sys /sys
 /bin/busybox mount -t devtmpfs dev /dev
@@ -11,6 +11,10 @@ for cpu in 0 1; do
 done
 wait
 /bin/busybox sleep 1
-echo "NESTED: $(/bin/busybox cat /proc/interrupts | /bin/busybox grep -c LOC) timer line, $(/bin/busybox du -sm /tmp | /bin/busybox cut -f1) MiB written"
+echo "NESTED: $(/bin/busybox du -sm /tmp | /bin/busybox cut -f1) MiB written"
 echo "NESTED: done"
-/bin/busybox poweroff -f
+# Firecracker stops on a keyboard-controller reset, the others on power off.
+case " $(/bin/busybox cat /proc/cmdline) " in
+*" reboot=k "*) /bin/busybox reboot -f ;;
+*) /bin/busybox poweroff -f ;;
+esac

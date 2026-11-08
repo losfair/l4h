@@ -4,17 +4,43 @@
 /bin/busybox mount -t tmpfs tmp /tmp
 /bin/busybox mount -t devtmpfs dev /dev
 /bin/kvmtest
-# With QEMU in the initramfs (run-kvmtest.sh qemu): boot a Linux guest on
-# /dev/kvm, with its in-kernel irqchip, timers and two vCPUs.
+# With VMMs in the initramfs (run-kvmtest.sh vmm): boot a Linux guest with
+# two vCPUs under each, on /dev/kvm.
+prefix() {
+	while IFS= read -r line; do echo "$1: $line"; done
+}
+args="console=ttyS0 panic=-1 quiet"
 if [ -x /usr/bin/qemu-system-x86_64 ]; then
-	echo "KVMTEST: QEMU start"
+	echo "KVMTEST: VMM qemu"
 	{ /usr/bin/qemu-system-x86_64 -accel kvm -cpu host -m 256 -smp 2 \
 		-display none -vga none -nic none -no-reboot -monitor none -serial stdio \
 		-L /usr/share/seabios -L /usr/share/qemu \
 		-kernel /nested/vmlinuz -initrd /nested/initrd.cpio.gz \
-		-append "console=ttyS0 panic=-1 quiet" </dev/null 2>&1
-	  echo "QEMU exit status $?"; } |
-		while IFS= read -r line; do echo "nested: $line"; done
-	echo "KVMTEST: QEMU done"
+		-append "$args" </dev/null 2>&1
+	  echo "exit status $?"; } | prefix qemu
 fi
+if [ -x /usr/bin/firecracker ]; then
+	echo "KVMTEST: VMM firecracker"
+	cat >/tmp/fc.json <<JSON
+{
+  "boot-source": {
+    "kernel_image_path": "/nested/vmlinux",
+    "initrd_path": "/nested/initrd.cpio.gz",
+    "boot_args": "$args reboot=k pci=off"
+  },
+  "drives": [],
+  "machine-config": { "vcpu_count": 2, "mem_size_mib": 256 }
+}
+JSON
+	{ /usr/bin/firecracker --no-api --config-file /tmp/fc.json </dev/null 2>&1
+	  echo "exit status $?"; } | prefix firecracker
+fi
+if [ -x /usr/bin/cloud-hypervisor ]; then
+	echo "KVMTEST: VMM cloud-hypervisor"
+	{ /usr/bin/cloud-hypervisor --kernel /nested/vmlinux --initramfs /nested/initrd.cpio.gz \
+		--cmdline "$args" --cpus boot=2 --memory size=256M \
+		--serial tty --console off </dev/null 2>&1
+	  echo "exit status $?"; } | prefix cloud-hypervisor
+fi
+echo "KVMTEST: VMMs done"
 /bin/busybox poweroff -f

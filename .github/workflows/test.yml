@@ -114,9 +114,10 @@ jobs:
             if grep -q 'vt-x: unavailable' build/qemu.log; then
               echo "the self-test ran without VT-x"; exit 1
             fi
-            # KVM in dom0; QEMU too where there is a host kernel to boot.
+            # KVM in dom0; QEMU, Firecracker and cloud-hypervisor too where
+            # there is a host kernel to boot.
             if [ -r "/boot/vmlinuz-$(uname -r)" ]; then
-              tests/run-kvmtest.sh qemu
+              tests/run-kvmtest.sh vmm
             else
               tests/run-kvmtest.sh
             fi
