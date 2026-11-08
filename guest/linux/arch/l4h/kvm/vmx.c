@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * KVM's vendor backend for the l4h guest kernel: kvm_x86_ops on seL4 VCPUs
- * (DESIGN.md §5.10).
+ * KVM's VT-x backend for the l4h guest kernel: kvm_x86_ops on seL4 VCPUs
+ * (DESIGN.md §5.10).  svm.c is the AMD-V one; common.c has what they share.
  *
  * The role of arch/x86/kvm/vmx/vmx.c, without VMX instructions: the guest
  * kernel runs in ring 3, seL4 holds the VMCS, and each read or write of a
@@ -46,10 +46,7 @@ struct vmcs_cached {
 };
 
 struct vcpu_l4h {
-	struct kvm_vcpu vcpu;
-	struct l4h_obj obj;
-	u64 id;
-	int bound_cpu;		/* the vCPU whose kTCB it is bound to, or -1 */
+	struct l4h_vcpu_obj base;
 
 	struct vmcs_cached cache[VMCS_CACHE_SIZE];
 	u32 gen;
@@ -63,19 +60,18 @@ struct vcpu_l4h {
 
 	struct l4h_vmexit x;
 	unsigned long rflags, hw_cr2;
-	u64 hw_xcr0;		/* what seL4 loads for VM entries */
 	/* What seL4 has of the general-purpose registers. */
 	unsigned long hw_gp[L4H_VMX_NR_GP];
 };
 
 static inline struct vcpu_l4h *to_l4h(struct kvm_vcpu *vcpu)
 {
-	return container_of(vcpu, struct vcpu_l4h, vcpu);
+	return container_of(vcpu, struct vcpu_l4h, base.vcpu);
 }
 
 static inline unsigned long cap(struct kvm_vcpu *vcpu)
 {
-	return to_l4h(vcpu)->obj.cptr;
+	return to_l4h(vcpu)->base.obj.cptr;
 }
 
 /* ---- the VMCS */
@@ -88,7 +84,7 @@ static unsigned long vmcs_rd(struct kvm_vcpu *vcpu, u32 field)
 
 	if (c->field == field && c->gen == l->gen)
 		return c->value;
-	c->value = l4h_vcpu_read(l->obj.cptr, field, &err);
+	c->value = l4h_vcpu_read(l->base.obj.cptr, field, &err);
 	WARN_ONCE(err, "l4h-kvm: read of VMCS field %x: %d\n", field, err);
 	c->field = field;
 	c->gen = l->gen;
@@ -99,7 +95,7 @@ static void vmcs_wr(struct kvm_vcpu *vcpu, u32 field, unsigned long value)
 {
 	struct vcpu_l4h *l = to_l4h(vcpu);
 	struct vmcs_cached *c = &l->cache[(field ^ (field >> 8)) % VMCS_CACHE_SIZE];
-	int err = l4h_vcpu_write(l->obj.cptr, field, value);
+	int err = l4h_vcpu_write(l->base.obj.cptr, field, value);
 
 	WARN_ONCE(err, "l4h-kvm: write of VMCS field %x: %d\n", field, err);
 	/* seL4 may have adjusted it to the CPU's fixed bits. */
@@ -611,23 +607,6 @@ static int l4h_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr)
 	return kvm_set_msr_common(vcpu, msr);
 }
 
-static bool l4h_has_emulated_msr(struct kvm *kvm, u32 index)
-{
-	switch (index) {
-	case MSR_IA32_VMX_BASIC ... MSR_IA32_VMX_VMFUNC:
-	case MSR_IA32_SMBASE:
-	case MSR_AMD64_VIRT_SPEC_CTRL:
-	case MSR_AMD64_TSC_RATIO:
-		return false;
-	}
-	return true;
-}
-
-static int l4h_get_feature_msr(u32 msr, u64 *data)
-{
-	return KVM_MSR_RET_UNSUPPORTED;
-}
-
 /* ---- TLBs */
 
 /*
@@ -661,65 +640,22 @@ static void l4h_flush_tlb_gva(struct kvm_vcpu *vcpu, gva_t addr)
 
 /* ---- vCPUs */
 
-static atomic64_t next_vcpu_id = ATOMIC64_INIT(1);
-
-/* What each kTCB is set up to run. */
-static DEFINE_PER_CPU(u64, bound_vcpu);
-static DEFINE_PER_CPU(unsigned long, bound_ept);
-
-static void l4h_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
-{
-	struct vcpu_l4h *l = to_l4h(vcpu);
-	unsigned long ktcb = l4h_this_vcpu()->ktcb, root = to_ept(vcpu->kvm)->root;
-
-	/* A binding has two ends: binding the VCPU to another kTCB, or
-	 * another VCPU to this one, undoes it. */
-	if (this_cpu_read(bound_vcpu) != l->id || l->bound_cpu != cpu) {
-		WARN_ON_ONCE(l4h_vcpu_set_tcb(l->obj.cptr, ktcb));
-		this_cpu_write(bound_vcpu, l->id);
-		l->bound_cpu = cpu;
-	}
-	if (this_cpu_read(bound_ept) != root) {
-		WARN_ON_ONCE(l4h_tcb_set_ept(ktcb, root));
-		this_cpu_write(bound_ept, root);
-	}
-}
-
-/*
- * The task may be leaving this vCPU in the middle of KVM_RUN (a preemption,
- * then a migration): its guest's registers must not stay in this kTCB, where
- * the next vCPU would not find them, and from which a later save here would
- * overwrite what the guest did since.
- */
-static void l4h_vcpu_put(struct kvm_vcpu *vcpu)
-{
-	l4h_kvm_fpu_save();
-}
-
 static int l4h_vcpu_create(struct kvm_vcpu *vcpu)
 {
 	struct vcpu_l4h *l = to_l4h(vcpu);
 	u32 sec = SECONDARY_EXEC_ENABLE_EPT | SECONDARY_EXEC_UNRESTRICTED_GUEST |
 		  SECONDARY_EXEC_ENABLE_INVPCID | SECONDARY_EXEC_WBINVD_EXITING;
-	int err;
+	int err = l4h_kvm_vcpu_alloc(&l->base);
 
-	for (;;) {
-		err = l4h_obj_alloc(L4H_OBJ_VCPU, 0, &l->obj);
-		if (err != -ENOMEM || !l4h_objmem_wait())
-			break;
-	}
 	if (err)
 		return err;
-	l->id = atomic64_inc_return(&next_vcpu_id);
-	l->bound_cpu = -1;
-	l->hw_xcr0 = l4h_xfeatures;	/* seL4's for a new VCPU */
 	/* A valid generation is never the initial 0. */
 	l->gen = 1;
 
 	vmcs_wr(vcpu, SECONDARY_VM_EXEC_CONTROL, sec);
 	if (!(vmcs_rd(vcpu, SECONDARY_VM_EXEC_CONTROL) & SECONDARY_EXEC_UNRESTRICTED_GUEST)) {
 		pr_warn_once("the CPU has no unrestricted guest\n");
-		l4h_obj_free(&l->obj);
+		l4h_obj_free(&l->base.obj);
 		return -EOPNOTSUPP;
 	}
 	l->entry_control = VM_ENTRY_LOAD_IA32_PAT | VM_ENTRY_LOAD_IA32_EFER;
@@ -733,11 +669,6 @@ static int l4h_vcpu_create(struct kvm_vcpu *vcpu)
 	vcpu->arch.cr4_guest_owned_bits = 0;
 	vcpu->arch.pat = MSR_IA32_CR_PAT_DEFAULT;
 	return 0;
-}
-
-static void l4h_vcpu_free(struct kvm_vcpu *vcpu)
-{
-	l4h_obj_free(&to_l4h(vcpu)->obj);
 }
 
 static void seg_setup(struct kvm_vcpu *vcpu, int seg)
@@ -800,7 +731,6 @@ static void sync_to_vcpu(struct kvm_vcpu *vcpu)
 	struct vcpu_l4h *l = to_l4h(vcpu);
 	unsigned long *r = vcpu->arch.regs;
 	struct kvm_mmu *mmu = vcpu->arch.walk_mmu;
-	u64 xcr0;
 	unsigned long gp[L4H_VMX_NR_GP] = {
 		[L4H_VMX_RAX] = r[VCPU_REGS_RAX], [L4H_VMX_RBX] = r[VCPU_REGS_RBX],
 		[L4H_VMX_RCX] = r[VCPU_REGS_RCX], [L4H_VMX_RDX] = r[VCPU_REGS_RDX],
@@ -813,7 +743,7 @@ static void sync_to_vcpu(struct kvm_vcpu *vcpu)
 	};
 
 	if (memcmp(gp, l->hw_gp, sizeof(gp))) {
-		WARN_ON_ONCE(l4h_vcpu_write_regs(l->obj.cptr, gp));
+		WARN_ON_ONCE(l4h_vcpu_write_regs(l->base.obj.cptr, gp));
 		memcpy(l->hw_gp, gp, sizeof(gp));
 	}
 	if (kvm_register_is_dirty(vcpu, VCPU_REGS_RSP))
@@ -826,15 +756,9 @@ static void sync_to_vcpu(struct kvm_vcpu *vcpu)
 		vmcs_wr(vcpu, GUEST_PDPTR2, mmu->pdptrs[2]);
 		vmcs_wr(vcpu, GUEST_PDPTR3, mmu->pdptrs[3]);
 	}
-	/* As kvm_load_guest_xsave_state(): XCR0 matters to the guest only with
-	 * CR4.OSXSAVE, and seL4 loads it only around VM entries. */
-	xcr0 = kvm_is_cr4_bit_set(vcpu, X86_CR4_OSXSAVE) ? vcpu->arch.xcr0 : l4h_xfeatures;
-	if (xcr0 != l->hw_xcr0) {
-		WARN_ON_ONCE(l4h_vcpu_write_xcr0(l->obj.cptr, xcr0));
-		l->hw_xcr0 = xcr0;
-	}
+	l4h_kvm_sync_xcr0(vcpu);
 	if (vcpu->arch.cr2 != l->hw_cr2) {
-		WARN_ON_ONCE(l4h_vcpu_write_cr2(l->obj.cptr, vcpu->arch.cr2));
+		WARN_ON_ONCE(l4h_vcpu_write_cr2(l->base.obj.cptr, vcpu->arch.cr2));
 		l->hw_cr2 = vcpu->arch.cr2;
 	}
 	vcpu->arch.regs_dirty = 0;
@@ -927,14 +851,7 @@ static fastpath_t l4h_vcpu_run(struct kvm_vcpu *vcpu, u64 run_flags)
 
 static int internal_error(struct kvm_vcpu *vcpu)
 {
-	struct l4h_vmexit *x = &to_l4h(vcpu)->x;
-
-	vcpu->run->exit_reason = KVM_EXIT_INTERNAL_ERROR;
-	vcpu->run->internal.suberror = KVM_INTERNAL_ERROR_UNEXPECTED_EXIT_REASON;
-	vcpu->run->internal.ndata = 2;
-	vcpu->run->internal.data[0] = x->reason;
-	vcpu->run->internal.data[1] = vcpu->arch.last_vmentry_cpu;
-	return 0;
+	return l4h_kvm_internal_error(vcpu, to_l4h(vcpu)->x.reason);
 }
 
 static int handle_exception(struct kvm_vcpu *vcpu)
@@ -1208,35 +1125,6 @@ static void l4h_get_entry_info(struct kvm_vcpu *vcpu, u32 *intr_info, u32 *error
 
 /* ---- VMs and the rest of the interface */
 
-static void l4h_nop_vcpu(struct kvm_vcpu *vcpu)
-{
-}
-
-static int l4h_vm_init(struct kvm *kvm)
-{
-	return l4h_ept_init(to_ept(kvm));
-}
-
-static void l4h_vm_destroy(struct kvm *kvm)
-{
-}
-
-/* After KVM's last use of the MMU; maybe with no l4h_vm_init() before it. */
-void l4h_kvm_vm_free(struct kvm *kvm)
-{
-	if (to_ept(kvm)->root)
-		l4h_ept_destroy(to_ept(kvm));
-}
-
-static int l4h_ok(void)
-{
-	return 0;
-}
-
-static void l4h_disable_cpu(void)
-{
-}
-
 static void l4h_vcpu_after_set_cpuid(struct kvm_vcpu *vcpu)
 {
 	update_exception_bitmap(vcpu);
@@ -1250,26 +1138,9 @@ static void l4h_refresh_apicv(struct kvm_vcpu *vcpu)
 {
 }
 
-static bool l4h_has_wbinvd_exit(void)
-{
-	return true;
-}
-
-static u64 l4h_l2_zero(struct kvm_vcpu *vcpu)
-{
-	return 0;
-}
-
 static void l4h_write_tsc_offset(struct kvm_vcpu *vcpu)
 {
 	vmcs_wr(vcpu, TSC_OFFSET, vcpu->arch.tsc_offset);
-}
-
-static int l4h_check_intercept(struct kvm_vcpu *vcpu, struct x86_instruction_info *info,
-			       enum x86_intercept_stage stage,
-			       struct x86_exception *exception)
-{
-	return X86EMUL_CONTINUE;
 }
 
 static int l4h_check_emulate_instruction(struct kvm_vcpu *vcpu, int emul_type, void *insn,
@@ -1293,74 +1164,30 @@ static void l4h_setup_mce(struct kvm_vcpu *vcpu)
 {
 }
 
-static bool l4h_init_signal_blocked(struct kvm_vcpu *vcpu)
-{
-	return false;
-}
-
 static void l4h_sync_dirty_debug_regs(struct kvm_vcpu *vcpu)
 {
 }
-
-/* No nested VMX: a guest never enters guest mode, and none of these runs. */
-static bool l4h_is_exception_vmexit(struct kvm_vcpu *vcpu, u8 vector, u32 error_code)
-{
-	return false;
-}
-
-static int l4h_nested_check_events(struct kvm_vcpu *vcpu)
-{
-	return 0;
-}
-
-static int l4h_nested_get_state(struct kvm_vcpu *vcpu, struct kvm_nested_state __user *state,
-				unsigned int size)
-{
-	return -EINVAL;
-}
-
-static int l4h_nested_set_state(struct kvm_vcpu *vcpu, struct kvm_nested_state __user *ustate,
-				struct kvm_nested_state *state)
-{
-	return -EINVAL;
-}
-
-static bool l4h_nested_state_pages(struct kvm_vcpu *vcpu)
-{
-	return true;
-}
-
-static const struct kvm_x86_nested_ops l4h_nested_ops = {
-	.leave_nested = l4h_nop_vcpu,
-	.is_exception_vmexit = l4h_is_exception_vmexit,
-	.check_events = l4h_nested_check_events,
-	.triple_fault = l4h_nop_vcpu,
-	.get_state = l4h_nested_get_state,
-	.set_state = l4h_nested_set_state,
-	.get_nested_state_pages = l4h_nested_state_pages,
-	.hv_inject_synthetic_vmexit_post_tlb_flush = l4h_nop_vcpu,
-};
 
 static struct kvm_x86_ops l4h_x86_ops __initdata = {
 	.nested_ops = &l4h_nested_ops,
 	.name = "l4h",
 	.vm_size = sizeof(struct kvm_l4h),
-	.check_processor_compatibility = l4h_ok,
-	.enable_virtualization_cpu = l4h_ok,
-	.disable_virtualization_cpu = l4h_disable_cpu,
-	.hardware_unsetup = l4h_disable_cpu,
-	.has_emulated_msr = l4h_has_emulated_msr,
+	.check_processor_compatibility = l4h_kvm_ok,
+	.enable_virtualization_cpu = l4h_kvm_ok,
+	.disable_virtualization_cpu = l4h_kvm_nop,
+	.hardware_unsetup = l4h_kvm_nop,
+	.has_emulated_msr = l4h_kvm_has_emulated_msr,
 	.vcpu_after_set_cpuid = l4h_vcpu_after_set_cpuid,
-	.vm_init = l4h_vm_init,
-	.vm_destroy = l4h_vm_destroy,
+	.vm_init = l4h_kvm_vm_init,
+	.vm_destroy = l4h_kvm_nop_vm,
 	.vcpu_create = l4h_vcpu_create,
-	.vcpu_free = l4h_vcpu_free,
+	.vcpu_free = l4h_kvm_vcpu_free,
 	.vcpu_reset = l4h_vcpu_reset,
 	.prepare_switch_to_guest = l4h_prepare_switch,
-	.vcpu_load = l4h_vcpu_load,
-	.vcpu_put = l4h_vcpu_put,
+	.vcpu_load = l4h_kvm_vcpu_load,
+	.vcpu_put = l4h_kvm_vcpu_put,
 	.update_exception_bitmap = update_exception_bitmap,
-	.get_feature_msr = l4h_get_feature_msr,
+	.get_feature_msr = l4h_kvm_get_feature_msr,
 	.get_msr = l4h_get_msr,
 	.set_msr = l4h_set_msr,
 	.get_segment_base = l4h_get_segment_base,
@@ -1408,57 +1235,22 @@ static struct kvm_x86_ops l4h_x86_ops __initdata = {
 	.refresh_apicv_exec_ctrl = l4h_refresh_apicv,
 	.deliver_interrupt = l4h_deliver_interrupt,
 	.load_mmu_pgd = l4h_load_mmu_pgd,
-	.has_wbinvd_exit = l4h_has_wbinvd_exit,
-	.get_l2_tsc_offset = l4h_l2_zero,
-	.get_l2_tsc_multiplier = l4h_l2_zero,
+	.has_wbinvd_exit = l4h_kvm_true,
+	.get_l2_tsc_offset = l4h_kvm_l2_zero,
+	.get_l2_tsc_multiplier = l4h_kvm_l2_zero,
 	.write_tsc_offset = l4h_write_tsc_offset,
-	.write_tsc_multiplier = l4h_nop_vcpu,
+	.write_tsc_multiplier = l4h_kvm_nop_vcpu,
 	.get_exit_info = l4h_get_exit_info,
 	.get_entry_info = l4h_get_entry_info,
-	.check_intercept = l4h_check_intercept,
+	.check_intercept = l4h_kvm_check_intercept,
 	.handle_exit_irqoff = l4h_handle_exit_irqoff,
 	.setup_mce = l4h_setup_mce,
 	.check_emulate_instruction = l4h_check_emulate_instruction,
-	.apic_init_signal_blocked = l4h_init_signal_blocked,
-	.recalc_intercepts = l4h_nop_vcpu,
+	.apic_init_signal_blocked = l4h_kvm_init_signal_blocked,
+	.recalc_intercepts = l4h_kvm_nop_vcpu,
 	.complete_emulated_msr = kvm_complete_insn_gp,
 	.vcpu_deliver_sipi_vector = kvm_vcpu_deliver_sipi_vector,
 };
-
-/* What neither seL4's VCPU interface nor XCR0 lets a guest have. */
-static void __init set_cpu_caps(void)
-{
-	kvm_set_cpu_caps();
-	kvm_cpu_cap_clear(X86_FEATURE_VMX);
-	kvm_cpu_cap_clear(X86_FEATURE_PDCM);
-	kvm_cpu_cap_clear(X86_FEATURE_DS);
-	kvm_cpu_cap_clear(X86_FEATURE_DTES64);
-	kvm_cpu_cap_clear(X86_FEATURE_XSAVES);
-	kvm_cpu_cap_clear(X86_FEATURE_RDTSCP);
-	kvm_cpu_cap_clear(X86_FEATURE_RDPID);
-	kvm_cpu_cap_clear(X86_FEATURE_PKU);
-	kvm_cpu_cap_clear(X86_FEATURE_OSPKE);
-	kvm_cpu_cap_clear(X86_FEATURE_WAITPKG);
-	kvm_cpu_cap_clear(X86_FEATURE_SHSTK);
-	kvm_cpu_cap_clear(X86_FEATURE_IBT);
-	kvm_cpu_cap_clear(X86_FEATURE_INTEL_PT);
-	kvm_cpu_cap_clear(X86_FEATURE_SGX);
-	kvm_cpu_cap_clear(X86_FEATURE_SGX_LC);
-	kvm_cpu_cap_clear(X86_FEATURE_SGX1);
-	kvm_cpu_cap_clear(X86_FEATURE_SGX2);
-	kvm_cpu_cap_clear(X86_FEATURE_MPX);
-	kvm_cpu_cap_clear(X86_FEATURE_LAM);
-	kvm_cpu_cap_clear(X86_FEATURE_FRED);
-	kvm_cpu_cap_clear(X86_FEATURE_LKGS);
-	kvm_cpu_cap_clear(X86_FEATURE_XFD);
-	/* The guest could not switch these MSRs. */
-	kvm_cpu_cap_clear(X86_FEATURE_SPEC_CTRL);
-	kvm_cpu_cap_clear(X86_FEATURE_INTEL_STIBP);
-	kvm_cpu_cap_clear(X86_FEATURE_SPEC_CTRL_SSBD);
-	kvm_cpu_cap_clear(X86_FEATURE_ARCH_CAPABILITIES);
-	kvm_cpu_cap_clear(X86_FEATURE_FLUSH_L1D);
-	kvm_caps.supported_xss = 0;
-}
 
 static int __init l4h_hardware_setup(void)
 {
@@ -1472,42 +1264,9 @@ static int __init l4h_hardware_setup(void)
 	kvm_configure_mmu(true, 0, 4, PG_LEVEL_2M);
 	if (boot_cpu_has(X86_FEATURE_NX))
 		kvm_enable_efer_bits(EFER_NX);
-	set_cpu_caps();
+	l4h_kvm_set_cpu_caps();
 	return 0;
 }
-
-/* No counters: enable_pmu is off, and none of these is called. */
-static struct kvm_pmc *l4h_pmc_none(struct kvm_vcpu *vcpu, unsigned int idx, u64 *mask)
-{
-	return NULL;
-}
-
-static struct kvm_pmc *l4h_msr_pmc_none(struct kvm_vcpu *vcpu, u32 msr)
-{
-	return NULL;
-}
-
-static bool l4h_pmu_msr_invalid(struct kvm_vcpu *vcpu, u32 msr)
-{
-	return false;
-}
-
-static int l4h_pmu_msr_fail(struct kvm_vcpu *vcpu, struct msr_data *msr)
-{
-	return 1;
-}
-
-static struct kvm_pmu_ops l4h_pmu_ops __initdata = {
-	.rdpmc_ecx_to_pmc = l4h_pmc_none,
-	.msr_idx_to_pmc = l4h_msr_pmc_none,
-	.is_valid_msr = l4h_pmu_msr_invalid,
-	.get_msr = l4h_pmu_msr_fail,
-	.set_msr = l4h_pmu_msr_fail,
-	.refresh = l4h_nop_vcpu,
-	.init = l4h_nop_vcpu,
-	.MAX_NR_GP_COUNTERS = 0,
-	.MIN_NR_GP_COUNTERS = 0,
-};
 
 static struct kvm_x86_init_ops l4h_init_ops __initdata = {
 	.hardware_setup = l4h_hardware_setup,
@@ -1515,46 +1274,10 @@ static struct kvm_x86_init_ops l4h_init_ops __initdata = {
 	.pmu_ops = &l4h_pmu_ops,
 };
 
-/* Fill in what x86's boot code would have about the CPU, before KVM's
- * module init reads it (the physical address width, for SPTEs). */
-static int __init cpu_setup(void)
+int __init l4h_vmx_init(void)
 {
-	struct cpuinfo_um *c = &boot_cpu_data;
-	u32 eax, ebx, ecx, edx;
+	int err = kvm_x86_vendor_init(&l4h_init_ops);
 
-	cpuid(0, &eax, &ebx, &ecx, &edx);
-	c->x86_vendor = ebx == 0x756e6547 ? X86_VENDOR_INTEL : X86_VENDOR_AMD;
-	eax = cpuid_eax(1);
-	c->x86 = (eax >> 8) & 15;
-	if (c->x86 == 15)
-		c->x86 += (eax >> 20) & 0xff;
-	c->x86_model = (eax >> 4) & 15;
-	if (c->x86 >= 6)
-		c->x86_model |= (eax >> 12) & 0xf0;
-	c->x86_stepping = eax & 15;
-	c->extended_cpuid_level = cpuid_eax(0x80000000);
-	eax = c->extended_cpuid_level >= 0x80000008 ? cpuid_eax(0x80000008) : 36;
-	c->x86_phys_bits = c->x86_cache_bits = eax & 0xff;
-	c->x86_virt_bits = (eax >> 8) & 0xff;
-	/* MSR_TSC_AUX is the host's: seL4 does not switch it. */
-	clear_bit(X86_FEATURE_RDTSCP, (unsigned long *)c->x86_capability);
-	clear_bit(X86_FEATURE_RDPID, (unsigned long *)c->x86_capability);
-	return 0;
-}
-arch_initcall(cpu_setup);
-
-static int __init l4h_kvm_init(void)
-{
-	int err;
-
-	if (!l4h_bootinfo->nr_ept_roots) {
-		pr_info("no VT-x on this host\n");
-		return 0;
-	}
-	enable_pmu = false;
-	l4h_kvm_fpu_init();
-	l4h_ept_pool_init(l4h_bootinfo->nr_ept_roots);
-	err = kvm_x86_vendor_init(&l4h_init_ops);
 	if (err)
 		return err;
 	err = kvm_init(sizeof(struct vcpu_l4h), __alignof__(struct vcpu_l4h), THIS_MODULE);
@@ -1562,4 +1285,3 @@ static int __init l4h_kvm_init(void)
 		kvm_x86_vendor_exit();
 	return err;
 }
-late_initcall(l4h_kvm_init);

@@ -11,9 +11,9 @@ config KVM
 	depends on !UML_ARM64
 	select KVM_X86
 	help
-	  Provide /dev/kvm on hosts whose CPU has VT-x, for QEMU, Firecracker
-	  and cloud-hypervisor.  A kernel with this option boots everywhere:
-	  /dev/kvm only appears when the host hands out EPT roots.
+	  Provide /dev/kvm on hosts whose CPU has VT-x or AMD-V, for QEMU,
+	  Firecracker and cloud-hypervisor.  A kernel with this option boots
+	  everywhere: /dev/kvm only appears when the host hands out EPT roots.
 
 config KVM_X86
 	bool

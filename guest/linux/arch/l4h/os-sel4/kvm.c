@@ -56,6 +56,31 @@ int l4h_vcpu_flush_tlb(unsigned long vcpu)
 	return seL4_X86_VCPU_FlushTLB(vcpu);
 }
 
+int l4h_vcpu_read_vmcb(unsigned long vcpu, unsigned long offset, unsigned long count,
+		       unsigned long *words)
+{
+	seL4_MessageInfo_t tag = seL4_MessageInfo_new(X86VCPUReadVMCB, 0, 0, 2);
+	unsigned long i;
+
+	seL4_SetMR(0, offset);
+	seL4_SetMR(1, count);
+	tag = seL4_Call(vcpu, tag);
+	if (seL4_MessageInfo_get_label(tag))
+		return seL4_MessageInfo_get_label(tag);
+	for (i = 0; i < count; i++)
+		words[i] = seL4_GetMR(i);
+	return 0;
+}
+
+int l4h_vcpu_write_vmcb(unsigned long vcpu, unsigned long offset, unsigned long value,
+			unsigned long *written)
+{
+	seL4_X86_VCPU_WriteVMCB_t r = seL4_X86_VCPU_WriteVMCB(vcpu, offset, value);
+
+	*written = r.written;
+	return r.error;
+}
+
 int l4h_vcpu_write_regs(unsigned long vcpu, const unsigned long *gp)
 {
 	seL4_VCPUContext c = {
@@ -98,6 +123,7 @@ void l4h_vcpu_enter(struct l4h_vmexit *x, unsigned long rip, unsigned long contr
 	x->idt_vector_info = seL4_GetMR(SEL4_VMENTER_FAULT_IDT_VECTOR_INFO);
 	x->idt_vector_error = seL4_GetMR(SEL4_VMENTER_FAULT_IDT_VECTOR_ERROR);
 	x->cr2 = seL4_GetMR(SEL4_VMENTER_FAULT_CR2);
+	x->cr3 = seL4_GetMR(SEL4_VMENTER_FAULT_CR3_MR);
 }
 
 int l4h_ept_map_table(int level, unsigned long table, unsigned long ept, unsigned long gpa)
