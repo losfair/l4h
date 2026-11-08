@@ -25,7 +25,7 @@
 /* Guest code, assembled here and copied to guest address 0x1000. */
 extern const char rm_start[], rm_end[], lm_start[], lm_end[], probe_start[], probe_end[];
 extern const char fpu_start[], fpu_end[], xcr0_start[], xcr0_end[], smap_start[], smap_end[];
-extern const char state_start[], state_end[];
+extern const char state_start[], state_end[], rdpmc_start[], rdpmc_end[];
 __asm__(".pushsection .rodata\n"
 	/* Real mode: "OK" to port 0x3f8, then hlt. */
 	".code16\n"
@@ -168,6 +168,14 @@ __asm__(".pushsection .rodata\n"
 	"  out %al, %dx\n"
 	"  jmp 1b\n"
 	"state_end:\n"
+	/* RDPMC of counter 0, then its low half to port 0x40. */
+	"rdpmc_start:\n"
+	"  xor %ecx, %ecx\n"
+	"  rdpmc\n"
+	"  mov $0x40, %dx\n"
+	"  out %eax, %dx\n"
+	"  hlt\n"
+	"rdpmc_end:\n"
 	".popsection\n");
 
 static int failures;
@@ -640,6 +648,31 @@ static int state_between_runs(int kvm)
 	return 0;
 }
 
+/*
+ * seL4 always intercepts RDPMC.  KVM emulates it: the counter's value where
+ * there is a PMU, a #GP (here a shutdown, with no IDT) where there is none,
+ * as on l4h, and never an exit the VMM cannot handle.
+ */
+static int rdpmc(int kvm)
+{
+	struct kvm_sregs sregs;
+	struct vm vm;
+
+	if (vm_create(&vm, kvm) || enter_long_mode(&vm, rdpmc_start, rdpmc_end, 0, 0))
+		return -1;
+	CHECK(ioctl(vm.vcpu, KVM_GET_SREGS, &sregs) == 0, "KVM_GET_SREGS");
+	sregs.idt.base = 0;
+	sregs.idt.limit = 0;
+	CHECK(ioctl(vm.vcpu, KVM_SET_SREGS, &sregs) == 0, "KVM_SET_SREGS");
+	CHECK(ioctl(vm.vcpu, KVM_RUN, 0) == 0, "KVM_RUN");
+	CHECK(vm.run->exit_reason == KVM_EXIT_SHUTDOWN ||
+	      (vm.run->exit_reason == KVM_EXIT_IO && vm.run->io.port == 0x40),
+	      "rdpmc: exit %u", vm.run->exit_reason);
+	printf("KVMTEST: rdpmc ok (%s)\n", vm.run->exit_reason == KVM_EXIT_IO ? "read" : "#GP");
+	vm_destroy(&vm);
+	return 0;
+}
+
 struct job {
 	int kvm, ret;
 };
@@ -674,6 +707,7 @@ int main(void)
 	xcr0(kvm);
 	smap_paging(kvm);
 	state_between_runs(kvm);
+	rdpmc(kvm);
 	for (i = 0; i < 2; i++) {
 		jobs[i].kvm = kvm;
 		pthread_create(&t[i], NULL, parallel_vm, &jobs[i]);

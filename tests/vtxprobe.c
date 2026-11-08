@@ -51,9 +51,15 @@ static int is_amd(void)
 #define VMCB_I_MISC1    0x008   /* the exception intercepts, then misc1 */
 #define VMCB_I_MISC2    0x010
 #define VMCB_IOPM       0x040
+#define VMCB_CLEAN      0x0c0
 #define VMCB_CS         0x410
+#define VMCB_IDTR       0x480
+#define VMCB_CR4        0x548
+#define VMCB_CLEAN_DT   (1u << 7)
 #define VMCB_RIP        0x578
+#define SVM_I1_INVD     (1u << 22)
 #define SVM_I1_HLT      (1u << 24)
+#define SVM_EXIT_INVD   0x76
 #define SVM_EXIT_IOIO   0x7b
 #define SVM_EXIT_HLT    0x78
 #define SVM_EXIT_NPF    0x400
@@ -64,8 +70,9 @@ static void check(const char *what, int ok)
 }
 
 /* Run a real-mode guest on the root thread: an OUT, a read of unmapped
- * guest memory and a HLT, each a VM exit to here.  The kernel must keep
- * its intercepts and refuse the VMCB fields it owns. */
+ * guest memory, an INVD that only the kernel intercepts and a HLT, each a
+ * VM exit to here.  The kernel must keep its intercepts and refuse the
+ * VMCB fields it owns. */
 static void svm_probe(seL4_BootInfo *bi, seL4_CPtr ut, seL4_CPtr vcpu, seL4_CPtr pml4,
                       seL4_CPtr pt, seL4_CPtr free)
 {
@@ -73,16 +80,21 @@ static void svm_probe(seL4_BootInfo *bi, seL4_CPtr ut, seL4_CPtr vcpu, seL4_CPtr
         0xb0, 0x42,             /* mov $0x42, %al */
         0xe6, 0x80,             /* out %al, $0x80 */
         0xa0, 0x00, 0x50,       /* mov 0x5000, %al */
+        0x0f, 0x08,             /* invd */
         0xf4,                   /* hlt */
     };
     seL4_CPtr pdpt = free, pd = free + 1, frame = free + 2, copy = free + 3;
     seL4_CPtr vpdpt = free + 4, vpd = free + 5, vpt = free + 6;
     unsigned long va = 0x8000000000ul;
     seL4_X86_VCPU_WriteVMCB_t w;
+    seL4_MessageInfo_t tag;
     seL4_Word badge;
+    int ok;
 
     w = seL4_X86_VCPU_WriteVMCB(vcpu, VMCB_I_MISC2, 0);
     check("svm_forced_intercepts", !w.error && (w.written & 0x7d) == 0x7d);
+    w = seL4_X86_VCPU_WriteVMCB(vcpu, VMCB_I_MISC1, 0);
+    check("svm_forced_invd", !w.error && (w.written >> 32 & SVM_I1_INVD));
     report("svm_owned_field", seL4_X86_VCPU_WriteVMCB(vcpu, VMCB_IOPM, 0).error);
 
     seL4_Untyped_Retype(ut, seL4_X86_EPTPDPTObject, 0, seL4_CapInitThreadCNode, 0, 0, pdpt, 1);
@@ -127,9 +139,32 @@ static void svm_probe(seL4_BootInfo *bi, seL4_CPtr ut, seL4_CPtr vcpu, seL4_CPtr
           seL4_GetMR(SEL4_VMENTER_FAULT_GUEST_PHYSICAL_MR) == 0x5000 &&
           seL4_GetMR(SEL4_VMENTER_CALL_EIP_MR) == 4);
 
+    /* Only HLT requested: INVD must exit anyway. */
     seL4_SetMR(SEL4_VMENTER_CALL_EIP_MR, 7);
+    check("svm_invd", seL4_VMEnter(&badge) == SEL4_VMENTER_RESULT_FAULT &&
+          seL4_GetMR(SEL4_VMENTER_FAULT_REASON_MR) == SVM_EXIT_INVD &&
+          seL4_GetMR(SEL4_VMENTER_CALL_EIP_MR) == 7);
+
+    seL4_SetMR(SEL4_VMENTER_CALL_EIP_MR, 9);
     check("svm_hlt", seL4_VMEnter(&badge) == SEL4_VMENTER_RESULT_FAULT &&
           seL4_GetMR(SEL4_VMENTER_FAULT_REASON_MR) == SVM_EXIT_HLT);
+
+    /* A VMRUN that fails its checks may load nothing: an IDTR written
+     * before it is still not clean for the next VMRUN, which runs. */
+    seL4_X86_VCPU_WriteVMCB(vcpu, VMCB_IDTR + 8, 0x1000);
+    seL4_X86_VCPU_WriteVMCB(vcpu, VMCB_CR4, 1ul << 63);
+    seL4_SetMR(SEL4_VMENTER_CALL_EIP_MR, 9);
+    check("svm_invalid", seL4_VMEnter(&badge) == SEL4_VMENTER_RESULT_FAULT &&
+          seL4_GetMR(SEL4_VMENTER_FAULT_REASON_MR) == 0xffffffff);
+    seL4_X86_VCPU_WriteVMCB(vcpu, VMCB_CR4, 0);
+    seL4_SetMR(SEL4_VMENTER_CALL_EIP_MR, 9);
+    ok = seL4_VMEnter(&badge) == SEL4_VMENTER_RESULT_FAULT &&
+         seL4_GetMR(SEL4_VMENTER_FAULT_REASON_MR) == SVM_EXIT_HLT;
+    seL4_SetMR(0, VMCB_CLEAN);
+    seL4_SetMR(1, 1);
+    tag = seL4_Call(vcpu, seL4_MessageInfo_new(X86VCPUReadVMCB, 0, 0, 2));
+    check("svm_dirty_kept", ok && !seL4_MessageInfo_get_label(tag) &&
+          !(seL4_GetMR(0) & VMCB_CLEAN_DT));
     (void)bi;
 }
 

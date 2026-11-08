@@ -1209,6 +1209,9 @@ static int l4h_handle_exit(struct kvm_vcpu *vcpu, fastpath_t fastpath)
 		return handle_iret(vcpu);
 	case SVM_EXIT_INVD:
 		return kvm_emulate_invd(vcpu);
+	case SVM_EXIT_RDPMC:
+		/* seL4 always intercepts it: with no PMU, a #GP. */
+		return kvm_emulate_rdpmc(vcpu);
 	case SVM_EXIT_PAUSE:
 		return kvm_skip_emulated_instruction(vcpu);
 	case SVM_EXIT_HLT:

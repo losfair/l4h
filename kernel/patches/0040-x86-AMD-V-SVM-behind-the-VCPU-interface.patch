@@ -1,4 +1,4 @@
-From 9d7decd44f7fbec1d872037f53346801e36b9c95 Mon Sep 17 00:00:00 2001
+From 3a6952f888d6ef920ec61e8e8dc360a447216f97 Mon Sep 17 00:00:00 2001
 From: l4h <l4h@localhost>
 Date: Sun, 8 Nov 2026 19:30:53 +0100
 Subject: [PATCH] x86: AMD-V (SVM) behind the VCPU interface
@@ -16,7 +16,8 @@ VMs on both.  32-bit kernels keep VT-x only.
 - ReadVMCB reads up to 64 words of the VMCB, and WriteVMCB writes one,
   by byte offset.  Userspace may write only the fields listed in
   svm_field(), and only some of their bits.  The kernel keeps on the
-  intercepts the host needs: INTR, NMI, SMI, INIT and shutdown, the
+  intercepts the host needs: INTR, NMI, SMI, INIT and shutdown, INVD
+  (which would discard dirty cache lines of seL4 and other guests), the
   permission maps (every port exits, and only the MSRs VMLOAD and
   VMSAVE switch do not), VMRUN, VMLOAD, VMSAVE, CLGI, STGI, SKINIT and
   INVLPGA, which would act on host state or host physical memory in a
@@ -61,7 +62,8 @@ VMs on both.  32-bit kernels keep VT-x only.
 - The CPU may keep VMCB fields from the last VMRUN of a VMCB on a core
   (clean bits).  The kernel clears the bits of the fields each write
   changes, and all of them when the VCPU last ran on another core or
-  another VCPU ran there since.
+  another VCPU ran there since.  A VMRUN that failed its checks may not
+  have loaded the changed fields, so they stay dirty for the next.
 ---
  include/arch/x86/arch/model/statedata.h       |   7 +
  include/arch/x86/arch/object/svm.h            | 154 +++
@@ -73,9 +75,9 @@ VMs on both.  32-bit kernels keep VT-x only.
  src/arch/x86/config.cmake                     |   1 +
  src/arch/x86/kernel/ept.c                     |  21 +-
  src/arch/x86/model/statedata.c                |   6 +
- src/arch/x86/object/svm.c                     | 927 ++++++++++++++++++
+ src/arch/x86/object/svm.c                     | 932 ++++++++++++++++++
  src/arch/x86/object/vcpu.c                    |  69 +-
- 12 files changed, 1255 insertions(+), 23 deletions(-)
+ 12 files changed, 1260 insertions(+), 23 deletions(-)
  create mode 100644 include/arch/x86/arch/object/svm.h
  create mode 100644 src/arch/x86/object/svm.c
 
@@ -535,10 +537,10 @@ index da0b07c6f..c34ff5567 100644
  #ifdef CONFIG_PRINTING
 diff --git a/src/arch/x86/object/svm.c b/src/arch/x86/object/svm.c
 new file mode 100644
-index 000000000..88110f231
+index 000000000..3bdb54266
 --- /dev/null
 +++ b/src/arch/x86/object/svm.c
-@@ -0,0 +1,927 @@
+@@ -0,0 +1,932 @@
 +/*
 + * SPDX-License-Identifier: GPL-2.0-only
 + */
@@ -611,6 +613,7 @@ index 000000000..88110f231
 +#define SVM_I1_SMI              BIT(2)
 +#define SVM_I1_INIT             BIT(3)
 +#define SVM_I1_RDPMC            BIT(15)
++#define SVM_I1_INVD             BIT(22)
 +#define SVM_I1_INVLPGA          BIT(26)
 +#define SVM_I1_IOIO             BIT(27)
 +#define SVM_I1_MSR              BIT(28)
@@ -634,19 +637,19 @@ index 000000000..88110f231
 +
 +/*
 + * The intercepts seL4 keeps on: host interrupts, NMIs, SMIs and INIT must
-+ * leave the guest; a shutdown would reset the core; the counters and debug
++ * leave the guest; a shutdown would reset the core; INVD would discard
++ * dirty cache lines of seL4 and other guests; the counters and debug
 + * registers are not switched; XCR0 takes only values WriteMSR checked; and
 + * nothing makes VMLOAD, VMSAVE, CLGI, STGI, SKINIT and INVLPGA safe in a
-+ * guest.  #DB and #AC
-+ * always exit, as a guest could otherwise loop on them without an exit, and
-+ * #MC belongs to the host.
++ * guest.  #DB and #AC always exit, as a guest could otherwise loop on them
++ * without an exit, and #MC belongs to the host.
 + */
 +#define SVM_I1_FORCED (SVM_I1_INTR | SVM_I1_NMI | SVM_I1_SMI | SVM_I1_INIT | SVM_I1_RDPMC | \
-+                       SVM_I1_INVLPGA | SVM_I1_IOIO | SVM_I1_MSR | SVM_I1_SHUTDOWN)
++                       SVM_I1_INVD | SVM_I1_INVLPGA | SVM_I1_IOIO | SVM_I1_MSR | SVM_I1_SHUTDOWN)
 +/* VINTR, selective CR0, the descriptor table reads and writes, RDTSC,
-+ * PUSHF, POPF, CPUID, RSM, IRET, INTn, INVD, PAUSE, HLT, INVLPG, task
-+ * switches and FERR_FREEZE are userspace's. */
-+#define SVM_I1_WRITABLE ((MASK(15) & ~MASK(4)) | (MASK(26) & ~MASK(16)) | BIT(29) | BIT(30))
++ * PUSHF, POPF, CPUID, RSM, IRET, INTn, PAUSE, HLT, INVLPG, task switches
++ * and FERR_FREEZE are userspace's. */
++#define SVM_I1_WRITABLE ((MASK(15) & ~MASK(4)) | (MASK(26) & ~MASK(16) & ~SVM_I1_INVD) | BIT(29) | BIT(30))
 +#define SVM_I2_FORCED (SVM_I2_VMRUN | SVM_I2_VMLOAD | SVM_I2_VMSAVE | SVM_I2_STGI | SVM_I2_CLGI | \
 +                       SVM_I2_SKINIT | SVM_I2_MONITOR | SVM_I2_MWAIT | SVM_I2_MWAIT_COND | \
 +                       SVM_I2_XSETBV | SVM_I2_RDPRU)
@@ -1263,7 +1266,11 @@ index 000000000..88110f231
 +    assert(vcpu == ARCH_NODE_STATE(x86KSCurrentVCPU));
 +    vcpu_load_host_xcr0(vcpu);
 +    vcpu->gp_registers[VCPU_EAX] = *vmcb_word(vcpu, VMCB_RAX);
-+    vcpu->svm.dirty = 0;
++    /* A VMRUN that failed its checks may not have loaded what changed, so
++     * it stays dirty for the next one, as the ASID flush does. */
++    if (code != SVM_EXIT_INVALID) {
++        vcpu->svm.dirty = 0;
++    }
 +    vcpu->svm.instr_len = next_rip ? next_rip - *vmcb_word(vcpu, VMCB_RIP) : 0;
 +    *vmcb_word(vcpu, VMCB_NEXT_RIP) = 0;
 +    /* A VMRUN that failed its checks may not have flushed. */
