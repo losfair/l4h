@@ -165,6 +165,19 @@ static void svm_probe(seL4_BootInfo *bi, seL4_CPtr ut, seL4_CPtr vcpu, seL4_CPtr
     tag = seL4_Call(vcpu, seL4_MessageInfo_new(X86VCPUReadVMCB, 0, 0, 2));
     check("svm_dirty_kept", ok && !seL4_MessageInfo_get_label(tag) &&
           !(seL4_GetMR(0) & VMCB_CLEAN_DT));
+
+    /* An exit while VMRUN delivers EVENTINJ: interrupt 0x20 pushes its
+     * frame below SP 0, to unmapped guest memory.  The guest's interrupt
+     * shadow must stay clear (no host STI shadow in INT_STATE). */
+    ((volatile unsigned short *)va)[0x80 / 2] = 0x100;
+    ((volatile unsigned short *)va)[0x82 / 2] = 0;
+    seL4_SetMR(SEL4_VMENTER_CALL_EIP_MR, 9);
+    seL4_SetMR(SEL4_VMENTER_CALL_INTERRUPT_INFO_MR, 1u << 31 | 0x20);
+    check("svm_inject_exit", seL4_VMEnter(&badge) == SEL4_VMENTER_RESULT_FAULT &&
+          seL4_GetMR(SEL4_VMENTER_FAULT_REASON_MR) == SVM_EXIT_NPF &&
+          (seL4_GetMR(SEL4_VMENTER_FAULT_IDT_VECTOR_INFO) & (1u << 31 | 0x7ff)) ==
+          (1u << 31 | 0x20) &&
+          !(seL4_GetMR(SEL4_VMENTER_FAULT_GUEST_INT_MR) & 1));
     (void)bi;
 }
 

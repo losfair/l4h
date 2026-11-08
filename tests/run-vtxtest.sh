@@ -90,7 +90,7 @@ if [ "$mode" = on ] && [ "$virt" = svm ]; then
     grep -aq 'vtxprobe: svm_forced_intercepts ok' "$log" || fail "an intercept seL4 needs was cleared"
     grep -aq 'vtxprobe: svm_forced_invd ok' "$log" || fail "the INVD intercept was cleared"
     grep -aq 'vtxprobe: svm_owned_field err=3' "$log" || fail "a kernel-owned VMCB field was written"
-    for step in asid map bind io npf invd hlt invalid dirty_kept; do
+    for step in asid map bind io npf invd hlt invalid dirty_kept inject_exit; do
         grep -aq "vtxprobe: svm_$step ok" "$log" || fail "the guest failed at svm_$step"
     done
 fi

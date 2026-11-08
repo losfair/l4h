@@ -1,4 +1,4 @@
-From 3a6952f888d6ef920ec61e8e8dc360a447216f97 Mon Sep 17 00:00:00 2001
+From dd4500e0162ba87e87f641dd143040a14f806074 Mon Sep 17 00:00:00 2001
 From: l4h <l4h@localhost>
 Date: Sun, 8 Nov 2026 19:30:53 +0100
 Subject: [PATCH] x86: AMD-V (SVM) behind the VCPU interface
@@ -35,11 +35,14 @@ VMs on both.  32-bit kernels keep VT-x only.
   EXITINTINFO.  ReadMSR and WriteMSR reach the syscall MSRs,
   KERNEL_GS_BASE and CR2 in the VMCB, and the VCPU's XCR0 (patch
   0039), which is loaded around VMRUN as around a VT-x entry.
-- restore_svm() runs the guest with CLGI, VMLOAD, STI, VMRUN, then
+- restore_svm() runs the guest with CLGI, STI, VMLOAD, VMRUN, then
   VMSAVE and a VMLOAD of the host's FS, GS, TR, LDTR and syscall MSRs,
   which each core saves the first time it runs a VCPU; only then, on
-  the kernel stack, STGI.  STI before VMRUN is what makes a host
-  interrupt end guest mode, with V_INTR_MASKING always on.  An NMI
+  the kernel stack, STGI.  IF set at VMRUN is what makes a host
+  interrupt end guest mode, with V_INTR_MASKING always on.  The STI
+  comes right after CLGI, not just before VMRUN: a VMRUN that exits
+  while delivering EVENTINJ would leave the STI shadow in the guest's
+  INT_STATE.  An NMI
   that arrived in guest mode is then taken in the kernel, which ignores
   it instead of halting.  The exit goes on as a VT-x one does, through
   c_handle_vmexit(): INTR, NMI, SMI and INIT go back into the guest
@@ -75,9 +78,9 @@ VMs on both.  32-bit kernels keep VT-x only.
  src/arch/x86/config.cmake                     |   1 +
  src/arch/x86/kernel/ept.c                     |  21 +-
  src/arch/x86/model/statedata.c                |   6 +
- src/arch/x86/object/svm.c                     | 932 ++++++++++++++++++
+ src/arch/x86/object/svm.c                     | 935 ++++++++++++++++++
  src/arch/x86/object/vcpu.c                    |  69 +-
- 12 files changed, 1260 insertions(+), 23 deletions(-)
+ 12 files changed, 1263 insertions(+), 23 deletions(-)
  create mode 100644 include/arch/x86/arch/object/svm.h
  create mode 100644 src/arch/x86/object/svm.c
 
@@ -537,10 +540,10 @@ index da0b07c6f..c34ff5567 100644
  #ifdef CONFIG_PRINTING
 diff --git a/src/arch/x86/object/svm.c b/src/arch/x86/object/svm.c
 new file mode 100644
-index 000000000..3bdb54266
+index 000000000..f92638e51
 --- /dev/null
 +++ b/src/arch/x86/object/svm.c
-@@ -0,0 +1,932 @@
+@@ -0,0 +1,935 @@
 +/*
 + * SPDX-License-Identifier: GPL-2.0-only
 + */
@@ -1412,8 +1415,14 @@ index 000000000..3bdb54266
 +    vcpu->gp_registers[VCPU_EAX] = host;
 +
 +    asm volatile(
-+        /* No interrupt or NMI until the host state is back. */
++        /* No interrupt or NMI until the host state is back.  With
++         * V_INTR_MASKING, the host IF at VMRUN decides whether a host
++         * interrupt ends guest mode, so IF is set here, with GIF clear: an
++         * STI just before VMRUN would leave its shadow in the guest's
++         * INT_STATE if an exit came while delivering EVENTINJ (as upstream
++         * KVM found, be45bc4eff33). */
 +        "clgi\n"
++        "sti\n"
 +        "movq %[regs], %%rsp\n"
 +        "popq %%rbx\n"
 +        "popq %%rcx\n"
@@ -1430,9 +1439,6 @@ index 000000000..3bdb54266
 +        "popq %%r14\n"
 +        "popq %%r15\n"
 +        "vmload %%rax\n"
-+        /* With V_INTR_MASKING, the host IF at VMRUN decides whether a host
-+         * interrupt ends guest mode. */
-+        "sti\n"
 +        "vmrun %%rax\n"
 +        "cli\n"
 +        "pushq %%r15\n"
