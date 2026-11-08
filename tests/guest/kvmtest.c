@@ -27,6 +27,7 @@ extern const char rm_start[], rm_end[], lm_start[], lm_end[], probe_start[], pro
 extern const char fpu_start[], fpu_end[], xcr0_start[], xcr0_end[], smap_start[], smap_end[];
 extern const char state_start[], state_end[], rdpmc_start[], rdpmc_end[];
 extern const char nmiss_start[], nmiss_ud[], nmiss_nmi[], nmiss_end[];
+extern const char tpr_start[], tpr_end[], vintr_start[], vintr_ok[], vintr_v0[], vintr_end[];
 __asm__(".pushsection .rodata\n"
 	/* Real mode: "OK" to port 0x3f8, then hlt. */
 	".code16\n"
@@ -189,6 +190,27 @@ __asm__(".pushsection .rodata\n"
 	"nmiss_nmi:\n"
 	"  iretq\n"
 	"nmiss_end:\n"
+	/* Raise CR8, lower it, hlt. */
+	"tpr_start:\n"
+	"  mov $8, %eax\n"
+	"  mov %rax, %cr8\n"
+	"  xor %eax, %eax\n"
+	"  mov %rax, %cr8\n"
+	"  hlt\n"
+	"tpr_end:\n"
+	/* UD2 (with no IDT, a shutdown); then, after a reset, the normal path
+	 * to port 0x40, and a vector 0 handler that goes to port 0x41. */
+	"vintr_start:\n"
+	"  ud2\n"
+	"vintr_ok:\n"
+	"  mov $0x40, %dx\n"
+	"  out %al, %dx\n"
+	"  hlt\n"
+	"vintr_v0:\n"
+	"  mov $0x41, %dx\n"
+	"  out %al, %dx\n"
+	"  hlt\n"
+	"vintr_end:\n"
 	".popsection\n");
 
 static int failures;
@@ -748,6 +770,76 @@ static int nmi_singlestep_event(int kvm)
 	return 0;
 }
 
+/*
+ * Without an in-kernel LAPIC, a guest lowering CR8 exits with
+ * KVM_EXIT_SET_TPR, so the VMM can deliver what the TPR held back;
+ * raising it does not exit.
+ */
+static int tpr_lowered(int kvm)
+{
+	struct vm vm;
+
+	if (vm_create(&vm, kvm) || enter_long_mode(&vm, tpr_start, tpr_end, 0, 0))
+		return -1;
+	CHECK(ioctl(vm.vcpu, KVM_RUN, 0) == 0, "KVM_RUN");
+	CHECK(vm.run->exit_reason == KVM_EXIT_SET_TPR && vm.run->cr8 == 0,
+	      "tpr: exit %u with CR8 %llu, wanted SET_TPR with 0", vm.run->exit_reason,
+	      (unsigned long long)vm.run->cr8);
+	CHECK(ioctl(vm.vcpu, KVM_RUN, 0) == 0, "KVM_RUN");
+	CHECK(vm.run->exit_reason == KVM_EXIT_HLT, "tpr: exit %u after SET_TPR", vm.run->exit_reason);
+	vm_destroy(&vm);
+	printf("KVMTEST: SET_TPR on a lowered CR8 ok\n");
+	return 0;
+}
+
+/*
+ * An IRQ window still open when the VCPU shuts down must not survive the
+ * reset as an interrupt: run with a window requested and IF=0 into a
+ * shutdown, then from the same VCPU with IF=1 and no window, which must
+ * reach port 0x40 and not the vector 0 handler.
+ */
+static int irq_window_reset(int kvm)
+{
+	struct kvm_sregs sregs;
+	struct kvm_regs regs;
+	struct vm vm;
+
+	if (vm_create(&vm, kvm) || enter_long_mode(&vm, vintr_start, vintr_end, 0, 0))
+		return -1;
+	CHECK(ioctl(vm.vcpu, KVM_GET_SREGS, &sregs) == 0, "KVM_GET_SREGS");
+	sregs.idt.base = 0;
+	sregs.idt.limit = 0;
+	CHECK(ioctl(vm.vcpu, KVM_SET_SREGS, &sregs) == 0, "KVM_SET_SREGS");
+	vm.run->request_interrupt_window = 1;
+	CHECK(ioctl(vm.vcpu, KVM_RUN, 0) == 0, "KVM_RUN");
+	CHECK(vm.run->exit_reason == KVM_EXIT_SHUTDOWN, "irq window reset: exit %u, wanted shutdown",
+	      vm.run->exit_reason);
+	vm.run->request_interrupt_window = 0;
+
+	if (enter_long_mode(&vm, vintr_start, vintr_end, 0, 0))
+		return -1;
+	gate64(vm.mem + 0x20000, 0, 0x1000 + (vintr_v0 - vintr_start));
+	((uint64_t *)(vm.mem + 0x21000))[1] = 0x00af9b000000ffff;
+	((uint64_t *)(vm.mem + 0x21000))[2] = 0x00cf93000000ffff;
+	CHECK(ioctl(vm.vcpu, KVM_GET_SREGS, &sregs) == 0, "KVM_GET_SREGS");
+	sregs.idt.base = 0x20000;
+	sregs.idt.limit = 0xfff;
+	sregs.gdt.base = 0x21000;
+	sregs.gdt.limit = 23;
+	CHECK(ioctl(vm.vcpu, KVM_SET_SREGS, &sregs) == 0, "KVM_SET_SREGS");
+	CHECK(ioctl(vm.vcpu, KVM_GET_REGS, &regs) == 0, "KVM_GET_REGS");
+	regs.rip = 0x1000 + (vintr_ok - vintr_start);
+	regs.rflags = 0x202;
+	regs.rsp = 0x30000;
+	CHECK(ioctl(vm.vcpu, KVM_SET_REGS, &regs) == 0, "KVM_SET_REGS");
+	CHECK(ioctl(vm.vcpu, KVM_RUN, 0) == 0, "KVM_RUN");
+	CHECK(vm.run->exit_reason == KVM_EXIT_IO, "irq window reset: exit %u", vm.run->exit_reason);
+	CHECK(vm.run->io.port == 0x40, "irq window reset: an interrupt nobody queued reached the guest");
+	vm_destroy(&vm);
+	printf("KVMTEST: IRQ window across a reset ok\n");
+	return 0;
+}
+
 struct job {
 	int kvm, ret;
 };
@@ -784,6 +876,8 @@ int main(void)
 	state_between_runs(kvm);
 	rdpmc(kvm);
 	nmi_singlestep_event(kvm);
+	tpr_lowered(kvm);
+	irq_window_reset(kvm);
 	for (i = 0; i < 2; i++) {
 		jobs[i].kvm = kvm;
 		pthread_create(&t[i], NULL, parallel_vm, &jobs[i]);

@@ -848,7 +848,10 @@ static void l4h_vcpu_reset(struct kvm_vcpu *vcpu, bool init_event)
 	s->nmi_masked = false;
 	s->awaiting_iret_completion = false;
 	s->nmi_singlestep = false;
-	misc1_update(vcpu, 0, I1(IRET) | I1(VINTR));
+	misc1_update(vcpu, 0, I1(IRET));
+	/* And V_IRQ, or an IRQ window open at the reset would deliver its
+	 * dummy vector 0 once the guest sets IF. */
+	clear_vintr(vcpu);
 	if (!init_event)
 		s->msr_decfg = 0;
 	kvm_set_cr8(vcpu, 0);
@@ -1181,6 +1184,19 @@ static int handle_npf(struct kvm_vcpu *vcpu)
 
 /* As shutdown_interception(): the VMCB is undefined, and seL4 has reset its
  * save area. */
+/* As cr8_write_interception(): with the LAPIC in userspace, a lowered TPR
+ * goes to the VMM, which may have interrupts to deliver now. */
+static int handle_cr8_write(struct kvm_vcpu *vcpu)
+{
+	u8 prev = kvm_get_cr8(vcpu);
+	int r = handle_cr(vcpu);	/* or the emulator, which sets CR8 too */
+
+	if (lapic_in_kernel(vcpu) || prev <= kvm_get_cr8(vcpu))
+		return r;
+	vcpu->run->exit_reason = KVM_EXIT_SET_TPR;
+	return 0;
+}
+
 static int handle_shutdown(struct kvm_vcpu *vcpu)
 {
 	to_svm(vcpu)->gen++;
@@ -1194,6 +1210,8 @@ static int l4h_handle_exit(struct kvm_vcpu *vcpu, fastpath_t fastpath)
 	struct l4h_vmexit *x = &to_svm(vcpu)->x;
 	u32 reason = x->reason;
 
+	if (reason == SVM_EXIT_WRITE_CR8)
+		return handle_cr8_write(vcpu);
 	if (reason >= SVM_EXIT_READ_CR0 && reason <= SVM_EXIT_WRITE_CR0 + 15)
 		return handle_cr(vcpu);
 	if (reason >= SVM_EXIT_READ_DR0 && reason <= SVM_EXIT_WRITE_DR0 + 15)
