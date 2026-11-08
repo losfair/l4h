@@ -1,0 +1,20 @@
+#!/bin/sh
+/bin/busybox mount -t proc proc /proc
+/bin/busybox mount -t sysfs sys /sys
+/bin/busybox mount -t tmpfs tmp /tmp
+/bin/busybox mount -t devtmpfs dev /dev
+/bin/kvmtest
+# With QEMU in the initramfs (run-kvmtest.sh qemu): boot a Linux guest on
+# /dev/kvm, with its in-kernel irqchip, timers and two vCPUs.
+if [ -x /usr/bin/qemu-system-x86_64 ]; then
+	echo "KVMTEST: QEMU start"
+	{ /usr/bin/qemu-system-x86_64 -accel kvm -cpu host -m 256 -smp 2 \
+		-display none -vga none -nic none -no-reboot -monitor none -serial stdio \
+		-L /usr/share/seabios -L /usr/share/qemu \
+		-kernel /nested/vmlinuz -initrd /nested/initrd.cpio.gz \
+		-append "console=ttyS0 panic=-1 quiet" </dev/null 2>&1
+	  echo "QEMU exit status $?"; } |
+		while IFS= read -r line; do echo "nested: $line"; done
+	echo "KVMTEST: QEMU done"
+fi
+/bin/busybox poweroff -f

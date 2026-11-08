@@ -92,6 +92,16 @@ struct cpuinfo_um {
 		__u32		x86_capability[NCAPINTS + NBUGINTS];
 		unsigned long	x86_capability_alignment;
 	};
+	/* From CPUID, for arch/x86/kvm (kvm/init.c). */
+	__u8			x86;
+	__u8			x86_vendor;
+	__u8			x86_model;
+	__u8			x86_stepping;
+	__u8			x86_phys_bits;
+	__u8			x86_virt_bits;
+	__u8			x86_cache_bits;
+	__u16			x86_power;
+	__u32			extended_cpuid_level;
 };
 
 extern struct cpuinfo_um boot_cpu_data;

@@ -74,6 +74,7 @@ USER_CFLAGS = $(patsubst -I%,,$(filter-out -mcmodel=large -nostdinc -fno-builtin
 		-idirafter $(objtree)/include -D__KERNEL__ -D__UM_HOST__
 
 core-y += $(ARCH_DIR)/x86/
+core-$(CONFIG_KVM) += $(HOST_DIR)/kvm/ $(ARCH_DIR)/kvm/
 # x86 SIMD crypto (AES-NI, ...): needs CONFIG_L4H_X86_SIMD, selected per algorithm.
 core-$(CONFIG_CRYPTO) += $(HOST_DIR)/crypto/
 # The x86-64 BPF JIT, with x86/bpf_jit.c.

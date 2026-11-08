@@ -60,6 +60,9 @@ static inline bool irq_fpu_usable(void)
 #define KFPU_387	_BITUL(0)	/* 387 state will be initialized */
 #define KFPU_MXCSR	_BITUL(1)	/* MXCSR will be initialized */
 
+/* A KVM guest's registers may be in the kTCB's (arch/l4h/kvm/fpu.c). */
+void l4h_kvm_fpu_save(void);
+
 extern void kernel_fpu_begin_mask(unsigned int kfpu_mask);
 extern void kernel_fpu_end(void);
 extern bool irq_fpu_usable(void);

@@ -42,4 +42,6 @@ config ARCH_REUSE_HOST_VSYSCALL_AREA
 config GENERIC_HWEIGHT
 	def_bool y
 
+source "arch/l4h/kvm/Kconfig"
+
 endif

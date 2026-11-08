@@ -175,7 +175,8 @@ static int obj_class(int type, int bits)
 {
 	int c;
 
-	if (type == L4H_OBJ_PT || type == L4H_OBJ_PD || type == L4H_OBJ_PDPT)
+	if (type == L4H_OBJ_PT || type == L4H_OBJ_PD || type == L4H_OBJ_PDPT ||
+	    type == L4H_OBJ_EPT_PT || type == L4H_OBJ_EPT_PD || type == L4H_OBJ_EPT_PDPT)
 		return CLASS_PT;
 	if (bits == L4H_BLOCK_SHIFT && (type == L4H_OBJ_UNTYPED || type == L4H_OBJ_LARGE_FRAME))
 		return CLASS_LARGE;
