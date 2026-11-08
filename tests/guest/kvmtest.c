@@ -24,7 +24,7 @@
 
 /* Guest code, assembled here and copied to guest address 0x1000. */
 extern const char rm_start[], rm_end[], lm_start[], lm_end[], probe_start[], probe_end[];
-extern const char fpu_start[], fpu_end[];
+extern const char fpu_start[], fpu_end[], xcr0_start[], xcr0_end[], smap_start[], smap_end[];
 __asm__(".pushsection .rodata\n"
 	/* Real mode: "OK" to port 0x3f8, then hlt. */
 	".code16\n"
@@ -100,6 +100,63 @@ __asm__(".pushsection .rodata\n"
 	"  out %eax, %dx\n"
 	"  hlt\n"
 	"fpu_end:\n"
+	/* CPUID's OSXSAVE bit with CR4.OSXSAVE set (port 0x42) and clear
+	 * (0x43); then XSETBV(3) and XGETBV (0x40), CPUID 0xD.0's XSAVE size
+	 * (0x41), and an XSAVE of everything to 0x40000. */
+	"xcr0_start:\n"
+	"  mov %cr4, %rax\n"
+	"  or $0x40000, %rax\n"
+	"  mov %rax, %cr4\n"
+	"  mov $1, %eax\n"
+	"  cpuid\n"
+	"  mov %ecx, %eax\n"
+	"  mov $0x42, %dx\n"
+	"  out %eax, %dx\n"
+	"  mov %cr4, %rax\n"
+	"  and $~0x40000, %rax\n"
+	"  mov %rax, %cr4\n"
+	"  mov $1, %eax\n"
+	"  cpuid\n"
+	"  mov %ecx, %eax\n"
+	"  mov $0x43, %dx\n"
+	"  out %eax, %dx\n"
+	"  mov %cr4, %rax\n"
+	"  or $0x40000, %rax\n"
+	"  mov %rax, %cr4\n"
+	"  xor %ecx, %ecx\n"
+	"  xor %edx, %edx\n"
+	"  mov $3, %eax\n"
+	"  xsetbv\n"
+	"  xor %ecx, %ecx\n"
+	"  xgetbv\n"
+	"  mov $0x40, %dx\n"
+	"  out %eax, %dx\n"
+	"  mov $0xd, %eax\n"
+	"  xor %ecx, %ecx\n"
+	"  cpuid\n"
+	"  mov %ebx, %eax\n"
+	"  mov $0x41, %dx\n"
+	"  out %eax, %dx\n"
+	"  mov $-1, %eax\n"
+	"  mov $-1, %edx\n"
+	"  mov $0x40000, %rbx\n"
+	"  xsave (%rbx)\n"
+	"  hlt\n"
+	"xcr0_end:\n"
+	/* 32-bit protected mode with SMAP set before paging: turn paging on,
+	 * then read a user page in ring 0, which must fault. */
+	".code32\n"
+	"smap_start:\n"
+	"  mov %cr0, %eax\n"
+	"  or $0x80000000, %eax\n"
+	"  mov %eax, %cr0\n"
+	"  jmp 1f\n"
+	"1: mov 0x400000, %eax\n"
+	"  mov $0x50, %dx\n"
+	"  out %eax, %dx\n"
+	"  hlt\n"
+	"smap_end:\n"
+	".code64\n"
 	".popsection\n");
 
 static int failures;
@@ -386,6 +443,83 @@ static int dirty_log(int kvm)
 	return 0;
 }
 
+/* XCR0 is the guest's, and CPUID's dynamic bits follow it and CR4: a
+ * guest that sets XCR0 to x87|SSE gets a 576-byte XSAVE area, and XSAVE
+ * writes no further. */
+static int xcr0(int kvm)
+{
+	uint32_t xgetbv = 0, size = 0, osxsave_on = 0, osxsave_off = ~0u;
+	struct vm vm;
+	int i;
+
+	if (vm_create(&vm, kvm) || enter_long_mode(&vm, xcr0_start, xcr0_end, 0, 0))
+		return -1;
+	memset(vm.mem + 0x40000, 0xaa, 4096);
+	for (;;) {
+		uint32_t v;
+
+		CHECK(ioctl(vm.vcpu, KVM_RUN, 0) == 0, "KVM_RUN");
+		if (vm.run->exit_reason != KVM_EXIT_IO)
+			break;
+		v = *(uint32_t *)((char *)vm.run + vm.run->io.data_offset);
+		switch (vm.run->io.port) {
+		case 0x40: xgetbv = v; break;
+		case 0x41: size = v; break;
+		case 0x42: osxsave_on = v; break;
+		case 0x43: osxsave_off = v; break;
+		}
+	}
+	CHECK(vm.run->exit_reason == KVM_EXIT_HLT, "xcr0: exit %u", vm.run->exit_reason);
+	CHECK(osxsave_on & (1u << 27), "xcr0: CPUID OSXSAVE clear with CR4.OSXSAVE set");
+	CHECK(!(osxsave_off & (1u << 27)), "xcr0: CPUID OSXSAVE set with CR4.OSXSAVE clear");
+	CHECK(xgetbv == 3, "xcr0: XGETBV %x after XSETBV(3)", xgetbv);
+	CHECK(size == 576, "xcr0: CPUID 0xD reports %u bytes for x87|SSE", size);
+	for (i = 576; i < 4096; i++)
+		CHECK(vm.mem[0x40000 + i] == 0xaa, "xcr0: XSAVE wrote byte %d of a %u-byte area", i, size);
+	vm_destroy(&vm);
+	printf("KVMTEST: xcr0 ok\n");
+	return 0;
+}
+
+/*
+ * SMEP and SMAP set while paging is off take effect when the guest turns
+ * paging on: the read of a user page must fault (and, with no IDT, end in a
+ * shutdown) rather than reach port 0x50.
+ */
+static int smap_paging(int kvm)
+{
+	struct kvm_sregs sregs;
+	struct kvm_regs regs = { .rip = 0x1000, .rflags = 2 };
+	uint32_t *pd;
+	struct vm vm;
+
+	if (vm_create(&vm, kvm))
+		return -1;
+	memcpy(vm.mem + 0x1000, smap_start, smap_end - smap_start);
+	pd = (uint32_t *)(vm.mem + 0x10000);
+	pd[0] = 0x00000083;		/* 4 MiB, supervisor */
+	pd[1] = 0x00400087;		/* 4 MiB, user */
+	CHECK(ioctl(vm.vcpu, KVM_GET_SREGS, &sregs) == 0, "KVM_GET_SREGS");
+	sregs.cr0 = 0x11;		/* PE, ET */
+	sregs.cr3 = 0x10000;
+	sregs.cr4 = (1 << 4) | (1 << 21);	/* PSE, SMAP */
+	sregs.efer = 0;
+	seg64(&sregs.cs, 1);
+	sregs.cs.l = 0;
+	sregs.cs.db = 1;
+	seg64(&sregs.ds, 0);
+	sregs.es = sregs.fs = sregs.gs = sregs.ss = sregs.ds;
+	CHECK(ioctl(vm.vcpu, KVM_SET_SREGS, &sregs) == 0, "KVM_SET_SREGS");
+	CHECK(ioctl(vm.vcpu, KVM_SET_REGS, &regs) == 0, "KVM_SET_REGS");
+	CHECK(ioctl(vm.vcpu, KVM_RUN, 0) == 0, "KVM_RUN");
+	CHECK(!(vm.run->exit_reason == KVM_EXIT_IO && vm.run->io.port == 0x50),
+	      "smap: a ring-0 read of a user page succeeded after paging was turned on");
+	CHECK(vm.run->exit_reason == KVM_EXIT_SHUTDOWN, "smap: exit %u", vm.run->exit_reason);
+	vm_destroy(&vm);
+	printf("KVMTEST: smap across paging ok\n");
+	return 0;
+}
+
 struct mover {
 	pthread_t target;
 	volatile int stop;
@@ -472,6 +606,8 @@ int main(void)
 	slot_replace(kvm);
 	dirty_log(kvm);
 	fpu_migrate(kvm);
+	xcr0(kvm);
+	smap_paging(kvm);
 	for (i = 0; i < 2; i++) {
 		jobs[i].kvm = kvm;
 		pthread_create(&t[i], NULL, parallel_vm, &jobs[i]);

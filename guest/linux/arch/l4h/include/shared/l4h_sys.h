@@ -219,6 +219,7 @@ int l4h_vcpu_write(unsigned long vcpu, unsigned long field, unsigned long value)
 int l4h_vcpu_read_msr(unsigned long vcpu, unsigned long msr, unsigned long *value);
 int l4h_vcpu_write_msr(unsigned long vcpu, unsigned long msr, unsigned long value);
 int l4h_vcpu_write_cr2(unsigned long vcpu, unsigned long value);
+int l4h_vcpu_write_xcr0(unsigned long vcpu, unsigned long long value);
 int l4h_vcpu_flush_tlb(unsigned long vcpu);
 int l4h_vcpu_write_regs(unsigned long vcpu, const unsigned long *gp);
 void l4h_vcpu_enter(struct l4h_vmexit *x, unsigned long rip, unsigned long controls,

@@ -46,6 +46,11 @@ int l4h_vcpu_write_cr2(unsigned long vcpu, unsigned long value)
 	return l4h_vcpu_write_msr(vcpu, SEL4_VCPU_MSR_CR2, value);
 }
 
+int l4h_vcpu_write_xcr0(unsigned long vcpu, unsigned long long value)
+{
+	return l4h_vcpu_write_msr(vcpu, SEL4_VCPU_MSR_XCR0, value);
+}
+
 int l4h_vcpu_flush_tlb(unsigned long vcpu)
 {
 	return seL4_X86_VCPU_FlushTLB(vcpu);

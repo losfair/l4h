@@ -63,6 +63,7 @@ struct vcpu_l4h {
 
 	struct l4h_vmexit x;
 	unsigned long rflags, hw_cr2;
+	u64 hw_xcr0;		/* what seL4 loads for VM entries */
 	/* What seL4 has of the general-purpose registers. */
 	unsigned long hw_gp[L4H_VMX_NR_GP];
 };
@@ -270,16 +271,21 @@ static bool l4h_is_valid_cr4(struct kvm_vcpu *vcpu, unsigned long cr4)
 	return !(cr4 & X86_CR4_VMXE);
 }
 
+/*
+ * As vmx_set_cr4() with an unrestricted guest: the CPU itself ignores SMEP,
+ * SMAP and PKE while CR0.PG=0, so they stay as the guest set them.
+ */
 static void l4h_set_cr4(struct kvm_vcpu *vcpu, unsigned long cr4)
 {
-	unsigned long hw = cr4 | X86_CR4_VMXE;
+	unsigned long old = kvm_read_cr4(vcpu);
 
 	vcpu->arch.cr4 = cr4;
 	kvm_register_mark_available(vcpu, VCPU_EXREG_CR4);
-	if (!is_paging(vcpu))
-		hw &= ~(X86_CR4_SMEP | X86_CR4_SMAP | X86_CR4_PKE);
 	vmcs_wr(vcpu, CR4_READ_SHADOW, cr4);
-	vmcs_wr(vcpu, GUEST_CR4, hw);
+	vmcs_wr(vcpu, GUEST_CR4, cr4 | X86_CR4_VMXE);
+	/* CPUID.1:ECX.OSXSAVE and CPUID.7:ECX.OSPKE follow them. */
+	if ((cr4 ^ old) & (X86_CR4_OSXSAVE | X86_CR4_PKE))
+		vcpu->arch.cpuid_dynamic_bits_dirty = true;
 }
 
 /* The EPT root is the kTCB's (vcpu_load): this only keeps CR3 current. */
@@ -625,11 +631,18 @@ static int l4h_get_feature_msr(u32 msr, u64 *data)
 /* ---- TLBs */
 
 /*
- * Page table changes are flushed where they are made: seL4 invalidates every
- * core that has entered a VM when it removes an EPT leaf or table (patch
- * 0039), before ept.c returns.  Adding one needs nothing, as no TLB holds a
+ * flush_tlb_all serves KVM_REQ_TLB_FLUSH, which the common code raises only
+ * from kvm_flush_remote_tlbs(), after a change to the TDP page table.  Those
+ * are flushed where they are made: seL4 invalidates every core that has
+ * entered a VM when it removes an EPT leaf or table (patch 0039), before
+ * ept.c returns, and adding one needs nothing, as no TLB holds a
  * not-present entry.  tests/guest/kvmtest.c checks both (slot_replace,
  * dirty_log).
+ *
+ * Everything else is a flush of what the guest's own paging produced (after
+ * CR4 or PCID changes, KVM_REQ_TLB_FLUSH_CURRENT and _GUEST), which no EPT
+ * change does: that is a real invept.  seL4 also flushes a VCPU's VPID when
+ * it moves to another core.
  */
 static void l4h_flush_tlb_noop(struct kvm_vcpu *vcpu)
 {
@@ -699,6 +712,7 @@ static int l4h_vcpu_create(struct kvm_vcpu *vcpu)
 		return err;
 	l->id = atomic64_inc_return(&next_vcpu_id);
 	l->bound_cpu = -1;
+	l->hw_xcr0 = l4h_xfeatures;	/* seL4's for a new VCPU */
 	/* A valid generation is never the initial 0. */
 	l->gen = 1;
 
@@ -786,6 +800,7 @@ static void sync_to_vcpu(struct kvm_vcpu *vcpu)
 	struct vcpu_l4h *l = to_l4h(vcpu);
 	unsigned long *r = vcpu->arch.regs;
 	struct kvm_mmu *mmu = vcpu->arch.walk_mmu;
+	u64 xcr0;
 	unsigned long gp[L4H_VMX_NR_GP] = {
 		[L4H_VMX_RAX] = r[VCPU_REGS_RAX], [L4H_VMX_RBX] = r[VCPU_REGS_RBX],
 		[L4H_VMX_RCX] = r[VCPU_REGS_RCX], [L4H_VMX_RDX] = r[VCPU_REGS_RDX],
@@ -810,6 +825,13 @@ static void sync_to_vcpu(struct kvm_vcpu *vcpu)
 		vmcs_wr(vcpu, GUEST_PDPTR1, mmu->pdptrs[1]);
 		vmcs_wr(vcpu, GUEST_PDPTR2, mmu->pdptrs[2]);
 		vmcs_wr(vcpu, GUEST_PDPTR3, mmu->pdptrs[3]);
+	}
+	/* As kvm_load_guest_xsave_state(): XCR0 matters to the guest only with
+	 * CR4.OSXSAVE, and seL4 loads it only around VM entries. */
+	xcr0 = kvm_is_cr4_bit_set(vcpu, X86_CR4_OSXSAVE) ? vcpu->arch.xcr0 : l4h_xfeatures;
+	if (xcr0 != l->hw_xcr0) {
+		WARN_ON_ONCE(l4h_vcpu_write_xcr0(l->obj.cptr, xcr0));
+		l->hw_xcr0 = xcr0;
 	}
 	if (vcpu->arch.cr2 != l->hw_cr2) {
 		WARN_ON_ONCE(l4h_vcpu_write_cr2(l->obj.cptr, vcpu->arch.cr2));
@@ -1363,7 +1385,7 @@ static struct kvm_x86_ops l4h_x86_ops __initdata = {
 	.set_rflags = l4h_set_rflags,
 	.get_if_flag = l4h_get_if_flag,
 	.flush_tlb_all = l4h_flush_tlb_noop,
-	.flush_tlb_current = l4h_flush_tlb_noop,
+	.flush_tlb_current = l4h_flush_tlb_guest,
 	.flush_tlb_gva = l4h_flush_tlb_gva,
 	.flush_tlb_guest = l4h_flush_tlb_guest,
 	.vcpu_pre_run = l4h_vcpu_pre_run,
