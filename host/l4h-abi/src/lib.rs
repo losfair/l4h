@@ -691,8 +691,9 @@ pub mod usb {
     pub const ST_MISSED: i32 = -18;
     pub const ST_NOSPC: i32 = -28;
     pub const ST_IO: i32 = -5;
-    /// URB_CANCEL: the URB is not accepted yet (behind a full CQ): ask again.
-    pub const ST_AGAIN: i32 = -11;
+    /// URB_CANCEL of an URB still in the transfer SQ: usbd skips its
+    /// record and never completes it (the guest gives it back).
+    pub const ST_DROPPED: i32 = -125;
 
     pub const CQ_CTL: u32 = 1;
     pub const CQ_XFER: u32 = 2;

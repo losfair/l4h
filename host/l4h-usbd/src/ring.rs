@@ -97,19 +97,37 @@ impl Rings {
         (pos + USABLE - first) % USABLE
     }
 
-    /// Whether `n` more TRBs fit, leaving one free so that a full ring is
+    /// Whether an URB of `n` TRBs fits (with the no-ops before it, if it
+    /// would cross the Link TRB), leaving one free so that a full ring is
     /// never mistaken for an empty one.
     pub fn room(&self, r: u16, n: usize) -> bool {
         let ring = &self.rings[r as usize];
         let used = (ring.enq + USABLE - ring.deq) % USABLE;
-        n + used as usize + 1 < USABLE as usize
+        let to_end = (USABLE - ring.enq) as usize;
+        let pad = if n > to_end { to_end } else { 0 };
+        n + pad + used as usize + 1 < USABLE as usize
     }
 
     /// Write `trbs` at the enqueue pointer: the first TRB's cycle bit last,
-    /// so that the controller never sees half a TD.  Returns where it went.
+    /// so that the controller never sees half a TD.  An URB that would
+    /// cross the Link TRB goes at the start of the ring instead, after
+    /// no-ops to the end (`room` counted them).  Returns where it went.
     pub fn write(&mut self, dma: Region, r: u16, trbs: &[Trb]) -> u16 {
         let off = dma.ring(r as usize);
         let ring = &mut self.rings[r as usize];
+        if trbs.len() > (USABLE - ring.enq) as usize {
+            while ring.enq < USABLE {
+                let e = Mmio(dma.va(off + ring.enq as usize * 16));
+                e.w64(0, 0);
+                e.w32(8, 0);
+                e.w32(12, (proto::TRB_NOOP << 10) | ring.cycle);
+                ring.enq += 1;
+            }
+            dma_fence(Ordering::SeqCst);
+            Mmio(dma.va(off + USABLE as usize * 16)).w32(12, (proto::TRB_LINK << 10) | proto::TRB_TC | ring.cycle);
+            ring.cycle ^= 1;
+            ring.enq = 0;
+        }
         let (first, first_cycle) = (ring.enq, ring.cycle);
         for (k, t) in trbs.iter().enumerate() {
             let e = Mmio(dma.va(off + ring.enq as usize * 16));
@@ -119,9 +137,10 @@ impl Rings {
             e.w32(12, (t.control & !proto::TRB_CYCLE) | cycle);
             ring.enq += 1;
             if ring.enq == USABLE {
-                // The Link TRB is part of a TD that goes on past it.
-                let ch = t.control & proto::TRB_CH;
-                Mmio(dma.va(off + USABLE as usize * 16)).w32(12, (proto::TRB_LINK << 10) | proto::TRB_TC | ch | ring.cycle);
+                // The URB ends right before the Link TRB: no TD goes on
+                // past it.
+                debug_assert!(k + 1 == trbs.len());
+                Mmio(dma.va(off + USABLE as usize * 16)).w32(12, (proto::TRB_LINK << 10) | proto::TRB_TC | ring.cycle);
                 ring.cycle ^= 1;
                 ring.enq = 0;
             }

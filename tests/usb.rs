@@ -35,7 +35,7 @@ fn xfer(ty: u8, dci: u8, segs: &[(u64, u32)]) -> abi::XferReq {
     r
 }
 
-const EP: EpShape = EpShape { max_packet: 512, burst: 1, mult: 1, hci_1_0: true };
+const EP: EpShape = EpShape { max_packet: 512, burst: 1, mult: 1, hci_1_0: true, full_speed: false, period: 1 };
 
 #[test]
 fn walk_ends_on_loops_and_out_of_bounds() {
@@ -255,6 +255,30 @@ fn isoch_tds() {
 }
 
 #[test]
+fn isoch_frame_ids() {
+    // High speed, interval 1 microframe, from microframe 80: frames 10, 10.
+    let hs = EpShape { max_packet: 192, period: 1, ..EP };
+    assert_eq!((0..9).map(|k| iso_frame(&hs, 80, k)).collect::<Vec<_>>(), [10, 10, 10, 10, 10, 10, 10, 10, 11]);
+    // High speed, every 4 microframes: two packets a frame.
+    let hs4 = EpShape { period: 4, ..hs };
+    assert_eq!((0..4).map(|k| iso_frame(&hs4, 80, k)).collect::<Vec<_>>(), [10, 10, 11, 11]);
+    // Full speed, every frame (8 microframes), start in frames; wraps at 2048.
+    let fs = EpShape { full_speed: true, period: 8, ..hs };
+    assert_eq!((0..3).map(|k| iso_frame(&fs, 2047, k)).collect::<Vec<_>>(), [2047, 0, 1]);
+    // In the TRBs: a non-ASAP high-speed URB from microframe 80.
+    let p = pool();
+    let mut i = xfer(abi::XFER_ISOC, 3, &[(p.gpa, 2 * 192)]);
+    i.flags = abi::XF_IN;
+    i.start_frame = 80;
+    i.n_iso = 2;
+    for k in 0..2 {
+        i.iso[k] = abi::Iso { offset: 192 * k as u32, len: 192 };
+    }
+    let (t, _) = trbs(&check_xfer(&i, &p, MAX_TRANSFER).unwrap(), &hs);
+    assert_eq!(t.iter().map(|t| (t.control >> 20) & 0x7ff).collect::<Vec<_>>(), [10, 10]);
+}
+
+#[test]
 fn too_many_trbs_refused() {
     // 64 segments, each crossing several 64 KiB boundaries, beyond
     // MAX_URB_TRBS.
@@ -310,5 +334,5 @@ fn port_writes_only_allowed_bits() {
 fn dma_region_sizes() {
     assert_eq!(dma_bytes(32, 0, 4096), 4 << 20);
     assert_eq!(dma_bytes(255, 1023, 4096).count_ones(), 1);
-    assert!(dma_bytes(64, 256, 4096) >= FIXED_BYTES + 64 * 4096 + USB_RINGS * 4096 + 257 * 4096);
+    assert!(dma_bytes(64, 256, 4096) >= FIXED_BYTES + 64 * 4096 + USB_RINGS * RING_BYTES + 257 * 4096);
 }

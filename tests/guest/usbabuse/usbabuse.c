@@ -300,10 +300,11 @@ static int run(struct q *q)
 	kick(q);
 	check(wait_cq(q, 1, 2000) && pop(q) == L4H_USB_ST_NODEV, "after a wild CQ tail");
 
-	/* Flood: three SQs' worth without consuming: usbd stops at the CQ's
-	 * size, then serves the rest as we consume. */
+	/* Flood: three SQs' worth without consuming: usbd stops one short of
+	 * the CQ's size (an entry is kept for control requests), then serves
+	 * the rest as we consume. */
 	for (i = 0; i < 3 * L4H_USB_XFER_SQ_SIZE; i++) {
-		while (q->xh - READ_ONCE(q->info->xfer_sq_tail.v) >= L4H_USB_XFER_SQ_SIZE && cq_avail(q) < L4H_USB_CQ_SIZE)
+		while (q->xh - READ_ONCE(q->info->xfer_sq_tail.v) >= L4H_USB_XFER_SQ_SIZE && cq_avail(q) < L4H_USB_CQ_SIZE - 1)
 			msleep(1);
 		if (q->xh - READ_ONCE(q->info->xfer_sq_tail.v) >= L4H_USB_XFER_SQ_SIZE)
 			break;
@@ -312,13 +313,42 @@ static int run(struct q *q)
 		push_xfer(q, &r);
 	}
 	msleep(100);
-	check(cq_avail(q) == L4H_USB_CQ_SIZE, "flood: %u completions, not the CQ's %u", cq_avail(q), L4H_USB_CQ_SIZE);
-	n = 0;
-	while (n < (u32)i && wait_cq(q, 1, 2000)) {
-		pop(q);
-		n++;
+	check(cq_avail(q) == L4H_USB_CQ_SIZE - 1, "flood: %u completions, not the CQ's %u - 1", cq_avail(q), L4H_USB_CQ_SIZE);
+	/* The kept entry: a control request still gets in. */
+	memset(&c, 0, sizeof(c));
+	c.op = L4H_USB_OP_URB_CANCEL;
+	c.arg[0] = 0x12345;
+	c.tag = 0x777;
+	push_ctl(q, &c);
+	msleep(100);
+	check(cq_avail(q) == L4H_USB_CQ_SIZE, "flood: a control request did not get in");
+	/* With room for nothing but the cancel's own completion, a cancel of
+	 * the last record, still in the SQ, drops it: it never completes. */
+	pop(q);
+	n = 1;
+	c.arg[0] = i - 1;
+	c.tag = 0x778;
+	push_ctl(q, &c);
+	msleep(100);
+	/* The transfers' but the dropped one's, and both cancels'. */
+	{
+		int ok777 = 0, dropped = 0, ran = 0;
+
+		while (n < (u32)i + 1 && wait_cq(q, 1, 2000)) {
+			st = pop(q);
+			n++;
+			if (q->last.kind == L4H_USB_CQ_CTL && q->last.tag == 0x777)
+				ok777 = st == 0;
+			else if (q->last.kind == L4H_USB_CQ_CTL && q->last.tag == 0x778)
+				dropped = st == L4H_USB_ST_DROPPED;
+			else if (q->last.tag == (u32)i - 1)
+				ran = 1;
+		}
+		check(!wait_cq(q, 1, 200), "flood: a completion beyond the dropped record's");
+		check(ok777 && dropped && !ran, "flood: cancel of nothing %d, dropped %d, the dropped one ran %d", ok777, dropped, ran);
 	}
-	check(n == (u32)i, "flood: %u of %d completions", n, i);
+	check(n == (u32)i + 1, "flood: %u of %d completions", n, i + 1);
+	check(READ_ONCE(q->info->xfer_sq_tail.v) == q->xh, "flood: the dropped record was not consumed");
 
 	/* Records rewritten from another vCPU while usbd reads them. */
 	t = kthread_create(rewriter, q, "usbabuse");

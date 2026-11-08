@@ -35,14 +35,21 @@ pub const MAX_SLOTS: u32 = 64;
 pub const FIXED_BYTES: usize = 128 << 10;
 pub const EVENT_TRBS: usize = 4096;
 
-/// Transfer rings in usbd's fixed pool, one 4 KiB page each.
-pub const USB_RINGS: usize = 512;
-/// TRBs in a ring page; the last is the Link TRB back to the start.
-pub const RING_TRBS: usize = 256;
+/// Transfer rings in usbd's fixed pool, RING_BYTES each.
+pub const USB_RINGS: usize = 256;
+/// TRBs of a ring (contiguous, one segment); the last is the Link TRB back
+/// to the start.
+pub const RING_TRBS: usize = 512;
+pub const RING_BYTES: usize = RING_TRBS * 16;
 /// TRBs of one URB: a TD (or the TDs of an isoch URB) never takes more of
 /// a ring, so a ring always has room for one more URB once it has this
 /// many free.
 pub const MAX_URB_TRBS: usize = 192;
+// An URB never crosses the Link TRB (a TD fragment there would have to
+// end on a packet boundary, xHCI 1.2 §4.11.7.1): one that does not fit
+// before it goes at the start after no-ops.  Even an empty ring has room
+// for the no-ops and the URB.
+const _: () = assert!(2 * MAX_URB_TRBS + 1 < RING_TRBS - 1 && USB_RINGS % 64 == 0 && 65536 % RING_BYTES == 0);
 /// The largest URB, whatever the pool: 32 x 64 KiB pieces, plus one TRB
 /// per segment boundary, fit MAX_URB_TRBS (64 segments, each across a
 /// 64 KiB boundary, take 128).
@@ -54,7 +61,7 @@ pub const MAX_TRANSFER: u32 = 2 << 20;
 pub fn dma_bytes(slots: u32, scratch: u32, page: u32) -> usize {
     let _ = slots;
     let fixed = FIXED_BYTES + MAX_SLOTS as usize * 4096 // output device contexts
-        + USB_RINGS * 4096;
+        + USB_RINGS * RING_BYTES;
     // The scratchpad buffers start on a controller page.
     let total = fixed + page as usize + scratch as usize * page as usize;
     total.next_power_of_two().max(4 << 20)
@@ -503,6 +510,23 @@ pub struct EpShape {
     pub mult: u32,
     /// HCIVERSION >= 0x100: TD Size counts packets, not KiB.
     pub hci_1_0: bool,
+    /// Isoch scheduling: a low or full speed device (its start frame in
+    /// frames; at high speed and above, in microframes, as Linux's URB
+    /// start_frame), and the service interval in microframes (2^Interval).
+    pub full_speed: bool,
+    pub period: u32,
+}
+
+/// The Frame ID of isoch packet `k` of an URB scheduled from `start`, as
+/// Linux's xhci_get_isoc_frame_id: packets one service interval apart.
+pub fn iso_frame(ep: &EpShape, start: u32, k: u32) -> u32 {
+    let period = ep.period.max(1);
+    let frame = if ep.full_speed {
+        start.wrapping_add(k.wrapping_mul((period / 8).max(1)))
+    } else {
+        start.wrapping_add(k.wrapping_mul(period)) >> 3
+    };
+    frame & 0x7ff
 }
 
 /// TD Size of a TRB of `len` bytes after `done` bytes of a TD of `total`
@@ -608,7 +632,7 @@ pub fn build_trbs(x: &Xfer, ep: &EpShape, out: &mut Trbs, ends: &mut TdEnds) -> 
                 let frame = if x.flags & abi::XF_ISO_ASAP != 0 {
                     TRB_SIA
                 } else {
-                    ((x.start_frame.wrapping_add(k as u32)) & 0x7ff) << 20
+                    iso_frame(ep, x.start_frame, k as u32) << 20
                 };
                 let mut done = 0;
                 pieces(x, off, len, |pa, n| {

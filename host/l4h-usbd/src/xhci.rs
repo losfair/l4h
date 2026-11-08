@@ -121,7 +121,7 @@ impl Region {
     }
     /// Transfer ring r of the pool.
     pub fn ring(&self, r: usize) -> usize {
-        proto::FIXED_BYTES + MAX_SLOTS as usize * PAGE + r * PAGE
+        proto::FIXED_BYTES + MAX_SLOTS as usize * PAGE + r * proto::RING_BYTES
     }
     fn scratch(&self, page: usize) -> usize {
         self.ring(proto::USB_RINGS).next_multiple_of(page)

@@ -2426,8 +2426,8 @@ controller, one per claimed controller, and the guest forwards Linux's
   first `CTL_USB_ATTACH` (or dom0's `dom0_usb=`) claims one: root reads its
   capability registers through a temporary uncached mapping, allocates
   usbd's DMA region (one contiguous Untyped, `host::usb::dma_bytes`: the
-  scratchpad, DCBAA and contexts, command and event rings and a pool of 512
-  transfer rings; 4 MiB for QEMU's), maps BAR 0 uncached into a new usbd,
+  scratchpad, DCBAA and contexts, command and event rings and a pool of 256
+  transfer rings of 512 TRBs; 4 MiB for QEMU's), maps BAR 0 uncached into a new usbd,
   binds the interrupt (MSI-X entry 0, or plain MSI, which Intel PCH
   controllers have instead) to its notification, and calls `USBD_CLAIM`.
   usbd walks the extended capabilities (bounded: 256 entries inside BAR 0,
@@ -2477,11 +2477,18 @@ controller, one per claimed controller, and the guest forwards Linux's
   one event ring of 4096 TRBs (interrupter 0, IMOD 40 us, which the guest
   cannot change), a ring per endpoint or stream from the fixed pool, TDs
   laid out as Linux's `xhci-ring.c` does (64 KiB splits, TD Size, TBC and
-  TLBPC for isoch, ISP on IN data). Commands run one at a time, polling the
+  TLBPC for isoch, Frame IDs from the start frame, device speed and service
+  interval, ISP on IN data). An URB never crosses the Link TRB, where a TD
+  fragment would have to end on a packet boundary (xHCI §4.11.7.1): one
+  that does not fit before it goes at the start of the ring after no-ops,
+  which even an empty ring has room for. Commands run one at a time, polling the
   event ring (5 s timeout). An endpoint halted by an error is recovered
   with Reset Endpoint and Set TR Dequeue past the failed URB, as Linux
   does; a cancelled URB is skipped (dequeue moved, or its TRBs made
-  no-ops) and completed only once the endpoint has stopped. A URB that
+  no-ops) and completed only once the endpoint has stopped, and every
+  stream of the endpoint restarted. One whose record usbd has not taken
+  (it waits behind a full CQ) is marked to be skipped and never completes
+  (`ST_DROPPED`; the guest gives it back). A URB that
   does not fit its ring waits in usbd, so one full ring does not hold up
   other endpoints. A command timeout, HSE or HCE resets the controller and
   posts `HC_RESET`; only its owner is affected.

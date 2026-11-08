@@ -541,7 +541,7 @@ static void ul4h_xfer_done(struct ul4h *ul, const struct l4h_usb_cqe *c, struct 
 	ul4h_finish(ul, u, status, done);
 }
 
-static void ul4h_ctl_done(struct ul4h *ul, const struct l4h_usb_cqe *c)
+static void ul4h_ctl_done(struct ul4h *ul, const struct l4h_usb_cqe *c, struct list_head *done)
 {
 	u32 tag = READ_ONCE(c->tag);
 	s32 status = ul4h_status(READ_ONCE(c->status));
@@ -551,14 +551,18 @@ static void ul4h_ctl_done(struct ul4h *ul, const struct l4h_usb_cqe *c)
 		struct ul4h_urb *u = ul->inflight[UL4H_TAG_IDX(tag)];
 
 		/*
-		 * The URB completes before its cancel does.  A cancel that
-		 * failed while the URB is still in flight is tried again:
-		 * without limit while usbd has yet to take the URB's record
-		 * (AGAIN: it waits behind a full CQ), a few times otherwise.
+		 * The URB completes before its cancel does.  DROPPED: usbd
+		 * had not taken its record yet and skips it, so it never
+		 * completes: give it back now.  A cancel that failed while
+		 * the URB is still in flight is tried again.
 		 */
 		tag &= ~UL4H_CANCEL_TAG;
+		if (u && u->tag == tag && u->cancel == UL4H_CANCEL_SENT && status == L4H_USB_ST_DROPPED) {
+			ul4h_finish(ul, u, -ECONNRESET, done);
+			return;
+		}
 		if (u && u->tag == tag && u->cancel == UL4H_CANCEL_SENT && status &&
-		    (status == L4H_USB_ST_AGAIN || u->cancel_tries++ < UL4H_CANCEL_TRIES)) {
+		    u->cancel_tries++ < UL4H_CANCEL_TRIES) {
 			u->cancel = UL4H_CANCEL_QUEUED;
 			list_add_tail(&u->node, &ul->cancels);
 		}
@@ -694,7 +698,7 @@ static bool ul4h_drain(struct ul4h *ul, struct list_head *done, bool *bad)
 		if (READ_ONCE(c->kind) == L4H_USB_CQ_XFER)
 			ul4h_xfer_done(ul, c, done);
 		else
-			ul4h_ctl_done(ul, c);
+			ul4h_ctl_done(ul, c, done);
 		ul->cq_tail++;
 		work = true;
 	}

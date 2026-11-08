@@ -51,6 +51,8 @@ const CTL_RESERVE: u32 = 1;
 /// ring and the mailbox get their turn again.
 const CTL_BUDGET: u32 = abi::CTL_SQ_SIZE as u32;
 const XFER_BUDGET: u32 = abi::XFER_SQ_SIZE as u32;
+// Client::skip has a bit per transfer SQ entry.
+const _: () = assert!(abi::XFER_SQ_SIZE == 128);
 
 /// Isoch TDs in flight, at most: with every other URB's two events, the
 /// event ring (EVENT_TRBS) never fills.
@@ -113,6 +115,9 @@ struct Client {
     lost: u32,
     /// The transfer SQ waits for CQ room or isoch TDs.
     blocked: bool,
+    /// Transfer SQ records cancelled before they were taken (by position
+    /// % XFER_SQ_SIZE): skipped, never completed.
+    skip: u128,
 }
 
 impl Client {
@@ -480,6 +485,8 @@ impl Usbd {
             burst: (ep.ep.burst_mult & 0xf) as u32 + 1,
             mult: ((ep.ep.burst_mult >> 4) & 3) as u32 + 1,
             hci_1_0: self.hci_1_0(),
+            full_speed: matches!(self.slots[slot].speed, abi::SPEED_LOW | abi::SPEED_FULL),
+            period: 1 << (ep.ep.interval & 15),
         };
         let shape = if dci == 1 { proto::EpShape { max_packet: self.ep0_mps(slot), ..shape } } else { shape };
         let dma = self.hc.as_ref().unwrap().dma;
@@ -1103,19 +1110,15 @@ impl Usbd {
 
     /// URB_CANCEL: complete the URB with CANCELLED once the controller can
     /// no longer touch its buffers.  An URB not found may still be in the
-    /// transfer SQ, submitted before the cancel: take what is there first.
-    /// One still not found has completed (OK), or waits behind a full CQ
-    /// (AGAIN: the guest asks again).
+    /// transfer SQ, submitted before the cancel: take what is there first;
+    /// one still there (behind a full CQ) is skipped when its turn comes
+    /// and never completes (DROPPED).  One not found at all has completed.
     fn cancel(&mut self, tag: u32) -> i32 {
         if self.urbs.find(tag).is_none() {
             // Leave the entry for this request's own completion.
             self.accept_transfers(XFER_BUDGET, 1);
         }
-        let Some(u) = self.urbs.find(tag) else {
-            let cl = self.client.as_ref().unwrap();
-            let left = cl.xfer.avail(cl.guest(|c| &c.xfer_sq_head)).unwrap_or(0);
-            return if left == 0 { abi::ST_OK } else { abi::ST_AGAIN };
-        };
+        let Some(u) = self.urbs.find(tag) else { return self.drop_pending(tag) };
         let urb = self.urbs.get(u);
         let (s, d, r) = (urb.xfer.slot as usize, urb.xfer.dci as usize, urb.ring);
         if !urb.posted {
@@ -1142,6 +1145,26 @@ impl Usbd {
         }
         // Stop Endpoint stopped every stream of it: restart them all.
         self.restart(s, d);
+        abi::ST_OK
+    }
+
+    /// Skip the transfer SQ record with `tag` that usbd has not taken yet:
+    /// DROPPED, or OK if there is none (it completed).
+    fn drop_pending(&mut self, tag: u32) -> i32 {
+        let Some(cl) = self.client.as_mut() else { return abi::ST_OK };
+        let n = cl.xfer.avail(cl.guest(|c| &c.xfer_sq_head)).unwrap_or(0);
+        let base = (cl.area + abi::XFER_SQ_OFF) as *const XferReq;
+        for k in 0..n {
+            let at = cl.xfer.tail.wrapping_add(k);
+            let bit = 1u128 << (at % abi::XFER_SQ_SIZE as u32);
+            // Only the tag: the record is copied again, and checked, if it
+            // is ever taken.
+            let t = unsafe { read_volatile(addr_of!((*base.add(at as usize % abi::XFER_SQ_SIZE)).tag)) };
+            if t == tag && cl.skip & bit == 0 {
+                cl.skip |= bit;
+                return abi::ST_DROPPED;
+            }
+        }
         abi::ST_OK
     }
 
@@ -1184,7 +1207,9 @@ impl Usbd {
             }
         };
         // It must fit a ring: lay it out once now.
-        let shape = proto::EpShape { max_packet: (ep.ep.max_packet as u32 & 0x7ff).max(8), burst: 1, mult: 1, hci_1_0: true };
+        let shape = proto::EpShape {
+            max_packet: (ep.ep.max_packet as u32 & 0x7ff).max(8), burst: 1, mult: 1, hci_1_0: true, full_speed: false, period: 1,
+        };
         let (mut trbs, mut ends) = (proto::Trbs::new(), proto::TdEnds::new());
         if proto::build_trbs(&x, &shape, &mut trbs, &mut ends).is_err() {
             return self.refuse(req.tag, abi::ST_INVALID);
@@ -1219,6 +1244,14 @@ impl Usbd {
             let Some(n) = cl.xfer.avail(head) else { return };
             if n == 0 {
                 return;
+            }
+            let bit = 1u128 << (cl.xfer.tail % abi::XFER_SQ_SIZE as u32);
+            if cl.skip & bit != 0 {
+                // Cancelled before it was taken: no completion, no room.
+                cl.skip &= !bit;
+                cl.xfer.tail = cl.xfer.tail.wrapping_add(1);
+                cl.publish(|i| &mut i.xfer_sq_tail, cl.xfer.tail);
+                continue;
             }
             if cl.room() <= CTL_RESERVE + keep || cl.iso_tds + abi::MAX_ISO as u32 > MAX_ISO_TDS {
                 cl.blocked = true;
@@ -1283,8 +1316,8 @@ impl Usbd {
         }
         cl.guest(|c| &c.reset_seq) != cl.reset_seen
             || cl.ctl.avail(cl.guest(|c| &c.ctl_sq_head)).is_some_and(|n| n > 0 && cl.room() > 0)
-            || cl.xfer.avail(cl.guest(|c| &c.xfer_sq_head)).is_some_and(|n| n > 0 && cl.room() > CTL_RESERVE
-                && cl.iso_tds + abi::MAX_ISO as u32 <= MAX_ISO_TDS)
+            || cl.xfer.avail(cl.guest(|c| &c.xfer_sq_head)).is_some_and(|n| n > 0 && (cl.room() > CTL_RESERVE
+                && cl.iso_tds + abi::MAX_ISO as u32 <= MAX_ISO_TDS || cl.skip & 1u128 << (cl.xfer.tail % abi::XFER_SQ_SIZE as u32) != 0))
     }
 
     // ---- Controller lifetime.
@@ -1395,7 +1428,7 @@ impl Usbd {
             idx, area, pool, max_transfer,
             ctl: Sq { tail: 0, size: abi::CTL_SQ_SIZE as u32 },
             xfer: Sq { tail: 0, size: abi::XFER_SQ_SIZE as u32 },
-            cq_head: 0, eq_head: 0, in_flight: 0, iso_tds: 0, reset_seen: 0, irq, notify: false, lost: 0, blocked: false,
+            cq_head: 0, eq_head: 0, in_flight: 0, iso_tds: 0, reset_seen: 0, irq, notify: false, lost: 0, blocked: false, skip: 0,
         });
         self.dead = false;
         if !self.hc().start() {

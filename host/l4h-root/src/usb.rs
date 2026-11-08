@@ -91,8 +91,10 @@ struct Usbd {
     areas: [Option<Area>; usb::AREAS],
     /// The attached guest's area (State::Vm).
     idx: usize,
-    /// The area a REMOVE runs for.
+    /// The area a REMOVE runs for, or is due for: posted once the ATTACH
+    /// usbd is still on is done (remove_queued).
     draining: Option<usize>,
+    remove_queued: bool,
     /// The attached guest's ATTACH waits for that REMOVE.
     queued: bool,
 }
@@ -365,7 +367,8 @@ fn claim(h: &mut Host, i: usize) -> Result<(), i64> {
     component::start(&comp);
     let ep = comp.service_ep;
     c.driver = Some(Usbd {
-        comp, arena, mbox, seq: 0, op: 0, busy: false, kick, areas: [const { None }; usb::AREAS], idx: 0, draining: None, queued: false,
+        comp, arena, mbox, seq: 0, op: 0, busy: false, kick, areas: [const { None }; usb::AREAS], idx: 0, draining: None, remove_queued: false,
+        queued: false,
     });
     let r = call(ep, usb::USBD_CLAIM, &[]);
     if r != 0 {
@@ -475,12 +478,26 @@ pub fn poll(h: &mut Host) {
                     post_attach(h, i);
                 }
             }
-            _ if result != 0 => {
-                // The guest sees the controller dead.
-                log!("l4h-root: xHCI {:02x}:{:02x}.{}: usbd refused the attachment ({})", p.bus, p.dev, p.func, result);
-                quarantine(c, &h.pci);
+            _ => {
+                if result != 0 {
+                    // The guest sees the controller dead.
+                    log!("l4h-root: xHCI {:02x}:{:02x}.{}: usbd refused the attachment ({})", p.bus, p.dev, p.func, result);
+                    quarantine(c, &h.pci);
+                }
+                let d = ctrls()[i].driver.as_mut().unwrap();
+                if d.remove_queued {
+                    // The guest went while usbd attached it.
+                    d.remove_queued = false;
+                    let idx = d.draining.expect("a REMOVE is due");
+                    if ctrls()[i].state == State::Failed {
+                        // usbd is suspended.
+                        d.draining = None;
+                        free_area(h, d, idx);
+                    } else {
+                        post(&mut h.wins.a, d, usb::MBOX_REMOVE, idx, (0, 0, 0));
+                    }
+                }
             }
-            _ => {}
         }
     }
 }
@@ -590,7 +607,12 @@ pub fn remove(h: &mut Host, i: usize) -> bool {
         free_area(h, d, idx);
     } else {
         d.draining = Some(idx);
-        post(&mut h.wins.a, d, usb::MBOX_REMOVE, idx, (0, 0, 0));
+        if d.busy {
+            // usbd is still on the ATTACH: the REMOVE follows it (poll).
+            d.remove_queued = true;
+        } else {
+            post(&mut h.wins.a, d, usb::MBOX_REMOVE, idx, (0, 0, 0));
+        }
     }
     true
 }

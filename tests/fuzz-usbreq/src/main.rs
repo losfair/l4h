@@ -128,6 +128,8 @@ fn shape(rng: &mut Rng) -> EpShape {
         burst: rng.below(17) as u32,
         mult: rng.below(4) as u32,
         hci_1_0: rng.chance(2),
+        full_speed: rng.chance(2),
+        period: 1 << rng.below(16),
     }
 }
 

@@ -752,7 +752,9 @@ struct l4h_ctl_vm {
  * owns the head, the consumer the tail.  usbd copies a record before it
  * checks it, and checks every index the guest writes against its own
  * copies.  It accepts a request only while fewer than L4H_USB_CQ_SIZE are
- * accepted and not yet consumed from the CQ, so the CQ never overflows.
+ * accepted and not yet consumed from the CQ, so the CQ never overflows; a
+ * transfer only while fewer than L4H_USB_CQ_SIZE - 1, so a control request
+ * (URB_CANCEL) always gets in once the guest consumes its completions.
  *
  * Kicks: after writing a head or a tail of its own (or `reset_seq`), the
  * guest signals kick_slot if `usbd_waiting` is set.  usbd sets it and
@@ -989,7 +991,9 @@ struct l4h_usb_xfer_req {
 #define L4H_USB_ST_MISSED       (-18)   /* -EXDEV: isoch packet not sent */
 #define L4H_USB_ST_NOSPC        (-28)   /* -ENOSPC: no slot, ring or bandwidth */
 #define L4H_USB_ST_IO           (-5)    /* -EIO: any other failure */
-#define L4H_USB_ST_AGAIN        (-11)   /* -EAGAIN: URB_CANCEL of an URB not taken yet */
+#define L4H_USB_ST_DROPPED      (-125)  /* -ECANCELED: URB_CANCEL of an URB still in the
+                                         * transfer SQ: usbd skips its record and never
+                                         * completes it */
 
 #define L4H_USB_CQ_CTL          1u      /* l4h_usb_cqe.kind: a control request */
 #define L4H_USB_CQ_XFER         2u      /* a transfer */
