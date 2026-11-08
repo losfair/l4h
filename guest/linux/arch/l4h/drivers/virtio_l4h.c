@@ -27,6 +27,7 @@
 #include <linux/virtio_config.h>
 #include <linux/virtio_ring.h>
 #include <uapi/linux/virtio_ids.h>
+#include <asm/l4h_dma.h>
 #include <irq_kern.h>
 #include <l4h_sys.h>
 
@@ -55,6 +56,16 @@ struct virtio_l4h_device {
 
 /* The DMA device of every virtio-l4h device, bound to the I/O pool. */
 static struct platform_device *vl4h_dma;
+
+/*
+ * Other drivers of host devices (usb-l4h) map with it too: the pool is
+ * set up once, and every mapping of it is in one io_tlb_mem.
+ */
+struct device *l4h_io_pool_dev(void)
+{
+	return vl4h_dma ? &vl4h_dma->dev : NULL;
+}
+EXPORT_SYMBOL_GPL(l4h_io_pool_dev);
 
 static unsigned long vl4h_op(struct virtio_l4h_device *d, unsigned long op, unsigned long a,
 			     unsigned long b)
