@@ -70,8 +70,13 @@ void vtxprobe_main(seL4_BootInfo *bi)
                                          seL4_CapInitThreadCNode, 0, 0, pt, 1));
     report("tcb", seL4_Untyped_Retype(ut, seL4_TCBObject, 0,
                                       seL4_CapInitThreadCNode, 0, 0, tcb, 1));
-    if (vcpu_err == seL4_NoError)
+    if (vcpu_err == seL4_NoError) {
         report("vcpu_set_tcb", seL4_X86_VCPU_SetTCB(vcpu, tcb));
+        /* Loaded with WRMSR before VM entry: only canonical addresses
+         * (patch 0039). */
+        report("kgs_canonical", seL4_X86_VCPU_WriteMSR(vcpu, 0xC0000102, 0xffff800000001000ul).error);
+        report("kgs_noncanonical", seL4_X86_VCPU_WriteMSR(vcpu, 0xC0000102, 0x0100000000000000ul).error);
+    }
     puts_("vtxprobe: done\n");
     for (;;)
         seL4_Yield();

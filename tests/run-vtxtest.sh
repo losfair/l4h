@@ -73,5 +73,8 @@ done
 grep -aq 'vtxprobe: tcb ok' "$log" || fail "a TCB was not created"
 if [ "$mode" = on ]; then
     grep -aq 'vtxprobe: vcpu_set_tcb ok' "$log" || fail "the VCPU did not bind to a TCB"
+    # Patch 0039: seL4 loads KERNEL_GS_BASE with WRMSR before VM entry.
+    grep -aq 'vtxprobe: kgs_canonical ok' "$log" || fail "a canonical KERNEL_GS_BASE was refused"
+    grep -aq 'vtxprobe: kgs_noncanonical err=1' "$log" || fail "a noncanonical KERNEL_GS_BASE was accepted"
 fi
 echo "VTXTEST($mode): PASS"
