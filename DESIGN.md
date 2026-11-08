@@ -91,7 +91,7 @@ rust-sel4.**
  │  └──────────────┘  └─────────────────────┘                                  │
  └─────────────────────────────────────────────────────────────────────────────┘
    seL4 microkernel (MCS, SMP, x86_64 or aarch64), plus l4h extensions (§4)
-   Cloud VM or bare-metal hardware, with no VT-x used
+   Cloud VM or bare-metal hardware; VT-x only for guests' KVM (§5.10)
 ```
 
 - `l4h-root` spawns the host services and keeps the hardware: PCI, the
@@ -141,9 +141,10 @@ dropped without renumbering the rest.
   (QEMU/HVF raises tens of thousands of them).
 - `KernelIOMMU=OFF`: root drives the IOMMU itself (§9.5).
 - `KernelVTX=ON`, `KernelX86_64VTX64BitGuests=ON`: seL4's VCPU and EPT
-  objects, for guests that will run KVM
-  ([#84](https://github.com/losfair/l4h/issues/84)). Every guest may create
-  them from its own RAM; there is no per-VM grant. On a CPU without usable
+  objects, for guests that run KVM (§5.10,
+  [#84](https://github.com/losfair/l4h/issues/84)). Every guest may create
+  them from its own RAM; there is no per-VM grant, and patch 0039 limits
+  the VMX controls a guest can turn on. On a CPU without usable
   VT-x (no VMX, as under QEMU's `-cpu host,-vmx`, VMX locked off, or no EPT)
   the kernel boots without it (patch 0038), so the same image serves both.
   The SKIM variant leaves VT-x off at runtime: Meltdown-affected CPUs are
@@ -288,6 +289,7 @@ support, since no device is passed into a guest.
 | 0024 | (x86) No boot without SKIM unless the CPU reports RDCL_NO (above). |
 | 0025 | (x86) `GetIOAPICRemapped` adds a 16-bit interrupt-remapping table index to the I/O APIC handler arguments and writes the remappable RTE format. Root publishes the matching VT-d IRTE first; seL4 keeps pin masking, acknowledgement and capability lifecycle and does not manage the IOMMU. |
 | 0038 | (x86, `KernelVTX`) A kernel built with VT-x boots on a CPU without usable VT-x (no VMX, VMX locked off by firmware, or no EPT write-back or 2 MiB support) instead of halting. The boot core records the result in `x86KSVTXEnabled`; secondary cores skip VT-x when it is off and must match the boot core when it is on. Without VT-x, `Untyped_Retype` refuses VCPU and EPT objects (`seL4_InvalidArgument`), which is also how userspace probes for it. With the SKIM window VT-x stays off (§4.1). EPT checks run before `vmxon`, and a failed `vmxon` clears `CR4.VMXE`, so no core is left in VMX operation, where INIT is blocked. This lets one `KernelVTX` image (§4.1) serve hosts with and without VT-x. |
+| 0039 | (x86, `KernelVTX`) The VCPU interface KVM in a guest needs (§5.10). Userspace can turn on only listed VM-execution, exit and entry controls: the others use VMCS address fields nothing sets (virtual APIC, PML, posted interrupts, VMCS shadowing, #VE), which would point at host physical page 0. MOV-DR, RDPMC, MWAIT and MONITOR always exit. `VMEnter` returns one MR layout for faults and notifications, adding RSP, CR2 and the exit and IDT-vectoring information; when the VCPU did not run, the exit fields read 0 and `INTERRUPT_INFO_MR` keeps the undelivered event. The guest's CR2 survives exits (other threads' page faults overwrite it) and `WriteMSR(SEL4_VCPU_MSR_CR2)` sets it. `invept` reaches every core that has entered a VM, so no core keeps translations of an unmapped frame; `VCPU_FlushTLB` is that `invept` for guest TLB flushes. `WriteVMCS` takes the TSC offset and entry instruction length, `Read`/`WriteMSR` `KERNEL_GS_BASE`. The guest runs on the TCB's FPU state, without the two swaps per exit seL4 made into state userspace could not read. |
 
 **Verification.** The MCS SMP x86_64 configuration is not covered by the
 seL4 proofs, with or without these patches. l4h benefits from seL4's design
@@ -938,6 +940,63 @@ run AArch64 programs natively. `tests/run-kemutest.sh` checks the emulated
 ABI, tagged addresses, vector state across threads and signals, and FP
 exception flags in signal contexts (requires `gcc-aarch64-linux-gnu` and
 cross libc headers); `KEMU_CMDLINE=kemu.jit=0` checks the interpreter.
+
+### 5.10 KVM inside guests
+
+Where the CPU has VT-x, the x86_64 guest kernel provides `/dev/kvm` for
+unmodified QEMU (and, untested so far, Firecracker and cloud-hypervisor).
+The guest runs in ring 3, so it cannot run VMX instructions: it builds
+`arch/x86/kvm`'s common code (`x86.c`, the TDP MMU, lapic/ioapic/PIT, the
+emulator, `virt/kvm`) with a vendor backend in `arch/l4h/kvm` that
+implements `kvm_x86_ops` on seL4 VCPU objects (patch 0039).
+
+- **Enabling.** l4h-root retypes a VCPU at boot; patch 0038 refuses it
+  without usable VT-x. Where it works, vmmgr gives every guest
+  `L4H_MAX_EPT_ROOTS` (8) EPT PML4s with ASIDs at `L4H_SLOT_EPT_POOL`, as
+  it gives VSpace roots, and `bootinfo.nr_ept_roots` says how many. With
+  none the guest registers no `/dev/kvm`. Each KVM VM takes a root, so a
+  guest runs at most 8 VMs at a time.
+- **Running a vCPU.** `KVM_RUN` calls `seL4_VMEnter` on the kTCB of the
+  L4H vCPU it runs on; `vcpu_load` binds the VCPU and the VM's EPT root to
+  that kTCB when they are not already. The exit is the call returning,
+  with the guest's GPRs, RIP, RSP, RFLAGS, CR2, CR3, interruptibility and
+  exit and IDT-vectoring information in message registers. A notification
+  on N_v (timer, IPI, device event) ends the call too, and counts as an
+  external-interrupt exit: the vCPU's events are delivered when KVM
+  re-enables interrupts. Other VMCS reads are system calls, cached until
+  the next entry; GPRs are written back only when they differ from what
+  seL4 holds.
+- **Nested guest memory.** KVM keeps its TDP page table in software, and
+  the CPU walks a seL4 EPT that mirrors its leaves (`kvm/ept.c`), as
+  process VSpaces mirror Linux page tables (§5.3): one frame-capability
+  copy per mapping, 4 KiB or, for a RAM block with a large frame, 2 MiB.
+  A hook in the TDP MMU (patch `guest/linux/patches/0016`) syncs a leaf to
+  its SPTE's current value after each change, under a per-VM lock, so
+  concurrent changes cannot leave a mapping behind; a fault KVM finds
+  spurious syncs it again, which repairs anything the EPT lacks. Fast page
+  faults are off (they change SPTEs without the hook); there are no
+  accessed or dirty bits, so aging and dirty logging use write protection
+  and access tracking. Revoking a block takes our capability copies, and
+  the nested guest refaults. seL4 invalidates the EPT on every core at each
+  change, so KVM's remote TLB flushes have nothing to do.
+- **FPU.** seL4 runs the guest on the kTCB's FPU registers. The guest's
+  XSAVE state stays loaded across exits and is saved when kernel-mode SIMD
+  needs the registers or the task leaves `KVM_RUN`. `KVM_SET_XSAVE`
+  refuses a state XRSTOR would fault on. XCR0 is seL4's (x87, SSE, AVX);
+  guest XSETBV is emulated.
+- **What the common code would do in ring 0** (MSRs, debug registers,
+  XSETBV, WBINVD, IBPB) is a no-op through `arch/l4h/kvm/compat.h`. Optional
+  static calls left NULL return 0 (the guest has no `HAVE_STATIC_CALL`).
+- **Not available**, as seL4's VCPU interface cannot provide them: APICv
+  and posted interrupts, PML, nested VMX, the PMU, PKU, XSAVES, AVX-512,
+  RDTSCP/RDPID (seL4 does not switch `TSC_AUX`), hardware breakpoints in
+  the guest, and the speculation-control MSRs (hidden from guests, which
+  get no IBPB between nested VMs either). SMM is not built.
+- **Cost.** Every exit is an seL4 call and its return, and the exits KVM
+  handles in the guest kernel add a few VMCS calls; an EPT fault adds a
+  capability copy and a map. Under nested KVM on an i7-13700H, the host's
+  Debian 6.12 kernel boots to userspace under QEMU in dom0 in about 1.5 s.
+- **Test.** `tests/run-kvmtest.sh` (§14.3).
 
 ---
 
@@ -3777,7 +3836,8 @@ without it the host reports `unknown`.
 **Test environment.** The development machine has KVM, which QEMU uses
 only as a fast CPU to mimic a cloud VM: `-cpu host,-vmx -smp 4`, with
 `virtio-blk-pci`, `nvme` and `virtio-net-pci`, and UEFI via OVMF or plain
-multiboot. seL4 never uses VT-x. The 30-guest test uses a 16 GiB QEMU
+multiboot. seL4 uses VT-x only in `tests/run-vtxtest.sh on` and
+`tests/run-kvmtest.sh`, which expose VMX. The 30-guest test uses a 16 GiB QEMU
 machine and guests of 256–512 MiB.
 
 ### 14.3 Test command index
@@ -3836,6 +3896,7 @@ machine and guests of 256–512 MiB.
 | `tests/run-bench.sh`, `tests/run-vmbench.sh`, `tests/run-startbench.sh` | micro-benchmarks, guest cost, start latency |
 | `tests/run-fuzz.sh` | hostile-guest virtqueue fuzzing of l4h-vmm |
 | `tests/run-skimtest.sh` | the skim-xapic-nopcid variant on a Meltdown-affected CPU without PCID/x2APIC: SKIM mappings and syscall state at the user/kernel boundary (`tests/skim-qemu.py`, GDB); VT-x stays off (`run-vtxtest.sh skim`) |
+| `tests/run-kvmtest.sh [qemu] [vcpus]` | KVM in dom0 (§5.10; needs nested VMX, `-cpu host` on Intel): `tests/guest/kvmtest.c` runs real- and long-mode VMs with port I/O, MMIO, 62 MiB of EPT faults, a run long enough to be preempted, two VMs at once and 20 in a row; `qemu` also boots the host's kernel (`KVMTEST_KERNEL`) under the host's QEMU in dom0 with two vCPUs. CI runs it in the VT-x step where the runner has nested VMX |
 | `tests/run-vtxtest.sh off\|on\|skim` | VT-x below l4h-root (patch 0038), with `tests/vtxprobe.c` as the root task on 4 cores: `off` (`-cpu host,-vmx`) boots without VT-x and refuses VCPU and EPT objects; `on` (`-cpu host`, nested KVM on Intel) creates them and binds the VCPU to a TCB; `skim` keeps VT-x off. CI runs `off` always and `on`, with the 1-vCPU self-test, where the runner has nested VMX, and says in the job summary when it has not |
 | `tools/lint-shell.sh [-a]` | ShellCheck over every tracked shell script (`*.sh`, and sh/bash shebangs such as the guest init scripts): fails on error-severity findings and on SC2251, a bare `! cmd` that `set -e` ignores; `-a` also prints warnings and notes without failing. CI runs it in the installer job |
 | `python3 tests/blkmq-qemu.py` | block multiqueue and fsync suites under local QEMU (`--suite blkmq\|fsync`, `--guest-queues`, `--scsi-queues`); run by hand |
