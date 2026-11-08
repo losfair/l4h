@@ -171,7 +171,7 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
         abi::CTL_IOMMU_INFO | abi::CTL_DISK_INFO | abi::CTL_BLK_INFO | abi::CTL_SWITCH_CREATE | abi::CTL_SWITCH_ATTACH_UPLINK
         | abi::CTL_NIC_INFO | abi::CTL_SWITCH_INFO | abi::CTL_HOST_REBOOT | abi::CTL_RTC_SET
         | abi::CTL_EP_SET | abi::CTL_EP_DEL | abi::CTL_EP_LIST | abi::CTL_STEER_SET | abi::CTL_STEER_DEL
-        | abi::CTL_STEER_LIST | abi::CTL_PARTITION_INFO => {
+        | abi::CTL_STEER_LIST | abi::CTL_PARTITION_INFO | abi::CTL_USB_INFO => {
             resp.vals = host_op(h, req.op, a)?;
             resp.data = *root::result_data();
             Ok(())
@@ -346,6 +346,13 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
             }
             resp.vals = [start + n as u64, n as u64, start - off, 0, 0, 0];
             Ok(())
+        }
+        abi::CTL_USB_ATTACH => {
+            let id = vm_arg(a[0])?;
+            if id == caller {
+                return Err(EINVAL);
+            }
+            h.attach_usb(id, a[1] as usize)
         }
         abi::CTL_GPU_ATTACH => {
             let id = vm_arg(a[0])?;

@@ -81,6 +81,9 @@ pub enum Backend {
         /// the port.
         keep: cap::CNode,
     },
+    /// A USB controller: the VMM raises its event when usbd signals
+    /// host::vmm_badge_usb(n), and maps nothing of it.
+    Usb { n: usize },
     /// virtio-gpu (gpu.rs): frame i < display_pages is page i of the
     /// display area, the others are the VMM's tables.
     Gpu {
@@ -174,6 +177,10 @@ fn create(
                 dev.chan_kick_slot = host::VMM_KICK_SLOT_BASE + d as u64;
                 dev.mac[..6].copy_from_slice(mac);
             }
+            Backend::Usb { n } => {
+                dev.kind = host::VDEV_USB;
+                dev.chan_kick_slot = *n as u64;
+            }
             Backend::Gpu { display_pages, width, height, .. } => {
                 dev.kind = host::VDEV_GPU;
                 dev.chan_va = host::gpu::VMM_DISPLAY_VA as u64;
@@ -234,6 +241,10 @@ fn map(g: &mut Guest, comp: &Component, backends: &[(usize, Backend)], alloc: &m
         comp.give_badged(host::VCPU_NTFN_SLOT_BASE + v as u64, vcpu.ntfn, CapRights::write_only(), abi::BADGE_EVENT);
     }
     for (d, dev) in g.devices.iter().enumerate() {
+        // A USB controller's queue area is usbd's and the guest's alone.
+        if matches!(dev.kind, DevKind::Usb(_)) {
+            continue;
+        }
         let p = crate::component::abs_of(dev.page);
         comp.map_copy(alloc, &mut g.arena, &p, host::vmm_device_page_va(d), CapRights::read_write(), attrs, keep_slot());
     }
@@ -247,7 +258,7 @@ fn map(g: &mut Guest, comp: &Component, backends: &[(usize, Backend)], alloc: &m
     }
     for &(d, ref b) in backends.iter() {
         match b {
-            Backend::UnavailableBlk => {},
+            Backend::UnavailableBlk | Backend::Usb { .. } => {},
             Backend::Blk { chan, kick } => {
                 for (i, f) in chan.iter().enumerate() {
                     let fc = crate::component::abs_of(*f);

@@ -58,6 +58,8 @@ pub const CTL_STEER_DEL: u32 = 36;
 pub const CTL_STEER_LIST: u32 = 37;
 pub const CTL_PARTITION_INFO: u32 = 38;
 pub const CTL_BLK_ATTACH_EXTENTS: u32 = 39;
+pub const CTL_USB_INFO: u32 = 40;
+pub const CTL_USB_ATTACH: u32 = 41;
 /// Extents of a disk made of them, and the least sectors of each when
 /// there are several.
 pub const BLK_MAX_EXTENTS: usize = 4096;
@@ -264,6 +266,7 @@ pub fn errno_name(e: i64) -> &'static str {
         11 => "try again",
         12 => "out of memory",
         16 => "busy",
+        19 => "unsupported device",
         17 => "already exists",
         22 => "invalid argument",
         28 => "no space for devices",
@@ -675,6 +678,25 @@ pub struct VmSpec<'a> {
     pub nics: Vec<(u64, u64, u64)>,
     /// A virtio-gpu with one scanout of (width, height).
     pub gpu: Option<(u64, u64)>,
+    /// Whole USB controllers ([`Ctl::usb_info`] indices).
+    pub usbs: Vec<u64>,
+}
+
+/// An xHCI controller of the host, as [`Ctl::usb_info`] reports it.
+#[derive(Clone, Debug)]
+pub struct UsbInfo {
+    pub bdf: u16,
+    pub vendor: u16,
+    pub device: u16,
+    pub usb2_ports: u16,
+    pub usb3_ports: u16,
+    /// "firmware", "idle", "vm", "failed" or "unsupported".
+    pub state: &'static str,
+    pub owner: Option<u64>,
+    /// Requests usbd refused as malformed.
+    pub refused: u64,
+    /// Why it is unsupported.
+    pub reason: String,
 }
 
 /// The I/O pool a VM with a GPU of `width` x `height` gets by default: its
@@ -774,6 +796,15 @@ impl Ctl {
             (0, Some((w, h))) => gpu_io_pool(w, h),
             (p, _) => p,
         };
+        // Each USB controller's transfers bounce through the pool: 4 MiB
+        // more each by default.
+        let io_pool = match (io_pool, o.usbs.len() as u64) {
+            (0, 0) => 0,
+            (0, n) => ((4 << 20) + (n << 22)).next_power_of_two(),
+            (p, 0) => p,
+            (p, n) => (p + (n << 22)).next_power_of_two(),
+        };
+        let io_pool = if o.io_pool != 0 { o.io_pool } else { io_pool };
         let resp = self.call(CTL_VM_CREATE, &[o.mem, o.vcpus, 0, 0, io_pool], &name, &[])?;
         let (vm, initrd_gpa) = (resp.vals[0], resp.vals[1]);
         let r = (|| {
@@ -789,6 +820,9 @@ impl Ctl {
             }
             if let Some((w, h)) = o.gpu {
                 self.call(CTL_GPU_ATTACH, &[vm, w, h], &[], &[])?;
+            }
+            for &c in &o.usbs {
+                self.call(CTL_USB_ATTACH, &[vm, c], &[], &[])?;
             }
             if !o.initrd.is_empty() {
                 load(self, vm, initrd_gpa, o.initrd)?;
@@ -976,6 +1010,45 @@ pub struct DiskAttachment {
 }
 
 impl Ctl {
+    /// xHCI controller `index`, or None past the last.
+    pub fn usb_info(&self, index: u64) -> Result<Option<UsbInfo>> {
+        let r = self.raw_call(CTL_USB_INFO, &[index], &[], 0, 0)?;
+        match r.status {
+            0 => {}
+            -2 => return Ok(None),
+            s => return err(format!("request {CTL_USB_INFO} failed: {}", errno_name(-s))),
+        }
+        let v = r.vals;
+        let state = match v[3] {
+            0 => "firmware",
+            1 => "idle",
+            2 => "vm",
+            3 => "failed",
+            _ => "unsupported",
+        };
+        let n = r.data.iter().position(|&c| c == 0).unwrap_or(r.data.len());
+        Ok(Some(UsbInfo {
+            bdf: v[0] as u16,
+            vendor: v[1] as u16,
+            device: (v[1] >> 16) as u16,
+            usb2_ports: v[2] as u16,
+            usb3_ports: (v[2] >> 16) as u16,
+            state,
+            owner: (v[4] != u64::MAX).then_some(v[4]),
+            refused: v[5],
+            reason: String::from_utf8_lossy(&r.data[..n]).into_owned(),
+        }))
+    }
+
+    /// Every xHCI controller of the host.
+    pub fn usbs(&self) -> Result<Vec<UsbInfo>> {
+        let mut v = Vec::new();
+        while let Some(u) = self.usb_info(v.len() as u64)? {
+            v.push(u);
+        }
+        Ok(v)
+    }
+
     pub fn disk_info(&self, index: u64) -> Result<DiskInfo> {
         let r = self.call(CTL_DISK_INFO, &[index], &[], &[])?;
         Ok(DiskInfo { index, bdf: r.vals[0] & 0xffff, address: r.vals[0] >> 16, owner: (r.vals[1] != u64::MAX).then_some(r.vals[1]),

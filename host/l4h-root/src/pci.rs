@@ -51,6 +51,8 @@ pub struct Device {
     pub bars: [Bar; 6],
     /// MSI-X capability: config offset, table BAR/offset, table size.
     pub msix: Option<Msix>,
+    /// Plain MSI capability (xHCI controllers of Intel PCHs have no MSI-X).
+    pub msi: Option<Msi>,
     /// Vendor-specific capabilities (virtio): (cap offset, cfg_type, bar, offset, length, notify multiplier).
     pub virtio_caps: VirtioCaps,
 }
@@ -61,6 +63,15 @@ pub struct Msix {
     pub table_bar: u8,
     pub table_offset: u32,
     pub table_size: u16,
+}
+
+/// An MSI capability: its config offset, 64-bit addresses, per-vector
+/// masking.
+#[derive(Clone, Copy, Debug)]
+pub struct Msi {
+    pub cap: u8,
+    pub is64: bool,
+    pub maskable: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -129,6 +140,14 @@ pub const VECTOR_NIC_BASE: u64 = 0;
 #[cfg(target_arch = "x86_64")]
 pub const VECTOR_MONITOR: u64 = 8;
 pub const VECTOR_DISK_BASE: u64 = 16;
+/// xHCI controllers, as they are claimed: the vectors left between the
+/// NICs (MAX_NICS from 0), the monitor and the disks, and on x86 between
+/// the disks and the multikernel doorbells.
+#[cfg(target_arch = "x86_64")]
+pub const VECTORS_USB: [u64; 16] = [80, 81, 82, 83, 84, 85, 86, 87, 4, 5, 6, 7, 9, 10, 11, 12];
+#[cfg(target_arch = "aarch64")]
+pub const VECTORS_USB: [u64; 12] = [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+const _: () = assert!(l4h_host::net::MAX_NICS <= 4);
 /// Disk controllers beyond this many are left alone.
 #[cfg(target_arch = "x86_64")]
 pub const MAX_DISK_CTRLS: usize = 64;
@@ -406,11 +425,12 @@ impl Pci {
         bars
     }
 
-    fn caps(&self, bus: u8, dev: u8, func: u8) -> (Option<Msix>, VirtioCaps) {
+    fn caps(&self, bus: u8, dev: u8, func: u8) -> (Option<Msix>, Option<Msi>, VirtioCaps) {
         let mut msix = None;
+        let mut msi = None;
         let mut virtio = VirtioCaps::new();
         if self.read16(bus, dev, func, 6) & 0x10 == 0 {
-            return (msix, virtio);
+            return (msix, msi, virtio);
         }
         let mut ptr = self.read8(bus, dev, func, 0x34) & !3;
         let mut guard = 0;
@@ -427,6 +447,10 @@ impl Pci {
                         table_size: (ctrl & 0x7ff) + 1,
                     });
                 }
+                0x05 => {
+                    let ctrl = self.read16(bus, dev, func, ptr + 2);
+                    msi = Some(Msi { cap: ptr, is64: ctrl & 0x80 != 0, maskable: ctrl & 0x100 != 0 });
+                }
                 0x09 => {
                     let cfg_type = self.read8(bus, dev, func, ptr + 3);
                     let bar = self.read8(bus, dev, func, ptr + 4);
@@ -440,7 +464,7 @@ impl Pci {
             ptr = self.read8(bus, dev, func, ptr + 1) & !3;
             guard += 1;
         }
-        (msix, virtio)
+        (msix, msi, virtio)
     }
 
     /// Every PCI function, in bus, device, function order, each probed as
@@ -457,7 +481,7 @@ impl Pci {
         }
         let class = self.read32(bus, dev, func, 8);
         let header = self.read8(bus, dev, func, 0xe) & 0x7f;
-        let (msix, virtio_caps) = self.caps(bus, dev, func);
+        let (msix, msi, virtio_caps) = self.caps(bus, dev, func);
         // A partition never sizes a BAR: sizing stops the function
         // decoding, and the shim sized them all before any kernel ran.
         let bdf = (bus as u16) << 8 | (dev as u16) << 3 | func as u16;
@@ -494,6 +518,7 @@ impl Pci {
             revision: class as u8,
             bars,
             msix,
+            msi,
             virtio_caps,
         })
     }
@@ -525,6 +550,46 @@ impl Pci {
             let ctrl = self.read16(d.bus, d.dev, d.func, m.cap + 2);
             self.write16(d.bus, d.dev, d.func, m.cap + 2, ctrl & !0x8000);
         }
+        self.disable_msi(d);
+    }
+
+    /// Program plain MSI with one vector (`address`, `data`) and enable it,
+    /// INTx off.  MSI-X, if the function also has it, stays off.
+    pub fn enable_msi(&self, d: &Device, address: u64, data: u32) {
+        let Some(m) = d.msi else { return };
+        let (b, dv, f, c) = (d.bus, d.dev, d.func, m.cap);
+        let ctrl = self.read16(b, dv, f, c + 2);
+        // Disabled while it changes; one vector (Multiple Message Enable 0).
+        self.write16(b, dv, f, c + 2, ctrl & !(1 | 0x70));
+        self.write32(b, dv, f, c + 4, address as u32);
+        let data_off = if m.is64 {
+            self.write32(b, dv, f, c + 8, (address >> 32) as u32);
+            c + 12
+        } else {
+            c + 8
+        };
+        self.write16(b, dv, f, data_off, data as u16);
+        if m.maskable {
+            // The mask bits follow the data (and a reserved word).
+            self.write32(b, dv, f, data_off + 4, 0);
+        }
+        let cmd = self.read16(b, dv, f, 4);
+        self.write16(b, dv, f, 4, cmd | 0x400);
+        self.write16(b, dv, f, c + 2, (ctrl & !0x70) | 1);
+    }
+
+    /// Turn plain MSI off.
+    pub fn disable_msi(&self, d: &Device) {
+        if let Some(m) = d.msi {
+            let ctrl = self.read16(d.bus, d.dev, d.func, m.cap + 2);
+            self.write16(d.bus, d.dev, d.func, m.cap + 2, ctrl & !1);
+        }
+    }
+
+    /// Turn bus mastering on or off, leaving decoding as it is.
+    pub fn bus_master(&self, d: &Device, on: bool) {
+        let cmd = self.read16(d.bus, d.dev, d.func, 4);
+        self.write16(d.bus, d.dev, d.func, 4, if on { cmd | 0x4 } else { cmd & !0x4 });
     }
 
     /// Enable MSI-X with all vectors unmasked at the function level.

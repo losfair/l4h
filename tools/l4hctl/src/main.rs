@@ -21,6 +21,7 @@ struct CreateOpts {
     io_pool: u64,
     nics: Vec<(u64, u64, u64)>,
     gpu: Option<(u64, u64)>,
+    usbs: Vec<u64>,
 }
 
 /// Where the PV on `disk` starts: dom0's only window on it, which holds
@@ -49,11 +50,27 @@ fn cmd_create(ctl: &Ctl, o: &CreateOpts) -> Result<u64> {
         io_pool: o.io_pool,
         nics: o.nics.clone(),
         gpu: o.gpu,
+        usbs: o.usbs.clone(),
     })?;
     for (&(sw, _, _), mac) in o.nics.iter().zip(macs) {
         eprintln!("vm {vm}: nic on switch {sw}, mac {}", fmt_mac(mac));
     }
     Ok(vm)
+}
+
+/// A USB controller named by its PCI address (bus:dev.fn) or index.
+fn usb_index(ctl: &Ctl, v: &str) -> Result<u64> {
+    if !v.contains(':') {
+        return parse_num(v);
+    }
+    let bdf = (|| {
+        let (bus, rest) = v.split_once(':')?;
+        let (dev, func) = rest.split_once('.')?;
+        let (b, d, f) = (u16::from_str_radix(bus, 16).ok()?, u16::from_str_radix(dev, 16).ok()?, u16::from_str_radix(func, 16).ok()?);
+        (b < 256 && d < 32 && f < 8).then_some(b << 8 | d << 3 | f)
+    })().ok_or(Error(format!("--usb: {v}: not a PCI address")))?;
+    let list = ctl.usbs()?;
+    list.iter().position(|u| u.bdf == bdf).map(|i| i as u64).ok_or(Error(format!("--usb: no xHCI controller at {v}")))
 }
 
 fn cmd_console(ctl: &Ctl, vm: u64, follow: bool, until: Option<&str>, timeout: Option<Duration>) -> Result<bool> {
@@ -131,6 +148,8 @@ const USAGE: &str = "usage: l4hctl <command>
   rtc-set [UNIX_SECONDS]       set the machine RTC in UTC (default: dom0's
                                current time, e.g. after NTP synchronizes)
   disks                        host disks, owners, capacities and attachments
+  usb [--json]                 host xHCI controllers: ports, state (firmware
+                               until a VM is given one, then idle or vm N)
   disk-zero DISK START SECTORS zero an unattached region
   disk-write DISK START FILE   seed an unattached region, then flush
   lv-extents DISK VG/LV [--pv-start SECTOR]
@@ -152,6 +171,9 @@ const USAGE: &str = "usage: l4hctl <command>
          [--io-pool MB]        device I/O buffer pool (power of two, 1-256;
                                default 4, or room for the GPU's buffers)
          [--gpu WxH]           a virtio-gpu display of W x H pixels
+         [--usb BUS:DEV.FN|I]... a whole xHCI controller, its ports and
+                               every device behind them (see usb); the
+                               default I/O pool grows 4 MiB for each
   shutdown VM [--reboot]       ask the VM to shut down (or reboot) cleanly
   destroy VM                   stop a VM and free its resources
   sched VM CAP                 cap each vCPU of VM at CAP% of a core (0: none)
@@ -468,6 +490,28 @@ fn run(args: &[String]) -> Result<i32> {
                 println!("disk {d}: pci {:02x}:{:02x}.{} {kind}, owner {owner}{failed}, sectors {}, attachments {}", bdf >> 8, (bdf >> 3) & 0x1f, bdf & 7, r.vals[4], r.vals[5]);
             }
         }
+        "usb" => {
+            let json = args.get(1).map(|s| s.as_str()) == Some("--json");
+            let list = ctl.usbs()?;
+            if json {
+                let rows: Vec<String> = list.iter().enumerate().map(|(i, u)| format!(
+                    "{{\"index\":{i},\"pci\":\"{:02x}:{:02x}.{}\",\"id\":\"{:04x}:{:04x}\",\"usb2_ports\":{},\"usb3_ports\":{},\"state\":\"{}\",\"vm\":{},\"refused\":{},\"reason\":\"{}\"}}",
+                    u.bdf >> 8, (u.bdf >> 3) & 0x1f, u.bdf & 7, u.vendor, u.device, u.usb2_ports, u.usb3_ports, u.state,
+                    u.owner.map_or("null".to_string(), |v| v.to_string()), u.refused, u.reason.replace('"', "'"))).collect();
+                println!("[{}]", rows.join(","));
+            } else {
+                for (i, u) in list.iter().enumerate() {
+                    let state = match (u.state, u.owner) {
+                        ("vm", Some(vm)) => format!("vm {vm}"),
+                        ("unsupported", _) => format!("unsupported: {}", u.reason),
+                        (s, _) => s.to_string(),
+                    };
+                    let ports = if u.state == "firmware" { String::new() } else { format!(", {} USB 2 + {} USB 3 ports", u.usb2_ports, u.usb3_ports) };
+                    println!("usb {i}: pci {:02x}:{:02x}.{} {:04x}:{:04x}, {state}{ports}, refused {}",
+                        u.bdf >> 8, (u.bdf >> 3) & 0x1f, u.bdf & 7, u.vendor, u.device, u.refused);
+                }
+            }
+        }
         "disk-zero" => {
             if args.len() != 4 { return err("disk-zero DISK START SECTORS"); }
             let disk = parse_num(&args[1])?;
@@ -541,6 +585,7 @@ fn run(args: &[String]) -> Result<i32> {
                 io_pool: 0,
                 nics: Vec::new(),
                 gpu: None,
+                usbs: Vec::new(),
             };
             let mut it = args[2..].iter();
             while let Some(a) = it.next() {
@@ -622,6 +667,10 @@ fn run(args: &[String]) -> Result<i32> {
                             }
                         }
                         o.nics.push((sw, mac, flags));
+                    }
+                    "--usb" => {
+                        let v = val()?;
+                        o.usbs.push(usb_index(&ctl, &v)?);
                     }
                     "--gpu" => {
                         let v = val()?;

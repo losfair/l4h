@@ -29,7 +29,7 @@ typedef int32_t l4h_s32;
 typedef int64_t l4h_s64;
 #endif
 
-#define L4H_ABI_VERSION 6
+#define L4H_ABI_VERSION 7
 
 /* ------------------------------------------------------------------------
  * Guest CSpace layout
@@ -170,6 +170,8 @@ typedef int64_t l4h_s64;
 #define L4H_DEV_AREA_VA(d)      (L4H_SPECIAL_BASE + 0x10000000ull + (l4h_u64)(d) * 0x10000ull)
 /* Bulk data area of the control device (dom0 only, L4H_CTL_LOAD_MAX). */
 #define L4H_CTL_DATA_VA         (L4H_SPECIAL_BASE + 0x20000000ull)
+/* Queue areas of USB controllers (L4H_USB_AREA_VA(n), n < L4H_MAX_GUEST_USB),
+ * from L4H_SPECIAL_BASE + 0x28000000. */
 /* The kernel's modules and module build tree, read-only (bootinfo.kmod_size
  * bytes, at most L4H_KMOD_MAX). */
 #define L4H_KMOD_VA             (L4H_SPECIAL_BASE + 0x30000000ull)
@@ -262,6 +264,7 @@ enum l4h_dev_type {
 	L4H_DEV_CTL = 3,        /* dom0 control channel (l4hctl) */
 	L4H_DEV_ATTEST = 4,     /* attestation by l4h-trustd, see l4h_attest_page */
 	L4H_DEV_MEM = 5,        /* memory hotplug, see l4h_mem_page */
+	L4H_DEV_USB = 6,        /* an xHCI controller driven by l4h-usbd, see l4h_usb_info */
 };
 
 struct l4h_dev_desc {
@@ -637,7 +640,25 @@ enum l4h_ctl_op {
 	 * bounds, extents that overlap); -EBUSY: conflicts with another
 	 * attachment or a dom0 boot range. */
 	L4H_CTL_BLK_ATTACH_EXTENTS = 39,
+	/* args: controller index -> vals: bdf, vendor | device << 16, USB 2
+	 * ports | USB 3 ports << 16, state (L4H_USB_STATE_*), owner vm (or -1),
+	 * requests refused (counted by usbd); data: the reason, for
+	 * L4H_USB_STATE_UNSUPPORTED.  -ENOENT past the last controller.  xHCI
+	 * controllers (DESIGN.md §9.7), listed at boot and left to the
+	 * firmware until the first USB_ATTACH claims one. */
+	L4H_CTL_USB_INFO = 40,
+	/* args: vm, controller index.  Before VM_START: give the VM the whole
+	 * controller.  Claims it first if it is still the firmware's.  -EBUSY
+	 * (another VM has it), -EIO (failed), -ENODEV (unsupported), -ENOSPC
+	 * (no device slot, or L4H_MAX_GUEST_USB already), -ENOMEM. */
+	L4H_CTL_USB_ATTACH = 41,
 };
+
+#define L4H_USB_STATE_FIRMWARE    0 /* not claimed: the firmware has it */
+#define L4H_USB_STATE_IDLE        1 /* claimed, halted, no VM */
+#define L4H_USB_STATE_VM          2 /* a VM has it */
+#define L4H_USB_STATE_FAILED      3 /* claim, reset or drain failed: until reboot */
+#define L4H_USB_STATE_UNSUPPORTED 4
 
 struct l4h_ctl_extent {
 	l4h_u64 start;          /* 512-byte sectors */
@@ -708,8 +729,302 @@ struct l4h_ctl_vm {
  * Hypercalls: seL4_Call(L4H_SLOT_HYP_EP) with the label below, arguments
  * in message registers, result in MR0.
  */
+/* ------------------------------------------------------------------------
+ * USB host controller (L4H_DEV_USB): a whole xHCI controller, which
+ * l4h-usbd drives for the guest (DESIGN.md §9.7).  The guest's USB core
+ * does enumeration, hubs and class drivers; it sends host-controller
+ * operations (slots, contexts, endpoints, root-hub ports) and one URB per
+ * transfer record.  The guest never names a DMA address other than I/O
+ * pool segments, never touches the controller, and never sees usbd's
+ * memory.
+ *
+ * The queue area (page_va, page_size = L4H_USB_AREA_PAGES pages at
+ * L4H_USB_AREA_VA(n)) is host memory shared with usbd:
+ *
+ *   page 0       read-only   struct l4h_usb_info (usbd -> guest)
+ *   page 1       read-write  struct l4h_usb_ctrl (guest -> usbd)
+ *   pages 2-3    read-write  control SQ, L4H_USB_CTL_SQ_SIZE records
+ *   pages 4-35   read-write  transfer SQ, L4H_USB_XFER_SQ_SIZE records
+ *   pages 36-67  read-only   completion queue (CQ), shared by both SQs
+ *   page 68      read-only   event queue (EQ)
+ *
+ * Indices are free-running u32s; entry i is at [i % size].  The producer
+ * owns the head, the consumer the tail.  usbd copies a record before it
+ * checks it, and checks every index the guest writes against its own
+ * copies.  It accepts a request only while fewer than L4H_USB_CQ_SIZE are
+ * accepted and not yet consumed from the CQ, so the CQ never overflows.
+ *
+ * Kicks: after writing a head or a tail of its own (or `reset_seq`), the
+ * guest signals kick_slot if `usbd_waiting` is set.  usbd sets it and
+ * looks at the indices again before it waits.
+ *
+ * Interrupts: usbd signals the guest's VMM, which raises the device's
+ * event on the vCPU the guest chose with L4H_HC_DEV_WRITE(index,
+ * L4H_USB_DEVOP_IRQ_VCPU, vcpu).  The handler drains the CQ and the EQ,
+ * then looks at cq_head and eq_head again.
+ *
+ * Control requests complete in order.  Transfers complete in order per
+ * endpoint (and stream); a URB_CANCEL completes the URB it names with
+ * L4H_USB_ST_CANCELLED once the controller can no longer touch its
+ * buffers, then completes itself.
+ *
+ * Reset: the guest writes reset_seq = the previous one plus one and kicks.
+ * usbd sets state = L4H_USB_RESETTING, halts and resets the controller
+ * (every slot is gone), completes every request it had accepted with
+ * L4H_USB_ST_SHUTDOWN (they fit in the CQ), restarts the controller, then
+ * writes reset_done = reset_seq and state = L4H_USB_READY, and raises
+ * the event.  Indices carry on: records still in the SQs are served
+ * after the reset (those naming a slot fail with L4H_USB_ST_NODEV).  A
+ * driver starting afresh sets its SQ heads to usbd's tails and its CQ and
+ * EQ tails to usbd's heads (page 0).  A controller error does the same of
+ * usbd's own accord, followed by an L4H_USB_EV_HC_RESET event.
+ */
+#define L4H_MAX_GUEST_USB       4
+#define L4H_USB_AREA_VA(n)      (L4H_SPECIAL_BASE + 0x28000000ull + (l4h_u64)(n) * 0x100000ull)
+#define L4H_USB_AREA_PAGES      69
+#define L4H_USB_MAGIC           0x6273756cu /* "lusb" */
+#define L4H_USB_VERSION         1
+
+#define L4H_USB_CTL_SQ_SIZE     32
+#define L4H_USB_XFER_SQ_SIZE    128
+#define L4H_USB_CQ_SIZE         256
+#define L4H_USB_EQ_SIZE         64
+#define L4H_USB_CTL_SQ_OFF      0x2000
+#define L4H_USB_XFER_SQ_OFF     0x4000
+#define L4H_USB_CQ_OFF          0x24000
+#define L4H_USB_EQ_OFF          0x44000
+#define L4H_USB_MAX_SEGS        16
+#define L4H_USB_MAX_ISO         48
+#define L4H_USB_MAX_PORTS       255
+#define L4H_USB_MAX_STREAMS     16
+
+/* l4h_usb_info.features */
+#define L4H_USB_F_ISOCH         (1u << 0)
+#define L4H_USB_F_STREAMS       (1u << 1)
+#define L4H_USB_F_CSZ           (1u << 2) /* 64-byte contexts (informational) */
+
+/* l4h_usb_info.state */
+#define L4H_USB_READY           1
+#define L4H_USB_RESETTING       2
+#define L4H_USB_DEAD            3   /* the controller failed: nothing completes */
+
+struct l4h_usb_index {
+	l4h_u32 v;
+	l4h_u32 pad[15];
+};
+
+/* Page 0, written by usbd only. */
+struct l4h_usb_info {
+	l4h_u32 magic;
+	l4h_u32 version;
+	l4h_u32 features;       /* L4H_USB_F_* */
+	l4h_u32 state;          /* L4H_USB_READY, ... */
+	l4h_u32 max_slots;      /* slot handles are 1..max_slots */
+	l4h_u32 max_ports;      /* root ports are 1..max_ports */
+	l4h_u32 usb2_ports;     /* ports with port_proto 2 */
+	l4h_u32 usb3_ports;     /* ports with port_proto 3 */
+	l4h_u32 max_streams;    /* per endpoint, a power of two (0: none) */
+	l4h_u32 max_transfer;   /* bytes of one URB */
+	l4h_u32 hci_version;    /* HCIVERSION, as BCD */
+	l4h_u32 reset_done;     /* the last reset_seq completed */
+	l4h_u32 mfindex;        /* MFINDEX, as usbd last read it */
+	l4h_u32 hc_resets;      /* resets so far, for any reason */
+	l4h_u32 reserved[2];
+	struct l4h_usb_index usbd_waiting;
+	struct l4h_usb_index ctl_sq_tail;
+	struct l4h_usb_index xfer_sq_tail;
+	struct l4h_usb_index cq_head;
+	struct l4h_usb_index eq_head;
+	struct l4h_usb_index lost_events; /* EQ was full: the guest rescans every port */
+	/* port_proto[p]: USB major revision (2 or 3) of root port p, 0: none */
+	l4h_u8 port_proto[L4H_USB_MAX_PORTS + 1];
+};
+
+/* Page 1, written by the guest only. */
+struct l4h_usb_ctrl {
+	struct l4h_usb_index ctl_sq_head;
+	struct l4h_usb_index xfer_sq_head;
+	struct l4h_usb_index cq_tail;
+	struct l4h_usb_index eq_tail;
+	struct l4h_usb_index reset_seq;
+};
+
+/* Control SQ ops (l4h_usb_ctl_req.op). */
+enum l4h_usb_op {
+	/* port -> val[0] = PORTSC */
+	L4H_USB_OP_PORT_GET = 1,
+	/* port, arg[0] = L4H_USB_PF_*, arg[1] = value */
+	L4H_USB_OP_PORT_SET = 2,
+	L4H_USB_OP_PORT_CLEAR = 3,
+	/* -> val[0] = slot handle */
+	L4H_USB_OP_SLOT_ENABLE = 4,
+	/* slot: its transfers complete first */
+	L4H_USB_OP_SLOT_DISABLE = 5,
+	/* slot, port = root port, arg[0] = route string, arg[1] = speed
+	 * (L4H_USB_SPEED_*), arg[2] = TT hub slot (0: none), arg[3] = TT port,
+	 * arg[4] = multi-TT, arg[5] = ep0 max packet, arg[6] = BSR (address
+	 * later) -> val[0] = the device's USB address */
+	L4H_USB_OP_ADDRESS = 6,
+	/* slot, drop = DCIs dropped (bit n = DCI n), n_eps entries in eps:
+	 * endpoints added (or changed: drop and add) */
+	L4H_USB_OP_EP_CONFIG = 7,
+	/* slot, arg[0] = ports, arg[1] = TT think time (0-3), arg[2] = multi-TT */
+	L4H_USB_OP_HUB_CONFIG = 8,
+	/* slot, arg[0] = ep0 max packet */
+	L4H_USB_OP_EP0_MPS = 9,
+	/* slot: Reset Device; every endpoint but ep0 is gone */
+	L4H_USB_OP_DEV_RESET = 10,
+	/* slot, arg[0] = DCI: clear the halt and the data toggle */
+	L4H_USB_OP_EP_RESET = 11,
+	/* slot, drop = DCIs, arg[0] = streams (a power of two, at most
+	 * max_streams; stream IDs are 1..streams-1) */
+	L4H_USB_OP_STREAMS_ALLOC = 12,
+	L4H_USB_OP_STREAMS_FREE = 13,
+	/* arg[0] = the tag of a transfer */
+	L4H_USB_OP_URB_CANCEL = 14,
+};
+
+/* Port features (L4H_USB_OP_PORT_SET / PORT_CLEAR arg[0]). */
+enum l4h_usb_port_feature {
+	L4H_USB_PF_POWER = 1,
+	L4H_USB_PF_RESET = 2,           /* set only */
+	L4H_USB_PF_WARM_RESET = 3,      /* set only, USB 3 ports */
+	L4H_USB_PF_LINK_STATE = 4,      /* set only: value = PLS 0 (U0), 3 (U3), 4 (disabled), 5 (RxDetect), 15 (resume) */
+	L4H_USB_PF_ENABLE = 5,          /* clear only: disable a USB 2 port */
+	L4H_USB_PF_WAKE = 6,            /* set: value = bit 0 connect, 1 disconnect, 2 over-current */
+	L4H_USB_PF_CHANGE = 7,          /* clear only: value = PORTSC change bits (17-23) */
+};
+
+#define L4H_USB_SPEED_FULL      1
+#define L4H_USB_SPEED_LOW       2
+#define L4H_USB_SPEED_HIGH      3
+#define L4H_USB_SPEED_SUPER     4
+#define L4H_USB_SPEED_SUPER_PLUS 5
+
+/* xHCI endpoint types. */
+#define L4H_USB_EP_ISOC_OUT     1
+#define L4H_USB_EP_BULK_OUT     2
+#define L4H_USB_EP_INT_OUT      3
+#define L4H_USB_EP_CONTROL      4
+#define L4H_USB_EP_ISOC_IN      5
+#define L4H_USB_EP_BULK_IN      6
+#define L4H_USB_EP_INT_IN       7
+
+struct l4h_usb_ep {
+	l4h_u8 dci;             /* 2..31 */
+	l4h_u8 type;            /* L4H_USB_EP_* */
+	l4h_u8 interval;        /* xHCI interval (2^n * 125 us), 0..15 */
+	l4h_u8 burst_mult;      /* max burst (bits 0-3), mult (bits 4-5) */
+	l4h_u16 max_packet;
+	l4h_u16 max_esit;       /* max ESIT payload, bytes */
+};
+
+#define L4H_USB_CTL_EPS         30
+
+struct l4h_usb_ctl_req {
+	l4h_u32 op;             /* enum l4h_usb_op */
+	l4h_u32 tag;            /* returned in the completion */
+	l4h_u16 slot;
+	l4h_u8 port;
+	l4h_u8 n_eps;
+	l4h_u32 drop;
+	union {
+		struct l4h_usb_ep eps[L4H_USB_CTL_EPS];
+		l4h_u32 arg[60];
+	};
+};
+
+/* Transfer SQ records: one URB each. */
+#define L4H_USB_XFER_CONTROL    0
+#define L4H_USB_XFER_BULK       1
+#define L4H_USB_XFER_INT        2
+#define L4H_USB_XFER_ISOC       3
+
+#define L4H_USB_XF_IN           (1u << 0)  /* device to host */
+#define L4H_USB_XF_ZERO_PACKET  (1u << 1)  /* OUT: end with a zero-length packet */
+#define L4H_USB_XF_SHORT_NOT_OK (1u << 2)  /* IN: a short packet is an error */
+#define L4H_USB_XF_ISO_ASAP     (1u << 3)  /* start_frame ignored */
+
+struct l4h_usb_seg {
+	l4h_u64 gpa;            /* in the I/O pool */
+	l4h_u32 len;
+	l4h_u32 reserved;
+};
+
+struct l4h_usb_iso {
+	l4h_u32 offset;         /* in the transfer's data */
+	l4h_u32 len;
+};
+
+struct l4h_usb_xfer_req {
+	l4h_u32 tag;
+	l4h_u16 slot;
+	l4h_u8 dci;             /* 1 (ep0) .. 31 */
+	l4h_u8 type;            /* L4H_USB_XFER_* */
+	l4h_u32 flags;          /* L4H_USB_XF_* */
+	l4h_u32 stream;         /* 0: none */
+	l4h_u32 start_frame;
+	l4h_u32 length;         /* bytes: the segments together */
+	l4h_u16 n_segs;
+	l4h_u16 n_iso;
+	l4h_u32 reserved0;
+	l4h_u8 setup[8];        /* control transfers */
+	l4h_u32 reserved[6];
+	struct l4h_usb_seg segs[L4H_USB_MAX_SEGS];
+	struct l4h_usb_iso iso[L4H_USB_MAX_ISO];
+	l4h_u8 pad[1024 - 64 - 16 * L4H_USB_MAX_SEGS - 8 * L4H_USB_MAX_ISO];
+};
+
+/* Completion status: 0 or a negative errno, as Linux's USB core uses them. */
+#define L4H_USB_ST_OK           0
+#define L4H_USB_ST_INVALID      (-22)   /* -EINVAL: refused by usbd */
+#define L4H_USB_ST_NODEV        (-19)   /* -ENODEV: no such slot or device */
+#define L4H_USB_ST_STALL        (-32)   /* -EPIPE */
+#define L4H_USB_ST_PROTO        (-71)   /* -EPROTO: transaction error */
+#define L4H_USB_ST_BABBLE       (-75)   /* -EOVERFLOW */
+#define L4H_USB_ST_SHORT        (-121)  /* -EREMOTEIO: short, with SHORT_NOT_OK */
+#define L4H_USB_ST_CANCELLED    (-104)  /* -ECONNRESET */
+#define L4H_USB_ST_SHUTDOWN     (-108)  /* -ESHUTDOWN: controller reset */
+#define L4H_USB_ST_TIMEOUT      (-62)   /* -ETIME: a command timed out */
+#define L4H_USB_ST_MISSED       (-18)   /* -EXDEV: isoch packet not sent */
+#define L4H_USB_ST_NOSPC        (-28)   /* -ENOSPC: no slot, ring or bandwidth */
+#define L4H_USB_ST_IO           (-5)    /* -EIO: any other failure */
+
+#define L4H_USB_CQ_CTL          1u      /* l4h_usb_cqe.kind: a control request */
+#define L4H_USB_CQ_XFER         2u      /* a transfer */
+
+struct l4h_usb_cqe {
+	l4h_u32 tag;
+	l4h_u32 kind;           /* L4H_USB_CQ_* */
+	l4h_s32 status;
+	l4h_u32 actual;         /* bytes transferred */
+	l4h_u32 start_frame;
+	l4h_u32 error_count;    /* isoch packets with errors */
+	l4h_u32 n_iso;
+	l4h_u32 val[2];
+	l4h_u32 reserved[7];
+	struct {
+		l4h_s32 status;
+		l4h_u32 actual;
+	} iso[L4H_USB_MAX_ISO];
+	l4h_u8 pad[512 - 64 - 8 * L4H_USB_MAX_ISO];
+};
+
+#define L4H_USB_EV_PORT         1       /* port, portsc: a change bit is set */
+#define L4H_USB_EV_HC_RESET     2       /* every slot is gone: re-enumerate */
+
+struct l4h_usb_event {
+	l4h_u32 type;           /* L4H_USB_EV_* */
+	l4h_u32 port;
+	l4h_u32 portsc;
+	l4h_u32 reserved[5];
+};
+
+/* L4H_HC_DEV_WRITE ops of an L4H_DEV_USB device. */
+#define L4H_USB_DEVOP_IRQ_VCPU  5       /* MR2 = vCPU of the device's event */
+
 enum l4h_hypercall {
-	L4H_HC_POWER = 2,           /* MR0 = L4H_POWER_* */
+	L4H_HC_POWER = 2,         /* MR0 = L4H_POWER_* */
 	L4H_HC_DEV_WRITE = 3,       /* MR0 = device index, MR1 = L4H_VIRTIO_OP_*, MR2.. = args */
 	L4H_HC_GET_TIME = 6,        /* returns MR0 = wall clock ns since epoch */
 };

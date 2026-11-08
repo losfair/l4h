@@ -22,6 +22,7 @@ pub mod net;
 pub mod ring;
 pub mod serial;
 pub mod trust;
+pub mod usb;
 pub mod vmmgr;
 
 /// Whether host components print informational messages.  The serial port
@@ -130,12 +131,13 @@ pub const KIND_TRUSTD: u32 = 4;
 pub const KIND_MEMD: u32 = 5;
 pub const KIND_VMMGR: u32 = 6;
 pub const KIND_LOGD: u32 = 7;
+pub const KIND_USBD: u32 = 8;
 
 /// The kinds that answer requests: root calls memd and asks blkd and netd
 /// (mailbox), guests' VMMs call vmmgr.  A caller could not wait for their
 /// faults to be reported, so a keeper thread answers for a failed one.
 pub const fn has_keeper(kind: u32) -> bool {
-    matches!(kind, KIND_BLKD | KIND_NETD | KIND_MEMD | KIND_VMMGR)
+    matches!(kind, KIND_BLKD | KIND_NETD | KIND_MEMD | KIND_VMMGR | KIND_USBD)
 }
 
 /// Badge bit of a fault message on a parent's endpoint (a component's on
@@ -193,6 +195,9 @@ pub const VDEV_CTL: u32 = 3;
 pub const VDEV_GPU: u32 = 4;
 /// Zero-capacity virtio-blk placeholder, with no backend channel.
 pub const VDEV_BLK_UNAVAILABLE: u32 = 5;
+/// A USB controller (l4h_abi::DEV_USB): the VMM only raises its event when
+/// usbd signals vmm_badge_usb(chan_kick_slot); it maps nothing of it.
+pub const VDEV_USB: u32 = 6;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -305,6 +310,11 @@ pub const VMM_BADGE_MEM: u64 = 1 << 2;
 pub const VMM_BADGE_CONSOLE: u64 = 1 << 3;
 /// The guest made a hotplug request in its memory device page.
 pub const VMM_BADGE_MEM_REQ: u64 = 1 << 4;
+/// usbd has completions for the guest's USB controller n (n <
+/// usb::MAX_GUEST_USB): raise its event.
+pub const fn vmm_badge_usb(n: usize) -> u64 {
+    1 << (8 + n)
+}
 
 /// The architectural time counter that seL4 deadlines (seL4_TCB_SetTimer)
 /// are expressed in: the TSC on x86_64, the virtual counter on aarch64.

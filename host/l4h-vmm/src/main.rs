@@ -30,6 +30,16 @@ enum Dev {
     Blk(Device<blk::Blk>),
     Net(Device<net::Net>),
     Gpu(Device<gpu::Gpu>),
+    Usb(Usb),
+}
+
+/// A USB controller (DESIGN.md §9.7): usbd and the guest share its queue
+/// area, which the VMM never maps.  It only relays usbd's signal to the
+/// vCPU the guest routed the device's event to.
+struct Usb {
+    event: u32,
+    vcpu: usize,
+    badge: u64,
 }
 const _: () = assert!(core::mem::size_of::<[Option<Dev>; host::VMM_MAX_DEVICES]>() + (64 << 10) <= host::VMM_STACK_SIZE);
 
@@ -39,6 +49,13 @@ impl Dev {
             Dev::Blk(d) => d.op(mem, vcpus, op, a, b),
             Dev::Net(d) => d.op(mem, vcpus, op, a, b),
             Dev::Gpu(d) => d.op(mem, vcpus, op, a, b),
+            Dev::Usb(u) => match op {
+                abi::usb::DEVOP_IRQ_VCPU if (a as usize) < vcpus.n => {
+                    u.vcpu = a as usize;
+                    0
+                }
+                _ => u64::MAX,
+            },
         }
     }
 
@@ -47,6 +64,7 @@ impl Dev {
             Dev::Blk(d) => d.poll(mem, vcpus, 0),
             Dev::Net(d) => d.poll(mem, vcpus, 0),
             Dev::Gpu(d) => d.poll(mem, vcpus, 0),
+            Dev::Usb(_) => {}
         }
     }
 
@@ -55,6 +73,7 @@ impl Dev {
             Dev::Blk(d) => d.complete(mem, vcpus),
             Dev::Net(d) => d.complete(mem, vcpus),
             Dev::Gpu(d) => d.complete(mem, vcpus),
+            Dev::Usb(_) => {}
         }
     }
 }
@@ -132,6 +151,7 @@ fn main(info: &'static Info) -> ! {
                 d.event,
                 gpu::Gpu::new(d.chan_va as usize, d.chan_size, d.width, d.height),
             )),
+            host::VDEV_USB => Dev::Usb(Usb { event: d.event, vcpu: 0, badge: host::vmm_badge_usb(d.chan_kick_slot as usize) }),
             k => panic!("l4h-vmm: unsupported device kind {}", k),
         };
         devs[idx] = Some(dev);
@@ -170,6 +190,12 @@ fn main(info: &'static Info) -> ! {
             // device.
             for idx in devices.iter().map(|d| d.guest_index as usize) {
                 let Some(d) = devs[idx].as_mut() else { continue };
+                if let Dev::Usb(u) = d {
+                    if badge & u.badge != 0 {
+                        vcpus.raise(u.vcpu, u.event);
+                    }
+                    continue;
+                }
                 if badge & host::VMM_BADGE_DONE != 0 {
                     d.complete(&mem, &vcpus);
                 }

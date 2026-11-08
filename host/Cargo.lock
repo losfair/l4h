@@ -401,6 +401,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "l4h-usbd"
+version = "0.1.0"
+dependencies = [
+ "l4h-abi",
+ "l4h-rt",
+ "l4h-virtio",
+]
+
+[[package]]
 name = "l4h-virtio"
 version = "0.1.0"
 
