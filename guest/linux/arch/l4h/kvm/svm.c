@@ -946,6 +946,17 @@ static fastpath_t l4h_vcpu_run(struct kvm_vcpu *vcpu, u64 run_flags)
 		l4h_cancel_injection(vcpu);
 		return EXIT_FASTPATH_NONE;
 	}
+	/*
+	 * As svm_vcpu_run(): the event this entry injects would push the
+	 * single-step TF and RF in its frame, where handle_db() cannot take
+	 * them back.  Upstream forces an immediate exit to open the NMI window
+	 * after delivery; nothing makes VMEnter return that early, so it is
+	 * looked at again at the next exit.
+	 */
+	if (s->nmi_singlestep && (s->event_inj & SVM_EVTINJ_VALID)) {
+		disable_nmi_singlestep(vcpu);
+		kvm_make_request(KVM_REQ_EVENT, vcpu);
+	}
 	sync_to_vcpu(vcpu);
 	if (s->event_inj & SVM_EVTINJ_VALID_ERR)
 		vmcb_wr(vcpu, VMCB_OFF(control.event_inj), s->event_inj | (u64)s->event_inj_err << 32);

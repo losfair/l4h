@@ -26,6 +26,7 @@
 extern const char rm_start[], rm_end[], lm_start[], lm_end[], probe_start[], probe_end[];
 extern const char fpu_start[], fpu_end[], xcr0_start[], xcr0_end[], smap_start[], smap_end[];
 extern const char state_start[], state_end[], rdpmc_start[], rdpmc_end[];
+extern const char nmiss_start[], nmiss_ud[], nmiss_nmi[], nmiss_end[];
 __asm__(".pushsection .rodata\n"
 	/* Real mode: "OK" to port 0x3f8, then hlt. */
 	".code16\n"
@@ -176,6 +177,18 @@ __asm__(".pushsection .rodata\n"
 	"  out %eax, %dx\n"
 	"  hlt\n"
 	"rdpmc_end:\n"
+	/* UD2, whose #UD handler sends the RFLAGS in its frame to port 0x40;
+	 * the NMI handler only returns. */
+	"nmiss_start:\n"
+	"  ud2\n"
+	"nmiss_ud:\n"
+	"  mov 16(%rsp), %rax\n"
+	"  mov $0x40, %dx\n"
+	"  out %eax, %dx\n"
+	"  hlt\n"
+	"nmiss_nmi:\n"
+	"  iretq\n"
+	"nmiss_end:\n"
 	".popsection\n");
 
 static int failures;
@@ -673,6 +686,68 @@ static int rdpmc(int kvm)
 	return 0;
 }
 
+/* A 64-bit interrupt gate to `addr` in the code segment. */
+static void gate64(uint8_t *idt, int vector, uint64_t addr)
+{
+	uint32_t *g = (uint32_t *)(idt + vector * 16);
+
+	g[0] = (addr & 0xffff) | 8 << 16;
+	g[1] = (addr & 0xffff0000) | 0x8e00;
+	g[2] = addr >> 32;
+	g[3] = 0;
+}
+
+/*
+ * An NMI pending in an STI shadow: KVM single-steps the guest to the NMI
+ * window with TF and RF set.  The #UD it then injects for a UD2 must not
+ * carry that TF in its frame, where nothing could take it back, and the
+ * NMI must still be delivered.
+ */
+static int nmi_singlestep_event(int kvm)
+{
+	struct kvm_vcpu_events ev;
+	struct kvm_sregs sregs;
+	struct kvm_regs regs;
+	struct vm vm;
+	uint32_t flags;
+
+	if (vm_create(&vm, kvm) || enter_long_mode(&vm, nmiss_start, nmiss_end, 0, 0))
+		return -1;
+	gate64(vm.mem + 0x20000, 2, 0x1000 + (nmiss_nmi - nmiss_start));
+	gate64(vm.mem + 0x20000, 6, 0x1000 + (nmiss_ud - nmiss_start));
+	/* Delivery and IRETQ load CS and SS from the GDT: seg64's. */
+	((uint64_t *)(vm.mem + 0x21000))[1] = 0x00af9b000000ffff;
+	((uint64_t *)(vm.mem + 0x21000))[2] = 0x00cf93000000ffff;
+	CHECK(ioctl(vm.vcpu, KVM_GET_SREGS, &sregs) == 0, "KVM_GET_SREGS");
+	sregs.idt.base = 0x20000;
+	sregs.idt.limit = 0xfff;
+	sregs.gdt.base = 0x21000;
+	sregs.gdt.limit = 23;
+	CHECK(ioctl(vm.vcpu, KVM_SET_SREGS, &sregs) == 0, "KVM_SET_SREGS");
+	CHECK(ioctl(vm.vcpu, KVM_GET_REGS, &regs) == 0, "KVM_GET_REGS");
+	regs.rsp = 0x30000;
+	CHECK(ioctl(vm.vcpu, KVM_SET_REGS, &regs) == 0, "KVM_SET_REGS");
+	CHECK(ioctl(vm.vcpu, KVM_GET_VCPU_EVENTS, &ev) == 0, "KVM_GET_VCPU_EVENTS");
+	ev.nmi.pending = 1;
+	ev.interrupt.shadow = KVM_X86_SHADOW_INT_STI;
+	ev.flags = KVM_VCPUEVENT_VALID_NMI_PENDING | KVM_VCPUEVENT_VALID_SHADOW;
+	CHECK(ioctl(vm.vcpu, KVM_SET_VCPU_EVENTS, &ev) == 0, "KVM_SET_VCPU_EVENTS");
+	CHECK(ioctl(vm.vcpu, KVM_RUN, 0) == 0, "KVM_RUN");
+	CHECK(vm.run->exit_reason == KVM_EXIT_IO && vm.run->io.port == 0x40,
+	      "nmi single-step: exit %u", vm.run->exit_reason);
+	flags = *(uint32_t *)((char *)vm.run + vm.run->io.data_offset);
+	CHECK(!(flags & 0x100), "nmi single-step: the #UD frame has RFLAGS %x, with TF", flags);
+	/* The NMI still comes, and its handler returns to the HLT. */
+	CHECK(ioctl(vm.vcpu, KVM_RUN, 0) == 0, "KVM_RUN");
+	CHECK(vm.run->exit_reason == KVM_EXIT_HLT, "nmi single-step: exit %u after the #UD",
+	      vm.run->exit_reason);
+	CHECK(ioctl(vm.vcpu, KVM_GET_VCPU_EVENTS, &ev) == 0, "KVM_GET_VCPU_EVENTS");
+	CHECK(!ev.nmi.pending && !ev.nmi.injected, "nmi single-step: the NMI was not delivered");
+	vm_destroy(&vm);
+	printf("KVMTEST: nmi single-step and an injected exception ok\n");
+	return 0;
+}
+
 struct job {
 	int kvm, ret;
 };
@@ -708,6 +783,7 @@ int main(void)
 	smap_paging(kvm);
 	state_between_runs(kvm);
 	rdpmc(kvm);
+	nmi_singlestep_event(kvm);
 	for (i = 0; i < 2; i++) {
 		jobs[i].kvm = kvm;
 		pthread_create(&t[i], NULL, parallel_vm, &jobs[i]);

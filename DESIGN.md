@@ -982,8 +982,11 @@ vendor, as seL4 makes it).
   until the next entry, and `WriteVMCB` writes through. `svm.c` follows
   Linux's `svm/svm.c`: CR0 and CR4 writes and CR8 always exit, CR0 reads
   only when the CPU's CR0 differs from the guest's, CR3 never; NMI masking
-  is tracked to the IRET (no vNMI); IRQ windows are a V_IRQ at the highest
-  priority. Nested KVM gives L1 no decode assists, so CR, DR and string I/O
+  is tracked to the IRET (no vNMI), and an NMI blocked by an interrupt
+  shadow is single-stepped to, except on an entry that injects an event,
+  whose frame would keep the TF (the window is looked at again at the next
+  exit, as VMEnter has no immediate exit); IRQ windows are a V_IRQ at the
+  highest priority. Nested KVM gives L1 no decode assists, so CR, DR and string I/O
   exits go through KVM's emulator. seL4 keeps #DB, #AC and #MC
   intercepted; the debug registers always exit, as on VT-x, and so does
   XSETBV, whose XCR0 reaches seL4 as on VT-x (FPU below).
@@ -3973,7 +3976,7 @@ machine and guests of 256–512 MiB.
 | `tests/run-fuzz.sh` | hostile-guest virtqueue fuzzing of l4h-vmm |
 | `tests/run-skimtest.sh` | the skim-xapic-nopcid variant on a Meltdown-affected CPU without PCID/x2APIC: SKIM mappings and syscall state at the user/kernel boundary (`tests/skim-qemu.py`, GDB); VT-x stays off (`run-vtxtest.sh skim`) |
 | `tests/run-kvmbench.sh l4h\|linux` | KVM exit, EPT or nested page fault and guest compute timings (`tests/guest/kvmbench.c`) and boot times under QEMU, Firecracker and cloud-hypervisor, with L1 l4h's dom0 or the host's Linux kernel in QEMU, both on nested KVM with two vCPUs (§5.10); `KVMBENCH_CMDLINE` adds to dom0's command line |
-| `tests/run-kvmtest.sh [vmm] [vcpus]` | KVM in dom0 (§5.10; needs nested VMX or SVM, `-cpu host`): `tests/guest/kvmtest.c` runs real- and long-mode VMs with port I/O, MMIO, 62 MiB of EPT faults, a run long enough to be preempted, a replaced memslot, dirty logging, vector registers across migrations inside `KVM_RUN`, XCR0 and CPUID after XSETBV and CR4 changes, SMAP set before paging, IDTR and CR4 changed between runs on one core and then two (SVM's clean bits), an RDPMC (always an exit), two VMs at once and 20 in a row; `vmm` also boots the host's kernel (`KVMTEST_KERNEL`) with two vCPUs under the host's QEMU and the pinned Firecracker and cloud-hypervisor releases (`KVMTEST_VMMS`). CI runs it in the VT-x/AMD-V step where the runner has nested virtualization |
+| `tests/run-kvmtest.sh [vmm] [vcpus]` | KVM in dom0 (§5.10; needs nested VMX or SVM, `-cpu host`): `tests/guest/kvmtest.c` runs real- and long-mode VMs with port I/O, MMIO, 62 MiB of EPT faults, a run long enough to be preempted, a replaced memslot, dirty logging, vector registers across migrations inside `KVM_RUN`, XCR0 and CPUID after XSETBV and CR4 changes, SMAP set before paging, IDTR and CR4 changed between runs on one core and then two (SVM's clean bits), an RDPMC (always an exit), an exception injected while KVM single-steps to an NMI window, two VMs at once and 20 in a row; `vmm` also boots the host's kernel (`KVMTEST_KERNEL`) with two vCPUs under the host's QEMU and the pinned Firecracker and cloud-hypervisor releases (`KVMTEST_VMMS`). CI runs it in the VT-x/AMD-V step where the runner has nested virtualization |
 | `tests/run-vtxtest.sh off\|on\|skim` | VT-x or AMD-V below l4h-root (patches 0038 and 0040, by the host's CPU), with `tests/vtxprobe.c` as the root task on 4 cores: `off` (`-cpu host,-vmx,-svm`) boots without them and refuses VCPU and EPT objects; `on` (`-cpu host`, nested KVM) creates them, binds the VCPU to a TCB and checks that WriteMSR refuses a noncanonical KERNEL_GS_BASE, and on AMD runs a real-mode guest to an I/O exit, a nested page fault, an INVD exit it did not ask for and a HLT and checks that seL4 keeps its intercepts and refuses the VMCB fields it owns; `skim` keeps VT-x off. CI runs `off` always and `on`, with the 1-vCPU self-test, where the runner has nested virtualization, and says in the job summary when it has not |
 | `tools/lint-shell.sh [-a]` | ShellCheck over every tracked shell script (`*.sh`, and sh/bash shebangs such as the guest init scripts): fails on error-severity findings and on SC2251, a bare `! cmd` that `set -e` ignores; `-a` also prints warnings and notes without failing. CI runs it in the installer job |
 | `python3 tests/blkmq-qemu.py` | block multiqueue and fsync suites under local QEMU (`--suite blkmq\|fsync`, `--guest-queues`, `--scsi-queues`); run by hand |
