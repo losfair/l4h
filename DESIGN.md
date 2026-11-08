@@ -2524,8 +2524,10 @@ controller, one per claimed controller, and the guest forwards Linux's
   blkd and netd, a bug in usbd or a controller erratum.
 - **Release.** `GUEST_DEL` cuts the controller off without waiting for
   usbd: root revokes the guest's copies of the queue frames, turns bus
-  mastering off (the controller can no longer reach memory, so the pool can
-  be reused at once, with or without an IOMMU), unmaps the pool from the
+  mastering off and reads the command register back (the controller can
+  issue no more DMA, and that read's completion cannot pass the writes it
+  already posted, so they are in memory: the pool can be reused at once,
+  with or without an IOMMU), unmaps the pool from the
   domain, deletes usbd's copy of the VMM notification (usbd signals it with
   NBSend, which an empty slot ignores) and posts `MBOX_REMOVE`. usbd then
   halts and resets the controller and forgets every URB; when it reports

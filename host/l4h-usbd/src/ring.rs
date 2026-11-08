@@ -28,10 +28,6 @@ pub struct Ring {
     pub deq: u16,
     /// Isoch: the start frame of an URB that follows those on the ring.
     pub next_frame: u32,
-    /// Where the no-ops of URBs cancelled after every posted URB begin
-    /// (NONE: none).  The controller has yet to pass them: they go with the
-    /// next URB posted.
-    pub hole: u16,
     /// URBs, oldest first.
     pub head: u16,
     pub tail: u16,
@@ -40,7 +36,7 @@ pub struct Ring {
     pub stream: u16,
 }
 
-const FREE_RING: Ring = Ring { used: false, enq: 0, cycle: 1, deq: 0, next_frame: 0, hole: NONE, head: NONE, tail: NONE, slot: 0, dci: 0, stream: 0 };
+const FREE_RING: Ring = Ring { used: false, enq: 0, cycle: 1, deq: 0, next_frame: 0, head: NONE, tail: NONE, slot: 0, dci: 0, stream: 0 };
 
 static mut RINGS: [Ring; USB_RINGS] = [FREE_RING; USB_RINGS];
 
@@ -96,7 +92,7 @@ impl Rings {
         link.w64(0, dma.pa(off));
         link.w32(12, (proto::TRB_LINK << 10) | proto::TRB_TC);
         let ring = &mut self.rings[r as usize];
-        (ring.enq, ring.cycle, ring.deq, ring.hole) = (0, 1, 0, NONE);
+        (ring.enq, ring.cycle, ring.deq) = (0, 1, 0);
     }
 
     /// Position `pos` as an offset from `first`, going round the ring.
@@ -181,6 +177,30 @@ impl Rings {
         dma_fence(Ordering::SeqCst);
     }
 
+    /// Take back the TRBs from `to` (where a posted URB's start, padding
+    /// included) to the enqueue pointer, on a stopped ring the controller
+    /// has not reached them on: each loses its cycle bit, the Link TRB too
+    /// if they cross it, so the controller stops at `to` until the next
+    /// URB is written there.
+    pub fn rewind(&mut self, dma: Region, r: u16, to: u16) {
+        let off = dma.ring(r as usize);
+        let ring = &mut self.rings[r as usize];
+        let cycle = Mmio(dma.va(off + to as usize * 16)).r32(12) & proto::TRB_CYCLE;
+        let mut p = to;
+        while p != ring.enq {
+            let e = Mmio(dma.va(off + p as usize * 16));
+            e.w32(12, e.r32(12) ^ proto::TRB_CYCLE);
+            p += 1;
+            if p == USABLE {
+                let link = Mmio(dma.va(off + USABLE as usize * 16));
+                link.w32(12, link.r32(12) ^ proto::TRB_CYCLE);
+                p = 0;
+            }
+        }
+        dma_fence(Ordering::SeqCst);
+        (ring.enq, ring.cycle) = (to, cycle);
+    }
+
     /// Where a stopped ring resumes: the oldest posted URB, or the enqueue
     /// pointer; and the cycle bit there.
     pub fn resume_point(&self, dma: Region, urbs: &Urbs, r: u16) -> (u16, u32) {
@@ -214,17 +234,10 @@ impl Rings {
         u
     }
 
-    /// The controller is at the enqueue pointer (Set TR Dequeue there):
-    /// it has passed everything on ring `r`.
-    pub fn passed_all(&mut self, r: u16) {
-        let ring = &mut self.rings[r as usize];
-        (ring.hole, ring.deq) = (NONE, ring.enq);
-    }
-
     /// Take URB `u` off ring `r`: completed, or cancelled.  The TRBs of
-    /// one after the oldest posted URB (made no-ops) are the controller's
-    /// until it is past them, so they go to the posted URB after it, or to
-    /// the next one posted.  Returns the URB after it.
+    /// one after the oldest posted URB, made no-ops, are the controller's
+    /// until it is past them: they go to the posted URB after it (with
+    /// none, the ring was wound back over them).  Returns the URB after it.
     pub fn unlink(&mut self, urbs: &mut Urbs, r: u16, u: u16) -> u16 {
         let ring = &mut self.rings[r as usize];
         let next = urbs.get(u).next;
@@ -243,10 +256,8 @@ impl Rings {
             urbs.get_mut(prev).next = next;
             if urbs.get(u).posted {
                 let start = urbs.get(u).start;
-                // Any hole is after it: the no-ops now start earlier.
-                match next {
-                    n if n != NONE && urbs.get(n).posted => urbs.get_mut(n).start = start,
-                    _ => ring.hole = start,
+                if next != NONE && urbs.get(next).posted {
+                    urbs.get_mut(next).start = start;
                 }
             }
         }
@@ -255,7 +266,6 @@ impl Rings {
         }
         ring.deq = match ring.head {
             h if h != NONE && urbs.get(h).posted => urbs.get(h).start,
-            _ if ring.hole != NONE => ring.hole,
             _ => ring.enq,
         };
         next

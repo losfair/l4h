@@ -586,10 +586,17 @@ impl Pci {
         }
     }
 
-    /// Turn bus mastering on or off, leaving decoding as it is.
+    /// Turn bus mastering on or off, leaving decoding as it is.  Off,
+    /// the device issues no more DMA, and what it already issued has
+    /// reached memory on return: the command register is read back, and
+    /// that read's completion may not pass the device's posted writes
+    /// (PCIe 6.0 §2.4.1, root-issued requests carry no Relaxed Ordering).
     pub fn bus_master(&self, d: &Device, on: bool) {
         let cmd = self.read16(d.bus, d.dev, d.func, 4);
         self.write16(d.bus, d.dev, d.func, 4, if on { cmd | 0x4 } else { cmd & !0x4 });
+        if !on {
+            let _ = self.read16(d.bus, d.dev, d.func, 4);
+        }
     }
 
     /// Enable MSI-X with all vectors unmasked at the function level.
