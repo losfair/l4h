@@ -2484,15 +2484,18 @@ controller, one per claimed controller, and the guest forwards Linux's
   in the CQE; with CFC, TDs carry Frame IDs from it, the device speed and
   the service interval (SIA when it is out of the valid window, or ASAP).
   An isoch TD that fails before its last TRB stays on the ring until an
-  event shows the controller past it. A TD crosses the Link TRB only where its data
+  event shows the controller past it; an event on a later isoch URB retires
+  the ones before it, their unreported TDs missed (a Missed Service event
+  may carry no TRB pointer). A TD crosses the Link TRB only where its data
   before it ends on a packet boundary (xHCI §4.11.7.1); otherwise its URB
   goes at the start of the ring after no-ops, which even an empty ring has
   room for, and which stay reserved until the URB completes. Commands run one at a time, polling the
   event ring (5 s timeout). An endpoint halted by an error is recovered
   with Reset Endpoint and Set TR Dequeue past the failed URB, as Linux
   does; a cancelled URB is skipped (dequeue moved, or its TRBs made
-  no-ops, which stay reserved with the URB after them until the
-  controller is past them) and completed only once the endpoint has stopped, and every
+  no-ops, unchained, which stay reserved with the URB after them until the
+  controller is past them, or wound back off a stopped ring after its last
+  posted URB) and completed only once the endpoint has stopped, and every
   stream of the endpoint restarted. One whose record usbd has not taken
   (it waits behind a full CQ) is marked to be skipped and never completes
   (`ST_DROPPED`; the guest gives it back). A URB that

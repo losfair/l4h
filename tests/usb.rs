@@ -89,6 +89,13 @@ fn endpoint_ranges() {
     assert!(!ep_ok(&ep(3, abi::EP_INT_IN, 9, 0, 3, 8), abi::SPEED_LOW));
     assert!(!ep_ok(&ep(3, abi::EP_INT_IN, 8, 0, 16, 8), abi::SPEED_LOW), "interval > 15");
     assert!(!ep_ok(&ep(3, abi::EP_INT_IN, 8, 0, 3, 9), abi::SPEED_LOW), "ESIT beyond a packet");
+    // SuperSpeed interrupt bursts up to 16 packets of 1024; high speed
+    // has at most 2 more transactions.
+    assert!(ep_ok(&ep(3, abi::EP_INT_IN, 1024, 3, 0, 4096), abi::SPEED_SUPER));
+    assert!(ep_ok(&ep(3, abi::EP_INT_IN, 1024, 15, 0, 16384), abi::SPEED_SUPER));
+    assert!(!ep_ok(&ep(3, abi::EP_INT_IN, 512, 3, 0, 2048), abi::SPEED_SUPER), "burst needs 1024");
+    assert!(!ep_ok(&ep(3, abi::EP_INT_IN, 1024, 0x13, 0, 4096), abi::SPEED_SUPER), "mult on interrupt");
+    assert!(!ep_ok(&ep(3, abi::EP_INT_IN, 1024, 3, 0, 4096), abi::SPEED_HIGH));
     // SuperSpeed isoch: 3 x 16 x 1024.
     assert!(ep_ok(&ep(5, abi::EP_ISOC_IN, 1024, 0x2f, 0, 49152), abi::SPEED_SUPER));
     assert!(!ep_ok(&ep(5, abi::EP_ISOC_IN, 1024, 0x3f, 0, 0), abi::SPEED_SUPER), "mult 3");

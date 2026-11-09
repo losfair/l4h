@@ -165,14 +165,20 @@ impl Rings {
         Trb { param: e.r64(0), status: e.r32(8), control: e.r32(12) }
     }
 
-    /// Turn `n` TRBs at `first` into no-ops, keeping their cycle and chain
-    /// bits: a cancelled URB the controller has not reached.
+    /// Turn `n` TRBs at `first` into no-ops, keeping their cycle bits: a
+    /// cancelled URB the controller has not reached.  Unchained, the Link
+    /// TRB too if they cross it: No-Op TRBs may not be chained (xHCI 1.2
+    /// §4.11.7.1).
     pub fn noop(&mut self, dma: Region, r: u16, first: u16, n: u16) {
+        let off = dma.ring(r as usize);
         for k in 0..n {
             let pos = (first + k) % USABLE;
-            let e = Mmio(dma.va(dma.ring(r as usize) + pos as usize * 16));
-            let c = e.r32(12);
-            e.w32(12, (c & (proto::TRB_CYCLE | proto::TRB_CH)) | (proto::TRB_NOOP << 10));
+            let e = Mmio(dma.va(off + pos as usize * 16));
+            e.w32(12, (e.r32(12) & proto::TRB_CYCLE) | (proto::TRB_NOOP << 10));
+            if pos == USABLE - 1 && k + 1 < n {
+                let link = Mmio(dma.va(off + USABLE as usize * 16));
+                link.w32(12, link.r32(12) & !proto::TRB_CH);
+            }
         }
         dma_fence(Ordering::SeqCst);
     }

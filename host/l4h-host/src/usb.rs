@@ -371,7 +371,8 @@ pub fn ep_ok(ep: &abi::Ep, speed: u32) -> bool {
                 abi::SPEED_LOW => burst == 0 && mps <= 8,
                 abi::SPEED_FULL => burst == 0 && mps <= 64,
                 abi::SPEED_HIGH => burst <= 2,
-                _ => burst <= 2 && (burst == 0 || mps == 1024),
+                // SuperSpeed: bMaxBurst 0..15, 1024-byte packets to burst.
+                _ => burst == 0 || mps == 1024,
             }
         }
         abi::EP_ISOC_OUT | abi::EP_ISOC_IN => {

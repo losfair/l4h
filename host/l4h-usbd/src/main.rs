@@ -295,6 +295,8 @@ impl Usbd {
     fn transfer_event(&mut self, ev: &Trb) {
         let (slot, dci) = ((ev.control >> 24) as usize, ((ev.control >> 16) & 0x1f) as usize);
         let (cc, resid) = (ev.status >> 24, ev.status & 0xff_ffff);
+        // No TRB pointer (a Missed Service event may have none): the next
+        // event with one says where the controller is (see below).
         if slot == 0 || slot > proto::MAX_SLOTS as usize || dci == 0 || ev.control & (1 << 2) != 0 || ev.param == 0 {
             return;
         }
@@ -325,21 +327,32 @@ impl Usbd {
         }
         let mut dist = self.rings.dist(r, self.urbs.get(u).first, pos);
         if dist >= self.urbs.get(u).ntrbs {
-            // An isoch URB whose TD failed mid TD, with no event for its
-            // end: done once the controller is on the next URB.
-            let urb = self.urbs.get(u);
-            let n = urb.next;
-            if urb.xfer.ty != abi::XFER_ISOC || !urb.mid || n == NONE || !self.urbs.get(n).posted {
+            // Isoch: an event on a later posted URB shows the controller
+            // past the ones before it, whose TDs it missed (a Missed
+            // Service event, which may carry no TRB pointer, skips several)
+            // or failed mid TD with no event for their end.
+            if self.urbs.get(u).xfer.ty != abi::XFER_ISOC {
                 return;
             }
-            let d = self.rings.dist(r, self.urbs.get(n).first, pos);
-            if d >= self.urbs.get(n).ntrbs {
-                return;
+            let mut n = self.urbs.get(u).next;
+            let d = loop {
+                if n == NONE || !self.urbs.get(n).posted {
+                    return;
+                }
+                let d = self.rings.dist(r, self.urbs.get(n).first, pos);
+                if d < self.urbs.get(n).ntrbs {
+                    break d;
+                }
+                n = self.urbs.get(n).next;
+            };
+            while u != n {
+                let next = self.urbs.get(u).next;
+                let len = self.urbs.get(u).ends.len();
+                self.iso_passed(u, len);
+                self.iso_done(u, r);
+                u = next;
             }
-            let len = self.urbs.get(u).ends.len();
-            self.iso_passed(u, len);
-            self.iso_done(u, r);
-            (u, dist) = (n, d);
+            dist = d;
         }
         if matches!(cc, CC_STOPPED | CC_STOPPED_LENGTH_INVALID | CC_STOPPED_SHORT) {
             // A Stop Endpoint for a cancel: what it did of the TD.  Stopped
