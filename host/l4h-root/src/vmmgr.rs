@@ -9,6 +9,7 @@
 
 use core::sync::atomic::Ordering;
 
+use l4h_host::errno::Errno;
 use sel4::{CapRights, ObjectBlueprint, VmAttributes, cap, cap_type};
 
 use l4h_abi as abi;
@@ -367,60 +368,57 @@ fn xchg(h: &Host, i: usize) -> sel4::AbsoluteCPtr {
 /// vmmgr's: `serve` lets each make only its own.
 pub struct Calls<'a>(pub &'a mut Host);
 
-fn errno<T>(r: Result<T, i64>) -> Result<T, u64> {
-    r.map_err(|e| e as u64)
-}
 
 impl root_call::Server for Calls<'_> {
-    fn hw(&mut self, _: Sender, op: u64, addr: usize, off: usize, width: usize, value: u64) -> Result<u64, u64> {
+    fn hw(&mut self, _: Sender, op: u64, addr: usize, off: usize, width: usize, value: u64) -> Result<u64, Errno> {
         Ok(crate::trustd::hw(self.0, op, addr, off, width, value))
     }
 
-    fn attest_done(&mut self, _: Sender, guest: usize) -> Result<(), u64> {
+    fn attest_done(&mut self, _: Sender, guest: usize) -> Result<(), Errno> {
         crate::trustd::done(self.0, guest);
         Ok(())
     }
 
-    fn relay(&mut self, _: Sender, peer: u32, len: usize) -> Result<(), u64> {
-        if crate::trustd::relay(self.0, peer, len) == 0 { Ok(()) } else { Err(ctl::EIO as u64) }
+    fn relay(&mut self, _: Sender, peer: u32, len: usize) -> Result<(), Errno> {
+        if crate::trustd::relay(self.0, peer, len) == 0 { Ok(()) } else { Err(ctl::EIO) }
     }
 
-    fn guest_new(&mut self, _: Sender, guest: usize, pool: usize, gpa: usize, dom0: bool) -> Result<NewGuest, u64> {
-        errno(guest_new(self.0, guest, pool, gpa, dom0))
+    fn guest_new(&mut self, _: Sender, guest: usize, pool: usize, gpa: usize, dom0: bool) -> Result<NewGuest, Errno> {
+        guest_new(self.0, guest, pool, gpa, dom0)
     }
 
-    fn guest_del(&mut self, _: Sender, guest: usize) -> Result<u64, u64> {
-        errno(guest_del(self.0, guest))
+    fn guest_del(&mut self, _: Sender, guest: usize) -> Result<u64, Errno> {
+        guest_del(self.0, guest)
     }
 
     fn disk_attach(&mut self, _: Sender, guest: usize, dev: usize, disk: usize, flags: u64, lba_start: u64, lba_count: u64,
         n: usize, list: u64) -> Result<Later<()>, u64> {
-        errno(disk_attach(self.0, guest, dev, disk, flags, lba_start, lba_count, n, list))
+        disk_attach(self.0, guest, dev, disk, flags, lba_start, lba_count, n, list)
     }
 
-    fn nic_add(&mut self, _: Sender, guest: usize, dev: usize, switch: u32, mac: u64, lock: bool, isolated: bool) -> Result<u64, u64> {
-        errno(nic_add(self.0, guest, dev, switch, mac, lock, isolated))
+    fn nic_add(&mut self, _: Sender, guest: usize, dev: usize, switch: u32, mac: u64, lock: bool, isolated: bool) -> Result<u64, Errno> {
+        nic_add(self.0, guest, dev, switch, mac, lock, isolated)
     }
 
-    fn trust_register(&mut self, _: Sender, guest: usize, ram: u64, vcpus: u32, launch: [u64; 4]) -> Result<(), u64> {
-        errno(trust_register(self.0, guest, ram, vcpus, launch))
+    fn trust_register(&mut self, _: Sender, guest: usize, ram: u64, vcpus: u32, launch: [u64; 4]) -> Result<(), Errno> {
+        trust_register(self.0, guest, ram, vcpus, launch)
     }
 
-    fn host_op(&mut self, _: Sender, op: u32, args: [u64; 6]) -> Result<Later<RootVals>, u64> {
+    fn host_op(&mut self, _: Sender, op: u32, args: [u64; 6]) -> Result<Later<RootVals>, Errno> {
         let data = unsafe { &mut *(RESULT_VA as *mut [u8; abi::CTL_DATA_MAX]) };
         data.fill(0);
-        errno(ctl::host_op(self.0, op, &args, data).map(|a| match a {
+        ctl::host_op(self.0, op, &args, data).map(|a| match a {
             Answer::Now(vals) => Later::Now(RootVals::of(&vals)),
             Answer::Later(t) => Later::Token(t),
-        }))
+        })
     }
 
-    fn result(&mut self, _: Sender, token: usize) -> Result<RootVals, u64> {
-        errno(result(self.0, token).map(|vals| RootVals::of(&vals)))
+    fn result(&mut self, _: Sender, token: usize) -> Result<RootVals, Errno> {
+        result(self.0, token).map(|vals| RootVals::of(&vals))
     }
 
-    fn usb_attach(&mut self, _: Sender, guest: usize, dev: usize, ctrl: usize) -> Result<u64, u64> {
-        errno(usb_attach(self.0, guest, dev, ctrl))
+    fn usb_attach(&mut self, _: Sender, guest: usize, dev: usize, ctrl: usize) -> Result<u64, Errno> {
+        usb_attach(self.0, guest, dev, ctrl)
     }
 }
 
@@ -448,7 +446,7 @@ pub enum OpResult {
 pub struct Op {
     guest: Option<(usize, u64)>,
     ctrl: usize,
-    done: Option<Result<OpResult, i64>>,
+    done: Option<Result<OpResult, Errno>>,
 }
 
 pub type Ops = [Option<Op>; proto::MAX_PENDING];
@@ -460,7 +458,7 @@ const _: () = assert!(2 * proto::PENDING_PER_CTRL * crate::pci::MAX_DISK_CTRLS <
 /// A token for a request to controller `ctrl` to be answered later, for
 /// `guest` if any.  EBUSY if the controller has PENDING_PER_CTRL
 /// unanswered, or vmmgr has as many waiting as there are tokens.
-pub fn op_new(h: &mut Host, guest: Option<usize>, ctrl: usize) -> Result<usize, i64> {
+pub fn op_new(h: &mut Host, guest: Option<usize>, ctrl: usize) -> Result<usize, Errno> {
     let guest = match guest {
         Some(id) => Some((id, h.guests.get(id).and_then(|g| g.as_ref()).ok_or(ctl::ENOENT)?.instance)),
         None => None,
@@ -476,7 +474,7 @@ pub fn op_new(h: &mut Host, guest: Option<usize>, ctrl: usize) -> Result<usize, 
 /// The request of `token` is answered: tell vmmgr.  Not its guest's if
 /// that has gone since (a disk's kick is in one of its slots, which go
 /// with it).
-pub fn op_done(h: &mut Host, token: usize, r: Result<OpResult, i64>) {
+pub fn op_done(h: &mut Host, token: usize, r: Result<OpResult, Errno>) {
     let Some(op) = h.ops[token].as_mut() else { return };
     let gone = op.guest.is_some_and(|(id, instance)| h.guests[id].as_ref().is_none_or(|g| g.instance != instance));
     op.done = Some(if gone { Err(ctl::ENOENT) } else { r });
@@ -486,7 +484,7 @@ pub fn op_done(h: &mut Host, token: usize, r: Result<OpResult, i64>) {
 }
 
 /// `result`: the answer of pending request `token`, which frees it.
-fn result(h: &mut Host, token: usize) -> Result<Vals, i64> {
+fn result(h: &mut Host, token: usize) -> Result<Vals, Errno> {
     let op = h.ops.get_mut(token).ok_or(ctl::EINVAL)?;
     if op.as_ref().is_none_or(|op| op.done.is_none()) {
         return Err(if op.is_some() { ctl::EAGAIN } else { ctl::EINVAL });
@@ -547,12 +545,12 @@ pub fn zombie_done(h: &mut Host, z: Option<usize>, pool_reusable: bool) {
     }
 }
 
-fn guest_arg(id: usize) -> Result<usize, i64> {
+fn guest_arg(id: usize) -> Result<usize, Errno> {
     if id < MAX_GUESTS { Ok(id) } else { Err(ctl::ENOENT) }
 }
 
 /// Run `f` on guest `id` with root slot allocations tracked into it.
-pub fn with_guest<R>(h: &mut Host, id: usize, f: impl FnOnce(&mut Host, &mut RootGuest) -> Result<R, i64>) -> Result<R, i64> {
+pub fn with_guest<R>(h: &mut Host, id: usize, f: impl FnOnce(&mut Host, &mut RootGuest) -> Result<R, Errno>) -> Result<R, Errno> {
     let mut g = h.guests.get_mut(id).and_then(|g| g.take()).ok_or(ctl::ENOENT)?;
     h.alloc.slots.track(id);
     let r = f(h, &mut g);
@@ -562,7 +560,7 @@ pub fn with_guest<R>(h: &mut Host, id: usize, f: impl FnOnce(&mut Host, &mut Roo
 }
 
 /// `guest_new`: the pool, and the attestation device.
-fn guest_new(h: &mut Host, id: usize, size: usize, gpa: usize, dom0: bool) -> Result<NewGuest, i64> {
+fn guest_new(h: &mut Host, id: usize, size: usize, gpa: usize, dom0: bool) -> Result<NewGuest, Errno> {
     let id = guest_arg(id)?;
     if h.guests[id].is_some() || !size.is_power_of_two() || !(IO_POOL_MIN..=IO_POOL_MAX).contains(&size) || gpa % PAGE != 0 {
         return Err(ctl::EINVAL);
@@ -630,7 +628,7 @@ fn kept_later() -> u64 {
 /// (disk channels, port memory) is kept until they say they no longer use
 /// it, which root never waits for (a Zombie).  Without an IOMMU the pool
 /// is kept with it, as a disk may still write to it.
-fn guest_del(h: &mut Host, id: usize) -> Result<u64, i64> {
+fn guest_del(h: &mut Host, id: usize) -> Result<u64, Errno> {
     let mut g = h.guests.get_mut(id).and_then(|g| g.take()).ok_or(ctl::ENOENT)?;
     if let Some(t) = &mut h.trustd {
         t.unregister(id);
@@ -694,7 +692,7 @@ fn guest_del(h: &mut Host, id: usize) -> Result<u64, i64> {
 /// which slot: answered later (blkd::poll).
 #[allow(clippy::too_many_arguments)]
 fn disk_attach(h: &mut Host, id: usize, dev: usize, disk: usize, flags: u64, lba_start: u64, lba_count: u64, n: usize, list: u64)
-    -> Result<Later<()>, i64> {
+    -> Result<Later<()>, Errno> {
     let id = guest_arg(id)?;
     let (read_only, volatile) = (flags & abi::BLK_RO != 0, flags & abi::BLK_VOLATILE != 0);
     if dev >= MAX_GUEST_DEVICES || flags & !(abi::BLK_RO | abi::BLK_VOLATILE) != 0 || n > l4h_host::blk::MAX_EXTENTS
@@ -716,7 +714,7 @@ fn disk_attach(h: &mut Host, id: usize, dev: usize, disk: usize, flags: u64, lba
 }
 
 /// `nic_add`: a port of `switch` for the guest.  Returns the MAC.
-fn nic_add(h: &mut Host, id: usize, dev: usize, switch: u32, mac: u64, lock: bool, isolated: bool) -> Result<u64, i64> {
+fn nic_add(h: &mut Host, id: usize, dev: usize, switch: u32, mac: u64, lock: bool, isolated: bool) -> Result<u64, Errno> {
     let id = guest_arg(id)?;
     if dev >= MAX_GUEST_DEVICES {
         return Err(ctl::EINVAL);
@@ -751,7 +749,7 @@ fn nic_add(h: &mut Host, id: usize, dev: usize, switch: u32, mac: u64, lock: boo
 
 /// `usb_attach`: give the guest a whole USB controller.  Returns its USB
 /// number.
-fn usb_attach(h: &mut Host, id: usize, dev: usize, ctrl: usize) -> Result<u64, i64> {
+fn usb_attach(h: &mut Host, id: usize, dev: usize, ctrl: usize) -> Result<u64, Errno> {
     let id = guest_arg(id)?;
     if dev >= MAX_GUEST_DEVICES {
         return Err(ctl::EINVAL);
@@ -769,7 +767,7 @@ fn usb_attach(h: &mut Host, id: usize, dev: usize, ctrl: usize) -> Result<u64, i
 }
 
 /// `trust_register`: the guest starts.
-fn trust_register(h: &mut Host, id: usize, ram: u64, vcpus: u32, words: [u64; 4]) -> Result<(), i64> {
+fn trust_register(h: &mut Host, id: usize, ram: u64, vcpus: u32, words: [u64; 4]) -> Result<(), Errno> {
     let id = guest_arg(id)?;
     let g = h.guests[id].as_ref().ok_or(ctl::ENOENT)?;
     if !g.attest {

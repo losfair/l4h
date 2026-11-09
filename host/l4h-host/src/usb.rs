@@ -67,14 +67,21 @@ pub fn dma_bytes(slots: u32, scratch: u32, page: u32) -> usize {
     total.next_power_of_two().max(4 << 20)
 }
 
-use crate::wire::RootOnly;
+use crate::badges::driver as recv;
+
+crate::senders! {
+    /// Who posts in the mailbox: l4h-root alone.
+    pub enum Sender in recv {
+        Root: mailbox;
+    }
+}
 
 crate::protocol! {
     /// Root's requests to usbd (crate::mailbox, crate::wire::protocol; a
     /// failed usbd answers wire::FAILED).  Root never waits for usbd, which
     /// a guest drives and could keep busy: it posts a request and finishes
     /// what it was for when usbd has answered.
-    pub mod call (from: RootOnly) {
+    pub mod call (from: Sender) {
         /// Take the controller from the firmware (legacy handoff, halt,
         /// reset, capability walk).  Posted once, before any guest has the
         /// controller.

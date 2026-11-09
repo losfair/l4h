@@ -13,6 +13,7 @@
 
 use core::sync::atomic::{Ordering, fence};
 
+use l4h_rt::host::errno::Errno;
 use l4h_rt::host::trust::{self, RELAY_HEADER, RELAY_SLOT_HEADER, RelayHeader, RelaySlot};
 use l4h_rt::{cap, host, sel4};
 use sel4::cap_type;
@@ -140,7 +141,7 @@ impl Relay {
     /// The request out, if it is done: what it was for, and the answer's
     /// payload or -errno (ETIMEDOUT when none came).  Sends it again when
     /// it is time.
-    pub fn poll(&mut self) -> Option<(Wait, Result<&[u8], i64>)> {
+    pub fn poll(&mut self) -> Option<(Wait, Result<&[u8], Errno>)> {
         let p = self.pending.as_ref()?;
         let (head, what) = (p.head, p.what);
         let now = host::ticks::now();
@@ -164,7 +165,7 @@ impl Relay {
         Some((what, match answered {
             None => Err(crate::ETIMEDOUT),
             Some((0, n)) => Ok(&self.buf[RELAY_HEADER..RELAY_HEADER + n]),
-            Some((status, _)) => Err(-(status as i64)),
+            Some((status, _)) => Err(l4h_rt::host::errno::of_status(status as i64)),
         }))
     }
 }

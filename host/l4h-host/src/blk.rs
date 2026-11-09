@@ -91,14 +91,22 @@ pub const BLKD_SLOT_CLIENT_DONE: u64 = 32;
 pub const MAX_CLIENTS: usize = 512;
 pub const CHANNEL_PAGES: usize = core::mem::size_of::<Channel>().div_ceil(4096);
 pub const STAGING_SIZE: usize = 1 << 20;
-use crate::wire::RootOnly;
+use crate::badges::driver as recv;
+use crate::errno::{EBUSY, EINVAL, ENOSPC, Errno};
+
+crate::senders! {
+    /// Who posts in the mailbox: l4h-root alone.
+    pub enum Sender in recv {
+        Root: mailbox;
+    }
+}
 
 crate::protocol! {
     /// Root's requests to blkd (crate::mailbox, crate::wire::protocol): an
     /// answer's first word is 0 or an errno, its value follows.  A failed
     /// blkd answers wire::FAILED.  Label 1 is unused: blkd publishes its
     /// units instead (Published).
-    pub mod call (from: RootOnly) {
+    pub mod call (from: Sender) {
         /// Attach what `check` allowed in slot `client`: the channel's
         /// window (n = 0) or the n extents in staging.  blkd builds the
         /// client's ExtentTable at extent_va(client).
@@ -161,11 +169,6 @@ pub struct PublishedUnit {
 }
 const _: () = assert!(core::mem::size_of::<Published>() <= 4096);
 
-/// Errnos of blkd's range decisions, as the control API returns them.
-pub const EPERM: u64 = 1;
-pub const EBUSY: u64 = 16;
-pub const EINVAL: u64 = 22;
-pub const ENOSPC: u64 = 28;
 /// Units per controller, at most.
 pub const MAX_UNITS: usize = 16;
 
@@ -401,7 +404,7 @@ impl<'a> Volume<'a> {
     /// sectors) in guest order, and check them against a unit of `capacity`
     /// sectors.  EINVAL if they are no disk.
     pub fn build(raw: impl Iterator<Item = (u64, u64)>, order: &'a mut [u16], extents: &'a mut [Extent],
-        capacity: u64) -> Result<Volume<'a>, u64> {
+        capacity: u64) -> Result<Volume<'a>, Errno> {
         let mut offset = 0u64;
         for ((e, o), (i, (start, sectors))) in extents.iter_mut().zip(order.iter_mut()).zip(raw.enumerate()) {
             *e = Extent { start, sectors, offset };
@@ -420,7 +423,7 @@ impl<'a> Volume<'a> {
     /// MAX_EXTENTS extents, each a valid window and, if there are several,
     /// at least MIN_EXTENT_SECTORS; sorted and disjoint; and each extent in
     /// `order` starting where the one before it ends.
-    pub fn check(&self, capacity: u64) -> Result<(), u64> {
+    pub fn check(&self, capacity: u64) -> Result<(), Errno> {
         let (n, e) = (self.extents.len(), self.extents);
         let ok = (1..=MAX_EXTENTS).contains(&n) && self.order.len() == n
             && e.iter().all(|x| DiskWindow::new(x.start, x.sectors, capacity).is_some_and(|w| w.sectors == x.sectors)
@@ -529,7 +532,7 @@ impl<const N: usize> Reservations<N> {
 
     /// The slot `want` may attach in: EBUSY if it conflicts with a client
     /// or with a reservation it cannot claim, ENOSPC if no slot is free.
-    pub fn slot<'a>(&self, active: &impl Fn(usize) -> Option<Hold<'a>>, want: &Hold, dom0: bool) -> Result<usize, u64> {
+    pub fn slot<'a>(&self, active: &impl Fn(usize) -> Option<Hold<'a>>, want: &Hold, dom0: bool) -> Result<usize, Errno> {
         let conflicts = |h: &Hold| h.unit == want.unit && !(want.read_only && h.read_only) && overlap(want.extents, h.extents);
         // A claimed reservation is represented by its client.
         let busy = (0..N).any(|i| match active(i) {
@@ -543,7 +546,7 @@ impl<const N: usize> Reservations<N> {
     }
 
     /// Keep `r` (a range of dom0's boot plan) from other users.
-    pub fn reserve<'a>(&mut self, active: &impl Fn(usize) -> Option<Hold<'a>>, r: Reserved) -> Result<usize, u64> {
+    pub fn reserve<'a>(&mut self, active: &impl Fn(usize) -> Option<Hold<'a>>, r: Reserved) -> Result<usize, Errno> {
         let range = Extent { start: r.window.start, sectors: r.window.sectors, offset: 0 };
         let want = Hold { unit: r.unit, extents: core::slice::from_ref(&range), read_only: r.read_only };
         let i = self.slot(active, &want, false)?;

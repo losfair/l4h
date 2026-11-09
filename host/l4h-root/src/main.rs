@@ -46,6 +46,7 @@ mod vmmgr;
 #[cfg(target_arch = "x86_64")]
 mod vtd;
 
+use l4h_host::errno::Errno;
 use l4h_host::fixed::StaticCell;
 
 /// The root task's own capabilities.
@@ -288,7 +289,7 @@ impl Host {
 
     /// Learn the geometry of host disk `disk` if its controller could
     /// not tell at boot.
-    pub fn ensure_disk(&mut self, disk: usize) -> Result<(), i64> {
+    pub fn ensure_disk(&mut self, disk: usize) -> Result<(), Errno> {
         let (c, unit) = self.disks.get(disk).map(|d| (d.ctrl, d.unit)).ok_or(ctl::ENOENT)?;
         if self.ctrls[c].failed { return Err(ctl::EIO); }
         if self.disks[disk].capacity == 0 {
@@ -858,7 +859,7 @@ fn component_call(h: &mut Host, badge: u64, info: &sel4::MessageInfo) -> Option<
         trustd::fault(h, id);
         return None;
     }
-    match host::root::Sender::of_id(id) {
+    match host::root::Sender::of_badge(badge) {
         Some(from) => l4h_ipc::serve(info, |label, args, out| root_call::serve(&mut vmmgr::Calls(h), label, args, from, out)),
         None => {
             log!("l4h-root: component {:#x}: unknown call {}", id, info.label());

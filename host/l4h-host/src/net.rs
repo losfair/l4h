@@ -110,7 +110,14 @@ pub const NETD_PORT_ISOLATED: u64 = 1 << 1;
 /// additional allowed source MAC (0: none).  Ordinary guests cannot set it.
 pub const NETD_PORT_UPLINK: u64 = 1 << 2;
 
-use crate::wire::RootOnly;
+use crate::badges::driver as recv;
+
+crate::senders! {
+    /// Who posts in the mailbox: l4h-root alone.
+    pub enum Sender in recv {
+        Root: mailbox;
+    }
+}
 
 crate::protocol! {
     /// Commands from l4h-root (crate::mailbox, crate::wire::protocol),
@@ -118,7 +125,7 @@ crate::protocol! {
     /// their state, and reads only the answers' count: they are done.
     /// Labels 4, 5 and 10 are unused: netd publishes its counters and MACs
     /// instead (Published).
-    pub mod call (from: RootOnly) {
+    pub mod call (from: Sender) {
         /// Port `port` on `switch`, with MAC `mac` (low 48 bits) and
         /// NETD_PORT_* `flags`.
         AddPort / add_port = 1 from [Root] (port: usize, switch: usize, mac: u64, flags: u64, alias: u64) -> ();

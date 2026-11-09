@@ -35,39 +35,16 @@ pub const SLOT_DYN_BASE: u64 = 256;
 const _: () = assert!(SLOT_GUEST_HCN as usize + MAX_GUESTS <= SLOT_XCHG as usize);
 const _: () = assert!(SLOT_XCHG as usize + XCHG_SLOTS <= SLOT_DYN_BASE as usize);
 
-/// Who calls memd, from the badge of its capability (badges::memd).
-/// l4h-root calls with an unbadged one, for its own memory; l4h-vmmgr with
-/// one badged VMMGR, for its own memory and guests' RAM, passing
-/// capabilities in its mailbox; a guest's l4h-vmm with one badged
-/// `VMM | GUEST`, for the hotplug calls of its own guest.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Sender {
-    Root,
-    Vmmgr,
-    Vmm(usize),
-}
-
-impl Sender {
-    /// The caller of a badge, if it is a call's.
-    pub const fn of_badge(badge: u64) -> Option<Sender> {
-        if badge & recv::VMM != 0 {
-            Some(Sender::Vmm(recv::GUEST.get(badge) as usize))
-        } else if badge & recv::VMMGR != 0 {
-            Some(Sender::Vmmgr)
-        } else if badge == 0 {
-            Some(Sender::Root)
-        } else {
-            None
-        }
-    }
-
-    /// The badge l4h-root gives the sender's capability.
-    pub const fn badge(self) -> u64 {
-        match self {
-            Sender::Root => 0,
-            Sender::Vmmgr => recv::VMMGR,
-            Sender::Vmm(g) => recv::VMM | recv::GUEST.put(g as u64),
-        }
+crate::senders! {
+    /// Who calls memd, by the badge of its capability (badges::memd).
+    /// l4h-root calls with an unbadged one, for its own memory; l4h-vmmgr
+    /// with one badged VMMGR, for its own memory and guests' RAM, passing
+    /// capabilities in its mailbox; a guest's l4h-vmm with one badged
+    /// `VMM | GUEST`, for the hotplug calls of its own guest.
+    pub enum Sender in recv {
+        Root: [];
+        Vmmgr: [VMMGR];
+        Vmm(GUEST): [VMM];
     }
 }
 

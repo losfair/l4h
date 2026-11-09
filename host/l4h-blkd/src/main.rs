@@ -20,10 +20,10 @@ use core::ops::{Deref, DerefMut};
 use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{Ordering, fence};
 
+use l4h_rt::host::errno::{self, Errno};
 use l4h_rt::host;
 use l4h_rt::host::blk::{self, BlkdConfig, Channel, Pool};
 use l4h_rt::host::fixed::ArrayVec;
-use l4h_rt::host::wire::RootOnly;
 use l4h_rt::sel4;
 use l4h_rt::{Info, cap};
 use sel4::cap_type;
@@ -343,14 +343,14 @@ impl Blkd {
 
     /// A blk::STATUS_* (u64::MAX: the device failed), or the errno the
     /// range is refused with.
-    fn provision(&mut self, cfg: &BlkdConfig, unit: usize, sector: u64, len: usize, flush: bool) -> Result<u64, u64> {
+    fn provision(&mut self, cfg: &BlkdConfig, unit: usize, sector: u64, len: usize, flush: bool) -> Result<u64, Errno> {
         let Some(&dev) = self.dev.get(unit) else { return Ok(u64::MAX) };
-        if dev.read_only { return Err(blk::EPERM); }
+        if dev.read_only { return Err(errno::EPERM); }
         if !flush {
             // Whole 4 KiB blocks, which every block size divides.
             let w = blk::DiskWindow::new(sector, (len / 512) as u64, dev.capacity)
-                .filter(|_| len != 0 && len <= blk::STAGING_SIZE && len % 4096 == 0).ok_or(blk::EINVAL)?;
-            if !self.reserved.unattached(&holds(&self.clients[..]), unit, w) { return Err(blk::EBUSY); }
+                .filter(|_| len != 0 && len <= blk::STAGING_SIZE && len % 4096 == 0).ok_or(errno::EINVAL)?;
+            if !self.reserved.unattached(&holds(&self.clients[..]), unit, w) { return Err(errno::EBUSY); }
         }
         if flush && !dev.flush { return Ok(blk::STATUS_OK as u64); }
         let end = self.deadline();
@@ -377,13 +377,13 @@ impl Blkd {
     #[allow(clippy::too_many_arguments)]
     fn check<'a>(&self, cfg: &BlkdConfig, unit: usize, start: u64, sectors: u64, n: usize, read_only: bool, dom0: bool,
         order: &'a mut [u16], extents: &'a mut [blk::Extent]) -> Result<(usize, blk::Volume<'a>, bool), u64> {
-        let dev = self.dev.get(unit).ok_or(blk::EINVAL)?;
+        let dev = self.dev.get(unit).ok_or(errno::EINVAL)?;
         let read_only = read_only || dev.read_only;
         let vol = if n == 0 {
-            let w = blk::DiskWindow::new(start, sectors, dev.capacity).ok_or(blk::EINVAL)?;
+            let w = blk::DiskWindow::new(start, sectors, dev.capacity).ok_or(errno::EINVAL)?;
             blk::Volume::build(core::iter::once((w.start, w.sectors)), &mut order[..1], &mut extents[..1], dev.capacity)?
         } else {
-            if n > blk::MAX_EXTENTS { return Err(blk::EINVAL); }
+            if n > blk::MAX_EXTENTS { return Err(errno::EINVAL); }
             // Each pair is read once, into `extents`, before it is checked.
             let staging = (cfg.dma_va + cfg.dma_size) as *const [u64; 2];
             let raw = (0..n).map(|k| unsafe { staging.add(k).read_volatile() }).map(|[s, c]| (s, c));
@@ -405,10 +405,10 @@ struct Requests<'a> {
 }
 
 impl blk::call::Server for Requests<'_> {
-    fn add(&mut self, _: RootOnly, i: usize, unit: usize, dom0: bool, n: usize) -> Result<(), u64> {
+    fn add(&mut self, _: blk::Sender, i: usize, unit: usize, dom0: bool, n: usize) -> Result<(), Errno> {
         let b = &mut *self.b;
         if i >= blk::MAX_CLIENTS || b.clients[i].is_some() || unit >= b.dev.len() || n > blk::MAX_EXTENTS {
-            return Err(blk::EINVAL);
+            return Err(errno::EINVAL);
         }
         let dev = b.dev[unit];
         let chan = blk::channel_va(i) as *mut Channel;
@@ -441,23 +441,23 @@ impl blk::call::Server for Requests<'_> {
                 }
                 Ok(())
             }
-            _ => Err(blk::EINVAL),
+            _ => Err(errno::EINVAL),
         }
     }
 
-    fn remove(&mut self, _: RootOnly, client: usize) -> Result<(), u64> {
-        if self.b.remove(client) == 0 { Ok(()) } else { Err(blk::EBUSY) }
+    fn remove(&mut self, _: blk::Sender, client: usize) -> Result<(), Errno> {
+        if self.b.remove(client) == 0 { Ok(()) } else { Err(errno::EBUSY) }
     }
 
-    fn write(&mut self, _: RootOnly, sector: u64, length: usize, unit: usize) -> Result<u64, u64> {
+    fn write(&mut self, _: blk::Sender, sector: u64, length: usize, unit: usize) -> Result<u64, Errno> {
         self.b.provision(self.cfg, unit, sector, length, false)
     }
 
-    fn flush(&mut self, _: RootOnly, unit: usize) -> Result<u64, u64> {
+    fn flush(&mut self, _: blk::Sender, unit: usize) -> Result<u64, Errno> {
         self.b.provision(self.cfg, unit, 0, 0, true)
     }
 
-    fn reserve(&mut self, _: RootOnly, unit: usize, start: u64, sectors: u64, read_only: bool) -> Result<usize, u64> {
+    fn reserve(&mut self, _: blk::Sender, unit: usize, start: u64, sectors: u64, read_only: bool) -> Result<usize, Errno> {
         // Boot ranges may lie beyond an unknown or unaligned capacity:
         // they keep sectors from others, never address them.
         match blk::DiskWindow::new(start, sectors, u64::MAX & !7) {
@@ -466,26 +466,26 @@ impl blk::call::Server for Requests<'_> {
                 let b = &mut *self.b;
                 b.reserved.reserve(&holds(&b.clients[..]), r)
             }
-            _ => Err(blk::EINVAL),
+            _ => Err(errno::EINVAL),
         }
     }
 
-    fn check(&mut self, _: RootOnly, unit: usize, start: u64, sectors: u64, read_only: bool, dom0: bool, n: usize)
-        -> Result<blk::Checked, u64> {
+    fn check(&mut self, _: blk::Sender, unit: usize, start: u64, sectors: u64, read_only: bool, dom0: bool, n: usize)
+        -> Result<blk::Checked, Errno> {
         let (slot, vol, read_only) = self.b.check(self.cfg, unit, start, sectors, n, read_only, dom0, self.order, self.extents)?;
         Ok(blk::Checked { slot, sectors: vol.sectors(), read_only })
     }
 
-    fn extent(&mut self, _: RootOnly, client: usize, k: usize) -> Result<(u64, u64), u64> {
-        let e = self.b.clients.get(client).and_then(|c| c.as_ref()?.vol.nth(k)).ok_or(blk::EINVAL)?;
+    fn extent(&mut self, _: blk::Sender, client: usize, k: usize) -> Result<(u64, u64), Errno> {
+        let e = self.b.clients.get(client).and_then(|c| c.as_ref()?.vol.nth(k)).ok_or(errno::EINVAL)?;
         Ok((e.start, e.sectors))
     }
 
-    fn test_hang(&mut self, _: RootOnly) -> Result<(), u64> {
+    fn test_hang(&mut self, _: blk::Sender) -> Result<(), Errno> {
         if host::TEST_INJECT {
             l4h_rt::test_hang();
         }
-        Err(blk::EINVAL)
+        Err(errno::EINVAL)
     }
 }
 
@@ -542,7 +542,7 @@ fn main(info: &'static Info) -> ! {
         // coalesced.
         let answered = l4h_rt::mailbox::serve(|label, args, out| {
             let mut req = Requests { b: &mut b, cfg, order: &mut *scratch_order, extents: &mut *scratch_extents };
-            let n = blk::call::serve(&mut req, label, args, RootOnly::Root, out);
+            let n = blk::call::serve(&mut req, label, args, blk::Sender::Root, out);
             // Service calls can have reaped completions while polling. A kick
             // may have been coalesced, so always revisit all pending channels.
             b.submit();

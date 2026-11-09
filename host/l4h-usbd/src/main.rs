@@ -25,10 +25,10 @@ mod xhci;
 use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
 use core::sync::atomic::{Ordering, fence};
 
+use l4h_rt::host::errno::Errno;
 use l4h_abi::usb::{self as abi, Cqe, CtlReq, Event, Info, XferReq};
 use l4h_rt::host::usb::{self as proto, Pool, Sq, Trb, UsbdConfig};
 use l4h_rt::sel4;
-use l4h_rt::host::wire::RootOnly;
 use l4h_rt::{cap, host};
 use l4h_virtio::Mmio;
 use sel4::cap_type;
@@ -36,7 +36,7 @@ use sel4::cap_type;
 use crate::ring::{NONE, Rings, Urbs};
 use crate::xhci::*;
 
-const EINVAL: u64 = 22;
+use l4h_rt::host::errno::{EBUSY, EINVAL, EIO, check as errno};
 
 /// Root's requests, as l4h_host::usb::call declares them.
 struct Requests<'a> {
@@ -45,26 +45,19 @@ struct Requests<'a> {
     tsc_hz: u64,
 }
 
-/// A handler's errno as a request's result.
-fn errno(e: u64) -> Result<(), u64> {
-    if e == 0 { Ok(()) } else { Err(e) }
-}
-
 impl proto::call::Server for Requests<'_> {
-    fn claim(&mut self, _: RootOnly) -> Result<proto::Claimed, u64> {
+    fn claim(&mut self, _: proto::Sender) -> Result<proto::Claimed, Errno> {
         self.u.claim(self.cfg, self.tsc_hz)
     }
 
-    fn attach(&mut self, _: RootOnly, area: usize, gpa: u64, paddr: u64, size: u64) -> Result<(), u64> {
+    fn attach(&mut self, _: proto::Sender, area: usize, gpa: u64, paddr: u64, size: u64) -> Result<(), Errno> {
         errno(self.u.attach(area, Pool { gpa, paddr, size }))
     }
 
-    fn remove(&mut self, _: RootOnly, area: usize) -> Result<(), u64> {
+    fn remove(&mut self, _: proto::Sender, area: usize) -> Result<(), Errno> {
         errno(self.u.remove(area))
     }
 }
-const EIO: u64 = 5;
-const EBUSY: u64 = 16;
 
 /// CQ entries transfers leave free: a control request (an URB_CANCEL)
 /// always gets in once the guest has consumed its completions, even with
@@ -1623,7 +1616,7 @@ impl Usbd {
     }
 
     /// `claim`: take the controller from the firmware.
-    fn claim(&mut self, cfg: &UsbdConfig, tsc_hz: u64) -> Result<proto::Claimed, u64> {
+    fn claim(&mut self, cfg: &UsbdConfig, tsc_hz: u64) -> Result<proto::Claimed, Errno> {
         if self.hc.is_some() {
             return Err(EBUSY);
         }
@@ -1652,7 +1645,7 @@ impl Usbd {
         published.refused.store(self.refused, Ordering::Relaxed);
         published.resets.store(self.resets, Ordering::Relaxed);
         let mut req = Requests { u: self, cfg, tsc_hz };
-        let answered = l4h_rt::mailbox::serve(|label, args, out| proto::call::serve(&mut req, label, args, RootOnly::Root, out));
+        let answered = l4h_rt::mailbox::serve(|label, args, out| proto::call::serve(&mut req, label, args, proto::Sender::Root, out));
         if answered {
             published.resets.store(self.resets, Ordering::Relaxed);
             l4h_rt::mailbox::signal();

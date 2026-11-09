@@ -21,6 +21,7 @@
 //! Links' channels are netd's (netd.rs): root never maps them, and only
 //! rings their doorbells for netd.
 
+use l4h_host::errno::Errno;
 use l4h_partition::{self as part, Channel, MsgReader, MsgRing};
 use sel4::cap_type;
 #[cfg(target_arch = "x86_64")]
@@ -264,7 +265,7 @@ pub fn tick(h: &mut Host) {
 }
 
 /// dom0's RTC_SET on a secondary: the RTC is the primary's.
-pub fn rtc_set(h: &mut Host, secs: u64) -> Result<(), i64> {
+pub fn rtc_set(h: &mut Host, secs: u64) -> Result<(), Errno> {
     let cs = h.channels.as_ref().ok_or(crate::ctl::ENOSYS)?;
     if cs.send(0, part::MSG_RTC_SET, &[&secs.to_le_bytes()]) { Ok(()) } else { Err(crate::ctl::EIO) }
 }

@@ -1,16 +1,18 @@
 //! Memory grants to root and vmmgr through their exchange slots.
 
+use l4h_rt::host::errno::Errno;
 use l4h_rt::host::memd::{self, BLOCK_BITS, XCHG_SLOTS};
 use l4h_rt::sel4::CapRights;
 
 use crate::mem::{State, abs};
-use crate::{Client, EINVAL, ENOMEM, Memd, xchg};
+use crate::{Client, Memd, xchg};
+use l4h_rt::host::errno::{EINVAL, ENOMEM};
 use l4h_rt::host::fixed::ArrayVec;
 
 impl Memd {
     /// `alloc`: `count` blocks of 2^bits bytes into the exchange slots,
     /// and their physical addresses.  Root gets them, vmmgr copies.
-    pub(super) fn alloc(&mut self, c: Client, bits: usize, count: usize) -> Result<ArrayVec<u64, XCHG_SLOTS>, u64> {
+    pub(super) fn alloc(&mut self, c: Client, bits: usize, count: usize) -> Result<ArrayVec<u64, XCHG_SLOTS>, Errno> {
         let k = match bits.checked_sub(BLOCK_BITS) {
             Some(k) if k < memd::ORDERS && count <= XCHG_SLOTS => k,
             _ => return Err(EINVAL),

@@ -1,10 +1,9 @@
 //! The production CTL_VM_START handler with a guest that records its boot.
+#[path = "../host/l4h-host/src/errno.rs"]
+mod errno;
+use errno::{EBUSY, EINVAL, ENOENT, ENOMEM, Errno};
 use l4h_abi as abi;
 
-const EINVAL: i64 = 22;
-const ENOENT: i64 = 2;
-const ENOMEM: i64 = 12;
-const EBUSY: i64 = 16;
 const MAX_GUESTS: usize = 2;
 
 #[derive(PartialEq, Eq)]
@@ -47,7 +46,7 @@ impl Vmmgr {
         Some(r)
     }
     fn can_afford(&self, _: usize, _: usize, _: usize) -> bool { true }
-    fn start_guest(&mut self, id: usize) -> Result<(), i64> {
+    fn start_guest(&mut self, id: usize) -> Result<(), Errno> {
         let g = self.guests[id].as_ref().unwrap();
         if g.root_pending { return Err(EBUSY); }
         self.started += 1;

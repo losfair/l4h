@@ -31,9 +31,9 @@ use core::mem::MaybeUninit;
 use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{Ordering, fence};
 
+use l4h_rt::host::errno::Errno;
 use l4h_rt::host::fixed::ArrayVec;
 use l4h_rt::host::net::{self, NetdConfig};
-use l4h_rt::host::wire::RootOnly;
 use l4h_rt::sel4;
 use l4h_rt::{Info, cap, host};
 use sel4::cap_type;
@@ -679,7 +679,7 @@ fn rx_put(chan: *mut net::Port, frame: &(impl Frame + ?Sized), hdr: &[u8; net::H
     true
 }
 
-const EINVAL: u64 = 22;
+use l4h_rt::host::errno::EINVAL;
 
 /// Root's commands, as l4h_host::net::call declares them, and the ports
 /// they added.
@@ -689,7 +689,7 @@ struct Commands<'a> {
 }
 
 impl net::call::Server for Commands<'_> {
-    fn add_port(&mut self, _: RootOnly, i: usize, switch: usize, mac: u64, flags: u64, alias: u64) -> Result<(), u64> {
+    fn add_port(&mut self, _: net::Sender, i: usize, switch: usize, mac: u64, flags: u64, alias: u64) -> Result<(), Errno> {
         if i >= net::MAX_PORTS || switch >= net::MAX_SWITCHES {
             return Err(EINVAL);
         }
@@ -723,18 +723,18 @@ impl net::call::Server for Commands<'_> {
         Ok(())
     }
 
-    fn remove_port(&mut self, _: RootOnly, port: usize) -> Result<(), u64> {
+    fn remove_port(&mut self, _: net::Sender, port: usize) -> Result<(), Errno> {
         self.d.remove_port(port);
         Ok(())
     }
 
-    fn attach_uplink(&mut self, _: RootOnly, nic: usize, switch: usize) -> Result<(), u64> {
+    fn attach_uplink(&mut self, _: net::Sender, nic: usize, switch: usize) -> Result<(), Errno> {
         let nic = self.d.nics.get_mut(nic).filter(|_| switch < net::MAX_SWITCHES).ok_or(EINVAL)?;
         nic.switch = Some(switch as u32);
         Ok(())
     }
 
-    fn ep_set(&mut self, _: RootOnly, ep: usize, switch: usize, mac: u64, peer: u64) -> Result<(), u64> {
+    fn ep_set(&mut self, _: net::Sender, ep: usize, switch: usize, mac: u64, peer: u64) -> Result<(), Errno> {
         if switch >= net::MAX_SWITCHES {
             return Err(EINVAL);
         }
@@ -742,13 +742,13 @@ impl net::call::Server for Commands<'_> {
         if self.d.steer.ep_set(ep, e) { Ok(()) } else { Err(EINVAL) }
     }
 
-    fn ep_del(&mut self, _: RootOnly, ep: usize) -> Result<(), u64> {
+    fn ep_del(&mut self, _: net::Sender, ep: usize) -> Result<(), Errno> {
         self.d.steer.ep_del(ep);
         Ok(())
     }
 
-    fn steer_set(&mut self, _: RootOnly, rule: usize, ep: usize, matches: u64, ip_hi: u64, ip_lo: u64, targets: u64)
-        -> Result<(), u64> {
+    fn steer_set(&mut self, _: net::Sender, rule: usize, ep: usize, matches: u64, ip_hi: u64, ip_lo: u64, targets: u64)
+        -> Result<(), Errno> {
         let d = &mut *self.d;
         // One target, an existing port: its MAC is the rule's.
         let t = targets.trailing_zeros() as usize;
@@ -759,12 +759,12 @@ impl net::call::Server for Commands<'_> {
         }
     }
 
-    fn steer_del(&mut self, _: RootOnly, rule: usize) -> Result<(), u64> {
+    fn steer_del(&mut self, _: net::Sender, rule: usize) -> Result<(), Errno> {
         self.d.steer.rule_del(rule);
         Ok(())
     }
 
-    fn add_link(&mut self, _: RootOnly, l: usize, switch: usize, size: u64, me: u32, peer: u32) -> Result<(), u64> {
+    fn add_link(&mut self, _: net::Sender, l: usize, switch: usize, size: u64, me: u32, peer: u32) -> Result<(), Errno> {
         let d = &mut *self.d;
         let ok = l < net::MAX_LINKS && d.links[l].is_none() && switch < net::MAX_SWITCHES
             && size as usize <= net::LINK_CHANNEL_MAX && size >= 4096;
@@ -775,14 +775,14 @@ impl net::call::Server for Commands<'_> {
         Ok(())
     }
 
-    fn test_panic(&mut self, _: RootOnly) -> Result<(), u64> {
+    fn test_panic(&mut self, _: net::Sender) -> Result<(), Errno> {
         if host::TEST_INJECT {
             panic!("injected panic");
         }
         Err(EINVAL)
     }
 
-    fn test_hang(&mut self, _: RootOnly) -> Result<(), u64> {
+    fn test_hang(&mut self, _: net::Sender) -> Result<(), Errno> {
         if host::TEST_INJECT {
             l4h_rt::test_hang();
         }
@@ -870,7 +870,7 @@ fn main(info: &'static Info) -> ! {
         // Root's commands (host::mailbox), even if their signal was
         // coalesced.  Root reads the answers' count only: they are done.
         let mut cmds = Commands { d: &mut d, added: 0 };
-        if l4h_rt::mailbox::serve(|label, args, out| net::call::serve(&mut cmds, label, args, RootOnly::Root, out)) {
+        if l4h_rt::mailbox::serve(|label, args, out| net::call::serve(&mut cmds, label, args, net::Sender::Root, out)) {
             l4h_rt::mailbox::signal();
         }
         let added = cmds.added;

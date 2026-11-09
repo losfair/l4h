@@ -1,6 +1,7 @@
 //! Fixed-size, single-writer flags service. No heap, TPM, AML or calls
 //! back to root: a caller donates only the time for this one request.
 
+use l4h_rt::host::errno::Errno;
 use l4h_rt::host::trust::call::{self, Client as _};
 use l4h_rt::{cap, host::trust::{self, Flags, Sender, FlagsEntry}, sel4};
 use sel4::cap_type;
@@ -11,17 +12,17 @@ pub fn read(id: usize, instance: u64) -> Flags {
 
 /// Act on or seal (trust::FLAGS_ACT, FLAGS_SEAL) guest `id`'s flags,
 /// through the flags thread: its flags, or a positive errno.
-pub fn call(op: u64, id: usize, instance: u64, bits: [u64; 4], flags: u64) -> Result<Flags, i64> {
+pub fn call(op: u64, id: usize, instance: u64, bits: [u64; 4], flags: u64) -> Result<Flags, Errno> {
     let ep = l4h_rt::ipc::Endpoint(cap::<cap_type::Endpoint>(trust::SLOT_FLAGS_CALL));
     let r = if op == trust::FLAGS_SEAL { ep.seal(id, instance, bits, flags) } else { ep.act(id, instance, bits, flags) };
-    r.map_err(|e| if e == l4h_rt::host::wire::FAILED { 5 } else { e as i64 })
+    l4h_rt::host::wire::eio_if_failed(r)
 }
 
 /// The calls, as trust::call declares them.
 struct Entries;
 
 /// Guest `id`'s entry, which only this thread writes.
-fn entry(id: usize) -> Result<&'static FlagsEntry, u64> {
+fn entry(id: usize) -> Result<&'static FlagsEntry, Errno> {
     if id >= trust::MAX_RECORDS {
         return Err(22);
     }
@@ -29,16 +30,16 @@ fn entry(id: usize) -> Result<&'static FlagsEntry, u64> {
 }
 
 impl call::Server for Entries {
-    fn ready(&mut self, _: Sender) -> Result<(), u64> {
+    fn ready(&mut self, _: Sender) -> Result<(), Errno> {
         Ok(())
     }
 
-    fn act(&mut self, from: Sender, guest: usize, instance: u64, bits: [u64; 4], flags: u64) -> Result<Flags, u64> {
-        unsafe { entry(guest)?.update(from, trust::FLAGS_ACT, instance, bits, flags) }.map_err(|e| e as u64)
+    fn act(&mut self, from: Sender, guest: usize, instance: u64, bits: [u64; 4], flags: u64) -> Result<Flags, Errno> {
+        unsafe { entry(guest)?.update(from, trust::FLAGS_ACT, instance, bits, flags) }
     }
 
-    fn seal(&mut self, from: Sender, guest: usize, instance: u64, bits: [u64; 4], flags: u64) -> Result<Flags, u64> {
-        unsafe { entry(guest)?.update(from, trust::FLAGS_SEAL, instance, bits, flags) }.map_err(|e| e as u64)
+    fn seal(&mut self, from: Sender, guest: usize, instance: u64, bits: [u64; 4], flags: u64) -> Result<Flags, Errno> {
+        unsafe { entry(guest)?.update(from, trust::FLAGS_SEAL, instance, bits, flags) }
     }
 }
 

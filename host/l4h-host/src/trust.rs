@@ -162,29 +162,16 @@ pub const RELAY_ACTIVATE: u32 = 2;
 pub const FLAGS_ACT: u64 = 1;
 pub const FLAGS_SEAL: u64 = 2;
 
-/// Who calls trustd's flags endpoint, from its badge: root (and vmmgr,
-/// with root's capability, for the console), or trustd's main thread for
-/// guests.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Sender {
-    Root,
-    Trustd,
-}
+use crate::badges::flags as flags_badge;
+use crate::errno::{EINVAL, EPERM, ESRCH, Errno};
 
-impl Sender {
-    pub const fn of_badge(badge: u64) -> Option<Sender> {
-        match badge {
-            crate::badges::flags::ROOT => Some(Sender::Root),
-            crate::badges::flags::TRUSTD => Some(Sender::Trustd),
-            _ => None,
-        }
-    }
-
-    pub const fn badge(self) -> u64 {
-        match self {
-            Sender::Root => crate::badges::flags::ROOT,
-            Sender::Trustd => crate::badges::flags::TRUSTD,
-        }
+crate::senders! {
+    /// Who calls trustd's flags endpoint, by its badge (badges::flags):
+    /// root (and vmmgr, with root's capability, for the console), or
+    /// trustd's main thread for guests.
+    pub enum Sender in flags_badge {
+        Root: [ROOT];
+        Trustd: [TRUSTD];
     }
 }
 
@@ -265,13 +252,13 @@ impl Flags {
 
     /// Actor fast path: check the seal even when already tainted. If
     /// false, ACT must succeed before any of the operation's effects.
-    pub fn acted(&self, bits: u64) -> Result<bool, i64> {
-        if self.seal[0] & bits != 0 { Err(1) } else { Ok(self.taint[0] & bits == bits) }
+    pub fn acted(&self, bits: u64) -> Result<bool, Errno> {
+        if self.seal[0] & bits != 0 { Err(EPERM) } else { Ok(self.taint[0] & bits == bits) }
     }
 
     /// Shared actor steps: check every seal, and record only the first
     /// effect. `record` must synchronously ACT through the flags service.
-    pub fn act(&self, bits: u64, effect: bool, record: impl FnOnce() -> Result<(), i64>) -> Result<(), i64> {
+    pub fn act(&self, bits: u64, effect: bool, record: impl FnOnce() -> Result<(), Errno>) -> Result<(), Errno> {
         if self.acted(bits)? || !effect { Ok(()) } else { record() }
     }
 }
@@ -315,7 +302,7 @@ impl FlagsEntry {
     ///
     /// # Safety
     /// There must be exactly one writer of this entry.
-    pub unsafe fn update(&self, from: Sender, op: u64, instance: u64, bits: [u64; 4], flags: u64) -> Result<Flags, i64> {
+    pub unsafe fn update(&self, from: Sender, op: u64, instance: u64, bits: [u64; 4], flags: u64) -> Result<Flags, Errno> {
         let sealable = bits[0] & !abi::FLAGS_HOST_DEFINED == 0 && bits[1] == 0;
         let allowed = match (from, op) {
             (Sender::Root, FLAGS_ACT) => bits[0] & !abi::FLAGS_HOST_DEFINED == 0 && bits[1..] == [0; 3] && flags == 0,
@@ -323,11 +310,11 @@ impl FlagsEntry {
             (Sender::Trustd, FLAGS_SEAL) => sealable && flags == 0,
             _ => false,
         };
-        if !allowed || flags & !(abi::ACT_SEAL as u64) != 0 || instance == 0 { return Err(22); }
+        if !allowed || flags & !(abi::ACT_SEAL as u64) != 0 || instance == 0 { return Err(EINVAL); }
         let old = self.read();
-        if instance < old.instance { return Err(3); }
+        if instance < old.instance { return Err(ESRCH); }
         let mut next = old.for_instance(instance);
-        if op == FLAGS_ACT && (0..4).any(|i| next.seal[i] & bits[i] != 0) { return Err(1); }
+        if op == FLAGS_ACT && (0..4).any(|i| next.seal[i] & bits[i] != 0) { return Err(EPERM); }
         for i in 0..4 {
             if op == FLAGS_ACT { next.taint[i] |= bits[i]; }
             if op == FLAGS_SEAL || flags & abi::ACT_SEAL as u64 != 0 { next.seal[i] |= bits[i]; }

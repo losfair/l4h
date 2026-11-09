@@ -6,6 +6,7 @@
 //! (main.rs, root_done).  And trustd's flags, which vmmgr acts on for the
 //! console.
 
+use l4h_host::errno::Errno;
 use sel4::{cap, cap_type};
 
 use l4h_abi as abi;
@@ -14,7 +15,6 @@ use l4h_host::fixed::ArrayVec;
 use l4h_host::trust;
 use l4h_host::root::{Vals, call::Client};
 use l4h_host::vmmgr as proto;
-use l4h_host::wire;
 use l4h_ipc::Endpoint;
 
 use crate::component::abs_of;
@@ -28,17 +28,15 @@ fn root() -> Endpoint {
     Endpoint(sel4::Cap::from_bits(host::SLOT_ROOT_EP))
 }
 
-/// Root's errno as ours.
-fn errno<T>(r: Result<T, u64>) -> Result<T, i64> {
-    r.map_err(|e| if e == wire::FAILED { ctl::EIO } else { e as i64 })
-}
+/// Root's errno as ours: a failed root is EIO.
+use l4h_host::wire::eio_if_failed as errno;
 
 /// An answer root gives now, or later: the token of its `result`.
 pub use l4h_host::root::Later;
 
 /// The answer of pending request `token`, now that root has it: as the
 /// request would have answered.
-fn result(token: usize) -> Result<Vals, i64> {
+fn result(token: usize) -> Result<Vals, Errno> {
     errno(root().result(token))
 }
 
@@ -73,7 +71,7 @@ pub struct NewGuest {
 
 /// Guest `id` is being created, with an I/O pool of `pool` bytes at
 /// `pool_gpa`.
-pub fn guest_new(alloc: &mut Alloc, id: usize, pool: usize, pool_gpa: usize, dom0: bool) -> Result<NewGuest, i64> {
+pub fn guest_new(alloc: &mut Alloc, id: usize, pool: usize, pool_gpa: usize, dom0: bool) -> Result<NewGuest, Errno> {
     let new = errno(root().guest_new(id, pool, pool_gpa, dom0))?;
     let (instance, attest) = (new.instance, new.attest);
     let pool_frames = take(alloc, 0);
@@ -95,14 +93,14 @@ pub fn guest_del(id: usize) {
 /// abi::BLK_*.
 #[allow(clippy::too_many_arguments)]
 pub fn disk_attach(alloc: &mut Alloc, id: usize, d: usize, disk: usize, flags: u64, lba_start: u64, lba_count: u64,
-    (n, offset): (u64, u64)) -> Result<Later<Backend>, i64> {
+    (n, offset): (u64, u64)) -> Result<Later<Backend>, Errno> {
     let r = errno(root().disk_attach(id, d, disk, flags, lba_start, lba_count, n as usize, offset))?;
     Ok(r.map(|()| disk_backend(alloc)))
 }
 
 /// The channel of disk attachment `token` (disk_attach), now that root
 /// has it.
-pub fn disk_attach_result(alloc: &mut Alloc, token: usize) -> Result<Backend, i64> {
+pub fn disk_attach_result(alloc: &mut Alloc, token: usize) -> Result<Backend, Errno> {
     result(token)?;
     Ok(disk_backend(alloc))
 }
@@ -119,7 +117,7 @@ fn disk_backend(alloc: &mut Alloc) -> Backend {
 /// A port of netd's `switch` for guest `id`'s device `d`.  The VMM's
 /// mappings of it are kept in a CNode of `arena`.
 #[allow(clippy::too_many_arguments)]
-pub fn nic_add(alloc: &mut Alloc, arena: &mut Arena, id: usize, d: usize, switch: u32, mac: u64, lock: bool, isolated: bool) -> Result<Backend, i64> {
+pub fn nic_add(alloc: &mut Alloc, arena: &mut Arena, id: usize, d: usize, switch: u32, mac: u64, lock: bool, isolated: bool) -> Result<Backend, Errno> {
     let keep = arena.try_object(alloc, sel4::ObjectBlueprint::CNode { size_bits: proto::PORT_RADIX }).ok_or(ctl::ENOMEM)?;
     let mac = errno(root().nic_add(id, d, switch, mac, lock, isolated))?.to_be_bytes();
     let chan = take(alloc, 0);
@@ -129,7 +127,7 @@ pub fn nic_add(alloc: &mut Alloc, arena: &mut Arena, id: usize, d: usize, switch
 
 /// USB controller `ctrl` for guest `id`'s device `d`: the CNode of its
 /// queue area's frames, usbd's kick, and the guest's USB number.
-pub fn usb_attach(alloc: &mut Alloc, id: usize, d: usize, ctrl: usize) -> Result<(cap::CNode, cap::Notification, usize), i64> {
+pub fn usb_attach(alloc: &mut Alloc, id: usize, d: usize, ctrl: usize) -> Result<(cap::CNode, cap::Notification, usize), Errno> {
     let n = errno(root().usb_attach(id, d, ctrl))? as usize;
     Ok((take(alloc, 0), take(alloc, 1), n))
 }
@@ -143,13 +141,13 @@ pub fn trust_register(g: &Guest) {
 
 /// A control op root serves (`host_op`): its vals, and its data in the
 /// result page.
-pub fn host_op(op: u32, args: &[u64; 6]) -> Result<Later<[u64; 6]>, i64> {
+pub fn host_op(op: u32, args: &[u64; 6]) -> Result<Later<[u64; 6]>, Errno> {
     Ok(errno(root().host_op(op, *args))?.map(|v| core::array::from_fn(|i| v.at(i))))
 }
 
 /// The vals of host op `token` (host_op), now that root has them.  Its
 /// data is none.
-pub fn host_op_result(token: usize) -> Result<[u64; 6], i64> {
+pub fn host_op_result(token: usize) -> Result<[u64; 6], Errno> {
     let v = result(token)?;
     Ok(core::array::from_fn(|i| v.at(i)))
 }
@@ -175,7 +173,7 @@ impl Flags {
 
     /// Seal check on every op, ACT only for its first taint. `effect`
     /// is false for an empty read/write: it checks seals without tainting.
-    pub fn act(&self, g: &Guest, caller: usize, bits: u64, effect: bool) -> Result<(), i64> {
+    pub fn act(&self, g: &Guest, caller: usize, bits: u64, effect: bool) -> Result<(), Errno> {
         if g.id == caller { return Ok(()); }
         self.flags(g).act(bits, effect, || {
             use l4h_host::trust::call::Client;

@@ -59,17 +59,12 @@ use crate::relay::{Relay, Served, Wait};
 use crate::tpm::{Error, Tpm};
 use crate::tpm2::Template;
 
-const EAGAIN: i64 = 11;
-const EINVAL: i64 = 22;
-const EIO: i64 = 5;
-const ENOSYS: i64 = 38;
-const ENODEV: i64 = 19;
-const ETIMEDOUT: i64 = 110;
-/// Not errnos (those are positive here): execute() did not answer, as the
+use l4h_rt::host::errno::{EAGAIN, EINVAL, EIO, ENODEV, ENOSYS, ETIMEDOUT, Errno};
+/// Not errnos (all of those are below): execute() did not answer, as the
 /// request waits for the relay to be free (DEFER) or for its answer
 /// (PENDING).
-const DEFER: i64 = -1;
-const PENDING: i64 = -2;
+const DEFER: Errno = 1 << 32;
+const PENDING: Errno = (1 << 32) + 1;
 
 /// ActivateCredential per guest: up to ACTIVATE_BURST at once, then one
 /// every ACTIVATE_INTERVAL_MS (about 80 ms of TPM time each, on a discrete
@@ -349,7 +344,7 @@ fn start_remote(relay: &mut Relay, hz: u64) -> Result<SigningKey, &'static str> 
 }
 
 /// The primary's answer to start_remote: the state, or why there is none.
-fn ready(key: SigningKey, partition: u32, answer: Result<&[u8], i64>, t0: u64, hz: u64) -> Result<State, &'static str> {
+fn ready(key: SigningKey, partition: u32, answer: Result<&[u8], Errno>, t0: u64, hz: u64) -> Result<State, &'static str> {
     let ev = match answer {
         Ok(ev) if ev.len() <= EVIDENCE_MAX => ev,
         Ok(_) => return Err("partition 0's evidence is too large"),
@@ -441,7 +436,7 @@ impl Local {
     }
 
     /// Partition `k`'s evidence, from its quote, into `out`.
-    fn evidence(&self, k: u32, out: &mut [u8]) -> Result<usize, i64> {
+    fn evidence(&self, k: u32, out: &mut [u8]) -> Result<usize, Errno> {
         let q = self.quotes[k as usize].as_ref().ok_or(EINVAL)?;
         let (_, point) = &self.chain[q.at];
         encode_evidence(out, self.ak_public.get(), point, &q.pcrs, q.quote.get(), self.ek_cert.as_ref().map(|c| c.get()),
@@ -451,7 +446,7 @@ impl Local {
     /// Quote partition `k`'s key `point` and extend PCR 15 with it, once:
     /// its evidence, into `out`.  The same key again gets the same
     /// evidence; another key is refused.
-    fn quote_key(&mut self, k: u32, point: &[u8; 65], out: &mut [u8]) -> Result<usize, i64> {
+    fn quote_key(&mut self, k: u32, point: &[u8; 65], out: &mut [u8]) -> Result<usize, Errno> {
         if let Some(&(_, p)) = self.chain.iter().find(|(q, _)| *q == k) {
             return if p == *point { self.evidence(k, out) } else { Err(EINVAL) };
         }
@@ -490,7 +485,7 @@ fn serve(state: &mut Option<State>, relay: &mut Relay, served: &mut [Served; tru
                     out[..last.len].copy_from_slice(&last.data[..last.len]);
                     Ok(last.len)
                 }
-                (e, _) => Err(-(e as i64)),
+                (e, _) => Err(l4h_rt::host::errno::of_status(e as i64)),
             }
         } else {
             let local = state.as_mut().and_then(|s| s.local.as_mut());
@@ -512,7 +507,7 @@ fn serve(state: &mut Option<State>, relay: &mut Relay, served: &mut [Served; tru
                 }
                 _ => Err(ENOSYS),
             };
-            *last = Served { id: head.id, op: head.op, status: r.err().map_or(0, |e| -e as i32), ..Served::default() };
+            *last = Served { id: head.id, op: head.op, status: r.err().map_or(0, |e| l4h_rt::host::errno::negative(e) as i32), ..Served::default() };
             if let (Ok(n), trust::RELAY_ACTIVATE) = (r, head.op) {
                 last.len = n;
                 last.data[..n].copy_from_slice(&out[..n]);
@@ -521,7 +516,7 @@ fn serve(state: &mut Option<State>, relay: &mut Relay, served: &mut [Served; tru
         };
         match result {
             Ok(n) => reply.len = n as u32,
-            Err(e) => reply.status = -e as i32,
+            Err(e) => reply.status = l4h_rt::host::errno::negative(e) as i32,
         }
         relay.send(from, reply);
     }
@@ -572,7 +567,7 @@ fn execute<'a>(
     hz: u64,
     relay: Option<&mut Relay>,
     out: &'a mut [u8; ANSWER_MAX],
-) -> Result<&'a [u8], i64> {
+) -> Result<&'a [u8], Errno> {
     let p = page(id);
     let (op, in_len, blob_len) = unsafe {
         (addr_of!((*p).op).read_volatile(), addr_of!((*p).in_len).read_volatile() as usize, addr_of!((*p).blob_len).read_volatile() as usize)
@@ -636,7 +631,7 @@ fn execute<'a>(
 
 /// Answer guest `id`'s request `seq`: the result's piece from the
 /// request's offset, then done = seq; root raises the device's event.
-fn answer(id: usize, seq: u32, result: Result<&[u8], i64>) {
+fn answer(id: usize, seq: u32, result: Result<&[u8], Errno>) {
     let p = page(id);
     unsafe {
         let off = addr_of!((*p).offset).read_volatile() as usize;
@@ -648,7 +643,7 @@ fn answer(id: usize, seq: u32, result: Result<&[u8], i64>) {
                 }
                 (0, r.len(), n)
             }
-            Err(e) => (-e, 0, 0),
+            Err(e) => (l4h_rt::host::errno::negative(*e), 0, 0),
         };
         addr_of_mut!((*p).status).write_volatile(status as i32);
         addr_of_mut!((*p).total).write_volatile(total as u32);

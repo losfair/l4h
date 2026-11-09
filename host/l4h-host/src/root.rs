@@ -16,20 +16,14 @@ use crate::wire::{Tail, Wire};
 pub const TRUSTD_ID: u32 = 0x300;
 pub const FLAGS_ID: u32 = 0x301;
 
-/// Who calls root, from its component id (badges::parent::ID).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Sender {
-    Trustd,
-    Vmmgr,
-}
+use crate::badges::root as recv;
 
-impl Sender {
-    pub const fn of_id(id: u32) -> Option<Sender> {
-        match id {
-            TRUSTD_ID => Some(Sender::Trustd),
-            crate::vmmgr::VMMGR_ID => Some(Sender::Vmmgr),
-            _ => None,
-        }
+crate::senders! {
+    /// Who calls root, by the badge l4h_task gives a component's calls
+    /// (badges::root, COMPONENT | ID).
+    pub enum Sender in recv {
+        Trustd: [COMPONENT] ID = TRUSTD_ID;
+        Vmmgr: [COMPONENT] ID = crate::vmmgr::VMMGR_ID;
     }
 }
 
@@ -186,8 +180,10 @@ mod tests {
         assert!(Later::<()>::get(&[1, crate::vmmgr::MAX_PENDING as u64]).is_none());
         assert!(Later::<()>::get(&[2]).is_none());
         assert_eq!(call::Request::MAX_REPLY_WORDS, 1 + 1 + 6);
-        assert_eq!(Sender::of_id(TRUSTD_ID), Some(Sender::Trustd));
-        assert_eq!(Sender::of_id(crate::vmmgr::VMMGR_ID), Some(Sender::Vmmgr));
-        assert_eq!(Sender::of_id(FLAGS_ID), None);
+        assert_eq!(Sender::of_badge(recv::COMPONENT | TRUSTD_ID as u64), Some(Sender::Trustd));
+        assert_eq!(Sender::of_badge(recv::COMPONENT | crate::vmmgr::VMMGR_ID as u64), Some(Sender::Vmmgr));
+        assert_eq!(Sender::of_badge(recv::COMPONENT | FLAGS_ID as u64), None);
+        // A fault is no call.
+        assert_eq!(Sender::of_badge(recv::COMPONENT | recv::FAULT | TRUSTD_ID as u64), None);
     }
 }

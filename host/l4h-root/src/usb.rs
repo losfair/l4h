@@ -24,6 +24,7 @@
 use core::ptr::addr_of_mut;
 use core::sync::atomic::Ordering;
 
+use l4h_host::errno::Errno;
 use sel4::{CapRights, ObjectBlueprint, VmAttributes, cap, cap_type};
 
 use l4h_abi::{self as abi, usb as uabi};
@@ -259,7 +260,7 @@ fn program_irq(h: &mut Host, i: usize, vector: u64, dom: Domain) {
 /// with the firmware; EIO marks it failed.  A CLAIM usbd refuses
 /// quarantines the controller (the handoff cannot be undone), and the
 /// guest that got it meanwhile sees no controller (no magic).
-fn claim(h: &mut Host, i: usize) -> Result<(), i64> {
+fn claim(h: &mut Host, i: usize) -> Result<(), Errno> {
     let claimed = ctrls().iter().filter(|c| c.driver.is_some()).count();
     let Some(&vector) = pci::VECTORS_USB.get(claimed) else { return Err(ctl::ENOSPC) };
     let Some((slots, scratch, page)) = caps(h, i) else {
@@ -395,7 +396,7 @@ pub struct Attached {
 
 /// Claim controller `i` if the firmware still has it: outside any
 /// guest's slot tracking, since usbd outlives the guest.
-pub fn ensure_claimed(h: &mut Host, i: usize) -> Result<(), i64> {
+pub fn ensure_claimed(h: &mut Host, i: usize) -> Result<(), Errno> {
     match ctrls().get(i).ok_or(ctl::ENOENT)?.state {
         State::Firmware => claim(h, i),
         _ => Ok(()),
@@ -493,7 +494,7 @@ pub fn poll(h: &mut Host) {
 /// (its VMM's badge).  usbd starts the controller when it gets to it
 /// (after the CLAIM or the previous guest's REMOVE): the guest waits for
 /// the magic.
-pub fn attach(h: &mut Host, i: usize, g: &mut RootGuest) -> Result<Attached, i64> {
+pub fn attach(h: &mut Host, i: usize, g: &mut RootGuest) -> Result<Attached, Errno> {
     let state = ctrls().get(i).ok_or(ctl::ENOENT)?.state;
     match state {
         State::Firmware => return Err(ctl::EIO),
@@ -622,7 +623,7 @@ pub fn dom0_ctrls(h: &Host) -> ArrayVec<u64, { usb::MAX_GUEST_USB }> {
 }
 
 /// CTL_USB_INFO for controller `i`.
-pub fn info(i: usize, data: &mut [u8; abi::CTL_DATA_MAX]) -> Result<[u64; 6], i64> {
+pub fn info(i: usize, data: &mut [u8; abi::CTL_DATA_MAX]) -> Result<[u64; 6], Errno> {
     let c = ctrls().get(i).ok_or(ctl::ENOENT)?;
     let p = &c.pci;
     let (state, owner) = match c.state {

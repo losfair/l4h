@@ -8,21 +8,11 @@ use l4h_abi as abi;
 use crate::Host;
 use crate::vmmgr::Answer;
 
-pub const EPERM: i64 = 1;
-pub const ENOENT: i64 = 2;
-pub const EIO: i64 = 5;
-pub const EAGAIN: i64 = 11;
-pub const ENOMEM: i64 = 12;
-pub const ENODEV: i64 = 19;
-pub const EBUSY: i64 = 16;
-pub const EEXIST: i64 = 17;
-pub const EINVAL: i64 = 22;
-pub const ENOSPC: i64 = 28;
-pub const ENOSYS: i64 = 38;
+pub use l4h_host::errno::{EAGAIN, EBUSY, EEXIST, EINVAL, EIO, ENODEV, ENOENT, ENOMEM, ENOSPC, ENOSYS, EPERM, Errno};
 
 /// Execute control op `op` with `a`: its vals, and its data into `data`;
 /// or later, for an op that waits for blkd (BLK_WRITE, BLK_INFO).
-pub fn host_op(h: &mut Host, op: u32, a: &[u64; 6], data: &mut [u8; abi::CTL_DATA_MAX]) -> Result<Answer, i64> {
+pub fn host_op(h: &mut Host, op: u32, a: &[u64; 6], data: &mut [u8; abi::CTL_DATA_MAX]) -> Result<Answer, Errno> {
     let mut vals = [0; 6];
     match op {
         abi::CTL_HOST_INFO => {

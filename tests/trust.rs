@@ -8,7 +8,7 @@ fn bits(ns: &[usize]) -> [u64; 4] {
     for &n in ns { b[n / 64] |= 1 << (n % 64); }
     b
 }
-fn update(e: &mut FlagsEntry, from: Sender, op: u64, instance: u64, ns: &[usize], flags: u64) -> Result<Flags, i64> {
+fn update(e: &mut FlagsEntry, from: Sender, op: u64, instance: u64, ns: &[usize], flags: u64) -> Result<Flags, l4h_host::errno::Errno> {
     // Exclusive reference serializes writers as the endpoint does.
     unsafe { e.update(from, op, instance, bits(ns), flags) }
 }

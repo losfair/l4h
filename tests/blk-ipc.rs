@@ -9,6 +9,7 @@ pub use l4h_host as host;
 use host::blk::{self, BlkdConfig, Channel};
 use host::blk::call::{Request, reply};
 use host::wire::{self, Message};
+use host::errno;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -262,7 +263,7 @@ fn run(kind: u32, legacy: bool, (label, args): (u64, [u64; 6]), pending_io: bool
 fn units_are_published_and_requests_survive_pending_io() {
     for kind in [blk::BLKD_VIRTIO, blk::BLKD_VIRTIO_SCSI] {
         for legacy in [false, true] {
-            assert_eq!(run(kind, legacy, UNKNOWN, true, false, 0)[0], blk::EINVAL);
+            assert_eq!(run(kind, legacy, UNKNOWN, true, false, 0)[0], errno::EINVAL);
             let p = mailbox::published::<blk::Published>();
             let u = &p.unit[0];
             let unit = [&u.capacity, &u.block_size, &u.read_only, &u.address].map(|w| w.load(Ordering::Relaxed));
@@ -275,7 +276,7 @@ fn units_are_published_and_requests_survive_pending_io() {
 fn service_status_survives_pending_io() {
     for kind in [blk::BLKD_VIRTIO, blk::BLKD_VIRTIO_SCSI] {
         assert_eq!(wire::reply::<reply::Flush>(&run(kind, true, post(Request::Flush { unit: 0 }), true, false, 0)), Ok(0));
-        assert_eq!(run(kind, true, UNKNOWN, true, false, 0)[0], blk::EINVAL);
+        assert_eq!(run(kind, true, UNKNOWN, true, false, 0)[0], errno::EINVAL);
     }
 }
 
@@ -291,7 +292,7 @@ fn provisioning_status_survives_scsi_retry() {
 fn refused_provisioning_reports_its_errno() {
     // Sector 0, length 0: not a flush, so not a valid range.
     let r = run(blk::BLKD_VIRTIO, true, post(Request::Write { sector: 0, length: 0, unit: 0 }), true, false, 0);
-    assert_eq!(wire::reply::<reply::Write>(&r), Err(blk::EINVAL));
+    assert_eq!(wire::reply::<reply::Write>(&r), Err(errno::EINVAL));
 }
 
 #[test]

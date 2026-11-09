@@ -6,6 +6,7 @@ use core::ops::Range;
 use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use l4h_host::errno::Errno;
 use sel4::{CapRights, VmAttributes, cap, cap_type};
 
 use l4h_host::mailbox::RING;
@@ -230,7 +231,7 @@ impl Controller {
     /// The `k`th extent (start, sectors) of client `i`'s disk, into
     /// vals[2..4] for pending request `token`: Ok(false) if blkd cannot say
     /// (they are u64::MAX and 0 then), Ok(true) if `poll` answers it.
-    pub fn extent(&mut self, i: usize, k: usize, token: usize, vals: &mut [u64; 6]) -> Result<bool, i64> {
+    pub fn extent(&mut self, i: usize, k: usize, token: usize, vals: &mut [u64; 6]) -> Result<bool, Errno> {
         if self.failed {
             (vals[2], vals[3]) = (u64::MAX, 0);
             return Ok(false);
@@ -553,7 +554,7 @@ pub type Channel = l4h_host::fixed::ArrayVec<cap::Granule, { blk::CHANNEL_PAGES 
 /// controller, or blkd has left too much unanswered.
 #[allow(clippy::too_many_arguments)]
 pub fn attach_start(h: &mut Host, c: usize, token: usize, id: usize, disk: usize, unit: u64, (start, sectors): (u64, u64),
-    (n, list): (usize, *const u8), read_only: bool, volatile: bool, dom0: bool) -> Result<(), i64> {
+    (n, list): (usize, *const u8), read_only: bool, volatile: bool, dom0: bool) -> Result<(), Errno> {
     let instance = h.guests[id].as_ref().ok_or(ctl::ENOENT)?.instance;
     let ctrl = &mut h.ctrls[c];
     if ctrl.failed { return Err(ctl::EIO); }
@@ -581,7 +582,7 @@ fn checked(h: &mut Host, c: usize, token: usize, id: usize, instance: u64, disk:
                 quarantine(ctrl, &h.pci);
                 return Err(ctl::EIO);
             }
-            Err(errno) => return Err(errno as i64),
+            Err(errno) => return Err(errno),
         };
         let i = ok.slot;
         // A slot that is free, or a reservation without a client.
@@ -613,7 +614,7 @@ fn checked(h: &mut Host, c: usize, token: usize, id: usize, instance: u64, disk:
 /// kick stays in a slot of the guest's until then.
 #[allow(clippy::too_many_arguments)]
 fn activate(ctrl: &mut Controller, unit: u64, i: usize, client: &RootGuest, chan: Channel, kick: cap::Notification,
-    token: usize, win: &mut Window) -> Result<(), i64> {
+    token: usize, win: &mut Window) -> Result<(), Errno> {
     let a = ctrl.clients[i].as_ref().unwrap();
     let (read_only, volatile) = (a.read_only, a.volatile);
     win.with_frame(&abs_of(chan[0]), |p| unsafe {
@@ -731,7 +732,7 @@ fn removed(h: &mut Host, c: usize, i: usize, quiet: bool) {
 /// `token`, which `poll` answers. Data copies occur only during seeding. A
 /// zero-length request flushes the disk. Never trust discard to zero.
 /// blkd refuses ranges anything holds.
-pub fn write(h: &mut Host, disk: usize, sector: u64, len: usize, from: Option<*const u8>, token: usize) -> Result<(), i64> {
+pub fn write(h: &mut Host, disk: usize, sector: u64, len: usize, from: Option<*const u8>, token: usize) -> Result<(), Errno> {
     let (c, unit) = (h.disks[disk].ctrl, h.disks[disk].unit);
     let ctrl = &mut h.ctrls[c];
     if ctrl.failed { return Err(ctl::EIO); }
@@ -815,7 +816,7 @@ fn complete(h: &mut Host, c: usize, op: BlkOp, w: [u64; host::mailbox::ANSWER]) 
                 }
                 Ok(_) => Err(ctl::EIO),
                 // The range refused.
-                Err(errno) => Err(errno as i64),
+                Err(errno) => Err(errno),
             };
             crate::vmmgr::op_done(h, token, r);
         }

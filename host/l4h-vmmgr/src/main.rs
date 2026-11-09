@@ -28,6 +28,7 @@ mod vmm;
 
 use core::sync::atomic::Ordering;
 
+use l4h_host::errno::Errno;
 use sel4::{ObjectBlueprint, cap};
 
 use l4h_abi as abi;
@@ -263,7 +264,7 @@ impl Vmmgr {
     /// Root answers later, after blkd: then `then` follows (`root_done`).
     /// No device of the guest changes, nor does it start, meanwhile.
     pub fn attach_disk(&mut self, id: usize, disk: usize, flags: u64, lba_start: u64, lba_count: u64,
-        extents: (u64, u64), then: Then) -> Result<Later<()>, i64> {
+        extents: (u64, u64), then: Then) -> Result<Later<()>, Errno> {
         if !self.can_afford(1 << 20, 0, 0) { return Err(ctl::ENOMEM); }
         let instance = self.guest(id).ok_or(ctl::ENOENT)?.instance;
         self.with_guest(id, |h, g| {
@@ -292,7 +293,7 @@ impl Vmmgr {
     }
 
     /// Root answered the disk attachment of guest `id` (`attach_disk`).
-    fn disk_attached(&mut self, id: usize, instance: u64, token: usize) -> Result<(), i64> {
+    fn disk_attached(&mut self, id: usize, instance: u64, token: usize) -> Result<(), Errno> {
         if self.guest(id).is_none_or(|g| g.instance != instance) {
             root::discard(token);
             return Err(ctl::ENOENT);
@@ -328,7 +329,7 @@ impl Vmmgr {
 
     /// Give guest `id` (before it starts) the whole USB controller `ctrl`
     /// (DESIGN.md §9.7).  Root claims it on its first attachment.
-    pub fn attach_usb(&mut self, id: usize, ctrl: usize) -> Result<(), i64> {
+    pub fn attach_usb(&mut self, id: usize, ctrl: usize) -> Result<(), Errno> {
         if !self.can_afford(1 << 20, 0, 0) { return Err(ctl::ENOMEM); }
         self.with_guest(id, |h, g| {
             if g.state != State::Created || g.vmm.is_some() || g.root_pending {
@@ -349,7 +350,7 @@ impl Vmmgr {
     }
 
     /// Keep a failed boot disk's position without a channel or DMA access.
-    pub fn attach_dummy_disk(&mut self, id: usize) -> Result<(), i64> {
+    pub fn attach_dummy_disk(&mut self, id: usize) -> Result<(), Errno> {
         self.with_guest(id, |h, g| {
             if g.state != State::Created || g.root_pending { return Err(ctl::EBUSY); }
             let d = g.add_device(&mut h.alloc, guest::DevKind::Virtio(2)).ok_or(ctl::ENOSPC)?;
@@ -359,7 +360,7 @@ impl Vmmgr {
     }
 
     /// Spawn the guest's l4h-vmm; the guest starts when the VMM is ready.
-    pub fn start_guest(&mut self, id: usize) -> Result<(), i64> {
+    pub fn start_guest(&mut self, id: usize) -> Result<(), Errno> {
         self.with_guest(id, |h, g| {
             if g.state != State::Created || g.vmm.is_some() || g.root_pending {
                 return Err(ctl::EBUSY);
@@ -381,7 +382,7 @@ impl Vmmgr {
 
     /// Give guest `id` (before it starts) a virtio-net device on `switch`.
     /// Returns the MAC.
-    pub fn create_nic(&mut self, id: usize, switch: u32, mac: u64, lock: bool, isolated: bool) -> Result<u64, i64> {
+    pub fn create_nic(&mut self, id: usize, switch: u32, mac: u64, lock: bool, isolated: bool) -> Result<u64, Errno> {
         if !self.can_afford(1 << 20, 0, 0) {
             return Err(ctl::ENOMEM);
         }
@@ -410,7 +411,7 @@ impl Vmmgr {
 
     /// Give guest `id` (before it starts) a virtio-gpu device with one
     /// scanout of `width` x `height` pixels.
-    pub fn attach_gpu(&mut self, id: usize, width: u64, height: u64) -> Result<(), i64> {
+    pub fn attach_gpu(&mut self, id: usize, width: u64, height: u64) -> Result<(), Errno> {
         if !gpu::valid_size(width, height) {
             return Err(ctl::EINVAL);
         }
@@ -441,7 +442,7 @@ impl Vmmgr {
         .ok_or(ctl::ENOENT)?
     }
 
-    pub fn destroy_guest(&mut self, id: usize) -> Result<(), i64> {
+    pub fn destroy_guest(&mut self, id: usize) -> Result<(), Errno> {
         let g = self.guests.get_mut(id).and_then(|g| g.take()).ok_or(ctl::ENOENT)?;
         let name = g.name.clone();
         self.asids.in_use -= g.asids;
@@ -599,7 +600,7 @@ fn dom0_disks(h: &mut Vmmgr, id: usize, mut k: usize) {
 
 /// Root answered dom0's boot disk `k` with `r`: the next, unless this dom0
 /// (`instance`) is gone.
-fn dom0_disk_done(h: &mut Vmmgr, id: usize, instance: u64, k: usize, r: Result<(), i64>) {
+fn dom0_disk_done(h: &mut Vmmgr, id: usize, instance: u64, k: usize, r: Result<(), Errno>) {
     if h.guest(id).is_none_or(|g| g.instance != instance) {
         return;
     }
@@ -609,7 +610,7 @@ fn dom0_disk_done(h: &mut Vmmgr, id: usize, instance: u64, k: usize, r: Result<(
     dom0_disks(h, id, k + 1);
 }
 
-fn dom0_no_disk(h: &mut Vmmgr, id: usize, k: usize, e: i64) {
+fn dom0_no_disk(h: &mut Vmmgr, id: usize, k: usize, e: Errno) {
     let d = &h.cfg.dom0_disk[k];
     l4h_rt::log!("l4h-vmmgr: disk {} window {}:{} unavailable to dom0: error {}; using zero-capacity device",
         d.disk, d.start, d.sectors, e);
@@ -824,25 +825,29 @@ fn component_call(h: &mut Vmmgr, badge: u64, info: &sel4::MessageInfo) -> Option
         return None;
     }
     // The VMMs' component ids are their guests'.
-    if id >= MAX_GUESTS {
-        l4h_rt::log!("l4h-vmmgr: component {:#x}: unknown", id);
-        return Some(l4h_ipc::refuse());
+    match proto::Sender::of_badge(badge) {
+        Some(from @ proto::Sender::Vmm(g)) if g < MAX_GUESTS => {
+            l4h_ipc::serve(info, |label, args, out| call::serve(&mut VmmCalls(h), label, args, from, out))
+        }
+        _ => {
+            l4h_rt::log!("l4h-vmmgr: component {:#x}: unknown", id);
+            Some(l4h_ipc::refuse())
+        }
     }
-    l4h_ipc::serve(info, |label, args, out| call::serve(&mut VmmCalls(h), label, args, proto::Sender::Vmm(id), out))
 }
 
 /// The VMMs' calls, as l4h_host::vmmgr::call declares them.
 struct VmmCalls<'a>(&'a mut Vmmgr);
 
 impl call::Server for VmmCalls<'_> {
-    fn vmm_ready(&mut self, from: proto::Sender) -> Result<(), u64> {
+    fn vmm_ready(&mut self, from: proto::Sender) -> Result<(), Errno> {
         let proto::Sender::Vmm(id) = from;
         let g = self.0.guests.get_mut(id).and_then(|g| g.as_mut()).ok_or(l4h_host::wire::NO_REPLY)?;
         g.start();
         Ok(())
     }
 
-    fn guest_power(&mut self, from: proto::Sender, how: u64) -> Result<(), u64> {
+    fn guest_power(&mut self, from: proto::Sender, how: u64) -> Result<(), Errno> {
         let proto::Sender::Vmm(id) = from;
         let h = &mut *self.0;
         let reason = match how {

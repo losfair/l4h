@@ -12,6 +12,7 @@
 
 pub mod badges;
 pub mod blk;
+pub mod errno;
 pub mod fixed;
 pub mod font;
 pub mod gpu;

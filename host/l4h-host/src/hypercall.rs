@@ -5,11 +5,14 @@
 
 use l4h_abi as abi;
 
-/// Who makes a hypercall: the guest, whose capability to the VMM's
-/// endpoint vmmgr badges HYPERCALL.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Sender {
-    Guest,
+use crate::badges::vmm as recv;
+
+crate::senders! {
+    /// Who makes a hypercall: the guest, whose capability to the VMM's
+    /// endpoint vmmgr badges HYPERCALL.
+    pub enum Sender in recv {
+        Guest: [HYPERCALL];
+    }
 }
 
 crate::protocol! {

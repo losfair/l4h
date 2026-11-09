@@ -32,6 +32,7 @@ mod balloon;
 mod exchange;
 mod mem;
 
+use l4h_rt::host::errno::Errno;
 use l4h_rt::host::badges::memd as recv;
 use l4h_rt::host::fixed::{ArrayVec, Scratch};
 use l4h_rt::host::memd::{self, BalloonConfig, GuestHp, HpState, MemdConfig, Sender, Status, call, BLOCK_BITS, HP_MAP_WORDS, HP_MAX, MAX_GUESTS, XCHG_SLOTS};
@@ -42,11 +43,7 @@ use sel4::{CapRights, cap_type};
 use crate::balloon::Balloon;
 use crate::mem::{List, Mem, State, abs};
 
-const ENODEV: u64 = 19;
-const ENOMEM: u64 = 12;
-const EBUSY: u64 = 16;
-const EINVAL: u64 = 22;
-const ENOSPC: u64 = 28;
+use l4h_rt::host::errno::{EBUSY, EINVAL, ENODEV, ENOMEM, ENOSPC, check as errno};
 
 /// 2 MiB blocks of a hotplug block, and the depth that names slot
 /// (m, i) in a guest's hotplug CNode.
@@ -119,7 +116,7 @@ enum Client {
 
 impl Client {
     /// The protocol lets only these make the calls that take a Client.
-    fn of(from: Sender) -> Result<Client, u64> {
+    fn of(from: Sender) -> Result<Client, Errno> {
         match from {
             Sender::Root => Ok(Client::Root),
             Sender::Vmmgr => Ok(Client::Vmmgr),
@@ -129,16 +126,11 @@ impl Client {
 }
 
 /// The guest of a VMM's call.
-fn vmm_guest(from: Sender) -> Result<usize, u64> {
+fn vmm_guest(from: Sender) -> Result<usize, Errno> {
     match from {
         Sender::Vmm(g) => Ok(g),
         _ => Err(EINVAL),
     }
-}
-
-/// A handler's errno as a call's result.
-fn errno(e: u64) -> Result<(), u64> {
-    if e == 0 { Ok(()) } else { Err(e) }
 }
 
 /// Slot `i` of the caller's mailbox: root's in our CNode, vmmgr's in the
@@ -283,14 +275,14 @@ impl Memd {
     }
 
     /// `hp_state`: target, plugged and the bitmap.
-    fn hp_state(&self, g: usize) -> Result<HpState, u64> {
+    fn hp_state(&self, g: usize) -> Result<HpState, Errno> {
         let r = self.guest(g).ok_or(EINVAL)?;
         let map: [u64; HP_MAP_WORDS] = r.hp.map;
         Ok(HpState { target: r.hp.target as u64, plugged: r.hp.plugged as u64, map })
     }
 
     /// `guest_copy`: the block's physical address.
-    fn guest_copy(&mut self, g: usize, b: usize) -> Result<u64, u64> {
+    fn guest_copy(&mut self, g: usize, b: usize) -> Result<u64, Errno> {
         let i = self.guest_block(g, b).ok_or(EINVAL)?;
         // Fails if the block already has a copy.
         let _ = xchg(Client::Vmmgr, 0).delete();
@@ -416,47 +408,47 @@ fn main(info: &'static Info) -> ! {
 /// The calls, as l4h_host::memd::call declares them.  Each may be made
 /// only by the senders the declaration allows: `serve` refuses the others.
 impl call::Server for Memd {
-    fn alloc(&mut self, from: Sender, bits: usize, count: usize) -> Result<Tail<u64, XCHG_SLOTS>, u64> {
+    fn alloc(&mut self, from: Sender, bits: usize, count: usize) -> Result<Tail<u64, XCHG_SLOTS>, Errno> {
         Memd::alloc(self, Client::of(from)?, bits, count).map(Tail)
     }
 
-    fn free(&mut self, from: Sender, blocks: ArrayVec<(usize, usize), XCHG_SLOTS>) -> Result<(), u64> {
+    fn free(&mut self, from: Sender, blocks: ArrayVec<(usize, usize), XCHG_SLOTS>) -> Result<(), Errno> {
         errno(Memd::free(self, Client::of(from)?, &blocks))
     }
 
-    fn guest_create(&mut self, _: Sender, guest: usize, blocks: usize, radix: usize, hp_count: usize) -> Result<(), u64> {
+    fn guest_create(&mut self, _: Sender, guest: usize, blocks: usize, radix: usize, hp_count: usize) -> Result<(), Errno> {
         errno(Memd::guest_create(self, guest, blocks, radix, hp_count))
     }
 
-    fn guest_copy(&mut self, _: Sender, guest: usize, block: usize) -> Result<u64, u64> {
+    fn guest_copy(&mut self, _: Sender, guest: usize, block: usize) -> Result<u64, Errno> {
         Memd::guest_copy(self, guest, block)
     }
 
-    fn guest_give(&mut self, _: Sender, guest: usize, first: usize, skip: usize) -> Result<(), u64> {
+    fn guest_give(&mut self, _: Sender, guest: usize, first: usize, skip: usize) -> Result<(), Errno> {
         errno(Memd::guest_give(self, guest, first, skip))
     }
 
-    fn guest_destroy(&mut self, _: Sender, guest: usize) -> Result<(), u64> {
+    fn guest_destroy(&mut self, _: Sender, guest: usize) -> Result<(), Errno> {
         errno(Memd::guest_destroy(self, guest))
     }
 
-    fn balloon(&mut self, _: Sender, cfg: BalloonConfig) -> Result<(), u64> {
+    fn balloon(&mut self, _: Sender, cfg: BalloonConfig) -> Result<(), Errno> {
         errno(Memd::balloon(self, cfg))
     }
 
-    fn set_target(&mut self, _: Sender, guest: usize, target: usize) -> Result<(), u64> {
+    fn set_target(&mut self, _: Sender, guest: usize, target: usize) -> Result<(), Errno> {
         errno(Memd::set_target(self, guest, target))
     }
 
-    fn hp_plug(&mut self, from: Sender, m: usize) -> Result<(), u64> {
+    fn hp_plug(&mut self, from: Sender, m: usize) -> Result<(), Errno> {
         errno(Memd::hp_plug(self, vmm_guest(from)?, m))
     }
 
-    fn hp_unplug(&mut self, from: Sender, m: usize) -> Result<(), u64> {
+    fn hp_unplug(&mut self, from: Sender, m: usize) -> Result<(), Errno> {
         errno(Memd::hp_unplug(self, vmm_guest(from)?, m))
     }
 
-    fn hp_state(&mut self, from: Sender) -> Result<HpState, u64> {
+    fn hp_state(&mut self, from: Sender) -> Result<HpState, Errno> {
         Memd::hp_state(self, vmm_guest(from)?)
     }
 }

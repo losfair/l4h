@@ -50,7 +50,7 @@ vm_arg = ctl[start:end]
 start = ctl.index('        abi::CTL_BLK_ATTACH => {')
 end = ctl.index('        abi::CTL_CONSOLE_READ => {', start)
 (out / 'blk-attach.inc').write_text(vm_arg + '''
-fn execute(h: &mut Vmmgr, caller: usize, op: u32, a: &[u64; 6]) -> Result<(), i64> {
+fn execute(h: &mut Vmmgr, caller: usize, op: u32, a: &[u64; 6]) -> Result<(), Errno> {
     match op {
 ''' + ctl[start:end] + '''
         _ => unreachable!(),
@@ -60,7 +60,7 @@ fn execute(h: &mut Vmmgr, caller: usize, op: u32, a: &[u64; 6]) -> Result<(), i6
 start = ctl.index('        abi::CTL_VM_START => {')
 end = ctl.index('        abi::CTL_VM_DESTROY => {', start)
 (out / 'vm-start.inc').write_text(vm_arg + '''
-fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq) -> Result<(), i64> {
+fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq) -> Result<(), Errno> {
     let a = &req.args;
     match req.op {
 ''' + ctl[start:end] + '''

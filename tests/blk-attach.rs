@@ -1,10 +1,9 @@
 //! Production control handlers with a backend that records attachments.
+use l4h_host::errno::{EINVAL, ENOENT, Errno};
 use l4h_abi as abi;
 use l4h_host as host;
 
 const MAX_GUESTS: usize = 64;
-const ENOENT: i64 = 2;
-const EINVAL: i64 = 22;
 
 #[derive(Debug, PartialEq, Eq)]
 struct Attachment {
@@ -21,7 +20,7 @@ struct Attachment {
 enum Later<T> { Now(T), Token(usize) }
 struct Then;
 fn later(_: &Vmmgr) -> Then { Then }
-fn deferred(r: Later<()>) -> Result<(), i64> {
+fn deferred(r: Later<()>) -> Result<(), Errno> {
     match r { Later::Now(()) => Ok(()), Later::Token(_) => unreachable!() }
 }
 
@@ -29,7 +28,7 @@ fn deferred(r: Later<()>) -> Result<(), i64> {
 struct Vmmgr { attached: Vec<Attachment> }
 impl Vmmgr {
     fn attach_disk(&mut self, id: usize, disk: usize, flags: u64, start: u64, sectors: u64,
-        extents: (u64, u64), _: Then) -> Result<Later<()>, i64> {
+        extents: (u64, u64), _: Then) -> Result<Later<()>, Errno> {
         self.attached.push(Attachment { id, disk, flags, start, sectors, extents });
         Ok(Later::Now(()))
     }

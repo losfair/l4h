@@ -22,22 +22,15 @@ use crate::fixed::ArrayVec;
 /// Message registers of an IPC buffer (seL4_MsgMaxLength).
 pub const MAX_MRS: usize = 120;
 
-pub const EINVAL: u64 = 22;
+pub use crate::errno::{EINVAL, Errno};
 /// The reply's first word when the server failed: its keeper answers
 /// everything with it (l4h_rt::abort_trap), and a reply too short for its
 /// type is taken as one.
-pub const FAILED: u64 = u64::MAX;
+pub const FAILED: Errno = u64::MAX;
 /// What a `Server` method returns to leave its caller unanswered (a
 /// stopped or destroyed caller): `serve` then writes no reply.  Never on
 /// the wire.
-pub const NO_REPLY: u64 = u64::MAX - 2;
-
-/// The sender of a protocol only l4h-root uses: the drivers' mailboxes
-/// (crate::mailbox), whose requests only root posts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RootOnly {
-    Root,
-}
+pub const NO_REPLY: Errno = u64::MAX - 2;
 
 /// A call, as a client posts it: what `protocol!`'s Request implements.
 pub trait Message {
@@ -335,12 +328,17 @@ pub trait Call {
 
 /// The reply of a call, as `protocol!`'s clients see it: its value, or
 /// the errno the server gave (FAILED if it failed).
-pub fn reply<R: Wire>(words: &[u64]) -> Result<R, u64> {
+pub fn reply<R: Wire>(words: &[u64]) -> Result<R, Errno> {
     match words.first() {
         None => Err(FAILED),
         Some(0) => R::get(&words[1..]).map(|(v, _)| v).ok_or(FAILED),
         Some(&e) => Err(e),
     }
+}
+
+/// A client's result, with a failed server (FAILED) taken as EIO.
+pub fn eio_if_failed<T>(r: Result<T, Errno>) -> Result<T, Errno> {
+    r.map_err(|e| if e == FAILED { crate::errno::EIO } else { e })
 }
 
 /// Declare the badge bits of a receiver.
@@ -394,6 +392,102 @@ macro_rules! badge_space {
     (@signal signal $lo:literal) => { (1u64 << $lo) };
     (@signal signals $lo:literal $hi:expr) => { $crate::wire::Bits::new($lo, $hi).mask() };
     (@signal $kind:ident $lo:literal $($hi:expr)?) => { 0 };
+}
+
+/// Declare who calls a protocol, by the badge of their capability in a
+/// badge space (in scope as `$space`): its flags, and at most one field,
+/// which the variant carries or which is fixed to a value.  A mailbox's
+/// poster has no badge.
+///
+/// ```ignore
+/// senders! {
+///     pub enum Sender in recv {
+///         Root: [];                           // unbadged
+///         Vmmgr: [VMMGR];
+///         Vmm(GUEST): [VMM];                  // VMM | GUEST.put(guest)
+///         Trustd: [COMPONENT] ID = TRUSTD_ID; // COMPONENT | ID.put(TRUSTD_ID)
+///         Root: mailbox;                      // posts in the mailbox
+///     }
+/// }
+/// ```
+///
+/// `of_badge` takes a badge to its sender only if it has no other bits;
+/// `badge` is the badge to mint for one.  The declaration does not compile
+/// if a sender's badge does not decode to it.
+#[macro_export]
+macro_rules! senders {
+    (
+        $(#[$doc:meta])*
+        $vis:vis enum $name:ident in $space:ident {
+            $( $(#[$m:meta])* $v:ident $(($field:ident))? : $spec:tt $($fixed:ident = $val:expr)? ; )*
+        }
+    ) => {
+        $(#[$doc])*
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        $vis enum $name {
+            $( $(#[$m])* $v $(($crate::senders!(@usize $field)))? ),*
+        }
+
+        impl $name {
+            /// The sender a badge is, if it is exactly one's.
+            #[allow(unused_variables)]
+            pub const fn of_badge(badge: u64) -> Option<Self> {
+                $( $crate::senders!(@of $space, badge, $v, $spec, [$($field)?], [$($fixed = $val)?]); )*
+                None
+            }
+
+            /// The badge to mint for the sender's capability (none for a
+            /// mailbox's poster: 0).
+            #[allow(irrefutable_let_patterns, unreachable_code)]
+            pub const fn badge(self) -> u64 {
+                $( $crate::senders!(@badge $space, self, $v, $spec, [$($field)?], [$($fixed = $val)?]); )*
+                0
+            }
+        }
+
+        const _: () = {
+            // The space is a badge space.
+            let _: &[$crate::wire::Bits] = $space::OWN;
+            $( $crate::senders!(@check $name, $v, $spec, [$($field)?]); )*
+        };
+    };
+    (@usize $field:ident) => { usize };
+    (@flags $space:ident, [$($flag:ident)|*]) => { 0 $(| $space::$flag)* };
+    (@fixed $space:ident, []) => { 0 };
+    (@fixed $space:ident, [$fixed:ident = $val:expr]) => { $space::$fixed.put($val as u64) };
+    (@of $space:ident, $b:ident, $v:ident, mailbox, [], []) => {};
+    (@of $space:ident, $b:ident, $v:ident, $spec:tt, [], [$($fx:tt)*]) => {
+        if $b == $crate::senders!(@flags $space, $spec) | $crate::senders!(@fixed $space, [$($fx)*]) {
+            return Some(Self::$v);
+        }
+    };
+    (@of $space:ident, $b:ident, $v:ident, $spec:tt, [$field:ident], []) => {
+        if $b & !$space::$field.mask() == $crate::senders!(@flags $space, $spec) {
+            return Some(Self::$v($space::$field.get($b) as usize));
+        }
+    };
+    (@badge $space:ident, $s:ident, $v:ident, mailbox, [], []) => {
+        if let Self::$v = $s {
+            return 0;
+        }
+    };
+    (@badge $space:ident, $s:ident, $v:ident, $spec:tt, [], [$($fx:tt)*]) => {
+        if let Self::$v = $s {
+            return $crate::senders!(@flags $space, $spec) | $crate::senders!(@fixed $space, [$($fx)*]);
+        }
+    };
+    (@badge $space:ident, $s:ident, $v:ident, $spec:tt, [$field:ident], []) => {
+        if let Self::$v(x) = $s {
+            return $crate::senders!(@flags $space, $spec) | $space::$field.put(x as u64);
+        }
+    };
+    (@check $name:ident, $v:ident, mailbox, []) => {};
+    (@check $name:ident, $v:ident, $spec:tt, []) => {
+        assert!(matches!($name::of_badge($name::$v.badge()), Some($name::$v)), "a sender's badge is another's");
+    };
+    (@check $name:ident, $v:ident, $spec:tt, [$field:ident]) => {
+        assert!(matches!($name::of_badge($name::$v(1).badge()), Some($name::$v(1))), "a sender's badge is another's");
+    };
 }
 
 /// Declare the calls on an endpoint.
@@ -464,7 +558,7 @@ macro_rules! protocol {
                 /// unknown, `from` may not make it, or its arguments are
                 /// not valid.  Words past the arguments are ignored.
                 #[allow(unused_mut, unused_variables, unused_assignments)]
-                pub fn decode(label: u64, args: &[u64], from: Sender) -> Result<Self, u64> {
+                pub fn decode(label: u64, args: &[u64], from: Sender) -> Result<Self, $crate::errno::Errno> {
                     if !Self::allowed(label, from) {
                         return Err($crate::wire::EINVAL);
                     }
@@ -525,7 +619,7 @@ macro_rules! protocol {
             /// What the server implements: a method per call, made only by
             /// the senders its declaration allows.
             pub trait Server {
-                $( $(#[$m])* fn $method(&mut self, from: Sender, $($arg: $aty),*) -> Result<$rty, u64>; )*
+                $( $(#[$m])* fn $method(&mut self, from: Sender, $($arg: $aty),*) -> Result<$rty, $crate::errno::Errno>; )*
             }
 
             /// Decode the call `label` from `from`, run its method, and
@@ -557,7 +651,7 @@ macro_rules! protocol {
             pub trait Client: $crate::wire::Call {
                 $(
                     $(#[$m])*
-                    fn $method(&self, $($arg: $aty),*) -> Result<$rty, u64> {
+                    fn $method(&self, $($arg: $aty),*) -> Result<$rty, $crate::errno::Errno> {
                         let req = Request::$variant { $($arg),* };
                         let mut args = [0u64; Request::MAX_WORDS];
                         let n = req.encode(&mut args);
@@ -611,10 +705,12 @@ mod tests {
         space::ID.put(1 << 16);
     }
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum Who {
-        Boss,
-        Guest(u16),
+    crate::senders! {
+        pub enum Who in space {
+            Boss: [CALLER];
+            Guest(ID): [FAULT];
+            Poster: mailbox;
+        }
     }
 
     crate::wire_struct! {
@@ -636,13 +732,13 @@ mod tests {
 
     struct Srv;
     impl demo::Server for Srv {
-        fn add(&mut self, _: Who, x: u64, y: u8) -> Result<u64, u64> {
+        fn add(&mut self, _: Who, x: u64, y: u8) -> Result<u64, Errno> {
             x.checked_add(y as u64).ok_or(EINVAL)
         }
-        fn pairs(&mut self, _: Who, list: ArrayVec<Pair, 4>) -> Result<Tail<u64, 4>, u64> {
+        fn pairs(&mut self, _: Who, list: ArrayVec<Pair, 4>) -> Result<Tail<u64, 4>, Errno> {
             Ok(Tail(list.iter().map(|p| p.a + p.b as u64).collect()))
         }
-        fn ping(&mut self, from: Who) -> Result<(), u64> {
+        fn ping(&mut self, from: Who) -> Result<(), Errno> {
             match from {
                 Who::Guest(7) => Ok(()),
                 Who::Guest(8) => Err(NO_REPLY),
@@ -683,6 +779,19 @@ mod tests {
         assert_eq!(reply::<demo::reply::Add>(&[0, 9]), Ok(9));
         assert_eq!(demo::Request::MAX_WORDS, 1 + 4 * 2);
         assert_eq!(demo::Request::MAX_REPLY_WORDS, 1 + 4);
+    }
+
+    #[test]
+    fn senders() {
+        assert_eq!(Who::Boss.badge(), space::CALLER);
+        assert_eq!(Who::Guest(9).badge(), space::FAULT | 9);
+        assert_eq!(Who::of_badge(space::FAULT | 9), Some(Who::Guest(9)));
+        assert_eq!(Who::of_badge(space::CALLER), Some(Who::Boss));
+        // Exactly: no stray bits, and a mailbox's poster from no badge.
+        assert_eq!(Who::of_badge(space::CALLER | 1), None);
+        assert_eq!(Who::of_badge(space::FAULT | space::TIMER), None);
+        assert_eq!(Who::of_badge(0), None);
+        assert_eq!(Who::Poster.badge(), 0);
     }
 
     #[test]

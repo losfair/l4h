@@ -15,12 +15,13 @@ mod exchange;
 mod mem;
 #[path = "../host/l4h-host/src/fixed.rs"]
 pub mod fixed;
+#[path = "../host/l4h-host/src/errno.rs"]
+pub mod errno;
 
 use host::memd::{BLOCK_BITS, TABLE_VA, XCHG_SLOTS};
 use mem::{Mem, State, abs};
 
-const EINVAL: u64 = 22;
-const ENOMEM: u64 = 12;
+use errno::{EINVAL, ENOMEM};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Client { Root, Vmmgr }
@@ -129,7 +130,7 @@ impl AbsoluteCPtr {
 }
 
 pub mod host {
-    pub use crate::fixed;
+    pub use crate::{errno, fixed};
     pub const SLOT_CNODE: u64 = 1;
     pub mod ticks { pub fn now() -> u64 { 1000 } }
     pub mod memd {

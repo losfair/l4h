@@ -15,7 +15,6 @@ use sel4::cap_type;
 
 use crate::guest::Vcpus;
 
-const EIO: i64 = 5;
 
 pub struct MemDev {
     page: *mut abi::MemPage,
@@ -65,17 +64,15 @@ impl MemDev {
         let plug = match op {
             abi::MEM_PLUG => true,
             abi::MEM_UNPLUG => false,
-            _ => return -22,
+            _ => return host::errno::negative(host::errno::EINVAL),
         };
         if m >= self.count as u64 {
-            return -22;
+            return host::errno::negative(host::errno::EINVAL);
         }
         let m = m as usize;
-        let r = match if plug { memd().hp_plug(m) } else { memd().hp_unplug(m) } {
+        let r = match host::wire::eio_if_failed(if plug { memd().hp_plug(m) } else { memd().hp_unplug(m) }) {
             Ok(()) => 0,
-            // memd failed: its keeper answers everything so.
-            Err(l4h_rt::host::wire::FAILED) => return -EIO,
-            Err(e) => -(e as i64),
+            Err(e) => host::errno::negative(e),
         };
         self.refresh();
         r

@@ -90,11 +90,14 @@ pub const CTL_DATA_VA: usize = 0x5100_0100_0000;
 pub const MAX_PENDING: usize = 256;
 pub const PENDING_PER_CTRL: usize = 2;
 
-/// Who calls vmmgr's endpoint: a guest's l4h-vmm, badged with its guest
-/// (badges::vmmgr, COMPONENT | ID).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Sender {
-    Vmm(usize),
+use crate::badges::vmmgr as recv;
+
+crate::senders! {
+    /// Who calls vmmgr's endpoint: a guest's l4h-vmm, badged with its guest
+    /// (badges::vmmgr, COMPONENT | ID).
+    pub enum Sender in recv {
+        Vmm(ID): [COMPONENT];
+    }
 }
 
 crate::protocol! {

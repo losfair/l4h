@@ -15,6 +15,7 @@ mod memhp;
 mod net;
 mod virtq;
 
+use l4h_rt::host::errno::Errno;
 use l4h_abi as abi;
 use l4h_rt::host::badges::vmm as recv;
 use l4h_rt::host::hypercall::{Sender as Guest, call as hypercall};
@@ -94,7 +95,7 @@ struct Hypercalls<'a> {
 }
 
 impl hypercall::Server for Hypercalls<'_> {
-    fn power(&mut self, _: Guest, how: u64) -> Result<(), u64> {
+    fn power(&mut self, _: Guest, how: u64) -> Result<(), Errno> {
         // What the guest printed before (a crash report) goes out before
         // it stops.  vmmgr stops the vCPUs, which cancels this call: do not
         // reply.
@@ -103,12 +104,12 @@ impl hypercall::Server for Hypercalls<'_> {
         Err(host::wire::NO_REPLY)
     }
 
-    fn dev_write(&mut self, _: Guest, device: usize, op: u64, a: u64, b: u64) -> Result<u64, u64> {
+    fn dev_write(&mut self, _: Guest, device: usize, op: u64, a: u64, b: u64) -> Result<u64, Errno> {
         let d = self.devs.get_mut(device).and_then(|d| d.as_mut()).ok_or(host::wire::EINVAL)?;
         Ok(d.op(self.mem, self.vcpus, op, a, b))
     }
 
-    fn get_time(&mut self, _: Guest) -> Result<u64, u64> {
+    fn get_time(&mut self, _: Guest) -> Result<u64, Errno> {
         Ok(wall_clock_ns(self.cfg, self.tsc_hz))
     }
 }
@@ -260,7 +261,12 @@ fn main(info: &'static Info) -> ! {
             continue;
         }
         let mut hc = Hypercalls { cfg, tsc_hz, mem: &mem, vcpus: &vcpus, devs: &mut devs, console: &mut console, root_ep };
-        let Some(response) = l4h_rt::ipc::serve(&info, |label, args, out| hypercall::serve(&mut hc, label, args, Guest::Guest, out)) else {
+        // Only the guest holds a capability to the endpoint.
+        let Some(from) = Guest::of_badge(badge) else {
+            (info, badge) = ep.reply_recv(l4h_rt::ipc::refuse(), reply);
+            continue;
+        };
+        let Some(response) = l4h_rt::ipc::serve(&info, |label, args, out| hypercall::serve(&mut hc, label, args, from, out)) else {
             (info, badge) = ep.recv(reply);
             continue;
         };

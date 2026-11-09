@@ -4,6 +4,7 @@
 
 use core::sync::atomic::Ordering;
 
+use l4h_host::errno::Errno;
 use sel4::{CapRights, ObjectBlueprint, VmAttributes, cap, cap_type};
 
 use l4h_host::badges;
@@ -380,7 +381,7 @@ impl Netd {
     /// Post a command; EBUSY if netd has left the ring full.
     /// Post a command: dropped once netd has failed, as root keeps the
     /// state commands set and reads nothing back.
-    fn post(&mut self, req: Request) -> Result<(), i64> {
+    fn post(&mut self, req: Request) -> Result<(), Errno> {
         if self.failed {
             return Ok(());
         }
@@ -403,7 +404,7 @@ impl Netd {
 
     /// A new switch; ENOSPC once there are MAX_SWITCHES, the size of
     /// netd's table of them.
-    pub fn try_create_switch(&mut self) -> Result<u32, i64> {
+    pub fn try_create_switch(&mut self) -> Result<u32, Errno> {
         if self.switches as usize >= net::MAX_SWITCHES {
             return Err(ctl::ENOSPC);
         }
@@ -416,7 +417,7 @@ impl Netd {
         self.try_create_switch().expect("l4h-root: more switches than MAX_SWITCHES")
     }
 
-    pub fn attach_uplink(&mut self, switch: u32, nic: usize) -> Result<(), i64> {
+    pub fn attach_uplink(&mut self, switch: u32, nic: usize) -> Result<(), Errno> {
         if switch >= self.switches {
             return Err(ctl::ENOENT);
         }
@@ -432,7 +433,7 @@ impl Netd {
     }
 
     /// The port a new port on `switch` would be.
-    pub fn free_port(&self, switch: u32) -> Result<usize, i64> {
+    pub fn free_port(&self, switch: u32) -> Result<usize, Errno> {
         if switch >= self.switches {
             return Err(ctl::ENOENT);
         }
@@ -443,7 +444,7 @@ impl Netd {
 
     /// A port's memory, in its own root slot: taken before the guest's
     /// device, so that running out leaves nothing behind.
-    pub fn port_memory(alloc: &mut Alloc) -> Result<(Slot, UtRegion), i64> {
+    pub fn port_memory(alloc: &mut Alloc) -> Result<(Slot, UtRegion), Errno> {
         let s = alloc.slots.alloc();
         match alloc.split(PORT_BITS, s) {
             Some(region) => Ok((s, region)),
@@ -605,7 +606,7 @@ impl Netd {
         ntfn: cap::Notification,
         alloc: &mut Alloc,
         devmem: &mut DevMem,
-    ) -> Result<usize, i64> {
+    ) -> Result<usize, Errno> {
         let l = self.links.len();
         if l >= net::MAX_LINKS || switch >= self.switches {
             return Err(ctl::ENOSPC);
@@ -697,7 +698,7 @@ impl Netd {
 
     /// Set the endpoint (switch, mac): a new one, or a new peer for an
     /// existing one.  Returns its id.
-    pub fn ep_set(&mut self, switch: u32, mac: u64, peer: u64) -> Result<usize, i64> {
+    pub fn ep_set(&mut self, switch: u32, mac: u64, peer: u64) -> Result<usize, Errno> {
         if switch >= self.switches {
             return Err(ctl::ENOENT);
         }
@@ -719,7 +720,7 @@ impl Netd {
     }
 
     /// Delete endpoint `id` and its rules.
-    pub fn ep_del(&mut self, id: usize) -> Result<(), i64> {
+    pub fn ep_del(&mut self, id: usize) -> Result<(), Errno> {
         self.endpoints.get(id).copied().flatten().ok_or(ctl::ENOENT)?;
         self.post(Request::EpDel { ep: id })?;
         self.endpoints[id] = None;
@@ -733,7 +734,7 @@ impl Netd {
 
     /// Set the rule (ep, matches, ip): a new one, or new targets for an
     /// existing one.  Returns its id.
-    pub fn steer_set(&mut self, ep: usize, matches: u64, ip: (u64, u64), targets: u64) -> Result<usize, i64> {
+    pub fn steer_set(&mut self, ep: usize, matches: u64, ip: (u64, u64), targets: u64) -> Result<usize, Errno> {
         let e = self.endpoints.get(ep).copied().flatten().ok_or(ctl::ENOENT)?;
         let (family, proto, port) = (matches as u8, (matches >> 8) as u8, (matches >> 16) as u16);
         let v6 = match family {
@@ -770,7 +771,7 @@ impl Netd {
         Ok(id)
     }
 
-    pub fn steer_del(&mut self, id: usize) -> Result<(), i64> {
+    pub fn steer_del(&mut self, id: usize) -> Result<(), Errno> {
         self.rules.get(id).copied().flatten().ok_or(ctl::ENOENT)?;
         self.post(Request::SteerDel { rule: id })?;
         self.rules[id] = None;
