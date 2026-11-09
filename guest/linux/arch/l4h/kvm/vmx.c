@@ -620,8 +620,9 @@ static int l4h_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr)
  *
  * Everything else is a flush of what the guest's own paging produced (after
  * CR4 or PCID changes, KVM_REQ_TLB_FLUSH_CURRENT and _GUEST), which no EPT
- * change does: that is a real invept.  seL4 also flushes a VCPU's VPID when
- * it moves to another core.
+ * change does: seL4_X86_VCPU_FlushTLB flushes the VCPU's VPID before it next
+ * runs.  seL4 also flushes a VCPU's VPID when it moves to another core, so a
+ * flush reaches no other core.
  */
 static void l4h_flush_tlb_noop(struct kvm_vcpu *vcpu)
 {
