@@ -748,6 +748,8 @@ static int nmi_singlestep_event(int kvm)
 	CHECK(ioctl(vm.vcpu, KVM_SET_SREGS, &sregs) == 0, "KVM_SET_SREGS");
 	CHECK(ioctl(vm.vcpu, KVM_GET_REGS, &regs) == 0, "KVM_GET_REGS");
 	regs.rsp = 0x30000;
+	/* An STI shadow comes with IF set: VMX refuses the entry otherwise. */
+	regs.rflags |= 0x200;
 	CHECK(ioctl(vm.vcpu, KVM_SET_REGS, &regs) == 0, "KVM_SET_REGS");
 	CHECK(ioctl(vm.vcpu, KVM_GET_VCPU_EVENTS, &ev) == 0, "KVM_GET_VCPU_EVENTS");
 	ev.nmi.pending = 1;
