@@ -191,7 +191,7 @@ fn main(info: &'static Info) -> ! {
         m.refresh();
     }
 
-    let console = Console::new(cfg.serial != 0, if cfg.dom0 != 0 { None } else { Some(cfg.guest_id) }, cfg.console_event, tsc_hz);
+    let mut console = Console::new(cfg.serial != 0, if cfg.dom0 != 0 { None } else { Some(cfg.guest_id) }, cfg.console_event, tsc_hz);
     // vmmgr's endpoint (l4h_host::vmmgr::call).
     let root_ep = Endpoint::of(&host::wiring::VMM_VMMGR, host::wiring::p::Vmm, 0);
     let ep = cap::<cap_type::Endpoint>(host::SLOT_SERVICE_EP);
@@ -199,8 +199,11 @@ fn main(info: &'static Info) -> ! {
 
     let _ = root_ep.vmm_ready();
 
+    // The device models stay where they are: the server borrows them, as
+    // they are too large to move on the stack.
     let mut vmm = Vmm {
-        cfg, tsc_hz, mem: &mem, vcpus: &vcpus, devices, devs, memdev, console, root_ep, tcb, ntfn,
+        cfg, tsc_hz, mem: &mem, vcpus: &vcpus, devices, devs: &mut devs, memdev: &mut memdev, console: &mut console,
+        root_ep, tcb, ntfn,
         console_pending: false, unbound: false, after_unbound: false, answered: None,
     };
     l4h_rt::ipc::run(ep, reply, &mut vmm)
@@ -214,9 +217,9 @@ struct Vmm<'a> {
     mem: &'a GuestMem,
     vcpus: &'a Vcpus,
     devices: &'a [host::VmmDevice],
-    devs: [Option<Dev>; host::VMM_MAX_DEVICES],
-    memdev: Option<MemDev>,
-    console: Console,
+    devs: &'a mut [Option<Dev>; host::VMM_MAX_DEVICES],
+    memdev: &'a mut Option<MemDev>,
+    console: &'a mut Console,
     root_ep: Endpoint<host::vmmgr::call::Proto>,
     tcb: sel4::cap::Tcb,
     ntfn: sel4::cap::Notification,
@@ -294,8 +297,8 @@ impl l4h_rt::ipc::Server for Vmm<'_> {
     fn call(&mut self, from: Guest, _: u64, info: &sel4::MessageInfo) -> Option<sel4::MessageInfo> {
         self.after_unbound = false;
         let mut hc = Hypercalls {
-            cfg: self.cfg, tsc_hz: self.tsc_hz, mem: self.mem, vcpus: self.vcpus, devs: &mut self.devs,
-            console: &mut self.console, root_ep: self.root_ep,
+            cfg: self.cfg, tsc_hz: self.tsc_hz, mem: self.mem, vcpus: self.vcpus, devs: self.devs,
+            console: self.console, root_ep: self.root_ep,
         };
         let answer = l4h_rt::ipc::serve(info, |label, args, out| hypercall::serve(&mut hc, label, args, from, out));
         self.answered = Some(answer.is_some());

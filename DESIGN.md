@@ -2802,12 +2802,13 @@ one way to do each part of it:
   and its faults go to its parent by its fault edge (`parent_fault`, or
   `keeper_fault` for a component with a keeper); `create` checks that
   both are to the parent it is given. In debug builds the running system
-  is held to the declarations too: before a component starts, its parent
-  looks at every slot of its CSpace (`Component::audit`, with seL4's
-  `DebugCapIdentify`) and stops if an endpoint or notification is in a
-  slot no edge it holds, and none of its own objects (`wiring::OWN`),
-  gives it, or is of another type than the edge's object; each later
-  `give_edge` checks the type of what it minted. At compile time no two edges share
+  is held to the declarations too: each component, as it starts
+  (`l4h_rt::init`), looks at every slot of its CSpace's layout with
+  seL4's `DebugCapIdentify` and stops if an endpoint or notification is
+  in a slot that no edge it holds, and none of its own objects
+  (`wiring::OWN`), gives it, or is of another type than the edge's
+  object (`wiring::audit`); each later `give_edge` checks the type of
+  what it minted. At compile time no two edges share
   a slot or a notification bit unless both are declared shared, every
   call's badge decodes as a sender its protocol accepts, every signal is
   in its receiver's badge space, root calls no driver, vmmgr or VMM (it

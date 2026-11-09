@@ -480,10 +480,31 @@ pub fn expected(kind: u32, slot: u64) -> Option<Object> {
     })
 }
 
-/// Whether a capability to `object` is an endpoint's (or else a
-/// notification's).
-pub const fn is_endpoint(object: Object) -> bool {
-    matches!(object, Endpoint | Flags)
+/// seL4's cap tags (seL4_DebugCapIdentify), the same on every
+/// architecture, of the capabilities that call and signal.
+pub const CAP_ENDPOINT: u32 = 4;
+pub const CAP_NOTIFICATION: u32 = 6;
+
+/// The tag of a capability to `object`.
+pub const fn cap_tag(object: Object) -> u32 {
+    match object {
+        Endpoint | Flags => CAP_ENDPOINT,
+        Notification | Kick | Vcpu => CAP_NOTIFICATION,
+    }
+}
+
+/// What is wrong with a capability tagged `tag` in slot `slot` of a
+/// component of `kind`, if anything: one that calls or signals must be one
+/// the wiring gives it (expected), of its object's type.
+pub fn audit(kind: u32, slot: u64, tag: u32) -> Result<(), &'static str> {
+    if tag != CAP_ENDPOINT && tag != CAP_NOTIFICATION {
+        return Ok(());
+    }
+    match expected(kind, slot) {
+        Some(o) if cap_tag(o) == tag => Ok(()),
+        Some(_) => Err("of another type than the wiring has there"),
+        None => Err("that no edge gives it"),
+    }
 }
 
 /// No component keeps its own object where it holds an edge.

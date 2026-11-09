@@ -138,10 +138,31 @@ pub fn init() -> &'static Info {
     host::log::init(unsafe { &*(host::log::VA as *const host::log::Ring) }, INFO.header().id);
     host::serial::init(unsafe { &*(host::serial::VA as *const host::serial::Ring) }, INFO.header().id);
     sel4_panicking::set_hook(&|info| log!("l4h-rt: component {:#x}: {}", INFO.header().id, info));
+    audit(INFO.header().kind);
     if host::has_keeper(INFO.header().kind) {
         start_keeper();
     }
     &INFO
+}
+
+/// Stop if this component holds a capability that calls or signals which
+/// the wiring does not give it, or of another type (debug builds: seL4's
+/// DebugCapIdentify; DESIGN.md §10, "Wiring declarations").  The slots of
+/// the layout are looked at: memd's and vmmgr's larger CNodes hold memory
+/// above them.
+fn audit(kind: u32) {
+    sel4::sel4_cfg_if! {
+        if #[sel4_cfg(DEBUG_BUILD)] {
+            for slot in 0..1u64 << host::CNODE_BITS {
+                let tag = cap::<sel4::cap_type::Null>(slot).debug_identify();
+                if let Err(why) = host::wiring::audit(kind, slot, tag) {
+                    panic!("wiring audit: slot {} holds a capability (tag {}) {}", slot, tag, why);
+                }
+            }
+        } else {
+            let _ = kind;
+        }
+    }
 }
 
 #[repr(align(64))]
