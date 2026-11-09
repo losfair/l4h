@@ -1,4 +1,4 @@
-From 562020108e952ec34999c73c8977fb9c06623d25 Mon Sep 17 00:00:00 2001
+From 61036a7c75b8b674c7e3f7e1744feb1fb6fade91 Mon Sep 17 00:00:00 2001
 From: l4h <l4h@localhost>
 Date: Fri, 6 Nov 2026 23:22:24 -0800
 Subject: [PATCH] x86: what KVM needs from the VCPU interface
@@ -132,6 +132,9 @@ MSR.  So VM exits and entries do only what they need:
   looks up the EPT root after: one deleted in between was freed with no
   invept there.  Deleting an ASID pool invalidates the EPT roots in it,
   as deleting each root does: unmapping below them no longer finds them.
+- VT-x needs an x86_64 kernel: KernelVTX now depends on it.  VMEnter
+  reads its three call MRs from registers, which a 32-bit kernel does
+  not have enough of for a thread without an IPC buffer.
 ---
  include/arch/x86/arch/machine/debug.h         |  10 +
  include/arch/x86/arch/object/vcpu.h           |  49 +-
@@ -142,14 +145,15 @@ MSR.  So VM exits and entries do only what they need:
  src/arch/x86/32/c_traps.c                     |  28 +-
  src/arch/x86/64/c_traps.c                     |  47 +-
  src/arch/x86/c_traps.c                        |   5 +-
+ src/arch/x86/config.cmake                     |   4 +-
  src/arch/x86/kernel/ept.c                     |  60 +-
  src/arch/x86/kernel/vspace.c                  |  20 +
  src/arch/x86/object/objecttype.c              |   3 +
- src/arch/x86/object/vcpu.c                    | 674 +++++++++++++++---
+ src/arch/x86/object/vcpu.c                    | 677 +++++++++++++++---
  src/arch/x86/smp/ipi.c                        |   3 +
  src/kernel/thread.c                           |  10 +
  src/object/notification.c                     |   7 +-
- 16 files changed, 835 insertions(+), 120 deletions(-)
+ 17 files changed, 840 insertions(+), 122 deletions(-)
 
 diff --git a/include/arch/x86/arch/machine/debug.h b/include/arch/x86/arch/machine/debug.h
 index 1d01b65f0..15eb556bd 100644
@@ -536,6 +540,21 @@ index 9ce868692..afc8e022c 100644
              restore_user_context();
          } else {
              setThreadState(NODE_STATE(ksCurThread), ThreadState_RunningVM);
+diff --git a/src/arch/x86/config.cmake b/src/arch/x86/config.cmake
+index 252684bbf..bc12a1897 100644
+--- a/src/arch/x86/config.cmake
++++ b/src/arch/x86/config.cmake
+@@ -66,8 +66,8 @@ config_option(
+ config_string(KernelCacheLnSz CACHE_LN_SZ "Define cache line size for the current architecture"
+               DEFAULT 64 DEPENDS "KernelArchX86" UNDEF_DISABLED UNQUOTE)
+ 
+-config_option(KernelVTX VTX "VTX support" DEFAULT OFF
+-              DEPENDS "KernelArchX86;NOT KernelVerificationBuild")
++config_option(KernelVTX VTX "VTX support (x86_64 kernels only)" DEFAULT OFF
++              DEPENDS "KernelSel4ArchX86_64;NOT KernelVerificationBuild")
+ 
+ config_option(KernelX86_64VTX64BitGuests X86_64_VTX_64BIT_GUESTS "Support 64-bit guests" DEFAULT OFF
+               DEPENDS "KernelArchX86;KernelVTX;NOT KernelVerificationBuild")
 diff --git a/src/arch/x86/kernel/ept.c b/src/arch/x86/kernel/ept.c
 index 84e5737e5..a1fe1bc17 100644
 --- a/src/arch/x86/kernel/ept.c
@@ -741,7 +760,7 @@ index 7b494f3a4..03c510315 100644
  
  void Arch_postCapDeletion(cap_t cap)
 diff --git a/src/arch/x86/object/vcpu.c b/src/arch/x86/object/vcpu.c
-index 92dd1dfef..143710a2c 100644
+index 92dd1dfef..e58416ef1 100644
 --- a/src/arch/x86/object/vcpu.c
 +++ b/src/arch/x86/object/vcpu.c
 @@ -21,6 +21,14 @@
@@ -1245,7 +1264,7 @@ index 92dd1dfef..143710a2c 100644
      case VMX_CONTROL_PIN_EXECUTION_CONTROLS:
      case VMX_CONTROL_PRIMARY_PROCESSOR_CONTROLS:
      case VMX_CONTROL_SECONDARY_PROCESSOR_CONTROLS:
-@@ -1092,24 +1333,39 @@ void vcpu_update_state_sysvmenter(vcpu_t *vcpu)
+@@ -1092,24 +1333,42 @@ void vcpu_update_state_sysvmenter(vcpu_t *vcpu)
      if (ARCH_NODE_STATE(x86KSCurrentVCPU) != vcpu) {
          switchVCPU(vcpu);
      }
@@ -1253,7 +1272,10 @@ index 92dd1dfef..143710a2c 100644
 +    /* MR0-2 (RIP, controls, entry event) are in registers, so a thread
 +     * without an IPC buffer still delivers them; getSyscallArg() reads the
 +     * first n_msgRegisters from registers.  Without this, such a VMEnter
-+     * re-entered with a stale RIP and re-injected an already-taken event. */
++     * re-entered with a stale RIP and re-injected an already-taken event.
++     * VT-x needs an x86_64 kernel, which has four message registers. */
++    compile_assert(vmenter_call_mrs_in_registers,
++                   (word_t)SEL4_VMENTER_CALL_INTERRUPT_INFO_MR < (word_t)n_msgRegisters);
      buffer = lookupIPCBuffer(false, NODE_STATE(ksCurThread));
 -    if (!buffer) {
 -        userError("No IPC buffer.");
@@ -1297,7 +1319,7 @@ index 92dd1dfef..143710a2c 100644
  
      assert(vcpu);
  
-@@ -1117,11 +1373,7 @@ void vcpu_sysvmenter_reply_to_user(tcb_t *tcb)
+@@ -1117,11 +1376,7 @@ void vcpu_sysvmenter_reply_to_user(tcb_t *tcb)
          switchVCPU(vcpu);
      }
  
@@ -1310,7 +1332,7 @@ index 92dd1dfef..143710a2c 100644
      setRegister(tcb, msgInfoRegister, 0);
  }
  
-@@ -1138,6 +1390,21 @@ exception_t decodeX86VCPUInvocation(
+@@ -1138,6 +1393,21 @@ exception_t decodeX86VCPUInvocation(
      switch (invLabel) {
      case X86VCPUSetTCB:
          return decodeSetTCB(cap, length, buffer);
@@ -1332,7 +1354,7 @@ index 92dd1dfef..143710a2c 100644
      case X86VCPUReadVMCS:
          return decodeReadVMCS(cap, length, call, buffer);
      case X86VCPUWriteVMCS:
-@@ -1146,8 +1413,16 @@ exception_t decodeX86VCPUInvocation(
+@@ -1146,8 +1416,16 @@ exception_t decodeX86VCPUInvocation(
          return decodeEnableIOPort(cap, length, buffer);
      case X86VCPUDisableIOPort:
          return decodeDisableIOPort(cap, length, buffer);
@@ -1350,7 +1372,7 @@ index 92dd1dfef..143710a2c 100644
  #ifdef CONFIG_X86_64_VTX_64BIT_GUESTS
      case X86VCPUWriteMSR:
          return decodeVCPUWriteMSR(cap, length, buffer);
-@@ -1231,6 +1506,15 @@ static BOOT_CODE bool_t vtx_try_init(void)
+@@ -1231,6 +1509,15 @@ static BOOT_CODE bool_t vtx_try_init(void)
          printf("vt-x: Expected supported for 2m pages\n");
          return false;
      }
@@ -1366,7 +1388,7 @@ index 92dd1dfef..143710a2c 100644
      /* Before calling vmxon, we must check that CR0 and CR4 are not set to values
       * that are unsupported by vt-x */
      if (!vtx_check_fixed_values(read_cr0(), read_cr4() | CR4_VMXE)) {
-@@ -1268,6 +1552,9 @@ static BOOT_CODE bool_t vtx_try_init(void)
+@@ -1268,6 +1555,9 @@ static BOOT_CODE bool_t vtx_try_init(void)
  
  BOOT_CODE bool_t vtx_init(void)
  {
@@ -1376,7 +1398,7 @@ index 92dd1dfef..143710a2c 100644
      if (CURRENT_CPU_INDEX() != 0) {
          /* Secondary cores follow the boot core, which runs first: none
           * uses VT-x without it, and each must match it when it does. */
-@@ -1288,39 +1575,103 @@ BOOT_CODE bool_t vtx_init(void)
+@@ -1288,39 +1578,103 @@ BOOT_CODE bool_t vtx_init(void)
      return true;
  }
  
@@ -1498,7 +1520,7 @@ index 92dd1dfef..143710a2c 100644
  
      /* Set the thread back to running */
      setThreadState(NODE_STATE(ksCurThread), ThreadState_Running);
-@@ -1330,15 +1681,31 @@ static void handleVmxFault(uint32_t reason, word_t qualification)
+@@ -1330,15 +1684,31 @@ static void handleVmxFault(uint32_t reason, word_t qualification)
      activateThread();
  }
  
@@ -1535,7 +1557,7 @@ index 92dd1dfef..143710a2c 100644
  }
  
  exception_t handleVmexit(void)
-@@ -1347,16 +1714,17 @@ exception_t handleVmexit(void)
+@@ -1347,16 +1717,17 @@ exception_t handleVmexit(void)
      /* qualification is host width, reason is defined as being 32 bit */
      word_t qualification;
      uint32_t reason;
@@ -1559,7 +1581,7 @@ index 92dd1dfef..143710a2c 100644
              ARCH_NODE_STATE(x86KScurInterrupt) = interrupt;
              handleInterruptEntry();
          } else {
-@@ -1370,8 +1738,6 @@ exception_t handleVmexit(void)
+@@ -1370,8 +1741,6 @@ exception_t handleVmexit(void)
          return EXCEPTION_NONE;
      }
  
@@ -1568,7 +1590,7 @@ index 92dd1dfef..143710a2c 100644
      switch (reason) {
      case EXCEPTION_OR_NMI:
      case MOV_DR:
-@@ -1400,6 +1766,8 @@ exception_t handleVmexit(void)
+@@ -1400,6 +1769,8 @@ exception_t handleVmexit(void)
          qualification = 0;
      }
  
@@ -1577,7 +1599,7 @@ index 92dd1dfef..143710a2c 100644
      handleVmxFault(reason, qualification);
  
      return EXCEPTION_NONE;
-@@ -1452,6 +1820,28 @@ static void invvpid_context(uint16_t vpid)
+@@ -1452,6 +1823,28 @@ static void invvpid_context(uint16_t vpid)
      asm volatile("invvpid %0, %1" :: "m"(operand), "r"((word_t)1) : "cc");
  }
  
@@ -1606,7 +1628,7 @@ index 92dd1dfef..143710a2c 100644
  static void setEPTRoot(cap_t vmxSpace, vcpu_t *vcpu)
  {
      paddr_t ept_root;
-@@ -1479,10 +1869,7 @@ static void setEPTRoot(cap_t vmxSpace, vcpu_t *vcpu)
+@@ -1479,10 +1872,7 @@ static void setEPTRoot(cap_t vmxSpace, vcpu_t *vcpu)
                                6               /* write back memory type */
                            );
          vmwrite(VMX_CONTROL_EPT_POINTER, eptp.words[0]);
@@ -1618,7 +1640,7 @@ index 92dd1dfef..143710a2c 100644
      }
  }
  
-@@ -1558,28 +1945,33 @@ static void storeVPID(vcpu_t *vcpu, vpid_t vpid)
+@@ -1558,28 +1948,33 @@ static void storeVPID(vcpu_t *vcpu, vpid_t vpid)
      vcpu->vpid = vpid;
  }
  
@@ -1663,7 +1685,7 @@ index 92dd1dfef..143710a2c 100644
          switchLocalFpuOwner(tcb);
      }
  }
-@@ -1589,17 +1981,70 @@ void vcpu_fpu_to_host(tcb_t *tcb, vcpu_t *vcpu)
+@@ -1589,17 +1984,70 @@ void vcpu_fpu_to_host(tcb_t *tcb, vcpu_t *vcpu)
      if (tcb->tcbFlags & seL4_TCBFlag_fpuDisabled) {
          /* FPU may have been enabled for the guest, but host isn't allowed to use it */
          disableFpu();
@@ -1739,7 +1761,7 @@ index 92dd1dfef..143710a2c 100644
  void restoreVMCS(void)
  {
      tcb_t *cur_thread = NODE_STATE(ksCurThread);
-@@ -1616,24 +2061,29 @@ void restoreVMCS(void)
+@@ -1616,24 +2064,29 @@ void restoreVMCS(void)
          vmwrite(VMX_HOST_CR3, getCurrentCR3().words[0]);
      }
  #endif
@@ -1778,7 +1800,7 @@ index 92dd1dfef..143710a2c 100644
              type = 1;
          } else if (vmx_ept_vpid_cap_msr_get_invept_all_context(vpid_capability)) {
              type = 2;
-@@ -1645,7 +2095,11 @@ void invept(ept_pml4e_t *ept_pml4)
+@@ -1645,7 +2098,11 @@ void invept(ept_pml4e_t *ept_pml4)
              return;
          }
  
@@ -1791,12 +1813,10 @@ index 92dd1dfef..143710a2c 100644
          address.parts[1] = 0;
          asm volatile(
              "invept %0, %1"
-@@ -1656,4 +2110,28 @@ void invept(ept_pml4e_t *ept_pml4)
+@@ -1656,4 +2113,28 @@ void invept(ept_pml4e_t *ept_pml4)
      }
  }
  
-+/* EPT translations outlive the VCPU on a core: a VCPU that moved, or that
-+ * never leaves guest mode, must not keep a frame that was just unmapped. */
 +/* Whether invept(NULL) can invalidate all EPT contexts in one call, for
 + * deleting a whole ASID pool: it needs all-context INVEPT. */
 +bool_t eptInveptAllSupported(void)
@@ -1805,6 +1825,8 @@ index 92dd1dfef..143710a2c 100644
 +           vmx_ept_vpid_cap_msr_get_invept_all_context(vpid_capability);
 +}
 +
++/* EPT translations outlive the VCPU on a core: a VCPU that moved, or that
++ * never leaves guest mode, must not keep a frame that was just unmapped. */
 +void invept(ept_pml4e_t *ept_pml4)
 +{
 +    invalidateLocalEPT(ept_pml4);
