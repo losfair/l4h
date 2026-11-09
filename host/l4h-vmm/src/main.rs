@@ -191,8 +191,7 @@ fn main(info: &'static Info) -> ! {
         m.refresh();
     }
 
-    let mut console = Console::new(cfg.serial != 0, if cfg.dom0 != 0 { None } else { Some(cfg.guest_id) }, cfg.console_event, tsc_hz);
-    let mut console_pending = false;
+    let console = Console::new(cfg.serial != 0, if cfg.dom0 != 0 { None } else { Some(cfg.guest_id) }, cfg.console_event, tsc_hz);
     // vmmgr's endpoint (l4h_host::vmmgr::call).
     let root_ep = Endpoint(cap::<cap_type::Endpoint>(host::SLOT_ROOT_EP));
     let ep = cap::<cap_type::Endpoint>(host::SLOT_SERVICE_EP);
@@ -200,87 +199,128 @@ fn main(info: &'static Info) -> ! {
 
     let _ = root_ep.vmm_ready();
 
-    let (mut info, mut badge) = ep.recv(reply);
-    loop {
-        if badge & recv::HYPERCALL == 0 {
-            console_pending |= badge & recv::CONSOLE != 0;
-            if badge & recv::MEM != 0 {
-                if let Some(m) = memdev.as_mut() {
-                    m.target_changed(&vcpus);
-                }
+    let mut vmm = Vmm {
+        cfg, tsc_hz, mem: &mem, vcpus: &vcpus, devices, devs, memdev, console, root_ep, tcb, ntfn,
+        console_pending: false, unbound: false, after_unbound: false, answered: None,
+    };
+    l4h_rt::ipc::run(ep, reply, &mut vmm)
+}
+
+/// The VMM's thread: the guest's hypercalls, and its devices' kicks and
+/// backends' completions.
+struct Vmm<'a> {
+    cfg: &'a VmmConfig,
+    tsc_hz: u64,
+    mem: &'a GuestMem,
+    vcpus: &'a Vcpus,
+    devices: &'a [host::VmmDevice],
+    devs: [Option<Dev>; host::VMM_MAX_DEVICES],
+    memdev: Option<MemDev>,
+    console: Console,
+    root_ep: Endpoint,
+    tcb: sel4::cap::Tcb,
+    ntfn: sel4::cap::Notification,
+    /// The console ring has more than one batch.
+    console_pending: bool,
+    /// The notification is unbound, for a poll that gives a queued
+    /// hypercall a turn.
+    unbound: bool,
+    /// That poll was the last receive.
+    after_unbound: bool,
+    /// The hypercall this turn served, and whether it was answered.
+    answered: Option<bool>,
+}
+
+impl l4h_rt::ipc::Server for Vmm<'_> {
+    const SIGNALS: u64 = recv::SIGNALS;
+    // Only the guest holds a capability to the endpoint.
+    type Sender = Guest;
+
+    fn received(&mut self) {
+        self.after_unbound = core::mem::take(&mut self.unbound);
+        if self.after_unbound {
+            // TCB invocations use the IPC buffer too (run keeps a hypercall
+            // there).  A gap timer may have expired while unbound, losing
+            // its notification: re-arm it before sleeping.
+            self.tcb.tcb_bind_notification(self.ntfn).expect("bind VMM notification");
+            self.console.rearm_timer();
+        }
+    }
+
+    fn signal(&mut self, badge: u64) {
+        // The unbound poll found no hypercall: receive again, bound.
+        if core::mem::take(&mut self.after_unbound) {
+            return;
+        }
+        let (vcpus, mem) = (self.vcpus, self.mem);
+        self.console_pending |= badge & recv::CONSOLE != 0;
+        if badge & recv::MEM != 0 {
+            if let Some(m) = self.memdev.as_mut() {
+                m.target_changed(vcpus);
             }
-            if badge & recv::MEM_REQ != 0 {
-                if let Some(m) = memdev.as_mut() {
-                    m.request(&vcpus);
-                }
+        }
+        if badge & recv::MEM_REQ != 0 {
+            if let Some(m) = self.memdev.as_mut() {
+                m.request(vcpus);
             }
-            // Notification: device kicks and backend completions, from any
-            // device.
-            for idx in devices.iter().map(|d| d.guest_index as usize) {
-                let Some(d) = devs[idx].as_mut() else { continue };
-                if let Dev::Usb(u) = d {
-                    if badge & u.badge != 0 {
-                        vcpus.raise(u.vcpu, u.event);
-                    }
-                    continue;
+        }
+        // Device kicks and backend completions, from any device.
+        for idx in self.devices.iter().map(|d| d.guest_index as usize) {
+            let Some(d) = self.devs[idx].as_mut() else { continue };
+            if let Dev::Usb(u) = d {
+                if badge & u.badge != 0 {
+                    vcpus.raise(u.vcpu, u.event);
                 }
-                if badge & recv::DONE != 0 {
-                    d.complete(&mem, &vcpus);
-                }
-                if badge & recv::KICK != 0 {
-                    d.poll(&mem, &vcpus);
-                }
+                continue;
             }
-            let served_console = console_pending;
-            if served_console {
-                console_pending = console.drain(&vcpus);
+            if badge & recv::DONE != 0 {
+                d.complete(mem, vcpus);
             }
-            if served_console {
-                // Bound notifications take precedence over endpoint calls,
-                // even in NBRecv. A guest retrying a full console ring can
-                // keep that notification active: give a queued call a turn.
-                // Signals remain pending on ntfn while it is unbound.
-                tcb.tcb_unbind_notification().expect("unbind VMM notification");
-                let call = ep.nb_recv(reply);
-                // TCB invocations use the IPC buffer too: keep a hypercall
-                // there across rebinding the notification.  A gap timer
-                // may have expired while unbound, losing its notification:
-                // re-arm it before sleeping.
-                l4h_rt::ipc::preserving(|| {
-                    tcb.tcb_bind_notification(ntfn).expect("bind VMM notification");
-                    console.rearm_timer();
-                });
-                if call.1 != 0 {
-                    (info, badge) = call;
-                    continue;
-                }
+            if badge & recv::KICK != 0 {
+                d.poll(mem, vcpus);
+            }
+        }
+        if self.console_pending {
+            self.console_pending = self.console.drain(vcpus);
+            // Bound notifications take precedence over endpoint calls, even
+            // in NBRecv. A guest retrying a full console ring can keep that
+            // notification active: give a queued call a turn.  Signals
+            // remain pending on ntfn while it is unbound.
+            self.tcb.tcb_unbind_notification().expect("unbind VMM notification");
+            self.unbound = true;
+        }
+    }
+
+    fn call(&mut self, from: Guest, _: u64, info: &sel4::MessageInfo) -> Option<sel4::MessageInfo> {
+        self.after_unbound = false;
+        let mut hc = Hypercalls {
+            cfg: self.cfg, tsc_hz: self.tsc_hz, mem: self.mem, vcpus: self.vcpus, devs: &mut self.devs,
+            console: &mut self.console, root_ep: self.root_ep,
+        };
+        let answer = l4h_rt::ipc::serve(info, |label, args, out| hypercall::serve(&mut hc, label, args, from, out));
+        self.answered = Some(answer.is_some());
+        answer
+    }
+
+    fn next(&mut self) -> l4h_rt::ipc::Next {
+        use l4h_rt::ipc::Next;
+        if self.unbound {
+            return Next::Poll;
+        }
+        match self.answered.take() {
+            // The guest stays blocked.
+            Some(false) => Next::Wait,
+            // Draining can re-arm the console's timer, which overwrites
+            // the reply (run keeps it).
+            Some(true) if self.console_pending => {
+                self.console_pending = self.console.drain(self.vcpus);
+                if self.console_pending { Next::Poll } else { Next::Wait }
             }
             // A producer may have extended a nonempty ring without a kick.
             // Poll between bounded batches instead of waiting for a new kick.
-            (info, badge) = if console_pending { ep.nb_recv(reply) } else { ep.recv(reply) };
-            continue;
+            _ if self.console_pending => Next::Poll,
+            _ => Next::Wait,
         }
-        let mut hc = Hypercalls { cfg, tsc_hz, mem: &mem, vcpus: &vcpus, devs: &mut devs, console: &mut console, root_ep };
-        // Only the guest holds a capability to the endpoint.
-        let Some(from) = Guest::of_badge(badge) else {
-            (info, badge) = ep.reply_recv(l4h_rt::ipc::refuse(), reply);
-            continue;
-        };
-        let Some(response) = l4h_rt::ipc::serve(&info, |label, args, out| hypercall::serve(&mut hc, label, args, from, out)) else {
-            (info, badge) = ep.recv(reply);
-            continue;
-        };
-        if console_pending {
-            // Draining can re-arm the console's timer, which overwrites the
-            // reply in the message registers.
-            console_pending = l4h_rt::ipc::preserving(|| console.drain(&vcpus));
-        }
-        (info, badge) = if console_pending {
-            reply.send(response);
-            ep.nb_recv(reply)
-        } else {
-            ep.reply_recv(response, reply)
-        };
     }
 }
 

@@ -10,7 +10,7 @@
 
 #![no_std]
 
-use l4h_host::wire::{Call, EINVAL, MAX_MRS};
+use l4h_host::wire::{Badged, Call, EINVAL, MAX_MRS};
 
 /// An endpoint capability, as a protocol's client calls it.
 #[derive(Clone, Copy)]
@@ -61,4 +61,113 @@ pub fn refuse() -> sel4::MessageInfo {
 pub fn reply(words: &[u64]) -> sel4::MessageInfo {
     sel4::with_ipc_buffer_mut(|b| b.msg_regs_mut()[..words.len()].copy_from_slice(words));
     sel4::MessageInfo::new(0, 0, 0, words.len())
+}
+
+/// What a server does after a message (Server::next).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Next {
+    /// Wait for the next message.
+    Wait,
+    /// Take the next message if one is queued; if none is, an idle turn
+    /// (`signal(0)`): a server that polls has no sender badged 0.
+    Poll,
+    /// Another turn on `signal(badge)` at once, receiving nothing.
+    Again(u64),
+}
+
+/// A server's thread: what arrives on its endpoint, and its bound
+/// notification's signals.  `run` receives, tells the kinds apart by the
+/// badge and answers, the same way for every server.
+pub trait Server {
+    /// The bound notification's bits (its badge space's SIGNALS): a
+    /// message with any of them is a signal.
+    const SIGNALS: u64;
+    /// Its badge space's FAULT bit, for a server faults go to.
+    const FAULT: u64 = 0;
+    /// Who may call it (wire::Badged; Infallible for an endpoint nobody
+    /// calls).
+    type Sender: Badged;
+
+    /// After each receive, before the message is looked at, which it
+    /// keeps.
+    fn received(&mut self) {}
+    /// A signal: `badge` is some of SIGNALS (0 for an idle turn).
+    fn signal(&mut self, badge: u64) {
+        let _ = badge;
+    }
+    /// A fault, which is never answered: the thread stays stopped.
+    fn fault(&mut self, badge: u64, info: &sel4::MessageInfo) {
+        let _ = (badge, info);
+    }
+    /// A call from `from`: its reply (`serve`), or None to leave the
+    /// caller blocked for good.
+    fn call(&mut self, from: Self::Sender, badge: u64, info: &sel4::MessageInfo) -> Option<sel4::MessageInfo>;
+    /// A call from a badge no sender is, which is refused (EINVAL).
+    fn unknown(&mut self, badge: u64, info: &sel4::MessageInfo) {
+        let _ = (badge, info);
+    }
+    /// After each message, before its reply (which it keeps): what next.
+    fn next(&mut self) -> Next {
+        Next::Wait
+    }
+}
+
+/// A server's reply object.
+pub trait ReplyObject {
+    fn cap(&self) -> sel4::cap::Reply;
+    /// It is still bound to a caller left unanswered (a fault, or a
+    /// call answered None).  A plain reply capability does nothing: the
+    /// next receive cancels that caller's IPC, which leaves it inactive.
+    fn unanswered(&mut self) {}
+}
+
+impl ReplyObject for sel4::cap::Reply {
+    fn cap(&self) -> sel4::cap::Reply {
+        *self
+    }
+}
+
+/// Serve `ep` with `s`, for good.
+pub fn run<S: Server>(ep: sel4::cap::Endpoint, mut reply: impl ReplyObject, s: &mut S) -> ! {
+    let (mut info, mut badge) = ep.recv(reply.cap());
+    let mut received = true;
+    let mut polled = false;
+    loop {
+        if received {
+            preserving(|| s.received());
+        }
+        let mut answer = None;
+        if !received || (polled && badge == 0) || badge & S::SIGNALS != 0 {
+            s.signal(badge);
+        } else if badge & S::FAULT != 0 {
+            s.fault(badge, &info);
+            reply.unanswered();
+        } else {
+            answer = match S::Sender::of_badge(badge) {
+                Some(from) => s.call(from, badge, &info),
+                None => {
+                    preserving(|| s.unknown(badge, &info));
+                    Some(refuse())
+                }
+            };
+            if answer.is_none() {
+                reply.unanswered();
+            }
+        }
+        let next = if answer.is_some() { preserving(|| s.next()) } else { s.next() };
+        (received, polled) = (!matches!(next, Next::Again(_)), next == Next::Poll);
+        (info, badge) = match (next, answer) {
+            (Next::Wait, Some(a)) => ep.reply_recv(a, reply.cap()),
+            (Next::Wait, None) => ep.recv(reply.cap()),
+            (next, a) => {
+                if let Some(a) = a {
+                    reply.cap().send(a);
+                }
+                match next {
+                    Next::Again(b) => (sel4::MessageInfo::new(0, 0, 0, 0), b),
+                    _ => ep.nb_recv(reply.cap()),
+                }
+            }
+        };
+    }
 }

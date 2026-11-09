@@ -29,7 +29,7 @@ mod vmm;
 use core::sync::atomic::Ordering;
 
 use l4h_host::errno::{EINVAL, Errno};
-use sel4::{ObjectBlueprint, cap};
+use sel4::cap;
 
 use l4h_abi as abi;
 use l4h_host as host;
@@ -37,6 +37,7 @@ use l4h_host::fixed::{ArrayVec, StaticCell};
 use l4h_host::vmmgr::{self as proto, VmmgrConfig};
 use l4h_rt::Info;
 use l4h_task::{elf, mem, topology, vspace, window};
+use l4h_task::reply::ReplySlot;
 
 use l4h_host::badges::vmmgr as recv;
 use l4h_host::vmmgr::call;
@@ -506,7 +507,12 @@ fn main(info: &'static Info) -> ! {
     let mut alloc = Alloc::empty(slots, ALLOC_STORAGE.take());
     alloc.memd = Some(memd::link());
     alloc.refill();
-    let reply = ReplySlot::new(&mut alloc);
+    // Root made SLOT_REPLY, which cannot be replaced: ours is there, where
+    // the keeper finds it if vmmgr fails, so that the caller it holds gets
+    // an answer (l4h_rt::abort_trap).
+    let reply = sel4::Cap::from_bits(host::SLOT_REPLY);
+    slot::CNODE.cap().absolute_cptr(reply).delete().expect("delete reply object");
+    let reply = ReplySlot::new(&mut alloc, reply);
     let wins = Windows {
         a: Window::new(&mut alloc, slot::VSPACE.cap(), layout::WINDOWS.base),
         b: Window::new(&mut alloc, slot::VSPACE.cap(), layout::WINDOWS.base + 4096),
@@ -687,103 +693,87 @@ fn watchdog_dump(h: &Vmmgr) {
 }
 
 
-/// The serve loop's reply object, made from an Untyped of its own so that
-/// one left unanswered can be replaced without using more memory.  It is
-/// in SLOT_REPLY, where the keeper finds it if vmmgr fails: the caller it
-/// holds then gets an answer (l4h_rt::abort_trap).
-struct ReplySlot {
-    ut: cap::Untyped,
-    reply: cap::Reply,
+/// vmmgr's thread: calls from guests' VMMs, faults of guest kernels and
+/// VMMs, root's notices and dom0's control requests, and the timer.
+struct Serve<'a> {
+    h: &'a mut Vmmgr,
+    next_watchdog: u64,
+    last_balance: u64,
 }
 
-impl ReplySlot {
-    fn new(alloc: &mut Alloc) -> Self {
-        let ut_slot = alloc.slots.alloc();
-        let ut = alloc.split(12, ut_slot).expect("reply object memory").cap;
-        let reply = sel4::Cap::from_bits(host::SLOT_REPLY);
-        // The one root made, which we cannot replace.
-        slot::CNODE.cap().absolute_cptr(reply).delete().expect("delete reply object");
-        let r = ReplySlot { ut, reply };
-        r.make();
-        r
-    }
-
-    fn make(&self) {
-        self.ut
-            .untyped_retype(&ObjectBlueprint::Reply, &mem::cnode_dest(slot::CNODE.cap()), self.reply.bits() as usize, 1)
-            .expect("reply object");
-    }
-
-    /// Replace the reply object, which is bound to a caller left
-    /// unanswered (a faulted or stopped thread): revoking the Untyped
-    /// deletes it, which leaves that thread inactive for good.
-    fn renew(&self) {
-        slot::CNODE.cap().absolute_cptr(self.ut).revoke().expect("revoke reply object");
-        self.make();
-    }
-}
-
-/// Serve calls from guests' VMMs, faults of guest kernels and VMMs, and
-/// root's events.
-fn serve(h: &mut Vmmgr, reply_slot: ReplySlot) -> ! {
-    let reply = reply_slot.reply;
-    let hyp_ep = h.info.hyp_ep;
+fn serve(h: &mut Vmmgr, reply: ReplySlot) -> ! {
     arm_timer(&h.info);
-    let mut next_watchdog = rdtsc() + h.info.tsc_hz * h.cfg.watchdog_secs;
-    let mut last_balance = rdtsc();
-    let (mut info, mut badge) = hyp_ep.recv(reply);
-    loop {
-        h.alloc.refill();
-        let notified = badge & recv::SIGNALS != 0;
+    let next_watchdog = rdtsc() + h.info.tsc_hz * h.cfg.watchdog_secs;
+    let hyp_ep = h.info.hyp_ep;
+    l4h_ipc::run(hyp_ep, reply, &mut Serve { h, next_watchdog, last_balance: rdtsc() })
+}
+
+impl l4h_ipc::Server for Serve<'_> {
+    const SIGNALS: u64 = recv::SIGNALS;
+    const FAULT: u64 = recv::FAULT;
+    type Sender = proto::Sender;
+
+    fn received(&mut self) {
+        self.h.alloc.refill();
+    }
+
+    fn signal(&mut self, badge: u64) {
+        let h = &mut *self.h;
         if badge & recv::MAILBOX != 0 {
             root_notices(h);
         }
         if badge & recv::CTL_KICK != 0 {
             ctl::kicked(h);
         }
-        let resp = if notified {
-            if badge & recv::TIMER != 0 {
-                let now = rdtsc();
-                sched::balance(h, (now - last_balance) * 1_000_000 / h.info.tsc_hz);
-                last_balance = now;
-                if h.cfg.watchdog_secs != 0 && rdtsc() >= next_watchdog {
-                    watchdog_dump(h);
-                    next_watchdog = rdtsc() + h.info.tsc_hz * h.cfg.watchdog_secs;
-                }
-                arm_timer(&h.info);
+        if badge & recv::TIMER != 0 {
+            let now = rdtsc();
+            sched::balance(h, (now - self.last_balance) * 1_000_000 / h.info.tsc_hz);
+            self.last_balance = now;
+            if h.cfg.watchdog_secs != 0 && rdtsc() >= self.next_watchdog {
+                watchdog_dump(h);
+                self.next_watchdog = rdtsc() + h.info.tsc_hz * h.cfg.watchdog_secs;
             }
-            None
-        } else if badge & recv::COMPONENT != 0 {
-            component_call(h, badge, &info)
-        } else if badge & recv::FAULT != 0 {
-            let gid = recv::ID.get(badge) as usize;
-            let vcpu = recv::VCPU.get(badge) as usize;
-            let fault = sel4::with_ipc_buffer(|b| sel4::Fault::new(b, &info));
-            l4h_rt::log!("l4h-vmmgr: guest {} vCPU {} kernel fault: {:x?}", gid, vcpu, fault);
-            if h.guest(gid).is_some_and(|g| g.dom0) {
-                restart_dom0(h, gid);
-            } else if let Some(Some(g)) = h.guests.get_mut(gid) {
-                g.stop();
+            arm_timer(&h.info);
+        }
+    }
+
+    fn fault(&mut self, badge: u64, info: &sel4::MessageInfo) {
+        let h = &mut *self.h;
+        let id = recv::ID.get(badge) as usize;
+        let fault = sel4::with_ipc_buffer(|b| sel4::Fault::new(b, info));
+        if badge & recv::COMPONENT != 0 {
+            l4h_rt::log!("l4h-vmmgr: guest {:#x}'s l4h-vmm fault: {:x?}", id, fault);
+            return;
+        }
+        let vcpu = recv::VCPU.get(badge) as usize;
+        l4h_rt::log!("l4h-vmmgr: guest {} vCPU {} kernel fault: {:x?}", id, vcpu, fault);
+        if h.guest(id).is_some_and(|g| g.dom0) {
+            restart_dom0(h, id);
+        } else if let Some(Some(g)) = h.guests.get_mut(id) {
+            g.stop();
+        }
+    }
+
+    fn call(&mut self, from: proto::Sender, badge: u64, info: &sel4::MessageInfo) -> Option<sel4::MessageInfo> {
+        match from {
+            // The VMMs' component ids are their guests'.
+            proto::Sender::Vmm(g) if g < MAX_GUESTS => {
+                l4h_ipc::serve(info, |label, args, out| call::serve(&mut VmmCalls(self.h), label, args, from, out))
             }
-            None
-        } else {
-            l4h_rt::log!("l4h-vmmgr: unexpected message, badge {:#x} label {}", badge, info.label());
-            None
-        };
-        h.publish();
-        match resp {
-            Some(answer) => {
-                (info, badge) = hyp_ep.reply_recv(answer, reply);
-            }
-            None => {
-                // A reply object left unanswered (a faulted or stopped
-                // thread) stays bound to its caller: make it afresh.
-                if !notified {
-                    reply_slot.renew();
-                }
-                (info, badge) = hyp_ep.recv(reply);
+            _ => {
+                self.unknown(badge, info);
+                Some(l4h_ipc::refuse())
             }
         }
+    }
+
+    fn unknown(&mut self, badge: u64, info: &sel4::MessageInfo) {
+        l4h_rt::log!("l4h-vmmgr: unknown call {} badged {:#x}", info.label(), badge);
+    }
+
+    fn next(&mut self) -> l4h_ipc::Next {
+        self.h.publish();
+        l4h_ipc::Next::Wait
     }
 }
 
@@ -792,27 +782,6 @@ fn root_notices(h: &mut Vmmgr) {
     let mut calls = VmmCalls(h);
     if l4h_rt::mailbox::serve(|label, args, out| call::serve(&mut calls, label, args, proto::Sender::Root, out)) {
         l4h_rt::mailbox::signal();
-    }
-}
-
-/// A call or fault from a guest's l4h-vmm: its reply (its words in the
-/// message registers), or None to leave the caller blocked.
-fn component_call(h: &mut Vmmgr, badge: u64, info: &sel4::MessageInfo) -> Option<sel4::MessageInfo> {
-    let id = recv::ID.get(badge) as usize;
-    if badge & recv::FAULT != 0 {
-        let fault = sel4::with_ipc_buffer(|b| sel4::Fault::new(b, info));
-        l4h_rt::log!("l4h-vmmgr: guest {:#x}'s l4h-vmm fault: {:x?}", id, fault);
-        return None;
-    }
-    // The VMMs' component ids are their guests'.
-    match proto::Sender::of_badge(badge) {
-        Some(from @ proto::Sender::Vmm(g)) if g < MAX_GUESTS => {
-            l4h_ipc::serve(info, |label, args, out| call::serve(&mut VmmCalls(h), label, args, from, out))
-        }
-        _ => {
-            l4h_rt::log!("l4h-vmmgr: component {:#x}: unknown", id);
-            Some(l4h_ipc::refuse())
-        }
     }
 }
 

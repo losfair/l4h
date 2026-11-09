@@ -816,8 +816,9 @@ fn main(info: &'static Info) -> ! {
         let _ = d.nics.push(Nic::new(n, c, d.tsc_hz));
         d.gro[n] = Some(offload::Gro::init(g));
     }
-    let ep = cap::<cap_type::Endpoint>(host::SLOT_SERVICE_EP);
-    let reply = cap::<cap_type::Reply>(host::SLOT_REPLY);
+    // Nothing calls a driver: it waits on its notification, for root's
+    // requests (badges::driver::CALL), interrupts and clients' kicks.
+    let ntfn = cap::<cap_type::Notification>(host::SLOT_NTFN);
     l4h_rt::info!("netd: {} uplink NIC(s)", d.nics.len());
 
     // Root reads the NICs' MACs here, and the counters, which publish()
@@ -829,7 +830,7 @@ fn main(info: &'static Info) -> ! {
     published.ready.store(1, Ordering::Release);
     l4h_rt::mailbox::signal();
     let mut deferred_tx = 0;
-    let (_, mut badge) = ep.recv(reply);
+    let mut badge = ntfn.wait().1;
     loop {
         // Notification: port kicks and NIC interrupts. Deferred slots and
         // new client kicks use the same drain path.
@@ -877,14 +878,14 @@ fn main(info: &'static Info) -> ! {
         // Root handed out an added port's channel before netd added it:
         // its VMM may have kicked already, and read the page's link state,
         // DOWN.  Serve the port as if kicked, and signal it.
-        // With slots deferred, poll for notifications (NBRecv returns badge
-        // zero when idle) and come back for the rest.
+        // With slots deferred, poll for notifications (badge zero when
+        // idle) and come back for the rest.
         badge = if added != 0 {
             added
         } else if deferred_tx != 0 {
-            ep.nb_recv(reply).1
+            ntfn.poll().1
         } else {
-            ep.recv(reply).1
+            ntfn.wait().1
         };
     }
 }

@@ -61,15 +61,15 @@ pub mod sel4 {
     pub fn with_ipc_buffer_mut<R>(f: impl FnOnce(&mut IpcBuffer) -> R) -> R {
         crate::KERNEL.with_borrow_mut(|k| f(&mut k.ipc))
     }
-    impl Cap<cap_type::Endpoint> {
+    impl Cap<cap_type::Notification> {
+        pub fn signal(self) { crate::KERNEL.with_borrow_mut(|k| k.signals += 1); }
         /// Root's signal (badges::driver::CALL); the test ends once every request
         /// is answered.
-        pub fn recv(self, _: Cap<cap_type::Reply>) -> (MessageInfo, u64) {
+        pub fn wait(self) -> (MessageInfo, u64) {
             if crate::KERNEL.with_borrow(|k| k.requests.is_empty()) { std::panic::panic_any(crate::Finished); }
             (MessageInfo::new(0, 0, 0, 0), crate::host::badges::driver::CALL)
         }
     }
-    impl Cap<cap_type::Notification> { pub fn signal(self) { crate::KERNEL.with_borrow_mut(|k| k.signals += 1); } }
     impl Cap<cap_type::IrqHandler> { pub fn irq_handler_ack(self) -> Result<(), ()> { Ok(()) } }
 }
 

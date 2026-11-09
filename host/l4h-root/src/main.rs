@@ -59,6 +59,7 @@ use l4h_host::badges::root as recv;
 use l4h_host::root::call as root_call;
 use l4h_host::fixed::ArrayVec;
 use l4h_task::{mem, topology, vspace, window};
+use l4h_task::reply::ReplySlot;
 
 use crate::blkd::{Controller, Disk};
 use crate::mem::{Alloc, Slots};
@@ -385,7 +386,8 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     let wd_ntfn = alloc.object_cap::<cap_type::Notification>(ObjectBlueprint::Notification);
     slot::TCB.cap().tcb_bind_notification(wd_ntfn).expect("bind watchdog notification");
     mailbox::init(wd_ntfn);
-    let reply = ReplySlot::new(&mut alloc);
+    let reply_slot = alloc.slots.alloc();
+    let reply = ReplySlot::new(&mut alloc, sel4::init_thread::Slot::<cap_type::Reply>::from_index(reply_slot).cap());
     let mut wins = Windows {
         a: Window::new(&mut alloc, slot::VSPACE.cap(), layout::WINDOWS.base),
         b: Window::new(&mut alloc, slot::VSPACE.cap(), layout::WINDOWS.base + 4096),
@@ -753,57 +755,39 @@ fn watchdog_dump(h: &Host) {
 }
 
 /// Serve calls from host components and faults of guest kernels.
-/// The serve loop's reply object, made from an Untyped of its own so that
-/// one left unanswered can be replaced without using more memory.
-struct ReplySlot {
-    ut: cap::Untyped,
-    reply: cap::Reply,
+/// Root's thread: calls and faults of host components, the timer, the
+/// serial monitor's and partitions' interrupts, and drivers' answers.
+struct Root<'a> {
+    h: &'a mut Host,
+    modules: &'a bootmod::Modules,
+    booting: bool,
+    next_watchdog: u64,
 }
 
-impl ReplySlot {
-    fn new(alloc: &mut Alloc) -> Self {
-        let (ut_slot, slot) = (alloc.slots.alloc(), alloc.slots.alloc());
-        let ut = alloc.split(12, ut_slot).expect("reply object memory").cap;
-        let r = ReplySlot { ut, reply: sel4::init_thread::Slot::<cap_type::Reply>::from_index(slot).cap() };
-        r.make();
-        r
-    }
-
-    fn make(&self) {
-        self.ut
-            .untyped_retype(&ObjectBlueprint::Reply, &mem::cnode_dest(slot::CNODE.cap()), self.reply.bits() as usize, 1)
-            .expect("reply object");
-    }
-
-    /// Replace the reply object, which is bound to a caller left
-    /// unanswered (a faulted or stopped thread): revoking the Untyped
-    /// deletes it, which leaves that thread inactive for good.
-    fn renew(&self) {
-        slot::CNODE.cap().absolute_cptr(self.ut).revoke().expect("revoke reply object");
-        self.make();
-    }
-}
-
-/// Serve calls and faults of host components, and the timer and serial
-/// interrupts.
-fn serve(h: &mut Host, reply_slot: ReplySlot, modules: &bootmod::Modules) -> ! {
-    let reply = reply_slot.reply;
-    let hyp_ep = h.info.hyp_ep;
+fn serve(h: &mut Host, reply: ReplySlot, modules: &bootmod::Modules) -> ! {
     arm_timer(&h.info);
-    let mut next_watchdog = rdtsc() + h.info.tsc_hz * h.cfg.watchdog_secs as u64;
-    let mut booting = true;
-    let (mut info, mut badge) = hyp_ep.recv(reply);
-    loop {
-        h.alloc.refill();
-        let notified = badge & recv::SIGNALS != 0;
+    let next_watchdog = rdtsc() + h.info.tsc_hz * h.cfg.watchdog_secs as u64;
+    let hyp_ep = h.info.hyp_ep;
+    l4h_ipc::run(hyp_ep, reply, &mut Root { h, modules, booting: true, next_watchdog })
+}
+
+impl l4h_ipc::Server for Root<'_> {
+    const SIGNALS: u64 = recv::SIGNALS;
+    const FAULT: u64 = recv::FAULT;
+    type Sender = host::root::Sender;
+
+    fn received(&mut self) {
+        self.h.alloc.refill();
+    }
+
+    fn signal(&mut self, badge: u64) {
+        let h = &mut *self.h;
         // Drivers' answers, and what a quarantine left (blkd::poll).  Not
         // on a call: it would overwrite the caller's message registers.
-        if notified {
-            h.poll_drivers();
-            if booting && h.drivers_ready() {
-                booting = false;
-                finish_boot(h, modules);
-            }
+        h.poll_drivers();
+        if self.booting && h.drivers_ready() {
+            self.booting = false;
+            finish_boot(h, self.modules);
         }
         if badge & recv::MONITOR != 0 {
             monitor::Monitor::interrupt(h);
@@ -814,59 +798,35 @@ fn serve(h: &mut Host, reply_slot: ReplySlot, modules: &bootmod::Modules) -> ! {
         if badge & recv::LINK.mask() != 0 {
             h.netd.link_ring(badge);
         }
-        let resp = if notified {
-            if badge & recv::TIMER != 0 {
-                dashboard::Dashboard::tick(h);
-                channel::tick(h);
-                trustd::tick(h);
-                h.iommu.poll();
-                if h.cfg.watchdog_secs != 0 && rdtsc() >= next_watchdog {
-                    watchdog_dump(h);
-                    next_watchdog = rdtsc() + h.info.tsc_hz * h.cfg.watchdog_secs as u64;
-                }
-                arm_timer(&h.info);
+        if badge & recv::TIMER != 0 {
+            dashboard::Dashboard::tick(h);
+            channel::tick(h);
+            trustd::tick(h);
+            h.iommu.poll();
+            if h.cfg.watchdog_secs != 0 && rdtsc() >= self.next_watchdog {
+                watchdog_dump(h);
+                self.next_watchdog = rdtsc() + h.info.tsc_hz * h.cfg.watchdog_secs as u64;
             }
-            None
-        } else if badge & recv::COMPONENT != 0 {
-            component_call(h, badge, &info)
-        } else {
-            log!("l4h-root: unexpected message, badge {:#x} label {}", badge, info.label());
-            None
-        };
-        match resp {
-            Some(answer) => {
-                (info, badge) = hyp_ep.reply_recv(answer, reply);
-            }
-            None => {
-                // A reply object left unanswered (a faulted or stopped
-                // thread) stays bound to its caller: make it afresh.
-                if !notified {
-                    reply_slot.renew();
-                }
-                (info, badge) = hyp_ep.recv(reply);
-            }
+            arm_timer(&h.info);
         }
     }
-}
 
-/// A call or fault from a host component: its reply (its words in the
-/// message registers), or None to leave the caller blocked.
-fn component_call(h: &mut Host, badge: u64, info: &sel4::MessageInfo) -> Option<sel4::MessageInfo> {
-    let id = recv::ID.get(badge) as u32;
-    if badge & recv::FAULT != 0 {
+    fn fault(&mut self, badge: u64, info: &sel4::MessageInfo) {
+        let id = recv::ID.get(badge) as u32;
         let fault = sel4::with_ipc_buffer(|b| sel4::Fault::new(b, info));
         log!("l4h-root: component {:#x} fault: {:x?}", id, fault);
         // A driver (it has no keeper) is failed here; trustd's start-up
-        // stops.  The faulted thread is left unanswered.
+        // stops.
+        let h = &mut *self.h;
         let _ = blkd::fault(h, id) || netd::Netd::fault(h, id) || crate::usb::fault(h, id);
         trustd::fault(h, id);
-        return None;
     }
-    match host::root::Sender::of_badge(badge) {
-        Some(from) => l4h_ipc::serve(info, |label, args, out| root_call::serve(&mut vmmgr::Calls(h), label, args, from, out)),
-        None => {
-            log!("l4h-root: component {:#x}: unknown call {}", id, info.label());
-            Some(l4h_ipc::refuse())
-        }
+
+    fn call(&mut self, from: host::root::Sender, _: u64, info: &sel4::MessageInfo) -> Option<sel4::MessageInfo> {
+        l4h_ipc::serve(info, |label, args, out| root_call::serve(&mut vmmgr::Calls(self.h), label, args, from, out))
+    }
+
+    fn unknown(&mut self, badge: u64, info: &sel4::MessageInfo) {
+        log!("l4h-root: unknown call {} badged {:#x}", info.label(), badge);
     }
 }

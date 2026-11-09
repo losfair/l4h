@@ -47,14 +47,16 @@ extern "C" fn serve() -> ! {
     unsafe { sel4::set_ipc_buffer(&mut *(trust::FLAGS_IPCBUF_VA as *mut sel4::IpcBuffer)) };
     let ep = cap::<cap_type::Endpoint>(trust::SLOT_FLAGS_EP);
     let reply = cap::<cap_type::Reply>(trust::SLOT_FLAGS_REPLY);
-    let (mut info, mut badge) = ep.recv(reply);
-    loop {
-        let answer = match Sender::of_badge(badge) {
-            // Every method answers.
-            Some(from) => l4h_rt::ipc::serve(&info, |label, args, out| call::serve(&mut Entries, label, args, from, out)),
-            None => None,
-        };
-        (info, badge) = ep.reply_recv(answer.unwrap_or_else(l4h_rt::ipc::refuse), reply);
+    l4h_rt::ipc::run(ep, reply, &mut Entries)
+}
+
+/// The flags thread: the calls, and nothing bound to it.
+impl l4h_rt::ipc::Server for Entries {
+    const SIGNALS: u64 = 0;
+    type Sender = Sender;
+
+    fn call(&mut self, from: Sender, _: u64, info: &sel4::MessageInfo) -> Option<sel4::MessageInfo> {
+        l4h_rt::ipc::serve(info, |label, args, out| call::serve(self, label, args, from, out))
     }
 }
 

@@ -383,26 +383,26 @@ fn main(info: &'static Info) -> ! {
     let ep = cap::<cap_type::Endpoint>(host::SLOT_SERVICE_EP);
     let reply = cap::<cap_type::Reply>(host::SLOT_REPLY);
 
-    let (mut msg, mut badge) = ep.recv(reply);
-    loop {
-        if badge & recv::TIMER != 0 {
-            let delay = balloon::REPORT_DELAY_MS * d.ticks_per_ms;
-            d.mem.report_free(host::ticks::now(), delay);
-            d.write_status();
-            arm_timer(d.ticks_per_ms);
-            (msg, badge) = ep.recv(reply);
-            continue;
-        }
-        let answer = match Sender::of_badge(badge) {
-            Some(from) => l4h_rt::ipc::serve(&msg, |label, args, out| call::serve(&mut d, label, args, from, out)),
-            None => Some(l4h_rt::ipc::refuse()),
-        };
-        d.write_status();
-        // memd's methods always answer.
-        (msg, badge) = match answer {
-            Some(answer) => ep.reply_recv(answer, reply),
-            None => ep.recv(reply),
-        };
+    l4h_rt::ipc::run(ep, reply, &mut d)
+}
+
+/// memd's thread: the calls, and its timer.
+impl l4h_rt::ipc::Server for Memd {
+    const SIGNALS: u64 = recv::SIGNALS;
+    type Sender = Sender;
+
+    /// The timer.
+    fn signal(&mut self, _: u64) {
+        let delay = balloon::REPORT_DELAY_MS * self.ticks_per_ms;
+        self.mem.report_free(host::ticks::now(), delay);
+        self.write_status();
+        arm_timer(self.ticks_per_ms);
+    }
+
+    fn call(&mut self, from: Sender, _: u64, info: &sel4::MessageInfo) -> Option<sel4::MessageInfo> {
+        let answer = l4h_rt::ipc::serve(info, |label, args, out| call::serve(self, label, args, from, out));
+        self.write_status();
+        answer
     }
 }
 

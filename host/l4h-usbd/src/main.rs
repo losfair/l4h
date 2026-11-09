@@ -1730,12 +1730,11 @@ fn main(info: &'static l4h_rt::Info) -> ! {
         dead: false,
         errors: l4h_rt::ErrorLimit::new(),
     };
-    let ep = cap::<cap_type::Endpoint>(host::SLOT_SERVICE_EP);
-    let reply = cap::<cap_type::Reply>(host::SLOT_REPLY);
+    // Nothing calls a driver: it waits on its notification, for root's
+    // requests (badges::driver::CALL), interrupts and clients' kicks.
+    let ntfn = cap::<cap_type::Notification>(host::SLOT_NTFN);
     let irq = cap::<cap_type::IrqHandler>(proto::USBD_SLOT_IRQ);
-    // Only notifications arrive: root's requests (badges::driver::CALL), the
-    // interrupt and the client's kicks.
-    let mut badge = ep.recv(reply).1;
+    let mut badge = ntfn.wait().1;
     loop {
         u.turn(cfg, tsc_hz);
         if badge & host::badges::usbd::IRQ != 0 {
@@ -1747,7 +1746,7 @@ fn main(info: &'static l4h_rt::Info) -> ! {
             badge = host::badges::usbd::KICK;
             continue;
         }
-        badge = ep.recv(reply).1;
+        badge = ntfn.wait().1;
         u.woken();
     }
 }

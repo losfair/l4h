@@ -518,8 +518,9 @@ fn main(info: &'static Info) -> ! {
     // The only references to the scratch table.
     let scratch_order = unsafe { &mut *addr_of_mut!(SCRATCH_ORDER) };
     let scratch_extents = unsafe { &mut *addr_of_mut!(SCRATCH_EXTENTS) };
-    let ep = cap::<cap_type::Endpoint>(host::SLOT_SERVICE_EP);
-    let reply = cap::<cap_type::Reply>(host::SLOT_REPLY);
+    // Nothing calls a driver: it waits on its notification, for root's
+    // requests (badges::driver::CALL), interrupts and clients' kicks.
+    let ntfn = cap::<cap_type::Notification>(host::SLOT_NTFN);
     let irq = cap::<cap_type::IrqHandler>(blk::BLKD_SLOT_IRQ);
     // Root reads the units here, and asks nothing before.
     let published = l4h_rt::mailbox::published::<blk::Published>();
@@ -533,7 +534,7 @@ fn main(info: &'static Info) -> ! {
     published.units.store(b.dev.len() as u64, Ordering::Relaxed);
     published.ready.store(1, Ordering::Release);
     l4h_rt::mailbox::signal();
-    let (_, mut badge) = ep.recv(reply);
+    let mut badge = ntfn.wait().1;
     loop {
         b.reap();
         b.submit();
@@ -549,7 +550,7 @@ fn main(info: &'static Info) -> ! {
             n
         });
         if answered { l4h_rt::mailbox::signal(); }
-        (_, badge) = ep.recv(reply);
+        badge = ntfn.wait().1;
     }
 }
 

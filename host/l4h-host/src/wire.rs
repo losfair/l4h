@@ -376,6 +376,19 @@ pub const fn caps_fit(caps: &[Caps], slots: usize) -> bool {
     true
 }
 
+/// A protocol's callers, as their badges name them (`senders!`).
+pub trait Badged: Sized {
+    /// The sender a badge is, if it is exactly one's.
+    fn of_badge(badge: u64) -> Option<Self>;
+}
+
+/// The callers of an endpoint nobody calls (a driver's): none.
+impl Badged for core::convert::Infallible {
+    fn of_badge(_: u64) -> Option<Self> {
+        None
+    }
+}
+
 /// An endpoint a client calls.
 pub trait Call {
     /// Call with `label` and `args` in message registers 0..; the reply's
@@ -499,6 +512,12 @@ macro_rules! senders {
             pub const fn badge(self) -> u64 {
                 $( $crate::senders!(@badge $space, self, $v, $spec, [$($field)?], [$($fixed = $val)?]); )*
                 0
+            }
+        }
+
+        impl $crate::wire::Badged for $name {
+            fn of_badge(badge: u64) -> Option<Self> {
+                $name::of_badge(badge)
             }
         }
 
