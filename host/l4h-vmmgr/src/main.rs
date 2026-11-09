@@ -38,6 +38,7 @@ use l4h_rt::Info;
 use l4h_task::{elf, mem, topology, vspace, window};
 
 use l4h_host::badges::vmmgr as recv;
+use l4h_host::vmmgr::call;
 use crate::guest::{Guest, GuestConfig, State};
 use crate::mem::{Alloc, Slots};
 use crate::root::Later;
@@ -684,13 +685,6 @@ fn watchdog_dump(h: &Vmmgr) {
     }
 }
 
-pub fn mr(i: usize) -> u64 {
-    sel4::with_ipc_buffer(|b| b.msg_regs()[i])
-}
-
-pub fn set_mr(i: usize, v: u64) {
-    sel4::with_ipc_buffer_mut(|b| b.msg_regs_mut()[i] = v)
-}
 
 /// The serve loop's reply object, made from an Untyped of its own so that
 /// one left unanswered can be replaced without using more memory.  It is
@@ -777,9 +771,8 @@ fn serve(h: &mut Vmmgr, reply_slot: ReplySlot) -> ! {
         };
         h.publish();
         match resp {
-            Some(v) => {
-                set_mr(0, v);
-                (info, badge) = hyp_ep.reply_recv(sel4::MessageInfo::new(0, 0, 0, 1), reply);
+            Some(answer) => {
+                (info, badge) = hyp_ep.reply_recv(answer, reply);
             }
             None => {
                 // A reply object left unanswered (a faulted or stopped
@@ -821,9 +814,9 @@ fn root_events(h: &mut Vmmgr) {
     }
 }
 
-/// A call or fault from a guest's l4h-vmm.  Returns the reply value, or
-/// None to leave the caller blocked.
-fn component_call(h: &mut Vmmgr, badge: u64, info: &sel4::MessageInfo) -> Option<u64> {
+/// A call or fault from a guest's l4h-vmm: its reply (its words in the
+/// message registers), or None to leave the caller blocked.
+fn component_call(h: &mut Vmmgr, badge: u64, info: &sel4::MessageInfo) -> Option<sel4::MessageInfo> {
     let id = recv::ID.get(badge) as usize;
     if badge & recv::FAULT != 0 {
         let fault = sel4::with_ipc_buffer(|b| sel4::Fault::new(b, info));
@@ -833,42 +826,47 @@ fn component_call(h: &mut Vmmgr, badge: u64, info: &sel4::MessageInfo) -> Option
     // The VMMs' component ids are their guests'.
     if id >= MAX_GUESTS {
         l4h_rt::log!("l4h-vmmgr: component {:#x}: unknown", id);
-        return Some(u64::MAX);
+        return Some(l4h_ipc::refuse());
     }
-    match info.label() {
-        host::ROOT_CALL_VMM_READY => {
-            h.guests.get_mut(id)?.as_mut()?.start();
-            Some(0)
+    l4h_ipc::serve(info, |label, args, out| call::serve(&mut VmmCalls(h), label, args, proto::Sender::Vmm(id), out))
+}
+
+/// The VMMs' calls, as l4h_host::vmmgr::call declares them.
+struct VmmCalls<'a>(&'a mut Vmmgr);
+
+impl call::Server for VmmCalls<'_> {
+    fn vmm_ready(&mut self, from: proto::Sender) -> Result<(), u64> {
+        let proto::Sender::Vmm(id) = from;
+        let g = self.0.guests.get_mut(id).and_then(|g| g.as_mut()).ok_or(l4h_host::wire::NO_REPLY)?;
+        g.start();
+        Ok(())
+    }
+
+    fn guest_power(&mut self, from: proto::Sender, how: u64) -> Result<(), u64> {
+        let proto::Sender::Vmm(id) = from;
+        let h = &mut *self.0;
+        let reason = match how {
+            abi::POWER_OFF => "power off",
+            abi::POWER_REBOOT => "reboot",
+            abi::POWER_CRASH => "kernel panic",
+            _ => "unknown",
+        };
+        info!("l4h-vmmgr: guest {} power request {} ({})", id, how, reason);
+        if how != abi::POWER_OFF && h.guest(id).is_some_and(|g| g.dom0) {
+            // The caller (dom0's VMM) is destroyed: no reply.
+            restart_dom0(h, id);
+            return Err(l4h_host::wire::NO_REPLY);
         }
-        host::ROOT_CALL_GUEST_POWER => {
-            let how = mr(1);
-            let reason = match how {
-                abi::POWER_OFF => "power off",
-                abi::POWER_REBOOT => "reboot",
-                abi::POWER_CRASH => "kernel panic",
-                _ => "unknown",
-            };
-            info!("l4h-vmmgr: guest {} power request {} ({})", id, how, reason);
-            if how != abi::POWER_OFF && h.guest(id).is_some_and(|g| g.dom0) {
-                // The caller (dom0's VMM) is destroyed: no reply.
-                restart_dom0(h, id);
-                return None;
+        if let Some(Some(g)) = h.guests.get_mut(id) {
+            for v in &g.vcpus {
+                let _ = v.ktcb.tcb_suspend();
             }
-            if let Some(Some(g)) = h.guests.get_mut(id) {
-                for v in &g.vcpus {
-                    let _ = v.ktcb.tcb_suspend();
-                }
-                g.state = State::Stopped;
-            }
-            if h.guests.iter().flatten().all(|g| g.state != State::Running) {
-                info!("l4h-vmmgr: all guests stopped");
-            }
-            Some(0)
+            g.state = State::Stopped;
         }
-        other => {
-            l4h_rt::log!("l4h-vmmgr: guest {}'s l4h-vmm: unknown call {}", id, other);
-            Some(u64::MAX)
+        if h.guests.iter().flatten().all(|g| g.state != State::Running) {
+            info!("l4h-vmmgr: all guests stopped");
         }
+        Ok(())
     }
 }
 

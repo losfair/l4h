@@ -10,7 +10,6 @@ use sel4::cap_type;
 use crate::Host;
 use crate::mem::Alloc;
 
-use l4h_host::badges::root::MONITOR as MONITOR_BADGE;
 
 /// seL4 user IRQ vector for the serial port.
 #[cfg(target_arch = "x86_64")]
@@ -66,7 +65,7 @@ impl Monitor {
         let irq = sel4::init_thread::Slot::<cap_type::IrqHandler>::from_index(irq_slot).cap();
         let badged = alloc.slots.alloc();
         abs(badged)
-            .mint(&slot::CNODE.cap().absolute_cptr(ntfn), sel4::CapRights::write_only(), MONITOR_BADGE)
+            .mint(&slot::CNODE.cap().absolute_cptr(ntfn), sel4::CapRights::write_only(), l4h_host::badges::root::MONITOR)
             .ok()?;
         irq.irq_handler_set_notification(sel4::init_thread::Slot::<cap_type::Notification>::from_index(badged).cap()).ok()?;
         m.irq = Some(irq);
@@ -92,7 +91,7 @@ impl Monitor {
         let irq = sel4::init_thread::Slot::<cap_type::IrqHandler>::from_index(irq_slot).cap();
         let badge_slot = alloc.slots.alloc();
         let badge = sel4::init_thread::Slot::<cap_type::Notification>::from_index(badge_slot).cap();
-        crate::component::abs_of(badge).mint(&crate::component::abs_of(ntfn), CapRights::write_only(), MONITOR_BADGE).ok()?;
+        crate::component::abs_of(badge).mint(&crate::component::abs_of(ntfn), CapRights::write_only(), l4h_host::badges::root::MONITOR).ok()?;
         irq.irq_handler_set_notification(badge).ok()?;
         unsafe {
             ((UART_VA + 0x44) as *mut u32).write_volatile(0x7ff); // clear pending IRQs

@@ -16,6 +16,10 @@ mod net;
 mod virtq;
 
 use l4h_abi as abi;
+use l4h_rt::host::badges::vmm as recv;
+use l4h_rt::host::hypercall::{Sender as Guest, call as hypercall};
+use l4h_rt::ipc::Endpoint;
+use l4h_rt::host::vmmgr::call::Client as _;
 use l4h_rt::host::{self, VmmConfig};
 use l4h_rt::sel4;
 use l4h_rt::{Info, cap};
@@ -78,12 +82,35 @@ impl Dev {
     }
 }
 
-fn mr(i: usize) -> u64 {
-    sel4::with_ipc_buffer(|b| b.msg_regs()[i])
+/// The guest's hypercalls, as l4h_host::hypercall::call declares them.
+struct Hypercalls<'a> {
+    cfg: &'a VmmConfig,
+    tsc_hz: u64,
+    mem: &'a GuestMem,
+    vcpus: &'a Vcpus,
+    devs: &'a mut [Option<Dev>; host::VMM_MAX_DEVICES],
+    console: &'a mut Console,
+    root_ep: Endpoint,
 }
 
-fn set_mr(i: usize, v: u64) {
-    sel4::with_ipc_buffer_mut(|b| b.msg_regs_mut()[i] = v)
+impl hypercall::Server for Hypercalls<'_> {
+    fn power(&mut self, _: Guest, how: u64) -> Result<(), u64> {
+        // What the guest printed before (a crash report) goes out before
+        // it stops.  vmmgr stops the vCPUs, which cancels this call: do not
+        // reply.
+        self.console.flush(self.vcpus);
+        let _ = self.root_ep.guest_power(how);
+        Err(host::wire::NO_REPLY)
+    }
+
+    fn dev_write(&mut self, _: Guest, device: usize, op: u64, a: u64, b: u64) -> Result<u64, u64> {
+        let d = self.devs.get_mut(device).and_then(|d| d.as_mut()).ok_or(host::wire::EINVAL)?;
+        Ok(d.op(self.mem, self.vcpus, op, a, b))
+    }
+
+    fn get_time(&mut self, _: Guest) -> Result<u64, u64> {
+        Ok(wall_clock_ns(self.cfg, self.tsc_hz))
+    }
 }
 
 /// Nanoseconds since the Unix epoch (0 if the host does not know).
@@ -151,7 +178,7 @@ fn main(info: &'static Info) -> ! {
                 d.event,
                 gpu::Gpu::new(d.chan_va as usize, d.chan_size, d.width, d.height),
             )),
-            host::VDEV_USB => Dev::Usb(Usb { event: d.event, vcpu: 0, badge: host::vmm_badge_usb(d.chan_kick_slot as usize) }),
+            host::VDEV_USB => Dev::Usb(Usb { event: d.event, vcpu: 0, badge: recv::USB.nth(d.chan_kick_slot as usize) }),
             k => panic!("l4h-vmm: unsupported device kind {}", k),
         };
         devs[idx] = Some(dev);
@@ -165,23 +192,23 @@ fn main(info: &'static Info) -> ! {
 
     let mut console = Console::new(cfg.serial != 0, if cfg.dom0 != 0 { None } else { Some(cfg.guest_id) }, cfg.console_event, tsc_hz);
     let mut console_pending = false;
-    let root_ep = cap::<cap_type::Endpoint>(host::SLOT_ROOT_EP);
+    // vmmgr's endpoint (l4h_host::vmmgr::call).
+    let root_ep = Endpoint(cap::<cap_type::Endpoint>(host::SLOT_ROOT_EP));
     let ep = cap::<cap_type::Endpoint>(host::SLOT_SERVICE_EP);
     let reply = cap::<cap_type::Reply>(host::SLOT_REPLY);
 
-    set_mr(0, cfg.guest_id as u64);
-    root_ep.call(sel4::MessageInfo::new(host::ROOT_CALL_VMM_READY, 0, 0, 1));
+    let _ = root_ep.vmm_ready();
 
     let (mut info, mut badge) = ep.recv(reply);
     loop {
-        if badge & host::VMM_BADGE_HYPERCALL == 0 {
-            console_pending |= badge & host::VMM_BADGE_CONSOLE != 0;
-            if badge & host::VMM_BADGE_MEM != 0 {
+        if badge & recv::HYPERCALL == 0 {
+            console_pending |= badge & recv::CONSOLE != 0;
+            if badge & recv::MEM != 0 {
                 if let Some(m) = memdev.as_mut() {
                     m.target_changed(&vcpus);
                 }
             }
-            if badge & host::VMM_BADGE_MEM_REQ != 0 {
+            if badge & recv::MEM_REQ != 0 {
                 if let Some(m) = memdev.as_mut() {
                     m.request(&vcpus);
                 }
@@ -196,10 +223,10 @@ fn main(info: &'static Info) -> ! {
                     }
                     continue;
                 }
-                if badge & host::VMM_BADGE_DONE != 0 {
+                if badge & recv::DONE != 0 {
                     d.complete(&mem, &vcpus);
                 }
-                if badge & host::VMM_BADGE_KICK != 0 {
+                if badge & recv::KICK != 0 {
                     d.poll(&mem, &vcpus);
                 }
             }
@@ -214,17 +241,15 @@ fn main(info: &'static Info) -> ! {
                 // Signals remain pending on ntfn while it is unbound.
                 tcb.tcb_unbind_notification().expect("unbind VMM notification");
                 let call = ep.nb_recv(reply);
-                // TCB invocations use the IPC buffer too: preserve the
-                // hypercall arguments across rebinding the notification.
-                let args: [u64; 4] = core::array::from_fn(mr);
-                tcb.tcb_bind_notification(ntfn).expect("bind VMM notification");
-                // A gap timer may have expired while unbound, losing its
-                // notification. Re-arm before sleeping; args are still saved.
-                console.rearm_timer();
+                // TCB invocations use the IPC buffer too: keep a hypercall
+                // there across rebinding the notification.  A gap timer
+                // may have expired while unbound, losing its notification:
+                // re-arm it before sleeping.
+                l4h_rt::ipc::preserving(|| {
+                    tcb.tcb_bind_notification(ntfn).expect("bind VMM notification");
+                    console.rearm_timer();
+                });
                 if call.1 != 0 {
-                    for (i, a) in args.into_iter().enumerate() {
-                        set_mr(i, a);
-                    }
                     (info, badge) = call;
                     continue;
                 }
@@ -234,34 +259,16 @@ fn main(info: &'static Info) -> ! {
             (info, badge) = if console_pending { ep.nb_recv(reply) } else { ep.recv(reply) };
             continue;
         }
-        let resp = match info.label() {
-            abi::HC_POWER => {
-                // What the guest printed before (a crash report) goes out
-                // before it stops.  l4h-root stops the vCPUs, which cancels
-                // this call: do not reply.
-                let how = mr(0);
-                console.flush(&vcpus);
-                set_mr(0, cfg.guest_id as u64);
-                set_mr(1, how);
-                root_ep.call(sel4::MessageInfo::new(host::ROOT_CALL_GUEST_POWER, 0, 0, 2));
-                (info, badge) = ep.recv(reply);
-                continue;
-            }
-            abi::HC_DEV_WRITE => {
-                let (idx, op, a, b) = (mr(0) as usize, mr(1), mr(2), mr(3));
-                match devs.get_mut(idx).and_then(|d| d.as_mut()) {
-                    Some(d) => d.op(&mem, &vcpus, op, a, b),
-                    None => u64::MAX,
-                }
-            }
-            abi::HC_GET_TIME => wall_clock_ns(cfg, tsc_hz),
-            _ => u64::MAX,
+        let mut hc = Hypercalls { cfg, tsc_hz, mem: &mem, vcpus: &vcpus, devs: &mut devs, console: &mut console, root_ep };
+        let Some(response) = l4h_rt::ipc::serve(&info, |label, args, out| hypercall::serve(&mut hc, label, args, Guest::Guest, out)) else {
+            (info, badge) = ep.recv(reply);
+            continue;
         };
         if console_pending {
-            console_pending = console.drain(&vcpus);
+            // Draining can re-arm the console's timer, which overwrites the
+            // reply in the message registers.
+            console_pending = l4h_rt::ipc::preserving(|| console.drain(&vcpus));
         }
-        set_mr(0, resp);
-        let response = sel4::MessageInfo::new(0, 0, 0, 1);
         (info, badge) = if console_pending {
             reply.send(response);
             ep.nb_recv(reply)

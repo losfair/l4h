@@ -1740,18 +1740,18 @@ fn main(info: &'static l4h_rt::Info) -> ! {
     let ep = cap::<cap_type::Endpoint>(host::SLOT_SERVICE_EP);
     let reply = cap::<cap_type::Reply>(host::SLOT_REPLY);
     let irq = cap::<cap_type::IrqHandler>(proto::USBD_SLOT_IRQ);
-    // Only notifications arrive: root's requests (BADGE_CALL), the
+    // Only notifications arrive: root's requests (badges::driver::CALL), the
     // interrupt and the client's kicks.
     let mut badge = ep.recv(reply).1;
     loop {
         u.turn(cfg, tsc_hz);
-        if badge & proto::USBD_BADGE_IRQ != 0 {
+        if badge & host::badges::usbd::IRQ != 0 {
             irq.irq_handler_ack().expect("usbd IRQ ack");
         }
         // More work: another bounded turn.  The guest kicks only once
         // usbd_waiting is set, so its kicks never pile up.
         if u.prepare_wait() {
-            badge = proto::USBD_BADGE_KICK;
+            badge = host::badges::usbd::KICK;
             continue;
         }
         badge = ep.recv(reply).1;

@@ -17,6 +17,7 @@
 use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 pub use l4h_host as host;
+pub use l4h_ipc as ipc;
 pub use sel4;
 
 #[doc(hidden)]
@@ -30,7 +31,6 @@ pub use sel4_panicking_env;
 #[doc(hidden)]
 pub use sel4_runtime_common;
 
-pub mod call;
 mod failure;
 pub mod ioport;
 pub mod mailbox;

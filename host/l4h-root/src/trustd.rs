@@ -24,15 +24,14 @@ use crate::devmem::DevMem;
 use crate::mem::{Alloc, Arena, ObjCtx};
 use crate::vspace::{FRAME_BP, map_frame};
 use crate::window::Window;
-use crate::{AsidPools, Host, HostInfo, mr};
+use crate::{AsidPools, Host, HostInfo};
 
 pub use l4h_host::trust::AML_MAX;
 
 static TRUSTD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/l4h-trustd.elf"));
 
 const PAGE: usize = 4096;
-pub const TRUSTD_ID: u32 = 0x300;
-pub const FLAGS_ID: u32 = 0x301;
+pub use l4h_host::root::{FLAGS_ID, TRUSTD_ID};
 /// The registry page in the root task.
 const REGISTRY_VA: usize = crate::layout::TRUSTD_REGISTRY.base;
 /// Mapping capabilities trustd's ranges and AML pages can need.
@@ -46,12 +45,12 @@ pub struct Trustd {
     flags_ep: cap::Endpoint,
     no_reports: bool,
     failed: bool,
-    /// Multikernel: the kick, badged RELAY_BADGE, to tell trustd about a
+    /// Multikernel: the kick, badged trust::RELAY_BADGE, to tell trustd about a
     /// message in its relay inbox.
     relay: Option<cap::Notification>,
     /// The request page of each guest id, mapped in trustd.
     pages: [cap::Granule; trust::MAX_RECORDS],
-    /// Guests signal it, badged with trust::kick_badge(id).
+    /// Guests signal it, badged with badges::trustd_kick::GUEST bit id.
     kick: cap::Notification,
     /// The flags table, which root and vmmgr map read-only.
     flags: [cap::Granule; trust::FLAGS_SIZE / PAGE],
@@ -422,16 +421,18 @@ fn finish(
     let ep = arena.object_cap::<cap_type::Endpoint>(alloc, ObjectBlueprint::Endpoint);
     comp.give(trust::SLOT_FLAGS_EP, ep, CapRights::all());
     let call_rights = sel4::CapRightsBuilder::none().write(true).grant_reply(true).build();
-    comp.give_badged(trust::SLOT_FLAGS_CALL, ep, call_rights.clone(), trust::FLAGS_TRUSTD);
+    comp.give_badged(trust::SLOT_FLAGS_CALL, ep, call_rights.clone(), trust::Sender::Trustd.badge());
     let slot = alloc.slots.alloc();
     let flags_ep = sel4::init_thread::Slot::<cap_type::Endpoint>::from_index(slot).cap();
-    abs_of(flags_ep).mint(&abs_of(ep), call_rights, trust::FLAGS_ROOT).expect("root flags endpoint");
+    abs_of(flags_ep).mint(&abs_of(ep), call_rights, trust::Sender::Root.badge()).expect("root flags endpoint");
     let bootstrap = flags_thread(&comp, alloc, &mut arena, info);
     component::start(&comp);
     // reply_recv puts the worker back on the endpoint before returning
     // this reply. Unbind only now: subsequent calls donate their SC.
-    sel4::with_ipc_buffer_mut(|b| b.msg_regs_mut()[..8].fill(0));
-    flags_ep.call(sel4::MessageInfo::new(0, 0, 0, 8));
+    {
+        use l4h_host::trust::call::Client;
+        let _ = l4h_ipc::Endpoint(flags_ep).ready();
+    }
     bootstrap.unbind().expect("passive flags server");
     Some(Trustd { comp, arena, registry: REGISTRY_VA as *mut GuestRecord,
         flags_ep, no_reports, failed: false, relay, pages, kick, flags,
@@ -440,7 +441,7 @@ fn finish(
 
 impl Trustd {
     /// Give vmmgr the flags: read-only at FLAGS_VA, and the capability to
-    /// act on them for the console (root's, FLAGS_ROOT).
+    /// act on them for the console (root's, badged as Sender::Root).
     pub fn give_vmmgr(&self, vmmgr: &Component, alloc: &mut Alloc, arena: &mut Arena, keep: &mut impl FnMut() -> sel4::AbsoluteCPtr) {
         vmmgr.give(l4h_host::vmmgr::SLOT_FLAGS_EP, self.flags_ep, CapRights::all());
         for (p, &f) in self.flags.iter().enumerate() {
@@ -463,7 +464,7 @@ impl Trustd {
                 .write_volatile(if self.no_reports { abi::ATTEST_NO_REPORTS } else { 0 });
         });
         page.copy(&abs_of(p), CapRights::all()).expect("attestation page");
-        kick.mint(&abs_of(self.kick), CapRights::write_only(), trust::kick_badge(id)).expect("attestation kick");
+        kick.mint(&abs_of(self.kick), CapRights::write_only(), l4h_host::badges::trustd_kick::GUEST.nth(id)).expect("attestation kick");
         true
     }
 
@@ -523,7 +524,7 @@ pub fn fault(h: &mut Host, id: u32) {
     }
 }
 
-/// ROOT_CALL_ATTEST_DONE: trustd answered guest `id`; vmmgr raises the
+/// `attest_done`: trustd answered guest `id`; vmmgr raises the
 /// event of its attestation device.
 pub fn done(h: &mut Host, id: usize) {
     if h.guests.get(id).and_then(|g| g.as_ref()).is_some_and(|g| g.attest) {
@@ -533,11 +534,10 @@ pub fn done(h: &mut Host, id: usize) {
     }
 }
 
-/// ROOT_CALL_HW from trustd: one access the firmware's AML makes
-/// (trust::HW_*).  Returns what it read (all ones when refused).
+/// `hw` from trustd: one access the firmware's AML makes (trust::HW_*).
+/// Returns what it read (all ones when refused).
 #[cfg(target_arch = "x86_64")]
-pub fn hw(h: &mut Host) -> u64 {
-    let (op, addr, off, width, value) = (mr(0), mr(1) as usize, mr(2) as usize, mr(3) as usize, mr(4));
+pub fn hw(h: &mut Host, op: u64, addr: usize, off: usize, width: usize, value: u64) -> u64 {
     let write = op & 1 != 0;
     let r = match op {
         trust::HW_MEM_READ | trust::HW_MEM_WRITE => {
@@ -570,7 +570,7 @@ pub fn hw(h: &mut Host) -> u64 {
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-pub fn hw(_h: &mut Host) -> u64 {
+pub fn hw(_h: &mut Host, _op: u64, _addr: usize, _off: usize, _width: usize, _value: u64) -> u64 {
     u64::MAX
 }
 
@@ -675,9 +675,9 @@ pub fn channel_message(h: &mut Host, peer: u32, ty: u32, msg: &[u8]) {
     relay.signal();
 }
 
-/// ROOT_CALL_RELAY from trustd: its outbox (MR1 bytes) to partition MR0.
-pub fn relay(h: &mut Host) -> u64 {
-    let (peer, len) = (mr(0) as u32, mr(1) as usize);
+/// `relay` from trustd: its outbox (`len` bytes) to partition `peer`.
+/// 0, or u64::MAX if root cannot.
+pub fn relay(h: &mut Host, peer: u32, len: usize) -> u64 {
     let secondary = crate::partition::secondary();
     let ty = if secondary { l4h_partition::MSG_TPM_REQUEST } else { l4h_partition::MSG_TPM_REPLY };
     // Secondaries ask only the primary, which answers only them.

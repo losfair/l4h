@@ -622,7 +622,8 @@ static uint64_t dev_write(uint64_t op)
 	seL4_SetMR(2, 0);
 	seL4_SetMR(3, 0);
 	seL4_Call(L4H_CPTR(L4H_SLOT_HYP_EP), seL4_MessageInfo_new(L4H_HC_DEV_WRITE, 0, 0, 4));
-	return seL4_GetMR(0);
+	/* MR0 is 0 or an errno, the op's result follows. */
+	return seL4_GetMR(0) ? ~0ULL : seL4_GetMR(1);
 }
 
 static uint64_t set_status(uint32_t s)

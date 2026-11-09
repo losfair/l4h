@@ -4,7 +4,7 @@
 //! vmmgr builds guests and runs their lifecycle, schedules their vCPUs and
 //! serves dom0's control API.  l4h-root keeps the hardware and the memory
 //! devices reach: guests' I/O pools, disk channels and netd ports.  vmmgr
-//! calls root (VMMGR_*), never the other way round: root tells it of
+//! calls root (crate::root::call), never the other way round: root tells it of
 //! events through the events page and its notification.
 //!
 //! Capabilities cross in vmmgr's exchange slots, which root reaches through
@@ -27,7 +27,7 @@ pub const CNODE_BITS: usize = 18;
 pub const SLOT_MEMD_EP: u64 = 16;
 /// The mailbox CNode it shares with memd (memd::MAILBOX_*).
 pub const SLOT_MEMD_MAILBOX: u64 = 17;
-/// trustd's flags service, badged trust::FLAGS_ROOT: ACT for the host
+/// trustd's flags service, badged as trust::Sender::Root: ACT for the host
 /// bits of the console.
 pub const SLOT_FLAGS_EP: u64 = 18;
 /// The CNode of the boot module frames root maps into vmmgr (radix
@@ -82,65 +82,33 @@ pub const RESULT_VA: usize = 0x5100_0040_0000;
 pub const CTL_DATA_VA: usize = 0x5100_0100_0000;
 
 
-/// Calls from vmmgr to l4h-root, on its SLOT_ROOT_EP.  The reply's MR0 is
-/// 0 or an errno, values follow.
-///
-/// MR0 = guest, MR1 = I/O pool bytes (a power of two), MR2 = its GPA, MR3
-/// = dom0.  Root makes the pool and the guest's l4h-vmm notification,
-/// which backends signal (root's, so that it is one).  Exchange slot 0 =
-/// the CNode of the pool's frames (radix: the pool's pages), slot 3 = the
-/// notification, and if the guest gets an attestation device, slot 1 its
-/// page and slot 2 its kick capability (badged).  MR1 = the guest's
-/// instance, MR2 = whether it has an attestation device.
-pub const VMMGR_GUEST_NEW: u64 = 0x100;
-/// MR0 = guest, stopped and torn down by vmmgr: drain its disks, remove
-/// its ports, forget it in trustd, revoke its pool.  MR1 = bytes of pool
-/// kept out of use (a disk could not be stopped).
-pub const VMMGR_GUEST_DEL: u64 = 0x101;
-/// MR0 = guest, MR1 = its device index, MR2 = host disk, MR3 = l4h_abi::BLK_*,
-/// MR4 = first sector, MR5 = sectors (0: to the end); or, if MR6 (n) is
-/// not 0, the n extents (start, sectors) at offset MR7 of dom0's control
-/// data area, which blkd reads (root copies them unread).  Exchange slots
-/// [0, blk::CHANNEL_PAGES) = the channel frames, the next = blkd's kick.
-pub const VMMGR_DISK_ATTACH: u64 = 0x102;
-/// MR0 = guest, MR1 = its device index, MR2 = switch, MR3 = MAC (0:
-/// choose), MR4 = MAC lock, MR5 = isolated.  Exchange slot 0 = the CNode
-/// of the port's frames (radix PORT_RADIX), slot 1 = netd's kick.  MR1 =
-/// the MAC.
-pub const VMMGR_NIC_ADD: u64 = 0x103;
-/// MR0 = guest, MR1 = its RAM bytes, MR2 = vCPUs, MR3 = trust::RECORD_*
-/// flags, MR4..MR7 = its launch digest: it starts, its reports describe
-/// it from now on.
-pub const VMMGR_TRUST_REGISTER: u64 = 0x104;
-/// MR0 = a control op that root serves (abi::CTL_*: host, disks,
-/// switches, NICs), MR1..MR6 = its args.  MR1..MR6 of the reply = its
-/// vals; its data is in the result page.  The data area of dom0's control
-/// device is the source of CTL_BLK_WRITE.
-pub const VMMGR_HOST_OP: u64 = 0x105;
-/// MR0 = a token of VMMGR_PENDING, which root has answered: the answer, as
-/// the request would have given it (exchange slots too), and the token is
-/// free.  EAGAIN if root has not answered yet.
-pub const VMMGR_RESULT: u64 = 0x106;
-
-/// MR0 of a reply instead of 0 or an errno: root has taken the request and
-/// waits for a driver (DISK_ATTACH, and HOST_OP's BLK_WRITE and BLK_INFO),
-/// which root never waits for in a call.  MR1 = a token below
-/// MAX_PENDING: root sets its bit in Events::ops_done and signals
-/// badges::vmmgr::ROOT_EVENT once it has the answer, which VMMGR_RESULT gives.  A
-/// driver that never answers leaves it pending; the guest's GUEST_DEL
-/// still answers ENOENT for it.  A disk controller holds at most
-/// PENDING_PER_CTRL of them for requests blkd has not answered (EBUSY
+/// Requests root answers later (crate::root::Later), at most: tokens.
+/// A driver that never answers leaves its token pending; the guest's
+/// `guest_del` still answers ENOENT for it.  A disk controller holds at
+/// most PENDING_PER_CTRL of them for requests blkd has not answered (EBUSY
 /// past that), so drivers that never answer leave tokens for the others.
-pub const VMMGR_PENDING: u64 = 1 << 63;
 pub const MAX_PENDING: usize = 256;
 pub const PENDING_PER_CTRL: usize = 2;
 
-/// MR0 = guest, MR1 = its device index, MR2 = USB controller (CTL_USB_INFO
-/// index).  Root claims it if the firmware still has it (a CLAIM posted
-/// to its usbd, not waited for), and makes the queue area.  Exchange slot 0 = the CNode of its frames (radix
-/// usb::QUEUE_RADIX in root), slot 1 = usbd's kick.  MR1 = the guest's
-/// USB number n: the VMM raises the device's event on vmm_badge_usb(n).
-pub const VMMGR_USB_ATTACH: u64 = 0x107;
+/// Who calls vmmgr's endpoint: a guest's l4h-vmm, badged with its guest
+/// (badges::vmmgr, COMPONENT | ID).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sender {
+    Vmm(usize),
+}
+
+crate::protocol! {
+    /// The calls guests' l4h-vmms make on vmmgr's endpoint.  The guest is
+    /// the badge's.  A reply's first word is 0 or an errno; a caller vmmgr
+    /// stops or destroys gets none.
+    pub mod call (from: Sender) {
+        /// The guest asks to power off, reboot or crash (abi::POWER_*).
+        GuestPower / guest_power = 1 from [Vmm] (how: u64) -> ();
+        /// The VMM has initialised the device pages: start the guest.
+        VmmReady / vmm_ready = 3 from [Vmm] () -> ();
+    }
+}
+
 /// Radix of the CNode of a USB controller's queue frames.
 pub const USB_QUEUE_RADIX: usize = 7;
 
@@ -155,7 +123,7 @@ pub struct Events {
     /// A serial monitor command (MONITOR_*), 0 once vmmgr took it.
     pub monitor: core::sync::atomic::AtomicU64,
     /// Bit t % 64 of word t / 64: root has the answer of pending request
-    /// t (VMMGR_PENDING).
+    /// t (crate::root::Later::Token).
     pub ops_done: [core::sync::atomic::AtomicU64; MAX_PENDING / 64],
 }
 const _: () = assert!(MAX_PENDING % 64 == 0);

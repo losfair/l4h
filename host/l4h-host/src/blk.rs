@@ -80,10 +80,6 @@ pub struct Channel {
     pub resps: [Resp; RING_SIZE],
 }
 
-/// Notification badges of blkd (badges::blkd).
-pub const BLKD_BADGE_KICK: u64 = crate::badges::blkd::KICK;
-pub const BLKD_BADGE_IRQ: u64 = crate::badges::blkd::IRQ;
-
 /// blkd CSpace slots (beyond the common ones).
 pub const BLKD_SLOT_IRQ: u64 = 16;
 /// I/O port capability of a legacy virtio device (BlkdConfig::legacy_io).

@@ -82,7 +82,7 @@ pub enum Backend {
         keep: cap::CNode,
     },
     /// A USB controller: the VMM raises its event when usbd signals
-    /// host::vmm_badge_usb(n), and maps nothing of it.
+    /// badges::vmm::USB bit n, and maps nothing of it.
     Usb { n: usize },
     /// virtio-gpu (gpu.rs): frame i < display_pages is page i of the
     /// display area, the others are the VMM's tables.

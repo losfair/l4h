@@ -116,14 +116,10 @@ pub struct Published {
     pub resets: AtomicU64,
 }
 
-/// Badges of usbd's bound notification (badges::usbd).
-pub const USBD_BADGE_IRQ: u64 = crate::badges::usbd::IRQ;
-/// The client kicked.
-pub const USBD_BADGE_KICK: u64 = crate::badges::usbd::KICK;
 
 /// usbd's CSpace slots, beyond the common ones.
 pub const USBD_SLOT_IRQ: u64 = 16;
-/// Client area idx's VMM notification (badged host::vmm_badge_usb(n)),
+/// Client area idx's VMM notification (badged badges::vmm::USB bit n),
 /// idx < AREAS.  Root deletes it at `remove` without waiting: usbd signals
 /// it with NBSend, which an empty slot ignores.
 pub const USBD_SLOT_CLIENT_IRQ: u64 = 32;

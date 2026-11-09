@@ -101,6 +101,68 @@ crate::badge_space! {
 }
 
 crate::badge_space! {
+    /// trustd's flags endpoint (crate::trust::call).
+    pub mod flags {
+        /// l4h-root's capability, which vmmgr also holds.
+        flag ROOT: 0;
+        /// trustd's main thread's.
+        flag TRUSTD: 1;
+    }
+}
+
+crate::badge_space! {
+    /// A guest's l4h-vmm: hypercalls on its endpoint, and signals on its
+    /// bound notification, which say what kind of source signalled, not
+    /// which device: the VMM checks each device's kick word and backend
+    /// ring, which is a load or two for an idle one.
+    pub mod vmm {
+        /// A hypercall (crate::hypercall): the guest's capability to the
+        /// endpoint has it, notification badges never.
+        flag HYPERCALL: 63;
+        /// A guest device was kicked.
+        signal KICK: 0;
+        /// A device backend (blkd, netd) has completions or room.
+        signal DONE: 1;
+        /// From l4h-vmmgr: the guest's hotplug target changed.
+        signal MEM: 2;
+        /// The guest wrote to its console output ring; also the console's
+        /// deadline timer.
+        signal CONSOLE: 3;
+        /// The guest made a hotplug request in its memory device page.
+        signal MEM_REQ: 4;
+        /// usbd has completions for the guest's USB controller n: bit n,
+        /// n < usb::MAX_GUEST_USB.
+        signals USB: 8..8 + crate::usb::MAX_GUEST_USB as u32;
+    }
+}
+
+crate::badge_space! {
+    /// trustd's bound notification.
+    pub mod trustd {
+        /// Its deadline timer, which nothing else signals.
+        signal TIMER: 0;
+    }
+}
+
+crate::badge_space! {
+    /// trustd's kick notification (trust::SLOT_KICK).
+    pub mod trustd_kick {
+        /// Guest g kicked its attestation device: bit g.  The relay shares
+        /// guest 63's bit (trust::RELAY_BADGE): kicks are only hints, so
+        /// trustd looks at both.
+        signals GUEST: 0..crate::trust::MAX_RECORDS as u32;
+    }
+}
+
+crate::badge_space! {
+    /// l4h-logd's bound notification.
+    pub mod logd {
+        /// Its deadline timer.
+        signal TIMER: 0;
+    }
+}
+
+crate::badge_space! {
     /// l4h-memd's service endpoint (crate::memd::call).  l4h-root calls
     /// with an unbadged capability.
     pub mod memd {

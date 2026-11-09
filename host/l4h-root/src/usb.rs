@@ -344,7 +344,7 @@ fn claim(h: &mut Host, i: usize) -> Result<(), i64> {
     pci::msi_irq(&d, vector, &abs_of(root_cap::<cap_type::Null>(irq_slot)));
     let irq = root_cap::<cap_type::IrqHandler>(irq_slot);
     let irq_ntfn = root_cap::<cap_type::Notification>(h.alloc.slots.alloc());
-    abs_of(irq_ntfn).mint(&abs_of(comp.ntfn), CapRights::all(), usb::USBD_BADGE_IRQ).expect("usbd IRQ notification");
+    abs_of(irq_ntfn).mint(&abs_of(comp.ntfn), CapRights::all(), l4h_host::badges::usbd::IRQ).expect("usbd IRQ notification");
     irq.irq_handler_set_notification(irq_ntfn).expect("usbd IRQ set notification");
     comp.give(usb::USBD_SLOT_IRQ, irq, CapRights::all());
     c.dom = dom;
@@ -431,7 +431,7 @@ fn free_area(h: &mut Host, d: &mut Usbd, idx: usize) {
     }
 }
 
-/// What usbd has answered (from the serve loop, on mailbox::MAILBOX_BADGE).
+/// What usbd has answered (from the serve loop, on badges::root::MAILBOX).
 /// A quarantined usbd is suspended: its requests are given up at once.
 pub fn poll(h: &mut Host) {
     for i in 0..ctrls().len() {
@@ -478,7 +478,7 @@ pub fn poll(h: &mut Host) {
     }
 }
 
-/// VMMGR_USB_ATTACH: give guest `g` controller `i`, claimed already
+/// `usb_attach`: give guest `g` controller `i`, claimed already
 /// (ensure_claimed).  The guest's USB device number is `g.usbs.len()`
 /// (its VMM's badge).  usbd starts the controller when it gets to it
 /// (after the CLAIM or the previous guest's REMOVE): the guest waits for
@@ -534,9 +534,9 @@ pub fn attach(h: &mut Host, i: usize, g: &mut RootGuest) -> Result<Attached, i64
     // Completions go to the guest's VMM, which raises the device's event.
     let irq_slot = usb::USBD_SLOT_CLIENT_IRQ + idx as u64;
     let _ = d.comp.slot(irq_slot).delete();
-    d.comp.give_badged(irq_slot, g.vmm_ntfn, CapRights::write_only(), host::vmm_badge_usb(n));
+    d.comp.give_badged(irq_slot, g.vmm_ntfn, CapRights::write_only(), l4h_host::badges::vmm::USB.nth(n));
     let kick = root_cap::<cap_type::Notification>(h.alloc.slots.alloc());
-    abs_of(kick).mint(&abs_of(d.comp.ntfn), CapRights::write_only(), usb::USBD_BADGE_KICK).expect("usbd kick");
+    abs_of(kick).mint(&abs_of(d.comp.ntfn), CapRights::write_only(), l4h_host::badges::usbd::KICK).expect("usbd kick");
     d.idx = idx;
     c.pool = Some((g.pool.gpa, g.pool.paddr, g.pool.size));
     c.state = State::Vm(g.id);

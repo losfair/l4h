@@ -7,6 +7,7 @@ version.workspace = true
 [dependencies]
 sel4.workspace = true
 l4h-host = { path = "../l4h-host" }
+l4h-ipc = { path = "../l4h-ipc" }
 one-shot-mutex = "0.2.1"
 sel4-dlmalloc = { path = "../../third_party/rust-sel4/crates/sel4-dlmalloc" }
 sel4-initialize-tls = { path = "../../third_party/rust-sel4/crates/sel4-initialize-tls" }

@@ -1607,7 +1607,7 @@ Untypeds reclaims everything it made. Plugging does not involve
   CNodes of the region's GiBs (16 KiB each) when it first plugs there.
 - **Control.** `VM_SET_MEM` (vm, bytes): vmmgr rounds the part above boot
   RAM up to whole hotplug blocks, clamps it to the region, sets memd's
-  target (`set_target`), signals the VMM (`VMM_BADGE_MEM`) and
+  target (`set_target`), signals the VMM (`badges::vmm::MEM`) and
   returns. `VM_MEM_INFO`: boot, region, target and plugged bytes, from
   memd's status page; `VM_LIST` counts plugged memory. CLI: `l4hctl mem VM
   [MB] [--wait[=SECS]]`. Lowering a target revokes nothing: the guest gives
@@ -1822,8 +1822,8 @@ extent.
 
 - **Where the list goes.** dom0 writes the list into its control data area.
   Root bounds its count and offset and copies the bytes, unread, into
-  blkd's staging buffer, as it does for `BLK_WRITE`. `BLKD_CHECK` builds and
-  checks the disk there; `BLKD_ADD` builds it again into the client's
+  blkd's staging buffer, as it does for `BLK_WRITE`. `blk::call::check` builds and
+  checks the disk there; `add` builds it again into the client's
   extent table: frames root allocates per attachment (two pages for a
   window, 27 for 4096 extents) and maps into blkd alone, at
   `extent_va(client)`. The table holds the extents sorted by start, for
@@ -1862,9 +1862,9 @@ extent.
   alignment, direction, permissions, operation and pool bounds.
 - **Who may use which sectors.** blkd alone decides: the overlap rule
   (`DiskWindow::conflicts`), dom0's boot reservations and provisioning
-  exclusion (`blk::Reservations`). Root only asks: `BLKD_CHECK` gives the
+  exclusion (`blk::Reservations`). Root only asks: `check` gives the
   errno or the slot to attach in before root allocates anything, and
-  `BLKD_ADD` repeats the check. Root parses no ranges of dom0's and keeps
+  `add` repeats the check. Root parses no ranges of dom0's and keeps
   its attachment records only for teardown and reports. blkd sends the
   commands, so a second check in root could not stop a faulty one.
 - **Volatile attachments.** `BLK_ATTACH` takes flags: `BLK_RO`, and
@@ -1927,7 +1927,7 @@ extent.
   names the first attachment, or -1); `BLK_INFO` enumerates `(vm, start,
   sectors, read-only, extent)` with a cursor: a row per window, or per
   extent of a volume in guest order, which root asks blkd for
-  (`BLKD_EXTENT`; unknown once the controller is quarantined).
+  (`blk::call::extent`; unknown once the controller is quarantined).
 
 `tests/run-sharedblk.sh` checks concurrent clients, overlap and bounds
 rejection, provisioning exclusion, destroy during I/O, read-only windows
@@ -1962,7 +1962,7 @@ firewalling belong in a VM.
   MAC entries and port rate limits are not implemented.
 - **Ports and copies.** A vNIC has TX and RX rings of 24 frame slots of
   68 KiB each, so a slot holds a whole 64 KiB TSO frame, shared by its VMM and netd, in memory of the guest's root arena; root adds
-  and removes ports with `NETD_ADD_PORT`/`NETD_REMOVE_PORT`. The guest
+  and removes ports with `net::call::add_port`/`remove_port`. The guest
   bounces buffers through its I/O pool, the VMM copies between pool and
   port slots, and netd copies slot to slot or slot to NIC DMA buffer.
 - **Offloads.** Checksum and TSO metadata pass through in the virtio-net
@@ -2432,7 +2432,7 @@ controller, one per claimed controller, and the guest forwards Linux's
   scratchpad, DCBAA and contexts, command and event rings and a pool of 256
   transfer rings of 512 TRBs; 4 MiB for QEMU's), maps BAR 0 uncached into a new usbd,
   binds the interrupt (MSI-X entry 0, or plain MSI, which Intel PCH
-  controllers have instead) to its notification, and posts `USBD_CLAIM` in
+  controllers have instead) to its notification, and posts `usb::call::claim` in
   usbd's mailbox (`l4h_host::mailbox`, §10, "Root never waits on a
   driver").
   usbd walks the extended capabilities (bounded: 256 entries inside BAR 0,
@@ -2454,13 +2454,13 @@ controller, one per claimed controller, and the guest forwards Linux's
   `idle` (halted, bus mastering off, its DMA region kept) when no guest has
   it, and `failed` if a reset or drain fails. Renesas uPD72020x without a
   firmware ROM and controllers without MSI are `unsupported`.
-- **Attach.** `VMMGR_USB_ATTACH (guest, device, controller)`: vmmgr names
+- **Attach.** `root::call::usb_attach (guest, device, controller)`: vmmgr names
   both by number; root claims the controller if needed, makes the queue
   area (101 host frames in an arena of root's own, mapped into usbd, and
   copies of them for the guest), usbd's kick, mints the guest's VMM
   notification (root's, from `GUEST_NEW`) for usbd with badge
   `vmm_badge_usb(n)`, maps the pool into the controller's IOMMU domain,
-  turns bus mastering on and posts `USBD_ATTACH` with the pool's addresses
+  turns bus mastering on and posts `usb::call::attach` with the pool's addresses
   from its own table. usbd keeps two areas (`AREAS`): while the previous
   guest's release still runs, the next guest gets the other, and its
   attach (bus mastering with it) waits for the release (or the claim)
@@ -2549,7 +2549,7 @@ controller, one per claimed controller, and the guest forwards Linux's
   already posted, so they are in memory: the pool can be reused at once,
   with or without an IOMMU), unmaps the pool from the
   domain, deletes usbd's copy of the VMM notification (usbd signals it with
-  NBSend, which an empty slot ignores) and posts `USBD_REMOVE`, after the
+  NBSend, which an empty slot ignores) and posts `usb::call::remove`, after the
   attach if usbd has not answered that yet. usbd then halts and resets the
   controller and forgets every URB; when it answers root frees the area, and the controller is `idle` for the next
   guest, which enumerates its devices again. If the reset fails root
@@ -2643,7 +2643,7 @@ pending, and so does whatever waits for it, nothing else:
   MACs in the mailbox's second page, as blkd publishes its disks. Root's
   boot, which needs both, finishes from the serve loop once they are there.
 - **blkd's** checks and attachments, provisioning writes and extent queries
-  are answered later through vmmgr (`VMMGR_PENDING`, §10.3), and through
+  are answered later through vmmgr (`root::Later::Token`, §10.3), and through
   dom0's control device, whose caller may give up and make the next
   request (§10.1). One staging user at a time per controller: another is
   `EBUSY`. A controller holds at most two of vmmgr's 256 tokens for
@@ -2687,11 +2687,12 @@ responsibility:
 | Crate | Responsibility | Boundary |
 |-------|----------------|----------|
 | `l4h-host` | Component protocols, address-space and CSpace layouts, shared data structures, bounded containers, pure validation helpers. | Independent of seL4 calls, runtime initialization and task ownership. |
+| `l4h-ipc` | The one seL4 IPC path of the protocols `l4h-host` declares: calling an endpoint (`Endpoint`), serving one (`serve`), keeping a received message across invocations (`preserving`). | Moves words between the message registers and arrays; knows no protocol. |
 | `l4h-rt` | Component entry, TLS and IPC-buffer setup, panic handling, keeper threads, optional heap, runtime conveniences. | Runs a component on resources its parent provisioned. |
 | `l4h-task` | Kernel-object and CSpace allocation, memd grant client (`memd::MemdLink`), ELF loading, component spawning, CPU topology, VSpace/scratch mappings. | Callers supply capabilities, storage, mappings and ASID assignment; boot setup, authorization and placement policy stay in the executables. |
 
-`l4h-rt` and `l4h-task` both depend on `l4h-host` and are independent of
-each other. Shared code lives in a library imported through Cargo;
+`l4h-rt` and `l4h-task` both depend on `l4h-host` and `l4h-ipc` (which
+`l4h-rt` re-exports as `l4h_rt::ipc`) and are independent of each other. Shared code lives in a library imported through Cargo;
 executables never import another executable's sources. Root and vmmgr use
 `l4h-task` to allocate objects, build address spaces and spawn components,
 each with its own CNode, allocator storage, scratch VSpace, memd endpoint
@@ -2701,42 +2702,56 @@ parent and need only `l4h-rt`. memd's allocator, which tracks physical
 blocks, ownership, retained originals and reporting, is memd's own.
 
 **Wiring declarations.** How components reach each other is declared in
-`l4h-host` as data the compiler checks, rather than spread over the
-components that mint capabilities and the loops that serve them
-(`l4h_host::wire`):
+`l4h-host` as data the compiler checks (`l4h_host::wire`), and there is
+one way to do each part of it:
 
-- **Badge spaces** (`badge_space!`, all in `l4h_host::badges`) give every
-  bit a receiver can see in a badge: an endpoint's and, since a bound
-  notification's signals arrive in the same word, its notification's. Each
-  range is a `field` (a value: `ID.get(b)`, `ID.put(v)`), a `flag` (a call's
-  bit), a `signal` or a range of `signals`. A space can include one other
-  (root's and vmmgr's include `parent`, the badges `l4h_task::component`
-  mints for a spawned component's calls and faults) and fails to compile
-  if two of its ranges overlap. Its `SIGNALS` is every notification bit,
-  so a serve loop's "was this a signal?" test cannot miss a new one, and a
-  `FailureHandler`'s `notification_badges` is the same constant. memd's
-  timer moved from bit 0 to bit 40 when its space was declared: bit 0 lay
-  in the VMMs' guest field, told apart only by the order of memd's tests.
-- **Protocols** (`protocol!`) give an endpoint's calls: label, typed
-  arguments and reply (`wire::Wire`: integers that reject a word too wide
-  instead of truncating it, arrays, pairs, bounded lists, structs declared
-  with `wire_struct!`), and the senders that may make each. A protocol
-  generates the decoded `Request` enum, a `Server` trait with a method per
-  call, `serve`, which decodes, refuses senders the declaration does not
-  allow (`EINVAL`), runs the method and encodes the reply, and a `Client`
-  trait with a method per call for anything that implements `wire::Call`
-  (`l4h_task::memd::MemdLink`, `l4h_rt::call::Endpoint`). Arguments leave the
-  message registers before a handler runs and the reply goes there after
-  it returns, so no handler's invocations can overwrite either. The reply's
-  first word is 0 or an errno; a keeper's `u64::MAX` is `wire::FAILED`.
-  Labels must be distinct and calls must fit the IPC buffer, at compile
-  time.
-
-memd's calls (`l4h_host::memd::call`) are declared so; root's and vmmgr's
-endpoint and notification badges are in their spaces. The other endpoint
-protocols (root's calls from trustd and vmmgr, vmmgr's from the VMMs) and
-the drivers' mailboxes, whose requests have the same label-and-words
-shape, are still constants and comments.
+- **Badges.** Every receiver's badge bits are a badge space
+  (`badge_space!`), all in `l4h_host::badges`: root's, vmmgr's, memd's,
+  the VMM's, trustd's two notifications and its flags endpoint's, logd's,
+  and the drivers', which include `driver` (root's `CALL`). A range is a
+  `field` (a value: `ID.get(b)`, `ID.put(v)`), a `flag` (a call's bit), a
+  `signal` or a range of `signals` (`LINK.nth(l)`). A space can include one
+  other (root's and vmmgr's include `parent`, the badges `l4h_task`'s
+  `component_badge` mints for a spawned component's calls and faults) and
+  fails to compile if two ranges overlap. Its `SIGNALS` is every
+  notification bit, which a serve loop tests and a `FailureHandler`'s
+  `notification_badges` is. Whoever mints and whoever tests a badge name
+  the space's constant; there are no other names for them. The guest
+  vCPUs' badges are the guest ABI's (`L4H_BADGE_*`). memd's timer moved
+  from bit 0 to bit 40 when its space was declared (bit 0 lay in the VMMs'
+  guest field), and trustd's kick shares guest 63's bit with the relay
+  (`trust::RELAY_BADGE`) by design, as one range.
+- **Protocols.** Every request one component makes of another is a call
+  of a protocol (`protocol!`): its label, typed arguments and reply
+  (`wire::Wire`: integers that reject a word too wide instead of
+  truncating it, booleans that must be 0 or 1, arrays, pairs, bounded
+  lists, `Tail`s, structs declared with `wire_struct!`, `root::Later`),
+  and the senders that may make it. Each protocol is `<module>::call` and
+  its callers `<module>::Sender`, made from the badge: memd's endpoint
+  (`memd`), root's (`root`: trustd's and vmmgr's calls), vmmgr's (`vmmgr`:
+  the VMMs'), trustd's flags endpoint (`trust`), the VMM's (`hypercall`:
+  the guest's, whose side is `abi.h`), and the drivers' mailboxes (`blk`,
+  `net`, `usb`, sender `wire::RootOnly`). A protocol generates the decoded
+  `Request`, a `Server` trait with a method per call, `serve` (decode,
+  refuse what the declaration does not allow with `EINVAL`, run, encode),
+  a `Client` trait with a method per call, and `reply::<Call>` for a
+  reply taken later. Labels must be distinct and calls must fit the IPC
+  buffer (a mailbox's `ARGS` and `ANSWER`), at compile time. A reply's
+  first word is 0 or an errno and its value follows; a failed server
+  answers `wire::FAILED` (its keeper, or l4h-rt's mailbox `fail`), and a
+  method that must leave its caller blocked returns `wire::NO_REPLY`.
+- **Transports.** An endpoint's calls go through `l4h-ipc`: clients call
+  an `l4h_ipc::Endpoint` (or `MemdLink`, which is one with exchange
+  slots), servers answer with `l4h_ipc::serve`, which takes the arguments
+  out of the message registers before the handler runs and puts the reply
+  there after it returns, so no handler's invocations can overwrite
+  either; work between receiving a message and serving it runs in
+  `l4h_ipc::preserving`. A driver's mailbox carries the same protocols
+  without IPC: root posts a typed `Request` (`Mailbox::send`) and decodes
+  each answer by its call's reply type; the driver answers with
+  `l4h_rt::mailbox::serve`, which reads and writes the ring and never the
+  registers. Capabilities still cross in exchange slots, which each call's
+  declaration names.
 
 **Serial output** goes through shared memory to l4h-logd (§10.4), and root
 drives COM1 input for the monitor. The port takes about 11 KB/s, so prints
@@ -2784,7 +2799,7 @@ into the guest's boot blocks, builds the kernel VSpace and
 `struct l4h_bootinfo`, then starts vCPU0 at the entry point with `rdi`
 (`x0` on aarch64) pointing at boot info. It holds:
 
-- a magic number and the guest ABI version (`L4H_ABI_VERSION`, currently 7);
+- a magic number and the guest ABI version (`L4H_ABI_VERSION`, currently 8);
 - the guest id;
 - RAM size, direct-map base (`ram_base_va`), block and boot-block counts;
 - the kernel's end and the initramfs's GPA and size;
@@ -2856,7 +2871,7 @@ settings.
   memory and attestation devices, all disk windows and NICs; oversized plans
   stop boot, and neither list is truncated.
 - Root has blkd reserve every boot disk range before attaching it
-  (`BLKD_RESERVE`); blkd keeps those reservations across dom0 restarts. If an attachment fails, dom0 gets a
+  (`blk::call::reserve`); blkd keeps those reservations across dom0 restarts. If an attachment fails, dom0 gets a
   zero-capacity, read-only virtio-blk device in that position, which fails
   all I/O without a driver channel or DMA mappings, so other disks keep their
   names and dom0 can still boot. The range stays reserved against
@@ -2950,7 +2965,7 @@ holding SC_U.
   create/destroy leaves free memory unchanged (`tests/run-ctltest.sh`).
 - **Disk detach.** A disk window is detached only when its guest is
   destroyed, and the shared controller keeps running. Root asks blkd to
-  drain the client (`BLKD_REMOVE`): every request it submitted completes
+  drain the client (`blk::call::remove`): every request it submitted completes
   before the pool can be reused, then root unmaps the pool from the
   controller's IOMMU domain. Clearing bus mastering alone would not be a
   drain, since a device can complete a command it already started. If blkd
@@ -3028,7 +3043,7 @@ The chain has four links.
      request into the device page, then a new sequence number, and signals
      the kick, whose badge is the guest's id, so trustd answers a guest only
      about itself. trustd answers in the page, sets `done`, and asks root
-     (`ROOT_CALL_ATTEST_DONE`) to have the device's event raised on vCPU 0
+     (`root::call::attest_done`) to have the device's event raised on vCPU 0
      (root tells vmmgr through its events page). Linux sleeps the caller
      meanwhile.
    - trustd owns the 64 request pages, one per guest id, and root lends one
@@ -3120,8 +3135,8 @@ checking taint alone leaves a session key exposed after its report.
   the registry at start. An entry for another instance reads as empty; a
   higher-instance request replaces an entry, an older one gets `-ESRCH`.
   Destruction does not clear flags.
-- **Callers.** The flags endpoint has badged callers: `FLAGS_ROOT` (used by
-  the host actor) can ACT on defined host bits, and `FLAGS_TRUSTD` (guest
+- **Callers.** The flags endpoint has badged callers: `trust::Sender::Root` (used by
+  the host actor) can ACT on defined host bits, and `trust::Sender::Trustd` (guest
   requests) can ACT on guest bits and SEAL defined host or userspace bits.
   Kernel bits cannot be sealed. All arguments are validated before any
   entry changes. Requests are MR0 op, MR1 id, MR2 instance, MR3–6 bitmap,
@@ -3173,7 +3188,7 @@ a secondary's comes from RDRAND, and partition 0's trustd quotes it and
 runs the secondary's ActivateCredential calls (the relay):
 
 - **Transport.** trustd writes a request into a relay page it shares with
-  root and calls root (`ROOT_CALL_RELAY`), which sends it over the control
+  root and calls root (`root::call::relay`), which sends it over the control
   channel (`MSG_TPM_REQUEST`); the other root writes it into the sender's
   inbox slot there and kicks trustd (badge bit 63, also guest 63's kick,
   which is only a hint). Answers go back as `MSG_TPM_REPLY`. Channels
@@ -3215,7 +3230,7 @@ runs the secondary's ActivateCredential calls (the relay):
   trustd loads them into the `acpi` crate's interpreter, finds the
   `MSFT0101` device whose `_DSM` offers that function, runs only its and its
   parents' `_INI`, and calls the `_DSM` after setting the start bit.
-  - Accesses outside trustd's own TPM ranges go to root (`ROOT_CALL_HW`),
+  - Accesses outside trustd's own TPM ranges go to root (`root::call::hw`),
     which refuses RAM, device memory in use, I/O ports already handed out,
     and config writes to the PCI functions the host drives; refused reads
     return all ones.
@@ -3303,8 +3318,8 @@ root.
   control ops on the host's disks, switches and NICs, reset and RTC as their
   `CTL_*` number and six arguments, with data returned in a result page.
   Root answers every call at once; one that waits for blkd answers
-  `VMMGR_PENDING` and a token, and root sets the token's bit in the events
-  page when it has the answer, which `VMMGR_RESULT` then gives. vmmgr goes
+  `root::Later::Token` and a token, and root sets the token's bit in the events
+  page when it has the answer, which `root::call::result` then gives. vmmgr goes
   on meanwhile: a guest whose disk is pending gets no other device, and
   does not start, until it is answered; dom0's boot disks are attached one
   after another this way.

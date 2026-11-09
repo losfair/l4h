@@ -260,6 +260,13 @@ impl<T: Wire, const N: usize> Wire for ArrayVec<T, N> {
 #[derive(Clone, Debug, Default)]
 pub struct Tail<T, const N: usize>(pub ArrayVec<T, N>);
 
+impl<T: PartialEq, const N: usize> PartialEq for Tail<T, N> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.as_slice() == other.0.as_slice()
+    }
+}
+impl<T: Eq, const N: usize> Eq for Tail<T, N> {}
+
 impl<T: Wire, const N: usize> Wire for Tail<T, N> {
     const MAX_WORDS: usize = N * T::MAX_WORDS;
     fn put(&self, out: &mut [u64]) -> usize {

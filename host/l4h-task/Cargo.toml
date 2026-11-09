@@ -7,3 +7,4 @@ version.workspace = true
 [dependencies]
 sel4.workspace = true
 l4h-host = { path = "../l4h-host" }
+l4h-ipc = { path = "../l4h-ipc" }

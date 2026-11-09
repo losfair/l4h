@@ -29,7 +29,7 @@ typedef int32_t l4h_s32;
 typedef int64_t l4h_s64;
 #endif
 
-#define L4H_ABI_VERSION 7
+#define L4H_ABI_VERSION 8
 
 /* ------------------------------------------------------------------------
  * Guest CSpace layout
@@ -1032,10 +1032,15 @@ struct l4h_usb_event {
 /* L4H_HC_DEV_WRITE ops of an L4H_DEV_USB device. */
 #define L4H_USB_DEVOP_IRQ_VCPU  5       /* MR2 = vCPU of the device's event */
 
+/*
+ * Hypercalls, on L4H_SLOT_HYP_EP.  A reply's MR0 is 0 or an errno, its
+ * value follows in MR1 (host/l4h-host/src/hypercall.rs declares the host's
+ * side).  L4H_HC_POWER is not answered.
+ */
 enum l4h_hypercall {
 	L4H_HC_POWER = 2,         /* MR0 = L4H_POWER_* */
-	L4H_HC_DEV_WRITE = 3,       /* MR0 = device index, MR1 = L4H_VIRTIO_OP_*, MR2.. = args */
-	L4H_HC_GET_TIME = 6,        /* returns MR0 = wall clock ns since epoch */
+	L4H_HC_DEV_WRITE = 3,       /* MR0 = device index, MR1 = L4H_VIRTIO_OP_*, MR2, MR3 = args; returns the op's result */
+	L4H_HC_GET_TIME = 6,        /* returns wall clock ns since epoch */
 };
 
 /* ------------------------------------------------------------------------

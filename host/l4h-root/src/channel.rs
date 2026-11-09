@@ -30,7 +30,6 @@ use crate::Host;
 use crate::devmem::DevMem;
 use crate::mem::Alloc;
 
-use l4h_host::badges::root::CHANNEL as CHANNEL_BADGE;
 
 /// The largest control message (trustd's, with its header).
 pub const MSG_MAX: usize = 9216 + 64;
@@ -76,7 +75,7 @@ impl Channels {
         };
         let badged = alloc.slots.alloc();
         crate::component::abs_of(sel4::init_thread::Slot::<cap_type::Null>::from_index(badged).cap())
-            .mint(&crate::component::abs_of(ntfn), sel4::CapRights::write_only(), CHANNEL_BADGE)
+            .mint(&crate::component::abs_of(ntfn), sel4::CapRights::write_only(), l4h_host::badges::root::CHANNEL)
             .expect("doorbell badge");
         let badged = sel4::init_thread::Slot::<cap_type::Notification>::from_index(badged).cap();
         for ch in d.channels() {

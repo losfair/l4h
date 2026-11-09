@@ -90,12 +90,10 @@ impl Relay {
     /// bytes, to partition `to`.  False if root could not.
     pub fn send(&mut self, to: u32, head: RelayHeader) -> bool {
         unsafe { ((trust::RELAY_VA + RELAY_SLOT_HEADER) as *mut RelayHeader).write_volatile(head) };
-        sel4::with_ipc_buffer_mut(|b| {
-            b.msg_regs_mut()[0] = to as u64;
-            b.msg_regs_mut()[1] = (RELAY_HEADER + head.len as usize) as u64;
-        });
-        let r = cap::<cap_type::Endpoint>(host::SLOT_ROOT_EP).call(sel4::MessageInfo::new(host::ROOT_CALL_RELAY, 0, 0, 2));
-        r.length() >= 1 && sel4::with_ipc_buffer(|b| b.msg_regs()[0]) == 0
+        use l4h_rt::host::root::call::Client;
+        l4h_rt::ipc::Endpoint(cap::<cap_type::Endpoint>(host::SLOT_ROOT_EP))
+            .relay(to, RELAY_HEADER + head.len as usize)
+            .is_ok()
     }
 
     /// What partition `from` sent since the last call, if anything (and

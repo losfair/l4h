@@ -486,8 +486,8 @@ impl Guest {
         let kick = match kind {
             // Control requests go to vmmgr itself, not through the VMM.
             DevKind::Ctl => (crate::slot::NTFN.cap(), l4h_host::badges::vmmgr::CTL_KICK),
-            DevKind::Mem => (self.vmm_ntfn, host::VMM_BADGE_MEM_REQ),
-            _ => (self.vmm_ntfn, host::VMM_BADGE_KICK),
+            DevKind::Mem => (self.vmm_ntfn, l4h_host::badges::vmm::MEM_REQ),
+            _ => (self.vmm_ntfn, l4h_host::badges::vmm::KICK),
         };
         self.add_device_with(alloc, kind, page, kick)
     }
@@ -608,7 +608,7 @@ impl Guest {
         alloc.slots.free(s);
     }
 
-    /// Signal the guest's l4h-vmm with `badge` (host::VMM_BADGE_*).
+    /// Signal the guest's l4h-vmm with `badge` (badges::vmm).
     pub fn signal_vmm(&self, alloc: &mut Alloc, badge: u64) {
         let s = alloc.slots.alloc();
         let badged = self_cap::<cap_type::Notification>(s);
@@ -1091,7 +1091,7 @@ pub fn create(
         abi::SLOT_HYP_EP,
         g.vmm_ep,
         sel4::CapRightsBuilder::none().write(true).grant_reply(true).build(),
-        host::VMM_BADGE_HYPERCALL,
+        l4h_host::badges::vmm::HYPERCALL,
     );
 
     // ---- I/O pool: root's physically contiguous memory, whose frames we
@@ -1106,7 +1106,7 @@ pub fn create(
     g.instance = new.instance;
     g.vmm_ntfn = new.vmm_ntfn;
     // The vCPUs' console output rings (in their event pages) are l4h-vmm's.
-    g.give_badged(abi::SLOT_CONSOLE_KICK, g.vmm_ntfn, CapRights::write_only(), host::VMM_BADGE_CONSOLE);
+    g.give_badged(abi::SLOT_CONSOLE_KICK, g.vmm_ntfn, CapRights::write_only(), l4h_host::badges::vmm::CONSOLE);
     g.pool = IoPool { gpa: pool_gpa, size: cfg.io_pool, frames: new.pool_frames, radix: pool_radix };
     let tmp = alloc.slots.alloc();
     let keep = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: pool_radix });

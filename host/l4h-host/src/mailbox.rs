@@ -2,7 +2,7 @@
 //! rings and device memory, so root must assume its code can be an
 //! attacker's, and an attacker's driver could leave a request unanswered
 //! for good.  Root never waits for one: it posts requests in a ring in a
-//! page the two share, signals the driver's notification with BADGE_CALL
+//! page the two share, signals the driver's notification with badges::driver::CALL
 //! and goes back to its loop.  The driver answers them in order, counts
 //! them in `done` and signals SLOT_MAILBOX_DONE; root finishes what it was
 //! doing then (l4h-root's mailbox.rs).  A request a driver never answers
@@ -22,9 +22,6 @@ pub const PUBLISHED_OFFSET: usize = 2 * 4096;
 const _: () = assert!(MAILBOX_VA >= crate::serial::VA + crate::serial::PAGES * 4096
     && MAILBOX_VA + MAILBOX_PAGES * 4096 < crate::KEEPER_STACK_TOP - crate::KEEPER_STACK_SIZE);
 
-/// Badge bit of root's requests on the driver's notification
-/// (badges::driver, which every driver's space includes).
-pub const BADGE_CALL: u64 = crate::badges::driver::CALL;
 
 /// The driver's capability to signal root that it answered.
 pub const SLOT_MAILBOX_DONE: u64 = 11;

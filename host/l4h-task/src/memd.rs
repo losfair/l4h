@@ -78,10 +78,6 @@ impl MemdLink {
 /// memd's calls (l4h_host::memd::call) go over its endpoint.
 impl Call for MemdLink {
     fn ipc(&self, label: u64, args: &[u64], reply: &mut [u64]) -> usize {
-        sel4::with_ipc_buffer_mut(|b| b.msg_regs_mut()[..args.len()].copy_from_slice(args));
-        let info = self.ep.call(sel4::MessageInfo::new(label, 0, 0, args.len()));
-        let n = info.length().min(reply.len());
-        sel4::with_ipc_buffer(|b| reply[..n].copy_from_slice(&b.msg_regs()[..n]));
-        n
+        l4h_ipc::Endpoint(self.ep).ipc(label, args, reply)
     }
 }

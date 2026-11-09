@@ -55,6 +55,7 @@ use sel4_root_task::{Never, root_task};
 
 use l4h_host as host;
 use l4h_host::badges::root as recv;
+use l4h_host::root::call as root_call;
 use l4h_host::fixed::ArrayVec;
 use l4h_task::{mem, topology, vspace, window};
 
@@ -747,14 +748,6 @@ fn watchdog_dump(h: &Host) {
     );
 }
 
-pub fn mr(i: usize) -> u64 {
-    sel4::with_ipc_buffer(|b| b.msg_regs()[i])
-}
-
-pub fn set_mr(i: usize, v: u64) {
-    sel4::with_ipc_buffer_mut(|b| b.msg_regs_mut()[i] = v)
-}
-
 /// Serve calls from host components and faults of guest kernels.
 /// The serve loop's reply object, made from an Untyped of its own so that
 /// one left unanswered can be replaced without using more memory.
@@ -837,8 +830,8 @@ fn serve(h: &mut Host, reply_slot: ReplySlot, modules: &bootmod::Modules) -> ! {
             None
         };
         match resp {
-            Some(len) => {
-                (info, badge) = hyp_ep.reply_recv(sel4::MessageInfo::new(0, 0, 0, len), reply);
+            Some(answer) => {
+                (info, badge) = hyp_ep.reply_recv(answer, reply);
             }
             None => {
                 // A reply object left unanswered (a faulted or stopped
@@ -852,9 +845,9 @@ fn serve(h: &mut Host, reply_slot: ReplySlot, modules: &bootmod::Modules) -> ! {
     }
 }
 
-/// A call or fault from a host component.  Sets the reply's message
-/// registers and returns its length, or None to leave the caller blocked.
-fn component_call(h: &mut Host, badge: u64, info: &sel4::MessageInfo) -> Option<usize> {
+/// A call or fault from a host component: its reply (its words in the
+/// message registers), or None to leave the caller blocked.
+fn component_call(h: &mut Host, badge: u64, info: &sel4::MessageInfo) -> Option<sel4::MessageInfo> {
     let id = recv::ID.get(badge) as u32;
     if badge & recv::FAULT != 0 {
         let fault = sel4::with_ipc_buffer(|b| sel4::Fault::new(b, info));
@@ -862,21 +855,11 @@ fn component_call(h: &mut Host, badge: u64, info: &sel4::MessageInfo) -> Option<
         trustd::fault(h, id);
         return None;
     }
-    let reply = |v: u64| {
-        set_mr(0, v);
-        Some(1)
-    };
-    match info.label() {
-        host::ROOT_CALL_HW if id == trustd::TRUSTD_ID => reply(trustd::hw(h)),
-        host::ROOT_CALL_RELAY if id == trustd::TRUSTD_ID => reply(trustd::relay(h)),
-        host::ROOT_CALL_ATTEST_DONE if id == trustd::TRUSTD_ID => {
-            trustd::done(h, mr(0) as usize);
-            reply(0)
-        }
-        label if id == l4h_host::vmmgr::VMMGR_ID => Some(vmmgr::call(h, label)),
-        other => {
-            log!("l4h-root: component {:#x}: unknown call {}", id, other);
-            reply(u64::MAX)
+    match host::root::Sender::of_id(id) {
+        Some(from) => l4h_ipc::serve(info, |label, args, out| root_call::serve(&mut vmmgr::Calls(h), label, args, from, out)),
+        None => {
+            log!("l4h-root: component {:#x}: unknown call {}", id, info.label());
+            Some(l4h_ipc::refuse())
         }
     }
 }

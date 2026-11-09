@@ -11,7 +11,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use sel4::{CapRights, VmAttributes, cap, cap_type};
 
-use l4h_host::badges::root::MAILBOX as MAILBOX_BADGE;
+use l4h_host::badges;
 use l4h_host::mailbox::{self as mb, ANSWER, ARGS, MAILBOX_PAGES, MAILBOX_VA, PUBLISHED_OFFSET, RING};
 
 use crate::component::{Component, abs_of};
@@ -42,7 +42,7 @@ pub fn init(ntfn: cap::Notification) {
 pub struct Mailbox {
     page: *const mb::Mailbox,
     published: usize,
-    /// The driver's notification, badged BADGE_CALL.
+    /// The driver's notification, badged badges::driver::CALL.
     kick: cap::Notification,
     /// Requests posted and answered, as root counts them: the driver
     /// can write over the page's.
@@ -64,10 +64,10 @@ impl Mailbox {
                 CapRights::read_write(), VmAttributes::DEFAULT);
         }
         let ntfn = cap::Notification::from_bits(NTFN.load(Ordering::Relaxed));
-        comp.give_badged(mb::SLOT_MAILBOX_DONE, ntfn, CapRights::write_only(), MAILBOX_BADGE);
+        comp.give_badged(mb::SLOT_MAILBOX_DONE, ntfn, CapRights::write_only(), badges::root::MAILBOX);
         let slot = alloc.slots.alloc();
         let kick = sel4::init_thread::Slot::<cap_type::Notification>::from_index(slot).cap();
-        abs_of(kick).mint(&abs_of(comp.ntfn), CapRights::write_only(), mb::BADGE_CALL).expect("mailbox kick");
+        abs_of(kick).mint(&abs_of(comp.ntfn), CapRights::write_only(), badges::driver::CALL).expect("mailbox kick");
         Mailbox { page: base as *const mb::Mailbox, published: base + PUBLISHED_OFFSET, kick, posted: 0, answered: 0 }
     }
 
@@ -92,7 +92,7 @@ impl Mailbox {
 
     /// Post a request: its number, or None if the ring is full (a driver
     /// that does not answer).
-    pub fn post(&mut self, label: u64, args: &[u64]) -> Option<u64> {
+    fn post(&mut self, label: u64, args: &[u64]) -> Option<u64> {
         if !self.room() {
             return None;
         }

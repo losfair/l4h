@@ -451,7 +451,7 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
                 }
                 // Before it runs, its VMM reads the target when it starts.
                 if g.vmm.is_some() {
-                    g.signal_vmm(&mut h.alloc, host::VMM_BADGE_MEM);
+                    g.signal_vmm(&mut h.alloc, l4h_host::badges::vmm::MEM);
                 }
                 Ok(())
             })

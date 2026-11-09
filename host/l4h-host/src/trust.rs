@@ -1,8 +1,8 @@
 //! l4h-trustd: the attestation service (DESIGN.md §10.2).  Each guest has
 //! an attestation device (L4H_DEV_ATTEST): a request page, which trustd
 //! maps at page_va(guest), and the kick notification, badged with
-//! kick_badge(guest).  trustd answers in the page and has root raise the
-//! device's event (ROOT_CALL_ATTEST_DONE).  l4h-root tells trustd about
+//! badges::trustd_kick::GUEST bit guest.  trustd answers in the page and
+//! has root raise the device's event (root::call::attest_done).  l4h-root tells trustd about
 //! guests through the registry page, which it writes and trustd only
 //! reads. Root waits only for trustd's passive flags thread, never for
 //! its main thread, whose TPM commands can take seconds.
@@ -77,7 +77,7 @@ pub const PAGES_VA: usize = crate::SHARED_VA + 0x1000;
 pub const fn page_va(guest: usize) -> usize {
     PAGES_VA + guest * 4096
 }
-/// The kick notification: guest g signals it with kick_badge(g).  The
+/// The kick notification: guest g signals it with badges::trustd_kick::GUEST bit g.  The
 /// bound notification (SLOT_NTFN) is trustd's timer.
 pub const SLOT_KICK: u64 = crate::SLOT_FIRST_FREE;
 pub const SLOT_FLAGS_EP: u64 = SLOT_KICK + 1;
@@ -101,7 +101,7 @@ pub const FLAGS_SIZE: usize = 8192;
 ///
 /// The relay pages are slots of RELAY_SLOT_SIZE: a `RelaySlot` header,
 /// then a message.  trustd writes a message to the outbox, slot 0 at
-/// RELAY_VA, and calls root (ROOT_CALL_RELAY), which copies it to the
+/// RELAY_VA, and calls root (root::call::relay), which copies it to the
 /// channel.  Root writes what comes from partition k into inbox slot k
 /// (relay_slot_va(k), seqlocked) and signals the kick with RELAY_BADGE.
 /// While a secondary waits for an answer, it sets the outbox's `wake`, and
@@ -121,8 +121,7 @@ pub const MAX_PARTITIONS: usize = 8;
 pub const RELAY_MSG_MAX: usize = 9216;
 /// Also guest 63's kick bit: kicks are only hints (trustd answers a guest
 /// whose page has a new seq), so trustd looks at both.
-pub const RELAY_BADGE: u64 = 1 << 63;
-const _: () = assert!(RELAY_BADGE == kick_badge(MAX_RECORDS - 1));
+pub const RELAY_BADGE: u64 = crate::badges::trustd_kick::GUEST.nth(MAX_RECORDS - 1);
 const _: () = assert!(FLAGS_WRITE_VA + FLAGS_SIZE <= RELAY_VA && RELAY_VA + RELAY_PAGES * 4096 <= AML_VA);
 const _: () = assert!(RELAY_MSG_MAX + core::mem::size_of::<RelaySlot>() <= RELAY_SLOT_SIZE);
 
@@ -158,14 +157,53 @@ pub const RELAY_KEY: u32 = 1;
 /// ActivateCredential: u32 blob length, the blob, the secret; the reply
 /// is the credential.
 pub const RELAY_ACTIVATE: u32 = 2;
-pub const FLAGS_ROOT: u64 = 1;
-pub const FLAGS_TRUSTD: u64 = 2;
-pub const FLAGS_READY: u64 = 0;
+/// The ops of FlagsEntry::update: the labels of `call`'s act and
+/// seal.
 pub const FLAGS_ACT: u64 = 1;
 pub const FLAGS_SEAL: u64 = 2;
-pub const fn kick_badge(guest: usize) -> u64 {
-    1 << guest
+
+/// Who calls trustd's flags endpoint, from its badge: root (and vmmgr,
+/// with root's capability, for the console), or trustd's main thread for
+/// guests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sender {
+    Root,
+    Trustd,
 }
+
+impl Sender {
+    pub const fn of_badge(badge: u64) -> Option<Sender> {
+        match badge {
+            crate::badges::flags::ROOT => Some(Sender::Root),
+            crate::badges::flags::TRUSTD => Some(Sender::Trustd),
+            _ => None,
+        }
+    }
+
+    pub const fn badge(self) -> u64 {
+        match self {
+            Sender::Root => crate::badges::flags::ROOT,
+            Sender::Trustd => crate::badges::flags::TRUSTD,
+        }
+    }
+}
+
+crate::protocol! {
+    /// trustd's flags endpoint (crate::wire::protocol), served by a passive
+    /// thread with no heap, TPM, AML or calls back to root: a caller
+    /// donates only the time for one request.  FlagsEntry::update checks
+    /// what each caller may set; a reply's first word is 0 or an errno.
+    pub mod call (from: Sender) {
+        /// Root's start-up handshake: the thread is waiting.
+        Ready / ready = 0 from [Root] () -> ();
+        /// Taint guest `guest`'s `bits` (and seal them with abi::ACT_SEAL in
+        /// `flags`), for `instance`: its flags.
+        Act / act = 1 from [Root, Trustd] (guest: usize, instance: u64, bits: [u64; 4], flags: u64) -> Flags;
+        /// Seal guest `guest`'s `bits`, for `instance`: its flags.
+        Seal / seal = 2 from [Trustd] (guest: usize, instance: u64, bits: [u64; 4], flags: u64) -> Flags;
+    }
+}
+const _: () = assert!(FLAGS_ACT == 1 && FLAGS_SEAL == 2);
 /// Most ACPI table bytes root gives trustd.
 pub const AML_MAX: usize = 4 << 20;
 
@@ -199,6 +237,20 @@ pub struct Flags {
     pub instance: u64,
     pub taint: [u64; 4],
     pub seal: [u64; 4],
+}
+
+impl crate::wire::Wire for Flags {
+    const MAX_WORDS: usize = 9;
+    fn put(&self, out: &mut [u64]) -> usize {
+        out[0] = self.instance;
+        out[1..5].copy_from_slice(&self.taint);
+        out[5..9].copy_from_slice(&self.seal);
+        9
+    }
+    fn get(words: &[u64]) -> Option<(Self, usize)> {
+        let w = words.get(..9)?;
+        Some((Flags { instance: w[0], taint: w[1..5].try_into().ok()?, seal: w[5..9].try_into().ok()? }, 9))
+    }
 }
 
 impl Flags {
@@ -263,12 +315,12 @@ impl FlagsEntry {
     ///
     /// # Safety
     /// There must be exactly one writer of this entry.
-    pub unsafe fn update(&self, badge: u64, op: u64, instance: u64, bits: [u64; 4], flags: u64) -> Result<Flags, i64> {
+    pub unsafe fn update(&self, from: Sender, op: u64, instance: u64, bits: [u64; 4], flags: u64) -> Result<Flags, i64> {
         let sealable = bits[0] & !abi::FLAGS_HOST_DEFINED == 0 && bits[1] == 0;
-        let allowed = match (badge, op) {
-            (FLAGS_ROOT, FLAGS_ACT) => bits[0] & !abi::FLAGS_HOST_DEFINED == 0 && bits[1..] == [0; 3] && flags == 0,
-            (FLAGS_TRUSTD, FLAGS_ACT) => bits[0] == 0 && (flags & abi::ACT_SEAL as u64 == 0 || sealable),
-            (FLAGS_TRUSTD, FLAGS_SEAL) => sealable && flags == 0,
+        let allowed = match (from, op) {
+            (Sender::Root, FLAGS_ACT) => bits[0] & !abi::FLAGS_HOST_DEFINED == 0 && bits[1..] == [0; 3] && flags == 0,
+            (Sender::Trustd, FLAGS_ACT) => bits[0] == 0 && (flags & abi::ACT_SEAL as u64 == 0 || sealable),
+            (Sender::Trustd, FLAGS_SEAL) => sealable && flags == 0,
             _ => false,
         };
         if !allowed || flags & !(abi::ACT_SEAL as u64) != 0 || instance == 0 { return Err(22); }
@@ -294,13 +346,8 @@ impl FlagsEntry {
 const _: () = assert!(core::mem::size_of::<FlagsEntry>() == 128);
 const _: () = assert!(MAX_RECORDS * core::mem::size_of::<FlagsEntry>() == FLAGS_SIZE);
 
-/// trustd -> root (ROOT_CALL_HW): an access the firmware's AML makes
-/// outside trustd's own ranges.  MR0 = HW_*, MR1 = physical address, I/O
-/// port or PCI function (bus << 8 | device << 3 | function), MR2 = PCI
-/// config offset, MR3 = width in bytes, MR4 = the value to write.  Returns
-/// the value read; root refuses RAM, memory and ports in use, and the
-/// config space of the PCI functions the host drives (reads give all ones,
-/// writes are dropped).
+/// The `op` of trustd's root::call::hw: an access the firmware's AML
+/// makes outside trustd's own ranges.
 pub const HW_MEM_READ: u64 = 0;
 pub const HW_MEM_WRITE: u64 = 1;
 pub const HW_IO_READ: u64 = 2;

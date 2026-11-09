@@ -273,14 +273,18 @@ void l4h_yield(void)
 unsigned long l4h_hypercall(unsigned long label, unsigned long *mrs, int n_in, int n_out)
 {
 	seL4_MessageInfo_t info;
-	int i;
+	int i, len;
 
 	for (i = 0; i < n_in; i++)
 		seL4_SetMR(i, mrs[i]);
 	info = seL4_Call(L4H_CPTR(L4H_SLOT_HYP_EP), seL4_MessageInfo_new(label, 0, 0, n_in));
-	for (i = 0; i < n_out && i < (int)seL4_MessageInfo_get_length(info); i++)
-		mrs[i] = seL4_GetMR(i);
-	return seL4_MessageInfo_get_length(info) ? seL4_GetMR(0) : 0;
+	len = seL4_MessageInfo_get_length(info);
+	/* MR0 is 0 or an errno, the values follow: an error is all ones. */
+	if (!len || seL4_GetMR(0))
+		return ~0UL;
+	for (i = 0; i < n_out && i + 1 < len; i++)
+		mrs[i] = seL4_GetMR(i + 1);
+	return len > 1 ? seL4_GetMR(1) : 0;
 }
 
 /* Record sequence numbers, shared by the vCPUs: the host prints the

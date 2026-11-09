@@ -32,7 +32,7 @@ pub mod sel4 {
         pub fn inner_mut(&mut self) -> &mut Self { self }
         #[allow(non_snake_case)]
         pub fn seL4_TCB_SetTimer(&mut self, tcb: u64, deadline: u64, badge: u64) -> u64 {
-            assert_eq!((tcb, badge), (crate::host::SLOT_TCB, crate::host::VMM_BADGE_CONSOLE));
+            assert_eq!((tcb, badge), (crate::host::SLOT_TCB, crate::host::badges::vmm::CONSOLE));
             crate::TIMER.store(deadline, crate::Ordering::Relaxed);
             crate::ARMS.lock().unwrap().push(deadline);
             0

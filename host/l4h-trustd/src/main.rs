@@ -656,8 +656,8 @@ fn answer(id: usize, seq: u32, result: Result<&[u8], i64>) {
         fence(Ordering::Release);
         addr_of_mut!((*p).done).write_volatile(seq);
     }
-    sel4::with_ipc_buffer_mut(|b| b.msg_regs_mut()[0] = id as u64);
-    cap::<cap_type::Endpoint>(host::SLOT_ROOT_EP).call(sel4::MessageInfo::new(host::ROOT_CALL_ATTEST_DONE, 0, 0, 1));
+    use l4h_rt::host::root::call::Client;
+    let _ = l4h_rt::ipc::Endpoint(cap::<cap_type::Endpoint>(host::SLOT_ROOT_EP)).attest_done(id);
 }
 
 fn main(info: &'static Info) -> ! {
@@ -758,7 +758,7 @@ fn main(info: &'static Info) -> ! {
             let result = execute(&mut state, starting.is_some(), id, seq, &r, last, hz, relay.as_mut(), &mut out);
             match result {
                 Err(DEFER) => {
-                    deferred |= trust::kick_badge(id);
+                    deferred |= host::badges::trustd_kick::GUEST.nth(id);
                     continue;
                 }
                 Err(PENDING) => continue,

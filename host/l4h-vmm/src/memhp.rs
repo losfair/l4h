@@ -7,7 +7,7 @@ use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{Ordering, fence};
 
 use l4h_abi as abi;
-use l4h_rt::call::Endpoint;
+use l4h_rt::ipc::Endpoint;
 use l4h_rt::host::memd::call::Client;
 use l4h_rt::host;
 use l4h_rt::{cap, sel4};

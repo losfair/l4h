@@ -6,7 +6,7 @@ use core::sync::atomic::Ordering;
 
 use sel4::{CapRights, ObjectBlueprint, VmAttributes, cap, cap_type};
 
-use l4h_host::badges::{self, root::LINK as LINK_BADGES};
+use l4h_host::badges;
 use l4h_host::net::call::Request;
 use l4h_host::fixed::ArrayVec;
 use l4h_host::{self as host, net};
@@ -484,7 +484,7 @@ impl Netd {
             net::NETD_SLOT_CLIENT_BASE + p as u64,
             g.vmm_ntfn,
             CapRights::write_only(),
-            host::VMM_BADGE_DONE,
+            badges::vmm::DONE,
         );
         let kick_slot = alloc.slots.alloc();
         let kick = sel4::init_thread::Slot::<cap_type::Notification>::from_index(kick_slot).cap();
@@ -597,7 +597,7 @@ impl Netd {
             None => log!("l4h-root: no doorbell from partition {} for the link", ch.peer),
         }
         self.comp.give_badged(net::NETD_SLOT_LINK_KICK_BASE + l as u64, self.comp.ntfn, CapRights::write_only(), badge);
-        self.comp.give_badged(net::NETD_SLOT_LINK_RING_BASE + l as u64, ntfn, CapRights::write_only(), LINK_BADGES.nth(l));
+        self.comp.give_badged(net::NETD_SLOT_LINK_RING_BASE + l as u64, ntfn, CapRights::write_only(), badges::root::LINK.nth(l));
         self.post(Request::AddLink { link: l, switch: switch as usize, size: ch.size as u64, me: me as u32, peer: ch.peer as u32 })?;
         self.links.must_push(Link { peer: ch.peer, peer_slot: ch.peer_slot, peer_vector: ch.peer_vector });
         Ok(l)
@@ -608,7 +608,7 @@ impl Netd {
     /// frames netd wrote, and the notification merges repeated asks.
     pub fn link_ring(&self, badge: u64) {
         for (l, k) in self.links.iter().enumerate() {
-            if badge & LINK_BADGES.nth(l) != 0 {
+            if badge & badges::root::LINK.nth(l) != 0 {
                 crate::channel::ring(k.peer_slot, k.peer_vector);
             }
         }

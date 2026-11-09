@@ -14,6 +14,7 @@ use sel4::{CapRights, ObjectBlueprint, VmAttributes, cap, cap_type};
 use l4h_abi as abi;
 use l4h_host as host;
 use l4h_host::fixed::ArrayVec;
+use l4h_host::root::{Later, NewGuest, Sender, Vals as RootVals, call as root_call};
 use l4h_host::vmmgr::{self as proto, VmmgrConfig};
 
 use crate::blkd::{self, Channel};
@@ -22,7 +23,7 @@ use crate::component::{self, Component, SpawnArgs, abs_of, root_cap};
 use crate::mem::{Arena, Dest, Slot};
 use crate::netd::Netd;
 use crate::vspace::{FRAME_BP, map_frame};
-use crate::{Host, MAX_GUESTS, ctl, mr, set_mr};
+use crate::{Host, MAX_GUESTS, ctl};
 
 static VMMGR_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/l4h-vmmgr.elf"));
 
@@ -362,50 +363,71 @@ fn xchg(h: &Host, i: usize) -> sel4::AbsoluteCPtr {
     s
 }
 
-/// A call from vmmgr (label `label`): its reply's length.
-pub fn call(h: &mut Host, label: u64) -> usize {
-    let a: [u64; 8] = core::array::from_fn(mr);
-    let now = |r: Result<Vals, i64>| r.map(Answer::Now);
-    let r = match label {
-        proto::VMMGR_GUEST_NEW => now(guest_new(h, a)),
-        proto::VMMGR_GUEST_DEL => now(guest_del(h, a[0] as usize)),
-        proto::VMMGR_DISK_ATTACH => disk_attach(h, a),
-        proto::VMMGR_NIC_ADD => now(nic_add(h, a)),
-        proto::VMMGR_TRUST_REGISTER => now(trust_register(h, a)),
-        proto::VMMGR_USB_ATTACH => now(usb_attach(h, a)),
-        proto::VMMGR_HOST_OP => {
-            let data = unsafe { &mut *(RESULT_VA as *mut [u8; abi::CTL_DATA_MAX]) };
-            data.fill(0);
-            let args = a[1..7].try_into().unwrap();
-            ctl::host_op(h, a[0] as u32, &args, data)
-        }
-        proto::VMMGR_RESULT => result(h, a[0] as usize).map(Answer::Now),
-        _ => Err(ctl::ENOSYS),
-    };
-    match r {
-        Ok(Answer::Now(vals)) => {
-            set_mr(0, 0);
-            for (i, &v) in vals.iter().enumerate() {
-                set_mr(1 + i, v);
-            }
-            1 + vals.len()
-        }
-        Ok(Answer::Later(token)) => {
-            set_mr(0, proto::VMMGR_PENDING);
-            set_mr(1, token as u64);
-            2
-        }
-        Err(e) => {
-            set_mr(0, e as u64);
-            1
-        }
+/// The calls on root's endpoint (l4h_host::root::call), trustd's and
+/// vmmgr's: `serve` lets each make only its own.
+pub struct Calls<'a>(pub &'a mut Host);
+
+fn errno<T>(r: Result<T, i64>) -> Result<T, u64> {
+    r.map_err(|e| e as u64)
+}
+
+impl root_call::Server for Calls<'_> {
+    fn hw(&mut self, _: Sender, op: u64, addr: usize, off: usize, width: usize, value: u64) -> Result<u64, u64> {
+        Ok(crate::trustd::hw(self.0, op, addr, off, width, value))
+    }
+
+    fn attest_done(&mut self, _: Sender, guest: usize) -> Result<(), u64> {
+        crate::trustd::done(self.0, guest);
+        Ok(())
+    }
+
+    fn relay(&mut self, _: Sender, peer: u32, len: usize) -> Result<(), u64> {
+        if crate::trustd::relay(self.0, peer, len) == 0 { Ok(()) } else { Err(ctl::EIO as u64) }
+    }
+
+    fn guest_new(&mut self, _: Sender, guest: usize, pool: usize, gpa: usize, dom0: bool) -> Result<NewGuest, u64> {
+        errno(guest_new(self.0, guest, pool, gpa, dom0))
+    }
+
+    fn guest_del(&mut self, _: Sender, guest: usize) -> Result<u64, u64> {
+        errno(guest_del(self.0, guest))
+    }
+
+    fn disk_attach(&mut self, _: Sender, guest: usize, dev: usize, disk: usize, flags: u64, lba_start: u64, lba_count: u64,
+        n: usize, list: u64) -> Result<Later<()>, u64> {
+        errno(disk_attach(self.0, guest, dev, disk, flags, lba_start, lba_count, n, list))
+    }
+
+    fn nic_add(&mut self, _: Sender, guest: usize, dev: usize, switch: u32, mac: u64, lock: bool, isolated: bool) -> Result<u64, u64> {
+        errno(nic_add(self.0, guest, dev, switch, mac, lock, isolated))
+    }
+
+    fn trust_register(&mut self, _: Sender, guest: usize, ram: u64, vcpus: u32, launch: [u64; 4]) -> Result<(), u64> {
+        errno(trust_register(self.0, guest, ram, vcpus, launch))
+    }
+
+    fn host_op(&mut self, _: Sender, op: u32, args: [u64; 6]) -> Result<Later<RootVals>, u64> {
+        let data = unsafe { &mut *(RESULT_VA as *mut [u8; abi::CTL_DATA_MAX]) };
+        data.fill(0);
+        errno(ctl::host_op(self.0, op, &args, data).map(|a| match a {
+            Answer::Now(vals) => Later::Now(RootVals::of(&vals)),
+            Answer::Later(t) => Later::Token(t),
+        }))
+    }
+
+    fn result(&mut self, _: Sender, token: usize) -> Result<RootVals, u64> {
+        errno(result(self.0, token).map(|vals| RootVals::of(&vals)))
+    }
+
+    fn usb_attach(&mut self, _: Sender, guest: usize, dev: usize, ctrl: usize) -> Result<u64, u64> {
+        errno(usb_attach(self.0, guest, dev, ctrl))
     }
 }
 
 /// Up to six reply values.
 pub type Vals = ArrayVec<u64, 6>;
 
-/// A request's answer: now, or later (VMMGR_PENDING), when a driver has
+/// A request's answer: now, or later (Later::Token), when a driver has
 /// answered, for this token.
 pub enum Answer {
     Now(Vals),
@@ -420,7 +442,7 @@ pub enum OpResult {
     Disk { chan: Channel, kick: cap::Notification },
 }
 
-/// A request root answers later (VMMGR_PENDING): for a guest (id,
+/// A request root answers later (Later::Token): for a guest (id,
 /// instance), if any; the disk controller it waits for; its answer, once
 /// there is one.
 pub struct Op {
@@ -463,7 +485,7 @@ pub fn op_done(h: &mut Host, token: usize, r: Result<OpResult, i64>) {
     }
 }
 
-/// VMMGR_RESULT: the answer of pending request `token`, which frees it.
+/// `result`: the answer of pending request `token`, which frees it.
 fn result(h: &mut Host, token: usize) -> Result<Vals, i64> {
     let op = h.ops.get_mut(token).ok_or(ctl::EINVAL)?;
     if op.as_ref().is_none_or(|op| op.done.is_none()) {
@@ -525,8 +547,7 @@ pub fn zombie_done(h: &mut Host, z: Option<usize>, pool_reusable: bool) {
     }
 }
 
-fn guest_arg(id: u64) -> Result<usize, i64> {
-    let id = id as usize;
+fn guest_arg(id: usize) -> Result<usize, i64> {
     if id < MAX_GUESTS { Ok(id) } else { Err(ctl::ENOENT) }
 }
 
@@ -540,10 +561,9 @@ pub fn with_guest<R>(h: &mut Host, id: usize, f: impl FnOnce(&mut Host, &mut Roo
     r
 }
 
-/// VMMGR_GUEST_NEW: the pool, and the attestation device.
-fn guest_new(h: &mut Host, a: [u64; 8]) -> Result<Vals, i64> {
-    let id = guest_arg(a[0])?;
-    let (size, gpa, dom0) = (a[1] as usize, a[2] as usize, a[3] != 0);
+/// `guest_new`: the pool, and the attestation device.
+fn guest_new(h: &mut Host, id: usize, size: usize, gpa: usize, dom0: bool) -> Result<NewGuest, i64> {
+    let id = guest_arg(id)?;
     if h.guests[id].is_some() || !size.is_power_of_two() || !(IO_POOL_MIN..=IO_POOL_MAX).contains(&size) || gpa % PAGE != 0 {
         return Err(ctl::EINVAL);
     }
@@ -590,7 +610,7 @@ fn guest_new(h: &mut Host, a: [u64; 8]) -> Result<Vals, i64> {
             attest,
             usbs: ArrayVec::new(),
         });
-        Ok([instance, attest as u64].into_iter().collect())
+        Ok(NewGuest { instance, attest })
     })();
     h.alloc.slots.untrack();
     if r.is_err() {
@@ -599,18 +619,18 @@ fn guest_new(h: &mut Host, a: [u64; 8]) -> Result<Vals, i64> {
     r
 }
 
-/// GUEST_DEL's answer: no bytes of pool kept out of use, which root says
-/// itself (zombie_done) once it knows.
-fn kept_later() -> Vals {
-    [0].into_iter().collect()
+/// `guest_del`'s answer: no bytes of pool kept out of use, which root
+/// says itself (zombie_done) once it knows.
+fn kept_later() -> u64 {
+    0
 }
 
-/// VMMGR_GUEST_DEL: vmmgr has stopped and torn down guest `id`.  Disks
+/// `guest_del`: vmmgr has stopped and torn down guest `id`.  Disks
 /// are cut off from the I/O pool by the IOMMU at once; what drivers map
 /// (disk channels, port memory) is kept until they say they no longer use
 /// it, which root never waits for (a Zombie).  Without an IOMMU the pool
 /// is kept with it, as a disk may still write to it.
-fn guest_del(h: &mut Host, id: usize) -> Result<Vals, i64> {
+fn guest_del(h: &mut Host, id: usize) -> Result<u64, i64> {
     let mut g = h.guests.get_mut(id).and_then(|g| g.take()).ok_or(ctl::ENOENT)?;
     if let Some(t) = &mut h.trustd {
         t.unregister(id);
@@ -667,16 +687,16 @@ fn guest_del(h: &mut Host, id: usize) -> Result<Vals, i64> {
     Ok(kept_later())
 }
 
-/// VMMGR_DISK_ATTACH: pass host disk `disk` (or sectors [lba_start,
+/// `disk_attach`: pass host disk `disk` (or sectors [lba_start,
 /// lba_start + lba_count) of it, 0 = to the end; or the n extents at
 /// `list` in dom0's control data area) through to the guest, with
 /// abi::BLK_* flags.  blkd decides whether the disk may attach, and in
 /// which slot: answered later (blkd::poll).
-fn disk_attach(h: &mut Host, a: [u64; 8]) -> Result<Answer, i64> {
-    let id = guest_arg(a[0])?;
-    let (dev, disk, flags, lba_start, lba_count) = (a[1] as usize, a[2] as usize, a[3], a[4], a[5]);
+#[allow(clippy::too_many_arguments)]
+fn disk_attach(h: &mut Host, id: usize, dev: usize, disk: usize, flags: u64, lba_start: u64, lba_count: u64, n: usize, list: u64)
+    -> Result<Later<()>, i64> {
+    let id = guest_arg(id)?;
     let (read_only, volatile) = (flags & abi::BLK_RO != 0, flags & abi::BLK_VOLATILE != 0);
-    let (n, list) = (a[6] as usize, a[7]);
     if dev >= MAX_GUEST_DEVICES || flags & !(abi::BLK_RO | abi::BLK_VOLATILE) != 0 || n > l4h_host::blk::MAX_EXTENTS
         || list.checked_add(16 * n as u64).is_none_or(|end| end > l4h_abi::CTL_LOAD_MAX) {
         return Err(ctl::EINVAL);
@@ -687,7 +707,7 @@ fn disk_attach(h: &mut Host, a: [u64; 8]) -> Result<Answer, i64> {
     let list = (CTL_DATA_VA + list as usize) as *const u8;
     let t = op_new(h, Some(id), c)?;
     match blkd::attach_start(h, c, t, id, disk, unit, (lba_start, lba_count), (n, list), read_only, volatile, dom0) {
-        Ok(()) => Ok(Answer::Later(t)),
+        Ok(()) => Ok(Later::Token(t)),
         Err(e) => {
             h.ops[t] = None;
             Err(e)
@@ -695,10 +715,9 @@ fn disk_attach(h: &mut Host, a: [u64; 8]) -> Result<Answer, i64> {
     }
 }
 
-/// VMMGR_NIC_ADD: a port of `switch` for the guest.  Returns the MAC.
-fn nic_add(h: &mut Host, a: [u64; 8]) -> Result<Vals, i64> {
-    let id = guest_arg(a[0])?;
-    let (dev, switch, mac, lock, isolated) = (a[1] as usize, a[2] as u32, a[3], a[4] != 0, a[5] != 0);
+/// `nic_add`: a port of `switch` for the guest.  Returns the MAC.
+fn nic_add(h: &mut Host, id: usize, dev: usize, switch: u32, mac: u64, lock: bool, isolated: bool) -> Result<u64, i64> {
+    let id = guest_arg(id)?;
     if dev >= MAX_GUEST_DEVICES {
         return Err(ctl::EINVAL);
     }
@@ -726,15 +745,14 @@ fn nic_add(h: &mut Host, a: [u64; 8]) -> Result<Vals, i64> {
         xchg(h, 0).copy(&abs_of(chan), CapRights::all()).expect("vmmgr port frames");
         xchg(h, 1).move_(&abs_of(kick)).expect("vmmgr port kick");
         h.alloc.slots.free(kick.bits() as Slot);
-        Ok([mac].into_iter().collect())
+        Ok(mac)
     })
 }
 
-/// VMMGR_USB_ATTACH: give the guest a whole USB controller.  Returns its
-/// USB number.
-fn usb_attach(h: &mut Host, a: [u64; 8]) -> Result<Vals, i64> {
-    let id = guest_arg(a[0])?;
-    let (dev, ctrl) = (a[1] as usize, a[2] as usize);
+/// `usb_attach`: give the guest a whole USB controller.  Returns its USB
+/// number.
+fn usb_attach(h: &mut Host, id: usize, dev: usize, ctrl: usize) -> Result<u64, i64> {
+    let id = guest_arg(id)?;
     if dev >= MAX_GUEST_DEVICES {
         return Err(ctl::EINVAL);
     }
@@ -746,25 +764,25 @@ fn usb_attach(h: &mut Host, a: [u64; 8]) -> Result<Vals, i64> {
         xchg(h, 0).copy(&abs_of(att.frames), CapRights::all()).expect("vmmgr USB queue frames");
         xchg(h, 1).move_(&abs_of(att.kick)).expect("vmmgr usbd kick");
         crate::usb::free_slot(h, att.kick);
-        Ok([n as u64].into_iter().collect())
+        Ok(n as u64)
     })
 }
 
-/// VMMGR_TRUST_REGISTER: the guest starts.
-fn trust_register(h: &mut Host, a: [u64; 8]) -> Result<Vals, i64> {
-    let id = guest_arg(a[0])?;
+/// `trust_register`: the guest starts.
+fn trust_register(h: &mut Host, id: usize, ram: u64, vcpus: u32, words: [u64; 4]) -> Result<(), i64> {
+    let id = guest_arg(id)?;
     let g = h.guests[id].as_ref().ok_or(ctl::ENOENT)?;
     if !g.attest {
         return Err(ctl::EINVAL);
     }
     let mut launch = [0; 32];
-    for (i, w) in a[4..8].iter().enumerate() {
+    for (i, w) in words.iter().enumerate() {
         launch[8 * i..8 * i + 8].copy_from_slice(&w.to_le_bytes());
     }
     let record = host::trust::GuestRecord {
         instance: 0,
-        ram: a[1],
-        vcpus: a[2] as u32,
+        ram,
+        vcpus,
         // dom0 is root's to say.
         flags: if g.dom0 { host::trust::RECORD_DOM0 } else { 0 },
         launch,
@@ -774,5 +792,5 @@ fn trust_register(h: &mut Host, a: [u64; 8]) -> Result<Vals, i64> {
     if let Some(t) = &mut h.trustd {
         t.register(id, instance, record);
     }
-    Ok(Vals::new())
+    Ok(())
 }

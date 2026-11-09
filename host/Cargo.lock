@@ -323,6 +323,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "l4h-ipc"
+version = "0.1.0"
+dependencies = [
+ "l4h-host",
+ "sel4",
+]
+
+[[package]]
 name = "l4h-logd"
 version = "0.1.0"
 dependencies = [
@@ -357,6 +365,7 @@ version = "0.1.0"
 dependencies = [
  "l4h-abi",
  "l4h-host",
+ "l4h-ipc",
  "l4h-partition",
  "l4h-task",
  "l4h-virtio",
@@ -370,6 +379,7 @@ name = "l4h-rt"
 version = "0.1.0"
 dependencies = [
  "l4h-host",
+ "l4h-ipc",
  "one-shot-mutex",
  "sel4",
  "sel4-dlmalloc",
@@ -385,6 +395,7 @@ name = "l4h-task"
 version = "0.1.0"
 dependencies = [
  "l4h-host",
+ "l4h-ipc",
  "sel4",
 ]
 
@@ -427,6 +438,7 @@ version = "0.1.0"
 dependencies = [
  "l4h-abi",
  "l4h-host",
+ "l4h-ipc",
  "l4h-rt",
  "l4h-task",
  "sel4",

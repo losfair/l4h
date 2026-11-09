@@ -487,7 +487,7 @@ pub fn start(
     let irq = sel4::init_thread::Slot::<cap_type::IrqHandler>::from_index(irq_slot).cap();
     let irq_ntfn_slot = alloc.slots.alloc();
     let irq_ntfn = sel4::init_thread::Slot::<cap_type::Notification>::from_index(irq_ntfn_slot).cap();
-    abs_of(irq_ntfn).mint(&abs_of(comp.ntfn), CapRights::all(), blk::BLKD_BADGE_IRQ).expect("IRQ notification");
+    abs_of(irq_ntfn).mint(&abs_of(comp.ntfn), CapRights::all(), host::badges::blkd::IRQ).expect("IRQ notification");
     irq.irq_handler_set_notification(irq_ntfn).expect("IRQ set notification");
     comp.give(blk::BLKD_SLOT_IRQ, irq, CapRights::all());
     if legacy_io.is_some() {
@@ -531,10 +531,10 @@ fn attach(ctrl: &mut Controller, i: usize, disk: usize, client: &mut RootGuest, 
             keep.absolute_cptr_from_bits_with_depth((blk::CHANNEL_PAGES + k) as u64, 10)));
     }
     driver.comp.give_badged(blk::BLKD_SLOT_CLIENT_DONE + i as u64, client.vmm_ntfn,
-        CapRights::write_only(), host::VMM_BADGE_DONE);
+        CapRights::write_only(), host::badges::vmm::DONE);
     let kick_slot = alloc.slots.alloc();
     let kick = sel4::init_thread::Slot::<cap_type::Notification>::from_index(kick_slot).cap();
-    abs_of(kick).mint(&abs_of(driver.comp.ntfn), CapRights::write_only(), blk::BLKD_BADGE_KICK).expect("blkd kick");
+    abs_of(kick).mint(&abs_of(driver.comp.ntfn), CapRights::write_only(), host::badges::blkd::KICK).expect("blkd kick");
     // Reads write the pool, writes read it.
     let pool = (client.pool.paddr, client.pool.size);
     iommu.map(alloc, ctrl.dom, pool.0, pool.1, true);

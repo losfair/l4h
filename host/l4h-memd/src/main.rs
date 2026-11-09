@@ -400,25 +400,16 @@ fn main(info: &'static Info) -> ! {
             (msg, badge) = ep.recv(reply);
             continue;
         }
-        // The arguments leave the message registers before the handler's
-        // invocations use them, and the reply goes there after.
-        let mut out = [0; call::Request::MAX_REPLY_WORDS];
-        let len = match Sender::of_badge(badge) {
-            Some(from) => {
-                let mut args = [0; call::Request::MAX_WORDS];
-                let n = msg.length().min(args.len());
-                sel4::with_ipc_buffer(|b| args[..n].copy_from_slice(&b.msg_regs()[..n]));
-                // memd's methods always answer.
-                call::serve(&mut d, msg.label(), &args[..n], from, &mut out).unwrap_or(0)
-            }
-            None => {
-                out[0] = EINVAL;
-                1
-            }
+        let answer = match Sender::of_badge(badge) {
+            Some(from) => l4h_rt::ipc::serve(&msg, |label, args, out| call::serve(&mut d, label, args, from, out)),
+            None => Some(l4h_rt::ipc::refuse()),
         };
         d.write_status();
-        sel4::with_ipc_buffer_mut(|b| b.msg_regs_mut()[..len].copy_from_slice(&out[..len]));
-        (msg, badge) = ep.reply_recv(sel4::MessageInfo::new(0, 0, 0, len), reply);
+        // memd's methods always answer.
+        (msg, badge) = match answer {
+            Some(answer) => ep.reply_recv(answer, reply),
+            None => ep.recv(reply),
+        };
     }
 }
 
