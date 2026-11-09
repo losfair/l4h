@@ -1,4 +1,4 @@
-From acb5badf6a3698d90f11f738c905a29517bf89d6 Mon Sep 17 00:00:00 2001
+From 6ca4f912563e8ad36851d3a9d3490359ea79393a Mon Sep 17 00:00:00 2001
 From: l4h <l4h@localhost>
 Date: Fri, 6 Nov 2026 23:22:24 -0800
 Subject: [PATCH] x86: what KVM needs from the VCPU interface
@@ -115,6 +115,9 @@ than a VMM written for seL4 does, and any guest can now hold a VCPU:
 - An NMI injected again after an exit userspace did not see has its
   blocking cleared first: the delivery that exited had set it, and an
   entry that injects an NMI with it set fails its checks.
+- A spurious interrupt that ends guest mode, acknowledged on the exit as
+  vector 255, is dropped, as c_handle_interrupt() drops it.  It was
+  handled as IRQ 223: reported as one above maxIRQ, and given an EOI.
 
 When seL4 itself runs under a hypervisor without VMCS shadowing, each
 VMREAD and VMWRITE is an exit to it, and so is each WRMSR of a syscall
@@ -140,9 +143,14 @@ MSR.  So VM exits and entries do only what they need:
   INVEPT gets the whole EPTP the VMCS has, not just the root's
   address: the CPU ignores the other bits, but nested KVM compares them
   and, with the address alone, invalidated nothing.  A core records
-  that it enters VMs before it releases the kernel lock to do so, as it
-  looks up the EPT root after: one deleted in between was freed with no
-  invept there.  Deleting an ASID pool invalidates the EPT roots in it,
+  that it enters VMs, and looks up the EPT root to enter with, before it
+  releases the kernel lock: a root deleted after that is invalidated
+  there, which ends guest mode.  It looked the root up after, in the ASID
+  pool the thread's root cap names, which another core could have deleted
+  and freed meanwhile (a pool with no EPT root in it invalidates nothing,
+  so nothing held this core back): what replaced the pool could name the
+  cap's root, which has no ASID any more and whose tables can still map
+  frames that were since freed.  Deleting an ASID pool invalidates the EPT roots in it,
   as deleting each root does: unmapping below them no longer finds them.
 ---
  include/arch/x86/arch/machine/debug.h         |  10 +
@@ -157,11 +165,11 @@ MSR.  So VM exits and entries do only what they need:
  src/arch/x86/kernel/ept.c                     |  59 +-
  src/arch/x86/kernel/vspace.c                  |  20 +
  src/arch/x86/object/objecttype.c              |   3 +
- src/arch/x86/object/vcpu.c                    | 695 +++++++++++++++---
+ src/arch/x86/object/vcpu.c                    | 713 +++++++++++++++---
  src/arch/x86/smp/ipi.c                        |   3 +
  src/kernel/thread.c                           |  10 +
  src/object/notification.c                     |   7 +-
- 16 files changed, 874 insertions(+), 123 deletions(-)
+ 16 files changed, 890 insertions(+), 125 deletions(-)
 
 diff --git a/include/arch/x86/arch/machine/debug.h b/include/arch/x86/arch/machine/debug.h
 index 1d01b65f0..15eb556bd 100644
@@ -790,7 +798,7 @@ index 7b494f3a4..03c510315 100644
  
  void Arch_postCapDeletion(cap_t cap)
 diff --git a/src/arch/x86/object/vcpu.c b/src/arch/x86/object/vcpu.c
-index 92dd1dfef..22082e212 100644
+index 92dd1dfef..5f9f6b1c8 100644
 --- a/src/arch/x86/object/vcpu.c
 +++ b/src/arch/x86/object/vcpu.c
 @@ -21,6 +21,14 @@
@@ -1594,7 +1602,7 @@ index 92dd1dfef..22082e212 100644
  }
  
  exception_t handleVmexit(void)
-@@ -1347,16 +1723,17 @@ exception_t handleVmexit(void)
+@@ -1347,18 +1723,24 @@ exception_t handleVmexit(void)
      /* qualification is host width, reason is defined as being 32 bit */
      word_t qualification;
      uint32_t reason;
@@ -1615,10 +1623,19 @@ index 92dd1dfef..22082e212 100644
          NODE_LOCK_IRQ;
          if (vmx_feature_ack_on_exit) {
 -            interrupt = vmread(VMX_DATA_EXIT_INTERRUPT_INFO) & 0xff;
-             ARCH_NODE_STATE(x86KScurInterrupt) = interrupt;
-             handleInterruptEntry();
+-            ARCH_NODE_STATE(x86KScurInterrupt) = interrupt;
+-            handleInterruptEntry();
++            /* A spurious interrupt is no IRQ, as for c_handle_interrupt():
++             * handleInterrupt() would report it as one above maxIRQ and
++             * send an EOI, which the APIC expects for none. */
++            if (interrupt != int_spurious) {
++                ARCH_NODE_STATE(x86KScurInterrupt) = interrupt;
++                handleInterruptEntry();
++            }
          } else {
-@@ -1370,8 +1747,6 @@ exception_t handleVmexit(void)
+             /* poll for the pending irq. We will then handle it once we return back
+              * up to restore_user_context */
+@@ -1370,8 +1752,6 @@ exception_t handleVmexit(void)
          return EXCEPTION_NONE;
      }
  
@@ -1627,7 +1644,7 @@ index 92dd1dfef..22082e212 100644
      switch (reason) {
      case EXCEPTION_OR_NMI:
      case MOV_DR:
-@@ -1400,6 +1775,8 @@ exception_t handleVmexit(void)
+@@ -1400,6 +1780,8 @@ exception_t handleVmexit(void)
          qualification = 0;
      }
  
@@ -1636,15 +1653,16 @@ index 92dd1dfef..22082e212 100644
      handleVmxFault(reason, qualification);
  
      return EXCEPTION_NONE;
-@@ -1452,6 +1829,28 @@ static void invvpid_context(uint16_t vpid)
+@@ -1452,6 +1834,29 @@ static void invvpid_context(uint16_t vpid)
      asm volatile("invvpid %0, %1" :: "m"(operand), "r"((word_t)1) : "cc");
  }
  
 +/*
-+ * Flush the VPID the next entry of the current VCPU runs on, after the
-+ * kernel lock is released (restoreVMCS()).  That is the VCPU's own, unless
-+ * another core took it since vcpu_make_current() (findFreeVPID()): then the
-+ * VMCS still names it, and the entry runs on it, translations and all.
++ * Flush the VPID the next entry of the current VCPU runs on.  That is the
++ * VCPU's own, unless this is after the kernel lock was released
++ * (restoreVMCS()) and another core took it since vcpu_make_current()
++ * (findFreeVPID()): then the VMCS still names it, and the entry runs on it,
++ * translations and all.
 + */
 +static void vcpu_flush_entry_vpid(vcpu_t *vcpu)
 +{
@@ -1665,7 +1683,7 @@ index 92dd1dfef..22082e212 100644
  static void setEPTRoot(cap_t vmxSpace, vcpu_t *vcpu)
  {
      paddr_t ept_root;
-@@ -1479,10 +1878,7 @@ static void setEPTRoot(cap_t vmxSpace, vcpu_t *vcpu)
+@@ -1479,10 +1884,7 @@ static void setEPTRoot(cap_t vmxSpace, vcpu_t *vcpu)
                                6               /* write back memory type */
                            );
          vmwrite(VMX_CONTROL_EPT_POINTER, eptp.words[0]);
@@ -1677,7 +1695,7 @@ index 92dd1dfef..22082e212 100644
      }
  }
  
-@@ -1558,28 +1954,33 @@ static void storeVPID(vcpu_t *vcpu, vpid_t vpid)
+@@ -1558,28 +1960,33 @@ static void storeVPID(vcpu_t *vcpu, vpid_t vpid)
      vcpu->vpid = vpid;
  }
  
@@ -1722,7 +1740,7 @@ index 92dd1dfef..22082e212 100644
          switchLocalFpuOwner(tcb);
      }
  }
-@@ -1589,17 +1990,80 @@ void vcpu_fpu_to_host(tcb_t *tcb, vcpu_t *vcpu)
+@@ -1589,17 +1996,88 @@ void vcpu_fpu_to_host(tcb_t *tcb, vcpu_t *vcpu)
      if (tcb->tcbFlags & seL4_TCBFlag_fpuDisabled) {
          /* FPU may have been enabled for the guest, but host isn't allowed to use it */
          disableFpu();
@@ -1747,8 +1765,8 @@ index 92dd1dfef..22082e212 100644
 +void vcpu_make_current(vcpu_t *vcpu)
 +{
 +#ifdef ENABLE_SMP_SUPPORT
-+    /* Before the kernel lock is released: the entry reads the EPT root
-+     * after, and invept() reaches only the cores in this mask, so a core it
++    /* Before the EPT root is looked up below, and the kernel lock
++     * released: invept() reaches only the cores in this mask, so a core it
 +     * did not know of would enter with a root deleted meanwhile. */
 +    __atomic_fetch_or(&x86KSVMXCores, BIT(getCurrentCPUIndex()), __ATOMIC_SEQ_CST);
 +#endif
@@ -1762,6 +1780,14 @@ index 92dd1dfef..22082e212 100644
 +    if (vcpu->vpid == VPID_INVALID) {
 +        vcpu_take_vpid(vcpu);
 +    }
++    /* The EPT root too, with the lock: it keeps the thread's root cap and
++     * the ASID pool the cap names where they are.  Looked up after, the
++     * pool could be one another core had just deleted and freed, and what
++     * replaced it could name a root that has no ASID any more, whose tables
++     * still map frames that were since freed.  A root that loses its ASID
++     * after this is invalidated on this core (invept()), which ends guest
++     * mode here, and the next entry looks it up again. */
++    setEPTRoot(TCB_PTR_CTE_PTR(vcpu->vcpuTCB, tcbArchEPTRoot)->cap, vcpu);
 +}
 +
 +/*
@@ -1808,7 +1834,7 @@ index 92dd1dfef..22082e212 100644
  void restoreVMCS(void)
  {
      tcb_t *cur_thread = NODE_STATE(ksCurThread);
-@@ -1616,24 +2080,29 @@ void restoreVMCS(void)
+@@ -1616,24 +2094,29 @@ void restoreVMCS(void)
          vmwrite(VMX_HOST_CR3, getCurrentCR3().words[0]);
      }
  #endif
@@ -1818,15 +1844,15 @@ index 92dd1dfef..22082e212 100644
 -        if (vmx_feature_vpid) {
 -            vmwrite(VMX_CONTROL_VPID, vpid);
 -        }
--    }
-     setEPTRoot(TCB_PTR_CTE_PTR(cur_thread, tcbArchEPTRoot)->cap, expected_vmcs);
++    /* vcpu_make_current() set the EPT root, with the kernel lock. */
 +    if (expected_vmcs->flush_vpid) {
 +        expected_vmcs->flush_vpid = false;
 +        vcpu_flush_entry_vpid(expected_vmcs);
 +    }
 +    if (expected_vmcs->exit_info_valid) {
 +        vcpu_requeue_event(expected_vmcs);
-+    }
+     }
+-    setEPTRoot(TCB_PTR_CTE_PTR(cur_thread, tcbArchEPTRoot)->cap, expected_vmcs);
  }
  
 -void invept(ept_pml4e_t *ept_pml4)
@@ -1847,7 +1873,7 @@ index 92dd1dfef..22082e212 100644
              type = 1;
          } else if (vmx_ept_vpid_cap_msr_get_invept_all_context(vpid_capability)) {
              type = 2;
-@@ -1645,7 +2114,11 @@ void invept(ept_pml4e_t *ept_pml4)
+@@ -1645,7 +2128,11 @@ void invept(ept_pml4e_t *ept_pml4)
              return;
          }
  
@@ -1860,7 +1886,7 @@ index 92dd1dfef..22082e212 100644
          address.parts[1] = 0;
          asm volatile(
              "invept %0, %1"
-@@ -1656,4 +2129,28 @@ void invept(ept_pml4e_t *ept_pml4)
+@@ -1656,4 +2143,28 @@ void invept(ept_pml4e_t *ept_pml4)
      }
  }
  

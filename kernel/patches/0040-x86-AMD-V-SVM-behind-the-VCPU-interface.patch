@@ -1,4 +1,4 @@
-From 59ebec2e85e405d4024612b5ca3c6cbcc3e65a84 Mon Sep 17 00:00:00 2001
+From 542d304c50cc00e2170e4c87b7e76339716750c5 Mon Sep 17 00:00:00 2001
 From: l4h <l4h@localhost>
 Date: Sun, 8 Nov 2026 19:30:53 +0100
 Subject: [PATCH] x86: AMD-V (SVM) behind the VCPU interface
@@ -42,7 +42,8 @@ VMs on both.
   the CPU owns a VMCB during VMRUN, and the exit writes the VCPU before
   it takes the kernel lock.  vcpu_make_current() (patch 0039) records the
   VCPU as its core's before that core releases the lock to enter guest
-  mode, so none is missed.  A VCPU being deleted is forgotten on every
+  mode, so none is missed, and sets the nested page table root there
+  too, as it does the EPT root on VT-x.  A VCPU being deleted is forgotten on every
   core it ran on, not only the last.  So it is when a thread loses its
   VCPU in guest mode and its VMEnter ends (patch 0039).  The exit reads
   what it reports from the VMCB before the lock: once it has the lock,
@@ -112,9 +113,9 @@ VMs on both.
  src/arch/x86/config.cmake                     |    1 +
  src/arch/x86/kernel/ept.c                     |   21 +-
  src/arch/x86/model/statedata.c                |    7 +
- src/arch/x86/object/svm.c                     | 1035 +++++++++++++++++
+ src/arch/x86/object/svm.c                     | 1039 +++++++++++++++++
  src/arch/x86/object/vcpu.c                    |  122 +-
- 14 files changed, 1452 insertions(+), 56 deletions(-)
+ 14 files changed, 1456 insertions(+), 56 deletions(-)
  create mode 100644 include/arch/x86/arch/object/svm.h
  create mode 100644 src/arch/x86/object/svm.c
 
@@ -682,10 +683,10 @@ index da0b07c6f..a651c405e 100644
  #ifdef CONFIG_PRINTING
 diff --git a/src/arch/x86/object/svm.c b/src/arch/x86/object/svm.c
 new file mode 100644
-index 000000000..a37978d6f
+index 000000000..1662c4752
 --- /dev/null
 +++ b/src/arch/x86/object/svm.c
-@@ -0,0 +1,1035 @@
+@@ -0,0 +1,1039 @@
 +/*
 + * SPDX-License-Identifier: GPL-2.0-only
 + */
@@ -1589,6 +1590,10 @@ index 000000000..a37978d6f
 +        vcpu->last_cpu = cpu;
 +#endif
 +    }
++    /* The nested page table root too, with the lock, as on VT-x
++     * (vcpu_make_current()): looked up after, its ASID pool could be one
++     * another core had just freed. */
++    svm_set_npt_root(TCB_PTR_CTE_PTR(vcpu->vcpuTCB, tcbArchEPTRoot)->cap, vcpu);
 +}
 +
 +/*
@@ -1630,9 +1635,9 @@ index 000000000..a37978d6f
 +        svm_vmsave(host);
 +        ARCH_NODE_STATE(x86KSSVMHostSaved) = true;
 +    }
-+    /* vcpu_make_current() did, before the kernel lock was released. */
++    /* vcpu_make_current() did, before the kernel lock was released, and
++     * set the nested page table root. */
 +    assert(ARCH_NODE_STATE(x86KSCurrentVCPU) == vcpu && vcpu->svm.last_cpu == CURRENT_CPU_INDEX());
-+    svm_set_npt_root(TCB_PTR_CTE_PTR(cur_thread, tcbArchEPTRoot)->cap, vcpu);
 +    svm_assign_asid(vcpu);
 +    if (vcpu->exit_info_valid) {
 +        svm_requeue_event(vcpu);
@@ -1722,7 +1727,7 @@ index 000000000..a37978d6f
 +
 +#endif /* CONFIG_VTX */
 diff --git a/src/arch/x86/object/vcpu.c b/src/arch/x86/object/vcpu.c
-index 22082e212..c077e60ca 100644
+index 5f9f6b1c8..b798b176a 100644
 --- a/src/arch/x86/object/vcpu.c
 +++ b/src/arch/x86/object/vcpu.c
 @@ -55,7 +55,7 @@ typedef struct msr_bitmaps {
@@ -1935,7 +1940,7 @@ index 22082e212..c077e60ca 100644
      reason = vmread(VMX_DATA_EXIT_REASON);
      finishVmexitSaving(reason);
      /* the basic exit reason is the bottom 16 bits of the exit reason field */
-@@ -2011,6 +2045,10 @@ void vcpu_make_current(vcpu_t *vcpu)
+@@ -2017,6 +2051,10 @@ void vcpu_make_current(vcpu_t *vcpu)
       * did not know of would enter with a root deleted meanwhile. */
      __atomic_fetch_or(&x86KSVMXCores, BIT(getCurrentCPUIndex()), __ATOMIC_SEQ_CST);
  #endif
@@ -1946,7 +1951,7 @@ index 22082e212..c077e60ca 100644
      if (ARCH_NODE_STATE(x86KSCurrentVCPU) != vcpu) {
          switchVCPU(vcpu);
      }
-@@ -2092,6 +2130,10 @@ void restoreVMCS(void)
+@@ -2106,6 +2144,10 @@ void restoreVMCS(void)
  
  void invalidateLocalEPT(ept_pml4e_t *ept_pml4)
  {
@@ -1957,7 +1962,7 @@ index 22082e212..c077e60ca 100644
      if (vmx_ept_vpid_cap_msr_get_invept(vpid_capability)) {
          struct {
              uint64_t parts[2];
-@@ -2130,9 +2172,13 @@ void invalidateLocalEPT(ept_pml4e_t *ept_pml4)
+@@ -2144,9 +2186,13 @@ void invalidateLocalEPT(ept_pml4e_t *ept_pml4)
  }
  
  /* Whether invept(NULL) can invalidate all EPT contexts in one call, for
