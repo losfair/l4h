@@ -200,6 +200,17 @@ impl Slots {
         }
     }
 
+    /// Give the slots of owner `from` to owner `to`, which frees them in
+    /// its time (objects a guest leaves behind that a driver still uses).
+    pub fn reown(&mut self, from: usize, to: usize) {
+        assert!(from < GLOBAL as usize && to < GLOBAL as usize, "slot owner out of range");
+        for o in self.owners.iter_mut() {
+            if *o == from as u8 {
+                *o = to as u8;
+            }
+        }
+    }
+
     /// Run `f` with tracking suspended (for objects that outlive a guest).
     pub fn global<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
         let t = core::mem::replace(&mut self.owner, GLOBAL);

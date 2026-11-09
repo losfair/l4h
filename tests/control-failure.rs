@@ -13,6 +13,12 @@ use std::sync::Mutex;
 
 #[path = "../host/l4h-rt/src/failure.rs"]
 mod failure;
+/// The components here have no mailbox.
+mod mailbox {
+    pub fn fail() {
+        unreachable!("no mailbox");
+    }
+}
 pub use failure::FailureHandler;
 #[path = "../host/l4h-vmmgr/src/ctl_failure.rs"]
 mod ctl_failure;
@@ -178,7 +184,7 @@ fn panic_and_keeper_finish_outstanding_and_future_requests_without_replying_to_f
                 Input::Notify(host::vmmgr::BADGE_ROOT_EVENT), Input::Request(8),
                 Input::Request(9), Input::Call, Input::End].into();
         });
-        let end = std::panic::catch_unwind(|| failure::answer_failed(tcb)).unwrap_err();
+        let end = std::panic::catch_unwind(|| failure::answer_failed(tcb, false)).unwrap_err();
         assert!(end.is::<End>());
         MODEL.with(|m| {
             let m = m.borrow();

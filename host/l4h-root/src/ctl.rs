@@ -6,10 +6,12 @@
 use l4h_abi as abi;
 
 use crate::Host;
+use crate::vmmgr::Answer;
 
 pub const EPERM: i64 = 1;
 pub const ENOENT: i64 = 2;
 pub const EIO: i64 = 5;
+pub const EAGAIN: i64 = 11;
 pub const ENOMEM: i64 = 12;
 pub const EBUSY: i64 = 16;
 pub const EEXIST: i64 = 17;
@@ -17,8 +19,9 @@ pub const EINVAL: i64 = 22;
 pub const ENOSPC: i64 = 28;
 pub const ENOSYS: i64 = 38;
 
-/// Execute control op `op` with `a`: its vals, and its data into `data`.
-pub fn host_op(h: &mut Host, op: u32, a: &[u64; 6], data: &mut [u8; abi::CTL_DATA_MAX]) -> Result<[u64; 6], i64> {
+/// Execute control op `op` with `a`: its vals, and its data into `data`;
+/// or later, for an op that waits for blkd (BLK_WRITE, BLK_INFO).
+pub fn host_op(h: &mut Host, op: u32, a: &[u64; 6], data: &mut [u8; abi::CTL_DATA_MAX]) -> Result<Answer, i64> {
     let mut vals = [0; 6];
     match op {
         abi::CTL_HOST_INFO => {
@@ -59,24 +62,37 @@ pub fn host_op(h: &mut Host, op: u32, a: &[u64; 6], data: &mut [u8; abi::CTL_DAT
             h.ensure_disk(disk)?;
             // dom0's control data area, which root maps read-only.
             let from = (zero == 0).then_some(crate::vmmgr::CTL_DATA_VA as *const u8);
-            let dk = &h.disks[disk];
-            crate::blkd::write(&mut h.ctrls[dk.ctrl], dk, sector, len, from, &h.pci, &mut h.wins.a)?;
+            let t = crate::vmmgr::op_new(h, None)?;
+            if let Err(e) = crate::blkd::write(h, disk, sector, len, from, t) {
+                h.ops[t] = None;
+                return Err(e);
+            }
+            return Ok(Answer::Later(t));
         }
         abi::CTL_BLK_INFO => {
             let disk = h.disks.get(a[0] as usize).ok_or(ENOENT)?;
             // Row k of attachment i: one per extent, MAX_EXTENTS at most.
             let first = usize::try_from(a[1]).map_err(|_| EINVAL)?;
             let (slot, k) = (first >> 12, first & 0xfff);
-            let ctrl = &h.ctrls[disk.ctrl];
-            let row = ctrl.attachments(a[0] as usize)
+            let c = disk.ctrl;
+            let row = h.ctrls[c].attachments(a[0] as usize)
                 .map(|(i, att)| (i, att, if i == slot { k } else { 0 }))
-                .find(|&(i, att, k)| i >= slot && k < att.extents.max(1));
-            if let Some((i, att, k)) = row {
-                let (start, sectors) = match att.extents {
-                    0 => (att.window.start, att.window.sectors),
-                    _ => ctrl.extent(i, k).unwrap_or((u64::MAX, 0)),
-                };
-                vals = [((i << 12 | k) + 1) as u64, att.vm as u64, start, sectors, att.read_only as u64, k as u64];
+                .find(|&(i, att, k)| i >= slot && k < att.extents.max(1))
+                .map(|(i, att, k)| (i, k, att.extents, att.window, att.vm, att.read_only));
+            if let Some((i, k, extents, window, vm, read_only)) = row {
+                vals = [((i << 12 | k) + 1) as u64, vm as u64, window.start, window.sectors, read_only as u64, k as u64];
+                // An extent's place is blkd's to say.
+                if extents != 0 {
+                    let t = crate::vmmgr::op_new(h, None)?;
+                    match h.ctrls[c].extent(i, k, t, &mut vals) {
+                        Ok(true) => return Ok(Answer::Later(t)),
+                        Ok(false) => h.ops[t] = None,
+                        Err(e) => {
+                            h.ops[t] = None;
+                            return Err(e);
+                        }
+                    }
+                }
             }
         }
         abi::CTL_SWITCH_CREATE => vals[0] = h.netd.try_create_switch()? as u64,
@@ -156,7 +172,7 @@ pub fn host_op(h: &mut Host, op: u32, a: &[u64; 6], data: &mut [u8; abi::CTL_DAT
         abi::CTL_RTC_SET => h.rtc.set_secs(&mut h.wins.a, a[0])?,
         _ => return Err(ENOSYS),
     }
-    Ok(vals)
+    Ok(Answer::Now(vals.into_iter().collect()))
 }
 
 /// Write as many of `items` as fit into `data`; returns how many.

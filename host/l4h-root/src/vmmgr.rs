@@ -16,9 +16,11 @@ use l4h_host as host;
 use l4h_host::fixed::ArrayVec;
 use l4h_host::vmmgr::{self as proto, VmmgrConfig};
 
+use crate::blkd::{self, Channel};
 use crate::bootmod::Modules;
 use crate::component::{self, Component, SpawnArgs, abs_of, root_cap};
 use crate::mem::{Arena, Dest, Slot};
+use crate::netd::Netd;
 use crate::vspace::{FRAME_BP, map_frame};
 use crate::{Host, MAX_GUESTS, ctl, mr, set_mr};
 
@@ -79,6 +81,12 @@ pub struct Vmmgr {
 impl Vmmgr {
     fn events(&self) -> &proto::Events {
         unsafe { &*(EVENTS_VA as *const proto::Events) }
+    }
+
+    /// Root has the answer of pending request `token`.
+    fn op_done(&self, token: usize) {
+        self.events().ops_done.fetch_or(1 << token, Ordering::AcqRel);
+        self.signal.signal();
     }
 
     /// trustd answered guest `id`: vmmgr raises its device's event.
@@ -350,36 +358,154 @@ fn xchg(h: &Host, i: usize) -> sel4::AbsoluteCPtr {
 /// A call from vmmgr (label `label`): its reply's length.
 pub fn call(h: &mut Host, label: u64) -> usize {
     let a: [u64; 8] = core::array::from_fn(mr);
-    let mut len = 1;
+    let now = |r: Result<Vals, i64>| r.map(Answer::Now);
     let r = match label {
-        proto::VMMGR_GUEST_NEW => guest_new(h, a),
-        proto::VMMGR_GUEST_DEL => guest_del(h, a[0] as usize),
+        proto::VMMGR_GUEST_NEW => now(guest_new(h, a)),
+        proto::VMMGR_GUEST_DEL => now(guest_del(h, a[0] as usize)),
         proto::VMMGR_DISK_ATTACH => disk_attach(h, a),
-        proto::VMMGR_NIC_ADD => nic_add(h, a),
-        proto::VMMGR_TRUST_REGISTER => trust_register(h, a),
+        proto::VMMGR_NIC_ADD => now(nic_add(h, a)),
+        proto::VMMGR_TRUST_REGISTER => now(trust_register(h, a)),
         proto::VMMGR_HOST_OP => {
             let data = unsafe { &mut *(RESULT_VA as *mut [u8; abi::CTL_DATA_MAX]) };
             data.fill(0);
             let args = a[1..7].try_into().unwrap();
-            ctl::host_op(h, a[0] as u32, &args, data).map(|vals| vals.into_iter().collect())
+            ctl::host_op(h, a[0] as u32, &args, data)
         }
+        proto::VMMGR_RESULT => result(h, a[0] as usize).map(Answer::Now),
         _ => Err(ctl::ENOSYS),
     };
     match r {
-        Ok(vals) => {
+        Ok(Answer::Now(vals)) => {
             set_mr(0, 0);
             for (i, &v) in vals.iter().enumerate() {
                 set_mr(1 + i, v);
             }
-            len += vals.len();
+            1 + vals.len()
         }
-        Err(e) => set_mr(0, e as u64),
+        Ok(Answer::Later(token)) => {
+            set_mr(0, proto::VMMGR_PENDING);
+            set_mr(1, token as u64);
+            2
+        }
+        Err(e) => {
+            set_mr(0, e as u64);
+            1
+        }
     }
-    len
 }
 
 /// Up to six reply values.
-type Vals = ArrayVec<u64, 6>;
+pub type Vals = ArrayVec<u64, 6>;
+
+/// A request's answer: now, or later (VMMGR_PENDING), when a driver has
+/// answered, for this token.
+pub enum Answer {
+    Now(Vals),
+    Later(usize),
+}
+
+/// What a pending request answers.
+pub enum OpResult {
+    Vals(Vals),
+    /// An attached disk's channel frames, and its kick, in a slot of the
+    /// guest's.
+    Disk { chan: Channel, kick: cap::Notification },
+}
+
+/// A request root answers later (VMMGR_PENDING): for a guest (id,
+/// instance), if any; its answer, once there is one.
+pub struct Op {
+    guest: Option<(usize, u64)>,
+    done: Option<Result<OpResult, i64>>,
+}
+
+pub type Ops = [Option<Op>; proto::MAX_PENDING];
+
+/// A token for a request to be answered later, for `guest` if any.
+/// EBUSY if vmmgr has as many waiting as there are tokens.
+pub fn op_new(h: &mut Host, guest: Option<usize>) -> Result<usize, i64> {
+    let guest = match guest {
+        Some(id) => Some((id, h.guests.get(id).and_then(|g| g.as_ref()).ok_or(ctl::ENOENT)?.instance)),
+        None => None,
+    };
+    let t = h.ops.iter().position(Option::is_none).ok_or(ctl::EBUSY)?;
+    h.ops[t] = Some(Op { guest, done: None });
+    Ok(t)
+}
+
+/// The request of `token` is answered: tell vmmgr.  Not its guest's if
+/// that has gone since (a disk's kick is in one of its slots, which go
+/// with it).
+pub fn op_done(h: &mut Host, token: usize, r: Result<OpResult, i64>) {
+    let Some(op) = h.ops[token].as_mut() else { return };
+    let gone = op.guest.is_some_and(|(id, instance)| h.guests[id].as_ref().is_none_or(|g| g.instance != instance));
+    op.done = Some(if gone { Err(ctl::ENOENT) } else { r });
+    if let Some(v) = &h.vmmgr {
+        v.op_done(token);
+    }
+}
+
+/// VMMGR_RESULT: the answer of pending request `token`, which frees it.
+fn result(h: &mut Host, token: usize) -> Result<Vals, i64> {
+    let op = h.ops.get_mut(token).ok_or(ctl::EINVAL)?;
+    if op.as_ref().is_none_or(|op| op.done.is_none()) {
+        return Err(if op.is_some() { ctl::EAGAIN } else { ctl::EINVAL });
+    }
+    match op.take().unwrap().done.unwrap()? {
+        OpResult::Vals(vals) => Ok(vals),
+        OpResult::Disk { chan, kick } => {
+            for (i, f) in chan.iter().enumerate() {
+                xchg(h, i).copy(&abs_of(*f), CapRights::all()).expect("vmmgr channel frame");
+            }
+            xchg(h, chan.len()).move_(&abs_of(kick)).expect("vmmgr blkd kick");
+            h.alloc.slots.free(kick.bits() as Slot);
+            Ok(Vals::new())
+        }
+    }
+}
+
+/// What a guest leaves behind while drivers may still use some of it:
+/// the memory they map (disk channels, extent tables, port memory), and
+/// without an IOMMU its I/O pool, which a disk may still write.  Its root
+/// slots belong to zombie_owner(z) meanwhile.
+pub struct Zombie {
+    arena: Arena,
+    /// Removals the drivers have not finished.
+    waits: usize,
+    /// The I/O pool, if it is still in the arena, and whether a disk that
+    /// could not be stopped keeps it out of use for good.
+    pool: Option<usize>,
+    pin: bool,
+}
+
+pub type Zombies = [Option<Zombie>; MAX_GUESTS];
+
+/// Root slot owners of zombies, after the guests'; of a guest's slots that
+/// had no zombie to go to.
+const fn zombie_owner(z: usize) -> usize {
+    MAX_GUESTS + z
+}
+const LOST_OWNER: usize = 2 * MAX_GUESTS;
+const _: () = assert!(LOST_OWNER < crate::mem::GLOBAL as usize);
+
+/// A driver has finished a removal that zombie `z` waits for: whether the
+/// pool can be reused.  The zombie's memory is reclaimed after the last.
+pub fn zombie_done(h: &mut Host, z: Option<usize>, pool_reusable: bool) {
+    let Some(z) = z else { return };
+    let Some(zb) = h.zombies[z].as_mut() else { return };
+    zb.pin |= !pool_reusable;
+    zb.waits -= 1;
+    if zb.waits > 0 {
+        return;
+    }
+    let zb = h.zombies[z].take().unwrap();
+    let (pin, pool) = (zb.pin, zb.pool);
+    let pinned = h.alloc.reclaim_pinning(zb.arena, |p| pin && Some(p) == pool);
+    h.alloc.slots.free_owned(zombie_owner(z));
+    if pinned != 0 {
+        log!("l4h-root: {} MiB of I/O pool kept out of use: a disk of a deleted guest could not be stopped", pinned >> 20);
+    }
+}
 
 fn guest_arg(id: u64) -> Result<usize, i64> {
     let id = id as usize;
@@ -387,7 +513,7 @@ fn guest_arg(id: u64) -> Result<usize, i64> {
 }
 
 /// Run `f` on guest `id` with root slot allocations tracked into it.
-fn with_guest<R>(h: &mut Host, id: usize, f: impl FnOnce(&mut Host, &mut RootGuest) -> Result<R, i64>) -> Result<R, i64> {
+pub fn with_guest<R>(h: &mut Host, id: usize, f: impl FnOnce(&mut Host, &mut RootGuest) -> Result<R, i64>) -> Result<R, i64> {
     let mut g = h.guests.get_mut(id).and_then(|g| g.take()).ok_or(ctl::ENOENT)?;
     h.alloc.slots.track(id);
     let r = f(h, &mut g);
@@ -454,36 +580,74 @@ fn guest_new(h: &mut Host, a: [u64; 8]) -> Result<Vals, i64> {
     r
 }
 
-/// VMMGR_GUEST_DEL: vmmgr has stopped and torn down guest `id`.  Disks are
-/// quiesced, or cut off by the IOMMU, before any memory they were given is
-/// reused.
+/// GUEST_DEL's answer: no bytes of pool kept out of use, which root says
+/// itself (zombie_done) once it knows.
+fn kept_later() -> Vals {
+    [0].into_iter().collect()
+}
+
+/// VMMGR_GUEST_DEL: vmmgr has stopped and torn down guest `id`.  Disks
+/// are cut off from the I/O pool by the IOMMU at once; what drivers map
+/// (disk channels, port memory) is kept until they say they no longer use
+/// it, which root never waits for (a Zombie).  Without an IOMMU the pool
+/// is kept with it, as a disk may still write to it.
 fn guest_del(h: &mut Host, id: usize) -> Result<Vals, i64> {
-    let g = h.guests.get_mut(id).and_then(|g| g.take()).ok_or(ctl::ENOENT)?;
+    let mut g = h.guests.get_mut(id).and_then(|g| g.take()).ok_or(ctl::ENOENT)?;
     if let Some(t) = &mut h.trustd {
         t.unregister(id);
     }
-    for &p in &g.ports {
-        h.netd.remove_port(p);
+    // Answers for it that vmmgr has not taken are no more.
+    for op in h.ops.iter_mut().flatten() {
+        if op.guest == Some((id, g.instance)) && op.done.is_some() {
+            op.done = Some(Err(ctl::ENOENT));
+        }
     }
-    let mut quiet = true;
-    for &(ctrl, client) in &g.disks {
-        quiet &= crate::blkd::remove(&mut h.ctrls[ctrl], client, &h.pci, &mut h.iommu);
+    let mut cut = true;
+    for &(c, i) in &g.disks {
+        cut &= blkd::cut_off(h, c, i);
     }
-    // A disk that could not be stopped may still write to the pool, the
-    // only memory of the guest's a device is given: it is kept out of use
-    // for good.
+    let waits = g.disks.len() + g.ports.len();
+    if waits == 0 {
+        h.alloc.reclaim(g.arena);
+        h.alloc.slots.free_owned(id);
+        return Ok(kept_later());
+    }
+    // No device reaches the pool any more: it goes now.
     let pool = g.pool.paddr;
-    let pinned = h.alloc.reclaim_pinning(g.arena, |p| !quiet && p == pool);
-    h.alloc.slots.free_owned(id);
-    Ok([pinned as u64].into_iter().collect())
+    if cut {
+        if let Some(k) = g.arena.owned.iter().position(|o| o.1 == pool) {
+            let (slot, paddr, bits) = g.arena.owned.remove(k);
+            let mut a = Arena::new();
+            a.own(slot, paddr, bits);
+            h.alloc.reclaim(a);
+        }
+    }
+    let z = h.zombies.iter().position(Option::is_none);
+    match z {
+        Some(z) => {
+            h.zombies[z] = Some(Zombie { arena: g.arena, waits, pool: (!cut).then_some(pool), pin: false });
+            h.alloc.slots.reown(id, zombie_owner(z));
+        }
+        None => {
+            log!("l4h-root: guest {}: its memory stays with the drivers for good: too many guests' does", id);
+            h.alloc.slots.reown(id, LOST_OWNER);
+        }
+    }
+    for &p in &g.ports {
+        Netd::remove_port(h, p, z);
+    }
+    for &(c, i) in &g.disks {
+        blkd::remove(h, c, i, z);
+    }
+    Ok(kept_later())
 }
 
 /// VMMGR_DISK_ATTACH: pass host disk `disk` (or sectors [lba_start,
 /// lba_start + lba_count) of it, 0 = to the end; or the n extents at
 /// `list` in dom0's control data area) through to the guest, with
 /// abi::BLK_* flags.  blkd decides whether the disk may attach, and in
-/// which slot.
-fn disk_attach(h: &mut Host, a: [u64; 8]) -> Result<Vals, i64> {
+/// which slot: answered later (blkd::poll).
+fn disk_attach(h: &mut Host, a: [u64; 8]) -> Result<Answer, i64> {
     let id = guest_arg(a[0])?;
     let (dev, disk, flags, lba_start, lba_count) = (a[1] as usize, a[2] as usize, a[3], a[4], a[5]);
     let (read_only, volatile) = (flags & abi::BLK_RO != 0, flags & abi::BLK_VOLATILE != 0);
@@ -496,23 +660,14 @@ fn disk_attach(h: &mut Host, a: [u64; 8]) -> Result<Vals, i64> {
     let (c, unit) = (h.disks[disk].ctrl, h.disks[disk].unit);
     let dom0 = h.guests[id].as_ref().ok_or(ctl::ENOENT)?.dom0;
     let list = (CTL_DATA_VA + list as usize) as *const u8;
-    let (client, window, read_only) =
-        h.ctrls[c].check(unit, lba_start, lba_count, n, list, read_only, dom0, &mut h.wins.a, &h.pci)?;
-    if !h.can_afford(1 << 20, 0, 0) { return Err(ctl::ENOMEM); }
-    with_guest(h, id, |h, g| {
-        if g.disks.is_full() {
-            return Err(ctl::ENOSPC);
+    let t = op_new(h, Some(id))?;
+    match blkd::attach_start(h, c, t, id, disk, unit, (lba_start, lba_count), (n, list), read_only, volatile, dom0) {
+        Ok(()) => Ok(Answer::Later(t)),
+        Err(e) => {
+            h.ops[t] = None;
+            Err(e)
         }
-        let (chan, kick) = crate::blkd::attach(&mut h.ctrls[c], client, disk, g, window, n, read_only, volatile, &mut h.alloc, &mut h.iommu);
-        g.disks.must_push((c, client));
-        crate::blkd::activate(&mut h.ctrls[c], unit, client, g, &chan, &mut h.wins.a, &h.pci)?;
-        for (i, f) in chan.iter().enumerate() {
-            xchg(h, i).copy(&abs_of(*f), CapRights::all()).expect("vmmgr channel frame");
-        }
-        xchg(h, chan.len()).move_(&abs_of(kick)).expect("vmmgr blkd kick");
-        h.alloc.slots.free(kick.bits() as Slot);
-        Ok(Vals::new())
-    })
+    }
 }
 
 /// VMMGR_NIC_ADD: a port of `switch` for the guest.  Returns the MAC.
@@ -528,6 +683,9 @@ fn nic_add(h: &mut Host, a: [u64; 8]) -> Result<Vals, i64> {
     with_guest(h, id, |h, g| {
         if g.ports.is_full() {
             return Err(ctl::ENOSPC);
+        }
+        if !h.netd.room() {
+            return Err(ctl::EBUSY);
         }
         let p = h.netd.free_port(switch)?;
         // Generated: 02:4c:34:<partition>:<guest>:<port>, unique across the

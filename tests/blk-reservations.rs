@@ -16,18 +16,25 @@ impl Iommu {
 }
 struct Slot;
 impl Slot { fn delete(&self) -> Result<(), ()> { Ok(()) } }
-struct Component { service_ep: u64 }
+struct Component;
 impl Component { fn slot(&self, _: u64) -> Slot { Slot } }
 struct Driver { comp: Component }
 pub struct Controller {
     clients: Vec<Option<Attachment>>, driver: Option<Driver>, failed: bool, dom: Domain,
 }
-fn call(ep: u64, _: u64, _: &[u64]) -> u64 { ep }
 fn quarantine(c: &mut Controller, _: &Pci) { c.failed = true; }
+pub struct Host { ctrls: Vec<Controller>, pci: Pci, iommu: Iommu, released: Vec<(Option<usize>, bool)> }
+mod vmmgr {
+    /// What a deleted guest's memory waits for: the removal, and whether
+    /// its pool can be reused.
+    pub fn zombie_done(h: &mut crate::Host, zombie: Option<usize>, reusable: bool) {
+        h.released.push((zombie, reusable));
+    }
+}
 
 fn reservation() -> Attachment {
     Attachment { vm: 0, disk: 0, window: DiskWindow::new(8, 16, 1024).unwrap(), extents: 0,
-        read_only: false, volatile: false, reserved: true, pool: None }
+        read_only: false, volatile: false, reserved: true, pool: None, remove: None }
 }
 
 #[test]
@@ -63,21 +70,27 @@ fn explicit_ranges_still_use_the_known_capacity() {
 fn detach_keeps_boot_reservations_and_releases_normal_attachments() {
     for reserved in [false, true] {
         for fails in [false, true] {
-            let mut a = reservation();
-            a.reserved = reserved;
-            a.pool = Some((0x100000, 0x400000));
-            let mut c = Controller { clients: vec![Some(a)], failed: false, dom: Domain(1),
-                driver: Some(Driver { comp: Component { service_ep: if fails { u64::MAX } else { 0 } } }) };
-            let mut iommu = Iommu { unmapped: Vec::new() };
-            assert!(remove(&mut c, 0, &Pci, &mut iommu));
-            assert_eq!(c.failed, fails);
-            assert_eq!(iommu.unmapped, [(0x100000, 0x400000)]);
-            if reserved {
-                // Still listed as dom0's, without a pool.
-                let kept = c.clients[0].as_ref().unwrap();
-                assert!(kept.pool.is_none() && kept.vm == 0 && kept.window == reservation().window);
-            } else {
-                assert!(c.clients[0].is_none());
+            for dom in [Domain(1), Domain::NONE] {
+                let mut a = reservation();
+                a.reserved = reserved;
+                a.pool = Some((0x100000, 0x400000));
+                a.remove = Some(Removal { zombie: Some(3), posted: true });
+                let c = Controller { clients: vec![Some(a)], failed: false, dom, driver: Some(Driver { comp: Component }) };
+                let mut h = Host { ctrls: vec![c], pci: Pci, iommu: Iommu { unmapped: Vec::new() }, released: Vec::new() };
+                // The pool leaves the domain at once; blkd drains later.
+                assert_eq!(cut_off(&mut h, 0, 0), dom != Domain::NONE);
+                assert_eq!(h.iommu.unmapped, [(0x100000, 0x400000)]);
+                removed(&mut h, 0, 0, !fails);
+                assert_eq!(h.ctrls[0].failed, fails);
+                // Without a domain, a disk that did not drain keeps the pool.
+                assert_eq!(h.released, [(Some(3), !fails || dom != Domain::NONE)]);
+                if reserved {
+                    // Still listed as dom0's, without a pool or removal.
+                    let kept = h.ctrls[0].clients[0].as_ref().unwrap();
+                    assert!(kept.pool.is_none() && kept.remove.is_none() && kept.vm == 0 && kept.window == reservation().window);
+                } else {
+                    assert!(h.ctrls[0].clients[0].is_none());
+                }
             }
         }
     }

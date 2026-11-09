@@ -120,6 +120,20 @@ pub const VMMGR_TRUST_REGISTER: u64 = 0x104;
 /// vals; its data is in the result page.  The data area of dom0's control
 /// device is the source of CTL_BLK_WRITE.
 pub const VMMGR_HOST_OP: u64 = 0x105;
+/// MR0 = a token of VMMGR_PENDING, which root has answered: the answer, as
+/// the request would have given it (exchange slots too), and the token is
+/// free.  EAGAIN if root has not answered yet.
+pub const VMMGR_RESULT: u64 = 0x106;
+
+/// MR0 of a reply instead of 0 or an errno: root has taken the request and
+/// waits for a driver (DISK_ATTACH, and HOST_OP's BLK_WRITE and BLK_INFO),
+/// which root never waits for in a call.  MR1 = a token below
+/// MAX_PENDING: root sets its bit in Events::ops_done and signals
+/// BADGE_ROOT_EVENT once it has the answer, which VMMGR_RESULT gives.  A
+/// driver that never answers leaves it pending; the guest's GUEST_DEL
+/// still answers ENOENT for it.
+pub const VMMGR_PENDING: u64 = 1 << 63;
+pub const MAX_PENDING: usize = 64;
 
 /// Radix of the CNode of a netd port's frames.
 pub const PORT_RADIX: usize = 10;
@@ -131,7 +145,10 @@ pub struct Events {
     pub attest_done: core::sync::atomic::AtomicU64,
     /// A serial monitor command (MONITOR_*), 0 once vmmgr took it.
     pub monitor: core::sync::atomic::AtomicU64,
+    /// Bit t: root has the answer of pending request t (VMMGR_PENDING).
+    pub ops_done: core::sync::atomic::AtomicU64,
 }
+const _: () = assert!(MAX_PENDING <= 64);
 
 /// Monitor commands, (cmd << 32) | arg.
 pub const MONITOR_DESTROY: u64 = 1;

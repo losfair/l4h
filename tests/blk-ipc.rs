@@ -1,5 +1,6 @@
-//! Run the production block service with mocked IPC and disk hardware.
-//! Kernel invocations overwrite MRs just as the Rust seL4 stubs do.
+//! Run the production block service with mocked IPC, root's mailbox and
+//! disk hardware.  Kernel invocations overwrite MRs just as the Rust seL4
+//! stubs do.
 #![allow(dead_code)]
 
 extern crate self as l4h_rt;
@@ -9,6 +10,7 @@ use host::blk::{self, BlkdConfig, Channel};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use production::{DevInfo, Driver, Seg};
 
@@ -27,6 +29,7 @@ impl Info {
 }
 
 pub fn cap<T>(slot: u64) -> sel4::Cap<T> { sel4::Cap(slot, core::marker::PhantomData) }
+pub fn test_hang() -> ! { unreachable!("host::TEST_INJECT is off") }
 
 pub mod sel4 {
     pub mod cap_type {
@@ -56,30 +59,44 @@ pub mod sel4 {
         crate::KERNEL.with_borrow_mut(|k| f(&mut k.ipc))
     }
     impl Cap<cap_type::Endpoint> {
+        /// Root's signal (BADGE_CALL); the test ends once every request
+        /// is answered.
         pub fn recv(self, _: Cap<cap_type::Reply>) -> (MessageInfo, u64) {
-            crate::KERNEL.with_borrow_mut(|k| {
-                let (label, args, pending_io) = k.requests.pop_front().expect("unexpected receive");
-                k.ipc.0[..args.len()].copy_from_slice(&args);
-                if pending_io {
-                    // A client publishes work while root's service call is
-                    // being received. submit() must notify the hardware.
-                    unsafe { (*crate::channel()).sq.head = 1; }
-                }
-                (MessageInfo::new(label, 0, 0, args.len()), 0)
-            })
-        }
-        pub fn reply_recv(self, msg: MessageInfo, reply: Cap<cap_type::Reply>) -> (MessageInfo, u64) {
-            let finished = crate::KERNEL.with_borrow_mut(|k| {
-                assert_eq!(msg.length, 5);
-                k.replies.push(k.ipc.0[..5].try_into().unwrap());
-                k.requests.is_empty()
-            });
-            if finished { std::panic::panic_any(crate::Finished); }
-            self.recv(reply)
+            if crate::KERNEL.with_borrow(|k| k.requests.is_empty()) { std::panic::panic_any(crate::Finished); }
+            (MessageInfo::new(0, 0, 0, 0), crate::host::mailbox::BADGE_CALL)
         }
     }
     impl Cap<cap_type::Notification> { pub fn signal(self) { crate::KERNEL.with_borrow_mut(|k| k.signals += 1); } }
     impl Cap<cap_type::IrqHandler> { pub fn irq_handler_ack(self) -> Result<(), ()> { Ok(()) } }
+}
+
+/// Root's requests, as l4h_rt::mailbox gives them.
+pub mod mailbox {
+    use super::*;
+    static PUBLISHED: [AtomicU64; 512] = [const { AtomicU64::new(0) }; 512];
+    pub fn published<T>() -> &'static T {
+        const { assert!(core::mem::size_of::<T>() <= 4096) };
+        unsafe { &*PUBLISHED.as_ptr().cast::<T>() }
+    }
+    pub fn request() -> Option<u64> {
+        crate::KERNEL.with_borrow_mut(|k| {
+            let (label, args, pending_io) = k.requests.pop_front()?;
+            k.ipc.0[..args.len()].copy_from_slice(&args);
+            if pending_io {
+                // A client publishes work while root's request is taken.
+                // submit() must notify the hardware.
+                unsafe { (*crate::channel()).sq.head = 1; }
+            }
+            Some(label)
+        })
+    }
+    pub fn answer(n: usize) {
+        crate::KERNEL.with_borrow_mut(|k| {
+            assert_eq!(n, 5);
+            k.replies.push(k.ipc.0[..5].try_into().unwrap());
+        });
+    }
+    pub fn signal() {}
 }
 
 mod production {
@@ -225,10 +242,14 @@ fn run(kind: u32, legacy: bool, label: u64, pending_io: bool, retry: bool, statu
 }
 
 #[test]
-fn disk_info_survives_pending_io() {
+fn units_are_published_and_requests_survive_pending_io() {
     for kind in [blk::BLKD_VIRTIO, blk::BLKD_VIRTIO_SCSI] {
         for legacy in [false, true] {
-            assert_eq!(run(kind, legacy, blk::BLKD_INFO, true, false, 0), [131072, 512, 0, 1, 0x301]);
+            assert_eq!(run(kind, legacy, u64::MAX, true, false, 0)[0], u64::MAX);
+            let p = mailbox::published::<blk::Published>();
+            let u = &p.unit[0];
+            let unit = [&u.capacity, &u.block_size, &u.read_only, &u.address].map(|w| w.load(Ordering::Relaxed));
+            assert_eq!((p.ready.load(Ordering::Relaxed), p.units.load(Ordering::Relaxed), unit), (1, 1, [131072, 512, 0, 0x301]));
         }
     }
 }
@@ -268,9 +289,9 @@ fn a_split_request_waits_for_room_and_drains_on_remove() {
     }
     KERNEL.with_borrow_mut(|k| {
         k.ipc.0.fill(0);
-        // Attach the two extents; the request arrives with BLKD_INFO; the
-        // device has room for one piece; then remove the client.
-        k.requests = [(blk::BLKD_ADD, [0, 0, 0, 2, 0, 0], false), (blk::BLKD_INFO, [0; 6], true),
+        // Attach the two extents; the request arrives with an extent query;
+        // the device has room for one piece; then remove the client.
+        k.requests = [(blk::BLKD_ADD, [0, 0, 0, 2, 0, 0], false), (blk::BLKD_EXTENT, [0; 6], true),
             (blk::BLKD_REMOVE, [0; 6], false)].into();
         k.replies.clear();
         (k.retry, k.status, k.kicks, k.room) = (false, 0, 0, 1);

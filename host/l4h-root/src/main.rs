@@ -32,6 +32,7 @@ mod devmem;
 mod iommu;
 mod layout;
 mod logd;
+mod mailbox;
 mod memd;
 mod monitor;
 mod netd;
@@ -76,6 +77,8 @@ pub const MAX_GUESTS: usize = 64;
 pub const HYP_BADGE_FAULT: u64 = host::BADGE_FAULT;
 /// What root made for vmmgr's guests, by id.
 static GUESTS: StaticCell<[Option<RootGuest>; MAX_GUESTS]> = StaticCell::new([const { None }; MAX_GUESTS]);
+static OPS: StaticCell<vmmgr::Ops> = StaticCell::new([const { None }; l4h_host::vmmgr::MAX_PENDING]);
+static ZOMBIES: StaticCell<vmmgr::Zombies> = StaticCell::new([const { None }; MAX_GUESTS]);
 /// Memory and root CNode slots kept back from guest requests.
 const RESERVE_BYTES: usize = 32 << 20;
 const RESERVE_SLOTS: usize = 32768;
@@ -251,6 +254,10 @@ pub struct Host {
     pub netd: netd::Netd,
     /// What root made for vmmgr's guests.
     pub guests: &'static mut [Option<RootGuest>; MAX_GUESTS],
+    /// vmmgr's requests that wait for a driver.
+    pub ops: &'static mut vmmgr::Ops,
+    /// Deleted guests' memory that drivers may still use.
+    pub zombies: &'static mut vmmgr::Zombies,
     pub total_bytes: usize,
     pub monitor: Option<monitor::Monitor>,
     pub dashboard: Option<dashboard::Dashboard>,
@@ -293,14 +300,30 @@ impl Host {
         Ok(())
     }
 
-    /// Start every controller's blkd and number the host disks: one per
-    /// unit of each controller, in PCI order.  The host fails to boot if
-    /// it cannot start them all (each needs 4 MiB of physically
-    /// contiguous DMA memory), so no disk is ever missing its driver.  A
-    /// controller that did not reset stays disabled: its disk (virtio-blk
-    /// and NVMe have one) keeps its number and fails with EIO, and a
-    /// virtio-scsi one has no units to report.
-    fn scan_disks(&mut self) {
+    /// Start every controller's blkd.  The host fails to boot if it cannot
+    /// start them all (each needs 4 MiB of physically contiguous DMA
+    /// memory), so no disk is ever missing its driver.
+    fn start_disks(&mut self) {
+        for c in 0..self.ctrls.len() {
+            if !self.ctrls[c].failed {
+                blkd::start(c, &mut self.ctrls[c], &self.pci, &mut self.iommu,
+                    &mut self.devmem, &mut self.alloc, &mut self.wins.a, &mut self.asids, &self.info);
+            }
+        }
+    }
+
+    /// Whether every driver has published what boot reads (its units, its
+    /// NICs' MACs), or never will.
+    fn drivers_ready(&self) -> bool {
+        self.ctrls.iter().all(|c| c.ready()) && self.netd.ready()
+    }
+
+    /// Number the host disks, once their blkds are ready: one per unit of
+    /// each controller, in PCI order.  A controller that did not reset
+    /// stays disabled: its disk (virtio-blk and NVMe have one) keeps its
+    /// number and fails with EIO, and a virtio-scsi one has no units to
+    /// report.
+    fn number_disks(&mut self) {
         let add = |disks: &mut ArrayVec<Disk, MAX_DISKS>, d: Disk| {
             let (unit, ctrl) = (d.unit, d.ctrl);
             if disks.push(d).is_err() {
@@ -308,16 +331,8 @@ impl Host {
             }
         };
         for c in 0..self.ctrls.len() {
-            let failed = self.ctrls[c].failed;
-            if !failed {
-                blkd::start(0x100 + c as u32, &mut self.ctrls[c], &self.pci, &mut self.iommu,
-                    &mut self.devmem, &mut self.alloc, &mut self.wins.a, &mut self.asids, &self.info);
-            }
             if self.ctrls[c].kind != l4h_host::blk::BLKD_VIRTIO_SCSI {
                 add(self.disks, Disk::new(c, 0));
-                continue;
-            }
-            if failed {
                 continue;
             }
             let units = self.ctrls[c].info(0).1;
@@ -327,6 +342,14 @@ impl Host {
                 }
             }
         }
+    }
+
+    /// Finish what the drivers have answered (mailbox.rs).
+    fn poll_drivers(&mut self) {
+        for c in 0..self.ctrls.len() {
+            blkd::poll(self, c);
+        }
+        netd::Netd::poll(self);
     }
 }
 
@@ -358,6 +381,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     // wakes the serve loop out of its receive on hyp_ep.
     let wd_ntfn = alloc.object_cap::<cap_type::Notification>(ObjectBlueprint::Notification);
     slot::TCB.cap().tcb_bind_notification(wd_ntfn).expect("bind watchdog notification");
+    mailbox::init(wd_ntfn);
     let reply = ReplySlot::new(&mut alloc);
     let mut wins = Windows {
         a: Window::new(&mut alloc, slot::VSPACE.cap(), layout::WINDOWS.base),
@@ -512,6 +536,8 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         disks: unsafe { &mut *(&raw mut DISKS) },
         netd,
         guests: GUESTS.take(),
+        ops: OPS.take(),
+        zombies: ZOMBIES.take(),
         total_bytes,
         monitor: None,
         dashboard,
@@ -526,20 +552,27 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         ntfn: wd_ntfn,
         channels: None,
     };
-    h.scan_disks();
+    h.start_disks();
     // The serial port and its interrupt (an I/O APIC pin) are partition 0's.
     if !partition::secondary() {
         h.monitor = uart.as_ref().and_then(|u| monitor::Monitor::new(&mut h.alloc, wd_ntfn, u.monitor, h.cfg.serial_port, h.cfg.serial_irq, &mut h.iommu));
     }
     h.channels = channel::Channels::new(&mut h.alloc, &mut h.devmem, wd_ntfn, h.info.tsc_hz);
+    // The rest of the boot needs the drivers' disks and MACs, which root
+    // does not wait for: the serve loop finishes it (finish_boot).
+    serve(&mut h, reply, &modules)
+}
 
-    if module("guest-kernel").is_none() {
+/// The drivers have published their disks and MACs: number the disks, and
+/// start vmmgr with dom0's plan.
+fn finish_boot(h: &mut Host, modules: &bootmod::Modules) {
+    h.number_disks();
+    if !modules.iter().any(|m| m.name == "guest-kernel") {
         log!("l4h-root: no guest kernel, nothing to do");
     } else {
-        let plan = dom0_plan(&mut h, wd_ntfn);
-        h.vmmgr = Some(vmmgr::spawn(&mut h, &modules, &plan));
+        let plan = dom0_plan(h, h.ntfn);
+        h.vmmgr = Some(vmmgr::spawn(h, modules, &plan));
     }
-    serve(&mut h, reply)
 }
 
 /// dom0's disks and vNICs, the same for every dom0 vmmgr starts: the
@@ -754,15 +787,26 @@ impl ReplySlot {
 
 /// Serve calls and faults of host components, and the timer and serial
 /// interrupts.
-fn serve(h: &mut Host, reply_slot: ReplySlot) -> ! {
+fn serve(h: &mut Host, reply_slot: ReplySlot, modules: &bootmod::Modules) -> ! {
     let reply = reply_slot.reply;
     let hyp_ep = h.info.hyp_ep;
     arm_timer(&h.info);
     let mut next_watchdog = rdtsc() + h.info.tsc_hz * h.cfg.watchdog_secs as u64;
+    let mut booting = true;
     let (mut info, mut badge) = hyp_ep.recv(reply);
     loop {
         h.alloc.refill();
-        let notified = badge & (TIMER_BADGE | monitor::MONITOR_BADGE | channel::CHANNEL_BADGE | netd::LINK_BADGES) != 0;
+        let notified = badge & (TIMER_BADGE | monitor::MONITOR_BADGE | channel::CHANNEL_BADGE | netd::LINK_BADGES
+            | mailbox::MAILBOX_BADGE) != 0;
+        // Drivers' answers, and what a quarantine left (blkd::poll).  Not
+        // on a call: it would overwrite the caller's message registers.
+        if notified {
+            h.poll_drivers();
+            if booting && h.drivers_ready() {
+                booting = false;
+                finish_boot(h, modules);
+            }
+        }
         if badge & monitor::MONITOR_BADGE != 0 {
             monitor::Monitor::interrupt(h);
         }

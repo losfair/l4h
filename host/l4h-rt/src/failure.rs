@@ -24,9 +24,10 @@ pub fn set_failure_handler(handler: &'static FailureHandler) {
 }
 
 /// Answer the callers of a failed component: u64::MAX and zeros to every
-/// call, the one the main thread's reply object holds (if any) first.
+/// call, the one the main thread's reply object holds (if any) first, and
+/// to every request in its mailbox (host::mailbox), if it has one.
 /// Faults sent to it (vmmgr's guests' and VMMs') stay unanswered.
-pub(crate) fn answer_failed(tcb: u64) -> ! {
+pub(crate) fn answer_failed(tcb: u64, mailbox: bool) -> ! {
     let handler = unsafe { HANDLER.load(Ordering::Acquire).as_ref() };
     if let Some(handler) = handler {
         if tcb != host::SLOT_TCB {
@@ -37,6 +38,9 @@ pub(crate) fn answer_failed(tcb: u64) -> ! {
                 .tcb_bind_notification(cap(host::SLOT_NTFN)).expect("failure bind");
         }
         (handler.notified)(0);
+    }
+    if mailbox {
+        crate::mailbox::fail();
     }
     let ep = cap::<sel4::cap_type::Endpoint>(host::SLOT_SERVICE_EP);
     let reply = cap::<sel4::cap_type::Reply>(host::SLOT_REPLY);
@@ -52,7 +56,10 @@ pub(crate) fn answer_failed(tcb: u64) -> ! {
         } else {
             ep.recv(reply)
         };
-        if let Some(handler) = handler.filter(|h| badge & h.notification_badges != 0) {
+        if mailbox && badge & host::mailbox::BADGE_CALL != 0 {
+            crate::mailbox::fail();
+            answer = false;
+        } else if let Some(handler) = handler.filter(|h| badge & h.notification_badges != 0) {
             (handler.notified)(badge);
             answer = false;
         } else {

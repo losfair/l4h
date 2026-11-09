@@ -99,6 +99,9 @@ regions! {
     TRUSTD_RELAY = 0x7500_0002_0000, l4h_host::trust::RELAY_PAGES * PAGE;
     /// memd's status page (memd.rs).
     MEMD_STATUS = 0x7700_0000_0000, PAGE;
+    /// The drivers' mailboxes, netd's then each disk controller's
+    /// (mailbox.rs).
+    MAILBOXES = 0x7a00_0000_0000, (1 + crate::pci::MAX_DISK_CTRLS) * l4h_host::mailbox::MAILBOX_PAGES * PAGE;
     /// x86 multikernel partitions: each PCI function's ECAM page, by BDF
     /// (pci.rs).
     ECAM_X86 = 0x6100_0000_0000, 256 * MIB;

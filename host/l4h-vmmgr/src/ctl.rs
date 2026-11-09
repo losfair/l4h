@@ -10,7 +10,8 @@ use l4h_abi as abi;
 use l4h_host as host;
 
 use crate::guest::{GuestConfig, State};
-use crate::{MAX_GUESTS, Vmmgr, root};
+use crate::root::Later;
+use crate::{MAX_GUESTS, Then, Vmmgr, root};
 
 pub const EPERM: i64 = 1;
 pub const ENOENT: i64 = 2;
@@ -21,6 +22,9 @@ pub const EBUSY: i64 = 16;
 pub const EINVAL: i64 = 22;
 pub const ENOSPC: i64 = 28;
 pub const ENOSYS: i64 = 38;
+/// Not an errno: the request waits for root, which answers it later
+/// (`answer`).
+const DEFER: i64 = i64::MAX;
 
 const HOST_VERSION: &str = match option_env!("L4H_VERSION") {
     Some(version) => version,
@@ -28,9 +32,10 @@ const HOST_VERSION: &str = match option_env!("L4H_VERSION") {
 };
 const _: () = assert!(!HOST_VERSION.is_empty() && HOST_VERSION.len() <= abi::CTL_DATA_MAX);
 
-/// Execute the request in the control page of guest `caller` (dom0).
-pub fn handle(h: &mut Vmmgr, caller: usize) {
-    let Some(page) = h.guest(caller).and_then(|g| g.ctl_page()) else { return };
+/// Execute the request in the control page of guest `caller` (dom0):
+/// whether it is answered, or waits for root (`answer`).
+pub fn handle(h: &mut Vmmgr, caller: usize) -> bool {
+    let Some(page) = h.guest(caller).and_then(|g| g.ctl_page()) else { return true };
     let req = unsafe { (page as *const abi::CtlReq).read_volatile() };
     let mut resp = abi::CtlResp { status: 0, vals: [0; 6], data: [0; abi::CTL_DATA_MAX] };
     resp.status = if req.version != abi::CTL_VERSION {
@@ -38,31 +43,96 @@ pub fn handle(h: &mut Vmmgr, caller: usize) {
     } else {
         match execute(h, caller, &req, &mut resp) {
             Ok(()) => 0,
+            Err(DEFER) => return false,
             Err(e) => -e,
         }
     };
     unsafe { (page.add(abi::CTL_RESP_OFF) as *mut abi::CtlResp).write_volatile(resp) };
+    true
 }
 
 /// dom0 kicked: execute the request of each dom0 whose control page has a
 /// new seq (abi::CtlSync), then mark it done and raise the device's event.
+/// One that waits for root is answered later (`answer`); dom0 may make
+/// another meanwhile, which takes its place.  Either way vmmgr has taken
+/// the request, and its data, as `taken` says.
 pub fn kicked(h: &mut Vmmgr) {
     for id in 0..MAX_GUESTS {
-        let Some((page, instance)) = h.guest(id).filter(|g| g.dom0).and_then(|g| Some((g.ctl_page()?, g.instance))) else { continue };
+        let Some((page, instance, taken)) = h.guest(id).filter(|g| g.dom0)
+            .and_then(|g| Some((g.ctl_page()?, g.instance, g.ctl_taken))) else { continue };
         let sync = unsafe { page.add(abi::CTL_SYNC_OFF) as *mut abi::CtlSync };
         let seq = unsafe { addr_of!((*sync).seq).read_volatile() };
-        if seq == unsafe { addr_of!((*sync).done).read_volatile() } {
+        if seq == taken {
             continue;
         }
         fence(Ordering::Acquire);
-        handle(h, id);
+        h.guests[id].as_mut().unwrap().ctl_taken = seq;
+        h.ctl_now = Some((id, seq));
+        let answered = handle(h, id);
+        h.ctl_now = None;
         // The request may have restarted dom0: the page is a new one then,
         // and no one waits.
-        let Some(g) = h.guests[id].as_ref().filter(|g| g.instance == instance) else { continue };
-        let Some(d) = g.devices.iter().position(|d| d.kind == crate::guest::DevKind::Ctl) else { continue };
-        fence(Ordering::Release);
-        unsafe { addr_of_mut!((*sync).done).write_volatile(seq) };
-        g.raise_event(&mut h.alloc, crate::guest::dev_event(d));
+        if h.guests[id].as_ref().is_none_or(|g| g.instance != instance) {
+            continue;
+        }
+        unsafe { (page.add(abi::CTL_TAKEN_OFF) as *mut u32).write_volatile(seq) };
+        if answered {
+            done(h, id, seq);
+        } else {
+            raise(h, id);
+        }
+    }
+}
+
+/// Answer dom0 `caller`'s (`instance`) control request `seq` with `r`, as
+/// root answered it later: unless dom0 has made another since.
+pub fn answer(h: &mut Vmmgr, caller: usize, instance: u64, seq: u32, r: Result<[u64; 6], i64>) {
+    let Some(page) = h.guest(caller).filter(|g| g.instance == instance && g.ctl_taken == seq).and_then(|g| g.ctl_page()) else { return };
+    let resp = abi::CtlResp { status: r.err().map_or(0, |e| -e), vals: r.unwrap_or_default(), data: [0; abi::CTL_DATA_MAX] };
+    unsafe { (page.add(abi::CTL_RESP_OFF) as *mut abi::CtlResp).write_volatile(resp) };
+    done(h, caller, seq);
+}
+
+/// Mark request `seq` of dom0 `id` answered.
+fn done(h: &mut Vmmgr, id: usize, seq: u32) {
+    let Some(page) = h.guest(id).and_then(|g| g.ctl_page()) else { return };
+    let sync = unsafe { page.add(abi::CTL_SYNC_OFF) as *mut abi::CtlSync };
+    fence(Ordering::Release);
+    unsafe { addr_of_mut!((*sync).done).write_volatile(seq) };
+    raise(h, id);
+}
+
+/// Raise dom0 `id`'s control device's event.
+fn raise(h: &mut Vmmgr, id: usize) {
+    let Some(g) = h.guests[id].as_ref() else { return };
+    let Some(d) = g.devices.iter().position(|d| d.kind == crate::guest::DevKind::Ctl) else { return };
+    g.raise_event(&mut h.alloc, crate::guest::dev_event(d));
+}
+
+/// What answers the control request being executed, when root answers
+/// later.
+fn later(h: &Vmmgr) -> Then {
+    let (caller, seq) = h.ctl_now.expect("a control request");
+    Then::Ctl { caller, instance: h.guests[caller].as_ref().map_or(0, |g| g.instance), seq }
+}
+
+/// Root's answer to a host op of the control request being executed: now,
+/// or later, which defers the request.
+fn host_op(h: &mut Vmmgr, op: u32, a: &[u64; 6]) -> Result<[u64; 6], i64> {
+    match root::host_op(op, a)? {
+        Later::Now(vals) => Ok(vals),
+        Later::Token(t) => {
+            h.root_ops[t] = Some(crate::RootOp::HostOp { then: later(h) });
+            Err(DEFER)
+        }
+    }
+}
+
+/// A control request done now, or deferred.
+fn deferred(r: Later<()>) -> Result<(), i64> {
+    match r {
+        Later::Now(()) => Ok(()),
+        Later::Token(_) => Err(DEFER),
     }
 }
 
@@ -92,7 +162,7 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
             Ok(())
         }
         abi::CTL_HOST_INFO => {
-            resp.vals = root::host_op(req.op, a)?;
+            resp.vals = host_op(h, req.op, a)?;
             // Root's free memory and memd's, and ours; the guests are ours.
             resp.vals[1] += h.alloc.local_free_bytes() as u64;
             resp.vals[4] = h.guests.iter().flatten().count() as u64;
@@ -102,14 +172,14 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
         | abi::CTL_NIC_INFO | abi::CTL_SWITCH_INFO | abi::CTL_HOST_REBOOT | abi::CTL_RTC_SET
         | abi::CTL_EP_SET | abi::CTL_EP_DEL | abi::CTL_EP_LIST | abi::CTL_STEER_SET | abi::CTL_STEER_DEL
         | abi::CTL_STEER_LIST | abi::CTL_PARTITION_INFO => {
-            resp.vals = root::host_op(req.op, a)?;
+            resp.vals = host_op(h, req.op, a)?;
             resp.data = *root::result_data();
             Ok(())
         }
         abi::CTL_BLK_WRITE => {
             // From dom0's control data area, which root maps too.
             if h.guest(caller).and_then(|g| g.ctl_data()).is_none() { return Err(EINVAL); }
-            resp.vals = root::host_op(req.op, a)?;
+            resp.vals = host_op(h, req.op, a)?;
             Ok(())
         }
         abi::CTL_VM_CREATE => {
@@ -241,7 +311,8 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
             if a[2] & !(abi::BLK_RO | abi::BLK_VOLATILE) != 0 {
                 return Err(EINVAL);
             }
-            h.attach_disk(id, a[1] as usize, a[2], a[3], a[4], (0, 0))
+            let then = later(h);
+            h.attach_disk(id, a[1] as usize, a[2], a[3], a[4], (0, 0), then).and_then(deferred)
         }
         abi::CTL_BLK_ATTACH_EXTENTS => {
             let id = vm_arg(a[0])?;
@@ -252,7 +323,8 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
                 return Err(EINVAL);
             }
             // Root reads the list from the data area.
-            h.attach_disk(id, a[1] as usize, a[2], 0, 0, (a[4], a[3]))
+            let then = later(h);
+            h.attach_disk(id, a[1] as usize, a[2], 0, 0, (a[4], a[3]), then).and_then(deferred)
         }
         abi::CTL_CONSOLE_READ => {
             let g = h.guest(vm_arg(a[0])?).ok_or(ENOENT)?;

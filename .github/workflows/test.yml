@@ -92,6 +92,8 @@ jobs:
         run: L4H_RELEASE=1 tests/run-logtest.sh
       - name: Serial output when components, l4h-logd or root fail
         run: tests/run-logdtest.sh
+      - name: A driver that stops answering leaves root and the rest running
+        run: tests/run-hangtest.sh
       - name: Guest ABI and seL4 extensions (module), module tree
         run: tests/run-abitest.sh
       - name: Boot RAM clearing and initial user context

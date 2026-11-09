@@ -1,0 +1,39 @@
+#!/bin/sh
+slow=${L4H_TEST_SLOW:-1}
+# dom0 init for tests/run-hangtest.sh: disk 1's blkd stops answering, as
+# a compromised one might.  What waits for it stays pending and can be
+# given up, and the rest of the host goes on.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mount -t tmpfs tmp /tmp
+fail() { echo "HANGTEST: FAIL: $*"; poweroff -f; }
+l4hctl disks || fail "disks"
+echo "HANGTEST: ready"
+# The harness has the blkd hang through the serial monitor.
+n=0
+until l4hctl logs | grep -q "hangs (injected)"; do
+    n=$((n + 1))
+    [ "$n" -lt $((60 * slow)) ] || fail "no hang injected"
+    sleep 1
+done
+# A provisioning write waits for that blkd for good: give it up (busybox
+# timeout exits 143, killed by SIGTERM; coreutils' 124).
+gave_up() { [ "$1" = 124 ] || [ "$1" = 143 ]; }
+rc=0
+timeout 5 l4hctl disk-zero 1 0 8 || rc=$?
+gave_up "$rc" || fail "zeroing the hung disk: exit $rc, not pending"
+echo "HANGTEST: write pending, given up"
+# The next is refused at once: the first still holds blkd's staging.
+rc=0
+timeout $((10 * slow)) l4hctl disk-zero 1 0 8 2>/tmp/err || rc=$?
+[ "$rc" != 0 ] && ! gave_up "$rc" || fail "second write to the hung disk: exit $rc"
+echo "HANGTEST: second write refused: $(cat /tmp/err)"
+# Root, vmmgr and the other disk go on.
+l4hctl info >/dev/null || fail "info"
+l4hctl disks >/dev/null || fail "disks after the hang"
+id=$(l4hctl create diskvm --initrd /bin/vm.cpio.gz --mem 128 --disk 0) || fail "create with disk 0"
+l4hctl console "$id" --until "GUEST: disk ok" --timeout "$((60 * slow))" >/dev/null || fail "vm with disk 0"
+l4hctl destroy "$id" || fail "destroy"
+echo "HANGTEST: PASS"
+poweroff -f

@@ -32,6 +32,7 @@ pub use sel4_runtime_common;
 
 mod failure;
 pub mod ioport;
+pub mod mailbox;
 
 pub use failure::{FailureHandler, set_failure_handler};
 
@@ -195,25 +196,34 @@ extern "C" fn keeper() -> ! {
     let (info, _) = cap::<sel4::cap_type::Endpoint>(host::SLOT_FAULT_EP).recv(reply);
     let fault = sel4::with_ipc_buffer(|b| sel4::Fault::new(b, &info));
     log!("l4h-rt: component {:#x} fault: {:x?}", INFO.header().id, fault);
-    failure::answer_failed(host::SLOT_KEEPER)
+    failure::answer_failed(host::SLOT_KEEPER, host::mailbox::has_mailbox(INFO.header().kind))
 }
 
 pub fn cap<T: sel4::CapType>(slot: u64) -> sel4::Cap<T> {
     sel4::Cap::from_bits(slot)
 }
 
-/// Where an aborted component ends.  l4h-root calls blkd, netd and memd
-/// synchronously, and guests' VMMs call vmmgr, and could not wait for
-/// their faults to be reported: one that has failed keeps answering on its
-/// service endpoint (a fault, its keeper does).  Any other component
-/// faults, which root handles.
+/// Stop for good, without failing: for tests of what waits for a
+/// component that does not answer.  The thread suspends itself, so it
+/// takes no CPU time either.
+pub fn test_hang() -> ! {
+    log!("l4h-rt: component {:#x} hangs (injected)", INFO.header().id);
+    let _ = cap::<sel4::cap_type::Tcb>(host::SLOT_TCB).tcb_suspend();
+    unreachable!("a suspended thread ran");
+}
+
+/// Where an aborted component ends.  l4h-root calls memd and asks blkd
+/// and netd (host::mailbox), and guests' VMMs call vmmgr, and could not wait
+/// for their faults to be reported: one that has failed keeps answering on
+/// its service endpoint and mailbox (a fault, its keeper does).  Any other
+/// component faults, which root handles.
 #[doc(hidden)]
 pub fn abort_trap() -> ! {
     let h = INFO.header();
     panic_flush();
     log!("l4h-rt: component {:#x} aborted", h.id);
     if h.magic == INFO_MAGIC && host::has_keeper(h.kind) {
-        failure::answer_failed(host::SLOT_TCB);
+        failure::answer_failed(host::SLOT_TCB, host::mailbox::has_mailbox(h.kind));
     }
     loop {
         unsafe {

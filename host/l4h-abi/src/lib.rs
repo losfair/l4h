@@ -264,6 +264,10 @@ pub const MEM_UNPLUG: u64 = 2;
 pub const CTL_VERSION: u32 = 3;
 pub const CTL_RESP_OFF: usize = 2048;
 pub const CTL_SYNC_OFF: usize = 2040;
+/// The seq of the last request the host has taken (a u32 it writes):
+/// read it, and its data area, whether answered yet or not.
+pub const CTL_TAKEN_OFF: usize = 4088;
+const _: () = assert!(CTL_RESP_OFF + core::mem::size_of::<CtlResp>() <= CTL_TAKEN_OFF);
 pub const CTL_DATA_MAX: usize = 1984;
 pub const CTL_LOAD_MAX: u64 = 1 << 20;
 pub const CTL_NAME_MAX: usize = 32;

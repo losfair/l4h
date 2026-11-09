@@ -16,6 +16,7 @@ pub mod font;
 pub mod gpu;
 pub mod iopool;
 pub mod log;
+pub mod mailbox;
 pub mod memd;
 pub mod net;
 pub mod ring;
@@ -130,9 +131,9 @@ pub const KIND_MEMD: u32 = 5;
 pub const KIND_VMMGR: u32 = 6;
 pub const KIND_LOGD: u32 = 7;
 
-/// The kinds called synchronously: root calls blkd, netd and memd, guests'
-/// VMMs call vmmgr.  A caller could not wait for their faults to be
-/// reported, so a keeper thread answers for a failed one.
+/// The kinds that answer requests: root calls memd and asks blkd and netd
+/// (mailbox), guests' VMMs call vmmgr.  A caller could not wait for their
+/// faults to be reported, so a keeper thread answers for a failed one.
 pub const fn has_keeper(kind: u32) -> bool {
     matches!(kind, KIND_BLKD | KIND_NETD | KIND_MEMD | KIND_VMMGR)
 }

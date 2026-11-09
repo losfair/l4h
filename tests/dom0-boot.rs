@@ -21,7 +21,11 @@ struct GuestConfig {
 }
 struct Kernel { ram_base: usize }
 struct Windows { a: () }
-struct Guest { devices: Vec<()>, booted: bool }
+struct Guest { devices: Vec<()>, booted: bool, instance: u64 }
+/// Root answers every attachment at once here.
+enum Later<T> { Now(T), Token(usize) }
+#[derive(Clone, Copy)]
+enum Then { Dom0Boot { k: usize } }
 
 pub struct Vmmgr {
     cfg: &'static VmmgrConfig,
@@ -41,7 +45,7 @@ pub struct Vmmgr {
 
 impl Vmmgr {
     fn create_guest(&mut self, _: &GuestConfig) -> Option<usize> {
-        self.guest = Some(Guest { devices: vec![(); self.builtins], booted: false });
+        self.guest = Some(Guest { devices: vec![(); self.builtins], booted: false, instance: 1 });
         Some(0)
     }
     fn guest(&self, _: usize) -> Option<&Guest> { self.guest.as_ref() }
@@ -57,15 +61,18 @@ impl Vmmgr {
         g.devices.push(());
         Ok(())
     }
-    fn attach_disk(&mut self, _: usize, disk: usize, flags: u64, start: u64, sectors: u64, extents: (u64, u64)) -> Result<(), i64> {
+    fn attach_disk(&mut self, _: usize, disk: usize, flags: u64, start: u64, sectors: u64, extents: (u64, u64),
+        then: Then) -> Result<Later<()>, i64> {
         assert_eq!(extents, (0, 0), "boot disks are windows");
         assert_eq!(flags, 0);
         let attempt = self.disk_attempts.len();
+        let Then::Dom0Boot { k } = then;
+        assert_eq!(k, attempt, "boot disks attach in order");
         self.disk_attempts.push((disk, start, sectors));
         if self.fail_disks.contains(&attempt) { return Err(5); }
         self.add_device()?;
         self.disks.push(Some((disk, start, sectors)));
-        Ok(())
+        Ok(Later::Now(()))
     }
     fn attach_dummy_disk(&mut self, _: usize) -> Result<(), i64> {
         self.add_device()?;

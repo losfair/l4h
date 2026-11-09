@@ -1,7 +1,10 @@
 //! vmmgr's calls to l4h-root (l4h_host::vmmgr): what guests get of the
 //! hardware and of the memory devices reach.  Root answers with
 //! capabilities in our exchange slots, which we move to slots of our own.
-//! And trustd's flags, which vmmgr acts on for the console.
+//! A request that waits for a driver root answers later (Later::Token):
+//! vmmgr goes on, and takes the answer when root says it has it
+//! (main.rs, root_done).  And trustd's flags, which vmmgr acts on for the
+//! console.
 
 use sel4::{cap, cap_type};
 
@@ -9,7 +12,8 @@ use l4h_abi as abi;
 use l4h_host as host;
 use l4h_host::fixed::ArrayVec;
 use l4h_host::trust;
-use l4h_host::vmmgr::{self as proto, VMMGR_DISK_ATTACH, VMMGR_GUEST_DEL, VMMGR_GUEST_NEW, VMMGR_HOST_OP, VMMGR_NIC_ADD, VMMGR_TRUST_REGISTER};
+use l4h_host::vmmgr::{self as proto, VMMGR_DISK_ATTACH, VMMGR_GUEST_DEL, VMMGR_GUEST_NEW, VMMGR_HOST_OP, VMMGR_NIC_ADD, VMMGR_PENDING,
+    VMMGR_RESULT, VMMGR_TRUST_REGISTER};
 
 use crate::component::abs_of;
 use crate::guest::Guest;
@@ -23,14 +27,52 @@ fn ep() -> cap::Endpoint {
 
 /// Call root with `args`: Ok, or the errno it answered.
 fn call(label: u64, args: &[u64]) -> Result<(), i64> {
+    match call_later(label, args)? {
+        Later::Now(()) => Ok(()),
+        // Only the requests that say so are answered later.
+        Later::Token(_) => Err(ctl::EIO),
+    }
+}
+
+/// An answer root gives now, or later: the token of VMMGR_PENDING.
+pub enum Later<T> {
+    Now(T),
+    Token(usize),
+}
+
+impl Later<()> {
+    /// What an answer now is (read from the reply).
+    fn map<U>(self, f: impl FnOnce() -> U) -> Later<U> {
+        match self {
+            Later::Now(()) => Later::Now(f()),
+            Later::Token(t) => Later::Token(t),
+        }
+    }
+}
+
+/// Call root with `args`: Ok now or later, or the errno it answered.
+fn call_later(label: u64, args: &[u64]) -> Result<Later<()>, i64> {
     for (i, &a) in args.iter().enumerate() {
         set_mr(i, a);
     }
     ep().call(sel4::MessageInfo::new(label, 0, 0, args.len()));
     match mr(0) {
-        0 => Ok(()),
+        0 => Ok(Later::Now(())),
+        VMMGR_PENDING if (mr(1) as usize) < proto::MAX_PENDING => Ok(Later::Token(mr(1) as usize)),
         e => Err(e as i64),
     }
+}
+
+/// The answer of pending request `token`, now that root has it: as the
+/// request would have answered.
+fn result(token: usize) -> Result<(), i64> {
+    call(VMMGR_RESULT, &[token as u64])
+}
+
+/// Take root's answer of a pending request whose answer vmmgr does not
+/// want any more (its guest is gone): the token is free again.
+pub fn discard(token: usize) {
+    let _ = result(token);
 }
 
 fn xchg(i: usize) -> sel4::AbsoluteCPtr {
@@ -80,14 +122,27 @@ pub fn guest_del(id: usize) {
 /// abi::BLK_*.
 #[allow(clippy::too_many_arguments)]
 pub fn disk_attach(alloc: &mut Alloc, id: usize, d: usize, disk: usize, flags: u64, lba_start: u64, lba_count: u64,
-    (n, offset): (u64, u64)) -> Result<Backend, i64> {
-    call(VMMGR_DISK_ATTACH, &[id as u64, d as u64, disk as u64, flags, lba_start, lba_count, n, offset])?;
+    (n, offset): (u64, u64)) -> Result<Later<Backend>, i64> {
+    match call_later(VMMGR_DISK_ATTACH, &[id as u64, d as u64, disk as u64, flags, lba_start, lba_count, n, offset])? {
+        Later::Now(()) => Ok(Later::Now(disk_backend(alloc))),
+        Later::Token(t) => Ok(Later::Token(t)),
+    }
+}
+
+/// The channel of disk attachment `token` (disk_attach), now that root
+/// has it.
+pub fn disk_attach_result(alloc: &mut Alloc, token: usize) -> Result<Backend, i64> {
+    result(token)?;
+    Ok(disk_backend(alloc))
+}
+
+fn disk_backend(alloc: &mut Alloc) -> Backend {
     let mut chan = ArrayVec::new();
     for i in 0..host::blk::CHANNEL_PAGES {
         chan.must_push(take(alloc, i));
     }
     let kick = take(alloc, host::blk::CHANNEL_PAGES);
-    Ok(Backend::Blk { chan, kick })
+    Backend::Blk { chan, kick }
 }
 
 /// A port of netd's `switch` for guest `id`'s device `d`.  The VMM's
@@ -112,11 +167,17 @@ pub fn trust_register(g: &Guest) {
 
 /// A control op root serves (VMMGR_HOST_OP): its vals, and its data in
 /// the result page.
-pub fn host_op(op: u32, args: &[u64; 6]) -> Result<[u64; 6], i64> {
+pub fn host_op(op: u32, args: &[u64; 6]) -> Result<Later<[u64; 6]>, i64> {
     let mut a = [0; 7];
     a[0] = op as u64;
     a[1..].copy_from_slice(args);
-    call(VMMGR_HOST_OP, &a)?;
+    Ok(call_later(VMMGR_HOST_OP, &a)?.map(|| core::array::from_fn(|i| mr(1 + i))))
+}
+
+/// The vals of host op `token` (host_op), now that root has them.  Its
+/// data is none.
+pub fn host_op_result(token: usize) -> Result<[u64; 6], i64> {
+    result(token)?;
     Ok(core::array::from_fn(|i| mr(1 + i)))
 }
 
