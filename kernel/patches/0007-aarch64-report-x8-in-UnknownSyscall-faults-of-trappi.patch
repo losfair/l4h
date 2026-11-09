@@ -1,4 +1,4 @@
-From 8bca5f7e1636b212a69c5f597b0a276a47d7fefc Mon Sep 17 00:00:00 2001
+From a0d0e7447973982e06ad45b44c4afc49973449be Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Sat, 17 Oct 2026 17:39:47 -0700
 Subject: [PATCH] aarch64: report x8 in UnknownSyscall faults of trapping

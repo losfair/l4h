@@ -1,4 +1,4 @@
-From 212c3a056fb69cb4295cc540b9c5c26d4c19e729 Mon Sep 17 00:00:00 2001
+From cc1a5a20d9bbef4b8cb0f7cb22030f38e5502c59 Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Sat, 17 Oct 2026 10:16:20 -0700
 Subject: [PATCH] x86_64: preserve the user stack pointer across syscalls
@@ -64,10 +64,10 @@ index 76d6421ac..61a420d87 100644
  
  extern nodeInfo_t node_info[CONFIG_MAX_NUM_NODES] ALIGN(L1_CACHE_LINE_SIZE);
 diff --git a/libsel4/include/sel4/constants.h b/libsel4/include/sel4/constants.h
-index 1b8741089..831db07f9 100644
+index 4ed7d52e7..1705734cf 100644
 --- a/libsel4/include/sel4/constants.h
 +++ b/libsel4/include/sel4/constants.h
-@@ -95,7 +95,11 @@ typedef enum {
+@@ -93,7 +93,11 @@ typedef enum {
  
      SEL4_FORCE_LONG_ENUM(seL4_TCBFlag),
      seL4_TCBFlag_MASK = seL4_TCBFlag_NoFlag

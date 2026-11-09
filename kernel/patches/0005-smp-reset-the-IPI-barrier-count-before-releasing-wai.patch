@@ -1,4 +1,4 @@
-From 6aa0af4bf3e1c880ef8fdb9a6a55f1ec12c57efd Mon Sep 17 00:00:00 2001
+From 3e2ea327bab83c86fe91a861bbeeb628d15e5ad0 Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Sat, 17 Oct 2026 14:11:59 -0700
 Subject: [PATCH] smp: reset the IPI barrier count before releasing waiters

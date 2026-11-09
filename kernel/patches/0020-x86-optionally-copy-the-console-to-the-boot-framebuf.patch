@@ -1,4 +1,4 @@
-From 394d1b3c7a01eae7db6de0ef80a0b4835c6f0981 Mon Sep 17 00:00:00 2001
+From a5990c5e710f779a8d64735c8209d4bbd0115549 Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Tue, 20 Oct 2026 09:29:04 -0700
 Subject: [PATCH] x86: optionally copy the console to the boot framebuffer

@@ -16,11 +16,7 @@ static inline int syscall_get_arch(struct task_struct *task)
 {
 	if (task_is_kemu(task))
 		return AUDIT_ARCH_AARCH64;
-#ifdef CONFIG_X86_32
-	return AUDIT_ARCH_I386;
-#else
 	return AUDIT_ARCH_X86_64;
-#endif
 }
 
 #endif /* __UM_ASM_SYSCALL_H */

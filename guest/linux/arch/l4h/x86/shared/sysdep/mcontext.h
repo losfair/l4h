@@ -17,24 +17,11 @@ extern int get_stub_state(struct uml_pt_regs *regs, struct stub_data *data,
 extern int set_stub_state(struct uml_pt_regs *regs, struct stub_data *data,
 			  int single_stepping);
 
-#ifdef __i386__
-
-#define GET_FAULTINFO_FROM_MC(fi, mc) \
-	{ \
-		(fi).cr2 = (mc)->cr2; \
-		(fi).error_code = (mc)->gregs[REG_ERR]; \
-		(fi).trap_no = (mc)->gregs[REG_TRAPNO]; \
-	}
-
-#else
-
 #define GET_FAULTINFO_FROM_MC(fi, mc) \
 	{ \
 		(fi).cr2 = (mc)->gregs[REG_CR2]; \
 		(fi).error_code = (mc)->gregs[REG_ERR]; \
 		(fi).trap_no = (mc)->gregs[REG_TRAPNO]; \
 	}
-
-#endif
 
 #endif

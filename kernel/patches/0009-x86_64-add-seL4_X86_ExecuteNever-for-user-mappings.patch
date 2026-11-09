@@ -1,4 +1,4 @@
-From 2917e4144fd27ceb840235bf587c40d66fb6dff8 Mon Sep 17 00:00:00 2001
+From 986916fbc097fbb72f10a516323ee286925a1e35 Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Sat, 17 Oct 2026 23:08:26 -0700
 Subject: [PATCH] x86_64: add seL4_X86_ExecuteNever for user mappings
@@ -17,8 +17,8 @@ ignored, as XD is a reserved bit then.
  libsel4/arch_include/x86/sel4/arch/types.h      |  3 +++
  src/arch/x86/64/head.S                          | 12 +++++++++++-
  src/arch/x86/64/kernel/vspace.c                 | 17 ++++++++++++++---
- src/arch/x86/kernel/vspace.c                    |  6 ++++++
- 6 files changed, 39 insertions(+), 5 deletions(-)
+ src/arch/x86/kernel/vspace.c                    |  4 ++++
+ 6 files changed, 37 insertions(+), 5 deletions(-)
 
 diff --git a/include/arch/x86/arch/64/mode/kernel/vspace.h b/include/arch/x86/arch/64/mode/kernel/vspace.h
 index 413843e75..127b49a7a 100644
@@ -139,19 +139,17 @@ index bab7edd57..9bdde4b3b 100644
                 0,                                              /* global               */
                 vm_attributes_get_x86PATBit(vm_attr),          /* pat                  */
 diff --git a/src/arch/x86/kernel/vspace.c b/src/arch/x86/kernel/vspace.c
-index ddf4ce451..8ca477b79 100644
+index ddf4ce451..c892f60da 100644
 --- a/src/arch/x86/kernel/vspace.c
 +++ b/src/arch/x86/kernel/vspace.c
-@@ -962,6 +962,12 @@ exception_t decodeX86FrameInvocation(
+@@ -962,6 +962,10 @@ exception_t decodeX86FrameInvocation(
          vaddr = getSyscallArg(0, buffer);
          w_rightsMask = getSyscallArg(1, buffer);
          vmAttr = vmAttributesFromWord(getSyscallArg(2, buffer));
-+#ifdef CONFIG_ARCH_X86_64
 +        /* Without execute-disable the XD bit is reserved: ignore it. */
 +        if (vm_attributes_get_x86XDBit(vmAttr) && !x86_64_nxEnabled()) {
 +            vmAttr = vm_attributes_set_x86XDBit(vmAttr, 0);
 +        }
-+#endif
          vspaceCap = current_extra_caps.excaprefs[0]->cap;
  
          capVMRights = cap_frame_cap_get_capFVMRights(cap);

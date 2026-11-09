@@ -1,4 +1,4 @@
-From 3a9046f0f8d751ba07acffe5e01ffc8942b740a0 Mon Sep 17 00:00:00 2001
+From ad69f7bafad7a0a41315ace5819b66ea15420981 Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Sat, 17 Oct 2026 08:30:23 -0700
 Subject: [PATCH] tcb: add seL4_TCB_ReadFPU and seL4_TCB_WriteFPU
@@ -19,11 +19,11 @@ is masked with the CPU's MXCSR_MASK, read with FXSAVE at boot.
 ---
  include/arch/x86/arch/model/statedata.h   |   1 +
  libsel4/include/interfaces/object-api.xml |  56 ++++++++++++
- libsel4/include/sel4/constants.h          |  15 ++++
+ libsel4/include/sel4/constants.h          |  13 +++
  src/arch/x86/machine/fpu.c                |  10 +++
  src/arch/x86/model/statedata.c            |   3 +
  src/object/tcb.c                          | 104 ++++++++++++++++++++++
- 6 files changed, 189 insertions(+)
+ 6 files changed, 187 insertions(+)
 
 diff --git a/include/arch/x86/arch/model/statedata.h b/include/arch/x86/arch/model/statedata.h
 index 478c3344e..1474abcd2 100644
@@ -105,10 +105,10 @@ index b0590847e..5362400fe 100644
  
      <interface name="seL4_CNode" manual_name="CNode">
 diff --git a/libsel4/include/sel4/constants.h b/libsel4/include/sel4/constants.h
-index c356a1395..1b8741089 100644
+index c356a1395..4ed7d52e7 100644
 --- a/libsel4/include/sel4/constants.h
 +++ b/libsel4/include/sel4/constants.h
-@@ -69,6 +69,21 @@ typedef enum {
+@@ -69,6 +69,19 @@ typedef enum {
      SEL4_FORCE_LONG_ENUM(seL4_LookupFailureType),
  } seL4_LookupFailureType;
  
@@ -117,8 +117,6 @@ index c356a1395..1b8741089 100644
 +#define seL4_FPUStateSize CONFIG_XSAVE_SIZE
 +#elif defined(CONFIG_ARCH_AARCH64)
 +#define seL4_FPUStateSize (64 * 8 + 8)
-+#elif defined(CONFIG_ARCH_AARCH32)
-+#define seL4_FPUStateSize (32 * 8 + 4 + 4)
 +#elif defined(CONFIG_ARCH_RISCV) && defined(CONFIG_RISCV_EXT_D)
 +#define seL4_FPUStateSize (32 * 8 + 4 + 4)
 +#elif defined(CONFIG_ARCH_RISCV)

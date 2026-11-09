@@ -1,4 +1,4 @@
-From 9aa06df1313db3c7b47d686a4b2d20d941ca5196 Mon Sep 17 00:00:00 2001
+From 66869479f510cc2d00b5cf842cbe62a25d73f33b Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Tue, 20 Oct 2026 23:27:25 -0700
 Subject: [PATCH] x86: keep the extra boot modules for the root task
@@ -33,8 +33,8 @@ zero-extends to a positive value, and its 64-bit size wrapped.
  .../x86/sel4/arch/bootinfo_types.h            |  19 +++
  libsel4/include/sel4/bootinfo_types.h         |   1 +
  src/arch/x86/kernel/boot.c                    |  17 ++-
- src/arch/x86/kernel/boot_sys.c                | 126 +++++++++++++++++-
- 6 files changed, 163 insertions(+), 4 deletions(-)
+ src/arch/x86/kernel/boot_sys.c                | 124 +++++++++++++++++-
+ 6 files changed, 161 insertions(+), 4 deletions(-)
 
 diff --git a/include/arch/x86/arch/kernel/boot.h b/include/arch/x86/arch/kernel/boot.h
 index a4f7fa057..e88efb4ee 100644
@@ -144,10 +144,10 @@ index 93b320964..8f8216b1e 100644
      /* set up sched control for each core */
      init_sched_control(root_cnode_cap, CONFIG_MAX_NUM_NODES);
 diff --git a/src/arch/x86/kernel/boot_sys.c b/src/arch/x86/kernel/boot_sys.c
-index f386fa39a..140ac24cc 100644
+index f386fa39a..9bcc59ccd 100644
 --- a/src/arch/x86/kernel/boot_sys.c
 +++ b/src/arch/x86/kernel/boot_sys.c
-@@ -64,8 +64,19 @@ BOOT_CODE static paddr_t find_load_paddr(paddr_t min_paddr, word_t image_size)
+@@ -64,8 +64,17 @@ BOOT_CODE static paddr_t find_load_paddr(paddr_t min_paddr, word_t image_size)
      int i;
  
      for (i = 0; i < boot_state.mem_p_regs.count; i++) {
@@ -155,11 +155,9 @@ index f386fa39a..140ac24cc 100644
 +        /* mbi2 memory regions need not be page aligned. */
 +        paddr_t start = ROUND_UP(MAX(min_paddr, boot_state.mem_p_regs.list[i].start), PAGE_BITS);
          paddr_t end = boot_state.mem_p_regs.list[i].end;
-+#ifdef CONFIG_ARCH_X86_64
 +        /* Images are copied through the boot page tables, which map only
 +         * the low 4 GiB. */
 +        end = MIN(end, 0x100000000ull);
-+#endif
 +        /* A region below min_paddr has nothing to offer (and its size
 +         * would wrap around). */
 +        if (start >= end) {
@@ -168,7 +166,7 @@ index f386fa39a..140ac24cc 100644
          word_t region_size = end - start;
  
          if (region_size >= image_size) {
-@@ -76,6 +87,106 @@ BOOT_CODE static paddr_t find_load_paddr(paddr_t min_paddr, word_t image_size)
+@@ -76,6 +85,106 @@ BOOT_CODE static paddr_t find_load_paddr(paddr_t min_paddr, word_t image_size)
      return 0;
  }
  
@@ -275,7 +273,7 @@ index f386fa39a..140ac24cc 100644
  BOOT_CODE static paddr_t load_boot_module(word_t boot_module_start, word_t boot_module_end, paddr_t load_paddr)
  {
      v_region_t v_reg;
-@@ -180,7 +291,8 @@ static BOOT_CODE bool_t try_boot_sys_node(cpu_id_t cpu_id)
+@@ -180,7 +289,8 @@ static BOOT_CODE bool_t try_boot_sys_node(cpu_id_t cpu_id)
              &boot_state.acpi_rsdp,
              &boot_state.vbe_info,
              &boot_state.mb_mmap_info,
@@ -285,7 +283,7 @@ index f386fa39a..140ac24cc 100644
          )) {
          return false;
      }
-@@ -460,6 +572,10 @@ static BOOT_CODE bool_t try_boot_sys(void)
+@@ -460,6 +570,10 @@ static BOOT_CODE bool_t try_boot_sys(void)
          return false;
      }
  
@@ -296,7 +294,7 @@ index f386fa39a..140ac24cc 100644
      /* calculate final location of userland images */
      ui_p_regs.start = boot_state.ki_p_reg.end;
      ui_p_regs.end = ui_p_regs.start + load_paddr - mods_end_paddr;
-@@ -549,6 +665,9 @@ static BOOT_CODE bool_t try_boot_sys_mbi1(
+@@ -549,6 +663,9 @@ static BOOT_CODE bool_t try_boot_sys_mbi1(
          if (boot_state.mods_end_paddr < modules[i].end) {
              boot_state.mods_end_paddr = modules[i].end;
          }
@@ -306,7 +304,7 @@ index f386fa39a..140ac24cc 100644
      }
  
      /* initialize the memory. We track two kinds of memory regions. Physical memory
-@@ -662,6 +781,9 @@ static BOOT_CODE bool_t try_boot_sys_mbi2(
+@@ -662,6 +779,9 @@ static BOOT_CODE bool_t try_boot_sys_mbi2(
              if (boot_state.mods_end_paddr < module->end) {
                  boot_state.mods_end_paddr = module->end;
              }

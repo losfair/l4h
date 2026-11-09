@@ -1,4 +1,4 @@
-From f03bb30c84c9ed6962878562d3655cdae4a96bb7 Mon Sep 17 00:00:00 2001
+From 917ff78cdf10f90de8544551b8f0ba1bd32dad97 Mon Sep 17 00:00:00 2001
 From: l4h <l4h@localhost>
 Date: Wed, 28 Oct 2026 10:15:58 -0700
 Subject: [PATCH] x86_64: preserve syscall RSP with the SKIM window
@@ -107,10 +107,10 @@ index e5f4d8c72..9fd1b8381 100644
 +extern word_t x64KSSyscallUserRSP VISIBLE SKIM_BSS;
 +#endif
 diff --git a/libsel4/include/sel4/constants.h b/libsel4/include/sel4/constants.h
-index 831db07f9..1b8741089 100644
+index 1705734cf..4ed7d52e7 100644
 --- a/libsel4/include/sel4/constants.h
 +++ b/libsel4/include/sel4/constants.h
-@@ -95,11 +95,7 @@ typedef enum {
+@@ -93,11 +93,7 @@ typedef enum {
  
      SEL4_FORCE_LONG_ENUM(seL4_TCBFlag),
      seL4_TCBFlag_MASK = seL4_TCBFlag_NoFlag

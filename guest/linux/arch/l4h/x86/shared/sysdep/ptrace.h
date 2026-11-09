@@ -38,11 +38,7 @@
 #define UPT_DS(r) REGS_DS((r)->gp)
 #define UPT_ES(r) REGS_ES((r)->gp)
 
-#ifdef __i386__
-#include "ptrace_32.h"
-#else
 #include "ptrace_64.h"
-#endif
 
 extern unsigned long host_fp_size;
 

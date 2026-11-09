@@ -1,4 +1,4 @@
-From 874973085f0e7e6fd75eea833ec0d1a6d5e0632a Mon Sep 17 00:00:00 2001
+From 323df72ed30ba64b442a974319eef13aba406276 Mon Sep 17 00:00:00 2001
 From: l4h <l4h@localhost>
 Date: Tue, 3 Nov 2026 01:04:29 -0800
 Subject: [PATCH 35/36] x86: print to a ring in memory (console_ring=)
@@ -10,7 +10,7 @@ Subject: [PATCH 35/36] x86: print to a ring in memory (console_ring=)
  3 files changed, 44 insertions(+)
 
 diff --git a/include/plat/pc99/plat/machine/io.h b/include/plat/pc99/plat/machine/io.h
-index fce2d0b..8708c1a 100644
+index fce2d0be7..8708c1ab7 100644
 --- a/include/plat/pc99/plat/machine/io.h
 +++ b/include/plat/pc99/plat/machine/io.h
 @@ -26,6 +26,8 @@ uint32_t in32(uint16_t port);
@@ -23,7 +23,7 @@ index fce2d0b..8708c1a 100644
                    uint8_t type, p_region_t const *ram, word_t ram_count);
  #endif
 diff --git a/src/arch/x86/kernel/cmdline.c b/src/arch/x86/kernel/cmdline.c
-index f399d89..eb87670 100644
+index f399d894c..eb8767002 100644
 --- a/src/arch/x86/kernel/cmdline.c
 +++ b/src/arch/x86/kernel/cmdline.c
 @@ -153,6 +153,15 @@ void cmdline_parse(const char *cmdline, cmdline_opt_t *cmdline_opt)
@@ -43,7 +43,7 @@ index f399d89..eb87670 100644
      cmdline_opt->console_port = bda_ports_count && *bda_port ? *bda_port : 0x3f8;
  
 diff --git a/src/plat/pc99/machine/io.c b/src/plat/pc99/machine/io.c
-index ef61806..148cf7c 100644
+index ef618063b..148cf7cf5 100644
 --- a/src/plat/pc99/machine/io.c
 +++ b/src/plat/pc99/machine/io.c
 @@ -210,12 +210,45 @@ static void fbcon_putchar(unsigned char c)

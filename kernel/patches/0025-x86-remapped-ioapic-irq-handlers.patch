@@ -1,4 +1,4 @@
-From ca1e5acdb424d2a16764a102862ae1672197cec8 Mon Sep 17 00:00:00 2001
+From 5b95a6fe4b6b586fe6d3c6b3852a3855fba4df0d Mon Sep 17 00:00:00 2001
 From: l4h <l4h@localhost>
 Date: Sat, 24 Oct 2026 03:43:38 -0700
 Subject: [PATCH] x86: expose remapped I/O APIC IRQ handlers to root
@@ -24,10 +24,10 @@ index b89017192..f0a25a1d2 100644
 +                              word_t vector, word_t handle);
 +
 diff --git a/libsel4/arch_include/x86/interfaces/object-api-arch.xml b/libsel4/arch_include/x86/interfaces/object-api-arch.xml
-index 1d821c88c..697cc2954 100644
+index aedc425af..da6a5210d 100644
 --- a/libsel4/arch_include/x86/interfaces/object-api-arch.xml
 +++ b/libsel4/arch_include/x86/interfaces/object-api-arch.xml
-@@ -886,6 +886,67 @@
+@@ -885,6 +885,67 @@
                  </description>
              </error>
          </method>

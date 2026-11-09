@@ -10,96 +10,6 @@
 
 #define CORE_DUMP_USE_REGSET
 
-#ifdef CONFIG_X86_32
-
-#define R_386_NONE	0
-#define R_386_32	1
-#define R_386_PC32	2
-#define R_386_GOT32	3
-#define R_386_PLT32	4
-#define R_386_COPY	5
-#define R_386_GLOB_DAT	6
-#define R_386_JMP_SLOT	7
-#define R_386_RELATIVE	8
-#define R_386_GOTOFF	9
-#define R_386_GOTPC	10
-#define R_386_NUM	11
-
-/*
- * This is used to ensure we don't load something for the wrong architecture.
- */
-#define elf_check_arch(x) \
-	(((x)->e_machine == EM_386) || ((x)->e_machine == EM_486))
-
-#define ELF_CLASS	ELFCLASS32
-#define ELF_DATA        ELFDATA2LSB
-#define ELF_ARCH        EM_386
-
-#define ELF_PLAT_INIT(regs, load_addr) do { \
-	PT_REGS_BX(regs) = 0; \
-	PT_REGS_CX(regs) = 0; \
-	PT_REGS_DX(regs) = 0; \
-	PT_REGS_SI(regs) = 0; \
-	PT_REGS_DI(regs) = 0; \
-	PT_REGS_BP(regs) = 0; \
-	PT_REGS_AX(regs) = 0; \
-} while (0)
-
-/* Shamelessly stolen from include/asm-i386/elf.h */
-
-#define ELF_CORE_COPY_REGS(pr_reg, regs) do {	\
-	pr_reg[0] = PT_REGS_BX(regs);		\
-	pr_reg[1] = PT_REGS_CX(regs);		\
-	pr_reg[2] = PT_REGS_DX(regs);		\
-	pr_reg[3] = PT_REGS_SI(regs);		\
-	pr_reg[4] = PT_REGS_DI(regs);		\
-	pr_reg[5] = PT_REGS_BP(regs);		\
-	pr_reg[6] = PT_REGS_AX(regs);		\
-	pr_reg[7] = PT_REGS_DS(regs);		\
-	pr_reg[8] = PT_REGS_ES(regs);		\
-	/* fake once used fs and gs selectors? */	\
-	pr_reg[9] = PT_REGS_DS(regs);		\
-	pr_reg[10] = PT_REGS_DS(regs);		\
-	pr_reg[11] = PT_REGS_SYSCALL_NR(regs);	\
-	pr_reg[12] = PT_REGS_IP(regs);		\
-	pr_reg[13] = PT_REGS_CS(regs);		\
-	pr_reg[14] = PT_REGS_EFLAGS(regs);	\
-	pr_reg[15] = PT_REGS_SP(regs);		\
-	pr_reg[16] = PT_REGS_SS(regs);		\
-} while (0);
-
-extern char * elf_aux_platform;
-#define ELF_PLATFORM (elf_aux_platform)
-
-extern unsigned long vsyscall_ehdr;
-extern unsigned long vsyscall_end;
-extern unsigned long __kernel_vsyscall;
-
-/*
- * This is the range that is readable by user mode, and things
- * acting like user mode such as get_user_pages.
- */
-#define FIXADDR_USER_START      vsyscall_ehdr
-#define FIXADDR_USER_END        vsyscall_end
-
-
-/*
- * Architecture-neutral AT_ values in 0-17, leave some room
- * for more of them, start the x86-specific ones at 32.
- */
-#define AT_SYSINFO		32
-#define AT_SYSINFO_EHDR		33
-
-#define ARCH_DLINFO						\
-do {								\
-	if ( vsyscall_ehdr ) {					\
-		NEW_AUX_ENT(AT_SYSINFO,	__kernel_vsyscall);	\
-		NEW_AUX_ENT(AT_SYSINFO_EHDR, vsyscall_ehdr);	\
-	}							\
-} while (0)
-
-#else
-
 /* x86-64 relocation types, taken from asm-x86_64/elf.h */
 #define R_X86_64_NONE		0	/* No reloc */
 #define R_X86_64_64		1	/* Direct 64 bit  */
@@ -191,8 +101,6 @@ extern int arch_setup_additional_pages(struct linux_binprm *bprm,
 extern unsigned long um_vdso_addr;
 #define AT_SYSINFO_EHDR 33
 #define ARCH_DLINFO	NEW_AUX_ENT(AT_SYSINFO_EHDR, um_vdso_addr)
-
-#endif
 
 typedef unsigned long elf_greg_t;
 

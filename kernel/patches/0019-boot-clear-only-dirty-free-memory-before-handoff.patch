@@ -1,4 +1,4 @@
-From 982a69b925c2d45429c2f0df3be2eea098b8fdb9 Mon Sep 17 00:00:00 2001
+From 698f22eb19cb903be62d4f1b07975833c00034fa Mon Sep 17 00:00:00 2001
 From: l4h <l4h@localhost>
 Date: Wed, 28 Oct 2026 06:50:14 -0700
 Subject: [PATCH] boot: clear only dirty free memory before handing out
