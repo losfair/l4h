@@ -1,4 +1,4 @@
-From e0fd7ce00463e9ddb1eb7cb20ace641367824d4e Mon Sep 17 00:00:00 2001
+From d6d8d28b20af4240eb3cda14ca0a7d62a5bc0fdd Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Mon, 9 Nov 2026 01:22:12 +0100
 Subject: [PATCH] x86/vcpu: VT-x guests set only the CR4 bits on an allowlist
@@ -22,7 +22,7 @@ VMX_CONTROL_CR4_MASK shows the others set.
  1 file changed, 6 insertions(+), 2 deletions(-)
 
 diff --git a/src/arch/x86/object/vcpu.c b/src/arch/x86/object/vcpu.c
-index c5d977053..b5ad745eb 100644
+index 84c3367da..e1e3e749f 100644
 --- a/src/arch/x86/object/vcpu.c
 +++ b/src/arch/x86/object/vcpu.c
 @@ -611,6 +611,8 @@ void vcpu_init(vcpu_t *vcpu)
@@ -52,7 +52,7 @@ index c5d977053..b5ad745eb 100644
      case VMX_CONTROL_PIN_EXECUTION_CONTROLS:
          value = applyFixedBits(value, pin_control_high, pin_control_low & (pin_control_high | PIN_CONTROLS_ALLOWED));
          break;
-@@ -1158,7 +1162,7 @@ static exception_t decodeWriteVMCS(cap_t cap, word_t length, bool_t call, word_t
+@@ -1167,7 +1171,7 @@ static exception_t decodeWriteVMCS(cap_t cap, word_t length, bool_t call, word_t
          value = applyFixedBits(value, cr0_high, cr0_low);
          break;
      case VMX_GUEST_CR4:
