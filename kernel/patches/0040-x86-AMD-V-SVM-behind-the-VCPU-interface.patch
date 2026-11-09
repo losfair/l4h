@@ -1,4 +1,4 @@
-From 4dfdf745df971a7386acac4acf9ee7b601a5f8c8 Mon Sep 17 00:00:00 2001
+From de7fdfffd31024ef0a591c53f4befb632a415f9f Mon Sep 17 00:00:00 2001
 From: l4h <l4h@localhost>
 Date: Sun, 8 Nov 2026 19:30:53 +0100
 Subject: [PATCH] x86: AMD-V (SVM) behind the VCPU interface
@@ -44,7 +44,9 @@ VMs on both.  32-bit kernels keep VT-x only.
   VCPU as its core's before that core releases the lock to enter guest
   mode, so none is missed.  A VCPU being deleted is forgotten on every
   core it ran on, not only the last.  So it is when a thread loses its
-  VCPU in guest mode and its VMEnter ends (patch 0039).
+  VCPU in guest mode and its VMEnter ends (patch 0039).  The exit reads
+  what it reports from the VMCB before the lock: once it has the lock,
+  it may find its VMEnter ended and the VCPU deleted.
 - VMEnter has VT-x's MR layout, with SVM's fields in it (vmenter.h):
   the misc1 intercepts, EVENTINJ (its defined bits, as WriteVMCB
   takes; MR0-2 are in registers, so a thread without an IPC buffer
@@ -107,9 +109,9 @@ VMs on both.  32-bit kernels keep VT-x only.
  src/arch/x86/config.cmake                     |    1 +
  src/arch/x86/kernel/ept.c                     |   21 +-
  src/arch/x86/model/statedata.c                |    7 +
- src/arch/x86/object/svm.c                     | 1032 +++++++++++++++++
+ src/arch/x86/object/svm.c                     | 1035 +++++++++++++++++
  src/arch/x86/object/vcpu.c                    |  138 ++-
- 13 files changed, 1459 insertions(+), 52 deletions(-)
+ 13 files changed, 1462 insertions(+), 52 deletions(-)
  create mode 100644 include/arch/x86/arch/object/svm.h
  create mode 100644 src/arch/x86/object/svm.c
 
@@ -136,7 +138,7 @@ index 9a1aee2b6..12e16e5e1 100644
  NODE_STATE_END(archNodeState);
 diff --git a/include/arch/x86/arch/object/svm.h b/include/arch/x86/arch/object/svm.h
 new file mode 100644
-index 000000000..ed668c3f1
+index 000000000..0da1e2d3f
 --- /dev/null
 +++ b/include/arch/x86/arch/object/svm.h
 @@ -0,0 +1,162 @@
@@ -286,7 +288,7 @@ index 000000000..ed668c3f1
 +    /* Address bits 12-51, PS (bit 7), the software bits 9-11, R/W. */
 +    npt = (ept & (0x000ffffffffff000ull | BIT(7) | 0xe00ull | BIT(1))) | BIT(0) | BIT(2);
 +    if (!(ept & BIT(2))) {
-+        npt |= BIT(63);
++        npt |= 1ull << 63;      /* NX; BIT() is 32 bits wide on ia32 */
 +    }
 +    if (leaf) {
 +        type = (ept >> 3) & 7;
@@ -648,10 +650,10 @@ index da0b07c6f..a651c405e 100644
  #ifdef CONFIG_PRINTING
 diff --git a/src/arch/x86/object/svm.c b/src/arch/x86/object/svm.c
 new file mode 100644
-index 000000000..18e652c8c
+index 000000000..5d65726ef
 --- /dev/null
 +++ b/src/arch/x86/object/svm.c
-@@ -0,0 +1,1032 @@
+@@ -0,0 +1,1035 @@
 +/*
 + * SPDX-License-Identifier: GPL-2.0-only
 + */
@@ -1425,6 +1427,9 @@ index 000000000..18e652c8c
 +    vcpu_t *vcpu = NODE_STATE(ksCurThread)->tcbArch.tcbVCPU;
 +    uint64_t code = *vmcb_word(vcpu, VMCB_EXIT_CODE);
 +    word_t next_rip = *vmcb_word(vcpu, VMCB_NEXT_RIP);
++    /* Before the lock, as everything here: while this core waits for it,
++     * another core may end the VMEnter and delete the VCPU. */
++    word_t info1 = *vmcb_word(vcpu, VMCB_EXIT_INFO1);
 +
 +    assert(vcpu == ARCH_NODE_STATE(x86KSCurrentVCPU));
 +    ARCH_NODE_STATE(x86KSSVMNMIWindow) = false;
@@ -1486,7 +1491,7 @@ index 000000000..18e652c8c
 +        return EXCEPTION_NONE;
 +    default:
 +        NODE_LOCK_SYS;
-+        svm_fault(code, *vmcb_word(vcpu, VMCB_EXIT_INFO1));
++        svm_fault(code, info1);
 +        return EXCEPTION_NONE;
 +    }
 +}
@@ -1685,7 +1690,7 @@ index 000000000..18e652c8c
 +
 +#endif /* CONFIG_VTX && CONFIG_ARCH_X86_64 */
 diff --git a/src/arch/x86/object/vcpu.c b/src/arch/x86/object/vcpu.c
-index 8d89dfe4b..4e073b27b 100644
+index 379095260..acd559c89 100644
 --- a/src/arch/x86/object/vcpu.c
 +++ b/src/arch/x86/object/vcpu.c
 @@ -55,7 +55,7 @@ typedef struct msr_bitmaps {
@@ -1916,7 +1921,7 @@ index 8d89dfe4b..4e073b27b 100644
      reason = vmread(VMX_DATA_EXIT_REASON);
      finishVmexitSaving(reason);
      /* the basic exit reason is the bottom 16 bits of the exit reason field */
-@@ -1950,6 +2002,12 @@ void vcpu_make_current(vcpu_t *vcpu)
+@@ -1968,6 +2020,12 @@ void vcpu_make_current(vcpu_t *vcpu)
       * after, and invept() reaches only the cores in this mask, so a core it
       * did not know of would enter with a root deleted meanwhile. */
      __atomic_fetch_or(&x86KSVMXCores, BIT(getCurrentCPUIndex()), __ATOMIC_SEQ_CST);
@@ -1929,7 +1934,7 @@ index 8d89dfe4b..4e073b27b 100644
  #endif
      if (ARCH_NODE_STATE(x86KSCurrentVCPU) != vcpu) {
          switchVCPU(vcpu);
-@@ -2024,6 +2082,12 @@ void restoreVMCS(void)
+@@ -2040,6 +2098,12 @@ void restoreVMCS(void)
  
  void invalidateLocalEPT(ept_pml4e_t *ept_pml4)
  {
