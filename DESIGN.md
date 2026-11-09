@@ -132,10 +132,9 @@ l4h supports only 64-bit platforms, x86_64 and aarch64. Its patches assume
 a 64-bit kernel (for example, `VMEnter` takes its three call MRs from
 registers even without an IPC buffer, and the frame and EPT invocations
 they add exist only with 64-bit page tables), and none is built or tested
-for ia32, aarch32 or riscv32: patch 0044 makes configuring a 32-bit kernel
-a CMake error. The guest's `arch/l4h` likewise builds only 64-bit kernels.
-Upstream seL4's own 32-bit code is left in place, to keep the patch set
-small against upstream.
+for ia32, aarch32 or riscv32, which may not build or may misbehave. The
+guest's `arch/l4h` likewise builds only 64-bit kernels. Upstream seL4's own
+32-bit code is left in place, to keep the patch set small against upstream.
 
 ### 4.1 Configuration
 
@@ -306,7 +305,6 @@ support, since no device is passed into a guest.
 | 0041 | (x86, `KernelVTX`) VT-x keeps CR0.CD, CR0.NW and the reserved CR0 bits (28:19, 17, 15:6) in the CR0 guest/host mask, whatever userspace writes to `VMX_CONTROL_CR0_MASK`: VM entries and exits do not load these bits, so a guest MOV to CR0 that set CD or NW would leave the core's caches off for seL4 and every thread after it. A guest write to them now always exits. l4h's KVM already owns all of CR0 (`CR0_GUEST_HOST_MASK` is `~0` in `kvm/vmx.c`), so nothing changes for it. AMD-V needs no counterpart, as #VMEXIT reloads the host's whole CR0 from the host save area. Cherry-picked from upstream seL4 PR #1847 (open), without its CHANGES.md entry. |
 | 0042 | (x86, `KernelVTX`) VT-x guests set only the CR4 bits on an allowlist, `VCPU_GUEST_CR4_ALLOWED`, as they turn on only the VM-execution controls on 0039's lists. 0040 defines the list and applies it on AMD-V. The list holds the bits whose effects stay in guest mode, on state that VM entry and exit or seL4 switch: VME, PVI, TSD, DE, PSE, PAE, MCE, PGE, PCE, OSFXSR, OSXMMEXCPT, UMIP, LA57, FSGSBASE, PCIDE, OSXSAVE, SMEP and SMAP. Every other bit stays clear, including any a later CPU defines, because some enable state that nothing switches and that the next guest on the core would run with. PKE is one: PKRU is outside the XSAVE features seL4 enables (`KernelXSaveFeatureSet` 7), and the host runs with CR4.PKE clear. KL is another: LOADIWKEY sets the core's Key Locker wrapping key. PKS, CET, UINTR and FRED are left out for the same reason. On VT-x, the bits outside the list are always in `VMX_CONTROL_CR4_MASK`, so a guest changing one exits, and `GUEST_CR4` takes only listed bits and the fixed ones (VMXE). On AMD-V (0040), which has no CR4 mask, CR4 writes always exit and `WriteVMCB` keeps the bits outside the list clear. l4h's KVM already owns all of CR4 and hides PKU, CET, LAM and FRED, and Linux's KVM does not offer Key Locker, PKS or UINTR, so nothing changes for it. |
 | 0043 | (x86, `KernelVTX`) VT-x keeps CR8-load and CR8-store exiting on, as 0039 keeps MOV-DR exiting on. CR8 is the core's local APIC TPR: 0039 does not allow the TPR shadow, so with these exits off a guest MOV to or from CR8 reaches the TPR, which neither VM entry and exit nor seL4 switch. The next guest on the core would read the value, and a guest that raised it would mask the host's timer and IPIs on that core, in guest mode and after it. A guest's CR8 access is now a control-register exit to userspace, which emulates CR8 per VCPU. l4h's KVM already sets both exits (`kvm/vmx.c`), so nothing changes for it. AMD-V needs no counterpart, as `V_INTR_MASKING` is always on (0040) and a guest's CR8 is its VMCB's `V_TPR`. |
-| 0044 | Configuring a 32-bit kernel (ia32, aarch32, riscv32) fails in `configs/seL4Config.cmake` with a message: l4h supports only 64-bit platforms (§4). |
 
 **Verification.** The MCS SMP x86_64 configuration is not covered by the
 seL4 proofs, with or without these patches. l4h benefits from seL4's design
