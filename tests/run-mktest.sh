@@ -177,7 +177,7 @@ run_qemu() {
         tpm=(-chardev socket,id=tpm,path="$out/tpm/sock" -tpmdev emulator,id=tpm0,chardev=tpm -device tpm-crb,tpmdev=tpm0)
     fi
     rm -f "$log"
-    qemu-system-x86_64 -machine "$machine" -enable-kvm -cpu "${L4H_QEMU_CPU:-host,-vmx,+invtsc}" \
+    qemu-system-x86_64 -machine "$machine" -enable-kvm -cpu "${L4H_QEMU_CPU:-host,-vmx,-svm,+invtsc}" \
         -smp $((2 * n)) -m "${MK_MEM:-$((2 * n + 2))G}" -nographic -serial mon:stdio -no-reboot \
         "${iommu[@]}" "${tpm[@]}" \
         "${boot[@]}" \

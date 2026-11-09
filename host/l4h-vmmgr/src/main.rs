@@ -77,7 +77,7 @@ pub struct HostInfo {
     pub cores: usize,
     pub topology: topology::Topology,
     pub tsc_hz: u64,
-    /// The kernel makes VT-x objects (VmmgrConfig::vtx).
+    /// The kernel makes VCPU and EPT objects, on VT-x or AMD-V (VmmgrConfig::vtx).
     pub vtx: bool,
     /// AArch64 feature ID registers for the guests' bootinfo.
     pub cpu_id: [u64; 5],

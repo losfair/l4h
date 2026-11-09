@@ -26,7 +26,10 @@ linux)
     mods=$(mktemp -d)
     trap 'rm -rf "$mods"' EXIT
     mkdir -p "$mods/lib/kvm"
-    for m in virt/lib/irqbypass arch/x86/kvm/kvm arch/x86/kvm/kvm-intel; do
+    # kvm-amd needs ccp (SEV's firmware interface).
+    vendor=arch/x86/kvm/kvm-intel
+    grep -qw svm /proc/cpuinfo && vendor="drivers/crypto/ccp/ccp arch/x86/kvm/kvm-amd"
+    for m in virt/lib/irqbypass arch/x86/kvm/kvm $vendor; do
         xz -dc "/lib/modules/$(uname -r)/kernel/$m.ko.xz" >"$mods/lib/kvm/$(basename "$m").ko"
     done
     (cd "$mods" && find . | cpio -o -H newc --quiet | gzip -1) >>"$out/kvmbench.cpio.gz"

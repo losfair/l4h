@@ -3,8 +3,8 @@
 # VMs on /dev/kvm.  With "vmm" it then boots the host's Linux kernel with two
 # vCPUs under each of QEMU (the host's), Firecracker and cloud-hypervisor
 # (their static release binaries, downloaded and checked into build/dl);
-# KVMTEST_VMMS picks a subset.  Needs a CPU with VMX in QEMU (-cpu host on
-# an Intel host with nested KVM); L4H_QEMU_CPU overrides it.
+# KVMTEST_VMMS picks a subset.  Needs a CPU with VMX or SVM in QEMU (-cpu
+# host on a host with nested KVM); L4H_QEMU_CPU overrides it.
 # Usage: run-kvmtest.sh [vmm] [vcpus]
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)

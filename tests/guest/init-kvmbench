@@ -4,7 +4,7 @@
 /bin/busybox mount -t tmpfs tmp /tmp
 /bin/busybox mount -t devtmpfs dev /dev
 # The Linux baseline (run-kvmbench.sh linux) has KVM as modules.
-for m in irqbypass kvm kvm-intel; do
+for m in irqbypass kvm kvm-intel ccp kvm-amd; do
 	[ -f /lib/kvm/$m.ko ] && /bin/busybox insmod /lib/kvm/$m.ko
 done
 echo "KVMBENCH: start on $(/bin/busybox uname -r)"

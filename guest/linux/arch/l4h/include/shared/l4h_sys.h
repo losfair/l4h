@@ -202,13 +202,17 @@ enum {
 
 /* What a VMEnter returned.  Without `fault` a notification ended it: there
  * was no exit to handle, and intr_info still holds an event not delivered.
- * Fields an exit does not define are 0; RSP and CR3 are for l4h_vcpu_read(). */
+ * Fields an exit does not define are 0; RSP and CR3 are for l4h_vcpu_read()
+ * on VT-x.  On AMD (patch 0040) the fields have SVM's meaning: reason is the
+ * exit code, qualification and gpa EXITINFO1 and 2, interruptibility the
+ * interrupt state, and idt_vector_* EXITINTINFO. */
 struct l4h_vmexit {
 	int fault;
 	unsigned int reason, instr_len;
 	unsigned int intr_info, exit_intr_info, exit_intr_error;
 	unsigned int idt_vector_info, idt_vector_error, interruptibility;
 	unsigned long rip, rflags, cr2, qualification, gpa;
+	unsigned long cr3;			/* AMD only; 0 on VT-x */
 	unsigned long gp[L4H_VMX_NR_GP];	/* L4H_VMX_* */
 };
 
@@ -221,6 +225,11 @@ int l4h_vcpu_write_msr(unsigned long vcpu, unsigned long msr, unsigned long valu
 int l4h_vcpu_write_cr2(unsigned long vcpu, unsigned long value);
 int l4h_vcpu_write_xcr0(unsigned long vcpu, unsigned long long value);
 int l4h_vcpu_flush_tlb(unsigned long vcpu);
+/* AMD: count (at most 32) words of the VMCB from byte offset, and one word. */
+int l4h_vcpu_read_vmcb(unsigned long vcpu, unsigned long offset, unsigned long count,
+		       unsigned long *words);
+int l4h_vcpu_write_vmcb(unsigned long vcpu, unsigned long offset, unsigned long value,
+			unsigned long *written);
 int l4h_vcpu_write_regs(unsigned long vcpu, const unsigned long *gp);
 void l4h_vcpu_enter(struct l4h_vmexit *x, unsigned long rip, unsigned long controls,
 		    unsigned long intr_info);

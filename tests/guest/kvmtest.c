@@ -25,6 +25,9 @@
 /* Guest code, assembled here and copied to guest address 0x1000. */
 extern const char rm_start[], rm_end[], lm_start[], lm_end[], probe_start[], probe_end[];
 extern const char fpu_start[], fpu_end[], xcr0_start[], xcr0_end[], smap_start[], smap_end[];
+extern const char state_start[], state_end[], rdpmc_start[], rdpmc_end[];
+extern const char nmiss_start[], nmiss_ud[], nmiss_nmi[], nmiss_end[];
+extern const char tpr_start[], tpr_end[], vintr_start[], vintr_ok[], vintr_v0[], vintr_end[];
 __asm__(".pushsection .rodata\n"
 	/* Real mode: "OK" to port 0x3f8, then hlt. */
 	".code16\n"
@@ -157,6 +160,57 @@ __asm__(".pushsection .rodata\n"
 	"  hlt\n"
 	"smap_end:\n"
 	".code64\n"
+	/* Store what the CPU has of IDTR (at 0x3000) and CR4 (at 0x3010),
+	 * then OUT to port 0x40, over and over. */
+	"state_start:\n"
+	"1: sidt 0x3000\n"
+	"  mov %cr4, %rax\n"
+	"  mov %rax, 0x3010\n"
+	"  mov $0x40, %dx\n"
+	"  out %al, %dx\n"
+	"  jmp 1b\n"
+	"state_end:\n"
+	/* RDPMC of counter 0, then its low half to port 0x40. */
+	"rdpmc_start:\n"
+	"  xor %ecx, %ecx\n"
+	"  rdpmc\n"
+	"  mov $0x40, %dx\n"
+	"  out %eax, %dx\n"
+	"  hlt\n"
+	"rdpmc_end:\n"
+	/* UD2, whose #UD handler sends the RFLAGS in its frame to port 0x40;
+	 * the NMI handler only returns. */
+	"nmiss_start:\n"
+	"  ud2\n"
+	"nmiss_ud:\n"
+	"  mov 16(%rsp), %rax\n"
+	"  mov $0x40, %dx\n"
+	"  out %eax, %dx\n"
+	"  hlt\n"
+	"nmiss_nmi:\n"
+	"  iretq\n"
+	"nmiss_end:\n"
+	/* Raise CR8, lower it, hlt. */
+	"tpr_start:\n"
+	"  mov $8, %eax\n"
+	"  mov %rax, %cr8\n"
+	"  xor %eax, %eax\n"
+	"  mov %rax, %cr8\n"
+	"  hlt\n"
+	"tpr_end:\n"
+	/* UD2 (with no IDT, a shutdown); then, after a reset, the normal path
+	 * to port 0x40, and a vector 0 handler that goes to port 0x41. */
+	"vintr_start:\n"
+	"  ud2\n"
+	"vintr_ok:\n"
+	"  mov $0x40, %dx\n"
+	"  out %al, %dx\n"
+	"  hlt\n"
+	"vintr_v0:\n"
+	"  mov $0x41, %dx\n"
+	"  out %al, %dx\n"
+	"  hlt\n"
+	"vintr_end:\n"
 	".popsection\n");
 
 static int failures;
@@ -303,6 +357,15 @@ static int enter_long_mode(struct vm *vm, const char *code, const char *end,
 	return 0;
 }
 
+/* EBX of CPUID leaf 0: "Genu" or "Auth". */
+static uint32_t host_vendor(void)
+{
+	uint32_t a = 0, b, c, d;
+
+	__asm__ volatile("cpuid" : "+a"(a), "=b"(b), "=c"(c), "=d"(d));
+	return b;
+}
+
 /* Fill `fill` bytes and spin `spin` times in long mode. */
 static int long_mode(int kvm, uint64_t fill, uint64_t spin, const char *what)
 {
@@ -346,8 +409,9 @@ static int long_mode(int kvm, uint64_t fill, uint64_t spin, const char *what)
 	CHECK(port_val == sum, "%s: port sum %x, wanted %lx", what, port_val, sum);
 	CHECK(got_mmio && mmio_val == sum, "%s: MMIO write %d %x", what, got_mmio, mmio_val);
 	CHECK(ioctl(vm.vcpu, KVM_GET_REGS, &regs) == 0, "KVM_GET_REGS");
-	/* rbx of the emulated CPUID went into the guest. */
-	CHECK(regs.rbx == 0xd0000000 && regs.r8 == sum && regs.r9 == 0x756e6547,
+	/* rbx of the emulated CPUID went into the guest: the host's vendor
+	 * (KVM_GET_SUPPORTED_CPUID). */
+	CHECK(regs.rbx == 0xd0000000 && regs.r8 == sum && regs.r9 == host_vendor(),
 	      "%s: registers after exit: rbx %llx r8 %llx r9 %llx", what, regs.rbx, regs.r8, regs.r9);
 	vm_destroy(&vm);
 	printf("KVMTEST: %s ok (%.3f s)\n", what,
@@ -575,6 +639,207 @@ static int fpu_migrate(int kvm)
 	return 0;
 }
 
+/*
+ * Guest state that KVM changes between runs must reach the CPU, which
+ * keeps VMCB fields across VMRUNs on one core unless told they changed
+ * (SVM's clean bits): IDTR and CR4, changed before each run, read by the
+ * guest itself, on one core and then moving between two.
+ */
+static int state_between_runs(int kvm)
+{
+	struct kvm_sregs sregs;
+	cpu_set_t set, old;
+	struct vm vm;
+	int round;
+
+	if (vm_create(&vm, kvm) || enter_long_mode(&vm, state_start, state_end, 0, 0))
+		return -1;
+	pthread_getaffinity_np(pthread_self(), sizeof(old), &old);
+	for (round = 0; round < 16; round++) {
+		uint64_t base = 0x100000 + round * 0x1000, cr4;
+
+		CPU_ZERO(&set);
+		CPU_SET(round < 8 ? 0 : round & 1, &set);
+		pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+		CHECK(ioctl(vm.vcpu, KVM_GET_SREGS, &sregs) == 0, "KVM_GET_SREGS");
+		sregs.idt.base = base;
+		sregs.idt.limit = 0xfff;
+		sregs.cr4 = (1 << 5) | (1 << 9) | (round & 1 ? 1 << 10 : 0);
+		cr4 = sregs.cr4;
+		CHECK(ioctl(vm.vcpu, KVM_SET_SREGS, &sregs) == 0, "KVM_SET_SREGS");
+		CHECK(ioctl(vm.vcpu, KVM_RUN, 0) == 0, "KVM_RUN");
+		CHECK(vm.run->exit_reason == KVM_EXIT_IO && vm.run->io.port == 0x40,
+		      "state between runs: exit %u", vm.run->exit_reason);
+		CHECK(*(uint64_t *)(vm.mem + 0x3002) == base && *(uint16_t *)(vm.mem + 0x3000) == 0xfff,
+		      "state between runs %d: guest IDTR %lx, set %lx", round,
+		      *(uint64_t *)(vm.mem + 0x3002), base);
+		CHECK(*(uint64_t *)(vm.mem + 0x3010) == cr4,
+		      "state between runs %d: guest CR4 %lx, set %lx", round,
+		      *(uint64_t *)(vm.mem + 0x3010), cr4);
+	}
+	pthread_setaffinity_np(pthread_self(), sizeof(old), &old);
+	vm_destroy(&vm);
+	printf("KVMTEST: state between runs ok\n");
+	return 0;
+}
+
+/*
+ * seL4 always intercepts RDPMC.  KVM emulates it: the counter's value where
+ * there is a PMU, a #GP (here a shutdown, with no IDT) where there is none,
+ * as on l4h, and never an exit the VMM cannot handle.
+ */
+static int rdpmc(int kvm)
+{
+	struct kvm_sregs sregs;
+	struct vm vm;
+
+	if (vm_create(&vm, kvm) || enter_long_mode(&vm, rdpmc_start, rdpmc_end, 0, 0))
+		return -1;
+	CHECK(ioctl(vm.vcpu, KVM_GET_SREGS, &sregs) == 0, "KVM_GET_SREGS");
+	sregs.idt.base = 0;
+	sregs.idt.limit = 0;
+	CHECK(ioctl(vm.vcpu, KVM_SET_SREGS, &sregs) == 0, "KVM_SET_SREGS");
+	CHECK(ioctl(vm.vcpu, KVM_RUN, 0) == 0, "KVM_RUN");
+	CHECK(vm.run->exit_reason == KVM_EXIT_SHUTDOWN ||
+	      (vm.run->exit_reason == KVM_EXIT_IO && vm.run->io.port == 0x40),
+	      "rdpmc: exit %u", vm.run->exit_reason);
+	printf("KVMTEST: rdpmc ok (%s)\n", vm.run->exit_reason == KVM_EXIT_IO ? "read" : "#GP");
+	vm_destroy(&vm);
+	return 0;
+}
+
+/* A 64-bit interrupt gate to `addr` in the code segment. */
+static void gate64(uint8_t *idt, int vector, uint64_t addr)
+{
+	uint32_t *g = (uint32_t *)(idt + vector * 16);
+
+	g[0] = (addr & 0xffff) | 8 << 16;
+	g[1] = (addr & 0xffff0000) | 0x8e00;
+	g[2] = addr >> 32;
+	g[3] = 0;
+}
+
+/*
+ * An NMI pending in an STI shadow: KVM single-steps the guest to the NMI
+ * window with TF and RF set.  The #UD it then injects for a UD2 must not
+ * carry that TF in its frame, where nothing could take it back, and the
+ * NMI must still be delivered.
+ */
+static int nmi_singlestep_event(int kvm)
+{
+	struct kvm_vcpu_events ev;
+	struct kvm_sregs sregs;
+	struct kvm_regs regs;
+	struct vm vm;
+	uint32_t flags;
+
+	if (vm_create(&vm, kvm) || enter_long_mode(&vm, nmiss_start, nmiss_end, 0, 0))
+		return -1;
+	gate64(vm.mem + 0x20000, 2, 0x1000 + (nmiss_nmi - nmiss_start));
+	gate64(vm.mem + 0x20000, 6, 0x1000 + (nmiss_ud - nmiss_start));
+	/* Delivery and IRETQ load CS and SS from the GDT: seg64's. */
+	((uint64_t *)(vm.mem + 0x21000))[1] = 0x00af9b000000ffff;
+	((uint64_t *)(vm.mem + 0x21000))[2] = 0x00cf93000000ffff;
+	CHECK(ioctl(vm.vcpu, KVM_GET_SREGS, &sregs) == 0, "KVM_GET_SREGS");
+	sregs.idt.base = 0x20000;
+	sregs.idt.limit = 0xfff;
+	sregs.gdt.base = 0x21000;
+	sregs.gdt.limit = 23;
+	CHECK(ioctl(vm.vcpu, KVM_SET_SREGS, &sregs) == 0, "KVM_SET_SREGS");
+	CHECK(ioctl(vm.vcpu, KVM_GET_REGS, &regs) == 0, "KVM_GET_REGS");
+	regs.rsp = 0x30000;
+	CHECK(ioctl(vm.vcpu, KVM_SET_REGS, &regs) == 0, "KVM_SET_REGS");
+	CHECK(ioctl(vm.vcpu, KVM_GET_VCPU_EVENTS, &ev) == 0, "KVM_GET_VCPU_EVENTS");
+	ev.nmi.pending = 1;
+	ev.interrupt.shadow = KVM_X86_SHADOW_INT_STI;
+	ev.flags = KVM_VCPUEVENT_VALID_NMI_PENDING | KVM_VCPUEVENT_VALID_SHADOW;
+	CHECK(ioctl(vm.vcpu, KVM_SET_VCPU_EVENTS, &ev) == 0, "KVM_SET_VCPU_EVENTS");
+	CHECK(ioctl(vm.vcpu, KVM_RUN, 0) == 0, "KVM_RUN");
+	CHECK(vm.run->exit_reason == KVM_EXIT_IO && vm.run->io.port == 0x40,
+	      "nmi single-step: exit %u", vm.run->exit_reason);
+	flags = *(uint32_t *)((char *)vm.run + vm.run->io.data_offset);
+	CHECK(!(flags & 0x100), "nmi single-step: the #UD frame has RFLAGS %x, with TF", flags);
+	/* The NMI still comes, and its handler returns to the HLT. */
+	CHECK(ioctl(vm.vcpu, KVM_RUN, 0) == 0, "KVM_RUN");
+	CHECK(vm.run->exit_reason == KVM_EXIT_HLT, "nmi single-step: exit %u after the #UD",
+	      vm.run->exit_reason);
+	CHECK(ioctl(vm.vcpu, KVM_GET_VCPU_EVENTS, &ev) == 0, "KVM_GET_VCPU_EVENTS");
+	CHECK(!ev.nmi.pending && !ev.nmi.injected, "nmi single-step: the NMI was not delivered");
+	vm_destroy(&vm);
+	printf("KVMTEST: nmi single-step and an injected exception ok\n");
+	return 0;
+}
+
+/*
+ * Without an in-kernel LAPIC, a guest lowering CR8 exits with
+ * KVM_EXIT_SET_TPR, so the VMM can deliver what the TPR held back;
+ * raising it does not exit.
+ */
+static int tpr_lowered(int kvm)
+{
+	struct vm vm;
+
+	if (vm_create(&vm, kvm) || enter_long_mode(&vm, tpr_start, tpr_end, 0, 0))
+		return -1;
+	CHECK(ioctl(vm.vcpu, KVM_RUN, 0) == 0, "KVM_RUN");
+	CHECK(vm.run->exit_reason == KVM_EXIT_SET_TPR && vm.run->cr8 == 0,
+	      "tpr: exit %u with CR8 %llu, wanted SET_TPR with 0", vm.run->exit_reason,
+	      (unsigned long long)vm.run->cr8);
+	CHECK(ioctl(vm.vcpu, KVM_RUN, 0) == 0, "KVM_RUN");
+	CHECK(vm.run->exit_reason == KVM_EXIT_HLT, "tpr: exit %u after SET_TPR", vm.run->exit_reason);
+	vm_destroy(&vm);
+	printf("KVMTEST: SET_TPR on a lowered CR8 ok\n");
+	return 0;
+}
+
+/*
+ * An IRQ window still open when the VCPU shuts down must not survive the
+ * reset as an interrupt: run with a window requested and IF=0 into a
+ * shutdown, then from the same VCPU with IF=1 and no window, which must
+ * reach port 0x40 and not the vector 0 handler.
+ */
+static int irq_window_reset(int kvm)
+{
+	struct kvm_sregs sregs;
+	struct kvm_regs regs;
+	struct vm vm;
+
+	if (vm_create(&vm, kvm) || enter_long_mode(&vm, vintr_start, vintr_end, 0, 0))
+		return -1;
+	CHECK(ioctl(vm.vcpu, KVM_GET_SREGS, &sregs) == 0, "KVM_GET_SREGS");
+	sregs.idt.base = 0;
+	sregs.idt.limit = 0;
+	CHECK(ioctl(vm.vcpu, KVM_SET_SREGS, &sregs) == 0, "KVM_SET_SREGS");
+	vm.run->request_interrupt_window = 1;
+	CHECK(ioctl(vm.vcpu, KVM_RUN, 0) == 0, "KVM_RUN");
+	CHECK(vm.run->exit_reason == KVM_EXIT_SHUTDOWN, "irq window reset: exit %u, wanted shutdown",
+	      vm.run->exit_reason);
+	vm.run->request_interrupt_window = 0;
+
+	if (enter_long_mode(&vm, vintr_start, vintr_end, 0, 0))
+		return -1;
+	gate64(vm.mem + 0x20000, 0, 0x1000 + (vintr_v0 - vintr_start));
+	((uint64_t *)(vm.mem + 0x21000))[1] = 0x00af9b000000ffff;
+	((uint64_t *)(vm.mem + 0x21000))[2] = 0x00cf93000000ffff;
+	CHECK(ioctl(vm.vcpu, KVM_GET_SREGS, &sregs) == 0, "KVM_GET_SREGS");
+	sregs.idt.base = 0x20000;
+	sregs.idt.limit = 0xfff;
+	sregs.gdt.base = 0x21000;
+	sregs.gdt.limit = 23;
+	CHECK(ioctl(vm.vcpu, KVM_SET_SREGS, &sregs) == 0, "KVM_SET_SREGS");
+	CHECK(ioctl(vm.vcpu, KVM_GET_REGS, &regs) == 0, "KVM_GET_REGS");
+	regs.rip = 0x1000 + (vintr_ok - vintr_start);
+	regs.rflags = 0x202;
+	regs.rsp = 0x30000;
+	CHECK(ioctl(vm.vcpu, KVM_SET_REGS, &regs) == 0, "KVM_SET_REGS");
+	CHECK(ioctl(vm.vcpu, KVM_RUN, 0) == 0, "KVM_RUN");
+	CHECK(vm.run->exit_reason == KVM_EXIT_IO, "irq window reset: exit %u", vm.run->exit_reason);
+	CHECK(vm.run->io.port == 0x40, "irq window reset: an interrupt nobody queued reached the guest");
+	vm_destroy(&vm);
+	printf("KVMTEST: IRQ window across a reset ok\n");
+	return 0;
+}
+
 struct job {
 	int kvm, ret;
 };
@@ -608,6 +873,11 @@ int main(void)
 	fpu_migrate(kvm);
 	xcr0(kvm);
 	smap_paging(kvm);
+	state_between_runs(kvm);
+	rdpmc(kvm);
+	nmi_singlestep_event(kvm);
+	tpr_lowered(kvm);
+	irq_window_reset(kvm);
 	for (i = 0; i < 2; i++) {
 		jobs[i].kvm = kvm;
 		pthread_create(&t[i], NULL, parallel_vm, &jobs[i]);

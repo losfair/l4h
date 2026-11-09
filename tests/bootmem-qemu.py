@@ -83,7 +83,7 @@ end
         else:
             image = work / "kernel32.elf"
             subprocess.run(["objcopy", "-O", "elf32-i386", str(KERNEL), str(image)], check=True)
-            command = ["qemu-system-x86_64", "-enable-kvm", "-cpu", "host,-vmx,+invtsc",
+            command = ["qemu-system-x86_64", "-enable-kvm", "-cpu", "host,-vmx,-svm,+invtsc",
                        "-m", "1G", "-kernel", str(image), "-initrd", str(work / "root.elf")]
 
         with socket.socket() as sock:

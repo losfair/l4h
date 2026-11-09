@@ -103,7 +103,7 @@ if [[ $nics == 2 ]]; then
 fi
 echo "Running KVM ($firmware) as $qemu_user with $nics NIC(s); serial log: $work/serial.log"
 timeout "${INSTALL_VM_TIMEOUT:-600}" sudo -u "$qemu_user" qemu-system-x86_64 \
-    -enable-kvm -cpu host,-vmx -m "${INSTALL_VM_MEMORY:-6G}" -smp "${INSTALL_VM_CPUS:-2}" "${machine[@]}" \
+    -enable-kvm -cpu host,-vmx,-svm -m "${INSTALL_VM_MEMORY:-6G}" -smp "${INSTALL_VM_CPUS:-2}" "${machine[@]}" \
     "${network[@]}" \
     -display none -serial "file:$work/serial.log" -monitor none &
 qemu=$!

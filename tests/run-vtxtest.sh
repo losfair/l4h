@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
-# VT-x in the kernel (patch 0038, DESIGN.md §4.1), below l4h-root: boot
-# seL4 with tests/vtxprobe.c as the root task on 4 cores and check which
-# VT-x objects it can create.
+# VT-x and AMD-V in the kernel (patches 0038 and 0040, DESIGN.md §4.1), below
+# l4h-root: boot seL4 with tests/vtxprobe.c as the root task on 4 cores and
+# check which VCPU and EPT objects it can create.  The host's CPU decides
+# which: VT-x on Intel, SVM on AMD.
 # Usage: run-vtxtest.sh off|on|skim
-#   off   a CPU without VMX (-cpu host,-vmx): the kernel boots without VT-x
-#         and refuses VCPU and EPT objects.
-#   on    a CPU with VMX (-cpu host; needs nested KVM on an Intel host):
-#         every core enters VMX operation, the objects are created and the
-#         VCPU binds to a TCB.
+#   off   a CPU without VMX or SVM (-cpu host,-vmx,-svm): the kernel boots
+#         without them and refuses VCPU and EPT objects.
+#   on    a CPU with VMX or SVM (-cpu host; needs nested KVM): every core
+#         enters VMX operation or enables SVM, the objects are created and
+#         the VCPU binds to a TCB.  On AMD the probe also runs a real-mode
+#         guest to an I/O exit, a nested page fault and a HLT, and checks
+#         that seL4 keeps its intercepts and VMCB fields.
 #   skim  the SKIM variant (L4H_KERNEL_VARIANT, default skim-xapic-nopcid)
 #         keeps VT-x off whatever the CPU has.
 # L4H_QEMU_CPU overrides the CPU model, L4H_KERNEL_VARIANT the kernel
@@ -18,13 +21,18 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 mode=${1:?usage: run-vtxtest.sh off|on|skim}
 variant=${L4H_KERNEL_VARIANT:-}
 case "$mode" in
-    off) cpu=host,-vmx,+invtsc ;;
+    off) cpu=host,-vmx,-svm,+invtsc ;;
     on) cpu=host,+invtsc ;;
     skim) variant=${variant:-skim-xapic-nopcid}
         cpu=host,vendor=GenuineIntel,-vmx,+invtsc,-arch-capabilities,-pcid,-invpcid,-x2apic ;;
     *) echo "usage: run-vtxtest.sh off|on|skim" >&2; exit 2 ;;
 esac
 cpu=${L4H_QEMU_CPU:-$cpu}
+# The kernel's messages say "vt-x" or "svm", by the vendor it sees.
+virt=vt-x
+if [ "$mode" != skim ] && grep -q '^vendor_id.*AuthenticAMD' /proc/cpuinfo; then
+    virt=svm
+fi
 # The probe's object numbering must match the default libsel4 build, as
 # l4h-root's does on every variant.
 inc=$root/build/sel4/libsel4/include
@@ -53,15 +61,15 @@ wait $qemu 2>/dev/null || true
 trap - EXIT
 fail() {
     echo "VTXTEST($mode): FAIL: $*" >&2
-    tr -d '\r' <"$log" | grep -a -E 'vt-x|vtxprobe|fail|halting' >&2 || true
+    tr -d '\r' <"$log" | grep -a -E 'vt-x|svm|vtxprobe|fail|halting' >&2 || true
     exit 1
 }
 grep -aq 'vtxprobe: done' "$log" || fail "the probe did not finish"
 # seL4_InvalidArgument is 1.
 case "$mode" in
-    off) grep -aq 'vt-x: unavailable; booting without it' "$log" || fail "VT-x was not reported unavailable" ;;
+    off) grep -aq "$virt: unavailable; booting without it" "$log" || fail "$virt was not reported unavailable" ;;
     skim) grep -aq 'vt-x: off with the SKIM window' "$log" || fail "SKIM did not turn VT-x off" ;;
-    on) ! grep -aq 'vt-x: unavailable\|vt-x: off' "$log" || fail "VT-x is off" ;;
+    on) ! grep -aq "$virt: unavailable\|$virt: off" "$log" || fail "$virt is off" ;;
 esac
 for object in vcpu ept_pml4 ept_pt; do
     if [ "$mode" = on ]; then
@@ -76,5 +84,14 @@ if [ "$mode" = on ]; then
     # Patch 0039: seL4 loads KERNEL_GS_BASE with WRMSR before VM entry.
     grep -aq 'vtxprobe: kgs_canonical ok' "$log" || fail "a canonical KERNEL_GS_BASE was refused"
     grep -aq 'vtxprobe: kgs_noncanonical err=1' "$log" || fail "a noncanonical KERNEL_GS_BASE was accepted"
+fi
+if [ "$mode" = on ] && [ "$virt" = svm ]; then
+    # Patch 0040.  seL4_IllegalOperation is 3.
+    grep -aq 'vtxprobe: svm_forced_intercepts ok' "$log" || fail "an intercept seL4 needs was cleared"
+    grep -aq 'vtxprobe: svm_forced_invd ok' "$log" || fail "the INVD intercept was cleared"
+    grep -aq 'vtxprobe: svm_owned_field err=3' "$log" || fail "a kernel-owned VMCB field was written"
+    for step in asid map bind io npf invd hlt invalid dirty_kept inject_exit; do
+        grep -aq "vtxprobe: svm_$step ok" "$log" || fail "the guest failed at svm_$step"
+    done
 fi
 echo "VTXTEST($mode): PASS"
