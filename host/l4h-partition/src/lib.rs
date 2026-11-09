@@ -282,9 +282,8 @@ pub const SERIAL_RING_SIZE: u64 = 256 << 10;
 
 /// Size of a control channel: two message rings.
 pub const CHANNEL_SIZE: u64 = 256 << 10;
-/// Size of a link channel: rings of 512 KiB, room for 56 frames of 9216
-/// bytes or 340 of 1514 in flight.
-pub const LINK_CHANNEL_SIZE: u64 = 1 << 20;
+/// Two 1 MiB rings. Each can carry a full-size GSO frame in one record.
+pub const LINK_CHANNEL_SIZE: u64 = 2 << 20;
 
 /// The user vectors (as for an MSI handler) of the doorbells from
 /// partition P: CONTROL_VECTOR_BASE + P on its control channel,
@@ -536,6 +535,8 @@ pub const MSG_TPM_REPLY: u32 = 5;
 /// On a link channel: the payload is one whole Ethernet frame of at most
 /// LINK_FRAME_MAX bytes (checksums complete, no segmentation offload).
 pub const MSG_FRAME: u32 = 6;
+/// A virtio-net header followed by a TCP GSO frame.
+pub const MSG_FRAME_GSO: u32 = 7;
 pub const LINK_FRAME_MAX: usize = 9216;
 
 const _: () = assert!(core::mem::size_of::<Func>() == 160);
