@@ -5,17 +5,12 @@
 /* This is here because signal.c needs the REGSET_FP_LEGACY definition */
 enum {
 	REGSET_GENERAL,
-#ifdef CONFIG_X86_32
-	REGSET_FP_LEGACY,
-#endif
 	REGSET_FP,
 	REGSET_XSTATE,
 };
 
 #include <linux/compiler.h>
-#ifndef CONFIG_X86_32
 #define __FRAME_OFFSETS /* Needed to get the R* macros */
-#endif
 #include <asm/ptrace-abi.h>
 #include <asm/ptrace-generic.h>
 
@@ -57,18 +52,6 @@ static inline long regs_return_value(struct pt_regs *regs)
  */
 struct user_desc;
 
-#ifdef CONFIG_X86_32
-
-extern int ptrace_get_thread_area(struct task_struct *child, int idx,
-                                  struct user_desc __user *user_desc);
-
-extern int ptrace_set_thread_area(struct task_struct *child, int idx,
-                                  struct user_desc __user *user_desc);
-
-extern int arch_switch_tls(struct task_struct *to);
-
-#else
-
 #define PT_REGS_R8(r) UPT_R8(&(r)->regs)
 #define PT_REGS_R9(r) UPT_R9(&(r)->regs)
 #define PT_REGS_R10(r) UPT_R10(&(r)->regs)
@@ -94,8 +77,6 @@ static inline int ptrace_set_thread_area(struct task_struct *child, int idx,
 
 extern long arch_prctl(struct task_struct *task, int option,
 		       unsigned long __user *addr);
-
-#endif
 
 #define user_stack_pointer(regs) PT_REGS_SP(regs)
 

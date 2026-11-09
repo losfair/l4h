@@ -1,4 +1,4 @@
-From 44e38f83a45d594d561c1128db1726b5574b2f61 Mon Sep 17 00:00:00 2001
+From f5a736f0cba5ad9541a423182063a1850220a774 Mon Sep 17 00:00:00 2001
 From: l4h <l4h@localhost>
 Date: Tue, 3 Nov 2026 01:02:18 -0800
 Subject: [PATCH 31/36] x86: build option for the kernel image's physical
@@ -10,7 +10,7 @@ Subject: [PATCH 31/36] x86: build option for the kernel image's physical
  2 files changed, 14 insertions(+), 4 deletions(-)
 
 diff --git a/include/plat/pc99/plat/64/plat_mode/machine/hardware.h b/include/plat/pc99/plat/64/plat_mode/machine/hardware.h
-index e530a7e..bc44e4b 100644
+index e530a7e82..bc44e4b52 100644
 --- a/include/plat/pc99/plat/64/plat_mode/machine/hardware.h
 +++ b/include/plat/pc99/plat/64/plat_mode/machine/hardware.h
 @@ -86,10 +86,11 @@
@@ -30,7 +30,7 @@ index e530a7e..bc44e4b 100644
  /* Kernel mapping starts directly after the physical memory window */
  #define KERNEL_ELF_BASE (PPTR_TOP + KERNEL_ELF_PADDR_BASE)
 diff --git a/src/arch/x86/config.cmake b/src/arch/x86/config.cmake
-index 8927c02..252684b 100644
+index 8927c020e..252684bbf 100644
 --- a/src/arch/x86/config.cmake
 +++ b/src/arch/x86/config.cmake
 @@ -217,6 +217,15 @@ config_string(

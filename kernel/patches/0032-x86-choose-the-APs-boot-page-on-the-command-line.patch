@@ -1,4 +1,4 @@
-From d890fedd987786b7d721932df0e04d3742a14f30 Mon Sep 17 00:00:00 2001
+From 36b2052c397454a62803b4935227adb4c0207600 Mon Sep 17 00:00:00 2001
 From: l4h <l4h@localhost>
 Date: Tue, 3 Nov 2026 01:03:20 -0800
 Subject: [PATCH 32/36] x86: choose the APs' boot page on the command line
@@ -10,7 +10,7 @@ Subject: [PATCH 32/36] x86: choose the APs' boot page on the command line
  3 files changed, 57 insertions(+), 4 deletions(-)
 
 diff --git a/include/arch/x86/arch/kernel/cmdline.h b/include/arch/x86/arch/kernel/cmdline.h
-index 523d7d7..1d1e219 100644
+index 523d7d7ac..1d1e21961 100644
 --- a/include/arch/x86/arch/kernel/cmdline.h
 +++ b/include/arch/x86/arch/kernel/cmdline.h
 @@ -17,7 +17,14 @@ typedef struct cmdline_opt {
@@ -29,7 +29,7 @@ index 523d7d7..1d1e219 100644
 +extern cmdline_opt_t cmdline_opt;
 +
 diff --git a/src/arch/x86/kernel/cmdline.c b/src/arch/x86/kernel/cmdline.c
-index 211cf84..9b37720 100644
+index 211cf84ea..9b3772060 100644
 --- a/src/arch/x86/kernel/cmdline.c
 +++ b/src/arch/x86/kernel/cmdline.c
 @@ -9,6 +9,8 @@
@@ -91,7 +91,7 @@ index 211cf84..9b37720 100644
      printf("Boot config: disable_iommu = %s\n", cmdline_opt->disable_iommu ? "true" : "false");
  }
 diff --git a/src/arch/x86/kernel/smp_sys.c b/src/arch/x86/kernel/smp_sys.c
-index 3e049f3..5e30a3c 100644
+index 3e049f35c..5e30a3c11 100644
 --- a/src/arch/x86/kernel/smp_sys.c
 +++ b/src/arch/x86/kernel/smp_sys.c
 @@ -9,6 +9,7 @@

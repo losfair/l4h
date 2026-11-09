@@ -1,4 +1,4 @@
-From 8d6fda44e259e32fe8d50af63bdb7bd393178a81 Mon Sep 17 00:00:00 2001
+From fd5838366a06b36d904836e541fb5631109587c7 Mon Sep 17 00:00:00 2001
 From: l4h <l4h@localhost>
 Date: Tue, 3 Nov 2026 01:04:03 -0800
 Subject: [PATCH 34/36] x86: take the TSC and APIC timer rates from the command
@@ -12,7 +12,7 @@ Subject: [PATCH 34/36] x86: take the TSC and APIC timer rates from the command
  4 files changed, 22 insertions(+), 1 deletion(-)
 
 diff --git a/include/arch/x86/arch/kernel/cmdline.h b/include/arch/x86/arch/kernel/cmdline.h
-index 051bcc1..9f3d83e 100644
+index 051bcc143..9f3d83ee6 100644
 --- a/include/arch/x86/arch/kernel/cmdline.h
 +++ b/include/arch/x86/arch/kernel/cmdline.h
 @@ -24,6 +24,11 @@ typedef struct cmdline_opt {
@@ -28,7 +28,7 @@ index 051bcc1..9f3d83e 100644
  
  void cmdline_parse(const char *cmdline, cmdline_opt_t *cmdline_opt);
 diff --git a/src/arch/x86/kernel/apic.c b/src/arch/x86/kernel/apic.c
-index e1a377b..ad277dc 100644
+index e1a377bf0..ad277dcaf 100644
 --- a/src/arch/x86/kernel/apic.c
 +++ b/src/arch/x86/kernel/apic.c
 @@ -5,6 +5,7 @@
@@ -49,7 +49,7 @@ index e1a377b..ad277dc 100644
              x86KSapicMaxDelta = div64(0xffffffffllu * x86KStscMhz * 1000llu, apic_khz);
              printf("Apic Khz %lu, TSC Mhz %lu\n", (long) apic_khz, (long) x86KStscMhz);
 diff --git a/src/arch/x86/kernel/cmdline.c b/src/arch/x86/kernel/cmdline.c
-index 72efaf7..f399d89 100644
+index 72efaf70a..f399d894c 100644
 --- a/src/arch/x86/kernel/cmdline.c
 +++ b/src/arch/x86/kernel/cmdline.c
 @@ -205,6 +205,17 @@ void cmdline_parse(const char *cmdline, cmdline_opt_t *cmdline_opt)
@@ -71,7 +71,7 @@ index 72efaf7..f399d89 100644
      printf("Boot config: no_legacy_irq = %s\n", cmdline_opt->no_legacy_irq ? "true" : "false");
  
 diff --git a/src/plat/pc99/machine/hardware.c b/src/plat/pc99/machine/hardware.c
-index 05f98a6..c9b73b5 100644
+index 05f98a623..c9b73b5bc 100644
 --- a/src/plat/pc99/machine/hardware.c
 +++ b/src/plat/pc99/machine/hardware.c
 @@ -5,6 +5,7 @@

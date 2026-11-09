@@ -9,168 +9,6 @@
 #include <asm/sigcontext.h>
 #include <asm/fpu/api.h>
 
-#ifdef CONFIG_X86_32
-/*
- * FPU tag word conversions.
- */
-
-static inline unsigned short twd_i387_to_fxsr(unsigned short twd)
-{
-	unsigned int tmp; /* to avoid 16 bit prefixes in the code */
-
-	/* Transform each pair of bits into 01 (valid) or 00 (empty) */
-	tmp = ~twd;
-	tmp = (tmp | (tmp>>1)) & 0x5555; /* 0V0V0V0V0V0V0V0V */
-	/* and move the valid bits to the lower byte. */
-	tmp = (tmp | (tmp >> 1)) & 0x3333; /* 00VV00VV00VV00VV */
-	tmp = (tmp | (tmp >> 2)) & 0x0f0f; /* 0000VVVV0000VVVV */
-	tmp = (tmp | (tmp >> 4)) & 0x00ff; /* 00000000VVVVVVVV */
-	return tmp;
-}
-
-static inline unsigned long
-twd_fxsr_to_i387(const struct user_fxsr_struct *fxsave)
-{
-	struct _fpxreg *st = NULL;
-	unsigned long twd = (unsigned long) fxsave->twd;
-	unsigned long tag;
-	unsigned long ret = 0xffff0000;
-	int i;
-
-#define FPREG_ADDR(f, n)	((char *)&(f)->st_space + (n) * 16)
-
-	for (i = 0; i < 8; i++) {
-		if (twd & 0x1) {
-			st = (struct _fpxreg *) FPREG_ADDR(fxsave, i);
-
-			switch (st->exponent & 0x7fff) {
-			case 0x7fff:
-				tag = 2;		/* Special */
-				break;
-			case 0x0000:
-				if (!st->significand[0] &&
-				    !st->significand[1] &&
-				    !st->significand[2] &&
-				    !st->significand[3]) {
-					tag = 1;	/* Zero */
-				} else {
-					tag = 2;	/* Special */
-				}
-				break;
-			default:
-				if (st->significand[3] & 0x8000)
-					tag = 0;	/* Valid */
-				else
-					tag = 2;	/* Special */
-				break;
-			}
-		} else {
-			tag = 3;			/* Empty */
-		}
-		ret |= (tag << (2 * i));
-		twd = twd >> 1;
-	}
-	return ret;
-}
-
-/*
- * Get/set the old 32bit i387 registers (pre-FPX)
- *
- * We provide simple wrappers for mcontext.c, they are only defined locally
- * because mcontext.c is userspace facing and needs to a different definition
- * of the structures.
- */
-static int _um_i387_from_fxsr(struct membuf to,
-			      const struct user_fxsr_struct *fxsave)
-{
-	int i;
-
-	membuf_store(&to, (unsigned long)fxsave->cwd | 0xffff0000ul);
-	membuf_store(&to, (unsigned long)fxsave->swd | 0xffff0000ul);
-	membuf_store(&to, twd_fxsr_to_i387(fxsave));
-	membuf_store(&to, fxsave->fip);
-	membuf_store(&to, fxsave->fcs | ((unsigned long)fxsave->fop << 16));
-	membuf_store(&to, fxsave->foo);
-	membuf_store(&to, fxsave->fos);
-
-	for (i = 0; i < 8; i++)
-		membuf_write(&to, (void *)fxsave->st_space + i * 16, 10);
-
-	return 0;
-}
-
-int um_i387_from_fxsr(struct user_i387_struct *i387,
-		      const struct user_fxsr_struct *fxsave);
-
-int um_i387_from_fxsr(struct user_i387_struct *i387,
-		      const struct user_fxsr_struct *fxsave)
-{
-	struct membuf to = {
-		.p = i387,
-		.left = sizeof(*i387),
-	};
-
-	return _um_i387_from_fxsr(to, fxsave);
-}
-
-static int fpregs_legacy_get(struct task_struct *target,
-			     const struct user_regset *regset,
-			     struct membuf to)
-{
-	struct user_fxsr_struct *fxsave = (void *)target->thread.regs.regs.fp;
-
-	l4h_fpu_fetch(target);
-	return _um_i387_from_fxsr(to, fxsave);
-}
-
-int um_fxsr_from_i387(struct user_fxsr_struct *fxsave,
-		      const struct user_i387_struct *from);
-
-int um_fxsr_from_i387(struct user_fxsr_struct *fxsave,
-		      const struct user_i387_struct *from)
-{
-	int i;
-
-	fxsave->cwd = (unsigned short)(from->cwd & 0xffff);
-	fxsave->swd = (unsigned short)(from->swd & 0xffff);
-	fxsave->twd = twd_i387_to_fxsr((unsigned short)(from->twd & 0xffff));
-	fxsave->fip = from->fip;
-	fxsave->fop = (unsigned short)((from->fcs & 0xffff0000ul) >> 16);
-	fxsave->fcs = (from->fcs & 0xffff);
-	fxsave->foo = from->foo;
-	fxsave->fos = from->fos;
-
-	for (i = 0; i < 8; i++) {
-		memcpy((void *)fxsave->st_space + i * 16,
-		       (void *)from->st_space + i * 10, 10);
-	}
-
-	return 0;
-}
-
-static int fpregs_legacy_set(struct task_struct *target,
-			     const struct user_regset *regset,
-			     unsigned int pos, unsigned int count,
-			     const void *kbuf, const void __user *ubuf)
-{
-	struct user_fxsr_struct *fxsave = (void *)target->thread.regs.regs.fp;
-	const struct user_i387_struct *from;
-	struct user_i387_struct buf;
-
-	if (ubuf) {
-		if (copy_from_user(&buf, ubuf, sizeof(buf)))
-			return -EFAULT;
-		from = &buf;
-	} else {
-		from = kbuf;
-	}
-
-	l4h_fpu_fetch(target);
-	l4h_fpu_dirty(target);
-	return um_fxsr_from_i387(fxsave, from);
-}
-#endif
-
 static int genregs_get(struct task_struct *target,
 		       const struct user_regset *regset,
 		       struct membuf to)
@@ -326,26 +164,9 @@ static struct user_regset uml_regsets[] __ro_after_init = {
 		.regset_get	= genregs_get,
 		.set		= genregs_set
 	},
-#ifdef CONFIG_X86_32
-	/* Old FP registers, they are needed in signal frames */
-	[REGSET_FP_LEGACY] = {
-		USER_REGSET_NOTE_TYPE(PRFPREG),
-		.n		= sizeof(struct user_i387_ia32_struct) / sizeof(long),
-		.size		= sizeof(long),
-		.align		= sizeof(long),
-		.active		= generic_fpregs_active,
-		.regset_get	= fpregs_legacy_get,
-		.set		= fpregs_legacy_set,
-	},
-#endif
 	[REGSET_FP] = {
-#ifdef CONFIG_X86_32
-		USER_REGSET_NOTE_TYPE(PRXFPREG),
-		.n		= sizeof(struct user32_fxsr_struct) / sizeof(long),
-#else
 		USER_REGSET_NOTE_TYPE(PRFPREG),
 		.n		= sizeof(struct user_i387_struct) / sizeof(long),
-#endif
 		.size		= sizeof(long),
 		.align		= sizeof(long),
 		.active		= generic_fpregs_active,
@@ -364,11 +185,7 @@ static struct user_regset uml_regsets[] __ro_after_init = {
 };
 
 static const struct user_regset_view user_uml_view = {
-#ifdef CONFIG_X86_32
-	.name = "i386", .e_machine = EM_386,
-#else
 	.name = "x86_64", .e_machine = EM_X86_64,
-#endif
 	.regsets = uml_regsets, .n = ARRAY_SIZE(uml_regsets)
 };
 

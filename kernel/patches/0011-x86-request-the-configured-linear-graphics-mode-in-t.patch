@@ -1,4 +1,4 @@
-From c07b441203ac26422fa0c8beb60c285de894a198 Mon Sep 17 00:00:00 2001
+From baa590edccabe6dec14d5cfaa897a1a1b979e480 Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Sun, 18 Oct 2026 00:54:31 -0700
 Subject: [PATCH] x86: request the configured linear graphics mode in the

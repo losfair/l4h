@@ -1,0 +1,38 @@
+From 30d729db0d7f6c477d0024a37a9aaa8eb49688b0 Mon Sep 17 00:00:00 2001
+From: l4h <l4h@localhost>
+Date: Mon, 9 Nov 2026 19:28:56 +0000
+Subject: [PATCH] cmake: refuse to configure a 32-bit kernel
+
+l4h supports only 64-bit platforms (x86_64 and aarch64).  Its patches
+assume a 64-bit word: VMEnter reads all three call MRs from registers,
+the frame and EPT invocations they add exist only with 64-bit page
+tables, and nothing builds or tests ia32, aarch32 or riscv32.  So
+configuring one now fails at once, with a message, instead of producing
+a kernel that does not build or misbehaves.
+
+Upstream's own 32-bit code is left in place, to keep this patch stack
+small against upstream.
+---
+ configs/seL4Config.cmake | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/configs/seL4Config.cmake b/configs/seL4Config.cmake
+index 83a7df221..7fb27439f 100644
+--- a/configs/seL4Config.cmake
++++ b/configs/seL4Config.cmake
+@@ -73,9 +73,9 @@ macro(declare_seL4_arch)
+ 
+   # Set kernel mode options
+   if(KernelSel4ArchAarch32 OR KernelSel4ArchRiscV32 OR KernelSel4ArchIA32)
+-    config_set(KernelWordSize WORD_SIZE 32)
+-    set(Kernel64 OFF CACHE INTERNAL "")
+-    set(Kernel32 ON CACHE INTERNAL "")
++    # l4h's patches assume a 64-bit kernel and are not built or tested
++    # for 32-bit ones.
++    message(FATAL_ERROR "l4h supports only 64-bit kernels, not '${KernelSel4Arch}'")
+   elseif(KernelSel4ArchAarch64 OR KernelSel4ArchRiscV64 OR KernelSel4ArchX86_64)
+     config_set(KernelWordSize WORD_SIZE 64)
+     set(Kernel64 ON CACHE INTERNAL "")
+-- 
+2.47.3
+

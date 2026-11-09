@@ -1,4 +1,4 @@
-From 96f5f8e4e5dad63ce7397d925d809118b6c231a7 Mon Sep 17 00:00:00 2001
+From 61d6faf850d9744f32f28b733cbe745ff6a145f0 Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Sun, 18 Oct 2026 06:49:04 -0700
 Subject: [PATCH] x86, mcs: measure the TSC and APIC timer rates once, robustly

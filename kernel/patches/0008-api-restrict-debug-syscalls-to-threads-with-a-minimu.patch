@@ -1,4 +1,4 @@
-From 6e53f0404721149d3bd3857a1e4281bd08965a0c Mon Sep 17 00:00:00 2001
+From 3bc9cec6c454a48392856c8632d4a40d313b8837 Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Sat, 17 Oct 2026 22:58:58 -0700
 Subject: [PATCH] api: restrict debug syscalls to threads with a minimum MCP

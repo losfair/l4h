@@ -23,16 +23,7 @@
 #include <asm/segment.h>
 #include <asm/fpu/api.h>
 
-#ifdef CONFIG_X86_32
-struct _xstate_64 {
-	struct _fpstate_64		fpstate;
-	struct _header			xstate_hdr;
-	struct _ymmh_state		ymmh;
-	/* New processor state extensions go here: */
-};
-#else
 #define _xstate_64 _xstate
-#endif
 
 static int copy_sc_from_user(struct pt_regs *regs,
 			     struct sigcontext __user *from)
@@ -50,12 +41,6 @@ static int copy_sc_from_user(struct pt_regs *regs,
 
 #define GETREG(regno, regname) regs->regs.gp[HOST_##regno] = sc.regname
 
-#ifdef CONFIG_X86_32
-	GETREG(GS, gs);
-	GETREG(FS, fs);
-	GETREG(ES, es);
-	GETREG(DS, ds);
-#endif
 	GETREG(DI, di);
 	GETREG(SI, si);
 	GETREG(BP, bp);
@@ -77,38 +62,16 @@ static int copy_sc_from_user(struct pt_regs *regs,
 	GETREG(R15, r15);
 #endif
 
-#ifdef CONFIG_X86_32
-	GETREG(CS, cs);
-#endif
 	GETREG(EFLAGS, flags);
-#ifdef CONFIG_X86_32
-	GETREG(SS, ss);
-#endif
 
 #undef GETREG
 
-#ifdef CONFIG_X86_32
-	from_fp64 = ((void __user *)sc.fpstate) +
-		    offsetof(struct _fpstate_32, _fxsr_env);
-#else
 	from_fp64 = (void __user *)sc.fpstate;
-#endif
 
 	err = copy_from_user(regs->regs.fp, from_fp64, host_fp_size);
 	l4h_fpu_dirty(current);
 	if (err)
 		return 1;
-
-#ifdef CONFIG_X86_32
-	/* Data is duplicated and this copy is the important one */
-	err = copy_regset_from_user(current,
-				    task_user_regset_view(current),
-				    REGSET_FP_LEGACY, 0,
-				    sizeof(struct user_i387_struct),
-				    (void __user *)sc.fpstate);
-	if (err < 0)
-		return err;
-#endif
 
 	return 0;
 }
@@ -125,12 +88,6 @@ static int copy_sc_to_user(struct sigcontext __user *to,
 
 #define PUTREG(regno, regname) sc.regname = regs->regs.gp[HOST_##regno]
 
-#ifdef CONFIG_X86_32
-	PUTREG(GS, gs);
-	PUTREG(FS, fs);
-	PUTREG(ES, es);
-	PUTREG(DS, ds);
-#endif
 	PUTREG(DI, di);
 	PUTREG(SI, si);
 	PUTREG(BP, bp);
@@ -155,14 +112,8 @@ static int copy_sc_to_user(struct sigcontext __user *to,
 	sc.trapno = fi->trap_no;
 	PUTREG(IP, ip);
 	PUTREG(EFLAGS, flags);
-#ifdef CONFIG_X86_32
-	PUTREG(CS, cs);
-	PUTREG(SP, sp_at_signal);
-	PUTREG(SS, ss);
-#else
 	sc.cs = __USER_CS;
 	sc.ss = __USER_DS;
-#endif
 #undef PUTREG
 	sc.oldmask = mask;
 	sc.fpstate = (unsigned long)to_fp;
@@ -171,24 +122,7 @@ static int copy_sc_to_user(struct sigcontext __user *to,
 	if (err)
 		return 1;
 
-#ifdef CONFIG_X86_32
-	err = copy_regset_to_user(current,
-				  task_user_regset_view(current),
-				  REGSET_FP_LEGACY, 0,
-				  sizeof(struct _fpstate_32), to_fp);
-	if (err < 0)
-		return err;
-
-	__put_user(X86_FXSR_MAGIC, &to_fp->fpstate.magic);
-
-	BUILD_BUG_ON(offsetof(struct _xstate, xstate_hdr) !=
-		     offsetof(struct _xstate_64, xstate_hdr) +
-			offsetof(struct _fpstate_32, _fxsr_env));
-	to_fp64 = (void __user *)to_fp +
-		  offsetof(struct _fpstate_32, _fxsr_env);
-#else
 	to_fp64 = to_fp;
-#endif /* CONFIG_X86_32 */
 
 	l4h_fpu_fetch(current);
 	if (copy_to_user(to_fp64, regs->regs.fp, host_fp_size))
@@ -205,14 +139,8 @@ static int copy_sc_to_user(struct sigcontext __user *to,
 		return 0;
 
 	BUILD_BUG_ON(sizeof(int) != FP_XSTATE_MAGIC2_SIZE);
-#ifdef CONFIG_X86_32
-	__put_user(offsetof(struct _fpstate_32, _fxsr_env) +
-		   host_fp_size + FP_XSTATE_MAGIC2_SIZE,
-		   &to_fp64->fpstate.sw_reserved.extended_size);
-#else
 	__put_user(host_fp_size + FP_XSTATE_MAGIC2_SIZE,
 		   &to_fp64->fpstate.sw_reserved.extended_size);
-#endif
 	__put_user(host_fp_size, &to_fp64->fpstate.sw_reserved.xstate_size);
 	__put_user(l4h_xfeatures, &to_fp64->fpstate.sw_reserved.xfeatures);
 
@@ -222,159 +150,6 @@ static int copy_sc_to_user(struct sigcontext __user *to,
 
 	return 0;
 }
-
-#ifdef CONFIG_X86_32
-static int copy_ucontext_to_user(struct ucontext __user *uc,
-				 struct _xstate __user *fp, sigset_t *set,
-				 unsigned long sp)
-{
-	int err = 0;
-
-	err |= __save_altstack(&uc->uc_stack, sp);
-	err |= copy_sc_to_user(&uc->uc_mcontext, fp, &current->thread.regs, 0);
-	err |= copy_to_user(&uc->uc_sigmask, set, sizeof(*set));
-	return err;
-}
-
-int setup_signal_stack_sc(unsigned long stack_top, struct ksignal *ksig,
-			  struct pt_regs *regs, sigset_t *mask)
-{
-	size_t math_size = offsetof(struct _fpstate_32, _fxsr_env) +
-			   host_fp_size + FP_XSTATE_MAGIC2_SIZE;
-	struct sigframe __user *frame;
-	void __user *restorer;
-	int err = 0, sig = ksig->sig;
-	unsigned long fp_to;
-
-	/* This is the same calculation as i386 - ((sp + 4) & 15) == 0 */
-	stack_top = ((stack_top + 4) & -16UL) - 4;
-	frame = (struct sigframe __user *) stack_top - 1;
-	if (!access_ok(frame, sizeof(*frame)))
-		return 1;
-
-	/* Add required space for math frame */
-	frame = (struct sigframe __user *)((unsigned long)frame - math_size);
-
-	restorer = frame->retcode;
-	if (ksig->ka.sa.sa_flags & SA_RESTORER)
-		restorer = ksig->ka.sa.sa_restorer;
-
-	err |= __put_user(restorer, (void __user * __user *)&frame->pretcode);
-	err |= __put_user(sig, &frame->sig);
-
-	fp_to = (unsigned long)frame + sizeof(*frame);
-
-	err |= copy_sc_to_user(&frame->sc,
-			       (struct _xstate __user *)fp_to,
-			       regs, mask->sig[0]);
-	if (_NSIG_WORDS > 1)
-		err |= __copy_to_user(&frame->extramask, &mask->sig[1],
-				      sizeof(frame->extramask));
-
-	/*
-	 * This is popl %eax ; movl $,%eax ; int $0x80
-	 *
-	 * WE DO NOT USE IT ANY MORE! It's only left here for historical
-	 * reasons and because gdb uses it as a signature to notice
-	 * signal handler stack frames.
-	 */
-	err |= __put_user(0xb858, (short __user *)(frame->retcode+0));
-	err |= __put_user(__NR_sigreturn, (int __user *)(frame->retcode+2));
-	err |= __put_user(0x80cd, (short __user *)(frame->retcode+6));
-
-	if (err)
-		return err;
-
-	PT_REGS_SP(regs) = (unsigned long) frame;
-	PT_REGS_IP(regs) = (unsigned long) ksig->ka.sa.sa_handler;
-	PT_REGS_AX(regs) = (unsigned long) sig;
-	PT_REGS_DX(regs) = (unsigned long) 0;
-	PT_REGS_CX(regs) = (unsigned long) 0;
-	return 0;
-}
-
-int setup_signal_stack_si(unsigned long stack_top, struct ksignal *ksig,
-			  struct pt_regs *regs, sigset_t *mask)
-{
-	size_t math_size = offsetof(struct _fpstate_32, _fxsr_env) +
-			   host_fp_size + FP_XSTATE_MAGIC2_SIZE;
-	struct rt_sigframe __user *frame;
-	void __user *restorer;
-	int err = 0, sig = ksig->sig;
-	unsigned long fp_to;
-
-	stack_top &= -8UL;
-	frame = (struct rt_sigframe __user *) stack_top - 1;
-	if (!access_ok(frame, sizeof(*frame)))
-		return 1;
-
-	/* Add required space for math frame */
-	frame = (struct rt_sigframe __user *)((unsigned long)frame - math_size);
-
-	restorer = frame->retcode;
-	if (ksig->ka.sa.sa_flags & SA_RESTORER)
-		restorer = ksig->ka.sa.sa_restorer;
-
-	err |= __put_user(restorer, (void __user * __user *)&frame->pretcode);
-	err |= __put_user(sig, &frame->sig);
-	err |= __put_user(&frame->info, (void __user * __user *)&frame->pinfo);
-	err |= __put_user(&frame->uc, (void __user * __user *)&frame->puc);
-	err |= copy_siginfo_to_user(&frame->info, &ksig->info);
-
-	fp_to = (unsigned long)frame + sizeof(*frame);
-
-	err |= copy_ucontext_to_user(&frame->uc, (struct _xstate __user *)fp_to,
-				     mask, PT_REGS_SP(regs));
-
-	/*
-	 * This is movl $,%eax ; int $0x80
-	 *
-	 * WE DO NOT USE IT ANY MORE! It's only left here for historical
-	 * reasons and because gdb uses it as a signature to notice
-	 * signal handler stack frames.
-	 */
-	err |= __put_user(0xb8, (char __user *)(frame->retcode+0));
-	err |= __put_user(__NR_rt_sigreturn, (int __user *)(frame->retcode+1));
-	err |= __put_user(0x80cd, (short __user *)(frame->retcode+5));
-
-	if (err)
-		return err;
-
-	PT_REGS_SP(regs) = (unsigned long) frame;
-	PT_REGS_IP(regs) = (unsigned long) ksig->ka.sa.sa_handler;
-	PT_REGS_AX(regs) = (unsigned long) sig;
-	PT_REGS_DX(regs) = (unsigned long) &frame->info;
-	PT_REGS_CX(regs) = (unsigned long) &frame->uc;
-	return 0;
-}
-
-SYSCALL_DEFINE0(sigreturn)
-{
-	unsigned long sp = PT_REGS_SP(&current->thread.regs);
-	struct sigframe __user *frame = (struct sigframe __user *)(sp - 8);
-	sigset_t set;
-	struct sigcontext __user *sc = &frame->sc;
-	int sig_size = (_NSIG_WORDS - 1) * sizeof(unsigned long);
-
-	if (copy_from_user(&set.sig[0], &sc->oldmask, sizeof(set.sig[0])) ||
-	    copy_from_user(&set.sig[1], frame->extramask, sig_size))
-		goto segfault;
-
-	set_current_blocked(&set);
-
-	if (copy_sc_from_user(&current->thread.regs, sc))
-		goto segfault;
-
-	/* Avoid ERESTART handling */
-	PT_REGS_SYSCALL_NR(&current->thread.regs) = -1;
-	return PT_REGS_SYSCALL_RET(&current->thread.regs);
-
- segfault:
-	force_sig(SIGSEGV);
-	return 0;
-}
-
-#else
 
 /* The initial FPU state: XSTATE_BV 0 makes XRSTOR load x87, SSE and AVX
  * in their init state; MXCSR is loaded from the image. */
@@ -474,7 +249,6 @@ int setup_signal_stack_si(unsigned long stack_top, struct ksignal *ksig,
  out:
 	return err;
 }
-#endif
 
 SYSCALL_DEFINE0(rt_sigreturn)
 {

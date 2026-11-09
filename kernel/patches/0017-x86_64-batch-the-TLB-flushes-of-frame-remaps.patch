@@ -1,4 +1,4 @@
-From b5e0a4b11a287e6c0c394000cae9163c32223e9a Mon Sep 17 00:00:00 2001
+From 4a7226d97dfead47692d372371ccf8937c22d5bf Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Mon, 19 Oct 2026 03:30:42 -0700
 Subject: [PATCH] x86_64: batch the TLB flushes of frame remaps
@@ -105,7 +105,7 @@ index 9bdde4b3b..1eade79b9 100644
          return EXCEPTION_SYSCALL_ERROR;
  
 diff --git a/src/arch/x86/kernel/vspace.c b/src/arch/x86/kernel/vspace.c
-index 8ca477b79..81d41b332 100644
+index c892f60da..f72660d95 100644
 --- a/src/arch/x86/kernel/vspace.c
 +++ b/src/arch/x86/kernel/vspace.c
 @@ -794,12 +794,65 @@ void unmapPageTable(asid_t asid, vptr_t vaddr, pte_t *pt)
@@ -191,10 +191,10 @@ index 8ca477b79..81d41b332 100644
 -        vmAttr = vmAttributesFromWord(getSyscallArg(2, buffer));
 +        deferFlush = !!(getSyscallArg(2, buffer) & X86_ATTR_DEFER_FLUSH);
 +        vmAttr = vmAttributesFromWord(getSyscallArg(2, buffer) & ~X86_ATTR_DEFER_FLUSH);
- #ifdef CONFIG_ARCH_X86_64
          /* Without execute-disable the XD bit is reserved: ignore it. */
          if (vm_attributes_get_x86XDBit(vmAttr) && !x86_64_nxEnabled()) {
-@@ -1061,7 +1116,8 @@ exception_t decodeX86FrameInvocation(
+             vmAttr = vm_attributes_set_x86XDBit(vmAttr, 0);
+@@ -1059,7 +1114,8 @@ exception_t decodeX86FrameInvocation(
              }
  
              setThreadState(NODE_STATE(ksCurThread), ThreadState_Restart);
