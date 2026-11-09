@@ -1,0 +1,140 @@
+From ad53cf8d319e63c1fb8a1842c31beb9adc31e9b0 Mon Sep 17 00:00:00 2001
+From: Bill Nguyen <bill.nguyen@unsw.edu.au>
+Date: Thu, 5 Nov 2026 10:17:36 +1100
+Subject: [PATCH] x86/vcpu: block VMs from disabling cache core-wide
+
+From the Intel SDM Order Number: 325462-093US September 2026:
+section 29.3.2.1 "Loading Guest Control Registers, Debug Registers,
+and MSRs":
+> The following items describe how guest control registers, debug
+> registers, and MSRs are loaded on VM entry:
+> - CR0 is loaded from the CR0 field with the exception of the following
+>   bits, which are never modified on VM entry: ET (bit 4); reserved
+>   bits 15:6, 17, and 28:19; NW (bit 29) and CD (bit 30). The values
+>   of these bits in the CR0 field are ignored.
+
+section 30.5.1 "Loading Host Control Registers, Debug Registers, MSRs":
+> VM exits load new values for controls registers, debug registers, and
+> some MSRs:
+> - CR0, CR3, and CR4 are loaded from the CR0 field, the CR3 field, and
+>   the CR4 field, respectively, with the following exceptions:
+>   - The following bits are not modified:
+>     - For CR0, ET, CD, NW...
+
+In other words, the hardware does not context switch CR0.CD and CR0.NW.
+If a guest sets either bit and `mov`s the value into CR0, the bit stays
+set in the physical CR0 after the VM exit. The guest can then turn off
+caching for the kernel and everything else that later runs on the
+physical core.
+
+The kernel must prevent this itself. It must not rely on the userspace
+VMM to sanitise the guest's CR0. So the kernel always sets CD and NW in
+the CR0 guest/host mask. A guest `mov` to CR0 that tries to change
+either bit then causes a VM exit, and a `mov` that does not exit leaves
+the masked bits of the physical CR0 unchanged. The CD and NW bits of
+the guest CR0 field do not need sanitising, as VM entry ignores them.
+
+The kernel also sets the reserved bits 28:19, 17 and 15:6 in the mask.
+MOV to CR0 currently leaves them unchanged, so this has no effect today,
+but it stops a future CPU from letting a guest change them in the
+physical CR0. CR0.ET is hardwired to 1, so it does not need to be in
+the mask.
+
+The guest's own view of the masked bits lives in the CR0 read shadow,
+which the userspace VMM is responsible for maintaining.
+
+This is a breaking change for userspace VMMs: a guest attempting to
+change CR0.CD, CR0.NW or the reserved bits now always causes a VM exit,
+even if the VMM never set those bits in the mask. Reading back
+VMX_CONTROL_CR0_MASK also returns these bits set.
+
+Also remove the unused VMX_EXIT_QUAL_TYPE_CLTS, VMX_EXIT_QUAL_TYPE_LMSW
+and VMX_EXIT_QUAL_TYPE_MOV_CR defines.
+
+Cherry-picked from https://github.com/seL4/seL4/pull/1847, open upstream
+(both commits squashed, without the CHANGES.md entry).
+
+Signed-off-by: Bill Nguyen <bill.nguyen@unsw.edu.au>
+---
+ include/arch/x86/arch/machine/cpu_registers.h |  4 ++++
+ src/arch/x86/object/vcpu.c                    | 20 ++++++++++++++-----
+ 2 files changed, 19 insertions(+), 5 deletions(-)
+
+diff --git a/include/arch/x86/arch/machine/cpu_registers.h b/include/arch/x86/arch/machine/cpu_registers.h
+index bf4a999da..19955a71d 100644
+--- a/include/arch/x86/arch/machine/cpu_registers.h
++++ b/include/arch/x86/arch/machine/cpu_registers.h
+@@ -12,7 +12,11 @@
+ #define CR0_TASK_SWITCH     BIT(3)  /* Trap on any FPU usage, for lazy FPU. */
+ #define CR0_NUMERIC_ERROR   BIT(5)  /* Internally handle FPU problems. */
+ #define CR0_WRITE_PROTECT   BIT(16) /* Write protection in supervisor mode. */
++#define CR0_NW              BIT(29) /* Not write through */
++#define CR0_CD              BIT(30) /* Cache disable */
+ #define CR0_PG              BIT(31) /* Paging On */
++#define CR0_RESERVED_BITS   ((MASK(10) << 19) | BIT(17) | (MASK(10) << 6)) /* Bits 28:19, 17 and 15:6 */
++
+ #define CR4_PCE             BIT(8)  /* Performance-Monitoring Counter enable. */
+ #define CR4_OSFXSR          BIT(9)  /* Enable SSE et. al. features. */
+ #define CR4_OSXMMEXCPT      BIT(10) /* Enable SSE exceptions. */
+diff --git a/src/arch/x86/object/vcpu.c b/src/arch/x86/object/vcpu.c
+index 8edfb9f22..b7ce7c23d 100644
+--- a/src/arch/x86/object/vcpu.c
++++ b/src/arch/x86/object/vcpu.c
+@@ -21,9 +21,7 @@
+ #include <util.h>
+ #include <sel4/arch/vmenter.h>
+ 
+-#define VMX_EXIT_QUAL_TYPE_MOV_CR 0
+-#define VMX_EXIT_QUAL_TYPE_CLTS 2
+-#define VMX_EXIT_QUAL_TYPE_LMSW 3
++#define VMX_CR0_KERNEL_OWNED_BITS (CR0_CD | CR0_NW | CR0_RESERVED_BITS)
+ 
+ const vcpu_gp_register_t crExitRegs[] = {
+     VCPU_EAX, VCPU_ECX, VCPU_EDX, VCPU_EBX, VCPU_ESP, VCPU_EBP, VCPU_ESI, VCPU_EDI,
+@@ -511,7 +509,14 @@ void vcpu_init(vcpu_t *vcpu)
+ 
+     vcpu->cr0 = cr0_high & cr0_low;
+     vcpu->cr0_shadow = 0;
+-    vcpu->cr0_mask = 0;
++    /* Do not let the guest disable caching core-wide by setting CR0.CD and CR0.NW.
++     * The reserved bits are also set in case future CPUs unreserve them.
++     * This is important as these bits are not context switched by hardware.
++     * See section 29.3.2.1 "Loading Guest Control Registers, Debug Registers, and MSRs",
++     * and 30.5.1 "Loading Host Control Registers, Debug Registers, MSRs" of the Intel SDM
++     * for more details.
++     */
++    vcpu->cr0_mask = VMX_CR0_KERNEL_OWNED_BITS;
+     vcpu->exception_bitmap = 0;
+     vcpu->vpid = VPID_INVALID;
+ #ifdef ENABLE_SMP_SUPPORT
+@@ -574,6 +579,8 @@ void vcpu_init(vcpu_t *vcpu)
+ 
+     vmwrite(VMX_CONTROL_MSR_ADDRESS, (word_t)kpptr_to_paddr(&msr_bitmap_region));
+     vmwrite(VMX_GUEST_CR0, vcpu->cr0);
++    vmwrite(VMX_CONTROL_CR0_MASK, vcpu->cr0_mask);
++    vmwrite(VMX_CONTROL_CR0_READ_SHADOW, vcpu->cr0_shadow);
+     vmwrite(VMX_GUEST_CR4, cr4_high & cr4_low);
+ 
+     vmwrite(VMX_GUEST_VMCS_LINK_POINTER, ~(word_t)0);
+@@ -1030,7 +1037,6 @@ static exception_t decodeWriteVMCS(cap_t cap, word_t length, bool_t call, word_t
+     case VMX_GUEST_PENDING_DEBUG_EXCEPTIONS:
+     case VMX_GUEST_SYSENTER_ESP:
+     case VMX_GUEST_SYSENTER_EIP:
+-    case VMX_CONTROL_CR0_MASK:
+     case VMX_CONTROL_CR4_MASK:
+     case VMX_CONTROL_CR0_READ_SHADOW:
+     case VMX_CONTROL_CR4_READ_SHADOW:
+@@ -1041,6 +1047,10 @@ static exception_t decodeWriteVMCS(cap_t cap, word_t length, bool_t call, word_t
+     case VMX_CONTROL_ENTRY_INSTRUCTION_LENGTH:
+     case VMX_CONTROL_TSC_OFFSET:
+         break;
++    case VMX_CONTROL_CR0_MASK:
++        /* CD, NW and reserved bits are always kernel-owned, see vcpu_init() */
++        value |= VMX_CR0_KERNEL_OWNED_BITS;
++        break;
+     case VMX_CONTROL_PIN_EXECUTION_CONTROLS:
+         value = applyFixedBits(value, pin_control_high, pin_control_low & (pin_control_high | PIN_CONTROLS_ALLOWED));
+         break;
+-- 
+2.47.3
+
