@@ -745,6 +745,7 @@ fn main(info: &'static Info) -> ! {
         // Root's commands (host::mailbox), even if their signal was
         // coalesced.  Root reads the answers' count only: they are done.
         let mut answered = false;
+        let mut added = 0;
         while let Some(label) = l4h_rt::mailbox::request() {
             let resp = match label {
                 net::NETD_ADD_PORT => {
@@ -767,13 +768,14 @@ fn main(info: &'static Info) -> ! {
                             uplink: mr(3) & net::NETD_PORT_UPLINK != 0,
                             isolated: mr(3) & net::NETD_PORT_ISOLATED != 0,
                             client: cap::<cap_type::Notification>(net::NETD_SLOT_CLIENT_BASE + i as u64),
-                            signal: false,
+                            signal: true,
                             rx_frames: 0,
                             tx_frames: 0,
                             drops: 0,
                             backlog: Fifo::EMPTY,
                         });
                         d.publish_links();
+                        added |= 1 << i;
                         0
                     } else {
                         u64::MAX
@@ -837,7 +839,10 @@ fn main(info: &'static Info) -> ! {
         if answered {
             l4h_rt::mailbox::signal();
         }
-        (_, badge) = ep.recv(reply);
+        // Root handed out an added port's channel before netd added it:
+        // its VMM may have kicked already, and read the page's link state,
+        // DOWN.  Serve the port as if kicked, and signal it.
+        badge = if added != 0 { added } else { ep.recv(reply).1 };
     }
 }
 
