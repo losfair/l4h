@@ -49,6 +49,7 @@ static int is_amd(void)
 }
 
 /* Patch 0040's VMCB offsets and exit codes. */
+#define VMCB_I_CR       0x000   /* the CR intercepts, then the DR ones */
 #define VMCB_I_MISC1    0x008   /* the exception intercepts, then misc1 */
 #define VMCB_I_MISC2    0x010
 #define VMCB_IOPM       0x040
@@ -60,10 +61,18 @@ static int is_amd(void)
 #define VMCB_RIP        0x578
 #define SVM_I1_INVD     (1u << 22)
 #define SVM_I1_HLT      (1u << 24)
+#define SVM_CR4_WRITE   (1u << 20)
+#define SVM_EXC_UD      (1u << 6)
 #define SVM_EXIT_INVD   0x76
 #define SVM_EXIT_IOIO   0x7b
 #define SVM_EXIT_HLT    0x78
 #define SVM_EXIT_NPF    0x400
+#define SVM_EXIT_CR4_WRITE 0x14
+#define SVM_EXIT_UD     0x46
+#define CR4_PKE         (1ul << 22)
+/* Patch 0042's VT-x side: the VMCS fields it masks. */
+#define VMX_CR4_MASK    0x6002
+#define VMX_GUEST_CR4   0x6804
 
 static void check(const char *what, int ok)
 {
@@ -184,6 +193,43 @@ static void svm_probe(seL4_BootInfo *bi, seL4_CPtr ut, seL4_CPtr vcpu, seL4_CPtr
     check("svm_dirty_kept", ok && !seL4_MessageInfo_get_label(tag) &&
           !(seL4_GetMR(0) & VMCB_CLEAN_DT));
 
+    /* Patch 0042: CR4.PKE stays clear and CR4 writes always exit, so the
+     * guest cannot set a PKRU that the next guest on the core runs with.
+     * The guest sets PKE with a MOV; written back as a VMM would on that
+     * exit, CR4 keeps PKE clear and WRPKRU raises #UD. */
+    static const unsigned char pke_code[] = {
+        0x0f, 0x20, 0xe0,                       /* mov %cr4, %eax */
+        0x66, 0x0d, 0x00, 0x00, 0x40, 0x00,     /* or $0x400000, %eax */
+        0x0f, 0x22, 0xe0,                       /* mov %eax, %cr4 */
+        0x66, 0x31, 0xc9,                       /* xor %ecx, %ecx */
+        0x66, 0x31, 0xd2,                       /* xor %edx, %edx */
+        0x0f, 0x01, 0xef,                       /* wrpkru */
+        0xf4,                                   /* hlt */
+    };
+    unsigned long cr4;
+    w = seL4_X86_VCPU_WriteVMCB(vcpu, VMCB_I_CR, 0);
+    check("svm_forced_cr4_write", !w.error && (w.written & SVM_CR4_WRITE));
+    w = seL4_X86_VCPU_WriteVMCB(vcpu, VMCB_CR4, CR4_PKE);
+    check("svm_cr4_pke", !w.error && !(w.written & CR4_PKE));
+    for (unsigned int i = 0; i < sizeof(pke_code); i++)
+        ((volatile unsigned char *)va)[0x10 + i] = pke_code[i];
+    seL4_X86_VCPU_WriteVMCB(vcpu, VMCB_I_MISC1, (unsigned long)SVM_I1_HLT << 32 | SVM_EXC_UD);
+    seL4_SetMR(SEL4_VMENTER_CALL_EIP_MR, 0x10);
+    seL4_SetMR(SEL4_VMENTER_CALL_CONTROL_PPC_MR, SVM_I1_HLT);
+    seL4_SetMR(SEL4_VMENTER_CALL_INTERRUPT_INFO_MR, 0);
+    ok = seL4_VMEnter(&badge) == SEL4_VMENTER_RESULT_FAULT &&
+         seL4_GetMR(SEL4_VMENTER_FAULT_REASON_MR) == SVM_EXIT_CR4_WRITE &&
+         seL4_GetMR(SEL4_VMENTER_CALL_EIP_MR) == 0x19;
+    cr4 = seL4_GetMR(SEL4_VMENTER_FAULT_EAX);
+    check("svm_cr4_exit", ok && (cr4 & CR4_PKE));
+    seL4_X86_VCPU_WriteVMCB(vcpu, VMCB_CR4, cr4);
+    seL4_SetMR(SEL4_VMENTER_CALL_EIP_MR, 0x1c);
+    seL4_SetMR(SEL4_VMENTER_CALL_CONTROL_PPC_MR, SVM_I1_HLT);
+    seL4_SetMR(SEL4_VMENTER_CALL_INTERRUPT_INFO_MR, 0);
+    check("svm_pkru_ud", seL4_VMEnter(&badge) == SEL4_VMENTER_RESULT_FAULT &&
+          seL4_GetMR(SEL4_VMENTER_FAULT_REASON_MR) == SVM_EXIT_UD &&
+          seL4_GetMR(SEL4_VMENTER_CALL_EIP_MR) == 0x22);
+
     /* An exit while VMRUN delivers EVENTINJ: interrupt 0x20 pushes its
      * frame below SP 0, to unmapped guest memory.  The guest's interrupt
      * shadow must stay clear (no host STI shadow in INT_STATE). */
@@ -238,8 +284,15 @@ void vtxprobe_main(seL4_BootInfo *bi)
          * (patch 0039). */
         report("kgs_canonical", seL4_X86_VCPU_WriteMSR(vcpu, 0xC0000102, 0xffff800000001000ul).error);
         report("kgs_noncanonical", seL4_X86_VCPU_WriteMSR(vcpu, 0xC0000102, 0x0100000000000000ul).error);
-        if (is_amd())
+        if (is_amd()) {
             svm_probe(bi, ut, vcpu, pml4, pt, tcb + 1);
+        } else {
+            /* Patch 0042: CR4.PKE stays in the mask and out of the guest. */
+            seL4_X86_VCPU_WriteVMCS_t w = seL4_X86_VCPU_WriteVMCS(vcpu, VMX_CR4_MASK, 0);
+            check("vmx_cr4_mask_pke", !w.error && (w.written & CR4_PKE));
+            w = seL4_X86_VCPU_WriteVMCS(vcpu, VMX_GUEST_CR4, CR4_PKE);
+            check("vmx_guest_cr4_pke", !w.error && !(w.written & CR4_PKE));
+        }
     }
     puts_("vtxprobe: done\n");
     for (;;)

@@ -1,0 +1,138 @@
+From 0274c366bbb20d23dfc35e8041910b1b1461cdf1 Mon Sep 17 00:00:00 2001
+From: l4h <z@univalence.me>
+Date: Mon, 9 Nov 2026 01:22:12 +0100
+Subject: [PATCH] x86: keep CR4.PKE clear in guests
+
+Neither VT-x nor AMD-V switches PKRU on VM entry or exit, and seL4 does
+not switch it either: it is outside the XSAVE features seL4 enables, and
+the host runs with CR4.PKE clear.  A guest that set CR4.PKE could WRPKRU
+a value that stayed in the core's PKRU, where the next guest on that
+core with CR4.PKE set would read it and run with it: a channel between
+guests, and access-disabled pages for the other guest's user programs.
+
+So guests do not get protection keys.  On VT-x CR4.PKE is always in the
+CR4 guest/host mask and always clear in GUEST_CR4, like CR0.CD and NW
+(0041).  On AMD-V, which has no CR4 mask, CR4 writes always exit and
+WriteVMCB keeps CR4.PKE clear.  Reading VMX_CONTROL_CR4_MASK or the CR
+intercepts back shows these bits set.
+---
+ include/arch/x86/arch/machine/cpu_registers.h |  1 +
+ src/arch/x86/object/svm.c                     | 13 +++++++++++--
+ src/arch/x86/object/vcpu.c                    | 14 +++++++++++---
+ 3 files changed, 23 insertions(+), 5 deletions(-)
+
+diff --git a/include/arch/x86/arch/machine/cpu_registers.h b/include/arch/x86/arch/machine/cpu_registers.h
+index 19955a71d..6df7d9d4d 100644
+--- a/include/arch/x86/arch/machine/cpu_registers.h
++++ b/include/arch/x86/arch/machine/cpu_registers.h
+@@ -24,6 +24,7 @@
+ #define CR4_VMXE            BIT(13) /* Enable VMX mode. */
+ #define CR4_SMEP            BIT(20) /* Supervisor Mode Execution Prevention. */
+ #define CR4_SMAP            BIT(21) /* Supervisor Mode Access Prevention. */
++#define CR4_PKE             BIT(22) /* Protection keys for user pages (PKRU). */
+ 
+ #define FLAGS_CF            BIT(0)  /* Carry Flag */
+ #define FLAGS_PF            BIT(2)  /* Parity Flag */
+diff --git a/src/arch/x86/object/svm.c b/src/arch/x86/object/svm.c
+index f92638e51..02a432bc2 100644
+--- a/src/arch/x86/object/svm.c
++++ b/src/arch/x86/object/svm.c
+@@ -112,6 +112,11 @@
+                        SVM_I2_XSETBV | SVM_I2_RDPRU)
+ #define SVM_I2_WRITABLE (SVM_I2_VMMCALL | SVM_I2_RDTSCP | SVM_I2_ICEBP | SVM_I2_WBINVD)
+ #define SVM_EXC_FORCED (BIT(1) | BIT(17) | BIT(18))
++/* Neither VMRUN nor #VMEXIT switches PKRU, and seL4 does not switch it
++ * either: a guest that could set CR4.PKE could WRPKRU a value that the next
++ * guest on the core with CR4.PKE reads and runs with.  CR4.PKE stays clear,
++ * and CR4 writes always exit so that a guest cannot set it. */
++#define SVM_CR_FORCED  BIT(16 + 4)
+ 
+ #define SVM_INT_CTL_WRITABLE    (MASK(9) | (MASK(4) << 16) | BIT(20))
+ #define SVM_V_INTR_MASKING      BIT(24)
+@@ -284,6 +289,7 @@ void svm_vcpu_init(vcpu_t *vcpu)
+     vcpu->svm.last_cpu = getCurrentCPUIndex();
+ 
+     memzero(vcpu->vmcs, VCPU_VMCS_SIZE);
++    *vmcb_u32(vcpu, VMCB_INTERCEPT_CR) = SVM_CR_FORCED;
+     *vmcb_u32(vcpu, VMCB_INTERCEPT_DR) = ~(uint32_t)0;
+     *vmcb_u32(vcpu, VMCB_INTERCEPT_EXC) = SVM_EXC_FORCED;
+     *vmcb_u32(vcpu, VMCB_INTERCEPT_MISC1) = SVM_I1_FORCED;
+@@ -340,7 +346,7 @@ static bool_t svm_field(word_t offset, svm_field_t *f)
+     switch (offset) {
+     case VMCB_INTERCEPT_CR:      /* and the DR intercepts, all on */
+         f->writable = MASK(32);
+-        f->forced = (uint64_t)MASK(32) << 32;
++        f->forced = SVM_CR_FORCED | ((uint64_t)MASK(32) << 32);
+         f->clean = VMCB_CLEAN_I;
+         return true;
+     case VMCB_INTERCEPT_EXC:     /* and misc1 */
+@@ -426,9 +432,12 @@ static bool_t svm_field(word_t offset, svm_field_t *f)
+         f->forced = EFER_SVME;
+         f->clean = VMCB_CLEAN_CRX;
+         return true;
++    case VMCB_CR4:
++        f->writable = ~(uint64_t)CR4_PKE;
++        f->clean = VMCB_CLEAN_CRX;
++        return true;
+     case VMCB_CR0:
+     case VMCB_CR3:
+-    case VMCB_CR4:
+         f->clean = VMCB_CLEAN_CRX;
+         return true;
+     case VMCB_DR6:
+diff --git a/src/arch/x86/object/vcpu.c b/src/arch/x86/object/vcpu.c
+index b7ce7c23d..e1d11a221 100644
+--- a/src/arch/x86/object/vcpu.c
++++ b/src/arch/x86/object/vcpu.c
+@@ -22,6 +22,11 @@
+ #include <sel4/arch/vmenter.h>
+ 
+ #define VMX_CR0_KERNEL_OWNED_BITS (CR0_CD | CR0_NW | CR0_RESERVED_BITS)
++/* Neither VM entries nor exits switch PKRU, and seL4 does not switch it
++ * either: a guest that could set CR4.PKE could WRPKRU a value that the next
++ * guest on the core with CR4.PKE reads and runs with.  CR4.PKE stays clear
++ * in the guest, and in the mask so that a guest setting it exits. */
++#define VMX_CR4_KERNEL_OWNED_BITS CR4_PKE
+ 
+ const vcpu_gp_register_t crExitRegs[] = {
+     VCPU_EAX, VCPU_ECX, VCPU_EDX, VCPU_EBX, VCPU_ESP, VCPU_EBP, VCPU_ESI, VCPU_EDI,
+@@ -581,7 +586,8 @@ void vcpu_init(vcpu_t *vcpu)
+     vmwrite(VMX_GUEST_CR0, vcpu->cr0);
+     vmwrite(VMX_CONTROL_CR0_MASK, vcpu->cr0_mask);
+     vmwrite(VMX_CONTROL_CR0_READ_SHADOW, vcpu->cr0_shadow);
+-    vmwrite(VMX_GUEST_CR4, cr4_high & cr4_low);
++    vmwrite(VMX_GUEST_CR4, cr4_high & cr4_low & ~VMX_CR4_KERNEL_OWNED_BITS);
++    vmwrite(VMX_CONTROL_CR4_MASK, VMX_CR4_KERNEL_OWNED_BITS);
+ 
+     vmwrite(VMX_GUEST_VMCS_LINK_POINTER, ~(word_t)0);
+     vmwrite(VMX_GUEST_VMCS_LINK_POINTER_HIGH, ~(word_t)0);
+@@ -1037,7 +1043,6 @@ static exception_t decodeWriteVMCS(cap_t cap, word_t length, bool_t call, word_t
+     case VMX_GUEST_PENDING_DEBUG_EXCEPTIONS:
+     case VMX_GUEST_SYSENTER_ESP:
+     case VMX_GUEST_SYSENTER_EIP:
+-    case VMX_CONTROL_CR4_MASK:
+     case VMX_CONTROL_CR0_READ_SHADOW:
+     case VMX_CONTROL_CR4_READ_SHADOW:
+     case VMX_GUEST_CR3:
+@@ -1051,6 +1056,9 @@ static exception_t decodeWriteVMCS(cap_t cap, word_t length, bool_t call, word_t
+         /* CD, NW and reserved bits are always kernel-owned, see vcpu_init() */
+         value |= VMX_CR0_KERNEL_OWNED_BITS;
+         break;
++    case VMX_CONTROL_CR4_MASK:
++        value |= VMX_CR4_KERNEL_OWNED_BITS;
++        break;
+     case VMX_CONTROL_PIN_EXECUTION_CONTROLS:
+         value = applyFixedBits(value, pin_control_high, pin_control_low & (pin_control_high | PIN_CONTROLS_ALLOWED));
+         break;
+@@ -1071,7 +1079,7 @@ static exception_t decodeWriteVMCS(cap_t cap, word_t length, bool_t call, word_t
+         value = applyFixedBits(value, cr0_high, cr0_low);
+         break;
+     case VMX_GUEST_CR4:
+-        value = applyFixedBits(value, cr4_high, cr4_low);
++        value = applyFixedBits(value, cr4_high, cr4_low & ~VMX_CR4_KERNEL_OWNED_BITS);
+         break;
+     default:
+         userError("VCPU WriteVMCS: Invalid field %lx.", (long)field);
+-- 
+2.47.3
+

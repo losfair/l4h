@@ -85,12 +85,20 @@ if [ "$mode" = on ]; then
     grep -aq 'vtxprobe: kgs_canonical ok' "$log" || fail "a canonical KERNEL_GS_BASE was refused"
     grep -aq 'vtxprobe: kgs_noncanonical err=1' "$log" || fail "a noncanonical KERNEL_GS_BASE was accepted"
 fi
+if [ "$mode" = on ] && [ "$virt" = vt-x ]; then
+    # Patch 0042: CR4.PKE stays in the CR4 mask and out of GUEST_CR4.
+    grep -aq 'vtxprobe: vmx_cr4_mask_pke ok' "$log" || fail "CR4.PKE left the CR4 guest/host mask"
+    grep -aq 'vtxprobe: vmx_guest_cr4_pke ok' "$log" || fail "CR4.PKE was written to GUEST_CR4"
+fi
 if [ "$mode" = on ] && [ "$virt" = svm ]; then
     # Patch 0040.  seL4_IllegalOperation is 3.
     grep -aq 'vtxprobe: svm_forced_intercepts ok' "$log" || fail "an intercept seL4 needs was cleared"
     grep -aq 'vtxprobe: svm_forced_invd ok' "$log" || fail "the INVD intercept was cleared"
     grep -aq 'vtxprobe: svm_owned_field err=3' "$log" || fail "a kernel-owned VMCB field was written"
-    for step in asid map bind io npf invd hlt tls_base invalid dirty_kept inject_exit; do
+    # Patch 0042: CR4.PKE stays clear and CR4 writes always exit.
+    grep -aq 'vtxprobe: svm_forced_cr4_write ok' "$log" || fail "the CR4 write intercept was cleared"
+    grep -aq 'vtxprobe: svm_cr4_pke ok' "$log" || fail "CR4.PKE was written"
+    for step in asid map bind io npf invd hlt tls_base invalid dirty_kept cr4_exit pkru_ud inject_exit; do
         grep -aq "vtxprobe: svm_$step ok" "$log" || fail "the guest failed at svm_$step"
     done
 fi
