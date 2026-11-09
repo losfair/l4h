@@ -1,4 +1,4 @@
-From 8da3e51d1823b35141951ee8d363045f80f13317 Mon Sep 17 00:00:00 2001
+From c70c1d2c208f9f754bc37fe9c5553e7e099535a8 Mon Sep 17 00:00:00 2001
 From: l4h <l4h@localhost>
 Date: Fri, 6 Nov 2026 23:22:24 -0800
 Subject: [PATCH] x86: what KVM needs from the VCPU interface
@@ -27,10 +27,15 @@ than a VMM written for seL4 does, and any guest can now hold a VCPU:
   leaves the translations of a frame unmapped while its VCPU runs on
   another core, or on the core a VCPU has left.
 - Each VCPU has its own XCR0 (SEL4_VCPU_MSR_XCR0), validated as XSETBV
-  would, loaded just before VM entry and replaced by the kernel's at the
-  exit, and only when it differs from the kernel's.
+  would (x87 on, AVX with SSE, AVX-512, MPX and AMX state only whole),
+  loaded just before VM entry and replaced by the kernel's at the exit,
+  and only when it differs from the kernel's.
 - A VCPU that arrives on a core it did not last run on has its VPID
   invalidated there: the guest may have flushed its TLB elsewhere since.
+- A thread about to enter guest mode makes its VCPU its core's current
+  one before the kernel lock is released, not after.  An invocation on
+  another core then always finds it there and takes it out of guest mode
+  first, rather than loading a VMCS that core is about to enter with.
 - The guest runs on the TCB's FPU state, without two swaps per exit:
   userspace needs the guest's registers, which seL4 kept in the VCPU
   where nothing could read them.
@@ -50,24 +55,27 @@ MSR.  So VM exits and entries do only what they need:
   translation; it invalidated none, so a guest kept reaching a frame
   after it was unmapped (seen once mapping stopped invalidating).
   Mapping does no invept: it only fills not-present entries, which no
-  TLB caches.  INVEPT gets the whole EPTP the VMCS has, not just the root's
+  TLB caches.  So deleting a root invalidates it on those cores: what
+  was below it can no longer be found to unmap, and a root later made
+  at the same address would otherwise run on its translations.  INVEPT gets the whole EPTP the VMCS has, not just the root's
   address: the CPU ignores the other bits, but nested KVM compares them
   and, with the address alone, invalidated nothing.
 ---
- include/arch/x86/arch/object/vcpu.h           |  35 +-
+ include/arch/x86/arch/object/vcpu.h           |  36 +-
  include/arch/x86/arch/smp/ipi.h               |   1 +
  include/arch/x86/arch/smp/ipi_inline.h        |   5 +
  .../x86/interfaces/object-api-arch.xml        |  16 +
- libsel4/arch_include/x86/sel4/arch/vmenter.h  |  16 +-
- src/arch/x86/64/c_traps.c                     |   5 +-
+ libsel4/arch_include/x86/sel4/arch/vmenter.h  |  17 +-
+ src/arch/x86/32/c_traps.c                     |   8 +
+ src/arch/x86/64/c_traps.c                     |  13 +-
  src/arch/x86/c_traps.c                        |   5 +-
- src/arch/x86/kernel/ept.c                     |  14 +-
- src/arch/x86/object/vcpu.c                    | 367 +++++++++++++++---
+ src/arch/x86/kernel/ept.c                     |  18 +-
+ src/arch/x86/object/vcpu.c                    | 389 +++++++++++++++---
  src/arch/x86/smp/ipi.c                        |   3 +
- 10 files changed, 390 insertions(+), 77 deletions(-)
+ 11 files changed, 434 insertions(+), 77 deletions(-)
 
 diff --git a/include/arch/x86/arch/object/vcpu.h b/include/arch/x86/arch/object/vcpu.h
-index e97af45..c5012d9 100644
+index e97af4545..8e4a25a7a 100644
 --- a/include/arch/x86/arch/object/vcpu.h
 +++ b/include/arch/x86/arch/object/vcpu.h
 @@ -283,6 +283,12 @@ enum vcpu_msr_register {
@@ -123,10 +131,11 @@ index e97af45..c5012d9 100644
  
      /* Currently assigned VPID */
      vpid_t vpid;
-@@ -394,6 +424,9 @@ void VMCheckBoundNotification(tcb_t *tcb);
+@@ -394,6 +424,10 @@ void VMCheckBoundNotification(tcb_t *tcb);
  #endif /* ENABLE_SMP_SUPPORT */
  
  void invept(ept_pml4e_t *ept_pml4);
++void vcpu_make_current(vcpu_t *vcpu);
 +void vcpu_load_guest_xcr0(vcpu_t *vcpu);
 +void vcpu_load_host_xcr0(vcpu_t *vcpu);
 +void invalidateLocalEPT(ept_pml4e_t *ept_pml4);
@@ -134,7 +143,7 @@ index e97af45..c5012d9 100644
  /* Removes any IO port mappings that have been cached for the given VPID */
  void clearVPIDIOPortMappings(vpid_t vpid, uint16_t first, uint16_t last);
 diff --git a/include/arch/x86/arch/smp/ipi.h b/include/arch/x86/arch/smp/ipi.h
-index eee60ee..04dc9f7 100644
+index eee60ee8b..04dc9f78b 100644
 --- a/include/arch/x86/arch/smp/ipi.h
 +++ b/include/arch/x86/arch/smp/ipi.h
 @@ -13,6 +13,7 @@ typedef enum {
@@ -146,7 +155,7 @@ index eee60ee..04dc9f7 100644
      IpiRemoteCall_InvalidatePageStructureCacheASID,
      IpiRemoteCall_InvalidateTranslationSingle,
 diff --git a/include/arch/x86/arch/smp/ipi_inline.h b/include/arch/x86/arch/smp/ipi_inline.h
-index 9934b65..d06fee9 100644
+index 9934b65f9..d06fee908 100644
 --- a/include/arch/x86/arch/smp/ipi_inline.h
 +++ b/include/arch/x86/arch/smp/ipi_inline.h
 @@ -50,6 +50,11 @@ static inline void doRemoteVMCheckBoundNotification(word_t cpu, tcb_t *tcb)
@@ -162,7 +171,7 @@ index 9934b65..d06fee9 100644
  
  #endif /* ENABLE_SMP_SUPPORT */
 diff --git a/libsel4/arch_include/x86/interfaces/object-api-arch.xml b/libsel4/arch_include/x86/interfaces/object-api-arch.xml
-index 8de4b1d..68aa387 100644
+index 8de4b1dfb..68aa387ee 100644
 --- a/libsel4/arch_include/x86/interfaces/object-api-arch.xml
 +++ b/libsel4/arch_include/x86/interfaces/object-api-arch.xml
 @@ -1124,6 +1124,22 @@
@@ -189,7 +198,7 @@ index 8de4b1d..68aa387 100644
              <condition><config var="CONFIG_VTX"/></condition>
              <brief>
 diff --git a/libsel4/arch_include/x86/sel4/arch/vmenter.h b/libsel4/arch_include/x86/sel4/arch/vmenter.h
-index 5081e1d..a1f5f30 100644
+index 5081e1d5a..2f82c8fe8 100644
 --- a/libsel4/arch_include/x86/sel4/arch/vmenter.h
 +++ b/libsel4/arch_include/x86/sel4/arch/vmenter.h
 @@ -29,7 +29,7 @@ typedef enum kernel_fault_context {
@@ -213,7 +222,7 @@ index 5081e1d..a1f5f30 100644
      SEL4_VMENTER_NUM_FAULT_MSGS,
  } kernel_fault_context_t;
  #endif
-@@ -64,6 +69,13 @@ typedef enum kernel_fault_context {
+@@ -64,6 +69,14 @@ typedef enum kernel_fault_context {
   * format is a combination of the format we passed to seL4_SysVMEnter with
   * additional registers described with the SEL4_VMENTER_FAULT_ constants
   */
@@ -221,21 +230,41 @@ index 5081e1d..a1f5f30 100644
 + * and which other threads' page faults overwrite. */
 +#define SEL4_VCPU_MSR_CR2 0xffffffffu
 +/* The guest's XCR0, installed for VM entries only: a subset of the kernel's
-+ * (KernelXSaveFeatureSet) with x87 enabled, and SSE wherever AVX is. */
++ * (KernelXSaveFeatureSet) that XSETBV accepts, with x87 enabled, SSE wherever
++ * AVX is, and AVX-512, MPX and AMX state only whole. */
 +#define SEL4_VCPU_MSR_XCR0 0xfffffffeu
 +
  #define SEL4_VMENTER_RESULT_FAULT 1
  #define SEL4_VMENTER_RESULT_NOTIF 0
  
-@@ -72,5 +84,5 @@ typedef enum kernel_fault_context {
+@@ -72,5 +85,5 @@ typedef enum kernel_fault_context {
   * kernel for each of the return cases of VMEnter
   */
  #define SEL4_VMENTER_RESULT_FAULT_LEN SEL4_VMENTER_NUM_FAULT_MSGS
 -#define SEL4_VMENTER_RESULT_NOTIF_LEN 3
 +#define SEL4_VMENTER_RESULT_NOTIF_LEN SEL4_VMENTER_NUM_FAULT_MSGS
  
+diff --git a/src/arch/x86/32/c_traps.c b/src/arch/x86/32/c_traps.c
+index 7d27325b5..13bebd636 100644
+--- a/src/arch/x86/32/c_traps.c
++++ b/src/arch/x86/32/c_traps.c
+@@ -101,6 +101,14 @@ void NORETURN VISIBLE restore_user_context(void)
+ {
+     c_exit_hook();
+ 
++#ifdef CONFIG_VTX
++    /* While the lock is held, so that an invocation on another core finds
++     * the VCPU here and takes it out of guest mode before touching it. */
++    if (thread_state_ptr_get_tsType(&NODE_STATE(ksCurThread)->tcbState) == ThreadState_RunningVM) {
++        vcpu_make_current(NODE_STATE(ksCurThread)->tcbArch.tcbVCPU);
++    }
++#endif
++
+     NODE_UNLOCK_IF_HELD;
+ 
+     /* we've now 'exited' the kernel. If we have a pending interrupt
 diff --git a/src/arch/x86/64/c_traps.c b/src/arch/x86/64/c_traps.c
-index cdb4f08..6f49e51 100644
+index cdb4f08e5..bddd05b5e 100644
 --- a/src/arch/x86/64/c_traps.c
 +++ b/src/arch/x86/64/c_traps.c
 @@ -38,9 +38,8 @@ static void NORETURN restore_vmx(tcb_t *cur_thread, vcpu_t *vcpu)
@@ -250,8 +279,23 @@ index cdb4f08..6f49e51 100644
  
      /* attempt to do a vmlaunch/vmresume */
      asm volatile(
+@@ -202,6 +201,14 @@ void VISIBLE NORETURN restore_user_context(void)
+ {
+     c_exit_hook();
+ 
++#ifdef CONFIG_VTX
++    /* While the lock is held, so that an invocation on another core finds
++     * the VCPU here and takes it out of guest mode before touching it. */
++    if (thread_state_ptr_get_tsType(&NODE_STATE(ksCurThread)->tcbState) == ThreadState_RunningVM) {
++        vcpu_make_current(NODE_STATE(ksCurThread)->tcbArch.tcbVCPU);
++    }
++#endif
++
+     NODE_UNLOCK_IF_HELD;
+ 
+     /* we've now 'exited' the kernel. If we have a pending interrupt
 diff --git a/src/arch/x86/c_traps.c b/src/arch/x86/c_traps.c
-index 9ce8686..afc8e02 100644
+index 9ce868692..afc8e022c 100644
 --- a/src/arch/x86/c_traps.c
 +++ b/src/arch/x86/c_traps.c
 @@ -154,10 +154,7 @@ void NORETURN slowpath(syscall_t syscall)
@@ -267,10 +311,21 @@ index 9ce8686..afc8e02 100644
          } else {
              setThreadState(NODE_STATE(ksCurThread), ThreadState_RunningVM);
 diff --git a/src/arch/x86/kernel/ept.c b/src/arch/x86/kernel/ept.c
-index 84e5737..557b4c9 100644
+index 84e5737e5..cbfbfa38c 100644
 --- a/src/arch/x86/kernel/ept.c
 +++ b/src/arch/x86/kernel/ept.c
-@@ -296,7 +296,7 @@ static exception_t performEPTPDPTInvocationMap(cap_t cap, cte_t *cte, ept_pml4e_
+@@ -49,6 +49,10 @@ void deleteEPTASID(asid_t asid, ept_pml4e_t *ept)
+         if (asid_map_get_type(asid_map) == asid_map_asid_map_ept &&
+             (ept_pml4e_t *)asid_map_asid_map_ept_get_ept_root(asid_map) == ept) {
+             poolPtr->array[ASID_LOW(asid)] = asid_map_asid_map_none_new();
++            /* The cores that ran on this root may still hold its
++             * translations, and unmapping what was below it no longer finds
++             * it: invalidate them now, before the root can be reused. */
++            invept(ept);
+         }
+     }
+ }
+@@ -296,7 +300,7 @@ static exception_t performEPTPDPTInvocationMap(cap_t cap, cte_t *cte, ept_pml4e_
  {
      cte->cap = cap;
      *pml4Slot = pml4e;
@@ -279,7 +334,7 @@ index 84e5737..557b4c9 100644
  
      return EXCEPTION_NONE;
  }
-@@ -499,7 +499,7 @@ static exception_t performEPTPDInvocationMap(cap_t cap, cte_t *cte, ept_pdpte_t
+@@ -499,7 +503,7 @@ static exception_t performEPTPDInvocationMap(cap_t cap, cte_t *cte, ept_pdpte_t
  {
      cte->cap = cap;
      *pdptSlot = pdpte;
@@ -288,7 +343,7 @@ index 84e5737..557b4c9 100644
  
      return EXCEPTION_NONE;
  }
-@@ -686,7 +686,7 @@ static exception_t performEPTPTInvocationMap(cap_t cap, cte_t *cte, ept_pde_t pd
+@@ -686,7 +690,7 @@ static exception_t performEPTPTInvocationMap(cap_t cap, cte_t *cte, ept_pde_t pd
  {
      cte->cap = cap;
      *pdSlot = pde;
@@ -297,7 +352,7 @@ index 84e5737..557b4c9 100644
  
      return EXCEPTION_NONE;
  }
-@@ -807,7 +807,7 @@ static exception_t performEPTPageMapPTE(cap_t cap, cte_t *cte, ept_pte_t *ptSlot
+@@ -807,7 +811,7 @@ static exception_t performEPTPageMapPTE(cap_t cap, cte_t *cte, ept_pte_t *ptSlot
  {
      *ptSlot = pte;
      cte->cap = cap;
@@ -306,7 +361,7 @@ index 84e5737..557b4c9 100644
  
      return EXCEPTION_NONE;
  }
-@@ -820,7 +820,7 @@ static exception_t performEPTPageMapPDE(cap_t cap, cte_t *cte, ept_pde_t *pdSlot
+@@ -820,7 +824,7 @@ static exception_t performEPTPageMapPDE(cap_t cap, cte_t *cte, ept_pde_t *pdSlot
          pdSlot[1] = pde2;
      }
      cte->cap = cap;
@@ -315,7 +370,7 @@ index 84e5737..557b4c9 100644
  
      return EXCEPTION_NONE;
  }
-@@ -1042,7 +1042,11 @@ void unmapEPTPage(vm_page_size_t page_size, asid_t asid, vptr_t vptr, void *pptr
+@@ -1042,7 +1046,11 @@ void unmapEPTPage(vm_page_size_t page_size, asid_t asid, vptr_t vptr, void *pptr
           * so this should not happen. As we have no way to return an error
           * all we can do is assert */
          assert(!"Invalid page size for unmap");
@@ -328,7 +383,7 @@ index 84e5737..557b4c9 100644
  
  #endif /* CONFIG_VTX */
 diff --git a/src/arch/x86/object/vcpu.c b/src/arch/x86/object/vcpu.c
-index 92dd1df..411a5e5 100644
+index 92dd1dfef..ed9360f20 100644
 --- a/src/arch/x86/object/vcpu.c
 +++ b/src/arch/x86/object/vcpu.c
 @@ -49,6 +49,23 @@ static msr_bitmaps_t msr_bitmap_region ALIGN(BIT(seL4_PageBits));
@@ -388,7 +443,7 @@ index 92dd1df..411a5e5 100644
          BIT(31);    //Activate secondary controls
      uint32_t secondary_control_mask =
          BIT(1);     //Enable EPT
-@@ -440,11 +467,46 @@ static inline uint32_t applyFixedBits(uint32_t original, uint32_t high, uint32_t
+@@ -440,11 +467,54 @@ static inline uint32_t applyFixedBits(uint32_t original, uint32_t high, uint32_t
      return original;
  }
  
@@ -400,12 +455,20 @@ index 92dd1df..411a5e5 100644
 +
 +#define HOST_XCR0 ((uint64_t)config_ternary(CONFIG_XSAVE, CONFIG_XSAVE_FEATURE_SET, 1))
 +
++#define XCR0_AVX512 (MASK(3) << 5)
++
 +/* A value XSETBV accepts for the guest: XSETBV runs in kernel mode, where
-+ * any other would fault. */
++ * any other would fault.  x87 is on, AVX needs SSE, AVX-512's three
++ * components go together and need AVX, and MPX's two and AMX's two each go
++ * together, whatever KernelXSaveFeatureSet enables. */
 +static inline bool_t CONST validGuestXCR0(uint64_t xcr0)
 +{
 +    return (xcr0 & ~HOST_XCR0) == 0 && (xcr0 & BIT(0)) &&
-+           (!(xcr0 & BIT(2)) || (xcr0 & BIT(1)));
++           (!(xcr0 & BIT(2)) || (xcr0 & BIT(1))) &&
++           ((xcr0 & XCR0_AVX512) == 0 ||
++            ((xcr0 & XCR0_AVX512) == XCR0_AVX512 && (xcr0 & BIT(2)))) &&
++           !(xcr0 & BIT(3)) == !(xcr0 & BIT(4)) &&
++           !(xcr0 & BIT(17)) == !(xcr0 & BIT(18));
 +}
 +
 +void vcpu_load_guest_xcr0(vcpu_t *vcpu)
@@ -435,7 +498,7 @@ index 92dd1df..411a5e5 100644
      vcpu->fpuState = x86KSnullFpuState;
  
      memcpy(vcpu->vmcs, &vmcs_revision, 4);
-@@ -519,6 +581,32 @@ void vcpu_init(vcpu_t *vcpu)
+@@ -519,6 +589,32 @@ void vcpu_init(vcpu_t *vcpu)
      vmwrite(VMX_GUEST_VMCS_LINK_POINTER, ~(word_t)0);
      vmwrite(VMX_GUEST_VMCS_LINK_POINTER_HIGH, ~(word_t)0);
  
@@ -468,7 +531,7 @@ index 92dd1df..411a5e5 100644
      memset(vcpu->io, ~(word_t)0, VCPU_IOBITMAP_SIZE);
      vmwrite(VMX_CONTROL_IOA_ADDRESS, pptr_to_paddr(vcpu->io));
      vmwrite(VMX_CONTROL_IOB_ADDRESS, pptr_to_paddr((char *)vcpu->io + (VCPU_IOBITMAP_SIZE / 2)));
-@@ -601,15 +689,28 @@ static exception_t invokeWriteMSR(vcpu_t *vcpu, word_t *buffer, word_t field, wo
+@@ -601,15 +697,28 @@ static exception_t invokeWriteMSR(vcpu_t *vcpu, word_t *buffer, word_t field, wo
      switch (field) {
      case IA32_LSTAR_MSR:
          vcpu->syscall_registers[VCPU_LSTAR] = value;
@@ -497,7 +560,7 @@ index 92dd1df..411a5e5 100644
          break;
      }
      setMR(thread, buffer, 0, value);
-@@ -617,6 +718,12 @@ static exception_t invokeWriteMSR(vcpu_t *vcpu, word_t *buffer, word_t field, wo
+@@ -617,6 +726,12 @@ static exception_t invokeWriteMSR(vcpu_t *vcpu, word_t *buffer, word_t field, wo
      return EXCEPTION_NONE;
  }
  
@@ -510,7 +573,7 @@ index 92dd1df..411a5e5 100644
  static exception_t decodeVCPUWriteMSR(cap_t cap, word_t length, word_t *buffer)
  {
      word_t field;
-@@ -632,9 +739,29 @@ static exception_t decodeVCPUWriteMSR(cap_t cap, word_t length, word_t *buffer)
+@@ -632,9 +747,29 @@ static exception_t decodeVCPUWriteMSR(cap_t cap, word_t length, word_t *buffer)
      value = getSyscallArg(1, buffer);
      switch (field) {
      case IA32_LSTAR_MSR:
@@ -541,7 +604,7 @@ index 92dd1df..411a5e5 100644
          break;
      default:
          userError("VCPU WriteMSR: Invalid field %lx.", (long)field);
-@@ -664,6 +791,12 @@ static exception_t invokeReadMSR(vcpu_t *vcpu, word_t field, word_t *buffer)
+@@ -664,6 +799,12 @@ static exception_t invokeReadMSR(vcpu_t *vcpu, word_t field, word_t *buffer)
      case IA32_FMASK_MSR:
          value = vcpu->syscall_registers[VCPU_SYSCALL_MASK];
          break;
@@ -554,7 +617,7 @@ index 92dd1df..411a5e5 100644
      case IA32_VMX_MISC_MSR:
          value = x86_rdmsr(field);
          break;
-@@ -689,6 +822,8 @@ static exception_t decodeVCPUReadMSR(cap_t cap, word_t length, word_t *buffer)
+@@ -689,6 +830,8 @@ static exception_t decodeVCPUReadMSR(cap_t cap, word_t length, word_t *buffer)
      case IA32_STAR_MSR:
      case IA32_CSTAR_MSR:
      case IA32_FMASK_MSR:
@@ -563,7 +626,7 @@ index 92dd1df..411a5e5 100644
      case IA32_VMX_MISC_MSR:
          break;
      default:
-@@ -804,6 +939,16 @@ static exception_t invokeWriteVMCS(vcpu_t *vcpu, bool_t call, word_t *buffer, wo
+@@ -804,6 +947,16 @@ static exception_t invokeWriteVMCS(vcpu_t *vcpu, bool_t call, word_t *buffer, wo
      case VMX_CONTROL_CR0_READ_SHADOW:
          vcpu->cr0_shadow = vcpu->cached_cr0_shadow = value;
          break;
@@ -580,7 +643,7 @@ index 92dd1df..411a5e5 100644
      }
      vmwrite(field, value);
  
-@@ -895,21 +1040,24 @@ static exception_t decodeWriteVMCS(cap_t cap, word_t length, bool_t call, word_t
+@@ -895,21 +1048,24 @@ static exception_t decodeWriteVMCS(cap_t cap, word_t length, bool_t call, word_t
      case VMX_CONTROL_EXCEPTION_BITMAP:
      case VMX_CONTROL_ENTRY_INTERRUPTION_INFO:
      case VMX_CONTROL_ENTRY_EXCEPTION_ERROR_CODE:
@@ -610,7 +673,7 @@ index 92dd1df..411a5e5 100644
          break;
      case VMX_GUEST_CR0:
          value = applyFixedBits(value, cr0_high, cr0_low);
-@@ -1041,6 +1189,7 @@ static exception_t decodeReadVMCS(cap_t cap, word_t length, bool_t call, word_t
+@@ -1041,6 +1197,7 @@ static exception_t decodeReadVMCS(cap_t cap, word_t length, bool_t call, word_t
      case VMX_DATA_IO_RIP:
      case VMX_DATA_GUEST_LINEAR_ADDRESS:
      case VMX_CONTROL_ENTRY_INTERRUPTION_INFO:
@@ -618,7 +681,7 @@ index 92dd1df..411a5e5 100644
      case VMX_CONTROL_PIN_EXECUTION_CONTROLS:
      case VMX_CONTROL_PRIMARY_PROCESSOR_CONTROLS:
      case VMX_CONTROL_SECONDARY_PROCESSOR_CONTROLS:
-@@ -1092,24 +1241,39 @@ void vcpu_update_state_sysvmenter(vcpu_t *vcpu)
+@@ -1092,24 +1249,39 @@ void vcpu_update_state_sysvmenter(vcpu_t *vcpu)
      if (ARCH_NODE_STATE(x86KSCurrentVCPU) != vcpu) {
          switchVCPU(vcpu);
      }
@@ -667,7 +730,7 @@ index 92dd1df..411a5e5 100644
  
      assert(vcpu);
  
-@@ -1117,11 +1281,7 @@ void vcpu_sysvmenter_reply_to_user(tcb_t *tcb)
+@@ -1117,11 +1289,7 @@ void vcpu_sysvmenter_reply_to_user(tcb_t *tcb)
          switchVCPU(vcpu);
      }
  
@@ -680,7 +743,7 @@ index 92dd1df..411a5e5 100644
      setRegister(tcb, msgInfoRegister, 0);
  }
  
-@@ -1138,6 +1298,15 @@ exception_t decodeX86VCPUInvocation(
+@@ -1138,6 +1306,15 @@ exception_t decodeX86VCPUInvocation(
      switch (invLabel) {
      case X86VCPUSetTCB:
          return decodeSetTCB(cap, length, buffer);
@@ -696,7 +759,7 @@ index 92dd1df..411a5e5 100644
      case X86VCPUReadVMCS:
          return decodeReadVMCS(cap, length, call, buffer);
      case X86VCPUWriteVMCS:
-@@ -1288,31 +1457,83 @@ BOOT_CODE bool_t vtx_init(void)
+@@ -1288,31 +1465,83 @@ BOOT_CODE bool_t vtx_init(void)
      return true;
  }
  
@@ -797,7 +860,7 @@ index 92dd1df..411a5e5 100644
  }
  
  static void handleVmxFault(uint32_t reason, word_t qualification)
-@@ -1320,7 +1541,7 @@ static void handleVmxFault(uint32_t reason, word_t qualification)
+@@ -1320,7 +1549,7 @@ static void handleVmxFault(uint32_t reason, word_t qualification)
      /* Indicate that we are returning the from VMEnter with a fault */
      setRegister(NODE_STATE(ksCurThread), msgInfoRegister, SEL4_VMENTER_RESULT_FAULT);
  
@@ -806,7 +869,7 @@ index 92dd1df..411a5e5 100644
  
      /* Set the thread back to running */
      setThreadState(NODE_STATE(ksCurThread), ThreadState_Running);
-@@ -1334,11 +1555,19 @@ static inline void finishVmexitSaving(void)
+@@ -1334,11 +1563,19 @@ static inline void finishVmexitSaving(void)
  {
      vcpu_t *vcpu = ARCH_NODE_STATE(x86KSCurrentVCPU);
      assert(vcpu == NODE_STATE(ksCurThread)->tcbArch.tcbVCPU);
@@ -829,7 +892,7 @@ index 92dd1df..411a5e5 100644
  }
  
  exception_t handleVmexit(void)
-@@ -1348,9 +1577,6 @@ exception_t handleVmexit(void)
+@@ -1348,9 +1585,6 @@ exception_t handleVmexit(void)
      word_t qualification;
      uint32_t reason;
      finishVmexitSaving();
@@ -839,7 +902,7 @@ index 92dd1df..411a5e5 100644
      /* the basic exit reason is the bottom 16 bits of the exit reason field */
      reason = vmread(VMX_DATA_EXIT_REASON) & MASK(16);
      if (reason == EXTERNAL_INTERRUPT) {
-@@ -1407,6 +1633,7 @@ exception_t handleVmexit(void)
+@@ -1407,6 +1641,7 @@ exception_t handleVmexit(void)
  
  exception_t handleVmEntryFail(void)
  {
@@ -847,7 +910,7 @@ index 92dd1df..411a5e5 100644
      handleVmxFault(-1, -1);
  
      return EXCEPTION_NONE;
-@@ -1562,24 +1789,16 @@ static void storeVPID(vcpu_t *vcpu, vpid_t vpid)
+@@ -1562,24 +1797,16 @@ static void storeVPID(vcpu_t *vcpu, vpid_t vpid)
   * enable or disable the FPU. However, with x86 virtualisation there is only
   * one TCB. Use the task flag for the host and always enable FPU for the guest.
   *
@@ -875,7 +938,7 @@ index 92dd1df..411a5e5 100644
          switchLocalFpuOwner(tcb);
      }
  }
-@@ -1589,11 +1808,6 @@ void vcpu_fpu_to_host(tcb_t *tcb, vcpu_t *vcpu)
+@@ -1589,17 +1816,26 @@ void vcpu_fpu_to_host(tcb_t *tcb, vcpu_t *vcpu)
      if (tcb->tcbFlags & seL4_TCBFlag_fpuDisabled) {
          /* FPU may have been enabled for the guest, but host isn't allowed to use it */
          disableFpu();
@@ -887,7 +950,27 @@ index 92dd1df..411a5e5 100644
      } else if (!nativeThreadUsingFPU(tcb)) {
          /* Handle corner cases like dissociated vcpu */
          switchLocalFpuOwner(tcb);
-@@ -1624,9 +1838,21 @@ void restoreVMCS(void)
+     }
+ }
+ 
++/*
++ * Make the VCPU of the thread about to enter guest mode this core's, before
++ * the kernel lock is released.  An invocation on another core needs the
++ * lock, so it then finds the VCPU here (switchVCPU()) and takes it out of
++ * guest mode first, instead of loading a VMCS that this core is about to
++ * enter with.
++ */
++void vcpu_make_current(vcpu_t *vcpu)
++{
++    if (ARCH_NODE_STATE(x86KSCurrentVCPU) != vcpu) {
++        switchVCPU(vcpu);
++    }
++}
++
+ void restoreVMCS(void)
+ {
+     tcb_t *cur_thread = NODE_STATE(ksCurThread);
+@@ -1624,9 +1860,21 @@ void restoreVMCS(void)
          }
      }
      setEPTRoot(TCB_PTR_CTE_PTR(cur_thread, tcbArchEPTRoot)->cap, expected_vmcs);
@@ -910,7 +993,7 @@ index 92dd1df..411a5e5 100644
  {
      if (vmx_ept_vpid_cap_msr_get_invept(vpid_capability)) {
          struct {
-@@ -1645,7 +1871,10 @@ void invept(ept_pml4e_t *ept_pml4)
+@@ -1645,7 +1893,10 @@ void invept(ept_pml4e_t *ept_pml4)
              return;
          }
  
@@ -922,7 +1005,7 @@ index 92dd1df..411a5e5 100644
          address.parts[1] = 0;
          asm volatile(
              "invept %0, %1"
-@@ -1656,4 +1885,18 @@ void invept(ept_pml4e_t *ept_pml4)
+@@ -1656,4 +1907,18 @@ void invept(ept_pml4e_t *ept_pml4)
      }
  }
  
@@ -942,7 +1025,7 @@ index 92dd1df..411a5e5 100644
 +
  #endif
 diff --git a/src/arch/x86/smp/ipi.c b/src/arch/x86/smp/ipi.c
-index b672489..15bd8ad 100644
+index b67248941..15bd8ade9 100644
 --- a/src/arch/x86/smp/ipi.c
 +++ b/src/arch/x86/smp/ipi.c
 @@ -45,6 +45,9 @@ void handleRemoteCall(IpiRemoteCall_t call, word_t arg0, word_t arg1, word_t arg
