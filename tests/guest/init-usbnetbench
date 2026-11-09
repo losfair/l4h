@@ -1,0 +1,17 @@
+#!/bin/sh
+# dom0 of tests/run-usbnetbench.sh: one guest with the xHCI controller and
+# its USB NIC runs the benchmark (tests/guest/init-usbnetvm).
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+fail() { echo "USBNET: FAIL: $*"; poweroff -f; }
+arg() { sed -n "s/.* $1=\([^ ]*\).*/\1/p" /proc/cmdline; }
+id=$(l4hctl create net --initrd /bin/usbnetvm.cpio.gz --mem 512 --vcpus 2 --usb "$(arg usbbdf)" \
+    --cmdline "console=hvc0 netmb=$(arg netmb) netruns=$(arg netruns) rxport=$(arg rxport) txport=$(arg txport)") \
+    || fail "create"
+l4hctl console "$id" --until "USBNET: DONE" --timeout 1000 > /tmp/out || fail "no USBNET: DONE"
+grep -a USBNET /tmp/out
+grep -q 'USBNET: FAIL' /tmp/out && fail "guest"
+l4hctl destroy "$id"
+echo "USBNET: PASS"
+poweroff -f

@@ -41,6 +41,7 @@ mod pci;
 mod reset;
 mod rtc;
 mod trustd;
+mod usb;
 mod vmmgr;
 #[cfg(target_arch = "x86_64")]
 mod vtd;
@@ -350,6 +351,7 @@ impl Host {
             blkd::poll(self, c);
         }
         netd::Netd::poll(self);
+        usb::poll(self);
     }
 }
 
@@ -494,6 +496,9 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
             if nics.push(d).is_err() {
                 log!("l4h-root: more than {} NICs, ignoring {:02x}:{:02x}.{}", host::net::MAX_NICS, d.bus, d.dev, d.func);
             }
+        } else if usb::is_xhci(&d) {
+            // Left to the firmware, enabled as it is, until claimed.
+            usb::found(d, &pci);
         } else if memd::is_balloon(&d) && balloon.is_none() && !partition::secondary() {
             balloon = Some(d);
         }
@@ -697,6 +702,7 @@ fn dom0_plan(h: &mut Host, ntfn: cap::Notification) -> Dom0Plan {
             add_nic(sw, 0);
         }
     }
+    plan.usbs = usb::dom0_ctrls(h);
     // Reserve the whole plan before vmmgr can attach anything. Reservations
     // also cover placeholders and survive dom0 restarts, so no system range
     // becomes available to another guest or to provisioning on a failure.

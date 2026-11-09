@@ -2408,6 +2408,186 @@ its display off, checks every pixel of dom0's screenshots (`gpucheck`),
 checks that the host refuses a display or I/O pool too small, and that
 destroy returns the memory.
 
+### 9.7 USB: whole xHCI controllers, safe without an IOMMU
+
+A guest (dom0 included) can be given whole xHCI controllers (one PCI
+function each), with all their root ports and everything behind them. This
+is device assignment, not PCI passthrough (§1): an xHCI fetches DMA
+addresses from memory its driver writes, asynchronously, and without an
+IOMMU uses them as host physical addresses, so a guest running `xhci-hcd`
+on the hardware could reach any host page. Instead `l4h-usbd` drives the
+controller, one per claimed controller, and the guest forwards Linux's
+`hc_driver` operations and URBs to it.
+
+- **Discovery and claim.** At boot root only lists functions of class
+  `0c/03/30` (up to `MAX_USB_CTRLS`, 16) and leaves them to the firmware:
+  legacy keyboard emulation and BMC virtual devices keep working, and a
+  host that assigns no USB spends nothing (`l4hctl usb`: `firmware`). The
+  first `CTL_USB_ATTACH` (or dom0's `dom0_usb=`) claims one: root reads its
+  capability registers through a temporary uncached mapping, allocates
+  usbd's DMA region (one contiguous Untyped, `host::usb::dma_bytes`: the
+  scratchpad, DCBAA and contexts, command and event rings and a pool of 256
+  transfer rings of 512 TRBs; 4 MiB for QEMU's), maps BAR 0 uncached into a new usbd,
+  binds the interrupt (MSI-X entry 0, or plain MSI, which Intel PCH
+  controllers have instead) to its notification, and posts `USBD_CLAIM` in
+  usbd's mailbox (`l4h_host::mailbox`, §10, "Root never waits on a
+  driver").
+  usbd walks the extended capabilities (bounded: 256 entries inside BAR 0,
+  `host::usb::xcaps`), takes the controller from the firmware (OS Owned,
+  then up to 1 s for BIOS Owned to clear, else it clears it, as Linux
+  does; legacy SMIs off), halts and resets it. Root routes Intel PCH ports
+  to the xHCI once usbd has answered. Root never calls usbd: a guest that
+  has the controller can keep usbd busy, and even the claim's handoff and
+  reset take up to seconds, which would hold up every guest's control
+  requests. Claim, attach and release are requests in the mailbox: usbd
+  answers them in order when it gets to them, and root finishes each from
+  its serve loop (`usb::poll`). The attachment that claimed the controller
+  does not wait for the claim: the guest gets its queue area at once, its
+  attach is posted when the claim is answered, and if the claim fails the
+  controller is quarantined and the guest's driver finds no magic. usbd
+  publishes its refused requests and resets in the mailbox's second page
+  (`usb::Published`, for `l4hctl usb`). A controller once claimed stays
+  with its usbd until reboot,
+  `idle` (halted, bus mastering off, its DMA region kept) when no guest has
+  it, and `failed` if a reset or drain fails. Renesas uPD72020x without a
+  firmware ROM and controllers without MSI are `unsupported`.
+- **Attach.** `VMMGR_USB_ATTACH (guest, device, controller)`: vmmgr names
+  both by number; root claims the controller if needed, makes the queue
+  area (101 host frames in an arena of root's own, mapped into usbd, and
+  copies of them for the guest), usbd's kick, mints the guest's VMM
+  notification (root's, from `GUEST_NEW`) for usbd with badge
+  `vmm_badge_usb(n)`, maps the pool into the controller's IOMMU domain,
+  turns bus mastering on and posts `USBD_ATTACH` with the pool's addresses
+  from its own table. usbd keeps two areas (`AREAS`): while the previous
+  guest's release still runs, the next guest gets the other, and its
+  attach (bus mastering with it) waits for the release (or the claim)
+  to be answered; the guest's
+  driver waits for usbd to write the area's magic. vmmgr maps the area into the guest at
+  `L4H_USB_AREA_VA(n)` (the pages usbd writes read-only) and adds an
+  `L4H_DEV_USB` device (ABI 7). A guest has at most four
+  (`L4H_MAX_GUEST_USB`); `l4hctl create --usb BDF` raises the default I/O
+  pool by 4 MiB each.
+- **The queue area** (`include/l4h/abi.h`): usbd's info page (ports and
+  their USB revision, slots, streams, the largest transfer, its indices),
+  the guest's index page, a control SQ (32 records of 256 bytes: port
+  get/set/clear, enable/disable slot, address, endpoint configuration, hub,
+  ep0 max packet, device and endpoint reset, streams, URB cancel), a
+  transfer SQ (128 records of 2 KiB: one URB each, with up to 64 pool
+  segments, a 256 KiB request of 4 KiB pages, and 48 isoch packets), a 256-entry completion queue shared by
+  both, and a 64-entry event queue (port changes, controller resets).
+  Indices are free-running and each in its own cache line; the guest
+  signals usbd's kick only when usbd said it is about to wait.
+  Completions go back through the VMM, which raises the device's event on
+  the vCPU the guest routed it to (`L4H_HC_DEV_WRITE`, as virtio's): the
+  VMM sees no request, maps nothing of the controller and needs no
+  capability from vmmgr.
+- **usbd** is a Rust xHCI driver in the shape of blkd's: one command ring,
+  one event ring of 4096 TRBs (interrupter 0, IMOD 40 us, which the guest
+  cannot change; in one 64 KiB-aligned segment), a ring per endpoint or
+  stream from the fixed pool, TDs laid out as Linux's `xhci-ring.c` does
+  (64 KiB splits, TD Size, TBC and TLBPC for isoch, ISP on IN data, a bulk
+  zero-length packet as a TD of its own). usbd schedules isoch URBs, as
+  Linux's HCD does: right after the endpoint's previous URB, or past MFINDEX
+  plus the scheduling threshold for an idle one, reporting the start frame
+  in the CQE; with CFC, TDs carry Frame IDs from it, the device speed and
+  the service interval (SIA when it is out of the valid window, or ASAP).
+  usbd publishes MFINDEX with the host counter (TSC, CNTVCT) at which it
+  read it, under a sequence count, each time it runs; the guest's frame
+  number goes on from that sample at 8000 microframes a second, so it
+  advances while usbd sleeps. A cancelled isoch URB reports its packets as
+  done, failed or cancelled (the one the controller stopped in with its
+  bytes), and its length as their sum.
+  An isoch TD that fails before its last TRB stays on the ring until an
+  event shows the controller past it; an event on a later isoch URB retires
+  the ones before it, their unreported TDs missed (a Missed Service event
+  may carry no TRB pointer). A TD crosses the Link TRB only where its data
+  before it ends on a packet boundary (xHCI §4.11.7.1); otherwise its URB
+  goes at the start of the ring after no-ops, which even an empty ring has
+  room for, and which stay reserved until the URB completes. Commands run one at a time, polling the
+  event ring (5 s timeout). An endpoint halted by an error is recovered
+  with Reset Endpoint and Set TR Dequeue past the failed URB, as Linux
+  does; a cancelled URB is skipped (dequeue moved, or its TRBs made
+  no-ops, unchained, which stay reserved with the URB after them until the
+  controller is past them, or wound back off a stopped ring after its last
+  posted URB) and completed only once the endpoint has stopped, and every
+  stream of the endpoint restarted. One whose record usbd has not taken
+  (it waits behind a full CQ) is marked to be skipped and never completes
+  (`ST_DROPPED`; the guest gives it back). A URB that
+  does not fit its ring waits in usbd, so one full ring does not hold up
+  other endpoints. A command timeout, HSE or HCE resets the controller and
+  posts `HC_RESET`; only its owner is affected.
+- **Validation** (`host::usb`, the code tests/fuzz-usbreq runs): every
+  record is copied before it is checked, every index against usbd's own
+  copy and the ring size; every segment must lie in the pool
+  (`blk::Pool::translate`) and the total within the advertised maximum;
+  slots must be the client's and endpoints configured, with the type and
+  direction of the transfer; endpoint fields must be in the xHCI range for
+  their speed and type; route strings at most five tiers; isoch packets
+  inside the data; port writes only the bits the feature names. A request
+  is accepted only while the CQ has room for it, so it never overflows and
+  a guest that does not consume completions stalls only itself; transfers
+  leave one entry for control requests, so an `URB_CANCEL` always gets in.
+  usbd's turns are bounded (one SQ's worth of each), so a guest refilling
+  its queues from another vCPU does not keep usbd from its events and the
+  mailbox.
+- **DMA without an IOMMU.** Every DMA pointer the controller reads is
+  written by usbd into its own region, which no guest maps: registers,
+  DCBAA, scratchpad, contexts, stream arrays, rings and Link TRBs. Every
+  data pointer is a translated pool segment; setup packets travel as
+  immediate data; only data buffers are shared, and the controller does
+  not interpret them. USB devices cannot DMA. With an IOMMU the
+  controller's domain holds only usbd's region and the attached pool, and
+  interrupt remapping confines its MSI. What remains without one is, as for
+  blkd and netd, a bug in usbd or a controller erratum.
+- **Release.** `GUEST_DEL` cuts the controller off without waiting for
+  usbd: root revokes the guest's copies of the queue frames, turns bus
+  mastering off and reads the command register back (the controller can
+  issue no more DMA, and that read's completion cannot pass the writes it
+  already posted, so they are in memory: the pool can be reused at once,
+  with or without an IOMMU), unmaps the pool from the
+  domain, deletes usbd's copy of the VMM notification (usbd signals it with
+  NBSend, which an empty slot ignores) and posts `USBD_REMOVE`, after the
+  attach if usbd has not answered that yet. usbd then halts and resets the
+  controller and forgets every URB; when it answers root frees the area, and the controller is `idle` for the next
+  guest, which enumerates its devices again. If the reset fails root
+  quarantines the controller (decoding, bus mastering and MSI off). A
+  reset does not reset USB devices' firmware: a controller carries its
+  devices with it.
+- **Guest.** `usb-l4h` (`arch/l4h/drivers/usb_l4h.c`) registers a USB 2 and
+  a shared USB 3 HCD whose root hubs have the controller's ports; the
+  stock USB core does enumeration, hubs, descriptors and class drivers, so
+  usbd never parses device data. Buffers bounce through the pool
+  (swiotlb), like virtio-l4h's. The HCD, HID and the common class
+  drivers (storage, UAS, serial, audio, network) are built into the guest
+  kernel, not modules: every guest maps the kernel's text and rodata from
+  the same host frames, while a module would be copied into the RAM of each
+  guest that loads it (§5.6). Built in, they add 1.45 MiB of shared text
+  and rodata, and about 200 KiB to a guest's RAM whether it uses USB or not
+  (60 KiB of data, the rest slab from their initialization), against 0.6 to
+  1.6 MiB per guest that loads them as modules.
+- **Not in v1:** sharing a controller among guests or assigning single
+  ports (the protocol is meant to allow it: an owner per root port and
+  slot), hot attach and detach, EHCI and older, USB4, LPM and runtime PM,
+  the Debug Capability (usbd never enables DbC), giving a controller back to
+  the firmware.
+
+`tests/run-usbstress.sh` benchmarks each disk (against the same devices
+under a plain Linux VM with `USBSTRESS_NATIVE=1`, §13), runs writers,
+readers and verifiers on all of them for `STRESS_SECS` while one is
+deauthorized and authorized again every few seconds (its URBs cancelled
+under load), destroys `STRESS_CYCLES` guests while every disk is busy,
+and checks that the stress run's data survived.
+`tests/run-usbtest.sh` (QEMU's xHCI with MSI-X, `USBTEST_HC=nec` an NEC
+one with MSI only; `L4H_QEMU_IOMMU=intel|amd`) checks that the controller
+is the firmware's until a guest gets it; that a guest enumerates a
+keyboard, a tablet, a BOT disk on the root hub and one behind a hub and a
+UAS disk, reads both disks' digests and writes one; that a driver reload
+resets the controller and enumerates again; and that a guest destroyed
+during I/O leaves it idle for the next. `tests/usb.rs` and
+`tests/fuzz-usbreq` (`tests/run-fuzz.sh`) check the capability walk on
+malformed lists, endpoint ranges, TRB layout and index arithmetic, and
+that whatever usbd accepts from random records points only into the pool.
+
 ---
 
 ## 10. Host components
@@ -2427,6 +2607,7 @@ whose components assume a static, Microkit-shaped system.
 | `l4h-netd` | 1 | Runs all L2 switches, guest ports and the virtio-net, gVNIC, ENA, X550 and ConnectX-5 uplink drivers. |
 | `l4h-trustd` | 1 | Maintains taint/seal flags; with a TPM, quotes its signing key and signs guests' reports (§10.2). |
 | `l4h-memd` | 1 | Owns free memory and every guest's RAM blocks; gives root and vmmgr memory for host objects; serves memory hotplug; reports free memory to the hypervisor (§8.4). |
+| `l4h-usbd` | 1 per claimed xHCI controller | Drives a whole USB controller for the guest it is assigned to; validates its requests and pool segments (§9.7). |
 | `l4h-logd` | 1 | The only host writer to the serial port: prints every partition's serial ring and the other kernels' console rings, whole lines in one order (§10.4). |
 
 **No dynamic allocation.** Nothing a guest, dom0 or a device does may
@@ -2438,20 +2619,20 @@ tables. Where allocation is truly needed, it is bounded by a stated limit
 checked before the allocation, fails as an error rather than a panic, and is
 never made per request on a path whose size a guest or client controls. A
 component without a heap says so (`component!(main, no_heap)`, or for root
-a `#[root_task]` without `heap_size`) and does not link `alloc`: root, vmmgr, memd, netd, blkd, logd and the VMM have none, and keep
+a `#[root_task]` without `heap_size`) and does not link `alloc`: root, vmmgr, memd, netd, blkd, usbd, logd and the VMM have none, and keep
 state too large for a stack in statics (`l4h_host::fixed::{StaticCell,
 Scratch}`). The one heap is trustd's, for the third-party AML interpreter of
 the TPM start method; its size (`aml::HEAP`) is bounded by the firmware's
 tables, which trustd checks first.
 
-**Root never waits on a driver.** blkd and netd handle guests' rings and
-device memory, so root assumes either may run an attacker's code, and an
+**Root never waits on a driver.** blkd, netd and usbd handle guests' rings
+and device memory, so root assumes any may run an attacker's code, and an
 attacker's driver could leave a request unanswered forever. Root does not
 call them, nor wait for them with a deadline: it posts requests in a ring
 in a page it shares with the driver (`l4h_host::mailbox`), signals the
 driver's notification and goes back to its loop. The driver answers in
 order and signals root, which then finishes what the request was for
-(`blkd::poll`, `Netd::poll`). A request a driver never answers stays
+(`blkd::poll`, `Netd::poll`, `usb::poll`). A request a driver never answers stays
 pending, and so does whatever waits for it, nothing else:
 
 - **netd's commands** need no answer: root validates them and keeps their
@@ -2465,6 +2646,10 @@ pending, and so does whatever waits for it, nothing else:
   `EBUSY`. A controller holds at most two of vmmgr's 256 tokens for
   requests its blkd has not answered, so drivers that never answer leave
   tokens for the other controllers.
+- **usbd's** claim, attach and release need no answer before root replies
+  to vmmgr: a guest's driver waits for the queue area's magic instead
+  (§9.7). A usbd that never answers keeps its controller's queue areas,
+  and no later guest of that controller gets a working one.
 - **Teardown waits for no one.** A destroyed guest's I/O pool leaves the
   devices' IOMMU domains at once and is reused; what drivers map (disk
   channels, extent tables, port memory) is kept until they say they have
@@ -2474,7 +2659,8 @@ pending, and so does whatever waits for it, nothing else:
   client and port slots, for good.
 - A full ring (64 requests) refuses new ones with `EBUSY`; removals queue
   in root until there is room. A failed driver's keeper answers everything
-  with `u64::MAX`; a quarantined blkd's pending requests fail at once.
+  with `u64::MAX`; a quarantined blkd's or usbd's pending requests fail at
+  once.
 
 Root still calls memd, which handles no one's data, and trustd only in its
 start-up handshake, before any guest exists; everything else root shares
@@ -2556,7 +2742,7 @@ into the guest's boot blocks, builds the kernel VSpace and
 `struct l4h_bootinfo`, then starts vCPU0 at the entry point with `rdi`
 (`x0` on aarch64) pointing at boot info. It holds:
 
-- a magic number and the guest ABI version (`L4H_ABI_VERSION`, currently 6);
+- a magic number and the guest ABI version (`L4H_ABI_VERSION`, currently 7);
 - the guest id;
 - RAM size, direct-map base (`ram_base_va`), block and boot-block counts;
 - the kernel's end and the initramfs's GPA and size;
@@ -3070,7 +3256,7 @@ root.
   they stay unique since boot whatever vmmgr does.
 - **The interface** (`l4h_host::vmmgr`) is a handful of calls from vmmgr to
   root, with integers in message registers: `GUEST_NEW` (the pool and the
-  attestation device), `GUEST_DEL`, `DISK_ATTACH`, `NIC_ADD`,
+  attestation device), `GUEST_DEL`, `DISK_ATTACH`, `NIC_ADD`, `USB_ATTACH` (§9.7),
   `TRUST_REGISTER` (the launch digest), and `HOST_OP`, which carries the
   control ops on the host's disks, switches and NICs, reset and RTC as their
   `CTL_*` number and six arguments, with data returned in a result page.
@@ -3798,6 +3984,9 @@ pessimistic.
 | fork+exit+wait | 340–450 µs | |
 | disk, 1 MiB direct, 1 vCPU | 430–510 MB/s write, 450–600 MB/s read | Measured on a heavily loaded host (load ~10 on 8 CPUs, up to 3× run-to-run variation); includes the swiotlb bounce. A quieter run gave 974 MB/s write and 750 MB/s read. |
 | disk, 4 KiB read latency | 350–375 µs | Two cross-core wakeups each way (guest → VMM → blkd), plus the bounce; higher than the copy alone explains, not yet investigated. |
+| USB disk through usbd (§9.7), 1 MiB direct, 2 vCPUs | UAS: 470–1280 MB/s read, 430–510 MB/s write; BOT: 115–195 / 115–140 MB/s | QEMU's xHCI (`tests/run-usbstress.sh`, several runs on a host with other load: up to 2× run-to-run). The same devices under a plain Linux VM with `xhci-pci`: UAS 560–985 / 390–440, BOT 400–1070 / 320–410 MB/s. Requests are at most 256 KiB (64 pool segments, swiotlb's largest mapping) against native 512 KiB–1 MiB. |
+| USB disk, 4 KiB direct reads | UAS 1250–1740 IOPS, BOT 640–830 IOPS | Native 1590–1910 and 1580–2110. Each URB round trip (guest → usbd → controller → usbd → VMM → guest) costs a few hundred µs more, the cross-core wakeups of the disk path above; BOT takes three per command, UAS overlaps them. |
+| USB Ethernet through usbd (QEMU's `usb-net`, CDC Ethernet, on QEMU's user network) | 12.5–12.9 MB/s receive, 5–10 MB/s send; ping 1.2 ms | `tests/run-usbnetbench.sh`: 256 MB each way to a peer on the build host. A plain Linux VM on the same devices: 13.8 MB/s receive, 4–9 MB/s send, ping 0.35 ms. QEMU's emulation of the device sets the throughput for both; the extra 0.8 ms of ping is two URB round trips (§9.7 disks above). |
 | guest↔guest ping | 1.4 ms | Four component hops per direction, with cross-core wakeups. |
 | guest↔guest TCP | 670–710 MB/s | 1 vCPU each, sender ~70 % busy (`netbench`, 256 KiB writes, 1 MiB reads); checksum offload and TSO pass through the switch. |
 | dom0 ↔ host over a tap NIC (vhost) | 380–620 MB/s down, 410–490 MB/s up | 256 MiB with wget / a 256 KiB-write sender. A plain Linux VM on the same QEMU: 0.5–1.3 GB/s. |
@@ -4006,6 +4195,9 @@ machine and guests of 256–512 MiB.
 | `tests/run-ctltest.sh` | VM lifecycle, console, clean shutdown, disk re-attach, windows, reclaim |
 | `tests/run-devicelimit.sh` | 64 devices per guest |
 | `tests/run-gputest.sh` | virtio-gpu drawing, screenshots, size checks and reclaim |
+| `tests/run-usbstress.sh` (`STRESS_SECS`, `STRESS_CYCLES`, `USBSTRESS_NATIVE=1`) | USB stress and benchmark: all disks busy while one is pulled and put back, guests destroyed under load, data intact; per-disk throughput and IOPS, optionally against a plain Linux VM |
+| `tests/run-usbnetbench.sh` (`NETBENCH_MB`, `NETBENCH_RUNS`, `USBSTRESS_NATIVE=1`) | USB Ethernet (QEMU's `usb-net`) given whole to a guest: receive and send throughput and ping against a peer on the build host, optionally against a plain Linux VM |
+| `tests/run-usbtest.sh` (`USBTEST_HC=nec`) | whole xHCI controller assignment: left to the firmware until claimed, HID, BOT and UAS disks, a hub, driver reload, destroy during I/O, a second guest (§9.7) |
 | `tests/run-nettest.sh`, `tests/run-router.sh` | switches, uplink, multi-NIC, isolation, MAC lock, NAT router VM (`NETTEST_LEGACY=1`: legacy virtio-net uplink) |
 | `tests/run-density.sh 30 256` | 30 guests on 4 cores stay responsive |
 | `tests/run-m6test.sh` | dom0 restart, CPU caps, steal time |
@@ -4029,7 +4221,7 @@ machine and guests of 256–512 MiB.
 | `tests/run-attesttest.sh` | attestation with swtpm over CRB, FIFO and the AMD fTPM ACPI start method: reports on dom0 and a guest, host evidence, AK credential |
 | `tests/run-debian.sh`, `tests/run-workload.sh` | Debian + systemd, fio verify, parallel build, fsck (`tests/mkdebian.sh` first) |
 | `tests/run-bench.sh`, `tests/run-vmbench.sh`, `tests/run-startbench.sh` | micro-benchmarks, guest cost, start latency |
-| `tests/run-fuzz.sh` | hostile-guest virtqueue fuzzing of l4h-vmm |
+| `tests/run-fuzz.sh` | hostile-guest virtqueue fuzzing of l4h-vmm; usbd's record checks and TRB layout (`tests/usb.rs`, `tests/fuzz-usbreq`) |
 | `tests/run-skimtest.sh` | the skim-xapic-nopcid variant on a Meltdown-affected CPU without PCID/x2APIC: SKIM mappings and syscall state at the user/kernel boundary (`tests/skim-qemu.py`, GDB); VT-x stays off (`run-vtxtest.sh skim`) |
 | `tests/run-kvmbench.sh l4h\|linux` | KVM exit, EPT or nested page fault and guest compute timings (`tests/guest/kvmbench.c`) and boot times under QEMU, Firecracker and cloud-hypervisor, with L1 l4h's dom0 or the host's Linux kernel in QEMU, both on nested KVM with two vCPUs (§5.10); `KVMBENCH_CMDLINE` adds to dom0's command line |
 | `tests/run-kvmtest.sh [vmm] [vcpus]` | KVM in dom0 (§5.10; needs nested VMX or SVM, `-cpu host`): `tests/guest/kvmtest.c` runs real- and long-mode VMs with port I/O, MMIO, 62 MiB of EPT faults, a run long enough to be preempted, a replaced memslot, dirty logging, vector registers across migrations inside `KVM_RUN`, XCR0 and CPUID after XSETBV and CR4 changes, SMAP set before paging, IDTR and CR4 changed between runs on one core and then two (SVM's clean bits), an RDPMC (always an exit), an exception injected while KVM single-steps to an NMI window, `KVM_EXIT_SET_TPR` when a guest without an in-kernel LAPIC lowers CR8, an IRQ window open across a shutdown's reset, two VMs at once and 20 in a row; `vmm` also boots the host's kernel (`KVMTEST_KERNEL`) with two vCPUs under the host's QEMU and the pinned Firecracker and cloud-hypervisor releases (`KVMTEST_VMMS`). CI runs it in the VT-x/AMD-V step where the runner has nested virtualization |

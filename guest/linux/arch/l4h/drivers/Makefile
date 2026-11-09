@@ -10,3 +10,4 @@ obj-$(CONFIG_L4H_KMOD) += kmod.o
 obj-$(CONFIG_L4H_RTC) += rtc_l4h.o
 obj-$(CONFIG_L4H_MEMHP) += memhp.o
 obj-$(CONFIG_L4H_RNG) += rng_l4h.o
+obj-$(CONFIG_USB_L4H) += usb_l4h.o

@@ -17,8 +17,8 @@ strip() {
         export "L4H_$(echo $c | tr a-z A-Z)_ELF=$out/stripped/l4h-$c.elf"
     done
 }
-cargo build -q --target aarch64-sel4 -p l4h-vmm -p l4h-blkd -p l4h-netd -p l4h-trustd -p l4h-memd -p l4h-logd
-strip vmm blkd netd trustd memd logd
+cargo build -q --target aarch64-sel4 -p l4h-vmm -p l4h-blkd -p l4h-netd -p l4h-trustd -p l4h-memd -p l4h-logd -p l4h-usbd
+strip vmm blkd netd trustd memd logd usbd
 cargo build -q --target aarch64-sel4 -p l4h-vmmgr
 strip vmmgr
 cargo build -q --target aarch64-sel4-roottask -p l4h-root "$@"

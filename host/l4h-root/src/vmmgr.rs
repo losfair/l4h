@@ -67,6 +67,9 @@ pub struct RootGuest {
     pub ports: ArrayVec<usize, MAX_GUEST_DEVICES>,
     /// It has an attestation device (trustd.rs).
     pub attest: bool,
+    /// USB controllers it has (usb.rs), in the order attached: the
+    /// position is its USB number.
+    pub usbs: ArrayVec<usize, { host::usb::MAX_GUEST_USB }>,
 }
 
 /// vmmgr, as root keeps it.
@@ -126,6 +129,8 @@ pub struct Dom0Plan {
     pub io_pool: usize,
     pub disks: ArrayVec<proto::Dom0Disk, { proto::DOM0_MAX_DISKS }>,
     pub nics: ArrayVec<proto::Dom0Nic, { proto::DOM0_MAX_NICS }>,
+    /// USB controllers (usb.rs indices), from dom0_usb.
+    pub usbs: ArrayVec<u64, { host::usb::MAX_GUEST_USB }>,
 }
 
 /// The vmmgr configuration under construction.
@@ -195,6 +200,8 @@ pub fn spawn(h: &mut Host, modules: &Modules, plan: &Dom0Plan) -> Vmmgr {
         cfg.dom0_disk[..plan.disks.len()].copy_from_slice(&plan.disks);
         cfg.dom0_nics = plan.nics.len() as u64;
         cfg.dom0_nic[..plan.nics.len()].copy_from_slice(&plan.nics);
+        cfg.dom0_usbs = plan.usbs.len() as u64;
+        cfg.dom0_usb[..plan.usbs.len()].copy_from_slice(&plan.usbs);
         let cmdline = h.cfg.dom0_cmdline.as_bytes();
         let n = cmdline.len().min(abi::CMDLINE_SIZE - 1);
         cfg.dom0_cmdline[..n].copy_from_slice(&cmdline[..n]);
@@ -365,6 +372,7 @@ pub fn call(h: &mut Host, label: u64) -> usize {
         proto::VMMGR_DISK_ATTACH => disk_attach(h, a),
         proto::VMMGR_NIC_ADD => now(nic_add(h, a)),
         proto::VMMGR_TRUST_REGISTER => now(trust_register(h, a)),
+        proto::VMMGR_USB_ATTACH => now(usb_attach(h, a)),
         proto::VMMGR_HOST_OP => {
             let data = unsafe { &mut *(RESULT_VA as *mut [u8; abi::CTL_DATA_MAX]) };
             data.fill(0);
@@ -580,6 +588,7 @@ fn guest_new(h: &mut Host, a: [u64; 8]) -> Result<Vals, i64> {
             disks: ArrayVec::new(),
             ports: ArrayVec::new(),
             attest,
+            usbs: ArrayVec::new(),
         });
         Ok([instance, attest as u64].into_iter().collect())
     })();
@@ -616,9 +625,15 @@ fn guest_del(h: &mut Host, id: usize) -> Result<Vals, i64> {
     for &(c, i) in &g.disks {
         cut &= blkd::cut_off(h, c, i);
     }
+    // A USB controller is cut off from the pool (and the guest from its
+    // queue frames, root's) before the pool goes.
+    for &u in &g.usbs {
+        cut &= crate::usb::remove(h, u);
+    }
     let waits = g.disks.len() + g.ports.len();
     if waits == 0 {
-        h.alloc.reclaim(g.arena);
+        let pool = g.pool.paddr;
+        h.alloc.reclaim_pinning(g.arena, |p| !cut && p == pool);
         h.alloc.slots.free_owned(id);
         return Ok(kept_later());
     }
@@ -712,6 +727,26 @@ fn nic_add(h: &mut Host, a: [u64; 8]) -> Result<Vals, i64> {
         xchg(h, 1).move_(&abs_of(kick)).expect("vmmgr port kick");
         h.alloc.slots.free(kick.bits() as Slot);
         Ok([mac].into_iter().collect())
+    })
+}
+
+/// VMMGR_USB_ATTACH: give the guest a whole USB controller.  Returns its
+/// USB number.
+fn usb_attach(h: &mut Host, a: [u64; 8]) -> Result<Vals, i64> {
+    let id = guest_arg(a[0])?;
+    let (dev, ctrl) = (a[1] as usize, a[2] as usize);
+    if dev >= MAX_GUEST_DEVICES {
+        return Err(ctl::EINVAL);
+    }
+    h.guests[id].as_ref().ok_or(ctl::ENOENT)?;
+    crate::usb::ensure_claimed(h, ctrl)?;
+    with_guest(h, id, |h, g| {
+        let n = g.usbs.len();
+        let att = crate::usb::attach(h, ctrl, g)?;
+        xchg(h, 0).copy(&abs_of(att.frames), CapRights::all()).expect("vmmgr USB queue frames");
+        xchg(h, 1).move_(&abs_of(att.kick)).expect("vmmgr usbd kick");
+        crate::usb::free_slot(h, att.kick);
+        Ok([n as u64].into_iter().collect())
     })
 }
 

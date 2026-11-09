@@ -40,6 +40,8 @@ pub struct Vmmgr {
     disks: Vec<Option<(usize, u64, u64)>>,
     nics: Vec<u32>,
     fail_disks: Vec<usize>,
+    usbs: Vec<usize>,
+    fail_usbs: Vec<usize>,
     started: bool,
 }
 
@@ -84,6 +86,12 @@ impl Vmmgr {
         self.nics.push(switch);
         Ok(())
     }
+    fn attach_usb(&mut self, _: usize, ctrl: usize) -> Result<(), i64> {
+        if self.fail_usbs.contains(&ctrl) { return Err(16); }
+        self.add_device()?;
+        self.usbs.push(ctrl);
+        Ok(())
+    }
     fn start_guest(&mut self, _: usize) -> Result<(), i64> {
         assert!(self.guest.as_ref().unwrap().booted);
         self.started = true;
@@ -120,7 +128,8 @@ fn fixture(builtins: usize, windows: usize, other_disks: usize, nics: usize) -> 
     Vmmgr {
         cfg: Box::leak(cfg), kernel: Some(Kernel { ram_base: 0 }), dom0_initrd: &[],
         alloc: (), wins: Windows { a: () }, info: (), guest: None, builtins,
-        disk_attempts: Vec::new(), disks: Vec::new(), nics: Vec::new(), fail_disks: Vec::new(), started: false,
+        disk_attempts: Vec::new(), disks: Vec::new(), nics: Vec::new(), fail_disks: Vec::new(),
+        usbs: Vec::new(), fail_usbs: Vec::new(), started: false,
     }
 }
 
@@ -210,4 +219,19 @@ fn oversized_whole_disk_plan_is_also_rejected() {
     fails_before_boot(&mut h, "dom0 device plan needs 69 slots");
     assert!(h.disk_attempts.is_empty());
     assert!(h.nics.is_empty());
+}
+
+#[test]
+fn dom0_usb_controllers_are_attached_and_a_failure_is_not_fatal() {
+    let mut h = fixture(2, 0, 1, 1);
+    let mut cfg: Box<VmmgrConfig> = Box::new(unsafe { core::ptr::read(h.cfg) });
+    cfg.dom0_usbs = 3;
+    cfg.dom0_usb[..3].copy_from_slice(&[2, 0, 5]);
+    h.cfg = Box::leak(cfg);
+    h.fail_usbs.push(0);
+    boot_dom0(&mut h);
+    assert!(h.started);
+    assert_eq!(h.usbs, [2, 5]);
+    // Console, control, the disk, the NIC and two controllers.
+    assert_eq!(h.guest.as_ref().unwrap().devices.len(), 6);
 }

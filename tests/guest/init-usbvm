@@ -1,0 +1,75 @@
+#!/bin/sh
+# Init of the guests tests/guest/init-usbtest gives a whole xHCI
+# controller: wait for the devices QEMU puts behind it (usb-l4h and the
+# class drivers are built in), check them, and power off.  The expected digests come on the command
+# line (usbsha=, usbsha2=, usbsha3= for the UAS disk).
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+fail() { echo "USBVM: FAIL: $*"; poweroff -f; }
+arg() { sed -n "s/.* $1=\([^ ]*\).*/\1/p" /proc/cmdline; }
+case " $(cat /proc/cmdline) " in
+*" usbabuse=1 "*)
+    # The hostile driver instead of usb-l4h, which lets go of the
+    # controller (and has usbd reset it) first.  It runs on load.
+    echo usb-l4h.0 > /sys/bus/platform/drivers/usb-l4h/unbind || fail "unbind usb-l4h"
+    insmod /bin/usbabuse.ko 2>/dev/null
+    dmesg | grep USBABUSE
+    dmesg | grep -q "USBABUSE: PASS" || fail "usbabuse"
+    echo "USBVM: PASS"
+    poweroff -f ;;
+esac
+[ -d /sys/bus/platform/drivers/usb-l4h/usb-l4h.0 ] || fail "usb-l4h has no controller"
+echo "USBVM: drivers loaded"
+# Every device QEMU attached: keyboard, tablet, a hub, a disk on the root
+# hub and one behind the hub, a UAS disk.
+want=$(arg usbdevs)
+for _ in $(seq 100); do
+    n=$(ls /sys/bus/usb/devices | grep -c -E '^[0-9]+-[0-9.]+$')
+    disks=$(ls -d /sys/block/sd* 2>/dev/null | wc -l)
+    [ "$n" -ge "$want" ] && [ "$disks" -ge 3 ] && break
+    sleep 0.2
+done
+echo "USBVM: $n devices"
+for d in /sys/bus/usb/devices/[0-9]*-*; do
+    case $d in *:*) continue ;; esac
+    echo "USBVM: device ${d##*/} $(cat "$d/idVendor"):$(cat "$d/idProduct") speed $(cat "$d/speed") $(cat "$d/product" 2>/dev/null)"
+done
+[ "$n" -ge "$want" ] || fail "only $n of $want devices"
+# The disks' contents, whatever the order they came in.
+sums=$(for b in /sys/block/sd*; do sha256sum "/dev/${b##*/}" | cut -d' ' -f1; done | sort | tr '\n' ' ')
+for s in $(arg usbsha) $(arg usbsha2) $(arg usbsha3); do
+    case " $sums" in *" $s "*) ;; *) fail "no disk with digest $s (got $sums)" ;; esac
+done
+echo "USBVM: disks read"
+# Write through the first disk and read it back past the page cache.
+dev=$(for b in /sys/block/sd*; do echo "/dev/${b##*/}"; done | head -1)
+# The next guest checks the digests again: put the original back.
+dd if="$dev" of=/tmp/orig bs=64k skip=64 count=64 iflag=direct 2>/dev/null || fail "read $dev"
+dd if=/dev/urandom of=/tmp/pat bs=64k count=64 2>/dev/null
+dd if=/tmp/pat of="$dev" bs=64k seek=64 oflag=direct 2>/dev/null || fail "write $dev"
+dd if="$dev" of=/tmp/back bs=64k skip=64 count=64 iflag=direct 2>/dev/null || fail "read $dev"
+cmp /tmp/pat /tmp/back || fail "readback $dev"
+dd if=/tmp/orig of="$dev" bs=64k seek=64 oflag=direct 2>/dev/null || fail "restore $dev"
+echo "USBVM: disk written"
+# HID: the keyboard and tablet are input devices.
+grep -q -i 'keyboard' /proc/bus/input/devices || fail "no USB keyboard"
+echo "USBVM: input devices ok"
+case " $(cat /proc/cmdline) " in
+*" usbreload=1 "*)
+    # The driver lets go of the controller and takes it again: usbd
+    # resets it, the devices enumerate again.
+    echo usb-l4h.0 > /sys/bus/platform/drivers/usb-l4h/unbind || fail "unbind usb-l4h"
+    for _ in $(seq 25); do [ -b /dev/sda ] || break; sleep 0.2; done
+    [ -b /dev/sda ] && fail "a disk outlived the unbind"
+    echo usb-l4h.0 > /sys/bus/platform/drivers/usb-l4h/bind || fail "bind usb-l4h"
+    for _ in $(seq 100); do [ -b /dev/sda ] && break; sleep 0.2; done
+    [ -b /dev/sda ] || fail "no disk after reload"
+    echo "USBVM: reload ok" ;;
+*" usbbusy=1 "*)
+    # Keep the disks busy until the guest is destroyed.
+    echo "USBVM: busy"
+    while :; do dd if=/dev/sda of=/dev/null bs=1M iflag=direct 2>/dev/null; done ;;
+esac
+echo "USBVM: PASS"
+poweroff -f

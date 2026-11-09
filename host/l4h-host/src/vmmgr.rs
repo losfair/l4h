@@ -138,6 +138,15 @@ pub const VMMGR_PENDING: u64 = 1 << 63;
 pub const MAX_PENDING: usize = 256;
 pub const PENDING_PER_CTRL: usize = 2;
 
+/// MR0 = guest, MR1 = its device index, MR2 = USB controller (CTL_USB_INFO
+/// index).  Root claims it if the firmware still has it (a CLAIM posted
+/// to its usbd, not waited for), and makes the queue area.  Exchange slot 0 = the CNode of its frames (radix
+/// usb::QUEUE_RADIX in root), slot 1 = usbd's kick.  MR1 = the guest's
+/// USB number n: the VMM raises the device's event on vmm_badge_usb(n).
+pub const VMMGR_USB_ATTACH: u64 = 0x107;
+/// Radix of the CNode of a USB controller's queue frames.
+pub const USB_QUEUE_RADIX: usize = 7;
+
 /// Radix of the CNode of a netd port's frames.
 pub const PORT_RADIX: usize = 10;
 
@@ -263,6 +272,9 @@ pub struct VmmgrConfig {
     pub dom0_disk: [Dom0Disk; DOM0_MAX_DISKS],
     pub dom0_nics: u64,
     pub dom0_nic: [Dom0Nic; DOM0_MAX_NICS],
+    /// USB controllers (CTL_USB_INFO indices) every dom0 gets.
+    pub dom0_usbs: u64,
+    pub dom0_usb: [u64; crate::usb::MAX_GUEST_USB],
     pub dom0_cmdline: [u8; l4h_abi::CMDLINE_SIZE],
 }
 const _: () = assert!(crate::CONFIG_OFFSET + core::mem::size_of::<VmmgrConfig>() <= crate::INFO_SIZE);

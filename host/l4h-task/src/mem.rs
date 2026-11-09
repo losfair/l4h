@@ -734,8 +734,9 @@ impl Alloc {
         }
     }
 
-    /// Undo a partly built arena: reclaim its memory and free its slots.
-    fn release(&mut self, arena: Arena) {
+    /// Undo a partly built arena, or one made outside any owner's slot
+    /// tracking: reclaim its memory and free its slots.
+    pub fn release(&mut self, arena: Arena) {
         self.reclaim_inner(arena, |_| false, true);
     }
 

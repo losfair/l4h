@@ -13,6 +13,7 @@ pub const ENOENT: i64 = 2;
 pub const EIO: i64 = 5;
 pub const EAGAIN: i64 = 11;
 pub const ENOMEM: i64 = 12;
+pub const ENODEV: i64 = 19;
 pub const EBUSY: i64 = 16;
 pub const EEXIST: i64 = 17;
 pub const EINVAL: i64 = 22;
@@ -95,6 +96,7 @@ pub fn host_op(h: &mut Host, op: u32, a: &[u64; 6], data: &mut [u8; abi::CTL_DAT
                 }
             }
         }
+        abi::CTL_USB_INFO => vals = crate::usb::info(a[0] as usize, data)?,
         abi::CTL_SWITCH_CREATE => vals[0] = h.netd.try_create_switch()? as u64,
         abi::CTL_SWITCH_ATTACH_UPLINK => h.netd.attach_uplink(a[0] as u32, a[1] as usize)?,
         abi::CTL_NIC_INFO => {

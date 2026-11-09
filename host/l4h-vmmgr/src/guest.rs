@@ -118,6 +118,9 @@ pub enum DevKind {
     Attest,
     /// Memory hotplug (abi::MemPage), written by l4h-vmm.
     Mem,
+    /// USB controller n (abi::usb): its queue area is usbd's, mapped at
+    /// abi::usb::area_va(n); `page` is a copy of its first frame.
+    Usb(u8),
 }
 
 pub struct GuestDev {
@@ -296,6 +299,8 @@ pub struct Guest {
     pub hp_count: usize,
     /// Its memory device (DevKind::Mem).
     pub mem_dev: Option<usize>,
+    /// USB controllers it has (DevKind::Usb).
+    pub usbs: usize,
 }
 
 pub(crate) fn abs(c: impl sel4::HasCPtrWithDepth) -> sel4::AbsoluteCPtr {
@@ -522,7 +527,7 @@ impl Guest {
         let self_va = match kind {
             DevKind::Ctl => Some(self_guest_va(self.id)),
             DevKind::Console => Some(self_guest_va(self.id) + PAGE),
-            DevKind::Virtio(_) | DevKind::Attest | DevKind::Mem => None,
+            DevKind::Virtio(_) | DevKind::Attest | DevKind::Mem | DevKind::Usb(_) => None,
         };
         if let Some(va) = self_va {
             self.map_in_self(alloc, page, va);
@@ -543,6 +548,36 @@ impl Guest {
             self.ctl_data = true;
         }
         self.devices.must_push(GuestDev { kind, page });
+        Some(d)
+    }
+
+    /// Add USB controller `n`: its queue area (frames in `frames`, radix
+    /// USB_QUEUE_RADIX) at abi::usb::area_va(n), the pages usbd writes
+    /// read-only, and usbd's kick.
+    pub fn add_usb(&mut self, alloc: &mut Alloc, n: usize, frames: cap::CNode, kick: cap::Notification) -> Option<usize> {
+        let d = self.devices.len();
+        if d >= MAX_GUEST_DEVICES || self.state != State::Created || n != self.usbs {
+            return None;
+        }
+        let vspace = self.vspace;
+        let mut first = None;
+        for p in 0..abi::usb::AREA_PAGES {
+            // Page 0 (usbd's info) and the CQ and EQ are usbd's to write.
+            let rw = matches!(p, 1..=67);
+            let rights = if rw { CapRights::read_write() } else { CapRights::read_only() };
+            let mut ctx = self.ctx(alloc);
+            let copy = ctx.alloc.slots.alloc();
+            abs(self_cap::<cap_type::Null>(copy))
+                .copy(&frames.absolute_cptr_from_bits_with_depth(p as u64, proto::USB_QUEUE_RADIX), CapRights::all())
+                .expect("USB queue frame copy");
+            map_frame(&mut ctx, vspace, self_cap::<cap_type::Granule>(copy), abi::usb::area_va(n) as usize + p * PAGE,
+                rights, VmAttributes::DEFAULT);
+            first.get_or_insert(self_cap::<cap_type::Granule>(copy));
+        }
+        let kick_slot = self.dev_cn.absolute_cptr_from_bits_with_depth(d as u64, abi::ROOT_CNODE_BITS);
+        kick_slot.copy(&abs(kick), CapRights::write_only()).expect("USB kick cap");
+        self.devices.must_push(GuestDev { kind: DevKind::Usb(n as u8), page: first? });
+        self.usbs += 1;
         Some(d)
     }
 
@@ -754,6 +789,11 @@ impl Guest {
                 DevKind::Virtio(id) => (abi::DEV_VIRTIO, id),
                 DevKind::Attest => (abi::DEV_ATTEST, 0),
                 DevKind::Mem => (abi::DEV_MEM, 0),
+                DevKind::Usb(_) => (abi::DEV_USB, 0),
+            };
+            let (page_va, page_size) = match dev.kind {
+                DevKind::Usb(n) => (abi::usb::area_va(n as usize), (abi::usb::AREA_PAGES * PAGE) as u64),
+                _ => (abi::dev_area_va(d), PAGE as u64),
             };
             let (data_va, data_size) = match dev.kind {
                 DevKind::Ctl => (abi::CTL_DATA_VA, abi::CTL_LOAD_MAX),
@@ -762,8 +802,8 @@ impl Guest {
             bi.devices[d] = abi::DevDesc {
                 ty,
                 virtio_id,
-                page_va: abi::dev_area_va(d),
-                page_size: PAGE as u64,
+                page_va,
+                page_size,
                 event: dev_event(d),
                 kick_slot: d as u32,
                 data_va,
@@ -1010,6 +1050,7 @@ pub fn create(
         hp_gpa,
         hp_count,
         mem_dev: None,
+        usbs: 0,
     };
 
     let Some(cnodes) = vmm::Cnodes::new(&mut g.arena, alloc, cfg.io_pool) else {

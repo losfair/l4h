@@ -11,7 +11,7 @@ pub mod shared;
 // One pool per guest device, one DMA allocation per controller/NIC, and
 // the balloon. Backends keep these records out of root's stack.
 pub const MAX_MAPPINGS: usize = crate::MAX_GUESTS * crate::vmmgr::MAX_GUEST_DEVICES
-    + pci::MAX_DISK_CTRLS + l4h_host::net::MAX_NICS + 1;
+    + pci::MAX_DISK_CTRLS + l4h_host::net::MAX_NICS + l4h_host::usb::MAX_USB_CTRLS + 1;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Domain {

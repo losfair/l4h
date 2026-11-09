@@ -328,6 +328,28 @@ impl Vmmgr {
         }
     }
 
+    /// Give guest `id` (before it starts) the whole USB controller `ctrl`
+    /// (DESIGN.md §9.7).  Root claims it on its first attachment.
+    pub fn attach_usb(&mut self, id: usize, ctrl: usize) -> Result<(), i64> {
+        if !self.can_afford(1 << 20, 0, 0) { return Err(ctl::ENOMEM); }
+        self.with_guest(id, |h, g| {
+            if g.state != State::Created || g.vmm.is_some() || g.root_pending {
+                return Err(ctl::EBUSY);
+            }
+            if g.devices.len() >= MAX_GUEST_DEVICES || g.usbs >= host::usb::MAX_GUEST_USB {
+                return Err(ctl::ENOSPC);
+            }
+            let d = g.devices.len();
+            let (frames, kick, n) = root::usb_attach(&mut h.alloc, id, d, ctrl)?;
+            assert_eq!(n, g.usbs, "root and vmmgr number USB controllers alike");
+            let added = g.add_usb(&mut h.alloc, n, frames, kick);
+            assert_eq!(added, Some(d), "guest device room checked");
+            g.backends.must_push((d, vmm::Backend::Usb { n }));
+            Ok(())
+        })
+        .ok_or(ctl::ENOENT)?
+    }
+
     /// Keep a failed boot disk's position without a channel or DMA access.
     pub fn attach_dummy_disk(&mut self, id: usize) -> Result<(), i64> {
         self.with_guest(id, |h, g| {
@@ -552,7 +574,7 @@ pub fn boot_dom0(h: &mut Vmmgr) {
     // Count the actual console/control, memory and attestation devices
     // before attaching anything. A placeholder still needs a device slot.
     let used = h.guest(id).unwrap().devices.len();
-    let total = used + h.cfg.dom0_disks as usize + h.cfg.dom0_nics as usize;
+    let total = used + h.cfg.dom0_disks as usize + h.cfg.dom0_nics as usize + h.cfg.dom0_usbs as usize;
     assert!(total <= MAX_GUEST_DEVICES,
         "dom0 device plan needs {} slots ({} built-in, {} disks, {} NICs); limit is {}",
         total, used, h.cfg.dom0_disks, h.cfg.dom0_nics, MAX_GUEST_DEVICES);
@@ -601,6 +623,11 @@ fn dom0_finish(h: &mut Vmmgr, id: usize) {
     for n in &h.cfg.dom0_nic[..h.cfg.dom0_nics as usize] {
         if let Err(e) = h.create_nic(id, n.switch as u32, n.mac, true, false) {
             l4h_rt::log!("l4h-vmmgr: cannot give dom0 a NIC on switch {}: error {}", n.switch, e);
+        }
+    }
+    for &c in &h.cfg.dom0_usb[..h.cfg.dom0_usbs as usize] {
+        if let Err(e) = h.attach_usb(id, c as usize) {
+            l4h_rt::log!("l4h-vmmgr: cannot give dom0 USB controller {}: error {}", c, e);
         }
     }
     let cmdline = &h.cfg.dom0_cmdline;

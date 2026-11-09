@@ -978,7 +978,7 @@ pub fn map_bar_mask(
 }
 
 /// The frames of BAR `b` of `d`, carved on first use and cached in `cache`.
-fn bar_frames(alloc: &mut Alloc, devmem: &mut DevMem, d: &pci::Device, cache: &mut BarCache, b: u8) -> Range<Slot> {
+pub fn bar_frames(alloc: &mut Alloc, devmem: &mut DevMem, d: &pci::Device, cache: &mut BarCache, b: u8) -> Range<Slot> {
     cache[b as usize]
         .get_or_insert_with(|| {
             let bar = d.bars[b as usize];

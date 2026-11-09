@@ -210,6 +210,15 @@ config L4H_RNG
 	  /dev/hw_random on the CPU's random number generator (RDRAND on
 	  x86_64), which Android's prng_seeder needs.
 
+config USB_L4H
+	tristate "USB host controllers driven by l4h-usbd"
+	depends on L4H_VIRTIO && USB
+	help
+	  Whole xHCI controllers the host assigns to this guest.  l4h-usbd
+	  drives the controller; this driver forwards the USB core's host
+	  controller operations and URBs to it, with buffers in the I/O
+	  pool.  The controller's ports form a USB 2 and a USB 3 root hub.
+
 endmenu
 
 config ARCH_SUSPEND_POSSIBLE

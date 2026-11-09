@@ -5,7 +5,7 @@
 
 #![no_std]
 
-pub const ABI_VERSION: u64 = 6;
+pub const ABI_VERSION: u64 = 7;
 
 pub const ROOT_CNODE_BITS: usize = 12;
 pub const L2_INDEX_BITS: usize = 18;
@@ -134,6 +134,7 @@ pub const DEV_CONSOLE: u32 = 2;
 pub const DEV_CTL: u32 = 3;
 pub const DEV_ATTEST: u32 = 4;
 pub const DEV_MEM: u32 = 5;
+pub const DEV_USB: u32 = 6;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -334,6 +335,13 @@ pub const CTL_STEER_DEL: u32 = 36;
 pub const CTL_STEER_LIST: u32 = 37;
 pub const CTL_PARTITION_INFO: u32 = 38;
 pub const CTL_BLK_ATTACH_EXTENTS: u32 = 39;
+pub const CTL_USB_INFO: u32 = 40;
+pub const CTL_USB_ATTACH: u32 = 41;
+pub const USB_STATE_FIRMWARE: u64 = 0;
+pub const USB_STATE_IDLE: u64 = 1;
+pub const USB_STATE_VM: u64 = 2;
+pub const USB_STATE_FAILED: u64 = 3;
+pub const USB_STATE_UNSUPPORTED: u64 = 4;
 /// Extents of a disk made of them (CTL_BLK_ATTACH_EXTENTS), and the least
 /// sectors of each when there are several.
 pub const BLK_MAX_EXTENTS: u64 = 4096;
@@ -479,3 +487,275 @@ const _: () = assert!(CTL_RESP_OFF + core::mem::size_of::<CtlResp>() <= 4096);
 const _: () = assert!(core::mem::size_of::<CtlVm>() == 56);
 const _: () = assert!(core::mem::size_of::<MemPage>() == 128);
 const _: () = assert!(HP_L1_GUARD == 3 && MAX_RAM_L1 << 30 >> HP_SHIFT == HP_MAX);
+
+/// USB host controllers (L4H_DEV_USB): the queue area shared by the guest
+/// and l4h-usbd.
+pub mod usb {
+    use super::SPECIAL_BASE;
+
+    pub const MAX_GUEST_USB: usize = 4;
+    pub const fn area_va(n: usize) -> u64 {
+        SPECIAL_BASE + 0x2800_0000 + n as u64 * 0x10_0000
+    }
+    pub const AREA_PAGES: usize = 101;
+    pub const MAGIC: u32 = 0x6273_756c;
+    pub const VERSION: u32 = 1;
+
+    pub const CTL_SQ_SIZE: usize = 32;
+    pub const XFER_SQ_SIZE: usize = 128;
+    pub const CQ_SIZE: usize = 256;
+    pub const EQ_SIZE: usize = 64;
+    pub const CTL_SQ_OFF: usize = 0x2000;
+    pub const XFER_SQ_OFF: usize = 0x4000;
+    pub const CQ_OFF: usize = 0x44000;
+    pub const EQ_OFF: usize = 0x64000;
+    pub const MAX_SEGS: usize = 64;
+    pub const MAX_ISO: usize = 48;
+    pub const MAX_PORTS: usize = 255;
+    pub const MAX_STREAMS: u32 = 16;
+
+    pub const F_ISOCH: u32 = 1 << 0;
+    pub const F_STREAMS: u32 = 1 << 1;
+    pub const F_CSZ: u32 = 1 << 2;
+
+    pub const READY: u32 = 1;
+    pub const RESETTING: u32 = 2;
+    pub const DEAD: u32 = 3;
+
+    #[repr(C)]
+    pub struct Index {
+        pub v: u32,
+        pub pad: [u32; 15],
+    }
+
+    #[repr(C)]
+    pub struct Info {
+        pub magic: u32,
+        pub version: u32,
+        pub features: u32,
+        pub state: u32,
+        pub max_slots: u32,
+        pub max_ports: u32,
+        pub usb2_ports: u32,
+        pub usb3_ports: u32,
+        pub max_streams: u32,
+        pub max_transfer: u32,
+        pub hci_version: u32,
+        pub reset_done: u32,
+        /// MFINDEX (bits 0..13) as usbd last read it, and a sequence
+        /// (bits 14..31) that is odd while usbd updates it with mf_ticks.
+        pub mfindex: u32,
+        pub hc_resets: u32,
+        /// The host counter (TSC, CNTVCT) when MFINDEX was read; 0: the
+        /// controller is not running.
+        pub mf_ticks: u64,
+        pub usbd_waiting: Index,
+        pub ctl_sq_tail: Index,
+        pub xfer_sq_tail: Index,
+        pub cq_head: Index,
+        pub eq_head: Index,
+        pub lost_events: Index,
+        pub port_proto: [u8; MAX_PORTS + 1],
+    }
+
+    #[repr(C)]
+    pub struct Ctrl {
+        pub ctl_sq_head: Index,
+        pub xfer_sq_head: Index,
+        pub cq_tail: Index,
+        pub eq_tail: Index,
+        pub reset_seq: Index,
+    }
+
+    pub const OP_PORT_GET: u32 = 1;
+    pub const OP_PORT_SET: u32 = 2;
+    pub const OP_PORT_CLEAR: u32 = 3;
+    pub const OP_SLOT_ENABLE: u32 = 4;
+    pub const OP_SLOT_DISABLE: u32 = 5;
+    pub const OP_ADDRESS: u32 = 6;
+    pub const OP_EP_CONFIG: u32 = 7;
+    pub const OP_HUB_CONFIG: u32 = 8;
+    pub const OP_EP0_MPS: u32 = 9;
+    pub const OP_DEV_RESET: u32 = 10;
+    pub const OP_EP_RESET: u32 = 11;
+    pub const OP_STREAMS_ALLOC: u32 = 12;
+    pub const OP_STREAMS_FREE: u32 = 13;
+    pub const OP_URB_CANCEL: u32 = 14;
+
+    pub const PF_POWER: u32 = 1;
+    pub const PF_RESET: u32 = 2;
+    pub const PF_WARM_RESET: u32 = 3;
+    pub const PF_LINK_STATE: u32 = 4;
+    pub const PF_ENABLE: u32 = 5;
+    pub const PF_WAKE: u32 = 6;
+    pub const PF_CHANGE: u32 = 7;
+
+    pub const SPEED_FULL: u32 = 1;
+    pub const SPEED_LOW: u32 = 2;
+    pub const SPEED_HIGH: u32 = 3;
+    pub const SPEED_SUPER: u32 = 4;
+    pub const SPEED_SUPER_PLUS: u32 = 5;
+
+    pub const EP_ISOC_OUT: u8 = 1;
+    pub const EP_BULK_OUT: u8 = 2;
+    pub const EP_INT_OUT: u8 = 3;
+    pub const EP_CONTROL: u8 = 4;
+    pub const EP_ISOC_IN: u8 = 5;
+    pub const EP_BULK_IN: u8 = 6;
+    pub const EP_INT_IN: u8 = 7;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default, Debug)]
+    pub struct Ep {
+        pub dci: u8,
+        pub ty: u8,
+        pub interval: u8,
+        pub burst_mult: u8,
+        pub max_packet: u16,
+        pub max_esit: u16,
+    }
+
+    pub const CTL_EPS: usize = 30;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub union CtlBody {
+        pub eps: [Ep; CTL_EPS],
+        pub arg: [u32; 60],
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct CtlReq {
+        pub op: u32,
+        pub tag: u32,
+        pub slot: u16,
+        pub port: u8,
+        pub n_eps: u8,
+        pub drop: u32,
+        pub body: CtlBody,
+    }
+
+    pub const XFER_CONTROL: u8 = 0;
+    pub const XFER_BULK: u8 = 1;
+    pub const XFER_INT: u8 = 2;
+    pub const XFER_ISOC: u8 = 3;
+
+    pub const XF_IN: u32 = 1 << 0;
+    pub const XF_ZERO_PACKET: u32 = 1 << 1;
+    pub const XF_SHORT_NOT_OK: u32 = 1 << 2;
+    pub const XF_ISO_ASAP: u32 = 1 << 3;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default, Debug)]
+    pub struct Seg {
+        pub gpa: u64,
+        pub len: u32,
+        pub reserved: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default, Debug)]
+    pub struct Iso {
+        pub offset: u32,
+        pub len: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct XferReq {
+        pub tag: u32,
+        pub slot: u16,
+        pub dci: u8,
+        pub ty: u8,
+        pub flags: u32,
+        pub stream: u32,
+        /// Ignored: usbd schedules isoch URBs (Cqe::start_frame).
+        pub start_frame: u32,
+        pub length: u32,
+        pub n_segs: u16,
+        pub n_iso: u16,
+        pub reserved0: u32,
+        pub setup: [u8; 8],
+        pub reserved: [u32; 6],
+        pub segs: [Seg; MAX_SEGS],
+        pub iso: [Iso; MAX_ISO],
+        pub pad: [u8; 2048 - 64 - 16 * MAX_SEGS - 8 * MAX_ISO],
+    }
+
+    pub const ST_OK: i32 = 0;
+    pub const ST_INVALID: i32 = -22;
+    pub const ST_NODEV: i32 = -19;
+    pub const ST_STALL: i32 = -32;
+    pub const ST_PROTO: i32 = -71;
+    pub const ST_BABBLE: i32 = -75;
+    pub const ST_SHORT: i32 = -121;
+    pub const ST_CANCELLED: i32 = -104;
+    pub const ST_SHUTDOWN: i32 = -108;
+    pub const ST_TIMEOUT: i32 = -62;
+    pub const ST_MISSED: i32 = -18;
+    pub const ST_NOSPC: i32 = -28;
+    pub const ST_IO: i32 = -5;
+    /// URB_CANCEL of an URB still in the transfer SQ: usbd skips its
+    /// record and never completes it (the guest gives it back).
+    pub const ST_DROPPED: i32 = -125;
+
+    pub const CQ_CTL: u32 = 1;
+    pub const CQ_XFER: u32 = 2;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default, Debug)]
+    pub struct IsoStatus {
+        pub status: i32,
+        pub actual: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct Cqe {
+        pub tag: u32,
+        pub kind: u32,
+        pub status: i32,
+        pub actual: u32,
+        /// Isoch: where usbd scheduled it (frames below high speed,
+        /// microframes from it, as Linux's xHCI driver).
+        pub start_frame: u32,
+        pub error_count: u32,
+        pub n_iso: u32,
+        pub val: [u32; 2],
+        pub reserved: [u32; 7],
+        pub iso: [IsoStatus; MAX_ISO],
+        pub pad: [u8; 512 - 64 - 8 * MAX_ISO],
+    }
+
+    pub const EV_PORT: u32 = 1;
+    pub const EV_HC_RESET: u32 = 2;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default, Debug)]
+    pub struct Event {
+        pub ty: u32,
+        pub port: u32,
+        pub portsc: u32,
+        pub reserved: [u32; 5],
+    }
+
+    pub const DEVOP_IRQ_VCPU: u64 = 5;
+
+    const _: () = assert!(core::mem::size_of::<Info>() <= 4096);
+    const _: () = assert!(core::mem::offset_of!(Info, mf_ticks) == 56 && core::mem::offset_of!(Info, usbd_waiting) == 64);
+    const _: () = assert!(core::mem::size_of::<Ctrl>() <= 4096);
+    const _: () = assert!(core::mem::size_of::<Ep>() == 8);
+    const _: () = assert!(core::mem::size_of::<CtlReq>() == 256);
+    const _: () = assert!(core::mem::size_of::<XferReq>() == 2048);
+    const _: () = assert!(core::mem::size_of::<Cqe>() == 512);
+    const _: () = assert!(core::mem::size_of::<Event>() == 32);
+    const _: () = assert!(CTL_SQ_OFF + CTL_SQ_SIZE * 256 == XFER_SQ_OFF);
+    const _: () = assert!(XFER_SQ_OFF + XFER_SQ_SIZE * 2048 == CQ_OFF);
+    const _: () = assert!(CQ_OFF + CQ_SIZE * 512 == EQ_OFF);
+    const _: () = assert!(EQ_OFF + EQ_SIZE * 32 <= AREA_PAGES * 4096);
+    const _: () = assert!(area_va(MAX_GUEST_USB) <= super::KMOD_VA);
+    const _: () = assert!(core::mem::offset_of!(XferReq, segs) == 64);
+    const _: () = assert!(core::mem::offset_of!(Cqe, iso) == 64);
+    const _: () = assert!(core::mem::offset_of!(Info, usbd_waiting) == 64);
+}

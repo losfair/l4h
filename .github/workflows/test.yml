@@ -150,6 +150,8 @@ jobs:
         run: tests/run-androidtest.sh
       - name: Display (virtio-gpu)
         run: tests/run-gputest.sh
+      - name: USB controller assignment (xHCI, MSI-X and MSI)
+        run: tests/run-usbtest.sh && USBTEST_HC=nec tests/run-usbtest.sh
       - name: Block pass-through (virtio-blk)
         run: tests/run-blktest.sh
       - name: Block pass-through (NVMe)

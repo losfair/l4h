@@ -1,0 +1,42 @@
+#!/bin/sh
+# dom0 of tests/run-usbtest.sh: the xHCI controller is the firmware's
+# until a guest gets it; a guest enumerates and uses its devices; destroy
+# during I/O leaves it to the next guest, which enumerates them again.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+fail() { echo "USBTEST: FAIL: $*"; poweroff -f; }
+slow=$(sed -n 's/.*L4H_TEST_SLOW=\([0-9]*\).*/\1/p' /proc/cmdline)
+slow=${slow:-1}
+arg() { sed -n "s/.* $1=\([^ ]*\).*/\1/p" /proc/cmdline; }
+cmd="console=hvc0 usbdevs=$(arg usbdevs) usbsha=$(arg usbsha) usbsha2=$(arg usbsha2) usbsha3=$(arg usbsha3)"
+l4hctl usb || fail "l4hctl usb"
+l4hctl usb | grep -q "usb 0: .*, firmware" || fail "the controller is not the firmware's before an attach"
+run() { # name, extra cmdline, what to wait for
+    id=$(l4hctl create "$1" --initrd /bin/usbvm.cpio.gz --mem 256 --vcpus 2 --usb "$(arg usbbdf)" \
+        --cmdline "$cmd $2") || fail "create $1"
+    l4hctl console "$id" --until "$3" --timeout "$((120 * slow))" > /tmp/out
+    ok=$?
+    grep USBVM /tmp/out
+    [ $ok = 0 ] || fail "$1: no '$3'"
+}
+run first usbreload=1 "USBVM: PASS"
+l4hctl usb | grep -q "usb 0: .*, vm $id" || fail "the controller is not vm $id's"
+l4hctl destroy "$id" || fail "destroy"
+l4hctl usb | grep -q "usb 0: .*, idle" || fail "the controller is not idle after destroy"
+# Destroy while the disks are busy, then a second guest.
+run busy usbbusy=1 "USBVM: busy"
+sleep 1
+l4hctl destroy "$id" || fail "destroy busy"
+l4hctl usb | grep -q "usb 0: .*, idle" || fail "not idle after destroy during I/O"
+run second "" "USBVM: PASS"
+l4hctl destroy "$id"
+# A hostile driver: usbd refuses its requests and keeps serving.
+run abuse usbabuse=1 "USBVM: PASS"
+l4hctl destroy "$id"
+l4hctl usb
+l4hctl usb | grep -q "usb 0: .*, idle, .*refused [1-9]" || fail "usbd counted no refused requests"
+run after-abuse "" "USBVM: PASS"
+l4hctl destroy "$id"
+echo "USBTEST: PASS"
+poweroff -f

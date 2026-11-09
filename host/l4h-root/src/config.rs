@@ -141,6 +141,12 @@ pub struct Config {
     pub iommu_intremap: bool,
     /// `host::TEST_INJECT` only: panic early in root's boot.
     pub test_early_panic: bool,
+    /// xHCI controllers (PCI addresses, comma-separated) every dom0 gets,
+    /// claimed when dom0 is created: none by default, so that the
+    /// firmware keeps every controller until an operator gives it away.
+    pub dom0_usb: [Option<u32>; l4h_host::usb::MAX_GUEST_USB],
+    /// `host::TEST_INJECT` only: usbd's legacy handoff times out.
+    pub test_usb_handoff_timeout: bool,
 }
 
 impl Config {
@@ -167,6 +173,8 @@ impl Config {
             iommu: parse_usize(option_env!("L4H_IOMMU"), 1) != 0,
             iommu_intremap: parse_usize(option_env!("L4H_IOMMU_INTREMAP"), 1) != 0,
             test_early_panic: false,
+            dom0_usb: [None; l4h_host::usb::MAX_GUEST_USB],
+            test_usb_handoff_timeout: false,
         };
         let Some(text) = text else { return c };
         let Ok(text) = core::str::from_utf8(text) else {
@@ -238,6 +246,22 @@ impl Config {
             "iommu" => flag(&mut self.iommu),
             "iommu_intremap" => flag(&mut self.iommu_intremap),
             "test_early_panic" => flag(&mut self.test_early_panic),
+            "test_usb_handoff_timeout" => flag(&mut self.test_usb_handoff_timeout),
+            "dom0_usb" => {
+                let mut list = [None; l4h_host::usb::MAX_GUEST_USB];
+                let mut n = 0;
+                for part in value.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                    match try_parse_bdf(part) {
+                        Some(b) if n < list.len() => {
+                            list[n] = Some(b);
+                            n += 1;
+                        }
+                        _ => return false,
+                    }
+                }
+                self.dom0_usb = list;
+                true
+            }
             "watchdog_secs" => num(&mut self.watchdog_secs),
             _ => false,
         }

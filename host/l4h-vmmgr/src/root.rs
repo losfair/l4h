@@ -13,7 +13,7 @@ use l4h_host as host;
 use l4h_host::fixed::ArrayVec;
 use l4h_host::trust;
 use l4h_host::vmmgr::{self as proto, VMMGR_DISK_ATTACH, VMMGR_GUEST_DEL, VMMGR_GUEST_NEW, VMMGR_HOST_OP, VMMGR_NIC_ADD, VMMGR_PENDING,
-    VMMGR_RESULT, VMMGR_TRUST_REGISTER};
+    VMMGR_RESULT, VMMGR_TRUST_REGISTER, VMMGR_USB_ATTACH};
 
 use crate::component::abs_of;
 use crate::guest::Guest;
@@ -155,6 +155,14 @@ pub fn nic_add(alloc: &mut Alloc, arena: &mut Arena, id: usize, d: usize, switch
     let chan = take(alloc, 0);
     let kick = take(alloc, 1);
     Ok(Backend::Net { chan, kick, mac: mac[2..8].try_into().unwrap(), keep: sel4::Cap::from_bits(keep as u64) })
+}
+
+/// USB controller `ctrl` for guest `id`'s device `d`: the CNode of its
+/// queue area's frames, usbd's kick, and the guest's USB number.
+pub fn usb_attach(alloc: &mut Alloc, id: usize, d: usize, ctrl: usize) -> Result<(cap::CNode, cap::Notification, usize), i64> {
+    call(VMMGR_USB_ATTACH, &[id as u64, d as u64, ctrl as u64])?;
+    let n = mr(1) as usize;
+    Ok((take(alloc, 0), take(alloc, 1), n))
 }
 
 /// Guest `g` starts: its reports describe it from now on.
