@@ -1,4 +1,4 @@
-From 65c2ad0d2532da3350adbb34c04d2bc673dbb287 Mon Sep 17 00:00:00 2001
+From 74390001e81ff0ef5111822026722429d7bebdb2 Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Mon, 9 Nov 2026 10:20:48 +0100
 Subject: [PATCH] x86/vcpu: VT-x guest accesses to CR8 always exit
@@ -24,7 +24,7 @@ always on, so a guest's CR8 is its VMCB's V_TPR.
  1 file changed, 2 insertions(+)
 
 diff --git a/src/arch/x86/object/vcpu.c b/src/arch/x86/object/vcpu.c
-index d4da9e197..6bad65cf7 100644
+index a7a35ba77..3445edc6c 100644
 --- a/src/arch/x86/object/vcpu.c
 +++ b/src/arch/x86/object/vcpu.c
 @@ -269,6 +269,8 @@ static bool_t BOOT_CODE init_vtx_fixed_values(bool_t useTrueMsrs)

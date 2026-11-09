@@ -1,4 +1,4 @@
-From fa58d9b45d8d5c059b9de12a6d6a22038e050ab3 Mon Sep 17 00:00:00 2001
+From ad6f67f7cacac11bfa1389b1399b6b86ca121426 Mon Sep 17 00:00:00 2001
 From: l4h <l4h@localhost>
 Date: Sun, 8 Nov 2026 19:30:53 +0100
 Subject: [PATCH] x86: AMD-V (SVM) behind the VCPU interface
@@ -33,8 +33,14 @@ VMs on both.  32-bit kernels keep VT-x only.
   they are must be canonical, and gPAT valid (seL4_InvalidArgument).
   ReadVMCS, WriteVMCS and the I/O port invocations are refused on AMD,
   and ReadVMCB and WriteVMCB on Intel (seL4_IllegalOperation).
+- An invocation on a VCPU whose thread is in guest mode on another core
+  first takes it out of guest mode there, as switchVCPU() does on VT-x:
+  the CPU owns a VMCB during VMRUN, and the exit writes the VCPU before
+  it takes the kernel lock.  A VCPU being deleted is forgotten on every
+  core it ran on, not only the last.
 - VMEnter has VT-x's MR layout, with SVM's fields in it (vmenter.h):
-  the misc1 intercepts, EVENTINJ, the exit code, EXITINFO1 and 2, the
+  the misc1 intercepts, EVENTINJ (its defined bits, as WriteVMCB
+  takes), the exit code, EXITINFO1 and 2, the
   instruction length from NEXT_RIP, the interrupt state, CR3 and
   EXITINTINFO.  ReadMSR and WriteMSR reach the syscall MSRs,
   KERNEL_GS_BASE and CR2 in the VMCB, and the VCPU's XCR0 (patch
@@ -42,7 +48,9 @@ VMs on both.  32-bit kernels keep VT-x only.
 - restore_svm() runs the guest with CLGI, STI, VMLOAD, VMRUN, then
   VMSAVE and a VMLOAD of the host's FS, GS, TR, LDTR and syscall MSRs,
   which each core saves the first time it runs a VCPU; only then, on
-  the kernel stack, STGI.  IF set at VMRUN is what makes a host
+  the kernel stack, STGI.  The exit finds the save area's address in
+  the VCPU's SVM state, not in its register array, which WriteRegisters
+  and WriteVMCB write.  IF set at VMRUN is what makes a host
   interrupt end guest mode, with V_INTR_MASKING always on.  The STI
   comes right after CLGI, not just before VMRUN: a VMRUN that exits
   while delivering EVENTINJ would leave the STI shadow in the guest's
@@ -73,8 +81,8 @@ VMs on both.  32-bit kernels keep VT-x only.
   have loaded the changed fields, so they stay dirty for the next.
 ---
  include/arch/x86/arch/model/statedata.h       |   7 +
- include/arch/x86/arch/object/svm.h            | 154 +++
- include/arch/x86/arch/object/vcpu.h           |  34 +
+ include/arch/x86/arch/object/svm.h            | 158 +++
+ include/arch/x86/arch/object/vcpu.h           |  42 +
  .../x86/interfaces/object-api-arch.xml        |  50 +
  libsel4/arch_include/x86/sel4/arch/vmenter.h  |  12 +-
  src/arch/x86/64/c_traps.c                     |   3 +
@@ -83,9 +91,9 @@ VMs on both.  32-bit kernels keep VT-x only.
  src/arch/x86/config.cmake                     |   1 +
  src/arch/x86/kernel/ept.c                     |  21 +-
  src/arch/x86/model/statedata.c                |   6 +
- src/arch/x86/object/svm.c                     | 946 ++++++++++++++++++
- src/arch/x86/object/vcpu.c                    |  69 +-
- 13 files changed, 1301 insertions(+), 29 deletions(-)
+ src/arch/x86/object/svm.c                     | 969 ++++++++++++++++++
+ src/arch/x86/object/vcpu.c                    |  93 +-
+ 13 files changed, 1352 insertions(+), 37 deletions(-)
  create mode 100644 include/arch/x86/arch/object/svm.h
  create mode 100644 src/arch/x86/object/svm.c
 
@@ -109,10 +117,10 @@ index 9a1aee2b6..8306413de 100644
  NODE_STATE_END(archNodeState);
 diff --git a/include/arch/x86/arch/object/svm.h b/include/arch/x86/arch/object/svm.h
 new file mode 100644
-index 000000000..b9e6530f8
+index 000000000..80a37aaad
 --- /dev/null
 +++ b/include/arch/x86/arch/object/svm.h
-@@ -0,0 +1,154 @@
+@@ -0,0 +1,158 @@
 +/*
 + * SPDX-License-Identifier: GPL-2.0-only
 + */
@@ -221,6 +229,9 @@ index 000000000..b9e6530f8
 +    word_t last_cpu;
 +    /* NEXT_RIP - RIP of the last exit, or 0 when the CPU gave none. */
 +    word_t instr_len;
++    /* The host save area restore_svm()'s exit path VMLOADs: here, and not
++     * in gp_registers, which WriteRegisters and WriteVMCB write. */
++    word_t host_area;
 +};
 +
 +struct vcpu;
@@ -237,6 +248,7 @@ index 000000000..b9e6530f8
 +void svm_reply_to_user(struct tcb *tcb, struct vcpu *vcpu);
 +exception_t svm_handle_exit(void);
 +void svm_invalidate_local(void);
++void svm_claim_vcpu(struct vcpu *vcpu);
 +void NORETURN restore_svm(struct tcb *cur_thread, struct vcpu *vcpu);
 +
 +/* A nested page table entry, from the EPT entry ept.c builds: the same
@@ -268,7 +280,7 @@ index 000000000..b9e6530f8
 +
 +#endif /* CONFIG_VTX */
 diff --git a/include/arch/x86/arch/object/vcpu.h b/include/arch/x86/arch/object/vcpu.h
-index c5012d988..44da90d64 100644
+index c5012d988..d19f214a5 100644
 --- a/include/arch/x86/arch/object/vcpu.h
 +++ b/include/arch/x86/arch/object/vcpu.h
 @@ -8,6 +8,20 @@
@@ -302,18 +314,26 @@ index c5012d988..44da90d64 100644
  };
  typedef struct vcpu vcpu_t;
  
-@@ -424,8 +441,25 @@ void VMCheckBoundNotification(tcb_t *tcb);
+@@ -424,8 +441,33 @@ void VMCheckBoundNotification(tcb_t *tcb);
  #endif /* ENABLE_SMP_SUPPORT */
  
  void invept(ept_pml4e_t *ept_pml4);
 +#define HOST_XCR0 ((uint64_t)config_ternary(CONFIG_XSAVE, CONFIG_XSAVE_FEATURE_SET, 1))
 +
++#define XCR0_AVX512 (MASK(3) << 5)
++
 +/* A value XSETBV accepts for the guest: XSETBV runs in kernel mode, where
-+ * any other would fault. */
++ * any other would fault.  x87 is on, AVX needs SSE, AVX-512's three
++ * components go together and need AVX, and MPX's two and AMX's two each go
++ * together, whatever KernelXSaveFeatureSet enables. */
 +static inline bool_t CONST validGuestXCR0(uint64_t xcr0)
 +{
 +    return (xcr0 & ~HOST_XCR0) == 0 && (xcr0 & BIT(0)) &&
-+           (!(xcr0 & BIT(2)) || (xcr0 & BIT(1)));
++           (!(xcr0 & BIT(2)) || (xcr0 & BIT(1))) &&
++           ((xcr0 & XCR0_AVX512) == 0 ||
++            ((xcr0 & XCR0_AVX512) == XCR0_AVX512 && (xcr0 & BIT(2)))) &&
++           !(xcr0 & BIT(3)) == !(xcr0 & BIT(4)) &&
++           !(xcr0 & BIT(17)) == !(xcr0 & BIT(18));
 +}
 +
  void vcpu_load_guest_xcr0(vcpu_t *vcpu);
@@ -390,7 +410,7 @@ index 68aa387ee..ce1bad98e 100644
              <condition><config var="CONFIG_VTX"/></condition>
              <brief>
 diff --git a/libsel4/arch_include/x86/sel4/arch/vmenter.h b/libsel4/arch_include/x86/sel4/arch/vmenter.h
-index a1f5f3045..8ea2d0d01 100644
+index 2f82c8fe8..de1f9f21b 100644
 --- a/libsel4/arch_include/x86/sel4/arch/vmenter.h
 +++ b/libsel4/arch_include/x86/sel4/arch/vmenter.h
 @@ -7,6 +7,16 @@
@@ -496,7 +516,7 @@ index 252684bbf..64852a025 100644
           kernel/apic.c
           kernel/xapic.c
 diff --git a/src/arch/x86/kernel/ept.c b/src/arch/x86/kernel/ept.c
-index 557b4c988..bd19ecc9a 100644
+index cbfbfa38c..b896766b3 100644
 --- a/src/arch/x86/kernel/ept.c
 +++ b/src/arch/x86/kernel/ept.c
 @@ -11,6 +11,7 @@
@@ -507,7 +527,7 @@ index 557b4c988..bd19ecc9a 100644
  
  struct lookupEPTPDPTSlot_ret {
      exception_t status;
-@@ -190,6 +191,14 @@ static ept_cache_options_t eptCacheFromVmAttr(vm_attributes_t vmAttr)
+@@ -194,6 +195,14 @@ static ept_cache_options_t eptCacheFromVmAttr(vm_attributes_t vmAttr)
      return option;
  }
  
@@ -522,7 +542,7 @@ index 557b4c988..bd19ecc9a 100644
  static inline ept_pte_t CONST makeEPTPTEInvalid(void)
  {
      return ept_pte_new(0, 0, 0, 0, 0, 0, 0);
-@@ -295,7 +304,7 @@ static exception_t performEPTPDPTInvocationMap(cap_t cap, cte_t *cte, ept_pml4e_
+@@ -299,7 +308,7 @@ static exception_t performEPTPDPTInvocationMap(cap_t cap, cte_t *cte, ept_pml4e_
                                                 ept_pml4e_t *pml4)
  {
      cte->cap = cap;
@@ -531,7 +551,7 @@ index 557b4c988..bd19ecc9a 100644
      /* Over a not-present entry, which no TLB holds (SDM 29.3.2): no invept. */
  
      return EXCEPTION_NONE;
-@@ -498,7 +507,7 @@ static exception_t performEPTPDInvocationMap(cap_t cap, cte_t *cte, ept_pdpte_t
+@@ -502,7 +511,7 @@ static exception_t performEPTPDInvocationMap(cap_t cap, cte_t *cte, ept_pdpte_t
                                               ept_pml4e_t *pml4)
  {
      cte->cap = cap;
@@ -540,7 +560,7 @@ index 557b4c988..bd19ecc9a 100644
      /* Over a not-present entry, which no TLB holds (SDM 29.3.2): no invept. */
  
      return EXCEPTION_NONE;
-@@ -685,7 +694,7 @@ static exception_t performEPTPTInvocationUnmap(cap_t cap, cte_t *cte)
+@@ -689,7 +698,7 @@ static exception_t performEPTPTInvocationUnmap(cap_t cap, cte_t *cte)
  static exception_t performEPTPTInvocationMap(cap_t cap, cte_t *cte, ept_pde_t pde, ept_pde_t *pdSlot, ept_pml4e_t *pml4)
  {
      cte->cap = cap;
@@ -549,7 +569,7 @@ index 557b4c988..bd19ecc9a 100644
      /* Over a not-present entry, which no TLB holds (SDM 29.3.2): no invept. */
  
      return EXCEPTION_NONE;
-@@ -805,7 +814,7 @@ exception_t decodeX86EPTPTInvocation(
+@@ -809,7 +818,7 @@ exception_t decodeX86EPTPTInvocation(
  
  static exception_t performEPTPageMapPTE(cap_t cap, cte_t *cte, ept_pte_t *ptSlot, ept_pte_t pte, ept_pml4e_t *pml4)
  {
@@ -558,7 +578,7 @@ index 557b4c988..bd19ecc9a 100644
      cte->cap = cap;
      /* Over a not-present entry, which no TLB holds (SDM 29.3.2): no invept. */
  
-@@ -815,9 +824,9 @@ static exception_t performEPTPageMapPTE(cap_t cap, cte_t *cte, ept_pte_t *ptSlot
+@@ -819,9 +828,9 @@ static exception_t performEPTPageMapPTE(cap_t cap, cte_t *cte, ept_pte_t *ptSlot
  static exception_t performEPTPageMapPDE(cap_t cap, cte_t *cte, ept_pde_t *pdSlot, ept_pde_t pde1, ept_pde_t pde2,
                                          ept_pml4e_t *pml4)
  {
@@ -590,10 +610,10 @@ index da0b07c6f..c34ff5567 100644
  #ifdef CONFIG_PRINTING
 diff --git a/src/arch/x86/object/svm.c b/src/arch/x86/object/svm.c
 new file mode 100644
-index 000000000..f21a703d1
+index 000000000..6bef19574
 --- /dev/null
 +++ b/src/arch/x86/object/svm.c
-@@ -0,0 +1,946 @@
+@@ -0,0 +1,969 @@
 +/*
 + * SPDX-License-Identifier: GPL-2.0-only
 + */
@@ -638,6 +658,7 @@ index 000000000..f21a703d1
 +#include <arch/object/vcpu.h>
 +#include <arch/object/svm.h>
 +#include <arch/kernel/ept.h>
++#include <arch/smp/ipi_inline.h>
 +#include <util.h>
 +#include <sel4/arch/vmenter.h>
 +
@@ -713,6 +734,8 @@ index 000000000..f21a703d1
 +#define SVM_CR_FORCED  BIT(16 + 4)
 +
 +#define SVM_INT_CTL_WRITABLE    (MASK(9) | (MASK(4) << 16) | BIT(20))
++/* EVENTINJ: vector, type, EV and V, and the error code. */
++#define SVM_EVENT_INJ_WRITABLE  0xffffffff80000fffull
 +#define SVM_V_INTR_MASKING      BIT(24)
 +#define SVM_NP_ENABLE           BIT(0)
 +#define SVM_TLB_FLUSH_ALL       1
@@ -881,6 +904,9 @@ index 000000000..f21a703d1
 +    vcpu->entry_intr = 0;
 +    vcpu->xcr0 = HOST_XCR0;
 +    vcpu->svm.last_cpu = CURRENT_CPU_INDEX();
++#ifdef ENABLE_SMP_SUPPORT
++    vcpu->last_cpu = CURRENT_CPU_INDEX();
++#endif
 +
 +    memzero(vcpu->vmcs, VCPU_VMCS_SIZE);
 +    *vmcb_u32(vcpu, VMCB_INTERCEPT_CR) = SVM_CR_FORCED;
@@ -969,7 +995,7 @@ index 000000000..f21a703d1
 +        f->writable = BIT(0);
 +        return true;
 +    case VMCB_EVENT_INJ:         /* the CPU checks the event */
-+        f->writable = 0xffffffff80000fffull;
++        f->writable = SVM_EVENT_INJ_WRITABLE;
 +        return true;
 +    case VMCB_NEXT_RIP:          /* for soft interrupts and exceptions */
 +        return true;
@@ -1237,9 +1263,26 @@ index 000000000..f21a703d1
 +}
 +#endif /* CONFIG_X86_64_VTX_64BIT_GUESTS */
 +
++/*
++ * A VCPU whose thread is in guest mode on another core leaves it there, as
++ * switchVCPU() makes it on VT-x, before an invocation reads or writes it:
++ * the CPU owns a VMCB during VMRUN, and the exit path writes the VCPU
++ * before it takes the kernel lock.  That core then waits for the lock.
++ */
++void svm_claim_vcpu(vcpu_t *vcpu)
++{
++#ifdef ENABLE_SMP_SUPPORT
++    if (vcpu->last_cpu != getCurrentCPUIndex() &&
++        ARCH_NODE_STATE_ON_CORE(x86KSCurrentVCPU, vcpu->last_cpu) == vcpu) {
++        doRemoteClearCurrentVCPU(vcpu->last_cpu);
++    }
++#endif
++}
++
 +exception_t svm_decodeVCPUInvocation(word_t invLabel, word_t length, cap_t cap,
 +                                     bool_t call, word_t *buffer)
 +{
++    svm_claim_vcpu(VCPU_PTR(cap_vcpu_cap_get_capVCPUPtr(cap)));
 +    switch (invLabel) {
 +    case X86VCPUReadVMCB:
 +        return decodeReadVMCB(cap, length, call, buffer);
@@ -1271,7 +1314,7 @@ index 000000000..f21a703d1
 +        vcpu->svm.dirty |= VMCB_CLEAN_I;
 +    }
 +    vcpu->ppc = misc1;
-+    intr = getSyscallArg(2, buffer);
++    intr = getSyscallArg(2, buffer) & (uint32_t)SVM_EVENT_INJ_WRITABLE;
 +    *vmcb_u32(vcpu, VMCB_EVENT_INJ) = intr;
 +    vcpu->entry_intr = intr;
 +}
@@ -1472,8 +1515,7 @@ index 000000000..f21a703d1
 +    __atomic_fetch_or(&x86KSVMXCores, BIT(cpu), __ATOMIC_SEQ_CST);
 +#endif
 +    *vmcb_word(vcpu, VMCB_RAX) = vcpu->gp_registers[VCPU_EAX];
-+    /* restore_svm's exit path finds the host's VMLOAD area there. */
-+    vcpu->gp_registers[VCPU_EAX] = host;
++    vcpu->svm.host_area = host;
 +
 +    asm volatile(
 +        /* No interrupt or NMI until the host state is back.  With
@@ -1517,7 +1559,7 @@ index 000000000..f21a703d1
 +        "pushq %%rcx\n"
 +        "pushq %%rbx\n"
 +        "vmsave %%rax\n"
-+        "movq -8(%%rsp), %%rax\n"
++        "movq %c[host_area](%%rsp), %%rax\n"
 +        "vmload %%rax\n"
 +        /* GS is the kernel's again: to the stack, and only then STGI, as
 +         * an NMI held since the exit comes now. */
@@ -1530,7 +1572,8 @@ index 000000000..f21a703d1
 +        "call c_handle_vmexit\n"
 +        :
 +        : "a"(vmcb), [regs]"r"(&vcpu->gp_registers[VCPU_EAX + 1]),
-+        [stack_size]"i"(BIT(CONFIG_KERNEL_STACK_BITS))
++        [stack_size]"i"(BIT(CONFIG_KERNEL_STACK_BITS)),
++        [host_area]"i"(OFFSETOF(vcpu_t, svm.host_area) - OFFSETOF(vcpu_t, gp_registers[VCPU_EAX + 1]))
 +#ifdef ENABLE_SMP_SUPPORT
 +        , [stack_offset]"i"(OFFSETOF(nodeInfo_t, stackTop))
 +#endif
@@ -1541,7 +1584,7 @@ index 000000000..f21a703d1
 +
 +#endif /* CONFIG_VTX && CONFIG_ARCH_X86_64 */
 diff --git a/src/arch/x86/object/vcpu.c b/src/arch/x86/object/vcpu.c
-index 411a5e555..8edfb9f22 100644
+index 43bf26268..fd2b55d4e 100644
 --- a/src/arch/x86/object/vcpu.c
 +++ b/src/arch/x86/object/vcpu.c
 @@ -47,7 +47,7 @@ typedef struct msr_bitmaps {
@@ -1575,24 +1618,32 @@ index 411a5e555..8edfb9f22 100644
          vcpu->launched = false;
          ARCH_NODE_STATE(x86KSCurrentVCPU) = NULL;
          if (vcpu->fpu_active && vcpu->vcpuTCB) {
-@@ -473,16 +475,6 @@ static inline uint32_t applyPrimaryControls(uint32_t value)
+@@ -473,24 +475,6 @@ static inline uint32_t applyPrimaryControls(uint32_t value)
                            primary_control_low & (primary_control_high | PRIMARY_CONTROLS_ALLOWED));
  }
  
 -#define HOST_XCR0 ((uint64_t)config_ternary(CONFIG_XSAVE, CONFIG_XSAVE_FEATURE_SET, 1))
 -
+-#define XCR0_AVX512 (MASK(3) << 5)
+-
 -/* A value XSETBV accepts for the guest: XSETBV runs in kernel mode, where
-- * any other would fault. */
+- * any other would fault.  x87 is on, AVX needs SSE, AVX-512's three
+- * components go together and need AVX, and MPX's two and AMX's two each go
+- * together, whatever KernelXSaveFeatureSet enables. */
 -static inline bool_t CONST validGuestXCR0(uint64_t xcr0)
 -{
 -    return (xcr0 & ~HOST_XCR0) == 0 && (xcr0 & BIT(0)) &&
--           (!(xcr0 & BIT(2)) || (xcr0 & BIT(1)));
+-           (!(xcr0 & BIT(2)) || (xcr0 & BIT(1))) &&
+-           ((xcr0 & XCR0_AVX512) == 0 ||
+-            ((xcr0 & XCR0_AVX512) == XCR0_AVX512 && (xcr0 & BIT(2)))) &&
+-           !(xcr0 & BIT(3)) == !(xcr0 & BIT(4)) &&
+-           !(xcr0 & BIT(17)) == !(xcr0 & BIT(18));
 -}
 -
  void vcpu_load_guest_xcr0(vcpu_t *vcpu)
  {
  #ifdef CONFIG_XSAVE
-@@ -503,6 +495,12 @@ void vcpu_load_host_xcr0(vcpu_t *vcpu)
+@@ -511,6 +495,12 @@ void vcpu_load_host_xcr0(vcpu_t *vcpu)
  
  void vcpu_init(vcpu_t *vcpu)
  {
@@ -1605,7 +1656,25 @@ index 411a5e555..8edfb9f22 100644
      vcpu->vcpuTCB = NULL;
      vcpu->launched = false;
      vcpu->fpu_active = false;
-@@ -1238,6 +1236,15 @@ static exception_t decodeSetTCB(cap_t cap, word_t length, word_t *buffer)
+@@ -632,6 +622,17 @@ static void dissociateVcpuTcb(tcb_t *tcb, vcpu_t *vcpu)
+ 
+ void vcpu_finalise(vcpu_t *vcpu)
+ {
++#if defined(CONFIG_ARCH_X86_64) && defined(ENABLE_SMP_SUPPORT)
++    if (x86KSSVMEnabled) {
++        /* restore_svm() leaves a core the VCPU moved away from naming it
++         * still: forget it there too before it is freed. */
++        for (word_t i = 0; i < CONFIG_MAX_NUM_NODES; i++) {
++            if (i != vcpu->last_cpu && ARCH_NODE_STATE_ON_CORE(x86KSCurrentVCPU, i) == vcpu) {
++                ARCH_NODE_STATE_ON_CORE(x86KSCurrentVCPU, i) = NULL;
++            }
++        }
++    }
++#endif
+     if (ARCH_NODE_STATE_ON_CORE(x86KSCurrentVCPU, vcpu->last_cpu) == vcpu) {
+ #ifdef ENABLE_SMP_SUPPORT
+         if (vcpu->last_cpu != getCurrentCPUIndex()) {
+@@ -1246,6 +1247,15 @@ static exception_t decodeSetTCB(cap_t cap, word_t length, word_t *buffer)
  void vcpu_update_state_sysvmenter(vcpu_t *vcpu)
  {
      word_t *buffer;
@@ -1621,7 +1690,7 @@ index 411a5e555..8edfb9f22 100644
      if (ARCH_NODE_STATE(x86KSCurrentVCPU) != vcpu) {
          switchVCPU(vcpu);
      }
-@@ -1277,6 +1284,13 @@ void vcpu_sysvmenter_reply_to_user(tcb_t *tcb)
+@@ -1285,6 +1295,13 @@ void vcpu_sysvmenter_reply_to_user(tcb_t *tcb)
  
      assert(vcpu);
  
@@ -1635,16 +1704,21 @@ index 411a5e555..8edfb9f22 100644
      if (ARCH_NODE_STATE(x86KSCurrentVCPU) != vcpu) {
          switchVCPU(vcpu);
      }
-@@ -1298,6 +1312,8 @@ exception_t decodeX86VCPUInvocation(
+@@ -1306,6 +1323,13 @@ exception_t decodeX86VCPUInvocation(
      switch (invLabel) {
      case X86VCPUSetTCB:
          return decodeSetTCB(cap, length, buffer);
 +    case X86VCPUWriteRegisters:
++#ifdef CONFIG_ARCH_X86_64
++        if (x86KSSVMEnabled) {
++            svm_claim_vcpu(VCPU_PTR(cap_vcpu_cap_get_capVCPUPtr(cap)));
++        }
++#endif
 +        return decodeVCPUWriteRegisters(cap, length, buffer);
      case X86VCPUFlushTLB: {
          vcpu_t *vcpu = VCPU_PTR(cap_vcpu_cap_get_capVCPUPtr(cap));
  
-@@ -1307,6 +1323,13 @@ exception_t decodeX86VCPUInvocation(
+@@ -1315,6 +1339,13 @@ exception_t decodeX86VCPUInvocation(
          }
          return EXCEPTION_NONE;
      }
@@ -1658,7 +1732,7 @@ index 411a5e555..8edfb9f22 100644
      case X86VCPUReadVMCS:
          return decodeReadVMCS(cap, length, call, buffer);
      case X86VCPUWriteVMCS:
-@@ -1315,8 +1338,6 @@ exception_t decodeX86VCPUInvocation(
+@@ -1323,8 +1354,6 @@ exception_t decodeX86VCPUInvocation(
          return decodeEnableIOPort(cap, length, buffer);
      case X86VCPUDisableIOPort:
          return decodeDisableIOPort(cap, length, buffer);
@@ -1667,7 +1741,7 @@ index 411a5e555..8edfb9f22 100644
  #ifdef CONFIG_X86_64_VTX_64BIT_GUESTS
      case X86VCPUWriteMSR:
          return decodeVCPUWriteMSR(cap, length, buffer);
-@@ -1437,6 +1458,11 @@ static BOOT_CODE bool_t vtx_try_init(void)
+@@ -1445,6 +1474,11 @@ static BOOT_CODE bool_t vtx_try_init(void)
  
  BOOT_CODE bool_t vtx_init(void)
  {
@@ -1679,7 +1753,7 @@ index 411a5e555..8edfb9f22 100644
      if (CURRENT_CPU_INDEX() != 0) {
          /* Secondary cores follow the boot core, which runs first: none
           * uses VT-x without it, and each must match it when it does. */
-@@ -1576,6 +1602,11 @@ exception_t handleVmexit(void)
+@@ -1584,6 +1618,11 @@ exception_t handleVmexit(void)
      /* qualification is host width, reason is defined as being 32 bit */
      word_t qualification;
      uint32_t reason;
@@ -1691,7 +1765,7 @@ index 411a5e555..8edfb9f22 100644
      finishVmexitSaving();
      /* the basic exit reason is the bottom 16 bits of the exit reason field */
      reason = vmread(VMX_DATA_EXIT_REASON) & MASK(16);
-@@ -1854,6 +1885,12 @@ void restoreVMCS(void)
+@@ -1862,6 +1901,12 @@ void restoreVMCS(void)
  
  void invalidateLocalEPT(ept_pml4e_t *ept_pml4)
  {
