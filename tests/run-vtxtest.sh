@@ -40,7 +40,7 @@ kernel=$root/build/sel4${variant:+-$variant}/bin/kernel.elf
 out=$root/build/vtxtest${variant:+-$variant}
 mkdir -p "$out"
 gcc -O2 -static -nostdlib -ffreestanding -fno-pic -no-pie -fno-stack-protector \
-    -fcf-protection=none -mno-red-zone -mfsgsbase -I"$inc" -I"$inc/sel4" \
+    -fcf-protection=none -mno-red-zone -I"$inc" -I"$inc/sel4" \
     -Wl,-z,max-page-size=4096 -Wl,-e,_start -Wl,--build-id=none \
     -o "$out/vtxprobe.elf" "$root/tests/vtxprobe.c"
 objcopy -O elf32-i386 "$kernel" "$out/kernel32.elf"
@@ -90,7 +90,7 @@ if [ "$mode" = on ] && [ "$virt" = svm ]; then
     grep -aq 'vtxprobe: svm_forced_intercepts ok' "$log" || fail "an intercept seL4 needs was cleared"
     grep -aq 'vtxprobe: svm_forced_invd ok' "$log" || fail "the INVD intercept was cleared"
     grep -aq 'vtxprobe: svm_owned_field err=3' "$log" || fail "a kernel-owned VMCB field was written"
-    for step in asid map bind io npf invd hlt invalid dirty_kept inject_exit; do
+    for step in asid map bind io npf invd hlt tls_base invalid dirty_kept inject_exit; do
         grep -aq "vtxprobe: svm_$step ok" "$log" || fail "the guest failed at svm_$step"
     done
 fi

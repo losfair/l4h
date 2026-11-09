@@ -10,6 +10,7 @@
 
 __thread seL4_IPCBuffer *__sel4_ipc_buffer;
 static char tls[4096] __attribute__((aligned(64)));
+static char tls2[4096] __attribute__((aligned(64)));
 char vtxprobe_stack[16384] __attribute__((aligned(16)));
 
 static void puts_(const char *s)
@@ -86,6 +87,7 @@ static void svm_probe(seL4_BootInfo *bi, seL4_CPtr ut, seL4_CPtr vcpu, seL4_CPtr
     seL4_CPtr pdpt = free, pd = free + 1, frame = free + 2, copy = free + 3;
     seL4_CPtr vpdpt = free + 4, vpd = free + 5, vpt = free + 6;
     unsigned long va = 0x8000000000ul;
+    unsigned long tp = (unsigned long)(tls + sizeof(tls) - 64), tp2, fs;
     seL4_X86_VCPU_WriteVMCB_t w;
     seL4_MessageInfo_t tag;
     seL4_Word badge;
@@ -149,6 +151,22 @@ static void svm_probe(seL4_BootInfo *bi, seL4_CPtr ut, seL4_CPtr vcpu, seL4_CPtr
     check("svm_hlt", seL4_VMEnter(&badge) == SEL4_VMENTER_RESULT_FAULT &&
           seL4_GetMR(SEL4_VMENTER_FAULT_REASON_MR) == SVM_EXIT_HLT);
 
+    /* An exit's VMLOAD restores the FS base the kernel's host area was
+     * saved with, at the first VMRUN: a TLS base set since must still be
+     * this thread's after an exit (with KernelFSGSBase=msr, the kernel
+     * skips the WRMSR of a base it thinks is loaded already). */
+    for (unsigned int i = 0; i < sizeof(tls); i++)
+        tls2[i] = tls[i];
+    tp2 = (unsigned long)(tls2 + sizeof(tls2) - 64);
+    *(unsigned long *)tp2 = tp2;
+    ok = seL4_TCB_SetTLSBase(seL4_CapInitThreadTCB, tp2) == seL4_NoError;
+    seL4_SetMR(SEL4_VMENTER_CALL_EIP_MR, 9);
+    ok = ok && seL4_VMEnter(&badge) == SEL4_VMENTER_RESULT_FAULT &&
+         seL4_GetMR(SEL4_VMENTER_FAULT_REASON_MR) == SVM_EXIT_HLT;
+    __asm__ volatile("mov %%fs:0, %0" : "=r"(fs));
+    check("svm_tls_base", ok && fs == tp2);
+    seL4_TCB_SetTLSBase(seL4_CapInitThreadTCB, tp);
+
     /* A VMRUN that fails its checks may load nothing: an IDTR written
      * before it is still not clean for the next VMRUN, which runs. */
     seL4_X86_VCPU_WriteVMCB(vcpu, VMCB_IDTR + 8, 0x1000);
@@ -183,10 +201,11 @@ static void svm_probe(seL4_BootInfo *bi, seL4_CPtr ut, seL4_CPtr vcpu, seL4_CPtr
 
 void vtxprobe_main(seL4_BootInfo *bi)
 {
-    /* libsel4 keeps the IPC buffer pointer in TLS (%fs). */
+    /* libsel4 keeps the IPC buffer pointer in TLS (%fs).  Not with
+     * WRFSBASE, which a KernelFSGSBase=msr kernel leaves disabled. */
     unsigned long tp = (unsigned long)(tls + sizeof(tls) - 64);
     *(unsigned long *)tp = tp;
-    __asm__ volatile("wrfsbase %0" :: "r"(tp));
+    seL4_TCB_SetTLSBase(seL4_CapInitThreadTCB, tp);
     __sel4_ipc_buffer = bi->ipcBuffer;
 
     seL4_CPtr ut = seL4_CapNull;
