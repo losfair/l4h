@@ -108,8 +108,9 @@ pub enum Kick {
     Mem,
     /// The VMM's, as a device kick (GUEST_VMM_KICK).
     Device,
-    /// One minted already (root's, to trustd: GUEST_TRUSTD).
-    Minted(cap::Notification),
+    /// trustd's, which root minted for the guest and vmmgr passes on
+    /// (GUEST_TRUSTD).
+    Attest(cap::Notification),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -367,12 +368,12 @@ impl Guest {
 
     /// Its l4h-vmm's notification, which root made (root::guest_new).
     pub(crate) fn vmm_ntfn_obj(&self) -> Obj<p::Vmm, o::Notification> {
-        Obj::claim(abs(self.vmm_ntfn))
+        Obj::claim(p::Vmm, o::Notification, abs(self.vmm_ntfn))
     }
 
     /// vCPU v's notification.
     pub(crate) fn vcpu_obj(&self, v: usize) -> Obj<p::Guest, o::Vcpu> {
-        Obj::claim(abs(self.vcpus[v].ntfn))
+        Obj::claim(p::Guest, o::Vcpu, abs(self.vcpus[v].ntfn))
     }
 
     /// Mint `e`, which the guest holds in one slot of its root CNode, from
@@ -545,10 +546,10 @@ impl Guest {
         let kick_slot = self.dev_cn.absolute_cptr_from_bits_with_depth(d as u64, abi::ROOT_CNODE_BITS);
         match kick {
             // Control requests go to vmmgr itself, not through the VMM.
-            Kick::Ctl => mint_edge(&kick_slot, &wiring::GUEST_CTL, 0, &Obj::claim(abs(crate::slot::NTFN.cap()))),
+            Kick::Ctl => mint_edge(&kick_slot, &wiring::GUEST_CTL, 0, &Obj::claim(p::Vmmgr, o::Notification, abs(crate::slot::NTFN.cap()))),
             Kick::Mem => mint_edge(&kick_slot, &wiring::GUEST_VMM_MEM, 0, &self.vmm_ntfn_obj()),
             Kick::Device => mint_edge(&kick_slot, &wiring::GUEST_VMM_KICK, 0, &self.vmm_ntfn_obj()),
-            Kick::Minted(n) => kick_slot.copy(&abs(n), CapRights::write_only()),
+            Kick::Attest(n) => l4h_task::edge::pass(&kick_slot, &wiring::GUEST_TRUSTD, &abs(n)),
         }
         .expect("device kick cap");
         // Console and control pages are also used by vmmgr itself.
@@ -1126,7 +1127,7 @@ pub fn create(
     // ---- Hypercall endpoint (served by l4h-vmm).
     g.vmm_ep = g.arena.object_cap::<cap_type::Endpoint>(alloc, ObjectBlueprint::Endpoint);
     // The VMM's endpoint, which we made.
-    g.give_edge(&wiring::GUEST_VMM, &Obj::<p::Vmm, o::Endpoint>::claim(abs(g.vmm_ep)));
+    g.give_edge(&wiring::GUEST_VMM, &Obj::claim(p::Vmm, o::Endpoint, abs(g.vmm_ep)));
 
     // ---- I/O pool: root's physically contiguous memory, whose frames we
     // map after RAM in the direct map.  The guest gets these mappings
@@ -1213,7 +1214,7 @@ pub fn create(
         ktcb.tcb_configure(g.cnode, CNodeCapData::new(0, abi::ROOT_GUARD_BITS), g.vspace, abi::vcpu_ipcbuf_va(v), ipcbuf)
             .expect("kTCB configure");
         let fault_slot = alloc.slots.alloc();
-        mint_edge(&abs(self_cap::<cap_type::Null>(fault_slot)), &wiring::GUEST_FAULT, wiring::guest_fault(id, v), &Obj::claim(abs(host_info.hyp_ep)))
+        mint_edge(&abs(self_cap::<cap_type::Null>(fault_slot)), &wiring::GUEST_FAULT, wiring::guest_fault(id, v), &Obj::claim(p::Vmmgr, o::Endpoint, abs(host_info.hyp_ep)))
             .expect("fault ep");
         ktcb.tcb_set_sched_params(
             slot::TCB.cap(),
@@ -1231,7 +1232,7 @@ pub fn create(
         g.give(base + abi::VCPU_NTFN, ntfn, CapRights::all());
         g.give(base + abi::VCPU_SC_U, sc_u, CapRights::all());
         // The vCPU's notification, which we just made.
-        mint_edge(&g.guest_slot(base + abi::VCPU_IPI), &wiring::GUEST_IPI, 0, &Obj::claim(abs(ntfn))).expect("vCPU IPI cap");
+        mint_edge(&g.guest_slot(base + abi::VCPU_IPI), &wiring::GUEST_IPI, 0, &Obj::claim(p::Guest, o::Vcpu, abs(ntfn))).expect("vCPU IPI cap");
         g.give(base + abi::VCPU_IPCBUF, ipcbuf, CapRights::read_write());
         g.give(base + abi::VCPU_EVENT, event, CapRights::read_write());
         g.vcpus.must_push(Vcpu { ktcb, ntfn, event, sc_k, sc_u, core, cooldown: 0, usage: 0, k_share: crate::sched::K_SHARE_INIT, wall_ticks: 0, run_ticks: 0, steal_ns: 0 });
@@ -1273,7 +1274,7 @@ pub fn create(
     // ---- The attestation device, which trustd serves: root cleared its
     // page, and badged the kick for this guest.
     if let Some((page, kick)) = new.attest {
-        g.attest = g.add_device_with(alloc, DevKind::Attest, page, Kick::Minted(kick)).is_some();
+        g.attest = g.add_device_with(alloc, DevKind::Attest, page, Kick::Attest(kick)).is_some();
     }
 
     info!(

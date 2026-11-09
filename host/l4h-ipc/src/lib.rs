@@ -14,8 +14,9 @@
 #![allow(clippy::disallowed_methods)]
 
 use core::marker::PhantomData;
+use core::mem::MaybeUninit;
 
-use l4h_host::wire::{Badged, Call, EINVAL, MAX_MRS, Protocol};
+use l4h_host::wire::{Badged, Call, Cap, EINVAL, MAX_MRS, Protocol};
 use l4h_host::wiring::{At, E, p};
 
 /// An endpoint that serves protocol P, as P's client calls it: made from
@@ -62,28 +63,55 @@ impl<P: Protocol> Call for Endpoint<P> {
 
 const _: () = assert!(MAX_MRS == sel4::NUM_MESSAGE_REGISTERS);
 
-/// Serve the call `info` describes: `f(label, args, reply)` writes the
-/// reply's words (a protocol's `serve`) and returns their count, or None
+/// Run `f` on a copy of the first `n` message registers.  Only those are
+/// read: a message is a few words, the buffer 120.
+fn with_words<R>(n: usize, f: impl FnOnce(&[u64]) -> R) -> R {
+    let n = n.min(MAX_MRS);
+    let mut words = [const { MaybeUninit::<u64>::uninit() }; MAX_MRS];
+    sel4::with_ipc_buffer(|b| {
+        for (w, r) in words[..n].iter_mut().zip(&b.msg_regs()[..n]) {
+            w.write(*r);
+        }
+    });
+    // The first n are written.
+    f(unsafe { &*(&words[..n] as *const [MaybeUninit<u64>] as *const [u64]) })
+}
+
+/// Serve the call `info` describes, of protocol P: `f(label, args, reply)`
+/// writes the reply's words (P's `serve`) and returns their count, or None
 /// to leave the caller unanswered.  The arguments are taken out of the
 /// message registers first, so do it before any invocation; the reply's
 /// MessageInfo, its words in the message registers.
-pub fn serve(info: &sel4::MessageInfo, f: impl FnOnce(u64, &[u64], &mut [u64]) -> Option<usize>) -> Option<sel4::MessageInfo> {
-    let mut args = [0; MAX_MRS];
-    let len = info.length().min(MAX_MRS);
-    sel4::with_ipc_buffer(|b| args[..len].copy_from_slice(&b.msg_regs()[..len]));
-    let mut out = [0; MAX_MRS];
-    let n = f(info.label(), &args[..len], &mut out)?;
-    Some(reply(&out[..n]))
+pub fn serve<P: Protocol>(info: &sel4::MessageInfo, f: impl FnOnce(u64, &[u64], &mut [u64]) -> Option<usize>) -> Option<sel4::MessageInfo> {
+    // Words past the longest call's arguments are ignored.
+    with_words(info.length().min(P::MAX_WORDS), |args| {
+        let mut out = [const { MaybeUninit::<u64>::uninit() }; MAX_MRS];
+        let out = &mut out[..P::MAX_REPLY_WORDS];
+        out.iter_mut().for_each(|w| {
+            w.write(0);
+        });
+        // All of `out` is written.
+        let out = unsafe { &mut *(out as *mut [MaybeUninit<u64>] as *mut [u64]) };
+        let n = f(info.label(), args, out)?;
+        Some(reply(&out[..n]))
+    })
 }
 
 /// Run `f`, whose invocations overwrite the message registers, without
-/// losing a message received but not yet served there (a call, or a
-/// fault, which seL4 delivers in the registers too).
+/// losing the `n` words of a message there: one received but not yet
+/// served (a call, or a fault, which seL4 delivers in the registers too),
+/// or a reply not yet sent.
+fn keeping<R>(n: usize, f: impl FnOnce() -> R) -> R {
+    with_words(n, |words| {
+        let r = f();
+        sel4::with_ipc_buffer_mut(|b| b.msg_regs_mut()[..words.len()].copy_from_slice(words));
+        r
+    })
+}
+
+/// `keeping`, for a message of unknown length: all the registers.
 pub fn preserving<R>(f: impl FnOnce() -> R) -> R {
-    let regs: [u64; MAX_MRS] = sel4::with_ipc_buffer(|b| b.msg_regs()[..MAX_MRS].try_into().unwrap());
-    let r = f();
-    sel4::with_ipc_buffer_mut(|b| b.msg_regs_mut()[..MAX_MRS].copy_from_slice(&regs));
-    r
+    keeping(MAX_MRS, f)
 }
 
 /// The reply to a caller the server does not know: EINVAL.
@@ -105,8 +133,6 @@ pub enum Next {
     /// Take the next message if one is queued; if none is, an idle turn
     /// (`signal(0)`): a server that polls has no sender badged 0.
     Poll,
-    /// Another turn on `signal(badge)` at once, receiving nothing.
-    Again(u64),
 }
 
 /// A server's thread: what arrives on its endpoint, and its bound
@@ -125,7 +151,8 @@ pub trait Server {
     /// After each receive, before the message is looked at, which it
     /// keeps.
     fn received(&mut self) {}
-    /// A signal: `badge` is some of SIGNALS (0 for an idle turn).
+    /// A signal: `badge` is some of SIGNALS (0 for an idle turn, after
+    /// Next::Poll found nothing).
     fn signal(&mut self, badge: u64) {
         let _ = badge;
     }
@@ -164,14 +191,11 @@ impl ReplyObject for sel4::cap::Reply {
 /// Serve `ep` with `s`, for good.
 pub fn run<S: Server>(ep: sel4::cap::Endpoint, mut reply: impl ReplyObject, s: &mut S) -> ! {
     let (mut info, mut badge) = ep.recv(reply.cap());
-    let mut received = true;
     let mut polled = false;
     loop {
-        if received {
-            preserving(|| s.received());
-        }
+        keeping(info.length(), || s.received());
         let mut answer = None;
-        if !received || (polled && badge == 0) || badge & S::SIGNALS != 0 {
+        if (polled && badge == 0) || badge & S::SIGNALS != 0 {
             s.signal(badge);
         } else if badge & S::FAULT != 0 {
             s.fault(badge, &info);
@@ -180,7 +204,7 @@ pub fn run<S: Server>(ep: sel4::cap::Endpoint, mut reply: impl ReplyObject, s: &
             answer = match S::Sender::of_badge(badge) {
                 Some(from) => s.call(from, badge, &info),
                 None => {
-                    preserving(|| s.unknown(badge, &info));
+                    s.unknown(badge, &info);
                     Some(refuse())
                 }
             };
@@ -188,20 +212,46 @@ pub fn run<S: Server>(ep: sel4::cap::Endpoint, mut reply: impl ReplyObject, s: &
                 reply.unanswered();
             }
         }
-        let next = if answer.is_some() { preserving(|| s.next()) } else { s.next() };
-        (received, polled) = (!matches!(next, Next::Again(_)), next == Next::Poll);
+        let next = match &answer {
+            Some(a) => keeping(a.length(), || s.next()),
+            None => s.next(),
+        };
+        polled = next == Next::Poll;
         (info, badge) = match (next, answer) {
             (Next::Wait, Some(a)) => ep.reply_recv(a, reply.cap()),
             (Next::Wait, None) => ep.recv(reply.cap()),
-            (next, a) => {
+            (Next::Poll, a) => {
                 if let Some(a) = a {
                     reply.cap().send(a);
                 }
-                match next {
-                    Next::Again(b) => (sel4::MessageInfo::new(0, 0, 0, 0), b),
-                    _ => ep.nb_recv(reply.cap()),
-                }
+                ep.nb_recv(reply.cap())
             }
         };
     }
+}
+
+/// A capability type, as the kind protocols declare that a call passes
+/// (wire::Cap): `Caps::passed_in` and `passed_out` take it, so that the
+/// capability put in an exchange slot, or taken from it, is of the kind
+/// the call declares there.
+pub trait Kind: sel4::CapType {
+    const KIND: Cap;
+}
+
+impl Kind for sel4::cap_type::Untyped {
+    const KIND: Cap = Cap::Untyped;
+}
+impl Kind for sel4::cap_type::CNode {
+    const KIND: Cap = Cap::CNode;
+}
+impl Kind for sel4::cap_type::Granule {
+    const KIND: Cap = Cap::Granule;
+}
+impl Kind for sel4::cap_type::Notification {
+    const KIND: Cap = Cap::Notification;
+}
+
+/// The kind of `cap`.
+pub const fn kind_of<T: Kind>(_: &sel4::Cap<T>) -> Cap {
+    T::KIND
 }

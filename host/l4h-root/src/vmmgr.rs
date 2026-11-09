@@ -17,6 +17,9 @@ use l4h_host::fixed::ArrayVec;
 use l4h_host::root::{Later, NewGuest, Sender, Vals as RootVals, call as root_call};
 use l4h_host::vmmgr::{self as proto, VmmgrConfig, call::Request as Notice};
 
+use l4h_host::wire::Cap;
+use l4h_ipc::kind_of;
+
 use crate::mailbox::Mailbox;
 
 use crate::blkd::{self, Channel};
@@ -526,9 +529,9 @@ fn result(h: &mut Host, token: usize) -> Result<Vals, Errno> {
         OpResult::Disk { chan, kick } => {
             use root_call::caps::disk_attach::{CHANNEL, KICK};
             for (i, f) in chan.iter().enumerate() {
-                xchg(h, CHANNEL.slot(i)).copy(&abs_of(*f), CapRights::all()).expect("vmmgr channel frame");
+                xchg(h, CHANNEL.passed_out(i, kind_of(f))).copy(&abs_of(*f), CapRights::all()).expect("vmmgr channel frame");
             }
-            xchg(h, KICK.first).move_(&abs_of(kick)).expect("vmmgr blkd kick");
+            xchg(h, KICK.passed_out(0, kind_of(&kick))).move_(&abs_of(kick)).expect("vmmgr blkd kick");
             h.alloc.slots.free(kick.bits() as Slot);
             Ok(Vals::new())
         }
@@ -621,9 +624,9 @@ fn guest_new(h: &mut Host, id: usize, size: usize, gpa: usize, dom0: bool) -> Re
         let frames = arena.object_cap::<cap_type::CNode>(&mut h.alloc, ObjectBlueprint::CNode { size_bits: radix });
         region.retype(&FRAME_BP, size / PAGE, Dest { cnode: abs_of(frames), offset: 0 }).expect("I/O pool frames");
         use root_call::caps::guest_new::{ATTEST_KICK, ATTEST_PAGE, POOL_FRAMES, VMM_NTFN};
-        xchg(h, POOL_FRAMES.first).copy(&abs_of(frames), CapRights::all()).expect("vmmgr pool frames");
-        xchg(h, VMM_NTFN.first).copy(&abs_of(vmm_ntfn), CapRights::all()).expect("vmmgr VMM notification");
-        let (page, kick) = (xchg(h, ATTEST_PAGE.first), xchg(h, ATTEST_KICK.first));
+        xchg(h, POOL_FRAMES.passed_out(0, kind_of(&frames))).copy(&abs_of(frames), CapRights::all()).expect("vmmgr pool frames");
+        xchg(h, VMM_NTFN.passed_out(0, kind_of(&vmm_ntfn))).copy(&abs_of(vmm_ntfn), CapRights::all()).expect("vmmgr VMM notification");
+        let (page, kick) = (xchg(h, ATTEST_PAGE.passed_out(0, Cap::Granule)), xchg(h, ATTEST_KICK.passed_out(0, Cap::Notification)));
         let attest = match &h.trustd {
             Some(t) => t.give(id, &mut h.wins.a, &page, &kick),
             None => false,
@@ -636,7 +639,7 @@ fn guest_new(h: &mut Host, id: usize, size: usize, gpa: usize, dom0: bool) -> Re
             dom0,
             arena,
             pool: Pool { gpa, paddr, size },
-            vmm_ntfn: component::Obj::claim(abs_of(vmm_ntfn)),
+            vmm_ntfn: component::Obj::claim(component::p::Vmm, component::o::Notification, abs_of(vmm_ntfn)),
             disks: ArrayVec::new(),
             ports: ArrayVec::new(),
             attest,
@@ -775,8 +778,8 @@ fn nic_add(h: &mut Host, id: usize, dev: usize, switch: u32, mac: u64, lock: boo
         let (chan, kick) = h.netd.add_port(g, p, switch, mac, lock, isolated, memory, &mut h.alloc);
         g.ports.must_push(p);
         use root_call::caps::nic_add::{KICK, PORT_FRAMES};
-        xchg(h, PORT_FRAMES.first).copy(&abs_of(chan), CapRights::all()).expect("vmmgr port frames");
-        xchg(h, KICK.first).move_(&abs_of(kick)).expect("vmmgr port kick");
+        xchg(h, PORT_FRAMES.passed_out(0, kind_of(&chan))).copy(&abs_of(chan), CapRights::all()).expect("vmmgr port frames");
+        xchg(h, KICK.passed_out(0, kind_of(&kick))).move_(&abs_of(kick)).expect("vmmgr port kick");
         h.alloc.slots.free(kick.bits() as Slot);
         Ok(mac)
     })
@@ -795,8 +798,8 @@ fn usb_attach(h: &mut Host, id: usize, dev: usize, ctrl: usize) -> Result<u64, E
         let n = g.usbs.len();
         let att = crate::usb::attach(h, ctrl, g)?;
         use root_call::caps::usb_attach::{KICK, QUEUE_FRAMES};
-        xchg(h, QUEUE_FRAMES.first).copy(&abs_of(att.frames), CapRights::all()).expect("vmmgr USB queue frames");
-        xchg(h, KICK.first).move_(&abs_of(att.kick)).expect("vmmgr usbd kick");
+        xchg(h, QUEUE_FRAMES.passed_out(0, kind_of(&att.frames))).copy(&abs_of(att.frames), CapRights::all()).expect("vmmgr USB queue frames");
+        xchg(h, KICK.passed_out(0, kind_of(&att.kick))).move_(&abs_of(att.kick)).expect("vmmgr usbd kick");
         crate::usb::free_slot(h, att.kick);
         Ok(n as u64)
     })

@@ -408,7 +408,7 @@ fn finish(
         }
         let slot = alloc.slots.alloc();
         let badged = sel4::init_thread::Slot::<cap_type::Notification>::from_index(slot).cap();
-        component::mint_edge(&abs_of(badged), &wiring::ROOT_TRUSTD_RELAY, 0, &Obj::claim(abs_of(kick))).expect("relay kick");
+        component::mint_edge(&abs_of(badged), &wiring::ROOT_TRUSTD_RELAY, 0, &Obj::claim(p::Trustd, o::Kick, abs_of(kick))).expect("relay kick");
         badged
     });
     let flags = core::array::from_fn(|p| {
@@ -422,7 +422,7 @@ fn finish(
     let ep = arena.object_cap::<cap_type::Endpoint>(alloc, ObjectBlueprint::Endpoint);
     comp.give(trust::SLOT_FLAGS_EP, ep, CapRights::all());
     // The flags thread's endpoint.
-    let flags_obj = Obj::<p::Trustd, o::Flags>::claim(abs_of(ep));
+    let flags_obj = Obj::claim(p::Trustd, o::Flags, abs_of(ep));
     comp.give_edge(&wiring::TRUSTD_FLAGS, 0, 0, &flags_obj);
     let slot = alloc.slots.alloc();
     let flags_ep = sel4::init_thread::Slot::<cap_type::Endpoint>::from_index(slot).cap();
@@ -444,13 +444,14 @@ fn finish(
 impl Trustd {
     /// trustd's kick notification, which root made.
     fn kick_obj(&self) -> Obj<p::Trustd, o::Kick> {
-        Obj::claim(abs_of(self.kick))
+        Obj::claim(p::Trustd, o::Kick, abs_of(self.kick))
     }
 
     /// Give vmmgr the flags: read-only at FLAGS_VA, and the capability to
-    /// act on them for the console (root's, badged as Sender::Root).
+    /// act on them for the console (root's own passed on, badged as
+    /// Sender::Root: wiring::VMMGR_FLAGS).
     pub fn give_vmmgr(&self, vmmgr: &Component, alloc: &mut Alloc, arena: &mut Arena, keep: &mut impl FnMut() -> sel4::AbsoluteCPtr) {
-        vmmgr.give(l4h_host::vmmgr::SLOT_FLAGS_EP, self.flags_ep, CapRights::all());
+        vmmgr.pass_edge(&wiring::VMMGR_FLAGS, 0, self.flags_ep);
         for (p, &f) in self.flags.iter().enumerate() {
             vmmgr.map_copy(alloc, arena, &abs_of(f), l4h_host::vmmgr::FLAGS_VA + p * PAGE, CapRights::read_only(), VmAttributes::DEFAULT, keep());
         }
@@ -633,7 +634,7 @@ fn flags_thread(c: &Component, alloc: &mut Alloc, arena: &mut Arena, info: &Host
         map_frame(&mut ctx, c.vspace, f, va, CapRights::read_write(), VmAttributes::DEFAULT);
     }
     let fault_slot = ctx.alloc.slots.alloc();
-    component::mint_edge(&abs_of(root_cap::<cap_type::Null>(fault_slot)), &wiring::FLAGS_FAULT, 0, &Obj::claim(abs_of(info.hyp_ep)))
+    component::mint_edge(&abs_of(root_cap::<cap_type::Null>(fault_slot)), &wiring::FLAGS_FAULT, 0, &Obj::claim(p::Root, o::Endpoint, abs_of(info.hyp_ep)))
         .expect("flags fault ep");
     tcb.tcb_configure(c.cnode, CNodeCapData::new(0, 64 - c.cnode_bits), c.vspace, trust::FLAGS_IPCBUF_VA as u64, ipc)
         .expect("flags TCB configure");

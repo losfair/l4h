@@ -29,8 +29,10 @@ pub use crate::errno::{EINVAL, Errno};
 pub const FAILED: Errno = u64::MAX;
 /// What a `Server` method returns to leave its caller unanswered (a
 /// stopped or destroyed caller): `serve` then writes no reply.  Never on
-/// the wire.
+/// the wire, and never from it: `reply` takes any first word above
+/// errno::MAX_ERRNO as FAILED.
 pub const NO_REPLY: Errno = u64::MAX - 2;
+const _: () = assert!(NO_REPLY > crate::errno::MAX_ERRNO && FAILED > crate::errno::MAX_ERRNO);
 
 /// A call, as a client posts it: what `protocol!`'s Request implements.
 pub trait Message {
@@ -339,19 +341,45 @@ pub enum Cap {
 /// Capabilities a call passes in the caller's exchange area: slots
 /// [first, first + count), at most count of them.  The area is the slots
 /// of the caller's that the protocol declares (`xchg`), wherever the two
-/// can both reach them.
+/// can both reach them.  Both ends find a slot with `passed_in` or
+/// `passed_out`, which refuse the other direction and another kind of
+/// capability than the call declares.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Caps {
-    pub first: usize,
-    pub count: usize,
-    pub dir: Dir,
-    pub kind: Cap,
+    first: usize,
+    count: usize,
+    dir: Dir,
+    kind: Cap,
 }
 
 impl Caps {
-    /// Slot i of these: first + i.
-    pub const fn slot(self, i: usize) -> usize {
+    pub const fn new(first: usize, count: usize, dir: Dir, kind: Cap) -> Self {
+        Caps { first, count, dir, kind }
+    }
+
+    /// How many the call passes, at most.
+    pub const fn count(self) -> usize {
+        self.count
+    }
+
+    /// Slot i of these, which the caller passes to the server: for a
+    /// capability of `kind` (the caller's, which puts it there; the
+    /// server's, which takes it).
+    pub const fn passed_in(self, i: usize, kind: Cap) -> usize {
+        assert!(matches!(self.dir, Dir::In), "the call passes these to the caller");
+        self.slot(i, kind)
+    }
+
+    /// Slot i of these, which the server passes to the caller with the
+    /// reply: for a capability of `kind`.
+    pub const fn passed_out(self, i: usize, kind: Cap) -> usize {
+        assert!(matches!(self.dir, Dir::Out), "the call passes these to the server");
+        self.slot(i, kind)
+    }
+
+    const fn slot(self, i: usize, kind: Cap) -> usize {
         assert!(i < self.count, "capability index out of range");
+        assert!(self.kind as u8 == kind as u8, "the call passes another kind of capability there");
         self.first + i
     }
 }
@@ -393,11 +421,17 @@ impl Badged for core::convert::Infallible {
 pub trait Protocol {
     /// Its module path, which names it.
     const NAME: &'static str;
+    /// Words of its longest call's arguments, and of its longest reply
+    /// (the errno included).
+    const MAX_WORDS: usize;
+    const MAX_REPLY_WORDS: usize;
 }
 
 /// No protocol: what a signal or fault edge carries (wiring::E).
 impl Protocol for () {
     const NAME: &'static str = "";
+    const MAX_WORDS: usize = 0;
+    const MAX_REPLY_WORDS: usize = 0;
 }
 
 /// An endpoint a client calls.
@@ -411,12 +445,16 @@ pub trait Call {
 }
 
 /// The reply of a call, as `protocol!`'s clients see it: its value, or
-/// the errno the server gave (FAILED if it failed).
+/// the errno the server gave (FAILED if it failed).  A server chooses its
+/// reply's words, and a client may be more trusted than it (root, of a
+/// driver's answer): a first word that is no errno is a failed server, not
+/// a value the client passes on.
 pub fn reply<R: Wire>(words: &[u64]) -> Result<R, Errno> {
     match words.first() {
         None => Err(FAILED),
         Some(0) => R::get(&words[1..]).map(|(v, _)| v).ok_or(FAILED),
-        Some(&e) => Err(e),
+        Some(&e) if e <= crate::errno::MAX_ERRNO => Err(e),
+        Some(_) => Err(FAILED),
     }
 }
 
@@ -624,6 +662,8 @@ macro_rules! protocol {
 
             impl $crate::wire::Protocol for Proto {
                 const NAME: &'static str = module_path!();
+                const MAX_WORDS: usize = Request::MAX_WORDS;
+                const MAX_REPLY_WORDS: usize = Request::MAX_REPLY_WORDS;
             }
 
             /// A decoded call.  No heap: it lives on the server's stack.
@@ -650,9 +690,8 @@ macro_rules! protocol {
                         #[allow(unused_imports)]
                         use super::*;
                         $($(
-                            pub const $cname: $crate::wire::Caps = $crate::wire::Caps {
-                                first: $clo, count: $cn, dir: $crate::wire::Dir::$cdir, kind: $crate::wire::Cap::$ckind,
-                            };
+                            pub const $cname: $crate::wire::Caps =
+                                $crate::wire::Caps::new($clo, $cn, $crate::wire::Dir::$cdir, $crate::wire::Cap::$ckind);
                         )*)?
                         /// All of them.
                         pub const ALL: &[$crate::wire::Caps] = &[$($($cname),*)?];
@@ -909,7 +948,8 @@ mod tests {
         // A reply taken later, by its call's type.
         assert_eq!(reply::<demo::reply::Add>(&[0, 9]), Ok(9));
         assert_eq!(demo::Request::MAX_WORDS, 1 + 4 * 2);
-        assert_eq!(demo::caps::add::NTFN.slot(1), 2);
+        assert_eq!(demo::caps::add::NTFN.passed_out(1, Cap::Notification), 2);
+        assert_eq!(demo::caps::add::PAGE.passed_in(0, Cap::Granule), 0);
         assert_eq!(demo::caps::add::ALL.len(), 2);
         assert!(demo::caps::ping::ALL.is_empty());
         assert!(!caps_fit(&[demo::caps::add::PAGE, demo::caps::add::PAGE], 4));
@@ -949,5 +989,23 @@ mod tests {
         assert_eq!(reply::<u64>(&[FAILED]), Err(FAILED));
         assert_eq!(reply::<()>(&[]), Err(FAILED));
         assert_eq!(reply::<()>(&[12]), Err(12));
+        // No errno: a server cannot answer NO_REPLY, or what overflows a
+        // status.
+        assert_eq!(reply::<()>(&[NO_REPLY]), Err(FAILED));
+        assert_eq!(reply::<u64>(&[1 << 63, 7]), Err(FAILED));
+        assert_eq!(reply::<()>(&[crate::errno::MAX_ERRNO]), Err(crate::errno::MAX_ERRNO));
+        assert_eq!(reply::<()>(&[crate::errno::MAX_ERRNO + 1]), Err(FAILED));
+    }
+
+    #[test]
+    #[should_panic]
+    fn caps_direction() {
+        demo::caps::add::PAGE.passed_out(0, Cap::Granule);
+    }
+
+    #[test]
+    #[should_panic]
+    fn caps_kind() {
+        demo::caps::add::PAGE.passed_in(0, Cap::CNode);
     }
 }

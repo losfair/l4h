@@ -387,6 +387,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     let wd_ntfn = alloc.object_cap::<cap_type::Notification>(ObjectBlueprint::Notification);
     slot::TCB.cap().tcb_bind_notification(wd_ntfn).expect("bind watchdog notification");
     mailbox::init(wd_ntfn);
+    component::minter(l4h_host::wiring::Party::Root);
     component::audit_in(alloc.slots.alloc());
     let reply_slot = alloc.slots.alloc();
     let reply = ReplySlot::new(&mut alloc, sel4::init_thread::Slot::<cap_type::Reply>::from_index(reply_slot).cap());
@@ -825,7 +826,7 @@ impl l4h_ipc::Server for Root<'_> {
     }
 
     fn call(&mut self, from: host::root::Sender, _: u64, info: &sel4::MessageInfo) -> Option<sel4::MessageInfo> {
-        l4h_ipc::serve(info, |label, args, out| root_call::serve(&mut vmmgr::Calls(self.h), label, args, from, out))
+        l4h_ipc::serve::<root_call::Proto>(info, |label, args, out| root_call::serve(&mut vmmgr::Calls(self.h), label, args, from, out))
     }
 
     fn unknown(&mut self, badge: u64, info: &sel4::MessageInfo) {

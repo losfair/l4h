@@ -59,6 +59,15 @@ fn xchg(c: Client, i: usize) -> AbsoluteCPtr {
     AbsoluteCPtr(if c == Client::Root { 160 } else { 1000 } + i as u64)
 }
 
+/// memd's two views of a block's exchange slot (alloc's and free's).
+fn granted(c: Client, i: usize) -> AbsoluteCPtr {
+    xchg(c, i)
+}
+
+fn returned(c: Client, i: usize) -> AbsoluteCPtr {
+    xchg(c, i)
+}
+
 #[macro_export]
 macro_rules! info { ($($a:tt)*) => { println!($($a)*); }; }
 #[macro_export]

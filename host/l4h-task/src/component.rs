@@ -80,13 +80,40 @@ impl Component {
         O: o::IsObject,
         P: Protocol,
     {
-        assert!(H::PARTY.kind() == Some(self.kind), "component {} does not hold {}", self.id, e.name);
-        let idx = e.slot(n);
+        let idx = self.held(e, n);
         crate::edge::mint(&self.slot(idx), e, i, src)
-            .unwrap_or_else(|err| panic!("component {} slot {} ({}) mint: {:?}", self.id, idx, e.name, err));
-        // What it was minted from was the edge's object (Obj::claim).
+            .unwrap_or_else(|err| panic!("component {} slot {} ({}: {}) mint: {:?}", self.id, idx, e.name, e.what, err));
+        self.minted(e, idx);
+    }
+
+    /// Pass on to it a capability of `e`, which this component holds, that
+    /// was minted already (`minted`: this task's own of the same badge, or
+    /// one a call passed to it), into the edge's n-th slot.
+    pub fn pass_edge<H, T, O, P>(&self, e: &E<H, T, O, P>, n: usize, minted: impl sel4::HasCPtrWithDepth)
+    where
+        H: p::IsParty,
+        T: p::IsParty,
+        O: o::IsObject,
+        P: Protocol,
+    {
+        let idx = self.held(e, n);
+        self.slot(idx)
+            .copy(&self.local_cnode.absolute_cptr(minted), crate::edge::rights(e))
+            .unwrap_or_else(|err| panic!("component {} slot {} ({}: {}) copy: {:?}", self.id, idx, e.name, e.what, err));
+        self.minted(e, idx);
+    }
+
+    /// The n-th slot of `e`, which this component must hold.
+    fn held<H: p::IsParty, T, O, P>(&self, e: &E<H, T, O, P>, n: usize) -> u64 {
+        assert!(H::PARTY.kind() == Some(self.kind), "component {} does not hold {}", self.id, e.name);
+        e.slot(n)
+    }
+
+    /// What is now in slot `idx` is a capability to the edge's object, as
+    /// far as its type says (debug builds).
+    fn minted<H, T, O: o::IsObject, P>(&self, e: &E<H, T, O, P>, idx: u64) {
         if let Some(t) = self.identify(idx) {
-            assert!(t == wiring::cap_tag(O::OBJECT), "component {} slot {} ({}): not minted from {:?}", self.id, idx, e.name, O::OBJECT);
+            assert!(t == wiring::cap_tag(O::OBJECT), "component {} slot {} ({}): not a capability to {:?}", self.id, idx, e.name, O::OBJECT);
         }
     }
 
@@ -116,11 +143,12 @@ impl Component {
     /// Its notification or service endpoint, as T's: it must be one.
     pub fn obj<T: p::IsParty, O: o::IsObject>(&self) -> Obj<T, O> {
         assert!(T::PARTY.kind() == Some(self.kind), "component {} is not {:?}", self.id, T::PARTY);
-        Obj::claim(match O::OBJECT {
+        let cap = match O::OBJECT {
             Object::Notification => self.local_cnode.absolute_cptr(self.ntfn),
             Object::Endpoint => self.local_cnode.absolute_cptr(self.service_ep),
             o => panic!("a component has no {:?} of its own", o),
-        })
+        };
+        Obj::of(cap)
     }
 
     /// Map `frame` (a capability anywhere in the parent's CSpace) into the

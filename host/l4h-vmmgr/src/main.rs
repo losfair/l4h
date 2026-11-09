@@ -508,6 +508,7 @@ fn main(info: &'static Info) -> ! {
     let mut alloc = Alloc::empty(slots, ALLOC_STORAGE.take());
     alloc.memd = Some(memd::link());
     alloc.refill();
+    l4h_task::edge::minter(l4h_host::wiring::Party::Vmmgr);
     component::audit_in(alloc.slots.alloc());
     // Root made SLOT_REPLY, which cannot be replaced: ours is there, where
     // the keeper finds it if vmmgr fails, so that the caller it holds gets
@@ -760,7 +761,7 @@ impl l4h_ipc::Server for Serve<'_> {
         match from {
             // The VMMs' component ids are their guests'.
             proto::Sender::Vmm(g) if g < MAX_GUESTS => {
-                l4h_ipc::serve(info, |label, args, out| call::serve(&mut VmmCalls(self.h), label, args, from, out))
+                l4h_ipc::serve::<call::Proto>(info, |label, args, out| call::serve(&mut VmmCalls(self.h), label, args, from, out))
             }
             _ => {
                 self.unknown(badge, info);

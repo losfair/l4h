@@ -39,7 +39,7 @@ impl MemdLink {
 
     /// memd's endpoint, to mint from (wiring::VMMGR_MEMD).
     pub fn obj(&self) -> crate::edge::Obj<p::Memd, o::Endpoint> {
-        crate::edge::Obj::claim(self.local_cnode.absolute_cptr(self.ep.cap()))
+        crate::edge::Obj::claim(p::Memd, o::Endpoint, self.local_cnode.absolute_cptr(self.ep.cap()))
     }
 
     pub fn slot(&self, i: u64) -> sel4::AbsoluteCPtr {
@@ -62,7 +62,7 @@ impl MemdLink {
     pub fn alloc(&self, bits: usize, slot: Slot) -> Option<usize> {
         let paddr = *Client::alloc(self, bits, 1).ok()?.0.first()? as usize;
         self.local_cnode.absolute_cptr(cap_at::<cap_type::Null>(slot))
-            .move_(&self.area(memd::call::caps::alloc::BLOCKS.slot(0))).expect("memd: take grant");
+            .move_(&self.area(memd::call::caps::alloc::BLOCKS.passed_out(0, l4h_host::wire::Cap::Untyped))).expect("memd: take grant");
         Some(paddr)
     }
 
@@ -72,7 +72,7 @@ impl MemdLink {
         assert!(blocks.len() <= memd::XCHG_SLOTS);
         let mut given = ArrayVec::new();
         for (i, &(ut, paddr, bits)) in blocks.iter().enumerate() {
-            self.area(memd::call::caps::free::BLOCKS.slot(i)).move_(&self.local_cnode.absolute_cptr(ut)).expect("memd: return block");
+            self.area(memd::call::caps::free::BLOCKS.passed_in(i, l4h_ipc::kind_of(&ut))).move_(&self.local_cnode.absolute_cptr(ut)).expect("memd: return block");
             given.must_push((paddr, bits));
         }
         Client::free(self, given).expect("memd: free");

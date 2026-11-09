@@ -18,19 +18,42 @@ pub const EINVAL: Errno = 22;
 pub const ENOSPC: Errno = 28;
 pub const ENOSYS: Errno = 38;
 pub const ETIMEDOUT: Errno = 110;
+/// The largest errno (Linux's MAX_ERRNO).  A reply's first word above it
+/// is no errno: a client takes it as a failed server (wire::reply), so
+/// that nothing a server answers passes for one of the host's own values
+/// above it (wire::NO_REPLY, a component's "deferred").
+pub const MAX_ERRNO: Errno = 4095;
 
 /// A handler's 0 or errno as a result.
 pub const fn check(e: Errno) -> Result<(), Errno> {
     if e == 0 { Ok(()) } else { Err(e) }
 }
 
-/// The guest ABI's status of an errno: its negative.
+/// The guest ABI's status of an errno: its negative (-EIO for a value
+/// that is no errno).
 pub const fn negative(e: Errno) -> i64 {
-    -(e as i64)
+    if e <= MAX_ERRNO { -(e as i64) } else { -(EIO as i64) }
 }
 
 /// The errno of a guest ABI status (`negative`'s inverse; EIO for one that
 /// is not negative).
 pub const fn of_status(status: i64) -> Errno {
-    if status < 0 { status.unsigned_abs() } else { EIO }
+    if status < 0 && status.unsigned_abs() <= MAX_ERRNO { status.unsigned_abs() } else { EIO }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn statuses() {
+        assert_eq!(negative(EINVAL), -22);
+        assert_eq!(of_status(-22), EINVAL);
+        // No errno: not a status, and no overflow.
+        assert_eq!(negative(1 << 63), -5);
+        assert_eq!(negative(u64::MAX), -5);
+        assert_eq!(negative(MAX_ERRNO + 1), -5);
+        assert_eq!(of_status(7), EIO);
+        assert_eq!(of_status(i64::MIN), EIO);
+    }
 }

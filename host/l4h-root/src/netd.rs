@@ -185,7 +185,8 @@ pub fn bdf(d: &pci::Device) -> u32 {
     ((d.bus as u32) << 8) | ((d.dev as u32) << 3) | d.func as u32
 }
 
-/// Make netd panic, for tests/run-logdtest.sh. Its keeper answers.
+/// Make netd panic, for tests/run-logdtest.sh.  It has no keeper: its
+/// fault comes to root, which fails it (`fault`).
 pub fn inject_panic(h: &mut Host) {
     let _ = h.netd.post(Request::TestPanic {});
 }

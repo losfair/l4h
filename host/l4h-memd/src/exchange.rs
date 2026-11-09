@@ -5,7 +5,7 @@ use l4h_rt::host::memd::{self, BLOCK_BITS, XCHG_SLOTS};
 use l4h_rt::sel4::CapRights;
 
 use crate::mem::{State, abs};
-use crate::{Client, Memd, xchg};
+use crate::{Client, Memd, granted, returned};
 use l4h_rt::host::errno::{EINVAL, ENOMEM};
 use l4h_rt::host::fixed::ArrayVec;
 
@@ -32,11 +32,11 @@ impl Memd {
         for (n, &i) in got[..count].iter().enumerate() {
             let from = abs(self.mem.slot(i, k));
             match c {
-                Client::Root => xchg(c, n).move_(&from).expect("memd: move to exchange"),
+                Client::Root => granted(c, n).move_(&from).expect("memd: move to exchange"),
                 Client::Vmmgr => {
                     // Whatever vmmgr left in its mailbox must not make us fail.
-                    let _ = xchg(c, n).delete();
-                    xchg(c, n).copy(&from, CapRights::all()).expect("memd: copy to mailbox")
+                    let _ = granted(c, n).delete();
+                    granted(c, n).copy(&from, CapRights::all()).expect("memd: copy to mailbox")
                 }
             }
         }
@@ -73,9 +73,9 @@ impl Memd {
         }
         for (n, &(i, k)) in blocks[..count].iter().enumerate() {
             match c {
-                Client::Root => abs(self.mem.slot(i, k)).move_(&xchg(c, n)).expect("memd: move from exchange"),
+                Client::Root => abs(self.mem.slot(i, k)).move_(&returned(c, n)).expect("memd: move from exchange"),
                 Client::Vmmgr => {
-                    let _ = xchg(c, n).delete();
+                    let _ = returned(c, n).delete();
                     abs(self.mem.slot(i, k)).revoke().expect("memd: revoke vmmgr block");
                 }
             }

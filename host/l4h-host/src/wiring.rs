@@ -144,6 +144,9 @@ pub struct Edge {
     pub badge: Badge,
     /// Instances: the badge's index runs below it.
     pub instances: usize,
+    /// Who mints it, root or vmmgr: no other task's mint of it goes
+    /// through (l4h_task::edge::minter).  A holder that got it from
+    /// another passes it on (l4h_task::edge::pass).
     pub minted_by: Party,
     /// A call's protocol (wire::Protocol::NAME; "" for no call), from E.
     pub protocol: &'static str,
@@ -151,6 +154,7 @@ pub struct Edge {
     /// design (a device's kick slot holds one of several kicks; a bit two
     /// sources signal the same news on).
     pub shared: bool,
+    /// What it is for, in the words a failed mint reports.
     pub what: &'static str,
 }
 

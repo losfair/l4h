@@ -2468,8 +2468,8 @@ controller, one per claimed controller, and the guest forwards Linux's
   both by number; root claims the controller if needed, makes the queue
   area (101 host frames in an arena of root's own, mapped into usbd, and
   copies of them for the guest), usbd's kick, mints the guest's VMM
-  notification (root's, from `GUEST_NEW`) for usbd with badge
-  `vmm_badge_usb(n)`, maps the pool into the controller's IOMMU domain,
+  notification (root's, from `guest_new`) for usbd with bit n of
+  `badges::vmm::USB` (`wiring::USBD_VMM`), maps the pool into the controller's IOMMU domain,
   turns bus mastering on and posts `usb::call::attach` with the pool's addresses
   from its own table. usbd keeps two areas (`AREAS`): while the previous
   guest's release still runs, the next guest gets the other, and its
@@ -2775,7 +2775,13 @@ one way to do each part of it:
   takes a call's arguments out of the message registers before its
   handler runs and puts the reply there after it returns, and `run` keeps
   a message, and a reply not yet sent, there across the server's other
-  work (`l4h_ipc::preserving`), so no invocation can overwrite either. A
+  work, so no invocation can overwrite either; both copy only the
+  message's own words, and `serve` at most its protocol's longest call
+  and reply. A reply's first word is 0 or an errno, at most
+  `errno::MAX_ERRNO`: a client takes anything above as a failed server
+  (`wire::reply`), so no answer of a less trusted server (a driver's, to
+  root) passes for a value the host gives a meaning of its own
+  (`wire::NO_REPLY`, a deferred request) or overflows a guest status. A
   thread that is not called (trustd's main thread, logd, the drivers)
   waits on its notification instead. Only l4h-ipc calls, serves and
   receives on endpoints (and l4h-rt's keeper and failure answers, which
@@ -2785,7 +2791,10 @@ one way to do each part of it:
   typed `Request` (`Mailbox::send`) and decodes each answer by its
   call's reply type; the driver answers with `l4h_rt::mailbox::serve`,
   which reads and writes the ring and never the registers. Capabilities
-  still cross in exchange slots, which each call's declaration names.
+  still cross in exchange slots, which each call's declaration names,
+  with their direction and kind: both ends find a slot with
+  `Caps::passed_in` or `passed_out`, which refuse the other direction and
+  another kind than the capability's own type (`l4h_ipc::Kind`).
 - **Wiring.** Every capability by which one party calls, signals or
   faults to another is an edge of `l4h_host::wiring`: its holder and
   where it holds it (fixed slots, a slot its minter chooses, an IRQ
@@ -2799,13 +2808,20 @@ one way to do each part of it:
   `Component::give_edge`, the guest's `give_edge` in vmmgr), so slot,
   rights and badge cannot drift from the declaration, and only from an
   `Obj<Target, Object>`: what an edge is minted from has the edge's
-  target and object as its type. An `Obj` is claimed once, where the
-  object is made or received (`Obj::claim`, `Component::obj`, which
-  checks the component's kind, `MemdLink::obj`, the guest's `vcpu_obj`
-  and `vmm_ntfn_obj`), so passing another party's notification to a mint
-  does not compile. The only other mint is of a CNode with its guard
+  target and object as its type. An `Obj` is claimed where the object
+  is made or received, naming its party and object (`Obj::claim(party,
+  object, cap)`; `Component::obj`, which checks the component's kind;
+  `MemdLink::obj`, the guest's `vcpu_obj` and `vmm_ntfn_obj`), so
+  passing another party's notification to a mint does not compile. Only
+  an edge's minter mints it: root and vmmgr say which they are
+  (`edge::minter`), and a mint of another's edge stops. A capability
+  that reaches its holder through another (vmmgr's copy of root's flags
+  capability, a VMM's capability to memd and its backends' kicks, a
+  guest's attestation kick) is passed on from its edge as well
+  (`Component::pass_edge`, `edge::pass`), which gives the slot and caps
+  the rights. The only other mint is of a CNode with its guard
   (`edge::mint_cnode`, `give_cnode`), and clippy refuses `mint` anywhere
-  else. A component gets a capability to its parent's endpoint only if
+  else, for both architectures. A component gets a capability to its parent's endpoint only if
   it calls its parent (`wiring::parent_call`: trustd, vmmgr, the VMMs),
   and its faults go to its parent by its fault edge (`parent_fault`, or
   `keeper_fault` for a component with a keeper); `create` checks that
@@ -2816,8 +2832,8 @@ one way to do each part of it:
   seL4's `DebugCapIdentify` and stops if an endpoint or notification is
   in a slot that no edge it holds, and none of its own objects
   (`wiring::OWN`), gives it, or is of another type than the edge's
-  object (`wiring::audit`); each later `give_edge` checks the type of
-  what it minted. At compile time no two edges share
+  object (`wiring::audit`); each later `give_edge` and `pass_edge`
+  checks the type of what it put there. At compile time no two edges share
   a slot or a notification bit unless both are declared shared, every
   call's badge decodes as a sender its protocol accepts, every signal is
   in its receiver's badge space, root calls no driver, vmmgr or VMM (it

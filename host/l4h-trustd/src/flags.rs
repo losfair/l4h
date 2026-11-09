@@ -24,7 +24,7 @@ struct Entries;
 /// Guest `id`'s entry, which only this thread writes.
 fn entry(id: usize) -> Result<&'static FlagsEntry, Errno> {
     if id >= trust::MAX_RECORDS {
-        return Err(22);
+        return Err(l4h_rt::host::errno::EINVAL);
     }
     Ok(unsafe { &*(trust::FLAGS_WRITE_VA as *const FlagsEntry).add(id) })
 }
@@ -56,7 +56,7 @@ impl l4h_rt::ipc::Server for Entries {
     type Sender = Sender;
 
     fn call(&mut self, from: Sender, _: u64, info: &sel4::MessageInfo) -> Option<sel4::MessageInfo> {
-        l4h_rt::ipc::serve(info, |label, args, out| call::serve(self, label, args, from, out))
+        l4h_rt::ipc::serve::<call::Proto>(info, |label, args, out| call::serve(self, label, args, from, out))
     }
 }
 

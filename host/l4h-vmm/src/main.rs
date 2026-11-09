@@ -300,7 +300,7 @@ impl l4h_rt::ipc::Server for Vmm<'_> {
             cfg: self.cfg, tsc_hz: self.tsc_hz, mem: self.mem, vcpus: self.vcpus, devs: self.devs,
             console: self.console, root_ep: self.root_ep,
         };
-        let answer = l4h_rt::ipc::serve(info, |label, args, out| hypercall::serve(&mut hc, label, args, from, out));
+        let answer = l4h_rt::ipc::serve::<hypercall::Proto>(info, |label, args, out| hypercall::serve(&mut hc, label, args, from, out));
         self.answered = Some(answer.is_some());
         answer
     }

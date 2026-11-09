@@ -36,7 +36,7 @@ use l4h_rt::host::errno::Errno;
 use l4h_rt::host::badges::memd as recv;
 use l4h_rt::host::fixed::{ArrayVec, Scratch};
 use l4h_rt::host::memd::{self, BalloonConfig, GuestHp, HpState, MemdConfig, Sender, Status, call, BLOCK_BITS, HP_MAP_WORDS, HP_MAX, MAX_GUESTS, XCHG_SLOTS};
-use l4h_rt::host::wire::Tail;
+use l4h_rt::host::wire::{self, Tail};
 use l4h_rt::{Info, cap, host, sel4};
 use sel4::{CapRights, cap_type};
 
@@ -143,11 +143,15 @@ fn area(c: Client, i: usize) -> sel4::AbsoluteCPtr {
     }
 }
 
-/// Block n that an `alloc` or `free` passes (call::caps::*::BLOCKS).
-fn xchg(c: Client, n: usize) -> sel4::AbsoluteCPtr {
-    area(c, call::caps::alloc::BLOCKS.slot(n))
+/// Where an `alloc` passes its n-th block to the caller.
+fn granted(c: Client, n: usize) -> sel4::AbsoluteCPtr {
+    area(c, call::caps::alloc::BLOCKS.passed_out(n, wire::Cap::Untyped))
 }
-const _: () = assert!(call::caps::alloc::BLOCKS.first == call::caps::free::BLOCKS.first);
+
+/// Where a `free`'s caller passed its n-th block.
+fn returned(c: Client, n: usize) -> sel4::AbsoluteCPtr {
+    area(c, call::caps::free::BLOCKS.passed_in(n, wire::Cap::Untyped))
+}
 
 impl Memd {
     fn guest(&self, g: usize) -> Option<&GuestRam> {
@@ -167,8 +171,8 @@ impl Memd {
         let (bcn, hcn) = (abs(memd::SLOT_GUEST_BCN + g as u64), abs(memd::SLOT_GUEST_HCN + g as u64));
         let _ = (bcn.delete(), hcn.delete());
         use call::caps::guest_create::{BLOCK_CNODE, HP_CNODE};
-        if bcn.move_(&area(Client::Vmmgr, BLOCK_CNODE.first)).is_err()
-            || hcn.move_(&area(Client::Vmmgr, HP_CNODE.first)).is_err()
+        if bcn.move_(&area(Client::Vmmgr, BLOCK_CNODE.passed_in(0, wire::Cap::CNode))).is_err()
+            || hcn.move_(&area(Client::Vmmgr, HP_CNODE.passed_in(0, wire::Cap::CNode))).is_err()
         {
             return EINVAL;
         }
@@ -285,7 +289,7 @@ impl Memd {
     fn guest_copy(&mut self, g: usize, b: usize) -> Result<u64, Errno> {
         let i = self.guest_block(g, b).ok_or(EINVAL)?;
         // Fails if the block already has a copy.
-        let out = area(Client::Vmmgr, call::caps::guest_copy::BLOCK.first);
+        let out = area(Client::Vmmgr, call::caps::guest_copy::BLOCK.passed_out(0, wire::Cap::Untyped));
         let _ = out.delete();
         if out.copy(&abs(self.mem.slot(i, 0)), CapRights::all()).is_err() {
             return Err(EINVAL);
@@ -400,7 +404,7 @@ impl l4h_rt::ipc::Server for Memd {
     }
 
     fn call(&mut self, from: Sender, _: u64, info: &sel4::MessageInfo) -> Option<sel4::MessageInfo> {
-        let answer = l4h_rt::ipc::serve(info, |label, args, out| call::serve(self, label, args, from, out));
+        let answer = l4h_rt::ipc::serve::<call::Proto>(info, |label, args, out| call::serve(self, label, args, from, out));
         self.write_status();
         answer
     }

@@ -294,6 +294,8 @@ jobs:
         run: tools/ci-setup.sh aarch64
       - name: Build seL4 and loader
         run: tools/build-kernel-aarch64.sh && tools/build-loader-aarch64.sh
+      - name: IPC goes through the wiring and l4h-ipc (clippy)
+        run: tests/check-ipc.sh
       - name: Build Linux
         run: tools/build-linux.sh vmlinux
       - name: Guest ABI and PCI (EL1)
