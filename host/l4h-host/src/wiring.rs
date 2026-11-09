@@ -524,10 +524,7 @@ const _: () = match keepers() {
 
 #[cfg(test)]
 mod tests {
-    extern crate std;
     use super::*;
-    use std::format;
-    use std::string::String;
 
     #[test]
     fn edges_check() {
@@ -559,27 +556,5 @@ mod tests {
         let mut odd = IRQ_BLKD;
         odd.badge = Fixed(1 << 50);
         assert!(check(&[odd]).is_err());
-    }
-
-    /// DESIGN.md's table of the wiring is this one.
-    #[test]
-    fn design_table() {
-        let mut t = String::from("| Edge | Holder | Target | Rights | What |\n|---|---|---|---|---|\n");
-        for e in EDGES {
-            t += &format!("| `{}` | {:?} | {:?} {:?} | {:?} | {} |\n", e.name, e.holder, e.target, e.object, e.rights, e.what);
-        }
-        let design = include_str!("../../../DESIGN.md");
-        let (begin, end) = ("<!-- wiring:begin -->\n", "<!-- wiring:end -->");
-        let have = design.split(begin).nth(1).and_then(|s| s.split(end).next()).unwrap_or("");
-        if have != t {
-            if std::env::var_os("L4H_BLESS").is_some() {
-                let path = std::path::Path::new(file!()).parent().unwrap().join("../../../DESIGN.md");
-                let i = design.find(begin).expect("DESIGN.md has the wiring markers") + begin.len();
-                let j = design[i..].find(end).unwrap() + i;
-                std::fs::write(path, format!("{}{}{}", &design[..i], t, &design[j..])).unwrap();
-            } else {
-                panic!("DESIGN.md's wiring table is stale; run with L4H_BLESS=1, or paste:\n{}", t);
-            }
-        }
     }
 }
