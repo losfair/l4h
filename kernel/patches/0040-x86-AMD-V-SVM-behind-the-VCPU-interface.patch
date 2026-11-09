@@ -1,4 +1,4 @@
-From dd4500e0162ba87e87f641dd143040a14f806074 Mon Sep 17 00:00:00 2001
+From d949ecfccdadc2ad38c89d115f5d498247a806c2 Mon Sep 17 00:00:00 2001
 From: l4h <l4h@localhost>
 Date: Sun, 8 Nov 2026 19:30:53 +0100
 Subject: [PATCH] x86: AMD-V (SVM) behind the VCPU interface
@@ -75,12 +75,13 @@ VMs on both.  32-bit kernels keep VT-x only.
  libsel4/arch_include/x86/sel4/arch/vmenter.h  |  12 +-
  src/arch/x86/64/c_traps.c                     |   3 +
  src/arch/x86/api/faults.c                     |   7 +
+ src/arch/x86/c_traps.c                        |  20 +-
  src/arch/x86/config.cmake                     |   1 +
  src/arch/x86/kernel/ept.c                     |  21 +-
  src/arch/x86/model/statedata.c                |   6 +
- src/arch/x86/object/svm.c                     | 935 ++++++++++++++++++
+ src/arch/x86/object/svm.c                     | 939 ++++++++++++++++++
  src/arch/x86/object/vcpu.c                    |  69 +-
- 12 files changed, 1263 insertions(+), 23 deletions(-)
+ 13 files changed, 1281 insertions(+), 29 deletions(-)
  create mode 100644 include/arch/x86/arch/object/svm.h
  create mode 100644 src/arch/x86/object/svm.c
 
@@ -433,6 +434,38 @@ index 8b9bd9bd8..8d690bd84 100644
      /* Check if we are in a state where we expect a GP fault, if so record it and return */
      if (vector == int_gp_fault && ARCH_NODE_STATE(x86KSGPExceptReturnTo) != 0) {
          word_t ret = ARCH_NODE_STATE(x86KSGPExceptReturnTo);
+diff --git a/src/arch/x86/c_traps.c b/src/arch/x86/c_traps.c
+index afc8e022c..cbbfc99b8 100644
+--- a/src/arch/x86/c_traps.c
++++ b/src/arch/x86/c_traps.c
+@@ -255,13 +255,21 @@ void VISIBLE NORETURN c_handle_vmexit(void)
+      *
+      * This needs to happen before the entry hook which will try to
+      * restore the registers without having a means to determine whether
+-     * they may have been dirtied by a VM exit. */
+-#ifndef CONFIG_X86_64_VTX_64BIT_GUESTS
+-    tcb_t *cur_thread = NODE_STATE(ksCurThread);
+-    ARCH_NODE_STATE(x86KSCurrentGSBase) = -(word_t)1;
+-    ARCH_NODE_STATE(x86KSCurrentFSBase) = -(word_t)1;
+-    x86_load_fsgs_base(cur_thread, CURRENT_CPU_INDEX());
++     * they may have been dirtied by a VM exit.
++     *
++     * 64-bit VT-x guests save and restore the host's bases around each
++     * VM entry. On AMD, VMLOAD restores them from the host save area,
++     * which restore_svm() saves only once per core: they are whatever
++     * they were then, not this thread's. */
++#ifdef CONFIG_X86_64_VTX_64BIT_GUESTS
++    if (x86KSSVMEnabled)
+ #endif
++    {
++        tcb_t *cur_thread = NODE_STATE(ksCurThread);
++        ARCH_NODE_STATE(x86KSCurrentGSBase) = -(word_t)1;
++        ARCH_NODE_STATE(x86KSCurrentFSBase) = -(word_t)1;
++        x86_load_fsgs_base(cur_thread, CURRENT_CPU_INDEX());
++    }
+ 
+     c_entry_hook();
+     /* NODE_LOCK will get called in handleVmexit */
 diff --git a/src/arch/x86/config.cmake b/src/arch/x86/config.cmake
 index 252684bbf..64852a025 100644
 --- a/src/arch/x86/config.cmake
@@ -540,10 +573,10 @@ index da0b07c6f..c34ff5567 100644
  #ifdef CONFIG_PRINTING
 diff --git a/src/arch/x86/object/svm.c b/src/arch/x86/object/svm.c
 new file mode 100644
-index 000000000..f92638e51
+index 000000000..979d3039c
 --- /dev/null
 +++ b/src/arch/x86/object/svm.c
-@@ -0,0 +1,935 @@
+@@ -0,0 +1,939 @@
 +/*
 + * SPDX-License-Identifier: GPL-2.0-only
 + */
@@ -1106,6 +1139,7 @@ index 000000000..f92638e51
 +    return EXCEPTION_NONE;
 +}
 +
++#ifdef CONFIG_X86_64_VTX_64BIT_GUESTS
 +/* The MSRs that Read/WriteMSR have on VT-x, here in the VMCB. */
 +static word_t svm_msr_offset(word_t msr)
 +{
@@ -1177,6 +1211,7 @@ index 000000000..f92638e51
 +    setThreadState(thread, ThreadState_Restart);
 +    return EXCEPTION_NONE;
 +}
++#endif /* CONFIG_X86_64_VTX_64BIT_GUESTS */
 +
 +exception_t svm_decodeVCPUInvocation(word_t invLabel, word_t length, cap_t cap,
 +                                     bool_t call, word_t *buffer)
@@ -1186,10 +1221,12 @@ index 000000000..f92638e51
 +        return decodeReadVMCB(cap, length, call, buffer);
 +    case X86VCPUWriteVMCB:
 +        return decodeWriteVMCB(cap, length, call, buffer);
++#ifdef CONFIG_X86_64_VTX_64BIT_GUESTS
 +    case X86VCPUWriteMSR:
 +        return decodeSVMMSR(cap, length, true, buffer);
 +    case X86VCPUReadMSR:
 +        return decodeSVMMSR(cap, length, false, buffer);
++#endif /* CONFIG_X86_64_VTX_64BIT_GUESTS */
 +    default:
 +        userError("VCPU: Illegal operation on an AMD CPU.");
 +        current_syscall_error.type = seL4_IllegalOperation;
