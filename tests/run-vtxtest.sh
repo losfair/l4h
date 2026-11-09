@@ -90,6 +90,8 @@ if [ "$mode" = on ] && [ "$virt" = vt-x ]; then
     # and out of GUEST_CR4.
     grep -aq 'vtxprobe: vmx_cr4_mask ok' "$log" || fail "a CR4 bit outside the allowlist left the CR4 guest/host mask"
     grep -aq 'vtxprobe: vmx_guest_cr4 ok' "$log" || fail "a CR4 bit outside the allowlist was written to GUEST_CR4"
+    # Patches 0039 and 0043: MOV-DR and CR8 accesses always exit.
+    grep -aq 'vtxprobe: vmx_ppc_forced ok' "$log" || fail "MOV-DR or CR8-load/store exiting was cleared"
 fi
 if [ "$mode" = on ] && [ "$virt" = svm ]; then
     # Patch 0040.  seL4_IllegalOperation is 3.

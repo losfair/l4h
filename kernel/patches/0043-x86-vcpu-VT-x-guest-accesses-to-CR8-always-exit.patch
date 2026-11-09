@@ -1,0 +1,41 @@
+From 65c2ad0d2532da3350adbb34c04d2bc673dbb287 Mon Sep 17 00:00:00 2001
+From: l4h <z@univalence.me>
+Date: Mon, 9 Nov 2026 10:20:48 +0100
+Subject: [PATCH] x86/vcpu: VT-x guest accesses to CR8 always exit
+
+CR8 is the core's local APIC TPR.  Without the TPR shadow, which 0039
+does not allow, and with CR8-load and CR8-store exiting clear, a guest
+MOV to or from CR8 reaches the TPR itself.  Nothing switches the TPR at
+VM entry or exit, and seL4 never writes it, so:
+
+- the next guest on the core reads the value the last one left there;
+- a guest that raises it masks the host's interrupts on that core: those
+  at or below the TPR's priority class are no longer delivered, so
+  neither the host's timer nor its IPIs end guest mode, and they stay
+  masked for seL4 and every thread after it.
+
+So, as with MOV-DR (0039), CR8-load and CR8-store exiting are always on.
+A guest's MOV to or from CR8 is a control-register exit to userspace,
+which emulates CR8 per VCPU.  Reading back the primary controls shows
+both bits set.  AMD-V (0040) needs no counterpart: V_INTR_MASKING is
+always on, so a guest's CR8 is its VMCB's V_TPR.
+---
+ src/arch/x86/object/vcpu.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/arch/x86/object/vcpu.c b/src/arch/x86/object/vcpu.c
+index d4da9e197..6bad65cf7 100644
+--- a/src/arch/x86/object/vcpu.c
++++ b/src/arch/x86/object/vcpu.c
+@@ -269,6 +269,8 @@ static bool_t BOOT_CODE init_vtx_fixed_values(bool_t useTrueMsrs)
+     uint32_t primary_control_mask =
+         BIT(10) |   //MWAIT exiting
+         BIT(11) |   //RDPMC exiting: the counters are not switched
++        BIT(19) |   //CR8-load exiting: CR8 is the core's APIC TPR
++        BIT(20) |   //CR8-store exiting
+         BIT(23) |   //MOV-DR exiting: neither are the debug registers
+         BIT(25) |   //Use I/O bitmaps
+         BIT(28) |   //Use MSR bitmaps
+-- 
+2.47.3
+
