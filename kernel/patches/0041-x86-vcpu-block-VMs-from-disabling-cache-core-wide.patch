@@ -1,4 +1,4 @@
-From 7732301effb9da0ececb84d2b70fb663aa599be9 Mon Sep 17 00:00:00 2001
+From 0d4e45969f0149801d6fa115b79b11e5d2725819 Mon Sep 17 00:00:00 2001
 From: Bill Nguyen <bill.nguyen@unsw.edu.au>
 Date: Thu, 5 Nov 2026 10:17:36 +1100
 Subject: [PATCH] x86/vcpu: block VMs from disabling cache core-wide
@@ -77,7 +77,7 @@ index bf4a999da..19955a71d 100644
  #define CR4_OSFXSR          BIT(9)  /* Enable SSE et. al. features. */
  #define CR4_OSXMMEXCPT      BIT(10) /* Enable SSE exceptions. */
 diff --git a/src/arch/x86/object/vcpu.c b/src/arch/x86/object/vcpu.c
-index fd2b55d4e..5face92ea 100644
+index 99078f385..8a8900d38 100644
 --- a/src/arch/x86/object/vcpu.c
 +++ b/src/arch/x86/object/vcpu.c
 @@ -21,9 +21,7 @@
