@@ -71,7 +71,7 @@ static int is_amd(void)
 #define SVM_EXIT_CR4_WRITE 0x14
 #define SVM_EXIT_UD     0x46
 #define CR4_PKE         (1ul << 22)
-/* Patch 0042: the CR4 bits a guest may set (VCPU_GUEST_CR4_ALLOWED). */
+/* Patches 0040 and 0042: the CR4 bits a guest may set (VCPU_GUEST_CR4_ALLOWED). */
 #define CR4_ALLOWED     (0x1ffful | 1ul << 16 | 1ul << 17 | 1ul << 18 | 1ul << 20 | 1ul << 21)
 #define CR4_VMXE        (1ul << 13)
 /* The VMCS fields patch 0042 masks on VT-x. */
@@ -197,7 +197,7 @@ static void svm_probe(seL4_BootInfo *bi, seL4_CPtr ut, seL4_CPtr vcpu, seL4_CPtr
     check("svm_dirty_kept", ok && !seL4_MessageInfo_get_label(tag) &&
           !(seL4_GetMR(0) & VMCB_CLEAN_DT));
 
-    /* Patch 0042: CR4 writes always exit and CR4 keeps only the allowed
+    /* Patch 0040: CR4 writes always exit and CR4 keeps only the allowed
      * bits, so the guest cannot, for one, set a PKRU that the next guest on
      * the core runs with.  The guest sets PKE with a MOV; written back as a
      * VMM would on that exit, CR4 keeps PKE clear and WRPKRU raises #UD. */

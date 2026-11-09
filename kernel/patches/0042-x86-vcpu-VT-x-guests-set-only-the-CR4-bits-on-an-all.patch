@@ -1,0 +1,66 @@
+From ee608d71415937f04c75a1418620f2e4e09fb193 Mon Sep 17 00:00:00 2001
+From: l4h <z@univalence.me>
+Date: Mon, 9 Nov 2026 01:22:12 +0100
+Subject: [PATCH] x86/vcpu: VT-x guests set only the CR4 bits on an allowlist
+
+CR4 enables features whose state VM entries and exits do not switch,
+and seL4 does not switch either.  PKE is one: PKRU is outside the XSAVE
+features seL4 enables, and the host runs with CR4.PKE clear, so a guest
+that set CR4.PKE could WRPKRU a value that the next guest on the core
+with CR4.PKE set would read and run with.  KL is another: LOADIWKEY sets
+the core's Key Locker wrapping key, and seL4 does not allow the control
+that makes it exit.  Each new CPU may add more.
+
+So, as with the VM-execution controls (0039) and as patch 0040 does on
+AMD-V, guests get only the CR4 bits in VCPU_GUEST_CR4_ALLOWED, whose
+effects stay in guest mode.  The others are always in the CR4
+guest/host mask, so a guest changing one exits, and GUEST_CR4 takes only
+listed bits and the fixed ones (VMXE).  Reading back
+VMX_CONTROL_CR4_MASK shows the others set.
+---
+ src/arch/x86/object/vcpu.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/src/arch/x86/object/vcpu.c b/src/arch/x86/object/vcpu.c
+index b7ce7c23d..d4da9e197 100644
+--- a/src/arch/x86/object/vcpu.c
++++ b/src/arch/x86/object/vcpu.c
+@@ -582,6 +582,8 @@ void vcpu_init(vcpu_t *vcpu)
+     vmwrite(VMX_CONTROL_CR0_MASK, vcpu->cr0_mask);
+     vmwrite(VMX_CONTROL_CR0_READ_SHADOW, vcpu->cr0_shadow);
+     vmwrite(VMX_GUEST_CR4, cr4_high & cr4_low);
++    /* A guest changing a CR4 bit it may not set exits. */
++    vmwrite(VMX_CONTROL_CR4_MASK, ~(word_t)VCPU_GUEST_CR4_ALLOWED);
+ 
+     vmwrite(VMX_GUEST_VMCS_LINK_POINTER, ~(word_t)0);
+     vmwrite(VMX_GUEST_VMCS_LINK_POINTER_HIGH, ~(word_t)0);
+@@ -1037,7 +1039,6 @@ static exception_t decodeWriteVMCS(cap_t cap, word_t length, bool_t call, word_t
+     case VMX_GUEST_PENDING_DEBUG_EXCEPTIONS:
+     case VMX_GUEST_SYSENTER_ESP:
+     case VMX_GUEST_SYSENTER_EIP:
+-    case VMX_CONTROL_CR4_MASK:
+     case VMX_CONTROL_CR0_READ_SHADOW:
+     case VMX_CONTROL_CR4_READ_SHADOW:
+     case VMX_GUEST_CR3:
+@@ -1051,6 +1052,9 @@ static exception_t decodeWriteVMCS(cap_t cap, word_t length, bool_t call, word_t
+         /* CD, NW and reserved bits are always kernel-owned, see vcpu_init() */
+         value |= VMX_CR0_KERNEL_OWNED_BITS;
+         break;
++    case VMX_CONTROL_CR4_MASK:
++        value |= ~(word_t)VCPU_GUEST_CR4_ALLOWED;
++        break;
+     case VMX_CONTROL_PIN_EXECUTION_CONTROLS:
+         value = applyFixedBits(value, pin_control_high, pin_control_low & (pin_control_high | PIN_CONTROLS_ALLOWED));
+         break;
+@@ -1071,7 +1075,7 @@ static exception_t decodeWriteVMCS(cap_t cap, word_t length, bool_t call, word_t
+         value = applyFixedBits(value, cr0_high, cr0_low);
+         break;
+     case VMX_GUEST_CR4:
+-        value = applyFixedBits(value, cr4_high, cr4_low);
++        value = applyFixedBits(value, cr4_high, cr4_low & (cr4_high | VCPU_GUEST_CR4_ALLOWED));
+         break;
+     default:
+         userError("VCPU WriteVMCS: Invalid field %lx.", (long)field);
+-- 
+2.47.3
+

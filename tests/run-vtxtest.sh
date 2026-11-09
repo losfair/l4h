@@ -96,7 +96,7 @@ if [ "$mode" = on ] && [ "$virt" = svm ]; then
     grep -aq 'vtxprobe: svm_forced_intercepts ok' "$log" || fail "an intercept seL4 needs was cleared"
     grep -aq 'vtxprobe: svm_forced_invd ok' "$log" || fail "the INVD intercept was cleared"
     grep -aq 'vtxprobe: svm_owned_field err=3' "$log" || fail "a kernel-owned VMCB field was written"
-    # Patch 0042: CR4 writes always exit and CR4 keeps only the allowed bits.
+    # Patch 0040: CR4 writes always exit and CR4 keeps only the allowed bits.
     grep -aq 'vtxprobe: svm_forced_cr4_write ok' "$log" || fail "the CR4 write intercept was cleared"
     grep -aq 'vtxprobe: svm_cr4_allowed ok' "$log" || fail "a CR4 bit outside the allowlist was written"
     for step in asid map bind io npf invd hlt tls_base invalid dirty_kept cr4_exit pkru_ud inject_exit; do

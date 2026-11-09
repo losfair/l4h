@@ -1,4 +1,4 @@
-From 86dd145efa348b19dd43c42902b2034011a66352 Mon Sep 17 00:00:00 2001
+From fa58d9b45d8d5c059b9de12a6d6a22038e050ab3 Mon Sep 17 00:00:00 2001
 From: l4h <l4h@localhost>
 Date: Sun, 8 Nov 2026 19:30:53 +0100
 Subject: [PATCH] x86: AMD-V (SVM) behind the VCPU interface
@@ -25,7 +25,11 @@ VMs on both.  32-bit kernels keep VT-x only.
   and every debug register access, and #DB, #AC (a guest could loop on
   them) and #MC.  The permission map addresses, nCR3, the ASID, AVIC,
   SEV and the virtual VMLOAD and GIF settings are the kernel's; words
-  with host physical addresses read as 0.  Addresses VMLOAD loads as
+  with host physical addresses read as 0.  CR4 writes always exit, and
+  CR4 takes only the bits in VCPU_GUEST_CR4_ALLOWED (vcpu.h), whose
+  effects stay in guest mode: others enable state nothing switches,
+  such as PKRU, which the next guest on the core would run with, and
+  bits later CPUs define stay clear too.  Addresses VMLOAD loads as
   they are must be canonical, and gPAT valid (seL4_InvalidArgument).
   ReadVMCS, WriteVMCS and the I/O port invocations are refused on AMD,
   and ReadVMCB and WriteVMCB on Intel (seL4_IllegalOperation).
@@ -70,7 +74,7 @@ VMs on both.  32-bit kernels keep VT-x only.
 ---
  include/arch/x86/arch/model/statedata.h       |   7 +
  include/arch/x86/arch/object/svm.h            | 154 +++
- include/arch/x86/arch/object/vcpu.h           |  21 +
+ include/arch/x86/arch/object/vcpu.h           |  34 +
  .../x86/interfaces/object-api-arch.xml        |  50 +
  libsel4/arch_include/x86/sel4/arch/vmenter.h  |  12 +-
  src/arch/x86/64/c_traps.c                     |   3 +
@@ -79,9 +83,9 @@ VMs on both.  32-bit kernels keep VT-x only.
  src/arch/x86/config.cmake                     |   1 +
  src/arch/x86/kernel/ept.c                     |  21 +-
  src/arch/x86/model/statedata.c                |   6 +
- src/arch/x86/object/svm.c                     | 939 ++++++++++++++++++
+ src/arch/x86/object/svm.c                     | 946 ++++++++++++++++++
  src/arch/x86/object/vcpu.c                    |  69 +-
- 13 files changed, 1281 insertions(+), 29 deletions(-)
+ 13 files changed, 1301 insertions(+), 29 deletions(-)
  create mode 100644 include/arch/x86/arch/object/svm.h
  create mode 100644 src/arch/x86/object/svm.c
 
@@ -264,18 +268,31 @@ index 000000000..b9e6530f8
 +
 +#endif /* CONFIG_VTX */
 diff --git a/include/arch/x86/arch/object/vcpu.h b/include/arch/x86/arch/object/vcpu.h
-index c5012d988..14435ea90 100644
+index c5012d988..44da90d64 100644
 --- a/include/arch/x86/arch/object/vcpu.h
 +++ b/include/arch/x86/arch/object/vcpu.h
-@@ -8,6 +8,7 @@
+@@ -8,6 +8,20 @@
  
  #include <config.h>
  #include <api/failures.h>
 +#include <arch/object/svm.h>
++
++/*
++ * The CR4 bits a guest may set, on VT-x and AMD-V: those whose effects stay
++ * in guest mode, on state that VM entry and exit switch or that seL4 does
++ * (XCR0, the FS and GS bases).  VME, PVI, TSD, DE, PSE, PAE, MCE, PGE, PCE,
++ * OSFXSR, OSXMMEXCPT, UMIP, LA57, FSGSBASE, PCIDE, OSXSAVE, SMEP and SMAP.
++ * Every other bit stays clear in the guest, including any a later CPU
++ * defines: some enable state that nothing switches and that the next guest
++ * on the core would run with, such as PKRU (PKE), the Key Locker wrapping
++ * key (KL), PKRS (PKS) and the CET, UINTR and FRED registers.
++ */
++#define VCPU_GUEST_CR4_ALLOWED \
++    (MASK(13) | BIT(16) | BIT(17) | BIT(18) | BIT(20) | BIT(21))
  
  #define VCPU_VMCS_SIZE 4096
  #define VCPU_IOBITMAP_SIZE 8192
-@@ -381,6 +382,9 @@ struct vcpu {
+@@ -381,6 +395,9 @@ struct vcpu {
      /* Core this VCPU was last loaded on, or is currently loaded on */
      word_t last_cpu;
  #endif /* ENABLE_SMP_SUPPORT */
@@ -285,7 +302,7 @@ index c5012d988..14435ea90 100644
  };
  typedef struct vcpu vcpu_t;
  
-@@ -424,8 +428,25 @@ void VMCheckBoundNotification(tcb_t *tcb);
+@@ -424,8 +441,25 @@ void VMCheckBoundNotification(tcb_t *tcb);
  #endif /* ENABLE_SMP_SUPPORT */
  
  void invept(ept_pml4e_t *ept_pml4);
@@ -573,10 +590,10 @@ index da0b07c6f..c34ff5567 100644
  #ifdef CONFIG_PRINTING
 diff --git a/src/arch/x86/object/svm.c b/src/arch/x86/object/svm.c
 new file mode 100644
-index 000000000..94022e197
+index 000000000..f21a703d1
 --- /dev/null
 +++ b/src/arch/x86/object/svm.c
-@@ -0,0 +1,939 @@
+@@ -0,0 +1,946 @@
 +/*
 + * SPDX-License-Identifier: GPL-2.0-only
 + */
@@ -691,6 +708,9 @@ index 000000000..94022e197
 +                       SVM_I2_XSETBV | SVM_I2_RDPRU)
 +#define SVM_I2_WRITABLE (SVM_I2_VMMCALL | SVM_I2_RDTSCP | SVM_I2_ICEBP | SVM_I2_WBINVD)
 +#define SVM_EXC_FORCED (BIT(1) | BIT(17) | BIT(18))
++/* CR4 writes always exit: SVM has no CR4 mask, and a guest must not set
++ * the bits outside VCPU_GUEST_CR4_ALLOWED. */
++#define SVM_CR_FORCED  BIT(16 + 4)
 +
 +#define SVM_INT_CTL_WRITABLE    (MASK(9) | (MASK(4) << 16) | BIT(20))
 +#define SVM_V_INTR_MASKING      BIT(24)
@@ -863,6 +883,7 @@ index 000000000..94022e197
 +    vcpu->svm.last_cpu = CURRENT_CPU_INDEX();
 +
 +    memzero(vcpu->vmcs, VCPU_VMCS_SIZE);
++    *vmcb_u32(vcpu, VMCB_INTERCEPT_CR) = SVM_CR_FORCED;
 +    *vmcb_u32(vcpu, VMCB_INTERCEPT_DR) = ~(uint32_t)0;
 +    *vmcb_u32(vcpu, VMCB_INTERCEPT_EXC) = SVM_EXC_FORCED;
 +    *vmcb_u32(vcpu, VMCB_INTERCEPT_MISC1) = SVM_I1_FORCED;
@@ -919,7 +940,7 @@ index 000000000..94022e197
 +    switch (offset) {
 +    case VMCB_INTERCEPT_CR:      /* and the DR intercepts, all on */
 +        f->writable = MASK(32);
-+        f->forced = (uint64_t)MASK(32) << 32;
++        f->forced = SVM_CR_FORCED | ((uint64_t)MASK(32) << 32);
 +        f->clean = VMCB_CLEAN_I;
 +        return true;
 +    case VMCB_INTERCEPT_EXC:     /* and misc1 */
@@ -1005,9 +1026,12 @@ index 000000000..94022e197
 +        f->forced = EFER_SVME;
 +        f->clean = VMCB_CLEAN_CRX;
 +        return true;
++    case VMCB_CR4:
++        f->writable = VCPU_GUEST_CR4_ALLOWED;
++        f->clean = VMCB_CLEAN_CRX;
++        return true;
 +    case VMCB_CR0:
 +    case VMCB_CR3:
-+    case VMCB_CR4:
 +        f->clean = VMCB_CLEAN_CRX;
 +        return true;
 +    case VMCB_DR6:
