@@ -19,6 +19,8 @@ pub(crate) struct Slot<const W: usize> {
     // Text bytes in the low 16 bits; the rest is the user's (`Meta`).
     meta: AtomicU64,
     ticks: AtomicU64,
+    // `checksum` of the committed record.
+    sum: AtomicU64,
     text: [AtomicU64; W],
 }
 
@@ -26,9 +28,21 @@ impl<const W: usize> Slot<W> {
     const fn new() -> Self {
         Self {
             state: AtomicU64::new(0), meta: AtomicU64::new(0), ticks: AtomicU64::new(0),
-            text: [const { AtomicU64::new(0) }; W],
+            sum: AtomicU64::new(0), text: [const { AtomicU64::new(0) }; W],
         }
     }
+}
+
+/// What `commit` stores in `sum`, over the words as the slot holds them. A
+/// writer of an earlier lap can still make one store into a later record
+/// (`commit`). Each step maps its word one-to-one, so changing any one word
+/// changes the result, and the reader drops the record.
+fn checksum(seq: u64, ticks: u64, meta: u64, text: &[u64]) -> u64 {
+    let mut h = seq ^ 0x9e37_79b9_7f4a_7c15;
+    for w in [ticks, meta].into_iter().chain(text.iter().copied()) {
+        h = (h ^ w).wrapping_mul(0x0000_0100_0000_01b3).rotate_left(29);
+    }
+    h
 }
 
 #[repr(C)]
@@ -108,7 +122,8 @@ impl<const N: usize, const W: usize> Ring<N, W> {
     /// it would have if it had committed: its record is a lap old, and the
     /// writer may be dead. If it is only slow, it sees that the slot is no
     /// longer its own and stops; the worst it can do is one more store,
-    /// into a record that a reader will find whole but for that word.
+    /// into a later record, which its checksum then shows a reader to be
+    /// torn.
     pub fn commit(&self, seq: u64, ticks: u64, meta: u64, len: usize, text: &Buf<W>) {
         // Sequence exhaustion is not expected within a host's lifetime.
         let Some(state) = seq.checked_add(1).and_then(|n| n.checked_mul(2)) else { return };
@@ -119,7 +134,8 @@ impl<const N: usize, const W: usize> Ring<N, W> {
         }
         let ours = || slot.state.load(SeqCst) == mine;
         // Atomic payload and sequential consistency make a reader's two
-        // state checks exclude torn records even on AArch64.
+        // state checks exclude records torn by this lap's writers even on
+        // AArch64; `sum` excludes those an earlier lap's writer tore.
         for (dst, src) in slot.text.iter().zip(&text.0) {
             if !ours() {
                 return;
@@ -133,7 +149,12 @@ impl<const N: usize, const W: usize> Ring<N, W> {
         if !ours() {
             return;
         }
-        slot.meta.store(meta << 16 | len as u64, SeqCst);
+        let meta = meta << 16 | len as u64;
+        slot.meta.store(meta, SeqCst);
+        if !ours() {
+            return;
+        }
+        slot.sum.store(checksum(seq, ticks, meta, &text.0), SeqCst);
         let _ = slot.state.compare_exchange(mine, state, SeqCst, SeqCst);
     }
 
@@ -155,9 +176,37 @@ impl<const N: usize, const W: usize> Ring<N, W> {
         for (dst, src) in text.iter_mut().zip(&slot.text) {
             *dst = src.load(SeqCst);
         }
-        if slot.state.load(SeqCst) != want {
+        let sum = slot.sum.load(SeqCst);
+        if slot.state.load(SeqCst) != want || sum != checksum(seq, ticks, meta, &text) {
             return Entry::Gone;
         }
         Entry::Ready(Record { ticks, meta: meta >> 16, len, text })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A writer of an earlier lap, preempted between its ownership check
+    /// and its store, stores into the record committed after it.
+    #[test]
+    fn a_stale_writers_store_does_not_tear_a_later_record() {
+        let ring = Ring::<4, 4>::new();
+        let mut buf = Buf::<4>::new();
+        buf.bytes_mut()[..10].copy_from_slice(b"0123456789");
+        let stray: [fn(&Slot<4>); 4] = [
+            |s| s.meta.store(3, SeqCst),
+            |s| s.ticks.store(7, SeqCst),
+            |s| s.text[1].store(u64::from_le_bytes(*b"stalestr"), SeqCst),
+            |s| s.sum.store(0, SeqCst),
+        ];
+        for (seq, store) in (4u64..).zip(stray) {
+            ring.commit(seq, 5, 1, 10, &buf);
+            let Entry::Ready(r) = ring.get(seq) else { panic!("not committed") };
+            assert_eq!(r.text(), b"0123456789");
+            store(&ring.slots[(seq % 4) as usize]);
+            assert!(matches!(ring.get(seq), Entry::Gone));
+        }
     }
 }

@@ -2729,8 +2729,9 @@ guest power requests distinguish power off, reboot and kernel panic.
   operations, without allocating, making an IPC or touching message
   registers, and never wait on a lock: a writer preempted or faulting in a
   slot leaves the others the remaining slots. Readers validate the slot
-  generation around atomic payload reads and report overwritten, dropped
-  and incomplete records as unavailable; no reader consumes another's
+  generation around atomic payload reads, and a checksum of the record
+  against the one store a writer that lost its slot can still make, and
+  report overwritten, dropped, torn and incomplete records as unavailable; no reader consumes another's
   history or blocks the host.
 - Querying needs a working dom0 and vmmgr; this does not capture seL4's own
   debug stream or make a crashed host queryable.
@@ -3336,14 +3337,15 @@ a line.
              secondary kernels' console rings
 ```
 
-- **Serial ring** (`l4h_host::serial`). 1023 slots of 232 bytes, 256 KiB,
+- **Serial ring** (`l4h_host::serial`). 1023 slots of 224 bytes, 256 KiB,
   room for a dom0 boot and no deeper, since a deep ring only makes output
   later: a guest flood fills it, and everything waits behind that. Separate
   from the log ring so that console volume cannot push diagnostics
   out of `l4hctl logs`. The slots are the log ring's (`l4h_host::ring`):
   writers format on their stack, claim, never wait and make no seL4 call. A
   writer that stalls in a commit keeps its slot until the writer of a later
-  lap takes it back, and then stops, at worst after one more store. A line
+  lap takes it back, and then stops, at worst after one more store, which
+  the record's checksum shows its reader (the record is then lost). A line
   that does not fit takes consecutive slots, flagged as going on, and a
   reader prints them next to each other. Every task maps its partition's
   ring at the same address.
