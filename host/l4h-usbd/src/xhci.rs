@@ -74,6 +74,7 @@ pub const CC_STALL: u32 = 6;
 pub const CC_RESOURCE: u32 = 7;
 pub const CC_BANDWIDTH: u32 = 8;
 pub const CC_NO_SLOTS: u32 = 9;
+pub const CC_INVALID_STREAM_TYPE: u32 = 10;
 pub const CC_SHORT_PACKET: u32 = 13;
 pub const CC_RING_UNDERRUN: u32 = 14;
 pub const CC_RING_OVERRUN: u32 = 15;
@@ -82,6 +83,7 @@ pub const CC_MISSED_SERVICE: u32 = 23;
 pub const CC_STOPPED: u32 = 26;
 pub const CC_STOPPED_LENGTH_INVALID: u32 = 27;
 pub const CC_STOPPED_SHORT: u32 = 28;
+pub const CC_INVALID_STREAM_ID: u32 = 34;
 
 /// USBLEGCTLSTS: SMI enables cleared, the RW1C SMI events written back.
 const LEGACY_DISABLE_SMI: u32 = (0x7 << 1) | (0xff << 5) | (0x7 << 17);

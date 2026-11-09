@@ -23,6 +23,7 @@ mod blk;
 mod usb;
 
 pub const SHARED_VA: usize = 0x2000_0000_0000;
+pub const MMIO_VA: usize = 0x3000_0000_0000;
 
 use l4h_abi::usb as abi;
 use usb::*;

@@ -198,6 +198,13 @@ fn halts(cc: u32) -> bool {
     matches!(cc, CC_STALL | CC_BABBLE | CC_TRANSACTION | CC_TRB | 36)
 }
 
+/// Errors that halt a stream endpoint without a TRB to point at: a STALL
+/// or transaction error during Prime Pipe, a bad stream ID or context
+/// (xHCI 1.2 §4.12.2.1, §4.17.4; Linux's handle_transferless_tx_event).
+fn halts_transferless(cc: u32) -> bool {
+    matches!(cc, CC_STALL | CC_TRANSACTION | CC_INVALID_STREAM_TYPE | CC_INVALID_STREAM_ID)
+}
+
 pub struct Usbd {
     hc: Option<Xhci>,
     client: Option<Client>,
@@ -299,13 +306,22 @@ impl Usbd {
     fn transfer_event(&mut self, ev: &Trb) {
         let (slot, dci) = ((ev.control >> 24) as usize, ((ev.control >> 16) & 0x1f) as usize);
         let (cc, resid) = (ev.status >> 24, ev.status & 0xff_ffff);
-        // No TRB pointer (a Missed Service event may have none): the next
-        // event with one says where the controller is (see below).
-        if slot == 0 || slot > proto::MAX_SLOTS as usize || dci == 0 || ev.control & (1 << 2) != 0 || ev.param == 0 {
+        if slot == 0 || slot > proto::MAX_SLOTS as usize || dci == 0 || ev.control & (1 << 2) != 0 {
             return;
         }
         let ep = self.slots[slot].eps[dci];
         if ep.state == EpState::Disabled {
+            return;
+        }
+        if ev.param == 0 {
+            // A stream endpoint halted between TDs: reset it, with no URB
+            // to complete or skip (recover_all).
+            if ep.streams != 0 && halts_transferless(cc) && ep.state != EpState::Halted {
+                self.slots[slot].eps[dci].state = EpState::Halted;
+                let _ = self.recover.push((slot as u8, dci as u8, NONE));
+            }
+            // Otherwise (a Missed Service event may have no pointer) the
+            // next event with one says where the controller is (below).
             return;
         }
         let Some(hc) = &self.hc else { return };
@@ -635,7 +651,9 @@ impl Usbd {
     }
 
     /// Clear the halts the event handler found: Reset Endpoint, then Set TR
-    /// Dequeue past the URB that failed, then restart the ring.
+    /// Dequeue past the URB that failed (none for a stream endpoint's
+    /// transferless halt, ring NONE: its streams' dequeue pointers stay),
+    /// then restart the rings.
     fn recover_all(&mut self) {
         while let Some((slot, dci, r)) = self.recover.pop() {
             let (s, d) = (slot as usize, dci as usize);
@@ -646,7 +664,9 @@ impl Usbd {
             if self.command(reset).is_none() {
                 return;
             }
-            self.set_deq(s, d, r);
+            if r != NONE {
+                self.set_deq(s, d, r);
+            }
             self.slots[s].eps[d].state = EpState::Stopped;
             // The other rings of a stream endpoint start again too.
             let ep = self.slots[s].eps[d];
