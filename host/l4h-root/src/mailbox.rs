@@ -12,7 +12,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use sel4::{CapRights, VmAttributes, cap, cap_type};
 
-use l4h_host::wiring::Edge;
+use l4h_host::wiring::{E, o, p};
 use l4h_host::mailbox::{self as mb, ANSWER, ARGS, MAILBOX_PAGES, MAILBOX_VA, PUBLISHED_OFFSET, RING};
 
 use crate::component::{Component, abs_of};
@@ -56,7 +56,8 @@ impl Mailbox {
     /// Give `comp` its mailbox, number `index` in layout::MAILBOXES, from
     /// `arena`, keeping the mapping capabilities in `keep()`.  Root posts
     /// on edge `call`, and `comp` answers on `done`.
-    pub fn new(comp: &Component, index: usize, call: &Edge, done: &Edge, alloc: &mut Alloc, arena: &mut Arena,
+    pub fn new<T: p::IsParty>(comp: &Component, index: usize, call: &E<p::Root, T, o::Notification>,
+        done: &E<T, p::Root, o::Notification>, alloc: &mut Alloc, arena: &mut Arena,
         mut keep: impl FnMut() -> sel4::AbsoluteCPtr) -> Self {
         let base = layout::MAILBOXES.base + index * MAILBOX_PAGES * PAGE;
         assert!(base + MAILBOX_PAGES * PAGE <= layout::MAILBOXES.end(), "mailbox {}", index);
@@ -67,10 +68,10 @@ impl Mailbox {
                 CapRights::read_write(), VmAttributes::DEFAULT);
         }
         let ntfn = cap::Notification::from_bits(NTFN.load(Ordering::Relaxed));
-        comp.give_edge(done, 0, 0, ntfn);
+        comp.give_edge(done, 0, 0, &crate::component::root_ntfn(ntfn));
         let slot = alloc.slots.alloc();
         let kick = sel4::init_thread::Slot::<cap_type::Notification>::from_index(slot).cap();
-        crate::component::mint_edge(&abs_of(kick), call, 0, &abs_of(comp.ntfn)).expect("mailbox kick");
+        crate::component::mint_edge(&abs_of(kick), call, 0, &comp.obj()).expect("mailbox kick");
         Mailbox { page: base as *const mb::Mailbox, published: base + PUBLISHED_OFFSET, kick, posted: 0, answered: 0 }
     }
 

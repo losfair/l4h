@@ -389,8 +389,22 @@ impl Badged for core::convert::Infallible {
     }
 }
 
+/// A protocol: `protocol!` declares each as `<module>::call::Proto`.
+pub trait Protocol {
+    /// Its module path, which names it.
+    const NAME: &'static str;
+}
+
+/// No protocol: what a signal or fault edge carries (wiring::E).
+impl Protocol for () {
+    const NAME: &'static str = "";
+}
+
 /// An endpoint a client calls.
 pub trait Call {
+    /// The protocol the endpoint serves: only its `Client` calls it.
+    type Proto: Protocol;
+
     /// Call with `label` and `args` in message registers 0..; the reply's
     /// message registers go into `reply`.  Returns the reply's length.
     fn ipc(&self, label: u64, args: &[u64], reply: &mut [u64]) -> usize;
@@ -603,6 +617,15 @@ macro_rules! protocol {
 
             pub type Sender = super::$sender;
 
+            /// The protocol, as a type (wire::Protocol): an endpoint that
+            /// serves it is an `l4h_ipc::Endpoint<Proto>`.
+            #[derive(Clone, Copy, Debug)]
+            pub struct Proto;
+
+            impl $crate::wire::Protocol for Proto {
+                const NAME: &'static str = module_path!();
+            }
+
             /// A decoded call.  No heap: it lives on the server's stack.
             #[derive(Clone, Debug)]
             #[allow(clippy::large_enum_variant)]
@@ -767,7 +790,7 @@ macro_rules! protocol {
                 )*
             }
 
-            impl<T: $crate::wire::Call + ?Sized> Client for T {}
+            impl<T: $crate::wire::Call<Proto = Proto> + ?Sized> Client for T {}
         }
     };
     (@xchg) => { 0 };
@@ -857,6 +880,7 @@ mod tests {
     /// A client whose calls go straight to Srv.
     struct Loop(Who);
     impl Call for Loop {
+        type Proto = demo::Proto;
         fn ipc(&self, label: u64, args: &[u64], reply: &mut [u64]) -> usize {
             let mut out = [0; demo::Request::MAX_REPLY_WORDS];
             let n = demo::serve(&mut Srv, label, args, self.0, &mut out).unwrap_or(0);

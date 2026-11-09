@@ -13,7 +13,7 @@ pub fn read(id: usize, instance: u64) -> Flags {
 /// Act on or seal (trust::FLAGS_ACT, FLAGS_SEAL) guest `id`'s flags,
 /// through the flags thread: its flags, or a positive errno.
 pub fn call(op: u64, id: usize, instance: u64, bits: [u64; 4], flags: u64) -> Result<Flags, Errno> {
-    let ep = l4h_rt::ipc::Endpoint(cap::<cap_type::Endpoint>(trust::SLOT_FLAGS_CALL));
+    let ep = l4h_rt::ipc::Endpoint::of(&l4h_rt::host::wiring::TRUSTD_FLAGS, l4h_rt::host::wiring::p::Trustd, 0);
     let r = if op == trust::FLAGS_SEAL { ep.seal(id, instance, bits, flags) } else { ep.act(id, instance, bits, flags) };
     l4h_rt::host::wire::eio_if_failed(r)
 }

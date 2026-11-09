@@ -17,7 +17,10 @@ use crate::window::Window;
 const PAGE: usize = 4096;
 
 use l4h_host::badges::parent;
-use l4h_host::wiring::{self, Edge};
+use l4h_host::wire::Protocol;
+use l4h_host::wiring::{self, E, Object, o, p};
+
+use crate::edge::Obj;
 
 /// The badge of a component's calls on its parent's endpoint (badges::parent).
 pub const fn component_badge(id: u32) -> u64 {
@@ -51,22 +54,35 @@ impl Component {
             .unwrap_or_else(|e| panic!("component {} slot {} copy: {:?}", self.id, idx, e));
     }
 
-    /// Mint a capability that is no IPC (a CNode's guard): those are
-    /// edges (give_edge).
-    pub fn give_badged(&self, idx: u64, src: impl sel4::HasCPtrWithDepth, rights: CapRights, badge: u64) {
-        self.slot(idx)
-            .mint(&self.local_cnode.absolute_cptr(src), rights, badge)
+    /// Give it a CNode, with `guard`: the one mint that is no edge.
+    pub fn give_cnode(&self, idx: u64, cnode: cap::CNode, guard: CNodeCapData) {
+        crate::edge::mint_cnode(&self.slot(idx), self.local_cnode, cnode, guard)
             .unwrap_or_else(|e| panic!("component {} slot {} mint: {:?}", self.id, idx, e));
     }
 
     /// Mint instance `i` of `e`, which this component holds, from `src`
-    /// (the target's object, in the caller's CSpace) into the edge's n-th
-    /// slot.
-    pub fn give_edge(&self, e: &Edge, n: usize, i: usize, src: impl sel4::HasCPtrWithDepth) {
-        assert!(e.holder.kind() == Some(self.kind), "component {} does not hold {}", self.id, e.name);
+    /// into the edge's n-th slot.
+    pub fn give_edge<H, T, O, P>(&self, e: &E<H, T, O, P>, n: usize, i: usize, src: &Obj<T, O>)
+    where
+        H: p::IsParty,
+        T: p::IsParty,
+        O: o::IsObject,
+        P: Protocol,
+    {
+        assert!(H::PARTY.kind() == Some(self.kind), "component {} does not hold {}", self.id, e.name);
         let idx = e.slot(n);
-        crate::edge::mint(&self.slot(idx), e, i, &self.local_cnode.absolute_cptr(src))
+        crate::edge::mint(&self.slot(idx), e, i, src)
             .unwrap_or_else(|err| panic!("component {} slot {} ({}) mint: {:?}", self.id, idx, e.name, err));
+    }
+
+    /// Its notification or service endpoint, as T's: it must be one.
+    pub fn obj<T: p::IsParty, O: o::IsObject>(&self) -> Obj<T, O> {
+        assert!(T::PARTY.kind() == Some(self.kind), "component {} is not {:?}", self.id, T::PARTY);
+        Obj::claim(match O::OBJECT {
+            Object::Notification => self.local_cnode.absolute_cptr(self.ntfn),
+            Object::Endpoint => self.local_cnode.absolute_cptr(self.service_ep),
+            o => panic!("a component has no {:?} of its own", o),
+        })
     }
 
     /// Map `frame` (a capability anywhere in the parent's CSpace) into the
@@ -116,6 +132,8 @@ pub struct SpawnContext {
     pub authority: cap::Tcb,
     pub sched_control: cap::SchedControl,
     pub parent_ep: cap::Endpoint,
+    /// Whose parent_ep is: the components' calls and faults go to it.
+    pub parent: wiring::Party,
     pub tsc_hz: u64,
     /// First of the parent's contiguous capabilities to the log frames.
     pub log_frames: u64,
@@ -286,13 +304,16 @@ pub fn create(
 
     // ---- CSpace.
     let guard = CNodeCapData::new(0, 64 - cnode_bits);
-    c.give_badged(host::SLOT_CNODE, cnode, CapRights::all(), guard.into_word());
+    c.give_cnode(host::SLOT_CNODE, cnode, guard);
     c.give(host::SLOT_VSPACE, vspace, CapRights::all());
     c.give(host::SLOT_TCB, tcb, CapRights::all());
     // Only a component that calls its parent can.
     if let Some(e) = wiring::parent_call(args.kind) {
         assert_eq!(e.badge(args.id as usize), component_badge(args.id), "{}: the parent knows the caller by its id", e.name);
-        c.give_edge(e, 0, args.id as usize, context.parent_ep);
+        assert!(e.target == context.parent, "{} is not to the parent", e.name);
+        let dst = c.slot(e.slot(0));
+        crate::edge::mint_dyn(&dst, e, args.id as usize, &local_cnode.absolute_cptr(context.parent_ep))
+            .expect("component's parent endpoint");
     }
     c.give(host::SLOT_NTFN, ntfn, CapRights::all());
     c.give(host::SLOT_SERVICE_EP, service_ep, CapRights::all());
@@ -309,8 +330,9 @@ pub fn create(
     let fault = if keeper.is_some() { wiring::keeper_fault(args.kind) } else { wiring::parent_fault(args.kind) }
         .expect("a component's faults go to its parent");
     assert_eq!(fault.badge(args.id as usize), component_badge(args.id) | parent::FAULT, "{}", fault.name);
+    assert!(fault.target == context.parent, "{} is not to the parent", fault.name);
     let fault_slot = alloc.slots.alloc();
-    crate::edge::mint(&local_cnode.absolute_cptr(cap_at::<cap_type::Null>(fault_slot)), fault, args.id as usize,
+    crate::edge::mint_dyn(&local_cnode.absolute_cptr(cap_at::<cap_type::Null>(fault_slot)), fault, args.id as usize,
         &local_cnode.absolute_cptr(context.parent_ep))
         .expect("component fault ep");
     let root_fault = cap_at::<cap_type::Endpoint>(fault_slot);

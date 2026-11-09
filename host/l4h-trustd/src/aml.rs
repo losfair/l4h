@@ -21,8 +21,7 @@ use acpi::{Handle, PciAddress, RawPhysicalMapping};
 
 use l4h_rt::host::fixed::ArrayVec;
 use l4h_rt::host::trust::{self, TrustdConfig};
-use l4h_rt::{cap, host, sel4};
-use sel4::cap_type;
+use l4h_rt::host;
 
 use crate::time;
 
@@ -77,7 +76,7 @@ impl Hw {
     /// What root read: all ones if it refused, or failed.
     fn root(&self, op: u64, addr: u64, off: u64, width: usize, value: u64) -> u64 {
         use l4h_rt::host::root::call::Client;
-        l4h_rt::ipc::Endpoint(cap::<cap_type::Endpoint>(host::SLOT_ROOT_EP))
+        l4h_rt::ipc::Endpoint::of(&l4h_rt::host::wiring::TRUSTD_ROOT, l4h_rt::host::wiring::p::Trustd, 0)
             .hw(op, addr as usize, off as usize, width, value)
             .unwrap_or(u64::MAX)
     }

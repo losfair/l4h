@@ -4,6 +4,7 @@
 use l4h_host::fixed::ArrayVec;
 use l4h_host::memd::{self, Status, call::Client};
 use l4h_host::wire::Call;
+use l4h_host::wiring::{o, p};
 use sel4::{cap, cap_type};
 
 use crate::cap_at;
@@ -11,7 +12,7 @@ use crate::mem::Slot;
 
 #[derive(Clone, Copy)]
 pub struct MemdLink {
-    ep: cap::Endpoint,
+    ep: l4h_ipc::Endpoint<memd::call::Proto>,
     local_cnode: cap::CNode,
     exchange: cap::CNode,
     exchange_bits: usize,
@@ -26,7 +27,7 @@ impl MemdLink {
     /// `status_va` must remain mapped to memd's aligned, readable `Status`
     /// record for the lifetime of this link and all its copies.
     pub unsafe fn new(
-        ep: cap::Endpoint,
+        ep: l4h_ipc::Endpoint<memd::call::Proto>,
         local_cnode: cap::CNode,
         exchange: cap::CNode,
         exchange_bits: usize,
@@ -36,8 +37,9 @@ impl MemdLink {
         Self { ep, local_cnode, exchange, exchange_bits, exchange_base, status_va }
     }
 
-    pub fn endpoint(&self) -> cap::Endpoint {
-        self.ep
+    /// memd's endpoint, to mint from (wiring::VMMGR_MEMD).
+    pub fn obj(&self) -> crate::edge::Obj<p::Memd, o::Endpoint> {
+        crate::edge::Obj::claim(self.local_cnode.absolute_cptr(self.ep.cap()))
     }
 
     pub fn slot(&self, i: u64) -> sel4::AbsoluteCPtr {
@@ -79,7 +81,9 @@ impl MemdLink {
 
 /// memd's calls (l4h_host::memd::call) go over its endpoint.
 impl Call for MemdLink {
+    type Proto = memd::call::Proto;
+
     fn ipc(&self, label: u64, args: &[u64], reply: &mut [u64]) -> usize {
-        l4h_ipc::Endpoint(self.ep).ipc(label, args, reply)
+        self.ep.ipc(label, args, reply)
     }
 }

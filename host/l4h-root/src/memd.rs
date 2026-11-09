@@ -55,9 +55,9 @@ fn link(alloc: &Alloc) -> MemdLink {
 pub fn give_vmmgr(alloc: &mut Alloc, arena: &mut Arena, vmmgr: &Component) {
     use l4h_host::vmmgr as proto;
     let m = link(alloc);
-    vmmgr.give_edge(&wiring::VMMGR_MEMD, 0, 0, m.endpoint());
+    vmmgr.give_edge(&wiring::VMMGR_MEMD, 0, 0, &m.obj());
     for g in 0..memd::MAX_GUESTS {
-        vmmgr.give_edge(&wiring::VMMGR_VMM_MEMD, g, g, m.endpoint());
+        vmmgr.give_edge(&wiring::VMMGR_VMM_MEMD, g, g, &m.obj());
     }
     let area = arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: memd::XCHG_RADIX });
     vmmgr.give(proto::SLOT_MEMD_XCHG, area, CapRights::all());
@@ -236,7 +236,7 @@ pub fn spawn(alloc: &mut Alloc, win: &mut Window, asids: &mut AsidPools, info: &
     component::start(&m.comp);
     // The status mapping above remains readable for the root task's life.
     let link = unsafe {
-        MemdLink::new(m.comp.service_ep, crate::slot::CNODE.cap(), m.comp.cnode, bits, memd::SLOT_XCHG, STATUS_VA)
+        MemdLink::new(l4h_ipc::Endpoint::chosen(&wiring::ROOT_MEMD, wiring::p::Root, m.comp.service_ep), crate::slot::CNODE.cap(), m.comp.cnode, bits, memd::SLOT_XCHG, STATUS_VA)
     };
     alloc.hand_over(link);
     info!(

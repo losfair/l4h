@@ -237,7 +237,7 @@ fn map(g: &mut Guest, comp: &Component, backends: &[(usize, Backend)], alloc: &m
     for (v, vcpu) in g.vcpus.iter().enumerate() {
         let ev = crate::component::abs_of(vcpu.event);
         comp.map_copy(alloc, &mut g.arena, &ev, host::vmm_event_page_va(v), CapRights::read_write(), attrs, keep_slot());
-        comp.give_edge(&l4h_host::wiring::VMM_VCPU, v, 0, vcpu.ntfn);
+        comp.give_edge(&l4h_host::wiring::VMM_VCPU, v, 0, &g.vcpu_obj(v));
     }
     for (d, dev) in g.devices.iter().enumerate() {
         // A USB controller's queue area is usbd's and the guest's alone.

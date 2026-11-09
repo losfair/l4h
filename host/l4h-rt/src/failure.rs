@@ -26,6 +26,8 @@ pub fn set_failure_handler(handler: &'static FailureHandler) {
 /// Answer the callers of a failed component (host::has_keeper): wire::FAILED
 /// to every call, the one the main thread's reply object holds (if any)
 /// first.  Faults sent to it (vmmgr's guests' and VMMs') stay unanswered.
+/// Not l4h_ipc::run: it serves no protocol, and starts by answering.
+#[allow(clippy::disallowed_methods)]
 pub(crate) fn answer_failed(tcb: u64) -> ! {
     let handler = unsafe { HANDLER.load(Ordering::Acquire).as_ref() };
     if handler.is_some() && tcb != host::SLOT_TCB {

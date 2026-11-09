@@ -121,6 +121,7 @@ impl HostInfo {
             authority: slot::TCB.cap(),
             sched_control: self.sched_control(core),
             parent_ep: self.hyp_ep,
+            parent: l4h_host::wiring::Party::Root,
             tsc_hz: self.tsc_hz,
             log_frames: self.log_frames,
             serial_frames: self.serial_frames,

@@ -345,7 +345,7 @@ fn claim(h: &mut Host, i: usize) -> Result<(), Errno> {
     pci::msi_irq(&d, vector, &abs_of(root_cap::<cap_type::Null>(irq_slot)));
     let irq = root_cap::<cap_type::IrqHandler>(irq_slot);
     let irq_ntfn = root_cap::<cap_type::Notification>(h.alloc.slots.alloc());
-    component::mint_edge(&abs_of(irq_ntfn), &wiring::IRQ_USBD, 0, &abs_of(comp.ntfn)).expect("usbd IRQ notification");
+    component::mint_edge(&abs_of(irq_ntfn), &wiring::IRQ_USBD, 0, &comp.obj()).expect("usbd IRQ notification");
     irq.irq_handler_set_notification(irq_ntfn).expect("usbd IRQ set notification");
     comp.give(usb::USBD_SLOT_IRQ, irq, CapRights::all());
     c.dom = dom;
@@ -545,9 +545,9 @@ pub fn attach(h: &mut Host, i: usize, g: &mut RootGuest) -> Result<Attached, Err
     // Completions go to the guest's VMM, which raises the device's event.
     let irq_slot = usb::USBD_SLOT_CLIENT_IRQ + idx as u64;
     let _ = d.comp.slot(irq_slot).delete();
-    d.comp.give_edge(&wiring::USBD_VMM, idx, n, g.vmm_ntfn);
+    d.comp.give_edge(&wiring::USBD_VMM, idx, n, &g.vmm_ntfn);
     let kick = root_cap::<cap_type::Notification>(h.alloc.slots.alloc());
-    component::mint_edge(&abs_of(kick), &wiring::VMM_USBD_KICK, 0, &abs_of(d.comp.ntfn)).expect("usbd kick");
+    component::mint_edge(&abs_of(kick), &wiring::VMM_USBD_KICK, 0, &d.comp.obj()).expect("usbd kick");
     d.idx = idx;
     c.pool = Some((g.pool.gpa, g.pool.paddr, g.pool.size));
     c.state = State::Vm(g.id);

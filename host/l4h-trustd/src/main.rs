@@ -652,7 +652,7 @@ fn answer(id: usize, seq: u32, result: Result<&[u8], Errno>) {
         addr_of_mut!((*p).done).write_volatile(seq);
     }
     use l4h_rt::host::root::call::Client;
-    let _ = l4h_rt::ipc::Endpoint(cap::<cap_type::Endpoint>(host::SLOT_ROOT_EP)).attest_done(id);
+    let _ = l4h_rt::ipc::Endpoint::of(&l4h_rt::host::wiring::TRUSTD_ROOT, l4h_rt::host::wiring::p::Trustd, 0).attest_done(id);
 }
 
 fn main(info: &'static Info) -> ! {

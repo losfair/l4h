@@ -21,6 +21,7 @@ mod caps {
 }
 use l4h_host::vmmgr as proto;
 use l4h_ipc::Endpoint;
+use l4h_host::wiring;
 
 use crate::component::abs_of;
 use crate::guest::Guest;
@@ -29,8 +30,8 @@ use crate::vmm::Backend;
 use crate::ctl;
 
 /// Root's endpoint, whose calls l4h_host::root::call declares.
-fn root() -> Endpoint {
-    Endpoint(sel4::Cap::from_bits(host::SLOT_ROOT_EP))
+fn root() -> Endpoint<l4h_host::root::call::Proto> {
+    Endpoint::of(&wiring::VMMGR_ROOT, wiring::p::Vmmgr, 0)
 }
 
 /// Root's errno as ours: a failed root is EIO.
@@ -167,12 +168,12 @@ pub fn result_data() -> &'static [u8; abi::CTL_DATA_MAX] {
 
 /// trustd's flags, and the capability to act on them for the console.
 pub struct Flags {
-    ep: cap::Endpoint,
+    ep: Endpoint<l4h_host::trust::call::Proto>,
 }
 
 impl Flags {
     pub fn new(cfg: &proto::VmmgrConfig) -> Option<Self> {
-        (cfg.trust != 0).then(|| Flags { ep: sel4::Cap::from_bits(proto::SLOT_FLAGS_EP) })
+        (cfg.trust != 0).then(|| Flags { ep: Endpoint::of(&wiring::VMMGR_FLAGS, wiring::p::Vmmgr, 0) })
     }
 
     pub fn flags(&self, g: &Guest) -> trust::Flags {
@@ -185,7 +186,7 @@ impl Flags {
         if g.id == caller { return Ok(()); }
         self.flags(g).act(bits, effect, || {
             use l4h_host::trust::call::Client;
-            errno(Endpoint(self.ep).act(g.id, g.instance, [bits, 0, 0, 0], 0)).map(|_| ())
+            errno(self.ep.act(g.id, g.instance, [bits, 0, 0, 0], 0)).map(|_| ())
         })
     }
 }

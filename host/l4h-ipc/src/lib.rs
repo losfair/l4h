@@ -9,14 +9,48 @@
 //! declarations".
 
 #![no_std]
+// The one crate that calls, serves and receives on endpoints: host/clippy.toml
+// refuses those seL4 calls everywhere else.
+#![allow(clippy::disallowed_methods)]
 
-use l4h_host::wire::{Badged, Call, EINVAL, MAX_MRS};
+use core::marker::PhantomData;
 
-/// An endpoint capability, as a protocol's client calls it.
-#[derive(Clone, Copy)]
-pub struct Endpoint(pub sel4::cap::Endpoint);
+use l4h_host::wire::{Badged, Call, EINVAL, MAX_MRS, Protocol};
+use l4h_host::wiring::{At, E, p};
 
-impl Call for Endpoint {
+/// An endpoint that serves protocol P, as P's client calls it: made from
+/// a call edge whose protocol is P (wiring::E), so that no other
+/// protocol's calls can be made on it.
+pub struct Endpoint<P>(sel4::cap::Endpoint, PhantomData<P>);
+
+impl<P> Clone for Endpoint<P> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<P> Copy for Endpoint<P> {}
+
+impl<P: Protocol> Endpoint<P> {
+    /// The one `e` gives its holder, `_me`, in the edge's slot n.
+    pub const fn of<H: p::IsParty, T, O>(e: &E<H, T, O, P>, _me: H, n: usize) -> Self {
+        Endpoint(sel4::cap::Endpoint::from_bits(e.0.slot(n)), PhantomData)
+    }
+
+    /// The one `e` gives its holder in a slot of the holder's choosing
+    /// (At::Chosen), `ep`.
+    pub fn chosen<H: p::IsParty, T, O>(e: &E<H, T, O, P>, _me: H, ep: sel4::cap::Endpoint) -> Self {
+        assert!(matches!(e.at, At::Chosen), "{} is in a slot of its own", e.name);
+        Endpoint(ep, PhantomData)
+    }
+
+    pub fn cap(&self) -> sel4::cap::Endpoint {
+        self.0
+    }
+}
+
+impl<P: Protocol> Call for Endpoint<P> {
+    type Proto = P;
+
     fn ipc(&self, label: u64, args: &[u64], reply: &mut [u64]) -> usize {
         sel4::with_ipc_buffer_mut(|b| b.msg_regs_mut()[..args.len()].copy_from_slice(args));
         let info = self.0.call(sel4::MessageInfo::new(label, 0, 0, args.len()));

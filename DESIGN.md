@@ -2753,41 +2753,66 @@ one way to do each part of it:
   faulted driver's mailbox, `Mailbox::abandon`), and a
   method that must leave its caller blocked returns `wire::NO_REPLY`.
 - **Transports.** An endpoint's calls go through `l4h-ipc`: clients call
-  an `l4h_ipc::Endpoint` (or `MemdLink`, which is one with exchange
-  slots), servers answer with `l4h_ipc::serve`, which takes the arguments
-  out of the message registers before the handler runs and puts the reply
-  there after it returns, so no handler's invocations can overwrite
-  either; work between receiving a message and serving it runs in
-  `l4h_ipc::preserving`. A driver's mailbox carries the same protocols
-  without IPC: root posts a typed `Request` (`Mailbox::send`) and decodes
-  each answer by its call's reply type; the driver answers with
-  `l4h_rt::mailbox::serve`, which reads and writes the ring and never the
-  registers. Capabilities still cross in exchange slots, which each call's
-  declaration names.
+  an `l4h_ipc::Endpoint<P>`, which serves protocol P and is made from a
+  call edge whose protocol is P (`Endpoint::of`, or `chosen` for one in a
+  slot of the holder's choosing), so only P's `Client` methods can be
+  called on it (`MemdLink` is one with exchange slots). Every server's
+  thread runs `l4h_ipc::run`, the one serve loop: the server
+  (`l4h_ipc::Server`) names its badge space's signals, the FAULT bit if
+  faults come to it, and its `Sender`; `run` tells signals, faults and
+  calls apart by the badge, decodes the sender (`wire::Badged`) and
+  refuses with `EINVAL` any badge that is no sender, answers no fault,
+  and replaces a reply object left bound to an unanswered caller
+  (`l4h_task::reply::ReplySlot`, where the server can). `l4h_ipc::serve`
+  takes a call's arguments out of the message registers before its
+  handler runs and puts the reply there after it returns, and `run` keeps
+  a message, and a reply not yet sent, there across the server's other
+  work (`l4h_ipc::preserving`), so no invocation can overwrite either. A
+  thread that is not called (trustd's main thread, logd, the drivers)
+  waits on its notification instead. Only l4h-ipc calls, serves and
+  receives on endpoints (and l4h-rt's keeper and failure answers, which
+  serve no protocol): clippy's `disallowed-methods` (`host/clippy.toml`,
+  `tests/check-ipc.sh`) refuses those seL4 calls anywhere else. A
+  driver's mailbox carries the same protocols without IPC: root posts a
+  typed `Request` (`Mailbox::send`) and decodes each answer by its
+  call's reply type; the driver answers with `l4h_rt::mailbox::serve`,
+  which reads and writes the ring and never the registers. Capabilities
+  still cross in exchange slots, which each call's declaration names.
 - **Wiring.** Every capability by which one party calls, signals or
-  faults to another is an `Edge` of `l4h_host::wiring`: its holder and
+  faults to another is an edge of `l4h_host::wiring`: its holder and
   where it holds it (fixed slots, a slot its minter chooses, an IRQ
   handler, a fault endpoint), its target and which of its objects, its
   rights, its badge (one value, a field per instance, or a bit per
-  instance), its minter and what it is for. It is minted from the edge
-  and nothing else (`l4h_task::edge::mint`, `Component::give_edge`, the
-  guest's `give_edge` in vmmgr), so slot, rights and badge cannot drift
-  from the declaration; `tests/check-wiring.sh` allows no other mint but
-  a CNode's guard. A component gets a capability to its parent's
-  endpoint only if it calls its parent (`wiring::parent_call`: trustd,
-  vmmgr, the VMMs), and its faults go to its parent by its fault edge
-  (`parent_fault`, or `keeper_fault` for a component with a keeper). At
-  compile time no two edges share a slot or a notification bit unless
-  both are declared shared, every call's badge decodes as a sender its
-  protocol accepts, every signal is in its receiver's badge space, root
-  calls no driver, vmmgr or VMM (it posts in their mailboxes), every fault
-  carries the FAULT bit, and a component has a keeper exactly when
-  another component calls it (`host::has_keeper`). trustd is the
-  exception: root and vmmgr call its flags thread, and a flags thread
-  that faults stops the host (`FLAGS_FAULT`). Capabilities that pass
-  resources (CNodes, frames, IRQ handlers, I/O ports, TCBs) are not
-  edges, nor are a guest's own vCPUs' (the guest ABI). The edges
-  themselves are listed only in `wiring.rs`.
+  instance), its minter and what it is for. Each edge is typed
+  `E<Holder, Target, Object, Protocol>`, and `E::new` checks at compile
+  time that the type names the edge's holder, target and object and,
+  for a call, the protocol the target's object serves. A capability is
+  minted from its edge and nothing else (`l4h_task::edge::mint`,
+  `Component::give_edge`, the guest's `give_edge` in vmmgr), so slot,
+  rights and badge cannot drift from the declaration, and only from an
+  `Obj<Target, Object>`: what an edge is minted from has the edge's
+  target and object as its type. An `Obj` is claimed once, where the
+  object is made or received (`Obj::claim`, `Component::obj`, which
+  checks the component's kind, `MemdLink::obj`, the guest's `vcpu_obj`
+  and `vmm_ntfn_obj`), so passing another party's notification to a mint
+  does not compile. The only other mint is of a CNode with its guard
+  (`edge::mint_cnode`, `give_cnode`), and clippy refuses `mint` anywhere
+  else. A component gets a capability to its parent's endpoint only if
+  it calls its parent (`wiring::parent_call`: trustd, vmmgr, the VMMs),
+  and its faults go to its parent by its fault edge (`parent_fault`, or
+  `keeper_fault` for a component with a keeper); `create` checks that
+  both are to the parent it is given. At compile time no two edges share
+  a slot or a notification bit unless both are declared shared, every
+  call's badge decodes as a sender its protocol accepts, every signal is
+  in its receiver's badge space, root calls no driver, vmmgr or VMM (it
+  posts in their mailboxes), every fault carries the FAULT bit, and a
+  component has a keeper exactly when another component calls it
+  (`host::has_keeper`). trustd is the exception: root and vmmgr call its
+  flags thread, and a flags thread that faults stops the host
+  (`FLAGS_FAULT`). Capabilities that pass resources (CNodes, frames, IRQ
+  handlers, I/O ports, TCBs) are not edges, nor are a guest's own
+  vCPUs' (the guest ABI). The edges themselves are listed only in
+  `wiring.rs`.
 
 **Serial output** goes through shared memory to l4h-logd (§10.4), and root
 drives COM1 input for the monitor. The port takes about 11 KB/s, so prints

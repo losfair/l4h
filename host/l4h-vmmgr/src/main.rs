@@ -99,6 +99,7 @@ impl HostInfo {
             authority: slot::TCB.cap(),
             sched_control: self.sched_control(core),
             parent_ep: self.hyp_ep,
+            parent: l4h_host::wiring::Party::Vmmgr,
             tsc_hz: self.tsc_hz,
             log_frames: proto::SLOT_LOG_FRAMES,
             serial_frames: proto::SLOT_SERIAL_FRAMES,

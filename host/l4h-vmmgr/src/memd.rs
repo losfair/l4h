@@ -18,7 +18,7 @@ pub fn link() -> MemdLink {
     // Root maps the read-only status record for this task's lifetime.
     unsafe {
         MemdLink::new(
-            sel4::Cap::from_bits(proto::SLOT_MEMD_EP), crate::slot::CNODE.cap(),
+            l4h_ipc::Endpoint::of(&l4h_host::wiring::VMMGR_MEMD, l4h_host::wiring::p::Vmmgr, 0), crate::slot::CNODE.cap(),
             sel4::Cap::from_bits(proto::SLOT_MEMD_XCHG), XCHG_RADIX, 0, proto::MEMD_STATUS_VA,
         )
     }

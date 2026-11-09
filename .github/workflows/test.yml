@@ -72,8 +72,6 @@ jobs:
         run: tests/run-versiontest.sh
       - name: No host code prints through the kernel
         run: tests/check-debug-print.sh
-      - name: Capabilities are minted from the wiring
-        run: tests/check-wiring.sh
       - name: Control client and multikernel preflight
         run: cargo +stable test --manifest-path tools/l4hctl/Cargo.toml
       - name: Host unit tests (allocator, memd grants, I/O pool, display)
@@ -82,6 +80,8 @@ jobs:
         run: tests/run-trusttest.sh
       - name: Build seL4
         run: tools/build-kernel.sh
+      - name: IPC goes through the wiring and l4h-ipc (clippy)
+        run: tests/check-ipc.sh
       - name: VT-x kernel on a CPU without VMX (boots, refuses VCPU and EPT objects)
         run: tests/run-vtxtest.sh off
       - name: CPU topology and migration policy

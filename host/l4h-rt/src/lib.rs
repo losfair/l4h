@@ -188,7 +188,9 @@ pub unsafe fn start_secondary(slot: u64, top: usize, entry: extern "C" fn() -> !
 }
 
 /// The keeper: wait for the main thread to fault (its fault is never
-/// answered), and answer for it.
+/// answered), and answer for it.  It receives one fault, and serves
+/// nothing: no l4h_ipc::run.
+#[allow(clippy::disallowed_methods)]
 extern "C" fn keeper() -> ! {
     unsafe {
         sel4::set_ipc_buffer((host::KEEPER_IPCBUF_VA as *mut sel4::IpcBuffer).as_mut().unwrap());

@@ -61,8 +61,9 @@ pub struct RootGuest {
     /// The pool, disk channels and port memory: revoked at GUEST_DEL.
     pub arena: Arena,
     pub pool: Pool,
-    /// Its l4h-vmm's notification: backends signal it (badged).
-    pub vmm_ntfn: cap::Notification,
+    /// Its l4h-vmm's notification, which root makes: backends signal it
+    /// (badged).
+    pub vmm_ntfn: component::Obj<component::p::Vmm, component::o::Notification>,
     /// Disk windows attached to the guest: (controller, blkd client).
     pub disks: ArrayVec<(usize, usize), MAX_GUEST_DEVICES>,
     /// netd ports of its virtio-net devices.
@@ -635,7 +636,7 @@ fn guest_new(h: &mut Host, id: usize, size: usize, gpa: usize, dom0: bool) -> Re
             dom0,
             arena,
             pool: Pool { gpa, paddr, size },
-            vmm_ntfn,
+            vmm_ntfn: component::Obj::claim(abs_of(vmm_ntfn)),
             disks: ArrayVec::new(),
             ports: ArrayVec::new(),
             attest,

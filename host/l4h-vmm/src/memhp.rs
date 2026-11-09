@@ -10,8 +10,7 @@ use l4h_abi as abi;
 use l4h_rt::ipc::Endpoint;
 use l4h_rt::host::memd::call::Client;
 use l4h_rt::host;
-use l4h_rt::{cap, sel4};
-use sel4::cap_type;
+
 
 use crate::guest::Vcpus;
 
@@ -24,8 +23,8 @@ pub struct MemDev {
 
 /// memd's endpoint for this guest (l4h_host::memd::call, badged as
 /// Sender::Vmm of the guest).
-fn memd() -> Endpoint {
-    Endpoint(cap::<cap_type::Endpoint>(host::VMM_SLOT_MEMD_EP))
+fn memd() -> Endpoint<host::memd::call::Proto> {
+    Endpoint::of(&host::wiring::VMM_MEMD, host::wiring::p::Vmm, 0)
 }
 
 impl MemDev {

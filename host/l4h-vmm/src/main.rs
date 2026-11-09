@@ -91,7 +91,7 @@ struct Hypercalls<'a> {
     vcpus: &'a Vcpus,
     devs: &'a mut [Option<Dev>; host::VMM_MAX_DEVICES],
     console: &'a mut Console,
-    root_ep: Endpoint,
+    root_ep: Endpoint<host::vmmgr::call::Proto>,
 }
 
 impl hypercall::Server for Hypercalls<'_> {
@@ -193,7 +193,7 @@ fn main(info: &'static Info) -> ! {
 
     let console = Console::new(cfg.serial != 0, if cfg.dom0 != 0 { None } else { Some(cfg.guest_id) }, cfg.console_event, tsc_hz);
     // vmmgr's endpoint (l4h_host::vmmgr::call).
-    let root_ep = Endpoint(cap::<cap_type::Endpoint>(host::SLOT_ROOT_EP));
+    let root_ep = Endpoint::of(&host::wiring::VMM_VMMGR, host::wiring::p::Vmm, 0);
     let ep = cap::<cap_type::Endpoint>(host::SLOT_SERVICE_EP);
     let reply = cap::<cap_type::Reply>(host::SLOT_REPLY);
 
@@ -217,7 +217,7 @@ struct Vmm<'a> {
     devs: [Option<Dev>; host::VMM_MAX_DEVICES],
     memdev: Option<MemDev>,
     console: Console,
-    root_ep: Endpoint,
+    root_ep: Endpoint<host::vmmgr::call::Proto>,
     tcb: sel4::cap::Tcb,
     ntfn: sel4::cap::Notification,
     /// The console ring has more than one batch.

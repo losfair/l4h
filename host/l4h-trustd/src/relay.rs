@@ -15,8 +15,7 @@ use core::sync::atomic::{Ordering, fence};
 
 use l4h_rt::host::errno::Errno;
 use l4h_rt::host::trust::{self, RELAY_HEADER, RELAY_SLOT_HEADER, RelayHeader, RelaySlot};
-use l4h_rt::{cap, host, sel4};
-use sel4::cap_type;
+use l4h_rt::host;
 
 /// What a request is for.
 #[derive(Clone, Copy)]
@@ -92,7 +91,7 @@ impl Relay {
     pub fn send(&mut self, to: u32, head: RelayHeader) -> bool {
         unsafe { ((trust::RELAY_VA + RELAY_SLOT_HEADER) as *mut RelayHeader).write_volatile(head) };
         use l4h_rt::host::root::call::Client;
-        l4h_rt::ipc::Endpoint(cap::<cap_type::Endpoint>(host::SLOT_ROOT_EP))
+        l4h_rt::ipc::Endpoint::of(&l4h_rt::host::wiring::TRUSTD_ROOT, l4h_rt::host::wiring::p::Trustd, 0)
             .relay(to, RELAY_HEADER + head.len as usize)
             .is_ok()
     }
