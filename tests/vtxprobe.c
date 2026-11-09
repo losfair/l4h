@@ -77,6 +77,10 @@ static int is_amd(void)
 /* The VMCS fields patch 0042 masks on VT-x. */
 #define VMX_CR4_MASK    0x6002
 #define VMX_GUEST_CR4   0x6804
+/* The primary controls patches 0039 and 0043 keep on: CR8-load and
+ * CR8-store exiting and MOV-DR exiting. */
+#define VMX_PRIMARY_CONTROLS 0x4002
+#define VMX_PPC_FORCED  (1ul << 19 | 1ul << 20 | 1ul << 23)
 
 static void check(const char *what, int ok)
 {
@@ -299,6 +303,9 @@ void vtxprobe_main(seL4_BootInfo *bi)
             w = seL4_X86_VCPU_WriteVMCS(vcpu, VMX_GUEST_CR4, ~0ul);
             check("vmx_guest_cr4", !w.error && !(w.written & ~(CR4_ALLOWED | CR4_VMXE)) &&
                   !(w.written & CR4_PKE));
+            /* Patch 0043: guest MOVs to and from CR8 always exit. */
+            w = seL4_X86_VCPU_WriteVMCS(vcpu, VMX_PRIMARY_CONTROLS, 0);
+            check("vmx_ppc_forced", !w.error && (w.written & VMX_PPC_FORCED) == VMX_PPC_FORCED);
         }
     }
     puts_("vtxprobe: done\n");
