@@ -40,6 +40,13 @@ pub const VERBOSE: bool = match option_env!("L4H_RELEASE") {
     None => true,
 };
 
+/// The wiring audit (l4h_rt::init, l4h_task's give_edge), which uses
+/// seL4_DebugCapIdentify, runs in debug host builds only.  A host is built
+/// against the debug kernel's headers whatever kernel it boots, so the
+/// kernel's DEBUG_BUILD does not say whether that call exists: the release
+/// kernels (`L4H_RELEASE=1`) boot release hosts, which do not make it.
+pub const AUDIT: bool = VERBOSE;
+
 /// Whether the host has the test-only fault injection tests/run-logdtest.sh
 /// uses (`L4H_TEST_INJECT=1` when the host is built).
 pub const TEST_INJECT: bool = match option_env!("L4H_TEST_INJECT") {

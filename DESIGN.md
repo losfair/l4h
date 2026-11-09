@@ -2810,7 +2810,8 @@ one way to do each part of it:
   and its faults go to its parent by its fault edge (`parent_fault`, or
   `keeper_fault` for a component with a keeper); `create` checks that
   both are to the parent it is given. In debug builds the running system
-  is held to the declarations too: each component, as it starts
+  is held to the declarations too (`host::AUDIT`: debug host builds,
+  which boot debug kernels): each component, as it starts
   (`l4h_rt::init`), looks at every slot of its CSpace's layout with
   seL4's `DebugCapIdentify` and stops if an endpoint or notification is
   in a slot that no edge it holds, and none of its own objects

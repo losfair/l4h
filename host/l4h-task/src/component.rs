@@ -96,7 +96,7 @@ impl Component {
         sel4::sel4_cfg_if! {
             if #[sel4_cfg(DEBUG_BUILD)] {
                 let slot = AUDIT_SLOT.load(core::sync::atomic::Ordering::Relaxed);
-                if slot == 0 {
+                if slot == 0 || !host::AUDIT {
                     return None;
                 }
                 let scratch = self.local_cnode.absolute_cptr(cap_at::<cap_type::Null>(slot));

@@ -153,6 +153,9 @@ pub fn init() -> &'static Info {
 fn audit(kind: u32) {
     sel4::sel4_cfg_if! {
         if #[sel4_cfg(DEBUG_BUILD)] {
+            if !host::AUDIT {
+                return;
+            }
             for slot in 0..1u64 << host::CNODE_BITS {
                 let tag = cap::<sel4::cap_type::Null>(slot).debug_identify();
                 if let Err(why) = host::wiring::audit(kind, slot, tag) {
