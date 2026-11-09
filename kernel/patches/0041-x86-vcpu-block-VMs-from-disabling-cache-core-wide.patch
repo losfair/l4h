@@ -1,4 +1,4 @@
-From 2b2254d4012d35b2b93898a732a184706c2b5896 Mon Sep 17 00:00:00 2001
+From 6e0b7f8229f127aeb76c33ab2598cbb6e196c8af Mon Sep 17 00:00:00 2001
 From: Bill Nguyen <bill.nguyen@unsw.edu.au>
 Date: Thu, 5 Nov 2026 10:17:36 +1100
 Subject: [PATCH] x86/vcpu: block VMs from disabling cache core-wide
@@ -77,7 +77,7 @@ index bf4a999da..19955a71d 100644
  #define CR4_OSFXSR          BIT(9)  /* Enable SSE et. al. features. */
  #define CR4_OSXMMEXCPT      BIT(10) /* Enable SSE exceptions. */
 diff --git a/src/arch/x86/object/vcpu.c b/src/arch/x86/object/vcpu.c
-index 9cc1653dc..ca8b6755b 100644
+index e47ca3a1e..81acf60c6 100644
 --- a/src/arch/x86/object/vcpu.c
 +++ b/src/arch/x86/object/vcpu.c
 @@ -29,9 +29,7 @@
@@ -91,7 +91,7 @@ index 9cc1653dc..ca8b6755b 100644
  
  const vcpu_gp_register_t crExitRegs[] = {
      VCPU_EAX, VCPU_ECX, VCPU_EDX, VCPU_EBX, VCPU_ESP, VCPU_EBP, VCPU_ESI, VCPU_EDI,
-@@ -519,7 +517,14 @@ void vcpu_init(vcpu_t *vcpu)
+@@ -520,7 +518,14 @@ void vcpu_init(vcpu_t *vcpu)
  
      vcpu->cr0 = cr0_high & cr0_low;
      vcpu->cr0_shadow = 0;
@@ -107,7 +107,7 @@ index 9cc1653dc..ca8b6755b 100644
      vcpu->exception_bitmap = vcpu->cached_exception_bitmap = VMX_EXCEPTIONS_KERNEL_OWNED;
      vcpu->vpid = VPID_INVALID;
  #ifdef ENABLE_SMP_SUPPORT
-@@ -583,6 +588,8 @@ void vcpu_init(vcpu_t *vcpu)
+@@ -584,6 +589,8 @@ void vcpu_init(vcpu_t *vcpu)
      vmwrite(VMX_CONTROL_MSR_ADDRESS, (word_t)kpptr_to_paddr(&msr_bitmap_region));
      vmwrite(VMX_CONTROL_EXCEPTION_BITMAP, vcpu->exception_bitmap);
      vmwrite(VMX_GUEST_CR0, vcpu->cr0);
@@ -116,7 +116,7 @@ index 9cc1653dc..ca8b6755b 100644
      vmwrite(VMX_GUEST_CR4, cr4_high & cr4_low);
  
      vmwrite(VMX_GUEST_VMCS_LINK_POINTER, ~(word_t)0);
-@@ -1072,7 +1079,6 @@ static exception_t decodeWriteVMCS(cap_t cap, word_t length, bool_t call, word_t
+@@ -1067,7 +1074,6 @@ static exception_t decodeWriteVMCS(cap_t cap, word_t length, bool_t call, word_t
      case VMX_GUEST_PENDING_DEBUG_EXCEPTIONS:
      case VMX_GUEST_SYSENTER_ESP:
      case VMX_GUEST_SYSENTER_EIP:
@@ -124,7 +124,7 @@ index 9cc1653dc..ca8b6755b 100644
      case VMX_CONTROL_CR4_MASK:
      case VMX_CONTROL_CR0_READ_SHADOW:
      case VMX_CONTROL_CR4_READ_SHADOW:
-@@ -1085,6 +1091,10 @@ static exception_t decodeWriteVMCS(cap_t cap, word_t length, bool_t call, word_t
+@@ -1080,6 +1086,10 @@ static exception_t decodeWriteVMCS(cap_t cap, word_t length, bool_t call, word_t
      case VMX_CONTROL_EXCEPTION_BITMAP:
          value |= VMX_EXCEPTIONS_KERNEL_OWNED;
          break;
