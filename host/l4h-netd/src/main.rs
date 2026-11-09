@@ -31,6 +31,7 @@ use core::mem::MaybeUninit;
 use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{Ordering, fence};
 
+use l4h_rt::host::errno::Errno;
 use l4h_rt::host::fixed::ArrayVec;
 use l4h_rt::host::net::{self, NetdConfig};
 use l4h_rt::sel4;
@@ -678,12 +679,115 @@ fn rx_put(chan: *mut net::Port, frame: &(impl Frame + ?Sized), hdr: &[u8; net::H
     true
 }
 
-fn mr(i: usize) -> u64 {
-    sel4::with_ipc_buffer(|b| b.msg_regs()[i])
+use l4h_rt::host::errno::EINVAL;
+
+/// Root's commands, as l4h_host::net::call declares them, and the ports
+/// they added.
+struct Commands<'a> {
+    d: &'a mut Netd,
+    added: u64,
 }
 
-fn set_mr(i: usize, v: u64) {
-    sel4::with_ipc_buffer_mut(|b| b.msg_regs_mut()[i] = v)
+impl net::call::Server for Commands<'_> {
+    fn add_port(&mut self, _: net::Sender, i: usize, switch: usize, mac: u64, flags: u64, alias: u64) -> Result<(), Errno> {
+        if i >= net::MAX_PORTS || switch >= net::MAX_SWITCHES {
+            return Err(EINVAL);
+        }
+        let d = &mut *self.d;
+        d.remove_port(i);
+        let chan = net::port_va(i) as *mut net::Port;
+        let mac = mac_of(mac);
+        unsafe {
+            addr_of_mut!((*chan).mac).write_volatile([mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], 0, 0]);
+            addr_of_mut!((*chan).link_state).write_volatile(net::LinkState::VIRTUAL.0);
+            addr_of_mut!((*chan).rx_wanted).write_volatile(0);
+        }
+        let uplink = flags & net::NETD_PORT_UPLINK != 0;
+        d.ports[i] = Some(GuestPort {
+            chan,
+            switch: switch as u32,
+            mac,
+            lock: flags & net::NETD_PORT_MAC_LOCK != 0,
+            alias: (uplink && alias != 0).then(|| mac_of(alias)),
+            uplink,
+            isolated: flags & net::NETD_PORT_ISOLATED != 0,
+            client: cap::<cap_type::Notification>(net::NETD_SLOT_CLIENT_BASE + i as u64),
+            signal: true,
+            rx_frames: 0,
+            tx_frames: 0,
+            drops: 0,
+            backlog: Fifo::EMPTY,
+        });
+        d.publish_links();
+        self.added |= 1 << i;
+        Ok(())
+    }
+
+    fn remove_port(&mut self, _: net::Sender, port: usize) -> Result<(), Errno> {
+        self.d.remove_port(port);
+        Ok(())
+    }
+
+    fn attach_uplink(&mut self, _: net::Sender, nic: usize, switch: usize) -> Result<(), Errno> {
+        let nic = self.d.nics.get_mut(nic).filter(|_| switch < net::MAX_SWITCHES).ok_or(EINVAL)?;
+        nic.switch = Some(switch as u32);
+        Ok(())
+    }
+
+    fn ep_set(&mut self, _: net::Sender, ep: usize, switch: usize, mac: u64, peer: u64) -> Result<(), Errno> {
+        if switch >= net::MAX_SWITCHES {
+            return Err(EINVAL);
+        }
+        let e = steer::Endpoint { switch: switch as u8, mac: mac_of(mac), peer: mac_of(peer) };
+        if self.d.steer.ep_set(ep, e) { Ok(()) } else { Err(EINVAL) }
+    }
+
+    fn ep_del(&mut self, _: net::Sender, ep: usize) -> Result<(), Errno> {
+        self.d.steer.ep_del(ep);
+        Ok(())
+    }
+
+    fn steer_set(&mut self, _: net::Sender, rule: usize, ep: usize, matches: u64, ip_hi: u64, ip_lo: u64, targets: u64)
+        -> Result<(), Errno> {
+        let d = &mut *self.d;
+        // One target, an existing port: its MAC is the rule's.
+        let t = targets.trailing_zeros() as usize;
+        let mac = (targets.count_ones() == 1).then(|| d.ports.get(t)).flatten().and_then(|p| p.as_ref()).map(|p| p.mac);
+        match (mac, steer::Match::from_words(matches, ip_hi, ip_lo)) {
+            (Some(mac), Some(m)) if d.steer.rule_set(rule, ep, m, targets, mac) => Ok(()),
+            _ => Err(EINVAL),
+        }
+    }
+
+    fn steer_del(&mut self, _: net::Sender, rule: usize) -> Result<(), Errno> {
+        self.d.steer.rule_del(rule);
+        Ok(())
+    }
+
+    fn add_link(&mut self, _: net::Sender, l: usize, switch: usize, size: u64, me: u32, peer: u32) -> Result<(), Errno> {
+        let d = &mut *self.d;
+        let ok = l < net::MAX_LINKS && d.links[l].is_none() && switch < net::MAX_SWITCHES
+            && size as usize <= net::LINK_CHANNEL_MAX && size >= 4096;
+        if !ok {
+            return Err(EINVAL);
+        }
+        d.links[l] = Some(link::Link::new(l, switch as u32, size, me, peer));
+        Ok(())
+    }
+
+    fn test_panic(&mut self, _: net::Sender) -> Result<(), Errno> {
+        if host::TEST_INJECT {
+            panic!("injected panic");
+        }
+        Err(EINVAL)
+    }
+
+    fn test_hang(&mut self, _: net::Sender) -> Result<(), Errno> {
+        if host::TEST_INJECT {
+            l4h_rt::test_hang();
+        }
+        Err(EINVAL)
+    }
 }
 
 fn main(info: &'static Info) -> ! {
@@ -712,8 +816,9 @@ fn main(info: &'static Info) -> ! {
         let _ = d.nics.push(Nic::new(n, c, d.tsc_hz));
         d.gro[n] = Some(offload::Gro::init(g));
     }
-    let ep = cap::<cap_type::Endpoint>(host::SLOT_SERVICE_EP);
-    let reply = cap::<cap_type::Reply>(host::SLOT_REPLY);
+    // Nothing calls a driver: it waits on its notification, for root's
+    // requests (badges::driver::CALL), interrupts and clients' kicks.
+    let ntfn = cap::<cap_type::Notification>(host::SLOT_NTFN);
     l4h_rt::info!("netd: {} uplink NIC(s)", d.nics.len());
 
     // Root reads the NICs' MACs here, and the counters, which publish()
@@ -725,7 +830,7 @@ fn main(info: &'static Info) -> ! {
     published.ready.store(1, Ordering::Release);
     l4h_rt::mailbox::signal();
     let mut deferred_tx = 0;
-    let (_, mut badge) = ep.recv(reply);
+    let mut badge = ntfn.wait().1;
     loop {
         // Notification: port kicks and NIC interrupts. Deferred slots and
         // new client kicks use the same drain path.
@@ -739,7 +844,7 @@ fn main(info: &'static Info) -> ! {
             }
         }
         for n in 0..d.nics.len() {
-            if badge & (1 << (net::NETD_BADGE_IRQ_SHIFT as usize + n)) != 0 {
+            if badge & host::badges::netd::IRQ.nth(n) != 0 {
                 d.nic_rx(n);
                 cap::<cap_type::IrqHandler>(net::NETD_SLOT_IRQ_BASE + n as u64)
                     .irq_handler_ack()
@@ -747,7 +852,7 @@ fn main(info: &'static Info) -> ! {
             }
         }
         for l in 0..net::MAX_LINKS {
-            if badge & (1 << (net::NETD_BADGE_LINK_SHIFT as usize + l)) != 0 {
+            if badge & host::badges::netd::LINK.nth(l) != 0 {
                 if let Some(k) = d.links[l].as_ref() {
                     k.ack();
                 }
@@ -765,112 +870,22 @@ fn main(info: &'static Info) -> ! {
         d.publish(published);
         // Root's commands (host::mailbox), even if their signal was
         // coalesced.  Root reads the answers' count only: they are done.
-        let mut answered = false;
-        let mut added = 0;
-        while let Some(label) = l4h_rt::mailbox::request() {
-            let resp = match label {
-                net::NETD_ADD_PORT => {
-                    let i = mr(0) as usize;
-                    if i < net::MAX_PORTS && mr(1) < net::MAX_SWITCHES as u64 {
-                        d.remove_port(i);
-                        let chan = net::port_va(i) as *mut net::Port;
-                        let mac = mac_of(mr(2));
-                        unsafe {
-                            addr_of_mut!((*chan).mac).write_volatile([mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], 0, 0]);
-                            addr_of_mut!((*chan).link_state).write_volatile(net::LinkState::VIRTUAL.0);
-                            addr_of_mut!((*chan).rx_wanted).write_volatile(0);
-                        }
-                        d.ports[i] = Some(GuestPort {
-                            chan,
-                            switch: mr(1) as u32,
-                            mac,
-                            lock: mr(3) & net::NETD_PORT_MAC_LOCK != 0,
-                            alias: (mr(3) & net::NETD_PORT_UPLINK != 0 && mr(4) != 0).then(|| mac_of(mr(4))),
-                            uplink: mr(3) & net::NETD_PORT_UPLINK != 0,
-                            isolated: mr(3) & net::NETD_PORT_ISOLATED != 0,
-                            client: cap::<cap_type::Notification>(net::NETD_SLOT_CLIENT_BASE + i as u64),
-                            signal: true,
-                            rx_frames: 0,
-                            tx_frames: 0,
-                            drops: 0,
-                            backlog: Fifo::EMPTY,
-                        });
-                        d.publish_links();
-                        added |= 1 << i;
-                        0
-                    } else {
-                        u64::MAX
-                    }
-                }
-                net::NETD_REMOVE_PORT => {
-                    d.remove_port(mr(0) as usize);
-                    0
-                }
-                net::NETD_ATTACH_UPLINK => {
-                    let (n, sw) = (mr(0) as usize, mr(1) as u32);
-                    match d.nics.get_mut(n).filter(|_| (sw as usize) < net::MAX_SWITCHES) {
-                        Some(nic) => {
-                            nic.switch = Some(sw);
-                            0
-                        }
-                        None => u64::MAX,
-                    }
-                }
-                net::NETD_ADD_LINK => {
-                    let (l, sw, size) = (mr(0) as usize, mr(1), mr(2));
-                    let ok = l < net::MAX_LINKS && d.links[l].is_none() && sw < net::MAX_SWITCHES as u64
-                        && size as usize <= net::LINK_CHANNEL_MAX && size >= 4096;
-                    if ok {
-                        d.links[l] = Some(link::Link::new(l, sw as u32, size, mr(3) as u32, mr(4) as u32));
-                        0
-                    } else {
-                        u64::MAX
-                    }
-                }
-                net::NETD_EP_SET => {
-                    let ep = steer::Endpoint { switch: mr(1) as u8, mac: mac_of(mr(2)), peer: mac_of(mr(3)) };
-                    if mr(1) < net::MAX_SWITCHES as u64 && d.steer.ep_set(mr(0) as usize, ep) { 0 } else { u64::MAX }
-                }
-                net::NETD_TEST_PANIC if host::TEST_INJECT => panic!("injected panic"),
-                net::NETD_TEST_HANG if host::TEST_INJECT => l4h_rt::test_hang(),
-                net::NETD_EP_DEL => {
-                    d.steer.ep_del(mr(0) as usize);
-                    0
-                }
-                net::NETD_STEER_SET => {
-                    // One target, an existing port: its MAC is the rule's.
-                    let targets = mr(5);
-                    let t = targets.trailing_zeros() as usize;
-                    let mac = (targets.count_ones() == 1).then(|| d.ports.get(t)).flatten().and_then(|p| p.as_ref()).map(|p| p.mac);
-                    match (mac, steer::Match::from_words(mr(2), mr(3), mr(4))) {
-                        (Some(mac), Some(m)) if d.steer.rule_set(mr(0) as usize, mr(1) as usize, m, targets, mac) => 0,
-                        _ => u64::MAX,
-                    }
-                }
-                net::NETD_STEER_DEL => {
-                    d.steer.rule_del(mr(0) as usize);
-                    0
-                }
-                _ => u64::MAX,
-            };
-            set_mr(0, resp);
-            l4h_rt::mailbox::answer(1);
-            answered = true;
-        }
-        if answered {
+        let mut cmds = Commands { d: &mut d, added: 0 };
+        if l4h_rt::mailbox::serve(|label, args, out| net::call::serve(&mut cmds, label, args, net::Sender::Root, out)) {
             l4h_rt::mailbox::signal();
         }
+        let added = cmds.added;
         // Root handed out an added port's channel before netd added it:
         // its VMM may have kicked already, and read the page's link state,
         // DOWN.  Serve the port as if kicked, and signal it.
-        // With slots deferred, poll for notifications (NBRecv returns badge
-        // zero when idle) and come back for the rest.
+        // With slots deferred, poll for notifications (badge zero when
+        // idle) and come back for the rest.
         badge = if added != 0 {
             added
         } else if deferred_tx != 0 {
-            ep.nb_recv(reply).1
+            ntfn.poll().1
         } else {
-            ep.recv(reply).1
+            ntfn.wait().1
         };
     }
 }

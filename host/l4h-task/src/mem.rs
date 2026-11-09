@@ -442,22 +442,22 @@ impl Alloc {
         // Root and vmmgr refill before dispatching received calls and
         // faults.  Both kernel invocations and calls to memd overwrite
         // the IPC buffer, so keep the incoming message across this work.
-        let regs: [u64; sel4::NUM_MESSAGE_REGISTERS] = sel4::with_ipc_buffer(|b| b.msg_regs().try_into().unwrap());
-        // Regions too full to be of use leave the pool; their objects
-        // stay, as global objects do.
-        self.pool.regions.retain(|r| r.size() - r.used >= 4096);
-        if self.pool.regions.is_full() {
-            let (i, _) = self.pool.regions.iter().enumerate().min_by_key(|(_, r)| r.size() - r.used).unwrap();
-            self.pool.regions.remove(i);
-        }
-        let s = self.slots.global(|s| s.alloc());
-        match self.split(SMALL_POOL_BITS, s) {
-            Some(r) => {
-                let _ = self.pool.add(r);
+        l4h_ipc::preserving(|| {
+            // Regions too full to be of use leave the pool; their objects
+            // stay, as global objects do.
+            self.pool.regions.retain(|r| r.size() - r.used >= 4096);
+            if self.pool.regions.is_full() {
+                let (i, _) = self.pool.regions.iter().enumerate().min_by_key(|(_, r)| r.size() - r.used).unwrap();
+                self.pool.regions.remove(i);
             }
-            None => self.slots.global(|sl| sl.free(s)),
-        }
-        sel4::with_ipc_buffer_mut(|b| b.msg_regs_mut().copy_from_slice(&regs));
+            let s = self.slots.global(|s| s.alloc());
+            match self.split(SMALL_POOL_BITS, s) {
+                Some(r) => {
+                    let _ = self.pool.add(r);
+                }
+                None => self.slots.global(|sl| sl.free(s)),
+            }
+        })
     }
 
     fn local_bytes(&self) -> usize {

@@ -28,7 +28,8 @@ mod vmm;
 
 use core::sync::atomic::Ordering;
 
-use sel4::{ObjectBlueprint, cap};
+use l4h_host::errno::{EINVAL, Errno};
+use sel4::cap;
 
 use l4h_abi as abi;
 use l4h_host as host;
@@ -36,14 +37,16 @@ use l4h_host::fixed::{ArrayVec, StaticCell};
 use l4h_host::vmmgr::{self as proto, VmmgrConfig};
 use l4h_rt::Info;
 use l4h_task::{elf, mem, topology, vspace, window};
+use l4h_task::reply::ReplySlot;
 
-use crate::component::ROOT_BADGE_COMPONENT;
-use crate::guest::{Guest, GuestConfig, State, hyp_badge_guest, hyp_badge_vcpu};
+use l4h_host::badges::vmmgr as recv;
+use l4h_host::vmmgr::call;
+use crate::guest::{Guest, GuestConfig, State};
 use crate::mem::{Alloc, Slots};
 use crate::root::Later;
 use crate::window::{Window, Windows};
 
-pub use crate::guest::{HYP_BADGE_FAULT, MAX_GUEST_DEVICES};
+pub use crate::guest::MAX_GUEST_DEVICES;
 
 /// vmmgr's own capabilities, at the standard component slots.
 pub mod slot {
@@ -69,9 +72,6 @@ static GUESTS: StaticCell<[Option<Guest>; MAX_GUESTS]> = StaticCell::new([const 
 const RESERVE_BYTES: usize = 32 << 20;
 const RESERVE_SLOTS: usize = 16384;
 
-const TIMER_BADGE: u64 = 1 << 40;
-/// dom0 made a control request in its device page (abi::CtlSync).
-pub const CTL_KICK_BADGE: u64 = 1 << 41;
 
 /// Facts about the host the guests run on.
 pub struct HostInfo {
@@ -99,6 +99,7 @@ impl HostInfo {
             authority: slot::TCB.cap(),
             sched_control: self.sched_control(core),
             parent_ep: self.hyp_ep,
+            parent: l4h_host::wiring::Party::Vmmgr,
             tsc_hz: self.tsc_hz,
             log_frames: proto::SLOT_LOG_FRAMES,
             serial_frames: proto::SLOT_SERIAL_FRAMES,
@@ -265,7 +266,7 @@ impl Vmmgr {
     /// Root answers later, after blkd: then `then` follows (`root_done`).
     /// No device of the guest changes, nor does it start, meanwhile.
     pub fn attach_disk(&mut self, id: usize, disk: usize, flags: u64, lba_start: u64, lba_count: u64,
-        extents: (u64, u64), then: Then) -> Result<Later<()>, i64> {
+        extents: (u64, u64), then: Then) -> Result<Later<()>, Errno> {
         if !self.can_afford(1 << 20, 0, 0) { return Err(ctl::ENOMEM); }
         let instance = self.guest(id).ok_or(ctl::ENOENT)?.instance;
         self.with_guest(id, |h, g| {
@@ -294,7 +295,7 @@ impl Vmmgr {
     }
 
     /// Root answered the disk attachment of guest `id` (`attach_disk`).
-    fn disk_attached(&mut self, id: usize, instance: u64, token: usize) -> Result<(), i64> {
+    fn disk_attached(&mut self, id: usize, instance: u64, token: usize) -> Result<(), Errno> {
         if self.guest(id).is_none_or(|g| g.instance != instance) {
             root::discard(token);
             return Err(ctl::ENOENT);
@@ -330,7 +331,7 @@ impl Vmmgr {
 
     /// Give guest `id` (before it starts) the whole USB controller `ctrl`
     /// (DESIGN.md §9.7).  Root claims it on its first attachment.
-    pub fn attach_usb(&mut self, id: usize, ctrl: usize) -> Result<(), i64> {
+    pub fn attach_usb(&mut self, id: usize, ctrl: usize) -> Result<(), Errno> {
         if !self.can_afford(1 << 20, 0, 0) { return Err(ctl::ENOMEM); }
         self.with_guest(id, |h, g| {
             if g.state != State::Created || g.vmm.is_some() || g.root_pending {
@@ -351,7 +352,7 @@ impl Vmmgr {
     }
 
     /// Keep a failed boot disk's position without a channel or DMA access.
-    pub fn attach_dummy_disk(&mut self, id: usize) -> Result<(), i64> {
+    pub fn attach_dummy_disk(&mut self, id: usize) -> Result<(), Errno> {
         self.with_guest(id, |h, g| {
             if g.state != State::Created || g.root_pending { return Err(ctl::EBUSY); }
             let d = g.add_device(&mut h.alloc, guest::DevKind::Virtio(2)).ok_or(ctl::ENOSPC)?;
@@ -361,7 +362,7 @@ impl Vmmgr {
     }
 
     /// Spawn the guest's l4h-vmm; the guest starts when the VMM is ready.
-    pub fn start_guest(&mut self, id: usize) -> Result<(), i64> {
+    pub fn start_guest(&mut self, id: usize) -> Result<(), Errno> {
         self.with_guest(id, |h, g| {
             if g.state != State::Created || g.vmm.is_some() || g.root_pending {
                 return Err(ctl::EBUSY);
@@ -383,7 +384,7 @@ impl Vmmgr {
 
     /// Give guest `id` (before it starts) a virtio-net device on `switch`.
     /// Returns the MAC.
-    pub fn create_nic(&mut self, id: usize, switch: u32, mac: u64, lock: bool, isolated: bool) -> Result<u64, i64> {
+    pub fn create_nic(&mut self, id: usize, switch: u32, mac: u64, lock: bool, isolated: bool) -> Result<u64, Errno> {
         if !self.can_afford(1 << 20, 0, 0) {
             return Err(ctl::ENOMEM);
         }
@@ -412,7 +413,7 @@ impl Vmmgr {
 
     /// Give guest `id` (before it starts) a virtio-gpu device with one
     /// scanout of `width` x `height` pixels.
-    pub fn attach_gpu(&mut self, id: usize, width: u64, height: u64) -> Result<(), i64> {
+    pub fn attach_gpu(&mut self, id: usize, width: u64, height: u64) -> Result<(), Errno> {
         if !gpu::valid_size(width, height) {
             return Err(ctl::EINVAL);
         }
@@ -443,7 +444,7 @@ impl Vmmgr {
         .ok_or(ctl::ENOENT)?
     }
 
-    pub fn destroy_guest(&mut self, id: usize) -> Result<(), i64> {
+    pub fn destroy_guest(&mut self, id: usize) -> Result<(), Errno> {
         let g = self.guests.get_mut(id).and_then(|g| g.take()).ok_or(ctl::ENOENT)?;
         let name = g.name.clone();
         self.asids.in_use -= g.asids;
@@ -507,7 +508,14 @@ fn main(info: &'static Info) -> ! {
     let mut alloc = Alloc::empty(slots, ALLOC_STORAGE.take());
     alloc.memd = Some(memd::link());
     alloc.refill();
-    let reply = ReplySlot::new(&mut alloc);
+    l4h_task::edge::minter(l4h_host::wiring::Party::Vmmgr);
+    component::audit_in(alloc.slots.alloc());
+    // Root made SLOT_REPLY, which cannot be replaced: ours is there, where
+    // the keeper finds it if vmmgr fails, so that the caller it holds gets
+    // an answer (l4h_rt::abort_trap).
+    let reply = sel4::Cap::from_bits(host::SLOT_REPLY);
+    slot::CNODE.cap().absolute_cptr(reply).delete().expect("delete reply object");
+    let reply = ReplySlot::new(&mut alloc, reply);
     let wins = Windows {
         a: Window::new(&mut alloc, slot::VSPACE.cap(), layout::WINDOWS.base),
         b: Window::new(&mut alloc, slot::VSPACE.cap(), layout::WINDOWS.base + 4096),
@@ -601,7 +609,7 @@ fn dom0_disks(h: &mut Vmmgr, id: usize, mut k: usize) {
 
 /// Root answered dom0's boot disk `k` with `r`: the next, unless this dom0
 /// (`instance`) is gone.
-fn dom0_disk_done(h: &mut Vmmgr, id: usize, instance: u64, k: usize, r: Result<(), i64>) {
+fn dom0_disk_done(h: &mut Vmmgr, id: usize, instance: u64, k: usize, r: Result<(), Errno>) {
     if h.guest(id).is_none_or(|g| g.instance != instance) {
         return;
     }
@@ -611,7 +619,7 @@ fn dom0_disk_done(h: &mut Vmmgr, id: usize, instance: u64, k: usize, r: Result<(
     dom0_disks(h, id, k + 1);
 }
 
-fn dom0_no_disk(h: &mut Vmmgr, id: usize, k: usize, e: i64) {
+fn dom0_no_disk(h: &mut Vmmgr, id: usize, k: usize, e: Errno) {
     let d = &h.cfg.dom0_disk[k];
     l4h_rt::log!("l4h-vmmgr: disk {} window {}:{} unavailable to dom0: error {}; using zero-capacity device",
         d.disk, d.start, d.sectors, e);
@@ -667,7 +675,7 @@ fn rdtsc() -> u64 {
 fn arm_timer(info: &HostInfo) {
     let deadline = rdtsc() + info.tsc_hz * sched::BALANCE_MS / 1000;
     let tcb = slot::TCB.cap();
-    sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_TCB_SetTimer(tcb.bits(), deadline, TIMER_BADGE));
+    sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_TCB_SetTimer(tcb.bits(), deadline, recv::TIMER));
 }
 
 fn watchdog_dump(h: &Vmmgr) {
@@ -687,191 +695,174 @@ fn watchdog_dump(h: &Vmmgr) {
     }
 }
 
-pub fn mr(i: usize) -> u64 {
-    sel4::with_ipc_buffer(|b| b.msg_regs()[i])
+
+/// vmmgr's thread: calls from guests' VMMs, faults of guest kernels and
+/// VMMs, root's notices and dom0's control requests, and the timer.
+struct Serve<'a> {
+    h: &'a mut Vmmgr,
+    next_watchdog: u64,
+    last_balance: u64,
 }
 
-pub fn set_mr(i: usize, v: u64) {
-    sel4::with_ipc_buffer_mut(|b| b.msg_regs_mut()[i] = v)
-}
-
-/// The serve loop's reply object, made from an Untyped of its own so that
-/// one left unanswered can be replaced without using more memory.  It is
-/// in SLOT_REPLY, where the keeper finds it if vmmgr fails: the caller it
-/// holds then gets an answer (l4h_rt::abort_trap).
-struct ReplySlot {
-    ut: cap::Untyped,
-    reply: cap::Reply,
-}
-
-impl ReplySlot {
-    fn new(alloc: &mut Alloc) -> Self {
-        let ut_slot = alloc.slots.alloc();
-        let ut = alloc.split(12, ut_slot).expect("reply object memory").cap;
-        let reply = sel4::Cap::from_bits(host::SLOT_REPLY);
-        // The one root made, which we cannot replace.
-        slot::CNODE.cap().absolute_cptr(reply).delete().expect("delete reply object");
-        let r = ReplySlot { ut, reply };
-        r.make();
-        r
-    }
-
-    fn make(&self) {
-        self.ut
-            .untyped_retype(&ObjectBlueprint::Reply, &mem::cnode_dest(slot::CNODE.cap()), self.reply.bits() as usize, 1)
-            .expect("reply object");
-    }
-
-    /// Replace the reply object, which is bound to a caller left
-    /// unanswered (a faulted or stopped thread): revoking the Untyped
-    /// deletes it, which leaves that thread inactive for good.
-    fn renew(&self) {
-        slot::CNODE.cap().absolute_cptr(self.ut).revoke().expect("revoke reply object");
-        self.make();
-    }
-}
-
-/// Serve calls from guests' VMMs, faults of guest kernels and VMMs, and
-/// root's events.
-fn serve(h: &mut Vmmgr, reply_slot: ReplySlot) -> ! {
-    let reply = reply_slot.reply;
-    let hyp_ep = h.info.hyp_ep;
+fn serve(h: &mut Vmmgr, reply: ReplySlot) -> ! {
     arm_timer(&h.info);
-    let mut next_watchdog = rdtsc() + h.info.tsc_hz * h.cfg.watchdog_secs;
-    let mut last_balance = rdtsc();
-    let (mut info, mut badge) = hyp_ep.recv(reply);
-    loop {
-        h.alloc.refill();
-        let notified = badge & (TIMER_BADGE | proto::BADGE_ROOT_EVENT | CTL_KICK_BADGE) != 0;
-        if badge & proto::BADGE_ROOT_EVENT != 0 {
-            root_events(h);
+    let next_watchdog = rdtsc() + h.info.tsc_hz * h.cfg.watchdog_secs;
+    let hyp_ep = h.info.hyp_ep;
+    l4h_ipc::run(hyp_ep, reply, &mut Serve { h, next_watchdog, last_balance: rdtsc() })
+}
+
+impl l4h_ipc::Server for Serve<'_> {
+    const SIGNALS: u64 = recv::SIGNALS;
+    const FAULT: u64 = recv::FAULT;
+    type Sender = proto::Sender;
+
+    fn received(&mut self) {
+        self.h.alloc.refill();
+    }
+
+    fn signal(&mut self, badge: u64) {
+        let h = &mut *self.h;
+        if badge & recv::MAILBOX != 0 {
+            root_notices(h);
         }
-        if badge & CTL_KICK_BADGE != 0 {
+        if badge & recv::CTL_KICK != 0 {
             ctl::kicked(h);
         }
-        let resp = if notified {
-            if badge & TIMER_BADGE != 0 {
-                let now = rdtsc();
-                sched::balance(h, (now - last_balance) * 1_000_000 / h.info.tsc_hz);
-                last_balance = now;
-                if h.cfg.watchdog_secs != 0 && rdtsc() >= next_watchdog {
-                    watchdog_dump(h);
-                    next_watchdog = rdtsc() + h.info.tsc_hz * h.cfg.watchdog_secs;
-                }
-                arm_timer(&h.info);
+        if badge & recv::TIMER != 0 {
+            let now = rdtsc();
+            sched::balance(h, (now - self.last_balance) * 1_000_000 / h.info.tsc_hz);
+            self.last_balance = now;
+            if h.cfg.watchdog_secs != 0 && rdtsc() >= self.next_watchdog {
+                watchdog_dump(h);
+                self.next_watchdog = rdtsc() + h.info.tsc_hz * h.cfg.watchdog_secs;
             }
-            None
-        } else if badge & ROOT_BADGE_COMPONENT != 0 {
-            component_call(h, badge, &info)
-        } else if badge & HYP_BADGE_FAULT != 0 {
-            let gid = hyp_badge_guest(badge);
-            let vcpu = hyp_badge_vcpu(badge);
-            let fault = sel4::with_ipc_buffer(|b| sel4::Fault::new(b, &info));
-            l4h_rt::log!("l4h-vmmgr: guest {} vCPU {} kernel fault: {:x?}", gid, vcpu, fault);
-            if h.guest(gid).is_some_and(|g| g.dom0) {
-                restart_dom0(h, gid);
-            } else if let Some(Some(g)) = h.guests.get_mut(gid) {
-                g.stop();
+            arm_timer(&h.info);
+        }
+    }
+
+    fn fault(&mut self, badge: u64, info: &sel4::MessageInfo) {
+        let h = &mut *self.h;
+        let id = recv::ID.get(badge) as usize;
+        let fault = sel4::with_ipc_buffer(|b| sel4::Fault::new(b, info));
+        if badge & recv::COMPONENT != 0 {
+            l4h_rt::log!("l4h-vmmgr: guest {:#x}'s l4h-vmm fault: {:x?}", id, fault);
+            return;
+        }
+        let vcpu = recv::VCPU.get(badge) as usize;
+        l4h_rt::log!("l4h-vmmgr: guest {} vCPU {} kernel fault: {:x?}", id, vcpu, fault);
+        if h.guest(id).is_some_and(|g| g.dom0) {
+            restart_dom0(h, id);
+        } else if let Some(Some(g)) = h.guests.get_mut(id) {
+            g.stop();
+        }
+    }
+
+    fn call(&mut self, from: proto::Sender, badge: u64, info: &sel4::MessageInfo) -> Option<sel4::MessageInfo> {
+        match from {
+            // The VMMs' component ids are their guests'.
+            proto::Sender::Vmm(g) if g < MAX_GUESTS => {
+                l4h_ipc::serve::<call::Proto>(info, |label, args, out| call::serve(&mut VmmCalls(self.h), label, args, from, out))
             }
-            None
-        } else {
-            l4h_rt::log!("l4h-vmmgr: unexpected message, badge {:#x} label {}", badge, info.label());
-            None
-        };
-        h.publish();
-        match resp {
-            Some(v) => {
-                set_mr(0, v);
-                (info, badge) = hyp_ep.reply_recv(sel4::MessageInfo::new(0, 0, 0, 1), reply);
-            }
-            None => {
-                // A reply object left unanswered (a faulted or stopped
-                // thread) stays bound to its caller: make it afresh.
-                if !notified {
-                    reply_slot.renew();
-                }
-                (info, badge) = hyp_ep.recv(reply);
+            _ => {
+                self.unknown(badge, info);
+                Some(l4h_ipc::refuse())
             }
         }
     }
+
+    fn unknown(&mut self, badge: u64, info: &sel4::MessageInfo) {
+        l4h_rt::log!("l4h-vmmgr: unknown call {} badged {:#x}", info.label(), badge);
+    }
+
+    fn next(&mut self) -> l4h_ipc::Next {
+        self.h.publish();
+        l4h_ipc::Next::Wait
+    }
 }
 
-/// What root signalled: trustd answered guests, or a monitor command.
-fn root_events(h: &mut Vmmgr) {
-    let ev = unsafe { &*(proto::EVENTS_VA as *const proto::Events) };
-    let done = ev.attest_done.swap(0, Ordering::AcqRel);
-    for id in (0..MAX_GUESTS).filter(|&i| done & (1 << i) != 0) {
-        let Some(g) = h.guests[id].as_ref() else { continue };
+/// Root's notices, in our mailbox (l4h_host::vmmgr::call, from Root).
+fn root_notices(h: &mut Vmmgr) {
+    let mut calls = VmmCalls(h);
+    if l4h_rt::mailbox::serve(|label, args, out| call::serve(&mut calls, label, args, proto::Sender::Root, out)) {
+        l4h_rt::mailbox::signal();
+    }
+}
+
+/// The VMMs' calls, as l4h_host::vmmgr::call declares them.
+struct VmmCalls<'a>(&'a mut Vmmgr);
+
+impl call::Server for VmmCalls<'_> {
+    fn vmm_ready(&mut self, from: proto::Sender) -> Result<(), Errno> {
+        let proto::Sender::Vmm(id) = from else { return Err(EINVAL) };
+        let g = self.0.guests.get_mut(id).and_then(|g| g.as_mut()).ok_or(l4h_host::wire::NO_REPLY)?;
+        g.start();
+        Ok(())
+    }
+
+    fn guest_power(&mut self, from: proto::Sender, how: u64) -> Result<(), Errno> {
+        let proto::Sender::Vmm(id) = from else { return Err(EINVAL) };
+        let h = &mut *self.0;
+        let reason = match how {
+            abi::POWER_OFF => "power off",
+            abi::POWER_REBOOT => "reboot",
+            abi::POWER_CRASH => "kernel panic",
+            _ => "unknown",
+        };
+        info!("l4h-vmmgr: guest {} power request {} ({})", id, how, reason);
+        if how != abi::POWER_OFF && h.guest(id).is_some_and(|g| g.dom0) {
+            // The caller (dom0's VMM) is destroyed: no reply.
+            restart_dom0(h, id);
+            return Err(l4h_host::wire::NO_REPLY);
+        }
+        if let Some(Some(g)) = h.guests.get_mut(id) {
+            for v in &g.vcpus {
+                let _ = v.ktcb.tcb_suspend();
+            }
+            g.state = State::Stopped;
+        }
+        if h.guests.iter().flatten().all(|g| g.state != State::Running) {
+            info!("l4h-vmmgr: all guests stopped");
+        }
+        Ok(())
+    }
+
+    fn op_done(&mut self, _: proto::Sender, token: usize) -> Result<(), Errno> {
+        if token >= proto::MAX_PENDING {
+            return Err(EINVAL);
+        }
+        let mut done = [0; proto::MAX_PENDING / 64];
+        done[token / 64] = 1 << (token % 64);
+        self.0.root_done(done);
+        Ok(())
+    }
+
+    fn attest_done(&mut self, _: proto::Sender, guest: usize) -> Result<(), Errno> {
+        let h = &mut *self.0;
+        let g = h.guests.get(guest).and_then(|g| g.as_ref()).ok_or(EINVAL)?;
         if let Some(d) = g.devices.iter().position(|d| d.kind == guest::DevKind::Attest) {
             g.raise_event(&mut h.alloc, guest::dev_event(d));
         }
+        Ok(())
     }
-    let ops = ev.ops_done.each_ref().map(|w| w.swap(0, Ordering::AcqRel));
-    h.root_done(ops);
-    let cmd = ev.monitor.swap(0, Ordering::AcqRel);
-    let arg = (cmd & 0xffff_ffff) as usize;
-    match cmd >> 32 {
-        0 => {}
-        proto::MONITOR_DESTROY if h.guest(arg).is_some_and(|g| !g.dom0) => {
-            let _ = h.destroy_guest(arg);
+
+    fn destroy(&mut self, _: proto::Sender, guest: usize) -> Result<(), Errno> {
+        let h = &mut *self.0;
+        if !h.guest(guest).is_some_and(|g| !g.dom0) {
+            l4h_rt::log!("l4h-vmmgr: monitor: destroy {} refused", guest);
+            return Err(EINVAL);
         }
-        proto::MONITOR_RESTART_DOM0 => match h.guests.iter().flatten().find(|g| g.dom0).map(|g| g.id) {
+        let _ = h.destroy_guest(guest);
+        Ok(())
+    }
+
+    fn restart_dom0(&mut self, _: proto::Sender) -> Result<(), Errno> {
+        let h = &mut *self.0;
+        match h.guests.iter().flatten().find(|g| g.dom0).map(|g| g.id) {
             Some(id) => restart_dom0(h, id),
             None if h.kernel.is_some() => boot_dom0(h),
             None => {}
-        },
-        _ => l4h_rt::log!("l4h-vmmgr: monitor command {:#x} refused", cmd),
-    }
-}
-
-/// A call or fault from a guest's l4h-vmm.  Returns the reply value, or
-/// None to leave the caller blocked.
-fn component_call(h: &mut Vmmgr, badge: u64, info: &sel4::MessageInfo) -> Option<u64> {
-    let id = (badge & 0xffff) as usize;
-    if badge & HYP_BADGE_FAULT != 0 {
-        let fault = sel4::with_ipc_buffer(|b| sel4::Fault::new(b, info));
-        l4h_rt::log!("l4h-vmmgr: guest {:#x}'s l4h-vmm fault: {:x?}", id, fault);
-        return None;
-    }
-    // The VMMs' component ids are their guests'.
-    if id >= MAX_GUESTS {
-        l4h_rt::log!("l4h-vmmgr: component {:#x}: unknown", id);
-        return Some(u64::MAX);
-    }
-    match info.label() {
-        host::ROOT_CALL_VMM_READY => {
-            h.guests.get_mut(id)?.as_mut()?.start();
-            Some(0)
         }
-        host::ROOT_CALL_GUEST_POWER => {
-            let how = mr(1);
-            let reason = match how {
-                abi::POWER_OFF => "power off",
-                abi::POWER_REBOOT => "reboot",
-                abi::POWER_CRASH => "kernel panic",
-                _ => "unknown",
-            };
-            info!("l4h-vmmgr: guest {} power request {} ({})", id, how, reason);
-            if how != abi::POWER_OFF && h.guest(id).is_some_and(|g| g.dom0) {
-                // The caller (dom0's VMM) is destroyed: no reply.
-                restart_dom0(h, id);
-                return None;
-            }
-            if let Some(Some(g)) = h.guests.get_mut(id) {
-                for v in &g.vcpus {
-                    let _ = v.ktcb.tcb_suspend();
-                }
-                g.state = State::Stopped;
-            }
-            if h.guests.iter().flatten().all(|g| g.state != State::Running) {
-                info!("l4h-vmmgr: all guests stopped");
-            }
-            Some(0)
-        }
-        other => {
-            l4h_rt::log!("l4h-vmmgr: guest {}'s l4h-vmm: unknown call {}", id, other);
-            Some(u64::MAX)
-        }
+        Ok(())
     }
 }
 

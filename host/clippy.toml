@@ -1,0 +1,7 @@
+disallowed-methods = [
+    { path = "sel4::AbsoluteCPtr::mint", reason = "mint an IPC capability from its edge (l4h_task::edge)" },
+    { path = "sel4::Cap::recv", reason = "serve with l4h_ipc::run; wait on a notification with wait()" },
+    { path = "sel4::Cap::nb_recv", reason = "serve with l4h_ipc::run (Next::Poll)" },
+    { path = "sel4::Cap::reply_recv", reason = "serve with l4h_ipc::run" },
+    { path = "sel4::Cap::call", reason = "call through l4h_ipc::Endpoint<P>, a protocol's Client" },
+]

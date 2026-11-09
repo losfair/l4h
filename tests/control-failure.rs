@@ -4,6 +4,8 @@
 //! serving new requests, and leave fault IPC unanswered.
 extern crate self as l4h_rt;
 pub use l4h_host as host;
+/// failure.rs answers through l4h_rt::ipc.
+pub use sel4::ipc_mock as ipc;
 
 use l4h_abi as abi;
 use std::cell::RefCell;
@@ -13,22 +15,17 @@ use std::sync::Mutex;
 
 #[path = "../host/l4h-rt/src/failure.rs"]
 mod failure;
-/// A second copy, whose handler is never set: blkd's and netd's.
+/// A second copy, whose handler is never set: memd's.
 #[path = "../host/l4h-rt/src/failure.rs"]
 #[allow(dead_code)]
-mod failure_mailbox;
-mod mailbox {
-    pub fn fail() {
-        super::MODEL.with(|m| m.borrow_mut().mailbox_fails += 1);
-    }
-}
+mod failure_plain;
 pub use failure::FailureHandler;
 #[path = "../host/l4h-vmmgr/src/ctl_failure.rs"]
 mod ctl_failure;
 
 const MAX_GUESTS: usize = 2;
-const TIMER_BADGE: u64 = 1 << 40;
-const CTL_KICK_BADGE: u64 = 1 << 41;
+
+
 const EVENT: usize = 71;
 const DONE_CAP: u64 = 300;
 static LOCK: Mutex<()> = Mutex::new(());
@@ -41,7 +38,6 @@ struct Model {
     current_tcb: u64,
     bound_tcb: u64,
     bindings: Vec<u64>,
-    mailbox_fails: usize,
     incoming: VecDeque<Input>,
     caller: Option<bool>, // true: a fault, which must remain unanswered
     replies: Vec<[u64; 8]>,
@@ -75,6 +71,13 @@ pub mod sel4 {
     impl IpcBuffer { pub fn msg_regs_mut(&mut self) -> &mut [u64] { &mut self.0 } }
     pub fn with_ipc_buffer_mut<R>(f: impl FnOnce(&mut IpcBuffer) -> R) -> R {
         MODEL.with(|m| f(&mut m.borrow_mut().ipc))
+    }
+    /// l4h_ipc::reply, on the mock IPC buffer.
+    pub mod ipc_mock {
+        pub fn reply(words: &[u64]) -> super::MessageInfo {
+            super::with_ipc_buffer_mut(|b| b.msg_regs_mut()[..words.len()].copy_from_slice(words));
+            super::MessageInfo::new(0, 0, 0, words.len())
+        }
     }
     impl Cap<cap_type::Tcb> {
         pub fn tcb_unbind_notification(self) -> Result<(), ()> {
@@ -117,7 +120,7 @@ pub mod sel4 {
     }
     impl Cap<cap_type::Endpoint> {
         pub fn reply_recv(self, info: MessageInfo, reply: Cap<cap_type::Reply>) -> (MessageInfo, u64) {
-            assert_eq!(info.0, 8);
+            assert_eq!(info.0, 1, "a failed component answers wire::FAILED alone");
             MODEL.with(|m| {
                 let mut m = m.borrow_mut();
                 if let Some(fault) = m.caller.take() {
@@ -134,7 +137,7 @@ pub mod sel4 {
                 let mut m = m.borrow_mut();
                 let badge = match m.incoming.pop_front().expect("scripted input") {
                     Input::Call => { m.caller = Some(false); 0x500 }
-                    Input::Fault => { m.caller = Some(true); host::BADGE_FAULT | 1 }
+                    Input::Fault => { m.caller = Some(true); host::badges::parent::FAULT | 1 }
                     Input::Notify(badge) => {
                         assert_eq!(m.bound_tcb, m.current_tcb);
                         badge
@@ -142,7 +145,7 @@ pub mod sel4 {
                     Input::Request(seq) => {
                         assert_eq!(m.bound_tcb, m.current_tcb);
                         unsafe { (*((m.page + abi::CTL_SYNC_OFF) as *mut abi::CtlSync)).seq = seq };
-                        CTL_KICK_BADGE
+                        host::badges::vmmgr::CTL_KICK
                     }
                     Input::End => std::panic::panic_any(End),
                 };
@@ -184,11 +187,11 @@ fn panic_and_keeper_finish_outstanding_and_future_requests_without_replying_to_f
             m.current_tcb = tcb;
             m.bound_tcb = host::SLOT_TCB;
             m.caller = Some(false); // preserve synchronous failure replies
-            m.incoming = [Input::Call, Input::Fault, Input::Notify(TIMER_BADGE),
-                Input::Notify(host::vmmgr::BADGE_ROOT_EVENT), Input::Request(8),
+            m.incoming = [Input::Call, Input::Fault, Input::Notify(host::badges::vmmgr::TIMER),
+                Input::Notify(host::badges::vmmgr::MAILBOX), Input::Request(8),
                 Input::Request(9), Input::Call, Input::End].into();
         });
-        let end = std::panic::catch_unwind(|| failure::answer_failed(tcb, false)).unwrap_err();
+        let end = std::panic::catch_unwind(|| failure::answer_failed(tcb)).unwrap_err();
         assert!(end.is::<End>());
         MODEL.with(|m| {
             let m = m.borrow();
@@ -200,25 +203,25 @@ fn panic_and_keeper_finish_outstanding_and_future_requests_without_replying_to_f
 }
 
 #[test]
-fn mailbox_keeper_without_handler_takes_the_notification() {
+fn keeper_without_handler_answers_calls_and_leaves_faults() {
     let _lock = LOCK.lock().unwrap();
     for tcb in [host::SLOT_TCB, host::SLOT_KEEPER] {
         MODEL.with(|m| {
             *m.borrow_mut() = Model {
                 current_tcb: tcb,
                 bound_tcb: host::SLOT_TCB,
-                incoming: [Input::Notify(host::mailbox::BADGE_CALL), Input::Call, Input::Fault,
-                    Input::Notify(host::mailbox::BADGE_CALL), Input::End].into(),
+                incoming: [Input::Call, Input::Fault, Input::Call, Input::End].into(),
                 ..Model::default()
             };
         });
-        let end = std::panic::catch_unwind(|| failure_mailbox::answer_failed(tcb, true)).unwrap_err();
+        let end = std::panic::catch_unwind(|| failure_plain::answer_failed(tcb)).unwrap_err();
         assert!(end.is::<End>());
         MODEL.with(|m| {
             let m = m.borrow();
-            assert_eq!(m.mailbox_fails, 3);
-            assert_eq!(m.replies, [[u64::MAX, 0, 0, 0, 0, 0, 0, 0]]);
-            assert_eq!(m.bindings, if tcb == host::SLOT_KEEPER { vec![0, tcb] } else { vec![] });
+            // The notification stays with the main thread: nothing on it is
+            // the keeper's.
+            assert_eq!(m.replies, [[u64::MAX, 0, 0, 0, 0, 0, 0, 0]; 2]);
+            assert!(m.bindings.is_empty());
         });
     }
 }
@@ -233,12 +236,12 @@ fn completed_request_is_woken_and_removed_guest_is_not_touched() {
     MODEL.with(|m| assert_eq!(m.borrow().wakes, [(u32::MAX, u32::MAX, 0)]));
     // The next request wraps the sequence; it still receives EIO.
     unsafe { (*((f.page.as_mut_ptr() as *mut u8).add(abi::CTL_SYNC_OFF).cast::<abi::CtlSync>())).seq = 0 };
-    (ctl_failure::HANDLER.notified)(CTL_KICK_BADGE);
+    (ctl_failure::HANDLER.notified)(host::badges::vmmgr::CTL_KICK);
     MODEL.with(|m| assert_eq!(m.borrow().wakes.last(), Some(&(0, 0, -5))));
     drop(f);
-    (ctl_failure::HANDLER.notified)(CTL_KICK_BADGE);
+    (ctl_failure::HANDLER.notified)(host::badges::vmmgr::CTL_KICK);
     MODEL.with(|m| assert_eq!(m.borrow().wakes.len(), 2));
     let _replacement = Fixture::new(1, 0);
-    (ctl_failure::HANDLER.notified)(CTL_KICK_BADGE);
+    (ctl_failure::HANDLER.notified)(host::badges::vmmgr::CTL_KICK);
     MODEL.with(|m| assert_eq!(m.borrow().wakes, [(1, 1, -5)]));
 }

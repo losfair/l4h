@@ -5,14 +5,12 @@
 use l4h_rt::{cap, host, sel4};
 use sel4::cap_type;
 
-const TIMER_BADGE: u64 = 1;
-
 /// Block until the time counter reaches `deadline`.
 pub fn sleep_until(deadline: u64) {
     let tcb = cap::<cap_type::Tcb>(host::SLOT_TCB);
     let ntfn = cap::<cap_type::Notification>(host::SLOT_NTFN);
     while host::ticks::now() < deadline {
-        sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_TCB_SetTimer(tcb.bits(), deadline, TIMER_BADGE));
+        sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_TCB_SetTimer(tcb.bits(), deadline, host::badges::trustd::TIMER));
         ntfn.wait();
     }
 }

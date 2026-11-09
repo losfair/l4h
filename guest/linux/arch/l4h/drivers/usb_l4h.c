@@ -776,9 +776,9 @@ static irqreturn_t ul4h_interrupt(int irq, void *data)
 static int ul4h_set_irq_cpu(void *data, unsigned int cpu)
 {
 	struct ul4h *ul = data;
-	unsigned long mrs[3] = { ul->index, L4H_USB_DEVOP_IRQ_VCPU, cpu };
+	unsigned long mrs[4] = { ul->index, L4H_USB_DEVOP_IRQ_VCPU, cpu, 0 };
 
-	return l4h_hypercall(L4H_HC_DEV_WRITE, mrs, 3, 1) ? -EINVAL : 0;
+	return l4h_hypercall(L4H_HC_DEV_WRITE, mrs, 4, 1) ? -EINVAL : 0;
 }
 
 /* ---- reset */

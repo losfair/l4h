@@ -4,7 +4,6 @@
 
 use sel4::{CapRights, ObjectBlueprint, VmAttributes, cap, cap_type};
 
-use l4h_abi as abi;
 use l4h_host as host;
 use l4h_host::fixed::{ArrayVec, Scratch};
 
@@ -82,7 +81,7 @@ pub enum Backend {
         keep: cap::CNode,
     },
     /// A USB controller: the VMM raises its event when usbd signals
-    /// host::vmm_badge_usb(n), and maps nothing of it.
+    /// badges::vmm::USB bit n, and maps nothing of it.
     Usb { n: usize },
     /// virtio-gpu (gpu.rs): frame i < display_pages is page i of the
     /// display area, the others are the VMM's tables.
@@ -168,13 +167,13 @@ fn create(
                 dev.kind = host::VDEV_BLK;
                 dev.chan_va = host::vmm_chan_va(d) as u64;
                 dev.chan_size = (chan.len() * PAGE) as u64;
-                dev.chan_kick_slot = host::VMM_KICK_SLOT_BASE + d as u64;
+                dev.chan_kick_slot = l4h_host::wiring::VMM_BLKD_KICK.slot(d);
             }
             Backend::Net { mac, .. } => {
                 dev.kind = host::VDEV_NET;
                 dev.chan_va = host::vmm_chan_va(d) as u64;
                 dev.chan_size = (host::net::PORT_PAGES * PAGE) as u64;
-                dev.chan_kick_slot = host::VMM_KICK_SLOT_BASE + d as u64;
+                dev.chan_kick_slot = l4h_host::wiring::VMM_NETD_KICK.slot(d);
                 dev.mac[..6].copy_from_slice(mac);
             }
             Backend::Usb { n } => {
@@ -238,7 +237,7 @@ fn map(g: &mut Guest, comp: &Component, backends: &[(usize, Backend)], alloc: &m
     for (v, vcpu) in g.vcpus.iter().enumerate() {
         let ev = crate::component::abs_of(vcpu.event);
         comp.map_copy(alloc, &mut g.arena, &ev, host::vmm_event_page_va(v), CapRights::read_write(), attrs, keep_slot());
-        comp.give_badged(host::VCPU_NTFN_SLOT_BASE + v as u64, vcpu.ntfn, CapRights::write_only(), abi::BADGE_EVENT);
+        comp.give_edge(&l4h_host::wiring::VMM_VCPU, v, 0, &g.vcpu_obj(v));
     }
     for (d, dev) in g.devices.iter().enumerate() {
         // A USB controller's queue area is usbd's and the guest's alone.
@@ -249,8 +248,7 @@ fn map(g: &mut Guest, comp: &Component, backends: &[(usize, Backend)], alloc: &m
         comp.map_copy(alloc, &mut g.arena, &p, host::vmm_device_page_va(d), CapRights::read_write(), attrs, keep_slot());
     }
     if g.mem_dev.is_some() {
-        let dst = comp.slot(host::VMM_SLOT_MEMD_EP);
-        crate::memd::give_vmm_ep(g.id, &dst);
+        crate::memd::give_vmm_ep(g.id, comp);
     }
     for (i, f) in g.console_ring.iter().enumerate() {
         let p = crate::component::abs_of(*f);
@@ -264,7 +262,8 @@ fn map(g: &mut Guest, comp: &Component, backends: &[(usize, Backend)], alloc: &m
                     let fc = crate::component::abs_of(*f);
                     comp.map_copy(alloc, &mut g.arena, &fc, host::vmm_chan_va(d) + i * PAGE, CapRights::read_write(), attrs, keep_slot());
                 }
-                comp.give(host::VMM_KICK_SLOT_BASE + d as u64, *kick, CapRights::write_only());
+                // blkd's kick, which root minted and passed with the channel.
+                comp.pass_edge(&l4h_host::wiring::VMM_BLKD_KICK, d, *kick);
             }
             Backend::Net { chan, kick, keep, .. } => {
                 for i in 0..host::net::PORT_PAGES {
@@ -272,7 +271,8 @@ fn map(g: &mut Guest, comp: &Component, backends: &[(usize, Backend)], alloc: &m
                     let dst = keep.absolute_cptr_from_bits_with_depth(i as u64, l4h_host::vmmgr::PORT_RADIX);
                     comp.map_copy(alloc, &mut g.arena, &fc, host::vmm_chan_va(d) + i * PAGE, CapRights::read_write(), attrs, dst);
                 }
-                comp.give(host::VMM_KICK_SLOT_BASE + d as u64, *kick, CapRights::write_only());
+                // netd's, for the port.
+                comp.pass_edge(&l4h_host::wiring::VMM_NETD_KICK, d, *kick);
             }
             Backend::Gpu { frames, keep, radix, display_pages, .. } => {
                 for i in 0..display_pages + host::gpu::STATE_PAGES {

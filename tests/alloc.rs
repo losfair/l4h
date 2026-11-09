@@ -4,6 +4,15 @@
 
 extern crate self as l4h_host;
 extern crate self as sel4;
+extern crate self as l4h_ipc;
+
+/// l4h_ipc::preserving, on the mock IPC buffer.
+pub fn preserving<R>(f: impl FnOnce() -> R) -> R {
+    let regs = with_ipc_buffer(|b| b.msg);
+    let r = f();
+    with_ipc_buffer_mut(|b| b.msg = regs);
+    r
+}
 
 macro_rules! log { ($($arg:tt)*) => { println!($($arg)*) }; }
 

@@ -5,7 +5,7 @@
 
 #![no_std]
 
-pub const ABI_VERSION: u64 = 7;
+pub const ABI_VERSION: u64 = 8;
 
 pub const ROOT_CNODE_BITS: usize = 12;
 pub const L2_INDEX_BITS: usize = 18;

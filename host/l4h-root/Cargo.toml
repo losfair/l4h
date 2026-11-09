@@ -10,6 +10,7 @@ sel4-root-task.workspace = true
 l4h-abi.workspace = true
 l4h-partition.workspace = true
 l4h-host = { path = "../l4h-host" }
+l4h-ipc = { path = "../l4h-ipc" }
 l4h-task = { path = "../l4h-task" }
 l4h-virtio = { path = "../l4h-virtio" }
 sha2.workspace = true

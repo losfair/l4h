@@ -7,6 +7,9 @@ extern crate self as l4h_rt;
 pub use l4h_host as host;
 
 use host::blk::{self, BlkdConfig, Channel};
+use host::blk::call::{Request, reply};
+use host::wire::{self, Message};
+use host::errno;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -58,15 +61,15 @@ pub mod sel4 {
     pub fn with_ipc_buffer_mut<R>(f: impl FnOnce(&mut IpcBuffer) -> R) -> R {
         crate::KERNEL.with_borrow_mut(|k| f(&mut k.ipc))
     }
-    impl Cap<cap_type::Endpoint> {
-        /// Root's signal (BADGE_CALL); the test ends once every request
+    impl Cap<cap_type::Notification> {
+        pub fn signal(self) { crate::KERNEL.with_borrow_mut(|k| k.signals += 1); }
+        /// Root's signal (badges::driver::CALL); the test ends once every request
         /// is answered.
-        pub fn recv(self, _: Cap<cap_type::Reply>) -> (MessageInfo, u64) {
+        pub fn wait(self) -> (MessageInfo, u64) {
             if crate::KERNEL.with_borrow(|k| k.requests.is_empty()) { std::panic::panic_any(crate::Finished); }
-            (MessageInfo::new(0, 0, 0, 0), crate::host::mailbox::BADGE_CALL)
+            (MessageInfo::new(0, 0, 0, 0), crate::host::badges::driver::CALL)
         }
     }
-    impl Cap<cap_type::Notification> { pub fn signal(self) { crate::KERNEL.with_borrow_mut(|k| k.signals += 1); } }
     impl Cap<cap_type::IrqHandler> { pub fn irq_handler_ack(self) -> Result<(), ()> { Ok(()) } }
 }
 
@@ -78,23 +81,24 @@ pub mod mailbox {
         const { assert!(core::mem::size_of::<T>() <= 4096) };
         unsafe { &*PUBLISHED.as_ptr().cast::<T>() }
     }
-    pub fn request() -> Option<u64> {
-        crate::KERNEL.with_borrow_mut(|k| {
-            let (label, args, pending_io) = k.requests.pop_front()?;
-            k.ipc.0[..args.len()].copy_from_slice(&args);
+    pub fn serve(mut f: impl FnMut(u64, &[u64; 6], &mut [u64; 5]) -> Option<usize>) -> bool {
+        let mut answered = false;
+        loop {
+            let Some((label, args, pending_io)) = crate::KERNEL.with_borrow_mut(|k| k.requests.pop_front()) else {
+                return answered;
+            };
             if pending_io {
                 // A client publishes work while root's request is taken.
                 // submit() must notify the hardware.
                 unsafe { (*crate::channel()).sq.head = 1; }
             }
-            Some(label)
-        })
-    }
-    pub fn answer(n: usize) {
-        crate::KERNEL.with_borrow_mut(|k| {
-            assert_eq!(n, 5);
-            k.replies.push(k.ipc.0[..5].try_into().unwrap());
-        });
+            let mut words = [0; 5];
+            if f(label, &args, &mut words).is_none() {
+                words = [crate::host::wire::FAILED, 0, 0, 0, 0];
+            }
+            crate::KERNEL.with_borrow_mut(|k| k.replies.push(words));
+            answered = true;
+        }
     }
     pub fn signal() {}
 }
@@ -206,7 +210,21 @@ fn unmap_client() {
     }
 }
 
-fn run(kind: u32, legacy: bool, label: u64, pending_io: bool, retry: bool, status: u32) -> [u64; 5] {
+/// A request as root posts it: label and argument words.
+fn post(r: Request) -> (u64, [u64; 6]) {
+    let mut args = [0; 6];
+    r.encode(&mut args);
+    (r.label(), args)
+}
+
+fn add() -> (u64, [u64; 6]) {
+    post(Request::Add { client: 0, unit: 0, dom0: false, n: 0 })
+}
+
+/// Not a request of blkd's.
+const UNKNOWN: (u64, [u64; 6]) = (u64::MAX, [0; 6]);
+
+fn run(kind: u32, legacy: bool, (label, args): (u64, [u64; 6]), pending_io: bool, retry: bool, status: u32) -> [u64; 5] {
     let _lock = LOCK.lock().unwrap();
     map_client();
     unsafe {
@@ -217,7 +235,7 @@ fn run(kind: u32, legacy: bool, label: u64, pending_io: bool, retry: bool, statu
     }
     KERNEL.with_borrow_mut(|k| {
         k.ipc.0.fill(0);
-        k.requests = [(blk::BLKD_ADD, [0; 6], false), (label, [0; 6], pending_io)].into();
+        k.requests = [(add().0, add().1, false), (label, args, pending_io)].into();
         k.replies.clear();
         k.retry = retry;
         k.status = status;
@@ -245,7 +263,7 @@ fn run(kind: u32, legacy: bool, label: u64, pending_io: bool, retry: bool, statu
 fn units_are_published_and_requests_survive_pending_io() {
     for kind in [blk::BLKD_VIRTIO, blk::BLKD_VIRTIO_SCSI] {
         for legacy in [false, true] {
-            assert_eq!(run(kind, legacy, u64::MAX, true, false, 0)[0], u64::MAX);
+            assert_eq!(run(kind, legacy, UNKNOWN, true, false, 0)[0], errno::EINVAL);
             let p = mailbox::published::<blk::Published>();
             let u = &p.unit[0];
             let unit = [&u.capacity, &u.block_size, &u.read_only, &u.address].map(|w| w.load(Ordering::Relaxed));
@@ -257,23 +275,24 @@ fn units_are_published_and_requests_survive_pending_io() {
 #[test]
 fn service_status_survives_pending_io() {
     for kind in [blk::BLKD_VIRTIO, blk::BLKD_VIRTIO_SCSI] {
-        assert_eq!(run(kind, true, blk::BLKD_FLUSH, true, false, 0)[0], 0);
-        assert_eq!(run(kind, true, u64::MAX, true, false, 0)[0], u64::MAX);
+        assert_eq!(wire::reply::<reply::Flush>(&run(kind, true, post(Request::Flush { unit: 0 }), true, false, 0)), Ok(0));
+        assert_eq!(run(kind, true, UNKNOWN, true, false, 0)[0], errno::EINVAL);
     }
 }
 
 #[test]
 fn provisioning_status_survives_scsi_retry() {
     for status in [blk::STATUS_OK, blk::STATUS_IOERR] {
-        assert_eq!(run(blk::BLKD_VIRTIO_SCSI, true, blk::BLKD_FLUSH, false, true, status)[0], status as u64);
+        let r = run(blk::BLKD_VIRTIO_SCSI, true, post(Request::Flush { unit: 0 }), false, true, status);
+        assert_eq!(wire::reply::<reply::Flush>(&r), Ok(status as u64));
     }
 }
 
 #[test]
 fn refused_provisioning_reports_its_errno() {
     // Sector 0, length 0: not a flush, so not a valid range.
-    let r = run(blk::BLKD_VIRTIO, true, blk::BLKD_WRITE, true, false, 0);
-    assert_eq!(r[..2], [blk::BLKD_REFUSED, blk::EINVAL]);
+    let r = run(blk::BLKD_VIRTIO, true, post(Request::Write { sector: 0, length: 0, unit: 0 }), true, false, 0);
+    assert_eq!(wire::reply::<reply::Write>(&r), Err(errno::EINVAL));
 }
 
 #[test]
@@ -291,8 +310,9 @@ fn a_split_request_waits_for_room_and_drains_on_remove() {
         k.ipc.0.fill(0);
         // Attach the two extents; the request arrives with an extent query;
         // the device has room for one piece; then remove the client.
-        k.requests = [(blk::BLKD_ADD, [0, 0, 0, 2, 0, 0], false), (blk::BLKD_EXTENT, [0; 6], true),
-            (blk::BLKD_REMOVE, [0; 6], false)].into();
+        let (add, extent, remove) = (post(Request::Add { client: 0, unit: 0, dom0: false, n: 2 }),
+            post(Request::Extent { client: 0, k: 0 }), post(Request::Remove { client: 0 }));
+        k.requests = [(add.0, add.1, false), (extent.0, extent.1, true), (remove.0, remove.1, false)].into();
         k.replies.clear();
         (k.retry, k.status, k.kicks, k.room) = (false, 0, 0, 1);
         k.started.clear();
@@ -328,7 +348,8 @@ fn completion_batch_wakes_the_client_once_and_returns_every_request() {
     }
     KERNEL.with_borrow_mut(|k| {
         k.ipc.0.fill(0);
-        k.requests = [(blk::BLKD_ADD, [0; 6], false), (blk::BLKD_REMOVE, [0; 6], false)].into();
+        let remove = post(Request::Remove { client: 0 });
+        k.requests = [(add().0, add().1, false), (remove.0, remove.1, false)].into();
         k.replies.clear();
         (k.retry, k.status, k.kicks, k.signals, k.room) = (false, 0, 0, 0, usize::MAX);
         k.started.clear();

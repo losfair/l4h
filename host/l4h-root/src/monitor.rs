@@ -10,8 +10,6 @@ use sel4::cap_type;
 use crate::Host;
 use crate::mem::Alloc;
 
-/// Badge of the monitor's interrupt on the root task's bound notification.
-pub const MONITOR_BADGE: u64 = 1 << 41;
 
 /// seL4 user IRQ vector for the serial port.
 #[cfg(target_arch = "x86_64")]
@@ -66,9 +64,7 @@ impl Monitor {
         }
         let irq = sel4::init_thread::Slot::<cap_type::IrqHandler>::from_index(irq_slot).cap();
         let badged = alloc.slots.alloc();
-        abs(badged)
-            .mint(&slot::CNODE.cap().absolute_cptr(ntfn), sel4::CapRights::write_only(), MONITOR_BADGE)
-            .ok()?;
+        crate::component::mint_edge(&abs(badged), &l4h_host::wiring::IRQ_MONITOR, 0, &crate::component::root_ntfn(ntfn)).ok()?;
         irq.irq_handler_set_notification(sel4::init_thread::Slot::<cap_type::Notification>::from_index(badged).cap()).ok()?;
         m.irq = Some(irq);
         // Receive-data interrupt; OUT2 routes UART interrupts to the PIC/IOAPIC.
@@ -93,7 +89,7 @@ impl Monitor {
         let irq = sel4::init_thread::Slot::<cap_type::IrqHandler>::from_index(irq_slot).cap();
         let badge_slot = alloc.slots.alloc();
         let badge = sel4::init_thread::Slot::<cap_type::Notification>::from_index(badge_slot).cap();
-        crate::component::abs_of(badge).mint(&crate::component::abs_of(ntfn), CapRights::write_only(), MONITOR_BADGE).ok()?;
+        crate::component::mint_edge(&crate::component::abs_of(badge), &l4h_host::wiring::IRQ_MONITOR, 0, &crate::component::root_ntfn(ntfn)).ok()?;
         irq.irq_handler_set_notification(badge).ok()?;
         unsafe {
             ((UART_VA + 0x44) as *mut u32).write_volatile(0x7ff); // clear pending IRQs
@@ -214,12 +210,13 @@ fn run(h: &mut Host, line: &str) {
         }
         _ => {}
     }
-    let Some(v) = &h.vmmgr else {
+    let Some(v) = h.vmmgr.as_mut() else {
         log!("monitor: vmmgr is not running");
         return;
     };
     // Guests are vmmgr's: it runs what changes them.
-    let send = |cmd, arg| if !v.monitor(cmd, arg) { log!("monitor: vmmgr is busy, try again") };
+    use l4h_host::vmmgr::call::Request as Notice;
+    let send = |v: &mut crate::vmmgr::Vmmgr, cmd| if !v.monitor(cmd) { log!("monitor: vmmgr is busy, try again") };
     match cmd {
         "list" => {
             for id in 0..crate::MAX_GUESTS {
@@ -232,10 +229,10 @@ fn run(h: &mut Host, line: &str) {
             }
         }
         "destroy" => match words.next().and_then(|w| w.parse::<u32>().ok()) {
-            Some(id) if v.guest(id as usize).is_some_and(|g| g.dom0 == 0) => send(l4h_host::vmmgr::MONITOR_DESTROY, id),
+            Some(id) if v.guest(id as usize).is_some_and(|g| g.dom0 == 0) => send(v, Notice::Destroy { guest: id as usize }),
             _ => log!("monitor: destroy <vm> (not dom0; use restart-dom0)"),
         },
-        "restart-dom0" => send(l4h_host::vmmgr::MONITOR_RESTART_DOM0, 0),
+        "restart-dom0" => send(v, Notice::RestartDom0 {}),
         _ => log!("monitor: unknown command '{}' (try 'help')", cmd),
     }
 }

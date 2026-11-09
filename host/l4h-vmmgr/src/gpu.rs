@@ -6,6 +6,7 @@
 
 use core::sync::atomic::{Ordering, fence};
 
+use l4h_host::errno::Errno;
 use sel4::{ObjectBlueprint, cap_type};
 
 use l4h_abi as abi;
@@ -62,12 +63,12 @@ pub fn table_bytes(pages: usize) -> usize {
 /// The frames of a GPU with one scanout of `width` x `height`, its display
 /// area mapped in vmmgr.  ENOMEM if the host has too little memory;
 /// what was allocated by then stays in the guest's arena until destroy.
-pub fn attach(g: &mut Guest, alloc: &mut Alloc, width: u32, height: u32) -> Result<Backend, i64> {
+pub fn attach(g: &mut Guest, alloc: &mut Alloc, width: u32, height: u32) -> Result<Backend, Errno> {
     let (n, radix) = frames(width, height);
     // The CNodes are larger than reserve guarantees: they may not fit.
     let mut cnode = || {
         let s = g.arena.try_object(alloc, ObjectBlueprint::CNode { size_bits: radix }).ok_or(ENOMEM)?;
-        Ok::<_, i64>(sel4::init_thread::Slot::<cap_type::CNode>::from_index(s).cap())
+        Ok::<_, Errno>(sel4::init_thread::Slot::<cap_type::CNode>::from_index(s).cap())
     };
     let frames = cnode()?;
     let keep = cnode()?;
@@ -97,7 +98,7 @@ pub fn attach(g: &mut Guest, alloc: &mut Alloc, width: u32, height: u32) -> Resu
 /// CTL_GPU_READ: copy the image of guest `g` from byte `offset` into `to`
 /// (dom0's control data area, CTL_LOAD_MAX bytes).  The size is vmmgr's
 /// own, not what l4h-vmm may have written in the header.
-pub fn read(g: &Guest, offset: u64, to: *mut u8, before_copy: impl FnOnce(bool) -> Result<(), i64>) -> Result<[u64; 6], i64> {
+pub fn read(g: &Guest, offset: u64, to: *mut u8, before_copy: impl FnOnce(bool) -> Result<(), Errno>) -> Result<[u64; 6], Errno> {
     let (width, height) = g.gpu.ok_or(EINVAL)?;
     let base = self_display_va(g.id);
     let hdr = unsafe { &*(base as *const DisplayHeader) };

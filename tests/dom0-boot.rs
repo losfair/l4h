@@ -4,6 +4,7 @@
 
 extern crate self as l4h_rt;
 
+use l4h_host::errno::Errno;
 use l4h_host::{MAX_GUEST_DEVICES, blk::DiskWindow, vmmgr::{DOM0_MAX_DISKS, Dom0Disk, Dom0Nic, VmmgrConfig}};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -57,14 +58,14 @@ impl Vmmgr {
         self.guest = Some(g);
         Some(result)
     }
-    fn add_device(&mut self) -> Result<(), i64> {
+    fn add_device(&mut self) -> Result<(), Errno> {
         let g = self.guest.as_mut().unwrap();
         if g.devices.len() == MAX_GUEST_DEVICES { return Err(28); }
         g.devices.push(());
         Ok(())
     }
     fn attach_disk(&mut self, _: usize, disk: usize, flags: u64, start: u64, sectors: u64, extents: (u64, u64),
-        then: Then) -> Result<Later<()>, i64> {
+        then: Then) -> Result<Later<()>, Errno> {
         assert_eq!(extents, (0, 0), "boot disks are windows");
         assert_eq!(flags, 0);
         let attempt = self.disk_attempts.len();
@@ -76,23 +77,23 @@ impl Vmmgr {
         self.disks.push(Some((disk, start, sectors)));
         Ok(Later::Now(()))
     }
-    fn attach_dummy_disk(&mut self, _: usize) -> Result<(), i64> {
+    fn attach_dummy_disk(&mut self, _: usize) -> Result<(), Errno> {
         self.add_device()?;
         self.disks.push(None);
         Ok(())
     }
-    fn create_nic(&mut self, _: usize, switch: u32, _: u64, _: bool, _: bool) -> Result<(), i64> {
+    fn create_nic(&mut self, _: usize, switch: u32, _: u64, _: bool, _: bool) -> Result<(), Errno> {
         self.add_device()?;
         self.nics.push(switch);
         Ok(())
     }
-    fn attach_usb(&mut self, _: usize, ctrl: usize) -> Result<(), i64> {
+    fn attach_usb(&mut self, _: usize, ctrl: usize) -> Result<(), Errno> {
         if self.fail_usbs.contains(&ctrl) { return Err(16); }
         self.add_device()?;
         self.usbs.push(ctrl);
         Ok(())
     }
-    fn start_guest(&mut self, _: usize) -> Result<(), i64> {
+    fn start_guest(&mut self, _: usize) -> Result<(), Errno> {
         assert!(self.guest.as_ref().unwrap().booted);
         self.started = true;
         Ok(())

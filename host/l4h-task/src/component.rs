@@ -16,16 +16,22 @@ use crate::window::Window;
 
 const PAGE: usize = 4096;
 
-/// Badge bits on the root endpoint for messages from components.
-pub const ROOT_BADGE_COMPONENT: u64 = 1 << 25;
+use l4h_host::badges::parent;
+use l4h_host::wire::Protocol;
+use l4h_host::wiring::{self, E, Object, o, p};
 
-pub fn component_badge(id: u32) -> u64 {
-    ROOT_BADGE_COMPONENT | id as u64
+use crate::edge::Obj;
+
+/// The badge of a component's calls on its parent's endpoint (badges::parent).
+pub const fn component_badge(id: u32) -> u64 {
+    parent::COMPONENT | parent::ID.put(id as u64)
 }
 
 pub struct Component {
     local_cnode: cap::CNode,
     pub id: u32,
+    /// host::KIND_*.
+    pub kind: u32,
     pub tcb: cap::Tcb,
     pub cnode: cap::CNode,
     pub vspace: cap::VSpace,
@@ -34,6 +40,17 @@ pub struct Component {
     pub sc: cap::SchedContext,
     /// Radix of its CNode.
     pub cnode_bits: usize,
+}
+
+/// A slot of the caller's in which give_edge looks at what it minted (0:
+/// it does not).
+static AUDIT_SLOT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Check what this task mints into its components (debug builds), looking
+/// at it in `slot`, an empty slot of its own CSpace kept for it.  Each
+/// component audits its whole CSpace itself (l4h_rt::init).
+pub fn audit_in(slot: crate::mem::Slot) {
+    AUDIT_SLOT.store(slot, core::sync::atomic::Ordering::Relaxed);
 }
 
 impl Component {
@@ -48,10 +65,90 @@ impl Component {
             .unwrap_or_else(|e| panic!("component {} slot {} copy: {:?}", self.id, idx, e));
     }
 
-    pub fn give_badged(&self, idx: u64, src: impl sel4::HasCPtrWithDepth, rights: CapRights, badge: u64) {
-        self.slot(idx)
-            .mint(&self.local_cnode.absolute_cptr(src), rights, badge)
+    /// Give it a CNode, with `guard`: the one mint that is no edge.
+    pub fn give_cnode(&self, idx: u64, cnode: cap::CNode, guard: CNodeCapData) {
+        crate::edge::mint_cnode(&self.slot(idx), self.local_cnode, cnode, guard)
             .unwrap_or_else(|e| panic!("component {} slot {} mint: {:?}", self.id, idx, e));
+    }
+
+    /// Mint instance `i` of `e`, which this component holds, from `src`
+    /// into the edge's n-th slot.
+    pub fn give_edge<H, T, O, P>(&self, e: &E<H, T, O, P>, n: usize, i: usize, src: &Obj<T, O>)
+    where
+        H: p::IsParty,
+        T: p::IsParty,
+        O: o::IsObject,
+        P: Protocol,
+    {
+        let idx = self.held(e, n);
+        crate::edge::mint(&self.slot(idx), e, i, src)
+            .unwrap_or_else(|err| panic!("component {} slot {} ({}: {}) mint: {:?}", self.id, idx, e.name, e.what, err));
+        self.minted(e, idx);
+    }
+
+    /// Pass on to it a capability of `e`, which this component holds, that
+    /// was minted already (`minted`: this task's own of the same badge, or
+    /// one a call passed to it), into the edge's n-th slot.
+    pub fn pass_edge<H, T, O, P>(&self, e: &E<H, T, O, P>, n: usize, minted: impl sel4::HasCPtrWithDepth)
+    where
+        H: p::IsParty,
+        T: p::IsParty,
+        O: o::IsObject,
+        P: Protocol,
+    {
+        let idx = self.held(e, n);
+        self.slot(idx)
+            .copy(&self.local_cnode.absolute_cptr(minted), crate::edge::rights(e))
+            .unwrap_or_else(|err| panic!("component {} slot {} ({}: {}) copy: {:?}", self.id, idx, e.name, e.what, err));
+        self.minted(e, idx);
+    }
+
+    /// The n-th slot of `e`, which this component must hold.
+    fn held<H: p::IsParty, T, O, P>(&self, e: &E<H, T, O, P>, n: usize) -> u64 {
+        assert!(H::PARTY.kind() == Some(self.kind), "component {} does not hold {}", self.id, e.name);
+        e.slot(n)
+    }
+
+    /// What is now in slot `idx` is a capability to the edge's object, as
+    /// far as its type says (debug builds).
+    fn minted<H, T, O: o::IsObject, P>(&self, e: &E<H, T, O, P>, idx: u64) {
+        if let Some(t) = self.identify(idx) {
+            assert!(t == wiring::cap_tag(O::OBJECT), "component {} slot {} ({}): not a capability to {:?}", self.id, idx, e.name, O::OBJECT);
+        }
+    }
+
+    /// The type (seL4's cap tag) of what is in slot `idx`, which is not
+    /// empty, in debug builds.
+    fn identify(&self, idx: u64) -> Option<u32> {
+        sel4::sel4_cfg_if! {
+            if #[sel4_cfg(DEBUG_BUILD)] {
+                let slot = AUDIT_SLOT.load(core::sync::atomic::Ordering::Relaxed);
+                if slot == 0 || !host::AUDIT {
+                    return None;
+                }
+                let scratch = self.local_cnode.absolute_cptr(cap_at::<cap_type::Null>(slot));
+                if scratch.copy(&self.slot(idx), CapRights::all()).is_err() {
+                    return None;
+                }
+                let t = cap_at::<cap_type::Null>(slot).debug_identify();
+                scratch.delete().expect("audit scratch slot");
+                Some(t)
+            } else {
+                let _ = idx;
+                None
+            }
+        }
+    }
+
+    /// Its notification or service endpoint, as T's: it must be one.
+    pub fn obj<T: p::IsParty, O: o::IsObject>(&self) -> Obj<T, O> {
+        assert!(T::PARTY.kind() == Some(self.kind), "component {} is not {:?}", self.id, T::PARTY);
+        let cap = match O::OBJECT {
+            Object::Notification => self.local_cnode.absolute_cptr(self.ntfn),
+            Object::Endpoint => self.local_cnode.absolute_cptr(self.service_ep),
+            o => panic!("a component has no {:?} of its own", o),
+        };
+        Obj::of(cap)
     }
 
     /// Map `frame` (a capability anywhere in the parent's CSpace) into the
@@ -101,6 +198,8 @@ pub struct SpawnContext {
     pub authority: cap::Tcb,
     pub sched_control: cap::SchedControl,
     pub parent_ep: cap::Endpoint,
+    /// Whose parent_ep is: the components' calls and faults go to it.
+    pub parent: wiring::Party,
     pub tsc_hz: u64,
     /// First of the parent's contiguous capabilities to the log frames.
     pub log_frames: u64,
@@ -148,7 +247,7 @@ pub fn create(
     drop(ctx);
     assign_asid(alloc, vspace);
 
-    let c = Component { local_cnode, id: args.id, tcb, cnode, vspace, ntfn, service_ep, sc, cnode_bits };
+    let c = Component { local_cnode, id: args.id, kind: args.kind, tcb, cnode, vspace, ntfn, service_ep, sc, cnode_bits };
 
     // Shared diagnostics: mapping caps belong to the child's arena, so
     // destroying a VMM releases them without revoking the shared frames.
@@ -271,15 +370,17 @@ pub fn create(
 
     // ---- CSpace.
     let guard = CNodeCapData::new(0, 64 - cnode_bits);
-    c.give_badged(host::SLOT_CNODE, cnode, CapRights::all(), guard.into_word());
+    c.give_cnode(host::SLOT_CNODE, cnode, guard);
     c.give(host::SLOT_VSPACE, vspace, CapRights::all());
     c.give(host::SLOT_TCB, tcb, CapRights::all());
-    c.give_badged(
-        host::SLOT_ROOT_EP,
-        context.parent_ep,
-        sel4::CapRightsBuilder::none().write(true).grant_reply(true).build(),
-        component_badge(args.id),
-    );
+    // Only a component that calls its parent can.
+    if let Some(e) = wiring::parent_call(args.kind) {
+        assert_eq!(e.badge(args.id as usize), component_badge(args.id), "{}: the parent knows the caller by its id", e.name);
+        assert!(e.target == context.parent, "{} is not to the parent", e.name);
+        let dst = c.slot(e.slot(0));
+        crate::edge::mint_dyn(&dst, e, args.id as usize, &local_cnode.absolute_cptr(context.parent_ep))
+            .expect("component's parent endpoint");
+    }
     c.give(host::SLOT_NTFN, ntfn, CapRights::all());
     c.give(host::SLOT_SERVICE_EP, service_ep, CapRights::all());
     c.give(host::SLOT_REPLY, reply, CapRights::all());
@@ -290,9 +391,15 @@ pub fn create(
     context.sched_control
         .sched_control_configure_flags(sc, args.budget_us, args.period_us, 0, 0, 0)
         .expect("component SC");
+    // To the parent go the faults of the keeper, if there is one, or else
+    // of the main thread.
+    let fault = if keeper.is_some() { wiring::keeper_fault(args.kind) } else { wiring::parent_fault(args.kind) }
+        .expect("a component's faults go to its parent");
+    assert_eq!(fault.badge(args.id as usize), component_badge(args.id) | parent::FAULT, "{}", fault.name);
+    assert!(fault.target == context.parent, "{} is not to the parent", fault.name);
     let fault_slot = alloc.slots.alloc();
-    local_cnode.absolute_cptr(cap_at::<cap_type::Null>(fault_slot))
-        .mint(&local_cnode.absolute_cptr(context.parent_ep), CapRights::all(), component_badge(args.id) | host::BADGE_FAULT)
+    crate::edge::mint_dyn(&local_cnode.absolute_cptr(cap_at::<cap_type::Null>(fault_slot)), fault, args.id as usize,
+        &local_cnode.absolute_cptr(context.parent_ep))
         .expect("component fault ep");
     let root_fault = cap_at::<cap_type::Endpoint>(fault_slot);
     // The keeper is left suspended: the main thread starts it, on its own

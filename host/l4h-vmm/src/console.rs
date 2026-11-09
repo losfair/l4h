@@ -186,7 +186,7 @@ impl Console {
 
     fn timer(&self, deadline: u64) {
         let tcb = cap::<sel4::cap_type::Tcb>(host::SLOT_TCB);
-        let error = sel4::with_ipc_buffer_mut(|b| b.inner_mut().seL4_TCB_SetTimer(tcb.bits(), deadline, host::VMM_BADGE_CONSOLE));
+        let error = sel4::with_ipc_buffer_mut(|b| b.inner_mut().seL4_TCB_SetTimer(tcb.bits(), deadline, host::badges::vmm::CONSOLE));
         assert_eq!(error, 0, "console gap timer");
     }
 

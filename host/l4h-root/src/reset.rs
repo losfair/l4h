@@ -74,9 +74,9 @@ impl Reset {
     }
 }
 
-/// Reset the machine.  Returns only if every method failed: -EIO
-/// (-ENOSYS on aarch64, which has none yet).
-pub fn reboot(h: &mut Host, by: &str) -> i64 {
+/// Reset the machine.  Returns only if every method failed: EIO
+/// (ENOSYS on aarch64, which has none yet).
+pub fn reboot(h: &mut Host, by: &str) -> crate::ctl::Errno {
     if cfg!(not(target_arch = "x86_64")) {
         return crate::ctl::ENOSYS;
     }

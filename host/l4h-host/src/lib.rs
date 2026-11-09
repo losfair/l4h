@@ -10,20 +10,26 @@
 
 #![no_std]
 
+pub mod badges;
 pub mod blk;
+pub mod errno;
 pub mod fixed;
 pub mod font;
 pub mod gpu;
+pub mod hypercall;
 pub mod iopool;
 pub mod log;
 pub mod mailbox;
 pub mod memd;
 pub mod net;
 pub mod ring;
+pub mod root;
 pub mod serial;
 pub mod trust;
 pub mod usb;
 pub mod vmmgr;
+pub mod wire;
+pub mod wiring;
 
 /// Whether host components print informational messages.  The serial port
 /// takes about 11 KB/s, so release builds (`L4H_RELEASE=1` when the host is
@@ -33,6 +39,13 @@ pub const VERBOSE: bool = match option_env!("L4H_RELEASE") {
     Some(v) => !matches!(v.as_bytes(), [b'1']),
     None => true,
 };
+
+/// The wiring audit (l4h_rt::init, l4h_task's give_edge), which uses
+/// seL4_DebugCapIdentify, runs in debug host builds only.  A host is built
+/// against the debug kernel's headers whatever kernel it boots, so the
+/// kernel's DEBUG_BUILD does not say whether that call exists: the release
+/// kernels (`L4H_RELEASE=1`) boot release hosts, which do not make it.
+pub const AUDIT: bool = VERBOSE;
 
 /// Whether the host has the test-only fault injection tests/run-logdtest.sh
 /// uses (`L4H_TEST_INJECT=1` when the host is built).
@@ -133,17 +146,15 @@ pub const KIND_VMMGR: u32 = 6;
 pub const KIND_LOGD: u32 = 7;
 pub const KIND_USBD: u32 = 8;
 
-/// The kinds that answer requests: root calls memd and asks blkd and netd
-/// (mailbox), guests' VMMs call vmmgr.  A caller could not wait for their
-/// faults to be reported, so a keeper thread answers for a failed one.
+/// The kinds that serve calls: root calls memd, guests' VMMs call vmmgr.
+/// A caller blocked in a call could not wait for their faults to be
+/// reported, so a keeper thread answers for a failed one.  The drivers
+/// serve root's mailbox (crate::mailbox), which root never waits on: their
+/// faults go to root, which acts on them itself.
 pub const fn has_keeper(kind: u32) -> bool {
-    matches!(kind, KIND_BLKD | KIND_NETD | KIND_MEMD | KIND_VMMGR | KIND_USBD)
+    matches!(kind, KIND_MEMD | KIND_VMMGR)
 }
 
-/// Badge bit of a fault message on a parent's endpoint (a component's on
-/// root's, a guest kernel's or a VMM's on vmmgr's).  A failed parent's
-/// keeper leaves faults unanswered: the thread would only fault again.
-pub const BADGE_FAULT: u64 = 1 << 24;
 
 /// Driver address-space layout: the device structures, then DMA memory.
 pub const fn blkd_chan_va() -> usize {
@@ -163,23 +174,6 @@ pub struct InfoHeader {
 
 pub const CONFIG_OFFSET: usize = 64;
 
-/// Labels of calls from components to their parent (SLOT_ROOT_EP): a
-/// guest's l4h-vmm calls l4h-vmmgr, trustd calls l4h-root.
-pub const ROOT_CALL_GUEST_POWER: u64 = 1; // MR0 = guest id, MR1 = abi POWER_*
-pub const ROOT_CALL_LOG: u64 = 2;
-/// l4h-vmm has initialised the device pages: start the guest (MR0 = guest id).
-pub const ROOT_CALL_VMM_READY: u64 = 3;
-/// trustd: a hardware access for the firmware's AML (trust::HW_*).
-pub const ROOT_CALL_HW: u64 = 5;
-/// trustd: it answered guest MR0's request; raise its device's event.
-pub const ROOT_CALL_ATTEST_DONE: u64 = 6;
-/// trustd: send its relay outbox (MR1 bytes) to partition MR0's trustd
-/// (trust::RELAY_*).  Returns 0, or u64::MAX if root cannot.
-pub const ROOT_CALL_RELAY: u64 = 7;
-
-/// Badge bit set on every endpoint capability l4h-root gives to a guest
-/// for l4h-vmm's service endpoint; notification badges never have it.
-pub const VMM_BADGE_HYPERCALL: u64 = 1 << 63;
 
 /// Per-guest l4h-vmm configuration.
 pub const VMM_MAX_DEVICES: usize = MAX_GUEST_DEVICES;
@@ -196,7 +190,7 @@ pub const VDEV_GPU: u32 = 4;
 /// Zero-capacity virtio-blk placeholder, with no backend channel.
 pub const VDEV_BLK_UNAVAILABLE: u32 = 5;
 /// A USB controller (l4h_abi::DEV_USB): the VMM only raises its event when
-/// usbd signals vmm_badge_usb(chan_kick_slot); it maps nothing of it.
+/// usbd signals badges::vmm::USB bit chan_kick_slot; it maps nothing of it.
 pub const VDEV_USB: u32 = 6;
 
 #[repr(C)]
@@ -296,25 +290,7 @@ const _: () = assert!(blk::CHANNEL_PAGES * 4096 <= VMM_CHANNEL_STRIDE);
 const _: () = assert!(net::PORT_PAGES * 4096 <= VMM_CHANNEL_STRIDE);
 const _: () = assert!(gpu::SHARED_VA == SHARED_VA && vmm_chan_va(VMM_MAX_DEVICES) <= gpu::VMM_DISPLAY_VA);
 
-// Badges of the VMM's bound notification.  They say what kind of source
-// signalled, not which device: the VMM checks each device's kick word and
-// backend ring, which is a load or two for an idle one.
-
-/// A guest device was kicked.
-pub const VMM_BADGE_KICK: u64 = 1 << 0;
-/// A device backend (blkd, netd) has completions or room.
-pub const VMM_BADGE_DONE: u64 = 1 << 1;
-/// From l4h-vmmgr: the guest's hotplug target changed.
-pub const VMM_BADGE_MEM: u64 = 1 << 2;
-/// The guest wrote to its console output ring.
-pub const VMM_BADGE_CONSOLE: u64 = 1 << 3;
-/// The guest made a hotplug request in its memory device page.
-pub const VMM_BADGE_MEM_REQ: u64 = 1 << 4;
-/// usbd has completions for the guest's USB controller n (n <
-/// usb::MAX_GUEST_USB): raise its event.
-pub const fn vmm_badge_usb(n: usize) -> u64 {
-    1 << (8 + n)
-}
+// The VMM's badges are badges::vmm.
 
 /// The architectural time counter that seL4 deadlines (seL4_TCB_SetTimer)
 /// are expressed in: the TSC on x86_64, the virtual counter on aarch64.

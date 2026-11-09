@@ -13,18 +13,10 @@ use crate::guest::{GuestConfig, State};
 use crate::root::Later;
 use crate::{MAX_GUESTS, Then, Vmmgr, root};
 
-pub const EPERM: i64 = 1;
-pub const ENOENT: i64 = 2;
-pub const EIO: i64 = 5;
-pub const EAGAIN: i64 = 11;
-pub const ENOMEM: i64 = 12;
-pub const EBUSY: i64 = 16;
-pub const EINVAL: i64 = 22;
-pub const ENOSPC: i64 = 28;
-pub const ENOSYS: i64 = 38;
+pub use l4h_host::errno::{EAGAIN, EBUSY, EINVAL, ENOENT, ENOMEM, ENOSPC, ENOSYS, EPERM, Errno};
 /// Not an errno: the request waits for root, which answers it later
 /// (`answer`).
-const DEFER: i64 = i64::MAX;
+const DEFER: Errno = 1 << 32;
 
 const HOST_VERSION: &str = match option_env!("L4H_VERSION") {
     Some(version) => version,
@@ -39,12 +31,12 @@ pub fn handle(h: &mut Vmmgr, caller: usize) -> bool {
     let req = unsafe { (page as *const abi::CtlReq).read_volatile() };
     let mut resp = abi::CtlResp { status: 0, vals: [0; 6], data: [0; abi::CTL_DATA_MAX] };
     resp.status = if req.version != abi::CTL_VERSION {
-        -EINVAL
+        l4h_host::errno::negative(EINVAL)
     } else {
         match execute(h, caller, &req, &mut resp) {
             Ok(()) => 0,
             Err(DEFER) => return false,
-            Err(e) => -e,
+            Err(e) => l4h_host::errno::negative(e),
         }
     };
     unsafe { (page.add(abi::CTL_RESP_OFF) as *mut abi::CtlResp).write_volatile(resp) };
@@ -86,9 +78,9 @@ pub fn kicked(h: &mut Vmmgr) {
 
 /// Answer dom0 `caller`'s (`instance`) control request `seq` with `r`, as
 /// root answered it later: unless dom0 has made another since.
-pub fn answer(h: &mut Vmmgr, caller: usize, instance: u64, seq: u32, r: Result<[u64; 6], i64>) {
+pub fn answer(h: &mut Vmmgr, caller: usize, instance: u64, seq: u32, r: Result<[u64; 6], Errno>) {
     let Some(page) = h.guest(caller).filter(|g| g.instance == instance && g.ctl_taken == seq).and_then(|g| g.ctl_page()) else { return };
-    let resp = abi::CtlResp { status: r.err().map_or(0, |e| -e), vals: r.unwrap_or_default(), data: [0; abi::CTL_DATA_MAX] };
+    let resp = abi::CtlResp { status: r.err().map_or(0, l4h_host::errno::negative), vals: r.unwrap_or_default(), data: [0; abi::CTL_DATA_MAX] };
     unsafe { (page.add(abi::CTL_RESP_OFF) as *mut abi::CtlResp).write_volatile(resp) };
     done(h, caller, seq);
 }
@@ -118,7 +110,7 @@ fn later(h: &Vmmgr) -> Then {
 
 /// Root's answer to a host op of the control request being executed: now,
 /// or later, which defers the request.
-fn host_op(h: &mut Vmmgr, op: u32, a: &[u64; 6]) -> Result<[u64; 6], i64> {
+fn host_op(h: &mut Vmmgr, op: u32, a: &[u64; 6]) -> Result<[u64; 6], Errno> {
     match root::host_op(op, a)? {
         Later::Now(vals) => Ok(vals),
         Later::Token(t) => {
@@ -129,14 +121,14 @@ fn host_op(h: &mut Vmmgr, op: u32, a: &[u64; 6]) -> Result<[u64; 6], i64> {
 }
 
 /// A control request done now, or deferred.
-fn deferred(r: Later<()>) -> Result<(), i64> {
+fn deferred(r: Later<()>) -> Result<(), Errno> {
     match r {
         Later::Now(()) => Ok(()),
         Later::Token(_) => Err(DEFER),
     }
 }
 
-fn vm_arg(a: u64) -> Result<usize, i64> {
+fn vm_arg(a: u64) -> Result<usize, Errno> {
     let id = a as usize;
     if id >= MAX_GUESTS { Err(ENOENT) } else { Ok(id) }
 }
@@ -146,7 +138,7 @@ fn cstr(data: &[u8]) -> &[u8] {
     &data[..n]
 }
 
-fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlResp) -> Result<(), i64> {
+fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlResp) -> Result<(), Errno> {
     let a = &req.args;
     match req.op {
         abi::CTL_LOG_READ => {
@@ -451,7 +443,7 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
                 }
                 // Before it runs, its VMM reads the target when it starts.
                 if g.vmm.is_some() {
-                    g.signal_vmm(&mut h.alloc, host::VMM_BADGE_MEM);
+                    g.signal_vmm(&mut h.alloc, &l4h_host::wiring::VMMGR_VMM);
                 }
                 Ok(())
             })

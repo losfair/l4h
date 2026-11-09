@@ -35,6 +35,8 @@ use l4h_abi as abi;
 use l4h_host as host;
 use l4h_host::fixed::{ArrayString, ArrayVec, Scratch};
 use l4h_host::vmmgr as proto;
+use l4h_host::wiring::{self, E, o, p};
+use l4h_task::edge::{Obj, mint as mint_edge};
 
 use crate::component::Component;
 use crate::kimage::Kernel;
@@ -63,17 +65,6 @@ pub use l4h_host::MAX_GUEST_DEVICES;
 /// VSpaces of a guest's processes (the guest's VSpace pool), at most.
 pub const MAX_VSPACES: usize = 64;
 
-/// Badge layout of vmmgr's fault endpoint for guest kernels.
-pub const HYP_BADGE_FAULT: u64 = host::BADGE_FAULT;
-pub fn hyp_badge(guest: usize, vcpu: usize) -> u64 {
-    (guest as u64) | ((vcpu as u64) << 16)
-}
-pub fn hyp_badge_guest(b: u64) -> usize {
-    (b & 0xffff) as usize
-}
-pub fn hyp_badge_vcpu(b: u64) -> usize {
-    ((b >> 16) & 0xff) as usize
-}
 
 /// Where vmmgr maps a guest's pages for itself (layout::GUEST_PAGES):
 /// its control page, its console page, then from these offsets its
@@ -107,6 +98,19 @@ pub struct GuestConfig<'a> {
     /// Guest-virtual address of GPA 0 (from the kernel image).
     pub ram_base: usize,
     pub dom0: bool,
+}
+
+/// How the guest kicks a device (Guest::add_device_with).
+pub enum Kick {
+    /// vmmgr's notification (wiring::GUEST_CTL).
+    Ctl,
+    /// The VMM's, as a hotplug request (GUEST_VMM_MEM).
+    Mem,
+    /// The VMM's, as a device kick (GUEST_VMM_KICK).
+    Device,
+    /// trustd's, which root minted for the guest and vmmgr passes on
+    /// (GUEST_TRUSTD).
+    Attest(cap::Notification),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -356,10 +360,33 @@ impl Guest {
             .unwrap_or_else(|e| panic!("guest slot {} copy failed: {:?}", idx, e));
     }
 
-    pub(crate) fn give_badged(&self, idx: usize, src: impl sel4::HasCPtrWithDepth, rights: CapRights, badge: u64) {
-        self.guest_slot(idx)
-            .mint(&abs(src), rights, badge)
+    /// Give it a CNode, with `guard`: the one mint that is no edge.
+    pub(crate) fn give_cnode(&self, idx: usize, cnode: cap::CNode, guard: CNodeCapData) {
+        l4h_task::edge::mint_cnode(&self.guest_slot(idx), slot::CNODE.cap(), cnode, guard)
             .unwrap_or_else(|e| panic!("guest slot {} mint failed: {:?}", idx, e));
+    }
+
+    /// Its l4h-vmm's notification, which root made (root::guest_new).
+    pub(crate) fn vmm_ntfn_obj(&self) -> Obj<p::Vmm, o::Notification> {
+        Obj::claim(p::Vmm, o::Notification, abs(self.vmm_ntfn))
+    }
+
+    /// vCPU v's notification.
+    pub(crate) fn vcpu_obj(&self, v: usize) -> Obj<p::Guest, o::Vcpu> {
+        Obj::claim(p::Guest, o::Vcpu, abs(self.vcpus[v].ntfn))
+    }
+
+    /// Mint `e`, which the guest holds in one slot of its root CNode, from
+    /// `src`.
+    pub(crate) fn give_edge<T, O, P>(&self, e: &E<p::Guest, T, O, P>, src: &Obj<T, O>)
+    where
+        T: p::IsParty,
+        O: o::IsObject,
+        P: l4h_host::wire::Protocol,
+    {
+        let idx = e.slot(0) as usize;
+        mint_edge(&self.guest_slot(idx), e, 0, src)
+            .unwrap_or_else(|err| panic!("guest slot {} ({}) mint failed: {:?}", idx, e.name, err));
     }
 
     /// The frame capability backing guest-physical address `gpa`, which
@@ -496,16 +523,16 @@ impl Guest {
         let page = self.arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP);
         let kick = match kind {
             // Control requests go to vmmgr itself, not through the VMM.
-            DevKind::Ctl => (crate::slot::NTFN.cap(), crate::CTL_KICK_BADGE),
-            DevKind::Mem => (self.vmm_ntfn, host::VMM_BADGE_MEM_REQ),
-            _ => (self.vmm_ntfn, host::VMM_BADGE_KICK),
+            DevKind::Ctl => Kick::Ctl,
+            DevKind::Mem => Kick::Mem,
+            _ => Kick::Device,
         };
         self.add_device_with(alloc, kind, page, kick)
     }
 
-    /// Add a device with shared page `page`, whose kick notification is
-    /// `kick` (a notification and a badge, or 0 if it is badged already).
-    pub fn add_device_with(&mut self, alloc: &mut Alloc, kind: DevKind, page: cap::Granule, kick: (cap::Notification, u64)) -> Option<usize> {
+    /// Add a device with shared page `page`, which the guest kicks with
+    /// `kick`.
+    pub fn add_device_with(&mut self, alloc: &mut Alloc, kind: DevKind, page: cap::Granule, kick: Kick) -> Option<usize> {
         let d = self.devices.len();
         if d >= MAX_GUEST_DEVICES || self.state != State::Created {
             return None;
@@ -517,10 +544,12 @@ impl Guest {
         abs(self_cap::<cap_type::Null>(copy)).copy(&abs(page), CapRights::all()).expect("device page copy");
         map_frame(&mut ctx, vspace, self_cap::<cap_type::Granule>(copy), abi::dev_area_va(d) as usize, CapRights::read_write(), VmAttributes::DEFAULT);
         let kick_slot = self.dev_cn.absolute_cptr_from_bits_with_depth(d as u64, abi::ROOT_CNODE_BITS);
-        if kick.1 == 0 {
-            kick_slot.copy(&abs(kick.0), CapRights::write_only())
-        } else {
-            kick_slot.mint(&abs(kick.0), CapRights::write_only(), kick.1)
+        match kick {
+            // Control requests go to vmmgr itself, not through the VMM.
+            Kick::Ctl => mint_edge(&kick_slot, &wiring::GUEST_CTL, 0, &Obj::claim(p::Vmmgr, o::Notification, abs(crate::slot::NTFN.cap()))),
+            Kick::Mem => mint_edge(&kick_slot, &wiring::GUEST_VMM_MEM, 0, &self.vmm_ntfn_obj()),
+            Kick::Device => mint_edge(&kick_slot, &wiring::GUEST_VMM_KICK, 0, &self.vmm_ntfn_obj()),
+            Kick::Attest(n) => l4h_task::edge::pass(&kick_slot, &wiring::GUEST_TRUSTD, &abs(n)),
         }
         .expect("device kick cap");
         // Console and control pages are also used by vmmgr itself.
@@ -613,17 +642,17 @@ impl Guest {
         }
         let s = alloc.slots.alloc();
         let badged = self_cap::<cap_type::Notification>(s);
-        abs(badged).mint(&abs(self.vcpus[0].ntfn), CapRights::write_only(), abi::BADGE_EVENT).expect("event cap");
+        mint_edge(&abs(badged), &wiring::VMMGR_VCPU, 0, &self.vcpu_obj(0)).expect("event cap");
         badged.signal();
         abs(badged).delete().expect("delete event cap");
         alloc.slots.free(s);
     }
 
-    /// Signal the guest's l4h-vmm with `badge` (host::VMM_BADGE_*).
-    pub fn signal_vmm(&self, alloc: &mut Alloc, badge: u64) {
+    /// Signal the guest's l4h-vmm on `e`.
+    pub fn signal_vmm(&self, alloc: &mut Alloc, e: &E<p::Vmmgr, p::Vmm, o::Notification>) {
         let s = alloc.slots.alloc();
         let badged = self_cap::<cap_type::Notification>(s);
-        abs(badged).mint(&abs(self.vmm_ntfn), CapRights::write_only(), badge).expect("VMM signal cap");
+        mint_edge(&abs(badged), e, 0, &self.vmm_ntfn_obj()).expect("VMM signal cap");
         badged.signal();
         abs(badged).delete().expect("delete VMM signal cap");
         alloc.slots.free(s);
@@ -1058,13 +1087,12 @@ pub fn create(
     };
     g.vmm_cnodes = Some(cnodes);
 
-    let guard34 = CNodeCapData::new(0, abi::ROOT_GUARD_BITS).into_word();
-    let guard6 = CNodeCapData::new(0, abi::L2_INDEX_BITS - abi::ROOT_CNODE_BITS).into_word();
+    let guard34 = CNodeCapData::new(0, abi::ROOT_GUARD_BITS);
+    let guard6 = CNodeCapData::new(0, abi::L2_INDEX_BITS - abi::ROOT_CNODE_BITS);
     let meta = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: abi::ROOT_CNODE_BITS });
-    meta.absolute_cptr_from_bits_with_depth(0, abi::ROOT_CNODE_BITS)
-        .mint(&abs(g.cnode), CapRights::all(), guard34)
+    l4h_task::edge::mint_cnode(&meta.absolute_cptr_from_bits_with_depth(0, abi::ROOT_CNODE_BITS), slot::CNODE.cap(), g.cnode, guard34)
         .expect("meta CNode");
-    g.give_badged(abi::SLOT_META, meta, CapRights::all(), guard6);
+    g.give_cnode(abi::SLOT_META, meta, guard6.clone());
     g.give(abi::SLOT_VSPACE, g.vspace, CapRights::all());
 
     // ---- RAM: 2 MiB blocks, each an Untyped from any free 2 MiB of host
@@ -1074,19 +1102,19 @@ pub fn create(
     // The shared blocks of the image are filled now.
     // Level-1 RAM CNodes (one per GiB, resolving 9 bits) for the guest's
     // level-2 RAM CNodes, and the block CNode for the Untyped copies.
-    let guard0 = CNodeCapData::new(0, 0).into_word();
+    let guard0 = CNodeCapData::new(0, 0);
     for n in 0..n_l1 {
         let cn = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: abi::RAM_L2_BITS });
-        g.give_badged(abi::SLOT_RAM_L1_BASE + n, cn, CapRights::all(), guard0);
+        g.give_cnode(abi::SLOT_RAM_L1_BASE + n, cn, guard0.clone());
         g.ram_l1.must_push(cn);
     }
     let block_cn = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: block_radix });
-    let guard = CNodeCapData::new(0, abi::L2_INDEX_BITS - block_radix).into_word();
-    g.give_badged(abi::SLOT_BLOCKS, block_cn, CapRights::all(), guard);
+    let guard = CNodeCapData::new(0, abi::L2_INDEX_BITS - block_radix);
+    g.give_cnode(abi::SLOT_BLOCKS, block_cn, guard);
     // The hotplug CNode: the guest makes a level-2 CNode in slot m before
     // plugging hotplug block m, and memd copies its blocks into it.
     let hp_cn = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: abi::HP_L1_BITS });
-    g.give_badged(abi::SLOT_HP, hp_cn, CapRights::all(), CNodeCapData::new(0, abi::HP_L1_GUARD).into_word());
+    g.give_cnode(abi::SLOT_HP, hp_cn, CNodeCapData::new(0, abi::HP_L1_GUARD));
     if !memd::guest_create(alloc, id, owned, block_cn, block_radix, hp_cn, hp_count) {
         return Err(Some(g));
     }
@@ -1098,12 +1126,8 @@ pub fn create(
     }
     // ---- Hypercall endpoint (served by l4h-vmm).
     g.vmm_ep = g.arena.object_cap::<cap_type::Endpoint>(alloc, ObjectBlueprint::Endpoint);
-    g.give_badged(
-        abi::SLOT_HYP_EP,
-        g.vmm_ep,
-        sel4::CapRightsBuilder::none().write(true).grant_reply(true).build(),
-        host::VMM_BADGE_HYPERCALL,
-    );
+    // The VMM's endpoint, which we made.
+    g.give_edge(&wiring::GUEST_VMM, &Obj::claim(p::Vmm, o::Endpoint, abs(g.vmm_ep)));
 
     // ---- I/O pool: root's physically contiguous memory, whose frames we
     // map after RAM in the direct map.  The guest gets these mappings
@@ -1117,7 +1141,7 @@ pub fn create(
     g.instance = new.instance;
     g.vmm_ntfn = new.vmm_ntfn;
     // The vCPUs' console output rings (in their event pages) are l4h-vmm's.
-    g.give_badged(abi::SLOT_CONSOLE_KICK, g.vmm_ntfn, CapRights::write_only(), host::VMM_BADGE_CONSOLE);
+    g.give_edge(&wiring::GUEST_VMM_CONSOLE, &g.vmm_ntfn_obj());
     g.pool = IoPool { gpa: pool_gpa, size: cfg.io_pool, frames: new.pool_frames, radix: pool_radix };
     let tmp = alloc.slots.alloc();
     let keep = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: pool_radix });
@@ -1142,7 +1166,7 @@ pub fn create(
             .copy(&abs(vs), CapRights::all())
             .expect("vspace pool copy");
     }
-    g.give_badged(abi::SLOT_VSPACE_POOL, pool_cn, CapRights::all(), guard6);
+    g.give_cnode(abi::SLOT_VSPACE_POOL, pool_cn, guard6.clone());
 
     // ---- EPT roots for the guest's KVM.
     #[cfg(target_arch = "x86_64")]
@@ -1158,10 +1182,10 @@ pub fn create(
                 .expect("EPT pool copy");
         }
         g.nr_ept_roots = abi::MAX_EPT_ROOTS;
-        g.give_badged(abi::SLOT_EPT_POOL, ept_cn, CapRights::all(), guard6);
+        g.give_cnode(abi::SLOT_EPT_POOL, ept_cn, guard6.clone());
     }
     g.dev_cn = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: abi::ROOT_CNODE_BITS });
-    g.give_badged(abi::SLOT_DEV_CNODE, g.dev_cn, CapRights::all(), guard6);
+    g.give_cnode(abi::SLOT_DEV_CNODE, g.dev_cn, guard6);
 
     // ---- vCPUs.
     for v in 0..cfg.vcpus {
@@ -1190,8 +1214,7 @@ pub fn create(
         ktcb.tcb_configure(g.cnode, CNodeCapData::new(0, abi::ROOT_GUARD_BITS), g.vspace, abi::vcpu_ipcbuf_va(v), ipcbuf)
             .expect("kTCB configure");
         let fault_slot = alloc.slots.alloc();
-        abs(self_cap::<cap_type::Null>(fault_slot))
-            .mint(&abs(host_info.hyp_ep), CapRights::all(), hyp_badge(id, v) | HYP_BADGE_FAULT)
+        mint_edge(&abs(self_cap::<cap_type::Null>(fault_slot)), &wiring::GUEST_FAULT, wiring::guest_fault(id, v), &Obj::claim(p::Vmmgr, o::Endpoint, abs(host_info.hyp_ep)))
             .expect("fault ep");
         ktcb.tcb_set_sched_params(
             slot::TCB.cap(),
@@ -1208,7 +1231,8 @@ pub fn create(
         g.give(base + abi::VCPU_EP, ep, CapRights::all());
         g.give(base + abi::VCPU_NTFN, ntfn, CapRights::all());
         g.give(base + abi::VCPU_SC_U, sc_u, CapRights::all());
-        g.give_badged(base + abi::VCPU_IPI, ntfn, CapRights::write_only(), abi::BADGE_IPI);
+        // The vCPU's notification, which we just made.
+        mint_edge(&g.guest_slot(base + abi::VCPU_IPI), &wiring::GUEST_IPI, 0, &Obj::claim(p::Guest, o::Vcpu, abs(ntfn))).expect("vCPU IPI cap");
         g.give(base + abi::VCPU_IPCBUF, ipcbuf, CapRights::read_write());
         g.give(base + abi::VCPU_EVENT, event, CapRights::read_write());
         g.vcpus.must_push(Vcpu { ktcb, ntfn, event, sc_k, sc_u, core, cooldown: 0, usage: 0, k_share: crate::sched::K_SHARE_INIT, wall_ticks: 0, run_ticks: 0, steal_ns: 0 });
@@ -1241,7 +1265,7 @@ pub fn create(
         // The failure service cannot allocate a notification after the
         // manager has failed. Keep this cap in the guest's tracked slots.
         let done = self_cap::<cap_type::Notification>(alloc.slots.alloc());
-        abs(done).mint(&abs(g.vcpus[0].ntfn), CapRights::write_only(), abi::BADGE_EVENT).expect("control failure event");
+        mint_edge(&abs(done), &wiring::VMMGR_VCPU, 0, &g.vcpu_obj(0)).expect("control failure event");
         unsafe { crate::ctl_failure::register(g.id, g.ctl_page().unwrap(), g.event_page(0), dev_event(d), done.bits()) };
     }
     if hp_count != 0 {
@@ -1250,7 +1274,7 @@ pub fn create(
     // ---- The attestation device, which trustd serves: root cleared its
     // page, and badged the kick for this guest.
     if let Some((page, kick)) = new.attest {
-        g.attest = g.add_device_with(alloc, DevKind::Attest, page, (kick, 0)).is_some();
+        g.attest = g.add_device_with(alloc, DevKind::Attest, page, Kick::Attest(kick)).is_some();
     }
 
     info!(

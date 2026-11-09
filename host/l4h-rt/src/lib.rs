@@ -17,6 +17,7 @@
 use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 pub use l4h_host as host;
+pub use l4h_ipc as ipc;
 pub use sel4;
 
 #[doc(hidden)]
@@ -137,10 +138,34 @@ pub fn init() -> &'static Info {
     host::log::init(unsafe { &*(host::log::VA as *const host::log::Ring) }, INFO.header().id);
     host::serial::init(unsafe { &*(host::serial::VA as *const host::serial::Ring) }, INFO.header().id);
     sel4_panicking::set_hook(&|info| log!("l4h-rt: component {:#x}: {}", INFO.header().id, info));
+    audit(INFO.header().kind);
     if host::has_keeper(INFO.header().kind) {
         start_keeper();
     }
     &INFO
+}
+
+/// Stop if this component holds a capability that calls or signals which
+/// the wiring does not give it, or of another type (debug builds: seL4's
+/// DebugCapIdentify; DESIGN.md §10, "Wiring declarations").  The slots of
+/// the layout are looked at: memd's and vmmgr's larger CNodes hold memory
+/// above them.
+fn audit(kind: u32) {
+    sel4::sel4_cfg_if! {
+        if #[sel4_cfg(DEBUG_BUILD)] {
+            if !host::AUDIT {
+                return;
+            }
+            for slot in 0..1u64 << host::CNODE_BITS {
+                let tag = cap::<sel4::cap_type::Null>(slot).debug_identify();
+                if let Err(why) = host::wiring::audit(kind, slot, tag) {
+                    panic!("wiring audit: slot {} holds a capability (tag {}) {}", slot, tag, why);
+                }
+            }
+        } else {
+            let _ = kind;
+        }
+    }
 }
 
 #[repr(align(64))]
@@ -187,7 +212,9 @@ pub unsafe fn start_secondary(slot: u64, top: usize, entry: extern "C" fn() -> !
 }
 
 /// The keeper: wait for the main thread to fault (its fault is never
-/// answered), and answer for it.
+/// answered), and answer for it.  It receives one fault, and serves
+/// nothing: no l4h_ipc::run.
+#[allow(clippy::disallowed_methods)]
 extern "C" fn keeper() -> ! {
     unsafe {
         sel4::set_ipc_buffer((host::KEEPER_IPCBUF_VA as *mut sel4::IpcBuffer).as_mut().unwrap());
@@ -196,7 +223,7 @@ extern "C" fn keeper() -> ! {
     let (info, _) = cap::<sel4::cap_type::Endpoint>(host::SLOT_FAULT_EP).recv(reply);
     let fault = sel4::with_ipc_buffer(|b| sel4::Fault::new(b, &info));
     log!("l4h-rt: component {:#x} fault: {:x?}", INFO.header().id, fault);
-    failure::answer_failed(host::SLOT_KEEPER, host::mailbox::has_mailbox(INFO.header().kind))
+    failure::answer_failed(host::SLOT_KEEPER)
 }
 
 pub fn cap<T: sel4::CapType>(slot: u64) -> sel4::Cap<T> {
@@ -212,18 +239,18 @@ pub fn test_hang() -> ! {
     unreachable!("a suspended thread ran");
 }
 
-/// Where an aborted component ends.  l4h-root calls memd and asks blkd
-/// and netd (host::mailbox), and guests' VMMs call vmmgr, and could not wait
-/// for their faults to be reported: one that has failed keeps answering on
-/// its service endpoint and mailbox (a fault, its keeper does).  Any other
-/// component faults, which root handles.
+/// Where an aborted component ends.  l4h-root calls memd and guests' VMMs
+/// call vmmgr, and could not wait for their faults to be reported: one of
+/// those that has failed keeps answering on its service endpoint (a fault,
+/// its keeper does).  Any other component faults, which its parent
+/// handles.
 #[doc(hidden)]
 pub fn abort_trap() -> ! {
     let h = INFO.header();
     panic_flush();
     log!("l4h-rt: component {:#x} aborted", h.id);
     if h.magic == INFO_MAGIC && host::has_keeper(h.kind) {
-        failure::answer_failed(host::SLOT_TCB, host::mailbox::has_mailbox(h.kind));
+        failure::answer_failed(host::SLOT_TCB);
     }
     loop {
         unsafe {

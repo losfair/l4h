@@ -23,12 +23,11 @@ l4h_rt::component!(main, no_heap);
 const BYTE_US: u64 = 90;
 const IDLE_MS: u64 = 10;
 
-const BADGE_TIMER: u64 = 1;
 
 fn sleep(ticks: u64) {
     let tcb = cap::<sel4::cap_type::Tcb>(host::SLOT_TCB);
     let deadline = host::ticks::now().saturating_add(ticks);
-    let error = sel4::with_ipc_buffer_mut(|b| b.inner_mut().seL4_TCB_SetTimer(tcb.bits(), deadline, BADGE_TIMER));
+    let error = sel4::with_ipc_buffer_mut(|b| b.inner_mut().seL4_TCB_SetTimer(tcb.bits(), deadline, host::badges::logd::TIMER));
     assert_eq!(error, 0, "logd timer");
     let ntfn = cap::<sel4::cap_type::Notification>(host::SLOT_NTFN);
     ntfn.wait();

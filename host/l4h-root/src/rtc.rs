@@ -4,6 +4,7 @@
 #[cfg(target_arch = "x86_64")]
 mod cmos;
 
+use l4h_host::errno::Errno;
 use crate::{ctl, devmem::DevMem, mem::Alloc, window::Window};
 
 pub struct Rtc {
@@ -52,7 +53,7 @@ impl Rtc {
     }
 
     /// Set the RTC only: the boot-time anchor used by VMMs is unchanged.
-    pub fn set_secs(&self, _win: &mut Window, seconds: u64) -> Result<(), i64> {
+    pub fn set_secs(&self, _win: &mut Window, seconds: u64) -> Result<(), Errno> {
         #[cfg(target_arch = "x86_64")]
         {
             let port = self.port.ok_or(ctl::ENOSYS)?;

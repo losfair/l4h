@@ -69,21 +69,16 @@ pub struct Channel {
     pub ready: u32,
     /// Logical block size in bytes (512 or 4096); requests must be aligned.
     pub block_size: u32,
-    /// Written by l4h-root before BLKD_ADD: blkd completes flushes at once
+    /// Written by l4h-root before `call::add`: blkd completes flushes at once
     /// and the VMM offers the guest none (l4h_abi::BLK_VOLATILE).
     pub volatile: u32,
     pub reserved: [u32; 10],
-    /// Written by l4h-root before BLKD_ADD; copied into private driver state.
+    /// Written by l4h-root before `call::add`; copied into private driver state.
     pub lba_start: u64,
     pub pool: Pool,
     pub reqs: [Req; RING_SIZE],
     pub resps: [Resp; RING_SIZE],
 }
-
-/// Notification badges of blkd: the client kicked the channel, the device
-/// interrupted.
-pub const BLKD_BADGE_KICK: u64 = 1 << 0;
-pub const BLKD_BADGE_IRQ: u64 = 1 << 1;
 
 /// blkd CSpace slots (beyond the common ones).
 pub const BLKD_SLOT_IRQ: u64 = 16;
@@ -96,36 +91,62 @@ pub const BLKD_SLOT_CLIENT_DONE: u64 = 32;
 pub const MAX_CLIENTS: usize = 512;
 pub const CHANNEL_PAGES: usize = core::mem::size_of::<Channel>().div_ceil(4096);
 pub const STAGING_SIZE: usize = 1 << 20;
-/// Root's requests to blkd (host::mailbox: arguments, then answer[0] and
-/// the words after it).  1 is unused: blkd publishes its units instead
-/// (Published).
-/// client, unit, dom0, n -> 0: what BLKD_CHECK allowed in that slot, the
-/// channel's window (n = 0) or the n extents in staging.  blkd builds the
-/// client's ExtentTable at extent_va(client).
-pub const BLKD_ADD: u64 = 2;
-/// client -> 0, or u64::MAX if it did not drain
-pub const BLKD_REMOVE: u64 = 3;
-/// sector, length, unit -> blk::STATUS_*, or u64::MAX
-pub const BLKD_WRITE: u64 = 4;
-/// unit -> blk::STATUS_*, or u64::MAX
-pub const BLKD_FLUSH: u64 = 5;
-/// unit, start, sectors, read-only -> slot of the dom0 boot range, or
-/// u64::MAX (conflicting or no slot).  Before anything attaches.
-pub const BLKD_RESERVE: u64 = 6;
-/// unit, start, sectors (0 = to the end), read-only, dom0, n -> 0 or an
-/// errno (EINVAL, EBUSY, ENOSPC); then the slot BLKD_ADD must use, the
-/// guest disk's sectors and whether it is read-only.  With n > 0 the disk
-/// is the n extents in staging, (start, sectors) pairs in guest order,
-/// instead of the window.  Changes nothing.
-pub const BLKD_CHECK: u64 = 7;
-/// client, k -> 0 and the start and sectors of its kth extent in guest
-/// order, or u64::MAX if it has none.
-pub const BLKD_EXTENT: u64 = 8;
-/// `host::TEST_INJECT` only: stop for good without failing, as a
-/// compromised blkd might.
-pub const BLKD_TEST_HANG: u64 = 0x7e58;
-/// BLKD_WRITE and BLKD_FLUSH refused the range: answer[1] is the errno.
-pub const BLKD_REFUSED: u64 = u64::MAX - 1;
+use crate::badges::driver as recv;
+use crate::errno::{EBUSY, EINVAL, ENOSPC, Errno};
+
+crate::senders! {
+    /// Who posts in the mailbox: l4h-root alone.
+    pub enum Sender in recv {
+        Root: mailbox;
+    }
+}
+
+crate::protocol! {
+    /// Root's requests to blkd (crate::mailbox, crate::wire::protocol): an
+    /// answer's first word is 0 or an errno, its value follows.  A failed
+    /// blkd answers wire::FAILED.  Label 1 is unused: blkd publishes its
+    /// units instead (Published).
+    pub mod call (from: Sender) {
+        /// Attach what `check` allowed in slot `client`: the channel's
+        /// window (n = 0) or the n extents in staging.  blkd builds the
+        /// client's ExtentTable at extent_va(client).
+        Add / add = 2 from [Root] (client: usize, unit: usize, dom0: bool, n: usize) -> ();
+        /// Drain and forget a client: EBUSY if it did not drain.
+        Remove / remove = 3 from [Root] (client: usize) -> ();
+        /// Write `length` bytes of staging at `sector` of `unit`: a
+        /// STATUS_* (u64::MAX: the device failed), or the errno the range
+        /// is refused with.
+        Write / write = 4 from [Root] (sector: u64, length: usize, unit: usize) -> u64;
+        /// Flush `unit`: a STATUS_* as `write`.
+        Flush / flush = 5 from [Root] (unit: usize) -> u64;
+        /// Reserve a dom0 boot range, before anything attaches: its slot
+        /// (refused if it conflicts or no slot is left).
+        Reserve / reserve = 6 from [Root] (unit: usize, start: u64, sectors: u64, read_only: bool) -> usize;
+        /// Whether a client may attach the window `start`, `sectors` (0:
+        /// to the end) of `unit`, or with n > 0 the n extents in staging,
+        /// (start, sectors) pairs in guest order: the slot `add` must use
+        /// and the guest disk, or EINVAL, EBUSY, ENOSPC.  Changes nothing.
+        Check / check = 7 from [Root] (unit: usize, start: u64, sectors: u64, read_only: bool, dom0: bool, n: usize) -> Checked;
+        /// The start and sectors of a client's kth extent in guest order.
+        Extent / extent = 8 from [Root] (client: usize, k: usize) -> (u64, u64);
+        /// `crate::TEST_INJECT` only: stop for good without failing, as a
+        /// compromised blkd might.
+        TestHang / test_hang = 0x7e58 from [Root] () -> ();
+    }
+}
+const _: () = assert!(call::Request::MAX_WORDS <= crate::mailbox::ARGS
+    && call::Request::MAX_REPLY_WORDS <= crate::mailbox::ANSWER);
+
+crate::wire_struct! {
+    /// What `check` allows: the slot, the guest disk's sectors, whether
+    /// it is read-only.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Checked {
+        pub slot: usize,
+        pub sectors: u64,
+        pub read_only: bool,
+    }
+}
 
 /// What blkd publishes for root (host::mailbox::PUBLISHED_OFFSET), once it
 /// has set up the controller; it does not change after.
@@ -148,11 +169,6 @@ pub struct PublishedUnit {
 }
 const _: () = assert!(core::mem::size_of::<Published>() <= 4096);
 
-/// Errnos of blkd's range decisions, as the control API returns them.
-pub const EPERM: u64 = 1;
-pub const EBUSY: u64 = 16;
-pub const EINVAL: u64 = 22;
-pub const ENOSPC: u64 = 28;
 /// Units per controller, at most.
 pub const MAX_UNITS: usize = 16;
 
@@ -388,7 +404,7 @@ impl<'a> Volume<'a> {
     /// sectors) in guest order, and check them against a unit of `capacity`
     /// sectors.  EINVAL if they are no disk.
     pub fn build(raw: impl Iterator<Item = (u64, u64)>, order: &'a mut [u16], extents: &'a mut [Extent],
-        capacity: u64) -> Result<Volume<'a>, u64> {
+        capacity: u64) -> Result<Volume<'a>, Errno> {
         let mut offset = 0u64;
         for ((e, o), (i, (start, sectors))) in extents.iter_mut().zip(order.iter_mut()).zip(raw.enumerate()) {
             *e = Extent { start, sectors, offset };
@@ -407,7 +423,7 @@ impl<'a> Volume<'a> {
     /// MAX_EXTENTS extents, each a valid window and, if there are several,
     /// at least MIN_EXTENT_SECTORS; sorted and disjoint; and each extent in
     /// `order` starting where the one before it ends.
-    pub fn check(&self, capacity: u64) -> Result<(), u64> {
+    pub fn check(&self, capacity: u64) -> Result<(), Errno> {
         let (n, e) = (self.extents.len(), self.extents);
         let ok = (1..=MAX_EXTENTS).contains(&n) && self.order.len() == n
             && e.iter().all(|x| DiskWindow::new(x.start, x.sectors, capacity).is_some_and(|w| w.sectors == x.sectors)
@@ -516,7 +532,7 @@ impl<const N: usize> Reservations<N> {
 
     /// The slot `want` may attach in: EBUSY if it conflicts with a client
     /// or with a reservation it cannot claim, ENOSPC if no slot is free.
-    pub fn slot<'a>(&self, active: &impl Fn(usize) -> Option<Hold<'a>>, want: &Hold, dom0: bool) -> Result<usize, u64> {
+    pub fn slot<'a>(&self, active: &impl Fn(usize) -> Option<Hold<'a>>, want: &Hold, dom0: bool) -> Result<usize, Errno> {
         let conflicts = |h: &Hold| h.unit == want.unit && !(want.read_only && h.read_only) && overlap(want.extents, h.extents);
         // A claimed reservation is represented by its client.
         let busy = (0..N).any(|i| match active(i) {
@@ -530,7 +546,7 @@ impl<const N: usize> Reservations<N> {
     }
 
     /// Keep `r` (a range of dom0's boot plan) from other users.
-    pub fn reserve<'a>(&mut self, active: &impl Fn(usize) -> Option<Hold<'a>>, r: Reserved) -> Result<usize, u64> {
+    pub fn reserve<'a>(&mut self, active: &impl Fn(usize) -> Option<Hold<'a>>, r: Reserved) -> Result<usize, Errno> {
         let range = Extent { start: r.window.start, sectors: r.window.sectors, offset: 0 };
         let want = Hold { unit: r.unit, extents: core::slice::from_ref(&range), read_only: r.read_only };
         let i = self.slot(active, &want, false)?;

@@ -21,6 +21,7 @@
 //! Links' channels are netd's (netd.rs): root never maps them, and only
 //! rings their doorbells for netd.
 
+use l4h_host::errno::Errno;
 use l4h_partition::{self as part, Channel, MsgReader, MsgRing};
 use sel4::cap_type;
 #[cfg(target_arch = "x86_64")]
@@ -30,8 +31,6 @@ use crate::Host;
 use crate::devmem::DevMem;
 use crate::mem::Alloc;
 
-/// Badge of a doorbell on the root task's bound notification.
-pub const CHANNEL_BADGE: u64 = 1 << 42;
 
 /// The largest control message (trustd's, with its header).
 pub const MSG_MAX: usize = 9216 + 64;
@@ -76,8 +75,8 @@ impl Channels {
             buf: [0; MSG_MAX],
         };
         let badged = alloc.slots.alloc();
-        crate::component::abs_of(sel4::init_thread::Slot::<cap_type::Null>::from_index(badged).cap())
-            .mint(&crate::component::abs_of(ntfn), sel4::CapRights::write_only(), CHANNEL_BADGE)
+        let dst = crate::component::abs_of(sel4::init_thread::Slot::<cap_type::Null>::from_index(badged).cap());
+        crate::component::mint_edge(&dst, &l4h_host::wiring::DOORBELL_ROOT, 0, &crate::component::root_ntfn(ntfn))
             .expect("doorbell badge");
         let badged = sel4::init_thread::Slot::<cap_type::Notification>::from_index(badged).cap();
         for ch in d.channels() {
@@ -266,7 +265,7 @@ pub fn tick(h: &mut Host) {
 }
 
 /// dom0's RTC_SET on a secondary: the RTC is the primary's.
-pub fn rtc_set(h: &mut Host, secs: u64) -> Result<(), i64> {
+pub fn rtc_set(h: &mut Host, secs: u64) -> Result<(), Errno> {
     let cs = h.channels.as_ref().ok_or(crate::ctl::ENOSYS)?;
     if cs.send(0, part::MSG_RTC_SET, &[&secs.to_le_bytes()]) { Ok(()) } else { Err(crate::ctl::EIO) }
 }

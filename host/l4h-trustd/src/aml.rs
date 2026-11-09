@@ -3,7 +3,7 @@
 //! we run with the `acpi` crate's interpreter.  Running it here rather than
 //! in root confines what a firmware bug or an interpreter panic can harm
 //! to attestation (root then revokes our endpoint).  Accesses outside our
-//! own TPM ranges go to root (ROOT_CALL_HW), which refuses RAM and
+//! own TPM ranges go to root (root::call::hw), which refuses RAM and
 //! hardware in use.
 
 use alloc::sync::Arc;
@@ -21,8 +21,7 @@ use acpi::{Handle, PciAddress, RawPhysicalMapping};
 
 use l4h_rt::host::fixed::ArrayVec;
 use l4h_rt::host::trust::{self, TrustdConfig};
-use l4h_rt::{cap, host, sel4};
-use sel4::cap_type;
+use l4h_rt::host;
 
 use crate::time;
 
@@ -74,12 +73,12 @@ impl Hw {
     }
 
     /// One access through root.
+    /// What root read: all ones if it refused, or failed.
     fn root(&self, op: u64, addr: u64, off: u64, width: usize, value: u64) -> u64 {
-        for (i, v) in [op, addr, off, width as u64, value].into_iter().enumerate() {
-            sel4::with_ipc_buffer_mut(|b| b.msg_regs_mut()[i] = v);
-        }
-        cap::<cap_type::Endpoint>(host::SLOT_ROOT_EP).call(sel4::MessageInfo::new(host::ROOT_CALL_HW, 0, 0, 5));
-        sel4::with_ipc_buffer(|b| b.msg_regs()[0])
+        use l4h_rt::host::root::call::Client;
+        l4h_rt::ipc::Endpoint::of(&l4h_rt::host::wiring::TRUSTD_ROOT, l4h_rt::host::wiring::p::Trustd, 0)
+            .hw(op, addr as usize, off as usize, width, value)
+            .unwrap_or(u64::MAX)
     }
 
     fn read(&self, paddr: usize, width: usize) -> u64 {

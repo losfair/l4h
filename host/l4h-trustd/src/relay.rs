@@ -13,9 +13,9 @@
 
 use core::sync::atomic::{Ordering, fence};
 
+use l4h_rt::host::errno::Errno;
 use l4h_rt::host::trust::{self, RELAY_HEADER, RELAY_SLOT_HEADER, RelayHeader, RelaySlot};
-use l4h_rt::{cap, host, sel4};
-use sel4::cap_type;
+use l4h_rt::host;
 
 /// What a request is for.
 #[derive(Clone, Copy)]
@@ -90,12 +90,10 @@ impl Relay {
     /// bytes, to partition `to`.  False if root could not.
     pub fn send(&mut self, to: u32, head: RelayHeader) -> bool {
         unsafe { ((trust::RELAY_VA + RELAY_SLOT_HEADER) as *mut RelayHeader).write_volatile(head) };
-        sel4::with_ipc_buffer_mut(|b| {
-            b.msg_regs_mut()[0] = to as u64;
-            b.msg_regs_mut()[1] = (RELAY_HEADER + head.len as usize) as u64;
-        });
-        let r = cap::<cap_type::Endpoint>(host::SLOT_ROOT_EP).call(sel4::MessageInfo::new(host::ROOT_CALL_RELAY, 0, 0, 2));
-        r.length() >= 1 && sel4::with_ipc_buffer(|b| b.msg_regs()[0]) == 0
+        use l4h_rt::host::root::call::Client;
+        l4h_rt::ipc::Endpoint::of(&l4h_rt::host::wiring::TRUSTD_ROOT, l4h_rt::host::wiring::p::Trustd, 0)
+            .relay(to, RELAY_HEADER + head.len as usize)
+            .is_ok()
     }
 
     /// What partition `from` sent since the last call, if anything (and
@@ -142,7 +140,7 @@ impl Relay {
     /// The request out, if it is done: what it was for, and the answer's
     /// payload or -errno (ETIMEDOUT when none came).  Sends it again when
     /// it is time.
-    pub fn poll(&mut self) -> Option<(Wait, Result<&[u8], i64>)> {
+    pub fn poll(&mut self) -> Option<(Wait, Result<&[u8], Errno>)> {
         let p = self.pending.as_ref()?;
         let (head, what) = (p.head, p.what);
         let now = host::ticks::now();
@@ -166,7 +164,7 @@ impl Relay {
         Some((what, match answered {
             None => Err(crate::ETIMEDOUT),
             Some((0, n)) => Ok(&self.buf[RELAY_HEADER..RELAY_HEADER + n]),
-            Some((status, _)) => Err(-(status as i64)),
+            Some((status, _)) => Err(l4h_rt::host::errno::of_status(status as i64)),
         }))
     }
 }

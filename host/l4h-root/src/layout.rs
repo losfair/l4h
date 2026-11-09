@@ -84,7 +84,7 @@ regions! {
     WINDOWS = 0x7000_0000_0000, 2 * PAGE;
     /// The events, status and result pages root shares with vmmgr
     /// (vmmgr.rs).
-    VMMGR_PAGES = 0x7100_0000_0000, 3 * PAGE;
+    VMMGR_PAGES = 0x7100_0000_0000, 2 * PAGE;
     /// dom0's control data area (CTL_BLK_WRITE source), read-only.
     CTL_DATA = 0x7180_0000_0000, l4h_abi::CTL_LOAD_MAX as usize;
     /// The boot framebuffer (dashboard.rs).

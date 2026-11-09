@@ -29,9 +29,11 @@ pub fn print_log(args: core::fmt::Arguments<'_>, serial: bool) {
 }
 
 pub mod component;
+pub mod edge;
 pub mod elf;
 pub mod mem;
 pub mod memd;
+pub mod reply;
 pub mod topology;
 pub mod vspace;
 pub mod window;

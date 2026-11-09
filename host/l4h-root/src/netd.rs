@@ -4,8 +4,11 @@
 
 use core::sync::atomic::Ordering;
 
+use l4h_host::errno::Errno;
 use sel4::{CapRights, ObjectBlueprint, VmAttributes, cap, cap_type};
 
+use l4h_host::{badges, wiring};
+use l4h_host::net::call::Request;
 use l4h_host::fixed::ArrayVec;
 use l4h_host::{self as host, net};
 
@@ -45,11 +48,6 @@ const _: () = assert!(net::PORT_PAGES <= 1 << PORT_KEEP_BITS);
 /// MSI vectors of NICs start here.
 const NIC_MSI_BASE: u64 = crate::pci::VECTOR_NIC_BASE;
 const NETD_ID: u32 = 0x200;
-
-/// Badges on root's notification: netd asks root to ring the doorbell of
-/// link l's peer with bit LINK_BADGE_SHIFT + l.
-pub const LINK_BADGE_SHIFT: u32 = 44;
-pub const LINK_BADGES: u64 = ((1 << net::MAX_LINKS) - 1) << LINK_BADGE_SHIFT;
 
 pub fn is_virtio_net(d: &pci::Device) -> bool {
     d.vendor == 0x1af4
@@ -160,8 +158,11 @@ pub struct Netd {
     #[allow(dead_code)]
     arena: Arena,
     /// Commands to netd, which it does not answer: root validates them
-    /// and keeps their state (net::NETD_ADD_PORT).
+    /// and keeps their state (net::call::add_port).
     mailbox: Mailbox,
+    /// netd faulted (`fault`): it is suspended, and commands to it go
+    /// nowhere.
+    failed: bool,
     /// Removals in the ring, by number mod RING: the port, and what waits
     /// for netd to let go of its memory (vmmgr::Zombie).
     removals: [Option<(usize, Option<usize>)>; RING],
@@ -184,15 +185,16 @@ pub fn bdf(d: &pci::Device) -> u32 {
     ((d.bus as u32) << 8) | ((d.dev as u32) << 3) | d.func as u32
 }
 
-/// Make netd panic, for tests/run-logdtest.sh. Its keeper answers.
+/// Make netd panic, for tests/run-logdtest.sh.  It has no keeper: its
+/// fault comes to root, which fails it (`fault`).
 pub fn inject_panic(h: &mut Host) {
-    let _ = h.netd.post(net::NETD_TEST_PANIC, &[]);
+    let _ = h.netd.post(Request::TestPanic {});
 }
 
 /// Make netd stop, for tests/run-logdtest.sh, as a compromised netd
 /// might: root goes on, and what waits for netd stays pending.
 pub fn inject_hang(h: &mut Host) {
-    let _ = h.netd.post(net::NETD_TEST_HANG, &[]);
+    let _ = h.netd.post(Request::TestHang {});
 }
 
 /// The BARs netd maps of NIC `d`, bit b for BAR b.
@@ -347,22 +349,21 @@ pub fn spawn(
         let irq = sel4::init_thread::Slot::<cap_type::IrqHandler>::from_index(irq_slot).cap();
         let ntfn_slot = alloc.slots.alloc();
         let ntfn = sel4::init_thread::Slot::<cap_type::Notification>::from_index(ntfn_slot).cap();
-        abs_of(ntfn)
-            .mint(&abs_of(comp.ntfn), CapRights::all(), 1 << (net::NETD_BADGE_IRQ_SHIFT as usize + n))
-            .expect("NIC IRQ notification");
+        component::mint_edge(&abs_of(ntfn), &wiring::IRQ_NETD, n, &comp.obj()).expect("NIC IRQ notification");
         irq.irq_handler_set_notification(ntfn).expect("NIC IRQ set notification");
         comp.give(net::NETD_SLOT_IRQ_BASE + n as u64, irq, CapRights::all());
         pci.enable(&d);
         pci.enable_msix(&d);
         let _ = nic_list.push(Nic { pci: *d, switch: None });
     }
-    let mailbox = Mailbox::new(&comp, mailbox::NETD_MAILBOX, alloc, &mut arena, &mut keep_slot);
+    let mailbox = Mailbox::new(&comp, mailbox::NETD_MAILBOX, &wiring::ROOT_NETD_CALL, &wiring::NETD_DONE, alloc, &mut arena, &mut keep_slot);
     component::start(&comp);
     Netd {
         comp,
         arena,
         mailbox,
         removals: [None; RING],
+        failed: false,
         held: 0,
         backlog: 0,
         zombies: [None; net::MAX_PORTS],
@@ -377,8 +378,13 @@ pub fn spawn(
 
 impl Netd {
     /// Post a command; EBUSY if netd has left the ring full.
-    fn post(&mut self, label: u64, args: &[u64]) -> Result<u64, i64> {
-        self.mailbox.post(label, args).ok_or(ctl::EBUSY)
+    /// Post a command: dropped once netd has failed, as root keeps the
+    /// state commands set and reads nothing back.
+    fn post(&mut self, req: Request) -> Result<(), Errno> {
+        if self.failed {
+            return Ok(());
+        }
+        self.mailbox.send(&req).map(|_| ()).ok_or(ctl::EBUSY)
     }
 
     /// Whether a command can be posted now.
@@ -388,7 +394,7 @@ impl Netd {
 
     /// Whether netd has published its NICs' MACs, or never will.
     pub fn ready(&self) -> bool {
-        self.mailbox.failed() || self.published().ready.load(Ordering::Acquire) != 0
+        self.failed || self.published().ready.load(Ordering::Acquire) != 0
     }
 
     fn published(&self) -> &net::Published {
@@ -397,7 +403,7 @@ impl Netd {
 
     /// A new switch; ENOSPC once there are MAX_SWITCHES, the size of
     /// netd's table of them.
-    pub fn try_create_switch(&mut self) -> Result<u32, i64> {
+    pub fn try_create_switch(&mut self) -> Result<u32, Errno> {
         if self.switches as usize >= net::MAX_SWITCHES {
             return Err(ctl::ENOSPC);
         }
@@ -410,7 +416,7 @@ impl Netd {
         self.try_create_switch().expect("l4h-root: more switches than MAX_SWITCHES")
     }
 
-    pub fn attach_uplink(&mut self, switch: u32, nic: usize) -> Result<(), i64> {
+    pub fn attach_uplink(&mut self, switch: u32, nic: usize) -> Result<(), Errno> {
         if switch >= self.switches {
             return Err(ctl::ENOENT);
         }
@@ -418,13 +424,15 @@ impl Netd {
         if n.switch.is_some() {
             return Err(ctl::EBUSY);
         }
-        self.mailbox.post(net::NETD_ATTACH_UPLINK, &[nic as u64, switch as u64]).ok_or(ctl::EBUSY)?;
+        if !self.failed {
+            self.mailbox.send(&Request::AttachUplink { nic: nic as usize, switch: switch as usize }).ok_or(ctl::EBUSY)?;
+        }
         n.switch = Some(switch);
         Ok(())
     }
 
     /// The port a new port on `switch` would be.
-    pub fn free_port(&self, switch: u32) -> Result<usize, i64> {
+    pub fn free_port(&self, switch: u32) -> Result<usize, Errno> {
         if switch >= self.switches {
             return Err(ctl::ENOENT);
         }
@@ -435,7 +443,7 @@ impl Netd {
 
     /// A port's memory, in its own root slot: taken before the guest's
     /// device, so that running out leaves nothing behind.
-    pub fn port_memory(alloc: &mut Alloc) -> Result<(Slot, UtRegion), i64> {
+    pub fn port_memory(alloc: &mut Alloc) -> Result<(Slot, UtRegion), Errno> {
         let s = alloc.slots.alloc();
         match alloc.split(PORT_BITS, s) {
             Some(region) => Ok((s, region)),
@@ -483,15 +491,10 @@ impl Netd {
                 comp.map_copy(alloc, arena, &f, net::port_va(p) + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, dst)
             });
         }
-        self.comp.give_badged(
-            net::NETD_SLOT_CLIENT_BASE + p as u64,
-            g.vmm_ntfn,
-            CapRights::write_only(),
-            host::VMM_BADGE_DONE,
-        );
+        self.comp.give_edge(&wiring::NETD_VMM_DONE, p, 0, &g.vmm_ntfn);
         let kick_slot = alloc.slots.alloc();
         let kick = sel4::init_thread::Slot::<cap_type::Notification>::from_index(kick_slot).cap();
-        abs_of(kick).mint(&abs_of(self.comp.ntfn), CapRights::write_only(), 1 << p).expect("port kick");
+        component::mint_edge(&abs_of(kick), &wiring::VMM_NETD_KICK, p, &self.comp.obj()).expect("port kick");
         // Only root grants a dom0 port the physical uplink's identity.
         // A bond keeps both permanent MACs but can send with either
         // member's MAC on either link. Do not unlock arbitrary sources.
@@ -505,7 +508,7 @@ impl Netd {
             | if isolated { net::NETD_PORT_ISOLATED } else { 0 }
             | if physical { net::NETD_PORT_UPLINK } else { 0 };
         // The caller made sure of room in the ring (`room`).
-        if self.post(net::NETD_ADD_PORT, &[p as u64, switch as u64, mac, flags, alias]).is_err() {
+        if self.post(Request::AddPort { port: p, switch: switch as usize, mac, flags, alias }).is_err() {
             log!("l4h-root: netd has no room for port {}", p);
         }
         self.ports[p] = Some(PortInfo { vm: g.id, switch, mac });
@@ -533,25 +536,56 @@ impl Netd {
         n.flush_backlog();
     }
 
-    /// Post the removals that wait for room in the ring.
+    /// Post the removals that wait for room in the ring.  A failed netd
+    /// keeps them for `poll`.
     fn flush_backlog(&mut self) {
-        while self.backlog != 0 {
+        while self.backlog != 0 && !self.failed {
             let p = self.backlog.trailing_zeros() as usize;
-            let Some(k) = self.mailbox.post(net::NETD_REMOVE_PORT, &[p as u64]) else { break };
+            let Some(k) = self.mailbox.send(&Request::RemovePort { port: p }) else { break };
             self.removals[k as usize % RING] = Some((p, self.zombies[p].take()));
             self.backlog &= !(1 << p);
         }
     }
 
-    /// Ports netd has let go of: their memory can be reclaimed.
+    /// Ports netd has let go of: their memory can be reclaimed.  A
+    /// failed netd, suspended, lets go of every port at once.
     pub fn poll(h: &mut Host) {
-        while let Some((k, _)) = h.netd.mailbox.answer() {
-            let Some((p, zombie)) = h.netd.removals[k as usize % RING].take() else { continue };
-            let _ = h.netd.comp.slot(net::NETD_SLOT_CLIENT_BASE + p as u64).delete();
-            h.netd.held &= !(1 << p);
-            crate::vmmgr::zombie_done(h, zombie, true);
+        loop {
+            let n = &mut h.netd;
+            let next = if n.failed { n.mailbox.abandon() } else { n.mailbox.answer().map(|(k, _)| k) };
+            let Some(k) = next else { break };
+            let Some((p, zombie)) = n.removals[k as usize % RING].take() else { continue };
+            Self::released(h, p, zombie);
+        }
+        while h.netd.failed && h.netd.backlog != 0 {
+            let p = h.netd.backlog.trailing_zeros() as usize;
+            h.netd.backlog &= !(1 << p);
+            let zombie = h.netd.zombies[p].take();
+            Self::released(h, p, zombie);
         }
         h.netd.flush_backlog();
+    }
+
+    /// netd no longer uses port `p`'s memory.
+    fn released(h: &mut Host, p: usize, zombie: Option<usize>) {
+        let _ = h.netd.comp.slot(net::NETD_SLOT_CLIENT_BASE + p as u64).delete();
+        h.netd.held &= !(1 << p);
+        crate::vmmgr::zombie_done(h, zombie, true);
+    }
+
+    /// Component `id`'s fault, if it is netd's: suspend it, and let go of
+    /// what it has not answered.  Whether it was netd's.
+    pub fn fault(h: &mut Host, id: u32) -> bool {
+        if id != NETD_ID {
+            return false;
+        }
+        if !h.netd.failed {
+            log!("l4h-root: netd failed: guest networking stops until reboot");
+            h.netd.failed = true;
+            let _ = h.netd.comp.tcb.tcb_suspend();
+        }
+        Self::poll(h);
+        true
     }
 
     /// Put the link channel `ch` of partition `me` on `switch`, as netd's
@@ -566,7 +600,7 @@ impl Netd {
         ntfn: cap::Notification,
         alloc: &mut Alloc,
         devmem: &mut DevMem,
-    ) -> Result<usize, i64> {
+    ) -> Result<usize, Errno> {
         let l = self.links.len();
         if l >= net::MAX_LINKS || switch >= self.switches {
             return Err(ctl::ENOSPC);
@@ -591,18 +625,16 @@ impl Netd {
             .ok_or(ctl::ENOMEM)?;
         // The doorbell wakes netd directly, badged as the link; netd acks
         // it.  netd's kick to itself carries the same badge.
-        let badge = 1 << (net::NETD_BADGE_LINK_SHIFT as usize + l);
         let badged = alloc.slots.alloc();
         let badged = sel4::init_thread::Slot::<cap_type::Notification>::from_index(badged).cap();
-        abs_of(badged).mint(&abs_of(self.comp.ntfn), CapRights::write_only(), badge).expect("link doorbell badge");
+        component::mint_edge(&abs_of(badged), &wiring::DOORBELL_NETD, l, &self.comp.obj()).expect("link doorbell badge");
         match crate::channel::doorbell(alloc, ch.vector, badged) {
             Some(irq) => self.comp.give(net::NETD_SLOT_LINK_IRQ_BASE + l as u64, irq, CapRights::all()),
             None => log!("l4h-root: no doorbell from partition {} for the link", ch.peer),
         }
-        self.comp.give_badged(net::NETD_SLOT_LINK_KICK_BASE + l as u64, self.comp.ntfn, CapRights::write_only(), badge);
-        self.comp.give_badged(net::NETD_SLOT_LINK_RING_BASE + l as u64, ntfn, CapRights::write_only(), 1 << (LINK_BADGE_SHIFT as usize + l));
-        let args = [l as u64, switch as u64, ch.size, me as u64, ch.peer as u64];
-        self.post(net::NETD_ADD_LINK, &args)?;
+        self.comp.give_edge(&wiring::NETD_LINK_SELF, l, l, &self.comp.obj());
+        self.comp.give_edge(&wiring::NETD_LINK_RING, l, l, &component::root_ntfn(ntfn));
+        self.post(Request::AddLink { link: l, switch: switch as usize, size: ch.size as u64, me: me as u32, peer: ch.peer as u32 })?;
         self.links.must_push(Link { peer: ch.peer, peer_slot: ch.peer_slot, peer_vector: ch.peer_vector });
         Ok(l)
     }
@@ -612,7 +644,7 @@ impl Netd {
     /// frames netd wrote, and the notification merges repeated asks.
     pub fn link_ring(&self, badge: u64) {
         for (l, k) in self.links.iter().enumerate() {
-            if badge & (1 << (LINK_BADGE_SHIFT as usize + l)) != 0 {
+            if badge & badges::root::LINK.nth(l) != 0 {
                 crate::channel::ring(k.peer_slot, k.peer_vector);
             }
         }
@@ -659,7 +691,7 @@ impl Netd {
 
     /// Set the endpoint (switch, mac): a new one, or a new peer for an
     /// existing one.  Returns its id.
-    pub fn ep_set(&mut self, switch: u32, mac: u64, peer: u64) -> Result<usize, i64> {
+    pub fn ep_set(&mut self, switch: u32, mac: u64, peer: u64) -> Result<usize, Errno> {
         if switch >= self.switches {
             return Err(ctl::ENOENT);
         }
@@ -675,15 +707,15 @@ impl Netd {
             Some(id) => id,
             None => self.endpoints.iter().position(|e| e.is_none()).ok_or(ctl::ENOSPC)?,
         };
-        self.post(net::NETD_EP_SET, &[id as u64, switch as u64, mac, peer])?;
+        self.post(Request::EpSet { ep: id, switch: switch as usize, mac, peer })?;
         self.endpoints[id] = Some(Endpoint { switch, mac, peer });
         Ok(id)
     }
 
     /// Delete endpoint `id` and its rules.
-    pub fn ep_del(&mut self, id: usize) -> Result<(), i64> {
+    pub fn ep_del(&mut self, id: usize) -> Result<(), Errno> {
         self.endpoints.get(id).copied().flatten().ok_or(ctl::ENOENT)?;
-        self.post(net::NETD_EP_DEL, &[id as u64])?;
+        self.post(Request::EpDel { ep: id })?;
         self.endpoints[id] = None;
         for r in self.rules.iter_mut() {
             if r.is_some_and(|r| r.ep == id) {
@@ -695,7 +727,7 @@ impl Netd {
 
     /// Set the rule (ep, matches, ip): a new one, or new targets for an
     /// existing one.  Returns its id.
-    pub fn steer_set(&mut self, ep: usize, matches: u64, ip: (u64, u64), targets: u64) -> Result<usize, i64> {
+    pub fn steer_set(&mut self, ep: usize, matches: u64, ip: (u64, u64), targets: u64) -> Result<usize, Errno> {
         let e = self.endpoints.get(ep).copied().flatten().ok_or(ctl::ENOENT)?;
         let (family, proto, port) = (matches as u8, (matches >> 8) as u8, (matches >> 16) as u16);
         let v6 = match family {
@@ -727,15 +759,14 @@ impl Netd {
             Some(id) => id,
             None => self.rules.iter().position(|r| r.is_none()).ok_or(ctl::ENOSPC)?,
         };
-        let args = [id as u64, ep as u64, matches, ip.0, ip.1, targets];
-        self.post(net::NETD_STEER_SET, &args)?;
+        self.post(Request::SteerSet { rule: id, ep: ep as usize, matches: matches as u64, ip_hi: ip.0, ip_lo: ip.1, targets })?;
         self.rules[id] = Some(SteerRule { ep, matches, ip, targets });
         Ok(id)
     }
 
-    pub fn steer_del(&mut self, id: usize) -> Result<(), i64> {
+    pub fn steer_del(&mut self, id: usize) -> Result<(), Errno> {
         self.rules.get(id).copied().flatten().ok_or(ctl::ENOENT)?;
-        self.post(net::NETD_STEER_DEL, &[id as u64])?;
+        self.post(Request::SteerDel { rule: id })?;
         self.rules[id] = None;
         Ok(())
     }

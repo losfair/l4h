@@ -46,6 +46,7 @@ mod vmmgr;
 #[cfg(target_arch = "x86_64")]
 mod vtd;
 
+use l4h_host::errno::Errno;
 use l4h_host::fixed::StaticCell;
 
 /// The root task's own capabilities.
@@ -54,11 +55,13 @@ use sel4::{ObjectBlueprint, cap, cap_type};
 use sel4_root_task::{Never, root_task};
 
 use l4h_host as host;
+use l4h_host::badges::root as recv;
+use l4h_host::root::call as root_call;
 use l4h_host::fixed::ArrayVec;
 use l4h_task::{mem, topology, vspace, window};
+use l4h_task::reply::ReplySlot;
 
 use crate::blkd::{Controller, Disk};
-use crate::component::ROOT_BADGE_COMPONENT;
 use crate::mem::{Alloc, Slots};
 use crate::vmmgr::{Dom0Plan, RootGuest};
 use crate::window::{Window, Windows};
@@ -74,8 +77,6 @@ static LOG: host::log::Ring = host::log::Ring::new();
 /// Partition 0's serial ring. A secondary only starts on it.
 static SERIAL: host::serial::Ring = host::serial::Ring::new();
 pub const MAX_GUESTS: usize = 64;
-/// Badge bit of a component's fault on the root endpoint.
-pub const HYP_BADGE_FAULT: u64 = host::BADGE_FAULT;
 /// What root made for vmmgr's guests, by id.
 static GUESTS: StaticCell<[Option<RootGuest>; MAX_GUESTS]> = StaticCell::new([const { None }; MAX_GUESTS]);
 static OPS: StaticCell<vmmgr::Ops> = StaticCell::new([const { None }; l4h_host::vmmgr::MAX_PENDING]);
@@ -85,8 +86,6 @@ const RESERVE_BYTES: usize = 32 << 20;
 const RESERVE_SLOTS: usize = 32768;
 /// Longest free slot range kept for disk DMA buffers.
 const RESERVE_RANGE: usize = 4096;
-
-const TIMER_BADGE: u64 = 1 << 40;
 
 /// Host disks, at most: the units of all controllers (a virtio-scsi
 /// controller reports its own number).  Units beyond are reported and
@@ -122,6 +121,7 @@ impl HostInfo {
             authority: slot::TCB.cap(),
             sched_control: self.sched_control(core),
             parent_ep: self.hyp_ep,
+            parent: l4h_host::wiring::Party::Root,
             tsc_hz: self.tsc_hz,
             log_frames: self.log_frames,
             serial_frames: self.serial_frames,
@@ -291,7 +291,7 @@ impl Host {
 
     /// Learn the geometry of host disk `disk` if its controller could
     /// not tell at boot.
-    pub fn ensure_disk(&mut self, disk: usize) -> Result<(), i64> {
+    pub fn ensure_disk(&mut self, disk: usize) -> Result<(), Errno> {
         let (c, unit) = self.disks.get(disk).map(|d| (d.ctrl, d.unit)).ok_or(ctl::ENOENT)?;
         if self.ctrls[c].failed { return Err(ctl::EIO); }
         if self.disks[disk].capacity == 0 {
@@ -352,6 +352,9 @@ impl Host {
         }
         netd::Netd::poll(self);
         usb::poll(self);
+        if let Some(v) = self.vmmgr.as_mut() {
+            v.poll();
+        }
     }
 }
 
@@ -384,7 +387,10 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     let wd_ntfn = alloc.object_cap::<cap_type::Notification>(ObjectBlueprint::Notification);
     slot::TCB.cap().tcb_bind_notification(wd_ntfn).expect("bind watchdog notification");
     mailbox::init(wd_ntfn);
-    let reply = ReplySlot::new(&mut alloc);
+    component::minter(l4h_host::wiring::Party::Root);
+    component::audit_in(alloc.slots.alloc());
+    let reply_slot = alloc.slots.alloc();
+    let reply = ReplySlot::new(&mut alloc, sel4::init_thread::Slot::<cap_type::Reply>::from_index(reply_slot).cap());
     let mut wins = Windows {
         a: Window::new(&mut alloc, slot::VSPACE.cap(), layout::WINDOWS.base),
         b: Window::new(&mut alloc, slot::VSPACE.cap(), layout::WINDOWS.base + 4096),
@@ -739,7 +745,7 @@ pub fn arm_timer(info: &HostInfo) {
 /// Signal root's notification at `deadline`, replacing what was armed.
 pub fn set_timer(deadline: u64) {
     let tcb = slot::TCB.cap();
-    sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_TCB_SetTimer(tcb.bits(), deadline, TIMER_BADGE));
+    sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_TCB_SetTimer(tcb.bits(), deadline, recv::TIMER));
 }
 
 /// Root's part of the watchdog dump (vmmgr dumps the guests' vCPUs).
@@ -751,137 +757,79 @@ fn watchdog_dump(h: &Host) {
     );
 }
 
-pub fn mr(i: usize) -> u64 {
-    sel4::with_ipc_buffer(|b| b.msg_regs()[i])
-}
-
-pub fn set_mr(i: usize, v: u64) {
-    sel4::with_ipc_buffer_mut(|b| b.msg_regs_mut()[i] = v)
-}
-
 /// Serve calls from host components and faults of guest kernels.
-/// The serve loop's reply object, made from an Untyped of its own so that
-/// one left unanswered can be replaced without using more memory.
-struct ReplySlot {
-    ut: cap::Untyped,
-    reply: cap::Reply,
+/// Root's thread: calls and faults of host components, the timer, the
+/// serial monitor's and partitions' interrupts, and drivers' answers.
+struct Root<'a> {
+    h: &'a mut Host,
+    modules: &'a bootmod::Modules,
+    booting: bool,
+    next_watchdog: u64,
 }
 
-impl ReplySlot {
-    fn new(alloc: &mut Alloc) -> Self {
-        let (ut_slot, slot) = (alloc.slots.alloc(), alloc.slots.alloc());
-        let ut = alloc.split(12, ut_slot).expect("reply object memory").cap;
-        let r = ReplySlot { ut, reply: sel4::init_thread::Slot::<cap_type::Reply>::from_index(slot).cap() };
-        r.make();
-        r
-    }
-
-    fn make(&self) {
-        self.ut
-            .untyped_retype(&ObjectBlueprint::Reply, &mem::cnode_dest(slot::CNODE.cap()), self.reply.bits() as usize, 1)
-            .expect("reply object");
-    }
-
-    /// Replace the reply object, which is bound to a caller left
-    /// unanswered (a faulted or stopped thread): revoking the Untyped
-    /// deletes it, which leaves that thread inactive for good.
-    fn renew(&self) {
-        slot::CNODE.cap().absolute_cptr(self.ut).revoke().expect("revoke reply object");
-        self.make();
-    }
-}
-
-/// Serve calls and faults of host components, and the timer and serial
-/// interrupts.
-fn serve(h: &mut Host, reply_slot: ReplySlot, modules: &bootmod::Modules) -> ! {
-    let reply = reply_slot.reply;
-    let hyp_ep = h.info.hyp_ep;
+fn serve(h: &mut Host, reply: ReplySlot, modules: &bootmod::Modules) -> ! {
     arm_timer(&h.info);
-    let mut next_watchdog = rdtsc() + h.info.tsc_hz * h.cfg.watchdog_secs as u64;
-    let mut booting = true;
-    let (mut info, mut badge) = hyp_ep.recv(reply);
-    loop {
-        h.alloc.refill();
-        let notified = badge & (TIMER_BADGE | monitor::MONITOR_BADGE | channel::CHANNEL_BADGE | netd::LINK_BADGES
-            | mailbox::MAILBOX_BADGE) != 0;
+    let next_watchdog = rdtsc() + h.info.tsc_hz * h.cfg.watchdog_secs as u64;
+    let hyp_ep = h.info.hyp_ep;
+    l4h_ipc::run(hyp_ep, reply, &mut Root { h, modules, booting: true, next_watchdog })
+}
+
+impl l4h_ipc::Server for Root<'_> {
+    const SIGNALS: u64 = recv::SIGNALS;
+    const FAULT: u64 = recv::FAULT;
+    type Sender = host::root::Sender;
+
+    fn received(&mut self) {
+        self.h.alloc.refill();
+    }
+
+    fn signal(&mut self, badge: u64) {
+        let h = &mut *self.h;
         // Drivers' answers, and what a quarantine left (blkd::poll).  Not
         // on a call: it would overwrite the caller's message registers.
-        if notified {
-            h.poll_drivers();
-            if booting && h.drivers_ready() {
-                booting = false;
-                finish_boot(h, modules);
-            }
+        h.poll_drivers();
+        if self.booting && h.drivers_ready() {
+            self.booting = false;
+            finish_boot(h, self.modules);
         }
-        if badge & monitor::MONITOR_BADGE != 0 {
+        if badge & recv::MONITOR != 0 {
             monitor::Monitor::interrupt(h);
         }
-        if badge & channel::CHANNEL_BADGE != 0 {
+        if badge & recv::CHANNEL != 0 {
             channel::poll(h);
         }
-        if badge & netd::LINK_BADGES != 0 {
+        if badge & recv::LINK.mask() != 0 {
             h.netd.link_ring(badge);
         }
-        let resp = if notified {
-            if badge & TIMER_BADGE != 0 {
-                dashboard::Dashboard::tick(h);
-                channel::tick(h);
-                trustd::tick(h);
-                h.iommu.poll();
-                if h.cfg.watchdog_secs != 0 && rdtsc() >= next_watchdog {
-                    watchdog_dump(h);
-                    next_watchdog = rdtsc() + h.info.tsc_hz * h.cfg.watchdog_secs as u64;
-                }
-                arm_timer(&h.info);
+        if badge & recv::TIMER != 0 {
+            dashboard::Dashboard::tick(h);
+            channel::tick(h);
+            trustd::tick(h);
+            h.iommu.poll();
+            if h.cfg.watchdog_secs != 0 && rdtsc() >= self.next_watchdog {
+                watchdog_dump(h);
+                self.next_watchdog = rdtsc() + h.info.tsc_hz * h.cfg.watchdog_secs as u64;
             }
-            None
-        } else if badge & ROOT_BADGE_COMPONENT != 0 {
-            component_call(h, badge, &info)
-        } else {
-            log!("l4h-root: unexpected message, badge {:#x} label {}", badge, info.label());
-            None
-        };
-        match resp {
-            Some(len) => {
-                (info, badge) = hyp_ep.reply_recv(sel4::MessageInfo::new(0, 0, 0, len), reply);
-            }
-            None => {
-                // A reply object left unanswered (a faulted or stopped
-                // thread) stays bound to its caller: make it afresh.
-                if !notified {
-                    reply_slot.renew();
-                }
-                (info, badge) = hyp_ep.recv(reply);
-            }
+            arm_timer(&h.info);
         }
     }
-}
 
-/// A call or fault from a host component.  Sets the reply's message
-/// registers and returns its length, or None to leave the caller blocked.
-fn component_call(h: &mut Host, badge: u64, info: &sel4::MessageInfo) -> Option<usize> {
-    let id = (badge & 0xffff) as u32;
-    if badge & HYP_BADGE_FAULT != 0 {
+    fn fault(&mut self, badge: u64, info: &sel4::MessageInfo) {
+        let id = recv::ID.get(badge) as u32;
         let fault = sel4::with_ipc_buffer(|b| sel4::Fault::new(b, info));
         log!("l4h-root: component {:#x} fault: {:x?}", id, fault);
+        // A driver (it has no keeper) is failed here; trustd's start-up
+        // stops.
+        let h = &mut *self.h;
+        let _ = blkd::fault(h, id) || netd::Netd::fault(h, id) || crate::usb::fault(h, id);
         trustd::fault(h, id);
-        return None;
     }
-    let reply = |v: u64| {
-        set_mr(0, v);
-        Some(1)
-    };
-    match info.label() {
-        host::ROOT_CALL_HW if id == trustd::TRUSTD_ID => reply(trustd::hw(h)),
-        host::ROOT_CALL_RELAY if id == trustd::TRUSTD_ID => reply(trustd::relay(h)),
-        host::ROOT_CALL_ATTEST_DONE if id == trustd::TRUSTD_ID => {
-            trustd::done(h, mr(0) as usize);
-            reply(0)
-        }
-        label if id == l4h_host::vmmgr::VMMGR_ID => Some(vmmgr::call(h, label)),
-        other => {
-            log!("l4h-root: component {:#x}: unknown call {}", id, other);
-            reply(u64::MAX)
-        }
+
+    fn call(&mut self, from: host::root::Sender, _: u64, info: &sel4::MessageInfo) -> Option<sel4::MessageInfo> {
+        l4h_ipc::serve::<root_call::Proto>(info, |label, args, out| root_call::serve(&mut vmmgr::Calls(self.h), label, args, from, out))
+    }
+
+    fn unknown(&mut self, badge: u64, info: &sel4::MessageInfo) {
+        log!("l4h-root: unknown call {} badged {:#x}", info.label(), badge);
     }
 }

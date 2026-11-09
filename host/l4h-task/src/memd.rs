@@ -1,7 +1,10 @@
 //! The allocator's memory-service client. Root and vmmgr supply their own
 //! endpoint, exchange CNode, slot range and mapped status page.
 
-use l4h_host::memd::{self, Status};
+use l4h_host::fixed::ArrayVec;
+use l4h_host::memd::{self, Status, call::Client};
+use l4h_host::wire::Call;
+use l4h_host::wiring::{o, p};
 use sel4::{cap, cap_type};
 
 use crate::cap_at;
@@ -9,7 +12,7 @@ use crate::mem::Slot;
 
 #[derive(Clone, Copy)]
 pub struct MemdLink {
-    ep: cap::Endpoint,
+    ep: l4h_ipc::Endpoint<memd::call::Proto>,
     local_cnode: cap::CNode,
     exchange: cap::CNode,
     exchange_bits: usize,
@@ -24,7 +27,7 @@ impl MemdLink {
     /// `status_va` must remain mapped to memd's aligned, readable `Status`
     /// record for the lifetime of this link and all its copies.
     pub unsafe fn new(
-        ep: cap::Endpoint,
+        ep: l4h_ipc::Endpoint<memd::call::Proto>,
         local_cnode: cap::CNode,
         exchange: cap::CNode,
         exchange_bits: usize,
@@ -34,23 +37,20 @@ impl MemdLink {
         Self { ep, local_cnode, exchange, exchange_bits, exchange_base, status_va }
     }
 
-    pub fn endpoint(&self) -> cap::Endpoint {
-        self.ep
+    /// memd's endpoint, to mint from (wiring::VMMGR_MEMD).
+    pub fn obj(&self) -> crate::edge::Obj<p::Memd, o::Endpoint> {
+        crate::edge::Obj::claim(p::Memd, o::Endpoint, self.local_cnode.absolute_cptr(self.ep.cap()))
     }
 
     pub fn slot(&self, i: u64) -> sel4::AbsoluteCPtr {
         self.exchange.absolute_cptr_from_bits_with_depth(i, self.exchange_bits)
     }
 
-    pub fn xchg(&self, i: usize) -> sel4::AbsoluteCPtr {
-        assert!(i < memd::XCHG_SLOTS);
+    /// Slot `i` of our exchange area with memd (memd::call::XCHG; each
+    /// call's capabilities are memd::call::caps).
+    pub fn area(&self, i: usize) -> sel4::AbsoluteCPtr {
+        assert!(i < memd::XCHG_AREA);
         self.slot(self.exchange_base + i as u64)
-    }
-
-    pub fn call(&self, label: u64, args: &[u64]) -> u64 {
-        sel4::with_ipc_buffer_mut(|b| b.msg_regs_mut()[..args.len()].copy_from_slice(args));
-        self.ep.call(sel4::MessageInfo::new(label, 0, 0, args.len()));
-        sel4::with_ipc_buffer(|b| b.msg_regs()[0])
     }
 
     pub fn status(&self) -> Status {
@@ -60,12 +60,9 @@ impl MemdLink {
     /// An untouched Untyped of 2^bits bytes in local `slot`: its physical
     /// address, or None when the service cannot supply it.
     pub fn alloc(&self, bits: usize, slot: Slot) -> Option<usize> {
-        if self.call(memd::MEMD_ALLOC, &[bits as u64, 1]) != 0 {
-            return None;
-        }
-        let paddr = sel4::with_ipc_buffer(|b| b.msg_regs()[1]) as usize;
+        let paddr = *Client::alloc(self, bits, 1).ok()?.0.first()? as usize;
         self.local_cnode.absolute_cptr(cap_at::<cap_type::Null>(slot))
-            .move_(&self.xchg(0)).expect("memd: take grant");
+            .move_(&self.area(memd::call::caps::alloc::BLOCKS.passed_out(0, l4h_host::wire::Cap::Untyped))).expect("memd: take grant");
         Some(paddr)
     }
 
@@ -73,12 +70,20 @@ impl MemdLink {
     /// Their local slots are left empty.
     pub fn free(&self, blocks: &[(cap::Untyped, usize, usize)]) {
         assert!(blocks.len() <= memd::XCHG_SLOTS);
-        let mut args = [0; 1 + 2 * memd::XCHG_SLOTS];
-        args[0] = blocks.len() as u64;
+        let mut given = ArrayVec::new();
         for (i, &(ut, paddr, bits)) in blocks.iter().enumerate() {
-            self.xchg(i).move_(&self.local_cnode.absolute_cptr(ut)).expect("memd: return block");
-            (args[1 + 2 * i], args[2 + 2 * i]) = (paddr as u64, bits as u64);
+            self.area(memd::call::caps::free::BLOCKS.passed_in(i, l4h_ipc::kind_of(&ut))).move_(&self.local_cnode.absolute_cptr(ut)).expect("memd: return block");
+            given.must_push((paddr, bits));
         }
-        assert_eq!(self.call(memd::MEMD_FREE, &args[..1 + 2 * blocks.len()]), 0, "memd: free");
+        Client::free(self, given).expect("memd: free");
+    }
+}
+
+/// memd's calls (l4h_host::memd::call) go over its endpoint.
+impl Call for MemdLink {
+    type Proto = memd::call::Proto;
+
+    fn ipc(&self, label: u64, args: &[u64], reply: &mut [u64]) -> usize {
+        self.ep.ipc(label, args, reply)
     }
 }

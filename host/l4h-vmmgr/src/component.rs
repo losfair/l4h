@@ -1,6 +1,6 @@
 //! Component spawning through l4h-task, with local CSpace conveniences.
 
-pub use l4h_task::component::{Component, SpawnArgs, SpawnContext, ROOT_BADGE_COMPONENT, create, start};
+pub use l4h_task::component::{Component, SpawnArgs, SpawnContext, audit_in, create, start};
 
 /// A capability in this task's CSpace, expressed as an absolute pointer.
 pub fn abs_of(c: impl sel4::HasCPtrWithDepth) -> sel4::AbsoluteCPtr {
