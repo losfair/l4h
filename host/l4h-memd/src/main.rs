@@ -408,7 +408,8 @@ fn main(info: &'static Info) -> ! {
                 let mut args = [0; call::Request::MAX_WORDS];
                 let n = msg.length().min(args.len());
                 sel4::with_ipc_buffer(|b| args[..n].copy_from_slice(&b.msg_regs()[..n]));
-                call::serve(&mut d, msg.label(), &args[..n], from, &mut out)
+                // memd's methods always answer.
+                call::serve(&mut d, msg.label(), &args[..n], from, &mut out).unwrap_or(0)
             }
             None => {
                 out[0] = EINVAL;

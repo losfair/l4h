@@ -59,6 +59,48 @@ pub const fn guest_fault(guest: usize, vcpu: usize) -> u64 {
 }
 
 crate::badge_space! {
+    /// What every driver with a mailbox (crate::mailbox: blkd, netd,
+    /// usbd) sees on its bound notification from root.  Their spaces
+    /// include it.
+    pub mod driver {
+        /// Root posted requests in the mailbox.
+        signal CALL: 62;
+    }
+}
+
+crate::badge_space! {
+    /// l4h-blkd's bound notification.
+    pub mod blkd: super::driver {
+        /// A client kicked its channel.
+        signal KICK: 0;
+        /// The controller's interrupt.
+        signal IRQ: 1;
+    }
+}
+
+crate::badge_space! {
+    /// l4h-netd's bound notification.
+    pub mod netd: super::driver {
+        /// Port p's client kicked: bit p.
+        signals PORT: 0..crate::net::MAX_PORTS as u32;
+        /// Uplink NIC n's interrupt: bit n.
+        signals IRQ: 48..48 + crate::net::MAX_NICS as u32;
+        /// Link l's doorbell, and netd's own kick to read it later: bit l.
+        signals LINK: 52..52 + crate::net::MAX_LINKS as u32;
+    }
+}
+
+crate::badge_space! {
+    /// l4h-usbd's bound notification.
+    pub mod usbd: super::driver {
+        /// The controller's interrupt.
+        signal IRQ: 0;
+        /// The client kicked.
+        signal KICK: 1;
+    }
+}
+
+crate::badge_space! {
     /// l4h-memd's service endpoint (crate::memd::call).  l4h-root calls
     /// with an unbadged capability.
     pub mod memd {

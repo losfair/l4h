@@ -9,7 +9,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use sel4::{CapRights, VmAttributes, cap, cap_type};
 
 use l4h_host::mailbox::RING;
-use l4h_host::{self as host, blk};
+use l4h_host::blk::call::{Request, reply};
+use l4h_host::{self as host, blk, wire};
 
 use crate::component::{self, Component, SpawnArgs, abs_of};
 use crate::devmem::DevMem;
@@ -118,7 +119,7 @@ enum BlkOp {
 }
 
 /// How blkd's requests fail once it has.
-const FAILED: [u64; host::mailbox::ANSWER] = [u64::MAX, 0, 0, 0, 0];
+const FAILED: [u64; host::mailbox::ANSWER] = [wire::FAILED, 0, 0, 0, 0];
 
 /// A host disk: unit `unit` of controller `ctrl`.
 pub struct Disk {
@@ -184,9 +185,9 @@ impl Controller {
 
     /// Post a request to blkd, which `poll` finishes with `op`; the op back
     /// if the ring is full.
-    fn post(&mut self, label: u64, args: &[u64], op: BlkOp) -> Result<(), BlkOp> {
+    fn post(&mut self, req: Request, op: BlkOp) -> Result<(), BlkOp> {
         let Some(driver) = self.driver.as_mut() else { return Err(op) };
-        match driver.mailbox.post(label, args) {
+        match driver.mailbox.send(&req) {
             Some(k) => {
                 self.ops[k as usize % RING] = Some(op);
                 Ok(())
@@ -208,7 +209,7 @@ impl Controller {
         let op = BlkOp::Reserve { disk, window, read_only };
         if self.failed {
             self.list_reservation(disk, window, read_only, None);
-        } else if self.post(blk::BLKD_RESERVE, &[unit, window.start, window.sectors, read_only as u64], op).is_err() {
+        } else if self.post(Request::Reserve { unit: unit as usize, start: window.start, sectors: window.sectors, read_only }, op).is_err() {
             panic!("l4h-root: more dom0 disk reservations than blkd's ring");
         }
     }
@@ -234,7 +235,7 @@ impl Controller {
             (vals[2], vals[3]) = (u64::MAX, 0);
             return Ok(false);
         }
-        self.post(blk::BLKD_EXTENT, &[i as u64, k as u64], BlkOp::Extent { token, vals: *vals }).map_err(|_| ctl::EBUSY)?;
+        self.post(Request::Extent { client: i, k }, BlkOp::Extent { token, vals: *vals }).map_err(|_| ctl::EBUSY)?;
         Ok(true)
     }
 
@@ -557,10 +558,10 @@ pub fn attach_start(h: &mut Host, c: usize, token: usize, id: usize, disk: usize
     let ctrl = &mut h.ctrls[c];
     if ctrl.failed { return Err(ctl::EIO); }
     if ctrl.staging_busy || !ctrl.room() { return Err(ctl::EBUSY); }
-    // blkd reads the list from staging, where BLKD_ADD finds it too.
+    // blkd reads the list from staging, where `add` finds it too.
     ctrl.stage(Some(list), 16 * n, &mut h.wins.a);
     let op = BlkOp::Check { token, id, instance, disk, unit, start, n, volatile };
-    ctrl.post(blk::BLKD_CHECK, &[unit, start, sectors, read_only as u64, dom0 as u64, n as u64], op).map_err(|_| ctl::EBUSY)?;
+    ctrl.post(Request::Check { unit: unit as usize, start, sectors, read_only, dom0, n }, op).map_err(|_| ctl::EBUSY)?;
     ctrl.staging_busy = true;
     Ok(())
 }
@@ -574,18 +575,22 @@ fn checked(h: &mut Host, c: usize, token: usize, id: usize, instance: u64, disk:
     volatile: bool, w: [u64; host::mailbox::ANSWER]) {
     let r = (|| {
         let ctrl = &mut h.ctrls[c];
-        let i = w[1] as usize;
-        // A slot that is free, or a reservation without a client.
-        let usable = i < blk::MAX_CLIENTS && ctrl.clients[i].as_ref().is_none_or(|a| a.pool.is_none() && a.remove.is_none());
-        match w[0] {
-            0 if usable => {}
-            0 | u64::MAX => {
+        let ok = match wire::reply::<reply::Check>(&w) {
+            Ok(ok) => ok,
+            Err(wire::FAILED) => {
                 quarantine(ctrl, &h.pci);
                 return Err(ctl::EIO);
             }
-            errno => return Err(errno as i64),
+            Err(errno) => return Err(errno as i64),
+        };
+        let i = ok.slot;
+        // A slot that is free, or a reservation without a client.
+        let usable = i < blk::MAX_CLIENTS && ctrl.clients[i].as_ref().is_none_or(|a| a.pool.is_none() && a.remove.is_none());
+        if !usable {
+            quarantine(ctrl, &h.pci);
+            return Err(ctl::EIO);
         }
-        let (window, read_only) = (blk::DiskWindow { start, sectors: w[2] }, w[3] != 0);
+        let (window, read_only) = (blk::DiskWindow { start, sectors: ok.sectors }, ok.read_only);
         if h.guests[id].as_ref().is_none_or(|g| g.instance != instance) { return Err(ctl::ENOENT); }
         if !h.can_afford(1 << 20, 0, 0) { return Err(ctl::ENOMEM); }
         crate::vmmgr::with_guest(h, id, |h, g| {
@@ -621,10 +626,10 @@ fn activate(ctrl: &mut Controller, unit: u64, i: usize, client: &RootGuest, chan
             gpa: client.pool.gpa as u64, paddr: client.pool.paddr as u64, size: client.pool.size as u64,
         });
     });
-    let (dom0, n) = (client.dom0 as u64, a.extents as u64);
+    let (dom0, n) = (client.dom0, a.extents);
     // The check's answer has just left room in the ring.  The attachment
     // stays with the guest either way, for its teardown.
-    ctrl.post(blk::BLKD_ADD, &[i as u64, unit, dom0, n], BlkOp::Add { token, chan, kick }).map_err(|_| ctl::EBUSY)
+    ctrl.post(Request::Add { client: i, unit: unit as usize, dom0, n }, BlkOp::Add { token, chan, kick }).map_err(|_| ctl::EBUSY)
 }
 
 /// Stop using controller `disk` until host reboot: its blkd is suspended
@@ -676,7 +681,7 @@ fn flush_backlog(h: &mut Host, c: usize) {
             removed(h, c, i, false);
             continue;
         }
-        if ctrl.post(blk::BLKD_REMOVE, &[i as u64], BlkOp::Remove { client: i }).is_err() {
+        if ctrl.post(Request::Remove { client: i }, BlkOp::Remove { client: i }).is_err() {
             ctrl.backlog = true;
             break;
         }
@@ -717,9 +722,9 @@ pub fn write(h: &mut Host, disk: usize, sector: u64, len: usize, from: Option<*c
     if ctrl.staging_busy || !ctrl.room() { return Err(ctl::EBUSY); }
     ctrl.stage(from, len, &mut h.wins.a);
     let r = if len == 0 {
-        ctrl.post(blk::BLKD_FLUSH, &[unit], BlkOp::Write { token })
+        ctrl.post(Request::Flush { unit: unit as usize }, BlkOp::Write { token })
     } else {
-        ctrl.post(blk::BLKD_WRITE, &[sector, len as u64, unit], BlkOp::Write { token })
+        ctrl.post(Request::Write { sector, length: len, unit: unit as usize }, BlkOp::Write { token })
     };
     r.map_err(|_| ctl::EBUSY)?;
     ctrl.staging_busy = true;
@@ -731,7 +736,7 @@ pub fn write(h: &mut Host, disk: usize, sector: u64, len: usize, from: Option<*c
 pub fn inject_hang(h: &mut Host, c: usize) {
     let ctrl = &mut h.ctrls[c];
     if let Some(driver) = ctrl.driver.as_mut().filter(|_| !ctrl.failed) {
-        let _ = driver.mailbox.post(blk::BLKD_TEST_HANG, &[]);
+        let _ = driver.mailbox.send(&Request::TestHang {});
     }
 }
 
@@ -756,7 +761,8 @@ fn complete(h: &mut Host, c: usize, op: BlkOp, w: [u64; host::mailbox::ANSWER]) 
     match op {
         BlkOp::Reserve { disk, window, read_only } => {
             let ctrl = &mut h.ctrls[c];
-            let i = w[0] as usize;
+            // A refused reservation is no slot.
+            let i = wire::reply::<reply::Reserve>(&w).unwrap_or(usize::MAX);
             if !ctrl.failed && (i >= blk::MAX_CLIENTS || ctrl.clients[i].is_some()) {
                 log!("l4h-root: disk {}: blkd refused a dom0 boot range: conflicting or excessive reservations", disk);
                 quarantine(ctrl, &h.pci);
@@ -769,7 +775,7 @@ fn complete(h: &mut Host, c: usize, op: BlkOp, w: [u64; host::mailbox::ANSWER]) 
         BlkOp::Add { token, chan, kick } => {
             let ctrl = &mut h.ctrls[c];
             ctrl.staging_busy = false;
-            let r = if w[0] == 0 {
+            let r = if wire::reply::<reply::Add>(&w).is_ok() {
                 Ok(OpResult::Disk { chan, kick })
             } else {
                 quarantine(ctrl, &h.pci);
@@ -777,23 +783,26 @@ fn complete(h: &mut Host, c: usize, op: BlkOp, w: [u64; host::mailbox::ANSWER]) 
             };
             crate::vmmgr::op_done(h, token, r);
         }
-        BlkOp::Remove { client } => removed(h, c, client, w[0] == 0),
+        BlkOp::Remove { client } => removed(h, c, client, wire::reply::<reply::Remove>(&w).is_ok()),
         BlkOp::Write { token } => {
             let ctrl = &mut h.ctrls[c];
             ctrl.staging_busy = false;
-            let r = match w[0] {
-                0 => Ok(OpResult::Vals(Default::default())),
-                blk::BLKD_REFUSED => Err(w[1] as i64),
-                u64::MAX => {
+            // Flush's reply is write's.
+            let r = match wire::reply::<reply::Write>(&w) {
+                Ok(0) => Ok(OpResult::Vals(Default::default())),
+                // The device failed, or blkd did.
+                Ok(u64::MAX) | Err(wire::FAILED) => {
                     quarantine(ctrl, &h.pci);
                     Err(ctl::EIO)
                 }
-                _ => Err(ctl::EIO),
+                Ok(_) => Err(ctl::EIO),
+                // The range refused.
+                Err(errno) => Err(errno as i64),
             };
             crate::vmmgr::op_done(h, token, r);
         }
         BlkOp::Extent { token, mut vals } => {
-            (vals[2], vals[3]) = if w[0] == 0 { (w[1], w[2]) } else { (u64::MAX, 0) };
+            (vals[2], vals[3]) = wire::reply::<reply::Extent>(&w).unwrap_or((u64::MAX, 0));
             crate::vmmgr::op_done(h, token, Ok(OpResult::Vals(vals.into_iter().collect())));
         }
     }

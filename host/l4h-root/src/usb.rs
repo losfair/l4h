@@ -27,7 +27,8 @@ use core::sync::atomic::Ordering;
 use sel4::{CapRights, ObjectBlueprint, VmAttributes, cap, cap_type};
 
 use l4h_abi::{self as abi, usb as uabi};
-use l4h_host::{self as host, usb};
+use l4h_host::usb::call::{Request, reply};
+use l4h_host::{self as host, usb, wire};
 use l4h_host::fixed::ArrayVec;
 
 use crate::blkd::{BarCache, DEVICE_ATTRS, bar_frames, keep_bits};
@@ -354,7 +355,7 @@ fn claim(h: &mut Host, i: usize) -> Result<(), i64> {
     h.pci.enable_memory(&c.pci);
     component::start(&comp);
     let mut u = Usbd { comp, arena, mailbox: mbox, ops: ArrayVec::new(), areas: [const { None }; usb::AREAS], idx: 0, waiting: false };
-    send(&mut u, usb::USBD_CLAIM, &[], Op::Claim);
+    send(&mut u, Request::Claim {}, Op::Claim);
     c.driver = Some(u);
     c.state = State::Idle;
     info!("l4h-root: xHCI {:02x}:{:02x}.{}: claiming it, {} KiB of DMA memory", d.bus, d.dev, d.func, dma >> 10);
@@ -368,13 +369,15 @@ fn claimed(h: &mut Host, i: usize, w: &[u64; host::mailbox::ANSWER]) {
     if c.state == State::Failed {
         return;
     }
-    if w[0] != 0 {
-        log!("l4h-root: xHCI {:02x}:{:02x}.{}: claim failed ({:#x})", d.bus, d.dev, d.func, w[0]);
-        quarantine(c, &h.pci);
-        return;
-    }
-    (c.usb2, c.usb3) = (w[1] as u16, (w[1] >> 16) as u16);
-    c.ac64 = w[2] & (1 << 16) != 0;
+    let got = match wire::reply::<reply::Claim>(w) {
+        Ok(got) => got,
+        Err(e) => {
+            log!("l4h-root: xHCI {:02x}:{:02x}.{}: claim failed ({:#x})", d.bus, d.dev, d.func, e);
+            quarantine(c, &h.pci);
+            return;
+        }
+    };
+    (c.usb2, c.usb3, c.ac64) = (got.usb2, got.usb3, got.ac64);
     c.claimed = true;
     route_intel_ports(&d, &h.pci);
     // An owner's ATTACH turns it back on.
@@ -401,8 +404,8 @@ pub fn ensure_claimed(h: &mut Host, i: usize) -> Result<(), i64> {
 
 /// Post a request to usbd.  Root posts at most two before they are
 /// answered (Usbd::ops), so the ring has room.
-fn send(d: &mut Usbd, label: u64, args: &[u64], op: Op) {
-    d.mailbox.post(label, args).expect("usbd mailbox room");
+fn send(d: &mut Usbd, req: Request, op: Op) {
+    d.mailbox.send(&req).expect("usbd mailbox room");
     d.ops.must_push(op);
 }
 
@@ -414,7 +417,7 @@ fn post_attach(h: &mut Host, i: usize) {
     h.iommu.map(&mut h.alloc, c.dom, pool.1, pool.2, true);
     h.pci.bus_master(&c.pci, true);
     d.waiting = false;
-    send(d, usb::USBD_ATTACH, &[d.idx as u64, pool.0 as u64, pool.1 as u64, pool.2 as u64], Op::Attach);
+    send(d, Request::Attach { area: d.idx, gpa: pool.0 as u64, paddr: pool.1 as u64, size: pool.2 as u64 }, Op::Attach);
 }
 
 /// Free area `idx`: usbd no longer uses it (REMOVE done, never attached,
@@ -444,7 +447,7 @@ pub fn poll(h: &mut Host) {
             let d = c.driver.as_mut().unwrap();
             let failed = c.state == State::Failed;
             let w = if failed {
-                d.mailbox.abandon().map(|_| [u64::MAX; host::mailbox::ANSWER])
+                d.mailbox.abandon().map(|_| [wire::FAILED; host::mailbox::ANSWER])
             } else {
                 d.mailbox.answer().map(|(_, w)| w)
             };
@@ -454,13 +457,13 @@ pub fn poll(h: &mut Host) {
                 Op::Claim => claimed(h, i, &w),
                 // The guest finds no magic.
                 Op::Attach => {
-                    if w[0] != 0 && !failed {
-                        log!("l4h-root: xHCI {:02x}:{:02x}.{}: usbd refused the attachment ({:#x})", p.bus, p.dev, p.func, w[0]);
+                    if let (Err(e), false) = (wire::reply::<reply::Attach>(&w), failed) {
+                        log!("l4h-root: xHCI {:02x}:{:02x}.{}: usbd refused the attachment ({:#x})", p.bus, p.dev, p.func, e);
                     }
                 }
                 Op::Remove(idx) => {
-                    if w[0] != 0 && !failed {
-                        log!("l4h-root: xHCI {:02x}:{:02x}.{}: usbd could not stop it ({:#x})", p.bus, p.dev, p.func, w[0]);
+                    if let (Err(e), false) = (wire::reply::<reply::Remove>(&w), failed) {
+                        log!("l4h-root: xHCI {:02x}:{:02x}.{}: usbd could not stop it ({:#x})", p.bus, p.dev, p.func, e);
                         quarantine(c, &h.pci);
                     }
                     free_area(h, ctrls()[i].driver.as_mut().unwrap(), idx);
@@ -586,7 +589,7 @@ pub fn remove(h: &mut Host, i: usize) -> bool {
         free_area(h, d, idx);
     } else {
         // After the ATTACH, if usbd has not answered it yet.
-        send(d, usb::USBD_REMOVE, &[idx as u64], Op::Remove(idx));
+        send(d, Request::Remove { area: idx }, Op::Remove(idx));
     }
     true
 }

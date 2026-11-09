@@ -81,6 +81,15 @@ impl Mailbox {
     }
 
 
+    /// Post a request of the driver's protocol (l4h_host::wire::protocol):
+    /// its number, or None if the ring is full.
+    pub fn send<M: l4h_host::wire::Message>(&mut self, req: &M) -> Option<u64> {
+        const { assert!(M::MAX_WORDS <= ARGS, "a mailbox request is at most ARGS words") };
+        let mut args = [0; ARGS];
+        let n = req.encode(&mut args);
+        self.post(req.label(), &args[..n])
+    }
+
     /// Post a request: its number, or None if the ring is full (a driver
     /// that does not answer).
     pub fn post(&mut self, label: u64, args: &[u64]) -> Option<u64> {

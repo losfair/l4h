@@ -27,6 +27,27 @@ pub const EINVAL: u64 = 22;
 /// everything with it (l4h_rt::abort_trap), and a reply too short for its
 /// type is taken as one.
 pub const FAILED: u64 = u64::MAX;
+/// What a `Server` method returns to leave its caller unanswered (a
+/// stopped or destroyed caller): `serve` then writes no reply.  Never on
+/// the wire.
+pub const NO_REPLY: u64 = u64::MAX - 2;
+
+/// The sender of a protocol only l4h-root uses: the drivers' mailboxes
+/// (crate::mailbox), whose requests only root posts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RootOnly {
+    Root,
+}
+
+/// A call, as a client posts it: what `protocol!`'s Request implements.
+pub trait Message {
+    /// Words of the longest call's arguments.
+    const MAX_WORDS: usize;
+    fn label(&self) -> u64;
+    /// Write the arguments into `out` (at least MAX_WORDS long): their
+    /// length.
+    fn encode(&self, out: &mut [u64]) -> usize;
+}
 
 /// A range of badge bits, [lo, hi).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -467,6 +488,30 @@ macro_rules! protocol {
                 }
             }
 
+            impl $crate::wire::Message for Request {
+                const MAX_WORDS: usize = Request::MAX_WORDS;
+                fn label(&self) -> u64 {
+                    Request::label(self)
+                }
+                fn encode(&self, out: &mut [u64]) -> usize {
+                    Request::encode(self, out)
+                }
+            }
+
+            /// The reply type of the call with label L.
+            pub trait ReplyOf<const L: u64> {
+                type T;
+            }
+            /// What implements ReplyOf for every call.
+            pub struct Calls;
+            $( impl ReplyOf<$label> for Calls { type T = $rty; } )*
+
+            /// Each call's reply type, for a client that takes the reply
+            /// later (a mailbox's answer): `wire::reply::<reply::Call>(words)`.
+            pub mod reply {
+                $( pub type $variant = <super::Calls as super::ReplyOf<$label>>::T; )*
+            }
+
             const _: () = assert!(Request::MAX_WORDS <= $crate::wire::MAX_MRS
                 && Request::MAX_REPLY_WORDS <= $crate::wire::MAX_MRS, "call longer than the IPC buffer");
 
@@ -477,11 +522,12 @@ macro_rules! protocol {
             }
 
             /// Decode the call `label` from `from`, run its method, and
-            /// write the reply (0 and its value, or the errno) into `out`:
-            /// the reply's length.
+            /// write the reply (0 and its value, or the errno) into `out`
+            /// (at least Request::MAX_REPLY_WORDS long): the reply's
+            /// length, or None if the method returned wire::NO_REPLY.
             pub fn serve<S: Server + ?Sized>(
-                s: &mut S, label: u64, args: &[u64], from: Sender, out: &mut [u64; Request::MAX_REPLY_WORDS],
-            ) -> usize {
+                s: &mut S, label: u64, args: &[u64], from: Sender, out: &mut [u64],
+            ) -> Option<usize> {
                 let r = match Request::decode(label, args, from) {
                     $( Ok(Request::$variant { $($arg),* }) => s.$method(from, $($arg),*)
                         .map(|v| $crate::wire::Wire::put(&v, &mut out[1..])), )*
@@ -490,11 +536,12 @@ macro_rules! protocol {
                 match r {
                     Ok(n) => {
                         out[0] = 0;
-                        1 + n
+                        Some(1 + n)
                     }
+                    Err($crate::wire::NO_REPLY) => None,
                     Err(e) => {
                         out[0] = e;
-                        1
+                        Some(1)
                     }
                 }
             }
@@ -591,6 +638,7 @@ mod tests {
         fn ping(&mut self, from: Who) -> Result<(), u64> {
             match from {
                 Who::Guest(7) => Ok(()),
+                Who::Guest(8) => Err(NO_REPLY),
                 _ => Err(16),
             }
         }
@@ -601,7 +649,7 @@ mod tests {
     impl Call for Loop {
         fn ipc(&self, label: u64, args: &[u64], reply: &mut [u64]) -> usize {
             let mut out = [0; demo::Request::MAX_REPLY_WORDS];
-            let n = demo::serve(&mut Srv, label, args, self.0, &mut out);
+            let n = demo::serve(&mut Srv, label, args, self.0, &mut out).unwrap_or(0);
             reply[..n].copy_from_slice(&out[..n]);
             n
         }
@@ -620,6 +668,12 @@ mod tests {
         assert_eq!(Loop(Who::Guest(1)).add(1, 1), Err(EINVAL));
         assert_eq!(Loop(Who::Guest(1)).ping(), Err(16));
         assert_eq!(Loop(Who::Guest(7)).ping(), Ok(()));
+        // No reply: the client sees no words, as from a failed server.
+        assert_eq!(Loop(Who::Guest(8)).ping(), Err(FAILED));
+        let mut out = [0; demo::Request::MAX_REPLY_WORDS];
+        assert_eq!(demo::serve(&mut Srv, 3, &[], Who::Guest(8), &mut out), None);
+        // A reply taken later, by its call's type.
+        assert_eq!(reply::<demo::reply::Add>(&[0, 9]), Ok(9));
         assert_eq!(demo::Request::MAX_WORDS, 1 + 4 * 2);
         assert_eq!(demo::Request::MAX_REPLY_WORDS, 1 + 4);
     }

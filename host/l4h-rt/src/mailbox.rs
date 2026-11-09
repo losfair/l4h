@@ -15,33 +15,30 @@ pub fn published<T>() -> &'static T {
     unsafe { &*((MAILBOX_VA + PUBLISHED_OFFSET) as *const T) }
 }
 
-/// Root's next request, if one is waiting: its label, with its arguments
-/// in message registers 0.., as a call would have them.  Answer it before
-/// asking for the next.
-pub fn request() -> Option<u64> {
+/// Answer every request root has waiting, in order: `f(label, args,
+/// answer)` fills the answer and returns its length, or None to answer as
+/// a failed driver would (FAILED).  Arguments and answer never pass
+/// through the message registers, so `f`'s invocations cannot overwrite
+/// them.  Returns whether it answered any; then `signal` root.
+pub fn serve(mut f: impl FnMut(u64, &[u64; ARGS], &mut [u64; ANSWER]) -> Option<usize>) -> bool {
     let m = page();
-    let k = m.done.load(Ordering::Relaxed);
-    if m.posted.load(Ordering::Acquire) == k {
-        return None;
-    }
-    let e = &m.entries[k as usize % RING];
-    sel4::with_ipc_buffer_mut(|b| {
-        for (r, a) in b.msg_regs_mut()[..ARGS].iter_mut().zip(&e.args) {
-            *r = a.load(Ordering::Relaxed);
+    let mut answered = false;
+    loop {
+        let k = m.done.load(Ordering::Relaxed);
+        if m.posted.load(Ordering::Acquire) == k {
+            return answered;
         }
-    });
-    Some(e.label.load(Ordering::Relaxed))
-}
-
-/// Answer the request `request` returned with message registers 0..n.
-/// Root learns of it at the next `signal`.
-pub fn answer(n: usize) {
-    let words = sel4::with_ipc_buffer(|b| {
-        let mut w = [0; ANSWER];
-        w[..n].copy_from_slice(&b.msg_regs()[..n]);
-        w
-    });
-    publish(&words);
+        let e = &m.entries[k as usize % RING];
+        let label = e.label.load(Ordering::Relaxed);
+        let args: [u64; ARGS] = core::array::from_fn(|i| e.args[i].load(Ordering::Relaxed));
+        let mut words = [0; ANSWER];
+        if f(label, &args, &mut words).is_none() {
+            words = [0; ANSWER];
+            words[0] = crate::host::wire::FAILED;
+        }
+        publish(&words);
+        answered = true;
+    }
 }
 
 /// Tell root that requests were answered.

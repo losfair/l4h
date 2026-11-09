@@ -67,28 +67,45 @@ pub fn dma_bytes(slots: u32, scratch: u32, page: u32) -> usize {
     total.next_power_of_two().max(4 << 20)
 }
 
-/// Root's requests to usbd (host::mailbox; answer word 0 is 0 or an
-/// errno, u64::MAX if usbd failed).  Root never waits for usbd, which a
-/// guest drives and could keep busy: it posts a request and finishes what
-/// it was for when usbd has answered.
-///
-/// CLAIM: take the controller from the firmware (legacy handoff, halt,
-/// reset, capability walk).  Posted once, before any guest has the
-/// controller.  -> answer 1 = USB 2 ports | USB 3 ports << 16 | max slots
-/// << 32, answer 2 = HCIVERSION | 64-bit addressing << 16.
-pub const USBD_CLAIM: u64 = 1;
-/// ATTACH(idx, pool GPA, paddr, size): root has mapped client area `idx`'s
-/// frames at queue_va(idx), given the VMM's notification at
-/// USBD_SLOT_CLIENT_IRQ + idx and turned bus mastering on; start the
-/// controller for the pool.  Posted only once the requests before it are
-/// answered (bus mastering stays off while a CLAIM or REMOVE runs).
-pub const USBD_ATTACH: u64 = 2;
-/// REMOVE(idx): root has turned bus mastering off and taken the
-/// notification away; forget everything, halt and reset the controller
-/// and let go of the area, which root then frees (the next guest gets
-/// fresh frames).  0 once the controller has nothing of the client's left,
-/// also if the ATTACH before it was refused.
-pub const USBD_REMOVE: u64 = 3;
+use crate::wire::RootOnly;
+
+crate::protocol! {
+    /// Root's requests to usbd (crate::mailbox, crate::wire::protocol; a
+    /// failed usbd answers wire::FAILED).  Root never waits for usbd, which
+    /// a guest drives and could keep busy: it posts a request and finishes
+    /// what it was for when usbd has answered.
+    pub mod call (from: RootOnly) {
+        /// Take the controller from the firmware (legacy handoff, halt,
+        /// reset, capability walk).  Posted once, before any guest has the
+        /// controller.
+        Claim / claim = 1 from [Root] () -> Claimed;
+        /// Root has mapped client area `area`'s frames at queue_va(area),
+        /// given the VMM's notification at USBD_SLOT_CLIENT_IRQ + area and
+        /// turned bus mastering on: start the controller for the pool.
+        /// Posted only once the requests before it are answered (bus
+        /// mastering stays off while a claim or remove runs).
+        Attach / attach = 2 from [Root] (area: usize, gpa: u64, paddr: u64, size: u64) -> ();
+        /// Root has turned bus mastering off and taken the notification
+        /// away: forget everything, halt and reset the controller and let
+        /// go of the area, which root then frees (the next guest gets fresh
+        /// frames).  Done once the controller has nothing of the client's
+        /// left, also if the attach before it was refused.
+        Remove / remove = 3 from [Root] (area: usize) -> ();
+    }
+}
+const _: () = assert!(call::Request::MAX_WORDS <= crate::mailbox::ARGS
+    && call::Request::MAX_REPLY_WORDS <= crate::mailbox::ANSWER);
+
+crate::wire_struct! {
+    /// A claimed controller: its USB 2 and USB 3 ports, and whether it
+    /// addresses 64 bits.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Claimed {
+        pub usb2: u16,
+        pub usb3: u16,
+        pub ac64: bool,
+    }
+}
 
 /// What usbd publishes in its mailbox (host::mailbox, the second page),
 /// for CTL_USB_INFO.
@@ -99,19 +116,19 @@ pub struct Published {
     pub resets: AtomicU64,
 }
 
-/// Badges of usbd's bound notification (and host::mailbox::BADGE_CALL).
-pub const USBD_BADGE_IRQ: u64 = 1 << 0;
+/// Badges of usbd's bound notification (badges::usbd).
+pub const USBD_BADGE_IRQ: u64 = crate::badges::usbd::IRQ;
 /// The client kicked.
-pub const USBD_BADGE_KICK: u64 = 1 << 1;
+pub const USBD_BADGE_KICK: u64 = crate::badges::usbd::KICK;
 
 /// usbd's CSpace slots, beyond the common ones.
 pub const USBD_SLOT_IRQ: u64 = 16;
 /// Client area idx's VMM notification (badged host::vmm_badge_usb(n)),
-/// idx < AREAS.  Root deletes it at REMOVE without waiting: usbd signals
+/// idx < AREAS.  Root deletes it at `remove` without waiting: usbd signals
 /// it with NBSend, which an empty slot ignores.
 pub const USBD_SLOT_CLIENT_IRQ: u64 = 32;
 
-/// Client areas: one attached, and one draining (REMOVE still running)
+/// Client areas: one attached, and one draining (`remove` still running)
 /// while the next guest's is already mapped.
 pub const AREAS: usize = 2;
 

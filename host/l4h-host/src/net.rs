@@ -60,16 +60,14 @@ pub struct Port {
 
 pub const PORT_PAGES: usize = core::mem::size_of::<Port>().div_ceil(4096);
 
-/// Ports netd serves; port p kicks netd with badge bit p.
+/// Ports netd serves; port p kicks netd with badges::netd::PORT bit p.
 pub const MAX_PORTS: usize = 48;
-/// Uplink NICs; NIC n interrupts with badge bit NETD_BADGE_IRQ_SHIFT + n.
+/// Uplink NICs; NIC n interrupts with badges::netd::IRQ bit n.
 pub const MAX_NICS: usize = 4;
-pub const NETD_BADGE_IRQ_SHIFT: u32 = 48;
 /// Links to other partitions' netds (multikernel, DESIGN.md §11.4): one
 /// to each other partition.  Link l's doorbell (and netd's own kick to
-/// read on later) signals badge bit NETD_BADGE_LINK_SHIFT + l.
+/// read on later) signals badges::netd::LINK bit l.
 pub const MAX_LINKS: usize = 7;
-pub const NETD_BADGE_LINK_SHIFT: u32 = 52;
 /// A link's channel, at most (l4h_partition::LINK_CHANNEL_SIZE).
 pub const LINK_CHANNEL_MAX: usize = 2 << 20;
 /// Switches: one per port and NIC is the most that can carry traffic at
@@ -105,45 +103,53 @@ pub const NETD_SLOT_LINK_RING_BASE: u64 = 56;
 pub const NETD_SLOT_CLIENT_BASE: u64 = 64;
 pub const NETD_SLOT_LINK_KICK_BASE: u64 = NETD_SLOT_CLIENT_BASE + MAX_PORTS as u64;
 
-/// Commands from l4h-root (host::mailbox), which netd carries out in order
-/// and does not answer: root has validated them, and keeps their state.
-/// Arguments are args[0..]; "MRn" below is args[n].  4, 5 and 10 are
-/// unused: netd publishes its counters and MACs instead (Published).
-/// MR0 = port, MR1 = switch, MR2 = MAC (low 48 bits), MR3 = flags.
-pub const NETD_ADD_PORT: u64 = 1;
+/// Flags of `add_port`.
 pub const NETD_PORT_MAC_LOCK: u64 = 1 << 0;
 pub const NETD_PORT_ISOLATED: u64 = 1 << 1;
-/// Root-selected dom0 port of the physical uplink. MR4 is its one
-/// additional allowed source MAC (0: none). Ordinary guests cannot set it.
+/// Root-selected dom0 port of the physical uplink, whose `alias` is its one
+/// additional allowed source MAC (0: none).  Ordinary guests cannot set it.
 pub const NETD_PORT_UPLINK: u64 = 1 << 2;
-/// MR0 = port.  netd no longer touches the port's memory, nor signals its
-/// client, once it has counted this done.
-pub const NETD_REMOVE_PORT: u64 = 2;
-/// MR0 = NIC, MR1 = switch.
-pub const NETD_ATTACH_UPLINK: u64 = 3;
-/// Steering (DESIGN.md §9.3).  Root allocates the ids and validates;
-/// netd checks bounds and that targets exist, and ignores a command that
-/// fails them.
-/// MR0 = endpoint, MR1 = switch, MR2 = MAC, MR3 = peer MAC.  Setting an
-/// endpoint with the same switch and MAC changes only its peer.
-pub const NETD_EP_SET: u64 = 6;
-/// MR0 = endpoint; deletes its rules too.
-pub const NETD_EP_DEL: u64 = 7;
-/// `host::TEST_INJECT` only: panic.
-pub const NETD_TEST_PANIC: u64 = 0x7e57;
-/// `host::TEST_INJECT` only: stop for good without failing, as a
-/// compromised netd might.
-pub const NETD_TEST_HANG: u64 = 0x7e58;
-/// MR0 = rule, MR1 = endpoint, MR2 = match (abi::CTL_STEER_SET args[1]),
-/// MR3 = IP bits 127-64, MR4 = IP bits 63-0, MR5 = target port mask.
-pub const NETD_STEER_SET: u64 = 8;
-/// MR0 = rule.
-pub const NETD_STEER_DEL: u64 = 9;
-/// MR0 = link, MR1 = switch, MR2 = channel size, MR3 = this partition,
-/// MR4 = the peer.  The channel is mapped at link_va(link) and the
-/// NETD_SLOT_LINK_* capabilities given.  Links last until the machine
-/// reboots.
-pub const NETD_ADD_LINK: u64 = 11;
+
+use crate::wire::RootOnly;
+
+crate::protocol! {
+    /// Commands from l4h-root (crate::mailbox, crate::wire::protocol),
+    /// which netd carries out in order.  Root has validated them, keeps
+    /// their state, and reads only the answers' count: they are done.
+    /// Labels 4, 5 and 10 are unused: netd publishes its counters and MACs
+    /// instead (Published).
+    pub mod call (from: RootOnly) {
+        /// Port `port` on `switch`, with MAC `mac` (low 48 bits) and
+        /// NETD_PORT_* `flags`.
+        AddPort / add_port = 1 from [Root] (port: usize, switch: usize, mac: u64, flags: u64, alias: u64) -> ();
+        /// netd no longer touches the port's memory, nor signals its
+        /// client, once it has counted this done.
+        RemovePort / remove_port = 2 from [Root] (port: usize) -> ();
+        AttachUplink / attach_uplink = 3 from [Root] (nic: usize, switch: usize) -> ();
+        /// Steering (DESIGN.md §9.3).  Root allocates the ids and
+        /// validates; netd checks bounds and that targets exist, and
+        /// ignores a command that fails them.  Setting an endpoint with the
+        /// same switch and MAC changes only its peer.
+        EpSet / ep_set = 6 from [Root] (ep: usize, switch: usize, mac: u64, peer: u64) -> ();
+        /// Delete an endpoint, and its rules.
+        EpDel / ep_del = 7 from [Root] (ep: usize) -> ();
+        /// `matches` is abi::CTL_STEER_SET's args[1]; `targets` a port mask.
+        SteerSet / steer_set = 8 from [Root] (rule: usize, ep: usize, matches: u64, ip_hi: u64, ip_lo: u64, targets: u64) -> ();
+        SteerDel / steer_del = 9 from [Root] (rule: usize) -> ();
+        /// Link `link` to partition `peer`, on `switch`, with a channel of
+        /// `size` bytes mapped at link_va(link) and the NETD_SLOT_LINK_*
+        /// capabilities given.  Links last until the machine reboots.
+        AddLink / add_link = 11 from [Root] (link: usize, switch: usize, size: u64, me: u32, peer: u32) -> ();
+        /// `crate::TEST_INJECT` only: panic.
+        TestPanic / test_panic = 0x7e57 from [Root] () -> ();
+        /// `crate::TEST_INJECT` only: stop for good without failing, as a
+        /// compromised netd might.
+        TestHang / test_hang = 0x7e58 from [Root] () -> ();
+    }
+}
+const _: () = assert!(call::Request::MAX_WORDS <= crate::mailbox::ARGS
+    && call::Request::MAX_REPLY_WORDS <= crate::mailbox::ANSWER);
+
 /// Endpoints and rules netd holds.
 pub const MAX_STEER_ENDPOINTS: usize = 16;
 pub const MAX_STEER_RULES: usize = 128;
@@ -229,9 +235,7 @@ pub struct NetdConfig {
 const _: () = assert!(PORT_PAGES * 4096 <= 0x40_0000 - 0x1_0000);
 const _: () = assert!(port_va(MAX_PORTS) <= link_va(0) && link_va(MAX_LINKS) <= crate::MMIO_VA);
 const _: () = assert!(
-    NETD_BADGE_IRQ_SHIFT as usize + MAX_NICS <= NETD_BADGE_LINK_SHIFT as usize
-        && NETD_BADGE_LINK_SHIFT as usize + MAX_LINKS <= crate::mailbox::BADGE_CALL.trailing_zeros() as usize
-        && NETD_SLOT_IOPORT_BASE as usize + MAX_NICS <= NETD_SLOT_LINK_IRQ_BASE as usize
+    NETD_SLOT_IOPORT_BASE as usize + MAX_NICS <= NETD_SLOT_LINK_IRQ_BASE as usize
         && NETD_SLOT_LINK_IRQ_BASE as usize + MAX_LINKS <= NETD_SLOT_LINK_RING_BASE as usize
         && NETD_SLOT_LINK_RING_BASE as usize + MAX_LINKS <= NETD_SLOT_CLIENT_BASE as usize
         && NETD_SLOT_LINK_KICK_BASE as usize + MAX_LINKS <= 1 << crate::CNODE_BITS

@@ -22,9 +22,9 @@ pub const PUBLISHED_OFFSET: usize = 2 * 4096;
 const _: () = assert!(MAILBOX_VA >= crate::serial::VA + crate::serial::PAGES * 4096
     && MAILBOX_VA + MAILBOX_PAGES * 4096 < crate::KEEPER_STACK_TOP - crate::KEEPER_STACK_SIZE);
 
-/// Badge bit of root's requests on the driver's notification (above every
-/// blkd, netd and usbd notification badge).
-pub const BADGE_CALL: u64 = 1 << 62;
+/// Badge bit of root's requests on the driver's notification
+/// (badges::driver, which every driver's space includes).
+pub const BADGE_CALL: u64 = crate::badges::driver::CALL;
 
 /// The driver's capability to signal root that it answered.
 pub const SLOT_MAILBOX_DONE: u64 = 11;

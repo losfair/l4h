@@ -7,7 +7,7 @@
 //! handed to the device by physical address: the device reads and writes
 //! the pool directly, never guest RAM (the guest bounces through the pool
 //! with swiotlb).  blkd alone decides which clients may use which sectors
-//! (blk::Reservations); l4h-root asks with BLKD_CHECK.  See DESIGN.md §9.2.
+//! (blk::Reservations); l4h-root asks with `blk::call::check`.  See DESIGN.md §9.2.
 
 #![no_std]
 #![no_main]
@@ -23,6 +23,7 @@ use core::sync::atomic::{Ordering, fence};
 use l4h_rt::host;
 use l4h_rt::host::blk::{self, BlkdConfig, Channel, Pool};
 use l4h_rt::host::fixed::ArrayVec;
+use l4h_rt::host::wire::RootOnly;
 use l4h_rt::sel4;
 use l4h_rt::{Info, cap};
 use sel4::cap_type;
@@ -155,7 +156,7 @@ fn finish(pending: &mut [Option<Pending>], clients: &mut [Option<Client>], t: us
 static mut CLIENTS: [Option<Client>; blk::MAX_CLIENTS] = [const { None }; blk::MAX_CLIENTS];
 /// dom0's boot ranges, in the same slots.
 static mut RESERVED: blk::Reservations<{ blk::MAX_CLIENTS }> = blk::Reservations::new();
-/// Where BLKD_CHECK builds the disk it checks.
+/// Where `check` builds the disk it checks.
 static mut SCRATCH_ORDER: [u16; blk::MAX_EXTENTS] = [0; blk::MAX_EXTENTS];
 static mut SCRATCH_EXTENTS: [blk::Extent; blk::MAX_EXTENTS] =
     [blk::Extent { start: 0, sectors: 0, offset: 0 }; blk::MAX_EXTENTS];
@@ -393,8 +394,100 @@ impl Blkd {
     }
 }
 
-fn mr(i: usize) -> u64 { sel4::with_ipc_buffer(|b| b.msg_regs()[i]) }
-fn set_mr(i: usize, v: u64) { sel4::with_ipc_buffer_mut(|b| b.msg_regs_mut()[i] = v); }
+/// Root's requests, as l4h_host::blk::call declares them.  Arguments and
+/// answers never pass through the message registers, which legacy virtio
+/// kicks (IOPort invocations) overwrite.
+struct Requests<'a> {
+    b: &'a mut Blkd,
+    cfg: &'a BlkdConfig,
+    order: &'a mut [u16; blk::MAX_EXTENTS],
+    extents: &'a mut [blk::Extent; blk::MAX_EXTENTS],
+}
+
+impl blk::call::Server for Requests<'_> {
+    fn add(&mut self, _: RootOnly, i: usize, unit: usize, dom0: bool, n: usize) -> Result<(), u64> {
+        let b = &mut *self.b;
+        if i >= blk::MAX_CLIENTS || b.clients[i].is_some() || unit >= b.dev.len() || n > blk::MAX_EXTENTS {
+            return Err(blk::EINVAL);
+        }
+        let dev = b.dev[unit];
+        let chan = blk::channel_va(i) as *mut Channel;
+        let (start, count, ro, volatile, pool) = unsafe {
+            (addr_of!((*chan).lba_start).read_volatile(), addr_of!((*chan).capacity_sectors).read_volatile(),
+             addr_of!((*chan).read_only).read_volatile(), addr_of!((*chan).volatile).read_volatile() != 0,
+             addr_of!((*chan).pool).read_volatile())
+        };
+        // Root mapped table_pages(n.max(1)) of the client's table for blkd
+        // alone; they stay until `remove`.
+        let table = blk::extent_va(i) as *mut blk::ExtentTable;
+        let (order, extents) = unsafe {
+            (core::slice::from_raw_parts_mut(addr_of_mut!((*table).order).cast(), n.max(1)),
+             core::slice::from_raw_parts_mut(addr_of_mut!((*table).extents).cast(), n.max(1)))
+        };
+        // Exactly what `check` allowed: root serializes checks and
+        // attachments.
+        match b.check(self.cfg, unit, start, count, n, ro != 0, dom0, order, extents) {
+            Ok((slot, vol, read_only)) if slot == i => {
+                b.clients[i] = Some(Client { chan, unit, pool, vol, read_only, volatile,
+                    done: cap::<cap_type::Notification>(blk::BLKD_SLOT_CLIENT_DONE + i as u64), outstanding: 0, notify_pending: false });
+                // Not attached yet, so not in active.
+                let _ = b.active.push(i);
+                unsafe {
+                    addr_of_mut!((*chan).capacity_sectors).write_volatile(vol.sectors());
+                    addr_of_mut!((*chan).read_only).write_volatile(read_only as u32);
+                    addr_of_mut!((*chan).block_size).write_volatile(dev.block_size);
+                    fence(Ordering::Release);
+                    addr_of_mut!((*chan).ready).write_volatile(1);
+                }
+                Ok(())
+            }
+            _ => Err(blk::EINVAL),
+        }
+    }
+
+    fn remove(&mut self, _: RootOnly, client: usize) -> Result<(), u64> {
+        if self.b.remove(client) == 0 { Ok(()) } else { Err(blk::EBUSY) }
+    }
+
+    fn write(&mut self, _: RootOnly, sector: u64, length: usize, unit: usize) -> Result<u64, u64> {
+        self.b.provision(self.cfg, unit, sector, length, false)
+    }
+
+    fn flush(&mut self, _: RootOnly, unit: usize) -> Result<u64, u64> {
+        self.b.provision(self.cfg, unit, 0, 0, true)
+    }
+
+    fn reserve(&mut self, _: RootOnly, unit: usize, start: u64, sectors: u64, read_only: bool) -> Result<usize, u64> {
+        // Boot ranges may lie beyond an unknown or unaligned capacity:
+        // they keep sectors from others, never address them.
+        match blk::DiskWindow::new(start, sectors, u64::MAX & !7) {
+            Some(window) if sectors != 0 && unit < blk::MAX_UNITS => {
+                let r = blk::Reserved { unit, window, read_only };
+                let b = &mut *self.b;
+                b.reserved.reserve(&holds(&b.clients[..]), r)
+            }
+            _ => Err(blk::EINVAL),
+        }
+    }
+
+    fn check(&mut self, _: RootOnly, unit: usize, start: u64, sectors: u64, read_only: bool, dom0: bool, n: usize)
+        -> Result<blk::Checked, u64> {
+        let (slot, vol, read_only) = self.b.check(self.cfg, unit, start, sectors, n, read_only, dom0, self.order, self.extents)?;
+        Ok(blk::Checked { slot, sectors: vol.sectors(), read_only })
+    }
+
+    fn extent(&mut self, _: RootOnly, client: usize, k: usize) -> Result<(u64, u64), u64> {
+        let e = self.b.clients.get(client).and_then(|c| c.as_ref()?.vol.nth(k)).ok_or(blk::EINVAL)?;
+        Ok((e.start, e.sectors))
+    }
+
+    fn test_hang(&mut self, _: RootOnly) -> Result<(), u64> {
+        if host::TEST_INJECT {
+            l4h_rt::test_hang();
+        }
+        Err(blk::EINVAL)
+    }
+}
 
 fn main(info: &'static Info) -> ! {
     let cfg: &BlkdConfig = unsafe { info.config() };
@@ -444,105 +537,17 @@ fn main(info: &'static Info) -> ! {
     loop {
         b.reap();
         b.submit();
-        if badge & blk::BLKD_BADGE_IRQ != 0 { irq.irq_handler_ack().expect("blkd IRQ ack"); }
+        if badge & host::badges::blkd::IRQ != 0 { irq.irq_handler_ack().expect("blkd IRQ ack"); }
         // Root's requests (host::mailbox), even if their signal was
         // coalesced.
-        let mut answered = false;
-        while let Some(label) = l4h_rt::mailbox::request() {
-            let mut response = [0; 5];
-            let result = match label {
-                blk::BLKD_ADD => {
-                    let (i, unit, dom0, n) = (mr(0) as usize, mr(1) as usize, mr(2) != 0, mr(3) as usize);
-                    if i >= blk::MAX_CLIENTS || b.clients[i].is_some() || unit >= b.dev.len() || n > blk::MAX_EXTENTS { u64::MAX } else {
-                        let dev = b.dev[unit];
-                        let chan = blk::channel_va(i) as *mut Channel;
-                        let (start, count, ro, volatile, pool) = unsafe {
-                            (addr_of!((*chan).lba_start).read_volatile(), addr_of!((*chan).capacity_sectors).read_volatile(),
-                             addr_of!((*chan).read_only).read_volatile(), addr_of!((*chan).volatile).read_volatile() != 0,
-                             addr_of!((*chan).pool).read_volatile())
-                        };
-                        // Root mapped table_pages(n.max(1)) of the client's
-                        // table for blkd alone; they stay until BLKD_REMOVE.
-                        let table = blk::extent_va(i) as *mut blk::ExtentTable;
-                        let (order, extents) = unsafe {
-                            (core::slice::from_raw_parts_mut(addr_of_mut!((*table).order).cast(), n.max(1)),
-                             core::slice::from_raw_parts_mut(addr_of_mut!((*table).extents).cast(), n.max(1)))
-                        };
-                        // Exactly what BLKD_CHECK allowed: root serializes
-                        // checks and attachments.
-                        match b.check(cfg, unit, start, count, n, ro != 0, dom0, order, extents) {
-                            Ok((slot, vol, read_only)) if slot == i => {
-                                b.clients[i] = Some(Client { chan, unit, pool, vol, read_only, volatile,
-                                    done: cap::<cap_type::Notification>(blk::BLKD_SLOT_CLIENT_DONE + i as u64), outstanding: 0, notify_pending: false });
-                                // Not attached yet, so not in active.
-                                let _ = b.active.push(i);
-                                unsafe {
-                                    addr_of_mut!((*chan).capacity_sectors).write_volatile(vol.sectors());
-                                    addr_of_mut!((*chan).read_only).write_volatile(read_only as u32);
-                                    addr_of_mut!((*chan).block_size).write_volatile(dev.block_size);
-                                    fence(Ordering::Release);
-                                    addr_of_mut!((*chan).ready).write_volatile(1);
-                                }
-                                0
-                            }
-                            _ => u64::MAX,
-                        }
-                    }
-                }
-                blk::BLKD_REMOVE => b.remove(mr(0) as usize),
-            blk::BLKD_TEST_HANG if host::TEST_INJECT => l4h_rt::test_hang(),
-                blk::BLKD_RESERVE => {
-                    // Boot ranges may lie beyond an unknown or unaligned
-                    // capacity: they keep sectors from others, never address them.
-                    match blk::DiskWindow::new(mr(1), mr(2), u64::MAX & !7) {
-                        Some(window) if mr(2) != 0 && (mr(0) as usize) < blk::MAX_UNITS => {
-                            let r = blk::Reserved { unit: mr(0) as usize, window, read_only: mr(3) != 0 };
-                            b.reserved.reserve(&holds(&b.clients[..]), r).map_or(u64::MAX, |i| i as u64)
-                        }
-                        _ => u64::MAX,
-                    }
-                }
-                blk::BLKD_CHECK => {
-                    let (order, extents) = (&mut *scratch_order, &mut *scratch_extents);
-                    match b.check(cfg, mr(0) as usize, mr(1), mr(2), mr(5) as usize, mr(3) != 0, mr(4) != 0, order, extents) {
-                        Ok((slot, vol, read_only)) => {
-                            response[1] = slot as u64;
-                            response[2] = vol.sectors();
-                            response[3] = read_only as u64;
-                            0
-                        }
-                        Err(errno) => errno,
-                    }
-                }
-                blk::BLKD_EXTENT => match b.clients.get(mr(0) as usize).and_then(|c| c.as_ref()?.vol.nth(mr(1) as usize)) {
-                    Some(e) => {
-                        response[1] = e.start;
-                        response[2] = e.sectors;
-                        0
-                    }
-                    None => u64::MAX,
-                },
-                blk::BLKD_WRITE | blk::BLKD_FLUSH => {
-                    let flush = label == blk::BLKD_FLUSH;
-                    let r = if flush { b.provision(cfg, mr(0) as usize, 0, 0, true) }
-                        else { b.provision(cfg, mr(2) as usize, mr(0), mr(1) as usize, false) };
-                    r.unwrap_or_else(|errno| {
-                        response[1] = errno;
-                        blk::BLKD_REFUSED
-                    })
-                }
-                _ => u64::MAX,
-            };
-            response[0] = result;
+        let answered = l4h_rt::mailbox::serve(|label, args, out| {
+            let mut req = Requests { b: &mut b, cfg, order: &mut *scratch_order, extents: &mut *scratch_extents };
+            let n = blk::call::serve(&mut req, label, args, RootOnly::Root, out);
             // Service calls can have reaped completions while polling. A kick
             // may have been coalesced, so always revisit all pending channels.
             b.submit();
-            // Legacy virtio kicks invoke IOPort capabilities and overwrite MRs.
-            // Marshal the whole reply only after that work has finished.
-            for (i, v) in response.into_iter().enumerate() { set_mr(i, v); }
-            l4h_rt::mailbox::answer(5);
-            answered = true;
-        }
+            n
+        });
         if answered { l4h_rt::mailbox::signal(); }
         (_, badge) = ep.recv(reply);
     }
