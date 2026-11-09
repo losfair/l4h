@@ -1532,14 +1532,16 @@ grow and shrink without going through `l4h-root`.
   can fill the CNode.
 - **Clients.** memd calls no one. Its calls, and which caller may make
   each, are declared in `l4h_host::memd::call` (§10, "Wiring declarations").
-  Root holds memd's CNode and passes
-  Untypeds by moving them into memd's exchange slots. vmmgr, with a badge of
-  its own (`Sender::Vmmgr`), gets memory for itself and guests' RAM; memd is
-  more trusted than vmmgr, so they share a small mailbox CNode instead, memd
-  keeps the original of every block it grants vmmgr and gives a copy, and
-  freeing a grant revokes the original, so a mislabelled capability in the
-  mailbox cannot confuse memd's table. memd empties a mailbox slot before
-  writing one. VMMs call it, badged as `Sender::Vmm(guest)`, for their guest's
+  Each call's capabilities cross in the caller's exchange area, at the
+  slots the call declares (`call::caps`). Root holds memd's CNode, and its
+  area is slots of memd's (`SLOT_XCHG`), into which it moves Untypeds. vmmgr,
+  with a badge of its own (`Sender::Vmmgr`), gets memory for itself and
+  guests' RAM; memd is more trusted than vmmgr, so vmmgr's area is a small
+  CNode the two share (`SLOT_XCHG_CNODE`) instead, memd keeps the original
+  of every block it grants vmmgr and gives a copy, and freeing a grant
+  revokes the original, so a mislabelled capability in the area cannot
+  confuse memd's table. memd empties a slot of the area before writing
+  one. VMMs call it, badged as `Sender::Vmm(guest)`, for their guest's
   hotplug operations only (§8.5); root mints those endpoints, since vmmgr's
   own badged one cannot be minted again.
 - **Grants.** When a client's free blocks cannot meet a request, it takes an

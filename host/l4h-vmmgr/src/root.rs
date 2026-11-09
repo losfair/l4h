@@ -14,6 +14,11 @@ use l4h_host as host;
 use l4h_host::fixed::ArrayVec;
 use l4h_host::trust;
 use l4h_host::root::{Vals, call::Client};
+/// What root's calls pass in our exchange area.
+mod caps {
+    pub use l4h_host::root::call::XCHG;
+    pub use l4h_host::root::call::caps::*;
+}
 use l4h_host::vmmgr as proto;
 use l4h_ipc::Endpoint;
 
@@ -46,11 +51,13 @@ pub fn discard(token: usize) {
     let _ = result(token);
 }
 
+/// Slot `i` of our exchange area with root (root::call::XCHG).
 fn xchg(i: usize) -> sel4::AbsoluteCPtr {
+    assert!(i < caps::XCHG);
     abs_of(sel4::Cap::<cap_type::Null>::from_bits(proto::SLOT_XCHG + i as u64))
 }
 
-/// Move what root put in exchange slot `i` to a slot of ours.
+/// Move what root put in slot `i` of our exchange area to a slot of ours.
 fn take<T: sel4::CapType>(alloc: &mut Alloc, i: usize) -> sel4::Cap<T> {
     let s = alloc.slots.alloc();
     let to = sel4::Cap::<T>::from_bits(s as u64);
@@ -74,9 +81,10 @@ pub struct NewGuest {
 pub fn guest_new(alloc: &mut Alloc, id: usize, pool: usize, pool_gpa: usize, dom0: bool) -> Result<NewGuest, Errno> {
     let new = errno(root().guest_new(id, pool, pool_gpa, dom0))?;
     let (instance, attest) = (new.instance, new.attest);
-    let pool_frames = take(alloc, 0);
-    let vmm_ntfn = take(alloc, 3);
-    let attest = attest.then(|| (take(alloc, 1), take(alloc, 2)));
+    use caps::guest_new::{ATTEST_KICK, ATTEST_PAGE, POOL_FRAMES, VMM_NTFN};
+    let pool_frames = take(alloc, POOL_FRAMES.first);
+    let vmm_ntfn = take(alloc, VMM_NTFN.first);
+    let attest = attest.then(|| (take(alloc, ATTEST_PAGE.first), take(alloc, ATTEST_KICK.first)));
     Ok(NewGuest { instance, pool_frames, vmm_ntfn, attest })
 }
 
@@ -108,9 +116,9 @@ pub fn disk_attach_result(alloc: &mut Alloc, token: usize) -> Result<Backend, Er
 fn disk_backend(alloc: &mut Alloc) -> Backend {
     let mut chan = ArrayVec::new();
     for i in 0..host::blk::CHANNEL_PAGES {
-        chan.must_push(take(alloc, i));
+        chan.must_push(take(alloc, caps::disk_attach::CHANNEL.slot(i)));
     }
-    let kick = take(alloc, host::blk::CHANNEL_PAGES);
+    let kick = take(alloc, caps::disk_attach::KICK.first);
     Backend::Blk { chan, kick }
 }
 
@@ -120,8 +128,8 @@ fn disk_backend(alloc: &mut Alloc) -> Backend {
 pub fn nic_add(alloc: &mut Alloc, arena: &mut Arena, id: usize, d: usize, switch: u32, mac: u64, lock: bool, isolated: bool) -> Result<Backend, Errno> {
     let keep = arena.try_object(alloc, sel4::ObjectBlueprint::CNode { size_bits: proto::PORT_RADIX }).ok_or(ctl::ENOMEM)?;
     let mac = errno(root().nic_add(id, d, switch, mac, lock, isolated))?.to_be_bytes();
-    let chan = take(alloc, 0);
-    let kick = take(alloc, 1);
+    let chan = take(alloc, caps::nic_add::PORT_FRAMES.first);
+    let kick = take(alloc, caps::nic_add::KICK.first);
     Ok(Backend::Net { chan, kick, mac: mac[2..8].try_into().unwrap(), keep: sel4::Cap::from_bits(keep as u64) })
 }
 
@@ -129,7 +137,7 @@ pub fn nic_add(alloc: &mut Alloc, arena: &mut Arena, id: usize, d: usize, switch
 /// queue area's frames, usbd's kick, and the guest's USB number.
 pub fn usb_attach(alloc: &mut Alloc, id: usize, d: usize, ctrl: usize) -> Result<(cap::CNode, cap::Notification, usize), Errno> {
     let n = errno(root().usb_attach(id, d, ctrl))? as usize;
-    Ok((take(alloc, 0), take(alloc, 1), n))
+    Ok((take(alloc, caps::usb_attach::QUEUE_FRAMES.first), take(alloc, caps::usb_attach::KICK.first), n))
 }
 
 /// Guest `g` starts: its reports describe it from now on.

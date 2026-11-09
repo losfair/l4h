@@ -25,8 +25,8 @@ pub const CNODE_BITS: usize = 18;
 ///
 /// memd's service endpoint, badged as memd::Sender::Vmmgr.
 pub const SLOT_MEMD_EP: u64 = 16;
-/// The mailbox CNode it shares with memd (memd::MAILBOX_*).
-pub const SLOT_MEMD_MAILBOX: u64 = 17;
+/// Its exchange area with memd: the CNode the two share (memd::XCHG_RADIX).
+pub const SLOT_MEMD_XCHG: u64 = 17;
 /// trustd's flags service, badged as trust::Sender::Root: ACT for the host
 /// bits of the console.
 pub const SLOT_FLAGS_EP: u64 = 18;

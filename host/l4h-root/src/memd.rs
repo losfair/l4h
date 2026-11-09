@@ -50,7 +50,7 @@ fn link(alloc: &Alloc) -> MemdLink {
 }
 
 /// Give vmmgr its capabilities to memd: its endpoint (badged as
-/// Sender::Vmmgr), the mailbox it shares with memd, and an endpoint for
+/// Sender::Vmmgr), the exchange area it shares with memd, and an endpoint for
 /// each guest's l4h-vmm (badged as Sender::Vmm), which vmmgr cannot mint.
 pub fn give_vmmgr(alloc: &mut Alloc, arena: &mut Arena, vmmgr: &Component) {
     use l4h_host::vmmgr as proto;
@@ -60,9 +60,9 @@ pub fn give_vmmgr(alloc: &mut Alloc, arena: &mut Arena, vmmgr: &Component) {
     for g in 0..memd::MAX_GUESTS {
         vmmgr.give_badged(proto::SLOT_VMM_MEMD_EP + g as u64, m.endpoint(), call.clone(), Sender::Vmm(g).badge());
     }
-    let mailbox = arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: memd::MAILBOX_RADIX });
-    vmmgr.give(proto::SLOT_MEMD_MAILBOX, mailbox, CapRights::all());
-    m.slot(memd::SLOT_MAILBOX).copy(&abs_of(mailbox), CapRights::all()).expect("memd: vmmgr mailbox");
+    let area = arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: memd::XCHG_RADIX });
+    vmmgr.give(proto::SLOT_MEMD_XCHG, area, CapRights::all());
+    m.slot(memd::SLOT_XCHG_CNODE).copy(&abs_of(area), CapRights::all()).expect("memd: vmmgr exchange area");
 }
 
 /// memd, as l4h-root keeps it.

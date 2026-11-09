@@ -2,8 +2,8 @@
 //! vmmgr make to it, which share its labels.  Their faults arrive there
 //! too (badges::root::FAULT) and are no call.
 //!
-//! vmmgr's calls pass capabilities in its exchange slots
-//! (vmmgr::SLOT_XCHG), which the calls below name.  A call that waits for
+//! vmmgr's calls pass capabilities in its exchange area (vmmgr::SLOT_XCHG,
+//! XCHG_SLOTS of them), as each call declares (`call::caps`).  A call that waits for
 //! a driver, which root never does in a call, is answered later
 //! (Later::Token): root sets the token's bit in vmmgr::Events::ops_done
 //! and signals badges::vmmgr::ROOT_EVENT once it has the answer, which
@@ -88,7 +88,7 @@ crate::wire_struct! {
 crate::protocol! {
     /// The calls on root's endpoint.  A reply's first word is 0 or an
     /// errno (abi CTL errnos), its value follows.
-    pub mod call (from: Sender) {
+    pub mod call (from: Sender, xchg: crate::vmmgr::XCHG_SLOTS) {
         /// An access the firmware's AML makes outside trustd's own ranges
         /// (trust::HW_*): `addr` is a physical address, I/O port or PCI
         /// function (bus << 8 | device << 3 | function), `off` a PCI config
@@ -106,11 +106,16 @@ crate::protocol! {
 
         /// Make guest `guest`'s I/O pool, `pool` bytes (a power of two) at
         /// `gpa`, and its l4h-vmm's notification, which backends signal
-        /// (root's, so that it is one).  Exchange slot 0 = the CNode of
-        /// the pool's frames (radix: the pool's pages), slot 3 = the
-        /// notification, and with an attestation device slot 1 its page and
-        /// slot 2 its kick capability (badged).
-        GuestNew / guest_new = 0x100 from [Vmmgr] (guest: usize, pool: usize, gpa: usize, dom0: bool) -> NewGuest;
+        /// (root's, so that it is one): the CNode of the pool's frames
+        /// (radix: the pool's pages), the notification, and with an
+        /// attestation device its page and kick capability (badged).
+        GuestNew / guest_new = 0x100 from [Vmmgr] (guest: usize, pool: usize, gpa: usize, dom0: bool)
+            caps {
+                Out POOL_FRAMES: CNode [0; 1],
+                Out ATTEST_PAGE: Granule [1; 1],
+                Out ATTEST_KICK: Notification [2; 1],
+                Out VMM_NTFN: Notification [3; 1],
+            } -> NewGuest;
         /// The guest is stopped and torn down by vmmgr: drain its disks,
         /// remove its ports, forget it in trustd, revoke its pool.  The
         /// bytes of pool kept out of use (a disk could not be stopped).
@@ -119,14 +124,19 @@ crate::protocol! {
         /// `flags`: sectors [lba_start, lba_start + lba_count) of it (0: to
         /// the end), or if n is not 0 the n extents (start, sectors) at
         /// offset `list` of dom0's control data area, which blkd reads (root
-        /// copies them unread).  Exchange slots [0, blk::CHANNEL_PAGES) = the
-        /// channel frames, the next = blkd's kick.  Answered later.
+        /// copies them unread).  The channel's frames and blkd's kick, with
+        /// the answer, which comes later (`result`).
         DiskAttach / disk_attach = 0x102 from [Vmmgr]
-            (guest: usize, dev: usize, disk: usize, flags: u64, lba_start: u64, lba_count: u64, n: usize, list: u64) -> Later<()>;
+            (guest: usize, dev: usize, disk: usize, flags: u64, lba_start: u64, lba_count: u64, n: usize, list: u64)
+            caps {
+                Out CHANNEL: Granule [0; crate::blk::CHANNEL_PAGES],
+                Out KICK: Notification [crate::blk::CHANNEL_PAGES; 1],
+            } -> Later<()>;
         /// A port of `switch` for the guest's device `dev`, with MAC `mac`
-        /// (0: choose).  Exchange slot 0 = the CNode of the port's frames
-        /// (radix vmmgr::PORT_RADIX), slot 1 = netd's kick.  The MAC.
-        NicAdd / nic_add = 0x103 from [Vmmgr] (guest: usize, dev: usize, switch: u32, mac: u64, lock: bool, isolated: bool) -> u64;
+        /// (0: choose): the CNode of the port's frames (radix
+        /// vmmgr::PORT_RADIX) and netd's kick.  The MAC.
+        NicAdd / nic_add = 0x103 from [Vmmgr] (guest: usize, dev: usize, switch: u32, mac: u64, lock: bool, isolated: bool)
+            caps { Out PORT_FRAMES: CNode [0; 1], Out KICK: Notification [1; 1] } -> u64;
         /// The guest starts, with `ram` bytes, `vcpus` and its launch
         /// digest: its reports describe it from now on.  Whether it is
         /// dom0 is root's to say.
@@ -137,17 +147,17 @@ crate::protocol! {
         /// CTL_BLK_WRITE.  BLK_WRITE and BLK_INFO are answered later.
         HostOp / host_op = 0x105 from [Vmmgr] (op: u32, args: [u64; 6]) -> Later<Vals>;
         /// The answer of a request answered later, which frees its token:
-        /// as the request would have given it (exchange slots too).
+        /// as the request would have given it, its capabilities too.
         /// EAGAIN if root has not answered yet.
         Result / result = 0x106 from [Vmmgr] (token: usize) -> Vals;
         /// USB controller `ctrl` (CTL_USB_INFO index) for the guest's
         /// device `dev`.  Root claims it if the firmware still has it (a
         /// claim posted to its usbd, not waited for), and makes the queue
-        /// area.  Exchange slot 0 = the CNode of its frames (radix
-        /// vmmgr::USB_QUEUE_RADIX in root), slot 1 = usbd's kick.  The
-        /// guest's USB number n: the VMM raises the device's event on
-        /// badges::vmm::USB bit n.
-        UsbAttach / usb_attach = 0x107 from [Vmmgr] (guest: usize, dev: usize, ctrl: usize) -> u64;
+        /// area: the CNode of its frames (radix vmmgr::USB_QUEUE_RADIX in
+        /// root) and usbd's kick.  The guest's USB number n: the VMM raises
+        /// the device's event on badges::vmm::USB bit n.
+        UsbAttach / usb_attach = 0x107 from [Vmmgr] (guest: usize, dev: usize, ctrl: usize)
+            caps { Out QUEUE_FRAMES: CNode [0; 1], Out KICK: Notification [1; 1] } -> u64;
     }
 }
 

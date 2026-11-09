@@ -356,8 +356,9 @@ fn map_in_root(h: &mut Host, f: cap::Granule, va: usize, rights: CapRights) {
     });
 }
 
-/// Exchange slot `i` of vmmgr's, emptied for root to put a capability in:
-/// whatever vmmgr left there must not make root fail.
+/// Slot `i` of vmmgr's exchange area (root_call::XCHG), emptied for root
+/// to put a capability in: whatever vmmgr left there must not make root
+/// fail.
 fn xchg(h: &Host, i: usize) -> sel4::AbsoluteCPtr {
     let s = h.vmmgr.as_ref().expect("vmmgr").comp.slot(proto::SLOT_XCHG + i as u64);
     let _ = s.delete();
@@ -492,10 +493,11 @@ fn result(h: &mut Host, token: usize) -> Result<Vals, Errno> {
     match op.take().unwrap().done.unwrap()? {
         OpResult::Vals(vals) => Ok(vals),
         OpResult::Disk { chan, kick } => {
+            use root_call::caps::disk_attach::{CHANNEL, KICK};
             for (i, f) in chan.iter().enumerate() {
-                xchg(h, i).copy(&abs_of(*f), CapRights::all()).expect("vmmgr channel frame");
+                xchg(h, CHANNEL.slot(i)).copy(&abs_of(*f), CapRights::all()).expect("vmmgr channel frame");
             }
-            xchg(h, chan.len()).move_(&abs_of(kick)).expect("vmmgr blkd kick");
+            xchg(h, KICK.first).move_(&abs_of(kick)).expect("vmmgr blkd kick");
             h.alloc.slots.free(kick.bits() as Slot);
             Ok(Vals::new())
         }
@@ -587,9 +589,10 @@ fn guest_new(h: &mut Host, id: usize, size: usize, gpa: usize, dom0: bool) -> Re
         arena.own(pool_slot, paddr, bits);
         let frames = arena.object_cap::<cap_type::CNode>(&mut h.alloc, ObjectBlueprint::CNode { size_bits: radix });
         region.retype(&FRAME_BP, size / PAGE, Dest { cnode: abs_of(frames), offset: 0 }).expect("I/O pool frames");
-        xchg(h, 0).copy(&abs_of(frames), CapRights::all()).expect("vmmgr pool frames");
-        xchg(h, 3).copy(&abs_of(vmm_ntfn), CapRights::all()).expect("vmmgr VMM notification");
-        let (page, kick) = (xchg(h, 1), xchg(h, 2));
+        use root_call::caps::guest_new::{ATTEST_KICK, ATTEST_PAGE, POOL_FRAMES, VMM_NTFN};
+        xchg(h, POOL_FRAMES.first).copy(&abs_of(frames), CapRights::all()).expect("vmmgr pool frames");
+        xchg(h, VMM_NTFN.first).copy(&abs_of(vmm_ntfn), CapRights::all()).expect("vmmgr VMM notification");
+        let (page, kick) = (xchg(h, ATTEST_PAGE.first), xchg(h, ATTEST_KICK.first));
         let attest = match &h.trustd {
             Some(t) => t.give(id, &mut h.wins.a, &page, &kick),
             None => false,
@@ -740,8 +743,9 @@ fn nic_add(h: &mut Host, id: usize, dev: usize, switch: u32, mac: u64, lock: boo
         let memory = crate::netd::Netd::port_memory(&mut h.alloc)?;
         let (chan, kick) = h.netd.add_port(g, p, switch, mac, lock, isolated, memory, &mut h.alloc);
         g.ports.must_push(p);
-        xchg(h, 0).copy(&abs_of(chan), CapRights::all()).expect("vmmgr port frames");
-        xchg(h, 1).move_(&abs_of(kick)).expect("vmmgr port kick");
+        use root_call::caps::nic_add::{KICK, PORT_FRAMES};
+        xchg(h, PORT_FRAMES.first).copy(&abs_of(chan), CapRights::all()).expect("vmmgr port frames");
+        xchg(h, KICK.first).move_(&abs_of(kick)).expect("vmmgr port kick");
         h.alloc.slots.free(kick.bits() as Slot);
         Ok(mac)
     })
@@ -759,8 +763,9 @@ fn usb_attach(h: &mut Host, id: usize, dev: usize, ctrl: usize) -> Result<u64, E
     with_guest(h, id, |h, g| {
         let n = g.usbs.len();
         let att = crate::usb::attach(h, ctrl, g)?;
-        xchg(h, 0).copy(&abs_of(att.frames), CapRights::all()).expect("vmmgr USB queue frames");
-        xchg(h, 1).move_(&abs_of(att.kick)).expect("vmmgr usbd kick");
+        use root_call::caps::usb_attach::{KICK, QUEUE_FRAMES};
+        xchg(h, QUEUE_FRAMES.first).copy(&abs_of(att.frames), CapRights::all()).expect("vmmgr USB queue frames");
+        xchg(h, KICK.first).move_(&abs_of(att.kick)).expect("vmmgr usbd kick");
         crate::usb::free_slot(h, att.kick);
         Ok(n as u64)
     })

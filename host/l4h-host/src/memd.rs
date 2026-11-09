@@ -4,9 +4,10 @@
 //!
 //! memd's CSpace is one CNode of 2^cnode_bits slots (MemdConfig), with a
 //! slot for every block it can hold (`block_slots`).  l4h-root holds a
-//! capability to it, and passes Untypeds by moving them into the exchange
-//! slots below.  vmmgr passes them through its mailbox (SLOT_MAILBOX).
-//! memd never calls either.
+//! capability to it.  A call's capabilities cross in the caller's
+//! exchange area (`call::XCHG` slots; each call declares which it uses):
+//! root's is at SLOT_XCHG in memd's CNode, vmmgr's is a CNode the two share
+//! (SLOT_XCHG_CNODE).  memd never calls either.
 //!
 //! memd allocates nothing: what it knows of memory is a table with an
 //! entry per 2 MiB of physical address space (TABLE_VA), which l4h-root
@@ -16,24 +17,28 @@
 /// l4h-root puts here before `call::balloon`.
 pub const SLOT_BALLOON_IOPORT: u64 = crate::SLOT_FIRST_FREE;
 /// Slot of guest g's block CNode (L4H_SLOT_BLOCKS of the guest), which
-/// memd takes from vmmgr's mailbox at `guest_create` and deletes at
+/// memd takes from vmmgr's exchange area at `guest_create` and deletes at
 /// `guest_destroy`.
 pub const SLOT_GUEST_BCN: u64 = 32;
 const _: () = assert!(SLOT_BALLOON_IOPORT < SLOT_GUEST_BCN);
 pub const MAX_GUESTS: usize = 64;
 /// Slot of guest g's hotplug CNode (L4H_SLOT_HP of the guest, without its
-/// guard), SLOT_GUEST_HCN + g, which memd takes from vmmgr's mailbox at
-/// `guest_create` and deletes at `guest_destroy`.
+/// guard), SLOT_GUEST_HCN + g, which memd takes from vmmgr's exchange area
+/// at `guest_create` and deletes at `guest_destroy`.
 pub const SLOT_GUEST_HCN: u64 = SLOT_GUEST_BCN + MAX_GUESTS as u64;
-/// Exchange slots: Untypeds passed by `alloc`, `free` and `guest_copy`,
-/// slot SLOT_XCHG + i for the i-th.  A call passes at most XCHG_SLOTS
-/// (`free` takes two message registers for each).
+/// Root's exchange area: slots [SLOT_XCHG, SLOT_XCHG + XCHG_AREA) of
+/// memd's CNode.  vmmgr's is the CNode in SLOT_XCHG_CNODE, of radix
+/// XCHG_RADIX.
 pub const SLOT_XCHG: u64 = 160;
+pub const XCHG_RADIX: usize = 6;
+pub const XCHG_AREA: usize = 1 << XCHG_RADIX;
+/// Blocks an `alloc` or `free` passes, at most (`free` takes two message
+/// registers for each).
 pub const XCHG_SLOTS: usize = 32;
 /// The blocks' slots start here (`block_slots`).
 pub const SLOT_DYN_BASE: u64 = 256;
 const _: () = assert!(SLOT_GUEST_HCN as usize + MAX_GUESTS <= SLOT_XCHG as usize);
-const _: () = assert!(SLOT_XCHG as usize + XCHG_SLOTS <= SLOT_DYN_BASE as usize);
+const _: () = assert!(SLOT_XCHG as usize + XCHG_AREA <= SLOT_DYN_BASE as usize);
 
 crate::senders! {
     /// Who calls memd, by the badge of its capability (badges::memd).
@@ -60,25 +65,29 @@ crate::protocol! {
     /// vmmgr is less trusted than memd, so memd keeps the original of every
     /// block it grants vmmgr and gives it a copy: `free` then revokes the
     /// original, whatever vmmgr put in the mailbox.
-    pub mod call (from: Sender) {
+    pub mod call (from: Sender, xchg: XCHG_AREA) {
         /// `count` (at most XCHG_SLOTS) Untypeds of 2^bits bytes
         /// (BLOCK_BITS..=MAX_BITS) without children, in the exchange
         /// slots: their physical addresses.
-        Alloc / alloc = 1 from [Root, Vmmgr] (bits: usize, count: usize) -> Tail<u64, XCHG_SLOTS>;
+        Alloc / alloc = 1 from [Root, Vmmgr] (bits: usize, count: usize)
+            caps { Out BLOCKS: Untyped [0; XCHG_SLOTS] } -> Tail<u64, XCHG_SLOTS>;
         /// Untypeds without children that the caller put in its exchange
         /// slots, (physical address, size bits) each, returned to the free
         /// memory.  Each is a block memd gave, or one of at least
         /// 2^BLOCK_BITS bytes in the units of the table.
-        Free / free = 2 from [Root, Vmmgr] (blocks: ArrayVec<(usize, usize), XCHG_SLOTS>) -> ();
+        Free / free = 2 from [Root, Vmmgr] (blocks: ArrayVec<(usize, usize), XCHG_SLOTS>)
+            caps { In BLOCKS: Untyped [0; XCHG_SLOTS] } -> ();
         /// Take the guest's RAM, `blocks` 2 MiB blocks, with its block
         /// CNode (of radix `radix`) and hotplug CNode (for `hp_count`
-        /// hotplug blocks, at most HP_MAX) in the mailbox.  Nothing is
-        /// given yet, and its hotplug target is 0.
-        GuestCreate / guest_create = 3 from [Vmmgr] (guest: usize, blocks: usize, radix: usize, hp_count: usize) -> ();
+        /// hotplug blocks, at most HP_MAX).  Nothing is given yet, and its
+        /// hotplug target is 0.
+        GuestCreate / guest_create = 3 from [Vmmgr] (guest: usize, blocks: usize, radix: usize, hp_count: usize)
+            caps { In BLOCK_CNODE: CNode [XCHG_SLOTS; 1], In HP_CNODE: CNode [XCHG_SLOTS + 1; 1] } -> ();
         /// A copy of the block's Untyped in exchange slot 0, for vmmgr to
         /// fill with frames (a boot block): its physical address.  Once
         /// per block, before `guest_give`.
-        GuestCopy / guest_copy = 4 from [Vmmgr] (guest: usize, block: usize) -> u64;
+        GuestCopy / guest_copy = 4 from [Vmmgr] (guest: usize, block: usize)
+            caps { Out BLOCK: Untyped [0; 1] } -> u64;
         /// Copies of the Untypeds of blocks [first, blocks) into the
         /// guest's block CNode, block b at index b + skip (the guest's
         /// blocks of the shared kernel image have none).
@@ -115,15 +124,11 @@ crate::wire_struct! {
     }
 }
 
-/// Slot of the mailbox CNode memd shares with vmmgr: vmmgr's exchange
-/// slots (MAILBOX_XCHG + i, as SLOT_XCHG + i is root's) and the guest
-/// CNodes of `guest_create`.
-pub const SLOT_MAILBOX: u64 = 16;
-pub const MAILBOX_RADIX: usize = 6;
-pub const MAILBOX_XCHG: u64 = 0;
-pub const MAILBOX_BCN: u64 = XCHG_SLOTS as u64;
-pub const MAILBOX_HCN: u64 = MAILBOX_BCN + 1;
-const _: () = assert!(MAILBOX_HCN < 1 << MAILBOX_RADIX && SLOT_MAILBOX < SLOT_GUEST_BCN);
+/// Slot of vmmgr's exchange area: a CNode memd shares with it, of radix
+/// XCHG_RADIX.  (It was SLOT_BALLOON_IOPORT's slot, which a legacy
+/// balloon's I/O ports also took.)
+pub const SLOT_XCHG_CNODE: u64 = SLOT_BALLOON_IOPORT + 1;
+const _: () = assert!(SLOT_XCHG_CNODE < SLOT_GUEST_BCN);
 /// Hotplug blocks of a region, at most, and the words of its bitmap.
 pub const HP_MAX: usize = 512;
 pub const HP_MAP_WORDS: usize = HP_MAX / 64;

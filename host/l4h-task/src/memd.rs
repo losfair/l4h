@@ -44,8 +44,10 @@ impl MemdLink {
         self.exchange.absolute_cptr_from_bits_with_depth(i, self.exchange_bits)
     }
 
-    pub fn xchg(&self, i: usize) -> sel4::AbsoluteCPtr {
-        assert!(i < memd::XCHG_SLOTS);
+    /// Slot `i` of our exchange area with memd (memd::call::XCHG; each
+    /// call's capabilities are memd::call::caps).
+    pub fn area(&self, i: usize) -> sel4::AbsoluteCPtr {
+        assert!(i < memd::XCHG_AREA);
         self.slot(self.exchange_base + i as u64)
     }
 
@@ -58,7 +60,7 @@ impl MemdLink {
     pub fn alloc(&self, bits: usize, slot: Slot) -> Option<usize> {
         let paddr = *Client::alloc(self, bits, 1).ok()?.0.first()? as usize;
         self.local_cnode.absolute_cptr(cap_at::<cap_type::Null>(slot))
-            .move_(&self.xchg(0)).expect("memd: take grant");
+            .move_(&self.area(memd::call::caps::alloc::BLOCKS.slot(0))).expect("memd: take grant");
         Some(paddr)
     }
 
@@ -68,7 +70,7 @@ impl MemdLink {
         assert!(blocks.len() <= memd::XCHG_SLOTS);
         let mut given = ArrayVec::new();
         for (i, &(ut, paddr, bits)) in blocks.iter().enumerate() {
-            self.xchg(i).move_(&self.local_cnode.absolute_cptr(ut)).expect("memd: return block");
+            self.area(memd::call::caps::free::BLOCKS.slot(i)).move_(&self.local_cnode.absolute_cptr(ut)).expect("memd: return block");
             given.must_push((paddr, bits));
         }
         Client::free(self, given).expect("memd: free");

@@ -133,22 +133,21 @@ fn vmm_guest(from: Sender) -> Result<usize, Errno> {
     }
 }
 
-/// Slot `i` of the caller's mailbox: root's in our CNode, vmmgr's in the
-/// CNode we share with it.
-fn mailbox(c: Client, i: u64) -> sel4::AbsoluteCPtr {
+/// Slot `i` of the caller's exchange area (memd::call::XCHG): root's in
+/// our CNode, vmmgr's the CNode we share with it.
+fn area(c: Client, i: usize) -> sel4::AbsoluteCPtr {
+    assert!(i < memd::XCHG_AREA);
     match c {
-        Client::Root => abs(i),
-        Client::Vmmgr => cap::<cap_type::CNode>(memd::SLOT_MAILBOX).absolute_cptr_from_bits_with_depth(i, memd::MAILBOX_RADIX),
+        Client::Root => abs(memd::SLOT_XCHG + i as u64),
+        Client::Vmmgr => cap::<cap_type::CNode>(memd::SLOT_XCHG_CNODE).absolute_cptr_from_bits_with_depth(i as u64, memd::XCHG_RADIX),
     }
 }
 
-/// Exchange slot `i` of the caller.
-fn xchg(c: Client, i: usize) -> sel4::AbsoluteCPtr {
-    match c {
-        Client::Root => mailbox(c, memd::SLOT_XCHG + i as u64),
-        Client::Vmmgr => mailbox(c, memd::MAILBOX_XCHG + i as u64),
-    }
+/// Block n that an `alloc` or `free` passes (call::caps::*::BLOCKS).
+fn xchg(c: Client, n: usize) -> sel4::AbsoluteCPtr {
+    area(c, call::caps::alloc::BLOCKS.slot(n))
 }
+const _: () = assert!(call::caps::alloc::BLOCKS.first == call::caps::free::BLOCKS.first);
 
 impl Memd {
     fn guest(&self, g: usize) -> Option<&GuestRam> {
@@ -164,11 +163,12 @@ impl Memd {
         if g >= MAX_GUESTS || self.guests[g].live || n == 0 || radix > 20 || n > 1 << radix || hp_count > HP_MAX {
             return EINVAL;
         }
-        // The guest's CNodes, from vmmgr's mailbox.
+        // The guest's CNodes, from vmmgr's exchange area.
         let (bcn, hcn) = (abs(memd::SLOT_GUEST_BCN + g as u64), abs(memd::SLOT_GUEST_HCN + g as u64));
         let _ = (bcn.delete(), hcn.delete());
-        if bcn.move_(&mailbox(Client::Vmmgr, memd::MAILBOX_BCN)).is_err()
-            || hcn.move_(&mailbox(Client::Vmmgr, memd::MAILBOX_HCN)).is_err()
+        use call::caps::guest_create::{BLOCK_CNODE, HP_CNODE};
+        if bcn.move_(&area(Client::Vmmgr, BLOCK_CNODE.first)).is_err()
+            || hcn.move_(&area(Client::Vmmgr, HP_CNODE.first)).is_err()
         {
             return EINVAL;
         }
@@ -285,8 +285,9 @@ impl Memd {
     fn guest_copy(&mut self, g: usize, b: usize) -> Result<u64, Errno> {
         let i = self.guest_block(g, b).ok_or(EINVAL)?;
         // Fails if the block already has a copy.
-        let _ = xchg(Client::Vmmgr, 0).delete();
-        if xchg(Client::Vmmgr, 0).copy(&abs(self.mem.slot(i, 0)), CapRights::all()).is_err() {
+        let out = area(Client::Vmmgr, call::caps::guest_copy::BLOCK.first);
+        let _ = out.delete();
+        if out.copy(&abs(self.mem.slot(i, 0)), CapRights::all()).is_err() {
             return Err(EINVAL);
         }
         Ok((i as u64) << BLOCK_BITS)

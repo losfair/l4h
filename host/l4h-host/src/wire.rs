@@ -319,6 +319,63 @@ macro_rules! wire_struct {
     };
 }
 
+/// Which way a capability crosses in a call: from the caller (In) or to it
+/// (Out, with the reply).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dir {
+    In,
+    Out,
+}
+
+/// The kind of a capability a call passes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cap {
+    Untyped,
+    CNode,
+    Granule,
+    Notification,
+}
+
+/// Capabilities a call passes in the caller's exchange area: slots
+/// [first, first + count), at most count of them.  The area is the slots
+/// of the caller's that the protocol declares (`xchg`), wherever the two
+/// can both reach them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Caps {
+    pub first: usize,
+    pub count: usize,
+    pub dir: Dir,
+    pub kind: Cap,
+}
+
+impl Caps {
+    /// Slot i of these: first + i.
+    pub const fn slot(self, i: usize) -> usize {
+        assert!(i < self.count, "capability index out of range");
+        self.first + i
+    }
+}
+
+/// Whether a call's capabilities fit an exchange area of `slots` and do
+/// not overlap.
+pub const fn caps_fit(caps: &[Caps], slots: usize) -> bool {
+    let mut i = 0;
+    while i < caps.len() {
+        if caps[i].count == 0 || caps[i].first + caps[i].count > slots {
+            return false;
+        }
+        let mut j = i + 1;
+        while j < caps.len() {
+            if caps[i].first < caps[j].first + caps[j].count && caps[j].first < caps[i].first + caps[i].count {
+                return false;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    true
+}
+
 /// An endpoint a client calls.
 pub trait Call {
     /// Call with `label` and `args` in message registers 0..; the reply's
@@ -508,11 +565,13 @@ macro_rules! senders {
 macro_rules! protocol {
     (
         $(#[$doc:meta])*
-        $vis:vis mod $name:ident (from: $sender:ident) {
+        $vis:vis mod $name:ident (from: $sender:ident $(, xchg: $xchg:expr)?) {
             $(
                 $(#[$m:meta])*
                 $variant:ident / $method:ident = $label:literal from [$($role:ident),+ $(,)?]
-                    ( $($arg:ident : $aty:ty),* $(,)? ) -> $rty:ty;
+                    ( $($arg:ident : $aty:ty),* $(,)? )
+                    $( caps { $( $cdir:ident $cname:ident : $ckind:ident [$clo:expr ; $cn:expr] ),* $(,)? } )?
+                    -> $rty:ty;
             )*
         }
     ) => {
@@ -533,6 +592,33 @@ macro_rules! protocol {
             }
 
             const _: () = assert!($crate::wire::distinct(&[$($label),*]), "two calls share a label");
+
+            /// Slots of the caller's exchange area (0 if the protocol
+            /// passes no capabilities).
+            pub const XCHG: usize = $crate::protocol!(@xchg $($xchg)?);
+
+            /// The capabilities each call passes, in the caller's exchange
+            /// area: caps::<call>::<NAME>.
+            pub mod caps {
+                #[allow(unused_imports)]
+                use super::*;
+                $(
+                    #[allow(dead_code)]
+                    pub mod $method {
+                        #[allow(unused_imports)]
+                        use super::*;
+                        $($(
+                            pub const $cname: $crate::wire::Caps = $crate::wire::Caps {
+                                first: $clo, count: $cn, dir: $crate::wire::Dir::$cdir, kind: $crate::wire::Cap::$ckind,
+                            };
+                        )*)?
+                        /// All of them.
+                        pub const ALL: &[$crate::wire::Caps] = &[$($($cname),*)?];
+                    }
+                )*
+            }
+            $( const _: () = assert!($crate::wire::caps_fit(caps::$method::ALL, XCHG),
+                "a call's capabilities overlap or do not fit the exchange area"); )*
 
             impl Request {
                 /// Words of the longest call's arguments.
@@ -665,6 +751,8 @@ macro_rules! protocol {
             impl<T: $crate::wire::Call + ?Sized> Client for T {}
         }
     };
+    (@xchg) => { 0 };
+    (@xchg $xchg:expr) => { $xchg };
 }
 
 #[cfg(test)]
@@ -722,9 +810,9 @@ mod tests {
     }
 
     crate::protocol! {
-        pub mod demo (from: Who) {
+        pub mod demo (from: Who, xchg: 4) {
             /// Add.
-            Add / add = 1 from [Boss] (x: u64, y: u8) -> u64;
+            Add / add = 1 from [Boss] (x: u64, y: u8) caps { In PAGE: Granule [0; 1], Out NTFN: Notification [1; 2] } -> u64;
             Pairs / pairs = 2 from [Boss, Guest] (list: ArrayVec<Pair, 4>) -> Tail<u64, 4>;
             Ping / ping = 3 from [Guest] () -> ();
         }
@@ -778,6 +866,11 @@ mod tests {
         // A reply taken later, by its call's type.
         assert_eq!(reply::<demo::reply::Add>(&[0, 9]), Ok(9));
         assert_eq!(demo::Request::MAX_WORDS, 1 + 4 * 2);
+        assert_eq!(demo::caps::add::NTFN.slot(1), 2);
+        assert_eq!(demo::caps::add::ALL.len(), 2);
+        assert!(demo::caps::ping::ALL.is_empty());
+        assert!(!caps_fit(&[demo::caps::add::PAGE, demo::caps::add::PAGE], 4));
+        assert!(!caps_fit(demo::caps::add::ALL, 2));
         assert_eq!(demo::Request::MAX_REPLY_WORDS, 1 + 4);
     }
 
