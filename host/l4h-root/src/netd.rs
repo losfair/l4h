@@ -159,6 +159,9 @@ pub struct Netd {
     /// Commands to netd, which it does not answer: root validates them
     /// and keeps their state (net::call::add_port).
     mailbox: Mailbox,
+    /// netd faulted (`fault`): it is suspended, and commands to it go
+    /// nowhere.
+    failed: bool,
     /// Removals in the ring, by number mod RING: the port, and what waits
     /// for netd to let go of its memory (vmmgr::Zombie).
     removals: [Option<(usize, Option<usize>)>; RING],
@@ -360,6 +363,7 @@ pub fn spawn(
         arena,
         mailbox,
         removals: [None; RING],
+        failed: false,
         held: 0,
         backlog: 0,
         zombies: [None; net::MAX_PORTS],
@@ -374,8 +378,13 @@ pub fn spawn(
 
 impl Netd {
     /// Post a command; EBUSY if netd has left the ring full.
-    fn post(&mut self, req: Request) -> Result<u64, i64> {
-        self.mailbox.send(&req).ok_or(ctl::EBUSY)
+    /// Post a command: dropped once netd has failed, as root keeps the
+    /// state commands set and reads nothing back.
+    fn post(&mut self, req: Request) -> Result<(), i64> {
+        if self.failed {
+            return Ok(());
+        }
+        self.mailbox.send(&req).map(|_| ()).ok_or(ctl::EBUSY)
     }
 
     /// Whether a command can be posted now.
@@ -385,7 +394,7 @@ impl Netd {
 
     /// Whether netd has published its NICs' MACs, or never will.
     pub fn ready(&self) -> bool {
-        self.mailbox.failed() || self.published().ready.load(Ordering::Acquire) != 0
+        self.failed || self.published().ready.load(Ordering::Acquire) != 0
     }
 
     fn published(&self) -> &net::Published {
@@ -415,7 +424,9 @@ impl Netd {
         if n.switch.is_some() {
             return Err(ctl::EBUSY);
         }
-        self.mailbox.send(&Request::AttachUplink { nic: nic as usize, switch: switch as usize }).ok_or(ctl::EBUSY)?;
+        if !self.failed {
+            self.mailbox.send(&Request::AttachUplink { nic: nic as usize, switch: switch as usize }).ok_or(ctl::EBUSY)?;
+        }
         n.switch = Some(switch);
         Ok(())
     }
@@ -530,9 +541,10 @@ impl Netd {
         n.flush_backlog();
     }
 
-    /// Post the removals that wait for room in the ring.
+    /// Post the removals that wait for room in the ring.  A failed netd
+    /// keeps them for `poll`.
     fn flush_backlog(&mut self) {
-        while self.backlog != 0 {
+        while self.backlog != 0 && !self.failed {
             let p = self.backlog.trailing_zeros() as usize;
             let Some(k) = self.mailbox.send(&Request::RemovePort { port: p }) else { break };
             self.removals[k as usize % RING] = Some((p, self.zombies[p].take()));
@@ -540,15 +552,45 @@ impl Netd {
         }
     }
 
-    /// Ports netd has let go of: their memory can be reclaimed.
+    /// Ports netd has let go of: their memory can be reclaimed.  A
+    /// failed netd, suspended, lets go of every port at once.
     pub fn poll(h: &mut Host) {
-        while let Some((k, _)) = h.netd.mailbox.answer() {
-            let Some((p, zombie)) = h.netd.removals[k as usize % RING].take() else { continue };
-            let _ = h.netd.comp.slot(net::NETD_SLOT_CLIENT_BASE + p as u64).delete();
-            h.netd.held &= !(1 << p);
-            crate::vmmgr::zombie_done(h, zombie, true);
+        loop {
+            let n = &mut h.netd;
+            let next = if n.failed { n.mailbox.abandon() } else { n.mailbox.answer().map(|(k, _)| k) };
+            let Some(k) = next else { break };
+            let Some((p, zombie)) = n.removals[k as usize % RING].take() else { continue };
+            Self::released(h, p, zombie);
+        }
+        while h.netd.failed && h.netd.backlog != 0 {
+            let p = h.netd.backlog.trailing_zeros() as usize;
+            h.netd.backlog &= !(1 << p);
+            let zombie = h.netd.zombies[p].take();
+            Self::released(h, p, zombie);
         }
         h.netd.flush_backlog();
+    }
+
+    /// netd no longer uses port `p`'s memory.
+    fn released(h: &mut Host, p: usize, zombie: Option<usize>) {
+        let _ = h.netd.comp.slot(net::NETD_SLOT_CLIENT_BASE + p as u64).delete();
+        h.netd.held &= !(1 << p);
+        crate::vmmgr::zombie_done(h, zombie, true);
+    }
+
+    /// Component `id`'s fault, if it is netd's: suspend it, and let go of
+    /// what it has not answered.  Whether it was netd's.
+    pub fn fault(h: &mut Host, id: u32) -> bool {
+        if id != NETD_ID {
+            return false;
+        }
+        if !h.netd.failed {
+            log!("l4h-root: netd failed: guest networking stops until reboot");
+            h.netd.failed = true;
+            let _ = h.netd.comp.tcb.tcb_suspend();
+        }
+        Self::poll(h);
+        true
     }
 
     /// Put the link channel `ch` of partition `me` on `switch`, as netd's

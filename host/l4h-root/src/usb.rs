@@ -431,6 +431,23 @@ fn free_area(h: &mut Host, d: &mut Usbd, idx: usize) {
     }
 }
 
+/// Component `id`'s fault, if it is a usbd's: quarantine its controller and
+/// finish what it has not answered.  Whether it was one.
+pub fn fault(h: &mut Host, id: u32) -> bool {
+    let Some(i) = id.checked_sub(usb::USBD_ID_BASE).map(|i| i as usize).filter(|&i| i < ctrls().len()) else { return false };
+    let c = &mut ctrls()[i];
+    if c.driver.is_none() {
+        return false;
+    }
+    if c.state != State::Failed {
+        let p = c.pci;
+        log!("l4h-root: xHCI {:02x}:{:02x}.{}: usbd failed", p.bus, p.dev, p.func);
+        quarantine(c, &h.pci);
+    }
+    poll(h);
+    true
+}
+
 /// What usbd has answered (from the serve loop, on badges::root::MAILBOX).
 /// A quarantined usbd is suspended: its requests are given up at once.
 pub fn poll(h: &mut Host) {
@@ -438,13 +455,6 @@ pub fn poll(h: &mut Host) {
         loop {
             let c = &mut ctrls()[i];
             let Some(d) = c.driver.as_mut() else { break };
-            if c.state != State::Failed && d.mailbox.failed() {
-                let p = c.pci;
-                log!("l4h-root: xHCI {:02x}:{:02x}.{}: usbd failed", p.bus, p.dev, p.func);
-                quarantine(c, &h.pci);
-            }
-            let c = &mut ctrls()[i];
-            let d = c.driver.as_mut().unwrap();
             let failed = c.state == State::Failed;
             let w = if failed {
                 d.mailbox.abandon().map(|_| [wire::FAILED; host::mailbox::ANSWER])

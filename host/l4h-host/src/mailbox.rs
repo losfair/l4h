@@ -6,7 +6,10 @@
 //! and goes back to its loop.  The driver answers them in order, counts
 //! them in `done` and signals SLOT_MAILBOX_DONE; root finishes what it was
 //! doing then (l4h-root's mailbox.rs).  A request a driver never answers
-//! stays pending, and so does whatever waits for it, nothing else.
+//! stays pending, and so does whatever waits for it, nothing else.  A
+//! driver has no keeper: its faults go to root (badges::root::FAULT),
+//! which quarantines it and gives up on what it has not answered, as
+//! wire::FAILED.  Nothing a driver writes says that it failed.
 //!
 //! The second page is the driver's to publish what root reads without
 //! asking: blkd's disks (blk::Published), netd's counters (net::Published),
@@ -37,7 +40,6 @@ pub const RING: usize = 64;
 pub struct Entry {
     pub label: AtomicU64,
     pub args: [AtomicU64; ARGS],
-    /// u64::MAX in answer[0] if the driver failed (l4h_rt::abort_trap).
     pub answer: [AtomicU64; ANSWER],
 }
 
@@ -49,14 +51,7 @@ pub struct Mailbox {
     /// Requests the driver has answered, in order.  It writes the answer,
     /// then raises `done`.
     pub done: AtomicU64,
-    /// Non-zero once the driver has failed: it answers everything with
-    /// u64::MAX, and publishes no more.
-    pub failed: AtomicU64,
     pub entries: [Entry; RING],
 }
 const _: () = assert!(core::mem::size_of::<Mailbox>() <= PUBLISHED_OFFSET);
 
-/// The kinds root asks through a mailbox.
-pub const fn has_mailbox(kind: u32) -> bool {
-    matches!(kind, crate::KIND_BLKD | crate::KIND_NETD | crate::KIND_USBD)
-}

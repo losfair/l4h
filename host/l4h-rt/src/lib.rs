@@ -197,7 +197,7 @@ extern "C" fn keeper() -> ! {
     let (info, _) = cap::<sel4::cap_type::Endpoint>(host::SLOT_FAULT_EP).recv(reply);
     let fault = sel4::with_ipc_buffer(|b| sel4::Fault::new(b, &info));
     log!("l4h-rt: component {:#x} fault: {:x?}", INFO.header().id, fault);
-    failure::answer_failed(host::SLOT_KEEPER, host::mailbox::has_mailbox(INFO.header().kind))
+    failure::answer_failed(host::SLOT_KEEPER)
 }
 
 pub fn cap<T: sel4::CapType>(slot: u64) -> sel4::Cap<T> {
@@ -213,18 +213,18 @@ pub fn test_hang() -> ! {
     unreachable!("a suspended thread ran");
 }
 
-/// Where an aborted component ends.  l4h-root calls memd and asks blkd
-/// and netd (host::mailbox), and guests' VMMs call vmmgr, and could not wait
-/// for their faults to be reported: one that has failed keeps answering on
-/// its service endpoint and mailbox (a fault, its keeper does).  Any other
-/// component faults, which root handles.
+/// Where an aborted component ends.  l4h-root calls memd and guests' VMMs
+/// call vmmgr, and could not wait for their faults to be reported: one of
+/// those that has failed keeps answering on its service endpoint (a fault,
+/// its keeper does).  Any other component faults, which its parent
+/// handles.
 #[doc(hidden)]
 pub fn abort_trap() -> ! {
     let h = INFO.header();
     panic_flush();
     log!("l4h-rt: component {:#x} aborted", h.id);
     if h.magic == INFO_MAGIC && host::has_keeper(h.kind) {
-        failure::answer_failed(host::SLOT_TCB, host::mailbox::has_mailbox(h.kind));
+        failure::answer_failed(host::SLOT_TCB);
     }
     loop {
         unsafe {

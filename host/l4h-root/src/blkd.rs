@@ -178,7 +178,7 @@ impl Controller {
     /// failed, or there is none).
     pub fn ready(&self) -> bool {
         match &self.driver {
-            Some(d) => self.failed || d.mailbox.failed() || d.mailbox.published::<blk::Published>().ready.load(Ordering::Acquire) != 0,
+            Some(d) => self.failed || d.mailbox.published::<blk::Published>().ready.load(Ordering::Acquire) != 0,
             None => true,
         }
     }
@@ -255,7 +255,7 @@ impl Controller {
     /// `unit` as blkd published it: (disk geometry, number of units), None
     /// if there is no such unit or blkd cannot say.
     pub fn info(&self, unit: u64) -> (Option<Disk>, u64) {
-        let Some(d) = self.driver.as_ref().filter(|d| !self.failed && !d.mailbox.failed()) else { return (None, 0) };
+        let Some(d) = self.driver.as_ref().filter(|_| !self.failed) else { return (None, 0) };
         let p = d.mailbox.published::<blk::Published>();
         if p.ready.load(Ordering::Acquire) == 0 {
             return (None, 0);
@@ -448,7 +448,7 @@ pub fn start(
     };
 
     let args = SpawnArgs {
-        id: 0x100 + ctrl as u32,
+        id: BLKD_ID_BASE + ctrl as u32,
         kind: host::KIND_BLKD,
         elf: BLKD_ELF,
         prio: host::PRIO_SERVICE,
@@ -630,6 +630,24 @@ fn activate(ctrl: &mut Controller, unit: u64, i: usize, client: &RootGuest, chan
     // The check's answer has just left room in the ring.  The attachment
     // stays with the guest either way, for its teardown.
     ctrl.post(Request::Add { client: i, unit: unit as usize, dom0, n }, BlkOp::Add { token, chan, kick }).map_err(|_| ctl::EBUSY)
+}
+
+/// Component ids of the controllers' blkds: BLKD_ID_BASE + controller.
+pub const BLKD_ID_BASE: u32 = 0x100;
+
+/// Component `id`'s fault, if it is a blkd's: quarantine its controller and
+/// finish what it has not answered.  Whether it was one.
+pub fn fault(h: &mut Host, id: u32) -> bool {
+    let Some(c) = id.checked_sub(BLKD_ID_BASE).map(|c| c as usize).filter(|&c| c < h.ctrls.len()) else { return false };
+    if h.ctrls[c].driver.is_none() {
+        return false;
+    }
+    if !h.ctrls[c].failed {
+        log!("l4h-root: disk controller {}: blkd failed, quarantined until reboot", c);
+        quarantine(&mut h.ctrls[c], &h.pci);
+    }
+    poll(h, c);
+    true
 }
 
 /// Stop using controller `disk` until host reboot: its blkd is suspended

@@ -137,11 +137,13 @@ pub const KIND_VMMGR: u32 = 6;
 pub const KIND_LOGD: u32 = 7;
 pub const KIND_USBD: u32 = 8;
 
-/// The kinds that answer requests: root calls memd and asks blkd and netd
-/// (mailbox), guests' VMMs call vmmgr.  A caller could not wait for their
-/// faults to be reported, so a keeper thread answers for a failed one.
+/// The kinds that serve calls: root calls memd, guests' VMMs call vmmgr.
+/// A caller blocked in a call could not wait for their faults to be
+/// reported, so a keeper thread answers for a failed one.  The drivers
+/// serve root's mailbox (crate::mailbox), which root never waits on: their
+/// faults go to root, which acts on them itself.
 pub const fn has_keeper(kind: u32) -> bool {
-    matches!(kind, KIND_BLKD | KIND_NETD | KIND_MEMD | KIND_VMMGR | KIND_USBD)
+    matches!(kind, KIND_MEMD | KIND_VMMGR)
 }
 
 

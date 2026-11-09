@@ -23,24 +23,21 @@ pub fn set_failure_handler(handler: &'static FailureHandler) {
     HANDLER.store(core::ptr::from_ref(handler).cast_mut(), Ordering::Release);
 }
 
-/// Answer the callers of a failed component: wire::FAILED to every call, the one the main thread's reply object holds (if any) first, and
-/// to every request in its mailbox (host::mailbox), if it has one.
-/// Faults sent to it (vmmgr's guests' and VMMs') stay unanswered.
-pub(crate) fn answer_failed(tcb: u64, mailbox: bool) -> ! {
+/// Answer the callers of a failed component (host::has_keeper): wire::FAILED
+/// to every call, the one the main thread's reply object holds (if any)
+/// first.  Faults sent to it (vmmgr's guests' and VMMs') stay unanswered.
+pub(crate) fn answer_failed(tcb: u64) -> ! {
     let handler = unsafe { HANDLER.load(Ordering::Acquire).as_ref() };
-    if (handler.is_some() || mailbox) && tcb != host::SLOT_TCB {
+    if handler.is_some() && tcb != host::SLOT_TCB {
         // The faulted main thread still owns the notification, which
-        // carries the handler's signals and root's badges::driver::CALL. Pending
-        // signals survive the transfer to the keeper.
+        // carries the handler's signals. Pending signals survive the
+        // transfer to the keeper.
         cap::<sel4::cap_type::Tcb>(host::SLOT_TCB).tcb_unbind_notification().expect("failure unbind");
         cap::<sel4::cap_type::Tcb>(tcb)
             .tcb_bind_notification(cap(host::SLOT_NTFN)).expect("failure bind");
     }
     if let Some(handler) = handler {
         (handler.notified)(0);
-    }
-    if mailbox {
-        crate::mailbox::fail();
     }
     let ep = cap::<sel4::cap_type::Endpoint>(host::SLOT_SERVICE_EP);
     let reply = cap::<sel4::cap_type::Reply>(host::SLOT_REPLY);
@@ -51,10 +48,7 @@ pub(crate) fn answer_failed(tcb: u64, mailbox: bool) -> ! {
         } else {
             ep.recv(reply)
         };
-        if mailbox && badge & host::badges::driver::CALL != 0 {
-            crate::mailbox::fail();
-            answer = false;
-        } else if let Some(handler) = handler.filter(|h| badge & h.notification_badges != 0) {
+        if let Some(handler) = handler.filter(|h| badge & h.notification_badges != 0) {
             (handler.notified)(badge);
             answer = false;
         } else {

@@ -54,16 +54,3 @@ fn publish(words: &[u64; ANSWER]) {
     }
     m.done.store(k + 1, Ordering::Release);
 }
-
-/// The driver has failed: answer every request, now and later, with
-/// u64::MAX.
-pub(crate) fn fail() {
-    let m = page();
-    m.failed.store(1, Ordering::Release);
-    let mut words = [0; ANSWER];
-    words[0] = u64::MAX;
-    while m.posted.load(Ordering::Acquire) != m.done.load(Ordering::Relaxed) {
-        publish(&words);
-    }
-    signal();
-}

@@ -852,6 +852,9 @@ fn component_call(h: &mut Host, badge: u64, info: &sel4::MessageInfo) -> Option<
     if badge & recv::FAULT != 0 {
         let fault = sel4::with_ipc_buffer(|b| sel4::Fault::new(b, info));
         log!("l4h-root: component {:#x} fault: {:x?}", id, fault);
+        // A driver (it has no keeper) is failed here; trustd's start-up
+        // stops.  The faulted thread is left unanswered.
+        let _ = blkd::fault(h, id) || netd::Netd::fault(h, id) || crate::usb::fault(h, id);
         trustd::fault(h, id);
         return None;
     }

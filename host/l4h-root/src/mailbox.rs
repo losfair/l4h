@@ -4,7 +4,8 @@
 //! and finishes what the request was for when the driver has answered
 //! (blkd.rs, netd.rs, usb.rs: `poll`, from the serve loop on
 //! badges::root::MAILBOX).  A request a driver never answers stays pending, and so
-//! does whatever waits for it.  memd, which handles no one's data, is
+//! does whatever waits for it.  A driver that faults (it has no keeper) is
+//! failed by root (`fault`), which gives up on what it has not answered.  memd, which handles no one's data, is
 //! called (memd.rs).
 
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -131,11 +132,6 @@ impl Mailbox {
             self.answered += 1;
             self.answered - 1
         })
-    }
-
-    /// The driver says it has failed (l4h_rt::abort_trap).
-    pub fn failed(&self) -> bool {
-        self.page().failed.load(Ordering::Acquire) != 0
     }
 
     /// What the driver publishes (blk::Published, net::Published).

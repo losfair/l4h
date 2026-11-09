@@ -2661,9 +2661,18 @@ pending, and so does whatever waits for it, nothing else:
   would fault. A driver that never answers keeps that memory, and the
   client and port slots, for good.
 - A full ring (64 requests) refuses new ones with `EBUSY`; removals queue
-  in root until there is room. A failed driver's keeper answers everything
-  with `u64::MAX`; a quarantined blkd's or usbd's pending requests fail at
-  once.
+  in root until there is room.
+- **A driver that faults** fails in root, not in itself. Drivers have no
+  keeper thread (`host::has_keeper`): no one calls them, so no caller
+  needs answering, and a fault goes to root's endpoint like any other
+  component's. Root suspends the driver and quarantines what it drove
+  (`blkd::fault`, `Netd::fault`, `usb::fault`), and its pending requests
+  finish at once as `wire::FAILED` answers would (`Mailbox::abandon`), as
+  do later ones: a quarantined controller takes none, and a failed netd's
+  commands are dropped and its ports let go. Root acts on the kernel's
+  fault message, which the driver cannot forge or withhold; nothing the
+  driver writes says that it failed. A Rust panic in a driver traps after
+  `l4h_rt::abort_trap` logs it, and faults so too.
 
 Root still calls memd, which handles no one's data, and trustd only in its
 start-up handshake, before any guest exists; everything else root shares
@@ -2738,7 +2747,8 @@ one way to do each part of it:
   reply taken later. Labels must be distinct and calls must fit the IPC
   buffer (a mailbox's `ARGS` and `ANSWER`), at compile time. A reply's
   first word is 0 or an errno and its value follows; a failed server
-  answers `wire::FAILED` (its keeper, or l4h-rt's mailbox `fail`), and a
+  answers `wire::FAILED` (memd's and vmmgr's keeper; root itself for a
+  faulted driver's mailbox, `Mailbox::abandon`), and a
   method that must leave its caller blocked returns `wire::NO_REPLY`.
 - **Transports.** An endpoint's calls go through `l4h-ipc`: clients call
   an `l4h_ipc::Endpoint` (or `MemdLink`, which is one with exchange
@@ -3352,8 +3362,8 @@ root.
   trustd's flags. A bug in vmmgr reaches guests' memory but not the
   hardware, the IOMMU, the TPM or root.
 - **If vmmgr fails**, guests keep running: their vCPUs, disks, networks and
-  memory hotplug need nothing of vmmgr. Like blkd, netd and memd it has a
-  keeper thread (`l4h_rt`), which reports the fault and answers every later
+  memory hotplug need nothing of vmmgr. Like memd, the other component
+  that serves calls, it has a keeper thread (`l4h_rt`), which reports the fault and answers every later
   call with a failure, the call vmmgr was serving first (its reply object is
   in `SLOT_REPLY`), so a VMM's call or a guest's power request returns
   instead of blocking. For dom0's control requests, the failure service
