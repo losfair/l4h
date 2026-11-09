@@ -238,6 +238,8 @@ int l4h_ept_map_frame(unsigned long frame, unsigned long ept, unsigned long gpa,
 
 /* ---- events, timers, idle */
 unsigned long long l4h_rdtsc(void);
+/* Host counter ticks (l4h_rdtsc) as nanoseconds. */
+unsigned long long l4h_ticks_to_ns(unsigned long long ticks);
 void l4h_timer_arm(unsigned long long tsc_deadline);
 /* Collect all pending event sources on this vCPU; returns nonzero if any
  * were found and leaves them in *timer, *ipi and events[]. */

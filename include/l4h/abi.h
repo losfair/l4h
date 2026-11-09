@@ -829,9 +829,12 @@ struct l4h_usb_info {
 	l4h_u32 max_transfer;   /* bytes of one URB */
 	l4h_u32 hci_version;    /* HCIVERSION, as BCD */
 	l4h_u32 reset_done;     /* the last reset_seq completed */
-	l4h_u32 mfindex;        /* MFINDEX, as usbd last read it */
+	l4h_u32 mfindex;        /* bits 0..13: MFINDEX, as usbd last read it; 14..31: a
+	                         * sequence, odd while usbd updates it with mf_ticks */
 	l4h_u32 hc_resets;      /* resets so far, for any reason */
-	l4h_u32 reserved[2];
+	l4h_u64 mf_ticks;       /* the host counter (TSC, CNTVCT) when MFINDEX was read;
+	                         * 0: the controller is not running.  MFINDEX advances 8000
+	                         * times a second from there */
 	struct l4h_usb_index usbd_waiting;
 	struct l4h_usb_index ctl_sq_tail;
 	struct l4h_usb_index xfer_sq_tail;

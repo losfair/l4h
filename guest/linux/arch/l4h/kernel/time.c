@@ -36,6 +36,11 @@ long long os_nsecs(void)
 	return mul_u64_u32_shr(l4h_rdtsc(), tsc_to_ns_mult, tsc_to_ns_shift);
 }
 
+unsigned long long l4h_ticks_to_ns(unsigned long long ticks)
+{
+	return mul_u64_u32_shr(ticks, tsc_to_ns_mult, tsc_to_ns_shift);
+}
+
 long long os_persistent_clock_emulation(void)
 {
 	unsigned long mr = 0;

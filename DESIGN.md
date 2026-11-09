@@ -2483,6 +2483,12 @@ controller, one per claimed controller, and the guest forwards Linux's
   plus the scheduling threshold for an idle one, reporting the start frame
   in the CQE; with CFC, TDs carry Frame IDs from it, the device speed and
   the service interval (SIA when it is out of the valid window, or ASAP).
+  usbd publishes MFINDEX with the host counter (TSC, CNTVCT) at which it
+  read it, under a sequence count, each time it runs; the guest's frame
+  number goes on from that sample at 8000 microframes a second, so it
+  advances while usbd sleeps. A cancelled isoch URB reports its packets as
+  done, failed or cancelled (the one the controller stopped in with its
+  bytes), and its length as their sum.
   An isoch TD that fails before its last TRB stays on the ring until an
   event shows the controller past it; an event on a later isoch URB retires
   the ones before it, their unreported TDs missed (a Missed Service event

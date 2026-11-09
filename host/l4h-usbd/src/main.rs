@@ -364,7 +364,11 @@ impl Usbd {
                 CC_STOPPED_LENGTH_INVALID => before,
                 _ => before.saturating_add(at.saturating_sub(resid)),
             };
-            self.urbs.get_mut(u).actual = done;
+            let urb = self.urbs.get_mut(u);
+            urb.actual = done;
+            if urb.xfer.ty == abi::XFER_ISOC {
+                urb.stopped = urb.ends.iter().position(|&e| e >= dist).map_or(NONE, |t| t as u16);
+            }
             return;
         }
         let ty = self.urbs.get(u).xfer.ty;
@@ -1274,11 +1278,24 @@ impl Usbd {
         abi::ST_OK
     }
 
+    /// Complete cancelled URB `u`, `actual` bytes done.  Isoch: its TDs
+    /// not done are cancelled, the one the controller stopped in with its
+    /// bytes, and the URB's bytes are its packets'.
     fn complete_cancelled(&mut self, u: u16, s: usize, d: usize, r: u16, actual: u32) {
-        let posted = self.urbs.get(u).posted;
+        let urb = self.urbs.get_mut(u);
+        let mut actual = actual;
+        if urb.xfer.ty == abi::XFER_ISOC {
+            let n = urb.ends.len();
+            // A TD failed mid TD keeps its error.
+            let from = urb.td as usize + urb.mid as usize;
+            for k in from..n {
+                let bytes = if k == urb.stopped as usize { actual.min(urb.xfer.iso[k].1) } else { 0 };
+                urb.iso[k] = abi::IsoStatus { status: abi::ST_CANCELLED, actual: bytes };
+                urb.errors += 1;
+            }
+            actual = urb.iso[..n].iter().map(|s| s.actual).sum();
+        }
         self.complete(u, abi::ST_CANCELLED, actual, s, d, r, false);
-        // A posted URB left the ring; the ring's free space follows it.
-        let _ = posted;
     }
 
     /// A transfer record: accept it, or complete it at once if it is bad.
@@ -1625,8 +1642,20 @@ impl Usbd {
     /// Signal the client's VMM once for whatever was published.
     fn flush(&mut self) {
         if let Some(c) = &mut self.client {
-            if let Some(hc) = &self.hc {
-                unsafe { write_volatile(addr_of_mut!((*c.info()).mfindex), hc.mfindex()) };
+            // The guest extrapolates the frame number from this sample.
+            let (mf, ticks) = match &self.hc {
+                Some(hc) if !self.dead && !hc.broken => (hc.mfindex(), l4h_rt::host::ticks::now().max(1)),
+                Some(hc) => (hc.mfindex(), 0),
+                None => (0, 0),
+            };
+            let info = c.info();
+            unsafe {
+                let seq = (read_volatile(addr_of!((*info).mfindex)) >> 14).wrapping_add(1) | 1;
+                write_volatile(addr_of_mut!((*info).mfindex), seq << 14);
+                core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+                write_volatile(addr_of_mut!((*info).mf_ticks), ticks);
+                core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+                write_volatile(addr_of_mut!((*info).mfindex), seq.wrapping_add(1) << 14 | mf);
             }
             if c.notify {
                 c.notify = false;

@@ -295,6 +295,9 @@ pub struct Urb {
     /// past it.
     pub td: u16,
     pub mid: bool,
+    /// Isoch: the TD a Stop Endpoint stopped in (NONE: none), `actual`
+    /// its bytes.
+    pub stopped: u16,
     /// Bytes done so far (a control transfer's short data stage, a stopped
     /// TD).
     pub actual: u32,
@@ -325,7 +328,7 @@ impl Urbs {
     pub fn alloc(&mut self, xfer: Xfer, ring: u16) -> Option<u16> {
         let u = self.free.pop()?;
         self.urbs[u as usize] = Some(Urb {
-            xfer, ring, posted: false, start: 0, first: 0, ntrbs: 0, ends: TdEnds::new(), td: 0, mid: false, actual: 0, short: false,
+            xfer, ring, posted: false, start: 0, first: 0, ntrbs: 0, ends: TdEnds::new(), td: 0, mid: false, stopped: NONE, actual: 0, short: false,
             iso: [abi::IsoStatus::default(); abi::MAX_ISO], errors: 0, next: NONE,
         });
         Some(u)

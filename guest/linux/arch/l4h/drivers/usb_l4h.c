@@ -1419,9 +1419,33 @@ static int ul4h_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
 	return 0;
 }
 
+/*
+ * usbd samples MFINDEX only when it runs: go on from its last sample at
+ * 8000 microframes a second.  A few tries for a consistent pair, then
+ * the sample alone.
+ */
 static int ul4h_get_frame_number(struct usb_hcd *hcd)
 {
-	return READ_ONCE(hcd_to_ul4h(hcd)->info->mfindex) >> 3;
+	const struct l4h_usb_info *info = hcd_to_ul4h(hcd)->info;
+	unsigned long long now, ticks = 0;
+	u32 m1, m2 = 0;
+	int i;
+
+	for (i = 0; i < 8; i++) {
+		m1 = READ_ONCE(info->mfindex);
+		smp_rmb();
+		ticks = READ_ONCE(info->mf_ticks);
+		smp_rmb();
+		m2 = READ_ONCE(info->mfindex);
+		if (m1 == m2 && !(m1 & (1u << 14)))
+			break;
+		ticks = 0;
+	}
+	m2 &= 0x3fff;
+	now = l4h_rdtsc();
+	if (ticks && now > ticks)
+		m2 += div_u64(l4h_ticks_to_ns(now - ticks), 125000);
+	return (m2 & 0x3fff) >> 3;
 }
 
 /* ---- root hubs */

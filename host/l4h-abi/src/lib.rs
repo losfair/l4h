@@ -542,9 +542,13 @@ pub mod usb {
         pub max_transfer: u32,
         pub hci_version: u32,
         pub reset_done: u32,
+        /// MFINDEX (bits 0..13) as usbd last read it, and a sequence
+        /// (bits 14..31) that is odd while usbd updates it with mf_ticks.
         pub mfindex: u32,
         pub hc_resets: u32,
-        pub reserved: [u32; 2],
+        /// The host counter (TSC, CNTVCT) when MFINDEX was read; 0: the
+        /// controller is not running.
+        pub mf_ticks: u64,
         pub usbd_waiting: Index,
         pub ctl_sq_tail: Index,
         pub xfer_sq_tail: Index,
@@ -739,6 +743,7 @@ pub mod usb {
     pub const DEVOP_IRQ_VCPU: u64 = 5;
 
     const _: () = assert!(core::mem::size_of::<Info>() <= 4096);
+    const _: () = assert!(core::mem::offset_of!(Info, mf_ticks) == 56 && core::mem::offset_of!(Info, usbd_waiting) == 64);
     const _: () = assert!(core::mem::size_of::<Ctrl>() <= 4096);
     const _: () = assert!(core::mem::size_of::<Ep>() == 8);
     const _: () = assert!(core::mem::size_of::<CtlReq>() == 256);
