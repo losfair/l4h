@@ -1,4 +1,4 @@
-From 1c298113d25fcad251ed8a655d2512a108f34af7 Mon Sep 17 00:00:00 2001
+From 1647d46f4671875c9376e8162726086407c27d42 Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Mon, 19 Oct 2026 07:32:33 -0700
 Subject: [PATCH] aarch64: pass the CPU feature ID registers to the root task

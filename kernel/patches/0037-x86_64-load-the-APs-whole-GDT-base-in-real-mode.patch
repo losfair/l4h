@@ -1,4 +1,4 @@
-From 473406a3a642651da6d4111b2deea09a8844db94 Mon Sep 17 00:00:00 2001
+From d1881af0d62902ebbee5a8186360e7901c11f3a1 Mon Sep 17 00:00:00 2001
 From: l4h <l4h@localhost>
 Date: Tue, 3 Nov 2026 02:11:33 -0800
 Subject: [PATCH] x86_64: load the APs' whole GDT base in real mode
@@ -8,7 +8,7 @@ Subject: [PATCH] x86_64: load the APs' whole GDT base in real mode
  1 file changed, 3 insertions(+), 1 deletion(-)
 
 diff --git a/src/arch/x86/64/head.S b/src/arch/x86/64/head.S
-index cf3e85e..0e89983 100644
+index cf3e85ed0..0e89983a4 100644
 --- a/src/arch/x86/64/head.S
 +++ b/src/arch/x86/64/head.S
 @@ -372,7 +372,9 @@ BEGIN_FUNC(boot_cpu_start)

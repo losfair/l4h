@@ -113,10 +113,6 @@ static inline __sum16 ip_fast_csum(const void *iph, unsigned int ihl)
 	return (__force __sum16)sum;
 }
 
-#ifdef CONFIG_X86_32
-# include "checksum_32.h"
-#else
 # include "checksum_64.h"
-#endif
 
 #endif

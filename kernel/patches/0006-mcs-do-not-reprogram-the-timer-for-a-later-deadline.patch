@@ -1,4 +1,4 @@
-From e06d31c894ed3c34c3e4d0d7a5542d299d27cd48 Mon Sep 17 00:00:00 2001
+From a4ef88b279bd39f0218d70f721f5aa913deaff44 Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Sat, 17 Oct 2026 17:13:04 -0700
 Subject: [PATCH] mcs: do not reprogram the timer for a later deadline

@@ -6,11 +6,7 @@
 /* include faultinfo structure */
 #include <sysdep/faultinfo.h>
 
-#ifdef CONFIG_X86_32
-# include "processor_32.h"
-#else
 # include "processor_64.h"
-#endif
 
 /* The user IP, as on x86 (seccomp, SIGSYS); KSTK_ESP is the kernel's, for
  * stack walks. */

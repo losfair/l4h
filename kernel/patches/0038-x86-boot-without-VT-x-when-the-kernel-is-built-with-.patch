@@ -1,4 +1,4 @@
-From 9fa7a9f2817d32a6e091b8ddd3a2bced294f0421 Mon Sep 17 00:00:00 2001
+From 4498be827efa51c6494d9c142fd3a437dff5dacd Mon Sep 17 00:00:00 2001
 From: l4h <l4h@localhost>
 Date: Fri, 6 Nov 2026 21:22:54 +0000
 Subject: [PATCH] x86: boot without VT-x when the kernel is built with it
@@ -32,7 +32,7 @@ VMX operation (where INIT is blocked).
  5 files changed, 81 insertions(+), 20 deletions(-)
 
 diff --git a/include/arch/x86/arch/model/statedata.h b/include/arch/x86/arch/model/statedata.h
-index 76e62cc..9a1aee2 100644
+index 76e62cc76..9a1aee2b6 100644
 --- a/include/arch/x86/arch/model/statedata.h
 +++ b/include/arch/x86/arch/model/statedata.h
 @@ -81,6 +81,12 @@ extern uint32_t x86KSnumIODomainIDBits;
@@ -49,7 +49,7 @@ index 76e62cc..9a1aee2 100644
  extern uint16_t x86KSconsolePort;
  #endif
 diff --git a/include/arch/x86/arch/object/objecttype.h b/include/arch/x86/arch/object/objecttype.h
-index 01f66b2..6873706 100644
+index 01f66b2a3..687370642 100644
 --- a/include/arch/x86/arch/object/objecttype.h
 +++ b/include/arch/x86/arch/object/objecttype.h
 @@ -25,6 +25,23 @@ exception_t Arch_decodeInvocation(word_t invLabel, word_t length, cptr_t cptr, c
@@ -77,7 +77,7 @@ index 01f66b2..6873706 100644
  
  deriveCap_ret_t Mode_deriveCap(cte_t *slot, cap_t cap);
 diff --git a/src/arch/x86/model/statedata.c b/src/arch/x86/model/statedata.c
-index e30f57e..da0b07c 100644
+index e30f57e3e..da0b07c6f 100644
 --- a/src/arch/x86/model/statedata.c
 +++ b/src/arch/x86/model/statedata.c
 @@ -59,6 +59,7 @@ uint32_t x86KSFirstValidIODomain;
@@ -89,7 +89,7 @@ index e30f57e..da0b07c 100644
  
  #ifdef CONFIG_PRINTING
 diff --git a/src/arch/x86/object/vcpu.c b/src/arch/x86/object/vcpu.c
-index 4dd0d5c..92dd1df 100644
+index 4dd0d5c98..92dd1dfef 100644
 --- a/src/arch/x86/object/vcpu.c
 +++ b/src/arch/x86/object/vcpu.c
 @@ -1175,7 +1175,9 @@ static inline void clear_bit(word_t *bitmap, word_t bit)
@@ -188,7 +188,7 @@ index 4dd0d5c..92dd1df 100644
  }
  
 diff --git a/src/object/untyped.c b/src/object/untyped.c
-index c164c30..41f73bd 100644
+index c164c306e..41f73bde3 100644
 --- a/src/object/untyped.c
 +++ b/src/object/untyped.c
 @@ -71,6 +71,17 @@ exception_t decodeUntypedInvocation(word_t invLabel, word_t length, cte_t *slot,

@@ -1,15 +1,15 @@
-From e6ffc90f168db634db81121d2ecd6c7438a3658d Mon Sep 17 00:00:00 2001
+From 9b77435c4d71a98f667156b81fb56936701f4c6d Mon Sep 17 00:00:00 2001
 From: Heyang Zhou <hello@su3.io>
 Date: Fri, 30 Oct 2026 09:40:18 -0700
 Subject: [PATCH] vspace: derive 4 KiB aliases of 2 MiB RAM frames and sample
  large leaves
 
 ---
- .../arm/interfaces/object-api-arch.xml        |  36 ++++-
- .../x86/interfaces/object-api-arch.xml        |  36 ++++-
+ .../arm/interfaces/object-api-arch.xml        |  36 +++++-
+ .../x86/interfaces/object-api-arch.xml        |  35 +++++-
  src/arch/arm/64/kernel/vspace.c               |  97 +++++++++++++-
- src/arch/x86/kernel/vspace.c                  | 123 ++++++++++++++++--
- 4 files changed, 269 insertions(+), 23 deletions(-)
+ src/arch/x86/kernel/vspace.c                  | 118 ++++++++++++++++--
+ 4 files changed, 263 insertions(+), 23 deletions(-)
 
 diff --git a/libsel4/arch_include/arm/interfaces/object-api-arch.xml b/libsel4/arch_include/arm/interfaces/object-api-arch.xml
 index 36420301b..a02bfb6c2 100644
@@ -71,15 +71,14 @@ index 36420301b..a02bfb6c2 100644
              <error name="seL4_InvalidCapability">
                  <description>The capability's mapping is stale.</description>
 diff --git a/libsel4/arch_include/x86/interfaces/object-api-arch.xml b/libsel4/arch_include/x86/interfaces/object-api-arch.xml
-index 697cc2954..cfccbfdbd 100644
+index da6a5210d..ee3fd011a 100644
 --- a/libsel4/arch_include/x86/interfaces/object-api-arch.xml
 +++ b/libsel4/arch_include/x86/interfaces/object-api-arch.xml
-@@ -398,21 +398,51 @@
+@@ -398,20 +398,49 @@
                  </description>
              </error>
          </method>
 +        <method id="X86PageDeriveSubframe" name="DeriveSubframe" manual_name="Derive Subframe">
-+            <condition><config var="CONFIG_ARCH_X86_64"/></condition>
 +            <brief>Derive 4 KiB aliases of a RAM-backed 2 MiB frame.</brief>
 +            <description>
 +                Derives count consecutive aliases, starting at offset, into
@@ -110,7 +109,6 @@ index 697cc2954..cfccbfdbd 100644
 +        </method>
          <method id="X86PageTestAndClearAccessed" name="TestAndClearAccessed"
              manual_name="Test and Clear Accessed">
-             <condition><config var="CONFIG_ARCH_X86_64"/></condition>
 -            <brief>Test and clear the accessed bit of a mapped 4 KiB frame.</brief>
 +            <brief>Test and clear the accessed bit of a mapped 4 KiB or 2 MiB frame.</brief>
              <description>
@@ -274,7 +272,7 @@ index 3645ed683..4903c783b 100644
          vptr_t vaddr;
          paddr_t base;
 diff --git a/src/arch/x86/kernel/vspace.c b/src/arch/x86/kernel/vspace.c
-index f9f4d6d30..467761435 100644
+index 88ee42395..ab660365a 100644
 --- a/src/arch/x86/kernel/vspace.c
 +++ b/src/arch/x86/kernel/vspace.c
 @@ -6,6 +6,8 @@
@@ -286,7 +284,7 @@ index f9f4d6d30..467761435 100644
  #include <machine/io.h>
  #include <kernel/boot.h>
  #include <model/statedata.h>
-@@ -986,7 +988,8 @@ static create_mapping_pde_return_t createSafeMappingEntries_PDE(paddr_t base, wo
+@@ -985,7 +987,8 @@ static create_mapping_pde_return_t createSafeMappingEntries_PDE(paddr_t base, wo
  static exception_t decodePageTestAndClearAccessed(cap_t cap, bool_t call)
  {
      asid_t asid = cap_frame_cap_get_capFMappedASID(cap);
@@ -296,7 +294,7 @@ index f9f4d6d30..467761435 100644
          asid == asidInvalid || cap_frame_cap_get_capFMapType(cap) != X86_MappingVSpace) {
          current_syscall_error.type = seL4_IllegalOperation;
          return EXCEPTION_SYSCALL_ERROR;
-@@ -996,17 +999,27 @@ static exception_t decodePageTestAndClearAccessed(cap_t cap, bool_t call)
+@@ -995,17 +998,27 @@ static exception_t decodePageTestAndClearAccessed(cap_t cap, bool_t call)
      if (find_ret.status != EXCEPTION_NONE) {
          goto stale;
      }
@@ -334,11 +332,10 @@ index f9f4d6d30..467761435 100644
      tcb_t *thread = NODE_STATE(ksCurThread);
      if (call) {
          word_t *ipcBuffer = lookupIPCBuffer(true, thread);
-@@ -1025,6 +1038,90 @@ stale:
+@@ -1023,6 +1036,87 @@ stale:
+     return EXCEPTION_SYSCALL_ERROR;
  }
- #endif
  
-+#ifdef CONFIG_ARCH_X86_64
 +/* Derive aliases, not new objects: no retype, zeroing, or ownership
 + * transfer. The Untyped remains the ancestor of every alias. Like a
 + * frame copy, each alias is non-revocable: deriving a narrower region
@@ -420,19 +417,15 @@ index f9f4d6d30..467761435 100644
 +    return EXCEPTION_NONE;
 +}
 +
-+#endif
-+
  exception_t decodeX86FrameInvocation(
      word_t invLabel,
      word_t length,
-@@ -1035,6 +1132,10 @@ exception_t decodeX86FrameInvocation(
+@@ -1033,6 +1127,8 @@ exception_t decodeX86FrameInvocation(
  )
  {
      switch (invLabel) {
-+#ifdef CONFIG_ARCH_X86_64
 +    case X86PageDeriveSubframe:
 +        return decodePageDeriveSubframe(length, cte, cap, buffer);
-+#endif
      case X86PageMap: { /* Map */
          word_t          vaddr;
          word_t          vtop;

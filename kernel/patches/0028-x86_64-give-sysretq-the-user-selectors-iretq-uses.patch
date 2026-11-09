@@ -1,4 +1,4 @@
-From 2664000672c2d772d46a9729ad5bcb37eb12c608 Mon Sep 17 00:00:00 2001
+From 8d9abfa91750e5477435a69c4d0320d2ea7bccbb Mon Sep 17 00:00:00 2001
 From: l4h <l4h@localhost>
 Date: Thu, 29 Oct 2026 08:18:01 -0700
 Subject: [PATCH] x86_64: give sysretq the user selectors iretq uses

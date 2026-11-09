@@ -1,15 +1,15 @@
-From 53f217d2d59ac35d42927e4f1801f00897ec2ef8 Mon Sep 17 00:00:00 2001
+From 13ce5479a5a58784cc8517a87bd3674a86b29367 Mon Sep 17 00:00:00 2001
 From: l4h <l4h@localhost>
 Date: Fri, 23 Oct 2026 13:02:35 -0700
 Subject: [PATCH] vspace: expose accessed bits of native 4 KiB mappings
 
 ---
  .../arm/interfaces/object-api-arch.xml        | 20 ++++
- .../x86/interfaces/object-api-arch.xml        | 20 ++++
+ .../x86/interfaces/object-api-arch.xml        | 19 ++++
  src/arch/arm/64/kernel/vspace.c               | 93 +++++++++++++++++++
- src/arch/x86/kernel/vspace.c                  | 48 ++++++++++
+ src/arch/x86/kernel/vspace.c                  | 44 +++++++++
  src/fastpath/fastpath.c                       |  8 ++
- 5 files changed, 189 insertions(+)
+ 5 files changed, 184 insertions(+)
 
 diff --git a/libsel4/arch_include/arm/interfaces/object-api-arch.xml b/libsel4/arch_include/arm/interfaces/object-api-arch.xml
 index 5c54f31df..36420301b 100644
@@ -43,16 +43,15 @@ index 5c54f31df..36420301b 100644
              <brief>
                  Get the physical address of the underlying frame.
 diff --git a/libsel4/arch_include/x86/interfaces/object-api-arch.xml b/libsel4/arch_include/x86/interfaces/object-api-arch.xml
-index db5b20a01..1d821c88c 100644
+index db5b20a01..aedc425af 100644
 --- a/libsel4/arch_include/x86/interfaces/object-api-arch.xml
 +++ b/libsel4/arch_include/x86/interfaces/object-api-arch.xml
-@@ -398,6 +398,26 @@
+@@ -398,6 +398,25 @@
                  </description>
              </error>
          </method>
 +        <method id="X86PageTestAndClearAccessed" name="TestAndClearAccessed"
 +            manual_name="Test and Clear Accessed">
-+            <condition><config var="CONFIG_ARCH_X86_64"/></condition>
 +            <brief>Test and clear the accessed bit of a mapped 4 KiB frame.</brief>
 +            <description>
 +                The mapping is located using the capability's ASID and address,
@@ -206,14 +205,13 @@ index a68631936..3645ed683 100644
          setThreadState(NODE_STATE(ksCurThread), ThreadState_Restart);
          return performPageInvocationUnmap(cap, cte);
 diff --git a/src/arch/x86/kernel/vspace.c b/src/arch/x86/kernel/vspace.c
-index 81d41b332..f9f4d6d30 100644
+index f72660d95..88ee42395 100644
 --- a/src/arch/x86/kernel/vspace.c
 +++ b/src/arch/x86/kernel/vspace.c
-@@ -982,6 +982,49 @@ static create_mapping_pde_return_t createSafeMappingEntries_PDE(paddr_t base, wo
+@@ -982,6 +982,47 @@ static create_mapping_pde_return_t createSafeMappingEntries_PDE(paddr_t base, wo
  }
  
  
-+#ifdef CONFIG_ARCH_X86_64
 +static exception_t decodePageTestAndClearAccessed(cap_t cap, bool_t call)
 +{
 +    asid_t asid = cap_frame_cap_get_capFMappedASID(cap);
@@ -254,19 +252,16 @@ index 81d41b332..f9f4d6d30 100644
 +    current_syscall_error.invalidCapNumber = 0;
 +    return EXCEPTION_SYSCALL_ERROR;
 +}
-+#endif
 +
  exception_t decodeX86FrameInvocation(
      word_t invLabel,
      word_t length,
-@@ -1141,6 +1184,11 @@ exception_t decodeX86FrameInvocation(
+@@ -1139,6 +1180,9 @@ exception_t decodeX86FrameInvocation(
          return EXCEPTION_SYSCALL_ERROR;
      }
  
-+#ifdef CONFIG_ARCH_X86_64
 +    case X86PageTestAndClearAccessed:
 +        return decodePageTestAndClearAccessed(cap, call);
-+#endif
 +
      case X86PageUnmap: { /* Unmap */
          setThreadState(NODE_STATE(ksCurThread), ThreadState_Restart);

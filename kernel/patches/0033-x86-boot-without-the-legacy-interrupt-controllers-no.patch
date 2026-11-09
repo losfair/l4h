@@ -1,4 +1,4 @@
-From a45d437802c6cb57d350416d24520d48f0d8baea Mon Sep 17 00:00:00 2001
+From ebe2c39eed7a2217d577d82b29f8187ddcf711a0 Mon Sep 17 00:00:00 2001
 From: l4h <l4h@localhost>
 Date: Tue, 3 Nov 2026 01:03:36 -0800
 Subject: [PATCH 33/36] x86: boot without the legacy interrupt controllers
@@ -11,7 +11,7 @@ Subject: [PATCH 33/36] x86: boot without the legacy interrupt controllers
  3 files changed, 23 insertions(+), 7 deletions(-)
 
 diff --git a/include/arch/x86/arch/kernel/cmdline.h b/include/arch/x86/arch/kernel/cmdline.h
-index 1d1e219..051bcc1 100644
+index 1d1e21961..051bcc143 100644
 --- a/include/arch/x86/arch/kernel/cmdline.h
 +++ b/include/arch/x86/arch/kernel/cmdline.h
 @@ -21,6 +21,9 @@ typedef struct cmdline_opt {
@@ -25,10 +25,10 @@ index 1d1e219..051bcc1 100644
  
  void cmdline_parse(const char *cmdline, cmdline_opt_t *cmdline_opt);
 diff --git a/src/arch/x86/kernel/boot_sys.c b/src/arch/x86/kernel/boot_sys.c
-index fc76a77..e431cfc 100644
+index d988b568d..d9e4a2035 100644
 --- a/src/arch/x86/kernel/boot_sys.c
 +++ b/src/arch/x86/kernel/boot_sys.c
-@@ -517,12 +517,15 @@ static BOOT_CODE bool_t try_boot_sys(void)
+@@ -515,12 +515,15 @@ static BOOT_CODE bool_t try_boot_sys(void)
             (paddr_t)_start
            );
  
@@ -50,7 +50,7 @@ index fc76a77..e431cfc 100644
      }
  
      /* validate the ACPI table */
-@@ -556,7 +559,13 @@ static BOOT_CODE bool_t try_boot_sys(void)
+@@ -554,7 +557,13 @@ static BOOT_CODE bool_t try_boot_sys(void)
          return false;
      }
  
@@ -66,7 +66,7 @@ index fc76a77..e431cfc 100644
              printf("No IOAPICs detected\n");
              return false;
 diff --git a/src/arch/x86/kernel/cmdline.c b/src/arch/x86/kernel/cmdline.c
-index 9b37720..72efaf7 100644
+index 9b3772060..72efaf70a 100644
 --- a/src/arch/x86/kernel/cmdline.c
 +++ b/src/arch/x86/kernel/cmdline.c
 @@ -25,6 +25,7 @@ char cmdline_val[MAX_CMDLINE_VAL_LEN];

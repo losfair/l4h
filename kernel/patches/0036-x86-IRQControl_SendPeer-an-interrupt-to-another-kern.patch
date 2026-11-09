@@ -1,4 +1,4 @@
-From 7599af4b4c0093873ad52b6db91c6918bc76e878 Mon Sep 17 00:00:00 2001
+From b3f4d838da655474f096b9f2829d8e857ab6584c Mon Sep 17 00:00:00 2001
 From: l4h <l4h@localhost>
 Date: Tue, 3 Nov 2026 01:05:31 -0800
 Subject: [PATCH 36/36] x86: IRQControl_SendPeer, an interrupt to another
@@ -13,7 +13,7 @@ Subject: [PATCH 36/36] x86: IRQControl_SendPeer, an interrupt to another
  5 files changed, 75 insertions(+)
 
 diff --git a/include/arch/x86/arch/model/statedata.h b/include/arch/x86/arch/model/statedata.h
-index eeb488e..76e62cc 100644
+index eeb488edd..76e62cc76 100644
 --- a/include/arch/x86/arch/model/statedata.h
 +++ b/include/arch/x86/arch/model/statedata.h
 @@ -86,6 +86,11 @@ extern uint16_t x86KSconsolePort;
@@ -29,10 +29,10 @@ index eeb488e..76e62cc 100644
  
  extern x86_irq_state_t x86KSIRQState[];
 diff --git a/libsel4/arch_include/x86/interfaces/object-api-arch.xml b/libsel4/arch_include/x86/interfaces/object-api-arch.xml
-index cfccbfd..8de4b1d 100644
+index ee3fd011a..3dc1dc447 100644
 --- a/libsel4/arch_include/x86/interfaces/object-api-arch.xml
 +++ b/libsel4/arch_include/x86/interfaces/object-api-arch.xml
-@@ -977,6 +977,35 @@
+@@ -975,6 +975,35 @@
                  </description>
              </error>
          </method>
@@ -69,7 +69,7 @@ index cfccbfd..8de4b1d 100644
      <interface name="seL4_TCB" manual_name="TCB" cap_description="Capability to the TCB which is being operated on.">
          <method id="TCBSetEPTRoot" name="SetEPTRoot" manual_name="Set EPT Root" manual_label="set_eptroot">
 diff --git a/src/arch/x86/kernel/cmdline.c b/src/arch/x86/kernel/cmdline.c
-index eb87670..29d84e8 100644
+index eb8767002..29d84e862 100644
 --- a/src/arch/x86/kernel/cmdline.c
 +++ b/src/arch/x86/kernel/cmdline.c
 @@ -5,6 +5,7 @@
@@ -98,7 +98,7 @@ index eb87670..29d84e8 100644
      printf("Boot config: no_legacy_irq = %s\n", cmdline_opt->no_legacy_irq ? "true" : "false");
  
 diff --git a/src/arch/x86/model/statedata.c b/src/arch/x86/model/statedata.c
-index ecd3c63..e30f57e 100644
+index ecd3c6377..e30f57e3e 100644
 --- a/src/arch/x86/model/statedata.c
 +++ b/src/arch/x86/model/statedata.c
 @@ -66,6 +66,8 @@ uint16_t x86KSconsolePort;
@@ -111,7 +111,7 @@ index ecd3c63..e30f57e 100644
  
  /* State data tracking what IRQ source is related to each
 diff --git a/src/arch/x86/object/interrupt.c b/src/arch/x86/object/interrupt.c
-index 0a79d56..ca735e2 100644
+index 0a79d5653..ca735e294 100644
 --- a/src/arch/x86/object/interrupt.c
 +++ b/src/arch/x86/object/interrupt.c
 @@ -5,6 +5,8 @@
