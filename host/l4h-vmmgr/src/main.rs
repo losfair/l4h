@@ -309,8 +309,8 @@ impl Vmmgr {
     }
 
     /// Root has the answers of the requests in `done` (tokens' bits).
-    pub fn root_done(&mut self, done: u64) {
-        for t in (0..proto::MAX_PENDING).filter(|&t| done & (1 << t) != 0) {
+    pub fn root_done(&mut self, done: [u64; proto::MAX_PENDING / 64]) {
+        for t in (0..proto::MAX_PENDING).filter(|&t| done[t / 64] & (1 << (t % 64)) != 0) {
             match self.root_ops[t].take() {
                 Some(RootOp::Disk { id, instance, then }) => {
                     let r = self.disk_attached(id, instance, t);
@@ -779,7 +779,7 @@ fn root_events(h: &mut Vmmgr) {
             g.raise_event(&mut h.alloc, guest::dev_event(d));
         }
     }
-    let ops = ev.ops_done.swap(0, Ordering::AcqRel);
+    let ops = ev.ops_done.each_ref().map(|w| w.swap(0, Ordering::AcqRel));
     h.root_done(ops);
     let cmd = ev.monitor.swap(0, Ordering::AcqRel);
     let arg = (cmd & 0xffff_ffff) as usize;

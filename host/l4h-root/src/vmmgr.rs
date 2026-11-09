@@ -85,7 +85,7 @@ impl Vmmgr {
 
     /// Root has the answer of pending request `token`.
     fn op_done(&self, token: usize) {
-        self.events().ops_done.fetch_or(1 << token, Ordering::AcqRel);
+        self.events().ops_done[token / 64].fetch_or(1 << (token % 64), Ordering::AcqRel);
         self.signal.signal();
     }
 
@@ -413,23 +413,33 @@ pub enum OpResult {
 }
 
 /// A request root answers later (VMMGR_PENDING): for a guest (id,
-/// instance), if any; its answer, once there is one.
+/// instance), if any; the disk controller it waits for; its answer, once
+/// there is one.
 pub struct Op {
     guest: Option<(usize, u64)>,
+    ctrl: usize,
     done: Option<Result<OpResult, i64>>,
 }
 
 pub type Ops = [Option<Op>; proto::MAX_PENDING];
 
-/// A token for a request to be answered later, for `guest` if any.
-/// EBUSY if vmmgr has as many waiting as there are tokens.
-pub fn op_new(h: &mut Host, guest: Option<usize>) -> Result<usize, i64> {
+// Even if no blkd ever answers, as many tokens again are left for answers
+// vmmgr has yet to take.
+const _: () = assert!(2 * proto::PENDING_PER_CTRL * crate::pci::MAX_DISK_CTRLS <= proto::MAX_PENDING);
+
+/// A token for a request to controller `ctrl` to be answered later, for
+/// `guest` if any.  EBUSY if the controller has PENDING_PER_CTRL
+/// unanswered, or vmmgr has as many waiting as there are tokens.
+pub fn op_new(h: &mut Host, guest: Option<usize>, ctrl: usize) -> Result<usize, i64> {
     let guest = match guest {
         Some(id) => Some((id, h.guests.get(id).and_then(|g| g.as_ref()).ok_or(ctl::ENOENT)?.instance)),
         None => None,
     };
+    if h.ops.iter().flatten().filter(|op| op.ctrl == ctrl && op.done.is_none()).count() >= proto::PENDING_PER_CTRL {
+        return Err(ctl::EBUSY);
+    }
     let t = h.ops.iter().position(Option::is_none).ok_or(ctl::EBUSY)?;
-    h.ops[t] = Some(Op { guest, done: None });
+    h.ops[t] = Some(Op { guest, ctrl, done: None });
     Ok(t)
 }
 
@@ -660,7 +670,7 @@ fn disk_attach(h: &mut Host, a: [u64; 8]) -> Result<Answer, i64> {
     let (c, unit) = (h.disks[disk].ctrl, h.disks[disk].unit);
     let dom0 = h.guests[id].as_ref().ok_or(ctl::ENOENT)?.dom0;
     let list = (CTL_DATA_VA + list as usize) as *const u8;
-    let t = op_new(h, Some(id))?;
+    let t = op_new(h, Some(id), c)?;
     match blkd::attach_start(h, c, t, id, disk, unit, (lba_start, lba_count), (n, list), read_only, volatile, dom0) {
         Ok(()) => Ok(Answer::Later(t)),
         Err(e) => {

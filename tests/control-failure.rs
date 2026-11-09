@@ -15,6 +15,7 @@ use std::sync::Mutex;
 mod failure;
 /// A second copy, whose handler is never set: blkd's and netd's.
 #[path = "../host/l4h-rt/src/failure.rs"]
+#[allow(dead_code)]
 mod failure_mailbox;
 mod mailbox {
     pub fn fail() {

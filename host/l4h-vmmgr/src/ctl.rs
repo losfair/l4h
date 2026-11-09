@@ -252,6 +252,11 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
                 if g.state != State::Created || g.vmm.is_some() {
                     return Err(EINVAL);
                 }
+                // Before boot prepares it, so it can start once its disk is
+                // attached.
+                if g.root_pending {
+                    return Err(EBUSY);
+                }
                 // The boot blocks it fills with frames (as many as dom0
                 // asks for) and its l4h-vmm.
                 let (bytes, slots) = g.boot_cost(kernel.end, initrd).ok_or(EINVAL)?;

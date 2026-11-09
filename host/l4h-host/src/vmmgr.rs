@@ -131,9 +131,12 @@ pub const VMMGR_RESULT: u64 = 0x106;
 /// MAX_PENDING: root sets its bit in Events::ops_done and signals
 /// BADGE_ROOT_EVENT once it has the answer, which VMMGR_RESULT gives.  A
 /// driver that never answers leaves it pending; the guest's GUEST_DEL
-/// still answers ENOENT for it.
+/// still answers ENOENT for it.  A disk controller holds at most
+/// PENDING_PER_CTRL of them for requests blkd has not answered (EBUSY
+/// past that), so drivers that never answer leave tokens for the others.
 pub const VMMGR_PENDING: u64 = 1 << 63;
-pub const MAX_PENDING: usize = 64;
+pub const MAX_PENDING: usize = 256;
+pub const PENDING_PER_CTRL: usize = 2;
 
 /// Radix of the CNode of a netd port's frames.
 pub const PORT_RADIX: usize = 10;
@@ -145,10 +148,11 @@ pub struct Events {
     pub attest_done: core::sync::atomic::AtomicU64,
     /// A serial monitor command (MONITOR_*), 0 once vmmgr took it.
     pub monitor: core::sync::atomic::AtomicU64,
-    /// Bit t: root has the answer of pending request t (VMMGR_PENDING).
-    pub ops_done: core::sync::atomic::AtomicU64,
+    /// Bit t % 64 of word t / 64: root has the answer of pending request
+    /// t (VMMGR_PENDING).
+    pub ops_done: [core::sync::atomic::AtomicU64; MAX_PENDING / 64],
 }
-const _: () = assert!(MAX_PENDING <= 64);
+const _: () = assert!(MAX_PENDING % 64 == 0);
 
 /// Monitor commands, (cmd << 32) | arg.
 pub const MONITOR_DESTROY: u64 = 1;

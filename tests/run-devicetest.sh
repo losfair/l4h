@@ -57,6 +57,17 @@ fn execute(h: &mut Vmmgr, caller: usize, op: u32, a: &[u64; 6]) -> Result<(), i6
     }
 }
 ''')
+start = ctl.index('        abi::CTL_VM_START => {')
+end = ctl.index('        abi::CTL_VM_DESTROY => {', start)
+(out / 'vm-start.inc').write_text(vm_arg + '''
+fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq) -> Result<(), i64> {
+    let a = &req.args;
+    match req.op {
+''' + ctl[start:end] + '''
+        _ => unreachable!(),
+    }
+}
+''')
 PY
 cc -std=c11 -O2 -Wall -Wextra -Werror -I "$root/include" -I "$out" \
     -c "$root/tests/console-guest.c" -o "$out/console-guest.o"
@@ -86,6 +97,9 @@ L4H_BLK_ATTACH_TEST_SRC="$out/blk-attach.inc" rustc +stable --edition=2024 --tes
     --extern l4h_abi="$out/libl4h_abi.rlib" --extern l4h_host="$out/libl4h_host.rlib" \
     "$root/tests/blk-attach.rs" -o "$out/blk-attach-tests"
 "$out/blk-attach-tests"
+L4H_VM_START_TEST_SRC="$out/vm-start.inc" rustc +stable --edition=2024 --test -L dependency="$out" \
+    --extern l4h_abi="$out/libl4h_abi.rlib" "$root/tests/vm-start.rs" -o "$out/vm-start-tests"
+"$out/vm-start-tests"
 L4H_BLKD_TEST_SRC="$out/blkd-main.inc" rustc +stable --edition=2024 --test -L dependency="$out" \
     --extern l4h_host="$out/libl4h_host.rlib" \
     "$root/tests/blk-ipc.rs" -o "$out/blk-ipc-tests"

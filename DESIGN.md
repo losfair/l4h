@@ -2461,7 +2461,9 @@ pending, and so does whatever waits for it, nothing else:
   are answered later through vmmgr (`VMMGR_PENDING`, §10.3), and through
   dom0's control device, whose caller may give up and make the next
   request (§10.1). One staging user at a time per controller: another is
-  `EBUSY`.
+  `EBUSY`. A controller holds at most two of vmmgr's 256 tokens for
+  requests its blkd has not answered, so drivers that never answer leave
+  tokens for the other controllers.
 - **Teardown waits for no one.** A destroyed guest's I/O pool leaves the
   devices' IOMMU domains at once and is reused; what drivers map (disk
   channels, extent tables, port memory) is kept until they say they have

@@ -62,7 +62,7 @@ pub fn host_op(h: &mut Host, op: u32, a: &[u64; 6], data: &mut [u8; abi::CTL_DAT
             h.ensure_disk(disk)?;
             // dom0's control data area, which root maps read-only.
             let from = (zero == 0).then_some(crate::vmmgr::CTL_DATA_VA as *const u8);
-            let t = crate::vmmgr::op_new(h, None)?;
+            let t = crate::vmmgr::op_new(h, None, h.disks[disk].ctrl)?;
             if let Err(e) = crate::blkd::write(h, disk, sector, len, from, t) {
                 h.ops[t] = None;
                 return Err(e);
@@ -83,7 +83,7 @@ pub fn host_op(h: &mut Host, op: u32, a: &[u64; 6], data: &mut [u8; abi::CTL_DAT
                 vals = [((i << 12 | k) + 1) as u64, vm as u64, window.start, window.sectors, read_only as u64, k as u64];
                 // An extent's place is blkd's to say.
                 if extents != 0 {
-                    let t = crate::vmmgr::op_new(h, None)?;
+                    let t = crate::vmmgr::op_new(h, None, c)?;
                     match h.ctrls[c].extent(i, k, t, &mut vals) {
                         Ok(true) => return Ok(Answer::Later(t)),
                         Ok(false) => h.ops[t] = None,
