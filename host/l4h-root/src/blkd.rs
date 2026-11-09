@@ -11,7 +11,7 @@ use sel4::{CapRights, VmAttributes, cap, cap_type};
 
 use l4h_host::mailbox::RING;
 use l4h_host::blk::call::{Request, reply};
-use l4h_host::{self as host, blk, wire};
+use l4h_host::{self as host, blk, wire, wiring};
 
 use crate::component::{self, Component, SpawnArgs, abs_of};
 use crate::devmem::DevMem;
@@ -488,7 +488,7 @@ pub fn start(
     let irq = sel4::init_thread::Slot::<cap_type::IrqHandler>::from_index(irq_slot).cap();
     let irq_ntfn_slot = alloc.slots.alloc();
     let irq_ntfn = sel4::init_thread::Slot::<cap_type::Notification>::from_index(irq_ntfn_slot).cap();
-    abs_of(irq_ntfn).mint(&abs_of(comp.ntfn), CapRights::all(), host::badges::blkd::IRQ).expect("IRQ notification");
+    component::mint_edge(&abs_of(irq_ntfn), &wiring::IRQ_BLKD, 0, &abs_of(comp.ntfn)).expect("IRQ notification");
     irq.irq_handler_set_notification(irq_ntfn).expect("IRQ set notification");
     comp.give(blk::BLKD_SLOT_IRQ, irq, CapRights::all());
     if legacy_io.is_some() {
@@ -497,7 +497,7 @@ pub fn start(
     }
     pci.enable(d);
     pci.enable_msix(d);
-    let mailbox = Mailbox::new(&comp, mailbox::blkd_mailbox(ctrl), host::badges::driver::CALL, alloc, &mut arena, &mut keep_slot);
+    let mailbox = Mailbox::new(&comp, mailbox::blkd_mailbox(ctrl), &wiring::ROOT_BLKD_CALL, &wiring::BLKD_DONE, alloc, &mut arena, &mut keep_slot);
     component::start(&comp);
 
     let staging = dma_frames.start + n_dma - blk::STAGING_SIZE / PAGE..dma_frames.end;
@@ -531,11 +531,10 @@ fn attach(ctrl: &mut Controller, i: usize, disk: usize, client: &mut RootGuest, 
             CapRights::read_write(), VmAttributes::DEFAULT,
             keep.absolute_cptr_from_bits_with_depth((blk::CHANNEL_PAGES + k) as u64, 10)));
     }
-    driver.comp.give_badged(blk::BLKD_SLOT_CLIENT_DONE + i as u64, client.vmm_ntfn,
-        CapRights::write_only(), host::badges::vmm::DONE);
+    driver.comp.give_edge(&wiring::BLKD_VMM_DONE, i, 0, client.vmm_ntfn);
     let kick_slot = alloc.slots.alloc();
     let kick = sel4::init_thread::Slot::<cap_type::Notification>::from_index(kick_slot).cap();
-    abs_of(kick).mint(&abs_of(driver.comp.ntfn), CapRights::write_only(), host::badges::blkd::KICK).expect("blkd kick");
+    component::mint_edge(&abs_of(kick), &wiring::VMM_BLKD_KICK, 0, &abs_of(driver.comp.ntfn)).expect("blkd kick");
     // Reads write the pool, writes read it.
     let pool = (client.pool.paddr, client.pool.size);
     iommu.map(alloc, ctrl.dom, pool.0, pool.1, true);

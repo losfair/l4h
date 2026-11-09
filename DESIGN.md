@@ -2742,7 +2742,7 @@ one way to do each part of it:
   (`memd`), root's (`root`: trustd's and vmmgr's calls), vmmgr's (`vmmgr`:
   the VMMs'), trustd's flags endpoint (`trust`), the VMM's (`hypercall`:
   the guest's, whose side is `abi.h`), and the drivers' mailboxes (`blk`,
-  `net`, `usb`, sender `wire::RootOnly`). A protocol generates the decoded
+  `net`, `usb`, whose `Sender` is root alone, `Root: mailbox`). A protocol generates the decoded
   `Request`, a `Server` trait with a method per call, `serve` (decode,
   refuse what the declaration does not allow with `EINVAL`, run, encode),
   a `Client` trait with a method per call, and `reply::<Call>` for a
@@ -2764,6 +2764,89 @@ one way to do each part of it:
   `l4h_rt::mailbox::serve`, which reads and writes the ring and never the
   registers. Capabilities still cross in exchange slots, which each call's
   declaration names.
+- **Wiring.** Every capability by which one party calls, signals or
+  faults to another is an `Edge` of `l4h_host::wiring`: its holder and
+  where it holds it (fixed slots, a slot its minter chooses, an IRQ
+  handler, a fault endpoint), its target and which of its objects, its
+  rights, its badge (one value, a field per instance, or a bit per
+  instance), its minter and what it is for. It is minted from the edge
+  and nothing else (`l4h_task::edge::mint`, `Component::give_edge`, the
+  guest's `give_edge` in vmmgr), so slot, rights and badge cannot drift
+  from the declaration; `tests/check-wiring.sh` allows no other mint but
+  a CNode's guard. A component gets a capability to its parent's
+  endpoint only if it calls its parent (`wiring::parent_call`: trustd,
+  vmmgr, the VMMs), and its faults go to its parent by its fault edge
+  (`parent_fault`, or `keeper_fault` for a component with a keeper). At
+  compile time no two edges share a slot or a notification bit unless
+  both are declared shared, every call's badge decodes as a sender its
+  protocol accepts, every signal is in its receiver's badge space, root
+  calls no driver, vmmgr or VMM (it posts in their mailboxes), every fault
+  carries the FAULT bit, and a component has a keeper exactly when
+  another component calls it (`host::has_keeper`). trustd is the
+  exception: root and vmmgr call its flags thread, and a flags thread
+  that faults stops the host (`FLAGS_FAULT`). Capabilities that pass resources (CNodes, frames, IRQ
+  handlers, I/O ports, TCBs) are not edges, nor are a guest's own
+  vCPUs' (the guest ABI).
+
+The wiring (`l4h_host::wiring`, checked and kept here by its tests):
+
+<!-- wiring:begin -->
+| Edge | Holder | Target | Rights | What |
+|---|---|---|---|---|
+| `ROOT_MEMD` | Root | Memd Endpoint | Call | root's own memory (memd::call) |
+| `VMMGR_MEMD` | Vmmgr | Memd Endpoint | Call | vmmgr's memory and guests' RAM |
+| `VMMGR_VMM_MEMD` | Vmmgr | Memd Endpoint | Call | guest g's VMM's, which vmmgr cannot mint and copies to it (VMM_MEMD) |
+| `VMM_MEMD` | Vmm | Memd Endpoint | Call | a VMM's memory hotplug (VMMGR_VMM_MEMD's copy) |
+| `TRUSTD_ROOT` | Trustd | Root Endpoint | Call | trustd's calls to root (root::call) |
+| `VMMGR_ROOT` | Vmmgr | Root Endpoint | Call | vmmgr's calls to root (root::call) |
+| `VMM_VMMGR` | Vmm | Vmmgr Endpoint | Call | a VMM's calls to vmmgr (vmmgr::call) |
+| `ROOT_FLAGS` | Root | Trustd Flags | Call | the host's flags (trust::call), root's start-up handshake |
+| `VMMGR_FLAGS` | Vmmgr | Trustd Flags | Call | the host's flags for the console (ROOT_FLAGS's copy) |
+| `TRUSTD_FLAGS` | Trustd | Trustd Flags | Call | trustd's main thread's for guests |
+| `GUEST_VMM` | Guest | Vmm Endpoint | Call | the guest's hypercalls (hypercall::call) |
+| `TRUSTD_FAULT` | Trustd | Root Endpoint | Fault | trustd's main thread's faults |
+| `FLAGS_FAULT` | Trustd | Root Endpoint | Fault | trustd's flags thread's faults, which stop the host |
+| `BLKD_FAULT` | Blkd | Root Endpoint | Fault | a blkd's faults: root quarantines it |
+| `NETD_FAULT` | Netd | Root Endpoint | Fault | netd's faults: root suspends it |
+| `USBD_FAULT` | Usbd | Root Endpoint | Fault | a usbd's faults: root quarantines it |
+| `LOGD_FAULT` | Logd | Root Endpoint | Fault | logd's faults |
+| `VMM_FAULT` | Vmm | Vmmgr Endpoint | Fault | a VMM's faults |
+| `MEMD_KEEPER_FAULT` | Memd | Root Endpoint | KeeperFault | memd's keeper's faults |
+| `VMMGR_KEEPER_FAULT` | Vmmgr | Root Endpoint | KeeperFault | vmmgr's keeper's faults |
+| `GUEST_FAULT` | Guest | Vmmgr Endpoint | Fault | guest g's vCPU v's kernel's faults (instance guest_fault(g, v)) |
+| `ROOT_BLKD_CALL` | Root | Blkd Notification | Signal | root posted in blkd's mailbox (blk::call) |
+| `ROOT_NETD_CALL` | Root | Netd Notification | Signal | root posted in netd's mailbox (net::call) |
+| `ROOT_USBD_CALL` | Root | Usbd Notification | Signal | root posted in usbd's mailbox (usb::call) |
+| `ROOT_VMMGR_CALL` | Root | Vmmgr Notification | Signal | root posted notices in vmmgr's mailbox (vmmgr::call) |
+| `BLKD_DONE` | Blkd | Root Notification | Signal | blkd answered in its mailbox (root polls every mailbox on the bit) |
+| `NETD_DONE` | Netd | Root Notification | Signal | netd answered in its mailbox |
+| `USBD_DONE` | Usbd | Root Notification | Signal | usbd answered in its mailbox |
+| `VMMGR_DONE` | Vmmgr | Root Notification | Signal | vmmgr took root's notices |
+| `VMM_BLKD_KICK` | Vmm | Blkd Notification | Signal | a disk channel has requests (in its device's kick slot) |
+| `VMM_NETD_KICK` | Vmm | Netd Notification | Signal | port p has frames to send (in its device's kick slot) |
+| `VMM_USBD_KICK` | Vmm | Usbd Notification | Signal | the guest's USB queues have requests (the guest's, in its device CNode) |
+| `BLKD_VMM_DONE` | Blkd | Vmm Notification | Signal | client i's channel has completions |
+| `NETD_VMM_DONE` | Netd | Vmm Notification | Signal | port p has frames or room |
+| `USBD_VMM` | Usbd | Vmm Notification | Signal | the guest's USB controller n has completions |
+| `IRQ_BLKD` | Irq | Blkd Notification | Bind | its controller's interrupt |
+| `IRQ_NETD` | Irq | Netd Notification | Bind | uplink NIC n's interrupt |
+| `IRQ_USBD` | Irq | Usbd Notification | Bind | its xHCI's interrupt |
+| `IRQ_MONITOR` | Irq | Root Notification | Signal | the serial monitor's input |
+| `DOORBELL_ROOT` | Irq | Root Notification | Signal | another partition rang (its control channel) |
+| `DOORBELL_NETD` | Irq | Netd Notification | Signal | link l's peer rang |
+| `NETD_LINK_SELF` | Netd | Netd Notification | Signal | netd's reminder to read link l again (as its doorbell) |
+| `NETD_LINK_RING` | Netd | Root Notification | Signal | ring link l's peer's doorbell (only root holds IRQControl) |
+| `GUEST_TRUSTD` | Guest | Trustd Kick | Signal | guest g made a request in its attestation page |
+| `ROOT_TRUSTD_RELAY` | Root | Trustd Kick | Signal | another partition's trustd answered or asked (guest 63's bit too) |
+| `GUEST_CTL` | Guest | Vmmgr Notification | Signal | dom0 made a control request (its control device's kick) |
+| `GUEST_VMM_KICK` | Guest | Vmm Notification | Signal | a guest device was kicked (its device CNode) |
+| `GUEST_VMM_MEM` | Guest | Vmm Notification | Signal | a hotplug request in the memory device page |
+| `GUEST_VMM_CONSOLE` | Guest | Vmm Notification | Signal | the guest wrote to its console ring |
+| `VMMGR_VMM` | Vmmgr | Vmm Notification | Signal | the guest's hotplug target changed |
+| `VMM_VCPU` | Vmm | Guest Vcpu | Signal | raise device events on vCPU v |
+| `GUEST_IPI` | Guest | Guest Vcpu | Signal | a guest's IPIs to its own vCPUs (abi::VCPU_IPI of each) |
+| `VMMGR_VCPU` | Vmmgr | Guest Vcpu | Signal | raise events vmmgr serves (attestation, control) on vCPU 0 |
+<!-- wiring:end -->
 
 **Serial output** goes through shared memory to l4h-logd (§10.4), and root
 drives COM1 input for the monitor. The port takes about 11 KB/s, so prints

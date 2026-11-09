@@ -17,9 +17,10 @@ use sel4::{CNodeCapData, CapRights, ObjectBlueprint, VmAttributes, cap, cap_type
 use l4h_abi as abi;
 use l4h_host as host;
 use l4h_host::fixed::ArrayVec;
+use l4h_host::wiring;
 use l4h_host::trust::{self, GuestRecord, TrustdConfig};
 
-use crate::component::{self, Component, SpawnArgs, abs_of, component_badge, root_cap};
+use crate::component::{self, Component, SpawnArgs, abs_of, root_cap};
 use crate::devmem::DevMem;
 use crate::mem::{Alloc, Arena, ObjCtx};
 use crate::vspace::{FRAME_BP, map_frame};
@@ -407,7 +408,7 @@ fn finish(
         }
         let slot = alloc.slots.alloc();
         let badged = sel4::init_thread::Slot::<cap_type::Notification>::from_index(slot).cap();
-        abs_of(badged).mint(&abs_of(kick), CapRights::write_only(), trust::RELAY_BADGE).expect("relay kick");
+        component::mint_edge(&abs_of(badged), &wiring::ROOT_TRUSTD_RELAY, 0, &abs_of(kick)).expect("relay kick");
         badged
     });
     let flags = core::array::from_fn(|p| {
@@ -420,11 +421,10 @@ fn finish(
     });
     let ep = arena.object_cap::<cap_type::Endpoint>(alloc, ObjectBlueprint::Endpoint);
     comp.give(trust::SLOT_FLAGS_EP, ep, CapRights::all());
-    let call_rights = sel4::CapRightsBuilder::none().write(true).grant_reply(true).build();
-    comp.give_badged(trust::SLOT_FLAGS_CALL, ep, call_rights.clone(), trust::Sender::Trustd.badge());
+    comp.give_edge(&wiring::TRUSTD_FLAGS, 0, 0, ep);
     let slot = alloc.slots.alloc();
     let flags_ep = sel4::init_thread::Slot::<cap_type::Endpoint>::from_index(slot).cap();
-    abs_of(flags_ep).mint(&abs_of(ep), call_rights, trust::Sender::Root.badge()).expect("root flags endpoint");
+    component::mint_edge(&abs_of(flags_ep), &wiring::ROOT_FLAGS, 0, &abs_of(ep)).expect("root flags endpoint");
     let bootstrap = flags_thread(&comp, alloc, &mut arena, info);
     component::start(&comp);
     // reply_recv puts the worker back on the endpoint before returning
@@ -464,7 +464,7 @@ impl Trustd {
                 .write_volatile(if self.no_reports { abi::ATTEST_NO_REPORTS } else { 0 });
         });
         page.copy(&abs_of(p), CapRights::all()).expect("attestation page");
-        kick.mint(&abs_of(self.kick), CapRights::write_only(), l4h_host::badges::trustd_kick::GUEST.nth(id)).expect("attestation kick");
+        component::mint_edge(kick, &wiring::GUEST_TRUSTD, id, &abs_of(self.kick)).expect("attestation kick");
         true
     }
 
@@ -626,8 +626,7 @@ fn flags_thread(c: &Component, alloc: &mut Alloc, arena: &mut Arena, info: &Host
         map_frame(&mut ctx, c.vspace, f, va, CapRights::read_write(), VmAttributes::DEFAULT);
     }
     let fault_slot = ctx.alloc.slots.alloc();
-    abs_of(root_cap::<cap_type::Null>(fault_slot))
-        .mint(&abs_of(info.hyp_ep), CapRights::all(), component_badge(FLAGS_ID) | l4h_host::badges::root::FAULT)
+    component::mint_edge(&abs_of(root_cap::<cap_type::Null>(fault_slot)), &wiring::FLAGS_FAULT, 0, &abs_of(info.hyp_ep))
         .expect("flags fault ep");
     tcb.tcb_configure(c.cnode, CNodeCapData::new(0, 64 - c.cnode_bits), c.vspace, trust::FLAGS_IPCBUF_VA as u64, ipc)
         .expect("flags TCB configure");

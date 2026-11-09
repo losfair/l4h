@@ -75,8 +75,8 @@ impl Channels {
             buf: [0; MSG_MAX],
         };
         let badged = alloc.slots.alloc();
-        crate::component::abs_of(sel4::init_thread::Slot::<cap_type::Null>::from_index(badged).cap())
-            .mint(&crate::component::abs_of(ntfn), sel4::CapRights::write_only(), l4h_host::badges::root::CHANNEL)
+        let dst = crate::component::abs_of(sel4::init_thread::Slot::<cap_type::Null>::from_index(badged).cap());
+        crate::component::mint_edge(&dst, &l4h_host::wiring::DOORBELL_ROOT, 0, &crate::component::abs_of(ntfn))
             .expect("doorbell badge");
         let badged = sel4::init_thread::Slot::<cap_type::Notification>::from_index(badged).cap();
         for ch in d.channels() {

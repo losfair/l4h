@@ -29,7 +29,7 @@ use sel4::{CapRights, ObjectBlueprint, VmAttributes, cap, cap_type};
 
 use l4h_abi::{self as abi, usb as uabi};
 use l4h_host::usb::call::{Request, reply};
-use l4h_host::{self as host, usb, wire};
+use l4h_host::{self as host, usb, wire, wiring};
 use l4h_host::fixed::ArrayVec;
 
 use crate::blkd::{BarCache, DEVICE_ATTRS, bar_frames, keep_bits};
@@ -339,13 +339,13 @@ fn claim(h: &mut Host, i: usize) -> Result<(), Errno> {
         let f = dma_cn.absolute_cptr_from_bits_with_depth(p as u64, bits - 12);
         comp.map_copy(&mut h.alloc, &mut arena, &f, host::DMA_VA + p * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep_slot());
     }
-    let mbox = Mailbox::new(&comp, mailbox::usbd_mailbox(i), l4h_host::badges::driver::CALL, &mut h.alloc, &mut arena, &mut keep_slot);
+    let mbox = Mailbox::new(&comp, mailbox::usbd_mailbox(i), &wiring::ROOT_USBD_CALL, &wiring::USBD_DONE, &mut h.alloc, &mut arena, &mut keep_slot);
     // The interrupt.
     let irq_slot = h.alloc.slots.global(|s| s.alloc());
     pci::msi_irq(&d, vector, &abs_of(root_cap::<cap_type::Null>(irq_slot)));
     let irq = root_cap::<cap_type::IrqHandler>(irq_slot);
     let irq_ntfn = root_cap::<cap_type::Notification>(h.alloc.slots.alloc());
-    abs_of(irq_ntfn).mint(&abs_of(comp.ntfn), CapRights::all(), l4h_host::badges::usbd::IRQ).expect("usbd IRQ notification");
+    component::mint_edge(&abs_of(irq_ntfn), &wiring::IRQ_USBD, 0, &abs_of(comp.ntfn)).expect("usbd IRQ notification");
     irq.irq_handler_set_notification(irq_ntfn).expect("usbd IRQ set notification");
     comp.give(usb::USBD_SLOT_IRQ, irq, CapRights::all());
     c.dom = dom;
@@ -545,9 +545,9 @@ pub fn attach(h: &mut Host, i: usize, g: &mut RootGuest) -> Result<Attached, Err
     // Completions go to the guest's VMM, which raises the device's event.
     let irq_slot = usb::USBD_SLOT_CLIENT_IRQ + idx as u64;
     let _ = d.comp.slot(irq_slot).delete();
-    d.comp.give_badged(irq_slot, g.vmm_ntfn, CapRights::write_only(), l4h_host::badges::vmm::USB.nth(n));
+    d.comp.give_edge(&wiring::USBD_VMM, idx, n, g.vmm_ntfn);
     let kick = root_cap::<cap_type::Notification>(h.alloc.slots.alloc());
-    abs_of(kick).mint(&abs_of(d.comp.ntfn), CapRights::write_only(), l4h_host::badges::usbd::KICK).expect("usbd kick");
+    component::mint_edge(&abs_of(kick), &wiring::VMM_USBD_KICK, 0, &abs_of(d.comp.ntfn)).expect("usbd kick");
     d.idx = idx;
     c.pool = Some((g.pool.gpa, g.pool.paddr, g.pool.size));
     c.state = State::Vm(g.id);

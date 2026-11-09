@@ -53,11 +53,6 @@ crate::badge_space! {
     }
 }
 
-/// A guest kernel vCPU's fault badge on vmmgr's endpoint.
-pub const fn guest_fault(guest: usize, vcpu: usize) -> u64 {
-    vmmgr::FAULT | vmmgr::ID.put(guest as u64) | vmmgr::VCPU.put(vcpu as u64)
-}
-
 crate::badge_space! {
     /// What every driver with a mailbox (crate::mailbox: blkd, netd,
     /// usbd) sees on its bound notification from root.  Their spaces
@@ -188,7 +183,9 @@ mod tests {
         assert_eq!(parent::COMPONENT, 1 << 25);
         assert_eq!(root::SIGNALS, (1 << 40) | (1 << 41) | (1 << 42) | (1 << 43) | (((1 << crate::net::MAX_LINKS) - 1) << 44));
         assert_eq!(vmmgr::SIGNALS, (1 << 40) | (1 << 41) | (1 << 42));
-        assert_eq!(guest_fault(3, 5), (1 << 24) | 3 | (5 << 16));
+        let fault = crate::wiring::GUEST_FAULT.badge(crate::wiring::guest_fault(3, 5));
+        assert_eq!(fault, (1 << 24) | 3 | (5 << 16));
+        assert_eq!((vmmgr::ID.get(fault), vmmgr::VCPU.get(fault)), (3, 5));
         assert_eq!(memd::VMM | memd::GUEST.put(7), (1 << 62) | 7);
         assert_eq!(memd::VMMGR, 1 << 61);
     }

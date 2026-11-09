@@ -29,6 +29,7 @@ pub mod trust;
 pub mod usb;
 pub mod vmmgr;
 pub mod wire;
+pub mod wiring;
 
 /// Whether host components print informational messages.  The serial port
 /// takes about 11 KB/s, so release builds (`L4H_RELEASE=1` when the host is

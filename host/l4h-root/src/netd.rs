@@ -7,7 +7,7 @@ use core::sync::atomic::Ordering;
 use l4h_host::errno::Errno;
 use sel4::{CapRights, ObjectBlueprint, VmAttributes, cap, cap_type};
 
-use l4h_host::badges;
+use l4h_host::{badges, wiring};
 use l4h_host::net::call::Request;
 use l4h_host::fixed::ArrayVec;
 use l4h_host::{self as host, net};
@@ -348,16 +348,14 @@ pub fn spawn(
         let irq = sel4::init_thread::Slot::<cap_type::IrqHandler>::from_index(irq_slot).cap();
         let ntfn_slot = alloc.slots.alloc();
         let ntfn = sel4::init_thread::Slot::<cap_type::Notification>::from_index(ntfn_slot).cap();
-        abs_of(ntfn)
-            .mint(&abs_of(comp.ntfn), CapRights::all(), badges::netd::IRQ.nth(n))
-            .expect("NIC IRQ notification");
+        component::mint_edge(&abs_of(ntfn), &wiring::IRQ_NETD, n, &abs_of(comp.ntfn)).expect("NIC IRQ notification");
         irq.irq_handler_set_notification(ntfn).expect("NIC IRQ set notification");
         comp.give(net::NETD_SLOT_IRQ_BASE + n as u64, irq, CapRights::all());
         pci.enable(&d);
         pci.enable_msix(&d);
         let _ = nic_list.push(Nic { pci: *d, switch: None });
     }
-    let mailbox = Mailbox::new(&comp, mailbox::NETD_MAILBOX, badges::driver::CALL, alloc, &mut arena, &mut keep_slot);
+    let mailbox = Mailbox::new(&comp, mailbox::NETD_MAILBOX, &wiring::ROOT_NETD_CALL, &wiring::NETD_DONE, alloc, &mut arena, &mut keep_slot);
     component::start(&comp);
     Netd {
         comp,
@@ -492,15 +490,10 @@ impl Netd {
                 comp.map_copy(alloc, arena, &f, net::port_va(p) + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, dst)
             });
         }
-        self.comp.give_badged(
-            net::NETD_SLOT_CLIENT_BASE + p as u64,
-            g.vmm_ntfn,
-            CapRights::write_only(),
-            badges::vmm::DONE,
-        );
+        self.comp.give_edge(&wiring::NETD_VMM_DONE, p, 0, g.vmm_ntfn);
         let kick_slot = alloc.slots.alloc();
         let kick = sel4::init_thread::Slot::<cap_type::Notification>::from_index(kick_slot).cap();
-        abs_of(kick).mint(&abs_of(self.comp.ntfn), CapRights::write_only(), badges::netd::PORT.nth(p)).expect("port kick");
+        component::mint_edge(&abs_of(kick), &wiring::VMM_NETD_KICK, p, &abs_of(self.comp.ntfn)).expect("port kick");
         // Only root grants a dom0 port the physical uplink's identity.
         // A bond keeps both permanent MACs but can send with either
         // member's MAC on either link. Do not unlock arbitrary sources.
@@ -631,16 +624,15 @@ impl Netd {
             .ok_or(ctl::ENOMEM)?;
         // The doorbell wakes netd directly, badged as the link; netd acks
         // it.  netd's kick to itself carries the same badge.
-        let badge = badges::netd::LINK.nth(l);
         let badged = alloc.slots.alloc();
         let badged = sel4::init_thread::Slot::<cap_type::Notification>::from_index(badged).cap();
-        abs_of(badged).mint(&abs_of(self.comp.ntfn), CapRights::write_only(), badge).expect("link doorbell badge");
+        component::mint_edge(&abs_of(badged), &wiring::DOORBELL_NETD, l, &abs_of(self.comp.ntfn)).expect("link doorbell badge");
         match crate::channel::doorbell(alloc, ch.vector, badged) {
             Some(irq) => self.comp.give(net::NETD_SLOT_LINK_IRQ_BASE + l as u64, irq, CapRights::all()),
             None => log!("l4h-root: no doorbell from partition {} for the link", ch.peer),
         }
-        self.comp.give_badged(net::NETD_SLOT_LINK_KICK_BASE + l as u64, self.comp.ntfn, CapRights::write_only(), badge);
-        self.comp.give_badged(net::NETD_SLOT_LINK_RING_BASE + l as u64, ntfn, CapRights::write_only(), badges::root::LINK.nth(l));
+        self.comp.give_edge(&wiring::NETD_LINK_SELF, l, l, self.comp.ntfn);
+        self.comp.give_edge(&wiring::NETD_LINK_RING, l, l, ntfn);
         self.post(Request::AddLink { link: l, switch: switch as usize, size: ch.size as u64, me: me as u32, peer: ch.peer as u32 })?;
         self.links.must_push(Link { peer: ch.peer, peer_slot: ch.peer_slot, peer_vector: ch.peer_vector });
         Ok(l)

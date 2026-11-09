@@ -337,7 +337,7 @@ pub fn spawn(h: &mut Host, modules: &Modules, plan: &Dom0Plan) -> Vmmgr {
         comp.map_copy(&mut h.alloc, &mut arena, &f, proto::CTL_DATA_VA + p * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep_slot());
     }
 
-    let mailbox = Mailbox::new(&comp, crate::mailbox::VMMGR_MAILBOX, l4h_host::badges::vmmgr::MAILBOX, &mut h.alloc, &mut arena, &mut keep_slot);
+    let mailbox = Mailbox::new(&comp, crate::mailbox::VMMGR_MAILBOX, &l4h_host::wiring::ROOT_VMMGR_CALL, &l4h_host::wiring::VMMGR_DONE, &mut h.alloc, &mut arena, &mut keep_slot);
     component::start(&comp);
     info!("l4h-root: vmmgr started with {} MiB of boot modules", pages * PAGE >> 20);
     Vmmgr { comp, arena, mailbox, ops_waiting: [0; proto::MAX_PENDING / 64], attest_waiting: 0, monitor_waiting: None }

@@ -8,8 +8,8 @@
 //! (l4h-vmmgr's memd.rs), and memory a guest plugs while it runs (DESIGN.md
 //! §8.5) between its l4h-vmm and memd.
 
-use l4h_host as host;
-use l4h_host::memd::{self, BalloonConfig, MemdConfig, Sender, call::Client};
+use l4h_host::{self as host, wiring};
+use l4h_host::memd::{self, BalloonConfig, MemdConfig, call::Client};
 use l4h_task::memd::MemdLink;
 use sel4::{CapRights, ObjectBlueprint, VmAttributes, cap, cap_type};
 
@@ -55,10 +55,9 @@ fn link(alloc: &Alloc) -> MemdLink {
 pub fn give_vmmgr(alloc: &mut Alloc, arena: &mut Arena, vmmgr: &Component) {
     use l4h_host::vmmgr as proto;
     let m = link(alloc);
-    let call = sel4::CapRightsBuilder::none().write(true).grant_reply(true).build();
-    vmmgr.give_badged(proto::SLOT_MEMD_EP, m.endpoint(), call.clone(), Sender::Vmmgr.badge());
+    vmmgr.give_edge(&wiring::VMMGR_MEMD, 0, 0, m.endpoint());
     for g in 0..memd::MAX_GUESTS {
-        vmmgr.give_badged(proto::SLOT_VMM_MEMD_EP + g as u64, m.endpoint(), call.clone(), Sender::Vmm(g).badge());
+        vmmgr.give_edge(&wiring::VMMGR_VMM_MEMD, g, g, m.endpoint());
     }
     let area = arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: memd::XCHG_RADIX });
     vmmgr.give(proto::SLOT_MEMD_XCHG, area, CapRights::all());

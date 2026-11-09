@@ -12,7 +12,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use sel4::{CapRights, VmAttributes, cap, cap_type};
 
-use l4h_host::badges;
+use l4h_host::wiring::Edge;
 use l4h_host::mailbox::{self as mb, ANSWER, ARGS, MAILBOX_PAGES, MAILBOX_VA, PUBLISHED_OFFSET, RING};
 
 use crate::component::{Component, abs_of};
@@ -54,11 +54,10 @@ pub struct Mailbox {
 
 impl Mailbox {
     /// Give `comp` its mailbox, number `index` in layout::MAILBOXES, from
-    /// `arena`, keeping the mapping capabilities in `keep()`.  Root kicks
-    /// it with `kick` in its badge space (a driver's badges::driver::CALL).
-    pub fn new(comp: &Component, index: usize, kick: u64, alloc: &mut Alloc, arena: &mut Arena,
+    /// `arena`, keeping the mapping capabilities in `keep()`.  Root posts
+    /// on edge `call`, and `comp` answers on `done`.
+    pub fn new(comp: &Component, index: usize, call: &Edge, done: &Edge, alloc: &mut Alloc, arena: &mut Arena,
         mut keep: impl FnMut() -> sel4::AbsoluteCPtr) -> Self {
-        let kick_badge = kick;
         let base = layout::MAILBOXES.base + index * MAILBOX_PAGES * PAGE;
         assert!(base + MAILBOX_PAGES * PAGE <= layout::MAILBOXES.end(), "mailbox {}", index);
         for p in 0..MAILBOX_PAGES {
@@ -68,10 +67,10 @@ impl Mailbox {
                 CapRights::read_write(), VmAttributes::DEFAULT);
         }
         let ntfn = cap::Notification::from_bits(NTFN.load(Ordering::Relaxed));
-        comp.give_badged(mb::SLOT_MAILBOX_DONE, ntfn, CapRights::write_only(), badges::root::MAILBOX);
+        comp.give_edge(done, 0, 0, ntfn);
         let slot = alloc.slots.alloc();
         let kick = sel4::init_thread::Slot::<cap_type::Notification>::from_index(slot).cap();
-        abs_of(kick).mint(&abs_of(comp.ntfn), CapRights::write_only(), kick_badge).expect("mailbox kick");
+        crate::component::mint_edge(&abs_of(kick), call, 0, &abs_of(comp.ntfn)).expect("mailbox kick");
         Mailbox { page: base as *const mb::Mailbox, published: base + PUBLISHED_OFFSET, kick, posted: 0, answered: 0 }
     }
 

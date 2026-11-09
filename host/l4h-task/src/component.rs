@@ -17,6 +17,7 @@ use crate::window::Window;
 const PAGE: usize = 4096;
 
 use l4h_host::badges::parent;
+use l4h_host::wiring::{self, Edge};
 
 /// The badge of a component's calls on its parent's endpoint (badges::parent).
 pub const fn component_badge(id: u32) -> u64 {
@@ -26,6 +27,8 @@ pub const fn component_badge(id: u32) -> u64 {
 pub struct Component {
     local_cnode: cap::CNode,
     pub id: u32,
+    /// host::KIND_*.
+    pub kind: u32,
     pub tcb: cap::Tcb,
     pub cnode: cap::CNode,
     pub vspace: cap::VSpace,
@@ -48,10 +51,22 @@ impl Component {
             .unwrap_or_else(|e| panic!("component {} slot {} copy: {:?}", self.id, idx, e));
     }
 
+    /// Mint a capability that is no IPC (a CNode's guard): those are
+    /// edges (give_edge).
     pub fn give_badged(&self, idx: u64, src: impl sel4::HasCPtrWithDepth, rights: CapRights, badge: u64) {
         self.slot(idx)
             .mint(&self.local_cnode.absolute_cptr(src), rights, badge)
             .unwrap_or_else(|e| panic!("component {} slot {} mint: {:?}", self.id, idx, e));
+    }
+
+    /// Mint instance `i` of `e`, which this component holds, from `src`
+    /// (the target's object, in the caller's CSpace) into the edge's n-th
+    /// slot.
+    pub fn give_edge(&self, e: &Edge, n: usize, i: usize, src: impl sel4::HasCPtrWithDepth) {
+        assert!(e.holder.kind() == Some(self.kind), "component {} does not hold {}", self.id, e.name);
+        let idx = e.slot(n);
+        crate::edge::mint(&self.slot(idx), e, i, &self.local_cnode.absolute_cptr(src))
+            .unwrap_or_else(|err| panic!("component {} slot {} ({}) mint: {:?}", self.id, idx, e.name, err));
     }
 
     /// Map `frame` (a capability anywhere in the parent's CSpace) into the
@@ -148,7 +163,7 @@ pub fn create(
     drop(ctx);
     assign_asid(alloc, vspace);
 
-    let c = Component { local_cnode, id: args.id, tcb, cnode, vspace, ntfn, service_ep, sc, cnode_bits };
+    let c = Component { local_cnode, id: args.id, kind: args.kind, tcb, cnode, vspace, ntfn, service_ep, sc, cnode_bits };
 
     // Shared diagnostics: mapping caps belong to the child's arena, so
     // destroying a VMM releases them without revoking the shared frames.
@@ -274,12 +289,11 @@ pub fn create(
     c.give_badged(host::SLOT_CNODE, cnode, CapRights::all(), guard.into_word());
     c.give(host::SLOT_VSPACE, vspace, CapRights::all());
     c.give(host::SLOT_TCB, tcb, CapRights::all());
-    c.give_badged(
-        host::SLOT_ROOT_EP,
-        context.parent_ep,
-        sel4::CapRightsBuilder::none().write(true).grant_reply(true).build(),
-        component_badge(args.id),
-    );
+    // Only a component that calls its parent can.
+    if let Some(e) = wiring::parent_call(args.kind) {
+        assert_eq!(e.badge(args.id as usize), component_badge(args.id), "{}: the parent knows the caller by its id", e.name);
+        c.give_edge(e, 0, args.id as usize, context.parent_ep);
+    }
     c.give(host::SLOT_NTFN, ntfn, CapRights::all());
     c.give(host::SLOT_SERVICE_EP, service_ep, CapRights::all());
     c.give(host::SLOT_REPLY, reply, CapRights::all());
@@ -290,9 +304,14 @@ pub fn create(
     context.sched_control
         .sched_control_configure_flags(sc, args.budget_us, args.period_us, 0, 0, 0)
         .expect("component SC");
+    // To the parent go the faults of the keeper, if there is one, or else
+    // of the main thread.
+    let fault = if keeper.is_some() { wiring::keeper_fault(args.kind) } else { wiring::parent_fault(args.kind) }
+        .expect("a component's faults go to its parent");
+    assert_eq!(fault.badge(args.id as usize), component_badge(args.id) | parent::FAULT, "{}", fault.name);
     let fault_slot = alloc.slots.alloc();
-    local_cnode.absolute_cptr(cap_at::<cap_type::Null>(fault_slot))
-        .mint(&local_cnode.absolute_cptr(context.parent_ep), CapRights::all(), component_badge(args.id) | parent::FAULT)
+    crate::edge::mint(&local_cnode.absolute_cptr(cap_at::<cap_type::Null>(fault_slot)), fault, args.id as usize,
+        &local_cnode.absolute_cptr(context.parent_ep))
         .expect("component fault ep");
     let root_fault = cap_at::<cap_type::Endpoint>(fault_slot);
     // The keeper is left suspended: the main thread starts it, on its own

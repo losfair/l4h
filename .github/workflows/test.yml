@@ -72,6 +72,8 @@ jobs:
         run: tests/run-versiontest.sh
       - name: No host code prints through the kernel
         run: tests/check-debug-print.sh
+      - name: Capabilities are minted from the wiring
+        run: tests/check-wiring.sh
       - name: Control client and multikernel preflight
         run: cargo +stable test --manifest-path tools/l4hctl/Cargo.toml
       - name: Host unit tests (allocator, memd grants, I/O pool, display)

@@ -4,7 +4,6 @@
 
 use sel4::{CapRights, ObjectBlueprint, VmAttributes, cap, cap_type};
 
-use l4h_abi as abi;
 use l4h_host as host;
 use l4h_host::fixed::{ArrayVec, Scratch};
 
@@ -238,7 +237,7 @@ fn map(g: &mut Guest, comp: &Component, backends: &[(usize, Backend)], alloc: &m
     for (v, vcpu) in g.vcpus.iter().enumerate() {
         let ev = crate::component::abs_of(vcpu.event);
         comp.map_copy(alloc, &mut g.arena, &ev, host::vmm_event_page_va(v), CapRights::read_write(), attrs, keep_slot());
-        comp.give_badged(host::VCPU_NTFN_SLOT_BASE + v as u64, vcpu.ntfn, CapRights::write_only(), abi::BADGE_EVENT);
+        comp.give_edge(&l4h_host::wiring::VMM_VCPU, v, 0, vcpu.ntfn);
     }
     for (d, dev) in g.devices.iter().enumerate() {
         // A USB controller's queue area is usbd's and the guest's alone.
