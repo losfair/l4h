@@ -1,4 +1,4 @@
-//! Root's requests to the drivers (blkd, netd).  A driver handles guests'
+//! Root's requests to the drivers (blkd, netd, usbd).  A driver handles guests'
 //! rings and device memory, so root must assume its code can be an
 //! attacker's, and an attacker's driver could leave a request unanswered
 //! for good.  Root never waits for one: it posts requests in a ring in a
@@ -9,7 +9,8 @@
 //! stays pending, and so does whatever waits for it, nothing else.
 //!
 //! The second page is the driver's to publish what root reads without
-//! asking: blkd's disks (blk::Published), netd's counters (net::Published).
+//! asking: blkd's disks (blk::Published), netd's counters (net::Published),
+//! usbd's (usb::Published).
 
 use core::sync::atomic::AtomicU64;
 
@@ -22,7 +23,7 @@ const _: () = assert!(MAILBOX_VA >= crate::serial::VA + crate::serial::PAGES * 4
     && MAILBOX_VA + MAILBOX_PAGES * 4096 < crate::KEEPER_STACK_TOP - crate::KEEPER_STACK_SIZE);
 
 /// Badge bit of root's requests on the driver's notification (above every
-/// blkd and netd notification badge).
+/// blkd, netd and usbd notification badge).
 pub const BADGE_CALL: u64 = 1 << 62;
 
 /// The driver's capability to signal root that it answered.
@@ -60,5 +61,5 @@ const _: () = assert!(core::mem::size_of::<Mailbox>() <= PUBLISHED_OFFSET);
 
 /// The kinds root asks through a mailbox.
 pub const fn has_mailbox(kind: u32) -> bool {
-    matches!(kind, crate::KIND_BLKD | crate::KIND_NETD)
+    matches!(kind, crate::KIND_BLKD | crate::KIND_NETD | crate::KIND_USBD)
 }

@@ -2429,18 +2429,25 @@ controller, one per claimed controller, and the guest forwards Linux's
   scratchpad, DCBAA and contexts, command and event rings and a pool of 256
   transfer rings of 512 TRBs; 4 MiB for QEMU's), maps BAR 0 uncached into a new usbd,
   binds the interrupt (MSI-X entry 0, or plain MSI, which Intel PCH
-  controllers have instead) to its notification, and calls `USBD_CLAIM`.
+  controllers have instead) to its notification, and posts `USBD_CLAIM` in
+  usbd's mailbox (`l4h_host::mailbox`, §10, "Root never waits on a
+  driver").
   usbd walks the extended capabilities (bounded: 256 entries inside BAR 0,
   `host::usb::xcaps`), takes the controller from the firmware (OS Owned,
   then up to 1 s for BIOS Owned to clear, else it clears it, as Linux
   does; legacy SMIs off), halts and resets it. Root routes Intel PCH ports
-  to the xHCI. `USBD_CLAIM` is the only call root makes to usbd: once a
-  guest has the controller it can keep usbd busy, so root never waits for
-  usbd again (it would hold up every guest's control requests). Attach and
-  release are requests in a mailbox page root and usbd share
-  (`host::usb::Mailbox`): root writes one and signals usbd, usbd does it
-  when it gets to it and signals root's notification (`USB_BADGE`), and
-  root acts on the result there. A controller once claimed stays with its usbd until reboot,
+  to the xHCI once usbd has answered. Root never calls usbd: a guest that
+  has the controller can keep usbd busy, and even the claim's handoff and
+  reset take up to seconds, which would hold up every guest's control
+  requests. Claim, attach and release are requests in the mailbox: usbd
+  answers them in order when it gets to them, and root finishes each from
+  its serve loop (`usb::poll`). The attachment that claimed the controller
+  does not wait for the claim: the guest gets its queue area at once, its
+  attach is posted when the claim is answered, and if the claim fails the
+  controller is quarantined and the guest's driver finds no magic. usbd
+  publishes its refused requests and resets in the mailbox's second page
+  (`usb::Published`, for `l4hctl usb`). A controller once claimed stays
+  with its usbd until reboot,
   `idle` (halted, bus mastering off, its DMA region kept) when no guest has
   it, and `failed` if a reset or drain fails. Renesas uPD72020x without a
   firmware ROM and controllers without MSI are `unsupported`.
@@ -2450,10 +2457,11 @@ controller, one per claimed controller, and the guest forwards Linux's
   copies of them for the guest), usbd's kick, mints the guest's VMM
   notification (root's, from `GUEST_NEW`) for usbd with badge
   `vmm_badge_usb(n)`, maps the pool into the controller's IOMMU domain,
-  turns bus mastering on and posts `MBOX_ATTACH` with the pool's addresses
+  turns bus mastering on and posts `USBD_ATTACH` with the pool's addresses
   from its own table. usbd keeps two areas (`AREAS`): while the previous
   guest's release still runs, the next guest gets the other, and its
-  attach (bus mastering with it) waits for the release; the guest's
+  attach (bus mastering with it) waits for the release (or the claim)
+  to be answered; the guest's
   driver waits for usbd to write the area's magic. vmmgr maps the area into the guest at
   `L4H_USB_AREA_VA(n)` (the pages usbd writes read-only) and adds an
   `L4H_DEV_USB` device (ABI 7). A guest has at most four
@@ -2538,9 +2546,9 @@ controller, one per claimed controller, and the guest forwards Linux's
   already posted, so they are in memory: the pool can be reused at once,
   with or without an IOMMU), unmaps the pool from the
   domain, deletes usbd's copy of the VMM notification (usbd signals it with
-  NBSend, which an empty slot ignores) and posts `MBOX_REMOVE`. usbd then
-  halts and resets the controller and forgets every URB; when it reports
-  done root frees the area, and the controller is `idle` for the next
+  NBSend, which an empty slot ignores) and posts `USBD_REMOVE`, after the
+  attach if usbd has not answered that yet. usbd then halts and resets the
+  controller and forgets every URB; when it answers root frees the area, and the controller is `idle` for the next
   guest, which enumerates its devices again. If the reset fails root
   quarantines the controller (decoding, bus mastering and MSI off). A
   reset does not reset USB devices' firmware: a controller carries its
@@ -2617,14 +2625,14 @@ Scratch}`). The one heap is trustd's, for the third-party AML interpreter of
 the TPM start method; its size (`aml::HEAP`) is bounded by the firmware's
 tables, which trustd checks first.
 
-**Root never waits on a driver.** blkd and netd handle guests' rings and
-device memory, so root assumes either may run an attacker's code, and an
+**Root never waits on a driver.** blkd, netd and usbd handle guests' rings
+and device memory, so root assumes any may run an attacker's code, and an
 attacker's driver could leave a request unanswered forever. Root does not
 call them, nor wait for them with a deadline: it posts requests in a ring
 in a page it shares with the driver (`l4h_host::mailbox`), signals the
 driver's notification and goes back to its loop. The driver answers in
 order and signals root, which then finishes what the request was for
-(`blkd::poll`, `Netd::poll`). A request a driver never answers stays
+(`blkd::poll`, `Netd::poll`, `usb::poll`). A request a driver never answers stays
 pending, and so does whatever waits for it, nothing else:
 
 - **netd's commands** need no answer: root validates them and keeps their
@@ -2638,6 +2646,10 @@ pending, and so does whatever waits for it, nothing else:
   `EBUSY`. A controller holds at most two of vmmgr's 256 tokens for
   requests its blkd has not answered, so drivers that never answer leave
   tokens for the other controllers.
+- **usbd's** claim, attach and release need no answer before root replies
+  to vmmgr: a guest's driver waits for the queue area's magic instead
+  (§9.7). A usbd that never answers keeps its controller's queue areas,
+  and no later guest of that controller gets a working one.
 - **Teardown waits for no one.** A destroyed guest's I/O pool leaves the
   devices' IOMMU domains at once and is reused; what drivers map (disk
   channels, extent tables, port memory) is kept until they say they have
@@ -2647,7 +2659,8 @@ pending, and so does whatever waits for it, nothing else:
   client and port slots, for good.
 - A full ring (64 requests) refuses new ones with `EBUSY`; removals queue
   in root until there is room. A failed driver's keeper answers everything
-  with `u64::MAX`; a quarantined blkd's pending requests fail at once.
+  with `u64::MAX`; a quarantined blkd's or usbd's pending requests fail at
+  once.
 
 Root still calls memd, which handles no one's data, and trustd only in its
 start-up handshake, before any guest exists; everything else root shares

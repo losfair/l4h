@@ -1,10 +1,11 @@
-//! Root's requests to blkd and netd (host::mailbox).  Each handles guests'
-//! rings and device memory, so its code may be an attacker's, and root
-//! never waits for it: it posts a request and goes back to its loop, and
-//! finishes what the request was for when the driver has answered
-//! (blkd.rs, netd.rs: `poll`, from the serve loop on MAILBOX_BADGE).  A
-//! request a driver never answers stays pending, and so does whatever
-//! waits for it.  memd, which handles no one's data, is called (memd.rs).
+//! Root's requests to blkd, netd and usbd (host::mailbox).  Each handles
+//! guests' rings and device memory, so its code may be an attacker's, and
+//! root never waits for it: it posts a request and goes back to its loop,
+//! and finishes what the request was for when the driver has answered
+//! (blkd.rs, netd.rs, usb.rs: `poll`, from the serve loop on
+//! MAILBOX_BADGE).  A request a driver never answers stays pending, and so
+//! does whatever waits for it.  memd, which handles no one's data, is
+//! called (memd.rs).
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -22,11 +23,16 @@ const PAGE: usize = 4096;
 /// Badge bit of a driver's answers on root's notification.
 pub const MAILBOX_BADGE: u64 = 1 << 43;
 
-/// Mailboxes in layout::MAILBOXES: netd's, then each disk controller's.
+/// Mailboxes in layout::MAILBOXES: netd's, then each disk controller's,
+/// then each xHCI controller's.
 pub const NETD_MAILBOX: usize = 0;
 pub const fn blkd_mailbox(ctrl: usize) -> usize {
     1 + ctrl
 }
+pub const fn usbd_mailbox(ctrl: usize) -> usize {
+    1 + crate::pci::MAX_DISK_CTRLS + ctrl
+}
+pub const MAILBOXES: usize = usbd_mailbox(l4h_host::usb::MAX_USB_CTRLS);
 
 /// Root's notification, bound to its TCB (main.rs).
 static NTFN: AtomicU64 = AtomicU64::new(0);

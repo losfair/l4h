@@ -20,6 +20,7 @@ use l4h_abi::usb as abi;
 
 pub use crate::blk::Pool;
 use crate::fixed::ArrayVec;
+use core::sync::atomic::AtomicU64;
 
 pub const USBD_ID_BASE: u32 = 0x700;
 
@@ -66,65 +67,45 @@ pub fn dma_bytes(slots: u32, scratch: u32, page: u32) -> usize {
     total.next_power_of_two().max(4 << 20)
 }
 
-/// usbd's one service call (root -> usbd, message registers; MR0 of the
-/// reply is 0 or an errno, u64::MAX if usbd failed): take the controller
-/// from the firmware (legacy handoff, halt, reset, capability walk).
-/// -> MR1 = USB 2 ports | USB 3 ports << 16 | max slots << 32, MR2 =
-/// HCIVERSION | 64-bit addressing << 16.
+/// Root's requests to usbd (host::mailbox; answer word 0 is 0 or an
+/// errno, u64::MAX if usbd failed).  Root never waits for usbd, which a
+/// guest drives and could keep busy: it posts a request and finishes what
+/// it was for when usbd has answered.
 ///
-/// Root makes it once, before any guest has the controller.  From then on
-/// a guest drives usbd and could keep it busy, so root never waits for it
-/// again: it posts requests in the mailbox (`Mailbox`) and signals
-/// USBD_BADGE_ROOT, and usbd signals root's notification
-/// (USBD_SLOT_ROOT_NTFN) when it has done one.
+/// CLAIM: take the controller from the firmware (legacy handoff, halt,
+/// reset, capability walk).  Posted once, before any guest has the
+/// controller.  -> answer 1 = USB 2 ports | USB 3 ports << 16 | max slots
+/// << 32, answer 2 = HCIVERSION | 64-bit addressing << 16.
 pub const USBD_CLAIM: u64 = 1;
+/// ATTACH(idx, pool GPA, paddr, size): root has mapped client area `idx`'s
+/// frames at queue_va(idx), given the VMM's notification at
+/// USBD_SLOT_CLIENT_IRQ + idx and turned bus mastering on; start the
+/// controller for the pool.  Posted only once the requests before it are
+/// answered (bus mastering stays off while a CLAIM or REMOVE runs).
+pub const USBD_ATTACH: u64 = 2;
+/// REMOVE(idx): root has turned bus mastering off and taken the
+/// notification away; forget everything, halt and reset the controller
+/// and let go of the area, which root then frees (the next guest gets
+/// fresh frames).  0 once the controller has nothing of the client's left,
+/// also if the ATTACH before it was refused.
+pub const USBD_REMOVE: u64 = 3;
 
-/// Mailbox requests.  ATTACH: root has mapped client area `idx`'s frames at
-/// queue_va(idx), given the VMM's notification at USBD_SLOT_CLIENT_IRQ +
-/// idx and turned bus mastering on; start the controller for the pool.
-pub const MBOX_ATTACH: u32 = 1;
-/// REMOVE: root has turned bus mastering off and taken the notification
-/// away; forget everything, halt and reset the controller and let go of
-/// the area, which root then frees (the next guest gets fresh frames).
-/// Result 0 once the controller has nothing of the client's left.
-pub const MBOX_REMOVE: u32 = 2;
-
-/// A page root and usbd share (at MBOX_VA in usbd).  Root writes the
-/// request fields and then `seq`; usbd writes the result and then `done`
-/// (= seq).  Root posts a request only when the last one is done.
+/// What usbd publishes in its mailbox (host::mailbox, the second page),
+/// for CTL_USB_INFO.
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct Mailbox {
-    pub seq: u32,
-    pub op: u32,
-    pub idx: u32,
-    pub reserved: u32,
-    pub gpa: u64,
-    pub paddr: u64,
-    pub size: u64,
-    /// usbd's.
-    pub done: u32,
-    /// 0 or an errno.
-    pub result: u32,
-    /// Requests refused, controller resets (CTL_USB_INFO).
-    pub refused: u64,
-    pub resets: u64,
+pub struct Published {
+    /// Requests refused, controller resets.
+    pub refused: AtomicU64,
+    pub resets: AtomicU64,
 }
 
-/// Where usbd sees the mailbox.
-pub const MBOX_VA: usize = crate::SHARED_VA + 0x30_0000;
-
-/// Badges of usbd's bound notification.
+/// Badges of usbd's bound notification (and host::mailbox::BADGE_CALL).
 pub const USBD_BADGE_IRQ: u64 = 1 << 0;
 /// The client kicked.
 pub const USBD_BADGE_KICK: u64 = 1 << 1;
-/// Root posted a mailbox request.
-pub const USBD_BADGE_ROOT: u64 = 1 << 2;
 
 /// usbd's CSpace slots, beyond the common ones.
 pub const USBD_SLOT_IRQ: u64 = 16;
-/// Root's notification, for finished mailbox requests.
-pub const USBD_SLOT_ROOT_NTFN: u64 = 17;
 /// Client area idx's VMM notification (badged host::vmm_badge_usb(n)),
 /// idx < AREAS.  Root deletes it at REMOVE without waiting: usbd signals
 /// it with NBSend, which an empty slot ignores.
@@ -138,7 +119,7 @@ pub const AREAS: usize = 2;
 pub const fn queue_va(idx: usize) -> usize {
     crate::SHARED_VA + idx * 0x10_0000
 }
-const _: () = assert!(abi::AREA_PAGES * 4096 <= 0x10_0000 && queue_va(AREAS) <= MBOX_VA);
+const _: () = assert!(abi::AREA_PAGES * 4096 <= 0x10_0000 && queue_va(AREAS) <= crate::MMIO_VA);
 
 /// usbd's configuration (its info page).
 #[repr(C)]

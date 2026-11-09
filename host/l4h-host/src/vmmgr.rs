@@ -139,11 +139,11 @@ pub const MAX_PENDING: usize = 256;
 pub const PENDING_PER_CTRL: usize = 2;
 
 /// MR0 = guest, MR1 = its device index, MR2 = USB controller (CTL_USB_INFO
-/// index).  Root claims it if the firmware still has it, and makes the
-/// queue area.  Exchange slot 0 = the CNode of its frames (radix
+/// index).  Root claims it if the firmware still has it (a CLAIM posted
+/// to its usbd, not waited for), and makes the queue area.  Exchange slot 0 = the CNode of its frames (radix
 /// usb::QUEUE_RADIX in root), slot 1 = usbd's kick.  MR1 = the guest's
 /// USB number n: the VMM raises the device's event on vmm_badge_usb(n).
-pub const VMMGR_USB_ATTACH: u64 = 0x106;
+pub const VMMGR_USB_ATTACH: u64 = 0x107;
 /// Radix of the CNode of a USB controller's queue frames.
 pub const USB_QUEUE_RADIX: usize = 7;
 

@@ -12,9 +12,9 @@
 //! overflows and a guest that does not consume completions stalls only
 //! itself.  Each turn does a bounded amount of work.
 //!
-//! Root calls usbd once, to claim the controller.  After that the guest
-//! can keep usbd busy, so root only posts requests in the mailbox
-//! (proto::Mailbox) and is signalled when they are done.
+//! Root never calls usbd, which a guest can keep busy: it posts requests
+//! (claim, attach, remove) in its mailbox (host::mailbox) and is signalled
+//! when they are answered.
 
 #![no_std]
 #![no_main]
@@ -37,6 +37,10 @@ use crate::xhci::*;
 
 fn set_mr(i: usize, v: u64) {
     sel4::with_ipc_buffer_mut(|b| b.msg_regs_mut()[i] = v);
+}
+
+fn mr(i: usize) -> u64 {
+    sel4::with_ipc_buffer(|b| b.msg_regs()[i])
 }
 
 const EINVAL: u64 = 22;
@@ -1570,7 +1574,7 @@ impl Usbd {
     /// Root has already cut the controller off (bus mastering) and taken
     /// the notification away; it frees the area once this is done.
     fn remove(&mut self, idx: usize) -> u64 {
-        if self.client.as_ref().is_none_or(|c| c.idx != idx) {
+        if self.client.as_ref().is_some_and(|c| c.idx != idx) {
             return EINVAL;
         }
         let ok = self.hc.as_mut().is_some_and(|h| h.halt_reset());
@@ -1579,31 +1583,55 @@ impl Usbd {
         if ok { 0 } else { EIO }
     }
 
-    /// Do root's request, if it posted one.  Whether it did.
-    fn mailbox(&mut self) -> bool {
-        let m = proto::MBOX_VA as *mut proto::Mailbox;
-        unsafe {
-            write_volatile(addr_of_mut!((*m).refused), self.refused);
-            write_volatile(addr_of_mut!((*m).resets), self.resets);
-            let seq = read_volatile(addr_of!((*m).seq));
-            if seq == read_volatile(addr_of!((*m).done)) {
-                return false;
-            }
-            fence(Ordering::Acquire);
-            let r = read_volatile(m);
-            let idx = r.idx as usize;
-            let result = match r.op {
-                proto::MBOX_ATTACH => self.attach(idx, Pool { gpa: r.gpa, paddr: r.paddr, size: r.size }),
-                proto::MBOX_REMOVE => self.remove(idx),
+    /// CLAIM: take the controller from the firmware.  Answer words 1, 2.
+    fn claim(&mut self, cfg: &UsbdConfig, tsc_hz: u64) -> u64 {
+        if self.hc.is_some() {
+            return EBUSY;
+        }
+        let dma = Region { va: cfg.dma_va as usize, pa: cfg.dma_paddr, size: cfg.dma_size as usize };
+        let Some(mut hc) = Xhci::new(cfg.bar0_va as usize, cfg.bar0_len as usize, dma, tsc_hz) else { return EIO };
+        if !hc.caps.ac64 && dma.pa + dma.size as u64 > 1 << 32 {
+            return EIO;
+        }
+        if !hc.handoff(cfg.force_handoff_timeout != 0) {
+            l4h_rt::log!("l4h-usbd {:#x}: legacy handoff timed out", cfg.pci_bdf);
+        }
+        if !hc.halt_reset() {
+            return EIO;
+        }
+        let c = &hc.caps;
+        set_mr(1, c.usb2 as u64 | (c.usb3 as u64) << 16 | (c.max_slots as u64) << 32);
+        set_mr(2, c.hci_version as u64 | (c.ac64 as u64) << 16);
+        l4h_rt::info!("l4h-usbd {:#x}: xHCI {:x}.{:02x}, {} slots, {} USB 2 and {} USB 3 ports, {}-byte contexts",
+            cfg.pci_bdf, c.hci_version >> 8, c.hci_version & 0xff, c.max_slots, c.usb2, c.usb3, c.ctx_size);
+        self.hc = Some(hc);
+        0
+    }
+
+    /// Answer root's requests (host::mailbox).
+    fn mailbox(&mut self, cfg: &UsbdConfig, tsc_hz: u64) {
+        let published = l4h_rt::mailbox::published::<proto::Published>();
+        published.refused.store(self.refused, Ordering::Relaxed);
+        published.resets.store(self.resets, Ordering::Relaxed);
+        let mut answered = false;
+        while let Some(label) = l4h_rt::mailbox::request() {
+            let (idx, pool) = (mr(0) as usize, Pool { gpa: mr(1), paddr: mr(2), size: mr(3) });
+            set_mr(1, 0);
+            set_mr(2, 0);
+            let r = match label {
+                proto::USBD_CLAIM => self.claim(cfg, tsc_hz),
+                proto::USBD_ATTACH => self.attach(idx, pool),
+                proto::USBD_REMOVE => self.remove(idx),
                 _ => EINVAL,
             };
-            write_volatile(addr_of_mut!((*m).result), result as u32);
-            write_volatile(addr_of_mut!((*m).resets), self.resets);
-            fence(Ordering::Release);
-            write_volatile(addr_of_mut!((*m).done), seq);
+            set_mr(0, r);
+            l4h_rt::mailbox::answer(3);
+            answered = true;
         }
-        cap::<cap_type::Notification>(proto::USBD_SLOT_ROOT_NTFN).signal();
-        true
+        if answered {
+            published.resets.store(self.resets, Ordering::Relaxed);
+            l4h_rt::mailbox::signal();
+        }
     }
 
     /// Before waiting: tell the guest to kick, then look once more.
@@ -1619,18 +1647,19 @@ impl Usbd {
         true
     }
 
-    /// One turn: events, root's request, the client's queues.
-    fn turn(&mut self) {
-        if self.hc.is_none() {
-            return;
+    /// One turn: events, root's requests, the client's queues.
+    fn turn(&mut self, cfg: &UsbdConfig, tsc_hz: u64) {
+        if self.hc.is_some() {
+            self.events();
+            if self.hc.as_ref().is_some_and(|h| h.sts() & (STS_HSE | STS_HCE) != 0 || h.sts() == u32::MAX) {
+                self.hc_failed();
+            }
         }
-        self.events();
-        if self.hc.as_ref().is_some_and(|h| h.sts() & (STS_HSE | STS_HCE) != 0 || h.sts() == u32::MAX) {
-            self.hc_failed();
+        self.mailbox(cfg, tsc_hz);
+        if self.hc.is_some() {
+            self.serve();
+            self.flush();
         }
-        self.mailbox();
-        self.serve();
-        self.flush();
     }
 
     fn woken(&self) {
@@ -1669,7 +1698,6 @@ impl Usbd {
 fn main(info: &'static l4h_rt::Info) -> ! {
     let cfg: &UsbdConfig = unsafe { info.config() };
     let tsc_hz = info.header().tsc_hz;
-    let dma = Region { va: cfg.dma_va as usize, pa: cfg.dma_paddr, size: cfg.dma_size as usize };
     let mut u = Usbd {
         hc: None,
         client: None,
@@ -1687,53 +1715,21 @@ fn main(info: &'static l4h_rt::Info) -> ! {
     let ep = cap::<cap_type::Endpoint>(host::SLOT_SERVICE_EP);
     let reply = cap::<cap_type::Reply>(host::SLOT_REPLY);
     let irq = cap::<cap_type::IrqHandler>(proto::USBD_SLOT_IRQ);
-    let (mut msg, mut badge) = ep.recv(reply);
+    // Only notifications arrive: root's requests (BADGE_CALL), the
+    // interrupt and the client's kicks.
+    let mut badge = ep.recv(reply).1;
     loop {
-        if badge != 0 {
-            u.turn();
-            if badge & proto::USBD_BADGE_IRQ != 0 {
-                irq.irq_handler_ack().expect("usbd IRQ ack");
-            }
-            // More work: another bounded turn.  The guest kicks only once
-            // usbd_waiting is set, so its kicks never pile up.
-            if u.prepare_wait() {
-                badge = proto::USBD_BADGE_KICK;
-                continue;
-            }
-            (msg, badge) = ep.recv(reply);
-            u.woken();
+        u.turn(cfg, tsc_hz);
+        if badge & proto::USBD_BADGE_IRQ != 0 {
+            irq.irq_handler_ack().expect("usbd IRQ ack");
+        }
+        // More work: another bounded turn.  The guest kicks only once
+        // usbd_waiting is set, so its kicks never pile up.
+        if u.prepare_wait() {
+            badge = proto::USBD_BADGE_KICK;
             continue;
         }
-        // Root's one call.
-        let mut resp = [0u64; 3];
-        resp[0] = match msg.label() {
-            proto::USBD_CLAIM => match Xhci::new(cfg.bar0_va as usize, cfg.bar0_len as usize, dma, tsc_hz) {
-                _ if u.hc.is_some() => EBUSY,
-                None => EIO,
-                Some(hc) if !hc.caps.ac64 && dma.pa + dma.size as u64 > 1 << 32 => EIO,
-                Some(mut hc) => {
-                    if !hc.handoff(cfg.force_handoff_timeout != 0) {
-                        l4h_rt::log!("l4h-usbd {:#x}: legacy handoff timed out", cfg.pci_bdf);
-                    }
-                    if hc.halt_reset() {
-                        let c = &hc.caps;
-                        resp[1] = c.usb2 as u64 | (c.usb3 as u64) << 16 | (c.max_slots as u64) << 32;
-                        resp[2] = c.hci_version as u64 | (c.ac64 as u64) << 16;
-                        l4h_rt::info!("l4h-usbd {:#x}: xHCI {:x}.{:02x}, {} slots, {} USB 2 and {} USB 3 ports, {}-byte contexts",
-                            cfg.pci_bdf, c.hci_version >> 8, c.hci_version & 0xff, c.max_slots, c.usb2, c.usb3, c.ctx_size);
-                        u.hc = Some(hc);
-                        0
-                    } else {
-                        EIO
-                    }
-                }
-            },
-            _ => EINVAL,
-        };
-        for (i, v) in resp.into_iter().enumerate() {
-            set_mr(i, v);
-        }
-        (msg, badge) = ep.reply_recv(sel4::MessageInfo::new(0, 0, 0, 3), reply);
+        badge = ep.recv(reply).1;
         u.woken();
     }
 }

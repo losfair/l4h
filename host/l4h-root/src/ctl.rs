@@ -96,7 +96,7 @@ pub fn host_op(h: &mut Host, op: u32, a: &[u64; 6], data: &mut [u8; abi::CTL_DAT
                 }
             }
         }
-        abi::CTL_USB_INFO => vals = crate::usb::info(h, a[0] as usize, data)?,
+        abi::CTL_USB_INFO => vals = crate::usb::info(a[0] as usize, data)?,
         abi::CTL_SWITCH_CREATE => vals[0] = h.netd.try_create_switch()? as u64,
         abi::CTL_SWITCH_ATTACH_UPLINK => h.netd.attach_uplink(a[0] as u32, a[1] as usize)?,
         abi::CTL_NIC_INFO => {
