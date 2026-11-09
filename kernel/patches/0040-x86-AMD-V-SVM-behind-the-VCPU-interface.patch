@@ -1,4 +1,4 @@
-From d949ecfccdadc2ad38c89d115f5d498247a806c2 Mon Sep 17 00:00:00 2001
+From 86dd145efa348b19dd43c42902b2034011a66352 Mon Sep 17 00:00:00 2001
 From: l4h <l4h@localhost>
 Date: Sun, 8 Nov 2026 19:30:53 +0100
 Subject: [PATCH] x86: AMD-V (SVM) behind the VCPU interface
@@ -573,7 +573,7 @@ index da0b07c6f..c34ff5567 100644
  #ifdef CONFIG_PRINTING
 diff --git a/src/arch/x86/object/svm.c b/src/arch/x86/object/svm.c
 new file mode 100644
-index 000000000..979d3039c
+index 000000000..94022e197
 --- /dev/null
 +++ b/src/arch/x86/object/svm.c
 @@ -0,0 +1,939 @@
@@ -860,7 +860,7 @@ index 000000000..979d3039c
 +    vcpu->last_ept_root = 0;
 +    vcpu->entry_intr = 0;
 +    vcpu->xcr0 = HOST_XCR0;
-+    vcpu->svm.last_cpu = getCurrentCPUIndex();
++    vcpu->svm.last_cpu = CURRENT_CPU_INDEX();
 +
 +    memzero(vcpu->vmcs, VCPU_VMCS_SIZE);
 +    *vmcb_u32(vcpu, VMCB_INTERCEPT_DR) = ~(uint32_t)0;
@@ -1369,7 +1369,7 @@ index 000000000..979d3039c
 +
 +static void svm_assign_asid(vcpu_t *vcpu)
 +{
-+    word_t cpu = getCurrentCPUIndex();
++    word_t cpu = CURRENT_CPU_INDEX();
 +
 +    if (vcpu->svm.asid_cpu == cpu && vcpu->svm.asid_gen == ARCH_NODE_STATE(x86KSSVMASIDGen)) {
 +        return;
@@ -1409,7 +1409,7 @@ index 000000000..979d3039c
 +
 +void NORETURN restore_svm(tcb_t *cur_thread, vcpu_t *vcpu)
 +{
-+    word_t cpu = getCurrentCPUIndex();
++    word_t cpu = CURRENT_CPU_INDEX();
 +    paddr_t host = kpptr_to_paddr(&ARCH_NODE_STATE(x86KSSVMHostArea));
 +    paddr_t vmcb = vmcb_paddr(vcpu);
 +
