@@ -4,8 +4,8 @@
 //! vmmgr builds guests and runs their lifecycle, schedules their vCPUs and
 //! serves dom0's control API.  l4h-root keeps the hardware and the memory
 //! devices reach: guests' I/O pools, disk channels and netd ports.  vmmgr
-//! calls root (crate::root::call), never the other way round: root tells it of
-//! events through the events page and its notification.
+//! calls root (crate::root::call), never the other way round: root posts
+//! its notices in vmmgr's mailbox (`call`, from Sender::Root).
 //!
 //! Capabilities cross in vmmgr's exchange slots, which root reaches through
 //! the CNode it holds of vmmgr's (root dominates vmmgr).  Root empties a
@@ -71,8 +71,6 @@ pub const MODULES_SIZE: usize = 64 << 30;
 pub const FLAGS_VA: usize = 0x5100_0000_0000;
 /// memd's status page, read-only.
 pub const MEMD_STATUS_VA: usize = 0x5100_0010_0000;
-/// The events page (`Events`), read-write: root sets, vmmgr clears.
-pub const EVENTS_VA: usize = 0x5100_0020_0000;
 /// The status page (`Status`): vmmgr writes, root reads.
 pub const STATUS_VA: usize = 0x5100_0030_0000;
 /// The result page: root writes a host op's data (`HOST_OP`), vmmgr
@@ -93,47 +91,46 @@ pub const PENDING_PER_CTRL: usize = 2;
 use crate::badges::vmmgr as recv;
 
 crate::senders! {
-    /// Who calls vmmgr's endpoint: a guest's l4h-vmm, badged with its guest
-    /// (badges::vmmgr, COMPONENT | ID).
+    /// Who calls vmmgr: a guest's l4h-vmm, on its endpoint, badged with its
+    /// guest (badges::vmmgr, COMPONENT | ID); l4h-root, in its mailbox
+    /// (crate::mailbox), which root gives it.
     pub enum Sender in recv {
         Vmm(ID): [COMPONENT];
+        Root: mailbox;
     }
 }
 
 crate::protocol! {
-    /// The calls guests' l4h-vmms make on vmmgr's endpoint.  The guest is
-    /// the badge's.  A reply's first word is 0 or an errno; a caller vmmgr
-    /// stops or destroys gets none.
+    /// The calls guests' l4h-vmms make on vmmgr's endpoint, whose guest is
+    /// the badge's, and root's notices in vmmgr's mailbox, which root never
+    /// waits on (a full ring keeps them in root until there is room).  A
+    /// reply's first word is 0 or an errno; a caller vmmgr stops or
+    /// destroys gets none.
     pub mod call (from: Sender) {
         /// The guest asks to power off, reboot or crash (abi::POWER_*).
         GuestPower / guest_power = 1 from [Vmm] (how: u64) -> ();
         /// The VMM has initialised the device pages: start the guest.
         VmmReady / vmm_ready = 3 from [Vmm] () -> ();
+        /// Root has the answer of a request it answers later
+        /// (crate::root::Later::Token): take it with root::call::result.
+        OpDone / op_done = 0x10 from [Root] (token: usize) -> ();
+        /// trustd answered guest `guest`: raise its attestation device's
+        /// event.
+        AttestDone / attest_done = 0x11 from [Root] (guest: usize) -> ();
+        /// The serial monitor: destroy guest `guest`, which is not dom0.
+        Destroy / destroy = 0x12 from [Root] (guest: usize) -> ();
+        /// The serial monitor: restart dom0, or boot it if there is none.
+        RestartDom0 / restart_dom0 = 0x13 from [Root] () -> ();
     }
 }
+const _: () = assert!(call::Request::MAX_WORDS <= crate::mailbox::ARGS
+    && call::Request::MAX_REPLY_WORDS <= crate::mailbox::ANSWER);
 
 /// Radix of the CNode of a USB controller's queue frames.
 pub const USB_QUEUE_RADIX: usize = 7;
 
 /// Radix of the CNode of a netd port's frames.
 pub const PORT_RADIX: usize = 10;
-
-/// What root has for vmmgr, on the events page.
-#[repr(C)]
-pub struct Events {
-    /// Bit g: trustd answered guest g, raise its attestation device's event.
-    pub attest_done: core::sync::atomic::AtomicU64,
-    /// A serial monitor command (MONITOR_*), 0 once vmmgr took it.
-    pub monitor: core::sync::atomic::AtomicU64,
-    /// Bit t % 64 of word t / 64: root has the answer of pending request
-    /// t (crate::root::Later::Token).
-    pub ops_done: [core::sync::atomic::AtomicU64; MAX_PENDING / 64],
-}
-const _: () = assert!(MAX_PENDING % 64 == 0);
-
-/// Monitor commands, (cmd << 32) | arg.
-pub const MONITOR_DESTROY: u64 = 1;
-pub const MONITOR_RESTART_DOM0: u64 = 2;
 
 /// A guest as vmmgr reports it to root (for the dashboard and the
 /// monitor), under a sequence count: odd while it is being written.

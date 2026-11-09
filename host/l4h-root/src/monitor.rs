@@ -212,12 +212,13 @@ fn run(h: &mut Host, line: &str) {
         }
         _ => {}
     }
-    let Some(v) = &h.vmmgr else {
+    let Some(v) = h.vmmgr.as_mut() else {
         log!("monitor: vmmgr is not running");
         return;
     };
     // Guests are vmmgr's: it runs what changes them.
-    let send = |cmd, arg| if !v.monitor(cmd, arg) { log!("monitor: vmmgr is busy, try again") };
+    use l4h_host::vmmgr::call::Request as Notice;
+    let send = |v: &mut crate::vmmgr::Vmmgr, cmd| if !v.monitor(cmd) { log!("monitor: vmmgr is busy, try again") };
     match cmd {
         "list" => {
             for id in 0..crate::MAX_GUESTS {
@@ -230,10 +231,10 @@ fn run(h: &mut Host, line: &str) {
             }
         }
         "destroy" => match words.next().and_then(|w| w.parse::<u32>().ok()) {
-            Some(id) if v.guest(id as usize).is_some_and(|g| g.dom0 == 0) => send(l4h_host::vmmgr::MONITOR_DESTROY, id),
+            Some(id) if v.guest(id as usize).is_some_and(|g| g.dom0 == 0) => send(v, Notice::Destroy { guest: id as usize }),
             _ => log!("monitor: destroy <vm> (not dom0; use restart-dom0)"),
         },
-        "restart-dom0" => send(l4h_host::vmmgr::MONITOR_RESTART_DOM0, 0),
+        "restart-dom0" => send(v, Notice::RestartDom0 {}),
         _ => log!("monitor: unknown command '{}' (try 'help')", cmd),
     }
 }

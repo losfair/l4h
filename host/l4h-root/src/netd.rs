@@ -357,7 +357,7 @@ pub fn spawn(
         pci.enable_msix(&d);
         let _ = nic_list.push(Nic { pci: *d, switch: None });
     }
-    let mailbox = Mailbox::new(&comp, mailbox::NETD_MAILBOX, alloc, &mut arena, &mut keep_slot);
+    let mailbox = Mailbox::new(&comp, mailbox::NETD_MAILBOX, badges::driver::CALL, alloc, &mut arena, &mut keep_slot);
     component::start(&comp);
     Netd {
         comp,

@@ -7,7 +7,6 @@
 //! addresses root gives the IOMMU, blkd and netd are all its own: vmmgr
 //! passes guest ids, disk numbers, windows and sizes.
 
-use core::sync::atomic::Ordering;
 
 use l4h_host::errno::Errno;
 use sel4::{CapRights, ObjectBlueprint, VmAttributes, cap, cap_type};
@@ -16,7 +15,9 @@ use l4h_abi as abi;
 use l4h_host as host;
 use l4h_host::fixed::ArrayVec;
 use l4h_host::root::{Later, NewGuest, Sender, Vals as RootVals, call as root_call};
-use l4h_host::vmmgr::{self as proto, VmmgrConfig};
+use l4h_host::vmmgr::{self as proto, VmmgrConfig, call::Request as Notice};
+
+use crate::mailbox::Mailbox;
 
 use crate::blkd::{self, Channel};
 use crate::bootmod::Modules;
@@ -38,9 +39,8 @@ const IO_POOL_MAX: usize = 256 << 20;
 pub const IO_POOL_DEFAULT: usize = 4 << 20;
 
 /// Where root maps the pages it shares with vmmgr.
-const EVENTS_VA: usize = crate::layout::VMMGR_PAGES.base;
-const STATUS_VA: usize = EVENTS_VA + PAGE;
-const RESULT_VA: usize = EVENTS_VA + 2 * PAGE;
+const STATUS_VA: usize = crate::layout::VMMGR_PAGES.base;
+const RESULT_VA: usize = STATUS_VA + PAGE;
 /// dom0's control data area (the source of CTL_BLK_WRITE).
 pub const CTL_DATA_VA: usize = crate::layout::CTL_DATA.base;
 
@@ -79,35 +79,68 @@ pub struct Vmmgr {
     comp: Component,
     #[allow(dead_code)]
     arena: Arena,
-    /// Its bound notification, badged badges::vmmgr::ROOT_EVENT.
-    signal: cap::Notification,
+    /// Root's notices to vmmgr (l4h_host::vmmgr::call), and those that wait
+    /// for room in its ring: answers by token, guests trustd answered, and
+    /// one monitor command.
+    mailbox: Mailbox,
+    ops_waiting: [u64; proto::MAX_PENDING / 64],
+    attest_waiting: u64,
+    monitor_waiting: Option<Notice>,
 }
 
 impl Vmmgr {
-    fn events(&self) -> &proto::Events {
-        unsafe { &*(EVENTS_VA as *const proto::Events) }
-    }
-
     /// Root has the answer of pending request `token`.
-    fn op_done(&self, token: usize) {
-        self.events().ops_done[token / 64].fetch_or(1 << (token % 64), Ordering::AcqRel);
-        self.signal.signal();
+    fn op_done(&mut self, token: usize) {
+        self.ops_waiting[token / 64] |= 1 << (token % 64);
+        self.flush();
     }
 
     /// trustd answered guest `id`: vmmgr raises its device's event.
-    pub fn attest_done(&self, id: usize) {
-        self.events().attest_done.fetch_or(1 << id, Ordering::AcqRel);
-        self.signal.signal();
+    pub fn attest_done(&mut self, id: usize) {
+        self.attest_waiting |= 1 << id;
+        self.flush();
     }
 
-    /// Have vmmgr run a monitor command (MONITOR_*); false if it has not
-    /// taken the last one yet.
-    pub fn monitor(&self, cmd: u64, arg: u32) -> bool {
-        let ok = self.events().monitor.compare_exchange(0, cmd << 32 | arg as u64, Ordering::AcqRel, Ordering::Acquire).is_ok();
-        if ok {
-            self.signal.signal();
+    /// Have vmmgr run a monitor command (Notice::Destroy, RestartDom0);
+    /// false if the last one still waits for room.
+    pub fn monitor(&mut self, cmd: Notice) -> bool {
+        if self.monitor_waiting.is_some() {
+            return false;
         }
-        ok
+        self.monitor_waiting = Some(cmd);
+        self.flush();
+        true
+    }
+
+    /// vmmgr took notices: post those that waited for room.
+    pub fn poll(&mut self) {
+        while self.mailbox.answer().is_some() {}
+        self.flush();
+    }
+
+    /// Post what waits, while the ring has room.
+    fn flush(&mut self) {
+        for w in 0..self.ops_waiting.len() {
+            while self.ops_waiting[w] != 0 {
+                let t = self.ops_waiting[w].trailing_zeros() as usize;
+                if self.mailbox.send(&Notice::OpDone { token: 64 * w + t }).is_none() {
+                    return;
+                }
+                self.ops_waiting[w] &= !(1 << t);
+            }
+        }
+        while self.attest_waiting != 0 {
+            let g = self.attest_waiting.trailing_zeros() as usize;
+            if self.mailbox.send(&Notice::AttestDone { guest: g }).is_none() {
+                return;
+            }
+            self.attest_waiting &= !(1 << g);
+        }
+        if let Some(cmd) = self.monitor_waiting.clone() {
+            if self.mailbox.send(&cmd).is_some() {
+                self.monitor_waiting = None;
+            }
+        }
     }
 
     /// Guest `id` as vmmgr last reported it.
@@ -279,10 +312,9 @@ pub fn spawn(h: &mut Host, modules: &Modules, plan: &Dom0Plan) -> Vmmgr {
         t.give_vmmgr(&comp, &mut h.alloc, &mut arena, &mut keep_slot);
     }
     h.memd.map_status(&comp, &mut h.alloc, &mut arena, keep_slot());
-    // The events page (both write), the status page (vmmgr writes), the
-    // result page (root writes), all host memory of root's.
+    // The status page (vmmgr writes), the result page (root writes), both
+    // host memory of root's.
     for (root_va, va, rights) in [
-        (EVENTS_VA, proto::EVENTS_VA, CapRights::read_write()),
         (STATUS_VA, proto::STATUS_VA, CapRights::read_write()),
         (RESULT_VA, proto::RESULT_VA, CapRights::read_only()),
     ] {
@@ -305,12 +337,10 @@ pub fn spawn(h: &mut Host, modules: &Modules, plan: &Dom0Plan) -> Vmmgr {
         comp.map_copy(&mut h.alloc, &mut arena, &f, proto::CTL_DATA_VA + p * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep_slot());
     }
 
-    let s = h.alloc.slots.alloc();
-    let signal = root_cap::<cap_type::Notification>(s);
-    abs_of(signal).mint(&abs_of(comp.ntfn), CapRights::write_only(), l4h_host::badges::vmmgr::ROOT_EVENT).expect("vmmgr signal");
+    let mailbox = Mailbox::new(&comp, crate::mailbox::VMMGR_MAILBOX, l4h_host::badges::vmmgr::MAILBOX, &mut h.alloc, &mut arena, &mut keep_slot);
     component::start(&comp);
     info!("l4h-root: vmmgr started with {} MiB of boot modules", pages * PAGE >> 20);
-    Vmmgr { comp, arena, signal }
+    Vmmgr { comp, arena, mailbox, ops_waiting: [0; proto::MAX_PENDING / 64], attest_waiting: 0, monitor_waiting: None }
 }
 
 /// Whether guests may map the module image `data` in whole pages: it must
@@ -479,7 +509,7 @@ pub fn op_done(h: &mut Host, token: usize, r: Result<OpResult, Errno>) {
     let Some(op) = h.ops[token].as_mut() else { return };
     let gone = op.guest.is_some_and(|(id, instance)| h.guests[id].as_ref().is_none_or(|g| g.instance != instance));
     op.done = Some(if gone { Err(ctl::ENOENT) } else { r });
-    if let Some(v) = &h.vmmgr {
+    if let Some(v) = h.vmmgr.as_mut() {
         v.op_done(token);
     }
 }

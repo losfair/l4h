@@ -23,7 +23,7 @@ use crate::vspace::{FRAME_BP, map_frame};
 const PAGE: usize = 4096;
 
 /// Mailboxes in layout::MAILBOXES: netd's, then each disk controller's,
-/// then each xHCI controller's.
+/// then each xHCI controller's, then vmmgr's.
 pub const NETD_MAILBOX: usize = 0;
 pub const fn blkd_mailbox(ctrl: usize) -> usize {
     1 + ctrl
@@ -31,7 +31,8 @@ pub const fn blkd_mailbox(ctrl: usize) -> usize {
 pub const fn usbd_mailbox(ctrl: usize) -> usize {
     1 + crate::pci::MAX_DISK_CTRLS + ctrl
 }
-pub const MAILBOXES: usize = usbd_mailbox(l4h_host::usb::MAX_USB_CTRLS);
+pub const VMMGR_MAILBOX: usize = usbd_mailbox(l4h_host::usb::MAX_USB_CTRLS);
+pub const MAILBOXES: usize = VMMGR_MAILBOX + 1;
 
 /// Root's notification, bound to its TCB (main.rs).
 static NTFN: AtomicU64 = AtomicU64::new(0);
@@ -53,9 +54,11 @@ pub struct Mailbox {
 
 impl Mailbox {
     /// Give `comp` its mailbox, number `index` in layout::MAILBOXES, from
-    /// `arena`, keeping the mapping capabilities in `keep()`.
-    pub fn new(comp: &Component, index: usize, alloc: &mut Alloc, arena: &mut Arena,
+    /// `arena`, keeping the mapping capabilities in `keep()`.  Root kicks
+    /// it with `kick` in its badge space (a driver's badges::driver::CALL).
+    pub fn new(comp: &Component, index: usize, kick: u64, alloc: &mut Alloc, arena: &mut Arena,
         mut keep: impl FnMut() -> sel4::AbsoluteCPtr) -> Self {
+        let kick_badge = kick;
         let base = layout::MAILBOXES.base + index * MAILBOX_PAGES * PAGE;
         assert!(base + MAILBOX_PAGES * PAGE <= layout::MAILBOXES.end(), "mailbox {}", index);
         for p in 0..MAILBOX_PAGES {
@@ -68,7 +71,7 @@ impl Mailbox {
         comp.give_badged(mb::SLOT_MAILBOX_DONE, ntfn, CapRights::write_only(), badges::root::MAILBOX);
         let slot = alloc.slots.alloc();
         let kick = sel4::init_thread::Slot::<cap_type::Notification>::from_index(slot).cap();
-        abs_of(kick).mint(&abs_of(comp.ntfn), CapRights::write_only(), badges::driver::CALL).expect("mailbox kick");
+        abs_of(kick).mint(&abs_of(comp.ntfn), CapRights::write_only(), kick_badge).expect("mailbox kick");
         Mailbox { page: base as *const mb::Mailbox, published: base + PUBLISHED_OFFSET, kick, posted: 0, answered: 0 }
     }
 

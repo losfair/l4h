@@ -350,6 +350,9 @@ impl Host {
         }
         netd::Netd::poll(self);
         usb::poll(self);
+        if let Some(v) = self.vmmgr.as_mut() {
+            v.poll();
+        }
     }
 }
 

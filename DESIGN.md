@@ -1262,7 +1262,7 @@ top: a guest capped at 25% sees about 75% steal (`tests/run-m6test.sh`).
 `l4h-root` reads COM1 (I/O ports and IOAPIC IRQ 4, or the configured
 `serial_port`/`serial_irq`; PL011 on aarch64) and runs `help`, `list`,
 `info`, `destroy <vm>`, `restart-dom0` and `reboot`. vmmgr runs `destroy`
-and `restart-dom0`, which root passes through the events page (§10.3);
+and `restart-dom0`, which root posts in vmmgr's mailbox (§10.3);
 `reboot` resets the host as `host_reboot` does, the way out when neither
 dom0 nor vmmgr answers. The kernel keeps using the port for output. An
 absent UART (line status reads `0xff`) disables the monitor. Input uses
@@ -3056,7 +3056,7 @@ The chain has four links.
      the kick, whose badge is the guest's id, so trustd answers a guest only
      about itself. trustd answers in the page, sets `done`, and asks root
      (`root::call::attest_done`) to have the device's event raised on vCPU 0
-     (root tells vmmgr through its events page). Linux sleeps the caller
+     (root posts it in vmmgr's mailbox). Linux sleeps the caller
      meanwhile.
    - trustd owns the 64 request pages, one per guest id, and root lends one
      to each guest, so a page stays mapped in trustd while it answers a
@@ -3330,8 +3330,9 @@ root.
   control ops on the host's disks, switches and NICs, reset and RTC as their
   `CTL_*` number and six arguments, with data returned in a result page.
   Root answers every call at once; one that waits for blkd answers
-  `root::Later::Token` and a token, and root sets the token's bit in the events
-  page when it has the answer, which `root::call::result` then gives. vmmgr goes
+  `root::Later::Token` and a token, and root posts `vmmgr::call::op_done`
+  in vmmgr's mailbox when it has the answer, which `root::call::result`
+  then gives. vmmgr goes
   on meanwhile: a guest whose disk is pending gets no other device, and
   does not start, until it is answered; dom0's boot disks are attached one
   after another this way.
@@ -3340,11 +3341,15 @@ root.
   full cannot make root fail, and takes no capability from vmmgr: even the
   notification blkd and netd signal for a guest's VMM is made by root at
   `GUEST_NEW`, so it cannot be an endpoint that would block them.
-- **Root never calls vmmgr**, so calls cannot deadlock. It signals vmmgr's
-  notification instead, with news in an events page: trustd answered a
-  guest (vmmgr raises its attestation event), or the serial monitor asked
-  for `destroy` or `restart-dom0`. vmmgr publishes its guests in a status
-  page for the monitor's `list` and the dashboard.
+- **Root never calls vmmgr**, so calls cannot deadlock. It posts notices
+  in vmmgr's mailbox instead (`vmmgr::call`, from `Sender::Root`), as it
+  asks the drivers: a request it answers later has its answer (`op_done`),
+  trustd answered a guest (`attest_done`: vmmgr raises its attestation
+  event), or the serial monitor asked for `destroy` or `restart-dom0`. A
+  full ring keeps them in root until vmmgr has taken some: answers and
+  guests as bits, and one monitor command (the monitor says "busy" past
+  that). vmmgr publishes its guests in a status page for the monitor's
+  `list` and the dashboard.
 - **Destroy.** vmmgr stops the guest and revokes its own arena (VSpaces
   first, so nothing is unmapped page by page), then `GUEST_DEL` has root
   forget it in trustd, cut its disks off the pool (the IOMMU) and revoke it

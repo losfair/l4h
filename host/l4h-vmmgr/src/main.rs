@@ -28,7 +28,7 @@ mod vmm;
 
 use core::sync::atomic::Ordering;
 
-use l4h_host::errno::Errno;
+use l4h_host::errno::{EINVAL, Errno};
 use sel4::{ObjectBlueprint, cap};
 
 use l4h_abi as abi;
@@ -735,8 +735,8 @@ fn serve(h: &mut Vmmgr, reply_slot: ReplySlot) -> ! {
     loop {
         h.alloc.refill();
         let notified = badge & recv::SIGNALS != 0;
-        if badge & recv::ROOT_EVENT != 0 {
-            root_events(h);
+        if badge & recv::MAILBOX != 0 {
+            root_notices(h);
         }
         if badge & recv::CTL_KICK != 0 {
             ctl::kicked(h);
@@ -787,31 +787,11 @@ fn serve(h: &mut Vmmgr, reply_slot: ReplySlot) -> ! {
     }
 }
 
-/// What root signalled: trustd answered guests, or a monitor command.
-fn root_events(h: &mut Vmmgr) {
-    let ev = unsafe { &*(proto::EVENTS_VA as *const proto::Events) };
-    let done = ev.attest_done.swap(0, Ordering::AcqRel);
-    for id in (0..MAX_GUESTS).filter(|&i| done & (1 << i) != 0) {
-        let Some(g) = h.guests[id].as_ref() else { continue };
-        if let Some(d) = g.devices.iter().position(|d| d.kind == guest::DevKind::Attest) {
-            g.raise_event(&mut h.alloc, guest::dev_event(d));
-        }
-    }
-    let ops = ev.ops_done.each_ref().map(|w| w.swap(0, Ordering::AcqRel));
-    h.root_done(ops);
-    let cmd = ev.monitor.swap(0, Ordering::AcqRel);
-    let arg = (cmd & 0xffff_ffff) as usize;
-    match cmd >> 32 {
-        0 => {}
-        proto::MONITOR_DESTROY if h.guest(arg).is_some_and(|g| !g.dom0) => {
-            let _ = h.destroy_guest(arg);
-        }
-        proto::MONITOR_RESTART_DOM0 => match h.guests.iter().flatten().find(|g| g.dom0).map(|g| g.id) {
-            Some(id) => restart_dom0(h, id),
-            None if h.kernel.is_some() => boot_dom0(h),
-            None => {}
-        },
-        _ => l4h_rt::log!("l4h-vmmgr: monitor command {:#x} refused", cmd),
+/// Root's notices, in our mailbox (l4h_host::vmmgr::call, from Root).
+fn root_notices(h: &mut Vmmgr) {
+    let mut calls = VmmCalls(h);
+    if l4h_rt::mailbox::serve(|label, args, out| call::serve(&mut calls, label, args, proto::Sender::Root, out)) {
+        l4h_rt::mailbox::signal();
     }
 }
 
@@ -841,14 +821,14 @@ struct VmmCalls<'a>(&'a mut Vmmgr);
 
 impl call::Server for VmmCalls<'_> {
     fn vmm_ready(&mut self, from: proto::Sender) -> Result<(), Errno> {
-        let proto::Sender::Vmm(id) = from;
+        let proto::Sender::Vmm(id) = from else { return Err(EINVAL) };
         let g = self.0.guests.get_mut(id).and_then(|g| g.as_mut()).ok_or(l4h_host::wire::NO_REPLY)?;
         g.start();
         Ok(())
     }
 
     fn guest_power(&mut self, from: proto::Sender, how: u64) -> Result<(), Errno> {
-        let proto::Sender::Vmm(id) = from;
+        let proto::Sender::Vmm(id) = from else { return Err(EINVAL) };
         let h = &mut *self.0;
         let reason = match how {
             abi::POWER_OFF => "power off",
@@ -870,6 +850,45 @@ impl call::Server for VmmCalls<'_> {
         }
         if h.guests.iter().flatten().all(|g| g.state != State::Running) {
             info!("l4h-vmmgr: all guests stopped");
+        }
+        Ok(())
+    }
+
+    fn op_done(&mut self, _: proto::Sender, token: usize) -> Result<(), Errno> {
+        if token >= proto::MAX_PENDING {
+            return Err(EINVAL);
+        }
+        let mut done = [0; proto::MAX_PENDING / 64];
+        done[token / 64] = 1 << (token % 64);
+        self.0.root_done(done);
+        Ok(())
+    }
+
+    fn attest_done(&mut self, _: proto::Sender, guest: usize) -> Result<(), Errno> {
+        let h = &mut *self.0;
+        let g = h.guests.get(guest).and_then(|g| g.as_ref()).ok_or(EINVAL)?;
+        if let Some(d) = g.devices.iter().position(|d| d.kind == guest::DevKind::Attest) {
+            g.raise_event(&mut h.alloc, guest::dev_event(d));
+        }
+        Ok(())
+    }
+
+    fn destroy(&mut self, _: proto::Sender, guest: usize) -> Result<(), Errno> {
+        let h = &mut *self.0;
+        if !h.guest(guest).is_some_and(|g| !g.dom0) {
+            l4h_rt::log!("l4h-vmmgr: monitor: destroy {} refused", guest);
+            return Err(EINVAL);
+        }
+        let _ = h.destroy_guest(guest);
+        Ok(())
+    }
+
+    fn restart_dom0(&mut self, _: proto::Sender) -> Result<(), Errno> {
+        let h = &mut *self.0;
+        match h.guests.iter().flatten().find(|g| g.dom0).map(|g| g.id) {
+            Some(id) => restart_dom0(h, id),
+            None if h.kernel.is_some() => boot_dom0(h),
+            None => {}
         }
         Ok(())
     }

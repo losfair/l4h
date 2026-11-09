@@ -528,7 +528,7 @@ pub fn fault(h: &mut Host, id: u32) {
 /// event of its attestation device.
 pub fn done(h: &mut Host, id: usize) {
     if h.guests.get(id).and_then(|g| g.as_ref()).is_some_and(|g| g.attest) {
-        if let Some(v) = &h.vmmgr {
+        if let Some(v) = h.vmmgr.as_mut() {
             v.attest_done(id);
         }
     }

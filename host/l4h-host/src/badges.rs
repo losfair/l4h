@@ -48,8 +48,8 @@ crate::badge_space! {
         signal TIMER: 40;
         /// dom0 made a control request in its device page (abi::CtlSync).
         signal CTL_KICK: 41;
-        /// Root's signal: the events page has news (crate::vmmgr::Events).
-        signal ROOT_EVENT: 42;
+        /// Root posted in vmmgr's mailbox (crate::vmmgr::call).
+        signal MAILBOX: 42;
     }
 }
 

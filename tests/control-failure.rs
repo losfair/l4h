@@ -188,7 +188,7 @@ fn panic_and_keeper_finish_outstanding_and_future_requests_without_replying_to_f
             m.bound_tcb = host::SLOT_TCB;
             m.caller = Some(false); // preserve synchronous failure replies
             m.incoming = [Input::Call, Input::Fault, Input::Notify(host::badges::vmmgr::TIMER),
-                Input::Notify(host::badges::vmmgr::ROOT_EVENT), Input::Request(8),
+                Input::Notify(host::badges::vmmgr::MAILBOX), Input::Request(8),
                 Input::Request(9), Input::Call, Input::End].into();
         });
         let end = std::panic::catch_unwind(|| failure::answer_failed(tcb)).unwrap_err();

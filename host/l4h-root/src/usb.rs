@@ -339,7 +339,7 @@ fn claim(h: &mut Host, i: usize) -> Result<(), Errno> {
         let f = dma_cn.absolute_cptr_from_bits_with_depth(p as u64, bits - 12);
         comp.map_copy(&mut h.alloc, &mut arena, &f, host::DMA_VA + p * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep_slot());
     }
-    let mbox = Mailbox::new(&comp, mailbox::usbd_mailbox(i), &mut h.alloc, &mut arena, &mut keep_slot);
+    let mbox = Mailbox::new(&comp, mailbox::usbd_mailbox(i), l4h_host::badges::driver::CALL, &mut h.alloc, &mut arena, &mut keep_slot);
     // The interrupt.
     let irq_slot = h.alloc.slots.global(|s| s.alloc());
     pci::msi_irq(&d, vector, &abs_of(root_cap::<cap_type::Null>(irq_slot)));

@@ -5,9 +5,8 @@
 //! vmmgr's calls pass capabilities in its exchange area (vmmgr::SLOT_XCHG,
 //! XCHG_SLOTS of them), as each call declares (`call::caps`).  A call that waits for
 //! a driver, which root never does in a call, is answered later
-//! (Later::Token): root sets the token's bit in vmmgr::Events::ops_done
-//! and signals badges::vmmgr::ROOT_EVENT once it has the answer, which
-//! `result` gives.
+//! (Later::Token): root posts vmmgr::call::op_done in vmmgr's mailbox
+//! once it has the answer, which `result` gives.
 
 use crate::fixed::ArrayVec;
 use crate::wire::{Tail, Wire};

@@ -1,4 +1,5 @@
-//! Root's requests to the drivers (blkd, netd, usbd).  A driver handles guests'
+//! Root's requests to the drivers (blkd, netd, usbd), and its notices to
+//! vmmgr, which root never waits on either.  A driver handles guests'
 //! rings and device memory, so root must assume its code can be an
 //! attacker's, and an attacker's driver could leave a request unanswered
 //! for good.  Root never waits for one: it posts requests in a ring in a

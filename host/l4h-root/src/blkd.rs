@@ -497,7 +497,7 @@ pub fn start(
     }
     pci.enable(d);
     pci.enable_msix(d);
-    let mailbox = Mailbox::new(&comp, mailbox::blkd_mailbox(ctrl), alloc, &mut arena, &mut keep_slot);
+    let mailbox = Mailbox::new(&comp, mailbox::blkd_mailbox(ctrl), host::badges::driver::CALL, alloc, &mut arena, &mut keep_slot);
     component::start(&comp);
 
     let staging = dma_frames.start + n_dma - blk::STAGING_SIZE / PAGE..dma_frames.end;
