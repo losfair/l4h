@@ -203,7 +203,12 @@ fn run(h: &mut Host, line: &str) {
                 Some("root") => panic!("injected panic"),
                 Some("logd") => crate::logd::inject_fault(h),
                 Some("netd") => crate::netd::inject_panic(h),
-                _ => log!("monitor: inject root | logd | netd"),
+                Some("netd-hang") => crate::netd::inject_hang(h),
+                Some("blkd-hang") => match words.next().and_then(|c| c.parse().ok()) {
+                    Some(c) if c < h.ctrls.len() => crate::blkd::inject_hang(h, c),
+                    _ => log!("monitor: inject blkd-hang <controller>"),
+                },
+                _ => log!("monitor: inject root | logd | netd | netd-hang | blkd-hang <controller>"),
             }
             return;
         }

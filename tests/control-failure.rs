@@ -13,6 +13,15 @@ use std::sync::Mutex;
 
 #[path = "../host/l4h-rt/src/failure.rs"]
 mod failure;
+/// A second copy, whose handler is never set: blkd's and netd's.
+#[path = "../host/l4h-rt/src/failure.rs"]
+#[allow(dead_code)]
+mod failure_mailbox;
+mod mailbox {
+    pub fn fail() {
+        super::MODEL.with(|m| m.borrow_mut().mailbox_fails += 1);
+    }
+}
 pub use failure::FailureHandler;
 #[path = "../host/l4h-vmmgr/src/ctl_failure.rs"]
 mod ctl_failure;
@@ -32,6 +41,7 @@ struct Model {
     current_tcb: u64,
     bound_tcb: u64,
     bindings: Vec<u64>,
+    mailbox_fails: usize,
     incoming: VecDeque<Input>,
     caller: Option<bool>, // true: a fault, which must remain unanswered
     replies: Vec<[u64; 8]>,
@@ -178,12 +188,36 @@ fn panic_and_keeper_finish_outstanding_and_future_requests_without_replying_to_f
                 Input::Notify(host::vmmgr::BADGE_ROOT_EVENT), Input::Request(8),
                 Input::Request(9), Input::Call, Input::End].into();
         });
-        let end = std::panic::catch_unwind(|| failure::answer_failed(tcb)).unwrap_err();
+        let end = std::panic::catch_unwind(|| failure::answer_failed(tcb, false)).unwrap_err();
         assert!(end.is::<End>());
         MODEL.with(|m| {
             let m = m.borrow();
             assert_eq!(m.wakes, [(7, 7, -5), (8, 8, -5), (9, 9, -5)]);
             assert_eq!(m.replies, [[u64::MAX, 0, 0, 0, 0, 0, 0, 0]; 3]);
+            assert_eq!(m.bindings, if tcb == host::SLOT_KEEPER { vec![0, tcb] } else { vec![] });
+        });
+    }
+}
+
+#[test]
+fn mailbox_keeper_without_handler_takes_the_notification() {
+    let _lock = LOCK.lock().unwrap();
+    for tcb in [host::SLOT_TCB, host::SLOT_KEEPER] {
+        MODEL.with(|m| {
+            *m.borrow_mut() = Model {
+                current_tcb: tcb,
+                bound_tcb: host::SLOT_TCB,
+                incoming: [Input::Notify(host::mailbox::BADGE_CALL), Input::Call, Input::Fault,
+                    Input::Notify(host::mailbox::BADGE_CALL), Input::End].into(),
+                ..Model::default()
+            };
+        });
+        let end = std::panic::catch_unwind(|| failure_mailbox::answer_failed(tcb, true)).unwrap_err();
+        assert!(end.is::<End>());
+        MODEL.with(|m| {
+            let m = m.borrow();
+            assert_eq!(m.mailbox_fails, 3);
+            assert_eq!(m.replies, [[u64::MAX, 0, 0, 0, 0, 0, 0, 0]]);
             assert_eq!(m.bindings, if tcb == host::SLOT_KEEPER { vec![0, tcb] } else { vec![] });
         });
     }

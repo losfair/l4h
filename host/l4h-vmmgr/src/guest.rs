@@ -251,6 +251,12 @@ pub struct Guest {
     pub vcpus: ArrayVec<Vcpu, { abi::MAX_VCPUS }>,
     pub state: State,
     pub dom0: bool,
+    /// Root attaches a device for it, and answers later (root::Later):
+    /// no other device changes, nor does it start, meanwhile.
+    pub root_pending: bool,
+    /// dom0: the seq of the last control request taken (abi::CtlSync),
+    /// answered or waiting for root.
+    pub ctl_taken: u32,
     /// Its processes' VSpaces (the pool it recycles, abi::SLOT_VSPACE_POOL).
     vspaces: ArrayVec<cap::VSpace, MAX_VSPACES>,
     /// EPT roots in its pool (abi::SLOT_EPT_POOL).
@@ -980,6 +986,8 @@ pub fn create(
         vcpus: ArrayVec::new(),
         state: State::Created,
         dom0: cfg.dom0,
+        root_pending: false,
+        ctl_taken: 0,
         vspaces: ArrayVec::new(),
         nr_ept_roots: 0,
         bootinfo: ArrayVec::new(),

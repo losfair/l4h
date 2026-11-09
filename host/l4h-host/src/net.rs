@@ -105,7 +105,10 @@ pub const NETD_SLOT_LINK_RING_BASE: u64 = 56;
 pub const NETD_SLOT_CLIENT_BASE: u64 = 64;
 pub const NETD_SLOT_LINK_KICK_BASE: u64 = NETD_SLOT_CLIENT_BASE + MAX_PORTS as u64;
 
-/// Calls from l4h-root to netd's service endpoint.
+/// Commands from l4h-root (host::mailbox), which netd carries out in order
+/// and does not answer: root has validated them, and keeps their state.
+/// Arguments are args[0..]; "MRn" below is args[n].  4, 5 and 10 are
+/// unused: netd publishes its counters and MACs instead (Published).
 /// MR0 = port, MR1 = switch, MR2 = MAC (low 48 bits), MR3 = flags.
 pub const NETD_ADD_PORT: u64 = 1;
 pub const NETD_PORT_MAC_LOCK: u64 = 1 << 0;
@@ -113,17 +116,14 @@ pub const NETD_PORT_ISOLATED: u64 = 1 << 1;
 /// Root-selected dom0 port of the physical uplink. MR4 is its one
 /// additional allowed source MAC (0: none). Ordinary guests cannot set it.
 pub const NETD_PORT_UPLINK: u64 = 1 << 2;
-/// MR0 = port.  netd no longer touches the port's memory when this returns.
+/// MR0 = port.  netd no longer touches the port's memory, nor signals its
+/// client, once it has counted this done.
 pub const NETD_REMOVE_PORT: u64 = 2;
 /// MR0 = NIC, MR1 = switch.
 pub const NETD_ATTACH_UPLINK: u64 = 3;
-/// MR0 = port -> MR0 = rx frames, MR1 = tx frames, MR2 = drops.
-pub const NETD_PORT_STATS: u64 = 4;
-/// MR0 = NIC -> MR0 = its MAC address (low 48 bits).
-pub const NETD_NIC_MAC: u64 = 5;
 /// Steering (DESIGN.md §9.3).  Root allocates the ids and validates;
-/// netd checks bounds and that targets exist.  u64::MAX in MR0 is a
-/// failure.
+/// netd checks bounds and that targets exist, and ignores a command that
+/// fails them.
 /// MR0 = endpoint, MR1 = switch, MR2 = MAC, MR3 = peer MAC.  Setting an
 /// endpoint with the same switch and MAC changes only its peer.
 pub const NETD_EP_SET: u64 = 6;
@@ -131,13 +131,14 @@ pub const NETD_EP_SET: u64 = 6;
 pub const NETD_EP_DEL: u64 = 7;
 /// `host::TEST_INJECT` only: panic.
 pub const NETD_TEST_PANIC: u64 = 0x7e57;
+/// `host::TEST_INJECT` only: stop for good without failing, as a
+/// compromised netd might.
+pub const NETD_TEST_HANG: u64 = 0x7e58;
 /// MR0 = rule, MR1 = endpoint, MR2 = match (abi::CTL_STEER_SET args[1]),
 /// MR3 = IP bits 127-64, MR4 = IP bits 63-0, MR5 = target port mask.
 pub const NETD_STEER_SET: u64 = 8;
 /// MR0 = rule.
 pub const NETD_STEER_DEL: u64 = 9;
-/// MR0 = rule -> MR0 = inbound frames, MR1 = return frames.
-pub const NETD_STEER_STATS: u64 = 10;
 /// MR0 = link, MR1 = switch, MR2 = channel size, MR3 = this partition,
 /// MR4 = the peer.  The channel is mapped at link_va(link) and the
 /// NETD_SLOT_LINK_* capabilities given.  Links last until the machine
@@ -146,6 +147,21 @@ pub const NETD_ADD_LINK: u64 = 11;
 /// Endpoints and rules netd holds.
 pub const MAX_STEER_ENDPOINTS: usize = 16;
 pub const MAX_STEER_RULES: usize = 128;
+
+/// What netd publishes for root (host::mailbox::PUBLISHED_OFFSET).  The
+/// counters are netd's word: root only reports them.
+#[repr(C)]
+pub struct Published {
+    /// Non-zero once nic_mac is written; it does not change after.
+    pub ready: core::sync::atomic::AtomicU64,
+    /// Uplink NICs' MAC addresses (low 48 bits).
+    pub nic_mac: [core::sync::atomic::AtomicU64; MAX_NICS],
+    /// Per port: rx frames, tx frames, drops.
+    pub ports: [[core::sync::atomic::AtomicU64; 3]; MAX_PORTS],
+    /// Per rule: inbound frames, return frames.
+    pub rules: [[core::sync::atomic::AtomicU64; 2]; MAX_STEER_RULES],
+}
+const _: () = assert!(core::mem::size_of::<Published>() <= 4096);
 
 /// NicConfig::kind.
 pub const NIC_VIRTIO: u32 = 0;
@@ -214,7 +230,7 @@ const _: () = assert!(PORT_PAGES * 4096 <= 0x40_0000 - 0x1_0000);
 const _: () = assert!(port_va(MAX_PORTS) <= link_va(0) && link_va(MAX_LINKS) <= crate::MMIO_VA);
 const _: () = assert!(
     NETD_BADGE_IRQ_SHIFT as usize + MAX_NICS <= NETD_BADGE_LINK_SHIFT as usize
-        && NETD_BADGE_LINK_SHIFT as usize + MAX_LINKS <= 64
+        && NETD_BADGE_LINK_SHIFT as usize + MAX_LINKS <= crate::mailbox::BADGE_CALL.trailing_zeros() as usize
         && NETD_SLOT_IOPORT_BASE as usize + MAX_NICS <= NETD_SLOT_LINK_IRQ_BASE as usize
         && NETD_SLOT_LINK_IRQ_BASE as usize + MAX_LINKS <= NETD_SLOT_LINK_RING_BASE as usize
         && NETD_SLOT_LINK_RING_BASE as usize + MAX_LINKS <= NETD_SLOT_CLIENT_BASE as usize

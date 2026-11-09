@@ -16,13 +16,22 @@ struct Attachment {
     extents: (u64, u64),
 }
 
+/// Root answers every attachment at once here.
+#[allow(dead_code)]
+enum Later<T> { Now(T), Token(usize) }
+struct Then;
+fn later(_: &Vmmgr) -> Then { Then }
+fn deferred(r: Later<()>) -> Result<(), i64> {
+    match r { Later::Now(()) => Ok(()), Later::Token(_) => unreachable!() }
+}
+
 #[derive(Default)]
 struct Vmmgr { attached: Vec<Attachment> }
 impl Vmmgr {
     fn attach_disk(&mut self, id: usize, disk: usize, flags: u64, start: u64, sectors: u64,
-        extents: (u64, u64)) -> Result<(), i64> {
+        extents: (u64, u64), _: Then) -> Result<Later<()>, i64> {
         self.attached.push(Attachment { id, disk, flags, start, sectors, extents });
-        Ok(())
+        Ok(Later::Now(()))
     }
 }
 

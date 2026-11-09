@@ -439,7 +439,11 @@ enum l4h_mem_op {
  * device page and the response at L4H_CTL_RESP_OFF.  The guest writes a
  * new seq in the l4h_ctl_sync at L4H_CTL_SYNC_OFF (the previous one plus
  * one) and signals the device's kick notification; the host writes the
- * response, then done = seq, and raises the device's event line.  Bulk
+ * response, then done = seq, and raises the device's event line.  A request
+ * that waits for a driver may be answered much later, or never: the host
+ * writes its seq at L4H_CTL_TAKEN_OFF (a u32) once it has read the
+ * request and the data area, and raises the event, and the guest may then
+ * write the next request, which takes the place of the one waiting.  Bulk
  * data (images) is passed in the device's data area (l4h_dev_desc.data_va),
  * which belongs to the host: the host never reads dom0's RAM.  See
  * DESIGN.md §10.1.
@@ -453,6 +457,7 @@ enum l4h_mem_op {
 #define L4H_CTL_VERSION         3
 #define L4H_CTL_RESP_OFF        2048
 #define L4H_CTL_SYNC_OFF        2040    /* between request and response */
+#define L4H_CTL_TAKEN_OFF       4088    /* after the response */
 #define L4H_CTL_DATA_MAX        1984
 #define L4H_CTL_LOAD_MAX        (1u << 20)
 #define L4H_CTL_NAME_MAX        32

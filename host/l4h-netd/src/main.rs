@@ -602,6 +602,22 @@ impl Netd {
         self.gro[n] = Some(g);
     }
 
+    /// Publish the counters root reports (net::Published).
+    fn publish(&self, to: &net::Published) {
+        for (p, c) in self.ports.iter().zip(&to.ports) {
+            let v = p.as_ref().map_or([0; 3], |p| [p.rx_frames, p.tx_frames, p.drops]);
+            for (w, v) in c.iter().zip(v) {
+                w.store(v, Ordering::Relaxed);
+            }
+        }
+        for (r, c) in self.steer.rules.iter().zip(&to.rules) {
+            let v = r.as_ref().map_or([0; 2], |r| [r.in_frames, r.out_frames]);
+            for (w, v) in c.iter().zip(v) {
+                w.store(v, Ordering::Relaxed);
+            }
+        }
+    }
+
     fn signal_clients(&mut self) {
         for p in self.ports.iter_mut().flatten() {
             if p.signal {
@@ -684,148 +700,149 @@ fn main(info: &'static Info) -> ! {
     let reply = cap::<cap_type::Reply>(host::SLOT_REPLY);
     l4h_rt::info!("netd: {} uplink NIC(s)", d.nics.len());
 
-    let (mut msg, mut badge) = ep.recv(reply);
+    // Root reads the NICs' MACs here, and the counters, which publish()
+    // updates.
+    let published = l4h_rt::mailbox::published::<net::Published>();
+    for (n, nic) in d.nics.iter().enumerate() {
+        published.nic_mac[n].store(nic.mac.iter().fold(0u64, |m, &b| (m << 8) | b as u64), Ordering::Relaxed);
+    }
+    published.ready.store(1, Ordering::Release);
+    l4h_rt::mailbox::signal();
+    let (_, mut badge) = ep.recv(reply);
     loop {
-        if badge != 0 {
-            // Notification: port kicks and NIC interrupts.
-            for i in 0..net::MAX_PORTS {
-                if badge & (1 << i) != 0 {
-                    d.port_tx(i);
-                    d.rx_backlog(i);
-                }
+        // Notification: port kicks and NIC interrupts.
+        for i in 0..net::MAX_PORTS {
+            if badge & (1 << i) != 0 {
+                d.port_tx(i);
+                d.rx_backlog(i);
             }
-            for n in 0..d.nics.len() {
-                if badge & (1 << (net::NETD_BADGE_IRQ_SHIFT as usize + n)) != 0 {
-                    d.nic_rx(n);
-                    cap::<cap_type::IrqHandler>(net::NETD_SLOT_IRQ_BASE + n as u64)
-                        .irq_handler_ack()
-                        .expect("netd: IRQ ack");
-                }
-            }
-            for l in 0..net::MAX_LINKS {
-                if badge & (1 << (net::NETD_BADGE_LINK_SHIFT as usize + l)) != 0 {
-                    if let Some(k) = d.links[l].as_ref() {
-                        k.ack();
-                    }
-                    d.link_rx(l);
-                }
-            }
-            for nic in &mut d.nics {
-                nic.kick_tx();
-            }
-            // Once per batch, so a peer that sleeps is woken once for all.
-            for k in d.links.iter_mut().flatten() {
-                k.doorbell();
-            }
-            d.signal_clients();
-            (msg, badge) = ep.recv(reply);
-            continue;
         }
-        // A call from l4h-root.
-        let resp = match msg.label() {
-            net::NETD_ADD_PORT => {
-                let i = mr(0) as usize;
-                if i < net::MAX_PORTS && mr(1) < net::MAX_SWITCHES as u64 {
-                    d.remove_port(i);
-                    let chan = net::port_va(i) as *mut net::Port;
-                    let mac = mac_of(mr(2));
-                    unsafe {
-                        addr_of_mut!((*chan).mac).write_volatile([mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], 0, 0]);
-                        addr_of_mut!((*chan).link_state).write_volatile(net::LinkState::VIRTUAL.0);
-                        addr_of_mut!((*chan).rx_wanted).write_volatile(0);
-                    }
-                    d.ports[i] = Some(GuestPort {
-                        chan,
-                        switch: mr(1) as u32,
-                        mac,
-                        lock: mr(3) & net::NETD_PORT_MAC_LOCK != 0,
-                        alias: (mr(3) & net::NETD_PORT_UPLINK != 0 && mr(4) != 0).then(|| mac_of(mr(4))),
-                        uplink: mr(3) & net::NETD_PORT_UPLINK != 0,
-                        isolated: mr(3) & net::NETD_PORT_ISOLATED != 0,
-                        client: cap::<cap_type::Notification>(net::NETD_SLOT_CLIENT_BASE + i as u64),
-                        signal: false,
-                        rx_frames: 0,
-                        tx_frames: 0,
-                        drops: 0,
-                        backlog: Fifo::EMPTY,
-                    });
-                    d.publish_links();
-                    0
-                } else {
-                    u64::MAX
+        for n in 0..d.nics.len() {
+            if badge & (1 << (net::NETD_BADGE_IRQ_SHIFT as usize + n)) != 0 {
+                d.nic_rx(n);
+                cap::<cap_type::IrqHandler>(net::NETD_SLOT_IRQ_BASE + n as u64)
+                    .irq_handler_ack()
+                    .expect("netd: IRQ ack");
+            }
+        }
+        for l in 0..net::MAX_LINKS {
+            if badge & (1 << (net::NETD_BADGE_LINK_SHIFT as usize + l)) != 0 {
+                if let Some(k) = d.links[l].as_ref() {
+                    k.ack();
                 }
+                d.link_rx(l);
             }
-            net::NETD_REMOVE_PORT => {
-                d.remove_port(mr(0) as usize);
-                0
-            }
-            net::NETD_ATTACH_UPLINK => {
-                let (n, sw) = (mr(0) as usize, mr(1) as u32);
-                match d.nics.get_mut(n).filter(|_| (sw as usize) < net::MAX_SWITCHES) {
-                    Some(nic) => {
-                        nic.switch = Some(sw);
+        }
+        for nic in &mut d.nics {
+            nic.kick_tx();
+        }
+        // Once per batch, so a peer that sleeps is woken once for all.
+        for k in d.links.iter_mut().flatten() {
+            k.doorbell();
+        }
+        d.signal_clients();
+        d.publish(published);
+        // Root's commands (host::mailbox), even if their signal was
+        // coalesced.  Root reads the answers' count only: they are done.
+        let mut answered = false;
+        let mut added = 0;
+        while let Some(label) = l4h_rt::mailbox::request() {
+            let resp = match label {
+                net::NETD_ADD_PORT => {
+                    let i = mr(0) as usize;
+                    if i < net::MAX_PORTS && mr(1) < net::MAX_SWITCHES as u64 {
+                        d.remove_port(i);
+                        let chan = net::port_va(i) as *mut net::Port;
+                        let mac = mac_of(mr(2));
+                        unsafe {
+                            addr_of_mut!((*chan).mac).write_volatile([mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], 0, 0]);
+                            addr_of_mut!((*chan).link_state).write_volatile(net::LinkState::VIRTUAL.0);
+                            addr_of_mut!((*chan).rx_wanted).write_volatile(0);
+                        }
+                        d.ports[i] = Some(GuestPort {
+                            chan,
+                            switch: mr(1) as u32,
+                            mac,
+                            lock: mr(3) & net::NETD_PORT_MAC_LOCK != 0,
+                            alias: (mr(3) & net::NETD_PORT_UPLINK != 0 && mr(4) != 0).then(|| mac_of(mr(4))),
+                            uplink: mr(3) & net::NETD_PORT_UPLINK != 0,
+                            isolated: mr(3) & net::NETD_PORT_ISOLATED != 0,
+                            client: cap::<cap_type::Notification>(net::NETD_SLOT_CLIENT_BASE + i as u64),
+                            signal: true,
+                            rx_frames: 0,
+                            tx_frames: 0,
+                            drops: 0,
+                            backlog: Fifo::EMPTY,
+                        });
+                        d.publish_links();
+                        added |= 1 << i;
                         0
+                    } else {
+                        u64::MAX
                     }
-                    None => u64::MAX,
                 }
-            }
-            net::NETD_ADD_LINK => {
-                let (l, sw, size) = (mr(0) as usize, mr(1), mr(2));
-                let ok = l < net::MAX_LINKS && d.links[l].is_none() && sw < net::MAX_SWITCHES as u64
-                    && size as usize <= net::LINK_CHANNEL_MAX && size >= 4096;
-                if ok {
-                    d.links[l] = Some(link::Link::new(l, sw as u32, size, mr(3) as u32, mr(4) as u32));
+                net::NETD_REMOVE_PORT => {
+                    d.remove_port(mr(0) as usize);
                     0
-                } else {
-                    u64::MAX
                 }
-            }
-            net::NETD_NIC_MAC => match d.nics.get(mr(0) as usize) {
-                Some(n) => n.mac.iter().fold(0u64, |m, &b| (m << 8) | b as u64),
-                None => u64::MAX,
-            },
-            net::NETD_PORT_STATS => match d.ports.get(mr(0) as usize).and_then(|p| p.as_ref()) {
-                Some(p) => {
-                    set_mr(1, p.tx_frames);
-                    set_mr(2, p.drops);
-                    p.rx_frames
+                net::NETD_ATTACH_UPLINK => {
+                    let (n, sw) = (mr(0) as usize, mr(1) as u32);
+                    match d.nics.get_mut(n).filter(|_| (sw as usize) < net::MAX_SWITCHES) {
+                        Some(nic) => {
+                            nic.switch = Some(sw);
+                            0
+                        }
+                        None => u64::MAX,
+                    }
                 }
-                None => u64::MAX,
-            },
-            net::NETD_EP_SET => {
-                let ep = steer::Endpoint { switch: mr(1) as u8, mac: mac_of(mr(2)), peer: mac_of(mr(3)) };
-                if mr(1) < net::MAX_SWITCHES as u64 && d.steer.ep_set(mr(0) as usize, ep) { 0 } else { u64::MAX }
-            }
-            net::NETD_TEST_PANIC if host::TEST_INJECT => panic!("injected panic"),
-            net::NETD_EP_DEL => {
-                d.steer.ep_del(mr(0) as usize);
-                0
-            }
-            net::NETD_STEER_SET => {
-                // One target, an existing port: its MAC is the rule's.
-                let targets = mr(5);
-                let t = targets.trailing_zeros() as usize;
-                let mac = (targets.count_ones() == 1).then(|| d.ports.get(t)).flatten().and_then(|p| p.as_ref()).map(|p| p.mac);
-                match (mac, steer::Match::from_words(mr(2), mr(3), mr(4))) {
-                    (Some(mac), Some(m)) if d.steer.rule_set(mr(0) as usize, mr(1) as usize, m, targets, mac) => 0,
-                    _ => u64::MAX,
+                net::NETD_ADD_LINK => {
+                    let (l, sw, size) = (mr(0) as usize, mr(1), mr(2));
+                    let ok = l < net::MAX_LINKS && d.links[l].is_none() && sw < net::MAX_SWITCHES as u64
+                        && size as usize <= net::LINK_CHANNEL_MAX && size >= 4096;
+                    if ok {
+                        d.links[l] = Some(link::Link::new(l, sw as u32, size, mr(3) as u32, mr(4) as u32));
+                        0
+                    } else {
+                        u64::MAX
+                    }
                 }
-            }
-            net::NETD_STEER_DEL => {
-                d.steer.rule_del(mr(0) as usize);
-                0
-            }
-            net::NETD_STEER_STATS => match d.steer.rules.get(mr(0) as usize).and_then(|r| r.as_ref()) {
-                Some(r) => {
-                    set_mr(1, r.out_frames);
-                    r.in_frames
+                net::NETD_EP_SET => {
+                    let ep = steer::Endpoint { switch: mr(1) as u8, mac: mac_of(mr(2)), peer: mac_of(mr(3)) };
+                    if mr(1) < net::MAX_SWITCHES as u64 && d.steer.ep_set(mr(0) as usize, ep) { 0 } else { u64::MAX }
                 }
-                None => u64::MAX,
-            },
-            _ => u64::MAX,
-        };
-        set_mr(0, resp);
-        (msg, badge) = ep.reply_recv(sel4::MessageInfo::new(0, 0, 0, 3), reply);
+                net::NETD_TEST_PANIC if host::TEST_INJECT => panic!("injected panic"),
+                net::NETD_TEST_HANG if host::TEST_INJECT => l4h_rt::test_hang(),
+                net::NETD_EP_DEL => {
+                    d.steer.ep_del(mr(0) as usize);
+                    0
+                }
+                net::NETD_STEER_SET => {
+                    // One target, an existing port: its MAC is the rule's.
+                    let targets = mr(5);
+                    let t = targets.trailing_zeros() as usize;
+                    let mac = (targets.count_ones() == 1).then(|| d.ports.get(t)).flatten().and_then(|p| p.as_ref()).map(|p| p.mac);
+                    match (mac, steer::Match::from_words(mr(2), mr(3), mr(4))) {
+                        (Some(mac), Some(m)) if d.steer.rule_set(mr(0) as usize, mr(1) as usize, m, targets, mac) => 0,
+                        _ => u64::MAX,
+                    }
+                }
+                net::NETD_STEER_DEL => {
+                    d.steer.rule_del(mr(0) as usize);
+                    0
+                }
+                _ => u64::MAX,
+            };
+            set_mr(0, resp);
+            l4h_rt::mailbox::answer(1);
+            answered = true;
+        }
+        if answered {
+            l4h_rt::mailbox::signal();
+        }
+        // Root handed out an added port's channel before netd added it:
+        // its VMM may have kicked already, and read the page's link state,
+        // DOWN.  Serve the port as if kicked, and signal it.
+        badge = if added != 0 { added } else { ep.recv(reply).1 };
     }
 }
 

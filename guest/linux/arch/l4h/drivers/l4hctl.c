@@ -43,6 +43,8 @@ static DEFINE_MUTEX(ctl_lock);
 /* Requests are kicked and answered with the device's event, so the vCPU
  * runs other tasks meanwhile. */
 static struct l4h_ctl_sync *ctl_sync;
+/* The seq of the last request the host has taken (L4H_CTL_TAKEN_OFF). */
+static u32 *ctl_taken;
 static unsigned long ctl_kick;
 static u32 ctl_seq;
 static DECLARE_WAIT_QUEUE_HEAD(ctl_wq);
@@ -56,6 +58,13 @@ static irqreturn_t l4hctl_interrupt(int irq, void *data)
 static bool ctl_done(void)
 {
 	return smp_load_acquire(&ctl_sync->done) == ctl_seq;
+}
+
+/* The host no longer reads the page for the last request: it answered it,
+ * or took it to answer later (it waits for a driver, maybe for good). */
+static bool ctl_free(void)
+{
+	return ctl_done() || smp_load_acquire(ctl_taken) == ctl_seq;
 }
 
 /* Have the host execute the request in the control page.  -EINTR if we
@@ -83,8 +92,9 @@ static long l4hctl_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 	 * userfaultfd or FUSE page): waiters stay killable. */
 	if (mutex_lock_killable(&ctl_lock))
 		return -EINTR;
-	/* A request whose caller was killed may still use the page. */
-	if (wait_event_killable(ctl_wq, ctl_done())) {
+	/* A request whose caller was killed may still use the page until the
+	 * host has taken it; ours then takes its place. */
+	if (wait_event_killable(ctl_wq, ctl_free())) {
 		ret = -EINTR;
 		goto out;
 	}
@@ -184,6 +194,7 @@ static int __init l4hctl_init(void)
 		return -ENODEV;
 
 	ctl_sync = ctl_page + L4H_CTL_SYNC_OFF;
+	ctl_taken = ctl_page + L4H_CTL_TAKEN_OFF;
 	ctl_seq = READ_ONCE(ctl_sync->seq);
 	ctl_kick = L4H_CPTR2(L4H_SLOT_DEV_CNODE, desc->kick_slot);
 	irq = l4h_event_irq(desc->event);

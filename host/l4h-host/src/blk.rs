@@ -96,10 +96,9 @@ pub const BLKD_SLOT_CLIENT_DONE: u64 = 32;
 pub const MAX_CLIENTS: usize = 512;
 pub const CHANNEL_PAGES: usize = core::mem::size_of::<Channel>().div_ceil(4096);
 pub const STAGING_SIZE: usize = 1 << 20;
-/// Service calls of blkd (message registers; the result is in MR 0).
-/// unit -> capacity (u64::MAX if no such unit), block size, read-only,
-/// number of units, unit address (blkd_scsi_addr for virtio-scsi, else 0).
-pub const BLKD_INFO: u64 = 1;
+/// Root's requests to blkd (host::mailbox: arguments, then answer[0] and
+/// the words after it).  1 is unused: blkd publishes its units instead
+/// (Published).
 /// client, unit, dom0, n -> 0: what BLKD_CHECK allowed in that slot, the
 /// channel's window (n = 0) or the n extents in staging.  blkd builds the
 /// client's ExtentTable at extent_va(client).
@@ -122,8 +121,32 @@ pub const BLKD_CHECK: u64 = 7;
 /// client, k -> 0 and the start and sectors of its kth extent in guest
 /// order, or u64::MAX if it has none.
 pub const BLKD_EXTENT: u64 = 8;
-/// BLKD_WRITE and BLKD_FLUSH refused the range: MR1 is the errno.
+/// `host::TEST_INJECT` only: stop for good without failing, as a
+/// compromised blkd might.
+pub const BLKD_TEST_HANG: u64 = 0x7e58;
+/// BLKD_WRITE and BLKD_FLUSH refused the range: answer[1] is the errno.
 pub const BLKD_REFUSED: u64 = u64::MAX - 1;
+
+/// What blkd publishes for root (host::mailbox::PUBLISHED_OFFSET), once it
+/// has set up the controller; it does not change after.
+#[repr(C)]
+pub struct Published {
+    /// Non-zero once the rest is written.
+    pub ready: core::sync::atomic::AtomicU64,
+    pub units: core::sync::atomic::AtomicU64,
+    pub unit: [PublishedUnit; MAX_UNITS],
+}
+
+#[repr(C)]
+pub struct PublishedUnit {
+    /// In 512-byte sectors.
+    pub capacity: core::sync::atomic::AtomicU64,
+    pub block_size: core::sync::atomic::AtomicU64,
+    pub read_only: core::sync::atomic::AtomicU64,
+    /// blkd_scsi_addr for virtio-scsi, else 0.
+    pub address: core::sync::atomic::AtomicU64,
+}
+const _: () = assert!(core::mem::size_of::<Published>() <= 4096);
 
 /// Errnos of blkd's range decisions, as the control API returns them.
 pub const EPERM: u64 = 1;

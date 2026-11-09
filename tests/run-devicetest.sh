@@ -33,14 +33,15 @@ start = blkd.index('use core::ops::{Deref, DerefMut};')
 # Keep the production boot sequence and reservation lifecycle intact.
 vmmgr = (root / 'host/l4h-vmmgr/src/main.rs').read_text()
 start = vmmgr.index('pub fn boot_dom0(')
-end = vmmgr.index('\n}', start) + 2
+end = vmmgr.index('\n}', vmmgr.index('fn dom0_finish(', start)) + 2
 (out / 'dom0-boot.inc').write_text(vmmgr[start:end])
 blkd = (root / 'host/l4h-root/src/blkd.rs').read_text()
 reservations = blkd[blkd.index('pub const WINDOW_ALIGN:'):blkd.index('/// Mapping attributes for device registers.')]
 reservations += blkd[blkd.index('pub struct Attachment {'):blkd.index('struct Blkd {')]
-start = blkd.index('pub fn remove(')
-end = blkd.index('\n}', start) + 2
-(out / 'blk-reservations.inc').write_text(reservations + blkd[start:end])
+for f in ['pub fn cut_off(', 'fn removed(']:
+    start = blkd.index(f)
+    reservations += blkd[start:blkd.index('\n}', start) + 2] + '\n'
+(out / 'blk-reservations.inc').write_text(reservations)
 # Exercise both public block-attachment operations before any backend call.
 ctl = (root / 'host/l4h-vmmgr/src/ctl.rs').read_text()
 start = ctl.index('fn vm_arg(')
@@ -51,6 +52,17 @@ end = ctl.index('        abi::CTL_CONSOLE_READ => {', start)
 (out / 'blk-attach.inc').write_text(vm_arg + '''
 fn execute(h: &mut Vmmgr, caller: usize, op: u32, a: &[u64; 6]) -> Result<(), i64> {
     match op {
+''' + ctl[start:end] + '''
+        _ => unreachable!(),
+    }
+}
+''')
+start = ctl.index('        abi::CTL_VM_START => {')
+end = ctl.index('        abi::CTL_VM_DESTROY => {', start)
+(out / 'vm-start.inc').write_text(vm_arg + '''
+fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq) -> Result<(), i64> {
+    let a = &req.args;
+    match req.op {
 ''' + ctl[start:end] + '''
         _ => unreachable!(),
     }
@@ -85,6 +97,9 @@ L4H_BLK_ATTACH_TEST_SRC="$out/blk-attach.inc" rustc +stable --edition=2024 --tes
     --extern l4h_abi="$out/libl4h_abi.rlib" --extern l4h_host="$out/libl4h_host.rlib" \
     "$root/tests/blk-attach.rs" -o "$out/blk-attach-tests"
 "$out/blk-attach-tests"
+L4H_VM_START_TEST_SRC="$out/vm-start.inc" rustc +stable --edition=2024 --test -L dependency="$out" \
+    --extern l4h_abi="$out/libl4h_abi.rlib" "$root/tests/vm-start.rs" -o "$out/vm-start-tests"
+"$out/vm-start-tests"
 L4H_BLKD_TEST_SRC="$out/blkd-main.inc" rustc +stable --edition=2024 --test -L dependency="$out" \
     --extern l4h_host="$out/libl4h_host.rlib" \
     "$root/tests/blk-ipc.rs" -o "$out/blk-ipc-tests"

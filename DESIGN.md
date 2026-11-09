@@ -1874,12 +1874,14 @@ extent.
   milliseconds, and per-commit `fsync` dominates package installs and builds
   there. Other attachments of the disk, and dom0's provisioning flush, still
   flush the device.
-- **Destroy** stops the client's VMM, drains that client's submitted work,
-  then releases its mapping and pool, without resetting the shared
-  controller. On a five-second timeout, root suspends the driver and
-  quarantines the controller: its DMA memory stays allocated, every affected
-  guest pool is pinned when destroyed, and no new attachment or provisioning
-  write is accepted until host reboot.
+- **Destroy** stops the client's VMM and takes its pool out of the
+  device's IOMMU domain; blkd then drains that client's submitted work and
+  releases it, without resetting the shared controller, and root reclaims
+  its channel once blkd has answered (§10, "Root never waits on a driver").
+  If blkd cannot drain within five seconds, it says so, and root suspends
+  the driver and quarantines the controller: its DMA memory stays
+  allocated, without an IOMMU every affected guest pool is pinned, and no
+  new attachment or provisioning write is accepted until host reboot.
 - **Provisioning.** dom0 can seed or explicitly zero *unattached* ranges
   with `BLK_WRITE` and its ioctl staging buffer (up to 1 MiB per call); a
   zero-length call flushes the controller. Provisioning uses a private 1 MiB
@@ -2442,6 +2444,45 @@ Scratch}`). The one heap is trustd's, for the third-party AML interpreter of
 the TPM start method; its size (`aml::HEAP`) is bounded by the firmware's
 tables, which trustd checks first.
 
+**Root never waits on a driver.** blkd and netd handle guests' rings and
+device memory, so root assumes either may run an attacker's code, and an
+attacker's driver could leave a request unanswered forever. Root does not
+call them, nor wait for them with a deadline: it posts requests in a ring
+in a page it shares with the driver (`l4h_host::mailbox`), signals the
+driver's notification and goes back to its loop. The driver answers in
+order and signals root, which then finishes what the request was for
+(`blkd::poll`, `Netd::poll`). A request a driver never answers stays
+pending, and so does whatever waits for it, nothing else:
+
+- **netd's commands** need no answer: root validates them and keeps their
+  state (ports, uplinks, steering), and netd publishes its counters and
+  MACs in the mailbox's second page, as blkd publishes its disks. Root's
+  boot, which needs both, finishes from the serve loop once they are there.
+- **blkd's** checks and attachments, provisioning writes and extent queries
+  are answered later through vmmgr (`VMMGR_PENDING`, §10.3), and through
+  dom0's control device, whose caller may give up and make the next
+  request (§10.1). One staging user at a time per controller: another is
+  `EBUSY`. A controller holds at most two of vmmgr's 256 tokens for
+  requests its blkd has not answered, so drivers that never answer leave
+  tokens for the other controllers.
+- **Teardown waits for no one.** A destroyed guest's I/O pool leaves the
+  devices' IOMMU domains at once and is reused; what drivers map (disk
+  channels, extent tables, port memory) is kept until they say they have
+  let go, and with it, without an IOMMU, the pool (a `Zombie`). Revoking
+  the memory would also unmap it from the driver, but an honest driver
+  would fault. A driver that never answers keeps that memory, and the
+  client and port slots, for good.
+- A full ring (64 requests) refuses new ones with `EBUSY`; removals queue
+  in root until there is room. A failed driver's keeper answers everything
+  with `u64::MAX`; a quarantined blkd's pending requests fail at once.
+
+Root still calls memd, which handles no one's data, and trustd only in its
+start-up handshake, before any guest exists; everything else root shares
+with a component is a notification or shared memory. `tests/run-hangtest.sh`
+has a blkd stop answering (`inject blkd-hang`): dom0 gives up a write that
+waits for it, its next is `EBUSY`, and a guest with another disk boots and
+is destroyed; then netd stops too, and root still serves the monitor.
+
 **Stacks.** Every stack has an unmapped page below it, so an overflow faults
 rather than writing over statics: root maps each component's stacks (its
 main thread's and its keeper's) in a region of their own
@@ -2614,7 +2655,13 @@ none. dom0 runs no host hardware drivers.
 - dom0 writes a fixed-layout request (`struct l4h_ctl_req`) into the page,
   bumps its `seq` and signals the kick. vmmgr executes the request, writes
   the response into the same page, sets `done` and raises the device's
-  event; the calling task sleeps meanwhile, and the vCPU runs others.
+  event; the calling task sleeps meanwhile, and the vCPU runs others. A
+  request that waits for a driver (`blk_attach`, `blk_write`, an extent's
+  `blk_info`) is answered when the driver has answered, or never: vmmgr
+  writes its seq at `L4H_CTL_TAKEN_OFF` once it has read the request and
+  the data area, and the caller can be killed. The next request then takes
+  its place, and the old one's answer, if it ever comes, is dropped (its
+  effect, such as an attached disk, stays).
 - `/dev/l4hctl` (mode 0600, and `CAP_SYS_ADMIN`) takes one ioctl that
   carries a request, its response and, for `VM_LOAD`, a user buffer. The
   driver stages the buffer in the control device's data area, 1 MiB of
@@ -3027,6 +3074,12 @@ root.
   `TRUST_REGISTER` (the launch digest), and `HOST_OP`, which carries the
   control ops on the host's disks, switches and NICs, reset and RTC as their
   `CTL_*` number and six arguments, with data returned in a result page.
+  Root answers every call at once; one that waits for blkd answers
+  `VMMGR_PENDING` and a token, and root sets the token's bit in the events
+  page when it has the answer, which `VMMGR_RESULT` then gives. vmmgr goes
+  on meanwhile: a guest whose disk is pending gets no other device, and
+  does not start, until it is answered; dom0's boot disks are attached one
+  after another this way.
   Capabilities cross in vmmgr's exchange slots, which root reaches through
   vmmgr's CNode. Root empties a slot before filling it, so a slot vmmgr left
   full cannot make root fail, and takes no capability from vmmgr: even the
@@ -3039,10 +3092,11 @@ root.
   page for the monitor's `list` and the dashboard.
 - **Destroy.** vmmgr stops the guest and revokes its own arena (VSpaces
   first, so nothing is unmapped page by page), then `GUEST_DEL` has root
-  forget it in trustd, remove its ports, quiesce its disks and only then
-  revoke the pool (kept out of use if a disk did not stop), and finally memd
-  revokes the guest's RAM blocks (§8.4). The call to root is synchronous, so
-  a disk reset holds up vmmgr for its timeout.
+  forget it in trustd, cut its disks off the pool (the IOMMU) and revoke it
+  (without an IOMMU, only once its disks are quiesced, and kept out of use
+  if one did not stop), have netd and blkd let go of its ports and disks, and finally memd revokes the guest's RAM blocks (§8.4). Root
+  answers at once: what drivers map stays with root until they have let go
+  of it (§10).
 - **Boot modules.** Root maps the guest kernel, its module tree and dom0's
   initramfs read-only into vmmgr, with a CNode of their frames, so guests
   can share the kernel's read-only blocks and the module tree (§5.6).
