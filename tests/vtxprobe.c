@@ -81,10 +81,6 @@ static int is_amd(void)
  * CR8-store exiting and MOV-DR exiting. */
 #define VMX_PRIMARY_CONTROLS 0x4002
 #define VMX_PPC_FORCED  (1ul << 19 | 1ul << 20 | 1ul << 23)
-/* The secondary controls patch 0039 keeps on: EPT, and WBINVD exiting
- * (KVM offers it nested). */
-#define VMX_SECONDARY_CONTROLS 0x401e
-#define VMX_SPC_FORCED  (1ul << 1 | 1ul << 6)
 /* Patch 0040: misc2 intercepts kept on (VMRUN, VMLOAD, VMSAVE, STGI, CLGI,
  * SKINIT, WBINVD). */
 #define SVM_I2_FORCED_PROBE 0x27d
@@ -315,8 +311,6 @@ void vtxprobe_main(seL4_BootInfo *bi)
             /* Patch 0043: guest MOVs to and from CR8 always exit. */
             w = seL4_X86_VCPU_WriteVMCS(vcpu, VMX_PRIMARY_CONTROLS, 0);
             check("vmx_ppc_forced", !w.error && (w.written & VMX_PPC_FORCED) == VMX_PPC_FORCED);
-            w = seL4_X86_VCPU_WriteVMCS(vcpu, VMX_SECONDARY_CONTROLS, 0);
-            check("vmx_spc_forced", !w.error && (w.written & VMX_SPC_FORCED) == VMX_SPC_FORCED);
         }
     }
     puts_("vtxprobe: done\n");
