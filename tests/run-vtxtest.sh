@@ -84,6 +84,7 @@ if [ "$mode" = on ]; then
     # Patch 0039: seL4 loads KERNEL_GS_BASE with WRMSR before VM entry.
     grep -aq 'vtxprobe: kgs_canonical ok' "$log" || fail "a canonical KERNEL_GS_BASE was refused"
     grep -aq 'vtxprobe: kgs_noncanonical err=1' "$log" || fail "a noncanonical KERNEL_GS_BASE was accepted"
+    grep -aq 'vtxprobe: flush_tlb ok' "$log" || fail "VCPU_FlushTLB failed"
 fi
 if [ "$mode" = on ] && [ "$virt" = vt-x ]; then
     # Patch 0042: the CR4 bits outside the allowlist stay in the CR4 mask
@@ -92,6 +93,8 @@ if [ "$mode" = on ] && [ "$virt" = vt-x ]; then
     grep -aq 'vtxprobe: vmx_guest_cr4 ok' "$log" || fail "a CR4 bit outside the allowlist was written to GUEST_CR4"
     # Patches 0039 and 0043: MOV-DR and CR8 accesses always exit.
     grep -aq 'vtxprobe: vmx_ppc_forced ok' "$log" || fail "MOV-DR or CR8-load/store exiting was cleared"
+    # Patch 0039: WBINVD always exits.
+    grep -aq 'vtxprobe: vmx_spc_forced ok' "$log" || fail "EPT or WBINVD exiting was cleared"
 fi
 if [ "$mode" = on ] && [ "$virt" = svm ]; then
     # Patch 0040.  seL4_IllegalOperation is 3.

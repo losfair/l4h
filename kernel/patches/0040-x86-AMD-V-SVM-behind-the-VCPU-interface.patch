@@ -1,4 +1,4 @@
-From c3d8d6ab6fb7dd11dea50fe784e1c85f3644f617 Mon Sep 17 00:00:00 2001
+From 4dfdf745df971a7386acac4acf9ee7b601a5f8c8 Mon Sep 17 00:00:00 2001
 From: l4h <l4h@localhost>
 Date: Sun, 8 Nov 2026 19:30:53 +0100
 Subject: [PATCH] x86: AMD-V (SVM) behind the VCPU interface
@@ -19,7 +19,8 @@ VMs on both.  32-bit kernels keep VT-x only.
   by byte offset.  Userspace may write only the fields listed in
   svm_field(), and only some of their bits.  The kernel keeps on the
   intercepts the host needs: INTR, NMI, SMI, INIT and shutdown, INVD
-  (which would discard dirty cache lines of seL4 and other guests), the
+  (which would discard dirty cache lines of seL4 and other guests) and
+  WBINVD (which would flush the caches they share), the
   permission maps (every port exits, and only the MSRs VMLOAD and
   VMSAVE switch do not), VMRUN, VMLOAD, VMSAVE, CLGI, STGI, SKINIT and
   INVLPGA, which would act on host state or host physical memory in a
@@ -46,7 +47,8 @@ VMs on both.  32-bit kernels keep VT-x only.
   VCPU in guest mode and its VMEnter ends (patch 0039).
 - VMEnter has VT-x's MR layout, with SVM's fields in it (vmenter.h):
   the misc1 intercepts, EVENTINJ (its defined bits, as WriteVMCB
-  takes), the exit code, EXITINFO1 and 2, the
+  takes; MR0-2 are in registers, so a thread without an IPC buffer
+  brings them too), the exit code, EXITINFO1 and 2, the
   instruction length from NEXT_RIP, the interrupt state, CR3 and
   EXITINTINFO.  ReadMSR and WriteMSR reach the syscall MSRs,
   KERNEL_GS_BASE and CR2 in the VMCB, and the VCPU's XCR0 (patch
@@ -80,9 +82,10 @@ VMs on both.  32-bit kernels keep VT-x only.
   index into the host's PAT: write-combining uses its WC entry.
 - TLB entries are tagged by ASIDs, which are per core.  A VCPU takes
   the next ASID of its core, and an invalidation (unmapping from a
-  nested page table, FlushTLB, a new root) moves that core to a new
-  generation, so every VCPU takes a fresh ASID before it runs there
-  again.  A VCPU that moves to another core takes a fresh ASID there
+  nested page table) moves that core to a new generation, so every VCPU
+  takes a fresh ASID before it runs there again.  A new root, or
+  FlushTLB, gives only its VCPU a fresh ASID, as FlushTLB flushes only
+  the VCPU's VPID on VT-x.  A VCPU that moves to another core takes a fresh ASID there
   too, which is what VT-x's VPID flush on a move does.  invept()
   reaches the same cores as on VT-x.  When the ASIDs
   run out, every entry on the core flushes them all until a VMRUN that
@@ -104,9 +107,9 @@ VMs on both.  32-bit kernels keep VT-x only.
  src/arch/x86/config.cmake                     |    1 +
  src/arch/x86/kernel/ept.c                     |   21 +-
  src/arch/x86/model/statedata.c                |    7 +
- src/arch/x86/object/svm.c                     | 1029 +++++++++++++++++
- src/arch/x86/object/vcpu.c                    |  122 +-
- 13 files changed, 1443 insertions(+), 49 deletions(-)
+ src/arch/x86/object/svm.c                     | 1032 +++++++++++++++++
+ src/arch/x86/object/vcpu.c                    |  138 ++-
+ 13 files changed, 1459 insertions(+), 52 deletions(-)
  create mode 100644 include/arch/x86/arch/object/svm.h
  create mode 100644 src/arch/x86/object/svm.c
 
@@ -381,7 +384,7 @@ index 9f14a237b..197b6bfef 100644
  
  /* Removes any IO port mappings that have been cached for the given VPID */
 diff --git a/libsel4/arch_include/x86/interfaces/object-api-arch.xml b/libsel4/arch_include/x86/interfaces/object-api-arch.xml
-index 68aa387ee..ce1bad98e 100644
+index a4e626a50..33f3e8a1c 100644
 --- a/libsel4/arch_include/x86/interfaces/object-api-arch.xml
 +++ b/libsel4/arch_include/x86/interfaces/object-api-arch.xml
 @@ -1140,6 +1140,56 @@
@@ -645,10 +648,10 @@ index da0b07c6f..a651c405e 100644
  #ifdef CONFIG_PRINTING
 diff --git a/src/arch/x86/object/svm.c b/src/arch/x86/object/svm.c
 new file mode 100644
-index 000000000..7e3ddfce7
+index 000000000..18e652c8c
 --- /dev/null
 +++ b/src/arch/x86/object/svm.c
-@@ -0,0 +1,1029 @@
+@@ -0,0 +1,1032 @@
 +/*
 + * SPDX-License-Identifier: GPL-2.0-only
 + */
@@ -747,11 +750,12 @@ index 000000000..7e3ddfce7
 +/*
 + * The intercepts seL4 keeps on: host interrupts, NMIs, SMIs and INIT must
 + * leave the guest; a shutdown would reset the core; INVD would discard
-+ * dirty cache lines of seL4 and other guests; the counters and debug
-+ * registers are not switched; XCR0 takes only values WriteMSR checked; and
-+ * nothing makes VMLOAD, VMSAVE, CLGI, STGI, SKINIT and INVLPGA safe in a
-+ * guest.  #DB and #AC always exit, as a guest could otherwise loop on them
-+ * without an exit, and #MC belongs to the host.
++ * dirty cache lines of seL4 and other guests, and WBINVD would flush the
++ * caches they share, holding off the core's interrupts meanwhile; the
++ * counters and debug registers are not switched; XCR0 takes only values
++ * WriteMSR checked; and nothing makes VMLOAD, VMSAVE, CLGI, STGI, SKINIT
++ * and INVLPGA safe in a guest.  #DB and #AC always exit, as a guest could
++ * otherwise loop on them without an exit, and #MC belongs to the host.
 + */
 +#define SVM_I1_FORCED (SVM_I1_INTR | SVM_I1_NMI | SVM_I1_SMI | SVM_I1_INIT | SVM_I1_RDPMC | \
 +                       SVM_I1_INVD | SVM_I1_INVLPGA | SVM_I1_IOIO | SVM_I1_MSR | SVM_I1_SHUTDOWN)
@@ -760,9 +764,9 @@ index 000000000..7e3ddfce7
 + * and FERR_FREEZE are userspace's. */
 +#define SVM_I1_WRITABLE ((MASK(15) & ~MASK(4)) | (MASK(26) & ~MASK(16) & ~SVM_I1_INVD) | BIT(29) | BIT(30))
 +#define SVM_I2_FORCED (SVM_I2_VMRUN | SVM_I2_VMLOAD | SVM_I2_VMSAVE | SVM_I2_STGI | SVM_I2_CLGI | \
-+                       SVM_I2_SKINIT | SVM_I2_MONITOR | SVM_I2_MWAIT | SVM_I2_MWAIT_COND | \
-+                       SVM_I2_XSETBV | SVM_I2_RDPRU)
-+#define SVM_I2_WRITABLE (SVM_I2_VMMCALL | SVM_I2_RDTSCP | SVM_I2_ICEBP | SVM_I2_WBINVD)
++                       SVM_I2_SKINIT | SVM_I2_WBINVD | SVM_I2_MONITOR | SVM_I2_MWAIT | \
++                       SVM_I2_MWAIT_COND | SVM_I2_XSETBV | SVM_I2_RDPRU)
++#define SVM_I2_WRITABLE (SVM_I2_VMMCALL | SVM_I2_RDTSCP | SVM_I2_ICEBP)
 +#define SVM_EXC_FORCED (BIT(1) | BIT(17) | BIT(18))
 +/* CR4 writes always exit: SVM has no CR4 mask, and a guest must not set
 + * the bits outside VCPU_GUEST_CR4_ALLOWED. */
@@ -1458,7 +1462,9 @@ index 000000000..7e3ddfce7
 +    case SVM_EXIT_NMI:
 +    case SVM_EXIT_SMI:
 +    case SVM_EXIT_INIT:
-+        /* The host took it at STGI (restore_svm()): just go on. */
++        /* The host took an NMI or SMI at STGI (restore_svm()): just go
++         * on.  An INIT taken there resets the core, as seL4 leaves
++         * VM_CR.R_INIT clear, so its exit never gets this far. */
 +        NODE_LOCK_IRQ;
 +#ifdef ENABLE_SMP_SUPPORT
 +        VMCheckBoundNotification(NODE_STATE(ksCurThread));
@@ -1679,7 +1685,7 @@ index 000000000..7e3ddfce7
 +
 +#endif /* CONFIG_VTX && CONFIG_ARCH_X86_64 */
 diff --git a/src/arch/x86/object/vcpu.c b/src/arch/x86/object/vcpu.c
-index e4d9ab4cd..4bcfe120b 100644
+index 8d89dfe4b..4e073b27b 100644
 --- a/src/arch/x86/object/vcpu.c
 +++ b/src/arch/x86/object/vcpu.c
 @@ -55,7 +55,7 @@ typedef struct msr_bitmaps {
@@ -1715,7 +1721,7 @@ index e4d9ab4cd..4bcfe120b 100644
          vcpu->launched = false;
          ARCH_NODE_STATE(x86KSCurrentVCPU) = NULL;
          if (vcpu->fpu_active && vcpu->vcpuTCB) {
-@@ -484,24 +484,6 @@ static inline uint32_t applyPrimaryControls(uint32_t value)
+@@ -492,24 +492,6 @@ static inline uint32_t applyPrimaryControls(uint32_t value)
                            primary_control_low & (primary_control_high | PRIMARY_CONTROLS_ALLOWED));
  }
  
@@ -1740,7 +1746,7 @@ index e4d9ab4cd..4bcfe120b 100644
  void vcpu_load_guest_xcr0(vcpu_t *vcpu)
  {
  #ifdef CONFIG_XSAVE
-@@ -522,6 +504,12 @@ void vcpu_load_host_xcr0(vcpu_t *vcpu)
+@@ -530,6 +512,12 @@ void vcpu_load_host_xcr0(vcpu_t *vcpu)
  
  void vcpu_init(vcpu_t *vcpu)
  {
@@ -1753,7 +1759,7 @@ index e4d9ab4cd..4bcfe120b 100644
      vcpu->vcpuTCB = NULL;
      vcpu->launched = false;
      vcpu->fpu_active = false;
-@@ -640,6 +628,11 @@ static void dissociateVcpuTcb(tcb_t *tcb, vcpu_t *vcpu)
+@@ -648,6 +636,11 @@ static void dissociateVcpuTcb(tcb_t *tcb, vcpu_t *vcpu)
       * enter it again with no VCPU: its VMEnter ends now, as a notification
       * ends it, while the VCPU still has the guest's state. */
      if (thread_state_ptr_get_tsType(&tcb->tcbState) == ThreadState_RunningVM) {
@@ -1765,7 +1771,7 @@ index e4d9ab4cd..4bcfe120b 100644
          vcpu_sysvmenter_reply_to_user(tcb);
          setRegister(tcb, badgeRegister, 0);
          setThreadState(tcb, ThreadState_Running);
-@@ -656,6 +649,17 @@ void vcpu_finalise(vcpu_t *vcpu)
+@@ -664,6 +657,17 @@ void vcpu_finalise(vcpu_t *vcpu)
      if (vcpu->vcpuTCB) {
          dissociateVcpuTcb(vcpu->vcpuTCB, vcpu);
      }
@@ -1783,23 +1789,23 @@ index e4d9ab4cd..4bcfe120b 100644
      if (ARCH_NODE_STATE_ON_CORE(x86KSCurrentVCPU, vcpu->last_cpu) == vcpu) {
  #ifdef ENABLE_SMP_SUPPORT
          if (vcpu->last_cpu != getCurrentCPUIndex()) {
-@@ -1298,6 +1302,15 @@ static exception_t decodeSetTCB(cap_t cap, word_t length, word_t *buffer)
+@@ -1306,6 +1310,15 @@ static exception_t decodeSetTCB(cap_t cap, word_t length, word_t *buffer)
  void vcpu_update_state_sysvmenter(vcpu_t *vcpu)
  {
      word_t *buffer;
 +#ifdef CONFIG_ARCH_X86_64
 +    if (x86KSSVMEnabled) {
++        /* MR0-2 are in registers: a thread without an IPC buffer brings
++         * them too, and the exit it saw before is then not injected again. */
 +        buffer = lookupIPCBuffer(false, NODE_STATE(ksCurThread));
-+        if (buffer) {
-+            svm_update_state_sysvmenter(vcpu, buffer);
-+        }
++        svm_update_state_sysvmenter(vcpu, buffer);
 +        return;
 +    }
 +#endif
      if (ARCH_NODE_STATE(x86KSCurrentVCPU) != vcpu) {
          switchVCPU(vcpu);
      }
-@@ -1337,6 +1350,13 @@ void vcpu_sysvmenter_reply_to_user(tcb_t *tcb)
+@@ -1345,6 +1358,13 @@ void vcpu_sysvmenter_reply_to_user(tcb_t *tcb)
  
      assert(vcpu);
  
@@ -1813,7 +1819,7 @@ index e4d9ab4cd..4bcfe120b 100644
      if (ARCH_NODE_STATE(x86KSCurrentVCPU) != vcpu) {
          switchVCPU(vcpu);
      }
-@@ -1358,6 +1378,21 @@ exception_t decodeX86VCPUInvocation(
+@@ -1366,6 +1386,21 @@ exception_t decodeX86VCPUInvocation(
      switch (invLabel) {
      case X86VCPUSetTCB:
          return decodeSetTCB(cap, length, buffer);
@@ -1835,8 +1841,28 @@ index e4d9ab4cd..4bcfe120b 100644
      case X86VCPUFlushTLB: {
          vcpu_t *vcpu = VCPU_PTR(cap_vcpu_cap_get_capVCPUPtr(cap));
  
-@@ -1367,6 +1402,13 @@ exception_t decodeX86VCPUInvocation(
+@@ -1374,13 +1409,30 @@ exception_t decodeX86VCPUInvocation(
+          * VPID then (switchVCPU()), and EPT changes are invalidated on
+          * every core where they are made.  An invept here interrupted
+          * every core that had run a VM, each time a guest flushed. */
+-        if (ARCH_NODE_STATE(x86KSCurrentVCPU) != vcpu) {
+-            switchVCPU(vcpu);
++#ifdef CONFIG_ARCH_X86_64
++        if (x86KSSVMEnabled) {
++            svm_claim_vcpu(vcpu);
++            /* A new ASID, as for a new root (svm_set_npt_root()), which
++             * a core the VCPU arrives on gives it too. */
++            vcpu->svm.asid_gen = 0;
++        } else
++#endif
++        {
++            if (ARCH_NODE_STATE(x86KSCurrentVCPU) != vcpu) {
++                switchVCPU(vcpu);
++            }
++            vcpu->flush_vpid = true;
          }
+-        vcpu->flush_vpid = true;
+         setThreadState(NODE_STATE(ksCurThread), ThreadState_Restart);
          return EXCEPTION_NONE;
      }
 +    }
@@ -1849,7 +1875,7 @@ index e4d9ab4cd..4bcfe120b 100644
      case X86VCPUReadVMCS:
          return decodeReadVMCS(cap, length, call, buffer);
      case X86VCPUWriteVMCS:
-@@ -1375,16 +1417,6 @@ exception_t decodeX86VCPUInvocation(
+@@ -1389,16 +1441,6 @@ exception_t decodeX86VCPUInvocation(
          return decodeEnableIOPort(cap, length, buffer);
      case X86VCPUDisableIOPort:
          return decodeDisableIOPort(cap, length, buffer);
@@ -1866,7 +1892,7 @@ index e4d9ab4cd..4bcfe120b 100644
  #ifdef CONFIG_X86_64_VTX_64BIT_GUESTS
      case X86VCPUWriteMSR:
          return decodeVCPUWriteMSR(cap, length, buffer);
-@@ -1508,6 +1540,11 @@ BOOT_CODE bool_t vtx_init(void)
+@@ -1522,6 +1564,11 @@ BOOT_CODE bool_t vtx_init(void)
      if (CURRENT_CPU_INDEX() == 0) {
          x86KSVCPULA57 = x86_cpuid_eax(0, 0) >= 7 && (x86_cpuid_ecx(7, 0) & BIT(16));
      }
@@ -1878,7 +1904,7 @@ index e4d9ab4cd..4bcfe120b 100644
      if (CURRENT_CPU_INDEX() != 0) {
          /* Secondary cores follow the boot core, which runs first: none
           * uses VT-x without it, and each must match it when it does. */
-@@ -1663,6 +1700,11 @@ exception_t handleVmexit(void)
+@@ -1681,6 +1728,11 @@ exception_t handleVmexit(void)
      /* qualification is host width, reason is defined as being 32 bit */
      word_t qualification;
      uint32_t reason;
@@ -1890,7 +1916,7 @@ index e4d9ab4cd..4bcfe120b 100644
      reason = vmread(VMX_DATA_EXIT_REASON);
      finishVmexitSaving(reason);
      /* the basic exit reason is the bottom 16 bits of the exit reason field */
-@@ -1932,6 +1974,12 @@ void vcpu_make_current(vcpu_t *vcpu)
+@@ -1950,6 +2002,12 @@ void vcpu_make_current(vcpu_t *vcpu)
       * after, and invept() reaches only the cores in this mask, so a core it
       * did not know of would enter with a root deleted meanwhile. */
      __atomic_fetch_or(&x86KSVMXCores, BIT(getCurrentCPUIndex()), __ATOMIC_SEQ_CST);
@@ -1903,7 +1929,7 @@ index e4d9ab4cd..4bcfe120b 100644
  #endif
      if (ARCH_NODE_STATE(x86KSCurrentVCPU) != vcpu) {
          switchVCPU(vcpu);
-@@ -2006,6 +2054,12 @@ void restoreVMCS(void)
+@@ -2024,6 +2082,12 @@ void restoreVMCS(void)
  
  void invalidateLocalEPT(ept_pml4e_t *ept_pml4)
  {
@@ -1917,5 +1943,5 @@ index e4d9ab4cd..4bcfe120b 100644
          struct {
              uint64_t parts[2];
 -- 
-2.47.3
+2.43.0
 
