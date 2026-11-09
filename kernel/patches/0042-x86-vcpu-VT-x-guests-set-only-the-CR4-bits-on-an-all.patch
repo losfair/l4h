@@ -1,4 +1,4 @@
-From a7d8683cd985fbad4cad94526cffef784da438ea Mon Sep 17 00:00:00 2001
+From be909dd2608e027d54d70e99144cf254a0d6b8f8 Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Mon, 9 Nov 2026 01:22:12 +0100
 Subject: [PATCH] x86/vcpu: VT-x guests set only the CR4 bits on an allowlist
@@ -22,10 +22,10 @@ VMX_CONTROL_CR4_MASK shows the others set.
  1 file changed, 6 insertions(+), 2 deletions(-)
 
 diff --git a/src/arch/x86/object/vcpu.c b/src/arch/x86/object/vcpu.c
-index 8a8900d38..d7178d081 100644
+index ca8b6755b..ca64cc5e3 100644
 --- a/src/arch/x86/object/vcpu.c
 +++ b/src/arch/x86/object/vcpu.c
-@@ -582,6 +582,8 @@ void vcpu_init(vcpu_t *vcpu)
+@@ -591,6 +591,8 @@ void vcpu_init(vcpu_t *vcpu)
      vmwrite(VMX_CONTROL_CR0_MASK, vcpu->cr0_mask);
      vmwrite(VMX_CONTROL_CR0_READ_SHADOW, vcpu->cr0_shadow);
      vmwrite(VMX_GUEST_CR4, cr4_high & cr4_low);
@@ -34,7 +34,7 @@ index 8a8900d38..d7178d081 100644
  
      vmwrite(VMX_GUEST_VMCS_LINK_POINTER, ~(word_t)0);
      vmwrite(VMX_GUEST_VMCS_LINK_POINTER_HIGH, ~(word_t)0);
-@@ -1048,7 +1050,6 @@ static exception_t decodeWriteVMCS(cap_t cap, word_t length, bool_t call, word_t
+@@ -1079,7 +1081,6 @@ static exception_t decodeWriteVMCS(cap_t cap, word_t length, bool_t call, word_t
      case VMX_GUEST_PENDING_DEBUG_EXCEPTIONS:
      case VMX_GUEST_SYSENTER_ESP:
      case VMX_GUEST_SYSENTER_EIP:
@@ -42,7 +42,7 @@ index 8a8900d38..d7178d081 100644
      case VMX_CONTROL_CR0_READ_SHADOW:
      case VMX_CONTROL_CR4_READ_SHADOW:
      case VMX_GUEST_CR3:
-@@ -1062,6 +1063,9 @@ static exception_t decodeWriteVMCS(cap_t cap, word_t length, bool_t call, word_t
+@@ -1095,6 +1096,9 @@ static exception_t decodeWriteVMCS(cap_t cap, word_t length, bool_t call, word_t
          /* CD, NW and reserved bits are always kernel-owned, see vcpu_init() */
          value |= VMX_CR0_KERNEL_OWNED_BITS;
          break;
@@ -52,7 +52,7 @@ index 8a8900d38..d7178d081 100644
      case VMX_CONTROL_PIN_EXECUTION_CONTROLS:
          value = applyFixedBits(value, pin_control_high, pin_control_low & (pin_control_high | PIN_CONTROLS_ALLOWED));
          break;
-@@ -1082,7 +1086,7 @@ static exception_t decodeWriteVMCS(cap_t cap, word_t length, bool_t call, word_t
+@@ -1115,7 +1119,7 @@ static exception_t decodeWriteVMCS(cap_t cap, word_t length, bool_t call, word_t
          value = applyFixedBits(value, cr0_high, cr0_low);
          break;
      case VMX_GUEST_CR4:

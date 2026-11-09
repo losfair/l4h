@@ -1,4 +1,4 @@
-From 6966cf1bec0cc5e67b0573554ec06b0d3b43a96b Mon Sep 17 00:00:00 2001
+From 59d89dba1184b30e1b7f742839c0c2bd54dfa458 Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Mon, 9 Nov 2026 10:20:48 +0100
 Subject: [PATCH] x86/vcpu: VT-x guest accesses to CR8 always exit
@@ -24,10 +24,10 @@ always on, so a guest's CR8 is its VMCB's V_TPR.
  1 file changed, 2 insertions(+)
 
 diff --git a/src/arch/x86/object/vcpu.c b/src/arch/x86/object/vcpu.c
-index d7178d081..147076fc9 100644
+index ca64cc5e3..da034c54f 100644
 --- a/src/arch/x86/object/vcpu.c
 +++ b/src/arch/x86/object/vcpu.c
-@@ -269,6 +269,8 @@ static bool_t BOOT_CODE init_vtx_fixed_values(bool_t useTrueMsrs)
+@@ -277,6 +277,8 @@ static bool_t BOOT_CODE init_vtx_fixed_values(bool_t useTrueMsrs)
      uint32_t primary_control_mask =
          BIT(10) |   //MWAIT exiting
          BIT(11) |   //RDPMC exiting: the counters are not switched
