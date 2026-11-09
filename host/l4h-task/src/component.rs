@@ -16,11 +16,11 @@ use crate::window::Window;
 
 const PAGE: usize = 4096;
 
-/// Badge bits on the root endpoint for messages from components.
-pub const ROOT_BADGE_COMPONENT: u64 = 1 << 25;
+use l4h_host::badges::parent;
 
-pub fn component_badge(id: u32) -> u64 {
-    ROOT_BADGE_COMPONENT | id as u64
+/// The badge of a component's calls on its parent's endpoint (badges::parent).
+pub const fn component_badge(id: u32) -> u64 {
+    parent::COMPONENT | parent::ID.put(id as u64)
 }
 
 pub struct Component {
@@ -292,7 +292,7 @@ pub fn create(
         .expect("component SC");
     let fault_slot = alloc.slots.alloc();
     local_cnode.absolute_cptr(cap_at::<cap_type::Null>(fault_slot))
-        .mint(&local_cnode.absolute_cptr(context.parent_ep), CapRights::all(), component_badge(args.id) | host::BADGE_FAULT)
+        .mint(&local_cnode.absolute_cptr(context.parent_ep), CapRights::all(), component_badge(args.id) | parent::FAULT)
         .expect("component fault ep");
     let root_fault = cap_at::<cap_type::Endpoint>(fault_slot);
     // The keeper is left suspended: the main thread starts it, on its own

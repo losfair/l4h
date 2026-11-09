@@ -54,11 +54,11 @@ use sel4::{ObjectBlueprint, cap, cap_type};
 use sel4_root_task::{Never, root_task};
 
 use l4h_host as host;
+use l4h_host::badges::root as recv;
 use l4h_host::fixed::ArrayVec;
 use l4h_task::{mem, topology, vspace, window};
 
 use crate::blkd::{Controller, Disk};
-use crate::component::ROOT_BADGE_COMPONENT;
 use crate::mem::{Alloc, Slots};
 use crate::vmmgr::{Dom0Plan, RootGuest};
 use crate::window::{Window, Windows};
@@ -74,8 +74,6 @@ static LOG: host::log::Ring = host::log::Ring::new();
 /// Partition 0's serial ring. A secondary only starts on it.
 static SERIAL: host::serial::Ring = host::serial::Ring::new();
 pub const MAX_GUESTS: usize = 64;
-/// Badge bit of a component's fault on the root endpoint.
-pub const HYP_BADGE_FAULT: u64 = host::BADGE_FAULT;
 /// What root made for vmmgr's guests, by id.
 static GUESTS: StaticCell<[Option<RootGuest>; MAX_GUESTS]> = StaticCell::new([const { None }; MAX_GUESTS]);
 static OPS: StaticCell<vmmgr::Ops> = StaticCell::new([const { None }; l4h_host::vmmgr::MAX_PENDING]);
@@ -85,8 +83,6 @@ const RESERVE_BYTES: usize = 32 << 20;
 const RESERVE_SLOTS: usize = 32768;
 /// Longest free slot range kept for disk DMA buffers.
 const RESERVE_RANGE: usize = 4096;
-
-const TIMER_BADGE: u64 = 1 << 40;
 
 /// Host disks, at most: the units of all controllers (a virtio-scsi
 /// controller reports its own number).  Units beyond are reported and
@@ -739,7 +735,7 @@ pub fn arm_timer(info: &HostInfo) {
 /// Signal root's notification at `deadline`, replacing what was armed.
 pub fn set_timer(deadline: u64) {
     let tcb = slot::TCB.cap();
-    sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_TCB_SetTimer(tcb.bits(), deadline, TIMER_BADGE));
+    sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_TCB_SetTimer(tcb.bits(), deadline, recv::TIMER));
 }
 
 /// Root's part of the watchdog dump (vmmgr dumps the guests' vCPUs).
@@ -802,8 +798,7 @@ fn serve(h: &mut Host, reply_slot: ReplySlot, modules: &bootmod::Modules) -> ! {
     let (mut info, mut badge) = hyp_ep.recv(reply);
     loop {
         h.alloc.refill();
-        let notified = badge & (TIMER_BADGE | monitor::MONITOR_BADGE | channel::CHANNEL_BADGE | netd::LINK_BADGES
-            | mailbox::MAILBOX_BADGE) != 0;
+        let notified = badge & recv::SIGNALS != 0;
         // Drivers' answers, and what a quarantine left (blkd::poll).  Not
         // on a call: it would overwrite the caller's message registers.
         if notified {
@@ -813,17 +808,17 @@ fn serve(h: &mut Host, reply_slot: ReplySlot, modules: &bootmod::Modules) -> ! {
                 finish_boot(h, modules);
             }
         }
-        if badge & monitor::MONITOR_BADGE != 0 {
+        if badge & recv::MONITOR != 0 {
             monitor::Monitor::interrupt(h);
         }
-        if badge & channel::CHANNEL_BADGE != 0 {
+        if badge & recv::CHANNEL != 0 {
             channel::poll(h);
         }
-        if badge & netd::LINK_BADGES != 0 {
+        if badge & recv::LINK.mask() != 0 {
             h.netd.link_ring(badge);
         }
         let resp = if notified {
-            if badge & TIMER_BADGE != 0 {
+            if badge & recv::TIMER != 0 {
                 dashboard::Dashboard::tick(h);
                 channel::tick(h);
                 trustd::tick(h);
@@ -835,7 +830,7 @@ fn serve(h: &mut Host, reply_slot: ReplySlot, modules: &bootmod::Modules) -> ! {
                 arm_timer(&h.info);
             }
             None
-        } else if badge & ROOT_BADGE_COMPONENT != 0 {
+        } else if badge & recv::COMPONENT != 0 {
             component_call(h, badge, &info)
         } else {
             log!("l4h-root: unexpected message, badge {:#x} label {}", badge, info.label());
@@ -860,8 +855,8 @@ fn serve(h: &mut Host, reply_slot: ReplySlot, modules: &bootmod::Modules) -> ! {
 /// A call or fault from a host component.  Sets the reply's message
 /// registers and returns its length, or None to leave the caller blocked.
 fn component_call(h: &mut Host, badge: u64, info: &sel4::MessageInfo) -> Option<usize> {
-    let id = (badge & 0xffff) as u32;
-    if badge & HYP_BADGE_FAULT != 0 {
+    let id = recv::ID.get(badge) as u32;
+    if badge & recv::FAULT != 0 {
         let fault = sel4::with_ipc_buffer(|b| sel4::Fault::new(b, info));
         log!("l4h-root: component {:#x} fault: {:x?}", id, fault);
         trustd::fault(h, id);

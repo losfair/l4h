@@ -6,13 +6,12 @@
 
 use sel4::{CapRights, cap, cap_type};
 
-use l4h_host::memd::{self, MAILBOX_BCN, MAILBOX_HCN, MAILBOX_RADIX, MAILBOX_XCHG, Status};
+use l4h_host::memd::{self, MAILBOX_BCN, MAILBOX_HCN, MAILBOX_RADIX, MAILBOX_XCHG, Status, call::Client};
 use l4h_host::vmmgr as proto;
 use l4h_task::memd::MemdLink;
 
 use crate::component::abs_of;
 use crate::mem::{Alloc, Slot};
-use crate::mr;
 
 /// memd's endpoint, mailbox, and status mapping, installed by root.
 pub fn link() -> MemdLink {
@@ -37,7 +36,7 @@ pub fn guest_create(alloc: &Alloc, g: usize, blocks: usize, block_cn: cap::CNode
     let m = link_of(alloc);
     m.slot(MAILBOX_BCN).copy(&abs_of(block_cn), CapRights::all()).expect("memd: give block CNode");
     m.slot(MAILBOX_HCN).copy(&abs_of(hp_cn), CapRights::all()).expect("memd: give hotplug CNode");
-    let ok = m.call(memd::MEMD_GUEST_CREATE, &[g as u64, blocks as u64, radix as u64, hp_count as u64]) == 0;
+    let ok = m.guest_create(g, blocks, radix, hp_count).is_ok();
     // What memd did not take.
     let _ = (m.slot(MAILBOX_BCN).delete(), m.slot(MAILBOX_HCN).delete());
     ok
@@ -45,7 +44,7 @@ pub fn guest_create(alloc: &Alloc, g: usize, blocks: usize, block_cn: cap::CNode
 
 /// Set the hotplug target of guest `g`, in hotplug blocks.
 pub fn set_target(alloc: &Alloc, g: usize, target: usize) -> bool {
-    link_of(alloc).call(memd::MEMD_SET_TARGET, &[g as u64, target as u64]) == 0
+    link_of(alloc).set_target(g, target).is_ok()
 }
 
 /// Hotplug target and plugged hotplug blocks of guest `g`.
@@ -65,8 +64,7 @@ pub fn give_vmm_ep(g: usize, dst: &sel4::AbsoluteCPtr) {
 /// address.
 pub fn guest_copy(alloc: &Alloc, g: usize, b: usize, slot: Slot) -> usize {
     let m = link_of(alloc);
-    assert_eq!(m.call(memd::MEMD_GUEST_COPY, &[g as u64, b as u64]), 0, "memd: copy of a guest block");
-    let paddr = mr(1) as usize;
+    let paddr = m.guest_copy(g, b).expect("memd: copy of a guest block") as usize;
     abs_of(sel4::Cap::<cap_type::Null>::from_bits(slot as u64)).move_(&m.xchg(0)).expect("memd: take block copy");
     paddr
 }
@@ -74,12 +72,12 @@ pub fn guest_copy(alloc: &Alloc, g: usize, b: usize, slot: Slot) -> usize {
 /// Give guest `g` its blocks from `first` on, block b at index b + `skip`
 /// of its block CNode (past its shared blocks, guest.rs).
 pub fn guest_give(alloc: &Alloc, g: usize, first: usize, skip: usize) -> bool {
-    link_of(alloc).call(memd::MEMD_GUEST_GIVE, &[g as u64, first as u64, skip as u64]) == 0
+    link_of(alloc).guest_give(g, first, skip).is_ok()
 }
 
 /// Revoke and free all the RAM of guest `g`.
 pub fn guest_destroy(alloc: &Alloc, g: usize) {
     if let Some(m) = alloc.memd {
-        m.call(memd::MEMD_GUEST_DESTROY, &[g as u64]);
+        let _ = m.guest_destroy(g);
     }
 }

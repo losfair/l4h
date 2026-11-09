@@ -77,7 +77,7 @@ pub struct Vmmgr {
     comp: Component,
     #[allow(dead_code)]
     arena: Arena,
-    /// Its bound notification, badged BADGE_ROOT_EVENT.
+    /// Its bound notification, badged badges::vmmgr::ROOT_EVENT.
     signal: cap::Notification,
 }
 
@@ -305,7 +305,7 @@ pub fn spawn(h: &mut Host, modules: &Modules, plan: &Dom0Plan) -> Vmmgr {
 
     let s = h.alloc.slots.alloc();
     let signal = root_cap::<cap_type::Notification>(s);
-    abs_of(signal).mint(&abs_of(comp.ntfn), CapRights::write_only(), proto::BADGE_ROOT_EVENT).expect("vmmgr signal");
+    abs_of(signal).mint(&abs_of(comp.ntfn), CapRights::write_only(), l4h_host::badges::vmmgr::ROOT_EVENT).expect("vmmgr signal");
     component::start(&comp);
     info!("l4h-root: vmmgr started with {} MiB of boot modules", pages * PAGE >> 20);
     Vmmgr { comp, arena, signal }

@@ -10,6 +10,7 @@
 
 #![no_std]
 
+pub mod badges;
 pub mod blk;
 pub mod fixed;
 pub mod font;
@@ -24,6 +25,7 @@ pub mod serial;
 pub mod trust;
 pub mod usb;
 pub mod vmmgr;
+pub mod wire;
 
 /// Whether host components print informational messages.  The serial port
 /// takes about 11 KB/s, so release builds (`L4H_RELEASE=1` when the host is
@@ -140,10 +142,8 @@ pub const fn has_keeper(kind: u32) -> bool {
     matches!(kind, KIND_BLKD | KIND_NETD | KIND_MEMD | KIND_VMMGR | KIND_USBD)
 }
 
-/// Badge bit of a fault message on a parent's endpoint (a component's on
-/// root's, a guest kernel's or a VMM's on vmmgr's).  A failed parent's
-/// keeper leaves faults unanswered: the thread would only fault again.
-pub const BADGE_FAULT: u64 = 1 << 24;
+/// Badge bit of a fault message on a parent's endpoint (badges::parent).
+pub const BADGE_FAULT: u64 = badges::parent::FAULT;
 
 /// Driver address-space layout: the device structures, then DMA memory.
 pub const fn blkd_chan_va() -> usize {

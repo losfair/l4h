@@ -63,17 +63,6 @@ pub use l4h_host::MAX_GUEST_DEVICES;
 /// VSpaces of a guest's processes (the guest's VSpace pool), at most.
 pub const MAX_VSPACES: usize = 64;
 
-/// Badge layout of vmmgr's fault endpoint for guest kernels.
-pub const HYP_BADGE_FAULT: u64 = host::BADGE_FAULT;
-pub fn hyp_badge(guest: usize, vcpu: usize) -> u64 {
-    (guest as u64) | ((vcpu as u64) << 16)
-}
-pub fn hyp_badge_guest(b: u64) -> usize {
-    (b & 0xffff) as usize
-}
-pub fn hyp_badge_vcpu(b: u64) -> usize {
-    ((b >> 16) & 0xff) as usize
-}
 
 /// Where vmmgr maps a guest's pages for itself (layout::GUEST_PAGES):
 /// its control page, its console page, then from these offsets its
@@ -496,7 +485,7 @@ impl Guest {
         let page = self.arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP);
         let kick = match kind {
             // Control requests go to vmmgr itself, not through the VMM.
-            DevKind::Ctl => (crate::slot::NTFN.cap(), crate::CTL_KICK_BADGE),
+            DevKind::Ctl => (crate::slot::NTFN.cap(), l4h_host::badges::vmmgr::CTL_KICK),
             DevKind::Mem => (self.vmm_ntfn, host::VMM_BADGE_MEM_REQ),
             _ => (self.vmm_ntfn, host::VMM_BADGE_KICK),
         };
@@ -1191,7 +1180,7 @@ pub fn create(
             .expect("kTCB configure");
         let fault_slot = alloc.slots.alloc();
         abs(self_cap::<cap_type::Null>(fault_slot))
-            .mint(&abs(host_info.hyp_ep), CapRights::all(), hyp_badge(id, v) | HYP_BADGE_FAULT)
+            .mint(&abs(host_info.hyp_ep), CapRights::all(), l4h_host::badges::guest_fault(id, v))
             .expect("fault ep");
         ktcb.tcb_set_sched_params(
             slot::TCB.cap(),

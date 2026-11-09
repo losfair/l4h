@@ -627,7 +627,7 @@ fn flags_thread(c: &Component, alloc: &mut Alloc, arena: &mut Arena, info: &Host
     }
     let fault_slot = ctx.alloc.slots.alloc();
     abs_of(root_cap::<cap_type::Null>(fault_slot))
-        .mint(&abs_of(info.hyp_ep), CapRights::all(), component_badge(FLAGS_ID) | crate::HYP_BADGE_FAULT)
+        .mint(&abs_of(info.hyp_ep), CapRights::all(), component_badge(FLAGS_ID) | l4h_host::badges::root::FAULT)
         .expect("flags fault ep");
     tcb.tcb_configure(c.cnode, CNodeCapData::new(0, 64 - c.cnode_bits), c.vspace, trust::FLAGS_IPCBUF_VA as u64, ipc)
         .expect("flags TCB configure");

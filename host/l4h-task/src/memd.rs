@@ -1,7 +1,9 @@
 //! The allocator's memory-service client. Root and vmmgr supply their own
 //! endpoint, exchange CNode, slot range and mapped status page.
 
-use l4h_host::memd::{self, Status};
+use l4h_host::fixed::ArrayVec;
+use l4h_host::memd::{self, Status, call::Client};
+use l4h_host::wire::Call;
 use sel4::{cap, cap_type};
 
 use crate::cap_at;
@@ -47,12 +49,6 @@ impl MemdLink {
         self.slot(self.exchange_base + i as u64)
     }
 
-    pub fn call(&self, label: u64, args: &[u64]) -> u64 {
-        sel4::with_ipc_buffer_mut(|b| b.msg_regs_mut()[..args.len()].copy_from_slice(args));
-        self.ep.call(sel4::MessageInfo::new(label, 0, 0, args.len()));
-        sel4::with_ipc_buffer(|b| b.msg_regs()[0])
-    }
-
     pub fn status(&self) -> Status {
         unsafe { (self.status_va as *const Status).read_volatile() }
     }
@@ -60,10 +56,7 @@ impl MemdLink {
     /// An untouched Untyped of 2^bits bytes in local `slot`: its physical
     /// address, or None when the service cannot supply it.
     pub fn alloc(&self, bits: usize, slot: Slot) -> Option<usize> {
-        if self.call(memd::MEMD_ALLOC, &[bits as u64, 1]) != 0 {
-            return None;
-        }
-        let paddr = sel4::with_ipc_buffer(|b| b.msg_regs()[1]) as usize;
+        let paddr = *Client::alloc(self, bits, 1).ok()?.0.first()? as usize;
         self.local_cnode.absolute_cptr(cap_at::<cap_type::Null>(slot))
             .move_(&self.xchg(0)).expect("memd: take grant");
         Some(paddr)
@@ -73,12 +66,22 @@ impl MemdLink {
     /// Their local slots are left empty.
     pub fn free(&self, blocks: &[(cap::Untyped, usize, usize)]) {
         assert!(blocks.len() <= memd::XCHG_SLOTS);
-        let mut args = [0; 1 + 2 * memd::XCHG_SLOTS];
-        args[0] = blocks.len() as u64;
+        let mut given = ArrayVec::new();
         for (i, &(ut, paddr, bits)) in blocks.iter().enumerate() {
             self.xchg(i).move_(&self.local_cnode.absolute_cptr(ut)).expect("memd: return block");
-            (args[1 + 2 * i], args[2 + 2 * i]) = (paddr as u64, bits as u64);
+            given.must_push((paddr, bits));
         }
-        assert_eq!(self.call(memd::MEMD_FREE, &args[..1 + 2 * blocks.len()]), 0, "memd: free");
+        Client::free(self, given).expect("memd: free");
+    }
+}
+
+/// memd's calls (l4h_host::memd::call) go over its endpoint.
+impl Call for MemdLink {
+    fn ipc(&self, label: u64, args: &[u64], reply: &mut [u64]) -> usize {
+        sel4::with_ipc_buffer_mut(|b| b.msg_regs_mut()[..args.len()].copy_from_slice(args));
+        let info = self.ep.call(sel4::MessageInfo::new(label, 0, 0, args.len()));
+        let n = info.length().min(reply.len());
+        sel4::with_ipc_buffer(|b| reply[..n].copy_from_slice(&b.msg_regs()[..n]));
+        n
     }
 }

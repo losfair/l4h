@@ -2,8 +2,8 @@
 //! (DESIGN.md §8.4).
 //!
 //! At boot, l4h-root moves every free RAM Untyped of 2 MiB or more here.
-//! From then on it asks for memory for its own objects (MEMD_ALLOC) and
-//! returns it when it is free again (MEMD_FREE), and guest RAM is taken,
+//! From then on it asks for memory for its own objects (`alloc`) and
+//! returns it when it is free again (`free`), and guest RAM is taken,
 //! given and revoked here: memd keeps the original Untyped of every 2 MiB
 //! block of a guest, hands copies to l4h-root (for the boot blocks it
 //! fills with frames) and to the guest, and revokes the originals when the
@@ -16,7 +16,9 @@
 //! checks against the target and its own state only.
 //!
 //! memd serves l4h-root, l4h-vmmgr and the VMMs, one call at a time, and never calls
-//! anyone.  It cannot read memory: every Untyped it has handed out has a child, so it
+//! anyone.  Its calls, and who may make each, are declared in
+//! l4h_host::memd::call; it implements their `Server` trait.  It cannot
+//! read memory: every Untyped it has handed out has a child, so it
 //! cannot retype it, and revoking it first makes seL4 clear the memory
 //! before it is used again.
 //!
@@ -30,8 +32,10 @@ mod balloon;
 mod exchange;
 mod mem;
 
-use l4h_rt::host::fixed::Scratch;
-use l4h_rt::host::memd::{self, BalloonConfig, GuestHp, MemdConfig, Status, BLOCK_BITS, HP_MAP_WORDS, HP_MAX, MAX_GUESTS, XCHG_SLOTS};
+use l4h_rt::host::badges::memd as recv;
+use l4h_rt::host::fixed::{ArrayVec, Scratch};
+use l4h_rt::host::memd::{self, BalloonConfig, GuestHp, HpState, MemdConfig, Sender, Status, call, BLOCK_BITS, HP_MAP_WORDS, HP_MAX, MAX_GUESTS, XCHG_SLOTS};
+use l4h_rt::host::wire::Tail;
 use l4h_rt::{Info, cap, host, sel4};
 use sel4::{CapRights, cap_type};
 
@@ -106,19 +110,35 @@ struct Memd {
     ticks_per_ms: u64,
 }
 
-fn mr(i: usize) -> u64 {
-    sel4::with_ipc_buffer(|b| b.msg_regs()[i])
-}
-
-fn set_mr(i: usize, v: u64) {
-    sel4::with_ipc_buffer_mut(|b| b.msg_regs_mut()[i] = v)
-}
-
-/// Who calls: l4h-root, or l4h-vmmgr (memd::BADGE_VMMGR).
+/// Who calls for memory of its own: l4h-root, or l4h-vmmgr.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Client {
     Root,
     Vmmgr,
+}
+
+impl Client {
+    /// The protocol lets only these make the calls that take a Client.
+    fn of(from: Sender) -> Result<Client, u64> {
+        match from {
+            Sender::Root => Ok(Client::Root),
+            Sender::Vmmgr => Ok(Client::Vmmgr),
+            Sender::Vmm(_) => Err(EINVAL),
+        }
+    }
+}
+
+/// The guest of a VMM's call.
+fn vmm_guest(from: Sender) -> Result<usize, u64> {
+    match from {
+        Sender::Vmm(g) => Ok(g),
+        _ => Err(EINVAL),
+    }
+}
+
+/// A handler's errno as a call's result.
+fn errno(e: u64) -> Result<(), u64> {
+    if e == 0 { Ok(()) } else { Err(e) }
 }
 
 /// Slot `i` of the caller's mailbox: root's in our CNode, vmmgr's in the
@@ -187,7 +207,7 @@ impl Memd {
         0
     }
 
-    /// MEMD_HP_PLUG from guest g's VMM: hotplug block m.
+    /// `hp_plug` from guest g's VMM: hotplug block m.
     fn hp_plug(&mut self, g: usize, m: usize) -> u64 {
         let now = self.now_ms();
         let Some(r) = self.guests.get_mut(g).filter(|r| r.live) else { return EINVAL };
@@ -248,7 +268,7 @@ impl Memd {
         r.hp.plugged -= 1;
     }
 
-    /// MEMD_HP_UNPLUG from guest g's VMM: hotplug block m.
+    /// `hp_unplug` from guest g's VMM: hotplug block m.
     fn hp_unplug(&mut self, g: usize, m: usize) -> u64 {
         let now = self.now_ms();
         let Some(r) = self.guests.get_mut(g).filter(|r| r.live) else { return EINVAL };
@@ -262,29 +282,22 @@ impl Memd {
         0
     }
 
-    /// MEMD_HP_STATE: target, plugged and the bitmap from MR1 on.  Returns
-    /// the reply's length.
-    fn hp_state(&self, g: usize) -> Result<usize, u64> {
+    /// `hp_state`: target, plugged and the bitmap.
+    fn hp_state(&self, g: usize) -> Result<HpState, u64> {
         let r = self.guest(g).ok_or(EINVAL)?;
-        set_mr(1, r.hp.target as u64);
-        set_mr(2, r.hp.plugged as u64);
-        for (w, &bits) in r.hp.map.iter().enumerate() {
-            set_mr(3 + w, bits);
-        }
-        Ok(3 + HP_MAP_WORDS)
+        let map: [u64; HP_MAP_WORDS] = r.hp.map;
+        Ok(HpState { target: r.hp.target as u64, plugged: r.hp.plugged as u64, map })
     }
 
-    fn guest_copy(&mut self, g: usize, b: usize) -> u64 {
-        let Some(i) = self.guest_block(g, b) else {
-            return EINVAL;
-        };
+    /// `guest_copy`: the block's physical address.
+    fn guest_copy(&mut self, g: usize, b: usize) -> Result<u64, u64> {
+        let i = self.guest_block(g, b).ok_or(EINVAL)?;
         // Fails if the block already has a copy.
         let _ = xchg(Client::Vmmgr, 0).delete();
         if xchg(Client::Vmmgr, 0).copy(&abs(self.mem.slot(i, 0)), CapRights::all()).is_err() {
-            return EINVAL;
+            return Err(EINVAL);
         }
-        set_mr(1, (i as u64) << BLOCK_BITS);
-        0
+        Ok((i as u64) << BLOCK_BITS)
     }
 
     fn guest_give(&mut self, g: usize, first: usize, skip: usize) -> u64 {
@@ -328,8 +341,7 @@ impl Memd {
         0
     }
 
-    fn balloon(&mut self) -> u64 {
-        let cfg = BalloonConfig::from_mrs(core::array::from_fn(mr));
+    fn balloon(&mut self, cfg: BalloonConfig) -> u64 {
         if self.mem.balloon.is_some() {
             return EINVAL;
         }
@@ -364,7 +376,7 @@ impl Memd {
 fn arm_timer(ticks_per_ms: u64) {
     let tcb = cap::<cap_type::Tcb>(host::SLOT_TCB);
     let deadline = host::ticks::now() + TICK_MS * ticks_per_ms;
-    sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_TCB_SetTimer(tcb.bits(), deadline, memd::BADGE_TIMER));
+    sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_TCB_SetTimer(tcb.bits(), deadline, recv::TIMER));
 }
 
 fn main(info: &'static Info) -> ! {
@@ -380,65 +392,80 @@ fn main(info: &'static Info) -> ! {
 
     let (mut msg, mut badge) = ep.recv(reply);
     loop {
-        if badge & memd::BADGE_VMM != 0 {
-            // A guest's VMM: hotplug only, for its own guest.
-            let g = (badge & 0xffff) as usize;
-            let mut len = 1;
-            let resp = match msg.label() {
-                memd::MEMD_HP_PLUG => d.hp_plug(g, mr(0) as usize),
-                memd::MEMD_HP_UNPLUG => d.hp_unplug(g, mr(0) as usize),
-                memd::MEMD_HP_STATE => match d.hp_state(g) {
-                    Ok(n) => {
-                        len = n;
-                        0
-                    }
-                    Err(e) => e,
-                },
-                _ => EINVAL,
-            };
-            d.write_status();
-            set_mr(0, resp);
-            (msg, badge) = ep.reply_recv(sel4::MessageInfo::new(0, 0, 0, len), reply);
-            continue;
-        }
-        let client = if badge & memd::BADGE_VMMGR != 0 {
-            Client::Vmmgr
-        } else if badge != 0 {
-            // The timer.
+        if badge & recv::TIMER != 0 {
             let delay = balloon::REPORT_DELAY_MS * d.ticks_per_ms;
             d.mem.report_free(host::ticks::now(), delay);
             d.write_status();
             arm_timer(d.ticks_per_ms);
             (msg, badge) = ep.recv(reply);
             continue;
-        } else {
-            Client::Root
-        };
-        // A call from l4h-root (its own memory) or l4h-vmmgr (its own, and
-        // guests' RAM).
-        let vmmgr = client == Client::Vmmgr;
-        let mut len = 1;
-        let resp = match msg.label() {
-            memd::MEMD_ALLOC => {
-                let count = mr(1) as usize;
-                len += count;
-                d.alloc(client, mr(0) as usize, count)
+        }
+        // The arguments leave the message registers before the handler's
+        // invocations use them, and the reply goes there after.
+        let mut out = [0; call::Request::MAX_REPLY_WORDS];
+        let len = match Sender::of_badge(badge) {
+            Some(from) => {
+                let mut args = [0; call::Request::MAX_WORDS];
+                let n = msg.length().min(args.len());
+                sel4::with_ipc_buffer(|b| args[..n].copy_from_slice(&b.msg_regs()[..n]));
+                call::serve(&mut d, msg.label(), &args[..n], from, &mut out)
             }
-            memd::MEMD_FREE => d.free(client, mr(0) as usize),
-            memd::MEMD_GUEST_CREATE if vmmgr => d.guest_create(mr(0) as usize, mr(1) as usize, mr(2) as usize, mr(3) as usize),
-            memd::MEMD_SET_TARGET if vmmgr => d.set_target(mr(0) as usize, mr(1) as usize),
-            memd::MEMD_GUEST_COPY if vmmgr => {
-                len = 2;
-                d.guest_copy(mr(0) as usize, mr(1) as usize)
+            None => {
+                out[0] = EINVAL;
+                1
             }
-            memd::MEMD_GUEST_GIVE if vmmgr => d.guest_give(mr(0) as usize, mr(1) as usize, mr(2) as usize),
-            memd::MEMD_GUEST_DESTROY if vmmgr => d.guest_destroy(mr(0) as usize),
-            memd::MEMD_BALLOON if !vmmgr => d.balloon(),
-            _ => EINVAL,
         };
         d.write_status();
-        set_mr(0, resp);
-        (msg, badge) = ep.reply_recv(sel4::MessageInfo::new(0, 0, 0, len.min(XCHG_SLOTS + 1)), reply);
+        sel4::with_ipc_buffer_mut(|b| b.msg_regs_mut()[..len].copy_from_slice(&out[..len]));
+        (msg, badge) = ep.reply_recv(sel4::MessageInfo::new(0, 0, 0, len), reply);
+    }
+}
+
+/// The calls, as l4h_host::memd::call declares them.  Each may be made
+/// only by the senders the declaration allows: `serve` refuses the others.
+impl call::Server for Memd {
+    fn alloc(&mut self, from: Sender, bits: usize, count: usize) -> Result<Tail<u64, XCHG_SLOTS>, u64> {
+        Memd::alloc(self, Client::of(from)?, bits, count).map(Tail)
+    }
+
+    fn free(&mut self, from: Sender, blocks: ArrayVec<(usize, usize), XCHG_SLOTS>) -> Result<(), u64> {
+        errno(Memd::free(self, Client::of(from)?, &blocks))
+    }
+
+    fn guest_create(&mut self, _: Sender, guest: usize, blocks: usize, radix: usize, hp_count: usize) -> Result<(), u64> {
+        errno(Memd::guest_create(self, guest, blocks, radix, hp_count))
+    }
+
+    fn guest_copy(&mut self, _: Sender, guest: usize, block: usize) -> Result<u64, u64> {
+        Memd::guest_copy(self, guest, block)
+    }
+
+    fn guest_give(&mut self, _: Sender, guest: usize, first: usize, skip: usize) -> Result<(), u64> {
+        errno(Memd::guest_give(self, guest, first, skip))
+    }
+
+    fn guest_destroy(&mut self, _: Sender, guest: usize) -> Result<(), u64> {
+        errno(Memd::guest_destroy(self, guest))
+    }
+
+    fn balloon(&mut self, _: Sender, cfg: BalloonConfig) -> Result<(), u64> {
+        errno(Memd::balloon(self, cfg))
+    }
+
+    fn set_target(&mut self, _: Sender, guest: usize, target: usize) -> Result<(), u64> {
+        errno(Memd::set_target(self, guest, target))
+    }
+
+    fn hp_plug(&mut self, from: Sender, m: usize) -> Result<(), u64> {
+        errno(Memd::hp_plug(self, vmm_guest(from)?, m))
+    }
+
+    fn hp_unplug(&mut self, from: Sender, m: usize) -> Result<(), u64> {
+        errno(Memd::hp_unplug(self, vmm_guest(from)?, m))
+    }
+
+    fn hp_state(&mut self, from: Sender) -> Result<HpState, u64> {
+        Memd::hp_state(self, vmm_guest(from)?)
     }
 }
 

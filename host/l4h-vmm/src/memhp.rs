@@ -7,7 +7,9 @@ use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{Ordering, fence};
 
 use l4h_abi as abi;
-use l4h_rt::host::{self, memd};
+use l4h_rt::call::Endpoint;
+use l4h_rt::host::memd::call::Client;
+use l4h_rt::host;
 use l4h_rt::{cap, sel4};
 use sel4::cap_type;
 
@@ -21,25 +23,10 @@ pub struct MemDev {
     count: usize,
 }
 
-fn mr(i: usize) -> u64 {
-    sel4::with_ipc_buffer(|b| b.msg_regs()[i])
-}
-
-fn set_mr(i: usize, v: u64) {
-    sel4::with_ipc_buffer_mut(|b| b.msg_regs_mut()[i] = v)
-}
-
-/// Call memd; its errno, or Err(()) if memd failed (its keeper answers
-/// u64::MAX).
-fn call(label: u64, args: &[u64]) -> Result<u64, ()> {
-    for (i, &a) in args.iter().enumerate() {
-        set_mr(i, a);
-    }
-    cap::<cap_type::Endpoint>(host::VMM_SLOT_MEMD_EP).call(sel4::MessageInfo::new(label, 0, 0, args.len()));
-    match mr(0) {
-        u64::MAX => Err(()),
-        e => Ok(e),
-    }
+/// memd's endpoint for this guest (l4h_host::memd::call, badged as
+/// Sender::Vmm of the guest).
+fn memd() -> Endpoint {
+    Endpoint(cap::<cap_type::Endpoint>(host::VMM_SLOT_MEMD_EP))
 }
 
 impl MemDev {
@@ -50,11 +37,10 @@ impl MemDev {
     /// Copy memd's state of the guest into the device page.  Returns
     /// whether the target changed.
     pub fn refresh(&mut self) -> bool {
-        if call(memd::MEMD_HP_STATE, &[]) != Ok(0) {
+        let Ok(st) = memd().hp_state() else {
             return false;
-        }
-        let (target, plugged) = (mr(1) as u32, mr(2) as u32);
-        let map: [u64; memd::HP_MAP_WORDS] = core::array::from_fn(|w| mr(3 + w));
+        };
+        let (target, plugged, map) = (st.target as u32, st.plugged as u32, st.map);
         unsafe {
             let p = self.page;
             let changed = addr_of_mut!((*p).target).read_volatile() != target;
@@ -76,17 +62,20 @@ impl MemDev {
 
     /// A plug or unplug request: the result as -errno.
     fn serve(&mut self, op: u64, m: u64) -> i64 {
-        let label = match op {
-            abi::MEM_PLUG => memd::MEMD_HP_PLUG,
-            abi::MEM_UNPLUG => memd::MEMD_HP_UNPLUG,
+        let plug = match op {
+            abi::MEM_PLUG => true,
+            abi::MEM_UNPLUG => false,
             _ => return -22,
         };
         if m >= self.count as u64 {
             return -22;
         }
-        let r = match call(label, &[m]) {
-            Ok(e) => -(e as i64),
-            Err(()) => return -EIO,
+        let m = m as usize;
+        let r = match if plug { memd().hp_plug(m) } else { memd().hp_unplug(m) } {
+            Ok(()) => 0,
+            // memd failed: its keeper answers everything so.
+            Err(l4h_rt::host::wire::FAILED) => return -EIO,
+            Err(e) => -(e as i64),
         };
         self.refresh();
         r

@@ -37,13 +37,13 @@ use l4h_host::vmmgr::{self as proto, VmmgrConfig};
 use l4h_rt::Info;
 use l4h_task::{elf, mem, topology, vspace, window};
 
-use crate::component::ROOT_BADGE_COMPONENT;
-use crate::guest::{Guest, GuestConfig, State, hyp_badge_guest, hyp_badge_vcpu};
+use l4h_host::badges::vmmgr as recv;
+use crate::guest::{Guest, GuestConfig, State};
 use crate::mem::{Alloc, Slots};
 use crate::root::Later;
 use crate::window::{Window, Windows};
 
-pub use crate::guest::{HYP_BADGE_FAULT, MAX_GUEST_DEVICES};
+pub use crate::guest::MAX_GUEST_DEVICES;
 
 /// vmmgr's own capabilities, at the standard component slots.
 pub mod slot {
@@ -69,9 +69,6 @@ static GUESTS: StaticCell<[Option<Guest>; MAX_GUESTS]> = StaticCell::new([const 
 const RESERVE_BYTES: usize = 32 << 20;
 const RESERVE_SLOTS: usize = 16384;
 
-const TIMER_BADGE: u64 = 1 << 40;
-/// dom0 made a control request in its device page (abi::CtlSync).
-pub const CTL_KICK_BADGE: u64 = 1 << 41;
 
 /// Facts about the host the guests run on.
 pub struct HostInfo {
@@ -667,7 +664,7 @@ fn rdtsc() -> u64 {
 fn arm_timer(info: &HostInfo) {
     let deadline = rdtsc() + info.tsc_hz * sched::BALANCE_MS / 1000;
     let tcb = slot::TCB.cap();
-    sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_TCB_SetTimer(tcb.bits(), deadline, TIMER_BADGE));
+    sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_TCB_SetTimer(tcb.bits(), deadline, recv::TIMER));
 }
 
 fn watchdog_dump(h: &Vmmgr) {
@@ -742,15 +739,15 @@ fn serve(h: &mut Vmmgr, reply_slot: ReplySlot) -> ! {
     let (mut info, mut badge) = hyp_ep.recv(reply);
     loop {
         h.alloc.refill();
-        let notified = badge & (TIMER_BADGE | proto::BADGE_ROOT_EVENT | CTL_KICK_BADGE) != 0;
-        if badge & proto::BADGE_ROOT_EVENT != 0 {
+        let notified = badge & recv::SIGNALS != 0;
+        if badge & recv::ROOT_EVENT != 0 {
             root_events(h);
         }
-        if badge & CTL_KICK_BADGE != 0 {
+        if badge & recv::CTL_KICK != 0 {
             ctl::kicked(h);
         }
         let resp = if notified {
-            if badge & TIMER_BADGE != 0 {
+            if badge & recv::TIMER != 0 {
                 let now = rdtsc();
                 sched::balance(h, (now - last_balance) * 1_000_000 / h.info.tsc_hz);
                 last_balance = now;
@@ -761,11 +758,11 @@ fn serve(h: &mut Vmmgr, reply_slot: ReplySlot) -> ! {
                 arm_timer(&h.info);
             }
             None
-        } else if badge & ROOT_BADGE_COMPONENT != 0 {
+        } else if badge & recv::COMPONENT != 0 {
             component_call(h, badge, &info)
-        } else if badge & HYP_BADGE_FAULT != 0 {
-            let gid = hyp_badge_guest(badge);
-            let vcpu = hyp_badge_vcpu(badge);
+        } else if badge & recv::FAULT != 0 {
+            let gid = recv::ID.get(badge) as usize;
+            let vcpu = recv::VCPU.get(badge) as usize;
             let fault = sel4::with_ipc_buffer(|b| sel4::Fault::new(b, &info));
             l4h_rt::log!("l4h-vmmgr: guest {} vCPU {} kernel fault: {:x?}", gid, vcpu, fault);
             if h.guest(gid).is_some_and(|g| g.dom0) {
@@ -827,8 +824,8 @@ fn root_events(h: &mut Vmmgr) {
 /// A call or fault from a guest's l4h-vmm.  Returns the reply value, or
 /// None to leave the caller blocked.
 fn component_call(h: &mut Vmmgr, badge: u64, info: &sel4::MessageInfo) -> Option<u64> {
-    let id = (badge & 0xffff) as usize;
-    if badge & HYP_BADGE_FAULT != 0 {
+    let id = recv::ID.get(badge) as usize;
+    if badge & recv::FAULT != 0 {
         let fault = sel4::with_ipc_buffer(|b| sel4::Fault::new(b, info));
         l4h_rt::log!("l4h-vmmgr: guest {:#x}'s l4h-vmm fault: {:x?}", id, fault);
         return None;

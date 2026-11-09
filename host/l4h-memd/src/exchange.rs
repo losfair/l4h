@@ -4,15 +4,16 @@ use l4h_rt::host::memd::{self, BLOCK_BITS, XCHG_SLOTS};
 use l4h_rt::sel4::CapRights;
 
 use crate::mem::{State, abs};
-use crate::{Client, EINVAL, ENOMEM, Memd, mr, set_mr, xchg};
+use crate::{Client, EINVAL, ENOMEM, Memd, xchg};
+use l4h_rt::host::fixed::ArrayVec;
 
 impl Memd {
-    /// MEMD_ALLOC: `count` blocks of 2^bits bytes into the exchange slots.
-    /// Root gets them, vmmgr copies.
-    pub(super) fn alloc(&mut self, c: Client, bits: usize, count: usize) -> u64 {
+    /// `alloc`: `count` blocks of 2^bits bytes into the exchange slots,
+    /// and their physical addresses.  Root gets them, vmmgr copies.
+    pub(super) fn alloc(&mut self, c: Client, bits: usize, count: usize) -> Result<ArrayVec<u64, XCHG_SLOTS>, u64> {
         let k = match bits.checked_sub(BLOCK_BITS) {
             Some(k) if k < memd::ORDERS && count <= XCHG_SLOTS => k,
-            _ => return EINVAL,
+            _ => return Err(EINVAL),
         };
         let mut got = [0u32; XCHG_SLOTS];
         for n in 0..count {
@@ -22,7 +23,7 @@ impl Memd {
                     for &i in &got[..n] {
                         self.mem.add(i, k);
                     }
-                    return ENOMEM;
+                    return Err(ENOMEM);
                 }
             }
         }
@@ -37,25 +38,21 @@ impl Memd {
                 }
             }
         }
-        // Invocations use the message registers: the reply's go last.
-        for (n, &i) in got[..count].iter().enumerate() {
-            set_mr(1 + n, (i as u64) << BLOCK_BITS);
-        }
-        0
+        Ok(got[..count].iter().map(|&i| (i as u64) << BLOCK_BITS).collect())
     }
 
-    /// MEMD_FREE: blocks from the exchange slots.  Of vmmgr's, we keep the
-    /// originals: revoking one deletes its copy wherever vmmgr put it, and
-    /// all that was made of it.
-    pub(super) fn free(&mut self, c: Client, count: usize) -> u64 {
+    /// `free`: the (physical address, size bits) of blocks in the exchange
+    /// slots.  Of vmmgr's, we keep the originals: revoking one deletes its
+    /// copy wherever vmmgr put it, and all that was made of it.
+    pub(super) fn free(&mut self, c: Client, given: &[(usize, usize)]) -> u64 {
+        let count = given.len();
         if count > XCHG_SLOTS {
             return EINVAL;
         }
-        // Check them all first, reading the message registers before any
-        // invocation uses them.
+        // Check them all first.
         let mut blocks = [(0u32, 0usize); XCHG_SLOTS];
-        for n in 0..count {
-            let Some((i, k)) = self.mem.block_at(mr(1 + 2 * n) as usize, mr(2 + 2 * n) as usize) else {
+        for (n, &(paddr, bits)) in given.iter().enumerate() {
+            let Some((i, k)) = self.mem.block_at(paddr, bits) else {
                 return EINVAL;
             };
             let ours = match c {

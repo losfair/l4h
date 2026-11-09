@@ -13,6 +13,8 @@ use std::sync::{Mutex, MutexGuard};
 mod exchange;
 #[path = "../host/l4h-memd/src/mem.rs"]
 mod mem;
+#[path = "../host/l4h-host/src/fixed.rs"]
+pub mod fixed;
 
 use host::memd::{BLOCK_BITS, TABLE_VA, XCHG_SLOTS};
 use mem::{Mem, State, abs};
@@ -52,8 +54,6 @@ fn invoke<T>(f: impl FnOnce(&mut Kernel) -> T) -> T {
     })
 }
 
-fn mr(i: usize) -> u64 { kernel(|k| k.mrs[i]) }
-fn set_mr(i: usize, v: u64) { kernel(|k| k.mrs[i] = v); }
 fn xchg(c: Client, i: usize) -> AbsoluteCPtr {
     AbsoluteCPtr(if c == Client::Root { 160 } else { 1000 } + i as u64)
 }
@@ -129,6 +129,7 @@ impl AbsoluteCPtr {
 }
 
 pub mod host {
+    pub use crate::fixed;
     pub const SLOT_CNODE: u64 = 1;
     pub mod ticks { pub fn now() -> u64 { 1000 } }
     pub mod memd {
@@ -179,36 +180,32 @@ impl Fixture {
         // Boot handover from root: the table has no state or order for
         // this 8 MiB block yet. Root must still be allowed to return it.
         kernel(|k| { k.caps.insert(xchg(Client::Root, 0).0, (8 << BLOCK_BITS, 4 << BLOCK_BITS)); });
-        f.request(&[(8, BLOCK_BITS + 2)]);
-        assert_eq!(f.d.free(Client::Root, 1), 0);
+        assert_eq!(f.d.free(Client::Root, &batch(&[(8, BLOCK_BITS + 2)])), 0);
         assert_eq!(f.d.mem.free_bytes(), 8 << 20);
         f
     }
 
     fn grant(&mut self, c: Client, order: usize) -> (u32, u64) {
-        assert_eq!(self.d.alloc(c, BLOCK_BITS + order, 1), 0);
-        let i = (mr(1) >> BLOCK_BITS) as u32;
+        let paddrs = self.d.alloc(c, BLOCK_BITS + order, 1).unwrap();
+        let i = (paddrs[0] >> BLOCK_BITS) as u32;
         let slot = self.next_slot;
         self.next_slot += 1;
         abs(slot).move_(&xchg(c, 0)).unwrap();
         (i, slot)
     }
 
-    fn request(&self, blocks: &[(u32, usize)]) {
-        for (n, &(i, bits)) in blocks.iter().enumerate() {
-            set_mr(1 + 2 * n, (i as u64) << BLOCK_BITS);
-            set_mr(2 + 2 * n, bits as u64);
-        }
-    }
-
     fn reject(&mut self, c: Client, blocks: &[(u32, usize)]) {
-        self.request(blocks);
         let before = kernel(|k| k.clone());
         let free = self.d.mem.free_bytes();
-        assert_eq!(self.d.free(c, blocks.len()), EINVAL);
+        assert_eq!(self.d.free(c, &batch(blocks)), EINVAL);
         assert_eq!(kernel(|k| k.clone()), before, "invalid batch made a capability invocation");
         assert_eq!(self.d.mem.free_bytes(), free);
     }
+}
+
+/// A `free` call's blocks: (physical address, size bits) of (unit, bits).
+fn batch(blocks: &[(u32, usize)]) -> Vec<(usize, usize)> {
+    blocks.iter().map(|&(i, bits)| ((i as usize) << BLOCK_BITS, bits)).collect()
 }
 
 impl Drop for Fixture {
@@ -230,8 +227,7 @@ fn forged_parent_cannot_revoke_a_neighboring_root_grant() {
     assert!(f.d.mem.state(mgr) == State::Vmmgr);
     assert!(f.d.mem.state(root) == State::Root);
 
-    f.request(&[(mgr, BLOCK_BITS)]);
-    assert_eq!(f.d.free(Client::Vmmgr, 1), 0);
+    assert_eq!(f.d.free(Client::Vmmgr, &batch(&[(mgr, BLOCK_BITS)])), 0);
     assert!(!kernel(|k| k.caps.contains_key(&mgr_cap)));
     assert!(kernel(|k| k.caps.contains_key(&root_cap)));
     assert_eq!(f.d.mem.free_bytes(), 6 << 20);
@@ -246,11 +242,10 @@ fn partial_and_malformed_returns_are_rejected() {
         f.reject(Client::Vmmgr, &[(i, bits)]);
     }
     let before = kernel(|k| k.clone());
-    assert_eq!(f.d.free(Client::Vmmgr, XCHG_SLOTS + 1), EINVAL);
-    assert_eq!(f.d.free(Client::Vmmgr, 0), 0);
+    assert_eq!(f.d.free(Client::Vmmgr, &batch(&[(mgr, BLOCK_BITS + 1); XCHG_SLOTS + 1])), EINVAL);
+    assert_eq!(f.d.free(Client::Vmmgr, &[]), 0);
     assert_eq!(kernel(|k| k.clone()), before);
-    f.request(&[(mgr, BLOCK_BITS + 1)]);
-    assert_eq!(f.d.free(Client::Vmmgr, 1), 0);
+    assert_eq!(f.d.free(Client::Vmmgr, &batch(&[(mgr, BLOCK_BITS + 1)])), 0);
     assert_eq!(f.d.mem.free_bytes(), 8 << 20);
 }
 
@@ -262,15 +257,14 @@ fn duplicate_and_invalid_batches_are_atomic() {
     f.reject(Client::Vmmgr, &[(a, BLOCK_BITS), (a, BLOCK_BITS)]);
     f.reject(Client::Vmmgr, &[(b, BLOCK_BITS), (a, BLOCK_BITS + 1)]);
     assert!(f.d.mem.state(a) == State::Vmmgr && f.d.mem.state(b) == State::Vmmgr);
-    f.request(&[(a, BLOCK_BITS), (b, BLOCK_BITS)]);
-    assert_eq!(f.d.free(Client::Vmmgr, 2), 0);
+    assert_eq!(f.d.free(Client::Vmmgr, &batch(&[(a, BLOCK_BITS), (b, BLOCK_BITS)])), 0);
     assert!(!kernel(|k| k.caps.contains_key(&a_cap) || k.caps.contains_key(&b_cap)));
     assert_eq!(f.d.mem.free_bytes(), 8 << 20);
     f.reject(Client::Vmmgr, &[(a, BLOCK_BITS)]);
     // All of the returned memory must still merge into one usable block.
     assert_eq!(f.grant(Client::Vmmgr, 2).0, 8);
     assert_eq!(f.d.mem.free_bytes(), 0);
-    assert_eq!(f.d.alloc(Client::Vmmgr, BLOCK_BITS, 1), ENOMEM);
+    assert_eq!(f.d.alloc(Client::Vmmgr, BLOCK_BITS, 1).err(), Some(ENOMEM));
 }
 
 #[test]
@@ -278,8 +272,7 @@ fn root_can_return_a_grant_after_boot_handover() {
     let mut f = Fixture::new();
     let (root, slot) = f.grant(Client::Root, 1);
     xchg(Client::Root, 0).move_(&abs(slot)).unwrap();
-    f.request(&[(root, BLOCK_BITS + 1)]);
-    assert_eq!(f.d.free(Client::Root, 1), 0);
+    assert_eq!(f.d.free(Client::Root, &batch(&[(root, BLOCK_BITS + 1)])), 0);
     assert_eq!(f.d.mem.free_bytes(), 8 << 20);
     assert_eq!(f.grant(Client::Root, 2).0, 8);
 }

@@ -23,7 +23,7 @@ pub const CNODE_BITS: usize = 18;
 
 /// vmmgr's slots, after the standard ones (crate::SLOT_*).
 ///
-/// memd's service endpoint, badged memd::BADGE_VMMGR.
+/// memd's service endpoint, badged as memd::Sender::Vmmgr.
 pub const SLOT_MEMD_EP: u64 = 16;
 /// The mailbox CNode it shares with memd (memd::MAILBOX_*).
 pub const SLOT_MEMD_MAILBOX: u64 = 17;
@@ -45,7 +45,7 @@ pub const MAX_CORES: usize = 64;
 /// ASID pools: SLOT_ASID_POOL + i, `VmmgrConfig::asid_pools` of them.
 pub const SLOT_ASID_POOL: u64 = SLOT_SCHED_CONTROL + MAX_CORES as u64;
 pub const MAX_ASID_POOLS: usize = 8;
-/// memd's endpoint for guest g's l4h-vmm (badged memd::BADGE_VMM | g),
+/// memd's endpoint for guest g's l4h-vmm (badged as memd::Sender::Vmm(g)),
 /// which vmmgr copies into it: SLOT_VMM_MEMD_EP + g.
 pub const SLOT_VMM_MEMD_EP: u64 = SLOT_ASID_POOL + MAX_ASID_POOLS as u64;
 /// Shared log frames, also mapped into each guest's VMM.
@@ -81,9 +81,6 @@ pub const RESULT_VA: usize = 0x5100_0040_0000;
 /// dom0's control data area, CTL_DATA_PAGES pages.
 pub const CTL_DATA_VA: usize = 0x5100_0100_0000;
 
-/// Badge of root's signals on vmmgr's bound notification: the events page
-/// has news.
-pub const BADGE_ROOT_EVENT: u64 = 1 << 42;
 
 /// Calls from vmmgr to l4h-root, on its SLOT_ROOT_EP.  The reply's MR0 is
 /// 0 or an errno, values follow.
@@ -129,7 +126,7 @@ pub const VMMGR_RESULT: u64 = 0x106;
 /// waits for a driver (DISK_ATTACH, and HOST_OP's BLK_WRITE and BLK_INFO),
 /// which root never waits for in a call.  MR1 = a token below
 /// MAX_PENDING: root sets its bit in Events::ops_done and signals
-/// BADGE_ROOT_EVENT once it has the answer, which VMMGR_RESULT gives.  A
+/// badges::vmmgr::ROOT_EVENT once it has the answer, which VMMGR_RESULT gives.  A
 /// driver that never answers leaves it pending; the guest's GUEST_DEL
 /// still answers ENOENT for it.  A disk controller holds at most
 /// PENDING_PER_CTRL of them for requests blkd has not answered (EBUSY

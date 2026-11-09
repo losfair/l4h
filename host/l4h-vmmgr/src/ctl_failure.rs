@@ -8,7 +8,7 @@ use l4h_abi as abi;
 use l4h_rt::{FailureHandler, cap, sel4};
 
 pub static HANDLER: FailureHandler = FailureHandler {
-    notification_badges: crate::TIMER_BADGE | crate::CTL_KICK_BADGE | l4h_host::vmmgr::BADGE_ROOT_EVENT,
+    notification_badges: l4h_host::badges::vmmgr::SIGNALS,
     notified: complete,
 };
 
@@ -46,7 +46,7 @@ pub fn remove(id: usize) {
 }
 
 fn complete(badge: u64) {
-    if badge != 0 && badge & crate::CTL_KICK_BADGE == 0 {
+    if badge != 0 && badge & l4h_host::badges::vmmgr::CTL_KICK == 0 {
         return;
     }
     for c in &CONTROLS {

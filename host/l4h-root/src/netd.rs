@@ -6,6 +6,7 @@ use core::sync::atomic::Ordering;
 
 use sel4::{CapRights, ObjectBlueprint, VmAttributes, cap, cap_type};
 
+use l4h_host::badges::root::LINK as LINK_BADGES;
 use l4h_host::fixed::ArrayVec;
 use l4h_host::{self as host, net};
 
@@ -45,11 +46,6 @@ const _: () = assert!(net::PORT_PAGES <= 1 << PORT_KEEP_BITS);
 /// MSI vectors of NICs start here.
 const NIC_MSI_BASE: u64 = crate::pci::VECTOR_NIC_BASE;
 const NETD_ID: u32 = 0x200;
-
-/// Badges on root's notification: netd asks root to ring the doorbell of
-/// link l's peer with bit LINK_BADGE_SHIFT + l.
-pub const LINK_BADGE_SHIFT: u32 = 44;
-pub const LINK_BADGES: u64 = ((1 << net::MAX_LINKS) - 1) << LINK_BADGE_SHIFT;
 
 pub fn is_virtio_net(d: &pci::Device) -> bool {
     d.vendor == 0x1af4
@@ -600,7 +596,7 @@ impl Netd {
             None => log!("l4h-root: no doorbell from partition {} for the link", ch.peer),
         }
         self.comp.give_badged(net::NETD_SLOT_LINK_KICK_BASE + l as u64, self.comp.ntfn, CapRights::write_only(), badge);
-        self.comp.give_badged(net::NETD_SLOT_LINK_RING_BASE + l as u64, ntfn, CapRights::write_only(), 1 << (LINK_BADGE_SHIFT as usize + l));
+        self.comp.give_badged(net::NETD_SLOT_LINK_RING_BASE + l as u64, ntfn, CapRights::write_only(), LINK_BADGES.nth(l));
         let args = [l as u64, switch as u64, ch.size, me as u64, ch.peer as u64];
         self.post(net::NETD_ADD_LINK, &args)?;
         self.links.must_push(Link { peer: ch.peer, peer_slot: ch.peer_slot, peer_vector: ch.peer_vector });
@@ -612,7 +608,7 @@ impl Netd {
     /// frames netd wrote, and the notification merges repeated asks.
     pub fn link_ring(&self, badge: u64) {
         for (l, k) in self.links.iter().enumerate() {
-            if badge & (1 << (LINK_BADGE_SHIFT as usize + l)) != 0 {
+            if badge & LINK_BADGES.nth(l) != 0 {
                 crate::channel::ring(k.peer_slot, k.peer_vector);
             }
         }

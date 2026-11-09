@@ -3,7 +3,7 @@
 //! root never waits for it: it posts a request and goes back to its loop,
 //! and finishes what the request was for when the driver has answered
 //! (blkd.rs, netd.rs, usb.rs: `poll`, from the serve loop on
-//! MAILBOX_BADGE).  A request a driver never answers stays pending, and so
+//! badges::root::MAILBOX).  A request a driver never answers stays pending, and so
 //! does whatever waits for it.  memd, which handles no one's data, is
 //! called (memd.rs).
 
@@ -11,6 +11,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use sel4::{CapRights, VmAttributes, cap, cap_type};
 
+use l4h_host::badges::root::MAILBOX as MAILBOX_BADGE;
 use l4h_host::mailbox::{self as mb, ANSWER, ARGS, MAILBOX_PAGES, MAILBOX_VA, PUBLISHED_OFFSET, RING};
 
 use crate::component::{Component, abs_of};
@@ -19,9 +20,6 @@ use crate::mem::{Alloc, Arena, ObjCtx};
 use crate::vspace::{FRAME_BP, map_frame};
 
 const PAGE: usize = 4096;
-
-/// Badge bit of a driver's answers on root's notification.
-pub const MAILBOX_BADGE: u64 = 1 << 43;
 
 /// Mailboxes in layout::MAILBOXES: netd's, then each disk controller's,
 /// then each xHCI controller's.

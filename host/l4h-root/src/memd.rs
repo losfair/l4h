@@ -9,7 +9,7 @@
 //! §8.5) between its l4h-vmm and memd.
 
 use l4h_host as host;
-use l4h_host::memd::{self, BalloonConfig, MemdConfig};
+use l4h_host::memd::{self, BalloonConfig, MemdConfig, Sender, call::Client};
 use l4h_task::memd::MemdLink;
 use sel4::{CapRights, ObjectBlueprint, VmAttributes, cap, cap_type};
 
@@ -49,16 +49,16 @@ fn link(alloc: &Alloc) -> MemdLink {
     alloc.memd.expect("memd is not running")
 }
 
-/// Give vmmgr its capabilities to memd: its endpoint (badged BADGE_VMMGR),
-/// the mailbox it shares with memd, and an endpoint for each guest's
-/// l4h-vmm (badged BADGE_VMM | guest), which vmmgr cannot mint.
+/// Give vmmgr its capabilities to memd: its endpoint (badged as
+/// Sender::Vmmgr), the mailbox it shares with memd, and an endpoint for
+/// each guest's l4h-vmm (badged as Sender::Vmm), which vmmgr cannot mint.
 pub fn give_vmmgr(alloc: &mut Alloc, arena: &mut Arena, vmmgr: &Component) {
     use l4h_host::vmmgr as proto;
     let m = link(alloc);
     let call = sel4::CapRightsBuilder::none().write(true).grant_reply(true).build();
-    vmmgr.give_badged(proto::SLOT_MEMD_EP, m.endpoint(), call.clone(), memd::BADGE_VMMGR);
+    vmmgr.give_badged(proto::SLOT_MEMD_EP, m.endpoint(), call.clone(), Sender::Vmmgr.badge());
     for g in 0..memd::MAX_GUESTS {
-        vmmgr.give_badged(proto::SLOT_VMM_MEMD_EP + g as u64, m.endpoint(), call.clone(), memd::BADGE_VMM | g as u64);
+        vmmgr.give_badged(proto::SLOT_VMM_MEMD_EP + g as u64, m.endpoint(), call.clone(), Sender::Vmm(g).badge());
     }
     let mailbox = arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: memd::MAILBOX_RADIX });
     vmmgr.give(proto::SLOT_MEMD_MAILBOX, mailbox, CapRights::all());
@@ -163,7 +163,7 @@ impl Memd {
             pci.enable_io(d);
         }
         pci.enable(d);
-        if link(alloc).call(memd::MEMD_BALLOON, &cfg.to_mrs()) != 0 {
+        if link(alloc).balloon(cfg).is_err() {
             pci.disable(d);
         }
     }

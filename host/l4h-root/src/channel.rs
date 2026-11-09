@@ -30,8 +30,7 @@ use crate::Host;
 use crate::devmem::DevMem;
 use crate::mem::Alloc;
 
-/// Badge of a doorbell on the root task's bound notification.
-pub const CHANNEL_BADGE: u64 = 1 << 42;
+use l4h_host::badges::root::CHANNEL as CHANNEL_BADGE;
 
 /// The largest control message (trustd's, with its header).
 pub const MSG_MAX: usize = 9216 + 64;

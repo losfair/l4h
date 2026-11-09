@@ -1530,30 +1530,32 @@ grow and shrink without going through `l4h-root`.
   power of two (64 KiB of CNode for a 1 GiB host). The halves of a split
   block are always in consecutive slots, as a retype needs, and no request
   can fill the CNode.
-- **Clients.** memd calls no one. Root holds memd's CNode and passes
+- **Clients.** memd calls no one. Its calls, and which caller may make
+  each, are declared in `l4h_host::memd::call` (§10, "Wiring declarations").
+  Root holds memd's CNode and passes
   Untypeds by moving them into memd's exchange slots. vmmgr, with a badge of
-  its own (`BADGE_VMMGR`), gets memory for itself and guests' RAM; memd is
+  its own (`Sender::Vmmgr`), gets memory for itself and guests' RAM; memd is
   more trusted than vmmgr, so they share a small mailbox CNode instead, memd
   keeps the original of every block it grants vmmgr and gives a copy, and
   freeing a grant revokes the original, so a mislabelled capability in the
   mailbox cannot confuse memd's table. memd empties a mailbox slot before
-  writing one. VMMs call it, badged `BADGE_VMM | guest`, for their guest's
+  writing one. VMMs call it, badged as `Sender::Vmm(guest)`, for their guest's
   hotplug operations only (§8.5); root mints those endpoints, since vmmgr's
   own badged one cannot be minted again.
 - **Grants.** When a client's free blocks cannot meet a request, it takes an
   untouched Untyped of 16 MiB, or the request if larger (if memd has none
-  that large, exactly the request, at least 2 MiB), from memd (`MEMD_ALLOC`) and splits it.
+  that large, exactly the request, at least 2 MiB), from memd (`alloc`) and splits it.
   Grants are never merged with each other. When a destroy or failed create
   leaves a client (root or vmmgr) with 48 MiB or more of free blocks, it
   merges them and returns
-  whole grants beyond 32 MiB (`MEMD_FREE`, `Alloc::trim`); merging after
+  whole grants beyond 32 MiB (`free`, `Alloc::trim`); merging after
   every destroy would make creates a fifth slower (§8.2). Host objects,
   arenas, I/O pools and ASID pools come from these blocks.
 - **Merging** in memd is lazy for the same reason: free buddies merge only
   when no block is large enough, in one pass over the smaller orders. A
   pass that finds nothing is not repeated until a block is freed or a
   report returns.
-- **Guest RAM** (`MEMD_GUEST_*`). At create, memd takes the guest's 2 MiB
+- **Guest RAM** (`guest_create`, `guest_copy`, `guest_give`, `guest_destroy`). At create, memd takes the guest's 2 MiB
   blocks and the block CNode capability vmmgr passes it. For a boot block,
   memd gives vmmgr a copy of its Untyped, which vmmgr fills with frames.
   At start, memd copies the Untypeds of the other blocks into the block
@@ -1605,7 +1607,7 @@ Untypeds reclaims everything it made. Plugging does not involve
   CNodes of the region's GiBs (16 KiB each) when it first plugs there.
 - **Control.** `VM_SET_MEM` (vm, bytes): vmmgr rounds the part above boot
   RAM up to whole hotplug blocks, clamps it to the region, sets memd's
-  target (`MEMD_SET_TARGET`), signals the VMM (`VMM_BADGE_MEM`) and
+  target (`set_target`), signals the VMM (`VMM_BADGE_MEM`) and
   returns. `VM_MEM_INFO`: boot, region, target and plugged bytes, from
   memd's status page; `VM_LIST` counts plugged memory. CLI: `l4hctl mem VM
   [MB] [--wait[=SECS]]`. Lowering a target revokes nothing: the guest gives
@@ -1616,7 +1618,7 @@ Untypeds reclaims everything it made. Plugging does not involve
 - **memd.** Per guest: the region's size, the target, a bitmap of plugged
   hotplug blocks, and for each the head of a list of its 64 units through
   the table (`HP_HEADS`, 128 KiB of BSS for all guests). VMMs call
-  `MEMD_HP_PLUG`, `MEMD_HP_UNPLUG` and `MEMD_HP_STATE` for their own guest.
+  `hp_plug`, `hp_unplug` and `hp_state` for their own guest.
   A plug checks the range, the bitmap and the target, takes 64 free blocks
   and copies them into the guest's level-2 CNode; a copy that fails (no
   CNode, or the slot occupied) undoes the plug. It takes only blocks that
@@ -1628,7 +1630,7 @@ Untypeds reclaims everything it made. Plugging does not involve
   memd, which runs on core 0 above every guest.
 - **VMM.** The memory device (`L4H_DEV_MEM`, `struct l4h_mem_page`) is one
   more device page: target, plugged count and bitmap, which the VMM
-  refreshes from memd (`MEMD_HP_STATE`) at start, after each request and
+  refreshes from memd (`hp_state`) at start, after each request and
   when signalled with a new target, raising the device's event then. A
   guest request (op, m), written in the page with a kick, becomes one memd
   call; memd does every check, and the VMM answers in the page and raises
@@ -2697,6 +2699,44 @@ and exchange slots; ASID-pool ownership and assignment stay local. blkd,
 netd, trustd and the VMM use capabilities and mappings installed by their
 parent and need only `l4h-rt`. memd's allocator, which tracks physical
 blocks, ownership, retained originals and reporting, is memd's own.
+
+**Wiring declarations.** How components reach each other is declared in
+`l4h-host` as data the compiler checks, rather than spread over the
+components that mint capabilities and the loops that serve them
+(`l4h_host::wire`):
+
+- **Badge spaces** (`badge_space!`, all in `l4h_host::badges`) give every
+  bit a receiver can see in a badge: an endpoint's and, since a bound
+  notification's signals arrive in the same word, its notification's. Each
+  range is a `field` (a value: `ID.get(b)`, `ID.put(v)`), a `flag` (a call's
+  bit), a `signal` or a range of `signals`. A space can include one other
+  (root's and vmmgr's include `parent`, the badges `l4h_task::component`
+  mints for a spawned component's calls and faults) and fails to compile
+  if two of its ranges overlap. Its `SIGNALS` is every notification bit,
+  so a serve loop's "was this a signal?" test cannot miss a new one, and a
+  `FailureHandler`'s `notification_badges` is the same constant. memd's
+  timer moved from bit 0 to bit 40 when its space was declared: bit 0 lay
+  in the VMMs' guest field, told apart only by the order of memd's tests.
+- **Protocols** (`protocol!`) give an endpoint's calls: label, typed
+  arguments and reply (`wire::Wire`: integers that reject a word too wide
+  instead of truncating it, arrays, pairs, bounded lists, structs declared
+  with `wire_struct!`), and the senders that may make each. A protocol
+  generates the decoded `Request` enum, a `Server` trait with a method per
+  call, `serve`, which decodes, refuses senders the declaration does not
+  allow (`EINVAL`), runs the method and encodes the reply, and a `Client`
+  trait with a method per call for anything that implements `wire::Call`
+  (`l4h_task::memd::MemdLink`, `l4h_rt::call::Endpoint`). Arguments leave the
+  message registers before a handler runs and the reply goes there after
+  it returns, so no handler's invocations can overwrite either. The reply's
+  first word is 0 or an errno; a keeper's `u64::MAX` is `wire::FAILED`.
+  Labels must be distinct and calls must fit the IPC buffer, at compile
+  time.
+
+memd's calls (`l4h_host::memd::call`) are declared so; root's and vmmgr's
+endpoint and notification badges are in their spaces. The other endpoint
+protocols (root's calls from trustd and vmmgr, vmmgr's from the VMMs) and
+the drivers' mailboxes, whose requests have the same label-and-words
+shape, are still constants and comments.
 
 **Serial output** goes through shared memory to l4h-logd (§10.4), and root
 drives COM1 input for the monitor. The port takes about 11 KB/s, so prints

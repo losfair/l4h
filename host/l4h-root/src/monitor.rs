@@ -10,8 +10,7 @@ use sel4::cap_type;
 use crate::Host;
 use crate::mem::Alloc;
 
-/// Badge of the monitor's interrupt on the root task's bound notification.
-pub const MONITOR_BADGE: u64 = 1 << 41;
+use l4h_host::badges::root::MONITOR as MONITOR_BADGE;
 
 /// seL4 user IRQ vector for the serial port.
 #[cfg(target_arch = "x86_64")]

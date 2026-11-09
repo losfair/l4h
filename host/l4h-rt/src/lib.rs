@@ -30,6 +30,7 @@ pub use sel4_panicking_env;
 #[doc(hidden)]
 pub use sel4_runtime_common;
 
+pub mod call;
 mod failure;
 pub mod ioport;
 pub mod mailbox;
