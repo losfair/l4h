@@ -25,7 +25,8 @@ use crate::ring::{self, Buf, Entry};
 /// full one takes up to 20 s to print at 115200 baud, 30 s where each byte
 /// costs logd a slow VM exit, and everything else waits behind a flood.
 pub const CAPACITY: usize = 1023;
-pub const TEXT_SIZE: usize = 232;
+/// A slot is then 256 bytes, its header (with the checksum) included.
+pub const TEXT_SIZE: usize = 224;
 const WORDS: usize = TEXT_SIZE / 8;
 pub const PAGES: usize = core::mem::size_of::<Ring>() / 4096;
 pub const FRAME_RADIX: usize = PAGES.next_power_of_two().trailing_zeros() as usize;
