@@ -1,4 +1,4 @@
-From d6d8d28b20af4240eb3cda14ca0a7d62a5bc0fdd Mon Sep 17 00:00:00 2001
+From ecda7d27440f1d34d1baa472a14a9c07a7d43026 Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Mon, 9 Nov 2026 01:22:12 +0100
 Subject: [PATCH] x86/vcpu: VT-x guests set only the CR4 bits on an allowlist
@@ -22,7 +22,7 @@ VMX_CONTROL_CR4_MASK shows the others set.
  1 file changed, 6 insertions(+), 2 deletions(-)
 
 diff --git a/src/arch/x86/object/vcpu.c b/src/arch/x86/object/vcpu.c
-index 84c3367da..e1e3e749f 100644
+index f7fc6acdd..94dd0da38 100644
 --- a/src/arch/x86/object/vcpu.c
 +++ b/src/arch/x86/object/vcpu.c
 @@ -611,6 +611,8 @@ void vcpu_init(vcpu_t *vcpu)
