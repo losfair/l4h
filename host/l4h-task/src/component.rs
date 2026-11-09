@@ -22,6 +22,19 @@ use l4h_host::wiring::{self, E, Object, o, p};
 
 use crate::edge::Obj;
 
+/// seL4's cap tags (seL4_DebugCapIdentify), the same on every
+/// architecture.
+const CAP_ENDPOINT: u32 = 4;
+const CAP_NOTIFICATION: u32 = 6;
+
+const fn cap_tag(o: Object) -> u32 {
+    if wiring::is_endpoint(o) { CAP_ENDPOINT } else { CAP_NOTIFICATION }
+}
+
+fn tag_name(t: u32) -> &'static str {
+    if t == CAP_ENDPOINT { "endpoint" } else { "notification" }
+}
+
 /// The badge of a component's calls on its parent's endpoint (badges::parent).
 pub const fn component_badge(id: u32) -> u64 {
     parent::COMPONENT | parent::ID.put(id as u64)
@@ -40,6 +53,16 @@ pub struct Component {
     pub sc: cap::SchedContext,
     /// Radix of its CNode.
     pub cnode_bits: usize,
+}
+
+/// A slot of the caller's in which `Component::audit` looks at capabilities
+/// (0: no audit).
+static AUDIT_SLOT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Audit the components this task makes (debug builds), looking at their
+/// capabilities in `slot`, an empty slot of its own CSpace kept for it.
+pub fn audit_in(slot: crate::mem::Slot) {
+    AUDIT_SLOT.store(slot, core::sync::atomic::Ordering::Relaxed);
 }
 
 impl Component {
@@ -73,6 +96,53 @@ impl Component {
         let idx = e.slot(n);
         crate::edge::mint(&self.slot(idx), e, i, src)
             .unwrap_or_else(|err| panic!("component {} slot {} ({}) mint: {:?}", self.id, idx, e.name, err));
+        // What it was minted from was the edge's object (Obj::claim).
+        if let Some(t) = self.identify(idx) {
+            assert!(t == cap_tag(O::OBJECT), "component {} slot {} ({}): not minted from {:?}", self.id, idx, e.name, O::OBJECT);
+        }
+    }
+
+    /// The type (seL4's cap tag) of what is in slot `idx`, in debug
+    /// builds: 0 if nothing.
+    fn identify(&self, idx: u64) -> Option<u32> {
+        sel4::sel4_cfg_if! {
+            if #[sel4_cfg(DEBUG_BUILD)] {
+                let slot = AUDIT_SLOT.load(core::sync::atomic::Ordering::Relaxed);
+                if slot == 0 {
+                    return None;
+                }
+                let scratch = self.local_cnode.absolute_cptr(cap_at::<cap_type::Null>(slot));
+                // Some capabilities cannot be copied: none calls or signals.
+                if scratch.copy(&self.slot(idx), CapRights::all()).is_err() {
+                    return Some(0);
+                }
+                let t = cap_at::<cap_type::Null>(slot).debug_identify();
+                scratch.delete().expect("audit scratch slot");
+                Some(t)
+            } else {
+                let _ = idx;
+                None
+            }
+        }
+    }
+
+    /// Check, in debug builds, that every capability in its CSpace that
+    /// calls or signals is one the wiring gives it (an edge it holds, or
+    /// one of its own objects: wiring::expected), of the declared type.
+    /// The slots of a component's layout (host::CNODE_BITS) are looked at:
+    /// memd's and vmmgr's larger CNodes hold memory above them.
+    pub fn audit(&self) {
+        for idx in 0..1u64 << self.cnode_bits.min(host::CNODE_BITS) {
+            let Some(t) = self.identify(idx) else { return };
+            if t != CAP_ENDPOINT && t != CAP_NOTIFICATION {
+                continue;
+            }
+            match wiring::expected(self.kind, idx) {
+                Some(o) if cap_tag(o) == t => {}
+                Some(o) => panic!("wiring audit: component {} slot {} holds a {} where the wiring has {:?}", self.id, idx, tag_name(t), o),
+                None => panic!("wiring audit: component {} (kind {}) slot {} holds a {} no edge gives it", self.id, self.kind, idx, tag_name(t)),
+            }
+        }
     }
 
     /// Its notification or service endpoint, as T's: it must be one.
@@ -361,5 +431,6 @@ pub fn create(
 }
 
 pub fn start(c: &Component) {
+    c.audit();
     c.tcb.tcb_resume().expect("start component");
 }

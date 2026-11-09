@@ -1,6 +1,6 @@
 //! Component spawning through l4h-task, with local CSpace conveniences.
 
-pub use l4h_task::component::{Component, SpawnArgs, SpawnContext, create, start};
+pub use l4h_task::component::{Component, SpawnArgs, SpawnContext, audit_in, create, start};
 pub use l4h_task::cap_at as root_cap;
 pub use l4h_task::edge::{Obj, mint as mint_edge};
 pub use l4h_host::wiring::{o, p};

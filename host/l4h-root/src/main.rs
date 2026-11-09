@@ -387,6 +387,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     let wd_ntfn = alloc.object_cap::<cap_type::Notification>(ObjectBlueprint::Notification);
     slot::TCB.cap().tcb_bind_notification(wd_ntfn).expect("bind watchdog notification");
     mailbox::init(wd_ntfn);
+    component::audit_in(alloc.slots.alloc());
     let reply_slot = alloc.slots.alloc();
     let reply = ReplySlot::new(&mut alloc, sel4::init_thread::Slot::<cap_type::Reply>::from_index(reply_slot).cap());
     let mut wins = Windows {

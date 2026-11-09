@@ -447,6 +447,68 @@ pub const EDGES: &[Edge] = &[
     GUEST_CTL.0, GUEST_VMM_KICK.0, GUEST_VMM_MEM.0, GUEST_VMM_CONSOLE.0, VMMGR_VMM.0, VMM_VCPU.0, GUEST_IPI.0, VMMGR_VCPU.0,
 ];
 
+/// A slot where a component keeps an IPC object of its own, which no
+/// edge gives it: with the edges it holds, all it may have in its CSpace
+/// that calls or signals (l4h_task's audit of each component, in debug
+/// builds).
+#[derive(Clone, Copy, Debug)]
+pub struct Own {
+    /// host::KIND_*, or every kind.
+    pub kind: Option<u32>,
+    pub slot: u64,
+    pub object: Object,
+    pub what: &'static str,
+}
+
+pub const OWN: &[Own] = &[
+    Own { kind: None, slot: crate::SLOT_NTFN, object: Notification, what: "its notification" },
+    Own { kind: None, slot: crate::SLOT_SERVICE_EP, object: Endpoint, what: "its endpoint" },
+    Own { kind: None, slot: crate::SLOT_FAULT_EP, object: Endpoint, what: "its keeper's: the main thread's faults" },
+    Own { kind: Some(crate::KIND_TRUSTD), slot: trust::SLOT_KICK, object: Kick, what: "its kick notification" },
+    Own { kind: Some(crate::KIND_TRUSTD), slot: trust::SLOT_FLAGS_EP, object: Flags, what: "its flags thread's endpoint" },
+];
+
+/// What a component of `kind` may have in slot `slot` that calls or
+/// signals: the object of the edge it holds there, or of its own.
+pub fn expected(kind: u32, slot: u64) -> Option<Object> {
+    let held = EDGES.iter().find(|e| {
+        e.holder.kind() == Some(kind)
+            && matches!(e.at, At::Slots(base, len) if slot >= base && slot < base + len as u64)
+    });
+    held.map(|e| e.object).or_else(|| {
+        OWN.iter().find(|o| o.slot == slot && o.kind.is_none_or(|k| k == kind)).map(|o| o.object)
+    })
+}
+
+/// Whether a capability to `object` is an endpoint's (or else a
+/// notification's).
+pub const fn is_endpoint(object: Object) -> bool {
+    matches!(object, Endpoint | Flags)
+}
+
+/// No component keeps its own object where it holds an edge.
+const fn own_check() -> Result<(), &'static str> {
+    let mut i = 0;
+    while i < OWN.len() {
+        let o = &OWN[i];
+        let mut j = 0;
+        while j < EDGES.len() {
+            let e = &EDGES[j];
+            let kind_ok = match (o.kind, e.holder.kind()) {
+                (None, Some(_)) => true,
+                (Some(k), Some(h)) => k == h,
+                _ => false,
+            };
+            if kind_ok && matches!(e.at, At::Slots(base, len) if o.slot >= base && o.slot < base + len as u64) {
+                return Err(e.name);
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
 /// The edge by which a component of `kind` calls its parent, if it does:
 /// only those get a capability to the parent's endpoint.
 pub const fn parent_call(kind: u32) -> Option<&'static Edge> {
@@ -629,6 +691,10 @@ const _: () = match check(EDGES) {
     Ok(()) => {}
     Err(_) => panic!("the wiring does not check: an edge's slot, badge or rights"),
 };
+const _: () = match own_check() {
+    Ok(()) => {}
+    Err(_) => panic!("a component's own object is in an edge's slot"),
+};
 const _: () = match keepers() {
     Ok(()) => {}
     Err(e) => panic!("{}", e),
@@ -668,6 +734,15 @@ mod tests {
         let mut odd = IRQ_BLKD.0;
         odd.badge = Fixed(1 << 50);
         assert!(check(&[odd]).is_err());
+    }
+
+    #[test]
+    fn own_and_held() {
+        assert_eq!(expected(crate::KIND_VMMGR, crate::SLOT_ROOT_EP), Some(Endpoint));
+        assert_eq!(expected(crate::KIND_BLKD, crate::SLOT_ROOT_EP), None);
+        assert_eq!(expected(crate::KIND_TRUSTD, trust::SLOT_KICK), Some(Kick));
+        assert_eq!(expected(crate::KIND_BLKD, trust::SLOT_KICK), None);
+        assert_eq!(expected(crate::KIND_NETD, crate::SLOT_NTFN), Some(Notification));
     }
 
     #[test]
