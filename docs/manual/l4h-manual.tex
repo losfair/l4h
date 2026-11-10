@@ -1085,7 +1085,9 @@ and destroying a VM leaves its diagnostics available.
 Each host component keeps its messages in a bounded log of its own, which
 no other component can write: the host itself 255, the guest manager 63,
 each guest's device model 7. The component id printed is that of the log a
-message is in, and control characters in messages are shown as \texttt{?}.
+message is in (the host itself is \texttt{0x0}; a guest's device model is
+\texttt{0x1000} plus the VM's id), and control characters in messages are
+shown as \texttt{?}.
 Long records are marked truncated; overwritten or incomplete records are
 reported as unavailable. The ring
 does not survive a host reboot. Use \cmd{l4hctl console VM} for Linux console

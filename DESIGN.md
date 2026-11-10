@@ -1341,11 +1341,14 @@ pool, and host components map only host-owned pages.
   buffer or indirect table outside the pool are returned unused, and so are
   chains longer than the queue size, indirect descriptors included (virtio
   1.x §2.7.5.3.1): a chain is collected into a fixed array of that size.
-- **Request size.** A block request bounces entirely through the pool, and
-  one that cannot fit even in an empty pool would be requeued forever. The
-  VMM therefore offers `VIRTIO_BLK_F_SIZE_MAX` with `seg_max * size_max` at
-  most a quarter of the pool (72 KiB segments, about 1 MiB per request,
-  with 4 MiB; 16 KiB with 1 MiB).
+- **Request size.** A block request bounces entirely through the pool, and one
+  that cannot fit even in an empty pool would be requeued forever. The VMM
+  therefore offers `VIRTIO_BLK_F_SIZE_MAX` with `seg_max * size_max` at most a
+  quarter of the pool (72 KiB segments, about 1 MiB per request, with 4 MiB;
+  16 KiB with 1 MiB). The guest is held to both: a chain with a longer data
+  segment, or with more data segments than `seg_max` (14, or fewer if the
+  disk's device takes fewer; data sharing the header's or the status byte's
+  buffer counts), is returned with an I/O error and never reaches blkd.
 - **Receive buffers.** A virtio-net driver keeps its receive ring full, so
   its buffers hold pool memory all the time. The VMM offers `GUEST_TSO4/6`
   without `MRG_RXBUF` or indirect descriptors, so Linux posts "big" buffers
@@ -1868,24 +1871,23 @@ seeded image can back many guests. Every window is a separate virtio-blk
 volume starting at sector zero. There is no image format, host filesystem,
 thin provisioning or copy-on-write.
 
-**Extent volumes (LVM-compatible).** `BLK_ATTACH_EXTENTS` attaches instead
-a list of up to 4096 4 KiB aligned extents of one disk, joined in order
-into one guest disk: an LVM2 linear logical volume, among others. It takes
-the same flags as `BLK_ATTACH`. The host never reads LVM metadata. dom0
-runs stock LVM2, and `l4hctl lv-extents` / `--lv` turn a linear LV on one
-PV into extents from `lvm`'s own reports (segments in LV order, physical
-extents to host sectors, adjacent runs joined); thin, snapshot, origin,
-mirror, RAID and cache volumes are refused. The bytes the guest sees are
-those dm-linear maps from the same metadata, so the disk stays an ordinary
-LVM2 PV. With several extents each is at least 4 MiB (LVM's default extent
-size): a request is at most 3.5 MiB (14 segments of 256 KiB), so it crosses
-at most one boundary, and blkd splits such a request into two device
-requests. If the device has no room for the second when the first starts,
-it waits ("carry") and starts before any new request; the guest gets one
-completion, with the first error. The overlap rule applies extent by
-extent: dom0 can only reattach the physical extents of a removed LV once no
-guest holds them, and provisioning (`BLK_WRITE`) refuses every attached
-extent.
+**Extent volumes (LVM-compatible).** `BLK_ATTACH_EXTENTS` attaches instead a
+list of up to 4096 4 KiB aligned extents of one disk, joined in order into one
+guest disk: an LVM2 linear logical volume, among others. It takes the same
+flags as `BLK_ATTACH`. The host never reads LVM metadata. dom0 runs stock
+LVM2, and `l4hctl lv-extents` / `--lv` turn a linear LV on one PV into extents
+from `lvm`'s own reports (segments in LV order, physical extents to host
+sectors, adjacent runs joined); thin, snapshot, origin, mirror, RAID and cache
+volumes are refused. The bytes the guest sees are those dm-linear maps from
+the same metadata, so the disk stays an ordinary LVM2 PV. With several extents
+each is at least 4 MiB (LVM's default extent size): a request is at most 3.5
+MiB (14 segments of 256 KiB; blkd refuses a larger one from any client), so it
+crosses at most one boundary, and blkd splits such a request into two device
+requests. If the device has no room for the second when the first starts, it
+waits ("carry") and starts before any new request; the guest gets one
+completion, with the first error. The overlap rule applies extent by extent:
+dom0 can only reattach the physical extents of a removed LV once no guest
+holds them, and provisioning (`BLK_WRITE`) refuses every attached extent.
 
 - **Where the list goes.** dom0 writes the list into its control data area.
   Root bounds its count and offset and copies the bytes, unread, into
@@ -1914,32 +1916,45 @@ extent.
   ring changed; completion retries visit blocked queues without reading
   every idle queue's available ring.
 - **Flush and reset.** A flush waits for accepted requests from every queue,
-  and later requests wait until it completes. Device reset drains all
-  accepted work before buffers can be reused. Reset of one queue returns
-  completions to the others and drops only its own. A VMM waits at most
-  five seconds for the drain (blkd's own bound for its device): a blkd
-  that root quarantined is suspended and never answers. The disk then
-  fails for good: what blkd still has fails, every later request is an
-  I/O error, and its channel is not read again.
+  and later requests wait until it completes. Device reset drains all accepted
+  work before buffers can be reused. Reset of one queue returns completions to
+  the others and drops only its own. A VMM waits at most five seconds for the
+  drain, whether or not responses keep coming, and takes no more of them than
+  blkd can owe it (one per request, and a ring's worth): a blkd that root
+  quarantined is suspended and never answers, and one that runs an attacker's
+  code may answer for ever. The disk then fails for good: what blkd still has
+  fails, every later request is an I/O error, and its channel is not read
+  again.
 - **Clients.** Each client has its own immutable pool/window/permission
   configuration, channel and completion notification. A controller supports
   512 clients; blkd's submit loop visits only attached ones. Submission is
   round-robin, with bounded work per client and reserved completion capacity
-  for outstanding requests. Hardware request tags are allocated by blkd, so
-  identical IDs from different clients cannot collide.
+  for outstanding requests: blkd takes a request only while its response has
+  room in the completion ring, and a VMM that takes responses while requests
+  wait in its submission ring kicks blkd, which learns of the room no other
+  way. Hardware request tags are allocated by blkd, so identical IDs from
+  different clients cannot collide.
 - **Validation.** Descriptor buffers must lie in the client's I/O pool; blkd
-  translates pool GPAs to physical addresses, and the device never sees
-  guest RAM. Requests are checked with checked arithmetic for block
-  alignment, direction, permissions, operation and pool bounds.
+  translates pool GPAs to physical addresses, and the device never sees guest
+  RAM. Requests are checked with checked arithmetic for block alignment,
+  direction, permissions, operation, pool bounds and size: at most 3.5 MiB,
+  whatever the client's VMM let through, so what a client can have in flight
+  is bounded. A virtio-blk device that takes fewer than 14 data segments is
+  given no more: blkd tells its clients (`Channel::seg_max`), whose VMMs offer
+  their guests that many, and refuses a request with more. Operations other
+  than read, write and flush (GET_ID among them) are answered unsupported by
+  the VMM.
 - **Who may use which sectors.** blkd alone decides: the overlap rule
   (`DiskWindow::conflicts`), dom0's boot reservations and provisioning
-  exclusion (`blk::Reservations`). Root only asks: `check` gives the
-  errno or the slot to attach in before root allocates anything, and
-  `add` repeats the check for that slot (`Reservations::admits`): a
-  removal root posts in between may free a lower slot, which leaves the
-  checked one right. Root parses no ranges of dom0's and keeps
-  its attachment records only for teardown and reports. blkd sends the
-  commands, so a second check in root could not stop a faulty one.
+  exclusion (`blk::Reservations`). Root only asks: `check` gives the errno or
+  the slot to attach in before root allocates anything, and `add` repeats the
+  check for that slot (`Reservations::admits`): a removal root posts in
+  between may free a lower slot, which leaves the checked one right. Root asks
+  for a claim of a boot range only for dom0's windows, and takes a reserved
+  slot only for dom0's window of the disk and range it reserved: any other
+  answer naming one quarantines the controller. Root parses no ranges of
+  dom0's and keeps its attachment records only for teardown and reports. blkd
+  sends the commands, so a second check in root could not stop a faulty one.
 - **Volatile attachments.** `BLK_ATTACH` takes flags: `BLK_RO`, and
   `BLK_VOLATILE` for a disk whose contents need not survive a power failure,
   such as the scratch disk of a VM discarded with it. Its VMM does not offer
@@ -1950,19 +1965,23 @@ extent.
   milliseconds, and per-commit `fsync` dominates package installs and builds
   there. Other attachments of the disk, and dom0's provisioning flush, still
   flush the device.
-- **Destroy** stops the client's VMM and takes its pool out of the
-  device's IOMMU domain; blkd then drains that client's submitted work and
-  releases it, without resetting the shared controller, and root reclaims
-  its channel once blkd has answered (§10, "Root never waits on a driver").
-  If blkd cannot drain within five seconds, it says so, and root suspends
-  the driver and quarantines the controller: its DMA memory stays
-  allocated, without an IOMMU every affected guest pool is pinned, and no
-  new attachment or provisioning write is accepted until host reboot.
-- **Provisioning.** dom0 can seed or explicitly zero *unattached* ranges
-  with `BLK_WRITE` and its ioctl staging buffer (up to 1 MiB per call); a
+- **Destroy** stops the client's VMM and takes its pool out of the device's
+  IOMMU domain; blkd then drains that client's submitted work and releases it,
+  without resetting the shared controller, and root reclaims its channel once
+  blkd has answered (§10, "Root never waits on a driver"). blkd serves its
+  other clients meanwhile. A slow device is waited for: only if it finishes
+  none of the requests it had when the drain began for five seconds does blkd
+  say so, and root suspends the driver and quarantines the controller: its DMA
+  memory stays allocated, without an IOMMU every affected guest pool is
+  pinned, and no new attachment or provisioning write is accepted until host
+  reboot.
+- **Provisioning.** dom0 can seed or explicitly zero *unattached* ranges with
+  `BLK_WRITE` and its ioctl staging buffer (up to 1 MiB per call); a
   zero-length call flushes the controller. Provisioning uses a private 1 MiB
-  DMA scratch area and never writes over a client, read-only clients
-  included.
+  DMA scratch area and never writes over a client, read-only clients included.
+  It waits for a busy device as long as that completes requests; one that
+  completes nothing for five seconds fails the write, and root quarantines the
+  controller.
 - **Legacy devices.** Every virtio device the host drives (virtio-blk,
   virtio-scsi, virtio-net and the balloon) may also be a legacy (0.9.5) one:
   transitional device ID, registers in I/O BAR 0, no virtio capabilities, as
@@ -1989,19 +2008,21 @@ extent.
   sized by the limit) suffice for a 4 MiB request at an 8 KiB limit, unless
   the device's queue is shallower.
 - **Boot.** Host disks are numbered by controller in PCI order, then target
-  and LUN. Before anything enables a disk controller, root resets it
-  through a mapping of its registers, with bus mastering off, since
-  firmware may leave one running: NVMe clears CC.EN and waits up to CAP.TO
-  for CSTS.RDY to clear, which aborts every command and deletes the queues;
-  virtio writes 0 to `device_status` and waits until it reads back 0. It
-  then starts every
-  controller's blkd at boot and learns the virtio-scsi units there. Each
-  needs 4 MiB of physically contiguous DMA memory, and the host fails to boot
-  without it, so a disk never lacks its driver later. A controller whose
-  reset failed, or whose BARs are not free device memory (below), is not
-  started and stays disabled: its disks fail with `EIO`, and the host boots
-  without them. Clients and quarantine are per
-  controller.
+  and LUN. Before anything enables a disk controller, root resets it through a
+  mapping of its registers, with bus mastering off, since firmware may leave
+  one running: NVMe clears CC.EN and waits up to CAP.TO for CSTS.RDY to clear,
+  which aborts every command and deletes the queues; virtio writes 0 to
+  `device_status` and waits until it reads back 0. It then starts every
+  controller's blkd at boot and learns the virtio-scsi units there. A blkd
+  that has not reported its units 30 seconds after the drivers were started is
+  quarantined as one that faulted, and the host boots without its disks; a
+  driver's own reset of a virtio device is bounded too (a count of status
+  reads), and a device that does not reset stops its driver. Each needs 4 MiB
+  of physically contiguous DMA memory, and the host fails to boot without it,
+  so a disk never lacks its driver later. A controller whose reset failed, or
+  whose BARs are not free device memory (below), is not started and stays
+  disabled: its disks fail with `EIO`, and the host boots without them.
+  Clients and quarantine are per controller.
 - **Queries.** `DISK_INFO` returns the PCI address, kind, failed flag,
   capacity and attachment count (volumes, not extents; the owner field
   names the first attachment, or -1); `BLK_INFO` enumerates `(vm, start,
@@ -2742,9 +2763,12 @@ order and signals root, which then finishes what the request was for
 pending, and so does whatever waits for it, nothing else:
 
 - **netd's commands** need no answer: root validates them and keeps their
-  state (ports, uplinks, steering), and netd publishes its counters and
-  MACs in the mailbox's second page, as blkd publishes its disks. Root's
-  boot, which needs both, finishes from the serve loop once they are there.
+  state (ports, uplinks, steering), and netd publishes its counters and MACs
+  in the mailbox's second page, as blkd publishes its disks. Root's boot,
+  which needs both, finishes from the serve loop once they are there, or 30
+  seconds after the drivers were started: a driver that has not published by
+  then is failed as one that faulted (a disk controller is quarantined, netd's
+  networking stops), and the host boots without it.
 - **blkd's** checks and attachments, provisioning writes and extent queries
   are answered later through vmmgr (`root::Later::Token`, §10.3), and through
   dom0's control device, whose caller may give up and make the next
@@ -2769,21 +2793,21 @@ pending, and so does whatever waits for it, nothing else:
 - A full ring (64 requests) refuses new ones with `EBUSY`; removals queue
   in root until there is room.
 - **A driver that faults** fails in root, not in itself. Drivers have no
-  keeper thread (`host::has_keeper`): no one calls them, so no caller
-  needs answering, and a fault goes to root's endpoint like any other
-  component's. Root suspends the driver and quarantines what it drove
-  (`blkd::fault`, `Netd::fault`, `usb::fault`), and its pending requests
-  finish at once as `wire::FAILED` answers would (`Mailbox::abandon`), as
-  do later ones: a quarantined controller takes none, and a failed netd's
-  commands are dropped and its ports let go. Root acts on the kernel's
-  fault message, which the driver cannot forge or withhold. A driver's
-  answer can also say that a request failed (an errno, or `wire::FAILED`,
-  which `l4h_rt::mailbox::serve` writes for a request the driver could not
-  carry out), and root quarantines the controller on a `Check` answered
-  `FAILED` or with a slot in use, a refused `Add`, `Remove` or `Reserve`,
-  a device failure in `Write`, and a failed USB `Claim` or `Remove`, as
-  it would on a fault. That gives a driver nothing it lacks, since it
-  could fault or stop answering instead, and a quarantine only takes
+  keeper thread (`host::has_keeper`): no one calls them, so no caller needs
+  answering, and a fault goes to root's endpoint like any other component's.
+  Root suspends the driver and quarantines what it drove (`blkd::fault`,
+  `Netd::fault`, `usb::fault`), and its pending requests finish at once as
+  `wire::FAILED` answers would (`Mailbox::abandon`), as do later ones: a
+  quarantined controller takes none, and a failed netd's commands are dropped
+  and its ports let go. Root acts on the kernel's fault message, which the
+  driver cannot forge or withhold. A driver's answer can also say that a
+  request failed (an errno, or `wire::FAILED`, which `l4h_rt::mailbox::serve`
+  writes for a request the driver could not carry out), and root quarantines
+  the controller on a `Check` answered `FAILED`, with a slot in use or with a
+  boot range's slot for anything but dom0's claim of it, a refused `Add`,
+  `Remove` or `Reserve`, a device failure in `Write`, and a failed USB `Claim`
+  or `Remove`, as it would on a fault. That gives a driver nothing it lacks,
+  since it could fault or stop answering instead, and a quarantine only takes
   memory out of use, never frees it early. A Rust panic in a driver traps
   after `l4h_rt::abort_trap` logs it, and faults so too.
 
@@ -3129,11 +3153,13 @@ settings.
 
 **dom0's disks.**
 
-- `dom0_disk0_windows=start:count,...` exposes each selected partition of
-  an existing GPT installation as a separate filesystem device. Values are
-  in 512-byte sectors, multiples of eight, counts positive. The list replaces
+- `dom0_disk0_windows=start:count,...` exposes each selected partition of an
+  existing GPT installation as a separate filesystem device. Values are in
+  512-byte sectors, multiples of eight, counts positive. The list replaces
   disk 0 and requires `dom0_disks` > 0 and `dom0_disk0_mb=0`. Invalid,
-  overlapping, excessive or out-of-bounds ranges stop boot; they never grant
+  overlapping or excessive ranges stop boot. A range beyond the disk's
+  capacity, which is its driver's word, does not: it is logged and stays
+  reserved, and dom0 gets a zero-capacity placeholder for it. None ever grants
   access to the whole disk. Other host disks keep their order after these
   devices.
 - dom0's whole device plan must fit in 64 slots, including console, control,
@@ -3248,28 +3274,28 @@ call chain may hold (`Guest::stop`). `vm_pause` would need to give them back.
   deletes the guest's by a scan of owner bytes. Destroy order is in §10.3.
   ASIDs are released by the kernel when VSpaces die. Repeated
   create/destroy leaves free memory unchanged (`tests/run-ctltest.sh`).
-- **Disk detach.** A disk window is detached only when its guest is
-  destroyed, and the shared controller keeps running. Root first unmaps the
-  pool from the controller's IOMMU domain, which waits for the device's
-  DMA to it to drain (§9.5): the device can no longer reach the pool,
-  whatever blkd does, and the pool is reused at once (once every device of
-  the guest is cut off so). Then root asks blkd to drain the client
-  (`blk::call::remove`); without an IOMMU the pool waits for that, until
-  every request the client submitted has completed.
-  Root cannot cut one client off by clearing bus mastering, as it cuts off
-  a USB controller's one guest (§9.7): that would stop the controller's
-  other clients, and once bus mastering was back on the device would finish
-  commands it had started, into the reused pool. A USB controller is reset
-  before bus mastering comes back. If blkd has failed or the drain times
-  out (five seconds), root quarantines the controller: it suspends blkd
-  and disables the PCI function, marks the controller failed until host
-  reboot (`blk_attach` returns EIO, `l4hctl disks` says so), and keeps the
-  guest's pool and blkd's DMA memory out of the free pool, unless an IOMMU
-  has cut the device off from the pool (§9.5). Root does not count on the
-  disabled function there: a controller that did not drain is already not
-  doing what it was told. `tests/run-ctltest.sh` destroys guests in the middle of throttled
-  reads on virtio-blk and NVMe, and checks that the next guest, which reuses
-  the memory, sees no disk data appear in it.
+- **Disk detach.** A disk window is detached only when its guest is destroyed,
+  and the shared controller keeps running. Root first unmaps the pool from the
+  controller's IOMMU domain, which waits for the device's DMA to it to drain
+  (§9.5): the device can no longer reach the pool, whatever blkd does, and the
+  pool is reused at once (once every device of the guest is cut off so). Then
+  root asks blkd to drain the client (`blk::call::remove`); without an IOMMU
+  the pool waits for that, until every request the client submitted has
+  completed. Root cannot cut one client off by clearing bus mastering, as it
+  cuts off a USB controller's one guest (§9.7): that would stop the
+  controller's other clients, and once bus mastering was back on the device
+  would finish commands it had started, into the reused pool. A USB controller
+  is reset before bus mastering comes back. If blkd has failed or the device
+  finishes nothing of what it had for five seconds, root quarantines the
+  controller: it suspends blkd and disables the PCI function, marks the
+  controller failed until host reboot (`blk_attach` returns EIO, `l4hctl
+  disks` says so), and keeps the guest's pool and blkd's DMA memory out of the
+  free pool, unless an IOMMU has cut the device off from the pool (§9.5). Root
+  does not count on the disabled function there: a controller that did not
+  drain is already not doing what it was told. `tests/run-ctltest.sh` destroys
+  guests in the middle of throttled reads on virtio-blk and NVMe, and checks
+  that the next guest, which reuses the memory, sees no disk data appear in
+  it.
 
 **Policy and safety.**
 
