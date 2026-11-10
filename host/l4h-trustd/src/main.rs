@@ -370,13 +370,25 @@ fn record(id: usize) -> Option<GuestRecord> {
     if id >= trust::MAX_RECORDS {
         return None;
     }
+    use core::sync::atomic::{Ordering, fence};
     let p = (trust::REGISTRY_VA as *const GuestRecord).wrapping_add(id);
+    let instance = || unsafe { core::ptr::addr_of!((*p).instance).read_volatile() };
+    // Root writes a record's fields while its instance is 0, then the
+    // instance (l4h-root's trustd.rs `register`), and instances are never
+    // given twice.  So the instance comes first, on its own: fields read
+    // after it and before it reads the same again are that instance's.
+    // One read of the whole record would not do: its loads come in any
+    // order, the instance's after another guest's launch digest.
     loop {
+        let first = instance();
+        if first == 0 {
+            return None;
+        }
+        fence(Ordering::Acquire);
         let r = unsafe { p.read_volatile() };
-        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
-        let again = unsafe { core::ptr::addr_of!((*p).instance).read_volatile() };
-        if again == r.instance {
-            return (r.instance != 0).then_some(r);
+        fence(Ordering::Acquire);
+        if instance() == first {
+            return Some(GuestRecord { instance: first, ..r });
         }
     }
 }

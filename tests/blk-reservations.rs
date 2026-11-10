@@ -25,9 +25,9 @@ pub struct Controller {
 fn quarantine(c: &mut Controller, _: &Pci) { c.failed = true; }
 pub struct Host { ctrls: Vec<Controller>, pci: Pci, iommu: Iommu, released: Vec<(Option<usize>, bool)> }
 mod vmmgr {
-    /// What a deleted guest's memory waits for: the removal, and whether
-    /// its pool can be reused.
-    pub fn zombie_done(h: &mut crate::Host, zombie: Option<usize>, reusable: bool) {
+    /// What a deleted guest's memory waits for: a disk's removal, and
+    /// whether its pool can be reused.
+    pub fn zombie_disk_done(h: &mut crate::Host, zombie: Option<usize>, reusable: bool) {
         h.released.push((zombie, reusable));
     }
 }

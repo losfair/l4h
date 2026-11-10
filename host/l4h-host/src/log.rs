@@ -355,11 +355,16 @@ impl Ring {
         // is later than `now`, in the next snapshot.  One claimed and not
         // committed may be older: then a snapshot ends a moment ago, so
         // that it is in the next one rather than missed.
-        let snapshot = if self.in_flight() { now.saturating_sub(hz / 10) } else { now };
-        let end = if end == 0 { snapshot } else { end.min(snapshot) };
-        if cursor > end {
+        // Only a cursor no read gave is refused: one in the future, or past
+        // the caller's own end.  A cursor a read gave is at most the `now`
+        // of that read, which a snapshot that ends a moment ago can be
+        // before: that read is empty, at the cursor, not an error, or any
+        // writer could make others' reads fail by leaving a slot claimed.
+        if cursor > now || (end != 0 && cursor > end) {
             return None;
         }
+        let snapshot = if self.in_flight() { now.saturating_sub(hz / 10) } else { now };
+        let end = if end == 0 { snapshot } else { end.min(snapshot) }.max(cursor);
         let (mut len, mut lost, mut last) = (0, 0u64, None);
         // The records of one time are never split between reads: where
         // they start in `out`, and what was lost before them.
@@ -755,6 +760,30 @@ mod tests {
         // A snapshot that ended before it does not take it.
         assert_eq!(read(ring, 1_250_101, 1_250_150).1, "");
         assert_eq!(read(ring, 1_250_101, 0).1, "[     1.250100] [0x200] next\n");
+    }
+
+    /// A read that filled its output gives a cursor less than a moment
+    /// old; a writer that then leaves a slot claimed and not committed
+    /// makes the next snapshot end before that cursor.  That read is empty,
+    /// at the cursor, for a follower and a snapshot alike: no writer can
+    /// make another's read fail.
+    #[test]
+    fn a_claimed_slot_does_not_fail_a_recent_cursor() {
+        let ring = ring();
+        let long = "x".repeat(400);
+        for k in 0..6 {
+            ring.write(Writer::Netd, NOW - 1000 + k, format_args!("{long}"));
+        }
+        let (first, _) = read(ring, 0, 0);
+        assert!(first.next > NOW - HZ / 10 && first.next < first.end, "a full read stops at a recent record");
+        ring.lane(Writer::Usbd(0)).unwrap().claim(1);
+        for end in [0, first.end] {
+            let (r, text) = read(ring, first.next, end);
+            assert_eq!((r.next, r.len, r.end, text.as_str()), (first.next, 0, first.next, ""));
+        }
+        // What only a caller could have made up is still refused.
+        assert!(ring.read_at(NOW, NOW + 1, 0, &mut [0; 1984]).is_none());
+        assert!(ring.read_at(NOW, first.next, first.next - 1, &mut [0; 1984]).is_none());
     }
 
     #[test]

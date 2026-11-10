@@ -48,6 +48,15 @@ pub fn serve(mut f: impl FnMut(u64, &[u64], &mut [u64; ANSWER]) -> Option<usize>
     }
 }
 
+/// Whether root has posted a request the driver has not answered yet.  A
+/// driver in the middle of a client's work that can take long (usbd's
+/// controller commands) stops at the next request of its own to let
+/// `serve` take root's first: root's REMOVE of a guest that is going must
+/// not wait behind that guest's own work.
+pub fn pending() -> bool {
+    page().posted.load(Ordering::Acquire) != DONE.load(Ordering::Relaxed)
+}
+
 /// Tell root that requests were answered.
 pub fn signal() {
     cap::<sel4::cap_type::Notification>(SLOT_MAILBOX_DONE).signal();

@@ -1461,8 +1461,16 @@ impl Usbd {
         self.xfer_budget = XFER_BUDGET;
         self.recover_all();
         self.refill();
-        // Control requests complete at once, in order.
+        // Control requests complete at once, in order.  Each may wait for
+        // a controller command (CMD_TIMEOUT_MS, and a reset after), so root's
+        // requests go first: a REMOVE of a guest that is going, and with it
+        // the next guest's ATTACH, does not wait behind up to CTL_BUDGET of
+        // the going guest's own records.  They stay queued for the next turn,
+        // which serves the mailbox first.
         for _ in 0..CTL_BUDGET {
+            if l4h_rt::mailbox::pending() {
+                return;
+            }
             let cl = self.client.as_mut().unwrap();
             let head = cl.guest(|c| &c.ctl_sq_head);
             let Some(n) = cl.ctl.avail(head) else { break };

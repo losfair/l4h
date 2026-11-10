@@ -603,6 +603,14 @@ pub struct Zombie {
     /// could not be stopped keeps it out of use for good.
     pool: Option<usize>,
     pin: bool,
+    /// The I/O pool, cut off from the devices' IOMMU domains but not
+    /// freed yet: a disk controller may still finish what the guest had
+    /// started (blkd's drain), and its domain may meanwhile map another
+    /// client's pool at the same addresses, which those commands would
+    /// then reach.  It goes once the guest's disks are all removed
+    /// (`disk_waits`), whatever netd does.
+    cut_pool: Option<Arena>,
+    disk_waits: usize,
 }
 
 pub type Zombies = [Option<Zombie>; MAX_GUESTS];
@@ -625,13 +633,30 @@ pub fn zombie_done(h: &mut Host, z: Option<usize>, pool_reusable: bool) {
     if zb.waits > 0 {
         return;
     }
-    let zb = h.zombies[z].take().unwrap();
+    let mut zb = h.zombies[z].take().unwrap();
+    if let Some(a) = zb.cut_pool.take() {
+        h.alloc.reclaim(a);
+    }
     let (pin, pool) = (zb.pin, zb.pool);
     let pinned = h.alloc.reclaim_pinning(zb.arena, |p| pin && Some(p) == pool);
     h.alloc.slots.free_owned(zombie_owner(z));
     if pinned != 0 {
         log!("l4h-root: {} MiB of I/O pool kept out of use: a disk of a deleted guest could not be stopped", pinned >> 20);
     }
+}
+
+/// blkd has finished removing one of zombie `z`'s disks (`zombie_done`):
+/// after the last, no disk can reach its I/O pool, which goes then.
+pub fn zombie_disk_done(h: &mut Host, z: Option<usize>, pool_reusable: bool) {
+    if let Some(zb) = z.and_then(|z| h.zombies[z].as_mut()) {
+        zb.disk_waits -= 1;
+        if zb.disk_waits == 0 {
+            if let Some(a) = zb.cut_pool.take() {
+                h.alloc.reclaim(a);
+            }
+        }
+    }
+    zombie_done(h, z, pool_reusable);
 }
 
 fn guest_arg(id: usize) -> Result<usize, Errno> {
@@ -780,20 +805,31 @@ fn guest_del(h: &mut Host, id: usize) -> Result<u64, Errno> {
         h.alloc.slots.free_owned(id);
         return Ok(kept as u64);
     }
-    // No device reaches the pool any more: it goes now.
+    // No device can reach the pool any more, but a disk controller may
+    // still be finishing the guest's commands, and could reach it again
+    // once its domain maps another client's pool at the same addresses:
+    // with disks, the pool goes once blkd has drained them all
+    // (`zombie_disk_done`).  Without, it goes now.
     let pool = g.pool.paddr;
-    if cut {
+    let z = h.zombies.iter().position(Option::is_none);
+    let mut cut_pool = None;
+    if cut && (g.disks.is_empty() || z.is_some()) {
         if let Some(k) = g.arena.owned.iter().position(|o| o.1 == pool) {
             let (slot, paddr, bits) = g.arena.owned.remove(k);
             let mut a = Arena::new();
             a.own(slot, paddr, bits);
-            h.alloc.reclaim(a);
+            if g.disks.is_empty() {
+                h.alloc.reclaim(a);
+            } else {
+                cut_pool = Some(a);
+            }
         }
     }
-    let z = h.zombies.iter().position(Option::is_none);
     match z {
         Some(z) => {
-            h.zombies[z] = Some(Zombie { arena: g.arena, waits, pool: (!cut).then_some(pool), pin: false });
+            h.zombies[z] = Some(Zombie {
+                arena: g.arena, waits, pool: (!cut).then_some(pool), pin: false, cut_pool, disk_waits: g.disks.len(),
+            });
             h.alloc.slots.reown(id, zombie_owner(z));
         }
         None => {

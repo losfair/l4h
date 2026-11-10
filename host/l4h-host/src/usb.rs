@@ -221,6 +221,13 @@ pub type Sq = crate::spsc::Consumer;
 /// A queue usbd produces into: its head and the size (`room`).
 pub type Cq = crate::spsc::Producer;
 
+// The guest counts these queues' indices in free-running u32s and takes
+// slot i % size, and so does usbd where it looks at records by index
+// (read_record, drop_pending, post_cqe): the same slot as crate::spsc's
+// own position only for a size that divides 2^32.
+const _: () = assert!(abi::CTL_SQ_SIZE.is_power_of_two() && abi::XFER_SQ_SIZE.is_power_of_two()
+    && abi::CQ_SIZE.is_power_of_two() && abi::EQ_SIZE.is_power_of_two());
+
 /// Copy record `i` of `n` records of type T at `base`, which the guest can
 /// write while we read.
 ///
