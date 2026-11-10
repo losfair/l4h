@@ -50,8 +50,8 @@ pub fn set_target(alloc: &Alloc, g: usize, target: usize) -> bool {
 
 /// Hotplug target and plugged hotplug blocks of guest `g`.
 pub fn hotplug(g: usize) -> memd::GuestHp {
-    let st = proto::MEMD_STATUS_VA as *const Status;
-    unsafe { core::ptr::addr_of!((*st).hp[g]).read_volatile() }
+    // A page memd was writing at every look reads as nothing plugged.
+    unsafe { Status::read_at(proto::MEMD_STATUS_VA) }.map_or_else(memd::GuestHp::default, |st| st.hp[g])
 }
 
 /// Give guest `g`'s l4h-vmm, `vmm`, its capability to memd: root made it

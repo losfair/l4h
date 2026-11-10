@@ -23,7 +23,7 @@
 //! Blocks that stay free are reported to the hypervisor, if it takes free
 //! page reports (`balloon`), so that it can drop their memory.
 
-use l4h_rt::host::memd::{BLOCK_BITS, ORDERS, SLOT_DYN_BASE, TABLE_VA, UNIT_BYTES};
+use l4h_rt::host::memd::{BLOCK_BITS, HOST_RESERVE, ORDERS, SLOT_DYN_BASE, TABLE_VA, UNIT_BYTES};
 use l4h_rt::{cap, host, sel4};
 use sel4::{ObjectBlueprint, cap_type};
 
@@ -117,6 +117,12 @@ pub struct Mem {
     /// Merging below this order will find nothing until a block is freed.
     merged_below: usize,
     pub balloon: Option<Balloon>,
+    /// The device held a report longer than an allocation waits for one:
+    /// it gets no more reports and is not waited for again, so it stalls
+    /// memd once.  The blocks of that report stay out of use, since the
+    /// hypervisor may still drop their memory, until the device returns
+    /// them, if it ever does.
+    reports_off: bool,
 }
 
 /// Size of a block of order k, in bytes.
@@ -142,6 +148,7 @@ impl Mem {
             reporting: List::EMPTY,
             merged_below: 0,
             balloon: None,
+            reports_off: false,
         }
     }
 
@@ -274,13 +281,23 @@ impl Mem {
         self.merged_below = 0;
     }
 
+    /// Free memory that can be used: the blocks of a report in flight
+    /// come back, unless the device was given up on.
     pub fn free_bytes(&self) -> usize {
-        (0..ORDERS).map(|k| (self.free[k].len + self.reported[k].len) * bytes(k)).sum::<usize>() + self.reporting_bytes()
+        self.available_bytes() + if self.reports_off { 0 } else { self.reporting_bytes() }
     }
 
     /// Free memory that can be taken without waiting for a report.
     pub fn available_bytes(&self) -> usize {
         (0..ORDERS).map(|k| (self.free[k].len + self.reported[k].len) * bytes(k)).sum()
+    }
+
+    /// Whether `bytes` can be taken now, without waiting for a report,
+    /// and leave the hosts' reserve (HOST_RESERVE): what a guest may take
+    /// while it runs.  Root's and vmmgr's own requests are held to the
+    /// reserve by their `can_afford`, which counts on its being there.
+    pub fn spare(&self, bytes: usize) -> bool {
+        self.available_bytes() >= bytes.saturating_add(HOST_RESERVE)
     }
 
     fn reporting_bytes(&self) -> usize {
@@ -292,10 +309,14 @@ impl Mem {
         (0..ORDERS).map(|k| self.reported[k].len * bytes(k)).sum()
     }
 
-    /// Free blocks: (count, bytes of the largest).
+    /// Free blocks that can be used (as `free_bytes`): (count, bytes of
+    /// the largest).
     pub fn block_stats(&self) -> (usize, usize) {
-        let mut n = self.reporting.len;
-        let mut largest = self.iter(self.reporting).map(|i| bytes(self.order(i))).max().unwrap_or(0);
+        let (mut n, mut largest) = (0, 0);
+        if !self.reports_off {
+            n = self.reporting.len;
+            largest = self.iter(self.reporting).map(|i| bytes(self.order(i))).max().unwrap_or(0);
+        }
         for k in 0..ORDERS {
             let m = self.free[k].len + self.reported[k].len;
             n += m;
@@ -400,7 +421,7 @@ impl Mem {
     pub fn report_free(&mut self, now: u64, delay: u64) {
         self.finish_report(false);
         let Some(dev) = &self.balloon else { return };
-        if dev.busy() {
+        if dev.busy() || self.reports_off {
             return;
         }
         let cap = dev.capacity();
@@ -436,15 +457,21 @@ impl Mem {
     }
 
     /// Take back the blocks of the report in flight once the device is
-    /// done with it; `wait` waits for that.
+    /// done with it; `wait` waits for that, once: a device that did not
+    /// return a report in that time is given up on (`reports_off`).
     fn finish_report(&mut self, wait: bool) {
         let Some(dev) = &mut self.balloon else { return };
         if !dev.busy() {
             return;
         }
+        let wait = wait && !self.reports_off;
         if !dev.done(wait) {
             if wait {
-                l4h_rt::log!("memd: balloon: the device holds a free page report too long");
+                self.reports_off = true;
+                l4h_rt::log!(
+                    "memd: balloon: the device holds a free page report too long: no more reports, {} MiB out of use until it returns it",
+                    self.reporting_bytes() >> 20
+                );
             }
             return;
         }

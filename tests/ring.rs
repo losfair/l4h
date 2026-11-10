@@ -147,3 +147,95 @@ fn a_header_the_peer_writes_over_does_not_move_the_writer() {
     }
     assert_eq!(lost, 0);
 }
+
+/// Write the peer's count of bytes written over the ring's header.
+fn set_head(tx: &MsgRing, head: u64) {
+    unsafe { ((tx.va + MSG_RING_HEAD) as *mut u64).write_volatile(head) };
+}
+
+#[test]
+fn a_count_that_is_not_aligned_is_a_broken_writer() {
+    let (tx, mut rx) = ring(64 << 10);
+    let mut buf = vec![0u8; 256];
+    let mut lost = 0;
+    tx.send(MSG_FRAME, &[&frame(1, 100)]);
+    let head = tx.head();
+    // The peer's count is not a multiple of 8: what it covers is lost,
+    // also the message before it, and the reader waits there.
+    set_head(&tx, head + 5);
+    assert_eq!(rx.recv(&mut buf, &mut lost), None);
+    assert_eq!(lost, head + 5);
+    assert!(rx.is_empty());
+    assert_eq!(rx.recv(&mut buf, &mut lost), None);
+    assert_eq!(lost, head + 5);
+    // The writer's next count is aligned again (its own): the reader goes
+    // on from it, without reading a header at its unaligned position.
+    tx.send(MSG_FRAME, &[&frame(2, 100)]);
+    assert_eq!(rx.recv(&mut buf, &mut lost), None);
+    assert!(rx.is_empty() && rx.tail % 8 == 0);
+    tx.send(MSG_FRAME, &[&frame(3, 100)]);
+    let (ty, got) = rx.recv(&mut buf, &mut lost).expect("message");
+    assert_eq!((ty, got), (MSG_FRAME, 100));
+    assert!(intact(&buf[..got]) && buf[..8] == 3u64.to_le_bytes());
+}
+
+#[test]
+fn a_reader_that_starts_at_an_unaligned_count_reads_no_header_there() {
+    let mem: &'static mut [u64] = Box::leak(vec![0u64; (64usize << 10) / 8].into_boxed_slice());
+    let va = mem.as_ptr() as usize;
+    // The peer left an odd count before this side started.
+    unsafe { ((va + MSG_RING_HEAD) as *mut u64).write_volatile(1001) };
+    let (tx, _) = MsgRing::pair(va, 64 << 10, 0, 1);
+    let (_, rxr) = MsgRing::pair(va, 64 << 10, 1, 0);
+    let mut rx = MsgReader::new(rxr);
+    assert_eq!(rx.tail, 1001);
+    // What looks like a message at the reader's unaligned position.
+    for (i, b) in 16u32.to_le_bytes().into_iter().chain(MSG_FRAME.to_le_bytes()).enumerate() {
+        unsafe { ((va + MSG_RING_HEADER + 1001 + i) as *mut u8).write_volatile(b) };
+    }
+    set_head(&tx, 1001 + 24 + 7);
+    let mut buf = vec![0u8; 256];
+    let mut lost = 0;
+    assert_eq!(rx.recv(&mut buf, &mut lost), None);
+    assert!(lost > 0 && rx.tail % 8 == 0 && rx.is_empty());
+}
+
+#[test]
+fn padding_after_padding_is_not_read_record_by_record() {
+    let (tx, mut rx) = ring(64 << 10);
+    // The peer fills its ring with padding records of 8 bytes and
+    // publishes as many as a reader may be behind.
+    let n = (tx.cap - 2 * MsgRing::max_room(tx.cap)) / 8;
+    for i in 0..n {
+        unsafe {
+            ((tx.va + MSG_RING_HEADER + 8 * i as usize) as *mut u32).write_volatile(8);
+            ((tx.va + MSG_RING_HEADER + 8 * i as usize + 4) as *mut u32).write_volatile(MSG_PAD);
+        }
+    }
+    set_head(&tx, 8 * n);
+    let mut buf = vec![0u8; 256];
+    let mut lost = 0;
+    // One call reads two of them and gives up on the rest.
+    assert_eq!(rx.recv(&mut buf, &mut lost), None);
+    assert_eq!(lost, 8 * n - 16);
+    assert!(rx.is_empty());
+}
+
+#[test]
+fn padding_at_the_end_of_the_ring_is_skipped() {
+    let (tx, mut rx) = ring(64 << 10);
+    let mut buf = vec![0u8; 2048];
+    let mut lost = 0;
+    // Three laps, read as they are written: every message arrives, also
+    // those after the padding at the ring's end.
+    let mut seq = 1;
+    while tx.head() < 3 * tx.cap {
+        tx.send(MSG_FRAME, &[&frame(seq, 1000 + seq as usize % 7)]);
+        let (ty, got) = rx.recv(&mut buf, &mut lost).expect("message");
+        assert_eq!(ty, MSG_FRAME);
+        assert!(intact(&buf[..got]) && buf[..8] == seq.to_le_bytes());
+        seq += 1;
+    }
+    assert_eq!(rx.recv(&mut buf, &mut lost), None);
+    assert_eq!(lost, 0);
+}

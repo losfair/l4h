@@ -40,6 +40,9 @@ const DEVICE_TRANSITIONAL: u16 = 0x1002;
 const VIRTIO_PCI_CAP_COMMON_CFG: u8 = 1;
 const VIRTIO_PCI_CAP_NOTIFY_CFG: u8 = 2;
 const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
+/// Bytes of the common configuration structure that memd's driver reads
+/// and writes: through queue_device (virtio 1.x §4.1.4.3).
+const VIRTIO_COMMON_CFG_LEN: u32 = 0x38;
 
 fn root_cap<T: sel4::CapType>(s: Slot) -> sel4::Cap<T> {
     sel4::init_thread::Slot::<T>::from_index(s).cap()
@@ -119,6 +122,12 @@ impl Memd {
             else {
                 return;
             };
+            // pci.rs keeps a structure that lies inside its BAR, whatever
+            // its length: one shorter than what the driver touches could
+            // end where the BAR's mapping does, and memd would fault.
+            if common.length < VIRTIO_COMMON_CFG_LEN {
+                return;
+            }
             // BARs mapped, one bit each.
             let mut mapped = 0u8;
             for c in [common, notify, device] {
@@ -242,7 +251,7 @@ pub fn spawn(alloc: &mut Alloc, win: &mut Window, asids: &mut AsidPools, info: &
     alloc.hand_over(link);
     info!(
         "l4h-root: memd holds {} MiB, {} KiB of CNode, {} KiB of table",
-        link.status().free_bytes >> 20, (32usize << bits) >> 10, table_pages * PAGE >> 10
+        link.status().map_or(0, |s| s.free_bytes) >> 20, (32usize << bits) >> 10, table_pages * PAGE >> 10
     );
     m
 }

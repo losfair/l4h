@@ -169,18 +169,40 @@ pub mod host {
         pub const HP_SHARE: u64 = 125;
         pub const HP_BURST_US: u64 = 16_000;
         pub const HP_CALL_US: u64 = 1_000;
+        pub const HP_CALLS: u64 = 64;
+        pub const HP_CALL_GAP_US: u64 = 31_250;
+        pub const HOST_RESERVE: usize = 32 << 20;
     }
 }
 
 mod balloon {
     pub const QUEUE_SIZE: usize = 32;
     pub const MAX_DESC_BITS: usize = 31;
-    pub struct Balloon;
+    /// A reporting device under the test's control: whether it returns
+    /// the report in flight when asked, and what memd did with it.
+    #[derive(Default)]
+    pub struct Balloon {
+        pub busy: bool,
+        pub returns: bool,
+        /// Reports made, and times memd waited for one.
+        pub reports: usize,
+        pub waits: usize,
+    }
     impl Balloon {
-        pub fn busy(&self) -> bool { false }
+        pub fn busy(&self) -> bool { self.busy }
         pub fn capacity(&self) -> usize { QUEUE_SIZE }
-        pub fn done(&mut self, _: bool) -> bool { true }
-        pub fn report(&mut self, _: &[(usize, usize)]) { unreachable!() }
+        pub fn done(&mut self, wait: bool) -> bool {
+            if self.busy {
+                self.waits += wait as usize;
+                self.busy = !self.returns;
+            }
+            !self.busy
+        }
+        pub fn report(&mut self, ranges: &[(usize, usize)]) {
+            assert!(!self.busy && !ranges.is_empty());
+            self.busy = true;
+            self.reports += 1;
+        }
     }
 }
 
@@ -373,4 +395,100 @@ fn hotplug_bucket_bounds_calls_and_time() {
     assert_eq!(b.admit(0), Some(16_000));
     b.charge(u64::MAX);
     assert_eq!(b.admit(u64::MAX), None);
+}
+
+#[test]
+fn a_vmm_makes_only_so_many_calls() {
+    use bucket::Bucket;
+    let mut b = Bucket::full(0);
+    // 64 at once, whatever they ask, then one every 1/32 s.
+    for _ in 0..64 {
+        assert!(b.call(0));
+    }
+    assert!(!b.call(0));
+    assert!(!b.call(31_249));
+    assert!(b.call(31_250));
+    assert!(!b.call(31_250));
+    assert_eq!((0..=2_000).filter(|&ms| b.call(31_250 + ms * 1_000)).count(), 64);
+    // Refused calls cost the guest none of its time, and a guest in debt
+    // for a slow unplug can still ask for its state.
+    assert_eq!(b.admit(2_031_250), Some(16_000));
+    b.charge(u64::MAX);
+    assert_eq!(b.admit(3_000_000), None);
+    assert!(b.call(3_000_000));
+    // Time far apart or going back neither wraps nor overfills.
+    let mut b = Bucket::full(1_000_000);
+    assert_eq!((0..100).filter(|_| b.call(0)).count(), 64);
+    assert_eq!((0..100).filter(|_| b.call(u64::MAX)).count(), 64);
+    assert!(!b.call(0));
+}
+
+#[test]
+fn a_plug_leaves_the_hosts_reserve() {
+    let mut f = Fixture::new();
+    // 8 MiB free: less than the reserve, so a guest gets none of it.
+    assert!(!f.d.mem.spare(0));
+    assert!(!f.d.mem.spare(2 << 20));
+    kernel(|k| { k.caps.insert(xchg(Client::Root, 0).0, (16 << BLOCK_BITS, 16 << BLOCK_BITS)); });
+    assert_eq!(f.d.free(Client::Root, &batch(&[(16, BLOCK_BITS + 4)])), 0);
+    // 40 MiB: 8 beyond the reserve, and not a byte more.
+    assert!(f.d.mem.spare(8 << 20));
+    assert!(!f.d.mem.spare((8 << 20) + 1));
+    assert!(!f.d.mem.spare(usize::MAX));
+    f.grant(Client::Vmmgr, 0);
+    assert!(f.d.mem.spare(6 << 20));
+    assert!(!f.d.mem.spare(8 << 20));
+    // Blocks in a report in flight are not there to take.
+    f.d.mem.balloon = Some(balloon::Balloon::default());
+    f.d.mem.report_free(1 << 40, 0);
+    assert_eq!(f.d.mem.available_bytes(), 0);
+    assert!(!f.d.mem.spare(0));
+}
+
+#[test]
+fn a_device_that_holds_a_report_stalls_memd_once() {
+    let mut f = Fixture::new();
+    f.d.mem.balloon = Some(balloon::Balloon::default());
+    let dev = |f: &Fixture| { let b = f.d.mem.balloon.as_ref().unwrap(); (b.reports, b.waits) };
+    f.d.mem.report_free(1 << 40, 0);
+    assert_eq!(dev(&f), (1, 0));
+    assert_eq!((f.d.mem.free_bytes(), f.d.mem.available_bytes()), (8 << 20, 0));
+    // An allocation waits for the report, which does not come back.
+    assert_eq!(f.d.alloc(Client::Root, BLOCK_BITS, 1).err(), Some(ENOMEM));
+    assert_eq!(dev(&f), (1, 1));
+    // The next ones do not wait again, and the blocks the device holds
+    // are neither used nor counted as free.
+    for _ in 0..3 {
+        assert_eq!(f.d.alloc(Client::Vmmgr, BLOCK_BITS, 1).err(), Some(ENOMEM));
+    }
+    f.d.mem.report_free(2 << 40, 0);
+    assert_eq!(dev(&f), (1, 1));
+    assert_eq!(f.d.mem.free_bytes(), 0);
+    assert_eq!(f.d.mem.block_stats(), (0, 0));
+    // Should it return the report after all, the blocks are used again,
+    // but it gets no other report.
+    f.d.mem.balloon.as_mut().unwrap().returns = true;
+    f.d.mem.report_free(3 << 40, 0);
+    assert_eq!(f.d.mem.free_bytes(), 8 << 20);
+    let (root, slot) = f.grant(Client::Root, 1);
+    xchg(Client::Root, 0).move_(&abs(slot)).unwrap();
+    assert_eq!(f.d.free(Client::Root, &batch(&[(root, BLOCK_BITS + 1)])), 0);
+    f.d.mem.report_free(4 << 40, 0);
+    assert_eq!(dev(&f), (1, 1));
+    assert_eq!(f.grant(Client::Root, 2).0, 8);
+}
+
+#[test]
+fn a_device_that_returns_its_reports_keeps_getting_them() {
+    let mut f = Fixture::new();
+    f.d.mem.balloon = Some(balloon::Balloon { returns: true, ..Default::default() });
+    f.d.mem.report_free(1 << 40, 0);
+    // The allocation waits for the report in flight, and gets the block.
+    let (root, slot) = f.grant(Client::Root, 2);
+    assert_eq!(root, 8);
+    xchg(Client::Root, 0).move_(&abs(slot)).unwrap();
+    assert_eq!(f.d.free(Client::Root, &batch(&[(root, BLOCK_BITS + 2)])), 0);
+    f.d.mem.report_free(2 << 40, 0);
+    let b = f.d.mem.balloon.as_ref().unwrap();
+    assert_eq!((b.reports, b.waits), (2, 1));
 }

@@ -98,8 +98,7 @@ impl Console {
         unsafe {
             addr_of_mut!((*self.ring).data[(self.head % host::CONSOLE_RING_DATA as u64) as usize]).write_volatile(c);
             self.head = self.head.wrapping_add(1);
-            fence(Ordering::Release);
-            addr_of_mut!((*self.ring).head).write_volatile(self.head);
+            (*self.ring).head.store(self.head, Ordering::Release);
         }
         if self.serial {
             if c == b'\n' {

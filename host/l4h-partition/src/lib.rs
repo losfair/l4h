@@ -479,9 +479,23 @@ impl MsgReader {
         self.ring.head() == self.tail
     }
 
+    /// What the writer published up to `head` is lost (overwritten, or a
+    /// broken writer's): go on from there.
+    fn lose(&mut self, head: u64, lost: &mut u64) -> Option<(u32, usize)> {
+        *lost = lost.saturating_add(head.wrapping_sub(self.tail));
+        self.tail = head;
+        None
+    }
+
     /// The next message, copied into `buf` (cut to fit): (type, length),
     /// or None.  `lost` counts the bytes the writer overwrote unread.
+    ///
+    /// One call reads at most two records, whatever the writer (the other
+    /// partition) put in the ring: a message, or the padding at the ring's
+    /// end and the message at its start.  A caller that bounds its calls
+    /// bounds its work.
     pub fn recv(&mut self, buf: &mut [u8], lost: &mut u64) -> Option<(u32, usize)> {
+        let mut padded = false;
         loop {
             let head = self.ring.head();
             // The head before the message it covers (x86 orders loads).
@@ -490,25 +504,23 @@ impl MsgReader {
                 return None;
             }
             if self.ring.overrun(head, self.tail) {
-                *lost = lost.saturating_add(head.wrapping_sub(self.tail));
-                self.tail = head;
-                return None;
+                return self.lose(head, lost);
             }
             let pos = self.tail % self.ring.cap;
-            // The peer's count, which places the header: inside the ring.
-            if self.ring.cap - pos < 8 {
-                *lost = lost.saturating_add(head.wrapping_sub(self.tail));
-                self.tail = head;
-                return None;
+            // The peer's count places the header.  Counts are multiples of
+            // 8 (`MsgRing::send` pads to it), which keeps every header
+            // aligned and inside the ring: one that is not is a broken
+            // writer's.  The reader then waits at that count, and goes on
+            // from the next one that is aligned.
+            if head % 8 != 0 || pos % 8 != 0 || self.ring.cap - pos < 8 {
+                return self.lose(head, lost);
             }
             let (len, ty) = unsafe {
                 ((self.ring.data(pos) as *const u32).read_volatile() as u64, (self.ring.data(pos + 4) as *const u32).read_volatile())
             };
             let room = len.next_multiple_of(8);
             if len < 8 || pos + room > self.ring.cap {
-                *lost = lost.saturating_add(head.wrapping_sub(self.tail));
-                self.tail = head;
-                return None;
+                return self.lose(head, lost);
             }
             let n = (len as usize - 8).min(buf.len());
             if ty != MSG_PAD {
@@ -517,14 +529,22 @@ impl MsgReader {
             // Overwritten while it was copied, or being overwritten: lost.
             // The copy before the head that says so.
             core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-            if self.ring.overrun(self.ring.head(), self.tail) {
-                continue;
+            let now = self.ring.head();
+            if self.ring.overrun(now, self.tail) {
+                return self.lose(now, lost);
             }
             // The peer writes head: counts compare wrapping (`overrun`).
             self.tail = self.tail.wrapping_add(room);
             if ty != MSG_PAD {
                 return Some((ty, n));
             }
+            // Padding fills the rest of the ring, and the message that did
+            // not fit follows at its start: padding after padding is a
+            // broken writer's, not read record by record.
+            if padded {
+                return self.lose(head, lost);
+            }
+            padded = true;
         }
     }
 

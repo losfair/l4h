@@ -62,7 +62,8 @@ pub const MAX_NICS: usize = 4;
 /// to each other partition.  Link l's doorbell (and netd's own kick to
 /// read on later) signals badges::netd::LINK bit l.
 pub const MAX_LINKS: usize = 7;
-/// A link's channel, at most (l4h_partition::LINK_CHANNEL_SIZE).
+/// Room for a link's channel in netd's address space: a channel is
+/// l4h_partition::LINK_CHANNEL_SIZE bytes, which root and netd check.
 pub const LINK_CHANNEL_MAX: usize = 2 << 20;
 /// Switches: one per port and NIC is the most that can carry traffic at
 /// once.  Root refuses to create more, so netd keeps a fixed table of them
@@ -138,7 +139,8 @@ crate::protocol! {
         SteerSet / steer_set = 8 from [Root] (rule: usize, ep: usize, matches: u64, ip_hi: u64, ip_lo: u64, targets: u64) -> ();
         SteerDel / steer_del = 9 from [Root] (rule: usize) -> ();
         /// Link `link` to partition `peer`, on `switch`, with a channel of
-        /// `size` bytes mapped at link_va(link) and the NETD_SLOT_LINK_*
+        /// `size` bytes (l4h_partition::LINK_CHANNEL_SIZE: netd refuses
+        /// another) mapped at link_va(link) and the NETD_SLOT_LINK_*
         /// capabilities given.  Links last until the machine reboots.
         AddLink / add_link = 11 from [Root] (link: usize, switch: usize, size: u64, me: u32, peer: u32) -> ();
         /// `crate::TEST_INJECT` only: panic.

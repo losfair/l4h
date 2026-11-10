@@ -24,9 +24,13 @@ pub fn set_failure_handler(handler: &'static FailureHandler) {
 }
 
 /// Answer the callers of a failed component (host::has_keeper): wire::FAILED
-/// to every call, the one the main thread's reply object holds (if any)
-/// first.  Faults sent to it (vmmgr's guests' and VMMs') stay unanswered.
-/// Not l4h_ipc::run: it serves no protocol, and starts by answering.
+/// to every call, the one the main thread was serving first, if it was
+/// serving one (`ipc::holds_call`: its reply object is in SLOT_REPLY).
+/// Faults sent to it (vmmgr's guests' and VMMs') stay unanswered, the one
+/// it was handling when it failed too: a reply would restart that thread,
+/// with the reply's word in a register.  The first receive on the reply
+/// object lets go of it instead, which leaves the thread stopped.
+/// Not l4h_ipc::run: it serves no protocol, and may start by answering.
 #[allow(clippy::disallowed_methods)]
 pub(crate) fn answer_failed(tcb: u64) -> ! {
     let handler = unsafe { HANDLER.load(Ordering::Acquire).as_ref() };
@@ -43,7 +47,7 @@ pub(crate) fn answer_failed(tcb: u64) -> ! {
     }
     let ep = cap::<sel4::cap_type::Endpoint>(host::SLOT_SERVICE_EP);
     let reply = cap::<sel4::cap_type::Reply>(host::SLOT_REPLY);
-    let mut answer = true;
+    let mut answer = crate::ipc::holds_call();
     loop {
         let (_, badge) = if answer {
             ep.reply_recv(crate::ipc::reply(&[host::wire::FAILED]), reply)

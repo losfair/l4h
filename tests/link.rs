@@ -9,6 +9,8 @@ extern crate self as l4h_rt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 static BASE: AtomicUsize = AtomicUsize::new(0);
 static SIGNALS: AtomicUsize = AtomicUsize::new(0);
+/// BASE and SIGNALS are one test's at a time.
+static ONE_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub fn cap<T: Default>(_: u64) -> T {
     T::default()
 }
@@ -52,6 +54,7 @@ mod link;
 
 #[test]
 fn a_large_batch_wakes_a_sleeping_peer_before_the_end_of_the_poll() {
+    let _one = ONE_TEST.lock().unwrap_or_else(|e| e.into_inner());
     let mut memory = vec![0u64; LINK_CHANNEL_SIZE as usize / 8];
     BASE.store(memory.as_mut_ptr() as usize, Ordering::SeqCst);
     SIGNALS.store(0, Ordering::SeqCst);
@@ -99,13 +102,42 @@ fn a_large_batch_wakes_a_sleeping_peer_before_the_end_of_the_poll() {
     assert!(link.can_send_gso(frame.len()));
     link.send_gso(&frame, &hdr);
     let mut buf = vec![0; host::net::MAX_FRAME + host::net::HDR_SIZE + 1];
-    let (received, received_hdr) = receiver.recv(&mut buf).unwrap();
+    let link::Received::Frame(received, received_hdr) = receiver.recv(&mut buf) else { panic!("no frame") };
     assert_eq!(received, frame);
     assert_eq!(received_hdr, hdr);
     assert_eq!(receiver.lost, 0);
 
     hdr[6..8].copy_from_slice(&0u16.to_le_bytes());
     link.send_gso(&frame, &hdr);
-    assert!(receiver.recv(&mut buf).is_none());
+    assert!(matches!(receiver.recv(&mut buf), link::Received::Dropped));
     assert_eq!(receiver.drops, 1);
+    assert!(matches!(receiver.recv(&mut buf), link::Received::Empty));
+}
+
+/// One look at the ring takes one record, whatever it is: netd counts its
+/// looks, so records it drops cost a peer as much budget as frames.
+#[test]
+fn a_look_takes_one_record_whether_it_is_dropped_or_not() {
+    let _one = ONE_TEST.lock().unwrap_or_else(|e| e.into_inner());
+    let mut memory = vec![0u64; LINK_CHANNEL_SIZE as usize / 8];
+    BASE.store(memory.as_mut_ptr() as usize, Ordering::SeqCst);
+    let (peer_tx, _) = MsgRing::pair(memory.as_mut_ptr() as usize, LINK_CHANNEL_SIZE, 1, 0);
+    let mut link = link::Link::new(0, 0, LINK_CHANNEL_SIZE, 0, 1);
+    let mut buf = vec![0; host::net::MAX_FRAME + host::net::HDR_SIZE + 1];
+    // Records of an unknown type, a frame too short to be one, an offload
+    // header with no GSO type, then a frame.
+    for _ in 0..100 {
+        peer_tx.send(99, &[]);
+    }
+    peer_tx.send(MSG_FRAME, &[&[0u8; 13]]);
+    peer_tx.send(MSG_FRAME_GSO, &[&[0u8; 12 + 60]]);
+    peer_tx.send(MSG_FRAME, &[&[0x42u8; 60]]);
+    for dropped in 1..=102 {
+        assert!(matches!(link.recv(&mut buf), link::Received::Dropped));
+        assert_eq!(link.drops, dropped);
+    }
+    let link::Received::Frame(frame, hdr) = link.recv(&mut buf) else { panic!("no frame") };
+    assert_eq!((frame.len(), hdr), (60, [0; host::net::HDR_SIZE]));
+    assert!(matches!(link.recv(&mut buf), link::Received::Empty));
+    assert_eq!((link.drops, link.rx_frames, link.lost), (102, 1, 0));
 }

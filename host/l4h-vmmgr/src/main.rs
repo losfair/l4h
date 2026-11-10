@@ -68,7 +68,7 @@ const _: () = assert!(MAX_GUESTS <= host::memd::MAX_GUESTS);
 /// The guests, by id: too large for a stack.
 static GUESTS: StaticCell<[Option<Guest>; MAX_GUESTS]> = StaticCell::new([const { None }; MAX_GUESTS]);
 /// Memory and CNode slots kept back from guest requests.
-const RESERVE_BYTES: usize = 32 << 20;
+const RESERVE_BYTES: usize = host::memd::HOST_RESERVE;
 const RESERVE_SLOTS: usize = 16384;
 
 
@@ -193,15 +193,24 @@ pub struct Vmmgr {
 pub enum RootOp {
     /// Disk device `d` of guest `id` (instance `instance`).
     Disk { id: usize, instance: u64, d: usize, then: Then },
-    /// A host op of a control request (Then::Ctl).
-    HostOp { then: Then },
+    /// A host op of the control request `waits`.
+    HostOp { waits: CtlWait },
+}
+
+/// A control request that waits for root's answer: dom0 `caller`'s
+/// (`instance`) request `seq`.
+#[derive(Clone, Copy)]
+pub struct CtlWait {
+    pub caller: usize,
+    pub instance: u64,
+    pub seq: u32,
 }
 
 /// What follows a request root answered later.
 #[derive(Clone, Copy)]
 pub enum Then {
-    /// Answer dom0 `caller`'s control request `seq`.
-    Ctl { caller: usize, instance: u64, seq: u32 },
+    /// Answer the control request.
+    Ctl(CtlWait),
     /// Go on booting dom0, after its boot disk `k`.
     Dom0Boot { k: usize },
 }
@@ -320,15 +329,15 @@ impl Vmmgr {
                 Some(RootOp::Disk { id, instance, d, then }) => {
                     let r = self.disk_attached(id, instance, d, t);
                     match then {
-                        Then::Ctl { caller, instance, seq } => ctl::answer(self, caller, instance, seq, r.map(|()| [0; 6])),
+                        Then::Ctl(waits) => ctl::answer(self, waits, r.map(|()| [0; 6])),
                         Then::Dom0Boot { k } => dom0_disk_done(self, id, instance, k, r),
                     }
                 }
-                Some(RootOp::HostOp { then: Then::Ctl { caller, instance, seq } }) => {
+                Some(RootOp::HostOp { waits }) => {
                     let r = root::host_op_result(t);
-                    ctl::answer(self, caller, instance, seq, r);
+                    ctl::answer(self, waits, r);
                 }
-                Some(RootOp::HostOp { then: Then::Dom0Boot { .. } }) | None => root::discard(t),
+                None => root::discard(t),
             }
         }
     }
@@ -373,24 +382,35 @@ impl Vmmgr {
             if g.state != State::Created || g.vmm.is_some() || g.root_pending {
                 return Err(ctl::EBUSY);
             }
-            let maps: usize = g.backends.iter().map(|(_, b)| b.map_bytes()).sum();
-            if !g.reserve(&mut h.alloc, vmm::start_bytes(g.pool.size, g.vcpus.len(), g.devices.len()) + maps) {
+            if !g.reserve(&mut h.alloc, g.start_bytes()) {
                 return Err(ctl::ENOMEM);
             }
-            if g.attest {
-                root::trust_register(g);
-            }
-            let v = vmm::spawn(g, &mut h.alloc, &mut h.wins.a, &mut h.asids, &h.info);
-            component::start(&v);
-            g.vmm = Some(v);
+            h.spawn_vmm(g);
             Ok(())
         })
         .ok_or(ctl::ENOENT)?
     }
 
+    /// Spawn `g`'s l4h-vmm, within `with_guest`.  The caller checked that
+    /// `g` is created, without a VMM or a device root is attaching, and
+    /// reserved `Guest::start_bytes`: nothing here is refused, so a guest
+    /// that was booted for it starts.
+    pub fn spawn_vmm(&mut self, g: &mut Guest) {
+        if g.attest {
+            root::trust_register(g);
+        }
+        let v = vmm::spawn(g, &mut self.alloc, &mut self.wins.a, &mut self.asids, &self.info);
+        component::start(&v);
+        g.vmm = Some(v);
+    }
+
     /// Give guest `id` (before it starts) a virtio-net device on `switch`.
     /// Returns the MAC.
     pub fn create_nic(&mut self, id: usize, switch: u32, mac: u64, lock: bool, isolated: bool) -> Result<u64, Errno> {
+        // What root would refuse, before anything is made for the port.
+        if !proto::nic_mac_ok(mac) {
+            return Err(ctl::EINVAL);
+        }
         if !self.can_afford(1 << 20, 0, 0) {
             return Err(ctl::ENOMEM);
         }
@@ -404,7 +424,21 @@ impl Vmmgr {
                 return Err(ctl::ENOSPC);
             }
             let d = g.devices.len();
-            let backend = root::nic_add(&mut h.alloc, &mut g.arena, id, switch, mac, lock, isolated)?;
+            // The CNode of the VMM's mappings is made first, as it may not
+            // fit, and an arena gives nothing back: one that root's refusal
+            // (the switch, netd's ports) left unused is the next request's,
+            // so refused requests take no more than one.
+            let keep = match g.port_spare.take() {
+                Some(keep) => keep,
+                None => root::port_keep(&mut h.alloc, &mut g.arena).ok_or(ctl::ENOMEM)?,
+            };
+            let backend = match root::nic_add(&mut h.alloc, keep, id, switch, mac, lock, isolated) {
+                Ok(backend) => backend,
+                Err(e) => {
+                    g.port_spare = Some(keep);
+                    return Err(e);
+                }
+            };
             let mac = match &backend {
                 vmm::Backend::Net { mac, .. } => mac.iter().fold(0, |m, &b| m << 8 | b as u64),
                 _ => unreachable!(),

@@ -531,7 +531,19 @@ impl Ena {
         let bufs = TX_BUFS.min(tx_depth as usize / 2 - 1);
         let rx_bufs = RX_BUFS.min(rx_depth as usize - 1);
         let rings = tx_depth as usize * (TX_DESC + TX_CDESC) + rx_depth as usize * (RX_DESC + RX_CDESC);
-        let need = rings + 4 * 4096 + bufs * e.tx_buf + rx_bufs * RX_BUF;
+        let mut need = rings + 4 * 4096 + bufs * e.tx_buf + rx_bufs * RX_BUF;
+        // The RSS table, whose size is the device's: counted here with the
+        // rest, or left as the device has it if there is no room for it.
+        let mut rss_log = if e.has(FEAT_RSS_INDIRECTION_TABLE) { e.rss_table_log() } else { None };
+        if let Some(log) = rss_log {
+            let bytes = Self::rss_table_bytes(log) + 64;
+            if need <= dma.remaining() && bytes > dma.remaining() - need {
+                l4h_rt::log!("netd: NIC {}: no DMA memory for an ENA RSS table of 2^{} entries: default table kept", n, log);
+                rss_log = None;
+            } else {
+                need += bytes;
+            }
+        }
         if need > dma.remaining() {
             panic!("netd: NIC {}: ENA queue depths tx {} rx {} need {} KiB of DMA memory, {} KiB left",
                 n, tx_depth, rx_depth, need >> 10, dma.remaining() >> 10);
@@ -574,8 +586,8 @@ impl Ena {
         }
 
         // Received frames all go to the one RX queue, and up to the MTU.
-        if e.has(FEAT_RSS_INDIRECTION_TABLE) {
-            e.set_rss_table(&mut dma, rx_sq);
+        if let Some(log) = rss_log {
+            e.set_rss_table(&mut dma, rx_sq, log);
         }
         let mtu = (max_frame - 18) as u32;
         if e.has(FEAT_MTU) {
@@ -778,21 +790,32 @@ impl Ena {
         self.regs.0 + off as usize
     }
 
-    /// Send every received frame to RX queue `sq` (Linux sets the table
-    /// for its queues, naming each by its SQ; the device's default need not
-    /// name this one).
-    fn set_rss_table(&mut self, dma: &mut Dma, sq: u16) {
-        let Ok(t) = self.try_exec(Cmd::feature(AQ_GET_FEATURE, FEAT_RSS_INDIRECTION_TABLE, 0)) else {
-            return;
-        };
+    /// The size (log2 of the entries) of the RSS table netd would set:
+    /// RSS_TABLE_LOG within the device's limits, or None if the device
+    /// does not say or its table is larger than netd makes one.
+    fn rss_table_log(&mut self) -> Option<u16> {
+        let t = self.try_exec(Cmd::feature(AQ_GET_FEATURE, FEAT_RSS_INDIRECTION_TABLE, 0)).ok()?;
         let log = RSS_TABLE_LOG.clamp(le16(&t, 8), le16(&t, 10).max(le16(&t, 8)));
         // The device's minimum can be any u16: past 15 the shift and size
-        // below would wrap.
+        // of the table would wrap.
         if log > 15 {
             l4h_rt::log!("netd: NIC {}: ENA RSS table of 2^{} entries: default table kept", self.n, log);
-            return;
+            return None;
         }
-        let len = (1usize << log) * 4;
+        Some(log)
+    }
+
+    /// Bytes of an RSS table of 2^`log` entries (`log` at most 15).
+    fn rss_table_bytes(log: u16) -> usize {
+        (1usize << log) * 4
+    }
+
+    /// Send every received frame to RX queue `sq` (Linux sets the table
+    /// for its queues, naming each by its SQ; the device's default need not
+    /// name this one), with a table of 2^`log` entries (`rss_table_log`),
+    /// whose memory `new` counted before it made the queues.
+    fn set_rss_table(&mut self, dma: &mut Dma, sq: u16, log: u16) {
+        let len = Self::rss_table_bytes(log);
         let (va, pa) = dma.alloc(len, 64);
         for i in 0..1 << log {
             unsafe { write_volatile((va + i * 4) as *mut u16, sq.to_le()) };

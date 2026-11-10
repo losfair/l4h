@@ -7,7 +7,7 @@
 use core::sync::atomic::{Ordering, fence};
 
 use l4h_host::errno::Errno;
-use sel4::{ObjectBlueprint, cap_type};
+use sel4::{ObjectBlueprint, cap, cap_type};
 
 use l4h_abi as abi;
 use l4h_host as host;
@@ -60,27 +60,71 @@ pub fn table_bytes(pages: usize) -> usize {
     (pages / 512 + 2) * PAGE
 }
 
-/// The frames of a GPU with one scanout of `width` x `height`, its display
-/// area mapped in vmmgr.  ENOMEM if the host has too little memory;
-/// what was allocated by then stays in the guest's arena until destroy.
-pub fn attach(g: &mut Guest, alloc: &mut Alloc, width: u32, height: u32) -> Result<Backend, Errno> {
-    let (n, radix) = frames(width, height);
-    // The CNodes are larger than reserve guarantees: they may not fit.
-    let mut cnode = || {
-        let s = g.arena.try_object(alloc, ObjectBlueprint::CNode { size_bits: radix }).ok_or(ENOMEM)?;
-        Ok::<_, Errno>(sel4::init_thread::Slot::<cap_type::CNode>::from_index(s).cap())
+/// What `attach` makes in the guest's arena before it maps anything: kept
+/// with the guest if the host ran out of memory on the way, since an arena
+/// gives nothing back, so that attaches made again go on from it and
+/// leave no more behind than one attach takes.
+pub struct Parts {
+    /// Radix of both CNodes: at least what the scanout asked for needs.
+    radix: usize,
+    /// The frames, the first `made` of them made.
+    frames: cap::CNode,
+    made: usize,
+    /// For l4h-vmm's mapping capabilities.
+    keep: Option<cap::CNode>,
+}
+
+/// A CNode of `radix` in the guest's arena.  It is larger than reserve
+/// guarantees: it may not fit.
+fn cnode(g: &mut Guest, alloc: &mut Alloc, radix: usize) -> Result<cap::CNode, Errno> {
+    let s = g.arena.try_object(alloc, ObjectBlueprint::CNode { size_bits: radix }).ok_or(ENOMEM)?;
+    Ok(sel4::init_thread::Slot::<cap_type::CNode>::from_index(s).cap())
+}
+
+/// Make what `parts` lacks of a GPU of `n` frames: its second CNode.
+fn complete(g: &mut Guest, alloc: &mut Alloc, parts: &mut Parts, n: usize) -> Result<cap::CNode, Errno> {
+    let keep = match parts.keep {
+        Some(keep) => keep,
+        None => *parts.keep.insert(cnode(g, alloc, parts.radix)?),
     };
-    let frames = cnode()?;
-    let keep = cnode()?;
-    if !g.reserve(alloc, n * PAGE) {
+    if !g.reserve(alloc, n.saturating_sub(parts.made) * PAGE) {
         return Err(ENOMEM);
     }
-    let mut i = 0;
-    while i < n {
-        let k = (n - i).min(FRAME_BATCH);
-        g.arena.retype(alloc, &FRAME_BP, k, Dest { cnode: abs(frames), offset: i }).ok_or(ENOMEM)?;
-        i += k;
+    while parts.made < n {
+        let k = (n - parts.made).min(FRAME_BATCH);
+        g.arena.retype(alloc, &FRAME_BP, k, Dest { cnode: abs(parts.frames), offset: parts.made }).ok_or(ENOMEM)?;
+        parts.made += k;
     }
+    Ok(keep)
+}
+
+/// The frames of a GPU with one scanout of `width` x `height`, its display
+/// area mapped in vmmgr.  ENOMEM if the host has too little memory: what
+/// was made by then is the guest's next attach's (`Parts`).
+pub fn attach(g: &mut Guest, alloc: &mut Alloc, width: u32, height: u32) -> Result<Backend, Errno> {
+    let (n, radix) = frames(width, height);
+    // What an earlier attach left, if its CNodes hold this scanout (they
+    // hold any that is no larger).  One that is too small stays in the
+    // arena unused: each one replaced is larger than the last, so they add
+    // up to less than two GPUs of the largest size.
+    let mut parts = match g.gpu_parts.take() {
+        Some(parts) if parts.radix >= radix => parts,
+        smaller => match cnode(g, alloc, radix) {
+            Ok(frames) => Parts { radix, frames, made: 0, keep: None },
+            Err(e) => {
+                g.gpu_parts = smaller;
+                return Err(e);
+            }
+        },
+    };
+    let keep = match complete(g, alloc, &mut parts, n) {
+        Ok(keep) => keep,
+        Err(e) => {
+            g.gpu_parts = Some(parts);
+            return Err(e);
+        }
+    };
+    let (radix, frames) = (parts.radix, parts.frames);
     let pages = display_pages(width, height);
     let va = self_display_va(g.id);
     for p in 0..pages {
@@ -101,12 +145,14 @@ pub fn attach(g: &mut Guest, alloc: &mut Alloc, width: u32, height: u32) -> Resu
 pub fn read(g: &Guest, offset: u64, to: *mut u8, before_copy: impl FnOnce(bool) -> Result<(), Errno>) -> Result<[u64; 6], Errno> {
     let (width, height) = g.gpu.ok_or(EINVAL)?;
     let base = self_display_va(g.id);
-    let hdr = unsafe { &*(base as *const DisplayHeader) };
-    let frame = hdr.frame.load(Ordering::Acquire);
+    // l4h-vmm's to write: only its atomics are referred to.
+    let hdr = base as *const DisplayHeader;
+    let (seq, format) = unsafe { (&(*hdr).frame, &(*hdr).format) };
+    let frame = seq.load(Ordering::Acquire);
     if frame & 1 != 0 {
         return Err(EAGAIN);
     }
-    let format = unsafe { core::ptr::addr_of!(hdr.format).read_volatile() };
+    let format = format.load(Ordering::Relaxed);
     let total = image_bytes(width, height) as u64;
     let off = offset.min(total);
     let n = (total - off).min(abi::CTL_LOAD_MAX) as usize;
@@ -116,7 +162,7 @@ pub fn read(g: &Guest, offset: u64, to: *mut u8, before_copy: impl FnOnce(bool) 
     // l4h-vmm may be writing meanwhile: the frame counter tells.
     unsafe { host::gpu::copy_volatile((base + IMAGE_OFFSET + off as usize) as *const u8, to, n) };
     fence(Ordering::Acquire);
-    if hdr.frame.load(Ordering::Relaxed) != frame {
+    if seq.load(Ordering::Relaxed) != frame {
         return Err(EAGAIN);
     }
     Ok([n as u64, width as u64, height as u64, width as u64 * 4, format as u64, frame])

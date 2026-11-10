@@ -18,6 +18,11 @@
 //!   dom0's RTC_SET, forwarded to the primary;
 //! - trustd's requests and replies, handed to trustd.rs.
 //!
+//! The other partition is not trusted: what it writes costs root a bounded
+//! amount of work each time root looks (`poll`: POLL_MAX messages of a
+//! channel, each of bounded size), an RTC write at most every RTC_SET_SECS,
+//! and log records within a rate limit.
+//!
 //! Links' channels are netd's (netd.rs): root never maps them, and only
 //! rings their doorbells for netd.
 
@@ -39,6 +44,15 @@ const HEARTBEAT_SECS: u64 = 1;
 const CLOCK_SECS: u64 = 10;
 /// Heartbeats missed before the primary reports a partition.
 const MISSED: u64 = 5;
+/// Messages root handles from one channel in one `poll`.  The peer writes
+/// the ring, and can keep it from ever being found empty: what is left
+/// stays in the ring for the next doorbell or timer tick.  An honest peer
+/// sends a few messages a second.
+const POLL_MAX: usize = 64;
+/// Seconds between the RTC writes root makes for one partition
+/// (MSG_RTC_SET): a request sooner after the last one is dropped.  A write
+/// costs root port I/O and a clock message to every secondary.
+const RTC_SET_SECS: u64 = 1;
 
 struct Chan {
     desc: Channel,
@@ -50,6 +64,8 @@ struct Chan {
     /// The peer was reported stopped.
     reported: bool,
     lost: u64,
+    /// Ticks of the last RTC write made for the peer.
+    rtc_set: Option<u64>,
 }
 
 pub struct Channels {
@@ -60,6 +76,8 @@ pub struct Channels {
     next_clock: u64,
     tsc_hz: u64,
     buf: [u8; MSG_MAX],
+    /// What a peer's messages can make root log, per partition.
+    log: l4h_host::log::RateLimit<{ part::MAX_PARTITIONS }>,
 }
 
 impl Channels {
@@ -73,6 +91,7 @@ impl Channels {
             next_clock: 0,
             tsc_hz,
             buf: [0; MSG_MAX],
+            log: l4h_host::log::RateLimit::new(),
         };
         let badged = alloc.slots.alloc();
         let dst = crate::component::abs_of(sel4::init_thread::Slot::<cap_type::Null>::from_index(badged).cap());
@@ -107,6 +126,7 @@ impl Channels {
                 last_heard: l4h_host::ticks::now(),
                 reported: false,
                 lost: 0,
+                rtc_set: None,
             });
         }
         info!("l4h-root: {} channel(s) to other partitions, {} link(s)", c.chans.len(), c.links.len());
@@ -167,25 +187,45 @@ pub fn ring(peer_slot: u32, vector: u32) {
     }
 }
 
-/// Handle what arrived on every channel (a doorbell rang, or the timer).
+/// Handle what arrived on every channel (a doorbell rang, or the timer):
+/// at most POLL_MAX messages of each, and what a peer can make root log
+/// only within `Channels::log`'s limit.
 pub fn poll(h: &mut Host) {
     let Some(mut cs) = h.channels.take() else { return };
     let now = l4h_host::ticks::now();
     for i in 0..cs.chans.len() {
+        let peer = cs.chans[i].desc.peer;
         let mut lost = 0;
-        while let Some((ty, n)) = cs.chans[i].rx.recv(&mut cs.buf, &mut lost) {
+        for _ in 0..POLL_MAX {
+            let Some((ty, n)) = cs.chans[i].rx.recv(&mut cs.buf, &mut lost) else { break };
             cs.chans[i].last_heard = now;
             if cs.chans[i].reported {
                 cs.chans[i].reported = false;
-                log!("l4h-root: partition {} is heard from again", cs.chans[i].desc.peer);
+                if let Some(s) = cs.log.allow(peer as usize, now, cs.tsc_hz) {
+                    log!("l4h-root: partition {} is heard from again{}", peer, s);
+                }
             }
-            let peer = cs.chans[i].desc.peer;
-            handle(h, &cs, peer, ty, &cs.buf[..n]);
+            if ty == part::MSG_RTC_SET {
+                let c = &mut cs.chans[i];
+                if c.rtc_set.is_some_and(|at| now.saturating_sub(at) < RTC_SET_SECS.saturating_mul(cs.tsc_hz)) {
+                    continue;
+                }
+                c.rtc_set = Some(now);
+            }
+            let Some(rtc) = handle(h, &cs, peer, ty, &cs.buf[..n]) else { continue };
+            if let Some(s) = cs.log.allow(peer as usize, now, cs.tsc_hz) {
+                match rtc {
+                    Ok(()) => log!("l4h-root: RTC set for partition {}{}", peer, s),
+                    Err(e) => log!("l4h-root: RTC set for partition {} failed: {}{}", peer, e, s),
+                }
+            }
         }
         if lost > 0 {
             // The peer's count: it can say anything.
             cs.chans[i].lost = cs.chans[i].lost.saturating_add(lost);
-            log!("l4h-root: {} bytes from partition {} lost", lost, cs.chans[i].desc.peer);
+            if let Some(s) = cs.log.allow(peer as usize, now, cs.tsc_hz) {
+                log!("l4h-root: {} bytes from partition {} lost{}", lost, peer, s);
+            }
         }
         if let Some(irq) = cs.chans[i].irq {
             let _ = irq.irq_handler_ack();
@@ -198,27 +238,28 @@ fn u64_at(b: &[u8], i: usize) -> Option<u64> {
     Some(u64::from_le_bytes(b.get(i..i + 8)?.try_into().ok()?))
 }
 
-fn handle(h: &mut Host, cs: &Channels, peer: u32, ty: u32, msg: &[u8]) {
+/// Act on one message from `peer`.  Returns how the RTC write it asked
+/// for went, if it asked for one, for `poll` to log.
+fn handle(h: &mut Host, cs: &Channels, peer: u32, ty: u32, msg: &[u8]) -> Option<Result<(), Errno>> {
     match ty {
         part::MSG_HEARTBEAT => {}
         part::MSG_CLOCK if crate::partition::secondary() => {
-            let (Some(ns), Some(tsc)) = (u64_at(msg, 0), u64_at(msg, 8)) else { return };
+            let (Some(ns), Some(tsc)) = (u64_at(msg, 0), u64_at(msg, 8)) else { return None };
             h.info.epoch_ns = ns;
             h.info.epoch_ticks = tsc;
         }
         part::MSG_RTC_SET if !crate::partition::secondary() => {
-            let Some(secs) = u64_at(msg, 0) else { return };
-            match h.rtc.set_secs(&mut h.wins.a, secs) {
-                Ok(()) => {
-                    log!("l4h-root: RTC set for partition {}", peer);
-                    send_clock(h, cs);
-                }
-                Err(e) => log!("l4h-root: RTC set for partition {} failed: {}", peer, e),
+            let secs = u64_at(msg, 0)?;
+            let r = h.rtc.set_secs(&mut h.wins.a, secs);
+            if r.is_ok() {
+                send_clock(h, cs);
             }
+            return Some(r);
         }
         part::MSG_TPM_REQUEST | part::MSG_TPM_REPLY => crate::trustd::channel_message(h, peer, ty, msg),
         _ => {}
     }
+    None
 }
 
 /// The wall clock now, as the primary knows it, to every secondary.

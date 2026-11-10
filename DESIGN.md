@@ -1408,8 +1408,10 @@ pool, and host components map only host-owned pages.
     level-2 CNode and a page table) and three slots. Before filling any,
     `VM_START` checks that the host can afford the blocks not yet filled
     (`Guest::boot_cost`) and reserves room for them and the VMM's remaining
-    objects in the guest's arena (`Arena::reserve`), failing with `ENOMEM`
-    otherwise. `VM_LOAD` checks and reserves likewise. The VMM's three large
+    objects, its mappings of the backends included (`Guest::start_bytes`),
+    in the guest's arena (`Arena::reserve`), failing with `ENOMEM`
+    otherwise, before the kernel is written. `VM_LOAD` checks and reserves
+    likewise. The VMM's three large
     CNodes are made at create, before loads can fragment the arena.
 - **Capabilities.** Guest root slot `L4H_SLOT_BLOCKS` is the block CNode:
   slot `b` holds the Untyped copy of every non-boot block. Frames are named
@@ -1597,15 +1599,20 @@ grow and shrink without going through `l4h-root`.
   way round, each frame was unmapped with a TLB shootdown (585 ms instead of
   about 120 for a stopped 128 MiB guest).
 - **Free memory.** memd publishes its free blocks in a status page
-  (`l4h_host::memd::Status`). `host_info` reports root's, vmmgr's and
+  (`l4h_host::memd::Status`), under a sequence count that is odd while
+  memd writes it: root and vmmgr take a copy only if the count did not
+  change (`Status::read_at`, 16 tries) and otherwise count no memory in
+  memd, so `can_afford` refuses. `host_info` reports root's, vmmgr's and
   memd's free blocks; the monitor and dashboard show root's and memd's.
 - **Trust.** memd is in the host TCB. It cannot read memory: every Untyped
   it has handed out has a child, so it cannot retype it, and revoking it
   first makes seL4 clear the memory before reuse. It can revoke what it
   handed out, and if it faults, a keeper thread answers its callers with
   an error, so memory requests (grants, guest creation, hotplug) fail from
-  then on: a free memd does not take keeps its blocks, and a boot block it
-  cannot copy fails the guest's load.
+  then on: blocks a `free` does not take go back to the client's slots
+  and stay in use there (`MemdLink::free`, which also empties an exchange
+  slot before it puts a block in it), and a boot block it cannot copy
+  fails the guest's load.
 - **Scheduling.** memd runs on core 0 at `PRIO_KERNEL + 3`, above every
   guest, with a full budget: root waits for it.
 - **Limits.** Only the table: its size follows the host's memory, and no
@@ -1654,22 +1661,38 @@ Untypeds reclaims everything it made. Plugging does not involve
   and copies them into the guest's level-2 CNode; a copy that fails (no
   CNode, or the slot occupied) undoes the plug. It takes only blocks that
   need no free page report to come back, so a guest never holds memd
-  waiting: short of 128 MiB of them it answers `EBUSY`. An unplug revokes
+  waiting, and it leaves the hosts' reserve (`memd::HOST_RESERVE`, the
+  32 MiB that root's and vmmgr's `can_afford` keep back): short of
+  128 MiB of them beyond the reserve it answers `EBUSY`. An unplug revokes
   and frees the 64 originals; destroy revokes every plugged block with the
   rest. A token bucket per guest bounds the time one guest can take from
   memd, which runs on core 0 above every guest: it holds microseconds of
   memd's time, refilled at 8 ms a second up to 16 ms, and each call is
   charged what it took, at least 1 ms, so a guest makes 8 plugs or unplugs
-  a second after a burst of 16 (`EBUSY` beyond). How long a revocation
+  a second after a burst of 16 (`EBUSY` beyond). The bucket also counts
+  the VMM's calls, whatever they ask and however memd answers them
+  (`hp_state` and refused calls take no time from it otherwise): 64 at
+  once and 32 a second, where a guest's driver makes at most 18. A call
+  beyond is answered `EBUSY` before memd decodes it or writes its status
+  page, so it costs memd a receive and a reply. How long a revocation
   takes is the guest's to choose (it can make many capabilities of a
   block), so an unplug revokes only while the guest has time left, looked
   at after each block, and otherwise answers `EBUSY` with the rest still
   plugged, for its retry. A call overruns by at most one block's
-  revocation, which the guest pays back before its next.
+  revocation, which the guest pays back before its next. That one
+  revocation is not bounded by a block's size: a guest can hold about 33
+  million capabilities per GiB of its RAM (a CNode slot is 32 bytes), all
+  derived from one block, and memd deletes each. One unplug, and likewise
+  a destroy, can therefore keep memd, and root and vmmgr waiting on it,
+  for a time that grows with the guest's RAM (seconds per GiB by
+  estimate; not measured).
 - **VMM.** The memory device (`L4H_DEV_MEM`, `struct l4h_mem_page`) is one
   more device page: target, plugged count and bitmap, which the VMM
   refreshes from memd (`hp_state`) at start, after each request and
-  when signalled with a new target, raising the device's event then. A
+  when signalled with a new target, raising the device's event then. If
+  memd does not answer `hp_state` (`EBUSY`, or it has failed), the page
+  stays as the guest last saw it and the VMM asks again at the device's
+  next kick or target signal; it does not wait. A
   guest request (op, m), written in the page with a kick, becomes one memd
   call; memd does every check, and the VMM answers in the page and raises
   the event.
@@ -1751,7 +1774,9 @@ occupy the hypervisor's RAM.
   deflation or statistics. QEMU numbers its queues by the features it
   offers, so the reporting queue is 2, plus one each for statistics and free
   page hinting if offered. Root finds the device, enables it and maps its
-  BARs (or gives I/O ports, for a legacy one) and three DMA pages into memd.
+  BARs (or gives I/O ports, for a legacy one) and three DMA pages into memd;
+  a device whose common configuration structure is shorter than the 0x38
+  bytes the driver touches is left off.
   It has no interrupt: memd's 100 ms timer polls it
   (`l4h-memd/src/balloon.rs`). A balloon that translates through an IOMMU
   (QEMU `iommu_platform=on`) cannot report, since reports name memory the
@@ -1767,7 +1792,10 @@ occupy the hypervisor's RAM.
   reported.
 - **Reuse.** A block being reported is not used until the device returns
   it: allocation skips such blocks, and waits (up to 2 s) when nothing else
-  fits. Reported blocks are used like others: their contents read as zero,
+  fits. A device that does not return a report in that time is given up
+  on: it gets no more reports and is not waited for again, and the blocks
+  of that report stay out of use, and out of memd's free count, until it
+  returns them. Reported blocks are used like others: their contents read as zero,
   as seL4 would make them anyway, and touching them backs them again.
 - **Zeroing.** Patch 0019 clears free RAM at boot without touching zero
   pages, so first use of boot memory, including as guest RAM blocks, keeps
@@ -2012,7 +2040,7 @@ firewalling belong in a VM.
   through untouched. VLAN-aware switching, jumbo MTUs on guest ports, static
   MAC entries and port rate limits are not implemented.
 - **Ports and copies.** A vNIC has TX and RX rings of 24 frame slots of
-  68 KiB each, so a slot holds a whole 64 KiB TSO frame, shared by its VMM and netd, in memory of the guest's root arena; root adds
+  68 KiB each, so a slot holds a whole 64 KiB TSO frame, shared by its VMM and netd, in memory of the guest's root arena, whose frame capabilities stay root's (vmmgr gets copies, which revoke nothing); root adds
   and removes ports with `net::call::add_port`/`remove_port`. The guest
   bounces buffers through its I/O pool, the VMM copies between pool and
   port slots, and netd copies slot to slot or slot to NIC DMA buffer.
@@ -2020,7 +2048,7 @@ firewalling belong in a VM.
   header. netd validates flags, checksum offsets and GSO type, including
   that a GSO frame is TCP over IPv4/IPv6, and drops incoherent headers. A
   frame for a port that cannot take its offload is segmented and checksummed
-  in software.
+  in software. A guest port takes a GSO frame whole only if its driver accepted both large frames and partial checksums.
 - **Receive offloads.** netd's virtio-net driver negotiates `GUEST_CSUM`
   and, with mergeable RX buffers (`MRG_RXBUF`, 256 × 4 KiB), `GUEST_TSO4/6`,
   so a device with large frames delivers them whole. Frames from the uplink
@@ -2044,7 +2072,7 @@ firewalling belong in a VM.
   retransmission timeout per burst.
 - **NIC interrupts and notifications.** netd turns RX interrupts off while
   it drains a NIC's queue (re-checking after turning them on) and takes TX
-  interrupts only while frames wait for a TX buffer. It notifies the device
+  interrupts only while frames wait for a TX buffer. A turn takes at most 256 frames from a NIC: with more left, netd serves its ports, links and root's commands and comes back, without waiting for an interrupt. It notifies the device
   once per batch, and not while the device says it is busy with the queue
   (`VIRTQ_USED_F_NO_NOTIFY`). Each interrupt and notification is a VM exit
   in a cloud VM.
@@ -2454,7 +2482,10 @@ module.
 - **The VMM's tables** of resources and backing (1024 resources, 65536
   pieces of backing, merged where contiguous) live in host frames mapped
   only in that VMM, so VMMs without a GPU pay nothing. Commands complete at
-  once and in order, so a fence is done with its command. There is no cursor
+  once and in order, so a fence is done with its command. A kick handles at
+  most eight commands (a flush copies up to a whole frame); the VMM takes
+  the rest on its next turns, after the hypercalls and the other devices'
+  work that waits. There is no cursor
   plane (cursor commands are dropped), no EDID, no 3D and no blob resources.
 - **Memory.** The display area and tables come from the guest's arena, which
   destroy returns. A 1920 x 1200 display is about 10 MiB.
@@ -2856,7 +2887,9 @@ one way to do each part of it:
   calls apart by the badge, decodes the sender (`wire::Badged`) and
   refuses with `EINVAL` any badge that is no sender, answers no fault,
   and replaces a reply object left bound to an unanswered caller
-  (`l4h_task::reply::ReplySlot`, where the server can). `l4h_ipc::serve`
+  (`l4h_task::reply::ReplySlot`, where the server can). It records, before
+  the server's code runs, whether its reply object holds a call
+  (`l4h_ipc::holds_call`), for the failure service. `l4h_ipc::serve`
   takes a call's arguments out of the message registers before its
   handler runs and puts the reply there after it returns, and `run` keeps
   a message, and a reply not yet sent, there across the server's other
@@ -3150,7 +3183,10 @@ none. dom0 runs no host hardware drivers.
 
 A Rust userspace library and CLI live in `tools/l4hctl`; external
 orchestration runs in dom0. Devices are attached before start and removed
-on destroy. Pause/resume, device hotplug, switch deletion, I/O limits and
+on destroy. A `nic_create` that root refuses, or a `gpu_attach` that runs
+out of host memory, leaves what it had made (a CNode; the GPU's CNodes and
+frames) with the guest for the next attempt, since an arena gives nothing
+back: refused attempts take no more than one attach does. Pause/resume, device hotplug, switch deletion, I/O limits and
 asynchronous event queues are not implemented. A stopped guest (powered
 off, or its kernel or VMM faulted) stays stopped until it is destroyed:
 the guest needs its kTCBs and SC_Us with every right (it starts its
@@ -3167,7 +3203,13 @@ chain may hold (`Guest::stop`). `vm_pause` would need to give them back.
   `VM_LOAD(vm, gpa, bytes)` writes from the GPA `vm_create` returns; vmmgr
   copies page by page from the data area into the guest's boot blocks and
   never parses what guests load. `vm_start` loads the kernel, measures the
-  launch, writes the boot info and spawns the guest's VMM.
+  launch, writes the boot info and spawns the guest's VMM. It checks the
+  guest's state (`EBUSY` once it has a VMM, or while a disk is being
+  attached), its parameters and the host's memory for the boot blocks and
+  the VMM before it writes anything, so a start that is refused leaves the
+  guest as it was and can be made again; nothing after the boot info is
+  written can be refused. The kernel `vm_start` writes is not among what
+  was loaded into the guest.
 - `vm_shutdown` (`l4hctl shutdown [--reboot]`) is the ACPI power button:
   vmmgr sets `power_request` in the guest's console page and raises the
   console event on vCPU 0, and the guest runs `orderly_poweroff()` or
@@ -3604,10 +3646,12 @@ root.
   that). vmmgr publishes its guests in a status page for the monitor's
   `list` and the dashboard.
 - **Destroy.** vmmgr stops the guest and revokes its own arena (VSpaces
-  first, so nothing is unmapped page by page), then `GUEST_DEL` has root
-  forget it in trustd, cut its disks off the pool (the IOMMU) and revoke it
-  (without an IOMMU, only once its disks are quiesced, and kept out of use
-  if one did not stop), have netd and blkd let go of its ports and disks, and finally memd revokes the guest's RAM blocks (§8.4). Root
+  first, so nothing is unmapped page by page) and has memd revoke the
+  guest's RAM blocks (§8.4; guest RAM is never a DMA target, so this does
+  not wait for the drivers), then `GUEST_DEL` has root forget it in
+  trustd, cut its disks off the pool (the IOMMU) and revoke it (without an
+  IOMMU, only once its disks are quiesced, and kept out of use if one did
+  not stop), and have netd and blkd let go of its ports and disks. Root
   answers at once: what drivers map stays with root until they have let go
   of it (§10). Its requests still waiting for a driver are answered
   `ENOENT` then, so a control request waiting on them is answered; the
@@ -3629,8 +3673,11 @@ root.
 - **If vmmgr fails**, guests keep running: their vCPUs, disks, networks and
   memory hotplug need nothing of vmmgr. Like memd, the other component
   that serves calls, it has a keeper thread (`l4h_rt`), which reports the fault and answers every later
-  call with a failure, the call vmmgr was serving first (its reply object is
-  in `SLOT_REPLY`), so a VMM's call returns instead of blocking. A guest's
+  call with a failure, the call vmmgr was serving first if it was serving
+  one (its reply object is in `SLOT_REPLY`), so a VMM's call returns instead
+  of blocking. A fault vmmgr was handling when it failed gets no reply,
+  which would restart the faulting thread: the first receive on the reply
+  object lets go of it. A guest's
   power request does not return: its VMM does not answer it, so the vCPU
   that asked stays blocked in it, as stopped as vmmgr would have left it.
   For dom0's control requests, the failure service
@@ -4154,7 +4201,7 @@ Generated MACs carry the partition index (`02:4c:34:P:G:N`), and
 `l4hctl info` shows the partition (`CTL_PARTITION_INFO`).
 
 **Channels** (`channel.rs`). The shim reserves a control channel of 256 KiB
-between partition 0 and each other partition, and a channel of 1 MiB for
+between partition 0 and each other partition, and a channel of 2 MiB for
 each configured link, and lists each in both descriptors: two
 single-writer message rings and a doorbell each way (user vector 96 +
 sender for control, 88 + sender for a link; the kernel's `peers=` lists
@@ -4164,7 +4211,7 @@ lost messages; a crashed partition leaves a stale ring, never a blocked
 writer. Roots read and write the control channels: heartbeats (secondary
 to primary, every second; partition 0 logs a partition silent for 5 s),
 the wall clock (primary to secondaries every 10 s and after an RTC
-change), forwarded RTC settings, and trustd's requests. Frames never share
+change), forwarded RTC settings, and trustd's requests. Root handles at most 64 messages of a channel each time it looks and leaves the rest for the next doorbell or timer tick, writes the RTC for a partition at most once a second, and logs what a peer causes within a rate limit. Frames never share
 a control channel's rings, so a busy link cannot overwrite them.
 
 **IOMMU** (`iommu/shared.rs`). Every partition's root drives the IOMMU
@@ -4195,8 +4242,8 @@ message into its outgoing ring and switches each message from the incoming
 ring. Plain Ethernet frames carry complete checksums and have a limit of
 9216 bytes. TCP GSO frames carry their offload header in a separate record
 type. The receiving netd validates this header and segments the frame when
-the destination needs plain frames. Each direction has a 1 MiB ring.
-A reader that falls behind skips records that the writer can overwrite.
+the destination needs plain frames. Each direction has a 1 MiB ring; root and netd refuse a link channel of another size.
+A reader that falls behind skips records that the writer can overwrite. A count that is not a multiple of 8, or padding followed by padding, is a broken writer's: the reader drops what it published and goes on from the next aligned count. One read takes at most two records.
 
 Root binds the link's receive vector to netd's notification. Netd
 acknowledges the interrupt. Only root holds IRQControl, so the sending netd
@@ -4205,7 +4252,7 @@ wake flag only when its ring is empty, then checks the ring once more.
 The writer checks and clears the flag during large batches and at the end
 of each batch. Netd bounds each guest transmit turn on a linked switch by
 bytes and polls for control requests before it processes more slots.
-After 256 received records, netd gives its other ports a turn.
+Netd looks at a link's ring 256 times, each look reading at most two records (a frame, or a record it drops), then gives its other ports a turn.
 `link.pA-pB = uplink` instead puts the link port on both partitions'
 switch 0, with no switch or vNIC of its own: a partition without a NIC
 shares the network of the one whose switch 0 has the uplink NIC (a star of

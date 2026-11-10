@@ -138,6 +138,16 @@ pub fn is_gso(hdr: &[u8; HDR_SIZE]) -> bool {
     hdr[1] != GSO_NONE
 }
 
+/// Whether a guest port takes a GSO frame whole, given what its client
+/// says its driver accepted: large frames (`rx_gso`) and partial checksums
+/// (`rx_csum`).  A GSO frame has a partial checksum, which only `segment`
+/// can complete, so a port that does not take those gets segments.  An
+/// honest client sets rx_gso only with rx_csum (virtio-net's GUEST_TSO
+/// needs GUEST_CSUM); the flags are in memory it shares with netd.
+pub fn guest_takes_gso(rx_csum: bool, rx_gso: bool) -> bool {
+    rx_csum && rx_gso
+}
+
 /// Whether a peer partition's link takes this GSO frame whole: it
 /// refuses one with segments under MIN_MSS (`sanitize_rx` in link.rs),
 /// which an uplink's frames and GRO runs can have.  Those go segmented.
@@ -427,5 +437,75 @@ impl Gro {
             self.hdr = h;
         }
         emit(&mut self.buf[..len], &mut self.hdr);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A TCP/IPv4 GSO frame of `payload` bytes after 54 bytes of headers,
+    /// as a guest sends it: a partial checksum (the pseudo header's sum)
+    /// and its offload header.
+    fn gso_frame(payload: usize, mss: usize) -> ([u8; 54 + 4000], usize, [u8; HDR_SIZE]) {
+        let mut f = [0u8; 54 + 4000];
+        let len = 54 + payload;
+        f[12..14].copy_from_slice(&[8, 0]);
+        f[14] = 0x45;
+        f[16..18].copy_from_slice(&((len - 14) as u16).to_be_bytes());
+        f[23] = 6;
+        f[26..34].copy_from_slice(&[10, 0, 0, 1, 10, 0, 0, 2]);
+        f[46] = 0x50;
+        f[47] = 0x10;
+        for (i, b) in f[54..len].iter_mut().enumerate() {
+            *b = (i * 7) as u8;
+        }
+        let t = parse_tcp(&f[..len]).unwrap();
+        let p = fold(pseudo(&f[..len], &t, len - t.tcp));
+        f[50..52].copy_from_slice(&p.to_be_bytes());
+        let mut h = [0u8; HDR_SIZE];
+        h[0] = F_NEEDS_CSUM;
+        h[1] = GSO_TCPV4;
+        put16(&mut h, 4, mss);
+        put16(&mut h, 6, 34);
+        put16(&mut h, 8, 16);
+        assert!(sanitize(&mut h, &f[..len]));
+        (f, len, h)
+    }
+
+    #[test]
+    fn a_port_takes_gso_only_with_checksum_offload() {
+        assert!(guest_takes_gso(true, true));
+        assert!(!guest_takes_gso(false, true));
+        assert!(!guest_takes_gso(true, false));
+        assert!(!guest_takes_gso(false, false));
+    }
+
+    /// What a port that does not take a GSO frame whole gets, and what
+    /// the ports after it in a flood still get.
+    #[test]
+    fn segments_are_complete_and_leave_the_frame_for_the_next_port() {
+        let (f, len, h) = gso_frame(4000, 1448);
+        let frame = &f[..len];
+        let mut buf = [0u8; 2048];
+        let (mut segs, mut bytes) = (0, 0);
+        segment(frame, &h, &mut buf, |seg, sh| {
+            // No offload left to the receiver, and a checksum that holds.
+            assert_eq!(*sh, [0; HDR_SIZE]);
+            let t = parse_tcp(seg).unwrap();
+            assert!(csum_ok(seg, sh, &t));
+            segs += 1;
+            bytes += seg.len() - t.hdrs;
+        });
+        assert_eq!((segs, bytes), (3, 4000));
+        // The frame and its header are as they came: a later port that
+        // takes it whole, or a link's peer, gets a frame it accepts.
+        let mut again = h;
+        assert!(sanitize_rx(&mut again, frame, MIN_MSS) && again == h);
+        // Completing the checksum in place instead, as for a frame that
+        // is not GSO, would have left one no receiver takes.
+        let (mut g, mut gh) = (f, h);
+        complete_csum(&mut g[..len], &mut gh);
+        assert!(is_gso(&gh) && !sanitize_rx(&mut gh, &g[..len], MIN_MSS));
     }
 }

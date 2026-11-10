@@ -145,13 +145,27 @@ pub struct Device {
     pub device: Mmio,
 }
 
+/// Reads of the device status a reset waits through.  The driver has no
+/// clock here, so the bound is a count: each read is a round trip to the
+/// device (or to its hypervisor), a second or more in all, where a device
+/// that works reads 0 within a few.
+const RESET_READS: u32 = 10_000_000;
+
 impl Device {
-    pub fn reset(&self) {
+    /// Reset the device and acknowledge it: false if its status does not
+    /// read 0 within RESET_READS reads (the device has failed, and the
+    /// driver must not go on with it).
+    #[must_use]
+    pub fn reset(&self) -> bool {
         self.common.w8(DEVICE_STATUS, 0);
-        while self.common.r8(DEVICE_STATUS) != 0 {
+        for _ in 0..RESET_READS {
+            if self.common.r8(DEVICE_STATUS) == 0 {
+                self.common.w8(DEVICE_STATUS, STATUS_ACK | STATUS_DRIVER);
+                return true;
+            }
             core::hint::spin_loop();
         }
-        self.common.w8(DEVICE_STATUS, STATUS_ACK | STATUS_DRIVER);
+        false
     }
 
     pub fn features(&self) -> u64 {

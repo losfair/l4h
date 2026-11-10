@@ -15,6 +15,7 @@
 
 use core::marker::PhantomData;
 use core::mem::MaybeUninit;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use l4h_host::wire::{Badged, Call, Cap, EINVAL, MAX_MRS, Protocol};
 use l4h_host::wiring::{At, E, p};
@@ -188,14 +189,32 @@ impl ReplyObject for sel4::cap::Reply {
     }
 }
 
+/// Whether the reply object of this component's serve loop (`run`) holds a
+/// call that is still to be answered: not a fault, which is never
+/// answered, nor a caller the server leaves blocked.  A component has one
+/// serve loop.
+static HOLDS_CALL: AtomicBool = AtomicBool::new(false);
+
+/// Whether the serve loop was serving a call, for what answers in its
+/// place once it has failed (l4h_rt's failure service): the caller its
+/// reply object holds gets wire::FAILED, a faulting thread it holds
+/// nothing.  An atomic load: it uses no IPC buffer.
+pub fn holds_call() -> bool {
+    HOLDS_CALL.load(Ordering::Acquire)
+}
+
 /// Serve `ep` with `s`, for good.
 pub fn run<S: Server>(ep: sel4::cap::Endpoint, mut reply: impl ReplyObject, s: &mut S) -> ! {
     let (mut info, mut badge) = ep.recv(reply.cap());
     let mut polled = false;
     loop {
+        let signal = (polled && badge == 0) || badge & S::SIGNALS != 0;
+        // Before anything of the server's runs: if it fails from here on,
+        // the failure service knows whether a caller waits for an answer.
+        HOLDS_CALL.store(!signal && badge & S::FAULT == 0, Ordering::Release);
         keeping(info.length(), || s.received());
         let mut answer = None;
-        if (polled && badge == 0) || badge & S::SIGNALS != 0 {
+        if signal {
             s.signal(badge);
         } else if badge & S::FAULT != 0 {
             s.fault(badge, &info);
@@ -209,6 +228,8 @@ pub fn run<S: Server>(ep: sel4::cap::Endpoint, mut reply: impl ReplyObject, s: &
                 }
             };
             if answer.is_none() {
+                // The caller stays blocked, whatever happens to us.
+                HOLDS_CALL.store(false, Ordering::Release);
                 reply.unanswered();
             }
         }
@@ -223,6 +244,7 @@ pub fn run<S: Server>(ep: sel4::cap::Endpoint, mut reply: impl ReplyObject, s: &
             (Next::Poll, a) => {
                 if let Some(a) = a {
                     reply.cap().send(a);
+                    HOLDS_CALL.store(false, Ordering::Release);
                 }
                 ep.nb_recv(reply.cap())
             }

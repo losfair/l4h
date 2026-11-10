@@ -40,6 +40,8 @@ struct Model {
     bindings: Vec<u64>,
     incoming: VecDeque<Input>,
     caller: Option<bool>, // true: a fault, which must remain unanswered
+    /// What the failed serve loop left for l4h_ipc::holds_call.
+    holds_call: bool,
     replies: Vec<[u64; 8]>,
     wakes: Vec<(u32, u32, i64)>,
     page: usize,
@@ -72,8 +74,12 @@ pub mod sel4 {
     pub fn with_ipc_buffer_mut<R>(f: impl FnOnce(&mut IpcBuffer) -> R) -> R {
         MODEL.with(|m| f(&mut m.borrow_mut().ipc))
     }
-    /// l4h_ipc::reply, on the mock IPC buffer.
+    /// l4h_ipc::reply, on the mock IPC buffer, and what the serve loop
+    /// recorded of its reply object.
     pub mod ipc_mock {
+        pub fn holds_call() -> bool {
+            super::MODEL.with(|m| m.borrow().holds_call)
+        }
         pub fn reply(words: &[u64]) -> super::MessageInfo {
             super::with_ipc_buffer_mut(|b| b.msg_regs_mut()[..words.len()].copy_from_slice(words));
             super::MessageInfo::new(0, 0, 0, words.len())
@@ -124,7 +130,7 @@ pub mod sel4 {
             MODEL.with(|m| {
                 let mut m = m.borrow_mut();
                 if let Some(fault) = m.caller.take() {
-                    assert!(!fault, "a notification must not cause a reply to a fault");
+                    assert!(!fault, "a fault must stay unanswered");
                     let regs = m.ipc.0;
                     m.replies.push(regs);
                 }
@@ -135,6 +141,8 @@ pub mod sel4 {
             assert_eq!((self.0, reply.0), (host::SLOT_SERVICE_EP, host::SLOT_REPLY));
             MODEL.with(|m| {
                 let mut m = m.borrow_mut();
+                // A receive lets go of whoever the reply object still held.
+                m.caller = None;
                 let badge = match m.incoming.pop_front().expect("scripted input") {
                     Input::Call => { m.caller = Some(false); 0x500 }
                     Input::Fault => { m.caller = Some(true); host::badges::parent::FAULT | 1 }
@@ -187,6 +195,7 @@ fn panic_and_keeper_finish_outstanding_and_future_requests_without_replying_to_f
             m.current_tcb = tcb;
             m.bound_tcb = host::SLOT_TCB;
             m.caller = Some(false); // preserve synchronous failure replies
+            m.holds_call = true;
             m.incoming = [Input::Call, Input::Fault, Input::Notify(host::badges::vmmgr::TIMER),
                 Input::Notify(host::badges::vmmgr::MAILBOX), Input::Request(8),
                 Input::Request(9), Input::Call, Input::End].into();
@@ -223,6 +232,33 @@ fn keeper_without_handler_answers_calls_and_leaves_faults() {
             assert_eq!(m.replies, [[u64::MAX, 0, 0, 0, 0, 0, 0, 0]; 2]);
             assert!(m.bindings.is_empty());
         });
+    }
+}
+
+/// The serve loop failed while it handled a fault (a guest kernel's or a
+/// VMM's): the thread its reply object holds gets no reply, which would
+/// restart it.
+#[test]
+fn a_fault_held_at_failure_stays_unanswered() {
+    let _lock = LOCK.lock().unwrap();
+    failure::set_failure_handler(&ctl_failure::HANDLER);
+    for tcb in [host::SLOT_TCB, host::SLOT_KEEPER] {
+        for plain in [false, true] {
+            let _f = Fixture::new(3, 3);
+            MODEL.with(|m| {
+                let mut m = m.borrow_mut();
+                m.current_tcb = tcb;
+                m.bound_tcb = host::SLOT_TCB;
+                m.caller = Some(true);
+                m.holds_call = false;
+                m.incoming = [Input::Call, Input::Fault, Input::Call, Input::End].into();
+            });
+            let end = std::panic::catch_unwind(|| {
+                if plain { failure_plain::answer_failed(tcb) } else { failure::answer_failed(tcb) }
+            }).unwrap_err();
+            assert!(end.is::<End>());
+            MODEL.with(|m| assert_eq!(m.borrow().replies, [[u64::MAX, 0, 0, 0, 0, 0, 0, 0]; 2]));
+        }
     }
 }
 

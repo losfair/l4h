@@ -4,7 +4,7 @@
 //! driver transfers it to the host, so TRANSFER_TO_HOST_2D has nothing
 //! left to copy.  RESOURCE_FLUSH copies the flushed rectangle of the
 //! resource on the scanout into the display area (l4h_host::gpu), the one
-//! image the host keeps, from which l4h-root serves dom0.  Commands
+//! image the host keeps, from which l4h-vmmgr serves dom0.  Commands
 //! complete at once, in order, fences included.
 
 use core::sync::atomic::{Ordering, fence};
@@ -47,6 +47,12 @@ const MAX_SCANOUTS: usize = 16;
 const FORMATS: [u32; 8] = [1, 2, 3, 4, 67, 68, 121, 134];
 /// The largest resource: what the largest scanout needs, twice.
 const MAX_RESOURCE_BYTES: u64 = 2 * image_bytes(l4h_abi::GPU_MAX_WIDTH, l4h_abi::GPU_MAX_HEIGHT) as u64;
+
+/// Chains a kick handles.  A flush copies up to a whole frame, and the
+/// driver can queue as fast as the device completes: what a queue has
+/// beyond these waits for the VMM's next turn (`Gpu::more`), after the
+/// guest's hypercalls and its other devices had theirs.
+const KICK_CHAINS: usize = 8;
 
 const MAX_RESOURCES: usize = 1024;
 const MAX_ENTRIES: usize = 65536;
@@ -175,6 +181,9 @@ pub struct Gpu {
     height: u32,
     /// The resource on the scanout and the rectangle of it shown.
     scanout: Option<(u32, Rect)>,
+    /// Queues (a bit each) whose last kick handled KICK_CHAINS chains and
+    /// may have left some: the VMM's loop polls them again (main.rs).
+    pub more: u64,
 }
 
 impl Gpu {
@@ -188,6 +197,7 @@ impl Gpu {
             width,
             height,
             scanout: None,
+            more: 0,
         };
         g.reset();
         g
@@ -198,7 +208,7 @@ impl Gpu {
     }
 
     /// Begin and end an update of the display area (a seqlock with
-    /// l4h-root, which reads it).
+    /// l4h-vmmgr, which reads it).
     fn begin(&self) {
         let h = self.header();
         h.frame.store(h.frame.load(Ordering::Relaxed) | 1, Ordering::Relaxed);
@@ -214,13 +224,10 @@ impl Gpu {
     /// paint it, or nothing (black, format 0).
     fn show(&self, format: Option<u32>) {
         self.begin();
-        unsafe {
-            if format.is_none() {
-                core::ptr::write_bytes((self.display + IMAGE_OFFSET) as *mut u8, 0, image_bytes(self.width, self.height));
-            }
-            let h = self.display as *mut DisplayHeader;
-            core::ptr::addr_of_mut!((*h).format).write_volatile(format.unwrap_or(0));
+        if format.is_none() {
+            unsafe { core::ptr::write_bytes((self.display + IMAGE_OFFSET) as *mut u8, 0, image_bytes(self.width, self.height)) };
         }
+        self.header().format.store(format.unwrap_or(0), Ordering::Relaxed);
         self.end();
     }
 
@@ -503,14 +510,20 @@ impl Backend for Gpu {
     }
 
     fn kick(&mut self, mem: &GuestMem, queues: &mut [Queue], q: usize) -> bool {
-        let mut any = false;
+        let mut handled = 0;
         let mut bufs = ArrayVec::<Buf, { QUEUE_SIZE as usize }>::new();
-        while let Some(head) = queues[q].pop(mem) {
+        while handled < KICK_CHAINS {
+            let Some(head) = queues[q].pop(mem) else { break };
             let n = if queues[q].chain(mem, head, &mut bufs).is_ok() { self.handle(mem, q, &bufs) } else { 0 };
             queues[q].push(mem, head, n);
-            any = true;
+            handled += 1;
         }
-        any
+        if handled == KICK_CHAINS {
+            self.more |= 1 << q;
+        } else {
+            self.more &= !(1 << q);
+        }
+        handled != 0
     }
 
     fn complete(&mut self, _mem: &GuestMem, _queues: &mut [Queue]) -> bool {
@@ -527,6 +540,7 @@ impl Backend for Gpu {
         }
         self.t.nr_ents = 0;
         self.scanout = None;
+        self.more = 0;
         self.show(None);
     }
 }

@@ -83,6 +83,9 @@ const _: () = assert!(GUEST_EVENTS_OFF + abi::MAX_VCPUS * PAGE <= layout::GUEST_
 pub const IO_POOL_DEFAULT: usize = 4 << 20;
 pub const IO_POOL_MIN: usize = 1 << 20;
 pub const IO_POOL_MAX: usize = 256 << 20;
+/// Bounds of a guest's RAM, in bytes.
+pub const RAM_MIN: usize = 8 << 20;
+pub const RAM_MAX: usize = abi::MAX_BLOCKS * BLOCK;
 /// The I/O pool starts at the first GPA above RAM with this alignment.
 const IO_POOL_ALIGN: usize = 2 << 20;
 
@@ -288,8 +291,9 @@ pub struct Guest {
     pub asids: usize,
     /// It has an attestation device (trustd.rs).
     pub attest: bool,
-    /// Guest RAM ranges loaded before boot: the image, which must lie in
-    /// what the launch digest covers.
+    /// Guest RAM ranges loaded before boot (`load_ram`: what dom0 loaded,
+    /// and dom0's own initramfs), which must lie in what the launch digest
+    /// covers.  The kernel `boot` writes is not among them.
     loaded: Ranges,
     /// The launch digest, set at boot (DESIGN.md §10.2).
     pub launch: Option<[u8; 32]>,
@@ -305,6 +309,12 @@ pub struct Guest {
     pub mem_dev: Option<usize>,
     /// USB controllers it has (DevKind::Usb).
     pub usbs: usize,
+    /// A CNode made for a netd port that root then refused
+    /// (Vmmgr::create_nic), empty: the next port's.
+    pub port_spare: Option<cap::CNode>,
+    /// What a GPU attach that ran out of host memory had made
+    /// (gpu::attach): the next attach goes on from it.
+    pub gpu_parts: Option<crate::gpu::Parts>,
 }
 
 pub(crate) fn abs(c: impl sel4::HasCPtrWithDepth) -> sel4::AbsoluteCPtr {
@@ -494,13 +504,24 @@ impl Guest {
     }
 
     /// Copy `len` bytes from `from` (memory of vmmgr) into guest
-    /// RAM at `gpa` (before boot).
+    /// RAM at `gpa` (before boot), and record the range as loaded.
     pub fn load_ram(&mut self, alloc: &mut Alloc, win: &mut Window, gpa: usize, from: *const u8, len: usize) -> bool {
-        if !self.prepare_ram(alloc, gpa, len) {
+        if !self.copy_ram(alloc, win, gpa, from, len) {
             return false;
         }
         if len != 0 {
             self.loaded.add(gpa, len);
+        }
+        true
+    }
+
+    /// `load_ram` without the record, for the kernel image (`boot`): it
+    /// is the host's, always within what the launch digest covers, and
+    /// written again by a start made again, so it is not among what was
+    /// loaded into the guest.
+    fn copy_ram(&mut self, alloc: &mut Alloc, win: &mut Window, gpa: usize, from: *const u8, len: usize) -> bool {
+        if !self.prepare_ram(alloc, gpa, len) {
+            return false;
         }
         let mut off = 0;
         while off < len {
@@ -732,6 +753,40 @@ impl Guest {
         self.arena.reserve(alloc, bytes)
     }
 
+    /// Host memory spawning its l4h-vmm takes (Vmmgr::spawn_vmm), to
+    /// reserve first: the VMM itself and its mappings of the backends.
+    pub fn start_bytes(&self) -> usize {
+        let maps: usize = self.backends.iter().map(|(_, b)| b.map_bytes()).sum();
+        vmm::start_bytes(self.pool.size, self.vcpus.len(), self.devices.len()) + maps
+    }
+
+    /// What `write_boot_info` requires of the boot parameters and of what
+    /// was loaded, all that does not depend on host memory or memd: the
+    /// boot blocks, or None.  `boot` checks it before it writes the
+    /// kernel, so that a start refused for its parameters leaves the guest
+    /// as it was.
+    fn boot_plan(&self, entry: u64, kernel_end: usize, initrd: (usize, usize)) -> Option<usize> {
+        let ram = self.ram_size();
+        let entry_gpa = (entry as usize).wrapping_sub(self.ram_base);
+        if kernel_end > ram || kernel_end % PAGE != 0 || entry_gpa >= kernel_end || !self.valid_gpa(initrd.0, initrd.1) {
+            return None;
+        }
+        if self.boot_blocks != 0 {
+            return None;
+        }
+        // Everything loaded must be measured: the kernel image or the
+        // initramfs.
+        let within = |(gpa, len): (usize, usize), (lo, n): (usize, usize)| gpa >= lo && gpa + len <= lo + n;
+        if !self.loaded.iter().all(|r| within(r, (0, kernel_end)) || within(r, initrd)) {
+            return None;
+        }
+        let boot = self.boot_prefix(kernel_end, initrd)?;
+        // memd gives its blocks from the first after the boot blocks on, at
+        // their guest index: past the shared blocks, which are all in the
+        // image.
+        (self.shared_below(boot) == self.shared.count_ones() as usize).then_some(boot)
+    }
+
     /// Write the boot info and give the guest its RAM: the boot blocks
     /// (image, initrd and BOOT_SLACK more) as host frames, the others as
     /// Untyped copies.  Validates the boot parameters.
@@ -745,31 +800,16 @@ impl Guest {
         initrd: (usize, usize),
         cmdline: &[u8],
     ) -> bool {
-        let ram = self.ram_size();
-        let entry_gpa = (entry as usize).wrapping_sub(self.ram_base);
-        if kernel_end > ram || kernel_end % PAGE != 0 || entry_gpa >= kernel_end || !self.valid_gpa(initrd.0, initrd.1) {
-            return false;
-        }
-        if self.boot_blocks != 0 {
-            return false;
-        }
-        // Everything loaded must be measured: the kernel image or the
-        // initramfs.
-        let within = |(gpa, len): (usize, usize), (lo, n): (usize, usize)| gpa >= lo && gpa + len <= lo + n;
-        if !self.loaded.iter().all(|r| within(r, (0, kernel_end)) || within(r, initrd)) {
-            return false;
-        }
-        let Some(boot) = self.boot_prefix(kernel_end, initrd) else {
+        let Some(boot) = self.boot_plan(entry, kernel_end, initrd) else {
             return false;
         };
+        // What can still fail is memd's: blocks filled by then stay
+        // filled, and are boot blocks of a later attempt.
         if !(0..boot).all(|b| self.block_frames(alloc, b)) {
             return false;
         }
-        // memd gives its blocks from the first after the boot blocks on, at
-        // their guest index: past the shared blocks, which are all in the
-        // image.
         let shared = self.shared_below(boot);
-        if shared != self.shared.count_ones() as usize || !memd::guest_give(alloc, self.id, boot - shared, shared) {
+        if !memd::guest_give(alloc, self.id, boot - shared, shared) {
             return false;
         }
         self.boot_blocks = boot;
@@ -981,7 +1021,7 @@ pub fn create(
     kernel: &Kernel,
 ) -> Result<Guest, Option<Guest>> {
     // Every value comes from the control API: check before computing.
-    if cfg.vcpus < 1 || cfg.vcpus > abi::MAX_VCPUS || cfg.ram < (8 << 20) || cfg.ram > abi::MAX_BLOCKS * BLOCK {
+    if cfg.vcpus < 1 || cfg.vcpus > abi::MAX_VCPUS || cfg.ram < RAM_MIN || cfg.ram > RAM_MAX {
         return Err(None);
     }
     if cfg.vspaces > MAX_VSPACES {
@@ -1104,6 +1144,8 @@ pub fn create(
         hp_count,
         mem_dev: None,
         usbs: 0,
+        port_spare: None,
+        gpu_parts: None,
     };
 
     let Some(cnodes) = vmm::Cnodes::new(&mut g.arena, alloc, cfg.io_pool) else {
@@ -1318,12 +1360,19 @@ pub fn create(
 /// Load the guest kernel into `g`, whose initrd (if any) is at `initrd`,
 /// and write the boot info.  Only the initrd may have been loaded before:
 /// the kernel is the host's.  Returns false if the parameters are bad or
-/// the image does not fit.
+/// the image does not fit, before anything is written: a guest refused so
+/// is as it was, and can be booted with other parameters.  False also if
+/// memd has failed, which may leave the kernel in the guest's RAM and
+/// some boot blocks filled: a later boot writes the one again and counts
+/// the others in.
 pub fn boot(g: &mut Guest, alloc: &mut Alloc, win: &mut Window, host_info: &HostInfo, kernel: &Kernel, initrd: (usize, usize), cmdline: &[u8]) -> bool {
     // dom0 chose the initrd's range.
     let Some(initrd_end) = initrd.0.checked_add(initrd.1) else { return false };
     let within = |(gpa, len): (usize, usize)| gpa >= initrd.0 && gpa + len <= initrd_end;
     if g.ram_base != kernel.ram_base || (initrd.1 != 0 && initrd.0 < kernel.end) || !g.loaded.iter().all(within) {
+        return false;
+    }
+    if g.boot_plan(kernel.elf.entry, kernel.end, initrd).is_none() {
         return false;
     }
     // Into every block but the shared ones, which already hold the image.
@@ -1332,7 +1381,7 @@ pub fn boot(g: &mut Guest, alloc: &mut Alloc, win: &mut Window, host_info: &Host
         let mut off = 0;
         while off < seg.data.len() {
             let n = (BLOCK - (gpa + off) % BLOCK).min(seg.data.len() - off);
-            if !g.is_shared((gpa + off) / BLOCK) && !g.write_ram(alloc, win, gpa + off, &seg.data[off..off + n]) {
+            if !g.is_shared((gpa + off) / BLOCK) && !g.copy_ram(alloc, win, gpa + off, seg.data[off..].as_ptr(), n) {
                 return false;
             }
             off += n;

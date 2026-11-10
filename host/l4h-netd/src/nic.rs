@@ -113,7 +113,8 @@ impl Nic {
     }
 
     /// RX interrupts on again; false if frames arrived meanwhile, which the
-    /// caller drains (interrupts off again).  Returns buffers to the device
+    /// caller drains, now or on its next turn (interrupts off again, or
+    /// one raised that brings it back).  Returns buffers to the device
     /// with one notification per batch.
     pub fn rx_done(&mut self) -> bool {
         dev!(self, d => d.rx_done())
