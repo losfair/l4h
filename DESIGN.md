@@ -175,7 +175,7 @@ guest's `arch/l4h` likewise builds only 64-bit kernels. Upstream seL4's own
   tools/build-kernel.sh` turns the debug build off but keeps kernel
   printing for the host components' serial log.
 - `L4H_RELEASE=1` also builds the host components with Cargo's release
-  profile (optimised; overflow checks off), into
+  profile (optimised; overflow checks off: §10, "Integer arithmetic"), into
   `host/target/<target>/release` rather than `debug`
   (`tools/host-profile.sh`, the one definition: every script that
   builds, packages or boots them sources it, the Python tests through
@@ -2697,6 +2697,21 @@ with a component is a notification or shared memory. `tests/run-hangtest.sh`
 has a blkd stop answering (`inject blkd-hang`): dom0 gives up a write that
 waits for it, its next is `EBUSY`, and a guest with another disk boots and
 is destroyed; then netd stops too, and root still serves the monitor.
+
+**Integer arithmetic.** Shipped host components build without overflow
+checks (Cargo's release profile, §4.1), so an overflow wraps rather than
+panics, and a wrapped bound check passes. The code is correct by
+construction instead: arithmetic on a value a less-trusted party chose (a
+guest's descriptors, registers and requests, a device's DMA writes and
+registers, a driver's or a peer partition's shared pages and answers, dom0's
+control requests, the config file, firmware tables) never overflows. Such a
+value is validated where it comes in, so that the arithmetic after it is in
+range (`checked_add` and the like at that point), or is computed with the
+`wrapping_*` or `saturating_*` operation that is its meaning (sequence
+numbers wrap). Shifts by such a value are bounded first, and a divisor is
+checked for zero. Development builds check overflow as well, which catches
+what is missed in tests and in `tests/run-fuzz.sh`, whose parsers are the
+host's own.
 
 **Stacks.** Every stack has an unmapped page below it, so an overflow faults
 rather than writing over statics: root maps each component's stacks (its

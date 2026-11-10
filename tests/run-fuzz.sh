@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Host-side randomised tests of guest-facing parsers (virtqueues, netd's
-# offload and steering, usbd's records).  Debug build: like the host components, it checks
-# overflow and pointer preconditions.
+# offload and steering, usbd's records).  Debug build: it checks overflow and
+# pointer preconditions, which shipped (release) host builds do not
+# (DESIGN.md §10, "Integer arithmetic").
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 (cd "$root/tests/fuzz-virtq" && cargo +stable test -q && cargo +stable run -q -- "${1:-200000}")

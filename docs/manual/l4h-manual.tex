@@ -329,7 +329,8 @@ and images with \texttt{L4H\_RELEASE=1} too. Both builds keep printing on,
 since the host components log through the kernel.
 
 \texttt{L4H\_RELEASE=1} also builds the host components with Cargo's
-release profile, optimised and with integer overflow left unchecked, into
+release profile, optimised and with integer overflow left unchecked (the
+components' arithmetic does not rely on the checks), into
 \file{host/target/\allowbreak x86\_64-sel4-roottask/\allowbreak release/}
 instead of \file{debug/}, and makes them print critical errors only. The
 scripts that package or boot the host (\cmd{tools/mkefi.sh},
