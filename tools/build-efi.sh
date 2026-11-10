@@ -24,6 +24,9 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 out=$root/build/efi
 mkdir -p "$out"
+# The host components build to the cargo profile's directory (build-host.sh).
+profile=debug
+[ "${L4H_RELEASE:-0}" = 1 ] && profile=release
 variants=(
     "generic X2APIC ON OFF"
     "xapic-nopcid XAPIC OFF OFF"
@@ -46,8 +49,8 @@ done
 debug=$(mktemp -d)
 trap 'rm -rf "$debug"' EXIT
 mkdir "$debug/l4h-debug-x86_64"
-cp "$root/host/target/x86_64-sel4-roottask/debug/l4h-root.elf" \
-    "$root"/host/target/x86_64-sel4/debug/l4h-{vmmgr,vmm,blkd,netd,trustd,memd,logd,usbd}.elf \
+cp "$root/host/target/x86_64-sel4-roottask/$profile/l4h-root.elf" \
+    "$root"/host/target/x86_64-sel4/$profile/l4h-{vmmgr,vmm,blkd,netd,trustd,memd,logd,usbd}.elf \
     "$root/build/linux-l4h/vmlinux" "$debug/l4h-debug-x86_64/"
 for v in "${variants[@]}"; do
     read -r name _ <<<"$v"
@@ -58,7 +61,7 @@ for v in "${variants[@]}"; do
         [ -f "$mk/$f" ] || { echo "$mk/$f: missing" >&2; exit 1; }
     done
     L4H_MKSHIM=$mk "$root/tools/mkefi.sh" "$out/l4h-$name.efi" \
-        "$root/host/target/x86_64-sel4-roottask/debug/l4h-root.elf" \
+        "$root/host/target/x86_64-sel4-roottask/$profile/l4h-root.elf" \
         "$root/build/sel4-$name/bin/kernel.elf"
     cp "$root/build/sel4-$name/bin/kernel.elf" "$debug/l4h-debug-x86_64/kernel-$name.elf"
     for k in {0..7}; do
@@ -71,7 +74,7 @@ tar -C "$debug" -cJf "$out/l4h-debug-x86_64.tar.xz" l4h-debug-x86_64
 bios=$debug/l4h-bios-x86_64
 # Multikernel boot is UEFI-only in the release (the installer's BIOS
 # package has one kernel per variant).
-L4H_MKSHIM= "$root/tools/mkbios.sh" "$bios" "$root/host/target/x86_64-sel4-roottask/debug/l4h-root.elf" >/dev/null
+L4H_MKSHIM= "$root/tools/mkbios.sh" "$bios" "$root/host/target/x86_64-sel4-roottask/$profile/l4h-root.elf" >/dev/null
 rm "$bios/kernel.elf"
 for v in "${variants[@]}"; do
     read -r name _ <<<"$v"
