@@ -634,7 +634,7 @@ impl Guest {
         }
         let kick_slot = self.dev_cn.absolute_cptr_from_bits_with_depth(d as u64, abi::ROOT_CNODE_BITS);
         // usbd's kick, which root minted: the guest rings it.
-        l4h_task::edge::pass(&kick_slot, &wiring::VMM_USBD_KICK, &abs(kick)).expect("USB kick cap");
+        l4h_task::edge::pass(&kick_slot, &wiring::GUEST_USBD_KICK, &abs(kick)).expect("USB kick cap");
         self.devices.must_push(GuestDev { kind: DevKind::Usb(n as u8), page: first? });
         self.usbs += 1;
         Some(d)

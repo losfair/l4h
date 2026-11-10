@@ -64,9 +64,15 @@ impl proto::call::Server for Requests<'_> {
 /// every other entry reserved for transfers in flight.
 const CTL_RESERVE: u32 = 1;
 /// Records taken from each submission queue in one turn: then the event
-/// ring and the mailbox get their turn again.
+/// ring and the mailbox get their turn again.  The transfer records an
+/// URB_CANCEL takes on the way (`cancel`) count too.
 const CTL_BUDGET: u32 = abi::CTL_SQ_SIZE as u32;
 const XFER_BUDGET: u32 = abi::XFER_SQ_SIZE as u32;
+/// Batches of events taken from the event ring in one go, a ring's worth:
+/// a controller that kept producing events would otherwise keep usbd from
+/// the mailbox (a REMOVE halts it).  The rest are taken next turn, which
+/// follows at once (`Usbd::backlog`).
+const EVENT_BATCHES: usize = proto::EVENT_TRBS / EVENT_BATCH;
 // Client::skip has a bit per transfer SQ entry.
 const _: () = assert!(abi::XFER_SQ_SIZE == 128);
 
@@ -96,6 +102,10 @@ pub struct Ep {
     /// Streams (a power of two; 0: none) and their rings, by stream ID.
     pub streams: u16,
     pub stream_rings: [u16; abi::MAX_STREAMS as usize],
+    /// Halted: the stream whose ring the failed URB was on (0: the
+    /// endpoint's only ring, or for a stream endpoint none, halted between
+    /// TDs).  Recovery moves that ring's dequeue pointer past it.
+    pub halted: u16,
 }
 
 #[derive(Clone, Copy)]
@@ -107,7 +117,7 @@ pub struct Slot {
 }
 
 impl Slot {
-    const EMPTY: Slot = Slot { enabled: false, speed: 0, eps: [Ep { state: EpState::Disabled, ep: abi::Ep { dci: 0, ty: 0, interval: 0, burst_mult: 0, max_packet: 0, max_esit: 0 }, ring: NONE, streams: 0, stream_rings: [NONE; 16] }; 32] };
+    const EMPTY: Slot = Slot { enabled: false, speed: 0, eps: [Ep { state: EpState::Disabled, ep: abi::Ep { dci: 0, ty: 0, interval: 0, burst_mult: 0, max_packet: 0, max_esit: 0 }, ring: NONE, streams: 0, stream_rings: [NONE; 16], halted: 0 }; 32] };
 }
 
 /// The guest the controller is assigned to.
@@ -125,12 +135,12 @@ struct Client {
     in_flight: u32,
     iso_tds: u32,
     reset_seen: u32,
+    /// Controller resets while it has been attached (Info::hc_resets).
+    resets: u32,
     irq: sel4::cap::Notification,
     /// Something was published since the last signal.
     notify: bool,
     lost: u32,
-    /// The transfer SQ waits for CQ room or isoch TDs.
-    blocked: bool,
     /// Transfer SQ records cancelled before they were taken (by position
     /// % XFER_SQ_SIZE): skipped, never completed.
     skip: u128,
@@ -223,11 +233,18 @@ pub struct Usbd {
     slots: &'static mut [Slot; proto::MAX_SLOTS as usize + 1],
     pub rings: Rings,
     pub urbs: Urbs,
-    /// Endpoints whose halt is to be cleared: (slot, DCI, ring).
-    recover: l4h_rt::host::fixed::ArrayVec<(u8, u8, u16), 256>,
+    /// Endpoints whose halt is to be cleared (Ep::halted says on which
+    /// ring): one entry an endpoint, however often it halts before
+    /// `recover_all` gets to it.
+    recover: proto::EpSet,
     /// Rings a completion made room on, to post their waiting URBs once
     /// no command is running (refill).
     refill: [u64; proto::USB_RINGS / 64],
+    /// Transfer records this turn may still take (XFER_BUDGET a turn).
+    xfer_budget: u32,
+    /// The event ring had more than one go takes (EVENT_BATCHES): another
+    /// turn follows without waiting.
+    backlog: bool,
     refused: u64,
     resets: u64,
     dead: bool,
@@ -247,14 +264,17 @@ impl Usbd {
 
     // ---- Events.
 
-    /// Drain the event ring, handing every event but the completion of
-    /// command `cmd` (its TRB's address) to `event`: that one's result.
+    /// Take what the event ring has, at most EVENT_BATCHES batches (then
+    /// `backlog` says there may be more), handing every event but the
+    /// completion of command `cmd` (its TRB's address) to `event`: that
+    /// one's result.
     fn events_until(&mut self, cmd: Option<u64>) -> Option<CmdResult> {
         let mut batch = Events::new();
         let mut result = None;
-        loop {
+        for _ in 0..EVENT_BATCHES {
             let Some(hc) = self.hc.as_mut() else { return None };
             if !hc.take_events(&mut batch) {
+                self.backlog = false;
                 return result;
             }
             for ev in batch.iter() {
@@ -265,6 +285,8 @@ impl Usbd {
                 }
             }
         }
+        self.backlog = true;
+        result
     }
 
     fn events(&mut self) {
@@ -272,7 +294,10 @@ impl Usbd {
     }
 
     /// Run a command, handling the events that come meanwhile.  None if it
-    /// timed out: the controller is then reset.
+    /// was not run (the controller is broken) or timed out: the controller
+    /// was then reset, which forgot every slot and freed every ring of one
+    /// (`forget_all`).  A caller that gets None leaves it at that: what it
+    /// was working on is gone.
     fn command(&mut self, trb: Trb) -> Option<CmdResult> {
         let pa = self.hc.as_mut()?.submit_command(trb)?;
         let end = self.hc.as_ref()?.command_deadline();
@@ -329,8 +354,9 @@ impl Usbd {
             // A stream endpoint halted between TDs: reset it, with no URB
             // to complete or skip (recover_all).
             if ep.streams != 0 && halts_transferless(cc) && ep.state != EpState::Halted {
-                self.slots[slot].eps[dci].state = EpState::Halted;
-                let _ = self.recover.push((slot as u8, dci as u8, NONE));
+                let ep = &mut self.slots[slot].eps[dci];
+                (ep.state, ep.halted) = (EpState::Halted, 0);
+                self.recover.insert(slot, dci);
             }
             // Otherwise (a Missed Service event may have no pointer) the
             // next event with one says where the controller is (below).
@@ -554,8 +580,10 @@ impl Usbd {
         self.rings.unlink(&mut self.urbs, r, u);
         self.urbs.free(u);
         if halted && self.slots[slot].eps[dci].state != EpState::Disabled {
-            self.slots[slot].eps[dci].state = EpState::Halted;
-            let _ = self.recover.push((slot as u8, dci as u8, r));
+            let stream = self.rings.get(r).stream;
+            let ep = &mut self.slots[slot].eps[dci];
+            (ep.state, ep.halted) = (EpState::Halted, stream);
+            self.recover.insert(slot, dci);
         } else {
             // Its TRBs are free: URBs waiting for room can go on.
             self.refill[r as usize / 64] |= 1 << (r % 64);
@@ -563,7 +591,6 @@ impl Usbd {
         if let Some(cl) = &mut self.client {
             cl.in_flight -= 1;
             cl.iso_tds -= iso_tds;
-            cl.blocked = false;
             cl.post_cqe(&c);
         }
     }
@@ -663,39 +690,41 @@ impl Usbd {
     }
 
     /// Clear the halts the event handler found: Reset Endpoint, then Set TR
-    /// Dequeue past the URB that failed (none for a stream endpoint's
-    /// transferless halt, ring NONE: its streams' dequeue pointers stay),
-    /// then restart the rings.
+    /// Dequeue past the URB that failed, on the ring the endpoint has for
+    /// the stream it failed on (none for a stream endpoint's transferless
+    /// halt: its streams' dequeue pointers stay), then restart the rings,
+    /// those of a stream endpoint's other streams too.  The endpoint is
+    /// looked at as it is now: it may have been dropped or given other
+    /// rings since it halted, and is then no longer Halted.
     fn recover_all(&mut self) {
-        while let Some((slot, dci, r)) = self.recover.pop() {
-            let (s, d) = (slot as usize, dci as usize);
+        while let Some((s, d)) = self.recover.pop() {
             if self.slots[s].eps[d].state != EpState::Halted || self.hc.as_ref().is_none_or(|h| h.broken) {
                 continue;
             }
-            let reset = Trb { param: 0, status: 0, control: (CMD_RESET_EP << 10) | (dci as u32) << 16 | (slot as u32) << 24 };
+            let reset = Trb { param: 0, status: 0, control: (CMD_RESET_EP << 10) | (d as u32) << 16 | (s as u32) << 24 };
             if self.command(reset).is_none() {
                 return;
             }
-            if r != NONE {
-                self.set_deq(s, d, r);
+            let ep = self.slots[s].eps[d];
+            let r = if ep.streams == 0 {
+                ep.ring
+            } else if ep.halted != 0 && ep.halted < ep.streams {
+                ep.stream_rings[ep.halted as usize]
+            } else {
+                NONE
+            };
+            if r != NONE && !self.set_deq(s, d, r) {
+                return;
             }
             self.slots[s].eps[d].state = EpState::Stopped;
-            // The other rings of a stream endpoint start again too.
-            let ep = self.slots[s].eps[d];
-            if ep.streams == 0 {
-                self.post_or_ring(s, d, r);
-            } else {
-                for &sr in &ep.stream_rings[1..ep.streams as usize] {
-                    self.post_or_ring(s, d, sr);
-                }
-            }
+            self.restart(s, d);
         }
     }
 
-    /// Restart ring `r`: post what waits, or ring the doorbell if TRBs are
-    /// already on it.
+    /// Restart ring `r` (NONE: nothing): post what waits, or ring the
+    /// doorbell if TRBs are already on it.
     fn post_or_ring(&mut self, slot: usize, dci: usize, r: u16) {
-        if self.rings.get(r).head == NONE {
+        if r == NONE || self.rings.get(r).head == NONE {
             return;
         }
         if self.urbs.get(self.rings.get(r).head).posted {
@@ -707,8 +736,9 @@ impl Usbd {
     }
 
     /// Point the endpoint (stopped or halted) at the oldest URB still on
-    /// ring `r`, or at the ring's enqueue pointer.
-    fn set_deq(&mut self, slot: usize, dci: usize, r: u16) {
+    /// ring `r`, or at the ring's enqueue pointer.  False if the command
+    /// was not run or timed out (`command`): the ring is gone.
+    fn set_deq(&mut self, slot: usize, dci: usize, r: u16) -> bool {
         let dma = self.hc.as_ref().unwrap().dma;
         let (pos, cycle) = self.rings.resume_point(dma, &self.urbs, r);
         let ring = self.rings.get(r);
@@ -716,8 +746,11 @@ impl Usbd {
         let sct = if stream != 0 { 1 << 1 } else { 0 };
         let param = dma.pa(dma.ring(r as usize) + pos as usize * 16) | sct | cycle as u64;
         let trb = Trb { param, status: stream << 16, control: (CMD_SET_TR_DEQ << 10) | (dci as u32) << 16 | (slot as u32) << 24 };
-        let _ = self.command(trb);
+        if self.command(trb).is_none() {
+            return false;
+        }
         self.rings.get_mut(r).deq = pos;
+        true
     }
 
     // ---- Requests.
@@ -795,16 +828,12 @@ impl Usbd {
                 for dci in 1..32 {
                     self.drop_ep(s, dci);
                 }
-                let r = self.command(Trb { param: 0, status: 0, control: CMD_DISABLE_SLOT << 10 | (s as u32) << 24 });
+                let Some((cc, _)) = self.command(Trb { param: 0, status: 0, control: CMD_DISABLE_SLOT << 10 | (s as u32) << 24 }) else {
+                    return abi::ST_TIMEOUT;
+                };
                 self.slots[s] = Slot::EMPTY;
-                if let Some(hc) = &self.hc {
-                    hc.set_dcbaa(s as u32, None);
-                }
-                match r {
-                    Some((CC_SUCCESS, _)) => abi::ST_OK,
-                    Some((cc, _)) => cc_status(cc),
-                    None => abi::ST_TIMEOUT,
-                }
+                self.hc().set_dcbaa(s as u32, None);
+                if cc == CC_SUCCESS { abi::ST_OK } else { cc_status(cc) }
             }
             abi::OP_ADDRESS => self.address(r, val),
             abi::OP_EP_CONFIG => self.ep_config(r),
@@ -812,16 +841,15 @@ impl Usbd {
             abi::OP_EP0_MPS => self.ep0_mps_set(r.slot, arg[0]),
             abi::OP_DEV_RESET => {
                 let Some(s) = self.client_slot(r.slot) else { return abi::ST_INVALID };
-                let res = self.command(Trb { param: 0, status: 0, control: CMD_RESET_DEVICE << 10 | (s as u32) << 24 });
-                // Every endpoint but ep0 is disabled now.
+                let Some((cc, _)) = self.command(Trb { param: 0, status: 0, control: CMD_RESET_DEVICE << 10 | (s as u32) << 24 }) else {
+                    return abi::ST_TIMEOUT;
+                };
+                // Every endpoint but ep0 is disabled now (refused, the slot
+                // has none: it is in the Default state, xHCI 1.2 §4.6.11).
                 for dci in 2..32 {
                     self.drop_ep(s, dci);
                 }
-                match res {
-                    Some((CC_SUCCESS, _)) => abi::ST_OK,
-                    Some((cc, _)) => cc_status(cc),
-                    None => abi::ST_TIMEOUT,
-                }
+                if cc == CC_SUCCESS { abi::ST_OK } else { cc_status(cc) }
             }
             abi::OP_EP_RESET => self.ep_reset(r.slot, arg[0]),
             abi::OP_STREAMS_ALLOC => self.streams(r.slot, r.drop, arg[0]),
@@ -861,20 +889,14 @@ impl Usbd {
     }
 
     fn address(&mut self, r: &CtlReq, val: &mut [u32; 2]) -> i32 {
-        let arg = unsafe { r.body.arg };
+        let a = proto::Address::new(unsafe { &r.body.arg });
         let Some(s) = self.client_slot(r.slot) else { return abi::ST_INVALID };
-        let (route, speed, tt_slot, tt_port, mtt, mps, bsr) = (arg[0], arg[1], arg[2], arg[3], arg[4], arg[5], arg[6]);
-        let mps_ok = match speed {
-            abi::SPEED_LOW => mps == 8,
-            abi::SPEED_FULL => matches!(mps, 8 | 16 | 32 | 64),
-            abi::SPEED_HIGH => mps == 64,
-            _ => mps == 512,
-        };
-        let tt_ok = tt_slot == 0 || (tt_slot <= 255 && self.client_slot(tt_slot as u16).is_some() && (1..=255).contains(&tt_port));
-        if !proto::speed_ok(speed) || !proto::route_ok(route) || !self.port_ok(r.port as u32) || !mps_ok || !tt_ok
-            || mtt > 1 || bsr > 1 {
+        // A TT's hub is a device of the client's.
+        let tt_ok = a.tt_slot == 0 || self.client_slot(a.tt_slot as u16).is_some();
+        if !a.ok() || !self.port_ok(r.port as u32) || !tt_ok {
             return abi::ST_INVALID;
         }
+        let (speed, mps, bsr) = (a.speed, a.mps, a.bsr);
         // ep0's ring, new or emptied.
         let ep0 = self.slots[s].eps[1];
         let ring = if ep0.ring == NONE {
@@ -894,57 +916,61 @@ impl Usbd {
         let (ictx, ipa) = self.hc().input_ctx();
         ictx.w32(4, 0b11); // add: slot, ep0
         let slot_ctx = Mmio(ictx.0 + cs);
-        slot_ctx.w32(0, route | speed << 20 | mtt << 25 | 1 << 27);
-        slot_ctx.w32(4, (r.port as u32) << 16);
-        slot_ctx.w32(8, tt_slot | tt_port << 8);
+        for (w, dw) in a.slot_ctx(r.port).into_iter().enumerate() {
+            slot_ctx.w32(4 * w, dw);
+        }
         let ep_ctx = Mmio(ictx.0 + 2 * cs);
-        ep_ctx.w32(4, 3 << 1 | (abi::EP_CONTROL as u32) << 3 | mps << 16);
+        ep_ctx.w32(4, proto::ep0_ctx_dw1(mps));
         ep_ctx.w64(8, dma.pa(dma.ring(ring as usize)) | 1);
         ep_ctx.w32(16, 8);
-        let res = self.command(Trb { param: ipa, status: 0, control: CMD_ADDRESS_DEVICE << 10 | bsr << 9 | (s as u32) << 24 });
+        let Some((cc, _)) = self.command(Trb { param: ipa, status: 0, control: CMD_ADDRESS_DEVICE << 10 | bsr << 9 | (s as u32) << 24 }) else {
+            // The reset freed the ring if the slot had it; one made here
+            // was no slot's yet.
+            if ep0.ring == NONE {
+                self.rings.free(ring);
+            }
+            return abi::ST_TIMEOUT;
+        };
         self.slots[s].eps[1] = Ep {
             state: EpState::Stopped,
             ep: abi::Ep { dci: 1, ty: abi::EP_CONTROL, interval: 0, burst_mult: 0, max_packet: mps as u16, max_esit: 0 },
-            ring, streams: 0, stream_rings: [NONE; 16],
+            ring, streams: 0, stream_rings: [NONE; 16], halted: 0,
         };
-        match res {
-            Some((CC_SUCCESS, _)) => {
-                self.slots[s].speed = speed;
-                let hc = self.hc();
-                val[0] = Mmio(hc.dma.va(hc.dma.out_ctx(s as u32))).r32(12) & 0xff;
-                abi::ST_OK
-            }
-            Some((cc, _)) => cc_status(cc),
-            None => abi::ST_TIMEOUT,
+        if cc != CC_SUCCESS {
+            return cc_status(cc);
         }
+        self.slots[s].speed = speed;
+        let hc = self.hc();
+        val[0] = Mmio(hc.dma.va(hc.dma.out_ctx(s as u32))).r32(12) & 0xff;
+        abi::ST_OK
     }
 
     /// The input context for a Configure Endpoint or Evaluate Context of
-    /// slot `s`: its slot context copied from the output context.
+    /// slot `s`: its slot context copied from the output context, the
+    /// bits usbd gives the controller only (proto::slot_ctx: the output
+    /// context is the controller's to write).
     fn input_from_out(&mut self, s: usize) -> (Mmio, u64, usize) {
         let hc = self.hc();
         let cs = hc.caps.ctx_size;
         let out = Mmio(hc.dma.va(hc.dma.out_ctx(s as u32)));
         let (ictx, ipa) = hc.input_ctx();
-        for w in 0..3 {
-            ictx.w32(cs + 4 * w, out.r32(4 * w));
+        let sc = proto::slot_ctx([out.r32(0), out.r32(4), out.r32(8)]);
+        for (w, dw) in sc.into_iter().enumerate() {
+            ictx.w32(cs + 4 * w, dw);
         }
         (ictx, ipa, cs)
     }
 
+    /// The input endpoint context of checked endpoint `ep`: its ring, or
+    /// with `streams` its stream context array, at `ring_pa`.
     fn ep_ctx(&mut self, ictx: Mmio, cs: usize, ep: &abi::Ep, ring_pa: u64, streams: u16) {
         let c = Mmio(ictx.0 + cs * (1 + ep.dci as usize));
-        let isoc = matches!(ep.ty, abi::EP_ISOC_IN | abi::EP_ISOC_OUT);
-        let periodic = isoc || matches!(ep.ty, abi::EP_INT_IN | abi::EP_INT_OUT);
-        let (burst, mult) = ((ep.burst_mult & 0xf) as u32, ((ep.burst_mult >> 4) & 3) as u32);
-        let pstreams = if streams > 1 { streams.trailing_zeros() - 1 } else { 0 };
-        let lsa = if streams > 1 { 1 << 15 } else { 0 };
-        c.w32(0, mult << 8 | pstreams << 10 | lsa | (ep.interval as u32) << 16);
-        let cerr = if isoc { 0 } else { 3 };
-        c.w32(4, cerr << 1 | (ep.ty as u32) << 3 | burst << 8 | (ep.max_packet as u32) << 16);
-        c.w64(8, ring_pa | if streams > 1 { 0 } else { 1 });
-        let avg = if periodic { (ep.max_esit as u32).max(1) } else { 3072 };
-        c.w32(16, avg | (ep.max_esit as u32) << 16);
+        let [dw0, dw1, dw4] = proto::ep_ctx(ep, streams as u32);
+        c.w32(0, dw0);
+        c.w32(4, dw1);
+        // A transfer ring's dequeue cycle state is 1 (Rings::reinit).
+        c.w64(8, ring_pa | if streams != 0 { 0 } else { 1 });
+        c.w32(16, dw4);
     }
 
     fn ep_config(&mut self, r: &CtlReq) -> i32 {
@@ -1018,7 +1044,7 @@ impl Usbd {
         }
         for e in &eps[..n] {
             self.slots[s].eps[e.dci as usize] = Ep {
-                state: EpState::Stopped, ep: *e, ring: new[e.dci as usize], streams: 0, stream_rings: [NONE; 16],
+                state: EpState::Stopped, ep: *e, ring: new[e.dci as usize], streams: 0, stream_rings: [NONE; 16], halted: 0,
             };
         }
         abi::ST_OK
@@ -1027,25 +1053,15 @@ impl Usbd {
     fn hub_config(&mut self, slot: u16, ports: u32, think: u32, mtt: u32) -> i32 {
         let Some(s) = self.client_slot(slot) else { return abi::ST_INVALID };
         let speed = self.slots[s].speed;
-        if speed == 0 || ports > 255 || think > 3 || mtt > 1 {
-            return abi::ST_INVALID;
-        }
         let hci = self.hc().caps.hci_version;
         let (ictx, ipa, cs) = self.input_from_out(s);
         ictx.w32(4, 1);
         let sc = Mmio(ictx.0 + cs);
-        let mut dw0 = sc.r32(0) | 1 << 26;
-        if mtt != 0 {
-            dw0 |= 1 << 25;
-        } else if speed == abi::SPEED_FULL {
-            dw0 &= !(1 << 25);
-        }
-        sc.w32(0, dw0);
-        if hci > 0x95 {
-            sc.w32(4, (sc.r32(4) & 0x00ff_ffff) | ports << 24);
-            if hci < 0x100 || speed == abi::SPEED_HIGH {
-                sc.w32(8, (sc.r32(8) & !(3 << 16)) | think << 16);
-            }
+        let Some(dw) = proto::hub_slot_ctx([sc.r32(0), sc.r32(4), sc.r32(8)], speed, hci, ports, think, mtt) else {
+            return abi::ST_INVALID;
+        };
+        for (w, dw) in dw.into_iter().enumerate() {
+            sc.w32(4 * w, dw);
         }
         sc.w32(12, 0);
         let ty = if hci > 0x95 { CMD_CONFIGURE_EP } else { CMD_EVALUATE_CTX };
@@ -1058,14 +1074,7 @@ impl Usbd {
 
     fn ep0_mps_set(&mut self, slot: u16, mps: u32) -> i32 {
         let Some(s) = self.client_slot(slot) else { return abi::ST_INVALID };
-        let ok = match self.slots[s].speed {
-            abi::SPEED_FULL => matches!(mps, 8 | 16 | 32 | 64),
-            abi::SPEED_LOW => mps == 8,
-            abi::SPEED_HIGH => mps == 64,
-            0 => false,
-            _ => mps == 512,
-        };
-        if !ok {
+        if !proto::ep0_mps_ok(self.slots[s].speed, mps) {
             return abi::ST_INVALID;
         }
         let hc = self.hc();
@@ -1077,7 +1086,10 @@ impl Usbd {
         for w in 0..5 {
             ep.w32(4 * w, out.r32(4 * w));
         }
-        ep.w32(4, (ep.r32(4) & 0xffff) | mps << 16);
+        // The output context's state (and reserved) bits are not an input
+        // context's; dword 1 as Address Device gave it, with the new size.
+        ep.w32(0, ep.r32(0) & !0xff);
+        ep.w32(4, proto::ep0_ctx_dw1(mps));
         match self.command(Trb { param: ipa, status: 0, control: CMD_EVALUATE_CTX << 10 | (s as u32) << 24 }) {
             Some((CC_SUCCESS, _)) => {
                 self.slots[s].eps[1].ep.max_packet = mps as u16;
@@ -1182,7 +1194,7 @@ impl Usbd {
         let Some(s) = self.client_slot(slot) else { return abi::ST_INVALID };
         let max = self.hc().caps.max_streams;
         let ss = matches!(self.slots[s].speed, abi::SPEED_SUPER | abi::SPEED_SUPER_PLUS);
-        if mask & 0b11 != 0 || mask == 0 || (count != 0 && (!count.is_power_of_two() || count < 2 || count > max)) || !ss {
+        if mask & 0b11 != 0 || mask == 0 || (count != 0 && !proto::streams_ok(count, max)) || !ss {
             return abi::ST_INVALID;
         }
         for d in (2..32).filter(|d| mask & (1 << d) != 0) {
@@ -1234,7 +1246,7 @@ impl Usbd {
             }
             let ep = &mut self.slots[s].eps[d];
             let old = (ep.ring, ep.stream_rings, ep.streams);
-            *ep = Ep { state: EpState::Stopped, ep: ep.ep, ring: main, streams: count as u16, stream_rings: srings };
+            *ep = Ep { state: EpState::Stopped, ep: ep.ep, ring: main, streams: count as u16, stream_rings: srings, halted: 0 };
             self.rings.free(old.0);
             old.1[..old.2 as usize].iter().filter(|&&r| r != NONE).for_each(|&r| self.rings.free(r));
         }
@@ -1247,13 +1259,14 @@ impl Usbd {
 
     /// URB_CANCEL: complete the URB with CANCELLED once the controller can
     /// no longer touch its buffers.  An URB not found may still be in the
-    /// transfer SQ, submitted before the cancel: take what is there first;
-    /// one still there (behind a full CQ) is skipped when its turn comes
-    /// and never completes (DROPPED).  One not found at all has completed.
+    /// transfer SQ, submitted before the cancel: take what is there first,
+    /// as far as this turn's records go; one still there (behind a full
+    /// CQ, or beyond them) is skipped when its turn comes and never
+    /// completes (DROPPED).  One not found at all has completed.
     fn cancel(&mut self, tag: u32) -> i32 {
         if self.urbs.find(tag).is_none() {
             // Leave the entry for this request's own completion.
-            self.accept_transfers(XFER_BUDGET, 1);
+            self.accept_transfers(1);
         }
         let Some(u) = self.urbs.find(tag) else { return self.drop_pending(tag) };
         let urb = self.urbs.get(u);
@@ -1272,7 +1285,9 @@ impl Usbd {
                 // The controller is on it, or about to be: move past it.
                 let actual = self.urbs.get(u).actual;
                 self.complete_cancelled(u, s, d, r, actual);
-                self.set_deq(s, d, r);
+                if !self.set_deq(s, d, r) {
+                    return abi::ST_OK;
+                }
             } else {
                 // Later on the ring, where the stopped controller has not
                 // been.  Before another posted URB: it skips it as no-ops,
@@ -1392,10 +1407,11 @@ impl Usbd {
         }
     }
 
-    /// Take up to `budget` transfer records while the CQ has room beyond
-    /// `keep` entries (and CTL_RESERVE) and the isoch TDs allow.
-    fn accept_transfers(&mut self, budget: u32, keep: u32) {
-        for _ in 0..budget {
+    /// Take transfer records, as many as this turn still may
+    /// (`xfer_budget`), while the CQ has room beyond `keep` entries (and
+    /// CTL_RESERVE) and the isoch TDs allow.
+    fn accept_transfers(&mut self, keep: u32) {
+        while self.xfer_budget > 0 {
             let Some(cl) = self.client.as_mut() else { return };
             if self.dead {
                 return;
@@ -1411,16 +1427,17 @@ impl Usbd {
                 cl.skip &= !bit;
                 cl.xfer.tail = cl.xfer.tail.wrapping_add(1);
                 cl.publish(|i| &mut i.xfer_sq_tail, cl.xfer.tail);
+                self.xfer_budget -= 1;
                 continue;
             }
             if cl.room() <= CTL_RESERVE + keep || cl.iso_tds + abi::MAX_ISO as u32 > MAX_ISO_TDS {
-                cl.blocked = true;
                 return;
             }
             let base = (cl.area + abi::XFER_SQ_OFF) as *const XferReq;
             let req = unsafe { proto::read_record(base, abi::XFER_SQ_SIZE as u32, cl.xfer.tail) };
             cl.xfer.tail = cl.xfer.tail.wrapping_add(1);
             cl.publish(|i| &mut i.xfer_sq_tail, cl.xfer.tail);
+            self.xfer_budget -= 1;
             self.transfer(&req);
         }
     }
@@ -1441,6 +1458,7 @@ impl Usbd {
         if self.dead {
             return;
         }
+        self.xfer_budget = XFER_BUDGET;
         self.recover_all();
         self.refill();
         // Control requests complete at once, in order.
@@ -1462,7 +1480,7 @@ impl Usbd {
             }
             self.refill();
         }
-        self.accept_transfers(XFER_BUDGET, 0);
+        self.accept_transfers(0);
         self.recover_all();
         self.refill();
     }
@@ -1529,7 +1547,8 @@ impl Usbd {
         let ok = ok && self.hc().start();
         self.resets += 1;
         let Some(c) = &mut self.client else { return };
-        unsafe { write_volatile(addr_of_mut!((*c.info()).hc_resets), self.resets as u32) };
+        c.resets = c.resets.wrapping_add(1);
+        unsafe { write_volatile(addr_of_mut!((*c.info()).hc_resets), c.resets) };
         if !ok {
             l4h_rt::log!("l4h-usbd: the controller did not restart: dead until the guest is gone");
             self.dead = true;
@@ -1588,9 +1607,11 @@ impl Usbd {
             idx, area, pool, max_transfer,
             ctl: Sq { tail: 0, size: abi::CTL_SQ_SIZE as u32 },
             xfer: Sq { tail: 0, size: abi::XFER_SQ_SIZE as u32 },
-            cq_head: 0, eq_head: 0, in_flight: 0, iso_tds: 0, reset_seen: 0, irq, notify: false, lost: 0, blocked: false, skip: 0,
+            cq_head: 0, eq_head: 0, in_flight: 0, iso_tds: 0, reset_seen: 0, resets: 0, irq, notify: false, lost: 0, skip: 0,
         });
         self.dead = false;
+        // What this client's controller logs is limited anew.
+        self.errors = l4h_rt::ErrorLimit::new();
         if !self.hc().start() {
             self.dead = true;
             self.client.as_ref().unwrap().set_state(abi::DEAD);
@@ -1723,8 +1744,10 @@ fn main(info: &'static l4h_rt::Info) -> ! {
         slots: unsafe { &mut *addr_of_mut!(SLOTS) },
         rings: Rings::new(),
         urbs: Urbs::new(),
-        recover: l4h_rt::host::fixed::ArrayVec::new(),
+        recover: proto::EpSet::new(),
         refill: [0; proto::USB_RINGS / 64],
+        xfer_budget: 0,
+        backlog: false,
         refused: 0,
         resets: 0,
         dead: false,
@@ -1740,9 +1763,10 @@ fn main(info: &'static l4h_rt::Info) -> ! {
         if badge & host::badges::usbd::IRQ != 0 {
             irq.irq_handler_ack().expect("usbd IRQ ack");
         }
-        // More work: another bounded turn.  The guest kicks only once
-        // usbd_waiting is set, so its kicks never pile up.
-        if u.prepare_wait() {
+        // More work (events left on the ring, or the client's): another
+        // bounded turn.  The guest kicks only once usbd_waiting is set, so
+        // its kicks never pile up.
+        if u.backlog || u.prepare_wait() {
             badge = host::badges::usbd::KICK;
             continue;
         }

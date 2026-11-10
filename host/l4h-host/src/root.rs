@@ -93,14 +93,19 @@ crate::protocol! {
         /// (trust::HW_*): `addr` is a physical address, I/O port or PCI
         /// function (bus << 8 | device << 3 | function), `off` a PCI config
         /// offset, `width` in bytes, `value` the value to write.  The value
-        /// read (all ones if refused).  Root refuses RAM, memory and ports
-        /// in use, the BARs of the PCI functions it manages, and writes
-        /// to those functions' configuration space, by the configuration
-        /// mechanism or ECAM (reads are served); only for the ACPI start
-        /// method.
+        /// read (all ones if refused).  Root serves only free device
+        /// memory (never RAM, nor another partition's memory, nor what
+        /// root or a driver uses, their functions' BARs included), free
+        /// I/O ports that do not reset, suspend or enter SMM, and PCI
+        /// configuration, by the configuration mechanism or ECAM: every
+        /// read, and writes to functions root does not manage, except, in
+        /// any function, to the command register, the BARs and the
+        /// expansion ROM's.  Only for the ACPI start method.
         Hw / hw = 5 from [Trustd] (op: u64, addr: usize, off: usize, width: usize, value: u64) -> u64;
         /// trustd answered guest `guest`'s request: raise its device's
-        /// event.
+        /// event.  Root posts vmmgr at most one notice a guest at a time,
+        /// and a bounded number between two of its timer's ticks
+        /// (trust::AttestNotices): the event may come that much later.
         AttestDone / attest_done = 6 from [Trustd] (guest: usize) -> ();
         /// Send trustd's relay outbox, `len` bytes, to partition `peer`'s
         /// trustd (trust::RELAY_*).
@@ -111,6 +116,7 @@ crate::protocol! {
         /// (root's, so that it is one): the CNode of the pool's frames
         /// (radix: the pool's pages), the notification, and with an
         /// attestation device its page and kick capability (badged).
+        /// EEXIST for a dom0 while another lives: there is one.
         GuestNew / guest_new = 0x100 from [Vmmgr] (guest: usize, pool: usize, gpa: usize, dom0: bool)
             caps {
                 Out POOL_FRAMES: CNode [0; 1],
@@ -135,14 +141,14 @@ crate::protocol! {
         DiskAttach / disk_attach = 0x102 from [Vmmgr]
             (guest: usize, disk: usize, flags: u64, lba_start: u64, lba_count: u64, n: usize, list: u64) -> Later<()>;
         /// A port of `switch` for the guest, with MAC `mac` (0: choose; else
-        /// 48 bits, not multicast): the CNode of the port's frames (radix
+        /// 48 bits, not multicast): a CNode of copies of the port's frames (radix
         /// vmmgr::PORT_RADIX) and netd's kick.  The MAC.  EIO once netd
         /// has failed.
         NicAdd / nic_add = 0x103 from [Vmmgr] (guest: usize, switch: u32, mac: u64, lock: bool, isolated: bool)
             caps { Out PORT_FRAMES: CNode [0; 1], Out KICK: Notification [1; 1] } -> u64;
         /// The guest starts, with `ram` bytes, `vcpus` and its launch
         /// digest: its reports describe it from now on.  Whether it is
-        /// dom0 is root's to say.
+        /// dom0 is root's to say.  Once for a guest: EEXIST after.
         TrustRegister / trust_register = 0x104 from [Vmmgr] (guest: usize, ram: u64, vcpus: u32, launch: [u64; 4]) -> ();
         /// A control op that root serves (abi::CTL_*: host, disks,
         /// switches, NICs): its vals; its data is in the result page.  The

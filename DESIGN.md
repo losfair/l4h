@@ -1144,11 +1144,12 @@ Global on each core, with `P_K` = `PRIO_KERNEL` = 100:
 Other host services run with full budgets; guests' vCPUs are bounded by their
 SCs. A CPU cap bounds a guest's vCPUs only: what its VMM does for it
 (hypercalls, virtio queues, the display, the console) runs on the VMM's
-scheduling context at `P_K + 2`, on the core of the guest's first vCPU, and
-is not charged to the guest. memd charges hotplug to the guest's token
-bucket (§8.5); a guest that keeps its VMM busy still takes that core's
-time from other guests' vCPUs there. Because `P_K > P_U` for every guest, one guest's kernel work can
-briefly preempt another guest's user work, bounded by `SC_K` budgets.
+scheduling context at `P_K + 2`, on the core of the guest's first vCPU, and is
+not charged to the guest. memd charges hotplug to the guest's token bucket
+(§8.5); a guest that keeps its VMM busy still takes that core's time from
+other guests' vCPUs there. Because `P_K > P_U` for every guest, one guest's
+kernel work can briefly preempt another guest's user work, bounded by `SC_K`
+budgets.
 
 ### 7.2 Budgets and CPU caps
 
@@ -2039,16 +2040,19 @@ firewalling belong in a VM.
   the uplink of one switch; a switch without one is internal. VLAN tags pass
   through untouched. VLAN-aware switching, jumbo MTUs on guest ports, static
   MAC entries and port rate limits are not implemented.
-- **Ports and copies.** A vNIC has TX and RX rings of 24 frame slots of
-  68 KiB each, so a slot holds a whole 64 KiB TSO frame, shared by its VMM and netd, in memory of the guest's root arena, whose frame capabilities stay root's (vmmgr gets copies, which revoke nothing); root adds
-  and removes ports with `net::call::add_port`/`remove_port`. The guest
-  bounces buffers through its I/O pool, the VMM copies between pool and
-  port slots, and netd copies slot to slot or slot to NIC DMA buffer.
+- **Ports and copies.** A vNIC has TX and RX rings of 24 frame slots of 68 KiB
+  each, so a slot holds a whole 64 KiB TSO frame, shared by its VMM and netd,
+  in memory of the guest's root arena, whose frame capabilities stay root's
+  (vmmgr gets copies, which revoke nothing); root adds and removes ports with
+  `net::call::add_port`/`remove_port`. The guest bounces buffers through its
+  I/O pool, the VMM copies between pool and port slots, and netd copies slot
+  to slot or slot to NIC DMA buffer.
 - **Offloads.** Checksum and TSO metadata pass through in the virtio-net
-  header. netd validates flags, checksum offsets and GSO type, including
-  that a GSO frame is TCP over IPv4/IPv6, and drops incoherent headers. A
-  frame for a port that cannot take its offload is segmented and checksummed
-  in software. A guest port takes a GSO frame whole only if its driver accepted both large frames and partial checksums.
+  header. netd validates flags, checksum offsets and GSO type, including that
+  a GSO frame is TCP over IPv4/IPv6, and drops incoherent headers. A frame for
+  a port that cannot take its offload is segmented and checksummed in
+  software. A guest port takes a GSO frame whole only if its driver accepted
+  both large frames and partial checksums.
 - **Receive offloads.** netd's virtio-net driver negotiates `GUEST_CSUM`
   and, with mergeable RX buffers (`MRG_RXBUF`, 256 × 4 KiB), `GUEST_TSO4/6`,
   so a device with large frames delivers them whole. Frames from the uplink
@@ -2070,12 +2074,14 @@ firewalling belong in a VM.
   those bounds is a frame dropped, so a guest that stops reading costs
   nobody else more than that share. Dropping instead costs a TCP
   retransmission timeout per burst.
-- **NIC interrupts and notifications.** netd turns RX interrupts off while
-  it drains a NIC's queue (re-checking after turning them on) and takes TX
-  interrupts only while frames wait for a TX buffer. A turn takes at most 256 frames from a NIC: with more left, netd serves its ports, links and root's commands and comes back, without waiting for an interrupt. It notifies the device
-  once per batch, and not while the device says it is busy with the queue
-  (`VIRTQ_USED_F_NO_NOTIFY`). Each interrupt and notification is a VM exit
-  in a cloud VM.
+- **NIC interrupts and notifications.** netd turns RX interrupts off while it
+  drains a NIC's queue (re-checking after turning them on) and takes TX
+  interrupts only while frames wait for a TX buffer. A turn takes at most 256
+  frames from a NIC: with more left, netd serves its ports, links and root's
+  commands and comes back, without waiting for an interrupt. It notifies the
+  device once per batch, and not while the device says it is busy with the
+  queue (`VIRTQ_USED_F_NO_NOTIFY`). Each interrupt and notification is a VM
+  exit in a cloud VM.
 - **Learning and security.** MAC entries age after 300 s, with at most 1024
   per switch and 8192 in all. A full table drops expired entries and then
   stops learning; unknown unicast, broadcast and multicast are flooded
@@ -2510,52 +2516,53 @@ controller, one per claimed controller, and the guest forwards Linux's
 
 - **Discovery and claim.** At boot root only lists functions of class
   `0c/03/30` (up to `MAX_USB_CTRLS`, 16) and leaves them to the firmware:
-  legacy keyboard emulation and BMC virtual devices keep working, and a
-  host that assigns no USB spends nothing (`l4hctl usb`: `firmware`). The
-  first `CTL_USB_ATTACH` (or dom0's `dom0_usb=`) claims one: root reads its
-  capability registers through a temporary uncached mapping, allocates
-  usbd's DMA region (one contiguous Untyped, `host::usb::dma_bytes`: the
-  scratchpad, DCBAA and contexts, command and event rings and a pool of 256
-  transfer rings of 512 TRBs; 4 MiB for QEMU's), maps BAR 0 uncached into a new usbd,
-  binds the interrupt (MSI-X entry 0, or plain MSI, which Intel PCH
-  controllers have instead) to its notification, and posts `usb::call::claim` in
-  usbd's mailbox (`l4h_host::mailbox`, §10, "Root never waits on a
-  driver").
-  usbd walks the extended capabilities (bounded: 256 entries inside BAR 0,
-  `host::usb::xcaps`), takes the controller from the firmware (OS Owned,
-  then up to 1 s for BIOS Owned to clear, else it clears it, as Linux
-  does; legacy SMIs off), halts and resets it. Root routes Intel PCH ports
-  to the xHCI once usbd has answered. Root never calls usbd: a guest that
-  has the controller can keep usbd busy, and even the claim's handoff and
-  reset take up to seconds, which would hold up every guest's control
-  requests. Claim, attach and release are requests in the mailbox: usbd
-  answers them in order when it gets to them, and root finishes each from
-  its serve loop (`usb::poll`). The attachment that claimed the controller
-  does not wait for the claim: the guest gets its queue area at once, its
-  attach is posted when the claim is answered, and if the claim fails the
-  controller is quarantined and the guest's driver finds no magic. usbd
-  publishes its refused requests and resets in the mailbox's second page
-  (`usb::Published`, for `l4hctl usb`). A controller once claimed stays
-  with its usbd until reboot,
-  `idle` (halted, bus mastering off, its DMA region kept) when no guest has
-  it, and `failed` if a reset or drain fails. Renesas uPD72020x without a
-  firmware ROM and controllers without MSI are `unsupported`.
-- **Attach.** `root::call::usb_attach (guest, device, controller)`: vmmgr names
-  both by number; root claims the controller if needed, makes the queue
-  area (101 host frames in an arena of root's own, mapped into usbd, and
-  copies of them for the guest), usbd's kick, mints the guest's VMM
+  legacy keyboard emulation and BMC virtual devices keep working, and a host
+  that assigns no USB spends nothing (`l4hctl usb`: `firmware`). The first
+  `CTL_USB_ATTACH` (or dom0's `dom0_usb=`) claims one: root reads its
+  capability registers through a temporary uncached mapping (a controller the
+  firmware is still resetting gets 5 ms to become ready; the attach is then
+  refused with `EBUSY`, the controller stays the firmware's and the attach can
+  be tried again), allocates usbd's DMA region (one contiguous Untyped,
+  `host::usb::dma_bytes`: the scratchpad, DCBAA and contexts, command and
+  event rings and a pool of 256 transfer rings of 512 TRBs; 4 MiB for QEMU's),
+  maps BAR 0 uncached into a new usbd, binds the interrupt (MSI-X entry 0, or
+  plain MSI, which Intel PCH controllers have instead) to its notification,
+  and posts `usb::call::claim` in usbd's mailbox (`l4h_host::mailbox`, §10,
+  "Root never waits on a driver"). usbd walks the extended capabilities
+  (bounded: 256 entries inside BAR 0, `host::usb::xcaps`), takes the
+  controller from the firmware (OS Owned, then up to 1 s for BIOS Owned to
+  clear, else it clears it, as Linux does; legacy SMIs off), halts and resets
+  it. Root routes Intel PCH ports to the xHCI once usbd has answered. Root
+  never calls usbd: a guest that has the controller can keep usbd busy, and
+  even the claim's handoff and reset take up to seconds, which would hold up
+  every guest's control requests. Claim, attach and release are requests in
+  the mailbox: usbd answers them in order when it gets to them, and root
+  finishes each from its serve loop (`usb::poll`). The attachment that claimed
+  the controller does not wait for the claim: the guest gets its queue area at
+  once, its attach is posted when the claim is answered, and if the claim
+  fails the controller is quarantined and the guest's driver finds no magic.
+  usbd publishes its refused requests and resets in the mailbox's second page
+  (`usb::Published`, for `l4hctl usb`). A controller once claimed stays with
+  its usbd until reboot, `idle` (halted, bus mastering off, its DMA region
+  kept) when no guest has it, and `failed` if a reset or drain fails. Renesas
+  uPD72020x without a firmware ROM and controllers without MSI are
+  `unsupported`.
+- **Attach.** `root::call::usb_attach (guest, device, controller)`: vmmgr
+  names both by number; root claims the controller if needed, makes the queue
+  area (101 host frames in an arena of root's own: usbd maps the frames' own
+  capabilities and the guest's are copies of those, which root can revoke
+  without touching usbd's mapping), usbd's kick, mints the guest's VMM
   notification (root's, from `guest_new`) for usbd with bit n of
-  `badges::vmm::USB` (`wiring::USBD_VMM`), maps the pool into the controller's IOMMU domain,
-  turns bus mastering on and posts `usb::call::attach` with the pool's addresses
-  from its own table. usbd keeps two areas (`AREAS`): while the previous
-  guest's release still runs, the next guest gets the other, and its
-  attach (bus mastering with it) waits for the release (or the claim)
-  to be answered; the guest's
-  driver waits for usbd to write the area's magic. vmmgr maps the area into the guest at
-  `L4H_USB_AREA_VA(n)` (the pages usbd writes read-only) and adds an
-  `L4H_DEV_USB` device (ABI 7). A guest has at most four
-  (`L4H_MAX_GUEST_USB`); `l4hctl create --usb BDF` raises the default I/O
-  pool by 4 MiB each.
+  `badges::vmm::USB` (`wiring::USBD_VMM`), maps the pool into the controller's
+  IOMMU domain, turns bus mastering on and posts `usb::call::attach` with the
+  pool's addresses from its own table. usbd keeps two areas (`AREAS`): while
+  the previous guest's release still runs, the next guest gets the other, and
+  its attach (bus mastering with it) waits for the release (or the claim) to
+  be answered; the guest's driver waits for usbd to write the area's magic.
+  vmmgr maps the area into the guest at `L4H_USB_AREA_VA(n)` (the pages usbd
+  writes read-only) and adds an `L4H_DEV_USB` device (ABI 7). A guest has at
+  most four (`L4H_MAX_GUEST_USB`); `l4hctl create --usb BDF` raises the
+  default I/O pool by 4 MiB each.
 - **The queue area** (`include/l4h/abi.h`): usbd's info page (ports and
   their USB revision, slots, streams, the largest transfer, its indices),
   the guest's index page, a control SQ (32 records of 256 bytes: port
@@ -2570,55 +2577,61 @@ controller, one per claimed controller, and the guest forwards Linux's
   the vCPU the guest routed it to (`L4H_HC_DEV_WRITE`, as virtio's): the
   VMM sees no request, maps nothing of the controller and needs no
   capability from vmmgr.
-- **usbd** is a Rust xHCI driver in the shape of blkd's: one command ring,
-  one event ring of 4096 TRBs (interrupter 0, IMOD 40 us, which the guest
-  cannot change; in one 64 KiB-aligned segment), a ring per endpoint or
-  stream from the fixed pool, TDs laid out as Linux's `xhci-ring.c` does
-  (64 KiB splits, TD Size, TBC and TLBPC for isoch, ISP on IN data, a bulk
-  zero-length packet as a TD of its own). usbd schedules isoch URBs, as
-  Linux's HCD does: right after the endpoint's previous URB, or past MFINDEX
-  plus the scheduling threshold for an idle one, reporting the start frame
-  in the CQE; with CFC, TDs carry Frame IDs from it, the device speed and
-  the service interval (SIA when it is out of the valid window, or ASAP).
-  usbd publishes MFINDEX with the host counter (TSC, CNTVCT) at which it
-  read it, under a sequence count, each time it runs; the guest's frame
-  number goes on from that sample at 8000 microframes a second, so it
-  advances while usbd sleeps. A cancelled isoch URB reports its packets as
-  done, failed or cancelled (the one the controller stopped in with its
-  bytes), and its length as their sum.
-  An isoch TD that fails before its last TRB stays on the ring until an
-  event shows the controller past it; an event on a later isoch URB retires
-  the ones before it, their unreported TDs missed (a Missed Service event
-  may carry no TRB pointer). A TD crosses the Link TRB only where its data
-  before it ends on a packet boundary (xHCI §4.11.7.1); otherwise its URB
-  goes at the start of the ring after no-ops, which even an empty ring has
-  room for, and which stay reserved until the URB completes. Commands run one at a time, polling the
-  event ring (5 s timeout). An endpoint halted by an error is recovered
-  with Reset Endpoint and Set TR Dequeue past the failed URB, as Linux
-  does; a cancelled URB is skipped (dequeue moved, or its TRBs made
-  no-ops, unchained, which stay reserved with the URB after them until the
-  controller is past them, or wound back off a stopped ring after its last
-  posted URB) and completed only once the endpoint has stopped, and every
-  stream of the endpoint restarted. One whose record usbd has not taken
-  (it waits behind a full CQ) is marked to be skipped and never completes
-  (`ST_DROPPED`; the guest gives it back). A URB that
-  does not fit its ring waits in usbd, so one full ring does not hold up
+- **usbd** is a Rust xHCI driver in the shape of blkd's: one command ring, one
+  event ring of 4096 TRBs (interrupter 0, IMOD 40 us, which the guest cannot
+  change; in one 64 KiB-aligned segment), a ring per endpoint or stream from
+  the fixed pool, TDs laid out as Linux's `xhci-ring.c` does (64 KiB splits,
+  TD Size, TBC and TLBPC for isoch, ISP on IN data, a bulk zero-length packet
+  as a TD of its own). usbd schedules isoch URBs, as Linux's HCD does: right
+  after the endpoint's previous URB, or past MFINDEX plus the scheduling
+  threshold for an idle one, reporting the start frame in the CQE; with CFC,
+  TDs carry Frame IDs from it, the device speed and the service interval (SIA
+  when it is out of the valid window, or ASAP). usbd publishes MFINDEX with
+  the host counter (TSC, CNTVCT) at which it read it, under a sequence count,
+  each time it runs; the guest's frame number goes on from that sample at 8000
+  microframes a second, so it advances while usbd sleeps. A cancelled isoch
+  URB reports its packets as done, failed or cancelled (the one the controller
+  stopped in with its bytes), and its length as their sum. An isoch TD that
+  fails before its last TRB stays on the ring until an event shows the
+  controller past it; an event on a later isoch URB retires the ones before
+  it, their unreported TDs missed (a Missed Service event may carry no TRB
+  pointer). A TD crosses the Link TRB only where its data before it ends on a
+  packet boundary (xHCI §4.11.7.1); otherwise its URB goes at the start of the
+  ring after no-ops, which even an empty ring has room for, and which stay
+  reserved until the URB completes. Commands run one at a time, polling the
+  event ring (5 s timeout). An endpoint halted by an error is recovered with
+  Reset Endpoint and Set TR Dequeue past the failed URB, as Linux does (one
+  pending recovery an endpoint, on the ring it has by then); a cancelled URB
+  is skipped (dequeue moved, or its TRBs made no-ops, unchained, which stay
+  reserved with the URB after them until the controller is past them, or wound
+  back off a stopped ring after its last posted URB) and completed only once
+  the endpoint has stopped, and every stream of the endpoint restarted. One
+  whose record usbd has not taken (it waits behind a full CQ) is marked to be
+  skipped and never completes (`ST_DROPPED`; the guest gives it back). A URB
+  that does not fit its ring waits in usbd, so one full ring does not hold up
   other endpoints. A command timeout, HSE or HCE resets the controller and
   posts `HC_RESET`; only its owner is affected.
-- **Validation** (`host::usb`, the code tests/fuzz-usbreq runs): every
-  record is copied before it is checked, every index against usbd's own
-  copy and the ring size; every segment must lie in the pool
-  (`blk::Pool::translate`) and the total within the advertised maximum;
-  slots must be the client's and endpoints configured, with the type and
-  direction of the transfer; endpoint fields must be in the xHCI range for
-  their speed and type; route strings at most five tiers; isoch packets
-  inside the data; port writes only the bits the feature names. A request
-  is accepted only while the CQ has room for it, so it never overflows and
-  a guest that does not consume completions stalls only itself; transfers
-  leave one entry for control requests, so an `URB_CANCEL` always gets in.
-  usbd's turns are bounded (one SQ's worth of each), so a guest refilling
-  its queues from another vCPU does not keep usbd from its events and the
-  mailbox.
+- **Validation** (`host::usb`, the code tests/fuzz-usbreq runs): every record
+  is copied before it is checked, every index against usbd's own copy and the
+  ring size; every segment must lie in the pool (`blk::Pool::translate`) and
+  the total within the advertised maximum; slots must be the client's and
+  endpoints configured, with the type and direction of the transfer; endpoint
+  fields must be in the xHCI range for their speed and type, the interval
+  included; route strings at most five tiers; a device behind no transaction
+  translator names no TT port; a stream count is a power of two from 4 (a
+  stream array has no fewer entries); the context dwords the controller gets
+  are made from the checked fields, and slot context dwords copied back from
+  an output context are masked, so a guest sets no reserved bit and no
+  Interrupter Target (every event goes to interrupter 0, the only one usbd
+  sets up); isoch packets inside the data; port writes only the bits the
+  feature names. A request is accepted only while the CQ has room for it, so
+  it never overflows and a guest that does not consume completions stalls only
+  itself; transfers leave one entry for control requests, so an `URB_CANCEL`
+  always gets in. usbd's turns are bounded (one SQ's worth of each, the
+  transfer records an `URB_CANCEL` takes in on the way included, and one event
+  ring's worth of events), so neither a guest refilling its queues from
+  another vCPU nor a controller that keeps producing events keeps usbd from
+  its events and the mailbox.
 - **DMA without an IOMMU.** Every DMA pointer the controller reads is
   written by usbd into its own region, which no guest maps: registers,
   DCBAA, scratchpad, contexts, stream arrays, rings and Link TRBs. Every
@@ -2628,24 +2641,24 @@ controller, one per claimed controller, and the guest forwards Linux's
   controller's domain holds only usbd's region and the attached pool, and
   interrupt remapping confines its MSI. What remains without one is, as for
   blkd and netd, a bug in usbd or a controller erratum.
-- **Release.** `GUEST_DEL` cuts the controller off without waiting for
-  usbd: root revokes the guest's copies of the queue frames, turns bus
-  mastering off and reads the command register back (the controller can
-  issue no more DMA, and that read's completion cannot pass the writes it
-  already posted, so they are in memory: the pool can be reused at once,
-  with or without an IOMMU), unmaps the pool from the
-  domain, deletes usbd's copy of the VMM notification (usbd signals it with
-  NBSend, which an empty slot ignores) and posts `usb::call::remove`, after the
-  attach if usbd has not answered that yet. usbd then halts and resets the
-  controller and forgets every URB; when it answers root frees the area, and the controller is `idle` for the next
+- **Release.** `GUEST_DEL` cuts the controller off without waiting for usbd:
+  root revokes the guest's copies of the queue frames, turns bus mastering off
+  and reads the command register back (the controller can issue no more DMA,
+  and that read's completion cannot pass the writes it already posted, so they
+  are in memory: the pool can be reused at once, with or without an IOMMU),
+  unmaps the pool from the domain, deletes usbd's copy of the VMM notification
+  (usbd signals it with NBSend, which an empty slot ignores) and posts
+  `usb::call::remove`, after the attach if usbd has not answered that yet.
+  usbd then halts and resets the controller and forgets every URB; when it
+  answers root frees the area, and the controller is `idle` for the next
   guest, which enumerates its devices again. Bus mastering stays off until
   then: the next guest's attach turns it on only after the reset, so the
-  controller never finishes a transfer it had started into the reused pool
-  (a disk controller, which other guests share, cannot be cut off this way,
-  §10.3). If the reset fails root
-  quarantines the controller (decoding, bus mastering and MSI off). A
-  reset does not reset USB devices' firmware: a controller carries its
-  devices with it.
+  controller never finishes a transfer it had started into the reused pool (a
+  disk controller, which other guests share, cannot be cut off this way,
+  §10.3). If the reset fails root quarantines the controller (decoding, bus
+  mastering and MSI off); its guest's pool is then reused like any other's, as
+  the controller has no bus mastering. A reset does not reset USB devices'
+  firmware: a controller carries its devices with it.
 - **Guest.** `usb-l4h` (`arch/l4h/drivers/usb_l4h.c`) registers a USB 2 and
   a shared USB 3 HCD whose root hubs have the controller's ports; the
   stock USB core does enumeration, hubs, descriptors and class drivers, so
@@ -2745,14 +2758,14 @@ pending, and so does whatever waits for it, nothing else:
   and no later guest of that controller gets a working one.
 - **Teardown waits for no one.** A destroyed guest's I/O pool leaves the
   devices' IOMMU domains at once and is reused; what drivers map (disk
-  channels, extent tables, port memory) is kept until they say they have
-  let go, and with it, without an IOMMU, the pool (a `Zombie`). Revoking
-  the memory would also unmap it from the driver, but an honest driver
-  would fault. A driver that never answers keeps that memory, and the
-  client and port slots, for good, and each such guest keeps a guest's
-  place: root admits a guest other than dom0 only while live guests and
-  zombies are fewer than 64, so every deletion finds a zombie, and a
-  guest whose drivers answer gets all its memory back.
+  channels, extent tables, port memory) is kept until they say they have let
+  go, and with it, without an IOMMU, the pool (a `Zombie`). Revoking the
+  memory would also unmap it from the driver, but an honest driver would
+  fault. A driver that never answers keeps that memory, and the client and
+  port slots, for good, and each such guest keeps a guest's place: root admits
+  a guest other than dom0 only while live guests and zombies are fewer than
+  64, and a dom0 only while no other lives (`EEXIST`), so every deletion finds
+  a zombie, and a guest whose drivers answer gets all its memory back.
 - A full ring (64 requests) refuses new ones with `EBUSY`; removals queue
   in root until there is room.
 - **A driver that faults** fails in root, not in itself. Drivers have no
@@ -2876,55 +2889,55 @@ one way to do each part of it:
   answers `wire::FAILED` (memd's and vmmgr's keeper; root itself for a
   faulted driver's mailbox, `Mailbox::abandon`), and a
   method that must leave its caller blocked returns `wire::NO_REPLY`.
-- **Transports.** An endpoint's calls go through `l4h-ipc`: clients call
-  an `l4h_ipc::Endpoint<P>`, which serves protocol P and is made from a
-  call edge whose protocol is P (`Endpoint::of`, or `chosen` for one in a
-  slot of the holder's choosing), so only P's `Client` methods can be
-  called on it (`MemdLink` is one with exchange slots). Every server's
-  thread runs `l4h_ipc::run`, the one serve loop: the server
-  (`l4h_ipc::Server`) names its badge space's signals, the FAULT bit if
-  faults come to it, and its `Sender`; `run` tells signals, faults and
-  calls apart by the badge, decodes the sender (`wire::Badged`) and
-  refuses with `EINVAL` any badge that is no sender, answers no fault,
-  and replaces a reply object left bound to an unanswered caller
-  (`l4h_task::reply::ReplySlot`, where the server can). It records, before
-  the server's code runs, whether its reply object holds a call
-  (`l4h_ipc::holds_call`), for the failure service. `l4h_ipc::serve`
-  takes a call's arguments out of the message registers before its
-  handler runs and puts the reply there after it returns, and `run` keeps
-  a message, and a reply not yet sent, there across the server's other
-  work, so no invocation can overwrite either; both copy only the
-  message's own words, and `serve` at most its protocol's longest call
-  and reply. A reply's first word is 0 or an errno, at most
-  `errno::MAX_ERRNO`: a client takes anything above as a failed server
-  (`wire::reply`), so no answer of a less trusted server (a driver's, to
-  root) passes for a value the host gives a meaning of its own
-  (`wire::NO_REPLY`, a deferred request) or overflows a guest status. A
-  thread that is not called (trustd's main thread, logd, the drivers)
-  waits on its notification instead. Only l4h-ipc calls, serves and
-  receives on endpoints (and l4h-rt's keeper and failure answers, which
-  serve no protocol), and nothing sends on one without calling: a send
-  gives a server no reply to make, and a passive one no scheduling
-  context to come back on. clippy's `disallowed-methods`
-  (`host/clippy.toml`, `tests/check-ipc.sh`) refuses those seL4 calls
-  anywhere else; the one send left is `l4h_rt::mailbox::notify`'s, to a
-  notification. A
-  driver's mailbox carries the same protocols without IPC: root posts a
-  typed `Request` (`Mailbox::send`) and decodes each answer by its
-  call's reply type; the driver answers with `l4h_rt::mailbox::serve`,
-  which reads and writes the ring and never the registers. Capabilities
-  still cross in exchange slots, which each call's declaration names,
-  with their direction and kind: both ends find a slot with
-  `Caps::passed_in` or `passed_out`, which refuse, at compile time, the
-  other direction and another kind than the type of the capability that
-  end's own code puts or takes (`l4h_ipc::Kind`). Nothing checks what the
-  other end left in the slot: a release seL4 cannot tell a capability's
-  type. So a receiver never invokes what a less trusted sender passed: it
-  only moves or deletes it (memd's `free` deletes vmmgr's and revokes its
-  own originals), and a capability the more trusted side must invoke is
-  one it made and passes out (memd's GuestCreate CNodes). vmmgr invokes
-  only what root and memd pass it, and root only memd's Untypeds, which
-  are memd's to give.
+- **Transports.** An endpoint's calls go through `l4h-ipc`: clients call an
+  `l4h_ipc::Endpoint<P>`, which serves protocol P and is made from a call edge
+  whose protocol is P (`Endpoint::of`, or `chosen` for one in a slot of the
+  holder's choosing), so only P's `Client` methods can be called on it
+  (`MemdLink` is one with exchange slots). Every server's thread runs
+  `l4h_ipc::run`, the one serve loop: the server (`l4h_ipc::Server`) names its
+  badge space's signals, the FAULT bit if faults come to it, and its `Sender`;
+  `run` tells signals, faults and calls apart by the badge, decodes the sender
+  (`wire::Badged`) and refuses with `EINVAL` any badge that is no sender,
+  answers no fault, and replaces a reply object left bound to an unanswered
+  caller (`l4h_task::reply::ReplySlot`, where the server can). It records,
+  before the server's code runs, whether its reply object holds a call
+  (`l4h_ipc::holds_call`), for the failure service. `l4h_ipc::serve` takes a
+  call's arguments out of the message registers before its handler runs and
+  puts the reply there after it returns, and `run` keeps a message, and a
+  reply not yet sent, there across the server's other work, so no invocation
+  can overwrite either; both copy only the message's own words, and `serve` at
+  most its protocol's longest call and reply. A reply's first word is 0 or an
+  errno, at most `errno::MAX_ERRNO`: a client takes anything above as a failed
+  server (`wire::reply`), so no answer of a less trusted server (a driver's,
+  to root) passes for a value the host gives a meaning of its own
+  (`wire::NO_REPLY`, a deferred request) or overflows a guest status. A thread
+  that is not called (trustd's main thread, logd, the drivers) waits on its
+  notification instead. Only l4h-ipc calls, serves and receives on endpoints
+  (and l4h-rt's keeper and failure answers, which serve no protocol), and
+  nothing sends on one without calling: a send gives a server no reply to
+  make, and would leave a passive one without a scheduling context to come
+  back on (the host has no passive server: the flags server keeps a scheduling
+  context of its own, §10.2). clippy's `disallowed-methods`
+  (`host/clippy.toml`, `tests/check-ipc.sh`) refuses those seL4 calls anywhere
+  else; the one send left is `l4h_rt::mailbox::notify`'s, to a notification. A
+  driver's mailbox carries the same protocols without IPC: root posts a typed
+  `Request` (`Mailbox::send`) and decodes each answer by its call's reply
+  type; the driver answers with `l4h_rt::mailbox::serve`, which reads and
+  writes the ring and never the registers. Capabilities still cross in
+  exchange slots, which each call's declaration names, with their direction
+  and kind: both ends find a slot with `Caps::passed_in` or `passed_out`,
+  which refuse, at compile time, the other direction and another kind than the
+  type of the capability that end's own code puts or takes (`l4h_ipc::Kind`).
+  Nothing checks what the other end left in the slot: a release seL4 cannot
+  tell a capability's type. So a receiver never invokes what a less trusted
+  sender passed: it only moves or deletes it (memd's `free` deletes vmmgr's
+  and revokes its own originals), and a capability the more trusted side must
+  invoke is one it made and passes out (memd's GuestCreate CNodes). Nor does
+  the more trusted side keep a mapping under a capability the other can
+  revoke: root reads dom0's control data area, so it keeps the frames' own
+  capabilities and gives vmmgr a CNode of copies, as for a USB queue area and
+  a netd port's frames. vmmgr invokes only what root and memd pass it, and
+  root only memd's Untypeds, which are memd's to give.
 - **Wiring.** Every capability by which one party calls, signals or
   faults to another is an edge of `l4h_host::wiring`: its holder and
   where it holds it (fixed slots, a slot its minter chooses, an IRQ
@@ -3037,10 +3050,13 @@ requests distinguish power off, reboot and kernel panic.
   report overwritten, dropped, torn and incomplete records as unavailable;
   no reader consumes another's history or blocks the host. What a record's
   text holds is made printable (`log::printable`) before it is handed out.
-- **Rate limit.** A record that a less trusted party can make vmmgr write
-  (a guest's faults and power requests, its VMM's calls) goes through
-  `log::RateLimit`: per guest, 8 at once and then one a second, fixed
-  state; the next record let through says how many were not.
+- **Rate limit.** A record that a less trusted party can make vmmgr write (a
+  guest's faults and power requests, its VMM's calls) goes through
+  `log::RateLimit`: per guest, 8 at once and then one a second, fixed state;
+  the next record let through says how many were not. Root limits the same way
+  what trustd can make it write (refused `hw` accesses) and what a peer
+  partition can (channel.rs), and logs only the first 8 writes it refuses to
+  another partition's PCI function.
 - Querying needs a working dom0 and vmmgr; this does not capture seL4's own
   debug stream or make a crashed host queryable.
 - `tests/run-logtest.sh` checks kernel faults, panics and shutdowns retained
@@ -3182,19 +3198,19 @@ none. dom0 runs no host hardware drivers.
 | Display | `gpu_attach` (scanout size), `gpu_read` (the image, 1 MiB at a time, with size, format and frame; §9.6) |
 
 A Rust userspace library and CLI live in `tools/l4hctl`; external
-orchestration runs in dom0. Devices are attached before start and removed
-on destroy. A `nic_create` that root refuses, or a `gpu_attach` that runs
-out of host memory, leaves what it had made (a CNode; the GPU's CNodes and
-frames) with the guest for the next attempt, since an arena gives nothing
-back: refused attempts take no more than one attach does. Pause/resume, device hotplug, switch deletion, I/O limits and
-asynchronous event queues are not implemented. A stopped guest (powered
-off, or its kernel or VMM faulted) stays stopped until it is destroyed:
-the guest needs its kTCBs and SC_Us with every right (it starts its
-other vCPUs, arms their timers and binds SC_U to its tasks), and seL4 TCB
-capabilities have none to take away, so vmmgr revokes its own kTCB and
-SC_U capabilities, which deletes every copy the guest made of them, then
-suspends the kTCBs and unbinds every SC, which a user thread or call
-chain may hold (`Guest::stop`). `vm_pause` would need to give them back.
+orchestration runs in dom0. Devices are attached before start and removed on
+destroy. A `nic_create` that root refuses, or a `gpu_attach` that runs out of
+host memory, leaves what it had made (a CNode; the GPU's CNodes and frames)
+with the guest for the next attempt, since an arena gives nothing back:
+refused attempts take no more than one attach does. Pause/resume, device
+hotplug, switch deletion, I/O limits and asynchronous event queues are not
+implemented. A stopped guest (powered off, or its kernel or VMM faulted) stays
+stopped until it is destroyed: the guest needs its kTCBs and SC_Us with every
+right (it starts its other vCPUs, arms their timers and binds SC_U to its
+tasks), and seL4 TCB capabilities have none to take away, so vmmgr revokes its
+own kTCB and SC_U capabilities, which deletes every copy the guest made of
+them, then suspends the kTCBs and unbinds every SC, which a user thread or
+call chain may hold (`Guest::stop`). `vm_pause` would need to give them back.
 
 **Lifecycle.**
 
@@ -3283,11 +3299,12 @@ The chain has four links.
    checks afterwards. A BIOS boot measures none of this (BIOS GRUB has no
    `tpm` module), so such a host's quotes say nothing about what it booted.
 2. **The host key.** `l4h-trustd` is the only component that maps the TPM,
-   which root finds in the ACPI `TPM2` table (see **TPM interfaces**).
-   trustd polls it at locality 0, sleeping on its E3 timer between polls
-   (20 µs up to 2 ms). It runs on the last core at `P_K + 1` with at most
-   5 ms of every 20 ms, so neither a slow TPM nor the firmware's AML can
-   take a core from guests. At start, trustd:
+   which root finds in the ACPI `TPM2` table (see **TPM interfaces**). trustd
+   polls it at locality 0, sleeping on its E3 timer between polls (20 µs up to
+   2 ms). It runs on the last core at `P_K + 1` with at most 5 ms of every 20
+   ms, so neither a slow TPM nor the firmware's AML can take a core from
+   guests; the flags server takes at most a tenth of that core besides. At
+   start, trustd:
    - generates a P-256 key K in software, from TPM randomness;
    - creates the attestation key (AK), a restricted ECDSA P-256 signing
      primary key of the endorsement hierarchy, so the same template gives
@@ -3313,16 +3330,22 @@ The chain has four links.
      anything.
    - vmmgr passes the digest to root (`TRUST_REGISTER`), which writes
      {instance, RAM, vCPUs, dom0, digest} into a registry page that trustd
-     maps read-only. Root never waits for trustd's main thread, whose TPM
-     commands can take seconds.
+     maps read-only, once per guest (a second registration is `EEXIST`): a
+     running guest's record never changes, and its instance, written last,
+     never reads as 0 before the guest is destroyed. Whether a guest is dom0
+     is root's to say, and there is one at a time. Root never waits for
+     trustd's main thread, whose TPM commands can take seconds.
    - Each guest has an attestation device (`L4H_DEV_ATTEST`). Requests are
      asynchronous, so a vCPU never waits for trustd: the guest writes its
-     request into the device page, then a new sequence number, and signals
-     the kick, whose badge is the guest's id, so trustd answers a guest only
-     about itself. trustd answers in the page, sets `done`, and asks root
+     request into the device page, then a new sequence number, and signals the
+     kick, whose badge is the guest's id, so trustd answers a guest only about
+     itself. trustd answers in the page, sets `done`, and asks root
      (`root::call::attest_done`) to have the device's event raised on vCPU 0
-     (root posts it in vmmgr's mailbox). Linux sleeps the caller
-     meanwhile.
+     (root posts it in vmmgr's mailbox: one notice a guest at a time, the next
+     once vmmgr has taken it, and at most 32 a guest between two ticks of
+     root's 100 ms timer, so trustd cannot flood vmmgr or a guest with events;
+     an event can come that much later, and none is lost). Linux sleeps the
+     caller meanwhile.
    - trustd owns the request pages, two per guest id, and root lends one
      to each guest, so a page stays mapped in trustd while it answers a
      guest being destroyed. trustd drops an answer whose guest's instance
@@ -3367,11 +3390,12 @@ The chain has four links.
    stable across boots.
 
    **Rate limit.** ActivateCredential is the only request that uses the TPM
-   (about 80 ms on a discrete Infineon TPM), and trustd answers one request
-   at a time. Each guest instance may make 5 at once, then one a second
-   (GCRA, one timestamp per guest id, reset when a new guest takes the id);
-   beyond that trustd answers `-EAGAIN` without using the TPM. Reports,
-   evidence, ACT and SEAL cost no TPM time and are not limited.
+   (about 80 ms on a discrete Infineon TPM), and trustd answers one request at
+   a time. Each guest instance may make 5 at once, then one a second (GCRA,
+   one timestamp per guest id, reset when a new guest takes the id); beyond
+   that trustd answers `-EAGAIN` without using the TPM. A primary gives each
+   other partition's relayed requests the same allowance. Reports, evidence,
+   ACT and SEAL cost no TPM time and are not limited.
 
 **Taint and seal.** Each guest instance has two set-only 256-bit bitmaps.
 Taint bit b records that action b happened; seal bit b prevents it from
@@ -3408,35 +3432,43 @@ checking taint alone leaves a session key exposed after its report.
   outside the launch measurement; guests treat the network as untrusted,
   so steering rules (§9.3) take no bit, also on a sealed guest's MAC or
   port.
-- **The flags service.** The flags server, the trustd image started by
-  root a second time as a component of its own (`host::KIND_FLAGS`, with
-  its own CSpace and VSpace), is the sole writer of an 8 KiB flags area:
-  64 entries of 128 bytes, each with a seqlock, instance and the two
-  bitmaps. Only it maps the area writable; readers (the host actor, root
-  and trustd's main thread) map it read-only and retry an odd or changed
-  sequence. trustd's main thread, which parses guests' pages and runs the
-  firmware's AML, reaches the flags only through its calls. Root assigns
-  monotonically increasing instances at `VM_CREATE` and publishes them in
-  the registry at start, which the flags server maps read-only too. An
+- **The flags service.** The flags server, the trustd image started by root a
+  second time as a component of its own (`host::KIND_FLAGS`, with its own
+  CSpace and VSpace), is the sole writer of an 8 KiB flags area: 64 entries of
+  128 bytes, each with a seqlock, instance and the two bitmaps. Only it maps
+  the area writable; readers (the host actor, root and trustd's main thread)
+  map it read-only and retry an odd or changed sequence, 128 times at most:
+  the server can be stopped in the middle of a write until its next budget,
+  and no reader waits for it. An entry that stays unreadable reads as all
+  tainted and sealed (`Flags::UNAVAILABLE`): the host actor refuses the
+  operation with `-EAGAIN`, and a report fails with `-EAGAIN` rather than say
+  what trustd did not see. trustd's main thread, which parses guests' pages
+  and runs the firmware's AML, reaches the flags only through its calls. Root
+  assigns monotonically increasing instances at `VM_CREATE` and publishes them
+  in the registry at start, which the flags server maps read-only too. An
   entry for another instance reads as empty; a higher-instance request
-  replaces an entry, an older one gets `-ESRCH`. Destruction does not
-  clear flags.
-- **Callers.** The flags endpoint has badged callers, each with a badge
-  of its own: `trust::Sender::Vmmgr` (the host actor) can ACT on defined
-  host bits, `trust::Sender::Trustd` (guest requests) can ACT on guest
-  bits and SEAL defined host or userspace bits, and `trust::Sender::Root`
-  only makes the start-up handshake. Kernel bits cannot be sealed. All
-  arguments are validated before any entry changes, the instance too:
-  trustd's must be the one the registry has for the guest, and vmmgr's
-  too once the guest has started (before, vmmgr records console input
-  queued for the instance root gave it), so neither can replace a running
-  guest's entry with another instance's. The operation is the message
-  label (`trust::FLAGS_ACT`, `FLAGS_SEAL`); requests are MR0 id, MR1
-  instance, MR2–5 bitmap, MR6 options; replies MR0 status, MR1 instance,
-  MR2–5 taint, MR6–9 seal. The server runs at root's priority on the
-  caller's donated scheduling context, with no heap, TPM, AML or calls
-  back. If it faults, its keeper answers every call `FAILED` from then
-  on: the actions they were for are refused, so seals stay enforced.
+  replaces an entry, an older one gets `-ESRCH`. Destruction does not clear
+  flags.
+- **Callers.** The flags endpoint has badged callers, each with a badge of its
+  own: `trust::Sender::Vmmgr` (the host actor) can ACT on defined host bits,
+  `trust::Sender::Trustd` (guest requests) can ACT on guest bits and SEAL
+  defined host or userspace bits, and `trust::Sender::Root` only makes the
+  start-up handshake. Kernel bits cannot be sealed. All arguments are
+  validated before any entry changes, the instance too: trustd's must be the
+  one the registry has for the guest, and vmmgr's too once the guest has
+  started (before, vmmgr records console input queued for the instance root
+  gave it), so neither can replace a running guest's entry with another
+  instance's. The operation is the message label (`trust::FLAGS_ACT`,
+  `FLAGS_SEAL`); requests are MR0 id, MR1 instance, MR2–5 bitmap, MR6 options;
+  replies MR0 status, MR1 instance, MR2–5 taint, MR6–9 seal. The server runs
+  at root's priority on a scheduling context of its own, 1 ms of every 10 ms
+  (`trust::FLAGS_BUDGET_US`), with no heap, TPM, AML or calls back. It never
+  runs on a caller's: a message sent without a call donates none, and a server
+  waiting for one would stop for good, and vmmgr's next call with it. A
+  request takes microseconds; a caller that floods the server takes at most
+  that tenth of the last core and delays another caller's request by less than
+  10 ms. If it faults, its keeper answers every call `FAILED` from then on:
+  the actions they were for are refused, so seals stay enforced.
 - **Ordering.** An actor first checks the seal in a consistent entry. If the
   taint is already set, no IPC is needed; otherwise ACT must succeed before
   the operation. This costs one IPC per action kind per instance. ACT and
@@ -3480,19 +3512,20 @@ partition 0 has the TPM. Every partition's trustd still has its own key K;
 a secondary's comes from RDRAND, and partition 0's trustd quotes it and
 runs the secondary's ActivateCredential calls (the relay):
 
-- **Transport.** trustd writes a request into a relay page it shares with
-  root and calls root (`root::call::relay`), which sends it over the control
+- **Transport.** trustd writes a request into a relay page it shares with root
+  and calls root (`root::call::relay`), which sends it over the control
   channel (`MSG_TPM_REQUEST`); the other root writes it into the sender's
-  inbox slot there and kicks trustd (badge bit 63, also guest 63's kick,
-  which is only a hint). Answers go back as `MSG_TPM_REPLY`. Channels
-  never wait and can lose messages, so a request carries an id and is sent
-  again every second (key) or five seconds (ActivateCredential) until its
-  answer comes, for at most two minutes or 20 s; partition 0 answers a
-  repeated id from what it kept, without using the TPM again. A secondary
-  has one request out at a time and keeps serving other guests meanwhile
-  (root kicks it on its timer while it waits); only guests that need the
-  answer wait. If partition 0 is dead or has no TPM, the secondary ends up
-  flags only.
+  inbox slot there and kicks trustd (badge bit 63, also guest 63's kick, which
+  is only a hint). Answers go back as `MSG_TPM_REPLY`. Channels never wait and
+  can lose messages, so a request carries an id and is sent again every second
+  (key) or five seconds (ActivateCredential) until its answer comes, for at
+  most two minutes or 20 s; partition 0 answers a repeated id from what it
+  kept, without using the TPM again, and gives each partition's
+  ActivateCredential requests the allowance a guest's have. A secondary has
+  one request out at a time and keeps serving other guests meanwhile (root
+  kicks it on its timer while it waits); only guests that need the answer
+  wait. If partition 0 is dead or has no TPM, the secondary ends up flags
+  only.
 - **PCR 15.** The binding becomes `SHA-256("l4h-trustd-key-v2" ‖
   partition (u32 LE) ‖ K)`. Partition 0 quotes and extends its own key
   first, then each secondary's once, in the order they ask (partitions
@@ -3524,17 +3557,30 @@ runs the secondary's ActivateCredential calls (the relay):
   `MSFT0101` device whose `_DSM` offers that function, runs only its and its
   parents' `_INI`, and calls the `_DSM` after setting the start bit.
   - Accesses outside trustd's own TPM ranges go to root (`root::call::hw`),
-    which serves them only for this start method. It refuses RAM, device
-    memory root uses itself (the AML's pages are carved into a frame table
-    of their own, so whatever root carved, the IOMMU's registers among
-    it, is not free for them), I/O ports already handed out and those that
-    reset the machine, put it to sleep or enter SMM (0x60, 0x64, 0x92,
-    0xb2–0xb3, 0xcf9 and the FADT's SMI command and PM1/PM2 control
-    blocks), the BARs of the PCI functions root drives, and config writes,
-    by ports or through the MCFG's ECAM window, to every function root
-    manages: disk controllers, uplink NICs, xHCI controllers, the balloon
-    device, IOMMUs, the host bridge and every bridge. Refused reads return
-    all ones.
+    which serves them only for this start method and takes them for an
+    attacker's, since trustd's main thread also parses guests' pages. Root
+    serves memory only if it is free device memory: not RAM, not what root
+    carved for itself or a driver (the AML's pages are carved into a frame
+    table of their own, so whatever root carved, the IOMMU's registers among
+    it, is not free for them), and not a BAR of a PCI function root drives. On
+    a machine split into partitions the others' RAM is device memory to this
+    kernel and the descriptor does not list it, so there root serves memory
+    only where none can be: the chipset's addresses from 0xfec00000 to 4 GiB,
+    the ECAM window and the memory BARs of the partition's own functions. It
+    serves I/O ports seL4 has not handed out, except those that reset the
+    machine, put it to sleep or enter SMM (0x60, 0x64, 0x92, 0xb2–0xb3, 0xcf9
+    and the FADT's SMI command and PM1/PM2 control blocks). PCI configuration,
+    by ports or through the MCFG's ECAM windows, it serves for reading. Writes
+    it refuses to every function root manages (disk controllers, uplink NICs,
+    xHCI controllers, the balloon device, IOMMUs, every bridge, an ISA or LPC
+    bridge included, and the function that holds the FADT's reset register),
+    to functions of other segments, and in every function to the command
+    register, the BARs and the expansion ROM's, so the AML neither moves a
+    device root does not drive onto another's addresses nor lets one master
+    the bus. Root keeps up to 16 ECAM windows; if the MCFG lists more, or
+    cannot be read, it serves no memory write at all, since any could be a
+    configuration write. Refused reads return all ones, and root logs refusals
+    through `log::RateLimit`.
   - The interpreter runs in trustd, not root, because it can panic on some
     AML. If trustd's main thread faults, root suspends only it, revokes the
     guests' kick capabilities, marks every attestation page failed and
@@ -4201,18 +4247,20 @@ Generated MACs carry the partition index (`02:4c:34:P:G:N`), and
 `l4hctl info` shows the partition (`CTL_PARTITION_INFO`).
 
 **Channels** (`channel.rs`). The shim reserves a control channel of 256 KiB
-between partition 0 and each other partition, and a channel of 2 MiB for
-each configured link, and lists each in both descriptors: two
-single-writer message rings and a doorbell each way (user vector 96 +
-sender for control, 88 + sender for a link; the kernel's `peers=` lists
-each other partition once). A writer never waits: a header word counts the
-bytes ever written, and a reader that falls behind by a whole ring knows it
-lost messages; a crashed partition leaves a stale ring, never a blocked
-writer. Roots read and write the control channels: heartbeats (secondary
-to primary, every second; partition 0 logs a partition silent for 5 s),
-the wall clock (primary to secondaries every 10 s and after an RTC
-change), forwarded RTC settings, and trustd's requests. Root handles at most 64 messages of a channel each time it looks and leaves the rest for the next doorbell or timer tick, writes the RTC for a partition at most once a second, and logs what a peer causes within a rate limit. Frames never share
-a control channel's rings, so a busy link cannot overwrite them.
+between partition 0 and each other partition, and a channel of 2 MiB for each
+configured link, and lists each in both descriptors: two single-writer message
+rings and a doorbell each way (user vector 96 + sender for control, 88 +
+sender for a link; the kernel's `peers=` lists each other partition once). A
+writer never waits: a header word counts the bytes ever written, and a reader
+that falls behind by a whole ring knows it lost messages; a crashed partition
+leaves a stale ring, never a blocked writer. Roots read and write the control
+channels: heartbeats (secondary to primary, every second; partition 0 logs a
+partition silent for 5 s), the wall clock (primary to secondaries every 10 s
+and after an RTC change), forwarded RTC settings, and trustd's requests. Root
+handles at most 64 messages of a channel each time it looks and leaves the
+rest for the next doorbell or timer tick, writes the RTC for a partition at
+most once a second, and logs what a peer causes within a rate limit. Frames
+never share a control channel's rings, so a busy link cannot overwrite them.
 
 **IOMMU** (`iommu/shared.rs`). Every partition's root drives the IOMMU
 for its own functions; only the command queue is truly shared. The shim
@@ -4235,32 +4283,35 @@ reads the fault and event logs and names the owning partition.
 
 **Links** (`link.pA-pB = 1`, `l4h-netd/src/link.rs`). A link is a port of
 netd's, on a switch root creates for it, with one more dom0 vNIC, so the
-partitions' uplink networks are never bridged. The two netds move the
-frames themselves: root maps the link's channel into netd only (by the
-CPU; no device reaches it), and netd writes each frame for the link as a
-message into its outgoing ring and switches each message from the incoming
-ring. Plain Ethernet frames carry complete checksums and have a limit of
-9216 bytes. TCP GSO frames carry their offload header in a separate record
-type. The receiving netd validates this header and segments the frame when
-the destination needs plain frames. Each direction has a 1 MiB ring; root and netd refuse a link channel of another size.
-A reader that falls behind skips records that the writer can overwrite. A count that is not a multiple of 8, or padding followed by padding, is a broken writer's: the reader drops what it published and goes on from the next aligned count. One read takes at most two records.
+partitions' uplink networks are never bridged. The two netds move the frames
+themselves: root maps the link's channel into netd only (by the CPU; no device
+reaches it), and netd writes each frame for the link as a message into its
+outgoing ring and switches each message from the incoming ring. Plain Ethernet
+frames carry complete checksums and have a limit of 9216 bytes. TCP GSO frames
+carry their offload header in a separate record type. The receiving netd
+validates this header and segments the frame when the destination needs plain
+frames. Each direction has a 1 MiB ring; root and netd refuse a link channel
+of another size. A reader that falls behind skips records that the writer can
+overwrite. A count that is not a multiple of 8, or padding followed by
+padding, is a broken writer's: the reader drops what it published and goes on
+from the next aligned count. One read takes at most two records.
 
-Root binds the link's receive vector to netd's notification. Netd
-acknowledges the interrupt. Only root holds IRQControl, so the sending netd
-signals root to make one `SendPeer` call per pending link. A reader sets the
-wake flag only when its ring is empty, then checks the ring once more.
-The writer checks and clears the flag during large batches and at the end
-of each batch. Netd bounds each guest transmit turn on a linked switch by
-bytes and polls for control requests before it processes more slots.
-Netd looks at a link's ring 256 times, each look reading at most two records (a frame, or a record it drops), then gives its other ports a turn.
-`link.pA-pB = uplink` instead puts the link port on both partitions'
-switch 0, with no switch or vNIC of its own: a partition without a NIC
-shares the network of the one whose switch 0 has the uplink NIC (a star of
-such links shares one NIC among all partitions). Every frame then crosses
-the NIC owner's netd and the channel, without flow control, and the
-others lose the network if that partition stops. Networks that deliver
-only the instance's own MAC addresses (GCE, EC2) drop the other
-partitions' frames: there, route through the owner's dom0 instead.
+Root binds the link's receive vector to netd's notification. Netd acknowledges
+the interrupt. Only root holds IRQControl, so the sending netd signals root to
+make one `SendPeer` call per pending link. A reader sets the wake flag only
+when its ring is empty, then checks the ring once more. The writer checks and
+clears the flag during large batches and at the end of each batch. Netd bounds
+each guest transmit turn on a linked switch by bytes and polls for control
+requests before it processes more slots. Netd looks at a link's ring 256
+times, each look reading at most two records (a frame, or a record it drops),
+then gives its other ports a turn. `link.pA-pB = uplink` instead puts the link
+port on both partitions' switch 0, with no switch or vNIC of its own: a
+partition without a NIC shares the network of the one whose switch 0 has the
+uplink NIC (a star of such links shares one NIC among all partitions). Every
+frame then crosses the NIC owner's netd and the channel, without flow control,
+and the others lose the network if that partition stops. Networks that deliver
+only the instance's own MAC addresses (GCE, EC2) drop the other partitions'
+frames: there, route through the owner's dom0 instead.
 
 **Attestation.** Only partition 0 has the TPM. A secondary's trustd signs
 with a key of its own (from RDRAND) and asks partition 0's trustd, over

@@ -868,8 +868,8 @@ enum l4h_usb_op {
 	/* slot: its transfers complete first */
 	L4H_USB_OP_SLOT_DISABLE = 5,
 	/* slot, port = root port, arg[0] = route string, arg[1] = speed
-	 * (L4H_USB_SPEED_*), arg[2] = TT hub slot (0: none), arg[3] = TT port,
-	 * arg[4] = multi-TT, arg[5] = ep0 max packet, arg[6] = BSR (address
+	 * (L4H_USB_SPEED_*), arg[2] = TT hub slot (0: none), arg[3] = TT port
+	 * and arg[4] = multi-TT (both 0 without a TT hub), arg[5] = ep0 max packet, arg[6] = BSR (address
 	 * later) -> val[0] = the device's USB address */
 	L4H_USB_OP_ADDRESS = 6,
 	/* slot, drop = DCIs dropped (bit n = DCI n), n_eps entries in eps:
@@ -883,8 +883,8 @@ enum l4h_usb_op {
 	L4H_USB_OP_DEV_RESET = 10,
 	/* slot, arg[0] = DCI: clear the halt and the data toggle */
 	L4H_USB_OP_EP_RESET = 11,
-	/* slot, drop = DCIs, arg[0] = streams (a power of two, at most
-	 * max_streams; stream IDs are 1..streams-1) */
+	/* slot, drop = DCIs, arg[0] = streams (a power of two, at least
+	 * 4 and at most max_streams; stream IDs are 1..streams-1) */
 	L4H_USB_OP_STREAMS_ALLOC = 12,
 	L4H_USB_OP_STREAMS_FREE = 13,
 	/* arg[0] = the tag of a transfer */
@@ -920,7 +920,10 @@ enum l4h_usb_port_feature {
 struct l4h_usb_ep {
 	l4h_u8 dci;             /* 2..31 */
 	l4h_u8 type;            /* L4H_USB_EP_* */
-	l4h_u8 interval;        /* xHCI interval (2^n * 125 us), 0..15 */
+	/* xHCI interval (2^n * 125 us), 0..15: 3..10 for a low or full speed
+	 * interrupt endpoint, from 3 for full speed isoch, 0 for control and
+	 * bulk below high speed and at SuperSpeed */
+	l4h_u8 interval;
 	l4h_u8 burst_mult;      /* max burst (bits 0-3), mult (bits 4-5) */
 	l4h_u16 max_packet;
 	l4h_u16 max_esit;       /* max ESIT payload, bytes */

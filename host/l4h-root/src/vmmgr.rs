@@ -73,6 +73,8 @@ pub struct RootGuest {
     pub ports: ArrayVec<usize, MAX_GUEST_DEVICES>,
     /// It has an attestation device (trustd.rs).
     pub attest: bool,
+    /// vmmgr registered its start with trustd (`trust_register`): once.
+    pub registered: bool,
     /// USB controllers it has (usb.rs), in the order attached: the
     /// position is its USB number.
     pub usbs: ArrayVec<usize, { host::usb::MAX_GUEST_USB }>,
@@ -84,11 +86,13 @@ pub struct Vmmgr {
     #[allow(dead_code)]
     arena: Arena,
     /// Root's notices to vmmgr (l4h_host::vmmgr::call), and those that wait
-    /// for room in its ring: answers by token, guests trustd answered, and
-    /// one monitor command.
+    /// for room in its ring: answers by token, guests trustd answered
+    /// (which also wait for vmmgr to take the guest's last notice, and for
+    /// the guest's allowance: trust::AttestNotices), and one monitor
+    /// command.
     mailbox: Mailbox,
     ops_waiting: [u64; proto::MAX_PENDING / 64],
-    attest_waiting: u64,
+    attest: host::trust::AttestNotices,
     monitor_waiting: Option<Notice>,
 }
 
@@ -100,8 +104,16 @@ impl Vmmgr {
     }
 
     /// trustd answered guest `id`: vmmgr raises its device's event.
+    /// However often trustd says so, the guest has one notice in the ring
+    /// at a time, and a bounded number between two timer ticks.
     pub fn attest_done(&mut self, id: usize) {
-        self.attest_waiting |= 1 << id;
+        self.attest.answered(id);
+        self.flush();
+    }
+
+    /// Root's timer: the guests' allowance of attestation notices is new.
+    pub fn attest_tick(&mut self) {
+        self.attest.tick();
         self.flush();
     }
 
@@ -116,9 +128,12 @@ impl Vmmgr {
         true
     }
 
-    /// vmmgr took notices: post those that waited for room.
+    /// vmmgr took notices: post those that waited for room, or for the
+    /// guest's last one to be taken.
     pub fn poll(&mut self) {
-        while self.mailbox.answer().is_some() {}
+        while let Some((k, _)) = self.mailbox.answer() {
+            self.attest.taken(k);
+        }
         self.flush();
     }
 
@@ -133,12 +148,9 @@ impl Vmmgr {
                 self.ops_waiting[w] &= !(1 << t);
             }
         }
-        while self.attest_waiting != 0 {
-            let g = self.attest_waiting.trailing_zeros() as usize;
-            if self.mailbox.send(&Notice::AttestDone { guest: g }).is_none() {
-                return;
-            }
-            self.attest_waiting &= !(1 << g);
+        while let Some(g) = self.attest.next() {
+            let Some(k) = self.mailbox.send(&Notice::AttestDone { guest: g }) else { return };
+            self.attest.posted(g, k);
         }
         if let Some(cmd) = self.monitor_waiting.clone() {
             if self.mailbox.send(&cmd).is_some() {
@@ -330,24 +342,32 @@ pub fn spawn(h: &mut Host, modules: &Modules, plan: &Dom0Plan) -> Vmmgr {
         map_in_root(h, f, root_va, root_rights);
         comp.map_copy(&mut h.alloc, &mut arena, &abs_of(f), va, rights, VmAttributes::DEFAULT, keep_slot());
     }
-    // dom0's control data area: vmmgr maps it into every dom0.
+    // dom0's control data area: vmmgr maps it into every dom0.  Root
+    // reads it too (the source of CTL_BLK_WRITE, and extent lists), so
+    // the frames' own capabilities stay in a CNode of root's, and vmmgr
+    // gets a CNode of copies: revoking a copy takes nothing from root,
+    // where revoking the frame's own capability would unmap root's page
+    // and fault root at its next read.
+    let ctl_frames = arena.object_cap::<cap_type::CNode>(&mut h.alloc, ObjectBlueprint::CNode { size_bits: proto::CTL_DATA_RADIX });
     let ctl_cn = arena.object_cap::<cap_type::CNode>(&mut h.alloc, ObjectBlueprint::CNode { size_bits: proto::CTL_DATA_RADIX });
     arena
-        .retype(&mut h.alloc, &FRAME_BP, proto::CTL_DATA_PAGES, Dest { cnode: abs_of(ctl_cn), offset: 0 })
+        .retype(&mut h.alloc, &FRAME_BP, proto::CTL_DATA_PAGES, Dest { cnode: abs_of(ctl_frames), offset: 0 })
         .expect("dom0 control data area");
-    comp.give(proto::SLOT_CTL_DATA, ctl_cn, CapRights::all());
     for p in 0..proto::CTL_DATA_PAGES {
-        let f = ctl_cn.absolute_cptr_from_bits_with_depth(p as u64, proto::CTL_DATA_RADIX);
+        let f = ctl_frames.absolute_cptr_from_bits_with_depth(p as u64, proto::CTL_DATA_RADIX);
+        ctl_cn.absolute_cptr_from_bits_with_depth(p as u64, proto::CTL_DATA_RADIX)
+            .copy(&f, CapRights::all()).expect("vmmgr's control data frame");
         let copy = h.alloc.slots.alloc();
         abs_of(root_cap::<cap_type::Null>(copy)).copy(&f, CapRights::all()).expect("control data copy");
         map_in_root(h, root_cap(copy), CTL_DATA_VA + p * PAGE, CapRights::read_only());
         comp.map_copy(&mut h.alloc, &mut arena, &f, proto::CTL_DATA_VA + p * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep_slot());
     }
+    comp.give(proto::SLOT_CTL_DATA, ctl_cn, CapRights::all());
 
     let mailbox = Mailbox::new(&comp, crate::mailbox::VMMGR_MAILBOX, &l4h_host::wiring::ROOT_VMMGR_CALL, &l4h_host::wiring::VMMGR_DONE, &mut h.alloc, &mut arena, &mut keep_slot);
     component::start(&comp);
     info!("l4h-root: vmmgr started with {} MiB of boot modules", pages * PAGE >> 20);
-    Vmmgr { comp, arena, mailbox, ops_waiting: [0; proto::MAX_PENDING / 64], attest_waiting: 0, monitor_waiting: None }
+    Vmmgr { comp, arena, mailbox, ops_waiting: [0; proto::MAX_PENDING / 64], attest: host::trust::AttestNotices::new(), monitor_waiting: None }
 }
 
 /// Whether guests may map the module image `data` in whole pages: it must
@@ -634,6 +654,13 @@ fn guest_new(h: &mut Host, id: usize, size: usize, gpa: usize, dom0: bool) -> Re
     if h.guests[id].is_some() || !size.is_power_of_two() || !(IO_POOL_MIN..=IO_POOL_MAX).contains(&size) || gpa % PAGE != 0 {
         return Err(ctl::EINVAL);
     }
+    // There is one dom0, which is root's to say: what a guest gets as
+    // dom0 (its reports' claim, blkd's boot ranges, the uplink's identity
+    // in netd, a place past the limit below) no second one gets while the
+    // first lives.  vmmgr deletes a dom0 before it makes the next.
+    if dom0 && h.guests.iter().flatten().any(|g| g.dom0) {
+        return Err(ctl::EEXIST);
+    }
     // Every guest's deletion finds a zombie (guest_del): one whose drivers
     // have not let go of it keeps a guest's place.  dom0 must come back
     // all the same; should it take the last place, a deletion that then
@@ -672,6 +699,11 @@ fn guest_new(h: &mut Host, id: usize, size: usize, gpa: usize, dom0: bool) -> Re
             None => false,
         };
         let (page_out, kick_out) = (ATTEST_PAGE.passed_out(0, Cap::Granule), ATTEST_KICK.passed_out(0, Cap::Notification));
+        // vmmgr gets the CNode that holds the pool frames' own
+        // capabilities, and can revoke them: that unmaps the pool from the
+        // guest and its VMM, vmmgr's own to break.  Root never maps the
+        // pool and no driver does (devices reach it by DMA), so nothing of
+        // theirs depends on those capabilities.
         let given = give(h, POOL_FRAMES.passed_out(0, kind_of(&frames)), &abs_of(frames))
             .and_then(|()| give(h, VMM_NTFN.passed_out(0, kind_of(&vmm_ntfn)), &abs_of(vmm_ntfn)))
             .and_then(|()| if attest {
@@ -700,6 +732,7 @@ fn guest_new(h: &mut Host, id: usize, size: usize, gpa: usize, dom0: bool) -> Re
             disks: ArrayVec::new(),
             ports: ArrayVec::new(),
             attest,
+            registered: false,
             usbs: ArrayVec::new(),
         });
         Ok(NewGuest { instance, attest })
@@ -815,9 +848,9 @@ fn disk_attach(h: &mut Host, id: usize, disk: usize, flags: u64, lba_start: u64,
 /// `nic_add`: a port of `switch` for the guest.  Returns the MAC.
 fn nic_add(h: &mut Host, id: usize, switch: u32, mac: u64, lock: bool, isolated: bool) -> Result<u64, Errno> {
     let id = guest_arg(id)?;
-    // 48 bits, unicast; 0 asks root for one.  Not truncated: high bits
-    // would make 0, the all-zero MAC, of a nonzero request.
-    if mac >> 48 != 0 || mac >> 40 & 1 != 0 {
+    // 48 bits, unicast; 0 asks root for one (the check vmmgr makes before
+    // it allocates for the port).
+    if !l4h_host::vmmgr::nic_mac_ok(mac) {
         return Err(ctl::EINVAL);
     }
     // As DiskAttach and UsbAttach with a failed driver: a port netd never
@@ -879,13 +912,18 @@ fn usb_attach(h: &mut Host, id: usize, ctrl: usize) -> Result<u64, Errno> {
     })
 }
 
-/// `trust_register`: the guest starts.
+/// `trust_register`: the guest starts.  Once: what its reports say of a
+/// running guest does not change, so a second registration is EEXIST.
 fn trust_register(h: &mut Host, id: usize, ram: u64, vcpus: u32, words: [u64; 4]) -> Result<(), Errno> {
     let id = guest_arg(id)?;
-    let g = h.guests[id].as_ref().ok_or(ctl::ENOENT)?;
+    let g = h.guests[id].as_mut().ok_or(ctl::ENOENT)?;
     if !g.attest {
         return Err(ctl::EINVAL);
     }
+    if g.registered {
+        return Err(ctl::EEXIST);
+    }
+    g.registered = true;
     let mut launch = [0; 32];
     for (i, w) in words.iter().enumerate() {
         launch[8 * i..8 * i + 8].copy_from_slice(&w.to_le_bytes());
@@ -900,8 +938,8 @@ fn trust_register(h: &mut Host, id: usize, ram: u64, vcpus: u32, words: [u64; 4]
         reserved: 0,
     };
     let instance = g.instance;
-    if let Some(t) = &mut h.trustd {
-        t.register(id, instance, record);
+    if h.trustd.as_mut().is_some_and(|t| !t.register(id, instance, record)) {
+        return Err(ctl::EEXIST);
     }
     Ok(())
 }

@@ -14,7 +14,12 @@
 //! - every data pointer is a translated segment of the client's I/O pool
 //!   (`blk::Pool::translate`); nothing else a guest supplies becomes an
 //!   address;
-//! - every endpoint field is in the xHCI range for its type and speed.
+//! - every endpoint field is in the xHCI range for its type and speed;
+//! - a context dword usbd gives the controller is made here from checked
+//!   fields (`Address::slot_ctx`, `hub_slot_ctx`, `ep_ctx`), and what is
+//!   copied back from an output context goes through `slot_ctx`: a guest
+//!   sets no reserved bit, and nothing the controller's use of host memory
+//!   depends on (the Interrupter Target).
 
 use l4h_abi::usb as abi;
 
@@ -311,7 +316,7 @@ pub fn check_xfer(r: &abi::XferReq, pool: &Pool, max_transfer: u32) -> Result<Xf
 /// §9.6.6-9.6.7.
 pub fn ep_ok(ep: &abi::Ep, speed: u32) -> bool {
     let (burst, mult) = ((ep.burst_mult & 0xf) as u32, ((ep.burst_mult >> 4) & 3) as u32);
-    if ep.burst_mult & 0xc0 != 0 || !(2..=31).contains(&ep.dci) || ep.interval > 15 || !speed_ok(speed) {
+    if ep.burst_mult & 0xc0 != 0 || !(2..=31).contains(&ep.dci) || !speed_ok(speed) || !interval_ok(ep.ty, ep.interval, speed) {
         return false;
     }
     // The DCI says the direction: odd IN, even OUT.
@@ -370,6 +375,25 @@ pub fn ep_ok(ep: &abi::Ep, speed: u32) -> bool {
     shape && esit_ok
 }
 
+/// Whether xHCI Interval `interval` (2^n microframes) is one an endpoint
+/// of type `ty` (abi::EP_*) of a device of `speed` can have (xHCI 1.2
+/// §6.2.3.6, Table 6-12): a low or full speed interrupt endpoint polls
+/// every 1 to 128 frames, a full speed isoch endpoint every frame or more
+/// (up to the 15 the record and `EpShape::period` take), a high speed or
+/// SuperSpeed periodic endpoint every 2^0..2^15 microframes; a high speed
+/// control or bulk endpoint has a NAK rate there, and any other none.
+pub fn interval_ok(ty: u8, interval: u8, speed: u32) -> bool {
+    let periodic = matches!(ty, abi::EP_INT_OUT | abi::EP_INT_IN | abi::EP_ISOC_OUT | abi::EP_ISOC_IN);
+    let isoc = matches!(ty, abi::EP_ISOC_OUT | abi::EP_ISOC_IN);
+    match speed {
+        abi::SPEED_LOW | abi::SPEED_FULL if isoc => (3..=15).contains(&interval),
+        abi::SPEED_LOW | abi::SPEED_FULL if periodic => (3..=10).contains(&interval),
+        abi::SPEED_HIGH => interval <= 15,
+        abi::SPEED_SUPER | abi::SPEED_SUPER_PLUS if periodic => interval <= 15,
+        _ => interval == 0,
+    }
+}
+
 /// Whether a route string has at most 5 tiers of hub ports 1..15: each
 /// nibble is a port, 0 ends it, and nothing follows a 0.
 pub fn route_ok(route: u32) -> bool {
@@ -390,6 +414,176 @@ pub fn route_ok(route: u32) -> bool {
 
 pub fn speed_ok(speed: u32) -> bool {
     (abi::SPEED_FULL..=abi::SPEED_SUPER_PLUS).contains(&speed)
+}
+
+/// Whether `mps` is a max packet size ep0 of a device of `speed` can have
+/// (USB 2.0 §5.5.3, USB 3.2 §9.6.1).
+pub fn ep0_mps_ok(speed: u32, mps: u32) -> bool {
+    match speed {
+        abi::SPEED_LOW => mps == 8,
+        abi::SPEED_FULL => matches!(mps, 8 | 16 | 32 | 64),
+        abi::SPEED_HIGH => mps == 64,
+        abi::SPEED_SUPER | abi::SPEED_SUPER_PLUS => mps == 512,
+        _ => false,
+    }
+}
+
+// ---------------------------------------------------------------------
+// Contexts: the dwords usbd gives the controller, from checked fields.
+
+/// The bits of Slot Context dwords 0..2 usbd ever gives the controller
+/// (xHCI 1.2 §6.2.2): dword 0 without its reserved bit; of dword 1 the
+/// root hub port and the number of ports, not the Max Exit Latency (usbd
+/// has no LPM); of dword 2 the TT fields, not the Interrupter Target.
+/// Every event of a slot goes to interrupter 0, the only one usbd sets
+/// up: events aimed at another would be written through registers nothing
+/// programmed.  Dword 3 is the controller's, written as 0.
+pub const SLOT_CTX_BITS: [u32; 3] = [!(1 << 24), 0xffff_0000, 0x0003_ffff];
+
+/// Slot Context dwords 0..2 for an input context: `dw` (made here, or
+/// copied from the output context, which the controller writes) with
+/// nothing but SLOT_CTX_BITS.
+pub fn slot_ctx(dw: [u32; 3]) -> [u32; 3] {
+    [dw[0] & SLOT_CTX_BITS[0], dw[1] & SLOT_CTX_BITS[1], dw[2] & SLOT_CTX_BITS[2]]
+}
+
+/// What OP_ADDRESS says of a device (abi::CtlReq's arg[0..7]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Address {
+    pub route: u32,
+    pub speed: u32,
+    /// The slot and port of the high speed hub whose transaction
+    /// translator a low or full speed device is behind (0, 0: none), and
+    /// whether that hub has a TT per port.
+    pub tt_slot: u32,
+    pub tt_port: u32,
+    pub mtt: u32,
+    /// ep0's max packet size.
+    pub mps: u32,
+    /// Block Set Address Request.
+    pub bsr: u32,
+}
+
+impl Address {
+    pub fn new(arg: &[u32; 60]) -> Self {
+        Self { route: arg[0], speed: arg[1], tt_slot: arg[2], tt_port: arg[3], mtt: arg[4], mps: arg[5], bsr: arg[6] }
+    }
+
+    /// Whether every field is in range: the speed, a route of at most five
+    /// tiers, ep0's packet size for the speed, and a TT hub slot with a
+    /// port 1..255, or neither (a device behind no TT names no TT port and
+    /// no multi-TT).  Whether the TT's slot is the client's is usbd's to
+    /// check.
+    pub fn ok(&self) -> bool {
+        let tt = if self.tt_slot == 0 {
+            self.tt_port == 0 && self.mtt == 0
+        } else {
+            self.tt_slot <= 255 && (1..=255).contains(&self.tt_port) && self.mtt <= 1
+        };
+        speed_ok(self.speed) && route_ok(self.route) && ep0_mps_ok(self.speed, self.mps) && tt && self.bsr <= 1
+    }
+
+    /// Slot Context dwords 0..2 for Address Device of a checked (`ok`)
+    /// device below root hub port `port`: ep0 alone (Context Entries 1).
+    pub fn slot_ctx(&self, port: u8) -> [u32; 3] {
+        slot_ctx([
+            (self.route & 0xf_ffff) | (self.speed & 0xf) << 20 | (self.mtt & 1) << 25 | 1 << 27,
+            (port as u32) << 16,
+            (self.tt_slot & 0xff) | (self.tt_port & 0xff) << 8,
+        ])
+    }
+}
+
+/// Slot Context dwords 0..2 that make the device a hub with `ports`
+/// downstream ports, TT think time `think` (0..3) and, with `mtt`, a TT
+/// per port, from its current ones `sc` (as Linux's xhci_update_hub_device:
+/// the ports and think time from xHCI 0.96, the think time of a high speed
+/// hub only from 1.0).  None if a value is out of range.
+pub fn hub_slot_ctx(sc: [u32; 3], speed: u32, hci_version: u32, ports: u32, think: u32, mtt: u32) -> Option<[u32; 3]> {
+    if !speed_ok(speed) || ports > 255 || think > 3 || mtt > 1 {
+        return None;
+    }
+    let mut dw = sc;
+    dw[0] |= 1 << 26;
+    if mtt != 0 {
+        dw[0] |= 1 << 25;
+    } else if speed == abi::SPEED_FULL {
+        dw[0] &= !(1 << 25);
+    }
+    if hci_version > 0x95 {
+        dw[1] = (dw[1] & 0x00ff_ffff) | ports << 24;
+        if hci_version < 0x100 || speed == abi::SPEED_HIGH {
+            dw[2] = (dw[2] & !(3 << 16)) | think << 16;
+        }
+    }
+    Some(slot_ctx(dw))
+}
+
+/// Whether a bulk endpoint can be given `count` stream contexts on a
+/// controller that offers `max` (Caps::max_streams): a power of two, at
+/// least 4.  A primary stream array has 2^(MaxPStreams+1) entries and
+/// MaxPStreams 0 means no streams (xHCI 1.2 §6.2.3), so there is no array
+/// of two.
+pub fn streams_ok(count: u32, max: u32) -> bool {
+    count.is_power_of_two() && count >= 4 && count <= max
+}
+
+/// Endpoint Context dwords 0, 1 and 4 (xHCI 1.2 §6.2.3) of a checked
+/// (`ep_ok`) endpoint with `streams` stream contexts (0: none; otherwise
+/// checked, `streams_ok`: MaxPStreams and a linear array).  Dwords 2 and 3
+/// are the ring's or the stream array's address, usbd's.  No reserved bit
+/// is set, and no Host Initiate Disable.
+pub fn ep_ctx(ep: &abi::Ep, streams: u32) -> [u32; 3] {
+    let isoc = matches!(ep.ty, abi::EP_ISOC_IN | abi::EP_ISOC_OUT);
+    let periodic = isoc || matches!(ep.ty, abi::EP_INT_IN | abi::EP_INT_OUT);
+    let (burst, mult) = ((ep.burst_mult & 0xf) as u32, ((ep.burst_mult >> 4) & 3) as u32);
+    let (pstreams, lsa) = if streams >= 4 && streams.is_power_of_two() { (streams.trailing_zeros() - 1, 1 << 15) } else { (0, 0) };
+    let cerr = if isoc { 0 } else { 3 };
+    // The average TRB length: a periodic endpoint's payload, or Linux's
+    // guess for the others.
+    let avg = if periodic { (ep.max_esit as u32).max(1) } else { 3072 };
+    [
+        mult << 8 | pstreams << 10 | lsa | (ep.interval as u32 & 0xff) << 16,
+        cerr << 1 | (ep.ty as u32 & 7) << 3 | burst << 8 | (ep.max_packet as u32) << 16,
+        avg | (ep.max_esit as u32) << 16,
+    ]
+}
+
+/// ep0's Endpoint Context dword 1 for a checked (`ep0_mps_ok`) packet
+/// size: a control endpoint, three retries.
+pub fn ep0_ctx_dw1(mps: u32) -> u32 {
+    3 << 1 | (abi::EP_CONTROL as u32) << 3 | (mps & 0xffff) << 16
+}
+
+/// A set of endpoints (slot, DCI), a bit each: those whose halt is to be
+/// cleared.  Adding one that is in it changes nothing, so the set holds
+/// every endpoint there is and never fills.
+pub struct EpSet([u32; MAX_SLOTS as usize + 1]);
+
+impl EpSet {
+    pub const fn new() -> Self {
+        Self([0; MAX_SLOTS as usize + 1])
+    }
+
+    /// Add endpoint `dci` of `slot`; one outside 1..=MAX_SLOTS, 1..=31 is
+    /// none.
+    pub fn insert(&mut self, slot: usize, dci: usize) {
+        if (1..=MAX_SLOTS as usize).contains(&slot) && (1..32).contains(&dci) {
+            self.0[slot] |= 1 << dci;
+        }
+    }
+
+    /// Take one out, the lowest first.
+    pub fn pop(&mut self) -> Option<(usize, usize)> {
+        let slot = self.0.iter().position(|&w| w != 0)?;
+        let dci = self.0[slot].trailing_zeros() as usize;
+        self.0[slot] &= !(1 << dci);
+        Some((slot, dci))
+    }
+
+    pub fn clear(&mut self) {
+        self.0 = [0; MAX_SLOTS as usize + 1];
+    }
 }
 
 /// The PORTSC bits a PORT_SET or PORT_CLEAR names, None if the feature or

@@ -134,7 +134,8 @@ impl Region {
 }
 
 /// A batch of events.
-pub type Events = l4h_rt::host::fixed::ArrayVec<Trb, 64>;
+pub const EVENT_BATCH: usize = 64;
+pub type Events = l4h_rt::host::fixed::ArrayVec<Trb, EVENT_BATCH>;
 
 /// What the controller is: from its capability registers and extended
 /// capabilities.

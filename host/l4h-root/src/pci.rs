@@ -221,6 +221,24 @@ static ECAM_MAPPED: [core::sync::atomic::AtomicU64; 1024] = [const { core::sync:
 #[cfg(target_arch = "x86_64")]
 static ECAM_WRITABLE: [core::sync::atomic::AtomicU64; 1024] = [const { core::sync::atomic::AtomicU64::new(0) }; 1024];
 
+/// Report a write to a function that is not this partition's, which
+/// `write32` refuses: the first few only.  trustd's AML can ask for such
+/// writes as often as it likes (trustd::hw), and must not fill root's log
+/// or the serial port with them.
+#[cfg(target_arch = "x86_64")]
+fn refused_write(bus: u8, dev: u8, func: u8) {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    const MAX: u32 = 8;
+    static LOGGED: AtomicU32 = AtomicU32::new(0);
+    // Root is one thread.
+    let n = LOGGED.load(Ordering::Relaxed);
+    if n < MAX {
+        LOGGED.store(n + 1, Ordering::Relaxed);
+        log!("l4h-root: write to PCI function {:02x}:{:02x}.{}, which is not this partition's, refused{}", bus, dev, func,
+            if n + 1 == MAX { " (further ones are not logged)" } else { "" });
+    }
+}
+
 /// Whether function `bdf` is this partition's (always, with the machine
 /// to itself): another partition's may read as present but is not ours
 /// to program.
@@ -348,7 +366,7 @@ impl Pci {
         if self.ecam {
             let bdf = (bus as u16) << 8 | (dev as u16) << 3 | func as u16;
             if ECAM_WRITABLE[bdf as usize / 64].load(core::sync::atomic::Ordering::Relaxed) & (1 << (bdf % 64)) == 0 {
-                log!("l4h-root: write to PCI function {:02x}:{:02x}.{}, which is not this partition's, refused", bus, dev, func);
+                refused_write(bus, dev, func);
                 return;
             }
             if let Some(p) = self.ecam_page(bus, dev, func) {
@@ -357,7 +375,7 @@ impl Pci {
             return;
         }
         if self.shared_ports && !Self::bit(&ECAM_WRITABLE, (bus as u16) << 8 | (dev as u16) << 3 | func as u16) {
-            log!("l4h-root: write to PCI function {:02x}:{:02x}.{}, which is not this partition's, refused", bus, dev, func);
+            refused_write(bus, dev, func);
             return;
         }
         let port = self.port;

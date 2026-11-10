@@ -1,7 +1,8 @@
 //! Unit tests of usbd's guest-facing checks and TRB layout
 //! (host/l4h-host/src/usb.rs, through the l4h-host crate): the capability
-//! walk on malformed lists, endpoint range checks, 64 KiB TRB splits and
-//! index arithmetic on wrap.  Run by tests/run-fuzz.sh.
+//! walk on malformed lists, endpoint range checks, the context dwords made
+//! of a guest's values, 64 KiB TRB splits and index arithmetic on wrap.
+//! Run by tests/run-fuzz.sh.
 
 #![allow(dead_code)]
 
@@ -97,10 +98,185 @@ fn endpoint_ranges() {
     assert!(ep_ok(&ep(4, abi::EP_ISOC_OUT, 1024, 2, 0, 3072), abi::SPEED_HIGH));
     assert!(!ep_ok(&ep(4, abi::EP_ISOC_OUT, 1024, 3, 0, 0), abi::SPEED_HIGH));
     // Zero-bandwidth alternate setting.
-    assert!(ep_ok(&ep(4, abi::EP_ISOC_OUT, 0, 0, 0, 0), abi::SPEED_FULL));
+    assert!(ep_ok(&ep(4, abi::EP_ISOC_OUT, 0, 0, 3, 0), abi::SPEED_FULL));
     assert!(!ep_ok(&ep(4, abi::EP_ISOC_OUT, 1023, 0, 0, 0), abi::SPEED_LOW));
     assert!(!ep_ok(&ep(4, 0, 64, 0, 0, 0), abi::SPEED_FULL), "no type");
     assert!(!ep_ok(&ep(4, abi::EP_BULK_OUT, 64, 0, 0, 0), 9), "no speed");
+}
+
+#[test]
+fn endpoint_intervals() {
+    let ep = |dci, ty, mps, interval, esit| abi::Ep { dci, ty, interval, burst_mult: 0, max_packet: mps, max_esit: esit };
+    // Low and full speed interrupt: 1 to 128 frames (2^3..2^10 microframes).
+    for (interval, ok) in [(0, false), (2, false), (3, true), (10, true), (11, false), (15, false)] {
+        assert_eq!(ep_ok(&ep(3, abi::EP_INT_IN, 8, interval, 8), abi::SPEED_LOW), ok, "LS interrupt {interval}");
+        assert_eq!(ep_ok(&ep(3, abi::EP_INT_IN, 64, interval, 64), abi::SPEED_FULL), ok, "FS interrupt {interval}");
+    }
+    // Full speed isoch: from a frame.
+    for (interval, ok) in [(0, false), (2, false), (3, true), (15, true), (16, false)] {
+        assert_eq!(ep_ok(&ep(5, abi::EP_ISOC_IN, 1023, interval, 1023), abi::SPEED_FULL), ok, "FS isoch {interval}");
+    }
+    // High speed and SuperSpeed periodic: any 2^0..2^15 microframes.
+    for speed in [abi::SPEED_HIGH, abi::SPEED_SUPER, abi::SPEED_SUPER_PLUS] {
+        for (interval, ok) in [(0, true), (15, true), (16, false), (255, false)] {
+            assert_eq!(ep_ok(&ep(3, abi::EP_INT_IN, 1024, interval, 1024), speed), ok, "interrupt {interval} at {speed}");
+            assert_eq!(ep_ok(&ep(5, abi::EP_ISOC_IN, 1024, interval, 1024), speed), ok, "isoch {interval} at {speed}");
+        }
+    }
+    // Bulk: a NAK rate at high speed, nothing elsewhere.
+    assert!(ep_ok(&ep(2, abi::EP_BULK_OUT, 512, 7, 0), abi::SPEED_HIGH));
+    assert!(!ep_ok(&ep(2, abi::EP_BULK_OUT, 512, 16, 0), abi::SPEED_HIGH));
+    assert!(!ep_ok(&ep(2, abi::EP_BULK_OUT, 64, 1, 0), abi::SPEED_FULL));
+    assert!(!ep_ok(&ep(2, abi::EP_BULK_OUT, 1024, 1, 0), abi::SPEED_SUPER));
+    assert!(interval_ok(abi::EP_CONTROL, 0, abi::SPEED_FULL) && !interval_ok(abi::EP_CONTROL, 3, abi::SPEED_FULL));
+}
+
+fn address(route: u32, speed: u32, tt_slot: u32, tt_port: u32, mtt: u32, mps: u32, bsr: u32) -> Address {
+    Address { route, speed, tt_slot, tt_port, mtt, mps, bsr }
+}
+
+#[test]
+fn address_names_no_interrupter() {
+    // A device on a root port, and a full speed one behind a TT.
+    let a = address(0, abi::SPEED_HIGH, 0, 0, 0, 64, 0);
+    assert!(a.ok());
+    assert_eq!(a.slot_ctx(5), [abi::SPEED_HIGH << 20 | 1 << 27, 5 << 16, 0]);
+    let a = address(0x21, abi::SPEED_FULL, 3, 4, 1, 8, 1);
+    assert!(a.ok());
+    assert_eq!(a.slot_ctx(2), [0x21 | abi::SPEED_FULL << 20 | 1 << 25 | 1 << 27, 2 << 16, 3 | 4 << 8]);
+    // Without a TT hub the TT port is not the guest's to set: it would
+    // reach the TT think time and the Interrupter Target (bits 16..31).
+    for tt_port in [1, 0x100, 1 << 14, 0x3f_c000, u32::MAX] {
+        assert!(!address(0, abi::SPEED_HIGH, 0, tt_port, 0, 64, 0).ok(), "TT port {tt_port:#x} without a TT");
+    }
+    assert!(!address(0, abi::SPEED_HIGH, 0, 0, 1, 64, 0).ok(), "multi-TT without a TT");
+    // With one: a slot and a port of eight bits each.
+    assert!(!address(0, abi::SPEED_FULL, 3, 0, 0, 8, 0).ok());
+    assert!(!address(0, abi::SPEED_FULL, 3, 256, 0, 8, 0).ok());
+    assert!(!address(0, abi::SPEED_FULL, 256, 1, 0, 8, 0).ok());
+    assert!(!address(0, abi::SPEED_FULL, 3, 1, 2, 8, 0).ok());
+    // The other fields.
+    assert!(!address(0x100000, abi::SPEED_HIGH, 0, 0, 0, 64, 0).ok());
+    assert!(!address(0, 0, 0, 0, 0, 64, 0).ok());
+    assert!(!address(0, 6, 0, 0, 0, 512, 0).ok());
+    assert!(!address(0, abi::SPEED_HIGH, 0, 0, 0, 8, 0).ok());
+    assert!(!address(0, abi::SPEED_HIGH, 0, 0, 0, 64, 2).ok());
+    // Whatever the fields, the dwords carry nothing but the bits usbd
+    // gives a controller.
+    let a = address(u32::MAX, u32::MAX, u32::MAX, u32::MAX, u32::MAX, u32::MAX, u32::MAX);
+    let dw = a.slot_ctx(255);
+    assert_eq!(dw[2] >> 16, 0, "TT think time or Interrupter Target");
+    assert_eq!((dw[0] & !SLOT_CTX_BITS[0], dw[1] & !SLOT_CTX_BITS[1], dw[2] & !SLOT_CTX_BITS[2]), (0, 0, 0));
+    assert_eq!(dw[0] >> 27, 1, "context entries");
+}
+
+#[test]
+fn slot_context_copies_are_masked() {
+    // What the controller wrote in an output context goes back without
+    // the reserved bits, a Max Exit Latency or an Interrupter Target.
+    assert_eq!(slot_ctx([u32::MAX; 3]), [!(1 << 24), 0xffff_0000, 0x3_ffff]);
+    let out = [0x0830_0021, 0x0402_0000, 0x0002_0403];
+    assert_eq!(slot_ctx(out), out);
+}
+
+#[test]
+fn hub_contexts() {
+    let sc = [abi::SPEED_HIGH << 20 | 1 << 27, 3 << 16, 0];
+    // A high speed hub with seven ports and a think time, on xHCI 1.0.
+    assert_eq!(hub_slot_ctx(sc, abi::SPEED_HIGH, 0x100, 7, 2, 0), Some([sc[0] | 1 << 26, 3 << 16 | 7 << 24, 2 << 16]));
+    // Multi-TT; a SuperSpeed hub has no think time from 1.0; 0.95 takes neither.
+    assert_eq!(hub_slot_ctx(sc, abi::SPEED_HIGH, 0x100, 4, 0, 1).unwrap()[0], sc[0] | 1 << 26 | 1 << 25);
+    assert_eq!(hub_slot_ctx(sc, abi::SPEED_SUPER, 0x100, 4, 3, 0).unwrap()[2], 0);
+    assert_eq!(hub_slot_ctx(sc, abi::SPEED_HIGH, 0x95, 4, 3, 0), Some([sc[0] | 1 << 26, sc[1], 0]));
+    // A full speed hub loses a stale multi-TT bit.
+    assert_eq!(hub_slot_ctx([sc[0] | 1 << 25, sc[1], 0], abi::SPEED_FULL, 0x100, 4, 0, 0).unwrap()[0] & (1 << 25), 0);
+    // Out of range.
+    assert_eq!(hub_slot_ctx(sc, abi::SPEED_HIGH, 0x100, 256, 0, 0), None);
+    assert_eq!(hub_slot_ctx(sc, abi::SPEED_HIGH, 0x100, 4, 4, 0), None);
+    assert_eq!(hub_slot_ctx(sc, abi::SPEED_HIGH, 0x100, 4, 0, 2), None);
+    assert_eq!(hub_slot_ctx(sc, 0, 0x100, 4, 0, 0), None, "not addressed");
+    // Nothing the context held beyond usbd's bits survives.
+    let dw = hub_slot_ctx([u32::MAX; 3], abi::SPEED_HIGH, 0x100, 255, 3, 1).unwrap();
+    assert_eq!(dw, slot_ctx(dw));
+    assert_eq!(dw[2] >> 18, 0);
+}
+
+#[test]
+fn stream_counts() {
+    // A primary stream array has 2^(MaxPStreams+1) entries, MaxPStreams 0
+    // is no streams: 2 cannot be asked for.
+    for (count, max, ok) in [(0, 16, false), (1, 16, false), (2, 16, false), (3, 16, false), (4, 16, true), (8, 16, true),
+        (16, 16, true), (32, 16, false), (12, 16, false), (4, 0, false), (8, 4, false), (u32::MAX, 16, false), (1 << 31, u32::MAX, true)] {
+        assert_eq!(streams_ok(count, max), ok, "{count} of {max}");
+    }
+    let bulk = abi::Ep { dci: 3, ty: abi::EP_BULK_IN, interval: 0, burst_mult: 15, max_packet: 1024, max_esit: 0 };
+    // No streams: a transfer ring, MaxPStreams 0, no linear array.
+    assert_eq!(ep_ctx(&bulk, 0)[0], 0);
+    for (count, pstreams) in [(4, 1), (8, 2), (16, 3)] {
+        assert!(streams_ok(count, 16));
+        let dw0 = ep_ctx(&bulk, count)[0];
+        assert_eq!(((dw0 >> 10) & 0x1f, dw0 & (1 << 15)), (pstreams, 1 << 15), "{count} streams");
+        assert_eq!(2 << ((dw0 >> 10) & 0x1f), count, "array entries");
+    }
+}
+
+#[test]
+fn endpoint_contexts() {
+    // SuperSpeed isoch IN, 3 x 16 x 1024 every 2^4 microframes.
+    let e = abi::Ep { dci: 5, ty: abi::EP_ISOC_IN, interval: 4, burst_mult: 0x2f, max_packet: 1024, max_esit: 49152 };
+    assert!(ep_ok(&e, abi::SPEED_SUPER));
+    assert_eq!(ep_ctx(&e, 0), [2 << 8 | 4 << 16, (abi::EP_ISOC_IN as u32) << 3 | 15 << 8 | 1024 << 16, 49152 | 49152 << 16]);
+    // High speed bulk OUT: three retries, Linux's average TRB length.
+    let e = abi::Ep { dci: 2, ty: abi::EP_BULK_OUT, interval: 0, burst_mult: 0, max_packet: 512, max_esit: 0 };
+    assert_eq!(ep_ctx(&e, 0), [0, 3 << 1 | (abi::EP_BULK_OUT as u32) << 3 | 512 << 16, 3072]);
+    assert_eq!(ep0_ctx_dw1(64), 3 << 1 | (abi::EP_CONTROL as u32) << 3 | 64 << 16);
+    // Whatever the record, no reserved bit and no Host Initiate Disable:
+    // dword 0 bits 0..7 (the state is the controller's) and 24..31 (usbd
+    // has no ESIT payload beyond 16 bits), dword 1 bits 0, 6 and 7.
+    let e = abi::Ep { dci: 31, ty: 0xff, interval: 0xff, burst_mult: 0xff, max_packet: 0xffff, max_esit: 0xffff };
+    let dw = ep_ctx(&e, u32::MAX);
+    assert_eq!(dw[0] & 0x0000_00ff, 0);
+    assert_eq!(dw[1] & 0xc1, 0);
+    // ep0's packet sizes.
+    for (speed, mps, ok) in [(abi::SPEED_LOW, 8, true), (abi::SPEED_LOW, 64, false), (abi::SPEED_FULL, 16, true), (abi::SPEED_FULL, 24, false),
+        (abi::SPEED_HIGH, 64, true), (abi::SPEED_HIGH, 512, false), (abi::SPEED_SUPER, 512, true), (abi::SPEED_SUPER_PLUS, 512, true),
+        (abi::SPEED_SUPER, 64, false), (0, 8, false), (0, 512, false), (6, 512, false)] {
+        assert_eq!(ep0_mps_ok(speed, mps), ok, "speed {speed} mps {mps}");
+    }
+}
+
+#[test]
+fn endpoint_set_never_fills() {
+    let mut set = EpSet::new();
+    assert_eq!(set.pop(), None);
+    // One entry an endpoint, however often it is added.
+    for _ in 0..1000 {
+        set.insert(3, 4);
+        set.insert(1, 31);
+    }
+    assert_eq!((set.pop(), set.pop(), set.pop()), (Some((1, 31)), Some((3, 4)), None));
+    // Every endpoint there is, at once.
+    for slot in 1..=MAX_SLOTS as usize {
+        for dci in 1..32 {
+            set.insert(slot, dci);
+        }
+    }
+    let mut n = 0;
+    let mut last = (0, 0);
+    while let Some(e) = set.pop() {
+        assert!(e > last && (1..=MAX_SLOTS as usize).contains(&e.0) && (1..32).contains(&e.1));
+        last = e;
+        n += 1;
+    }
+    assert_eq!(n, MAX_SLOTS as usize * 31);
+    // Nothing outside the table, and clear empties it.
+    for (slot, dci) in [(0, 1), (MAX_SLOTS as usize + 1, 1), (1, 0), (1, 32), (usize::MAX, usize::MAX)] {
+        set.insert(slot, dci);
+    }
+    assert_eq!(set.pop(), None);
+    set.insert(2, 2);
+    set.clear();
+    assert_eq!(set.pop(), None);
 }
 
 #[test]

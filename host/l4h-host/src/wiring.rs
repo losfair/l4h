@@ -398,7 +398,7 @@ pub const VMM_BLKD_KICK: E<p::Vmm, p::Blkd, o::Notification> = E::new(shared(edg
     Fixed(badges::blkd::KICK), 1, Root, "a disk channel has requests (in its device's kick slot)")));
 pub const VMM_NETD_KICK: E<p::Vmm, p::Netd, o::Notification> = E::new(shared(edge("VMM_NETD_KICK", Vmm, VMM_KICKS, Netd, Notification, Signal,
     Bit(badges::netd::PORT), net::MAX_PORTS, Root, "port p has frames to send (in its device's kick slot)")));
-pub const VMM_USBD_KICK: E<p::Guest, p::Usbd, o::Notification> = E::new(shared(edge("VMM_USBD_KICK", Guest, Chosen, Usbd, Notification, Signal,
+pub const GUEST_USBD_KICK: E<p::Guest, p::Usbd, o::Notification> = E::new(shared(edge("GUEST_USBD_KICK", Guest, Chosen, Usbd, Notification, Signal,
     Fixed(badges::usbd::KICK), 1, Root, "the guest's USB queues have requests (in its device CNode, passed on by vmmgr)")));
 pub const BLKD_VMM_DONE: E<p::Blkd, p::Vmm, o::Notification> = E::new(shared(edge("BLKD_VMM_DONE", Blkd, Slots(blk::BLKD_SLOT_CLIENT_DONE, blk::MAX_CLIENTS), Vmm,
     Notification, Signal, Fixed(badges::vmm::DONE), 1, Root, "client i's channel has completions")));
@@ -456,7 +456,7 @@ pub const EDGES: &[Edge] = &[
     TRUSTD_FAULT.0, BLKD_FAULT.0, NETD_FAULT.0, USBD_FAULT.0, LOGD_FAULT.0, VMM_FAULT.0, MEMD_KEEPER_FAULT.0,
     VMMGR_KEEPER_FAULT.0, FLAGS_KEEPER_FAULT.0, GUEST_FAULT.0,
     ROOT_BLKD_CALL.0, ROOT_NETD_CALL.0, ROOT_USBD_CALL.0, ROOT_VMMGR_CALL.0, BLKD_DONE.0, NETD_DONE.0, USBD_DONE.0, VMMGR_DONE.0,
-    VMM_BLKD_KICK.0, VMM_NETD_KICK.0, VMM_USBD_KICK.0, BLKD_VMM_DONE.0, NETD_VMM_DONE.0, USBD_VMM.0,
+    VMM_BLKD_KICK.0, VMM_NETD_KICK.0, GUEST_USBD_KICK.0, BLKD_VMM_DONE.0, NETD_VMM_DONE.0, USBD_VMM.0,
     IRQ_BLKD.0, IRQ_NETD.0, IRQ_USBD.0, IRQ_MONITOR.0, DOORBELL_ROOT.0, DOORBELL_NETD.0, NETD_LINK_SELF.0, NETD_LINK_RING.0,
     GUEST_TRUSTD.0, ROOT_TRUSTD_RELAY.0,
     GUEST_CTL.0, GUEST_VMM_KICK.0, GUEST_VMM_MEM.0, GUEST_VMM_CONSOLE.0, VMMGR_VMM.0, VMM_VCPU.0, GUEST_IPI.0, VMMGR_VCPU.0,

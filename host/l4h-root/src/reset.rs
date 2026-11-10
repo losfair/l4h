@@ -72,6 +72,17 @@ impl Reset {
         info!("l4h-root: ACPI reset register: space {} at {:#x}{}", space, addr, if reg.is_none() { ", unusable" } else { "" });
         Reset { reg: reg.map(|r| (r, t[FADT_RESET_VALUE])) }
     }
+
+    /// The PCI function (bus, device, function) whose configuration space
+    /// holds the reset register, if it is there: no one else writes it
+    /// (trustd::hw).
+    #[cfg(target_arch = "x86_64")]
+    pub fn pci_function(&self) -> Option<(u8, u8, u8)> {
+        match self.reg {
+            Some((Reg::Pci { dev, func, .. }, _)) => Some((0, dev, func)),
+            _ => None,
+        }
+    }
 }
 
 /// Reset the machine.  Returns only if every method failed: EIO

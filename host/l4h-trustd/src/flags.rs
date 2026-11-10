@@ -1,17 +1,20 @@
 //! The flags: trustd's main thread reads them and calls the flags server,
 //! which is this image again, started by root as a component of its own
 //! (host::KIND_FLAGS): its own CSpace and VSpace, the only writable
-//! mapping of the flags, and a keeper that answers its callers if it
-//! fails.  No heap, TPM, AML or calls back to root: a caller donates only
-//! the time for this one request.
+//! mapping of the flags, a scheduling context of its own
+//! (trust::FLAGS_BUDGET_US of every FLAGS_PERIOD_US), and a keeper that
+//! answers its callers if it fails.  No heap, TPM, AML or calls back to
+//! root: a request is a few loads and stores.
 
 use l4h_rt::host::errno::Errno;
 use l4h_rt::host::trust::call::{self, Client as _};
 use l4h_rt::{cap, host, host::trust::{self, Flags, Sender, FlagsEntry}, sel4};
 use sel4::cap_type;
 
-pub fn read(id: usize, instance: u64) -> Flags {
-    unsafe { &*(trust::FLAGS_VA as *const FlagsEntry).add(id) }.read().for_instance(instance)
+/// Guest `id`'s flags as `instance`; None if they could not be read (the
+/// server was stopped in the middle of a write: FlagsEntry::try_read).
+pub fn read(id: usize, instance: u64) -> Option<Flags> {
+    unsafe { &*(trust::FLAGS_VA as *const FlagsEntry).add(id) }.try_read().map(|f| f.for_instance(instance))
 }
 
 /// Act on or seal (trust::FLAGS_ACT, FLAGS_SEAL) guest `id`'s flags,
@@ -61,9 +64,10 @@ impl l4h_rt::ipc::Server for Entries {
     }
 }
 
-/// The flags server's main thread (host::KIND_FLAGS).  Root unbinds its
-/// scheduling context once it waits (the Ready handshake): from then on
-/// it runs only on its callers'.
+/// The flags server's main thread (host::KIND_FLAGS).  It keeps the
+/// scheduling context root gave it, so it runs whatever a caller does: a
+/// message sent without a call, which donates no time, is served like any
+/// other, and its reply goes to no one.
 pub fn serve() -> ! {
     let ep = cap::<cap_type::Endpoint>(host::SLOT_SERVICE_EP);
     let reply = cap::<cap_type::Reply>(host::SLOT_REPLY);

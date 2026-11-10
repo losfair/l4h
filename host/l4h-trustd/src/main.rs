@@ -66,12 +66,6 @@ use l4h_rt::host::errno::{EAGAIN, EINVAL, EIO, ENODEV, ENOSYS, ETIMEDOUT, Errno}
 const DEFER: Errno = 1 << 32;
 const PENDING: Errno = (1 << 32) + 1;
 
-/// ActivateCredential per guest: up to ACTIVATE_BURST at once, then one
-/// every ACTIVATE_INTERVAL_MS (about 80 ms of TPM time each, on a discrete
-/// TPM).  Beyond that, -EAGAIN without using the TPM.
-const ACTIVATE_BURST: u64 = 5;
-const ACTIVATE_INTERVAL_MS: u64 = 1000;
-
 /// PCRs in the quote: the static ones (SRTM), 0-15.
 const QUOTE_PCRS: u32 = 0xffff;
 /// Extended with the key's hash once it is quoted.
@@ -390,10 +384,12 @@ fn record(id: usize) -> Option<GuestRecord> {
 impl State {
     /// The COSE_Sign1 report on guest `id`, whose record is `r`, with the
     /// guest's `data`, in `out`: its length.
-    fn report(&self, id: usize, r: &GuestRecord, data: &[u8; abi::ATTEST_DATA_SIZE], out: &mut [u8]) -> Result<usize, Overflow> {
+    /// EAGAIN if the guest's flags could not be read just now: a report
+    /// never says clean, or sealed, of flags it did not see.
+    fn report(&self, id: usize, r: &GuestRecord, data: &[u8; abi::ATTEST_DATA_SIZE], out: &mut [u8]) -> Result<usize, Errno> {
         let mut payload = [0u8; REPORT_MAX];
         let mut c = Enc::new(&mut payload);
-        let flags = flags::read(id, r.instance).bytes();
+        let flags = flags::read(id, r.instance).ok_or(EAGAIN)?.bytes();
         c.map(11 + self.partition.is_some() as usize);
         c.text("v").uint(if self.partition.is_some() { 2 } else { 1 });
         c.text("ram").uint(r.ram);
@@ -409,16 +405,17 @@ impl State {
         if let Some(k) = self.partition {
             c.text("partition").uint(k as u64);
         }
-        let payload = c.done()?;
+        // REPORT_MAX bounds every report.
+        let payload = c.done().map_err(|Overflow| EIO)?;
         // Protected header {1: -7}: alg ES256.
         let protected = [0xa1, 0x01, 0x26];
         let mut sig_structure = [0u8; REPORT_MAX];
         let mut s = Enc::new(&mut sig_structure);
         s.array(4).text("Signature1").bytes(&protected).bytes(&[]).bytes(payload);
-        let sig: Signature = self.key.sign(s.done()?);
+        let sig: Signature = self.key.sign(s.done().map_err(|Overflow| EIO)?);
         let mut o = Enc::new(out);
         o.tag(18).array(4).bytes(&protected).map(0).bytes(payload).bytes(&sig.to_bytes());
-        Ok(o.done()?.len())
+        Ok(o.done().map_err(|Overflow| EIO)?.len())
     }
 }
 
@@ -469,8 +466,12 @@ impl Local {
     }
 }
 
-/// The primary: answer what other partitions' trustds asked.
-fn serve(state: &mut Option<State>, relay: &mut Relay, served: &mut [Served; trust::MAX_PARTITIONS]) {
+/// The primary: answer what other partitions' trustds asked.  A
+/// partition's ActivateCredential requests have the allowance one guest's
+/// have (`limits`): beyond it, -EAGAIN without using the TPM, so that no
+/// partition keeps the TPM from this one's guests.
+fn serve(state: &mut Option<State>, relay: &mut Relay, served: &mut [Served; trust::MAX_PARTITIONS],
+    limits: &mut [trust::ActivateLimit; trust::MAX_PARTITIONS], hz: u64) {
     for k in 1..relay.count {
         let Some(m) = relay.recv(k) else { continue };
         let (head, from) = (m.head, k);
@@ -499,6 +500,7 @@ fn serve(state: &mut Option<State>, relay: &mut Relay, served: &mut [Served; tru
                     let blob_len = m.data.get(..4).map_or(usize::MAX, |b| u32::from_le_bytes(b.try_into().unwrap()) as usize);
                     match m.data.get(4..).filter(|d| blob_len <= d.len()) {
                         None => Err(EINVAL),
+                        Some(_) if !limits[from as usize].allow(host::ticks::now(), hz) => Err(EAGAIN),
                         Some(d) => l.activate(&d[..blob_len], &d[blob_len..], &mut out[..last.data.len()]).map_err(|e| {
                             info!("l4h-trustd: partition {}: ActivateCredential failed: {}", from, e);
                             EIO
@@ -529,23 +531,17 @@ fn serve(state: &mut Option<State>, relay: &mut Relay, served: &mut [Served; tru
 struct Answered {
     instance: u64,
     seq: u32,
-    /// The activation rate limit (GCRA): when the allowance is next full,
-    /// in ticks; 0 when it is.
-    activate_tat: u64,
+    /// The activation rate limit: up to trust::ACTIVATE_BURST at once,
+    /// then one every ACTIVATE_INTERVAL_MS.  Beyond that, -EAGAIN without
+    /// using the TPM.
+    activate: trust::ActivateLimit,
 }
 
 impl Answered {
     /// May the guest use the TPM for an ActivateCredential now?  If so, it
     /// is counted.
     fn may_activate(&mut self, hz: u64) -> bool {
-        let interval = hz * ACTIVATE_INTERVAL_MS / 1000;
-        let now = host::ticks::now();
-        let tat = self.activate_tat.max(now);
-        if tat - now > interval * (ACTIVATE_BURST - 1) {
-            return false;
-        }
-        self.activate_tat = tat + interval;
-        true
+        self.activate.allow(host::ticks::now(), hz)
     }
 }
 
@@ -602,8 +598,7 @@ fn execute<'a>(
             let mut d = [0u8; abi::ATTEST_DATA_SIZE];
             let n = data.len().min(d.len());
             d[..n].copy_from_slice(&data[..n]);
-            // REPORT_MAX bounds every report.
-            let n = s.report(id, r, &d, out).map_err(|Overflow| EIO)?;
+            let n = s.report(id, r, &d, out)?;
             Ok(&out[..n])
         }
         abi::ATTEST_EVIDENCE => Ok(&s.evidence[..s.evidence_len]),
@@ -719,6 +714,7 @@ fn main(info: &'static Info) -> ! {
     let kick = cap::<cap_type::Notification>(trust::SLOT_KICK);
     let mut answered = [Answered::default(); trust::MAX_RECORDS];
     let mut served = [Served::default(); trust::MAX_PARTITIONS];
+    let mut relayed = [trust::ActivateLimit::default(); trust::MAX_PARTITIONS];
     let mut out = [0u8; ANSWER_MAX];
     // Guests whose requests wait for the relay.
     let mut deferred = 0u64;
@@ -729,7 +725,7 @@ fn main(info: &'static Info) -> ! {
         match relay.as_mut() {
             Some(r) if r.primary() => {
                 if kicked & trust::RELAY_BADGE != 0 {
-                    serve(&mut state, r, &mut served);
+                    serve(&mut state, r, &mut served, &mut relayed, hz);
                 }
             }
             Some(r) => match r.poll() {

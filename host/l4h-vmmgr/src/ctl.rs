@@ -402,6 +402,11 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
             let g = h.guest(vm_arg(a[0])?).ok_or(ENOENT)?;
             let t = h.flags.as_ref().ok_or(ENOSYS)?;
             let flags = t.flags(g);
+            // An entry the flags server was writing at every look says
+            // nothing of the guest: not "all tainted and sealed".
+            if flags.unavailable() {
+                return Err(EAGAIN);
+            }
             resp.vals[0] = flags.taint[0];
             resp.vals[1] = flags.seal[0];
             Ok(())
