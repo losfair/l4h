@@ -3704,9 +3704,12 @@ a line.
   (also in `l4h_host::serial`) prints the record with the lowest timestamp
   of any ring, then lines of kernel console rings. A record claimed and not
   committed gets 100 ms; `(N lines lost)` reports what was overwritten or
-  skipped. Each ring has 64 records or reports of a pass, which bounds what
-  a ring claiming to hold the oldest record can do, and a pass ends only
-  when nothing is left to print. It has 5 more for the rest of a line it
+  skipped. Each partition has 64 records or reports of a pass, which bounds
+  what a ring claiming to hold the oldest record can do, and a pass ends
+  only when nothing is left to print. Partition 0's home ring and lanes
+  share theirs: its lines go out oldest first, as from the one ring it had,
+  so a line printed after a guest's (vmmgr's "all guests stopped") follows
+  what the guest printed before it. It has 5 more for the rest of a line it
   has started, the length of the longest message; a longer line can split
   where a pass ends. logd waits for the rest of a line only from root's
   ring: another writer could ask for 100 ms every time, and another

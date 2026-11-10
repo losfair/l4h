@@ -481,7 +481,8 @@ struct Input {
     lost: u64,
     /// When to stop waiting for the uncommitted record at the cursor.
     deadline: Option<u64>,
-    budget: u32,
+    /// Its partition, whose inputs share a budget (Merge::budgets).
+    group: usize,
 }
 
 struct KernelInput {
@@ -538,6 +539,10 @@ pub struct Merge {
     /// How long, in ticks, a claimed record gets to be committed.
     grace: u64,
     commit: Commit,
+    /// Records each partition may still print in this pass, partition 0's
+    /// home ring and lanes together: within a partition, lines go oldest
+    /// first, as they did from its one ring; partitions get their shares.
+    budgets: [u32; MAX_RINGS],
 }
 
 impl Merge {
@@ -550,6 +555,7 @@ impl Merge {
             open: None,
             grace,
             commit: Commit::None,
+            budgets: [PASS_RECORDS + LINE_RECORDS; MAX_RINGS],
         };
         m.add_ring(0, home, None);
         m
@@ -572,7 +578,7 @@ impl Merge {
     }
 
     fn add(&mut self, k: usize, ring: View<'static, WORDS>, drained: Option<&'static AtomicU64>, label: Label) {
-        self.inputs[k] = Some(Input { ring, drained, label, cursor: 0, lost: 0, deadline: None, budget: PASS_RECORDS + LINE_RECORDS });
+        self.inputs[k] = Some(Input { ring, drained, label, cursor: 0, lost: 0, deadline: None, group: if k < MAX_RINGS { k } else { 0 } });
     }
 
     /// Add the console ring of partition k's kernel.
@@ -600,9 +606,7 @@ impl Merge {
     }
 
     fn begin_pass(&mut self) {
-        for i in self.inputs.iter_mut().flatten() {
-            i.budget = PASS_RECORDS + LINE_RECORDS;
-        }
+        self.budgets = [PASS_RECORDS + LINE_RECORDS; MAX_RINGS];
         for i in self.kernels.iter_mut().flatten() {
             i.budget = PASS_RECORDS;
         }
@@ -632,7 +636,7 @@ impl Merge {
         let mut report = None;
         for (k, slot) in self.inputs.iter_mut().enumerate() {
             let Some(i) = slot else { continue };
-            if i.budget <= if open == Some(k) { 0 } else { LINE_RECORDS } {
+            if self.budgets[i.group] <= if open == Some(k) { 0 } else { LINE_RECORDS } {
                 continue;
             }
             let peek = i.peek(now, self.grace);
@@ -644,7 +648,7 @@ impl Merge {
                     let rest = self.open == Some((k, (r.meta >> SOURCE_SHIFT) as u32));
                     if rest {
                         continues = true;
-                    } else if i.budget <= LINE_RECORDS {
+                    } else if self.budgets[i.group] <= LINE_RECORDS {
                         continue;
                     }
                     if rest || !continues && best.as_ref().is_none_or(|(_, b)| r.ticks < b.ticks) {
@@ -662,7 +666,7 @@ impl Merge {
         if let Some(k) = report.filter(|&k| open == Some(k) || !(hold || continues)) {
             let Some(i) = &mut self.inputs[k] else { return false };
             let lost = core::mem::take(&mut i.lost);
-            i.budget -= 1;
+            self.budgets[i.group] -= 1;
             end_line(&mut self.open, out);
             write_prefix(out, i.label, 0);
             let _ = write!(out, "({} lines lost)\r\n", lost);
@@ -690,7 +694,7 @@ impl Merge {
                 self.open = None;
             }
             i.cursor += 1;
-            i.budget -= 1;
+            self.budgets[i.group] -= 1;
             self.commit = Commit::Ring(k, i.cursor);
             return true;
         }
@@ -1057,6 +1061,24 @@ mod tests {
         other.ring.head.store(3, SeqCst);
         home.write(5, 0, b"again", false);
         assert!(drain(&mut m, u64::MAX).contains("again\r\n"));
+    }
+
+    #[test]
+    fn partition_0s_lanes_go_oldest_first_as_one_ring() {
+        // dom0's console floods its lane; vmmgr says, later, that all
+        // guests stopped: that line comes after the console's, as from
+        // the one ring partition 0 had (tests stop on it).
+        let (home, lanes) = (ring(), lanes());
+        let mut m = Merge::new(home, GRACE);
+        m.add_lanes(lanes);
+        for t in 0..500 {
+            lanes.write(Writer::Dom0, t, SOURCE_DOM0, b"flood", false);
+        }
+        lanes.write(Writer::Dom0, 500, SOURCE_DOM0, b"PASS", false);
+        lanes.write(Writer::Vmmgr, 501, 0, b"stopped", false);
+        let text = drain(&mut m, 1000);
+        let (pass, stopped) = (text.find("PASS\r\n").expect(&text), text.find("[vmmgr] stopped").expect(&text));
+        assert!(pass < stopped, "{text}");
     }
 
     #[test]
