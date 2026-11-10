@@ -90,11 +90,12 @@ impl Component {
     /// own CNode (SLOT_CNODE), so it may have filled the slot, and may fill
     /// it again at any time: a full slot is emptied (and logged) and the
     /// mint tried once more.  If the component refilled it meanwhile, the
-    /// error comes back (logged) rather than its parent panicking: a
-    /// component that does so misbehaves, and the caller fails what it was
-    /// giving the capability for, and the component (as its other faults).
-    /// The other gives are for a component that has not started, where a
-    /// full slot is the parent's own mistake.
+    /// error (DeleteFirst) comes back, logged, rather than its parent
+    /// panicking: a component that does so misbehaves, and the caller fails
+    /// what it was giving the capability for, and the component (as its
+    /// other faults).  Any other error is the parent's own mistake and
+    /// panics, as in the other gives, which are for a component that has
+    /// not started, where even a full slot is.
     pub fn give_edge_live<H, T, O, P>(&self, e: &E<H, T, O, P>, n: usize, i: usize, src: &Obj<T, O>) -> sel4::Result<()>
     where
         H: p::IsParty,
@@ -114,17 +115,20 @@ impl Component {
 
     /// Put into slot `idx` of a running component with `put`, replacing
     /// once what it holds there (`give_edge_live`).
-    fn live(&self, idx: u64, what: &str, put: impl Fn() -> sel4::Result<()>) -> sel4::Result<()> {
-        let mut r = put();
-        if r == Err(sel4::Error::DeleteFirst) {
-            log!("component {} slot {} ({}): not empty, replacing what the component put there", self.id, idx, what);
-            let _ = self.slot(idx).delete();
-            r = put();
+    fn live(&self, idx: u64, what: &str, put: impl FnMut() -> sel4::Result<()>) -> sel4::Result<()> {
+        use l4h_host::wiring::Live;
+        match l4h_host::wiring::put_live(&sel4::Error::DeleteFirst, put, || { let _ = self.slot(idx).delete(); }) {
+            Live::Given => Ok(()),
+            Live::Replaced => {
+                log!("component {} slot {} ({}): was not empty: replaced what the component put there", self.id, idx, what);
+                Ok(())
+            }
+            Live::Refilled => {
+                log!("component {} slot {} ({}): not given: the component keeps filling the slot", self.id, idx, what);
+                Err(sel4::Error::DeleteFirst)
+            }
+            Live::Failed(err) => panic!("component {} slot {} ({}): {:?}", self.id, idx, what, err),
         }
-        if let Err(err) = r {
-            log!("component {} slot {} ({}): not given ({:?}): it keeps filling the slot", self.id, idx, what, err);
-        }
-        r
     }
 
     /// Pass on to it a capability of `e`, which this component holds, that

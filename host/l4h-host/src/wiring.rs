@@ -725,9 +725,66 @@ const _: () = match keepers() {
     Err(e) => panic!("{}", e),
 };
 
+/// What became of a capability put into a slot of a component that is
+/// running (l4h_task's `give_*_live`): it holds its own CNode, so it may
+/// have filled the slot, and may fill it again at any time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Live<E> {
+    /// Into an empty slot.
+    Given,
+    /// The slot was full: emptied, and given.
+    Replaced,
+    /// Emptied, and full again before the second try: the component
+    /// misbehaves.
+    Refilled,
+    /// `put` failed otherwise: the giver's own mistake, as for a give into
+    /// a component that has not started.
+    Failed(E),
+}
+
+/// Put a capability with `put` into a running component's slot, whose
+/// error `full` means the slot is occupied: then `empty` it and try once
+/// more.  Only a full slot is the component's doing.
+pub fn put_live<E: PartialEq>(full: &E, mut put: impl FnMut() -> Result<(), E>, empty: impl FnOnce()) -> Live<E> {
+    match put() {
+        Ok(()) => Live::Given,
+        Err(e) if e != *full => Live::Failed(e),
+        Err(_) => {
+            empty();
+            match put() {
+                Ok(()) => Live::Replaced,
+                Err(e) if e != *full => Live::Failed(e),
+                Err(_) => Live::Refilled,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn put_live_blames_only_a_full_slot() {
+        use core::cell::Cell;
+        // Each case: put's answers in turn; the outcome, and whether the slot
+        // was emptied.
+        let cases: [(&[Result<(), u8>], Live<u8>, bool); 6] = [
+            (&[Ok(())], Live::Given, false),
+            (&[Err(1), Ok(())], Live::Replaced, true),
+            (&[Err(1), Err(1)], Live::Refilled, true),
+            (&[Err(2)], Live::Failed(2), false),
+            (&[Err(1), Err(3)], Live::Failed(3), true),
+            (&[Err(1), Err(1), Ok(())], Live::Refilled, true),
+        ];
+        for (answers, want, emptied) in cases {
+            let (calls, empties) = (Cell::new(0), Cell::new(0));
+            let r = put_live(&1, || { calls.set(calls.get() + 1); answers[calls.get() - 1] }, || empties.set(empties.get() + 1));
+            assert_eq!(r, want, "{answers:?}");
+            assert_eq!(empties.get(), emptied as usize, "{answers:?}");
+            assert!(calls.get() <= 2, "{answers:?}: at most one retry");
+        }
+    }
 
     #[test]
     fn edges_check() {

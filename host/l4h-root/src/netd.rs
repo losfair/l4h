@@ -567,7 +567,7 @@ impl Netd {
 
     /// netd no longer uses port `p`'s memory.
     fn released(h: &mut Host, p: usize, zombie: Option<usize>) {
-        let _ = h.netd.comp.slot(net::NETD_SLOT_CLIENT_BASE + p as u64).delete();
+        h.netd.take_port_done(p);
         h.netd.held &= !(1 << p);
         crate::vmmgr::zombie_done(h, zombie, true);
     }
@@ -611,8 +611,8 @@ impl Netd {
         Ok(())
     }
 
-    /// Take back port `p`'s done notification, given by `give_port_done`,
-    /// when the port is not added after all.
+    /// Take back port `p`'s done notification (`give_port_done`): netd is
+    /// done with the port, or it is not added after all.
     pub fn take_port_done(&self, p: usize) {
         let _ = self.comp.slot(net::NETD_SLOT_CLIENT_BASE + p as u64).delete();
     }
