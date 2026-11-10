@@ -80,7 +80,8 @@ pub enum Rights {
     Call,
     /// Signal the notification (write).
     Signal,
-    /// Bind the notification to an IRQ handler (all rights).
+    /// Bind the notification to an IRQ handler, which then signals it:
+    /// write, which is all seL4 asks of a handler's notification.
     Bind,
     /// Receive the holder's main thread's faults (the TCB's fault
     /// endpoint).
@@ -413,11 +414,11 @@ pub const IRQ_NETD: E<p::Irq, p::Netd, o::Notification> = E::new(edge("IRQ_NETD"
     Bit(badges::netd::IRQ), net::MAX_NICS, Root, "uplink NIC n's interrupt"));
 pub const IRQ_USBD: E<p::Irq, p::Usbd, o::Notification> = E::new(edge("IRQ_USBD", Irq, Bound, Usbd, Notification, Bind,
     Fixed(badges::usbd::IRQ), 1, Root, "its xHCI's interrupt"));
-pub const IRQ_MONITOR: E<p::Irq, p::Root, o::Notification> = E::new(edge("IRQ_MONITOR", Irq, Bound, Root, Notification, Signal,
+pub const IRQ_MONITOR: E<p::Irq, p::Root, o::Notification> = E::new(edge("IRQ_MONITOR", Irq, Bound, Root, Notification, Bind,
     Fixed(badges::root::MONITOR), 1, Root, "the serial monitor's input"));
-pub const DOORBELL_ROOT: E<p::Irq, p::Root, o::Notification> = E::new(edge("DOORBELL_ROOT", Irq, Bound, Root, Notification, Signal,
+pub const DOORBELL_ROOT: E<p::Irq, p::Root, o::Notification> = E::new(edge("DOORBELL_ROOT", Irq, Bound, Root, Notification, Bind,
     Fixed(badges::root::CHANNEL), 1, Root, "another partition rang (its control channel)"));
-pub const DOORBELL_NETD: E<p::Irq, p::Netd, o::Notification> = E::new(shared(edge("DOORBELL_NETD", Irq, Bound, Netd, Notification, Signal,
+pub const DOORBELL_NETD: E<p::Irq, p::Netd, o::Notification> = E::new(shared(edge("DOORBELL_NETD", Irq, Bound, Netd, Notification, Bind,
     Bit(badges::netd::LINK), net::MAX_LINKS, Root, "link l's peer rang")));
 pub const NETD_LINK_SELF: E<p::Netd, p::Netd, o::Notification> = E::new(shared(edge("NETD_LINK_SELF", Netd, Slots(net::NETD_SLOT_LINK_KICK_BASE, net::MAX_LINKS), Netd,
     Notification, Signal, Bit(badges::netd::LINK), net::MAX_LINKS, Root, "netd's reminder to read link l again (as its doorbell)")));

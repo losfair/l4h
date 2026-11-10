@@ -55,6 +55,7 @@ pub fn signal() {
 /// and usbd's notifications of their clients).  Root may empty the slot
 /// before the driver has taken the request that says so, and Signal on an
 /// empty slot would fault the driver; NBSend ignores it.
+#[allow(clippy::disallowed_methods)]
 pub fn notify(client: sel4::cap::Notification) {
     client.nb_send(sel4::MessageInfo::new(0, 0, 0, 0));
 }

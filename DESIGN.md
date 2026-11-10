@@ -1142,7 +1142,12 @@ Global on each core, with `P_K` = `PRIO_KERNEL` = 100:
 | `P_U` = 99 | guest user TCBs (`SC_U`) |
 
 Other host services run with full budgets; guests' vCPUs are bounded by their
-SCs. Because `P_K > P_U` for every guest, one guest's kernel work can
+SCs. A CPU cap bounds a guest's vCPUs only: what its VMM does for it
+(hypercalls, virtio queues, the display, the console) runs on the VMM's
+scheduling context at `P_K + 2`, on the core of the guest's first vCPU, and
+is not charged to the guest. memd charges hotplug to the guest's token
+bucket (§8.5); a guest that keeps its VMM busy still takes that core's
+time from other guests' vCPUs there. Because `P_K > P_U` for every guest, one guest's kernel work can
 briefly preempt another guest's user work, bounded by `SC_K` budgets.
 
 ### 7.2 Budgets and CPU caps
@@ -2865,8 +2870,12 @@ one way to do each part of it:
   thread that is not called (trustd's main thread, logd, the drivers)
   waits on its notification instead. Only l4h-ipc calls, serves and
   receives on endpoints (and l4h-rt's keeper and failure answers, which
-  serve no protocol): clippy's `disallowed-methods` (`host/clippy.toml`,
-  `tests/check-ipc.sh`) refuses those seL4 calls anywhere else. A
+  serve no protocol), and nothing sends on one without calling: a send
+  gives a server no reply to make, and a passive one no scheduling
+  context to come back on. clippy's `disallowed-methods`
+  (`host/clippy.toml`, `tests/check-ipc.sh`) refuses those seL4 calls
+  anywhere else; the one send left is `l4h_rt::mailbox::notify`'s, to a
+  notification. A
   driver's mailbox carries the same protocols without IPC: root posts a
   typed `Request` (`Mailbox::send`) and decodes each answer by its
   call's reply type; the driver answers with `l4h_rt::mailbox::serve`,
@@ -2908,8 +2917,9 @@ one way to do each part of it:
   guest's attestation kick) is passed on from its edge as well
   (`Component::pass_edge`, `edge::pass`), which gives the slot and caps
   the rights. The only other mint is of a CNode with its guard
-  (`edge::mint_cnode`, `give_cnode`), and clippy refuses `mint` anywhere
-  else, for both architectures. A component gets a capability to its parent's endpoint only if
+  (`edge::mint_cnode`, `give_cnode`), and clippy refuses `mint`, and
+  `mutate`, which can badge what it moves, anywhere else, for both
+  architectures. A component gets a capability to its parent's endpoint only if
   it calls its parent (`wiring::parent_call`: trustd, vmmgr, the VMMs),
   and its faults go to its parent by its fault edge (`parent_fault`, or
   `keeper_fault` for a component with a keeper); `create` checks that

@@ -61,8 +61,8 @@ fn minted_here(e: &Edge) {
 pub fn rights(e: &Edge) -> CapRights {
     match e.rights {
         Rights::Call => CapRightsBuilder::none().write(true).grant_reply(true).build(),
-        Rights::Signal => CapRights::write_only(),
-        Rights::Bind | Rights::Fault | Rights::KeeperFault => CapRights::all(),
+        Rights::Signal | Rights::Bind => CapRights::write_only(),
+        Rights::Fault | Rights::KeeperFault => CapRights::all(),
     }
 }
 
