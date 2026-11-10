@@ -422,7 +422,7 @@ impl AmdVi {
                         _ => (id, u16_at(b, 6)),
                     };
                     let (start, len) = (u64_at(b, 16) as usize, u64_at(b, 24) as usize);
-                    let end = start.checked_add(len)?.next_multiple_of(PAGE);
+                    let end = start.checked_add(len)?.checked_next_multiple_of(PAGE)?;
                     let u = Unity { first, last, start: start & !(PAGE - 1), end, write: write || exclusion };
                     info!("l4h-root: iommu: unity range {:#x}..{:#x} for devices {:#06x}..={:#06x}", u.start, u.end, first, last);
                     if self.unity.push(u).is_err() {

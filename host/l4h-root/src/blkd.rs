@@ -302,22 +302,33 @@ impl Controller {
 pub fn is_virtio_blk(d: &pci::Device) -> bool {
     d.vendor == VIRTIO_VENDOR
         && (d.device == 0x1042 || d.device == 0x1001)
-        && (d.virtio_caps.iter().any(|c| c.cfg_type == VIRTIO_PCI_CAP_COMMON_CFG) || (d.device == 0x1001 && is_legacy_virtio(d)))
+        && (is_modern_virtio(d) || (d.device == 0x1001 && is_legacy_virtio(d)))
         && d.msix.is_some()
+}
+
+/// A virtio 1.x device with the structures `virtio_regions` gives its
+/// driver, and the device status `reset` writes (pci.rs keeps only
+/// structures inside their BARs).
+pub fn is_modern_virtio(d: &pci::Device) -> bool {
+    (VIRTIO_PCI_CAP_COMMON_CFG..=VIRTIO_PCI_CAP_DEVICE_CFG).all(|t| d.virtio_caps.iter().any(|c| c.cfg_type == t))
+        && d.virtio_caps.iter().any(|c| c.cfg_type == VIRTIO_PCI_CAP_COMMON_CFG && c.length as usize > VIRTIO_DEVICE_STATUS)
 }
 
 /// A virtio 0.9.5 ("legacy") device: registers in I/O BAR 0, no virtio
 /// capabilities.  GCE's virtio-net and virtio-scsi are legacy devices, and
-/// so are all of a hypervisor's whose virtio predates 1.0.
+/// so are all of a hypervisor's whose virtio predates 1.0.  The BAR is in
+/// the 16-bit port space, as its users take it.
 pub fn is_legacy_virtio(d: &pci::Device) -> bool {
-    cfg!(target_arch = "x86_64") && d.virtio_caps.is_empty() && d.bars[0].is_io && d.bars[0].size >= 0x20
+    let b = d.bars[0];
+    cfg!(target_arch = "x86_64") && d.virtio_caps.is_empty() && b.is_io && b.size >= 0x20
+        && b.addr.checked_add(b.size).is_some_and(|end| end <= 0x1_0000)
 }
 
 /// A virtio-scsi controller, modern or legacy (as on GCE).
 pub fn is_virtio_scsi(d: &pci::Device) -> bool {
     d.vendor == VIRTIO_VENDOR
         && (d.device == 0x1048 || d.device == 0x1004)
-        && (d.virtio_caps.iter().any(|c| c.cfg_type == VIRTIO_PCI_CAP_COMMON_CFG) || (d.device == 0x1004 && is_legacy_virtio(d)))
+        && (is_modern_virtio(d) || (d.device == 0x1004 && is_legacy_virtio(d)))
         && d.msix.is_some()
 }
 
@@ -325,9 +336,26 @@ pub fn is_nvme(d: &pci::Device) -> bool {
     d.class == 0x01 && d.subclass == 0x08 && d.prog_if == 0x02 && d.msix.is_some() && d.bars[0].size >= 0x2000
 }
 
-/// Disks l4h can pass through.
+/// Disks l4h can pass through: also, the BARs `start` maps can be.
 pub fn is_disk(d: &pci::Device) -> bool {
-    is_virtio_blk(d) || is_virtio_scsi(d) || is_nvme(d)
+    let bars = if is_nvme(d) {
+        1
+    } else if is_legacy_virtio(d) {
+        0
+    } else {
+        virtio_bar_mask(d)
+    };
+    (is_virtio_blk(d) || is_virtio_scsi(d) || is_nvme(d)) && mappable(d, bars | d.msix.map_or(0, |m| 1 << m.table_bar))
+}
+
+/// Whether BARs `bars` (bit b for BAR b) of `d` are memory `bar_frames`
+/// can map, in `bar_pages` frames: their sizes and addresses are the
+/// device's.
+pub fn mappable(d: &pci::Device, bars: u8) -> bool {
+    (0..6).filter(|b| bars & 1 << b != 0).all(|b| {
+        let bar = d.bars[b];
+        !bar.is_io && bar.size.is_power_of_two() && bar.size <= BAR_STRIDE as u64 && bar.addr % bar.size.max(PAGE as u64) == 0
+    })
 }
 
 pub struct Attachment {

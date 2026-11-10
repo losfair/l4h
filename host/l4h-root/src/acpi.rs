@@ -101,7 +101,8 @@ impl<'a> Phys<'a> {
     pub fn read_into_attrs(&mut self, paddr: usize, buf: &mut [u8], attrs: sel4::VmAttributes) -> Option<()> {
         let mut done = 0;
         while done < buf.len() {
-            let at = paddr + done;
+            // `paddr` is the firmware's.
+            let at = paddr.checked_add(done)?;
             let n = (PAGE - at % PAGE).min(buf.len() - done);
             let f = self.frame(at)?;
             let dst = &mut buf[done..done + n];
@@ -202,11 +203,12 @@ impl Tables {
     /// The address of the `i`th table listed.
     pub fn get(&self, phys: &mut Phys, i: usize) -> Option<usize> {
         let mut e = [0; 8];
+        // i < count, from the table's length (at most AML_MAX).
         if self.wide {
-            phys.read_into(self.root + 36 + 8 * i, &mut e)?;
+            phys.read_into(self.root.checked_add(36 + 8 * i)?, &mut e)?;
             Some(u64_at(&e, 0) as usize)
         } else {
-            phys.read_into(self.root + 36 + 4 * i, &mut e[..4])?;
+            phys.read_into(self.root.checked_add(36 + 4 * i)?, &mut e[..4])?;
             Some(u32_at(&e, 0) as usize)
         }
     }

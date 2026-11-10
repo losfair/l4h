@@ -12,7 +12,7 @@ use l4h_host::net::call::Request;
 use l4h_host::fixed::ArrayVec;
 use l4h_host::{self as host, net};
 
-use crate::blkd::{BAR_STRIDE, VirtioRegions, bar_pages, is_legacy_virtio, keep_bits, map_bar_mask, virtio_bar_mask, virtio_regions};
+use crate::blkd::{BAR_STRIDE, VirtioRegions, bar_pages, is_legacy_virtio, is_modern_virtio, keep_bits, map_bar_mask, mappable, virtio_bar_mask, virtio_regions};
 use crate::component::{self, Component, SpawnArgs, abs_of};
 use crate::devmem::DevMem;
 use crate::iommu::Iommu;
@@ -52,7 +52,7 @@ const NETD_ID: u32 = 0x200;
 pub fn is_virtio_net(d: &pci::Device) -> bool {
     d.vendor == 0x1af4
         && (d.device == 0x1041 || d.device == 0x1000)
-        && (d.virtio_caps.iter().any(|c| c.cfg_type == 1) || is_legacy(d))
+        && (is_modern_virtio(d) || is_legacy(d))
         && d.msix.is_some()
 }
 
@@ -106,9 +106,9 @@ pub fn is_mlx5(d: &pci::Device) -> bool {
             && m.table_offset as u64 + m.table_size as u64 * 16 <= aperture)
 }
 
-/// NICs netd can drive as an uplink.
+/// NICs netd can drive as an uplink: also, the BARs `spawn` maps can be.
 pub fn is_uplink(d: &pci::Device) -> bool {
-    is_virtio_net(d) || is_gvnic(d) || is_ena(d) || is_ixgbe(d) || is_mlx5(d)
+    (is_virtio_net(d) || is_gvnic(d) || is_ena(d) || is_ixgbe(d) || is_mlx5(d)) && mappable(&mapped_device(d), used_bars(d))
 }
 
 pub struct Nic {
@@ -335,9 +335,13 @@ pub fn spawn(
             comp.map_copy(alloc, &mut arena, &abs_of(f), net::nic_dma_va(n) + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep_slot());
         }
         if is_legacy(&d) {
+            // In the 16-bit port space (is_legacy_virtio); the kernel
+            // refuses ports already given out, which the device can name.
             let (base, len) = (d.bars[0].addr as u16, d.bars[0].size as u16);
-            let io = pci::io_ports(alloc, base, len).expect("NIC I/O ports");
-            comp.give(net::NETD_SLOT_IOPORT_BASE + n as u64, io, CapRights::all());
+            match pci::io_ports(alloc, base, len) {
+                Some(io) => comp.give(net::NETD_SLOT_IOPORT_BASE + n as u64, io, CapRights::all()),
+                None => log!("l4h-root: NIC {:02x}:{:02x}.{}: no I/O ports at {:#x}", d.bus, d.dev, d.func, base),
+            }
         }
         // Interrupt.
         let irq_slot = alloc.slots.alloc();

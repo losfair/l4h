@@ -598,11 +598,13 @@ fn dom0_plan(h: &mut Host, ntfn: cap::Notification) -> Dom0Plan {
     }
     // By default, room for full receive rings on all of dom0's vNICs (one
     // per uplink switch it is given, one per internal switch, one per link).
-    let nics = h.cfg.dom0_nics + h.cfg.uplink2_nic.is_some() as usize + h.cfg.dom0_internal_switches
-        + links.iter().filter(|&&(_, uplink)| !uplink).count();
+    // The counts are the config file's: more NICs than dom0 can have
+    // stop the boot below.
+    let nics = h.cfg.dom0_nics.saturating_add(h.cfg.uplink2_nic.is_some() as usize).saturating_add(h.cfg.dom0_internal_switches)
+        .saturating_add(links.iter().filter(|&&(_, uplink)| !uplink).count()).min(host::vmmgr::DOM0_MAX_NICS);
     plan.io_pool = match h.cfg.dom0_io_pool_mb {
         0 => l4h_host::iopool::for_nics(nics, vmmgr::IO_POOL_DEFAULT).min(256 << 20),
-        mb => mb << 20,
+        mb => mb.saturating_mul(1 << 20),
     };
     if h.cfg.dom0_disk0_windows.is_some() {
         assert!(h.cfg.dom0_disks > 0 && !h.disks.is_empty(), "dom0 disk windows need disk 0");
@@ -630,7 +632,7 @@ fn dom0_plan(h: &mut Host, ntfn: cap::Notification) -> Dom0Plan {
         // Of disk 0, only the first dom0_disk0_mb MiB if the disk is larger.
         let mut sectors = 0;
         if d == 0 && h.cfg.dom0_disk0_mb > 0 {
-            let n = (h.cfg.dom0_disk0_mb as u64) << 11;
+            let n = (h.cfg.dom0_disk0_mb as u64).saturating_mul(1 << 11);
             if n < capacity { sectors = n; }
         }
         plan.disks.push(l4h_host::vmmgr::Dom0Disk { disk: d as u64, start: 0, sectors })
@@ -684,10 +686,11 @@ fn dom0_plan(h: &mut Host, ntfn: cap::Notification) -> Dom0Plan {
         add_nic(1, h.netd.nic_mac(nic).unwrap_or(0));
     }
     let first = 1 + uplink2.is_some() as usize;
-    while (h.netd.switches as usize) < first + h.cfg.dom0_internal_switches {
+    let end = first.saturating_add(h.cfg.dom0_internal_switches);
+    while (h.netd.switches as usize) < end {
         h.netd.create_switch();
     }
-    for i in first..first + h.cfg.dom0_internal_switches {
+    for i in first..end {
         add_nic(i as u32, 0);
     }
     // Each link to another partition gets a switch of its own, with a
@@ -748,6 +751,11 @@ pub fn set_timer(deadline: u64) {
     sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_TCB_SetTimer(tcb.bits(), deadline, recv::TIMER));
 }
 
+/// When the next watchdog dump is due: watchdog_secs is the config file's.
+fn watchdog_after(h: &Host) -> u64 {
+    rdtsc().saturating_add(h.info.tsc_hz.saturating_mul(h.cfg.watchdog_secs as u64))
+}
+
 /// Root's part of the watchdog dump (vmmgr dumps the guests' vCPUs).
 fn watchdog_dump(h: &Host) {
     let ms = |ticks: u64| ticks * 1000 / h.info.tsc_hz.max(1);
@@ -769,7 +777,7 @@ struct Root<'a> {
 
 fn serve(h: &mut Host, reply: ReplySlot, modules: &bootmod::Modules) -> ! {
     arm_timer(&h.info);
-    let next_watchdog = rdtsc() + h.info.tsc_hz * h.cfg.watchdog_secs as u64;
+    let next_watchdog = watchdog_after(h);
     let hyp_ep = h.info.hyp_ep;
     l4h_ipc::run(hyp_ep, reply, &mut Root { h, modules, booting: true, next_watchdog })
 }
@@ -808,7 +816,7 @@ impl l4h_ipc::Server for Root<'_> {
             h.iommu.poll();
             if h.cfg.watchdog_secs != 0 && rdtsc() >= self.next_watchdog {
                 watchdog_dump(h);
-                self.next_watchdog = rdtsc() + h.info.tsc_hz * h.cfg.watchdog_secs as u64;
+                self.next_watchdog = watchdog_after(h);
             }
             arm_timer(&h.info);
         }

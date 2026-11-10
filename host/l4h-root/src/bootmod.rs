@@ -239,8 +239,9 @@ fn loader_modules(
         let name = core::str::from_utf8(raw).unwrap_or("").split_whitespace().last().unwrap_or("");
         let pages = size.div_ceil(4096);
         // Each page keeps a root slot: the modules may take at most half
-        // of the root CNode, the rest is for guests and components.
-        if va + pages * 4096 > region.end() || alloc.slots.available() < pages + crate::CNODE_SLOTS / 2 {
+        // of the root CNode, the rest is for guests and components.  The
+        // size is the boot loader's; va <= region.end().
+        if pages > (region.end() - va) / 4096 || paddr % 4096 != 0 || alloc.slots.available() < pages + crate::CNODE_SLOTS / 2 {
             log!("l4h-root: boot module '{}' of {} MiB does not fit, ignored", name, size >> 20);
             continue;
         }

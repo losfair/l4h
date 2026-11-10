@@ -232,7 +232,8 @@ pub fn spawn(h: &mut Host, modules: &Modules, plan: &Dom0Plan) -> Vmmgr {
             at += range.len();
         }
         (cfg.kernel, cfg.kmods, cfg.dom0_initrd) = (ranges[0], ranges[1], ranges[2]);
-        cfg.dom0_mem = (h.cfg.dom0_mem_mb << 20) as u64;
+        // The config file's: vmmgr refuses what it cannot give.
+        cfg.dom0_mem = (h.cfg.dom0_mem_mb as u64).saturating_mul(1 << 20);
         cfg.dom0_vcpus = h.cfg.dom0_vcpus as u64;
         cfg.dom0_io_pool = plan.io_pool as u64;
         cfg.dom0_disks = plan.disks.len() as u64;

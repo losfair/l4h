@@ -78,8 +78,9 @@ struct Layout {
 impl Layout {
     /// A new range covering [paddr, paddr + len): (range, offset).
     fn range(&mut self, paddr: usize, len: usize) -> Option<(usize, usize)> {
+        // The firmware's or the TPM's: the end must not wrap.
         let base = paddr & !(PAGE - 1);
-        let size = (paddr + len).next_multiple_of(PAGE) - base;
+        let size = paddr.checked_add(len)?.checked_next_multiple_of(PAGE)? - base;
         if size > trust::RANGE_STRIDE {
             return None;
         }
@@ -232,7 +233,7 @@ pub fn spawn(
         let aml_size = match l.start {
             trust::START_ACPI => {
                 let touch = |phys: &mut crate::acpi::Phys, pa: usize, len: usize| {
-                    (pa & !(PAGE - 1)..pa + len).step_by(PAGE).try_for_each(|p| phys.frame(p).map(drop))
+                    (pa & !(PAGE - 1)..pa.checked_add(len)?).step_by(PAGE).try_for_each(|p| phys.frame(p).map(drop))
                 };
                 match crate::acpi::aml_tables(bootinfo, &mut phys, touch) {
                     Some(n) => n,
@@ -284,7 +285,7 @@ pub fn spawn(
                         frame = Some(f);
                     }
                     let n = (len - done).min(PAGE - at % PAGE).min(buf.len());
-                    phys.read_into(pa + done, &mut buf[..n])?;
+                    phys.read_into(pa.checked_add(done)?, &mut buf[..n])?;
                     let off = at % PAGE;
                     phys.win.with_frame(&abs_of(frame?), |dst| unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), dst.add(off), n) });
                     (done, at) = (done + n, at + n);

@@ -131,12 +131,15 @@ pub fn is_xhci(d: &pci::Device) -> bool {
 
 /// Why `d` cannot be driven, or None.
 fn unsupported(d: &pci::Device, pci: &pci::Pci) -> Option<&'static str> {
-    let bar = d.bars[0];
-    if bar.is_io || bar.size < 0x1000 || bar.size as usize > crate::blkd::BAR_STRIDE {
+    if d.bars[0].size < 0x1000 || !crate::blkd::mappable(d, 1) {
         return Some("no usable BAR 0");
     }
     if d.msix.is_none() && d.msi.is_none() {
         return Some("no MSI or MSI-X");
+    }
+    // program_irq writes entry 0, in one page.
+    if d.msix.is_some_and(|m| !crate::blkd::mappable(d, 1 << m.table_bar) || m.table_offset as usize % PAGE > PAGE - 16) {
+        return Some("unusable MSI-X table");
     }
     // Renesas uPD720201/2 without a firmware ROM: their driver loads the
     // firmware through configuration space (Linux's renesas_xhci).
