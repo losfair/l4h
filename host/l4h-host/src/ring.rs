@@ -237,6 +237,13 @@ impl<'a, const W: usize> View<'a, W> {
         (slot.state.load(SeqCst) == want).then_some(ticks)
     }
 
+    /// Whether the record of sequence `seq`, which a writer has claimed
+    /// (below head), is not committed yet.
+    pub fn pending(&self, seq: u64) -> bool {
+        let Some(want) = seq.checked_add(1).and_then(|n| n.checked_mul(2)) else { return false };
+        self.slot(seq).state.load(SeqCst) < want
+    }
+
     /// Copy out the record of sequence `seq`, without consuming it.
     pub fn get(&self, seq: u64) -> Entry<W> {
         let Some(want) = seq.checked_add(1).and_then(|n| n.checked_mul(2)) else { return Entry::Gone };

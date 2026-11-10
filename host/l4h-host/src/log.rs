@@ -295,7 +295,7 @@ impl Ring {
 
     pub fn write(&self, w: Writer, ticks: u64, args: fmt::Arguments<'_>) {
         if let Some(lane) = self.lane(w) {
-            write_to(lane, ticks, args);
+            write_to(lane, || ticks, args);
         }
     }
 
@@ -306,16 +306,30 @@ impl Ring {
     /// arrive. Cursor 0 starts at boot; lost counts overwritten, dropped and
     /// not-yet-committed records.
     pub fn read(&self, cursor: u64, end: u64, out: &mut [u8]) -> Option<Read> {
-        self.read_at(crate::ticks::now(), cursor, end, out)
+        // Before any lane is looked at (`write_to` reads the time after it
+        // claims).
+        let now = crate::ticks::now_ordered();
+        self.read_at(now, cursor, end, out)
+    }
+
+    /// Whether a writer has claimed a slot of some lane and not committed
+    /// it yet.
+    fn in_flight(&self) -> bool {
+        Writer::all().filter_map(|w| self.lane(w)).any(|lane| {
+            let head = lane.head();
+            (lane.oldest_at(head)..head).any(|seq| lane.pending(seq))
+        })
     }
 
     fn read_at(&self, now: u64, cursor: u64, end: u64, out: &mut [u8]) -> Option<Read> {
         let hz = self.clock.hz.load(SeqCst).max(1);
         let start = self.clock.start_ticks.load(SeqCst);
-        // A record carries the time before its writer claimed its slot: a
-        // snapshot ends a moment ago, so that what is still being
-        // committed is in the next one rather than missed.
-        let snapshot = now.saturating_sub(hz / 10);
+        // A writer reads the time after it claims its slot (`write_to`),
+        // and `now` was read before any lane was: a record not yet claimed
+        // is later than `now`, in the next snapshot.  One claimed and not
+        // committed may be older: then a snapshot ends a moment ago, so
+        // that it is in the next one rather than missed.
+        let snapshot = if self.in_flight() { now.saturating_sub(hz / 10) } else { now };
         let end = if end == 0 { snapshot } else { end.min(snapshot) };
         if cursor > end {
             return None;
@@ -572,12 +586,15 @@ impl Write for Text {
 
 /// A record into `lane`: its text only. Its time and writer are put
 /// around it by the reader.
-fn write_to(lane: View<'_, WORDS>, ticks: u64, args: fmt::Arguments<'_>) {
+/// Write a record of `args`, at the time `ticks` gives once its slot is
+/// claimed: a reader that finds no slot claimed and uncommitted then knows
+/// that what is not written yet is later than its own time (`Ring::read`).
+fn write_to(lane: View<'_, WORDS>, ticks: impl FnOnce() -> u64, args: fmt::Arguments<'_>) {
     let mut text = Text::new();
     let _ = text.write_fmt(args);
     text.finish();
     let seq = lane.claim(1);
-    lane.commit(seq, ticks, 0, text.len, &text.buf);
+    lane.commit(seq, ticks(), 0, text.len, &text.buf);
 }
 
 /// This process's lane: its address and slots (0: none).
@@ -602,7 +619,7 @@ pub fn record(args: fmt::Arguments<'_>) {
     let (va, n) = (LANE_VA.load(SeqCst), LANE_RECORDS.load(SeqCst));
     if va != 0 && n != 0 {
         // init and init_lane only take a lane that lives for the process's lifetime.
-        write_to(unsafe { View::at(va, n) }, crate::ticks::now(), args);
+        write_to(unsafe { View::at(va, n) }, crate::ticks::now_ordered, args);
     }
 }
 
@@ -627,7 +644,8 @@ mod tests {
     use std::{string::String, sync::Arc, thread, vec::Vec};
 
     const HZ: u64 = 1_000_000;
-    /// Reads at this time see everything written before `NOW - HZ / 10`.
+    /// Reads are at this time: they see everything written before it, or
+    /// before `NOW - HZ / 10` while a slot is claimed and not committed.
     const NOW: u64 = 1 << 40;
 
     fn ring() -> &'static Ring {
@@ -655,11 +673,32 @@ mod tests {
         assert_eq!((r.next, r.lost), (r.end, 0));
         assert_eq!(read(ring, 0, 0).1, text);
         assert_eq!(read(ring, 1_250_101, 0).1, "");
-        assert!(ring.read_at(NOW, NOW, 0, &mut [0; 1984]).is_none());
+        assert!(ring.read_at(NOW, NOW + 1, 0, &mut [0; 1984]).is_none());
         ring.write(Writer::Netd, 1_250_200, format_args!("next"));
         // A snapshot that ended before it does not take it.
         assert_eq!(read(ring, 1_250_101, 1_250_150).1, "");
         assert_eq!(read(ring, 1_250_101, 0).1, "[     1.250100] [0x200] next\n");
+    }
+
+    #[test]
+    fn a_read_sees_what_was_written_just_before_it() {
+        // vmmgr logs a guest's fault and stops it; dom0 reads at once.
+        let ring = ring();
+        ring.write(Writer::Vmmgr, NOW - 1, format_args!("guest 1 vCPU 0 kernel fault"));
+        assert!(read(ring, 0, 0).1.contains("kernel fault"));
+        // A slot claimed and not committed may hold an older record: the
+        // snapshot then ends a moment ago, and takes it once it is in.
+        let lane = ring.lane(Writer::Netd).unwrap();
+        let seq = lane.claim(1);
+        ring.write(Writer::Root, NOW - 2, format_args!("recent"));
+        let (r, text) = read(ring, 0, 0);
+        assert!(!text.contains("recent") && r.end == NOW - HZ / 10, "{text}");
+        let mut text = Text::new();
+        let _ = text.write_fmt(format_args!("late"));
+        text.finish();
+        lane.commit(seq, NOW - 3, 0, text.len, &text.buf);
+        let text = read(ring, r.end, 0).1;
+        assert!(text.contains("late") && text.contains("recent"), "{text}");
     }
 
     #[test]

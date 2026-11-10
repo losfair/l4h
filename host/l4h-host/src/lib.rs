@@ -315,6 +315,24 @@ pub mod ticks {
         v
     }
 
+    /// `now`, read after every earlier load and store is done and before
+    /// any later one starts: a time that orders with memory accesses, as
+    /// the log's writers and readers need (log::Ring::read).
+    #[cfg(target_arch = "x86_64")]
+    pub fn now_ordered() -> u64 {
+        let lo: u32;
+        let hi: u32;
+        unsafe { core::arch::asm!("mfence", "lfence", "rdtsc", "lfence", out("eax") lo, out("edx") hi, options(nostack)) };
+        ((hi as u64) << 32) | lo as u64
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn now_ordered() -> u64 {
+        let v: u64;
+        unsafe { core::arch::asm!("dsb sy", "isb", "mrs {}, cntvct_el0", "isb", out(reg) v, options(nostack)) };
+        v
+    }
+
     /// Counter frequency, where the architecture defines a register for it.
     #[cfg(target_arch = "aarch64")]
     pub fn hz() -> u64 {
