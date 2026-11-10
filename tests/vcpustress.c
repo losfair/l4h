@@ -448,6 +448,14 @@ static void start_thread(seL4_CPtr tcb, seL4_CPtr sc, seL4_CPtr ipcframe, unsign
     CK(seL4_TCB_WriteRegisters(tcb, 1, 0, sizeof(regs) / sizeof(seL4_Word), &regs));
 }
 
+static unsigned long rdtsc(void)
+{
+    unsigned int lo, hi;
+
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return (unsigned long)hi << 32 | lo;
+}
+
 static unsigned long rnd(unsigned long *s)
 {
     *s ^= *s << 13;
@@ -570,14 +578,10 @@ static void attack(unsigned long *seed, int who, unsigned long mask)
     case 21:
         CK(seL4_TCB_SetIPCBuffer(gp->tcb, gp->ipcbuf, gp->ipcframe));
         break;
-    case 22: {
-        unsigned int lo, hi;
-
+    case 22:
         /* A deadline timer signals the bound notification (patch 0003). */
-        __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
-        CK(seL4_TCB_SetTimer(gp->tcb, ((unsigned long)hi << 32 | lo) + rnd(seed) % 2000000, 1));
+        CK(seL4_TCB_SetTimer(gp->tcb, rdtsc() + rnd(seed) % 2000000, 1));
         break;
-    }
     case 23:
         /* The thread's other VCPU: its VMEnter ends, and goes on with it. */
         gp->cur ^= 1;
@@ -591,12 +595,32 @@ static void attack(unsigned long *seed, int who, unsigned long mask)
 
 static unsigned long attacker_ipcbuf;
 static volatile int attack_stop, attack_stopped;
+/* The second attacker stands back while the root thread checks that the
+ * guests still run (vcpustress_main()). */
+static volatile int attack_hold, attack_held;
+
+static void relax(void)
+{
+#ifdef ONECORE
+    seL4_Yield();
+#else
+    __asm__ volatile("pause");
+#endif
+}
 
 static void attacker(unsigned long seed)
 {
     __sel4_ipc_buffer = (seL4_IPCBuffer *)attacker_ipcbuf;
-    while (!attack_stop)
+    while (!attack_stop) {
+        if (attack_hold) {
+            attack_held = 1;
+            while (attack_hold && !attack_stop)
+                relax();
+            attack_held = 0;
+            continue;
+        }
         attack(&seed, 1, MASK);
+    }
     attack_stopped = 1;
     for (;;)
         seL4_Yield();
@@ -730,14 +754,22 @@ void vcpustress_main(seL4_BootInfo *bootinfo)
 
         for (int i = 0; i < 500; i++)
             attack(&seed, 0, MASK);
-        /* Both guests must still make progress. */
-        for (int spin = 0; spin < 4000000 && (*g[0].counter == before[0] || *g[1].counter == before[1]); spin++) {
-#ifdef ONECORE
-            seL4_Yield();
-#else
-            __asm__ volatile("pause");
-#endif
-        }
+        /* Both guests must still make progress, once they are left alone.
+         * Not under attack: every invocation takes its VCPU out of guest
+         * mode, and one that comes before the next VM entry is done ends
+         * that entry before the guest runs an instruction.  Where a VM
+         * entry is slow (seL4 under a nested hypervisor), the second
+         * attacker alone kept both guests from ever running, and a guest
+         * that was only starved read as one the kernel had left stuck. */
+        attack_hold = 1;
+        while (!attack_held)
+            relax();
+        /* For a few seconds of TSC, not a number of spins, which is no
+         * time at all where a PAUSE is cheap and a VM entry is not. */
+        for (unsigned long end = rdtsc() + (1ul << 33);
+             rdtsc() < end && (*g[0].counter == before[0] || *g[1].counter == before[1]);)
+            relax();
+        attack_hold = 0;
         if (*g[0].counter == before[0] || *g[1].counter == before[1]) {
             lock_print();
             say_("a guest made no progress in round", round);
