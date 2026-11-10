@@ -208,11 +208,15 @@ impl VirtioScsi {
             p.out16(legacy::CONFIG_VECTOR, NO_VECTOR);
             p.out16(legacy::QUEUE_SELECT, REQUEST_QUEUE);
             let num = p.in16(legacy::QUEUE_SIZE);
-            // A legacy queue has the device's size.
+            // A legacy queue has the device's size, and a 32-bit page number.
             let (va, pa) = dma.alloc(legacy_ring_size(num), 4096);
+            if num == 0 || pa >> 12 > u32::MAX as u64 {
+                p.out8(legacy::STATUS, STATUS_FAILED);
+                panic!("blkd {:#x}: virtio-scsi request queue unusable (size {}, at {:#x})", id, num, pa);
+            }
             p.out32(legacy::QUEUE_PFN, (pa >> 12) as u32);
             p.out16(legacy::QUEUE_VECTOR, 0);
-            if num == 0 || p.in16(legacy::QUEUE_VECTOR) != 0 {
+            if p.in16(legacy::QUEUE_VECTOR) != 0 {
                 p.out8(legacy::STATUS, STATUS_FAILED);
                 panic!("blkd {:#x}: virtio-scsi request queue unusable (size {})", id, num);
             }
@@ -225,7 +229,9 @@ impl VirtioScsi {
                 notify_len: cfg.notify.len as usize,
                 device: Mmio(cfg.device.va as usize),
             };
-            dev.reset();
+            if !dev.reset() {
+                panic!("blkd {:#x}: device did not reset", id);
+            }
             let offered = dev.features();
             if offered & F_VERSION_1 == 0 {
                 dev.fail();
@@ -254,6 +260,8 @@ impl VirtioScsi {
                     let num = p.in16(legacy::QUEUE_SIZE);
                     if num == 0 { break; }
                     let (va, pa) = dma.alloc(legacy_ring_size(num), 4096);
+                    // As the first queue: a page number of 32 bits.
+                    if pa >> 12 > u32::MAX as u64 { break; }
                     p.out32(legacy::QUEUE_PFN, (pa >> 12) as u32);
                     p.out16(legacy::QUEUE_VECTOR, 0);
                     if p.in16(legacy::QUEUE_VECTOR) != 0 {
@@ -562,6 +570,8 @@ impl Driver for VirtioScsi {
             read_only: u.read_only,
             flush: u.flush,
             address: blk::blkd_scsi_addr(u.target, u.number),
+            // Commands are cut at the device's seg_max (`start`).
+            seg_max: MAX_PIECES,
         }
     }
 

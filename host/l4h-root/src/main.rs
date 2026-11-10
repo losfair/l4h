@@ -84,7 +84,7 @@ static GUESTS: StaticCell<[Option<RootGuest>; MAX_GUESTS]> = StaticCell::new([co
 static OPS: StaticCell<vmmgr::Ops> = StaticCell::new([const { None }; l4h_host::vmmgr::MAX_PENDING]);
 static ZOMBIES: StaticCell<vmmgr::Zombies> = StaticCell::new([const { None }; MAX_GUESTS]);
 /// Memory and root CNode slots kept back from guest requests.
-const RESERVE_BYTES: usize = 32 << 20;
+const RESERVE_BYTES: usize = l4h_host::memd::HOST_RESERVE;
 const RESERVE_SLOTS: usize = 32768;
 /// Longest free slot range kept for disk DMA buffers.
 const RESERVE_RANGE: usize = 4096;
@@ -326,6 +326,19 @@ impl Host {
     /// NICs' MACs), or never will.
     fn drivers_ready(&self) -> bool {
         self.ctrls.iter().all(|c| c.ready()) && self.netd.ready()
+    }
+
+    /// The drivers have had DRIVERS_READY_SECS: one that has not published
+    /// is failed as one that faulted, so that boot goes on without it.
+    fn fail_unready_drivers(&mut self) {
+        for c in 0..self.ctrls.len() {
+            blkd::unpublished(self, c);
+        }
+        if !self.netd.ready() {
+            log!("l4h-root: netd did not report its NICs");
+            self.netd.fail(&self.pci);
+            netd::Netd::poll(self);
+        }
     }
 
     /// Number the host disks, once their blkds are ready: one per unit of
@@ -640,8 +653,13 @@ fn dom0_plan(h: &mut Host, ntfn: cap::Notification) -> Dom0Plan {
         };
         if d == 0 {
             if let Some(text) = h.cfg.dom0_disk0_windows {
-                let (windows, len) = host::blk::DiskWindow::parse_list::<{ host::vmmgr::DOM0_MAX_DISKS }>(text, capacity)
+                // A list that is no list of windows is the config file's
+                // error; a disk too small for it is the disk's word.
+                let (windows, len, fits) = blkd::dom0_windows::<{ host::vmmgr::DOM0_MAX_DISKS }>(text, capacity)
                     .expect("invalid dom0_disk0_windows");
+                if !fits {
+                    log!("l4h-root: dom0_disk0_windows do not fit disk 0 ({} sectors): windows beyond it are placeholders", capacity);
+                }
                 for w in &windows[..len] {
                     plan.disks.push(host::vmmgr::Dom0Disk { disk: 0, start: w.start, sectors: w.sectors })
                         .ok().expect("too many dom0 disk windows");
@@ -738,7 +756,7 @@ fn dom0_plan(h: &mut Host, ntfn: cap::Notification) -> Dom0Plan {
     for d in &plan.disks {
         let index = d.disk as usize;
         let disk = &h.disks[index];
-        let window = blkd::dom0_reservation(d.start, d.sectors, disk.capacity).expect("invalid dom0 disk window");
+        let window = blkd::dom0_plan_reservation(d.start, d.sectors, disk.capacity).expect("invalid dom0 disk window");
         h.ctrls[disk.ctrl].reserve_dom0(index, disk.unit, window, disk.read_only);
     }
     plan
@@ -760,6 +778,15 @@ fn rdtsc() -> u64 {
 
 /// The root task's timer period: dashboard, IOMMU faults and watchdog.
 const TIMER_MS: u64 = 100;
+
+/// How long boot waits for the drivers to publish their disks and MACs
+/// (finish_boot), from when the serve loop starts, right after they were
+/// started.  Root never waits on a driver without a bound: one that has
+/// not published by then is failed (Host::fail_unready_drivers), and the
+/// host boots without what it drove.  Longer than a healthy controller
+/// takes to come up: an NVMe drive may take many seconds to become ready,
+/// and NIC firmware commands a few.
+const DRIVERS_READY_SECS: u64 = 30;
 
 pub fn arm_timer(info: &HostInfo) {
     set_timer(rdtsc() + info.tsc_hz * TIMER_MS / 1000);
@@ -792,6 +819,8 @@ struct Root<'a> {
     h: &'a mut Host,
     modules: &'a bootmod::Modules,
     booting: bool,
+    /// When boot stops waiting for the drivers (DRIVERS_READY_SECS).
+    drivers_deadline: u64,
     next_watchdog: u64,
 }
 
@@ -799,7 +828,8 @@ fn serve(h: &mut Host, reply: ReplySlot, modules: &bootmod::Modules) -> ! {
     arm_timer(&h.info);
     let next_watchdog = watchdog_after(h);
     let hyp_ep = h.info.hyp_ep;
-    l4h_ipc::run(hyp_ep, reply, &mut Root { h, modules, booting: true, next_watchdog })
+    let drivers_deadline = rdtsc().saturating_add(h.info.tsc_hz.saturating_mul(DRIVERS_READY_SECS));
+    l4h_ipc::run(hyp_ep, reply, &mut Root { h, modules, booting: true, drivers_deadline, next_watchdog })
 }
 
 impl l4h_ipc::Server for Root<'_> {
@@ -816,6 +846,9 @@ impl l4h_ipc::Server for Root<'_> {
         // Drivers' answers, and what a quarantine left (blkd::poll).  Not
         // on a call: it would overwrite the caller's message registers.
         h.poll_drivers();
+        if self.booting && !h.drivers_ready() && rdtsc() > self.drivers_deadline {
+            h.fail_unready_drivers();
+        }
         if self.booting && h.drivers_ready() {
             self.booting = false;
             finish_boot(h, self.modules);

@@ -38,6 +38,31 @@ pub const BLKD_ID_BASE: u32 = 0x100;
 pub const NETD_ID: u32 = 0x200;
 pub const MEMD_ID: u32 = 0x400;
 pub const LOGD_ID: u32 = 0x600;
+/// What `l4hctl logs` prints for guest g's VMM, `VMM_ID_BASE + g`: a VMM's
+/// component id is its guest's, and guest 0's would be root's 0.
+pub const VMM_ID_BASE: u32 = 0x1000;
+
+// No two writers print the same id: each kind's ids end before the next
+// kind's start, and root's 0 is below them all.
+const _: () = {
+    let ranges = [
+        (BLKD_ID_BASE, MAX_BLKDS),
+        (NETD_ID, 1),
+        (crate::root::TRUSTD_ID, 1),
+        (crate::root::FLAGS_ID, 1),
+        (MEMD_ID, 1),
+        (crate::vmmgr::VMMGR_ID, 1),
+        (LOGD_ID, 1),
+        (crate::usb::USBD_ID_BASE, MAX_USBDS),
+        (VMM_ID_BASE, MAX_VMMS),
+    ];
+    let (mut i, mut end) = (0, 1);
+    while i < ranges.len() {
+        assert!(ranges[i].0 >= end);
+        end = ranges[i].0 + ranges[i].1 as u32;
+        i += 1;
+    }
+};
 
 /// Who writes a lane. A record's writer is the lane's.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -118,7 +143,8 @@ impl Writer {
         (0..Self::COUNT).filter_map(Self::from_index)
     }
 
-    /// The component id `l4hctl logs` prints (root: 0).
+    /// The id `l4hctl logs` prints: the component's (root: 0), but a VMM's,
+    /// whose component id is its guest's. No two writers have the same.
     pub fn id(self) -> u32 {
         match self {
             Writer::Root => 0,
@@ -130,7 +156,7 @@ impl Writer {
             Writer::Netd => NETD_ID,
             Writer::Blkd(c) => BLKD_ID_BASE + c,
             Writer::Usbd(i) => crate::usb::USBD_ID_BASE + i,
-            Writer::Vmm(g) => g,
+            Writer::Vmm(g) => VMM_ID_BASE + g,
             Writer::Dom0 => u32::MAX,
         }
     }
@@ -338,7 +364,10 @@ impl Ring {
         // The records of one time are never split between reads: where
         // they start in `out`, and what was lost before them.
         let mut group: Option<(u64, usize, u64)> = None;
-        while let Some(key) = self.next_key(cursor, end, last) {
+        // The records each lane has given this read, which bound it
+        // (`next_key`).
+        let mut taken = [0; Writer::COUNT];
+        while let Some(key) = self.next_key(cursor, end, last, &mut taken) {
             last = Some(key);
             let (ticks, w, seq) = key;
             let Some(lane) = Writer::from_index(w).and_then(|w| self.lane(w)) else { continue };
@@ -363,7 +392,7 @@ impl Ring {
                 let Some((_, at, before)) = group.filter(|&(_, at, _)| at != 0 || len == 0) else {
                     // A time whose records do not fit at once: the rest of
                     // them is lost, rather than the reader stuck.
-                    lost = lost.saturating_add(1 + self.count_at(ticks, cursor, end, key));
+                    lost = lost.saturating_add(1 + self.count_at(ticks, cursor, end, key, &mut taken));
                     return Some(Read { next: ticks.saturating_add(1).min(end), len, lost, end });
                 };
                 return Some(Read { next: ticks, len: at, lost: before, end });
@@ -375,11 +404,23 @@ impl Ring {
     }
 
     /// The first record after `last` of those of [cursor, end), in the
-    /// order of (time, lane, sequence), looking at each lane's slots once.
-    fn next_key(&self, cursor: u64, end: u64, last: Option<(u64, usize, u64)>) -> Option<(u64, usize, u64)> {
+    /// order of (time, lane, sequence), looking at each lane's slots once,
+    /// and counted in `taken` for its lane.
+    ///
+    /// A lane gives one read no more records than it has slots: what an
+    /// honest writer's holds of a time before the read began. A writer that
+    /// changes its head, states and times as the reader goes can make
+    /// records without end, each after the last and none readable; past
+    /// its slots its lane is left out of the rest of the read, which so
+    /// takes no more records than all lanes have slots, and goes on to the
+    /// other lanes' and to its end.
+    fn next_key(&self, cursor: u64, end: u64, last: Option<(u64, usize, u64)>, taken: &mut [u16; Writer::COUNT]) -> Option<(u64, usize, u64)> {
         let mut best = None;
         for w in Writer::all() {
             let Some(lane) = self.lane(w) else { continue };
+            if taken[w.index()] as usize >= lane.capacity() {
+                continue;
+            }
             // One read of head bounds the scan to the lane's capacity.
             let head = lane.head();
             for seq in lane.oldest_at(head)..head {
@@ -390,13 +431,16 @@ impl Ring {
                 }
             }
         }
+        if let Some((_, w, _)) = best {
+            taken[w] += 1;
+        }
         best
     }
 
     /// Records of time `ticks` after `key`.
-    fn count_at(&self, ticks: u64, cursor: u64, end: u64, mut key: (u64, usize, u64)) -> u64 {
+    fn count_at(&self, ticks: u64, cursor: u64, end: u64, mut key: (u64, usize, u64), taken: &mut [u16; Writer::COUNT]) -> u64 {
         let mut n = 0;
-        while let Some(next) = self.next_key(cursor, end, Some(key)).filter(|k| k.0 == ticks) {
+        while let Some(next) = self.next_key(cursor, end, Some(key), taken).filter(|k| k.0 == ticks) {
             n += 1;
             key = next;
         }
@@ -410,6 +454,11 @@ impl Ring {
 /// overwritten. Each gap is counted with the record after it, which a
 /// sequence of reads returns once. A lane that a follower's read finds
 /// overwritten since its last record counts as at least one.
+///
+/// What was overwritten is the lane's head less its slots, which its
+/// writer can make anything: a lane counts for `LOST_MAX` at most, so that
+/// no writer's number hides, in a sum that no longer grows, what the
+/// others lost.
 fn gap(lane: View<'_, WORDS>, seq: u64, cursor: u64) -> u64 {
     // Head may have moved since `seq` was found, anywhere: the scan stays
     // within a lap of `seq`.
@@ -424,10 +473,15 @@ fn gap(lane: View<'_, WORDS>, seq: u64, cursor: u64) -> u64 {
     }
     match (cursor, oldest) {
         (_, 0) => n,
-        (0, _) => n.saturating_add(oldest),
+        (0, _) => n.saturating_add(oldest.min(LOST_MAX)),
         _ => n + 1,
     }
 }
+
+/// The most one record's gap adds to a read's lost count (`gap`): more
+/// records than a writer overwrites in a host's lifetime, and so few that
+/// all a read returns cannot bring the count near its end.
+const LOST_MAX: u64 = 1 << 32;
 
 pub struct Read {
     pub next: u64,
@@ -466,14 +520,17 @@ impl Write for Line {
 /// console), and a control character or escape sequence could move the
 /// cursor over another line, or make a line look like another writer's.
 /// Tabs and line ends become spaces; other control characters (C0, DEL,
-/// C1) and bytes that are not UTF-8 become `?`. The one place the host's
-/// readers that print (`serial::Merge`, `Ring::read`) clean text.
+/// C1), the characters that end a line or change the direction text is
+/// shown in (`reorders`), and bytes that are not UTF-8 become `?`. What is
+/// left is text for a terminal that reads UTF-8: one that reads single
+/// bytes takes some bytes of a character for controls. The one place the
+/// host's readers that print (`serial::Merge`, `Ring::read`) clean text.
 pub fn printable(text: &[u8], mut push: impl FnMut(&[u8])) {
     for chunk in text.utf8_chunks() {
         let valid = chunk.valid();
         let mut from = 0;
         for (i, c) in valid.char_indices() {
-            if c.is_control() {
+            if c.is_control() || reorders(c) {
                 push(&valid.as_bytes()[from..i]);
                 push(if matches!(c, '\t' | '\r' | '\n') { b" " } else { b"?" });
                 from = i + c.len_utf8();
@@ -484,6 +541,14 @@ pub fn printable(text: &[u8], mut push: impl FnMut(&[u8])) {
             push(b"?");
         }
     }
+}
+
+/// Whether `c`, which is no control character, still moves text on a
+/// terminal that reads UTF-8: the line and paragraph separators, and the
+/// marks, embeddings, overrides and isolates of bidirectional text, which
+/// can show a line's text before its prefix or in another order.
+fn reorders(c: char) -> bool {
+    matches!(c, '\u{2028}' | '\u{2029}' | '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }
 
 /// Limits what a less trusted party (a guest, or its VMM) can make a
@@ -609,8 +674,20 @@ pub fn init(area: &'static Ring, _source: u32) {
 }
 
 /// A component's: write to the lane of `records` records its parent
-/// mapped at `VA` (none if 0, `info_records`).
+/// mapped at `VA` (none if 0, `info_records`). Call before starting
+/// another thread.
+///
+/// The lane may have been another writer's (a guest id's VMM lane is the
+/// next VMM's of that id), which no longer runs: one it left as no honest
+/// writer does, or with a record of a time still to come, is reset first
+/// (`ring::View::adopt`), so that this writer's records go in and none of
+/// the other's comes up later as this one's. Readers count what a reset
+/// took as lost.
 pub fn init_lane(records: usize) {
+    if records != 0 {
+        // The parent mapped a lane of `records` records there for good.
+        unsafe { View::<WORDS>::at(VA, records) }.adopt(Some(crate::ticks::now_ordered()));
+    }
     LANE_RECORDS.store(records, SeqCst);
     LANE_VA.store(if records == 0 { 0 } else { VA }, SeqCst);
 }
@@ -710,7 +787,7 @@ mod tests {
         ring.write(Writer::Usbd(1), 400, format_args!("d"));
         let text = read(ring, 0, 0).1;
         let lines: Vec<_> = text.lines().map(|l| l.split_once("] ").unwrap().1).collect();
-        assert_eq!(lines, ["[0x3] a", "[0x102] b", "[0x0] c", "[0x701] d"]);
+        assert_eq!(lines, ["[0x1003] a", "[0x102] b", "[0x0] c", "[0x701] d"]);
     }
 
     #[test]
@@ -720,7 +797,7 @@ mod tests {
         // and an escape sequence that would move the cursor.
         ring.write(Writer::Vmm(5), 200, format_args!("x\n[     0.000001] [0x0] l4h-root: \x1b[1Aok\r"));
         let text = read(ring, 0, 0).1;
-        assert_eq!(text, "[     0.000100] [0x5] x [     0.000001] [0x0] l4h-root: ?[1Aok \n");
+        assert_eq!(text, "[     0.000100] [0x1005] x [     0.000001] [0x0] l4h-root: ?[1Aok \n");
     }
 
     #[test]
@@ -729,6 +806,20 @@ mod tests {
         printable("é\tna\u{9b}me\u{7f}".as_bytes(), |b| s.extend_from_slice(b));
         printable(b"\xff\xfe!", |b| s.extend_from_slice(b));
         assert_eq!(String::from_utf8(s).unwrap(), "é na?me???!");
+    }
+
+    #[test]
+    fn printable_text_cannot_end_a_line_or_reorder_it() {
+        // A right-to-left override would show the text before the prefix,
+        // and a line separator start a line without one.
+        let text = "ab\u{202e}cd\u{2028}e\u{2029}f\u{200f}g\u{200e}h\u{061c}i\u{202a}j\u{2066}k\u{2069}l\u{85}m\u{9b}2J";
+        let mut s = Vec::new();
+        printable(text.as_bytes(), |b| s.extend_from_slice(b));
+        assert_eq!(String::from_utf8(s).unwrap(), "ab?cd?e?f?g?h?i?j?k?l?m?2J");
+        // Letters next to them in the tables stay.
+        let mut s = Vec::new();
+        printable("א\u{200d}ب\u{2010}".as_bytes(), |b| s.extend_from_slice(b));
+        assert_eq!(String::from_utf8(s).unwrap(), "א\u{200d}ب\u{2010}");
     }
 
     #[test]
@@ -818,6 +909,125 @@ mod tests {
         fn memd_head(&self) -> &AtomicU64 {
             &self.service[1].0.head
         }
+    }
+
+    #[test]
+    fn a_writer_that_keeps_making_records_cannot_stop_the_reader() {
+        let ring = ring();
+        ring.write(Writer::Root, 2000, format_args!("root"));
+        // A VMM that commits, as the reader goes, a record after every one
+        // the reader has looked at, each of the time a read from boot
+        // starts at and none with its checksum: the next of the read each
+        // time, and never one it can return. A few a scan of the lanes, so
+        // that the reader finds each committed.
+        let stop: &'static AtomicU64 = std::boxed::Box::leak(std::boxed::Box::new(AtomicU64::new(0)));
+        let attacker = thread::spawn(move || {
+            let lane = &ring.vmm[5].0;
+            let mut seq = 0u64;
+            while stop.load(SeqCst) == 0 {
+                lane.slots[(seq % SMALL as u64) as usize].state.store(2 * seq + 2, SeqCst);
+                seq += 1;
+                lane.head.store(seq, SeqCst);
+                let wait = std::time::Instant::now();
+                while wait.elapsed().as_micros() < 2 {
+                    core::hint::spin_loop();
+                }
+            }
+        });
+        let (done, finished) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let start = std::time::Instant::now();
+            let mut reads = 0;
+            while start.elapsed().as_millis() < 500 || reads < 20 {
+                let (r, text) = read(ring, 0, 0);
+                // The read ends, with the others' records, past the lane.
+                assert!(text.contains("] [0x0] root\n"), "{text}");
+                assert_eq!(r.next, r.end);
+                assert!(r.lost <= SMALL as u64, "{}", r.lost);
+                reads += 1;
+            }
+            let _ = done.send(());
+        });
+        let result = finished.recv_timeout(std::time::Duration::from_secs(20));
+        stop.store(1, SeqCst);
+        attacker.join().unwrap();
+        result.expect("the reader stopped");
+    }
+
+    #[test]
+    fn a_read_takes_no_more_records_of_a_lane_than_it_has_slots() {
+        let ring = ring();
+        ring.write(Writer::Root, 2000, format_args!("root"));
+        // Every slot of a lane committed without its checksum.
+        let lane = &ring.blkd[3].0;
+        for seq in 0..SMALL as u64 {
+            lane.slots[seq as usize].state.store(2 * seq + 2, SeqCst);
+        }
+        lane.head.store(SMALL as u64, SeqCst);
+        let (r, text) = read(ring, 0, 0);
+        assert!(text.ends_with("] [0x0] root\n"), "{text}");
+        assert_eq!((r.lost, r.next), (SMALL as u64, r.end));
+    }
+
+    #[test]
+    fn a_wild_head_cannot_hide_what_other_lanes_lost() {
+        let ring = ring();
+        for i in 0..ROOT + 17 {
+            ring.write(Writer::Root, 1000 + i as u64, format_args!("record {i}"));
+        }
+        // Two lanes whose heads say that nearly every sequence there is
+        // was overwritten: their sum would be the largest count.
+        for w in [Writer::Memd, Writer::Netd] {
+            ring.lane(w).unwrap().claim((1 << 63) - 2);
+            ring.write(w, 500, format_args!("wild"));
+        }
+        let (mut cursor, mut end, mut lost) = (0, 0, 0u64);
+        loop {
+            let (r, _) = read(ring, cursor, end);
+            lost = lost.checked_add(r.lost).unwrap();
+            (cursor, end) = (r.next, r.end);
+            if cursor == end { break; }
+        }
+        // Each counts for the most a lane can, and the slots before its
+        // record; root's 17 are still told.
+        assert_eq!(lost, 2 * (LOST_MAX + SERVICE as u64 - 1) + 17);
+    }
+
+    #[test]
+    fn a_lane_is_reset_for_its_next_writer_if_it_was_left_wrong() {
+        let ring = ring();
+        let lane = ring.lane(Writer::Vmm(2)).unwrap();
+        // The VMM of a guest left a record for a time to come, to pass for
+        // the next VMM's of that guest id.
+        ring.write(Writer::Vmm(2), 1000, format_args!("old"));
+        ring.write(Writer::Vmm(2), NOW + 5000, format_args!("due later"));
+        assert!(lane.adopt(Some(NOW - 10)));
+        ring.write(Writer::Vmm(2), NOW - 5, format_args!("new"));
+        let (r, text) = read(ring, 0, 0);
+        assert_eq!(text.lines().count(), 1);
+        assert!(text.ends_with("] [0x1002] new\n"), "{text}");
+        // What the reset took is lost, not waited for.
+        assert_eq!((r.lost, r.end), (SMALL as u64 - 1, NOW));
+        let mut out = [0; 1984];
+        let later = ring.read_at(NOW + 10_000, r.end, 0, &mut out).unwrap();
+        assert_eq!((later.len, later.lost), (0, 0));
+
+        // A lane whose head and slots would drop every record written.
+        let lane = &ring.vmm[3].0;
+        lane.head.store(u64::MAX - 1, SeqCst);
+        for slot in &lane.slots {
+            slot.state.store(u64::MAX, SeqCst);
+        }
+        ring.write(Writer::Vmm(3), NOW - 4, format_args!("dropped"));
+        assert!(!read(ring, 0, 0).1.contains("dropped"));
+        assert!(ring.lane(Writer::Vmm(3)).unwrap().adopt(Some(NOW - 3)));
+        ring.write(Writer::Vmm(3), NOW - 2, format_args!("kept"));
+        assert!(read(ring, 0, 0).1.ends_with("] [0x1003] kept\n"));
+
+        // One an honest VMM left stays as it is, with its records.
+        ring.write(Writer::Vmm(4), 1000, format_args!("panic text"));
+        assert!(!ring.lane(Writer::Vmm(4)).unwrap().adopt(Some(NOW)));
+        assert!(read(ring, 0, 0).1.contains("] [0x1004] panic text\n"));
     }
 
     #[test]
@@ -950,9 +1160,18 @@ mod tests {
                     Writer::Usbd(_) => crate::KIND_USBD,
                     _ => crate::KIND_VMM,
                 };
-                assert_eq!(Writer::of(kind, w.id()), Some(w));
+                // A VMM's component id is its guest's.
+                let id = match w {
+                    Writer::Vmm(g) => g,
+                    w => w.id(),
+                };
+                assert_eq!(Writer::of(kind, id), Some(w));
             }
         }
+        // No id is printed for two writers.
+        let mut ids: Vec<_> = Writer::all().filter(|&w| w != Writer::Dom0).map(Writer::id).collect();
+        ids.sort();
+        assert!(ids.windows(2).all(|p| p[0] < p[1]), "{ids:x?}");
         assert_eq!(Writer::all().count(), Writer::COUNT);
         assert_eq!(Writer::of(crate::KIND_BLKD, BLKD_ID_BASE + MAX_BLKDS as u32), None);
         assert_eq!(Writer::of(crate::KIND_VMM, MAX_VMMS as u32), None);

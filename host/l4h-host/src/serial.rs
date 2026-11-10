@@ -161,7 +161,9 @@ impl LogdConfig {
 const MESSAGE_MAX: usize = 1024;
 /// What one ring can take of a pass: a ring that always claims to have
 /// the oldest record delays others by this much, and no more, apart from
-/// `LINE_RECORDS`. Reports of what it lost count too.
+/// `LINE_RECORDS`. Reports of what it lost count too. Partition 0's home
+/// ring and lanes take theirs together, in the order of their times, and
+/// `Merge::next` keeps a lane from holding the others back within it.
 const PASS_RECORDS: u32 = 64;
 /// What a ring keeps of its share for the rest of a line it has started:
 /// the records of the longest message. Longer lines can split where a pass
@@ -209,7 +211,7 @@ impl<const N: usize> Lane<N> {
     /// Write text as one line, or as the start of one if `more`: as
     /// consecutive records, which a reader prints next to each other.
     pub fn write(&self, ticks: u64, source: u32, text: &[u8], more: bool) {
-        write_to(self.ring.view(), ticks, source, text, more);
+        write_to(self.ring.view(), || ticks, source, text, more);
     }
 
     pub fn head(&self) -> u64 {
@@ -232,10 +234,14 @@ impl<const N: usize> Lane<N> {
     }
 }
 
-fn write_to(ring: View<'_, WORDS>, ticks: u64, source: u32, text: &[u8], more: bool) {
+/// Write `text` as records of the time `ticks` gives once they are
+/// claimed: a reader that saw the ring's head before them then knows that
+/// they are no older than that (`Input::time`).
+fn write_to(ring: View<'_, WORDS>, ticks: impl FnOnce() -> u64, source: u32, text: &[u8], more: bool) {
     let mut n = 0;
     for_records(text, more, |_, _| n += 1);
     let mut seq = ring.claim(n);
+    let ticks = ticks();
     let meta = (source as u64) << SOURCE_SHIFT;
     for_records(text, more, |record, more| {
         let mut buf = Buf::<WORDS>::new();
@@ -343,7 +349,7 @@ impl Lanes {
 
     #[cfg(test)]
     pub(crate) fn write(&self, w: Writer, ticks: u64, source: u32, text: &[u8], more: bool) {
-        write_to(self.lane(w).unwrap(), ticks, source, text, more);
+        write_to(self.lane(w).unwrap(), || ticks, source, text, more);
     }
 }
 
@@ -418,7 +424,22 @@ pub fn init<const N: usize>(ring: &'static Lane<N>, _source: u32) {
 
 /// A component's: write to the lane, or partition ring, of `records`
 /// records its parent mapped at `VA` (none if 0, `log::info_records`).
+/// Call before starting another thread.
+///
+/// A lane that was another writer's and was left as no honest writer
+/// leaves one is reset first, as the log's (`log::init_lane`,
+/// `ring::View::adopt`): this writer's lines would not print otherwise.
+/// One as deep as `Ring` may be a secondary partition's ring, which its
+/// other tasks write meanwhile, with later times than this task's: there
+/// times are not looked at, and an honest ring is never reset. (Dom0's
+/// lane is as deep; a line left in it with a later time only prints when
+/// its turn comes, as dom0's console.)
 pub fn init_lane(records: usize) {
+    if records != 0 {
+        let now = (records != CAPACITY).then(crate::ticks::now_ordered);
+        // The parent mapped a lane of `records` records there for good.
+        unsafe { View::<WORDS>::at(VA + RING_OFFSET, records) }.adopt(now);
+    }
     LANE_RECORDS.store(records, SeqCst);
     LANE_VA.store(if records == 0 { 0 } else { VA + RING_OFFSET }, SeqCst);
 }
@@ -438,7 +459,7 @@ pub fn write(source: u32, text: &[u8], more: bool) {
     let (va, n) = (LANE_VA.load(SeqCst), LANE_RECORDS.load(SeqCst));
     if va != 0 && n != 0 {
         // init and init_lane only take a ring that lives for the process's lifetime.
-        write_to(unsafe { View::at(va, n) }, crate::ticks::now(), source, text, more);
+        write_to(unsafe { View::at(va, n) }, crate::ticks::now, source, text, more);
     }
 }
 
@@ -483,6 +504,15 @@ struct Input {
     deadline: Option<u64>,
     /// Its partition, whose inputs share a budget (Merge::budgets).
     group: usize,
+    /// Its loss was reported in this pass: the next report waits for the
+    /// next pass.
+    reported: bool,
+    /// A sequence and a time of this reader's clock: the records from that
+    /// sequence on were claimed after that time, since the head read then
+    /// did not cover them. `seen` is the latest such pair at or before the
+    /// cursor, `ahead` the one taken when the cursor got there (`time`).
+    seen: (u64, u64),
+    ahead: (u64, u64),
 }
 
 struct KernelInput {
@@ -536,6 +566,8 @@ pub struct Merge {
     kernels: [Option<KernelInput>; MAX_RINGS],
     /// The input and source of a line that has no end on the port yet.
     open: Option<(usize, u32)>,
+    /// Records printed of the open line after its first.
+    run: u32,
     /// How long, in ticks, a claimed record gets to be committed.
     grace: u64,
     commit: Commit,
@@ -553,6 +585,7 @@ impl Merge {
             inputs: [const { None }; MAX_INPUTS],
             kernels: [const { None }; MAX_RINGS],
             open: None,
+            run: 0,
             grace,
             commit: Commit::None,
             budgets: [PASS_RECORDS + LINE_RECORDS; MAX_RINGS],
@@ -578,7 +611,10 @@ impl Merge {
     }
 
     fn add(&mut self, k: usize, ring: View<'static, WORDS>, drained: Option<&'static AtomicU64>, label: Label) {
-        self.inputs[k] = Some(Input { ring, drained, label, cursor: 0, lost: 0, deadline: None, group: if k < MAX_RINGS { k } else { 0 } });
+        self.inputs[k] = Some(Input {
+            ring, drained, label, cursor: 0, lost: 0, deadline: None, group: if k < MAX_RINGS { k } else { 0 },
+            reported: false, seen: (0, 0), ahead: (0, 0),
+        });
     }
 
     /// Add the console ring of partition k's kernel.
@@ -607,6 +643,9 @@ impl Merge {
 
     fn begin_pass(&mut self) {
         self.budgets = [PASS_RECORDS + LINE_RECORDS; MAX_RINGS];
+        for i in self.inputs.iter_mut().flatten() {
+            i.reported = false;
+        }
         for i in self.kernels.iter_mut().flatten() {
             i.budget = PASS_RECORDS;
         }
@@ -626,9 +665,28 @@ impl Merge {
 
     /// The next line to print, into `out`: the oldest record of any ring,
     /// or else a line of a kernel's. False if there is nothing for now.
+    ///
+    /// Partition 0's home ring and lanes share a budget, so that their
+    /// lines go out in the order of their times. A lane's times, lines
+    /// and losses are its writer's to make up, and must not keep root's
+    /// lines, or another lane's, waiting pass after pass:
+    /// - a lane's record takes its turn at its time, or at the time this
+    ///   reader saw the lane without it if that is later (`Input::time`):
+    ///   a record written now with an old time comes after what was
+    ///   already waiting;
+    /// - the rest of a lane's open line comes first for `LINE_RECORDS`
+    ///   records, the longest message, and then takes its turn by time, so
+    ///   that a line without an end is cut by an older line of another's;
+    /// - an input's loss is reported once in a pass, however often it is
+    ///   overwritten while the port sends.
+    ///
+    /// Honest writers' lines keep the order of their times through all
+    /// three, which a share of the budget for each lane would not: a lane
+    /// with more lines than its share older than another's line would see
+    /// that line printed between its own.
     fn next(&mut self, now: u64, out: &mut Line) -> bool {
         out.len = 0;
-        let mut best: Option<(usize, ring::Record<WORDS>)> = None;
+        let mut best: Option<(usize, ring::Record<WORDS>, u64)> = None;
         // The rest of an open line was claimed with it: it comes next,
         // whatever the time on the records between.
         let open = self.open.map(|(k, _)| k);
@@ -640,19 +698,21 @@ impl Merge {
                 continue;
             }
             let peek = i.peek(now, self.grace);
-            if i.lost != 0 && (report.is_none() || open == Some(k)) {
+            if i.lost != 0 && !i.reported && (report.is_none() || open == Some(k)) {
                 report = Some(k);
             }
             match peek {
                 Peek::Ready(r) => {
-                    let rest = self.open == Some((k, (r.meta >> SOURCE_SHIFT) as u32));
+                    let lane = matches!(i.label, Label::Lane(_));
+                    let rest = self.open == Some((k, (r.meta >> SOURCE_SHIFT) as u32)) && !(lane && self.run >= LINE_RECORDS);
                     if rest {
                         continues = true;
                     } else if self.budgets[i.group] <= LINE_RECORDS {
                         continue;
                     }
-                    if rest || !continues && best.as_ref().is_none_or(|(_, b)| r.ticks < b.ticks) {
-                        best = Some((k, r));
+                    let time = i.time(&r);
+                    if rest || !continues && best.as_ref().is_none_or(|&(_, _, b)| time < b) {
+                        best = Some((k, r, time));
                     }
                 }
                 // Only root is worth waiting for: another writer could
@@ -666,6 +726,7 @@ impl Merge {
         if let Some(k) = report.filter(|&k| open == Some(k) || !(hold || continues)) {
             let Some(i) = &mut self.inputs[k] else { return false };
             let lost = core::mem::take(&mut i.lost);
+            i.reported = true;
             self.budgets[i.group] -= 1;
             end_line(&mut self.open, out);
             write_prefix(out, i.label, 0);
@@ -676,13 +737,16 @@ impl Merge {
         if hold {
             return false;
         }
-        if let Some((k, r)) = best {
+        if let Some((k, r, _)) = best {
             let Some(i) = &mut self.inputs[k] else { return false };
             let source = (r.meta >> SOURCE_SHIFT) as u32;
             let more = r.meta & MORE != 0;
             if self.open != Some((k, source)) {
                 end_line(&mut self.open, out);
                 write_prefix(out, i.label, source);
+                self.run = 0;
+            } else {
+                self.run = self.run.saturating_add(1);
             }
             // The prefix says whose a line is: a record cannot make a line
             // that looks like someone else's, nor move the cursor to one.
@@ -768,16 +832,55 @@ impl Input {
         // A secondary can change this at any time: everything below comes
         // from this one read, which bounds the scan to the ring's capacity.
         let head = self.ring.head();
-        // Only a secondary whose memory went wrong moves its head back.
-        if self.cursor > head {
-            self.cursor = head;
-        }
         let oldest = self.ring.oldest_at(head);
+        if self.cursor > head {
+            // A lane reset for its next writer (`ring::View::adopt`), or a
+            // ring whose memory went wrong: what it holds now is read from
+            // the start, since going on from head would skip what its
+            // writer has written since. Nothing is known of when.
+            self.cursor = oldest;
+            self.deadline = None;
+            (self.seen, self.ahead) = ((0, 0), (0, 0));
+        }
         if self.cursor < oldest {
             self.lost = self.lost.saturating_add(oldest - self.cursor);
             self.cursor = oldest;
             self.deadline = None;
         }
+        let peek = self.at_cursor(head, now, grace);
+        // `now` was read before head: whatever head did not cover was
+        // claimed after it. A new pair is taken once the cursor is at the
+        // last one, so the pair in use is never one from after a record's
+        // claim; while nothing new is claimed the last one stays true.
+        if self.cursor >= self.ahead.0 {
+            self.seen = self.ahead;
+            self.ahead = (head, now);
+        } else if head == self.ahead.0 {
+            self.ahead.1 = now;
+        }
+        peek
+    }
+
+    /// When `r`, the record at the cursor, takes its turn among the
+    /// records of its partition's inputs: at its time, which is its
+    /// writer's to choose, but for a lane no earlier than the time this
+    /// reader saw the lane's head below it (`seen`). A writer reads the
+    /// time after it claims (`write_to`), so an honest record's is later
+    /// than that anyway. A record that claims to be older, as those of a
+    /// lane that always has the oldest would, waits behind what was
+    /// written before the reader looked. `seen` can be up to the lane's
+    /// slots of records behind (`peek`), so backdated records delay
+    /// another's line by twice the lane's slots at most: what it could
+    /// hold at two looks.
+    fn time(&self, r: &ring::Record<WORDS>) -> u64 {
+        match self.label {
+            Label::Lane(_) if self.cursor >= self.seen.0 => r.ticks.max(self.seen.1),
+            _ => r.ticks,
+        }
+    }
+
+    /// `peek`, from the cursor up to `head`.
+    fn at_cursor(&mut self, head: u64, now: u64, grace: u64) -> Peek {
         while self.cursor < head {
             match self.ring.get(self.cursor) {
                 Entry::Ready(r) => {
@@ -1141,7 +1244,8 @@ mod tests {
         let mut m = Merge::new(home, GRACE);
         m.add_ring(1, other, Some(1));
         home.write(5, 0, b"home", false);
-        // Each report needs a record to skip: one for every `next`.
+        // A record to skip before every `next`: the ring reports once in
+        // a pass, and what it loses after that waits for the next.
         let (mut line, mut before) = (Line::new(), 0);
         for _ in 0..PASS_RECORDS * 2 {
             other.ring.claim(1);
@@ -1152,7 +1256,162 @@ mod tests {
             }
             before += 1;
         }
-        assert_eq!(before, PASS_RECORDS);
+        assert_eq!(before, 1);
+    }
+
+    /// Run a pass at `now` while `attack` acts after every line printed:
+    /// the lines before root's "home", if it printed in that pass.
+    fn lines_before_home(m: &mut Merge, now: u64, mut attack: impl FnMut()) -> Option<usize> {
+        let (mut lines, mut before) = (0, None);
+        m.pass(|| now, |line| {
+            if line.ends_with(b"home\r\n") {
+                before = before.or(Some(lines));
+            }
+            lines += 1;
+            attack();
+        });
+        before
+    }
+
+    #[test]
+    fn a_lane_that_always_claims_the_oldest_time_cannot_hold_root_back() {
+        let (home, lanes) = (ring(), lanes());
+        let mut m = Merge::new(home, GRACE);
+        m.add_lanes(lanes);
+        // A VMM's lane full of records of time 0, and one more after every
+        // line printed: the lane always has the oldest record.
+        let flood = || lanes.write(Writer::Vmm(3), 0, 0, b"flood", false);
+        for _ in 0..VMM {
+            flood();
+        }
+        home.write(5, 0, b"home", false);
+        // What was there before root's line may be older; what the reader
+        // sees come in after it is not, whatever it says.
+        assert_eq!(lines_before_home(&mut m, 10, flood), Some(VMM));
+        // And so pass after pass: root's lines get out as the flood goes on.
+        for round in 1..20 {
+            home.write(10 * round + 5, 0, b"home", false);
+            let passes = (1..).find(|_| lines_before_home(&mut m, 10 * round + 10, flood).is_some());
+            assert!(passes <= Some(2), "round {round}: {passes:?} passes");
+        }
+    }
+
+    #[test]
+    fn honest_lanes_keep_the_order_of_their_times_however_often_the_reader_looks() {
+        let (home, lanes) = (ring(), lanes());
+        let mut m = Merge::new(home, GRACE);
+        m.add_lanes(lanes);
+        let mut expected = String::new();
+        for t in (0..2000).step_by(10) {
+            // A guest's console and vmmgr before and after a line of
+            // root's, more of the guest's than fit a pass now and then, and
+            // the reader in the middle of them at every other turn.
+            let guest = if t % 300 == 0 { VMM as u64 } else { 2 };
+            for i in 0..guest {
+                lanes.write(Writer::Vmm(1), t + i / 16, SOURCE_GUEST | 1, b"guest", false);
+                expected += "[vm1] guest\r\n";
+            }
+            home.write(t + 5, 0, b"home", false);
+            expected += "home\r\n";
+            if t % 20 == 0 {
+                assert_eq!(drain(&mut m, t + 6), expected);
+                expected.clear();
+            }
+            lanes.write(Writer::Vmmgr, t + 7, 0, b"stopped", false);
+            expected += "[vmmgr] stopped\r\n";
+            assert_eq!(drain(&mut m, t + 8), expected);
+            expected.clear();
+        }
+    }
+
+    #[test]
+    fn a_lane_lapped_at_every_call_cannot_hold_root_back() {
+        let (home, lanes) = (ring(), lanes());
+        let mut m = Merge::new(home, GRACE);
+        m.add_lanes(lanes);
+        // A guest's console that overwrites its whole lane while the port
+        // sends a line: there is a loss to report every time.
+        let flood = || {
+            for _ in 0..VMM + 1 {
+                lanes.write(Writer::Vmm(3), 100, SOURCE_GUEST | 3, b"flood", false);
+            }
+        };
+        flood();
+        for round in 0..20 {
+            home.write(5, 0, b"home", false);
+            let mut text = String::new();
+            m.pass(|| 1000, |line| {
+                text.push_str(core::str::from_utf8(line).unwrap());
+                flood();
+            });
+            // One report in the pass, and root's line right after it.
+            assert!(text.contains(" lines lost)\r\nhome\r\n"), "round {round}: {text}");
+            assert_eq!(text.matches("lost").count(), 1, "round {round}: {text}");
+        }
+    }
+
+    #[test]
+    fn a_lane_whose_line_never_ends_cannot_hold_root_back() {
+        let (home, lanes) = (ring(), lanes());
+        let mut m = Merge::new(home, GRACE);
+        m.add_lanes(lanes);
+        let time = Cell::new(1);
+        let chunk = || {
+            lanes.write(Writer::Vmm(3), time.get(), SOURCE_GUEST | 3, b"x", true);
+            time.set(time.get() + 2);
+        };
+        chunk();
+        assert_eq!(drain(&mut m, 2), "[vm3] x");
+        for _ in 0..20 {
+            // Root's line is older than the rest of the guest's, which
+            // comes first only for the records of the longest message.
+            home.write(0, 0, b"home", false);
+            chunk();
+            let before = lines_before_home(&mut m, time.get(), chunk);
+            assert!(before.is_some_and(|n| n <= LINE_RECORDS as usize), "{before:?}");
+        }
+    }
+
+    #[test]
+    fn a_lanes_message_is_not_cut_by_an_older_line() {
+        let (home, lanes) = (ring(), lanes());
+        let mut m = Merge::new(home, GRACE);
+        m.add_lanes(lanes);
+        // The longest message a component prints, in records claimed at
+        // once, and a line of root's older than its last ones.
+        let long = "x".repeat(MESSAGE_MAX);
+        lanes.write(Writer::Vmmgr, 1, 0, &long.as_bytes()[..TEXT_SIZE], true);
+        assert_eq!(drain(&mut m, 2), std::format!("[vmmgr] {}", &long[..TEXT_SIZE]));
+        home.write(3, 0, b"home", false);
+        lanes.write(Writer::Vmmgr, 4, 0, &long.as_bytes()[TEXT_SIZE..], false);
+        assert_eq!(drain(&mut m, 5), std::format!("{}\r\nhome\r\n", &long[TEXT_SIZE..]));
+    }
+
+    #[test]
+    fn a_lane_reset_for_its_next_writer_is_read_from_its_start() {
+        let (home, lanes) = (ring(), lanes());
+        let mut m = Merge::new(home, GRACE);
+        m.add_lanes(lanes);
+        let lane = lanes.lane(Writer::Vmm(2)).unwrap();
+        let console = |t, text: &[u8]| lanes.write(Writer::Vmm(2), t, SOURCE_GUEST | 2, text, false);
+        console(1, b"old");
+        assert_eq!(drain(&mut m, 2), "[vm2] old\r\n");
+        // The guest's VMM leaves a head that drops whatever is written,
+        // and the reader follows it there.
+        lanes.vmm[2].ring.head.store(u64::MAX - 1, SeqCst);
+        console(3, b"dropped");
+        assert!(drain(&mut m, 4).ends_with(" lines lost)\r\n"));
+        // The next VMM of that guest id resets the lane, whose head goes
+        // back: its first lines are not skipped.
+        assert!(lane.adopt(Some(5)));
+        console(6, b"first");
+        console(7, b"second");
+        assert_eq!(drain(&mut m, 8), std::format!("[vmm2] ({} lines lost)\r\n[vm2] first\r\n[vm2] second\r\n", VMM - 2));
+        // As it is when the reader did not look in between.
+        lanes.vmm[2].ring.head.store(1 << 60, SeqCst);
+        assert!(lane.adopt(Some(9)));
+        console(10, b"third");
+        assert!(drain(&mut m, 11).ends_with(" lines lost)\r\n[vm2] third\r\n"));
     }
 
     #[test]

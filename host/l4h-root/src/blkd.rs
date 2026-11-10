@@ -49,6 +49,27 @@ pub fn dom0_reservation(start: u64, sectors: u64, capacity: u64) -> Option<blk::
     blk::DiskWindow::new(start, sectors, capacity)
 }
 
+/// dom0's explicit windows of a disk (`dom0_disk0_windows`), and whether
+/// they fit its `capacity`, which is its blkd's word.  A list that does
+/// not is planned all the same: its windows stay reserved
+/// (`dom0_plan_reservation`), root refuses to attach those beyond the disk
+/// and dom0 gets placeholders for them, as for an automatic plan that
+/// cannot attach.  None if the text is no list of windows of any disk.
+pub fn dom0_windows<const N: usize>(text: &str, capacity: u64) -> Option<([blk::DiskWindow; N], usize, bool)> {
+    match blk::DiskWindow::parse_list::<N>(text, capacity) {
+        Some((windows, len)) => Some((windows, len, true)),
+        None => blk::DiskWindow::parse_list::<N>(text, UNKNOWN_CAPACITY).map(|(windows, len)| (windows, len, false)),
+    }
+}
+
+/// What a range of dom0's boot plan reserves: `dom0_reservation`, or for
+/// an explicit window beyond the disk's capacity the window itself, which
+/// keeps its sectors from others and is never addressed.
+pub fn dom0_plan_reservation(start: u64, sectors: u64, capacity: u64) -> Option<blk::DiskWindow> {
+    dom0_reservation(start, sectors, capacity)
+        .or_else(|| if sectors == 0 { None } else { blk::DiskWindow::new(start, sectors, UNKNOWN_CAPACITY) })
+}
+
 /// Mapping attributes for device registers.
 #[cfg(target_arch = "x86_64")]
 pub const DEVICE_ATTRS: VmAttributes = VmAttributes::CACHE_DISABLED;
@@ -111,8 +132,8 @@ pub struct Controller {
 enum BlkOp {
     Reserve { disk: usize, window: blk::DiskWindow, read_only: bool },
     /// The first step of attaching a disk for pending request `token`
-    /// (vmmgr.rs) of guest `id`.
-    Check { token: usize, id: usize, instance: u64, disk: usize, unit: u64, start: u64, n: usize, volatile: bool },
+    /// (vmmgr.rs) of guest `id`; `claims`: it may claim a dom0 boot range.
+    Check { token: usize, id: usize, instance: u64, disk: usize, unit: u64, start: u64, n: usize, volatile: bool, claims: bool },
     Add { token: usize, chan: Channel, kick: cap::Notification },
     Remove { client: usize },
     Write { token: usize },
@@ -392,6 +413,16 @@ struct Removal {
     posted: bool,
 }
 
+impl Attachment {
+    /// Whether blkd may give this slot to a new client: only a dom0 boot
+    /// range without a client, to dom0 (`claims`), as the window of the
+    /// disk that was reserved.  blkd gives a reservation's slot to nothing
+    /// else (blk::Reservations::claimable).
+    fn claimed_by(&self, claims: bool, disk: usize, window: blk::DiskWindow) -> bool {
+        self.reserved && self.pool.is_none() && self.remove.is_none() && claims && self.disk == disk && self.window == window
+    }
+}
+
 struct Blkd {
     comp: Component,
     arena: Arena,
@@ -588,8 +619,11 @@ pub fn attach_start(h: &mut Host, c: usize, token: usize, id: usize, disk: usize
     if ctrl.staging_busy || !ctrl.room() { return Err(ctl::EBUSY); }
     // blkd reads the list from staging, where `add` finds it too.
     ctrl.stage(Some(list), 16 * n, &mut h.wins.a);
-    let op = BlkOp::Check { token, id, instance, disk, unit, start, n, volatile };
-    ctrl.post(Request::Check { unit: unit as usize, start, sectors, read_only, dom0, n }, op).map_err(|_| ctl::EBUSY)?;
+    // Only dom0's window claims a boot range, never an extent list:
+    // root's record of the range is a window (`checked`).
+    let claims = dom0 && n == 0;
+    let op = BlkOp::Check { token, id, instance, disk, unit, start, n, volatile, claims };
+    ctrl.post(Request::Check { unit: unit as usize, start, sectors, read_only, dom0: claims, n }, op).map_err(|_| ctl::EBUSY)?;
     ctrl.staging_busy = true;
     Ok(())
 }
@@ -600,7 +634,7 @@ pub fn attach_start(h: &mut Host, c: usize, token: usize, id: usize, disk: usize
 /// EIO, and quarantines the controller.
 #[allow(clippy::too_many_arguments)]
 fn checked(h: &mut Host, c: usize, token: usize, id: usize, instance: u64, disk: usize, unit: u64, start: u64, n: usize,
-    volatile: bool, w: [u64; host::mailbox::ANSWER]) {
+    volatile: bool, claims: bool, w: [u64; host::mailbox::ANSWER]) {
     let r = (|| {
         let ctrl = &mut h.ctrls[c];
         let ok = match wire::reply::<reply::Check>(&w) {
@@ -612,13 +646,13 @@ fn checked(h: &mut Host, c: usize, token: usize, id: usize, instance: u64, disk:
             Err(errno) => return Err(errno),
         };
         let i = ok.slot;
-        // A slot that is free, or a reservation without a client.
-        let usable = i < blk::MAX_CLIENTS && ctrl.clients[i].as_ref().is_none_or(|a| a.pool.is_none() && a.remove.is_none());
+        let (window, read_only) = (blk::DiskWindow { start, sectors: ok.sectors }, ok.read_only);
+        // A slot that is free, or dom0's boot range that this claims.
+        let usable = i < blk::MAX_CLIENTS && ctrl.clients[i].as_ref().is_none_or(|a| a.claimed_by(claims, disk, window));
         if !usable {
             quarantine(ctrl, &h.pci);
             return Err(ctl::EIO);
         }
-        let (window, read_only) = (blk::DiskWindow { start, sectors: ok.sectors }, ok.read_only);
         if h.guests[id].as_ref().is_none_or(|g| g.instance != instance) { return Err(ctl::ENOENT); }
         if !h.can_afford(1 << 20, 0, 0) { return Err(ctl::ENOMEM); }
         crate::vmmgr::with_guest(h, id, |h, g| {
@@ -662,7 +696,9 @@ fn activate(ctrl: &mut Controller, unit: u64, i: usize, client: &RootGuest, chan
             gpa: client.pool.gpa as u64, paddr: client.pool.paddr as u64, size: client.pool.size as u64,
         });
     });
-    let (dom0, n) = (client.dom0, a.extents);
+    // As `attach_start` asked blkd.
+    let n = a.extents;
+    let dom0 = client.dom0 && n == 0;
     // The check's answer has just left room in the ring.  The attachment
     // stays with the guest either way, for its teardown.
     ctrl.post(Request::Add { client: i, unit: unit as usize, dom0, n }, BlkOp::Add { token, chan, kick }).map_err(|_| ctl::EBUSY)
@@ -684,6 +720,18 @@ pub fn fault(h: &mut Host, id: u32) -> bool {
     }
     poll(h, c);
     true
+}
+
+/// Controller `c`'s blkd has not published its units in the time boot
+/// gives the drivers (main.rs): it is failed as one that faulted, and the
+/// host boots without its disks.
+pub fn unpublished(h: &mut Host, c: usize) {
+    if h.ctrls[c].ready() {
+        return;
+    }
+    log!("l4h-root: disk controller {}: blkd did not report its disks, quarantined until reboot", c);
+    quarantine(&mut h.ctrls[c], &h.pci);
+    poll(h, c);
 }
 
 /// Stop using controller `disk` until host reboot: its blkd is suspended
@@ -824,8 +872,8 @@ fn complete(h: &mut Host, c: usize, op: BlkOp, w: [u64; host::mailbox::ANSWER]) 
             let slot = (!ctrl.failed).then_some(i);
             ctrl.list_reservation(disk, window, read_only, slot);
         }
-        BlkOp::Check { token, id, instance, disk, unit, start, n, volatile } =>
-            checked(h, c, token, id, instance, disk, unit, start, n, volatile, w),
+        BlkOp::Check { token, id, instance, disk, unit, start, n, volatile, claims } =>
+            checked(h, c, token, id, instance, disk, unit, start, n, volatile, claims, w),
         BlkOp::Add { token, chan, kick } => {
             let ctrl = &mut h.ctrls[c];
             ctrl.staging_busy = false;

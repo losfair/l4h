@@ -8,13 +8,20 @@
 
 pub const MAX_SEGS: usize = 16;
 pub const RING_SIZE: usize = 128;
+/// What a client offers its guest and holds it to (l4h-vmm): at most
+/// SEG_MAX data segments in a request (virtio-blk's seg_max), each at most
+/// SEG_SIZE_MAX bytes (the largest size_max, what the guest's swiotlb maps
+/// at once).  blkd holds every client to their product, MAX_REQUEST_BYTES
+/// (3.5 MiB, DiskWindow::check_request): what a client can have in flight,
+/// and so how long its requests can keep a device busy, is bounded
+/// whatever its VMM lets through.
+pub const SEG_MAX: usize = MAX_SEGS - 2;
+pub const SEG_SIZE_MAX: u32 = 256 << 10;
+pub const MAX_REQUEST_BYTES: u64 = SEG_MAX as u64 * SEG_SIZE_MAX as u64;
 
 pub const OP_READ: u32 = 0;
 pub const OP_WRITE: u32 = 1;
 pub const OP_FLUSH: u32 = 4;
-pub const OP_DISCARD: u32 = 11;
-pub const OP_WRITE_ZEROES: u32 = 13;
-pub const OP_GET_ID: u32 = 8;
 
 pub const STATUS_OK: u32 = 0;
 pub const STATUS_IOERR: u32 = 1;
@@ -64,7 +71,11 @@ pub struct Channel {
     /// Written by l4h-root before `call::add`: blkd completes flushes at once
     /// and the VMM offers the guest none (l4h_abi::BLK_VOLATILE).
     pub volatile: u32,
-    pub reserved: [u32; 10],
+    /// Written by blkd before it sets `ready`: the data segments of a
+    /// request the device takes, 1 to SEG_MAX, which the VMM offers its
+    /// guest as seg_max.
+    pub seg_max: u32,
+    pub reserved: [u32; 9],
     /// Written by l4h-root before `call::add`; copied into private driver state.
     pub lba_start: u64,
     pub pool: Pool,
@@ -119,6 +130,9 @@ crate::protocol! {
         /// to the end) of `unit`, or with n > 0 the n extents in staging,
         /// (start, sectors) pairs in guest order: the slot `add` must use
         /// and the guest disk, or EINVAL, EBUSY, ENOSPC.  Changes nothing.
+        /// `dom0`: the client may claim a boot range reserved for exactly
+        /// this window, whose slot is then the answer (root asks so only
+        /// for dom0's windows, and takes that slot for nothing else).
         Check / check = 7 from [Root] (unit: usize, start: u64, sectors: u64, read_only: bool, dom0: bool, n: usize) -> Checked;
         /// The start and sectors of a client's kth extent in guest order.
         Extent / extent = 8 from [Root] (client: usize, k: usize) -> (u64, u64);
@@ -300,7 +314,7 @@ impl DiskWindow {
         let segs = &req.segs[..req.nr_segs as usize];
         let bytes: u64 = segs.iter().map(|s| s.len as u64).sum();
         let sector = self.start.checked_add(req.sector).ok_or(STATUS_IOERR)?;
-        if bytes == 0 || bytes % block_size as u64 != 0 || sector % (block_size as u64 / 512) != 0
+        if bytes == 0 || bytes > MAX_REQUEST_BYTES || bytes % block_size as u64 != 0 || sector % (block_size as u64 / 512) != 0
             || req.sector.checked_add(bytes / 512).is_none_or(|end| end > self.sectors) {
             return Err(STATUS_IOERR);
         }
@@ -332,10 +346,10 @@ impl Extent {
 /// that was extended many times has hundreds of segments.
 pub const MAX_EXTENTS: usize = 4096;
 /// Every extent of a disk with more than one is at least this long (4 MiB,
-/// LVM's default physical extent).  A request is at most 3.5 MiB
-/// (l4h-vmm's SEG_MAX * SEG_SIZE_LIMIT), so it crosses at most one
-/// boundary.
+/// LVM's default physical extent).  A request is at most
+/// MAX_REQUEST_BYTES, so it crosses at most one boundary.
 pub const MIN_EXTENT_SECTORS: u64 = 8192;
+const _: () = assert!(MAX_REQUEST_BYTES <= MIN_EXTENT_SECTORS * 512);
 
 /// A client's extent table, built by blkd at extent_va(client) in frames
 /// only blkd maps: the extents sorted by start, and their indices in guest

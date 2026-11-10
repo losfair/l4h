@@ -37,6 +37,21 @@ thread_local! {
     /// blkd is suspended (root quarantined it): nothing runs when the VMM
     /// yields.
     static QUARANTINED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// blkd runs an attacker's code: whenever the VMM yields, it fills
+    /// this channel's completion ring with responses to no request.
+    static FLOOD: std::cell::Cell<*mut Channel> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+/// A response id of no request: its generation is none the VMM used.
+const BOGUS: u64 = 0xdead << 32;
+
+/// Fill the completion ring with BOGUS responses, as far as the VMM has
+/// taken the earlier ones.
+fn flood(channel: *mut Channel) {
+    let c = unsafe { &mut *channel };
+    while c.cq.head.load(Relaxed).wrapping_sub(c.cq.tail.load(Relaxed)) < chan::RING_SIZE as u32 {
+        reply(c, BOGUS);
+    }
 }
 
 /// host::ticks per second.
@@ -79,6 +94,7 @@ impl Blkd {
 /// blkd runs while the VMM yields in `drain`.
 pub fn blkd_run() {
     if QUARANTINED.get() { return; }
+    if !FLOOD.get().is_null() { return flood(FLOOD.get()); }
     BLKD.with_borrow_mut(|b| {
         let b = b.as_mut().unwrap();
         b.take();
@@ -87,6 +103,9 @@ pub fn blkd_run() {
 }
 
 const NUM: u16 = 128;
+/// virtio-blk operations the VMM does not offer.
+const OP_GET_ID: u32 = 8;
+const OP_DISCARD: u32 = 11;
 const CHAINS: u16 = 64;
 /// The I/O pool, above the guest's RAM.
 const POOL: u64 = 0x4020_0000;
@@ -98,7 +117,7 @@ const STATUS: u64 = POOL + 0x4000;
 
 #[test]
 fn unavailable_disk_has_zero_capacity_and_completes_io_without_a_backend() {
-    for op in [chan::OP_READ, chan::OP_WRITE, chan::OP_FLUSH, chan::OP_GET_ID, chan::OP_DISCARD] {
+    for op in [chan::OP_READ, chan::OP_WRITE, chan::OP_FLUSH, OP_GET_ID, OP_DISCARD] {
         let mut ram = vec![0u64; 0x8000 / 8];
         let mem = GuestMem { base: ram.as_mut_ptr() as usize, gpa: POOL, size: 0x8000 };
         let mut disk = Blk::unavailable(mem.size);
@@ -527,4 +546,200 @@ fn polling_multiple_queues_notifies_the_backend_once() {
     let f = DeviceFixture::new(&[chan::OP_READ, chan::OP_READ]);
     assert_eq!(f.channel.sq.head.load(Relaxed), 2);
     BACKEND_NOTIFICATIONS.with_borrow(|n| assert_eq!(*n, 1));
+}
+
+/// Queue 0 with one chain: a header buffer of `hdr` bytes for `op`, the
+/// `data` buffers (length, device-writable), and a status buffer of
+/// `status` bytes.  All data is the same pool memory.
+fn offer_chain(mem: &GuestMem, queue: &mut Queue, op: u32, hdr: u32, data: &[(u32, bool)], status: u32) {
+    *queue = Queue::default();
+    assert!(queue.setup(mem, NUM as u32, NUM as u32, DESC, AVAIL, USED));
+    let n = data.len() as u64 + 2;
+    let bufs = [(HDR, hdr, false)].into_iter()
+        .chain(data.iter().map(|&(len, write)| (POOL + 0x10000, len, write)))
+        .chain([(STATUS, status, true)]);
+    for (i, (address, len, write)) in bufs.enumerate() {
+        let d = DESC + 16 * i as u64;
+        mem.write::<u64>(d, address);
+        mem.write::<u32>(d + 8, len);
+        mem.write::<u16>(d + 12, if write { 2 } else { 0 } | if i as u64 + 1 < n { 1 } else { 0 });
+        mem.write::<u16>(d + 14, i as u16 + 1);
+    }
+    mem.write::<u32>(HDR, op);
+    mem.write::<u64>(HDR + 8, 0);
+    for i in 0..status as u64 { mem.write::<u8>(STATUS + i, 0xff); }
+    mem.write::<u16>(AVAIL + 4, 0);
+    mem.write::<u16>(AVAIL + 2, 1);
+}
+
+#[test]
+fn a_guest_is_held_to_the_seg_max_and_size_max_it_was_offered() {
+    let mut ram = vec![0u64; 0x100000 / 8];
+    let mem = GuestMem { base: ram.as_mut_ptr() as usize, gpa: POOL, size: 0x100000 };
+    let mut channel: Box<Channel> = unsafe { Box::new_zeroed().assume_init() };
+    channel.capacity_sectors = 1 << 20;
+    channel.block_size = 512;
+    // A 4 MiB pool: segments of 72 KiB.
+    let mut disk = Blk::new(&mut *channel as *mut Channel as usize, crate::sel4::cap::Notification, 4 << 20, HZ);
+    let mut config = [0u8; 36];
+    disk.init_config(&mut config);
+    let size_max = u32::from_le_bytes(config[8..12].try_into().unwrap());
+    let seg_max = u32::from_le_bytes(config[12..16].try_into().unwrap()) as usize;
+    assert_eq!((size_max, seg_max), (72 << 10, chan::SEG_MAX));
+    let mut queues = [Queue::default()];
+    let (r, w) = (chan::OP_READ, chan::OP_WRITE);
+    // (operation, header bytes, data buffers, status bytes) and whether
+    // blkd gets the request.
+    let cases: [(u32, u32, Vec<(u32, bool)>, u32, bool); 9] = [
+        // The largest request the guest was offered.
+        (r, 16, vec![(size_max, true); seg_max], 1, true),
+        (w, 16, vec![(size_max, false); seg_max], 1, true),
+        // Data sharing the header's and the status byte's buffers counts.
+        (w, 16 + 512, vec![(512, false); seg_max - 1], 1, true),
+        (r, 16, vec![(512, true); seg_max - 1], 1 + 512, true),
+        // A segment too many, in a buffer of its own or sharing one.
+        (r, 16, vec![(512, true); seg_max + 1], 1, false),
+        (w, 16 + 512, vec![(512, false); seg_max], 1, false),
+        (r, 16, vec![(512, true); seg_max], 1 + 512, false),
+        // A segment too long.
+        (r, 16, vec![(size_max + 512, true)], 1, false),
+        (w, 16 + size_max + 512, vec![], 1, false),
+    ];
+    let mut sent = 0;
+    for (i, (op, hdr, data, status, passes)) in cases.into_iter().enumerate() {
+        offer_chain(&mem, &mut queues[0], op, hdr, &data, status);
+        let returned = disk.kick(&mem, &mut queues, 0);
+        let status_gpa = STATUS + status as u64 - 1;
+        if passes {
+            assert!(!returned, "case {i}");
+            assert_eq!(channel.sq.head.load(Relaxed), sent + 1, "case {i}");
+            let req = channel.reqs[sent as usize];
+            let bytes: u64 = req.segs[..req.nr_segs as usize].iter().map(|s| s.len as u64).sum();
+            assert!(req.nr_segs as usize <= chan::SEG_MAX && bytes <= chan::MAX_REQUEST_BYTES, "case {i}");
+            sent += 1;
+            reply(&mut channel, req.id);
+            assert!(disk.complete(&mem, &mut queues));
+            assert_eq!(mem.read::<u8>(status_gpa), 0, "case {i}");
+        } else {
+            assert!(returned, "case {i}");
+            assert_eq!(channel.sq.head.load(Relaxed), sent, "case {i} must not reach blkd");
+            assert_eq!(mem.read::<u8>(status_gpa), 1, "case {i} is an I/O error");
+        }
+    }
+}
+
+#[test]
+fn a_guest_is_offered_and_held_to_the_segments_the_device_takes() {
+    let mut ram = vec![0u64; 0x20000 / 8];
+    let mem = GuestMem { base: ram.as_mut_ptr() as usize, gpa: POOL, size: 0x20000 };
+    for (said, offered) in [(0, chan::SEG_MAX as u32), (2, 2), (1000, chan::SEG_MAX as u32)] {
+        let mut channel: Box<Channel> = unsafe { Box::new_zeroed().assume_init() };
+        channel.capacity_sectors = 131072;
+        channel.block_size = 512;
+        channel.seg_max = said;
+        let mut disk = Blk::new(&mut *channel as *mut Channel as usize, crate::sel4::cap::Notification, mem.size, HZ);
+        let mut config = [0u8; 36];
+        disk.init_config(&mut config);
+        assert_eq!(u32::from_le_bytes(config[12..16].try_into().unwrap()), offered);
+        let mut queues = [Queue::default()];
+        offer_chain(&mem, &mut queues[0], chan::OP_READ, 16, &vec![(512, true); offered as usize + 1], 1);
+        assert!(disk.kick(&mem, &mut queues, 0));
+        assert_eq!((channel.sq.head.load(Relaxed), mem.read::<u8>(STATUS)), (0, 1));
+        offer_chain(&mem, &mut queues[0], chan::OP_READ, 16, &vec![(512, true); offered as usize], 1);
+        assert!(!disk.kick(&mem, &mut queues, 0));
+        assert_eq!(channel.sq.head.load(Relaxed), 1);
+    }
+}
+
+#[test]
+fn an_operation_that_is_not_offered_is_unsupported_and_never_reaches_blkd() {
+    let mut ram = vec![0u64; 0x20000 / 8];
+    let mem = GuestMem { base: ram.as_mut_ptr() as usize, gpa: POOL, size: 0x20000 };
+    let mut channel: Box<Channel> = unsafe { Box::new_zeroed().assume_init() };
+    channel.capacity_sectors = 131072;
+    channel.block_size = 512;
+    let mut disk = Blk::new(&mut *channel as *mut Channel as usize, crate::sel4::cap::Notification, mem.size, HZ);
+    let mut queues = [Queue::default()];
+    // GET_ID as Linux sends it (a 20-byte buffer for the id), and DISCARD.
+    for (op, data) in [(OP_GET_ID, (20, true)), (OP_DISCARD, (16, false))] {
+        offer_chain(&mem, &mut queues[0], op, 16, &[data], 1);
+        assert!(disk.kick(&mem, &mut queues, 0));
+        assert_eq!(channel.sq.head.load(Relaxed), 0, "operation {op} must not reach blkd");
+        assert_eq!(mem.read::<u8>(STATUS), 2, "operation {op} is unsupported");
+    }
+}
+
+#[test]
+fn taking_responses_kicks_blkd_while_requests_wait_in_the_submission_ring() {
+    let mut f = DeviceFixture::new(&[chan::OP_READ, chan::OP_READ]);
+    assert_eq!(f.channel.sq.head.load(Relaxed), 2);
+    // blkd took the first request and left the second: its completion
+    // ring had no room.  It sleeps until it is kicked.
+    f.channel.sq.tail.store(1, Relaxed);
+    BACKEND_NOTIFICATIONS.with_borrow_mut(|n| *n = 0);
+    f.complete(0);
+    BACKEND_NOTIFICATIONS.with_borrow(|n| assert_eq!(*n, 1, "blkd must hear that its completion ring has room"));
+    // With nothing waiting there is nothing to tell it.
+    f.channel.sq.tail.store(2, Relaxed);
+    f.complete(1);
+    BACKEND_NOTIFICATIONS.with_borrow(|n| assert_eq!(*n, 1));
+    assert!(!f.device.backend.pending());
+}
+
+#[test]
+fn a_reset_takes_no_more_responses_than_blkd_can_owe() {
+    for whole in [false, true] {
+        let mut ram = vec![0u64; 0x20000 / 8];
+        let mem = GuestMem { base: ram.as_mut_ptr() as usize, gpa: POOL, size: 0x20000 };
+        let mut channel: Box<Channel> = unsafe { Box::new_zeroed().assume_init() };
+        channel.capacity_sectors = 131072;
+        channel.block_size = 512;
+        let chan_ptr: *mut Channel = &mut *channel;
+        let mut disk = Blk::new(chan_ptr as usize, crate::sel4::cap::Notification, mem.size, HZ);
+        disk.features_accepted(1 << 12);
+        let mut queues = core::array::from_fn::<_, 4, _>(|_| Queue::default());
+        offer(&mem, &mut queues[0], 0, chan::OP_READ);
+        offer(&mem, &mut queues[1], 1, chan::OP_READ);
+        disk.kick(&mem, &mut queues, 0);
+        disk.kick(&mem, &mut queues, 1);
+        assert_eq!(channel.sq.head.load(Relaxed), 2);
+        // blkd never answers them, and has a response to nothing ready
+        // whenever the VMM looks.
+        flood(chan_ptr);
+        FLOOD.set(chan_ptr);
+        if whole { disk.drain(); } else { disk.drain_queue(&mem, &mut queues, 0); }
+        FLOOD.set(std::ptr::null_mut());
+        let taken = channel.cq.tail.load(Relaxed) as usize;
+        assert!(taken <= 2 + chan::RING_SIZE, "the reset took {taken} responses for 2 requests");
+        // The disk has failed, as with a blkd that stopped.
+        assert!(!disk.pending());
+        if whole { disk.reset(); }
+        offer(&mem, &mut queues[0], 0, chan::OP_READ);
+        disk.kick(&mem, &mut queues, 0);
+        assert_eq!(channel.sq.head.load(Relaxed), 2);
+        assert_eq!(mem.read::<u8>(POOL + 0x4000), 1);
+    }
+}
+
+#[test]
+fn a_reset_looks_at_the_time_while_responses_keep_coming() {
+    let mut ram = vec![0u64; 0x20000 / 8];
+    let mem = GuestMem { base: ram.as_mut_ptr() as usize, gpa: POOL, size: 0x20000 };
+    let mut channel: Box<Channel> = unsafe { Box::new_zeroed().assume_init() };
+    channel.capacity_sectors = 131072;
+    channel.block_size = 512;
+    let chan_ptr: *mut Channel = &mut *channel;
+    // A counter of 1 Hz: the wait is over by the time it is looked at.
+    let mut disk = Blk::new(chan_ptr as usize, crate::sel4::cap::Notification, mem.size, 1);
+    let mut queues = [Queue::default()];
+    offer(&mem, &mut queues[0], 0, chan::OP_READ);
+    disk.kick(&mem, &mut queues, 0);
+    assert_eq!(channel.sq.head.load(Relaxed), 1);
+    flood(chan_ptr);
+    QUARANTINED.set(true);
+    disk.drain();
+    QUARANTINED.set(false);
+    let taken = channel.cq.tail.load(Relaxed) as usize;
+    assert!(taken < chan::RING_SIZE, "the reset took all {taken} responses before it looked at the time");
+    assert!(!disk.pending());
 }
