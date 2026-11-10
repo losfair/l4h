@@ -613,10 +613,10 @@ static int l4h_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr)
  * flush_tlb_all serves KVM_REQ_TLB_FLUSH, which the common code raises only
  * from kvm_flush_remote_tlbs(), after a change to the TDP page table.  Those
  * are flushed where they are made: seL4 invalidates every core that has
- * entered a VM when it removes an EPT leaf or table (patch 0039), before
- * ept.c returns, and adding one needs nothing, as no TLB holds a
- * not-present entry.  tests/guest/kvmtest.c checks both (slot_replace,
- * dirty_log).
+ * entered a VM on the EPT since it was last invalidated when it removes a
+ * leaf or table of it (patch 0039), before ept.c returns, and adding one
+ * needs nothing, as no TLB holds a not-present entry.
+ * tests/guest/kvmtest.c checks both (slot_replace, dirty_log).
  *
  * Everything else is a flush of what the guest's own paging produced (after
  * CR4 or PCID changes, KVM_REQ_TLB_FLUSH_CURRENT and _GUEST), which no EPT

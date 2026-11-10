@@ -1,4 +1,4 @@
-From 040b68e27439de1a95300cf298410abf9989c46b Mon Sep 17 00:00:00 2001
+From 49874e23ff61c6086db59d338414cf508af9261c Mon Sep 17 00:00:00 2001
 From: l4h <l4h@localhost>
 Date: Fri, 6 Nov 2026 23:22:24 -0800
 Subject: [PATCH] x86: what KVM needs from the VCPU interface
@@ -29,9 +29,16 @@ than a VMM written for seL4 does, and any guest can now hold a VCPU:
   mode before the VM entry, where such a value faulted in the kernel.
   Canonical is in 57 bits on a CPU with 5-level paging, as the CPU
   checks it and as a guest with CR4.LA57 writes it.
-- invept reaches every core that has entered a VM.  A local invept
-  leaves the translations of a frame unmapped while its VCPU runs on
-  another core, or on the core a VCPU has left.  FlushTLB is for what
+- invept reaches every core that may hold the root's translations.  A
+  local invept leaves the translations of a frame unmapped while its
+  VCPU runs on another core, or on the core a VCPU has left.  Those
+  cores are the ones that looked the root up to enter a VM since it was
+  last invalidated: each root keeps them in the upper halves of its last
+  two entries, which map nothing, as guest-physical addresses end at
+  2^47, and which stay not present.  Reaching every core that had
+  entered a VM instead let any guest interrupt them all, as often as it
+  could map and unmap a page of its own: each left guest mode and queued
+  for the kernel lock.  FlushTLB is for what
   the guest's own paging produced: it flushes the VCPU's VPID before the
   VCPU next runs, which needs no other core, as one the VCPU arrives on
   flushes it then.  An invept there interrupted every core that had run
@@ -140,6 +147,20 @@ than a VMM written for seL4 does, and any guest can now hold a VCPU:
   Every core must have the type the boot core chose.
 - An exit for an INVPCID, and one for a failed VM entry, report their
   qualification: the operand, and which check or MSR failed.
+- The host SYSENTER fields are 0 in a kernel entered with SYSCALL.
+  Every VM exit loads the SYSENTER MSRs from them, and they held the
+  entry point of a kernel built for SYSENTER, which a SYSCALL kernel
+  never puts in the MSRs: there a user thread's SYSENTER is a #GP.
+  After the first exit on a core, any thread there entered the kernel
+  with SYSENTER instead, at handle_syscall: with the user's TF, which
+  stops the machine, and with a return address taken from RDX
+  unchecked, which the return with SYSRET uses as it is.
+- An exit for a failed VM entry reports no IDT-vectoring information
+  and no instruction length: the CPU leaves those of the exit before
+  it, and a VMM would inject that exit's event again.
+- ReadMSR of KERNEL_GS_BASE takes the VCPU out of guest mode on another
+  core first, as ReadVMCS does: it returned what the exit before had
+  stored.
 
 When seL4 itself runs under a hypervisor without VMCS shadowing, each
 VMREAD and VMWRITE is an exit to it, and so is each WRMSR of a syscall
@@ -176,7 +197,7 @@ MSR.  So VM exits and entries do only what they need:
   as deleting each root does: unmapping below them no longer finds them.
 ---
  include/arch/x86/arch/machine/debug.h         |  10 +
- include/arch/x86/arch/object/vcpu.h           |  70 +-
+ include/arch/x86/arch/object/vcpu.h           | 110 ++-
  include/arch/x86/arch/smp/ipi.h               |   1 +
  include/arch/x86/arch/smp/ipi_inline.h        |   5 +
  .../x86/interfaces/object-api-arch.xml        |  16 +
@@ -184,14 +205,14 @@ MSR.  So VM exits and entries do only what they need:
  src/arch/x86/32/c_traps.c                     |  35 +-
  src/arch/x86/64/c_traps.c                     |  54 +-
  src/arch/x86/c_traps.c                        |  21 +-
- src/arch/x86/kernel/ept.c                     |  59 +-
+ src/arch/x86/kernel/ept.c                     |  61 +-
  src/arch/x86/kernel/vspace.c                  |  20 +
  src/arch/x86/object/objecttype.c              |   3 +
- src/arch/x86/object/vcpu.c                    | 828 +++++++++++++++---
+ src/arch/x86/object/vcpu.c                    | 884 +++++++++++++++---
  src/arch/x86/smp/ipi.c                        |   3 +
  src/kernel/thread.c                           |  17 +
  src/object/notification.c                     |  13 +-
- 16 files changed, 1037 insertions(+), 135 deletions(-)
+ 16 files changed, 1128 insertions(+), 142 deletions(-)
 
 diff --git a/include/arch/x86/arch/machine/debug.h b/include/arch/x86/arch/machine/debug.h
 index 1d01b65f0..15eb556bd 100644
@@ -215,7 +236,7 @@ index 1d01b65f0..15eb556bd 100644
  {
      arch_tcb_t *uds = &target_thread->tcbArch;
 diff --git a/include/arch/x86/arch/object/vcpu.h b/include/arch/x86/arch/object/vcpu.h
-index e97af4545..83082c213 100644
+index e97af4545..33f1e40e3 100644
 --- a/include/arch/x86/arch/object/vcpu.h
 +++ b/include/arch/x86/arch/object/vcpu.h
 @@ -220,7 +220,8 @@ enum exit_reasons {
@@ -308,7 +329,7 @@ index e97af4545..83082c213 100644
  bool_t vtx_init(void);
  exception_t handleVmexit(void);
  exception_t handleVmEntryFail(void);
-@@ -394,6 +438,22 @@ void VMCheckBoundNotification(tcb_t *tcb);
+@@ -394,6 +438,62 @@ void VMCheckBoundNotification(tcb_t *tcb);
  #endif /* ENABLE_SMP_SUPPORT */
  
  void invept(ept_pml4e_t *ept_pml4);
@@ -327,11 +348,51 @@ index e97af4545..83082c213 100644
 +void vcpu_make_current(vcpu_t *vcpu);
 +void vcpu_load_guest_xcr0(vcpu_t *vcpu);
 +void vcpu_load_host_xcr0(vcpu_t *vcpu);
++
++#ifdef ENABLE_SMP_SUPPORT
++/*
++ * The cores that may hold translations of one EPT root: those that looked it
++ * up to enter a VM (vcpu_make_current()) since the root was last invalidated.
++ * Unmapping below the root interrupts only them: with every core that runs
++ * VMs interrupted instead, any guest could keep them all out of guest mode,
++ * and waiting for the kernel lock, by mapping and unmapping a page of its own.
++ * The mask is in the upper halves of the root's last two entries.  They map
++ * nothing, as guest-physical addresses end at 2^47 (ept_vaddr_valid()), and
++ * stay not present, both as EPT entries (bits 2:0) and as nested page table
++ * entries (bit 0).  Read and written with the kernel lock.
++ */
++#define EPT_CORES_INDEX (BIT(EPT_PML4_INDEX_BITS) - 2)
++compile_assert(ept_cores_fit, CONFIG_MAX_NUM_NODES <= 64)
++
++static inline word_t ept_cores_get(ept_pml4e_t *pml4)
++{
++    return (pml4[EPT_CORES_INDEX].words[0] >> 32) |
++           (pml4[EPT_CORES_INDEX + 1].words[0] & ~(word_t)MASK(32));
++}
++
++static inline void ept_cores_set(ept_pml4e_t *pml4, word_t cpu)
++{
++    uint64_t *entry = &pml4[EPT_CORES_INDEX + cpu / 32].words[0];
++    uint64_t bit = BIT(32 + cpu % 32);
++
++    /* Most entries find it set: leave the cache line shared then. */
++    if (!(*entry & bit)) {
++        *entry |= bit;
++    }
++}
++
++static inline void ept_cores_clear(ept_pml4e_t *pml4)
++{
++    pml4[EPT_CORES_INDEX].words[0] = 0;
++    pml4[EPT_CORES_INDEX + 1].words[0] = 0;
++}
++#endif
++
 +void invalidateLocalEPT(ept_pml4e_t *ept_pml4);
  
  /* Removes any IO port mappings that have been cached for the given VPID */
  void clearVPIDIOPortMappings(vpid_t vpid, uint16_t first, uint16_t last);
-@@ -405,10 +465,12 @@ void vcpu_restore_host_msrs(void);
+@@ -405,10 +505,12 @@ void vcpu_restore_host_msrs(void);
  
  static inline word_t vmread(word_t field)
  {
@@ -660,16 +721,18 @@ index 9ce868692..da2676082 100644
       * clobbered and set to potentially undefined values. we need to
       * make sure we reload the correct values of FS and GS.
 diff --git a/src/arch/x86/kernel/ept.c b/src/arch/x86/kernel/ept.c
-index 84e5737e5..7fb3064d9 100644
+index 84e5737e5..e4f90c304 100644
 --- a/src/arch/x86/kernel/ept.c
 +++ b/src/arch/x86/kernel/ept.c
-@@ -12,6 +12,14 @@
+@@ -12,6 +12,16 @@
  #include <arch/kernel/ept.h>
  #include <arch/api/invocation.h>
  
 +/* The EPT cap address fields are sign-extended from bit 47, so a
 + * guest-physical address at or above 2^47 cannot be stored: a map at one
-+ * trips the bitfield setter's assert in a debug build.  Reject it. */
++ * trips the bitfield setter's assert in a debug build.  Reject it.  The
++ * upper half of a root therefore maps nothing, and its last two entries
++ * hold the cores that may have the root's translations (ept_cores_get()). */
 +static inline bool_t ept_vaddr_valid(word_t vaddr)
 +{
 +    return vaddr < (((uint64_t)1) << 47);
@@ -678,7 +741,7 @@ index 84e5737e5..7fb3064d9 100644
  struct lookupEPTPDPTSlot_ret {
      exception_t status;
      ept_pdpte_t *pdptSlot;
-@@ -49,6 +57,10 @@ void deleteEPTASID(asid_t asid, ept_pml4e_t *ept)
+@@ -49,6 +59,10 @@ void deleteEPTASID(asid_t asid, ept_pml4e_t *ept)
          if (asid_map_get_type(asid_map) == asid_map_asid_map_ept &&
              (ept_pml4e_t *)asid_map_asid_map_ept_get_ept_root(asid_map) == ept) {
              poolPtr->array[ASID_LOW(asid)] = asid_map_asid_map_none_new();
@@ -689,7 +752,7 @@ index 84e5737e5..7fb3064d9 100644
          }
      }
  }
-@@ -296,7 +308,7 @@ static exception_t performEPTPDPTInvocationMap(cap_t cap, cte_t *cte, ept_pml4e_
+@@ -296,7 +310,7 @@ static exception_t performEPTPDPTInvocationMap(cap_t cap, cte_t *cte, ept_pml4e_
  {
      cte->cap = cap;
      *pml4Slot = pml4e;
@@ -698,7 +761,7 @@ index 84e5737e5..7fb3064d9 100644
  
      return EXCEPTION_NONE;
  }
-@@ -352,6 +364,11 @@ static exception_t decodeX86EPTPDPTInvocation(
+@@ -352,6 +366,11 @@ static exception_t decodeX86EPTPDPTInvocation(
       * this results in an error shifting by greater than 31 bits, so we manually
       * force a 64-bit variable to do the shifting with */
      vaddr = vaddr & ~(((uint64_t)1 << EPT_PML4_INDEX_OFFSET) - 1);
@@ -710,7 +773,7 @@ index 84e5737e5..7fb3064d9 100644
      pml4Cap = current_extra_caps.excaprefs[0]->cap;
  
      if (cap_get_capType(pml4Cap) != cap_ept_pml4_cap) {
-@@ -420,6 +437,13 @@ exception_t decodeX86EPTInvocation(
+@@ -420,6 +439,13 @@ exception_t decodeX86EPTInvocation(
          return decodeX86EPTPDInvocation(invLabel, length, cte, cap, buffer);
      case cap_ept_pt_cap:
          return decodeX86EPTPTInvocation(invLabel, length, cte, cap, buffer);
@@ -724,7 +787,7 @@ index 84e5737e5..7fb3064d9 100644
      default:
          fail("Invalid cap type");
      }
-@@ -499,7 +523,7 @@ static exception_t performEPTPDInvocationMap(cap_t cap, cte_t *cte, ept_pdpte_t
+@@ -499,7 +525,7 @@ static exception_t performEPTPDInvocationMap(cap_t cap, cte_t *cte, ept_pdpte_t
  {
      cte->cap = cap;
      *pdptSlot = pdpte;
@@ -733,7 +796,7 @@ index 84e5737e5..7fb3064d9 100644
  
      return EXCEPTION_NONE;
  }
-@@ -553,6 +577,11 @@ exception_t decodeX86EPTPDInvocation(
+@@ -553,6 +579,11 @@ exception_t decodeX86EPTPDInvocation(
  
      vaddr = getSyscallArg(0, buffer);
      vaddr = vaddr & ~MASK(EPT_PDPT_INDEX_OFFSET);
@@ -745,7 +808,7 @@ index 84e5737e5..7fb3064d9 100644
      pml4Cap = current_extra_caps.excaprefs[0]->cap;
  
      if (cap_get_capType(pml4Cap) != cap_ept_pml4_cap) {
-@@ -686,7 +715,7 @@ static exception_t performEPTPTInvocationMap(cap_t cap, cte_t *cte, ept_pde_t pd
+@@ -686,7 +717,7 @@ static exception_t performEPTPTInvocationMap(cap_t cap, cte_t *cte, ept_pde_t pd
  {
      cte->cap = cap;
      *pdSlot = pde;
@@ -754,7 +817,7 @@ index 84e5737e5..7fb3064d9 100644
  
      return EXCEPTION_NONE;
  }
-@@ -740,6 +769,11 @@ exception_t decodeX86EPTPTInvocation(
+@@ -740,6 +771,11 @@ exception_t decodeX86EPTPTInvocation(
  
      vaddr = getSyscallArg(0, buffer);
      vaddr = vaddr & ~MASK(EPT_PD_INDEX_OFFSET);
@@ -766,7 +829,7 @@ index 84e5737e5..7fb3064d9 100644
      pml4Cap = current_extra_caps.excaprefs[0]->cap;
  
      if (cap_get_capType(pml4Cap) != cap_ept_pml4_cap ||
-@@ -807,7 +841,7 @@ static exception_t performEPTPageMapPTE(cap_t cap, cte_t *cte, ept_pte_t *ptSlot
+@@ -807,7 +843,7 @@ static exception_t performEPTPageMapPTE(cap_t cap, cte_t *cte, ept_pte_t *ptSlot
  {
      *ptSlot = pte;
      cte->cap = cap;
@@ -775,7 +838,7 @@ index 84e5737e5..7fb3064d9 100644
  
      return EXCEPTION_NONE;
  }
-@@ -820,7 +854,7 @@ static exception_t performEPTPageMapPDE(cap_t cap, cte_t *cte, ept_pde_t *pdSlot
+@@ -820,7 +856,7 @@ static exception_t performEPTPageMapPDE(cap_t cap, cte_t *cte, ept_pde_t *pdSlot
          pdSlot[1] = pde2;
      }
      cte->cap = cap;
@@ -784,7 +847,7 @@ index 84e5737e5..7fb3064d9 100644
  
      return EXCEPTION_NONE;
  }
-@@ -843,9 +877,20 @@ exception_t decodeX86EPTPageMap(
+@@ -843,9 +879,20 @@ exception_t decodeX86EPTPageMap(
      vm_page_size_t  frameSize;
      asid_t          asid;
  
@@ -805,7 +868,7 @@ index 84e5737e5..7fb3064d9 100644
      w_rightsMask = getSyscallArg(1, buffer);
      vmAttr = vmAttributesFromWord(getSyscallArg(2, buffer));
      pml4Cap = current_extra_caps.excaprefs[0]->cap;
-@@ -1042,7 +1087,11 @@ void unmapEPTPage(vm_page_size_t page_size, asid_t asid, vptr_t vptr, void *pptr
+@@ -1042,7 +1089,11 @@ void unmapEPTPage(vm_page_size_t page_size, asid_t asid, vptr_t vptr, void *pptr
           * so this should not happen. As we have no way to return an error
           * all we can do is assert */
          assert(!"Invalid page size for unmap");
@@ -863,7 +926,7 @@ index 7b494f3a4..03c510315 100644
  
  void Arch_postCapDeletion(cap_t cap)
 diff --git a/src/arch/x86/object/vcpu.c b/src/arch/x86/object/vcpu.c
-index 92dd1dfef..3a2045ca7 100644
+index 92dd1dfef..55c03c302 100644
 --- a/src/arch/x86/object/vcpu.c
 +++ b/src/arch/x86/object/vcpu.c
 @@ -21,6 +21,14 @@
@@ -933,17 +996,23 @@ index 92dd1dfef..3a2045ca7 100644
  static vcpu_t *x86KSVPIDTable[VPID_LAST + 1];
  static vpid_t x86KSNextVPID = VPID_FIRST;
  
-@@ -174,6 +217,9 @@ static void switchVCPU(vcpu_t *vcpu)
+@@ -172,8 +215,13 @@ static void switchVCPU(vcpu_t *vcpu)
+         vmwrite(VMX_HOST_TR_BASE, (word_t)&x86KSGlobalState[CURRENT_CPU_INDEX()].x86KStss);
+         vmwrite(VMX_HOST_GDTR_BASE, (word_t)x86KSGlobalState[CURRENT_CPU_INDEX()].x86KSgdt);
          vmwrite(VMX_HOST_IDTR_BASE, (word_t)x86KSGlobalState[CURRENT_CPU_INDEX()].x86KSidt);
-         vmwrite(VMX_HOST_SYSENTER_ESP, (uint64_t)(word_t)((char *)&x86KSGlobalState[CURRENT_CPU_INDEX()].x86KStss.tss.words[0] +
-                                                           4));
+-        vmwrite(VMX_HOST_SYSENTER_ESP, (uint64_t)(word_t)((char *)&x86KSGlobalState[CURRENT_CPU_INDEX()].x86KStss.tss.words[0] +
+-                                                          4));
++        if (config_set(CONFIG_SYSENTER)) {
++            vmwrite(VMX_HOST_SYSENTER_ESP, (uint64_t)(word_t)((char *)&x86KSGlobalState[CURRENT_CPU_INDEX()].x86KStss.tss.words[0] +
++                                                              4));
++        }
 +        /* What this core cached for the VPID when the VCPU last ran here
 +         * can be stale: the guest flushed its TLB elsewhere since. */
 +        vcpu->flush_vpid = true;
      }
      vcpu->last_cpu = getCurrentCPUIndex();
  #endif
-@@ -244,8 +290,12 @@ static bool_t BOOT_CODE init_vtx_fixed_values(bool_t useTrueMsrs)
+@@ -244,8 +292,12 @@ static bool_t BOOT_CODE init_vtx_fixed_values(bool_t useTrueMsrs)
          BIT(3) |    //NMI exiting
          BIT(5);     //virtual NMIs
      uint32_t primary_control_mask =
@@ -956,7 +1025,7 @@ index 92dd1dfef..3a2045ca7 100644
          BIT(31);    //Activate secondary controls
      uint32_t secondary_control_mask =
          BIT(1);     //Enable EPT
-@@ -305,9 +355,35 @@ static bool_t BOOT_CODE init_vtx_fixed_values(bool_t useTrueMsrs)
+@@ -305,9 +357,35 @@ static bool_t BOOT_CODE init_vtx_fixed_values(bool_t useTrueMsrs)
          cr0_high &= ~(CR0_PE | CR0_PG);
      }
  
@@ -994,7 +1063,7 @@ index 92dd1dfef..3a2045ca7 100644
          printf("vt-x: VPIDs are not supported. Expect performance degradation\n");
      } else {
          vmx_feature_vpid = 1;
-@@ -440,11 +516,55 @@ static inline uint32_t applyFixedBits(uint32_t original, uint32_t high, uint32_t
+@@ -440,11 +518,55 @@ static inline uint32_t applyFixedBits(uint32_t original, uint32_t high, uint32_t
      return original;
  }
  
@@ -1050,7 +1119,7 @@ index 92dd1dfef..3a2045ca7 100644
      vcpu->fpuState = x86KSnullFpuState;
  
      memcpy(vcpu->vmcs, &vmcs_revision, 4);
-@@ -452,7 +572,7 @@ void vcpu_init(vcpu_t *vcpu)
+@@ -452,7 +574,7 @@ void vcpu_init(vcpu_t *vcpu)
      vcpu->cr0 = cr0_high & cr0_low;
      vcpu->cr0_shadow = 0;
      vcpu->cr0_mask = 0;
@@ -1059,7 +1128,7 @@ index 92dd1dfef..3a2045ca7 100644
      vcpu->vpid = VPID_INVALID;
  #ifdef ENABLE_SMP_SUPPORT
      vcpu->last_cpu = getCurrentCPUIndex();
-@@ -468,7 +588,11 @@ void vcpu_init(vcpu_t *vcpu)
+@@ -468,18 +590,36 @@ void vcpu_init(vcpu_t *vcpu)
      if (vmx_feature_load_perf_global_ctrl) {
          vmwrite(VMX_HOST_PERF_GLOBAL_CTRL, 0);
      }
@@ -1072,7 +1141,37 @@ index 92dd1dfef..3a2045ca7 100644
      vmwrite(VMX_HOST_CR4, read_cr4());
      vmwrite(VMX_HOST_FS_BASE, 0);
      vmwrite(VMX_HOST_GS_BASE, 0);
-@@ -513,12 +637,39 @@ void vcpu_init(vcpu_t *vcpu)
+     vmwrite(VMX_HOST_TR_BASE, (word_t)&x86KSGlobalState[CURRENT_CPU_INDEX()].x86KStss);
+     vmwrite(VMX_HOST_GDTR_BASE, (word_t)x86KSGlobalState[CURRENT_CPU_INDEX()].x86KSgdt);
+     vmwrite(VMX_HOST_IDTR_BASE, (word_t)x86KSGlobalState[CURRENT_CPU_INDEX()].x86KSidt);
+-    vmwrite(VMX_HOST_SYSENTER_CS, (word_t)SEL_CS_0);
+-    vmwrite(VMX_HOST_SYSENTER_EIP, (word_t)&handle_syscall);
+-    if (!config_set(CONFIG_HARDWARE_DEBUG_API)) {
+-        vmwrite(VMX_HOST_SYSENTER_ESP, (uint64_t)(word_t)((char *)&x86KSGlobalState[CURRENT_CPU_INDEX()].x86KStss.tss.words[0] +
+-                                                          4));
++    /* Every VM exit loads the SYSENTER MSRs from these fields.  Only a
++     * kernel entered with SYSENTER has set them up (init_sysenter_msrs()):
++     * in one entered with SYSCALL they stay 0, so that a user thread's
++     * SYSENTER is a #GP, and must stay so after an exit.  With the entry
++     * point here, any thread on a core that had run a VM entered the kernel
++     * at handle_syscall, which that kernel is not built to be entered at:
++     * with the user's TF, and with a return address it never checked, which
++     * the return with SYSRET takes as it is. */
++    if (config_set(CONFIG_SYSENTER)) {
++        vmwrite(VMX_HOST_SYSENTER_CS, (word_t)SEL_CS_0);
++        vmwrite(VMX_HOST_SYSENTER_EIP, (word_t)&handle_syscall);
++        if (!config_set(CONFIG_HARDWARE_DEBUG_API)) {
++            vmwrite(VMX_HOST_SYSENTER_ESP, (uint64_t)(word_t)((char *)&x86KSGlobalState[CURRENT_CPU_INDEX()].x86KStss.tss.words[0] +
++                                                              4));
++        }
++    } else {
++        vmwrite(VMX_HOST_SYSENTER_CS, 0);
++        vmwrite(VMX_HOST_SYSENTER_EIP, 0);
++        vmwrite(VMX_HOST_SYSENTER_ESP, 0);
+     }
+     /* Set host SP to point just beyond the first field to be stored on exit. */
+     vmwrite(VMX_HOST_RSP, (word_t)&vcpu->gp_registers[n_vcpu_gp_register]);
+@@ -513,12 +653,39 @@ void vcpu_init(vcpu_t *vcpu)
      vmwrite(VMX_CONTROL_ENTRY_CONTROLS, entry_control);
  
      vmwrite(VMX_CONTROL_MSR_ADDRESS, (word_t)kpptr_to_paddr(&msr_bitmap_region));
@@ -1112,7 +1211,7 @@ index 92dd1dfef..3a2045ca7 100644
      memset(vcpu->io, ~(word_t)0, VCPU_IOBITMAP_SIZE);
      vmwrite(VMX_CONTROL_IOA_ADDRESS, pptr_to_paddr(vcpu->io));
      vmwrite(VMX_CONTROL_IOB_ADDRESS, pptr_to_paddr((char *)vcpu->io + (VCPU_IOBITMAP_SIZE / 2)));
-@@ -528,7 +679,40 @@ static void dissociateVcpuTcb(tcb_t *tcb, vcpu_t *vcpu)
+@@ -528,7 +695,40 @@ static void dissociateVcpuTcb(tcb_t *tcb, vcpu_t *vcpu)
  {
      assert(tcb->tcbArch.tcbVCPU == vcpu);
      assert(vcpu->vcpuTCB == tcb);
@@ -1154,7 +1253,7 @@ index 92dd1dfef..3a2045ca7 100644
      vcpu->fpu_active = false;
      tcb->tcbArch.tcbVCPU = NULL;
      vcpu->vcpuTCB = NULL;
-@@ -536,6 +720,10 @@ static void dissociateVcpuTcb(tcb_t *tcb, vcpu_t *vcpu)
+@@ -536,6 +736,10 @@ static void dissociateVcpuTcb(tcb_t *tcb, vcpu_t *vcpu)
  
  void vcpu_finalise(vcpu_t *vcpu)
  {
@@ -1165,7 +1264,7 @@ index 92dd1dfef..3a2045ca7 100644
      if (ARCH_NODE_STATE_ON_CORE(x86KSCurrentVCPU, vcpu->last_cpu) == vcpu) {
  #ifdef ENABLE_SMP_SUPPORT
          if (vcpu->last_cpu != getCurrentCPUIndex()) {
-@@ -546,14 +734,19 @@ void vcpu_finalise(vcpu_t *vcpu)
+@@ -546,14 +750,19 @@ void vcpu_finalise(vcpu_t *vcpu)
              clearCurrentVCPU();
          }
      }
@@ -1188,7 +1287,7 @@ index 92dd1dfef..3a2045ca7 100644
  static void associateVcpuTcb(tcb_t *tcb, vcpu_t *vcpu)
  {
      if (tcb->tcbArch.tcbVCPU) {
-@@ -601,15 +794,28 @@ static exception_t invokeWriteMSR(vcpu_t *vcpu, word_t *buffer, word_t field, wo
+@@ -601,15 +810,28 @@ static exception_t invokeWriteMSR(vcpu_t *vcpu, word_t *buffer, word_t field, wo
      switch (field) {
      case IA32_LSTAR_MSR:
          vcpu->syscall_registers[VCPU_LSTAR] = value;
@@ -1217,7 +1316,7 @@ index 92dd1dfef..3a2045ca7 100644
          break;
      }
      setMR(thread, buffer, 0, value);
-@@ -632,9 +838,29 @@ static exception_t decodeVCPUWriteMSR(cap_t cap, word_t length, word_t *buffer)
+@@ -632,9 +854,29 @@ static exception_t decodeVCPUWriteMSR(cap_t cap, word_t length, word_t *buffer)
      value = getSyscallArg(1, buffer);
      switch (field) {
      case IA32_LSTAR_MSR:
@@ -1248,11 +1347,16 @@ index 92dd1dfef..3a2045ca7 100644
          break;
      default:
          userError("VCPU WriteMSR: Invalid field %lx.", (long)field);
-@@ -664,6 +890,12 @@ static exception_t invokeReadMSR(vcpu_t *vcpu, word_t field, word_t *buffer)
+@@ -664,6 +906,17 @@ static exception_t invokeReadMSR(vcpu_t *vcpu, word_t field, word_t *buffer)
      case IA32_FMASK_MSR:
          value = vcpu->syscall_registers[VCPU_SYSCALL_MASK];
          break;
 +    case IA32_KERNEL_GS_BASE_MSR:
++        /* The guest's own, while it is in guest mode on another core: out
++         * of it first, as for ReadVMCS, so that the exit stores it. */
++        if (ARCH_NODE_STATE(x86KSCurrentVCPU) != vcpu) {
++            switchVCPU(vcpu);
++        }
 +        value = vcpu->guest_msr_registers[VCPU_SHADOW_GS];
 +        break;
 +    case SEL4_VCPU_MSR_XCR0:
@@ -1261,7 +1365,7 @@ index 92dd1dfef..3a2045ca7 100644
      case IA32_VMX_MISC_MSR:
          value = x86_rdmsr(field);
          break;
-@@ -689,6 +921,8 @@ static exception_t decodeVCPUReadMSR(cap_t cap, word_t length, word_t *buffer)
+@@ -689,6 +942,8 @@ static exception_t decodeVCPUReadMSR(cap_t cap, word_t length, word_t *buffer)
      case IA32_STAR_MSR:
      case IA32_CSTAR_MSR:
      case IA32_FMASK_MSR:
@@ -1270,7 +1374,7 @@ index 92dd1dfef..3a2045ca7 100644
      case IA32_VMX_MISC_MSR:
          break;
      default:
-@@ -700,15 +934,23 @@ static exception_t decodeVCPUReadMSR(cap_t cap, word_t length, word_t *buffer)
+@@ -700,15 +955,23 @@ static exception_t decodeVCPUReadMSR(cap_t cap, word_t length, word_t *buffer)
  }
  #endif  /* CONFIG_X86_64_VTX_64BIT_GUESTS */
  
@@ -1297,7 +1401,7 @@ index 92dd1dfef..3a2045ca7 100644
      cap = cap_io_port_cap_set_capIOPortVPID(cap, vcpu->vpid);
      slot->cap = cap;
      setIOPortMask(vcpu->io, low, high, false);
-@@ -744,7 +986,10 @@ static exception_t decodeEnableIOPort(cap_t cap, word_t length, word_t *buffer)
+@@ -744,7 +1007,10 @@ static exception_t decodeEnableIOPort(cap_t cap, word_t length, word_t *buffer)
      low = getSyscallArg(0, buffer);
      high = getSyscallArg(1, buffer);
  
@@ -1309,7 +1413,7 @@ index 92dd1dfef..3a2045ca7 100644
          userError("VCPU EnableIOPort: Requested range not valid for given IOPort cap");
          current_syscall_error.type = seL4_InvalidArgument;
          current_syscall_error.invalidArgumentNumber = 0;
-@@ -778,6 +1023,13 @@ static exception_t decodeDisableIOPort(cap_t cap, word_t length, word_t *buffer)
+@@ -778,6 +1044,13 @@ static exception_t decodeDisableIOPort(cap_t cap, word_t length, word_t *buffer)
      low = getSyscallArg(0, buffer);
      high = getSyscallArg(1, buffer);
  
@@ -1323,7 +1427,7 @@ index 92dd1dfef..3a2045ca7 100644
      vcpu = VCPU_PTR(cap_vcpu_cap_get_capVCPUPtr(cap));
  
      return invokeDisableIOPort(vcpu, low, high);
-@@ -804,6 +1056,16 @@ static exception_t invokeWriteVMCS(vcpu_t *vcpu, bool_t call, word_t *buffer, wo
+@@ -804,6 +1077,16 @@ static exception_t invokeWriteVMCS(vcpu_t *vcpu, bool_t call, word_t *buffer, wo
      case VMX_CONTROL_CR0_READ_SHADOW:
          vcpu->cr0_shadow = vcpu->cached_cr0_shadow = value;
          break;
@@ -1340,7 +1444,7 @@ index 92dd1dfef..3a2045ca7 100644
      }
      vmwrite(field, value);
  
-@@ -868,7 +1130,6 @@ static exception_t decodeWriteVMCS(cap_t cap, word_t length, bool_t call, word_t
+@@ -868,7 +1151,6 @@ static exception_t decodeWriteVMCS(cap_t cap, word_t length, bool_t call, word_t
      case VMX_GUEST_LDTR_ACCESS_RIGHTS:
      case VMX_GUEST_TR_ACCESS_RIGHTS:
      case VMX_GUEST_INTERRUPTABILITY:
@@ -1348,7 +1452,7 @@ index 92dd1dfef..3a2045ca7 100644
      case VMX_GUEST_SMBASE:
      case VMX_GUEST_SYSENTER_CS:
      case VMX_GUEST_PREEMPTION_TIMER_VALUE:
-@@ -892,24 +1153,48 @@ static exception_t decodeWriteVMCS(cap_t cap, word_t length, bool_t call, word_t
+@@ -892,24 +1174,48 @@ static exception_t decodeWriteVMCS(cap_t cap, word_t length, bool_t call, word_t
      case VMX_CONTROL_CR0_READ_SHADOW:
      case VMX_CONTROL_CR4_READ_SHADOW:
      case VMX_GUEST_CR3:
@@ -1404,7 +1508,7 @@ index 92dd1dfef..3a2045ca7 100644
          break;
      case VMX_GUEST_CR0:
          value = applyFixedBits(value, cr0_high, cr0_low);
-@@ -931,7 +1216,14 @@ static word_t readVMCSField(vcpu_t *vcpu, word_t field)
+@@ -931,7 +1237,14 @@ static word_t readVMCSField(vcpu_t *vcpu, word_t field)
      case VMX_CONTROL_EXCEPTION_BITMAP:
          return vcpu->exception_bitmap;
      case VMX_GUEST_CR0:
@@ -1420,7 +1524,7 @@ index 92dd1dfef..3a2045ca7 100644
      case VMX_CONTROL_CR0_MASK:
          return vcpu->cr0_mask;
      case VMX_CONTROL_CR0_READ_SHADOW:
-@@ -1041,6 +1333,7 @@ static exception_t decodeReadVMCS(cap_t cap, word_t length, bool_t call, word_t
+@@ -1041,6 +1354,7 @@ static exception_t decodeReadVMCS(cap_t cap, word_t length, bool_t call, word_t
      case VMX_DATA_IO_RIP:
      case VMX_DATA_GUEST_LINEAR_ADDRESS:
      case VMX_CONTROL_ENTRY_INTERRUPTION_INFO:
@@ -1428,7 +1532,7 @@ index 92dd1dfef..3a2045ca7 100644
      case VMX_CONTROL_PIN_EXECUTION_CONTROLS:
      case VMX_CONTROL_PRIMARY_PROCESSOR_CONTROLS:
      case VMX_CONTROL_SECONDARY_PROCESSOR_CONTROLS:
-@@ -1092,24 +1385,40 @@ void vcpu_update_state_sysvmenter(vcpu_t *vcpu)
+@@ -1092,24 +1406,40 @@ void vcpu_update_state_sysvmenter(vcpu_t *vcpu)
      if (ARCH_NODE_STATE(x86KSCurrentVCPU) != vcpu) {
          switchVCPU(vcpu);
      }
@@ -1481,7 +1585,7 @@ index 92dd1dfef..3a2045ca7 100644
  
      assert(vcpu);
  
-@@ -1117,11 +1426,7 @@ void vcpu_sysvmenter_reply_to_user(tcb_t *tcb)
+@@ -1117,11 +1447,7 @@ void vcpu_sysvmenter_reply_to_user(tcb_t *tcb)
          switchVCPU(vcpu);
      }
  
@@ -1494,7 +1598,7 @@ index 92dd1dfef..3a2045ca7 100644
      setRegister(tcb, msgInfoRegister, 0);
  }
  
-@@ -1138,6 +1443,21 @@ exception_t decodeX86VCPUInvocation(
+@@ -1138,6 +1464,21 @@ exception_t decodeX86VCPUInvocation(
      switch (invLabel) {
      case X86VCPUSetTCB:
          return decodeSetTCB(cap, length, buffer);
@@ -1516,7 +1620,7 @@ index 92dd1dfef..3a2045ca7 100644
      case X86VCPUReadVMCS:
          return decodeReadVMCS(cap, length, call, buffer);
      case X86VCPUWriteVMCS:
-@@ -1146,8 +1466,16 @@ exception_t decodeX86VCPUInvocation(
+@@ -1146,8 +1487,16 @@ exception_t decodeX86VCPUInvocation(
          return decodeEnableIOPort(cap, length, buffer);
      case X86VCPUDisableIOPort:
          return decodeDisableIOPort(cap, length, buffer);
@@ -1534,7 +1638,7 @@ index 92dd1dfef..3a2045ca7 100644
  #ifdef CONFIG_X86_64_VTX_64BIT_GUESTS
      case X86VCPUWriteMSR:
          return decodeVCPUWriteMSR(cap, length, buffer);
-@@ -1222,6 +1550,16 @@ static BOOT_CODE bool_t vtx_try_init(void)
+@@ -1222,6 +1571,16 @@ static BOOT_CODE bool_t vtx_try_init(void)
      vpid_capability.words[0] = x86_rdmsr_low(IA32_VMX_EPT_VPID_CAP_MSR);
      vpid_capability.words[1] = x86_rdmsr_high(IA32_VMX_EPT_VPID_CAP_MSR);
  
@@ -1551,7 +1655,7 @@ index 92dd1dfef..3a2045ca7 100644
      /* check for supported EPT features */
      if (!vmx_ept_vpid_cap_msr_get_ept_wb(vpid_capability)) {
          printf("vt-x: Expected wb attribute for EPT paging structure\n");
-@@ -1231,6 +1569,15 @@ static BOOT_CODE bool_t vtx_try_init(void)
+@@ -1231,6 +1590,15 @@ static BOOT_CODE bool_t vtx_try_init(void)
          printf("vt-x: Expected supported for 2m pages\n");
          return false;
      }
@@ -1567,7 +1671,7 @@ index 92dd1dfef..3a2045ca7 100644
      /* Before calling vmxon, we must check that CR0 and CR4 are not set to values
       * that are unsupported by vt-x */
      if (!vtx_check_fixed_values(read_cr0(), read_cr4() | CR4_VMXE)) {
-@@ -1268,6 +1615,9 @@ static BOOT_CODE bool_t vtx_try_init(void)
+@@ -1268,6 +1636,9 @@ static BOOT_CODE bool_t vtx_try_init(void)
  
  BOOT_CODE bool_t vtx_init(void)
  {
@@ -1577,7 +1681,7 @@ index 92dd1dfef..3a2045ca7 100644
      if (CURRENT_CPU_INDEX() != 0) {
          /* Secondary cores follow the boot core, which runs first: none
           * uses VT-x without it, and each must match it when it does. */
-@@ -1288,57 +1638,155 @@ BOOT_CODE bool_t vtx_init(void)
+@@ -1288,57 +1659,157 @@ BOOT_CODE bool_t vtx_init(void)
      return true;
  }
  
@@ -1741,7 +1845,9 @@ index 92dd1dfef..3a2045ca7 100644
 +        /* The exit took the event, if there was one. */
 +        vcpu->entry_intr &= ~BIT(31);
 +    }
-+    vcpu->exit_info_valid = true;
++    /* A failed VM entry also leaves the IDT-vectoring information and the
++     * instruction length of the exit before it: they are not this one's. */
++    vcpu->exit_info_valid = !(reason & BIT(31));
 +    /* The guest moved RIP: setMRs_vmexit() reads it again before userspace
 +     * sees the exit, and a VMEnter that comes without one (a thread resumed
 +     * after a suspend in guest mode) writes the RIP it brings. */
@@ -1760,7 +1866,7 @@ index 92dd1dfef..3a2045ca7 100644
  }
  
  exception_t handleVmexit(void)
-@@ -1347,18 +1795,25 @@ exception_t handleVmexit(void)
+@@ -1347,18 +1818,25 @@ exception_t handleVmexit(void)
      /* qualification is host width, reason is defined as being 32 bit */
      word_t qualification;
      uint32_t reason;
@@ -1794,7 +1900,7 @@ index 92dd1dfef..3a2045ca7 100644
          } else {
              /* poll for the pending irq. We will then handle it once we return back
               * up to restore_user_context */
-@@ -1370,8 +1825,6 @@ exception_t handleVmexit(void)
+@@ -1370,8 +1848,6 @@ exception_t handleVmexit(void)
          return EXCEPTION_NONE;
      }
  
@@ -1803,7 +1909,7 @@ index 92dd1dfef..3a2045ca7 100644
      switch (reason) {
      case EXCEPTION_OR_NMI:
      case MOV_DR:
-@@ -1394,20 +1847,43 @@ exception_t handleVmexit(void)
+@@ -1394,20 +1870,43 @@ exception_t handleVmexit(void)
      case LDTR_OR_TR:
      case TPR_BELOW_THRESHOLD:
      case APIC_ACCESS:
@@ -1849,7 +1955,7 @@ index 92dd1dfef..3a2045ca7 100644
  
      return EXCEPTION_NONE;
  }
-@@ -1423,7 +1899,10 @@ void VMCheckBoundNotification(tcb_t *tcb)
+@@ -1423,7 +1922,10 @@ void VMCheckBoundNotification(tcb_t *tcb)
       */
      assert(tcb->tcbAffinity == getCurrentCPUIndex());
      notification_t *ntfnPtr = tcb->tcbBoundNotification;
@@ -1860,7 +1966,7 @@ index 92dd1dfef..3a2045ca7 100644
          && ntfnPtr && notification_ptr_get_state(ntfnPtr) == NtfnState_Active) {
  
          word_t badge = notification_ptr_get_ntfnMsgIdentifier(ntfnPtr);
-@@ -1449,7 +1928,30 @@ static void invvpid_context(uint16_t vpid)
+@@ -1449,7 +1951,30 @@ static void invvpid_context(uint16_t vpid)
          uint64_t rsvd : 48;
          uint64_t address;
      } PACKED operand = {vpid, 0, 0};
@@ -1892,7 +1998,19 @@ index 92dd1dfef..3a2045ca7 100644
  }
  
  static void setEPTRoot(cap_t vmxSpace, vcpu_t *vcpu)
-@@ -1479,10 +1981,7 @@ static void setEPTRoot(cap_t vmxSpace, vcpu_t *vcpu)
+@@ -1468,6 +1993,11 @@ static void setEPTRoot(cap_t vmxSpace, vcpu_t *vcpu)
+             ept_root = kpptr_to_paddr(null_ept_space);
+         } else {
+             ept_root = pptr_to_paddr(pml4);
++#ifdef ENABLE_SMP_SUPPORT
++            /* This core may hold the root's translations from here on,
++             * and invept() must reach it. */
++            ept_cores_set(pml4, getCurrentCPUIndex());
++#endif
+         }
+     }
+     if (ept_root != vcpu->last_ept_root) {
+@@ -1479,10 +2009,7 @@ static void setEPTRoot(cap_t vmxSpace, vcpu_t *vcpu)
                                6               /* write back memory type */
                            );
          vmwrite(VMX_CONTROL_EPT_POINTER, eptp.words[0]);
@@ -1904,7 +2022,7 @@ index 92dd1dfef..3a2045ca7 100644
      }
  }
  
-@@ -1558,28 +2057,33 @@ static void storeVPID(vcpu_t *vcpu, vpid_t vpid)
+@@ -1558,28 +2085,33 @@ static void storeVPID(vcpu_t *vcpu, vpid_t vpid)
      vcpu->vpid = vpid;
  }
  
@@ -1949,7 +2067,7 @@ index 92dd1dfef..3a2045ca7 100644
          switchLocalFpuOwner(tcb);
      }
  }
-@@ -1589,17 +2093,88 @@ void vcpu_fpu_to_host(tcb_t *tcb, vcpu_t *vcpu)
+@@ -1589,17 +2121,90 @@ void vcpu_fpu_to_host(tcb_t *tcb, vcpu_t *vcpu)
      if (tcb->tcbFlags & seL4_TCBFlag_fpuDisabled) {
          /* FPU may have been enabled for the guest, but host isn't allowed to use it */
          disableFpu();
@@ -1977,7 +2095,9 @@ index 92dd1dfef..3a2045ca7 100644
 +    /* Before the EPT root is looked up below, and the kernel lock
 +     * released: invept() reaches only the cores in this mask, so a core it
 +     * did not know of would enter with a root deleted meanwhile. */
-+    __atomic_fetch_or(&x86KSVMXCores, BIT(getCurrentCPUIndex()), __ATOMIC_SEQ_CST);
++    if (!(x86KSVMXCores & BIT(getCurrentCPUIndex()))) {
++        __atomic_fetch_or(&x86KSVMXCores, BIT(getCurrentCPUIndex()), __ATOMIC_SEQ_CST);
++    }
 +#endif
 +    if (ARCH_NODE_STATE(x86KSCurrentVCPU) != vcpu) {
 +        switchVCPU(vcpu);
@@ -2043,7 +2163,7 @@ index 92dd1dfef..3a2045ca7 100644
  void restoreVMCS(void)
  {
      tcb_t *cur_thread = NODE_STATE(ksCurThread);
-@@ -1616,24 +2191,29 @@ void restoreVMCS(void)
+@@ -1616,24 +2221,29 @@ void restoreVMCS(void)
          vmwrite(VMX_HOST_CR3, getCurrentCR3().words[0]);
      }
  #endif
@@ -2082,7 +2202,7 @@ index 92dd1dfef..3a2045ca7 100644
              type = 1;
          } else if (vmx_ept_vpid_cap_msr_get_invept_all_context(vpid_capability)) {
              type = 2;
-@@ -1645,7 +2225,11 @@ void invept(ept_pml4e_t *ept_pml4)
+@@ -1645,7 +2255,11 @@ void invept(ept_pml4e_t *ept_pml4)
              return;
          }
  
@@ -2095,7 +2215,7 @@ index 92dd1dfef..3a2045ca7 100644
          address.parts[1] = 0;
          asm volatile(
              "invept %0, %1"
-@@ -1656,4 +2240,28 @@ void invept(ept_pml4e_t *ept_pml4)
+@@ -1656,4 +2270,40 @@ void invept(ept_pml4e_t *ept_pml4)
      }
  }
  
@@ -2113,10 +2233,22 @@ index 92dd1dfef..3a2045ca7 100644
 +{
 +    invalidateLocalEPT(ept_pml4);
 +#ifdef ENABLE_SMP_SUPPORT
-+    /* Each core sets its bit with the kernel lock held, before it first
-+     * looks up an EPT root to enter a VM with (vcpu_make_current()). */
-+    word_t mask = x86KSVMXCores & ~BIT(getCurrentCPUIndex());
++    word_t mask;
 +
++    if (ept_pml4) {
++        /* The cores that looked this root up to enter a VM since it was
++         * last invalidated (setEPTRoot()): no other holds its translations,
++         * and each sets its bit again, with the kernel lock, before it
++         * next enters on the root. */
++        mask = ept_cores_get(ept_pml4);
++        ept_cores_clear(ept_pml4);
++    } else {
++        /* Every root: each core sets its bit with the kernel lock held,
++         * before it first looks up an EPT root to enter a VM with
++         * (vcpu_make_current()). */
++        mask = x86KSVMXCores;
++    }
++    mask &= ~BIT(getCurrentCPUIndex());
 +    if (mask) {
 +        doRemoteInvalidateEPT(ept_pml4, mask);
 +    }

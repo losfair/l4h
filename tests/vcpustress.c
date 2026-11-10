@@ -12,7 +12,9 @@
  * their VCPU, swap it for another, and in the end delete everything under
  * them.  The kernel must survive, and each runner checks what every VMEnter
  * returns: the guest's counter never goes back, its registers keep their
- * values, and exits come where the guest's code makes them.
+ * values, and exits come where the guest's code makes them.  At the end a
+ * thread on each core that ran a guest executes SYSENTER, which must fault:
+ * seL4 is entered with SYSCALL, and a VM exit must not leave SYSENTER armed.
  *
  * Built with -DTFSTEP the guests run with RFLAGS.TF set, so every guest
  * instruction is a #DB exit (seL4 always intercepts #DB) and a runner sees
@@ -27,9 +29,9 @@
 #include <sel4/arch/vmenter.h>
 
 __thread seL4_IPCBuffer *__sel4_ipc_buffer;
-static char tls[4][4096] __attribute__((aligned(64)));
+static char tls[5][4096] __attribute__((aligned(64)));
 char vcpustress_stack[16384] __attribute__((aligned(16)));
-static char stacks[3][16384] __attribute__((aligned(16)));
+static char stacks[5][16384] __attribute__((aligned(16)));
 
 #ifndef ROUNDS
 #define ROUNDS 40
@@ -428,7 +430,7 @@ static void runner(struct guest *gp)
 }
 
 static void start_thread(seL4_CPtr tcb, seL4_CPtr sc, seL4_CPtr ipcframe, unsigned long ipcbuf,
-                         int core, void *fn, unsigned long arg, int idx)
+                         int core, void *fn, unsigned long arg, int idx, seL4_CPtr fault_ep)
 {
     seL4_UserContext regs = { 0 };
     unsigned long tp = (unsigned long)(tls[idx] + sizeof(tls[idx]) - 64);
@@ -437,7 +439,7 @@ static void start_thread(seL4_CPtr tcb, seL4_CPtr sc, seL4_CPtr ipcframe, unsign
     CK(seL4_SchedControl_ConfigureFlags(bi->schedcontrol.start + core, sc, 5000, 5000, 0, 0, 0));
     CK(seL4_TCB_Configure(tcb, seL4_CapInitThreadCNode, 0, seL4_CapInitThreadVSpace, 0, ipcbuf, ipcframe));
     /* An MCP above KernelDebugSyscallMinMCP, to print. */
-    CK(seL4_TCB_SetSchedParams(tcb, seL4_CapInitThreadTCB, 255, 100, sc, seL4_CapNull));
+    CK(seL4_TCB_SetSchedParams(tcb, seL4_CapInitThreadTCB, 255, 100, sc, fault_ep));
     regs.rip = (unsigned long)fn;
     regs.rsp = (unsigned long)(stacks[idx] + sizeof(stacks[idx]) - 8);
     regs.rdi = arg;
@@ -509,7 +511,7 @@ static void attack(unsigned long *seed, int who, unsigned long mask)
         (void)seL4_SchedContext_Consumed(gp->sc);
         break;
     case 10:
-        /* An unmap invalidates the EPT on every core that ran a VM. */
+        /* An unmap invalidates the EPT on every core that ran a VM on it. */
         CK(seL4_X86_Page_Unmap(gp->extra));
         map_guest_page(gp, gp->extra, 0x7000);
         break;
@@ -600,6 +602,60 @@ static void attacker(unsigned long seed)
         seL4_Yield();
 }
 
+/*
+ * SYSENTER from user level.  seL4 is entered with SYSCALL and leaves
+ * IA32_SYSENTER_CS 0, so this is a #GP on an Intel CPU (and a #UD in long
+ * mode on an AMD one).  Every VM exit loads the SYSENTER MSRs from the VMCS
+ * host state, where seL4 once had the entry point of a kernel built for
+ * SYSENTER: a thread on a core that had run a VM then entered the kernel
+ * here, as for the system call in RAX, and came back at RDX.
+ */
+extern char sysenter_insn[];
+static volatile int sysenter_returned;
+
+static void sysenter_thread(unsigned long unused)
+{
+    (void)unused;
+    __asm__ volatile("lea 1f(%%rip), %%rdx\n"
+                     "mov %%rsp, %%rcx\n"
+                     ".global sysenter_insn\n"
+                     "sysenter_insn:\n"
+                     "sysenter\n"
+                     "1:\n"
+                     :: "a"((long)seL4_SysYield) : "rcx", "rdx", "r11", "memory", "cc");
+    sysenter_returned = 1;
+    for (;;)
+        __asm__ volatile("ud2");
+}
+
+/* The SYSENTER of a thread on the core must be the fault it is on a core
+ * that has run no VM. */
+static void check_sysenter(int core)
+{
+    seL4_CPtr ep = retype(seL4_EndpointObject, 0);
+    seL4_CPtr tcb = retype(seL4_TCBObject, 0);
+    seL4_CPtr sc = retype(seL4_SchedContextObject, 10);
+    seL4_CPtr frame = retype(seL4_X86_4K, 0);
+    seL4_MessageInfo_t tag;
+    seL4_Word number, ip;
+
+    start_thread(tcb, sc, frame, map_root(frame), core, sysenter_thread, 0, 4, ep);
+    tag = seL4_Wait(ep, 0);
+    number = seL4_GetMR(seL4_UserException_Number);
+    ip = seL4_GetMR(seL4_UserException_FaultIP);
+    if (sysenter_returned || seL4_MessageInfo_get_label(tag) != seL4_Fault_UserException ||
+        ip != (seL4_Word)sysenter_insn || (number != 13 && number != 6)) {
+        lock_print();
+        say_("SYSENTER entered the kernel on core", core);
+        say_("  returned", sysenter_returned);
+        say_("  fault", seL4_MessageInfo_get_label(tag));
+        say_("  exception", number);
+        say_("  at", ip);
+        fail();
+    }
+    CK(seL4_TCB_Suspend(tcb));
+}
+
 static void delete(seL4_CPtr cap)
 {
     unsigned long seed = cap;
@@ -655,14 +711,15 @@ void vcpustress_main(seL4_BootInfo *bootinfo)
         make_guest(&g[i], i + 1);
     for (int i = 0; i < 2; i++) {
         start_thread(g[i].tcb, g[i].sc, g[i].ipcframe, g[i].ipcbuf, g[i].core, runner,
-                     (unsigned long)&g[i], i);
+                     (unsigned long)&g[i], i, seL4_CapNull);
         CK(seL4_TCB_BindNotification(g[i].tcb, g[i].ntfn));
     }
     atcb = retype(seL4_TCBObject, 0);
     asc = retype(seL4_SchedContextObject, 10);
     aframe = retype(seL4_X86_4K, 0);
     attacker_ipcbuf = map_root(aframe);
-    start_thread(atcb, asc, aframe, attacker_ipcbuf, CORE(3), attacker, 0x1234567887654321ul, 2);
+    start_thread(atcb, asc, aframe, attacker_ipcbuf, CORE(3), attacker, 0x1234567887654321ul, 2,
+                 seL4_CapNull);
 #ifdef ONECORE
     CK(seL4_TCB_SetPriority(seL4_CapInitThreadTCB, seL4_CapInitThreadTCB, 100));
 #endif
@@ -714,6 +771,10 @@ void vcpustress_main(seL4_BootInfo *bootinfo)
     attack_stop = 1;
     while (!attack_stopped)
         seL4_Yield();
+    /* The guests ran on cores 1 and 2 (ONECORE: on core 0). */
+    tolerate = 0;
+    check_sysenter(CORE(1));
+    check_sysenter(CORE(2));
     puts_("vcpustress: done\n");
     for (;;)
         seL4_Yield();

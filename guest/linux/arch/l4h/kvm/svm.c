@@ -768,12 +768,12 @@ static int l4h_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr)
 
 /*
  * As in vmx.c: flush_tlb_all follows TDP changes, and seL4 gives every VCPU
- * on every core that has run one a new ASID when it removes a nested page
- * table leaf or table (patch 0040), before ept.c returns; adding one needs
- * nothing.  The other flushes are of what the guest's own paging produced
- * (after CR4 or PCID changes too): seL4_X86_VCPU_FlushTLB gives the VCPU a
- * new ASID before it next runs.  A VCPU that moves to another core gets a
- * new ASID there, so no flush done elsewhere is missed.
+ * on every core that has run one on the nested page table a new ASID when it
+ * removes a leaf or table of it (patch 0040), before ept.c returns; adding
+ * one needs nothing.  The other flushes are of what the guest's own paging
+ * produced (after CR4 or PCID changes too): seL4_X86_VCPU_FlushTLB gives the
+ * VCPU a new ASID before it next runs.  A VCPU that moves to another core
+ * gets a new ASID there, so no flush done elsewhere is missed.
  */
 static void l4h_flush_tlb_noop(struct kvm_vcpu *vcpu)
 {
