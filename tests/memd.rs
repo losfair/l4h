@@ -9,6 +9,8 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard};
 
+#[path = "../host/l4h-memd/src/bucket.rs"]
+mod bucket;
 #[path = "../host/l4h-memd/src/exchange.rs"]
 mod exchange;
 #[path = "../host/l4h-memd/src/mem.rs"]
@@ -33,11 +35,14 @@ struct Kernel {
     caps: BTreeMap<u64, (usize, usize)>,
     mrs: [u64; 1 + 2 * XCHG_SLOTS],
     calls: usize,
+    /// A slot another thread of the client fills again as soon as it is
+    /// emptied.
+    refill: Option<u64>,
 }
 
 thread_local! {
     static KERNEL: RefCell<Kernel> = RefCell::new(Kernel {
-        caps: BTreeMap::new(), mrs: [0; 1 + 2 * XCHG_SLOTS], calls: 0,
+        caps: BTreeMap::new(), mrs: [0; 1 + 2 * XCHG_SLOTS], calls: 0, refill: None,
     });
 }
 
@@ -112,20 +117,32 @@ pub struct AbsoluteCPtr(u64);
 
 impl AbsoluteCPtr {
     pub fn delete(&self) -> Result<(), ()> {
-        invoke(|k| { k.caps.remove(&self.0); });
+        invoke(|k| {
+            k.caps.remove(&self.0);
+            if k.refill == Some(self.0) {
+                k.caps.insert(self.0, (0, 0));
+            }
+        });
         Ok(())
     }
+    // Like seL4, a full destination fails and leaves the source as it was.
     pub fn move_(&self, from: &Self) -> Result<(), ()> {
         invoke(|k| {
+            if k.caps.contains_key(&self.0) {
+                return Err(());
+            }
             let cap = k.caps.remove(&from.0).ok_or(())?;
-            assert!(k.caps.insert(self.0, cap).is_none());
+            k.caps.insert(self.0, cap);
             Ok(())
         })
     }
     pub fn copy(&self, from: &Self, _: CapRights) -> Result<(), ()> {
         invoke(|k| {
+            if k.caps.contains_key(&self.0) {
+                return Err(());
+            }
             let cap = *k.caps.get(&from.0).ok_or(())?;
-            assert!(k.caps.insert(self.0, cap).is_none());
+            k.caps.insert(self.0, cap);
             Ok(())
         })
     }
@@ -149,6 +166,9 @@ pub mod host {
         pub const TABLE_VA: usize = 0x5100_0000_0000;
         pub const UNIT_BYTES: usize = 24;
         pub const XCHG_SLOTS: usize = 32;
+        pub const HP_SHARE: u64 = 125;
+        pub const HP_BURST_US: u64 = 16_000;
+        pub const HP_CALL_US: u64 = 1_000;
     }
 }
 
@@ -185,7 +205,7 @@ impl Fixture {
         // PROT_READ | PROT_WRITE; MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE.
         let p = unsafe { mmap(TABLE_VA as *mut u8, 4096, 3, 0x100022, -1, 0) };
         assert_eq!(p as usize, TABLE_VA);
-        kernel(|k| { k.caps.clear(); k.calls = 0; k.mrs.fill(0); });
+        kernel(|k| { k.caps.clear(); k.calls = 0; k.mrs.fill(0); k.refill = None; });
         let mut f = Self { d: Memd { mem: Mem::new(32) }, next_slot: 10_000, _table: guard };
         // Boot handover from root: the table has no state or order for
         // this 8 MiB block yet. Root must still be allowed to return it.
@@ -285,4 +305,72 @@ fn root_can_return_a_grant_after_boot_handover() {
     assert_eq!(f.d.free(Client::Root, &batch(&[(root, BLOCK_BITS + 1)])), 0);
     assert_eq!(f.d.mem.free_bytes(), 8 << 20);
     assert_eq!(f.grant(Client::Root, 2).0, 8);
+}
+
+#[test]
+fn a_slot_root_left_full_fails_alloc_and_keeps_the_blocks() {
+    let mut f = Fixture::new();
+    kernel(|k| { k.caps.insert(xchg(Client::Root, 1).0, (0, 0)); });
+    assert_eq!(f.d.alloc(Client::Root, BLOCK_BITS, 2).err(), Some(EINVAL));
+    // The first grant came back; the slot root left full is as it was.
+    assert!(!kernel(|k| k.caps.contains_key(&xchg(Client::Root, 0).0)));
+    assert_eq!(kernel(|k| k.caps.get(&xchg(Client::Root, 1).0).copied()), Some((0, 0)));
+    assert_eq!(f.d.mem.free_bytes(), 8 << 20);
+    assert_eq!(f.grant(Client::Root, 2).0, 8);
+}
+
+#[test]
+fn a_slot_vmmgr_fills_again_fails_alloc_and_keeps_the_blocks() {
+    let mut f = Fixture::new();
+    kernel(|k| k.refill = Some(xchg(Client::Vmmgr, 2).0));
+    assert_eq!(f.d.alloc(Client::Vmmgr, BLOCK_BITS, 3).err(), Some(EINVAL));
+    // The copies given are revoked, and every block is free.
+    for n in 0..2 {
+        assert!(!kernel(|k| k.caps.contains_key(&xchg(Client::Vmmgr, n).0)));
+    }
+    assert_eq!(f.d.mem.free_bytes(), 8 << 20);
+    kernel(|k| k.refill = None);
+    assert_eq!(f.grant(Client::Vmmgr, 2).0, 8);
+}
+
+#[test]
+fn hotplug_bucket_bounds_calls_and_time() {
+    use bucket::Bucket;
+    let mut b = Bucket::full(0);
+    // A burst of 16 quick calls, then 8 a second.
+    for _ in 0..16 {
+        assert!(b.admit(0).is_some());
+        b.charge(10);
+    }
+    assert_eq!(b.admit(0), None);
+    assert_eq!(b.admit(124_999), None);
+    assert_eq!(b.admit(125_000), Some(1_000));
+    b.charge(0);
+    let mut n = 0;
+    for t in (125_000..=1_125_000).step_by(1_000) {
+        if b.admit(t).is_some() {
+            b.charge(1);
+            n += 1;
+        }
+    }
+    assert_eq!(n, 8);
+    // A call that took 100 ms is paid for by 12.5 s without calls.
+    let mut b = Bucket::full(0);
+    assert_eq!(b.admit(0), Some(16_000));
+    b.charge(100_000);
+    let paid = 125 * (100_000 - 16_000 + 1_000);
+    assert_eq!(b.admit(paid - 1), None);
+    assert_eq!(b.admit(paid), Some(1_000));
+    // Polling often loses no refill, and time far apart or going back
+    // neither wraps nor overfills.
+    let mut b = Bucket::full(0);
+    b.charge(16_000);
+    for t in 0..125_000 {
+        assert_eq!(b.admit(t), None);
+    }
+    assert_eq!(b.admit(125_000), Some(1_000));
+    assert_eq!(b.admit(u64::MAX), Some(16_000));
+    assert_eq!(b.admit(0), Some(16_000));
+    b.charge(u64::MAX);
+    assert_eq!(b.admit(u64::MAX), None);
 }

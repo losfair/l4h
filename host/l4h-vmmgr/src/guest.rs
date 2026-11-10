@@ -408,19 +408,24 @@ impl Guest {
     /// Fill block `b` with frames: a level-2 RAM CNode (which the guest
     /// finds in its level-1 CNode) holding 512 frames retyped from the
     /// block's Untyped, mapped in the direct map.  The block becomes a
-    /// boot block: the guest gets no Untyped for it.
-    fn block_frames(&mut self, alloc: &mut Alloc, b: usize) {
+    /// boot block: the guest gets no Untyped for it.  False if memd has
+    /// failed.
+    fn block_frames(&mut self, alloc: &mut Alloc, b: usize) -> bool {
         if self.is_filled(b) {
-            return;
+            return true;
         }
+        // A copy of the block's Untyped, which memd revokes at destroy.
+        // First: a failed memd leaves nothing to undo.
+        let ut = alloc.slots.alloc();
+        let Some(paddr) = memd::guest_copy(alloc, self.id, self.memd_block(b), ut) else {
+            alloc.slots.free(ut);
+            return false;
+        };
         let l2 = self.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: abi::RAM_L2_BITS });
         self.ram_l1[b >> abi::RAM_L2_BITS]
             .absolute_cptr_from_bits_with_depth((b & ((1 << abi::RAM_L2_BITS) - 1)) as u64, abi::RAM_L2_BITS)
             .copy(&abs(l2), CapRights::all())
             .expect("level-2 RAM CNode");
-        // A copy of the block's Untyped, which memd revokes at destroy.
-        let ut = alloc.slots.alloc();
-        let paddr = memd::guest_copy(alloc, self.id, self.memd_block(b), ut);
         UtRegion::fresh(self_cap::<cap_type::Untyped>(ut), paddr, abi::BLOCK_SHIFT)
             .retype(&FRAME_BP, BLOCK_FRAMES, Dest { cnode: abs(l2), offset: 0 })
             .expect("RAM frames");
@@ -437,6 +442,7 @@ impl Guest {
             self.ram_frame(gpa).move_(&abs(frame)).expect("move frame back");
         }
         alloc.slots.free(tmp);
+        true
     }
 
     /// Fill shared block `b` with read-only copies of the kernel's frames
@@ -474,7 +480,9 @@ impl Guest {
                 return false;
             }
             for b in blocks {
-                self.block_frames(alloc, b);
+                if !self.block_frames(alloc, b) {
+                    return false;
+                }
             }
         }
         true
@@ -753,8 +761,8 @@ impl Guest {
         let Some(boot) = self.boot_prefix(kernel_end, initrd) else {
             return false;
         };
-        for b in 0..boot {
-            self.block_frames(alloc, b);
+        if !(0..boot).all(|b| self.block_frames(alloc, b)) {
+            return false;
         }
         // memd gives its blocks from the first after the boot blocks on, at
         // their guest index: past the shared blocks, which are all in the
@@ -1012,8 +1020,6 @@ pub fn create(
     let pool_pages = cfg.io_pool / PAGE;
     let estimate = (32 << abi::ROOT_CNODE_BITS) * 4
         + n_l1 * (32 << abi::RAM_L2_BITS)
-        + (32 << block_radix)
-        + (32 << abi::HP_L1_BITS)
         + (16 + shared.count_ones() as usize) * ((32 << abi::RAM_L2_BITS) + PAGE)
         + 32 * pool_pages
         + (cfg.io_pool / 512 + 2 * PAGE)
@@ -1023,7 +1029,8 @@ pub fn create(
         + abi::BOOTINFO_SIZE as usize
         + if cfg.dom0 { abi::CTL_LOAD_MAX as usize } else { 0 }
         + vmm::arena_bytes(cfg.io_pool, cfg.vcpus, MAX_GUEST_DEVICES);
-    if alloc.free_bytes() < estimate + owned * BLOCK {
+    // memd makes the block and hotplug CNodes, of a block it may need.
+    if alloc.free_bytes() < estimate + (owned + 1) * BLOCK {
         return Err(None);
     }
     let mut arena = alloc.arena(estimate).ok_or(None)?;
@@ -1101,23 +1108,29 @@ pub fn create(
     // frames (boot blocks), and the guest gets the others as Untypeds.
     // The shared blocks of the image are filled now.
     // Level-1 RAM CNodes (one per GiB, resolving 9 bits) for the guest's
-    // level-2 RAM CNodes, and the block CNode for the Untyped copies.
+    // level-2 RAM CNodes.
     let guard0 = CNodeCapData::new(0, 0);
     for n in 0..n_l1 {
         let cn = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: abi::RAM_L2_BITS });
         g.give_cnode(abi::SLOT_RAM_L1_BASE + n, cn, guard0.clone());
         g.ram_l1.must_push(cn);
     }
-    let block_cn = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: block_radix });
-    let guard = CNodeCapData::new(0, abi::L2_INDEX_BITS - block_radix);
-    g.give_cnode(abi::SLOT_BLOCKS, block_cn, guard);
-    // The hotplug CNode: the guest makes a level-2 CNode in slot m before
-    // plugging hotplug block m, and memd copies its blocks into it.
-    let hp_cn = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: abi::HP_L1_BITS });
-    g.give_cnode(abi::SLOT_HP, hp_cn, CNodeCapData::new(0, abi::HP_L1_GUARD));
-    if !memd::guest_create(alloc, id, owned, block_cn, block_radix, hp_cn, hp_count) {
+    // The block CNode for the Untyped copies, and the hotplug CNode: the
+    // guest makes a level-2 CNode in slot m before plugging hotplug block
+    // m, and memd copies its blocks into it.  memd makes both, so that it
+    // never invokes a capability of ours as a CNode.
+    let cnodes = [alloc.slots.alloc(), alloc.slots.alloc()];
+    if !memd::guest_create(alloc, id, owned, block_radix, hp_count, cnodes) {
+        // What memd gave, if anything: its guest_destroy revokes it too.
+        for s in cnodes {
+            let _ = abs(self_cap::<cap_type::Null>(s)).delete();
+            alloc.slots.free(s);
+        }
         return Err(Some(g));
     }
+    let [block_cn, hp_cn] = cnodes.map(|s| self_cap::<cap_type::CNode>(s));
+    g.give_cnode(abi::SLOT_BLOCKS, block_cn, CNodeCapData::new(0, abi::L2_INDEX_BITS - block_radix));
+    g.give_cnode(abi::SLOT_HP, hp_cn, CNodeCapData::new(0, abi::HP_L1_GUARD));
     g.nr_blocks = nr_blocks;
     for b in 0..nr_blocks.min(64) {
         if g.is_shared(b) {

@@ -67,7 +67,7 @@ impl MemdLink {
     }
 
     /// Return untouched grants: (capability, physical address, size bits).
-    /// Their local slots are left empty.
+    /// Their local slots are left empty.  A failed memd keeps them.
     pub fn free(&self, blocks: &[(cap::Untyped, usize, usize)]) {
         assert!(blocks.len() <= memd::XCHG_SLOTS);
         let mut given = ArrayVec::new();
@@ -75,7 +75,9 @@ impl MemdLink {
             self.area(memd::call::caps::free::BLOCKS.passed_in(i, l4h_ipc::kind_of(&ut))).move_(&self.local_cnode.absolute_cptr(ut)).expect("memd: return block");
             given.must_push((paddr, bits));
         }
-        Client::free(self, given).expect("memd: free");
+        if Client::free(self, given).is_err() {
+            log!("l4h-task: memd did not take back {} blocks", blocks.len());
+        }
     }
 }
 

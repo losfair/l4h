@@ -400,6 +400,18 @@ fn xchg(h: &Host, i: usize) -> sel4::AbsoluteCPtr {
     s
 }
 
+/// Copy `src` into slot `i` of vmmgr's exchange area.  A slot vmmgr fills
+/// again between root's emptying and filling it (from another thread)
+/// fails the call, not root.
+fn give(h: &Host, i: usize, src: &sel4::AbsoluteCPtr) -> Result<(), Errno> {
+    xchg(h, i).copy(src, CapRights::all()).map_err(|_| ctl::EINVAL)
+}
+
+/// `give`, moving `src`.
+fn give_moved(h: &Host, i: usize, src: &sel4::AbsoluteCPtr) -> Result<(), Errno> {
+    xchg(h, i).move_(src).map_err(|_| ctl::EINVAL)
+}
+
 /// The calls on root's endpoint (l4h_host::root::call), trustd's and
 /// vmmgr's: `serve` lets each make only its own.
 pub struct Calls<'a>(pub &'a mut Host);
@@ -529,12 +541,13 @@ fn result(h: &mut Host, token: usize) -> Result<Vals, Errno> {
         OpResult::Vals(vals) => Ok(vals),
         OpResult::Disk { chan, kick } => {
             use root_call::caps::disk_attach::{CHANNEL, KICK};
-            for (i, f) in chan.iter().enumerate() {
-                xchg(h, CHANNEL.passed_out(i, kind_of(f))).copy(&abs_of(*f), CapRights::all()).expect("vmmgr channel frame");
-            }
-            xchg(h, KICK.passed_out(0, kind_of(&kick))).move_(&abs_of(kick)).expect("vmmgr blkd kick");
+            let given = chan.iter().enumerate().try_for_each(|(i, f)| give(h, CHANNEL.passed_out(i, kind_of(f)), &abs_of(*f)))
+                .and_then(|()| give_moved(h, KICK.passed_out(0, kind_of(&kick)), &abs_of(kick)));
+            // The kick, if vmmgr did not get it.  The disk stays the
+            // guest's until GUEST_DEL.
+            let _ = abs_of(kick).delete();
             h.alloc.slots.free(kick.bits() as Slot);
-            Ok(Vals::new())
+            given.map(|()| Vals::new())
         }
     }
 }
@@ -602,6 +615,13 @@ fn guest_new(h: &mut Host, id: usize, size: usize, gpa: usize, dom0: bool) -> Re
     if h.guests[id].is_some() || !size.is_power_of_two() || !(IO_POOL_MIN..=IO_POOL_MAX).contains(&size) || gpa % PAGE != 0 {
         return Err(ctl::EINVAL);
     }
+    // Every guest's deletion finds a zombie (guest_del): one whose drivers
+    // have not let go of it keeps a guest's place.  dom0 must come back
+    // all the same; should it take the last place, a deletion that then
+    // finds no zombie leaves its memory to the drivers.
+    if !dom0 && h.guests.iter().flatten().count() + h.zombies.iter().flatten().count() >= MAX_GUESTS {
+        return Err(ctl::EBUSY);
+    }
     let bits = size.trailing_zeros() as usize;
     let radix = bits - 12;
     if !h.can_afford(size + (32 << radix) + PAGE, 0, 4) {
@@ -625,13 +645,30 @@ fn guest_new(h: &mut Host, id: usize, size: usize, gpa: usize, dom0: bool) -> Re
         let frames = arena.object_cap::<cap_type::CNode>(&mut h.alloc, ObjectBlueprint::CNode { size_bits: radix });
         region.retype(&FRAME_BP, size / PAGE, Dest { cnode: abs_of(frames), offset: 0 }).expect("I/O pool frames");
         use root_call::caps::guest_new::{ATTEST_KICK, ATTEST_PAGE, POOL_FRAMES, VMM_NTFN};
-        xchg(h, POOL_FRAMES.passed_out(0, kind_of(&frames))).copy(&abs_of(frames), CapRights::all()).expect("vmmgr pool frames");
-        xchg(h, VMM_NTFN.passed_out(0, kind_of(&vmm_ntfn))).copy(&abs_of(vmm_ntfn), CapRights::all()).expect("vmmgr VMM notification");
-        let (page, kick) = (xchg(h, ATTEST_PAGE.passed_out(0, Cap::Granule)), xchg(h, ATTEST_KICK.passed_out(0, Cap::Notification)));
+        // trustd fills root's slots, which then go with the others.
+        let (page_slot, kick_slot) = (h.alloc.slots.alloc(), h.alloc.slots.alloc());
+        let (page, kick) = (abs_of(root_cap::<cap_type::Null>(page_slot)), abs_of(root_cap::<cap_type::Null>(kick_slot)));
         let attest = match &h.trustd {
             Some(t) => t.give(id, &mut h.wins.a, &page, &kick),
             None => false,
         };
+        let (page_out, kick_out) = (ATTEST_PAGE.passed_out(0, Cap::Granule), ATTEST_KICK.passed_out(0, Cap::Notification));
+        let given = give(h, POOL_FRAMES.passed_out(0, kind_of(&frames)), &abs_of(frames))
+            .and_then(|()| give(h, VMM_NTFN.passed_out(0, kind_of(&vmm_ntfn)), &abs_of(vmm_ntfn)))
+            .and_then(|()| if attest {
+                give_moved(h, page_out, &page).and_then(|()| give_moved(h, kick_out, &kick))
+            } else {
+                let _ = (xchg(h, page_out), xchg(h, kick_out));
+                Ok(())
+            });
+        let _ = (page.delete(), kick.delete());
+        h.alloc.slots.free(page_slot);
+        h.alloc.slots.free(kick_slot);
+        if let Err(e) = given {
+            // Revoking the pool and arena deletes what vmmgr got of them.
+            h.alloc.reclaim(arena);
+            return Err(e);
+        }
         let instance = h.next_instance;
         h.next_instance = instance.checked_add(1).expect("guest instance exhausted");
         h.guests[id] = Some(RootGuest {
@@ -710,6 +747,7 @@ fn guest_del(h: &mut Host, id: usize) -> Result<u64, Errno> {
             h.alloc.slots.reown(id, zombie_owner(z));
         }
         None => {
+            // Only after dom0 took the last place (guest_new).
             log!("l4h-root: guest {}: its memory stays with the drivers for good: too many guests' does", id);
             h.alloc.slots.reown(id, LOST_OWNER);
         }
@@ -780,10 +818,13 @@ fn nic_add(h: &mut Host, id: usize, dev: usize, switch: u32, mac: u64, lock: boo
         let (chan, kick) = h.netd.add_port(g, p, switch, mac, lock, isolated, memory, &mut h.alloc);
         g.ports.must_push(p);
         use root_call::caps::nic_add::{KICK, PORT_FRAMES};
-        xchg(h, PORT_FRAMES.passed_out(0, kind_of(&chan))).copy(&abs_of(chan), CapRights::all()).expect("vmmgr port frames");
-        xchg(h, KICK.passed_out(0, kind_of(&kick))).move_(&abs_of(kick)).expect("vmmgr port kick");
+        let given = give(h, PORT_FRAMES.passed_out(0, kind_of(&chan)), &abs_of(chan))
+            .and_then(|()| give_moved(h, KICK.passed_out(0, kind_of(&kick)), &abs_of(kick)));
+        // The kick, if vmmgr did not get it.  The port stays the guest's
+        // until GUEST_DEL.
+        let _ = abs_of(kick).delete();
         h.alloc.slots.free(kick.bits() as Slot);
-        Ok(mac)
+        given.map(|()| mac)
     })
 }
 
@@ -800,10 +841,13 @@ fn usb_attach(h: &mut Host, id: usize, dev: usize, ctrl: usize) -> Result<u64, E
         let n = g.usbs.len();
         let att = crate::usb::attach(h, ctrl, g)?;
         use root_call::caps::usb_attach::{KICK, QUEUE_FRAMES};
-        xchg(h, QUEUE_FRAMES.passed_out(0, kind_of(&att.frames))).copy(&abs_of(att.frames), CapRights::all()).expect("vmmgr USB queue frames");
-        xchg(h, KICK.passed_out(0, kind_of(&att.kick))).move_(&abs_of(att.kick)).expect("vmmgr usbd kick");
+        let given = give(h, QUEUE_FRAMES.passed_out(0, kind_of(&att.frames)), &abs_of(att.frames))
+            .and_then(|()| give_moved(h, KICK.passed_out(0, kind_of(&att.kick)), &abs_of(att.kick)));
+        // The kick, if vmmgr did not get it.  The controller stays the
+        // guest's until GUEST_DEL.
+        let _ = abs_of(att.kick).delete();
         crate::usb::free_slot(h, att.kick);
-        Ok(n as u64)
+        given.map(|()| n as u64)
     })
 }
 
