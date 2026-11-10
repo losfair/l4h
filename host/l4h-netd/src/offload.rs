@@ -9,6 +9,11 @@ pub const GSO_NONE: u8 = 0;
 pub const GSO_TCPV4: u8 = 1;
 pub const GSO_TCPV6: u8 = 4;
 pub const GSO_ECN: u8 = 0x80;
+/// The smallest segment size we segment a GSO frame into (Linux's
+/// `TCP_MIN_MSS`): a guest that advertised a tiny `gso_size` would make
+/// `segment` cut one frame into tens of thousands of packets and keep
+/// netd's single thread busy for every other port (DESIGN.md §9.3).
+pub const MIN_MSS: usize = 88;
 
 fn get16(h: &[u8; HDR_SIZE], off: usize) -> usize {
     u16::from_le_bytes([h[off], h[off + 1]]) as usize
@@ -85,7 +90,7 @@ pub fn sanitize(hdr: &mut [u8; HDR_SIZE], frame: &[u8]) -> bool {
         t @ (GSO_TCPV4 | GSO_TCPV6) => {
             // The receiver trusts these: they must describe the frame.
             let Some(f) = parse_tcp(frame) else { return false };
-            if f.v6 != (t == GSO_TCPV6) || hdr[0] & F_NEEDS_CSUM == 0 || get16(hdr, 4) == 0 {
+            if f.v6 != (t == GSO_TCPV6) || hdr[0] & F_NEEDS_CSUM == 0 || get16(hdr, 4) < MIN_MSS {
                 return false;
             }
             if get16(hdr, 6) != f.tcp || get16(hdr, 8) != 16 {

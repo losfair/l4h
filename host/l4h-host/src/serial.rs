@@ -187,7 +187,7 @@ impl Ring {
             let mut buf = Buf::<WORDS>::new();
             buf.bytes_mut()[..record.len()].copy_from_slice(record);
             self.ring.commit(seq, ticks, meta | if more { MORE } else { 0 }, record.len(), &buf);
-            seq += 1;
+            seq = seq.wrapping_add(1);
         });
     }
 

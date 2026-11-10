@@ -557,7 +557,11 @@ pub fn hw(h: &mut Host, op: u64, addr: usize, off: usize, width: usize, value: u
             let (bus, dev, func) = ((addr >> 8) as u8, (addr >> 3 & 0x1f) as u8, (addr & 7) as u8);
             let driven = h.ctrls.iter().map(|c| &c.pci).chain(h.netd.nics.iter().map(|n| &n.pci))
                 .any(|d| (d.bus, d.dev, d.func) == (bus, dev, func));
-            if addr >> 16 != 0 || off + width > 256 || off % width != 0 || !matches!(width, 1 | 2 | 4) || (write && driven) {
+            // Width first: the `off % width` and `off + width` below are
+            // undefined or overflow for a width (or offset) trustd chose
+            // badly, and a panic here is the whole host.
+            if !matches!(width, 1 | 2 | 4) || addr >> 16 != 0 || off.checked_add(width).is_none_or(|e| e > 256)
+                || off % width != 0 || (write && driven) {
                 None
             } else {
                 let (word, shift) = (off as u8 & !3, (off % 4) * 8);
@@ -587,7 +591,7 @@ pub fn hw(_h: &mut Host, _op: u64, _addr: usize, _off: usize, _width: usize, _va
 /// legacy NICs).
 #[cfg(target_arch = "x86_64")]
 fn io(alloc: &mut Alloc, port: usize, width: usize, write: bool, value: u64) -> Option<u64> {
-    if !matches!(width, 1 | 2 | 4) || port + width > 0x1_0000 {
+    if !matches!(width, 1 | 2 | 4) || port.checked_add(width).is_none_or(|e| e > 0x1_0000) {
         return None;
     }
     let cap = crate::pci::io_ports(alloc, port as u16, width as u16)?;
@@ -678,7 +682,9 @@ pub fn channel_message(h: &mut Host, peer: u32, ty: u32, msg: &[u8]) {
         core::ptr::copy_nonoverlapping(msg.as_ptr(), (va + trust::RELAY_SLOT_HEADER) as *mut u8, msg.len());
     }
     slot.len.store(msg.len() as u32, Ordering::Relaxed);
-    slot.seq.store((seq | 1) + 1, Ordering::Release);
+    // `seq` comes from a page the peer's trustd maps writable: never let its
+    // value overflow root's own increment.
+    slot.seq.store((seq | 1).wrapping_add(1), Ordering::Release);
     relay.signal();
 }
 

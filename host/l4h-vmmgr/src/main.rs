@@ -270,7 +270,11 @@ impl Vmmgr {
         if !self.can_afford(1 << 20, 0, 0) { return Err(ctl::ENOMEM); }
         let instance = self.guest(id).ok_or(ctl::ENOENT)?.instance;
         self.with_guest(id, |h, g| {
-            if g.state != State::Created || g.root_pending {
+            // Like every other attach path (attach_usb, create_nic, ...):
+            // refuse once the VMM is spawned.  Otherwise the deferred answer
+            // can land after VmmReady has started the guest, when add_disk
+            // can no longer add a device.
+            if g.state != State::Created || g.vmm.is_some() || g.root_pending {
                 return Err(ctl::EBUSY);
             }
             if g.devices.len() >= MAX_GUEST_DEVICES {
@@ -281,7 +285,7 @@ impl Vmmgr {
             let d = g.devices.len();
             match root::disk_attach(&mut h.alloc, id, d, disk, flags, lba_start, lba_count, extents)? {
                 Later::Now(backend) => {
-                    add_disk(h, g, backend);
+                    add_disk(h, g, backend)?;
                     Ok(Later::Now(()))
                 }
                 Later::Token(t) => {
@@ -303,8 +307,7 @@ impl Vmmgr {
         self.with_guest(id, |h, g| {
             g.root_pending = false;
             let backend = root::disk_attach_result(&mut h.alloc, token)?;
-            add_disk(h, g, backend);
-            Ok(())
+            add_disk(h, g, backend)
         })
         .ok_or(ctl::ENOENT)?
     }
@@ -651,12 +654,13 @@ fn dom0_finish(h: &mut Vmmgr, id: usize) {
 }
 
 /// Add the disk device of `backend` to `g`, which has room for it
-/// (attach_disk checked, and nothing was added since).
-fn add_disk(h: &mut Vmmgr, g: &mut Guest, backend: vmm::Backend) {
-    let d = g.devices.len();
-    let added = g.add_device(&mut h.alloc, guest::DevKind::Virtio(2));
-    assert_eq!(added, Some(d), "guest device room checked");
+/// (attach_disk checked, and, since attach_disk refuses once the VMM is
+/// spawned, the guest is still Created here).  Fails rather than panics if
+/// a device can no longer be added.
+fn add_disk(h: &mut Vmmgr, g: &mut Guest, backend: vmm::Backend) -> Result<(), Errno> {
+    let d = g.add_device(&mut h.alloc, guest::DevKind::Virtio(2)).ok_or(ctl::ENOSPC)?;
     g.backends.must_push((d, backend));
+    Ok(())
 }
 
 /// dom0 rebooted or crashed: replace it.  Other guests keep running; the
@@ -795,6 +799,11 @@ impl call::Server for VmmCalls<'_> {
     fn vmm_ready(&mut self, from: proto::Sender) -> Result<(), Errno> {
         let proto::Sender::Vmm(id) = from else { return Err(EINVAL) };
         let g = self.0.guests.get_mut(id).and_then(|g| g.as_mut()).ok_or(l4h_host::wire::NO_REPLY)?;
+        // Only a freshly built guest starts: a second VmmReady, or one from
+        // the VMM of a running or stopped guest, must not reset vCPU 0.
+        if g.state != State::Created {
+            return Err(EINVAL);
+        }
         g.start();
         Ok(())
     }

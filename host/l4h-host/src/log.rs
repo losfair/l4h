@@ -50,10 +50,15 @@ impl Ring {
     /// that snapshot even while new messages arrive. Cursor 0 starts at
     /// boot; lost counts overwritten, dropped and not-yet-committed records.
     pub fn read(&self, cursor: u64, end: u64, out: &mut [u8]) -> Option<Read> {
+        // One snapshot of head: `oldest` must come from the same value, or
+        // a writer flipping head between a huge and a small value could put
+        // `next` far below `end` and spin the loop below (a reader bounds it
+        // to the ring's own CAPACITY of records).
         let head = self.ring.head();
         let end = if end == 0 { head } else { end.min(head) };
         if cursor > end { return None; }
-        let mut next = cursor.max(self.ring.oldest()).min(end);
+        let oldest = head.saturating_sub(CAPACITY as u64);
+        let mut next = cursor.max(oldest).min(end);
         let mut lost = next - cursor;
         let mut len = 0;
         while next < end {

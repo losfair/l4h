@@ -299,7 +299,8 @@ impl Memd {
 
     fn guest_give(&mut self, g: usize, first: usize, skip: usize) -> u64 {
         let Some(r) = self.guest(g) else { return EINVAL };
-        if r.blocks.len + skip > 1 << r.radix {
+        // `skip` is straight off the wire: a wide value must not overflow.
+        if r.blocks.len.checked_add(skip).is_none_or(|end| end > 1 << r.radix) {
             return EINVAL;
         }
         let bcn = cap::<cap_type::CNode>(memd::SLOT_GUEST_BCN + g as u64);
