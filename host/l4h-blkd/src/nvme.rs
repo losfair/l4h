@@ -151,6 +151,10 @@ impl Nvme {
         let mut dma = Dma::new(cfg.dma_va as usize, cfg.dma_paddr, cfg.dma_size as usize);
         let cap = regs.r64(REG_CAP);
         let stride = 4usize << ((cap >> 32) & 0xf);
+        // CAP.DSTRD is the device's: its four doorbells must be in BAR 0.
+        if 0x1000 + 4 * stride > cfg.bar0.len as usize {
+            panic!("nvme {:#x}: doorbell stride {} beyond BAR 0", id, stride);
+        }
         let db = |i: usize| Mmio(regs.0 + 0x1000 + i * stride);
 
         // Reset, then set up the admin queues.
@@ -215,9 +219,10 @@ impl Nvme {
         n.admin(Cmd { opcode: ADMIN_IDENTIFY, prp1: n.ident.1, cdw10: 1, ..Default::default() });
         let id_ctrl = Mmio(n.ident.0);
         let mdts = id_ctrl.r8(77);
-        if mdts != 0 {
-            let mpsmin = 1u64 << (12 + ((cap >> 48) & 0xf));
-            n.max_bytes = n.max_bytes.min(mpsmin << mdts);
+        // MDTS (the device's) in units of 2^(12 + CAP.MPSMIN): from 2^64 on, no limit.
+        let mdts_shift = 12 + ((cap >> 48) & 0xf) as u32 + mdts as u32;
+        if mdts != 0 && mdts_shift < 64 {
+            n.max_bytes = n.max_bytes.min(1 << mdts_shift);
         }
         n.flush = id_ctrl.r8(525) & 1 != 0;
         // Identify namespace 1: size and LBA format.
@@ -318,7 +323,7 @@ impl Driver for Nvme {
 
     fn info(&self, _unit: usize) -> DevInfo {
         DevInfo {
-            capacity: self.nsze << (self.lba_shift - 9),
+            capacity: self.nsze.min(u64::MAX >> 3) << (self.lba_shift - 9),
             block_size: 1 << self.lba_shift,
             read_only: false,
             flush: self.flush,

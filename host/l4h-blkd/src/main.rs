@@ -500,7 +500,10 @@ fn main(info: &'static Info) -> ! {
     // A driver has at most blk::MAX_UNITS units.
     let mut dev = ArrayVec::new();
     for u in 0..drv.units() {
-        let _ = dev.push(drv.info(u));
+        // The device's capacity: sectors from 2^55 on have no byte offset
+        // in a u64 (the drivers' `sector * 512`).
+        let d = drv.info(u);
+        let _ = dev.push(DevInfo { capacity: d.capacity.min(u64::MAX >> 9), ..d });
     }
     for (u, d) in dev.iter().enumerate() {
         l4h_rt::info!("blkd {:#x}: shared controller, unit {}: {} sectors, {}-byte blocks", id, u, d.capacity, d.block_size);

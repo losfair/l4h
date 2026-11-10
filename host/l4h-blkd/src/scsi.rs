@@ -419,7 +419,7 @@ impl VirtioScsi {
         }
         let mut u = Unit {
             lun, target, number,
-            blocks: last + 1,
+            blocks: last.saturating_add(1),
             block_size: block_size as u32,
             max_bytes: (self.max_sectors * 512 / block_size).max(1) * block_size,
             read_only: false,
@@ -559,7 +559,7 @@ impl Driver for VirtioScsi {
     fn info(&self, unit: usize) -> DevInfo {
         let u = &self.units[unit];
         DevInfo {
-            capacity: u.blocks * (u.block_size as u64 / 512),
+            capacity: u.blocks.saturating_mul(u.block_size as u64 / 512),
             block_size: u.block_size,
             read_only: u.read_only,
             flush: u.flush,
