@@ -107,9 +107,10 @@ crate::protocol! {
     /// blkd answers wire::FAILED.  Label 1 is unused: blkd publishes its
     /// units instead (Published).
     pub mod call (from: Sender) {
-        /// Attach what `check` allowed in slot `client`: the channel's
-        /// window (n = 0) or the n extents in staging.  blkd builds the
-        /// client's ExtentTable at extent_va(client).
+        /// Attach what `check` allowed in the slot it gave, `client`: the
+        /// channel's window (n = 0) or the n extents in staging.  blkd
+        /// checks again (Reservations::admits) and builds the client's
+        /// ExtentTable at extent_va(client).
         Add / add = 2 from [Root] (client: usize, unit: usize, dom0: bool, n: usize) -> ();
         /// Drain and forget a client: EBUSY if it did not drain.
         Remove / remove = 3 from [Root] (client: usize) -> ();
@@ -532,19 +533,35 @@ impl<const N: usize> Reservations<N> {
             && (r.window.start, r.window.sectors) == (want.extents[0].start, want.extents[0].sectors))
     }
 
+    /// Whether `want` conflicts with a client or with a reservation it
+    /// cannot claim.
+    fn busy<'a>(&self, active: &impl Fn(usize) -> Option<Hold<'a>>, want: &Hold, dom0: bool) -> bool {
+        let conflicts = |h: &Hold| h.unit == want.unit && !(want.read_only && h.read_only) && overlap(want.extents, h.extents);
+        // A claimed reservation is represented by its client.
+        (0..N).any(|i| match active(i) {
+            Some(a) => conflicts(&a),
+            None => self.hold(i).is_some_and(|r| conflicts(&r) && !self.claimable(i, active, want, dom0)),
+        })
+    }
+
     /// The slot `want` may attach in: EBUSY if it conflicts with a client
     /// or with a reservation it cannot claim, ENOSPC if no slot is free.
     pub fn slot<'a>(&self, active: &impl Fn(usize) -> Option<Hold<'a>>, want: &Hold, dom0: bool) -> Result<usize, Errno> {
-        let conflicts = |h: &Hold| h.unit == want.unit && !(want.read_only && h.read_only) && overlap(want.extents, h.extents);
-        // A claimed reservation is represented by its client.
-        let busy = (0..N).any(|i| match active(i) {
-            Some(a) => conflicts(&a),
-            None => self.hold(i).is_some_and(|r| conflicts(&r) && !self.claimable(i, active, want, dom0)),
-        });
-        if busy { return Err(EBUSY); }
+        if self.busy(active, want, dom0) { return Err(EBUSY); }
         (0..N).find(|&i| self.claimable(i, active, want, dom0))
             .or_else(|| (0..N).find(|&i| active(i).is_none() && self.slots[i].is_none()))
             .ok_or(ENOSPC)
+    }
+
+    /// Whether `want` may attach in slot `i`, which `slot` gave it before
+    /// clients were removed: it conflicts with nothing, and `i` is free or
+    /// a reservation it claims.  Removals since may have freed a lower
+    /// slot, or a reservation `want` could claim, without making `i`
+    /// wrong: another slot holding the same range of a reservation only
+    /// keeps more from others.
+    pub fn admits<'a>(&self, active: &impl Fn(usize) -> Option<Hold<'a>>, want: &Hold, dom0: bool, i: usize) -> bool {
+        i < N && !self.busy(active, want, dom0)
+            && (self.claimable(i, active, want, dom0) || (active(i).is_none() && self.slots[i].is_none()))
     }
 
     /// Keep `r` (a range of dom0's boot plan) from other users.

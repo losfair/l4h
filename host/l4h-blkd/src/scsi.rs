@@ -17,7 +17,7 @@ use l4h_virtio::{
     STATUS_ACK, STATUS_DRIVER, STATUS_DRIVER_OK, STATUS_FAILED, Virtq, legacy, legacy_ring_size,
 };
 
-use crate::{DevInfo, Driver, MAX_PIECES, Seg};
+use crate::{DevInfo, Driver, MAX_PIECES, MAX_REQUEST, Seg};
 
 /// The request queue; 0 and 1 are the control and event queues, unused.
 const REQUEST_QUEUE: u16 = 2;
@@ -27,9 +27,6 @@ const CFG_NUM_QUEUES: usize = 0;
 const MAX_SLOTS: usize = blk::RING_SIZE;
 /// Descriptors of a command: header, data pieces, response.
 const MAX_DESCS: usize = 2 + MAX_PIECES;
-/// Requests up to this size are split into as many commands as the
-/// device's limits need (clients send at most 14 segments of 256 KiB).
-const MAX_REQUEST: u64 = 4 << 20;
 
 // Device configuration.
 const CFG_SEG_MAX: usize = 4;

@@ -2,7 +2,8 @@
 //!
 //! A request becomes one or more NVMe commands: pieces join a command as
 //! long as they fit one PRP list (every piece but the first starts on a
-//! page, every piece but the last ends on one).
+//! page, every piece but the last ends on one).  A request is started only
+//! with a command id for each of its commands, so none fails part way.
 
 use core::sync::atomic::Ordering;
 
@@ -10,7 +11,7 @@ use l4h_rt::host::blk::{self, BlkdConfig};
 use l4h_rt::host::fixed::ArrayVec;
 use l4h_virtio::{dma_fence, Dma, Mmio};
 
-use crate::{DevInfo, Driver, MAX_PIECES, Seg};
+use crate::{DevInfo, Driver, MAX_PIECES, MAX_REQUEST, Seg};
 
 const PAGE: u64 = 4096;
 
@@ -22,9 +23,15 @@ const REG_ASQ: usize = 0x28;
 const REG_ACQ: usize = 0x30;
 
 const ADMIN_DEPTH: u16 = 16;
-const IO_DEPTH: u16 = 256;
+/// I/O queue entries, at most: with an 8 KiB transfer limit a request of
+/// MAX_REQUEST needs 544 commands.
+const IO_DEPTH: u16 = 1024;
+/// Requests in flight.
+const MAX_REQS: usize = 256;
 /// A command's PRP list fits in one page.
 const MAX_CMD_PAGES: usize = 512;
+/// The PRP lists: one slice per command id, sized for the transfer limit.
+const PRP_BYTES: usize = 1 << 20;
 
 const OP_FLUSH: u8 = 0x00;
 const OP_WRITE: u8 = 0x01;
@@ -122,16 +129,21 @@ pub struct Nvme {
     cq: Cq,
     ident: (usize, u64),
     /// Per command id (below the queue depth): the request it belongs to,
-    /// its PRP list page, whether the device has it.
+    /// whether the device has it.  Its PRP list is at `prp` + id * prp_len.
     cmd_req: [u16; IO_DEPTH as usize],
-    prp: [(usize, u64); IO_DEPTH as usize],
     cid_busy: [bool; IO_DEPTH as usize],
     free_cids: ArrayVec<u16, { IO_DEPTH as usize }>,
-    reqs: [Request; IO_DEPTH as usize],
-    free_reqs: ArrayVec<u16, { IO_DEPTH as usize }>,
+    prp: (usize, u64),
+    prp_len: usize,
+    reqs: [Request; MAX_REQS],
+    free_reqs: ArrayVec<u16, MAX_REQS>,
     lba_shift: u32,
     nsze: u64,
     max_bytes: u64,
+    /// Pages a command may span: its PRP list has one entry fewer.
+    cmd_pages: u64,
+    /// Command ids a request of up to MAX_REQUEST bytes needs.
+    max_cmds: usize,
     flush: bool,
 }
 
@@ -183,16 +195,9 @@ impl Nvme {
         let (sq_va, sq_pa) = dma.alloc(64 * depth as usize, 4096);
         let (cq_va, cq_pa) = dma.alloc(16 * depth as usize, 4096);
         let ident = dma.alloc(4096, 4096);
-        let mut prp = [(0, 0); IO_DEPTH as usize];
-        for p in &mut prp[..depth as usize] {
-            *p = dma.alloc(4096, 4096);
-        }
-        // One cid stays free: a full SQ has tail == head - 1.
-        let (mut free_cids, mut free_reqs) = (ArrayVec::new(), ArrayVec::new());
-        for i in (0..depth).rev() {
-            if i != depth - 1 {
-                let _ = free_cids.push(i);
-            }
+        let prp = dma.alloc(PRP_BYTES, 4096);
+        let mut free_reqs = ArrayVec::new();
+        for i in (0..MAX_REQS as u16).rev() {
             let _ = free_reqs.push(i);
         }
         let mut n = Nvme {
@@ -204,14 +209,17 @@ impl Nvme {
             cq: Cq { va: cq_va, depth, head: 0, phase: 1, doorbell: db(3) },
             ident,
             cmd_req: [0; IO_DEPTH as usize],
-            prp,
             cid_busy: [false; IO_DEPTH as usize],
-            free_cids,
-            reqs: [Request::default(); IO_DEPTH as usize],
+            free_cids: ArrayVec::new(),
+            prp,
+            prp_len: 0,
+            reqs: [Request::default(); MAX_REQS],
             free_reqs,
             lba_shift: 9,
             nsze: 0,
             max_bytes: (MAX_CMD_PAGES as u64 - 1) * PAGE,
+            cmd_pages: 0,
+            max_cmds: 0,
             flush: false,
         };
 
@@ -225,6 +233,23 @@ impl Nvme {
             n.max_bytes = n.max_bytes.min(1 << mdts_shift);
         }
         n.flush = id_ctrl.r8(525) & 1 != 0;
+        // A command that starts mid-page spans one page more than it fills
+        // (max_bytes is whole pages, at least two).
+        let entries = (n.max_bytes / PAGE) as usize;
+        n.prp_len = (8 * entries).next_power_of_two();
+        n.cmd_pages = entries as u64 + 1;
+        // One cid stays free: a full SQ has tail == head - 1.
+        let cids = (depth as usize - 1).min(PRP_BYTES / n.prp_len);
+        for i in (0..cids as u16).rev() {
+            let _ = n.free_cids.push(i);
+        }
+        // Every piece may start a command and end one cut short (it starts
+        // or ends mid-page); the other commands carry max_bytes each.
+        let need = 2 * MAX_PIECES + (MAX_REQUEST / n.max_bytes) as usize;
+        n.max_cmds = need.min(cids);
+        if need > cids {
+            l4h_rt::log!("nvme {:#x}: {} command ids for up to {} per request: large requests may fail", id, cids, need);
+        }
         // Identify namespace 1: size and LBA format.
         n.admin(Cmd { opcode: ADMIN_IDENTIFY, nsid: 1, prp1: n.ident.1, cdw10: 0, ..Default::default() });
         let id_ns = Mmio(n.ident.0);
@@ -277,7 +302,8 @@ impl Nvme {
             return Err(blk::STATUS_IOERR);
         }
         let cid = self.free_cids.pop().ok_or(blk::STATUS_IOERR)?;
-        let (list_va, list_pa) = self.prp[cid as usize];
+        let off = cid as usize * self.prp_len;
+        let (list_va, list_pa) = (self.prp.0 + off, self.prp.1 + off as u64);
         // Page addresses after the first.
         let mut n = 0usize;
         let mut first = true;
@@ -332,7 +358,7 @@ impl Driver for Nvme {
     }
 
     fn can_start(&self) -> bool {
-        !self.free_reqs.is_empty() && self.free_cids.len() >= MAX_PIECES
+        !self.free_reqs.is_empty() && self.free_cids.len() >= self.max_cmds
     }
 
     fn start(&mut self, tag: u64, _unit: usize, op: u32, sector: u64, data: &[Seg]) -> Result<(), u32> {
@@ -348,36 +374,22 @@ impl Driver for Nvme {
                 return Err(blk::STATUS_IOERR);
             }
             let mut lba = (sector << 9) >> self.lba_shift;
-            // The pieces of the command being built.
-            let mut cmd = [Seg { pa: 0, len: 0 }; MAX_PIECES];
-            let (mut n, mut bytes, mut pages) = (0usize, 0u64, 0u64);
-            for &p in data {
-                let (mut pa, mut len) = (p.pa, p.len as u64);
-                while len > 0 {
-                    let joins = n == 0 || (pa % PAGE == 0 && (cmd[n - 1].pa + cmd[n - 1].len as u64) % PAGE == 0);
-                    // Room left in the command, by bytes and by PRP entries;
-                    // a partial piece must end on a page.  With every PRP
-                    // entry used there is none: the piece starts a command.
-                    let room = (self.max_bytes - bytes).min(((MAX_CMD_PAGES as u64 - pages) * PAGE).saturating_sub(pa % PAGE));
-                    let mut take = len.min(room);
-                    if take < len {
-                        take = ((pa + take) & !(PAGE - 1)).saturating_sub(pa);
-                    }
-                    if !joins || take == 0 || n == MAX_PIECES {
-                        self.issue(r, opcode, lba, &cmd[..n])?;
-                        lba += bytes >> self.lba_shift;
-                        (n, bytes, pages) = (0, 0, 0);
-                        continue;
-                    }
-                    cmd[n] = Seg { pa, len: take as u32 };
-                    n += 1;
-                    bytes += take;
-                    pages += (pa + take).div_ceil(PAGE) - pa / PAGE;
-                    pa += take;
-                    len -= take;
-                }
+            let (max_bytes, cmd_pages, block) = (self.max_bytes, self.cmd_pages, (1u64 << self.lba_shift) - 1);
+            let len = |cmd: &[Seg]| cmd.iter().map(|p| p.len as u64).sum::<u64>();
+            // Count the commands first: all are issued, or none.
+            let mut cmds = 0;
+            split(data, max_bytes, cmd_pages, |cmd| {
+                cmds += 1;
+                if cmd.is_empty() || len(cmd) & block != 0 { Err(blk::STATUS_IOERR) } else { Ok(()) }
+            })?;
+            if cmds > self.free_cids.len() {
+                return Err(blk::STATUS_IOERR);
             }
-            self.issue(r, opcode, lba, &cmd[..n])
+            split(data, max_bytes, cmd_pages, |cmd| {
+                self.issue(r, opcode, lba, cmd)?;
+                lba += len(cmd) >> self.lba_shift;
+                Ok(())
+            })
         })();
         match result {
             Ok(()) => Ok(()),
@@ -428,6 +440,40 @@ impl Driver for Nvme {
             self.cq.ring();
         }
     }
+}
+
+/// Cut `data` into commands of at most `max_bytes` and `cmd_pages` pages
+/// that each fit one PRP list, and pass each to `f`, in order.
+fn split(data: &[Seg], max_bytes: u64, cmd_pages: u64, mut f: impl FnMut(&[Seg]) -> Result<(), u32>) -> Result<(), u32> {
+    // The pieces of the command being built.
+    let mut cmd = [Seg { pa: 0, len: 0 }; MAX_PIECES];
+    let (mut n, mut bytes, mut pages) = (0usize, 0u64, 0u64);
+    for &p in data {
+        let (mut pa, mut len) = (p.pa, p.len as u64);
+        while len > 0 {
+            let joins = n == 0 || (pa % PAGE == 0 && (cmd[n - 1].pa + cmd[n - 1].len as u64) % PAGE == 0);
+            // Room left in the command, by bytes and by PRP entries;
+            // a partial piece must end on a page.  With every PRP
+            // entry used there is none: the piece starts a command.
+            let room = (max_bytes - bytes).min(((cmd_pages - pages) * PAGE).saturating_sub(pa % PAGE));
+            let mut take = len.min(room);
+            if take < len {
+                take = ((pa + take) & !(PAGE - 1)).saturating_sub(pa);
+            }
+            if !joins || take == 0 || n == MAX_PIECES {
+                f(&cmd[..n])?;
+                (n, bytes, pages) = (0, 0, 0);
+                continue;
+            }
+            cmd[n] = Seg { pa, len: take as u32 };
+            n += 1;
+            bytes += take;
+            pages += (pa + take).div_ceil(PAGE) - pa / PAGE;
+            pa += take;
+            len -= take;
+        }
+    }
+    f(&cmd[..n])
 }
 
 impl Nvme {

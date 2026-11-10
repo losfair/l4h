@@ -1555,8 +1555,13 @@ grow and shrink without going through `l4h-root`.
   CNode the two share (`SLOT_XCHG_CNODE`) instead, memd keeps the original
   of every block it grants vmmgr and gives a copy, and freeing a grant
   revokes the original, so a mislabelled capability in the area cannot
-  confuse memd's table. memd empties a slot of the area before writing
-  one. VMMs call it, badged as `Sender::Vmm(guest)`, for their guest's
+  confuse memd's table. memd takes no capability from vmmgr to invoke: it
+  makes the guests' CNodes itself (below), since invoking an endpoint
+  vmmgr put there as a CNode would be a call, blocking memd or passing
+  vmmgr memd's own CNode. memd empties a slot of vmmgr's area before
+  writing one, and a write that fails all the same (vmmgr filled the slot
+  again from another thread, or root left its own slot full) fails the
+  call, taking back what it gave. VMMs call it, badged as `Sender::Vmm(guest)`, for their guest's
   hotplug operations only (§8.5); root mints those endpoints, since vmmgr's
   own badged one cannot be minted again.
 - **Grants.** When a client's free blocks cannot meet a request, it takes an
@@ -1573,13 +1578,16 @@ grow and shrink without going through `l4h-root`.
   pass that finds nothing is not repeated until a block is freed or a
   report returns.
 - **Guest RAM** (`guest_create`, `guest_copy`, `guest_give`, `guest_destroy`). At create, memd takes the guest's 2 MiB
-  blocks and the block CNode capability vmmgr passes it. For a boot block,
+  blocks and makes its block CNode and hotplug CNode (§8.5) of 2 MiB
+  blocks it keeps for guests' CNodes, each free again once no guest has
+  one there; vmmgr gets copies, to give the guest. For a boot block,
   memd gives vmmgr a copy of its Untyped, which vmmgr fills with frames.
   At start, memd copies the Untypeds of the other blocks into the block
   CNode, past the kernel's shared blocks (§5.6), which memd has no block
   for. At destroy, once vmmgr has reclaimed its arena, memd revokes every
   original: that deletes the guest's copies, everything the guest made of
-  them, and the host's copies of boot blocks with their frames. With the
+  them, and the host's copies of boot blocks with their frames; then the
+  guest's CNodes, with every copy. With the
   VSpace roots gone first, deleting the frames unmaps nothing; the other
   way round, each frame was unmapped with a TLB shootdown (585 ms instead of
   about 120 for a stopped 128 MiB guest).
@@ -1591,7 +1599,8 @@ grow and shrink without going through `l4h-root`.
   first makes seL4 clear the memory before reuse. It can revoke what it
   handed out, and if it faults, a keeper thread answers its callers with
   an error, so memory requests (grants, guest creation, hotplug) fail from
-  then on.
+  then on: a free memd does not take keeps its blocks, and a boot block it
+  cannot copy fails the guest's load.
 - **Scheduling.** memd runs on core 0 at `PRIO_KERNEL + 3`, above every
   guest, with a full budget: root waits for it.
 - **Limits.** Only the table: its size follows the host's memory, and no
@@ -1615,7 +1624,7 @@ Untypeds reclaims everything it made. Plugging does not involve
   blocks, one Linux memory block). Boot info: `hp_gpa`, `hp_count` (at most
   512).
 - **Capabilities.** Guest root slot `L4H_SLOT_HP` holds a level-1 hotplug
-  CNode (radix 9, guard 3) that the host makes, the only host memory the
+  CNode (radix 9, guard 3) that memd makes (§8.4), the only host memory the
   region costs. Before plugging hotplug block m, the guest retypes a
   level-2 CNode (radix 6, 2 KiB) into its slot m from its own object
   memory; memd copies the Untypeds of the block's 64 RAM blocks into it
@@ -1642,9 +1651,16 @@ Untypeds reclaims everything it made. Plugging does not involve
   need no free page report to come back, so a guest never holds memd
   waiting: short of 128 MiB of them it answers `EBUSY`. An unplug revokes
   and frees the 64 originals; destroy revokes every plugged block with the
-  rest. A token bucket per guest allows 8 plugs or unplugs a second after a
-  burst of 16 (`EBUSY` beyond), bounding the time one guest can take from
-  memd, which runs on core 0 above every guest.
+  rest. A token bucket per guest bounds the time one guest can take from
+  memd, which runs on core 0 above every guest: it holds microseconds of
+  memd's time, refilled at 8 ms a second up to 16 ms, and each call is
+  charged what it took, at least 1 ms, so a guest makes 8 plugs or unplugs
+  a second after a burst of 16 (`EBUSY` beyond). How long a revocation
+  takes is the guest's to choose (it can make many capabilities of a
+  block), so an unplug revokes only while the guest has time left, looked
+  at after each block, and otherwise answers `EBUSY` with the rest still
+  plugged, for its retry. A call overruns by at most one block's
+  revocation, which the guest pays back before its next.
 - **VMM.** The memory device (`L4H_DEV_MEM`, `struct l4h_mem_page`) is one
   more device page: target, plugged count and bitmap, which the VMM
   refreshes from memd (`hp_state`) at start, after each request and
@@ -1866,7 +1882,11 @@ extent.
 - **Flush and reset.** A flush waits for accepted requests from every queue,
   and later requests wait until it completes. Device reset drains all
   accepted work before buffers can be reused. Reset of one queue returns
-  completions to the others and drops only its own.
+  completions to the others and drops only its own. A VMM waits at most
+  five seconds for the drain (blkd's own bound for its device): a blkd
+  that root quarantined is suspended and never answers. The disk then
+  fails for good: what blkd still has fails, every later request is an
+  I/O error, and its channel is not read again.
 - **Clients.** Each client has its own immutable pool/window/permission
   configuration, channel and completion notification. A controller supports
   512 clients; blkd's submit loop visits only attached ones. Submission is
@@ -1881,7 +1901,9 @@ extent.
   (`DiskWindow::conflicts`), dom0's boot reservations and provisioning
   exclusion (`blk::Reservations`). Root only asks: `check` gives the
   errno or the slot to attach in before root allocates anything, and
-  `add` repeats the check. Root parses no ranges of dom0's and keeps
+  `add` repeats the check for that slot (`Reservations::admits`): a
+  removal root posts in between may free a lower slot, which leaves the
+  checked one right. Root parses no ranges of dom0's and keeps
   its attachment records only for teardown and reports. blkd sends the
   commands, so a second check in root could not stop a faulty one.
 - **Volatile attachments.** `BLK_ATTACH` takes flags: `BLK_RO`, and
@@ -1926,6 +1948,12 @@ extent.
   and each command keeps its queue for completion and retry. Provisioning
   uses queue zero. Indirect descriptors are used when offered; otherwise
   each command slot owns a fixed run of ring descriptors.
+- **NVMe** uses namespace 1 and one I/O queue pair of up to 1024 entries.
+  A request becomes commands cut at the device's transfer limit (MDTS) and
+  wherever its pieces cannot share one PRP list; it starts only once there
+  is a command id for each, so none fails part way. The ids (and PRP lists,
+  sized by the limit) suffice for a 4 MiB request at an 8 KiB limit, unless
+  the device's queue is shallower.
 - **Boot.** Host disks are numbered by controller in PCI order, then target
   and LUN. Before anything enables a disk controller, root resets it
   through a mapping of its registers, with bus mastering off, since
@@ -1936,8 +1964,9 @@ extent.
   controller's blkd at boot and learns the virtio-scsi units there. Each
   needs 4 MiB of physically contiguous DMA memory, and the host fails to boot
   without it, so a disk never lacks its driver later. A controller whose
-  reset failed is not started and stays disabled: its disks fail with `EIO`,
-  and the host boots without them. Clients and quarantine are per
+  reset failed, or whose BARs are not free device memory (below), is not
+  started and stays disabled: its disks fail with `EIO`, and the host boots
+  without them. Clients and quarantine are per
   controller.
 - **Queries.** `DISK_INFO` returns the PCI address, kind, failed flag,
   capacity and attachment count (volumes, not extents; the owner field
@@ -2676,7 +2705,10 @@ pending, and so does whatever waits for it, nothing else:
   let go, and with it, without an IOMMU, the pool (a `Zombie`). Revoking
   the memory would also unmap it from the driver, but an honest driver
   would fault. A driver that never answers keeps that memory, and the
-  client and port slots, for good.
+  client and port slots, for good, and each such guest keeps a guest's
+  place: root admits a guest other than dom0 only while live guests and
+  zombies are fewer than 64, so every deletion finds a zombie, and a
+  guest whose drivers answer gets all its memory back.
 - A full ring (64 requests) refuses new ones with `EBUSY`; removals queue
   in root until there is room.
 - **A driver that faults** fails in root, not in itself. Drivers have no
@@ -3441,7 +3473,8 @@ root.
   after another this way.
   Capabilities cross in vmmgr's exchange slots, which root reaches through
   vmmgr's CNode. Root empties a slot before filling it, so a slot vmmgr left
-  full cannot make root fail, and takes no capability from vmmgr: even the
+  full cannot make root fail, and one vmmgr fills again meanwhile (from
+  another thread) fails the call (`EINVAL`). Root takes no capability from vmmgr: even the
   notification blkd and netd signal for a guest's VMM is made by root at
   `GUEST_NEW`, so it cannot be an endpoint that would block them.
 - **Root never calls vmmgr**, so calls cannot deadlock. It posts notices
@@ -3628,7 +3661,12 @@ injects these failures in a host built with `L4H_TEST_INJECT=1`;
   (Meltdown isolation, xAPIC, no PCID). All variants share one `l4h-root`.
 - **Platform discovery.** seL4 reads ACPI (MADT, cores, IOAPIC). `l4h-root`
   enumerates PCI over MCFG/ECAM or port I/O config and allocates MSI/MSI-X
-  through `seL4_IRQControl_GetMSI`.
+  through `seL4_IRQControl_GetMSI`. A device names its own BAR addresses,
+  which may lie in RAM, in memory root already holds or over another
+  device's BAR: root carves the frames of the BARs it will map of a disk
+  controller, NIC or xHCI controller when it finds it (`blkd::carve_bars`)
+  and drives it only if that succeeds, logging the rest; of two devices
+  claiming one range, the first found takes it.
 - **Releases.** CI (`.github/workflows/release.yml`) builds, for x86_64, and
   attaches to the GitHub release of each pushed `v*` tag, with
   `SHA256SUMS`:

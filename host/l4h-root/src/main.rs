@@ -308,7 +308,7 @@ impl Host {
         for c in 0..self.ctrls.len() {
             if !self.ctrls[c].failed {
                 blkd::start(c, &mut self.ctrls[c], &self.pci, &mut self.iommu,
-                    &mut self.devmem, &mut self.alloc, &mut self.wins.a, &mut self.asids, &self.info);
+                    &mut self.alloc, &mut self.wins.a, &mut self.asids, &self.info);
             }
         }
     }
@@ -468,6 +468,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     // single-threaded.
     let ctrls = unsafe { &mut *(&raw mut CTRLS) };
     let mut nics = ArrayVec::<pci::Device, { host::net::MAX_NICS }>::new();
+    let mut nic_bars = ArrayVec::<blkd::BarCache, { host::net::MAX_NICS }>::new();
     let mut balloon = None;
     for d in pci.enumerate() {
         info!(
@@ -499,12 +500,16 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
             let _ = ctrls.push(ctrl);
         } else if netd::is_uplink(&d) {
             pci.disable(&d);
-            if nics.push(d).is_err() {
+            let mut bars = [const { None }; 6];
+            if nics.is_full() {
                 log!("l4h-root: more than {} NICs, ignoring {:02x}:{:02x}.{}", host::net::MAX_NICS, d.bus, d.dev, d.func);
+            } else if netd::carve(&mut alloc, &mut devmem, &d, &mut bars) {
+                nics.must_push(d);
+                nic_bars.must_push(bars);
             }
         } else if usb::is_xhci(&d) {
             // Left to the firmware, enabled as it is, until claimed.
-            usb::found(d, &pci);
+            usb::found(d, &pci, &mut alloc, &mut devmem);
         } else if memd::is_balloon(&d) && balloon.is_none() && !partition::secondary() {
             balloon = Some(d);
         }
@@ -533,7 +538,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         #[cfg(target_arch = "x86_64")]
         acpi_frames,
     );
-    let netd = netd::spawn(&nics, &pci, &mut iommu, &mut devmem, &mut alloc, &mut wins.a, &mut asids, &info);
+    let netd = netd::spawn(&nics, &nic_bars, &pci, &mut iommu, &mut alloc, &mut wins.a, &mut asids, &info);
 
     let mut h = Host {
         info,

@@ -156,20 +156,24 @@ fn unsupported(d: &pci::Device, pci: &pci::Pci) -> Option<&'static str> {
     None
 }
 
-/// Boot: list `d`, leaving it to the firmware.
-pub fn found(d: pci::Device, pci: &pci::Pci) {
+/// Boot: list `d`, leaving it to the firmware.  The BARs a claim maps
+/// are carved now (blkd::carve_bars), or it is unsupported.
+pub fn found(d: pci::Device, pci: &pci::Pci, alloc: &mut crate::mem::Alloc, devmem: &mut crate::devmem::DevMem) {
     let cs = ctrls();
     if cs.is_full() {
         log!("l4h-root: more than {} xHCI controllers, {:02x}:{:02x}.{} ignored", usb::MAX_USB_CTRLS, d.bus, d.dev, d.func);
         return;
     }
+    let mut bars = [const { None }; 6];
     let state = match unsupported(&d, pci) {
         Some(why) => State::Unsupported(why),
+        None if !crate::blkd::carve_bars(alloc, devmem, &d, &mut bars, 1 | d.msix.map_or(0, |m| 1 << m.table_bar)) =>
+            State::Unsupported("BARs not free device memory"),
         None => State::Firmware,
     };
     info!("l4h-root: xHCI {:02x}:{:02x}.{} {:04x}:{:04x}: left to the firmware{}", d.bus, d.dev, d.func,
         d.vendor, d.device, if let State::Unsupported(w) = state { w } else { "" });
-    cs.must_push(Ctrl { pci: d, state, claimed: false, usb2: 0, usb3: 0, bars: [const { None }; 6], driver: None, dom: Domain::NONE, pool: None, ac64: false });
+    cs.must_push(Ctrl { pci: d, state, claimed: false, usb2: 0, usb3: 0, bars, driver: None, dom: Domain::NONE, pool: None, ac64: false });
 }
 
 /// Stop the controller for good: usbd suspended, no DMA, no decoding, no
@@ -188,7 +192,7 @@ fn quarantine(c: &mut Ctrl, pci: &pci::Pci) {
 /// BAR 0's first page: (max slots, scratchpad buffers, page size).
 fn caps(h: &mut Host, i: usize) -> Option<(u32, u32, u32)> {
     let c = &mut ctrls()[i];
-    let frames = bar_frames(&mut h.alloc, &mut h.devmem, &c.pci, &mut c.bars, 0);
+    let frames = bar_frames(&c.bars, 0);
     h.pci.enable_memory(&c.pci);
     let frame = crate::devmem::granule(frames.start);
     let ticks_per_ms = h.info.tsc_hz / 1000;
@@ -241,7 +245,7 @@ fn program_irq(h: &mut Host, i: usize, vector: u64, dom: Domain) {
     let c = &mut ctrls()[i];
     match c.pci.msix {
         Some(m) => {
-            let frames = bar_frames(&mut h.alloc, &mut h.devmem, &c.pci, &mut c.bars, m.table_bar);
+            let frames = bar_frames(&c.bars, m.table_bar);
             let off = m.table_offset as usize;
             let frame = crate::devmem::granule(frames.start + off / PAGE);
             h.wins.a.with_frame_attrs(&abs_of(frame), DEVICE_ATTRS, |page| unsafe {
@@ -334,7 +338,7 @@ fn claim(h: &mut Host, i: usize) -> Result<(), Errno> {
         keep.absolute_cptr_from_bits_with_depth(next - 1, kb)
     };
     // BAR 0, uncached, and the DMA region.
-    let bar = bar_frames(&mut h.alloc, &mut h.devmem, &d, &mut c.bars, 0);
+    let bar = bar_frames(&c.bars, 0);
     for (p, f) in bar.map(crate::devmem::granule).enumerate() {
         comp.map_copy(&mut h.alloc, &mut arena, &abs_of(f), host::MMIO_VA + p * PAGE, CapRights::read_write(), DEVICE_ATTRS, keep_slot());
     }

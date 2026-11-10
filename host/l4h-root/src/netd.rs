@@ -12,7 +12,7 @@ use l4h_host::net::call::Request;
 use l4h_host::fixed::ArrayVec;
 use l4h_host::{self as host, net};
 
-use crate::blkd::{BAR_STRIDE, VirtioRegions, bar_pages, is_legacy_virtio, is_modern_virtio, keep_bits, map_bar_mask, mappable, virtio_bar_mask, virtio_regions};
+use crate::blkd::{BAR_STRIDE, BarCache, VirtioRegions, bar_pages, carve_bars, is_legacy_virtio, is_modern_virtio, keep_bits, map_bar_mask, mappable, virtio_bar_mask, virtio_regions};
 use crate::component::{self, Component, SpawnArgs, abs_of};
 use crate::devmem::DevMem;
 use crate::iommu::Iommu;
@@ -109,6 +109,12 @@ pub fn is_mlx5(d: &pci::Device) -> bool {
 /// NICs netd can drive as an uplink: also, the BARs `spawn` maps can be.
 pub fn is_uplink(d: &pci::Device) -> bool {
     (is_virtio_net(d) || is_gvnic(d) || is_ena(d) || is_ixgbe(d) || is_mlx5(d)) && mappable(&mapped_device(d), used_bars(d))
+}
+
+/// Carve the BARs `spawn` maps of uplink `d` into `cache`: whether it can
+/// be driven (blkd::carve_bars).
+pub fn carve(alloc: &mut Alloc, devmem: &mut DevMem, d: &pci::Device, cache: &mut BarCache) -> bool {
+    carve_bars(alloc, devmem, &mapped_device(d), cache, used_bars(d))
 }
 
 pub struct Nic {
@@ -210,12 +216,13 @@ fn used_bars(d: &pci::Device) -> u8 {
     }
 }
 
-/// Start netd with the uplink NICs `nics`.
+/// Start netd with the uplink NICs `nics`, whose BARs `carve` carved
+/// into `bars`.
 pub fn spawn(
     nics: &[pci::Device],
+    bars: &[BarCache],
     pci: &Pci,
     iommu: &mut Iommu,
-    devmem: &mut DevMem,
     alloc: &mut Alloc,
     win: &mut Window,
     asids: &mut AsidPools,
@@ -326,10 +333,9 @@ pub fn spawn(
     };
     let mut nic_list = ArrayVec::new();
     for (n, d) in nics.into_iter().take(nr_nics).enumerate() {
-        let mut bars = [const { None }; 6];
         // ENA's LLQ is written in 128-byte bursts.
         let wc = (ena_llq(&d) as u8) << 2;
-        map_bar_mask(&comp, alloc, &mut arena, devmem, &mapped_device(&d), &mut bars, used_bars(&d), wc, |b| net::nic_bar_va(n, b as usize), &mut keep_slot);
+        map_bar_mask(&comp, alloc, &mut arena, &bars[n], used_bars(&d), wc, |b| net::nic_bar_va(n, b as usize), &mut keep_slot);
         for (i, s) in dma[n].clone().enumerate() {
             let f = sel4::init_thread::Slot::<cap_type::Granule>::from_index(s).cap();
             comp.map_copy(alloc, &mut arena, &abs_of(f), net::nic_dma_va(n) + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep_slot());

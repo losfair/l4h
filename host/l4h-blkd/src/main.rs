@@ -39,8 +39,13 @@ pub struct Seg {
 /// contiguous).
 pub const MAX_PIECES: usize = blk::MAX_SEGS;
 
-/// Requests in flight on the controller: as many as the deepest queue
-/// (NVMe's) holds commands, which is more than the others.
+/// Device requests up to this size are split into as many commands as the
+/// device's limits need, whatever else is in flight (clients send at most
+/// 14 segments of 256 KiB).
+pub const MAX_REQUEST: u64 = 4 << 20;
+
+/// Requests in flight on the controller: as many as the driver that takes
+/// most (NVMe) does.
 const MAX_INFLIGHT: usize = 256;
 
 #[derive(Clone, Copy)]
@@ -372,11 +377,12 @@ impl Blkd {
 
     /// Build the disk a client of `unit` would get, the window `start`,
     /// `sectors` (0: to the end) or the n extents in staging, into `order`
-    /// and `extents`: the slot it may attach in, the disk and whether it is
-    /// read-only, or the errno it is refused with.
+    /// and `extents`: the slot it may attach in (`at`, if that admits it),
+    /// the disk and whether it is read-only, or the errno it is refused
+    /// with.
     #[allow(clippy::too_many_arguments)]
     fn check<'a>(&self, cfg: &BlkdConfig, unit: usize, start: u64, sectors: u64, n: usize, read_only: bool, dom0: bool,
-        order: &'a mut [u16], extents: &'a mut [blk::Extent]) -> Result<(usize, blk::Volume<'a>, bool), u64> {
+        at: Option<usize>, order: &'a mut [u16], extents: &'a mut [blk::Extent]) -> Result<(usize, blk::Volume<'a>, bool), u64> {
         let dev = self.dev.get(unit).ok_or(errno::EINVAL)?;
         let read_only = read_only || dev.read_only;
         let vol = if n == 0 {
@@ -390,7 +396,13 @@ impl Blkd {
             blk::Volume::build(raw, &mut order[..n], &mut extents[..n], dev.capacity)?
         };
         let hold = blk::Hold { unit, extents: vol.extents, read_only };
-        Ok((self.reserved.slot(&holds(&self.clients[..]), &hold, dom0)?, vol, read_only))
+        let active = holds(&self.clients[..]);
+        let slot = match at {
+            None => self.reserved.slot(&active, &hold, dom0)?,
+            Some(i) if self.reserved.admits(&active, &hold, dom0, i) => i,
+            Some(_) => return Err(errno::EINVAL),
+        };
+        Ok((slot, vol, read_only))
     }
 }
 
@@ -424,10 +436,11 @@ impl blk::call::Server for Requests<'_> {
             (core::slice::from_raw_parts_mut(addr_of_mut!((*table).order).cast(), n.max(1)),
              core::slice::from_raw_parts_mut(addr_of_mut!((*table).extents).cast(), n.max(1)))
         };
-        // Exactly what `check` allowed: root serializes checks and
-        // attachments.
-        match b.check(self.cfg, unit, start, count, n, ro != 0, dom0, order, extents) {
-            Ok((slot, vol, read_only)) if slot == i => {
+        // What `check` allowed, in the slot it gave: root serializes
+        // checks and attachments, but not removals, which may since have
+        // freed a lower slot.
+        match b.check(self.cfg, unit, start, count, n, ro != 0, dom0, Some(i), order, extents) {
+            Ok((_, vol, read_only)) => {
                 b.clients[i] = Some(Client { chan, unit, pool, vol, read_only, volatile,
                     done: cap::<cap_type::Notification>(blk::BLKD_SLOT_CLIENT_DONE + i as u64), outstanding: 0, notify_pending: false });
                 // Not attached yet, so not in active.
@@ -472,7 +485,7 @@ impl blk::call::Server for Requests<'_> {
 
     fn check(&mut self, _: blk::Sender, unit: usize, start: u64, sectors: u64, read_only: bool, dom0: bool, n: usize)
         -> Result<blk::Checked, Errno> {
-        let (slot, vol, read_only) = self.b.check(self.cfg, unit, start, sectors, n, read_only, dom0, self.order, self.extents)?;
+        let (slot, vol, read_only) = self.b.check(self.cfg, unit, start, sectors, n, read_only, dom0, None, self.order, self.extents)?;
         Ok(blk::Checked { slot, sectors: vol.sectors(), read_only })
     }
 

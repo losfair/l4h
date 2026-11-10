@@ -275,6 +275,14 @@ impl Controller {
         (disk, units)
     }
 
+    /// The BARs `start` maps, bit b for BAR b: the registers and the
+    /// MSI-X table.
+    fn used_bars(&self) -> u8 {
+        let d = &self.pci;
+        let regs = if self.kind == blk::BLKD_NVME { 1 } else if self.legacy_io().is_some() { 0 } else { virtio_bar_mask(d) };
+        regs | d.msix.map_or(0, |m| 1 << m.table_bar)
+    }
+
     /// Base of the I/O BAR of a legacy virtio device.
     fn legacy_io(&self) -> Option<u16> {
         is_legacy_virtio(&self.pci).then_some(self.pci.bars[0].addr as u16)
@@ -406,7 +414,6 @@ pub fn start(
     disk: &mut Controller,
     pci: &Pci,
     iommu: &mut Iommu,
-    devmem: &mut DevMem,
     alloc: &mut Alloc,
     win: &mut Window,
     asids: &mut AsidPools,
@@ -426,15 +433,8 @@ pub fn start(
         va: (bar_va(msix.table_bar) + msix.table_offset as usize) as u64,
         len: msix.table_size as u64 * 16,
     };
-    // The BARs to map, bit b for BAR b.
-    let (regions, bars) = if disk.kind == blk::BLKD_NVME {
-        (None, 1u8)
-    } else if legacy_io.is_some() {
-        (None, 0)
-    } else {
-        (Some(virtio_regions(d, bar_va)), virtio_bar_mask(d))
-    };
-    let bars = bars | 1 << msix.table_bar;
+    let regions = (disk.kind != blk::BLKD_NVME && legacy_io.is_none()).then(|| virtio_regions(d, bar_va));
+    let bars = disk.used_bars();
 
     let mut arena = alloc.arena(8 << 20).expect("blkd arena");
 
@@ -505,7 +505,7 @@ pub fn start(
     };
 
     // ---- Device BARs (uncached).
-    map_bar_mask(&comp, alloc, &mut arena, devmem, d, &mut disk.bars, bars, 0, bar_va, &mut keep_slot);
+    map_bar_mask(&comp, alloc, &mut arena, &disk.bars, bars, 0, bar_va, &mut keep_slot);
     for i in 0..n_dma {
         let f = sel4::init_thread::Slot::<cap_type::Granule>::from_index(dma_frames.start + i).cap();
         comp.map_copy(alloc, &mut arena, &abs_of(f), host::DMA_VA + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep_slot());
@@ -879,9 +879,15 @@ const VIRTIO_RESET_MS: u64 = 2000;
 /// and waits until it reads back 0.  Memory (or I/O) decoding is turned on
 /// for this; bus mastering is left as it is, so that DMA the device
 /// finishes while resetting lands in memory that is still the client's.
-/// On failure, marks the disk failed and returns false.
+/// First the BARs `start` maps are carved (`carve_bars`).  On failure,
+/// marks the disk failed and returns false.
 pub fn reset(disk: &mut Controller, pci: &Pci, alloc: &mut Alloc, devmem: &mut DevMem, win: &mut Window, ticks_per_ms: u64) -> bool {
     if disk.failed {
+        return false;
+    }
+    let bars = disk.used_bars();
+    if !carve_bars(alloc, devmem, &disk.pci, &mut disk.bars, bars) {
+        disk.failed = true;
         return false;
     }
     if let Some(base) = disk.legacy_io() {
@@ -912,7 +918,7 @@ pub fn reset(disk: &mut Controller, pci: &Pci, alloc: &mut Alloc, devmem: &mut D
         let c = disk.pci.virtio_caps.iter().find(|c| c.cfg_type == VIRTIO_PCI_CAP_COMMON_CFG).unwrap();
         (c.bar, c.offset as usize + VIRTIO_DEVICE_STATUS)
     };
-    let frame = crate::devmem::granule(bar_frames(alloc, devmem, &disk.pci, &mut disk.bars, bar).start + off / PAGE);
+    let frame = crate::devmem::granule(bar_frames(&disk.bars, bar).start + off / PAGE);
     pci.enable_memory(&disk.pci);
     let ok = win.with_frame_attrs(&abs_of(frame), DEVICE_ATTRS, |page| unsafe {
         let r32 = |o: usize| (page.add(o) as *const u32).read_volatile();
@@ -1003,28 +1009,43 @@ pub fn keep_bits(pages: usize) -> usize {
     pages.next_power_of_two().trailing_zeros().max(1) as usize
 }
 
-/// The frames of a device's BARs, carved on first use: their slots, by
-/// BAR.
+/// The frames of a device's BARs (`carve_bars`): their slots, by BAR.
 pub type BarCache = [Option<Range<Slot>>; 6];
 
-/// Map BARs `bars` (bit b for BAR b) of `d` into `comp`, uncached, or
-/// write-combining for those in `wc`.  BAR frames are carved once and
-/// cached in `cache`.
+/// Carve the frames of BARs `bars` (bit b for BAR b) of `d` into `cache`:
+/// whether all could be.  The device names its BARs' addresses, which may
+/// be RAM or memory already carved, another device's BAR included; root
+/// drives a device only once this succeeds, so `bar_frames` always finds
+/// them.
+pub fn carve_bars(alloc: &mut Alloc, devmem: &mut DevMem, d: &pci::Device, cache: &mut BarCache, bars: u8) -> bool {
+    (0..6).filter(|b| bars & 1 << b != 0).all(|b| {
+        let bar = d.bars[b];
+        if cache[b].is_none() && mappable(d, 1 << b) {
+            cache[b] = alloc.slots.global(|slots| devmem.frames(slots, bar.addr as usize, bar.size as usize));
+        }
+        if cache[b].is_none() {
+            log!("l4h-root: pci {:02x}:{:02x}.{}: BAR {} at {:#x} is not free device memory; not driven",
+                d.bus, d.dev, d.func, b, bar.addr);
+        }
+        cache[b].is_some()
+    })
+}
+
+/// Map BARs `bars` (bit b for BAR b, carved into `cache`) into `comp`,
+/// uncached, or write-combining for those in `wc`.
 #[allow(clippy::too_many_arguments)]
 pub fn map_bar_mask(
     comp: &Component,
     alloc: &mut Alloc,
     arena: &mut Arena,
-    devmem: &mut DevMem,
-    d: &pci::Device,
-    cache: &mut BarCache,
+    cache: &BarCache,
     bars: u8,
     wc: u8,
     bar_va: impl Fn(u8) -> usize,
     keep: &mut impl FnMut() -> sel4::AbsoluteCPtr,
 ) {
     for b in (0..6).filter(|b| bars & 1 << b != 0) {
-        let frames = bar_frames(alloc, devmem, d, cache, b);
+        let frames = bar_frames(cache, b);
         let attrs = if wc & 1 << b != 0 { wc_attrs() } else { DEVICE_ATTRS };
         for (i, f) in frames.map(crate::devmem::granule).enumerate() {
             comp.map_copy(
@@ -1040,16 +1061,8 @@ pub fn map_bar_mask(
     }
 }
 
-/// The frames of BAR `b` of `d`, carved on first use and cached in `cache`.
-pub fn bar_frames(alloc: &mut Alloc, devmem: &mut DevMem, d: &pci::Device, cache: &mut BarCache, b: u8) -> Range<Slot> {
-    cache[b as usize]
-        .get_or_insert_with(|| {
-            let bar = d.bars[b as usize];
-            assert!(!bar.is_io && bar.size > 0 && bar.size as usize <= BAR_STRIDE, "virtio BAR {} unusable", b);
-            alloc
-                .slots
-                .global(|slots| devmem.frames(slots, bar.addr as usize, bar.size as usize))
-                .unwrap_or_else(|| panic!("no device untyped for BAR {} at {:#x}", b, bar.addr))
-        })
-        .clone()
+/// The frames of BAR `b`, which `carve_bars` carved into `cache` before
+/// root chose to drive the device.
+pub fn bar_frames(cache: &BarCache, b: u8) -> Range<Slot> {
+    cache[b as usize].clone().expect("BAR carved when its device was chosen")
 }

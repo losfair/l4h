@@ -29,7 +29,13 @@ struct Blkd {
 
 thread_local! {
     static BLKD: RefCell<Option<Blkd>> = const { RefCell::new(None) };
+    /// blkd is suspended (root quarantined it): nothing runs when the VMM
+    /// yields.
+    static QUARANTINED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
+
+/// host::ticks per second.
+const HZ: u64 = 1_000_000_000;
 
 impl Blkd {
     /// Take every submitted request.
@@ -66,6 +72,7 @@ impl Blkd {
 
 /// blkd runs while the VMM yields in `drain`.
 pub fn blkd_run() {
+    if QUARANTINED.get() { return; }
     BLKD.with_borrow_mut(|b| {
         let b = b.as_mut().unwrap();
         b.take();
@@ -165,7 +172,7 @@ pub fn drain_check(rng: &mut Rng, iterations: u64) -> (u64, u64) {
         let chan_ptr: *mut Channel = &mut *channel;
         let seed = rng.next() | 1;
         BLKD.with_borrow_mut(|b| *b = Some(Blkd { chan: chan_ptr, pending: Vec::new(), rng: Rng(seed), bad }));
-        let mut blk = Blk::new(chan_ptr as usize, crate::sel4::cap::Notification, 0x8000);
+        let mut blk = Blk::new(chan_ptr as usize, crate::sel4::cap::Notification, 0x8000, HZ);
         blk.features_accepted(if nr_queues == 4 { 1 << 12 } else { 0 });
         let mut queues = core::array::from_fn::<_, 4, _>(|_| Queue::default());
         for (q, queue) in queues.iter_mut().enumerate().take(nr_queues) {
@@ -245,7 +252,7 @@ fn same_chain_head_on_two_queues_completes_on_its_own_queue() {
     let mut channel: Box<Channel> = unsafe { Box::new_zeroed().assume_init() };
     channel.capacity_sectors = 131072;
     channel.block_size = 512;
-    let mut disk = Blk::new(&mut *channel as *mut Channel as usize, crate::sel4::cap::Notification, mem.size);
+    let mut disk = Blk::new(&mut *channel as *mut Channel as usize, crate::sel4::cap::Notification, mem.size, HZ);
     disk.features_accepted(1 << 12);
     let mut queues = core::array::from_fn::<_, 4, _>(|_| Queue::default());
     offer(&mem, &mut queues[0], 0, chan::OP_READ);
@@ -273,7 +280,7 @@ fn flush_fences_other_queues_until_writes_and_flush_complete() {
     let mut channel: Box<Channel> = unsafe { Box::new_zeroed().assume_init() };
     channel.capacity_sectors = 131072;
     channel.block_size = 512;
-    let mut disk = Blk::new(&mut *channel as *mut Channel as usize, crate::sel4::cap::Notification, mem.size);
+    let mut disk = Blk::new(&mut *channel as *mut Channel as usize, crate::sel4::cap::Notification, mem.size, HZ);
     disk.features_accepted(1 << 12);
     let mut queues = core::array::from_fn::<_, 4, _>(|_| Queue::default());
     offer(&mem, &mut queues[0], 0, chan::OP_WRITE);
@@ -310,7 +317,7 @@ fn resetting_one_queue_returns_other_queues_and_fences_old_completions() {
     let mut channel: Box<Channel> = unsafe { Box::new_zeroed().assume_init() };
     channel.capacity_sectors = 131072;
     channel.block_size = 512;
-    let mut disk = Blk::new(&mut *channel as *mut Channel as usize, crate::sel4::cap::Notification, mem.size);
+    let mut disk = Blk::new(&mut *channel as *mut Channel as usize, crate::sel4::cap::Notification, mem.size, HZ);
     disk.features_accepted(1 << 12);
     let mut queues = core::array::from_fn::<_, 4, _>(|_| Queue::default());
     offer(&mem, &mut queues[0], 0, chan::OP_READ);
@@ -336,6 +343,47 @@ fn resetting_one_queue_returns_other_queues_and_fences_old_completions() {
     assert_eq!(queues[0].used_idx(), 1);
 }
 
+#[test]
+fn a_reset_gives_up_on_a_blkd_that_stopped_and_the_disk_fails() {
+    for whole in [false, true] {
+        let mut ram = vec![0u64; 0x20000 / 8];
+        let mem = GuestMem { base: ram.as_mut_ptr() as usize, gpa: POOL, size: 0x20000 };
+        let mut channel: Box<Channel> = unsafe { Box::new_zeroed().assume_init() };
+        channel.capacity_sectors = 131072;
+        channel.block_size = 512;
+        // A slow counter: the wait is short.
+        let mut disk = Blk::new(&mut *channel as *mut Channel as usize, crate::sel4::cap::Notification, mem.size, 1000);
+        disk.features_accepted(1 << 12);
+        let mut queues = core::array::from_fn::<_, 4, _>(|_| Queue::default());
+        offer(&mem, &mut queues[0], 0, chan::OP_READ);
+        offer(&mem, &mut queues[1], 1, chan::OP_READ);
+        disk.kick(&mem, &mut queues, 0);
+        disk.kick(&mem, &mut queues, 1);
+        assert_eq!(channel.sq.head, 2);
+        let ids = [channel.reqs[0].id, channel.reqs[1].id];
+        QUARANTINED.set(true);
+        if whole {
+            disk.drain();
+            disk.reset();
+        } else {
+            // The other queue's request fails; the reset one's is dropped.
+            assert_eq!(disk.drain_queue(&mem, &mut queues, 0), 1 << 1);
+            assert_eq!((queues[0].used_idx(), queues[1].used_idx()), (0, 1));
+            assert_eq!(mem.read::<u8>(POOL + 0x8000 + 0x4000), 1);
+        }
+        // Answers that come late are never read; new requests fail at once.
+        for id in ids { reply(&mut channel, id); }
+        assert!(!disk.pending());
+        assert!(!disk.complete(&mem, &mut queues));
+        offer(&mem, &mut queues[0], 0, chan::OP_READ);
+        disk.kick(&mem, &mut queues, 0);
+        assert_eq!(channel.sq.head, 2);
+        assert_eq!(queues[0].used_idx(), 1);
+        assert_eq!(mem.read::<u8>(POOL + 0x4000), 1);
+        disk.drain();
+        QUARANTINED.set(false);
+    }
+}
 
 struct DeviceFixture {
     _ram: Vec<u64>,
@@ -354,7 +402,7 @@ impl DeviceFixture {
         let mut channel: Box<Channel> = unsafe { Box::new_zeroed().assume_init() };
         channel.capacity_sectors = 131072;
         channel.block_size = 512;
-        let backend = Blk::new(&mut *channel as *mut Channel as usize, crate::sel4::cap::Notification, mem.size);
+        let backend = Blk::new(&mut *channel as *mut Channel as usize, crate::sel4::cap::Notification, mem.size, HZ);
         let mut page = Box::new([0u64; 512]);
         let regs = page.as_mut_ptr().cast::<l4h_abi::VirtioRegs>();
         let mut device = crate::dev::Device::new(page.as_mut_ptr() as usize, 20, backend);
