@@ -132,6 +132,21 @@ void l4h_deliver_events(int timer, unsigned long ipi, unsigned long *events)
 	set_irq_regs(old_regs);
 }
 
+#ifdef CONFIG_PARAVIRT_SPINLOCKS
+/* /proc/interrupts: how often each vCPU blocked waiting for a spinlock
+ * (asm/qspinlock.h) instead of spinning on. */
+int arch_show_interrupts(struct seq_file *p, int prec)
+{
+	int cpu;
+
+	seq_printf(p, "%*s:", prec, "PVW");
+	for_each_online_cpu(cpu)
+		seq_put_decimal_ull_width(p, " ", READ_ONCE(l4h_vcpus[cpu].pv_waits), 10);
+	seq_puts(p, "  Spinlock waits\n");
+	return 0;
+}
+#endif
+
 void __init init_IRQ(void)
 {
 	irq_set_chip_and_handler(TIMER_IRQ, &dummy_irq_chip, handle_percpu_irq);

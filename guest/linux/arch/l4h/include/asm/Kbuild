@@ -25,7 +25,6 @@ generic-y += trace_clock.h
 generic-y += kprobes.h
 generic-y += vga.h
 generic-y += video.h
-generic-y += qspinlock.h
 generic-y += qrwlock.h
 
 ifeq ($(SUBARCH),aarch64)

@@ -1118,10 +1118,47 @@ vendor, as seL4 makes it).
   Measured in a 4-vCPU dom0 on 4 cores, a loop mapping, touching and
   unmapping 8 pages, moved to the next vCPU every 10 ms: 66 µs a cycle
   (380 µs without the flush; 60 µs without moves).
-- **Lock-holder preemption.** The guest uses native qspinlocks and
-  qrwlocks; a waiter spins if the holder is descheduled. There is no
-  paravirtual spinlock slow path. The balancer keeps a guest's vCPUs on
-  distinct physical cores where possible (§7), which reduces the cost.
+- **Lock-holder preemption.** A vCPU that holds a spinlock, or waits in
+  a queued spinlock's line, can lose its core to another thread or run out
+  of budget under a CPU cap (§7.2), for milliseconds; a waiter that spins
+  meanwhile burns its core, and under a cap its own budget. The balancer
+  keeps a guest's vCPUs on distinct physical cores where possible (§7),
+  and guests with more than one vCPU use Linux's **paravirtual queued
+  spinlocks** (`CONFIG_PARAVIRT_SPINLOCKS`, `asm/qspinlock.h`); qrwlocks
+  queue their writers on one.
+  - A waiter spins for `SPIN_THRESHOLD` = 2¹¹ `cpu_relax()` iterations,
+    an estimated 100 µs, then blocks its kTCB in `seL4_Wait(N_v)` while the word
+    it watches is unchanged (`l4h_pv_wait()`). The vCPU that changes the
+    word signals the waiter's `N_v` afterwards (`l4h_pv_kick()`), with the
+    IPI badge and no reason bit, so a kick to a vCPU that no longer waits
+    delivers nothing. Signals are sticky: one sent between the check and
+    the wait ends the wait at once. Neither the host nor seL4 takes part
+    beyond the IPI path.
+  - With interrupts on, a waiter delivers pending events instead of
+    blocking, and those that end its wait, as its `cpu_relax()` did while
+    it spun. With interrupts off, events already collected do not keep it
+    from blocking, and one that ends the wait stays pending for the next
+    polling point (§5.4); the lock code re-checks the lock after any
+    wake-up.
+  - Unlocking is a compare-and-exchange instead of a store. There is
+    no code patching in `arch/l4h`, so a static key read by every lock
+    slow path and unlock selects the native operations for guests with one
+    vCPU, and with `nopvspin` on the kernel command line. It is switched
+    in `smp_prepare_cpus()`, while one vCPU runs. The x86_64 kernel's text
+    is no larger for it (27.27 MB either way).
+  - The native unlock is not a bare store either: `arch/l4h` takes
+    `smp_store_release()` from asm-generic, a full barrier and a store
+    (`mfence` on x86_64, where a store alone would do).
+  - Time blocked for a lock counts as idle, not steal (§7.4).
+    `/proc/interrupts` has a `PVW` row: how often each vCPU blocked.
+  - Not covered: `vcpu_is_preempted()` is always false, as before, so
+    mutexes and rwsems still spin optimistically on an owner whose vCPU is
+    not running. The guest cannot tell; seL4 would have to publish it.
+  - The threshold is not yet tuned by measurement.
+  - **Test.** `tests/run-pvlocktest.sh`: a module contends four locks on
+    every vCPU, holding them for 5 ms at times; no update is lost and
+    waiters block, in a 4-vCPU dom0 and a 4-vCPU guest capped at 25%,
+    and none blocks in guests with `nopvspin` or one vCPU.
 - **Steal time** is published by the balancer in the event page (§7.4).
 
 ---
@@ -1247,7 +1284,8 @@ seL4 does no load balancing, so `l4h-vmmgr` runs a balancer every 100 ms.
 
 ### 7.4 Steal time
 
-The guest accumulates its idle time in the event page (`idle_ticks`). Each
+The guest accumulates its idle time in the event page (`idle_ticks`),
+including the time its vCPUs block waiting for a spinlock (§6). Each
 balancer period vmmgr computes, per vCPU, `steal = wall − consumed − idle`
 from the vCPU's first run and publishes it monotonically as `steal_ns`.
 The guest returns it as Linux's paravirt steal clock
@@ -4832,6 +4870,7 @@ machine and guests of 256–512 MiB.
 | `tests/run-smttest.sh` | QEMU boot with SMT: CPU discovery, initial placement and busy-vCPU migration |
 | `tests/run-captest.sh [cap%] [rounds]` | self-test and fork loops in a guest capped from boot |
 | `tests/run-capperf.sh [caps]` | fork/exec and CPU-bound timings, uncapped and under each cap (use a release seL4) |
+| `tests/run-pvlocktest.sh` | paravirtual spinlocks: contended locks stay exclusive and waiters block, in dom0 and a capped 4-vCPU guest; plain locks with `nopvspin` or one vCPU |
 | `tests/run-limits.sh` | the host refuses what it cannot afford and recovers |
 | `tests/run-balloontest.sh` | free memory reported to QEMU (virtio-balloon; `BALLOONTEST_LEGACY=1`: a legacy one) is dropped: QEMU's memory use idle, with a guest and after destroying it |
 | `tests/run-hotplugtest.sh` | memory hotplug: a VM grows from 256 MiB to 2 GiB and shrinks again under `l4hctl mem`, falling short while its data needs the memory; host memory comes back |

@@ -225,3 +225,44 @@ void l4h_poll_events(void)
 	if (v->irqs_enabled && !v->in_irq && l4h_events_pending())
 		l4h_dispatch_pending();
 }
+
+/*
+ * Paravirtual spinlocks (asm/qspinlock.h): block this vCPU while
+ * *ptr == val.  The vCPU that changes *ptr kicks us afterwards, and a kick
+ * sent between the check and the wait leaves the notification active, so
+ * the wait returns at once.  Every other event ends the wait as well; the
+ * caller looks at the lock again.
+ */
+void l4h_pv_wait(const unsigned char *ptr, unsigned char val)
+{
+	struct l4h_vcpu *v = l4h_this_vcpu();
+	unsigned long long t0;
+	seL4_Word badge = 0;
+
+	/* With interrupts on, an event already here is delivered first, as
+	 * the waiter's cpu_relax() did while it spun. */
+	if (v->irqs_enabled && !v->in_irq && l4h_events_pending()) {
+		l4h_dispatch_pending();
+		return;
+	}
+	/* With interrupts off, events already collected stay pending, as on
+	 * a CPU, and do not keep us from blocking: l4h_events_pending() is
+	 * not asked.  A new one still ends the wait, and stays pending. */
+	if (__atomic_load_n(ptr, __ATOMIC_RELAXED) != val)
+		return;
+	/* Shown in /proc/interrupts; only we write it. */
+	__atomic_store_n(&v->pv_waits, v->pv_waits + 1, __ATOMIC_RELAXED);
+	t0 = l4h_rdtsc();
+	seL4_Wait(v->ntfn, &badge);
+	/* Blocked, not runnable: not steal time (see l4h_idle_wait()). */
+	__atomic_store_n(&v->evt->idle_ticks, v->evt->idle_ticks + (l4h_rdtsc() - t0), __ATOMIC_RELAXED);
+	__atomic_or_fetch(&v->ntfn_pending, badge, __ATOMIC_RELEASE);
+	l4h_poll_events();
+}
+
+/* Wake vCPU `cpu` from l4h_pv_wait(): an IPI without a reason, which is
+ * nothing to deliver if the vCPU is no longer waiting. */
+void l4h_pv_kick(int cpu)
+{
+	seL4_Signal(L4H_CPTR(L4H_SLOT_VCPU(cpu) + L4H_VCPU_IPI));
+}

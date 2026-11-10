@@ -227,7 +227,25 @@ config ARCH_SUSPEND_POSSIBLE
 config PARAVIRT
 	def_bool y
 	help
-	  Steal time reported by the l4h host.
+	  Steal time reported by the l4h host, and spinlocks that block.
+
+config PARAVIRT_SPINLOCKS
+	bool "Paravirtual spinlocks"
+	depends on PARAVIRT && SMP
+	default y
+	help
+	  A vCPU that has waited for a spinlock for a while blocks until
+	  the lock is passed to it, instead of spinning for as long as the
+	  lock's holder, or a waiter ahead of it, is not running: its vCPU
+	  lost the core to another thread, or ran out of budget under a
+	  CPU cap.  The time is left to other vCPUs, and under a cap is
+	  not taken from the waiter's own budget.
+
+	  Unlocking costs a compare-and-exchange instead of a store.
+	  Guests with one vCPU keep the plain locks, as does any guest
+	  booted with "nopvspin".
+
+	  If unsure, say Y.
 
 config PARAVIRT_TIME_ACCOUNTING
 	bool "Paravirtual steal time accounting"

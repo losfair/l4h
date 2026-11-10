@@ -95,17 +95,55 @@ void __init l4h_smp_setup(void)
 	set_nr_cpu_ids(n);
 }
 
+#ifdef CONFIG_PARAVIRT_SPINLOCKS
+/*
+ * Paravirtual spinlocks (asm/qspinlock.h).  The key is read by every
+ * spin_unlock(), which is inlined, in modules too.
+ */
+DEFINE_STATIC_KEY_FALSE(l4h_pv_spinlocks);
+EXPORT_SYMBOL(l4h_pv_spinlocks);
+EXPORT_SYMBOL(__pv_queued_spin_unlock);
+
+/*
+ * Switch to them while there is still one vCPU, so no lock is contended:
+ * a lock taken before the switch and released after it was not waited for,
+ * and is released the same either way.
+ */
+static void __init l4h_pv_spinlock_init(void)
+{
+	if (num_possible_cpus() == 1)
+		return;
+	if (nopvspin) {
+		pr_info("l4h: PV spinlocks disabled by \"nopvspin\"\n");
+		return;
+	}
+	static_branch_enable(&l4h_pv_spinlocks);
+	pr_info("l4h: PV spinlocks enabled\n");
+}
+#else
+static inline void l4h_pv_spinlock_init(void)
+{
+}
+#endif
+
 void __init smp_prepare_cpus(unsigned int max_cpus)
 {
 	unsigned int cpu;
 
 	for_each_possible_cpu(cpu)
 		set_cpu_present(cpu, true);
+	l4h_pv_spinlock_init();
 }
 
 void __init smp_prepare_boot_cpu(void)
 {
 	set_cpu_online(smp_processor_id(), true);
+#ifdef CONFIG_PARAVIRT_SPINLOCKS
+	/* The table of blocked lock waiters comes from memblock, so it is
+	 * allocated here, before "nopvspin" is parsed. */
+	if (num_possible_cpus() > 1)
+		__pv_init_lock_hash();
+#endif
 }
 
 static void l4h_secondary_main(int cpu)
