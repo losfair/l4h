@@ -89,13 +89,13 @@ impl Component {
     /// `give_edge` into a component that is already running.  It holds its
     /// own CNode (SLOT_CNODE), so it may have filled the slot, and may fill
     /// it again at any time: a full slot is emptied (and logged) and the
-    /// mint tried once more, and if the component refilled it meanwhile it
-    /// goes without the capability (logged) rather than its parent
-    /// panicking.  Only a component that misbehaves loses anything, and only
-    /// what it could have ignored anyway.  The other gives are for a
-    /// component that has not started, where a full slot is the parent's
-    /// own mistake.
-    pub fn give_edge_live<H, T, O, P>(&self, e: &E<H, T, O, P>, n: usize, i: usize, src: &Obj<T, O>)
+    /// mint tried once more.  If the component refilled it meanwhile, the
+    /// error comes back (logged) rather than its parent panicking: a
+    /// component that does so misbehaves, and the caller fails what it was
+    /// giving the capability for, and the component (as its other faults).
+    /// The other gives are for a component that has not started, where a
+    /// full slot is the parent's own mistake.
+    pub fn give_edge_live<H, T, O, P>(&self, e: &E<H, T, O, P>, n: usize, i: usize, src: &Obj<T, O>) -> sel4::Result<()>
     where
         H: p::IsParty,
         T: p::IsParty,
@@ -104,17 +104,17 @@ impl Component {
     {
         let idx = self.held(e, n);
         // No `minted` audit: the component can replace it again at once.
-        self.live(idx, e.name, || crate::edge::mint(&self.slot(idx), e, i, src));
+        self.live(idx, e.name, || crate::edge::mint(&self.slot(idx), e, i, src))
     }
 
     /// `give` into a running component, as `give_edge_live`.
-    pub fn give_live(&self, idx: u64, src: impl sel4::HasCPtrWithDepth + Copy, rights: CapRights, what: &str) {
-        self.live(idx, what, || self.slot(idx).copy(&self.local_cnode.absolute_cptr(src), rights.clone()));
+    pub fn give_live(&self, idx: u64, src: impl sel4::HasCPtrWithDepth + Copy, rights: CapRights, what: &str) -> sel4::Result<()> {
+        self.live(idx, what, || self.slot(idx).copy(&self.local_cnode.absolute_cptr(src), rights.clone()))
     }
 
     /// Put into slot `idx` of a running component with `put`, replacing
     /// once what it holds there (`give_edge_live`).
-    fn live(&self, idx: u64, what: &str, put: impl Fn() -> sel4::Result<()>) {
+    fn live(&self, idx: u64, what: &str, put: impl Fn() -> sel4::Result<()>) -> sel4::Result<()> {
         let mut r = put();
         if r == Err(sel4::Error::DeleteFirst) {
             log!("component {} slot {} ({}): not empty, replacing what the component put there", self.id, idx, what);
@@ -122,8 +122,9 @@ impl Component {
             r = put();
         }
         if let Err(err) = r {
-            log!("component {} slot {} ({}): not given ({:?}); the component goes without it", self.id, idx, what, err);
+            log!("component {} slot {} ({}): not given ({:?}): it keeps filling the slot", self.id, idx, what, err);
         }
+        r
     }
 
     /// Pass on to it a capability of `e`, which this component holds, that

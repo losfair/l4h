@@ -16,8 +16,7 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-# The cargo profile the host builds with (tools/host-profile.sh).
-PROFILE = "release" if os.environ.get("L4H_RELEASE", "0") == "1" else "debug"
+from host_profile import root_elf  # noqa: E402
 OUT = ROOT / "build/vtdtest"
 
 
@@ -89,7 +88,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="l4h-vtd-") as tmp, log.open("w") as output:
         sock = Path(tmp) / "qtest.sock"
         command = [str(ROOT / "tools/run-qemu.sh"),
-            str(ROOT / f"host/target/x86_64-sel4-roottask/{PROFILE}/l4h-root.elf"),
+            str(root_elf()),
             "-qtest", f"unix:{sock},server=on,wait=off", "-qtest-log", "/dev/null",
             *bridges,
             "-drive", f"file={disk},if=none,id=vtdtest,format=raw",

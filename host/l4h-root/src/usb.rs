@@ -516,6 +516,14 @@ pub fn attach(h: &mut Host, i: usize, g: &mut RootGuest) -> Result<Attached, Err
     if !h.can_afford((uabi::AREA_PAGES + 8) * PAGE, 0, 2 * (1 << QUEUE_RADIX) + 8) {
         return Err(ctl::ENOMEM);
     }
+    // Completions go to the guest's VMM, which raises the device's event:
+    // given before anything is allocated for the area.  A usbd that keeps
+    // filling the slot misbehaves.
+    let n = g.usbs.len();
+    if d.comp.give_edge_live(&wiring::USBD_VMM, idx, n, &g.vmm_ntfn).is_err() {
+        quarantine(c, &h.pci);
+        return Err(ctl::EIO);
+    }
     // The queue area: root's frames, in an arena outside the guest's
     // (usbd may use them after the guest is gone, until REMOVE is done).
     let area = h.alloc.global(|alloc| -> Option<Area> {
@@ -538,12 +546,12 @@ pub fn attach(h: &mut Host, i: usize, g: &mut RootGuest) -> Result<Attached, Err
         let slots = [frames.bits() as Slot, keep.bits() as Slot, guest.bits() as Slot];
         Some(Area { arena, guest, slots })
     });
-    let area = area.ok_or(ctl::ENOMEM)?;
-    let n = g.usbs.len();
+    let Some(area) = area else {
+        let _ = d.comp.slot(usb::USBD_SLOT_CLIENT_IRQ + idx as u64).delete();
+        return Err(ctl::ENOMEM);
+    };
     let guest_frames = area.guest;
     d.areas[idx] = Some(area);
-    // Completions go to the guest's VMM, which raises the device's event.
-    d.comp.give_edge_live(&wiring::USBD_VMM, idx, n, &g.vmm_ntfn);
     let kick = root_cap::<cap_type::Notification>(h.alloc.slots.alloc());
     component::mint_edge(&abs_of(kick), &wiring::VMM_USBD_KICK, 0, &d.comp.obj()).expect("usbd kick");
     d.idx = idx;

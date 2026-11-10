@@ -177,8 +177,9 @@ guest's `arch/l4h` likewise builds only 64-bit kernels. Upstream seL4's own
 - `L4H_RELEASE=1` also builds the host components with Cargo's release
   profile (optimised; overflow checks off), into
   `host/target/<target>/release` rather than `debug`
-  (`tools/host-profile.sh`, which every script that builds, packages or
-  boots them sources), and has them print critical errors only.
+  (`tools/host-profile.sh`, the one definition: every script that
+  builds, packages or boots them sources it, the Python tests through
+  `tests/host_profile.py`), and has them print critical errors only.
 
 Debug syscalls (including `seL4_DebugHalt`, which stops the machine) need
 no capability in seL4. Patch 0008 reserves them to threads with an MCP of

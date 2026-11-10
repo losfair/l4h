@@ -507,8 +507,9 @@ pub fn start(
 
 /// Attach a disk of host disk `disk` that blkd allowed in slot `i`
 /// (`checked`), a window or `extents` extents, to one client of its
-/// running shared controller.  Returns the channel frames (the client's)
-/// and a kick capability (in a slot of its own) for the client's l4h-vmm.
+/// running shared controller, whose blkd has been given the client's done
+/// notification.  Returns the channel frames (the client's) and a kick
+/// capability (in a slot of its own) for the client's l4h-vmm.
 #[allow(clippy::too_many_arguments)]
 fn attach(ctrl: &mut Controller, i: usize, disk: usize, client: &mut RootGuest, window: blk::DiskWindow,
     extents: usize, read_only: bool, volatile: bool, alloc: &mut Alloc, iommu: &mut Iommu) -> (Channel, cap::Notification) {
@@ -531,7 +532,6 @@ fn attach(ctrl: &mut Controller, i: usize, disk: usize, client: &mut RootGuest, 
             CapRights::read_write(), VmAttributes::DEFAULT,
             keep.absolute_cptr_from_bits_with_depth((blk::CHANNEL_PAGES + k) as u64, 10)));
     }
-    driver.comp.give_edge_live(&wiring::BLKD_VMM_DONE, i, 0, &client.vmm_ntfn);
     let kick_slot = alloc.slots.alloc();
     let kick = sel4::init_thread::Slot::<cap_type::Notification>::from_index(kick_slot).cap();
     component::mint_edge(&abs_of(kick), &wiring::VMM_BLKD_KICK, 0, &driver.comp.obj()).expect("blkd kick");
@@ -596,6 +596,14 @@ fn checked(h: &mut Host, c: usize, token: usize, id: usize, instance: u64, disk:
         crate::vmmgr::with_guest(h, id, |h, g| {
             if g.disks.is_full() {
                 return Err(ctl::ENOSPC);
+            }
+            // Client i's completions go to the guest's VMM, given before
+            // anything is allocated for it: a blkd that keeps filling the
+            // slot misbehaves, as one whose answer names a bad slot.
+            let driver = h.ctrls[c].driver.as_ref().expect("started blkd");
+            if driver.comp.give_edge_live(&wiring::BLKD_VMM_DONE, i, 0, &g.vmm_ntfn).is_err() {
+                quarantine(&mut h.ctrls[c], &h.pci);
+                return Err(ctl::EIO);
             }
             let (chan, kick) = attach(&mut h.ctrls[c], i, disk, g, window, n, read_only, volatile, &mut h.alloc, &mut h.iommu);
             g.disks.must_push((c, i));

@@ -115,11 +115,14 @@ fn check(hdr: &mut [u8; HDR_SIZE], frame: &[u8], min_mss: usize) -> bool {
 
 pub const F_DATA_VALID: u8 = 2;
 
-/// Check and normalise the header an uplink device (`min_mss`
-/// UPLINK_MIN_MSS) or a peer partition's link (MIN_MSS) sent with `frame`:
-/// as `sanitize`, but DATA_VALID (the device checked the checksum) is
-/// kept.  A GSO frame without NEEDS_CSUM fails here (guests refuse it);
-/// the caller segments it instead.
+/// Check and normalise the header that came with a received `frame`: as
+/// `sanitize`, but DATA_VALID (the device checked the checksum) is kept.
+/// `min_mss` is the smallest gso_size taken, the bound on how many
+/// packets `segment` can cut the frame into: MIN_MSS from a peer
+/// partition's link, which netd does not trust; UPLINK_MIN_MSS from an
+/// uplink device, whose frames hold the packets it received.  A GSO frame
+/// without NEEDS_CSUM fails here (guests refuse it); the uplink's caller
+/// segments it instead.
 pub fn sanitize_rx(hdr: &mut [u8; HDR_SIZE], frame: &[u8], min_mss: usize) -> bool {
     let valid = hdr[0] & F_DATA_VALID;
     if !check(hdr, frame, min_mss) {
@@ -135,9 +138,11 @@ pub fn is_gso(hdr: &[u8; HDR_SIZE]) -> bool {
     hdr[1] != GSO_NONE
 }
 
-/// The segment size of a GSO frame.
-pub fn gso_size(hdr: &[u8; HDR_SIZE]) -> usize {
-    get16(hdr, 4)
+/// Whether a peer partition's link takes this GSO frame whole: it
+/// refuses one with segments under MIN_MSS (`sanitize_rx` in link.rs),
+/// which an uplink's frames and GRO runs can have.  Those go segmented.
+pub fn link_takes_gso(hdr: &[u8; HDR_SIZE]) -> bool {
+    get16(hdr, 4) >= MIN_MSS
 }
 
 /// Ones' complement sum of `data` (big-endian words) added to `sum`.
@@ -179,8 +184,11 @@ pub fn complete_csum(frame: &mut [u8], hdr: &mut [u8; HDR_SIZE]) {
 }
 
 /// Split a GSO TCP frame (validated by `sanitize`) into MSS-sized frames
-/// with complete checksums, built in `buf`, and pass each to `emit`.  The
-/// segment size is bounded where the frame came in (MIN_MSS).
+/// with complete checksums, built in `buf`, and pass each to `emit`.  It
+/// takes any nonzero gso_size: the bound on segments is where a frame
+/// comes in, MIN_MSS from senders netd does not trust (`sanitize`,
+/// `sanitize_rx`); an uplink's frames and GRO runs segment back into the
+/// packets that were received.
 pub fn segment(frame: &[u8], hdr: &[u8; HDR_SIZE], buf: &mut [u8], mut emit: impl FnMut(&mut [u8], &mut [u8; HDR_SIZE])) {
     let Some(f) = parse_tcp(frame) else { return };
     let mss = get16(hdr, 4);

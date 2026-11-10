@@ -774,7 +774,8 @@ fn nic_add(h: &mut Host, id: usize, dev: usize, switch: u32, mac: u64, lock: boo
         if mac >> 40 & 1 != 0 {
             return Err(ctl::EINVAL);
         }
-        let memory = crate::netd::Netd::port_memory(&mut h.alloc)?;
+        h.netd.give_port_done(p, g, &h.pci)?;
+        let memory = crate::netd::Netd::port_memory(&mut h.alloc).inspect_err(|_| h.netd.take_port_done(p))?;
         let (chan, kick) = h.netd.add_port(g, p, switch, mac, lock, isolated, memory, &mut h.alloc);
         g.ports.must_push(p);
         use root_call::caps::nic_add::{KICK, PORT_FRAMES};

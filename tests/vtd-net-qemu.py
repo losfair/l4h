@@ -16,8 +16,7 @@ import subprocess
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-# The cargo profile the host builds with (tools/host-profile.sh).
-PROFILE = "release" if os.environ.get("L4H_RELEASE", "0") == "1" else "debug"
+from host_profile import root_elf  # noqa: E402
 OUT = ROOT / "build/vtdtest"
 
 
@@ -57,7 +56,7 @@ def run(topology, platform, taps, env, controllers, intremap):
     with log.open("w") as output:
         proc = subprocess.Popen([
             str(ROOT / "tools/run-qemu.sh"),
-            str(ROOT / f"host/target/x86_64-sel4-roottask/{PROFILE}/l4h-root.elf"),
+            str(root_elf()),
             *devices(topology, platform, taps, controllers),
         ], env=env, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
         try:

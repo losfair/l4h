@@ -412,6 +412,27 @@ fn min_mss_check(rng: &mut Rng) {
             n += 1;
         });
         assert_eq!(n, 10);
+        // A GRO run keeps its segments' size, under MIN_MSS too; netd
+        // segments such a run before a link, as the peer would refuse it.
+        for mss in [10, offload::MIN_MSS - 1, offload::MIN_MSS, 1460] {
+            let (mut frame, mut hdr) = tcp_frame(rng, v6, false, 3 * mss, mss);
+            let t = offload::parse_tcp(&frame).unwrap();
+            frame[t.tcp + 13] = 0x10;
+            assert!(offload::sanitize_rx(&mut hdr, &frame, offload::UPLINK_MIN_MSS));
+            let mut segs: Vec<Vec<u8>> = Vec::new();
+            offload::segment(&frame, &hdr, &mut buf, |f, _| segs.push(f.to_vec()));
+            let mut gro = offload::Gro::new();
+            for s in &segs {
+                assert!(gro.add(s, &[0u8; 12]), "segment of {mss} bytes not merged");
+            }
+            let mut run = None;
+            gro.flush(|f, h| run = Some((f.to_vec(), *h)));
+            let (run, h) = run.unwrap();
+            assert!(offload::is_gso(&h));
+            let peer_takes = offload::sanitize_rx(&mut h.clone(), &run, offload::MIN_MSS);
+            assert_eq!(offload::link_takes_gso(&h), peer_takes, "link and peer disagree on a run of {mss}");
+            assert_eq!(peer_takes, mss >= offload::MIN_MSS);
+        }
     }
 }
 

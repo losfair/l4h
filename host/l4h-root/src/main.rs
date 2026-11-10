@@ -700,7 +700,7 @@ fn dom0_plan(h: &mut Host, ntfn: cap::Notification) -> Dom0Plan {
     for (ch, uplink) in links.iter() {
         let (peer, uplink) = (ch.peer, *uplink);
         let sw = if uplink { 0 } else { h.netd.create_switch() };
-        match h.netd.add_link(ch, me, sw, ntfn, &mut h.alloc, &mut h.devmem) {
+        match h.netd.add_link(ch, me, sw, ntfn, &mut h.alloc, &mut h.devmem, &h.pci) {
             Ok(l) => info!("l4h-root: link to partition {} on switch {} (netd link {})", peer, sw, l),
             Err(e) => log!("l4h-root: no link to partition {}: error {}", peer, e),
         }
