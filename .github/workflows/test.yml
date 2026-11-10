@@ -120,6 +120,8 @@ jobs:
           echo "CPU: $model; $name, KVM nested: $nested"
           if grep -qw 'vmx\|svm' /proc/cpuinfo && [[ $nested == [Y1] ]]; then
             tests/run-vtxtest.sh on
+            # The VCPU stress has only been run on AMD-V so far.
+            if [ "$virt" = svm ]; then tests/run-vcpustress.sh; fi
             L4H_QEMU_CPU=host,+invtsc tests/run-selftest.sh 1
             if grep -q "$virt: unavailable" build/qemu.log; then
               echo "the self-test ran without $name"; exit 1
