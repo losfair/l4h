@@ -574,7 +574,7 @@ impl Input {
         if self.cursor > head {
             self.cursor = head;
         }
-        let oldest = head.saturating_sub(CAPACITY as u64);
+        let oldest = self.ring.ring.oldest_at(head);
         if self.cursor < oldest {
             self.lost += oldest - self.cursor;
             self.cursor = oldest;

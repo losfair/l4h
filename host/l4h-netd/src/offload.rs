@@ -9,11 +9,13 @@ pub const GSO_NONE: u8 = 0;
 pub const GSO_TCPV4: u8 = 1;
 pub const GSO_TCPV6: u8 = 4;
 pub const GSO_ECN: u8 = 0x80;
-/// The smallest segment size we segment a GSO frame into (Linux's
-/// `TCP_MIN_MSS`): a guest that advertised a tiny `gso_size` would make
-/// `segment` cut one frame into tens of thousands of packets and keep
-/// netd's single thread busy for every other port (DESIGN.md §9.3).
-pub const MIN_MSS: usize = 88;
+/// The smallest `gso_size` a GSO frame in netd has (Linux's sender floor,
+/// `TCP_MIN_SND_MSS`, the default of net.ipv4.tcp_min_snd_mss): a tiny one
+/// would make `segment` cut one frame into tens of thousands of packets
+/// and keep netd's single thread busy for every other port (DESIGN.md
+/// §9.3).  `sanitize` refuses a smaller one from a guest or an uplink,
+/// `Gro` builds none, and `segment` refuses one regardless.
+pub const MIN_MSS: usize = 48;
 
 fn get16(h: &[u8; HDR_SIZE], off: usize) -> usize {
     u16::from_le_bytes([h[off], h[off + 1]]) as usize
@@ -163,12 +165,13 @@ pub fn complete_csum(frame: &mut [u8], hdr: &mut [u8; HDR_SIZE]) {
 }
 
 /// Split a GSO TCP frame (validated by `sanitize`) into MSS-sized frames
-/// with complete checksums, built in `buf`, and pass each to `emit`.
+/// with complete checksums, built in `buf`, and pass each to `emit`.  A
+/// frame whose gso_size is under MIN_MSS is dropped.
 pub fn segment(frame: &[u8], hdr: &[u8; HDR_SIZE], buf: &mut [u8], mut emit: impl FnMut(&mut [u8], &mut [u8; HDR_SIZE])) {
     let Some(f) = parse_tcp(frame) else { return };
     let mss = get16(hdr, 4);
     let payload = &frame[f.hdrs..];
-    if mss == 0 || f.hdrs + mss > buf.len() {
+    if mss < MIN_MSS || f.hdrs + mss > buf.len() {
         return;
     }
     let seq0 = u32::from_be_bytes(frame[f.tcp + 4..f.tcp + 8].try_into().unwrap());
@@ -347,6 +350,11 @@ impl Gro {
         let seq = u32::from_be_bytes(frame[f.tcp + 4..f.tcp + 8].try_into().unwrap());
         let push = frame[f.tcp + 13] & 0x08 != 0;
         if self.f.is_none() {
+            // A run's segment size is its gso_size: below MIN_MSS the
+            // segment passes on its own.
+            if payload < MIN_MSS {
+                return false;
+            }
             self.buf[..end].copy_from_slice(&frame[..end]);
             self.len = end;
             self.hdr = *hdr;

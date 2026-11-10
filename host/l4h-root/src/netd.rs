@@ -491,9 +491,6 @@ impl Netd {
                 comp.map_copy(alloc, arena, &f, net::port_va(p) + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, dst)
             });
         }
-        // Empty the slot first: it is in netd's CNode, which netd could
-        // have filled, and a failed mint would panic root (as usb.rs does).
-        let _ = self.comp.slot(net::NETD_SLOT_CLIENT_BASE + p as u64).delete();
         self.comp.give_edge(&wiring::NETD_VMM_DONE, p, 0, &g.vmm_ntfn);
         let kick_slot = alloc.slots.alloc();
         let kick = sel4::init_thread::Slot::<cap_type::Notification>::from_index(kick_slot).cap();

@@ -7,6 +7,7 @@
 # L4H_TEST_KERNEL may name an already-built compatible guest kernel.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
+source "$root/tools/host-profile.sh"
 export PATH="/usr/sbin:$PATH"
 out=$root/build/sharedblk
 mkdir -p "$out"
@@ -43,7 +44,7 @@ scsi-luns)
 *) slowdev=(-device virtio-blk-pci,drive=d1,disable-legacy=on)
    dev=(-device virtio-blk-pci,drive=d0,disable-legacy=on) ;;
 esac
-"$root/tools/run-qemu.sh" "$root/host/target/x86_64-sel4-roottask/debug/l4h-root.elf" \
+"$root/tools/run-qemu.sh" "$root/host/target/x86_64-sel4-roottask/$l4h_profile/l4h-root.elf" \
     -drive "file=$out/disk.raw,if=none,id=d0,format=raw" "${dev[@]}" \
     -drive "file=$out/slow.raw,if=none,id=d1,format=raw,throttling.bps-read=65536" "${slowdev[@]}" > "$out/qemu.log" 2>&1 &
 qemu=$!

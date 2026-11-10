@@ -14,9 +14,11 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
+# The cargo profile the host builds with (tools/host-profile.sh).
+PROFILE = "release" if os.environ.get("L4H_RELEASE", "0") == "1" else "debug"
 VARIANT = os.environ.get("L4H_KERNEL_VARIANT", "skim-xapic-nopcid")
 KERNEL = ROOT / f"build/sel4-{VARIANT}/bin/kernel.elf"
-APP = ROOT / "host/target/x86_64-sel4-roottask/debug/l4h-root.elf"
+APP = ROOT / f"host/target/x86_64-sel4-roottask/{PROFILE}/l4h-root.elf"
 CPU = os.environ.get("L4H_QEMU_CPU", "host,vendor=GenuineIntel,-vmx,+invtsc,-arch-capabilities,-pcid,-invpcid,-x2apic")
 
 

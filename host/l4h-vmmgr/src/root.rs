@@ -115,6 +115,22 @@ pub fn disk_attach_result(alloc: &mut Alloc, token: usize) -> Result<Backend, Er
     Ok(disk_backend(alloc))
 }
 
+/// Give back vmmgr's capabilities of a disk channel it cannot use (the
+/// device could not be added).  Root keeps its end until `guest_del`.
+pub fn disk_backend_drop(alloc: &mut Alloc, backend: Backend) {
+    if let Backend::Blk { chan, kick } = backend {
+        for &c in chan.iter() {
+            drop_cap(alloc, c);
+        }
+        drop_cap(alloc, kick);
+    }
+}
+
+fn drop_cap<T: sel4::CapType>(alloc: &mut Alloc, c: sel4::Cap<T>) {
+    let _ = abs_of(c).delete();
+    alloc.slots.free(c.bits() as crate::mem::Slot);
+}
+
 fn disk_backend(alloc: &mut Alloc) -> Backend {
     let mut chan = ArrayVec::new();
     for i in 0..host::blk::CHANNEL_PAGES {

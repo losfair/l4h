@@ -7,7 +7,9 @@ export L4H_VERSION=$("$root/tools/version.sh")
 cd "$root/host"
 export SEL4_PREFIX=$root/build/sel4-aarch64
 export CC_aarch64_sel4=aarch64-linux-gnu-gcc CC_aarch64_sel4_roottask=aarch64-linux-gnu-gcc
-out=$root/host/target/aarch64-sel4/debug
+# The cargo profile, as for tools/build-host.sh.
+source "$root/tools/host-profile.sh"
+out=$root/host/target/aarch64-sel4/$l4h_profile
 mkdir -p "$out/stripped"
 strip() {
     for c in "$@"; do
@@ -17,8 +19,8 @@ strip() {
         export "L4H_$(echo $c | tr a-z A-Z)_ELF=$out/stripped/l4h-$c.elf"
     done
 }
-cargo build -q --target aarch64-sel4 -p l4h-vmm -p l4h-blkd -p l4h-netd -p l4h-trustd -p l4h-memd -p l4h-logd -p l4h-usbd
+cargo build -q "${l4h_cargo_profile[@]}" --target aarch64-sel4 -p l4h-vmm -p l4h-blkd -p l4h-netd -p l4h-trustd -p l4h-memd -p l4h-logd -p l4h-usbd
 strip vmm blkd netd trustd memd logd usbd
-cargo build -q --target aarch64-sel4 -p l4h-vmmgr
+cargo build -q "${l4h_cargo_profile[@]}" --target aarch64-sel4 -p l4h-vmmgr
 strip vmmgr
-cargo build -q --target aarch64-sel4-roottask -p l4h-root "$@"
+cargo build -q "${l4h_cargo_profile[@]}" --target aarch64-sel4-roottask -p l4h-root "$@"

@@ -29,7 +29,7 @@ rm -f "$log"
 balloon=$((1 - baseline))
 [ "${BALLOONTEST_LEGACY:-0}" = 1 ] && [ "$baseline" = 0 ] && balloon=legacy
 L4H_BALLOON=$balloon L4H_MEM=${L4H_MEM:-4G} \
-    "$l4h_qemu" "$root/host/target/$l4h_target/debug/l4h-root.elf" </dev/null >"$log" 2>&1 &
+    "$l4h_qemu" "$root/host/target/$l4h_target/$l4h_profile/l4h-root.elf" </dev/null >"$log" 2>&1 &
 qemu=$!
 trap 'kill $qemu 2>/dev/null || true' EXIT
 rss() { awk '/^VmRSS:/ { print int($2 / 1024) }' "/proc/$qemu/status"; }

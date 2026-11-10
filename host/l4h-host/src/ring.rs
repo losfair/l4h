@@ -106,9 +106,12 @@ impl<const N: usize, const W: usize> Ring<N, W> {
         self.head.load(SeqCst)
     }
 
-    /// The oldest sequence a reader can still find.
-    pub fn oldest(&self) -> u64 {
-        self.head().saturating_sub(N as u64)
+    /// The oldest sequence a reader can still find, given `head`, which
+    /// it read once: a writer can move head at any time, and a reader
+    /// whose bounds come from two reads of it can be sent far outside the
+    /// ring's N records.
+    pub fn oldest_at(&self, head: u64) -> u64 {
+        head.saturating_sub(N as u64)
     }
 
     /// Claim `n` consecutive sequences, so that a reader finds them next

@@ -177,6 +177,7 @@ fn main() {
     println!("fuzz-virtq: blk-mux pool check: {} segments, {segs} accepted", iterations * 4);
     let segs = offload_check(&mut rng, iterations / 4);
     let merged = gro_check(&mut rng, iterations / 20);
+    min_mss_check(&mut rng);
     println!("fuzz-virtq: offload: {} frames, {segs} segments checked", iterations / 4);
     println!("fuzz-virtq: GRO: {} streams, {merged} merged frames segment back exactly", iterations / 20);
     let (reqs, bad) = blkcheck::drain_check(&mut rng, iterations / 20);
@@ -385,6 +386,38 @@ fn offload_check(rng: &mut Rng, n: u64) -> u64 {
         segs += count;
     }
     segs
+}
+
+/// No GSO frame in netd has a gso_size under MIN_MSS, which would have
+/// `segment` cut one frame into tens of thousands of packets: `sanitize`
+/// refuses one, `segment` drops one whatever its header says, and `Gro`
+/// starts no run with a shorter segment.
+fn min_mss_check(rng: &mut Rng) {
+    let mut buf = vec![0u8; 70000];
+    for v6 in [false, true] {
+        for mss in [1, offload::MIN_MSS - 1] {
+            let (frame, mut hdr) = tcp_frame(rng, v6, false, 60000, mss);
+            let mut sanitized = hdr;
+            assert!(!offload::sanitize(&mut sanitized, &frame), "gso_size {mss} accepted");
+            hdr[0] = offload::F_NEEDS_CSUM;
+            let mut n = 0;
+            offload::segment(&frame, &hdr, &mut buf, |_, _| n += 1);
+            assert_eq!(n, 0, "gso_size {mss} segmented");
+        }
+        let (mut frame, mut hdr) = tcp_frame(rng, v6, false, offload::MIN_MSS + 10, offload::MIN_MSS);
+        let t = offload::parse_tcp(&frame).unwrap();
+        frame[t.tcp + 13] = 0x10;
+        assert!(offload::sanitize(&mut hdr, &frame), "gso_size MIN_MSS refused");
+        let mut segs: Vec<Vec<u8>> = Vec::new();
+        offload::segment(&frame, &hdr, &mut buf, |f, _| segs.push(f.to_vec()));
+        assert_eq!(segs.len(), 2);
+        // A full segment starts a run; the 10-byte one alone does not.
+        let rx = [0u8; 12];
+        let mut gro = offload::Gro::new();
+        assert!(gro.add(&segs[0], &rx), "MIN_MSS segment not merged");
+        let mut gro = offload::Gro::new();
+        assert!(!gro.add(&segs[1], &rx), "segment under MIN_MSS started a run");
+    }
 }
 
 /// netd's receive offload: a stream of segments (as a TSO sender's NIC

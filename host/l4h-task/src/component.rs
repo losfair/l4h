@@ -59,15 +59,26 @@ impl Component {
         self.cnode.absolute_cptr_from_bits_with_depth(idx, self.cnode_bits)
     }
 
+    /// Slot `idx`, emptied first.  A running component can fill its own
+    /// CNode, and a driver is not trusted to leave a slot it is to be given
+    /// empty: a copy or mint into a full slot fails, and the panic would
+    /// stop its parent (root's is the whole host).  Every give goes here.
+    fn target(&self, idx: u64) -> sel4::AbsoluteCPtr {
+        let slot = self.slot(idx);
+        // Deleting an empty slot succeeds; nothing to do if this fails.
+        let _ = slot.delete();
+        slot
+    }
+
     pub fn give(&self, idx: u64, src: impl sel4::HasCPtrWithDepth, rights: CapRights) {
-        self.slot(idx)
+        self.target(idx)
             .copy(&self.local_cnode.absolute_cptr(src), rights)
             .unwrap_or_else(|e| panic!("component {} slot {} copy: {:?}", self.id, idx, e));
     }
 
     /// Give it a CNode, with `guard`: the one mint that is no edge.
     pub fn give_cnode(&self, idx: u64, cnode: cap::CNode, guard: CNodeCapData) {
-        crate::edge::mint_cnode(&self.slot(idx), self.local_cnode, cnode, guard)
+        crate::edge::mint_cnode(&self.target(idx), self.local_cnode, cnode, guard)
             .unwrap_or_else(|e| panic!("component {} slot {} mint: {:?}", self.id, idx, e));
     }
 
@@ -81,7 +92,7 @@ impl Component {
         P: Protocol,
     {
         let idx = self.held(e, n);
-        crate::edge::mint(&self.slot(idx), e, i, src)
+        crate::edge::mint(&self.target(idx), e, i, src)
             .unwrap_or_else(|err| panic!("component {} slot {} ({}: {}) mint: {:?}", self.id, idx, e.name, e.what, err));
         self.minted(e, idx);
     }
@@ -97,7 +108,7 @@ impl Component {
         P: Protocol,
     {
         let idx = self.held(e, n);
-        self.slot(idx)
+        self.target(idx)
             .copy(&self.local_cnode.absolute_cptr(minted), crate::edge::rights(e))
             .unwrap_or_else(|err| panic!("component {} slot {} ({}: {}) copy: {:?}", self.id, idx, e.name, e.what, err));
         self.minted(e, idx);

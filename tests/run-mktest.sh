@@ -68,7 +68,7 @@ dom0_initramfs
 if [ -z "$efi" ]; then
     "$root/tools/build-mkshim.sh" "$n" >/dev/null
     "$root/tools/build-host.sh"
-    objcopy --strip-debug "$root/host/target/x86_64-sel4-roottask/debug/l4h-root.elf" "$out/l4h-root.elf"
+    objcopy --strip-debug "$root/host/target/x86_64-sel4-roottask/$l4h_profile/l4h-root.elf" "$out/l4h-root.elf"
     cp "$root/build/mkshim/l4h-mkshim.elf" "$out/"
 fi
 

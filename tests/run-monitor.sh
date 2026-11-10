@@ -16,7 +16,7 @@ log=$root/build/qemu-monitor.log
 fifo=$(mktemp -u)
 mkfifo "$fifo"
 trap 'rm -f "$fifo"' EXIT
-"$l4h_qemu" "$root/host/target/$l4h_target/debug/l4h-root.elf" <"$fifo" >"$log" 2>&1 &
+"$l4h_qemu" "$root/host/target/$l4h_target/$l4h_profile/l4h-root.elf" <"$fifo" >"$log" 2>&1 &
 qemu=$!
 exec 3>"$fifo"
 wait_for() { # pattern count timeout
@@ -67,7 +67,7 @@ serial_irq=3
 watchdog_secs=1
 CONF
     log=$root/build/qemu-monitor-absent.log
-    L4H_CONFIG="$config" "$l4h_qemu" "$root/host/target/$l4h_target/debug/l4h-root.elf" \
+    L4H_CONFIG="$config" "$l4h_qemu" "$root/host/target/$l4h_target/$l4h_profile/l4h-root.elf" \
         </dev/null >"$log" 2>&1 &
     qemu=$!
     # Root must keep handling timer notifications with no UART. Before

@@ -185,8 +185,8 @@ pub struct Vmmgr {
 
 /// What a request root answers later is for.
 pub enum RootOp {
-    /// A disk for guest `id` (instance `instance`).
-    Disk { id: usize, instance: u64, then: Then },
+    /// Disk device `d` of guest `id` (instance `instance`).
+    Disk { id: usize, instance: u64, d: usize, then: Then },
     /// A host op of a control request (Then::Ctl).
     HostOp { then: Then },
 }
@@ -285,12 +285,12 @@ impl Vmmgr {
             let d = g.devices.len();
             match root::disk_attach(&mut h.alloc, id, d, disk, flags, lba_start, lba_count, extents)? {
                 Later::Now(backend) => {
-                    add_disk(h, g, backend)?;
+                    add_disk(h, g, d, backend)?;
                     Ok(Later::Now(()))
                 }
                 Later::Token(t) => {
                     g.root_pending = true;
-                    h.root_ops[t] = Some(RootOp::Disk { id, instance, then });
+                    h.root_ops[t] = Some(RootOp::Disk { id, instance, d, then });
                     Ok(Later::Token(t))
                 }
             }
@@ -299,7 +299,7 @@ impl Vmmgr {
     }
 
     /// Root answered the disk attachment of guest `id` (`attach_disk`).
-    fn disk_attached(&mut self, id: usize, instance: u64, token: usize) -> Result<(), Errno> {
+    fn disk_attached(&mut self, id: usize, instance: u64, d: usize, token: usize) -> Result<(), Errno> {
         if self.guest(id).is_none_or(|g| g.instance != instance) {
             root::discard(token);
             return Err(ctl::ENOENT);
@@ -307,7 +307,7 @@ impl Vmmgr {
         self.with_guest(id, |h, g| {
             g.root_pending = false;
             let backend = root::disk_attach_result(&mut h.alloc, token)?;
-            add_disk(h, g, backend)
+            add_disk(h, g, d, backend)
         })
         .ok_or(ctl::ENOENT)?
     }
@@ -316,8 +316,8 @@ impl Vmmgr {
     pub fn root_done(&mut self, done: [u64; proto::MAX_PENDING / 64]) {
         for t in (0..proto::MAX_PENDING).filter(|&t| done[t / 64] & (1 << (t % 64)) != 0) {
             match self.root_ops[t].take() {
-                Some(RootOp::Disk { id, instance, then }) => {
-                    let r = self.disk_attached(id, instance, t);
+                Some(RootOp::Disk { id, instance, d, then }) => {
+                    let r = self.disk_attached(id, instance, d, t);
                     match then {
                         Then::Ctl { caller, instance, seq } => ctl::answer(self, caller, instance, seq, r.map(|()| [0; 6])),
                         Then::Dom0Boot { k } => dom0_disk_done(self, id, instance, k, r),
@@ -357,7 +357,9 @@ impl Vmmgr {
     /// Keep a failed boot disk's position without a channel or DMA access.
     pub fn attach_dummy_disk(&mut self, id: usize) -> Result<(), Errno> {
         self.with_guest(id, |h, g| {
-            if g.state != State::Created || g.root_pending { return Err(ctl::EBUSY); }
+            // As every attach path: not once the VMM, which was given the
+            // devices there were, is spawned.
+            if g.state != State::Created || g.vmm.is_some() || g.root_pending { return Err(ctl::EBUSY); }
             let d = g.add_device(&mut h.alloc, guest::DevKind::Virtio(2)).ok_or(ctl::ENOSPC)?;
             g.backends.must_push((d, vmm::Backend::UnavailableBlk));
             Ok(())
@@ -653,12 +655,21 @@ fn dom0_finish(h: &mut Vmmgr, id: usize) {
     h.start_guest(id).expect("start dom0");
 }
 
-/// Add the disk device of `backend` to `g`, which has room for it
-/// (attach_disk checked, and, since attach_disk refuses once the VMM is
-/// spawned, the guest is still Created here).  Fails rather than panics if
-/// a device can no longer be added.
-fn add_disk(h: &mut Vmmgr, g: &mut Guest, backend: vmm::Backend) -> Result<(), Errno> {
-    let d = g.add_device(&mut h.alloc, guest::DevKind::Virtio(2)).ok_or(ctl::ENOSPC)?;
+/// Add the disk device of `backend` to `g` as device `d`, the index root
+/// made the channel for.  attach_disk checked there was room and, while
+/// root_pending, nothing else can add a device or spawn the VMM, so this
+/// holds; should it not, the channel is given back rather than vmmgr
+/// panicking or the channel landing on another device.
+fn add_disk(h: &mut Vmmgr, g: &mut Guest, d: usize, backend: vmm::Backend) -> Result<(), Errno> {
+    if g.state != State::Created || g.vmm.is_some() || g.devices.len() != d {
+        root::disk_backend_drop(&mut h.alloc, backend);
+        return Err(ctl::EBUSY);
+    }
+    let Some(added) = g.add_device(&mut h.alloc, guest::DevKind::Virtio(2)) else {
+        root::disk_backend_drop(&mut h.alloc, backend);
+        return Err(ctl::ENOSPC);
+    };
+    debug_assert_eq!(added, d);
     g.backends.must_push((d, backend));
     Ok(())
 }

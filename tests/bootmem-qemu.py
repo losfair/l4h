@@ -14,13 +14,15 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
+# The cargo profile the host builds with (tools/host-profile.sh).
+PROFILE = "release" if os.environ.get("L4H_RELEASE", "0") == "1" else "debug"
 ARCH = os.environ.get("L4H_ARCH", "x86_64")
 assert ARCH in ("x86_64", "aarch64"), ARCH
 ARM = ARCH == "aarch64"
 SUFFIX = "-aarch64" if ARM else ""
 KERNEL = ROOT / f"build/kernel{SUFFIX}/kernel.elf"
 PREFIX = ROOT / f"build/sel4{SUFFIX}"
-APP = ROOT / f"host/target/{ARCH}-sel4-roottask/debug/l4h-root.elf"
+APP = ROOT / f"host/target/{ARCH}-sel4-roottask/{PROFILE}/l4h-root.elf"
 BASE = 0x60000000 if ARM else 0x20000000
 OFFSETS = (0, 0x1FF8, 0x2800)
 PATTERN = 0x123456789ABCDEF0

@@ -543,8 +543,6 @@ pub fn attach(h: &mut Host, i: usize, g: &mut RootGuest) -> Result<Attached, Err
     let guest_frames = area.guest;
     d.areas[idx] = Some(area);
     // Completions go to the guest's VMM, which raises the device's event.
-    let irq_slot = usb::USBD_SLOT_CLIENT_IRQ + idx as u64;
-    let _ = d.comp.slot(irq_slot).delete();
     d.comp.give_edge(&wiring::USBD_VMM, idx, n, &g.vmm_ntfn);
     let kick = root_cap::<cap_type::Notification>(h.alloc.slots.alloc());
     component::mint_edge(&abs_of(kick), &wiring::VMM_USBD_KICK, 0, &d.comp.obj()).expect("usbd kick");
