@@ -2828,12 +2828,14 @@ pending, and so does whatever waits for it, nothing else:
   (§9.7). A usbd that never answers keeps its controller's queue areas,
   and no later guest of that controller gets a working one.
 - **Teardown waits for no one.** A destroyed guest's I/O pool leaves the
-  devices' IOMMU domains at once, and is reused once blkd has drained its
-  disks (§10.1, Disk detach; netd's answers are not waited for); what drivers map (disk
-  channels, extent tables, port memory) is kept until they say they have
-  let go, and with it, without an IOMMU, the pool (a `Zombie`). Revoking
+  devices' IOMMU domains at once; what drivers map (disk channels, extent
+  tables, port memory) is kept until they say they have let go, and the
+  pool until blkd has drained the guest's disks, IOMMU or not, since the
+  device may still run their commands (a `Zombie`; §10.1, Disk detach;
+  the pool does not wait for netd). Revoking
   the memory would also unmap it from the driver, but an honest driver
-  would fault. A driver that never answers keeps that memory, and the
+  would fault. A driver that never answers keeps that memory (a blkd, the
+  pool too), and the
   client and port slots, for good, and each such guest keeps a guest's
   place: root admits a guest other than dom0 only while live guests and
   zombies are fewer than
@@ -3139,7 +3141,9 @@ requests distinguish power off, reboot and kernel panic.
   A cursor a read gave can be later than that moment (the read was full),
   and the read from it is then empty, at the cursor: only a cursor in the
   future, or past the caller's end, is refused, so no writer can make
-  another's reads fail by leaving a slot claimed.
+  another's reads fail by leaving a slot claimed. A read that stops short
+  of the end its caller gave still reports that end, so a snapshot's
+  reader goes on reading to it rather than taking it as done.
   A record's time is its writer's to choose: one in the future waits, one in
   the past is missed by a follower, and either is only its writer's loss.
   Lost counts the slots a read finds unavailable between a lane's records,

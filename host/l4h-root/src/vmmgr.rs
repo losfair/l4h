@@ -809,7 +809,11 @@ fn guest_del(h: &mut Host, id: usize) -> Result<u64, Errno> {
     // still be finishing the guest's commands, and could reach it again
     // once its domain maps another client's pool at the same addresses:
     // with disks, the pool goes once blkd has drained them all
-    // (`zombie_disk_done`).  Without, it goes now.
+    // (`zombie_disk_done`).  Without, it goes now.  A blkd that never
+    // answers keeps it, as it would without an IOMMU: its device may
+    // still run those commands, and only a quarantine (`blkd::removed`)
+    // stops it.  Without a zombie's place, the pool stays with the rest of
+    // the guest's memory, for good, as no drain can then be counted.
     let pool = g.pool.paddr;
     let z = h.zombies.iter().position(Option::is_none);
     let mut cut_pool = None;

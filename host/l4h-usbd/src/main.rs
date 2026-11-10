@@ -1466,10 +1466,11 @@ impl Usbd {
         // requests go first: a REMOVE of a guest that is going, and with it
         // the next guest's ATTACH, does not wait behind up to CTL_BUDGET of
         // the going guest's own records.  They stay queued for the next turn,
-        // which serves the mailbox first.
+        // which serves the mailbox first.  Transfers still go on: they wait
+        // for no command.
         for _ in 0..CTL_BUDGET {
             if l4h_rt::mailbox::pending() {
-                return;
+                break;
             }
             let cl = self.client.as_mut().unwrap();
             let head = cl.guest(|c| &c.ctl_sq_head);

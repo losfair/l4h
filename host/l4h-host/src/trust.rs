@@ -11,7 +11,7 @@
 //! firmware's AML, only calls it.  Root waits only for the flags server,
 //! in its start-up handshake.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 use l4h_abi as abi;
 
 /// The TPM interface.
@@ -273,6 +273,83 @@ pub unsafe fn registered(registry: usize, id: usize) -> u64 {
     }
     let p = (registry as *const GuestRecord).wrapping_add(id);
     unsafe { core::ptr::addr_of!((*p).instance).read_volatile() }
+}
+
+/// Both ends of a registry record: root writes it (`write_record`,
+/// `clear_record`), trustd reads it (`read_record`).  A record's fields are
+/// written only while its instance is 0, before the instance; instances are
+/// never given twice (root counts them, from 1).  So a reader that reads
+/// the instance, the fields, and the same instance again has that
+/// instance's fields.  One read of the whole record would not do: its
+/// loads come in any order, its instance's after a destroyed guest's
+/// launch digest, which a report would then give a guest started on its
+/// id.
+///
+/// Write guest `id`'s record, for `instance` (non-zero): its fields, then
+/// the instance.  False, and nothing written, if the record holds an
+/// instance (a running guest's record stays as it is) or there is none
+/// for `id`.
+///
+/// # Safety
+/// The registry must be mapped writable at `registry`, and its only writer
+/// this.
+pub unsafe fn write_record(registry: usize, id: usize, instance: u64, r: &GuestRecord) -> bool {
+    use core::ptr::{addr_of, addr_of_mut};
+    if id >= MAX_RECORDS || instance == 0 {
+        return false;
+    }
+    let p = (registry as *mut GuestRecord).wrapping_add(id);
+    unsafe {
+        if addr_of!((*p).instance).read_volatile() != 0 {
+            return false;
+        }
+        addr_of_mut!((*p).ram).write_volatile(r.ram);
+        addr_of_mut!((*p).vcpus).write_volatile(r.vcpus);
+        addr_of_mut!((*p).flags).write_volatile(r.flags);
+        addr_of_mut!((*p).launch).write_volatile(r.launch);
+        addr_of_mut!((*p).reserved).write_volatile(0);
+        fence(Ordering::Release);
+        addr_of_mut!((*p).instance).write_volatile(instance);
+    }
+    true
+}
+
+/// Guest `id` is destroyed: its record holds no instance, which a reader
+/// sees before any field the next guest's `write_record` writes.
+///
+/// # Safety
+/// As `write_record`.
+pub unsafe fn clear_record(registry: usize, id: usize) {
+    if id >= MAX_RECORDS {
+        return;
+    }
+    let p = (registry as *mut GuestRecord).wrapping_add(id);
+    unsafe { core::ptr::addr_of_mut!((*p).instance).write_volatile(0) };
+    fence(Ordering::SeqCst);
+}
+
+/// Guest `id`'s record, if it runs: one instance's fields (`write_record`).
+///
+/// # Safety
+/// The registry must be mapped at `registry`.
+pub unsafe fn read_record(registry: usize, id: usize) -> Option<GuestRecord> {
+    if id >= MAX_RECORDS {
+        return None;
+    }
+    let p = (registry as *const GuestRecord).wrapping_add(id);
+    let instance = || unsafe { core::ptr::addr_of!((*p).instance).read_volatile() };
+    loop {
+        let first = instance();
+        if first == 0 {
+            return None;
+        }
+        fence(Ordering::Acquire);
+        let r = unsafe { p.read_volatile() };
+        fence(Ordering::Acquire);
+        if instance() == first {
+            return Some(GuestRecord { instance: first, ..r });
+        }
+    }
 }
 
 /// One instance's consistent flags. A different instance reads as empty.
@@ -661,6 +738,30 @@ impl Default for AttestNotices {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_record_is_one_instances() {
+        let mut page = [0u64; 4096 / 8];
+        let reg = page.as_mut_ptr() as usize;
+        let rec = |ram, launch| GuestRecord { instance: 0, ram, vcpus: 2, flags: RECORD_DOM0, launch: [launch; 32], reserved: 7 };
+        unsafe {
+            assert!(read_record(reg, 3).is_none());
+            assert!(write_record(reg, 3, 5, &rec(64, 0xa)));
+            // A running guest's record stays; an id past the registry has none.
+            assert!(!write_record(reg, 3, 6, &rec(128, 0xb)));
+            assert!(!write_record(reg, MAX_RECORDS, 6, &rec(128, 0xb)));
+            assert!(!write_record(reg, 4, 0, &rec(128, 0xb)));
+            let r = read_record(reg, 3).unwrap();
+            assert_eq!((r.instance, r.ram, r.vcpus, r.flags, r.launch, r.reserved), (5, 64, 2, RECORD_DOM0, [0xa; 32], 0));
+            assert_eq!(registered(reg, 3), 5);
+            clear_record(reg, 3);
+            assert!(read_record(reg, 3).is_none());
+            assert!(write_record(reg, 3, 6, &GuestRecord { flags: 0, ..rec(128, 0xb) }));
+            let r = read_record(reg, 3).unwrap();
+            assert_eq!((r.instance, r.ram, r.flags, r.launch), (6, 128, 0, [0xb; 32]));
+            assert!(read_record(reg, MAX_RECORDS).is_none());
+        }
+    }
 
     #[test]
     fn an_entry_being_written_reads_as_unavailable_not_for_ever() {
