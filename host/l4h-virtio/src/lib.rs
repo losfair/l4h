@@ -145,13 +145,32 @@ pub struct Device {
     pub device: Mmio,
 }
 
+/// How long a reset waits for the device status to read 0, in
+/// milliseconds: a device that works does within a few reads.  A time and
+/// not a count of reads, each of which is a round trip to the device or a
+/// trap to its hypervisor, and takes anything from 100 ns to many
+/// microseconds.
+pub const RESET_MS: u64 = 1000;
+
 impl Device {
-    pub fn reset(&self) {
+    /// Reset the device and acknowledge it: false if its status does not
+    /// read 0 before `expired` says the time is up (RESET_MS, which the
+    /// caller measures: l4h_rt::timeout_ms): the device has failed, and
+    /// the driver must not go on with it.  The status is read once at
+    /// least.
+    #[must_use]
+    pub fn reset(&self, mut expired: impl FnMut() -> bool) -> bool {
         self.common.w8(DEVICE_STATUS, 0);
-        while self.common.r8(DEVICE_STATUS) != 0 {
+        loop {
+            if self.common.r8(DEVICE_STATUS) == 0 {
+                self.common.w8(DEVICE_STATUS, STATUS_ACK | STATUS_DRIVER);
+                return true;
+            }
+            if expired() {
+                return false;
+            }
             core::hint::spin_loop();
         }
-        self.common.w8(DEVICE_STATUS, STATUS_ACK | STATUS_DRIVER);
     }
 
     pub fn features(&self) -> u64 {

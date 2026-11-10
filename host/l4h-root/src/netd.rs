@@ -41,10 +41,18 @@ fn mapped_device(d: &pci::Device) -> pci::Device {
     }
     mapped
 }
-/// Port memory: the channel plus the CNode keeping netd's mappings of it.
+/// Port memory: the channel plus three CNodes, of its frames (root's),
+/// of netd's mappings of them, and of the copies vmmgr gets.
 const PORT_BITS: usize = 22;
 const PORT_KEEP_BITS: usize = l4h_host::vmmgr::PORT_RADIX;
+const PORT_CNODES: usize = 3;
 const _: () = assert!(net::PORT_PAGES <= 1 << PORT_KEEP_BITS);
+// The CNodes (64 bytes a slot at most) and the frames fit the memory.
+const _: () = assert!(PORT_CNODES * (64 << PORT_KEEP_BITS) + net::PORT_PAGES * PAGE <= 1 << PORT_BITS);
+// A link's channel is whole pages, and fits where netd maps it.
+const _: () = assert!(
+    l4h_partition::LINK_CHANNEL_SIZE as usize % PAGE == 0 && l4h_partition::LINK_CHANNEL_SIZE as usize <= net::LINK_CHANNEL_MAX
+);
 /// MSI vectors of NICs start here.
 const NIC_MSI_BASE: u64 = crate::pci::VECTOR_NIC_BASE;
 const NETD_ID: u32 = 0x200;
@@ -470,9 +478,9 @@ impl Netd {
     }
 
     /// Connect a guest device of `g` to `switch` as port `p` (free_port,
-    /// then give_port_done), using `memory` (port_memory).  Returns for the guest's l4h-vmm the
-    /// CNode of the port's frames (radix PORT_KEEP_BITS) and a kick
-    /// capability, in a slot of its own.
+    /// then give_port_done), using `memory` (port_memory).  Returns for the guest's l4h-vmm a
+    /// CNode of copies of the port's frames (radix PORT_KEEP_BITS) and a
+    /// kick capability, in a slot of its own.
     #[allow(clippy::too_many_arguments)]
     pub fn add_port(
         &mut self,
@@ -488,15 +496,21 @@ impl Netd {
         // Port memory is the guest's: it is reclaimed with it.
         g.arena.own(s, region.paddr, PORT_BITS);
         let mut pool = region;
-        // CNodes keeping netd's mappings of the port, and its frames.
-        let cnodes = alloc.slots.alloc_range(2);
-        pool.retype(&ObjectBlueprint::CNode { size_bits: PORT_KEEP_BITS }, 2, Dest::new(crate::slot::CNODE.cap(), cnodes.start)).expect("port CNodes");
-        let keep = sel4::init_thread::Slot::<cap_type::CNode>::from_index(cnodes.start).cap();
-        let chan = sel4::init_thread::Slot::<cap_type::CNode>::from_index(cnodes.start + 1).cap();
-        pool.retype(&FRAME_BP, net::PORT_PAGES, Dest { cnode: abs_of(chan), offset: 0 }).expect("port frames");
+        // CNodes of the port's frames, of netd's mappings of them, and of
+        // the copies the guest's VMM maps.  The frames themselves stay
+        // root's: whoever held them could revoke one, which unmaps it from
+        // netd, and netd would fault for every guest.  A copy revokes
+        // nothing.
+        let cnodes = alloc.slots.alloc_range(PORT_CNODES);
+        pool.retype(&ObjectBlueprint::CNode { size_bits: PORT_KEEP_BITS }, PORT_CNODES, Dest::new(crate::slot::CNODE.cap(), cnodes.start))
+            .expect("port CNodes");
+        let cnode = |k: usize| sel4::init_thread::Slot::<cap_type::CNode>::from_index(cnodes.start + k).cap();
+        let (frames, keep, chan) = (cnode(0), cnode(1), cnode(2));
+        pool.retype(&FRAME_BP, net::PORT_PAGES, Dest { cnode: abs_of(frames), offset: 0 }).expect("port frames");
         for i in 0..net::PORT_PAGES {
-            let f = chan.absolute_cptr_from_bits_with_depth(i as u64, PORT_KEEP_BITS);
+            let f = frames.absolute_cptr_from_bits_with_depth(i as u64, PORT_KEEP_BITS);
             let dst = keep.absolute_cptr_from_bits_with_depth(i as u64, PORT_KEEP_BITS);
+            chan.absolute_cptr_from_bits_with_depth(i as u64, PORT_KEEP_BITS).copy(&f, CapRights::all()).expect("port frame copy");
             // Paging structures for the port come from netd's own pool, and
             // outlive the guest: their root slots must not be tracked into
             // it, or destroying it deletes them (and the arena regions they
@@ -650,9 +664,17 @@ impl Netd {
         if l >= net::MAX_LINKS || switch >= self.switches {
             return Err(ctl::ENOSPC);
         }
-        let size = ch.size as usize;
-        if size > net::LINK_CHANNEL_MAX || size % PAGE != 0 {
+        // One size, as a control channel's is (channel.rs): netd's record
+        // limits are that size's, and it refuses another.
+        if ch.size != l4h_partition::LINK_CHANNEL_SIZE {
             return Err(ctl::EINVAL);
+        }
+        let size = ch.size as usize;
+        // Room for the command before anything is set up for the link:
+        // nothing else posts before it does, so a full ring refuses the
+        // link here, with nothing mapped or given yet.
+        if !self.failed && !self.mailbox.room() {
+            return Err(ctl::EBUSY);
         }
         let bits = keep_bits(size / PAGE);
         let keep = self.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: bits });
@@ -688,6 +710,7 @@ impl Netd {
             self.fail(pci);
             return Err(ctl::EIO);
         }
+        // There is room (checked above).
         self.post(Request::AddLink { link: l, switch: switch as usize, size: ch.size as u64, me: me as u32, peer: ch.peer as u32 })?;
         self.links.must_push(Link { peer: ch.peer, peer_slot: ch.peer_slot, peer_vector: ch.peer_vector });
         Ok(l)

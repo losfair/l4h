@@ -1,9 +1,9 @@
 //! A guest's virtio-gpu display (l4h-vmm's gpu.rs): the image of its one
-//! scanout, which l4h-vmm writes on every flush and l4h-root copies out
+//! scanout, which l4h-vmm writes on every flush and l4h-vmmgr copies out
 //! for dom0 (CTL_GPU_READ).  The guest's buffers themselves stay in its
 //! I/O pool; this is the only image the host keeps.
 
-use core::sync::atomic::AtomicU64;
+use core::sync::atomic::{AtomicU32, AtomicU64};
 
 /// The first page of the display area; the image follows at
 /// IMAGE_OFFSET, `width * 4` bytes a row.
@@ -11,13 +11,16 @@ use core::sync::atomic::AtomicU64;
 pub struct DisplayHeader {
     /// Odd while l4h-vmm writes the image; it changes with every update.
     pub frame: AtomicU64,
-    /// The scanout's size, set at attach.
+    /// The scanout's size, which l4h-vmmgr writes at attach and never
+    /// reads back: l4h-vmm can write the whole header.
     pub width: u32,
     pub height: u32,
-    /// The VIRTIO_GPU_FORMAT_* of what is shown, 0 if nothing is.
-    pub format: u32,
+    /// The VIRTIO_GPU_FORMAT_* of what is shown, 0 if nothing is: l4h-vmm
+    /// stores it, l4h-vmmgr loads it.
+    pub format: AtomicU32,
     pub reserved: [u32; 11],
 }
+const _: () = assert!(core::mem::size_of::<DisplayHeader>() == 64 && core::mem::offset_of!(DisplayHeader, format) == 16);
 
 pub const IMAGE_OFFSET: usize = 4096;
 

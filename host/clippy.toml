@@ -4,4 +4,8 @@ disallowed-methods = [
     { path = "sel4::Cap::nb_recv", reason = "serve with l4h_ipc::run (Next::Poll)" },
     { path = "sel4::Cap::reply_recv", reason = "serve with l4h_ipc::run" },
     { path = "sel4::Cap::call", reason = "call through l4h_ipc::Endpoint<P>, a protocol's Client" },
+    { path = "sel4::Cap::send", reason = "a send to a served endpoint gives its server no reply to make; call it (l4h_ipc::Endpoint<P>), or signal() a notification" },
+    { path = "sel4::Cap::nb_send", reason = "as send; signal a client's slot root may have emptied with l4h_rt::mailbox::notify" },
+    { path = "sel4::Cap::nb_send_recv", reason = "serve with l4h_ipc::run" },
+    { path = "sel4::AbsoluteCPtr::mutate", reason = "a badge is minted from its edge (l4h_task::edge), not set while moving a capability" },
 ]

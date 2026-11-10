@@ -47,6 +47,14 @@ fn checksum(seq: u64, ticks: u64, meta: u64, text: &[u64]) -> u64 {
     h
 }
 
+/// A head no writer reaches in a host's lifetime (a record every 100 ns
+/// for two centuries), far below the sequences `commit` cannot store: what
+/// `adopt` takes a lane's head to be wrong from.
+const HEAD_MAX: u64 = 1 << 56;
+/// The length of a record `adopt` puts in place of what a lane held: more
+/// than any slot holds, so that `get` finds it gone.
+const NO_TEXT: u64 = 0xffff;
+
 #[repr(C)]
 pub struct Ring<const N: usize, const W: usize> {
     pub(crate) head: AtomicU64,
@@ -224,6 +232,59 @@ impl<'a, const W: usize> View<'a, W> {
         let _ = slot.state.compare_exchange(mine, state, SeqCst, SeqCst);
     }
 
+    /// Take over a lane that another writer had before this one (a guest
+    /// id's VMM lanes are the next VMM's of that id), before the first
+    /// record: true if the lane had to be reset. That writer could leave
+    /// anything in it, and a head near the end of the sequences, or a slot
+    /// claimed by a sequence that is not there yet, would make `commit`
+    /// drop every record of this one. A lane is as an honest writer leaves
+    /// it if its head is below `HEAD_MAX`, every slot is unused or holds
+    /// the state of a sequence below head that belongs in that slot, and,
+    /// with `now`, no committed record is later than `now` (one would come
+    /// up in `log::Ring::read` at that time, as this writer's). Any other
+    /// lane is reset: every slot gets a committed record without text, of
+    /// the lap that starts at head (at 0 if head was wrong), and head moves
+    /// past them. Readers find those records, and every earlier one, gone,
+    /// and count them; none is left claimed and uncommitted, which a reader
+    /// would wait for.
+    ///
+    /// The states are read before head, so that writers of a ring several
+    /// tasks share (a secondary partition's), which claim and commit
+    /// meanwhile, never make it look wrong: pass no `now` there, since
+    /// their records are later than it. A reset is for a lane no one else
+    /// writes; in a shared ring it costs the records being committed.
+    pub fn adopt(&self, now: Option<u64>) -> bool {
+        const { assert!(W * 8 < NO_TEXT as usize) };
+        let n = self.slots.len() as u64;
+        let (mut newest, mut ok) = (None, true);
+        for (i, slot) in self.slots.iter().enumerate() {
+            let state = slot.state.load(SeqCst);
+            if state == 0 {
+                continue;
+            }
+            // 2 * seq + 1 while seq is written, 2 * seq + 2 once committed.
+            let seq = (state - 1) / 2;
+            ok &= seq % n == i as u64;
+            newest = newest.max(Some(seq));
+            if state % 2 == 0 && now.is_some_and(|now| slot.ticks.load(SeqCst) > now) {
+                ok = false;
+            }
+        }
+        let head = self.head.load(SeqCst);
+        if ok && head < HEAD_MAX && newest.is_none_or(|seq| seq < head) {
+            return false;
+        }
+        let base = if head < HEAD_MAX { head } else { 0 };
+        for seq in base..base + n {
+            let slot = self.slot(seq);
+            slot.meta.store(NO_TEXT, SeqCst);
+            slot.ticks.store(now.unwrap_or(0), SeqCst);
+            slot.state.store(2 * seq + 2, SeqCst);
+        }
+        self.head.store(base + n, SeqCst);
+        true
+    }
+
     /// The time of the record of sequence `seq`, if it is committed, without
     /// copying it out: what a reader that orders many rings looks at
     /// before it takes one record (`get`, which checks it).
@@ -294,5 +355,89 @@ mod tests {
             store(&ring.slots[(seq % 4) as usize]);
             assert!(matches!(ring.get(seq), Entry::Gone));
         }
+    }
+
+    fn text(s: &[u8]) -> Buf<4> {
+        let mut buf = Buf::<4>::new();
+        buf.bytes_mut()[..s.len()].copy_from_slice(s);
+        buf
+    }
+
+    #[test]
+    fn a_lane_an_honest_writer_left_is_adopted_as_it_is() {
+        let ring = Ring::<4, 4>::new();
+        assert!(!ring.view().adopt(Some(0)));
+        for _ in 0..6 {
+            let seq = ring.claim(1);
+            ring.commit(seq, 10 + seq, 0, 3, &text(b"old"));
+        }
+        // One it claimed and never committed, and one it died in.
+        ring.claim(1);
+        let seq = ring.claim(1);
+        ring.slots[(seq % 4) as usize].state.store(2 * seq + 1, SeqCst);
+        assert!(!ring.view().adopt(Some(100)));
+        assert_eq!(ring.head(), 8);
+        let Entry::Ready(r) = ring.get(5) else { panic!("record gone") };
+        assert_eq!((r.text(), r.ticks), (&b"old"[..], 15));
+        // Writers of a shared ring that commit meanwhile do not make it
+        // look wrong, whatever their times.
+        ring.commit(ring.claim(1), u64::MAX, 0, 3, &text(b"now"));
+        assert!(!ring.view().adopt(None));
+    }
+
+    /// What `adopt` leaves: nothing of before, nothing a reader waits for,
+    /// and a lane the next writer's records go into.
+    fn reset_and_usable(ring: &Ring<4, 4>, now: Option<u64>, base: u64) {
+        assert!(ring.view().adopt(now));
+        assert_eq!(ring.head(), base + 4);
+        assert_eq!(ring.view().ticks(base), now.or(Some(0)));
+        for seq in ring.view().oldest_at(base)..base + 4 {
+            assert!(matches!(ring.get(seq), Entry::Gone), "sequence {seq}");
+            assert!(!ring.view().pending(seq));
+        }
+        assert!(!ring.view().adopt(now), "a reset lane is an honest one");
+        for i in 0..9 {
+            let seq = ring.claim(1);
+            ring.commit(seq, i, 0, 3, &text(b"new"));
+            let Entry::Ready(r) = ring.get(seq) else { panic!("record {i} dropped") };
+            assert_eq!(r.text(), b"new");
+        }
+    }
+
+    #[test]
+    fn a_lane_left_with_a_head_at_the_end_of_the_sequences_is_reset() {
+        for head in [u64::MAX, u64::MAX / 2, 1 << 62, HEAD_MAX] {
+            let ring = Ring::<4, 4>::new();
+            ring.commit(ring.claim(1), 1, 0, 3, &text(b"old"));
+            ring.head.store(head, SeqCst);
+            // Without the reset every record of the next writer is dropped,
+            // or wraps the sequences.
+            reset_and_usable(&ring, Some(10), 0);
+        }
+    }
+
+    #[test]
+    fn a_lane_left_with_slots_no_writer_could_have_claimed_is_reset() {
+        let states: [fn(u64) -> u64; 3] = [|_| u64::MAX, |head| 2 * (head + 3) + 1, |head| 2 * (head - 2) + 2];
+        for state in states {
+            let ring = Ring::<4, 4>::new();
+            for _ in 0..6 {
+                ring.commit(ring.claim(1), 1, 0, 3, &text(b"old"));
+            }
+            // A later writer's, one of a sequence not claimed yet, and one
+            // of a sequence that belongs in another slot.
+            ring.slots[1].state.store(state(6), SeqCst);
+            reset_and_usable(&ring, Some(10), 6);
+        }
+    }
+
+    #[test]
+    fn a_lane_left_with_a_record_of_a_later_time_is_reset() {
+        let ring = Ring::<4, 4>::new();
+        ring.commit(ring.claim(1), 5, 0, 3, &text(b"old"));
+        ring.commit(ring.claim(1), 500, 0, 3, &text(b"due"));
+        assert!(!ring.view().adopt(None));
+        assert!(!ring.view().adopt(Some(500)));
+        reset_and_usable(&ring, Some(499), 2);
     }
 }

@@ -12,7 +12,9 @@
 //! them anyway when it hands them out again.
 //!
 //! There is no interrupt: memd's timer polls for the end of a report, and
-//! an allocation that needs a block in flight waits for it.  So a legacy
+//! an allocation that needs a block in flight waits for it, for WAIT_MS at
+//! most and for one report only: a device that holds a report longer gets
+//! no more (mem.rs).  So a legacy
 //! (0.9.5) device, whose registers are I/O ports, runs without MSI-X, and
 //! has no vector registers.
 
@@ -73,7 +75,7 @@ impl Balloon {
             notify_len: cfg.notify_len as usize,
             device: Mmio(BalloonConfig::va(cfg.device)),
         };
-        dev.reset();
+        if !dev.reset(l4h_rt::timeout_ms(virtio::RESET_MS)) { return None; }
         let offered = dev.features();
         if offered & virtio::F_VERSION_1 == 0 || offered & F_REPORTING == 0 {
             l4h_rt::info!("memd: balloon: no free page reporting (features {:#x})", offered);
@@ -153,7 +155,7 @@ impl Balloon {
     }
 
     /// Whether the report in flight (if any) is done; `wait` waits for it,
-    /// for a while.
+    /// for WAIT_MS at most.
     pub fn done(&mut self, wait: bool) -> bool {
         if !self.busy {
             return true;

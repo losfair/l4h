@@ -88,9 +88,14 @@ pub mod mailbox {
                 return answered;
             };
             if pending_io {
-                // A client publishes work while root's request is taken.
-                // submit() must notify the hardware.
-                unsafe { (*crate::channel()).sq.head.store(1, Ordering::Relaxed); }
+                let (client, shrink) = crate::KERNEL.with_borrow(|k| (k.publish, k.shrink));
+                match shrink {
+                    // The device has no more room from now on.
+                    Some(room) => crate::KERNEL.with_borrow_mut(|k| k.room = room),
+                    // A client publishes work while root's request is taken.
+                    // submit() must notify the hardware.
+                    None => unsafe { (*crate::chan(client)).sq.head.store(1, Ordering::Relaxed); },
+                }
             }
             let mut words = [0; 5];
             if f(label, &args, &mut words).is_none() {
@@ -135,11 +140,26 @@ struct Kernel {
     room: usize,
     /// Started requests: tag, sector, bytes.
     started: Vec<(u64, u64, u64)>,
+    /// Ticks between two completions of the mock device, which then
+    /// completes one request at a time (0: all at once); when it last did.
+    pace: u64,
+    last: u64,
+    /// The mock device completes nothing.
+    stuck: bool,
+    /// The client whose ring a request flagged `pending_io` publishes in,
+    /// or the room the device has from then on instead.
+    publish: usize,
+    shrink: Option<usize>,
+    /// Tags in the order the device started (true) and completed them.
+    log: Vec<(bool, u64)>,
+    /// Data pieces of a request the mock device takes.
+    seg_max: usize,
 }
 thread_local! {
     static KERNEL: RefCell<Kernel> = RefCell::new(Kernel {
         ipc: sel4::IpcBuffer([0; 120]), requests: VecDeque::new(), replies: Vec::new(),
         retry: false, status: 0, kicks: 0, signals: 0, room: usize::MAX, started: Vec::new(),
+        pace: 0, last: 0, stuck: false, publish: 0, shrink: None, log: Vec::new(), seg_max: production::MAX_PIECES,
     });
 }
 
@@ -163,7 +183,8 @@ impl MockDriver {
 impl Driver for MockDriver {
     fn units(&self) -> usize { 1 }
     fn info(&self, _: usize) -> DevInfo {
-        DevInfo { capacity: 131072, block_size: 512, read_only: false, flush: true, address: 0x301 }
+        DevInfo { capacity: 131072, block_size: 512, read_only: false, flush: true, address: 0x301,
+            seg_max: KERNEL.with_borrow(|k| k.seg_max) }
     }
     fn can_start(&self) -> bool { KERNEL.with_borrow(|k| self.in_flight.len() < k.room) }
     fn start(&mut self, tag: u64, _: usize, _: u32, sector: u64, data: &[Seg]) -> Result<(), u32> {
@@ -171,7 +192,7 @@ impl Driver for MockDriver {
         if tag != u64::MAX {
             self.in_flight.push(tag);
             let bytes = data.iter().map(|s| s.len as u64).sum();
-            KERNEL.with_borrow_mut(|k| k.started.push((tag, sector, bytes)));
+            KERNEL.with_borrow_mut(|k| { k.started.push((tag, sector, bytes)); k.log.push((true, tag)); });
         }
         Ok(())
     }
@@ -184,7 +205,16 @@ impl Driver for MockDriver {
             // completion in the batch needs retrying (BUSY/UNIT_ATTENTION).
             if retry { self.notify(); }
         }
-        for tag in self.in_flight.drain(..) {
+        let (pace, last, stuck) = KERNEL.with_borrow(|k| (k.pace, k.last, k.stuck));
+        let now = host::ticks::now();
+        let n = match (stuck, pace) {
+            (true, _) => 0,
+            (_, 0) => self.in_flight.len(),
+            _ if now.wrapping_sub(last) >= pace => self.in_flight.len().min(1),
+            _ => 0,
+        };
+        for tag in self.in_flight.drain(..n) {
+            KERNEL.with_borrow_mut(|k| { k.last = now; k.log.push((false, tag)); });
             done(tag, blk::STATUS_OK);
         }
     }
@@ -192,22 +222,29 @@ impl Driver for MockDriver {
 
 struct Finished;
 static LOCK: Mutex<()> = Mutex::new(());
+/// One test at a time: they share blkd's statics and the clients' fixed
+/// addresses.  A test that failed does not fail the others.
+fn lock() -> std::sync::MutexGuard<'static, ()> { LOCK.lock().unwrap_or_else(|e| e.into_inner()) }
 unsafe extern "C" {
     fn mmap(addr: usize, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> usize;
     fn munmap(addr: usize, len: usize) -> i32;
 }
-fn channel() -> *mut Channel { blk::channel_va(0) as *mut Channel }
+fn channel() -> *mut Channel { chan(0) }
+fn chan(client: usize) -> *mut Channel { blk::channel_va(client) as *mut Channel }
 
 /// Map client 0's channel and extent table, as root does.
-fn map_client() {
-    for (va, len) in [(channel() as usize, blk::CHANNEL_PAGES * 4096), (blk::extent_va(0), blk::EXTENT_STRIDE)] {
+fn map_client() { map(0) }
+fn unmap_client() { unmap(0) }
+
+fn map(client: usize) {
+    for (va, len) in [(chan(client) as usize, blk::CHANNEL_PAGES * 4096), (blk::extent_va(client), blk::EXTENT_STRIDE)] {
         // MAP_FIXED_NOREPLACE: never overwrite an unrelated mapping.
         assert_eq!(unsafe { mmap(va, len, 3, 0x100022, -1, 0) }, va);
     }
 }
 
-fn unmap_client() {
-    for (va, len) in [(channel() as usize, blk::CHANNEL_PAGES * 4096), (blk::extent_va(0), blk::EXTENT_STRIDE)] {
+fn unmap(client: usize) {
+    for (va, len) in [(chan(client) as usize, blk::CHANNEL_PAGES * 4096), (blk::extent_va(client), blk::EXTENT_STRIDE)] {
         assert_eq!(unsafe { munmap(va, len) }, 0);
     }
 }
@@ -227,7 +264,7 @@ fn add() -> (u64, [u64; 6]) {
 const UNKNOWN: (u64, [u64; 6]) = (u64::MAX, [0; 6]);
 
 fn run(kind: u32, legacy: bool, (label, args): (u64, [u64; 6]), pending_io: bool, retry: bool, status: u32) -> [u64; 5] {
-    let _lock = LOCK.lock().unwrap();
+    let _lock = lock();
     map_client();
     unsafe {
         (*channel()).capacity_sectors = 8;
@@ -299,7 +336,7 @@ fn refused_provisioning_reports_its_errno() {
 
 #[test]
 fn a_split_request_waits_for_room_and_drains_on_remove() {
-    let _lock = LOCK.lock().unwrap();
+    let _lock = lock();
     map_client();
     // Guest sectors 0..8192 are disk sectors 40960.., then 8192...
     let staging: &'static [[u64; 2]] = Box::leak(Box::new([[40960, 8192], [8192, 8192]]));
@@ -338,7 +375,7 @@ fn a_split_request_waits_for_room_and_drains_on_remove() {
 
 #[test]
 fn completion_batch_wakes_the_client_once_and_returns_every_request() {
-    let _lock = LOCK.lock().unwrap();
+    let _lock = lock();
     map_client();
     unsafe {
         (*channel()).pool = blk::Pool { gpa: 0x8000000, paddr: 0x10000000, size: 4096 };
@@ -366,4 +403,153 @@ fn completion_batch_wakes_the_client_once_and_returns_every_request() {
     }
     unmap_client();
     KERNEL.with_borrow(|k| { assert_eq!(k.started.len(), 4); assert_eq!(k.signals, 1); });
+}
+
+/// host::ticks per second here, measured against the clock.
+fn ticks_per_sec() -> u64 {
+    let (t, c) = (std::time::Instant::now(), host::ticks::now());
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let ticks = host::ticks::now().wrapping_sub(c) as u128;
+    (ticks * 1_000_000_000 / t.elapsed().as_nanos()) as u64
+}
+
+/// How long blkd lets a device complete nothing, here: its five seconds,
+/// with a counter rate 50 times lower than the real one.
+const BOUND_MS: u64 = 100;
+
+/// Run blkd with client 0 attached and `reads` one-block reads in its
+/// ring, then root's `requests`; the mock device is `set` up first.  The
+/// replies to `requests`.
+fn run_paced(reads: u32, requests: &[((u64, [u64; 6]), bool)], set: impl FnOnce(&mut Kernel, u64)) -> Vec<[u64; 5]> {
+    let hz = ticks_per_sec();
+    unsafe {
+        (*channel()).capacity_sectors = 8;
+        (*channel()).pool = blk::Pool { gpa: 0x8000000, paddr: 0x10000000, size: 4096 };
+        for i in 0..reads as usize {
+            (*channel()).reqs[i] = blk::Req { id: i as u64, op: blk::OP_READ, nr_segs: 1, ..Default::default() };
+            (*channel()).reqs[i].segs[0] = blk::Seg { gpa: 0x8000000, len: 512, flags: blk::SEG_WRITE };
+        }
+        (*channel()).sq.head.store(reads, Ordering::Relaxed);
+    }
+    KERNEL.with_borrow_mut(|k| {
+        k.ipc.0.fill(0);
+        k.requests = [(add().0, add().1, false)].into_iter().chain(requests.iter().map(|&((l, a), io)| (l, a, io))).collect();
+        k.replies.clear();
+        (k.retry, k.status, k.kicks, k.signals, k.room) = (false, 0, 0, 0, usize::MAX);
+        (k.pace, k.last, k.stuck, k.publish, k.shrink, k.seg_max) = (0, 0, false, 0, None, production::MAX_PIECES);
+        k.started.clear();
+        k.log.clear();
+        set(k, hz);
+    });
+    let config: BlkdConfig = unsafe { core::mem::zeroed() };
+    let info = Box::leak(Box::new(Info { header: Header { id: 1, tsc_hz: hz / (5000 / BOUND_MS) }, config }));
+    let stopped = std::panic::catch_unwind(|| production::run(info)).unwrap_err();
+    assert!(stopped.is::<Finished>(), "service failed before sending every reply");
+    KERNEL.with_borrow(|k| {
+        assert_eq!(k.replies[0][0], 0, "client must attach successfully");
+        k.replies[1..].to_vec()
+    })
+}
+
+#[test]
+fn a_slow_device_drains_and_one_that_stopped_does_not() {
+    let _lock = lock();
+    // Root asks again while blkd says the client still drains (EAGAIN,
+    // after a slice: a fifth of the bound): as often as two bounds take.
+    let remove = [(post(Request::Remove { client: 0 }), false); 12];
+    let outcome = |r: &[[u64; 5]]| {
+        let all: Vec<_> = r.iter().map(|w| wire::reply::<reply::Remove>(w)).collect();
+        let again = all.iter().take_while(|&&a| a == Err(errno::EAGAIN)).count();
+        (again, all.get(again).copied())
+    };
+    // A completion every eighth of the bound: the twelve requests take
+    // longer than the bound, and none of them does.
+    map_client();
+    let r = run_paced(12, &remove, |k, hz| k.pace = hz * BOUND_MS / 8 / 1000);
+    let done = unsafe { (*channel()).cq.head.load(Ordering::Relaxed) };
+    unmap_client();
+    let (again, end) = outcome(&r);
+    assert_eq!(end, Some(Ok(())), "a device that keeps completing is not failed: {r:?}");
+    // The drain took more than one slice: root's other requests had
+    // their turn in between.
+    assert!(again >= 2, "one call drained for {again} slices only");
+    assert_eq!(done, 12);
+    // A device that completes nothing for the bound has failed, and not
+    // before the bound: blkd says so after the slices of one.
+    map_client();
+    let r = run_paced(2, &remove, |k, _| k.stuck = true);
+    unmap_client();
+    let (again, end) = outcome(&r);
+    assert_eq!(end, Some(Err(errno::EBUSY)), "{r:?}");
+    assert!((3..=6).contains(&again), "given up after {again} slices");
+}
+
+#[test]
+fn other_clients_are_served_while_one_drains() {
+    let _lock = lock();
+    map(0);
+    map(1);
+    unsafe {
+        (*chan(1)).capacity_sectors = 8;
+        (*chan(1)).lba_start = 64;
+        (*chan(1)).pool = blk::Pool { gpa: 0x8000000, paddr: 0x20000000, size: 4096 };
+        (*chan(1)).reqs[0] = blk::Req { id: 9, op: blk::OP_READ, nr_segs: 1, ..Default::default() };
+        (*chan(1)).reqs[0].segs[0] = blk::Seg { gpa: 0x8000000, len: 512, flags: blk::SEG_WRITE };
+    }
+    // Client 1 attaches, and publishes its request once root's removal of
+    // client 0 is under way; client 0's two requests complete slowly.
+    // Client 1 is then removed in turn, which drains its request.
+    let requests = [(post(Request::Add { client: 1, unit: 0, dom0: false, n: 0 }), false),
+        (post(Request::Remove { client: 0 }), true), (post(Request::Remove { client: 0 }), false),
+        (post(Request::Remove { client: 1 }), false), (post(Request::Remove { client: 1 }), false)];
+    let r = run_paced(2, &requests, |k, hz| (k.pace, k.publish) = (hz * BOUND_MS / 8 / 1000, 1));
+    let answered = unsafe { ((*chan(1)).cq.head.load(Ordering::Relaxed), (*chan(1)).resps[0].id) };
+    unmap(0);
+    unmap(1);
+    // Each removal is asked for twice: a drain may take more than a slice,
+    // and one asked of a client that is gone is done.
+    let removed = |k: usize| wire::reply::<reply::Remove>(&r[k]);
+    assert_eq!(r[0][0], 0);
+    assert!(matches!(removed(1), Ok(()) | Err(errno::EAGAIN)), "{:?}", removed(1));
+    assert_eq!((removed(2), removed(4)), (Ok(()), Ok(())));
+    assert!(matches!(removed(3), Ok(()) | Err(errno::EAGAIN)), "{:?}", removed(3));
+    assert_eq!(answered, (1, 9));
+    KERNEL.with_borrow(|k| {
+        // The third request the device starts is client 1's, at its
+        // window: before the second of client 0's completes.
+        assert_eq!((k.started.len(), k.started[2].1, k.started[2].2), (3, 64, 512));
+        let at = |started: bool, nth: usize| k.log.iter().enumerate().filter(|(_, l)| l.0 == started).nth(nth).unwrap().0;
+        assert!(at(true, 2) < at(false, 1), "client 1 waited for the drain: {:?}", k.log);
+    });
+}
+
+#[test]
+fn provisioning_waits_for_a_slow_device() {
+    let _lock = lock();
+    // The device has twelve requests and no room until all are done, a
+    // completion every eighth of the bound; then the write starts.
+    let write = [(post(Request::Write { sector: 4096, length: 4096, unit: 0 }), true)];
+    map_client();
+    let r = run_paced(12, &write, |k, hz| (k.pace, k.shrink) = (hz * BOUND_MS / 8 / 1000, Some(1)));
+    unmap_client();
+    assert_eq!(wire::reply::<reply::Write>(&r[0]), Ok(blk::STATUS_OK as u64));
+    // A device that completes nothing has failed.
+    map_client();
+    let r = run_paced(2, &write, |k, _| (k.stuck, k.shrink) = (true, Some(1)));
+    unmap_client();
+    assert_eq!(wire::reply::<reply::Write>(&r[0]), Ok(u64::MAX));
+}
+
+#[test]
+fn a_client_is_told_the_segments_the_device_takes() {
+    let _lock = lock();
+    // A driver that cuts requests itself, one whose device takes three
+    // pieces, and one that names none.
+    for (device, told) in [(production::MAX_PIECES, blk::SEG_MAX as u32), (3, 3), (0, 1)] {
+        map_client();
+        run_paced(0, &[], |k, _| k.seg_max = device);
+        let (seg_max, ready) = unsafe { ((*channel()).seg_max, (*channel()).ready) };
+        unmap_client();
+        assert_eq!((seg_max, ready), (told, 1));
+    }
 }

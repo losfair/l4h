@@ -4,11 +4,12 @@
 //! At boot, l4h-root moves every free RAM Untyped of 2 MiB or more here.
 //! From then on it asks for memory for its own objects (`alloc`) and
 //! returns it when it is free again (`free`), and guest RAM is taken,
-//! given and revoked here: memd keeps the original Untyped of every 2 MiB
-//! block of a guest, hands copies to l4h-root (for the boot blocks it
-//! fills with frames) and to the guest, and revokes the originals when the
-//! guest is destroyed, which deletes everything made of them.  memd also
-//! reports free memory to the hypervisor l4h runs in (balloon.rs).
+//! given and revoked here, for l4h-vmmgr: memd keeps the original Untyped
+//! of every 2 MiB block of a guest, hands copies to l4h-vmmgr (for the
+//! boot blocks it fills with frames) and to the guest, and revokes the
+//! originals when the guest is destroyed, which deletes everything made of
+//! them.  memd also reports free memory to the hypervisor l4h runs in
+//! (balloon.rs).
 //!
 //! Guest RAM also comes and goes while the guest runs, in hotplug blocks
 //! of 128 MiB (DESIGN.md §8.5): l4h-vmmgr sets each guest's target, and the
@@ -307,8 +308,9 @@ impl Memd {
             return ENOSPC;
         }
         // Only blocks that need no report to come back: the guest must not
-        // hold memd waiting.
-        if self.mem.available_bytes() < HP_BLOCKS << BLOCK_BITS || r.hp.bucket.admit(now).is_none() {
+        // hold memd waiting.  And not the hosts' reserve, which root and
+        // vmmgr count on finding free after their own checks.
+        if !self.mem.spare(HP_BLOCKS << BLOCK_BITS) || r.hp.bucket.admit(now).is_none() {
             return EBUSY;
         }
         let e = self.hp_fill(g, m);
@@ -463,11 +465,23 @@ impl Memd {
         0
     }
 
+    /// Whether guest g's VMM may make a call now: Err(EINVAL) for a guest
+    /// memd does not have, Err(EBUSY) for a VMM that has made more calls
+    /// than its guest's bucket allows.  Asked before anything is done for
+    /// the call, so that such a call costs memd its receive and its reply
+    /// and no more.
+    fn vmm_call(&mut self, g: usize) -> Result<(), Errno> {
+        let now = self.now_us();
+        let r = self.guests.get_mut(g).filter(|r| r.live).ok_or(EINVAL)?;
+        if r.hp.bucket.call(now) { Ok(()) } else { Err(EBUSY) }
+    }
+
     fn write_status(&self) {
         let (blocks, largest) = self.mem.block_stats();
         let guest_blocks: usize = self.guests.iter().filter(|r| r.live).map(|r| r.blocks.len).sum();
         let plugged: usize = self.guests.iter().filter(|r| r.live).map(|r| r.hp.plugged * HP_BLOCKS).sum();
         let st = Status {
+            seq: core::sync::atomic::AtomicU32::new(0),
             free_bytes: self.mem.free_bytes() as u64,
             reported_bytes: self.mem.reported_bytes() as u64,
             free_blocks: blocks as u64,
@@ -479,7 +493,8 @@ impl Memd {
                 GuestHp { target: h.target as u16, plugged: h.plugged as u16, count: h.count as u16, reserved: 0 }
             }),
         };
-        unsafe { (memd::STATUS_VA as *mut Status).write_volatile(st) };
+        // Under its sequence count: root and vmmgr read it at any time.
+        unsafe { Status::write_at(memd::STATUS_VA, st) };
     }
 }
 
@@ -519,6 +534,14 @@ impl l4h_rt::ipc::Server for Memd {
     }
 
     fn call(&mut self, from: Sender, _: u64, info: &sel4::MessageInfo) -> Option<sel4::MessageInfo> {
+        // A VMM is the least trusted caller, and memd runs above every
+        // guest: its calls are counted before they are looked at, and one
+        // too many changes nothing, so the status page stays as it is.
+        if let Sender::Vmm(g) = from {
+            if let Err(e) = self.vmm_call(g) {
+                return Some(l4h_rt::ipc::reply(&[e]));
+            }
+        }
         let answer = l4h_rt::ipc::serve::<call::Proto>(info, |label, args, out| call::serve(self, label, args, from, out));
         self.write_status();
         answer

@@ -8,8 +8,10 @@
 //! confined: every data pointer a TRB carries lies, with its length, in
 //! the pool's physical range and within one 64 KiB page; a URB never takes
 //! more than MAX_URB_TRBS; its TD ends are in order; the data TRBs add up
-//! to the transfer's length; setup packets travel as immediate data; and
-//! a PORTSC write touches only the bits a feature names.
+//! to the transfer's length; setup packets travel as immediate data; a
+//! PORTSC write touches only the bits a feature names; and the context
+//! dwords made of a guest's values (Address Device, hub, endpoint, stream
+//! counts) carry no reserved bit and no Interrupter Target.
 //!
 //! Usage: fuzz-usbreq [iterations]
 
@@ -206,10 +208,137 @@ fn ports(rng: &mut Rng) {
     }
 }
 
+/// Slot Context dwords `dw` carry only what usbd gives a controller.
+fn check_slot_ctx(dw: [u32; 3]) {
+    assert_eq!(dw[0] & (1 << 24), 0, "reserved bit of dword 0");
+    assert_eq!(dw[1] & 0xffff, 0, "Max Exit Latency");
+    assert_eq!(dw[2] >> 18, 0, "reserved bits or an Interrupter Target");
+}
+
+/// The context dwords usbd makes of what a guest says of a device, a hub,
+/// an endpoint and its streams.  Whether the device and the endpoint were
+/// accepted.
+fn contexts(rng: &mut Rng) -> (bool, bool) {
+    // A field: small values, single bits, anything.
+    let field = |rng: &mut Rng| match rng.below(4) {
+        0 => rng.below(8) as u32,
+        1 => 1 << rng.below(32),
+        2 => rng.below(600) as u32,
+        _ => rng.next() as u32,
+    };
+    let mut arg = [0u32; 60];
+    arg.iter_mut().take(7).for_each(|a| *a = field(rng));
+    if rng.chance(2) {
+        // Mostly valid, so that the accepted ones are many: one field in
+        // four stays as it came.
+        let speed = 1 + rng.below(5) as u32;
+        let tiers = rng.below(6);
+        let valid = [
+            (0..tiers).fold(0, |r, t| r | (1 + rng.below(15) as u32) << (4 * t)),
+            speed,
+            if rng.chance(2) { 0 } else { 1 + rng.below(255) as u32 },
+            0,
+            rng.below(2) as u32,
+            match speed { abi::SPEED_LOW => 8, abi::SPEED_FULL => 8 << rng.below(4), abi::SPEED_HIGH => 64, _ => 512 },
+            rng.below(2) as u32,
+        ];
+        for (k, v) in valid.into_iter().enumerate() {
+            if !rng.chance(28) {
+                arg[k] = v;
+            }
+        }
+        if arg[2] != 0 && !rng.chance(8) {
+            arg[3] = 1 + rng.below(255) as u32;
+        } else if !rng.chance(8) {
+            arg[4] = 0;
+        }
+    }
+    let a = Address::new(&arg);
+    let port = rng.next() as u8;
+    let dw = a.slot_ctx(port);
+    check_slot_ctx(dw);
+    if a.ok() {
+        assert!(speed_ok(a.speed) && route_ok(a.route) && ep0_mps_ok(a.speed, a.mps) && a.bsr <= 1);
+        if a.tt_slot == 0 {
+            assert_eq!((a.tt_port, a.mtt, dw[2]), (0, 0, 0), "TT fields without a TT");
+        } else {
+            assert!(a.tt_slot <= 255 && (1..=255).contains(&a.tt_port) && a.mtt <= 1);
+        }
+        // Each field where it belongs, unchanged.
+        assert_eq!(dw, [a.route | a.speed << 20 | a.mtt << 25 | 1 << 27, (port as u32) << 16, a.tt_slot | a.tt_port << 8]);
+    }
+    // A hub, from whatever its output context holds.
+    let sc = [rng.next() as u32, rng.next() as u32, rng.next() as u32];
+    let (speed, hci, ports, think, mtt) = (rng.below(7) as u32, [0x90, 0x95, 0x96, 0x100, 0x110, 0x120][rng.below(6) as usize], field(rng), field(rng), field(rng));
+    match hub_slot_ctx(sc, speed, hci, ports, think, mtt) {
+        Some(dw) => {
+            assert!(speed_ok(speed) && ports <= 255 && think <= 3 && mtt <= 1);
+            check_slot_ctx(dw);
+            assert_eq!(dw[0] & (1 << 26), 1 << 26, "not a hub");
+            // The route, speed and context entries stay; the ports and
+            // think time are the ones given, where the controller takes them.
+            assert_eq!(dw[0] & 0xf8ff_ffff & !(3 << 25), sc[0] & 0xf8ff_ffff & !(3 << 25));
+            if hci > 0x95 {
+                assert_eq!(dw[1] >> 24, ports);
+            }
+            assert!(dw[2] >> 16 == think || dw[2] >> 16 == (sc[2] >> 16) & 3);
+        }
+        None => assert!(!speed_ok(speed) || ports > 255 || think > 3 || mtt > 1),
+    }
+    check_slot_ctx(slot_ctx(sc));
+    // Stream counts: what is accepted is an array size a context can say.
+    let (count, max) = (field(rng), [0, 4, 8, 16][rng.below(4) as usize]);
+    if streams_ok(count, max) {
+        assert!(count >= 4 && count <= max && count.is_power_of_two());
+    }
+    // An endpoint context.
+    let ty = rng.below(9) as u8;
+    let ep = abi::Ep {
+        // Mostly a DCI of the type's direction.
+        dci: if rng.chance(4) { rng.below(40) as u8 } else { (2 + 2 * rng.below(15) as u8) | (ty >= abi::EP_ISOC_IN) as u8 },
+        ty,
+        interval: rng.below(20) as u8,
+        burst_mult: match rng.below(4) { 0 => rng.next() as u8, 1 => rng.below(16) as u8, _ => 0 },
+        max_packet: if rng.chance(4) { rng.next() as u16 } else { [8, 16, 32, 64, 512, 1024][rng.below(6) as usize] },
+        max_esit: if rng.chance(2) { 0 } else { rng.below(1025) as u16 },
+    };
+    let speed = rng.below(7) as u32;
+    let streams = if streams_ok(count, max) { count } else { 0 };
+    let dw = ep_ctx(&ep, streams);
+    assert_eq!((dw[0] & 0xff, dw[1] & 0xc1), (0, 0), "reserved bits, endpoint state or HID");
+    if ep_ok(&ep, speed) {
+        assert!((2..=31).contains(&ep.dci) && ep.interval <= 15 && ep.max_packet <= 1024);
+        assert!(interval_ok(ep.ty, ep.interval, speed));
+        let periodic = matches!(ep.ty, abi::EP_INT_OUT | abi::EP_INT_IN | abi::EP_ISOC_OUT | abi::EP_ISOC_IN);
+        let slow = matches!(speed, abi::SPEED_LOW | abi::SPEED_FULL);
+        assert!(if !periodic { ep.interval == 0 || speed == abi::SPEED_HIGH } else { !slow || ep.interval >= 3 });
+        // Every field where it belongs: nothing shifted into a neighbour.
+        assert_eq!(dw[0] >> 24, 0, "Max ESIT Payload Hi");
+        assert_eq!((dw[0] >> 16) & 0xff, ep.interval as u32);
+        assert_eq!((dw[0] >> 8) & 3, (ep.burst_mult >> 4) as u32);
+        assert_eq!((dw[0] >> 10) & 0x1f, if streams == 0 { 0 } else { streams.trailing_zeros() - 1 });
+        assert_eq!((dw[0] >> 15) & 1, (streams != 0) as u32);
+        assert_eq!((dw[1] >> 3) & 7, ep.ty as u32);
+        assert_eq!((dw[1] >> 8) & 0xff, (ep.burst_mult & 0xf) as u32);
+        assert_eq!(dw[1] >> 16, ep.max_packet as u32);
+        assert_eq!(dw[2] >> 16, ep.max_esit as u32);
+    }
+    // The recovery set holds any endpoint once and nothing else.
+    let mut set = EpSet::new();
+    let (slot, dci) = (rng.below(70) as usize, rng.below(34) as usize);
+    for _ in 0..1 + rng.below(4) {
+        set.insert(slot, dci);
+    }
+    let inside = (1..=MAX_SLOTS as usize).contains(&slot) && (1..32).contains(&dci);
+    assert_eq!(set.pop(), inside.then_some((slot, dci)));
+    assert_eq!(set.pop(), None);
+    (a.ok(), ep_ok(&ep, speed))
+}
+
 fn main() {
     let iters: u64 = std::env::args().nth(1).map_or(200_000, |a| a.parse().expect("iterations"));
     let mut rng = Rng(0x5eed_0f05_bd17_u64);
-    let (mut accepted, mut laid_out) = (0u64, 0u64);
+    let (mut accepted, mut laid_out, mut devices, mut endpoints) = (0u64, 0u64, 0u64, 0u64);
     for _ in 0..iters {
         let p = pool(&mut rng);
         let r = record(&mut rng, &p);
@@ -238,6 +367,9 @@ fn main() {
         if ep_ok(&ep, rng.below(7) as u32) {
             assert!((2..=31).contains(&ep.dci) && ep.interval <= 15 && ep.max_packet <= 1024);
         }
+        let (device, endpoint) = contexts(&mut rng);
+        devices += device as u64;
+        endpoints += endpoint as u64;
         let route = rng.next() as u32 >> rng.below(32);
         if route_ok(route) {
             assert!(route < 1 << 20);
@@ -245,5 +377,5 @@ fn main() {
         indices(&mut rng);
         ports(&mut rng);
     }
-    println!("fuzz-usbreq: {iters} records, {accepted} accepted, {laid_out} laid out: ok");
+    println!("fuzz-usbreq: {iters} records, {accepted} accepted, {laid_out} laid out; {devices} devices and {endpoints} endpoints accepted: ok");
 }

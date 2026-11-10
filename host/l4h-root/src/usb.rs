@@ -17,9 +17,11 @@
 //! mailbox requests (host::mailbox), and at GUEST_DEL root cuts the
 //! controller off from the pool itself (bus mastering off, the IOMMU
 //! mapping gone) before usbd has even seen the request.  The queue area is
-//! root's until usbd has zeroed it (REMOVE answered), when root frees it;
-//! the next guest meanwhile gets the other area, and its ATTACH is posted
-//! (bus mastering back on) once the CLAIM or REMOVE before it is answered.
+//! root's: usbd maps the frames' own capabilities and the guest gets copies
+//! of them, which root revokes at GUEST_DEL.  usbd keeps using the area
+//! until it has answered the REMOVE, when root frees it; the next guest
+//! meanwhile gets the other area, and its ATTACH is posted (bus mastering
+//! back on) once the CLAIM or REMOVE before it is answered.
 
 use core::ptr::addr_of_mut;
 use core::sync::atomic::Ordering;
@@ -37,22 +39,26 @@ use crate::blkd::{BarCache, DEVICE_ATTRS, bar_frames, keep_bits};
 use crate::component::{self, Component, SpawnArgs, abs_of, root_cap};
 use crate::iommu::Domain;
 use crate::mailbox::{self, Mailbox};
-use crate::mem::{Arena, Dest, Slot};
+use crate::mem::{Arena, Dest, ObjCtx, Slot};
 use crate::vmmgr::RootGuest;
-use crate::vspace::FRAME_BP;
+use crate::vspace::{FRAME_BP, map_frame};
 use crate::{Host, ctl, pci};
 
 static USBD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/l4h-usbd.elf"));
 
 const PAGE: usize = 4096;
-/// Radix of the CNodes of a client's queue frames (vmmgr's copies, and
-/// usbd's mapping capabilities).
+/// Radix of the CNodes of a client's queue frames (the frames, which usbd
+/// maps, and vmmgr's copies).
 pub const QUEUE_RADIX: usize = host::vmmgr::USB_QUEUE_RADIX;
 const _: () = assert!(uabi::AREA_PAGES <= 1 << QUEUE_RADIX);
 
-/// How long root waits for a controller after a reset (CNR) before it
-/// reads its capabilities.
-const CAP_WAIT_MS: u64 = 1000;
+/// How long root waits for a controller the firmware is resetting (CNR)
+/// before it reads its capabilities: root serves every guest's requests,
+/// so no longer.  A controller not ready by then is busy (EBUSY), and the
+/// attachment is its caller's to make again: vmmgr does for dom0's boot,
+/// on its timer, for a second (its DOM0_USB_WAIT_MS); a control request's
+/// answer is EBUSY.
+const CAP_WAIT_MS: u64 = 5;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -110,19 +116,25 @@ enum Op {
 /// lives, and the copies the guest's are made from.
 struct Area {
     arena: Arena,
+    /// The frames (radix QUEUE_RADIX): the capabilities the Untyped made,
+    /// which usbd's mappings are of.  Every other capability to a frame is
+    /// a copy made from its one here, so revoking this one deletes them
+    /// all and leaves usbd's mapping.
+    frames: cap::CNode,
     /// Copies of the frames (radix QUEUE_RADIX), vmmgr's to give the
     /// guest: revoked at GUEST_DEL.
     guest: cap::CNode,
-    /// Root's slots of the arena's CNodes (the frames, usbd's mapping
-    /// copies, `guest`): empty once the arena is released.
-    slots: [Slot; 3],
+    /// Root's slots of the arena's CNodes (`frames`, `guest`): empty once
+    /// the arena is released.
+    slots: [Slot; 2],
 }
 
 /// The controllers, in .bss with the disk controllers.
 static mut CTRLS: ArrayVec<Ctrl, { usb::MAX_USB_CTRLS }> = ArrayVec::new();
 
 pub fn ctrls() -> &'static mut ArrayVec<Ctrl, { usb::MAX_USB_CTRLS }> {
-    // main takes the only reference once.
+    // Root has one thread, and a function takes its reference again after
+    // any call that takes one of its own.
     unsafe { &mut *(&raw mut CTRLS) }
 }
 
@@ -191,8 +203,10 @@ fn quarantine(c: &mut Ctrl, pci: &pci::Pci) {
 }
 
 /// The controller's capability registers, through a temporary mapping of
-/// BAR 0's first page: (max slots, scratchpad buffers, page size).
-fn caps(h: &mut Host, i: usize) -> Option<(u32, u32, u32)> {
+/// BAR 0's first page: (max slots, scratchpad buffers, page size).  EIO if
+/// it has none root can use; EBUSY if it is not ready within CAP_WAIT_MS
+/// (the firmware is resetting it).
+fn caps(h: &mut Host, i: usize) -> Result<(u32, u32, u32), Errno> {
     let c = &mut ctrls()[i];
     let frames = bar_frames(&c.bars, 0);
     h.pci.enable_memory(&c.pci);
@@ -202,17 +216,17 @@ fn caps(h: &mut Host, i: usize) -> Option<(u32, u32, u32)> {
         let r32 = |o: usize| (page.add(o) as *const u32).read_volatile();
         let cap0 = r32(0);
         if cap0 == u32::MAX {
-            return None;
+            return Err(ctl::EIO);
         }
         let caplength = (cap0 & 0xff) as usize;
         if caplength < 0x20 || caplength + 0x40 > PAGE {
-            return None;
+            return Err(ctl::EIO);
         }
-        // The firmware may be resetting it: wait for Controller Not Ready.
+        // The firmware may be resetting it: Controller Not Ready.
         let end = host::ticks::now() + CAP_WAIT_MS * ticks_per_ms;
         while r32(caplength + 0x04) & (1 << 11) != 0 {
             if host::ticks::now() > end {
-                return None;
+                return Err(ctl::EBUSY);
             }
             core::hint::spin_loop();
         }
@@ -221,9 +235,9 @@ fn caps(h: &mut Host, i: usize) -> Option<(u32, u32, u32)> {
         let scratch = ((hcs2 >> 21) & 0x1f) << 5 | (hcs2 >> 27);
         let pagesize = (r32(caplength + 0x08) & 0xffff).trailing_zeros();
         if slots == 0 || pagesize > 4 {
-            return None;
+            return Err(ctl::EIO);
         }
-        Some((slots, scratch, 4096 << pagesize))
+        Ok((slots, scratch, 4096 << pagesize))
     })
 }
 
@@ -265,18 +279,23 @@ fn program_irq(h: &mut Host, i: usize, vector: u64, dom: Domain) {
 }
 
 /// Claim controller `i` from the firmware: start its usbd and post the
-/// CLAIM, which does the legacy handoff and resets it.  ENOMEM leaves it
-/// with the firmware; EIO marks it failed.  A CLAIM usbd refuses
+/// CLAIM, which does the legacy handoff and resets it.  ENOMEM and EBUSY
+/// (the firmware is resetting it) leave it with the firmware, to be tried
+/// again; EIO marks it failed.  A CLAIM usbd refuses
 /// quarantines the controller (the handoff cannot be undone), and the
 /// guest that got it meanwhile sees no controller (no magic).
 fn claim(h: &mut Host, i: usize) -> Result<(), Errno> {
     let claimed = ctrls().iter().filter(|c| c.driver.is_some()).count();
     let Some(&vector) = pci::VECTORS_USB.get(claimed) else { return Err(ctl::ENOSPC) };
-    let Some((slots, scratch, page)) = caps(h, i) else {
-        let p = &ctrls()[i].pci;
-        log!("l4h-root: xHCI {:02x}:{:02x}.{}: no capabilities", p.bus, p.dev, p.func);
-        ctrls()[i].state = State::Failed;
-        return Err(ctl::EIO);
+    let (slots, scratch, page) = match caps(h, i) {
+        Ok(caps) => caps,
+        Err(e) if e == ctl::EBUSY => return Err(e),
+        Err(e) => {
+            let p = &ctrls()[i].pci;
+            log!("l4h-root: xHCI {:02x}:{:02x}.{}: no capabilities", p.bus, p.dev, p.func);
+            ctrls()[i].state = State::Failed;
+            return Err(e);
+        }
     };
     let dma = usb::dma_bytes(slots, scratch, page);
     if !h.can_afford(dma + (8 << 20), 1, 4096) {
@@ -288,7 +307,8 @@ fn claim(h: &mut Host, i: usize) -> Result<(), Errno> {
     let dma_slot = h.alloc.slots.alloc();
     let Some(mut region) = h.alloc.split(bits, dma_slot) else {
         h.alloc.slots.free(dma_slot);
-        h.alloc.reclaim(arena);
+        // With its slots: no guest's deletion frees them.
+        h.alloc.release(arena);
         return Err(ctl::ENOMEM);
     };
     let dma_paddr = region.paddr;
@@ -539,22 +559,31 @@ pub fn attach(h: &mut Host, i: usize, g: &mut RootGuest) -> Result<Attached, Err
     let area = h.alloc.global(|alloc| -> Option<Area> {
         let mut arena = alloc.arena((uabi::AREA_PAGES + 4) * PAGE)?;
         let frames = arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: QUEUE_RADIX });
-        let keep = arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: QUEUE_RADIX });
         let guest = arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: QUEUE_RADIX });
         let ok = arena.retype(alloc, &FRAME_BP, uabi::AREA_PAGES, Dest { cnode: abs_of(frames), offset: 0 }).is_some();
         if !ok {
             alloc.release(arena);
-            [frames.bits(), keep.bits(), guest.bits()].iter().for_each(|&s| alloc.slots.free(s as Slot));
+            [frames.bits(), guest.bits()].iter().for_each(|&s| alloc.slots.free(s as Slot));
             return None;
         }
+        // usbd maps each frame's own capability (invoked from a slot of
+        // root's CNode, then put back), and the guest's are copies of it:
+        // seL4 revokes what was copied from a capability an Untyped made,
+        // not what was copied from a copy, so only this way can `remove`
+        // take the guest's away and leave usbd's mapping.
+        let own = alloc.slots.alloc();
+        let frame = root_cap::<cap_type::Granule>(own);
         for p in 0..uabi::AREA_PAGES {
             let at = |cn: cap::CNode| cn.absolute_cptr_from_bits_with_depth(p as u64, QUEUE_RADIX);
-            d.comp.map_copy(alloc, &mut d.arena, &at(frames), usb::queue_va(idx) + p * PAGE,
-                CapRights::read_write(), VmAttributes::DEFAULT, at(keep));
+            abs_of(frame).move_(&at(frames)).expect("USB queue frame");
+            map_frame(&mut ObjCtx::arena(alloc, &mut d.arena), d.comp.vspace, frame, usb::queue_va(idx) + p * PAGE,
+                CapRights::read_write(), VmAttributes::DEFAULT);
+            at(frames).move_(&abs_of(frame)).expect("USB queue frame");
             at(guest).copy(&at(frames), CapRights::all()).expect("USB queue frame copy");
         }
-        let slots = [frames.bits() as Slot, keep.bits() as Slot, guest.bits() as Slot];
-        Some(Area { arena, guest, slots })
+        alloc.slots.free(own);
+        let slots = [frames.bits() as Slot, guest.bits() as Slot];
+        Some(Area { arena, frames, guest, slots })
     });
     let Some(area) = area else {
         let _ = d.comp.slot(usb::USBD_SLOT_CLIENT_IRQ + idx as u64).delete();
@@ -563,7 +592,7 @@ pub fn attach(h: &mut Host, i: usize, g: &mut RootGuest) -> Result<Attached, Err
     let guest_frames = area.guest;
     d.areas[idx] = Some(area);
     let kick = root_cap::<cap_type::Notification>(h.alloc.slots.alloc());
-    component::mint_edge(&abs_of(kick), &wiring::VMM_USBD_KICK, 0, &d.comp.obj()).expect("usbd kick");
+    component::mint_edge(&abs_of(kick), &wiring::GUEST_USBD_KICK, 0, &d.comp.obj()).expect("usbd kick");
     d.idx = idx;
     c.pool = Some((g.pool.gpa, g.pool.paddr, g.pool.size));
     c.state = State::Vm(g.id);
@@ -581,22 +610,30 @@ pub fn attach(h: &mut Host, i: usize, g: &mut RootGuest) -> Result<Attached, Err
 /// are revoked, the controller loses bus mastering and its IOMMU mapping
 /// of the pool, and usbd's notification of the VMM goes.  Then REMOVE
 /// (usbd may be busy; poll frees the area when it is done).  Whether the
-/// controller can no longer reach the guest's pool.
+/// controller can no longer reach the guest's pool: it cannot, with or
+/// without an IOMMU, as it has no bus mastering (a quarantined one lost it
+/// then, and one still being claimed was never given the pool).
 pub fn remove(h: &mut Host, i: usize) -> bool {
     let c = &mut ctrls()[i];
     let attached = matches!(c.state, State::Vm(_));
-    let Some(d) = c.driver.as_mut() else { return c.dom != Domain::NONE };
+    // Only a controller with a usbd is ever a guest's.
+    let Some(d) = c.driver.as_mut() else { return true };
     let idx = d.idx;
     if let Some(a) = &d.areas[idx] {
-        // vmmgr's copy of the CNode, then whatever was made of the frames.
+        // vmmgr's copy of the CNode, then every copy of a frame: the
+        // guest CNode's, and what vmmgr made of those for the guest (it
+        // deletes them itself when it destroys the guest).  The frames'
+        // own capabilities, usbd's mappings, stay.
         let _ = abs_of(a.guest).revoke();
         for p in 0..uabi::AREA_PAGES {
-            let _ = a.guest.absolute_cptr_from_bits_with_depth(p as u64, QUEUE_RADIX).revoke();
+            let _ = a.frames.absolute_cptr_from_bits_with_depth(p as u64, QUEUE_RADIX).revoke();
         }
     }
     // A waiting ATTACH never turned bus mastering on: during a CLAIM it is
-    // the firmware's until usbd has halted the controller.
-    if !d.waiting {
+    // the firmware's until usbd has halted the controller.  A quarantined
+    // controller has it off already (pci.disable); off again here, so that
+    // what it had issued is in memory when this returns (pci.bus_master).
+    if !d.waiting || !attached {
         h.pci.bus_master(&c.pci, false);
     }
     let _ = d.comp.slot(usb::USBD_SLOT_CLIENT_IRQ + idx as u64).delete();
@@ -607,7 +644,7 @@ pub fn remove(h: &mut Host, i: usize) -> bool {
     if !attached {
         // Quarantined: usbd is suspended.
         free_area(h, d, idx);
-        return c.dom != Domain::NONE;
+        return true;
     }
     c.state = State::Idle;
     if d.waiting {

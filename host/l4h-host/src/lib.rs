@@ -24,6 +24,7 @@ pub mod memd;
 pub mod net;
 pub mod ring;
 pub mod root;
+pub mod seqlock;
 pub mod serial;
 pub mod spsc;
 pub mod trust;
@@ -281,10 +282,14 @@ pub const CONSOLE_RING_DATA: usize = CONSOLE_RING_PAGES * 4096 - 64;
 #[repr(C)]
 pub struct ConsoleRing {
     /// Total bytes ever written; byte i is at data[i % CONSOLE_RING_DATA].
-    pub head: u64,
+    /// The VMM stores it and vmmgr loads it, once per read: an atomic, as
+    /// each has the other's memory behind its reference.
+    pub head: core::sync::atomic::AtomicU64,
     pub reserved: [u64; 7],
     pub data: [u8; CONSOLE_RING_DATA],
 }
+const _: () = assert!(core::mem::size_of::<ConsoleRing>() == CONSOLE_RING_PAGES * 4096
+    && core::mem::offset_of!(ConsoleRing, head) == 0 && core::mem::offset_of!(ConsoleRing, data) == 64);
 
 // 4 MiB holds a netd port or block channel; 64 fit before the GPU display.
 const VMM_CHANNEL_STRIDE: usize = 0x40_0000;

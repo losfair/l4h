@@ -302,5 +302,8 @@ impl<B: Backend> Device<B> {
         }
         // A completion must not read every idle queue's shared avail ring.
         self.poll(mem, vcpus, self.backend.retry_queues());
+        // `poll` returns early when no queue has work, and the backend may
+        // have a kick to send for the completions alone.
+        self.backend.notify_submissions();
     }
 }

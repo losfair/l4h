@@ -48,6 +48,12 @@ pub struct Vmmgr {
     info: Info,
     guest: Option<Guest>,
     dom0_wait: Option<Dom0Wait>,
+    dom0_usb_wait: Option<Dom0Wait>,
+    /// USB controllers root says are busy (EBUSY): (controller, how often
+    /// still).
+    busy_usbs: Vec<(usize, usize)>,
+    /// The attaches made, of whatever outcome: (controller, when).
+    usb_attempts: Vec<(usize, u64)>,
     /// Boot disks root has yet to answer: (k, the answer it gives).
     pending: Vec<(usize, Result<(), Errno>)>,
     /// Boot disks root answers EBUSY for, as many times each.
@@ -117,7 +123,12 @@ impl Vmmgr {
         Ok(())
     }
     fn attach_usb(&mut self, _: usize, ctrl: usize) -> Result<(), Errno> {
-        if self.fail_usbs.contains(&ctrl) { return Err(16); }
+        self.usb_attempts.push((ctrl, rdtsc()));
+        if self.fail_usbs.contains(&ctrl) { return Err(5); }
+        if let Some(b) = self.busy_usbs.iter_mut().find(|b| b.0 == ctrl && b.1 != 0) {
+            b.1 -= 1;
+            return Err(16);
+        }
         self.add_device()?;
         self.usbs.push(ctrl);
         Ok(())
@@ -158,7 +169,7 @@ fn fixture(builtins: usize, windows: usize, other_disks: usize, nics: usize) -> 
     Vmmgr {
         cfg: Box::leak(cfg), kernel: Some(Kernel { ram_base: 0 }), dom0_initrd: &[],
         alloc: (), wins: Windows { a: () }, info: Info { tsc_hz: 1000 }, guest: None, builtins,
-        dom0_wait: None, pending: Vec::new(), busy_disks: Vec::new(), destroyed: false,
+        dom0_wait: None, dom0_usb_wait: None, busy_usbs: Vec::new(), usb_attempts: Vec::new(), pending: Vec::new(), busy_disks: Vec::new(), destroyed: false,
         disk_attempts: Vec::new(), disks: Vec::new(), nics: Vec::new(), fail_disks: Vec::new(),
         usbs: Vec::new(), fail_usbs: Vec::new(), started: false,
     }
@@ -171,7 +182,7 @@ fn boot(h: &mut Vmmgr) {
     for _ in 0..10_000 {
         if let Some((k, r)) = h.pending.pop() {
             dom0_disk_done(h, 0, 1, k, r);
-        } else if h.dom0_wait.is_some() {
+        } else if h.dom0_wait.is_some() || h.dom0_usb_wait.is_some() {
             NOW.with(|n| n.set(n.get() + 100));
             dom0_retry(h);
         } else {
@@ -284,6 +295,37 @@ fn dom0_usb_controllers_are_attached_and_a_failure_is_not_fatal() {
     assert_eq!(h.usbs, [2, 5]);
     // Console, control, the disk, the NIC and two controllers.
     assert_eq!(h.guest.as_ref().unwrap().devices.len(), 6);
+    // A controller root refuses for good is not asked for again.
+    assert_eq!(h.usb_attempts.iter().filter(|a| a.0 == 0).count(), 1);
+}
+
+#[test]
+fn a_usb_controller_the_firmware_is_resetting_is_waited_for() {
+    let with = |busy: Vec<(usize, usize)>| {
+        let mut h = fixture(2, 0, 1, 1);
+        let mut cfg: Box<VmmgrConfig> = Box::new(unsafe { core::ptr::read(h.cfg) });
+        cfg.dom0_usbs = 3;
+        cfg.dom0_usb[..3].copy_from_slice(&[2, 0, 5]);
+        h.cfg = Box::leak(cfg);
+        h.busy_usbs = busy;
+        let begun = rdtsc();
+        boot(&mut h);
+        assert!(h.started);
+        (h, begun)
+    };
+    // Busy at three looks (the timer's, 100 ms apart): attached at the
+    // fourth, in its place among the others, which is its number in dom0.
+    let (h, _) = with(vec![(0, 3)]);
+    assert_eq!(h.usbs, [2, 0, 5]);
+    assert_eq!(h.usb_attempts.iter().map(|a| a.0).collect::<Vec<_>>(), [2, 0, 0, 0, 0, 5]);
+    // Busy for good: dom0 starts without it after DOM0_USB_WAIT_MS, with
+    // the controllers after it, and the NIC it got before is not made
+    // again.
+    let (h, begun) = with(vec![(0, usize::MAX)]);
+    assert_eq!((h.usbs.as_slice(), h.nics.len()), (&[2, 5][..], 1));
+    let tried: Vec<u64> = h.usb_attempts.iter().filter(|a| a.0 == 0).map(|a| a.1 - begun).collect();
+    assert_eq!((tried.first(), tried.last()), (Some(&0), Some(&DOM0_USB_WAIT_MS)), "{tried:?}");
+    assert!(h.dom0_usb_wait.is_none());
 }
 
 #[test]

@@ -163,12 +163,31 @@ pub mod memd {
     pub const BLOCK_BITS: usize = 21;
     pub const XCHG_SLOTS: usize = 32;
 
+    /// How the memd of a test answers `free`.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub enum Free {
+        /// No test expects one.
+        Unexpected,
+        /// It takes the blocks.
+        Takes,
+        /// It has failed: the blocks are back in the caller's slots.
+        Failed,
+        /// It failed after taking them.
+        FailedHolding,
+    }
+
     thread_local! {
         pub static GRANTS: std::cell::RefCell<Vec<Option<usize>>> = const { std::cell::RefCell::new(Vec::new()) };
+        /// memd's status page, if it can be read whole.
+        pub static STATUS: std::cell::Cell<Option<Status>> = const { std::cell::Cell::new(None) };
+        pub static FREE: std::cell::Cell<Free> = const { std::cell::Cell::new(Free::Unexpected) };
+        /// The batches `free` was called with: (physical address, size bits).
+        pub static FREED: std::cell::RefCell<Vec<Vec<(usize, usize)>>> = const { std::cell::RefCell::new(Vec::new()) };
     }
 
     #[derive(Clone, Copy)]
     pub struct MemdLink;
+    #[derive(Clone, Copy)]
     pub struct Status {
         pub free_bytes: u64,
         pub reported_bytes: u64,
@@ -176,7 +195,7 @@ pub mod memd {
     }
 
     impl MemdLink {
-        pub fn status(&self) -> Status { panic!("no memd in this test") }
+        pub fn status(&self) -> Option<Status> { STATUS.get() }
         pub fn alloc(&self, _: usize, _: usize) -> Option<usize> {
             let paddr = GRANTS.with_borrow_mut(|g| g.pop().expect("unexpected memd allocation"));
             crate::with_ipc_buffer_mut(|b| {
@@ -184,7 +203,14 @@ pub mod memd {
             });
             paddr
         }
-        pub fn free(&self, _: &[(crate::cap::Untyped, usize, usize)]) { panic!("no memd in this test") }
+        pub fn free(&self, blocks: &[(crate::cap::Untyped, usize, usize)]) -> Result<(), crate::fixed::ArrayVec<bool, XCHG_SLOTS>> {
+            FREED.with_borrow_mut(|f| f.push(blocks.iter().map(|&(_, paddr, bits)| (paddr, bits)).collect()));
+            match FREE.get() {
+                Free::Unexpected => panic!("no memd in this test"),
+                Free::Takes => Ok(()),
+                back => Err(blocks.iter().map(|_| back == Free::Failed).collect()),
+            }
+        }
     }
 }
 
@@ -352,4 +378,73 @@ fn independent_allocators_use_their_own_cnodes_and_storage() {
     manager.slots.free_owned(3);
     assert_eq!(manager.slots.available(), manager_slots);
     DELETES.with_borrow(|v| assert_eq!(v, &[1, 11]));
+}
+
+/// A memd that has failed takes no grants back.  Its client goes on with
+/// them: nothing is lost, nothing is offered twice in one trim, and the
+/// blocks serve the next requests.
+#[test]
+fn grants_a_failed_memd_does_not_take_stay_in_use() {
+    use memd::{FREE, FREED, Free, GRANTS, STATUS, Status};
+    const MIB: usize = 1 << 20;
+    let mut alloc = mem::Alloc::empty(
+        mem::Slots::new(Cap::from_bits(21), Box::leak(Box::new(mem::SlotStorage::<16, 1024>::new())), 64..1024),
+        Box::leak(Box::new(mem::AllocStorage::new())),
+    );
+    alloc.memd = Some(memd::MemdLink);
+    // A status page that cannot be read whole counts as no memory in memd.
+    assert_eq!(alloc.free_bytes(), 0);
+    assert!(alloc.arena(MIB).is_none());
+    STATUS.set(Some(Status { free_bytes: 100 << 20, reported_bytes: 0, largest_block: 32 << 20 }));
+    assert_eq!(alloc.free_bytes(), 100 * MIB);
+
+    // Three grants, of 32, 16 and 16 MiB, none a buddy of another.
+    let (a, b, c) = (1 << 30, (1 << 30) + 64 * MIB, (1 << 30) + 128 * MIB);
+    GRANTS.with_borrow_mut(|g| *g = vec![Some(c), Some(b), Some(a)]);
+    let arenas = [32, 16, 16].map(|mib| alloc.arena(mib * MIB).unwrap());
+    GRANTS.with_borrow(|g| assert!(g.is_empty()));
+    assert_eq!(alloc.local_free_bytes(), 0);
+
+    // memd has failed.  The first trim offers one size and stops.
+    FREE.set(Free::Failed);
+    let [x, y, z] = arenas;
+    alloc.reclaim(x);
+    FREED.with_borrow(|f| assert!(f.is_empty()));
+    let slots = alloc.slots.available();
+    alloc.reclaim(y);
+    FREED.with_borrow(|f| assert_eq!(f.as_slice(), [vec![(b, 24)]]));
+    assert_eq!(alloc.local_free_bytes(), 48 * MIB);
+    // The block kept its (new) slot; none was freed for it.
+    assert_eq!(alloc.slots.available(), slots - 1);
+    alloc.reclaim(z);
+    FREED.with_borrow(|f| assert_eq!(f.as_slice(), [vec![(b, 24)], vec![(a, 25)]]));
+    assert_eq!(alloc.local_free_bytes(), 64 * MIB);
+
+    // The blocks are used again (GRANTS is empty: memd is not asked), and
+    // are still grants: a memd that takes them gets them whole.
+    let x = alloc.arena(16 * MIB).unwrap();
+    assert_eq!(alloc.local_free_bytes(), 48 * MIB);
+    FREED.with_borrow_mut(Vec::clear);
+    FREE.set(Free::Takes);
+    let slots = alloc.slots.available();
+    alloc.reclaim(x);
+    FREED.with_borrow(|f| assert_eq!(f.as_slice(), [vec![(a, 25)]]));
+    assert_eq!(alloc.local_free_bytes(), 32 * MIB);
+    // One slot for the reclaimed region, one back from the grant returned.
+    assert_eq!(alloc.slots.available(), slots);
+
+    // A memd that failed holding a batch has it: the blocks are gone from
+    // here, with their slots, and the trim stops as well.
+    GRANTS.with_borrow_mut(|g| *g = vec![Some(a)]);
+    let x = alloc.arena(32 * MIB).unwrap();
+    FREED.with_borrow_mut(Vec::clear);
+    FREE.set(Free::FailedHolding);
+    let slots = alloc.slots.available();
+    alloc.reclaim(x);
+    FREED.with_borrow(|f| assert_eq!(f.as_slice(), [vec![(a, 25)]]));
+    assert_eq!(alloc.local_free_bytes(), 32 * MIB);
+    assert_eq!(alloc.slots.available(), slots);
+    // What is left serves requests without memd (GRANTS is empty).
+    let _rest = [alloc.arena(16 * MIB).unwrap(), alloc.arena(16 * MIB).unwrap()];
+    assert_eq!(alloc.local_free_bytes(), 0);
 }

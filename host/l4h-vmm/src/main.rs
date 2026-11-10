@@ -64,13 +64,27 @@ impl Dev {
         }
     }
 
-    fn poll(&mut self, mem: &GuestMem, vcpus: &Vcpus) {
+    /// The queues the guest kicked, and those in `more` (`take_more`).
+    fn poll(&mut self, mem: &GuestMem, vcpus: &Vcpus, more: u64) {
         match self {
             Dev::Blk(d) => d.poll(mem, vcpus, 0),
             Dev::Net(d) => d.poll(mem, vcpus, 0),
-            Dev::Gpu(d) => d.poll(mem, vcpus, 0),
+            Dev::Gpu(d) => d.poll(mem, vcpus, more),
             Dev::Usb(_) => {}
         }
+    }
+
+    /// The queues whose last kick left chains for a later turn (a bit
+    /// each), which this turn's `poll` takes up.
+    fn take_more(&mut self) -> u64 {
+        match self {
+            Dev::Gpu(d) => core::mem::take(&mut d.backend.more),
+            _ => 0,
+        }
+    }
+
+    fn has_more(&self) -> bool {
+        matches!(self, Dev::Gpu(d) if d.backend.more != 0)
     }
 
     fn complete(&mut self, mem: &GuestMem, vcpus: &Vcpus) {
@@ -280,8 +294,11 @@ impl l4h_rt::ipc::Server for Vmm<'_> {
             if badge & recv::DONE != 0 {
                 d.complete(mem, vcpus);
             }
-            if badge & recv::KICK != 0 {
-                d.poll(mem, vcpus);
+            // Kicked, or with chains its last turn left: on any turn,
+            // an idle one included (next polls for it).
+            let more = d.take_more();
+            if badge & recv::KICK != 0 || more != 0 {
+                d.poll(mem, vcpus, more);
             }
         }
         if self.console_pending {
@@ -311,6 +328,11 @@ impl l4h_rt::ipc::Server for Vmm<'_> {
         if self.unbound {
             return Next::Poll;
         }
+        // A device handled as much of its queues as one turn does and may
+        // have more: it gets another turn (an idle one, if nothing else
+        // waits) rather than a wait for a kick that need not come.
+        let more = self.devices.iter().any(|d| self.devs[d.guest_index as usize].as_ref().is_some_and(Dev::has_more));
+        let rest = if more { Next::Poll } else { Next::Wait };
         match self.answered.take() {
             // The guest stays blocked.
             Some(false) => Next::Wait,
@@ -318,12 +340,12 @@ impl l4h_rt::ipc::Server for Vmm<'_> {
             // the reply (run keeps it).
             Some(true) if self.console_pending => {
                 self.console_pending = self.console.drain(self.vcpus);
-                if self.console_pending { Next::Poll } else { Next::Wait }
+                if self.console_pending { Next::Poll } else { rest }
             }
             // A producer may have extended a nonempty ring without a kick.
             // Poll between bounded batches instead of waiting for a new kick.
             _ if self.console_pending => Next::Poll,
-            _ => Next::Wait,
+            _ => rest,
         }
     }
 }

@@ -129,6 +129,20 @@ impl Info {
 
 static INFO: Info = Info { _private: () };
 
+/// A deadline `ms` milliseconds from now, by the host's tick counter
+/// (host::ticks, at the rate root gave this component): the closure says
+/// whether it has passed.  For a driver's wait on its device, which must
+/// end whatever the device does.  An unknown rate is taken as 1 GHz, so
+/// that the wait stays finite.
+pub fn timeout_ms(ms: u64) -> impl FnMut() -> bool {
+    let hz = match INFO.header().tsc_hz {
+        0 => 1_000_000_000,
+        hz => hz,
+    };
+    let end = host::ticks::now().saturating_add((hz / 1000).max(1).saturating_mul(ms));
+    move || host::ticks::now() > end
+}
+
 #[doc(hidden)]
 pub fn init() -> &'static Info {
     unsafe {

@@ -1,7 +1,8 @@
-//! Transfer rings, from a fixed pool of pages in the DMA region, and the
-//! URBs in flight on them.  A ring is one page: TRBs 0..254, then a Link
-//! TRB back to the start.  Each ring keeps its URBs in order, those on the
-//! ring (posted) first, then those waiting for room.
+//! Transfer rings, from a fixed pool in the DMA region, and the URBs in
+//! flight on them.  A ring is RING_TRBS TRBs in one piece (two pages): 511
+//! for transfers, then a Link TRB back to the start.  Each ring keeps its
+//! URBs in order, those on the ring (posted) first, then those waiting for
+//! room.
 
 use core::ptr::addr_of_mut;
 use core::sync::atomic::Ordering;

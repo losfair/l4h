@@ -89,7 +89,10 @@ fn only_the_registered_instance_replaces_an_entry() {
     // Another instance than the running guest's, from either caller,
     // neither empties the entry nor answers for it.
     for from in [Sender::Trustd, Sender::Vmmgr] {
-        assert_eq!(registered(&mut e, from, FLAGS_ACT, u64::MAX, 5, &[], 0), Err(3));
+        assert_eq!(registered(&mut e, from, FLAGS_ACT, u64::MAX - 1, 5, &[], 0), Err(3));
+        // The instance readers take an unreadable entry for is no guest's.
+        assert_eq!(registered(&mut e, from, FLAGS_ACT, u64::MAX, 5, &[], 0), Err(22));
+        assert_eq!(registered(&mut e, from, FLAGS_ACT, u64::MAX, 0, &[], 0), Err(22));
         assert_eq!(registered(&mut e, from, FLAGS_ACT, 6, 5, &[], 0), Err(3));
         assert_eq!(e.read(), sealed);
     }
@@ -127,10 +130,16 @@ fn readers_never_mix_instances_or_see_a_seal_before_its_taint() {
             unsafe { w.update(Sender::Trustd, FLAGS_ACT, instance, instance, b, 1) }.unwrap();
         }
     });
+    let mut read = 0;
     while !writer.is_finished() {
-        let f = e.read();
+        // A reader gives up on an entry that stays in the middle of a write
+        // (this writer never rests); what it does read is consistent.
+        let Some(f) = e.try_read() else { continue };
+        read += 1;
         assert_eq!(f.taint, f.seal);
         if f.instance != 0 { assert_eq!(f.taint, [0, 0, f.instance, !f.instance]); }
     }
     writer.join().unwrap();
+    assert!(read > 0);
+    assert_eq!(e.try_read().unwrap().instance, 99_999);
 }

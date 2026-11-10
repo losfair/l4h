@@ -41,9 +41,11 @@ pub struct Seg {
 pub const MAX_PIECES: usize = blk::MAX_SEGS;
 
 /// Device requests up to this size are split into as many commands as the
-/// device's limits need, whatever else is in flight (clients send at most
-/// 14 segments of 256 KiB).
+/// device's limits need, whatever else is in flight: no client's request
+/// is larger (blk::MAX_REQUEST_BYTES, which DiskWindow::check_request
+/// holds them to), nor is a provisioning write (blk::STAGING_SIZE).
 pub const MAX_REQUEST: u64 = 4 << 20;
+const _: () = assert!(blk::MAX_REQUEST_BYTES <= MAX_REQUEST && blk::STAGING_SIZE as u64 <= MAX_REQUEST);
 
 /// Requests in flight on the controller: as many as the driver that takes
 /// most (NVMe) does.
@@ -58,6 +60,9 @@ pub struct DevInfo {
     pub flush: bool,
     /// Where the unit is on its controller (blk::PublishedUnit).
     pub address: u64,
+    /// Data pieces of one request (`Driver::start`) the device takes:
+    /// MAX_PIECES for a driver that cuts requests into commands itself.
+    pub seg_max: usize,
 }
 
 /// A disk driver.  Requests are identified by the caller's tag.
@@ -134,6 +139,8 @@ struct Pending {
     left: u8,
     /// The first error of a piece.
     status: u32,
+    /// Its number among the requests started (Blkd::seq).
+    seq: u64,
 }
 
 /// The second piece of a split request, started as soon as the device has
@@ -185,7 +192,33 @@ struct Blkd {
     dev: ArrayVec<DevInfo, { blk::MAX_UNITS }>,
     next: usize,
     ticks_per_sec: u64,
+    /// Requests started so far: the next one's Pending::seq.
+    seq: u64,
+    /// Completions the driver has reported so far.
+    reaped: u64,
+    /// The clients `remove` is draining, by slot: `submit` takes nothing
+    /// more from their channels.
+    drains: [Option<Drain>; blk::MAX_CLIENTS],
 }
+
+/// A client's drain (`Blkd::remove`), which root asks for again until it
+/// ends.
+#[derive(Clone, Copy)]
+struct Drain {
+    /// Blkd::seq when it began: requests below it are the ones the device
+    /// had then.
+    first: u64,
+    /// Of those, how many were pending at the last look, and when the
+    /// device is given up if no more of them complete.
+    left: usize,
+    end: u64,
+}
+
+/// What `Blkd::remove` says of a drain.
+const DRAINED: u64 = 0;
+/// The slice ended with requests still in flight and the device
+/// completing them: root asks again.
+const DRAINING: u64 = 1;
 
 /// What each slot's client holds, for blk::Reservations.
 fn holds(clients: &[Option<Client>]) -> impl Fn(usize) -> Option<blk::Hold<'static>> + '_ {
@@ -237,9 +270,10 @@ impl Blkd {
     }
 
     fn reap(&mut self) -> Option<u32> {
-        let Blkd { drv, pending, clients, .. } = self;
+        let Blkd { drv, pending, clients, reaped, .. } = self;
         let mut provision = None;
         drv.reap(&mut |tag, status| {
+            *reaped = reaped.wrapping_add(1);
             if tag == u64::MAX {
                 // Provisioning is serialized by l4h-root. Keep its result
                 // outside the IPC buffer: the driver may still invoke the
@@ -272,6 +306,7 @@ impl Blkd {
             let mut progress = false;
             for off in 0..n {
                 let i = self.active[(self.next + off) % n];
+                if self.drains[i].is_some() { continue; }
                 let Some(c) = self.clients[i].as_mut() else { continue };
                 for _ in 0..4 {
                     if self.carry.is_some() || !self.drv.can_start() { break; }
@@ -305,7 +340,8 @@ impl Blkd {
                         c.respond(req.id, status);
                         continue;
                     }
-                    self.pending[t] = Some(Pending { client: i, id: req.id, left: n.max(1) as u8, status: blk::STATUS_OK });
+                    self.pending[t] = Some(Pending { client: i, id: req.id, left: n.max(1) as u8, status: blk::STATUS_OK, seq: self.seq });
+                    self.seq = self.seq.wrapping_add(1);
                     c.outstanding += 1;
                     started = true;
                     if n == 2 {
@@ -328,22 +364,65 @@ impl Blkd {
         self.notify_completions();
     }
 
-    fn deadline(&self) -> u64 { host::ticks::now().saturating_add(5 * self.ticks_per_sec) }
+    /// How long the device may complete nothing before it is given up.
+    fn deadline(&self) -> u64 { host::ticks::now().saturating_add(5u64.saturating_mul(self.ticks_per_sec)) }
 
+    /// Whether the device has stopped: it has completed nothing since
+    /// `seen` completions (brought up to date), and `end` has passed.  A
+    /// completion moves `end` on.
+    fn stopped(&self, seen: &mut u64, end: &mut u64) -> bool {
+        if self.reaped != *seen {
+            (*seen, *end) = (self.reaped, self.deadline());
+            return false;
+        }
+        host::ticks::now() > *end
+    }
+
+    /// How long one `remove` drains before it answers root, which has
+    /// other requests for this blkd in the ring behind it.
+    fn slice(&self) -> u64 { host::ticks::now().saturating_add(self.ticks_per_sec) }
+
+    /// Drain client `i` and forget it: DRAINED; DRAINING if a slice was
+    /// not enough, and root is to ask again; or u64::MAX if the device
+    /// stopped completing what it had.
+    ///
+    /// The client's channel is no longer read from the first call on; the
+    /// other clients are served meanwhile, and between the calls.  Polling
+    /// the hardware drains only submitted work; no controller reset
+    /// disrupts other clients.  The device is given up only when, for the
+    /// bound, it finishes none of the requests it had when the drain
+    /// began: a slow device gets the time those need, each of bounded
+    /// size.  What the other clients submit meanwhile is no progress, so
+    /// the drain ends.  One call lasts a slice at most: a drain that takes
+    /// long does not keep root's other requests waiting for all of it.
     fn remove(&mut self, i: usize) -> u64 {
         if i >= self.clients.len() { return u64::MAX; }
-        // Stop consuming this channel first. Polling the hardware drains
-        // only submitted work; no controller reset disrupts other clients.
-        let end = self.deadline();
+        let old = |b: &Blkd, first: u64| b.pending.iter().flatten().filter(|p| p.seq < first).count();
+        let mut d = match self.drains[i] {
+            Some(d) => d,
+            None => Drain { first: self.seq, left: old(self, self.seq), end: self.deadline() },
+        };
+        self.drains[i] = Some(d);
+        let slice = self.slice();
         while self.clients[i].as_ref().is_some_and(|c| c.outstanding != 0) {
-            if self.start_carry() { self.drv.kick(); }
             self.reap();
-            if host::ticks::now() > end { return u64::MAX; }
+            self.submit();
+            let (still, now) = (old(self, d.first), host::ticks::now());
+            if still < d.left {
+                (d.left, d.end) = (still, self.deadline());
+            } else if now > d.end {
+                // Root quarantines the controller: nothing is left to drain.
+                self.drains[i] = None;
+                return u64::MAX;
+            }
+            self.drains[i] = Some(d);
+            if now > slice { return DRAINING; }
             core::hint::spin_loop();
         }
+        self.drains[i] = None;
         self.clients[i] = None;
         self.active.retain(|&a| a != i);
-        0
+        DRAINED
     }
 
     /// A blk::STATUS_* (u64::MAX: the device failed), or the errno the
@@ -358,10 +437,13 @@ impl Blkd {
             if !self.reserved.unattached(&holds(&self.clients[..]), unit, w) { return Err(errno::EBUSY); }
         }
         if flush && !dev.flush { return Ok(blk::STATUS_OK as u64); }
-        let end = self.deadline();
+        // The device is given up only when it completes nothing for the
+        // bound.  Nothing else is started while this waits, so what the
+        // device has runs out, and the wait ends.
+        let (mut seen, mut end) = (self.reaped, self.deadline());
         while !self.drv.can_start() {
             self.reap();
-            if host::ticks::now() > end { return Ok(u64::MAX); }
+            if self.stopped(&mut seen, &mut end) { return Ok(u64::MAX); }
         }
         let data = [Seg { pa: cfg.dma_paddr + cfg.dma_size, len: len as u32 }];
         let result = self.drv.start(u64::MAX, unit, if flush { blk::OP_FLUSH } else { blk::OP_WRITE },
@@ -370,7 +452,7 @@ impl Blkd {
         self.drv.kick();
         loop {
             if let Some(status) = self.reap() { return Ok(status as u64); }
-            if host::ticks::now() > end { return Ok(u64::MAX); }
+            if self.stopped(&mut seen, &mut end) { return Ok(u64::MAX); }
             core::hint::spin_loop();
         }
     }
@@ -451,6 +533,9 @@ impl blk::call::Server for Requests<'_> {
                     addr_of_mut!((*chan).capacity_sectors).write_volatile(vol.sectors());
                     addr_of_mut!((*chan).read_only).write_volatile(read_only as u32);
                     addr_of_mut!((*chan).block_size).write_volatile(dev.block_size);
+                    // A request cut where two extents meet has no more
+                    // pieces on either side than it had segments.
+                    addr_of_mut!((*chan).seg_max).write_volatile(dev.seg_max.clamp(1, blk::SEG_MAX) as u32);
                     fence(Ordering::Release);
                     addr_of_mut!((*chan).ready).write_volatile(1);
                 }
@@ -461,7 +546,11 @@ impl blk::call::Server for Requests<'_> {
     }
 
     fn remove(&mut self, _: blk::Sender, client: usize) -> Result<(), Errno> {
-        if self.b.remove(client) == 0 { Ok(()) } else { Err(errno::EBUSY) }
+        match self.b.remove(client) {
+            DRAINED => Ok(()),
+            DRAINING => Err(errno::EAGAIN),
+            _ => Err(errno::EBUSY),
+        }
     }
 
     fn write(&mut self, _: blk::Sender, sector: u64, length: usize, unit: usize) -> Result<u64, Errno> {
@@ -532,6 +621,7 @@ fn main(info: &'static Info) -> ! {
         pending: [None; MAX_INFLIGHT],
         carry: None,
         drv, dev, next: 0, ticks_per_sec: info.header().tsc_hz,
+        seq: 0, reaped: 0, drains: [None; blk::MAX_CLIENTS],
     };
     // The only references to the scratch table.
     let scratch_order = unsafe { &mut *addr_of_mut!(SCRATCH_ORDER) };

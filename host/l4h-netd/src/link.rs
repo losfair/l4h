@@ -31,6 +31,17 @@ const _: () = assert!(
         <= MsgRing::max_room(l4h_partition::LINK_CHANNEL_SIZE / 2 - l4h_partition::MSG_RING_HEADER as u64)
 );
 
+/// What one look at a link's incoming ring gave (`Link::recv`).
+pub enum Received<'a> {
+    /// A frame, and its offload header.
+    Frame(&'a mut [u8], [u8; net::HDR_SIZE]),
+    /// A record that is no frame netd takes: unknown, of a wrong length,
+    /// or with an offload header that does not describe it.
+    Dropped,
+    /// Nothing to read now.
+    Empty,
+}
+
 pub struct Link {
     pub switch: u32,
     tx: MsgRing,
@@ -107,25 +118,27 @@ impl Link {
         }
     }
 
-    /// Receive a frame and its offload header. The buffer has an extra
+    /// One look at the incoming ring: a frame and its offload header, a
+    /// record that was dropped, or nothing to read.  It reads at most two
+    /// records (`MsgReader::recv`), so a caller that bounds its looks
+    /// bounds the work the peer can give it.  The buffer has an extra
     /// byte so a truncated oversized record fails the length check.
-    pub fn recv<'a>(&mut self, buf: &'a mut [u8]) -> Option<(&'a mut [u8], [u8; net::HDR_SIZE])> {
-        loop {
-            let (ty, n) = self.rx.recv(buf, &mut self.lost)?;
-            if ty == MSG_FRAME && (14..=LINK_FRAME_MAX).contains(&n) {
-                self.rx_frames += 1;
-                return Some((&mut buf[..n], [0; net::HDR_SIZE]));
-            }
-            if ty == MSG_FRAME_GSO && (net::HDR_SIZE + 14..=net::HDR_SIZE + net::MAX_FRAME).contains(&n) {
-                let mut hdr = buf[..net::HDR_SIZE].try_into().unwrap();
-                // The peer partition is not trusted with tiny segments.
-                if is_gso(&hdr) && sanitize_rx(&mut hdr, &buf[net::HDR_SIZE..n], MIN_MSS) {
-                    self.rx_frames += 1;
-                    return Some((&mut buf[net::HDR_SIZE..n], hdr));
-                }
-            }
-            self.drops += 1;
+    pub fn recv<'a>(&mut self, buf: &'a mut [u8]) -> Received<'a> {
+        let Some((ty, n)) = self.rx.recv(buf, &mut self.lost) else { return Received::Empty };
+        if ty == MSG_FRAME && (14..=LINK_FRAME_MAX).contains(&n) {
+            self.rx_frames += 1;
+            return Received::Frame(&mut buf[..n], [0; net::HDR_SIZE]);
         }
+        if ty == MSG_FRAME_GSO && (net::HDR_SIZE + 14..=net::HDR_SIZE + net::MAX_FRAME).contains(&n) {
+            let mut hdr = buf[..net::HDR_SIZE].try_into().unwrap();
+            // The peer partition is not trusted with tiny segments.
+            if is_gso(&hdr) && sanitize_rx(&mut hdr, &buf[net::HDR_SIZE..n], MIN_MSS) {
+                self.rx_frames += 1;
+                return Received::Frame(&mut buf[net::HDR_SIZE..n], hdr);
+            }
+        }
+        self.drops += 1;
+        Received::Dropped
     }
 
     /// The ring is empty: ask for a doorbell.  False if a frame came in

@@ -44,7 +44,8 @@ const KEEP_BITS: usize = 12;
 
 pub struct Trustd {
     comp: Component,
-    /// The flags server (host::KIND_FLAGS), passive once started.
+    /// The flags server (host::KIND_FLAGS), on a scheduling context of
+    /// its own (trust::FLAGS_BUDGET_US).
     flags_server: Component,
     #[allow(dead_code)]
     arena: Arena,
@@ -71,6 +72,10 @@ pub struct Trustd {
     /// other TPM interface, whose trustd gets no hardware access.
     #[cfg(target_arch = "x86_64")]
     hw: Option<Hw>,
+    /// Refused accesses (`hw`) that root logs: trustd asks as often as it
+    /// likes, and must not fill root's log with them.
+    #[cfg(target_arch = "x86_64")]
+    hw_refusals: host::log::RateLimit<1>,
 }
 
 /// What `hw` serves trustd's AML from, and refuses it.
@@ -78,8 +83,11 @@ pub struct Trustd {
 struct Hw {
     /// The device pages it touched, a table of its own (acpi::Frames::hw).
     frames: crate::acpi::Frames,
-    /// The ECAM windows of segment 0 (MCFG): (base, first bus, last bus).
-    ecam: ArrayVec<(usize, u8, u8), 4>,
+    /// The MCFG's ECAM windows, of every segment, and whether these are
+    /// all of them.  If the firmware lists more than root keeps, no memory
+    /// write is served: any could be a configuration write.
+    ecam: ArrayVec<trust::Ecam, { trust::MAX_ECAM }>,
+    ecam_complete: bool,
     /// I/O ports that reset the machine, put it to sleep or enter SMM:
     /// (first, count).
     ports: ArrayVec<(usize, usize), 16>,
@@ -89,7 +97,7 @@ struct Hw {
 impl Hw {
     /// From the firmware's tables, read with `phys`.
     fn find(bootinfo: &sel4::BootInfoPtr, phys: &mut crate::acpi::Phys) -> Hw {
-        let mut hw = Hw { frames: crate::acpi::Frames::hw(), ecam: ArrayVec::new(), ports: ArrayVec::new() };
+        let mut hw = Hw { frames: crate::acpi::Frames::hw(), ecam: ArrayVec::new(), ecam_complete: true, ports: ArrayVec::new() };
         // The keyboard controller's and port A's reset, APM's SMI command
         // and data, the reset control register.
         for r in [(0x60, 1), (0x64, 1), (0x92, 1), (0xb2, 2), (0xcf9, 1)] {
@@ -114,14 +122,16 @@ impl Hw {
                 }
             }
         }
-        let mut buf = [0; 44 + 16 * 4];
-        if let Some(t) = crate::acpi::find(bootinfo, phys, b"MCFG", &mut buf) {
-            for e in t.get(44..).unwrap_or(&[]).chunks_exact(16) {
-                let base = u64::from_le_bytes(e[..8].try_into().unwrap()) as usize;
-                if u16::from_le_bytes([e[8], e[9]]) == 0 && e[10] <= e[11] {
-                    let _ = hw.ecam.push((base, e[10], e[11]));
-                }
-            }
+        // Every ECAM window, or the AML writes no memory: a write into
+        // one root does not know of would go unchecked.
+        let mut buf = [0; trust::MCFG_MAX];
+        match crate::acpi::find_len(bootinfo, phys, b"MCFG", &mut buf) {
+            Ok(None) => {}
+            Ok(Some((t, len))) => (hw.ecam, hw.ecam_complete) = trust::mcfg_windows(t, len),
+            Err(crate::acpi::Unreadable) => hw.ecam_complete = false,
+        }
+        if !hw.ecam_complete {
+            log!("l4h-root: the MCFG cannot be read, or lists more than {} ECAM windows: the TPM's AML gets no memory writes", trust::MAX_ECAM);
         }
         hw
     }
@@ -131,13 +141,11 @@ impl Hw {
         self.ports.iter().any(|&(p, n)| port < p + n && p < port + width)
     }
 
-    /// The PCI function whose ECAM page `paddr` is in, if it is one.
-    fn ecam_function(&self, paddr: usize) -> Option<(u8, u8, u8)> {
-        self.ecam.iter().find_map(|&(base, lo, hi)| {
-            let off = paddr.checked_sub(base)?;
-            let bus = off >> 20;
-            (bus >= lo as usize && bus <= hi as usize).then_some((bus as u8, (off >> 15 & 0x1f) as u8, (off >> 12 & 7) as u8))
-        })
+    /// The PCI function whose ECAM page `paddr` is in, if it is one, and
+    /// the offset in its configuration space: (segment, bus, device,
+    /// function, offset).
+    fn ecam_function(&self, paddr: usize) -> Option<(u16, u8, u8, u8, usize)> {
+        self.ecam.iter().find_map(|w| w.function(paddr).map(|(bus, dev, func, off)| (w.segment, bus, dev, func, off)))
     }
 }
 
@@ -447,15 +455,20 @@ fn create(
     // The flags server: the same image, with spaces of its own, so that
     // nothing trustd's main thread does (it parses guests' pages and runs
     // the firmware's AML) reaches the flags but its calls.  It runs at
-    // root's priority, the maximum; its own scheduling context, and its
-    // keeper's, take at most a quarter of a core.
+    // root's priority, the maximum, so that no caller waits behind
+    // another thread, on a scheduling context of its own, as its keeper
+    // does: a tenth of a core each at most (trust::FLAGS_BUDGET_US), which
+    // a caller's flood can use up and nothing more.  It never runs on a
+    // caller's: a server without a scheduling context would stop for good
+    // on a message sent without a call, which donates none, and its
+    // callers with it.
     let args = SpawnArgs {
         id: FLAGS_ID,
         kind: host::KIND_FLAGS,
         elf: TRUSTD_ELF,
         prio: 255,
-        budget_us: info.timeslice_us,
-        period_us: 4 * info.timeslice_us,
+        budget_us: trust::FLAGS_BUDGET_US,
+        period_us: trust::FLAGS_PERIOD_US,
         config: &[],
         ntfn: None,
         service_ep: None,
@@ -534,23 +547,23 @@ fn finish(
     let flags_ep = sel4::init_thread::Slot::<cap_type::Endpoint>::from_index(slot).cap();
     component::mint_edge(&abs_of(flags_ep), &wiring::ROOT_FLAGS, 0, &flags_obj).expect("root flags endpoint");
     component::start(&flags_server);
-    // reply_recv puts the server back on its endpoint before returning
-    // this reply.  Unbind only now: later calls donate their SC.  A server
-    // that failed meanwhile answers FAILED (its keeper), and so do every
-    // later call: their actions are refused.
+    // Root's one call to it, before any guest exists: the server answers
+    // once it serves its endpoint.  One that failed meanwhile answers
+    // FAILED (its keeper), as it does every later call: their actions are
+    // refused.  It keeps its scheduling context (`create`).
     {
         use l4h_host::trust::call::Client;
         if l4h_ipc::Endpoint::chosen(&wiring::ROOT_FLAGS, wiring::p::Root, flags_ep).ready().is_err() {
             log!("l4h-root: the flags server failed: no guest action can be recorded");
         }
     }
-    flags_server.sc.unbind().expect("passive flags server");
     let _ = abs_of(flags_ep).delete();
     alloc.slots.free(slot);
     component::start(&comp);
     Some(Trustd { comp, flags_server, arena, registry: REGISTRY_VA as *mut GuestRecord,
         no_reports, failed: false, relay, pages, second: core::array::from_fn(|_| Cell::new(false)), status, kick, flags,
-        #[cfg(target_arch = "x86_64")] hw })
+        #[cfg(target_arch = "x86_64")] hw,
+        #[cfg(target_arch = "x86_64")] hw_refusals: host::log::RateLimit::new() })
 }
 
 impl Trustd {
@@ -600,17 +613,28 @@ impl Trustd {
     }
 
     /// Guest `id`, instance `instance`, starts: its reports describe it
-    /// from now on.
-    pub fn register(&mut self, id: usize, instance: u64, record: GuestRecord) {
-        if self.failed { return; }
+    /// from now on.  False, and nothing changes, if it is registered
+    /// already: a running guest's record stays as it is, and its instance
+    /// never reads as 0, which would let trustd drop an answer and the
+    /// flags server take another instance for it.
+    pub fn register(&mut self, id: usize, instance: u64, record: GuestRecord) -> bool {
+        if self.failed { return true; }
         let p = self.registry.wrapping_add(id);
         let page = if self.second[id].get() { trust::RECORD_PAGE_B } else { 0 };
-        let record = GuestRecord { flags: record.flags & !trust::RECORD_PAGE_B | page, ..record };
         unsafe {
-            p.write_volatile(record);
+            if core::ptr::addr_of!((*p).instance).read_volatile() != 0 {
+                return false;
+            }
+            // Every other field, then the instance.
+            core::ptr::addr_of_mut!((*p).ram).write_volatile(record.ram);
+            core::ptr::addr_of_mut!((*p).vcpus).write_volatile(record.vcpus);
+            core::ptr::addr_of_mut!((*p).flags).write_volatile(record.flags & !trust::RECORD_PAGE_B | page);
+            core::ptr::addr_of_mut!((*p).launch).write_volatile(record.launch);
+            core::ptr::addr_of_mut!((*p).reserved).write_volatile(0);
             core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
             core::ptr::addr_of_mut!((*p).instance).write_volatile(instance);
         }
+        true
     }
 
     /// Guest `id` is destroyed.  Before its id is given again (`give`):
@@ -678,41 +702,81 @@ pub fn done(h: &mut Host, id: usize) {
 
 /// `hw` from trustd: one access the firmware's AML makes (trust::HW_*),
 /// served only for the ACPI start method.  Returns what it read (all ones
-/// when refused).  Refused, besides RAM and what is already given out
-/// (device memory root carved, which its frame table cannot have again;
-/// I/O ports seL4 has issued): writes to the configuration of the PCI
-/// functions root manages, by ports or through ECAM, their BARs, and the
-/// ports that reset the machine, put it to sleep or enter SMM.
+/// when refused).  trustd's main thread runs that AML and parses guests'
+/// pages, so root takes its requests for an attacker's and serves only
+/// what cannot reach beyond the hardware root has no use for:
+///
+/// - memory that is free device memory: not RAM, and not what root carved
+///   for itself or a driver, which its frame table cannot have again.  On
+///   a machine split into partitions, only where it is known to be no
+///   partition's memory (`partition_allows`);
+/// - I/O ports seL4 has not issued, other than those that reset the
+///   machine, put it to sleep or enter SMM;
+/// - of the BARs of the functions root drives, nothing;
+/// - PCI configuration, by the configuration mechanism or through ECAM:
+///   reads; writes only to functions root does not manage (`managed`),
+///   and in no function to the command register, the BARs or the
+///   expansion ROM's (trust::hw_config_write_protected), so that the AML
+///   neither moves a device onto another's addresses nor lets one master
+///   the bus.
+///
+/// Refusals are logged a few a second at most.
 #[cfg(target_arch = "x86_64")]
 pub fn hw(h: &mut Host, op: u64, addr: usize, off: usize, width: usize, value: u64) -> u64 {
+    match hw_access(h, op, addr, off, width, value) {
+        Ok(read) => read,
+        Err(why) => {
+            let (now, hz) = (host::ticks::now(), h.info.tsc_hz);
+            if let Some(more) = h.trustd.as_mut().and_then(|t| t.hw_refusals.allow(0, now, hz)) {
+                info!("l4h-root: trustd: refused hardware access {} at {:#x}+{:#x}: {}{}", op, addr, off, why, more);
+            }
+            u64::MAX
+        }
+    }
+}
+
+/// `hw`: what was read (0 for a write), or why the access is refused.
+#[cfg(target_arch = "x86_64")]
+fn hw_access(h: &mut Host, op: u64, addr: usize, off: usize, width: usize, value: u64) -> Result<u64, &'static str> {
     let write = op & 1 != 0;
-    let refused = |what: &str| {
-        info!("l4h-root: trustd: refused hardware access {} at {:#x}+{:#x}: {}", op, addr, off, what);
-        u64::MAX
-    };
-    let Some(hw) = h.trustd.as_ref().and_then(|t| t.hw.as_ref()) else { return refused("no ACPI start method") };
+    let Some(hw) = h.trustd.as_ref().and_then(|t| t.hw.as_ref()) else { return Err("no ACPI start method") };
     let r = match op {
         trust::HW_MEM_READ | trust::HW_MEM_WRITE => {
-            // `addr` and `width` are trustd's: the access must not wrap.
-            if !matches!(width, 1 | 2 | 4 | 8) || addr.checked_add(width).is_none() {
-                return refused("bad width or address");
+            // `addr` and `width` are trustd's: the access must not wrap,
+            // and, aligned, lies in one page.
+            if !matches!(width, 1 | 2 | 4 | 8) || addr % width != 0 || addr.checked_add(width).is_none() {
+                return Err("bad width or address");
             }
-            if hw.ecam_function(addr).is_some_and(|(b, d, f)| write && managed(h, b, d, f)) {
-                return refused("configuration of a function root manages");
+            if !partition_allows(addr, width) {
+                return Err("not known to be outside the partitions' memory");
+            }
+            if write {
+                if !hw.ecam_complete {
+                    return Err("a memory write, with more ECAM windows than root knows");
+                }
+                if let Some((segment, b, d, f, o)) = hw.ecam_function(addr) {
+                    if trust::hw_config_write_protected(o, width) {
+                        return Err("a function's command register, BARs or ROM");
+                    }
+                    // Root reads only segment 0, and cannot tell what a
+                    // function of another is.
+                    if segment != 0 || managed(h, b, d, f) {
+                        return Err("configuration of a function root manages");
+                    }
+                }
             }
             if in_bars(h, addr, width, false) {
-                return refused("a BAR of a function root manages");
+                return Err("a BAR of a function root manages");
             }
-            let Some(t) = h.trustd.as_mut() else { return u64::MAX };
-            let Some(hw) = t.hw.as_mut() else { return u64::MAX };
+            let Some(hw) = h.trustd.as_mut().and_then(|t| t.hw.as_mut()) else { return Err("no ACPI start method") };
             crate::acpi::Phys::new(&mut h.alloc, &mut h.devmem, &mut h.wins.a, &mut hw.frames).access(addr, width, write, value)
         }
         trust::HW_IO_READ | trust::HW_IO_WRITE => {
             if !matches!(width, 1 | 2 | 4) || addr.checked_add(width).is_none_or(|e| e > 0x1_0000) {
-                return refused("bad width or port");
+                return Err("bad width or port");
             }
             if hw.refused_port(addr, width) || in_bars(h, addr, width, true) {
-                return refused("a port the AML has no business with");
+                return Err("a port the AML has no business with");
             }
             io(&mut h.alloc, addr, width, write, value)
         }
@@ -723,10 +787,13 @@ pub fn hw(h: &mut Host, op: u64, addr: usize, off: usize, width: usize, value: u
             // badly, and a panic here is the whole host.
             if !matches!(width, 1 | 2 | 4) || addr >> 16 != 0 || off.checked_add(width).is_none_or(|e| e > 256)
                 || off % width != 0 {
-                return refused("bad width or offset");
+                return Err("bad width or offset");
+            }
+            if write && trust::hw_config_write_protected(off, width) {
+                return Err("a function's command register, BARs or ROM");
             }
             if write && managed(h, bus, dev, func) {
-                return refused("configuration of a function root manages");
+                return Err("configuration of a function root manages");
             }
             let (word, shift) = (off as u8 & !3, (off % 4) * 8);
             let old = h.pci.read32(bus, dev, func, word);
@@ -736,17 +803,39 @@ pub fn hw(h: &mut Host, op: u64, addr: usize, off: usize, width: usize, value: u
             }
             Some(((old & mask) >> shift) as u64)
         }
-        _ => None,
+        _ => return Err("no such access"),
     };
-    r.unwrap_or_else(|| refused("in use, or not device memory"))
+    r.ok_or("in use, or not device memory")
+}
+
+/// Whether memory [addr, addr + width) may be the AML's on this machine,
+/// as far as partitions go.  With the machine to itself root knows its RAM
+/// from the device memory seL4 gave it.  One of several partitions does
+/// not: the others' RAM, their kernels and the memory the shim shares
+/// between them are all device memory to this kernel, and the partition
+/// descriptor does not list them.  So there the AML gets memory only where
+/// it cannot be any of that: the chipset's addresses below 4 GiB
+/// (trust::HW_CHIPSET), the ECAM window, and the memory BARs of this
+/// partition's own PCI functions.
+#[cfg(target_arch = "x86_64")]
+fn partition_allows(addr: usize, width: usize) -> bool {
+    let Some(d) = crate::partition::get().filter(|d| d.count > 1) else { return true };
+    let within = |base: u64, size: u64| trust::hw_within(addr, width, base, size);
+    let buses = (d.ecam_bus_end as u64 + 1).saturating_sub(d.ecam_bus_start as u64);
+    within(trust::HW_CHIPSET.0, trust::HW_CHIPSET.1)
+        || d.ecam_base != 0 && within(d.ecam_base.saturating_add((d.ecam_bus_start as u64) << 20), buses << 20)
+        || d.funcs().iter().flat_map(|f| f.bars.iter())
+            .any(|b| b.size != 0 && b.flags & l4h_partition::BAR_IO == 0 && within(b.addr, b.size))
 }
 
 /// Whether root manages PCI function bus:dev.func, whose configuration
 /// the AML may then read but not write: the disk controllers and uplink
 /// NICs it drives, every xHCI controller (each is root's or the
-/// firmware's until claimed), the balloon device, IOMMUs, the host
-/// bridge and every bridge (their bus numbers and windows route the
-/// others).  So is a function root cannot read.
+/// firmware's until claimed), the balloon device, IOMMUs, every bridge
+/// (the host bridge's and the PCI bridges' bus numbers and windows route
+/// the others; an ISA or LPC bridge's registers place the chipset's
+/// power and reset blocks), and the function that holds the FADT's reset
+/// register.  So is a function root cannot read.
 #[cfg(target_arch = "x86_64")]
 fn managed(h: &Host, bus: u8, dev: u8, func: u8) -> bool {
     let is = |d: &crate::pci::Device| (d.bus, d.dev, d.func) == (bus, dev, func);
@@ -759,10 +848,13 @@ fn managed(h: &Host, bus: u8, dev: u8, func: u8) -> bool {
     let header = h.pci.read32(bus, dev, func, 0xc) >> 16 & 0x7f;
     id & 0xffff == 0xffff
         || header != 0
-        || matches!(class >> 8, 0x0600 | 0x0806)
+        // Base class 6: every bridge.
+        || class >> 16 == 0x06
+        || class >> 8 == 0x0806
         || class == 0x0c0330
         // virtio's balloon, modern and transitional (memd::is_balloon).
         || id & 0xffff == 0x1af4 && matches!(id >> 16, 0x1045 | 0x1002)
+        || h.reset.pci_function() == Some((bus, dev, func))
 }
 
 /// Whether [start, start + len), memory or (`io`) ports, meets a BAR of a
@@ -836,17 +928,14 @@ pub fn channel_message(h: &mut Host, peer: u32, ty: u32, msg: &[u8]) {
     }
     let va = relay_va(trust::relay_slot_va(peer as usize) - trust::RELAY_VA);
     let slot = unsafe { &*(va as *const trust::RelaySlot) };
-    use core::sync::atomic::Ordering;
-    let seq = slot.seq.load(Ordering::Relaxed);
-    slot.seq.store(seq | 1, Ordering::Relaxed);
-    core::sync::atomic::fence(Ordering::Release);
-    unsafe {
-        core::ptr::copy_nonoverlapping(msg.as_ptr(), (va + trust::RELAY_SLOT_HEADER) as *mut u8, msg.len());
-    }
-    slot.len.store(msg.len() as u32, Ordering::Relaxed);
-    // `seq` comes from a page the peer's trustd maps writable: never let its
-    // value overflow root's own increment.
-    slot.seq.store((seq | 1).wrapping_add(1), Ordering::Release);
+    // The count is in a page trustd maps writable: whatever it holds,
+    // the write leaves it even, and wraps.
+    host::seqlock::write(&slot.seq, |_| {
+        unsafe {
+            core::ptr::copy_nonoverlapping(msg.as_ptr(), (va + trust::RELAY_SLOT_HEADER) as *mut u8, msg.len());
+        }
+        slot.len.store(msg.len() as u32, core::sync::atomic::Ordering::Relaxed);
+    });
     relay.signal();
 }
 
@@ -864,9 +953,13 @@ pub fn relay(h: &mut Host, peer: u32, len: usize) -> u64 {
     if cs.send(peer, ty, &[msg]) { 0 } else { u64::MAX }
 }
 
-/// Root's timer: kick trustd while it waits for an answer from another
-/// partition, so that it can ask again or give up.
+/// Root's timer: guests' allowance of attestation notices is new
+/// (trust::AttestNotices); and kick trustd while it waits for an answer
+/// from another partition, so that it can ask again or give up.
 pub fn tick(h: &mut Host) {
+    if let Some(v) = h.vmmgr.as_mut() {
+        v.attest_tick();
+    }
     let Some(relay) = h.trustd.as_ref().filter(|t| !t.failed).and_then(|t| t.relay) else { return };
     let out = unsafe { &*(relay_va(0) as *const trust::RelaySlot) };
     if out.wake.load(core::sync::atomic::Ordering::Relaxed) != 0 {

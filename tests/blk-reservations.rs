@@ -95,3 +95,62 @@ fn detach_keeps_boot_reservations_and_releases_normal_attachments() {
         }
     }
 }
+
+#[test]
+fn windows_beyond_a_small_disk_are_planned_and_reserved_not_fatal() {
+    let text = "2048:8192,16384:8192";
+    // They fit the disk: planned and reserved as they are.
+    let (w, len, fits) = dom0_windows::<4>(text, 1 << 20).unwrap();
+    assert_eq!((len, fits), (2, true));
+    assert_eq!(w[..2], [DiskWindow { start: 2048, sectors: 8192 }, DiskWindow { start: 16384, sectors: 8192 }]);
+    assert_eq!(dom0_plan_reservation(16384, 8192, 1 << 20), Some(w[1]));
+    // The disk (its blkd says) ends inside the first window, or before
+    // both: the same plan, which root must not stop for.  Each window
+    // stays reserved; attaching one beyond the disk is refused later.
+    for capacity in [8, 4096, 20000] {
+        let (small, len, fits) = dom0_windows::<4>(text, capacity).unwrap();
+        assert_eq!((len, fits, &small[..2]), (2, false, &w[..2]));
+        for win in &small[..2] {
+            assert_eq!(dom0_plan_reservation(win.start, win.sectors, capacity), Some(*win));
+            // blkd reserves it: within the largest aligned capacity.
+            assert_eq!(DiskWindow::new(win.start, win.sectors, u64::MAX & !7), Some(*win));
+        }
+    }
+    assert!(DiskWindow::new(16384, 8192, 20000).is_none());
+    // An unknown capacity fits any list.
+    assert_eq!(dom0_windows::<4>(text, UNKNOWN_CAPACITY).map(|(_, len, fits)| (len, fits)), Some((2, true)));
+    // What is no list of windows of any disk is still refused.
+    for invalid in ["", "8:0", "1:8", "8:16,16:16", "8:8,16:8,24:8,32:8,40:8", "8:18446744073709551608"] {
+        assert!(dom0_windows::<4>(invalid, 1 << 20).is_none(), "{invalid}");
+        assert!(dom0_windows::<4>(invalid, 8).is_none(), "{invalid}");
+    }
+    // The automatic plan is as before: the whole disk, whatever it is.
+    for capacity in [0, 7, 131072, 131073] {
+        assert_eq!(dom0_plan_reservation(0, 0, capacity), dom0_reservation(0, 0, capacity));
+    }
+    assert!(dom0_plan_reservation(1, 8, 131072).is_none());
+}
+
+#[test]
+fn only_dom0_claims_a_boot_range_and_only_as_it_was_reserved() {
+    let r = reservation();
+    let (disk, window) = (r.disk, r.window);
+    assert!(r.claimed_by(true, disk, window));
+    // Another guest, another disk, another window: blkd gives the slot to
+    // none of them.
+    assert!(!r.claimed_by(false, disk, window));
+    assert!(!r.claimed_by(true, disk + 1, window));
+    assert!(!r.claimed_by(true, disk, DiskWindow { start: window.start, sectors: window.sectors + 8 }));
+    assert!(!r.claimed_by(true, disk, DiskWindow { start: window.start + 8, sectors: window.sectors }));
+    // A slot with a client, or one being removed, is no one's to take; nor
+    // is an attachment that is no reservation.
+    let mut busy = reservation();
+    busy.pool = Some((0x100000, 0x400000));
+    assert!(!busy.claimed_by(true, disk, window));
+    let mut going = reservation();
+    going.remove = Some(Removal { zombie: None, posted: false });
+    assert!(!going.claimed_by(true, disk, window));
+    let mut plain = reservation();
+    plain.reserved = false;
+    assert!(!plain.claimed_by(true, disk, window));
+}

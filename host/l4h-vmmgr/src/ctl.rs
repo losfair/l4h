@@ -1,7 +1,8 @@
 //! The control API for dom0 (DESIGN.md §10.1): requests arrive in dom0's
 //! control page (struct l4h_ctl_req), the response is written next to it.
 //! vmmgr serves the guests' ops; root those on the host's disks, switches
-//! and NICs, which vmmgr passes on as integers (root.rs, VMMGR_HOST_OP).
+//! and NICs, which vmmgr passes on as integers (root.rs,
+//! l4h_host::root::call::host_op).
 
 use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{Ordering, fence};
@@ -76,9 +77,11 @@ pub fn kicked(h: &mut Vmmgr) {
     }
 }
 
-/// Answer dom0 `caller`'s (`instance`) control request `seq` with `r`, as
-/// root answered it later: unless dom0 has made another since.
-pub fn answer(h: &mut Vmmgr, caller: usize, instance: u64, seq: u32, r: Result<[u64; 6], Errno>) {
+/// Answer the control request `waits` (dom0 `caller`'s, of `instance`,
+/// its `seq`) with `r`, as root answered it later: unless dom0 has made
+/// another since.
+pub fn answer(h: &mut Vmmgr, waits: crate::CtlWait, r: Result<[u64; 6], Errno>) {
+    let crate::CtlWait { caller, instance, seq } = waits;
     let Some(page) = h.guest(caller).filter(|g| g.instance == instance && g.ctl_taken == seq).and_then(|g| g.ctl_page()) else { return };
     let resp = abi::CtlResp { status: r.err().map_or(0, l4h_host::errno::negative), vals: r.unwrap_or_default(), data: [0; abi::CTL_DATA_MAX] };
     unsafe { (page.add(abi::CTL_RESP_OFF) as *mut abi::CtlResp).write_volatile(resp) };
@@ -101,11 +104,16 @@ fn raise(h: &mut Vmmgr, id: usize) {
     g.raise_event(&mut h.alloc, crate::guest::dev_event(d));
 }
 
+/// The control request being executed, which root answers later.
+fn waiting(h: &Vmmgr) -> crate::CtlWait {
+    let (caller, seq) = h.ctl_now.expect("a control request");
+    crate::CtlWait { caller, instance: h.guests[caller].as_ref().map_or(0, |g| g.instance), seq }
+}
+
 /// What answers the control request being executed, when root answers
 /// later.
 fn later(h: &Vmmgr) -> Then {
-    let (caller, seq) = h.ctl_now.expect("a control request");
-    Then::Ctl { caller, instance: h.guests[caller].as_ref().map_or(0, |g| g.instance), seq }
+    Then::Ctl(waiting(h))
 }
 
 /// Root's answer to a host op of the control request being executed: now,
@@ -114,7 +122,7 @@ fn host_op(h: &mut Vmmgr, op: u32, a: &[u64; 6]) -> Result<[u64; 6], Errno> {
     match root::host_op(op, a)? {
         Later::Now(vals) => Ok(vals),
         Later::Token(t) => {
-            h.root_ops[t] = Some(crate::RootOp::HostOp { then: later(h) });
+            h.root_ops[t] = Some(crate::RootOp::HostOp { waits: waiting(h) });
             Err(DEFER)
         }
     }
@@ -173,7 +181,12 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
         abi::CTL_VM_CREATE => {
             let name = core::str::from_utf8(cstr(&req.data[..abi::CTL_NAME_MAX])).map_err(|_| EINVAL)?;
             let (ram, vcpus) = (a[0] as usize, a[1] as usize);
-            if vcpus == 0 || vcpus > h.info.cores * 4 {
+            // What guest::create would refuse for its value, which is no
+            // lack of memory.
+            if vcpus == 0 || vcpus > h.info.cores * 4 || vcpus > abi::MAX_VCPUS {
+                return Err(EINVAL);
+            }
+            if !(crate::guest::RAM_MIN..=crate::guest::RAM_MAX).contains(&ram) {
                 return Err(EINVAL);
             }
             let io_pool = if a[4] != 0 { a[4] as usize } else { crate::guest::IO_POOL_DEFAULT };
@@ -237,25 +250,28 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
             let cmdline = cstr(&req.data);
             h.with_guest(id, |h, g| {
                 let kernel = h.kernel.as_ref().expect("guests run the host's kernel");
-                if g.state != State::Created || g.vmm.is_some() {
-                    return Err(EINVAL);
-                }
-                // Before boot prepares it, so it can start once its disk is
-                // attached.
-                if g.root_pending {
+                // As the attach paths: not once it has a VMM, nor while
+                // root attaches a device for it (it can start once that is
+                // answered).  Before boot prepares it.
+                if g.state != State::Created || g.vmm.is_some() || g.root_pending {
                     return Err(EBUSY);
                 }
                 // The boot blocks it fills with frames (as many as dom0
-                // asks for) and its l4h-vmm.
+                // asks for) and its l4h-vmm: all of it reserved before
+                // boot, which is done once, so that nothing after it can
+                // be refused.
                 let (bytes, slots) = g.boot_cost(kernel.end, initrd).ok_or(EINVAL)?;
-                let bytes = bytes + crate::vmm::start_bytes(g.pool.size, g.vcpus.len(), g.devices.len());
+                let bytes = bytes + g.start_bytes();
                 if !h.can_afford(bytes, 1, slots) || !g.reserve(&mut h.alloc, bytes) {
                     return Err(ENOMEM);
                 }
-                if crate::guest::boot(g, &mut h.alloc, &mut h.wins.a, &h.info, kernel, initrd, cmdline) { Ok(()) } else { Err(EINVAL) }
+                if !crate::guest::boot(g, &mut h.alloc, &mut h.wins.a, &h.info, kernel, initrd, cmdline) {
+                    return Err(EINVAL);
+                }
+                h.spawn_vmm(g);
+                Ok(())
             })
-            .ok_or(ENOENT)??;
-            h.start_guest(id)
+            .ok_or(ENOENT)?
         }
         abi::CTL_VM_DESTROY => {
             let id = vm_arg(a[0])?;
@@ -322,8 +338,8 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
         abi::CTL_CONSOLE_READ => {
             let g = h.guest(vm_arg(a[0])?).ok_or(ENOENT)?;
             let ring = g.console_ring();
-            let head = unsafe { addr_of!((*ring).head).read_volatile() };
-            fence(Ordering::Acquire);
+            // The VMM's to write: taken once, and the bytes after it.
+            let head = unsafe { (*ring).head.load(Ordering::Acquire) };
             let off = a[1].min(head);
             let start = off.max(head.saturating_sub(host::CONSOLE_RING_DATA as u64));
             let n = (head - start).min(abi::CTL_DATA_MAX as u64) as usize;
@@ -386,6 +402,11 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
             let g = h.guest(vm_arg(a[0])?).ok_or(ENOENT)?;
             let t = h.flags.as_ref().ok_or(ENOSYS)?;
             let flags = t.flags(g);
+            // An entry the flags server was writing at every look says
+            // nothing of the guest: not "all tainted and sealed".
+            if flags.unavailable() {
+                return Err(EAGAIN);
+            }
             resp.vals[0] = flags.taint[0];
             resp.vals[1] = flags.seal[0];
             Ok(())

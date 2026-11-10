@@ -12,11 +12,14 @@ use l4h_virtio::{
 
 use crate::{DevInfo, Driver, MAX_PIECES, Seg};
 
+const VIRTIO_BLK_F_SEG_MAX: u64 = 1 << 2;
 const VIRTIO_BLK_F_RO: u64 = 1 << 5;
 const VIRTIO_BLK_F_BLK_SIZE: u64 = 1 << 6;
 const VIRTIO_BLK_F_FLUSH: u64 = 1 << 9;
-/// Device configuration: capacity in sectors, block size.
+/// Device configuration: capacity in sectors, data segments of a request,
+/// block size.
 const CFG_CAPACITY: u16 = 0;
+const CFG_SEG_MAX: u16 = 12;
 const CFG_BLK_SIZE: u16 = 20;
 
 const MAX_DESCS: usize = 2 + MAX_PIECES;
@@ -42,6 +45,10 @@ pub struct VirtioBlk {
     features: u64,
     capacity: u64,
     block_size: u32,
+    /// Data pieces of a request the device takes (its seg_max, if it
+    /// states one): blkd's clients are told (blk::Channel::seg_max), and a
+    /// request with more is refused.
+    seg_max: usize,
 }
 
 impl VirtioBlk {
@@ -53,7 +60,13 @@ impl VirtioBlk {
         msix.w32(4, (cfg.msi_address >> 32) as u32);
         msix.w32(8, cfg.msi_data);
         msix.w32(12, 0);
-        let wanted = |offered: u64| offered & (VIRTIO_BLK_F_RO | VIRTIO_BLK_F_FLUSH | VIRTIO_BLK_F_BLK_SIZE);
+        let wanted = |offered: u64| {
+            offered & (VIRTIO_BLK_F_RO | VIRTIO_BLK_F_FLUSH | VIRTIO_BLK_F_BLK_SIZE | VIRTIO_BLK_F_SEG_MAX)
+        };
+        // The device's seg_max `v`, if `features` has one.
+        let seg_max = |features: u64, v: u32| {
+            if features & VIRTIO_BLK_F_SEG_MAX != 0 { (v as usize).clamp(1, MAX_PIECES) } else { MAX_PIECES }
+        };
         let modern = (cfg.legacy_io == 0).then(|| Device {
             common: Mmio(cfg.common.va as usize),
             notify: Mmio(cfg.notify.va as usize),
@@ -61,8 +74,10 @@ impl VirtioBlk {
                 notify_len: cfg.notify.len as usize,
             device: Mmio(cfg.device.va as usize),
         });
-        let (vq, features, ports, capacity, block_size) = if let Some(dev) = &modern {
-            dev.reset();
+        let (vq, features, ports, capacity, block_size, seg_max) = if let Some(dev) = &modern {
+            if !dev.reset(l4h_rt::timeout_ms(l4h_virtio::RESET_MS)) {
+                panic!("blkd {:#x}: device did not reset", id);
+            }
             let offered = dev.features();
             let want = F_VERSION_1 | F_INDIRECT_DESC;
             if offered & want != want {
@@ -78,7 +93,7 @@ impl VirtioBlk {
             let capacity = dev.device.r64(CFG_CAPACITY as usize);
             let block_size =
                 if features & VIRTIO_BLK_F_BLK_SIZE != 0 { dev.device.r32(CFG_BLK_SIZE as usize).max(512) } else { 512 };
-            (vq, features, None, capacity, block_size)
+            (vq, features, None, capacity, block_size, seg_max(features, dev.device.r32(CFG_SEG_MAX as usize)))
         } else {
             let p = Ports { cap: blk::BLKD_SLOT_IOPORT, base: cfg.legacy_io as u16 };
             p.out8(legacy::STATUS, 0);
@@ -104,7 +119,8 @@ impl VirtioBlk {
             let cfg32 = |off: u16| p.in32(legacy::DEVICE_CONFIG + off);
             let capacity = cfg32(CFG_CAPACITY) as u64 | (cfg32(CFG_CAPACITY + 4) as u64) << 32;
             let block_size = if features & VIRTIO_BLK_F_BLK_SIZE != 0 { cfg32(CFG_BLK_SIZE).max(512) } else { 512 };
-            (Virtq::legacy(0, num, va), features, Some(p), capacity, block_size)
+            let seg_max = seg_max(features, cfg32(CFG_SEG_MAX));
+            (Virtq::legacy(0, num, va), features, Some(p), capacity, block_size, seg_max)
         };
         // A slot per queue entry, up to blk::RING_SIZE: a legacy queue may
         // be larger.
@@ -122,7 +138,7 @@ impl VirtioBlk {
             p.out8(legacy::STATUS, STATUS_ACK | STATUS_DRIVER | STATUS_DRIVER_OK);
             l4h_rt::info!("blkd {:#x}: legacy virtio-blk, {} queue entries", id, vq.num);
         }
-        VirtioBlk { free, vq, ports, slots, features, capacity, block_size }
+        VirtioBlk { free, vq, ports, slots, features, capacity, block_size, seg_max }
     }
 }
 
@@ -138,6 +154,7 @@ impl Driver for VirtioBlk {
             read_only: self.features & VIRTIO_BLK_F_RO != 0,
             flush: self.features & VIRTIO_BLK_F_FLUSH != 0,
             address: 0,
+            seg_max: self.seg_max,
         }
     }
 
@@ -146,6 +163,11 @@ impl Driver for VirtioBlk {
     }
 
     fn start(&mut self, tag: u64, _unit: usize, op: u32, sector: u64, data: &[Seg]) -> Result<(), u32> {
+        // More pieces than the device said it takes: a client that
+        // ignored the seg_max it was given.
+        if data.len() > self.seg_max {
+            return Err(blk::STATUS_IOERR);
+        }
         let s = self.free.pop().ok_or(blk::STATUS_IOERR)?;
         let slot = &mut self.slots[s as usize];
         let hdr = Mmio(slot.hdr_va);

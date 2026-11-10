@@ -28,14 +28,15 @@ const VIRTIO_BLK_S_IOERR: u8 = 1;
 const VIRTIO_BLK_S_UNSUPP: u8 = 2;
 
 const QUEUE_SIZE: u32 = blk::RING_SIZE as u32;
-/// Segments of a request, leaving room for data sharing the header and
-/// status buffers.
-const SEG_MAX: u32 = blk::MAX_SEGS as u32 - 2;
+/// Data segments of a request at most, counting what shares the header's
+/// and the status byte's buffers.  The guest is offered this or what the
+/// disk's device takes, if that is fewer (Blk::seg_max), and held to it.
+const SEG_MAX: u32 = blk::SEG_MAX as u32;
 /// The largest segment the guest's DMA layer maps at once (swiotlb).
-const SEG_SIZE_LIMIT: u32 = 256 << 10;
-/// How long a reset waits for blkd to complete the requests it has, as
-/// blkd waits for its device when a client goes (DESIGN.md §9.2).  One
-/// that root quarantined never does: it is suspended.
+const SEG_SIZE_LIMIT: u32 = blk::SEG_SIZE_MAX;
+/// How long a reset waits for blkd to complete the requests it has
+/// (DESIGN.md §9.2).  One that root quarantined never does: it is
+/// suspended.
 const DRAIN_SECS: u64 = 5;
 
 /// Largest segment for a guest whose I/O pool has `pool` bytes.  Every
@@ -69,6 +70,8 @@ pub struct Blk {
     block_size: u32,
     /// Largest data segment (see size_max).
     size_max: u32,
+    /// Data segments of a request: SEG_MAX, or fewer if blkd says so.
+    seg_max: u32,
     /// Requests submitted to blkd, by queue and chain head.
     inflight: [[Option<Inflight>; QUEUE_SIZE as usize]; MAX_QUEUES],
     nr_queues: usize,
@@ -94,7 +97,7 @@ impl Blk {
         Blk {
             chan: core::ptr::null_mut(), sq: Producer::new(blk::RING_SIZE), cq: Consumer::new(blk::RING_SIZE),
             kick: None, capacity: 0, read_only: true, volatile: false,
-            block_size: 512, size_max: size_max(pool),
+            block_size: 512, size_max: size_max(pool), seg_max: SEG_MAX,
             inflight: [[None; QUEUE_SIZE as usize]; MAX_QUEUES], nr_queues: 1, kick_pending: false,
             outstanding: 0, generation: 0, stalled: [None; MAX_QUEUES],
             fence: None, flush_inflight: false, deferred: 0, tsc_hz: 0,
@@ -105,13 +108,14 @@ impl Blk {
     /// pool, `tsc_hz` the rate of host::ticks.
     pub fn new(chan_va: usize, kick: sel4::cap::Notification, pool: u64, tsc_hz: u64) -> Self {
         let chan = chan_va as *mut Channel;
-        let (capacity, read_only, volatile, block_size) = unsafe {
+        let (capacity, read_only, volatile, block_size, seg_max) = unsafe {
             fence(Ordering::Acquire);
             (
                 addr_of!((*chan).capacity_sectors).read_volatile(),
                 addr_of!((*chan).read_only).read_volatile() != 0,
                 addr_of!((*chan).volatile).read_volatile() != 0,
                 addr_of!((*chan).block_size).read_volatile().max(512),
+                addr_of!((*chan).seg_max).read_volatile(),
             )
         };
         Blk {
@@ -125,6 +129,8 @@ impl Blk {
             volatile,
             block_size,
             size_max: size_max(pool).max(block_size),
+            // blkd's word, read once: never more than SEG_MAX.
+            seg_max: if seg_max == 0 { SEG_MAX } else { seg_max.min(SEG_MAX) },
             inflight: [[None; QUEUE_SIZE as usize]; MAX_QUEUES],
             nr_queues: MAX_QUEUES,
             kick_pending: false,
@@ -146,6 +152,16 @@ impl Blk {
             let resp = addr_of!((*self.chan).resps[self.cq.slot()]).read_volatile();
             self.cq.pop(&(*self.chan).cq);
             Some(resp)
+        }
+    }
+
+    /// Responses were taken off the completion ring.  blkd takes a request
+    /// only while its response has room there, and nothing else tells it
+    /// when there is room again: with requests waiting in the submission
+    /// ring, kick it (`notify_submissions`).
+    fn made_room(&mut self) {
+        if unsafe { self.sq.used(&(*self.chan).sq) != 0 } {
+            self.kick_pending = true;
         }
     }
 
@@ -217,11 +233,15 @@ impl Blk {
         // Bytes the device writes, the status byte included (u64: a
         // hostile chain can describe more than 4 GiB).
         let mut written: u64 = 1;
+        // The guest is held to the seg_max and size_max it was offered: a
+        // request is then no more than blkd takes from any client
+        // (blk::MAX_REQUEST_BYTES), nor than the pool can bounce.
+        let (seg_max, size_max) = (self.seg_max, self.size_max);
         let mut seg = |gpa: u64, len: u32, write: bool, req: &mut blk::Req| -> bool {
             if len == 0 {
                 return true;
             }
-            if req.nr_segs as usize == blk::MAX_SEGS {
+            if req.nr_segs >= seg_max || len > size_max {
                 return false;
             }
             req.segs[req.nr_segs as usize] = blk::Seg { gpa, len, flags: if write { blk::SEG_WRITE } else { 0 } };
@@ -260,13 +280,8 @@ impl Blk {
                 }
             }
             blk::OP_FLUSH => if req.nr_segs == 0 { None } else { Some(VIRTIO_BLK_S_IOERR) },
-            blk::OP_GET_ID => {
-                if fits && req.nr_segs == 1 && req.segs[0].flags & blk::SEG_WRITE != 0 {
-                    None
-                } else {
-                    Some(VIRTIO_BLK_S_IOERR)
-                }
-            }
+            // Everything else (GET_ID, DISCARD, WRITE_ZEROES, ...): blkd
+            // takes reads, writes and flushes only.
             _ => Some(VIRTIO_BLK_S_UNSUPP),
         };
         if let Some(s) = status {
@@ -291,22 +306,34 @@ impl Blk {
     }
 
     /// Pass each response to `f` until blkd has none outstanding: false
-    /// if that takes more than DRAIN_SECS.
+    /// if that takes more than DRAIN_SECS, or blkd gives more responses
+    /// than it was given requests.  The time is checked whether or not
+    /// there is a response, so a blkd that keeps publishing them cannot
+    /// hold the VMM here.
     fn wait_outstanding(&mut self, mut f: impl FnMut(&mut Self, blk::Resp)) -> bool {
-        let mut end = None;
+        if self.outstanding == 0 { return true; }
+        // An unknown rate is taken as 1 GHz: the wait stays finite.
+        let hz = if self.tsc_hz == 0 { 1_000_000_000 } else { self.tsc_hz };
+        let end = host::ticks::now().saturating_add(DRAIN_SECS.saturating_mul(hz));
+        // blkd owes one response for each request.  A ring's worth of
+        // others is let through, as many as `complete` takes in a turn.
+        let mut budget = self.outstanding.saturating_add(blk::RING_SIZE);
+        let mut taken = false;
         while self.outstanding != 0 {
+            if host::ticks::now() > end || budget == 0 {
+                return false;
+            }
             let Some(resp) = self.next_resp() else {
-                // An unknown rate is taken as 1 GHz: the wait stays finite.
-                let now = host::ticks::now();
-                let hz = if self.tsc_hz == 0 { 1_000_000_000 } else { self.tsc_hz };
-                if now > *end.get_or_insert(now.saturating_add(DRAIN_SECS.saturating_mul(hz))) {
-                    return false;
+                if core::mem::take(&mut taken) {
+                    self.made_room();
+                    self.notify_submissions();
                 }
                 // blkd runs at a higher priority, on its own core or as
                 // soon as we yield.
                 sel4::r#yield();
                 continue;
             };
+            (taken, budget) = (true, budget - 1);
             f(self, resp);
         }
         true
@@ -367,7 +394,7 @@ impl Backend for Blk {
     fn init_config(&self, config: &mut [u8]) {
         config[0..8].copy_from_slice(&self.capacity.to_le_bytes());
         config[8..12].copy_from_slice(&self.size_max.to_le_bytes());
-        config[12..16].copy_from_slice(&SEG_MAX.to_le_bytes());
+        config[12..16].copy_from_slice(&self.seg_max.to_le_bytes());
 
         config[20..24].copy_from_slice(&self.block_size.to_le_bytes());
         if !self.chan.is_null() { config[34..36].copy_from_slice(&(MAX_QUEUES as u16).to_le_bytes()); }
@@ -420,11 +447,14 @@ impl Backend for Blk {
     fn complete(&mut self, mem: &GuestMem, queues: &mut [Queue]) -> bool {
         if self.chan.is_null() { return false; }
         let mut returned = 0;
+        let mut taken = false;
         // At most a ring's worth: what blkd publishes meanwhile is pending.
         for _ in 0..blk::RING_SIZE {
             let Some(resp) = self.next_resp() else { break };
+            taken = true;
             returned |= self.response(mem, queues, resp, None);
         }
+        if taken { self.made_room(); }
         for (q, queue) in queues.iter_mut().enumerate().take(self.nr_queues) {
             if returned & (1 << q) != 0 { queue.publish_used(mem); }
         }

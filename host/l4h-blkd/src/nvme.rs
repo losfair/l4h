@@ -354,6 +354,7 @@ impl Driver for Nvme {
             read_only: false,
             flush: self.flush,
             address: 0,
+            seg_max: MAX_PIECES,
         }
     }
 

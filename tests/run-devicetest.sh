@@ -33,7 +33,7 @@ start = blkd.index('use core::ops::{Deref, DerefMut};')
 # Keep the production boot sequence and reservation lifecycle intact.
 vmmgr = (root / 'host/l4h-vmmgr/src/main.rs').read_text()
 start = vmmgr.index('pub fn boot_dom0(')
-end = vmmgr.index('\n}', vmmgr.index('fn dom0_finish(', start)) + 2
+end = vmmgr.index('\n}', vmmgr.index('fn dom0_start(', start)) + 2
 (out / 'dom0-boot.inc').write_text(vmmgr[start:end])
 blkd = (root / 'host/l4h-root/src/blkd.rs').read_text()
 reservations = blkd[blkd.index('pub const WINDOW_ALIGN:'):blkd.index('/// Mapping attributes for device registers.')]

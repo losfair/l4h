@@ -19,6 +19,11 @@ pub struct MemDev {
     page: *mut abi::MemPage,
     event: u32,
     count: usize,
+    /// The page is behind memd's state: memd did not answer the last
+    /// `hp_state` (EBUSY: this VMM's calls came faster than memd takes
+    /// them, memd::HP_CALLS; or memd has failed).  It is asked again at
+    /// the next signal for the device, not before: nothing here waits.
+    stale: bool,
 }
 
 /// memd's endpoint for this guest (l4h_host::memd::call, badged as
@@ -29,15 +34,19 @@ fn memd() -> Endpoint<host::memd::call::Proto> {
 
 impl MemDev {
     pub fn new(page_va: usize, event: u32, count: usize) -> Self {
-        MemDev { page: page_va as *mut abi::MemPage, event, count }
+        MemDev { page: page_va as *mut abi::MemPage, event, count, stale: false }
     }
 
     /// Copy memd's state of the guest into the device page.  Returns
-    /// whether the target changed.
+    /// whether the target changed.  If memd does not answer with it, the
+    /// page stays as it was, which is how the guest last saw it, and is
+    /// marked stale.
     pub fn refresh(&mut self) -> bool {
         let Ok(st) = memd().hp_state() else {
+            self.stale = true;
             return false;
         };
+        self.stale = false;
         let (target, plugged, map) = (st.target as u32, st.plugged as u32, st.map);
         unsafe {
             let p = self.page;
@@ -52,7 +61,7 @@ impl MemDev {
         }
     }
 
-    /// l4h-root changed the target: tell the guest.
+    /// l4h-vmmgr changed the target: tell the guest.
     pub fn target_changed(&mut self, vcpus: &Vcpus) {
         self.refresh();
         vcpus.raise(0, self.event);
@@ -83,6 +92,11 @@ impl MemDev {
         let p = self.page;
         let seq = unsafe { addr_of!((*p).req_seq).read_volatile() };
         if seq == unsafe { addr_of!((*p).done_seq).read_volatile() } {
+            // No new request: the kick is still a turn to bring a stale
+            // page up to date, and the guest hears of a target it missed.
+            if self.stale && self.refresh() {
+                vcpus.raise(0, self.event);
+            }
             return;
         }
         fence(Ordering::Acquire);

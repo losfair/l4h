@@ -80,7 +80,8 @@ pub enum Rights {
     Call,
     /// Signal the notification (write).
     Signal,
-    /// Bind the notification to an IRQ handler (all rights).
+    /// Bind the notification to an IRQ handler, which then signals it:
+    /// write, which is all seL4 asks of a handler's notification.
     Bind,
     /// Receive the holder's main thread's faults (the TCB's fault
     /// endpoint).
@@ -397,7 +398,7 @@ pub const VMM_BLKD_KICK: E<p::Vmm, p::Blkd, o::Notification> = E::new(shared(edg
     Fixed(badges::blkd::KICK), 1, Root, "a disk channel has requests (in its device's kick slot)")));
 pub const VMM_NETD_KICK: E<p::Vmm, p::Netd, o::Notification> = E::new(shared(edge("VMM_NETD_KICK", Vmm, VMM_KICKS, Netd, Notification, Signal,
     Bit(badges::netd::PORT), net::MAX_PORTS, Root, "port p has frames to send (in its device's kick slot)")));
-pub const VMM_USBD_KICK: E<p::Guest, p::Usbd, o::Notification> = E::new(shared(edge("VMM_USBD_KICK", Guest, Chosen, Usbd, Notification, Signal,
+pub const GUEST_USBD_KICK: E<p::Guest, p::Usbd, o::Notification> = E::new(shared(edge("GUEST_USBD_KICK", Guest, Chosen, Usbd, Notification, Signal,
     Fixed(badges::usbd::KICK), 1, Root, "the guest's USB queues have requests (in its device CNode, passed on by vmmgr)")));
 pub const BLKD_VMM_DONE: E<p::Blkd, p::Vmm, o::Notification> = E::new(shared(edge("BLKD_VMM_DONE", Blkd, Slots(blk::BLKD_SLOT_CLIENT_DONE, blk::MAX_CLIENTS), Vmm,
     Notification, Signal, Fixed(badges::vmm::DONE), 1, Root, "client i's channel has completions")));
@@ -413,11 +414,11 @@ pub const IRQ_NETD: E<p::Irq, p::Netd, o::Notification> = E::new(edge("IRQ_NETD"
     Bit(badges::netd::IRQ), net::MAX_NICS, Root, "uplink NIC n's interrupt"));
 pub const IRQ_USBD: E<p::Irq, p::Usbd, o::Notification> = E::new(edge("IRQ_USBD", Irq, Bound, Usbd, Notification, Bind,
     Fixed(badges::usbd::IRQ), 1, Root, "its xHCI's interrupt"));
-pub const IRQ_MONITOR: E<p::Irq, p::Root, o::Notification> = E::new(edge("IRQ_MONITOR", Irq, Bound, Root, Notification, Signal,
+pub const IRQ_MONITOR: E<p::Irq, p::Root, o::Notification> = E::new(edge("IRQ_MONITOR", Irq, Bound, Root, Notification, Bind,
     Fixed(badges::root::MONITOR), 1, Root, "the serial monitor's input"));
-pub const DOORBELL_ROOT: E<p::Irq, p::Root, o::Notification> = E::new(edge("DOORBELL_ROOT", Irq, Bound, Root, Notification, Signal,
+pub const DOORBELL_ROOT: E<p::Irq, p::Root, o::Notification> = E::new(edge("DOORBELL_ROOT", Irq, Bound, Root, Notification, Bind,
     Fixed(badges::root::CHANNEL), 1, Root, "another partition rang (its control channel)"));
-pub const DOORBELL_NETD: E<p::Irq, p::Netd, o::Notification> = E::new(shared(edge("DOORBELL_NETD", Irq, Bound, Netd, Notification, Signal,
+pub const DOORBELL_NETD: E<p::Irq, p::Netd, o::Notification> = E::new(shared(edge("DOORBELL_NETD", Irq, Bound, Netd, Notification, Bind,
     Bit(badges::netd::LINK), net::MAX_LINKS, Root, "link l's peer rang")));
 pub const NETD_LINK_SELF: E<p::Netd, p::Netd, o::Notification> = E::new(shared(edge("NETD_LINK_SELF", Netd, Slots(net::NETD_SLOT_LINK_KICK_BASE, net::MAX_LINKS), Netd,
     Notification, Signal, Bit(badges::netd::LINK), net::MAX_LINKS, Root, "netd's reminder to read link l again (as its doorbell)")));
@@ -455,7 +456,7 @@ pub const EDGES: &[Edge] = &[
     TRUSTD_FAULT.0, BLKD_FAULT.0, NETD_FAULT.0, USBD_FAULT.0, LOGD_FAULT.0, VMM_FAULT.0, MEMD_KEEPER_FAULT.0,
     VMMGR_KEEPER_FAULT.0, FLAGS_KEEPER_FAULT.0, GUEST_FAULT.0,
     ROOT_BLKD_CALL.0, ROOT_NETD_CALL.0, ROOT_USBD_CALL.0, ROOT_VMMGR_CALL.0, BLKD_DONE.0, NETD_DONE.0, USBD_DONE.0, VMMGR_DONE.0,
-    VMM_BLKD_KICK.0, VMM_NETD_KICK.0, VMM_USBD_KICK.0, BLKD_VMM_DONE.0, NETD_VMM_DONE.0, USBD_VMM.0,
+    VMM_BLKD_KICK.0, VMM_NETD_KICK.0, GUEST_USBD_KICK.0, BLKD_VMM_DONE.0, NETD_VMM_DONE.0, USBD_VMM.0,
     IRQ_BLKD.0, IRQ_NETD.0, IRQ_USBD.0, IRQ_MONITOR.0, DOORBELL_ROOT.0, DOORBELL_NETD.0, NETD_LINK_SELF.0, NETD_LINK_RING.0,
     GUEST_TRUSTD.0, ROOT_TRUSTD_RELAY.0,
     GUEST_CTL.0, GUEST_VMM_KICK.0, GUEST_VMM_MEM.0, GUEST_VMM_CONSOLE.0, VMMGR_VMM.0, VMM_VCPU.0, GUEST_IPI.0, VMMGR_VCPU.0,

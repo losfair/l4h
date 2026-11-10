@@ -226,28 +226,42 @@ impl Tables {
     }
 }
 
-/// The address and length of the first table with signature `sig`.
-fn find_table(bootinfo: &sel4::BootInfoPtr, phys: &mut Phys, sig: &[u8; 4]) -> Option<(usize, usize)> {
+/// The tables could not be searched to the end, or the one sought not
+/// read: it may be there all the same.
+pub struct Unreadable;
+
+/// The address and length of the first table with signature `sig`, if
+/// there is one.
+fn find_table(bootinfo: &sel4::BootInfoPtr, phys: &mut Phys, sig: &[u8; 4]) -> Result<Option<(usize, usize)>, Unreadable> {
     let tables = Tables::new(bootinfo, phys);
     for i in 0..tables.count {
-        let pa = tables.get(phys, i)?;
+        let pa = tables.get(phys, i).ok_or(Unreadable)?;
         let mut s = [0; 4];
-        phys.read_into(pa, &mut s)?;
+        phys.read_into(pa, &mut s).ok_or(Unreadable)?;
         if &s == sig {
-            return table_len(phys, pa).map(|len| (pa, len));
+            return table_len(phys, pa).map(|len| Some((pa, len))).ok_or(Unreadable);
         }
     }
-    None
+    Ok(None)
 }
 
 /// The first table with signature `sig`, header included, read into `buf`:
 /// as much of it as fits.
 pub fn find<'b>(bootinfo: &sel4::BootInfoPtr, phys: &mut Phys, sig: &[u8; 4], buf: &'b mut [u8]) -> Option<&'b [u8]> {
-    let (pa, len) = find_table(bootinfo, phys, sig)?;
+    find_len(bootinfo, phys, sig, buf).ok().flatten().map(|(t, _)| t)
+}
+
+/// `find`, with the table's own length (more than what was read if `buf`
+/// is too small for it), for a caller that must not take a part of the
+/// table, or a table it could not read, for all there is: Ok(None) only
+/// if no table has the signature.
+pub fn find_len<'b>(bootinfo: &sel4::BootInfoPtr, phys: &mut Phys, sig: &[u8; 4], buf: &'b mut [u8])
+    -> Result<Option<(&'b [u8], usize)>, Unreadable> {
+    let Some((pa, len)) = find_table(bootinfo, phys, sig)? else { return Ok(None) };
     let n = len.min(buf.len());
     let t = &mut buf[..n];
-    phys.read_into(pa, t)?;
-    Some(t)
+    phys.read_into(pa, t).ok_or(Unreadable)?;
+    Ok(Some((t, len)))
 }
 
 /// The AML trustd runs (trust::TrustdConfig::aml_size): the FADT, the
@@ -260,7 +274,7 @@ pub fn aml_tables(
     phys: &mut Phys,
     mut each: impl FnMut(&mut Phys, usize, usize) -> Option<()>,
 ) -> Option<usize> {
-    let (fadt, fadt_len) = find_table(bootinfo, phys, b"FACP")?;
+    let (fadt, fadt_len) = find_table(bootinfo, phys, b"FACP").ok().flatten()?;
     let mut buf = [0; 148];
     let f = &mut buf[..fadt_len.min(148)];
     phys.read_into(fadt, f)?;

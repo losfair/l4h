@@ -2,6 +2,8 @@ use l4h_host::blk::*;
 use l4h_host::errno::{EBUSY, EINVAL, ENOSPC};
 
 fn pool() -> Pool { Pool { gpa: 0x8000000, paddr: 0x10000000, size: 4 << 20 } }
+/// virtio-blk's discard: an operation no client is offered.
+const OP_DISCARD: u32 = 11;
 fn window() -> DiskWindow { DiskWindow::new(2048, 16384, 131072).unwrap() }
 fn request() -> Req {
     let mut req = Req { op: OP_READ, nr_segs: 1, ..Default::default() };
@@ -89,6 +91,38 @@ fn permissions_operations_direction_and_segment_count() {
     assert!(window().check_request(&r, pool(), 4096, false).is_err());
     r.nr_segs = 0;
     assert_eq!(window().check_request(&r, pool(), 4096, true), Ok(0));
+}
+
+#[test]
+fn a_request_is_at_most_what_clients_are_offered() {
+    // SEG_MAX segments of SEG_SIZE_MAX: 3.5 MiB, less than the smallest
+    // extent of a volume, so a request crosses at most one boundary.
+    assert_eq!(MAX_REQUEST_BYTES, 14 * (256 << 10));
+    assert!(MAX_REQUEST_BYTES <= MIN_EXTENT_SECTORS * 512);
+    let w = DiskWindow::new(0, 1 << 20, 1 << 20).unwrap();
+    let pool = Pool { size: 64 << 20, ..pool() };
+    let full = |segs: usize, len: u32| {
+        let mut r = Req { op: OP_READ, nr_segs: segs as u32, ..Default::default() };
+        for s in &mut r.segs[..segs] {
+            *s = Seg { gpa: pool.gpa, len, flags: SEG_WRITE };
+        }
+        r
+    };
+    // The largest request a client's guest is offered passes.
+    assert_eq!(w.check_request(&full(SEG_MAX, SEG_SIZE_MAX), pool, 4096, false), Ok(0));
+    // One block more does not, however it is cut: more segments, longer
+    // segments, or segments that all name the same pool memory.
+    let mut r = full(SEG_MAX + 1, SEG_SIZE_MAX);
+    r.segs[SEG_MAX].len = 4096;
+    assert_eq!(w.check_request(&r, pool, 4096, false), Err(STATUS_IOERR));
+    assert_eq!(w.check_request(&full(1, MAX_REQUEST_BYTES as u32 + 512), pool, 512, false), Err(STATUS_IOERR));
+    assert_eq!(w.check_request(&full(1, MAX_REQUEST_BYTES as u32), pool, 512, false), Ok(0));
+    assert_eq!(w.check_request(&full(MAX_SEGS, pool.size as u32), pool, 4096, false), Err(STATUS_IOERR));
+    // A volume refuses it as a window does.
+    let (order, extents) = ([0u16], [Extent { start: 0, sectors: 1 << 20, offset: 0 }]);
+    let v = Volume { order: &order, extents: &extents };
+    assert!(v.map(&full(SEG_MAX, SEG_SIZE_MAX), pool, 4096, false).is_ok());
+    assert_eq!(v.map(&full(MAX_SEGS, SEG_SIZE_MAX), pool, 4096, false), Err(STATUS_IOERR));
 }
 
 #[test]

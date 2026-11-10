@@ -469,19 +469,22 @@ impl Alloc {
         self.local_bytes() + self.pool.free_bytes()
     }
 
-    /// Free memory, here and in memd.
+    /// Free memory, here and in memd.  A status page that could not be
+    /// read whole (memd was writing it at every look) counts as no free
+    /// memory in memd: a caller that checks what it can afford refuses,
+    /// rather than go by a number that memd never wrote.
     pub fn free_bytes(&self) -> usize {
-        self.local_bytes() + self.pool.free_bytes() + self.memd.map_or(0, |m| m.status().free_bytes as usize)
+        self.local_bytes() + self.pool.free_bytes() + self.memd.and_then(|m| m.status()).map_or(0, |s| s.free_bytes as usize)
     }
 
     /// Free memory reported to the hypervisor, in bytes (memd).
     pub fn reported_bytes(&self) -> usize {
-        self.memd.map_or(0, |m| m.status().reported_bytes as usize)
+        self.memd.and_then(|m| m.status()).map_or(0, |s| s.reported_bytes as usize)
     }
 
     /// Largest block available, here or in memd.
     pub fn largest_block_bits(&self) -> Option<usize> {
-        let memd = self.memd.map(|m| m.status().largest_block as usize).filter(|&b| b != 0).map(|b| b.trailing_zeros() as usize);
+        let memd = self.memd.and_then(|m| m.status()).map(|s| s.largest_block as usize).filter(|&b| b != 0).map(|b| b.trailing_zeros() as usize);
         self.blocks.iter().map(|b| b.size_bits).max().max(memd)
     }
 
@@ -696,7 +699,7 @@ impl Alloc {
         let mut bits = usize::BITS as usize;
         while bits > BLOCK_BITS {
             bits -= 1;
-            self.give_back(memd, |a, b| {
+            let taken = self.give_back(memd, |a, b| {
                 let size = 1usize << b.size_bits;
                 let back = b.size_bits == bits && a.is_grant(b.paddr, b.size_bits) && keep >= LOCAL_KEEP + size;
                 if back {
@@ -704,20 +707,31 @@ impl Alloc {
                 }
                 back
             });
+            // A memd that takes none back (it has failed) is not asked for
+            // every other size too: the grants stay here, in use.
+            if !taken {
+                return;
+            }
         }
     }
 
     /// Move the free blocks for which `pick` is true (untouched) to memd,
-    /// and free their slots.
-    fn give_back(&mut self, memd: MemdLink, mut pick: impl FnMut(&Self, &UtRegion) -> bool) {
+    /// and free their slots.  False if memd did not take a batch (it has
+    /// failed): the blocks of that batch it left us are free blocks here
+    /// again, grants as they were, and no more are offered.
+    fn give_back(&mut self, memd: MemdLink, mut pick: impl FnMut(&Self, &UtRegion) -> bool) -> bool {
+        const _: () = assert!(l4h_host::memd::XCHG_SLOTS <= u64::BITS as usize);
         loop {
             let mut batch: ArrayVec<(cap::Untyped, usize, usize), { l4h_host::memd::XCHG_SLOTS }> = ArrayVec::new();
+            // The blocks of the batch that are grants: bit n for block n.
+            let mut grants = 0u64;
             let mut i = 0;
             while i < self.blocks.len() && !batch.is_full() {
                 if pick(self, &self.blocks[i]) {
                     let b = self.blocks.swap_remove(i);
                     if let Some(g) = self.grants.iter().position(|&g| g == (b.paddr, b.size_bits)) {
                         self.grants.swap_remove(g);
+                        grants |= 1 << batch.len();
                     }
                     batch.must_push((b.cap, b.paddr, b.size_bits));
                 } else {
@@ -725,11 +739,22 @@ impl Alloc {
                 }
             }
             if batch.is_empty() {
-                return;
+                return true;
             }
-            memd.free(&batch);
-            for &(cap, _, _) in batch.iter() {
-                self.slots.global(|sl| sl.free(cap.bits() as Slot));
+            let back = memd.free(&batch).err();
+            for (n, &(cap, paddr, bits)) in batch.iter().enumerate() {
+                if back.as_ref().is_some_and(|b| b[n]) {
+                    // Their places in the tables were just left.
+                    self.blocks.must_push(UtRegion::fresh(cap, paddr, bits));
+                    if grants & (1 << n) != 0 {
+                        self.grants.must_push((paddr, bits));
+                    }
+                } else {
+                    self.slots.global(|sl| sl.free(cap.bits() as Slot));
+                }
+            }
+            if back.is_some() {
+                return false;
             }
         }
     }

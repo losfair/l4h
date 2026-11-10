@@ -53,31 +53,61 @@ impl MemdLink {
         self.slot(self.exchange_base + i as u64)
     }
 
-    pub fn status(&self) -> Status {
-        unsafe { (self.status_va as *const Status).read_volatile() }
+    /// memd's status page as it last wrote it, whole: None if it was
+    /// writing it at every look (memd::STATUS_TRIES), which a caller takes
+    /// as no free memory in memd.
+    pub fn status(&self) -> Option<Status> {
+        unsafe { Status::read_at(self.status_va) }
     }
 
     /// An untouched Untyped of 2^bits bytes in local `slot`: its physical
     /// address, or None when the service cannot supply it.
     pub fn alloc(&self, bits: usize, slot: Slot) -> Option<usize> {
+        let out = self.area(memd::call::caps::alloc::BLOCKS.passed_out(0, l4h_host::wire::Cap::Untyped));
+        // Nothing is ours to keep there between calls: what a call that
+        // failed left (memd stopped after passing a grant out) must not
+        // fail this one, as a full slot of root's would.
+        let _ = out.delete();
         let paddr = *Client::alloc(self, bits, 1).ok()?.0.first()? as usize;
-        self.local_cnode.absolute_cptr(cap_at::<cap_type::Null>(slot))
-            .move_(&self.area(memd::call::caps::alloc::BLOCKS.passed_out(0, l4h_host::wire::Cap::Untyped))).expect("memd: take grant");
+        self.local_cnode.absolute_cptr(cap_at::<cap_type::Null>(slot)).move_(&out).ok()?;
         Some(paddr)
     }
 
     /// Return untouched grants: (capability, physical address, size bits).
-    /// Their local slots are left empty.  A failed memd keeps them.
-    pub fn free(&self, blocks: &[(cap::Untyped, usize, usize)]) {
+    /// Ok if memd took them: their local slots are then empty.  If it did
+    /// not (it has failed), nothing is left in the exchange area and the
+    /// call says, for each block, whether it is back in its local slot,
+    /// the caller's to use as before; one that is not is gone (memd
+    /// stopped after taking it), and its local slot is empty.
+    pub fn free(&self, blocks: &[(cap::Untyped, usize, usize)]) -> Result<(), ArrayVec<bool, { memd::XCHG_SLOTS }>> {
         assert!(blocks.len() <= memd::XCHG_SLOTS);
+        let area = |i: usize, ut: &cap::Untyped| self.area(memd::call::caps::free::BLOCKS.passed_in(i, l4h_ipc::kind_of(ut)));
         let mut given = ArrayVec::new();
+        let mut passed = 0;
         for (i, &(ut, paddr, bits)) in blocks.iter().enumerate() {
-            self.area(memd::call::caps::free::BLOCKS.passed_in(i, l4h_ipc::kind_of(&ut))).move_(&self.local_cnode.absolute_cptr(ut)).expect("memd: return block");
+            // As memd and root do with a slot they write: whatever an
+            // earlier call left there is emptied first, so a full slot
+            // cannot fail this one.
+            let to = area(i, &ut);
+            let _ = to.delete();
+            if to.move_(&self.local_cnode.absolute_cptr(ut)).is_err() {
+                break;
+            }
             given.must_push((paddr, bits));
+            passed += 1;
         }
-        if Client::free(self, given).is_err() {
-            log!("l4h-task: memd did not take back {} blocks", blocks.len());
+        if passed == blocks.len() && Client::free(self, given).is_ok() {
+            return Ok(());
         }
+        // memd did not take them (or not all could be passed): each goes
+        // back to its slot, which is empty since it was moved out of it.
+        let mut back = ArrayVec::new();
+        for (i, &(ut, _, _)) in blocks.iter().enumerate() {
+            // A block that was not passed is in its slot still.
+            back.must_push(i >= passed || self.local_cnode.absolute_cptr(ut).move_(&area(i, &ut)).is_ok());
+        }
+        log!("l4h-task: memd did not take back {} blocks; {} kept", blocks.len(), back.iter().filter(|&&b| b).count());
+        Err(back)
     }
 }
 

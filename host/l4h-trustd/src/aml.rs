@@ -2,9 +2,10 @@
 //! command starts with the TPM device's _DSM, firmware code in AML, which
 //! we run with the `acpi` crate's interpreter.  Running it here rather than
 //! in root confines what a firmware bug or an interpreter panic can harm
-//! to attestation (root then revokes our endpoint).  Accesses outside our
-//! own TPM ranges go to root (root::call::hw), which refuses RAM and
-//! hardware in use.
+//! to attestation (root then suspends this thread and revokes the guests'
+//! kicks; the flags server runs on).  Accesses outside our own TPM ranges
+//! go to root (root::call::hw), which serves only what is neither RAM nor
+//! hardware in use, and no write that moves or enables a PCI function.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;

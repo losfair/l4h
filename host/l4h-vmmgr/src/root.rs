@@ -143,15 +143,21 @@ fn disk_backend(alloc: &mut Alloc) -> Backend {
     Backend::Blk { chan, kick }
 }
 
+/// The CNode a guest's l4h-vmm keeps its mapping capabilities of a netd
+/// port in (`nic_add`'s `keep`), from the guest's `arena`.
+pub fn port_keep(alloc: &mut Alloc, arena: &mut Arena) -> Option<cap::CNode> {
+    let s = arena.try_object(alloc, sel4::ObjectBlueprint::CNode { size_bits: proto::PORT_RADIX })?;
+    Some(sel4::Cap::from_bits(s as u64))
+}
+
 /// A port of netd's `switch` for guest `id`.  The VMM's mappings of it
-/// are kept in a CNode of `arena`.
-#[allow(clippy::too_many_arguments)]
-pub fn nic_add(alloc: &mut Alloc, arena: &mut Arena, id: usize, switch: u32, mac: u64, lock: bool, isolated: bool) -> Result<Backend, Errno> {
-    let keep = arena.try_object(alloc, sel4::ObjectBlueprint::CNode { size_bits: proto::PORT_RADIX }).ok_or(ctl::ENOMEM)?;
+/// are kept in `keep` (`port_keep`), which is the backend's if root gives
+/// the port, and the caller's still if it refuses.
+pub fn nic_add(alloc: &mut Alloc, keep: cap::CNode, id: usize, switch: u32, mac: u64, lock: bool, isolated: bool) -> Result<Backend, Errno> {
     let mac = errno(root().nic_add(id, switch, mac, lock, isolated))?.to_be_bytes();
     let chan = take(alloc, caps::nic_add::PORT_FRAMES, 0);
     let kick = take(alloc, caps::nic_add::KICK, 0);
-    Ok(Backend::Net { chan, kick, mac: mac[2..8].try_into().unwrap(), keep: sel4::Cap::from_bits(keep as u64) })
+    Ok(Backend::Net { chan, kick, mac: mac[2..8].try_into().unwrap(), keep })
 }
 
 /// USB controller `ctrl` for guest `id`: the CNode of its queue area's
@@ -196,8 +202,18 @@ impl Flags {
         (cfg.trust != 0).then(|| Flags { ep: Endpoint::of(&wiring::VMMGR_FLAGS, wiring::p::Vmmgr, 0) })
     }
 
+    /// The guest's flags; trust::Flags::UNAVAILABLE if the server was
+    /// writing them at every look and after it was asked to finish
+    /// (FlagsEntry::read_synced), as one that failed in a write.
     pub fn flags(&self, g: &Guest) -> trust::Flags {
-        unsafe { &*(proto::FLAGS_VA as *const trust::FlagsEntry).add(g.id) }.read().for_instance(g.instance)
+        use l4h_host::trust::call::Client;
+        let sync = || {
+            let _ = self.ep.sync();
+        };
+        unsafe { &*(proto::FLAGS_VA as *const trust::FlagsEntry).add(g.id) }
+            .read_synced(sync)
+            .unwrap_or(trust::Flags::UNAVAILABLE)
+            .for_instance(g.instance)
     }
 
     /// Seal check on every op, ACT only for its first taint. `effect`

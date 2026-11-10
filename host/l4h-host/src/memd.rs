@@ -1,6 +1,7 @@
 //! l4h-memd, the owner of the host's free memory and of every guest's RAM
-//! (DESIGN.md §8.4): its CSpace, the calls l4h-root and l4h-vmmgr make to
-//! it, and the status page it keeps for them.
+//! (DESIGN.md §8.4): its CSpace, the calls l4h-root, l4h-vmmgr and the
+//! guests' l4h-vmms make to it, and the status page it keeps for root and
+//! vmmgr.
 //!
 //! memd's CSpace is one CNode of 2^cnode_bits slots (MemdConfig), with a
 //! slot for every block it can hold (`block_slots`).  l4h-root holds a
@@ -111,7 +112,9 @@ crate::protocol! {
         SetTarget / set_target = 8 from [Vmmgr] (guest: usize, target: usize) -> ();
         /// Plug hotplug block m of the caller's guest, copying the Untypeds
         /// of its 64 blocks into the guest's level-2 hotplug CNode in slot m
-        /// of its hotplug CNode.
+        /// of its hotplug CNode.  EBUSY while that would leave less than
+        /// HOST_RESERVE free.  (Every call of a VMM's is answered EBUSY
+        /// once it has made more than HP_CALLS allow.)
         HpPlug / hp_plug = 16 from [Vmm] (m: usize) -> ();
         /// Revoke and free the blocks of hotplug block m.  EBUSY if they
         /// are not all revoked within the time the guest has left
@@ -147,6 +150,18 @@ pub const HP_MAP_WORDS: usize = HP_MAX / 64;
 pub const HP_SHARE: u64 = 125;
 pub const HP_BURST_US: u64 = 16_000;
 pub const HP_CALL_US: u64 = 1_000;
+/// A VMM's calls, whatever they ask and however memd answers: HP_CALLS at
+/// once, and one more every HP_CALL_GAP_US (32 a second).  A call beyond
+/// is answered EBUSY before memd does anything for it.  A guest's driver
+/// makes at most 18 a second (8 plugs and the one refused, each followed
+/// by `hp_state`) after 34 at once.
+pub const HP_CALLS: u64 = 64;
+pub const HP_CALL_GAP_US: u64 = 31_250;
+
+/// Free memory kept back from guests' requests, for the hosts' own
+/// objects: root and vmmgr refuse a guest operation that would leave less
+/// (their `can_afford`), and memd a plug.
+pub const HOST_RESERVE: usize = 32 << 20;
 
 /// Guest RAM comes in blocks of 2^BLOCK_BITS bytes, the smallest memd
 /// handles: a unit of its table.
@@ -185,14 +200,16 @@ pub const fn cnode_bits(units: u64) -> usize {
     (SLOT_DYN_BASE + block_slots(units)).next_power_of_two().trailing_zeros() as usize
 }
 
-/// memd's status page, mapped read-only in l4h-root.  memd updates it
-/// after every call and report.
+/// memd's status page, mapped read-only in l4h-root and l4h-vmmgr.  memd
+/// updates it after every call and report, under a sequence count: odd
+/// while it is being written.
 pub const STATUS_VA: usize = crate::SHARED_VA;
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
 pub struct Status {
-    /// Bytes in free blocks (not given to l4h-root or a guest).
+    pub seq: core::sync::atomic::AtomicU32,
+    /// Bytes in free blocks that can be used (not given to l4h-root or a
+    /// guest, nor held by a reporting device memd has given up on).
     pub free_bytes: u64,
     /// Of those, reported to the hypervisor.
     pub reported_bytes: u64,
@@ -217,6 +234,40 @@ pub struct GuestHp {
 }
 
 const _: () = assert!(core::mem::size_of::<Status>() <= 4096);
+
+/// Tries of `Status::read_at`: memd rewrites the page after every call.
+pub const STATUS_TRIES: usize = 16;
+
+impl Status {
+    /// A consistent copy of the fields, None while it is being written.
+    pub fn read(&self) -> Option<Status> {
+        crate::seqlock::look(&self.seq, || unsafe { core::ptr::read_volatile(self) })
+    }
+
+    /// A consistent copy of the page at `va`, in a few tries: None if memd
+    /// was writing it at each, which a reader takes as no free memory.
+    ///
+    /// # Safety
+    /// `va` must be mapped to memd's aligned, readable status page.
+    pub unsafe fn read_at(va: usize) -> Option<Status> {
+        let st = unsafe { &*(va as *const Status) };
+        crate::seqlock::read(&st.seq, STATUS_TRIES, || unsafe { core::ptr::read_volatile(st) })
+    }
+
+    /// Write the page at `va` (memd, its one writer): `fields`, whose
+    /// sequence count is not used.
+    ///
+    /// # Safety
+    /// `va` must be mapped to the aligned, writable status page.
+    pub unsafe fn write_at(va: usize, fields: Status) {
+        let p = va as *mut Status;
+        crate::seqlock::write(unsafe { &(*p).seq }, |odd| {
+            // The count the copy carries is the odd one already there.
+            fields.seq.store(odd, core::sync::atomic::Ordering::Relaxed);
+            unsafe { p.write_volatile(fields) };
+        });
+    }
+}
 
 /// The free page reporting device (a virtio-balloon on PCI): its BARs are
 /// mapped at BALLOON_VA + bar * BAR_STRIDE, three DMA pages at DMA_VA.
@@ -290,5 +341,37 @@ mod tests {
         assert_eq!(Sender::Vmmgr.badge(), 1 << 61);
         assert_eq!(Sender::Vmm(5).badge(), (1 << 62) | 5);
         assert_eq!(Sender::of_badge(recv::TIMER), None);
+    }
+
+    /// A reader of the status page gets what memd last wrote whole, or
+    /// nothing while memd writes it.
+    #[test]
+    fn status_reads_are_whole_or_refused() {
+        extern crate std;
+        use core::sync::atomic::Ordering;
+        let fields = |free: u64| {
+            let mut st: Status = unsafe { core::mem::zeroed() };
+            st.free_bytes = free;
+            st.hp[MAX_GUESTS - 1].target = 7;
+            st
+        };
+        let page: std::boxed::Box<Status> = std::boxed::Box::new(unsafe { core::mem::zeroed() });
+        let va = &*page as *const Status as usize;
+        // Before memd's first write: zeroed, and consistent.
+        assert_eq!(unsafe { Status::read_at(va) }.map(|s| s.free_bytes), Some(0));
+        for free in [1 << 30, 5 << 20] {
+            unsafe { Status::write_at(va, fields(free)) };
+            let st = unsafe { Status::read_at(va) }.expect("a written page");
+            assert_eq!((st.free_bytes, st.hp[MAX_GUESTS - 1].target), (free, 7));
+            assert_eq!(page.seq.load(Ordering::Relaxed) & 1, 0);
+        }
+        // memd is writing: its fields, old or new, are not handed out,
+        // however often the reader looks.
+        let even = page.seq.load(Ordering::Relaxed);
+        page.seq.store(even | 1, Ordering::Relaxed);
+        assert!(page.read().is_none());
+        assert!(unsafe { Status::read_at(va) }.is_none());
+        page.seq.store(even.wrapping_add(2), Ordering::Relaxed);
+        assert_eq!(unsafe { Status::read_at(va) }.map(|s| s.free_bytes), Some(5 << 20));
     }
 }

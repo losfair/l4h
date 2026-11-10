@@ -28,8 +28,8 @@ pub const CNODE_BITS: usize = 18;
 pub const SLOT_MEMD_EP: u64 = 16;
 /// Its exchange area with memd: the CNode the two share (memd::XCHG_RADIX).
 pub const SLOT_MEMD_XCHG: u64 = 17;
-/// trustd's flags service, badged as trust::Sender::Root: ACT for the host
-/// bits of the console.
+/// trustd's flags service, badged as trust::Sender::Vmmgr (root minted
+/// it, wiring::VMMGR_FLAGS): ACT for the host bits of the console.
 pub const SLOT_FLAGS_EP: u64 = 18;
 /// The CNode of the boot module frames root maps into vmmgr (radix
 /// `VmmgrConfig::modules_radix`): frame i is page i of MODULES_VA.
@@ -139,6 +139,14 @@ pub const USB_QUEUE_RADIX: usize = 7;
 /// Radix of the CNode of a netd port's frames.
 pub const PORT_RADIX: usize = 10;
 
+/// Whether `mac` is one a guest's vNIC can be asked for (root::call::
+/// nic_add): 48 bits and not multicast, or 0 for root to choose.  High
+/// bits are refused, not cut off, which would make the all-zero MAC of a
+/// nonzero request.
+pub const fn nic_mac_ok(mac: u64) -> bool {
+    mac >> 48 == 0 && mac >> 40 & 1 == 0
+}
+
 /// A guest as vmmgr reports it to root (for the dashboard and the
 /// monitor), under a sequence count: odd while it is being written.
 #[repr(C)]
@@ -169,14 +177,7 @@ const _: () = assert!(core::mem::size_of::<Status>() <= 4096);
 impl GuestStatus {
     /// A consistent copy of the fields, None while it is being written.
     pub fn read(&self) -> Option<GuestStatus> {
-        use core::sync::atomic::{Ordering, fence};
-        let seq = self.seq.load(Ordering::Acquire);
-        if seq & 1 != 0 {
-            return None;
-        }
-        let copy = unsafe { core::ptr::read_volatile(self) };
-        fence(Ordering::Acquire);
-        (self.seq.load(Ordering::Relaxed) == seq).then_some(copy)
+        crate::seqlock::look(&self.seq, || unsafe { core::ptr::read_volatile(self) })
     }
 }
 
@@ -253,3 +254,22 @@ pub struct VmmgrConfig {
     pub serial_lanes: u64,
 }
 const _: () = assert!(crate::CONFIG_OFFSET + core::mem::size_of::<VmmgrConfig>() <= crate::INFO_SIZE);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nic_macs() {
+        assert!(nic_mac_ok(0));
+        assert!(nic_mac_ok(0x0200_0000_0001));
+        assert!(nic_mac_ok(0xfeff_ffff_ffff));
+        // The group bit of the first octet.
+        assert!(!nic_mac_ok(0x0100_0000_0000));
+        assert!(!nic_mac_ok(0xffff_ffff_ffff));
+        // More than 48 bits, the low 48 of which are a unicast MAC, or 0.
+        assert!(!nic_mac_ok(1 << 48));
+        assert!(!nic_mac_ok(0x1_0200_0000_0001));
+        assert!(!nic_mac_ok(u64::MAX));
+    }
+}

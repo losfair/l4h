@@ -26,7 +26,6 @@ mod root;
 mod sched;
 mod vmm;
 
-use core::sync::atomic::Ordering;
 
 use l4h_host::errno::{EINVAL, Errno};
 use sel4::cap;
@@ -68,7 +67,7 @@ const _: () = assert!(MAX_GUESTS <= host::memd::MAX_GUESTS);
 /// The guests, by id: too large for a stack.
 static GUESTS: StaticCell<[Option<Guest>; MAX_GUESTS]> = StaticCell::new([const { None }; MAX_GUESTS]);
 /// Memory and CNode slots kept back from guest requests.
-const RESERVE_BYTES: usize = 32 << 20;
+const RESERVE_BYTES: usize = host::memd::HOST_RESERVE;
 const RESERVE_SLOTS: usize = 16384;
 
 
@@ -185,6 +184,8 @@ pub struct Vmmgr {
     pub ctl_now: Option<(usize, u32)>,
     /// dom0's boot waits for a busy disk controller.
     pub dom0_wait: Option<Dom0Wait>,
+    /// As `dom0_wait`, for a USB controller of dom0's boot (dom0_usbs).
+    pub dom0_usb_wait: Option<Dom0Wait>,
     /// What a guest or its VMM can make us log, per guest id.
     pub log_limit: l4h_host::log::RateLimit<MAX_GUESTS>,
 }
@@ -193,15 +194,24 @@ pub struct Vmmgr {
 pub enum RootOp {
     /// Disk device `d` of guest `id` (instance `instance`).
     Disk { id: usize, instance: u64, d: usize, then: Then },
-    /// A host op of a control request (Then::Ctl).
-    HostOp { then: Then },
+    /// A host op of the control request `waits`.
+    HostOp { waits: CtlWait },
+}
+
+/// A control request that waits for root's answer: dom0 `caller`'s
+/// (`instance`) request `seq`.
+#[derive(Clone, Copy)]
+pub struct CtlWait {
+    pub caller: usize,
+    pub instance: u64,
+    pub seq: u32,
 }
 
 /// What follows a request root answered later.
 #[derive(Clone, Copy)]
 pub enum Then {
-    /// Answer dom0 `caller`'s control request `seq`.
-    Ctl { caller: usize, instance: u64, seq: u32 },
+    /// Answer the control request.
+    Ctl(CtlWait),
     /// Go on booting dom0, after its boot disk `k`.
     Dom0Boot { k: usize },
 }
@@ -320,15 +330,15 @@ impl Vmmgr {
                 Some(RootOp::Disk { id, instance, d, then }) => {
                     let r = self.disk_attached(id, instance, d, t);
                     match then {
-                        Then::Ctl { caller, instance, seq } => ctl::answer(self, caller, instance, seq, r.map(|()| [0; 6])),
+                        Then::Ctl(waits) => ctl::answer(self, waits, r.map(|()| [0; 6])),
                         Then::Dom0Boot { k } => dom0_disk_done(self, id, instance, k, r),
                     }
                 }
-                Some(RootOp::HostOp { then: Then::Ctl { caller, instance, seq } }) => {
+                Some(RootOp::HostOp { waits }) => {
                     let r = root::host_op_result(t);
-                    ctl::answer(self, caller, instance, seq, r);
+                    ctl::answer(self, waits, r);
                 }
-                Some(RootOp::HostOp { then: Then::Dom0Boot { .. } }) | None => root::discard(t),
+                None => root::discard(t),
             }
         }
     }
@@ -373,24 +383,35 @@ impl Vmmgr {
             if g.state != State::Created || g.vmm.is_some() || g.root_pending {
                 return Err(ctl::EBUSY);
             }
-            let maps: usize = g.backends.iter().map(|(_, b)| b.map_bytes()).sum();
-            if !g.reserve(&mut h.alloc, vmm::start_bytes(g.pool.size, g.vcpus.len(), g.devices.len()) + maps) {
+            if !g.reserve(&mut h.alloc, g.start_bytes()) {
                 return Err(ctl::ENOMEM);
             }
-            if g.attest {
-                root::trust_register(g);
-            }
-            let v = vmm::spawn(g, &mut h.alloc, &mut h.wins.a, &mut h.asids, &h.info);
-            component::start(&v);
-            g.vmm = Some(v);
+            h.spawn_vmm(g);
             Ok(())
         })
         .ok_or(ctl::ENOENT)?
     }
 
+    /// Spawn `g`'s l4h-vmm, within `with_guest`.  The caller checked that
+    /// `g` is created, without a VMM or a device root is attaching, and
+    /// reserved `Guest::start_bytes`: nothing here is refused, so a guest
+    /// that was booted for it starts.
+    pub fn spawn_vmm(&mut self, g: &mut Guest) {
+        if g.attest {
+            root::trust_register(g);
+        }
+        let v = vmm::spawn(g, &mut self.alloc, &mut self.wins.a, &mut self.asids, &self.info);
+        component::start(&v);
+        g.vmm = Some(v);
+    }
+
     /// Give guest `id` (before it starts) a virtio-net device on `switch`.
     /// Returns the MAC.
     pub fn create_nic(&mut self, id: usize, switch: u32, mac: u64, lock: bool, isolated: bool) -> Result<u64, Errno> {
+        // What root would refuse, before anything is made for the port.
+        if !proto::nic_mac_ok(mac) {
+            return Err(ctl::EINVAL);
+        }
         if !self.can_afford(1 << 20, 0, 0) {
             return Err(ctl::ENOMEM);
         }
@@ -404,7 +425,21 @@ impl Vmmgr {
                 return Err(ctl::ENOSPC);
             }
             let d = g.devices.len();
-            let backend = root::nic_add(&mut h.alloc, &mut g.arena, id, switch, mac, lock, isolated)?;
+            // The CNode of the VMM's mappings is made first, as it may not
+            // fit, and an arena gives nothing back: one that root's refusal
+            // (the switch, netd's ports) left unused is the next request's,
+            // so refused requests take no more than one.
+            let keep = match g.port_spare.take() {
+                Some(keep) => keep,
+                None => root::port_keep(&mut h.alloc, &mut g.arena).ok_or(ctl::ENOMEM)?,
+            };
+            let backend = match root::nic_add(&mut h.alloc, keep, id, switch, mac, lock, isolated) {
+                Ok(backend) => backend,
+                Err(e) => {
+                    g.port_spare = Some(keep);
+                    return Err(e);
+                }
+            };
             let mac = match &backend {
                 vmm::Backend::Net { mac, .. } => mac.iter().fold(0, |m, &b| m << 8 | b as u64),
                 _ => unreachable!(),
@@ -466,11 +501,8 @@ impl Vmmgr {
     fn publish(&self) {
         let st = unsafe { &mut *(proto::STATUS_VA as *mut proto::Status) };
         for (id, e) in st.guests.iter_mut().enumerate() {
-            let seq = e.seq.load(Ordering::Relaxed);
-            e.seq.store(seq.wrapping_add(1), Ordering::Relaxed);
-            core::sync::atomic::fence(Ordering::Release);
             let p = e as *mut proto::GuestStatus;
-            unsafe {
+            host::seqlock::write(unsafe { &(*p).seq }, |_| unsafe {
                 match self.guest(id) {
                     None => core::ptr::addr_of_mut!((*p).state).write_volatile(0),
                     Some(g) => {
@@ -496,8 +528,7 @@ impl Vmmgr {
                         core::ptr::addr_of_mut!((*p).name).write_volatile(name);
                     }
                 }
-            }
-            e.seq.store(seq.wrapping_add(2), Ordering::Release);
+            });
         }
     }
 }
@@ -566,6 +597,7 @@ fn main(info: &'static Info) -> ! {
         log_limit: l4h_host::log::RateLimit::new(),
         ctl_now: None,
         dom0_wait: None,
+        dom0_usb_wait: None,
     };
     if h.kernel.is_none() {
         l4h_rt::log!("l4h-vmmgr: no guest kernel, nothing to do");
@@ -609,7 +641,7 @@ pub fn boot_dom0(h: &mut Vmmgr) {
 /// dom0 `id` cannot be built: give it back.
 fn dom0_failed(h: &mut Vmmgr, id: usize, why: &str) {
     l4h_rt::log!("l4h-vmmgr: cannot boot dom0: {}; the serial monitor's restart-dom0 tries again", why);
-    h.dom0_wait = None;
+    (h.dom0_wait, h.dom0_usb_wait) = (None, None);
     let _ = h.destroy_guest(id);
 }
 
@@ -619,8 +651,14 @@ fn dom0_failed(h: &mut Vmmgr, id: usize, why: &str) {
 /// a placeholder for the disk.
 const DOM0_DISK_WAIT_MS: u64 = 10_000;
 
+/// How long dom0's boot waits for a USB controller root answers EBUSY for
+/// (the firmware is resetting it: root looks for a few milliseconds and no
+/// longer, as it serves every guest) before dom0 starts without it.
+const DOM0_USB_WAIT_MS: u64 = 1000;
+
 /// dom0's boot waits for a busy controller: boot disk `k` of dom0 `id`
-/// (`instance`) is tried again on vmmgr's timer, until `until` (ticks).
+/// (`instance`), or its `k`th USB controller, is tried again on vmmgr's
+/// timer, until `until` (ticks).
 #[derive(Clone, Copy)]
 pub struct Dom0Wait {
     id: usize,
@@ -665,14 +703,23 @@ fn dom0_disk_done(h: &mut Vmmgr, id: usize, instance: u64, k: usize, r: Result<(
     dom0_disks(h, id, k + 1);
 }
 
-/// vmmgr's timer: try the boot disk dom0 waits for again.
+/// vmmgr's timer: try the boot disk, or the USB controller, dom0 waits
+/// for again.
 fn dom0_retry(h: &mut Vmmgr) {
-    let Some(w) = h.dom0_wait else { return };
-    if h.guest(w.id).is_none_or(|g| g.instance != w.instance) {
-        h.dom0_wait = None;
-        return;
+    if let Some(w) = h.dom0_wait {
+        if h.guest(w.id).is_none_or(|g| g.instance != w.instance) {
+            h.dom0_wait = None;
+        } else {
+            dom0_disks(h, w.id, w.k);
+        }
     }
-    dom0_disks(h, w.id, w.k);
+    if let Some(w) = h.dom0_usb_wait {
+        if h.guest(w.id).is_none_or(|g| g.instance != w.instance) {
+            h.dom0_usb_wait = None;
+        } else {
+            dom0_usbs(h, w.id, w.k);
+        }
+    }
 }
 
 /// dom0's boot disk `k` cannot be attached (`e`): whether boot goes on,
@@ -703,7 +750,7 @@ fn dom0_no_disk(h: &mut Vmmgr, id: usize, k: usize, e: Errno) -> bool {
     true
 }
 
-/// dom0's NICs, its image, and it starts.
+/// dom0's NICs and USB controllers, after which it starts.
 fn dom0_finish(h: &mut Vmmgr, id: usize) {
     for n in &h.cfg.dom0_nic[..h.cfg.dom0_nics as usize] {
         let r = u32::try_from(n.switch).map_err(|_| ctl::EINVAL).and_then(|sw| h.create_nic(id, sw, n.mac, true, false));
@@ -711,11 +758,37 @@ fn dom0_finish(h: &mut Vmmgr, id: usize) {
             l4h_rt::log!("l4h-vmmgr: cannot give dom0 a NIC on switch {}: error {}", n.switch, e);
         }
     }
-    for &c in &h.cfg.dom0_usb[..h.cfg.dom0_usbs as usize] {
-        if let Err(e) = h.attach_usb(id, c as usize) {
-            l4h_rt::log!("l4h-vmmgr: cannot give dom0 USB controller {}: error {}", c, e);
+    dom0_usbs(h, id, 0);
+}
+
+/// dom0's USB controllers from the `k`th on, in their order (which is
+/// their numbers in dom0), then it starts (dom0_start).  One that root
+/// says is busy is tried again on vmmgr's timer for DOM0_USB_WAIT_MS
+/// (dom0_retry) before dom0 goes without it.
+fn dom0_usbs(h: &mut Vmmgr, id: usize, from: usize) {
+    for k in from..h.cfg.dom0_usbs as usize {
+        let c = h.cfg.dom0_usb[k];
+        let Err(e) = h.attach_usb(id, c as usize) else { continue };
+        let now = rdtsc();
+        if e == ctl::EBUSY {
+            let instance = h.guest(id).map_or(0, |g| g.instance);
+            let until = match h.dom0_usb_wait {
+                Some(w) if w.id == id && w.instance == instance && w.k == k => w.until,
+                _ => now.saturating_add(h.info.tsc_hz.saturating_mul(DOM0_USB_WAIT_MS) / 1000),
+            };
+            if now < until {
+                h.dom0_usb_wait = Some(Dom0Wait { id, instance, k, until });
+                return;
+            }
         }
+        l4h_rt::log!("l4h-vmmgr: cannot give dom0 USB controller {}: error {}", c, e);
     }
+    h.dom0_usb_wait = None;
+    dom0_start(h, id);
+}
+
+/// dom0's image, and it starts.
+fn dom0_start(h: &mut Vmmgr, id: usize) {
     let cmdline = &h.cfg.dom0_cmdline;
     let cmdline = &cmdline[..cmdline.iter().position(|&c| c == 0).unwrap_or(cmdline.len())];
     let booted = h.with_guest(id, |h, g| {

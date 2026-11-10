@@ -1268,11 +1268,13 @@ static int ul4h_alloc_streams(struct usb_hcd *hcd, struct usb_device *udev,
 		mask |= bit;
 		n = min(n, max + 1);
 	}
-	/* A power of two (the stream context array), never more than asked. */
-	n = min(n, ul->max_streams);
-	if (n <= 1)
+	/*
+	 * A power of two (the stream context array), never more than asked,
+	 * and no fewer than four: xHCI has no smaller array.
+	 */
+	n = rounddown_pow_of_two(min(n, ul->max_streams));
+	if (n < 4)
 		return -EINVAL;
-	n = rounddown_pow_of_two(n);
 	req.slot = udev->slot_id;
 	req.drop = mask;
 	req.arg[0] = n;

@@ -80,7 +80,7 @@ fn expire_timer() {
 fn output() -> Vec<u8> {
     let r = host::VMM_CONSOLE_RING_VA as *const host::ConsoleRing;
     unsafe {
-        let n = addr_of!((*r).head).read_volatile() as usize;
+        let n = (*r).head.load(Ordering::Acquire) as usize;
         assert!(n <= host::CONSOLE_RING_DATA);
         (&(*r).data)[..n].to_vec()
     }
