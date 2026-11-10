@@ -90,7 +90,7 @@ pub struct Vmmgr {
     /// (which also wait for vmmgr to take the guest's last notice, and for
     /// the guest's allowance: trust::AttestNotices), and one monitor
     /// command.
-    mailbox: Mailbox,
+    mailbox: Mailbox<proto::call::Proto>,
     ops_waiting: [u64; proto::MAX_PENDING / 64],
     attest: host::trust::AttestNotices,
     monitor_waiting: Option<Notice>,

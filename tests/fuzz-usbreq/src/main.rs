@@ -183,12 +183,12 @@ fn indices(rng: &mut Rng) {
     let tail = rng.next() as u32;
     let size = [32u32, 64, 128, 256][rng.below(4) as usize];
     let head = tail.wrapping_add(match rng.below(4) { 0 => rng.next() as u32, _ => rng.below(2 * size as u64) as u32 });
-    let sq = Sq { tail, size };
+    let sq = Sq::at(size as usize, tail as u64);
     match sq.avail(head) {
         Some(n) => assert!(n <= size && tail.wrapping_add(n) == head),
         None => assert!(head.wrapping_sub(tail) > size),
     }
-    let cq = Cq { head: tail, size };
+    let cq = Cq::at(size as usize, tail as u64);
     match cq.room(head) {
         Some(r) => assert!(r <= size),
         None => assert!(tail.wrapping_sub(head) > size),

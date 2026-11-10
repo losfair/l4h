@@ -8,7 +8,7 @@ pub use l4h_host as host;
 
 use host::blk::{self, BlkdConfig, Channel};
 use host::blk::call::{Request, reply};
-use host::wire::{self, Message};
+use host::wire;
 use host::errno;
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -81,7 +81,7 @@ pub mod mailbox {
         const { assert!(core::mem::size_of::<T>() <= 4096) };
         unsafe { &*PUBLISHED.as_ptr().cast::<T>() }
     }
-    pub fn serve(mut f: impl FnMut(u64, &[u64; 6], &mut [u64; 5]) -> Option<usize>) -> bool {
+    pub fn serve(mut f: impl FnMut(u64, &[u64], &mut [u64; 5]) -> Option<usize>) -> bool {
         let mut answered = false;
         loop {
             let Some((label, args, pending_io)) = crate::KERNEL.with_borrow_mut(|k| k.requests.pop_front()) else {

@@ -93,7 +93,7 @@ pub struct Ctrl {
 struct Usbd {
     comp: Component,
     arena: Arena,
-    mailbox: Mailbox,
+    mailbox: Mailbox<usb::call::Proto>,
     /// The requests posted and not answered, by number mod RING, as blkd's
     /// and netd's are: at most a CLAIM, or an ATTACH and its REMOVE (an
     /// ATTACH waits for the others).
@@ -393,7 +393,7 @@ fn claim(h: &mut Host, i: usize) -> Result<(), Errno> {
 }
 
 /// usbd answered the CLAIM.
-fn claimed(h: &mut Host, i: usize, w: &[u64; host::mailbox::ANSWER]) {
+fn claimed(h: &mut Host, i: usize, w: &[u64]) {
     let c = &mut ctrls()[i];
     let d = c.pci;
     if c.state == State::Failed {
@@ -487,7 +487,7 @@ pub fn poll(h: &mut Host) {
             let Some(d) = c.driver.as_mut() else { break };
             let failed = c.state == State::Failed;
             let next = if failed {
-                d.mailbox.abandon().map(|k| (k, [wire::FAILED; host::mailbox::ANSWER]))
+                d.mailbox.abandon().map(|k| (k, host::mailbox::Reply::FAILED))
             } else {
                 d.mailbox.answer()
             };

@@ -524,13 +524,13 @@ fn too_many_trbs_refused() {
 
 #[test]
 fn indices_wrap() {
-    let sq = Sq { tail: u32::MAX - 1, size: 32 };
+    let sq = Sq::at(32, u32::MAX as u64 - 1);
     assert_eq!(sq.avail(u32::MAX - 1), Some(0));
     assert_eq!(sq.avail(3), Some(5));
     assert_eq!(sq.avail(30), Some(32));
     assert_eq!(sq.avail(31), None, "beyond the queue");
     assert_eq!(sq.avail(u32::MAX - 2), None, "behind our tail");
-    let cq = Cq { head: 2, size: 256 };
+    let cq = Cq::at(256, 2);
     assert_eq!(cq.room(2), Some(256));
     assert_eq!(cq.room(u32::MAX - 253), Some(0));
     assert_eq!(cq.room(u32::MAX - 254), None, "more than the queue holds");

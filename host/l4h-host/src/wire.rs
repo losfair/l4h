@@ -36,6 +36,8 @@ const _: () = assert!(NO_REPLY > crate::errno::MAX_ERRNO && FAILED > crate::errn
 
 /// A call, as a client posts it: what `protocol!`'s Request implements.
 pub trait Message {
+    /// The protocol that declares this request.
+    type Proto: Protocol;
     /// Words of the longest call's arguments.
     const MAX_WORDS: usize;
     fn label(&self) -> u64;
@@ -769,6 +771,7 @@ macro_rules! protocol {
             }
 
             impl $crate::wire::Message for Request {
+                type Proto = Proto;
                 const MAX_WORDS: usize = Request::MAX_WORDS;
                 fn label(&self) -> u64 {
                     Request::label(self)

@@ -409,7 +409,7 @@ fn resetting_one_queue_returns_other_queues_and_fences_old_completions() {
 }
 
 #[test]
-fn a_reset_gives_up_on_a_blkd_that_stopped_and_the_disk_fails() {
+fn a_failed_drain_stops_the_guest_before_any_queue_can_reuse_buffers() {
     for whole in [false, true] {
         let mut ram = vec![0u64; 0x20000 / 8];
         let mem = GuestMem { base: ram.as_mut_ptr() as usize, gpa: POOL, size: 0x20000 };
@@ -425,28 +425,20 @@ fn a_reset_gives_up_on_a_blkd_that_stopped_and_the_disk_fails() {
         disk.kick(&mem, &mut queues, 0);
         disk.kick(&mem, &mut queues, 1);
         assert_eq!(channel.sq.head.load(Relaxed), 2);
-        let ids = [channel.reqs[0].id, channel.reqs[1].id];
+        // No completions: whether the service stopped or the device is
+        // merely slow, reset cannot return and let the guest reuse DMA
+        // buffers. In production the VMM's panic faults to vmmgr, which
+        // stops the guest. Catch it here to inspect the untouched queues.
         QUARANTINED.set(true);
-        if whole {
-            disk.drain();
-            disk.reset();
-        } else {
-            // The other queue's request fails; the reset one's is dropped.
-            assert_eq!(disk.drain_queue(&mem, &mut queues, 0), 1 << 1);
-            assert_eq!((queues[0].used_idx(), queues[1].used_idx()), (0, 1));
-            assert_eq!(mem.read::<u8>(POOL + 0x8000 + 0x4000), 1);
-        }
-        // Answers that come late are never read; new requests fail at once.
-        for id in ids { reply(&mut channel, id); }
-        assert!(!disk.pending());
-        assert!(!disk.complete(&mem, &mut queues));
-        offer(&mem, &mut queues[0], 0, chan::OP_READ);
-        disk.kick(&mem, &mut queues, 0);
-        assert_eq!(channel.sq.head.load(Relaxed), 2);
-        assert_eq!(queues[0].used_idx(), 1);
-        assert_eq!(mem.read::<u8>(POOL + 0x4000), 1);
-        disk.drain();
+        let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if whole { disk.drain(); } else { disk.drain_queue(&mem, &mut queues, 0); }
+        }));
         QUARANTINED.set(false);
+        assert!(stopped.is_err(), "a failed drain must not acknowledge reset");
+        assert_eq!((queues[0].used_idx(), queues[1].used_idx()), (0, 0));
+        assert_eq!(mem.read::<u8>(POOL + 0x4000), 0xff);
+        assert_eq!(mem.read::<u8>(POOL + 0x8000 + 0x4000), 0xff);
+        assert_eq!(channel.cq.head.load(Relaxed), 0);
     }
 }
 
@@ -461,13 +453,17 @@ struct DeviceFixture {
 
 impl DeviceFixture {
     fn new(ops: &[u32]) -> Self {
+        Self::with_clock(ops, HZ)
+    }
+
+    fn with_clock(ops: &[u32], hz: u64) -> Self {
         IRQ_EVENTS.with_borrow_mut(Vec::clear);
         let mut ram = vec![0u64; 0x20000 / 8];
         let mem = GuestMem { base: ram.as_mut_ptr() as usize, gpa: POOL, size: 0x20000 };
         let mut channel: Box<Channel> = unsafe { Box::new_zeroed().assume_init() };
         channel.capacity_sectors = 131072;
         channel.block_size = 512;
-        let backend = Blk::new(&mut *channel as *mut Channel as usize, crate::sel4::cap::Notification, mem.size, HZ);
+        let backend = Blk::new(&mut *channel as *mut Channel as usize, crate::sel4::cap::Notification, mem.size, hz);
         let mut page = Box::new([0u64; 512]);
         let regs = page.as_mut_ptr().cast::<l4h_abi::VirtioRegs>();
         let mut device = crate::dev::Device::new(page.as_mut_ptr() as usize, 20, backend);
@@ -497,6 +493,30 @@ impl DeviceFixture {
         let id = self.channel.reqs[index].id;
         reply(&mut self.channel, id);
         self.device.complete(&self.mem, &self.vcpus);
+    }
+}
+
+#[test]
+fn timed_out_device_reset_never_replies_or_returns_dma_buffers() {
+    // Make the production five-second timeout immediate in counter ticks.
+    let mut f = DeviceFixture::with_clock(&[chan::OP_READ, chan::OP_READ], 1);
+    assert_eq!(f.channel.sq.head.load(Relaxed), 2);
+    // The disk accepted these requests; it can still DMA into their pool
+    // segments. It has produced no completion when the guest resets.
+    f.channel.sq.tail.store(2, Relaxed);
+    let regs = f._page.as_mut_ptr().cast::<l4h_abi::VirtioRegs>();
+    unsafe { (*regs).status = 0; }
+    let mut acknowledged = false;
+    let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        f.device.op(&f.mem, &f.vcpus, l4h_abi::VIRTIO_OP_STATUS, 0, 0);
+        acknowledged = true;
+    }));
+    assert!(stopped.is_err());
+    assert!(!acknowledged, "guest must remain blocked until vmmgr stops it");
+    assert_eq!(f.channel.cq.head.load(Relaxed), 0);
+    for q in 0..2 {
+        assert_eq!(f.mem.read::<u16>(POOL + q * 0x8000 + 0x2002), 0, "no buffer returned");
+        assert_eq!(f.mem.read::<u8>(POOL + q * 0x8000 + 0x4000), 0xff, "no synthetic completion");
     }
 }
 
@@ -707,17 +727,14 @@ fn a_reset_takes_no_more_responses_than_blkd_can_owe() {
         // whenever the VMM looks.
         flood(chan_ptr);
         FLOOD.set(chan_ptr);
-        if whole { disk.drain(); } else { disk.drain_queue(&mem, &mut queues, 0); }
+        let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if whole { disk.drain(); } else { disk.drain_queue(&mem, &mut queues, 0); }
+        }));
         FLOOD.set(std::ptr::null_mut());
+        assert!(stopped.is_err(), "a response flood cannot acknowledge a reset with DMA pending");
         let taken = channel.cq.tail.load(Relaxed) as usize;
         assert!(taken <= 2 + chan::RING_SIZE, "the reset took {taken} responses for 2 requests");
-        // The disk has failed, as with a blkd that stopped.
-        assert!(!disk.pending());
-        if whole { disk.reset(); }
-        offer(&mem, &mut queues[0], 0, chan::OP_READ);
-        disk.kick(&mem, &mut queues, 0);
-        assert_eq!(channel.sq.head.load(Relaxed), 2);
-        assert_eq!(mem.read::<u8>(POOL + 0x4000), 1);
+        assert_eq!((queues[0].used_idx(), queues[1].used_idx()), (0, 0));
     }
 }
 
@@ -737,9 +754,9 @@ fn a_reset_looks_at_the_time_while_responses_keep_coming() {
     assert_eq!(channel.sq.head.load(Relaxed), 1);
     flood(chan_ptr);
     QUARANTINED.set(true);
-    disk.drain();
+    let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| disk.drain()));
     QUARANTINED.set(false);
+    assert!(stopped.is_err(), "a timed-out reset must stop the guest");
     let taken = channel.cq.tail.load(Relaxed) as usize;
     assert!(taken < chan::RING_SIZE, "the reset took all {taken} responses before it looked at the time");
-    assert!(!disk.pending());
 }

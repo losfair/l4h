@@ -339,19 +339,6 @@ impl Blk {
         true
     }
 
-    /// blkd keeps requests it does not complete, and may still access
-    /// their buffers: the disk fails for good, as an unavailable one does
-    /// (every request an I/O error, the channel never read again).
-    fn fail(&mut self) {
-        self.chan = core::ptr::null_mut();
-        self.outstanding = 0;
-        self.inflight = [[None; QUEUE_SIZE as usize]; MAX_QUEUES];
-        self.stalled = [None; MAX_QUEUES];
-        self.fence = None;
-        self.flush_inflight = false;
-        self.deferred = 0;
-    }
-
     fn response(&mut self, mem: &GuestMem, queues: &mut [Queue], resp: blk::Resp, drop_queue: Option<usize>) -> u64 {
         let Some((q, head, inf)) = self.retire(resp.id) else { return 0; };
         if drop_queue == Some(q) || !queues[q].ready { return 0; }
@@ -479,7 +466,10 @@ impl Backend for Blk {
         self.flush_inflight = false;
         self.deferred = 0;
         if !self.wait_outstanding(|b, resp| { b.retire(resp.id); }) {
-            self.fail();
+            // No reset reply: blkd or its device may still DMA into these
+            // buffers. The VMM's fault stops the guest (vmmgr::end_guest);
+            // teardown cuts off DMA before root reuses its I/O pool.
+            panic!("block reset could not drain DMA; stopping guest");
         }
         // Requests completed from now on belong to the next generation.
         self.generation = self.generation.wrapping_add(1);
@@ -491,15 +481,10 @@ impl Backend for Blk {
         self.deferred &= !(1 << q);
         let mut completed = 0;
         if !self.wait_outstanding(|b, resp| completed |= b.response(mem, queues, resp, Some(q))) {
-            // The other queues' requests fail.
-            for qi in 0..MAX_QUEUES {
-                for h in 0..QUEUE_SIZE as u16 {
-                    if self.inflight[qi][h as usize].is_none() { continue; }
-                    let id = ((self.generation as u64) << 32) | ((qi as u64) << 16) | h as u64;
-                    completed |= self.response(mem, queues, blk::Resp { id, status: blk::STATUS_IOERR, reserved: 0 }, Some(q));
-                }
-            }
-            self.fail();
+            // Completing another queue with an error would let its driver
+            // reuse buffers too, while the old device request still owns
+            // them. Stop the guest as for a whole-device drain failure.
+            panic!("block queue reset could not drain DMA; stopping guest");
         }
         if self.fence == Some(q) { self.fence = None; self.flush_inflight = false; }
         for (q, queue) in queues.iter_mut().enumerate().take(self.nr_queues) {

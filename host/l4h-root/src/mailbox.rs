@@ -10,10 +10,12 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use l4h_host::wire::{Message, Protocol};
+
 use sel4::{CapRights, VmAttributes, cap, cap_type};
 
-use l4h_host::wiring::{E, o, p};
-use l4h_host::mailbox::{self as mb, ANSWER, ARGS, MAILBOX_PAGES, MAILBOX_VA, PUBLISHED_OFFSET, RING};
+use l4h_host::wiring::{E, Rights, o, p};
+use l4h_host::mailbox::{self as mb, MAILBOX_PAGES, MAILBOX_VA, PUBLISHED_OFFSET};
 
 use crate::component::{Component, abs_of};
 use crate::layout;
@@ -41,24 +43,21 @@ pub fn init(ntfn: cap::Notification) {
     NTFN.store(ntfn.bits(), Ordering::Relaxed);
 }
 
-pub struct Mailbox {
-    page: *const mb::Mailbox,
+pub struct Mailbox<P> {
+    client: mb::Client<'static, P>,
     published: usize,
     /// The driver's notification, badged badges::driver::CALL.
     kick: cap::Notification,
-    /// Requests posted and answered, as root counts them: the driver
-    /// can write over the page's.
-    posted: u64,
-    answered: u64,
 }
 
-impl Mailbox {
+impl<P: Protocol> Mailbox<P> {
     /// Give `comp` its mailbox, number `index` in layout::MAILBOXES, from
     /// `arena`, keeping the mapping capabilities in `keep()`.  Root posts
     /// on edge `call`, and `comp` answers on `done`.
-    pub fn new<T: p::IsParty>(comp: &Component, index: usize, call: &E<p::Root, T, o::Notification>,
+    pub fn new<T: p::IsParty>(comp: &Component, index: usize, call: &E<p::Root, T, o::Notification, P>,
         done: &E<T, p::Root, o::Notification>, alloc: &mut Alloc, arena: &mut Arena,
         mut keep: impl FnMut() -> sel4::AbsoluteCPtr) -> Self {
+        assert!(matches!(call.rights, Rights::Post), "a mailbox is made from a post edge");
         let base = layout::MAILBOXES.base + index * MAILBOX_PAGES * PAGE;
         assert!(base + MAILBOX_PAGES * PAGE <= layout::MAILBOXES.end(), "mailbox {}", index);
         for p in 0..MAILBOX_PAGES {
@@ -72,74 +71,32 @@ impl Mailbox {
         let slot = alloc.slots.alloc();
         let kick = sel4::init_thread::Slot::<cap_type::Notification>::from_index(slot).cap();
         crate::component::mint_edge(&abs_of(kick), call, 0, &comp.obj()).expect("mailbox kick");
-        Mailbox { page: base as *const mb::Mailbox, published: base + PUBLISHED_OFFSET, kick, posted: 0, answered: 0 }
+        let page = unsafe { &*(base as *const mb::Mailbox) };
+        Mailbox { client: mb::Client::new(page), published: base + PUBLISHED_OFFSET, kick }
     }
 
-    fn page(&self) -> &mb::Mailbox {
-        unsafe { &*self.page }
-    }
-
-    /// Whether a request can be posted now.
     pub fn room(&self) -> bool {
-        self.posted - self.answered < RING as u64
+        self.client.room()
     }
 
-    /// Whether every request posted is answered (or given up).
     pub fn idle(&self) -> bool {
-        self.answered == self.posted
+        self.client.idle()
     }
 
-
-    /// Post a request of the driver's protocol (l4h_host::wire::protocol):
-    /// its number, or None if the ring is full.
-    pub fn send<M: l4h_host::wire::Message>(&mut self, req: &M) -> Option<u64> {
-        const { assert!(M::MAX_WORDS <= ARGS, "a mailbox request is at most ARGS words") };
-        let mut args = [0; ARGS];
-        let n = req.encode(&mut args);
-        self.post(req.label(), &args[..n])
-    }
-
-    /// Post a request: its number, or None if the ring is full (a driver
-    /// that does not answer).
-    fn post(&mut self, label: u64, args: &[u64]) -> Option<u64> {
-        if !self.room() {
-            return None;
-        }
-        let k = self.posted;
-        let e = &self.page().entries[k as usize % RING];
-        e.label.store(label, Ordering::Relaxed);
-        for (i, a) in e.args.iter().enumerate() {
-            a.store(args.get(i).copied().unwrap_or(0), Ordering::Relaxed);
-        }
-        const { assert!(ARGS >= 6) };
-        self.posted = k + 1;
-        self.page().posted.store(k + 1, Ordering::Release);
+    /// Post a request of this mailbox's protocol and signal its peer.
+    pub fn send<M: Message<Proto = P>>(&mut self, req: &M) -> Option<u64> {
+        let k = self.client.send(req)?;
         self.kick.signal();
         Some(k)
     }
 
-    /// The oldest answer not taken yet, if the driver has given it: the
-    /// request's number and the answer's words.  A count the driver gives
-    /// out of order is ignored, which leaves everything pending.
-    pub fn answer(&mut self) -> Option<(u64, [u64; ANSWER])> {
-        let done = self.page().done.load(Ordering::Acquire);
-        if done <= self.answered || done > self.posted {
-            return None;
-        }
-        let k = self.answered;
-        let e = &self.page().entries[k as usize % RING];
-        let words = core::array::from_fn(|i| e.answer[i].load(Ordering::Relaxed));
-        self.answered = k + 1;
-        Some((k, words))
+    pub fn answer(&mut self) -> Option<(u64, mb::Reply)> {
+        self.client.answer()
     }
 
-    /// Give up on the oldest request not answered (the driver is stopped):
-    /// its number.
+    /// Give up on the oldest request, once the peer is stopped.
     pub fn abandon(&mut self) -> Option<u64> {
-        (self.answered < self.posted).then(|| {
-            self.answered += 1;
-            self.answered - 1
-        })
+        self.client.abandon()
     }
 
     /// What the driver publishes (blk::Published, net::Published).
