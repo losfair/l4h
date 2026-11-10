@@ -593,24 +593,51 @@ fn result(h: &mut Host, token: usize) -> Result<Vals, Errno> {
 
 /// What a guest leaves behind while drivers may still use some of it:
 /// the memory they map (disk channels, extent tables, port memory), and
-/// without an IOMMU its I/O pool, which a disk may still write.  Its root
+/// its I/O pool while a disk may still write it (`ZombiePool`).  Its root
 /// slots belong to zombie_owner(z) meanwhile.
 pub struct Zombie {
     arena: Arena,
     /// Removals the drivers have not finished.
     waits: usize,
-    /// The I/O pool, if it is still in the arena, and whether a disk that
-    /// could not be stopped keeps it out of use for good.
-    pool: Option<usize>,
-    pin: bool,
-    /// The I/O pool, cut off from the devices' IOMMU domains but not
-    /// freed yet: a disk controller may still finish what the guest had
-    /// started (blkd's drain), and its domain may meanwhile map another
-    /// client's pool at the same addresses, which those commands would
-    /// then reach.  It goes once the guest's disks are all removed
-    /// (`disk_waits`), whatever netd does.
-    cut_pool: Option<Arena>,
+    /// Those of them that are disks' (blkd's): the pool waits for these.
     disk_waits: usize,
+    pool: ZombiePool,
+    /// A disk that could not be stopped keeps an `InArena` pool out of
+    /// use for good.
+    pin: bool,
+}
+
+/// Where a deleted guest's I/O pool is, until it can be reused.
+pub enum ZombiePool {
+    /// Freed already, or never cut off from its devices and so not to be.
+    Gone,
+    /// Still in the zombie's arena, at this address: no IOMMU cut it off,
+    /// so it goes with the rest, or is pinned (`Zombie::pin`).
+    InArena(usize),
+    /// Cut off from the devices' IOMMU domains and taken out of the
+    /// arena, but not freed yet: a disk controller may still finish what
+    /// the guest had started (blkd's drain), and its domain may meanwhile
+    /// map another client's pool at the same addresses, which those
+    /// commands would then reach.  It goes once the guest's disks are all
+    /// removed (`Zombie::disk_waits`), whatever netd does.
+    Cut(Arena),
+}
+
+impl ZombiePool {
+    /// Guest pool `pool`, in `arena`, at deletion: where it waits, and what
+    /// is to be freed at once.  `cut`: no device's IOMMU domain maps it any
+    /// more.  `disks`: a disk controller may still run the guest's
+    /// commands.
+    pub fn at_deletion(arena: &mut Arena, pool: usize, cut: bool, disks: bool) -> (Self, Option<Arena>) {
+        if !cut {
+            return (Self::InArena(pool), None);
+        }
+        let Some(k) = arena.owned.iter().position(|o| o.1 == pool) else { return (Self::Gone, None) };
+        let (slot, paddr, bits) = arena.owned.remove(k);
+        let mut a = Arena::new();
+        a.own(slot, paddr, bits);
+        if disks { (Self::Cut(a), None) } else { (Self::Gone, Some(a)) }
+    }
 }
 
 pub type Zombies = [Option<Zombie>; MAX_GUESTS];
@@ -633,12 +660,17 @@ pub fn zombie_done(h: &mut Host, z: Option<usize>, pool_reusable: bool) {
     if zb.waits > 0 {
         return;
     }
-    let mut zb = h.zombies[z].take().unwrap();
-    if let Some(a) = zb.cut_pool.take() {
-        h.alloc.reclaim(a);
-    }
-    let (pin, pool) = (zb.pin, zb.pool);
-    let pinned = h.alloc.reclaim_pinning(zb.arena, |p| pin && Some(p) == pool);
+    let zb = h.zombies[z].take().unwrap();
+    let in_arena = match zb.pool {
+        ZombiePool::Cut(a) => {
+            h.alloc.reclaim(a);
+            None
+        }
+        ZombiePool::InArena(p) => Some(p),
+        ZombiePool::Gone => None,
+    };
+    let pin = zb.pin;
+    let pinned = h.alloc.reclaim_pinning(zb.arena, |p| pin && Some(p) == in_arena);
     h.alloc.slots.free_owned(zombie_owner(z));
     if pinned != 0 {
         log!("l4h-root: {} MiB of I/O pool kept out of use: a disk of a deleted guest could not be stopped", pinned >> 20);
@@ -648,10 +680,14 @@ pub fn zombie_done(h: &mut Host, z: Option<usize>, pool_reusable: bool) {
 /// blkd has finished removing one of zombie `z`'s disks (`zombie_done`):
 /// after the last, no disk can reach its I/O pool, which goes then.
 pub fn zombie_disk_done(h: &mut Host, z: Option<usize>, pool_reusable: bool) {
-    if let Some(zb) = z.and_then(|z| h.zombies[z].as_mut()) {
-        zb.disk_waits -= 1;
-        if zb.disk_waits == 0 {
-            if let Some(a) = zb.cut_pool.take() {
+    if let Some((z, zb)) = z.and_then(|z| Some((z, h.zombies[z].as_mut()?))) {
+        match zb.disk_waits.checked_sub(1) {
+            Some(n) => zb.disk_waits = n,
+            // Not a disk it waits for: the pool stays until the zombie goes.
+            None => log!("l4h-root: zombie {}: a disk removal more than it has disks", z),
+        }
+        if zb.disk_waits == 0 && matches!(zb.pool, ZombiePool::Cut(_)) {
+            if let ZombiePool::Cut(a) = core::mem::replace(&mut zb.pool, ZombiePool::Gone) {
                 h.alloc.reclaim(a);
             }
         }
@@ -814,26 +850,20 @@ fn guest_del(h: &mut Host, id: usize) -> Result<u64, Errno> {
     // still run those commands, and only a quarantine (`blkd::removed`)
     // stops it.  Without a zombie's place, the pool stays with the rest of
     // the guest's memory, for good, as no drain can then be counted.
-    let pool = g.pool.paddr;
     let z = h.zombies.iter().position(Option::is_none);
-    let mut cut_pool = None;
-    if cut && (g.disks.is_empty() || z.is_some()) {
-        if let Some(k) = g.arena.owned.iter().position(|o| o.1 == pool) {
-            let (slot, paddr, bits) = g.arena.owned.remove(k);
-            let mut a = Arena::new();
-            a.own(slot, paddr, bits);
-            if g.disks.is_empty() {
-                h.alloc.reclaim(a);
-            } else {
-                cut_pool = Some(a);
-            }
+    let disks = !g.disks.is_empty();
+    let pool = if z.is_some() || !disks {
+        let (pool, now) = ZombiePool::at_deletion(&mut g.arena, g.pool.paddr, cut, disks);
+        if let Some(a) = now {
+            h.alloc.reclaim(a);
         }
-    }
+        pool
+    } else {
+        ZombiePool::InArena(g.pool.paddr)
+    };
     match z {
         Some(z) => {
-            h.zombies[z] = Some(Zombie {
-                arena: g.arena, waits, pool: (!cut).then_some(pool), pin: false, cut_pool, disk_waits: g.disks.len(),
-            });
+            h.zombies[z] = Some(Zombie { arena: g.arena, waits, disk_waits: g.disks.len(), pool, pin: false });
             h.alloc.slots.reown(id, zombie_owner(z));
         }
         None => {

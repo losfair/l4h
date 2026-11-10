@@ -3462,8 +3462,10 @@ The chain has four links.
      {instance, RAM, vCPUs, dom0, digest} into a registry page that trustd
      maps read-only, once per guest (a second registration is `EEXIST`): a
      running guest's record never changes, and its instance, written last,
-     never reads as 0 before the guest is destroyed. trustd reads the
-     instance, then the record, then the instance again (`record`): the
+     never reads as 0 before the guest is destroyed. Root writes a record
+     with `trust::write_record` (its fields, then its instance) and clears
+     it with `clear_record`; trustd reads it with `trust::read_record`: the
+     instance, then the record, then the instance again. The
      fields between two equal readings are that instance's, since instances
      are never given twice and a record is written only while its instance
      is 0. One read of the whole record would not do, whose loads come in

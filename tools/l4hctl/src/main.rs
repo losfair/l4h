@@ -127,6 +127,12 @@ fn cmd_logs(ctl: &Ctl, follow: bool) -> Result<()> {
         if !follow {
             if cursor == snapshot { return Ok(()); }
             end = snapshot;
+            // Short of the snapshot's end with nothing read: a record of it
+            // is still being written (DESIGN.md §10, "Host log").  Read on
+            // once it can be done, not in a loop of empty reads meanwhile.
+            if data.is_empty() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
         } else if cursor == snapshot {
             std::thread::sleep(Duration::from_millis(100));
         }

@@ -367,9 +367,10 @@ impl Ring {
         // What this read scans to, and the end it reports: the caller's own,
         // if it gave one, even when this read stops earlier, so that a
         // snapshot is finished by later reads rather than taken as done
-        // where a slot in flight made this one stop.
+        // where a slot in flight made this one stop.  No later than now: a
+        // snapshot ends at a time that has come, whatever end it was given.
         let end = if until == 0 { snapshot } else { until.min(snapshot) }.max(cursor);
-        let reported = if until == 0 { end } else { until };
+        let reported = if until == 0 { end } else { until.min(now) };
         let (mut len, mut lost, mut last) = (0, 0u64, None);
         // The records of one time are never split between reads: where
         // they start in `out`, and what was lost before them.
@@ -794,6 +795,9 @@ mod tests {
         let (r, text) = read(ring, first.next, first.end);
         assert_eq!((r.next, r.end), (first.end, first.end));
         assert_eq!(before.matches(&long).count() + text.matches(&long).count(), 6, "the rest of the snapshot: {text:?}");
+        // An end still to come is now's, so the snapshot ends.
+        let (r, _) = read(ring, first.end, u64::MAX);
+        assert_eq!((r.next, r.end), (NOW, NOW));
         // What only a caller could have made up is still refused.
         assert!(ring.read_at(NOW, NOW + 1, 0, &mut [0; 1984]).is_none());
         assert!(ring.read_at(NOW, first.next, first.next - 1, &mut [0; 1984]).is_none());
