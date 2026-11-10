@@ -2,7 +2,7 @@
 //! passes us a copy of the RSDP; the tables lie outside RAM, in device
 //! memory.  Nothing here allocates: tables are read into the caller's
 //! buffers, a part at a time, and the frames carved for them are kept in
-//! one fixed table.
+//! a fixed table.  trustd's AML has a table of its own (Frames::hw).
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -20,10 +20,11 @@ const PAGE: usize = 4096;
 
 /// Device pages carved for ACPI, at most: the tables read at boot (the AML
 /// trustd runs is at most AML_MAX bytes, plus a page per table that does
-/// not start on one, and the few others), the TPM's ranges, and the pages
-/// trustd's AML touches at run time.  Beyond it, accesses to new pages are
-/// refused: the firmware's AML could otherwise make root carve every page
-/// of a large MMIO window.
+/// not start on one, and the few others), the registers root found in
+/// them (the IOMMU's, the reset register) and the TPM's ranges; and, in
+/// the other table, the pages trustd's AML touches at run time.  Beyond
+/// it, accesses to new pages are refused: the firmware's AML could
+/// otherwise make root carve every page of a large MMIO window.
 pub const TRUSTD_MAX_PAGES: usize = AML_MAX / PAGE + 1024;
 
 /// The FADT's size in ACPI 6 (revision 6); older ones are shorter.  Enough
@@ -33,10 +34,12 @@ pub const FADT_LEN: usize = 276;
 /// Carved frames as (page, frame), sorted by page.
 type PageTable = ArrayVec<(usize, cap::Granule), TRUSTD_MAX_PAGES>;
 
-/// The table lives in .bss: at 16 bytes an entry it is too large for the
-/// root task's stack, where `Host` and trustd's state are.
+/// The tables live in .bss: at 16 bytes an entry they are too large for
+/// the root task's stack, where `Host` and trustd's state are.
 static mut PAGES: PageTable = ArrayVec::new();
 static PAGES_TAKEN: AtomicBool = AtomicBool::new(false);
+static mut HW_PAGES: PageTable = ArrayVec::new();
+static HW_PAGES_TAKEN: AtomicBool = AtomicBool::new(false);
 
 /// Frames of physical memory outside RAM, carved on first use, by page.
 pub struct Frames {
@@ -52,6 +55,15 @@ impl Frames {
         // The flag gives out the only reference; the root task is
         // single-threaded.
         Frames { pages: unsafe { &mut *(&raw mut PAGES) }, full: false }
+    }
+
+    /// The table of trustd's AML (trustd::hw), empty, taken once.  It
+    /// shares no page with the other: a page root carved for itself (the
+    /// tables, the IOMMU's registers, the reset register, the TPM) is no
+    /// longer free device memory, so the AML cannot have it.
+    pub fn hw() -> Self {
+        assert!(!HW_PAGES_TAKEN.swap(true, Ordering::Relaxed), "AML frame table taken twice");
+        Frames { pages: unsafe { &mut *(&raw mut HW_PAGES) }, full: false }
     }
 
     /// The frame of `page`, if it was carved (`Phys::frame`).

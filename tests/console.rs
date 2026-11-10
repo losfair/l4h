@@ -385,12 +385,20 @@ fn poweroff_flush_skips_a_gap_without_waiting() {
 struct Serial(host::serial::Merge);
 
 impl Serial {
-    fn new() -> Self {
-        // Too large for a test thread's stack; all zeroes is Ring::new().
-        let ring: &'static host::serial::Ring =
-            unsafe { &*std::alloc::alloc_zeroed(std::alloc::Layout::new::<host::serial::Ring>()).cast() };
+    /// The VMM of guest `prefix`'s console (None: dom0's) writes its own
+    /// lane, which names the guest.
+    fn new(prefix: Option<u32>) -> Self {
+        // Too large for a test thread's stack; all zeroes is new().
+        fn zeroed<T>() -> &'static T {
+            unsafe { &*std::alloc::alloc_zeroed(std::alloc::Layout::new::<T>()).cast() }
+        }
+        let (ring, lanes) = (zeroed::<host::serial::Ring>(), zeroed::<host::serial::Lanes>());
         host::serial::init(ring, 0);
-        Self(host::serial::Merge::new(ring, 0))
+        let w = prefix.map_or(host::log::Writer::Dom0, host::log::Writer::Vmm);
+        host::serial::init_writer(lanes, w);
+        let mut merge = host::serial::Merge::new(ring, 0);
+        merge.add_lanes(lanes);
+        Self(merge)
     }
     fn read(&mut self) -> String {
         let mut s = String::new();
@@ -402,7 +410,7 @@ impl Serial {
 fn serial_fixture(prefix: Option<u32>) -> (Fixture, Serial) {
     let mut f = Fixture::new();
     f.console = console::Console::new(true, prefix, EVENT, 1000);
-    (f, Serial::new())
+    (f, Serial::new(prefix))
 }
 
 #[test]

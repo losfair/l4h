@@ -402,6 +402,11 @@ impl Netd {
         self.mailbox.room()
     }
 
+    /// Whether netd has failed (`fail`): NicAdd refuses then.
+    pub fn failed(&self) -> bool {
+        self.failed
+    }
+
     /// Whether netd has published its NICs' MACs, or never will.
     pub fn ready(&self) -> bool {
         self.failed || self.published().ready.load(Ordering::Acquire) != 0

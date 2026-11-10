@@ -1706,8 +1706,8 @@ impl Usbd {
             }
             if c.notify {
                 c.notify = false;
-                // NBSend: root may have emptied the slot (REMOVE).
-                c.irq.nb_send(sel4::MessageInfo::new(0, 0, 0, 0));
+                // Root may have emptied the slot (REMOVE).
+                l4h_rt::mailbox::notify(c.irq);
             }
         }
     }

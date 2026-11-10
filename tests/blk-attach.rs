@@ -15,22 +15,18 @@ struct Attachment {
     extents: (u64, u64),
 }
 
-/// Root answers every attachment at once here.
-#[allow(dead_code)]
-enum Later<T> { Now(T), Token(usize) }
+/// Root answers every attachment later (vmmgr's ctl answers it then).
 struct Then;
 fn later(_: &Vmmgr) -> Then { Then }
-fn deferred(r: Later<()>) -> Result<(), Errno> {
-    match r { Later::Now(()) => Ok(()), Later::Token(_) => unreachable!() }
-}
+const DEFER: Errno = 1 << 32;
 
 #[derive(Default)]
 struct Vmmgr { attached: Vec<Attachment> }
 impl Vmmgr {
     fn attach_disk(&mut self, id: usize, disk: usize, flags: u64, start: u64, sectors: u64,
-        extents: (u64, u64), _: Then) -> Result<Later<()>, Errno> {
+        extents: (u64, u64), _: Then) -> Result<(), Errno> {
         self.attached.push(Attachment { id, disk, flags, start, sectors, extents });
-        Ok(Later::Now(()))
+        Ok(())
     }
 }
 
@@ -50,7 +46,7 @@ fn valid_extent_counts_preserve_offset_flags_and_target() {
     let mut h = Vmmgr::default();
     let flags = abi::BLK_RO | abi::BLK_VOLATILE;
     for n in [1, 2, host::blk::MAX_EXTENTS as u64] {
-        assert_eq!(execute(&mut h, 0, abi::CTL_BLK_ATTACH_EXTENTS, &[1, 3, flags, 64, n, 0]), Ok(()));
+        assert_eq!(execute(&mut h, 0, abi::CTL_BLK_ATTACH_EXTENTS, &[1, 3, flags, 64, n, 0]), Err(DEFER));
         assert_eq!(h.attached.pop(), Some(Attachment {
             id: 1, disk: 3, flags, start: 0, sectors: 0, extents: (n, 64),
         }));
@@ -61,7 +57,7 @@ fn valid_extent_counts_preserve_offset_flags_and_target() {
 fn window_attachments_keep_zero_means_to_the_end() {
     let mut h = Vmmgr::default();
     for (start, sectors) in [(0, 0), (8192, 0), (8192, 16384)] {
-        assert_eq!(execute(&mut h, 0, abi::CTL_BLK_ATTACH, &[1, 3, 0, start, sectors, 0]), Ok(()));
+        assert_eq!(execute(&mut h, 0, abi::CTL_BLK_ATTACH, &[1, 3, 0, start, sectors, 0]), Err(DEFER));
         assert_eq!(h.attached.pop(), Some(Attachment {
             id: 1, disk: 3, flags: 0, start, sectors, extents: (0, 0),
         }));

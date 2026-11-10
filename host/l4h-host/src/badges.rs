@@ -96,12 +96,14 @@ crate::badge_space! {
 }
 
 crate::badge_space! {
-    /// trustd's flags endpoint (crate::trust::call).
+    /// The flags server's endpoint (crate::trust::call).
     pub mod flags {
-        /// l4h-root's capability, which vmmgr also holds.
+        /// l4h-root's capability (its start-up handshake).
         flag ROOT: 0;
-        /// trustd's main thread's.
+        /// trustd's main thread's (guests' requests).
         flag TRUSTD: 1;
+        /// vmmgr's (the host actor's).
+        flag VMMGR: 2;
     }
 }
 

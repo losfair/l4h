@@ -1360,7 +1360,7 @@ pool, and host components map only host-owned pages.
   data area, 1 MiB of host frames mapped into dom0 (`l4h_dev_desc.data_va`),
   so no host component reads guest RAM. `L4H_CTL_LOAD_MAX` is 1 MiB.
 - **Disk detach.** Destroy drains the guest's disk requests before any
-  memory is reused (§10.1). Only the pool and blkd's DMA memory can be
+  memory a device can still reach is reused (§10.1). Only the pool and blkd's DMA memory can be
   device targets, so a controller that fails to drain pins those, not the
   guest's RAM; with a supported IOMMU the pool is unmapped from the device
   instead, and only blkd's DMA memory stays pinned (§9.5).
@@ -2030,8 +2030,12 @@ firewalling belong in a VM.
   in the port and the VMM kicks netd when it frees RX slots. Frames for an
   uplink without a free TX buffer wait in a per-NIC backlog (512 frames,
   4 MiB). All backlogs share one pool of 2 KiB chunks, 16 MiB, fixed in
-  netd's image. Only beyond those bounds is a frame dropped, so a guest that
-  stops reading costs nobody else. Dropping instead costs a TCP
+  netd's image. The pool keeps 136 KiB for each backlog (two frames of any
+  size), and a backlog takes more of the rest only while it holds no more
+  of it than is left (`pool::Pool::push`): however many ports stall, each
+  other backlog keeps its reserve and a share of what remains. Only beyond
+  those bounds is a frame dropped, so a guest that stops reading costs
+  nobody else more than that share. Dropping instead costs a TCP
   retransmission timeout per burst.
 - **NIC interrupts and notifications.** netd turns RX interrupts off while
   it drains a NIC's queue (re-checking after turning them on) and takes TX
@@ -2598,7 +2602,11 @@ controller, one per claimed controller, and the guest forwards Linux's
   NBSend, which an empty slot ignores) and posts `usb::call::remove`, after the
   attach if usbd has not answered that yet. usbd then halts and resets the
   controller and forgets every URB; when it answers root frees the area, and the controller is `idle` for the next
-  guest, which enumerates its devices again. If the reset fails root
+  guest, which enumerates its devices again. Bus mastering stays off until
+  then: the next guest's attach turns it on only after the reset, so the
+  controller never finishes a transfer it had started into the reused pool
+  (a disk controller, which other guests share, cannot be cut off this way,
+  §10.3). If the reset fails root
   quarantines the controller (decoding, bus mastering and MSI off). A
   reset does not reset USB devices' firmware: a controller carries its
   devices with it.
@@ -2719,12 +2727,19 @@ pending, and so does whatever waits for it, nothing else:
   finish at once as `wire::FAILED` answers would (`Mailbox::abandon`), as
   do later ones: a quarantined controller takes none, and a failed netd's
   commands are dropped and its ports let go. Root acts on the kernel's
-  fault message, which the driver cannot forge or withhold; nothing the
-  driver writes says that it failed. A Rust panic in a driver traps after
-  `l4h_rt::abort_trap` logs it, and faults so too.
+  fault message, which the driver cannot forge or withhold. A driver's
+  answer can also say that a request failed (an errno, or `wire::FAILED`,
+  which `l4h_rt::mailbox::serve` writes for a request the driver could not
+  carry out), and root quarantines the controller on a `Check` answered
+  `FAILED` or with a slot in use, a refused `Add`, `Remove` or `Reserve`,
+  a device failure in `Write`, and a failed USB `Claim` or `Remove`, as
+  it would on a fault. That gives a driver nothing it lacks, since it
+  could fault or stop answering instead, and a quarantine only takes
+  memory out of use, never frees it early. A Rust panic in a driver traps
+  after `l4h_rt::abort_trap` logs it, and faults so too.
 
-Root still calls memd, which handles no one's data, and trustd only in its
-start-up handshake, before any guest exists; everything else root shares
+Root still calls memd, which handles no one's data, and trustd's flags
+server only in its start-up handshake, before any guest exists; everything else root shares
 with a component is a notification or shared memory. `tests/run-hangtest.sh`
 has a blkd stop answering (`inject blkd-hang`): dom0 gives up a write that
 waits for it, its next is `EBUSY`, and a guest with another disk boots and
@@ -2744,6 +2759,17 @@ numbers wrap). Shifts by such a value are bounded first, and a divisor is
 checked for zero. Development builds check overflow as well, which catches
 what is missed in tests and in `tests/run-fuzz.sh`, whose parsers are the
 host's own.
+
+**Shared rings.** A ring in memory shared with a less-trusted party (blkd's
+channels, netd's ports, usbd's queues) has one index per side, and each
+side keeps its own privately and only publishes it (`l4h_host::spsc`): the
+peer can write over the shared copy, which changes nothing this side does.
+The peer's index is read once per look and checked against ours; one
+further from it than the ring holds gives nothing to read and no room to
+write. A driver signals a client through a slot root fills and empties
+with NBSend (`l4h_rt::mailbox::notify`), which an empty slot ignores where
+Signal would fault the driver, whatever order root's request to stop and
+its emptying of the slot arrive in.
 
 **Stacks.** Every stack has an unmapped page below it, so an overflow faults
 rather than writing over statics: root maps each component's stacks (its
@@ -2847,8 +2873,16 @@ one way to do each part of it:
   which reads and writes the ring and never the registers. Capabilities
   still cross in exchange slots, which each call's declaration names,
   with their direction and kind: both ends find a slot with
-  `Caps::passed_in` or `passed_out`, which refuse the other direction and
-  another kind than the capability's own type (`l4h_ipc::Kind`).
+  `Caps::passed_in` or `passed_out`, which refuse, at compile time, the
+  other direction and another kind than the type of the capability that
+  end's own code puts or takes (`l4h_ipc::Kind`). Nothing checks what the
+  other end left in the slot: a release seL4 cannot tell a capability's
+  type. So a receiver never invokes what a less trusted sender passed: it
+  only moves or deletes it (memd's `free` deletes vmmgr's and revokes its
+  own originals), and a capability the more trusted side must invoke is
+  one it made and passes out (memd's GuestCreate CNodes). vmmgr invokes
+  only what root and memd pass it, and root only memd's Untypeds, which
+  are memd's to give.
 - **Wiring.** Every capability by which one party calls, signals or
   faults to another is an edge of `l4h_host::wiring`: its holder and
   where it holds it (fixed slots, a slot its minter chooses, an IRQ
@@ -2893,9 +2927,11 @@ one way to do each part of it:
   in its receiver's badge space, root calls no driver, vmmgr or VMM (it
   posts in their mailboxes), every fault carries the FAULT bit, and a
   component has a keeper exactly when another component calls it
-  (`host::has_keeper`). trustd is the exception: root and vmmgr call its
-  flags thread, and a flags thread that faults stops the host
-  (`FLAGS_FAULT`). Capabilities that pass resources (CNodes, frames, IRQ
+  (`host::has_keeper`): memd, vmmgr and trustd's flags server, which
+  trustd's main thread and vmmgr call. No two call capabilities on an
+  endpoint have the same badge unless the wiring declares one a copy of
+  the other (`VMM_MEMD`, passed on from vmmgr's `VMMGR_VMM_MEMD`), so each
+  holder is the sender its badge says. Capabilities that pass resources (CNodes, frames, IRQ
   handlers, I/O ports, TCBs) are not edges, nor are a guest's own
   vCPUs' (the guest ABI). The edges themselves are listed only in
   `wiring.rs`.
@@ -2916,25 +2952,52 @@ are rare:
 kernel, a synchronous serial write for every byte.
 
 **Host log.** Diagnostics from root, vmmgr, VMMs and device services also go
-to a shared, bounded log ring (`l4h_host::log`), including `info!` in
-release builds, Rust panics and keeper fault reports. `l4hctl logs` reads a
-snapshot and `--follow` polls for new records (`CTL_LOG_READ`, dom0 only,
-with independent sequence cursors and an explicit count of unavailable
-records). Guest kernel faults include the VM id, vCPU and fault registers;
-guest power requests distinguish power off, reboot and kernel panic.
-- The ring keeps 256 records in 132 KiB, each with elapsed host time and
-  component id, at most 480 bytes with an explicit truncation marker. Root
-  owns the page-aligned storage and shares only those frames; destroying a
-  VM neither revokes them nor clears its diagnostics. Logs do not survive a
-  host reboot.
+to a bounded log (`l4h_host::log`), including `info!` in release builds,
+Rust panics and keeper fault reports. `l4hctl logs` reads a snapshot and
+`--follow` polls for new records (`CTL_LOG_READ`, dom0 only, with
+independent time cursors and an explicit count of unavailable records).
+Guest kernel faults include the VM id, vCPU and fault registers; guest power
+requests distinguish power off, reboot and kernel panic.
+- **One lane per writer.** Every writer there can be (`log::Writer`: root,
+  logd, memd, trustd, the flags server, vmmgr, netd, a blkd per disk
+  controller, a usbd per xHCI controller, a VMM per guest) has a lane of its
+  own, in pages of its own, fixed at start in a static of root's (780 KiB):
+  255 records for root, 63 for vmmgr, 15 for each other service and 7 for
+  each driver and VMM, each record at most 480 bytes with an explicit
+  truncation marker. A component maps only its own lane, writable; root
+  gives vmmgr the VMMs' lanes, for it to give each VMM its own, and maps
+  all of them read-only into vmmgr for `CTL_LOG_READ`. A record holds its
+  text and time; the reader adds the time since boot, from a clock only
+  root writes, and the component id, from the lane the record is in: a
+  component can neither write a line another's id is printed on nor
+  overwrite or erase another's records, and fills only its own lane. A
+  guest id's VMM lane is the next VMM's of that id; destroying a VM
+  neither revokes the lanes nor clears vmmgr's diagnostics about it. Logs
+  do not survive a host reboot.
+- The reader merges the lanes by time: a read returns the records of
+  [cursor, end), oldest first, ending a moment (100 ms) before now, so that
+  a record still being committed falls in the next read rather than
+  between two; the records of one time are never split between two reads.
+  A record's time is its writer's to choose: one in the future waits, one in
+  the past is missed by a follower, and either is only its writer's loss.
+  Lost counts the slots a read finds unavailable between a lane's records,
+  and, from boot, what was overwritten; a lane that a follower's read finds
+  overwritten since its last record counts as at least one. Each read scans
+  every lane's slots once per record it returns, at most 1984 bytes of them.
 - Writers format on their own stack and publish with atomic memory
   operations, without allocating, making an IPC or touching message
   registers, and never wait on a lock: a writer preempted or faulting in a
   slot leaves the others the remaining slots. Readers validate the slot
   generation around atomic payload reads, and a checksum of the record
-  against the one store a writer that lost its slot can still make, and
-  report overwritten, dropped, torn and incomplete records as unavailable; no reader consumes another's
-  history or blocks the host.
+  against the one store a writer that lost its slot can still make, read
+  each lane's head once and bound every scan by the lane's capacity, and
+  report overwritten, dropped, torn and incomplete records as unavailable;
+  no reader consumes another's history or blocks the host. What a record's
+  text holds is made printable (`log::printable`) before it is handed out.
+- **Rate limit.** A record that a less trusted party can make vmmgr write
+  (a guest's faults and power requests, its VMM's calls) goes through
+  `log::RateLimit`: per guest, 8 at once and then one a second, fixed
+  state; the next record let through says how many were not.
 - Querying needs a working dom0 and vmmgr; this does not capture seL4's own
   debug stream or make a crashed host queryable.
 - `tests/run-logtest.sh` checks kernel faults, panics and shutdowns retained
@@ -3018,7 +3081,9 @@ settings.
   memory and attestation devices, all disk windows and NICs; oversized plans
   stop boot, and neither list is truncated.
 - Root has blkd reserve every boot disk range before attaching it
-  (`blk::call::reserve`); blkd keeps those reservations across dom0 restarts. If an attachment fails, dom0 gets a
+  (`blk::call::reserve`); blkd keeps those reservations across dom0 restarts. A controller root answers
+  `EBUSY` for (another attachment or a provisioning write under way, or
+  the last dom0's disks being let go) is tried again for up to 10 s. If an attachment fails, dom0 gets a
   zero-capacity, read-only virtio-blk device in that position, which fails
   all I/O without a driver channel or DMA mappings, so other disks keep their
   names and dom0 can still boot. The range stays reserved against
@@ -3076,9 +3141,14 @@ none. dom0 runs no host hardware drivers.
 A Rust userspace library and CLI live in `tools/l4hctl`; external
 orchestration runs in dom0. Devices are attached before start and removed
 on destroy. Pause/resume, device hotplug, switch deletion, I/O limits and
-asynchronous event queues are not implemented; `vm_pause` would need more
-than suspending the vCPU kernel thread, which does not stop a user thread
-holding SC_U.
+asynchronous event queues are not implemented. A stopped guest (powered
+off, or its kernel or VMM faulted) stays stopped until it is destroyed:
+the guest needs its kTCBs and SC_Us with every right (it starts its
+other vCPUs, arms their timers and binds SC_U to its tasks), and seL4 TCB
+capabilities have none to take away, so vmmgr revokes its own kTCB and
+SC_U capabilities, which deletes every copy the guest made of them, then
+suspends the kTCBs and unbinds every SC, which a user thread or call
+chain may hold (`Guest::stop`). `vm_pause` would need to give them back.
 
 **Lifecycle.**
 
@@ -3111,17 +3181,25 @@ holding SC_U.
   ASIDs are released by the kernel when VSpaces die. Repeated
   create/destroy leaves free memory unchanged (`tests/run-ctltest.sh`).
 - **Disk detach.** A disk window is detached only when its guest is
-  destroyed, and the shared controller keeps running. Root asks blkd to
-  drain the client (`blk::call::remove`): every request it submitted completes
-  before the pool can be reused, then root unmaps the pool from the
-  controller's IOMMU domain. Clearing bus mastering alone would not be a
-  drain, since a device can complete a command it already started. If blkd
-  has failed or the drain times out (five seconds), root quarantines the
-  controller: it suspends blkd and disables the PCI function, marks the
-  controller failed until host reboot (`blk_attach` returns EIO, `l4hctl
-  disks` says so), and keeps the guest's pool and blkd's DMA memory out of
-  the free pool, unless an IOMMU has cut the device off from the pool
-  (§9.5). `tests/run-ctltest.sh` destroys guests in the middle of throttled
+  destroyed, and the shared controller keeps running. Root first unmaps the
+  pool from the controller's IOMMU domain, which waits for the device's
+  DMA to it to drain (§9.5): the device can no longer reach the pool,
+  whatever blkd does, and the pool is reused at once (once every device of
+  the guest is cut off so). Then root asks blkd to drain the client
+  (`blk::call::remove`); without an IOMMU the pool waits for that, until
+  every request the client submitted has completed.
+  Root cannot cut one client off by clearing bus mastering, as it cuts off
+  a USB controller's one guest (§9.7): that would stop the controller's
+  other clients, and once bus mastering was back on the device would finish
+  commands it had started, into the reused pool. A USB controller is reset
+  before bus mastering comes back. If blkd has failed or the drain times
+  out (five seconds), root quarantines the controller: it suspends blkd
+  and disables the PCI function, marks the controller failed until host
+  reboot (`blk_attach` returns EIO, `l4hctl disks` says so), and keeps the
+  guest's pool and blkd's DMA memory out of the free pool, unless an IOMMU
+  has cut the device off from the pool (§9.5). Root does not count on the
+  disabled function there: a controller that did not drain is already not
+  doing what it was told. `tests/run-ctltest.sh` destroys guests in the middle of throttled
   reads on virtio-blk and NVMe, and checks that the next guest, which reuses
   the memory, sees no disk data appear in it.
 
@@ -3193,10 +3271,14 @@ The chain has four links.
      (`root::call::attest_done`) to have the device's event raised on vCPU 0
      (root posts it in vmmgr's mailbox). Linux sleeps the caller
      meanwhile.
-   - trustd owns the 64 request pages, one per guest id, and root lends one
+   - trustd owns the request pages, two per guest id, and root lends one
      to each guest, so a page stays mapped in trustd while it answers a
      guest being destroyed. trustd drops an answer whose guest's instance
-     changed while it worked.
+     changed while it worked: it says in a status page which page it is
+     about to write, then looks at the registry a last time. Root
+     unregisters a guest before it gives the id to another, and gives the
+     new guest the id's other page while the status names the old one's,
+     so no answer lands in a page given to another guest since.
    - `L4H_ATTEST_REPORT`, with 64 bytes of the guest's data, returns a
      COSE_Sign1 (ES256) signed by K, carrying a CBOR map `v` (1), `ram`,
      `data`, `dom0`, `host` (SHA-256 of K), `seal`, `guest`, `taint`,
@@ -3274,27 +3356,39 @@ checking taint alone leaves a session key exposed after its report.
   outside the launch measurement; guests treat the network as untrusted,
   so steering rules (§9.3) take no bit, also on a sealed guest's MAC or
   port.
-- **The flags service.** A passive thread in trustd is the sole writer of
-  an 8 KiB flags area: 64 entries of 128 bytes, each with a seqlock,
-  instance and the two bitmaps. Readers (the host actor and trustd's main
-  thread) map it read-only and retry an odd or changed sequence. Root assigns
+- **The flags service.** The flags server, the trustd image started by
+  root a second time as a component of its own (`host::KIND_FLAGS`, with
+  its own CSpace and VSpace), is the sole writer of an 8 KiB flags area:
+  64 entries of 128 bytes, each with a seqlock, instance and the two
+  bitmaps. Only it maps the area writable; readers (the host actor, root
+  and trustd's main thread) map it read-only and retry an odd or changed
+  sequence. trustd's main thread, which parses guests' pages and runs the
+  firmware's AML, reaches the flags only through its calls. Root assigns
   monotonically increasing instances at `VM_CREATE` and publishes them in
-  the registry at start. An entry for another instance reads as empty; a
-  higher-instance request replaces an entry, an older one gets `-ESRCH`.
-  Destruction does not clear flags.
-- **Callers.** The flags endpoint has badged callers: `trust::Sender::Root` (used by
-  the host actor) can ACT on defined host bits, and `trust::Sender::Trustd` (guest
-  requests) can ACT on guest bits and SEAL defined host or userspace bits.
-  Kernel bits cannot be sealed. All arguments are validated before any
-  entry changes. Requests are MR0 op, MR1 id, MR2 instance, MR3–6 bitmap,
-  MR7 options; replies MR0 status, MR1 instance, MR2–5 taint, MR6–9 seal.
-  The thread runs at root's priority on the caller's donated scheduling
-  context, with no heap, TPM, AML or calls back; a fault in it is a host
-  bug.
+  the registry at start, which the flags server maps read-only too. An
+  entry for another instance reads as empty; a higher-instance request
+  replaces an entry, an older one gets `-ESRCH`. Destruction does not
+  clear flags.
+- **Callers.** The flags endpoint has badged callers, each with a badge
+  of its own: `trust::Sender::Vmmgr` (the host actor) can ACT on defined
+  host bits, `trust::Sender::Trustd` (guest requests) can ACT on guest
+  bits and SEAL defined host or userspace bits, and `trust::Sender::Root`
+  only makes the start-up handshake. Kernel bits cannot be sealed. All
+  arguments are validated before any entry changes, the instance too:
+  trustd's must be the one the registry has for the guest, and vmmgr's
+  too once the guest has started (before, vmmgr records console input
+  queued for the instance root gave it), so neither can replace a running
+  guest's entry with another instance's. The operation is the message
+  label (`trust::FLAGS_ACT`, `FLAGS_SEAL`); requests are MR0 id, MR1
+  instance, MR2–5 bitmap, MR6 options; replies MR0 status, MR1 instance,
+  MR2–5 taint, MR6–9 seal. The server runs at root's priority on the
+  caller's donated scheduling context, with no heap, TPM, AML or calls
+  back. If it faults, its keeper answers every call `FAILED` from then
+  on: the actions they were for are refused, so seals stay enforced.
 - **Ordering.** An actor first checks the seal in a consistent entry. If the
   taint is already set, no IPC is needed; otherwise ACT must succeed before
   the operation. This costs one IPC per action kind per instance. ACT and
-  SEAL serialize in the flags thread. An operation that passed its check can
+  SEAL serialize in the flags server. An operation that passed its check can
   land after sealing, but its taint was set before that seal, so a report
   showing a clean sealed bit guarantees the action has never happened and
   never will (not that an already-tainted action is no longer in flight).
@@ -3378,14 +3472,23 @@ runs the secondary's ActivateCredential calls (the relay):
   `MSFT0101` device whose `_DSM` offers that function, runs only its and its
   parents' `_INI`, and calls the `_DSM` after setting the start bit.
   - Accesses outside trustd's own TPM ranges go to root (`root::call::hw`),
-    which refuses RAM, device memory in use, I/O ports already handed out,
-    and config writes to the PCI functions the host drives; refused reads
-    return all ones.
+    which serves them only for this start method. It refuses RAM, device
+    memory root uses itself (the AML's pages are carved into a frame table
+    of their own, so whatever root carved, the IOMMU's registers among
+    it, is not free for them), I/O ports already handed out and those that
+    reset the machine, put it to sleep or enter SMM (0x60, 0x64, 0x92,
+    0xb2–0xb3, 0xcf9 and the FADT's SMI command and PM1/PM2 control
+    blocks), the BARs of the PCI functions root drives, and config writes,
+    by ports or through the MCFG's ECAM window, to every function root
+    manages: disk controllers, uplink NICs, xHCI controllers, the balloon
+    device, IOMMUs, the host bridge and every bridge. Refused reads return
+    all ones.
   - The interpreter runs in trustd, not root, because it can panic on some
     AML. If trustd's main thread faults, root suspends only it, revokes the
     guests' kick capabilities, marks every attestation page failed and
     answers pending requests with -EIO; no new guest gets attestation. The
-    flags thread stays alive, so seals stay enforced.
+    flags server, which the main thread can reach only by its calls, stays
+    alive, so seals stay enforced.
   - The crate is pinned to an upstream commit past 6.1.1, whose buffer
     comparison, needed by every `_DSM`'s UUID check, panics.
 - **CRB with Pluton**, start method 13: the start and reply doorbells named
@@ -3448,12 +3551,16 @@ root.
   ASIDControl). It runs guest creation, image loading and the launch digest,
   start, shutdown and destroy, dom0's boot and restart, the balancer and
   steal time (§7), memory targets (§8.5) and the control API. Guests' VMMs
-  call it, and guest kernels and VMMs fault to it.
+  call it, and guest kernels and VMMs fault to it: a guest whose kernel or
+  VMM faults is stopped as one that powers off is (`Guest::stop`, §10.1),
+  and dom0 is restarted.
 - **Root holds** what devices reach. A guest's I/O pool is root's: root maps
   it into the IOMMU domains of the guest's disks by physical address. If
   vmmgr named addresses, a compromised vmmgr could have root give a device
   any memory, so vmmgr names guest ids, disk numbers, LBA windows and sizes,
-  root checks them against its own table (`vmmgr::RootGuest`), and every
+  root checks them against its own tables (`vmmgr::RootGuest`; a window
+  against the disk's capacity, while an extent list is blkd's to read and
+  check), and every
   address root gives the IOMMU, blkd or netd comes from that table. Disk
   channels and netd ports are root's too, in a per-guest arena root revokes
   when vmmgr is done with the guest. Root also numbers guest instances, so
@@ -3492,13 +3599,18 @@ root.
   (without an IOMMU, only once its disks are quiesced, and kept out of use
   if one did not stop), have netd and blkd let go of its ports and disks, and finally memd revokes the guest's RAM blocks (§8.4). Root
   answers at once: what drivers map stays with root until they have let go
-  of it (§10).
+  of it (§10). Its requests still waiting for a driver are answered
+  `ENOENT` then, so a control request waiting on them is answered; the
+  token stays taken until the driver answers too, which root then drops.
 - **Boot modules.** Root maps the guest kernel, its module tree and dom0's
   initramfs read-only into vmmgr, with a CNode of their frames, so guests
   can share the kernel's read-only blocks and the module tree (§5.6).
 - **dom0's devices.** Root makes the switches at boot, attaches the uplinks,
   and chooses dom0's disks and vNICs (`Dom0Plan`); vmmgr creates every dom0
-  with them.
+  with them. A dom0 that cannot be built (memory, or a plan that does not
+  fit) is logged and given back, and the monitor's `restart-dom0` tries
+  again; vmmgr does not fail for it. A vNIC whose netd has failed is not
+  added (`EIO`, as for a disk or USB controller whose driver failed).
 - **Trust.** vmmgr is in every guest's TCB: whoever builds a guest's CSpace
   can copy its frames. The console seals (§10.2) are vmmgr's to keep: it
   reads the VMM-written console rings and display areas and acts on
@@ -3508,8 +3620,10 @@ root.
   memory hotplug need nothing of vmmgr. Like memd, the other component
   that serves calls, it has a keeper thread (`l4h_rt`), which reports the fault and answers every later
   call with a failure, the call vmmgr was serving first (its reply object is
-  in `SLOT_REPLY`), so a VMM's call or a guest's power request returns
-  instead of blocking. For dom0's control requests, the failure service
+  in `SLOT_REPLY`), so a VMM's call returns instead of blocking. A guest's
+  power request does not return: its VMM does not answer it, so the vCPU
+  that asked stays blocked in it, as stopped as vmmgr would have left it.
+  For dom0's control requests, the failure service
   writes EIO, publishes the completion and raises the device event, for an
   outstanding request and later ones, using pages and a notification
   registered before dom0 starts and none of vmmgr's mutable state. A keeper
@@ -3531,13 +3645,15 @@ a line.
 
 ```
  partition 0                                 secondary partition k
- root, vmmgr, netd, blkd, memd, trustd       the same
- VMMs (guest console lines)
-        |                                           |
-        v                                           v
- serial ring 0 (in root's image)             serial ring k (shared region)
-        |                                           |
-        +------------------+------------------------+
+ root      every other writer (log::Writer)  root, vmmgr, netd, blkd, memd,
+ |         a lane each: netd, blkd c,         trustd, VMMs: one ring
+ |         VMM g (guest g's console),
+ |         dom0's VMM (dom0's console)
+ v              |                                   |
+ serial ring 0  v                                   v
+ (root's image) serial lanes (root's image)  serial ring k (shared region)
+        |       | read-only                         |
+        +-------+----------+------------------------+
                            v
                       l4h-logd  ------> UART, framebuffer
                            ^
@@ -3548,20 +3664,42 @@ a line.
 - **Serial ring** (`l4h_host::serial`). 1023 slots of 224 bytes, 256 KiB,
   room for a dom0 boot and no deeper, since a deep ring only makes output
   later: a guest flood fills it, and everything waits behind that. Separate
-  from the log ring so that console volume cannot push diagnostics
-  out of `l4hctl logs`. The slots are the log ring's (`l4h_host::ring`):
+  from the log so that console volume cannot push diagnostics
+  out of `l4hctl logs`. The slots are the log's (`l4h_host::ring`):
   writers format on their stack, claim, never wait and make no seL4 call. A
   writer that stalls in a commit keeps its slot until the writer of a later
   lap takes it back, and then stops, at worst after one more store, which
   the record's checksum shows its reader (the record is then lost). A line
   that does not fit takes consecutive slots, flagged as going on, and a
-  reader prints them next to each other. Every task maps its partition's
-  ring at the same address.
-- **Writers.** `log!` and printing `info!` write this ring as well as the
-  log ring. A VMM gathers its guest's console by line, and sends what it has
-  of one after 100 ms, so that prompts show. Panic text is gathered by line.
-  Text on the port is what it always was: the ring's timestamps are not
-  printed, and `[vmN] ` and `[pN] ` are.
+  reader prints them next to each other.
+- **Lanes.** In partition 0 the ring is root's alone. Every other writer
+  (`log::Writer`) has a lane of its own (`serial::Lanes`, 1.6 MiB in a
+  static of root's, fixed at start): dom0's VMM one as deep as the ring,
+  for dom0's console; each other VMM 63 records, for its guest's console;
+  vmmgr 31; every other component 15. A component maps only its own lane,
+  writable, at the address where a secondary's tasks map their ring; root
+  gives vmmgr the VMMs' lanes, for it to give each VMM its own, and maps
+  every lane into logd read-only. logd prints whose a line is from the lane
+  it is in, never from the record: root's lines and dom0's console have no
+  prefix; a VMM's guest console `[vmN] `, with N its guest's, whatever the
+  record claims; and every other writer's lines its name: `[netd] `,
+  `[blkd3] `, `[vmm2] `, `[dom0 vmm] `. A component can neither print a
+  line that passes for another's nor overwrite or erase another's: it fills
+  only its own lane. A secondary partition has one ring for all its tasks,
+  in the shared region the partition descriptor gives it (one ring's
+  room), and partition 0 prints its lines as `[pN] `: within a secondary a
+  task can still pass for, or overwrite, another (partitions are not a
+  security boundary, §11.4), never for partition 0's.
+- **Printable text.** logd hands on a record's text, and a kernel console
+  line, only as text (`log::printable`, also what `l4hctl logs` reads):
+  tabs and line ends become spaces, other control characters, escape
+  sequences included, and bytes that are not UTF-8 become `?`. Guest names
+  that root's monitor or vmmgr prints, and a guest's console, cannot move
+  the terminal's cursor over another line or pass for another writer's.
+- **Writers.** `log!` and printing `info!` write the writer's serial ring or
+  lane as well as its log lane. A VMM gathers its guest's console by line,
+  and sends what it has of one after 100 ms, so that prompts show. Panic
+  text is gathered by line. The ring's timestamps are not printed.
 - **logd** wakes on a 10 ms timer, since writers cannot wake it. `Merge`
   (also in `l4h_host::serial`) prints the record with the lowest timestamp
   of any ring, then lines of kernel console rings. A record claimed and not
@@ -3570,8 +3708,8 @@ a line.
   a ring claiming to hold the oldest record can do, and a pass ends only
   when nothing is left to print. It has 5 more for the rest of a line it
   has started, the length of the longest message; a longer line can split
-  where a pass ends. logd waits for the rest of a line only from
-  partition 0: a secondary could ask for 100 ms every time, and another
+  where a pass ends. logd waits for the rest of a line only from root's
+  ring: another writer could ask for 100 ms every time, and another
   ring's `(N lines lost)` waits for the end of a line. logd turns on
   the UART's FIFO, which seL4 leaves off on a 16550, and sends 15 bytes when
   it finds the FIFO empty, leaving room for a byte of the kernel's, or one
@@ -3586,9 +3724,10 @@ a line.
   and receiving use different registers.
 - **Secondary partitions** have no logd. Their ring is in the shared region,
   cleared by the shim and described in the partition descriptor. Partition
-  0 does not trust that memory: slots are indexed modulo their number,
-  lengths are clamped, a corrupt record is skipped and counted, and line ends in a record's text are replaced, so a
-  line cannot pass for another partition's. Root's first lines go to a
+  0 does not trust that memory, nor any lane: slots are indexed modulo
+  their number, lengths are clamped, a corrupt record is skipped and
+  counted, and text is made printable, so a line cannot pass for another
+  partition's. Root's first lines go to a
   private ring until the shared one is mapped.
 - **Framebuffer.** `fb_console` shows host output only if something draws
   it, now that it does not go through the kernel. logd draws it on the lower
@@ -3610,7 +3749,7 @@ that never yields is not:
 | Before logd starts | Records wait in the ring. logd is the first component root starts, once it has the setting and memory for it; a root panic before that is not printed |
 | Hard hang or kernel panic | Undrained records are lost; the kernel's own message still prints |
 
-A host reset sleeps until logd has printed partition 0's ring, for at most 2
+A host reset sleeps until logd has printed root's ring, for at most 2
 seconds, so that what preceded it is on the wire. `tests/run-logdtest.sh`
 injects these failures in a host built with `L4H_TEST_INJECT=1`;
 `tests/run-mktest.sh` fails on a `[pN] ` that is not at the start of a line.

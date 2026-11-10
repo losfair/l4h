@@ -31,6 +31,7 @@ use l4h_abi::{self as abi, usb as uabi};
 use l4h_host::usb::call::{Request, reply};
 use l4h_host::{self as host, usb, wire, wiring};
 use l4h_host::fixed::ArrayVec;
+use l4h_host::mailbox::RING;
 
 use crate::blkd::{BarCache, DEVICE_ATTRS, bar_frames, keep_bits};
 use crate::component::{self, Component, SpawnArgs, abs_of, root_cap};
@@ -87,9 +88,10 @@ struct Usbd {
     comp: Component,
     arena: Arena,
     mailbox: Mailbox,
-    /// The requests posted and not answered, oldest first: at most a
-    /// CLAIM, or an ATTACH and its REMOVE (an ATTACH waits for the others).
-    ops: ArrayVec<Op, 2>,
+    /// The requests posted and not answered, by number mod RING, as blkd's
+    /// and netd's are: at most a CLAIM, or an ATTACH and its REMOVE (an
+    /// ATTACH waits for the others).
+    ops: [Option<Op>; RING],
     areas: [Option<Area>; usb::AREAS],
     /// The attached guest's area (State::Vm).
     idx: usize,
@@ -362,7 +364,7 @@ fn claim(h: &mut Host, i: usize) -> Result<(), Errno> {
     // stays as it is until usbd has it halted.
     h.pci.enable_memory(&c.pci);
     component::start(&comp);
-    let mut u = Usbd { comp, arena, mailbox: mbox, ops: ArrayVec::new(), areas: [const { None }; usb::AREAS], idx: 0, waiting: false };
+    let mut u = Usbd { comp, arena, mailbox: mbox, ops: [None; RING], areas: [const { None }; usb::AREAS], idx: 0, waiting: false };
     send(&mut u, Request::Claim {}, Op::Claim);
     c.driver = Some(u);
     c.state = State::Idle;
@@ -413,8 +415,8 @@ pub fn ensure_claimed(h: &mut Host, i: usize) -> Result<(), Errno> {
 /// Post a request to usbd.  Root posts at most two before they are
 /// answered (Usbd::ops), so the ring has room.
 fn send(d: &mut Usbd, req: Request, op: Op) {
-    d.mailbox.send(&req).expect("usbd mailbox room");
-    d.ops.must_push(op);
+    let k = d.mailbox.send(&req).expect("usbd mailbox room");
+    d.ops[k as usize % RING] = Some(op);
 }
 
 /// The owner's ATTACH, once usbd has answered what came before: bus
@@ -464,22 +466,23 @@ pub fn poll(h: &mut Host) {
             let c = &mut ctrls()[i];
             let Some(d) = c.driver.as_mut() else { break };
             let failed = c.state == State::Failed;
-            let w = if failed {
-                d.mailbox.abandon().map(|_| [wire::FAILED; host::mailbox::ANSWER])
+            let next = if failed {
+                d.mailbox.abandon().map(|k| (k, [wire::FAILED; host::mailbox::ANSWER]))
             } else {
-                d.mailbox.answer().map(|(_, w)| w)
+                d.mailbox.answer()
             };
-            let Some(w) = w else { break };
+            let Some((k, w)) = next else { break };
             let p = c.pci;
-            match d.ops.remove(0) {
-                Op::Claim => claimed(h, i, &w),
+            match d.ops[k as usize % RING].take() {
+                None => {}
+                Some(Op::Claim) => claimed(h, i, &w),
                 // The guest finds no magic.
-                Op::Attach => {
+                Some(Op::Attach) => {
                     if let (Err(e), false) = (wire::reply::<reply::Attach>(&w), failed) {
                         log!("l4h-root: xHCI {:02x}:{:02x}.{}: usbd refused the attachment ({:#x})", p.bus, p.dev, p.func, e);
                     }
                 }
-                Op::Remove(idx) => {
+                Some(Op::Remove(idx)) => {
                     if let (Err(e), false) = (wire::reply::<reply::Remove>(&w), failed) {
                         log!("l4h-root: xHCI {:02x}:{:02x}.{}: usbd could not stop it ({:#x})", p.bus, p.dev, p.func, e);
                         quarantine(c, &h.pci);
@@ -489,7 +492,7 @@ pub fn poll(h: &mut Host) {
             }
             let c = &ctrls()[i];
             let d = c.driver.as_ref().unwrap();
-            if d.waiting && d.ops.is_empty() && c.state != State::Failed {
+            if d.waiting && d.mailbox.idle() && c.state != State::Failed {
                 post_attach(h, i);
             }
         }
@@ -565,7 +568,7 @@ pub fn attach(h: &mut Host, i: usize, g: &mut RootGuest) -> Result<Attached, Err
     c.pool = Some((g.pool.gpa, g.pool.paddr, g.pool.size));
     c.state = State::Vm(g.id);
     g.usbs.must_push(i);
-    if d.ops.is_empty() {
+    if d.mailbox.idle() {
         post_attach(h, i);
     } else {
         d.waiting = true;

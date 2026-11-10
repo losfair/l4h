@@ -196,6 +196,20 @@ impl Component {
         Obj::of(cap)
     }
 
+    /// Map `pages` frames, from the parent's capability `first` on, at `va`,
+    /// keeping the mapping capabilities in a CNode of its arena.
+    fn map_frames(&self, alloc: &mut Alloc, arena: &mut Arena, first: u64, pages: usize, va: usize, rights: CapRights) {
+        let radix = (pages.next_power_of_two().trailing_zeros() as usize).max(1);
+        let keep = arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: radix });
+        for i in 0..pages {
+            let frame = cap::Granule::from_bits(first + i as u64);
+            self.map_copy(
+                alloc, arena, &self.local_cnode.absolute_cptr(frame), va + i * PAGE, rights.clone(), VmAttributes::DEFAULT,
+                keep.absolute_cptr_from_bits_with_depth(i as u64, radix),
+            );
+        }
+    }
+
     /// Map `frame` (a capability anywhere in the parent's CSpace) into the
     /// component at `va`.  The mapping capability is a fresh copy that is
     /// moved into `keep` (a CNode slot that must outlive the mapping).
@@ -246,10 +260,17 @@ pub struct SpawnContext {
     /// Whose parent_ep is: the components' calls and faults go to it.
     pub parent: wiring::Party,
     pub tsc_hz: u64,
-    /// First of the parent's contiguous capabilities to the log frames.
+    /// First of the parent's contiguous capabilities to the frames of the
+    /// log area (`host::log::Ring`), from its page 0: all of it in root,
+    /// the VMMs' lanes in vmmgr.
     pub log_frames: u64,
-    /// The same for the frames of the partition's serial ring.
+    /// The same for the frames of the partition's serial ring (root's, or
+    /// a secondary's), which is a component's own only without lanes.
     pub serial_frames: u64,
+    /// The same for partition 0's serial lanes (`host::serial::Lanes`): in
+    /// root, all of them; in vmmgr, the VMMs'. None in a secondary
+    /// partition, where every task writes the partition's ring.
+    pub serial_lanes: Option<u64>,
 }
 
 /// Create a component, without starting it.  Objects come from `arena`.
@@ -294,25 +315,40 @@ pub fn create(
 
     let c = Component { local_cnode, id: args.id, kind: args.kind, tcb, cnode, vspace, ntfn, service_ep, sc, cnode_bits };
 
-    // Shared diagnostics: mapping caps belong to the child's arena, so
-    // destroying a VMM releases them without revoking the shared frames.
-    let keep = arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: host::log::FRAME_RADIX });
-    for i in 0..host::log::PAGES {
-        let frame = cap::Granule::from_bits(context.log_frames + i as u64);
-        c.map_copy(
-            alloc, arena, &local_cnode.absolute_cptr(frame), host::log::VA + i * PAGE,
-            CapRights::read_write(), VmAttributes::DEFAULT,
-            keep.absolute_cptr_from_bits_with_depth(i as u64, host::log::FRAME_RADIX),
-        );
-    }
-    let keep = arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: host::serial::FRAME_RADIX });
-    for i in 0..host::serial::PAGES {
-        let frame = cap::Granule::from_bits(context.serial_frames + i as u64);
-        c.map_copy(
-            alloc, arena, &local_cnode.absolute_cptr(frame), host::serial::VA + i * PAGE,
-            CapRights::read_write(), VmAttributes::DEFAULT,
-            keep.absolute_cptr_from_bits_with_depth(i as u64, host::serial::FRAME_RADIX),
-        );
+    // Diagnostics: its own lanes, which only it (and its parent) can write,
+    // and, for their readers, every lane read-only. Mapping caps belong to
+    // the child's arena, so destroying a VMM releases them without revoking
+    // the shared frames.
+    let writer = host::log::Writer::of(args.kind, args.id);
+    let log_records = writer.and_then(host::log::lane_at).map_or(0, |l| {
+        c.map_frames(alloc, arena, context.log_frames + l.page as u64, l.pages, host::log::VA, CapRights::read_write());
+        l.records
+    });
+    // A VMM's config says whether it is dom0's, whose console has a lane of its own.
+    let dom0 = args.kind == host::KIND_VMM
+        && args.config.get(core::mem::offset_of!(host::VmmConfig, dom0)..).is_some_and(|b| b.len() >= 4 && b[..4] != [0; 4]);
+    let serial_records = match context.serial_lanes {
+        Some(lanes) => host::serial::writer(args.kind, args.id, dom0).and_then(host::serial::lane_at).map_or(0, |l| {
+            c.map_frames(alloc, arena, lanes + l.page as u64, l.pages, host::serial::VA, CapRights::read_write());
+            l.records
+        }),
+        None => {
+            c.map_frames(alloc, arena, context.serial_frames, host::serial::PAGES, host::serial::VA, CapRights::read_write());
+            host::serial::CAPACITY
+        }
+    };
+    match args.kind {
+        host::KIND_VMMGR => {
+            c.map_frames(alloc, arena, context.log_frames, host::log::PAGES, host::log::READ_VA, CapRights::read_only());
+        }
+        // Root's ring: logd says in it what it printed.
+        host::KIND_LOGD => {
+            c.map_frames(alloc, arena, context.serial_frames, host::serial::PAGES, host::serial::RINGS_VA, CapRights::read_write());
+            if let Some(lanes) = context.serial_lanes {
+                c.map_frames(alloc, arena, lanes, host::serial::LANES_PAGES, host::serial::LANES_VA, CapRights::read_only());
+            }
+        }
+        _ => {}
     }
 
     // ---- Load the ELF image, one fresh frame per page; pages are writable
@@ -359,7 +395,11 @@ pub fn create(
         kind: args.kind,
         id: args.id,
         tsc_hz: context.tsc_hz,
-        reserved: [0; 5],
+        reserved: {
+            let mut r = [0; 5];
+            r[host::log::LANES_INFO] = host::log::lanes_info(log_records, serial_records);
+            r
+        },
     };
     let hdr = unsafe {
         core::slice::from_raw_parts(&hdr as *const host::InfoHeader as *const u8, core::mem::size_of::<host::InfoHeader>())

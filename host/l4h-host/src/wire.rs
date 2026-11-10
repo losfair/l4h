@@ -342,8 +342,20 @@ pub enum Cap {
 /// [first, first + count), at most count of them.  The area is the slots
 /// of the caller's that the protocol declares (`xchg`), wherever the two
 /// can both reach them.  Both ends find a slot with `passed_in` or
-/// `passed_out`, which refuse the other direction and another kind of
-/// capability than the call declares.
+/// `passed_out`, which refuse, at compile time, the other direction and
+/// another kind than the call declares: each end's own code puts or takes
+/// a capability of the declared kind (l4h_ipc::Kind).
+///
+/// Nothing checks the capability that arrives: a release seL4 cannot say
+/// what type a capability is, so a sender can leave anything in a slot.
+/// What a less trusted sender passed is therefore never invoked: the
+/// receiver only moves, copies or deletes it.  The one call that passes
+/// capabilities in, memd's `free`, keeps root's and deletes vmmgr's
+/// unused (it revokes its own originals instead); vmmgr invokes
+/// only what root and memd pass it, and root only memd's Untypeds (memd
+/// holds every Untyped: root's memory is its anyway).  A capability the
+/// more trusted side must invoke is made by it and passed out, as memd's
+/// GuestCreate CNodes are.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Caps {
     first: usize,

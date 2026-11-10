@@ -24,6 +24,7 @@ use l4h_rt::host::errno::{self, Errno};
 use l4h_rt::host;
 use l4h_rt::host::blk::{self, BlkdConfig, Channel, Pool};
 use l4h_rt::host::fixed::ArrayVec;
+use l4h_rt::host::spsc::{Consumer, Producer};
 use l4h_rt::sel4;
 use l4h_rt::{Info, cap};
 use sel4::cap_type;
@@ -115,6 +116,10 @@ struct Client {
     /// Flushes complete at once (l4h_abi::BLK_VOLATILE).
     volatile: bool,
     done: sel4::cap::Notification,
+    /// Our indices of the channel's rings: the client can write over the
+    /// channel's copies.
+    sq: Consumer,
+    cq: Producer,
     outstanding: usize,
     notify_pending: bool,
 }
@@ -188,13 +193,11 @@ fn holds(clients: &[Option<Client>]) -> impl Fn(usize) -> Option<blk::Hold<'stat
 }
 
 impl Client {
+    /// Room was reserved when the request was taken (`submit`).
     fn respond(&mut self, id: u64, status: u32) {
         unsafe {
-            let h = addr_of!((*self.chan).cq.head).read_volatile();
-            addr_of_mut!((*self.chan).resps[h as usize % blk::RING_SIZE])
-                .write_volatile(blk::Resp { id, status, reserved: 0 });
-            fence(Ordering::Release);
-            addr_of_mut!((*self.chan).cq.head).write_volatile(h.wrapping_add(1));
+            addr_of_mut!((*self.chan).resps[self.cq.slot()]).write_volatile(blk::Resp { id, status, reserved: 0 });
+            self.cq.push(&(*self.chan).cq);
         }
         self.notify_pending = true;
     }
@@ -228,7 +231,7 @@ impl Blkd {
     fn notify_completions(&mut self) {
         for &i in &self.active {
             if let Some(c) = self.clients[i].as_mut() {
-                if core::mem::take(&mut c.notify_pending) { c.done.signal(); }
+                if core::mem::take(&mut c.notify_pending) { l4h_rt::mailbox::notify(c.done); }
             }
         }
     }
@@ -274,16 +277,13 @@ impl Blkd {
                     if self.carry.is_some() || !self.drv.can_start() { break; }
                     let Some(t) = self.pending.iter().position(Option::is_none) else { break };
                     let req = unsafe {
-                        let tail = addr_of!((*c.chan).sq.tail).read_volatile();
-                        let head = addr_of!((*c.chan).sq.head).read_volatile();
-                        let cq_used = addr_of!((*c.chan).cq.head).read_volatile()
-                            .wrapping_sub(addr_of!((*c.chan).cq.tail).read_volatile()) as usize;
-                        // Reserve completion space for every in-flight request.
-                        if head == tail || head.wrapping_sub(tail) as usize > blk::RING_SIZE
-                            || cq_used.saturating_add(c.outstanding) >= blk::RING_SIZE { break; }
-                        fence(Ordering::Acquire);
-                        let req = addr_of!((*c.chan).reqs[tail as usize % blk::RING_SIZE]).read_volatile();
-                        addr_of_mut!((*c.chan).sq.tail).write_volatile(tail.wrapping_add(1));
+                        // Reserve completion space for every in-flight
+                        // request.  A ring whose index the client broke
+                        // has nothing ready, or no room.
+                        if c.sq.ready(&(*c.chan).sq) == 0
+                            || (c.cq.used(&(*c.chan).cq) as usize).saturating_add(c.outstanding) >= blk::RING_SIZE { break; }
+                        let req = addr_of!((*c.chan).reqs[c.sq.slot()]).read_volatile();
+                        c.sq.pop(&(*c.chan).sq);
                         req
                     };
                     progress = true;
@@ -442,7 +442,9 @@ impl blk::call::Server for Requests<'_> {
         match b.check(self.cfg, unit, start, count, n, ro != 0, dom0, Some(i), order, extents) {
             Ok((_, vol, read_only)) => {
                 b.clients[i] = Some(Client { chan, unit, pool, vol, read_only, volatile,
-                    done: cap::<cap_type::Notification>(blk::BLKD_SLOT_CLIENT_DONE + i as u64), outstanding: 0, notify_pending: false });
+                    done: cap::<cap_type::Notification>(blk::BLKD_SLOT_CLIENT_DONE + i as u64),
+                    // Root gave a fresh channel: both rings start empty.
+                    sq: Consumer::new(blk::RING_SIZE), cq: Producer::new(blk::RING_SIZE), outstanding: 0, notify_pending: false });
                 // Not attached yet, so not in active.
                 let _ = b.active.push(i);
                 unsafe {

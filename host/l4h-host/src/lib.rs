@@ -25,6 +25,7 @@ pub mod net;
 pub mod ring;
 pub mod root;
 pub mod serial;
+pub mod spsc;
 pub mod trust;
 pub mod usb;
 pub mod vmmgr;
@@ -145,14 +146,18 @@ pub const KIND_MEMD: u32 = 5;
 pub const KIND_VMMGR: u32 = 6;
 pub const KIND_LOGD: u32 = 7;
 pub const KIND_USBD: u32 = 8;
+/// trustd's flags server (trust::call): the trustd image, in spaces of its
+/// own.
+pub const KIND_FLAGS: u32 = 9;
 
-/// The kinds that serve calls: root calls memd, guests' VMMs call vmmgr.
-/// A caller blocked in a call could not wait for their faults to be
-/// reported, so a keeper thread answers for a failed one.  The drivers
-/// serve root's mailbox (crate::mailbox), which root never waits on: their
-/// faults go to root, which acts on them itself.
+/// The kinds that serve calls: root calls memd, guests' VMMs call vmmgr,
+/// vmmgr and trustd call the flags server.  A caller blocked in a call
+/// could not wait for their faults to be reported, so a keeper thread
+/// answers for a failed one.  The drivers serve root's mailbox
+/// (crate::mailbox), which root never waits on: their faults go to root,
+/// which acts on them itself.
 pub const fn has_keeper(kind: u32) -> bool {
-    matches!(kind, KIND_MEMD | KIND_VMMGR)
+    matches!(kind, KIND_MEMD | KIND_VMMGR | KIND_FLAGS)
 }
 
 

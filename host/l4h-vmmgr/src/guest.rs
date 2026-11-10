@@ -612,7 +612,8 @@ impl Guest {
             first.get_or_insert(self_cap::<cap_type::Granule>(copy));
         }
         let kick_slot = self.dev_cn.absolute_cptr_from_bits_with_depth(d as u64, abi::ROOT_CNODE_BITS);
-        kick_slot.copy(&abs(kick), CapRights::write_only()).expect("USB kick cap");
+        // usbd's kick, which root minted: the guest rings it.
+        l4h_task::edge::pass(&kick_slot, &wiring::VMM_USBD_KICK, &abs(kick)).expect("USB kick cap");
         self.devices.must_push(GuestDev { kind: DevKind::Usb(n as u8), page: first? });
         self.usbs += 1;
         Some(d)
@@ -917,10 +918,26 @@ impl Guest {
         info!("l4h-vmmgr: guest {} '{}' started", self.id, self.name);
     }
 
-    /// Stop all threads of the guest and its VMM.
+    /// Stop all threads of the guest and its VMM, for good: a stopped
+    /// guest is only destroyed.  The guest needs its kTCBs and SC_Us with
+    /// every right (it starts its other vCPUs with WriteRegisters, arms
+    /// their timers, binds SC_U to its tasks), and a TCB capability has no
+    /// rights to take away, so suspending the kTCBs is not enough: a thread
+    /// of the guest's still running on an SC_U could resume them, or bind
+    /// that SC_U again.  First every capability the guest has of them goes
+    /// (copies of ours, which revoking ours deletes; it can make no SC of
+    /// its own), so nothing of it can touch them any more; then the kTCBs
+    /// stop and every SC lets go of whatever thread, notification or call
+    /// chain it was bound to, so none of the guest's threads runs.
     pub fn stop(&mut self) {
         for v in &self.vcpus {
+            let _ = abs(v.ktcb).revoke();
+            let _ = abs(v.sc_u).revoke();
+        }
+        for v in &self.vcpus {
             let _ = v.ktcb.tcb_suspend();
+            let _ = v.sc_k.unbind();
+            let _ = v.sc_u.unbind();
         }
         if let Some(v) = &self.vmm {
             let _ = v.tcb.tcb_suspend();

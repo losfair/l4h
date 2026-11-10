@@ -34,6 +34,7 @@ use core::sync::atomic::{Ordering, fence};
 use l4h_rt::host::errno::Errno;
 use l4h_rt::host::fixed::ArrayVec;
 use l4h_rt::host::net::{self, NetdConfig};
+use l4h_rt::host::spsc::{Consumer, Producer};
 use l4h_rt::sel4;
 use l4h_rt::{Info, cap, host};
 use sel4::cap_type;
@@ -54,7 +55,8 @@ const FDB_MAX_TOTAL: usize = 8192;
 const FDB_SLOTS: usize = 2 * FDB_MAX_TOTAL;
 const _: () = assert!(FDB_SLOTS.is_power_of_two() && net::MAX_SWITCHES <= u8::MAX as usize);
 /// Frames held for a guest whose RX ring is full, and the pool chunks
-/// they may take (all backlogs together take at most pool::BYTES).
+/// they may take (all backlogs together take at most pool::BYTES, and
+/// each leaves the others their reserve and a share, pool::Pool::push).
 /// Dropping them instead costs TCP a retransmission timeout whenever a
 /// burst outruns the ring (24 slots); a guest that stops reading costs
 /// only its own backlog.
@@ -96,6 +98,10 @@ struct GuestPort {
     /// isolated (other guests' normal ports and the uplink).
     isolated: bool,
     client: sel4::cap::Notification,
+    /// Our indices of the port's rings: the client can write over the
+    /// port's copies.
+    tx: Consumer,
+    rx: Producer,
     /// The client must be told about new RX frames or freed TX slots.
     signal: bool,
     rx_frames: u64,
@@ -312,7 +318,7 @@ impl Netd {
                     hdr[0] = 0;
                 }
                 // Behind a backlog, or no room: hold the frame (in order).
-                if p.backlog.is_empty() && rx_put(p.chan, &*frame, hdr) {
+                if p.backlog.is_empty() && rx_put(p, &*frame, hdr) {
                     p.rx_frames += 1;
                     p.signal = true;
                 } else {
@@ -495,7 +501,7 @@ impl Netd {
         let Some(p) = self.ports[i].as_mut() else { return };
         loop {
             while let Some(f) = self.pool.front(&p.backlog) {
-                if !rx_put(p.chan, &f, &f.hdr) {
+                if !rx_put(p, &f, &f.hdr) {
                     break;
                 }
                 self.pool.pop(&mut p.backlog);
@@ -509,7 +515,7 @@ impl Netd {
             }
             // The client may have freed slots before it saw rx_wanted.
             fence(Ordering::SeqCst);
-            if rx_full(p.chan) {
+            if rx_full(p) {
                 return;
             }
         }
@@ -519,34 +525,26 @@ impl Netd {
     /// whether the byte budget left any of this snapshot for the next turn.
     fn port_tx(&mut self, i: usize) -> bool {
         let Some(p) = self.ports[i].as_ref() else { return false };
-        let chan = p.chan;
+        let (chan, mut tx) = (p.chan, p.tx);
         let limited = self.links.iter().flatten().any(|link| link.switch == p.switch);
-        let frame = core::mem::take(&mut self.buf);
-        // The indices are the client's: at most one ring's worth per kick,
-        // and nothing at all from a ring that claims more.
-        let pending = unsafe { addr_of!((*chan).tx.head).read_volatile().wrapping_sub(addr_of!((*chan).tx.tail).read_volatile()) };
-        if pending as usize > net::RING_SIZE {
+        // The head is the client's: at most one ring's worth per kick, and
+        // nothing at all from a ring that claims more.
+        let Some(pending) = (unsafe { tx.pending(&(*chan).tx) }) else {
             if let Some(p) = self.ports[i].as_mut() {
                 p.drops += 1;
             }
-            self.buf = frame;
             return false;
-        }
+        };
+        let frame = core::mem::take(&mut self.buf);
         let mut bytes = 0;
         let mut more = false;
         for index in 0..pending {
             let (n, mut hdr) = unsafe {
-                let tail = addr_of!((*chan).tx.tail).read_volatile();
-                if tail == addr_of!((*chan).tx.head).read_volatile() {
-                    break;
-                }
-                fence(Ordering::Acquire);
-                let slot = addr_of!((*chan).tx_slots[tail as usize % net::RING_SIZE]);
+                let slot = addr_of!((*chan).tx_slots[tx.slot()]);
                 let n = (addr_of!((*slot).len).read_volatile() as usize).min(net::MAX_FRAME);
                 core::ptr::copy_nonoverlapping(addr_of!((*slot).data) as *const u8, frame.as_mut_ptr(), n);
                 let hdr = addr_of!((*slot).hdr).read_volatile();
-                fence(Ordering::Release);
-                addr_of_mut!((*chan).tx.tail).write_volatile(tail.wrapping_add(1));
+                tx.pop(&(*chan).tx);
                 (n, hdr)
             };
             self.forward(PortId::Guest(i), &mut frame[..n], &mut hdr);
@@ -557,7 +555,9 @@ impl Netd {
             }
         }
         self.buf = frame;
+        // Switching does not touch this port's TX ring.
         if let Some(p) = self.ports[i].as_mut() {
+            p.tx = tx;
             p.signal = true;
         }
         more
@@ -640,7 +640,7 @@ impl Netd {
         for p in self.ports.iter_mut().flatten() {
             if p.signal {
                 p.signal = false;
-                p.client.signal();
+                l4h_rt::mailbox::notify(p.client);
             }
         }
     }
@@ -655,27 +655,22 @@ impl Netd {
     }
 }
 
-fn rx_full(chan: *mut net::Port) -> bool {
-    unsafe {
-        let head = addr_of!((*chan).rx.head).read_volatile();
-        let tail = addr_of!((*chan).rx.tail).read_volatile();
-        head.wrapping_sub(tail) as usize >= net::RING_SIZE
-    }
+/// Whether port `p`'s RX ring is full, or its client broke the tail.
+fn rx_full(p: &GuestPort) -> bool {
+    unsafe { p.rx.free(&(*p.chan).rx) == 0 }
 }
 
 /// Put a frame into a port's RX ring; false if it is full.
-fn rx_put(chan: *mut net::Port, frame: &(impl Frame + ?Sized), hdr: &[u8; net::HDR_SIZE]) -> bool {
-    if rx_full(chan) {
+fn rx_put(p: &mut GuestPort, frame: &(impl Frame + ?Sized), hdr: &[u8; net::HDR_SIZE]) -> bool {
+    if rx_full(p) {
         return false;
     }
     unsafe {
-        let head = addr_of!((*chan).rx.head).read_volatile();
-        let slot = addr_of_mut!((*chan).rx_slots[head as usize % net::RING_SIZE]);
+        let slot = addr_of_mut!((*p.chan).rx_slots[p.rx.slot()]);
         frame.copy_to(core::slice::from_raw_parts_mut(addr_of_mut!((*slot).data) as *mut u8, frame.len()));
         addr_of_mut!((*slot).hdr).write_volatile(*hdr);
         addr_of_mut!((*slot).len).write_volatile(frame.len() as u32);
-        fence(Ordering::Release);
-        addr_of_mut!((*chan).rx.head).write_volatile(head.wrapping_add(1));
+        p.rx.push(&(*p.chan).rx);
     }
     true
 }
@@ -713,6 +708,9 @@ impl net::call::Server for Commands<'_> {
             uplink,
             isolated: flags & net::NETD_PORT_ISOLATED != 0,
             client: cap::<cap_type::Notification>(net::NETD_SLOT_CLIENT_BASE + i as u64),
+            // Root gave fresh port memory: both rings start empty.
+            tx: Consumer::new(net::RING_SIZE),
+            rx: Producer::new(net::RING_SIZE),
             signal: true,
             rx_frames: 0,
             tx_frames: 0,

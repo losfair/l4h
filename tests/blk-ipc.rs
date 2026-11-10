@@ -90,7 +90,7 @@ pub mod mailbox {
             if pending_io {
                 // A client publishes work while root's request is taken.
                 // submit() must notify the hardware.
-                unsafe { (*crate::channel()).sq.head = 1; }
+                unsafe { (*crate::channel()).sq.head.store(1, Ordering::Relaxed); }
             }
             let mut words = [0; 5];
             if f(label, &args, &mut words).is_none() {
@@ -101,6 +101,8 @@ pub mod mailbox {
         }
     }
     pub fn signal() {}
+    /// blkd's signal of a client: counted as the kernel's.
+    pub fn notify(client: crate::sel4::cap::Notification) { client.signal(); }
 }
 
 mod production {
@@ -321,7 +323,7 @@ fn a_split_request_waits_for_room_and_drains_on_remove() {
     config.dma_va = staging.as_ptr() as u64;
     let info = Box::leak(Box::new(Info { header: Header { id: 1, tsc_hz: 1_000_000_000 }, config }));
     let stopped = std::panic::catch_unwind(|| production::run(info)).unwrap_err();
-    let (cq, resp) = unsafe { ((*channel()).cq.head, (*channel()).resps[0]) };
+    let (cq, resp) = unsafe { ((*channel()).cq.head.load(Ordering::Relaxed), (*channel()).resps[0]) };
     unmap_client();
     assert!(stopped.is::<Finished>(), "service failed before sending every reply");
     KERNEL.with_borrow(|k| {
@@ -344,7 +346,7 @@ fn completion_batch_wakes_the_client_once_and_returns_every_request() {
             (*channel()).reqs[i] = blk::Req { id: i as u64, op: blk::OP_READ, nr_segs: 1, ..Default::default() };
             (*channel()).reqs[i].segs[0] = blk::Seg { gpa: 0x8000000, len: 512, flags: blk::SEG_WRITE };
         }
-        (*channel()).sq.head = 4;
+        (*channel()).sq.head.store(4, Ordering::Relaxed);
     }
     KERNEL.with_borrow_mut(|k| {
         k.ipc.0.fill(0);
@@ -359,7 +361,7 @@ fn completion_batch_wakes_the_client_once_and_returns_every_request() {
     let stopped = std::panic::catch_unwind(|| production::run(info)).unwrap_err();
     assert!(stopped.is::<Finished>());
     unsafe {
-        assert_eq!((*channel()).cq.head, 4);
+        assert_eq!((*channel()).cq.head.load(Ordering::Relaxed), 4);
         for i in 0..4 { assert_eq!(((*channel()).resps[i].id, (*channel()).resps[i].status), (i as u64, blk::STATUS_OK)); }
     }
     unmap_client();

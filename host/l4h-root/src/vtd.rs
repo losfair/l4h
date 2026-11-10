@@ -428,12 +428,19 @@ impl Vtd {
             use sel4::init_thread::slot;
             let chunks = self.chunks.as_mut().unwrap();
             assert!(!chunks.is_full(), "VT-d: out of table space");
-            let (ut, page) = alloc.slots.global(|s| (s.alloc(), s.alloc()));
-            let mut region = alloc.split(CHUNK_BITS, ut).expect("VT-d: no memory for tables");
-            let pa = region.retype(&LARGE_PAGE_BP, 1, crate::mem::Dest::new(crate::slot::CNODE.cap(), page)).expect("VT-d table chunk");
             let va = crate::layout::IOMMU_TABLES.base + (chunks.len() << CHUNK_BITS);
-            let cap = sel4::init_thread::Slot::<sel4::cap_type::LargePage>::from_index(page).cap();
-            map_large_page(&mut crate::mem::ObjCtx::global(alloc), slot::VSPACE.cap(), cap, va, sel4::CapRights::read_write());
+            // Root's for good, whichever guest's mapping needs it: the
+            // chunk's slots, and those of the page directory every 1 GiB
+            // of chunks takes, must not be recorded as that guest's, or
+            // they would be deleted with it.
+            let pa = alloc.global(|alloc| {
+                let (ut, page) = (alloc.slots.alloc(), alloc.slots.alloc());
+                let mut region = alloc.split(CHUNK_BITS, ut).expect("VT-d: no memory for tables");
+                let pa = region.retype(&LARGE_PAGE_BP, 1, crate::mem::Dest::new(crate::slot::CNODE.cap(), page)).expect("VT-d table chunk");
+                let cap = sel4::init_thread::Slot::<sel4::cap_type::LargePage>::from_index(page).cap();
+                map_large_page(&mut crate::mem::ObjCtx::global(alloc), slot::VSPACE.cap(), cap, va, sel4::CapRights::read_write());
+                pa
+            });
             chunks.push((va, pa)).ok().unwrap();
             self.used = 0;
         }

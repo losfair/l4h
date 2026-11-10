@@ -4,11 +4,19 @@
 //! frames.  Every backlog takes from the same pool, so its limits are
 //! checks against it, and running out drops a frame instead of growing a
 //! heap (DESIGN.md §10).  Free of seL4 dependencies, like offload.rs.
+//!
+//! Backlogs that stop draining (a guest that stops reading, a stuck
+//! uplink) must not take the room of the others.  The pool keeps RESERVED
+//! chunks for each backlog, whatever the others hold, and backlogs share
+//! the rest: a backlog may take more of it only while what it holds of it
+//! stays no more than what is left of it.  However many stall, then, each
+//! other backlog has its reserve, and a share of what remains.
 
 use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::offload::HDR_SIZE;
+use l4h_rt::host::net;
 
 pub const CHUNK: usize = 2048;
 /// Bytes held in all backlogs, guest ports' and NICs' together.
@@ -16,6 +24,13 @@ pub const BYTES: usize = 16 << 20;
 pub const CHUNKS: usize = BYTES / CHUNK;
 const NIL: u16 = u16::MAX;
 const _: () = assert!(CHUNKS < NIL as usize);
+/// Backlogs, at most: each guest port's and each NIC's.
+pub const BACKLOGS: usize = net::MAX_PORTS + net::MAX_NICS;
+/// Chunks kept for each backlog: two frames of any size.
+pub const RESERVED: usize = 2 * net::MAX_FRAME.div_ceil(CHUNK);
+/// Chunks the backlogs share beyond their reserves.
+pub const SHARED: usize = CHUNKS - BACKLOGS * RESERVED;
+const _: () = assert!(BACKLOGS * RESERVED < CHUNKS);
 
 /// A held frame's length, header and successor in its FIFO, kept with
 /// its first chunk.
@@ -33,6 +48,8 @@ pub struct Pool {
     meta: [Meta; CHUNKS],
     free: u16,
     nfree: usize,
+    /// Chunks the backlogs hold beyond their reserves, of SHARED.
+    over: usize,
 }
 
 /// Zero, so that it takes no room in the image (.bss); take() links it.
@@ -42,6 +59,7 @@ static mut POOL: Pool = Pool {
     meta: [Meta { len: 0, hdr: [0; HDR_SIZE], next: 0 }; CHUNKS],
     free: 0,
     nfree: 0,
+    over: 0,
 };
 static TAKEN: AtomicBool = AtomicBool::new(false);
 
@@ -109,15 +127,22 @@ pub fn take() -> &'static mut Pool {
     }
     p.free = 0;
     p.nfree = CHUNKS;
+    p.over = 0;
     p
 }
 
 impl Pool {
-    /// Append a frame to `q` if it fits: in `q`'s limits (frames, chunks)
-    /// and in the chunks free.
+    /// Append a frame to `q` if it fits: in `q`'s limits (frames, chunks),
+    /// in its reserve or its share of the shared chunks, and in the chunks
+    /// free.  There are at most BACKLOGS FIFOs.
     pub fn push(&mut self, q: &mut Fifo, frame: &[u8], hdr: &[u8; HDR_SIZE], max_frames: usize, max_chunks: usize) -> bool {
         let need = frame.len().div_ceil(CHUNK).max(1);
-        if q.frames >= max_frames || q.chunks + need > max_chunks || need > self.nfree {
+        let held = q.chunks.saturating_sub(RESERVED);
+        let after = (q.chunks + need).saturating_sub(RESERVED);
+        // With more of the shared chunks, q may hold no more of them than
+        // are left: SHARED - (self.over + after - held) >= after.
+        let shared_ok = after == held || self.over - held + 2 * after <= SHARED;
+        if q.frames >= max_frames || q.chunks + need > max_chunks || !shared_ok || need > self.nfree {
             return false;
         }
         // The free list's first `need` chunks are already a chain.
@@ -141,6 +166,7 @@ impl Pool {
         q.tail = first;
         q.frames += 1;
         q.chunks += need;
+        self.over += after - held;
         true
     }
 
@@ -167,8 +193,10 @@ impl Pool {
         if q.head == NIL {
             q.tail = NIL;
         }
+        let held = q.chunks.saturating_sub(RESERVED);
         q.frames -= 1;
         q.chunks -= need;
+        self.over -= held - q.chunks.saturating_sub(RESERVED);
     }
 
     /// Drop every frame of `q`.

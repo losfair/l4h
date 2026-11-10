@@ -9,7 +9,9 @@
 //! headers and checks its TCP segmentation, and checks that a virtio-blk
 //! reset waits for every request blkd has (host/l4h-vmm/src/blk.rs),
 //! whatever the guest puts in the avail ring, and that no request with a
-//! buffer outside the pool reaches blkd.
+//! buffer outside the pool reaches blkd, nor any blkd index the VMM's own.
+//! Also that netd's backlog pool (host/l4h-netd/src/pool.rs) keeps every
+//! backlog's reserve however many others stall.
 
 #![allow(dead_code)]
 
@@ -36,6 +38,9 @@ mod virtq;
 
 #[path = "../../../host/l4h-netd/src/offload.rs"]
 mod offload;
+
+#[path = "../../../host/l4h-netd/src/pool.rs"]
+mod pool;
 
 // The production block backend and device model use fake seL4 notifications
 // and guest event delivery. blkcheck.rs plays the hardware service.  The
@@ -65,6 +70,7 @@ mod dev;
 mod blk;
 
 mod blkcheck;
+mod poolcheck;
 
 use guest::GuestMem;
 
@@ -182,6 +188,8 @@ fn main() {
     println!("fuzz-virtq: GRO: {} streams, {merged} merged frames segment back exactly", iterations / 20);
     let (reqs, bad) = blkcheck::drain_check(&mut rng, iterations / 20);
     println!("fuzz-virtq: blk: {} resets, {reqs} requests drained, {bad} chains outside the pool refused", iterations / 20);
+    let frames = poolcheck::check(&mut rng, iterations);
+    println!("fuzz-virtq: netd backlog pool: {frames} frames held, every reserve kept");
 }
 
 /// Chains whose buffers or indirect tables end exactly at the end of the

@@ -13,7 +13,7 @@ use l4h_task::memd::MemdLink;
 use crate::component::abs_of;
 use crate::mem::{Alloc, Slot};
 
-/// memd's endpoint, mailbox, and status mapping, installed by root.
+/// memd's endpoint, exchange area, and status mapping, installed by root.
 pub fn link() -> MemdLink {
     // Root maps the read-only status record for this task's lifetime.
     unsafe {

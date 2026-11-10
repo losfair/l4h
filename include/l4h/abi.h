@@ -590,12 +590,14 @@ enum l4h_ctl_op {
 	L4H_CTL_VM_MEM_INFO = 29,
 	/* vm -> taint bits 0-63, seal bits 0-63 (host actions only) */
 	L4H_CTL_VM_TRUST = 30,
-	/* Host diagnostics, readable only by dom0. args: sequence cursor (0
-	 * starts at boot), snapshot end (0 selects current head). vals: next
-	 * cursor, data bytes, lost records, snapshot end. Data is whole UTF-8
-	 * lines with seconds since host start and component id (root: 0).
-	 * Reads do not consume records. Lost includes overwritten, dropped or
-	 * concurrently publishing records. A future cursor returns EINVAL. */
+	/* Host diagnostics, readable only by dom0. args: cursor (0 starts at
+	 * boot), snapshot end (0 selects now); both are host times, in ticks,
+	 * to pass back as they come. vals: next cursor, data bytes, lost
+	 * records, snapshot end. Data is whole UTF-8 lines, oldest first, with
+	 * seconds since host start and the id of the component whose log the
+	 * line is in (root: 0); control characters are replaced. Reads do not
+	 * consume records. Lost includes overwritten, dropped or concurrently
+	 * publishing records. A future cursor returns EINVAL. */
 	L4H_CTL_LOG_READ = 31,
 	/* Steering (DESIGN.md §9.3): dom0 hands part of an address's traffic
 	 * to another port, rewriting only MAC addresses.

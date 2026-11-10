@@ -31,9 +31,9 @@ impl Memd {
         }
         for (n, &i) in got[..count].iter().enumerate() {
             let from = abs(self.mem.slot(i, k));
-            // Whatever vmmgr left in its mailbox must not make us fail, nor
-            // a slot it fills again before we do (from another thread):
-            // that fails the call.
+            // Whatever vmmgr left in its exchange area must not make us
+            // fail, nor a slot it fills again before we do (from another
+            // thread): that fails the call.
             let given = match c {
                 Client::Root => granted(c, n).move_(&from).is_ok(),
                 Client::Vmmgr => {

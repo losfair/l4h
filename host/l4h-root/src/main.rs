@@ -76,6 +76,8 @@ static ALLOC_STORAGE: StaticCell<mem::AllocStorage> = StaticCell::new(mem::Alloc
 static LOG: host::log::Ring = host::log::Ring::new();
 /// Partition 0's serial ring. A secondary only starts on it.
 static SERIAL: host::serial::Ring = host::serial::Ring::new();
+/// Partition 0's other writers' serial lanes (unused in a secondary).
+static SERIAL_LANES: host::serial::Lanes = host::serial::Lanes::new();
 pub const MAX_GUESTS: usize = 64;
 /// What root made for vmmgr's guests, by id.
 static GUESTS: StaticCell<[Option<RootGuest>; MAX_GUESTS]> = StaticCell::new([const { None }; MAX_GUESTS]);
@@ -104,6 +106,8 @@ pub struct HostInfo {
     pub tsc_hz: u64,
     log_frames: u64,
     serial_frames: u64,
+    /// SERIAL_LANES' first frame, in partition 0.
+    serial_lanes: Option<u64>,
     /// AArch64 feature ID registers for the guests' bootinfo (`cpu_id`).
     pub cpu_id: [u64; 5],
     pub hyp_ep: cap::Endpoint,
@@ -125,11 +129,16 @@ impl HostInfo {
             tsc_hz: self.tsc_hz,
             log_frames: self.log_frames,
             serial_frames: self.serial_frames,
+            serial_lanes: self.serial_lanes,
         }
     }
 
     pub fn serial_frames(&self) -> u64 {
         self.serial_frames
+    }
+
+    pub fn serial_lanes(&self) -> Option<u64> {
+        self.serial_lanes
     }
 
     pub fn sched_control(&self, core: usize) -> cap::SchedControl {
@@ -431,6 +440,12 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
             bootinfo.user_image_frames().index(i).cap().bits()
         },
         serial_frames,
+        // logd reads lanes in partition 0; a secondary's tasks share its ring.
+        serial_lanes: (!partition::secondary()).then(|| {
+            let first = (&raw const SERIAL_LANES) as usize;
+            assert!((first - layout::image_base()) / 4096 + host::serial::LANES_PAGES <= bootinfo.user_image_frames().len());
+            image_frame(first)
+        }),
         cpu_id: cpu_id(bootinfo),
         hyp_ep,
         sched_control_base: bootinfo.sched_control().range().start,

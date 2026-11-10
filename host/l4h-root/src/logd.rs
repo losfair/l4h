@@ -15,6 +15,10 @@ use crate::mem::{Alloc, Arena, Slot};
 use crate::window::Window;
 
 pub const LOGD_ID: u32 = 0x600;
+// The lanes are laid out by component id (host::log::Writer).
+const _: () = assert!(LOGD_ID == host::log::LOGD_ID && crate::memd::MEMD_ID == host::log::MEMD_ID
+    && crate::blkd::BLKD_ID_BASE == host::log::BLKD_ID_BASE && crate::pci::MAX_DISK_CTRLS <= host::log::MAX_BLKDS
+    && crate::MAX_GUESTS <= host::log::MAX_VMMS);
 static LOGD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/l4h-logd.elf"));
 
 /// logd's share of a core: a VM's UART takes output as fast as it comes.
@@ -101,7 +105,9 @@ pub fn spawn(
         return None;
     }
     let fb_pages = fb.as_ref().map_or(0, |f| f.frames.len());
-    let ring_pages = serial::MAX_RINGS * (serial::PAGES + l4h_partition::CONSOLE_RING_SIZE as usize / PAGE);
+    // Every ring, partition 0's lanes and logd's own lane.
+    let ring_pages = serial::MAX_RINGS * (serial::PAGES + l4h_partition::CONSOLE_RING_SIZE as usize / PAGE)
+        + serial::LANES_PAGES + serial::PAGES;
     let pages = fb_pages + ring_pages + 1;
     let keep_bits = pages.next_power_of_two().trailing_zeros() as usize;
     let mut arena = alloc
@@ -119,6 +125,8 @@ pub fn spawn(
         fb_width: 0,
         fb_height: 0,
         fb_offset: 0,
+        lanes: info.serial_lanes().is_some() as u32,
+        _pad2: 0,
     };
     if let Some(f) = &fb {
         cfg.fb_pitch = f.pitch as u32;

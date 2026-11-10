@@ -115,10 +115,12 @@ impl Screen {
 fn main(info: &'static Info) -> ! {
     // Root wrote this configuration for KIND_LOGD.
     let cfg: &LogdConfig = unsafe { info.config() };
-    let home = unsafe { &*(serial::VA as *const Ring) };
+    // Root's ring, which root mapped for us at partition 0's place among
+    // the rings (serial::VA has our own lane).
+    let home = unsafe { &*(serial::RINGS_VA as *const Ring) };
     let hz = cfg.tsc_hz;
     let mut merge = Merge::new(home, hz / 10);
-    cfg.add_inputs(&mut merge, serial::RINGS_VA, serial::KERNEL_RINGS_VA);
+    cfg.add_inputs(&mut merge, serial::RINGS_VA, serial::KERNEL_RINGS_VA, serial::LANES_VA);
     let port = open_port(cfg);
     let mut screen = Screen::new(cfg);
     loop {

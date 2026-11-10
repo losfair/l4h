@@ -99,13 +99,16 @@ pub fn guest_del(id: usize) {
 }
 
 /// A window of host disk `disk`, or (n, offset) extents in dom0's control
-/// data area, for guest `id`'s device `d`: its channel.  `flags`:
-/// abi::BLK_*.
-#[allow(clippy::too_many_arguments)]
-pub fn disk_attach(alloc: &mut Alloc, id: usize, d: usize, disk: usize, flags: u64, lba_start: u64, lba_count: u64,
-    (n, offset): (u64, u64)) -> Result<Later<Backend>, Errno> {
-    let r = errno(root().disk_attach(id, d, disk, flags, lba_start, lba_count, n as usize, offset))?;
-    Ok(r.map(|()| disk_backend(alloc)))
+/// data area, for guest `id`: the token of its answer, which root gives
+/// after blkd's (`disk_attach_result`).  `flags`: abi::BLK_*.
+pub fn disk_attach(id: usize, disk: usize, flags: u64, lba_start: u64, lba_count: u64,
+    (n, offset): (u64, u64)) -> Result<usize, Errno> {
+    let n = usize::try_from(n).map_err(|_| ctl::EINVAL)?;
+    match errno(root().disk_attach(id, disk, flags, lba_start, lba_count, n, offset))? {
+        Later::Token(t) => Ok(t),
+        // Root answers a disk only later: the channel comes with `result`.
+        Later::Now(()) => Err(l4h_host::errno::EIO),
+    }
 }
 
 /// The channel of disk attachment `token` (disk_attach), now that root
@@ -134,27 +137,27 @@ fn drop_cap<T: sel4::CapType>(alloc: &mut Alloc, c: sel4::Cap<T>) {
 fn disk_backend(alloc: &mut Alloc) -> Backend {
     let mut chan = ArrayVec::new();
     for i in 0..host::blk::CHANNEL_PAGES {
-        chan.must_push(take(alloc, caps::disk_attach::CHANNEL, i));
+        chan.must_push(take(alloc, caps::result::CHANNEL, i));
     }
-    let kick = take(alloc, caps::disk_attach::KICK, 0);
+    let kick = take(alloc, caps::result::KICK, 0);
     Backend::Blk { chan, kick }
 }
 
-/// A port of netd's `switch` for guest `id`'s device `d`.  The VMM's
-/// mappings of it are kept in a CNode of `arena`.
+/// A port of netd's `switch` for guest `id`.  The VMM's mappings of it
+/// are kept in a CNode of `arena`.
 #[allow(clippy::too_many_arguments)]
-pub fn nic_add(alloc: &mut Alloc, arena: &mut Arena, id: usize, d: usize, switch: u32, mac: u64, lock: bool, isolated: bool) -> Result<Backend, Errno> {
+pub fn nic_add(alloc: &mut Alloc, arena: &mut Arena, id: usize, switch: u32, mac: u64, lock: bool, isolated: bool) -> Result<Backend, Errno> {
     let keep = arena.try_object(alloc, sel4::ObjectBlueprint::CNode { size_bits: proto::PORT_RADIX }).ok_or(ctl::ENOMEM)?;
-    let mac = errno(root().nic_add(id, d, switch, mac, lock, isolated))?.to_be_bytes();
+    let mac = errno(root().nic_add(id, switch, mac, lock, isolated))?.to_be_bytes();
     let chan = take(alloc, caps::nic_add::PORT_FRAMES, 0);
     let kick = take(alloc, caps::nic_add::KICK, 0);
     Ok(Backend::Net { chan, kick, mac: mac[2..8].try_into().unwrap(), keep: sel4::Cap::from_bits(keep as u64) })
 }
 
-/// USB controller `ctrl` for guest `id`'s device `d`: the CNode of its
-/// queue area's frames, usbd's kick, and the guest's USB number.
-pub fn usb_attach(alloc: &mut Alloc, id: usize, d: usize, ctrl: usize) -> Result<(cap::CNode, cap::Notification, usize), Errno> {
-    let n = errno(root().usb_attach(id, d, ctrl))? as usize;
+/// USB controller `ctrl` for guest `id`: the CNode of its queue area's
+/// frames, usbd's kick, and the guest's USB number.
+pub fn usb_attach(alloc: &mut Alloc, id: usize, ctrl: usize) -> Result<(cap::CNode, cap::Notification, usize), Errno> {
+    let n = usize::try_from(errno(root().usb_attach(id, ctrl))?).map_err(|_| l4h_host::errno::EIO)?;
     Ok((take(alloc, caps::usb_attach::QUEUE_FRAMES, 0), take(alloc, caps::usb_attach::KICK, 0), n))
 }
 

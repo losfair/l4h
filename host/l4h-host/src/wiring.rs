@@ -28,6 +28,8 @@ pub enum Party {
     Vmmgr,
     Memd,
     Trustd,
+    /// trustd's flags server (host::KIND_FLAGS).
+    Flags,
     Blkd,
     Netd,
     Usbd,
@@ -46,6 +48,7 @@ impl Party {
             Party::Vmmgr => crate::KIND_VMMGR,
             Party::Memd => crate::KIND_MEMD,
             Party::Trustd => crate::KIND_TRUSTD,
+            Party::Flags => crate::KIND_FLAGS,
             Party::Blkd => crate::KIND_BLKD,
             Party::Netd => crate::KIND_NETD,
             Party::Usbd => crate::KIND_USBD,
@@ -60,14 +63,12 @@ impl Party {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Object {
     /// Its endpoint: a component's service endpoint, root's or vmmgr's,
-    /// a VMM's hypercall endpoint.
+    /// the flags server's, a VMM's hypercall endpoint.
     Endpoint,
     /// The notification bound to its thread.
     Notification,
     /// trustd's kick notification (trust::SLOT_KICK).
     Kick,
-    /// trustd's flags endpoint (trust::call).
-    Flags,
     /// A guest vCPU's notification (abi::BADGE_*).
     Vcpu,
 }
@@ -154,6 +155,10 @@ pub struct Edge {
     /// design (a device's kick slot holds one of several kicks; a bit two
     /// sources signal the same news on).
     pub shared: bool,
+    /// A call edge whose capabilities are copies of this other edge's,
+    /// passed on (its name; "" if none): only such a pair may share a
+    /// badge on an endpoint.
+    pub copy_of: &'static str,
     /// What it is for, in the words a failed mint reports.
     pub what: &'static str,
 }
@@ -198,7 +203,7 @@ pub mod p {
             }
         )*};
     }
-    parties!(Root, Vmmgr, Memd, Trustd, Blkd, Netd, Usbd, Logd, Vmm, Guest, Irq);
+    parties!(Root, Vmmgr, Memd, Trustd, Flags, Blkd, Netd, Usbd, Logd, Vmm, Guest, Irq);
 }
 
 /// The objects as types.
@@ -219,7 +224,7 @@ pub mod o {
             }
         )*};
     }
-    objects!(Endpoint, Notification, Kick, Flags, Vcpu);
+    objects!(Endpoint, Notification, Kick, Vcpu);
 }
 
 /// An edge with its holder H, its target T's object O and, for a call,
@@ -264,7 +269,7 @@ const fn served(target: Party, object: Object) -> &'static str {
         (Memd, Endpoint) => <crate::memd::call::Proto as Protocol>::NAME,
         (Root, Endpoint) => <crate::root::call::Proto as Protocol>::NAME,
         (Vmmgr, Endpoint) => <vmmgr::call::Proto as Protocol>::NAME,
-        (Trustd, Flags) => <trust::call::Proto as Protocol>::NAME,
+        (Flags, Endpoint) => <trust::call::Proto as Protocol>::NAME,
         (Vmm, Endpoint) => <crate::hypercall::call::Proto as Protocol>::NAME,
         _ => "none",
     }
@@ -287,7 +292,12 @@ const fn same_str(a: &str, b: &str) -> bool {
 
 const fn edge(name: &'static str, holder: Party, at: At, target: Party, object: Object, rights: Rights, badge: Badge,
     instances: usize, minted_by: Party, what: &'static str) -> Edge {
-    Edge { name, holder, at, target, object, rights, badge, instances, minted_by, protocol: "", shared: false, what }
+    Edge { name, holder, at, target, object, rights, badge, instances, minted_by, protocol: "", shared: false, copy_of: "", what }
+}
+
+/// `e`, whose capabilities are copies of edge `of`'s.
+const fn copy(e: Edge, of: &'static str) -> Edge {
+    Edge { copy_of: of, ..e }
 }
 
 const fn shared(e: Edge) -> Edge {
@@ -296,7 +306,7 @@ const fn shared(e: Edge) -> Edge {
 
 use At::{Bound, Chosen, Fault as AtFault, Slots};
 use Badge::{Bit, Field, Fixed};
-use Object::{Endpoint, Flags, Kick, Notification, Vcpu};
+use Object::{Endpoint, Kick, Notification, Vcpu};
 use Party::*;
 use Rights::{Bind, Call, Fault, KeeperFault, Signal};
 
@@ -314,28 +324,26 @@ pub const VMMGR_MEMD: E<p::Vmmgr, p::Memd, o::Endpoint, crate::memd::call::Proto
 pub const VMMGR_VMM_MEMD: E<p::Vmmgr, p::Memd, o::Endpoint, crate::memd::call::Proto> = E::new(edge("VMMGR_VMM_MEMD", Vmmgr, Slots(vmmgr::SLOT_VMM_MEMD_EP, MAX_GUESTS), Memd, Endpoint, Call,
     Field(badges::memd::VMM, badges::memd::GUEST), MAX_GUESTS, Root,
     "guest g's VMM's, which vmmgr cannot mint and copies to it (VMM_MEMD)"));
-pub const VMM_MEMD: E<p::Vmm, p::Memd, o::Endpoint, crate::memd::call::Proto> = E::new(edge("VMM_MEMD", Vmm, Slots(crate::VMM_SLOT_MEMD_EP, 1), Memd, Endpoint, Call,
-    Field(badges::memd::VMM, badges::memd::GUEST), MAX_GUESTS, Root, "a VMM's memory hotplug (VMMGR_VMM_MEMD's copy)"));
+pub const VMM_MEMD: E<p::Vmm, p::Memd, o::Endpoint, crate::memd::call::Proto> = E::new(copy(edge("VMM_MEMD", Vmm, Slots(crate::VMM_SLOT_MEMD_EP, 1), Memd, Endpoint, Call,
+    Field(badges::memd::VMM, badges::memd::GUEST), MAX_GUESTS, Root, "a VMM's memory hotplug (VMMGR_VMM_MEMD's copy)"), "VMMGR_VMM_MEMD"));
 pub const TRUSTD_ROOT: E<p::Trustd, p::Root, o::Endpoint, crate::root::call::Proto> = E::new(edge("TRUSTD_ROOT", Trustd, Slots(crate::SLOT_ROOT_EP, 1), Root, Endpoint, Call,
     Fixed(crate::root::Sender::Trustd.badge()), 1, Root, "trustd's calls to root (root::call)"));
 pub const VMMGR_ROOT: E<p::Vmmgr, p::Root, o::Endpoint, crate::root::call::Proto> = E::new(edge("VMMGR_ROOT", Vmmgr, Slots(crate::SLOT_ROOT_EP, 1), Root, Endpoint, Call,
     Fixed(crate::root::Sender::Vmmgr.badge()), 1, Root, "vmmgr's calls to root (root::call)"));
 pub const VMM_VMMGR: E<p::Vmm, p::Vmmgr, o::Endpoint, vmmgr::call::Proto> = E::new(edge("VMM_VMMGR", Vmm, Slots(crate::SLOT_ROOT_EP, 1), Vmmgr, Endpoint, Call,
     Field(badges::vmmgr::COMPONENT, badges::vmmgr::ID), MAX_GUESTS, Vmmgr, "a VMM's calls to vmmgr (vmmgr::call)"));
-pub const ROOT_FLAGS: E<p::Root, p::Trustd, o::Flags, trust::call::Proto> = E::new(edge("ROOT_FLAGS", Root, Chosen, Trustd, Flags, Call,
-    Fixed(trust::Sender::Root.badge()), 1, Root, "the host's flags (trust::call), root's start-up handshake"));
-pub const VMMGR_FLAGS: E<p::Vmmgr, p::Trustd, o::Flags, trust::call::Proto> = E::new(edge("VMMGR_FLAGS", Vmmgr, Slots(vmmgr::SLOT_FLAGS_EP, 1), Trustd, Flags, Call,
-    Fixed(trust::Sender::Root.badge()), 1, Root, "the host's flags for the console (ROOT_FLAGS's copy)"));
-pub const TRUSTD_FLAGS: E<p::Trustd, p::Trustd, o::Flags, trust::call::Proto> = E::new(edge("TRUSTD_FLAGS", Trustd, Slots(trust::SLOT_FLAGS_CALL, 1), Trustd, Flags, Call,
-    Fixed(trust::Sender::Trustd.badge()), 1, Root, "trustd's main thread's for guests"));
+pub const ROOT_FLAGS: E<p::Root, p::Flags, o::Endpoint, trust::call::Proto> = E::new(edge("ROOT_FLAGS", Root, Chosen, Flags, Endpoint, Call,
+    Fixed(trust::Sender::Root.badge()), 1, Root, "the flags server's start-up handshake (trust::call)"));
+pub const VMMGR_FLAGS: E<p::Vmmgr, p::Flags, o::Endpoint, trust::call::Proto> = E::new(edge("VMMGR_FLAGS", Vmmgr, Slots(vmmgr::SLOT_FLAGS_EP, 1), Flags, Endpoint, Call,
+    Fixed(trust::Sender::Vmmgr.badge()), 1, Root, "the host actor's flags, for the console"));
+pub const TRUSTD_FLAGS: E<p::Trustd, p::Flags, o::Endpoint, trust::call::Proto> = E::new(edge("TRUSTD_FLAGS", Trustd, Slots(trust::SLOT_FLAGS_CALL, 1), Flags, Endpoint, Call,
+    Fixed(trust::Sender::Trustd.badge()), 1, Root, "trustd's main thread's flags for guests"));
 pub const GUEST_VMM: E<p::Guest, p::Vmm, o::Endpoint, crate::hypercall::call::Proto> = E::new(edge("GUEST_VMM", Guest, Slots(abi::SLOT_HYP_EP as u64, 1), Vmm, Endpoint, Call,
     Fixed(crate::hypercall::Sender::Guest.badge()), 1, Vmmgr, "the guest's hypercalls (hypercall::call)"));
 
 // ---- Faults.
 pub const TRUSTD_FAULT: E<p::Trustd, p::Root, o::Endpoint> = E::new(edge("TRUSTD_FAULT", Trustd, AtFault, Root, Endpoint, Fault,
     id_fixed(crate::root::TRUSTD_ID), 1, Root, "trustd's main thread's faults"));
-pub const FLAGS_FAULT: E<p::Trustd, p::Root, o::Endpoint> = E::new(edge("FLAGS_FAULT", Trustd, AtFault, Root, Endpoint, Fault,
-    id_fixed(crate::root::FLAGS_ID), 1, Root, "trustd's flags thread's faults, which stop the host"));
 pub const BLKD_FAULT: E<p::Blkd, p::Root, o::Endpoint> = E::new(edge("BLKD_FAULT", Blkd, AtFault, Root, Endpoint, Fault,
     Field(COMPONENT_FAULT, badges::parent::ID), 1 << 16, Root, "a blkd's faults: root quarantines it"));
 pub const NETD_FAULT: E<p::Netd, p::Root, o::Endpoint> = E::new(edge("NETD_FAULT", Netd, AtFault, Root, Endpoint, Fault,
@@ -350,6 +358,8 @@ pub const MEMD_KEEPER_FAULT: E<p::Memd, p::Root, o::Endpoint> = E::new(edge("MEM
     Field(COMPONENT_FAULT, badges::parent::ID), 1 << 16, Root, "memd's keeper's faults"));
 pub const VMMGR_KEEPER_FAULT: E<p::Vmmgr, p::Root, o::Endpoint> = E::new(edge("VMMGR_KEEPER_FAULT", Vmmgr, AtFault, Root, Endpoint, KeeperFault,
     Field(COMPONENT_FAULT, badges::parent::ID), 1 << 16, Root, "vmmgr's keeper's faults"));
+pub const FLAGS_KEEPER_FAULT: E<p::Flags, p::Root, o::Endpoint> = E::new(edge("FLAGS_KEEPER_FAULT", Flags, AtFault, Root, Endpoint, KeeperFault,
+    id_fixed(crate::root::FLAGS_ID), 1, Root, "the flags server's keeper's faults"));
 /// Guest g's vCPU v: ID and VCPU are adjacent, one field.
 const GUEST_VCPU: Bits = Bits::new(badges::vmmgr::ID.lo, badges::vmmgr::VCPU.hi);
 pub const GUEST_FAULT: E<p::Guest, p::Vmmgr, o::Endpoint> = E::new(edge("GUEST_FAULT", Guest, AtFault, Vmmgr, Endpoint, Fault,
@@ -387,8 +397,8 @@ pub const VMM_BLKD_KICK: E<p::Vmm, p::Blkd, o::Notification> = E::new(shared(edg
     Fixed(badges::blkd::KICK), 1, Root, "a disk channel has requests (in its device's kick slot)")));
 pub const VMM_NETD_KICK: E<p::Vmm, p::Netd, o::Notification> = E::new(shared(edge("VMM_NETD_KICK", Vmm, VMM_KICKS, Netd, Notification, Signal,
     Bit(badges::netd::PORT), net::MAX_PORTS, Root, "port p has frames to send (in its device's kick slot)")));
-pub const VMM_USBD_KICK: E<p::Vmm, p::Usbd, o::Notification> = E::new(shared(edge("VMM_USBD_KICK", Vmm, Chosen, Usbd, Notification, Signal,
-    Fixed(badges::usbd::KICK), 1, Root, "the guest's USB queues have requests (the guest's, in its device CNode)")));
+pub const VMM_USBD_KICK: E<p::Guest, p::Usbd, o::Notification> = E::new(shared(edge("VMM_USBD_KICK", Guest, Chosen, Usbd, Notification, Signal,
+    Fixed(badges::usbd::KICK), 1, Root, "the guest's USB queues have requests (in its device CNode, passed on by vmmgr)")));
 pub const BLKD_VMM_DONE: E<p::Blkd, p::Vmm, o::Notification> = E::new(shared(edge("BLKD_VMM_DONE", Blkd, Slots(blk::BLKD_SLOT_CLIENT_DONE, blk::MAX_CLIENTS), Vmm,
     Notification, Signal, Fixed(badges::vmm::DONE), 1, Root, "client i's channel has completions")));
 pub const NETD_VMM_DONE: E<p::Netd, p::Vmm, o::Notification> = E::new(shared(edge("NETD_VMM_DONE", Netd, Slots(net::NETD_SLOT_CLIENT_BASE, net::MAX_PORTS), Vmm,
@@ -442,8 +452,8 @@ pub const VMMGR_VCPU: E<p::Vmmgr, p::Guest, o::Vcpu> = E::new(shared(edge("VMMGR
 pub const EDGES: &[Edge] = &[
     ROOT_MEMD.0, VMMGR_MEMD.0, VMMGR_VMM_MEMD.0, VMM_MEMD.0, TRUSTD_ROOT.0, VMMGR_ROOT.0, VMM_VMMGR.0, ROOT_FLAGS.0, VMMGR_FLAGS.0,
     TRUSTD_FLAGS.0, GUEST_VMM.0,
-    TRUSTD_FAULT.0, FLAGS_FAULT.0, BLKD_FAULT.0, NETD_FAULT.0, USBD_FAULT.0, LOGD_FAULT.0, VMM_FAULT.0, MEMD_KEEPER_FAULT.0,
-    VMMGR_KEEPER_FAULT.0, GUEST_FAULT.0,
+    TRUSTD_FAULT.0, BLKD_FAULT.0, NETD_FAULT.0, USBD_FAULT.0, LOGD_FAULT.0, VMM_FAULT.0, MEMD_KEEPER_FAULT.0,
+    VMMGR_KEEPER_FAULT.0, FLAGS_KEEPER_FAULT.0, GUEST_FAULT.0,
     ROOT_BLKD_CALL.0, ROOT_NETD_CALL.0, ROOT_USBD_CALL.0, ROOT_VMMGR_CALL.0, BLKD_DONE.0, NETD_DONE.0, USBD_DONE.0, VMMGR_DONE.0,
     VMM_BLKD_KICK.0, VMM_NETD_KICK.0, VMM_USBD_KICK.0, BLKD_VMM_DONE.0, NETD_VMM_DONE.0, USBD_VMM.0,
     IRQ_BLKD.0, IRQ_NETD.0, IRQ_USBD.0, IRQ_MONITOR.0, DOORBELL_ROOT.0, DOORBELL_NETD.0, NETD_LINK_SELF.0, NETD_LINK_RING.0,
@@ -469,7 +479,6 @@ pub const OWN: &[Own] = &[
     Own { kind: None, slot: crate::SLOT_SERVICE_EP, object: Endpoint, what: "its endpoint" },
     Own { kind: None, slot: crate::SLOT_FAULT_EP, object: Endpoint, what: "its keeper's: the main thread's faults" },
     Own { kind: Some(crate::KIND_TRUSTD), slot: trust::SLOT_KICK, object: Kick, what: "its kick notification" },
-    Own { kind: Some(crate::KIND_TRUSTD), slot: trust::SLOT_FLAGS_EP, object: Flags, what: "its flags thread's endpoint" },
 ];
 
 /// What a component of `kind` may have in slot `slot` that calls or
@@ -492,7 +501,7 @@ pub const CAP_NOTIFICATION: u32 = 6;
 /// The tag of a capability to `object`.
 pub const fn cap_tag(object: Object) -> u32 {
     match object {
-        Endpoint | Flags => CAP_ENDPOINT,
+        Endpoint => CAP_ENDPOINT,
         Notification | Kick | Vcpu => CAP_NOTIFICATION,
     }
 }
@@ -553,8 +562,7 @@ pub const fn parent_call(kind: u32) -> Option<&'static Edge> {
 }
 
 /// The edge by which a component of `kind`'s main thread faults to its
-/// parent, if it has no keeper (FLAGS_FAULT, trustd's second thread's,
-/// aside).
+/// parent, if it has no keeper.
 pub const fn parent_fault(kind: u32) -> Option<&'static Edge> {
     fault_of(kind, Rights::Fault)
 }
@@ -569,7 +577,7 @@ const fn fault_of(kind: u32, rights: Rights) -> Option<&'static Edge> {
     let mut i = 0;
     while i < EDGES.len() {
         let e = &EDGES[i];
-        if e.rights as u8 == rights as u8 && !matches!(e.badge, Badge::Fixed(b) if b == COMPONENT_FAULT | crate::root::FLAGS_ID as u64) {
+        if e.rights as u8 == rights as u8 {
             if let Some(k) = e.holder.kind() {
                 if k == kind {
                     return Some(e);
@@ -595,7 +603,7 @@ const fn space(target: Party, object: Object) -> Option<(&'static [Bits], u64)> 
         (Vmm, Endpoint | Notification) => (badges::vmm::OWN, badges::vmm::SIGNALS),
         (Trustd, Notification) => (badges::trustd::OWN, badges::trustd::SIGNALS),
         (Trustd, Kick) => (badges::trustd_kick::OWN, badges::trustd_kick::SIGNALS),
-        (Trustd, Flags) => (badges::flags::OWN, badges::flags::SIGNALS),
+        (Flags, Endpoint) => (badges::flags::OWN, badges::flags::SIGNALS),
         (Logd, Notification) => (badges::logd::OWN, badges::logd::SIGNALS),
         _ => return None,
     })
@@ -607,7 +615,7 @@ const fn accepts(target: Party, object: Object, badge: u64) -> bool {
         (Root, Endpoint) => crate::root::Sender::of_badge(badge).is_some(),
         (Vmmgr, Endpoint) => crate::vmmgr::Sender::of_badge(badge).is_some(),
         (Memd, Endpoint) => crate::memd::Sender::of_badge(badge).is_some(),
-        (Trustd, Flags) => trust::Sender::of_badge(badge).is_some(),
+        (Flags, Endpoint) => trust::Sender::of_badge(badge).is_some(),
         (Vmm, Endpoint) => crate::hypercall::Sender::of_badge(badge).is_some(),
         _ => false,
     }
@@ -665,11 +673,10 @@ const fn check(edges: &[Edge]) -> Result<(), &'static str> {
             if signals && same_object(e, f) && e.badge.mask() & f.badge.mask() != 0 && !both_shared {
                 return Err(e.name);
             }
-            // No two calls with the same badge on the same endpoint.
+            // No two calls with the same badge on the same endpoint, but for
+            // an edge whose capabilities are copies of the other's.
             if matches!(e.rights, Rights::Call) && matches!(f.rights, Rights::Call) && same_object(e, f)
-                && matches!((e.badge, f.badge), (Badge::Fixed(x), Badge::Fixed(y)) if x == y)
-                && !matches!(e.holder, Vmmgr) && !matches!(f.holder, Vmmgr) {
-                // vmmgr holds a copy of root's flags capability (VMMGR_FLAGS).
+                && badges_meet(e, f) && !same_str(e.copy_of, f.name) && !same_str(f.copy_of, e.name) {
                 return Err(e.name);
             }
             j += 1;
@@ -677,6 +684,37 @@ const fn check(edges: &[Edge]) -> Result<(), &'static str> {
         i += 1;
     }
     Ok(())
+}
+
+/// Whether call edge `e` can have badge `x`.
+const fn has_badge(e: &Edge, x: u64) -> bool {
+    match e.badge {
+        Badge::Fixed(b) => b == x,
+        Badge::Field(base, f) => x & !f.mask() == base && f.get(x) < e.instances as u64,
+        Badge::Bit(r) => x & !r.mask() == 0 && x.count_ones() == 1,
+    }
+}
+
+/// Whether two call edges can have the same badge (two fields: if they
+/// agree outside both).
+const fn badges_meet(a: &Edge, b: &Edge) -> bool {
+    match (a.badge, b.badge) {
+        (Badge::Fixed(x), _) => has_badge(b, x),
+        (_, Badge::Fixed(y)) => has_badge(a, y),
+        _ => {
+            let fields = field_mask(a.badge) | field_mask(b.badge);
+            a.badge.mask() & !fields == b.badge.mask() & !fields
+        }
+    }
+}
+
+/// The bits that vary between a badge's instances.
+const fn field_mask(b: Badge) -> u64 {
+    match b {
+        Badge::Fixed(_) => 0,
+        Badge::Field(_, f) => f.mask(),
+        Badge::Bit(r) => r.mask(),
+    }
 }
 
 /// Whether a host component calls into `p` (so a caller blocks on it).
@@ -694,16 +732,15 @@ const fn called(p: Party) -> bool {
 
 /// The keeper rule (host::has_keeper): a component host callers block on
 /// has a keeper to answer them if it fails, and has no fault edge to its
-/// parent; one they do not, faults to its parent.  trustd is called (its
-/// flags thread) and has none: a flags thread that faults stops the host.
+/// parent; one they do not, faults to its parent.
 const fn keepers() -> Result<(), &'static str> {
-    let kinds = [Vmmgr, Memd, Trustd, Blkd, Netd, Usbd, Logd, Vmm];
+    let kinds = [Vmmgr, Memd, Trustd, Flags, Blkd, Netd, Usbd, Logd, Vmm];
     let mut i = 0;
     while i < kinds.len() {
         let p = kinds[i];
         let Some(kind) = p.kind() else { return Err("party without a kind") };
         let keeper = crate::has_keeper(kind);
-        if keeper != (called(p) && !matches!(p, Trustd)) || keeper == parent_fault(kind).is_some()
+        if keeper != called(p) || keeper == parent_fault(kind).is_some()
             || keeper != keeper_fault(kind).is_some() {
             return Err("host::has_keeper does not follow the wiring");
         }
@@ -793,10 +830,15 @@ mod tests {
         // Who calls its parent: trustd and vmmgr root, the VMMs vmmgr.
         assert!(parent_call(crate::KIND_TRUSTD).is_some() && parent_call(crate::KIND_VMMGR).is_some()
             && parent_call(crate::KIND_VMM).is_some());
-        for k in [crate::KIND_MEMD, crate::KIND_BLKD, crate::KIND_NETD, crate::KIND_USBD, crate::KIND_LOGD] {
+        for k in [crate::KIND_MEMD, crate::KIND_FLAGS, crate::KIND_BLKD, crate::KIND_NETD, crate::KIND_USBD, crate::KIND_LOGD] {
             assert!(parent_call(k).is_none());
         }
         assert_eq!(VMM_VMMGR.badge(7), badges::parent::COMPONENT | 7);
+        // The flags server has a keeper; trustd's main thread, which nobody
+        // calls, faults to root.
+        assert!(crate::has_keeper(crate::KIND_FLAGS) && !crate::has_keeper(crate::KIND_TRUSTD));
+        assert!(keeper_fault(crate::KIND_FLAGS).is_some() && parent_fault(crate::KIND_FLAGS).is_none());
+        assert!(parent_fault(crate::KIND_TRUSTD).is_some());
         assert_eq!(VMMGR_VMM_MEMD.slot(3), vmmgr::SLOT_VMM_MEMD_EP + 3);
     }
 
@@ -813,6 +855,16 @@ mod tests {
         let mut to_driver = ROOT_MEMD.0;
         to_driver.target = Blkd;
         assert!(check(&[to_driver]).is_err());
+        // Two holders with one badge on an endpoint, unless declared a copy
+        // of the other: vmmgr's flags capability is its own.
+        let mut borrowed = VMMGR_FLAGS.0;
+        borrowed.badge = ROOT_FLAGS.badge;
+        assert_eq!(check(&[ROOT_FLAGS.0, borrowed]), Err("ROOT_FLAGS"));
+        assert_eq!(check(&[ROOT_FLAGS.0, copy(borrowed, "ROOT_FLAGS")]), Ok(()));
+        let mut stray = VMM_MEMD.0;
+        stray.copy_of = "";
+        assert!(check(&[VMMGR_VMM_MEMD.0, stray]).is_err());
+        assert_eq!(check(&[VMMGR_VMM_MEMD.0, VMM_MEMD.0]), Ok(()));
         let mut odd = IRQ_BLKD.0;
         odd.badge = Fixed(1 << 50);
         assert!(check(&[odd]).is_err());

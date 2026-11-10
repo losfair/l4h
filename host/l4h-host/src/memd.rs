@@ -44,7 +44,7 @@ crate::senders! {
     /// Who calls memd, by the badge of its capability (badges::memd).
     /// l4h-root calls with an unbadged one, for its own memory; l4h-vmmgr
     /// with one badged VMMGR, for its own memory and guests' RAM, passing
-    /// capabilities in its mailbox; a guest's l4h-vmm with one badged
+    /// capabilities in its exchange area; a guest's l4h-vmm with one badged
     /// `VMM | GUEST`, for the hotplug calls of its own guest.
     pub enum Sender in recv {
         Root: [];
@@ -64,7 +64,7 @@ crate::protocol! {
     ///
     /// vmmgr is less trusted than memd, so memd keeps the original of every
     /// block it grants vmmgr and gives it a copy: `free` then revokes the
-    /// original, whatever vmmgr put in the mailbox.  memd takes no
+    /// original, whatever vmmgr put in its exchange area.  memd takes no
     /// capability from vmmgr to invoke: one that is not what the call
     /// declares (an endpoint where a CNode should be) would make memd's
     /// invocation an IPC.  A slot the caller fills again while memd fills

@@ -10,6 +10,10 @@ use crate::vmmgr::Answer;
 
 pub use l4h_host::errno::{EAGAIN, EBUSY, EEXIST, EINVAL, EIO, ENODEV, ENOENT, ENOMEM, ENOSPC, ENOSYS, EPERM, Errno};
 
+// Request words narrowed to usize (`as usize`) keep every bit; narrower
+// ones are taken with try_from and the op's errno for a bad argument.
+const _: () = assert!(usize::BITS == u64::BITS);
+
 /// Execute control op `op` with `a`: its vals, and its data into `data`;
 /// or later, for an op that waits for blkd (BLK_WRITE, BLK_INFO).
 pub fn host_op(h: &mut Host, op: u32, a: &[u64; 6], data: &mut [u8; abi::CTL_DATA_MAX]) -> Result<Answer, Errno> {

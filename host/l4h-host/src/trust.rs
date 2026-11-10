@@ -1,11 +1,14 @@
 //! l4h-trustd: the attestation service (DESIGN.md §10.2).  Each guest has
 //! an attestation device (L4H_DEV_ATTEST): a request page, which trustd
-//! maps at page_va(guest), and the kick notification, badged with
-//! badges::trustd_kick::GUEST bit guest.  trustd answers in the page and
-//! has root raise the device's event (root::call::attest_done).  l4h-root tells trustd about
-//! guests through the registry page, which it writes and trustd only
-//! reads. Root waits only for trustd's passive flags thread, never for
-//! its main thread, whose TPM commands can take seconds.
+//! maps at page_va(page_of(guest, ...)), and the kick notification, badged
+//! with badges::trustd_kick::GUEST bit guest.  trustd answers in the page
+//! and has root raise the device's event (root::call::attest_done).
+//! l4h-root tells trustd about guests through the registry page, which it
+//! writes and trustd only reads.  The flags (`call`) are served by the
+//! flags server, the trustd image in spaces of its own (host::KIND_FLAGS),
+//! which alone maps them writable; trustd's main thread, whose TPM
+//! commands can take seconds and which parses guests' pages and runs the
+//! firmware's AML, only calls it.  Root waits only for the flags server.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 use l4h_abi as abi;
@@ -71,26 +74,43 @@ pub const TPM_VA: usize = crate::MMIO_VA;
 /// The registry page, read-only in trustd.
 pub const REGISTRY_VA: usize = crate::SHARED_VA;
 pub const AML_VA: usize = crate::SHARED_VA + 0x100_0000;
-/// The request pages, one per guest id; trustd owns them, so that they
-/// stay mapped while it answers a guest that is being destroyed.
+/// The request pages, two per guest id: trustd owns them, so that they
+/// stay mapped while it answers a guest that is being destroyed, and a
+/// new guest with the id gets the other one while trustd may still be
+/// writing an answer for the old one (Status).  The registry says which
+/// a running guest has (RECORD_PAGE_B).
 pub const PAGES_VA: usize = crate::SHARED_VA + 0x1000;
-pub const fn page_va(guest: usize) -> usize {
-    PAGES_VA + guest * 4096
+pub const PAGES: usize = 2 * MAX_RECORDS;
+pub const fn page_va(page: usize) -> usize {
+    PAGES_VA + page * 4096
+}
+/// The page of guest `guest`: its first, or its second (`b`).
+pub const fn page_of(guest: usize, b: bool) -> usize {
+    guest + if b { MAX_RECORDS } else { 0 }
 }
 /// The kick notification: guest g signals it with badges::trustd_kick::GUEST bit g.  The
 /// bound notification (SLOT_NTFN) is trustd's timer.
 pub const SLOT_KICK: u64 = crate::SLOT_FIRST_FREE;
-pub const SLOT_FLAGS_EP: u64 = SLOT_KICK + 1;
-pub const SLOT_FLAGS_CALL: u64 = SLOT_KICK + 2;
-pub const SLOT_FLAGS_TCB: u64 = SLOT_KICK + 3;
-pub const SLOT_FLAGS_REPLY: u64 = SLOT_KICK + 4;
-pub const FLAGS_IPCBUF_VA: usize = crate::KEEPER_IPCBUF_VA;
-pub const FLAGS_STACK_TOP: usize = crate::KEEPER_STACK_TOP;
-pub const FLAGS_STACK_SIZE: usize = crate::KEEPER_STACK_SIZE;
-pub const FLAGS_VA: usize = crate::SHARED_VA + 0x8_0000;
-/// Only the flags thread uses this writable alias. All readers use FLAGS_VA.
-pub const FLAGS_WRITE_VA: usize = FLAGS_VA + FLAGS_SIZE;
+/// The main thread's capability to the flags server (wiring::TRUSTD_FLAGS).
+pub const SLOT_FLAGS_CALL: u64 = SLOT_KICK + 1;
+/// The flags: read-only in trustd, root and vmmgr; the flags server's
+/// mapping, at the same address in its own space, is the only writable
+/// one.  The flags server also maps the registry, read-only.
+pub const FLAGS_VA: usize = crate::SHARED_VA + 0x9_0000;
 pub const FLAGS_SIZE: usize = 8192;
+/// trustd's status page (Status): it writes it, root reads it.
+pub const STATUS_VA: usize = FLAGS_VA + FLAGS_SIZE;
+
+/// What trustd tells root (STATUS_VA).
+#[repr(C)]
+pub struct Status {
+    /// 1 + the request page (page_va) trustd may be writing an answer
+    /// into, or 0.  trustd sets it before it looks a last time whether the
+    /// guest it answers still runs, and clears it once it has answered;
+    /// root, which unregisters a guest before it gives its id to another,
+    /// gives the new guest the other page while this names the old one's.
+    pub answering: AtomicU64,
+}
 
 /// The relay between partitions' trustds (multikernel only, DESIGN.md
 /// §10.2): the primary's trustd, which has the TPM, quotes each other
@@ -122,7 +142,7 @@ pub const RELAY_MSG_MAX: usize = 9216;
 /// Also guest 63's kick bit: kicks are only hints (trustd answers a guest
 /// whose page has a new seq), so trustd looks at both.
 pub const RELAY_BADGE: u64 = crate::badges::trustd_kick::GUEST.nth(MAX_RECORDS - 1);
-const _: () = assert!(FLAGS_WRITE_VA + FLAGS_SIZE <= RELAY_VA && RELAY_VA + RELAY_PAGES * 4096 <= AML_VA);
+const _: () = assert!(page_va(PAGES) <= FLAGS_VA && STATUS_VA + 4096 <= RELAY_VA && RELAY_VA + RELAY_PAGES * 4096 <= AML_VA);
 const _: () = assert!(RELAY_MSG_MAX + core::mem::size_of::<RelaySlot>() <= RELAY_SLOT_SIZE);
 
 /// A relay slot's header; the message follows.  In an inbox slot root
@@ -157,40 +177,41 @@ pub const RELAY_KEY: u32 = 1;
 /// ActivateCredential: u32 blob length, the blob, the secret; the reply
 /// is the credential.
 pub const RELAY_ACTIVATE: u32 = 2;
-/// The ops of FlagsEntry::update: the labels of `call`'s act and
-/// seal.
-pub const FLAGS_ACT: u64 = 1;
-pub const FLAGS_SEAL: u64 = 2;
-
 use crate::badges::flags as flags_badge;
 use crate::errno::{EINVAL, EPERM, ESRCH, Errno};
 
 crate::senders! {
-    /// Who calls trustd's flags endpoint, by its badge (badges::flags):
-    /// root (and vmmgr, with root's capability, for the console), or
-    /// trustd's main thread for guests.
+    /// Who calls the flags server, by its badge (badges::flags): root (its
+    /// start-up handshake), vmmgr (the host actor, for the console) or
+    /// trustd's main thread (for guests).
     pub enum Sender in flags_badge {
         Root: [ROOT];
         Trustd: [TRUSTD];
+        Vmmgr: [VMMGR];
     }
 }
 
 crate::protocol! {
-    /// trustd's flags endpoint (crate::wire::protocol), served by a passive
-    /// thread with no heap, TPM, AML or calls back to root: a caller
-    /// donates only the time for one request.  FlagsEntry::update checks
-    /// what each caller may set; a reply's first word is 0 or an errno.
+    /// The flags server's endpoint (crate::wire::protocol): a passive
+    /// thread with no heap, TPM, AML or calls back to root, in spaces of
+    /// its own, so that a caller donates only the time for one request and
+    /// trustd's main thread can reach the flags only through these calls.
+    /// FlagsEntry::update checks what each caller may set; a reply's first
+    /// word is 0 or an errno.
     pub mod call (from: Sender) {
         /// Root's start-up handshake: the thread is waiting.
         Ready / ready = 0 from [Root] () -> ();
         /// Taint guest `guest`'s `bits` (and seal them with abi::ACT_SEAL in
         /// `flags`), for `instance`: its flags.
-        Act / act = 1 from [Root, Trustd] (guest: usize, instance: u64, bits: [u64; 4], flags: u64) -> Flags;
+        Act / act = 1 from [Vmmgr, Trustd] (guest: usize, instance: u64, bits: [u64; 4], flags: u64) -> Flags;
         /// Seal guest `guest`'s `bits`, for `instance`: its flags.
         Seal / seal = 2 from [Trustd] (guest: usize, instance: u64, bits: [u64; 4], flags: u64) -> Flags;
     }
 }
-const _: () = assert!(FLAGS_ACT == 1 && FLAGS_SEAL == 2);
+/// The ops of FlagsEntry::update: the labels of `call`'s act and seal, as
+/// the protocol declares them.
+pub const FLAGS_ACT: u64 = call::Request::Act { guest: 0, instance: 0, bits: [0; 4], flags: 0 }.label();
+pub const FLAGS_SEAL: u64 = call::Request::Seal { guest: 0, instance: 0, bits: [0; 4], flags: 0 }.label();
 /// Most ACPI table bytes root gives trustd.
 pub const AML_MAX: usize = 4 << 20;
 
@@ -213,10 +234,25 @@ pub struct GuestRecord {
 }
 
 pub const RECORD_DOM0: u32 = 1;
+/// The guest's request page is its second (page_of(id, true)); root sets
+/// it.
+pub const RECORD_PAGE_B: u32 = 2;
 pub const MAX_RECORDS: usize = 64;
 const _: () = assert!(core::mem::size_of::<GuestRecord>() == 64);
 const _: () = assert!(MAX_RECORDS * core::mem::size_of::<GuestRecord>() <= 4096);
-const _: () = assert!(MAX_RECORDS <= 64 && page_va(MAX_RECORDS) <= AML_VA);
+const _: () = assert!(MAX_RECORDS <= 64 && page_va(PAGES) <= AML_VA);
+
+/// The instance guest `id` runs as, from the registry: 0 if none.
+///
+/// # Safety
+/// The registry must be mapped at `registry`.
+pub unsafe fn registered(registry: usize, id: usize) -> u64 {
+    if id >= MAX_RECORDS {
+        return 0;
+    }
+    let p = (registry as *const GuestRecord).wrapping_add(id);
+    unsafe { core::ptr::addr_of!((*p).instance).read_volatile() }
+}
 
 /// One instance's consistent flags. A different instance reads as empty.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -299,20 +335,31 @@ impl FlagsEntry {
 
     /// Serialized by the flags endpoint. Positive errno on failure;
     /// invalid requests and sealed ACTs change nothing, including instance.
+    /// `registered` is the instance the registry has for the guest (0: not
+    /// started, or not attested).  trustd answers only running guests, so
+    /// it must name that instance; vmmgr must too once there is one, and
+    /// before (console input queued before start) names the instance root
+    /// gave it.  Neither can replace a running guest's entry with another
+    /// instance's.
     ///
     /// # Safety
     /// There must be exactly one writer of this entry.
-    pub unsafe fn update(&self, from: Sender, op: u64, instance: u64, bits: [u64; 4], flags: u64) -> Result<Flags, Errno> {
+    pub unsafe fn update(&self, from: Sender, op: u64, instance: u64, registered: u64, bits: [u64; 4], flags: u64)
+        -> Result<Flags, Errno> {
         let sealable = bits[0] & !abi::FLAGS_HOST_DEFINED == 0 && bits[1] == 0;
         let allowed = match (from, op) {
-            (Sender::Root, FLAGS_ACT) => bits[0] & !abi::FLAGS_HOST_DEFINED == 0 && bits[1..] == [0; 3] && flags == 0,
+            (Sender::Vmmgr, FLAGS_ACT) => bits[0] & !abi::FLAGS_HOST_DEFINED == 0 && bits[1..] == [0; 3] && flags == 0,
             (Sender::Trustd, FLAGS_ACT) => bits[0] == 0 && (flags & abi::ACT_SEAL as u64 == 0 || sealable),
             (Sender::Trustd, FLAGS_SEAL) => sealable && flags == 0,
             _ => false,
         };
         if !allowed || flags & !(abi::ACT_SEAL as u64) != 0 || instance == 0 { return Err(EINVAL); }
+        let current = match from {
+            Sender::Trustd => instance == registered,
+            _ => registered == 0 || instance == registered,
+        };
         let old = self.read();
-        if instance < old.instance { return Err(ESRCH); }
+        if !current || instance < old.instance { return Err(ESRCH); }
         let mut next = old.for_instance(instance);
         if op == FLAGS_ACT && (0..4).any(|i| next.seal[i] & bits[i] != 0) { return Err(EPERM); }
         for i in 0..4 {

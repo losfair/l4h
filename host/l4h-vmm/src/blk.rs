@@ -7,6 +7,7 @@ use core::sync::atomic::{Ordering, fence};
 
 use l4h_rt::host::{self, blk::{self, Channel}};
 use l4h_rt::host::fixed::ArrayVec;
+use l4h_rt::host::spsc::{Consumer, Producer};
 use l4h_rt::sel4;
 
 use crate::dev::{Backend, VIRTIO_RING_F_INDIRECT_DESC};
@@ -54,6 +55,10 @@ struct Inflight {
 
 pub struct Blk {
     chan: *mut Channel,
+    /// Our indices of the channel's rings: blkd can write over the
+    /// channel's copies.
+    sq: Producer,
+    cq: Consumer,
     kick: Option<sel4::cap::Notification>,
     capacity: u64,
     read_only: bool,
@@ -87,7 +92,8 @@ impl Blk {
     /// every request locally with an I/O error, without touching hardware.
     pub fn unavailable(pool: u64) -> Self {
         Blk {
-            chan: core::ptr::null_mut(), kick: None, capacity: 0, read_only: true, volatile: false,
+            chan: core::ptr::null_mut(), sq: Producer::new(blk::RING_SIZE), cq: Consumer::new(blk::RING_SIZE),
+            kick: None, capacity: 0, read_only: true, volatile: false,
             block_size: 512, size_max: size_max(pool),
             inflight: [[None; QUEUE_SIZE as usize]; MAX_QUEUES], nr_queues: 1, kick_pending: false,
             outstanding: 0, generation: 0, stalled: [None; MAX_QUEUES],
@@ -110,6 +116,9 @@ impl Blk {
         };
         Blk {
             chan,
+            // A fresh channel: both rings start empty.
+            sq: Producer::new(blk::RING_SIZE),
+            cq: Consumer::new(blk::RING_SIZE),
             kick: Some(kick),
             capacity,
             read_only,
@@ -125,11 +134,18 @@ impl Blk {
         }
     }
 
+    /// Full, or blkd broke the tail.
     fn sq_full(&self) -> bool {
+        unsafe { self.sq.free(&(*self.chan).sq) == 0 }
+    }
+
+    /// The oldest response blkd has published, taken off the ring.
+    fn next_resp(&mut self) -> Option<blk::Resp> {
         unsafe {
-            let head = addr_of!((*self.chan).sq.head).read_volatile();
-            let tail = addr_of!((*self.chan).sq.tail).read_volatile();
-            head.wrapping_sub(tail) as usize >= blk::RING_SIZE
+            if self.cq.ready(&(*self.chan).cq) == 0 { return None; }
+            let resp = addr_of!((*self.chan).resps[self.cq.slot()]).read_volatile();
+            self.cq.pop(&(*self.chan).cq);
+            Some(resp)
         }
     }
 
@@ -268,10 +284,8 @@ impl Blk {
         if ty == blk::OP_FLUSH { self.flush_inflight = true; }
         self.outstanding += 1;
         unsafe {
-            let h = addr_of!((*self.chan).sq.head).read_volatile();
-            addr_of_mut!((*self.chan).reqs[h as usize % blk::RING_SIZE]).write_volatile(req);
-            fence(Ordering::Release);
-            addr_of_mut!((*self.chan).sq.head).write_volatile(h.wrapping_add(1));
+            addr_of_mut!((*self.chan).reqs[self.sq.slot()]).write_volatile(req);
+            self.sq.push(&(*self.chan).sq);
         }
         true
     }
@@ -281,25 +295,19 @@ impl Blk {
     fn wait_outstanding(&mut self, mut f: impl FnMut(&mut Self, blk::Resp)) -> bool {
         let mut end = None;
         while self.outstanding != 0 {
-            unsafe {
-                let tail = addr_of!((*self.chan).cq.tail).read_volatile();
-                if tail == addr_of!((*self.chan).cq.head).read_volatile() {
-                    // An unknown rate is taken as 1 GHz: the wait stays finite.
-                    let now = host::ticks::now();
-                    let hz = if self.tsc_hz == 0 { 1_000_000_000 } else { self.tsc_hz };
-                    if now > *end.get_or_insert(now.saturating_add(DRAIN_SECS.saturating_mul(hz))) {
-                        return false;
-                    }
-                    // blkd runs at a higher priority, on its own core or
-                    // as soon as we yield.
-                    sel4::r#yield();
-                    continue;
+            let Some(resp) = self.next_resp() else {
+                // An unknown rate is taken as 1 GHz: the wait stays finite.
+                let now = host::ticks::now();
+                let hz = if self.tsc_hz == 0 { 1_000_000_000 } else { self.tsc_hz };
+                if now > *end.get_or_insert(now.saturating_add(DRAIN_SECS.saturating_mul(hz))) {
+                    return false;
                 }
-                fence(Ordering::Acquire);
-                let resp = addr_of!((*self.chan).resps[tail as usize % blk::RING_SIZE]).read_volatile();
-                addr_of_mut!((*self.chan).cq.tail).write_volatile(tail.wrapping_add(1));
-                f(self, resp);
-            }
+                // blkd runs at a higher priority, on its own core or as
+                // soon as we yield.
+                sel4::r#yield();
+                continue;
+            };
+            f(self, resp);
         }
         true
     }
@@ -412,16 +420,10 @@ impl Backend for Blk {
     fn complete(&mut self, mem: &GuestMem, queues: &mut [Queue]) -> bool {
         if self.chan.is_null() { return false; }
         let mut returned = 0;
-        unsafe {
-            loop {
-                let tail = addr_of!((*self.chan).cq.tail).read_volatile();
-                let head = addr_of!((*self.chan).cq.head).read_volatile();
-                if tail == head { break; }
-                fence(Ordering::Acquire);
-                let resp = addr_of!((*self.chan).resps[tail as usize % blk::RING_SIZE]).read_volatile();
-                addr_of_mut!((*self.chan).cq.tail).write_volatile(tail.wrapping_add(1));
-                returned |= self.response(mem, queues, resp, None);
-            }
+        // At most a ring's worth: what blkd publishes meanwhile is pending.
+        for _ in 0..blk::RING_SIZE {
+            let Some(resp) = self.next_resp() else { break };
+            returned |= self.response(mem, queues, resp, None);
         }
         for (q, queue) in queues.iter_mut().enumerate().take(self.nr_queues) {
             if returned & (1 << q) != 0 { queue.publish_used(mem); }
@@ -431,7 +433,7 @@ impl Backend for Blk {
 
     fn pending(&self) -> bool {
         !self.chan.is_null() && (self.deferred != 0 || self.stalled.iter().any(Option::is_some)
-            || unsafe { addr_of!((*self.chan).cq.tail).read_volatile() != addr_of!((*self.chan).cq.head).read_volatile() })
+            || unsafe { self.cq.ready(&(*self.chan).cq) != 0 })
     }
 
     fn retry_queues(&self) -> u64 {

@@ -49,20 +49,12 @@ pub struct Resp {
     pub reserved: u32,
 }
 
-/// Single-producer single-consumer ring indices.  `head` is written by the
-/// producer, `tail` by the consumer; both increase monotonically.
-#[repr(C)]
-pub struct RingIdx {
-    pub head: u32,
-    pub pad0: [u32; 15],
-    pub tail: u32,
-    pub pad1: [u32; 15],
-}
-
 #[repr(C)]
 pub struct Channel {
-    pub sq: RingIdx,
-    pub cq: RingIdx,
+    /// Requests: the client produces, blkd consumes; then responses.
+    /// Each side keeps its own index (crate::spsc).
+    pub sq: crate::spsc::RingIdx,
+    pub cq: crate::spsc::RingIdx,
     /// Written by blkd before it sets `ready`.
     pub capacity_sectors: u64,
     pub read_only: u32,

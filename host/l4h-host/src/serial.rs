@@ -1,24 +1,30 @@
-//! The serial ring: what host code prints, on its way to l4h-logd, the only
-//! host code that writes the serial port (DESIGN.md §10.4).
+//! The serial rings: what host code prints, on its way to l4h-logd, the
+//! only host code that writes the serial port (DESIGN.md §10.4).
 //!
-//! Every task of a partition writes whole lines to its partition's ring and
-//! makes no seL4 call, so that printing neither waits nor stalls a core.
-//! `Merge`, in logd, reads the rings of all partitions, oldest record first,
-//! and hands out text line by line: lines cannot mix, because one task
-//! prints them.
+//! Every task writes whole lines to a ring and makes no seL4 call, so that
+//! printing neither waits nor stalls a core. In partition 0 each writer
+//! has a lane of its own (`Lanes`, laid out by `log::Writer`), which only
+//! it can write, and root's lane is its ring (`Ring`): logd reads them all,
+//! the lanes read-only, and prints whose a line is from the lane it is in
+//! (`[netd] `, `[vm3] `), never from the record. A secondary partition's
+//! tasks share its one ring, which partition 0 prints as `[pN] `. `Merge`,
+//! in logd, reads every ring and lane, oldest record first, and hands out
+//! text line by line: lines cannot mix, because one task prints them.
 //!
-//! This is separate from the log ring (`log`), so that console volume
-//! cannot push diagnostics out of `l4hctl logs`.
+//! This is separate from the log (`log`), so that console volume cannot
+//! push diagnostics out of `l4hctl logs`.
 //!
-//! A secondary partition's ring and kernel console ring are in memory the
-//! partition can write, so a reader believes nothing it finds there: the
-//! slots are `ring`'s, lengths are clamped, and `next` limits how much of
-//! a pass one ring can take.
+//! A secondary partition's ring and kernel console ring, and every lane,
+//! are in memory another party can write, so a reader believes nothing it
+//! finds there: the slots are `ring`'s, lengths are clamped, text is made
+//! printable (`log::printable`), and `next` limits how much of a pass one
+//! ring can take.
 
 use core::fmt::{self, Write};
-use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering::SeqCst, compiler_fence};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst, compiler_fence};
 
-use crate::ring::{self, Buf, Entry};
+use crate::log::{Writer, printable};
+use crate::ring::{self, Buf, Entry, View};
 
 /// Slots of `Ring`, which with its header makes exactly 256 KiB. A dom0 boot
 /// prints a few hundred lines. A deeper ring only makes output later: a
@@ -28,22 +34,29 @@ pub const CAPACITY: usize = 1023;
 /// A slot is then 256 bytes, its header (with the checksum) included.
 pub const TEXT_SIZE: usize = 224;
 const WORDS: usize = TEXT_SIZE / 8;
-pub const PAGES: usize = core::mem::size_of::<Ring>() / 4096;
+const PAGE: usize = 4096;
+pub const PAGES: usize = core::mem::size_of::<Ring>() / PAGE;
 pub const FRAME_RADIX: usize = PAGES.next_power_of_two().trailing_zeros() as usize;
 const _: () = assert!(PAGES == 1 << FRAME_RADIX && PAGES == 64);
-/// Where the ring is in every task of a partition.
+/// Where a task's ring, or lane, is in it.
 pub const VA: usize = 0x1010_0000;
-const _: () = assert!(VA >= crate::log::VA + crate::log::PAGES * 4096
-    && VA + PAGES * 4096 < crate::KEEPER_STACK_TOP - crate::KEEPER_STACK_SIZE);
+const _: () = assert!(VA >= crate::log::VA + crate::log::lane_pages(255) * PAGE
+    && VA + PAGES * PAGE < crate::KEEPER_STACK_TOP - crate::KEEPER_STACK_SIZE);
 
 /// Partitions on a machine (l4h_partition::MAX_PARTITIONS).
 pub const MAX_RINGS: usize = 8;
+/// `Merge`'s inputs: partition k's ring at k, partition 0's lanes after.
+const MAX_INPUTS: usize = MAX_RINGS + Writer::COUNT;
 
 /// logd's address space: partition k's ring and kernel console ring, and
 /// the part of the framebuffer it draws on.
 pub const RINGS_VA: usize = crate::SHARED_VA;
 pub const KERNEL_RINGS_VA: usize = crate::SHARED_VA + 0x1000_0000;
 pub const KERNEL_RING_STRIDE: usize = 1 << 20;
+/// Partition 0's lanes (`Lanes`), read-only.
+pub const LANES_VA: usize = crate::SHARED_VA + 0x2000_0000;
+const _: () = assert!(KERNEL_RINGS_VA + MAX_RINGS * KERNEL_RING_STRIDE <= LANES_VA
+    && LANES_VA + LANES_PAGES * PAGE <= crate::MMIO_VA);
 pub const FB_VA: usize = crate::MMIO_VA;
 /// The UART's registers (aarch64).
 pub const UART_VA: usize = FB_VA + (1 << 30);
@@ -115,16 +128,23 @@ pub struct LogdConfig {
     pub fb_width: u32,
     pub fb_height: u32,
     pub fb_offset: u64,
+    /// Partition 0's lanes are at LANES_VA (non-zero).
+    pub lanes: u32,
+    pub _pad2: u32,
 }
 const _: () = assert!(crate::CONFIG_OFFSET + core::mem::size_of::<LogdConfig>() <= crate::INFO_SIZE);
 
 impl LogdConfig {
-    /// Add the partitions' rings to `merge`, as mapped at these addresses.
-    pub fn add_inputs(&self, merge: &mut Merge, rings_va: usize, kernel_va: usize) {
+    /// Add the partitions' rings, and partition 0's lanes, to `merge`, as
+    /// mapped at these addresses.
+    pub fn add_inputs(&self, merge: &mut Merge, rings_va: usize, kernel_va: usize, lanes_va: usize) {
+        if self.lanes != 0 {
+            // Root mapped them for good; they are only ever read as atomics.
+            merge.add_lanes(unsafe { &*(lanes_va as *const Lanes) });
+        }
         for k in 1..MAX_RINGS {
             if self.rings & 1 << k != 0 {
-                // Root mapped it for good; it is only ever read as atomics.
-                let ring = unsafe { &*((rings_va + k * PAGES * 4096) as *const Ring) };
+                let ring = unsafe { &*((rings_va + k * PAGES * PAGE) as *const Ring) };
                 merge.add_ring(k, ring, Some(k as u32));
             }
             if self.kernel_rings & 1 << k != 0 {
@@ -151,8 +171,9 @@ const KERNEL_LINE_MAX: usize = 160;
 /// A line handed out: its text and what `next` puts around it.
 pub const LINE_MAX: usize = if TEXT_SIZE > KERNEL_LINE_MAX { TEXT_SIZE } else { KERNEL_LINE_MAX } + 48;
 
-/// `source` bit: the record is guest N's console (N in the low bits), which
-/// prints as `[vmN] ` at the start of a line.
+/// `source` bit: the record is a guest's console, which prints as `[vmN] `
+/// at the start of a line, N the guest of the VMM whose lane it is in (in
+/// a secondary's ring, N in the low bits, behind `[pK] `).
 pub const SOURCE_GUEST: u32 = 1 << 31;
 /// `source` of dom0's console, which has no prefix.
 pub const SOURCE_DOM0: u32 = 1 << 30;
@@ -161,17 +182,26 @@ pub const SOURCE_DOM0: u32 = 1 << 30;
 const MORE: u64 = 1;
 const SOURCE_SHIFT: u32 = 1;
 
-/// Page-aligned so that root can share its frames, and in memory shared
-/// between partitions for a secondary's.
+/// One writer's ring: `CAPACITY` slots for root's and dom0's (`Ring`), fewer
+/// for others. Page-aligned so that root can share its frames, and in
+/// memory shared between partitions for a secondary's.
 #[repr(C, align(4096))]
-pub struct Ring {
+pub struct Lane<const N: usize> {
     /// The sequence after the last one printed whole or reported lost,
-    /// which tells root when a reset can go ahead. Only the reader writes it.
+    /// which tells root when a reset can go ahead. Only the reader writes
+    /// it, in root's ring and secondaries'.
     drained: AtomicU64,
-    ring: ring::Ring<CAPACITY, WORDS>,
+    ring: ring::Ring<N, WORDS>,
 }
 
-impl Ring {
+/// Root's ring, and a secondary partition's.
+pub type Ring = Lane<CAPACITY>;
+
+/// Where a lane's slots start: what a writer that knows only its lane's
+/// address and size writes to (`init_lane`).
+const RING_OFFSET: usize = core::mem::offset_of!(Lane<1>, ring);
+
+impl<const N: usize> Lane<N> {
     pub const fn new() -> Self {
         Self { drained: AtomicU64::new(0), ring: ring::Ring::new() }
     }
@@ -179,16 +209,7 @@ impl Ring {
     /// Write text as one line, or as the start of one if `more`: as
     /// consecutive records, which a reader prints next to each other.
     pub fn write(&self, ticks: u64, source: u32, text: &[u8], more: bool) {
-        let mut n = 0;
-        for_records(text, more, |_, _| n += 1);
-        let mut seq = self.ring.claim(n);
-        let meta = (source as u64) << SOURCE_SHIFT;
-        for_records(text, more, |record, more| {
-            let mut buf = Buf::<WORDS>::new();
-            buf.bytes_mut()[..record.len()].copy_from_slice(record);
-            self.ring.commit(seq, ticks, meta | if more { MORE } else { 0 }, record.len(), &buf);
-            seq = seq.wrapping_add(1);
-        });
+        write_to(self.ring.view(), ticks, source, text, more);
     }
 
     pub fn head(&self) -> u64 {
@@ -201,13 +222,128 @@ impl Ring {
     }
 
     /// Copy every record to `to`, the ring its writers move to.
-    pub fn copy_to(&self, to: &Ring) {
+    pub fn copy_to(&self, to: &Lane<N>) {
         for seq in 0..self.head() {
             if let Entry::Ready(r) = self.ring.get(seq) {
                 let at = to.ring.claim(1);
                 to.ring.commit(at, r.ticks, r.meta, r.text().len(), &r.buf());
             }
         }
+    }
+}
+
+fn write_to(ring: View<'_, WORDS>, ticks: u64, source: u32, text: &[u8], more: bool) {
+    let mut n = 0;
+    for_records(text, more, |_, _| n += 1);
+    let mut seq = ring.claim(n);
+    let meta = (source as u64) << SOURCE_SHIFT;
+    for_records(text, more, |record, more| {
+        let mut buf = Buf::<WORDS>::new();
+        buf.bytes_mut()[..record.len()].copy_from_slice(record);
+        ring.commit(seq, ticks, meta | if more { MORE } else { 0 }, record.len(), &buf);
+        seq = seq.wrapping_add(1);
+    });
+}
+
+/// Records of the lanes: a guest's console prints most, dom0's a boot's
+/// worth (as root's ring), the rest little.
+const VMM: usize = 63;
+const VMMGR: usize = 31;
+const SMALL: usize = 15;
+
+const fn lane_pages(records: usize) -> usize {
+    (RING_OFFSET + core::mem::offset_of!(ring::Ring<1, WORDS>, slots)
+        + records * core::mem::size_of::<ring::Slot<WORDS>>()).div_ceil(PAGE)
+}
+
+/// Partition 0's lanes, but root's: one for each writer (`log::Writer`),
+/// dom0's VMM's being where dom0's console is. A static of root's.
+#[repr(C)]
+pub struct Lanes {
+    vmm: [Lane<VMM>; crate::log::MAX_VMMS],
+    dom0: Lane<CAPACITY>,
+    vmmgr: Lane<VMMGR>,
+    service: [Lane<SMALL>; 5],
+    blkd: [Lane<SMALL>; crate::log::MAX_BLKDS],
+    usbd: [Lane<SMALL>; crate::log::MAX_USBDS],
+}
+
+pub const LANES_PAGES: usize = core::mem::size_of::<Lanes>() / PAGE;
+/// The guests' VMMs' lanes and dom0's, the first pages: what vmmgr holds of
+/// `Lanes`, to give each VMM its own.
+pub const VMM_PAGES: usize = crate::log::MAX_VMMS * lane_pages(VMM) + PAGES;
+
+const _: () = {
+    use core::mem::size_of;
+    assert!(size_of::<Lane<VMM>>() == lane_pages(VMM) * PAGE && lane_pages(VMM + 1) > lane_pages(VMM));
+    assert!(size_of::<Lane<VMMGR>>() == lane_pages(VMMGR) * PAGE && lane_pages(VMMGR + 1) > lane_pages(VMMGR));
+    assert!(size_of::<Lane<SMALL>>() == lane_pages(SMALL) * PAGE && lane_pages(SMALL + 1) > lane_pages(SMALL));
+    assert!(lane_pages(CAPACITY) == PAGES && size_of::<Lanes>() % PAGE == 0);
+    assert!(core::mem::offset_of!(Lanes, vmmgr) == VMM_PAGES * PAGE);
+};
+
+/// The serial writer a component of `kind` and `id` is: dom0's VMM writes
+/// dom0's lane.
+pub fn writer(kind: u32, id: u32, dom0: bool) -> Option<Writer> {
+    match Writer::of(kind, id)? {
+        Writer::Vmm(_) if dom0 => Some(Writer::Dom0),
+        w => Some(w),
+    }
+}
+
+/// `w`'s lane in `Lanes` (root has none: its ring is its own).
+pub fn lane_at(w: Writer) -> Option<crate::log::LaneAt> {
+    use core::mem::{offset_of, size_of};
+    let at = |offset: usize, records: usize| crate::log::LaneAt { page: offset / PAGE, pages: lane_pages(records), records };
+    let small = size_of::<Lane<SMALL>>();
+    Some(match w {
+        Writer::Root => return None,
+        Writer::Vmm(g) => at(offset_of!(Lanes, vmm) + g as usize * size_of::<Lane<VMM>>(), VMM),
+        Writer::Dom0 => at(offset_of!(Lanes, dom0), CAPACITY),
+        Writer::Vmmgr => at(offset_of!(Lanes, vmmgr), VMMGR),
+        Writer::Logd => at(offset_of!(Lanes, service), SMALL),
+        Writer::Memd => at(offset_of!(Lanes, service) + small, SMALL),
+        Writer::Trustd => at(offset_of!(Lanes, service) + 2 * small, SMALL),
+        Writer::Flags => at(offset_of!(Lanes, service) + 3 * small, SMALL),
+        Writer::Netd => at(offset_of!(Lanes, service) + 4 * small, SMALL),
+        Writer::Blkd(c) => at(offset_of!(Lanes, blkd) + c as usize * small, SMALL),
+        Writer::Usbd(i) => at(offset_of!(Lanes, usbd) + i as usize * small, SMALL),
+    })
+}
+
+impl Lanes {
+    pub const fn new() -> Self {
+        Self {
+            vmm: [const { Lane::new() }; crate::log::MAX_VMMS],
+            dom0: Lane::new(),
+            vmmgr: Lane::new(),
+            service: [const { Lane::new() }; 5],
+            blkd: [const { Lane::new() }; crate::log::MAX_BLKDS],
+            usbd: [const { Lane::new() }; crate::log::MAX_USBDS],
+        }
+    }
+
+    /// `w`'s lane, with as many slots as the layout gives it.
+    pub fn lane(&self, w: Writer) -> Option<View<'_, WORDS>> {
+        let i = |n: u32| n as usize;
+        Some(match w {
+            Writer::Root => return None,
+            Writer::Vmm(g) => self.vmm.get(i(g))?.ring.view(),
+            Writer::Dom0 => self.dom0.ring.view(),
+            Writer::Vmmgr => self.vmmgr.ring.view(),
+            Writer::Logd => self.service[0].ring.view(),
+            Writer::Memd => self.service[1].ring.view(),
+            Writer::Trustd => self.service[2].ring.view(),
+            Writer::Flags => self.service[3].ring.view(),
+            Writer::Netd => self.service[4].ring.view(),
+            Writer::Blkd(c) => self.blkd.get(i(c))?.ring.view(),
+            Writer::Usbd(u) => self.usbd.get(i(u))?.ring.view(),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn write(&self, w: Writer, ticks: u64, source: u32, text: &[u8], more: bool) {
+        write_to(self.lane(w).unwrap(), ticks, source, text, more);
     }
 }
 
@@ -268,22 +404,41 @@ impl Write for Message {
     }
 }
 
-static RING: AtomicPtr<Ring> = AtomicPtr::new(core::ptr::null_mut());
-static SOURCE: AtomicU32 = AtomicU32::new(0);
+/// This process's ring or lane: the address of its slots, and their
+/// number (0: none).
+static LANE_VA: AtomicUsize = AtomicUsize::new(0);
+static LANE_RECORDS: AtomicUsize = AtomicUsize::new(0);
 
-/// Install this process's mapping before starting its secondary thread.
-/// A later call moves to another ring.
-pub fn init(ring: &'static Ring, source: u32) {
-    SOURCE.store(source, SeqCst);
-    RING.store(core::ptr::from_ref(ring).cast_mut(), SeqCst);
+/// Write to `ring` (root's). Install before starting another thread. A
+/// later call moves to another ring.
+pub fn init<const N: usize>(ring: &'static Lane<N>, _source: u32) {
+    LANE_RECORDS.store(N, SeqCst);
+    LANE_VA.store(core::ptr::from_ref(&ring.ring) as usize, SeqCst);
 }
 
-/// Print text of `source`, as `Ring::write`.
+/// A component's: write to the lane, or partition ring, of `records`
+/// records its parent mapped at `VA` (none if 0, `log::info_records`).
+pub fn init_lane(records: usize) {
+    LANE_RECORDS.store(records, SeqCst);
+    LANE_VA.store(if records == 0 { 0 } else { VA + RING_OFFSET }, SeqCst);
+}
+
+/// Write to `w`'s lane of `lanes`, as that writer does once its parent
+/// has mapped it (`init_lane`): for a process that is given no lane, a
+/// test's.
+pub fn init_writer(lanes: &'static Lanes, w: Writer) {
+    let Some(at) = lane_at(w) else { return };
+    LANE_RECORDS.store(at.records, SeqCst);
+    LANE_VA.store(core::ptr::from_ref(lanes) as usize + at.page * PAGE + RING_OFFSET, SeqCst);
+}
+
+/// Print text, as `Lane::write`: `source` says whether it is a guest's
+/// console (`SOURCE_GUEST`, `SOURCE_DOM0`); whose it is, the lane says.
 pub fn write(source: u32, text: &[u8], more: bool) {
-    let p = RING.load(SeqCst);
-    if !p.is_null() {
-        // init only accepts a mapping that lives for the process's lifetime.
-        unsafe { &*p }.write(crate::ticks::now(), source, text, more);
+    let (va, n) = (LANE_VA.load(SeqCst), LANE_RECORDS.load(SeqCst));
+    if va != 0 && n != 0 {
+        // init and init_lane only take a ring that lives for the process's lifetime.
+        write_to(unsafe { View::at(va, n) }, crate::ticks::now(), source, text, more);
     }
 }
 
@@ -291,7 +446,7 @@ pub fn write(source: u32, text: &[u8], more: bool) {
 pub fn record(args: fmt::Arguments<'_>) {
     let mut m = Message { bytes: [0; MESSAGE_MAX], len: 0, truncated: false };
     let _ = m.write_fmt(args);
-    write(SOURCE.load(SeqCst), m.finish(), false);
+    write(0, m.finish(), false);
 }
 
 /// A kernel console ring (kernel patch 0035): its header's first word
@@ -303,10 +458,24 @@ pub struct KernelRing {
     pub header: usize,
 }
 
+/// Whose an input's lines are, and what goes at their start.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Label {
+    /// Root's ring in partition 0: nothing.
+    Home,
+    /// A secondary partition's ring: `[pN] `, then whatever its records
+    /// claim (`[vmN] `), since its tasks share it.
+    Partition(u32),
+    /// A writer's lane in partition 0: its name (`log::Writer::name`), or
+    /// for a guest's console `[vmN] ` (none for dom0's).
+    Lane(Writer),
+}
+
 struct Input {
-    ring: &'static Ring,
-    /// Printed as `[pN] ` at the start of a line; a secondary's ring.
-    partition: Option<u32>,
+    ring: View<'static, WORDS>,
+    /// Where the reader says what it printed, if it can write there.
+    drained: Option<&'static AtomicU64>,
+    label: Label,
     cursor: u64,
     /// Records skipped since the last report.
     lost: u64,
@@ -362,7 +531,7 @@ enum Commit {
 
 /// The reader of every ring on the machine.
 pub struct Merge {
-    inputs: [Option<Input>; MAX_RINGS],
+    inputs: [Option<Input>; MAX_INPUTS],
     kernels: [Option<KernelInput>; MAX_RINGS],
     /// The input and source of a line that has no end on the port yet.
     open: Option<(usize, u32)>,
@@ -376,7 +545,7 @@ impl Merge {
     /// commit what it claimed.
     pub fn new(home: &'static Ring, grace: u64) -> Self {
         let mut m = Self {
-            inputs: [const { None }; MAX_RINGS],
+            inputs: [const { None }; MAX_INPUTS],
             kernels: [const { None }; MAX_RINGS],
             open: None,
             grace,
@@ -389,7 +558,21 @@ impl Merge {
     /// Add secondary partition k's ring (`partition` is k), or partition
     /// 0's for k = 0.
     pub fn add_ring(&mut self, k: usize, ring: &'static Ring, partition: Option<u32>) {
-        self.inputs[k] = Some(Input { ring, partition, cursor: 0, lost: 0, deadline: None, budget: PASS_RECORDS + LINE_RECORDS });
+        let label = partition.map_or(Label::Home, Label::Partition);
+        self.add(k, ring.ring.view(), Some(&ring.drained), label);
+    }
+
+    /// Add partition 0's lanes, which logd can only read.
+    pub fn add_lanes(&mut self, lanes: &'static Lanes) {
+        for w in Writer::all() {
+            if let Some(ring) = lanes.lane(w) {
+                self.add(MAX_RINGS + w.index(), ring, None, Label::Lane(w));
+            }
+        }
+    }
+
+    fn add(&mut self, k: usize, ring: View<'static, WORDS>, drained: Option<&'static AtomicU64>, label: Label) {
+        self.inputs[k] = Some(Input { ring, drained, label, cursor: 0, lost: 0, deadline: None, budget: PASS_RECORDS + LINE_RECORDS });
     }
 
     /// Add the console ring of partition k's kernel.
@@ -430,8 +613,8 @@ impl Merge {
         match core::mem::replace(&mut self.commit, Commit::None) {
             Commit::None => {}
             Commit::Ring(k, seq) => {
-                if let Some(i) = &self.inputs[k] {
-                    i.ring.drained.store(seq, SeqCst);
+                if let Some(d) = self.inputs[k].as_ref().and_then(|i| i.drained) {
+                    d.store(seq, SeqCst);
                 }
             }
         }
@@ -468,9 +651,9 @@ impl Merge {
                         best = Some((k, r));
                     }
                 }
-                // Only partition 0's tasks are worth waiting for: a
-                // secondary could ask for a grace period every time.
-                Peek::Pending => hold |= open == Some(k) && i.partition.is_none(),
+                // Only root is worth waiting for: another writer could
+                // ask for a grace period every time.
+                Peek::Pending => hold |= open == Some(k) && i.label == Label::Home,
                 Peek::Empty => {}
             }
         }
@@ -481,7 +664,7 @@ impl Merge {
             let lost = core::mem::take(&mut i.lost);
             i.budget -= 1;
             end_line(&mut self.open, out);
-            write_prefix(out, i.partition, 0);
+            write_prefix(out, i.label, 0);
             let _ = write!(out, "({} lines lost)\r\n", lost);
             self.commit = Commit::Ring(k, i.cursor);
             return true;
@@ -495,13 +678,11 @@ impl Merge {
             let more = r.meta & MORE != 0;
             if self.open != Some((k, source)) {
                 end_line(&mut self.open, out);
-                write_prefix(out, i.partition, source);
+                write_prefix(out, i.label, source);
             }
-            for &c in r.text() {
-                // The prefix says whose a line is: a record cannot make
-                // a line that looks like someone else's.
-                out.push(&[if c == b'\n' || i.partition.is_some() && c == b'\r' { b' ' } else { c }]);
-            }
+            // The prefix says whose a line is: a record cannot make a line
+            // that looks like someone else's, nor move the cursor to one.
+            printable(r.text(), |b| out.push(b));
             if more {
                 self.open = Some((k, source));
             } else {
@@ -530,7 +711,7 @@ impl Merge {
                     i.budget -= 1;
                     end_line(&mut self.open, out);
                     let _ = write!(out, "[p{}] ", i.partition);
-                    out.push(&i.line[..i.len]);
+                    printable(&i.line[..i.len], |b| out.push(b));
                     out.push(b"\r\n");
                     i.len = 0;
                     return true;
@@ -548,12 +729,25 @@ fn end_line(open: &mut Option<(usize, u32)>, out: &mut Line) {
     }
 }
 
-fn write_prefix(out: &mut Line, partition: Option<u32>, source: u32) {
-    if let Some(p) = partition {
-        let _ = write!(out, "[p{}] ", p);
-    }
-    if source & SOURCE_GUEST != 0 {
-        let _ = write!(out, "[vm{}] ", source & !SOURCE_GUEST);
+fn write_prefix(out: &mut Line, label: Label, source: u32) {
+    let console = source & (SOURCE_GUEST | SOURCE_DOM0) != 0;
+    match label {
+        Label::Home => {}
+        Label::Partition(p) => {
+            let _ = write!(out, "[p{}] ", p);
+            if source & SOURCE_GUEST != 0 {
+                let _ = write!(out, "[vm{}] ", source & !SOURCE_GUEST);
+            }
+        }
+        Label::Lane(Writer::Dom0) if console => {}
+        Label::Lane(Writer::Vmm(g)) if console => {
+            let _ = write!(out, "[vm{}] ", g);
+        }
+        Label::Lane(w) => {
+            out.push(b"[");
+            let _ = w.name(out);
+            out.push(b"] ");
+        }
     }
 }
 
@@ -574,14 +768,14 @@ impl Input {
         if self.cursor > head {
             self.cursor = head;
         }
-        let oldest = ring::Ring::<CAPACITY, WORDS>::oldest_at(head);
+        let oldest = self.ring.oldest_at(head);
         if self.cursor < oldest {
             self.lost = self.lost.saturating_add(oldest - self.cursor);
             self.cursor = oldest;
             self.deadline = None;
         }
         while self.cursor < head {
-            match self.ring.ring.get(self.cursor) {
+            match self.ring.get(self.cursor) {
                 Entry::Ready(r) => {
                     self.deadline = None;
                     return Peek::Ready(r);
@@ -671,22 +865,90 @@ mod tests {
         s
     }
 
+    fn lanes() -> &'static Lanes {
+        unsafe { &*std::alloc::alloc_zeroed(std::alloc::Layout::new::<Lanes>()).cast() }
+    }
+
     #[test]
     fn lines_print_whole_with_prefixes_and_crlf() {
-        let (home, other) = (ring(), ring());
+        let (home, other, lanes) = (ring(), ring(), lanes());
         let mut m = Merge::new(home, GRACE);
         m.add_ring(1, other, Some(1));
+        m.add_lanes(lanes);
         home.write(10, 0, b"root line", false);
         other.write(20, SOURCE_GUEST | 3, b"guest line", false);
-        home.write(30, SOURCE_GUEST | 2, b"vm2 line", false);
+        lanes.write(Writer::Vmm(2), 30, SOURCE_GUEST | 2, b"vm2 line", false);
         other.write(40, 0, b"secondary root", false);
+        lanes.write(Writer::Netd, 50, 0, b"l4h-netd: up", false);
+        lanes.write(Writer::Dom0, 60, SOURCE_DOM0, b"dom0 line", false);
+        lanes.write(Writer::Dom0, 70, 0, b"l4h-vmm: dom0's", false);
+        lanes.write(Writer::Vmm(2), 80, 0, b"l4h-vmm: vm2's", false);
         assert_eq!(
-            drain(&mut m, 50),
-            "root line\r\n[p1] [vm3] guest line\r\n[vm2] vm2 line\r\n[p1] secondary root\r\n"
+            drain(&mut m, 90),
+            "root line\r\n[p1] [vm3] guest line\r\n[vm2] vm2 line\r\n[p1] secondary root\r\n\
+             [netd] l4h-netd: up\r\ndom0 line\r\n[dom0 vmm] l4h-vmm: dom0's\r\n[vmm2] l4h-vmm: vm2's\r\n"
         );
-        assert_eq!(home.drained.load(SeqCst), 2);
+        assert_eq!(home.drained.load(SeqCst), 1);
         assert_eq!(other.drained.load(SeqCst), 2);
-        assert_eq!(drain(&mut m, 60), "");
+        assert_eq!(drain(&mut m, 100), "");
+    }
+
+    #[test]
+    fn a_lane_cannot_pass_for_another_writer() {
+        let (home, lanes) = (ring(), lanes());
+        let mut m = Merge::new(home, GRACE);
+        m.add_lanes(lanes);
+        // What a blkd or a VMM claims of itself does not change whose its
+        // lines are: the lane says.
+        lanes.write(Writer::Blkd(0), 1, SOURCE_DOM0, b"l4h-root: host reboot", false);
+        lanes.write(Writer::Vmm(4), 2, SOURCE_GUEST | 7, b"x", false);
+        lanes.write(Writer::Vmm(4), 3, 0, b"y\rl4h-root: \x1b[2Kz", false);
+        assert_eq!(drain(&mut m, 10), "[blkd0] l4h-root: host reboot\r\n[vm4] x\r\n[vmm4] y l4h-root: ?[2Kz\r\n");
+    }
+
+    #[test]
+    fn a_lane_cannot_erase_or_hold_back_others() {
+        let (home, lanes) = (ring(), lanes());
+        let mut m = Merge::new(home, GRACE);
+        m.add_lanes(lanes);
+        home.write(5, 0, b"home", false);
+        lanes.write(Writer::Vmmgr, 6, 0, b"vmmgr", false);
+        // A usbd floods its own lane, then leaves the rest of a line it
+        // started uncommitted, which logd does not wait for.
+        for _ in 0..1000 {
+            lanes.write(Writer::Usbd(1), 0, 0, b"flood", false);
+        }
+        let lane = lanes.lane(Writer::Usbd(1)).unwrap();
+        let seq = lane.claim(2);
+        let mut buf = Buf::new();
+        buf.bytes_mut()[0] = b'x';
+        lane.commit(seq, 7, MORE, 1, &buf);
+        let text = drain(&mut m, 10);
+        assert!(text.contains("\nhome\r\n") || text.starts_with("home\r\n"), "{text}");
+        assert!(text.contains("[vmmgr] vmmgr\r\n"), "{text}");
+        assert!(text.contains("[usbd1] (987 lines lost)\r\n"), "{text}");
+    }
+
+    #[test]
+    fn a_partial_line_is_continued_or_ended_by_another_source() {
+        let (home, lanes) = (ring(), lanes());
+        let mut m = Merge::new(home, GRACE);
+        m.add_lanes(lanes);
+        let vm1 = |t, text: &[u8], more| lanes.write(Writer::Vmm(1), t, SOURCE_GUEST | 1, text, more);
+        vm1(1, b"login: ", true);
+        assert_eq!(drain(&mut m, 2), "[vm1] login: ");
+        vm1(3, b"root", false);
+        assert_eq!(drain(&mut m, 4), "root\r\n");
+        // The rest of a line comes before another lane's older record; a
+        // record of the same lane's VMM ends it.
+        vm1(5, b"# ", true);
+        home.write(6, 0, b"host", false);
+        vm1(7, b"ls", false);
+        assert_eq!(drain(&mut m, 8), "[vm1] # ls\r\nhost\r\n");
+        vm1(9, b"$ ", true);
+        lanes.write(Writer::Vmm(1), 10, 0, b"l4h-vmm: x", false);
+        vm1(11, b"ls", false);
+        assert_eq!(drain(&mut m, 12), "[vm1] $ \r\n[vmm1] l4h-vmm: x\r\n[vm1] ls\r\n");
     }
 
     #[test]
@@ -706,20 +968,6 @@ mod tests {
         home.write(1, 0, b"\n", false);
         let mut m = Merge::new(home, GRACE);
         assert_eq!(drain(&mut m, 2), "\r\n\r\n");
-    }
-
-    #[test]
-    fn a_partial_line_is_continued_or_ended_by_another_source() {
-        let home = ring();
-        let mut m = Merge::new(home, GRACE);
-        home.write(1, SOURCE_GUEST | 1, b"login: ", true);
-        assert_eq!(drain(&mut m, 2), "[vm1] login: ");
-        home.write(3, SOURCE_GUEST | 1, b"root", false);
-        assert_eq!(drain(&mut m, 4), "root\r\n");
-        home.write(5, SOURCE_GUEST | 1, b"# ", true);
-        home.write(6, 0, b"host", false);
-        home.write(7, SOURCE_GUEST | 1, b"ls", false);
-        assert_eq!(drain(&mut m, 8), "[vm1] # \r\nhost\r\n[vm1] ls\r\n");
     }
 
     #[test]

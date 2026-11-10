@@ -941,12 +941,15 @@ tools/run-qemu.sh host/target/x86_64-sel4-roottask/debug/l4h-root.elf \
         of \texttt{L4H\_MEM}. \texttt{L4H\_BALLOON=0} leaves the device
         out. Memory a guest holds stays in use, even if the guest frees it.
   \item The serial port is the console. seL4 and the host components print
-        there, and so do the guests' consoles, each line prefixed with
-        \texttt{[vm$N$]}. The serial monitor (Chapter~\ref{ch:recovery})
-        reads it.
+        there, each component's lines prefixed with its name (such as
+        \texttt{[netd]} or \texttt{[vmmgr]}; the root task's have none),
+        and so do the guests' consoles, each line prefixed with
+        \texttt{[vm$N$]} (dom0's with none). Control characters a line
+        holds are shown as \texttt{?}. The serial monitor
+        (Chapter~\ref{ch:recovery}) reads it.
   \item To leave QEMU, type \texttt{Ctrl-a x}. The host never powers off by
         itself; when every guest has stopped, \texttt{l4h-vmmgr} prints
-        \texttt{l4h-vmmgr: all guests stopped}.
+        \texttt{[vmmgr] l4h-vmmgr: all guests stopped}.
 \end{itemize}
 
 \cmd{tools/run-dom0.sh INITRD [CMDLINE] [TIMEOUT]} combines the steps for
@@ -1079,8 +1082,12 @@ ones. Messages include seconds since host start and the emitting component
 id; they are retained in release builds too. Reads do not consume messages,
 and destroying a VM leaves its diagnostics available.
 
-The bounded ring holds 256 records. Long records are marked truncated;
-overwritten or incomplete records are reported as unavailable. The ring
+Each host component keeps its messages in a bounded log of its own, which
+no other component can write: the host itself 255, the guest manager 63,
+each guest's device model 7. The component id printed is that of the log a
+message is in, and control characters in messages are shown as \texttt{?}.
+Long records are marked truncated; overwritten or incomplete records are
+reported as unavailable. The ring
 does not survive a host reboot. Use \cmd{l4hctl console VM} for Linux console
 output and panic details. Querying host logs requires dom0 and its manager
 to be working; seL4's own debug output remains on the host serial console.
@@ -1389,6 +1396,8 @@ separate filesystem devices from disk 0. Each window consumes one device
 slot. The complete dom0 plan, including its console, control, optional
 memory and attestation devices, disks and NICs, must fit in 64 slots;
 an oversized plan stops boot instead of dropping devices.
+A controller busy with another attachment or a provisioning write is
+waited for, up to 10 seconds.
 If a boot disk attachment fails, dom0 sees a read-only, zero-capacity disk
 in that position. Its physical window remains reserved, including across
 dom0 restarts, and cannot be provisioned or given to a conflicting guest.

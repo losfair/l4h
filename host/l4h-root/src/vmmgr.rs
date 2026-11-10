@@ -216,6 +216,7 @@ pub fn spawn(h: &mut Host, modules: &Modules, plan: &Dom0Plan) -> Vmmgr {
         (cfg.topo_cpus, cfg.topo_physical, cfg.topo_order) = (cpus as u64, physical, order);
         cfg.watchdog_secs = h.cfg.watchdog_secs as u64;
         cfg.trust = h.trustd.is_some() as u64;
+        cfg.serial_lanes = h.info.serial_lanes().is_some() as u64;
         // Patches 0038 and 0040: without usable VT-x or AMD-V the kernel
         // refuses these objects.
         #[cfg(target_arch = "x86_64")]
@@ -276,13 +277,14 @@ pub fn spawn(h: &mut Host, modules: &Modules, plan: &Dom0Plan) -> Vmmgr {
         )
     });
 
-    for i in 0..host::log::PAGES {
+    // The VMMs' lanes, to give each its own: none of another writer's.
+    for i in 0..host::log::VMM_PAGES {
         comp.give(proto::SLOT_LOG_FRAMES + i as u64,
             cap::Granule::from_bits(h.info.log_frames + i as u64), CapRights::read_write());
     }
-    for i in 0..host::serial::PAGES {
-        comp.give(proto::SLOT_SERIAL_FRAMES + i as u64,
-            cap::Granule::from_bits(h.info.serial_frames() + i as u64), CapRights::read_write());
+    let (serial, pages) = h.info.serial_lanes().map_or((h.info.serial_frames(), host::serial::PAGES), |l| (l, host::serial::VMM_PAGES));
+    for i in 0..pages {
+        comp.give(proto::SLOT_SERIAL_FRAMES + i as u64, cap::Granule::from_bits(serial + i as u64), CapRights::read_write());
     }
     for core in 0..h.info.cores {
         comp.give(proto::SLOT_SCHED_CONTROL + core as u64, h.info.sched_control(core), CapRights::all());
@@ -439,13 +441,13 @@ impl root_call::Server for Calls<'_> {
         guest_del(self.0, guest)
     }
 
-    fn disk_attach(&mut self, _: Sender, guest: usize, dev: usize, disk: usize, flags: u64, lba_start: u64, lba_count: u64,
+    fn disk_attach(&mut self, _: Sender, guest: usize, disk: usize, flags: u64, lba_start: u64, lba_count: u64,
         n: usize, list: u64) -> Result<Later<()>, u64> {
-        disk_attach(self.0, guest, dev, disk, flags, lba_start, lba_count, n, list)
+        disk_attach(self.0, guest, disk, flags, lba_start, lba_count, n, list)
     }
 
-    fn nic_add(&mut self, _: Sender, guest: usize, dev: usize, switch: u32, mac: u64, lock: bool, isolated: bool) -> Result<u64, Errno> {
-        nic_add(self.0, guest, dev, switch, mac, lock, isolated)
+    fn nic_add(&mut self, _: Sender, guest: usize, switch: u32, mac: u64, lock: bool, isolated: bool) -> Result<u64, Errno> {
+        nic_add(self.0, guest, switch, mac, lock, isolated)
     }
 
     fn trust_register(&mut self, _: Sender, guest: usize, ram: u64, vcpus: u32, launch: [u64; 4]) -> Result<(), Errno> {
@@ -465,8 +467,8 @@ impl root_call::Server for Calls<'_> {
         result(self.0, token).map(|vals| RootVals::of(&vals))
     }
 
-    fn usb_attach(&mut self, _: Sender, guest: usize, dev: usize, ctrl: usize) -> Result<u64, Errno> {
-        usb_attach(self.0, guest, dev, ctrl)
+    fn usb_attach(&mut self, _: Sender, guest: usize, ctrl: usize) -> Result<u64, Errno> {
+        usb_attach(self.0, guest, ctrl)
     }
 }
 
@@ -489,12 +491,16 @@ pub enum OpResult {
 }
 
 /// A request root answers later (Later::Token): for a guest (id,
-/// instance), if any; the disk controller it waits for; its answer, once
-/// there is one.
+/// instance), if any; the disk controller it waits for; whether the driver
+/// owes its answer; the answer for vmmgr, once there is one, and whether
+/// vmmgr has taken it.  The token is free once both are done: a driver
+/// that answers late must not find it reused.
 pub struct Op {
     guest: Option<(usize, u64)>,
     ctrl: usize,
+    owed: bool,
     done: Option<Result<OpResult, Errno>>,
+    taken: bool,
 }
 
 pub type Ops = [Option<Op>; proto::MAX_PENDING];
@@ -511,19 +517,27 @@ pub fn op_new(h: &mut Host, guest: Option<usize>, ctrl: usize) -> Result<usize, 
         Some(id) => Some((id, h.guests.get(id).and_then(|g| g.as_ref()).ok_or(ctl::ENOENT)?.instance)),
         None => None,
     };
-    if h.ops.iter().flatten().filter(|op| op.ctrl == ctrl && op.done.is_none()).count() >= proto::PENDING_PER_CTRL {
+    if h.ops.iter().flatten().filter(|op| op.ctrl == ctrl && op.owed).count() >= proto::PENDING_PER_CTRL {
         return Err(ctl::EBUSY);
     }
     let t = h.ops.iter().position(Option::is_none).ok_or(ctl::EBUSY)?;
-    h.ops[t] = Some(Op { guest, ctrl, done: None });
+    h.ops[t] = Some(Op { guest, ctrl, owed: true, done: None, taken: false });
     Ok(t)
 }
 
-/// The request of `token` is answered: tell vmmgr.  Not its guest's if
-/// that has gone since (a disk's kick is in one of its slots, which go
-/// with it).
+/// The driver answered the request of `token`: tell vmmgr.  Not its
+/// guest's if that has gone since (a disk's kick is in one of its slots,
+/// which go with it): GUEST_DEL answered vmmgr ENOENT already.
 pub fn op_done(h: &mut Host, token: usize, r: Result<OpResult, Errno>) {
-    let Some(op) = h.ops[token].as_mut() else { return };
+    let Some(op) = h.ops[token].as_mut().filter(|op| op.owed) else { return };
+    op.owed = false;
+    if op.taken {
+        h.ops[token] = None;
+        return;
+    }
+    if op.done.is_some() {
+        return;
+    }
     let gone = op.guest.is_some_and(|(id, instance)| h.guests[id].as_ref().is_none_or(|g| g.instance != instance));
     op.done = Some(if gone { Err(ctl::ENOENT) } else { r });
     if let Some(v) = h.vmmgr.as_mut() {
@@ -531,16 +545,21 @@ pub fn op_done(h: &mut Host, token: usize, r: Result<OpResult, Errno>) {
     }
 }
 
-/// `result`: the answer of pending request `token`, which frees it.
+/// `result`: the answer of pending request `token`, which frees it (once
+/// its driver has answered too).
 fn result(h: &mut Host, token: usize) -> Result<Vals, Errno> {
-    let op = h.ops.get_mut(token).ok_or(ctl::EINVAL)?;
-    if op.as_ref().is_none_or(|op| op.done.is_none()) {
-        return Err(if op.is_some() { ctl::EAGAIN } else { ctl::EINVAL });
+    let slot = h.ops.get_mut(token).ok_or(ctl::EINVAL)?;
+    let op = slot.as_mut().filter(|op| !op.taken).ok_or(ctl::EINVAL)?;
+    let done = op.done.take().ok_or(ctl::EAGAIN)?;
+    if op.owed {
+        op.taken = true;
+    } else {
+        *slot = None;
     }
-    match op.take().unwrap().done.unwrap()? {
+    match done? {
         OpResult::Vals(vals) => Ok(vals),
         OpResult::Disk { chan, kick } => {
-            use root_call::caps::disk_attach::{CHANNEL, KICK};
+            use root_call::caps::result::{CHANNEL, KICK};
             let given = chan.iter().enumerate().try_for_each(|(i, f)| give(h, CHANNEL.passed_out(i, kind_of(f)), &abs_of(*f)))
                 .and_then(|()| give_moved(h, KICK.passed_out(0, kind_of(&kick)), &abs_of(kick)));
             // The kick, if vmmgr did not get it.  The disk stays the
@@ -692,12 +711,6 @@ fn guest_new(h: &mut Host, id: usize, size: usize, gpa: usize, dom0: bool) -> Re
     r
 }
 
-/// `guest_del`'s answer: no bytes of pool kept out of use, which root
-/// says itself (zombie_done) once it knows.
-fn kept_later() -> u64 {
-    0
-}
-
 /// `guest_del`: vmmgr has stopped and torn down guest `id`.  Disks
 /// are cut off from the I/O pool by the IOMMU at once; what drivers map
 /// (disk channels, port memory) is kept until they say they no longer use
@@ -708,10 +721,14 @@ fn guest_del(h: &mut Host, id: usize) -> Result<u64, Errno> {
     if let Some(t) = &mut h.trustd {
         t.unregister(id);
     }
-    // Answers for it that vmmgr has not taken are no more.
-    for op in h.ops.iter_mut().flatten() {
-        if op.guest == Some((id, g.instance)) && op.done.is_some() {
-            op.done = Some(Err(ctl::ENOENT));
+    // Its requests are answered ENOENT, those its driver has not
+    // answered yet too (op_done drops that answer when it comes).
+    for t in 0..proto::MAX_PENDING {
+        let Some(op) = h.ops[t].as_mut().filter(|op| op.guest == Some((id, g.instance)) && !op.taken) else { continue };
+        let tell = op.done.is_none();
+        op.done = Some(Err(ctl::ENOENT));
+        if let (true, Some(v)) = (tell, h.vmmgr.as_mut()) {
+            v.op_done(t);
         }
     }
     let mut cut = true;
@@ -726,9 +743,9 @@ fn guest_del(h: &mut Host, id: usize) -> Result<u64, Errno> {
     let waits = g.disks.len() + g.ports.len();
     if waits == 0 {
         let pool = g.pool.paddr;
-        h.alloc.reclaim_pinning(g.arena, |p| !cut && p == pool);
+        let kept = h.alloc.reclaim_pinning(g.arena, |p| !cut && p == pool);
         h.alloc.slots.free_owned(id);
-        return Ok(kept_later());
+        return Ok(kept as u64);
     }
     // No device reaches the pool any more: it goes now.
     let pool = g.pool.paddr;
@@ -758,7 +775,8 @@ fn guest_del(h: &mut Host, id: usize) -> Result<u64, Errno> {
     for &(c, i) in &g.disks {
         blkd::remove(h, c, i, z);
     }
-    Ok(kept_later())
+    // Whether the pool is kept for good the drivers say later: zombie_done.
+    Ok(0)
 }
 
 /// `disk_attach`: pass host disk `disk` (or sectors [lba_start,
@@ -767,15 +785,20 @@ fn guest_del(h: &mut Host, id: usize) -> Result<u64, Errno> {
 /// abi::BLK_* flags.  blkd decides whether the disk may attach, and in
 /// which slot: answered later (blkd::poll).
 #[allow(clippy::too_many_arguments)]
-fn disk_attach(h: &mut Host, id: usize, dev: usize, disk: usize, flags: u64, lba_start: u64, lba_count: u64, n: usize, list: u64)
+fn disk_attach(h: &mut Host, id: usize, disk: usize, flags: u64, lba_start: u64, lba_count: u64, n: usize, list: u64)
     -> Result<Later<()>, Errno> {
     let id = guest_arg(id)?;
     let (read_only, volatile) = (flags & abi::BLK_RO != 0, flags & abi::BLK_VOLATILE != 0);
-    if dev >= MAX_GUEST_DEVICES || flags & !(abi::BLK_RO | abi::BLK_VOLATILE) != 0 || n > l4h_host::blk::MAX_EXTENTS
+    if flags & !(abi::BLK_RO | abi::BLK_VOLATILE) != 0 || n > l4h_host::blk::MAX_EXTENTS
         || list.checked_add(16 * n as u64).is_none_or(|end| end > l4h_abi::CTL_LOAD_MAX) {
         return Err(ctl::EINVAL);
     }
     h.ensure_disk(disk)?;
+    // A window within the disk, as blkd checks it too; an extent list is
+    // blkd's to read and check.
+    if n == 0 && l4h_host::blk::DiskWindow::new(lba_start, lba_count, h.disks[disk].capacity).is_none() {
+        return Err(ctl::EINVAL);
+    }
     let (c, unit) = (h.disks[disk].ctrl, h.disks[disk].unit);
     let dom0 = h.guests[id].as_ref().ok_or(ctl::ENOENT)?.dom0;
     let list = (CTL_DATA_VA + list as usize) as *const u8;
@@ -790,10 +813,17 @@ fn disk_attach(h: &mut Host, id: usize, dev: usize, disk: usize, flags: u64, lba
 }
 
 /// `nic_add`: a port of `switch` for the guest.  Returns the MAC.
-fn nic_add(h: &mut Host, id: usize, dev: usize, switch: u32, mac: u64, lock: bool, isolated: bool) -> Result<u64, Errno> {
+fn nic_add(h: &mut Host, id: usize, switch: u32, mac: u64, lock: bool, isolated: bool) -> Result<u64, Errno> {
     let id = guest_arg(id)?;
-    if dev >= MAX_GUEST_DEVICES {
+    // 48 bits, unicast; 0 asks root for one.  Not truncated: high bits
+    // would make 0, the all-zero MAC, of a nonzero request.
+    if mac >> 48 != 0 || mac >> 40 & 1 != 0 {
         return Err(ctl::EINVAL);
+    }
+    // As DiskAttach and UsbAttach with a failed driver: a port netd never
+    // gets is no NIC.
+    if h.netd.failed() {
+        return Err(ctl::EIO);
     }
     if !h.can_afford(8 << 20, 0, 0) {
         return Err(ctl::ENOMEM);
@@ -809,10 +839,7 @@ fn nic_add(h: &mut Host, id: usize, dev: usize, switch: u32, mac: u64, lock: boo
         // Generated: 02:4c:34:<partition>:<guest>:<port>, unique across the
         // partitions of a machine, which a link may put on one L2.
         let part = crate::partition::get().map_or(0, |d| d.index as u64);
-        let mac = if mac == 0 { 0x02_4c_34_00_00_00 | part << 16 | ((id as u64) << 8) | p as u64 } else { mac & 0xffff_ffff_ffff };
-        if mac >> 40 & 1 != 0 {
-            return Err(ctl::EINVAL);
-        }
+        let mac = if mac == 0 { 0x02_4c_34_00_00_00 | part << 16 | ((id as u64) << 8) | p as u64 } else { mac };
         h.netd.give_port_done(p, g, &h.pci)?;
         let memory = crate::netd::Netd::port_memory(&mut h.alloc).inspect_err(|_| h.netd.take_port_done(p))?;
         let (chan, kick) = h.netd.add_port(g, p, switch, mac, lock, isolated, memory, &mut h.alloc);
@@ -830,12 +857,13 @@ fn nic_add(h: &mut Host, id: usize, dev: usize, switch: u32, mac: u64, lock: boo
 
 /// `usb_attach`: give the guest a whole USB controller.  Returns its USB
 /// number.
-fn usb_attach(h: &mut Host, id: usize, dev: usize, ctrl: usize) -> Result<u64, Errno> {
+fn usb_attach(h: &mut Host, id: usize, ctrl: usize) -> Result<u64, Errno> {
     let id = guest_arg(id)?;
-    if dev >= MAX_GUEST_DEVICES {
-        return Err(ctl::EINVAL);
+    // Room first, as NicAdd: the claim takes the controller from the
+    // firmware for good.
+    if h.guests[id].as_ref().ok_or(ctl::ENOENT)?.usbs.is_full() {
+        return Err(ctl::ENOSPC);
     }
-    h.guests[id].as_ref().ok_or(ctl::ENOENT)?;
     crate::usb::ensure_claimed(h, ctrl)?;
     with_guest(h, id, |h, g| {
         let n = g.usbs.len();

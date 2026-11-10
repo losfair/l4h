@@ -84,6 +84,11 @@ impl Mailbox {
         self.posted - self.answered < RING as u64
     }
 
+    /// Whether every request posted is answered (or given up).
+    pub fn idle(&self) -> bool {
+        self.answered == self.posted
+    }
+
 
     /// Post a request of the driver's protocol (l4h_host::wire::protocol):
     /// its number, or None if the ring is full.

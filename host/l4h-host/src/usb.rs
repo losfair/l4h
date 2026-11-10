@@ -8,7 +8,7 @@
 //! tests/usb.rs run it on the build host unchanged.  The rules:
 //!
 //! - usbd reads a guest index once, and checks it against its own copy and
-//!   the ring size (`Sq::avail`, `Cq::room`);
+//!   the ring size (`Sq::avail`, `Cq::room`: crate::spsc, as blkd and netd);
 //! - a record is copied out of the shared page before it is checked
 //!   (`read_record`), since the guest can rewrite it at any time;
 //! - every data pointer is a translated segment of the client's I/O pool
@@ -209,38 +209,12 @@ pub fn xcaps(read32: impl Fn(usize) -> u32, first: usize, bar_len: usize, max_po
 // ---------------------------------------------------------------------
 // Queue indices.
 
-/// A submission queue the guest produces into: usbd's tail and the size.
-#[derive(Clone, Copy, Debug)]
-pub struct Sq {
-    pub tail: u32,
-    pub size: u32,
-}
+/// A submission queue the guest produces into: usbd's tail and the size
+/// (`avail`).
+pub type Sq = crate::spsc::Consumer;
 
-impl Sq {
-    /// Records available at the guest's `head`, or None if it is further
-    /// from our tail than the queue holds (the guest is broken).
-    pub fn avail(&self, head: u32) -> Option<u32> {
-        let n = head.wrapping_sub(self.tail);
-        (n <= self.size).then_some(n)
-    }
-}
-
-/// A queue usbd produces into: its head, the size, and the guest's tail
-/// as last read.
-#[derive(Clone, Copy, Debug)]
-pub struct Cq {
-    pub head: u32,
-    pub size: u32,
-}
-
-impl Cq {
-    /// Free entries given the guest's `tail`, or None if the tail is not
-    /// between our head minus the size and our head.
-    pub fn room(&self, tail: u32) -> Option<u32> {
-        let used = self.head.wrapping_sub(tail);
-        (used <= self.size).then(|| self.size - used)
-    }
-}
+/// A queue usbd produces into: its head and the size (`room`).
+pub type Cq = crate::spsc::Producer;
 
 /// Copy record `i` of `n` records of type T at `base`, which the guest can
 /// write while we read.
