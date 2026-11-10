@@ -6,9 +6,11 @@
 //! record, and holds its slot for at most a lap of the ring. Readers never
 //! block writers. No allocation, IPC or seL4 invocation occurs.
 //!
-//! `Ring<N, W>` has N slots of W words of text. It lives in memory shared
-//! between tasks, and for `serial` between partitions that do not trust
-//! each other: a reader indexes with `seq % N`, and clamps what it reads.
+//! `Ring<N, W>` has N slots of W words of text, and `View` is one of any N,
+//! for code with rings of several sizes (each writer's lane). It lives in
+//! memory shared with a less trusted writer, and for `serial` between
+//! partitions that do not trust each other: a reader takes N from its own
+//! layout, indexes with `seq % N`, and clamps what it reads.
 
 use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
 
@@ -102,13 +104,77 @@ impl<const N: usize, const W: usize> Ring<N, W> {
         Self { head: AtomicU64::new(0), slots: [const { Slot::new() }; N] }
     }
 
+    /// The ring as the code that reads and writes it sees it, whatever N.
+    pub fn view(&self) -> View<'_, W> {
+        View { head: &self.head, slots: &self.slots }
+    }
+
     pub fn head(&self) -> u64 {
         self.head.load(SeqCst)
     }
 
-    /// The oldest sequence a reader can still find.
-    pub fn oldest(&self) -> u64 {
-        self.head().saturating_sub(N as u64)
+    /// The oldest sequence a reader can still find, given `head`, which
+    /// it read once: a writer can move head at any time, and a reader
+    /// whose bounds come from two reads of it can be sent far outside the
+    /// ring's N records.  No `self`, so it cannot read head again.
+    pub const fn oldest_at(head: u64) -> u64 {
+        head.saturating_sub(N as u64)
+    }
+
+    pub fn claim(&self, n: u64) -> u64 {
+        self.view().claim(n)
+    }
+
+    pub fn commit(&self, seq: u64, ticks: u64, meta: u64, len: usize, text: &Buf<W>) {
+        self.view().commit(seq, ticks, meta, len, text)
+    }
+
+    pub fn get(&self, seq: u64) -> Entry<W> {
+        self.view().get(seq)
+    }
+}
+
+/// A `Ring<N, W>` of any N: what the code that has rings of several sizes
+/// (the per-writer lanes of `log` and `serial`) works with. Its N is the
+/// one its owner laid out, never one read from the ring's memory.
+#[derive(Clone, Copy)]
+pub struct View<'a, const W: usize> {
+    head: &'a AtomicU64,
+    slots: &'a [Slot<W>],
+}
+
+impl<const W: usize> View<'static, W> {
+    /// The ring of `n` slots at `va`.
+    ///
+    /// # Safety
+    /// `va` must hold a `Ring<n, W>` for the rest of the program.
+    pub unsafe fn at(va: usize, n: usize) -> Self {
+        let ring = va as *const Ring<1, W>;
+        unsafe {
+            let head = &*core::ptr::addr_of!((*ring).head);
+            let slots = core::slice::from_raw_parts(core::ptr::addr_of!((*ring).slots).cast::<Slot<W>>(), n);
+            View { head, slots }
+        }
+    }
+}
+
+impl<'a, const W: usize> View<'a, W> {
+    /// Slots, which a reader indexes modulo.
+    pub fn capacity(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub fn head(&self) -> u64 {
+        self.head.load(SeqCst)
+    }
+
+    /// `Ring::oldest_at`.
+    pub fn oldest_at(&self, head: u64) -> u64 {
+        head.saturating_sub(self.slots.len() as u64)
+    }
+
+    fn slot(&self, seq: u64) -> &'a Slot<W> {
+        &self.slots[(seq % self.slots.len() as u64) as usize]
     }
 
     /// Claim `n` consecutive sequences, so that a reader finds them next
@@ -127,7 +193,7 @@ impl<const N: usize, const W: usize> Ring<N, W> {
     pub fn commit(&self, seq: u64, ticks: u64, meta: u64, len: usize, text: &Buf<W>) {
         // Sequence exhaustion is not expected within a host's lifetime.
         let Some(state) = seq.checked_add(1).and_then(|n| n.checked_mul(2)) else { return };
-        let slot = &self.slots[(seq % N as u64) as usize];
+        let slot = self.slot(seq);
         let (mine, old) = (state - 1, slot.state.load(SeqCst));
         if old >= mine || slot.state.compare_exchange(old, mine, SeqCst, SeqCst).is_err() {
             return;
@@ -158,10 +224,30 @@ impl<const N: usize, const W: usize> Ring<N, W> {
         let _ = slot.state.compare_exchange(mine, state, SeqCst, SeqCst);
     }
 
+    /// The time of the record of sequence `seq`, if it is committed, without
+    /// copying it out: what a reader that orders many rings looks at
+    /// before it takes one record (`get`, which checks it).
+    pub fn ticks(&self, seq: u64) -> Option<u64> {
+        let want = seq.checked_add(1)?.checked_mul(2)?;
+        let slot = self.slot(seq);
+        if slot.state.load(SeqCst) != want {
+            return None;
+        }
+        let ticks = slot.ticks.load(SeqCst);
+        (slot.state.load(SeqCst) == want).then_some(ticks)
+    }
+
+    /// Whether the record of sequence `seq`, which a writer has claimed
+    /// (below head), is not committed yet.
+    pub fn pending(&self, seq: u64) -> bool {
+        let Some(want) = seq.checked_add(1).and_then(|n| n.checked_mul(2)) else { return false };
+        self.slot(seq).state.load(SeqCst) < want
+    }
+
     /// Copy out the record of sequence `seq`, without consuming it.
     pub fn get(&self, seq: u64) -> Entry<W> {
         let Some(want) = seq.checked_add(1).and_then(|n| n.checked_mul(2)) else { return Entry::Gone };
-        let slot = &self.slots[(seq % N as u64) as usize];
+        let slot = self.slot(seq);
         let state = slot.state.load(SeqCst);
         if state != want {
             return if state > want { Entry::Gone } else { Entry::Pending };

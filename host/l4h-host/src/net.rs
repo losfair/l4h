@@ -30,17 +30,11 @@ pub struct Slot {
 }
 
 #[repr(C)]
-pub struct RingIdx {
-    pub head: u32,
-    pub pad0: [u32; 15],
-    pub tail: u32,
-    pub pad1: [u32; 15],
-}
-
-#[repr(C)]
 pub struct Port {
-    pub tx: RingIdx,
-    pub rx: RingIdx,
+    /// Frames the client sends (it produces, netd consumes), and those it
+    /// receives.  Each side keeps its own index (crate::spsc).
+    pub tx: crate::spsc::RingIdx,
+    pub rx: crate::spsc::RingIdx,
     pub mac: [u8; 8],
     /// netd publishes one packed LinkState, so carrier, speed and duplex
     /// change together. This field grants no port permissions.

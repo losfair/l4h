@@ -31,16 +31,40 @@ impl Memd {
         }
         for (n, &i) in got[..count].iter().enumerate() {
             let from = abs(self.mem.slot(i, k));
-            match c {
-                Client::Root => granted(c, n).move_(&from).expect("memd: move to exchange"),
+            // Whatever vmmgr left in its exchange area must not make us
+            // fail, nor a slot it fills again before we do (from another
+            // thread): that fails the call.
+            let given = match c {
+                Client::Root => granted(c, n).move_(&from).is_ok(),
                 Client::Vmmgr => {
-                    // Whatever vmmgr left in its mailbox must not make us fail.
                     let _ = granted(c, n).delete();
-                    granted(c, n).copy(&from, CapRights::all()).expect("memd: copy to mailbox")
+                    granted(c, n).copy(&from, CapRights::all()).is_ok()
                 }
+            };
+            if !given {
+                self.ungrant(c, k, &got[..count], n);
+                return Err(EINVAL);
             }
         }
         Ok(got[..count].iter().map(|&i| (i as u64) << BLOCK_BITS).collect())
+    }
+
+    /// Take back the blocks of order k at `got` of a failed `alloc`, the
+    /// first `given` of which are in the caller's slots.  A root grant
+    /// that root took already stays root's, to `free`.
+    fn ungrant(&mut self, c: Client, k: usize, got: &[u32], given: usize) {
+        for (n, &i) in got.iter().enumerate() {
+            let slot = abs(self.mem.slot(i, k));
+            let back = n >= given
+                || match c {
+                    Client::Root => slot.move_(&granted(c, n)).is_ok(),
+                    // Deletes the copy, wherever vmmgr put it.
+                    Client::Vmmgr => slot.revoke().is_ok(),
+                };
+            if back {
+                self.mem.add(i, k);
+            }
+        }
     }
 
     /// `free`: the (physical address, size bits) of blocks in the exchange

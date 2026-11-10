@@ -15,7 +15,12 @@ pub fn sleep_until(deadline: u64) {
     }
 }
 
+/// Ticks of a counter running at `hz` in `ns` nanoseconds, at most u64::MAX.
+pub fn ns_ticks(hz: u64, ns: u64) -> u64 {
+    u64::try_from(ns as u128 * hz as u128 / 1_000_000_000).unwrap_or(u64::MAX)
+}
+
 /// Block for `ns` nanoseconds of a counter running at `hz`.
 pub fn sleep_ns(hz: u64, ns: u64) {
-    sleep_until(host::ticks::now() + (ns as u128 * hz as u128 / 1_000_000_000) as u64);
+    sleep_until(host::ticks::now().saturating_add(ns_ticks(hz, ns)));
 }

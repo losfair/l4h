@@ -31,7 +31,8 @@
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 out=$1
-rootserver=${2:-$root/host/target/x86_64-sel4-roottask/debug/l4h-root.elf}
+source "$root/tools/host-profile.sh"
+rootserver=${2:-$root/host/target/x86_64-sel4-roottask/$l4h_profile/l4h-root.elf}
 kernel=${3:-$root/build/sel4${L4H_KERNEL_VARIANT:+-$L4H_KERNEL_VARIANT}/bin/kernel.elf}
 guest_kernel=${L4H_GUEST_KERNEL:-$root/build/linux-l4h/vmlinux}
 guest_kmods=${L4H_GUEST_KMODS-$(dirname "$guest_kernel")/kmods.erofs}

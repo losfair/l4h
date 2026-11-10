@@ -24,6 +24,7 @@ use l4h_rt::host::errno::{self, Errno};
 use l4h_rt::host;
 use l4h_rt::host::blk::{self, BlkdConfig, Channel, Pool};
 use l4h_rt::host::fixed::ArrayVec;
+use l4h_rt::host::spsc::{Consumer, Producer};
 use l4h_rt::sel4;
 use l4h_rt::{Info, cap};
 use sel4::cap_type;
@@ -39,8 +40,13 @@ pub struct Seg {
 /// contiguous).
 pub const MAX_PIECES: usize = blk::MAX_SEGS;
 
-/// Requests in flight on the controller: as many as the deepest queue
-/// (NVMe's) holds commands, which is more than the others.
+/// Device requests up to this size are split into as many commands as the
+/// device's limits need, whatever else is in flight (clients send at most
+/// 14 segments of 256 KiB).
+pub const MAX_REQUEST: u64 = 4 << 20;
+
+/// Requests in flight on the controller: as many as the driver that takes
+/// most (NVMe) does.
 const MAX_INFLIGHT: usize = 256;
 
 #[derive(Clone, Copy)]
@@ -110,6 +116,10 @@ struct Client {
     /// Flushes complete at once (l4h_abi::BLK_VOLATILE).
     volatile: bool,
     done: sel4::cap::Notification,
+    /// Our indices of the channel's rings: the client can write over the
+    /// channel's copies.
+    sq: Consumer,
+    cq: Producer,
     outstanding: usize,
     notify_pending: bool,
 }
@@ -183,13 +193,11 @@ fn holds(clients: &[Option<Client>]) -> impl Fn(usize) -> Option<blk::Hold<'stat
 }
 
 impl Client {
+    /// Room was reserved when the request was taken (`submit`).
     fn respond(&mut self, id: u64, status: u32) {
         unsafe {
-            let h = addr_of!((*self.chan).cq.head).read_volatile();
-            addr_of_mut!((*self.chan).resps[h as usize % blk::RING_SIZE])
-                .write_volatile(blk::Resp { id, status, reserved: 0 });
-            fence(Ordering::Release);
-            addr_of_mut!((*self.chan).cq.head).write_volatile(h.wrapping_add(1));
+            addr_of_mut!((*self.chan).resps[self.cq.slot()]).write_volatile(blk::Resp { id, status, reserved: 0 });
+            self.cq.push(&(*self.chan).cq);
         }
         self.notify_pending = true;
     }
@@ -223,7 +231,7 @@ impl Blkd {
     fn notify_completions(&mut self) {
         for &i in &self.active {
             if let Some(c) = self.clients[i].as_mut() {
-                if core::mem::take(&mut c.notify_pending) { c.done.signal(); }
+                if core::mem::take(&mut c.notify_pending) { l4h_rt::mailbox::notify(c.done); }
             }
         }
     }
@@ -269,16 +277,13 @@ impl Blkd {
                     if self.carry.is_some() || !self.drv.can_start() { break; }
                     let Some(t) = self.pending.iter().position(Option::is_none) else { break };
                     let req = unsafe {
-                        let tail = addr_of!((*c.chan).sq.tail).read_volatile();
-                        let head = addr_of!((*c.chan).sq.head).read_volatile();
-                        let cq_used = addr_of!((*c.chan).cq.head).read_volatile()
-                            .wrapping_sub(addr_of!((*c.chan).cq.tail).read_volatile()) as usize;
-                        // Reserve completion space for every in-flight request.
-                        if head == tail || head.wrapping_sub(tail) as usize > blk::RING_SIZE
-                            || cq_used.saturating_add(c.outstanding) >= blk::RING_SIZE { break; }
-                        fence(Ordering::Acquire);
-                        let req = addr_of!((*c.chan).reqs[tail as usize % blk::RING_SIZE]).read_volatile();
-                        addr_of_mut!((*c.chan).sq.tail).write_volatile(tail.wrapping_add(1));
+                        // Reserve completion space for every in-flight
+                        // request.  A ring whose index the client broke
+                        // has nothing ready, or no room.
+                        if c.sq.ready(&(*c.chan).sq) == 0
+                            || (c.cq.used(&(*c.chan).cq) as usize).saturating_add(c.outstanding) >= blk::RING_SIZE { break; }
+                        let req = addr_of!((*c.chan).reqs[c.sq.slot()]).read_volatile();
+                        c.sq.pop(&(*c.chan).sq);
                         req
                     };
                     progress = true;
@@ -372,11 +377,12 @@ impl Blkd {
 
     /// Build the disk a client of `unit` would get, the window `start`,
     /// `sectors` (0: to the end) or the n extents in staging, into `order`
-    /// and `extents`: the slot it may attach in, the disk and whether it is
-    /// read-only, or the errno it is refused with.
+    /// and `extents`: the slot it may attach in (`at`, if that admits it),
+    /// the disk and whether it is read-only, or the errno it is refused
+    /// with.
     #[allow(clippy::too_many_arguments)]
     fn check<'a>(&self, cfg: &BlkdConfig, unit: usize, start: u64, sectors: u64, n: usize, read_only: bool, dom0: bool,
-        order: &'a mut [u16], extents: &'a mut [blk::Extent]) -> Result<(usize, blk::Volume<'a>, bool), u64> {
+        at: Option<usize>, order: &'a mut [u16], extents: &'a mut [blk::Extent]) -> Result<(usize, blk::Volume<'a>, bool), u64> {
         let dev = self.dev.get(unit).ok_or(errno::EINVAL)?;
         let read_only = read_only || dev.read_only;
         let vol = if n == 0 {
@@ -390,7 +396,13 @@ impl Blkd {
             blk::Volume::build(raw, &mut order[..n], &mut extents[..n], dev.capacity)?
         };
         let hold = blk::Hold { unit, extents: vol.extents, read_only };
-        Ok((self.reserved.slot(&holds(&self.clients[..]), &hold, dom0)?, vol, read_only))
+        let active = holds(&self.clients[..]);
+        let slot = match at {
+            None => self.reserved.slot(&active, &hold, dom0)?,
+            Some(i) if self.reserved.admits(&active, &hold, dom0, i) => i,
+            Some(_) => return Err(errno::EINVAL),
+        };
+        Ok((slot, vol, read_only))
     }
 }
 
@@ -424,12 +436,15 @@ impl blk::call::Server for Requests<'_> {
             (core::slice::from_raw_parts_mut(addr_of_mut!((*table).order).cast(), n.max(1)),
              core::slice::from_raw_parts_mut(addr_of_mut!((*table).extents).cast(), n.max(1)))
         };
-        // Exactly what `check` allowed: root serializes checks and
-        // attachments.
-        match b.check(self.cfg, unit, start, count, n, ro != 0, dom0, order, extents) {
-            Ok((slot, vol, read_only)) if slot == i => {
+        // What `check` allowed, in the slot it gave: root serializes
+        // checks and attachments, but not removals, which may since have
+        // freed a lower slot.
+        match b.check(self.cfg, unit, start, count, n, ro != 0, dom0, Some(i), order, extents) {
+            Ok((_, vol, read_only)) => {
                 b.clients[i] = Some(Client { chan, unit, pool, vol, read_only, volatile,
-                    done: cap::<cap_type::Notification>(blk::BLKD_SLOT_CLIENT_DONE + i as u64), outstanding: 0, notify_pending: false });
+                    done: cap::<cap_type::Notification>(blk::BLKD_SLOT_CLIENT_DONE + i as u64),
+                    // Root gave a fresh channel: both rings start empty.
+                    sq: Consumer::new(blk::RING_SIZE), cq: Producer::new(blk::RING_SIZE), outstanding: 0, notify_pending: false });
                 // Not attached yet, so not in active.
                 let _ = b.active.push(i);
                 unsafe {
@@ -472,7 +487,7 @@ impl blk::call::Server for Requests<'_> {
 
     fn check(&mut self, _: blk::Sender, unit: usize, start: u64, sectors: u64, read_only: bool, dom0: bool, n: usize)
         -> Result<blk::Checked, Errno> {
-        let (slot, vol, read_only) = self.b.check(self.cfg, unit, start, sectors, n, read_only, dom0, self.order, self.extents)?;
+        let (slot, vol, read_only) = self.b.check(self.cfg, unit, start, sectors, n, read_only, dom0, None, self.order, self.extents)?;
         Ok(blk::Checked { slot, sectors: vol.sectors(), read_only })
     }
 
@@ -500,7 +515,10 @@ fn main(info: &'static Info) -> ! {
     // A driver has at most blk::MAX_UNITS units.
     let mut dev = ArrayVec::new();
     for u in 0..drv.units() {
-        let _ = dev.push(drv.info(u));
+        // The device's capacity: sectors from 2^55 on have no byte offset
+        // in a u64 (the drivers' `sector * 512`).
+        let d = drv.info(u);
+        let _ = dev.push(DevInfo { capacity: d.capacity.min(u64::MAX >> 9), ..d });
     }
     for (u, d) in dev.iter().enumerate() {
         l4h_rt::info!("blkd {:#x}: shared controller, unit {}: {} sectors, {}-byte blocks", id, u, d.capacity, d.block_size);

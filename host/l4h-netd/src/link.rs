@@ -24,7 +24,7 @@ use l4h_rt::host::net;
 use l4h_rt::{cap, sel4};
 use sel4::cap_type;
 
-use crate::offload::{is_gso, sanitize_rx};
+use crate::offload::{MIN_MSS, is_gso, sanitize_rx};
 
 const _: () = assert!(
     8 + net::HDR_SIZE as u64 + net::MAX_FRAME as u64
@@ -118,7 +118,8 @@ impl Link {
             }
             if ty == MSG_FRAME_GSO && (net::HDR_SIZE + 14..=net::HDR_SIZE + net::MAX_FRAME).contains(&n) {
                 let mut hdr = buf[..net::HDR_SIZE].try_into().unwrap();
-                if is_gso(&hdr) && sanitize_rx(&mut hdr, &buf[net::HDR_SIZE..n]) {
+                // The peer partition is not trusted with tiny segments.
+                if is_gso(&hdr) && sanitize_rx(&mut hdr, &buf[net::HDR_SIZE..n], MIN_MSS) {
                     self.rx_frames += 1;
                     return Some((&mut buf[net::HDR_SIZE..n], hdr));
                 }

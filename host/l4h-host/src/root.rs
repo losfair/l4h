@@ -11,7 +11,8 @@
 use crate::fixed::ArrayVec;
 use crate::wire::{Tail, Wire};
 
-/// trustd's component id; its flags thread's is FLAGS_ID.
+/// trustd's component id; its flags server's (a component of its own) is
+/// FLAGS_ID.
 pub const TRUSTD_ID: u32 = 0x300;
 pub const FLAGS_ID: u32 = 0x301;
 
@@ -92,9 +93,11 @@ crate::protocol! {
         /// (trust::HW_*): `addr` is a physical address, I/O port or PCI
         /// function (bus << 8 | device << 3 | function), `off` a PCI config
         /// offset, `width` in bytes, `value` the value to write.  The value
-        /// read; root refuses RAM, memory and ports in use, and the config
-        /// space of the PCI functions the host drives (reads give all
-        /// ones, writes are dropped).
+        /// read (all ones if refused).  Root refuses RAM, memory and ports
+        /// in use, the BARs of the PCI functions it manages, and writes
+        /// to those functions' configuration space, by the configuration
+        /// mechanism or ECAM (reads are served); only for the ACPI start
+        /// method.
         Hw / hw = 5 from [Trustd] (op: u64, addr: usize, off: usize, width: usize, value: u64) -> u64;
         /// trustd answered guest `guest`'s request: raise its device's
         /// event.
@@ -116,25 +119,26 @@ crate::protocol! {
                 Out VMM_NTFN: Notification [3; 1],
             } -> NewGuest;
         /// The guest is stopped and torn down by vmmgr: drain its disks,
-        /// remove its ports, forget it in trustd, revoke its pool.  The
-        /// bytes of pool kept out of use (a disk could not be stopped).
+        /// remove its ports, forget it in trustd, revoke its pool, and
+        /// answer ENOENT for its requests answered later (their tokens are
+        /// free once vmmgr has taken that and the driver has answered).
+        /// The bytes of pool kept out of use for good (no device could be
+        /// cut off from it), as root knows now: with removals to wait for,
+        /// 0, and root logs what they keep once the drivers have answered.
         GuestDel / guest_del = 0x101 from [Vmmgr] (guest: usize) -> u64;
-        /// Host disk `disk` for the guest's device `dev`, with abi::BLK_*
-        /// `flags`: sectors [lba_start, lba_start + lba_count) of it (0: to
-        /// the end), or if n is not 0 the n extents (start, sectors) at
-        /// offset `list` of dom0's control data area, which blkd reads (root
-        /// copies them unread).  The channel's frames and blkd's kick, with
-        /// the answer, which comes later (`result`).
+        /// Host disk `disk` for the guest, with abi::BLK_* `flags`:
+        /// sectors [lba_start, lba_start + lba_count) of it (0: to the end),
+        /// which root checks against the disk's capacity, or if n is not 0
+        /// the n extents (start, sectors) at offset `list` of dom0's control
+        /// data area, which blkd reads and checks (root copies them unread).
+        /// Always answered later (Later::Token): `result` gives the channel.
         DiskAttach / disk_attach = 0x102 from [Vmmgr]
-            (guest: usize, dev: usize, disk: usize, flags: u64, lba_start: u64, lba_count: u64, n: usize, list: u64)
-            caps {
-                Out CHANNEL: Granule [0; crate::blk::CHANNEL_PAGES],
-                Out KICK: Notification [crate::blk::CHANNEL_PAGES; 1],
-            } -> Later<()>;
-        /// A port of `switch` for the guest's device `dev`, with MAC `mac`
-        /// (0: choose): the CNode of the port's frames (radix
-        /// vmmgr::PORT_RADIX) and netd's kick.  The MAC.
-        NicAdd / nic_add = 0x103 from [Vmmgr] (guest: usize, dev: usize, switch: u32, mac: u64, lock: bool, isolated: bool)
+            (guest: usize, disk: usize, flags: u64, lba_start: u64, lba_count: u64, n: usize, list: u64) -> Later<()>;
+        /// A port of `switch` for the guest, with MAC `mac` (0: choose; else
+        /// 48 bits, not multicast): the CNode of the port's frames (radix
+        /// vmmgr::PORT_RADIX) and netd's kick.  The MAC.  EIO once netd
+        /// has failed.
+        NicAdd / nic_add = 0x103 from [Vmmgr] (guest: usize, switch: u32, mac: u64, lock: bool, isolated: bool)
             caps { Out PORT_FRAMES: CNode [0; 1], Out KICK: Notification [1; 1] } -> u64;
         /// The guest starts, with `ram` bytes, `vcpus` and its launch
         /// digest: its reports describe it from now on.  Whether it is
@@ -146,16 +150,21 @@ crate::protocol! {
         /// CTL_BLK_WRITE.  BLK_WRITE and BLK_INFO are answered later.
         HostOp / host_op = 0x105 from [Vmmgr] (op: u32, args: [u64; 6]) -> Later<Vals>;
         /// The answer of a request answered later, which frees its token:
-        /// as the request would have given it, its capabilities too.
-        /// EAGAIN if root has not answered yet.
-        Result / result = 0x106 from [Vmmgr] (token: usize) -> Vals;
-        /// USB controller `ctrl` (CTL_USB_INFO index) for the guest's
-        /// device `dev`.  Root claims it if the firmware still has it (a
-        /// claim posted to its usbd, not waited for), and makes the queue
-        /// area: the CNode of its frames (radix vmmgr::USB_QUEUE_RADIX in
-        /// root) and usbd's kick.  The guest's USB number n: the VMM raises
-        /// the device's event on badges::vmm::USB bit n.
-        UsbAttach / usb_attach = 0x107 from [Vmmgr] (guest: usize, dev: usize, ctrl: usize)
+        /// its vals, and for DiskAttach the channel's frames and blkd's
+        /// kick.  EAGAIN if root has not answered yet.
+        Result / result = 0x106 from [Vmmgr] (token: usize)
+            caps {
+                Out CHANNEL: Granule [0; crate::blk::CHANNEL_PAGES],
+                Out KICK: Notification [crate::blk::CHANNEL_PAGES; 1],
+            } -> Vals;
+        /// USB controller `ctrl` (CTL_USB_INFO index) for the guest.  Root
+        /// checks the guest has room for it, then claims it if the firmware
+        /// still has it (a claim posted to its usbd, not waited for), and
+        /// makes the queue area: the CNode of its frames (radix
+        /// vmmgr::USB_QUEUE_RADIX in root) and usbd's kick.  The guest's USB
+        /// number n: the VMM raises the device's event on badges::vmm::USB
+        /// bit n.
+        UsbAttach / usb_attach = 0x107 from [Vmmgr] (guest: usize, ctrl: usize)
             caps { Out QUEUE_FRAMES: CNode [0; 1], Out KICK: Notification [1; 1] } -> u64;
     }
 }
@@ -194,5 +203,16 @@ mod tests {
         assert_eq!(Sender::of_badge(recv::COMPONENT | FLAGS_ID as u64), None);
         // A fault is no call.
         assert_eq!(Sender::of_badge(recv::COMPONENT | recv::FAULT | TRUSTD_ID as u64), None);
+    }
+
+    #[test]
+    fn disk_caps_come_with_result() {
+        use crate::wire::Cap;
+        // DiskAttach is always answered later: its channel and kick come
+        // with Result, which declares them.
+        assert!(call::caps::disk_attach::ALL.is_empty());
+        assert_eq!(call::caps::result::ALL.len(), 2);
+        assert_eq!(call::caps::result::KICK.passed_out(0, Cap::Notification), crate::blk::CHANNEL_PAGES);
+        assert_eq!(call::caps::result::CHANNEL.passed_out(crate::blk::CHANNEL_PAGES - 1, Cap::Granule), crate::blk::CHANNEL_PAGES - 1);
     }
 }

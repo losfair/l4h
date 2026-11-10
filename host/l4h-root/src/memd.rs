@@ -127,7 +127,7 @@ impl Memd {
                 }
                 let bar = d.bars[c.bar as usize];
                 let pages = (bar.size as usize).div_ceil(PAGE);
-                if bar.is_io || bar.size == 0 || bar.size as usize > memd::BAR_STRIDE || pages + memd::DMA_PAGES > self.keep_left() {
+                if !crate::blkd::mappable(d, 1 << c.bar) || pages + memd::DMA_PAGES > self.keep_left() {
                     return;
                 }
                 let Some(frames) = alloc.slots.global(|s| devmem.frames(s, bar.addr as usize, bar.size as usize)) else {
@@ -145,6 +145,7 @@ impl Memd {
             cfg.notify = packed(notify);
             cfg.device = packed(device);
             cfg.notify_mult = notify.notify_off_multiplier as u64;
+            cfg.notify_len = notify.length as u64;
         }
         let frames = alloc.slots.global(|s| s.alloc_range(memd::DMA_PAGES));
         let Some(paddr) = self.arena.retype(alloc, &FRAME_BP, memd::DMA_PAGES, Dest::new(crate::slot::CNODE.cap(), frames.start)) else {

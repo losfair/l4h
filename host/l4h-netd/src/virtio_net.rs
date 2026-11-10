@@ -74,6 +74,7 @@ fn modern_device(c: &NicConfig) -> Device {
         common: Mmio(c.common.va as usize),
         notify: Mmio(c.notify.va as usize),
         notify_mult: c.notify_off_multiplier,
+        notify_len: c.notify.len as usize,
         device: Mmio(c.device.va as usize),
     }
 }

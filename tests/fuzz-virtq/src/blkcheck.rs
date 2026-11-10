@@ -5,12 +5,14 @@
 //! guest's I/O pool ever reaches blkd.
 
 use std::cell::RefCell;
+use std::sync::atomic::Ordering::Relaxed;
 
 use crate::Rng;
 use crate::blk::Blk;
 use crate::dev::Backend;
 use crate::guest::GuestMem;
 use crate::host::blk::{self as chan, Channel, Resp};
+use crate::host::spsc::{Consumer, Producer};
 use crate::virtq::Queue;
 
 thread_local! { pub static BACKEND_NOTIFICATIONS: RefCell<usize> = const { RefCell::new(0) }; }
@@ -20,6 +22,9 @@ thread_local! { pub static IRQ_EVENTS: RefCell<Vec<(usize, u32)>> = const { RefC
 /// completed (ids).
 struct Blkd {
     chan: *mut Channel,
+    /// Its own ring indices, as blkd keeps them.
+    sq: Consumer,
+    cq: Producer,
     pending: Vec<u64>,
     rng: Rng,
     /// Chain heads with a buffer outside the I/O pool: the VMM must refuse
@@ -29,18 +34,25 @@ struct Blkd {
 
 thread_local! {
     static BLKD: RefCell<Option<Blkd>> = const { RefCell::new(None) };
+    /// blkd is suspended (root quarantined it): nothing runs when the VMM
+    /// yields.
+    static QUARANTINED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
+
+/// host::ticks per second.
+const HZ: u64 = 1_000_000_000;
 
 impl Blkd {
     /// Take every submitted request.
     fn take(&mut self) {
         unsafe {
             let c = &mut *self.chan;
-            while c.sq.tail != c.sq.head {
-                let id = c.reqs[c.sq.tail as usize % chan::RING_SIZE].id;
+            assert!(self.sq.pending(&c.sq).is_some(), "the VMM published a broken head");
+            while self.sq.ready(&c.sq) != 0 {
+                let id = c.reqs[self.sq.slot()].id;
                 assert!(self.bad & (1 << (id as u16)) == 0, "chain {} outside the I/O pool reached blkd", id as u16);
                 self.pending.push(id);
-                c.sq.tail = c.sq.tail.wrapping_add(1);
+                self.sq.pop(&c.sq);
             }
         }
     }
@@ -50,15 +62,15 @@ impl Blkd {
     fn complete_one(&mut self) -> bool {
         if self.pending.is_empty() { return false; }
         unsafe {
-            if (*self.chan).cq.head.wrapping_sub((*self.chan).cq.tail) >= chan::RING_SIZE as u32 { return false; }
+            assert!(self.cq.room((*self.chan).cq.tail.load(Relaxed)).is_some(), "the VMM published a broken tail");
+            if self.cq.free(&(*self.chan).cq) == 0 { return false; }
         }
         let i = self.rng.below(self.pending.len() as u64) as usize;
         let id = self.pending.swap_remove(i);
         unsafe {
             let c = &mut *self.chan;
-            assert!(c.cq.head.wrapping_sub(c.cq.tail) < chan::RING_SIZE as u32, "completion ring overflows");
-            c.resps[c.cq.head as usize % chan::RING_SIZE] = Resp { id, status: chan::STATUS_OK, reserved: 0 };
-            c.cq.head = c.cq.head.wrapping_add(1);
+            c.resps[self.cq.slot()] = Resp { id, status: chan::STATUS_OK, reserved: 0 };
+            self.cq.push(&c.cq);
         }
         true
     }
@@ -66,6 +78,7 @@ impl Blkd {
 
 /// blkd runs while the VMM yields in `drain`.
 pub fn blkd_run() {
+    if QUARANTINED.get() { return; }
     BLKD.with_borrow_mut(|b| {
         let b = b.as_mut().unwrap();
         b.take();
@@ -164,8 +177,9 @@ pub fn drain_check(rng: &mut Rng, iterations: u64) -> (u64, u64) {
         channel.block_size = 512;
         let chan_ptr: *mut Channel = &mut *channel;
         let seed = rng.next() | 1;
-        BLKD.with_borrow_mut(|b| *b = Some(Blkd { chan: chan_ptr, pending: Vec::new(), rng: Rng(seed), bad }));
-        let mut blk = Blk::new(chan_ptr as usize, crate::sel4::cap::Notification, 0x8000);
+        BLKD.with_borrow_mut(|b| *b = Some(Blkd { chan: chan_ptr, sq: Consumer::new(chan::RING_SIZE),
+            cq: Producer::new(chan::RING_SIZE), pending: Vec::new(), rng: Rng(seed), bad }));
+        let mut blk = Blk::new(chan_ptr as usize, crate::sel4::cap::Notification, 0x8000, HZ);
         blk.features_accepted(if nr_queues == 4 { 1 << 12 } else { 0 });
         let mut queues = core::array::from_fn::<_, 4, _>(|_| Queue::default());
         for (q, queue) in queues.iter_mut().enumerate().take(nr_queues) {
@@ -202,7 +216,7 @@ pub fn drain_check(rng: &mut Rng, iterations: u64) -> (u64, u64) {
             b.take();
             assert!(b.pending.is_empty(), "drain returned with {} requests in blkd", b.pending.len());
         });
-        drained += channel.cq.tail as u64;
+        drained += channel.cq.tail.load(Relaxed) as u64;
         blk.reset();
         for queue in &mut queues { queue.reset(); }
         BLKD.with_borrow_mut(|b| *b = None);
@@ -233,9 +247,11 @@ fn offer(mem: &GuestMem, queue: &mut Queue, q: usize, op: u32) {
     mem.write::<u16>(base + 0x1002, 1);
 }
 
+/// blkd's answer to `id`, from a fake blkd that keeps no index of its own.
 fn reply(channel: &mut Channel, id: u64) {
-    channel.resps[channel.cq.head as usize % chan::RING_SIZE] = Resp { id, status: chan::STATUS_OK, reserved: 0 };
-    channel.cq.head = channel.cq.head.wrapping_add(1);
+    let head = channel.cq.head.load(Relaxed);
+    channel.resps[head as usize % chan::RING_SIZE] = Resp { id, status: chan::STATUS_OK, reserved: 0 };
+    channel.cq.head.store(head.wrapping_add(1), Relaxed);
 }
 
 #[test]
@@ -245,14 +261,14 @@ fn same_chain_head_on_two_queues_completes_on_its_own_queue() {
     let mut channel: Box<Channel> = unsafe { Box::new_zeroed().assume_init() };
     channel.capacity_sectors = 131072;
     channel.block_size = 512;
-    let mut disk = Blk::new(&mut *channel as *mut Channel as usize, crate::sel4::cap::Notification, mem.size);
+    let mut disk = Blk::new(&mut *channel as *mut Channel as usize, crate::sel4::cap::Notification, mem.size, HZ);
     disk.features_accepted(1 << 12);
     let mut queues = core::array::from_fn::<_, 4, _>(|_| Queue::default());
     offer(&mem, &mut queues[0], 0, chan::OP_READ);
     offer(&mem, &mut queues[1], 1, chan::OP_READ);
     disk.kick(&mem, &mut queues, 0);
     disk.kick(&mem, &mut queues, 1);
-    assert_eq!(channel.sq.head, 2, "both queues must submit their own head 0");
+    assert_eq!(channel.sq.head.load(Relaxed), 2, "both queues must submit their own head 0");
     let first = channel.reqs[0].id;
     let second = channel.reqs[1].id;
     assert_ne!(first, second);
@@ -267,13 +283,50 @@ fn same_chain_head_on_two_queues_completes_on_its_own_queue() {
 }
 
 #[test]
+fn indices_blkd_writes_over_stay_the_vmms() {
+    // blkd writes over the VMM's own indices (sq.head, cq.tail): where the
+    // VMM puts its next request, and which response it takes next, stay.
+    let mut ram = vec![0u64; 0x20000 / 8];
+    let mem = GuestMem { base: ram.as_mut_ptr() as usize, gpa: POOL, size: 0x20000 };
+    let mut channel: Box<Channel> = unsafe { Box::new_zeroed().assume_init() };
+    channel.capacity_sectors = 131072;
+    channel.block_size = 512;
+    let mut disk = Blk::new(&mut *channel as *mut Channel as usize, crate::sel4::cap::Notification, mem.size, HZ);
+    disk.features_accepted(1 << 12);
+    let mut queues = core::array::from_fn::<_, 4, _>(|_| Queue::default());
+    offer(&mem, &mut queues[0], 0, chan::OP_READ);
+    disk.kick(&mem, &mut queues, 0);
+    let first = channel.reqs[0].id;
+    channel.sq.tail.store(1, Relaxed);
+    channel.sq.head.store(77, Relaxed);
+    offer(&mem, &mut queues[1], 1, chan::OP_READ);
+    disk.kick(&mem, &mut queues, 1);
+    assert_eq!(channel.sq.head.load(Relaxed), 2, "the request goes after the VMM's own head");
+    let second = channel.reqs[1].id;
+    assert_ne!(second, first);
+    reply(&mut channel, first);
+    channel.cq.tail.store(1, Relaxed);
+    assert!(disk.complete(&mem, &mut queues));
+    assert_eq!((queues[0].used_idx(), channel.cq.tail.load(Relaxed)), (1, 1), "the response at the VMM's own tail");
+    // A head further from the VMM's tail than the ring holds gives nothing.
+    channel.cq.head.store(1 + 2 * chan::RING_SIZE as u32, Relaxed);
+    assert!(!disk.pending());
+    assert!(!disk.complete(&mem, &mut queues));
+    channel.cq.head.store(1, Relaxed);
+    reply(&mut channel, second);
+    assert!(disk.complete(&mem, &mut queues));
+    assert_eq!(queues[1].used_idx(), 1);
+    assert!(!disk.pending());
+}
+
+#[test]
 fn flush_fences_other_queues_until_writes_and_flush_complete() {
     let mut ram = vec![0u64; 0x20000 / 8];
     let mem = GuestMem { base: ram.as_mut_ptr() as usize, gpa: POOL, size: 0x20000 };
     let mut channel: Box<Channel> = unsafe { Box::new_zeroed().assume_init() };
     channel.capacity_sectors = 131072;
     channel.block_size = 512;
-    let mut disk = Blk::new(&mut *channel as *mut Channel as usize, crate::sel4::cap::Notification, mem.size);
+    let mut disk = Blk::new(&mut *channel as *mut Channel as usize, crate::sel4::cap::Notification, mem.size, HZ);
     disk.features_accepted(1 << 12);
     let mut queues = core::array::from_fn::<_, 4, _>(|_| Queue::default());
     offer(&mem, &mut queues[0], 0, chan::OP_WRITE);
@@ -282,20 +335,20 @@ fn flush_fences_other_queues_until_writes_and_flush_complete() {
     disk.kick(&mem, &mut queues, 0);
     disk.kick(&mem, &mut queues, 1);
     disk.kick(&mem, &mut queues, 2);
-    assert_eq!(channel.sq.head, 1, "flush waits for the accepted write");
+    assert_eq!(channel.sq.head.load(Relaxed), 1, "flush waits for the accepted write");
     let write = channel.reqs[0].id;
     reply(&mut channel, write);
     disk.complete(&mem, &mut queues);
     disk.kick(&mem, &mut queues, 1);
-    assert_eq!(channel.sq.head, 2);
+    assert_eq!(channel.sq.head.load(Relaxed), 2);
     assert_eq!(channel.reqs[1].op, chan::OP_FLUSH);
     disk.kick(&mem, &mut queues, 2);
-    assert_eq!(channel.sq.head, 2, "later writes wait for flush completion");
+    assert_eq!(channel.sq.head.load(Relaxed), 2, "later writes wait for flush completion");
     let flush = channel.reqs[1].id;
     reply(&mut channel, flush);
     disk.complete(&mem, &mut queues);
     disk.kick(&mem, &mut queues, 2);
-    assert_eq!(channel.sq.head, 3);
+    assert_eq!(channel.sq.head.load(Relaxed), 3);
     assert_eq!(channel.reqs[2].op, chan::OP_WRITE);
     let later = channel.reqs[2].id;
     reply(&mut channel, later);
@@ -310,7 +363,7 @@ fn resetting_one_queue_returns_other_queues_and_fences_old_completions() {
     let mut channel: Box<Channel> = unsafe { Box::new_zeroed().assume_init() };
     channel.capacity_sectors = 131072;
     channel.block_size = 512;
-    let mut disk = Blk::new(&mut *channel as *mut Channel as usize, crate::sel4::cap::Notification, mem.size);
+    let mut disk = Blk::new(&mut *channel as *mut Channel as usize, crate::sel4::cap::Notification, mem.size, HZ);
     disk.features_accepted(1 << 12);
     let mut queues = core::array::from_fn::<_, 4, _>(|_| Queue::default());
     offer(&mem, &mut queues[0], 0, chan::OP_READ);
@@ -336,6 +389,47 @@ fn resetting_one_queue_returns_other_queues_and_fences_old_completions() {
     assert_eq!(queues[0].used_idx(), 1);
 }
 
+#[test]
+fn a_reset_gives_up_on_a_blkd_that_stopped_and_the_disk_fails() {
+    for whole in [false, true] {
+        let mut ram = vec![0u64; 0x20000 / 8];
+        let mem = GuestMem { base: ram.as_mut_ptr() as usize, gpa: POOL, size: 0x20000 };
+        let mut channel: Box<Channel> = unsafe { Box::new_zeroed().assume_init() };
+        channel.capacity_sectors = 131072;
+        channel.block_size = 512;
+        // A slow counter: the wait is short.
+        let mut disk = Blk::new(&mut *channel as *mut Channel as usize, crate::sel4::cap::Notification, mem.size, 1000);
+        disk.features_accepted(1 << 12);
+        let mut queues = core::array::from_fn::<_, 4, _>(|_| Queue::default());
+        offer(&mem, &mut queues[0], 0, chan::OP_READ);
+        offer(&mem, &mut queues[1], 1, chan::OP_READ);
+        disk.kick(&mem, &mut queues, 0);
+        disk.kick(&mem, &mut queues, 1);
+        assert_eq!(channel.sq.head.load(Relaxed), 2);
+        let ids = [channel.reqs[0].id, channel.reqs[1].id];
+        QUARANTINED.set(true);
+        if whole {
+            disk.drain();
+            disk.reset();
+        } else {
+            // The other queue's request fails; the reset one's is dropped.
+            assert_eq!(disk.drain_queue(&mem, &mut queues, 0), 1 << 1);
+            assert_eq!((queues[0].used_idx(), queues[1].used_idx()), (0, 1));
+            assert_eq!(mem.read::<u8>(POOL + 0x8000 + 0x4000), 1);
+        }
+        // Answers that come late are never read; new requests fail at once.
+        for id in ids { reply(&mut channel, id); }
+        assert!(!disk.pending());
+        assert!(!disk.complete(&mem, &mut queues));
+        offer(&mem, &mut queues[0], 0, chan::OP_READ);
+        disk.kick(&mem, &mut queues, 0);
+        assert_eq!(channel.sq.head.load(Relaxed), 2);
+        assert_eq!(queues[0].used_idx(), 1);
+        assert_eq!(mem.read::<u8>(POOL + 0x4000), 1);
+        disk.drain();
+        QUARANTINED.set(false);
+    }
+}
 
 struct DeviceFixture {
     _ram: Vec<u64>,
@@ -354,7 +448,7 @@ impl DeviceFixture {
         let mut channel: Box<Channel> = unsafe { Box::new_zeroed().assume_init() };
         channel.capacity_sectors = 131072;
         channel.block_size = 512;
-        let backend = Blk::new(&mut *channel as *mut Channel as usize, crate::sel4::cap::Notification, mem.size);
+        let backend = Blk::new(&mut *channel as *mut Channel as usize, crate::sel4::cap::Notification, mem.size, HZ);
         let mut page = Box::new([0u64; 512]);
         let regs = page.as_mut_ptr().cast::<l4h_abi::VirtioRegs>();
         let mut device = crate::dev::Device::new(page.as_mut_ptr() as usize, 20, backend);
@@ -390,7 +484,7 @@ impl DeviceFixture {
 #[test]
 fn device_notifies_only_the_completed_queue_on_its_selected_cpu() {
     let mut f = DeviceFixture::new(&[chan::OP_READ, chan::OP_READ]);
-    assert_eq!(f.channel.sq.head, 2);
+    assert_eq!(f.channel.sq.head.load(Relaxed), 2);
     f.complete(1);
     IRQ_EVENTS.with_borrow(|events| assert_eq!(events.as_slice(), &[(1, 97)]));
     f.complete(0);
@@ -400,12 +494,12 @@ fn device_notifies_only_the_completed_queue_on_its_selected_cpu() {
 #[test]
 fn device_resumes_unpopped_queues_after_flush_without_another_guest_kick() {
     let mut f = DeviceFixture::new(&[chan::OP_WRITE, chan::OP_FLUSH, chan::OP_WRITE]);
-    assert_eq!(f.channel.sq.head, 1);
+    assert_eq!(f.channel.sq.head.load(Relaxed), 1);
     f.complete(0);
-    assert_eq!(f.channel.sq.head, 2);
+    assert_eq!(f.channel.sq.head.load(Relaxed), 2);
     assert_eq!(f.channel.reqs[1].op, chan::OP_FLUSH);
     f.complete(1);
-    assert_eq!(f.channel.sq.head, 3);
+    assert_eq!(f.channel.sq.head.load(Relaxed), 3);
     assert_eq!(f.channel.reqs[2].op, chan::OP_WRITE);
     f.complete(2);
     assert!(!f.device.backend.pending());
@@ -431,6 +525,6 @@ fn completion_batch_is_visible_even_when_one_queue_suppresses_interrupts() {
 fn polling_multiple_queues_notifies_the_backend_once() {
     BACKEND_NOTIFICATIONS.with_borrow_mut(|n| *n = 0);
     let f = DeviceFixture::new(&[chan::OP_READ, chan::OP_READ]);
-    assert_eq!(f.channel.sq.head, 2);
+    assert_eq!(f.channel.sq.head.load(Relaxed), 2);
     BACKEND_NOTIFICATIONS.with_borrow(|n| assert_eq!(*n, 1));
 }

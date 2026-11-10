@@ -65,11 +65,14 @@ static MUTEXES: AtomicU32 = AtomicU32::new(0);
 /// What the interpreter maps that is none of our ranges (the PM1 blocks,
 /// in system memory on some machines): it only touches them for the
 /// firmware's global lock, which we do not take.
-static mut SCRATCH: [u8; 4096] = [0; 4096];
+static mut SCRATCH: [u8; SCRATCH_LEN] = [0; SCRATCH_LEN];
+const SCRATCH_LEN: usize = 4096;
 
 impl Hw {
     fn local(&self, paddr: usize, width: usize) -> Option<usize> {
-        self.ranges.iter().find(|&&(p, n, _)| p <= paddr && paddr + width <= p + n).map(|&(p, _, va)| va + (paddr - p))
+        // The firmware's AML chooses `paddr` and `width`.
+        self.ranges.iter().find(|&&(p, n, _)| p <= paddr && paddr.checked_add(width).is_some_and(|end| end <= p + n))
+            .map(|&(p, _, va)| va + (paddr - p))
     }
 
     /// One access through root.
@@ -120,7 +123,7 @@ impl Hw {
     }
 
     fn spin_ns(&self, ns: u64) {
-        let end = host::ticks::now() + (ns as u128 * self.hz as u128 / 1_000_000_000) as u64;
+        let end = host::ticks::now().saturating_add(time::ns_ticks(self.hz, ns));
         while host::ticks::now() < end {
             core::hint::spin_loop();
         }
@@ -129,7 +132,16 @@ impl Hw {
 
 impl acpi::Handler for Hw {
     unsafe fn map_physical_region<T>(&self, paddr: usize, size: usize) -> RawPhysicalMapping<T> {
-        let va = self.local(paddr, size).unwrap_or(core::ptr::addr_of_mut!(SCRATCH) as usize);
+        // The firmware chose `size`: a region that is none of our ranges
+        // gets SCRATCH only if it fits there, so the interpreter's accesses
+        // through the mapping stay inside it.  Otherwise this thread panics,
+        // which root handles (no attestation), rather than letting the
+        // interpreter read and write trustd's own memory past SCRATCH.
+        let va = match self.local(paddr, size) {
+            Some(va) => va,
+            None if size <= SCRATCH_LEN => core::ptr::addr_of_mut!(SCRATCH) as usize,
+            None => panic!("trustd: AML maps {:#x}+{:#x}, outside the ranges root gave", paddr, size),
+        };
         unsafe { RawPhysicalMapping::new(paddr, NonNull::new(va as *mut T).unwrap(), size, size) }
     }
 
@@ -201,10 +213,10 @@ impl acpi::Handler for Hw {
     // Stall is a busy wait by the ACPI specification (at most 100 us);
     // Sleep need not be.
     fn stall(&self, us: u64) {
-        self.spin_ns(us * 1000);
+        self.spin_ns(us.saturating_mul(1000));
     }
     fn sleep(&self, ms: u64) {
-        time::sleep_ns(self.hz, ms * 1_000_000);
+        time::sleep_ns(self.hz, ms.saturating_mul(1_000_000));
     }
     // One thread: mutexes are always free.
     fn create_mutex(&self) -> Handle {

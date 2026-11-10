@@ -17,7 +17,7 @@ use l4h_virtio::{
     STATUS_ACK, STATUS_DRIVER, STATUS_DRIVER_OK, STATUS_FAILED, Virtq, legacy, legacy_ring_size,
 };
 
-use crate::{DevInfo, Driver, MAX_PIECES, Seg};
+use crate::{DevInfo, Driver, MAX_PIECES, MAX_REQUEST, Seg};
 
 /// The request queue; 0 and 1 are the control and event queues, unused.
 const REQUEST_QUEUE: u16 = 2;
@@ -27,9 +27,6 @@ const CFG_NUM_QUEUES: usize = 0;
 const MAX_SLOTS: usize = blk::RING_SIZE;
 /// Descriptors of a command: header, data pieces, response.
 const MAX_DESCS: usize = 2 + MAX_PIECES;
-/// Requests up to this size are split into as many commands as the
-/// device's limits need (clients send at most 14 segments of 256 KiB).
-const MAX_REQUEST: u64 = 4 << 20;
 
 // Device configuration.
 const CFG_SEG_MAX: usize = 4;
@@ -225,6 +222,7 @@ impl VirtioScsi {
                 common: Mmio(cfg.common.va as usize),
                 notify: Mmio(cfg.notify.va as usize),
                 notify_mult: cfg.notify_off_multiplier,
+                notify_len: cfg.notify.len as usize,
                 device: Mmio(cfg.device.va as usize),
             };
             dev.reset();
@@ -419,7 +417,7 @@ impl VirtioScsi {
         }
         let mut u = Unit {
             lun, target, number,
-            blocks: last + 1,
+            blocks: last.saturating_add(1),
             block_size: block_size as u32,
             max_bytes: (self.max_sectors * 512 / block_size).max(1) * block_size,
             read_only: false,
@@ -559,7 +557,7 @@ impl Driver for VirtioScsi {
     fn info(&self, unit: usize) -> DevInfo {
         let u = &self.units[unit];
         DevInfo {
-            capacity: u.blocks * (u.block_size as u64 / 512),
+            capacity: u.blocks.saturating_mul(u.block_size as u64 / 512),
             block_size: u.block_size,
             read_only: u.read_only,
             flush: u.flush,

@@ -41,7 +41,8 @@ while getopts e:b:i:c:m: o; do
 done
 shift $((OPTIND - 1))
 out=$1
-rootserver=${2:-$root/host/target/x86_64-sel4-roottask/debug/l4h-root.elf}
+source "$root/tools/host-profile.sh"
+rootserver=${2:-$root/host/target/x86_64-sel4-roottask/$l4h_profile/l4h-root.elf}
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 

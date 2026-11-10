@@ -120,17 +120,12 @@ fn host_op(h: &mut Vmmgr, op: u32, a: &[u64; 6]) -> Result<[u64; 6], Errno> {
     }
 }
 
-/// A control request done now, or deferred.
-fn deferred(r: Later<()>) -> Result<(), Errno> {
-    match r {
-        Later::Now(()) => Ok(()),
-        Later::Token(_) => Err(DEFER),
-    }
-}
+// Request words narrowed to usize (`as usize`) keep every bit; narrower
+// ones are taken with try_from and the op's errno for a bad argument.
+const _: () = assert!(usize::BITS == u64::BITS);
 
 fn vm_arg(a: u64) -> Result<usize, Errno> {
-    let id = a as usize;
-    if id >= MAX_GUESTS { Err(ENOENT) } else { Ok(id) }
+    usize::try_from(a).ok().filter(|&id| id < MAX_GUESTS).ok_or(ENOENT)
 }
 
 fn cstr(data: &[u8]) -> &[u8] {
@@ -142,7 +137,8 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
     let a = &req.args;
     match req.op {
         abi::CTL_LOG_READ => {
-            let ring = unsafe { &*(host::log::VA as *const host::log::Ring) };
+            // Every lane, as root mapped them for us, read-only.
+            let ring = unsafe { &*(host::log::READ_VA as *const host::log::Ring) };
             let r = ring.read(a[0], a[1], &mut resp.data).ok_or(EINVAL)?;
             resp.vals = [r.next, r.len as u64, r.lost, r.end, 0, 0];
             Ok(())
@@ -309,7 +305,7 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
                 return Err(EINVAL);
             }
             let then = later(h);
-            h.attach_disk(id, a[1] as usize, a[2], a[3], a[4], (0, 0), then).and_then(deferred)
+            h.attach_disk(id, a[1] as usize, a[2], a[3], a[4], (0, 0), then).and(Err(DEFER))
         }
         abi::CTL_BLK_ATTACH_EXTENTS => {
             let id = vm_arg(a[0])?;
@@ -321,7 +317,7 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
             }
             // Root reads the list from the data area.
             let then = later(h);
-            h.attach_disk(id, a[1] as usize, a[2], 0, 0, (a[4], a[3]), then).and_then(deferred)
+            h.attach_disk(id, a[1] as usize, a[2], 0, 0, (a[4], a[3]), then).and(Err(DEFER))
         }
         abi::CTL_CONSOLE_READ => {
             let g = h.guest(vm_arg(a[0])?).ok_or(ENOENT)?;
@@ -399,26 +395,23 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
             if id == caller {
                 return Err(EINVAL);
             }
-            resp.vals[0] = h.create_nic(id, a[1] as u32, a[2], a[3] & abi::NIC_NO_MAC_LOCK == 0, a[3] & abi::NIC_ISOLATED != 0)?;
+            let switch = u32::try_from(a[1]).map_err(|_| EINVAL)?;
+            resp.vals[0] = h.create_nic(id, switch, a[2], a[3] & abi::NIC_NO_MAC_LOCK == 0, a[3] & abi::NIC_ISOLATED != 0)?;
             Ok(())
         }
         abi::CTL_VM_SET_SCHED => {
             let id = vm_arg(a[0])?;
-            if a[1] > 100 {
-                return Err(EINVAL);
-            }
-            if crate::sched::set_cap(h, id, a[1] as u32) { Ok(()) } else { Err(ENOENT) }
+            let cap = u32::try_from(a[1]).ok().filter(|&c| c <= 100).ok_or(EINVAL)?;
+            if crate::sched::set_cap(h, id, cap) { Ok(()) } else { Err(ENOENT) }
         }
         abi::CTL_VM_SHUTDOWN => {
             let id = vm_arg(a[0])?;
-            if a[1] != abi::POWER_OFF && a[1] != abi::POWER_REBOOT {
-                return Err(EINVAL);
-            }
+            let how = u32::try_from(a[1]).ok().filter(|&p| p as u64 == abi::POWER_OFF || p as u64 == abi::POWER_REBOOT).ok_or(EINVAL)?;
             let g = h.guests.get(id).and_then(|g| g.as_ref()).ok_or(ENOENT)?;
             if g.state != State::Running {
                 return Err(EBUSY);
             }
-            unsafe { addr_of_mut!((*g.console_page()).power_request).write_volatile(a[1] as u32 + 1) };
+            unsafe { addr_of_mut!((*g.console_page()).power_request).write_volatile(how + 1) };
             // The console is device 0.
             g.raise_event(&mut h.alloc, crate::guest::dev_event(0));
             Ok(())

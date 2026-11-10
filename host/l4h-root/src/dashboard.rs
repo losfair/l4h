@@ -146,23 +146,25 @@ impl Dashboard {
     pub fn new(bootinfo: &sel4::BootInfoPtr, alloc: &mut Alloc, devmem: &mut DevMem, fb_console: bool) -> Option<Self> {
         let extra = bootinfo.extra().find(|e| e.id == sel4::BootInfoExtraId::X86FrameBuffer)?;
         let (addr, pitch, width, height, bpp, ty) = parse_fb(extra.content())?;
-        if addr == 0 || bpp != 32 || ty != 1 || width < 640 || height < 400 {
+        // `put` stays in the rows only with a pitch of at least a row.
+        if addr == 0 || bpp != 32 || ty != 1 || width < 640 || height < 400 || pitch < width * 4 {
             info!("l4h-root: framebuffer {}x{}@{} type {} not supported", width, height, bpp, ty);
             return None;
         }
-        // Device frames come in aligned power-of-two blocks.
+        // The geometry is the firmware's: bounded before it is worked with.
         let (addr, len) = (addr as usize, pitch * height);
+        if len > crate::layout::FRAMEBUFFER.size - 4096 || addr.checked_add(len).is_none() {
+            info!("l4h-root: framebuffer of {} MiB is too large", len >> 20);
+            return None;
+        }
+        // Device frames come in aligned power-of-two blocks.
         let mut size = len.next_power_of_two();
-        while addr & !(size - 1) < addr + len - size {
-            size *= 2;
+        while addr + len - (addr & !(size - 1)) > size {
+            size = size.checked_mul(2)?;
         }
         let base = addr & !(size - 1);
         let first = (addr - base) / 4096;
         let pages = (addr - base + len).div_ceil(4096) - first;
-        if pages * 4096 > crate::layout::FRAMEBUFFER.size {
-            info!("l4h-root: framebuffer of {} MiB is too large", len >> 20);
-            return None;
-        }
         let frames = alloc.slots.global(|slots| devmem.frames(slots, base, size))?;
         let wc = write_combining();
         alloc.global(|alloc| {

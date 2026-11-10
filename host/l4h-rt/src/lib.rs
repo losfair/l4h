@@ -88,7 +88,7 @@ static PANIC_LEN: AtomicUsize = AtomicUsize::new(0);
 fn panic_flush() {
     let n = PANIC_LEN.swap(0, Ordering::Relaxed).min(PANIC_LINE.len());
     let line: [u8; 120] = core::array::from_fn(|i| PANIC_LINE[i].load(Ordering::Relaxed));
-    host::serial::write(INFO.header().id, &line[..n], false);
+    host::serial::write(0, &line[..n], false);
 }
 
 /// What the panic machinery prints with.
@@ -135,8 +135,10 @@ pub fn init() -> &'static Info {
         sel4::set_ipc_buffer((IPCBUF_VA as *mut sel4::IpcBuffer).as_mut().unwrap());
     }
     assert_eq!(INFO.header().magic, INFO_MAGIC, "bad component info page");
-    host::log::init(unsafe { &*(host::log::VA as *const host::log::Ring) }, INFO.header().id);
-    host::serial::init(unsafe { &*(host::serial::VA as *const host::serial::Ring) }, INFO.header().id);
+    // The lanes the parent mapped at log::VA and serial::VA, and their sizes.
+    let (log, serial) = host::log::info_records(INFO.header().reserved[host::log::LANES_INFO]);
+    host::log::init_lane(log);
+    host::serial::init_lane(serial);
     sel4_panicking::set_hook(&|info| log!("l4h-rt: component {:#x}: {}", INFO.header().id, info));
     audit(INFO.header().kind);
     if host::has_keeper(INFO.header().kind) {

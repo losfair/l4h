@@ -232,8 +232,10 @@ pub fn run<S: Server>(ep: sel4::cap::Endpoint, mut reply: impl ReplyObject, s: &
 
 /// A capability type, as the kind protocols declare that a call passes
 /// (wire::Cap): `Caps::passed_in` and `passed_out` take it, so that the
-/// capability put in an exchange slot, or taken from it, is of the kind
-/// the call declares there.
+/// capability this end puts in an exchange slot, or takes from it as, is
+/// of the kind the call declares there.  It says nothing of what the other
+/// end left in the slot, which a release kernel cannot tell: a receiver
+/// never invokes what a less trusted sender passed (wire::Caps).
 pub trait Kind: sel4::CapType {
     const KIND: Cap;
 }

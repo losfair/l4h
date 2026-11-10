@@ -7,10 +7,15 @@
 # L4H_TEST_KERNEL may name an already-built compatible guest kernel.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
+source "$root/tools/host-profile.sh"
 export PATH="/usr/sbin:$PATH"
 out=$root/build/sharedblk
 mkdir -p "$out"
-rustc +stable --edition=2024 --test "$root/tests/blk-windows.rs" -o "$out/blk-window-tests"
+# The window and extent checks, against the l4h-host crate (tests/run-fuzz.sh
+# runs them too).
+rustc +stable --edition=2024 --crate-type rlib --crate-name l4h_abi "$root/host/l4h-abi/src/lib.rs" -o "$out/libl4h_abi.rlib"
+rustc +stable --edition=2024 --crate-type rlib --crate-name l4h_host "$root/host/l4h-host/src/lib.rs" --extern l4h_abi="$out/libl4h_abi.rlib" -o "$out/libl4h_host.rlib"
+rustc +stable --edition=2024 --test "$root/tests/blk-windows.rs" --extern l4h_host="$out/libl4h_host.rlib" -L "$out" -o "$out/blk-window-tests"
 "$out/blk-window-tests"
 if [ -n "${L4H_TEST_KERNEL:-}" ]; then
     objcopy --strip-debug "$L4H_TEST_KERNEL" "$out/vmlinux"
@@ -43,7 +48,7 @@ scsi-luns)
 *) slowdev=(-device virtio-blk-pci,drive=d1,disable-legacy=on)
    dev=(-device virtio-blk-pci,drive=d0,disable-legacy=on) ;;
 esac
-"$root/tools/run-qemu.sh" "$root/host/target/x86_64-sel4-roottask/debug/l4h-root.elf" \
+"$root/tools/run-qemu.sh" "$root/host/target/x86_64-sel4-roottask/$l4h_profile/l4h-root.elf" \
     -drive "file=$out/disk.raw,if=none,id=d0,format=raw" "${dev[@]}" \
     -drive "file=$out/slow.raw,if=none,id=d1,format=raw,throttling.bps-read=65536" "${slowdev[@]}" > "$out/qemu.log" 2>&1 &
 qemu=$!

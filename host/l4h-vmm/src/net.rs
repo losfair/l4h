@@ -7,6 +7,7 @@ use core::sync::atomic::{Ordering, fence};
 
 use l4h_rt::host::fixed::ArrayVec;
 use l4h_rt::host::net::{self, Port};
+use l4h_rt::host::spsc::{Consumer, Producer};
 use l4h_rt::sel4;
 
 use crate::dev::Backend;
@@ -35,6 +36,10 @@ type Chain = ArrayVec<Buf, { QUEUE_SIZE as usize }>;
 
 pub struct Net {
     chan: *mut Port,
+    /// Our indices of the port's rings: netd can write over the port's
+    /// copies.
+    tx: Producer,
+    rx: Consumer,
     kick: sel4::cap::Notification,
     mac: [u8; 6],
     /// The receive queue's size (host::iopool::rx_queue_size).
@@ -49,7 +54,9 @@ impl Net {
     pub fn new(chan_va: usize, kick: sel4::cap::Notification, mac: [u8; 6], rx_queue: u32) -> Self {
         let chan = chan_va as *mut Port;
         let link = net::LinkState(unsafe { addr_of!((*chan).link_state).read_volatile() });
-        Net { chan, kick, mac, rx_queue: rx_queue.min(QUEUE_SIZE), tx_blocked: false, link }
+        // Fresh port memory: both rings start empty.
+        Net { chan, tx: Producer::new(net::RING_SIZE), rx: Consumer::new(net::RING_SIZE), kick, mac,
+            rx_queue: rx_queue.min(QUEUE_SIZE), tx_blocked: false, link }
     }
 
     fn link_config(&self, config: &mut [u8]) {
@@ -59,12 +66,9 @@ impl Net {
         config[16] = self.link.duplex();
     }
 
+    /// Full, or netd broke the tail.
     fn tx_full(&self) -> bool {
-        unsafe {
-            let head = addr_of!((*self.chan).tx.head).read_volatile();
-            let tail = addr_of!((*self.chan).tx.tail).read_volatile();
-            head.wrapping_sub(tail) as usize >= net::RING_SIZE
-        }
+        unsafe { self.tx.free(&(*self.chan).tx) == 0 }
     }
 
     /// Guest -> port.  Returns (returned to guest, queued to the port).
@@ -80,8 +84,7 @@ impl Net {
             let mut bufs = Chain::new();
             if q.chain(mem, head, &mut bufs).is_ok() {
                 unsafe {
-                    let h = addr_of!((*self.chan).tx.head).read_volatile();
-                    let slot = addr_of_mut!((*self.chan).tx_slots[h as usize % net::RING_SIZE]);
+                    let slot = addr_of_mut!((*self.chan).tx_slots[self.tx.slot()]);
                     let hdr = addr_of_mut!((*slot).hdr) as *mut u8;
                     let data = addr_of_mut!((*slot).data) as *mut u8;
                     // The header first, then the frame.
@@ -107,8 +110,7 @@ impl Net {
                     }
                     if ok && off == HDR && n >= 14 {
                         addr_of_mut!((*slot).len).write_volatile(n as u32);
-                        fence(Ordering::Release);
-                        addr_of_mut!((*self.chan).tx.head).write_volatile(h.wrapping_add(1));
+                        self.tx.push(&(*self.chan).tx);
                         queued = true;
                     }
                 }
@@ -123,19 +125,15 @@ impl Net {
     fn receive(&mut self, mem: &GuestMem, q: &mut Queue) -> bool {
         let mut returned = false;
         loop {
-            let (tail, head) = unsafe {
-                (addr_of!((*self.chan).rx.tail).read_volatile(), addr_of!((*self.chan).rx.head).read_volatile())
-            };
-            if tail == head {
+            if unsafe { self.rx.ready(&(*self.chan).rx) } == 0 {
                 break;
             }
             let Some(chain) = q.pop(mem) else { break };
-            fence(Ordering::Acquire);
             let mut bufs = Chain::new();
             let mut written = 0usize;
             if q.chain(mem, chain, &mut bufs).is_ok() {
                 unsafe {
-                    let slot = addr_of!((*self.chan).rx_slots[tail as usize % net::RING_SIZE]);
+                    let slot = addr_of!((*self.chan).rx_slots[self.rx.slot()]);
                     let len = (addr_of!((*slot).len).read_volatile() as usize).min(net::MAX_FRAME);
                     let data = addr_of!((*slot).data) as *const u8;
                     // The slot's header, with num_buffers = 1.
@@ -165,10 +163,7 @@ impl Net {
                     }
                 }
             }
-            unsafe {
-                fence(Ordering::Release);
-                addr_of_mut!((*self.chan).rx.tail).write_volatile(tail.wrapping_add(1));
-            }
+            unsafe { self.rx.pop(&(*self.chan).rx) };
             q.push(mem, chain, written as u32);
             returned = true;
         }
@@ -262,7 +257,7 @@ impl Backend for Net {
 
     fn pending(&self) -> bool {
         self.tx_blocked
-            || unsafe { addr_of!((*self.chan).rx.tail).read_volatile() != addr_of!((*self.chan).rx.head).read_volatile() }
+            || unsafe { self.rx.ready(&(*self.chan).rx) != 0 }
     }
 
     fn reset(&mut self) {

@@ -15,6 +15,10 @@
 //! guest's l4h-vmm asks to plug and unplug hotplug blocks, which memd
 //! checks against the target and its own state only.
 //!
+//! memd invokes only capabilities it made or keeps the original of: the
+//! guests' CNodes it copies blocks into are its own (`make_cnodes`), so a
+//! less trusted caller cannot pass one that is not a CNode.
+//!
 //! memd serves l4h-root, l4h-vmmgr and the VMMs, one call at a time, and never calls
 //! anyone.  Its calls, and who may make each, are declared in
 //! l4h_host::memd::call; it implements their `Server` trait.  It cannot
@@ -29,6 +33,7 @@
 #![no_main]
 
 mod balloon;
+mod bucket;
 mod exchange;
 mod mem;
 
@@ -38,9 +43,10 @@ use l4h_rt::host::fixed::{ArrayVec, Scratch};
 use l4h_rt::host::memd::{self, BalloonConfig, GuestHp, HpState, MemdConfig, Sender, Status, call, BLOCK_BITS, HP_MAP_WORDS, HP_MAX, MAX_GUESTS, XCHG_SLOTS};
 use l4h_rt::host::wire::{self, Tail};
 use l4h_rt::{Info, cap, host, sel4};
-use sel4::{CapRights, cap_type};
+use sel4::{CapRights, ObjectBlueprint, cap_type};
 
 use crate::balloon::Balloon;
+use crate::bucket::Bucket;
 use crate::mem::{List, Mem, State, abs};
 
 use l4h_rt::host::errno::{EBUSY, EINVAL, ENODEV, ENOMEM, ENOSPC, check as errno};
@@ -53,46 +59,55 @@ const HP_DEPTH: usize = l4h_abi::HP_L1_BITS + l4h_abi::HP_BITS;
 /// How often the free page reports are made and polled.
 const TICK_MS: u64 = 100;
 
+/// Bytes of a CNode of radix r: seL4's slots are 32 bytes.
+const fn cnode_bytes(radix: usize) -> usize {
+    32 << radix
+}
+/// The largest block CNode: a slot for every block of the largest guest.
+const MAX_RADIX: usize = l4h_abi::MAX_BLOCKS.trailing_zeros() as usize;
+// Each of a guest's CNodes is at most half a block, so both fit in an
+// empty one.
+const _: () = assert!(2 * cnode_bytes(MAX_RADIX) <= 1 << BLOCK_BITS && 2 * cnode_bytes(l4h_abi::HP_L1_BITS) <= 1 << BLOCK_BITS);
+
+/// A 2 MiB block that guests' CNodes are made of: its unit, the bytes
+/// used (seL4 puts each object at the next multiple of its size, and
+/// reuses none until the block has no object left), and the guests whose
+/// CNodes are in it.  Free again once there are none.
+#[derive(Clone, Copy)]
+struct CnodeBlock {
+    unit: u32,
+    used: usize,
+    guests: u32,
+}
+
 /// A guest's RAM: its 2 MiB blocks, in order, on a list through the table.
 #[derive(Clone, Copy)]
 struct GuestRam {
     blocks: List,
     /// Radix of its block CNode.
     radix: usize,
+    /// The CnodeBlock its CNodes are in.
+    cnodes: usize,
     live: bool,
     hp: Hotplug,
 }
 
 /// A guest's hotplug region: its size, target and plugged hotplug blocks
-/// (in hotplug blocks), and the token bucket that limits how fast it plugs
-/// and unplugs, in thousandths of a hotplug block.
+/// (in hotplug blocks), and the bucket that bounds the time its calls take.
 #[derive(Clone, Copy)]
 struct Hotplug {
     count: usize,
     target: usize,
     plugged: usize,
     map: [u64; HP_MAP_WORDS],
-    tokens: u64,
-    last_ms: u64,
+    bucket: Bucket,
 }
 
 impl Hotplug {
-    const EMPTY: Hotplug = Hotplug { count: 0, target: 0, plugged: 0, map: [0; HP_MAP_WORDS], tokens: 0, last_ms: 0 };
+    const EMPTY: Hotplug = Hotplug { count: 0, target: 0, plugged: 0, map: [0; HP_MAP_WORDS], bucket: Bucket::full(0) };
 
     fn is_plugged(&self, m: usize) -> bool {
         self.map[m / 64] & (1 << (m % 64)) != 0
-    }
-
-    /// Take a token for one plug or unplug at `now_ms`, if there is one.
-    fn take_token(&mut self, now_ms: u64) -> bool {
-        let refill = now_ms.saturating_sub(self.last_ms).saturating_mul(memd::HP_RATE);
-        self.tokens = self.tokens.saturating_add(refill).min(memd::HP_BURST * 1000);
-        self.last_ms = now_ms;
-        if self.tokens < 1000 {
-            return false;
-        }
-        self.tokens -= 1000;
-        true
     }
 }
 
@@ -104,7 +119,10 @@ static HP_HEADS: Scratch<[[u32; HP_MAX]; MAX_GUESTS]> = Scratch::new([[u32::MAX;
 struct Memd {
     mem: Mem,
     guests: [GuestRam; MAX_GUESTS],
+    /// At most one per guest with CNodes in it.
+    cnode_blocks: [Option<CnodeBlock>; MAX_GUESTS],
     ticks_per_ms: u64,
+    ticks_per_us: u64,
 }
 
 /// Who calls for memory of its own: l4h-root, or l4h-vmmgr.
@@ -164,37 +182,111 @@ impl Memd {
     }
 
     fn guest_create(&mut self, g: usize, n: usize, radix: usize, hp_count: usize) -> u64 {
-        if g >= MAX_GUESTS || self.guests[g].live || n == 0 || radix > 20 || n > 1 << radix || hp_count > HP_MAX {
-            return EINVAL;
-        }
-        // The guest's CNodes, from vmmgr's exchange area.
-        let (bcn, hcn) = (abs(memd::SLOT_GUEST_BCN + g as u64), abs(memd::SLOT_GUEST_HCN + g as u64));
-        let _ = (bcn.delete(), hcn.delete());
-        use call::caps::guest_create::{BLOCK_CNODE, HP_CNODE};
-        if bcn.move_(&area(Client::Vmmgr, BLOCK_CNODE.passed_in(0, wire::Cap::CNode))).is_err()
-            || hcn.move_(&area(Client::Vmmgr, HP_CNODE.passed_in(0, wire::Cap::CNode))).is_err()
+        if g >= MAX_GUESTS || self.guests[g].live || n == 0 || radix == 0 || radix > MAX_RADIX || n > 1 << radix
+            || hp_count > HP_MAX
         {
             return EINVAL;
         }
+        let Some(cnodes) = self.make_cnodes(g, radix) else { return ENOMEM };
         let mut blocks = List::EMPTY;
         while blocks.len < n {
             match self.mem.take(0, State::Guest) {
                 Some(i) => self.mem.add_guest(&mut blocks, i),
                 None => {
-                    while let Some(i) = self.mem.pop_guest(&mut blocks) {
-                        self.mem.add(i, 0);
-                    }
+                    self.drop_ram(&mut blocks, cnodes, g);
                     return ENOMEM;
                 }
             }
         }
-        let hp = Hotplug { count: hp_count, last_ms: self.now_ms(), tokens: memd::HP_BURST * 1000, ..Hotplug::EMPTY };
-        self.guests[g] = GuestRam { blocks, radix, live: true, hp };
+        // vmmgr gets copies of the CNodes, to give the guest.  A slot it
+        // filled again before we did fails the call.
+        use call::caps::guest_create::{BLOCK_CNODE, HP_CNODE};
+        const OUT: [usize; 2] = [BLOCK_CNODE.passed_out(0, wire::Cap::CNode), HP_CNODE.passed_out(0, wire::Cap::CNode)];
+        for (out, s) in OUT.into_iter().zip([memd::SLOT_GUEST_BCN, memd::SLOT_GUEST_HCN]) {
+            let to = area(Client::Vmmgr, out);
+            let _ = to.delete();
+            if to.copy(&abs(s + g as u64), CapRights::all()).is_err() {
+                // Revoking the CNodes deletes the copy made.
+                self.drop_ram(&mut blocks, cnodes, g);
+                return EINVAL;
+            }
+        }
+        let hp = Hotplug { count: hp_count, bucket: Bucket::full(self.now_us()), ..Hotplug::EMPTY };
+        self.guests[g] = GuestRam { blocks, radix, cnodes, live: true, hp };
         0
     }
 
-    fn now_ms(&self) -> u64 {
-        host::ticks::now() / self.ticks_per_ms.max(1)
+    /// Undo a guest_create: free the blocks taken, which have no copies,
+    /// and the guest's CNodes.
+    fn drop_ram(&mut self, blocks: &mut List, cnodes: usize, g: usize) {
+        while let Some(i) = self.mem.pop_guest(blocks) {
+            self.mem.add(i, 0);
+        }
+        self.drop_cnodes(cnodes, g);
+    }
+
+    /// Make guest g's block CNode, of radix `radix`, and hotplug CNode in
+    /// their slots, of a CnodeBlock with room: its index.  memd makes them
+    /// rather than take them from vmmgr: invoking an endpoint vmmgr put
+    /// there as a CNode would be a call, which would block memd or pass
+    /// vmmgr memd's own CNode (the invocation's argument).
+    fn make_cnodes(&mut self, g: usize, radix: usize) -> Option<usize> {
+        let objs = [(radix, memd::SLOT_GUEST_BCN + g as u64), (l4h_abi::HP_L1_BITS, memd::SLOT_GUEST_HCN + g as u64)];
+        let end = |used: usize| objs.iter().fold(used, |at, &(r, _)| at.next_multiple_of(cnode_bytes(r)) + cnode_bytes(r));
+        let fits = |c: &Option<CnodeBlock>| c.is_some_and(|c| end(c.used) <= 1 << BLOCK_BITS);
+        let b = match self.cnode_blocks.iter().position(fits) {
+            Some(b) => b,
+            None => {
+                // Each block in use has a guest, and g has none yet.
+                let b = self.cnode_blocks.iter().position(Option::is_none)?;
+                let unit = self.mem.take(0, State::Guest)?;
+                self.cnode_blocks[b] = Some(CnodeBlock { unit, used: 0, guests: 0 });
+                b
+            }
+        };
+        let c = self.cnode_blocks[b].as_mut()?;
+        let ut = cap::<cap_type::Untyped>(self.mem.slot(c.unit, 0));
+        let made = objs.iter().take_while(|&&(r, s)| {
+            let _ = abs(s).delete();
+            ut.untyped_retype(&ObjectBlueprint::CNode { size_bits: r }, &mem::cnode().absolute_cptr_for_self(), s as usize, 1).is_ok()
+        }).count();
+        // Should seL4 have placed them otherwise, the block takes no more.
+        c.used = if made == objs.len() { end(c.used) } else { 1 << BLOCK_BITS };
+        c.guests += 1;
+        if made < objs.len() {
+            self.drop_cnodes(b, g);
+            return None;
+        }
+        Some(b)
+    }
+
+    /// Delete guest g's CNodes, in CnodeBlock `b`, and every copy of them
+    /// (vmmgr's, the guest's), and free the block if no guest's are left.
+    fn drop_cnodes(&mut self, b: usize, g: usize) {
+        for s in [memd::SLOT_GUEST_BCN, memd::SLOT_GUEST_HCN] {
+            let s = abs(s + g as u64);
+            s.revoke().expect("memd: revoke guest CNode");
+            let _ = s.delete();
+        }
+        let Some(c) = self.cnode_blocks[b].as_mut() else { return };
+        c.guests -= 1;
+        if c.guests == 0 {
+            let unit = c.unit;
+            self.cnode_blocks[b] = None;
+            // It has no object left: the next retype starts afresh.
+            self.mem.add(unit, 0);
+        }
+    }
+
+    fn now_us(&self) -> u64 {
+        host::ticks::now() / self.ticks_per_us
+    }
+
+    /// The bucket of guest g, which is live, pays for a call that started
+    /// at `start` (ticks).
+    fn charge(&mut self, g: usize, start: u64) {
+        let spent = host::ticks::now().saturating_sub(start) / self.ticks_per_us;
+        self.guests[g].hp.bucket.charge(spent);
     }
 
     fn set_target(&mut self, g: usize, target: usize) -> u64 {
@@ -205,7 +297,8 @@ impl Memd {
 
     /// `hp_plug` from guest g's VMM: hotplug block m.
     fn hp_plug(&mut self, g: usize, m: usize) -> u64 {
-        let now = self.now_ms();
+        let start = host::ticks::now();
+        let now = start / self.ticks_per_us;
         let Some(r) = self.guests.get_mut(g).filter(|r| r.live) else { return EINVAL };
         if m >= r.hp.count || r.hp.is_plugged(m) {
             return EINVAL;
@@ -215,9 +308,17 @@ impl Memd {
         }
         // Only blocks that need no report to come back: the guest must not
         // hold memd waiting.
-        if self.mem.available_bytes() < HP_BLOCKS << BLOCK_BITS || !r.hp.take_token(now) {
+        if self.mem.available_bytes() < HP_BLOCKS << BLOCK_BITS || r.hp.bucket.admit(now).is_none() {
             return EBUSY;
         }
+        let e = self.hp_fill(g, m);
+        self.charge(g, start);
+        e
+    }
+
+    /// Plug hotplug block m of guest g: copy 64 free blocks into its
+    /// level-2 CNode.
+    fn hp_fill(&mut self, g: usize, m: usize) -> u64 {
         let hcn = cap::<cap_type::CNode>(memd::SLOT_GUEST_HCN + g as u64);
         let mut blocks = List::EMPTY;
         let mut ok = true;
@@ -236,7 +337,8 @@ impl Memd {
             }
         }
         if !ok {
-            // Revoking deletes the copies already made.
+            // Revoking deletes the copies already made, which nothing was
+            // made of yet.
             while let Some(u) = self.mem.pop_guest(&mut blocks) {
                 abs(self.mem.slot(u, 0)).revoke().expect("memd: revoke failed plug");
                 self.mem.add(u, 0);
@@ -250,32 +352,42 @@ impl Memd {
         0
     }
 
-    /// Revoke and free hotplug block m of guest g, which is plugged.  That
-    /// deletes the guest's copies and everything it made of them.
-    fn hp_free(&mut self, g: usize, m: usize) {
-        let head = HP_HEADS.with(|h| core::mem::replace(&mut h[g][m], u32::MAX));
-        let mut blocks = List::from_head(head);
+    /// Revoke and free the blocks of hotplug block m of guest g, which is
+    /// plugged, until `deadline` (ticks, looked at after each block).
+    /// That deletes the guest's copies and everything it made of them,
+    /// which can be much.  Whether all are, and the block is unplugged;
+    /// if not, the rest stay plugged, for the next call.
+    fn hp_revoke(&mut self, g: usize, m: usize, deadline: u64) -> bool {
+        let mut blocks = List::from_head(HP_HEADS.with(|h| h[g][m]));
         while let Some(u) = self.mem.pop_guest(&mut blocks) {
             abs(self.mem.slot(u, 0)).revoke().expect("memd: revoke hotplug block");
             self.mem.add(u, 0);
+            if !blocks.is_empty() && host::ticks::now() >= deadline {
+                HP_HEADS.with(|h| h[g][m] = blocks.head());
+                return false;
+            }
         }
+        HP_HEADS.with(|h| h[g][m] = u32::MAX);
         let r = &mut self.guests[g];
         r.hp.map[m / 64] &= !(1 << (m % 64));
         r.hp.plugged -= 1;
+        true
     }
 
-    /// `hp_unplug` from guest g's VMM: hotplug block m.
+    /// `hp_unplug` from guest g's VMM: hotplug block m.  It may take the
+    /// time the guest's bucket holds; what that does not revoke waits for
+    /// the guest's next call, which the bucket admits later.
     fn hp_unplug(&mut self, g: usize, m: usize) -> u64 {
-        let now = self.now_ms();
+        let start = host::ticks::now();
+        let now = start / self.ticks_per_us;
         let Some(r) = self.guests.get_mut(g).filter(|r| r.live) else { return EINVAL };
         if m >= r.hp.count || !r.hp.is_plugged(m) {
             return EINVAL;
         }
-        if !r.hp.take_token(now) {
-            return EBUSY;
-        }
-        self.hp_free(g, m);
-        0
+        let Some(us) = r.hp.bucket.admit(now) else { return EBUSY };
+        let done = self.hp_revoke(g, m, start.saturating_add(us.saturating_mul(self.ticks_per_us)));
+        self.charge(g, start);
+        if done { 0 } else { EBUSY }
     }
 
     /// `hp_state`: target, plugged and the bitmap.
@@ -299,7 +411,8 @@ impl Memd {
 
     fn guest_give(&mut self, g: usize, first: usize, skip: usize) -> u64 {
         let Some(r) = self.guest(g) else { return EINVAL };
-        if r.blocks.len + skip > 1 << r.radix {
+        // `skip` is straight off the wire: a wide value must not overflow.
+        if r.blocks.len.checked_add(skip).is_none_or(|end| end > 1 << r.radix) {
             return EINVAL;
         }
         let bcn = cap::<cap_type::CNode>(memd::SLOT_GUEST_BCN + g as u64);
@@ -322,7 +435,7 @@ impl Memd {
         if self.guests[g].live {
             for m in 0..self.guests[g].hp.count {
                 if self.guests[g].hp.is_plugged(m) {
-                    self.hp_free(g, m);
+                    self.hp_revoke(g, m, u64::MAX);
                 }
             }
             let mut blocks = self.guests[g].blocks;
@@ -330,10 +443,10 @@ impl Memd {
                 abs(self.mem.slot(i, 0)).revoke().expect("memd: revoke guest block");
                 self.mem.add(i, 0);
             }
+            // Last, so that the CNodes are empty of the guest's RAM.
+            self.drop_cnodes(self.guests[g].cnodes, g);
             self.guests[g].live = false;
         }
-        let _ = abs(memd::SLOT_GUEST_BCN + g as u64).delete();
-        let _ = abs(memd::SLOT_GUEST_HCN + g as u64).delete();
         self.guests[g].hp = Hotplug::EMPTY;
         0
     }
@@ -380,8 +493,10 @@ fn main(info: &'static Info) -> ! {
     let cfg: &MemdConfig = unsafe { info.config() };
     let mut d = Memd {
         mem: Mem::new(cfg.units as usize),
-        guests: [GuestRam { blocks: List::EMPTY, radix: 0, live: false, hp: Hotplug::EMPTY }; MAX_GUESTS],
+        guests: [GuestRam { blocks: List::EMPTY, radix: 0, cnodes: 0, live: false, hp: Hotplug::EMPTY }; MAX_GUESTS],
+        cnode_blocks: [None; MAX_GUESTS],
         ticks_per_ms: info.header().tsc_hz / 1000,
+        ticks_per_us: (info.header().tsc_hz / 1_000_000).max(1),
     };
     d.write_status();
     let ep = cap::<cap_type::Endpoint>(host::SLOT_SERVICE_EP);

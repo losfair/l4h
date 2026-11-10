@@ -43,7 +43,6 @@ use l4h_host::badges::vmmgr as recv;
 use l4h_host::vmmgr::call;
 use crate::guest::{Guest, GuestConfig, State};
 use crate::mem::{Alloc, Slots};
-use crate::root::Later;
 use crate::window::{Window, Windows};
 
 pub use crate::guest::MAX_GUEST_DEVICES;
@@ -91,6 +90,8 @@ pub struct HostInfo {
     pub epoch_ticks: u64,
     /// Round-robin placement of new guests.
     placement: core::cell::Cell<usize>,
+    /// SLOT_SERIAL_FRAMES holds the VMMs' serial lanes (VmmgrConfig::serial_lanes).
+    serial_lanes: bool,
 }
 
 impl HostInfo {
@@ -103,6 +104,7 @@ impl HostInfo {
             tsc_hz: self.tsc_hz,
             log_frames: proto::SLOT_LOG_FRAMES,
             serial_frames: proto::SLOT_SERIAL_FRAMES,
+            serial_lanes: self.serial_lanes.then_some(proto::SLOT_SERIAL_FRAMES),
         }
     }
 
@@ -181,12 +183,16 @@ pub struct Vmmgr {
     pub root_ops: [Option<RootOp>; proto::MAX_PENDING],
     /// The dom0 control request being executed: its dom0 and seq.
     pub ctl_now: Option<(usize, u32)>,
+    /// dom0's boot waits for a busy disk controller.
+    pub dom0_wait: Option<Dom0Wait>,
+    /// What a guest or its VMM can make us log, per guest id.
+    pub log_limit: l4h_host::log::RateLimit<MAX_GUESTS>,
 }
 
 /// What a request root answers later is for.
 pub enum RootOp {
-    /// A disk for guest `id` (instance `instance`).
-    Disk { id: usize, instance: u64, then: Then },
+    /// Disk device `d` of guest `id` (instance `instance`).
+    Disk { id: usize, instance: u64, d: usize, then: Then },
     /// A host op of a control request (Then::Ctl).
     HostOp { then: Then },
 }
@@ -263,14 +269,20 @@ impl Vmmgr {
     /// of it; 0 = to the end) through to guest `id` before it starts.
     /// `flags`: abi::BLK_*.  Attach a window of host disk `disk`, or the
     /// `extents.0` extents at offset `extents.1` of dom0's control data area.
-    /// Root answers later, after blkd: then `then` follows (`root_done`).
-    /// No device of the guest changes, nor does it start, meanwhile.
+    /// Root answers later, after blkd: Ok is that it will, and then `then`
+    /// follows (`root_done`).  No device of the guest changes, nor does it
+    /// start, meanwhile.
     pub fn attach_disk(&mut self, id: usize, disk: usize, flags: u64, lba_start: u64, lba_count: u64,
-        extents: (u64, u64), then: Then) -> Result<Later<()>, Errno> {
+        extents: (u64, u64), then: Then) -> Result<(), Errno> {
         if !self.can_afford(1 << 20, 0, 0) { return Err(ctl::ENOMEM); }
         let instance = self.guest(id).ok_or(ctl::ENOENT)?.instance;
         self.with_guest(id, |h, g| {
-            if g.state != State::Created || g.root_pending {
+            // Like every other attach path (attach_usb, create_nic, ...):
+            // refuse once start_guest has spawned the VMM, which took the
+            // devices there were then: a disk added before VmmReady would
+            // be one it never serves.  (start_guest refuses while
+            // root_pending, so no answer can come after the VMM is spawned.)
+            if g.state != State::Created || g.vmm.is_some() || g.root_pending {
                 return Err(ctl::EBUSY);
             }
             if g.devices.len() >= MAX_GUEST_DEVICES {
@@ -279,23 +291,16 @@ impl Vmmgr {
             // Root checks the window and the disk's other users, and makes
             // the channel; the device is added once it has.
             let d = g.devices.len();
-            match root::disk_attach(&mut h.alloc, id, d, disk, flags, lba_start, lba_count, extents)? {
-                Later::Now(backend) => {
-                    add_disk(h, g, backend);
-                    Ok(Later::Now(()))
-                }
-                Later::Token(t) => {
-                    g.root_pending = true;
-                    h.root_ops[t] = Some(RootOp::Disk { id, instance, then });
-                    Ok(Later::Token(t))
-                }
-            }
+            let t = root::disk_attach(id, disk, flags, lba_start, lba_count, extents)?;
+            g.root_pending = true;
+            h.root_ops[t] = Some(RootOp::Disk { id, instance, d, then });
+            Ok(())
         })
         .ok_or(ctl::ENOENT)?
     }
 
     /// Root answered the disk attachment of guest `id` (`attach_disk`).
-    fn disk_attached(&mut self, id: usize, instance: u64, token: usize) -> Result<(), Errno> {
+    fn disk_attached(&mut self, id: usize, instance: u64, d: usize, token: usize) -> Result<(), Errno> {
         if self.guest(id).is_none_or(|g| g.instance != instance) {
             root::discard(token);
             return Err(ctl::ENOENT);
@@ -303,8 +308,7 @@ impl Vmmgr {
         self.with_guest(id, |h, g| {
             g.root_pending = false;
             let backend = root::disk_attach_result(&mut h.alloc, token)?;
-            add_disk(h, g, backend);
-            Ok(())
+            add_disk(h, g, d, backend)
         })
         .ok_or(ctl::ENOENT)?
     }
@@ -313,8 +317,8 @@ impl Vmmgr {
     pub fn root_done(&mut self, done: [u64; proto::MAX_PENDING / 64]) {
         for t in (0..proto::MAX_PENDING).filter(|&t| done[t / 64] & (1 << (t % 64)) != 0) {
             match self.root_ops[t].take() {
-                Some(RootOp::Disk { id, instance, then }) => {
-                    let r = self.disk_attached(id, instance, t);
+                Some(RootOp::Disk { id, instance, d, then }) => {
+                    let r = self.disk_attached(id, instance, d, t);
                     match then {
                         Then::Ctl { caller, instance, seq } => ctl::answer(self, caller, instance, seq, r.map(|()| [0; 6])),
                         Then::Dom0Boot { k } => dom0_disk_done(self, id, instance, k, r),
@@ -341,7 +345,7 @@ impl Vmmgr {
                 return Err(ctl::ENOSPC);
             }
             let d = g.devices.len();
-            let (frames, kick, n) = root::usb_attach(&mut h.alloc, id, d, ctrl)?;
+            let (frames, kick, n) = root::usb_attach(&mut h.alloc, id, ctrl)?;
             assert_eq!(n, g.usbs, "root and vmmgr number USB controllers alike");
             let added = g.add_usb(&mut h.alloc, n, frames, kick);
             assert_eq!(added, Some(d), "guest device room checked");
@@ -354,7 +358,9 @@ impl Vmmgr {
     /// Keep a failed boot disk's position without a channel or DMA access.
     pub fn attach_dummy_disk(&mut self, id: usize) -> Result<(), Errno> {
         self.with_guest(id, |h, g| {
-            if g.state != State::Created || g.root_pending { return Err(ctl::EBUSY); }
+            // As every attach path: not once the VMM, which was given the
+            // devices there were, is spawned.
+            if g.state != State::Created || g.vmm.is_some() || g.root_pending { return Err(ctl::EBUSY); }
             let d = g.add_device(&mut h.alloc, guest::DevKind::Virtio(2)).ok_or(ctl::ENOSPC)?;
             g.backends.must_push((d, vmm::Backend::UnavailableBlk));
             Ok(())
@@ -398,7 +404,7 @@ impl Vmmgr {
                 return Err(ctl::ENOSPC);
             }
             let d = g.devices.len();
-            let backend = root::nic_add(&mut h.alloc, &mut g.arena, id, d, switch, mac, lock, isolated)?;
+            let backend = root::nic_add(&mut h.alloc, &mut g.arena, id, switch, mac, lock, isolated)?;
             let mac = match &backend {
                 vmm::Backend::Net { mac, .. } => mac.iter().fold(0, |m, &b| m << 8 | b as u64),
                 _ => unreachable!(),
@@ -414,10 +420,10 @@ impl Vmmgr {
     /// Give guest `id` (before it starts) a virtio-gpu device with one
     /// scanout of `width` x `height` pixels.
     pub fn attach_gpu(&mut self, id: usize, width: u64, height: u64) -> Result<(), Errno> {
-        if !gpu::valid_size(width, height) {
+        let (Ok(width), Ok(height)) = (u32::try_from(width), u32::try_from(height)) else { return Err(ctl::EINVAL) };
+        if !gpu::valid_size(width.into(), height.into()) {
             return Err(ctl::EINVAL);
         }
-        let (width, height) = (width as u32, height as u32);
         let bytes = gpu::attach_bytes(width, height);
         let pages = host::gpu::display_pages(width, height);
         // The display area's mappings in vmmgr: a slot and page tables,
@@ -536,6 +542,7 @@ fn main(info: &'static Info) -> ! {
         epoch_ns: cfg.epoch_ns,
         epoch_ticks: cfg.epoch_ticks,
         placement: core::cell::Cell::new(0),
+        serial_lanes: cfg.serial_lanes != 0,
     };
     let modules = kimage::Modules::new(cfg.modules_radix as usize, cfg.modules_pages as usize);
     let kernel = module(&cfg.kernel).and_then(|k| {
@@ -556,7 +563,9 @@ fn main(info: &'static Info) -> ! {
         dom0_initrd: module(&cfg.dom0_initrd).unwrap_or(&[]),
         flags: root::Flags::new(cfg),
         root_ops: [const { None }; proto::MAX_PENDING],
+        log_limit: l4h_host::log::RateLimit::new(),
         ctl_now: None,
+        dom0_wait: None,
     };
     if h.kernel.is_none() {
         l4h_rt::log!("l4h-vmmgr: no guest kernel, nothing to do");
@@ -567,6 +576,9 @@ fn main(info: &'static Info) -> ! {
     serve(&mut h, reply)
 }
 
+/// Build and start dom0 with root's plan (Dom0Plan).  One that cannot be
+/// built is logged and given back, not a panic of vmmgr: the other guests
+/// stay managed, and the serial monitor's restart-dom0 tries again.
 pub fn boot_dom0(h: &mut Vmmgr) {
     let ram_base = h.kernel.as_ref().expect("guest kernel").ram_base;
     let cfg = GuestConfig {
@@ -578,15 +590,43 @@ pub fn boot_dom0(h: &mut Vmmgr) {
         ram_base,
         dom0: true,
     };
-    let id = h.create_guest(&cfg).expect("cannot create dom0");
+    let Some(id) = h.create_guest(&cfg) else {
+        l4h_rt::log!("l4h-vmmgr: cannot create dom0; the serial monitor's restart-dom0 tries again");
+        return;
+    };
     // Count the actual console/control, memory and attestation devices
     // before attaching anything. A placeholder still needs a device slot.
     let used = h.guest(id).unwrap().devices.len();
     let total = used + h.cfg.dom0_disks as usize + h.cfg.dom0_nics as usize + h.cfg.dom0_usbs as usize;
-    assert!(total <= MAX_GUEST_DEVICES,
-        "dom0 device plan needs {} slots ({} built-in, {} disks, {} NICs); limit is {}",
-        total, used, h.cfg.dom0_disks, h.cfg.dom0_nics, MAX_GUEST_DEVICES);
+    if total > MAX_GUEST_DEVICES {
+        l4h_rt::log!("l4h-vmmgr: dom0 device plan needs {} slots ({} built-in, {} disks, {} NICs); limit is {}",
+            total, used, h.cfg.dom0_disks, h.cfg.dom0_nics, MAX_GUEST_DEVICES);
+        return dom0_failed(h, id, "too many devices");
+    }
     dom0_disks(h, id, 0);
+}
+
+/// dom0 `id` cannot be built: give it back.
+fn dom0_failed(h: &mut Vmmgr, id: usize, why: &str) {
+    l4h_rt::log!("l4h-vmmgr: cannot boot dom0: {}; the serial monitor's restart-dom0 tries again", why);
+    h.dom0_wait = None;
+    let _ = h.destroy_guest(id);
+}
+
+/// How long dom0's boot waits for a disk controller root answers EBUSY
+/// for (another attachment or a provisioning write uses its staging, its
+/// ring is full, the last dom0's disks are being let go) before it takes
+/// a placeholder for the disk.
+const DOM0_DISK_WAIT_MS: u64 = 10_000;
+
+/// dom0's boot waits for a busy controller: boot disk `k` of dom0 `id`
+/// (`instance`) is tried again on vmmgr's timer, until `until` (ticks).
+#[derive(Clone, Copy)]
+pub struct Dom0Wait {
+    id: usize,
+    instance: u64,
+    k: usize,
+    until: u64,
 }
 
 /// Attach dom0's boot disks from the `k`th on, which root answers later,
@@ -598,12 +638,16 @@ fn dom0_disks(h: &mut Vmmgr, id: usize, mut k: usize) {
         let cfg = h.cfg;
         let d = &cfg.dom0_disk[k];
         match h.attach_disk(id, d.disk as usize, 0, d.start, d.sectors, (0, 0), Then::Dom0Boot { k }) {
-            Ok(Later::Token(_)) => return,
-            Ok(Later::Now(())) => {}
-            Err(e) => dom0_no_disk(h, id, k, e),
+            Ok(()) => {
+                // Pending now (root_pending): not tried again meanwhile.
+                h.dom0_wait = None;
+                return;
+            }
+            Err(e) => if !dom0_no_disk(h, id, k, e) { return },
         }
         k += 1;
     }
+    h.dom0_wait = None;
     dom0_finish(h, id);
 }
 
@@ -614,22 +658,56 @@ fn dom0_disk_done(h: &mut Vmmgr, id: usize, instance: u64, k: usize, r: Result<(
         return;
     }
     if let Err(e) = r {
-        dom0_no_disk(h, id, k, e);
+        if !dom0_no_disk(h, id, k, e) {
+            return;
+        }
     }
     dom0_disks(h, id, k + 1);
 }
 
-fn dom0_no_disk(h: &mut Vmmgr, id: usize, k: usize, e: Errno) {
+/// vmmgr's timer: try the boot disk dom0 waits for again.
+fn dom0_retry(h: &mut Vmmgr) {
+    let Some(w) = h.dom0_wait else { return };
+    if h.guest(w.id).is_none_or(|g| g.instance != w.instance) {
+        h.dom0_wait = None;
+        return;
+    }
+    dom0_disks(h, w.id, w.k);
+}
+
+/// dom0's boot disk `k` cannot be attached (`e`): whether boot goes on,
+/// with a zero-capacity placeholder.  A busy controller is waited for
+/// (dom0_retry), a while, rather than dom0 losing its disk to another
+/// guest's attachment; dom0 without a placeholder is given back.
+fn dom0_no_disk(h: &mut Vmmgr, id: usize, k: usize, e: Errno) -> bool {
+    let now = rdtsc();
+    if e == ctl::EBUSY {
+        let instance = h.guest(id).map_or(0, |g| g.instance);
+        let until = match h.dom0_wait {
+            Some(w) if w.id == id && w.instance == instance && w.k == k => w.until,
+            _ => now.saturating_add(h.info.tsc_hz.saturating_mul(DOM0_DISK_WAIT_MS) / 1000),
+        };
+        if now < until {
+            h.dom0_wait = Some(Dom0Wait { id, instance, k, until });
+            return false;
+        }
+    }
+    h.dom0_wait = None;
     let d = &h.cfg.dom0_disk[k];
     l4h_rt::log!("l4h-vmmgr: disk {} window {}:{} unavailable to dom0: error {}; using zero-capacity device",
         d.disk, d.start, d.sectors, e);
-    h.attach_dummy_disk(id).expect("cannot create dom0 disk placeholder");
+    if h.attach_dummy_disk(id).is_err() {
+        dom0_failed(h, id, "no room for a disk placeholder");
+        return false;
+    }
+    true
 }
 
 /// dom0's NICs, its image, and it starts.
 fn dom0_finish(h: &mut Vmmgr, id: usize) {
     for n in &h.cfg.dom0_nic[..h.cfg.dom0_nics as usize] {
-        if let Err(e) = h.create_nic(id, n.switch as u32, n.mac, true, false) {
+        let r = u32::try_from(n.switch).map_err(|_| ctl::EINVAL).and_then(|sw| h.create_nic(id, sw, n.mac, true, false));
+        if let Err(e) = r {
             l4h_rt::log!("l4h-vmmgr: cannot give dom0 a NIC on switch {}: error {}", n.switch, e);
         }
     }
@@ -640,29 +718,61 @@ fn dom0_finish(h: &mut Vmmgr, id: usize) {
     }
     let cmdline = &h.cfg.dom0_cmdline;
     let cmdline = &cmdline[..cmdline.iter().position(|&c| c == 0).unwrap_or(cmdline.len())];
-    h.with_guest(id, |h, g| {
+    let booted = h.with_guest(id, |h, g| {
         let kernel = h.kernel.as_ref().unwrap();
-        assert!(
-            guest::boot_with(g, &mut h.alloc, &mut h.wins.a, &h.info, kernel, h.dom0_initrd, cmdline),
-            "dom0 image does not fit"
-        );
+        guest::boot_with(g, &mut h.alloc, &mut h.wins.a, &h.info, kernel, h.dom0_initrd, cmdline)
     });
-    h.start_guest(id).expect("start dom0");
+    if booted != Some(true) {
+        return dom0_failed(h, id, "its image does not fit");
+    }
+    if let Err(e) = h.start_guest(id) {
+        l4h_rt::log!("l4h-vmmgr: dom0's l4h-vmm: error {}", e);
+        dom0_failed(h, id, "it cannot start");
+    }
 }
 
-/// Add the disk device of `backend` to `g`, which has room for it
-/// (attach_disk checked, and nothing was added since).
-fn add_disk(h: &mut Vmmgr, g: &mut Guest, backend: vmm::Backend) {
-    let d = g.devices.len();
-    let added = g.add_device(&mut h.alloc, guest::DevKind::Virtio(2));
-    assert_eq!(added, Some(d), "guest device room checked");
+/// Add the disk device of `backend` to `g` as device `d`, the index root
+/// made the channel for.  attach_disk checked there was room and, while
+/// root_pending, nothing else can add a device or spawn the VMM, so this
+/// holds; should it not, the channel is given back rather than vmmgr
+/// panicking or the channel landing on another device.
+fn add_disk(h: &mut Vmmgr, g: &mut Guest, d: usize, backend: vmm::Backend) -> Result<(), Errno> {
+    if g.state != State::Created || g.vmm.is_some() || g.devices.len() != d {
+        root::disk_backend_drop(&mut h.alloc, backend);
+        return Err(ctl::EBUSY);
+    }
+    let Some(added) = g.add_device(&mut h.alloc, guest::DevKind::Virtio(2)) else {
+        root::disk_backend_drop(&mut h.alloc, backend);
+        return Err(ctl::ENOSPC);
+    };
+    debug_assert_eq!(added, d);
     g.backends.must_push((d, backend));
+    Ok(())
+}
+
+/// Guest `id` runs no more: its kernel or VMM faulted, or it asked to
+/// stop.  dom0 is replaced if `restart`; any other guest, and dom0 that
+/// powered off, is stopped (Guest::stop: its vCPUs and its VMM).
+fn end_guest(h: &mut Vmmgr, id: usize, restart: bool) {
+    if restart && h.guest(id).is_some_and(|g| g.dom0) {
+        restart_dom0(h, id);
+        return;
+    }
+    if let Some(Some(g)) = h.guests.get_mut(id) {
+        g.stop();
+    }
+    if h.guests.iter().flatten().all(|g| g.state != State::Running) {
+        info!("l4h-vmmgr: all guests stopped");
+    }
 }
 
 /// dom0 rebooted or crashed: replace it.  Other guests keep running; the
 /// new dom0 finds them with the control API.
 pub fn restart_dom0(h: &mut Vmmgr, id: usize) {
-    l4h_rt::log!("l4h-vmmgr: restarting dom0");
+    // A dom0 that crashes as it boots would log each time.
+    if let Some(s) = h.log_limit.allow(id, rdtsc(), h.info.tsc_hz) {
+        l4h_rt::log!("l4h-vmmgr: restarting dom0{}", s);
+    }
     let _ = h.destroy_guest(id);
     boot_dom0(h);
 }
@@ -736,6 +846,7 @@ impl l4h_ipc::Server for Serve<'_> {
                 watchdog_dump(h);
                 self.next_watchdog = rdtsc() + h.info.tsc_hz * h.cfg.watchdog_secs;
             }
+            dom0_retry(h);
             arm_timer(&h.info);
         }
     }
@@ -744,17 +855,17 @@ impl l4h_ipc::Server for Serve<'_> {
         let h = &mut *self.h;
         let id = recv::ID.get(badge) as usize;
         let fault = sel4::with_ipc_buffer(|b| sel4::Fault::new(b, info));
-        if badge & recv::COMPONENT != 0 {
-            l4h_rt::log!("l4h-vmmgr: guest {:#x}'s l4h-vmm fault: {:x?}", id, fault);
-            return;
+        if let Some(s) = h.log_limit.allow(id, rdtsc(), h.info.tsc_hz) {
+            if badge & recv::COMPONENT != 0 {
+                l4h_rt::log!("l4h-vmmgr: guest {:#x}'s l4h-vmm fault: {:x?}{}", id, fault, s);
+            } else {
+                let vcpu = recv::VCPU.get(badge) as usize;
+                l4h_rt::log!("l4h-vmmgr: guest {} vCPU {} kernel fault: {:x?}{}", id, vcpu, fault, s);
+            }
         }
-        let vcpu = recv::VCPU.get(badge) as usize;
-        l4h_rt::log!("l4h-vmmgr: guest {} vCPU {} kernel fault: {:x?}", id, vcpu, fault);
-        if h.guest(id).is_some_and(|g| g.dom0) {
-            restart_dom0(h, id);
-        } else if let Some(Some(g)) = h.guests.get_mut(id) {
-            g.stop();
-        }
+        // Without its kernel, or its device model (a guest whose VMM is
+        // gone cannot be served), the guest cannot go on.
+        end_guest(h, id, true);
     }
 
     fn call(&mut self, from: proto::Sender, badge: u64, info: &sel4::MessageInfo) -> Option<sel4::MessageInfo> {
@@ -771,7 +882,10 @@ impl l4h_ipc::Server for Serve<'_> {
     }
 
     fn unknown(&mut self, badge: u64, info: &sel4::MessageInfo) {
-        l4h_rt::log!("l4h-vmmgr: unknown call {} badged {:#x}", info.label(), badge);
+        let h = &mut *self.h;
+        if let Some(s) = h.log_limit.allow(recv::ID.get(badge) as usize, rdtsc(), h.info.tsc_hz) {
+            l4h_rt::log!("l4h-vmmgr: unknown call {} badged {:#x}{}", info.label(), badge, s);
+        }
     }
 
     fn next(&mut self) -> l4h_ipc::Next {
@@ -795,6 +909,11 @@ impl call::Server for VmmCalls<'_> {
     fn vmm_ready(&mut self, from: proto::Sender) -> Result<(), Errno> {
         let proto::Sender::Vmm(id) = from else { return Err(EINVAL) };
         let g = self.0.guests.get_mut(id).and_then(|g| g.as_mut()).ok_or(l4h_host::wire::NO_REPLY)?;
+        // Only a freshly built guest starts: a second VmmReady, or one from
+        // the VMM of a running or stopped guest, must not reset vCPU 0.
+        if g.state != State::Created {
+            return Err(EINVAL);
+        }
         g.start();
         Ok(())
     }
@@ -808,22 +927,12 @@ impl call::Server for VmmCalls<'_> {
             abi::POWER_CRASH => "kernel panic",
             _ => "unknown",
         };
-        info!("l4h-vmmgr: guest {} power request {} ({})", id, how, reason);
-        if how != abi::POWER_OFF && h.guest(id).is_some_and(|g| g.dom0) {
-            // The caller (dom0's VMM) is destroyed: no reply.
-            restart_dom0(h, id);
-            return Err(l4h_host::wire::NO_REPLY);
+        if let Some(s) = h.log_limit.allow(id, rdtsc(), h.info.tsc_hz) {
+            info!("l4h-vmmgr: guest {} power request {} ({}){}", id, how, reason, s);
         }
-        if let Some(Some(g)) = h.guests.get_mut(id) {
-            for v in &g.vcpus {
-                let _ = v.ktcb.tcb_suspend();
-            }
-            g.state = State::Stopped;
-        }
-        if h.guests.iter().flatten().all(|g| g.state != State::Running) {
-            info!("l4h-vmmgr: all guests stopped");
-        }
-        Ok(())
+        end_guest(h, id, how != abi::POWER_OFF);
+        // The caller, the guest's VMM, is stopped or destroyed with it.
+        Err(l4h_host::wire::NO_REPLY)
     }
 
     fn op_done(&mut self, _: proto::Sender, token: usize) -> Result<(), Errno> {

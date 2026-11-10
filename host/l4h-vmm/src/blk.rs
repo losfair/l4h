@@ -5,8 +5,9 @@
 use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{Ordering, fence};
 
-use l4h_rt::host::blk::{self, Channel};
+use l4h_rt::host::{self, blk::{self, Channel}};
 use l4h_rt::host::fixed::ArrayVec;
+use l4h_rt::host::spsc::{Consumer, Producer};
 use l4h_rt::sel4;
 
 use crate::dev::{Backend, VIRTIO_RING_F_INDIRECT_DESC};
@@ -32,6 +33,10 @@ const QUEUE_SIZE: u32 = blk::RING_SIZE as u32;
 const SEG_MAX: u32 = blk::MAX_SEGS as u32 - 2;
 /// The largest segment the guest's DMA layer maps at once (swiotlb).
 const SEG_SIZE_LIMIT: u32 = 256 << 10;
+/// How long a reset waits for blkd to complete the requests it has, as
+/// blkd waits for its device when a client goes (DESIGN.md §9.2).  One
+/// that root quarantined never does: it is suspended.
+const DRAIN_SECS: u64 = 5;
 
 /// Largest segment for a guest whose I/O pool has `pool` bytes.  Every
 /// request bounces through the pool, so one must never need more than a
@@ -50,6 +55,10 @@ struct Inflight {
 
 pub struct Blk {
     chan: *mut Channel,
+    /// Our indices of the channel's rings: blkd can write over the
+    /// channel's copies.
+    sq: Producer,
+    cq: Consumer,
     kick: Option<sel4::cap::Notification>,
     capacity: u64,
     read_only: bool,
@@ -74,6 +83,8 @@ pub struct Blk {
     fence: Option<usize>,
     flush_inflight: bool,
     deferred: u64,
+    /// Counter ticks per second (host::ticks).
+    tsc_hz: u64,
 }
 
 impl Blk {
@@ -81,17 +92,18 @@ impl Blk {
     /// every request locally with an I/O error, without touching hardware.
     pub fn unavailable(pool: u64) -> Self {
         Blk {
-            chan: core::ptr::null_mut(), kick: None, capacity: 0, read_only: true, volatile: false,
+            chan: core::ptr::null_mut(), sq: Producer::new(blk::RING_SIZE), cq: Consumer::new(blk::RING_SIZE),
+            kick: None, capacity: 0, read_only: true, volatile: false,
             block_size: 512, size_max: size_max(pool),
             inflight: [[None; QUEUE_SIZE as usize]; MAX_QUEUES], nr_queues: 1, kick_pending: false,
             outstanding: 0, generation: 0, stalled: [None; MAX_QUEUES],
-            fence: None, flush_inflight: false, deferred: 0,
+            fence: None, flush_inflight: false, deferred: 0, tsc_hz: 0,
         }
     }
 
     /// The channel must be ready.  `pool` is the size of the guest's I/O
-    /// pool.
-    pub fn new(chan_va: usize, kick: sel4::cap::Notification, pool: u64) -> Self {
+    /// pool, `tsc_hz` the rate of host::ticks.
+    pub fn new(chan_va: usize, kick: sel4::cap::Notification, pool: u64, tsc_hz: u64) -> Self {
         let chan = chan_va as *mut Channel;
         let (capacity, read_only, volatile, block_size) = unsafe {
             fence(Ordering::Acquire);
@@ -104,6 +116,9 @@ impl Blk {
         };
         Blk {
             chan,
+            // A fresh channel: both rings start empty.
+            sq: Producer::new(blk::RING_SIZE),
+            cq: Consumer::new(blk::RING_SIZE),
             kick: Some(kick),
             capacity,
             read_only,
@@ -115,15 +130,22 @@ impl Blk {
             kick_pending: false,
             outstanding: 0,
             generation: 0,
-            stalled: [None; MAX_QUEUES], fence: None, flush_inflight: false, deferred: 0,
+            stalled: [None; MAX_QUEUES], fence: None, flush_inflight: false, deferred: 0, tsc_hz,
         }
     }
 
+    /// Full, or blkd broke the tail.
     fn sq_full(&self) -> bool {
+        unsafe { self.sq.free(&(*self.chan).sq) == 0 }
+    }
+
+    /// The oldest response blkd has published, taken off the ring.
+    fn next_resp(&mut self) -> Option<blk::Resp> {
         unsafe {
-            let head = addr_of!((*self.chan).sq.head).read_volatile();
-            let tail = addr_of!((*self.chan).sq.tail).read_volatile();
-            head.wrapping_sub(tail) as usize >= blk::RING_SIZE
+            if self.cq.ready(&(*self.chan).cq) == 0 { return None; }
+            let resp = addr_of!((*self.chan).resps[self.cq.slot()]).read_volatile();
+            self.cq.pop(&(*self.chan).cq);
+            Some(resp)
         }
     }
 
@@ -262,12 +284,45 @@ impl Blk {
         if ty == blk::OP_FLUSH { self.flush_inflight = true; }
         self.outstanding += 1;
         unsafe {
-            let h = addr_of!((*self.chan).sq.head).read_volatile();
-            addr_of_mut!((*self.chan).reqs[h as usize % blk::RING_SIZE]).write_volatile(req);
-            fence(Ordering::Release);
-            addr_of_mut!((*self.chan).sq.head).write_volatile(h.wrapping_add(1));
+            addr_of_mut!((*self.chan).reqs[self.sq.slot()]).write_volatile(req);
+            self.sq.push(&(*self.chan).sq);
         }
         true
+    }
+
+    /// Pass each response to `f` until blkd has none outstanding: false
+    /// if that takes more than DRAIN_SECS.
+    fn wait_outstanding(&mut self, mut f: impl FnMut(&mut Self, blk::Resp)) -> bool {
+        let mut end = None;
+        while self.outstanding != 0 {
+            let Some(resp) = self.next_resp() else {
+                // An unknown rate is taken as 1 GHz: the wait stays finite.
+                let now = host::ticks::now();
+                let hz = if self.tsc_hz == 0 { 1_000_000_000 } else { self.tsc_hz };
+                if now > *end.get_or_insert(now.saturating_add(DRAIN_SECS.saturating_mul(hz))) {
+                    return false;
+                }
+                // blkd runs at a higher priority, on its own core or as
+                // soon as we yield.
+                sel4::r#yield();
+                continue;
+            };
+            f(self, resp);
+        }
+        true
+    }
+
+    /// blkd keeps requests it does not complete, and may still access
+    /// their buffers: the disk fails for good, as an unavailable one does
+    /// (every request an I/O error, the channel never read again).
+    fn fail(&mut self) {
+        self.chan = core::ptr::null_mut();
+        self.outstanding = 0;
+        self.inflight = [[None; QUEUE_SIZE as usize]; MAX_QUEUES];
+        self.stalled = [None; MAX_QUEUES];
+        self.fence = None;
+        self.flush_inflight = false;
+        self.deferred = 0;
     }
 
     fn response(&mut self, mem: &GuestMem, queues: &mut [Queue], resp: blk::Resp, drop_queue: Option<usize>) -> u64 {
@@ -365,16 +420,10 @@ impl Backend for Blk {
     fn complete(&mut self, mem: &GuestMem, queues: &mut [Queue]) -> bool {
         if self.chan.is_null() { return false; }
         let mut returned = 0;
-        unsafe {
-            loop {
-                let tail = addr_of!((*self.chan).cq.tail).read_volatile();
-                let head = addr_of!((*self.chan).cq.head).read_volatile();
-                if tail == head { break; }
-                fence(Ordering::Acquire);
-                let resp = addr_of!((*self.chan).resps[tail as usize % blk::RING_SIZE]).read_volatile();
-                addr_of_mut!((*self.chan).cq.tail).write_volatile(tail.wrapping_add(1));
-                returned |= self.response(mem, queues, resp, None);
-            }
+        // At most a ring's worth: what blkd publishes meanwhile is pending.
+        for _ in 0..blk::RING_SIZE {
+            let Some(resp) = self.next_resp() else { break };
+            returned |= self.response(mem, queues, resp, None);
         }
         for (q, queue) in queues.iter_mut().enumerate().take(self.nr_queues) {
             if returned & (1 << q) != 0 { queue.publish_used(mem); }
@@ -384,7 +433,7 @@ impl Backend for Blk {
 
     fn pending(&self) -> bool {
         !self.chan.is_null() && (self.deferred != 0 || self.stalled.iter().any(Option::is_some)
-            || unsafe { addr_of!((*self.chan).cq.tail).read_volatile() != addr_of!((*self.chan).cq.head).read_volatile() })
+            || unsafe { self.cq.ready(&(*self.chan).cq) != 0 })
     }
 
     fn retry_queues(&self) -> u64 {
@@ -399,20 +448,8 @@ impl Backend for Blk {
         self.fence = None;
         self.flush_inflight = false;
         self.deferred = 0;
-        while self.outstanding != 0 {
-            unsafe {
-                let tail = addr_of!((*self.chan).cq.tail).read_volatile();
-                if tail == addr_of!((*self.chan).cq.head).read_volatile() {
-                    // blkd runs at a higher priority, on its own core or
-                    // as soon as we yield.
-                    sel4::r#yield();
-                    continue;
-                }
-                fence(Ordering::Acquire);
-                let resp = addr_of!((*self.chan).resps[tail as usize % blk::RING_SIZE]).read_volatile();
-                addr_of_mut!((*self.chan).cq.tail).write_volatile(tail.wrapping_add(1));
-                self.retire(resp.id);
-            }
+        if !self.wait_outstanding(|b, resp| { b.retire(resp.id); }) {
+            self.fail();
         }
         // Requests completed from now on belong to the next generation.
         self.generation = self.generation.wrapping_add(1);
@@ -423,18 +460,16 @@ impl Backend for Blk {
         self.stalled[q] = None;
         self.deferred &= !(1 << q);
         let mut completed = 0;
-        while self.outstanding != 0 {
-            unsafe {
-                let tail = addr_of!((*self.chan).cq.tail).read_volatile();
-                if tail == addr_of!((*self.chan).cq.head).read_volatile() {
-                    sel4::r#yield();
-                    continue;
+        if !self.wait_outstanding(|b, resp| completed |= b.response(mem, queues, resp, Some(q))) {
+            // The other queues' requests fail.
+            for qi in 0..MAX_QUEUES {
+                for h in 0..QUEUE_SIZE as u16 {
+                    if self.inflight[qi][h as usize].is_none() { continue; }
+                    let id = ((self.generation as u64) << 32) | ((qi as u64) << 16) | h as u64;
+                    completed |= self.response(mem, queues, blk::Resp { id, status: blk::STATUS_IOERR, reserved: 0 }, Some(q));
                 }
-                fence(Ordering::Acquire);
-                let resp = addr_of!((*self.chan).resps[tail as usize % blk::RING_SIZE]).read_volatile();
-                addr_of_mut!((*self.chan).cq.tail).write_volatile(tail.wrapping_add(1));
-                completed |= self.response(mem, queues, resp, Some(q));
             }
+            self.fail();
         }
         if self.fence == Some(q) { self.fence = None; self.flush_inflight = false; }
         for (q, queue) in queues.iter_mut().enumerate().take(self.nr_queues) {

@@ -183,7 +183,8 @@ pub fn poll(h: &mut Host) {
             handle(h, &cs, peer, ty, &cs.buf[..n]);
         }
         if lost > 0 {
-            cs.chans[i].lost += lost;
+            // The peer's count: it can say anything.
+            cs.chans[i].lost = cs.chans[i].lost.saturating_add(lost);
             log!("l4h-root: {} bytes from partition {} lost", lost, cs.chans[i].desc.peer);
         }
         if let Some(irq) = cs.chans[i].irq {

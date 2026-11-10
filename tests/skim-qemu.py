@@ -14,9 +14,10 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
+from host_profile import root_elf  # noqa: E402
 VARIANT = os.environ.get("L4H_KERNEL_VARIANT", "skim-xapic-nopcid")
 KERNEL = ROOT / f"build/sel4-{VARIANT}/bin/kernel.elf"
-APP = ROOT / "host/target/x86_64-sel4-roottask/debug/l4h-root.elf"
+APP = root_elf()
 CPU = os.environ.get("L4H_QEMU_CPU", "host,vendor=GenuineIntel,-vmx,+invtsc,-arch-capabilities,-pcid,-invpcid,-x2apic")
 
 

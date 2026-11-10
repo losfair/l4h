@@ -4,17 +4,16 @@
 //! plugs while it runs (DESIGN.md §8.5) is between its l4h-vmm and memd:
 //! vmmgr only sets the target.
 
-use sel4::{CapRights, cap, cap_type};
+use sel4::cap_type;
 
 use l4h_host::memd::{self, Status, XCHG_RADIX, call::Client, call::caps};
 use l4h_host::vmmgr as proto;
-use l4h_ipc::kind_of;
 use l4h_task::memd::MemdLink;
 
 use crate::component::abs_of;
 use crate::mem::{Alloc, Slot};
 
-/// memd's endpoint, mailbox, and status mapping, installed by root.
+/// memd's endpoint, exchange area, and status mapping, installed by root.
 pub fn link() -> MemdLink {
     // Root maps the read-only status record for this task's lifetime.
     unsafe {
@@ -29,19 +28,19 @@ fn link_of(alloc: &Alloc) -> MemdLink {
     alloc.memd.expect("memd link")
 }
 
-/// Take the RAM of guest `g`: `blocks` 2 MiB blocks.  `block_cn` is its
+/// Take the RAM of guest `g`: `blocks` 2 MiB blocks.  memd makes its
 /// block CNode, of radix `radix`, into which memd gives the guest its
-/// blocks at boot; `hp_cn` its hotplug CNode, for `hp_count` hotplug
-/// blocks.
-pub fn guest_create(alloc: &Alloc, g: usize, blocks: usize, block_cn: cap::CNode, radix: usize, hp_cn: cap::CNode, hp_count: usize) -> bool {
+/// blocks at boot, and its hotplug CNode, for `hp_count` hotplug blocks:
+/// they go to our slots `cnodes`.  False if memd cannot, or did not give
+/// them (it has the guest all the same: guest_destroy).
+pub fn guest_create(alloc: &Alloc, g: usize, blocks: usize, radix: usize, hp_count: usize, cnodes: [Slot; 2]) -> bool {
     let m = link_of(alloc);
-    let (bcn, hcn) = (m.area(caps::guest_create::BLOCK_CNODE.passed_in(0, kind_of(&block_cn))), m.area(caps::guest_create::HP_CNODE.passed_in(0, kind_of(&hp_cn))));
-    bcn.copy(&abs_of(block_cn), CapRights::all()).expect("memd: give block CNode");
-    hcn.copy(&abs_of(hp_cn), CapRights::all()).expect("memd: give hotplug CNode");
-    let ok = m.guest_create(g, blocks, radix, hp_count).is_ok();
-    // What memd did not take.
-    let _ = (bcn.delete(), hcn.delete());
-    ok
+    if m.guest_create(g, blocks, radix, hp_count).is_err() {
+        return false;
+    }
+    use caps::guest_create::{BLOCK_CNODE, HP_CNODE};
+    const GIVEN: [usize; 2] = [BLOCK_CNODE.passed_out(0, l4h_host::wire::Cap::CNode), HP_CNODE.passed_out(0, l4h_host::wire::Cap::CNode)];
+    GIVEN.into_iter().zip(cnodes).all(|(c, s)| abs_of(sel4::Cap::<cap_type::Null>::from_bits(s as u64)).move_(&m.area(c)).is_ok())
 }
 
 /// Set the hotplug target of guest `g`, in hotplug blocks.
@@ -64,12 +63,12 @@ pub fn give_vmm_ep(g: usize, vmm: &crate::component::Component) {
 }
 
 /// A copy of block `b` of guest `g`, into our slot `slot`: its physical
-/// address.
-pub fn guest_copy(alloc: &Alloc, g: usize, b: usize, slot: Slot) -> usize {
+/// address.  None if memd has failed.
+pub fn guest_copy(alloc: &Alloc, g: usize, b: usize, slot: Slot) -> Option<usize> {
     let m = link_of(alloc);
-    let paddr = m.guest_copy(g, b).expect("memd: copy of a guest block") as usize;
-    abs_of(sel4::Cap::<cap_type::Null>::from_bits(slot as u64)).move_(&m.area(caps::guest_copy::BLOCK.passed_out(0, l4h_host::wire::Cap::Untyped))).expect("memd: take block copy");
-    paddr
+    let paddr = m.guest_copy(g, b).ok()? as usize;
+    abs_of(sel4::Cap::<cap_type::Null>::from_bits(slot as u64)).move_(&m.area(caps::guest_copy::BLOCK.passed_out(0, l4h_host::wire::Cap::Untyped))).ok()?;
+    Some(paddr)
 }
 
 /// Give guest `g` its blocks from `first` on, block b at index b + `skip`

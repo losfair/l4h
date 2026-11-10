@@ -422,7 +422,7 @@ impl AmdVi {
                         _ => (id, u16_at(b, 6)),
                     };
                     let (start, len) = (u64_at(b, 16) as usize, u64_at(b, 24) as usize);
-                    let end = start.checked_add(len)?.next_multiple_of(PAGE);
+                    let end = start.checked_add(len)?.checked_next_multiple_of(PAGE)?;
                     let u = Unity { first, last, start: start & !(PAGE - 1), end, write: write || exclusion };
                     info!("l4h-root: iommu: unity range {:#x}..{:#x} for devices {:#06x}..={:#06x}", u.start, u.end, first, last);
                     if self.unity.push(u).is_err() {
@@ -696,12 +696,19 @@ impl AmdVi {
         use crate::vspace::{LARGE_PAGE_BP, map_large_page};
         use sel4::init_thread::slot;
         assert!(!self.chunks().is_full(), "l4h-root: iommu: out of table space");
-        let (ut, page) = alloc.slots.global(|s| (s.alloc(), s.alloc()));
-        let mut region = alloc.split(CHUNK_BITS, ut).expect("l4h-root: iommu: no memory for tables");
-        let pa = region.retype(&LARGE_PAGE_BP, 1, crate::mem::Dest::new(crate::slot::CNODE.cap(), page)).expect("iommu table chunk");
         let va = crate::layout::IOMMU_TABLES.base + (self.chunks().len() << CHUNK_BITS);
-        let cap = sel4::init_thread::Slot::<sel4::cap_type::LargePage>::from_index(page).cap();
-        map_large_page(&mut crate::mem::ObjCtx::global(alloc), slot::VSPACE.cap(), cap, va, sel4::CapRights::read_write());
+        // Root's for good, whichever guest's mapping needs it: the chunk's
+        // slots, and those of the page directory every 1 GiB of chunks
+        // takes, must not be recorded as that guest's, or they would be
+        // deleted with it.
+        let pa = alloc.global(|alloc| {
+            let (ut, page) = (alloc.slots.alloc(), alloc.slots.alloc());
+            let mut region = alloc.split(CHUNK_BITS, ut).expect("l4h-root: iommu: no memory for tables");
+            let pa = region.retype(&LARGE_PAGE_BP, 1, crate::mem::Dest::new(crate::slot::CNODE.cap(), page)).expect("iommu table chunk");
+            let cap = sel4::init_thread::Slot::<sel4::cap_type::LargePage>::from_index(page).cap();
+            map_large_page(&mut crate::mem::ObjCtx::global(alloc), slot::VSPACE.cap(), cap, va, sel4::CapRights::read_write());
+            pa
+        });
         let _ = self.dev.as_mut().unwrap().chunks.push((va, pa));
         (va, pa)
     }

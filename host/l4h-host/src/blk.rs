@@ -49,20 +49,12 @@ pub struct Resp {
     pub reserved: u32,
 }
 
-/// Single-producer single-consumer ring indices.  `head` is written by the
-/// producer, `tail` by the consumer; both increase monotonically.
-#[repr(C)]
-pub struct RingIdx {
-    pub head: u32,
-    pub pad0: [u32; 15],
-    pub tail: u32,
-    pub pad1: [u32; 15],
-}
-
 #[repr(C)]
 pub struct Channel {
-    pub sq: RingIdx,
-    pub cq: RingIdx,
+    /// Requests: the client produces, blkd consumes; then responses.
+    /// Each side keeps its own index (crate::spsc).
+    pub sq: crate::spsc::RingIdx,
+    pub cq: crate::spsc::RingIdx,
     /// Written by blkd before it sets `ready`.
     pub capacity_sectors: u64,
     pub read_only: u32,
@@ -107,9 +99,10 @@ crate::protocol! {
     /// blkd answers wire::FAILED.  Label 1 is unused: blkd publishes its
     /// units instead (Published).
     pub mod call (from: Sender) {
-        /// Attach what `check` allowed in slot `client`: the channel's
-        /// window (n = 0) or the n extents in staging.  blkd builds the
-        /// client's ExtentTable at extent_va(client).
+        /// Attach what `check` allowed in the slot it gave, `client`: the
+        /// channel's window (n = 0) or the n extents in staging.  blkd
+        /// checks again (Reservations::admits) and builds the client's
+        /// ExtentTable at extent_va(client).
         Add / add = 2 from [Root] (client: usize, unit: usize, dom0: bool, n: usize) -> ();
         /// Drain and forget a client: EBUSY if it did not drain.
         Remove / remove = 3 from [Root] (client: usize) -> ();
@@ -459,11 +452,13 @@ impl<'a> Volume<'a> {
         let bytes: u64 = req.segs[..req.nr_segs as usize].iter().map(|s| s.len as u64).sum();
         let k = self.order.partition_point(|&o| self.extents[o as usize].offset <= g) - 1;
         let e = self.nth(k).unwrap();
-        let first = bytes.min((e.offset + e.sectors - g) * 512);
+        // Extents are as long as a unit's capacity, which the device
+        // reports: in bytes they may not fit in a u64.
+        let first = bytes.min((e.offset + e.sectors - g).saturating_mul(512));
         let mut pieces = ([(e.start + (g - e.offset), first), (0, 0)], 1);
         if first < bytes {
             let next = self.nth(k + 1).ok_or(STATUS_IOERR)?;
-            if bytes - first > next.sectors * 512 { return Err(STATUS_IOERR); }
+            if bytes - first > next.sectors.saturating_mul(512) { return Err(STATUS_IOERR); }
             pieces.0[1] = (next.start, bytes - first);
             pieces.1 = 2;
         }
@@ -530,19 +525,35 @@ impl<const N: usize> Reservations<N> {
             && (r.window.start, r.window.sectors) == (want.extents[0].start, want.extents[0].sectors))
     }
 
+    /// Whether `want` conflicts with a client or with a reservation it
+    /// cannot claim.
+    fn busy<'a>(&self, active: &impl Fn(usize) -> Option<Hold<'a>>, want: &Hold, dom0: bool) -> bool {
+        let conflicts = |h: &Hold| h.unit == want.unit && !(want.read_only && h.read_only) && overlap(want.extents, h.extents);
+        // A claimed reservation is represented by its client.
+        (0..N).any(|i| match active(i) {
+            Some(a) => conflicts(&a),
+            None => self.hold(i).is_some_and(|r| conflicts(&r) && !self.claimable(i, active, want, dom0)),
+        })
+    }
+
     /// The slot `want` may attach in: EBUSY if it conflicts with a client
     /// or with a reservation it cannot claim, ENOSPC if no slot is free.
     pub fn slot<'a>(&self, active: &impl Fn(usize) -> Option<Hold<'a>>, want: &Hold, dom0: bool) -> Result<usize, Errno> {
-        let conflicts = |h: &Hold| h.unit == want.unit && !(want.read_only && h.read_only) && overlap(want.extents, h.extents);
-        // A claimed reservation is represented by its client.
-        let busy = (0..N).any(|i| match active(i) {
-            Some(a) => conflicts(&a),
-            None => self.hold(i).is_some_and(|r| conflicts(&r) && !self.claimable(i, active, want, dom0)),
-        });
-        if busy { return Err(EBUSY); }
+        if self.busy(active, want, dom0) { return Err(EBUSY); }
         (0..N).find(|&i| self.claimable(i, active, want, dom0))
             .or_else(|| (0..N).find(|&i| active(i).is_none() && self.slots[i].is_none()))
             .ok_or(ENOSPC)
+    }
+
+    /// Whether `want` may attach in slot `i`, which `slot` gave it before
+    /// clients were removed: it conflicts with nothing, and `i` is free or
+    /// a reservation it claims.  Removals since may have freed a lower
+    /// slot, or a reservation `want` could claim, without making `i`
+    /// wrong: another slot holding the same range of a reservation only
+    /// keeps more from others.
+    pub fn admits<'a>(&self, active: &impl Fn(usize) -> Option<Hold<'a>>, want: &Hold, dom0: bool, i: usize) -> bool {
+        i < N && !self.busy(active, want, dom0)
+            && (self.claimable(i, active, want, dom0) || (active(i).is_none() && self.slots[i].is_none()))
     }
 
     /// Keep `r` (a range of dom0's boot plan) from other users.

@@ -58,6 +58,7 @@ impl VirtioBlk {
             common: Mmio(cfg.common.va as usize),
             notify: Mmio(cfg.notify.va as usize),
             notify_mult: cfg.notify_off_multiplier,
+                notify_len: cfg.notify.len as usize,
             device: Mmio(cfg.device.va as usize),
         });
         let (vq, features, ports, capacity, block_size) = if let Some(dev) = &modern {

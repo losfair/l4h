@@ -10,6 +10,10 @@ use crate::vmmgr::Answer;
 
 pub use l4h_host::errno::{EAGAIN, EBUSY, EEXIST, EINVAL, EIO, ENODEV, ENOENT, ENOMEM, ENOSPC, ENOSYS, EPERM, Errno};
 
+// Request words narrowed to usize (`as usize`) keep every bit; narrower
+// ones are taken with try_from and the op's errno for a bad argument.
+const _: () = assert!(usize::BITS == u64::BITS);
+
 /// Execute control op `op` with `a`: its vals, and its data into `data`;
 /// or later, for an op that waits for blkd (BLK_WRITE, BLK_INFO).
 pub fn host_op(h: &mut Host, op: u32, a: &[u64; 6], data: &mut [u8; abi::CTL_DATA_MAX]) -> Result<Answer, Errno> {
@@ -88,7 +92,7 @@ pub fn host_op(h: &mut Host, op: u32, a: &[u64; 6], data: &mut [u8; abi::CTL_DAT
         }
         abi::CTL_USB_INFO => vals = crate::usb::info(a[0] as usize, data)?,
         abi::CTL_SWITCH_CREATE => vals[0] = h.netd.try_create_switch()? as u64,
-        abi::CTL_SWITCH_ATTACH_UPLINK => h.netd.attach_uplink(a[0] as u32, a[1] as usize)?,
+        abi::CTL_SWITCH_ATTACH_UPLINK => h.netd.attach_uplink(a[0].try_into().map_err(|_| ENOENT)?, a[1] as usize)?,
         abi::CTL_NIC_INFO => {
             let n = h.netd.nics.get(a[0] as usize).ok_or(ENOENT)?;
             let p = &n.pci;
@@ -97,7 +101,7 @@ pub fn host_op(h: &mut Host, op: u32, a: &[u64; 6], data: &mut [u8; abi::CTL_DAT
             vals[2] = h.netd.nic_mac(a[0] as usize).unwrap_or(0);
         }
         abi::CTL_SWITCH_INFO => {
-            let sw = a[0] as u32;
+            let sw = u32::try_from(a[0]).map_err(|_| ENOENT)?;
             if sw >= h.netd.switches {
                 return Err(ENOENT);
             }

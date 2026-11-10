@@ -25,6 +25,9 @@ const LINE_SIZE: usize = 1024;
 
 pub struct Console {
     ring: *mut host::ConsoleRing,
+    /// Bytes written to `ring`: we only publish its `head`, which vmmgr
+    /// reads.
+    head: u64,
     serial: bool,
     /// Whose console this is, in the serial ring.
     source: u32,
@@ -68,6 +71,8 @@ impl Console {
     pub fn new(serial: bool, prefix: Option<u32>, event: u32, hz: u64) -> Self {
         Console {
             ring: host::VMM_CONSOLE_RING_VA as *mut host::ConsoleRing,
+            // vmmgr made the ring for this VMM: it is empty.
+            head: 0,
             serial,
             source: prefix.map_or(host::serial::SOURCE_DOM0, |id| host::serial::SOURCE_GUEST | id),
             line: [0; LINE_SIZE],
@@ -91,10 +96,10 @@ impl Console {
 
     fn put(&mut self, c: u8) {
         unsafe {
-            let head = addr_of!((*self.ring).head).read_volatile();
-            addr_of_mut!((*self.ring).data[head as usize % host::CONSOLE_RING_DATA]).write_volatile(c);
+            addr_of_mut!((*self.ring).data[(self.head % host::CONSOLE_RING_DATA as u64) as usize]).write_volatile(c);
+            self.head = self.head.wrapping_add(1);
             fence(Ordering::Release);
-            addr_of_mut!((*self.ring).head).write_volatile(head + 1);
+            addr_of_mut!((*self.ring).head).write_volatile(self.head);
         }
         if self.serial {
             if c == b'\n' {

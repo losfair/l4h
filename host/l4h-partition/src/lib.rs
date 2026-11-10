@@ -362,10 +362,12 @@ pub const MSG_RING_HEAD: usize = 0;
 pub const MSG_RING_WAKE: usize = 8;
 
 /// One ring of a mapped channel: its header at `va`, then `cap` bytes.
-#[derive(Clone, Copy)]
+/// The writer keeps its count of bytes written, `written`, itself and
+/// only publishes it: the peer can write the header too.
 pub struct MsgRing {
     pub va: usize,
     pub cap: u64,
+    written: core::cell::Cell<u64>,
 }
 
 impl MsgRing {
@@ -376,7 +378,14 @@ impl MsgRing {
         let half = size as usize / 2;
         let cap = (half - MSG_RING_HEADER) as u64;
         let (tx, rx) = if me < peer { (va, va + half) } else { (va + half, va) };
-        (MsgRing { va: tx, cap }, MsgRing { va: rx, cap })
+        let ring = |va| {
+            let r = MsgRing { va, cap, written: core::cell::Cell::new(0) };
+            // A ring is never reset: the writer goes on from the count
+            // published (counts are multiples of 8, as cap is).
+            r.written.set(r.head() & !7);
+            r
+        };
+        (ring(tx), ring(rx))
     }
 
     pub fn head(&self) -> u64 {
@@ -412,17 +421,19 @@ impl MsgRing {
         let len = 8 + n as u64;
         let room = len.next_multiple_of(8);
         assert!(room <= Self::max_room(self.cap), "channel message too large");
-        let mut head = self.head();
-        let pos = head % self.cap;
+        // Our own count, not the header's (the peer can write it): the
+        // message (and padding) stays inside the ring.
+        let mut head = self.written.get();
+        let mut pos = head % self.cap;
         if pos + room > self.cap {
             // The rest of the ring is padding.
             unsafe {
                 (self.data(pos) as *mut u32).write_volatile((self.cap - pos) as u32);
                 (self.data(pos + 4) as *mut u32).write_volatile(MSG_PAD);
             }
-            head += self.cap - pos;
+            head = head.wrapping_add(self.cap - pos);
+            pos = 0;
         }
-        let pos = head % self.cap;
         unsafe {
             (self.data(pos) as *mut u32).write_volatile(len as u32);
             (self.data(pos + 4) as *mut u32).write_volatile(ty);
@@ -434,7 +445,8 @@ impl MsgRing {
         }
         // The message before the count that covers it (x86 orders stores).
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
-        unsafe { ((self.va + MSG_RING_HEAD) as *mut u64).write_volatile(head + room) };
+        self.written.set(head.wrapping_add(room));
+        unsafe { ((self.va + MSG_RING_HEAD) as *mut u64).write_volatile(self.written.get()) };
     }
 
     /// For the writer, after it published messages: whether the reader
@@ -478,17 +490,23 @@ impl MsgReader {
                 return None;
             }
             if self.ring.overrun(head, self.tail) {
-                *lost += head.wrapping_sub(self.tail);
+                *lost = lost.saturating_add(head.wrapping_sub(self.tail));
                 self.tail = head;
                 return None;
             }
             let pos = self.tail % self.ring.cap;
+            // The peer's count, which places the header: inside the ring.
+            if self.ring.cap - pos < 8 {
+                *lost = lost.saturating_add(head.wrapping_sub(self.tail));
+                self.tail = head;
+                return None;
+            }
             let (len, ty) = unsafe {
                 ((self.ring.data(pos) as *const u32).read_volatile() as u64, (self.ring.data(pos + 4) as *const u32).read_volatile())
             };
             let room = len.next_multiple_of(8);
             if len < 8 || pos + room > self.ring.cap {
-                *lost += head.wrapping_sub(self.tail);
+                *lost = lost.saturating_add(head.wrapping_sub(self.tail));
                 self.tail = head;
                 return None;
             }
@@ -502,7 +520,8 @@ impl MsgReader {
             if self.ring.overrun(self.ring.head(), self.tail) {
                 continue;
             }
-            self.tail += room;
+            // The peer writes head: counts compare wrapping (`overrun`).
+            self.tail = self.tail.wrapping_add(room);
             if ty != MSG_PAD {
                 return Some((ty, n));
             }

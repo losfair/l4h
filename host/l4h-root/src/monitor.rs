@@ -164,7 +164,9 @@ pub fn state_name(state: u8) -> &'static str {
     }
 }
 
-/// A guest's name as vmmgr reports it.
+/// A guest's name as vmmgr reports it: dom0 chose it, whatever bytes. What
+/// prints it hands it on only as text (`l4h_host::log::printable`, in logd
+/// and `l4hctl logs`; the dashboard draws glyphs).
 pub fn name(g: &l4h_host::vmmgr::GuestStatus) -> &str {
     let n = g.name.iter().position(|&c| c == 0).unwrap_or(g.name.len());
     core::str::from_utf8(&g.name[..n]).unwrap_or("?")

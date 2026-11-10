@@ -29,7 +29,7 @@ fifo=$(mktemp -u)
 mkfifo "$fifo"
 qemu=
 trap 'rm -f "$fifo"; [ -z "$qemu" ] || kill "$qemu" 2>/dev/null || true' EXIT
-"$l4h_qemu" "$root/host/target/$l4h_target/debug/l4h-root.elf" \
+"$l4h_qemu" "$root/host/target/$l4h_target/$l4h_profile/l4h-root.elf" \
     -drive file="$out/hang0.img",if=none,id=d0,format=raw -device virtio-blk-pci,drive=d0,disable-legacy=on \
     -drive file="$out/hang1.img",if=none,id=d1,format=raw -device virtio-blk-pci,drive=d1,disable-legacy=on \
     <"$fifo" >"$log" 2>&1 &

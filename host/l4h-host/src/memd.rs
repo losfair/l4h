@@ -17,14 +17,14 @@
 /// l4h-root puts here before `call::balloon`.
 pub const SLOT_BALLOON_IOPORT: u64 = crate::SLOT_FIRST_FREE;
 /// Slot of guest g's block CNode (L4H_SLOT_BLOCKS of the guest), which
-/// memd takes from vmmgr's exchange area at `guest_create` and deletes at
+/// memd makes at `guest_create` and deletes, with every copy, at
 /// `guest_destroy`.
 pub const SLOT_GUEST_BCN: u64 = 32;
 const _: () = assert!(SLOT_BALLOON_IOPORT < SLOT_GUEST_BCN);
 pub const MAX_GUESTS: usize = 64;
 /// Slot of guest g's hotplug CNode (L4H_SLOT_HP of the guest, without its
-/// guard), SLOT_GUEST_HCN + g, which memd takes from vmmgr's exchange area
-/// at `guest_create` and deletes at `guest_destroy`.
+/// guard), SLOT_GUEST_HCN + g, which memd makes at `guest_create` and
+/// deletes, with every copy, at `guest_destroy`.
 pub const SLOT_GUEST_HCN: u64 = SLOT_GUEST_BCN + MAX_GUESTS as u64;
 /// Root's exchange area: slots [SLOT_XCHG, SLOT_XCHG + XCHG_AREA) of
 /// memd's CNode.  vmmgr's is the CNode in SLOT_XCHG_CNODE, of radix
@@ -44,7 +44,7 @@ crate::senders! {
     /// Who calls memd, by the badge of its capability (badges::memd).
     /// l4h-root calls with an unbadged one, for its own memory; l4h-vmmgr
     /// with one badged VMMGR, for its own memory and guests' RAM, passing
-    /// capabilities in its mailbox; a guest's l4h-vmm with one badged
+    /// capabilities in its exchange area; a guest's l4h-vmm with one badged
     /// `VMM | GUEST`, for the hotplug calls of its own guest.
     pub enum Sender in recv {
         Root: [];
@@ -64,7 +64,11 @@ crate::protocol! {
     ///
     /// vmmgr is less trusted than memd, so memd keeps the original of every
     /// block it grants vmmgr and gives it a copy: `free` then revokes the
-    /// original, whatever vmmgr put in the mailbox.
+    /// original, whatever vmmgr put in its exchange area.  memd takes no
+    /// capability from vmmgr to invoke: one that is not what the call
+    /// declares (an endpoint where a CNode should be) would make memd's
+    /// invocation an IPC.  A slot the caller fills again while memd fills
+    /// it fails the call (EINVAL).
     pub mod call (from: Sender, xchg: XCHG_AREA) {
         /// `count` (at most XCHG_SLOTS) Untypeds of 2^bits bytes
         /// (BLOCK_BITS..=MAX_BITS) without children, in the exchange
@@ -77,12 +81,14 @@ crate::protocol! {
         /// 2^BLOCK_BITS bytes in the units of the table.
         Free / free = 2 from [Root, Vmmgr] (blocks: ArrayVec<(usize, usize), XCHG_SLOTS>)
             caps { In BLOCKS: Untyped [0; XCHG_SLOTS] } -> ();
-        /// Take the guest's RAM, `blocks` 2 MiB blocks, with its block
-        /// CNode (of radix `radix`) and hotplug CNode (for `hp_count`
-        /// hotplug blocks, at most HP_MAX).  Nothing is given yet, and its
-        /// hotplug target is 0.
+        /// Take the guest's RAM, `blocks` 2 MiB blocks, and make its block
+        /// CNode (of radix `radix`, 1..=15) and hotplug CNode (radix
+        /// HP_L1_BITS, for `hp_count` hotplug blocks, at most HP_MAX), of
+        /// memd's memory: copies of both in the exchange slots, for vmmgr
+        /// to give the guest.  Nothing is given yet, and its hotplug target
+        /// is 0.
         GuestCreate / guest_create = 3 from [Vmmgr] (guest: usize, blocks: usize, radix: usize, hp_count: usize)
-            caps { In BLOCK_CNODE: CNode [XCHG_SLOTS; 1], In HP_CNODE: CNode [XCHG_SLOTS + 1; 1] } -> ();
+            caps { Out BLOCK_CNODE: CNode [XCHG_SLOTS; 1], Out HP_CNODE: CNode [XCHG_SLOTS + 1; 1] } -> ();
         /// A copy of the block's Untyped in exchange slot 0, for vmmgr to
         /// fill with frames (a boot block): its physical address.  Once
         /// per block, before `guest_give`.
@@ -107,7 +113,9 @@ crate::protocol! {
         /// of its 64 blocks into the guest's level-2 hotplug CNode in slot m
         /// of its hotplug CNode.
         HpPlug / hp_plug = 16 from [Vmm] (m: usize) -> ();
-        /// Revoke and free the blocks of hotplug block m.
+        /// Revoke and free the blocks of hotplug block m.  EBUSY if they
+        /// are not all revoked within the time the guest has left
+        /// (HP_SHARE): the block stays plugged, and the next call goes on.
         HpUnplug / hp_unplug = 17 from [Vmm] (m: usize) -> ();
         /// The caller's guest's hotplug state.
         HpState / hp_state = 18 from [Vmm] () -> HpState;
@@ -132,10 +140,13 @@ const _: () = assert!(SLOT_XCHG_CNODE < SLOT_GUEST_BCN);
 /// Hotplug blocks of a region, at most, and the words of its bitmap.
 pub const HP_MAX: usize = 512;
 pub const HP_MAP_WORDS: usize = HP_MAX / 64;
-/// A guest plugs or unplugs at most HP_RATE hotplug blocks a second, after
-/// a burst of HP_BURST.
-pub const HP_RATE: u64 = 8;
-pub const HP_BURST: u64 = 16;
+/// A guest's hotplug calls take at most 1/HP_SHARE of memd's time (8 ms a
+/// second), after a burst of HP_BURST_US microseconds, each counted as
+/// what it took and at least HP_CALL_US: 8 plugs or unplugs a second
+/// after a burst of 16, or fewer if the guest made them slow.
+pub const HP_SHARE: u64 = 125;
+pub const HP_BURST_US: u64 = 16_000;
+pub const HP_CALL_US: u64 = 1_000;
 
 /// Guest RAM comes in blocks of 2^BLOCK_BITS bytes, the smallest memd
 /// handles: a unit of its table.
@@ -227,6 +238,9 @@ crate::wire_struct! {
         /// A legacy device: the base of its I/O ports, in
         /// SLOT_BALLOON_IOPORT (the others are then 0); 0 for a modern one.
         pub legacy_io: u64,
+        /// Bytes of the notify structure (the device's queue doorbells
+        /// must be in it).
+        pub notify_len: u64,
     }
 }
 
@@ -259,12 +273,13 @@ mod tests {
         assert_eq!(r(2, &[0], Sender::Vmmgr), Ok(2));
         assert_eq!(r(3, &[0, 1, 1, 0], Sender::Vmmgr), Ok(3));
         assert_eq!(r(5, &[0, 0, 0], Sender::Vmmgr), Ok(5));
-        assert_eq!(r(7, &[0; 6], Sender::Root), Ok(7));
+        // Balloon: 7 words since notify_len.
+        assert_eq!(r(7, &[0; 7], Sender::Root), Ok(7));
         assert_eq!(r(18, &[], Sender::Vmm(3)), Ok(18));
         // What memd refused before: guest calls from root, root's from
         // vmmgr, anything but hotplug from a VMM.
         assert_eq!(r(3, &[0, 1, 1, 0], Sender::Root), Err(crate::wire::EINVAL));
-        assert_eq!(r(7, &[0; 6], Sender::Vmmgr), Err(crate::wire::EINVAL));
+        assert_eq!(r(7, &[0; 7], Sender::Vmmgr), Err(crate::wire::EINVAL));
         assert_eq!(r(1, &[21, 1], Sender::Vmm(0)), Err(crate::wire::EINVAL));
         assert_eq!(r(16, &[0], Sender::Vmmgr), Err(crate::wire::EINVAL));
         assert_eq!(call::Request::MAX_WORDS, 1 + 2 * XCHG_SLOTS);

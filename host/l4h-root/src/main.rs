@@ -76,6 +76,8 @@ static ALLOC_STORAGE: StaticCell<mem::AllocStorage> = StaticCell::new(mem::Alloc
 static LOG: host::log::Ring = host::log::Ring::new();
 /// Partition 0's serial ring. A secondary only starts on it.
 static SERIAL: host::serial::Ring = host::serial::Ring::new();
+/// Partition 0's other writers' serial lanes (unused in a secondary).
+static SERIAL_LANES: host::serial::Lanes = host::serial::Lanes::new();
 pub const MAX_GUESTS: usize = 64;
 /// What root made for vmmgr's guests, by id.
 static GUESTS: StaticCell<[Option<RootGuest>; MAX_GUESTS]> = StaticCell::new([const { None }; MAX_GUESTS]);
@@ -104,6 +106,8 @@ pub struct HostInfo {
     pub tsc_hz: u64,
     log_frames: u64,
     serial_frames: u64,
+    /// SERIAL_LANES' first frame, in partition 0.
+    serial_lanes: Option<u64>,
     /// AArch64 feature ID registers for the guests' bootinfo (`cpu_id`).
     pub cpu_id: [u64; 5],
     pub hyp_ep: cap::Endpoint,
@@ -125,11 +129,16 @@ impl HostInfo {
             tsc_hz: self.tsc_hz,
             log_frames: self.log_frames,
             serial_frames: self.serial_frames,
+            serial_lanes: self.serial_lanes,
         }
     }
 
     pub fn serial_frames(&self) -> u64 {
         self.serial_frames
+    }
+
+    pub fn serial_lanes(&self) -> Option<u64> {
+        self.serial_lanes
     }
 
     pub fn sched_control(&self, core: usize) -> cap::SchedControl {
@@ -308,7 +317,7 @@ impl Host {
         for c in 0..self.ctrls.len() {
             if !self.ctrls[c].failed {
                 blkd::start(c, &mut self.ctrls[c], &self.pci, &mut self.iommu,
-                    &mut self.devmem, &mut self.alloc, &mut self.wins.a, &mut self.asids, &self.info);
+                    &mut self.alloc, &mut self.wins.a, &mut self.asids, &self.info);
             }
         }
     }
@@ -431,6 +440,12 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
             bootinfo.user_image_frames().index(i).cap().bits()
         },
         serial_frames,
+        // logd reads lanes in partition 0; a secondary's tasks share its ring.
+        serial_lanes: (!partition::secondary()).then(|| {
+            let first = (&raw const SERIAL_LANES) as usize;
+            assert!((first - layout::image_base()) / 4096 + host::serial::LANES_PAGES <= bootinfo.user_image_frames().len());
+            image_frame(first)
+        }),
         cpu_id: cpu_id(bootinfo),
         hyp_ep,
         sched_control_base: bootinfo.sched_control().range().start,
@@ -468,6 +483,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     // single-threaded.
     let ctrls = unsafe { &mut *(&raw mut CTRLS) };
     let mut nics = ArrayVec::<pci::Device, { host::net::MAX_NICS }>::new();
+    let mut nic_bars = ArrayVec::<blkd::BarCache, { host::net::MAX_NICS }>::new();
     let mut balloon = None;
     for d in pci.enumerate() {
         info!(
@@ -499,12 +515,16 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
             let _ = ctrls.push(ctrl);
         } else if netd::is_uplink(&d) {
             pci.disable(&d);
-            if nics.push(d).is_err() {
+            let mut bars = [const { None }; 6];
+            if nics.is_full() {
                 log!("l4h-root: more than {} NICs, ignoring {:02x}:{:02x}.{}", host::net::MAX_NICS, d.bus, d.dev, d.func);
+            } else if netd::carve(&mut alloc, &mut devmem, &d, &mut bars) {
+                nics.must_push(d);
+                nic_bars.must_push(bars);
             }
         } else if usb::is_xhci(&d) {
             // Left to the firmware, enabled as it is, until claimed.
-            usb::found(d, &pci);
+            usb::found(d, &pci, &mut alloc, &mut devmem);
         } else if memd::is_balloon(&d) && balloon.is_none() && !partition::secondary() {
             balloon = Some(d);
         }
@@ -533,7 +553,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         #[cfg(target_arch = "x86_64")]
         acpi_frames,
     );
-    let netd = netd::spawn(&nics, &pci, &mut iommu, &mut devmem, &mut alloc, &mut wins.a, &mut asids, &info);
+    let netd = netd::spawn(&nics, &nic_bars, &pci, &mut iommu, &mut alloc, &mut wins.a, &mut asids, &info);
 
     let mut h = Host {
         info,
@@ -598,11 +618,13 @@ fn dom0_plan(h: &mut Host, ntfn: cap::Notification) -> Dom0Plan {
     }
     // By default, room for full receive rings on all of dom0's vNICs (one
     // per uplink switch it is given, one per internal switch, one per link).
-    let nics = h.cfg.dom0_nics + h.cfg.uplink2_nic.is_some() as usize + h.cfg.dom0_internal_switches
-        + links.iter().filter(|&&(_, uplink)| !uplink).count();
+    // The counts are the config file's: more NICs than dom0 can have
+    // stop the boot below.
+    let nics = h.cfg.dom0_nics.saturating_add(h.cfg.uplink2_nic.is_some() as usize).saturating_add(h.cfg.dom0_internal_switches)
+        .saturating_add(links.iter().filter(|&&(_, uplink)| !uplink).count()).min(host::vmmgr::DOM0_MAX_NICS);
     plan.io_pool = match h.cfg.dom0_io_pool_mb {
         0 => l4h_host::iopool::for_nics(nics, vmmgr::IO_POOL_DEFAULT).min(256 << 20),
-        mb => mb << 20,
+        mb => mb.saturating_mul(1 << 20),
     };
     if h.cfg.dom0_disk0_windows.is_some() {
         assert!(h.cfg.dom0_disks > 0 && !h.disks.is_empty(), "dom0 disk windows need disk 0");
@@ -630,7 +652,7 @@ fn dom0_plan(h: &mut Host, ntfn: cap::Notification) -> Dom0Plan {
         // Of disk 0, only the first dom0_disk0_mb MiB if the disk is larger.
         let mut sectors = 0;
         if d == 0 && h.cfg.dom0_disk0_mb > 0 {
-            let n = (h.cfg.dom0_disk0_mb as u64) << 11;
+            let n = (h.cfg.dom0_disk0_mb as u64).saturating_mul(1 << 11);
             if n < capacity { sectors = n; }
         }
         plan.disks.push(l4h_host::vmmgr::Dom0Disk { disk: d as u64, start: 0, sectors })
@@ -684,10 +706,11 @@ fn dom0_plan(h: &mut Host, ntfn: cap::Notification) -> Dom0Plan {
         add_nic(1, h.netd.nic_mac(nic).unwrap_or(0));
     }
     let first = 1 + uplink2.is_some() as usize;
-    while (h.netd.switches as usize) < first + h.cfg.dom0_internal_switches {
+    let end = first.saturating_add(h.cfg.dom0_internal_switches);
+    while (h.netd.switches as usize) < end {
         h.netd.create_switch();
     }
-    for i in first..first + h.cfg.dom0_internal_switches {
+    for i in first..end {
         add_nic(i as u32, 0);
     }
     // Each link to another partition gets a switch of its own, with a
@@ -700,7 +723,7 @@ fn dom0_plan(h: &mut Host, ntfn: cap::Notification) -> Dom0Plan {
     for (ch, uplink) in links.iter() {
         let (peer, uplink) = (ch.peer, *uplink);
         let sw = if uplink { 0 } else { h.netd.create_switch() };
-        match h.netd.add_link(ch, me, sw, ntfn, &mut h.alloc, &mut h.devmem) {
+        match h.netd.add_link(ch, me, sw, ntfn, &mut h.alloc, &mut h.devmem, &h.pci) {
             Ok(l) => info!("l4h-root: link to partition {} on switch {} (netd link {})", peer, sw, l),
             Err(e) => log!("l4h-root: no link to partition {}: error {}", peer, e),
         }
@@ -748,6 +771,11 @@ pub fn set_timer(deadline: u64) {
     sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_TCB_SetTimer(tcb.bits(), deadline, recv::TIMER));
 }
 
+/// When the next watchdog dump is due: watchdog_secs is the config file's.
+fn watchdog_after(h: &Host) -> u64 {
+    rdtsc().saturating_add(h.info.tsc_hz.saturating_mul(h.cfg.watchdog_secs as u64))
+}
+
 /// Root's part of the watchdog dump (vmmgr dumps the guests' vCPUs).
 fn watchdog_dump(h: &Host) {
     let ms = |ticks: u64| ticks * 1000 / h.info.tsc_hz.max(1);
@@ -769,7 +797,7 @@ struct Root<'a> {
 
 fn serve(h: &mut Host, reply: ReplySlot, modules: &bootmod::Modules) -> ! {
     arm_timer(&h.info);
-    let next_watchdog = rdtsc() + h.info.tsc_hz * h.cfg.watchdog_secs as u64;
+    let next_watchdog = watchdog_after(h);
     let hyp_ep = h.info.hyp_ep;
     l4h_ipc::run(hyp_ep, reply, &mut Root { h, modules, booting: true, next_watchdog })
 }
@@ -808,7 +836,7 @@ impl l4h_ipc::Server for Root<'_> {
             h.iommu.poll();
             if h.cfg.watchdog_secs != 0 && rdtsc() >= self.next_watchdog {
                 watchdog_dump(h);
-                self.next_watchdog = rdtsc() + h.info.tsc_hz * h.cfg.watchdog_secs as u64;
+                self.next_watchdog = watchdog_after(h);
             }
             arm_timer(&h.info);
         }

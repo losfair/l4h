@@ -96,6 +96,10 @@ impl List {
         self.head
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.head == NIL
+    }
+
     /// The guest list from unit `head` on (NIL: empty), whose units are
     /// to be taken off with `pop_guest`: its tail and length are not kept.
     pub fn from_head(head: u32) -> List {

@@ -127,7 +127,8 @@ impl Dma {
     /// Zeroed memory: (virtual address, physical address).
     pub fn alloc(&mut self, size: usize, align: usize) -> (usize, u64) {
         let off = (self.used + align - 1) & !(align - 1);
-        assert!(off + size <= self.size, "out of DMA memory");
+        // Sizes can derive from device registers: no `off + size` to wrap.
+        assert!(off <= self.size && size <= self.size - off, "out of DMA memory");
         self.used = off + size;
         unsafe { core::ptr::write_bytes((self.va + off) as *mut u8, 0, size) };
         (self.va + off, self.paddr + off as u64)
@@ -138,6 +139,9 @@ pub struct Device {
     pub common: Mmio,
     pub notify: Mmio,
     pub notify_mult: u32,
+    /// Bytes of the notify structure, which every queue's doorbell must be
+    /// in: its offset is the device's.
+    pub notify_len: usize,
     pub device: Mmio,
 }
 
@@ -205,7 +209,12 @@ impl Device {
         if self.common.r16(QUEUE_MSIX_VECTOR) != vector {
             return None;
         }
+        // Both factors are the device's (16 and 32 bits: no overflow), and
+        // the driver writes the doorbell: inside the notify structure.
         let notify_off = self.common.r16(QUEUE_NOTIFY_OFF) as usize * self.notify_mult as usize;
+        if notify_off.checked_add(2).is_none_or(|end| end > self.notify_len) {
+            return None;
+        }
         self.common.w16(QUEUE_ENABLE, 1);
         Some(Virtq {
             idx,

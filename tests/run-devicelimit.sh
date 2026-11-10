@@ -4,6 +4,7 @@
 # L4H_TEST_KERNEL may name an already-built compatible guest kernel.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
+source "$root/tools/host-profile.sh"
 out=$root/build/devicelimit
 mkdir -p "$out"
 if [ -n "${L4H_TEST_KERNEL:-}" ]; then
@@ -38,7 +39,7 @@ trap 'if [ -n "$qemu" ]; then kill "$qemu" 2>/dev/null || true; wait "$qemu" 2>/
 for case in fits overflow; do
     log=$out/$case.log
     L4H_CONFIG="$out/$case.conf" "$root/tools/run-qemu.sh" \
-        "$root/host/target/x86_64-sel4-roottask/debug/l4h-root.elf" \
+        "$root/host/target/x86_64-sel4-roottask/$l4h_profile/l4h-root.elf" \
         -drive "file=$out/disk.raw,if=none,id=d0,format=raw" -device virtio-blk-pci,drive=d0,disable-legacy=on \
         -netdev user,id=n0 -device virtio-net-pci,netdev=n0,disable-legacy=on > "$log" 2>&1 </dev/null &
     qemu=$!

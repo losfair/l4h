@@ -25,6 +25,7 @@ pub mod net;
 pub mod ring;
 pub mod root;
 pub mod serial;
+pub mod spsc;
 pub mod trust;
 pub mod usb;
 pub mod vmmgr;
@@ -145,14 +146,18 @@ pub const KIND_MEMD: u32 = 5;
 pub const KIND_VMMGR: u32 = 6;
 pub const KIND_LOGD: u32 = 7;
 pub const KIND_USBD: u32 = 8;
+/// trustd's flags server (trust::call): the trustd image, in spaces of its
+/// own.
+pub const KIND_FLAGS: u32 = 9;
 
-/// The kinds that serve calls: root calls memd, guests' VMMs call vmmgr.
-/// A caller blocked in a call could not wait for their faults to be
-/// reported, so a keeper thread answers for a failed one.  The drivers
-/// serve root's mailbox (crate::mailbox), which root never waits on: their
-/// faults go to root, which acts on them itself.
+/// The kinds that serve calls: root calls memd, guests' VMMs call vmmgr,
+/// vmmgr and trustd call the flags server.  A caller blocked in a call
+/// could not wait for their faults to be reported, so a keeper thread
+/// answers for a failed one.  The drivers serve root's mailbox
+/// (crate::mailbox), which root never waits on: their faults go to root,
+/// which acts on them itself.
 pub const fn has_keeper(kind: u32) -> bool {
-    matches!(kind, KIND_MEMD | KIND_VMMGR)
+    matches!(kind, KIND_MEMD | KIND_VMMGR | KIND_FLAGS)
 }
 
 
@@ -307,6 +312,24 @@ pub mod ticks {
     pub fn now() -> u64 {
         let v: u64;
         unsafe { core::arch::asm!("isb", "mrs {}, cntvct_el0", out(reg) v, options(nomem, nostack)) };
+        v
+    }
+
+    /// `now`, read after every earlier load and store is done and before
+    /// any later one starts: a time that orders with memory accesses, as
+    /// the log's writers and readers need (log::Ring::read).
+    #[cfg(target_arch = "x86_64")]
+    pub fn now_ordered() -> u64 {
+        let lo: u32;
+        let hi: u32;
+        unsafe { core::arch::asm!("mfence", "lfence", "rdtsc", "lfence", out("eax") lo, out("edx") hi, options(nostack)) };
+        ((hi as u64) << 32) | lo as u64
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn now_ordered() -> u64 {
+        let v: u64;
+        unsafe { core::arch::asm!("dsb sy", "isb", "mrs {}, cntvct_el0", "isb", out(reg) v, options(nostack)) };
         v
     }
 

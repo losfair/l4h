@@ -14,8 +14,8 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
+from host_profile import root_elf  # noqa: E402
 ARM = os.environ.get("L4H_ARCH", "x86_64") == "aarch64"
-TARGET = "aarch64-sel4-roottask" if ARM else "x86_64-sel4-roottask"
 RUNNER = ROOT / "tools" / ("run-qemu-aarch64.sh" if ARM else "run-qemu.sh")
 
 
@@ -74,7 +74,7 @@ def run_case(directory, mode, control):
     env = dict(os.environ, L4H_CONFIG=str(config), L4H_BALLOON="0",
                L4H_SMP=os.environ.get("L4H_SMP", "4" if ARM else "2"))
     with log.open("wb") as output:
-        proc = subprocess.Popen([str(RUNNER), str(ROOT / "host/target" / TARGET / "debug/l4h-root.elf"),
+        proc = subprocess.Popen([str(RUNNER), str(root_elf(arch)),
                                  "-S", "-rtc", "base=2030-01-01T00:00:00,clock=vm",
                                  "-qmp", f"unix:{directory}/qmp,server=on,wait=off",
                                  "-qtest", f"unix:{directory}/qtest,server=on,wait=off",

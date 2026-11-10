@@ -6,10 +6,22 @@ extern crate self as l4h_rt;
 
 use l4h_host::errno::Errno;
 use l4h_host::{MAX_GUEST_DEVICES, blk::DiskWindow, vmmgr::{DOM0_MAX_DISKS, Dom0Disk, Dom0Nic, VmmgrConfig}};
-use std::panic::{AssertUnwindSafe, catch_unwind};
+
+thread_local! {
+    static LOG: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    static NOW: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 #[macro_export]
-macro_rules! log { ($($a:tt)*) => {{ let _ = format_args!($($a)*); }}; }
+macro_rules! log { ($($a:tt)*) => {{ $crate::LOG.with(|l| l.borrow_mut().push(format!($($a)*))); }}; }
+
+/// The tick counter, which the tests move (`Info::tsc_hz` ticks a second).
+fn rdtsc() -> u64 { NOW.with(|n| n.get()) }
+
+mod ctl {
+    pub const EBUSY: l4h_host::errno::Errno = l4h_host::errno::EBUSY;
+    pub const EINVAL: l4h_host::errno::Errno = l4h_host::errno::EINVAL;
+}
 
 struct GuestConfig {
     name: &'static str,
@@ -22,9 +34,8 @@ struct GuestConfig {
 }
 struct Kernel { ram_base: usize }
 struct Windows { a: () }
+struct Info { tsc_hz: u64 }
 struct Guest { devices: Vec<()>, booted: bool, instance: u64 }
-/// Root answers every attachment at once here.
-enum Later<T> { Now(T), Token(usize) }
 #[derive(Clone, Copy)]
 enum Then { Dom0Boot { k: usize } }
 
@@ -34,8 +45,14 @@ pub struct Vmmgr {
     dom0_initrd: &'static [u8],
     alloc: (),
     wins: Windows,
-    info: (),
+    info: Info,
     guest: Option<Guest>,
+    dom0_wait: Option<Dom0Wait>,
+    /// Boot disks root has yet to answer: (k, the answer it gives).
+    pending: Vec<(usize, Result<(), Errno>)>,
+    /// Boot disks root answers EBUSY for, as many times each.
+    busy_disks: Vec<(usize, usize)>,
+    destroyed: bool,
     builtins: usize,
     disk_attempts: Vec<(usize, u64, u64)>,
     disks: Vec<Option<(usize, u64, u64)>>,
@@ -51,6 +68,10 @@ impl Vmmgr {
         self.guest = Some(Guest { devices: vec![(); self.builtins], booted: false, instance: 1 });
         Some(0)
     }
+    fn destroy_guest(&mut self, _: usize) -> Result<(), Errno> {
+        self.destroyed = true;
+        Ok(())
+    }
     fn guest(&self, _: usize) -> Option<&Guest> { self.guest.as_ref() }
     fn with_guest<R>(&mut self, _: usize, f: impl FnOnce(&mut Self, &mut Guest) -> R) -> Option<R> {
         let mut g = self.guest.take()?;
@@ -65,17 +86,25 @@ impl Vmmgr {
         Ok(())
     }
     fn attach_disk(&mut self, _: usize, disk: usize, flags: u64, start: u64, sectors: u64, extents: (u64, u64),
-        then: Then) -> Result<Later<()>, Errno> {
+        then: Then) -> Result<(), Errno> {
         assert_eq!(extents, (0, 0), "boot disks are windows");
         assert_eq!(flags, 0);
-        let attempt = self.disk_attempts.len();
+        assert!(self.pending.is_empty(), "one boot disk at a time");
         let Then::Dom0Boot { k } = then;
-        assert_eq!(k, attempt, "boot disks attach in order");
+        if let Some(b) = self.busy_disks.iter_mut().find(|b| b.0 == k && b.1 > 0) {
+            b.1 -= 1;
+            return Err(ctl::EBUSY);
+        }
+        assert_eq!(k, self.disk_attempts.len(), "boot disks attach in order");
         self.disk_attempts.push((disk, start, sectors));
-        if self.fail_disks.contains(&attempt) { return Err(5); }
-        self.add_device()?;
-        self.disks.push(Some((disk, start, sectors)));
-        Ok(Later::Now(()))
+        // Root answers later (vmmgr's root_done): an error, or the disk.
+        let r = if self.fail_disks.contains(&k) { Err(5) } else {
+            self.add_device()?;
+            self.disks.push(Some((disk, start, sectors)));
+            Ok(())
+        };
+        self.pending.push((k, r));
+        Ok(())
     }
     fn attach_dummy_disk(&mut self, _: usize) -> Result<(), Errno> {
         self.add_device()?;
@@ -102,7 +131,7 @@ impl Vmmgr {
 
 mod guest {
     use super::*;
-    pub fn boot_with(g: &mut Guest, _: &mut (), _: &mut (), _: &(), _: &Kernel, _: &[u8], _: &[u8]) -> bool {
+    pub fn boot_with(g: &mut Guest, _: &mut (), _: &mut (), _: &Info, _: &Kernel, _: &[u8], _: &[u8]) -> bool {
         g.booted = true;
         true
     }
@@ -128,17 +157,37 @@ fn fixture(builtins: usize, windows: usize, other_disks: usize, nics: usize) -> 
     for i in 0..nics { cfg.dom0_nic[i] = Dom0Nic { switch: i as u64, mac: 0 }; }
     Vmmgr {
         cfg: Box::leak(cfg), kernel: Some(Kernel { ram_base: 0 }), dom0_initrd: &[],
-        alloc: (), wins: Windows { a: () }, info: (), guest: None, builtins,
+        alloc: (), wins: Windows { a: () }, info: Info { tsc_hz: 1000 }, guest: None, builtins,
+        dom0_wait: None, pending: Vec::new(), busy_disks: Vec::new(), destroyed: false,
         disk_attempts: Vec::new(), disks: Vec::new(), nics: Vec::new(), fail_disks: Vec::new(),
         usbs: Vec::new(), fail_usbs: Vec::new(), started: false,
     }
 }
 
+/// Boot dom0 as vmmgr does: root answers each boot disk later, and the
+/// timer (every 100 ms) retries one root was busy for.
+fn boot(h: &mut Vmmgr) {
+    boot_dom0(h);
+    for _ in 0..10_000 {
+        if let Some((k, r)) = h.pending.pop() {
+            dom0_disk_done(h, 0, 1, k, r);
+        } else if h.dom0_wait.is_some() {
+            NOW.with(|n| n.set(n.get() + 100));
+            dom0_retry(h);
+        } else {
+            return;
+        }
+    }
+    panic!("dom0's boot did not finish");
+}
+
+/// dom0 is given back, with `message` logged, before it starts.
 fn fails_before_boot(h: &mut Vmmgr, message: &str) {
-    let error = catch_unwind(AssertUnwindSafe(|| boot_dom0(h))).expect_err("dom0 must not start");
-    let text = error.downcast_ref::<String>().map(String::as_str)
-        .or_else(|| error.downcast_ref::<&str>().copied()).unwrap_or("");
-    assert!(text.contains(message), "unexpected failure: {text}");
+    LOG.with(|l| l.borrow_mut().clear());
+    boot(h);
+    let log = LOG.with(|l| l.borrow().join("\n"));
+    assert!(log.contains(message), "unexpected failure: {log}");
+    assert!(h.destroyed);
     assert!(!h.started);
     assert!(!h.guest.as_ref().unwrap().booted);
 }
@@ -169,7 +218,7 @@ fn exact_fit_keeps_all_windows_other_disks_and_nics() {
         for nics in 0..=2 {
             let windows = MAX_GUEST_DEVICES - builtins - nics - 1;
             let mut h = fixture(builtins, windows, 1, nics);
-            boot_dom0(&mut h);
+            boot(&mut h);
             assert!(h.started);
             assert_eq!(h.guest.as_ref().unwrap().devices.len(), MAX_GUEST_DEVICES);
             let expected: Vec<_> = h.cfg.dom0_disk[..windows + 1].iter()
@@ -186,7 +235,7 @@ fn failed_disks_keep_their_positions_and_allow_dom0_to_boot() {
         for failed in [vec![0], vec![1], vec![2], vec![0, 1, 2]] {
             let mut h = fixture(4, windows, other_disks, 1);
             h.fail_disks = failed.clone();
-            boot_dom0(&mut h);
+            boot(&mut h);
             assert!(h.started);
             assert_eq!(h.disk_attempts.len(), 3);
             assert_eq!(h.disks.len(), 3);
@@ -204,7 +253,7 @@ fn failed_disks_keep_their_positions_and_allow_dom0_to_boot() {
 fn placeholders_fit_at_high_device_indices() {
     let mut h = fixture(4, 59, 0, 1);
     h.fail_disks = vec![0, 16, 32, 58];
-    boot_dom0(&mut h);
+    boot(&mut h);
     assert!(h.started);
     assert_eq!(h.guest.as_ref().unwrap().devices.len(), 64);
     assert_eq!(h.disks.len(), 59);
@@ -230,9 +279,26 @@ fn dom0_usb_controllers_are_attached_and_a_failure_is_not_fatal() {
     cfg.dom0_usb[..3].copy_from_slice(&[2, 0, 5]);
     h.cfg = Box::leak(cfg);
     h.fail_usbs.push(0);
-    boot_dom0(&mut h);
+    boot(&mut h);
     assert!(h.started);
     assert_eq!(h.usbs, [2, 5]);
     // Console, control, the disk, the NIC and two controllers.
     assert_eq!(h.guest.as_ref().unwrap().devices.len(), 6);
+}
+
+#[test]
+fn a_busy_controller_is_waited_for_then_a_placeholder_taken() {
+    // Busy for 2 s: the disk is waited for and attached.
+    let mut h = fixture(2, 0, 2, 0);
+    h.busy_disks = vec![(0, 20)];
+    boot(&mut h);
+    assert!(h.started);
+    assert_eq!(h.disks.len(), 2);
+    assert!(h.disks.iter().all(Option::is_some), "a disk lost to a busy controller");
+    // Busy for good: after DOM0_DISK_WAIT_MS, a placeholder in its place.
+    let mut h = fixture(2, 0, 2, 0);
+    h.busy_disks = vec![(1, usize::MAX)];
+    boot(&mut h);
+    assert!(h.started);
+    assert_eq!(h.disks, [Some(h.disk_attempts[0]), None]);
 }

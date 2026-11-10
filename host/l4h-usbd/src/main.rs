@@ -1582,7 +1582,7 @@ impl Usbd {
             i.port_proto.copy_from_slice(&c.port_proto);
             i.state = abi::RESETTING;
         }
-        let max_transfer = ((pool.size / 4) as u32).min(proto::MAX_TRANSFER);
+        let max_transfer = (pool.size / 4).min(proto::MAX_TRANSFER as u64) as u32;
         unsafe { (*info).max_transfer = max_transfer };
         self.client = Some(Client {
             idx, area, pool, max_transfer,
@@ -1706,8 +1706,8 @@ impl Usbd {
             }
             if c.notify {
                 c.notify = false;
-                // NBSend: root may have emptied the slot (REMOVE).
-                c.irq.nb_send(sel4::MessageInfo::new(0, 0, 0, 0));
+                // Root may have emptied the slot (REMOVE).
+                l4h_rt::mailbox::notify(c.irq);
             }
         }
     }

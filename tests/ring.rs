@@ -126,3 +126,24 @@ fn messages_arrive_whole_and_wakeups_are_not_lost() {
     assert!(ok > 0 && lost > 0, "the reader was never lapped");
     assert_eq!(stuck, 0, "lost wakeups");
 }
+
+#[test]
+fn a_header_the_peer_writes_over_does_not_move_the_writer() {
+    let (tx, mut rx) = ring(64 << 10);
+    let mut buf = vec![0u8; 256];
+    let mut lost = 0;
+    tx.send(MSG_FRAME, &[&frame(1, 100)]);
+    let head = tx.head();
+    // The peer writes a count of its own, unaligned and far ahead: the
+    // writer's next message goes after its own last one, and its count
+    // replaces the peer's.
+    unsafe { ((tx.va + MSG_RING_HEAD) as *mut u64).write_volatile(u64::MAX - 3) };
+    tx.send(MSG_FRAME, &[&frame(2, 100)]);
+    assert_eq!(tx.head(), head + (8 + 100u64).next_multiple_of(8));
+    for seq in 1..=2u64 {
+        let (ty, got) = rx.recv(&mut buf, &mut lost).expect("message");
+        assert_eq!((ty, got), (MSG_FRAME, 100));
+        assert!(intact(&buf[..got]) && buf[..8] == seq.to_le_bytes());
+    }
+    assert_eq!(lost, 0);
+}

@@ -11,7 +11,8 @@
 //! the CNode it holds of vmmgr's (root dominates vmmgr).  Root empties a
 //! slot before it puts a capability there, and takes none from vmmgr.  Root takes ids,
 //! disk numbers, windows and sizes from vmmgr, and checks them against its
-//! own tables, but never a physical address.
+//! own tables (a disk window against the disk's capacity; an extent list
+//! is blkd's to read and check), but never a physical address.
 
 use crate::memd;
 
@@ -48,13 +49,18 @@ pub const MAX_ASID_POOLS: usize = 8;
 /// memd's endpoint for guest g's l4h-vmm (badged as memd::Sender::Vmm(g)),
 /// which vmmgr copies into it: SLOT_VMM_MEMD_EP + g.
 pub const SLOT_VMM_MEMD_EP: u64 = SLOT_ASID_POOL + MAX_ASID_POOLS as u64;
-/// Shared log frames, also mapped into each guest's VMM.
-pub const SLOT_LOG_FRAMES: u64 = SLOT_VMM_MEMD_EP + memd::MAX_GUESTS as u64;
-/// Frames of the serial ring, also mapped into each guest's VMM.
+/// The guests' VMMs' serial lanes, dom0's included (serial::VMM_PAGES
+/// frames, from page 0 of serial::Lanes), each mapped into its VMM; in a
+/// secondary partition, which has no lanes, the partition's serial ring
+/// (serial::PAGES frames), mapped into every VMM.
 pub const SLOT_SERIAL_FRAMES: u64 = 256;
+const SERIAL_FRAMES: usize = if crate::serial::VMM_PAGES > crate::serial::PAGES { crate::serial::VMM_PAGES } else { crate::serial::PAGES };
+/// The VMMs' log lanes (log::VMM_PAGES frames, from page 0 of the log
+/// area), each mapped into its VMM.
+pub const SLOT_LOG_FRAMES: u64 = SLOT_SERIAL_FRAMES + SERIAL_FRAMES as u64;
 /// vmmgr's own allocations start here.
-pub const SLOT_DYN_BASE: u64 = SLOT_SERIAL_FRAMES + crate::serial::PAGES as u64;
-const _: () = assert!(SLOT_LOG_FRAMES + crate::log::PAGES as u64 <= SLOT_SERIAL_FRAMES);
+pub const SLOT_DYN_BASE: u64 = SLOT_LOG_FRAMES + crate::log::VMM_PAGES as u64;
+const _: () = assert!(SLOT_VMM_MEMD_EP + memd::MAX_GUESTS as u64 <= SLOT_SERIAL_FRAMES);
 const _: () = assert!(SLOT_XCHG + XCHG_SLOTS as u64 <= SLOT_SCHED_CONTROL);
 
 /// Pages of dom0's control data area.
@@ -82,7 +88,8 @@ pub const CTL_DATA_VA: usize = 0x5100_0100_0000;
 
 /// Requests root answers later (crate::root::Later), at most: tokens.
 /// A driver that never answers leaves its token pending; the guest's
-/// `guest_del` still answers ENOENT for it.  A disk controller holds at
+/// `guest_del` still answers ENOENT for it (and the token is free once
+/// vmmgr has taken that and the driver has answered).  A disk controller holds at
 /// most PENDING_PER_CTRL of them for requests blkd has not answered (EBUSY
 /// past that), so drivers that never answer leave tokens for the others.
 pub const MAX_PENDING: usize = 256;
@@ -241,5 +248,8 @@ pub struct VmmgrConfig {
     pub dom0_usbs: u64,
     pub dom0_usb: [u64; crate::usb::MAX_GUEST_USB],
     pub dom0_cmdline: [u8; l4h_abi::CMDLINE_SIZE],
+    /// SLOT_SERIAL_FRAMES holds the VMMs' serial lanes (partition 0), not
+    /// the partition's ring.
+    pub serial_lanes: u64,
 }
 const _: () = assert!(crate::CONFIG_OFFSET + core::mem::size_of::<VmmgrConfig>() <= crate::INFO_SIZE);

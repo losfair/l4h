@@ -39,7 +39,7 @@ objcopy --strip-debug "$l4h_linux_out/vmlinux" "$out/vmlinux"
     "$l4h_ctl" "$out/vm.cpio.gz" "$root/tests/guest/udhcpc.script" >/dev/null
 "$root/tools/build-mkshim.sh" 2 >/dev/null
 "$root/tools/build-host.sh"
-objcopy --strip-debug "$root/host/target/x86_64-sel4-roottask/debug/l4h-root.elf" "$out/l4h-root.elf"
+objcopy --strip-debug "$root/host/target/x86_64-sel4-roottask/$l4h_profile/l4h-root.elf" "$out/l4h-root.elf"
 rm -rf "$out/esp" && mkdir -p "$out/esp/p0" "$out/esp/p1"
 printf 'partitions = 2\np1.pci = 00:04.0, 00:06.0\nlink.p0-p1 = 1\n' > "$out/esp/l4h-mk.conf"
 stress=${GCE_STRESS:+ MKSTRESS=$GCE_STRESS}

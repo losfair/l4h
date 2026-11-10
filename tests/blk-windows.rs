@@ -1,7 +1,5 @@
-#[allow(dead_code)]
-#[path = "../host/l4h-host/src/blk.rs"]
-mod blk;
-use blk::*;
+use l4h_host::blk::*;
+use l4h_host::errno::{EBUSY, EINVAL, ENOSPC};
 
 fn pool() -> Pool { Pool { gpa: 0x8000000, paddr: 0x10000000, size: 4 << 20 } }
 fn window() -> DiskWindow { DiskWindow::new(2048, 16384, 131072).unwrap() }
@@ -222,6 +220,40 @@ fn an_active_dom0_window_cannot_be_claimed_twice_and_returns_on_detach() {
 }
 
 #[test]
+fn a_removal_between_check_and_add_keeps_the_checked_slot() {
+    // Slots 0 and 1 are clients; a check gives slot 2.  Root then removes
+    // client 0 before the add, which must still take slot 2.
+    let (a, b, c) = ([ext(0, 8)], [ext(8, 8)], [ext(16, 8)]);
+    let r = Reservations::<4>::new();
+    let want = Hold { unit: 0, extents: &c, read_only: false };
+    let before = |i: usize| match i { 0 => Some(Hold { unit: 0, extents: &a, read_only: false }),
+        1 => Some(Hold { unit: 0, extents: &b, read_only: false }), _ => None };
+    assert_eq!(r.slot(&before, &want, false), Ok(2));
+    let after = |i: usize| (i == 1).then_some(Hold { unit: 0, extents: &b, read_only: false });
+    assert_eq!(r.slot(&after, &want, false), Ok(0));
+    assert!(r.admits(&after, &want, false, 2));
+    // Never a held slot, a slot beyond the table or a conflicting range.
+    assert!(!r.admits(&after, &want, false, 1) && !r.admits(&after, &want, false, 4));
+    assert!(!r.admits(&after, &Hold { unit: 0, extents: &b, read_only: false }, false, 2));
+}
+
+#[test]
+fn only_dom0_is_admitted_in_a_reservations_slot() {
+    let mut r = Reservations::<4>::new();
+    assert_eq!(r.reserve(&none, reserved(0, 8, 16, true)), Ok(0));
+    let w = [ext(8, 16)];
+    let want = Hold { unit: 0, extents: &w, read_only: true };
+    assert!(r.admits(&none, &want, true, 0) && !r.admits(&none, &want, false, 0));
+    // While a read-only client claims it, dom0 gets a free slot for the
+    // same range; that client's removal must not make it refuse.
+    let claimed = |i: usize| (i == 0).then_some(want);
+    assert_eq!(r.slot(&claimed, &want, true), Ok(1));
+    assert!(r.admits(&none, &want, true, 1) && r.admits(&none, &want, true, 0));
+    let e = [ext(32, 8)];
+    assert!(!r.admits(&none, &Hold { unit: 0, extents: &e, read_only: false }, true, 0));
+}
+
+#[test]
 fn volumes_conflict_where_any_extents_meet() {
     let a = [ext(0, 8192), ext(16384, 8192)];
     let active = |i: usize| (i == 0).then_some(Hold { unit: 0, extents: &a, read_only: false });
@@ -311,6 +343,11 @@ fn randomized_decisions_match_a_per_block_model() {
                 0 | 1 => {
                     let got = r.slot(&lookup, &want, dom0);
                     assert_eq!(got, expect(dom0));
+                    // `add` takes the slot the check gave; nothing busy is admitted.
+                    match got {
+                        Ok(i) => assert!(r.admits(&lookup, &want, dom0, i)),
+                        Err(_) => assert!((0..N).all(|i| !r.admits(&lookup, &want, dom0, i))),
+                    }
                     if let Ok(i) = got { active[i] = Some((unit, extents.clone(), read_only)); }
                 }
                 2 => active[next(N as u64) as usize] = None,

@@ -12,7 +12,7 @@ use l4h_host::net::call::Request;
 use l4h_host::fixed::ArrayVec;
 use l4h_host::{self as host, net};
 
-use crate::blkd::{BAR_STRIDE, VirtioRegions, bar_pages, is_legacy_virtio, keep_bits, map_bar_mask, virtio_bar_mask, virtio_regions};
+use crate::blkd::{BAR_STRIDE, BarCache, VirtioRegions, bar_pages, carve_bars, is_legacy_virtio, is_modern_virtio, keep_bits, map_bar_mask, mappable, virtio_bar_mask, virtio_regions};
 use crate::component::{self, Component, SpawnArgs, abs_of};
 use crate::devmem::DevMem;
 use crate::iommu::Iommu;
@@ -52,7 +52,7 @@ const NETD_ID: u32 = 0x200;
 pub fn is_virtio_net(d: &pci::Device) -> bool {
     d.vendor == 0x1af4
         && (d.device == 0x1041 || d.device == 0x1000)
-        && (d.virtio_caps.iter().any(|c| c.cfg_type == 1) || is_legacy(d))
+        && (is_modern_virtio(d) || is_legacy(d))
         && d.msix.is_some()
 }
 
@@ -106,9 +106,15 @@ pub fn is_mlx5(d: &pci::Device) -> bool {
             && m.table_offset as u64 + m.table_size as u64 * 16 <= aperture)
 }
 
-/// NICs netd can drive as an uplink.
+/// NICs netd can drive as an uplink: also, the BARs `spawn` maps can be.
 pub fn is_uplink(d: &pci::Device) -> bool {
-    is_virtio_net(d) || is_gvnic(d) || is_ena(d) || is_ixgbe(d) || is_mlx5(d)
+    (is_virtio_net(d) || is_gvnic(d) || is_ena(d) || is_ixgbe(d) || is_mlx5(d)) && mappable(&mapped_device(d), used_bars(d))
+}
+
+/// Carve the BARs `spawn` maps of uplink `d` into `cache`: whether it can
+/// be driven (blkd::carve_bars).
+pub fn carve(alloc: &mut Alloc, devmem: &mut DevMem, d: &pci::Device, cache: &mut BarCache) -> bool {
+    carve_bars(alloc, devmem, &mapped_device(d), cache, used_bars(d))
 }
 
 pub struct Nic {
@@ -210,12 +216,13 @@ fn used_bars(d: &pci::Device) -> u8 {
     }
 }
 
-/// Start netd with the uplink NICs `nics`.
+/// Start netd with the uplink NICs `nics`, whose BARs `carve` carved
+/// into `bars`.
 pub fn spawn(
     nics: &[pci::Device],
+    bars: &[BarCache],
     pci: &Pci,
     iommu: &mut Iommu,
-    devmem: &mut DevMem,
     alloc: &mut Alloc,
     win: &mut Window,
     asids: &mut AsidPools,
@@ -326,18 +333,21 @@ pub fn spawn(
     };
     let mut nic_list = ArrayVec::new();
     for (n, d) in nics.into_iter().take(nr_nics).enumerate() {
-        let mut bars = [const { None }; 6];
         // ENA's LLQ is written in 128-byte bursts.
         let wc = (ena_llq(&d) as u8) << 2;
-        map_bar_mask(&comp, alloc, &mut arena, devmem, &mapped_device(&d), &mut bars, used_bars(&d), wc, |b| net::nic_bar_va(n, b as usize), &mut keep_slot);
+        map_bar_mask(&comp, alloc, &mut arena, &bars[n], used_bars(&d), wc, |b| net::nic_bar_va(n, b as usize), &mut keep_slot);
         for (i, s) in dma[n].clone().enumerate() {
             let f = sel4::init_thread::Slot::<cap_type::Granule>::from_index(s).cap();
             comp.map_copy(alloc, &mut arena, &abs_of(f), net::nic_dma_va(n) + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep_slot());
         }
         if is_legacy(&d) {
+            // In the 16-bit port space (is_legacy_virtio); the kernel
+            // refuses ports already given out, which the device can name.
             let (base, len) = (d.bars[0].addr as u16, d.bars[0].size as u16);
-            let io = pci::io_ports(alloc, base, len).expect("NIC I/O ports");
-            comp.give(net::NETD_SLOT_IOPORT_BASE + n as u64, io, CapRights::all());
+            match pci::io_ports(alloc, base, len) {
+                Some(io) => comp.give(net::NETD_SLOT_IOPORT_BASE + n as u64, io, CapRights::all()),
+                None => log!("l4h-root: NIC {:02x}:{:02x}.{}: no I/O ports at {:#x}", d.bus, d.dev, d.func, base),
+            }
         }
         // Interrupt.
         let irq_slot = alloc.slots.alloc();
@@ -390,6 +400,11 @@ impl Netd {
     /// Whether a command can be posted now.
     pub fn room(&self) -> bool {
         self.mailbox.room()
+    }
+
+    /// Whether netd has failed (`fail`): NicAdd refuses then.
+    pub fn failed(&self) -> bool {
+        self.failed
     }
 
     /// Whether netd has published its NICs' MACs, or never will.
@@ -454,8 +469,8 @@ impl Netd {
         }
     }
 
-    /// Connect a guest device of `g` to `switch` as port `p` (free_port),
-    /// using `memory` (port_memory).  Returns for the guest's l4h-vmm the
+    /// Connect a guest device of `g` to `switch` as port `p` (free_port,
+    /// then give_port_done), using `memory` (port_memory).  Returns for the guest's l4h-vmm the
     /// CNode of the port's frames (radix PORT_KEEP_BITS) and a kick
     /// capability, in a slot of its own.
     #[allow(clippy::too_many_arguments)]
@@ -491,7 +506,6 @@ impl Netd {
                 comp.map_copy(alloc, arena, &f, net::port_va(p) + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, dst)
             });
         }
-        self.comp.give_edge(&wiring::NETD_VMM_DONE, p, 0, &g.vmm_ntfn);
         let kick_slot = alloc.slots.alloc();
         let kick = sel4::init_thread::Slot::<cap_type::Notification>::from_index(kick_slot).cap();
         component::mint_edge(&abs_of(kick), &wiring::VMM_NETD_KICK, p, &self.comp.obj()).expect("port kick");
@@ -568,7 +582,7 @@ impl Netd {
 
     /// netd no longer uses port `p`'s memory.
     fn released(h: &mut Host, p: usize, zombie: Option<usize>) {
-        let _ = h.netd.comp.slot(net::NETD_SLOT_CLIENT_BASE + p as u64).delete();
+        h.netd.take_port_done(p);
         h.netd.held &= !(1 << p);
         crate::vmmgr::zombie_done(h, zombie, true);
     }
@@ -579,13 +593,43 @@ impl Netd {
         if id != NETD_ID {
             return false;
         }
-        if !h.netd.failed {
-            log!("l4h-root: netd failed: guest networking stops until reboot");
-            h.netd.failed = true;
-            let _ = h.netd.comp.tcb.tcb_suspend();
-        }
+        h.netd.fail(&h.pci);
         Self::poll(h);
         true
+    }
+
+    /// Stop using netd until reboot (it faulted, or misbehaved): suspend
+    /// it, and cut the uplink NICs off from memory, as blkd's and usbd's
+    /// quarantines disable their controllers: a suspended driver must not
+    /// leave devices it programmed still bus-mastering.  `poll` then lets
+    /// go of what it has not answered.
+    pub fn fail(&mut self, pci: &Pci) {
+        if self.failed {
+            return;
+        }
+        log!("l4h-root: netd failed: guest networking stops until reboot");
+        self.failed = true;
+        let _ = self.comp.tcb.tcb_suspend();
+        for nic in self.nics.iter() {
+            pci.disable(&nic.pci);
+        }
+    }
+
+    /// Give netd port `p`'s done notification, to guest `g`'s VMM, before
+    /// anything is allocated for the port (`add_port`).  EIO, netd failed,
+    /// if netd keeps filling the slot.
+    pub fn give_port_done(&mut self, p: usize, g: &RootGuest, pci: &Pci) -> Result<(), Errno> {
+        if self.comp.give_edge_live(&wiring::NETD_VMM_DONE, p, 0, &g.vmm_ntfn).is_err() {
+            self.fail(pci);
+            return Err(ctl::EIO);
+        }
+        Ok(())
+    }
+
+    /// Take back port `p`'s done notification (`give_port_done`): netd is
+    /// done with the port, or it is not added after all.
+    pub fn take_port_done(&self, p: usize) {
+        let _ = self.comp.slot(net::NETD_SLOT_CLIENT_BASE + p as u64).delete();
     }
 
     /// Put the link channel `ch` of partition `me` on `switch`, as netd's
@@ -600,6 +644,7 @@ impl Netd {
         ntfn: cap::Notification,
         alloc: &mut Alloc,
         devmem: &mut DevMem,
+        pci: &Pci,
     ) -> Result<usize, Errno> {
         let l = self.links.len();
         if l >= net::MAX_LINKS || switch >= self.switches {
@@ -628,12 +673,21 @@ impl Netd {
         let badged = alloc.slots.alloc();
         let badged = sel4::init_thread::Slot::<cap_type::Notification>::from_index(badged).cap();
         component::mint_edge(&abs_of(badged), &wiring::DOORBELL_NETD, l, &self.comp.obj()).expect("link doorbell badge");
-        match crate::channel::doorbell(alloc, ch.vector, badged) {
-            Some(irq) => self.comp.give(net::NETD_SLOT_LINK_IRQ_BASE + l as u64, irq, CapRights::all()),
-            None => log!("l4h-root: no doorbell from partition {} for the link", ch.peer),
+        let mut given = match crate::channel::doorbell(alloc, ch.vector, badged) {
+            Some(irq) => self.comp.give_live(net::NETD_SLOT_LINK_IRQ_BASE + l as u64, irq, CapRights::all(), "link doorbell"),
+            None => {
+                log!("l4h-root: no doorbell from partition {} for the link", ch.peer);
+                Ok(())
+            }
+        };
+        given = given.and_then(|()| self.comp.give_edge_live(&wiring::NETD_LINK_SELF, l, l, &self.comp.obj()));
+        given = given.and_then(|()| self.comp.give_edge_live(&wiring::NETD_LINK_RING, l, l, &component::root_ntfn(ntfn)));
+        // A netd that keeps filling these slots misbehaves: what was set up
+        // for the link stays with it, stopped until reboot.
+        if given.is_err() {
+            self.fail(pci);
+            return Err(ctl::EIO);
         }
-        self.comp.give_edge(&wiring::NETD_LINK_SELF, l, l, &self.comp.obj());
-        self.comp.give_edge(&wiring::NETD_LINK_RING, l, l, &component::root_ntfn(ntfn));
         self.post(Request::AddLink { link: l, switch: switch as usize, size: ch.size as u64, me: me as u32, peer: ch.peer as u32 })?;
         self.links.must_push(Link { peer: ch.peer, peer_slot: ch.peer_slot, peer_vector: ch.peer_vector });
         Ok(l)

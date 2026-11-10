@@ -9,6 +9,7 @@
 # L4H_TEST_KERNEL may name an already-built compatible guest kernel.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
+source "$root/tools/host-profile.sh"
 export PATH="/usr/sbin:$PATH"
 out=$root/build/lvmblk
 mkdir -p "$out"
@@ -70,7 +71,7 @@ fi
     "$l4hctl" "$out/lvmvm.cpio.gz" "$out/extents" >/dev/null
 export L4H_GUEST_KERNEL="$out/vmlinux" L4H_DOM0_INITRD="$out/dom0.cpio.gz"
 env L4H_DOM0_DISKS=0 L4H_DOM0_MEM_MB=256 L4H_WATCHDOG_SECS=0 "$root/tools/build-host.sh" > "$out/host-build.log" 2>&1
-"$root/tools/run-qemu.sh" "$root/host/target/x86_64-sel4-roottask/debug/l4h-root.elf" \
+"$root/tools/run-qemu.sh" "$root/host/target/x86_64-sel4-roottask/$l4h_profile/l4h-root.elf" \
     -drive "file=$out/disk.raw,if=none,id=d0,format=raw" -device virtio-blk-pci,drive=d0,disable-legacy=on \
     > "$out/qemu.log" 2>&1 &
 qemu=$!

@@ -6,11 +6,17 @@
 //! page the two share, signals the driver's notification with badges::driver::CALL
 //! and goes back to its loop.  The driver answers them in order, counts
 //! them in `done` and signals SLOT_MAILBOX_DONE; root finishes what it was
-//! doing then (l4h-root's mailbox.rs).  A request a driver never answers
-//! stays pending, and so does whatever waits for it, nothing else.  A
-//! driver has no keeper: its faults go to root (badges::root::FAULT),
-//! which quarantines it and gives up on what it has not answered, as
-//! wire::FAILED.  Nothing a driver writes says that it failed.
+//! doing then (l4h-root's mailbox.rs), matching each answer to its request
+//! by the request's number.  A request a driver never answers stays
+//! pending, and so does whatever waits for it, nothing else.  A driver has
+//! no keeper: its faults go to root (badges::root::FAULT), which
+//! quarantines it and gives up on what it has not answered, as
+//! wire::FAILED.  An answer can also say that a request failed (an errno,
+//! or wire::FAILED from l4h_rt::mailbox::serve), and for some requests root
+//! then quarantines the controller as it would for a fault.  That gives a
+//! driver nothing it lacks: it could fault, or never answer, instead.  A
+//! quarantine suspends the driver and turns its device off, and keeps what
+//! either may still reach out of use.
 //!
 //! The second page is the driver's to publish what root reads without
 //! asking: blkd's disks (blk::Published), netd's counters (net::Published),

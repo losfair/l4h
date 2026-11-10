@@ -8,6 +8,7 @@
 # copy.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
+source "$root/tools/host-profile.sh"
 img=$root/build/debian.img
 [ -f "$img" ] || { echo "no $img: run tests/mkdebian.sh" >&2; exit 1; }
 "$root/tools/build-linux.sh" vmlinux >"$root/build/linux-build.log" 2>&1 \
@@ -18,7 +19,7 @@ L4H_DOM0_MEM_MB=${L4H_DOM0_MEM_MB:-1024} L4H_DOM0_VCPUS=${1:-2} \
     L4H_DOM0_CMDLINE="console=hvc0 root=/dev/vda rw${DEBIAN_ROLE:+ l4h.role=$DEBIAN_ROLE}" "$root/tools/build-host.sh"
 log=$root/build/qemu-debian.log
 [ "${DEBIAN_KEEP:-0}" = 1 ] || cp --sparse=always "$img" "$root/build/debian-run.img"
-"$root/tools/run-qemu.sh" "$root/host/target/x86_64-sel4-roottask/debug/l4h-root.elf" \
+"$root/tools/run-qemu.sh" "$root/host/target/x86_64-sel4-roottask/$l4h_profile/l4h-root.elf" \
     -drive file="$root/build/debian-run.img",if=none,id=d0,format=raw,cache=none \
     -device virtio-blk-pci,drive=d0,disable-legacy=on \
     -netdev user,id=n0 -device virtio-net-pci,netdev=n0,disable-legacy=on \

@@ -30,7 +30,7 @@ fi
 L4H_DOM0_MEM_MB=${L4H_DOM0_MEM_MB:-256} \
     L4H_DOM0_VCPUS=${L4H_DOM0_VCPUS:-1} L4H_WATCHDOG_SECS=${L4H_WATCHDOG_SECS:-0} L4H_DOM0_CMDLINE="$cmdline" \
     "$l4h_host_build"
-"$l4h_qemu" "$root/host/target/$l4h_target/debug/l4h-root.elf" \
+"$l4h_qemu" "$root/host/target/$l4h_target/$l4h_profile/l4h-root.elf" \
     ${L4H_QEMU_ARGS:-} </dev/null >"$log" 2>&1 &
 qemu=$!
 # The machine never powers off by itself: stop it once every guest has

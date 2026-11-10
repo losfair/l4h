@@ -1,9 +1,9 @@
 //! The attestation service, l4h-trustd (DESIGN.md §10.2): finding the TPM,
-//! starting trustd with it, making guests' attestation devices (vmmgr adds
-//! them to guests), the registry page through which trustd learns about
-//! guests, and what trustd asks root for: raising a device's event when it
-//! has answered (vmmgr raises it), and the hardware accesses of its AML
-//! interpreter.
+//! starting trustd with it and its flags server, making guests'
+//! attestation devices (vmmgr adds them to guests), the registry page
+//! through which trustd learns about guests, and what trustd asks root
+//! for: raising a device's event when it has answered (vmmgr raises it),
+//! and the hardware accesses of its AML interpreter.
 //!
 //! Only x86 finds a TPM (in ACPI) so far; other hosts run flags only.  In
 //! a multikernel secondary, which has no TPM, trustd has the primary's
@@ -12,7 +12,10 @@
 #![cfg_attr(not(target_arch = "x86_64"), allow(dead_code, unused_imports))]
 
 
-use sel4::{CNodeCapData, CapRights, ObjectBlueprint, VmAttributes, cap, cap_type};
+use core::cell::Cell;
+use core::sync::atomic::{Ordering, fence};
+
+use sel4::{CapRights, ObjectBlueprint, VmAttributes, cap, cap_type};
 
 use l4h_abi as abi;
 use l4h_host as host;
@@ -20,7 +23,7 @@ use l4h_host::fixed::ArrayVec;
 use l4h_host::wiring;
 use l4h_host::trust::{self, GuestRecord, TrustdConfig};
 
-use crate::component::{self, Component, Obj, SpawnArgs, abs_of, o, p, root_cap};
+use crate::component::{self, Component, Obj, SpawnArgs, abs_of, o, p};
 use crate::devmem::DevMem;
 use crate::mem::{Alloc, Arena, ObjCtx};
 use crate::vspace::{FRAME_BP, map_frame};
@@ -35,29 +38,107 @@ const PAGE: usize = 4096;
 pub use l4h_host::root::{FLAGS_ID, TRUSTD_ID};
 /// The registry page in the root task.
 const REGISTRY_VA: usize = crate::layout::TRUSTD_REGISTRY.base;
-/// Mapping capabilities trustd's ranges and AML pages can need.
+/// Mapping capabilities trustd's ranges and AML pages, and the flags
+/// server's pages, can need.
 const KEEP_BITS: usize = 12;
 
 pub struct Trustd {
     comp: Component,
+    /// The flags server (host::KIND_FLAGS), passive once started.
+    flags_server: Component,
     #[allow(dead_code)]
     arena: Arena,
     registry: *mut GuestRecord,
-    flags_ep: cap::Endpoint,
     no_reports: bool,
     failed: bool,
     /// Multikernel: the kick, badged trust::RELAY_BADGE, to tell trustd about a
     /// message in its relay inbox.
     relay: Option<cap::Notification>,
-    /// The request page of each guest id, mapped in trustd.
-    pages: [cap::Granule; trust::MAX_RECORDS],
+    /// The two request pages of each guest id, mapped in trustd
+    /// (trust::page_of), and which of them the id's guest has (the second:
+    /// true).
+    pages: [[cap::Granule; 2]; trust::MAX_RECORDS],
+    second: [Cell<bool>; trust::MAX_RECORDS],
+    /// trustd's status page (trust::Status), which root reads through its
+    /// window.
+    status: cap::Granule,
     /// Guests signal it, badged with badges::trustd_kick::GUEST bit id.
     kick: cap::Notification,
-    /// The flags table, which root and vmmgr map read-only.
+    /// The flags table: the flags server maps it writable, trustd, root and
+    /// vmmgr read-only.
     flags: [cap::Granule; trust::FLAGS_SIZE / PAGE],
-    /// Device memory carved for trustd's ranges and its AML's accesses.
+    /// What the ACPI start method's AML may reach (`hw`); None for every
+    /// other TPM interface, whose trustd gets no hardware access.
     #[cfg(target_arch = "x86_64")]
+    hw: Option<Hw>,
+}
+
+/// What `hw` serves trustd's AML from, and refuses it.
+#[cfg(target_arch = "x86_64")]
+struct Hw {
+    /// The device pages it touched, a table of its own (acpi::Frames::hw).
     frames: crate::acpi::Frames,
+    /// The ECAM windows of segment 0 (MCFG): (base, first bus, last bus).
+    ecam: ArrayVec<(usize, u8, u8), 4>,
+    /// I/O ports that reset the machine, put it to sleep or enter SMM:
+    /// (first, count).
+    ports: ArrayVec<(usize, usize), 16>,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Hw {
+    /// From the firmware's tables, read with `phys`.
+    fn find(bootinfo: &sel4::BootInfoPtr, phys: &mut crate::acpi::Phys) -> Hw {
+        let mut hw = Hw { frames: crate::acpi::Frames::hw(), ecam: ArrayVec::new(), ports: ArrayVec::new() };
+        // The keyboard controller's and port A's reset, APM's SMI command
+        // and data, the reset control register.
+        for r in [(0x60, 1), (0x64, 1), (0x92, 1), (0xb2, 2), (0xcf9, 1)] {
+            let _ = hw.ports.push(r);
+        }
+        let mut buf = [0; crate::acpi::FADT_LEN];
+        if let Some(f) = crate::acpi::find(bootinfo, phys, b"FACP", &mut buf) {
+            let u8_at = |i: usize| f.get(i).map_or(0, |&b| b as usize);
+            let u32_at = |i: usize| f.get(i..i + 4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()) as usize);
+            // SMI_CMD, PM1a/b_CNT_BLK (sleep), PM2_CNT_BLK.
+            for (at, len) in [(48, 1), (64, u8_at(89)), (68, u8_at(89)), (72, u8_at(90))] {
+                let port = u32_at(at);
+                if port != 0 && port < 0x1_0000 {
+                    let _ = hw.ports.push((port, len.max(1)));
+                }
+            }
+            // X_PM1a/b_CNT_BLK and X_PM2_CNT_BLK in I/O space (space 1).
+            for at in [172, 184, 196] {
+                let addr = f.get(at + 4..at + 12).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
+                if u8_at(at) == 1 && addr != 0 && addr < 0x1_0000 {
+                    let _ = hw.ports.push((addr as usize, (u8_at(at + 1) / 8).max(1)));
+                }
+            }
+        }
+        let mut buf = [0; 44 + 16 * 4];
+        if let Some(t) = crate::acpi::find(bootinfo, phys, b"MCFG", &mut buf) {
+            for e in t.get(44..).unwrap_or(&[]).chunks_exact(16) {
+                let base = u64::from_le_bytes(e[..8].try_into().unwrap()) as usize;
+                if u16::from_le_bytes([e[8], e[9]]) == 0 && e[10] <= e[11] {
+                    let _ = hw.ecam.push((base, e[10], e[11]));
+                }
+            }
+        }
+        hw
+    }
+
+    /// Whether ports [port, port + width) are any of `ports`.
+    fn refused_port(&self, port: usize, width: usize) -> bool {
+        self.ports.iter().any(|&(p, n)| port < p + n && p < port + width)
+    }
+
+    /// The PCI function whose ECAM page `paddr` is in, if it is one.
+    fn ecam_function(&self, paddr: usize) -> Option<(u8, u8, u8)> {
+        self.ecam.iter().find_map(|&(base, lo, hi)| {
+            let off = paddr.checked_sub(base)?;
+            let bus = off >> 20;
+            (bus >= lo as usize && bus <= hi as usize).then_some((bus as u8, (off >> 15 & 0x1f) as u8, (off >> 12 & 7) as u8))
+        })
+    }
 }
 
 /// Where the TPM is: its interface and the ranges trustd maps, with the
@@ -78,8 +159,9 @@ struct Layout {
 impl Layout {
     /// A new range covering [paddr, paddr + len): (range, offset).
     fn range(&mut self, paddr: usize, len: usize) -> Option<(usize, usize)> {
+        // The firmware's or the TPM's: the end must not wrap.
         let base = paddr & !(PAGE - 1);
-        let size = (paddr + len).next_multiple_of(PAGE) - base;
+        let size = paddr.checked_add(len)?.checked_next_multiple_of(PAGE)? - base;
         if size > trust::RANGE_STRIDE {
             return None;
         }
@@ -213,18 +295,18 @@ pub fn spawn(
             .is_some_and(|d| d.channels().iter().any(|c| c.peer == 0 && c.kind & l4h_partition::CHANNEL_CONTROL != 0));
         if crate::partition::secondary() {
             let iface = if to_primary { trust::TPM_REMOTE } else { trust::TPM_NONE };
-            return without_tpm(alloc, win, asids, info, frames, iface);
+            return without_tpm(alloc, win, asids, info, iface);
         }
         let mut frames = frames;
         let mut phys = crate::acpi::Phys::new(alloc, devmem, win, &mut frames);
         let Some(l) = find_tpm(bootinfo, &mut phys) else {
-            return flags_only(alloc, win, asids, info, frames);
+            return flags_only(alloc, win, asids, info);
         };
         // The pages of each range, which stay in `frames`.
         for &(base, size) in &l.ranges {
             if (0..size / PAGE).any(|p| phys.frame(base + p * PAGE).is_none()) {
                 log!("l4h-root: TPM at {:#x} is not device memory, no attestation", base);
-                return flags_only(alloc, win, asids, info, frames);
+                return flags_only(alloc, win, asids, info);
             }
         }
         // The AML's size.  Its pages are carved now, so that copying it
@@ -232,18 +314,20 @@ pub fn spawn(
         let aml_size = match l.start {
             trust::START_ACPI => {
                 let touch = |phys: &mut crate::acpi::Phys, pa: usize, len: usize| {
-                    (pa & !(PAGE - 1)..pa + len).step_by(PAGE).try_for_each(|p| phys.frame(p).map(drop))
+                    (pa & !(PAGE - 1)..pa.checked_add(len)?).step_by(PAGE).try_for_each(|p| phys.frame(p).map(drop))
                 };
                 match crate::acpi::aml_tables(bootinfo, &mut phys, touch) {
                     Some(n) => n,
                     None => {
                         log!("l4h-root: cannot read the ACPI tables for the TPM, no attestation");
-                        return flags_only(alloc, win, asids, info, frames);
+                        return flags_only(alloc, win, asids, info);
                     }
                 }
             }
             _ => 0,
         };
+        // Only the ACPI start method runs AML, which needs root's hardware.
+        let hw = (l.start == trust::START_ACPI).then(|| Hw::find(bootinfo, &mut phys));
         info!(
             "l4h-root: TPM 2.0 ({}) at {:#x}",
             match (l.iface, l.start) {
@@ -255,7 +339,7 @@ pub fn spawn(
             l.ranges[0].0
         );
         let cfg = l.config(aml_size);
-        let (comp, arena, keep) = create(&cfg, alloc, win, asids, info, aml_size)?;
+        let (comp, flags_server, arena, keep) = create(&cfg, alloc, win, asids, info, aml_size)?;
         let mut keep_next = 0;
         let mut keep_slot = || {
             keep_next += 1;
@@ -284,7 +368,7 @@ pub fn spawn(
                         frame = Some(f);
                     }
                     let n = (len - done).min(PAGE - at % PAGE).min(buf.len());
-                    phys.read_into(pa + done, &mut buf[..n])?;
+                    phys.read_into(pa.checked_add(done)?, &mut buf[..n])?;
                     let off = at % PAGE;
                     phys.win.with_frame(&abs_of(frame?), |dst| unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), dst.add(off), n) });
                     (done, at) = (done + n, at + n);
@@ -295,10 +379,10 @@ pub fn spawn(
             if crate::acpi::aml_tables(bootinfo, &mut phys, copy) != Some(aml_size) {
                 log!("l4h-root: cannot copy the ACPI tables for the TPM, no attestation");
                 alloc.reclaim(arena);
-                return flags_only(alloc, win, asids, info, frames);
+                return flags_only(alloc, win, asids, info);
             }
         }
-        finish(comp, arena, alloc, &mut keep_slot, info, false, frames)
+        finish(comp, flags_server, arena, alloc, &mut keep_slot, false, hw)
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -308,32 +392,25 @@ pub fn spawn(
 }
 
 /// The same flags service on machines with no usable TPM.
-fn flags_only(
-    alloc: &mut Alloc, win: &mut Window, asids: &mut AsidPools, info: &HostInfo,
-    #[cfg(target_arch = "x86_64")] frames: crate::acpi::Frames,
-) -> Option<Trustd> {
-    without_tpm(alloc, win, asids, info, #[cfg(target_arch = "x86_64")] frames, trust::TPM_NONE)
+fn flags_only(alloc: &mut Alloc, win: &mut Window, asids: &mut AsidPools, info: &HostInfo) -> Option<Trustd> {
+    without_tpm(alloc, win, asids, info, trust::TPM_NONE)
 }
 
 /// trustd with no TPM of its own: flags only, or (TPM_REMOTE) the
 /// primary's TPM through the relay.
-fn without_tpm(
-    alloc: &mut Alloc, win: &mut Window, asids: &mut AsidPools, info: &HostInfo,
-    #[cfg(target_arch = "x86_64")] frames: crate::acpi::Frames,
-    iface: u32,
-) -> Option<Trustd> {
+fn without_tpm(alloc: &mut Alloc, win: &mut Window, asids: &mut AsidPools, info: &HostInfo, iface: u32) -> Option<Trustd> {
     let cfg = TrustdConfig { iface, ..Layout::default().config(0) };
-    let (comp, arena, keep) = create(&cfg, alloc, win, asids, info, 0)?;
+    let (comp, flags_server, arena, keep) = create(&cfg, alloc, win, asids, info, 0)?;
     let mut next = 0;
-    finish(comp, arena, alloc, &mut || {
+    finish(comp, flags_server, arena, alloc, &mut || {
         let slot = keep.absolute_cptr_from_bits_with_depth(next, KEEP_BITS);
         next += 1;
         slot
-    }, info, iface == trust::TPM_NONE, #[cfg(target_arch = "x86_64")] frames)
+    }, iface == trust::TPM_NONE, #[cfg(target_arch = "x86_64")] None)
 }
 
-/// Create trustd with configuration `cfg`, and the CNode that keeps its
-/// mapping capabilities.
+/// Create trustd with configuration `cfg`, its flags server, and the CNode
+/// that keeps their mapping capabilities.
 fn create(
     cfg: &TrustdConfig,
     alloc: &mut Alloc,
@@ -341,8 +418,10 @@ fn create(
     asids: &mut AsidPools,
     info: &HostInfo,
     aml_size: usize,
-) -> Option<(Component, Arena, cap::CNode)> {
-    let mut arena = alloc.arena((8 << 20) + 2 * aml_size).expect("memory for trustd and flags service");
+) -> Option<(Component, Component, Arena, cap::CNode)> {
+    // trustd and the flags server are an image each (with the AML
+    // interpreter's heap), and trustd has the AML's copy.
+    let mut arena = alloc.arena((12 << 20) + 2 * aml_size).expect("memory for trustd and flags service");
     let cfg_bytes = unsafe {
         core::slice::from_raw_parts(cfg as *const TrustdConfig as *const u8, core::mem::size_of::<TrustdConfig>())
     };
@@ -365,21 +444,44 @@ fn create(
         &args, alloc, &mut arena, win, &mut |alloc, vspace| asids.assign(alloc, vspace),
         &info.spawn_context(info.cores - 1),
     );
+    // The flags server: the same image, with spaces of its own, so that
+    // nothing trustd's main thread does (it parses guests' pages and runs
+    // the firmware's AML) reaches the flags but its calls.  It runs at
+    // root's priority, the maximum; its own scheduling context, and its
+    // keeper's, take at most a quarter of a core.
+    let args = SpawnArgs {
+        id: FLAGS_ID,
+        kind: host::KIND_FLAGS,
+        elf: TRUSTD_ELF,
+        prio: 255,
+        budget_us: info.timeslice_us,
+        period_us: 4 * info.timeslice_us,
+        config: &[],
+        ntfn: None,
+        service_ep: None,
+        cnode: None,
+        cnode_bits: None,
+    };
+    let flags_server = component::create(
+        &args, alloc, &mut arena, win, &mut |alloc, vspace| asids.assign(alloc, vspace),
+        &info.spawn_context(info.cores - 1),
+    );
     let keep = arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: KEEP_BITS });
-    Some((comp, arena, keep))
+    Some((comp, flags_server, arena, keep))
 }
 
-/// Map the registry and request pages, give trustd its kick notification,
-/// and start it.
+/// Map the registry, request, status and flags pages, give trustd its
+/// kick notification and its capability to the flags server, start the
+/// flags server, then trustd.
 fn finish(
     comp: Component,
+    flags_server: Component,
     mut arena: Arena,
     alloc: &mut Alloc,
     keep: &mut impl FnMut() -> sel4::AbsoluteCPtr,
-    info: &HostInfo,
     no_reports: bool,
     #[cfg(target_arch = "x86_64")]
-    frames: crate::acpi::Frames,
+    hw: Option<Hw>,
 ) -> Option<Trustd> {
     let registry = alloc.object_cap::<cap_type::Granule>(FRAME_BP);
     alloc.global(|alloc| {
@@ -390,12 +492,18 @@ fn finish(
         let f = sel4::init_thread::Slot::<cap_type::Granule>::from_index(copy).cap();
         map_frame(&mut ObjCtx::global(alloc), sel4::init_thread::slot::VSPACE.cap(), f, REGISTRY_VA, CapRights::read_write(), VmAttributes::DEFAULT);
     });
-    comp.map_copy(alloc, &mut arena, &abs_of(registry), trust::REGISTRY_VA, CapRights::read_only(), VmAttributes::DEFAULT, keep());
+    for c in [&comp, &flags_server] {
+        c.map_copy(alloc, &mut arena, &abs_of(registry), trust::REGISTRY_VA, CapRights::read_only(), VmAttributes::DEFAULT, keep());
+    }
     let pages = core::array::from_fn(|g| {
-        let f = arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP);
-        comp.map_copy(alloc, &mut arena, &abs_of(f), trust::page_va(g), CapRights::read_write(), VmAttributes::DEFAULT, keep());
-        f
+        [false, true].map(|b| {
+            let f = arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP);
+            comp.map_copy(alloc, &mut arena, &abs_of(f), trust::page_va(trust::page_of(g, b)), CapRights::read_write(), VmAttributes::DEFAULT, keep());
+            f
+        })
     });
+    let status = arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP);
+    comp.map_copy(alloc, &mut arena, &abs_of(status), trust::STATUS_VA, CapRights::read_write(), VmAttributes::DEFAULT, keep());
     let kick = arena.object_cap::<cap_type::Notification>(alloc, ObjectBlueprint::Notification);
     comp.give(trust::SLOT_KICK, kick, CapRights::all());
     // The relay pages, shared with root, when there are other partitions.
@@ -411,34 +519,38 @@ fn finish(
         component::mint_edge(&abs_of(badged), &wiring::ROOT_TRUSTD_RELAY, 0, &Obj::claim(p::Trustd, o::Kick, abs_of(kick))).expect("relay kick");
         badged
     });
+    // The flags: writable only in the flags server.
     let flags = core::array::from_fn(|p| {
         let f = arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP);
+        flags_server.map_copy(alloc, &mut arena, &abs_of(f), trust::FLAGS_VA + p * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep());
         comp.map_copy(alloc, &mut arena, &abs_of(f), trust::FLAGS_VA + p * PAGE, CapRights::read_only(), VmAttributes::DEFAULT, keep());
-        comp.map_copy(alloc, &mut arena, &abs_of(f), trust::FLAGS_WRITE_VA + p * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep());
         map_frame(&mut ObjCtx::global(alloc), sel4::init_thread::slot::VSPACE.cap(), f,
             crate::layout::TRUSTD_FLAGS.base + p * PAGE, CapRights::read_only(), VmAttributes::DEFAULT);
         f
     });
-    let ep = arena.object_cap::<cap_type::Endpoint>(alloc, ObjectBlueprint::Endpoint);
-    comp.give(trust::SLOT_FLAGS_EP, ep, CapRights::all());
-    // The flags thread's endpoint.
-    let flags_obj = Obj::claim(p::Trustd, o::Flags, abs_of(ep));
+    let flags_obj = flags_server.obj::<p::Flags, o::Endpoint>();
     comp.give_edge(&wiring::TRUSTD_FLAGS, 0, 0, &flags_obj);
     let slot = alloc.slots.alloc();
     let flags_ep = sel4::init_thread::Slot::<cap_type::Endpoint>::from_index(slot).cap();
     component::mint_edge(&abs_of(flags_ep), &wiring::ROOT_FLAGS, 0, &flags_obj).expect("root flags endpoint");
-    let bootstrap = flags_thread(&comp, alloc, &mut arena, info);
-    component::start(&comp);
-    // reply_recv puts the worker back on the endpoint before returning
-    // this reply. Unbind only now: subsequent calls donate their SC.
+    component::start(&flags_server);
+    // reply_recv puts the server back on its endpoint before returning
+    // this reply.  Unbind only now: later calls donate their SC.  A server
+    // that failed meanwhile answers FAILED (its keeper), and so do every
+    // later call: their actions are refused.
     {
         use l4h_host::trust::call::Client;
-        let _ = l4h_ipc::Endpoint::chosen(&wiring::ROOT_FLAGS, wiring::p::Root, flags_ep).ready();
+        if l4h_ipc::Endpoint::chosen(&wiring::ROOT_FLAGS, wiring::p::Root, flags_ep).ready().is_err() {
+            log!("l4h-root: the flags server failed: no guest action can be recorded");
+        }
     }
-    bootstrap.unbind().expect("passive flags server");
-    Some(Trustd { comp, arena, registry: REGISTRY_VA as *mut GuestRecord,
-        flags_ep, no_reports, failed: false, relay, pages, kick, flags,
-        #[cfg(target_arch = "x86_64")] frames })
+    flags_server.sc.unbind().expect("passive flags server");
+    let _ = abs_of(flags_ep).delete();
+    alloc.slots.free(slot);
+    component::start(&comp);
+    Some(Trustd { comp, flags_server, arena, registry: REGISTRY_VA as *mut GuestRecord,
+        no_reports, failed: false, relay, pages, second: core::array::from_fn(|_| Cell::new(false)), status, kick, flags,
+        #[cfg(target_arch = "x86_64")] hw })
 }
 
 impl Trustd {
@@ -448,10 +560,10 @@ impl Trustd {
     }
 
     /// Give vmmgr the flags: read-only at FLAGS_VA, and the capability to
-    /// act on them for the console (root's own passed on, badged as
-    /// Sender::Root: wiring::VMMGR_FLAGS).
+    /// act on them for the console (its own, badged Sender::Vmmgr:
+    /// wiring::VMMGR_FLAGS).
     pub fn give_vmmgr(&self, vmmgr: &Component, alloc: &mut Alloc, arena: &mut Arena, keep: &mut impl FnMut() -> sel4::AbsoluteCPtr) {
-        vmmgr.pass_edge(&wiring::VMMGR_FLAGS, 0, self.flags_ep);
+        vmmgr.give_edge(&wiring::VMMGR_FLAGS, 0, 0, &self.flags_server.obj::<p::Flags, o::Endpoint>());
         for (p, &f) in self.flags.iter().enumerate() {
             vmmgr.map_copy(alloc, arena, &abs_of(f), l4h_host::vmmgr::FLAGS_VA + p * PAGE, CapRights::read_only(), VmAttributes::DEFAULT, keep());
         }
@@ -462,7 +574,18 @@ impl Trustd {
     /// `kick`.  False if trustd has failed.
     pub fn give(&self, id: usize, win: &mut Window, page: &sel4::AbsoluteCPtr, kick: &sel4::AbsoluteCPtr) -> bool {
         if self.failed { return false; }
-        let p = self.pages[id];
+        // The id's last guest is unregistered.  If trustd may still be
+        // writing an answer for it into its page, this guest gets the
+        // other one (trust::Status).
+        fence(Ordering::SeqCst);
+        let answering = win.with_frame(&abs_of(self.status), |p| unsafe {
+            (*(p as *const trust::Status)).answering.load(Ordering::SeqCst)
+        });
+        let second = &self.second[id];
+        if answering == trust::page_of(id, second.get()) as u64 + 1 {
+            second.set(!second.get());
+        }
+        let p = self.pages[id][second.get() as usize];
         win.with_frame(&abs_of(p), |p| unsafe {
             // Do not carry any guest-writable state across instances.
             // If TPM initialization failed, trustd also sets NO_REPORTS
@@ -481,6 +604,8 @@ impl Trustd {
     pub fn register(&mut self, id: usize, instance: u64, record: GuestRecord) {
         if self.failed { return; }
         let p = self.registry.wrapping_add(id);
+        let page = if self.second[id].get() { trust::RECORD_PAGE_B } else { 0 };
+        let record = GuestRecord { flags: record.flags & !trust::RECORD_PAGE_B | page, ..record };
         unsafe {
             p.write_volatile(record);
             core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
@@ -488,9 +613,11 @@ impl Trustd {
         }
     }
 
-    /// Guest `id` is destroyed.
+    /// Guest `id` is destroyed.  Before its id is given again (`give`):
+    /// trustd either sees it gone or has said which page it answers in.
     pub fn unregister(&mut self, id: usize) {
         unsafe { core::ptr::addr_of_mut!((*self.registry.wrapping_add(id)).instance).write_volatile(0) };
+        fence(Ordering::SeqCst);
     }
 
     /// The main thread faulted (the firmware's AML can make it panic): stop it,
@@ -505,7 +632,7 @@ impl Trustd {
             if h.guests[id].as_ref().is_none_or(|g| !g.attest) {
                 continue;
             }
-            h.wins.a.with_frame(&abs_of(self.pages[id]), |p| unsafe {
+            h.wins.a.with_frame(&abs_of(self.pages[id][self.second[id].get() as usize]), |p| unsafe {
                 let p = p as *mut abi::AttestPage;
                 core::ptr::addr_of_mut!((*p).state).write_volatile(abi::ATTEST_FAILED);
                 let seq = core::ptr::addr_of!((*p).seq).read_volatile();
@@ -521,14 +648,21 @@ impl Trustd {
     }
 }
 
-/// Stop a failed main thread, retaining the independent flags server.
+/// A fault of trustd's main thread: stop it (`fail`).  The flags server
+/// is a component of its own, which the main thread cannot reach but by
+/// its calls: its faults go to its keeper, which answers every call FAILED
+/// from then on (the actions they were for are refused, so seals stay
+/// enforced); only the keeper's own faults come here.
 pub fn fault(h: &mut Host, id: u32) {
-    assert!(id != FLAGS_ID, "l4h-root: flags thread faulted");
-    if id == TRUSTD_ID {
-        if let Some(mut t) = h.trustd.take() {
-            t.fail(h);
-            h.trustd = Some(t);
+    match id {
+        TRUSTD_ID => {
+            if let Some(mut t) = h.trustd.take() {
+                t.fail(h);
+                h.trustd = Some(t);
+            }
         }
+        FLAGS_ID => log!("l4h-root: the flags server's keeper faulted"),
+        _ => {}
     }
 }
 
@@ -542,39 +676,103 @@ pub fn done(h: &mut Host, id: usize) {
     }
 }
 
-/// `hw` from trustd: one access the firmware's AML makes (trust::HW_*).
-/// Returns what it read (all ones when refused).
+/// `hw` from trustd: one access the firmware's AML makes (trust::HW_*),
+/// served only for the ACPI start method.  Returns what it read (all ones
+/// when refused).  Refused, besides RAM and what is already given out
+/// (device memory root carved, which its frame table cannot have again;
+/// I/O ports seL4 has issued): writes to the configuration of the PCI
+/// functions root manages, by ports or through ECAM, their BARs, and the
+/// ports that reset the machine, put it to sleep or enter SMM.
 #[cfg(target_arch = "x86_64")]
 pub fn hw(h: &mut Host, op: u64, addr: usize, off: usize, width: usize, value: u64) -> u64 {
     let write = op & 1 != 0;
+    let refused = |what: &str| {
+        info!("l4h-root: trustd: refused hardware access {} at {:#x}+{:#x}: {}", op, addr, off, what);
+        u64::MAX
+    };
+    let Some(hw) = h.trustd.as_ref().and_then(|t| t.hw.as_ref()) else { return refused("no ACPI start method") };
     let r = match op {
         trust::HW_MEM_READ | trust::HW_MEM_WRITE => {
+            // `addr` and `width` are trustd's: the access must not wrap.
+            if !matches!(width, 1 | 2 | 4 | 8) || addr.checked_add(width).is_none() {
+                return refused("bad width or address");
+            }
+            if hw.ecam_function(addr).is_some_and(|(b, d, f)| write && managed(h, b, d, f)) {
+                return refused("configuration of a function root manages");
+            }
+            if in_bars(h, addr, width, false) {
+                return refused("a BAR of a function root manages");
+            }
             let Some(t) = h.trustd.as_mut() else { return u64::MAX };
-            crate::acpi::Phys::new(&mut h.alloc, &mut h.devmem, &mut h.wins.a, &mut t.frames).access(addr, width, write, value)
+            let Some(hw) = t.hw.as_mut() else { return u64::MAX };
+            crate::acpi::Phys::new(&mut h.alloc, &mut h.devmem, &mut h.wins.a, &mut hw.frames).access(addr, width, write, value)
         }
-        trust::HW_IO_READ | trust::HW_IO_WRITE => io(&mut h.alloc, addr, width, write, value),
+        trust::HW_IO_READ | trust::HW_IO_WRITE => {
+            if !matches!(width, 1 | 2 | 4) || addr.checked_add(width).is_none_or(|e| e > 0x1_0000) {
+                return refused("bad width or port");
+            }
+            if hw.refused_port(addr, width) || in_bars(h, addr, width, true) {
+                return refused("a port the AML has no business with");
+            }
+            io(&mut h.alloc, addr, width, write, value)
+        }
         trust::HW_PCI_READ | trust::HW_PCI_WRITE => {
             let (bus, dev, func) = ((addr >> 8) as u8, (addr >> 3 & 0x1f) as u8, (addr & 7) as u8);
-            let driven = h.ctrls.iter().map(|c| &c.pci).chain(h.netd.nics.iter().map(|n| &n.pci))
-                .any(|d| (d.bus, d.dev, d.func) == (bus, dev, func));
-            if addr >> 16 != 0 || off + width > 256 || off % width != 0 || !matches!(width, 1 | 2 | 4) || (write && driven) {
-                None
-            } else {
-                let (word, shift) = (off as u8 & !3, (off % 4) * 8);
-                let old = h.pci.read32(bus, dev, func, word);
-                let mask = if width == 4 { u32::MAX } else { ((1u32 << (8 * width)) - 1) << shift };
-                if write {
-                    h.pci.write32(bus, dev, func, word, (old & !mask) | ((value as u32) << shift & mask));
-                }
-                Some(((old & mask) >> shift) as u64)
+            // Width first: the `off % width` and `off + width` below are
+            // undefined or overflow for a width (or offset) trustd chose
+            // badly, and a panic here is the whole host.
+            if !matches!(width, 1 | 2 | 4) || addr >> 16 != 0 || off.checked_add(width).is_none_or(|e| e > 256)
+                || off % width != 0 {
+                return refused("bad width or offset");
             }
+            if write && managed(h, bus, dev, func) {
+                return refused("configuration of a function root manages");
+            }
+            let (word, shift) = (off as u8 & !3, (off % 4) * 8);
+            let old = h.pci.read32(bus, dev, func, word);
+            let mask = if width == 4 { u32::MAX } else { ((1u32 << (8 * width)) - 1) << shift };
+            if write {
+                h.pci.write32(bus, dev, func, word, (old & !mask) | ((value as u32) << shift & mask));
+            }
+            Some(((old & mask) >> shift) as u64)
         }
         _ => None,
     };
-    r.unwrap_or_else(|| {
-        info!("l4h-root: trustd: refused hardware access {} at {:#x}+{:#x}", op, addr, off);
-        u64::MAX
-    })
+    r.unwrap_or_else(|| refused("in use, or not device memory"))
+}
+
+/// Whether root manages PCI function bus:dev.func, whose configuration
+/// the AML may then read but not write: the disk controllers and uplink
+/// NICs it drives, every xHCI controller (each is root's or the
+/// firmware's until claimed), the balloon device, IOMMUs, the host
+/// bridge and every bridge (their bus numbers and windows route the
+/// others).  So is a function root cannot read.
+#[cfg(target_arch = "x86_64")]
+fn managed(h: &Host, bus: u8, dev: u8, func: u8) -> bool {
+    let is = |d: &crate::pci::Device| (d.bus, d.dev, d.func) == (bus, dev, func);
+    if h.ctrls.iter().any(|c| is(&c.pci)) || h.netd.nics.iter().any(|n| is(&n.pci)) || crate::usb::ctrls().iter().any(|c| is(&c.pci)) {
+        return true;
+    }
+    let id = h.pci.read32(bus, dev, func, 0);
+    // Class, subclass and programming interface.
+    let class = h.pci.read32(bus, dev, func, 8) >> 8;
+    let header = h.pci.read32(bus, dev, func, 0xc) >> 16 & 0x7f;
+    id & 0xffff == 0xffff
+        || header != 0
+        || matches!(class >> 8, 0x0600 | 0x0806)
+        || class == 0x0c0330
+        // virtio's balloon, modern and transitional (memd::is_balloon).
+        || id & 0xffff == 0x1af4 && matches!(id >> 16, 0x1045 | 0x1002)
+}
+
+/// Whether [start, start + len), memory or (`io`) ports, meets a BAR of a
+/// function root drives: what its drivers reach is not the AML's.
+#[cfg(target_arch = "x86_64")]
+fn in_bars(h: &Host, start: usize, len: usize, io: bool) -> bool {
+    let end = start.saturating_add(len);
+    h.ctrls.iter().map(|c| &c.pci).chain(h.netd.nics.iter().map(|n| &n.pci)).chain(crate::usb::ctrls().iter().map(|c| &c.pci))
+        .flat_map(|d| d.bars.iter())
+        .any(|b| b.size != 0 && b.is_io == io && (b.addr as usize) < end && start < (b.addr as usize).saturating_add(b.size as usize))
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -587,7 +785,7 @@ pub fn hw(_h: &mut Host, _op: u64, _addr: usize, _off: usize, _width: usize, _va
 /// legacy NICs).
 #[cfg(target_arch = "x86_64")]
 fn io(alloc: &mut Alloc, port: usize, width: usize, write: bool, value: u64) -> Option<u64> {
-    if !matches!(width, 1 | 2 | 4) || port + width > 0x1_0000 {
+    if !matches!(width, 1 | 2 | 4) || port.checked_add(width).is_none_or(|e| e > 0x1_0000) {
         return None;
     }
     let cap = crate::pci::io_ports(alloc, port as u16, width as u16)?;
@@ -615,38 +813,6 @@ fn io(alloc: &mut Alloc, port: usize, width: usize, write: bool, value: u64) -> 
     let _ = abs_of(cap).delete();
     alloc.slots.free(cap.bits() as usize);
     Some(r)
-}
-
-/// trustd's passive flags server. Its temporary SC is unbound after the
-/// initial reply_recv handshake; thereafter only callers supply budget.
-fn flags_thread(c: &Component, alloc: &mut Alloc, arena: &mut Arena, info: &HostInfo) -> cap::SchedContext {
-    use host::trust;
-    let mut ctx = ObjCtx::arena(alloc, arena);
-    let tcb = ctx.cap::<cap_type::Tcb>(ObjectBlueprint::Tcb);
-    let sc = ctx.cap::<cap_type::SchedContext>(ObjectBlueprint::SchedContext {
-        size_bits: sel4::sys::seL4_MinSchedContextBits as usize,
-    });
-    let ipc = ctx.cap::<cap_type::Granule>(FRAME_BP);
-    let reply = ctx.cap::<cap_type::Reply>(ObjectBlueprint::Reply);
-    map_frame(&mut ctx, c.vspace, ipc, trust::FLAGS_IPCBUF_VA, CapRights::read_write(), VmAttributes::DEFAULT);
-    for va in (trust::FLAGS_STACK_TOP - trust::FLAGS_STACK_SIZE..trust::FLAGS_STACK_TOP).step_by(PAGE) {
-        let f = ctx.cap::<cap_type::Granule>(FRAME_BP);
-        map_frame(&mut ctx, c.vspace, f, va, CapRights::read_write(), VmAttributes::DEFAULT);
-    }
-    let fault_slot = ctx.alloc.slots.alloc();
-    component::mint_edge(&abs_of(root_cap::<cap_type::Null>(fault_slot)), &wiring::FLAGS_FAULT, 0, &Obj::claim(p::Root, o::Endpoint, abs_of(info.hyp_ep)))
-        .expect("flags fault ep");
-    tcb.tcb_configure(c.cnode, CNodeCapData::new(0, 64 - c.cnode_bits), c.vspace, trust::FLAGS_IPCBUF_VA as u64, ipc)
-        .expect("flags TCB configure");
-    info.sched_control(info.cores - 1).sched_control_configure_flags(sc, info.timeslice_us, info.timeslice_us, 0, 0, 0)
-        .expect("flags bootstrap SC");
-    // Root is the initial task, at the maximum priority.
-    let prio = 255;
-    tcb.tcb_set_sched_params(crate::slot::TCB.cap(), prio, prio, sc, root_cap::<cap_type::Endpoint>(fault_slot))
-        .expect("flags sched params");
-    c.give(trust::SLOT_FLAGS_TCB, tcb, CapRights::all());
-    c.give(trust::SLOT_FLAGS_REPLY, reply, CapRights::all());
-    sc
 }
 
 // A relayed message fits a control channel's ring.
@@ -678,7 +844,9 @@ pub fn channel_message(h: &mut Host, peer: u32, ty: u32, msg: &[u8]) {
         core::ptr::copy_nonoverlapping(msg.as_ptr(), (va + trust::RELAY_SLOT_HEADER) as *mut u8, msg.len());
     }
     slot.len.store(msg.len() as u32, Ordering::Relaxed);
-    slot.seq.store((seq | 1) + 1, Ordering::Release);
+    // `seq` comes from a page the peer's trustd maps writable: never let its
+    // value overflow root's own increment.
+    slot.seq.store((seq | 1).wrapping_add(1), Ordering::Release);
     relay.signal();
 }
 

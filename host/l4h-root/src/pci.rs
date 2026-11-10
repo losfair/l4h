@@ -157,6 +157,9 @@ pub const MAX_DISK_CTRLS: usize = 48;
 /// A capability for I/O ports [base, base + len), in a new root slot.
 #[cfg(target_arch = "x86_64")]
 pub fn io_ports(alloc: &mut Alloc, base: u16, len: u16) -> Option<sel4::cap::Null> {
+    if len == 0 {
+        return None;
+    }
     let s = alloc.slots.alloc();
     let cap = sel4::init_thread::Slot::<cap_type::Null>::from_index(s).cap();
     let dst = slot::CNODE.cap().absolute_cptr(cap);
@@ -425,39 +428,51 @@ impl Pci {
         bars
     }
 
-    fn caps(&self, bus: u8, dev: u8, func: u8) -> (Option<Msix>, Option<Msi>, VirtioCaps) {
+    /// The capabilities of a function with BARs `bars`.  The device says
+    /// where they are and what they point at: one that does not fit in
+    /// configuration space, or whose table or structure is not inside a
+    /// memory BAR, is ignored (users index `bars` with it, and map and
+    /// write the pages it names).
+    fn caps(&self, bus: u8, dev: u8, func: u8, bars: &[Bar; 6]) -> (Option<Msix>, Option<Msi>, VirtioCaps) {
         let mut msix = None;
         let mut msi = None;
         let mut virtio = VirtioCaps::new();
         if self.read16(bus, dev, func, 6) & 0x10 == 0 {
             return (msix, msi, virtio);
         }
+        let inside = |bar: u8, off: u32, len: u64| bars.get(bar as usize).is_some_and(|b| !b.is_io && off as u64 + len <= b.size);
         let mut ptr = self.read8(bus, dev, func, 0x34) & !3;
         let mut guard = 0;
         while ptr != 0 && guard < 48 {
+            let fits = |len: usize| ptr as usize + len <= 0x100;
             let id = self.read8(bus, dev, func, ptr);
             match id {
-                0x11 => {
+                0x11 if fits(12) => {
                     let ctrl = self.read16(bus, dev, func, ptr + 2);
                     let table = self.read32(bus, dev, func, ptr + 4);
-                    msix = Some(Msix {
-                        cap: ptr,
-                        table_bar: (table & 7) as u8,
-                        table_offset: table & !7,
-                        table_size: (ctrl & 0x7ff) + 1,
-                    });
+                    let m = Msix { cap: ptr, table_bar: (table & 7) as u8, table_offset: table & !7, table_size: (ctrl & 0x7ff) + 1 };
+                    if inside(m.table_bar, m.table_offset, m.table_size as u64 * 16) {
+                        msix = Some(m);
+                    }
                 }
                 0x05 => {
                     let ctrl = self.read16(bus, dev, func, ptr + 2);
-                    msi = Some(Msi { cap: ptr, is64: ctrl & 0x80 != 0, maskable: ctrl & 0x100 != 0 });
+                    let m = Msi { cap: ptr, is64: ctrl & 0x80 != 0, maskable: ctrl & 0x100 != 0 };
+                    // Through the data, and the mask bits (enable_msi).
+                    if fits(if m.is64 { 0x10 } else { 0xc } + if m.maskable { 4 } else { 0 }) {
+                        msi = Some(m);
+                    }
                 }
-                0x09 => {
+                0x09 if fits(16) => {
                     let cfg_type = self.read8(bus, dev, func, ptr + 3);
                     let bar = self.read8(bus, dev, func, ptr + 4);
                     let offset = self.read32(bus, dev, func, ptr + 8);
                     let length = self.read32(bus, dev, func, ptr + 12);
-                    let mult = if cfg_type == 2 { self.read32(bus, dev, func, ptr + 16) } else { 0 };
-                    virtio.push(VirtioCap { cfg_type, bar, offset, length, notify_off_multiplier: mult });
+                    // The notify structure's multiplier follows.
+                    if inside(bar, offset, length as u64) && (cfg_type != 2 || fits(20)) {
+                        let mult = if cfg_type == 2 { self.read32(bus, dev, func, ptr + 16) } else { 0 };
+                        virtio.push(VirtioCap { cfg_type, bar, offset, length, notify_off_multiplier: mult });
+                    }
                 }
                 _ => {}
             }
@@ -481,7 +496,6 @@ impl Pci {
         }
         let class = self.read32(bus, dev, func, 8);
         let header = self.read8(bus, dev, func, 0xe) & 0x7f;
-        let (msix, msi, virtio_caps) = self.caps(bus, dev, func);
         // A partition never sizes a BAR: sizing stops the function
         // decoding, and the shim sized them all before any kernel ran.
         let bdf = (bus as u16) << 8 | (dev as u16) << 3 | func as u16;
@@ -497,8 +511,16 @@ impl Pci {
         #[cfg(target_arch = "aarch64")]
         for (n, b) in bars.iter_mut().enumerate() {
             if b.size == 0 || b.is_io { continue; }
-            let addr = (self.next_bar.get() + b.size - 1) & !(b.size - 1);
-            assert!(addr + b.size <= 0x3eff_0000, "PCI MMIO aperture exhausted");
+            // The size is the device's: a power of two, and the BAR must fit.
+            let end = Some(b.size).filter(|s| s.is_power_of_two())
+                .and_then(|s| self.next_bar.get().checked_next_multiple_of(s)?.checked_add(s))
+                .filter(|&end| end <= 0x3eff_0000);
+            let Some(end) = end else {
+                log!("l4h-root: pci {:02x}:{:02x}.{}: BAR {} of {:#x} bytes does not fit the MMIO aperture, unused", bus, dev, func, n, b.size);
+                *b = Bar::default();
+                continue;
+            };
+            let addr = end - b.size;
             let off = 0x10 + 4 * n as u8;
             let flags = self.read32(bus, dev, func, off) & 0xf;
             self.write32(bus, dev, func, off, addr as u32 | flags);
@@ -506,6 +528,7 @@ impl Pci {
             b.addr = addr;
             self.next_bar.set(addr + b.size);
         }
+        let (msix, msi, virtio_caps) = self.caps(bus, dev, func, &bars);
         Some(Device {
             bus,
             dev,

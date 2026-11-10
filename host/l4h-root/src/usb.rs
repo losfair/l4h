@@ -31,6 +31,7 @@ use l4h_abi::{self as abi, usb as uabi};
 use l4h_host::usb::call::{Request, reply};
 use l4h_host::{self as host, usb, wire, wiring};
 use l4h_host::fixed::ArrayVec;
+use l4h_host::mailbox::RING;
 
 use crate::blkd::{BarCache, DEVICE_ATTRS, bar_frames, keep_bits};
 use crate::component::{self, Component, SpawnArgs, abs_of, root_cap};
@@ -87,9 +88,10 @@ struct Usbd {
     comp: Component,
     arena: Arena,
     mailbox: Mailbox,
-    /// The requests posted and not answered, oldest first: at most a
-    /// CLAIM, or an ATTACH and its REMOVE (an ATTACH waits for the others).
-    ops: ArrayVec<Op, 2>,
+    /// The requests posted and not answered, by number mod RING, as blkd's
+    /// and netd's are: at most a CLAIM, or an ATTACH and its REMOVE (an
+    /// ATTACH waits for the others).
+    ops: [Option<Op>; RING],
     areas: [Option<Area>; usb::AREAS],
     /// The attached guest's area (State::Vm).
     idx: usize,
@@ -131,12 +133,15 @@ pub fn is_xhci(d: &pci::Device) -> bool {
 
 /// Why `d` cannot be driven, or None.
 fn unsupported(d: &pci::Device, pci: &pci::Pci) -> Option<&'static str> {
-    let bar = d.bars[0];
-    if bar.is_io || bar.size < 0x1000 || bar.size as usize > crate::blkd::BAR_STRIDE {
+    if d.bars[0].size < 0x1000 || !crate::blkd::mappable(d, 1) {
         return Some("no usable BAR 0");
     }
     if d.msix.is_none() && d.msi.is_none() {
         return Some("no MSI or MSI-X");
+    }
+    // program_irq writes entry 0, in one page.
+    if d.msix.is_some_and(|m| !crate::blkd::mappable(d, 1 << m.table_bar) || m.table_offset as usize % PAGE > PAGE - 16) {
+        return Some("unusable MSI-X table");
     }
     // Renesas uPD720201/2 without a firmware ROM: their driver loads the
     // firmware through configuration space (Linux's renesas_xhci).
@@ -153,20 +158,24 @@ fn unsupported(d: &pci::Device, pci: &pci::Pci) -> Option<&'static str> {
     None
 }
 
-/// Boot: list `d`, leaving it to the firmware.
-pub fn found(d: pci::Device, pci: &pci::Pci) {
+/// Boot: list `d`, leaving it to the firmware.  The BARs a claim maps
+/// are carved now (blkd::carve_bars), or it is unsupported.
+pub fn found(d: pci::Device, pci: &pci::Pci, alloc: &mut crate::mem::Alloc, devmem: &mut crate::devmem::DevMem) {
     let cs = ctrls();
     if cs.is_full() {
         log!("l4h-root: more than {} xHCI controllers, {:02x}:{:02x}.{} ignored", usb::MAX_USB_CTRLS, d.bus, d.dev, d.func);
         return;
     }
+    let mut bars = [const { None }; 6];
     let state = match unsupported(&d, pci) {
         Some(why) => State::Unsupported(why),
+        None if !crate::blkd::carve_bars(alloc, devmem, &d, &mut bars, 1 | d.msix.map_or(0, |m| 1 << m.table_bar)) =>
+            State::Unsupported("BARs not free device memory"),
         None => State::Firmware,
     };
     info!("l4h-root: xHCI {:02x}:{:02x}.{} {:04x}:{:04x}: left to the firmware{}", d.bus, d.dev, d.func,
         d.vendor, d.device, if let State::Unsupported(w) = state { w } else { "" });
-    cs.must_push(Ctrl { pci: d, state, claimed: false, usb2: 0, usb3: 0, bars: [const { None }; 6], driver: None, dom: Domain::NONE, pool: None, ac64: false });
+    cs.must_push(Ctrl { pci: d, state, claimed: false, usb2: 0, usb3: 0, bars, driver: None, dom: Domain::NONE, pool: None, ac64: false });
 }
 
 /// Stop the controller for good: usbd suspended, no DMA, no decoding, no
@@ -185,7 +194,7 @@ fn quarantine(c: &mut Ctrl, pci: &pci::Pci) {
 /// BAR 0's first page: (max slots, scratchpad buffers, page size).
 fn caps(h: &mut Host, i: usize) -> Option<(u32, u32, u32)> {
     let c = &mut ctrls()[i];
-    let frames = bar_frames(&mut h.alloc, &mut h.devmem, &c.pci, &mut c.bars, 0);
+    let frames = bar_frames(&c.bars, 0);
     h.pci.enable_memory(&c.pci);
     let frame = crate::devmem::granule(frames.start);
     let ticks_per_ms = h.info.tsc_hz / 1000;
@@ -238,7 +247,7 @@ fn program_irq(h: &mut Host, i: usize, vector: u64, dom: Domain) {
     let c = &mut ctrls()[i];
     match c.pci.msix {
         Some(m) => {
-            let frames = bar_frames(&mut h.alloc, &mut h.devmem, &c.pci, &mut c.bars, m.table_bar);
+            let frames = bar_frames(&c.bars, m.table_bar);
             let off = m.table_offset as usize;
             let frame = crate::devmem::granule(frames.start + off / PAGE);
             h.wins.a.with_frame_attrs(&abs_of(frame), DEVICE_ATTRS, |page| unsafe {
@@ -331,7 +340,7 @@ fn claim(h: &mut Host, i: usize) -> Result<(), Errno> {
         keep.absolute_cptr_from_bits_with_depth(next - 1, kb)
     };
     // BAR 0, uncached, and the DMA region.
-    let bar = bar_frames(&mut h.alloc, &mut h.devmem, &d, &mut c.bars, 0);
+    let bar = bar_frames(&c.bars, 0);
     for (p, f) in bar.map(crate::devmem::granule).enumerate() {
         comp.map_copy(&mut h.alloc, &mut arena, &abs_of(f), host::MMIO_VA + p * PAGE, CapRights::read_write(), DEVICE_ATTRS, keep_slot());
     }
@@ -355,7 +364,7 @@ fn claim(h: &mut Host, i: usize) -> Result<(), Errno> {
     // stays as it is until usbd has it halted.
     h.pci.enable_memory(&c.pci);
     component::start(&comp);
-    let mut u = Usbd { comp, arena, mailbox: mbox, ops: ArrayVec::new(), areas: [const { None }; usb::AREAS], idx: 0, waiting: false };
+    let mut u = Usbd { comp, arena, mailbox: mbox, ops: [None; RING], areas: [const { None }; usb::AREAS], idx: 0, waiting: false };
     send(&mut u, Request::Claim {}, Op::Claim);
     c.driver = Some(u);
     c.state = State::Idle;
@@ -406,8 +415,8 @@ pub fn ensure_claimed(h: &mut Host, i: usize) -> Result<(), Errno> {
 /// Post a request to usbd.  Root posts at most two before they are
 /// answered (Usbd::ops), so the ring has room.
 fn send(d: &mut Usbd, req: Request, op: Op) {
-    d.mailbox.send(&req).expect("usbd mailbox room");
-    d.ops.must_push(op);
+    let k = d.mailbox.send(&req).expect("usbd mailbox room");
+    d.ops[k as usize % RING] = Some(op);
 }
 
 /// The owner's ATTACH, once usbd has answered what came before: bus
@@ -457,22 +466,23 @@ pub fn poll(h: &mut Host) {
             let c = &mut ctrls()[i];
             let Some(d) = c.driver.as_mut() else { break };
             let failed = c.state == State::Failed;
-            let w = if failed {
-                d.mailbox.abandon().map(|_| [wire::FAILED; host::mailbox::ANSWER])
+            let next = if failed {
+                d.mailbox.abandon().map(|k| (k, [wire::FAILED; host::mailbox::ANSWER]))
             } else {
-                d.mailbox.answer().map(|(_, w)| w)
+                d.mailbox.answer()
             };
-            let Some(w) = w else { break };
+            let Some((k, w)) = next else { break };
             let p = c.pci;
-            match d.ops.remove(0) {
-                Op::Claim => claimed(h, i, &w),
+            match d.ops[k as usize % RING].take() {
+                None => {}
+                Some(Op::Claim) => claimed(h, i, &w),
                 // The guest finds no magic.
-                Op::Attach => {
+                Some(Op::Attach) => {
                     if let (Err(e), false) = (wire::reply::<reply::Attach>(&w), failed) {
                         log!("l4h-root: xHCI {:02x}:{:02x}.{}: usbd refused the attachment ({:#x})", p.bus, p.dev, p.func, e);
                     }
                 }
-                Op::Remove(idx) => {
+                Some(Op::Remove(idx)) => {
                     if let (Err(e), false) = (wire::reply::<reply::Remove>(&w), failed) {
                         log!("l4h-root: xHCI {:02x}:{:02x}.{}: usbd could not stop it ({:#x})", p.bus, p.dev, p.func, e);
                         quarantine(c, &h.pci);
@@ -482,7 +492,7 @@ pub fn poll(h: &mut Host) {
             }
             let c = &ctrls()[i];
             let d = c.driver.as_ref().unwrap();
-            if d.waiting && d.ops.is_empty() && c.state != State::Failed {
+            if d.waiting && d.mailbox.idle() && c.state != State::Failed {
                 post_attach(h, i);
             }
         }
@@ -516,6 +526,14 @@ pub fn attach(h: &mut Host, i: usize, g: &mut RootGuest) -> Result<Attached, Err
     if !h.can_afford((uabi::AREA_PAGES + 8) * PAGE, 0, 2 * (1 << QUEUE_RADIX) + 8) {
         return Err(ctl::ENOMEM);
     }
+    // Completions go to the guest's VMM, which raises the device's event:
+    // given before anything is allocated for the area.  A usbd that keeps
+    // filling the slot misbehaves.
+    let n = g.usbs.len();
+    if d.comp.give_edge_live(&wiring::USBD_VMM, idx, n, &g.vmm_ntfn).is_err() {
+        quarantine(c, &h.pci);
+        return Err(ctl::EIO);
+    }
     // The queue area: root's frames, in an arena outside the guest's
     // (usbd may use them after the guest is gone, until REMOVE is done).
     let area = h.alloc.global(|alloc| -> Option<Area> {
@@ -538,21 +556,19 @@ pub fn attach(h: &mut Host, i: usize, g: &mut RootGuest) -> Result<Attached, Err
         let slots = [frames.bits() as Slot, keep.bits() as Slot, guest.bits() as Slot];
         Some(Area { arena, guest, slots })
     });
-    let area = area.ok_or(ctl::ENOMEM)?;
-    let n = g.usbs.len();
+    let Some(area) = area else {
+        let _ = d.comp.slot(usb::USBD_SLOT_CLIENT_IRQ + idx as u64).delete();
+        return Err(ctl::ENOMEM);
+    };
     let guest_frames = area.guest;
     d.areas[idx] = Some(area);
-    // Completions go to the guest's VMM, which raises the device's event.
-    let irq_slot = usb::USBD_SLOT_CLIENT_IRQ + idx as u64;
-    let _ = d.comp.slot(irq_slot).delete();
-    d.comp.give_edge(&wiring::USBD_VMM, idx, n, &g.vmm_ntfn);
     let kick = root_cap::<cap_type::Notification>(h.alloc.slots.alloc());
     component::mint_edge(&abs_of(kick), &wiring::VMM_USBD_KICK, 0, &d.comp.obj()).expect("usbd kick");
     d.idx = idx;
     c.pool = Some((g.pool.gpa, g.pool.paddr, g.pool.size));
     c.state = State::Vm(g.id);
     g.usbs.must_push(i);
-    if d.ops.is_empty() {
+    if d.mailbox.idle() {
         post_attach(h, i);
     } else {
         d.waiting = true;

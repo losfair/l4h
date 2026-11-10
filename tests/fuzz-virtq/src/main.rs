@@ -9,7 +9,9 @@
 //! headers and checks its TCP segmentation, and checks that a virtio-blk
 //! reset waits for every request blkd has (host/l4h-vmm/src/blk.rs),
 //! whatever the guest puts in the avail ring, and that no request with a
-//! buffer outside the pool reaches blkd.
+//! buffer outside the pool reaches blkd, nor any blkd index the VMM's own.
+//! Also that netd's backlog pool (host/l4h-netd/src/pool.rs) keeps every
+//! backlog's reserve however many others stall.
 
 #![allow(dead_code)]
 
@@ -36,6 +38,9 @@ mod virtq;
 
 #[path = "../../../host/l4h-netd/src/offload.rs"]
 mod offload;
+
+#[path = "../../../host/l4h-netd/src/pool.rs"]
+mod pool;
 
 // The production block backend and device model use fake seL4 notifications
 // and guest event delivery. blkcheck.rs plays the hardware service.  The
@@ -65,6 +70,7 @@ mod dev;
 mod blk;
 
 mod blkcheck;
+mod poolcheck;
 
 use guest::GuestMem;
 
@@ -177,10 +183,13 @@ fn main() {
     println!("fuzz-virtq: blk-mux pool check: {} segments, {segs} accepted", iterations * 4);
     let segs = offload_check(&mut rng, iterations / 4);
     let merged = gro_check(&mut rng, iterations / 20);
+    min_mss_check(&mut rng);
     println!("fuzz-virtq: offload: {} frames, {segs} segments checked", iterations / 4);
     println!("fuzz-virtq: GRO: {} streams, {merged} merged frames segment back exactly", iterations / 20);
     let (reqs, bad) = blkcheck::drain_check(&mut rng, iterations / 20);
     println!("fuzz-virtq: blk: {} resets, {reqs} requests drained, {bad} chains outside the pool refused", iterations / 20);
+    let frames = poolcheck::check(&mut rng, iterations);
+    println!("fuzz-virtq: netd backlog pool: {frames} frames held, every reserve kept");
 }
 
 /// Chains whose buffers or indirect tables end exactly at the end of the
@@ -385,6 +394,54 @@ fn offload_check(rng: &mut Rng, n: u64) -> u64 {
         segs += count;
     }
     segs
+}
+
+/// A sender netd does not trust (a guest: `sanitize`; a peer partition:
+/// `sanitize_rx` with MIN_MSS) cannot have it segment one frame into tens
+/// of thousands of packets with a tiny gso_size.  An uplink's frames keep
+/// the size the device gave them (`UPLINK_MIN_MSS`), however small: they
+/// segment into no more packets than it received.
+fn min_mss_check(rng: &mut Rng) {
+    let mut buf = vec![0u8; 70000];
+    for v6 in [false, true] {
+        for mss in [1, offload::MIN_MSS - 1] {
+            let (frame, hdr) = tcp_frame(rng, v6, false, 60000, mss);
+            assert!(!offload::sanitize(&mut hdr.clone(), &frame), "guest gso_size {mss} accepted");
+            assert!(!offload::sanitize_rx(&mut hdr.clone(), &frame, offload::MIN_MSS), "link gso_size {mss} accepted");
+        }
+        let (frame, mut hdr) = tcp_frame(rng, v6, false, offload::MIN_MSS, offload::MIN_MSS);
+        assert!(offload::sanitize(&mut hdr, &frame), "gso_size MIN_MSS refused");
+        // An uplink frame of 10 one-byte segments segments back into 10.
+        let (frame, mut hdr) = tcp_frame(rng, v6, false, 10, 1);
+        assert!(offload::sanitize_rx(&mut hdr, &frame, offload::UPLINK_MIN_MSS), "uplink gso_size 1 refused");
+        let mut n = 0;
+        offload::segment(&frame, &hdr, &mut buf, |f, _| {
+            assert_eq!(f.len(), offload::parse_tcp(&frame).unwrap().hdrs + 1);
+            n += 1;
+        });
+        assert_eq!(n, 10);
+        // A GRO run keeps its segments' size, under MIN_MSS too; netd
+        // segments such a run before a link, as the peer would refuse it.
+        for mss in [10, offload::MIN_MSS - 1, offload::MIN_MSS, 1460] {
+            let (mut frame, mut hdr) = tcp_frame(rng, v6, false, 3 * mss, mss);
+            let t = offload::parse_tcp(&frame).unwrap();
+            frame[t.tcp + 13] = 0x10;
+            assert!(offload::sanitize_rx(&mut hdr, &frame, offload::UPLINK_MIN_MSS));
+            let mut segs: Vec<Vec<u8>> = Vec::new();
+            offload::segment(&frame, &hdr, &mut buf, |f, _| segs.push(f.to_vec()));
+            let mut gro = offload::Gro::new();
+            for s in &segs {
+                assert!(gro.add(s, &[0u8; 12]), "segment of {mss} bytes not merged");
+            }
+            let mut run = None;
+            gro.flush(|f, h| run = Some((f.to_vec(), *h)));
+            let (run, h) = run.unwrap();
+            assert!(offload::is_gso(&h));
+            let peer_takes = offload::sanitize_rx(&mut h.clone(), &run, offload::MIN_MSS);
+            assert_eq!(offload::link_takes_gso(&h), peer_takes, "link and peer disagree on a run of {mss}");
+            assert_eq!(peer_takes, mss >= offload::MIN_MSS);
+        }
+    }
 }
 
 /// netd's receive offload: a stream of segments (as a TSO sender's NIC

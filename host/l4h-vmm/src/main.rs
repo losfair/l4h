@@ -162,6 +162,7 @@ fn main(info: &'static Info) -> ! {
                     d.chan_va as usize,
                     cap::<cap_type::Notification>(d.chan_kick_slot),
                     cfg.io_pool_size,
+                    tsc_hz,
                 ),
             )),
             host::VDEV_NET => Dev::Net(Device::new(

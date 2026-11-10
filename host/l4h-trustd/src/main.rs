@@ -365,8 +365,8 @@ fn ready(key: SigningKey, partition: u32, answer: Result<&[u8], Errno>, t0: u64,
 
 /// No reports: tell every guest's driver.
 fn no_reports() {
-    for id in 0..trust::MAX_RECORDS {
-        unsafe { addr_of_mut!((*page(id)).state).write_volatile(abi::ATTEST_NO_REPORTS) };
+    for p in 0..trust::PAGES {
+        unsafe { addr_of_mut!((*page(p)).state).write_volatile(abi::ATTEST_NO_REPORTS) };
     }
     info!("l4h-trustd: no TPM: flags only");
 }
@@ -549,8 +549,14 @@ impl Answered {
     }
 }
 
-fn page(id: usize) -> *mut abi::AttestPage {
-    trust::page_va(id) as *mut abi::AttestPage
+/// Request page `p` (trust::page_va).
+fn page(p: usize) -> *mut abi::AttestPage {
+    trust::page_va(p) as *mut abi::AttestPage
+}
+
+/// The request page of guest `id`, whose record is `r`.
+fn page_of(id: usize, r: &GuestRecord) -> usize {
+    trust::page_of(id, r.flags & trust::RECORD_PAGE_B != 0)
 }
 
 /// The result of guest `id`'s request `seq` in its page (the evidence, or
@@ -568,7 +574,7 @@ fn execute<'a>(
     relay: Option<&mut Relay>,
     out: &'a mut [u8; ANSWER_MAX],
 ) -> Result<&'a [u8], Errno> {
-    let p = page(id);
+    let p = page(page_of(id, r));
     let (op, in_len, blob_len) = unsafe {
         (addr_of!((*p).op).read_volatile(), addr_of!((*p).in_len).read_volatile() as usize, addr_of!((*p).blob_len).read_volatile() as usize)
     };
@@ -629,10 +635,33 @@ fn execute<'a>(
     }
 }
 
-/// Answer guest `id`'s request `seq`: the result's piece from the
-/// request's offset, then done = seq; root raises the device's event.
-fn answer(id: usize, seq: u32, result: Result<&[u8], Errno>) {
-    let p = page(id);
+/// Answer guest `id`'s request `seq`, if the guest is still `instance`:
+/// the result's piece from the request's offset, then done = seq; root
+/// raises the device's event.  Whether it was answered.
+fn answer(id: usize, instance: u64, seq: u32, result: Result<&[u8], Errno>) -> bool {
+    let Some(r) = record(id).filter(|r| r.instance == instance) else { return false };
+    let at = page_of(id, &r);
+    // Say which page we write before we look a last time whether the guest
+    // runs: root, which unregisters a guest before it gives its id to
+    // another, then either sees this and gives the new guest the other
+    // page, or we see the guest gone (trust::Status).  Otherwise a stale
+    // answer could land in the next guest's page.
+    let status = unsafe { &*(trust::STATUS_VA as *const trust::Status) };
+    status.answering.store(at as u64 + 1, Ordering::SeqCst);
+    fence(Ordering::SeqCst);
+    let running = record(id).is_some_and(|now| now.instance == instance && page_of(id, &now) == at);
+    if running {
+        write_answer(page(at), seq, result);
+    }
+    status.answering.store(0, Ordering::Release);
+    if running {
+        use l4h_rt::host::root::call::Client;
+        let _ = l4h_rt::ipc::Endpoint::of(&l4h_rt::host::wiring::TRUSTD_ROOT, l4h_rt::host::wiring::p::Trustd, 0).attest_done(id);
+    }
+    running
+}
+
+fn write_answer(p: *mut abi::AttestPage, seq: u32, result: Result<&[u8], Errno>) {
     unsafe {
         let off = addr_of!((*p).offset).read_volatile() as usize;
         let (status, total, n) = match &result {
@@ -651,12 +680,13 @@ fn answer(id: usize, seq: u32, result: Result<&[u8], Errno>) {
         fence(Ordering::Release);
         addr_of_mut!((*p).done).write_volatile(seq);
     }
-    use l4h_rt::host::root::call::Client;
-    let _ = l4h_rt::ipc::Endpoint::of(&l4h_rt::host::wiring::TRUSTD_ROOT, l4h_rt::host::wiring::p::Trustd, 0).attest_done(id);
 }
 
 fn main(info: &'static Info) -> ! {
-    flags::start();
+    // The same image is the flags server, in spaces of its own.
+    if info.header().kind == host::KIND_FLAGS {
+        flags::serve();
+    }
     let cfg: &TrustdConfig = unsafe { info.config() };
     let hz = info.header().tsc_hz;
     let t0 = host::ticks::now();
@@ -725,8 +755,7 @@ fn main(info: &'static Info) -> ! {
                             Err(if e == ETIMEDOUT { EIO } else { e })
                         }
                     };
-                    if record(id).is_some_and(|now| now.instance == instance) && answered[id].instance == instance {
-                        answer(id, seq, result);
+                    if answered[id].instance == instance && answer(id, instance, seq, result) {
                         answered[id].seq = seq;
                     }
                 }
@@ -738,10 +767,11 @@ fn main(info: &'static Info) -> ! {
             let id = kicked.trailing_zeros() as usize;
             kicked &= kicked - 1;
             let Some(r) = record(id) else { continue };
+            let p = page(page_of(id, &r));
             if state.is_none() && starting.is_none() {
-                unsafe { addr_of_mut!((*page(id)).state).write_volatile(abi::ATTEST_NO_REPORTS) };
+                unsafe { addr_of_mut!((*p).state).write_volatile(abi::ATTEST_NO_REPORTS) };
             }
-            let seq = unsafe { addr_of!((*page(id)).seq).read_volatile() };
+            let seq = unsafe { addr_of!((*p).seq).read_volatile() };
             fence(Ordering::Acquire);
             let last = &mut answered[id];
             if last.instance != r.instance {
@@ -759,13 +789,11 @@ fn main(info: &'static Info) -> ! {
                 Err(PENDING) => continue,
                 _ => {}
             }
-            // Destroyed meanwhile (or replaced by another guest): nobody
-            // waits for this answer.
-            if record(id).is_none_or(|now| now.instance != r.instance) {
-                continue;
+            // Not if destroyed meanwhile (or replaced by another guest):
+            // nobody waits for this answer.
+            if answer(id, r.instance, seq, result) {
+                answered[id].seq = seq;
             }
-            answer(id, seq, result);
-            answered[id].seq = seq;
         }
     }
 }

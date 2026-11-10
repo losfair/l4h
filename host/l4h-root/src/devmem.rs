@@ -65,10 +65,13 @@ impl DevMem {
         let size = size.max(4096).next_power_of_two();
         let bits = size.trailing_zeros() as usize;
         assert!(paddr % size == 0, "device range {:#x}+{:#x} not aligned", paddr, size);
+        // `paddr` can come from trustd's `hw`; `paddr + size` must not
+        // overflow (a root panic is the whole host).
+        let end = paddr.checked_add(size)?;
         let i = self
             .free
             .iter()
-            .position(|r| r.paddr <= paddr && paddr + size <= r.paddr + (1 << r.size_bits))?;
+            .position(|r| r.paddr <= paddr && end <= r.paddr + (1 << r.size_bits))?;
         // Each halving leaves one free half.
         if self.free.len() - 1 + (self.free[i].size_bits - bits) > DEVMEM_REGIONS {
             log!("l4h-root: device memory table full, cannot carve {:#x}+{:#x}", paddr, size);

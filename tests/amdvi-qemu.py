@@ -12,6 +12,7 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
+from host_profile import root_elf  # noqa: E402
 OUT = ROOT / "build/amdvitest"
 Qtest = runpy.run_path(str(ROOT / "tests/vtd-qemu.py"))["Qtest"]
 
@@ -51,7 +52,7 @@ def main():
         sock = Path(tmp) / "qtest.sock"
         proc = subprocess.Popen([
             ROOT / "tools/run-qemu.sh",
-            ROOT / "host/target/x86_64-sel4-roottask/debug/l4h-root.elf",
+            root_elf(),
             "-qtest", f"unix:{sock},server=on,wait=off", "-qtest-log", "/dev/null",
             "-trace", "enable=amdvi_ir_target_abort", *devices,
         ], env=env, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)

@@ -275,6 +275,14 @@ impl Controller {
         (disk, units)
     }
 
+    /// The BARs `start` maps, bit b for BAR b: the registers and the
+    /// MSI-X table.
+    fn used_bars(&self) -> u8 {
+        let d = &self.pci;
+        let regs = if self.kind == blk::BLKD_NVME { 1 } else if self.legacy_io().is_some() { 0 } else { virtio_bar_mask(d) };
+        regs | d.msix.map_or(0, |m| 1 << m.table_bar)
+    }
+
     /// Base of the I/O BAR of a legacy virtio device.
     fn legacy_io(&self) -> Option<u16> {
         is_legacy_virtio(&self.pci).then_some(self.pci.bars[0].addr as u16)
@@ -302,22 +310,33 @@ impl Controller {
 pub fn is_virtio_blk(d: &pci::Device) -> bool {
     d.vendor == VIRTIO_VENDOR
         && (d.device == 0x1042 || d.device == 0x1001)
-        && (d.virtio_caps.iter().any(|c| c.cfg_type == VIRTIO_PCI_CAP_COMMON_CFG) || (d.device == 0x1001 && is_legacy_virtio(d)))
+        && (is_modern_virtio(d) || (d.device == 0x1001 && is_legacy_virtio(d)))
         && d.msix.is_some()
+}
+
+/// A virtio 1.x device with the structures `virtio_regions` gives its
+/// driver, and the device status `reset` writes (pci.rs keeps only
+/// structures inside their BARs).
+pub fn is_modern_virtio(d: &pci::Device) -> bool {
+    (VIRTIO_PCI_CAP_COMMON_CFG..=VIRTIO_PCI_CAP_DEVICE_CFG).all(|t| d.virtio_caps.iter().any(|c| c.cfg_type == t))
+        && d.virtio_caps.iter().any(|c| c.cfg_type == VIRTIO_PCI_CAP_COMMON_CFG && c.length as usize > VIRTIO_DEVICE_STATUS)
 }
 
 /// A virtio 0.9.5 ("legacy") device: registers in I/O BAR 0, no virtio
 /// capabilities.  GCE's virtio-net and virtio-scsi are legacy devices, and
-/// so are all of a hypervisor's whose virtio predates 1.0.
+/// so are all of a hypervisor's whose virtio predates 1.0.  The BAR is in
+/// the 16-bit port space, as its users take it.
 pub fn is_legacy_virtio(d: &pci::Device) -> bool {
-    cfg!(target_arch = "x86_64") && d.virtio_caps.is_empty() && d.bars[0].is_io && d.bars[0].size >= 0x20
+    let b = d.bars[0];
+    cfg!(target_arch = "x86_64") && d.virtio_caps.is_empty() && b.is_io && b.size >= 0x20
+        && b.addr.checked_add(b.size).is_some_and(|end| end <= 0x1_0000)
 }
 
 /// A virtio-scsi controller, modern or legacy (as on GCE).
 pub fn is_virtio_scsi(d: &pci::Device) -> bool {
     d.vendor == VIRTIO_VENDOR
         && (d.device == 0x1048 || d.device == 0x1004)
-        && (d.virtio_caps.iter().any(|c| c.cfg_type == VIRTIO_PCI_CAP_COMMON_CFG) || (d.device == 0x1004 && is_legacy_virtio(d)))
+        && (is_modern_virtio(d) || (d.device == 0x1004 && is_legacy_virtio(d)))
         && d.msix.is_some()
 }
 
@@ -325,9 +344,26 @@ pub fn is_nvme(d: &pci::Device) -> bool {
     d.class == 0x01 && d.subclass == 0x08 && d.prog_if == 0x02 && d.msix.is_some() && d.bars[0].size >= 0x2000
 }
 
-/// Disks l4h can pass through.
+/// Disks l4h can pass through: also, the BARs `start` maps can be.
 pub fn is_disk(d: &pci::Device) -> bool {
-    is_virtio_blk(d) || is_virtio_scsi(d) || is_nvme(d)
+    let bars = if is_nvme(d) {
+        1
+    } else if is_legacy_virtio(d) {
+        0
+    } else {
+        virtio_bar_mask(d)
+    };
+    (is_virtio_blk(d) || is_virtio_scsi(d) || is_nvme(d)) && mappable(d, bars | d.msix.map_or(0, |m| 1 << m.table_bar))
+}
+
+/// Whether BARs `bars` (bit b for BAR b) of `d` are memory `bar_frames`
+/// can map, in `bar_pages` frames: their sizes and addresses are the
+/// device's.
+pub fn mappable(d: &pci::Device, bars: u8) -> bool {
+    (0..6).filter(|b| bars & 1 << b != 0).all(|b| {
+        let bar = d.bars[b];
+        !bar.is_io && bar.size.is_power_of_two() && bar.size <= BAR_STRIDE as u64 && bar.addr % bar.size.max(PAGE as u64) == 0
+    })
 }
 
 pub struct Attachment {
@@ -378,7 +414,6 @@ pub fn start(
     disk: &mut Controller,
     pci: &Pci,
     iommu: &mut Iommu,
-    devmem: &mut DevMem,
     alloc: &mut Alloc,
     win: &mut Window,
     asids: &mut AsidPools,
@@ -398,15 +433,8 @@ pub fn start(
         va: (bar_va(msix.table_bar) + msix.table_offset as usize) as u64,
         len: msix.table_size as u64 * 16,
     };
-    // The BARs to map, bit b for BAR b.
-    let (regions, bars) = if disk.kind == blk::BLKD_NVME {
-        (None, 1u8)
-    } else if legacy_io.is_some() {
-        (None, 0)
-    } else {
-        (Some(virtio_regions(d, bar_va)), virtio_bar_mask(d))
-    };
-    let bars = bars | 1 << msix.table_bar;
+    let regions = (disk.kind != blk::BLKD_NVME && legacy_io.is_none()).then(|| virtio_regions(d, bar_va));
+    let bars = disk.used_bars();
 
     let mut arena = alloc.arena(8 << 20).expect("blkd arena");
 
@@ -477,7 +505,7 @@ pub fn start(
     };
 
     // ---- Device BARs (uncached).
-    map_bar_mask(&comp, alloc, &mut arena, devmem, d, &mut disk.bars, bars, 0, bar_va, &mut keep_slot);
+    map_bar_mask(&comp, alloc, &mut arena, &disk.bars, bars, 0, bar_va, &mut keep_slot);
     for i in 0..n_dma {
         let f = sel4::init_thread::Slot::<cap_type::Granule>::from_index(dma_frames.start + i).cap();
         comp.map_copy(alloc, &mut arena, &abs_of(f), host::DMA_VA + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep_slot());
@@ -507,8 +535,9 @@ pub fn start(
 
 /// Attach a disk of host disk `disk` that blkd allowed in slot `i`
 /// (`checked`), a window or `extents` extents, to one client of its
-/// running shared controller.  Returns the channel frames (the client's)
-/// and a kick capability (in a slot of its own) for the client's l4h-vmm.
+/// running shared controller, whose blkd has been given the client's done
+/// notification.  Returns the channel frames (the client's) and a kick
+/// capability (in a slot of its own) for the client's l4h-vmm.
 #[allow(clippy::too_many_arguments)]
 fn attach(ctrl: &mut Controller, i: usize, disk: usize, client: &mut RootGuest, window: blk::DiskWindow,
     extents: usize, read_only: bool, volatile: bool, alloc: &mut Alloc, iommu: &mut Iommu) -> (Channel, cap::Notification) {
@@ -531,7 +560,6 @@ fn attach(ctrl: &mut Controller, i: usize, disk: usize, client: &mut RootGuest, 
             CapRights::read_write(), VmAttributes::DEFAULT,
             keep.absolute_cptr_from_bits_with_depth((blk::CHANNEL_PAGES + k) as u64, 10)));
     }
-    driver.comp.give_edge(&wiring::BLKD_VMM_DONE, i, 0, &client.vmm_ntfn);
     let kick_slot = alloc.slots.alloc();
     let kick = sel4::init_thread::Slot::<cap_type::Notification>::from_index(kick_slot).cap();
     component::mint_edge(&abs_of(kick), &wiring::VMM_BLKD_KICK, 0, &driver.comp.obj()).expect("blkd kick");
@@ -596,6 +624,14 @@ fn checked(h: &mut Host, c: usize, token: usize, id: usize, instance: u64, disk:
         crate::vmmgr::with_guest(h, id, |h, g| {
             if g.disks.is_full() {
                 return Err(ctl::ENOSPC);
+            }
+            // Client i's completions go to the guest's VMM, given before
+            // anything is allocated for it: a blkd that keeps filling the
+            // slot misbehaves, as one whose answer names a bad slot.
+            let driver = h.ctrls[c].driver.as_ref().expect("started blkd");
+            if driver.comp.give_edge_live(&wiring::BLKD_VMM_DONE, i, 0, &g.vmm_ntfn).is_err() {
+                quarantine(&mut h.ctrls[c], &h.pci);
+                return Err(ctl::EIO);
             }
             let (chan, kick) = attach(&mut h.ctrls[c], i, disk, g, window, n, read_only, volatile, &mut h.alloc, &mut h.iommu);
             g.disks.must_push((c, i));
@@ -843,9 +879,15 @@ const VIRTIO_RESET_MS: u64 = 2000;
 /// and waits until it reads back 0.  Memory (or I/O) decoding is turned on
 /// for this; bus mastering is left as it is, so that DMA the device
 /// finishes while resetting lands in memory that is still the client's.
-/// On failure, marks the disk failed and returns false.
+/// First the BARs `start` maps are carved (`carve_bars`).  On failure,
+/// marks the disk failed and returns false.
 pub fn reset(disk: &mut Controller, pci: &Pci, alloc: &mut Alloc, devmem: &mut DevMem, win: &mut Window, ticks_per_ms: u64) -> bool {
     if disk.failed {
+        return false;
+    }
+    let bars = disk.used_bars();
+    if !carve_bars(alloc, devmem, &disk.pci, &mut disk.bars, bars) {
+        disk.failed = true;
         return false;
     }
     if let Some(base) = disk.legacy_io() {
@@ -876,7 +918,7 @@ pub fn reset(disk: &mut Controller, pci: &Pci, alloc: &mut Alloc, devmem: &mut D
         let c = disk.pci.virtio_caps.iter().find(|c| c.cfg_type == VIRTIO_PCI_CAP_COMMON_CFG).unwrap();
         (c.bar, c.offset as usize + VIRTIO_DEVICE_STATUS)
     };
-    let frame = crate::devmem::granule(bar_frames(alloc, devmem, &disk.pci, &mut disk.bars, bar).start + off / PAGE);
+    let frame = crate::devmem::granule(bar_frames(&disk.bars, bar).start + off / PAGE);
     pci.enable_memory(&disk.pci);
     let ok = win.with_frame_attrs(&abs_of(frame), DEVICE_ATTRS, |page| unsafe {
         let r32 = |o: usize| (page.add(o) as *const u32).read_volatile();
@@ -967,28 +1009,43 @@ pub fn keep_bits(pages: usize) -> usize {
     pages.next_power_of_two().trailing_zeros().max(1) as usize
 }
 
-/// The frames of a device's BARs, carved on first use: their slots, by
-/// BAR.
+/// The frames of a device's BARs (`carve_bars`): their slots, by BAR.
 pub type BarCache = [Option<Range<Slot>>; 6];
 
-/// Map BARs `bars` (bit b for BAR b) of `d` into `comp`, uncached, or
-/// write-combining for those in `wc`.  BAR frames are carved once and
-/// cached in `cache`.
+/// Carve the frames of BARs `bars` (bit b for BAR b) of `d` into `cache`:
+/// whether all could be.  The device names its BARs' addresses, which may
+/// be RAM or memory already carved, another device's BAR included; root
+/// drives a device only once this succeeds, so `bar_frames` always finds
+/// them.
+pub fn carve_bars(alloc: &mut Alloc, devmem: &mut DevMem, d: &pci::Device, cache: &mut BarCache, bars: u8) -> bool {
+    (0..6).filter(|b| bars & 1 << b != 0).all(|b| {
+        let bar = d.bars[b];
+        if cache[b].is_none() && mappable(d, 1 << b) {
+            cache[b] = alloc.slots.global(|slots| devmem.frames(slots, bar.addr as usize, bar.size as usize));
+        }
+        if cache[b].is_none() {
+            log!("l4h-root: pci {:02x}:{:02x}.{}: BAR {} at {:#x} is not free device memory; not driven",
+                d.bus, d.dev, d.func, b, bar.addr);
+        }
+        cache[b].is_some()
+    })
+}
+
+/// Map BARs `bars` (bit b for BAR b, carved into `cache`) into `comp`,
+/// uncached, or write-combining for those in `wc`.
 #[allow(clippy::too_many_arguments)]
 pub fn map_bar_mask(
     comp: &Component,
     alloc: &mut Alloc,
     arena: &mut Arena,
-    devmem: &mut DevMem,
-    d: &pci::Device,
-    cache: &mut BarCache,
+    cache: &BarCache,
     bars: u8,
     wc: u8,
     bar_va: impl Fn(u8) -> usize,
     keep: &mut impl FnMut() -> sel4::AbsoluteCPtr,
 ) {
     for b in (0..6).filter(|b| bars & 1 << b != 0) {
-        let frames = bar_frames(alloc, devmem, d, cache, b);
+        let frames = bar_frames(cache, b);
         let attrs = if wc & 1 << b != 0 { wc_attrs() } else { DEVICE_ATTRS };
         for (i, f) in frames.map(crate::devmem::granule).enumerate() {
             comp.map_copy(
@@ -1004,16 +1061,8 @@ pub fn map_bar_mask(
     }
 }
 
-/// The frames of BAR `b` of `d`, carved on first use and cached in `cache`.
-pub fn bar_frames(alloc: &mut Alloc, devmem: &mut DevMem, d: &pci::Device, cache: &mut BarCache, b: u8) -> Range<Slot> {
-    cache[b as usize]
-        .get_or_insert_with(|| {
-            let bar = d.bars[b as usize];
-            assert!(!bar.is_io && bar.size > 0 && bar.size as usize <= BAR_STRIDE, "virtio BAR {} unusable", b);
-            alloc
-                .slots
-                .global(|slots| devmem.frames(slots, bar.addr as usize, bar.size as usize))
-                .unwrap_or_else(|| panic!("no device untyped for BAR {} at {:#x}", b, bar.addr))
-        })
-        .clone()
+/// The frames of BAR `b`, which `carve_bars` carved into `cache` before
+/// root chose to drive the device.
+pub fn bar_frames(cache: &BarCache, b: u8) -> Range<Slot> {
+    cache[b as usize].clone().expect("BAR carved when its device was chosen")
 }
