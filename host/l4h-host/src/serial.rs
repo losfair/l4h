@@ -574,7 +574,7 @@ impl Input {
         if self.cursor > head {
             self.cursor = head;
         }
-        let oldest = self.ring.ring.oldest_at(head);
+        let oldest = ring::Ring::<CAPACITY, WORDS>::oldest_at(head);
         if self.cursor < oldest {
             self.lost += oldest - self.cursor;
             self.cursor = oldest;

@@ -287,7 +287,10 @@ impl Netd {
                 .as_ref()
                 .is_some_and(|p| unsafe { addr_of!((*p.chan).rx_gso).read_volatile() != 0 }),
             PortId::Uplink(n) => self.nics[n].takes_gso(hdr),
-            PortId::Link(l) => self.links[l].as_ref().is_some_and(|link| link.can_send_gso(len)),
+            // The peer refuses segments under MIN_MSS (an uplink's frames
+            // can have them): those go segmented.
+            PortId::Link(l) => offload::gso_size(hdr) >= offload::MIN_MSS
+                && self.links[l].as_ref().is_some_and(|link| link.can_send_gso(len)),
         }
     }
 
@@ -571,7 +574,7 @@ impl Netd {
                 if self.nics[n].switch.is_none() {
                     continue;
                 }
-                if offload::sanitize_rx(&mut hdr, &frame[..len]) {
+                if offload::sanitize_rx(&mut hdr, &frame[..len], offload::UPLINK_MIN_MSS) {
                     // Merge TCP segments into one GSO frame where possible.
                     if self.gro[n].as_mut().unwrap().add(&frame[..len], &hdr) {
                         continue;

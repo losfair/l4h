@@ -109,8 +109,8 @@ impl<const N: usize, const W: usize> Ring<N, W> {
     /// The oldest sequence a reader can still find, given `head`, which
     /// it read once: a writer can move head at any time, and a reader
     /// whose bounds come from two reads of it can be sent far outside the
-    /// ring's N records.
-    pub fn oldest_at(&self, head: u64) -> u64 {
+    /// ring's N records.  No `self`, so it cannot read head again.
+    pub const fn oldest_at(head: u64) -> u64 {
         head.saturating_sub(N as u64)
     }
 

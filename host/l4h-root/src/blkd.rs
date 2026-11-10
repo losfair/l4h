@@ -531,7 +531,7 @@ fn attach(ctrl: &mut Controller, i: usize, disk: usize, client: &mut RootGuest, 
             CapRights::read_write(), VmAttributes::DEFAULT,
             keep.absolute_cptr_from_bits_with_depth((blk::CHANNEL_PAGES + k) as u64, 10)));
     }
-    driver.comp.give_edge(&wiring::BLKD_VMM_DONE, i, 0, &client.vmm_ntfn);
+    driver.comp.give_edge_live(&wiring::BLKD_VMM_DONE, i, 0, &client.vmm_ntfn);
     let kick_slot = alloc.slots.alloc();
     let kick = sel4::init_thread::Slot::<cap_type::Notification>::from_index(kick_slot).cap();
     component::mint_edge(&abs_of(kick), &wiring::VMM_BLKD_KICK, 0, &driver.comp.obj()).expect("blkd kick");

@@ -292,7 +292,10 @@ Command & Result \\
   \texttt{l4h-netd}, \texttt{l4h-vmmgr} (which embeds \texttt{l4h-vmm}) and
   the root task \texttt{l4h-root}, which embeds the others
   (dom0 is not built in, Chapter~\ref{ch:dom0}). The result is
-  \file{host/target/\allowbreak x86\_64-sel4-roottask/\allowbreak debug/\allowbreak l4h-root.elf}. \\
+  \file{host/target/\allowbreak x86\_64-sel4-roottask/\allowbreak debug/\allowbreak l4h-root.elf},
+  or \file{release/} in place of \file{debug/} with
+  \texttt{L4H\_RELEASE=1} (Section~\ref{sec:release}). The examples in
+  this manual use \file{debug/}. \\
 \cmd{cd tools/l4hctl \&\& cargo build --release} & Builds the static
   \cmd{l4hctl} binary for dom0:
   \file{tools/l4hctl/target/release/l4hctl}. \\
@@ -316,13 +319,22 @@ never built into \texttt{l4h-root}: changing it needs no rebuild
 (Chapter~\ref{ch:dom0}).
 \end{caveat}
 
-\section{Debug and release kernels}
+\section{Debug and release builds}
+\label{sec:release}
 
 \cmd{tools/build-kernel.sh} builds a debug seL4 kernel by default: it checks
 assertions, and prints diagnostics on the serial port. For production, build
 it with \texttt{L4H\_RELEASE=1 tools/build-kernel.sh}, then rebuild the host
-and images. Both builds keep printing on, since the host components log
-through the kernel.
+and images with \texttt{L4H\_RELEASE=1} too. Both builds keep printing on,
+since the host components log through the kernel.
+
+\texttt{L4H\_RELEASE=1} also builds the host components with Cargo's
+release profile, optimised and with integer overflow left unchecked, into
+\file{host/target/\allowbreak x86\_64-sel4-roottask/\allowbreak release/}
+instead of \file{debug/}, and makes them print critical errors only. The
+scripts that package or boot the host (\cmd{tools/mkefi.sh},
+\cmd{tools/mkbios.sh}, \cmd{tools/mkimage.sh}, the tests) read it from
+the directory \texttt{L4H\_RELEASE} selects.
 
 seL4's debug system calls need no capability, and some of them stop the
 machine. The l4h kernel reserves them to host components, so guests cannot

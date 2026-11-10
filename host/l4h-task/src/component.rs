@@ -59,26 +59,15 @@ impl Component {
         self.cnode.absolute_cptr_from_bits_with_depth(idx, self.cnode_bits)
     }
 
-    /// Slot `idx`, emptied first.  A running component can fill its own
-    /// CNode, and a driver is not trusted to leave a slot it is to be given
-    /// empty: a copy or mint into a full slot fails, and the panic would
-    /// stop its parent (root's is the whole host).  Every give goes here.
-    fn target(&self, idx: u64) -> sel4::AbsoluteCPtr {
-        let slot = self.slot(idx);
-        // Deleting an empty slot succeeds; nothing to do if this fails.
-        let _ = slot.delete();
-        slot
-    }
-
     pub fn give(&self, idx: u64, src: impl sel4::HasCPtrWithDepth, rights: CapRights) {
-        self.target(idx)
+        self.slot(idx)
             .copy(&self.local_cnode.absolute_cptr(src), rights)
             .unwrap_or_else(|e| panic!("component {} slot {} copy: {:?}", self.id, idx, e));
     }
 
     /// Give it a CNode, with `guard`: the one mint that is no edge.
     pub fn give_cnode(&self, idx: u64, cnode: cap::CNode, guard: CNodeCapData) {
-        crate::edge::mint_cnode(&self.target(idx), self.local_cnode, cnode, guard)
+        crate::edge::mint_cnode(&self.slot(idx), self.local_cnode, cnode, guard)
             .unwrap_or_else(|e| panic!("component {} slot {} mint: {:?}", self.id, idx, e));
     }
 
@@ -92,9 +81,49 @@ impl Component {
         P: Protocol,
     {
         let idx = self.held(e, n);
-        crate::edge::mint(&self.target(idx), e, i, src)
+        crate::edge::mint(&self.slot(idx), e, i, src)
             .unwrap_or_else(|err| panic!("component {} slot {} ({}: {}) mint: {:?}", self.id, idx, e.name, e.what, err));
         self.minted(e, idx);
+    }
+
+    /// `give_edge` into a component that is already running.  It holds its
+    /// own CNode (SLOT_CNODE), so it may have filled the slot, and may fill
+    /// it again at any time: a full slot is emptied (and logged) and the
+    /// mint tried once more, and if the component refilled it meanwhile it
+    /// goes without the capability (logged) rather than its parent
+    /// panicking.  Only a component that misbehaves loses anything, and only
+    /// what it could have ignored anyway.  The other gives are for a
+    /// component that has not started, where a full slot is the parent's
+    /// own mistake.
+    pub fn give_edge_live<H, T, O, P>(&self, e: &E<H, T, O, P>, n: usize, i: usize, src: &Obj<T, O>)
+    where
+        H: p::IsParty,
+        T: p::IsParty,
+        O: o::IsObject,
+        P: Protocol,
+    {
+        let idx = self.held(e, n);
+        // No `minted` audit: the component can replace it again at once.
+        self.live(idx, e.name, || crate::edge::mint(&self.slot(idx), e, i, src));
+    }
+
+    /// `give` into a running component, as `give_edge_live`.
+    pub fn give_live(&self, idx: u64, src: impl sel4::HasCPtrWithDepth + Copy, rights: CapRights, what: &str) {
+        self.live(idx, what, || self.slot(idx).copy(&self.local_cnode.absolute_cptr(src), rights.clone()));
+    }
+
+    /// Put into slot `idx` of a running component with `put`, replacing
+    /// once what it holds there (`give_edge_live`).
+    fn live(&self, idx: u64, what: &str, put: impl Fn() -> sel4::Result<()>) {
+        let mut r = put();
+        if r == Err(sel4::Error::DeleteFirst) {
+            log!("component {} slot {} ({}): not empty, replacing what the component put there", self.id, idx, what);
+            let _ = self.slot(idx).delete();
+            r = put();
+        }
+        if let Err(err) = r {
+            log!("component {} slot {} ({}): not given ({:?}); the component goes without it", self.id, idx, what, err);
+        }
     }
 
     /// Pass on to it a capability of `e`, which this component holds, that
@@ -108,7 +137,7 @@ impl Component {
         P: Protocol,
     {
         let idx = self.held(e, n);
-        self.target(idx)
+        self.slot(idx)
             .copy(&self.local_cnode.absolute_cptr(minted), crate::edge::rights(e))
             .unwrap_or_else(|err| panic!("component {} slot {} ({}: {}) copy: {:?}", self.id, idx, e.name, e.what, err));
         self.minted(e, idx);

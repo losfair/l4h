@@ -57,7 +57,7 @@ impl Ring {
         let head = self.ring.head();
         let end = if end == 0 { head } else { end.min(head) };
         if cursor > end { return None; }
-        let oldest = self.ring.oldest_at(head);
+        let oldest = ring::Ring::<CAPACITY, WORDS>::oldest_at(head);
         let mut next = cursor.max(oldest).min(end);
         let mut lost = next - cursor;
         let mut len = 0;

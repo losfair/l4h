@@ -271,9 +271,10 @@ impl Vmmgr {
         let instance = self.guest(id).ok_or(ctl::ENOENT)?.instance;
         self.with_guest(id, |h, g| {
             // Like every other attach path (attach_usb, create_nic, ...):
-            // refuse once the VMM is spawned.  Otherwise the deferred answer
-            // can land after VmmReady has started the guest, when add_disk
-            // can no longer add a device.
+            // refuse once start_guest has spawned the VMM, which took the
+            // devices there were then: a disk added before VmmReady would
+            // be one it never serves.  (start_guest refuses while
+            // root_pending, so no answer can come after the VMM is spawned.)
             if g.state != State::Created || g.vmm.is_some() || g.root_pending {
                 return Err(ctl::EBUSY);
             }

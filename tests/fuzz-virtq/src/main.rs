@@ -388,35 +388,30 @@ fn offload_check(rng: &mut Rng, n: u64) -> u64 {
     segs
 }
 
-/// No GSO frame in netd has a gso_size under MIN_MSS, which would have
-/// `segment` cut one frame into tens of thousands of packets: `sanitize`
-/// refuses one, `segment` drops one whatever its header says, and `Gro`
-/// starts no run with a shorter segment.
+/// A sender netd does not trust (a guest: `sanitize`; a peer partition:
+/// `sanitize_rx` with MIN_MSS) cannot have it segment one frame into tens
+/// of thousands of packets with a tiny gso_size.  An uplink's frames keep
+/// the size the device gave them (`UPLINK_MIN_MSS`), however small: they
+/// segment into no more packets than it received.
 fn min_mss_check(rng: &mut Rng) {
     let mut buf = vec![0u8; 70000];
     for v6 in [false, true] {
         for mss in [1, offload::MIN_MSS - 1] {
-            let (frame, mut hdr) = tcp_frame(rng, v6, false, 60000, mss);
-            let mut sanitized = hdr;
-            assert!(!offload::sanitize(&mut sanitized, &frame), "gso_size {mss} accepted");
-            hdr[0] = offload::F_NEEDS_CSUM;
-            let mut n = 0;
-            offload::segment(&frame, &hdr, &mut buf, |_, _| n += 1);
-            assert_eq!(n, 0, "gso_size {mss} segmented");
+            let (frame, hdr) = tcp_frame(rng, v6, false, 60000, mss);
+            assert!(!offload::sanitize(&mut hdr.clone(), &frame), "guest gso_size {mss} accepted");
+            assert!(!offload::sanitize_rx(&mut hdr.clone(), &frame, offload::MIN_MSS), "link gso_size {mss} accepted");
         }
-        let (mut frame, mut hdr) = tcp_frame(rng, v6, false, offload::MIN_MSS + 10, offload::MIN_MSS);
-        let t = offload::parse_tcp(&frame).unwrap();
-        frame[t.tcp + 13] = 0x10;
+        let (frame, mut hdr) = tcp_frame(rng, v6, false, offload::MIN_MSS, offload::MIN_MSS);
         assert!(offload::sanitize(&mut hdr, &frame), "gso_size MIN_MSS refused");
-        let mut segs: Vec<Vec<u8>> = Vec::new();
-        offload::segment(&frame, &hdr, &mut buf, |f, _| segs.push(f.to_vec()));
-        assert_eq!(segs.len(), 2);
-        // A full segment starts a run; the 10-byte one alone does not.
-        let rx = [0u8; 12];
-        let mut gro = offload::Gro::new();
-        assert!(gro.add(&segs[0], &rx), "MIN_MSS segment not merged");
-        let mut gro = offload::Gro::new();
-        assert!(!gro.add(&segs[1], &rx), "segment under MIN_MSS started a run");
+        // An uplink frame of 10 one-byte segments segments back into 10.
+        let (frame, mut hdr) = tcp_frame(rng, v6, false, 10, 1);
+        assert!(offload::sanitize_rx(&mut hdr, &frame, offload::UPLINK_MIN_MSS), "uplink gso_size 1 refused");
+        let mut n = 0;
+        offload::segment(&frame, &hdr, &mut buf, |f, _| {
+            assert_eq!(f.len(), offload::parse_tcp(&frame).unwrap().hdrs + 1);
+            n += 1;
+        });
+        assert_eq!(n, 10);
     }
 }
 
