@@ -127,7 +127,8 @@ impl Dma {
     /// Zeroed memory: (virtual address, physical address).
     pub fn alloc(&mut self, size: usize, align: usize) -> (usize, u64) {
         let off = (self.used + align - 1) & !(align - 1);
-        assert!(off + size <= self.size, "out of DMA memory");
+        // Sizes can derive from device registers: no `off + size` to wrap.
+        assert!(off <= self.size && size <= self.size - off, "out of DMA memory");
         self.used = off + size;
         unsafe { core::ptr::write_bytes((self.va + off) as *mut u8, 0, size) };
         (self.va + off, self.paddr + off as u64)
