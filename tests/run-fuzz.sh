@@ -10,6 +10,7 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 out=$root/build/usbtest
 mkdir -p "$out"
 rustc +stable --edition=2024 --crate-type rlib --crate-name l4h_abi "$root/host/l4h-abi/src/lib.rs" -o "$out/libl4h_abi.rlib"
-rustc +stable --edition=2024 --test "$root/tests/usb.rs" --extern l4h_abi="$out/libl4h_abi.rlib" -o "$out/unit-tests"
+rustc +stable --edition=2024 --crate-type rlib --crate-name l4h_host "$root/host/l4h-host/src/lib.rs" --extern l4h_abi="$out/libl4h_abi.rlib" -o "$out/libl4h_host.rlib"
+rustc +stable --edition=2024 --test "$root/tests/usb.rs" --extern l4h_abi="$out/libl4h_abi.rlib" --extern l4h_host="$out/libl4h_host.rlib" -L "$out" -o "$out/unit-tests"
 "$out/unit-tests" -q
 (cd "$root/tests/fuzz-usbreq" && cargo +stable run -q -- "${1:-200000}")
