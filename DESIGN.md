@@ -3845,7 +3845,11 @@ one kernel and its components are; nothing defends one partition against
 another beyond correct static assignment. Partitioning is for scaling past
 the big kernel lock (§11.2 is the Xen alternative) and to keep partitions
 from disturbing each other by accident, not a security boundary; guest
-isolation inside each partition is unchanged.
+isolation inside each partition is unchanged. The boot shim is trusted as
+the boot loader and kernel images are: root takes its descriptor's values
+(the clock epoch, the ECAM base, channel and ring sizes, the PCI lists) as
+given, before any kernel runs, without the checks it applies to firmware
+tables, devices and the shared pages another partition writes.
 
 **Boot shim.** `boot/l4h-mkshim` (built with `tools/build-mkshim.sh`) is a
 freestanding multiboot1/multiboot2 image that GRUB (or QEMU's `-kernel`)
