@@ -291,6 +291,7 @@ pub struct Ena {
     pub csum: bool,
     pub tso: bool,
     regs: Mmio,
+    regs_len: usize,
     tsc_hz: u64,
     /// The readless response (struct ena_admin_ena_mmio_req_read_less_resp),
     /// if registers are read so.
@@ -358,6 +359,7 @@ impl Ena {
             csum: false,
             tso: false,
             regs,
+            regs_len: c.regs.len as usize,
             tsc_hz,
             readless: (c.revision & REVISION_NO_READLESS == 0).then_some(resp),
             mmio_seq: 0,
@@ -747,7 +749,7 @@ impl Ena {
                 .u32(8, IO_VECTOR)
                 .addr(12, pa),
         );
-        (le16(&r, 8), self.regs.0 + le32(&r, 20) as usize)
+        (le16(&r, 8), self.reg_at(le32(&r, 20)))
     }
 
     /// Create a submission queue with a completion for each frame (Linux's
@@ -764,7 +766,16 @@ impl Ena {
                 .u16(10, depth)
                 .addr(12, pa),
         );
-        (le16(&r, 8), self.regs.0 + le32(&r, 12) as usize, le32(&r, 16))
+        (le16(&r, 8), self.reg_at(le32(&r, 12)), le32(&r, 16))
+    }
+
+    /// A register the device names by its offset (a doorbell, an unmask
+    /// register): netd writes it, so it must be in BAR 0.
+    fn reg_at(&self, off: u32) -> usize {
+        if off as usize + 4 > self.regs_len {
+            panic!("netd: NIC {}: ENA register at {:#x} outside BAR 0 ({} KiB)", self.n, off, self.regs_len >> 10);
+        }
+        self.regs.0 + off as usize
     }
 
     /// Send every received frame to RX queue `sq` (Linux sets the table
@@ -775,6 +786,12 @@ impl Ena {
             return;
         };
         let log = RSS_TABLE_LOG.clamp(le16(&t, 8), le16(&t, 10).max(le16(&t, 8)));
+        // The device's minimum can be any u16: past 15 the shift and size
+        // below would wrap.
+        if log > 15 {
+            l4h_rt::log!("netd: NIC {}: ENA RSS table of 2^{} entries: default table kept", self.n, log);
+            return;
+        }
         let len = (1usize << log) * 4;
         let (va, pa) = dma.alloc(len, 64);
         for i in 0..1 << log {

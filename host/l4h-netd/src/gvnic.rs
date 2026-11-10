@@ -353,8 +353,17 @@ impl Gvnic {
                 .u32(28, 0)
                 .u8(32, QUEUE_FORMAT_DQO_RDA),
         );
+        // Doorbell indices the device writes: netd writes the doorbells,
+        // so they must be in BAR 2.
+        let db_index = |va: usize| {
+            let i = u32::from_be(unsafe { read_volatile(va as *const u32) });
+            if i as u64 * 4 + 4 > c.doorbells.len {
+                panic!("netd: NIC {}: gVNIC doorbell {} outside BAR 2 ({} KiB)", n, i, c.doorbells.len >> 10);
+            }
+            i
+        };
         for (db, blk) in g.irq_db.iter_mut().zip([tx_blk, rx_blk]) {
-            *db = u32::from_be(unsafe { read_volatile((irq_db_va + blk * IRQ_DB_STRIDE) as *const u32) });
+            *db = db_index(irq_db_va + blk * IRQ_DB_STRIDE);
         }
         // Packet types: which received frames had their checksums checked.
         let (ptype_va, ptype_pa) = dma.alloc(NUM_PTYPES * 2, 4096);
@@ -397,7 +406,7 @@ impl Gvnic {
                 .u16(40, tx_entries as u16)
                 .u16(42, tx_entries as u16),
         );
-        g.tx_db = u32::from_be(unsafe { read_volatile(tx_res as *const u32) });
+        g.tx_db = db_index(tx_res);
 
         // RX queue.  At most one buffer per completion slot is posted.
         let (rx_bufq, rx_bufq_pa) = dma.alloc(rx_entries as usize * RX_DESC, 4096);
@@ -420,7 +429,7 @@ impl Gvnic {
                 .u16(46, RX_BUF as u16)
                 .u16(48, rx_entries as u16),
         );
-        g.rx_db = u32::from_be(unsafe { read_volatile(rx_res as *const u32) });
+        g.rx_db = db_index(rx_res);
         for id in 0..g.rx_bufs.len() as u16 {
             g.post_rx(id);
         }

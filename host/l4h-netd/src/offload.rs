@@ -193,7 +193,8 @@ pub fn segment(frame: &[u8], hdr: &[u8; HDR_SIZE], buf: &mut [u8], mut emit: imp
     let Some(f) = parse_tcp(frame) else { return };
     let mss = get16(hdr, 4);
     let payload = &frame[f.hdrs..];
-    if mss == 0 || f.hdrs + mss > buf.len() {
+    // A segment's IP length must fit its 16 bits (a slot holds more).
+    if mss == 0 || f.hdrs + mss > buf.len() || f.hdrs - f.ip + mss.min(payload.len()) > 0xffff {
         return;
     }
     let seq0 = u32::from_be_bytes(frame[f.tcp + 4..f.tcp + 8].try_into().unwrap());
