@@ -139,6 +139,9 @@ pub struct Device {
     pub common: Mmio,
     pub notify: Mmio,
     pub notify_mult: u32,
+    /// Bytes of the notify structure, which every queue's doorbell must be
+    /// in: its offset is the device's.
+    pub notify_len: usize,
     pub device: Mmio,
 }
 
@@ -206,7 +209,12 @@ impl Device {
         if self.common.r16(QUEUE_MSIX_VECTOR) != vector {
             return None;
         }
+        // Both factors are the device's (16 and 32 bits: no overflow), and
+        // the driver writes the doorbell: inside the notify structure.
         let notify_off = self.common.r16(QUEUE_NOTIFY_OFF) as usize * self.notify_mult as usize;
+        if notify_off.checked_add(2).is_none_or(|end| end > self.notify_len) {
+            return None;
+        }
         self.common.w16(QUEUE_ENABLE, 1);
         Some(Virtq {
             idx,

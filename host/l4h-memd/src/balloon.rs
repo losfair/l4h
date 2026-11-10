@@ -70,6 +70,7 @@ impl Balloon {
             common: Mmio(BalloonConfig::va(cfg.common)),
             notify: Mmio(BalloonConfig::va(cfg.notify)),
             notify_mult: cfg.notify_mult as u32,
+            notify_len: cfg.notify_len as usize,
             device: Mmio(BalloonConfig::va(cfg.device)),
         };
         dev.reset();

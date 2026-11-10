@@ -30,10 +30,15 @@ pub const fn rx_queue_size(pool: usize, nics: usize) -> u32 {
 }
 
 /// The smallest power-of-two I/O pool, at least `min`, that gives each of
-/// `nics` virtio-net devices a full receive queue (RX_QUEUE_MAX).
+/// `nics` virtio-net devices a full receive queue (RX_QUEUE_MAX); usize::MAX
+/// for more NICs than an address space could hold pools for (the count can
+/// be the config file's: callers cap the result).
 pub const fn for_nics(nics: usize, min: usize) -> usize {
-    let standing = nics * (RX_QUEUE_MAX as usize / RX_BUF_DESCS) * RX_BUF_BYTES;
-    let pool = (2 * standing).next_power_of_two();
+    let standing = nics.saturating_mul((RX_QUEUE_MAX as usize / RX_BUF_DESCS) * RX_BUF_BYTES);
+    let pool = match standing.saturating_mul(2).checked_next_power_of_two() {
+        Some(pool) => pool,
+        None => usize::MAX,
+    };
     if pool > min { pool } else { min }
 }
 
@@ -61,5 +66,7 @@ mod tests {
         assert_eq!(rx_queue_size(for_nics(3, 4 << 20), 3), RX_QUEUE_MAX);
         assert_eq!(for_nics(1, 4 << 20), 4 << 20);
         assert_eq!(for_nics(0, 4 << 20), 4 << 20);
+        assert_eq!(for_nics(usize::MAX, 4 << 20), usize::MAX);
+        assert_eq!(for_nics(usize::MAX / RX_BUF_BYTES, 4 << 20), usize::MAX);
     }
 }

@@ -227,6 +227,9 @@ crate::wire_struct! {
         /// A legacy device: the base of its I/O ports, in
         /// SLOT_BALLOON_IOPORT (the others are then 0); 0 for a modern one.
         pub legacy_io: u64,
+        /// Bytes of the notify structure (the device's queue doorbells
+        /// must be in it).
+        pub notify_len: u64,
     }
 }
 
@@ -259,12 +262,13 @@ mod tests {
         assert_eq!(r(2, &[0], Sender::Vmmgr), Ok(2));
         assert_eq!(r(3, &[0, 1, 1, 0], Sender::Vmmgr), Ok(3));
         assert_eq!(r(5, &[0, 0, 0], Sender::Vmmgr), Ok(5));
-        assert_eq!(r(7, &[0; 6], Sender::Root), Ok(7));
+        // Balloon: 7 words since notify_len.
+        assert_eq!(r(7, &[0; 7], Sender::Root), Ok(7));
         assert_eq!(r(18, &[], Sender::Vmm(3)), Ok(18));
         // What memd refused before: guest calls from root, root's from
         // vmmgr, anything but hotplug from a VMM.
         assert_eq!(r(3, &[0, 1, 1, 0], Sender::Root), Err(crate::wire::EINVAL));
-        assert_eq!(r(7, &[0; 6], Sender::Vmmgr), Err(crate::wire::EINVAL));
+        assert_eq!(r(7, &[0; 7], Sender::Vmmgr), Err(crate::wire::EINVAL));
         assert_eq!(r(1, &[21, 1], Sender::Vmm(0)), Err(crate::wire::EINVAL));
         assert_eq!(r(16, &[0], Sender::Vmmgr), Err(crate::wire::EINVAL));
         assert_eq!(call::Request::MAX_WORDS, 1 + 2 * XCHG_SLOTS);

@@ -1,7 +1,5 @@
-#[allow(dead_code)]
-#[path = "../host/l4h-host/src/blk.rs"]
-mod blk;
-use blk::*;
+use l4h_host::blk::*;
+use l4h_host::errno::{EBUSY, EINVAL, ENOSPC};
 
 fn pool() -> Pool { Pool { gpa: 0x8000000, paddr: 0x10000000, size: 4 << 20 } }
 fn window() -> DiskWindow { DiskWindow::new(2048, 16384, 131072).unwrap() }
