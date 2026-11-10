@@ -3042,28 +3042,39 @@ requests distinguish power off, reboot and kernel panic.
   logd, memd, trustd, the flags server, vmmgr, netd, a blkd per disk
   controller, a usbd per xHCI controller, a VMM per guest) has a lane of its
   own, in pages of its own, fixed at start in a static of root's (780 KiB):
-  255 records for root, 63 for vmmgr, 15 for each other service and 7 for
-  each driver and VMM, each record at most 480 bytes with an explicit
-  truncation marker. A component maps only its own lane, writable; root
-  gives vmmgr the VMMs' lanes, for it to give each VMM its own, and maps
-  all of them read-only into vmmgr for `CTL_LOG_READ`. A record holds its
-  text and time; the reader adds the time since boot, from a clock only
-  root writes, and the component id, from the lane the record is in: a
-  component can neither write a line another's id is printed on nor
-  overwrite or erase another's records, and fills only its own lane. A
-  guest id's VMM lane is the next VMM's of that id; destroying a VM
-  neither revokes the lanes nor clears vmmgr's diagnostics about it. Logs
-  do not survive a host reboot.
-- The reader merges the lanes by time: a read returns the records of
-  [cursor, end), oldest first, ending a moment (100 ms) before now, so that
-  a record still being committed falls in the next read rather than
-  between two; the records of one time are never split between two reads.
-  A record's time is its writer's to choose: one in the future waits, one in
-  the past is missed by a follower, and either is only its writer's loss.
-  Lost counts the slots a read finds unavailable between a lane's records,
-  and, from boot, what was overwritten; a lane that a follower's read finds
-  overwritten since its last record counts as at least one. Each read scans
-  every lane's slots once per record it returns, at most 1984 bytes of them.
+  255 records for root, 63 for vmmgr, 15 for each other service and 7 for each
+  driver and VMM, each record at most 480 bytes with an explicit truncation
+  marker. A component maps only its own lane, writable; root gives vmmgr the
+  VMMs' lanes, for it to give each VMM its own, and maps all of them read-only
+  into vmmgr for `CTL_LOG_READ`. A record holds its text and time; the reader
+  adds the time since boot, from a clock only root writes, and the writer's
+  id, from the lane the record is in (the component id; `0x1000 + g` for guest
+  g's VMM, whose component id is its guest's and would be root's 0 for guest
+  0): a component can neither write a line another's id is printed on nor
+  overwrite or erase another's records, and fills only its own lane. A guest
+  id's VMM lane is the next VMM's of that id; destroying a VM neither revokes
+  the lanes nor clears vmmgr's diagnostics about it. A component takes its
+  lane over when it starts (`ring::View::adopt`): one left as no honest writer
+  leaves it (a head near the end of the sequences, a slot claimed by a
+  sequence that is not there yet, a record of a time still to come) is reset,
+  so the last VMM of a guest id can neither make the next one's records drop
+  nor leave one to come up later as the next one's; readers count what a reset
+  took as lost. Logs do not survive a host reboot.
+- The reader merges the lanes by time: a read returns the records of [cursor,
+  end), oldest first, ending a moment (100 ms) before now, so that a record
+  still being committed falls in the next read rather than between two; the
+  records of one time are never split between two reads. A record's time is
+  its writer's to choose: one in the future waits, one in the past is missed
+  by a follower, and either is only its writer's loss. Lost counts the slots a
+  read finds unavailable between a lane's records, and, from boot, what was
+  overwritten (2^32 at most for a lane, whose head is its writer's word, so no
+  lane's number can bring the count to its end and hide the others'); a lane
+  that a follower's read finds overwritten since its last record counts as at
+  least one. Each read scans every lane's slots once per record it takes,
+  returned (at most 1984 bytes of them) or unavailable, and takes no more
+  records of a lane than it has slots: a writer that keeps committing records
+  as the reader goes is left out of the rest of that read, which ends after at
+  most as many scans as the lanes have slots and moves a follower past it.
 - Writers format on their own stack and publish with atomic memory
   operations, without allocating, making an IPC or touching message
   registers, and never wait on a lock: a writer preempted or faulting in a
@@ -3802,53 +3813,70 @@ a line.
   that does not fit takes consecutive slots, flagged as going on, and a
   reader prints them next to each other.
 - **Lanes.** In partition 0 the ring is root's alone. Every other writer
-  (`log::Writer`) has a lane of its own (`serial::Lanes`, 1.6 MiB in a
-  static of root's, fixed at start): dom0's VMM one as deep as the ring,
-  for dom0's console; each other VMM 63 records, for its guest's console;
-  vmmgr 31; every other component 15. A component maps only its own lane,
-  writable, at the address where a secondary's tasks map their ring; root
-  gives vmmgr the VMMs' lanes, for it to give each VMM its own, and maps
-  every lane into logd read-only. logd prints whose a line is from the lane
-  it is in, never from the record: root's lines and dom0's console have no
-  prefix; a VMM's guest console `[vmN] `, with N its guest's, whatever the
-  record claims; and every other writer's lines its name: `[netd] `,
-  `[blkd3] `, `[vmm2] `, `[dom0 vmm] `. A component can neither print a
-  line that passes for another's nor overwrite or erase another's: it fills
-  only its own lane. A secondary partition has one ring for all its tasks,
-  in the shared region the partition descriptor gives it (one ring's
-  room), and partition 0 prints its lines as `[pN] `: within a secondary a
-  task can still pass for, or overwrite, another (partitions are not a
-  security boundary, §11.4), never for partition 0's.
+  (`log::Writer`) has a lane of its own (`serial::Lanes`, 1.6 MiB in a static
+  of root's, fixed at start): dom0's VMM one as deep as the ring, for dom0's
+  console; each other VMM 63 records, for its guest's console; vmmgr 31; every
+  other component 15. A component maps only its own lane, writable, at the
+  address where a secondary's tasks map their ring; root gives vmmgr the VMMs'
+  lanes, for it to give each VMM its own, and maps every lane into logd
+  read-only. logd prints whose a line is from the lane it is in, never from
+  the record: root's lines and dom0's console have no prefix; a VMM's guest
+  console `[vmN] `, with N its guest's, whatever the record claims; and every
+  other writer's lines its name: `[netd] `, `[blkd3] `, `[vmm2] `, `[dom0 vmm]
+  `. A component can neither print a line that passes for another's nor
+  overwrite or erase another's: it fills only its own lane. The next VMM of a
+  guest id resets a lane its last one left unusable, as in the log
+  (`serial::init_lane`; a ring as deep as root's, which may be a secondary's
+  shared one, only for a wrong head or slot, not for a record's time), and
+  logd reads a lane whose head moved back from the oldest record it holds, so
+  the new writer's first lines print. A secondary partition has one ring for
+  all its tasks, in the shared region the partition descriptor gives it (one
+  ring's room), and partition 0 prints its lines as `[pN] `: within a
+  secondary a task can still pass for, or overwrite, another (partitions are
+  not a security boundary, §11.4), never for partition 0's.
 - **Printable text.** logd hands on a record's text, and a kernel console
-  line, only as text (`log::printable`, also what `l4hctl logs` reads):
-  tabs and line ends become spaces, other control characters, escape
-  sequences included, and bytes that are not UTF-8 become `?`. Guest names
-  that root's monitor or vmmgr prints, and a guest's console, cannot move
-  the terminal's cursor over another line or pass for another writer's.
+  line, only as text (`log::printable`, also what `l4hctl logs` reads): tabs
+  and line ends become spaces, and other control characters (C0, DEL and C1,
+  escape sequences included), the line and paragraph separators, the controls
+  of bidirectional text and bytes that are not UTF-8 become `?`. The text is
+  for a terminal that reads UTF-8: one that reads single bytes takes some
+  bytes of a character for C1 controls. Guest names that root's monitor or
+  vmmgr prints, and a guest's console, cannot move the terminal's cursor over
+  another line or pass for another writer's.
 - **Writers.** `log!` and printing `info!` write the writer's serial ring or
   lane as well as its log lane. A VMM gathers its guest's console by line,
   and sends what it has of one after 100 ms, so that prompts show. Panic
   text is gathered by line. The ring's timestamps are not printed.
-- **logd** wakes on a 10 ms timer, since writers cannot wake it. `Merge`
-  (also in `l4h_host::serial`) prints the record with the lowest timestamp
-  of any ring, then lines of kernel console rings. A record claimed and not
-  committed gets 100 ms; `(N lines lost)` reports what was overwritten or
-  skipped. Each partition has 64 records or reports of a pass, which bounds
-  what a ring claiming to hold the oldest record can do, and a pass ends
-  only when nothing is left to print. Partition 0's home ring and lanes
-  share theirs: its lines go out oldest first, as from the one ring it had,
-  so a line printed after a guest's (vmmgr's "all guests stopped") follows
-  what the guest printed before it. It has 5 more for the rest of a line it
-  has started, the length of the longest message; a longer line can split
-  where a pass ends. logd waits for the rest of a line only from root's
-  ring: another writer could ask for 100 ms every time, and another
-  ring's `(N lines lost)` waits for the end of a line. logd turns on
-  the UART's FIFO, which seL4 leaves off on a 16550, and sends 15 bytes when
-  it finds the FIFO empty, leaving room for a byte of the kernel's, or one
-  byte without a FIFO. It sleeps on `seL4_TCB_SetTimer` while the UART
-  sends, 1.4 ms at 115200 baud, and a record only counts as printed once
-  its last byte has left the shift register. Root keeps the port's receive
-  side and interrupt.
+- **logd** wakes on a 10 ms timer, since writers cannot wake it. `Merge` (also
+  in `l4h_host::serial`) prints the record with the lowest timestamp of any
+  ring, then lines of kernel console rings. A record claimed and not committed
+  gets 100 ms; `(N lines lost)` reports what was overwritten or skipped. Each
+  partition has 64 records or reports of a pass, which bounds what a ring
+  claiming to hold the oldest record can do, and a pass ends only when nothing
+  is left to print. Partition 0's home ring and lanes share theirs: its lines
+  go out oldest first, as from the one ring it had, so a line printed after a
+  guest's (vmmgr's "all guests stopped") follows what the guest printed before
+  it. A lane's times, lines and losses are its writer's to make up, so within
+  that budget a lane's record takes its turn at its time or, if later, at the
+  time logd saw the lane without it (a writer reads the time once it has
+  claimed its records, so an honest record's is later anyway; a lane that
+  always claims the oldest time waits behind what was already there, and at
+  most twice its slots of backdated records get ahead of another's line); the
+  rest of a lane's open line comes first for 128 records, more than the
+  longest line a guest's tools print (an attestation's evidence), and then
+  takes its turn by time, so a line without an end is cut by an older line;
+  and an input's loss is reported once in a pass. Honest writers' lines keep
+  the order of their times through all three, which a share of the budget for
+  each lane would not. It has 5 more for the rest of a line it has started,
+  the length of the longest message; a longer line can split where a pass
+  ends. logd waits for the rest of a line only from root's ring: another
+  writer could ask for 100 ms every time, and another ring's `(N lines lost)`
+  waits for the end of a line. logd turns on the UART's FIFO, which seL4
+  leaves off on a 16550, and sends 15 bytes when it finds the FIFO empty,
+  leaving room for a byte of the kernel's, or one byte without a FIFO. It
+  sleeps on `seL4_TCB_SetTimer` while the UART sends, 1.4 ms at 115200 baud,
+  and a record only counts as printed once its last byte has left the shift
+  register. Root keeps the port's receive side and interrupt.
 - **Port.** On x86_64, logd uses the `serial_port` setting unless no UART
   answers there: then COM1, where the kernel prints unless told otherwise.
   On aarch64 it is the PL011 of QEMU's virt machine, whose registers root

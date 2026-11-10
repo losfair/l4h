@@ -169,6 +169,12 @@ const PASS_RECORDS: u32 = 64;
 /// the records of the longest message. Longer lines can split where a pass
 /// ends, or a line without an end would have no bound.
 const LINE_RECORDS: u32 = MESSAGE_MAX.div_ceil(TEXT_SIZE) as u32;
+/// The records of a lane's open line that come before another input's
+/// older line: more than the longest line a guest's tools print (an
+/// attestation's evidence in hex, 16 KiB). The rest of a longer line takes
+/// its turn by time, or a line without an end would keep the others, root
+/// too, waiting for good.
+const LANE_LINE_RECORDS: u32 = 128;
 const KERNEL_LINE_MAX: usize = 160;
 /// A line handed out: its text and what `next` puts around it.
 pub const LINE_MAX: usize = if TEXT_SIZE > KERNEL_LINE_MAX { TEXT_SIZE } else { KERNEL_LINE_MAX } + 48;
@@ -674,8 +680,8 @@ impl Merge {
     ///   reader saw the lane without it if that is later (`Input::time`):
     ///   a record written now with an old time comes after what was
     ///   already waiting;
-    /// - the rest of a lane's open line comes first for `LINE_RECORDS`
-    ///   records, the longest message, and then takes its turn by time, so
+    /// - the rest of a lane's open line comes first for
+    ///   `LANE_LINE_RECORDS` records, and then takes its turn by time, so
     ///   that a line without an end is cut by an older line of another's;
     /// - an input's loss is reported once in a pass, however often it is
     ///   overwritten while the port sends.
@@ -704,7 +710,7 @@ impl Merge {
             match peek {
                 Peek::Ready(r) => {
                     let lane = matches!(i.label, Label::Lane(_));
-                    let rest = self.open == Some((k, (r.meta >> SOURCE_SHIFT) as u32)) && !(lane && self.run >= LINE_RECORDS);
+                    let rest = self.open == Some((k, (r.meta >> SOURCE_SHIFT) as u32)) && !(lane && self.run >= LANE_LINE_RECORDS);
                     if rest {
                         continues = true;
                     } else if self.budgets[i.group] <= LINE_RECORDS {
@@ -1362,18 +1368,29 @@ mod tests {
         };
         chunk();
         assert_eq!(drain(&mut m, 2), "[vm3] x");
-        for _ in 0..20 {
-            // Root's line is older than the rest of the guest's, which
-            // comes first only for the records of the longest message.
+        for round in 0..5 {
+            // Root's line is older than the rest of the guest's, of which
+            // there is more after every line printed: it comes first for
+            // so many records, and no more.
             home.write(0, 0, b"home", false);
             chunk();
-            let before = lines_before_home(&mut m, time.get(), chunk);
-            assert!(before.is_some_and(|n| n <= LINE_RECORDS as usize), "{before:?}");
+            let (mut before, mut printed) = (0, false);
+            for _ in 0..10 {
+                m.pass(|| time.get(), |line| {
+                    printed |= line.ends_with(b"home\r\n");
+                    before += !printed as u32;
+                    chunk();
+                });
+                if printed {
+                    break;
+                }
+            }
+            assert!(printed && before <= LANE_LINE_RECORDS, "round {round}: {before} lines, printed: {printed}");
         }
     }
 
     #[test]
-    fn a_lanes_message_is_not_cut_by_an_older_line() {
+    fn a_long_line_of_a_lane_is_not_cut_by_an_older_line() {
         let (home, lanes) = (ring(), lanes());
         let mut m = Merge::new(home, GRACE);
         m.add_lanes(lanes);
@@ -1385,6 +1402,14 @@ mod tests {
         home.write(3, 0, b"home", false);
         lanes.write(Writer::Vmmgr, 4, 0, &long.as_bytes()[TEXT_SIZE..], false);
         assert_eq!(drain(&mut m, 5), std::format!("{}\r\nhome\r\n", &long[TEXT_SIZE..]));
+        // An attestation's evidence in hex on dom0's console, which a test
+        // reads as one line: more records than a pass has.
+        let long = "f".repeat(2 * 8192 + 20);
+        lanes.write(Writer::Dom0, 6, SOURCE_DOM0, &long.as_bytes()[..TEXT_SIZE], true);
+        assert_eq!(drain(&mut m, 7), &long[..TEXT_SIZE]);
+        home.write(8, 0, b"home", false);
+        lanes.write(Writer::Dom0, 9, SOURCE_DOM0, &long.as_bytes()[TEXT_SIZE..], false);
+        assert_eq!(drain(&mut m, 10), std::format!("{}\r\nhome\r\n", &long[TEXT_SIZE..]));
     }
 
     #[test]
