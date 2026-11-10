@@ -1290,7 +1290,9 @@ pub fn create(
 /// the kernel is the host's.  Returns false if the parameters are bad or
 /// the image does not fit.
 pub fn boot(g: &mut Guest, alloc: &mut Alloc, win: &mut Window, host_info: &HostInfo, kernel: &Kernel, initrd: (usize, usize), cmdline: &[u8]) -> bool {
-    let within = |(gpa, len): (usize, usize)| gpa >= initrd.0 && gpa + len <= initrd.0 + initrd.1;
+    // dom0 chose the initrd's range.
+    let Some(initrd_end) = initrd.0.checked_add(initrd.1) else { return false };
+    let within = |(gpa, len): (usize, usize)| gpa >= initrd.0 && gpa + len <= initrd_end;
     if g.ram_base != kernel.ram_base || (initrd.1 != 0 && initrd.0 < kernel.end) || !g.loaded.iter().all(within) {
         return false;
     }

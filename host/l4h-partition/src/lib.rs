@@ -412,17 +412,20 @@ impl MsgRing {
         let len = 8 + n as u64;
         let room = len.next_multiple_of(8);
         assert!(room <= Self::max_room(self.cap), "channel message too large");
-        let mut head = self.head();
-        let pos = head % self.cap;
+        // The peer can write the header too: whatever the count, the
+        // message (and padding) stays inside the ring.  Counts are
+        // multiples of 8, as cap is.
+        let mut head = self.head() & !7;
+        let mut pos = head % self.cap;
         if pos + room > self.cap {
             // The rest of the ring is padding.
             unsafe {
                 (self.data(pos) as *mut u32).write_volatile((self.cap - pos) as u32);
                 (self.data(pos + 4) as *mut u32).write_volatile(MSG_PAD);
             }
-            head += self.cap - pos;
+            head = head.wrapping_add(self.cap - pos);
+            pos = 0;
         }
-        let pos = head % self.cap;
         unsafe {
             (self.data(pos) as *mut u32).write_volatile(len as u32);
             (self.data(pos + 4) as *mut u32).write_volatile(ty);
@@ -434,7 +437,7 @@ impl MsgRing {
         }
         // The message before the count that covers it (x86 orders stores).
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
-        unsafe { ((self.va + MSG_RING_HEAD) as *mut u64).write_volatile(head + room) };
+        unsafe { ((self.va + MSG_RING_HEAD) as *mut u64).write_volatile(head.wrapping_add(room)) };
     }
 
     /// For the writer, after it published messages: whether the reader
@@ -478,17 +481,23 @@ impl MsgReader {
                 return None;
             }
             if self.ring.overrun(head, self.tail) {
-                *lost += head.wrapping_sub(self.tail);
+                *lost = lost.saturating_add(head.wrapping_sub(self.tail));
                 self.tail = head;
                 return None;
             }
             let pos = self.tail % self.ring.cap;
+            // The peer's count, which places the header: inside the ring.
+            if self.ring.cap - pos < 8 {
+                *lost = lost.saturating_add(head.wrapping_sub(self.tail));
+                self.tail = head;
+                return None;
+            }
             let (len, ty) = unsafe {
                 ((self.ring.data(pos) as *const u32).read_volatile() as u64, (self.ring.data(pos + 4) as *const u32).read_volatile())
             };
             let room = len.next_multiple_of(8);
             if len < 8 || pos + room > self.ring.cap {
-                *lost += head.wrapping_sub(self.tail);
+                *lost = lost.saturating_add(head.wrapping_sub(self.tail));
                 self.tail = head;
                 return None;
             }
@@ -502,7 +511,8 @@ impl MsgReader {
             if self.ring.overrun(self.ring.head(), self.tail) {
                 continue;
             }
-            self.tail += room;
+            // The peer writes head: counts compare wrapping (`overrun`).
+            self.tail = self.tail.wrapping_add(room);
             if ty != MSG_PAD {
                 return Some((ty, n));
             }

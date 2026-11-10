@@ -459,11 +459,13 @@ impl<'a> Volume<'a> {
         let bytes: u64 = req.segs[..req.nr_segs as usize].iter().map(|s| s.len as u64).sum();
         let k = self.order.partition_point(|&o| self.extents[o as usize].offset <= g) - 1;
         let e = self.nth(k).unwrap();
-        let first = bytes.min((e.offset + e.sectors - g) * 512);
+        // Extents are as long as a unit's capacity, which the device
+        // reports: in bytes they may not fit in a u64.
+        let first = bytes.min((e.offset + e.sectors - g).saturating_mul(512));
         let mut pieces = ([(e.start + (g - e.offset), first), (0, 0)], 1);
         if first < bytes {
             let next = self.nth(k + 1).ok_or(STATUS_IOERR)?;
-            if bytes - first > next.sectors * 512 { return Err(STATUS_IOERR); }
+            if bytes - first > next.sectors.saturating_mul(512) { return Err(STATUS_IOERR); }
             pieces.0[1] = (next.start, bytes - first);
             pieces.1 = 2;
         }

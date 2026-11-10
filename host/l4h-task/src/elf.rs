@@ -43,13 +43,27 @@ impl<'a> Elf<'a> {
         if u16_at(data, 18) != MACHINE {
             return Err("ELF architecture does not match the host");
         }
-        let phoff = u64_at(data, 32) as usize;
+        let phoff = usize::try_from(u64_at(data, 32)).map_err(|_| "bad program headers")?;
         let phentsize = u16_at(data, 54) as usize;
         let phnum = u16_at(data, 56) as usize;
-        if phentsize < 56 || phoff + phentsize * phnum > data.len() {
+        // Both u16: the product cannot overflow.
+        if phentsize < 56 || phoff.checked_add(phentsize * phnum).is_none_or(|end| end > data.len()) {
             return Err("bad program headers");
         }
-        Ok(Self { data, entry: u64_at(data, 24), phoff, phentsize, phnum })
+        let elf = Self { data, entry: u64_at(data, 24), phoff, phentsize, phnum };
+        // Every loadable segment's file data within the file and its
+        // memory within the address space: segments() relies on it.
+        for i in 0..phnum {
+            let o = elf.phoff + i * elf.phentsize;
+            if u32_at(data, o) != PT_LOAD {
+                continue;
+            }
+            let (offset, filesz, vaddr, memsz) = (u64_at(data, o + 8), u64_at(data, o + 32), u64_at(data, o + 16), u64_at(data, o + 40));
+            if offset.checked_add(filesz).is_none_or(|end| end > data.len() as u64) || filesz > memsz || vaddr.checked_add(memsz).is_none() {
+                return Err("bad loadable segment");
+            }
+        }
+        Ok(elf)
     }
 
     pub fn segments(&self) -> impl Iterator<Item = Segment<'a>> + '_ {

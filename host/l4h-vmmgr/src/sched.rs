@@ -171,7 +171,8 @@ pub fn balance(h: &mut Vmmgr, elapsed_us: u64) {
                     vcpu.run_ticks += c * tsc_mhz;
                     let idle = unsafe { core::ptr::addr_of!((*page).idle_ticks).read_volatile() };
                     let steal = vcpu.wall_ticks.saturating_sub(vcpu.run_ticks).saturating_sub(idle);
-                    let ns = steal * 1000 / tsc_mhz;
+                    // steal * 1000 overflows after weeks of steal: u128.
+                    let ns = u64::try_from(steal as u128 * 1000 / tsc_mhz as u128).unwrap_or(u64::MAX);
                     if ns > vcpu.steal_ns {
                         vcpu.steal_ns = ns;
                         unsafe { core::ptr::addr_of_mut!((*page).steal_ns).write_volatile(ns) };

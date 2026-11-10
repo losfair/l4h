@@ -69,7 +69,9 @@ static mut SCRATCH: [u8; 4096] = [0; 4096];
 
 impl Hw {
     fn local(&self, paddr: usize, width: usize) -> Option<usize> {
-        self.ranges.iter().find(|&&(p, n, _)| p <= paddr && paddr + width <= p + n).map(|&(p, _, va)| va + (paddr - p))
+        // The firmware's AML chooses `paddr` and `width`.
+        self.ranges.iter().find(|&&(p, n, _)| p <= paddr && paddr.checked_add(width).is_some_and(|end| end <= p + n))
+            .map(|&(p, _, va)| va + (paddr - p))
     }
 
     /// One access through root.
@@ -120,7 +122,7 @@ impl Hw {
     }
 
     fn spin_ns(&self, ns: u64) {
-        let end = host::ticks::now() + (ns as u128 * self.hz as u128 / 1_000_000_000) as u64;
+        let end = host::ticks::now().saturating_add(time::ns_ticks(self.hz, ns));
         while host::ticks::now() < end {
             core::hint::spin_loop();
         }
@@ -201,10 +203,10 @@ impl acpi::Handler for Hw {
     // Stall is a busy wait by the ACPI specification (at most 100 us);
     // Sleep need not be.
     fn stall(&self, us: u64) {
-        self.spin_ns(us * 1000);
+        self.spin_ns(us.saturating_mul(1000));
     }
     fn sleep(&self, ms: u64) {
-        time::sleep_ns(self.hz, ms * 1_000_000);
+        time::sleep_ns(self.hz, ms.saturating_mul(1_000_000));
     }
     // One thread: mutexes are always free.
     fn create_mutex(&self) -> Handle {

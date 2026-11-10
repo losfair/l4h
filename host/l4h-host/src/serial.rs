@@ -576,7 +576,7 @@ impl Input {
         }
         let oldest = ring::Ring::<CAPACITY, WORDS>::oldest_at(head);
         if self.cursor < oldest {
-            self.lost += oldest - self.cursor;
+            self.lost = self.lost.saturating_add(oldest - self.cursor);
             self.cursor = oldest;
             self.deadline = None;
         }
@@ -595,7 +595,7 @@ impl Input {
                 Entry::Gone => {}
             }
             self.deadline = None;
-            self.lost += 1;
+            self.lost = self.lost.saturating_add(1);
             self.cursor += 1;
         }
         Peek::Empty

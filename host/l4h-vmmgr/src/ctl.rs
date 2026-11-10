@@ -399,7 +399,8 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
             if id == caller {
                 return Err(EINVAL);
             }
-            resp.vals[0] = h.create_nic(id, a[1] as u32, a[2], a[3] & abi::NIC_NO_MAC_LOCK == 0, a[3] & abi::NIC_ISOLATED != 0)?;
+            let switch = u32::try_from(a[1]).map_err(|_| EINVAL)?;
+            resp.vals[0] = h.create_nic(id, switch, a[2], a[3] & abi::NIC_NO_MAC_LOCK == 0, a[3] & abi::NIC_ISOLATED != 0)?;
             Ok(())
         }
         abi::CTL_VM_SET_SCHED => {
