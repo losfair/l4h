@@ -2692,10 +2692,9 @@ controller, one per claimed controller, and the guest forwards Linux's
   ring's worth of events), so neither a guest refilling its queues from
   another vCPU nor a controller that keeps producing events keeps usbd from
   its events and the mailbox. They are bounded in records, not time: a
-  control record may wait for a controller command (5 s, then a reset), as
-  may an endpoint's recovery, so usbd stops taking either once root has
-  posted a request (`l4h_rt::mailbox::pending`), and the next turn serves
-  the mailbox first.
+  control record may wait for a controller command (5 s, then a reset), so
+  usbd stops taking them once root has posted a request
+  (`l4h_rt::mailbox::pending`), and the next turn serves the mailbox first.
   A going guest's REMOVE, and the next guest's ATTACH behind it, waits for
   at most the record usbd is in, not a queue of them.
 - **DMA without an IOMMU.** Every DMA pointer the controller reads is
