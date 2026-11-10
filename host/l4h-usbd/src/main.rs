@@ -166,7 +166,7 @@ impl Client {
     }
     /// CQ entries the guest has room for, beyond those in flight.
     fn room(&self) -> u32 {
-        let c = proto::Cq { head: self.cq_head, size: abi::CQ_SIZE as u32 };
+        let c = proto::Cq::at(abi::CQ_SIZE, self.cq_head as u64);
         c.room(self.guest(|c| &c.cq_tail)).map_or(0, |r| r.saturating_sub(self.in_flight))
     }
     fn post_cqe(&mut self, e: &Cqe) {
@@ -177,7 +177,7 @@ impl Client {
         self.notify = true;
     }
     fn post_event(&mut self, e: Event) {
-        let c = proto::Cq { head: self.eq_head, size: abi::EQ_SIZE as u32 };
+        let c = proto::Cq::at(abi::EQ_SIZE, self.eq_head as u64);
         if c.room(self.guest(|c| &c.eq_tail)).is_none_or(|r| r == 0) {
             self.lost = self.lost.wrapping_add(1);
             self.publish(|i| &mut i.lost_events, self.lost);
@@ -1425,7 +1425,7 @@ impl Usbd {
             if cl.skip & bit != 0 {
                 // Cancelled before it was taken: no completion, no room.
                 cl.skip &= !bit;
-                cl.xfer.tail = cl.xfer.tail.wrapping_add(1);
+                cl.xfer.advance();
                 cl.publish(|i| &mut i.xfer_sq_tail, cl.xfer.tail);
                 self.xfer_budget -= 1;
                 continue;
@@ -1435,7 +1435,7 @@ impl Usbd {
             }
             let base = (cl.area + abi::XFER_SQ_OFF) as *const XferReq;
             let req = unsafe { proto::read_record(base, abi::XFER_SQ_SIZE as u32, cl.xfer.tail) };
-            cl.xfer.tail = cl.xfer.tail.wrapping_add(1);
+            cl.xfer.advance();
             cl.publish(|i| &mut i.xfer_sq_tail, cl.xfer.tail);
             self.xfer_budget -= 1;
             self.transfer(&req);
@@ -1471,7 +1471,7 @@ impl Usbd {
             }
             let base = (cl.area + abi::CTL_SQ_OFF) as *const CtlReq;
             let req = unsafe { proto::read_record(base, abi::CTL_SQ_SIZE as u32, cl.ctl.tail) };
-            cl.ctl.tail = cl.ctl.tail.wrapping_add(1);
+            cl.ctl.advance();
             cl.publish(|i| &mut i.ctl_sq_tail, cl.ctl.tail);
             let c = self.control(&req);
             self.client.as_mut().unwrap().post_cqe(&c);
@@ -1605,8 +1605,8 @@ impl Usbd {
         unsafe { (*info).max_transfer = max_transfer };
         self.client = Some(Client {
             idx, area, pool, max_transfer,
-            ctl: Sq { tail: 0, size: abi::CTL_SQ_SIZE as u32 },
-            xfer: Sq { tail: 0, size: abi::XFER_SQ_SIZE as u32 },
+            ctl: Sq::new(abi::CTL_SQ_SIZE),
+            xfer: Sq::new(abi::XFER_SQ_SIZE),
             cq_head: 0, eq_head: 0, in_flight: 0, iso_tds: 0, reset_seen: 0, resets: 0, irq, notify: false, lost: 0, skip: 0,
         });
         self.dead = false;

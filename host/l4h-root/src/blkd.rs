@@ -141,7 +141,7 @@ enum BlkOp {
 }
 
 /// How blkd's requests fail once it has.
-const FAILED: [u64; host::mailbox::ANSWER] = [wire::FAILED, 0, 0, 0, 0];
+const FAILED: host::mailbox::Reply = host::mailbox::Reply::FAILED;
 
 /// A host disk: unit `unit` of controller `ctrl`.
 pub struct Disk {
@@ -426,7 +426,7 @@ impl Attachment {
 struct Blkd {
     comp: Component,
     arena: Arena,
-    mailbox: Mailbox,
+    mailbox: Mailbox<blk::call::Proto>,
     /// Slots of the frames of the staging buffer (the end of the DMA
     /// memory).
     staging: Range<Slot>,
@@ -634,7 +634,7 @@ pub fn attach_start(h: &mut Host, c: usize, token: usize, id: usize, disk: usize
 /// EIO, and quarantines the controller.
 #[allow(clippy::too_many_arguments)]
 fn checked(h: &mut Host, c: usize, token: usize, id: usize, instance: u64, disk: usize, unit: u64, start: u64, n: usize,
-    volatile: bool, claims: bool, w: [u64; host::mailbox::ANSWER]) {
+    volatile: bool, claims: bool, w: host::mailbox::Reply) {
     let r = (|| {
         let ctrl = &mut h.ctrls[c];
         let ok = match wire::reply::<reply::Check>(&w) {
@@ -859,7 +859,7 @@ pub fn poll(h: &mut Host, c: usize) {
 }
 
 /// blkd answered `op` with `w`.
-fn complete(h: &mut Host, c: usize, op: BlkOp, w: [u64; host::mailbox::ANSWER]) {
+fn complete(h: &mut Host, c: usize, op: BlkOp, w: host::mailbox::Reply) {
     match op {
         BlkOp::Reserve { disk, window, read_only } => {
             let ctrl = &mut h.ctrls[c];

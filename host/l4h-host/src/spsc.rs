@@ -2,7 +2,8 @@
 //! with a peer that may be hostile: a blkd channel's two rings
 //! (blk::Channel), a netd port's (net::Port), and usbd's queues (usb::Sq,
 //! usb::Cq, whose indices sit in the guest ABI's own layout).  Indices are
-//! free-running u32s; entry k is in slot k % size.
+//! free-running u32s. Each side also keeps its slot separately: for a size
+//! such as netd's 24, wrapping the count at 2^32 must not skip slots.
 //!
 //! Each side keeps its own index privately (`Producer::head`,
 //! `Consumer::tail`) and only publishes it: the peer can write over the
@@ -34,13 +35,20 @@ const _: () = assert!(core::mem::size_of::<RingIdx>() == 128);
 pub struct Consumer {
     pub tail: u32,
     pub size: u32,
+    position: u32,
 }
 
 impl Consumer {
     /// A ring the producer has not written to yet.
     pub const fn new(size: usize) -> Self {
+        Self::at(size, 0)
+    }
+
+    /// Start after `sequence` entries, an unwrapped count. The shared
+    /// counter is its low 32 bits; the slot uses the whole count.
+    pub const fn at(size: usize, sequence: u64) -> Self {
         assert!(size > 0 && size <= u32::MAX as usize);
-        Self { tail: 0, size: size as u32 }
+        Self { tail: sequence as u32, size: size as u32, position: (sequence % size as u64) as u32 }
     }
 
     /// Entries available at the producer's `head`, or None if it is
@@ -52,7 +60,7 @@ impl Consumer {
 
     /// The slot of the oldest entry not consumed.
     pub fn slot(&self) -> usize {
-        (self.tail % self.size) as usize
+        self.position as usize
     }
 
     /// Entries the producer of `idx` has published, or None if its head
@@ -69,8 +77,16 @@ impl Consumer {
     /// Free the oldest entry (`slot`), which was read: the producer may
     /// write over it once it sees the tail.
     pub fn pop(&mut self, idx: &RingIdx) {
-        self.tail = self.tail.wrapping_add(1);
+        self.advance();
         idx.tail.store(self.tail, Ordering::Release);
+    }
+
+    /// Consume one entry, for a layout (USB) that publishes its count
+    /// elsewhere. The caller publishes the returned tail after reading.
+    pub fn advance(&mut self) -> u32 {
+        self.tail = self.tail.wrapping_add(1);
+        self.position = (self.position + 1) % self.size;
+        self.tail
     }
 }
 
@@ -79,13 +95,19 @@ impl Consumer {
 pub struct Producer {
     pub head: u32,
     pub size: u32,
+    position: u32,
 }
 
 impl Producer {
     /// A ring the consumer has not read from yet.
     pub const fn new(size: usize) -> Self {
+        Self::at(size, 0)
+    }
+
+    /// Start after `sequence` entries, an unwrapped count, as Consumer::at.
+    pub const fn at(size: usize, sequence: u64) -> Self {
         assert!(size > 0 && size <= u32::MAX as usize);
-        Self { head: 0, size: size as u32 }
+        Self { head: sequence as u32, size: size as u32, position: (sequence % size as u64) as u32 }
     }
 
     /// Free entries given the consumer's `tail`, or None if the tail is
@@ -98,7 +120,7 @@ impl Producer {
 
     /// The slot the next entry goes in.
     pub fn slot(&self) -> usize {
-        (self.head % self.size) as usize
+        self.position as usize
     }
 
     /// Free entries in `idx`'s ring: none if the consumer's tail is broken.
@@ -116,6 +138,7 @@ impl Producer {
     /// Publish the entry written at `slot`, which `free` said was free.
     pub fn push(&mut self, idx: &RingIdx) {
         self.head = self.head.wrapping_add(1);
+        self.position = (self.position + 1) % self.size;
         idx.head.store(self.head, Ordering::Release);
     }
 }
@@ -154,8 +177,8 @@ mod tests {
     #[test]
     fn wraps() {
         let r = idx();
-        let mut p = Producer { head: u32::MAX - 1, size: 8 };
-        let mut c = Consumer { tail: u32::MAX - 1, size: 8 };
+        let mut p = Producer::at(8, u32::MAX as u64 - 1);
+        let mut c = Consumer::at(8, u32::MAX as u64 - 1);
         r.head.store(p.head, Ordering::Relaxed);
         r.tail.store(c.tail, Ordering::Relaxed);
         for _ in 0..8 {
@@ -166,5 +189,39 @@ mod tests {
             c.pop(&r);
         }
         assert_eq!((p.free(&r), c.ready(&r), p.head, c.tail), (8, 0, 6, 6));
+    }
+
+    #[test]
+    fn unread_entries_survive_counter_wrap_for_every_slot_alignment() {
+        // Include the production network capacity, a power of two and
+        // other non-powers of two. Fill a ring across the counter wrap,
+        // then drain it: indices may look valid even when slots collide.
+        for size in [1, 3, 8, crate::net::RING_SIZE, 31] {
+            for before in 0..=size {
+                let r = idx();
+                let sequence = (1u64 << 32) - before as u64;
+                let mut p = Producer::at(size, sequence);
+                let mut c = Consumer::at(size, sequence);
+                r.head.store(p.head, Ordering::Relaxed);
+                r.tail.store(c.tail, Ordering::Relaxed);
+                let mut entries = [0usize; 31];
+                // Several laps after the wrap check that the positions
+                // continue correctly, not just the first wrapped batch.
+                for lap in 0..3 {
+                    for i in 0..size {
+                        assert!(p.free(&r) > 0);
+                        entries[p.slot()] = lap * size + i;
+                        p.push(&r);
+                    }
+                    assert_eq!(p.free(&r), 0);
+                    assert_eq!(c.ready(&r), size as u32);
+                    for i in 0..size {
+                        assert_eq!(entries[c.slot()], lap * size + i, "size {size}, {before} before wrap");
+                        c.pop(&r);
+                    }
+                    assert_eq!((p.free(&r), c.ready(&r)), (size as u32, 0));
+                }
+            }
+        }
     }
 }

@@ -25,7 +25,7 @@ pub fn published<T>() -> &'static T {
 /// and answer never pass through the message registers, so `f`'s
 /// invocations cannot overwrite them.  Returns whether it answered any;
 /// then `signal` root.
-pub fn serve(mut f: impl FnMut(u64, &[u64; ARGS], &mut [u64; ANSWER]) -> Option<usize>) -> bool {
+pub fn serve(mut f: impl FnMut(u64, &[u64], &mut [u64; ANSWER]) -> Option<usize>) -> bool {
     let m = page();
     let mut answered = false;
     loop {
@@ -34,14 +34,16 @@ pub fn serve(mut f: impl FnMut(u64, &[u64; ARGS], &mut [u64; ANSWER]) -> Option<
             return answered;
         }
         let e = &m.entries[k as usize % RING];
-        let label = e.label.load(Ordering::Relaxed);
-        let args: [u64; ARGS] = core::array::from_fn(|i| e.args[i].load(Ordering::Relaxed));
+        let mut args = [0; ARGS];
         let mut words = [0; ANSWER];
-        if f(label, &args, &mut words).is_none() {
-            words = [0; ANSWER];
-            words[0] = crate::host::wire::FAILED;
+        match e.arguments(&mut args) {
+            Some((label, n)) => match f(label, &args[..n], &mut words) {
+                Some(n) if n <= ANSWER => e.write_reply(&words[..n]),
+                _ => e.write_reply(&[crate::host::wire::FAILED]),
+            },
+            None => e.write_reply(&[crate::host::wire::EINVAL]),
         }
-        publish(k, &words);
+        publish(k);
         answered = true;
     }
 }
@@ -60,11 +62,8 @@ pub fn notify(client: sel4::cap::Notification) {
     client.nb_send(sel4::MessageInfo::new(0, 0, 0, 0));
 }
 
-fn publish(k: u64, words: &[u64; ANSWER]) {
+fn publish(k: u64) {
     let m = page();
-    for (a, &w) in m.entries[k as usize % RING].answer.iter().zip(words) {
-        a.store(w, Ordering::Relaxed);
-    }
     DONE.store(k + 1, Ordering::Relaxed);
     m.done.store(k + 1, Ordering::Release);
 }

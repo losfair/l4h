@@ -18,7 +18,7 @@ use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use l4h_host::wire::{Badged, Call, Cap, EINVAL, MAX_MRS, Protocol};
-use l4h_host::wiring::{At, E, p};
+use l4h_host::wiring::{At, E, o, p};
 
 /// An endpoint that serves protocol P, as P's client calls it: made from
 /// a call edge whose protocol is P (wiring::E), so that no other
@@ -34,13 +34,13 @@ impl<P> Copy for Endpoint<P> {}
 
 impl<P: Protocol> Endpoint<P> {
     /// The one `e` gives its holder, `_me`, in the edge's slot n.
-    pub const fn of<H: p::IsParty, T, O>(e: &E<H, T, O, P>, _me: H, n: usize) -> Self {
+    pub const fn of<H: p::IsParty, T>(e: &E<H, T, o::Endpoint, P>, _me: H, n: usize) -> Self {
         Endpoint(sel4::cap::Endpoint::from_bits(e.0.slot(n)), PhantomData)
     }
 
     /// The one `e` gives its holder in a slot of the holder's choosing
     /// (At::Chosen), `ep`.
-    pub fn chosen<H: p::IsParty, T, O>(e: &E<H, T, O, P>, _me: H, ep: sel4::cap::Endpoint) -> Self {
+    pub fn chosen<H: p::IsParty, T>(e: &E<H, T, o::Endpoint, P>, _me: H, ep: sel4::cap::Endpoint) -> Self {
         assert!(matches!(e.at, At::Chosen), "{} is in a slot of its own", e.name);
         Endpoint(ep, PhantomData)
     }

@@ -1928,9 +1928,11 @@ extent.
   drain, whether or not responses keep coming, and takes no more of them than
   blkd can owe it (one per request, and a ring's worth): a blkd that root
   quarantined is suspended and never answers, and one that runs an attacker's
-  code may answer for ever. The disk then
-  fails for good: what blkd still has fails, every later request is an
-  I/O error, and its channel is not read again.
+  code may answer for ever. If the drain fails, the VMM faults and vmmgr
+  stops the guest (or replaces dom0). The reset call stays unanswered, and
+  no synthetic error completion returns another queue's pending buffers:
+  blkd or its device may still DMA into them. Root cuts devices off before
+  reusing the I/O pool at teardown, as for any other stopped guest.
 - **Clients.** Each client has its own immutable pool/window/permission
   configuration, channel and completion notification. A controller supports
   512 clients; blkd's submit loop visits only attached ones. Submission is
@@ -2090,6 +2092,9 @@ firewalling belong in a VM.
   and removes ports with `net::call::add_port`/`remove_port`. The guest
   bounces buffers through its I/O pool, the VMM copies between pool and
   port slots, and netd copies slot to slot or slot to NIC DMA buffer.
+  The shared counts wrap as `u32`; each producer and consumer also keeps
+  its slot privately (`l4h_host::spsc`), advancing modulo the ring size.
+  A counter wrap therefore preserves unread entries in the 24-slot rings.
 - **Offloads.** Checksum and TSO metadata pass through in the virtio-net
   header. netd validates flags, checksum offsets and GSO type, including
   that a GSO frame is TCP over IPv4/IPv6, and drops incoherent headers. A
@@ -2988,9 +2993,17 @@ one way to do each part of it:
   (`host/clippy.toml`, `tests/check-ipc.sh`) refuses those seL4 calls anywhere
   else; the one send left is `l4h_rt::mailbox::notify`'s, to a notification. A
   driver's mailbox carries the same protocols without IPC: root posts a
-  typed `Request` (`Mailbox::send`) and decodes each answer by its
-  call's reply type; the driver answers with `l4h_rt::mailbox::serve`,
-  which reads and writes the ring and never the registers. Capabilities
+  typed `Request` through `Mailbox<P>`, made from its `Rights::Post`
+  notification edge of protocol P, and decodes each answer by its
+  call's reply type. `wire::Message::Proto` ties the request to P, as an
+  endpoint's client is tied to its protocol. The private counts and
+  encoding live in `l4h_host::mailbox::Client<P>`; root adds the signal.
+  The driver answers with `l4h_rt::mailbox::serve`, which reads and writes
+  the ring and never the registers. Every entry carries the actual
+  argument and reply lengths: neither side decodes padding as fields or
+  tail items, oversized lengths are refused, and short replies stay short
+  for `wire::reply` to reject. The two ring pages and published page still
+  take three pages per mailbox. Capabilities
   still cross in exchange slots, which each call's declaration names,
   with their direction and kind: both ends find a slot with
   `Caps::passed_in` or `passed_out`, which refuse, at compile time, the
@@ -3015,7 +3028,7 @@ one way to do each part of it:
   instance), its minter and what it is for. Each edge is typed
   `E<Holder, Target, Object, Protocol>`, and `E::new` checks at compile
   time that the type names the edge's holder, target and object and,
-  for a call, the protocol the target's object serves. A capability is
+  for a call or mailbox post, the protocol the target's object serves. A capability is
   minted from its edge and nothing else (`l4h_task::edge::mint`,
   `Component::give_edge`, the guest's `give_edge` in vmmgr), so slot,
   rights and badge cannot drift from the declaration, and only from an

@@ -173,7 +173,7 @@ pub struct Netd {
     arena: Arena,
     /// Commands to netd, which it does not answer: root validates them
     /// and keeps their state (net::call::add_port).
-    mailbox: Mailbox,
+    mailbox: Mailbox<net::call::Proto>,
     /// netd faulted (`fault`): it is suspended, and commands to it go
     /// nowhere.
     failed: bool,

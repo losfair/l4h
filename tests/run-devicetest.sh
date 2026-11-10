@@ -80,6 +80,20 @@ rustc +stable --edition=2024 --crate-name l4h_host --crate-type rlib \
     --extern l4h_abi="$out/libl4h_abi.rlib" \
     "$root/host/l4h-host/src/lib.rs" -o "$out/libl4h_host.rlib"
 rustc +stable --edition=2024 --test -L dependency="$out" \
+    --extern l4h_host="$out/libl4h_host.rlib" "$root/tests/mailbox.rs" -o "$out/mailbox-tests"
+"$out/mailbox-tests"
+# Mailboxes carry their edge's protocol all the way to the request.
+types=(--edition=2024 --crate-type rlib -L dependency="$out" --extern l4h_host="$out/libl4h_host.rlib" "$root/tests/ipc-types.rs")
+rustc +stable "${types[@]}" -o "$out/ipc-types.rlib"
+for variant in wrong_protocol wrong_edge; do
+    if rustc +stable "${types[@]}" --cfg "$variant" -o "$out/ipc-types-$variant.rlib" 2>"$out/ipc-types-$variant.log"; then
+        echo "IPC type check accepted $variant" >&2
+        exit 1
+    fi
+done
+grep -Fq 'error[E0271]' "$out/ipc-types-wrong_protocol.log"
+grep -Fq 'error[E0080]' "$out/ipc-types-wrong_edge.log"
+rustc +stable --edition=2024 --test -L dependency="$out" \
     --extern l4h_abi="$out/libl4h_abi.rlib" --extern l4h_host="$out/libl4h_host.rlib" \
     -C link-arg="$out/console-guest.o" "$root/tests/console.rs" -o "$out/console-tests"
 "$out/console-tests"

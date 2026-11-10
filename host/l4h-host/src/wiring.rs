@@ -78,6 +78,9 @@ pub enum Object {
 pub enum Rights {
     /// Call the endpoint (write, grant reply).
     Call,
+    /// Post in the target's mailbox, then signal its notification
+    /// (write). The edge carries the mailbox's protocol.
+    Post,
     /// Signal the notification (write).
     Signal,
     /// Bind the notification to an IRQ handler, which then signals it:
@@ -257,6 +260,10 @@ impl<H: p::IsParty, T: p::IsParty, O: o::IsObject, P: Protocol> E<H, T, O, P> {
         );
         let served = match e.rights {
             Rights::Call => served(e.target, e.object),
+            Rights::Post => {
+                assert!(matches!(e.holder, Party::Root) && matches!(e.object, Object::Notification), "a mailbox post is root's notification");
+                served(e.target, e.object)
+            }
             _ => "",
         };
         assert!(same_str(P::NAME, served), "an edge's protocol is not its target's");
@@ -272,6 +279,10 @@ const fn served(target: Party, object: Object) -> &'static str {
         (Vmmgr, Endpoint) => <vmmgr::call::Proto as Protocol>::NAME,
         (Flags, Endpoint) => <trust::call::Proto as Protocol>::NAME,
         (Vmm, Endpoint) => <crate::hypercall::call::Proto as Protocol>::NAME,
+        (Blkd, Notification) => <blk::call::Proto as Protocol>::NAME,
+        (Netd, Notification) => <net::call::Proto as Protocol>::NAME,
+        (Usbd, Notification) => <usb::call::Proto as Protocol>::NAME,
+        (Vmmgr, Notification) => <vmmgr::call::Proto as Protocol>::NAME,
         _ => "none",
     }
 }
@@ -309,7 +320,7 @@ use At::{Bound, Chosen, Fault as AtFault, Slots};
 use Badge::{Bit, Field, Fixed};
 use Object::{Endpoint, Kick, Notification, Vcpu};
 use Party::*;
-use Rights::{Bind, Call, Fault, KeeperFault, Signal};
+use Rights::{Bind, Call, Fault, KeeperFault, Post, Signal};
 
 const MAX_GUESTS: usize = crate::memd::MAX_GUESTS;
 const COMPONENT_FAULT: u64 = badges::parent::COMPONENT | badges::parent::FAULT;
@@ -375,13 +386,13 @@ pub const fn guest_fault(g: usize, v: usize) -> usize {
 const _: () = assert!(badges::vmmgr::ID.hi == badges::vmmgr::VCPU.lo);
 
 // ---- Mailboxes (crate::mailbox).
-pub const ROOT_BLKD_CALL: E<p::Root, p::Blkd, o::Notification> = E::new(edge("ROOT_BLKD_CALL", Root, Chosen, Blkd, Notification, Signal,
+pub const ROOT_BLKD_CALL: E<p::Root, p::Blkd, o::Notification, blk::call::Proto> = E::new(edge("ROOT_BLKD_CALL", Root, Chosen, Blkd, Notification, Post,
     Fixed(badges::driver::CALL), 1, Root, "root posted in blkd's mailbox (blk::call)"));
-pub const ROOT_NETD_CALL: E<p::Root, p::Netd, o::Notification> = E::new(edge("ROOT_NETD_CALL", Root, Chosen, Netd, Notification, Signal,
+pub const ROOT_NETD_CALL: E<p::Root, p::Netd, o::Notification, net::call::Proto> = E::new(edge("ROOT_NETD_CALL", Root, Chosen, Netd, Notification, Post,
     Fixed(badges::driver::CALL), 1, Root, "root posted in netd's mailbox (net::call)"));
-pub const ROOT_USBD_CALL: E<p::Root, p::Usbd, o::Notification> = E::new(edge("ROOT_USBD_CALL", Root, Chosen, Usbd, Notification, Signal,
+pub const ROOT_USBD_CALL: E<p::Root, p::Usbd, o::Notification, usb::call::Proto> = E::new(edge("ROOT_USBD_CALL", Root, Chosen, Usbd, Notification, Post,
     Fixed(badges::driver::CALL), 1, Root, "root posted in usbd's mailbox (usb::call)"));
-pub const ROOT_VMMGR_CALL: E<p::Root, p::Vmmgr, o::Notification> = E::new(edge("ROOT_VMMGR_CALL", Root, Chosen, Vmmgr, Notification, Signal,
+pub const ROOT_VMMGR_CALL: E<p::Root, p::Vmmgr, o::Notification, vmmgr::call::Proto> = E::new(edge("ROOT_VMMGR_CALL", Root, Chosen, Vmmgr, Notification, Post,
     Fixed(badges::vmmgr::MAILBOX), 1, Root, "root posted notices in vmmgr's mailbox (vmmgr::call)"));
 pub const BLKD_DONE: E<p::Blkd, p::Root, o::Notification> = E::new(shared(edge("BLKD_DONE", Blkd, Slots(mailbox::SLOT_MAILBOX_DONE, 1), Root, Notification, Signal,
     Fixed(badges::root::MAILBOX), 1, Root, "blkd answered in its mailbox (root polls every mailbox on the bit)")));
@@ -645,7 +656,7 @@ const fn check(edges: &[Edge]) -> Result<(), &'static str> {
                     return Err(e.name);
                 }
             }
-            Rights::Signal | Rights::Bind => match space(e.target, e.object) {
+            Rights::Signal | Rights::Bind | Rights::Post => match space(e.target, e.object) {
                 Some((_, signals)) => {
                     if e.badge.mask() & !signals != 0 {
                         return Err(e.name);
@@ -670,7 +681,8 @@ const fn check(edges: &[Edge]) -> Result<(), &'static str> {
                 }
             }
             // No two signals on the same bits of the same notification.
-            let signals = matches!(e.rights, Rights::Signal | Rights::Bind) && matches!(f.rights, Rights::Signal | Rights::Bind);
+            let signals = matches!(e.rights, Rights::Signal | Rights::Bind | Rights::Post)
+                && matches!(f.rights, Rights::Signal | Rights::Bind | Rights::Post);
             if signals && same_object(e, f) && e.badge.mask() & f.badge.mask() != 0 && !both_shared {
                 return Err(e.name);
             }
