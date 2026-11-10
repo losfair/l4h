@@ -18,7 +18,8 @@
  *    thinks is mapped, KVM calls it spurious, and calls us again.  That is
  *    the one path that repairs the EPT, and all that is needed.
  *
- * seL4 invalidates the EPT on every core that has entered a VM whenever it
+ * seL4 invalidates the EPT on every core that may hold its translations
+ * (those that entered a VM on it since it was last invalidated) whenever it
  * removes a leaf or a table (patch 0039), and adding one needs no
  * invalidation, so KVM's TLB flushes for page table changes have nothing
  * left to do.

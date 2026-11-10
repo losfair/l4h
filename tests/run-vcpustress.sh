@@ -3,7 +3,9 @@
 # below l4h-root: boot seL4 with tests/vcpustress.c as the root task on 4
 # cores.  Two threads keep a guest in seL4_VMEnter while two others invoke,
 # signal, stall, rebind and finally delete what they run on; the kernel must
-# survive, and every VMEnter must return what the guest did.  Three runs:
+# survive, and every VMEnter must return what the guest did.  At the end a
+# thread on each core that ran a guest executes SYSENTER, which must fault as
+# on a core that ran none (a VM exit used to arm it).  Three runs:
 #   smp       the guests on cores 1 and 2, the attackers on cores 0 and 3
 #   step      the same with RFLAGS.TF set in the guests: every instruction
 #             is a #DB exit, so a dropped exit or a discarded VMEnter result
