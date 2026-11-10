@@ -7,8 +7,16 @@ name = "fuzz-virtq"
 version = "0.1.0"
 dependencies = [
  "l4h-abi",
+ "l4h-host",
 ]
 
 [[package]]
 name = "l4h-abi"
 version = "0.1.0"
+
+[[package]]
+name = "l4h-host"
+version = "0.1.0"
+dependencies = [
+ "l4h-abi",
+]

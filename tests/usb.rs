@@ -1,19 +1,11 @@
 //! Unit tests of usbd's guest-facing checks and TRB layout
-//! (host/l4h-host/src/usb.rs, compiled here unchanged): the capability
+//! (host/l4h-host/src/usb.rs, through the l4h-host crate): the capability
 //! walk on malformed lists, endpoint range checks, 64 KiB TRB splits and
 //! index arithmetic on wrap.  Run by tests/run-fuzz.sh.
 
 #![allow(dead_code)]
 
-#[path = "../host/l4h-host/src/fixed.rs"]
-mod fixed;
-#[path = "../host/l4h-host/src/blk.rs"]
-mod blk;
-#[path = "../host/l4h-host/src/usb.rs"]
-mod usb;
-
-pub const SHARED_VA: usize = 0x2000_0000_0000;
-pub const MMIO_VA: usize = 0x3000_0000_0000;
+use l4h_host::usb;
 
 use l4h_abi::usb as abi;
 use usb::*;

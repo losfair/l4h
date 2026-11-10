@@ -34,24 +34,16 @@ mod guest {
 #[path = "../../../host/l4h-vmm/src/virtq.rs"]
 mod virtq;
 
-/// The fixed-capacity containers virtq.rs and blk.rs use (as
-/// l4h_rt::host::fixed).
-#[path = "../../../host/l4h-host/src/fixed.rs"]
-pub mod host_fixed;
-
 #[path = "../../../host/l4h-netd/src/offload.rs"]
 mod offload;
 
 // The production block backend and device model use fake seL4 notifications
-// and guest event delivery. blkcheck.rs plays the hardware service.
+// and guest event delivery. blkcheck.rs plays the hardware service.  The
+// shared definitions (blk.rs's channel and pool, the fixed-capacity
+// containers) are l4h-host itself, as l4h_rt::host.
 extern crate self as l4h_rt;
 
-#[path = "../../../host/l4h-host/src/blk.rs"]
-pub mod host_blk;
-pub mod host {
-    pub use crate::host_blk as blk;
-    pub use crate::host_fixed as fixed;
-}
+pub use l4h_host as host;
 
 pub mod sel4 {
     /// blk.rs yields while it waits for blkd: blkd runs then.
@@ -77,7 +69,7 @@ mod blkcheck;
 use guest::GuestMem;
 
 /// The longest chain a queue of 256 entries (the largest here) carries.
-type Chain = host_fixed::ArrayVec<virtq::Buf, 256>;
+type Chain = host::fixed::ArrayVec<virtq::Buf, 256>;
 
 /// xorshift64*
 struct Rng(u64);
