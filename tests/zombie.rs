@@ -89,7 +89,7 @@ fn arena() -> Arena {
 fn host(disks: usize, ports: usize, cut: bool) -> Host {
     let mut h = Host { zombies: (0..MAX_GUESTS).map(|_| None).collect(), alloc: Alloc::default() };
     let mut a = arena();
-    let (pool, now) = ZombiePool::at_deletion(&mut a, POOL, cut, disks != 0);
+    let (pool, now) = ZombiePool::at_deletion(&mut a, POOL, cut, disks != 0, true);
     if let Some(now) = now {
         h.alloc.reclaim(now);
     }
@@ -120,13 +120,40 @@ fn a_cut_pool_goes_before_a_port_netd_has_not_let_go() {
     assert_eq!(h.alloc.reclaimed, [POOL, CHANNELS]);
 }
 
+/// guest_del's choice for every case: the pool is freed at once only if no
+/// device's domain maps it and no disk can still run the guest's commands,
+/// and leaves the arena to wait for drains only if a zombie counts them.
 #[test]
-fn without_disks_a_cut_pool_goes_at_once() {
-    let mut a = arena();
-    let (pool, now) = ZombiePool::at_deletion(&mut a, POOL, true, false);
-    assert!(matches!(pool, ZombiePool::Gone));
-    assert_eq!(now, Some(Arena { owned: vec![(2, POOL, 24)] }));
-    assert_eq!(a.owned, [(1, CHANNELS, 21)]);
+fn where_the_pool_goes_at_deletion() {
+    for cut in [false, true] {
+        for disks in [false, true] {
+            for zombie in [false, true] {
+                let mut a = arena();
+                let (pool, now) = ZombiePool::at_deletion(&mut a, POOL, cut, disks, zombie);
+                let case = format!("cut {cut}, disks {disks}, zombie {zombie}");
+                match (cut, disks, zombie) {
+                    (false, ..) | (true, true, false) => {
+                        assert!(matches!(pool, ZombiePool::InArena(POOL)), "{case}");
+                        assert!(now.is_none() && a == arena(), "{case}: nothing leaves the arena");
+                    }
+                    (true, false, _) => {
+                        assert!(matches!(pool, ZombiePool::Gone), "{case}");
+                        assert_eq!(now, Some(Arena { owned: vec![(2, POOL, 24)] }), "{case}: freed at once");
+                        assert_eq!(a.owned, [(1, CHANNELS, 21)], "{case}");
+                    }
+                    (true, true, true) => {
+                        assert!(matches!(&pool, ZombiePool::Cut(p) if p.owned == [(2, POOL, 24)]), "{case}");
+                        assert!(now.is_none(), "{case}: not freed while disks drain");
+                        assert_eq!(a.owned, [(1, CHANNELS, 21)], "{case}");
+                    }
+                }
+            }
+        }
+    }
+    // A pool the arena does not own is not the zombie's to free.
+    let mut a = Arena::new();
+    let (pool, now) = ZombiePool::at_deletion(&mut a, POOL, true, true, true);
+    assert!(matches!(pool, ZombiePool::Gone) && now.is_none());
 }
 
 #[test]
@@ -137,16 +164,52 @@ fn a_pool_no_iommu_cut_off_stays_and_is_pinned_if_a_disk_was_not_stopped() {
     assert_eq!((h.alloc.reclaimed.as_slice(), h.alloc.pinned.as_slice()), (&[CHANNELS][..], &[POOL][..]));
 }
 
+/// A disk removal the zombie does not wait for counts for nothing: not for
+/// the pool again, and not as a removal of another driver's, whose memory
+/// (netd's ports) must stay until that driver has let go of it.
 #[test]
-fn a_removal_more_than_the_disks_frees_nothing_twice() {
+fn a_removal_more_than_the_disks_changes_nothing() {
     let mut h = host(1, 2, true);
     zombie_disk_done(&mut h, Some(0), true);
     assert_eq!(h.alloc.reclaimed, [POOL]);
     zombie_disk_done(&mut h, Some(0), true);
-    assert_eq!(h.alloc.reclaimed, [POOL], "the pool goes once");
+    zombie_disk_done(&mut h, Some(0), false);
     assert!(LOG.with(|l| l.borrow().iter().any(|s| s.contains("more than it has disks"))));
+    let zb = h.zombies[0].as_ref().unwrap();
+    assert_eq!((zb.waits, zb.disk_waits, zb.pin), (2, 0, false), "nothing counted");
+    zombie_done(&mut h, Some(0), true);
+    assert_eq!(h.alloc.reclaimed, [POOL], "one port is still netd's");
     zombie_done(&mut h, Some(0), true);
     assert_eq!(h.alloc.reclaimed, [POOL, CHANNELS]);
+    assert!(h.zombies[0].is_none());
+}
+
+/// Whatever the order the drivers answer in, the pool goes at the last
+/// disk and the rest at the last removal, each once.
+#[test]
+fn every_order_of_removals() {
+    // 2 disks (D) and 2 ports (P), in every order.
+    let mut orders = vec![vec![]];
+    for _ in 0..4 {
+        orders = orders.into_iter().flat_map(|o: Vec<char>| ['D', 'P'].into_iter().map(move |c| {
+            let mut o = o.clone();
+            o.push(c);
+            o
+        })).filter(|o| o.iter().filter(|&&c| c == 'D').count() <= 2 && o.iter().filter(|&&c| c == 'P').count() <= 2).collect();
+    }
+    assert_eq!(orders.len(), 6);
+    for o in orders {
+        let mut h = host(2, 2, true);
+        let (mut disks, mut all) = (0, 0);
+        for &c in &o {
+            if c == 'D' { zombie_disk_done(&mut h, Some(0), true); disks += 1 } else { zombie_done(&mut h, Some(0), true) }
+            all += 1;
+            let pool_freed = h.alloc.reclaimed.contains(&POOL);
+            assert_eq!(pool_freed, disks == 2, "{o:?}: the pool goes at the last disk");
+            assert_eq!(h.alloc.reclaimed.contains(&CHANNELS), all == 4, "{o:?}: the rest at the last removal");
+        }
+        assert_eq!(h.alloc.reclaimed.len(), 2, "{o:?}: each once");
+    }
 }
 
 #[test]

@@ -697,7 +697,11 @@ impl Usbd {
     /// looked at as it is now: it may have been dropped or given other
     /// rings since it halted, and is then no longer Halted.
     fn recover_all(&mut self) {
-        while let Some((s, d)) = self.recover.pop() {
+        // Each reset is a controller command, which may wait: root's requests
+        // go first, as for control records (`serve`), and the rest are
+        // recovered next turn, which root's request starts at once.
+        while !l4h_rt::mailbox::pending() {
+            let Some((s, d)) = self.recover.pop() else { break };
             if self.slots[s].eps[d].state != EpState::Halted || self.hc.as_ref().is_none_or(|h| h.broken) {
                 continue;
             }

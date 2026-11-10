@@ -2692,9 +2692,10 @@ controller, one per claimed controller, and the guest forwards Linux's
   ring's worth of events), so neither a guest refilling its queues from
   another vCPU nor a controller that keeps producing events keeps usbd from
   its events and the mailbox. They are bounded in records, not time: a
-  control record may wait for a controller command (5 s, then a reset), so
-  usbd stops taking them once root has posted a request
-  (`l4h_rt::mailbox::pending`), and the next turn serves the mailbox first.
+  control record may wait for a controller command (5 s, then a reset), as
+  may an endpoint's recovery, so usbd stops taking either once root has
+  posted a request (`l4h_rt::mailbox::pending`), and the next turn serves
+  the mailbox first.
   A going guest's REMOVE, and the next guest's ATTACH behind it, waits for
   at most the record usbd is in, not a queue of them.
 - **DMA without an IOMMU.** Every DMA pointer the controller reads is
@@ -3143,7 +3144,9 @@ requests distinguish power off, reboot and kernel panic.
   future, or past the caller's end, is refused, so no writer can make
   another's reads fail by leaving a slot claimed. A read that stops short
   of the end its caller gave still reports that end, so a snapshot's
-  reader goes on reading to it rather than taking it as done.
+  reader goes on reading to it rather than taking it as done; an end still
+  to come counts as none, so a snapshot's end is fixed by its first read
+  and reached within a moment, whatever writers leave claimed.
   A record's time is its writer's to choose: one in the future waits, one in
   the past is missed by a follower, and either is only its writer's loss.
   Lost counts the slots a read finds unavailable between a lane's records,
