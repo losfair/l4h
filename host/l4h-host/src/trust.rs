@@ -11,7 +11,7 @@
 //! firmware's AML, only calls it.  Root waits only for the flags server,
 //! in its start-up handshake.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use l4h_abi as abi;
 
 /// The TPM interface.
@@ -210,6 +210,12 @@ crate::protocol! {
         Act / act = 1 from [Vmmgr, Trustd] (guest: usize, instance: u64, bits: [u64; 4], flags: u64) -> Flags;
         /// Seal guest `guest`'s `bits`, for `instance`: its flags.
         Seal / seal = 2 from [Trustd] (guest: usize, instance: u64, bits: [u64; 4], flags: u64) -> Flags;
+        /// Nothing, in its turn: when the server answers, no write of an
+        /// entry is under way that was when the call was made.  For a
+        /// reader that found an entry being written at every look
+        /// (FlagsEntry::read_synced): the server was stopped in the middle
+        /// of the write, out of budget, and goes on at its next.
+        Sync / sync = 3 from [Vmmgr, Trustd] () -> ();
     }
 }
 /// The ops of FlagsEntry::update: the labels of `call`'s act and seal, as
@@ -351,34 +357,23 @@ impl FlagsEntry {
     /// wait for a writer that is not running.
     pub const READ_TRIES: usize = 128;
 
-    /// The entry, if no write is under way and none came meanwhile.
-    fn look(&self) -> Option<Flags> {
-        let seq = self.seq.load(Ordering::Acquire);
-        if seq & 1 != 0 {
-            return None;
-        }
-        let flags = Flags {
+    /// The fields as they are now, each loaded on its own.
+    fn fields(&self) -> Flags {
+        Flags {
             instance: self.instance.load(Ordering::Relaxed),
             taint: core::array::from_fn(|i| self.taint[i].load(Ordering::Relaxed)),
             seal: core::array::from_fn(|i| self.seal[i].load(Ordering::Relaxed)),
-        };
-        fence(Ordering::Acquire);
-        (self.seq.load(Ordering::Relaxed) == seq).then_some(flags)
+        }
     }
 
     /// The entry, consistent; None if READ_TRIES looks found it being
     /// written.  The writer runs on a small budget of its own and can be
     /// stopped in the middle of a write until its next one, at worst by a
-    /// caller that used the budget up: a reader, which may be more trusted
-    /// than that caller, never waits for it.
+    /// caller that used the budget up: a reader does not spin for it, but
+    /// asks the server (`read_synced`), whose answer comes in bounded
+    /// time.
     pub fn try_read(&self) -> Option<Flags> {
-        for _ in 0..Self::READ_TRIES {
-            if let Some(flags) = self.look() {
-                return Some(flags);
-            }
-            core::hint::spin_loop();
-        }
-        None
+        crate::seqlock::read(&self.seq, Self::READ_TRIES, || self.fields())
     }
 
     /// `try_read`, with Flags::UNAVAILABLE for an entry that could not be
@@ -386,6 +381,28 @@ impl FlagsEntry {
     /// with EAGAIN, so an actor does nothing it could not check.
     pub fn read(&self) -> Flags {
         self.try_read().unwrap_or(Flags::UNAVAILABLE)
+    }
+
+    /// Times a reader asks the server to finish its write (`read_synced`).
+    pub const SYNC_TRIES: usize = 3;
+
+    /// `try_read`, and for an entry found being written at every look,
+    /// again after `sync` (the server's call::sync, which returns once
+    /// that write is done), SYNC_TRIES times at most.  The server's budget
+    /// can run out in the middle of a write, and a caller that floods it
+    /// makes that happen now and then: the entry is then unreadable until
+    /// the server's next budget, which `sync` waits for (less than
+    /// FLAGS_PERIOD_US, and a request of the flooder's), rather than the
+    /// reader being refused.  None if the entry is still being written
+    /// after that, as a failed server leaves it.
+    pub fn read_synced(&self, mut sync: impl FnMut()) -> Option<Flags> {
+        for _ in 0..Self::SYNC_TRIES {
+            if let Some(flags) = self.try_read() {
+                return Some(flags);
+            }
+            sync();
+        }
+        self.try_read()
     }
 
     /// Serialized by the flags endpoint. Positive errno on failure;
@@ -426,14 +443,13 @@ impl FlagsEntry {
             if op == FLAGS_ACT { next.taint[i] |= bits[i]; }
             if op == FLAGS_SEAL || flags & abi::ACT_SEAL as u64 != 0 { next.seal[i] |= bits[i]; }
         }
-        self.seq.fetch_add(1, Ordering::Relaxed);
-        fence(Ordering::Release);
-        self.instance.store(instance, Ordering::Relaxed);
-        for i in 0..4 {
-            self.taint[i].store(next.taint[i], Ordering::Relaxed);
-            self.seal[i].store(next.seal[i], Ordering::Relaxed);
-        }
-        self.seq.fetch_add(1, Ordering::Release);
+        crate::seqlock::write(&self.seq, |_| {
+            self.instance.store(instance, Ordering::Relaxed);
+            for i in 0..4 {
+                self.taint[i].store(next.taint[i], Ordering::Relaxed);
+                self.seal[i].store(next.seal[i], Ordering::Relaxed);
+            }
+        });
         Ok(next)
     }
 }
@@ -665,9 +681,20 @@ mod tests {
             assert_eq!(f.acted(1), Err(EAGAIN));
             assert_eq!(f.act(1, true, || panic!("acted on flags it could not read")), Err(EAGAIN));
         }
-        // The write ends: the entry reads again.
-        e.seq.fetch_add(1, Ordering::Relaxed);
+        // A reader that asks the server gets the entry once the server has
+        // gone on, and nothing from one that never does.
+        let mut asked = 0;
+        assert_eq!(e.read_synced(|| asked += 1), None);
+        assert_eq!(asked, FlagsEntry::SYNC_TRIES);
+        let mut asked = 0;
+        let f = e.read_synced(|| {
+            asked += 1;
+            e.seq.fetch_add(1, Ordering::Relaxed);
+        });
+        assert_eq!((f.map(|f| f.seal[0]), asked), (Some(1), 1));
+        // The write has ended: the entry reads again, without asking.
         assert_eq!(e.read().seal[0], 1);
+        assert_eq!(e.read_synced(|| panic!("asked for an entry that reads")).map(|f| f.seal[0]), Some(1));
         // No guest's entry can pass for an unreadable one.
         assert_eq!(unsafe { e.update(Sender::Vmmgr, FLAGS_ACT, u64::MAX, 0, [1, 0, 0, 0], 0) }, Err(EINVAL));
     }

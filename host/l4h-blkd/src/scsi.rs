@@ -229,7 +229,7 @@ impl VirtioScsi {
                 notify_len: cfg.notify.len as usize,
                 device: Mmio(cfg.device.va as usize),
             };
-            if !dev.reset() {
+            if !dev.reset(l4h_rt::timeout_ms(l4h_virtio::RESET_MS)) {
                 panic!("blkd {:#x}: device did not reset", id);
             }
             let offered = dev.features();

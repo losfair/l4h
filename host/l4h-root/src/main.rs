@@ -328,6 +328,20 @@ impl Host {
         self.ctrls.iter().all(|c| c.ready()) && self.netd.ready()
     }
 
+    /// The drivers have had DRIVERS_SLOW_SECS: say which boot still waits
+    /// for.
+    fn log_unready_drivers(&self) {
+        for (c, ctrl) in self.ctrls.iter().enumerate() {
+            if !ctrl.ready() {
+                log!("l4h-root: disk controller {}: blkd has not reported its disks yet; boot waits {} s more at most",
+                    c, DRIVERS_READY_SECS - DRIVERS_SLOW_SECS);
+            }
+        }
+        if !self.netd.ready() {
+            log!("l4h-root: netd has not reported its NICs yet; boot waits {} s more at most", DRIVERS_READY_SECS - DRIVERS_SLOW_SECS);
+        }
+    }
+
     /// The drivers have had DRIVERS_READY_SECS: one that has not published
     /// is failed as one that faulted, so that boot goes on without it.
     fn fail_unready_drivers(&mut self) {
@@ -783,10 +797,16 @@ const TIMER_MS: u64 = 100;
 /// (finish_boot), from when the serve loop starts, right after they were
 /// started.  Root never waits on a driver without a bound: one that has
 /// not published by then is failed (Host::fail_unready_drivers), and the
-/// host boots without what it drove.  Longer than a healthy controller
-/// takes to come up: an NVMe drive may take many seconds to become ready,
-/// and NIC firmware commands a few.
-const DRIVERS_READY_SECS: u64 = 30;
+/// host boots without what it drove, until reboot.  That is the end of a
+/// driver that hangs, not of one that is slow: a driver gives its own
+/// device up long before (an NVMe controller that does not become ready,
+/// a virtio device that does not reset, a NIC command that is not
+/// answered), panics, and is failed at once as any that faults.  So the
+/// bound is far beyond what a controller that works takes, on slow
+/// emulation too, and root says after DRIVERS_SLOW_SECS which drivers it
+/// still waits for.
+const DRIVERS_READY_SECS: u64 = 180;
+const DRIVERS_SLOW_SECS: u64 = 30;
 
 pub fn arm_timer(info: &HostInfo) {
     set_timer(rdtsc() + info.tsc_hz * TIMER_MS / 1000);
@@ -819,8 +839,10 @@ struct Root<'a> {
     h: &'a mut Host,
     modules: &'a bootmod::Modules,
     booting: bool,
-    /// When boot stops waiting for the drivers (DRIVERS_READY_SECS).
+    /// When boot stops waiting for the drivers (DRIVERS_READY_SECS), and
+    /// when it says which it waits for (DRIVERS_SLOW_SECS; None once said).
     drivers_deadline: u64,
+    drivers_slow: Option<u64>,
     next_watchdog: u64,
 }
 
@@ -828,8 +850,9 @@ fn serve(h: &mut Host, reply: ReplySlot, modules: &bootmod::Modules) -> ! {
     arm_timer(&h.info);
     let next_watchdog = watchdog_after(h);
     let hyp_ep = h.info.hyp_ep;
-    let drivers_deadline = rdtsc().saturating_add(h.info.tsc_hz.saturating_mul(DRIVERS_READY_SECS));
-    l4h_ipc::run(hyp_ep, reply, &mut Root { h, modules, booting: true, drivers_deadline, next_watchdog })
+    let after = |secs: u64| rdtsc().saturating_add(h.info.tsc_hz.saturating_mul(secs));
+    let (drivers_deadline, drivers_slow) = (after(DRIVERS_READY_SECS), Some(after(DRIVERS_SLOW_SECS)));
+    l4h_ipc::run(hyp_ep, reply, &mut Root { h, modules, booting: true, drivers_deadline, drivers_slow, next_watchdog })
 }
 
 impl l4h_ipc::Server for Root<'_> {
@@ -846,8 +869,14 @@ impl l4h_ipc::Server for Root<'_> {
         // Drivers' answers, and what a quarantine left (blkd::poll).  Not
         // on a call: it would overwrite the caller's message registers.
         h.poll_drivers();
-        if self.booting && !h.drivers_ready() && rdtsc() > self.drivers_deadline {
-            h.fail_unready_drivers();
+        if self.booting && !h.drivers_ready() {
+            let now = rdtsc();
+            if now > self.drivers_deadline {
+                h.fail_unready_drivers();
+            } else if self.drivers_slow.is_some_and(|at| now > at) {
+                self.drivers_slow = None;
+                h.log_unready_drivers();
+            }
         }
         if self.booting && h.drivers_ready() {
             self.booting = false;

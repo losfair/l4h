@@ -241,14 +241,7 @@ pub const STATUS_TRIES: usize = 16;
 impl Status {
     /// A consistent copy of the fields, None while it is being written.
     pub fn read(&self) -> Option<Status> {
-        use core::sync::atomic::{Ordering, fence};
-        let seq = self.seq.load(Ordering::Acquire);
-        if seq & 1 != 0 {
-            return None;
-        }
-        let copy = unsafe { core::ptr::read_volatile(self) };
-        fence(Ordering::Acquire);
-        (self.seq.load(Ordering::Relaxed) == seq).then_some(copy)
+        crate::seqlock::look(&self.seq, || unsafe { core::ptr::read_volatile(self) })
     }
 
     /// A consistent copy of the page at `va`, in a few tries: None if memd
@@ -258,7 +251,7 @@ impl Status {
     /// `va` must be mapped to memd's aligned, readable status page.
     pub unsafe fn read_at(va: usize) -> Option<Status> {
         let st = unsafe { &*(va as *const Status) };
-        (0..STATUS_TRIES).find_map(|_| st.read())
+        crate::seqlock::read(&st.seq, STATUS_TRIES, || unsafe { core::ptr::read_volatile(st) })
     }
 
     /// Write the page at `va` (memd, its one writer): `fields`, whose
@@ -267,16 +260,12 @@ impl Status {
     /// # Safety
     /// `va` must be mapped to the aligned, writable status page.
     pub unsafe fn write_at(va: usize, fields: Status) {
-        use core::sync::atomic::{Ordering, fence};
         let p = va as *mut Status;
-        let seq = unsafe { &(*p).seq };
-        let odd = seq.load(Ordering::Relaxed) | 1;
-        seq.store(odd, Ordering::Relaxed);
-        fence(Ordering::Release);
-        // The count the copy carries is the odd one already there.
-        fields.seq.store(odd, Ordering::Relaxed);
-        unsafe { p.write_volatile(fields) };
-        seq.store(odd.wrapping_add(1), Ordering::Release);
+        crate::seqlock::write(unsafe { &(*p).seq }, |odd| {
+            // The count the copy carries is the odd one already there.
+            fields.seq.store(odd, core::sync::atomic::Ordering::Relaxed);
+            unsafe { p.write_volatile(fields) };
+        });
     }
 }
 

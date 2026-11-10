@@ -74,6 +74,7 @@ pub struct Trustd {
     hw: Option<Hw>,
     /// Refused accesses (`hw`) that root logs: trustd asks as often as it
     /// likes, and must not fill root's log with them.
+    #[cfg(target_arch = "x86_64")]
     hw_refusals: host::log::RateLimit<1>,
 }
 
@@ -561,7 +562,8 @@ fn finish(
     component::start(&comp);
     Some(Trustd { comp, flags_server, arena, registry: REGISTRY_VA as *mut GuestRecord,
         no_reports, failed: false, relay, pages, second: core::array::from_fn(|_| Cell::new(false)), status, kick, flags,
-        #[cfg(target_arch = "x86_64")] hw, hw_refusals: host::log::RateLimit::new() })
+        #[cfg(target_arch = "x86_64")] hw,
+        #[cfg(target_arch = "x86_64")] hw_refusals: host::log::RateLimit::new() })
 }
 
 impl Trustd {
@@ -926,17 +928,14 @@ pub fn channel_message(h: &mut Host, peer: u32, ty: u32, msg: &[u8]) {
     }
     let va = relay_va(trust::relay_slot_va(peer as usize) - trust::RELAY_VA);
     let slot = unsafe { &*(va as *const trust::RelaySlot) };
-    use core::sync::atomic::Ordering;
-    let seq = slot.seq.load(Ordering::Relaxed);
-    slot.seq.store(seq | 1, Ordering::Relaxed);
-    core::sync::atomic::fence(Ordering::Release);
-    unsafe {
-        core::ptr::copy_nonoverlapping(msg.as_ptr(), (va + trust::RELAY_SLOT_HEADER) as *mut u8, msg.len());
-    }
-    slot.len.store(msg.len() as u32, Ordering::Relaxed);
-    // `seq` comes from a page the peer's trustd maps writable: never let its
-    // value overflow root's own increment.
-    slot.seq.store((seq | 1).wrapping_add(1), Ordering::Release);
+    // The count is in a page trustd maps writable: whatever it holds,
+    // the write leaves it even, and wraps.
+    host::seqlock::write(&slot.seq, |_| {
+        unsafe {
+            core::ptr::copy_nonoverlapping(msg.as_ptr(), (va + trust::RELAY_SLOT_HEADER) as *mut u8, msg.len());
+        }
+        slot.len.store(msg.len() as u32, core::sync::atomic::Ordering::Relaxed);
+    });
     relay.signal();
 }
 

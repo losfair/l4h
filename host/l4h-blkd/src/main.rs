@@ -196,10 +196,29 @@ struct Blkd {
     seq: u64,
     /// Completions the driver has reported so far.
     reaped: u64,
-    /// The client `remove` is draining: `submit` takes nothing more from
-    /// its channel.
-    draining: Option<usize>,
+    /// The clients `remove` is draining, by slot: `submit` takes nothing
+    /// more from their channels.
+    drains: [Option<Drain>; blk::MAX_CLIENTS],
 }
+
+/// A client's drain (`Blkd::remove`), which root asks for again until it
+/// ends.
+#[derive(Clone, Copy)]
+struct Drain {
+    /// Blkd::seq when it began: requests below it are the ones the device
+    /// had then.
+    first: u64,
+    /// Of those, how many were pending at the last look, and when the
+    /// device is given up if no more of them complete.
+    left: usize,
+    end: u64,
+}
+
+/// What `Blkd::remove` says of a drain.
+const DRAINED: u64 = 0;
+/// The slice ended with requests still in flight and the device
+/// completing them: root asks again.
+const DRAINING: u64 = 1;
 
 /// What each slot's client holds, for blk::Reservations.
 fn holds(clients: &[Option<Client>]) -> impl Fn(usize) -> Option<blk::Hold<'static>> + '_ {
@@ -287,7 +306,7 @@ impl Blkd {
             let mut progress = false;
             for off in 0..n {
                 let i = self.active[(self.next + off) % n];
-                if self.draining == Some(i) { continue; }
+                if self.drains[i].is_some() { continue; }
                 let Some(c) = self.clients[i].as_mut() else { continue };
                 for _ in 0..4 {
                     if self.carry.is_some() || !self.drv.can_start() { break; }
@@ -359,39 +378,51 @@ impl Blkd {
         host::ticks::now() > *end
     }
 
-    /// Drain client `i` and forget it: 0, or u64::MAX if the device
+    /// How long one `remove` drains before it answers root, which has
+    /// other requests for this blkd in the ring behind it.
+    fn slice(&self) -> u64 { host::ticks::now().saturating_add(self.ticks_per_sec) }
+
+    /// Drain client `i` and forget it: DRAINED; DRAINING if a slice was
+    /// not enough, and root is to ask again; or u64::MAX if the device
     /// stopped completing what it had.
+    ///
+    /// The client's channel is no longer read from the first call on; the
+    /// other clients are served meanwhile, and between the calls.  Polling
+    /// the hardware drains only submitted work; no controller reset
+    /// disrupts other clients.  The device is given up only when, for the
+    /// bound, it finishes none of the requests it had when the drain
+    /// began: a slow device gets the time those need, each of bounded
+    /// size.  What the other clients submit meanwhile is no progress, so
+    /// the drain ends.  One call lasts a slice at most: a drain that takes
+    /// long does not keep root's other requests waiting for all of it.
     fn remove(&mut self, i: usize) -> u64 {
         if i >= self.clients.len() { return u64::MAX; }
-        // Stop consuming this channel first; the other clients are served
-        // meanwhile.  Polling the hardware drains only submitted work; no
-        // controller reset disrupts other clients.
-        self.draining = Some(i);
-        // The device is given up only when, for the bound, it finishes
-        // none of the requests it had when the drain began: a slow device
-        // gets the time those need, each of bounded size.  What the other
-        // clients submit meanwhile is no progress, so the drain ends.
-        let first = self.seq;
-        let old = |b: &Blkd| b.pending.iter().flatten().filter(|p| p.seq < first).count();
-        let (mut left, mut end) = (old(self), self.deadline());
-        let mut drained = true;
+        let old = |b: &Blkd, first: u64| b.pending.iter().flatten().filter(|p| p.seq < first).count();
+        let mut d = match self.drains[i] {
+            Some(d) => d,
+            None => Drain { first: self.seq, left: old(self, self.seq), end: self.deadline() },
+        };
+        self.drains[i] = Some(d);
+        let slice = self.slice();
         while self.clients[i].as_ref().is_some_and(|c| c.outstanding != 0) {
             self.reap();
             self.submit();
-            let still = old(self);
-            if still < left {
-                (left, end) = (still, self.deadline());
-            } else if host::ticks::now() > end {
-                drained = false;
-                break;
+            let (still, now) = (old(self, d.first), host::ticks::now());
+            if still < d.left {
+                (d.left, d.end) = (still, self.deadline());
+            } else if now > d.end {
+                // Root quarantines the controller: nothing is left to drain.
+                self.drains[i] = None;
+                return u64::MAX;
             }
+            self.drains[i] = Some(d);
+            if now > slice { return DRAINING; }
             core::hint::spin_loop();
         }
-        self.draining = None;
-        if !drained { return u64::MAX; }
+        self.drains[i] = None;
         self.clients[i] = None;
         self.active.retain(|&a| a != i);
-        0
+        DRAINED
     }
 
     /// A blk::STATUS_* (u64::MAX: the device failed), or the errno the
@@ -515,7 +546,11 @@ impl blk::call::Server for Requests<'_> {
     }
 
     fn remove(&mut self, _: blk::Sender, client: usize) -> Result<(), Errno> {
-        if self.b.remove(client) == 0 { Ok(()) } else { Err(errno::EBUSY) }
+        match self.b.remove(client) {
+            DRAINED => Ok(()),
+            DRAINING => Err(errno::EAGAIN),
+            _ => Err(errno::EBUSY),
+        }
     }
 
     fn write(&mut self, _: blk::Sender, sector: u64, length: usize, unit: usize) -> Result<u64, Errno> {
@@ -586,7 +621,7 @@ fn main(info: &'static Info) -> ! {
         pending: [None; MAX_INFLIGHT],
         carry: None,
         drv, dev, next: 0, ticks_per_sec: info.header().tsc_hz,
-        seq: 0, reaped: 0, draining: None,
+        seq: 0, reaped: 0, drains: [None; blk::MAX_CLIENTS],
     };
     // The only references to the scratch table.
     let scratch_order = unsafe { &mut *addr_of_mut!(SCRATCH_ORDER) };

@@ -24,6 +24,7 @@ pub mod memd;
 pub mod net;
 pub mod ring;
 pub mod root;
+pub mod seqlock;
 pub mod serial;
 pub mod spsc;
 pub mod trust;

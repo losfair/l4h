@@ -454,20 +454,34 @@ fn run_paced(reads: u32, requests: &[((u64, [u64; 6]), bool)], set: impl FnOnce(
 #[test]
 fn a_slow_device_drains_and_one_that_stopped_does_not() {
     let _lock = lock();
-    let remove = [(post(Request::Remove { client: 0 }), false)];
+    // Root asks again while blkd says the client still drains (EAGAIN,
+    // after a slice: a fifth of the bound): as often as two bounds take.
+    let remove = [(post(Request::Remove { client: 0 }), false); 12];
+    let outcome = |r: &[[u64; 5]]| {
+        let all: Vec<_> = r.iter().map(|w| wire::reply::<reply::Remove>(w)).collect();
+        let again = all.iter().take_while(|&&a| a == Err(errno::EAGAIN)).count();
+        (again, all.get(again).copied())
+    };
     // A completion every eighth of the bound: the twelve requests take
     // longer than the bound, and none of them does.
     map_client();
     let r = run_paced(12, &remove, |k, hz| k.pace = hz * BOUND_MS / 8 / 1000);
     let done = unsafe { (*channel()).cq.head.load(Ordering::Relaxed) };
     unmap_client();
-    assert_eq!(wire::reply::<reply::Remove>(&r[0]), Ok(()), "a device that keeps completing is not failed");
+    let (again, end) = outcome(&r);
+    assert_eq!(end, Some(Ok(())), "a device that keeps completing is not failed: {r:?}");
+    // The drain took more than one slice: root's other requests had
+    // their turn in between.
+    assert!(again >= 2, "one call drained for {again} slices only");
     assert_eq!(done, 12);
-    // A device that completes nothing for the bound has failed.
+    // A device that completes nothing for the bound has failed, and not
+    // before the bound: blkd says so after the slices of one.
     map_client();
     let r = run_paced(2, &remove, |k, _| k.stuck = true);
     unmap_client();
-    assert_eq!(wire::reply::<reply::Remove>(&r[0]), Err(errno::EBUSY));
+    let (again, end) = outcome(&r);
+    assert_eq!(end, Some(Err(errno::EBUSY)), "{r:?}");
+    assert!((3..=6).contains(&again), "given up after {again} slices");
 }
 
 #[test]
@@ -486,12 +500,19 @@ fn other_clients_are_served_while_one_drains() {
     // client 0 is under way; client 0's two requests complete slowly.
     // Client 1 is then removed in turn, which drains its request.
     let requests = [(post(Request::Add { client: 1, unit: 0, dom0: false, n: 0 }), false),
-        (post(Request::Remove { client: 0 }), true), (post(Request::Remove { client: 1 }), false)];
+        (post(Request::Remove { client: 0 }), true), (post(Request::Remove { client: 0 }), false),
+        (post(Request::Remove { client: 1 }), false), (post(Request::Remove { client: 1 }), false)];
     let r = run_paced(2, &requests, |k, hz| (k.pace, k.publish) = (hz * BOUND_MS / 8 / 1000, 1));
     let answered = unsafe { ((*chan(1)).cq.head.load(Ordering::Relaxed), (*chan(1)).resps[0].id) };
     unmap(0);
     unmap(1);
-    assert_eq!((r[0][0], wire::reply::<reply::Remove>(&r[1]), wire::reply::<reply::Remove>(&r[2])), (0, Ok(()), Ok(())));
+    // Each removal is asked for twice: a drain may take more than a slice,
+    // and one asked of a client that is gone is done.
+    let removed = |k: usize| wire::reply::<reply::Remove>(&r[k]);
+    assert_eq!(r[0][0], 0);
+    assert!(matches!(removed(1), Ok(()) | Err(errno::EAGAIN)), "{:?}", removed(1));
+    assert_eq!((removed(2), removed(4)), (Ok(()), Ok(())));
+    assert!(matches!(removed(3), Ok(()) | Err(errno::EAGAIN)), "{:?}", removed(3));
     assert_eq!(answered, (1, 9));
     KERNEL.with_borrow(|k| {
         // The third request the device starts is client 1's, at its

@@ -115,7 +115,7 @@ impl VirtioNet {
             (rxq, txq, want, mac, Some(p), if want & VIRTIO_NET_F_MRG_RXBUF != 0 { HDR } else { LEGACY_HDR })
         } else {
             let dev = modern_device(c);
-            if !dev.reset() { panic!("netd: NIC {} does not reset", n); }
+            if !dev.reset(l4h_rt::timeout_ms(l4h_virtio::RESET_MS)) { panic!("netd: NIC {} does not reset", n); }
             let offered = dev.features();
             let want = F_VERSION_1 | wanted(offered) | (offered & F_ACCESS_PLATFORM);
             if offered & F_VERSION_1 == 0 || !dev.set_features(want) {

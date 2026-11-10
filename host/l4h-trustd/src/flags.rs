@@ -11,10 +11,15 @@ use l4h_rt::host::trust::call::{self, Client as _};
 use l4h_rt::{cap, host, host::trust::{self, Flags, Sender, FlagsEntry}, sel4};
 use sel4::cap_type;
 
-/// Guest `id`'s flags as `instance`; None if they could not be read (the
-/// server was stopped in the middle of a write: FlagsEntry::try_read).
+/// Guest `id`'s flags as `instance`; None if they could not be read: the
+/// server was stopped in the middle of a write, and still had not ended
+/// it when asked to (FlagsEntry::read_synced), as one that failed.
 pub fn read(id: usize, instance: u64) -> Option<Flags> {
-    unsafe { &*(trust::FLAGS_VA as *const FlagsEntry).add(id) }.try_read().map(|f| f.for_instance(instance))
+    let ep = l4h_rt::ipc::Endpoint::of(&l4h_rt::host::wiring::TRUSTD_FLAGS, l4h_rt::host::wiring::p::Trustd, 0);
+    let sync = || {
+        let _ = ep.sync();
+    };
+    unsafe { &*(trust::FLAGS_VA as *const FlagsEntry).add(id) }.read_synced(sync).map(|f| f.for_instance(instance))
 }
 
 /// Act on or seal (trust::FLAGS_ACT, FLAGS_SEAL) guest `id`'s flags,
@@ -40,6 +45,11 @@ fn entry(id: usize) -> Result<(&'static FlagsEntry, u64), Errno> {
 
 impl call::Server for Entries {
     fn ready(&mut self, _: Sender) -> Result<(), Errno> {
+        Ok(())
+    }
+
+    fn sync(&mut self, _: Sender) -> Result<(), Errno> {
+        // Served in its turn: any write that was under way has ended.
         Ok(())
     }
 

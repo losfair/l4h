@@ -177,14 +177,7 @@ const _: () = assert!(core::mem::size_of::<Status>() <= 4096);
 impl GuestStatus {
     /// A consistent copy of the fields, None while it is being written.
     pub fn read(&self) -> Option<GuestStatus> {
-        use core::sync::atomic::{Ordering, fence};
-        let seq = self.seq.load(Ordering::Acquire);
-        if seq & 1 != 0 {
-            return None;
-        }
-        let copy = unsafe { core::ptr::read_volatile(self) };
-        fence(Ordering::Acquire);
-        (self.seq.load(Ordering::Relaxed) == seq).then_some(copy)
+        crate::seqlock::look(&self.seq, || unsafe { core::ptr::read_volatile(self) })
     }
 }
 

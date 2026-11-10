@@ -202,8 +202,18 @@ impl Flags {
         (cfg.trust != 0).then(|| Flags { ep: Endpoint::of(&wiring::VMMGR_FLAGS, wiring::p::Vmmgr, 0) })
     }
 
+    /// The guest's flags; trust::Flags::UNAVAILABLE if the server was
+    /// writing them at every look and after it was asked to finish
+    /// (FlagsEntry::read_synced), as one that failed in a write.
     pub fn flags(&self, g: &Guest) -> trust::Flags {
-        unsafe { &*(proto::FLAGS_VA as *const trust::FlagsEntry).add(g.id) }.read().for_instance(g.instance)
+        use l4h_host::trust::call::Client;
+        let sync = || {
+            let _ = self.ep.sync();
+        };
+        unsafe { &*(proto::FLAGS_VA as *const trust::FlagsEntry).add(g.id) }
+            .read_synced(sync)
+            .unwrap_or(trust::Flags::UNAVAILABLE)
+            .for_instance(g.instance)
     }
 
     /// Seal check on every op, ACT only for its first taint. `effect`

@@ -75,7 +75,7 @@ impl Balloon {
             notify_len: cfg.notify_len as usize,
             device: Mmio(BalloonConfig::va(cfg.device)),
         };
-        if !dev.reset() { return None; }
+        if !dev.reset(l4h_rt::timeout_ms(virtio::RESET_MS)) { return None; }
         let offered = dev.features();
         if offered & virtio::F_VERSION_1 == 0 || offered & F_REPORTING == 0 {
             l4h_rt::info!("memd: balloon: no free page reporting (features {:#x})", offered);

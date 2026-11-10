@@ -145,27 +145,32 @@ pub struct Device {
     pub device: Mmio,
 }
 
-/// Reads of the device status a reset waits through.  The driver has no
-/// clock here, so the bound is a count: each read is a round trip to the
-/// device (or to its hypervisor), a second or more in all, where a device
-/// that works reads 0 within a few.
-const RESET_READS: u32 = 10_000_000;
+/// How long a reset waits for the device status to read 0, in
+/// milliseconds: a device that works does within a few reads.  A time and
+/// not a count of reads, each of which is a round trip to the device or a
+/// trap to its hypervisor, and takes anything from 100 ns to many
+/// microseconds.
+pub const RESET_MS: u64 = 1000;
 
 impl Device {
     /// Reset the device and acknowledge it: false if its status does not
-    /// read 0 within RESET_READS reads (the device has failed, and the
-    /// driver must not go on with it).
+    /// read 0 before `expired` says the time is up (RESET_MS, which the
+    /// caller measures: l4h_rt::timeout_ms): the device has failed, and
+    /// the driver must not go on with it.  The status is read once at
+    /// least.
     #[must_use]
-    pub fn reset(&self) -> bool {
+    pub fn reset(&self, mut expired: impl FnMut() -> bool) -> bool {
         self.common.w8(DEVICE_STATUS, 0);
-        for _ in 0..RESET_READS {
+        loop {
             if self.common.r8(DEVICE_STATUS) == 0 {
                 self.common.w8(DEVICE_STATUS, STATUS_ACK | STATUS_DRIVER);
                 return true;
             }
+            if expired() {
+                return false;
+            }
             core::hint::spin_loop();
         }
-        false
     }
 
     pub fn features(&self) -> u64 {

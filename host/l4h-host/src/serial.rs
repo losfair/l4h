@@ -433,18 +433,19 @@ pub fn init<const N: usize>(ring: &'static Lane<N>, _source: u32) {
 /// Call before starting another thread.
 ///
 /// A lane that was another writer's and was left as no honest writer
-/// leaves one is reset first, as the log's (`log::init_lane`,
-/// `ring::View::adopt`): this writer's lines would not print otherwise.
-/// One as deep as `Ring` may be a secondary partition's ring, which its
-/// other tasks write meanwhile, with later times than this task's: there
-/// times are not looked at, and an honest ring is never reset. (Dom0's
-/// lane is as deep; a line left in it with a later time only prints when
-/// its turn comes, as dom0's console.)
+/// leaves one (its head or its slots' states) is reset first, as the
+/// log's (`log::init_lane`, `ring::View::adopt`): this writer's lines
+/// would not print otherwise.  The records' times are not looked at here,
+/// unlike the log's: the ring may be a secondary partition's, which its
+/// other tasks write meanwhile with later times than this task's, and a
+/// ring they write honestly must never be reset, whatever its size.  A
+/// line a lane's last writer left with a later time is no loss either:
+/// `Merge` prints a record when it is the oldest waiting, not when its
+/// time comes, under the lane's label as that writer's lines were.
 pub fn init_lane(records: usize) {
     if records != 0 {
-        let now = (records != CAPACITY).then(crate::ticks::now_ordered);
         // The parent mapped a lane of `records` records there for good.
-        unsafe { View::<WORDS>::at(VA + RING_OFFSET, records) }.adopt(now);
+        unsafe { View::<WORDS>::at(VA + RING_OFFSET, records) }.adopt(None);
     }
     LANE_RECORDS.store(records, SeqCst);
     LANE_VA.store(if records == 0 { 0 } else { VA + RING_OFFSET }, SeqCst);

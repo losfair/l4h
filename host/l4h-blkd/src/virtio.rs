@@ -75,7 +75,7 @@ impl VirtioBlk {
             device: Mmio(cfg.device.va as usize),
         });
         let (vq, features, ports, capacity, block_size, seg_max) = if let Some(dev) = &modern {
-            if !dev.reset() {
+            if !dev.reset(l4h_rt::timeout_ms(l4h_virtio::RESET_MS)) {
                 panic!("blkd {:#x}: device did not reset", id);
             }
             let offered = dev.features();

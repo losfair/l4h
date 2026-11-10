@@ -115,7 +115,10 @@ crate::protocol! {
         /// checks again (Reservations::admits) and builds the client's
         /// ExtentTable at extent_va(client).
         Add / add = 2 from [Root] (client: usize, unit: usize, dom0: bool, n: usize) -> ();
-        /// Drain and forget a client: EBUSY if it did not drain.
+        /// Drain and forget a client.  EAGAIN while it still drains, for
+        /// root to ask again (blkd answers within a second, and reads the
+        /// client's channel no more); EBUSY if the device stopped
+        /// completing what it had.
         Remove / remove = 3 from [Root] (client: usize) -> ();
         /// Write `length` bytes of staging at `sector` of `unit`: a
         /// STATUS_* (u64::MAX: the device failed), or the errno the range

@@ -885,7 +885,18 @@ fn complete(h: &mut Host, c: usize, op: BlkOp, w: [u64; host::mailbox::ANSWER]) 
             };
             crate::vmmgr::op_done(h, token, r);
         }
-        BlkOp::Remove { client } => removed(h, c, client, wire::reply::<reply::Remove>(&w).is_ok()),
+        BlkOp::Remove { client } => match wire::reply::<reply::Remove>(&w) {
+            // Still draining, on a device that completes: asked again
+            // (flush_backlog), after whatever else waits in the ring.
+            Err(host::errno::EAGAIN) => {
+                let ctrl = &mut h.ctrls[c];
+                if let Some(r) = ctrl.clients[client].as_mut().and_then(|a| a.remove.as_mut()) {
+                    r.posted = false;
+                }
+                ctrl.backlog = true;
+            }
+            r => removed(h, c, client, r.is_ok()),
+        },
         BlkOp::Write { token } => {
             let ctrl = &mut h.ctrls[c];
             ctrl.staging_busy = false;

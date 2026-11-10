@@ -54,8 +54,10 @@ const _: () = assert!(uabi::AREA_PAGES <= 1 << QUEUE_RADIX);
 
 /// How long root waits for a controller the firmware is resetting (CNR)
 /// before it reads its capabilities: root serves every guest's requests,
-/// so no longer.  A controller not ready by then is busy (EBUSY): the
-/// attachment is tried again.
+/// so no longer.  A controller not ready by then is busy (EBUSY), and the
+/// attachment is its caller's to make again: vmmgr does for dom0's boot,
+/// on its timer, for a second (its DOM0_USB_WAIT_MS); a control request's
+/// answer is EBUSY.
 const CAP_WAIT_MS: u64 = 5;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
