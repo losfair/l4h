@@ -234,15 +234,16 @@ config PARAVIRT_SPINLOCKS
 	depends on PARAVIRT && SMP
 	default y
 	help
-	  A vCPU that has waited for a spinlock for a while blocks until
-	  the lock is passed to it, instead of spinning for as long as the
-	  lock's holder, or a waiter ahead of it, is not running: its vCPU
-	  lost the core to another thread, or ran out of budget under a
-	  CPU cap.  The time is left to other vCPUs, and under a cap is
-	  not taken from the waiter's own budget.
+	  A vCPU that has queued for a spinlock for a while blocks until
+	  the lock is free or passed to it, instead of spinning for as long
+	  as the lock's holder, or a waiter ahead of it, is not running:
+	  its vCPU lost the core to another thread, or ran out of budget
+	  under a CPU cap.  The time is left to other vCPUs, and under a
+	  cap is not taken from the waiter's own budget.  Waiters that
+	  arrive once the first in the queue has blocked still spin.
 
 	  Unlocking costs a compare-and-exchange instead of a store.
-	  Guests with one vCPU keep the plain locks, as does any guest
+	  Guests given one vCPU keep the plain locks, as does any guest
 	  booted with "nopvspin".
 
 	  If unsure, say Y.

@@ -13,6 +13,14 @@
  * Each lock guards a counter that is read, then written back incremented:
  * two vCPUs inside at once lose an increment, and leave their mark in
  * `owner`.  Loading fails unless every increment is there.
+ *
+ * Two kinds of waiter are counted when they blocked, from their vCPU's
+ * own count of waits, which nothing else can raise meanwhile: those with
+ * interrupts off, and timers run from an event's delivery, which block
+ * with events pending.  And the holder of the first lock,
+ * during a long hold, calls a function on every other vCPU and waits for
+ * it: a vCPU blocked for that lock with interrupts on must take the IPI,
+ * or the test never ends.
  */
 #include <linux/atomic.h>
 #include <linux/cpumask.h>
@@ -22,8 +30,10 @@
 #include <linux/percpu.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
+#include <linux/smp.h>
 #include <linux/spinlock.h>
 #include <linux/timer.h>
+#include <l4h_sys.h>
 
 static unsigned int secs = 3;
 module_param(secs, uint, 0444);
@@ -44,18 +54,34 @@ static DEFINE_RWLOCK(rw_lock);
 static struct guarded plain, irq, bh, rw;
 static atomic_long_t violations;
 static atomic_long_t timer_done;
+static atomic_long_t timer_blocked;
+static atomic_long_t ipis;
 
 struct worker {
 	struct task_struct *task;
 	struct timer_list timer;
 	unsigned long done[4];
+	unsigned long irqoff_blocked;
 };
 static DEFINE_PER_CPU(struct worker, workers);
 
+/* How often this vCPU has waited in seL4 for a spinlock (the PVW row of
+ * /proc/interrupts).  Only the vCPU itself counts. */
+static unsigned long my_waits(void)
+{
+	return READ_ONCE(l4h_vcpus[raw_smp_processor_id()].pv_waits);
+}
+
+static void pvlock_ipi(void *arg)
+{
+	atomic_long_inc(&ipis);
+}
+
 /* The critical section.  Called with g's lock held. */
-static void enter(struct guarded *g, bool hold)
+static void enter(struct guarded *g, bool hold, bool ipi)
 {
 	unsigned long n;
+	int cpu;
 
 	if (READ_ONCE(g->owner))
 		atomic_long_inc(&violations);
@@ -63,14 +89,26 @@ static void enter(struct guarded *g, bool hold)
 	n = READ_ONCE(g->count);
 	if (hold)
 		udelay(hold_us);
+	/* By now the lock's waiters have blocked. */
+	if (ipi)
+		for_each_online_cpu(cpu)
+			if (cpu != raw_smp_processor_id())
+				smp_call_function_single(cpu, pvlock_ipi, NULL, 1);
 	WRITE_ONCE(g->count, n + 1);
 	WRITE_ONCE(g->owner, 0);
 }
 
 static void pvlock_timer(struct timer_list *t)
 {
+	/* Run from an event's delivery (in_irq), a timer takes no further
+	 * event: a wait is this lock's, and blocks whatever is pending. */
+	struct l4h_vcpu *v = &l4h_vcpus[raw_smp_processor_id()];
+	unsigned long waits = READ_ONCE(v->pv_waits);
+
 	spin_lock(&bh_lock);
-	enter(&bh, false);
+	if (v->in_irq && READ_ONCE(v->pv_waits) != waits)
+		atomic_long_inc(&timer_blocked);
+	enter(&bh, false, false);
 	spin_unlock(&bh_lock);
 	atomic_long_inc(&timer_done);
 	mod_timer(t, jiffies + 1);
@@ -79,7 +117,7 @@ static void pvlock_timer(struct timer_list *t)
 static int pvlock_thread(void *arg)
 {
 	struct worker *w = arg;
-	unsigned long flags, i = 0;
+	unsigned long flags, waits, i = 0;
 
 	while (!kthread_should_stop()) {
 		/* The long holds fall on different iterations of each
@@ -88,24 +126,28 @@ static int pvlock_thread(void *arg)
 
 		if (i % 8 == 7) {
 			if (spin_trylock(&plain_lock)) {
-				enter(&plain, false);
+				enter(&plain, false, false);
 				spin_unlock(&plain_lock);
 				w->done[0]++;
 			}
 		} else {
 			spin_lock(&plain_lock);
-			enter(&plain, slow == 0);
+			enter(&plain, slow == 0, slow == 0);
 			spin_unlock(&plain_lock);
 			w->done[0]++;
 		}
 
-		spin_lock_irqsave(&irq_lock, flags);
-		enter(&irq, slow == 1);
+		local_irq_save(flags);
+		waits = my_waits();
+		spin_lock(&irq_lock);
+		if (my_waits() != waits)
+			w->irqoff_blocked++;
+		enter(&irq, slow == 1, false);
 		spin_unlock_irqrestore(&irq_lock, flags);
 		w->done[1]++;
 
 		spin_lock_bh(&bh_lock);
-		enter(&bh, slow == 2);
+		enter(&bh, slow == 2, false);
 		spin_unlock_bh(&bh_lock);
 		w->done[2]++;
 
@@ -116,7 +158,7 @@ static int pvlock_thread(void *arg)
 			read_unlock(&rw_lock);
 		} else {
 			write_lock(&rw_lock);
-			enter(&rw, slow == 4);
+			enter(&rw, slow == 4, false);
 			write_unlock(&rw_lock);
 			w->done[3]++;
 		}
@@ -128,7 +170,7 @@ static int pvlock_thread(void *arg)
 
 static int __init pvlock_init(void)
 {
-	unsigned long done[4] = {};
+	unsigned long done[4] = {}, irqoff_blocked = 0;
 	unsigned int cpu, k, threads = 0;
 	long bad;
 	int err = 0;
@@ -160,6 +202,7 @@ static int __init pvlock_init(void)
 		timer_shutdown_sync(&w->timer);
 		for (k = 0; k < 4; k++)
 			done[k] += w->done[k];
+		irqoff_blocked += w->irqoff_blocked;
 	}
 	if (err)
 		return err;
@@ -169,9 +212,10 @@ static int __init pvlock_init(void)
 	if (plain.count != done[0] || irq.count != done[1] || bh.count != done[2] ||
 	    rw.count != done[3])
 		bad++;
-	pr_info("PVLOCK: %s threads=%u plain=%lu/%lu irq=%lu/%lu bh=%lu/%lu rw=%lu/%lu violations=%ld\n",
+	pr_info("PVLOCK: %s threads=%u plain=%lu/%lu irq=%lu/%lu bh=%lu/%lu rw=%lu/%lu violations=%ld ipis=%ld irqoff_blocked=%lu timer_blocked=%ld\n",
 		bad ? "FAIL" : "PASS", threads, plain.count, done[0], irq.count, done[1],
-		bh.count, done[2], rw.count, done[3], atomic_long_read(&violations));
+		bh.count, done[2], rw.count, done[3], atomic_long_read(&violations),
+		atomic_long_read(&ipis), irqoff_blocked, atomic_long_read(&timer_blocked));
 	return bad ? -EIO : 0;
 }
 

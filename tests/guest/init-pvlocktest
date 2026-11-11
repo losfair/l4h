@@ -1,8 +1,9 @@
 #!/bin/sh
 # dom0 init for tests/run-pvlocktest.sh: paravirtual spinlocks.  Contended
-# locks stay exclusive and their waiters block, in dom0 and in a guest
-# whose vCPUs run out of budget while they hold locks; guests with one
-# vCPU or "nopvspin" keep the plain locks, and never block for one.
+# locks stay exclusive and their waiters block, also with interrupts off
+# and in timers, and take IPIs meanwhile, in dom0 and in a guest whose
+# vCPUs run out of budget while they hold locks; guests with one vCPU or
+# "nopvspin" keep the plain locks, and never block for one.
 mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
@@ -17,11 +18,17 @@ tmo=$(sed -n 's/.*pvlock_timeout=\([0-9]*\).*/\1/p' /proc/cmdline)
 # dom0: four vCPUs, uncapped.
 [ "$(nproc)" -ge 2 ] || fail "dom0 has $(nproc) vCPU"
 dmesg | grep -q 'PV spinlocks enabled' || fail "dom0 does not use PV spinlocks"
+# field NAME LINE: the number after NAME= in a PVLOCK result line.
+field() { echo "$2" | sed -n "s/.* $1=\\([0-9]*\\).*/\\1/p"; }
 w=$(waits)
 insmod /bin/l4h_pvlock.ko || fail "dom0: $(dmesg | grep 'PVLOCK:')"
 w=$(($(waits) - w))
-echo "PVLOCKTEST: dom0: $(dmesg | grep -o 'PVLOCK:.*'), waits=$w"
+r=$(dmesg | grep -o 'PVLOCK:.*')
+echo "PVLOCKTEST: dom0: $r, waits=$w"
 [ "$w" -gt 0 ] || fail "dom0: no waiter blocked"
+[ "$(field irqoff_blocked "$r")" -gt 0 ] || fail "dom0: no waiter blocked with interrupts off"
+[ "$(field timer_blocked "$r")" -gt 0 ] || fail "dom0: no timer blocked"
+[ "$(field ipis "$r")" -gt 0 ] || fail "dom0: no IPI under the lock"
 
 # run NAME VCPUS CAP PV BLOCKS [cmdline...]
 run() {

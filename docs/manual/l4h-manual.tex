@@ -1676,13 +1676,15 @@ waiting for a core as \emph{steal}, in the \texttt{st} column of
 \cmd{top} and \cmd{vmstat}, as on any cloud VM. A VM capped at 25\% that tries
 to use a full core shows about 75\% steal.
 
-\paragraph{Spinlocks.} In a guest with more than one vCPU, a vCPU that has
-waited about 100\,$\mu$s for a kernel spinlock blocks until the lock is
-passed to it, because the vCPU holding the lock may have lost its core or
-used up its cap. The \texttt{PVW} row of \file{/proc/interrupts} counts
-these waits per vCPU. Boot a guest with \texttt{nopvspin} on its kernel
-command line to make its vCPUs always spin instead, which avoids the
-wake-up delay when every vCPU has a core to itself and no cap.
+\paragraph{Spinlocks.} In a guest with more than one vCPU, the first vCPU
+to wait for a kernel spinlock blocks after about 100\,$\mu$s, until the
+lock is free, because the vCPU holding the lock may have lost its core or
+used up its cap; vCPUs that come for the lock after that still spin. The
+\texttt{PVW} row of \file{/proc/interrupts} counts these waits per vCPU.
+Boot a guest with \texttt{nopvspin} on its kernel command line to make its
+vCPUs always spin instead, which avoids the wake-up delay when every vCPU
+has a core to itself and no cap. Modules built for a kernel of the other
+kind do not load: rebuild them (Section~\ref{sec:kmods}).
 
 %======================================================================
 \chapter{Recovery and the serial monitor}

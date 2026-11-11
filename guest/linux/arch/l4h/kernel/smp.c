@@ -98,9 +98,10 @@ void __init l4h_smp_setup(void)
 #ifdef CONFIG_PARAVIRT_SPINLOCKS
 /*
  * Paravirtual spinlocks (asm/qspinlock.h).  The key is read by every
- * spin_unlock(), which is inlined, in modules too.
+ * spin_unlock(), which is inlined, in modules too: it is kept apart from
+ * data that is written.
  */
-DEFINE_STATIC_KEY_FALSE(l4h_pv_spinlocks);
+DEFINE_STATIC_KEY_FALSE_RO(l4h_pv_spinlocks);
 EXPORT_SYMBOL(l4h_pv_spinlocks);
 EXPORT_SYMBOL(__pv_queued_spin_unlock);
 

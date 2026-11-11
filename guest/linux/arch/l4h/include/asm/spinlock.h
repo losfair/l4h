@@ -7,9 +7,11 @@
  * (asm/qspinlock.h), in cpu_relax() iterations.  x86's 1 << 15 was about
  * 100 us of 10-cycle PAUSEs.  An iteration here is a PAUSE of some 40 to
  * 140 cycles, or an arm64 YIELD, and the event poll, with a read of the
- * time counter when interrupts are on: 1 << 11 spins about as long, well
+ * time counter when interrupts are on: 1 << 11 is an estimated 100 us on
+ * a current x86 CPU with interrupts on and a few times less otherwise,
  * beyond a critical section and the cost of blocking (two seL4 calls and
  * an IPI), and well short of the 5 ms a preempted vCPU can stay away.
+ * Not measured.
  */
 #define SPIN_THRESHOLD	(1 << 11)
 

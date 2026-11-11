@@ -1126,36 +1126,58 @@ vendor, as seL4 makes it).
   and guests with more than one vCPU use Linux's **paravirtual queued
   spinlocks** (`CONFIG_PARAVIRT_SPINLOCKS`, `asm/qspinlock.h`); qrwlocks
   queue their writers on one.
-  - A waiter spins for `SPIN_THRESHOLD` = 2¹¹ `cpu_relax()` iterations,
-    an estimated 100 µs, then blocks its kTCB in `seL4_Wait(N_v)` while the word
-    it watches is unchanged (`l4h_pv_wait()`). The vCPU that changes the
-    word signals the waiter's `N_v` afterwards (`l4h_pv_kick()`), with the
-    IPI badge and no reason bit, so a kick to a vCPU that no longer waits
-    delivers nothing. Signals are sticky: one sent between the check and
-    the wait ends the wait at once. Neither the host nor seL4 takes part
-    beyond the IPI path.
+  - The waiter at the head of a lock's queue, and those queued behind
+    it, spin for `SPIN_THRESHOLD` = 2¹¹ `cpu_relax()` iterations, an
+    estimated 100 µs with interrupts on and less with them off or on
+    AArch64, then block their kTCB in `seL4_Wait(N_v)` while the word they
+    watch is unchanged (`l4h_pv_wait()`). The vCPU that changes the word
+    signals the waiter's `N_v` afterwards, at once or when it unlocks
+    (`l4h_pv_kick()`), with the IPI badge and no reason bit: a vCPU that
+    no longer waits runs no handler for it, though it ends one user run,
+    VM entry or idle wait like any event. Signals are sticky: one sent
+    between the check and the wait ends the wait at once. Neither the
+    host nor seL4 takes part beyond the IPI path.
   - With interrupts on, a waiter delivers pending events instead of
     blocking, and those that end its wait, as its `cpu_relax()` did while
-    it spun. With interrupts off, events already collected do not keep it
+    it spun; like it, not inside an event's own delivery, softirqs
+    included, where it blocks with events pending until the handler
+    returns. With interrupts off, events already collected do not keep it
     from blocking, and one that ends the wait stays pending for the next
     polling point (§5.4); the lock code re-checks the lock after any
     wake-up.
   - Unlocking is a compare-and-exchange instead of a store. There is
     no code patching in `arch/l4h`, so a static key read by every lock
-    slow path and unlock selects the native operations for guests with one
-    vCPU, and with `nopvspin` on the kernel command line. It is switched
-    in `smp_prepare_cpus()`, while one vCPU runs. The x86_64 kernel's text
-    is no larger for it (27.27 MB either way).
+    slow path and unlock selects the native operations for guests given
+    one vCPU, and with `nopvspin` on the kernel command line. It is
+    switched in `smp_prepare_cpus()`, while one vCPU runs. The unlock is
+    inlined at some 5000 places, which adds about 230 KiB (1.4%) to the
+    x86_64 kernel's `.text`; the image, padded to 2 MiB, is no larger.
+  - Modules inline the unlock too, so one built for the other kind must
+    not load: the version magic says `pvspinlocks` (`asm/vermagic.h`).
   - Time blocked for a lock counts as idle, not steal (§7.4).
-    `/proc/interrupts` has a `PVW` row: how often each vCPU blocked.
-  - Not covered: `vcpu_is_preempted()` is always false, as before, so
-    mutexes and rwsems still spin optimistically on an owner whose vCPU is
-    not running. The guest cannot tell; seL4 would have to publish it.
+    `/proc/interrupts` has a `PVW` row: each vCPU's waits in seL4 for a
+    lock.
+  - Not covered:
+    - A waiter that arrives when the head of the queue has blocked spins
+      on, trying to steal the lock, until the lock is free or the head
+      wakes and spins again (`pv_hybrid_queued_unfair_trylock()`): with
+      interrupts on that is the head's next tick, with them off not
+      before it is kicked. So during one long preemption the first
+      waiter blocks, with those that queued behind it while it still
+      spun, and later ones burn their time as before.
+    - Readers of a qrwlock waiting for a writer, and a writer waiting
+      for readers, spin.
+    - `vcpu_is_preempted()` is always false, as before, so mutexes and
+      rwsems still spin optimistically on an owner whose vCPU is not
+      running. The guest cannot tell; seL4 would have to publish it.
   - The threshold is not yet tuned by measurement.
   - **Test.** `tests/run-pvlocktest.sh`: a module contends four locks on
-    every vCPU, holding them for 5 ms at times; no update is lost and
-    waiters block, in a 4-vCPU dom0 and a 4-vCPU guest capped at 25%,
-    and none blocks in guests with `nopvspin` or one vCPU.
+    every vCPU, holding them for 5 ms at times, and calls a function on
+    the other vCPUs from under one. No update is lost, waiters block
+    (counted apart with interrupts off and in timers) and take the IPI,
+    in a 4-vCPU dom0 and a 4-vCPU guest capped at 25%, and none blocks in
+    guests with `nopvspin` or one vCPU. It does not measure how long
+    waiters spin, nor the accounting.
 - **Memory barriers.** On x86_64 the barriers between CPUs are those of
   `arch/x86` (`x86/asm/barrier.h`): a vCPU is a thread on an x86 CPU, which
   reorders only a store with a later load.
