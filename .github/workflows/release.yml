@@ -31,7 +31,7 @@ defaults:
 
 env:
   # Must match tools/ci-setup.sh (cache key of the Linux tarball).
-  LINUX_VERSION: 6.18.62
+  LINUX_VERSION: 6.18.63
   L4H_LINUX_CC: ccache gcc
   CCACHE_DIR: ${{ github.workspace }}/.ccache
   CCACHE_MAXSIZE: 2G
