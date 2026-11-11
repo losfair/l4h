@@ -825,15 +825,21 @@ impl Usbd {
             }
             abi::OP_SLOT_DISABLE => {
                 let Some(s) = self.client_slot(r.slot) else { return abi::ST_INVALID };
-                for dci in 1..32 {
-                    self.drop_ep(s, dci);
-                }
                 let Some((cc, _)) = self.command(Trb { param: 0, status: 0, control: CMD_DISABLE_SLOT << 10 | (s as u32) << 24 }) else {
                     return abi::ST_TIMEOUT;
                 };
+                if cc != CC_SUCCESS {
+                    return cc_status(cc);
+                }
+                // Only a successful disable stops the controller owning
+                // these rings and buffers. The guest can consume a CQ
+                // entry as soon as drop_ep publishes it.
+                for dci in 1..32 {
+                    self.drop_ep(s, dci);
+                }
                 self.slots[s] = Slot::EMPTY;
                 self.hc().set_dcbaa(s as u32, None);
-                if cc == CC_SUCCESS { abi::ST_OK } else { cc_status(cc) }
+                abi::ST_OK
             }
             abi::OP_ADDRESS => self.address(r, val),
             abi::OP_EP_CONFIG => self.ep_config(r),
@@ -1550,10 +1556,15 @@ impl Usbd {
         if let Some(c) = &self.client {
             c.set_state(abi::RESETTING);
         }
-        let ok = self.hc().halt_reset();
+        if !self.hc().halt_reset() {
+            // Do not return the URBs: the controller may still DMA into
+            // their buffers. Root quarantines a faulted driver's device
+            // before the guest times out and gives those buffers back.
+            panic!("USB reset could not halt DMA; quarantining controller");
+        }
         // The controller fetches nothing now: the URBs can go.
         self.forget_all(true);
-        let ok = ok && self.hc().start();
+        let ok = self.hc().start();
         self.resets += 1;
         let Some(c) = &mut self.client else { return };
         c.resets = c.resets.wrapping_add(1);

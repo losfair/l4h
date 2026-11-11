@@ -855,8 +855,13 @@ fn rdtsc() -> u64 {
 }
 
 /// vmmgr's periodic timer: balancer and watchdog.
-fn arm_timer(info: &HostInfo) {
+fn arm_timer(info: &HostInfo) -> u64 {
     let deadline = rdtsc() + info.tsc_hz * sched::BALANCE_MS / 1000;
+    set_timer(deadline);
+    deadline
+}
+
+fn set_timer(deadline: u64) {
     let tcb = slot::TCB.cap();
     sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_TCB_SetTimer(tcb.bits(), deadline, recv::TIMER));
 }
@@ -885,19 +890,28 @@ struct Serve<'a> {
     h: &'a mut Vmmgr,
     next_watchdog: u64,
     last_balance: u64,
+    deadline: u64,
 }
 
 fn serve(h: &mut Vmmgr, reply: ReplySlot) -> ! {
-    arm_timer(&h.info);
+    let deadline = arm_timer(&h.info);
     let next_watchdog = rdtsc() + h.info.tsc_hz * h.cfg.watchdog_secs;
     let hyp_ep = h.info.hyp_ep;
-    l4h_ipc::run(hyp_ep, reply, &mut Serve { h, next_watchdog, last_balance: rdtsc() })
+    l4h_ipc::run(hyp_ep, reply, &mut Serve { h, next_watchdog, last_balance: rdtsc(), deadline })
 }
 
 impl l4h_ipc::Server for Serve<'_> {
     const SIGNALS: u64 = recv::SIGNALS;
     const FAULT: u64 = recv::FAULT;
     type Sender = proto::Sender;
+
+    fn notification(&self) -> Option<l4h_ipc::Bound> {
+        Some(l4h_ipc::Bound::new(slot::TCB.cap(), slot::NTFN.cap()))
+    }
+
+    fn rebound(&mut self) {
+        set_timer(self.deadline);
+    }
 
     fn received(&mut self) {
         self.h.alloc.refill();
@@ -920,7 +934,7 @@ impl l4h_ipc::Server for Serve<'_> {
                 self.next_watchdog = rdtsc() + h.info.tsc_hz * h.cfg.watchdog_secs;
             }
             dom0_retry(h);
-            arm_timer(&h.info);
+            self.deadline = arm_timer(&h.info);
         }
     }
 

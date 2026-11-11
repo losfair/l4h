@@ -454,7 +454,8 @@ pub trait Call {
     type Proto: Protocol;
 
     /// Call with `label` and `args` in message registers 0..; the reply's
-    /// message registers go into `reply`.  Returns the reply's length.
+    /// message registers go into `reply`, up to its capacity. Returns the
+    /// actual received length, even if it exceeds that capacity.
     fn ipc(&self, label: u64, args: &[u64], reply: &mut [u64]) -> usize;
 }
 
@@ -838,8 +839,9 @@ macro_rules! protocol {
                         let mut args = [0u64; Request::MAX_WORDS];
                         let n = req.encode(&mut args);
                         let mut reply = [0u64; Request::MAX_REPLY_WORDS];
-                        let len = self.ipc($label, &args[..n], &mut reply).min(reply.len());
-                        $crate::wire::reply::<$rty>(&reply[..len])
+                        let len = self.ipc($label, &args[..n], &mut reply);
+                        reply.get(..len).ok_or($crate::wire::FAILED)
+                            .and_then($crate::wire::reply::<$rty>)
                     }
                 )*
             }

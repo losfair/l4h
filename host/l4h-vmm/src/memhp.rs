@@ -21,9 +21,12 @@ pub struct MemDev {
     count: usize,
     /// The page is behind memd's state: memd did not answer the last
     /// `hp_state` (EBUSY: this VMM's calls came faster than memd takes
-    /// them, memd::HP_CALLS; or memd has failed).  It is asked again at
-    /// the next signal for the device, not before: nothing here waits.
+    /// them, memd::HP_CALLS; or memd has failed).
     stale: bool,
+    /// A transient EBUSY gets a timed retry even if the guest is idle at
+    /// its old target. Other errors wait for an explicit device signal.
+    retry_at: u64,
+    retry_ticks: u64,
 }
 
 /// memd's endpoint for this guest (l4h_host::memd::call, badged as
@@ -33,8 +36,9 @@ fn memd() -> Endpoint<host::memd::call::Proto> {
 }
 
 impl MemDev {
-    pub fn new(page_va: usize, event: u32, count: usize) -> Self {
-        MemDev { page: page_va as *mut abi::MemPage, event, count, stale: false }
+    pub fn new(page_va: usize, event: u32, count: usize, hz: u64) -> Self {
+        let retry_ticks = hz.saturating_mul(host::memd::HP_CALL_GAP_US).div_ceil(1_000_000).max(1);
+        MemDev { page: page_va as *mut abi::MemPage, event, count, stale: false, retry_at: 0, retry_ticks }
     }
 
     /// Copy memd's state of the guest into the device page.  Returns
@@ -42,11 +46,18 @@ impl MemDev {
     /// page stays as it was, which is how the guest last saw it, and is
     /// marked stale.
     pub fn refresh(&mut self) -> bool {
-        let Ok(st) = memd().hp_state() else {
-            self.stale = true;
-            return false;
+        let st = match memd().hp_state() {
+            Ok(st) => st,
+            Err(e) => {
+                self.stale = true;
+                self.retry_at = if e == host::errno::EBUSY {
+                    host::ticks::now().saturating_add(self.retry_ticks)
+                } else { 0 };
+                return false;
+            }
         };
         self.stale = false;
+        self.retry_at = 0;
         let (target, plugged, map) = (st.target as u32, st.plugged as u32, st.map);
         unsafe {
             let p = self.page;
@@ -58,6 +69,18 @@ impl MemDev {
             let g = addr_of_mut!((*p).generation).read_volatile();
             addr_of_mut!((*p).generation).write_volatile(g.wrapping_add(1));
             changed
+        }
+    }
+
+    pub fn deadline(&self) -> u64 {
+        self.retry_at
+    }
+
+    /// Called on each VMM turn, including the retry timer's wakeup. A
+    /// failed refresh schedules its next attempt without busy polling.
+    pub fn retry(&mut self, vcpus: &Vcpus) {
+        if self.retry_at != 0 && host::ticks::now() >= self.retry_at && self.refresh() {
+            vcpus.raise(0, self.event);
         }
     }
 

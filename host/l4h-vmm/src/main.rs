@@ -13,6 +13,7 @@ mod guest;
 mod mem;
 mod memhp;
 mod net;
+mod timer;
 mod virtq;
 
 use l4h_rt::host::errno::Errno;
@@ -201,7 +202,7 @@ fn main(info: &'static Info) -> ! {
     }
 
     let mut memdev = (cfg.mem_dev != 0)
-        .then(|| MemDev::new(host::vmm_device_page_va(cfg.mem_dev as usize - 1), cfg.mem_event, cfg.hp_count as usize));
+        .then(|| MemDev::new(host::vmm_device_page_va(cfg.mem_dev as usize - 1), cfg.mem_event, cfg.hp_count as usize, tsc_hz));
     if let Some(m) = memdev.as_mut() {
         m.refresh();
     }
@@ -219,8 +220,9 @@ fn main(info: &'static Info) -> ! {
     let mut vmm = Vmm {
         cfg, tsc_hz, mem: &mem, vcpus: &vcpus, devices, devs: &mut devs, memdev: &mut memdev, console: &mut console,
         root_ep, tcb, ntfn,
-        console_pending: false, unbound: false, after_unbound: false, answered: None,
+        console_pending: false, answered: None, timer: timer::Timer::new(),
     };
+    vmm.update_timer();
     l4h_rt::ipc::run(ep, reply, &mut vmm)
 }
 
@@ -240,13 +242,15 @@ struct Vmm<'a> {
     ntfn: sel4::cap::Notification,
     /// The console ring has more than one batch.
     console_pending: bool,
-    /// The notification is unbound, for a poll that gives a queued
-    /// hypercall a turn.
-    unbound: bool,
-    /// That poll was the last receive.
-    after_unbound: bool,
+    timer: timer::Timer,
     /// The hypercall this turn served, and whether it was answered.
     answered: Option<bool>,
+}
+
+impl Vmm<'_> {
+    fn update_timer(&mut self) {
+        self.timer.update(self.console.deadline(), self.memdev.as_ref().map_or(0, MemDev::deadline));
+    }
 }
 
 impl l4h_rt::ipc::Server for Vmm<'_> {
@@ -254,22 +258,21 @@ impl l4h_rt::ipc::Server for Vmm<'_> {
     // Only the guest holds a capability to the endpoint.
     type Sender = Guest;
 
+    fn notification(&self) -> Option<l4h_rt::ipc::Bound> {
+        Some(l4h_rt::ipc::Bound::new(self.tcb, self.ntfn))
+    }
+
+    fn rebound(&mut self) {
+        self.timer.rearm();
+    }
+
     fn received(&mut self) {
-        self.after_unbound = core::mem::take(&mut self.unbound);
-        if self.after_unbound {
-            // TCB invocations use the IPC buffer too (run keeps a hypercall
-            // there).  A gap timer may have expired while unbound, losing
-            // its notification: re-arm it before sleeping.
-            self.tcb.tcb_bind_notification(self.ntfn).expect("bind VMM notification");
-            self.console.rearm_timer();
+        if let Some(m) = self.memdev.as_mut() {
+            m.retry(self.vcpus);
         }
     }
 
     fn signal(&mut self, badge: u64) {
-        // The unbound poll found no hypercall: receive again, bound.
-        if core::mem::take(&mut self.after_unbound) {
-            return;
-        }
         let (vcpus, mem) = (self.vcpus, self.mem);
         self.console_pending |= badge & recv::CONSOLE != 0;
         if badge & recv::MEM != 0 {
@@ -303,17 +306,10 @@ impl l4h_rt::ipc::Server for Vmm<'_> {
         }
         if self.console_pending {
             self.console_pending = self.console.drain(vcpus);
-            // Bound notifications take precedence over endpoint calls, even
-            // in NBRecv. A guest retrying a full console ring can keep that
-            // notification active: give a queued call a turn.  Signals
-            // remain pending on ntfn while it is unbound.
-            self.tcb.tcb_unbind_notification().expect("unbind VMM notification");
-            self.unbound = true;
         }
     }
 
     fn call(&mut self, from: Guest, _: u64, info: &sel4::MessageInfo) -> Option<sel4::MessageInfo> {
-        self.after_unbound = false;
         let mut hc = Hypercalls {
             cfg: self.cfg, tsc_hz: self.tsc_hz, mem: self.mem, vcpus: self.vcpus, devs: self.devs,
             console: self.console, root_ep: self.root_ep,
@@ -325,19 +321,16 @@ impl l4h_rt::ipc::Server for Vmm<'_> {
 
     fn next(&mut self) -> l4h_rt::ipc::Next {
         use l4h_rt::ipc::Next;
-        if self.unbound {
-            return Next::Poll;
-        }
         // A device handled as much of its queues as one turn does and may
         // have more: it gets another turn (an idle one, if nothing else
         // waits) rather than a wait for a kick that need not come.
         let more = self.devices.iter().any(|d| self.devs[d.guest_index as usize].as_ref().is_some_and(Dev::has_more));
         let rest = if more { Next::Poll } else { Next::Wait };
-        match self.answered.take() {
+        let next = match self.answered.take() {
             // The guest stays blocked.
             Some(false) => Next::Wait,
-            // Draining can re-arm the console's timer, which overwrites
-            // the reply (run keeps it).
+            // Finish another console batch before choosing the timer.
+            // The timer invocation below overwrites the reply; run keeps it.
             Some(true) if self.console_pending => {
                 self.console_pending = self.console.drain(self.vcpus);
                 if self.console_pending { Next::Poll } else { rest }
@@ -346,7 +339,9 @@ impl l4h_rt::ipc::Server for Vmm<'_> {
             // Poll between bounded batches instead of waiting for a new kick.
             _ if self.console_pending => Next::Poll,
             _ => rest,
-        }
+        };
+        self.update_timer();
+        next
     }
 }
 

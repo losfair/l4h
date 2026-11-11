@@ -35,7 +35,7 @@ impl<P> Copy for Endpoint<P> {}
 impl<P: Protocol> Endpoint<P> {
     /// The one `e` gives its holder, `_me`, in the edge's slot n.
     pub const fn of<H: p::IsParty, T>(e: &E<H, T, o::Endpoint, P>, _me: H, n: usize) -> Self {
-        Endpoint(sel4::cap::Endpoint::from_bits(e.0.slot(n)), PhantomData)
+        Endpoint(sel4::cap::Endpoint::from_bits(e.edge().slot(n)), PhantomData)
     }
 
     /// The one `e` gives its holder in a slot of the holder's choosing
@@ -58,7 +58,9 @@ impl<P: Protocol> Call for Endpoint<P> {
         let info = self.0.call(sel4::MessageInfo::new(label, 0, 0, args.len()));
         let n = info.length().min(reply.len());
         sel4::with_ipc_buffer(|b| reply[..n].copy_from_slice(&b.msg_regs()[..n]));
-        n
+        // Preserve the received length: a client must reject an oversized
+        // envelope, not accept the successful prefix that fit its buffer.
+        info.length()
     }
 }
 
@@ -136,6 +138,21 @@ pub enum Next {
     Poll,
 }
 
+/// A bound notification whose senders must not keep endpoint callers
+/// waiting forever. A server with this binding has no caller badged 0,
+/// so an unbound NBRecv can distinguish an empty endpoint from a call.
+#[derive(Clone, Copy)]
+pub struct Bound {
+    tcb: sel4::cap::Tcb,
+    ntfn: sel4::cap::Notification,
+}
+
+impl Bound {
+    pub const fn new(tcb: sel4::cap::Tcb, ntfn: sel4::cap::Notification) -> Self {
+        Self { tcb, ntfn }
+    }
+}
+
 /// A server's thread: what arrives on its endpoint, and its bound
 /// notification's signals.  `run` receives, tells the kinds apart by the
 /// badge and answers, the same way for every server.
@@ -148,6 +165,18 @@ pub trait Server {
     /// Who may call it (wire::Badged; Infallible for an endpoint nobody
     /// calls).
     type Sender: Badged;
+
+    /// A notification that an untrusted sender can keep active. After
+    /// each real signal, run briefly unbinds it and polls the endpoint.
+    /// None for a server with no such source (memd's only signal is its
+    /// own timer, and root calls memd with badge 0).
+    fn notification(&self) -> Option<Bound> {
+        None
+    }
+    /// Called after rebinding, with the received message kept: rearm the
+    /// original deadline if a timer could expire while unbound. Do not
+    /// postpone that deadline on each poll, which could starve the timer.
+    fn rebound(&mut self) {}
 
     /// After each receive, before the message is looked at, which it
     /// keeps.
@@ -205,6 +234,9 @@ pub fn holds_call() -> bool {
 
 /// Serve `ep` with `s`, for good.
 pub fn run<S: Server>(ep: sel4::cap::Endpoint, mut reply: impl ReplyObject, s: &mut S) -> ! {
+    let bound = s.notification();
+    assert!(bound.is_none() || (S::SIGNALS != 0 && S::Sender::of_badge(0).is_none()),
+        "a server that polls unbound needs signals and no unbadged caller");
     let (mut info, mut badge) = ep.recv(reply.cap());
     let mut polled = false;
     loop {
@@ -237,6 +269,27 @@ pub fn run<S: Server>(ep: sel4::cap::Endpoint, mut reply: impl ReplyObject, s: &
             Some(a) => keeping(a.length(), || s.next()),
             None => s.next(),
         };
+        if signal && badge != 0 {
+            if let Some(bound) = bound {
+                // Bound notifications win even in NBRecv. One unbound
+                // poll gives a queued caller (or fault) a turn however
+                // often another core replenishes the notification.
+                bound.tcb.tcb_unbind_notification().expect("server unbind");
+                let (incoming, from) = ep.nb_recv(reply.cap());
+                HOLDS_CALL.store(from != 0 && from & S::FAULT == 0, Ordering::Release);
+                keeping(incoming.length(), || {
+                    bound.tcb.tcb_bind_notification(bound.ntfn).expect("server bind");
+                    s.rebound();
+                });
+                if from != 0 {
+                    (info, badge) = (incoming, from);
+                    polled = true;
+                    continue;
+                }
+                // An empty poll is not an idle handler turn: restore
+                // the server's chosen wait/poll with signals bound.
+            }
+        }
         polled = next == Next::Poll;
         (info, badge) = match (next, answer) {
             (Next::Wait, Some(a)) => ep.reply_recv(a, reply.cap()),

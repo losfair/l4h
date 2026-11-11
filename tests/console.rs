@@ -52,6 +52,8 @@ mod guest {
 }
 #[path = "../host/l4h-vmm/src/console.rs"]
 mod console;
+#[path = "../host/l4h-vmm/src/timer.rs"]
+mod timer;
 
 unsafe extern "C" {
     fn mmap(a: usize, n: usize, prot: i32, flags: i32, fd: i32, off: usize) -> usize;
@@ -85,7 +87,7 @@ fn output() -> Vec<u8> {
         (&(*r).data)[..n].to_vec()
     }
 }
-struct Fixture { _lock: MutexGuard<'static, ()>, console: console::Console, vcpus: guest::Vcpus }
+struct Fixture { _lock: MutexGuard<'static, ()>, console: console::Console, vcpus: guest::Vcpus, timer: timer::Timer }
 impl Fixture {
     fn new() -> Self {
         let lock = LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -103,9 +105,17 @@ impl Fixture {
         NOW.store(1000, Ordering::Relaxed);
         TIMER.store(0, Ordering::Relaxed);
         ARMS.lock().unwrap().clear();
-        Self { _lock: lock, console: console::Console::new(false, None, EVENT, 1000), vcpus: guest::Vcpus { n: VCPUS } }
+        Self { _lock: lock, console: console::Console::new(false, None, EVENT, 1000), vcpus: guest::Vcpus { n: VCPUS }, timer: timer::Timer::new() }
     }
-    fn drain(&mut self) -> bool { self.console.drain(&self.vcpus) }
+    fn drain(&mut self) -> bool {
+        let more = self.console.drain(&self.vcpus);
+        self.timer.update(self.console.deadline(), 0);
+        more
+    }
+    fn flush(&mut self) {
+        self.console.flush(&self.vcpus);
+        self.timer.update(self.console.deadline(), 0);
+    }
 }
 #[test]
 fn roundtrip_and_cursor_wrap_preserve_unread_records() {
@@ -146,7 +156,7 @@ fn continuous_producer_cannot_extend_a_drain_without_limit() {
     assert!(f.drain());
     assert!(output().len() <= abi::CONSOLE_OUT_SIZE / 9);
     f.console.after_put = None;
-    f.console.flush(&f.vcpus);
+    f.flush();
     assert_eq!(head(0), tail(0));
     assert_eq!(head(1), tail(1));
 }
@@ -292,7 +302,7 @@ fn notification_rebind_rearms_a_timer_lost_while_unbound() {
     // seL4 consumes the expired timer even if its TCB has no bound
     // notification. Rearming the original (now past) deadline wakes it.
     expire_timer();
-    f.console.rearm_timer();
+    f.timer.rearm();
     assert_eq!(TIMER.load(Ordering::Relaxed), 1100);
     assert_eq!(*ARMS.lock().unwrap(), [1100, 1100]);
     expire_timer();
@@ -375,7 +385,7 @@ fn poweroff_flush_skips_a_gap_without_waiting() {
     sequence(2);
     assert_eq!(write(1, b"crash report"), 12);
     assert!(!f.drain());
-    f.console.flush(&f.vcpus);
+    f.flush();
     assert_eq!(output(), b"[l4h: skipped 2 missing console records]\ncrash report");
     assert_eq!(TIMER.load(Ordering::Relaxed), 0);
     assert_eq!(head(1), tail(1));
@@ -463,7 +473,7 @@ fn flush_sends_a_partial_line_and_cancels_its_timer() {
     write(0, b"last words");
     assert!(!f.drain());
     assert_eq!(TIMER.load(Ordering::Relaxed), 1100);
-    f.console.flush(&f.vcpus);
+    f.flush();
     assert_eq!(s.read(), "last words");
     assert_eq!(TIMER.load(Ordering::Relaxed), 0);
 }
@@ -474,6 +484,6 @@ fn a_rebound_notification_rearms_the_line_timer() {
     write(0, b"part");
     assert!(!f.drain());
     TIMER.store(0, Ordering::Relaxed);
-    f.console.rearm_timer();
+    f.timer.rearm();
     assert_eq!(TIMER.load(Ordering::Relaxed), 1100);
 }

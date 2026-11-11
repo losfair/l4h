@@ -1768,8 +1768,12 @@ Untypeds reclaims everything it made. Plugging does not involve
   refreshes from memd (`hp_state`) at start, after each request and
   when signalled with a new target, raising the device's event then. If
   memd does not answer `hp_state` (`EBUSY`, or it has failed), the page
-  stays as the guest last saw it and the VMM asks again at the device's
-  next kick or target signal; it does not wait. A
+  stays as the guest last saw it. `EBUSY` schedules a retry after one call
+  credit can refill (31.25 ms), even if the guest is idle at its old
+  target; publication of a changed target raises the event. The VMM's
+  one-shot timer serves the earliest console or retry deadline. Other
+  errors wait for the device's next kick or target signal, so a failed
+  memd causes no retry loop. A
   guest request (op, m), written in the page with a kick, becomes one memd
   call; memd does every check, and the VMM answers in the page and raises
   the event.
@@ -2739,7 +2743,11 @@ controller, one per claimed controller, and the guest forwards Linux's
   (`ST_DROPPED`; the guest gives it back). A URB that
   does not fit its ring waits in usbd, so one full ring does not hold up
   other endpoints. A command timeout, HSE or HCE resets the controller and
-  posts `HC_RESET`; only its owner is affected.
+  posts `HC_RESET`; only its owner is affected. A reset that cannot halt
+  the controller faults usbd before returning any URB or freeing a ring,
+  so root quarantines the device while the buffers are still owned.
+  Disable Slot likewise releases endpoints and buffers only after the
+  command succeeds; a refused disable leaves them owned.
 - **Validation** (`host::usb`, the code tests/fuzz-usbreq runs): every
   record is copied before it is checked, every index against usbd's own
   copy and the ring size; every segment must lie in the pool
@@ -2943,6 +2951,16 @@ has a blkd stop answering (`inject blkd-hang`): dom0 gives up a write that
 waits for it, its next is `EBUSY`, and a guest with another disk boots and
 is destroyed; then netd stops too, and root still serves the monitor.
 
+Signals cannot keep queued calls waiting indefinitely either. Root,
+vmmgr and the VMM declare their bound notification to the common serve
+loop: after each signal it briefly unbinds it and polls the endpoint,
+then rebinds it, preserving the received words across both the bind and
+the timer rearm. A peer partition that keeps ringing its doorbell cannot
+take that endpoint turn. Each server rearms its original timer deadline,
+including one that expired while unbound, rather than postponing its next
+tick after every signal. memd has no untrusted signal source (only its own
+timer) and root calls it with badge 0, so it uses the ordinary receive.
+
 **Integer arithmetic.** Shipped host components build without overflow
 checks (Cargo's release profile, §4.1), so an overflow wraps rather than
 panics, and a wrapped bound check passes. The code is correct by
@@ -3038,6 +3056,10 @@ one way to do each part of it:
   answers `wire::FAILED` (memd's and vmmgr's keeper; root itself for a
   faulted driver's mailbox, `Mailbox::abandon`), and a
   method that must leave its caller blocked returns `wire::NO_REPLY`.
+  Both transports reject replies longer than their envelope: an endpoint
+  preserves the actual received length for its client to check, and a
+  mailbox refuses a length beyond its entry. Neither accepts a success
+  prefix obtained by truncating an oversized reply.
 - **Transports.** An endpoint's calls go through `l4h-ipc`: clients call
   an `l4h_ipc::Endpoint<P>`, which serves protocol P and is made from a
   call edge whose protocol is P (`Endpoint::of`, or `chosen` for one in a
@@ -3106,7 +3128,9 @@ one way to do each part of it:
   handler, a fault endpoint), its target and which of its objects, its
   rights, its badge (one value, a field per instance, or a bit per
   instance), its minter and what it is for. Each edge is typed
-  `E<Holder, Target, Object, Protocol>`, and `E::new` checks at compile
+  `E<Holder, Target, Object, Protocol>`, whose descriptor is private:
+  `edge()` and its shared `Deref` expose it read-only, so it cannot be
+  replaced in safe code. `E::new` checks at compile
   time that the type names the edge's holder, target and object and,
   for a call or mailbox post, the protocol the target's object serves. A capability is
   minted from its edge and nothing else (`l4h_task::edge::mint`,
@@ -4903,7 +4927,7 @@ machine and guests of 256–512 MiB.
 | `tests/run-flagstest.sh` | focused flags-only boot: console/display seals, kernel taints, userspace gates and instance reuse, on either architecture |
 | `tests/run-trusttest.sh` | taint/seal permissions, atomic gates, instances, seqlock snapshots and verifier policy |
 | `tests/run-alloctest.sh` | host allocator growth under fragmentation, reclaim, fixed-container panic safety and memd grant validation |
-| `tests/run-devicetest.sh [--qemu]` | console ordering, bounded sequence gaps, cursor wrap, draining and writer wakeups; memory-hotplug completion and retry scheduling; control completions after manager failure; block replies across nested calls; host log wraparound and concurrent writers; with QEMU, hypercalls under continuous console output |
+| `tests/run-devicetest.sh [--qemu]` | console ordering, bounded sequence gaps, cursor wrap, draining and writer wakeups; endpoint fairness and malformed replies; checked wiring cannot be replaced; memory-hotplug completion and timed retry scheduling; USB DMA ownership on failed halt/disable; control completions after manager failure; block replies across nested calls; host log wraparound and concurrent writers; with QEMU, hypercalls under continuous console output |
 | `tests/run-logtest.sh` | kernel faults, panics and shutdowns retained after VM destruction and queried/followed with l4hctl; also works with `L4H_RELEASE=1` |
 | `tests/run-abitest.sh` | guest ABI and seL4 extensions, from a module built against the module tree |
 | `python3 tests/bootmem-qemu.py` | boot RAM clearing, initial untyped watermarks, root-task entry and AArch64 TLS capture before the kernel lock; built debug kernel/root and GDB required, `L4H_ARCH=aarch64` also needs the loader and gdb-multiarch |
