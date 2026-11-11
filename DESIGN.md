@@ -739,6 +739,14 @@ arguments, including pool addresses, device indices and lifecycle state.
   `Makefile` sets `ARCH=l4h`, so `make -C /lib/modules/$(uname -r)/build
   M=$PWD` works in a guest. The image is boot module `guest-kmods`, and is
   optional.
+- **Kernel lockdown.** Guests can enable Linux lockdown with
+  `lockdown=integrity` or `lockdown=confidentiality` on their command line.
+  The lockdown LSM initializes early, even with an explicit `lsm=` list,
+  and exposes its state at `/sys/kernel/security/lockdown` when securityfs
+  is mounted. Lockdown is off by default. `modules_install` signs the
+  shipped modules with the build's key, whose certificate is built into
+  the kernel; the private key is not included in the module image.
+  Guests that enable lockdown reject unsigned external modules.
 - **Shared read-only.** The boot module's own pages are mapped read-only
   into every guest at `L4H_KMOD_VA` (bootinfo `kmod_va`, `kmod_size`): one
   copy for all guests, nothing allocated or copied at boot. Each guest's
