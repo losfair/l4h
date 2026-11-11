@@ -818,8 +818,10 @@ const TIMER_MS: u64 = 100;
 const DRIVERS_READY_SECS: u64 = 180;
 const DRIVERS_SLOW_SECS: u64 = 30;
 
-pub fn arm_timer(info: &HostInfo) {
-    set_timer(rdtsc() + info.tsc_hz * TIMER_MS / 1000);
+pub fn arm_timer(info: &HostInfo) -> u64 {
+    let deadline = rdtsc() + info.tsc_hz * TIMER_MS / 1000;
+    set_timer(deadline);
+    deadline
 }
 
 /// Signal root's notification at `deadline`, replacing what was armed.
@@ -854,21 +856,30 @@ struct Root<'a> {
     drivers_deadline: u64,
     drivers_slow: Option<u64>,
     next_watchdog: u64,
+    deadline: u64,
 }
 
 fn serve(h: &mut Host, reply: ReplySlot, modules: &bootmod::Modules) -> ! {
-    arm_timer(&h.info);
+    let deadline = arm_timer(&h.info);
     let next_watchdog = watchdog_after(h);
     let hyp_ep = h.info.hyp_ep;
     let after = |secs: u64| rdtsc().saturating_add(h.info.tsc_hz.saturating_mul(secs));
     let (drivers_deadline, drivers_slow) = (after(DRIVERS_READY_SECS), Some(after(DRIVERS_SLOW_SECS)));
-    l4h_ipc::run(hyp_ep, reply, &mut Root { h, modules, booting: true, drivers_deadline, drivers_slow, next_watchdog })
+    l4h_ipc::run(hyp_ep, reply, &mut Root { h, modules, booting: true, drivers_deadline, drivers_slow, next_watchdog, deadline })
 }
 
 impl l4h_ipc::Server for Root<'_> {
     const SIGNALS: u64 = recv::SIGNALS;
     const FAULT: u64 = recv::FAULT;
     type Sender = host::root::Sender;
+
+    fn notification(&self) -> Option<l4h_ipc::Bound> {
+        Some(l4h_ipc::Bound::new(slot::TCB.cap(), self.h.ntfn))
+    }
+
+    fn rebound(&mut self) {
+        set_timer(self.deadline);
+    }
 
     fn received(&mut self) {
         self.h.alloc.refill();
@@ -910,7 +921,7 @@ impl l4h_ipc::Server for Root<'_> {
                 watchdog_dump(h);
                 self.next_watchdog = watchdog_after(h);
             }
-            arm_timer(&h.info);
+            self.deadline = arm_timer(&h.info);
         }
     }
 

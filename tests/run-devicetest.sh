@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Production console rings, memory-hotplug scheduling and control failure
 # replies, dom0 boot planning, block reservations and service replies, and host log
-# publication, wraparound and concurrent readers/writers. --qemu
+# publication, wraparound and concurrent readers/writers. Also exercises
+# endpoint fairness, malformed replies, hotplug retries and USB DMA ownership. --qemu
 # also checks hypercalls under sustained console kicks.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -30,6 +31,17 @@ for signature in ['static long mem_call(', 'static void memhp_work_fn(struct wor
 blkd = (root / 'host/l4h-blkd/src/main.rs').read_text()
 start = blkd.index('use core::ops::{Deref, DerefMut};')
 (out / 'blkd-main.inc').write_text(blkd[start:])
+# USB ownership transitions: only hardware and completion publication are
+# mocked; run the production recovery and Disable Slot ordering.
+usbd = (root / 'host/l4h-usbd/src/main.rs').read_text()
+start = usbd.index('    fn reset(&mut self, error: bool)')
+end = usbd.index('\n    }', start) + len('\n    }')
+reset = usbd[start:end]
+start = usbd.index('            abi::OP_SLOT_DISABLE => {')
+start = usbd.index('{', start)
+end = usbd.index('\n            abi::OP_ADDRESS =>', start)
+disable = usbd[start:end].rstrip().removesuffix(',')
+(out / 'usb-lifetime.inc').write_text('impl Usbd {\n' + reset + '\nfn disable(&mut self, r: &Request) -> i32 ' + disable + '\n}\n')
 # Keep the production boot sequence and reservation lifecycle intact.
 vmmgr = (root / 'host/l4h-vmmgr/src/main.rs').read_text()
 start = vmmgr.index('pub fn boot_dom0(')
@@ -85,10 +97,20 @@ rustc +stable --edition=2024 --crate-name l4h_host --crate-type rlib \
 rustc +stable --edition=2024 --test -L dependency="$out" \
     --extern l4h_host="$out/libl4h_host.rlib" "$root/tests/mailbox.rs" -o "$out/mailbox-tests"
 "$out/mailbox-tests"
+rustc +stable --edition=2024 --test -L dependency="$out" \
+    --extern l4h_host="$out/libl4h_host.rlib" "$root/tests/ipc.rs" -o "$out/ipc-tests"
+"$out/ipc-tests" --test-threads=1
+rustc +stable --edition=2024 --test -L dependency="$out" \
+    --extern l4h_abi="$out/libl4h_abi.rlib" --extern l4h_host="$out/libl4h_host.rlib" \
+    "$root/tests/memhp.rs" -o "$out/memhp-tests"
+"$out/memhp-tests"
+L4H_USB_LIFETIME_TEST_SRC="$out/usb-lifetime.inc" rustc +stable --edition=2024 --test -L dependency="$out" \
+    --extern l4h_abi="$out/libl4h_abi.rlib" "$root/tests/usb-lifetime.rs" -o "$out/usb-lifetime-tests"
+"$out/usb-lifetime-tests"
 # Mailboxes carry their edge's protocol all the way to the request.
 types=(--edition=2024 --crate-type rlib -L dependency="$out" --extern l4h_host="$out/libl4h_host.rlib" "$root/tests/ipc-types.rs")
 rustc +stable "${types[@]}" -o "$out/ipc-types.rlib"
-for variant in wrong_protocol wrong_edge; do
+for variant in wrong_protocol wrong_edge replace_edge; do
     if rustc +stable "${types[@]}" --cfg "$variant" -o "$out/ipc-types-$variant.rlib" 2>"$out/ipc-types-$variant.log"; then
         echo "IPC type check accepted $variant" >&2
         exit 1
@@ -96,6 +118,7 @@ for variant in wrong_protocol wrong_edge; do
 done
 grep -Fq 'error[E0271]' "$out/ipc-types-wrong_protocol.log"
 grep -Fq 'error[E0080]' "$out/ipc-types-wrong_edge.log"
+grep -Fq 'error[E0616]' "$out/ipc-types-replace_edge.log"
 rustc +stable --edition=2024 --test -L dependency="$out" \
     --extern l4h_abi="$out/libl4h_abi.rlib" --extern l4h_host="$out/libl4h_host.rlib" \
     -C link-arg="$out/console-guest.o" "$root/tests/console.rs" -o "$out/console-tests"

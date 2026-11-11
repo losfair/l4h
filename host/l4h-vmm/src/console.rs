@@ -13,7 +13,7 @@ use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{Ordering, fence};
 
 use l4h_abi as abi;
-use l4h_rt::{cap, host, sel4};
+use l4h_rt::host;
 
 use crate::guest::Vcpus;
 
@@ -36,8 +36,6 @@ pub struct Console {
     line_len: usize,
     /// When what is in `line` goes out without an end of line.
     line_deadline: Option<u64>,
-    /// What SetTimer last armed; 0: nothing.
-    armed: u64,
     line_start: bool,
     /// The console device's event, raised when a ring wanted room.
     event: u32,
@@ -78,7 +76,6 @@ impl Console {
             line: [0; LINE_SIZE],
             line_len: 0,
             line_deadline: None,
-            armed: 0,
             line_start: true,
             event,
             tail: [0; abi::MAX_VCPUS],
@@ -139,18 +136,10 @@ impl Console {
     }
 
     /// The timer serves a missing record and a line in part.
-    fn deadline(&self) -> u64 {
+    pub fn deadline(&self) -> u64 {
         match (self.gap_deadline, self.line_deadline) {
             (Some(a), Some(b)) => a.min(b),
             (a, b) => a.or(b).unwrap_or(0),
-        }
-    }
-
-    fn update_timer(&mut self) {
-        let deadline = self.deadline();
-        if deadline != self.armed {
-            self.armed = deadline;
-            self.timer(deadline);
         }
     }
 
@@ -188,23 +177,6 @@ impl Console {
         fence(Ordering::SeqCst);
     }
 
-    fn timer(&self, deadline: u64) {
-        let tcb = cap::<sel4::cap_type::Tcb>(host::SLOT_TCB);
-        let error = sel4::with_ipc_buffer_mut(|b| b.inner_mut().seL4_TCB_SetTimer(tcb.bits(), deadline, host::badges::vmm::CONSOLE));
-        assert_eq!(error, 0, "console gap timer");
-    }
-
-    /// SetTimer drops an expiry while the TCB's notification is unbound.
-    /// Call after rebinding, before sleeping, even for an unchanged deadline.
-    /// Like other TCB invocations, this clobbers the IPC buffer.
-    pub fn rearm_timer(&mut self) {
-        let deadline = self.deadline();
-        if deadline != 0 {
-            self.armed = deadline;
-            self.timer(deadline);
-        }
-    }
-
     /// Keep the first deadline for this missing sequence: kicks must not
     /// extend it. Clear it only when we advance next_seq or have no backlog.
     fn waiting_for_gap(&mut self) -> bool {
@@ -227,7 +199,6 @@ impl Console {
         self.drain_limit(vcpus, SIZE * vcpus.n, true);
         self.pace_line(true);
         self.gap_deadline = None;
-        self.update_timer();
     }
 
     fn drain_limit(&mut self, vcpus: &Vcpus, mut budget: usize, flush: bool) -> bool {
@@ -330,7 +301,6 @@ impl Console {
             }
         }
         self.pace_line(false);
-        self.update_timer();
         more
     }
 }

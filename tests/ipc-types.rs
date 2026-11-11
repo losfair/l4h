@@ -5,7 +5,13 @@ use l4h_host::{blk, mailbox, net, wiring::{self, E, o, p}};
 #[cfg(not(wrong_edge))]
 const EDGE: E<p::Root, p::Blkd, o::Notification, blk::call::Proto> = wiring::ROOT_BLKD_CALL;
 #[cfg(wrong_edge)]
-const EDGE: E<p::Root, p::Blkd, o::Notification, net::call::Proto> = E::new(wiring::ROOT_BLKD_CALL.0);
+const EDGE: E<p::Root, p::Blkd, o::Notification, net::call::Proto> = E::new(*wiring::ROOT_BLKD_CALL.edge());
+
+#[cfg(replace_edge)]
+pub fn replace_edge() {
+    let mut edge = wiring::ROOT_BLKD_CALL;
+    edge.0 = *wiring::ROOT_NETD_CALL.edge();
+}
 
 pub fn post(page: &mailbox::Mailbox) {
     let _ = EDGE;

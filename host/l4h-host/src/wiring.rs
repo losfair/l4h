@@ -236,7 +236,15 @@ pub mod o {
 /// compile time: what is minted from it must be T's O
 /// (l4h_task::edge::Obj<T, O>), and an endpoint called through it serves P
 /// (l4h_ipc::Endpoint<P>).
-pub struct E<H, T, O, P = ()>(pub Edge, PhantomData<(H, T, O, P)>);
+pub struct E<H, T, O, P = ()>(Edge, PhantomData<(H, T, O, P)>);
+
+impl<H, T, O, P> E<H, T, O, P> {
+    /// The checked declaration, which cannot be replaced without going
+    /// through `new` and checking its holder, target, object and protocol.
+    pub const fn edge(&self) -> &Edge {
+        &self.0
+    }
+}
 
 impl<H, T, O, P> Clone for E<H, T, O, P> {
     fn clone(&self) -> Self {
