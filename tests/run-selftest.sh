@@ -24,5 +24,10 @@ cp "$root"/tests/guest/page-aging/* "$mod/"
 L4H_DOM0_VCPUS=${1:-1} "$root/tools/run-dom0.sh" "$out/selftest.cpio.gz" "console=hvc0" "${L4H_TEST_TIMEOUT:-${SELFTEST_TIMEOUT:-$test_timeout}}" \
     | sed -n '/SELFTEST: start/,/SELFTEST: \(PASS\|FAIL\)/p'
 grep -q "SELFTEST: PASS" "$root/build/qemu.log"
+# Root asks the kernel for a VCPU object before l4h-logd prints (DESIGN.md
+# §10.4), so a debug kernel's refusal, without VT-x, stands on a line of
+# its own and not inside a line of host output, where it broke greps.
+! grep -a 'Untyped Retype: VT-x is not available' "$root/build/qemu.log" |
+    grep -av $'^\x1b\\[0m\x1b\\[1m<<' >/dev/null || exit 1
 ! grep -q 'hardware sampling skipped' "$root/build/qemu.log" || exit 1
 ! grep -q 'deschedule .* SC failed\|SchedContext UnbindObject: object not bound' "$root/build/qemu.log" || exit 1

@@ -3940,6 +3940,11 @@ One task, l4h-logd, is the only host code that prints to the serial port. Lines 
 The kernel still prints boot messages and fatal errors to the port itself,
 so the guarantee covers host output only: a kernel message can land inside
 a line.
+A debug kernel also reports each invocation it refuses. Root makes the one
+that every boot without VT-x has, its try at a VCPU object (`HostInfo::vtx`),
+before it starts logd: that message stands on its own line, where it used to
+land inside one of root's first lines, a different one each boot, and failed
+whichever test looked for that line (`tests/run-selftest.sh` checks it).
 
 ```
  partition 0                                 secondary partition k

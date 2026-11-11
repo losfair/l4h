@@ -117,6 +117,9 @@ pub struct HostInfo {
     /// count when it was read.
     pub epoch_ns: u64,
     pub epoch_ticks: u64,
+    /// The kernel makes VCPU objects: the CPU has VT-x or AMD-V and the
+    /// kernel uses it (patches 0038 and 0040).
+    pub vtx: bool,
 }
 
 impl HostInfo {
@@ -479,6 +482,13 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         timeslice_us: 5000,
         epoch_ns: if partition::secondary() { partition::epoch_ns(tsc_hz) } else { rtc.read_ns(&mut wins.a) },
         epoch_ticks: rdtsc(),
+        // Asked by trying, and a debug kernel prints its refusal on the
+        // serial port itself: asked here, before logd prints anything, the
+        // message cannot land inside a line of host output (§10.4).
+        #[cfg(target_arch = "x86_64")]
+        vtx: alloc.can_retype(&sel4::ObjectBlueprintArch::VCpu.into()),
+        #[cfg(not(target_arch = "x86_64"))]
+        vtx: false,
     };
     let mut asids = AsidPools { pools: [(slot::ASID_POOL.cap(), 1)].into_iter().collect(), in_use: 1 };
     let dashboard = dashboard::Dashboard::new(bootinfo, &mut alloc, &mut devmem, cfg.fb_console);
