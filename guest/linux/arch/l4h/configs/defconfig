@@ -266,6 +266,15 @@ CONFIG_NFS_V3_ACL=y
 CONFIG_NFS_V4=y
 CONFIG_NFS_V4_1=y
 CONFIG_NFS_V4_2=y
+# Guests opt into lockdown with lockdown=integrity or lockdown=confidentiality.
+# Initialize it early, including when lsm= selects another LSM such as SELinux.
+CONFIG_SECURITY=y
+CONFIG_SECURITYFS=y
+CONFIG_SECURITY_LOCKDOWN_LSM=y
+CONFIG_SECURITY_LOCKDOWN_LSM_EARLY=y
+CONFIG_LOCK_DOWN_KERNEL_FORCE_NONE=y
+# Keep the shipped modules loadable in guests that enable lockdown.
+CONFIG_MODULE_SIG_ALL=y
 # Android guests (DESIGN.md §5.8).  What only Android uses is off until an
 # Android guest asks for it on its command line, so other guests run as
 # before: SELinux with lsm=selinux, PSI with psi=1, bootconfig with
@@ -289,7 +298,6 @@ CONFIG_TRACE_GPU_MEM=y
 # listen on vsock ports for their host, and stop if they cannot.
 CONFIG_VSOCKETS=y
 CONFIG_VSOCKETS_LOOPBACK=y
-CONFIG_SECURITY=y
 CONFIG_SECURITY_NETWORK=y
 CONFIG_SECURITY_SELINUX=y
 CONFIG_DEFAULT_SECURITY_DAC=y
