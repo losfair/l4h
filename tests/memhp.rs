@@ -124,7 +124,7 @@ fn idle_guest_gets_the_last_target_after_the_call_budget_refills() {
 
 #[test]
 fn another_busy_reply_backs_off_and_a_failed_server_stops_retries() {
-    let (_, mut dev, vcpus) = device();
+    let (_page, mut dev, vcpus) = device();
     MODEL.with(|m| m.borrow_mut().error = host::errno::EBUSY);
     dev.target_changed(&vcpus);
     let first = dev.deadline();
