@@ -50,6 +50,8 @@ if [[ $want == *" aarch64 "* ]]; then
     # Extract the foreign BusyBox without replacing the build host's binary.
     dpkg --add-architecture arm64
     apt-get update -q
+    # install-extmod-build rebuilds the module signing tool for the guest.
+    apt-get install -y -q --no-install-recommends libssl-dev:arm64
     busybox_pkg=$(mktemp -d)
     (cd "$busybox_pkg" && apt-get download busybox-static:arm64)
     mkdir -p "$root/build/busybox-aarch64"
