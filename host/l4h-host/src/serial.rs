@@ -2,12 +2,13 @@
 //! only host code that writes the serial port (DESIGN.md §10.4).
 //!
 //! Every task writes whole lines to a ring and makes no seL4 call, so that
-//! printing neither waits nor stalls a core. In partition 0 each writer
+//! printing neither waits nor stalls a core. In every partition each writer
 //! has a lane of its own (`Lanes`, laid out by `log::Writer`), which only
 //! it can write, and root's lane is its ring (`Ring`): logd reads them all,
 //! the lanes read-only, and prints whose a line is from the lane it is in
-//! (`[netd] `, `[vm3] `), never from the record. A secondary partition's
-//! tasks share its one ring, which partition 0 prints as `[pN] `. `Merge`,
+//! (`[netd] `, `[vm3] `), never from the record. A secondary's trusted logd
+//! forwards its lanes to the one shared ring, with lane-derived provenance
+//! on every record. Partition 0 adds `[pN] ` to those labels. `Merge`,
 //! in logd, reads every ring and lane, oldest record first, and hands out
 //! text line by line: lines cannot mix, because one task prints them.
 //!
@@ -45,7 +46,7 @@ const _: () = assert!(VA >= crate::log::VA + crate::log::lane_pages(255) * PAGE
 
 /// Partitions on a machine (l4h_partition::MAX_PARTITIONS).
 pub const MAX_RINGS: usize = 8;
-/// `Merge`'s inputs: partition k's ring at k, partition 0's lanes after.
+/// `Merge`'s inputs: partition k's transport at k, local lanes after.
 const MAX_INPUTS: usize = MAX_RINGS + Writer::COUNT;
 
 /// logd's address space: partition k's ring and kernel console ring, and
@@ -53,10 +54,13 @@ const MAX_INPUTS: usize = MAX_RINGS + Writer::COUNT;
 pub const RINGS_VA: usize = crate::SHARED_VA;
 pub const KERNEL_RINGS_VA: usize = crate::SHARED_VA + 0x1000_0000;
 pub const KERNEL_RING_STRIDE: usize = 1 << 20;
-/// Partition 0's lanes (`Lanes`), read-only.
+/// This partition's lanes (`Lanes`), read-only.
 pub const LANES_VA: usize = crate::SHARED_VA + 0x2000_0000;
+/// A secondary logd's output transport to partition 0, writable only here.
+pub const RELAY_VA: usize = crate::SHARED_VA + 0x3000_0000;
 const _: () = assert!(KERNEL_RINGS_VA + MAX_RINGS * KERNEL_RING_STRIDE <= LANES_VA
-    && LANES_VA + LANES_PAGES * PAGE <= crate::MMIO_VA);
+    && LANES_VA + LANES_PAGES * PAGE <= RELAY_VA
+    && RELAY_VA + PAGES * PAGE <= crate::MMIO_VA);
 pub const FB_VA: usize = crate::MMIO_VA;
 /// The UART's registers (aarch64).
 pub const UART_VA: usize = FB_VA + (1 << 30);
@@ -128,14 +132,15 @@ pub struct LogdConfig {
     pub fb_width: u32,
     pub fb_height: u32,
     pub fb_offset: u64,
-    /// Partition 0's lanes are at LANES_VA (non-zero).
+    /// This partition's lanes are at LANES_VA (non-zero).
     pub lanes: u32,
-    pub _pad2: u32,
+    /// Forward to RELAY_VA instead of opening the UART (secondary only).
+    pub relay: u32,
 }
 const _: () = assert!(crate::CONFIG_OFFSET + core::mem::size_of::<LogdConfig>() <= crate::INFO_SIZE);
 
 impl LogdConfig {
-    /// Add the partitions' rings, and partition 0's lanes, to `merge`, as
+    /// Add the partitions' transports and local lanes to `merge`, as
     /// mapped at these addresses.
     pub fn add_inputs(&self, merge: &mut Merge, rings_va: usize, kernel_va: usize, lanes_va: usize) {
         if self.lanes != 0 {
@@ -180,11 +185,17 @@ const KERNEL_LINE_MAX: usize = 160;
 pub const LINE_MAX: usize = if TEXT_SIZE > KERNEL_LINE_MAX { TEXT_SIZE } else { KERNEL_LINE_MAX } + 48;
 
 /// `source` bit: the record is a guest's console, which prints as `[vmN] `
-/// at the start of a line, N the guest of the VMM whose lane it is in (in
-/// a secondary's ring, N in the low bits, behind `[pK] `).
+/// at the start of a line, N the guest of the VMM whose lane it is in.
 pub const SOURCE_GUEST: u32 = 1 << 31;
 /// `source` of dom0's console, which has no prefix.
 pub const SOURCE_DOM0: u32 = 1 << 30;
+/// Only a secondary's trusted merger writes these: the low bits are the
+/// input Writer's index, never the writer claimed by an input record.
+const SOURCE_RELAY: u32 = 1 << 29;
+// A report must start a new line even after this writer's open diagnostic.
+const SOURCE_LOST: u32 = 1 << 28;
+const SOURCE_WRITER: u32 = (1 << 16) - 1;
+const _: () = assert!(Writer::COUNT <= SOURCE_WRITER as usize);
 
 /// Meta bit: the line goes on in the next record.
 const MORE: u64 = 1;
@@ -268,7 +279,7 @@ const fn lane_pages(records: usize) -> usize {
         + records * core::mem::size_of::<ring::Slot<WORDS>>()).div_ceil(PAGE)
 }
 
-/// Partition 0's lanes, but root's: one for each writer (`log::Writer`),
+/// The local partition's lanes, but root's: one per writer (`log::Writer`),
 /// dom0's VMM's being where dom0's console is. A static of root's.
 #[repr(C)]
 pub struct Lanes {
@@ -428,18 +439,16 @@ pub fn init<const N: usize>(ring: &'static Lane<N>, _source: u32) {
     LANE_VA.store(core::ptr::from_ref(&ring.ring) as usize, SeqCst);
 }
 
-/// A component's: write to the lane, or partition ring, of `records`
+/// A component's: write to the lane of `records`
 /// records its parent mapped at `VA` (none if 0, `log::info_records`).
 /// Call before starting another thread.
 ///
 /// A lane that was another writer's and was left as no honest writer
 /// leaves one (its head or its slots' states) is reset first, as the
 /// log's (`log::init_lane`, `ring::View::adopt`): this writer's lines
-/// would not print otherwise.  The records' times are not looked at here,
-/// unlike the log's: the ring may be a secondary partition's, which its
-/// other tasks write meanwhile with later times than this task's, and a
-/// ring they write honestly must never be reset, whatever its size.  A
-/// line a lane's last writer left with a later time is no loss either:
+/// would not print otherwise. The records' times are not looked at here,
+/// unlike the log's. A line the lane's last writer left with a later time
+/// is no loss:
 /// `Merge` prints a record when it is the oldest waiting, not when its
 /// time comes, under the lane's label as that writer's lines were.
 pub fn init_lane(records: usize) {
@@ -489,12 +498,12 @@ pub struct KernelRing {
 /// Whose an input's lines are, and what goes at their start.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Label {
-    /// Root's ring in partition 0: nothing.
+    /// The local root's ring: nothing.
     Home,
-    /// A secondary partition's ring: `[pN] `, then whatever its records
-    /// claim (`[vmN] `), since its tasks share it.
+    /// A secondary partition's trusted transport: `[pN] `, then the
+    /// writer its merger derived from a private input lane.
     Partition(u32),
-    /// A writer's lane in partition 0: its name (`log::Writer::name`), or
+    /// A local writer's lane: its name (`log::Writer::name`), or
     /// for a guest's console `[vmN] ` (none for dom0's).
     Lane(Writer),
 }
@@ -535,11 +544,14 @@ struct KernelInput {
 pub struct Line {
     bytes: [u8; LINE_MAX],
     len: usize,
+    /// Forwarded records carry identity even if a preceding fragment is lost.
+    source: u32,
+    more: bool,
 }
 
 impl Line {
     pub const fn new() -> Self {
-        Self { bytes: [0; LINE_MAX], len: 0 }
+        Self { bytes: [0; LINE_MAX], len: 0, source: 0, more: false }
     }
 
     pub fn bytes(&self) -> &[u8] {
@@ -608,7 +620,7 @@ impl Merge {
         self.add(k, ring.ring.view(), Some(&ring.drained), label);
     }
 
-    /// Add partition 0's lanes, which logd can only read.
+    /// Add the local partition's lanes, which logd can only read.
     pub fn add_lanes(&mut self, lanes: &'static Lanes) {
         for w in Writer::all() {
             if let Some(ring) = lanes.lane(w) {
@@ -646,6 +658,32 @@ impl Merge {
             printed = true;
         }
         printed
+    }
+
+    /// Forward this partition's private root ring and lanes through its
+    /// shared transport. Preserve the scheduler's bounds and continuation
+    /// bits, but replace claimed identities with the input lane's. Text is
+    /// made printable once, by partition 0; no formatting prefix can be
+    /// lost independently of the record it authenticates.
+    pub fn forward(&mut self, now: impl Fn() -> u64, to: &Ring) -> bool {
+        assert!(self.kernels.iter().all(Option::is_none));
+        assert!(self.inputs.iter().flatten().all(|i| !matches!(i.label, Label::Partition(_))));
+        self.begin_pass();
+        let (mut record, mut forwarded) = (Line::new(), false);
+        while self.next_output(now(), &mut record, true) {
+            // This is one input record, including untrusted control bytes.
+            // Do not parse embedded newlines as Ring::write does: only the
+            // primary's printable() may interpret this text for display.
+            let mut buf = Buf::<WORDS>::new();
+            buf.bytes_mut()[..record.len].copy_from_slice(record.bytes());
+            let seq = to.ring.claim(1);
+            let meta = (record.source as u64) << SOURCE_SHIFT | if record.more { MORE } else { 0 };
+            to.ring.commit(seq, now(), meta, record.len, &buf);
+            compiler_fence(SeqCst);
+            self.commit();
+            forwarded = true;
+        }
+        forwarded
     }
 
     fn begin_pass(&mut self) {
@@ -692,6 +730,10 @@ impl Merge {
     /// with more lines than its share older than another's line would see
     /// that line printed between its own.
     fn next(&mut self, now: u64, out: &mut Line) -> bool {
+        self.next_output(now, out, false)
+    }
+
+    fn next_output(&mut self, now: u64, out: &mut Line, forward: bool) -> bool {
         out.len = 0;
         let mut best: Option<(usize, ring::Record<WORDS>, u64)> = None;
         // The rest of an open line was claimed with it: it comes next,
@@ -735,9 +777,16 @@ impl Merge {
             let lost = core::mem::take(&mut i.lost);
             i.reported = true;
             self.budgets[i.group] -= 1;
-            end_line(&mut self.open, out);
-            write_prefix(out, i.label, 0);
-            let _ = write!(out, "({} lines lost)\r\n", lost);
+            if forward {
+                self.open = None;
+                out.source = relay_source(i.label, 0) | SOURCE_LOST;
+                out.more = false;
+                let _ = write!(out, "({} lines lost)", lost);
+            } else {
+                end_line(&mut self.open, out);
+                write_prefix(out, i.label, 0);
+                let _ = write!(out, "({} lines lost)\r\n", lost);
+            }
             self.commit = Commit::Ring(k, i.cursor);
             return true;
         }
@@ -749,19 +798,29 @@ impl Merge {
             let source = (r.meta >> SOURCE_SHIFT) as u32;
             let more = r.meta & MORE != 0;
             if self.open != Some((k, source)) {
-                end_line(&mut self.open, out);
-                write_prefix(out, i.label, source);
+                if !forward {
+                    end_line(&mut self.open, out);
+                    write_prefix(out, i.label, source);
+                }
                 self.run = 0;
             } else {
                 self.run = self.run.saturating_add(1);
             }
             // The prefix says whose a line is: a record cannot make a line
             // that looks like someone else's, nor move the cursor to one.
-            printable(r.text(), |b| out.push(b));
+            if forward {
+                out.source = relay_source(i.label, source);
+                out.more = more;
+                out.push(r.text());
+            } else {
+                printable(r.text(), |b| out.push(b));
+            }
             if more {
                 self.open = Some((k, source));
             } else {
-                out.push(b"\r\n");
+                if !forward {
+                    out.push(b"\r\n");
+                }
                 self.open = None;
             }
             i.cursor += 1;
@@ -804,14 +863,26 @@ fn end_line(open: &mut Option<(usize, u32)>, out: &mut Line) {
     }
 }
 
+fn relay_source(label: Label, source: u32) -> u32 {
+    let writer = match label {
+        Label::Home => Writer::Root,
+        Label::Lane(w) => w,
+        Label::Partition(_) => unreachable!("only local lanes may be forwarded"),
+    };
+    let console = if source & (SOURCE_GUEST | SOURCE_DOM0) != 0 { SOURCE_GUEST } else { 0 };
+    SOURCE_RELAY | console | writer.index() as u32
+}
+
 fn write_prefix(out: &mut Line, label: Label, source: u32) {
     let console = source & (SOURCE_GUEST | SOURCE_DOM0) != 0;
     match label {
         Label::Home => {}
         Label::Partition(p) => {
             let _ = write!(out, "[p{}] ", p);
-            if source & SOURCE_GUEST != 0 {
-                let _ = write!(out, "[vm{}] ", source & !SOURCE_GUEST);
+            if source & SOURCE_RELAY != 0 {
+                if let Some(w) = Writer::from_index((source & SOURCE_WRITER) as usize) {
+                    write_prefix(out, if w == Writer::Root { Label::Home } else { Label::Lane(w) }, source);
+                }
             }
         }
         Label::Lane(Writer::Dom0) if console => {}
@@ -990,7 +1061,7 @@ mod tests {
         m.add_ring(1, other, Some(1));
         m.add_lanes(lanes);
         home.write(10, 0, b"root line", false);
-        other.write(20, SOURCE_GUEST | 3, b"guest line", false);
+        other.write(20, relay_source(Label::Lane(Writer::Vmm(3)), SOURCE_GUEST), b"guest line", false);
         lanes.write(Writer::Vmm(2), 30, SOURCE_GUEST | 2, b"vm2 line", false);
         other.write(40, 0, b"secondary root", false);
         lanes.write(Writer::Netd, 50, 0, b"l4h-netd: up", false);
@@ -1005,6 +1076,92 @@ mod tests {
         assert_eq!(home.drained.load(SeqCst), 1);
         assert_eq!(other.drained.load(SeqCst), 2);
         assert_eq!(drain(&mut m, 100), "");
+    }
+
+    #[test]
+    fn a_secondary_relay_authenticates_each_writer_and_preserves_continuations() {
+        let (home, lanes, transport) = (ring(), lanes(), ring());
+        let mut relay = Merge::new(home, GRACE);
+        relay.add_lanes(lanes);
+        let mut primary = Merge::new(ring(), GRACE);
+        primary.add_ring(1, transport, Some(1));
+        // Claimed guest ids, relay flags and root identities are all input
+        // metadata controlled by the VMM; its writable lane is still vm3's.
+        lanes.write(Writer::Vmm(3), 1, SOURCE_GUEST | SOURCE_RELAY | 9, b"prompt> ", true);
+        assert!(relay.forward(|| 10, transport));
+        assert_eq!(drain(&mut primary, 11), "[p1] [vm3] prompt> ");
+        lanes.write(Writer::Vmm(3), 12, SOURCE_GUEST | SOURCE_RELAY | 9, b"answer", false);
+        home.write(13, 0, b"l4h-root: real", false);
+        lanes.write(Writer::Vmm(3), 14, SOURCE_RELAY, b"l4h-root: forged", false);
+        lanes.write(Writer::Netd, 15, SOURCE_GUEST | 9, b"network", false);
+        lanes.write(Writer::Dom0, 16, SOURCE_DOM0, b"dom0", false);
+        assert!(relay.forward(|| 20, transport));
+        assert_eq!(drain(&mut primary, 21),
+            "answer\r\n[p1] l4h-root: real\r\n[p1] [vmm3] l4h-root: forged\r\n[p1] [netd] network\r\n[p1] dom0\r\n");
+        assert!(home.is_drained());
+
+        let long = "x".repeat(TEXT_SIZE * 3 + 7);
+        lanes.write(Writer::Vmm(3), 22, SOURCE_GUEST | 9, long.as_bytes(), false);
+        assert!(relay.forward(|| 30, transport));
+        assert_eq!(drain(&mut primary, 31), std::format!("[p1] [vm3] {long}\r\n"));
+    }
+
+    #[test]
+    fn secondary_transport_wrap_cannot_remove_a_surviving_records_provenance() {
+        let (home, lanes, transport) = (ring(), lanes(), ring());
+        let mut relay = Merge::new(home, GRACE);
+        relay.add_lanes(lanes);
+        for t in 1..=CAPACITY as u64 + 7 {
+            lanes.write(Writer::Vmm(3), t, SOURCE_GUEST | 9, b"l4h-root: forged", true);
+            assert!(relay.forward(|| t + 1, transport));
+        }
+        // The VMM flood never wrote root's private ring.
+        assert_eq!(home.head(), 0);
+        home.write(2000, 0, b"real root", false);
+        assert!(relay.forward(|| 2001, transport));
+        let mut primary = Merge::new(ring(), GRACE);
+        primary.add_ring(1, transport, Some(1));
+        let text = drain(&mut primary, 2002);
+        assert!(text.starts_with("[p1] (8 lines lost)\r\n[p1] [vm3] l4h-root: forged"), "{text}");
+        assert!(text.ends_with("\r\n[p1] real root\r\n"), "{text}");
+        assert!(!text.contains("\r\n[p1] l4h-root: forged"));
+    }
+
+    #[test]
+    fn a_relay_does_not_parse_untrusted_record_text_as_newlines_or_prefixes() {
+        let (home, lanes, transport) = (ring(), lanes(), ring());
+        let mut relay = Merge::new(home, GRACE);
+        relay.add_lanes(lanes);
+        let lane = lanes.lane(Writer::Vmm(3)).unwrap();
+        let raw = b"guest\nl4h-root: forged\x1b";
+        let mut buf = Buf::<WORDS>::new();
+        buf.bytes_mut()[..raw.len()].copy_from_slice(raw);
+        let at = lane.claim(1);
+        lane.commit(at, 1, (SOURCE_GUEST as u64 | 9) << SOURCE_SHIFT, raw.len(), &buf);
+        assert!(relay.forward(|| 2, transport));
+        assert_eq!(transport.head(), 1, "one input record must remain one transport record");
+        let mut primary = Merge::new(ring(), GRACE);
+        primary.add_ring(1, transport, Some(1));
+        assert_eq!(drain(&mut primary, 3), "[p1] [vm3] guest l4h-root: forged?\r\n");
+    }
+
+    #[test]
+    fn secondary_lane_loss_ends_an_open_line_and_keeps_report_attribution() {
+        let (home, lanes, transport) = (ring(), lanes(), ring());
+        let mut relay = Merge::new(home, GRACE);
+        relay.add_lanes(lanes);
+        let mut primary = Merge::new(ring(), GRACE);
+        primary.add_ring(1, transport, Some(1));
+        lanes.write(Writer::Vmm(3), 1, 0, b"before", true);
+        assert!(relay.forward(|| 2, transport));
+        assert_eq!(drain(&mut primary, 3), "[p1] [vmm3] before");
+        for t in 4..4 + VMM as u64 + 1 {
+            lanes.write(Writer::Vmm(3), t, 0, b"after", false);
+        }
+        assert!(relay.forward(|| 100, transport));
+        let text = drain(&mut primary, 101);
+        assert!(text.starts_with("\r\n[p1] [vmm3] (1 lines lost)\r\n[p1] [vmm3] after\r\n"), "{text}");
+        assert_eq!(text.matches("after").count(), VMM);
     }
 
     #[test]

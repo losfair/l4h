@@ -13,8 +13,14 @@
 //! libraries are independent. See DESIGN.md §10 for the shared crate boundaries.
 
 #![no_std]
+#![feature(thread_local)]
 
 use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+
+// Each thread has its own TLS image. Panic recovery must use the TCB
+// actually executing it, including a keeper that panics during handoff.
+#[thread_local]
+static THREAD_TCB: core::cell::Cell<u64> = core::cell::Cell::new(host::SLOT_TCB);
 
 pub use l4h_host as host;
 pub use l4h_ipc as ipc;
@@ -232,6 +238,7 @@ pub unsafe fn start_secondary(slot: u64, top: usize, entry: extern "C" fn() -> !
 /// nothing: no l4h_ipc::run.
 #[allow(clippy::disallowed_methods)]
 extern "C" fn keeper() -> ! {
+    THREAD_TCB.set(host::SLOT_KEEPER);
     unsafe {
         sel4::set_ipc_buffer((host::KEEPER_IPCBUF_VA as *mut sel4::IpcBuffer).as_mut().unwrap());
     }
@@ -266,7 +273,7 @@ pub fn abort_trap() -> ! {
     panic_flush();
     log!("l4h-rt: component {:#x} aborted", h.id);
     if h.magic == INFO_MAGIC && host::has_keeper(h.kind) {
-        failure::answer_failed(host::SLOT_TCB);
+        failure::answer_failed(THREAD_TCB.get());
     }
     loop {
         unsafe {

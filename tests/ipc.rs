@@ -17,7 +17,12 @@ pub mod cap_type {
 pub struct Cap<T: CapType>(u64, PhantomData<T>);
 impl<T: CapType> Clone for Cap<T> { fn clone(&self) -> Self { *self } }
 impl<T: CapType> Copy for Cap<T> {}
-impl<T: CapType> Cap<T> { pub const fn from_bits(v: u64) -> Self { Self(v, PhantomData) } }
+impl<T: CapType> Cap<T> {
+    pub const fn from_bits(v: u64) -> Self { Self(v, PhantomData) }
+    pub fn bits(self) -> u64 { self.0 }
+}
+#[derive(Debug, Clone, Copy)]
+pub enum Error { IllegalOperation, InvalidCapability }
 pub mod cap {
     pub type Endpoint = super::Cap<super::cap_type::Endpoint>;
     pub type Reply = super::Cap<super::cap_type::Reply>;
@@ -48,6 +53,8 @@ fn clobber() { with_ipc_buffer_mut(|b| b.0.fill(0xbad)); }
 enum Input { Call(u64), Fault, Unanswered, Unbadged }
 struct Model {
     bound: bool, notification: bool, flood: bool,
+    bound_tcb: u64, notification_badge: u64,
+    unbind_error: Option<Error>, bind_error: Option<Error>,
     inputs: VecDeque<Input>, held: Option<Input>, replies: Vec<Vec<u64>>,
     signals: usize, polls: usize, rebinds: usize, unanswered: usize,
     calls: Vec<u64>, faults: usize, idle: usize,
@@ -58,6 +65,8 @@ impl Model {
     fn new() -> Self {
         Self {
             bound: true, notification: false, flood: false, inputs: VecDeque::new(), held: None,
+            bound_tcb: host::SLOT_TCB, notification_badge: host::badges::root::CHANNEL,
+            unbind_error: None, bind_error: None,
             replies: Vec::new(), signals: 0, polls: 0, rebinds: 0, unanswered: 0,
             calls: Vec::new(), faults: 0, idle: 0,
             expiry_on_unbind: false, rearm_expiry: false, deadline: 100, reply_words: vec![0],
@@ -80,7 +89,7 @@ fn receive(blocking: bool) -> (MessageInfo, u64) {
         Some(m.held)
     });
     match input {
-        None => (MessageInfo::new(0, 0, 0, 0), host::badges::root::CHANNEL),
+        None => (MessageInfo::new(0, 0, 0, 0), MODEL.with(|m| m.borrow().notification_badge)),
         Some(None) => (MessageInfo::new(0, 0, 0, 0), 0),
         Some(Some(input)) => {
             let (label, badge, word) = match input {
@@ -114,31 +123,39 @@ impl Cap<cap_type::Endpoint> {
 }
 impl Cap<cap_type::Reply> { pub fn send(self, info: MessageInfo) { answer(info); } }
 impl Cap<cap_type::Tcb> {
-    pub fn tcb_unbind_notification(self) -> Result<(), ()> {
-        MODEL.with(|m| {
+    pub fn tcb_unbind_notification(self) -> Result<(), Error> {
+        let result = MODEL.with(|m| {
             let mut m = m.borrow_mut();
-            assert!(m.bound);
+            if let Some(e) = m.unbind_error.take() { return Err(e); }
+            if !m.bound || m.bound_tcb != self.0 { return Err(Error::IllegalOperation); }
             m.bound = false;
             // A kernel timer can expire here without delivering a signal.
             if m.expiry_on_unbind { m.rearm_expiry = true; m.expiry_on_unbind = false; }
+            Ok(())
         });
         clobber();
-        Ok(())
+        result
     }
-    pub fn tcb_bind_notification(self, _: cap::Notification) -> Result<(), ()> {
-        MODEL.with(|m| {
+    pub fn tcb_bind_notification(self, _: cap::Notification) -> Result<(), Error> {
+        let result = MODEL.with(|m| {
             let mut m = m.borrow_mut();
-            assert!(!m.bound);
+            if let Some(e) = m.bind_error.take() { return Err(e); }
+            if m.bound { return Err(Error::IllegalOperation); }
             m.bound = true;
+            m.bound_tcb = self.0;
             m.rebinds += 1;
+            Ok(())
         });
         clobber();
-        Ok(())
+        result
     }
 }
 
 #[path = "../host/l4h-ipc/src/lib.rs"]
 mod ipc;
+pub fn cap<T: CapType>(slot: u64) -> Cap<T> { Cap::from_bits(slot) }
+#[path = "../host/l4h-rt/src/failure.rs"]
+mod failure;
 
 struct Reply;
 impl ipc::ReplyObject for Reply {
@@ -155,7 +172,7 @@ impl ipc::Server for Receiver {
     const FAULT: u64 = host::badges::root::FAULT;
     type Sender = host::root::Sender;
     fn notification(&self) -> Option<ipc::Bound> {
-        Some(ipc::Bound::new(cap::Tcb::from_bits(3), cap::Notification::from_bits(4)))
+        Some(ipc::Bound::new(cap::Tcb::from_bits(host::SLOT_TCB), cap::Notification::from_bits(4)))
     }
     fn rebound(&mut self) {
         MODEL.with(|m| {
@@ -273,4 +290,105 @@ fn client_rejects_a_length_beyond_its_buffer_even_from_another_transport() {
     }
     use host::trust::call::Client;
     assert_eq!(Oversized.sync(), Err(host::wire::FAILED));
+}
+
+static FAILURE_HANDLER: failure::FailureHandler = failure::FailureHandler {
+    notification_badges: host::badges::vmmgr::SIGNALS,
+    notified: failed_signal,
+};
+fn failed_signal(badge: u64) {
+    MODEL.with(|m| {
+        let mut m = m.borrow_mut();
+        if badge != 0 {
+            assert!(!ipc::holds_call());
+            m.signals += 1;
+            assert!(m.signals < 20, "notifications starved failed-server callers");
+        }
+        if m.inputs.is_empty() && m.held.is_none() && !m.replies.is_empty() { finish(); }
+        m.notification |= m.flood;
+    });
+    clobber();
+}
+fn failed_model(mut model: Model) {
+    // An empty production poll clears held-call state left by another test.
+    MODEL.with(|m| *m.borrow_mut() = Model::new());
+    assert!(ipc::Bound::new(cap(host::SLOT_TCB), cap(host::SLOT_NTFN))
+        .poll_endpoint(cap(host::SLOT_SERVICE_EP), cap(host::SLOT_REPLY), host::badges::parent::FAULT, || {}).is_none());
+    model.notification_badge = host::badges::vmmgr::CTL_KICK;
+    MODEL.with(|m| *m.borrow_mut() = model);
+    failure::set_failure_handler(&FAILURE_HANDLER);
+}
+fn run_failed(tcb: u64) {
+    let end = std::panic::catch_unwind(|| failure::answer_failed(tcb));
+    assert!(end.unwrap_err().is::<End>());
+}
+
+#[test]
+fn failed_server_transfers_pending_signals_from_bound_unbound_or_keeper_state() {
+    for (bound, owner, tcb) in [
+        (true, host::SLOT_TCB, host::SLOT_KEEPER),
+        (false, host::SLOT_TCB, host::SLOT_KEEPER),
+        (true, host::SLOT_KEEPER, host::SLOT_KEEPER),
+        (false, host::SLOT_TCB, host::SLOT_TCB),
+    ] {
+        failed_model(Model { bound, bound_tcb: owner, notification: true, ..Model::new() });
+        run_failed(tcb);
+        MODEL.with(|m| {
+            let m = m.borrow();
+            assert!(m.bound);
+            assert_eq!(m.bound_tcb, tcb);
+            assert_eq!(m.signals, 1, "handoff must preserve the pending kick");
+        });
+    }
+}
+
+#[test]
+fn failed_server_answers_calls_and_leaves_faults_stopped_under_continuous_kicks() {
+    failed_model(Model {
+        notification: true, flood: true,
+        inputs: [Input::Fault, Input::Call(42), Input::Call(43)].into(), ..Model::new()
+    });
+    run_failed(host::SLOT_KEEPER);
+    MODEL.with(|m| {
+        let m = m.borrow();
+        assert_eq!(m.replies, [vec![host::wire::FAILED], vec![host::wire::FAILED]]);
+        assert!(m.inputs.is_empty());
+        assert_eq!(m.polls, 3);
+        assert_eq!(m.bound_tcb, host::SLOT_KEEPER);
+    });
+}
+
+#[test]
+fn failure_after_a_fairness_poll_answers_the_call_already_received() {
+    failed_model(Model {
+        notification: true, inputs: [Input::Call(42)].into(),
+        bind_error: Some(Error::InvalidCapability), ..Model::new()
+    });
+    MODEL.with(|m| m.borrow_mut().notification_badge = host::badges::root::CHANNEL);
+    // Fail in the real live loop after NBRecv, before the notification binds.
+    assert!(std::panic::catch_unwind(|| ipc::run(cap(1), Reply, &mut Receiver)).is_err());
+    assert!(ipc::holds_call());
+    MODEL.with(|m| assert!(!m.borrow().bound));
+    run_failed(host::SLOT_KEEPER);
+    MODEL.with(|m| {
+        let m = m.borrow();
+        assert_eq!(m.replies, [vec![host::wire::FAILED]]);
+        assert_eq!(m.bound_tcb, host::SLOT_KEEPER);
+    });
+}
+
+#[test]
+fn notification_handoff_does_not_ignore_unrelated_kernel_errors() {
+    failed_model(Model { unbind_error: Some(Error::InvalidCapability), ..Model::new() });
+    let result = std::panic::catch_unwind(|| failure::answer_failed(host::SLOT_KEEPER));
+    let error = result.unwrap_err();
+    let message = error.downcast_ref::<String>().map(String::as_str)
+        .or_else(|| error.downcast_ref::<&str>().copied()).unwrap();
+    assert!(message.contains("failure unbind: InvalidCapability"));
+    MODEL.with(|m| {
+        let m = m.borrow();
+        assert!(m.bound);
+        assert_eq!(m.bound_tcb, host::SLOT_TCB);
+        assert_eq!(m.rebinds, 0);
+    });
 }

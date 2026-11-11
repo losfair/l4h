@@ -72,6 +72,9 @@ const LINK_BUDGET: usize = 256;
 /// faster than netd switches cannot starve the ports, the links and
 /// root's commands.
 const NIC_BUDGET: usize = 256;
+/// RX backlog attempts per port and turn, including failed puts. A peer
+/// can change its tail between the full check and the wakeup recheck.
+const BACKLOG_BUDGET: usize = net::RING_SIZE;
 /// Limit a guest's work per receive turn on a linked switch. The switch
 /// flushes link notifications before coming back for the remaining slots.
 const LINK_TX_BYTES: usize = 128 << 10;
@@ -241,6 +244,8 @@ struct Netd {
     steer: &'static mut Steer,
     /// The chunks of the frames all backlogs hold.
     pool: &'static mut Pool,
+    /// Ports with RX work left after their bounded wakeup recheck.
+    deferred_ports: u64,
     tsc_hz: u64,
     /// Frame being switched.
     buf: &'static mut [u8],
@@ -521,9 +526,13 @@ impl Netd {
     /// Move port `i`'s backlog into its RX ring while there is room.  While
     /// frames remain, the client is asked to kick netd when it frees slots.
     fn rx_backlog(&mut self, i: usize) {
+        self.deferred_ports &= !(1 << i);
         let Some(p) = self.ports[i].as_mut() else { return };
+        let mut budget = BACKLOG_BUDGET;
         loop {
-            while let Some(f) = self.pool.front(&p.backlog) {
+            while budget != 0 {
+                let Some(f) = self.pool.front(&p.backlog) else { break };
+                budget -= 1;
                 if !rx_put(p, &f, &f.hdr) {
                     break;
                 }
@@ -539,6 +548,12 @@ impl Netd {
             // The client may have freed slots before it saw rx_wanted.
             fence(Ordering::SeqCst);
             if rx_full(p) {
+                return;
+            }
+            if budget == 0 {
+                // Room appeared before the client saw rx_wanted. Come
+                // back without relying on a kick that may not arrive.
+                self.deferred_ports |= 1 << i;
                 return;
             }
         }
@@ -845,6 +860,7 @@ fn main(info: &'static Info) -> ! {
         },
         steer: unsafe { &mut *addr_of_mut!(STEER) },
         pool: pool::take(),
+        deferred_ports: 0,
         tsc_hz: info.header().tsc_hz,
         buf: unsafe { &mut *addr_of_mut!(BUF) },
         seg_buf: unsafe { &mut *addr_of_mut!(SEG_BUF) },
@@ -873,11 +889,14 @@ fn main(info: &'static Info) -> ! {
         // Notification: port kicks and NIC interrupts. Deferred slots and
         // new client kicks use the same drain path.
         let ports = badge | core::mem::take(&mut deferred_tx);
+        let backlogs = ports | core::mem::take(&mut d.deferred_ports);
         for i in 0..net::MAX_PORTS {
             if ports & (1 << i) != 0 {
                 if d.port_tx(i) {
                     deferred_tx |= 1 << i;
                 }
+            }
+            if backlogs & (1 << i) != 0 {
                 d.rx_backlog(i);
             }
         }
@@ -926,7 +945,7 @@ fn main(info: &'static Info) -> ! {
         // (badge zero when idle) and come back for the rest.
         badge = if added != 0 {
             added
-        } else if deferred_tx != 0 || deferred_rx != 0 {
+        } else if deferred_tx != 0 || deferred_rx != 0 || d.deferred_ports != 0 {
             ntfn.poll().1
         } else {
             ntfn.wait().1

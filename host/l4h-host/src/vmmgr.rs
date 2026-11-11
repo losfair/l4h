@@ -50,11 +50,9 @@ pub const MAX_ASID_POOLS: usize = 8;
 /// which vmmgr copies into it: SLOT_VMM_MEMD_EP + g.
 pub const SLOT_VMM_MEMD_EP: u64 = SLOT_ASID_POOL + MAX_ASID_POOLS as u64;
 /// The guests' VMMs' serial lanes, dom0's included (serial::VMM_PAGES
-/// frames, from page 0 of serial::Lanes), each mapped into its VMM; in a
-/// secondary partition, which has no lanes, the partition's serial ring
-/// (serial::PAGES frames), mapped into every VMM.
+/// frames, from page 0 of serial::Lanes), each mapped into its own VMM.
 pub const SLOT_SERIAL_FRAMES: u64 = 256;
-const SERIAL_FRAMES: usize = if crate::serial::VMM_PAGES > crate::serial::PAGES { crate::serial::VMM_PAGES } else { crate::serial::PAGES };
+const SERIAL_FRAMES: usize = crate::serial::VMM_PAGES;
 /// The VMMs' log lanes (log::VMM_PAGES frames, from page 0 of the log
 /// area), each mapped into its VMM.
 pub const SLOT_LOG_FRAMES: u64 = SLOT_SERIAL_FRAMES + SERIAL_FRAMES as u64;
@@ -249,9 +247,6 @@ pub struct VmmgrConfig {
     pub dom0_usbs: u64,
     pub dom0_usb: [u64; crate::usb::MAX_GUEST_USB],
     pub dom0_cmdline: [u8; l4h_abi::CMDLINE_SIZE],
-    /// SLOT_SERIAL_FRAMES holds the VMMs' serial lanes (partition 0), not
-    /// the partition's ring.
-    pub serial_lanes: u64,
 }
 const _: () = assert!(crate::CONFIG_OFFSET + core::mem::size_of::<VmmgrConfig>() <= crate::INFO_SIZE);
 

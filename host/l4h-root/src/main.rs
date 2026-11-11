@@ -106,8 +106,8 @@ pub struct HostInfo {
     pub tsc_hz: u64,
     log_frames: u64,
     serial_frames: u64,
-    /// SERIAL_LANES' first frame, in partition 0.
-    serial_lanes: Option<u64>,
+    /// SERIAL_LANES' first frame, private to this partition.
+    serial_lanes: u64,
     /// AArch64 feature ID registers for the guests' bootinfo (`cpu_id`).
     pub cpu_id: [u64; 5],
     pub hyp_ep: cap::Endpoint,
@@ -136,11 +136,7 @@ impl HostInfo {
         }
     }
 
-    pub fn serial_frames(&self) -> u64 {
-        self.serial_frames
-    }
-
-    pub fn serial_lanes(&self) -> Option<u64> {
+    pub fn serial_lanes(&self) -> u64 {
         self.serial_lanes
     }
 
@@ -442,13 +438,10 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     // The serial port is partition 0's.
     let uart = if partition::secondary() { None } else { logd::init_uart(&mut alloc, &mut devmem, cfg.serial_port) };
     let image_frame = |va: usize| bootinfo.user_image_frames().index((va - layout::image_base()) / 4096).cap().bits();
-    let serial_frames = match partition::serial_ring(&mut alloc, &mut devmem, &SERIAL) {
-        Some(frames) => frames.start as u64,
-        None => {
-            assert!(((&raw const SERIAL) as usize - layout::image_base()) / 4096 + host::serial::PAGES <= bootinfo.user_image_frames().len());
-            image_frame((&raw const SERIAL) as usize)
-        }
-    };
+    let outgoing = partition::serial_ring(&mut alloc, &mut devmem);
+    assert!(!partition::secondary() || outgoing.is_some(), "secondary serial relay ring");
+    assert!(((&raw const SERIAL) as usize - layout::image_base()) / 4096 + host::serial::PAGES <= bootinfo.user_image_frames().len());
+    let serial_frames = image_frame((&raw const SERIAL) as usize);
     // ACPI table frames are shared by RTC discovery, reset and trustd.
     #[cfg(target_arch = "x86_64")]
     let mut acpi_frames = acpi::Frames::new();
@@ -470,12 +463,11 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
             bootinfo.user_image_frames().index(i).cap().bits()
         },
         serial_frames,
-        // logd reads lanes in partition 0; a secondary's tasks share its ring.
-        serial_lanes: (!partition::secondary()).then(|| {
+        serial_lanes: {
             let first = (&raw const SERIAL_LANES) as usize;
             assert!((first - layout::image_base()) / 4096 + host::serial::LANES_PAGES <= bootinfo.user_image_frames().len());
             image_frame(first)
-        }),
+        },
         cpu_id: cpu_id(bootinfo),
         hyp_ep,
         sched_control_base: bootinfo.sched_control().range().start,
@@ -492,11 +484,11 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     };
     let mut asids = AsidPools { pools: [(slot::ASID_POOL.cap(), 1)].into_iter().collect(), in_use: 1 };
     let dashboard = dashboard::Dashboard::new(bootinfo, &mut alloc, &mut devmem, cfg.fb_console);
-    let logd = uart.as_ref().and_then(|uart| {
+    let logd = if uart.is_some() || outgoing.is_some() {
         let rings = partition::Rings::new(&mut alloc, &mut devmem);
         let fb = dashboard.as_ref().and_then(|d| d.console_area());
-        logd::spawn(&mut alloc, &mut wins.a, &mut asids, &info, uart, &rings, fb)
-    });
+        logd::spawn(&mut alloc, &mut wins.a, &mut asids, &info, uart.as_ref(), &rings, fb, outgoing)
+    } else { None };
     // From here on, memory comes from memd.
     let mut memd = memd::spawn(&mut alloc, &mut wins.a, &mut asids, &info);
     assert!(!host::TEST_INJECT || !cfg.test_early_panic, "injected early panic");

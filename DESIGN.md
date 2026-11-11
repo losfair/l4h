@@ -2188,7 +2188,11 @@ firewalling belong in a VM.
 - **Full rings hold, not drop.** A guest's RX ring has 24 slots, fewer than
   one TCP burst. Frames for a full ring wait in a per-port backlog (at most
   512 frames and 2 MiB) and are delivered in order: netd sets `rx_wanted`
-  in the port and the VMM kicks netd when it frees RX slots. Frames for an
+  in the port and the VMM kicks netd when it frees RX slots. Each drain
+  counts failed puts as well as delivered frames against a bounded turn.
+  If the wakeup recheck sees room after that budget runs out, netd defers
+  the port and polls on its next turn, so it need not wait for a lost kick.
+  Frames for an
   uplink without a free TX buffer wait in a per-NIC backlog (512 frames,
   4 MiB). All backlogs share one pool of 2 KiB chunks, 16 MiB, fixed in
   netd's image. The pool keeps 136 KiB for each backlog (two frames of any
@@ -2742,7 +2746,9 @@ controller, one per claimed controller, and the guest forwards Linux's
   (it waits behind a full CQ) is marked to be skipped and never completes
   (`ST_DROPPED`; the guest gives it back). A URB that
   does not fit its ring waits in usbd, so one full ring does not hold up
-  other endpoints. A command timeout, HSE or HCE resets the controller and
+  other endpoints. Recovery requires successful Reset Endpoint and Set TR
+  Dequeue completions; a rejection resets the controller before any old
+  ring can restart or its software dequeue advance. A command timeout, HSE or HCE resets the controller and
   posts `HC_RESET`; only its owner is affected. A reset that cannot halt
   the controller faults usbd before returning any URB or freeing a ring,
   so root quarantines the device while the buffers are still owned.
@@ -2960,6 +2966,11 @@ take that endpoint turn. Each server rearms its original timer deadline,
 including one that expired while unbound, rather than postponing its next
 tick after every signal. memd has no untrusted signal source (only its own
 timer) and root calls it with badge 0, so it uses the ordinary receive.
+The failed-server loop uses the same `Bound::poll_endpoint` arbitration:
+continuous control kicks cannot keep calls waiting for `wire::FAILED`.
+Notification takeover accepts an already-unbound main TCB, since it may
+have faulted during that poll, and repairs a binding already held by the
+keeper if its panic recovery retries. Other kernel errors still fail.
 
 **Integer arithmetic.** Shipped host components build without overflow
 checks (Cargo's release profile, §4.1), so an overflow wraps rather than
@@ -3086,8 +3097,7 @@ one way to do each part of it:
   (`wire::NO_REPLY`, a deferred request) or overflows a guest status. A
   thread that is not called (trustd's main thread, logd, the drivers)
   waits on its notification instead. Only l4h-ipc calls, serves and
-  receives on endpoints (and l4h-rt's keeper and failure answers, which
-  serve no protocol), and
+  receives on endpoints (and l4h-rt's keeper's initial fault receive), and
   nothing sends on one without calling: a send gives a server no reply to
   make, and would leave a passive one without a scheduling context to come
   back on (the host has no passive server: the flags server keeps a scheduling
@@ -3980,7 +3990,9 @@ root.
   outstanding request and later ones, using pages and a notification
   registered before dom0 starts and none of vmmgr's mutable state. A keeper
   takes over the main thread's bound notification; a panicking main thread
-  serves it itself. Faults of guest kernels and VMMs stay unanswered, so
+  serves it itself. Panic recovery retains the executing TCB in TLS, so a
+  panicking keeper keeps that ownership too. Faults of guest kernels and
+  VMMs stay unanswered, so
   those vCPUs stop. Nothing can then create, change or destroy guests,
   attestation answers no longer reach guests, and the balancer stops; the
   serial monitor's `reboot` resets the host (`tests/control-failure.rs`).
@@ -4001,21 +4013,23 @@ land inside one of root's first lines, a different one each boot, and failed
 whichever test looked for that line (`tests/run-selftest.sh` checks it).
 
 ```
- partition 0                                 secondary partition k
- root      every other writer (log::Writer)  root, vmmgr, netd, blkd, memd,
- |         a lane each: netd, blkd c,         trustd, VMMs: one ring
- |         VMM g (guest g's console),
- |         dom0's VMM (dom0's console)
- v              |                                   |
- serial ring 0  v                                   v
- (root's image) serial lanes (root's image)  serial ring k (shared region)
-        |       | read-only                         |
-        +-------+----------+------------------------+
-                           v
-                      l4h-logd  ------> UART, framebuffer
-                           ^
-                           |
-             secondary kernels' console rings
+ partition 0                         secondary partition k
+ root       other writers            root       other writers
+ |          | a lane each            |          | a lane each
+ v          v                        v          v
+ root ring  serial lanes             root ring  serial lanes
+ |          | read-only              |          | read-only
+ +----------+                        +----------+
+       |                                   |
+       |                              local l4h-logd
+       |                              trusted provenance per record
+       |                                   |
+       |                            serial ring k (shared region)
+       +--------------------+--------------+
+                            v
+                       l4h-logd  ------> UART, framebuffer
+                            ^
+              secondary kernels' console rings
 ```
 
 - **Serial ring** (`l4h_host::serial`). 1023 slots of 224 bytes, 256 KiB,
@@ -4029,12 +4043,13 @@ whichever test looked for that line (`tests/run-selftest.sh` checks it).
   the record's checksum shows its reader (the record is then lost). A line
   that does not fit takes consecutive slots, flagged as going on, and a
   reader prints them next to each other.
-- **Lanes.** In partition 0 the ring is root's alone. Every other writer
+- **Lanes.** In every partition the root ring is root's alone. Every other
+  writer
   (`log::Writer`) has a lane of its own (`serial::Lanes`, 1.6 MiB in a
   static of root's, fixed at start): dom0's VMM one as deep as the ring,
   for dom0's console; each other VMM 63 records, for its guest's console;
   vmmgr 31; every other component 15. A component maps only its own lane,
-  writable, at the address where a secondary's tasks map their ring; root
+  writable, at the same fixed address in every partition; root
   gives vmmgr the VMMs' lanes, for it to give each VMM its own, and maps
   every lane into logd read-only. logd prints whose a line is from the lane
   it is in, never from the record: root's lines and dom0's console have no
@@ -4044,15 +4059,20 @@ whichever test looked for that line (`tests/run-selftest.sh` checks it).
   line that passes for another's nor overwrite or erase another's: it fills
   only its own lane. The next VMM of a
   guest id resets a lane its last one left unusable, as in the log
-  (`serial::init_lane`; a ring as deep as root's, which may be a secondary's
-  shared one, only for a wrong head or slot, not for a record's time), and
+  (`serial::init_lane`; a ring as deep as root's only for a wrong head or
+  slot, not for a record's time), and
   logd reads a lane whose head moved back from the oldest record it holds, so
-  the new writer's first lines print. A secondary partition has one ring for
-  all its tasks,
-  in the shared region the partition descriptor gives it (one ring's
-  room), and partition 0 prints its lines as `[pN] `: within a secondary a
-  task can still pass for, or overwrite, another (partitions are not a
-  security boundary, §11.4), never for partition 0's.
+  the new writer's first lines print. A secondary runs a local logd without
+  UART authority. It reads root's private ring and every lane, applying the
+  same scheduling bounds, and is the only component given the shared
+  transport ring from the partition descriptor. `Merge::forward` copies
+  each input record with a writer index derived from its lane, plus its
+  continuation and console bits; claimed writer identities are discarded.
+  Partition 0 prints `[pN] ` followed by that writer's label. Every
+  continuation carries its provenance, so wrapping the transport cannot
+  remove a surviving record's identity. Lost records can still occur on
+  this bounded shared transport; retained host logs use their separate
+  lanes. Partitions themselves remain outside the security boundary (§11.4).
 - **Printable text.** logd hands on a record's text, and a kernel console
   line, only as text (`log::printable`, also what `l4hctl logs` reads):
   tabs

@@ -30,35 +30,23 @@ pub fn set_failure_handler(handler: &'static FailureHandler) {
 /// it was handling when it failed too: a reply would restart that thread,
 /// with the reply's word in a register.  The first receive on the reply
 /// object lets go of it instead, which leaves the thread stopped.
-/// Not l4h_ipc::run: it serves no protocol, and may start by answering.
-#[allow(clippy::disallowed_methods)]
 pub(crate) fn answer_failed(tcb: u64) -> ! {
     let handler = unsafe { HANDLER.load(Ordering::Acquire).as_ref() };
-    if handler.is_some() && tcb != host::SLOT_TCB {
-        // The faulted main thread still owns the notification, which
-        // carries the handler's signals. Pending signals survive the
-        // transfer to the keeper.
-        cap::<sel4::cap_type::Tcb>(host::SLOT_TCB).tcb_unbind_notification().expect("failure unbind");
-        cap::<sel4::cap_type::Tcb>(tcb)
-            .tcb_bind_notification(cap(host::SLOT_NTFN)).expect("failure bind");
-    }
-    if let Some(handler) = handler {
-        (handler.notified)(0);
-    }
+    let bound = handler.map(|_| {
+        let bound = crate::ipc::Bound::new(cap(tcb), cap(host::SLOT_NTFN));
+        // Main can have stopped during an unbound poll; a panicking
+        // keeper may also have completed this transfer already.
+        bound.take_from(cap(host::SLOT_TCB));
+        bound
+    });
     let ep = cap::<sel4::cap_type::Endpoint>(host::SLOT_SERVICE_EP);
     let reply = cap::<sel4::cap_type::Reply>(host::SLOT_REPLY);
-    let mut answer = crate::ipc::holds_call();
-    loop {
-        let (_, badge) = if answer {
-            ep.reply_recv(crate::ipc::reply(&[host::wire::FAILED]), reply)
-        } else {
-            ep.recv(reply)
-        };
-        if let Some(handler) = handler.filter(|h| badge & h.notification_badges != 0) {
-            (handler.notified)(badge);
-            answer = false;
-        } else {
-            answer = badge & host::badges::parent::FAULT == 0;
-        }
-    }
+    crate::ipc::fail(
+        ep, reply, bound, handler.map_or(0, |h| h.notification_badges),
+        host::badges::parent::FAULT, |badge| {
+            if let Some(handler) = handler {
+                (handler.notified)(badge);
+            }
+        },
+    )
 }

@@ -228,7 +228,6 @@ pub fn spawn(h: &mut Host, modules: &Modules, plan: &Dom0Plan) -> Vmmgr {
         (cfg.topo_cpus, cfg.topo_physical, cfg.topo_order) = (cpus as u64, physical, order);
         cfg.watchdog_secs = h.cfg.watchdog_secs as u64;
         cfg.trust = h.trustd.is_some() as u64;
-        cfg.serial_lanes = h.info.serial_lanes().is_some() as u64;
         cfg.vtx = h.info.vtx as u64;
         cfg.modules_radix = radix as u64;
         cfg.modules_pages = pages as u64;
@@ -289,8 +288,8 @@ pub fn spawn(h: &mut Host, modules: &Modules, plan: &Dom0Plan) -> Vmmgr {
         comp.give(proto::SLOT_LOG_FRAMES + i as u64,
             cap::Granule::from_bits(h.info.log_frames + i as u64), CapRights::read_write());
     }
-    let (serial, pages) = h.info.serial_lanes().map_or((h.info.serial_frames(), host::serial::PAGES), |l| (l, host::serial::VMM_PAGES));
-    for i in 0..pages {
+    let serial = h.info.serial_lanes();
+    for i in 0..host::serial::VMM_PAGES {
         comp.give(proto::SLOT_SERIAL_FRAMES + i as u64, cap::Granule::from_bits(serial + i as u64), CapRights::read_write());
     }
     for core in 0..h.info.cores {
