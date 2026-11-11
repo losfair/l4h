@@ -619,29 +619,17 @@ impl Trustd {
     /// flags server take another instance for it.
     pub fn register(&mut self, id: usize, instance: u64, record: GuestRecord) -> bool {
         if self.failed { return true; }
-        let p = self.registry.wrapping_add(id);
-        let page = if self.second[id].get() { trust::RECORD_PAGE_B } else { 0 };
-        unsafe {
-            if core::ptr::addr_of!((*p).instance).read_volatile() != 0 {
-                return false;
-            }
-            // Every other field, then the instance.
-            core::ptr::addr_of_mut!((*p).ram).write_volatile(record.ram);
-            core::ptr::addr_of_mut!((*p).vcpus).write_volatile(record.vcpus);
-            core::ptr::addr_of_mut!((*p).flags).write_volatile(record.flags & !trust::RECORD_PAGE_B | page);
-            core::ptr::addr_of_mut!((*p).launch).write_volatile(record.launch);
-            core::ptr::addr_of_mut!((*p).reserved).write_volatile(0);
-            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
-            core::ptr::addr_of_mut!((*p).instance).write_volatile(instance);
-        }
-        true
+        let Some(second) = self.second.get(id) else { return false };
+        let page = if second.get() { trust::RECORD_PAGE_B } else { 0 };
+        let record = GuestRecord { flags: record.flags & !trust::RECORD_PAGE_B | page, ..record };
+        // The registry is ours to write, and mapped for good.
+        unsafe { trust::write_record(self.registry as usize, id, instance, &record) }
     }
 
     /// Guest `id` is destroyed.  Before its id is given again (`give`):
     /// trustd either sees it gone or has said which page it answers in.
     pub fn unregister(&mut self, id: usize) {
-        unsafe { core::ptr::addr_of_mut!((*self.registry.wrapping_add(id)).instance).write_volatile(0) };
-        fence(Ordering::SeqCst);
+        unsafe { trust::clear_record(self.registry as usize, id) };
     }
 
     /// The main thread faulted (the firmware's AML can make it panic): stop it,

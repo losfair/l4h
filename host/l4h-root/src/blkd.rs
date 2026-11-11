@@ -759,7 +759,7 @@ pub fn cut_off(h: &mut Host, c: usize, i: usize) -> bool {
 /// (`removed`).  A drain that fails quarantines the controller.
 pub fn remove(h: &mut Host, c: usize, i: usize, zombie: Option<usize>) {
     let Some(a) = h.ctrls[c].clients[i].as_mut() else {
-        crate::vmmgr::zombie_done(h, zombie, true);
+        crate::vmmgr::zombie_disk_done(h, zombie, true);
         return;
     };
     a.remove = Some(Removal { zombie, posted: false });
@@ -808,7 +808,7 @@ fn removed(h: &mut Host, c: usize, i: usize, quiet: bool) {
         ctrl.clients[i] = Some(a);
     }
     let reusable = quiet || ctrl.dom != Domain::NONE;
-    crate::vmmgr::zombie_done(h, zombie, reusable);
+    crate::vmmgr::zombie_disk_done(h, zombie, reusable);
 }
 
 /// Provision an unattached range of host disk `disk`, for pending request

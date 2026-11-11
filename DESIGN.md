@@ -2367,8 +2367,9 @@ Common behaviour:
   `VIRTIO_F_ACCESS_PLATFORM`.
   - A NIC (netd) gets its 4 MiB of DMA memory.
   - A disk controller (blkd) gets blkd's 4 MiB, and each client's I/O pool
-    while it is attached. The pool is unmapped after the drain, or after a
-    quarantine. Shared pools are reference-counted per domain and
+    while it is attached. The pool is unmapped when its guest is destroyed,
+    and freed only once blkd has drained the client (§10.1, Disk detach), or
+    after a quarantine. Shared pools are reference-counted per domain and
     allocation, so only the final release removes their translations.
   - The balloon (memd) gets its DMA pages.
 - **Requester groups.** Root walks PCI bridge headers (VT-d) or uses the
@@ -2690,7 +2691,12 @@ controller, one per claimed controller, and the guest forwards Linux's
   transfer records an `URB_CANCEL` takes in on the way included, and one event
   ring's worth of events), so neither a guest refilling its queues from
   another vCPU nor a controller that keeps producing events keeps usbd from
-  its events and the mailbox.
+  its events and the mailbox. They are bounded in records, not time: a
+  control record may wait for a controller command (5 s, then a reset), so
+  usbd stops taking them once root has posted a request
+  (`l4h_rt::mailbox::pending`), and the next turn serves the mailbox first.
+  A going guest's REMOVE, and the next guest's ATTACH behind it, waits for
+  at most the record usbd is in, not a queue of them.
 - **DMA without an IOMMU.** Every DMA pointer the controller reads is
   written by usbd into its own region, which no guest maps: registers,
   DCBAA, scratchpad, contexts, stream arrays, rings and Link TRBs. Every
@@ -2822,11 +2828,14 @@ pending, and so does whatever waits for it, nothing else:
   (§9.7). A usbd that never answers keeps its controller's queue areas,
   and no later guest of that controller gets a working one.
 - **Teardown waits for no one.** A destroyed guest's I/O pool leaves the
-  devices' IOMMU domains at once and is reused; what drivers map (disk
-  channels, extent tables, port memory) is kept until they say they have
-  let go, and with it, without an IOMMU, the pool (a `Zombie`). Revoking
+  devices' IOMMU domains at once; what drivers map (disk channels, extent
+  tables, port memory) is kept until they say they have let go, and the
+  pool until blkd has drained the guest's disks, IOMMU or not, since the
+  device may still run their commands (a `Zombie`; §10.1, Disk detach;
+  the pool does not wait for netd). Revoking
   the memory would also unmap it from the driver, but an honest driver
-  would fault. A driver that never answers keeps that memory, and the
+  would fault. A driver that never answers keeps that memory (a blkd, the
+  pool too), and the
   client and port slots, for good, and each such guest keeps a guest's
   place: root admits a guest other than dom0 only while live guests and
   zombies are fewer than
@@ -3129,6 +3138,14 @@ requests distinguish power off, reboot and kernel panic.
   [cursor, end), oldest first, ending a moment (100 ms) before now, so that
   a record still being committed falls in the next read rather than
   between two; the records of one time are never split between two reads.
+  A cursor a read gave can be later than that moment (the read was full),
+  and the read from it is then empty, at the cursor: only a cursor in the
+  future, or past the caller's end, is refused, so no writer can make
+  another's reads fail by leaving a slot claimed. A read that stops short
+  of the end its caller gave still reports that end, so a snapshot's
+  reader goes on reading to it rather than taking it as done; an end still
+  to come counts as none, so a snapshot's end is fixed by its first read
+  and reached within a moment, whatever writers leave claimed.
   A record's time is its writer's to choose: one in the future waits, one in
   the past is missed by a follower, and either is only its writer's loss.
   Lost counts the slots a read finds unavailable between a lane's records,
@@ -3360,10 +3377,15 @@ chain may hold (`Guest::stop`). `vm_pause` would need to give them back.
   destroyed, and the shared controller keeps running. Root first unmaps the
   pool from the controller's IOMMU domain, which waits for the device's
   DMA to it to drain (§9.5): the device can no longer reach the pool,
-  whatever blkd does, and the pool is reused at once (once every device of
-  the guest is cut off so). Then root asks blkd to drain the client
-  (`blk::call::remove`); without an IOMMU the pool waits for that, until
-  every request the client submitted has completed.
+  whatever blkd does. Then root asks blkd to drain the client
+  (`blk::call::remove`), and the pool is reused once blkd has drained every
+  disk of the guest (`vmmgr::zombie_disk_done`): until then the device may
+  still run commands the guest had started and it had not begun, and the
+  controller's domain may meanwhile map another client's pool at the same
+  addresses (the allocator gives the next pool of that size the same
+  block), which those commands would reach. Without an IOMMU the pool
+  waits for that drain too, until every request the client submitted has
+  completed.
   Root cannot cut one client off by clearing bus mastering, as it cuts off
   a USB controller's one guest (§9.7): that would stop the controller's
   other clients, and once bus mastering was back on the device would finish
@@ -3442,7 +3464,15 @@ The chain has four links.
      {instance, RAM, vCPUs, dom0, digest} into a registry page that trustd
      maps read-only, once per guest (a second registration is `EEXIST`): a
      running guest's record never changes, and its instance, written last,
-     never reads as 0 before the guest is destroyed. Whether a guest is dom0
+     never reads as 0 before the guest is destroyed. Root writes a record
+     with `trust::write_record` (its fields, then its instance) and clears
+     it with `clear_record`; trustd reads it with `trust::read_record`: the
+     instance, then the record, then the instance again. The
+     fields between two equal readings are that instance's, since instances
+     are never given twice and a record is written only while its instance
+     is 0. One read of the whole record would not do, whose loads come in
+     any order: a guest started on a destroyed one's id could be given that
+     one's digest and dom0 bit. Whether a guest is dom0
      is root's to say, and there is one at a time. Root never waits for
      trustd's main thread, whose TPM
      commands can take seconds.

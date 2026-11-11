@@ -347,7 +347,7 @@ impl Ring {
         })
     }
 
-    fn read_at(&self, now: u64, cursor: u64, end: u64, out: &mut [u8]) -> Option<Read> {
+    fn read_at(&self, now: u64, cursor: u64, until: u64, out: &mut [u8]) -> Option<Read> {
         let hz = self.clock.hz.load(SeqCst).max(1);
         let start = self.clock.start_ticks.load(SeqCst);
         // A writer reads the time after it claims its slot (`write_to`),
@@ -355,11 +355,25 @@ impl Ring {
         // is later than `now`, in the next snapshot.  One claimed and not
         // committed may be older: then a snapshot ends a moment ago, so
         // that it is in the next one rather than missed.
-        let snapshot = if self.in_flight() { now.saturating_sub(hz / 10) } else { now };
-        let end = if end == 0 { snapshot } else { end.min(snapshot) };
-        if cursor > end {
+        // Only a cursor no read gave is refused: one in the future, or past
+        // the caller's own end.  A cursor a read gave is at most the `now`
+        // of that read, which a snapshot that ends a moment ago can be
+        // before: that read is empty, at the cursor, not an error, or any
+        // writer could make others' reads fail by leaving a slot claimed.
+        if cursor > now || (until != 0 && cursor > until) {
             return None;
         }
+        let snapshot = if self.in_flight() { now.saturating_sub(hz / 10) } else { now };
+        // An end still to come is no end: this read's is the snapshot's, as
+        // for 0, and fixed by the end it reports.  An end that moved on with
+        // the clock would never be reached while some slot stays claimed.
+        let until = if until > now { 0 } else { until };
+        // What this read scans to, and the end it reports: the caller's own,
+        // if it gave one, even when this read stops earlier, so that a
+        // snapshot is finished by later reads rather than taken as done
+        // where a slot in flight made this one stop.
+        let end = if until == 0 { snapshot } else { until.min(snapshot) }.max(cursor);
+        let reported = if until == 0 { end } else { until };
         let (mut len, mut lost, mut last) = (0, 0u64, None);
         // The records of one time are never split between reads: where
         // they start in `out`, and what was lost before them.
@@ -393,14 +407,14 @@ impl Ring {
                     // A time whose records do not fit at once: the rest of
                     // them is lost, rather than the reader stuck.
                     lost = lost.saturating_add(1 + self.count_at(ticks, cursor, end, key, &mut taken));
-                    return Some(Read { next: ticks.saturating_add(1).min(end), len, lost, end });
+                    return Some(Read { next: ticks.saturating_add(1).min(end), len, lost, end: reported });
                 };
-                return Some(Read { next: ticks, len: at, lost: before, end });
+                return Some(Read { next: ticks, len: at, lost: before, end: reported });
             }
             out[len..len + line.len].copy_from_slice(&line.bytes[..line.len]);
             len += line.len;
         }
-        Some(Read { next: end, len, lost, end })
+        Some(Read { next: end, len, lost, end: reported })
     }
 
     /// The first record after `last` of those of [cursor, end), in the
@@ -755,6 +769,128 @@ mod tests {
         // A snapshot that ended before it does not take it.
         assert_eq!(read(ring, 1_250_101, 1_250_150).1, "");
         assert_eq!(read(ring, 1_250_101, 0).1, "[     1.250100] [0x200] next\n");
+    }
+
+    /// A read that filled its output gives a cursor less than a moment
+    /// old; a writer that then leaves a slot claimed and not committed
+    /// makes the next snapshot end before that cursor.  That read is empty,
+    /// at the cursor, not an error: no writer can make another's read fail.
+    /// A snapshot's reader is told its end, not this read's, and reads on to
+    /// it rather than leaving out records it was promised.
+    #[test]
+    fn a_claimed_slot_does_not_fail_a_recent_cursor() {
+        let ring = ring();
+        let long = "x".repeat(400);
+        for k in 0..6 {
+            ring.write(Writer::Netd, NOW - 1000 + k, format_args!("{long}"));
+        }
+        let (first, before) = read(ring, 0, 0);
+        assert!(first.next > NOW - HZ / 10 && first.next < first.end, "a full read stops at a recent record");
+        let seq = ring.lane(Writer::Usbd(0)).unwrap().claim(1);
+        // A follower: nothing yet, and nothing to wait for but the next read.
+        let (r, text) = read(ring, first.next, 0);
+        assert_eq!((r.next, r.len, r.end, text.as_str()), (first.next, 0, first.next, ""));
+        // A snapshot: not done (next is short of its end), so its reader
+        // reads on rather than leaving out the records it has not had.
+        let (r, text) = read(ring, first.next, first.end);
+        assert_eq!((r.next, r.len, r.end, text.as_str()), (first.next, 0, first.end, ""));
+        ring.lane(Writer::Usbd(0)).unwrap().commit(seq, NOW - 1, 0, 0, &crate::ring::Buf([0; WORDS]));
+        let (r, text) = read(ring, first.next, first.end);
+        assert_eq!((r.next, r.end), (first.end, first.end));
+        assert_eq!(before.matches(&long).count() + text.matches(&long).count(), 6, "the rest of the snapshot: {text:?}");
+        // An end still to come is the snapshot's: with nothing in flight,
+        // now; with a slot claimed for good, a moment ago, and a reader that
+        // reads on with the end it was given finishes there.
+        let (r, _) = read(ring, first.end, u64::MAX);
+        assert_eq!((r.next, r.end), (NOW, NOW));
+        ring.lane(Writer::Usbd(1)).unwrap().claim(1);
+        let (r, _) = read(ring, 0, u64::MAX);
+        assert_eq!(r.end, NOW - HZ / 10, "fixed at the first read");
+        let mut cursor = r.next;
+        for later in 1..8 {
+            if cursor == r.end {
+                break;
+            }
+            let mut out = [0; 1984];
+            let n = ring.read_at(NOW + later * HZ, cursor, r.end, &mut out).unwrap();
+            assert_eq!(n.end, r.end, "the end stays the snapshot's");
+            cursor = n.next;
+        }
+        assert_eq!(cursor, r.end, "the snapshot finished");
+        // What only a caller could have made up is still refused.
+        assert!(ring.read_at(NOW, NOW + 1, 0, &mut [0; 1984]).is_none());
+        assert!(ring.read_at(NOW, first.next, first.next - 1, &mut [0; 1984]).is_none());
+    }
+
+    /// Whatever writers do (records at any recent time, slots claimed and
+    /// committed late or never), a reader that passes back what reads gave
+    /// is never refused, a snapshot finishes within a moment of time once
+    /// its records fit, and gives no record twice.
+    #[test]
+    fn reads_from_what_reads_gave_never_fail_and_snapshots_finish() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rand = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        for _ in 0..40 {
+            let ring = ring();
+            let lanes = [Writer::Netd, Writer::Vmm(0), Writer::Usbd(0), Writer::Memd];
+            let mut now = NOW;
+            let mut open = std::vec::Vec::new();
+            let mut id = 0;
+            let mut write = |ring: &Ring, now: u64, rand: &mut dyn FnMut(u64) -> u64, open: &mut Vec<(Writer, u64)>| {
+                let w = lanes[rand(lanes.len() as u64) as usize];
+                match rand(4) {
+                    0 => open.push((w, ring.lane(w).unwrap().claim(1))),
+                    1 if !open.is_empty() => {
+                        let (w, seq) = open.swap_remove(rand(open.len() as u64) as usize);
+                        ring.lane(w).unwrap().commit(seq, now - rand(HZ / 5), 0, 0, &crate::ring::Buf([0; WORDS]));
+                    }
+                    _ => {
+                        id += 1;
+                        ring.write(w, now - rand(HZ / 5), format_args!("r{id} {}", "y".repeat(rand(300) as usize)));
+                    }
+                }
+            };
+            for _ in 0..30 {
+                write(ring, now, &mut rand, &mut open);
+            }
+            // A follower and a snapshot, reading as time goes on and writers
+            // keep writing.
+            let (mut follow, mut snap, mut snap_end) = (0, 0, 0);
+            let mut seen = std::collections::BTreeSet::new();
+            let mut snap_done = false;
+            for step in 0..400 {
+                now += rand(HZ / 20) + 1;
+                write(ring, now, &mut rand, &mut open);
+                let mut out = [0; 1984];
+                let r = ring.read_at(now, follow, 0, &mut out).expect("a follower's cursor is refused");
+                assert!(r.next >= follow && r.next <= r.end && r.end <= now);
+                follow = r.next;
+                if !snap_done {
+                    let r = ring.read_at(now, snap, snap_end, &mut out).expect("a snapshot's cursor is refused");
+                    assert!(r.next >= snap && r.next <= r.end && r.end <= now);
+                    if snap_end != 0 {
+                        assert_eq!(r.end, snap_end, "a snapshot's end moved");
+                    }
+                    for line in std::str::from_utf8(&out[..r.len]).unwrap().lines() {
+                        if let Some(rid) = line.split("] ").nth(2).and_then(|t| t.split(' ').next()).filter(|t| t.starts_with('r')) {
+                            assert!(seen.insert(std::string::String::from(rid)), "{rid} twice in one snapshot");
+                        }
+                    }
+                    (snap, snap_end) = (r.next, r.end);
+                    snap_done = snap == snap_end;
+                }
+                if step == 200 {
+                    // Then every slot left open is committed, or not: the
+                    // snapshot is done by now in any case.
+                    assert!(snap_done, "a snapshot did not finish");
+                }
+            }
+        }
     }
 
     #[test]

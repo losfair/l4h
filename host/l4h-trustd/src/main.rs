@@ -367,18 +367,8 @@ fn no_reports() {
 
 /// Guest `id`'s record, if it runs.
 fn record(id: usize) -> Option<GuestRecord> {
-    if id >= trust::MAX_RECORDS {
-        return None;
-    }
-    let p = (trust::REGISTRY_VA as *const GuestRecord).wrapping_add(id);
-    loop {
-        let r = unsafe { p.read_volatile() };
-        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
-        let again = unsafe { core::ptr::addr_of!((*p).instance).read_volatile() };
-        if again == r.instance {
-            return (r.instance != 0).then_some(r);
-        }
-    }
+    // Root maps the registry here for good.
+    unsafe { trust::read_record(trust::REGISTRY_VA, id) }
 }
 
 impl State {

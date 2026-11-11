@@ -597,7 +597,12 @@ enum l4h_ctl_op {
 	 * seconds since host start and the id of the component whose log the
 	 * line is in (root: 0); control characters are replaced. Reads do not
 	 * consume records. Lost includes overwritten, dropped or concurrently
-	 * publishing records. A future cursor returns EINVAL. */
+	 * publishing records. The snapshot end returned is the one given (an
+	 * end still to come counts as 0), and stays so: a snapshot is done when
+	 * next reaches it. A read can be short of it, even empty, while a
+	 * record is still being written; read on, with what it returned, after
+	 * a moment. A future cursor, or one past the end given, returns
+	 * EINVAL. */
 	L4H_CTL_LOG_READ = 31,
 	/* Steering (DESIGN.md §9.3): dom0 hands part of an address's traffic
 	 * to another port, rewriting only MAC addresses.

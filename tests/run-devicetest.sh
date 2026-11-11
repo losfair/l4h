@@ -42,6 +42,9 @@ for f in ['pub fn cut_off(', 'fn removed(']:
     start = blkd.index(f)
     reservations += blkd[start:blkd.index('\n}', start) + 2] + '\n'
 (out / 'blk-reservations.inc').write_text(reservations)
+# A deleted guest's memory and I/O pool, and what each removal frees.
+vmmgr = (root / 'host/l4h-root/src/vmmgr.rs').read_text()
+(out / 'zombie.inc').write_text(vmmgr[vmmgr.index('pub struct Zombie {'):vmmgr.index('fn guest_arg(id: usize)')])
 # Exercise both public block-attachment operations before any backend call.
 ctl = (root / 'host/l4h-vmmgr/src/ctl.rs').read_text()
 start = ctl.index('fn vm_arg(')
@@ -107,6 +110,8 @@ L4H_DOM0_BOOT_TEST_SRC="$out/dom0-boot.inc" rustc +stable --edition=2024 --test 
 L4H_BLK_RESERVATIONS_TEST_SRC="$out/blk-reservations.inc" rustc +stable --edition=2024 --test -L dependency="$out" \
     --extern l4h_host="$out/libl4h_host.rlib" "$root/tests/blk-reservations.rs" -o "$out/blk-reservations-tests"
 "$out/blk-reservations-tests"
+L4H_ZOMBIE_TEST_SRC="$out/zombie.inc" rustc +stable --edition=2024 --test "$root/tests/zombie.rs" -o "$out/zombie-tests"
+"$out/zombie-tests"
 L4H_BLK_ATTACH_TEST_SRC="$out/blk-attach.inc" rustc +stable --edition=2024 --test -L dependency="$out" \
     --extern l4h_abi="$out/libl4h_abi.rlib" --extern l4h_host="$out/libl4h_host.rlib" \
     "$root/tests/blk-attach.rs" -o "$out/blk-attach-tests"
