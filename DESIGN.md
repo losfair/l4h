@@ -1146,9 +1146,6 @@ vendor, as seL4 makes it).
     vCPU, and with `nopvspin` on the kernel command line. It is switched
     in `smp_prepare_cpus()`, while one vCPU runs. The x86_64 kernel's text
     is no larger for it (27.27 MB either way).
-  - The native unlock is not a bare store either: `arch/l4h` takes
-    `smp_store_release()` from asm-generic, a full barrier and a store
-    (`mfence` on x86_64, where a store alone would do).
   - Time blocked for a lock counts as idle, not steal (§7.4).
     `/proc/interrupts` has a `PVW` row: how often each vCPU blocked.
   - Not covered: `vcpu_is_preempted()` is always false, as before, so
@@ -1159,6 +1156,20 @@ vendor, as seL4 makes it).
     every vCPU, holding them for 5 ms at times; no update is lost and
     waiters block, in a 4-vCPU dom0 and a 4-vCPU guest capped at 25%,
     and none blocks in guests with `nopvspin` or one vCPU.
+- **Memory barriers.** On x86_64 the barriers between CPUs are those of
+  `arch/x86` (`x86/asm/barrier.h`): a vCPU is a thread on an x86 CPU, which
+  reorders only a store with a later load.
+  - `smp_mb()` is a locked add. `smp_rmb()`, `smp_wmb()`,
+    `smp_store_release()`, `smp_load_acquire()` and the barriers around
+    atomic operations emit nothing. `dma_*` and `virt_*` follow them: the
+    host's components share guest memory from other cores of the same
+    machine. `mb()`, `rmb()` and `wmb()` stay fences.
+  - UML's header, written for one CPU, left all of these to asm-generic,
+    which builds them from the fences: an `mfence` in every
+    `spin_unlock()` and `set_current_state()`, an `lfence` in every
+    seqlock read. The kernel image had 9477 `mfence`, 2179 `lfence` and
+    691 `sfence`; it has 10, 9 and 12, and 502 locked adds.
+  - AArch64 guests keep asm-generic's barriers, built from `dmb`.
 - **Steal time** is published by the balancer in the event page (§7.4).
 
 ---
