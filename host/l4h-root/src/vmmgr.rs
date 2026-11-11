@@ -229,12 +229,7 @@ pub fn spawn(h: &mut Host, modules: &Modules, plan: &Dom0Plan) -> Vmmgr {
         cfg.watchdog_secs = h.cfg.watchdog_secs as u64;
         cfg.trust = h.trustd.is_some() as u64;
         cfg.serial_lanes = h.info.serial_lanes().is_some() as u64;
-        // Patches 0038 and 0040: without usable VT-x or AMD-V the kernel
-        // refuses these objects.
-        #[cfg(target_arch = "x86_64")]
-        {
-            cfg.vtx = h.alloc.can_retype(&sel4::ObjectBlueprintArch::VCpu.into()) as u64;
-        }
+        cfg.vtx = h.info.vtx as u64;
         cfg.modules_radix = radix as u64;
         cfg.modules_pages = pages as u64;
         let mut at = 0;

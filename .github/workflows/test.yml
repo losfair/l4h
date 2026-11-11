@@ -185,6 +185,8 @@ jobs:
           python3 tests/amdvi-qemu.py
       - name: dom0 restart, CPU caps, steal time
         run: tests/run-m6test.sh
+      - name: Paravirtual spinlocks
+        run: tests/run-pvlocktest.sh
       - name: SMT discovery, placement and migration
         run: tests/run-smttest.sh
       - name: Resource limits
@@ -333,6 +335,8 @@ jobs:
         run: tests/run-logdtest.sh
       - name: CPU caps, steal time and dom0 restart
         run: tests/run-m6test.sh
+      - name: Paravirtual spinlocks
+        run: tests/run-pvlocktest.sh
       - name: Resource limits
         run: tests/run-limits.sh
       - name: Upload logs

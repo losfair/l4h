@@ -1,0 +1,63 @@
+#!/bin/sh
+# dom0 init for tests/run-pvlocktest.sh: paravirtual spinlocks.  Contended
+# locks stay exclusive and their waiters block, also with interrupts off
+# and in timers, and take IPIs meanwhile, in dom0 and in a guest whose
+# vCPUs run out of budget while they hold locks; guests with one vCPU or
+# "nopvspin" keep the plain locks, and never block for one.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mount -t tmpfs tmp /tmp
+fail() { echo "PVLOCKTEST: FAIL: $*"; poweroff -f; }
+waits() {
+    awk '$1 == "PVW:" { for (i = 2; i <= NF && $i ~ /^[0-9]+$/; i++) n += $i }
+         END { print n + 0 }' /proc/interrupts
+}
+tmo=$(sed -n 's/.*pvlock_timeout=\([0-9]*\).*/\1/p' /proc/cmdline)
+
+# dom0: four vCPUs, uncapped.
+[ "$(nproc)" -ge 2 ] || fail "dom0 has $(nproc) vCPU"
+dmesg | grep -q 'PV spinlocks enabled' || fail "dom0 does not use PV spinlocks"
+# field NAME LINE: the number after NAME= in a PVLOCK result line.
+field() { echo "$2" | sed -n "s/.* $1=\\([0-9]*\\).*/\\1/p"; }
+w=$(waits)
+insmod /bin/l4h_pvlock.ko || fail "dom0: $(dmesg | grep 'PVLOCK:')"
+w=$(($(waits) - w))
+r=$(dmesg | grep -o 'PVLOCK:.*')
+echo "PVLOCKTEST: dom0: $r, waits=$w"
+[ "$w" -gt 0 ] || fail "dom0: no waiter blocked"
+[ "$(field irqoff_blocked "$r")" -gt 0 ] || fail "dom0: no waiter blocked with interrupts off"
+[ "$(field timer_blocked "$r")" -gt 0 ] || fail "dom0: no timer blocked"
+[ "$(field ipis "$r")" -gt 0 ] || fail "dom0: no IPI under the lock"
+
+# run NAME VCPUS CAP PV BLOCKS [cmdline...]
+run() {
+    name=$1 vcpus=$2 cap=$3 pv=$4 blocks=$5
+    shift 5
+    id=$(l4hctl create "$name" --initrd /bin/pvlockvm.cpio.gz --mem 128 --vcpus "$vcpus" \
+        --cmdline "console=hvc0 quiet $*") || fail "$name: create"
+    l4hctl console "$id" --until "PVLOCKVM: ready" --timeout "${tmo:-60}" >/dev/null ||
+        fail "$name: boot"
+    [ "$cap" = 0 ] || l4hctl sched "$id" "$cap" || fail "$name: sched"
+    l4hctl send "$id" --wait "PVLOCKVM: done" --timeout "${tmo:-60}" go >/dev/null ||
+        fail "$name: no result: $(l4hctl console "$id" | tail -5)"
+    l4hctl console "$id" | tr -d '\r' >/tmp/con.log
+    r=$(grep -o 'PVLOCKVM: done.*' /tmp/con.log)
+    echo "PVLOCKTEST: $name: $(grep -o 'PVLOCK: .*' /tmp/con.log), ${r#PVLOCKVM: done }"
+    case "$r" in
+    *" rc=0 pv=$pv vcpus=$vcpus "*) ;;
+    *) fail "$name: expected rc=0 pv=$pv vcpus=$vcpus" ;;
+    esac
+    w=${r##*waits=}
+    if [ "$blocks" = 1 ]; then
+        [ "$w" -gt 0 ] || fail "$name: no waiter blocked"
+    else
+        [ "$w" = 0 ] || fail "$name: $w waits with plain spinlocks"
+    fi
+    l4hctl destroy "$id" || fail "$name: destroy"
+}
+run capped 4 25 enabled 1
+run nopvspin 4 0 nopvspin 0 nopvspin
+run single 1 0 native 0
+echo "PVLOCKTEST: PASS"
+poweroff -f

@@ -1,0 +1,23 @@
+#!/bin/sh
+# Init of the guests started by tests/guest/init-pvlocktest: on any console
+# line, contend spinlocks on every vCPU (tests/guest/pvlock) and report the
+# result, whether the kernel uses paravirtual spinlocks, and how often its
+# vCPUs blocked waiting for a lock.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+waits() {
+    awk '$1 == "PVW:" { for (i = 2; i <= NF && $i ~ /^[0-9]+$/; i++) n += $i }
+         END { print n + 0 }' /proc/interrupts
+}
+pv=native
+dmesg | grep -q 'PV spinlocks enabled' && pv=enabled
+dmesg | grep -q 'PV spinlocks disabled by "nopvspin"' && pv=nopvspin
+echo "PVLOCKVM: ready"
+read line
+w=$(waits)
+rc=0
+insmod /bin/l4h_pvlock.ko || rc=$?
+dmesg | grep 'PVLOCK:' | sed 's/^/PVLOCKVM: /'
+echo "PVLOCKVM: done rc=$rc pv=$pv vcpus=$(nproc) waits=$(($(waits) - w))"
+while :; do sleep 10; done

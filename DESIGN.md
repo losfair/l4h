@@ -1118,10 +1118,80 @@ vendor, as seL4 makes it).
   Measured in a 4-vCPU dom0 on 4 cores, a loop mapping, touching and
   unmapping 8 pages, moved to the next vCPU every 10 ms: 66 µs a cycle
   (380 µs without the flush; 60 µs without moves).
-- **Lock-holder preemption.** The guest uses native qspinlocks and
-  qrwlocks; a waiter spins if the holder is descheduled. There is no
-  paravirtual spinlock slow path. The balancer keeps a guest's vCPUs on
-  distinct physical cores where possible (§7), which reduces the cost.
+- **Lock-holder preemption.** A vCPU that holds a spinlock, or waits in
+  a queued spinlock's line, can lose its core to another thread or run out
+  of budget under a CPU cap (§7.2), for milliseconds; a waiter that spins
+  meanwhile burns its core, and under a cap its own budget. The balancer
+  keeps a guest's vCPUs on distinct physical cores where possible (§7),
+  and guests with more than one vCPU use Linux's **paravirtual queued
+  spinlocks** (`CONFIG_PARAVIRT_SPINLOCKS`, `asm/qspinlock.h`); qrwlocks
+  queue their writers on one.
+  - The waiter at the head of a lock's queue, and those queued behind
+    it, spin for `SPIN_THRESHOLD` = 2¹¹ `cpu_relax()` iterations, an
+    estimated 100 µs with interrupts on and less with them off or on
+    AArch64, then block their kTCB in `seL4_Wait(N_v)` while the word they
+    watch is unchanged (`l4h_pv_wait()`). The vCPU that changes the word
+    signals the waiter's `N_v` afterwards, at once or when it unlocks
+    (`l4h_pv_kick()`), with the IPI badge and no reason bit: a vCPU that
+    no longer waits runs no handler for it, though it ends one user run,
+    VM entry or idle wait like any event. Signals are sticky: one sent
+    between the check and the wait ends the wait at once. Neither the
+    host nor seL4 takes part beyond the IPI path.
+  - With interrupts on, a waiter delivers pending events instead of
+    blocking, and those that end its wait, as its `cpu_relax()` did while
+    it spun; like it, not inside an event's own delivery, softirqs
+    included, where it blocks with events pending until the handler
+    returns. With interrupts off, events already collected do not keep it
+    from blocking, and one that ends the wait stays pending for the next
+    polling point (§5.4); the lock code re-checks the lock after any
+    wake-up.
+  - Unlocking is a compare-and-exchange instead of a store. There is
+    no code patching in `arch/l4h`, so a static key read by every lock
+    slow path and unlock selects the native operations for guests given
+    one vCPU, and with `nopvspin` on the kernel command line. It is
+    switched in `smp_prepare_cpus()`, while one vCPU runs. The unlock is
+    inlined at some 5000 places, which adds about 230 KiB (1.4%) to the
+    x86_64 kernel's `.text`; the image, padded to 2 MiB, is no larger.
+  - Modules inline the unlock too, so one built for the other kind must
+    not load: the version magic says `pvspinlocks` (`asm/vermagic.h`).
+  - Time blocked for a lock counts as idle, not steal (§7.4).
+    `/proc/interrupts` has a `PVW` row: each vCPU's waits in seL4 for a
+    lock.
+  - Not covered:
+    - A waiter that arrives when the head of the queue has blocked spins
+      on, trying to steal the lock, until the lock is free or the head
+      wakes and spins again (`pv_hybrid_queued_unfair_trylock()`): with
+      interrupts on that is the head's next tick, with them off not
+      before it is kicked. So during one long preemption the first
+      waiter blocks, with those that queued behind it while it still
+      spun, and later ones burn their time as before.
+    - Readers of a qrwlock waiting for a writer, and a writer waiting
+      for readers, spin.
+    - `vcpu_is_preempted()` is always false, as before, so mutexes and
+      rwsems still spin optimistically on an owner whose vCPU is not
+      running. The guest cannot tell; seL4 would have to publish it.
+  - The threshold is not yet tuned by measurement.
+  - **Test.** `tests/run-pvlocktest.sh`: a module contends four locks on
+    every vCPU, holding them for 5 ms at times, and calls a function on
+    the other vCPUs from under one. No update is lost, waiters block
+    (counted apart with interrupts off and in timers) and take the IPI,
+    in a 4-vCPU dom0 and a 4-vCPU guest capped at 25%, and none blocks in
+    guests with `nopvspin` or one vCPU. It does not measure how long
+    waiters spin, nor the accounting.
+- **Memory barriers.** On x86_64 the barriers between CPUs are those of
+  `arch/x86` (`x86/asm/barrier.h`): a vCPU is a thread on an x86 CPU, which
+  reorders only a store with a later load.
+  - `smp_mb()` is a locked add. `smp_rmb()`, `smp_wmb()`,
+    `smp_store_release()`, `smp_load_acquire()` and the barriers around
+    atomic operations emit nothing. `dma_*` and `virt_*` follow them: the
+    host's components share guest memory from other cores of the same
+    machine. `mb()`, `rmb()` and `wmb()` stay fences.
+  - UML's header, written for one CPU, left all of these to asm-generic,
+    which builds them from the fences: an `mfence` in every
+    `spin_unlock()` and `set_current_state()`, an `lfence` in every
+    seqlock read. The kernel image had 9477 `mfence`, 2179 `lfence` and
+    691 `sfence`; it has 10, 9 and 12, and 502 locked adds.
+  - AArch64 guests keep asm-generic's barriers, built from `dmb`.
 - **Steal time** is published by the balancer in the event page (§7.4).
 
 ---
@@ -1247,7 +1317,8 @@ seL4 does no load balancing, so `l4h-vmmgr` runs a balancer every 100 ms.
 
 ### 7.4 Steal time
 
-The guest accumulates its idle time in the event page (`idle_ticks`). Each
+The guest accumulates its idle time in the event page (`idle_ticks`),
+including the time its vCPUs block waiting for a spinlock (§6). Each
 balancer period vmmgr computes, per vCPU, `steal = wall − consumed − idle`
 from the vCPU's first run and publishes it monotonically as `steal_ns`.
 The guest returns it as Linux's paravirt steal clock
@@ -3899,6 +3970,11 @@ One task, l4h-logd, is the only host code that prints to the serial port. Lines 
 The kernel still prints boot messages and fatal errors to the port itself,
 so the guarantee covers host output only: a kernel message can land inside
 a line.
+A debug kernel also reports each invocation it refuses. Root makes the one
+that every boot without VT-x has, its try at a VCPU object (`HostInfo::vtx`),
+before it starts logd: that message stands on its own line, where it used to
+land inside one of root's first lines, a different one each boot, and failed
+whichever test looked for that line (`tests/run-selftest.sh` checks it).
 
 ```
  partition 0                                 secondary partition k
@@ -4862,6 +4938,7 @@ machine and guests of 256–512 MiB.
 | `tests/run-smttest.sh` | QEMU boot with SMT: CPU discovery, initial placement and busy-vCPU migration |
 | `tests/run-captest.sh [cap%] [rounds]` | self-test and fork loops in a guest capped from boot |
 | `tests/run-capperf.sh [caps]` | fork/exec and CPU-bound timings, uncapped and under each cap (use a release seL4) |
+| `tests/run-pvlocktest.sh` | paravirtual spinlocks: contended locks stay exclusive and waiters block, in dom0 and a capped 4-vCPU guest; plain locks with `nopvspin` or one vCPU |
 | `tests/run-limits.sh` | the host refuses what it cannot afford and recovers |
 | `tests/run-balloontest.sh` | free memory reported to QEMU (virtio-balloon; `BALLOONTEST_LEGACY=1`: a legacy one) is dropped: QEMU's memory use idle, with a guest and after destroying it |
 | `tests/run-hotplugtest.sh` | memory hotplug: a VM grows from 256 MiB to 2 GiB and shrinks again under `l4hctl mem`, falling short while its data needs the memory; host memory comes back |

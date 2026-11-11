@@ -120,6 +120,8 @@ struct l4h_vcpu {
 	void (*start_fn)(int cpu);
 	void *start_task;		/* idle task (struct task_struct *) */
 	unsigned long long tsc_last_idle;
+	/* Times this vCPU blocked waiting for a spinlock (l4h_pv_wait()). */
+	unsigned long pv_waits;
 };
 
 extern struct l4h_vcpu l4h_vcpus[L4H_MAX_VCPUS];
@@ -254,6 +256,9 @@ void l4h_dispatch_pending(void);
 int l4h_irqs_enabled(void);
 /* Kick another vCPU (IPI reason bitmask). */
 void l4h_send_ipi(int cpu, unsigned long reasons);
+/* Paravirtual spinlocks: block while *ptr == val; wake a blocked vCPU. */
+void l4h_pv_wait(const unsigned char *ptr, unsigned char val);
+void l4h_pv_kick(int cpu);
 
 /* Implemented by the kernel: deliver collected events (irqs disabled). */
 void l4h_deliver_events(int timer, unsigned long ipi, unsigned long *events);
