@@ -702,7 +702,7 @@ impl Usbd {
                 continue;
             }
             let reset = Trb { param: 0, status: 0, control: (CMD_RESET_EP << 10) | (d as u32) << 16 | (s as u32) << 24 };
-            if self.command(reset).is_none() {
+            if !self.recover_command(reset) {
                 return;
             }
             let ep = self.slots[s].eps[d];
@@ -735,9 +735,25 @@ impl Usbd {
         self.post(r);
     }
 
+    /// Recovery must establish the requested hardware state before any
+    /// ring can restart. A rejected command leaves the old DMA position
+    /// in place, possibly pointing at an already completed URB. Reset the
+    /// controller (or fault for root to quarantine it) before continuing.
+    fn recover_command(&mut self, trb: Trb) -> bool {
+        match self.command(trb) {
+            Some((CC_SUCCESS, _)) => true,
+            Some(_) => {
+                self.hc.as_mut().unwrap().broken = true;
+                self.hc_failed();
+                false
+            }
+            None => false, // command() has already handled controller failure.
+        }
+    }
+
     /// Point the endpoint (stopped or halted) at the oldest URB still on
     /// ring `r`, or at the ring's enqueue pointer.  False if the command
-    /// was not run or timed out (`command`): the ring is gone.
+    /// failed (`recover_command`): its old ring must never restart.
     fn set_deq(&mut self, slot: usize, dci: usize, r: u16) -> bool {
         let dma = self.hc.as_ref().unwrap().dma;
         let (pos, cycle) = self.rings.resume_point(dma, &self.urbs, r);
@@ -746,7 +762,7 @@ impl Usbd {
         let sct = if stream != 0 { 1 << 1 } else { 0 };
         let param = dma.pa(dma.ring(r as usize) + pos as usize * 16) | sct | cycle as u64;
         let trb = Trb { param, status: stream << 16, control: (CMD_SET_TR_DEQ << 10) | (dci as u32) << 16 | (slot as u32) << 24 };
-        if self.command(trb).is_none() {
+        if !self.recover_command(trb) {
             return false;
         }
         self.rings.get_mut(r).deq = pos;

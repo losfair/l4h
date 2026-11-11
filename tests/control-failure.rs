@@ -61,12 +61,24 @@ pub mod sel4 {
     }
     #[derive(Clone, Copy)]
     pub struct Cap<T>(pub u64, pub PhantomData<T>);
+    impl<T> Cap<T> { pub fn bits(&self) -> u64 { self.0 } }
+    pub mod cap {
+        pub type Tcb = super::Cap<super::cap_type::Tcb>;
+        pub type Notification = super::Cap<super::cap_type::Notification>;
+        pub type Endpoint = super::Cap<super::cap_type::Endpoint>;
+        pub type Reply = super::Cap<super::cap_type::Reply>;
+    }
+    #[derive(Debug)]
+    #[allow(dead_code)]
+    pub enum Error { IllegalOperation, InvalidCapability }
+    #[derive(Clone, Copy)]
     pub struct MessageInfo(usize);
     impl MessageInfo {
         pub fn new(label: u64, caps: usize, extra: usize, len: usize) -> Self {
             assert_eq!((label, caps, extra), (0, 0, 0));
             Self(len)
         }
+        pub fn length(&self) -> usize { self.0 }
     }
     #[derive(Default)]
     pub struct IpcBuffer([u64; 8]);
@@ -77,6 +89,23 @@ pub mod sel4 {
     /// l4h_ipc::reply, on the mock IPC buffer, and what the serve loop
     /// recorded of its reply object.
     pub mod ipc_mock {
+        use crate::sel4;
+        use core::sync::atomic::Ordering;
+        // Keep the held-call flag visible to this model's initial-state
+        // setup; the loop and binding arbitration below are production.
+        struct Held;
+        static HOLDS_CALL: Held = Held;
+        impl Held {
+            fn store(&self, value: bool, _: Ordering) {
+                super::MODEL.with(|m| m.borrow_mut().holds_call = value);
+            }
+        }
+        fn keeping<R>(n: usize, f: impl FnOnce() -> R) -> R {
+            let words = super::MODEL.with(|m| m.borrow().ipc.0);
+            let result = f();
+            super::MODEL.with(|m| m.borrow_mut().ipc.0[..n].copy_from_slice(&words[..n]));
+            result
+        }
         pub fn holds_call() -> bool {
             super::MODEL.with(|m| m.borrow().holds_call)
         }
@@ -84,16 +113,17 @@ pub mod sel4 {
             super::with_ipc_buffer_mut(|b| b.msg_regs_mut()[..words.len()].copy_from_slice(words));
             super::MessageInfo::new(0, 0, 0, words.len())
         }
+        include!(env!("L4H_IPC_FAILURE_TEST_SRC"));
     }
     impl Cap<cap_type::Tcb> {
-        pub fn tcb_unbind_notification(self) -> Result<(), ()> {
+        pub fn tcb_unbind_notification(self) -> Result<(), Error> {
             MODEL.with(|m| {
                 let mut m = m.borrow_mut();
-                assert_eq!(m.bound_tcb, self.0);
+                if m.bound_tcb != self.0 { return Err(Error::IllegalOperation); }
                 m.bound_tcb = 0;
                 m.bindings.push(0);
-            });
-            Ok(())
+                Ok(())
+            })
         }
         pub fn tcb_bind_notification(self, ntfn: Cap<cap_type::Notification>) -> Result<(), ()> {
             assert_eq!(ntfn.0, host::SLOT_NTFN);
@@ -125,6 +155,10 @@ pub mod sel4 {
         }
     }
     impl Cap<cap_type::Endpoint> {
+        pub fn nb_recv(self, reply: Cap<cap_type::Reply>) -> (MessageInfo, u64) {
+            let call = MODEL.with(|m| matches!(m.borrow().incoming.front(), Some(Input::Call | Input::Fault)));
+            if call { self.recv(reply) } else { (MessageInfo(0), 0) }
+        }
         pub fn reply_recv(self, info: MessageInfo, reply: Cap<cap_type::Reply>) -> (MessageInfo, u64) {
             assert_eq!(info.0, 1, "a failed component answers wire::FAILED alone");
             MODEL.with(|m| {
@@ -206,7 +240,8 @@ fn panic_and_keeper_finish_outstanding_and_future_requests_without_replying_to_f
             let m = m.borrow();
             assert_eq!(m.wakes, [(7, 7, -5), (8, 8, -5), (9, 9, -5)]);
             assert_eq!(m.replies, [[u64::MAX, 0, 0, 0, 0, 0, 0, 0]; 3]);
-            assert_eq!(m.bindings, if tcb == host::SLOT_KEEPER { vec![0, tcb] } else { vec![] });
+            // Initial takeover and one fair endpoint turn per notification.
+            assert_eq!(m.bindings, [0, tcb].repeat(5));
         });
     }
 }

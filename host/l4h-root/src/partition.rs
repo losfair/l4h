@@ -175,23 +175,9 @@ fn ring_frames(alloc: &mut Alloc, devmem: &mut DevMem, ring: Ring) -> Option<Ran
     alloc.slots.global(|slots| devmem.frames(slots, ring.paddr as usize, ring.size as usize))
 }
 
-/// In a secondary partition: print to the ring partition 0 reads from now
-/// on, with what `early` holds, and return its frames.
-pub fn serial_ring(alloc: &mut Alloc, devmem: &mut DevMem, early: &'static serial::Ring) -> Option<Range<Slot>> {
-    let d = get().filter(|d| !d.is_primary() && d.serial.size != 0)?;
-    let frames = ring_frames(alloc, devmem, d.serial)?;
-    alloc.global(|alloc| {
-        for (i, s) in frames.clone().enumerate() {
-            let copy = alloc.slots.alloc();
-            let f = devmem::granule(copy);
-            crate::component::abs_of(f).copy(&crate::component::abs_of(devmem::granule(s)), CapRights::all()).expect("ring frame");
-            crate::vspace::map_frame(&mut ObjCtx::global(alloc), slot::VSPACE.cap(), f, crate::layout::SERIAL.base + i * 4096,
-                CapRights::read_write(), VmAttributes::DEFAULT);
-        }
-    });
-    // Mapped for good, and the shim cleared it.
-    let ring = unsafe { &*(crate::layout::SERIAL.base as *const serial::Ring) };
-    early.copy_to(ring);
-    serial::init(ring, 0);
-    Some(frames)
+/// A secondary's transport to partition 0. Only its trusted logd receives
+/// these frames; root and components keep their private ring and lanes.
+pub fn serial_ring(alloc: &mut Alloc, devmem: &mut DevMem) -> Option<Range<Slot>> {
+    let d = get().filter(|d| !d.is_primary() && d.serial.size == core::mem::size_of::<serial::Ring>() as u64)?;
+    ring_frames(alloc, devmem, d.serial)
 }

@@ -151,6 +151,40 @@ impl Bound {
     pub const fn new(tcb: sel4::cap::Tcb, ntfn: sel4::cap::Notification) -> Self {
         Self { tcb, ntfn }
     }
+
+    /// Recover a binding after `previous` stopped, possibly during an
+    /// unbound endpoint poll. Also works when failure handling is retried
+    /// on this thread after it had already taken the notification.
+    pub fn take_from(self, previous: sel4::cap::Tcb) {
+        fn unbind(tcb: sel4::cap::Tcb) {
+            match tcb.tcb_unbind_notification() {
+                Ok(()) | Err(sel4::Error::IllegalOperation) => {}
+                Err(e) => panic!("failure unbind: {e:?}"),
+            }
+        }
+        unbind(previous);
+        if previous.bits() != self.tcb.bits() {
+            unbind(self.tcb);
+        }
+        self.tcb.tcb_bind_notification(self.ntfn).expect("failure bind");
+    }
+
+    /// Give an endpoint a turn despite a continuously active bound
+    /// notification. No caller may have badge zero. Keep received words
+    /// across rebinding and the timer's `rebound` hook, and record a held
+    /// call before either can fail. Used in both live and failed service.
+    pub fn poll_endpoint(self, ep: sel4::cap::Endpoint, reply: sel4::cap::Reply, fault: u64,
+        rebound: impl FnOnce()) -> Option<(sel4::MessageInfo, u64)>
+    {
+        self.tcb.tcb_unbind_notification().expect("server unbind");
+        let (incoming, from) = ep.nb_recv(reply);
+        HOLDS_CALL.store(from != 0 && from & fault == 0, Ordering::Release);
+        keeping(incoming.length(), || {
+            self.tcb.tcb_bind_notification(self.ntfn).expect("server bind");
+            rebound();
+        });
+        (from != 0).then_some((incoming, from))
+    }
 }
 
 /// A server's thread: what arrives on its endpoint, and its bound
@@ -274,15 +308,8 @@ pub fn run<S: Server>(ep: sel4::cap::Endpoint, mut reply: impl ReplyObject, s: &
                 // Bound notifications win even in NBRecv. One unbound
                 // poll gives a queued caller (or fault) a turn however
                 // often another core replenishes the notification.
-                bound.tcb.tcb_unbind_notification().expect("server unbind");
-                let (incoming, from) = ep.nb_recv(reply.cap());
-                HOLDS_CALL.store(from != 0 && from & S::FAULT == 0, Ordering::Release);
-                keeping(incoming.length(), || {
-                    bound.tcb.tcb_bind_notification(bound.ntfn).expect("server bind");
-                    s.rebound();
-                });
-                if from != 0 {
-                    (info, badge) = (incoming, from);
+                if let Some(incoming) = bound.poll_endpoint(ep, reply.cap(), S::FAULT, || s.rebound()) {
+                    (info, badge) = incoming;
                     polled = true;
                     continue;
                 }
@@ -302,6 +329,36 @@ pub fn run<S: Server>(ep: sel4::cap::Endpoint, mut reply: impl ReplyObject, s: &
                 ep.nb_recv(reply.cap())
             }
         };
+    }
+}
+
+/// Answer for a failed component, including the call its live serve loop
+/// already holds. Faults remain unanswered. Its asynchronous failure
+/// handler gets an initial turn for consumed kicks, then each signal;
+/// queued callers get the same unbound poll as in `run`.
+pub fn fail(ep: sel4::cap::Endpoint, reply: sel4::cap::Reply, bound: Option<Bound>,
+    signals: u64, fault: u64, mut notified: impl FnMut(u64)) -> !
+{
+    let mut answer = holds_call();
+    notified(0);
+    let mut pending = None;
+    loop {
+        let (_, badge) = pending.take().unwrap_or_else(|| {
+            if answer {
+                ep.reply_recv(self::reply(&[l4h_host::wire::FAILED]), reply)
+            } else {
+                ep.recv(reply)
+            }
+        });
+        let signal = badge & signals != 0;
+        answer = !signal && badge & fault == 0;
+        HOLDS_CALL.store(answer, Ordering::Release);
+        if signal {
+            notified(badge);
+            if let Some(bound) = bound {
+                pending = bound.poll_endpoint(ep, reply, fault, || {});
+            }
+        }
     }
 }
 

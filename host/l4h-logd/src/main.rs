@@ -115,12 +115,22 @@ impl Screen {
 fn main(info: &'static Info) -> ! {
     // Root wrote this configuration for KIND_LOGD.
     let cfg: &LogdConfig = unsafe { info.config() };
-    // Root's ring, which root mapped for us at partition 0's place among
+    // Root's private ring, which root mapped for us at its place among
     // the rings (serial::VA has our own lane).
     let home = unsafe { &*(serial::RINGS_VA as *const Ring) };
     let hz = cfg.tsc_hz;
     let mut merge = Merge::new(home, hz / 10);
     cfg.add_inputs(&mut merge, serial::RINGS_VA, serial::KERNEL_RINGS_VA, serial::LANES_VA);
+    if cfg.relay != 0 {
+        // No UART authority in a secondary. The only writer of this
+        // transport derives every record's provenance from its input lane.
+        let outgoing = unsafe { &*(serial::RELAY_VA as *const Ring) };
+        loop {
+            if !merge.forward(host::ticks::now, outgoing) {
+                sleep(hz / 1000 * IDLE_MS);
+            }
+        }
+    }
     let port = open_port(cfg);
     let mut screen = Screen::new(cfg);
     loop {

@@ -89,7 +89,7 @@ pub struct FbArea {
     pub height: usize,
 }
 
-/// Spawn logd: partition 0's serial output from now on. This is the first
+/// Spawn logd: serial output, or a secondary's trusted relay. This is the first
 /// component, so that a panic in the rest of root's boot is printed: root
 /// outranks it, and it runs once root stops or waits.
 pub fn spawn(
@@ -97,9 +97,10 @@ pub fn spawn(
     win: &mut Window,
     asids: &mut AsidPools,
     info: &HostInfo,
-    uart: &Uart,
+    uart: Option<&Uart>,
     rings: &crate::partition::Rings,
     fb: Option<FbArea>,
+    outgoing: Option<Range<Slot>>,
 ) -> Option<Logd> {
     if LOGD_ELF.is_empty() {
         return None;
@@ -115,7 +116,7 @@ pub fn spawn(
         .expect("memory for logd");
     let mut cfg = LogdConfig {
         tsc_hz: info.tsc_hz,
-        uart_base: uart.out_base,
+        uart_base: uart.map_or(0, |u| u.out_base),
         _pad: 0,
         rings: rings.serial_mask(),
         kernel_rings: rings.kernel_mask(),
@@ -125,8 +126,8 @@ pub fn spawn(
         fb_width: 0,
         fb_height: 0,
         fb_offset: 0,
-        lanes: info.serial_lanes().is_some() as u32,
-        _pad2: 0,
+        lanes: 1,
+        relay: outgoing.is_some() as u32,
     };
     if let Some(f) = &fb {
         cfg.fb_pitch = f.pitch as u32;
@@ -155,7 +156,9 @@ pub fn spawn(
         &mut |alloc, vspace| asids.assign(alloc, vspace), &info.spawn_context(0),
     );
     #[cfg(target_arch = "x86_64")]
-    comp.give(serial::SLOT_UART, crate::component::root_cap::<cap_type::Unspecified>(uart.out as usize), sel4::CapRights::all());
+    if let Some(uart) = uart {
+        comp.give(serial::SLOT_UART, crate::component::root_cap::<cap_type::Unspecified>(uart.out as usize), sel4::CapRights::all());
+    }
     let keep = arena.object_cap::<cap_type::CNode>(alloc, sel4::ObjectBlueprint::CNode { size_bits: keep_bits });
     let mut next = 0;
     let mut map = |alloc: &mut Alloc, arena: &mut Arena, frames: Range<Slot>, va: usize, attrs| {
@@ -177,8 +180,13 @@ pub fn spawn(
     if let Some(f) = fb {
         map(alloc, &mut arena, f.frames, serial::FB_VA, crate::dashboard::write_combining());
     }
+    if let Some(frames) = outgoing {
+        map(alloc, &mut arena, frames, serial::RELAY_VA, sel4::VmAttributes::DEFAULT);
+    }
     #[cfg(target_arch = "aarch64")]
-    map(alloc, &mut arena, uart.out as Slot..uart.out as Slot + 1, serial::UART_VA, sel4::VmAttributes::EXECUTE_NEVER);
+    if let Some(uart) = uart {
+        map(alloc, &mut arena, uart.out as Slot..uart.out as Slot + 1, serial::UART_VA, sel4::VmAttributes::EXECUTE_NEVER);
+    }
     component::start(&comp);
     Some(Logd { comp, _arena: arena })
 }

@@ -89,8 +89,6 @@ pub struct HostInfo {
     pub epoch_ticks: u64,
     /// Round-robin placement of new guests.
     placement: core::cell::Cell<usize>,
-    /// SLOT_SERIAL_FRAMES holds the VMMs' serial lanes (VmmgrConfig::serial_lanes).
-    serial_lanes: bool,
 }
 
 impl HostInfo {
@@ -103,7 +101,7 @@ impl HostInfo {
             tsc_hz: self.tsc_hz,
             log_frames: proto::SLOT_LOG_FRAMES,
             serial_frames: proto::SLOT_SERIAL_FRAMES,
-            serial_lanes: self.serial_lanes.then_some(proto::SLOT_SERIAL_FRAMES),
+            serial_lanes: proto::SLOT_SERIAL_FRAMES,
         }
     }
 
@@ -573,7 +571,6 @@ fn main(info: &'static Info) -> ! {
         epoch_ns: cfg.epoch_ns,
         epoch_ticks: cfg.epoch_ticks,
         placement: core::cell::Cell::new(0),
-        serial_lanes: cfg.serial_lanes != 0,
     };
     let modules = kimage::Modules::new(cfg.modules_radix as usize, cfg.modules_pages as usize);
     let kernel = module(&cfg.kernel).and_then(|k| {

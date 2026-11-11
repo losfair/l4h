@@ -34,6 +34,22 @@ start = blkd.index('use core::ops::{Deref, DerefMut};')
 # USB ownership transitions: only hardware and completion publication are
 # mocked; run the production recovery and Disable Slot ordering.
 usbd = (root / 'host/l4h-usbd/src/main.rs').read_text()
+def method(source, signature):
+    start = source.index(signature)
+    return source[start:source.index('\n    }', start) + len('\n    }')]
+def function(source, signature):
+    start = source.index(signature)
+    return source[start:source.index('\n}', start) + len('\n}')]
+(out / 'usb-recovery.inc').write_text('impl Usbd {\n' + '\n'.join(
+    method(usbd, sig) for sig in ['    fn recover_command(', '    fn set_deq(', '    fn cancel(', '    fn recover_all(']) + '\n}\n')
+netd = (root / 'host/l4h-netd/src/main.rs').read_text()
+rx_full = function(netd, 'fn rx_full(').replace('    unsafe {', '    peer_before_load(p);\n    unsafe {', 1)
+(out / 'net-backlog.inc').write_text(next(line for line in netd.splitlines() if line.startswith('const BACKLOG_BUDGET:'))
+    + '\nimpl Netd {\n' + method(netd, '    fn rx_backlog(') + '\n}\n'
+    + rx_full + '\n' + function(netd, 'fn rx_put('))
+ipc = (root / 'host/l4h-ipc/src/lib.rs').read_text()
+(out / 'ipc-failure.inc').write_text('#[derive(Clone, Copy)]\n' + function(ipc, 'pub struct Bound {')
+    + '\n' + function(ipc, 'impl Bound {') + '\n' + function(ipc, 'pub fn fail('))
 start = usbd.index('    fn reset(&mut self, error: bool)')
 end = usbd.index('\n    }', start) + len('\n    }')
 reset = usbd[start:end]
@@ -107,6 +123,12 @@ rustc +stable --edition=2024 --test -L dependency="$out" \
 L4H_USB_LIFETIME_TEST_SRC="$out/usb-lifetime.inc" rustc +stable --edition=2024 --test -L dependency="$out" \
     --extern l4h_abi="$out/libl4h_abi.rlib" "$root/tests/usb-lifetime.rs" -o "$out/usb-lifetime-tests"
 "$out/usb-lifetime-tests"
+L4H_USB_RECOVERY_TEST_SRC="$out/usb-recovery.inc" rustc +stable --edition=2024 --test -L dependency="$out" \
+    --extern l4h_abi="$out/libl4h_abi.rlib" "$root/tests/usb-recovery.rs" -o "$out/usb-recovery-tests"
+"$out/usb-recovery-tests"
+L4H_NET_BACKLOG_TEST_SRC="$out/net-backlog.inc" rustc +stable --edition=2024 --test -L dependency="$out" \
+    --extern l4h_host="$out/libl4h_host.rlib" "$root/tests/net-backlog.rs" -o "$out/net-backlog-tests"
+"$out/net-backlog-tests" --test-threads=1
 # Mailboxes carry their edge's protocol all the way to the request.
 types=(--edition=2024 --crate-type rlib -L dependency="$out" --extern l4h_host="$out/libl4h_host.rlib" "$root/tests/ipc-types.rs")
 rustc +stable "${types[@]}" -o "$out/ipc-types.rlib"
@@ -123,7 +145,7 @@ rustc +stable --edition=2024 --test -L dependency="$out" \
     --extern l4h_abi="$out/libl4h_abi.rlib" --extern l4h_host="$out/libl4h_host.rlib" \
     -C link-arg="$out/console-guest.o" "$root/tests/console.rs" -o "$out/console-tests"
 "$out/console-tests"
-rustc +stable --edition=2024 --test -L dependency="$out" \
+L4H_IPC_FAILURE_TEST_SRC="$out/ipc-failure.inc" rustc +stable --edition=2024 --test -L dependency="$out" \
     --extern l4h_abi="$out/libl4h_abi.rlib" --extern l4h_host="$out/libl4h_host.rlib" \
     "$root/tests/control-failure.rs" -o "$out/control-failure-tests"
 "$out/control-failure-tests"

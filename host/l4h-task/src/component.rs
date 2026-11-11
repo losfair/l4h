@@ -264,13 +264,11 @@ pub struct SpawnContext {
     /// log area (`host::log::Ring`), from its page 0: all of it in root,
     /// the VMMs' lanes in vmmgr.
     pub log_frames: u64,
-    /// The same for the frames of the partition's serial ring (root's, or
-    /// a secondary's), which is a component's own only without lanes.
+    /// The same for root's private serial ring, mapped only into logd.
     pub serial_frames: u64,
-    /// The same for partition 0's serial lanes (`host::serial::Lanes`): in
-    /// root, all of them; in vmmgr, the VMMs'. None in a secondary
-    /// partition, where every task writes the partition's ring.
-    pub serial_lanes: Option<u64>,
+    /// The same for this partition's serial lanes (`host::serial::Lanes`):
+    /// in root, all of them; in vmmgr, the VMMs'.
+    pub serial_lanes: u64,
 }
 
 /// Create a component, without starting it.  Objects come from `arena`.
@@ -327,16 +325,10 @@ pub fn create(
     // A VMM's config says whether it is dom0's, whose console has a lane of its own.
     let dom0 = args.kind == host::KIND_VMM
         && args.config.get(core::mem::offset_of!(host::VmmConfig, dom0)..).is_some_and(|b| b.len() >= 4 && b[..4] != [0; 4]);
-    let serial_records = match context.serial_lanes {
-        Some(lanes) => host::serial::writer(args.kind, args.id, dom0).and_then(host::serial::lane_at).map_or(0, |l| {
-            c.map_frames(alloc, arena, lanes + l.page as u64, l.pages, host::serial::VA, CapRights::read_write());
-            l.records
-        }),
-        None => {
-            c.map_frames(alloc, arena, context.serial_frames, host::serial::PAGES, host::serial::VA, CapRights::read_write());
-            host::serial::CAPACITY
-        }
-    };
+    let serial_records = host::serial::writer(args.kind, args.id, dom0).and_then(host::serial::lane_at).map_or(0, |l| {
+        c.map_frames(alloc, arena, context.serial_lanes + l.page as u64, l.pages, host::serial::VA, CapRights::read_write());
+        l.records
+    });
     match args.kind {
         host::KIND_VMMGR => {
             c.map_frames(alloc, arena, context.log_frames, host::log::PAGES, host::log::READ_VA, CapRights::read_only());
@@ -344,9 +336,7 @@ pub fn create(
         // Root's ring: logd says in it what it printed.
         host::KIND_LOGD => {
             c.map_frames(alloc, arena, context.serial_frames, host::serial::PAGES, host::serial::RINGS_VA, CapRights::read_write());
-            if let Some(lanes) = context.serial_lanes {
-                c.map_frames(alloc, arena, lanes, host::serial::LANES_PAGES, host::serial::LANES_VA, CapRights::read_only());
-            }
+            c.map_frames(alloc, arena, context.serial_lanes, host::serial::LANES_PAGES, host::serial::LANES_VA, CapRights::read_only());
         }
         _ => {}
     }
