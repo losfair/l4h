@@ -2511,7 +2511,9 @@ Common behaviour:
     reach each other's BARs without the IOMMU. QEMU's `xio3130-downstream`
     ports have no ACS; its `pcie-root-port` has it. Functions of one
     multi-function device without ACS can reach each other too, which is
-    not reported.
+    not reported. Root has none of Linux's ACS quirks: root ports of Intel
+    PCHs that keep ACS in vendor registers, or that Linux knows to
+    isolate without the capability, are reported as not isolating.
   - Without an MCFG (e.g. GCE, whose VMs have no IOMMU anyway) root says
     ACS is off. Without the IOMMU root leaves ACS alone: a device reaches
     all memory then.
@@ -4628,8 +4630,8 @@ AMD's command buffer and event log), then the VT-d context tables or AMD
 device table. Partition 0 resets and enables the units, pre-allocates a
 context table for every bus that carries a function (from its table of
 owners, so no secondary ever allocates a shared table), blocks every
-entry, and sets a ready flag (on, absent, or off with `iommu=0`); a
-secondary joins without writing a register, waits for the flag before
+entry, sets ACS in every bridge (§9.5), and then sets a ready flag (on,
+absent, or off with `iommu=0`); a secondary joins without writing a register, waits for the flag before
 enabling any device, and then programs only its own functions' context
 entries or DTEs, with I/O page tables in its own RAM. Domain IDs and VT-d
 IRTEs are split statically: partition *k* uses part *k* of *n* of each

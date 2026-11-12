@@ -161,22 +161,31 @@ pub fn enable(c: &impl Config, bdf: u16) -> Acs {
     Acs::Present { cap, before, after }
 }
 
-/// The blocks that map [start, end) (page aligned), largest first where
-/// alignment allows: 2^bits bytes at each address, of 2 MiB frames where
-/// bits >= 21, else of 4 KiB ones.  An ECAM window of whole 2 MiB-aligned
-/// buses is a few carves of 2 MiB frames: one device Untyped split a few
-/// times, and a slot per 2 MiB, where a page per function would split
-/// the device memory table into hundreds of pieces (devmem.rs).
-pub fn blocks(start: u64, end: u64) -> impl Iterator<Item = (u64, u32)> {
+/// The blocks that map [start, end) (page aligned) at virtual addresses
+/// `start - base` on (`base` the window's, its bus 0), largest first:
+/// 2^bits bytes at each address, aligned to that both physically and
+/// virtually, and of at most 2^limit(at) bytes (the free device Untyped
+/// `at` is in).  They are of 2 MiB frames where bits >= 21, else of
+/// 4 KiB ones.  An ECAM window of whole 2 MiB-aligned buses is a few
+/// carves of 2 MiB frames: one device Untyped split a few times, and a
+/// slot per 2 MiB, where a page per function would split the device
+/// memory table into hundreds of pieces (devmem.rs).  A block of fewer
+/// than 12 bits (no free memory at `at`, or a range not page aligned)
+/// ends the list: the caller refuses the window.
+pub fn blocks(start: u64, end: u64, base: u64, limit: impl Fn(u64) -> u32) -> impl Iterator<Item = (u64, u32)> {
     let mut at = start;
     core::iter::from_fn(move || {
         if at >= end {
             return None;
         }
         // A window is at most 256 MiB (256 buses); 1 GiB bounds the shift.
-        let bits = at.trailing_zeros().min(63 - (end - at).leading_zeros()).min(30);
+        let bits = at.trailing_zeros()
+            .min(at.wrapping_sub(base).trailing_zeros())
+            .min(63 - (end - at).leading_zeros())
+            .min(limit(at))
+            .min(30);
         let block = (at, bits);
-        at += 1 << bits;
+        at = if bits < 12 { end } else { at + (1 << bits) };
         Some(block)
     })
 }
@@ -189,7 +198,8 @@ pub fn has_children(c: &impl Config, bdf: u16) -> bool {
     if secondary == 0 || secondary as u16 == bdf >> 8 {
         return false;
     }
-    (0..32u16).any(|dev| c.read((secondary as u16) << 8 | dev << 3, 0) & 0xffff != 0xffff)
+    // Every function: a partition may see a device's function 1 but not 0.
+    (0..256u16).any(|devfn| c.read((secondary as u16) << 8 | devfn, 0) & 0xffff != 0xffff)
 }
 
 /// The names of the bits set in `bits`, for the log.

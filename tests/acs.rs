@@ -215,6 +215,9 @@ fn children_are_functions_on_the_secondary_bus() {
     // A disabled bridge, and one naming its own bus.
     let m = Model::new(&[(PORT, Func::pcie(acs::ROOT_PORT, None)), (0x0000, Func::pcie(0, None))]);
     assert!(!acs::has_children(&m, PORT));
+    // Only function 1 below it visible (a partition's).
+    let m = Model::new(&[(PORT, Func::pcie(acs::ROOT_PORT, None).bridge(2)), (0x0201, Func::pcie(0, None))]);
+    assert!(acs::has_children(&m, PORT));
     let looped = Func::pcie(acs::ROOT_PORT, None).bridge(1);
     assert!(!acs::has_children(&Model::new(&[(0x0108, looped.clone()), (0x0100, looped)]), 0x0108));
 }
@@ -237,18 +240,24 @@ fn state_reads_without_writing() {
 }
 
 /// Every byte of [start, end) once, in order, each block aligned to its
-/// size, of 2 MiB frames only where it holds whole ones.
-fn check_blocks(start: u64, end: u64) -> Vec<(u64, u32)> {
-    let blocks: Vec<_> = acs::blocks(start, end).collect();
+/// size physically and at its offset from `base` (where it is mapped),
+/// and within `limit`.
+fn check_blocks_in(start: u64, end: u64, base: u64, limit: impl Fn(u64) -> u32 + Copy) -> Vec<(u64, u32)> {
+    let blocks: Vec<_> = acs::blocks(start, end, base, limit).collect();
     let mut at = start;
     for &(b, bits) in &blocks {
         assert_eq!(b, at);
+        assert!(bits >= 12 && bits <= limit(b));
         assert_eq!(b % (1 << bits), 0);
-        assert!(bits >= 12);
+        assert_eq!((b - base) % (1 << bits), 0);
         at += 1 << bits;
     }
     assert_eq!(at, end.max(start));
     blocks
+}
+
+fn check_blocks(start: u64, end: u64) -> Vec<(u64, u32)> {
+    check_blocks_in(start, end, start & !0xfff_ffff, |_| 63)
 }
 
 #[test]
@@ -274,4 +283,16 @@ fn ecam_windows_map_in_few_aligned_blocks() {
             check_blocks(0xc000_0000 + (lo << 20), 0xc000_0000 + ((hi + 1) << 20));
         }
     }
+    // A base 1 MiB but not 2 MiB aligned: no block may be 2 MiB aligned
+    // physically but not virtually, which seL4 would refuse (and root
+    // would panic on), so it is all 1 MiB blocks of 4 KiB frames.
+    let b = check_blocks_in(0x8010_0000, 0x8010_0000 + (4 << 20), 0x8010_0000, |_| 63);
+    assert!(b.iter().all(|&(_, bits)| bits == 20), "{b:x?}");
+    // Two free Untypeds of 64 MiB meeting at 0xa400_0000: no block
+    // crosses them.
+    let b = check_blocks_in(0xa000_0000, 0xa800_0000, 0xa000_0000, |_| 26);
+    assert_eq!(b, [(0xa000_0000, 26), (0xa400_0000, 26)]);
+    // No free memory at a block: the list ends with it, under 12 bits.
+    let b: Vec<_> = acs::blocks(0xa000_0000, 0xa800_0000, 0xa000_0000, |at| if at >= 0xa400_0000 { 0 } else { 26 }).collect();
+    assert_eq!(b, [(0xa000_0000, 26), (0xa400_0000, 0)]);
 }

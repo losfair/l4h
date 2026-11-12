@@ -102,8 +102,9 @@ regions! {
     /// The drivers' mailboxes, netd's then each disk and xHCI
     /// controller's (mailbox.rs).
     MAILBOXES = 0x7a00_0000_0000, crate::mailbox::MAILBOXES * l4h_host::mailbox::MAILBOX_PAGES * PAGE;
-    /// x86 multikernel partitions: each PCI function's ECAM page, by BDF
-    /// (pci.rs).
+    /// x86: each PCI function's ECAM page, by BDF (pci.rs): a multikernel
+    /// partition's functions' pages, or root's whole ECAM windows, for
+    /// PCIe ACS (acs.rs).
     ECAM_X86 = 0x6100_0000_0000, 256 * MIB;
     /// A secondary partition's own serial ring.
     SERIAL = 0x6400_0000_0000, l4h_partition::SERIAL_RING_SIZE as usize;

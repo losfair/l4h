@@ -341,7 +341,16 @@ impl Pci {
             return Err("too many windows");
         }
         let va = |pa: u64| crate::layout::ECAM_X86.base + (pa - w.base) as usize;
-        for (at, bits) in crate::acs::blocks(start, end) {
+        // The whole plan first: a window that cannot all be carved is not
+        // carved at all.  Carving a block only splits Untypeds, so each
+        // later block stays inside a free one (they are buddies).
+        let mut plan = l4h_host::fixed::ArrayVec::<(u64, u32), 128>::new();
+        for b in crate::acs::blocks(start, end, w.base, |at| devmem.free_bits(at as usize)) {
+            if b.1 < 12 || plan.push(b).is_err() {
+                return Err("not free device memory");
+            }
+        }
+        for &(at, bits) in plan.iter() {
             let ok = alloc.global(|alloc| {
                 if bits >= 21 {
                     let frames = alloc.slots.global(|slots| devmem.large_frames(slots, at as usize, 1 << bits))?;
@@ -359,8 +368,8 @@ impl Pci {
                 }
                 Some(())
             });
-            // What was mapped stays so, unused.
-            ok.ok_or("not free device memory, or the device memory table is full")?;
+            // The device memory table is full: what was mapped stays so, unused.
+            ok.ok_or("the device memory table is full")?;
         }
         self.windows.must_push((w.base, start, end));
         self.ext = true;
@@ -446,11 +455,11 @@ impl Pci {
             let (b, d, f) = (bdf >> 8, bdf >> 3 & 0x1f, bdf & 7);
             let ty = acs::pcie_type(self, bdf);
             let r = if Self::bit(&ECAM_WRITABLE, bdf) { acs::enable(self, bdf) } else { acs::state(self, bdf) };
-            if let Acs::Present { cap, before, after } = r && after != before {
-                on += 1;
+            if let Acs::Present { cap, before, after } = r && Self::bit(&ECAM_WRITABLE, bdf) {
                 if after & cap & acs::ENABLE != cap & acs::ENABLE {
                     log!("l4h-root: pci {:02x}:{:02x}.{}: ACS control is {} after root set {}", b, d, f, Bits(after), Bits(before | cap & acs::ENABLE));
-                } else {
+                } else if after != before {
+                    on += 1;
                     info!("l4h-root: pci {:02x}:{:02x}.{}: ACS {} (was {})", b, d, f, Bits(after), Bits(before));
                 }
             }
@@ -924,7 +933,7 @@ impl Pci {
     // QEMU virt, highmem-ecam=off: 16 MiB ECAM, buses 0..15.
     const ECAM_VA: usize = crate::layout::ECAM.base;
     pub fn new(alloc: &mut Alloc, devmem: &mut crate::devmem::DevMem) -> Self {
-        use sel4::CapRights;
+        use sel4::{CapRights, VmAttributes};
         use crate::mem::ObjCtx;
         let frames = devmem.frames(&mut alloc.slots, 0x3f00_0000, 1 << 24).expect("PCI ECAM frames");
         for (n, frame) in frames.map(crate::devmem::granule).enumerate() {

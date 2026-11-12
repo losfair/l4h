@@ -118,6 +118,15 @@ impl DevMem {
         Some(s)
     }
 
+    /// The size, as a power of two, of the free device Untyped that holds
+    /// `paddr` (aligned to that size), or 0 if none does.
+    #[cfg(target_arch = "x86_64")]
+    pub fn free_bits(&self, paddr: usize) -> u32 {
+        self.free.iter()
+            .find(|r| r.paddr <= paddr && paddr - r.paddr < 1 << r.size_bits)
+            .map_or(0, |r| r.size_bits as u32)
+    }
+
     /// Whether the free device Untypeds cover [paddr, paddr + size).
     fn covers(&self, paddr: usize, size: usize) -> bool {
         let (mut at, end) = (paddr, paddr + size);
