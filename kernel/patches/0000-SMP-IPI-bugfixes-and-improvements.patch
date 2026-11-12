@@ -1,41 +1,131 @@
-From f545c808204f7236bcc480c87da315add3539cdf Mon Sep 17 00:00:00 2001
+From 8e240d3560f3c88f4dbe13d5bbbf3bd60d01aa56 Mon Sep 17 00:00:00 2001
 From: Indan Zupancic <indan@nul.nu>
-Date: Thu, 12 Nov 2026 18:39:03 +0100
-Subject: [PATCH] SMP: backport upstream IPI bugfixes and improvements
+Date: Thu, 12 Nov 2026 19:00:56 +0100
+Subject: [PATCH] SMP: IPI bugfixes and improvements
 
-Squash seL4/seL4#1849 at 59c2595a24cc64f1c291634ed7c4e3e912173d1b.
-Upstream-PR: https://github.com/seL4/seL4/pull/1849
+Squashed from https://github.com/seL4/seL4/pull/1849
 Upstream-base: c98d70adf15e8be7d3b99085c28d057069ba7155
+Upstream-head: 59c2595a24cc64f1c291634ed7c4e3e912173d1b
 
-Includes all eight PR commits, including the GenMC lock and IPI models:
-  55899850c Arm, SMP: implement arch_pause
-  972f55404 SMP: Add clh_lock_acquire_slowpath
-  ee74342fe SMP: Minor Cleanup
-  25b5acc6c SMP: IPI bugfixes and improvements
-  e3625273d SMP: Make locking code pass GenMC model checking
-  5293f03ab SMP: Add GenMC big kernel lock test
-  e39343e28 SMP: Remove IPI_MEM_BARRIER
-  59c2595a2 SMP: Add GenMC test for IPI / remote core calls
+55899850ce362ae6e10d9d30560e44267bee0afc
+Arm, SMP: implement arch_pause
 
-Blocking IPIs run only while waiting for the global kernel lock. Stalls
-that race a syscall or fault refuse the operation so its caller retries;
-IRQ-path stalls save live x86 FS/GS before switching to the idle thread.
-The new call counter and pending-call ordering supersede l4h patches
-0005 and 0010.
+Doing an isb stalls the execution pipeline and reduces unnecessary
+execution, saving power.
 
-Backport adaptations for l4h's extensions:
-- Preserve patch 0012's stale-timer fast return for native threads, with
-  explicit lock ownership rather than clh_is_self_in_queue(). VM returns
-  use the locked path and retain VCPU/notification/exit preparation.
-- Retain the EPT invalidation remote-call case from patch 0039.
-- Use switchLocalFpuOwner() for patch 0002's current-thread FPU reload;
-  upstream removed the redundant switchFpuOwner() wrapper.
-- Stall both affected TCBs before VCPU rebinding and stall the bound TCB
-  before final VCPU deletion, propagating EXCEPTION_PREEMPTED without
-  changing bindings if either stall refuses. TCB deletion already uses
-  upstream's retry path. Remove the now redundant inner dissociation stall.
+Signed-off-by: Indan Zupancic <indan@nul.nu>
 
-Co-authored-by: l4h <z@univalence.me>
+972f554046e6794378effc81c06942e4e3bf1a03
+SMP: Add clh_lock_acquire_slowpath
+
+To keep the rare congested case out of the fast path.
+
+Set node->myreq->state to CLHState_Pending at unlock time, when it
+is still cache hot and makes more sense. This does require it to be
+initially set to pending, so update clh_lock_init() too.
+
+Update ftp link to a http one for the paper this lock is based on.
+
+Signed-off-by: Indan Zupancic <indan@nul.nu>
+
+ee74342fe89886cdc66b90e29c79dab00ddd5e6c
+SMP: Minor Cleanup
+
+Make doRemoteStall() and doRemoteswitchFpuOwner() common.
+
+Add arch_ prefix to:
+- ipi_send_target
+- ipi_send_mask
+
+Signed-off-by: Indan Zupancic <indan@nul.nu>
+
+25b5acc6cbe55f3d2fdcd73ca2b9e252c8fec2bf
+SMP: IPI bugfixes and improvements
+
+There are some issues with the current IPI design, among others:
+- c_handle_interrupt() only takes the lock if there is no IPI pending.
+  It checks the pending hw IRQ instead of clh_is_ipi_pending().
+  However, IPI interrupts are async and their arrival can also be
+  delayed by other pending, higher priority interrupts. This means
+  that by the time we get to c_handle_interrupt(), the hw IPI it
+  sees might have been handled long ago and that it proceeds without
+  taking the kernel lock, leading to possible race conditions with
+  other cores currently running in kernel mode with the lock held.
+
+- NODE_UNLOCK_IF_HELD uses clh_is_self_in_queue() to see whether we
+  currently hold the lock. However, that function also returns true
+  when we are trying to take the lock, but haven't gotten it yet.
+  If it is called when we don't hold the lock, then we will unlock
+  the lock for our successor, the core that tries to take the lock
+  after us. This would make multiple cores run concurrently. Worse,
+  this faulty state persists, as from now on there are two unlocked
+  requests globally instead of the intended one.
+  The assumption made is that NODE_UNLOCK_IF_HELD is only called
+  when we hold the lock. Normally this is true, however, see above.
+  There may be other corner cases too, like x86 virtualisation.
+
+- ipiStallCoreCallback() does terrifying things for mysterious reasons.
+  The reason is that it can be called at awkward moments, like during
+  syscalls or faults, then it can't easily switch to the idle task,
+  otherwise the fault or syscall will be attributed to or executed by
+  the idle task.
+
+- To handle multiple IPIs in flight, the IPI code got more complicated
+  with no real correctness guarantees, e.g. globalsense.
+
+Streamline the IPI code by:
+- Making blocking remote call IPIs truly blocking and handle them only
+  and immediately in the lock path.
+- Only handle IpiRemoteCall_Stall when we are in the interrupt path.
+  To achieve this, let remoteTCBStall() return an error if the remote
+  core is in the wrong state and restart the syscall that required the
+  remote stall. The restart will give the remote core a chance to finish
+  what it was doing. Because we have a queueing lock, forward progress
+  is guaranteed.
+
+Signed-off-by: Indan Zupancic <indan@nul.nu>
+
+e3625273d49c95af4ca516142e92879734184743
+SMP: Make locking code pass GenMC model checking
+
+Use the opportunity to reduce the number of generated synchronisation
+instructions (dmb on Arm) to two for lock and one for unlock.
+
+Signed-off-by: Indan Zupancic <indan@nul.nu>
+
+5293f03abb72ec12cebc37b0927874d4c9f90f58
+SMP: Add GenMC big kernel lock test
+
+GenMC: A model checker for weak memory models,
+can be found at https://plv.mpi-sws.org/genmc
+
+Signed-off-by: Indan Zupancic <indan@nul.nu>
+
+e39343e280c485a1de57cd89e58f363744b9271a
+SMP: Remove IPI_MEM_BARRIER
+
+The old IPI_MEM_BARRIER was called before sending the IPI,
+presumably to avoid reordering between memory writes and IPI
+interrupts. Because it was before ipi_send_target(), it only
+protects against IPIs arriving earlier than the data.
+
+However, that is not a problem, because everything is serialised
+by the global lock anyway. If an IPI would arrive too early, the
+remote task will just block on the global lock. For remote calls
+it will spin till it sees the data, which is serialised by the
+atomic operation on the ipi flag. Async reschedule IPIs will
+be handled after obtaining the lock.
+
+Signed-off-by: Indan Zupancic <indan@nul.nu>
+
+59c2595a24cc64f1c291634ed7c4e3e912173d1b
+SMP: Add GenMC test for IPI / remote core calls
+
+Checking is limited to locking only, it does not test the
+correctness of specific IPI handler functions, nor hardware
+IPI interrupt sending.
+
+Signed-off-by: Indan Zupancic <indan@nul.nu>
 ---
  include/arch/arm/arch/machine.h             |   3 +-
  include/arch/arm/arch/machine/hardware.h    |   9 -
@@ -46,7 +136,6 @@ Co-authored-by: l4h <z@univalence.me>
  include/arch/riscv/arch/smp/ipi.h           |   3 +-
  include/arch/riscv/arch/smp/ipi_inline.h    |  13 -
  include/arch/x86/arch/kernel/apic.h         |   2 +-
- include/arch/x86/arch/kernel/traps.h        |   4 +
  include/arch/x86/arch/kernel/x2apic.h       |   1 -
  include/arch/x86/arch/kernel/xapic.h        |   1 -
  include/arch/x86/arch/smp/ipi_inline.h      |   9 -
@@ -64,12 +153,10 @@ Co-authored-by: l4h <z@univalence.me>
  src/arch/arm/smp/ipi.c                      |  81 +++---
  src/arch/riscv/c_traps.c                    |   2 +-
  src/arch/riscv/smp/ipi.c                    |  58 ++---
- src/arch/x86/32/c_traps.c                   |  39 +--
- src/arch/x86/64/c_traps.c                   |  37 +--
- src/arch/x86/c_traps.c                      |  19 +-
- src/arch/x86/object/objecttype.c            |  11 +-
- src/arch/x86/object/vcpu.c                  |  18 +-
- src/arch/x86/smp/ipi.c                      |  93 +++----
+ src/arch/x86/32/c_traps.c                   |   2 +-
+ src/arch/x86/64/c_traps.c                   |   2 +-
+ src/arch/x86/c_traps.c                      |   6 +-
+ src/arch/x86/smp/ipi.c                      |  87 +++----
  src/machine/fpu.c                           |  26 +-
  src/object/cnode.c                          |  10 +
  src/object/interrupt.c                      |   2 +-
@@ -77,22 +164,22 @@ Co-authored-by: l4h <z@univalence.me>
  src/object/reply.c                          |  23 ++
  src/object/schedcontext.c                   |  18 +-
  src/object/schedcontrol.c                   |   7 +-
- src/object/tcb.c                            |  23 +-
+ src/object/tcb.c                            |  21 +-
  src/smp/ipi.c                               | 258 +++++++++-----------
  src/smp/lock.c                              |  22 +-
  tools/test/smp-bkl-genmc.c                  |  64 +++++
  tools/test/smp-ipi-genmc.c                  | 133 ++++++++++
  tools/test/wrappers.h                       |  85 +++++++
- 46 files changed, 789 insertions(+), 531 deletions(-)
+ 43 files changed, 711 insertions(+), 483 deletions(-)
  create mode 100644 tools/test/smp-bkl-genmc.c
  create mode 100644 tools/test/smp-ipi-genmc.c
  create mode 100644 tools/test/wrappers.h
 
 diff --git a/include/arch/arm/arch/machine.h b/include/arch/arm/arch/machine.h
-index 433c15457..45c3b4f03 100644
+index fb6e6005f..8a8599f1d 100644
 --- a/include/arch/arm/arch/machine.h
 +++ b/include/arch/arm/arch/machine.h
-@@ -60,7 +60,8 @@ static inline void clearMemory_PT(word_t *ptr, word_t bits)
+@@ -69,7 +69,8 @@ static inline void clearMemory_PT(word_t *ptr, word_t bits)
  #ifdef ENABLE_SMP_SUPPORT
  static inline void arch_pause(void)
  {
@@ -230,21 +317,6 @@ index e24fdc6e7..c73a40db3 100644
 -#define ipi_send_target apic_send_ipi_core
 +#define arch_ipi_send_target apic_send_ipi_core
  
-diff --git a/include/arch/x86/arch/kernel/traps.h b/include/arch/x86/arch/kernel/traps.h
-index 4b0ee0996..e3ca6cab0 100644
---- a/include/arch/x86/arch/kernel/traps.h
-+++ b/include/arch/x86/arch/kernel/traps.h
-@@ -34,6 +34,10 @@ VISIBLE NORETURN;
- void restore_user_context(void)
- VISIBLE NORETURN;
- 
-+/* Stale-timer return for a native thread that never took the lock. */
-+void restore_user_context_no_lock(void)
-+VISIBLE NORETURN;
-+
- void c_nested_interrupt(int irq)
- VISIBLE;
- 
 diff --git a/include/arch/x86/arch/kernel/x2apic.h b/include/arch/x86/arch/kernel/x2apic.h
 index 3d517c2e7..373f52395 100644
 --- a/include/arch/x86/arch/kernel/x2apic.h
@@ -267,7 +339,7 @@ index 2be88896e..b7f7c8b7c 100644
  #endif  /* CONFIG_XAPIC */
  
 diff --git a/include/arch/x86/arch/smp/ipi_inline.h b/include/arch/x86/arch/smp/ipi_inline.h
-index d06fee908..d642292e1 100644
+index 9934b65f9..aa13f6cc7 100644
 --- a/include/arch/x86/arch/smp/ipi_inline.h
 +++ b/include/arch/x86/arch/smp/ipi_inline.h
 @@ -10,15 +10,6 @@
@@ -631,7 +703,7 @@ index 5347f2f9a..4b3510ee3 100644
 -#define NODE_LOCK_IRQ_IF(_cond) NODE_LOCK_IF(_cond, true)
  
 diff --git a/src/api/syscall.c b/src/api/syscall.c
-index 19f2c9653..9394a9108 100644
+index ec8880760..045e5e17b 100644
 --- a/src/api/syscall.c
 +++ b/src/api/syscall.c
 @@ -74,23 +74,12 @@ static inline void checkInterrupt(void)
@@ -648,14 +720,14 @@ index 19f2c9653..9394a9108 100644
 -
 -#ifdef CONFIG_KERNEL_MCS
 -    if (SMP_TERNARY(clh_is_self_in_queue(), 1)) {
--#endif
++    updateTimestamp();
++    checkBudget();
+ #endif
 -        schedule();
 -        activateThread();
 -#ifdef CONFIG_KERNEL_MCS
 -    }
-+    updateTimestamp();
-+    checkBudget();
- #endif
+-#endif
 -
 +    checkInterrupt(true);
 +    schedule();
@@ -690,7 +762,7 @@ index 2d5cbcd86..f6cb62113 100644
      asm volatile(
          "mov     sp, %0                     \n"
 diff --git a/src/arch/arm/c_traps.c b/src/arch/arm/c_traps.c
-index 0bea0047b..53f88e226 100644
+index 8104d73df..68c99defc 100644
 --- a/src/arch/arm/c_traps.c
 +++ b/src/arch/arm/c_traps.c
 @@ -86,7 +86,7 @@ void VISIBLE NORETURN c_handle_instruction_fault(void)
@@ -716,10 +788,10 @@ index bdedf2f3c..8cdeeae1a 100644
      if (config_set(CONFIG_PLAT_TX2)) {
          /* We need to swap the top 4 bits and the bottom 4 bits of the
 diff --git a/src/arch/arm/machine/gic_v3.c b/src/arch/arm/machine/gic_v3.c
-index 1d9d09c9f..ad9769a12 100644
+index 8687bce3d..430a96296 100644
 --- a/src/arch/arm/machine/gic_v3.c
 +++ b/src/arch/arm/machine/gic_v3.c
-@@ -429,7 +429,7 @@ void plat_sendSGI(word_t irq, word_t target)
+@@ -435,7 +435,7 @@ void plat_sendSGI(word_t irq, word_t target)
  #ifdef ENABLE_SMP_SUPPORT
  #define MPIDR_MT(x)   (x & BIT(24))
  
@@ -831,7 +903,7 @@ index 5cd132fea..6382d637d 100644
      generic_ipi_send_mask(ipi, mask, isBlocking);
  }
 diff --git a/src/arch/riscv/c_traps.c b/src/arch/riscv/c_traps.c
-index b8344a0be..69429b17e 100644
+index c2c199a91..b6cb5b1ad 100644
 --- a/src/arch/riscv/c_traps.c
 +++ b/src/arch/riscv/c_traps.c
 @@ -34,7 +34,7 @@ void VISIBLE NORETURN restore_user_context(void)
@@ -934,152 +1006,38 @@ index 0ec08e5ca..46396584b 100644
      fence_rw_rw();
      sbi_send_ipi(hart_mask);
 diff --git a/src/arch/x86/32/c_traps.c b/src/arch/x86/32/c_traps.c
-index f4f78e7e9..56caf8a78 100644
+index 7d27325b5..d32a28a1d 100644
 --- a/src/arch/x86/32/c_traps.c
 +++ b/src/arch/x86/32/c_traps.c
-@@ -102,26 +102,28 @@ static void NORETURN restore_vmx(tcb_t *cur_thread, vcpu_t *vcpu)
- #endif
- 
- void NORETURN VISIBLE restore_user_context(void);
--void NORETURN VISIBLE restore_user_context(void)
-+static void NORETURN restore_user_context_internal(bool_t lock_held);
-+
-+void VISIBLE NORETURN restore_user_context(void)
+@@ -101,7 +101,7 @@ void NORETURN VISIBLE restore_user_context(void)
  {
--    c_exit_hook();
-+    restore_user_context_internal(true);
-+}
-+
-+void VISIBLE NORETURN restore_user_context_no_lock(void)
-+{
-+    restore_user_context_internal(false);
-+}
- 
-+static void NORETURN restore_user_context_internal(bool_t lock_held)
-+{
-+    /* Only the stale-timer fast return may arrive without the lock. It
-+     * cannot return to a VM, which needs locked VCPU preparation. */
- #ifdef CONFIG_VTX
--    /* While the lock is held, so that an invocation on another core finds
--     * the VCPU here and takes it out of guest mode before touching it.
--     * The remote-call IPI and the MCS stale-timer drop get here without
--     * it, and the IPI may have been one taking the VCPU away: take the
--     * lock, which can also change the thread (a stall).  A notification
--     * another core signalled may not have been checked yet, if the thread
--     * was switched out and back in since its IPI: it ends the VMEnter.
--     * And a thread that a stall IPI took off its core, while it waited for
--     * the lock with an exit for userspace, has that exit to report still,
--     * instead of entering guest mode again. */
--    if (thread_state_ptr_get_tsType(&NODE_STATE(ksCurThread)->tcbState) == ThreadState_RunningVM) {
-+    assert(lock_held || thread_state_ptr_get_tsType(&NODE_STATE(ksCurThread)->tcbState)
-+           != ThreadState_RunningVM);
-+    if (lock_held && thread_state_ptr_get_tsType(&NODE_STATE(ksCurThread)->tcbState)
-+        == ThreadState_RunningVM) {
- #ifdef ENABLE_SMP_SUPPORT
--        if (!clh_is_self_in_queue()) {
--            NODE_LOCK_SYS;
--        }
-         VMCheckBoundNotification(NODE_STATE(ksCurThread));
- #endif
-         if (thread_state_ptr_get_tsType(&NODE_STATE(ksCurThread)->tcbState) == ThreadState_RunningVM) {
-@@ -134,7 +136,10 @@ void NORETURN VISIBLE restore_user_context(void)
-     }
- #endif
+     c_exit_hook();
  
 -    NODE_UNLOCK_IF_HELD;
-+    c_exit_hook();
-+    if (lock_held) {
-+        NODE_UNLOCK;
-+    }
++    NODE_UNLOCK;
  
      /* we've now 'exited' the kernel. If we have a pending interrupt
       * we should 'enter' it again */
 diff --git a/src/arch/x86/64/c_traps.c b/src/arch/x86/64/c_traps.c
-index 8742dc3fd..905ce5a2e 100644
+index 0f4b5e73c..6ed2d25c2 100644
 --- a/src/arch/x86/64/c_traps.c
 +++ b/src/arch/x86/64/c_traps.c
-@@ -208,26 +208,28 @@ static void NORETURN restore_vmx(tcb_t *cur_thread, vcpu_t *vcpu)
- }
- #endif
- 
-+static void NORETURN restore_user_context_internal(bool_t lock_held);
-+
- void VISIBLE NORETURN restore_user_context(void)
+@@ -202,7 +202,7 @@ void VISIBLE NORETURN restore_user_context(void)
  {
--    c_exit_hook();
-+    restore_user_context_internal(true);
-+}
-+
-+void VISIBLE NORETURN restore_user_context_no_lock(void)
-+{
-+    restore_user_context_internal(false);
-+}
- 
-+static void NORETURN restore_user_context_internal(bool_t lock_held)
-+{
-+    /* Only the stale-timer fast return may arrive without the lock. It
-+     * cannot return to a VM, which needs locked VCPU preparation. */
- #ifdef CONFIG_VTX
--    /* While the lock is held, so that an invocation on another core finds
--     * the VCPU here and takes it out of guest mode before touching it.
--     * The remote-call IPI and the MCS stale-timer drop get here without
--     * it, and the IPI may have been one taking the VCPU away: take the
--     * lock, which can also change the thread (a stall).  A notification
--     * another core signalled may not have been checked yet, if the thread
--     * was switched out and back in since its IPI: it ends the VMEnter.
--     * And a thread that a stall IPI took off its core, while it waited for
--     * the lock with an exit for userspace, has that exit to report still,
--     * instead of entering guest mode again. */
--    if (thread_state_ptr_get_tsType(&NODE_STATE(ksCurThread)->tcbState) == ThreadState_RunningVM) {
-+    assert(lock_held || thread_state_ptr_get_tsType(&NODE_STATE(ksCurThread)->tcbState)
-+           != ThreadState_RunningVM);
-+    if (lock_held && thread_state_ptr_get_tsType(&NODE_STATE(ksCurThread)->tcbState)
-+        == ThreadState_RunningVM) {
- #ifdef ENABLE_SMP_SUPPORT
--        if (!clh_is_self_in_queue()) {
--            NODE_LOCK_SYS;
--        }
-         VMCheckBoundNotification(NODE_STATE(ksCurThread));
- #endif
-         if (thread_state_ptr_get_tsType(&NODE_STATE(ksCurThread)->tcbState) == ThreadState_RunningVM) {
-@@ -240,7 +242,10 @@ void VISIBLE NORETURN restore_user_context(void)
-     }
- #endif
+     c_exit_hook();
  
 -    NODE_UNLOCK_IF_HELD;
-+    c_exit_hook();
-+    if (lock_held) {
-+        NODE_UNLOCK;
-+    }
++    NODE_UNLOCK;
  
      /* we've now 'exited' the kernel. If we have a pending interrupt
       * we should 'enter' it again */
 diff --git a/src/arch/x86/c_traps.c b/src/arch/x86/c_traps.c
-index ee78eb10a..19556268c 100644
+index 99ffc2a61..78d09664b 100644
 --- a/src/arch/x86/c_traps.c
 +++ b/src/arch/x86/c_traps.c
-@@ -62,21 +62,22 @@ void VISIBLE NORETURN c_handle_interrupt(int irq, int syscall)
+@@ -35,10 +35,8 @@ void VISIBLE NORETURN c_handle_interrupt(int irq, int syscall)
+         x86_enable_ibrs();
      }
- 
- #ifdef CONFIG_KERNEL_MCS
--    /* Drop a stale timer interrupt without taking the kernel lock: the
--     * timer will raise the interrupt again at the deadline it is armed
--     * with. */
--    if (irq == int_timer && timerIRQIsStale()) {
-+    /* Native threads can drop a stale tick without taking the lock. A
-+     * VM return needs locked VCPU preparation, so use the normal path. */
-+    if (irq == int_timer && timerIRQIsStale()
-+#ifdef CONFIG_VTX
-+        && thread_state_ptr_get_tsType(&NODE_STATE(ksCurThread)->tcbState) != ThreadState_RunningVM
-+#endif
-+       ) {
-         c_entry_hook();
-         apic_ack_active_interrupt();
--        restore_user_context();
-+        restore_user_context_no_lock();
-         UNREACHABLE();
-     }
- #endif
  
 -    /* Only grab the lock if we are not handling 'int_remote_call_ipi' interrupt
 -     * also flag this lock as IRQ lock if handling the irq interrupts. */
@@ -1090,76 +1048,11 @@ index ee78eb10a..19556268c 100644
  
      c_entry_hook();
  
-diff --git a/src/arch/x86/object/objecttype.c b/src/arch/x86/object/objecttype.c
-index 03c510315..550b112f7 100644
---- a/src/arch/x86/object/objecttype.c
-+++ b/src/arch/x86/object/objecttype.c
-@@ -9,6 +9,7 @@
- #include <api/failures.h>
- #include <kernel/vspace.h>
- #include <object/structures.h>
-+#include <object/tcb.h>
- #include <arch/machine.h>
- #include <arch/model/statedata.h>
- #include <machine/fpu.h>
-@@ -246,7 +247,15 @@ finaliseCap_ret_t Arch_finaliseCap(cap_t cap, bool_t final)
- #ifdef CONFIG_VTX
-     case cap_vcpu_cap:
-         if (final) {
--            vcpu_finalise(VCPU_PTR(cap_vcpu_cap_get_capVCPUPtr(cap)));
-+            vcpu_t *vcpu = VCPU_PTR(cap_vcpu_cap_get_capVCPUPtr(cap));
-+#ifdef ENABLE_SMP_SUPPORT
-+            if (vcpu->vcpuTCB && !remoteTCBStall(vcpu->vcpuTCB)) {
-+                fc_ret.remainder = cap_null_cap_new();
-+                fc_ret.cleanupInfo = Zombie_new(0, 0, 0);
-+                return fc_ret;
-+            }
-+#endif
-+            vcpu_finalise(vcpu);
-         }
-         break;
-     case cap_ept_pml4_cap:
-diff --git a/src/arch/x86/object/vcpu.c b/src/arch/x86/object/vcpu.c
-index 3ef170f7b..89f71318b 100644
---- a/src/arch/x86/object/vcpu.c
-+++ b/src/arch/x86/object/vcpu.c
-@@ -698,13 +698,10 @@ static void dissociateVcpuTcb(tcb_t *tcb, vcpu_t *vcpu)
-      * which is also when that core has finished recording an exit. */
-     if (thread_state_ptr_get_tsType(&tcb->tcbState) == ThreadState_RunningVM) {
- #ifdef ENABLE_SMP_SUPPORT
--        /* And off its core, as for an invocation of the thread itself.  It
--         * may be waiting there for the kernel lock, after an exit: a stall
--         * IPI in that wait takes a running thread for one in a system call
--         * and makes it start the call again (ipiStallCoreCallback()), so
--         * this thread would run its VMEnter again, in place of the result
--         * it is given here. */
--        remoteTCBStall(tcb);
-+        /* The decoding/finalisation path must stall both affected TCBs
-+         * before changing either binding, and retry if a stall fails. */
-+        assert(tcb->tcbAffinity == getCurrentCPUIndex() ||
-+               NODE_STATE_ON_CORE(ksCurThread, tcb->tcbAffinity) != tcb);
- #endif
-         if (x86KSSVMEnabled) {
-             svm_claim_vcpu(vcpu);
-@@ -1390,6 +1387,13 @@ static exception_t decodeReadVMCS(cap_t cap, word_t length, bool_t call, word_t
- 
- static exception_t invokeSetTCB(vcpu_t *vcpu, tcb_t *tcb)
- {
-+#ifdef ENABLE_SMP_SUPPORT
-+    /* Both the old and new binding must be safe before either changes. */
-+    if (!remoteTCBStall(tcb) || (vcpu->vcpuTCB && !remoteTCBStall(vcpu->vcpuTCB))) {
-+        setThreadState(NODE_STATE(ksCurThread), ThreadState_Restart);
-+        return EXCEPTION_PREEMPTED;
-+    }
-+#endif
-     associateVcpuTcb(tcb, vcpu);
- 
-     setThreadState(NODE_STATE(ksCurThread), ThreadState_Restart);
 diff --git a/src/arch/x86/smp/ipi.c b/src/arch/x86/smp/ipi.c
-index 15bd8ade9..9930bc88e 100644
+index b67248941..5f56c6ce0 100644
 --- a/src/arch/x86/smp/ipi.c
 +++ b/src/arch/x86/smp/ipi.c
-@@ -11,60 +11,47 @@
+@@ -11,57 +11,44 @@
  
  #ifdef ENABLE_SMP_SUPPORT
  
@@ -1217,9 +1110,6 @@ index 15bd8ade9..9930bc88e 100644
 -        case IpiRemoteCall_ClearCurrentVCPU:
 -            clearCurrentVCPU();
 -            break;
--        case IpiRemoteCall_InvalidateEPT:
--            invalidateLocalEPT((ept_pml4e_t *)arg0);
--            break;
 -        case IpiRemoteCall_VMCheckBoundNotification: {
 -            tcb_t *tcb = (tcb_t *)arg0;
 -
@@ -1230,9 +1120,6 @@ index 15bd8ade9..9930bc88e 100644
 -            break;
 +    case IpiRemoteCall_ClearCurrentVCPU:
 +        clearCurrentVCPU();
-+        break;
-+    case IpiRemoteCall_InvalidateEPT:
-+        invalidateLocalEPT((ept_pml4e_t *)arg0);
 +        break;
 +    case IpiRemoteCall_VMCheckBoundNotification: {
 +        tcb_t *tcb = (tcb_t *)arg0;
@@ -1257,7 +1144,7 @@ index 15bd8ade9..9930bc88e 100644
      }
  }
  
-@@ -85,7 +72,7 @@ static void x86_ipi_send_mask(interrupt_t ipi, word_t mask, bool_t isBlocking)
+@@ -82,7 +69,7 @@ static void x86_ipi_send_mask(interrupt_t ipi, word_t mask, bool_t isBlocking)
          word_t sub_mask = mask & cpu_mapping.other_indexes_in_cluster[core];
          target_clusters[nr_target_clusters] |= cpu_mapping.index_to_logical_id[core];
          if (isBlocking) {
@@ -1266,7 +1153,7 @@ index 15bd8ade9..9930bc88e 100644
          }
  
          /* check if there is any other core in this cluster */
-@@ -93,7 +80,7 @@ static void x86_ipi_send_mask(interrupt_t ipi, word_t mask, bool_t isBlocking)
+@@ -90,7 +77,7 @@ static void x86_ipi_send_mask(interrupt_t ipi, word_t mask, bool_t isBlocking)
              int index = wordBits - 1 - clzl(sub_mask);
              target_clusters[nr_target_clusters] |= cpu_mapping.index_to_logical_id[index];
              if (isBlocking) {
@@ -1275,7 +1162,7 @@ index 15bd8ade9..9930bc88e 100644
              }
              sub_mask &= ~BIT(index);
          }
-@@ -110,7 +97,7 @@ static void x86_ipi_send_mask(interrupt_t ipi, word_t mask, bool_t isBlocking)
+@@ -107,7 +94,7 @@ static void x86_ipi_send_mask(interrupt_t ipi, word_t mask, bool_t isBlocking)
  }
  #endif /* CONFIG_USE_LOGICAL_IDS */
  
@@ -1347,10 +1234,10 @@ index 8b8540bc1..71215c0c0 100644
              ret.status = EXCEPTION_NONE;
              ret.success = true;
 diff --git a/src/object/interrupt.c b/src/object/interrupt.c
-index bacba6cb7..6b98b4080 100644
+index a65d5f357..5bb8da0a3 100644
 --- a/src/object/interrupt.c
 +++ b/src/object/interrupt.c
-@@ -250,7 +250,7 @@ void handleInterrupt(irq_t irq)
+@@ -249,7 +249,7 @@ void handleInterrupt(irq_t irq)
  
  #ifdef ENABLE_SMP_SUPPORT
      case IRQIPI:
@@ -1360,7 +1247,7 @@ index bacba6cb7..6b98b4080 100644
  #endif /* ENABLE_SMP_SUPPORT */
  
 diff --git a/src/object/objecttype.c b/src/object/objecttype.c
-index 82ea3041c..b029f5d90 100644
+index e6c603623..d36ca251f 100644
 --- a/src/object/objecttype.c
 +++ b/src/object/objecttype.c
 @@ -18,6 +18,7 @@
@@ -1400,8 +1287,8 @@ index 82ea3041c..b029f5d90 100644
 +#endif
              unbindNotification(tcb);
  #ifdef CONFIG_KERNEL_MCS
-             timerQueueRemove(tcb);
-@@ -220,6 +234,13 @@ finaliseCap_ret_t finaliseCap(cap_t cap, bool_t final, bool_t exposed)
+             sched_context_t *sc = SC_PTR(tcb->tcbSchedContext);
+@@ -219,6 +233,13 @@ finaliseCap_ret_t finaliseCap(cap_t cap, bool_t final, bool_t exposed)
      case cap_sched_context_cap:
          if (final) {
              sched_context_t *sc = SC_PTR(cap_sched_context_cap_get_capSCPtr(cap));
@@ -1415,7 +1302,7 @@ index 82ea3041c..b029f5d90 100644
              schedContext_unbindAllTCBs(sc);
              schedContext_unbindNtfn(sc);
              schedContext_unbindReply(sc);
-@@ -813,6 +834,11 @@ exception_t performInvocation_Notification(notification_t *ntfn, word_t badge)
+@@ -812,6 +833,11 @@ exception_t performInvocation_Notification(notification_t *ntfn, word_t badge)
  #ifdef CONFIG_KERNEL_MCS
  exception_t performInvocation_Reply(tcb_t *thread, reply_t *reply, bool_t canGrant)
  {
@@ -1510,7 +1397,7 @@ index 621f82a79..7fd318952 100644
          tcbReleaseRemove(from);
          from->tcbSchedContext = NULL;
 diff --git a/src/object/schedcontrol.c b/src/object/schedcontrol.c
-index a99cba828..f26dd3135 100644
+index c3ee1498e..7bbc70bff 100644
 --- a/src/object/schedcontrol.c
 +++ b/src/object/schedcontrol.c
 @@ -15,10 +15,13 @@ static exception_t invokeSchedControl_ConfigureFlags(sched_context_t *target, wo
@@ -1530,7 +1417,7 @@ index a99cba828..f26dd3135 100644
          tcbReleaseRemove(thread);
          tcbSchedDequeue(thread);
 diff --git a/src/object/tcb.c b/src/object/tcb.c
-index b2955d387..43483a6dc 100644
+index 6bfcdd7fa..0a264d9ec 100644
 --- a/src/object/tcb.c
 +++ b/src/object/tcb.c
 @@ -461,20 +461,19 @@ void remoteQueueUpdate(tcb_t *tcb)
@@ -1559,16 +1446,7 @@ index b2955d387..43483a6dc 100644
  }
  
  #ifndef CONFIG_KERNEL_MCS
-@@ -934,7 +933,7 @@ static exception_t decodeFPUTransfer(cap_t cap, word_t length, word_t *buffer, b
-      * A target running on another core has already been stalled off it by
-      * remoteTCBStall() and reloads its FPU when it is switched to again. */
-     if (owned && thread == NODE_STATE(ksCurThread)) {
--        switchFpuOwner(thread, CURRENT_CPU_INDEX());
-+        switchLocalFpuOwner(thread);
-     }
-     return EXCEPTION_NONE;
- }
-@@ -966,9 +965,15 @@ static exception_t decodeSetTimer(cap_t cap, word_t length, word_t *buffer)
+@@ -851,9 +850,15 @@ static exception_t decodeSetFlags(cap_t cap, word_t length, bool_t call, word_t
  exception_t decodeTCBInvocation(word_t invLabel, word_t length, cap_t cap,
                                  cte_t *slot, bool_t call, word_t *buffer)
  {

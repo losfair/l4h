@@ -274,12 +274,13 @@ support, since no device is passed into a guest.
 
 | Patch | Fix |
 |-------|-----|
+| 0000 | Unmodified squashed backport of [seL4 PR #1849](https://github.com/seL4/seL4/pull/1849), all eight commits through `59c2595a24cc64f1c291634ed7c4e3e912173d1b`, including its GenMC lock/IPI models. Applied before the local patches. Blocking remote calls run in the kernel-lock wait path; a stall racing a syscall or fault makes its caller retry. IRQ-path stalls save live x86 FS/GS before switching to idle, preserving user TLS. The new completion counter and pending-call ordering replace patches 0005 and 0010. |
 | 0004 | x86_64 `syscall` entry never saved the user RSP and `sysretq` cleared it (libsel4 keeps RSP in RBX, which hid this). RSP is now saved through a per-node scratch slot and restored on both the slow path and the fastpath. 0027 does the same with SKIM: RSP is saved before loading the kernel CR3 and carried through the per-CPU SKIM scratch word, cleared after each read, with no user-stack access and no extra SKIM mappings. |
 | 0012 | (x86, MCS) The LAPIC latches a timer interrupt that fires while a core waits for the kernel lock; it was then handled as a new event after the next deadline was armed, meaning another lock wait. Under host load every core looped on stale interrupts and user threads never ran. A timer interrupt that finds the timer still armed is now acknowledged and dropped before the lock (checking 0006's `ksArmedDeadline` first). 0044 keeps the lock-free return for native threads; VM returns take the lock for VCPU preparation. The patch is x86-only. |
 | 0013 | `SchedControl_ConfigureFlags` on an SC whose runnable thread is on another core could enqueue a postponed thread in the remote ready queue too. Only a schedulable thread is enqueued now. The balancer can hit this when it changes the budget of a capped vCPU that is running on another core and has used up its budget. |
 | 0014 | (x86, MCS) Every core re-measured the TSC and APIC timer rates from one PIT wraparound and overwrote the shared values; a virtualised PIT can end that wait early (about one GCE boot in three). Rates are measured once, on the boot core, as the median of 5 wraparounds. Countdown conversion from TSC to APIC ticks uses both rates rather than their truncated ratio, and a delay too long for the 32-bit count fires early and is reprogrammed. |
 | 0028 | (x86_64) seL4's user segments are laid out as Linux's, so `sysretq` and `iretq` both return with CS 0x33 / SS 0x2b. `sysretq` previously returned with a data-slot CS that faulted when user code reloaded it with `iretq` (.NET's `RtlRestoreContext`). |
-| 0044 | Squashed backport of [seL4 PR #1849](https://github.com/seL4/seL4/pull/1849), all eight commits through `59c2595a24cc64f1c291634ed7c4e3e912173d1b`, including its GenMC lock/IPI models. Blocking remote calls run in the kernel-lock wait path; a stall racing a syscall or fault makes its caller retry. IRQ-path stalls save live x86 FS/GS before switching to idle, preserving user TLS. The new completion counter and pending-call ordering replace patches 0005 and 0010. Local adaptations retain EPT invalidation, use the local FPU-owner helper for Read/WriteFPU, preserve 0012's native stale-timer fast return with explicit lock ownership, and make VCPU rebinding/deletion retry before changing bindings when either TCB cannot be stalled. No userspace API changes. |
+| 0044 | Local compatibility fixes for 0000: preserve 0012's native stale-timer fast return with explicit lock ownership, keep locked VM-return preparation, use the retained local FPU-owner helper for Read/WriteFPU, and make VCPU rebinding/deletion retry before changing bindings when either affected TCB cannot be stalled. The upstream patch stays unchanged; patches 0003, 0012 and 0039 have refreshed application context. No userspace API changes. |
 
 **Performance:**
 
@@ -4797,7 +4798,7 @@ Rules that keep the port cheap:
 
 **Kernel.** seL4 aarch64 (QEMU `virt`, MCS, SMP, EL1, no hypervisor
 support) builds with all l4h patches from `kernel/configs/l4h-aarch64.cmake`
-via `tools/build-kernel-aarch64.sh`. E1–E3 and patches 0006 and 0044 are
+via `tools/build-kernel-aarch64.sh`. E1–E3 and patches 0000 and 0006 are
 ISA-neutral; 0007, 0015, 0016 and 0018 are aarch64-specific (§4.5).
 The HWCAPs come from the boot core's ID registers alone, so l4h requires
 cores with the same features; heterogeneous CPUs would need the fields
@@ -5101,7 +5102,7 @@ machine and guests of 256–512 MiB.
 | `python3 tests/vtd-net-qemu.py [--iommu amd]` | bridge aliases with two NICs and disk controllers; `--no-intremap` checks DMA-only confinement, `--controllers 17` checks shared interrupt capacity |
 | `python3 tests/amdvi-qemu.py` | AMD-Vi shared tables, DMA bounds and interrupt isolation using QEMU EDU devices |
 | `tests/run-schedtest.sh` | host-side SMT topology, initial placement and migration policy tests |
-| `tests/run-tls-stalltest.sh` | two-core seL4-only regression for remote-stall TLS preservation (0044): a worker changes FS/GS directly and yields while the other core issues 100,000 SC consumption queries; CI runs debug and release kernels |
+| `tests/run-tls-stalltest.sh` | two-core seL4-only regression for remote-stall TLS preservation (0000, 0044): a worker changes FS/GS directly and yields while the other core issues 100,000 SC consumption queries; CI runs debug and release kernels |
 | `tests/run-rtctest.sh [--qemu]` | RTC calendar, BCD/binary and 12/24-hour modes, bounds and error recovery; with `--qemu`, dom0 writes verified against the emulated hardware |
 | `tests/run-smttest.sh` | QEMU boot with SMT: CPU discovery, initial placement and busy-vCPU migration |
 | `tests/run-captest.sh [cap%] [rounds]` | self-test and fork loops in a guest capped from boot |

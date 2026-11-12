@@ -1,4 +1,4 @@
-From 49874e23ff61c6086db59d338414cf508af9261c Mon Sep 17 00:00:00 2001
+From 12242586c37868391dbcfa425d57fd9a889663a3 Mon Sep 17 00:00:00 2001
 From: l4h <l4h@localhost>
 Date: Fri, 6 Nov 2026 23:22:24 -0800
 Subject: [PATCH] x86: what KVM needs from the VCPU interface
@@ -420,10 +420,10 @@ index eee60ee8b..04dc9f78b 100644
      IpiRemoteCall_InvalidatePageStructureCacheASID,
      IpiRemoteCall_InvalidateTranslationSingle,
 diff --git a/include/arch/x86/arch/smp/ipi_inline.h b/include/arch/x86/arch/smp/ipi_inline.h
-index 9934b65f9..d06fee908 100644
+index aa13f6cc7..d642292e1 100644
 --- a/include/arch/x86/arch/smp/ipi_inline.h
 +++ b/include/arch/x86/arch/smp/ipi_inline.h
-@@ -50,6 +50,11 @@ static inline void doRemoteVMCheckBoundNotification(word_t cpu, tcb_t *tcb)
+@@ -41,6 +41,11 @@ static inline void doRemoteVMCheckBoundNotification(word_t cpu, tcb_t *tcb)
  {
      doRemoteOp1Arg(IpiRemoteCall_VMCheckBoundNotification, (word_t)tcb, cpu);
  }
@@ -510,7 +510,7 @@ index 5081e1d5a..2f82c8fe8 100644
 +#define SEL4_VMENTER_RESULT_NOTIF_LEN SEL4_VMENTER_NUM_FAULT_MSGS
  
 diff --git a/src/arch/x86/32/c_traps.c b/src/arch/x86/32/c_traps.c
-index 7d27325b5..f4f78e7e9 100644
+index d32a28a1d..234cbc4c5 100644
 --- a/src/arch/x86/32/c_traps.c
 +++ b/src/arch/x86/32/c_traps.c
 @@ -21,6 +21,10 @@
@@ -567,11 +567,11 @@ index 7d27325b5..f4f78e7e9 100644
 +    }
 +#endif
 +
-     NODE_UNLOCK_IF_HELD;
+     NODE_UNLOCK;
  
      /* we've now 'exited' the kernel. If we have a pending interrupt
 diff --git a/src/arch/x86/64/c_traps.c b/src/arch/x86/64/c_traps.c
-index cdb4f08e5..0965d151d 100644
+index 6545c1f7b..4a15326a9 100644
 --- a/src/arch/x86/64/c_traps.c
 +++ b/src/arch/x86/64/c_traps.c
 @@ -16,6 +16,12 @@
@@ -678,14 +678,14 @@ index cdb4f08e5..0965d151d 100644
 +    }
 +#endif
 +
-     NODE_UNLOCK_IF_HELD;
+     NODE_UNLOCK;
  
      /* we've now 'exited' the kernel. If we have a pending interrupt
 diff --git a/src/arch/x86/c_traps.c b/src/arch/x86/c_traps.c
-index 9ce868692..da2676082 100644
+index cea4cc896..939d78a30 100644
 --- a/src/arch/x86/c_traps.c
 +++ b/src/arch/x86/c_traps.c
-@@ -154,10 +154,7 @@ void NORETURN slowpath(syscall_t syscall)
+@@ -152,10 +152,7 @@ void NORETURN slowpath(syscall_t syscall)
          if (NODE_STATE(ksCurThread)->tcbBoundNotification
              && notification_ptr_get_state(NODE_STATE(ksCurThread)->tcbBoundNotification) == NtfnState_Active) {
              completeSignal(NODE_STATE(ksCurThread)->tcbBoundNotification, NODE_STATE(ksCurThread));
@@ -697,7 +697,7 @@ index 9ce868692..da2676082 100644
              restore_user_context();
          } else {
              setThreadState(NODE_STATE(ksCurThread), ThreadState_RunningVM);
-@@ -247,6 +244,22 @@ void VISIBLE NORETURN c_handle_vmexit(void)
+@@ -245,6 +242,22 @@ void VISIBLE NORETURN c_handle_vmexit(void)
      /* We *always* need to flush the rsb as a guest may have been able to train the rsb with kernel addresses */
      x86_flush_rsb();
  
@@ -2257,18 +2257,18 @@ index 92dd1dfef..55c03c302 100644
 +
  #endif
 diff --git a/src/arch/x86/smp/ipi.c b/src/arch/x86/smp/ipi.c
-index b67248941..15bd8ade9 100644
+index 5f56c6ce0..9930bc88e 100644
 --- a/src/arch/x86/smp/ipi.c
 +++ b/src/arch/x86/smp/ipi.c
-@@ -45,6 +45,9 @@ void handleRemoteCall(IpiRemoteCall_t call, word_t arg0, word_t arg1, word_t arg
-         case IpiRemoteCall_ClearCurrentVCPU:
-             clearCurrentVCPU();
-             break;
-+        case IpiRemoteCall_InvalidateEPT:
-+            invalidateLocalEPT((ept_pml4e_t *)arg0);
-+            break;
-         case IpiRemoteCall_VMCheckBoundNotification: {
-             tcb_t *tcb = (tcb_t *)arg0;
+@@ -36,6 +36,9 @@ void arch_handleRemoteCall(IpiRemoteCall_t call, word_t arg0, word_t arg1, word_
+     case IpiRemoteCall_ClearCurrentVCPU:
+         clearCurrentVCPU();
+         break;
++    case IpiRemoteCall_InvalidateEPT:
++        invalidateLocalEPT((ept_pml4e_t *)arg0);
++        break;
+     case IpiRemoteCall_VMCheckBoundNotification: {
+         tcb_t *tcb = (tcb_t *)arg0;
  
 diff --git a/src/kernel/thread.c b/src/kernel/thread.c
 index 06489d57d..a854dc793 100644
@@ -2334,5 +2334,5 @@ index f3f7f1172..001243e17 100644
                      setThreadState(tcb, ThreadState_Running);
                      setRegister(tcb, badgeRegister, badge);
 -- 
-2.43.0
+2.47.3
 
