@@ -102,9 +102,18 @@ assert int(regs[value('RSP')]) == 0x7f0000000007, 'entry lost RSP'
 assert value('$cr3') != user_cr3, 'entry retained user page tables'
 assert bytes(inf.read_memory(scratch, 8)) == bytes(8), 'entry left scratch'
 # Stop immediately before SYSRET, after the user CR3 and registers are restored.
-start = address('restore_user_context')
-insns = gdb.selected_frame().architecture().disassemble(start, count=400)
-sysret = next(i['addr'] for i in insns if i['asm'].startswith('sysret'))
+# restore_user_context may only call restore_user_context_internal, which
+# holds the SYSRET (and may lie below it): search that function's own range.
+try:
+    start = address('restore_user_context_internal')
+except gdb.error:
+    start = address('restore_user_context')
+block = gdb.block_for_pc(start)
+while block.function is None:
+    block = block.superblock
+insns = gdb.selected_frame().architecture().disassemble(block.start, block.end - 1)
+sysret = next((i['addr'] for i in insns if i['asm'].startswith('sysret')), None)
+assert sysret is not None, f'no SYSRET in {{block.function}}'
 gdb.Breakpoint('*' + hex(sysret), type=gdb.BP_HARDWARE_BREAKPOINT, temporary=True)
 end
 continue
