@@ -13,6 +13,9 @@ grep -q 'owner netd' /tmp/pci || fail 'PCI NIC owner'
 grep -q 'owner memd' /tmp/pci || fail 'PCI balloon owner'
 grep -q 'owner firmware' /tmp/pci || fail 'PCI unclaimed xHCI owner'
 echo "PLATFORMTEST: PCI_JSON $(l4hctl pci --json)"
+if evidence=$(l4hctl attest evidence 2>/dev/null); then
+    echo "PLATFORMTEST: EVIDENCE $evidence"
+fi
 capacity=$(l4hctl disks | sed -n 's/^disk 0: .*sectors \([0-9]*\), attachments.*/\1/p')
 [ -n "$capacity" ] || fail 'host capacity'
 sectors=$(cat /sys/class/block/vda/size)

@@ -11,9 +11,10 @@
 # partition N takes /l4h/pN/dom0/initrd and /l4h/pN/l4h.conf
 # (tools/mkshim-grub.sh, DESIGN.md §11.4); the shim and its slot kernels
 # come from L4H_MKSHIM (default build/mkshim[-VARIANT], tools/build-mkshim.sh),
-# when built.  The partition is the
-# one the application was loaded from or, when GRUB cannot tell, the first
-# with /l4h/dom0/initrd (or /l4h/l4h.conf).
+# when built. By default, /EFI/L4H/grubenv on exactly one device selects
+# the partition using l4h_esp_uuid or l4h_esp_label. With no such file,
+# use the loading partition or, when GRUB cannot tell, the first with
+# /l4h/dom0/initrd (or /l4h/l4h.conf). Multiple selector files fail closed.
 # L4H_ESP_UUID or L4H_ESP_LABEL selects the partition explicitly instead.
 # With L4H_BOOT_ENV=/absolute/path/to/grubenv, that partition holds a shared
 # GRUB environment block. Its l4h_esp_uuid or l4h_esp_label selects the slot
