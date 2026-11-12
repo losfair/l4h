@@ -53,6 +53,12 @@ CONFIG_PROC_FS=y
 CONFIG_SYSFS=y
 CONFIG_TMPFS=y
 CONFIG_EXT4_FS=y
+# Multi-device data volumes and snapshots, including under lockdown.
+CONFIG_BTRFS_FS=y
+CONFIG_BTRFS_FS_POSIX_ACL=y
+# The RAID6 benchmark's timed loop waits for jiffies without polling
+# guest events, so it cannot finish on a single vCPU.
+# CONFIG_RAID6_PQ_BENCHMARK is not set
 # CONFIG_VT is not set
 CONFIG_MAGIC_SYSRQ=y
 CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y
@@ -349,6 +355,11 @@ CONFIG_USB_HID=y
 CONFIG_USB_SUPPORT=y
 CONFIG_USB=y
 CONFIG_USB_L4H=y
+# Export devices from the controller-owning VM and attach them in another
+# VM over USB/IP, without loading modules under lockdown.
+CONFIG_USBIP_CORE=y
+CONFIG_USBIP_HOST=y
+CONFIG_USBIP_VHCI_HCD=y
 CONFIG_SCSI=y
 CONFIG_BLK_DEV_SD=y
 CONFIG_USB_STORAGE=y
@@ -408,6 +419,9 @@ CONFIG_IP_NF_RAW=y
 CONFIG_IP_NF_TARGET_REJECT=y
 CONFIG_IP6_NF_IPTABLES=y
 CONFIG_IP6_NF_FILTER=y
+# Dual-stack k3s kube-proxy with legacy ip6tables.
+CONFIG_IP6_NF_NAT=y
+CONFIG_IP6_NF_TARGET_MASQUERADE=y
 CONFIG_IP6_NF_MANGLE=y
 CONFIG_IP6_NF_RAW=y
 CONFIG_IP6_NF_TARGET_REJECT=y
