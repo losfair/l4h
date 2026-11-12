@@ -2,8 +2,6 @@
 //! configuration-space fixtures. No configuration writes or MMIO reads.
 use std::cell::Cell;
 use l4h_abi as abi;
-use l4h_host as host;
-use host::fixed::ArrayVec;
 
 #[derive(Clone, Copy)]
 pub struct Device {
@@ -16,12 +14,12 @@ fn device() -> Device {
         class: 0x0c, subclass: 3, prog_if: 0x30, revision: 2 }
 }
 
-pub struct Pci { config: [u8; 256], reads: Cell<usize>, disabled: Cell<bool> }
+pub struct Pci { config: [u8; 256], reads: Cell<usize> }
 impl Pci {
     fn new(header: u8) -> Self {
         let mut config = [0; 256];
         config[0x0e] = header;
-        Self { config, reads: Cell::new(0), disabled: Cell::new(false) }
+        Self { config, reads: Cell::new(0) }
     }
     fn read32(&self, bus: u8, dev: u8, func: u8, off: u8) -> u32 {
         assert_eq!((bus, dev, func), (0xff, 0x1f, 7));
@@ -38,18 +36,32 @@ impl Pci {
     fn subsystem(&mut self, off: usize) {
         self.config[off..off + 4].copy_from_slice(&0x9876_abcd_u32.to_le_bytes());
     }
-    fn disable(&self, _: &Device) { self.disabled.set(true); }
 }
 include!(env!("L4H_PCI_IDENTITY_TEST_SRC"));
 
-macro_rules! log { ($($args:tt)*) => {} }
-type Nics = ArrayVec<Device, { host::net::MAX_NICS }>;
-type NicBars = ArrayVec<[Option<()>; 6], { host::net::MAX_NICS }>;
 mod netd {
     pub fn bdf(p: &super::Device) -> u32 { (p.bus as u32) << 8 | (p.dev as u32) << 3 | p.func as u32 }
-    pub fn carve(allow: &mut bool, _: &mut (), _: &super::Device, bars: &mut [Option<()>; 6]) -> bool {
-        if *allow { bars[0] = Some(()); }
-        *allow
+}
+/// The NICs root found (their BDFs and pins), and the owner each reports.
+mod nicd {
+    use super::*;
+    pub struct Ids;
+    pub fn ids_of(_: &Device, _: &Pci) -> Ids { Ids }
+    pub type Pin = Option<Option<&'static str>>;
+    pub fn found(d: Device, _: Ids, pin: Pin, _: &Pci) -> bool {
+        FOUND.lock().unwrap().push((netd::bdf(&d) as u16, pin));
+        true
+    }
+    pub static FOUND: std::sync::Mutex<Vec<(u16, Pin)>> = std::sync::Mutex::new(Vec::new());
+    pub fn pci_owner(bdf: u16) -> Option<u16> {
+        (bdf == 24).then_some(abi::PCI_OWNER_NICD)
+    }
+}
+/// l4h.conf: NIC pins by BDF.
+struct Cfg { pin: Option<(u32, Option<&'static str>)> }
+impl Cfg {
+    fn nic_pin(&self, bdf: u32) -> nicd::Pin {
+        self.pin.filter(|&(b, _)| b == bdf).map(|(_, d)| d)
     }
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -71,7 +83,7 @@ fn disk_owner_queries_report_boot_failures_and_later_quarantine() {
     let row = |bdf, owner| abi::CtlPci { bdf, owner, ..Default::default() };
     let mut h = Host {
         pci_inventory: vec![row(8, abi::PCI_OWNER_BLKD), row(16, abi::PCI_OWNER_BLKD),
-            row(24, abi::PCI_OWNER_NETD), row(u16::MAX, abi::PCI_OWNER_NONE)],
+            row(24, abi::PCI_OWNER_ROOT), row(u16::MAX, abi::PCI_OWNER_NONE)],
         ctrls: vec![DiskCtrl { pci: Device { bus: 0, dev: 1, func: 0, ..device() }, failed: false },
             DiskCtrl { pci: Device { bus: 0, dev: 2, func: 0, ..device() }, failed: true }],
     };
@@ -86,7 +98,7 @@ fn disk_owner_queries_report_boot_failures_and_later_quarantine() {
     // still listed, and its failure does not change controller 0's owner.
     let entries = read(&mut h, 0);
     assert_eq!(entries.iter().map(|p| p.owner).collect::<Vec<_>>(),
-        [abi::PCI_OWNER_BLKD, abi::PCI_OWNER_ROOT, abi::PCI_OWNER_NETD, abi::PCI_OWNER_NONE]);
+        [abi::PCI_OWNER_BLKD, abi::PCI_OWNER_ROOT, abi::PCI_OWNER_NICD, abi::PCI_OWNER_NONE]);
     // A later reset, bad reply or drain failure sets the same sticky
     // Controller::failed flag. Re-query the original boot snapshot.
     h.ctrls[0].failed = true;
@@ -111,21 +123,16 @@ fn failed_usb_controllers_belong_to_root_even_when_the_driver_remains() {
 }
 
 #[test]
-fn disabled_nics_belong_to_root_until_a_driver_can_take_them() {
+fn nics_belong_to_root_until_their_nicd_takes_them() {
     let pci = Pci::new(0);
-    let (mut nics, mut bars) = (Nics::new(), NicBars::new());
-    // BAR carving failed: root disabled it, but netd never got it.
-    assert_eq!(record_nic(device(), &pci, &mut nics, &mut bars, &mut false, &mut ()).owner, abi::PCI_OWNER_ROOT);
-    assert!(pci.disabled.get());
-    assert!(nics.is_empty() && bars.is_empty());
-    for _ in 0..host::net::MAX_NICS {
-        assert_eq!(record_nic(device(), &pci, &mut nics, &mut bars, &mut true, &mut ()).owner, abi::PCI_OWNER_NETD);
+    // Every NIC found is root's (bound, and its nicd started, once the
+    // host is up), with its pin from l4h.conf.
+    for (pin, want) in [(None, None), (Some((0xffff, Some("e1000e"))), Some(Some("e1000e"))),
+        (Some((0xffff, None)), Some(None)), (Some((8, Some("ixgbe"))), None)] {
+        nicd::FOUND.lock().unwrap().clear();
+        assert_eq!(record_nic(device(), &pci, &Cfg { pin }).owner, abi::PCI_OWNER_ROOT);
+        assert_eq!(*nicd::FOUND.lock().unwrap(), [(0xffff, want)]);
     }
-    pci.disabled.set(false);
-    // netd is full: the next NIC is disabled and retained by root.
-    assert_eq!(record_nic(device(), &pci, &mut nics, &mut bars, &mut true, &mut ()).owner, abi::PCI_OWNER_ROOT);
-    assert!(pci.disabled.get());
-    assert_eq!((nics.len(), bars.len()), (host::net::MAX_NICS, host::net::MAX_NICS));
 }
 
 #[test]

@@ -2490,8 +2490,10 @@ root restarts. Root and netd know no device kind. The design is issue
   device without ACS. Binding refuses a driver that would share a confined
   NIC's group, and every start checks again. A virtio NIC's driver is never
   confined: the device takes the IOMMU path only if the driver negotiates
-  `ACCESS_PLATFORM`, which the driver, the untrusted party, decides. A
-  multikernel partition sees
+  `ACCESS_PLATFORM`, which the driver, the untrusted party, decides.
+  Root tells a virtio device by the device (a virtio PCI id, or virtio 1.x
+  structures under any vendor's), not by the driver's manifest, which a
+  driver dom0 loaded writes itself. A multikernel partition sees
   neither the bridges nor the other partitions' functions, so none of its
   NICs is confined. Elsewhere a driver is
   TCB code, and only the measured boot bundle's may run (Wi-Fi drivers

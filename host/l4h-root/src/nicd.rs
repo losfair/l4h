@@ -430,6 +430,14 @@ fn group_of(_h: &Host, d: pci::Device) -> ArrayVec<u16, 64> {
     g
 }
 
+/// A virtio device, whose DMA its driver may take past the IOMMU (by not
+/// negotiating ACCESS_PLATFORM): a virtio PCI id (transitional 0x1000..,
+/// modern 0x1040..0x107f), or virtio 1.x structures under any vendor's id
+/// (hardware virtio, as vDPA NICs).
+fn is_virtio(d: &pci::Device) -> bool {
+    (d.vendor == 0x1af4 && (0x1000..=0x107f).contains(&d.device)) || is_modern_virtio(d)
+}
+
 /// Whether NIC `i` would be confined bound to `driver`: an IOMMU with
 /// interrupt remapping, and every other function of its group unused by
 /// the host or a NIC of the same driver.
@@ -446,11 +454,13 @@ fn confined(h: &Host, i: usize, driver: usize) -> bool {
     // A virtio device's DMA goes through the IOMMU only if its driver
     // negotiates ACCESS_PLATFORM (a legacy one's never does), and the
     // driver is what is not trusted: its own choice could bypass the
-    // IOMMU, so a virtio NIC's driver is never confined.
-    if drivers().drivers[driver].manifest.flags & nicd::F_VIRTIO != 0 {
+    // IOMMU, so a virtio NIC's driver is never confined.  The device
+    // says what it is, not the driver's manifest: a driver dom0 loaded
+    // could match a virtio device without F_VIRTIO.
+    let n = &nics()[i];
+    if is_virtio(&n.pci) || drivers().drivers[driver].manifest.flags & nicd::F_VIRTIO != 0 {
         return false;
     }
-    let n = &nics()[i];
     // A device behind no IOMMU unit gets no domain: its DMA is
     // untranslated.
     if !matches!(n.dom, Some(d) if d != Domain::None) {

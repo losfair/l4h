@@ -172,6 +172,7 @@ static VECTORS_USED: [core::sync::atomic::AtomicU64; 2] = {
 };
 
 const fn reserved_vectors() -> u128 {
+    #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
     let mut used = !0u128 << VECTORS;
     #[cfg(target_arch = "x86_64")]
     {
