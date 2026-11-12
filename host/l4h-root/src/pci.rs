@@ -6,6 +6,14 @@ use sel4::cap_type;
 use sel4::init_thread::slot;
 
 use crate::mem::Alloc;
+use l4h_abi as abi;
+use l4h_host::fixed::{ArrayVec, StaticCell};
+
+/// One small record per possible BDF, in .bss rather than on root's
+/// stack. Kept at boot: serving the inventory must never probe BARs or
+/// touch a device that a driver is now using.
+pub type Inventory = ArrayVec<abi::CtlPci, 65536>;
+pub static INVENTORY: StaticCell<Inventory> = StaticCell::new(ArrayVec::new());
 
 #[cfg(target_arch = "x86_64")]
 const CONFIG_ADDRESS: u16 = 0xcf8;
@@ -246,6 +254,47 @@ fn refused_write(bus: u8, dev: u8, func: u8) {
 pub fn ours(bdf: u16) -> bool {
     crate::partition::get().is_none()
         || ECAM_WRITABLE[bdf as usize / 64].load(core::sync::atomic::Ordering::Relaxed) & (1 << (bdf % 64)) != 0
+}
+
+impl Pci {
+    /// Identity only, before the device is handed to a driver. PCI and
+    /// CardBus headers carry subsystem IDs at different offsets. Bridges
+    /// may carry them in the optional subsystem-ID capability instead.
+    pub fn identity(&self, d: &Device) -> abi::CtlPci {
+        let (bus, dev, func) = (d.bus, d.dev, d.func);
+        let subsystem = match self.read8(bus, dev, func, 0x0e) & 0x7f {
+            0 => self.read32(bus, dev, func, 0x2c),
+            2 => self.read32(bus, dev, func, 0x40),
+            1 => {
+                let mut id = 0;
+                if self.read16(bus, dev, func, 6) & 0x10 != 0 {
+                    let mut off = self.read8(bus, dev, func, 0x34) & !3;
+                    for _ in 0..48 {
+                        if off < 0x40 { break; }
+                        if self.read8(bus, dev, func, off) == 0x0d && off <= 0xf8 {
+                            id = self.read32(bus, dev, func, off + 4);
+                            break;
+                        }
+                        off = self.read8(bus, dev, func, off + 1) & !3;
+                    }
+                }
+                id
+            }
+            _ => 0,
+        };
+        abi::CtlPci {
+            bdf: (bus as u16) << 8 | (dev as u16) << 3 | func as u16,
+            vendor: d.vendor,
+            device: d.device,
+            subsystem_vendor: subsystem as u16,
+            subsystem_device: (subsystem >> 16) as u16,
+            class: d.class,
+            subclass: d.subclass,
+            prog_if: d.prog_if,
+            revision: d.revision,
+            owner: abi::PCI_OWNER_NONE,
+        }
+    }
 }
 
 #[cfg(target_arch = "x86_64")]

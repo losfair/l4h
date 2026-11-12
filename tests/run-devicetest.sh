@@ -40,6 +40,8 @@ def method(source, signature):
 def function(source, signature):
     start = source.index(signature)
     return source[start:source.index('\n}', start) + len('\n}')]
+pci = (root / 'host/l4h-root/src/pci.rs').read_text()
+(out / 'pci-identity.inc').write_text('impl Pci {\n' + method(pci, '    pub fn identity(') + '\n}\n')
 (out / 'usb-recovery.inc').write_text('impl Usbd {\n' + '\n'.join(
     method(usbd, sig) for sig in ['    fn recover_command(', '    fn set_deq(', '    fn cancel(', '    fn recover_all(']) + '\n}\n')
 netd = (root / 'host/l4h-netd/src/main.rs').read_text()
@@ -110,6 +112,9 @@ rustc +stable --edition=2024 --crate-name l4h_abi --crate-type rlib \
 rustc +stable --edition=2024 --crate-name l4h_host --crate-type rlib \
     --extern l4h_abi="$out/libl4h_abi.rlib" \
     "$root/host/l4h-host/src/lib.rs" -o "$out/libl4h_host.rlib"
+L4H_PCI_IDENTITY_TEST_SRC="$out/pci-identity.inc" rustc +stable --edition=2024 --test \
+    --extern l4h_abi="$out/libl4h_abi.rlib" "$root/tests/pci-identity.rs" -o "$out/pci-identity-tests"
+"$out/pci-identity-tests"
 rustc +stable --edition=2024 --test -L dependency="$out" \
     --extern l4h_host="$out/libl4h_host.rlib" "$root/tests/mailbox.rs" -o "$out/mailbox-tests"
 "$out/mailbox-tests"

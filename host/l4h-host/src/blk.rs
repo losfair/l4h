@@ -270,7 +270,9 @@ impl DiskWindow {
             && start.checked_add(sectors)? <= capacity).then_some(Self { start, sectors })
     }
 
-    /// Explicit partition ranges, in 512-byte sectors: start:count,... .
+    /// Explicit ranges in 512-byte sectors: start:count, start:end or
+    /// start:end-N (leave N sectors at the end). Resolve against this
+    /// boot's capacity, with checked arithmetic and no rounding.
     /// Invalid input never expands a range to the rest of the disk.
     pub fn parse_list<const N: usize>(text: &str, capacity: u64) -> Option<([Self; N], usize)> {
         let mut windows = [Self { start: 0, sectors: 0 }; N];
@@ -279,7 +281,12 @@ impl DiskWindow {
             if len == N { return None; }
             let (start, sectors) = entry.split_once(':')?;
             let start = start.parse::<u64>().ok()?;
-            let sectors = sectors.parse::<u64>().ok()?;
+            let sectors = if sectors == "end" || sectors.starts_with("end-") {
+                let tail = if sectors == "end" { 0 } else { sectors[4..].parse::<u64>().ok()? };
+                capacity.checked_sub(tail)?.checked_sub(start)?
+            } else {
+                sectors.parse::<u64>().ok()?
+            };
             if sectors == 0 { return None; }
             let window = Self::new(start, sectors, capacity)?;
             if windows[..len].iter().any(|w| window.overlaps(*w)) { return None; }

@@ -660,6 +660,32 @@ enum l4h_ctl_op {
 	 * (another VM has it), -EIO (failed), -ENODEV (unsupported), -ENOSPC
 	 * (no device slot, or L4H_MAX_GUEST_USB already), -ENOMEM. */
 	L4H_CTL_USB_ATTACH = 41,
+	/* args: first BDF (bus << 8 | dev << 3 | func, inclusive) -> vals:
+	 * count; data: l4h_ctl_pci[count], in BDF order. Continue from the
+	 * last BDF + 1; count 0 ends the list. Read-only boot inventory of
+	 * every function root enumerated (this partition's, on multikernel).
+	 * No configuration-space accesses or BAR probing at query time. */
+	L4H_CTL_PCI_LIST = 42,
+};
+
+#define L4H_PCI_OWNER_NONE     0 /* no host service assigned */
+#define L4H_PCI_OWNER_BLKD     1
+#define L4H_PCI_OWNER_NETD     2
+#define L4H_PCI_OWNER_MEMD     3
+#define L4H_PCI_OWNER_USBD     4
+#define L4H_PCI_OWNER_FIRMWARE 5 /* xHCI not claimed by usbd */
+
+struct l4h_ctl_pci {
+	l4h_u16 bdf;
+	l4h_u16 vendor;
+	l4h_u16 device;
+	l4h_u16 subsystem_vendor; /* 0 when not supplied by this header */
+	l4h_u16 subsystem_device;
+	l4h_u8 class;
+	l4h_u8 subclass;
+	l4h_u8 prog_if;
+	l4h_u8 revision;
+	l4h_u16 owner;            /* L4H_PCI_OWNER_*; host service, not VM */
 };
 
 #define L4H_USB_STATE_FIRMWARE    0 /* not claimed: the firmware has it */

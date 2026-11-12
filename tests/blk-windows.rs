@@ -196,6 +196,37 @@ fn dom0_partition_windows_preserve_offsets_and_reject_unsafe_ranges() {
     assert_eq!(w[0].check_request(&req, pool(), 512, false), Err(STATUS_IOERR));
 }
 
+#[test]
+fn end_relative_windows_follow_capacity_and_keep_the_tail_outside() {
+    for capacity in [32768, 65536, 131072] {
+        for (suffix, tail) in [("end", 0), ("end-0", 0), ("end-2048", 2048)] {
+            let text = format!("2048:8192,16384:{suffix}");
+            let (w, len) = DiskWindow::parse_list::<4>(&text, capacity).unwrap();
+            assert_eq!(len, 2);
+            assert_eq!(w[0], DiskWindow { start: 2048, sectors: 8192 });
+            assert_eq!(w[1], DiskWindow { start: 16384, sectors: capacity - tail - 16384 });
+            let mut req = request();
+            req.sector = w[1].sectors - 8;
+            assert_eq!(w[1].check_request(&req, pool(), 4096, false), Ok(capacity - tail - 8));
+            req.sector += 8;
+            assert_eq!(w[1].check_request(&req, pool(), 4096, false), Err(STATUS_IOERR));
+        }
+    }
+}
+
+#[test]
+fn end_relative_windows_reject_bad_syntax_empty_unaligned_and_overlapping_ranges() {
+    for text in ["0:end-", "0:end--8", "0:ending", "0:end-8:8", "0:-8", "0:end-18446744073709551616",
+        "0:end-65537", "0:end-65536", "65536:end", "65544:end", "65528:end-8", "1:end", "8:end-1",
+        "0:end,8:8", "8:16,16:end", "8:end,16:end", "8:end-8,"] {
+        assert!(DiskWindow::parse_list::<4>(text, 65536).is_none(), "{text}");
+    }
+    assert!(DiskWindow::parse_list::<4>("8:end", 0).is_none());
+    assert!(DiskWindow::parse_list::<4>("8:end", u64::MAX).is_none());
+    assert!(DiskWindow::parse_list::<4>("8:end-8", 65537).is_none());
+    assert!(DiskWindow::parse_list::<1>("8:8,24:end-8", 65536).is_none());
+}
+
 // Who may use which sectors: blk::Reservations with the attached clients,
 // as blkd decides it.
 

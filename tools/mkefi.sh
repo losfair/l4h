@@ -14,6 +14,11 @@
 # when built.  The partition is the
 # one the application was loaded from or, when GRUB cannot tell, the first
 # with /l4h/dom0/initrd (or /l4h/l4h.conf).
+# L4H_ESP_UUID or L4H_ESP_LABEL selects the partition explicitly instead.
+# With L4H_BOOT_ENV=/absolute/path/to/grubenv, that partition holds a shared
+# GRUB environment block. Its l4h_esp_uuid or l4h_esp_label selects the slot
+# containing /l4h. Only the selected slot's l4h.conf is sourced or loaded;
+# an explicit selector that cannot be resolved stops boot.
 # Measured boot: the firmware measures this application, with everything
 # in it, into PCR 4; GRUB's tpm module measures what it reads (the files
 # above) into PCR 9 and its commands into PCR 8 (DESIGN.md §10.2).
@@ -38,6 +43,8 @@ guest_kernel=${L4H_GUEST_KERNEL:-$root/build/linux-l4h/vmlinux}
 guest_kmods=${L4H_GUEST_KMODS-$(dirname "$guest_kernel")/kmods.erofs}
 mkshim=${L4H_MKSHIM-$root/build/mkshim${L4H_KERNEL_VARIANT:+-$L4H_KERNEL_VARIANT}}
 source "$root/tools/mkshim-grub.sh"
+source "$root/tools/efi-boot-config.sh"
+boot_partition=$(efi_boot_partition)
 mk_stanza= mk_files=()
 if [ -n "$mkshim" ] && [ -f "$mkshim/l4h-mkshim.elf" ]; then
     mk_stanza=$(mkshim_grub "(memdisk)/boot/mk" "(memdisk)/boot/l4h-root.elf" "(memdisk)/boot/vmlinux" \
@@ -67,12 +74,8 @@ cat > "$work/grub.cfg" <<CFG
 set timeout=0
 serial_port=${L4H_SERIAL_PORT:-0x3f8}
 fb_console=${L4H_FB_CONSOLE:-0}
-# The partition this application was loaded from, when GRUB knows it
-# (\$cmdpath is empty under OVMF), else the first one with l4h's files.
-esp=
-regexp --set=1:esp '^\(([^)]*)\)' "\$cmdpath"
-if [ -z "\$esp" ]; then search --no-floppy --set=esp --file /l4h/dom0/initrd; fi
-if [ -z "\$esp" ]; then search --no-floppy --set=esp --file /l4h/l4h.conf; fi
+$boot_partition
+if [ "\$l4h_boot_ok" = 1 ]; then
 if [ -n "\$esp" ]; then
     if [ -f "(\$esp)/l4h/l4h.conf" ]; then source "(\$esp)/l4h/l4h.conf"; fi
 fi
@@ -93,6 +96,7 @@ $acpi_cmd
 # rejects the file and frees the buffer.
 if load_env --file (memdisk)/boot/vmlinux; then true; fi
 if [ -n "\$esp" ]; then
+true
 $mk_stanza
 fi
 multiboot2 (memdisk)/boot/kernel.elf console_port=\$serial_port debug_port=\$serial_port\$fbcon
@@ -105,6 +109,12 @@ if [ -n "\$esp" ]; then
 fi
 boot
 echo "l4h: boot failed"
+else
+    serial --port=\$serial_port --speed=115200
+    terminal_output serial console
+    echo "l4h: boot partition selection failed"
+    halt
+fi
 CFG
 # seL4 and root load only the segments: drop the debug information.
 objcopy --strip-debug "$rootserver" "$work/l4h-root.elf"
@@ -112,7 +122,7 @@ objcopy --strip-debug "$guest_kernel" "$work/vmlinux"
 memdisk=("boot/vmlinux=$work/vmlinux")
 [ -n "$guest_kmods" ] && memdisk+=("boot/kmods.erofs=$guest_kmods")
 grub-mkstandalone -O x86_64-efi -o "$out" --compress=xz \
-    --modules="part_gpt fat search search_fs_file multiboot2 serial terminal normal configfile test regexp echo loadenv efi_gop video video_fb tpm${acpi_cmd:+ acpi}" \
+    --modules="part_gpt fat search search_fs_file search_fs_uuid search_label multiboot2 serial terminal normal configfile test regexp echo loadenv halt efi_gop video video_fb tpm${acpi_cmd:+ acpi}" \
     --locales= --fonts= --themes= \
     "boot/grub/grub.cfg=$work/grub.cfg" \
     "boot/kernel.elf=$kernel" \

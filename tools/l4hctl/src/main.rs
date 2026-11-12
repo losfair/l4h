@@ -154,6 +154,7 @@ const USAGE: &str = "usage: l4hctl <command>
   rtc-set [UNIX_SECONDS]       set the machine RTC in UTC (default: dom0's
                                current time, e.g. after NTP synchronizes)
   disks                        host disks, owners, capacities and attachments
+  pci [--json]                 host PCI functions, IDs, class and service owner
   usb [--json]                 host xHCI controllers: ports, state (firmware
                                until a VM is given one, then idle or vm N)
   disk-zero DISK START SECTORS zero an unattached region
@@ -494,6 +495,27 @@ fn run(args: &[String]) -> Result<i32> {
                 };
                 let failed = if r.vals[2] != 0 { ", failed (quarantined)" } else { "" };
                 println!("disk {d}: pci {:02x}:{:02x}.{} {kind}, owner {owner}{failed}, sectors {}, attachments {}", bdf >> 8, (bdf >> 3) & 0x1f, bdf & 7, r.vals[4], r.vals[5]);
+            }
+        }
+        "pci" => {
+            let json = match &args[1..] {
+                [] => false,
+                [arg] if arg == "--json" => true,
+                _ => return err("pci [--json]"),
+            };
+            let list = ctl.pci_list()?;
+            if json {
+                let rows: Vec<String> = list.iter().map(|p| format!(
+                    "{{\"pci\":\"{:02x}:{:02x}.{}\",\"vendor\":{},\"device\":{},\"subsystem_vendor\":{},\"subsystem_device\":{},\"class\":{},\"subclass\":{},\"prog_if\":{},\"revision\":{},\"owner\":\"{}\"}}",
+                    p.bdf >> 8, (p.bdf >> 3) & 0x1f, p.bdf & 7, p.vendor, p.device, p.subsystem_vendor,
+                    p.subsystem_device, p.class, p.subclass, p.prog_if, p.revision, p.owner_name())).collect();
+                println!("[{}]", rows.join(","));
+            } else {
+                for p in list {
+                    println!("pci {:02x}:{:02x}.{} {:04x}:{:04x} subsystem {:04x}:{:04x} class {:02x}{:02x}{:02x} revision {:02x}, owner {}",
+                        p.bdf >> 8, (p.bdf >> 3) & 0x1f, p.bdf & 7, p.vendor, p.device, p.subsystem_vendor,
+                        p.subsystem_device, p.class, p.subclass, p.prog_if, p.revision, p.owner_name());
+                }
             }
         }
         "usb" => {

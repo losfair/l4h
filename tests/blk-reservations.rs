@@ -132,6 +132,29 @@ fn windows_beyond_a_small_disk_are_planned_and_reserved_not_fatal() {
 }
 
 #[test]
+fn end_relative_boot_ranges_are_finite_and_unresolved_ranges_stay_reserved() {
+    let text = "2048:8192,16384:end-2048";
+    for capacity in [32768, 65536, 131072] {
+        let (windows, len, fits) = dom0_windows::<4>(text, capacity).unwrap();
+        assert_eq!((len, fits), (2, true));
+        assert_eq!(windows[1], DiskWindow { start: 16384, sectors: capacity - 2048 - 16384 });
+        assert_eq!(dom0_plan_reservation(windows[1].start, windows[1].sectors, capacity), Some(windows[1]));
+    }
+    // Missing, too small or unaligned geometry: reserve the unresolved
+    // data area, but never attach it or turn its zero length into a whole
+    // disk. Other configured windows keep their device positions.
+    for capacity in [0, 8, 16384, 18432, 32769] {
+        let (windows, len, fits) = dom0_windows::<4>(text, capacity).unwrap();
+        assert_eq!((len, fits), (2, false));
+        assert_eq!(windows[1], DiskWindow { start: 16384, sectors: UNKNOWN_CAPACITY - 2048 - 16384 });
+        assert!(DiskWindow::new(windows[1].start, windows[1].sectors, capacity).is_none());
+        assert_eq!(dom0_plan_reservation(windows[1].start, windows[1].sectors, capacity), Some(windows[1]));
+        assert_eq!(windows[0], DiskWindow { start: 2048, sectors: 8192 });
+    }
+    assert!(dom0_windows::<4>("8:end,16:8", 65536).is_none());
+}
+
+#[test]
 fn only_dom0_claims_a_boot_range_and_only_as_it_was_reserved() {
     let r = reservation();
     let (disk, window) = (r.disk, r.window);
