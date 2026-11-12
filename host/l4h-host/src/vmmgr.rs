@@ -90,7 +90,7 @@ pub const CTL_DATA_VA: usize = 0x5100_0100_0000;
 /// vmmgr has taken that and the driver has answered).  A disk controller holds at
 /// most PENDING_PER_CTRL of them for requests blkd has not answered (EBUSY
 /// past that), so drivers that never answer leave tokens for the others.
-pub const MAX_PENDING: usize = 256;
+pub const MAX_PENDING: usize = 320;
 pub const PENDING_PER_CTRL: usize = 2;
 
 use crate::badges::vmmgr as recv;

@@ -116,8 +116,6 @@ struct Inst {
     ops: [Option<Op>; RING],
     /// Its notification, badged badges::nicd::TIMER, if it asked for one.
     timer: Option<cap::Notification>,
-    /// The DMA region: its bus address and size.
-    dma: (usize, usize),
     /// The control page (root's frame, which the nicd maps).
     ctl_page: cap::Granule,
     /// The answer to its last control message: its length.
@@ -128,6 +126,18 @@ struct Inst {
 
 /// The uplink channel: root's frames, kept from the first bind until
 /// reboot, mapped into netd once and into each nicd.
+/// A NIC's DMA region: root's, made at its first spawn and kept until
+/// reboot, mapped in the device's IOMMU domain for good.  A device that a
+/// restart could not reset may still use addresses its last driver gave
+/// it: they are in this region, which nothing else ever gets.
+#[derive(Clone, Copy)]
+struct DmaRegion {
+    frames: cap::CNode,
+    bits: usize,
+    paddr: usize,
+    size: usize,
+}
+
 struct Chan {
     frames: cap::CNode,
     bits: usize,
@@ -153,6 +163,7 @@ pub struct Nic {
     irq: Option<cap::IrqHandler>,
     io: Option<cap::Null>,
     chan: Option<Chan>,
+    dma: Option<DmaRegion>,
     inst: Option<Inst>,
     /// The MAC its first instance offered, which root checked: later
     /// instances must offer the same.
@@ -171,7 +182,8 @@ pub struct Nic {
     manual: bool,
     removing: bool,
     reset_until: u64,
-    /// The header dwords an FLR clears (SAVED), while it runs.
+    /// The header dwords an FLR clears (SAVED), as the firmware left them
+    /// at boot: what root restores after a reset, whatever a driver did.
     saved: [u32; 8],
     then: Then,
     /// Restarts in the hour since `window_start`; the backoff.
@@ -214,10 +226,13 @@ pub fn ids_of(d: &pci::Device, pci: &pci::Pci) -> Ids {
     }
 }
 
-/// Boot: list `d`, with decoding and bus mastering off until a driver
-/// starts.  False if there are MAX_NICS already.
+/// Boot: list `d`.  False if there are MAX_NICS already.
 pub fn found(d: pci::Device, ids: Ids, pin: Option<Option<&'static str>>, pci: &pci::Pci) -> bool {
-    pci.disable(&d);
+    // Off until its driver starts, if one will: one no driver takes, or
+    // that the configuration leaves to the firmware, stays as it is.
+    if pin != Some(None) && drivers().matching(&ids, |_| true).is_some() {
+        pci.disable(&d);
+    }
     let ns = nics();
     if ns.is_full() {
         log!("l4h-root: more than {} network devices, {:02x}:{:02x}.{} ignored", MAX_NICS, d.bus, d.dev, d.func);
@@ -237,6 +252,7 @@ pub fn found(d: pci::Device, ids: Ids, pin: Option<Option<&'static str>>, pci: &
         irq: None,
         io: None,
         chan: None,
+        dma: None,
         inst: None,
         mac: None,
         generation: 0,
@@ -246,7 +262,7 @@ pub fn found(d: pci::Device, ids: Ids, pin: Option<Option<&'static str>>, pci: &
         manual: false,
         removing: false,
         reset_until: 0,
-        saved: [0; 8],
+        saved: core::array::from_fn(|k| pci.read32(d.bus, d.dev, d.func, SAVED[k])),
         then: Then::Restart,
         restarts: 0,
         window_start: 0,
@@ -371,6 +387,16 @@ fn group_of(h: &Host, d: pci::Device) -> ArrayVec<u16, 64> {
             for &f in functions.iter().filter(|&&f| (sec..=sub).contains(&((f >> 8) as u8)) && header(f) & 0x7f == 0) {
                 add(&mut group, f);
             }
+            // A bridge of a multi-function device without ACS may route to
+            // its sibling functions' buses too.
+            if header(bridge) & 0x80 != 0 {
+                for &sib in functions.iter().filter(|&&f| f >> 3 == bridge >> 3 && f != bridge && header(f) & 0x7f == 1) {
+                    let (s2, e2) = buses(sib);
+                    for &f in functions.iter().filter(|&&f| s2 != 0 && (s2..=e2).contains(&((f >> 8) as u8)) && header(f) & 0x7f == 0) {
+                        add(&mut group, f);
+                    }
+                }
+            }
         }
         if (bridge >> 8) as u8 >= bus {
             break;
@@ -394,6 +420,11 @@ fn group_of(_h: &Host, d: pci::Device) -> ArrayVec<u16, 64> {
 fn confined(h: &Host, i: usize, driver: usize) -> bool {
     let [state, remap, ..] = h.iommu.info();
     if state != abi::IOMMU_ON || remap == 0 {
+        return false;
+    }
+    // A partition sees only its own functions, not the bridges and other
+    // partitions' functions its groups would need: none is confined.
+    if crate::partition::get().is_some() {
         return false;
     }
     let n = &nics()[i];
@@ -461,6 +492,19 @@ fn allowed(h: &Host, i: usize, d: usize) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Whether NIC `i` may run driver `d` without breaking another NIC's
+/// confinement: one confined (or that may run again, Failed with its
+/// driver kept) with this one in its group stays so only with the same
+/// driver here.
+fn group_free(i: usize, d: usize) -> Result<(), &'static str> {
+    let me = bdf(&nics()[i].pci) as u16;
+    if nics().iter().enumerate().any(|(j, o)| j != i && o.confined && o.driver.is_some_and(|od| od != d)
+        && o.state != State::Unbound && o.group.contains(&me)) {
+        return Err("another driver's NIC shares its isolation group, confined");
+    }
+    Ok(())
+}
+
 /// Bind NIC `i` to `driver`, or the first that matches, and start it.
 pub fn bind(h: &mut Host, i: usize, driver: Option<usize>) -> Result<(), &'static str> {
     nics().get(i).ok_or("no such NIC")?;
@@ -503,13 +547,7 @@ pub fn bind(h: &mut Host, i: usize, driver: Option<usize>) -> Result<(), &'stati
         }
     };
     allowed(h, i, d)?;
-    // Another NIC confined with this one in its group stays so only with
-    // the same driver here.
-    let me = bdf(&nics()[i].pci) as u16;
-    if nics().iter().enumerate().any(|(j, o)| j != i && o.confined && o.driver.is_some_and(|od| od != d)
-        && matches!(o.state, State::Starting | State::Up | State::Backoff | State::Stopping) && o.group.contains(&me)) {
-        return Err("another driver's NIC shares its isolation group, confined");
-    }
+    group_free(i, d)?;
     let n = &nics()[i];
     let m = drivers().drivers[d].manifest;
     let bars = bars_for(&n.pci, &m)?;
@@ -619,6 +657,28 @@ fn alloc_channel(h: &mut Host, i: usize, data_bits: u32) -> Result<(), &'static 
     h.netd.map_uplink(i, c.frames, c.bits, c.pages, &mut h.alloc).map_err(|_| "netd cannot map its channel")
 }
 
+/// Make NIC `i`'s DMA region, 2^bits bytes, and map it in its device's
+/// IOMMU domain, both for good (DmaRegion).
+fn alloc_dma(h: &mut Host, i: usize, bits: usize) -> Result<(), &'static str> {
+    let dom = nics()[i].dom.unwrap();
+    let r = h.alloc.global(|alloc| -> Option<DmaRegion> {
+        let slot = alloc.slots.alloc();
+        let Some(mut region) = alloc.split(bits, slot) else {
+            alloc.slots.free(slot);
+            return None;
+        };
+        let pages = (1usize << bits) / PAGE;
+        let cn_bits = keep_bits(pages);
+        let cn_slot = alloc.object(ObjectBlueprint::CNode { size_bits: cn_bits });
+        let frames = root_cap::<cap_type::CNode>(cn_slot);
+        region.retype(&FRAME_BP, pages, Dest { cnode: abs_of(frames), offset: 0 })?;
+        Some(DmaRegion { frames, bits: cn_bits, paddr: region.paddr, size: 1 << bits })
+    }).ok_or("no memory for its DMA region")?;
+    h.iommu.map(&mut h.alloc, dom, r.paddr, r.size, true);
+    nics()[i].dma = Some(r);
+    Ok(())
+}
+
 /// Zero the channel's header and rings: a fresh channel for netd and the
 /// nicd (the data areas need not be: they hold only what both saw).
 fn reset_channel(h: &mut Host, i: usize) {
@@ -645,8 +705,12 @@ fn snapshot(pci: &pci::Pci, d: &pci::Device, page: *mut u8) {
 /// Start a new nicd for NIC `i`, bound already: its memory, its
 /// capabilities, then Start.
 fn spawn(h: &mut Host, i: usize) -> Result<(), &'static str> {
+    let d = nics()[i].driver.unwrap();
+    // What its group holds may have changed since the bind.
+    allowed(h, i, d)?;
+    group_free(i, d)?;
+    nics()[i].confined = confined(h, i, d);
     let n = &nics()[i];
-    let d = n.driver.unwrap();
     let m = drivers().drivers[d].manifest;
     let elf = drivers().drivers[d].elf;
     if n.chan.is_none() {
@@ -656,37 +720,31 @@ fn spawn(h: &mut Host, i: usize) -> Result<(), &'static str> {
     let dma_bits = m.dma_bits as usize;
     let dma = 1usize << dma_bits;
     let image = (1usize << m.image_max_bits) + m.firmware.iter().filter_map(|f| drivers().firmware(f)).map(|b| b.len()).sum::<usize>();
-    if !h.can_afford(dma + image + (4 << 20), 1, 1024) {
+    // The image, its keep CNode (a slot a page of every mapping) and page
+    // tables, a lot of each for the BAR windows.
+    let maps = bars_for(&nics()[i].pci, &m).map_or(0, |b| bar_pages(&windowed(&nics()[i].pci, &m), b)) + dma / PAGE;
+    if !h.can_afford(image + (4 << 20) + maps * 64 + maps / 512 * PAGE, 1, 1024) {
         return Err("no memory for it");
+    }
+    if nics()[i].dma.is_none() {
+        alloc_dma(h, i, dma_bits)?;
+    }
+    let dma_region = nics()[i].dma.unwrap();
+    if dma_region.size != dma {
+        return Err("its DMA region was made for a driver that wanted another size: reboot to change");
     }
     let n = &nics()[i];
     let pdev = n.pci;
     let bars = bars_for(&pdev, &m)?;
     let w = windowed(&pdev, &m);
     let (vector, msi_address, msi_data) = n.msi.unwrap();
-    let dom = n.dom.unwrap();
     let chan_bits = n.chan.as_ref().unwrap().data_bits;
 
     h.alloc.slots.track(slot_owner(i));
     let built = (|| -> Result<Inst, &'static str> {
         let mut arena = h.alloc.arena(image + (2 << 20)).ok_or("no memory for it")?;
-        // The DMA region: one Untyped, in the device's IOMMU domain only.
-        let dma_slot = h.alloc.slots.alloc();
-        let mut region = match h.alloc.split(dma_bits, dma_slot) {
-            Some(r) => r,
-            None => {
-                h.alloc.slots.free(dma_slot);
-                h.alloc.release(arena);
-                return Err("no memory for its DMA region");
-            }
-        };
-        let dma_paddr = region.paddr;
-        arena.own(dma_slot, dma_paddr, dma_bits);
+        let DmaRegion { frames: dma_cn, bits: dma_cn_bits, paddr: dma_paddr, .. } = dma_region;
         let dma_pages = dma / PAGE;
-        let dma_cn_bits = keep_bits(dma_pages);
-        let dma_cn = arena.object_cap::<cap_type::CNode>(&mut h.alloc, ObjectBlueprint::CNode { size_bits: dma_cn_bits });
-        region.retype(&FRAME_BP, dma_pages, Dest { cnode: abs_of(dma_cn), offset: 0 }).expect("nicd DMA frames");
-        h.iommu.map(&mut h.alloc, dom, dma_paddr, dma, true);
 
         // Its configuration.
         let none = host::blk::PciRegion { va: 0, len: 0 };
@@ -849,7 +907,7 @@ fn spawn(h: &mut Host, i: usize) -> Result<(), &'static str> {
             component::mint_edge(&abs_of(t), &wiring::ROOT_NICD_TIMER, 0, &comp.obj()).expect("nicd timer");
             t
         });
-        Ok(Inst { comp, arena, mailbox, ops: [None; RING], timer, dma: (dma_paddr, dma), ctl_page, ctl_len: 0, cfg_seq: 0 })
+        Ok(Inst { comp, arena, mailbox, ops: [None; RING], timer, ctl_page, ctl_len: 0, cfg_seq: 0 })
     })();
     h.alloc.slots.untrack();
     let mut inst = match built {
@@ -865,9 +923,11 @@ fn spawn(h: &mut Host, i: usize) -> Result<(), &'static str> {
     }
     // netd takes the fresh channel (it may already have been the uplink's).
     let n = &mut nics()[i];
-    n.generation = n.generation.wrapping_add(1);
     n.add_pending = h.netd.add_uplink(i, chan_bits).is_err();
     n.in_netd = !n.add_pending;
+    if n.in_netd {
+        n.generation = n.generation.wrapping_add(1);
+    }
     // The device: decoding and bus mastering on, MSI-X on.
     if legacy_of(&pdev, &m) {
         h.pci.enable_io(&pdev);
@@ -942,13 +1002,8 @@ fn kill(h: &mut Host, i: usize, then: Then, why: &'static str) {
     if let Some(irq) = n.irq {
         let _ = irq.irq_handler_clear();
     }
-    // Save what the reset clears.
-    let saved: [u32; 8] = core::array::from_fn(|k| h.pci.read32(p.bus, p.dev, p.func, SAVED[k]));
+    // Restored from root's boot record once it is over (`progress`).
     n.reset_until = flr(h, &p);
-    if n.reset_until != 0 {
-        // Restored once it is over (`progress`): kept in the BARs' place.
-        n.saved = saved;
-    }
     n.then = then;
     n.why = why;
     n.state = State::Stopping;
@@ -989,8 +1044,9 @@ fn progress(h: &mut Host, i: usize) {
         destroy(h, i, inst);
     }
     let n = &mut nics()[i];
+    let manual = core::mem::take(&mut n.manual);
     match n.then {
-        Then::Restart if core::mem::take(&mut n.manual) => {
+        Then::Restart if manual => {
             n.retry_at = 0;
             n.state = State::Backoff;
         }
@@ -1031,10 +1087,7 @@ fn progress(h: &mut Host, i: usize) {
 /// read back, or never on).
 fn destroy(h: &mut Host, i: usize, inst: Inst) {
     let _ = inst.comp.tcb.tcb_suspend();
-    let (pa, len) = inst.dma;
-    if let Some(dom) = nics()[i].dom {
-        h.iommu.unmap(dom, pa, len);
-    }
+    // The DMA region stays the NIC's, mapped (DmaRegion).
     for k in 0..RING {
         if let Some(Op::Ctl(t)) = inst.ops[k] {
             crate::vmmgr::op_done(h, t, Err(ctl::EIO));
@@ -1147,6 +1200,7 @@ pub fn tick(h: &mut Host) {
                         let n = &mut nics()[i];
                         n.add_pending = false;
                         n.in_netd = true;
+                        n.generation = n.generation.wrapping_add(1);
                     }
                 }
                 let n = &nics()[i];
@@ -1215,7 +1269,9 @@ pub fn fail_unready(h: &mut Host) {
 
 /// NIC `i`'s MAC, once up: what root checked.
 pub fn mac(i: usize) -> Option<u64> {
-    nics().get(i).filter(|n| n.state == State::Up).and(nics().get(i)?.mac)
+    // Later instances must offer the same (check_uplink): it stays the
+    // NIC's while its driver restarts.
+    nics().get(i).filter(|n| n.driver.is_some()).and_then(|n| n.mac)
 }
 
 // ---------------------------------------------------------------------
@@ -1223,9 +1279,10 @@ pub fn mac(i: usize) -> Option<u64> {
 
 /// The bits of its dword a write of `size` bytes at `off` of NIC `i`'s
 /// function may change, by root's filter: inside the manifest's windows,
-/// past the header, and in no capability but a vendor-specific one, AER,
-/// LTR, L1 PM substates, or PCI Express's Device Control relaxed ordering
-/// and no-snoop bits and Link Control's ASPM bits.  None if it may change
+/// past the header, and in no capability but a vendor-specific one (not
+/// virtio's), AER's status registers, LTR, L1 PM substates, or PCI
+/// Express's Device Control relaxed ordering and no-snoop bits and Link
+/// Control's ASPM bits.  None if it may change
 /// nothing.
 fn write_allowed(h: &Host, n: &Nic, m: &Manifest, off: u16, size: u16) -> Option<u32> {
     let end = off + size;
@@ -1255,7 +1312,9 @@ fn write_allowed(h: &Host, n: &Nic, m: &Manifest, off: u16, size: u16) -> Option
             continue;
         }
         match id {
-            0x09 => {}
+            // Vendor-specific, but virtio's: one of those (PCI_CFG) reaches
+            // the whole of a BAR, past the driver's window.
+            0x09 if d.vendor != 0x1af4 => {}
             0x10 => {
                 // Device Control's relaxed ordering (4) and no snoop (11),
                 // Link Control's ASPM (0..1); nothing else.
@@ -1281,10 +1340,15 @@ fn write_allowed(h: &Host, n: &Nic, m: &Manifest, off: u16, size: u16) -> Option
                 break;
             }
             let next = (w >> 20) as u16 & 0xffc;
-            let allowed = matches!(w & 0xffff, 0x01 | 0x0b | 0x18 | 0x1e);
             let len = if next > c { next - c } else { 4096 - c };
-            if !allowed && overlaps(c, len) {
-                return None;
+            if overlaps(c, len) {
+                match w & 0xffff {
+                    // AER: its status registers only (write 1 to clear);
+                    // not the masks or the severities.
+                    0x01 if dword == c + 4 || dword == c + 0x10 => {}
+                    0x0b | 0x18 | 0x1e => {}
+                    _ => return None,
+                }
             }
             if next < 0x100 || next <= c {
                 break;

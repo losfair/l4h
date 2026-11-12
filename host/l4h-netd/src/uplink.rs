@@ -155,7 +155,9 @@ impl Uplink {
     /// remain, netd asks the nicd to signal when it frees room.
     pub fn flush(&mut self, pool: &mut Pool) {
         let tx = self.chan.tx();
-        loop {
+        // A few looks: a nicd that flips its tail between full and free
+        // cannot hold netd here (it signals again when it frees room).
+        for _ in 0..4 {
             while let Some(f) = pool.front(&self.backlog) {
                 let Some(buf) = self.tx.reserve(&tx, f.len()) else { break };
                 f.copy_to(buf);
@@ -174,6 +176,9 @@ impl Uplink {
                 return;
             }
         }
+        // Room keeps appearing: come back on the nicd's next signal, or
+        // this uplink's next turn.
+        self.signal = true;
     }
 
     /// Forget the frames held (the uplink goes).

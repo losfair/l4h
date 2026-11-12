@@ -285,8 +285,6 @@ fn program_irq(h: &mut Host, i: usize, vector: u64, dom: Domain) {
 /// quarantines the controller (the handoff cannot be undone), and the
 /// guest that got it meanwhile sees no controller (no magic).
 fn claim(h: &mut Host, i: usize) -> Result<(), Errno> {
-    // Kept until reboot, as the controller's usbd is.
-    let Some(vector) = pci::vector_alloc() else { return Err(ctl::ENOSPC) };
     let (slots, scratch, page) = match caps(h, i) {
         Ok(caps) => caps,
         Err(e) if e == ctl::EBUSY => return Err(e),
@@ -313,6 +311,12 @@ fn claim(h: &mut Host, i: usize) -> Result<(), Errno> {
     };
     let dma_paddr = region.paddr;
     arena.own(dma_slot, dma_paddr, bits);
+    // Its vector, kept until reboot as the controller's usbd is: taken
+    // once nothing before it can fail (a failed claim is tried again).
+    let Some(vector) = pci::vector_alloc() else {
+        h.alloc.release(arena);
+        return Err(ctl::ENOSPC);
+    };
     let n_dma = dma / PAGE;
     let dma_cn = arena.object_cap::<cap_type::CNode>(&mut h.alloc, ObjectBlueprint::CNode { size_bits: bits - 12 });
     region.retype(&FRAME_BP, n_dma, Dest { cnode: abs_of(dma_cn), offset: 0 }).expect("usbd DMA frames");

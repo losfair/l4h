@@ -2456,26 +2456,34 @@ root restarts. Root and netd know no device kind. The design is issue
   channel; a control page; read-only copies of its firmware blobs; a
   mailbox. No PCI configuration capability, IRQControl, Untyped or
   endpoint to netd. Configuration writes go through root
-  (`Published::cfg_req`), inside the manifest's windows and never to the
-  header, MSI, MSI-X, power management, ACS, ATS, PRI, PASID, SR-IOV or the
-  PCI Express capability but Device Control's relaxed ordering and no-snoop
-  bits and Link Control's ASPM.
+  (`Published::cfg_req`), inside the manifest's windows, past the header,
+  and by an allow-list: vendor-specific capabilities (not virtio's, one of
+  which reaches a whole BAR), AER's status registers, LTR, L1 PM substates,
+  and in the PCI Express capability Device Control's relaxed ordering and
+  no-snoop bits and Link Control's ASPM bits; root merges the write into
+  the register's other bits.
 - **Confinement.** A nicd is outside the TCB (`confined` in `l4hctl nic
   list`) when the IOMMU is on with interrupt remapping and its device's
   isolation group holds only functions the host does not use or NICs of
   the same driver. The group follows Linux's: the functions below every
-  bridge on the path that does not isolate with ACS (§9.5), and the other
-  functions of a multi-function device without ACS. Elsewhere a driver is
+  bridge on the path that does not isolate with ACS (§9.5), those of its
+  multi-function siblings, and the other functions of a multi-function
+  device without ACS. Binding refuses a driver that would share a confined
+  NIC's group, and every start checks again. A multikernel partition sees
+  neither the bridges nor the other partitions' functions, so none of its
+  NICs is confined. Elsewhere a driver is
   TCB code, and only the measured boot bundle's may run (Wi-Fi drivers
   never), unless `nic_untrusted_without_iommu = 1`.
 - **Faults and restarts.** A nicd that faults, refuses its device, breaks
   its channel, has its offer refused or leaves a liveness ping unanswered
   for 5 s is stopped without waiting on it: suspended, bus mastering off
   and read back, an FLR if the function has one (its header restored
-  after), netd told to let go of the channel (RemoveUplink). Once both are
-  done, its memory is reclaimed and a new instance started after a backoff
+  after, from root's record of it at boot), netd told to let go of the
+  channel (RemoveUplink). Once both are done, its memory is reclaimed and a
+  new instance started after a backoff
   (1 s doubling to 60 s), at most `nic_max_restarts` (5) an hour. The
-  channel and the uplink's switch stay; a later instance must offer the
+  channel, the DMA region (in the device's IOMMU domain for good: a device
+  no reset stopped reaches only it) and the uplink's switch stay; a later instance must offer the
   same MAC, which root checks (unicast, unique) before dom0's uplink port
   takes it.
 - **Control API.** `l4hctl nic list|bind|unbind|restart|ctl` and `l4hctl

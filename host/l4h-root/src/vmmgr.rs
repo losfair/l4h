@@ -519,9 +519,11 @@ pub struct Op {
 
 pub type Ops = [Option<Op>; proto::MAX_PENDING];
 
-// Even if no blkd ever answers, as many tokens again are left for answers
-// vmmgr has yet to take.
-const _: () = assert!(2 * proto::PENDING_PER_CTRL * crate::pci::MAX_DISK_CTRLS <= proto::MAX_PENDING);
+// Even if no blkd or nicd ever answers, as many tokens again are left for
+// answers vmmgr has yet to take (a nicd's are keyed MAX_DISK_CTRLS + its
+// NIC, nicd.rs).
+const _: () = assert!(2 * proto::PENDING_PER_CTRL * (crate::pci::MAX_DISK_CTRLS + crate::nicd::MAX_NICS) <= proto::MAX_PENDING
+    && proto::MAX_PENDING % 64 == 0);
 
 /// A token for a request to controller `ctrl` to be answered later, for
 /// `guest` if any.  EBUSY if the controller has PENDING_PER_CTRL

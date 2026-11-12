@@ -95,6 +95,8 @@ pub struct Netd {
     /// removal may wait for room in the ring (backlog), with its zombie.
     held: u64,
     backlog: u64,
+    /// Uplink removals waiting for room in the ring (bit n: uplink n).
+    uplink_backlog: u32,
     zombies: [Option<usize>; net::MAX_PORTS],
     /// Each uplink's switch (nicd.rs numbers the uplinks).
     uplinks: [Option<u32>; net::MAX_UPLINKS],
@@ -167,6 +169,7 @@ pub fn spawn(alloc: &mut Alloc, win: &mut Window, asids: &mut AsidPools, info: &
         failed: false,
         held: 0,
         backlog: 0,
+        uplink_backlog: 0,
         zombies: [None; net::MAX_PORTS],
         uplinks: [None; net::MAX_UPLINKS],
         ports: [const { None }; net::MAX_PORTS],
@@ -305,20 +308,10 @@ impl Netd {
         if self.failed {
             return false;
         }
-        match self.mailbox.send(&Request::RemoveUplink { nic }) {
-            Some(k) => {
-                self.removals[k as usize % RING] = Some(Removal::Uplink(nic));
-                true
-            }
-            None => {
-                // A full ring: netd stopped taking commands, which a
-                // compromised netd might.  Fail it, so that it touches
-                // nothing.
-                log!("l4h-root: netd's mailbox is full: netd failed");
-                self.fail_inner();
-                false
-            }
-        }
+        // A full ring waits for room, as port removals do (`poll`).
+        self.uplink_backlog |= 1 << nic;
+        self.flush_backlog();
+        true
     }
 
     /// Uplink `nic`'s channel as netd published it: (UPLINK_* state, the
@@ -445,6 +438,12 @@ impl Netd {
     /// Post the removals that wait for room in the ring.  A failed netd
     /// keeps them for `poll`.
     fn flush_backlog(&mut self) {
+        while self.uplink_backlog != 0 && !self.failed {
+            let nic = self.uplink_backlog.trailing_zeros() as usize;
+            let Some(k) = self.mailbox.send(&Request::RemoveUplink { nic }) else { break };
+            self.removals[k as usize % RING] = Some(Removal::Uplink(nic));
+            self.uplink_backlog &= !(1 << nic);
+        }
         while self.backlog != 0 && !self.failed {
             let p = self.backlog.trailing_zeros() as usize;
             let Some(k) = self.mailbox.send(&Request::RemovePort { port: p }) else { break };
@@ -465,6 +464,11 @@ impl Netd {
                 Some(Removal::Uplink(nic)) => crate::nicd::netd_released(h, nic),
                 None => {}
             }
+        }
+        while h.netd.failed && h.netd.uplink_backlog != 0 {
+            let nic = h.netd.uplink_backlog.trailing_zeros() as usize;
+            h.netd.uplink_backlog &= !(1 << nic);
+            crate::nicd::netd_released(h, nic);
         }
         while h.netd.failed && h.netd.backlog != 0 {
             let p = h.netd.backlog.trailing_zeros() as usize;
