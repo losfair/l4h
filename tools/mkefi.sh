@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Build l4h as one UEFI application: a standalone GRUB whose memdisk holds
-# the seL4 kernel, l4h-root, the guest kernel that dom0 and every VM run
-# and its module tree (DESIGN.md §5.6).  dom0's initramfs and the settings
-# come from the EFI system partition the application was loaded from
-# (DESIGN.md §11):
+# Build l4h as one UEFI application: an EFI wrapper containing a standalone
+# GRUB whose memdisk holds the seL4 kernel, l4h-root, the guest kernel that
+# dom0 and every VM run and its module tree (DESIGN.md §5.6). dom0's
+# initramfs and settings come from the EFI system partition the application
+# was loaded from (DESIGN.md §11):
 #   /l4h/dom0/initrd    dom0's initramfs (optional)
 #   /l4h/l4h.conf       host and dom0 settings (optional; see the manual)
 # GRUB passes these to l4h-root as boot modules.  With /l4h/l4h-mk.conf
@@ -18,11 +18,12 @@
 # With L4H_BOOT_ENV=/absolute/path/to/grubenv, that partition holds a shared
 # GRUB environment block. Its l4h_esp_uuid or l4h_esp_label selects the slot
 # containing /l4h. Only the selected slot's l4h.conf is sourced or loaded;
-# an explicit selector that cannot be resolved returns to the caller for
-# A/B fallback, before any slot's files are read.
+# an explicit selector that cannot be resolved returns EFI_LOAD_ERROR to
+# the caller for A/B fallback, before any slot's files are read.
 # Measured boot: the firmware measures this application, with everything
-# in it, into PCR 4; GRUB's tpm module measures what it reads (the files
-# above) into PCR 9 and its commands into PCR 8 (DESIGN.md §10.2).
+# in it, and the child GRUB image into PCR 4; GRUB's tpm module measures
+# what it reads (the files above) into PCR 9 and its commands into PCR 8
+# (DESIGN.md §10.2).
 # L4H_KERNEL_VARIANT selects a built seL4 variant when kernel.elf is omitted.
 # Usage: mkefi.sh <out.efi> [l4h-root.elf] [kernel.elf]
 # L4H_GUEST_KERNEL is the guest kernel (default: build/linux-l4h/vmlinux)
@@ -122,10 +123,20 @@ objcopy --strip-debug "$rootserver" "$work/l4h-root.elf"
 objcopy --strip-debug "$guest_kernel" "$work/vmlinux"
 memdisk=("boot/vmlinux=$work/vmlinux")
 [ -n "$guest_kmods" ] && memdisk+=("boot/kmods.erofs=$guest_kmods")
-grub-mkstandalone -O x86_64-efi -o "$out" --compress=xz \
+grub-mkstandalone -O x86_64-efi -o "$work/grub.efi" --compress=xz \
     --modules="part_gpt fat search search_fs_file search_fs_uuid search_label multiboot2 serial terminal normal configfile test regexp echo loadenv efi_gop video video_fb tpm${acpi_cmd:+ acpi}" \
     --locales= --fonts= --themes= \
     "boot/grub/grub.cfg=$work/grub.cfg" \
     "boot/kernel.elf=$kernel" \
     "boot/l4h-root.elf=$work/l4h-root.elf" "${memdisk[@]}" "${acpi_files[@]}" "${mk_files[@]}"
+# GRUB's exit always returns success. The outer EFI image treats any
+# return from GRUB as a failed L4H boot, after GRUB has cleaned up its heap.
+cc -m64 -Os -Wall -Wextra -Werror -ffreestanding -fpie -fno-ident -mno-red-zone \
+    -fno-stack-protector -fno-asynchronous-unwind-tables -fno-unwind-tables \
+    -c "$root/boot/grub-efi-wrapper.c" -o "$work/wrapper.o"
+(cd "$work" && ld -r -b binary grub.efi -o payload.o \
+    && objcopy --rename-section .data=.payload,alloc,load,readonly,data,contents payload.o)
+ld -mi386pep --subsystem=10 --entry=efi_main --image-base=0 --enable-reloc-section \
+    --no-insert-timestamp --section-alignment=4096 --file-alignment=512 \
+    -o "$out" "$work/wrapper.o" "$work/payload.o"
 echo "$out: $(( $(stat -c %s "$out") >> 10 )) KiB"

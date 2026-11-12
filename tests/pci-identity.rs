@@ -59,7 +59,44 @@ fn ctrls() -> std::sync::MutexGuard<'static, Vec<Ctrl>> {
     static CTRLS: std::sync::Mutex<Vec<Ctrl>> = std::sync::Mutex::new(Vec::new());
     CTRLS.lock().unwrap()
 }
+struct DiskCtrl { pci: Device, failed: bool }
+struct Host { pci_inventory: Vec<abi::CtlPci>, ctrls: Vec<DiskCtrl> }
+mod usb {
+    pub fn pci_owner(bdf: u16) -> u16 { super::pci_owner(bdf) }
+}
 include!(env!("L4H_PCI_OWNERS_TEST_SRC"));
+
+#[test]
+fn disk_owner_queries_report_boot_failures_and_later_quarantine() {
+    let row = |bdf, owner| abi::CtlPci { bdf, owner, ..Default::default() };
+    let mut h = Host {
+        pci_inventory: vec![row(8, abi::PCI_OWNER_BLKD), row(16, abi::PCI_OWNER_BLKD),
+            row(24, abi::PCI_OWNER_NETD), row(u16::MAX, abi::PCI_OWNER_NONE)],
+        ctrls: vec![DiskCtrl { pci: Device { bus: 0, dev: 1, func: 0, ..device() }, failed: false },
+            DiskCtrl { pci: Device { bus: 0, dev: 2, func: 0, ..device() }, failed: true }],
+    };
+    let read = |h: &mut Host, first| {
+        let mut data = [0; abi::CTL_DATA_MAX];
+        let n = pci_page(h, first, &mut data);
+        (0..n).map(|i| unsafe {
+            std::ptr::read_unaligned(data.as_ptr().add(i * size_of::<abi::CtlPci>()).cast::<abi::CtlPci>())
+        }).collect::<Vec<_>>()
+    };
+    // Controller 1 failed before blkd could publish any disks. It is
+    // still listed, and its failure does not change controller 0's owner.
+    let entries = read(&mut h, 0);
+    assert_eq!(entries.iter().map(|p| p.owner).collect::<Vec<_>>(),
+        [abi::PCI_OWNER_BLKD, abi::PCI_OWNER_ROOT, abi::PCI_OWNER_NETD, abi::PCI_OWNER_NONE]);
+    // A later reset, bad reply or drain failure sets the same sticky
+    // Controller::failed flag. Re-query the original boot snapshot.
+    h.ctrls[0].failed = true;
+    assert_eq!(read(&mut h, 0)[0].owner, abi::PCI_OWNER_ROOT);
+    assert_eq!(h.pci_inventory[0].owner, abi::PCI_OWNER_BLKD);
+    assert_eq!(read(&mut h, 9).len(), 3);
+    assert_eq!(read(&mut h, u16::MAX as u64).len(), 1);
+    assert!(read(&mut h, u16::MAX as u64 + 1).is_empty());
+    assert!(read(&mut h, u64::MAX).is_empty());
+}
 
 #[test]
 fn failed_usb_controllers_belong_to_root_even_when_the_driver_remains() {

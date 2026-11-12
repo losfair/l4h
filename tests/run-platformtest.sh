@@ -47,7 +47,12 @@ search --no-floppy --set=bootpart --label 'L4H`BOOT'
 load_env --file "($bootpart)/EFI/L4H/frontenv" l4h_chain_uuid
 search --no-floppy --set=slot --fs-uuid "$l4h_chain_uuid"
 chainloader "($slot)/EFI/l4h.efi"
-boot
+# A failed image must return an error, including for native BootOrder
+# callers. GRUB propagates StartImage's EFI status through the boot command.
+if boot; then
+    echo 'PLATFORMTEST: successful EFI return'
+    halt
+fi
 echo 'PLATFORMTEST: fallback'
 search --no-floppy --set=fallback --fs-uuid 2222-2222
 chainloader "($fallback)/EFI/fallback.efi"
@@ -57,8 +62,14 @@ exit
 CFG
 grub-script-check "$out/front.cfg"
 grub-mkstandalone -O x86_64-efi -o "$out/front.efi" --compress=xz \
-    --modules='part_gpt fat search search_fs_uuid search_label loadenv chain serial terminal' \
+    --modules='part_gpt fat search search_fs_uuid search_label loadenv chain serial terminal halt' \
     --locales= --fonts= --themes= "boot/grub/grub.cfg=$out/front.cfg"
+# Positive control: upstream GRUB's bare exit really returns EFI_SUCCESS.
+# The front loader must reject that status, rather than call it a fallback.
+printf 'exit\n' > "$out/return-success.cfg"
+grub-mkstandalone -O x86_64-efi -o "$out/return-success.efi" --compress=xz \
+    --modules='normal minicmd' --locales= --fonts= --themes= \
+    "boot/grub/grub.cfg=$out/return-success.cfg"
 disk=$out/disk.raw
 rm -f "$disk"
 truncate -s 512M "$disk"
@@ -123,6 +134,12 @@ run() {
 import json, pathlib, re, sys
 log, expected, disk = sys.argv[1:]
 text = pathlib.Path(log).read_text(errors='replace')
+if expected == 'success':
+    assert 'PLATFORMTEST: successful EFI return' in text, text[-6000:]
+    assert 'PLATFORMTEST: fallback' not in text
+    print('exit-status-control: rejected EFI_SUCCESS: PASS')
+    sys.exit(0)
+assert 'PLATFORMTEST: successful EFI return' not in text
 if expected == 'fail':
     failure = text.index('l4h: boot partition selection failed')
     fallback = text.index('PLATFORMTEST: fallback')
@@ -185,4 +202,6 @@ run conflicting-selector fail 1111-1111 l4h_esp_uuid=1111-1111 conflict
 run option-as-selector fail 1111-1111 l4h_esp_uuid=--set=root
 run corrupt-env fail 1111-1111 l4h_esp_uuid=1111-1111 corrupt
 run missing-env fail 1111-1111 l4h_esp_uuid=1111-1111 missing
+mcopy -o -i "$slota" "$out/return-success.efi" ::/EFI/l4h.efi
+run exit-status-control success 1111-1111 ignored=1
 echo 'PLATFORMTEST: PASS'

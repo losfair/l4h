@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Exercise mkefi's generated configuration without building an EFI image."""
+"""Exercise mkefi's configuration and EFI wrapper without a full host build."""
 import os
 from pathlib import Path
 import shutil
+import struct
 import subprocess
 import tempfile
 import unittest
@@ -99,6 +100,43 @@ pathlib.Path(args[args.index('-o') + 1]).write_bytes(b'EFI fixture')
                          dict(L4H_ESP_UUID="a", L4H_BOOT_ENV="/grub\nenv")]:
             with self.subTest(settings=settings):
                 self.assertNotEqual(self.generate(**settings).returncode, 0)
+
+    def test_wrapper_status_device_path_and_cleanup(self):
+        binary = self.work / "efi-wrapper-test"
+        subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-mno-red-zone",
+                        str(ROOT / "tests/efi-wrapper.c"), "-o", str(binary)], check=True)
+        subprocess.run([str(binary)], check=True)
+
+    def test_wrapper_is_a_relocatable_efi_application(self):
+        self.assertEqual(self.generate().returncode, 0)
+        image = (self.work / 'out.efi').read_bytes()
+        self.assertEqual(image[:2], b'MZ')
+        pe, = struct.unpack_from('<I', image, 0x3c)
+        self.assertEqual(image[pe:pe + 4], b'PE\0\0')
+        machine, sections = struct.unpack_from('<HH', image, pe + 4)
+        self.assertEqual(machine, 0x8664)
+        optional_size, = struct.unpack_from('<H', image, pe + 20)
+        optional = pe + 24
+        self.assertEqual(struct.unpack_from('<H', image, optional)[0], 0x20b)
+        self.assertEqual(struct.unpack_from('<H', image, optional + 68)[0], 10)
+        entry, = struct.unpack_from('<I', image, optional + 16)
+        headers, = struct.unpack_from('<I', image, optional + 60)
+        reloc, reloc_size = struct.unpack_from('<II', image, optional + 152)
+        self.assertGreater(reloc_size, 0)
+        executable_entry = relocation_section = False
+        for i in range(sections):
+            name, size, addr, raw_size, raw, _, _, _, _, flags = struct.unpack_from(
+                '<8sIIIIIIHHI', image, optional + optional_size + i * 40)
+            # OVMF rejects sections at RVA 0 overlapping the PE headers,
+            # including a compiler's non-loadable .comment section.
+            self.assertGreaterEqual(addr, headers, name)
+            if raw_size:
+                self.assertGreaterEqual(raw, headers, name)
+                self.assertLessEqual(raw + raw_size, len(image), name)
+            executable_entry |= addr <= entry < addr + size and bool(flags & 0x20000000)
+            relocation_section |= addr <= reloc and reloc + reloc_size <= addr + size
+        self.assertTrue(executable_entry)
+        self.assertTrue(relocation_section)
 
 
 if __name__ == "__main__":

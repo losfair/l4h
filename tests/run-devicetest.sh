@@ -46,7 +46,20 @@ root_main = (root / 'host/l4h-root/src/main.rs').read_text()
 start = root_main.index('        } else if netd::is_uplink(&d) {') + len('        } else if netd::is_uplink(&d) {')
 end = root_main.index('        } else if usb::is_xhci(&d) {', start)
 usb = (root / 'host/l4h-root/src/usb.rs').read_text()
-(out / 'pci-owners.inc').write_text(function(usb, 'pub fn pci_owner(') + '''
+root_ctl = (root / 'host/l4h-root/src/ctl.rs').read_text()
+pci_start = root_ctl.index('        abi::CTL_PCI_LIST => {')
+pci_end = root_ctl.index('        abi::CTL_PARTITION_INFO => {', pci_start)
+(out / 'pci-owners.inc').write_text(function(usb, 'pub fn pci_owner(') + '\n'
+    + function(root_ctl, 'fn put_list<T: Copy>') + '''
+fn pci_page(h: &mut Host, first: u64, data: &mut [u8; abi::CTL_DATA_MAX]) -> usize {
+    let a = [first, 0, 0, 0, 0, 0];
+    let mut vals = [0; 6];
+    match abi::CTL_PCI_LIST {
+''' + root_ctl[pci_start:pci_end] + '''
+        _ => unreachable!(),
+    }
+    vals[0] as usize
+}
 fn record_nic(d: Device, pci: &Pci, nics: &mut Nics, nic_bars: &mut NicBars,
               mut alloc: &mut bool, mut devmem: &mut ()) -> abi::CtlPci {
     let mut entry = pci.identity(&d);

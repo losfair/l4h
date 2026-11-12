@@ -755,9 +755,10 @@ the same. There is no measured boot on BIOS (Section~\ref{sec:bios}).
 \section{dom0 on the EFI system partition}
 \label{sec:esp}
 
-l4h ships as one UEFI application, the same for every host: a standalone
-GRUB that carries the seL4 kernel, \texttt{l4h-root}, the guest kernel and
-its module tree (\cmd{tools/mkefi.sh OUT.efi}). It loads dom0's initramfs
+l4h ships as one UEFI application, the same for every host: an EFI wrapper
+containing a standalone GRUB that carries the seL4 kernel,
+\texttt{l4h-root}, the guest kernel and its module tree
+(\cmd{tools/mkefi.sh OUT.efi}). It loads dom0's initramfs
 and the settings from the EFI system partition it was booted from:
 \begin{lstlisting}
 EFI/BOOT/BOOTX64.EFI   the l4h application
@@ -790,8 +791,11 @@ select the partition containing \file{/l4h}. A front-stage GRUB can update
 it with \texttt{save\_env --file} before chainloading a slot. No slot's
 \file{l4h.conf} is read until selection finishes. A missing partition,
 unreadable block, or missing or conflicting selectors aborts this boot
-attempt and returns to the front loader or firmware boot manager so it
-can try a fallback entry.
+attempt and returns \texttt{EFI\_LOAD\_ERROR} to the front loader or
+firmware boot manager so it can try a fallback entry. The application
+uses a small EFI wrapper because GRUB 2.12's \texttt{exit} always returns
+success, even with a numeric argument. The wrapper loads the embedded
+GRUB as a child and converts any return into a failed boot attempt.
 Only the chosen slot's config and initramfs are read and measured; GRUB
 also measures the shared environment block into PCR~9. The selection
 also applies to \file{l4h-mk.conf} and its per-partition files.
@@ -1115,8 +1119,9 @@ with status 1 (Section~\ref{sec:errors}).
 including unhandled functions: BDF, vendor/device and subsystem IDs,
 class/subclass/programming interface, revision, and the assigned host
 service (\texttt{blkd}, \texttt{netd}, \texttt{memd}, \texttt{usbd},
-\texttt{firmware} for unclaimed xHCI, \texttt{root} for quarantined USB
-controllers or disabled NICs that could not be handed to netd, or
+\texttt{firmware} for unclaimed xHCI, \texttt{root} for failed or
+quarantined disk/USB controllers or disabled NICs that could not be
+handed to netd, or
 \texttt{none}).
 \cmd{l4hctl pci --json} returns the same inventory with numeric ID and
 class fields, for platform profiles and controller selection. Queries
@@ -1869,7 +1874,8 @@ interfaces of x86 PCs and servers:
 It works like this:
 \begin{itemize}
   \item the firmware measures the l4h application, with seL4, every
-        host component and the guest kernel in it, into PCR~4. GRUB
+        host component and the guest kernel in it, into PCR~4, then
+        extends PCR~4 again when loading the embedded GRUB image. GRUB
         measures dom0's initramfs and \file{l4h.conf} into PCR~9;
   \item at boot, the host generates a signing key and has the TPM quote it,
         together with the PCRs, using the TPM's attestation key (AK). That

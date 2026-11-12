@@ -3458,7 +3458,9 @@ BDF space, or 64 KiB for aarch64's 16 buses. Queries touch no PCI
 configuration registers or BARs and use a binary search to locate a page.
 The service owner is `none`, `blkd`, `netd`, `memd`, `firmware` (unclaimed
 xHCI), `usbd`, or `root` for disabled NICs that were not handed to netd
-and quarantined USB controllers. Guest assignment remains in the
+and failed or quarantined disk/USB controllers, including disk reset
+failures during boot. Disk and USB ownership is resolved from the current
+controller state on each query. Guest assignment remains in the
 disk/NIC/USB queries.
 Subsystem IDs come from an endpoint or CardBus header, or a bridge's
 optional subsystem-ID capability; absent IDs are zero. On a multikernel
@@ -3571,7 +3573,8 @@ The chain has four links.
 
 1. **Measured boot.** The firmware measures the UEFI application into PCR 4.
    The application holds seL4, `l4h-root` and every host component (§11),
-   so one digest covers the whole host. GRUB's `tpm` module measures dom0's
+   so one digest covers the whole host. Loading its child GRUB image
+   extends PCR 4 again. GRUB's `tpm` module measures dom0's
    kernel, initramfs and `l4h.conf` into PCR 9, and its commands into PCR 8.
    Secure Boot is not needed: nothing is checked at boot; the verifier
    checks afterwards. A BIOS boot measures none of this (BIOS GRUB has no
@@ -4203,11 +4206,12 @@ injects these failures in a host built with `L4H_TEST_INJECT=1`;
 
 ## 11. Boot and deployment
 
-- **UEFI.** UEFI → GRUB (EFI) → multiboot2. `tools/mkefi.sh` builds l4h as
-  one UEFI application: a standalone GRUB whose memdisk holds the seL4
-  kernel, `l4h-root` (with the service ELFs), the guest kernel and its
-  module tree (§5.6). GRUB loads dom0's initramfs and `l4h.conf` from the
-  EFI partition it was loaded from or, since `$cmdpath` is empty under OVMF,
+- **UEFI.** UEFI → EFI wrapper → GRUB (EFI) → multiboot2. `tools/mkefi.sh`
+  builds l4h as one UEFI application containing a standalone GRUB whose
+  memdisk holds the seL4 kernel, `l4h-root` (with the service ELFs), the
+  guest kernel and its module tree (§5.6). GRUB loads dom0's initramfs and
+  `l4h.conf` from the EFI partition it was loaded from or, since `$cmdpath`
+  is empty under OVMF,
   the first partition with `/l4h/dom0/initrd` (or else `/l4h/l4h.conf`)
   (§10.1). `L4H_ESP_UUID` or `L4H_ESP_LABEL` at application build time
   selects a partition explicitly, bypassing both guesses. With
@@ -4216,8 +4220,14 @@ injects these failures in a host built with `L4H_TEST_INJECT=1`;
   are imported, and exactly one must name the slot containing `/l4h`.
   Missing or ambiguous selectors, an unreadable environment block, or a
   failed explicit search abort this boot attempt before any slot's config
-  is sourced. The application exits to its caller, allowing a front
-  loader or firmware boot manager to try the other slot.
+  is sourced. The application returns `EFI_LOAD_ERROR` to its caller,
+  allowing a front loader or firmware boot manager to try the other slot.
+  GRUB 2.12's `exit` ignores arguments and returns success. A small outer
+  EFI wrapper (`boot/grub-efi-wrapper.c`) loads the standalone GRUB as a
+  child, preserving its device path. L4H boot never returns: any return
+  from GRUB is converted to `EFI_LOAD_ERROR`, after GRUB's normal cleanup
+  and unloading its image. Firmware measures both the wrapper (including
+  the embedded GRUB) and the child image into PCR 4.
   A front-stage GRUB can update this block and chainload the slot's
   application even when `$cmdpath` is empty. Only the selected slot's
   config and initramfs are read; the shared environment block is also

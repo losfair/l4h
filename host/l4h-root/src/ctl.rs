@@ -36,7 +36,9 @@ pub fn host_op(h: &mut Host, op: u32, a: &[u64; 6], data: &mut [u8; abi::CTL_DAT
             // inventory. Past 0xffff is an empty page, without narrowing.
             let start = h.pci_inventory.partition_point(|p| (p.bdf as u64) < a[0]);
             let entries = h.pci_inventory[start..].iter().copied().map(|mut p| {
-                if p.owner == abi::PCI_OWNER_FIRMWARE {
+                if p.owner == abi::PCI_OWNER_BLKD && h.ctrls.iter().any(|c| c.failed && crate::netd::bdf(&c.pci) == p.bdf as u32) {
+                    p.owner = abi::PCI_OWNER_ROOT;
+                } else if p.owner == abi::PCI_OWNER_FIRMWARE {
                     p.owner = crate::usb::pci_owner(p.bdf);
                 }
                 p
