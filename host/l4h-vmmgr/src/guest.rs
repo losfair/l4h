@@ -296,7 +296,8 @@ pub struct Guest {
     pub vmm_boosted: bool,
     /// Backoff after repeated priority abuse.
     pub vmm_guard: crate::sched::budget::BoostGuard,
-    /// Only throttle the VMM while a guest on its core can run.
+    /// Throttle a demoted VMM while a running guest is assigned to its core,
+    /// including when that guest blocks or waits for a budget refill.
     pub vmm_limited: bool,
     /// CPU cap per vCPU in percent of a core (0 = none).
     pub cpu_cap_pct: u32,

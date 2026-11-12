@@ -99,6 +99,39 @@ fn quiet_spin_cycles_back_off_instead_of_stalling_guests_every_other_sample() {
 }
 
 #[test]
+fn old_demotion_history_expires_after_a_minute_without_another_demotion() {
+    let p = budget::plan(5000, 0, 0, 500, Some(250));
+    let mut guard = budget::BoostGuard::default();
+    for wait in [1, 2, 4, 8, 16, 16] {
+        assert!(!guard.boost(true, PERIOD, PERIOD, PERIOD, true, PERIOD, p));
+        for _ in 1..wait*10 { assert!(!guard.boost(false, 0, 0, 0, false, PERIOD, p)); }
+        assert!(guard.boost(false, 0, 0, 0, false, PERIOD, p));
+    }
+    for _ in 0..600 { assert!(guard.boost(true, 0, 0, 0, false, PERIOD, p)); }
+    assert!(!guard.boost(true, PERIOD, PERIOD, PERIOD, true, PERIOD, p));
+    for _ in 0..9 { assert!(!guard.boost(false, 0, 0, 0, false, PERIOD, p)); }
+    assert!(guard.boost(false, 0, 0, 0, false, PERIOD, p), "an old guest should recover like a new one");
+}
+
+#[test]
+fn another_demotion_restarts_the_history_expiry_window() {
+    let p = budget::plan(5000, 0, 0, 500, Some(250));
+    let mut guard = budget::BoostGuard::default();
+    assert!(!guard.boost(true, PERIOD, PERIOD, PERIOD, true, PERIOD, p));
+    assert!(guard.boost(false, 0, 0, 0, false, 1_000_000, p));
+    assert!(guard.boost(true, 0, 0, 0, false, 59_900_000, p));
+    assert!(!guard.boost(true, PERIOD, PERIOD, PERIOD, true, PERIOD, p));
+    // The short quiet intervals never reach a boosted minute, even over
+    // a long-lived guest. They cannot reset the anti-cycling history.
+    for _ in 0..19 { assert!(!guard.boost(false, 0, 0, 0, false, PERIOD, p)); }
+    assert!(guard.boost(false, 0, 0, 0, false, PERIOD, p));
+    assert!(guard.boost(true, 0, 0, 0, false, 59_900_000, p));
+    assert!(!guard.boost(true, PERIOD, PERIOD, PERIOD, true, PERIOD, p));
+    for _ in 0..39 { assert!(!guard.boost(false, 0, 0, 0, false, PERIOD, p)); }
+    assert!(guard.boost(false, 0, 0, 0, false, PERIOD, p));
+}
+
+#[test]
 fn background_vmms_share_half_a_core_without_exceeding_guest_caps() {
     for peers in 1..=64 {
         for cap in 0..=100 {

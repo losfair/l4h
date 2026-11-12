@@ -149,7 +149,7 @@ fn main(info: &'static Info) -> ! {
     // tries to undo demotion, then yields long enough to regain its boost.
     if host::TEST_INJECT && matches!(option_env!("L4H_TEST_VMM_BUSY"), Some("1")) && cfg.guest_id == 1 {
         let tcb = cap::<cap_type::Tcb>(host::SLOT_TCB);
-        let mut end = l4h_rt::timeout_ms(8000);
+        let mut end = l4h_rt::timeout_ms(12000);
         let mut refused = false;
         while !end() {
             if !refused {

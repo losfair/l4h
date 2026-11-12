@@ -40,11 +40,13 @@ pub fn plan(timeslice: u64, min_period: u64, cap: u32, kernel_share: u32, vmm: O
 
 /// Boost recovery requires uninterrupted quiescence. Repeated offenders
 /// wait 1, 2, 4, 8, then 16 seconds, so quiet/spin cycles cannot regain a
-/// full-priority context every other 100 ms sample.
+/// full-priority context every other 100 ms sample. A minute spent boosted
+/// without another demotion clears that history; it is not a lifetime penalty.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BoostGuard {
     demotions: u8,
     quiet_us: u64,
+    boosted_us: u64,
 }
 
 impl BoostGuard {
@@ -58,10 +60,14 @@ impl BoostGuard {
             let crowded = core_vmm as u128 * 5 >= elapsed as u128 * 4;
             if contended && crowded && used > 0 && used == largest {
                 self.demotions = self.demotions.saturating_add(1);
+                self.boosted_us = 0;
                 return false;
             }
+            self.boosted_us = self.boosted_us.saturating_add(elapsed);
+            if self.boosted_us >= 60_000_000 { self.demotions = 0; }
             return true;
         }
+        self.boosted_us = 0;
         if used as u128 * old.vmm_period as u128 * 2 < old.vmm as u128 * elapsed as u128 {
             self.quiet_us = self.quiet_us.saturating_add(elapsed);
         } else {

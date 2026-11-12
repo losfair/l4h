@@ -42,6 +42,7 @@ mod kernel {
                 assert!(budget > 0 && budget <= period);
                 crate::MODEL.with_borrow_mut(|m| {
                     m.calls.push(sc.0);
+                    m.operations.push(('c', sc.0));
                     if m.fail_config == Some(sc.0) { return Err(()); }
                     m.limits.insert(sc.0, (self.0, budget, period, refills));
                     Ok(())
@@ -74,9 +75,10 @@ struct Model {
     fail_priority: Option<u64>,
     fail_config: Option<u64>,
     suspended: Vec<u64>,
+    operations: Vec<(char, u64)>,
 }
 thread_local! { static MODEL: RefCell<Model> = RefCell::new(Model { limits: BTreeMap::new(), used: BTreeMap::new(), ready: BTreeMap::new(), calls: Vec::new(),
-    priorities: BTreeMap::new(), priority_calls: Vec::new(), fail_priority: None, fail_config: None, suspended: Vec::new() }); }
+    priorities: BTreeMap::new(), priority_calls: Vec::new(), fail_priority: None, fail_config: None, suspended: Vec::new(), operations: Vec::new() }); }
 mod slot {
     pub struct Slot;
     pub const TCB: Slot = Slot;
@@ -103,8 +105,13 @@ mod guest {
     impl Guest {
         pub fn event_page(&self, v: usize) -> *mut Event { (&*self.events[v]) as *const Event as *mut Event }
         pub fn flush_tlb_bitmaps(&self) {}
+        pub fn start(&mut self) {
+            MODEL.with_borrow_mut(|m| m.operations.push(('s', self.id as u64)));
+            self.state = State::Running;
+        }
         pub fn stop(&mut self) {
             if let Some(vmm) = &self.vmm { vmm.tcb.tcb_suspend(); }
+            MODEL.with_borrow_mut(|m| m.operations.push(('x', self.id as u64)));
             self.state = State::Stopped;
         }
     }
@@ -114,7 +121,7 @@ struct Vmmgr { info: HostInfo, guests: Vec<Option<Guest>> }
 impl Vmmgr { fn guest(&self, id: usize) -> Option<&Guest> { self.guests.get(id)?.as_ref() } }
 fn manager() -> Vmmgr {
     MODEL.with_borrow_mut(|m| { m.limits.clear(); m.used.clear(); m.ready.clear(); m.calls.clear(); m.priorities.clear();
-        m.priority_calls.clear(); m.fail_priority = None; m.fail_config = None; m.suspended.clear(); });
+        m.priority_calls.clear(); m.fail_priority = None; m.fail_config = None; m.suspended.clear(); m.operations.clear(); });
     Vmmgr { info: HostInfo { timeslice_us: 5000, tsc_hz: 1_000_000, cores: 1, topology: topology::Topology::flat(1) },
         guests: (0..MAX_GUESTS).map(|_| None).collect() }
 }
@@ -127,7 +134,7 @@ fn create(id: usize, core: usize, cap: u32, vcpus: usize) -> Guest {
         vmm_guard: Default::default(), vmm_limited: false,
         events: (0..vcpus).map(|_| Box::new(Event { idle_ticks: 0, steal_ns: 0 })).collect() }
 }
-fn spawn(h: &mut Vmmgr, id: usize, core: usize, cap: u32, vcpus: usize) {
+fn build(h: &mut Vmmgr, id: usize, core: usize, cap: u32, vcpus: usize) {
     let mut g = create(id, core, cap, vcpus);
     let p = sched::prepare_vmm(h, &mut g).unwrap();
     let sc = sel4::cap::SchedContext((id * 10 + 9) as u64);
@@ -135,8 +142,11 @@ fn spawn(h: &mut Vmmgr, id: usize, core: usize, cap: u32, vcpus: usize) {
     h.info.sched_control(core).sched_control_configure_flags(sc, p.vmm, p.vmm_period, l4h_host::GUEST_EXTRA_REFILLS, 0, 0).unwrap();
     MODEL.with_borrow_mut(|m| { m.priorities.insert(sc.0, (l4h_host::PRIO_VMM, l4h_host::PRIO_VMM)); });
     g.vmm = Some(Component { sc, tcb: sel4::cap::Tcb(sc.0) });
-    g.state = State::Running;
     h.guests[id] = Some(g);
+}
+fn spawn(h: &mut Vmmgr, id: usize, core: usize, cap: u32, vcpus: usize) {
+    build(h, id, core, cap, vcpus);
+    sched::start(h, id).unwrap();
 }
 fn assert_limits(h: &Vmmgr) {
     for g in h.guests.iter().flatten().filter(|g| g.state != State::Stopped) {
@@ -363,7 +373,7 @@ fn a_lone_heavy_io_vmm_on_an_idle_core_keeps_its_full_budget() {
 }
 
 #[test]
-fn a_demoted_vmm_reclaims_idle_capacity_without_resetting_its_backoff() {
+fn blocking_and_refill_snapshots_cannot_remove_an_existing_limit() {
     let mut h = manager();
     h.info.cores = 2;
     h.info.topology = topology::Topology::flat(2);
@@ -373,19 +383,190 @@ fn a_demoted_vmm_reclaims_idle_capacity_without_resetting_its_backoff() {
     MODEL.with_borrow_mut(|m| m.used.insert(9, 90_000));
     sched::balance(&mut h, 100_000);
     assert!(h.guest(0).unwrap().vmm_limited);
-    MODEL.with_borrow_mut(|m| {
-        m.ready.extend([(1, false), (2, false)]);
-        m.used.insert(9, 50_000);
-    });
-    sched::balance(&mut h, 100_000);
+    let before = MODEL.with_borrow(|m| m.calls.len());
+    for tick in 0..1000 {
+        // Both blocked (including a capped SC waiting for refill), either
+        // scheduling band ready, and both ready must all retain protection.
+        MODEL.with_borrow_mut(|m| {
+            m.ready.extend([(1, tick % 4 >= 2), (2, tick % 2 != 0)]);
+            m.used.insert(9, 50_000);
+        });
+        sched::balance(&mut h, 100_000);
+        let g = h.guest(0).unwrap();
+        assert!(g.vmm_limited && !g.vmm_boosted);
+    }
+    assert_eq!(MODEL.with_borrow(|m| m.calls.len()), before, "blocking must not reconfigure/refill SCs");
+    assert_limits(&h);
+}
+
+fn guard_on_empty_core(h: &mut Vmmgr) {
+    h.info.cores = 2;
+    h.info.topology = topology::Topology::flat(2);
+    spawn(h, 0, 1, 0, 1);
+    spawn(h, 1, 1, 0, 1);
+    MODEL.with_borrow_mut(|m| m.used.insert(9, 90_000));
+    sched::balance(h, 100_000);
+    assert!(h.guest(0).unwrap().vmm_limited);
+    // A real balancing step moves vCPU 0 away; stop and destroy its peer
+    // afterwards so no guest threads remain assigned to the VMM's core.
+    h.guests[1].as_mut().unwrap().vcpus[0].cooldown = 10;
+    MODEL.with_borrow_mut(|m| m.used.extend([(9, 50_000), (1, 25_000), (11, 25_000)]));
+    sched::balance(h, 100_000);
+    h.guests[1].as_mut().unwrap().stop();
+    h.guests[1] = None;
+    MODEL.with_borrow_mut(|m| m.used.insert(9, 50_000));
+    sched::balance(h, 100_000);
     let g = h.guest(0).unwrap();
+    assert_eq!(g.vcpus[0].core, 0);
     assert!(!g.vmm_boosted && !g.vmm_limited);
     assert_eq!((g.vmm_limits.unwrap().1.vmm, g.vmm_limits.unwrap().1.vmm_period), (5000, 5000));
-    MODEL.with_borrow_mut(|m| { m.ready.insert(2, true); m.used.insert(9, 90_000); });
-    sched::balance(&mut h, 100_000);
+    assert_limits(h);
+}
+
+#[test]
+fn an_empty_core_reclaims_capacity_but_new_guests_are_protected_before_start() {
+    let mut h = manager();
+    guard_on_empty_core(&mut h);
+    build(&mut h, 1, 1, 0, 1);
+    MODEL.with_borrow_mut(|m| m.operations.clear());
+    sched::start(&mut h, 1).unwrap();
     assert!(h.guest(0).unwrap().vmm_limited);
-    assert!(!h.guest(0).unwrap().vmm_boosted);
+    assert!(!h.guest(0).unwrap().vmm_boosted, "placement must not clear backoff");
+    MODEL.with_borrow(|m| assert_eq!(m.operations, vec![('c', 9), ('s', 1)]));
     assert_limits(&h);
+}
+
+#[test]
+fn migrating_onto_a_guarded_core_installs_its_limit_before_the_move() {
+    let mut h = manager();
+    guard_on_empty_core(&mut h);
+    spawn(&mut h, 1, 0, 0, 1);
+    h.guests[0].as_mut().unwrap().vcpus[0].cooldown = 10;
+    MODEL.with_borrow_mut(|m| {
+        m.operations.clear();
+        m.used.extend([(9, 90_000), (1, 50_000), (11, 50_000)]);
+    });
+    sched::balance(&mut h, 100_000);
+    assert_eq!(h.guest(1).unwrap().vcpus[0].core, 1);
+    assert!(h.guest(0).unwrap().vmm_limited);
+    MODEL.with_borrow(|m| assert_eq!(m.operations, vec![('c', 9), ('c', 11), ('c', 12)]));
+    assert_limits(&h);
+}
+
+#[test]
+fn the_last_guest_stopping_releases_capacity_after_it_is_stopped() {
+    let mut h = manager();
+    guard_on_empty_core(&mut h);
+    spawn(&mut h, 1, 1, 0, 1);
+    MODEL.with_borrow_mut(|m| {
+        m.operations.clear();
+        m.used.insert(9, 50_000);
+    });
+    h.guests[1].as_mut().unwrap().stop();
+    sched::balance(&mut h, 100_000);
+    assert!(!h.guest(0).unwrap().vmm_limited && !h.guest(0).unwrap().vmm_boosted);
+    MODEL.with_borrow(|m| assert_eq!(m.operations, vec![('x', 1), ('c', 9)]));
+    assert_limits(&h);
+}
+
+#[test]
+fn failed_protection_stops_the_affected_vmm_before_a_new_guest_runs() {
+    let mut h = manager();
+    guard_on_empty_core(&mut h);
+    build(&mut h, 1, 1, 0, 1);
+    MODEL.with_borrow_mut(|m| m.fail_config = Some(9));
+    assert_eq!(sched::start(&mut h, 1), Ok(()));
+    assert_eq!(h.guest(0).unwrap().state, State::Stopped);
+    assert_eq!(h.guest(1).unwrap().state, State::Running);
+}
+
+#[test]
+fn a_failed_limit_on_the_starting_guest_prevents_its_start() {
+    let mut h = manager();
+    build(&mut h, 0, 0, 0, 1);
+    build(&mut h, 1, 0, 0, 1);
+    MODEL.with_borrow_mut(|m| m.used.extend([(9, 45_000), (19, 45_000)]));
+    sched::balance(&mut h, 100_000);
+    assert!(!h.guest(0).unwrap().vmm_boosted && !h.guest(0).unwrap().vmm_limited);
+    MODEL.with_borrow_mut(|m| { m.operations.clear(); m.fail_config = Some(9); });
+    assert_eq!(sched::start(&mut h, 0), Err(l4h_host::wire::NO_REPLY));
+    assert_eq!(h.guest(0).unwrap().state, State::Stopped);
+    assert!(!h.guest(1).unwrap().vmm_limited, "failed start must not reserve CPU from its neighbour");
+    assert_eq!(h.guest(1).unwrap().vmm_limits.unwrap().1.vmm, 5000);
+    MODEL.with_borrow(|m| assert!(!m.operations.iter().any(|(op, _)| *op == 's')));
+}
+
+#[test]
+fn a_failed_migration_removes_its_destination_reservation() {
+    let mut h = manager();
+    guard_on_empty_core(&mut h);
+    spawn(&mut h, 1, 0, 0, 1);
+    h.guests[0].as_mut().unwrap().vcpus[0].cooldown = 10;
+    MODEL.with_borrow_mut(|m| {
+        m.operations.clear();
+        m.fail_config = Some(11);
+        m.used.extend([(9, 90_000), (1, 50_000), (11, 50_000)]);
+    });
+    sched::balance(&mut h, 100_000);
+    assert_eq!(h.guest(1).unwrap().state, State::Stopped);
+    assert!(!h.guest(0).unwrap().vmm_limited && !h.guest(0).unwrap().vmm_boosted);
+    MODEL.with_borrow(|m| assert_eq!(m.operations, vec![('c', 9), ('c', 11), ('x', 1), ('c', 9)]));
+    assert_limits(&h);
+}
+
+#[test]
+fn timer_bookkeeping_is_not_pressure_but_a_quantum_or_waiting_vmm_is() {
+    for (other_used, other_ready, guarded) in [(50, false, false), (4999, false, false), (5000, false, true), (0, true, true)] {
+        let mut h = manager();
+        h.info.cores = 2;
+        h.info.topology = topology::Topology::flat(2);
+        for id in 0..4 { spawn(&mut h, id, 1, 0, 1); }
+        MODEL.with_borrow_mut(|m| {
+            for id in 0..4 { m.ready.extend([(id*10+1, false), (id*10+2, false), (id*10+9, false)]); }
+            m.ready.insert(19, other_ready);
+        });
+        for _ in 0..20 {
+            let own_used = if h.guest(0).unwrap().vmm_limited { 50_000 } else { 90_000 };
+            MODEL.with_borrow_mut(|m| m.used.extend([(9, own_used), (19, other_used)]));
+            sched::balance(&mut h, 100_000);
+            assert_eq!(!h.guest(0).unwrap().vmm_boosted, guarded);
+            assert!(h.guests[1..4].iter().flatten().all(|g| g.vmm_boosted));
+        }
+        assert_limits(&h);
+    }
+}
+
+#[test]
+fn many_idle_timers_still_do_not_remove_a_heavy_io_vmms_boost() {
+    let mut h = manager();
+    h.info.cores = 2;
+    h.info.topology = topology::Topology::flat(2);
+    for id in 0..64 { spawn(&mut h, id, 1, 0, 1); }
+    let before = MODEL.with_borrow(|m| m.calls.len());
+    MODEL.with_borrow_mut(|m| {
+        for id in 0..64 {
+            m.ready.extend([(id*10+1, false), (id*10+2, false), (id*10+9, false)]);
+            m.used.insert(id*10+9, if id == 0 { 90_000 } else { 50 });
+        }
+    });
+    sched::balance(&mut h, 100_000);
+    assert!(h.guests.iter().flatten().all(|g| g.vmm_boosted && !g.vmm_limited));
+    assert_eq!(MODEL.with_borrow(|m| m.calls.len()), before);
+    assert_limits(&h);
+}
+
+#[test]
+fn duplicate_or_stale_ready_never_restarts_a_guest_or_refills_contexts() {
+    let mut h = manager();
+    spawn(&mut h, 0, 0, 0, 1);
+    MODEL.with_borrow_mut(|m| m.operations.clear());
+    assert_eq!(sched::start(&mut h, 0), Err(l4h_host::errno::EINVAL));
+    assert_eq!(sched::start(&mut h, 63), Err(l4h_host::wire::NO_REPLY));
+    assert!(MODEL.with_borrow(|m| m.operations.is_empty()));
+    h.guests[0].as_mut().unwrap().stop();
+    MODEL.with_borrow_mut(|m| m.operations.clear());
+    assert_eq!(sched::start(&mut h, 0), Err(l4h_host::errno::EINVAL));
+    assert!(MODEL.with_borrow(|m| m.operations.is_empty()));
 }
 
 #[test]

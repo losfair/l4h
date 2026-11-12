@@ -87,6 +87,61 @@ fn configure_vmm(info: &HostInfo, g: &mut Guest, p: budget::Plan) -> bool {
     true
 }
 
+/// Placement, not instantaneous readiness, controls an existing guard.
+/// A blocked or budget-depleted guest can wake before the next sample.
+#[derive(Clone, Copy)]
+struct Arrival { guest: usize, cores: u64 }
+
+fn occupied(h: &Vmmgr, arrival: Option<Arrival>) -> [bool; topology::MAX_CPUS] {
+    let mut cores = [false; topology::MAX_CPUS];
+    for g in h.guests.iter().flatten().filter(|g| g.state == State::Running) {
+        for v in &g.vcpus { cores[v.core] = true; }
+    }
+    if let Some(a) = arrival.filter(|a| h.guest(a.guest).is_some_and(|g| g.state != State::Stopped)) {
+        for (i, core) in cores.iter_mut().enumerate() { *core |= a.cores & (1u64 << i) != 0; }
+    }
+    cores
+}
+
+/// Reconcile all limits together so only guarded VMMs on occupied cores
+/// divide the half-core pool. Stable placement/boost keeps the installed
+/// SCs unchanged, regardless of blocking and refill phase.
+fn protect(h: &mut Vmmgr, arrival: Option<Arrival>) {
+    loop {
+        let occupied = occupied(h, arrival);
+        for g in h.guests.iter_mut().flatten().filter(|g| active(g)) {
+            g.vmm_limited = !g.vmm_boosted && occupied[g.vmm_limits.expect("VMM limits").0];
+        }
+        let backgrounds = counts(h);
+        let mut failed = false;
+        for g in h.guests.iter_mut().flatten().filter(|g| active(g)) {
+            let core = g.vmm_limits.expect("VMM limits").0;
+            let p = plan(&h.info, g, 0, true, backgrounds[core]);
+            failed |= !configure_vmm(&h.info, g, p);
+        }
+        if !failed { break; }
+        // Each failed pass stops at least one active guest: bounded by
+        // MAX_GUESTS. Recompute both occupancy and pool membership so a
+        // failed arrival reserves no CPU from the surviving VMMs.
+    }
+}
+
+/// Install protection before any of this guest's vCPUs can run. A VMM
+/// already demoted on an otherwise empty core must not stall the new guest
+/// until the next 100 ms sample.
+pub fn start(h: &mut Vmmgr, gid: usize) -> Result<(), Errno> {
+    let g = h.guest(gid).ok_or(l4h_host::wire::NO_REPLY)?;
+    if g.state != State::Created { return Err(EINVAL); }
+    let cores = g.vcpus.iter().fold(0, |cores, v| cores | (1u64 << v.core));
+    protect(h, Some(Arrival { guest: gid, cores }));
+    let g = h.guests[gid].as_mut().unwrap();
+    // The READY caller is this guest's VMM. If protection stopped it,
+    // discard the reply just as guest_power does for a stopped caller.
+    if g.state == State::Stopped { return Err(l4h_host::wire::NO_REPLY); }
+    g.start();
+    Ok(())
+}
+
 /// Charge the VMM to vCPU 0 before it starts. Other VMMs' budgets are
 /// independent: idle guests must not reserve CPU time from busy ones.
 pub fn prepare_vmm(h: &mut Vmmgr, g: &mut Guest) -> Option<budget::Plan> {
@@ -183,8 +238,8 @@ pub fn balance(h: &mut Vmmgr, elapsed_us: u64) {
                     continue;
                 }
                 // Query kernel-owned runnable state, not guest idle
-                // counters or a consumption ratio. Idle/migrated vCPUs
-                // must not reserve CPU from I/O on this core.
+                // counters or a consumption ratio. This can establish
+                // contention, but cannot clear an existing guard.
                 guest_ready[g.vcpus[v].core] |= kr || ur;
                 // A capped vCPU whose budget split changed.
                 if g.cpu_cap_pct > 0 {
@@ -236,8 +291,11 @@ pub fn balance(h: &mut Vmmgr, elapsed_us: u64) {
     for g in h.guests.iter_mut().flatten().filter(|g| active(g)) {
         let core = g.vmm_limits.expect("VMM limits").0;
         // logd is on core 0. A competing VMM may be runnable without
-        // having consumed CPU yet, or may have blocked after its work.
-        let contended = guest_ready[core] || core == 0 || core_vmm[core] > vmm_used[g.id]
+        // having consumed CPU yet, or may have blocked after meaningful
+        // work. Timer bookkeeping of a few us is not pressure: require
+        // at least one configured scheduling quantum of other VMM work.
+        let contended = guest_ready[core] || core == 0
+            || core_vmm[core].saturating_sub(vmm_used[g.id]) >= h.info.timeslice_us
             || ready_vmms[core] > usize::from(vmm_ready[g.id]);
         let boosted = g.vmm_guard.boost(g.vmm_boosted, vmm_used[g.id], core_vmm[core], largest[core], contended, elapsed_us,
             vmm_before[g.id].expect("VMM limits"));
@@ -260,17 +318,12 @@ pub fn balance(h: &mut Vmmgr, elapsed_us: u64) {
         info!("l4h-vmmgr: guest {} VMM priority {} on core {} (used {} us, VMMs {} us)",
             g.id, if boosted { l4h_host::PRIO_VMM } else { l4h_host::PRIO_VMM_FAIR }, core, vmm_used[g.id], core_vmm[core]);
     }
-    for g in h.guests.iter_mut().flatten().filter(|g| active(g)) {
-        let core = g.vmm_limits.expect("VMM limits").0;
-        g.vmm_limited = !g.vmm_boosted && guest_ready[core];
-    }
-    let backgrounds = counts(h);
-    for g in h.guests.iter_mut().flatten().filter(|g| active(g)) {
-        let core = g.vmm_limits.expect("VMM limits").0;
-        let p = plan(&h.info, g, 0, true, backgrounds[core]);
-        configure_vmm(&h.info, g, p);
-    }
+    protect(h, None);
     let Some(policy::Migration { guest: gid, vcpu: v, src, dst }) = migration else { return };
+    if !h.guest(gid).is_some_and(|g| g.state == State::Running) { return; }
+    // Keep source protection until the move commits, and protect the
+    // destination before its first runnable guest arrives.
+    protect(h, Some(Arrival { guest: gid, cores: 1u64 << dst }));
     let Some(g) = h.guest(gid) else { return };
     if g.state != State::Running { return; }
     let limits = if v == 0 && active(g) { g.vmm_limits.expect("VMM limits").1 } else { plan(&h.info, g, v, false, 0) };
@@ -290,4 +343,5 @@ pub fn balance(h: &mut Vmmgr, elapsed_us: u64) {
     } else {
         h.guests[gid].as_mut().unwrap().stop();
     }
+    protect(h, None);
 }

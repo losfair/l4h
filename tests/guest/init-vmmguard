@@ -18,10 +18,12 @@ for n in 1 2 3; do
     ids="$ids $id"
     l4hctl console "$id" --until 'DENSVM: ready' --timeout 20 >/run/idle || fail idle-ready
 done
-victim=$(l4hctl create victim --initrd /bin/densvm.cpio.gz --mem 128 --cmdline 'console=hvc0 quiet HOG=1') || fail victim
+victim=$(l4hctl create victim --initrd /bin/densvm.cpio.gz --mem 128 --cmdline 'console=hvc0 quiet WAKE=1 HOG=1') || fail victim
 ids="$ids $victim"
 [ "$(l4hctl cores "$bad")" = "$(l4hctl cores "$victim")" ] || fail placement
-l4hctl console "$victim" --until 'DENSVM: ready' --timeout 20 >/run/victim || fail victim-ready
+l4hctl console "$victim" --until 'DENSVM: ready' --timeout 20 >/run/victim || { cat /run/victim; fail victim-ready; }
+grep -q 'VMMWAKE: PASS' /run/victim || fail 'interactive wakeups'
+grep 'VMMWAKE:' /run/victim
 l4hctl send "$victim" --wait 'DENSVM: pong progress' --timeout 5 progress >/run/pong || fail 'guest made no progress'
 sleep 1
 cpu=$(l4hctl top | awk '$2 == "victim" { split($3,a,"."); print a[1] }')

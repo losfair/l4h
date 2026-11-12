@@ -1218,7 +1218,7 @@ Global on each core, with `P_K` = `PRIO_KERNEL` = 100:
 | `P_K + 4` | l4h-netd (switches and NIC drivers), l4h-blkd (disk drivers), l4h-memd and l4h-vmmgr (both on core 0) |
 | `P_K + 3` | boosted l4h-vmm instances; l4h-trustd (last core, at most 5 ms per 20 ms) |
 | `P_K + 2` | l4h-logd (core 0, at most 1 ms per 5 ms), strictly above throttled VMMs |
-| `P_K + 1` | VMMs whose boost was withdrawn; their budgets are limited only while a guest on their core can run |
+| `P_K + 1` | VMMs whose boost was withdrawn; their budgets are limited while running guests have vCPUs assigned to their core, including blocked vCPUs |
 | `P_K` | guest kernel TCBs (`SC_K`) |
 | `P_U` = 99 | guest user TCBs (`SC_U`) |
 
@@ -1230,22 +1230,50 @@ its boost. Idle VMMs do not change that selection, so a spinner using
 60% does not demote an I/O neighbour using 40% merely because six other
 VMMs are idle.
 
+Contention means a guest or another VMM is runnable in the kernel's
+snapshot, other VMMs consumed at least one scheduling quantum (5 ms), or
+logd shares core 0. A few microseconds of idle VMM timer bookkeeping do
+not trigger demotion by themselves. The runnable snapshot (0044) can
+establish contention; it cannot predict whether a blocked thread will
+wake before the next sample.
+
 Throttled VMMs stay above guest kernels at `P_K + 1`, so a kernel spinning
-for a device reply cannot starve the VMM servicing it. While a guest on
-their core can run, these VMMs divide a combined half-core budget,
-leaving time for guest users. The kernel's `SchedContext_Consumed`
-runnable snapshot (0044) supplies that demand; a guest's reported idle
-counter does not. When no guest there can run, the extra limit is removed
-even during boost backoff: a busy VMM can use spare CPU rather than stay
-hard-capped on an idle core. Explicit guest caps still apply. Limited
-periods grow if necessary to keep every SC above 200 µs. Other VMMs,
-including idle ones, do not divide this allowance.
+for a device reply cannot starve the VMM servicing it. They divide a
+combined half-core budget while any running guest has a vCPU assigned
+to that core. This protection is latched across blocking and budget
+refills; an interactive guest can wake between samples without waiting
+behind an unlimited VMM. Protection takes precedence over reclaiming
+brief idle gaps on such a core. Guest idle counters cannot clear it.
+
+When the core has no vCPUs assigned by running guests, a demoted VMM
+can use a full scheduling context even during boost backoff. The manager
+installs protection before starting a guest or moving a vCPU onto the
+core, retains it on the source until a move commits, and reconciles it
+after the move. Stopping a core's last guest releases its reservation at
+the next balance. Explicit guest caps still apply. Limited periods grow
+if necessary to keep every SC above 200 µs. Boosted VMMs do not divide
+this allowance.
+
+The priority state and budget state have separate inputs:
+
+| State | Priority | Uncapped VMM budget | Exit |
+|-------|----------|---------------------|------|
+| Boosted | `P_K + 3` | Full period | Dominance plus contention at a sample |
+| Guarded, guest vCPUs assigned | `P_K + 1` | Combined half core | Continuous VMM quiet, or removal of the core's last guest vCPU |
+| Guarded, no guest vCPUs assigned | `P_K + 1` | Full period | Continuous VMM quiet, or a guest vCPU arriving (protection first) |
+
+Only successful kernel priority/configuration calls commit installed
+priority or budget metadata. A failure stops the affected guest and
+leaves the manager able to protect other guests. Stable priority and
+placement do not reconfigure SCs when readiness snapshots change.
 
 Before demotion vmmgr lowers the VMM's MCP to `P_K + 1`, so its own TCB
 cannot restore priority `P_K + 3`. Recovery requires continuous use below
 half its allowance for 1 second after the first demotion, then 2, 4, 8
 and at most 16 seconds after repeated demotions. Busy samples reset the
-quiet streak. Other VMMs' use does not block recovery, and the MCP stays
+quiet streak. A minute spent boosted without another demotion resets the
+backoff history; blocked time while guarded does not age it out. Other
+VMMs' use does not block recovery, and the MCP stays
 low when the manager restores priority. This prevents 100 ms quiet/spin
 cycles regaining a full boost every other sample. A VMM spinning before
 READY is protected and its CPU use appears
@@ -1253,8 +1281,10 @@ in management statistics. `tests/run-vmmfairtest.sh` checks progress with
 continuously runnable guest kernel, user and logd-priority threads in the
 real kernel, the runnable-state snapshots, and the authority ceiling.
 `tests/run-vmmguardtest.sh` has an actual VMM spin before READY, try to
-undo demotion, and go quiet for a restored boost; a CPU-bound guest on
-the same core must boot and keep making progress throughout.
+undo demotion, and go quiet for a restored boost. A guest on the same
+core must boot, wake every 10 ms for two seconds without 100 ms stalls,
+then make CPU-bound progress. Native manager tests cover readiness
+sequences, start/migration ordering, failures, and backoff expiry.
 
 VMMs stay on the core where vCPU 0 started; moving that vCPU does not move
 the VMM. A CPU cap charges the VMM's hypercalls, virtio queues, display

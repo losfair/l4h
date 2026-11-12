@@ -1000,14 +1000,9 @@ struct VmmCalls<'a>(&'a mut Vmmgr);
 impl call::Server for VmmCalls<'_> {
     fn vmm_ready(&mut self, from: proto::Sender) -> Result<(), Errno> {
         let proto::Sender::Vmm(id) = from else { return Err(EINVAL) };
-        let g = self.0.guests.get_mut(id).and_then(|g| g.as_mut()).ok_or(l4h_host::wire::NO_REPLY)?;
         // Only a freshly built guest starts: a second VmmReady, or one from
         // the VMM of a running or stopped guest, must not reset vCPU 0.
-        if g.state != State::Created {
-            return Err(EINVAL);
-        }
-        g.start();
-        Ok(())
+        sched::start(self.0, id)
     }
 
     fn guest_power(&mut self, from: proto::Sender, how: u64) -> Result<(), Errno> {
