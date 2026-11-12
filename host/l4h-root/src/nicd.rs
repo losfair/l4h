@@ -50,6 +50,9 @@ pub const MAX_NICS: usize = net::MAX_UPLINKS;
 /// How long an FLR takes before the function may be touched (PCIe 6.0
 /// §6.6.2).
 const FLR_MS: u64 = 100;
+/// Configuration-space requests root answers for a nicd per tick
+/// (TIMER_MS).
+const CFG_PER_TICK: u32 = 32;
 /// A nicd that has not answered a Ping for this long is hung: restarted.
 const HANG_SECS: u64 = 5;
 /// A nicd that has not come up this long after its start is restarted
@@ -120,8 +123,10 @@ struct Inst {
     ctl_page: cap::Granule,
     /// The answer to its last control message: its length.
     ctl_len: usize,
-    /// Its last configuration-space request's sequence number.
+    /// Its last configuration-space request's sequence number, and how
+    /// many more root answers before its next tick.
     cfg_seq: u32,
+    cfg_budget: u32,
 }
 
 /// The uplink channel: root's frames, kept from the first bind until
@@ -164,6 +169,9 @@ pub struct Nic {
     io: Option<cap::Null>,
     chan: Option<Chan>,
     dma: Option<DmaRegion>,
+    /// The driver whose instances last had the DMA region: another gets
+    /// it cleared first.
+    dma_driver: Option<usize>,
     inst: Option<Inst>,
     /// The MAC its first instance offered, which root checked: later
     /// instances must offer the same.
@@ -185,6 +193,9 @@ pub struct Nic {
     /// The header dwords an FLR clears (SAVED), as the firmware left them
     /// at boot: what root restores after a reset, whatever a driver did.
     saved: [u32; 8],
+    /// And of the PCI Express capability: its offset, Device Control,
+    /// Link Control, Device Control 2 and Link Control 2.
+    pcie_saved: Option<(u8, [u16; 4])>,
     then: Then,
     /// Restarts in the hour since `window_start`; the backoff.
     restarts: usize,
@@ -208,10 +219,12 @@ pub fn bdf(d: &pci::Device) -> u32 {
     crate::netd::bdf(d)
 }
 
-/// A function root lists as a network device: class 02 (network), or one
-/// some driver of the bundle matches.
-pub fn is_network(d: &pci::Device, ids: &Ids) -> bool {
-    d.class == 0x02 || drivers().matching(ids, |_| true).is_some()
+/// A function root lists as a network device: one some driver of the
+/// bundle matches, or that `nic_bind` names (a driver dom0 loads later may
+/// take it).  Others stay the firmware's, and take no NIC number.
+pub fn is_network(d: &pci::Device, ids: &Ids, pinned: bool) -> bool {
+    let _ = d;
+    pinned || drivers().matching(ids, |_| true).is_some()
 }
 
 pub fn ids_of(d: &pci::Device, pci: &pci::Pci) -> Ids {
@@ -228,15 +241,15 @@ pub fn ids_of(d: &pci::Device, pci: &pci::Pci) -> Ids {
 
 /// Boot: list `d`.  False if there are MAX_NICS already.
 pub fn found(d: pci::Device, ids: Ids, pin: Option<Option<&'static str>>, pci: &pci::Pci) -> bool {
-    // Off until its driver starts, if one will: one no driver takes, or
-    // that the configuration leaves to the firmware, stays as it is.
-    if pin != Some(None) && drivers().matching(&ids, |_| true).is_some() {
-        pci.disable(&d);
-    }
     let ns = nics();
     if ns.is_full() {
         log!("l4h-root: more than {} network devices, {:02x}:{:02x}.{} ignored", MAX_NICS, d.bus, d.dev, d.func);
         return false;
+    }
+    // Off until its driver starts, if one will: one no driver takes, or
+    // that the configuration leaves to the firmware, stays as it is.
+    if pin != Some(None) && drivers().matching(&ids, |_| true).is_some() {
+        pci.disable(&d);
     }
     ns.must_push(Nic {
         pci: d,
@@ -253,6 +266,7 @@ pub fn found(d: pci::Device, ids: Ids, pin: Option<Option<&'static str>>, pci: &
         io: None,
         chan: None,
         dma: None,
+        dma_driver: None,
         inst: None,
         mac: None,
         generation: 0,
@@ -263,6 +277,7 @@ pub fn found(d: pci::Device, ids: Ids, pin: Option<Option<&'static str>>, pci: &
         removing: false,
         reset_until: 0,
         saved: core::array::from_fn(|k| pci.read32(d.bus, d.dev, d.func, SAVED[k])),
+        pcie_saved: pcie_cap_of(pci, &d).map(|c| (c, PCIE_SAVED.map(|o| pci.read16(d.bus, d.dev, d.func, c + o)))),
         then: Then::Restart,
         restarts: 0,
         window_start: 0,
@@ -427,6 +442,13 @@ fn confined(h: &Host, i: usize, driver: usize) -> bool {
     if crate::partition::get().is_some() {
         return false;
     }
+    // A virtio device's DMA goes through the IOMMU only if its driver
+    // negotiates ACCESS_PLATFORM (a legacy one's never does), and the
+    // driver is what is not trusted: its own choice could bypass the
+    // IOMMU, so a virtio NIC's driver is never confined.
+    if drivers().drivers[driver].manifest.flags & nicd::F_VIRTIO != 0 {
+        return false;
+    }
     let n = &nics()[i];
     // A device behind no IOMMU unit gets no domain: its DMA is
     // untranslated.
@@ -498,8 +520,9 @@ fn allowed(h: &Host, i: usize, d: usize) -> Result<(), &'static str> {
 /// driver here.
 fn group_free(i: usize, d: usize) -> Result<(), &'static str> {
     let me = bdf(&nics()[i].pci) as u16;
+    let mine = &nics()[i].group;
     if nics().iter().enumerate().any(|(j, o)| j != i && o.confined && o.driver.is_some_and(|od| od != d)
-        && o.state != State::Unbound && o.group.contains(&me)) {
+        && o.state != State::Unbound && (o.group.contains(&me) || mine.contains(&(bdf(&o.pci) as u16)))) {
         return Err("another driver's NIC shares its isolation group, confined");
     }
     Ok(())
@@ -522,6 +545,18 @@ pub fn bind(h: &mut Host, i: usize, driver: Option<usize>) -> Result<(), &'stati
                 return Err("the driver does not match the device");
             }
             allowed(h, i, d)?;
+            group_free(i, d)?;
+            // What the new driver needs of what stays the NIC's (BARs as
+            // carved, the DMA region): checked before the running one goes.
+            let m = drivers().drivers[d].manifest;
+            let bars = bars_for(&n.pci, &m)?;
+            let w = windowed(&n.pci, &m);
+            if (0..6u8).filter(|b| bars & 1 << b != 0).any(|b| n.bars[b as usize].as_ref().is_some_and(|r| r.len() * PAGE < w.bars[b as usize].size as usize)) {
+                return Err("its BARs were mapped for a driver with a smaller window: reboot to change");
+            }
+            if n.dma.is_some_and(|r| r.size != 1 << m.dma_bits) {
+                return Err("its DMA region was made for a driver that wanted another size: reboot to change");
+            }
             kill(h, i, Then::Rebind(d), "rebound by dom0");
             return Ok(());
         }
@@ -595,6 +630,7 @@ pub fn unbind(h: &mut Host, i: usize) -> Result<(), Errno> {
         State::Failed | State::Backoff => {
             n.state = State::Unbound;
             n.driver = None;
+            n.mac = None;
             Ok(())
         }
         State::Stopping => {
@@ -733,6 +769,14 @@ fn spawn(h: &mut Host, i: usize) -> Result<(), &'static str> {
     if dma_region.size != dma {
         return Err("its DMA region was made for a driver that wanted another size: reboot to change");
     }
+    // Another driver's buffers and descriptors are not this one's to see.
+    if nics()[i].dma_driver.is_some_and(|o| o != d) {
+        for p in 0..dma / PAGE {
+            let f = dma_region.frames.absolute_cptr_from_bits_with_depth(p as u64, dma_region.bits);
+            h.wins.a.with_frame(&f, |page| unsafe { core::ptr::write_bytes(page, 0, PAGE) });
+        }
+    }
+    nics()[i].dma_driver = Some(d);
     let n = &nics()[i];
     let pdev = n.pci;
     let bars = bars_for(&pdev, &m)?;
@@ -907,7 +951,7 @@ fn spawn(h: &mut Host, i: usize) -> Result<(), &'static str> {
             component::mint_edge(&abs_of(t), &wiring::ROOT_NICD_TIMER, 0, &comp.obj()).expect("nicd timer");
             t
         });
-        Ok(Inst { comp, arena, mailbox, ops: [None; RING], timer, ctl_page, ctl_len: 0, cfg_seq: 0 })
+        Ok(Inst { comp, arena, mailbox, ops: [None; RING], timer, ctl_page, ctl_len: 0, cfg_seq: 0, cfg_budget: CFG_PER_TICK })
     })();
     h.alloc.slots.untrack();
     let mut inst = match built {
@@ -949,14 +993,23 @@ fn legacy_of(d: &pci::Device, m: &Manifest) -> bool {
     m.flags & nicd::F_LEGACY_IO != 0 && is_legacy_virtio(d)
 }
 
+/// Offsets in the PCI Express capability of what an FLR resets and root
+/// restores: Device Control, Link Control, Device Control 2, Link
+/// Control 2.
+const PCIE_SAVED: [u8; 4] = [0x08, 0x10, 0x28, 0x30];
+
 /// The PCI Express capability's offset, if the function has one.
 fn pcie_cap(h: &Host, d: &pci::Device) -> Option<u8> {
-    let mut off = (h.pci.read32(d.bus, d.dev, d.func, 0x34) & 0xfc) as u8;
+    pcie_cap_of(&h.pci, d)
+}
+
+fn pcie_cap_of(pci: &pci::Pci, d: &pci::Device) -> Option<u8> {
+    let mut off = (pci.read32(d.bus, d.dev, d.func, 0x34) & 0xfc) as u8;
     for _ in 0..48 {
         if off < 0x40 {
             return None;
         }
-        let w = h.pci.read32(d.bus, d.dev, d.func, off);
+        let w = pci.read32(d.bus, d.dev, d.func, off);
         if w & 0xff == 0x10 {
             return Some(off);
         }
@@ -1035,11 +1088,27 @@ fn progress(h: &mut Host, i: usize) {
     }
     let p = n.pci;
     if n.reset_until != 0 {
+        // What the reset cleared, as the firmware had it: the header, the
+        // PCI Express controls (payload and request sizes, error
+        // reporting, ASPM), and ACS, which root set at boot (acs.rs).
         for (k, &off) in SAVED.iter().enumerate() {
             h.pci.write32(p.bus, p.dev, p.func, off, n.saved[k]);
         }
+        if let Some((c, v)) = n.pcie_saved {
+            for (k, &o) in PCIE_SAVED.iter().enumerate() {
+                h.pci.write16(p.bus, p.dev, p.func, c + o, v[k]);
+            }
+        }
         n.reset_until = 0;
+        #[cfg(target_arch = "x86_64")]
+        if h.cfg.pcie_acs {
+            let _ = crate::acs::enable(&h.pci, bdf(&p) as u16);
+        }
+        // Its ACS may isolate less than before: the group is taken anew,
+        // and the next start checks confinement against it.
+        nics()[i].group = group_of(h, p);
     }
+    let n = &mut nics()[i];
     if let Some(inst) = n.inst.take() {
         destroy(h, i, inst);
     }
@@ -1067,14 +1136,18 @@ fn progress(h: &mut Host, i: usize) {
             n.backoff_secs = (n.backoff_secs * 2).clamp(1, BACKOFF_MAX_SECS);
             n.state = State::Backoff;
         }
+        // A new driver offers the MAC anew: the last one's may have been
+        // its own choice.
         Then::Unbind => {
             n.state = State::Unbound;
             n.driver = None;
+            n.mac = None;
         }
         Then::Fail => n.state = State::Failed,
         Then::Rebind(d) => {
             n.state = State::Unbound;
             n.driver = None;
+            n.mac = None;
             if let Err(why) = bind(h, i, Some(d)) {
                 log!("l4h-root: nic {}: not bound: {}", i, why);
             }
@@ -1157,12 +1230,24 @@ fn check_uplink(h: &mut Host, i: usize) {
     match state {
         net::UPLINK_UP if n.state == State::Starting => {
             let mac48 = mac & 0xffff_ffff_ffff;
+            let boot = |k: usize| nics()[k].driver.is_some_and(|d| drivers().drivers[d].boot);
+            let holder = (0..nics().len()).find(|&j| j != i && nics()[j].mac == Some(mac48));
             let why = if !is_unicast(mac48) {
                 Some("its MAC is not a unicast address")
             } else if n.mac.is_some_and(|m| m != mac48) {
                 Some("its MAC changed")
-            } else if nics().iter().enumerate().any(|(j, o)| j != i && o.mac == Some(mac48)) {
-                Some("its MAC is another NIC's")
+            } else if let Some(j) = holder {
+                // A driver dom0 loaded that took a boot driver's NIC's MAC
+                // first does not keep it from that NIC: the measured
+                // driver's word wins.  Otherwise the newcomer goes.
+                if boot(i) && !boot(j) {
+                    log!("l4h-root: nic {}: its driver offered nic {}'s MAC", j, i);
+                    nics()[j].mac = None;
+                    kill(h, j, Then::Fail, "its MAC is another NIC's");
+                    None
+                } else {
+                    Some("its MAC is another NIC's")
+                }
             } else {
                 None
             };
@@ -1190,6 +1275,11 @@ fn is_unicast(m: u64) -> bool {
 pub fn tick(h: &mut Host) {
     let now = crate::rdtsc();
     for i in 0..nics().len() {
+        if let Some(inst) = nics()[i].inst.as_mut() {
+            inst.cfg_budget = CFG_PER_TICK;
+        }
+        // One left waiting for the budget.
+        cfg_access(h, i);
         let n = &mut nics()[i];
         match n.state {
             State::Stopping => progress(h, i),
@@ -1260,7 +1350,8 @@ pub fn fail_unready(h: &mut Host) {
             if n.state == State::Backoff {
                 n.state = State::Failed;
             }
-            if n.state == State::Stopping {
+            // A pending unbind or rebind stands; a restart does not.
+            if n.state == State::Stopping && n.then == Then::Restart {
                 n.then = Then::Fail;
             }
         }
@@ -1291,70 +1382,55 @@ fn write_allowed(h: &Host, n: &Nic, m: &Manifest, off: u16, size: u16) -> Option
         return None;
     }
     let d = &n.pci;
-    let overlaps = |a: u16, len: u16| off < a + len && a < end;
     let dword = off & !3;
     // The bytes written, as bits of their dword.
     let shift = (off & 3) * 8;
     let mut bits = if size == 4 { u32::MAX } else { ((1u32 << (size * 8)) - 1) << shift };
-    // Standard capabilities, each taken to reach the next one up (or the
-    // end of the standard space): vendor-specific ones may be written,
-    // and two fields of PCI Express's; no other.
-    let mut caps: ArrayVec<(u16, u8), 48> = ArrayVec::new();
+    // Every capability, standard (below 0x100) and extended, by offset;
+    // each taken to reach the next one up in its space, or the space's
+    // end.  A write must lie inside one the driver may write: no byte
+    // outside any capability, nor in another kind, is.
+    let mut caps: ArrayVec<(u16, u16), 96> = ArrayVec::new();
     let mut c = (h.pci.read32(d.bus, d.dev, d.func, 0x34) & 0xfc) as u16;
-    while c >= 0x40 && !caps.is_full() && !caps.iter().any(|&(o, _)| o == c) {
+    while c >= 0x40 && c < 0x100 && !caps.is_full() && !caps.iter().any(|&(o, _)| o == c) {
         let w = h.pci.read32(d.bus, d.dev, d.func, c as u8);
-        caps.must_push((c, w as u8));
+        caps.must_push((c, w as u8 as u16));
         c = ((w >> 8) & 0xfc) as u16;
     }
-    for &(c, id) in caps.iter() {
-        let span = caps.iter().map(|&(o, _)| o).filter(|&o| o > c).min().unwrap_or(0x100) - c;
-        if !overlaps(c, span) {
-            continue;
-        }
-        match id {
-            // Vendor-specific, but virtio's: one of those (PCI_CFG) reaches
-            // the whole of a BAR, past the driver's window.
-            0x09 if d.vendor != 0x1af4 => {}
-            0x10 => {
-                // Device Control's relaxed ordering (4) and no snoop (11),
-                // Link Control's ASPM (0..1); nothing else.
-                if dword == c + 8 {
-                    bits &= 1 << 4 | 1 << 11;
-                } else if dword == c + 0x10 {
-                    bits &= 0b11;
-                } else {
-                    return None;
-                }
-            }
-            _ => return None,
-        }
-    }
-    // Extended capabilities: AER, vendor-specific, LTR and L1 PM
-    // substates only.
     #[cfg(target_arch = "x86_64")]
     {
         let mut c = 0x100u16;
-        for _ in 0..512 {
+        while c >= 0x100 && !caps.is_full() && !caps.iter().any(|&(o, _)| o == c) {
             let Some(w) = h.pci.read_ext32(bdf(d) as u16, c) else { break };
             if w == 0 || w == u32::MAX {
                 break;
             }
-            let next = (w >> 20) as u16 & 0xffc;
-            let len = if next > c { next - c } else { 4096 - c };
-            if overlaps(c, len) {
-                match w & 0xffff {
-                    // AER: its status registers only (write 1 to clear);
-                    // not the masks or the severities.
-                    0x01 if dword == c + 4 || dword == c + 0x10 => {}
-                    0x0b | 0x18 | 0x1e => {}
-                    _ => return None,
-                }
-            }
-            if next < 0x100 || next <= c {
-                break;
-            }
-            c = next;
+            // Extended ids are marked apart from standard ones.
+            caps.must_push((c, 0x8000 | (w & 0x7fff) as u16));
+            c = (w >> 20) as u16 & 0xffc;
         }
+    }
+    let space_end = |c: u16| if c < 0x100 { 0x100 } else { 0x1000 };
+    let Some(&(c, id)) = caps.iter().find(|&&(c, _)| {
+        let next = caps.iter().map(|&(o, _)| o).filter(|&o| o > c && o < space_end(c)).min().unwrap_or(space_end(c));
+        off >= c && end <= next
+    }) else {
+        return None;
+    };
+    match id {
+        // Vendor-specific, but virtio's: one of those (PCI_CFG) reaches
+        // the whole of a BAR, past the driver's window.
+        0x09 if d.vendor != 0x1af4 => {}
+        // PCI Express: Device Control's relaxed ordering (4) and no snoop
+        // (11), Link Control's ASPM (0..1); nothing else.
+        0x10 if dword == c + 8 => bits &= 1 << 4 | 1 << 11,
+        0x10 if dword == c + 0x10 => bits &= 0b11,
+        // AER: its status registers only (write 1 to clear), not the masks
+        // or the severities.
+        0x8001 if dword == c + 4 || dword == c + 0x10 => {}
+        // Vendor-specific, LTR, L1 PM substates.
+        0x800b | 0x8018 | 0x801e => {}
+        _ => return None,
     }
     (bits != 0).then_some(bits)
 }
@@ -1370,6 +1446,11 @@ fn cfg_access(h: &mut Host, i: usize) {
     let req = p.cfg_req.load(Ordering::Acquire);
     let seq = (req >> 32) as u32;
     if seq == inst.cfg_seq || seq == 0 {
+        return;
+    }
+    // A few a tick: a nicd asking without end must not keep root (and
+    // netd, on its core) busy.  The rest wait for the next tick.
+    if inst.cfg_budget == 0 {
         return;
     }
     let (kind, size, off) = (req & 0xf, (req >> 4 & 0xf) as u16, (req >> 16 & 0xfff) as u16);
@@ -1395,9 +1476,9 @@ fn cfg_access(h: &mut Host, i: usize) {
         };
         match kind {
             nicd::CFG_READ => read(h).map(|v| (v & mask) >> shift).ok_or(ctl::EIO),
-            nicd::CFG_WRITE if write_allowed(h, n, &m, off, size).is_some() => {
-                let mask = write_allowed(h, n, &m, off, size).unwrap() & mask;
-                match read(h) {
+            nicd::CFG_WRITE => match write_allowed(h, n, &m, off, size).map(|b| b & mask) {
+                None => Err(ctl::EPERM),
+                Some(mask) => match read(h) {
                     Some(old) => {
                         let v = old & !mask | (value << shift) & mask;
                         if dword < 256 {
@@ -1411,9 +1492,8 @@ fn cfg_access(h: &mut Host, i: usize) {
                         }
                     }
                     None => Err(ctl::EIO),
-                }
-            }
-            nicd::CFG_WRITE => Err(ctl::EPERM),
+                },
+            },
             _ => Err(ctl::EINVAL),
         }
     };
@@ -1425,6 +1505,7 @@ fn cfg_access(h: &mut Host, i: usize) {
     p.cfg_ans.store((seq as u64) << 32 | ans, Ordering::Release);
     let inst = nics()[i].inst.as_mut().unwrap();
     inst.cfg_seq = seq;
+    inst.cfg_budget -= 1;
     inst.mailbox.kick();
 }
 

@@ -585,7 +585,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
             // Below MAX_DISK_CTRLS: checked above.
             let _ = ctrls.push(ctrl);
             record.owner = l4h_abi::PCI_OWNER_BLKD;
-        } else if nicd::is_network(&d, &nicd::ids_of(&d, &pci)) {
+        } else if nicd::is_network(&d, &nicd::ids_of(&d, &pci), cfg.nic_pin(netd::bdf(&d)).is_some()) {
             // Bound (and its driver started) once the host is up.
             record.owner = l4h_abi::PCI_OWNER_ROOT;
             let ids = nicd::ids_of(&d, &pci);
@@ -741,9 +741,10 @@ fn dom0_plan(h: &mut Host, ntfn: cap::Notification) -> Dom0Plan {
     // uplink.
     let sw = 0;
     h.netd.create_switch();
-    // The first NIC that is up, or the one uplink_nic names.
+    // The first NIC with a driver (up or not yet), or the one uplink_nic
+    // names.
     let nic = match h.cfg.uplink_nic {
-        None => (0..nicd::nics().len()).find(|&n| nicd::mac(n).is_some()),
+        None => (0..nicd::nics().len()).find(|&n| nicd::nics()[n].driver.is_some()),
         Some(bdf) => {
             let n = nicd::nics().iter().position(|n| netd::bdf(&n.pci) == bdf);
             if n.is_none() {
