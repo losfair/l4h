@@ -57,17 +57,6 @@ pathlib.Path(args[args.index('-o') + 1]).write_bytes(b'EFI fixture')
         self.assertNotIn('/boot/mk/', config)
         self.assertNotIn('\ntrue\n', config)
 
-    def test_uuid_and_label_select_before_sourcing_any_config(self):
-        for key, flag, value in [("L4H_ESP_UUID", "--fs-uuid", "1234-ABCD"),
-                                 ("L4H_ESP_LABEL", "--label", "slot A")]:
-            with self.subTest(key=key):
-                self.assertEqual(self.generate(**{key: value}).returncode, 0)
-                config = self.config.read_text()
-                self.assertIn(f'{flag} -- "{value}"', config)
-                self.assertNotIn('for l4h_device', config)
-                self.assertNotIn('--file /l4h/dom0/initrd', config)
-                self.assertLess(config.index('if [ "$l4h_boot_ok" = 1 ]'), config.index('source '))
-
     def check_environment_import(self, config):
         self.assertIn('load_env --file "$l4h_boot_env" l4h_esp_uuid l4h_esp_label', config)
         self.assertLess(config.index('load_env --file "$l4h_boot_env"'), config.index('source '))
@@ -76,25 +65,13 @@ pathlib.Path(args[args.index('-o') + 1]).write_bytes(b'EFI fixture')
         self.assertIn('elif [ -n "$l4h_esp_label" -a -z "$l4h_esp_uuid" ]; then', config)
 
     def test_environment_import_is_whitelisted_and_precedes_slot_files(self):
-        self.assertEqual(self.generate(L4H_ESP_UUID="1234-ABCD", L4H_BOOT_ENV="/EFI/L4H/grubenv").returncode, 0)
+        self.assertEqual(self.generate().returncode, 0)
         config = self.config.read_text()
-        self.assertIn('l4h_boot_env="($esp)/EFI/L4H/grubenv"', config)
-        self.assertNotIn('for l4h_device', config)
         self.check_environment_import(config)
         self.assertIn('l4h: boot partition selection failed', config)
         self.assertIn('search_fs_uuid search_label', self.modules.read_text())
         self.assertIn('\n    exit\n', config)
         self.assertNotIn('halt', self.modules.read_text())
-
-    def test_literals_are_escaped_for_grub(self):
-        self.assertEqual(self.generate(L4H_ESP_LABEL='slot "$name"\\end').returncode, 0)
-        self.assertIn(r'--label -- "slot \"\$name\"\\end"', self.config.read_text())
-
-    def test_backticks_are_literals_in_grub_labels_and_paths(self):
-        self.assertEqual(self.generate(L4H_ESP_LABEL='slot`A', L4H_BOOT_ENV='/EFI/grub`env').returncode, 0)
-        config = self.config.read_text()
-        self.assertIn('--label -- "slot`A"', config)
-        self.assertIn('l4h_boot_env="($esp)/EFI/grub`env"', config)
 
     def test_multikernel_block_is_emitted_only_when_available(self):
         shim = self.work / 'mkshim'
@@ -105,16 +82,6 @@ pathlib.Path(args[args.index('-o') + 1]).write_bytes(b'EFI fixture')
         self.assertIn('if [ -n "$esp" ]; then\nif [ -f "($esp)/l4h/l4h-mk.conf" ]; then', config)
         self.assertIn('(memdisk)/boot/mk/l4h-mkshim.elf', config)
         self.assertNotIn('\ntrue\n', config)
-
-    def test_invalid_build_settings_fail(self):
-        for settings in [dict(L4H_ESP_UUID="a", L4H_ESP_LABEL="b"),
-                         dict(L4H_BOOT_ENV="/grubenv"),
-                         dict(L4H_ESP_LABEL="boot", L4H_BOOT_ENV="relative"),
-                         dict(L4H_ESP_LABEL="boot", L4H_BOOT_ENV="(hd0)/grubenv"),
-                         dict(L4H_ESP_LABEL="boot\nother"),
-                         dict(L4H_ESP_UUID="a", L4H_BOOT_ENV="/grub\nenv")]:
-            with self.subTest(settings=settings):
-                self.assertNotEqual(self.generate(**settings).returncode, 0)
 
     def test_wrapper_status_device_path_and_cleanup(self):
         binary = self.work / "efi-wrapper-test"

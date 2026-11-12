@@ -2,8 +2,8 @@
 # Build l4h as one UEFI application: an EFI wrapper containing a standalone
 # GRUB whose memdisk holds the seL4 kernel, l4h-root, the guest kernel that
 # dom0 and every VM run and its module tree (DESIGN.md §5.6). dom0's
-# initramfs and settings come from the EFI system partition the application
-# was loaded from (DESIGN.md §11):
+# initramfs and settings come from the partition selected at boot
+# (DESIGN.md §11):
 #   /l4h/dom0/initrd    dom0's initramfs (optional)
 #   /l4h/l4h.conf       host and dom0 settings (optional; see the manual)
 # GRUB passes these to l4h-root as boot modules.  With /l4h/l4h-mk.conf
@@ -11,15 +11,12 @@
 # partition N takes /l4h/pN/dom0/initrd and /l4h/pN/l4h.conf
 # (tools/mkshim-grub.sh, DESIGN.md §11.4); the shim and its slot kernels
 # come from L4H_MKSHIM (default build/mkshim[-VARIANT], tools/build-mkshim.sh),
-# when built. By default, /EFI/L4H/grubenv on exactly one device selects
+# when built. At boot, /EFI/L4H/grubenv on exactly one device selects
 # the partition using l4h_esp_uuid or l4h_esp_label. With no such file,
 # use the loading partition or, when GRUB cannot tell, the first with
 # /l4h/dom0/initrd (or /l4h/l4h.conf). Multiple selector files fail closed.
-# L4H_ESP_UUID or L4H_ESP_LABEL selects the partition explicitly instead.
-# With L4H_BOOT_ENV=/absolute/path/to/grubenv, that partition holds a shared
-# GRUB environment block. Its l4h_esp_uuid or l4h_esp_label selects the slot
-# containing /l4h. Only the selected slot's l4h.conf is sourced or loaded;
-# an explicit selector that cannot be resolved returns EFI_LOAD_ERROR to
+# Only the selected slot's l4h.conf is sourced or loaded;
+# a selector that cannot be resolved returns EFI_LOAD_ERROR to
 # the caller for A/B fallback, before any slot's files are read.
 # Measured boot: the firmware measures this application, with everything
 # in it, and the child GRUB image into PCR 4; GRUB's tpm module measures
