@@ -1,4 +1,4 @@
-From 809d5c0e646577d49929593270a0117e0b7e0301 Mon Sep 17 00:00:00 2001
+From 7ff22c5460c8a3a898413a4b0bb51c51492b6506 Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Sun, 18 Oct 2026 02:18:52 -0700
 Subject: [PATCH] x86, mcs: drop stale timer interrupts before taking the
@@ -28,10 +28,28 @@ return to user level without taking the lock. The armed deadline
 (ksArmedDeadline) is compared with the time first, so interrupts that
 are due do not pay for the MSR read, which traps when virtualised.
 ---
- include/arch/x86/arch/machine/timer.h | 12 +++++++++
- src/arch/x86/c_traps.c                | 38 +++++++++++++++++++++++++++
- 2 files changed, 50 insertions(+)
+ include/arch/x86/arch/kernel/traps.h  |  4 +++
+ include/arch/x86/arch/machine/timer.h | 12 ++++++++
+ src/arch/x86/32/c_traps.c             | 26 +++++++++++++++--
+ src/arch/x86/64/c_traps.c             | 24 ++++++++++++++--
+ src/arch/x86/c_traps.c                | 41 +++++++++++++++++++++++++++
+ 5 files changed, 102 insertions(+), 5 deletions(-)
 
+diff --git a/include/arch/x86/arch/kernel/traps.h b/include/arch/x86/arch/kernel/traps.h
+index 4b0ee0996..e3ca6cab0 100644
+--- a/include/arch/x86/arch/kernel/traps.h
++++ b/include/arch/x86/arch/kernel/traps.h
+@@ -34,6 +34,10 @@ VISIBLE NORETURN;
+ void restore_user_context(void)
+ VISIBLE NORETURN;
+ 
++/* Stale-timer return for a native thread that never took the lock. */
++void restore_user_context_no_lock(void)
++VISIBLE NORETURN;
++
+ void c_nested_interrupt(int irq)
+ VISIBLE;
+ 
 diff --git a/include/arch/x86/arch/machine/timer.h b/include/arch/x86/arch/machine/timer.h
 index 5771277b5..3367f7d33 100644
 --- a/include/arch/x86/arch/machine/timer.h
@@ -55,8 +73,85 @@ index 5771277b5..3367f7d33 100644
  #else
  static inline void resetTimer(void)
  {
+diff --git a/src/arch/x86/32/c_traps.c b/src/arch/x86/32/c_traps.c
+index d32a28a1d..66a50080b 100644
+--- a/src/arch/x86/32/c_traps.c
++++ b/src/arch/x86/32/c_traps.c
+@@ -97,11 +97,31 @@ static void NORETURN restore_vmx(tcb_t *cur_thread, vcpu_t *vcpu)
+ #endif
+ 
+ void NORETURN VISIBLE restore_user_context(void);
+-void NORETURN VISIBLE restore_user_context(void)
++static void NORETURN restore_user_context_internal(bool_t lock_held);
++
++void VISIBLE NORETURN restore_user_context(void)
+ {
+-    c_exit_hook();
++    restore_user_context_internal(true);
++}
++
++void VISIBLE NORETURN restore_user_context_no_lock(void)
++{
++    restore_user_context_internal(false);
++}
+ 
+-    NODE_UNLOCK;
++static void NORETURN restore_user_context_internal(bool_t lock_held)
++{
++    /* Only the stale-timer fast return may arrive without the lock. It
++     * cannot return to a VM, which needs locked VCPU preparation. */
++#ifdef CONFIG_VTX
++    assert(lock_held || thread_state_ptr_get_tsType(&NODE_STATE(ksCurThread)->tcbState)
++           != ThreadState_RunningVM);
++#endif
++
++    c_exit_hook();
++    if (lock_held) {
++        NODE_UNLOCK;
++    }
+ 
+     /* we've now 'exited' the kernel. If we have a pending interrupt
+      * we should 'enter' it again */
+diff --git a/src/arch/x86/64/c_traps.c b/src/arch/x86/64/c_traps.c
+index 3623bd1ef..99176c232 100644
+--- a/src/arch/x86/64/c_traps.c
++++ b/src/arch/x86/64/c_traps.c
+@@ -198,11 +198,31 @@ static void NORETURN restore_vmx(tcb_t *cur_thread, vcpu_t *vcpu)
+ }
+ #endif
+ 
++static void NORETURN restore_user_context_internal(bool_t lock_held);
++
+ void VISIBLE NORETURN restore_user_context(void)
+ {
+-    c_exit_hook();
++    restore_user_context_internal(true);
++}
++
++void VISIBLE NORETURN restore_user_context_no_lock(void)
++{
++    restore_user_context_internal(false);
++}
+ 
+-    NODE_UNLOCK;
++static void NORETURN restore_user_context_internal(bool_t lock_held)
++{
++    /* Only the stale-timer fast return may arrive without the lock. It
++     * cannot return to a VM, which needs locked VCPU preparation. */
++#ifdef CONFIG_VTX
++    assert(lock_held || thread_state_ptr_get_tsType(&NODE_STATE(ksCurThread)->tcbState)
++           != ThreadState_RunningVM);
++#endif
++
++    c_exit_hook();
++    if (lock_held) {
++        NODE_UNLOCK;
++    }
+ 
+     /* we've now 'exited' the kernel. If we have a pending interrupt
+      * we should 'enter' it again */
 diff --git a/src/arch/x86/c_traps.c b/src/arch/x86/c_traps.c
-index 16db3dd0e..cea4cc896 100644
+index 16db3dd0e..a228784a1 100644
 --- a/src/arch/x86/c_traps.c
 +++ b/src/arch/x86/c_traps.c
 @@ -26,6 +26,32 @@ void VISIBLE c_nested_interrupt(int irq)
@@ -92,18 +187,21 @@ index 16db3dd0e..cea4cc896 100644
  void VISIBLE NORETURN c_handle_interrupt(int irq, int syscall)
  {
      /* need to run this first as the NODE_LOCK code might end up as a function call
-@@ -35,6 +61,18 @@ void VISIBLE NORETURN c_handle_interrupt(int irq, int syscall)
+@@ -35,6 +61,21 @@ void VISIBLE NORETURN c_handle_interrupt(int irq, int syscall)
          x86_enable_ibrs();
      }
  
 +#ifdef CONFIG_KERNEL_MCS
-+    /* Drop a stale timer interrupt without taking the kernel lock: the
-+     * timer will raise the interrupt again at the deadline it is armed
-+     * with. */
-+    if (irq == int_timer && timerIRQIsStale()) {
++    /* Native threads can drop a stale tick without taking the lock. A
++     * VM return needs locked VCPU preparation, so use the normal path. */
++    if (irq == int_timer && timerIRQIsStale()
++#ifdef CONFIG_VTX
++        && thread_state_ptr_get_tsType(&NODE_STATE(ksCurThread)->tcbState) != ThreadState_RunningVM
++#endif
++       ) {
 +        c_entry_hook();
 +        apic_ack_active_interrupt();
-+        restore_user_context();
++        restore_user_context_no_lock();
 +        UNREACHABLE();
 +    }
 +#endif
