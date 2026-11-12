@@ -535,6 +535,9 @@ Variable & Meaning & Default \\
   console & 1 \\
 \texttt{iommu\_intremap} & 1: with \texttt{iommu}, also let each device raise
   only its own interrupts; 0: pass interrupts unremapped & 1 \\
+\texttt{pcie\_acs} & 1: with \texttt{iommu}, turn on PCIe Access Control
+  Services, so that one device cannot reach another's registers past the
+  IOMMU; 0: leave them as the firmware set them & 1 \\
 \bottomrule
 \end{tabularx}
 \caption{Host settings. Each defaults to its \texttt{L4H\_}-prefixed,

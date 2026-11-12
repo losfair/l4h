@@ -2476,8 +2476,36 @@ Common behaviour:
   the MSI data. Root programs blkd's and netd's MSI-X with them, so drivers
   write the MSI-X table unchanged, and a device can raise only its group's
   vectors.
-- **Requester spoofing.** Root does not enable ACS source validation, so
-  requester validation relies on the PCI fabric.
+- **Peer-to-peer and requester spoofing** (`pcie_acs`, on by default; `acs.rs`).
+  Without PCIe Access Control Services a switch routes a request from one
+  downstream port to a sibling's BARs directly, and a root port may route
+  one to another root port inside the root complex: such a request never
+  reaches the IOMMU, so a device could write another device's registers
+  whatever its domain maps. Nor does a port check that a request's
+  requester ID is one behind it, so a device could take another's ID, and
+  with it the other's domain and interrupt entries. So with the IOMMU on,
+  before it enables any device, root turns on in every PCIe function with
+  the ACS capability each of Source Validation, Translation Blocking (root
+  enables ATS nowhere), P2P Request and Completion Redirect and Upstream
+  Forwarding that the function implements, as Linux does, and reads the
+  control back. ACS is in extended configuration space, which the
+  configuration ports do not reach: root maps the ECAM page (from the
+  MCFG) of each PCIe function on segment 0 for it. A multikernel
+  partition uses the pages it has (§11.4), so it sets ACS in its own
+  functions only; the bridges above them, which it maps read-only, keep
+  what the firmware set.
+  - A root port or switch downstream port with devices below it that
+    still does not isolate them (no ACS, or a bit that does not stick) is
+    logged at boot: those devices can reach each other's BARs without the
+    IOMMU. QEMU's `xio3130-downstream` ports have no ACS; its
+    `pcie-root-port` has it. Functions of one multi-function device
+    without ACS can reach each other too, which is not reported.
+  - Without an MCFG (e.g. GCE, whose VMs have no IOMMU anyway) root says
+    ACS is off. Without the IOMMU root leaves ACS alone: a device reaches
+    all memory then.
+  - The ECAM pages root maps are root's, so trustd's AML can no longer
+    write them as memory; it still reaches the first 256 bytes of each
+    function through the configuration ports (§10.2).
 - **Tables** come from 2 MiB chunks of root memory (`layout::IOMMU_TABLES`)
   and are kept until reboot. Unmapping clears leaf entries and keeps the
   tables, so a pool slot attached again reuses them. Root stops if an IOMMU
@@ -2572,6 +2600,10 @@ Common behaviour:
 
 - `L4H_QEMU_IOMMU=intel` adds QEMU's `intel-iommu` with interrupt remapping
   and caching mode (so cached missing translations must be invalidated).
+  `tests/run-acstest.sh` checks the ACS setup against a model of
+  configuration space: only the bits a function implements are set,
+  firmware's other bits are kept, a bit that does not stick is reported,
+  and looping or out-of-range capability lists end.
   `tests/run-vtdtest.sh` checks firmware parsing, address bounds, interrupt
   source validation and command encodings on the host; `--qemu` also runs
   virtio-blk, NVMe, VM lifecycle/unmapping, NIC and serial-monitor tests,
@@ -2597,7 +2629,11 @@ Common behaviour:
   confinement, `--controllers 17` a shared interrupt table, and `--tap TAP0
   TAP1` uses vhost-net. The AMD-Vi PCIe-to-PCI case needs QEMU 10.2 or
   later (10.0 caches the secondary bus number before firmware assigns it);
-  CI uses conventional bridges with Debian 13's QEMU 10.0.
+  CI uses conventional bridges with Debian 13's QEMU 10.0. The
+  `pcie-switch` topology puts each device on its own downstream port of a
+  switch behind a root port, and checks that root turns ACS on in the root
+  port and reports the switch's ports, which have none in QEMU. With AMD-Vi
+  on QEMU 10.0 its first NIC gets no traffic, with `pcie_acs=0` too.
 - `python3 tests/amdvi-qemu.py` inspects the devices' and alias's shared
   tables, checks every vector, and uses EDU devices to verify that neither
   an unrelated requester nor an aliased sibling can write outside its mapped
@@ -4956,6 +4992,7 @@ machine and guests of 256–512 MiB.
 | `tests/run-install-vm.sh debian-13-nocloud-amd64.qcow2 [release-directory] [1\|2]` | in a disposable UEFI/KVM VM, install from native Debian with one or two uplinks, verify each switch and network, then return to native Linux; uses prebuilt releases and `sudo -u "$L4H_QEMU_USER"` (defaults to the invoking user); `INSTALL_VM_SWAP_NAMES=1` with two NICs also tests exchanging eth0/eth1 names; `INSTALL_VM_FIRMWARE=bios INSTALL_VM_MEMORY=1G INSTALL_VM_CPUS=1` tests small-VM defaults through BIOS GRUB |
 | `tests/run-versiontest.sh` | host version metadata: release tags, development builds, overrides and worktrees |
 | `tests/run-flagstest.sh` | focused flags-only boot: console/display seals, kernel taints, userspace gates and instance reuse, on either architecture |
+| `tests/run-acstest.sh` | PCIe ACS setup against a model of configuration space: implemented bits only, firmware bits kept, bits that do not stick, hostile capability lists |
 | `tests/run-trusttest.sh` | taint/seal permissions, atomic gates, instances, seqlock snapshots and verifier policy |
 | `tests/run-alloctest.sh` | host allocator growth under fragmentation, reclaim, fixed-container panic safety and memd grant validation |
 | `tests/run-devicetest.sh [--qemu]` | console ordering, bounded sequence gaps, cursor wrap, draining and writer wakeups; endpoint fairness and malformed replies; checked wiring cannot be replaced; memory-hotplug completion and timed retry scheduling; USB DMA ownership on failed halt/disable; control completions after manager failure; block replies across nested calls; host log wraparound and concurrent writers; with QEMU, hypercalls under continuous console output |

@@ -1,0 +1,175 @@
+//! PCIe Access Control Services (DESIGN.md §9.5, "Peer-to-peer and
+//! requester spoofing").  Without ACS a switch routes a request from one
+//! of its downstream ports to a sibling's BARs directly, and a root port
+//! may route one to another root port inside the root complex: neither
+//! request reaches the IOMMU, so a device could write another device's
+//! registers whatever its domain maps.  Nor does a port check that a
+//! request's requester ID is one behind it, so a device could take
+//! another's ID and with it the other's domain and interrupt entries.
+//!
+//! Root therefore turns on, in every function that has the capability,
+//! each of these the function implements, as Linux does
+//! (pci_std_enable_acs, with ATS disabled):
+//!
+//! - Source Validation: a downstream port drops requests whose requester
+//!   bus is not behind it;
+//! - Translation Blocking: ports drop requests marked translated (ATS),
+//!   which would bypass the I/O page tables (root enables ATS nowhere);
+//! - P2P Request and Completion Redirect: peer requests and completions go
+//!   up to the root complex, and through the IOMMU, instead of across;
+//! - Upstream Forwarding: a switch port sends them on upstream rather than
+//!   back down.
+//!
+//! Egress Control and Direct Translated P2P are left as they are.
+//!
+//! Extended configuration space is reached through ECAM only (pci.rs);
+//! the reads and writes are the caller's, so that tests/acs.rs can run
+//! this against a model.
+
+/// ACS control (and capability) bits.
+pub const SV: u16 = 1 << 0;
+pub const TB: u16 = 1 << 1;
+pub const RR: u16 = 1 << 2;
+pub const CR: u16 = 1 << 3;
+pub const UF: u16 = 1 << 4;
+/// What root enables, of what a function implements.
+pub const ENABLE: u16 = SV | TB | RR | CR | UF;
+/// What isolates the functions below a port from each other (Linux's
+/// REQ_ACS_FLAGS), of what the port implements: the specification has a
+/// port that cannot route peer requests leave Redirect unimplemented.
+pub const ISOLATE: u16 = SV | RR | CR | UF;
+
+const EXT_ACS: u32 = 0x000d;
+const CAP_PCIE: u8 = 0x10;
+/// PCI Express Capabilities register, Device/Port Type.
+pub const ROOT_PORT: u8 = 4;
+pub const DOWNSTREAM_PORT: u8 = 6;
+
+/// Configuration space of segment 0 functions, `bdf` as bus << 8 |
+/// device << 3 | function.
+pub trait Config {
+    /// A dword of the first 256 bytes; all ones if there is no function.
+    fn read(&self, bdf: u16, off: u8) -> u32;
+    /// A dword of extended configuration space (0x100..0x1000), if it can
+    /// be reached.
+    fn read_ext(&self, bdf: u16, off: u16) -> Option<u32>;
+    /// Write one; false if the function's space cannot be written.
+    fn write_ext(&self, bdf: u16, off: u16, val: u32) -> bool;
+}
+
+/// The function's PCI Express capability: its Device/Port Type, if it
+/// has one.  A list that loops or points into the header is not followed.
+pub fn pcie_type(c: &impl Config, bdf: u16) -> Option<u8> {
+    if c.read(bdf, 4) & (1 << 20) == 0 {
+        return None;
+    }
+    let mut cap = (c.read(bdf, 0x34) & 0xfc) as u8;
+    let mut seen = 0u64;
+    while cap != 0 {
+        if cap < 0x40 || seen & (1 << (cap / 4)) != 0 {
+            return None;
+        }
+        seen |= 1 << (cap / 4);
+        let header = c.read(bdf, cap);
+        if header as u8 == CAP_PCIE {
+            return Some((header >> 20 & 0xf) as u8);
+        }
+        cap = (header >> 8 & 0xfc) as u8;
+    }
+    None
+}
+
+/// The offset of extended capability `id`, if the function has it.  Every
+/// header is in [0x100, 0x1000) and dword aligned; a list that loops ends.
+fn find_ext(c: &impl Config, bdf: u16, id: u32) -> Option<u16> {
+    let mut off = 0x100u16;
+    let mut seen = [0u64; 16];
+    loop {
+        let i = off as usize / 4;
+        if seen[i / 64] & (1 << (i % 64)) != 0 {
+            return None;
+        }
+        seen[i / 64] |= 1 << (i % 64);
+        let header = c.read_ext(bdf, off)?;
+        if header == 0 || header == u32::MAX {
+            return None;
+        }
+        if header & 0xffff == id {
+            return Some(off);
+        }
+        let next = (header >> 20) as u16 & 0xffc;
+        if next < 0x100 {
+            return None;
+        }
+        off = next;
+    }
+}
+
+/// What `enable` found and did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Acs {
+    /// Extended configuration space cannot be reached, or written.
+    Unreachable,
+    /// The function has no ACS capability.
+    Absent,
+    /// The capability's bits, the control before, and as read back after
+    /// root's write.
+    Present { cap: u16, before: u16, after: u16 },
+}
+
+impl Acs {
+    /// Whether a port with this isolates the functions below it.
+    pub fn isolates(self) -> bool {
+        match self {
+            Acs::Present { cap, after, .. } => after & cap & ISOLATE == cap & ISOLATE,
+            _ => false,
+        }
+    }
+}
+
+/// Turn on the ENABLE bits function `bdf` implements, keeping the others.
+pub fn enable(c: &impl Config, bdf: u16) -> Acs {
+    if c.read_ext(bdf, 0x100).is_none() {
+        return Acs::Unreachable;
+    }
+    let Some(off) = find_ext(c, bdf, EXT_ACS) else { return Acs::Absent };
+    // The capability register, then control, in one dword.
+    let Some(regs) = off.checked_add(4).and_then(|o| c.read_ext(bdf, o)) else { return Acs::Unreachable };
+    let (cap, before) = (regs as u16, (regs >> 16) as u16);
+    let want = before | (cap & ENABLE);
+    if want != before && !c.write_ext(bdf, off + 4, (want as u32) << 16 | cap as u32) {
+        return Acs::Unreachable;
+    }
+    let after = c.read_ext(bdf, off + 4).map_or(before, |r| (r >> 16) as u16);
+    Acs::Present { cap, before, after }
+}
+
+/// Whether bridge `bdf` has a function on its secondary bus.
+pub fn has_children(c: &impl Config, bdf: u16) -> bool {
+    let buses = c.read(bdf, 0x18);
+    let secondary = (buses >> 8) as u8;
+    // A disabled bridge, or one that names its own bus.
+    if secondary == 0 || secondary as u16 == bdf >> 8 {
+        return false;
+    }
+    (0..32u16).any(|dev| c.read((secondary as u16) << 8 | dev << 3, 0) & 0xffff != 0xffff)
+}
+
+/// The names of the bits set in `bits`, for the log.
+pub struct Bits(pub u16);
+
+impl core::fmt::Display for Bits {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        let mut first = true;
+        for (bit, name) in [(SV, "SV"), (TB, "TB"), (RR, "RR"), (CR, "CR"), (UF, "UF"), (1 << 5, "EC"), (1 << 6, "DT")] {
+            if self.0 & bit != 0 {
+                write!(f, "{}{}", if first { "" } else { " " }, name)?;
+                first = false;
+            }
+        }
+        if first {
+            f.write_str("none")?;
+        }
+        Ok(())
+    }
+}
