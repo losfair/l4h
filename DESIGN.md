@@ -173,13 +173,15 @@ guest's `arch/l4h` likewise builds only 64-bit kernels. Upstream seL4's own
   The installer picks the variant (§11.3).
 - Development builds keep `KernelDebugBuild` on. `L4H_RELEASE=1
   tools/build-kernel.sh` turns the debug build off but keeps kernel
-  printing for the host components' serial log.
+  printing for boot messages and fatal errors. Host output goes through
+  l4h-logd (§10.4).
 - `L4H_RELEASE=1` also builds the host components with Cargo's release
   profile (optimised; overflow checks off: §10, "Integer arithmetic"), into
   `host/target/<target>/release` rather than `debug`
   (`tools/host-profile.sh`, the one definition: every script that
   builds, packages or boots them sources it, the Python tests through
-  `tests/host_profile.py`), and has them print critical errors only.
+  `tests/host_profile.py`). Host informational messages and guest consoles
+  are printed in either profile.
 
 Debug syscalls (including `seL4_DebugHalt`, which stops the machine) need
 no capability in seL4. Patch 0008 reserves them to threads with an MCP of
@@ -2404,7 +2406,7 @@ permanent MACs. Other master devices remain unsupported.
   numbered from one counter of the guest, into a ring in its event page,
   and kicks the VMM. The VMM prints the records of all rings in sequence
   order into a host-owned per-guest ring, which vmmgr reads for
-  `console_read`, and, in verbose builds, to the serial port with a `[vmN]`
+  `console_read`, and, in every build, to the serial port with a `[vmN]`
   prefix.
   - Head and tail wrap at twice the ring size, so their distance
     distinguishes full from empty.
@@ -3197,15 +3199,15 @@ one way to do each part of it:
   `wiring.rs`.
 
 **Serial output** goes through shared memory to l4h-logd (§10.4), and root
-drives COM1 input for the monitor. The port takes about 11 KB/s, so prints
-are rare:
+drives COM1 input for the monitor. The port takes about 11 KB/s; writers
+enqueue output without waiting for it:
 
 - informational messages (device discovery, guest lifecycle, balancer
-  moves) use `info!`, which prints only when `host::VERBOSE`, not in
-  `L4H_RELEASE=1` builds. Release builds print critical errors only, and
-  repeated ones (failed I/O) only the first few times (`l4h_rt::ErrorLimit`);
-- guest consoles, dom0's included, are copied to the serial port only when
-  verbose; they always go to the console rings `console_read` serves;
+  moves) use `info!`, and critical diagnostics use `log!`. Both print in
+  every build; repeated errors (failed I/O) print only the first few times
+  (`l4h_rt::ErrorLimit`);
+- guest consoles, dom0's included, are copied to the serial port in every
+  build; they also go to the console rings `console_read` serves;
 - the serial monitor's replies and the opt-in watchdog dumps always print.
 
 `tests/check-debug-print.sh` keeps host code from printing through the
@@ -4091,10 +4093,11 @@ whichever test looked for that line (`tests/run-selftest.sh` checks it).
   bytes of a character for C1 controls. Guest names
   that root's monitor or vmmgr prints, and a guest's console, cannot move
   the terminal's cursor over another line or pass for another writer's.
-- **Writers.** `log!` and printing `info!` write the writer's serial ring or
-  lane as well as its log lane. A VMM gathers its guest's console by line,
-  and sends what it has of one after 100 ms, so that prompts show. Panic
-  text is gathered by line. The ring's timestamps are not printed.
+- **Writers.** `log!` and `info!` write the writer's serial ring or
+  lane as well as its log lane in every build. A VMM gathers its guest's
+  console by line, and sends what it has of one after 100 ms, so that
+  prompts show. Panic text is gathered by line. The ring's timestamps are
+  not printed.
 - **logd** wakes on a 10 ms timer, since writers cannot wake it. `Merge`
   (also in `l4h_host::serial`) prints the record with the lowest timestamp
   of any ring, then lines of kernel console rings. A record claimed and not

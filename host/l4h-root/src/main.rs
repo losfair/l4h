@@ -7,15 +7,15 @@
 #![no_std]
 #![no_main]
 
-/// Always retained; printed to serial only in verbose builds.
+/// Always retained and queued for logd in every build.
 macro_rules! info {
     ($($arg:tt)*) => {
-        l4h_task::print_log(format_args!($($arg)*), l4h_host::VERBOSE)
+        l4h_task::print_log(format_args!($($arg)*))
     };
 }
 
 macro_rules! log {
-    ($($arg:tt)*) => { l4h_task::print_log(format_args!($($arg)*), true) };
+    ($($arg:tt)*) => { l4h_task::print_log(format_args!($($arg)*)) };
 }
 
 #[cfg(target_arch = "x86_64")]

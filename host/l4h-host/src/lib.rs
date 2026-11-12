@@ -33,21 +33,15 @@ pub mod vmmgr;
 pub mod wire;
 pub mod wiring;
 
-/// Whether host components print informational messages.  The serial port
-/// takes about 11 KB/s, so release builds (`L4H_RELEASE=1` when the host is
-/// built) print critical errors only; informational messages use `info!`.
-/// Both kinds are retained in the shared host log ring in every build.
-pub const VERBOSE: bool = match option_env!("L4H_RELEASE") {
-    Some(v) => !matches!(v.as_bytes(), [b'1']),
-    None => true,
-};
-
 /// The wiring audit (l4h_rt::init, l4h_task's give_edge), which uses
 /// seL4_DebugCapIdentify, runs in debug host builds only.  A host is built
 /// against the debug kernel's headers whatever kernel it boots, so the
 /// kernel's DEBUG_BUILD does not say whether that call exists: the release
 /// kernels (`L4H_RELEASE=1`) boot release hosts, which do not make it.
-pub const AUDIT: bool = VERBOSE;
+pub const AUDIT: bool = match option_env!("L4H_RELEASE") {
+    Some(v) => !matches!(v.as_bytes(), [b'1']),
+    None => true,
+};
 
 /// Whether the host has the test-only fault injection tests/run-logdtest.sh
 /// uses (`L4H_TEST_INJECT=1` when the host is built).

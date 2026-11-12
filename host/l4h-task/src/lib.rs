@@ -17,15 +17,13 @@
 extern crate std;
 
 macro_rules! log {
-    ($($arg:tt)*) => { crate::print_log(format_args!($($arg)*), true) };
+    ($($arg:tt)*) => { crate::print_log(format_args!($($arg)*)) };
 }
 
-/// Retain a host diagnostic, and optionally print it on the serial port.
-pub fn print_log(args: core::fmt::Arguments<'_>, serial: bool) {
+/// Retain a host diagnostic and queue it for logd in every build.
+pub fn print_log(args: core::fmt::Arguments<'_>) {
     l4h_host::log::record(args);
-    if serial {
-        l4h_host::serial::record(args);
-    }
+    l4h_host::serial::record(args);
 }
 
 pub mod component;

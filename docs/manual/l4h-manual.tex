@@ -325,14 +325,15 @@ never built into \texttt{l4h-root}: changing it needs no rebuild
 \cmd{tools/build-kernel.sh} builds a debug seL4 kernel by default: it checks
 assertions, and prints diagnostics on the serial port. For production, build
 it with \texttt{L4H\_RELEASE=1 tools/build-kernel.sh}, then rebuild the host
-and images with \texttt{L4H\_RELEASE=1} too. Both builds keep printing on,
-since the host components log through the kernel.
+and images with \texttt{L4H\_RELEASE=1} too. Both builds keep kernel printing
+on for boot messages and fatal errors.
 
 \texttt{L4H\_RELEASE=1} also builds the host components with Cargo's
 release profile, optimised and with integer overflow left unchecked (the
 components' arithmetic does not rely on the checks), into
 \file{host/target/\allowbreak x86\_64-sel4-roottask/\allowbreak release/}
-instead of \file{debug/}, and makes them print critical errors only. The
+instead of \file{debug/}. Host informational messages and guest consoles
+go through \texttt{l4h-logd} to the serial port in both profiles. The
 scripts that package or boot the host (\cmd{tools/mkefi.sh},
 \cmd{tools/mkbios.sh}, \cmd{tools/mkimage.sh}, the tests) read it from
 the directory \texttt{L4H\_RELEASE} selects.

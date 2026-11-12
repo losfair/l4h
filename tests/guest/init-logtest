@@ -1,5 +1,5 @@
 #!/bin/sh
-# Save results to disk as well: release builds suppress guest serial output.
+# Save results to disk as well, independently of the serial output.
 mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev

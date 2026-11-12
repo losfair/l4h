@@ -7,7 +7,7 @@
 #![no_std]
 #![no_main]
 
-/// Always retained; printed to serial only in verbose builds.
+/// Always retained and queued for logd in every build.
 macro_rules! info {
     ($($arg:tt)*) => {
         l4h_rt::info!($($arg)*)

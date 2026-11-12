@@ -44,7 +44,7 @@ pub mod mailbox;
 pub use failure::{FailureHandler, set_failure_handler};
 
 /// Limits a recurring critical error (such as failed I/O) to its first few
-/// prints: the serial port is slow (see `host::VERBOSE`).
+/// prints: the serial port is slow.
 pub struct ErrorLimit(u32);
 
 impl ErrorLimit {
@@ -64,26 +64,24 @@ impl ErrorLimit {
     }
 }
 
-/// An informational message: always retained, printed only when verbose.
+/// An informational message: retained and queued for logd in every build.
 #[macro_export]
 macro_rules! info {
     ($($arg:tt)*) => {
-        $crate::print_log(format_args!($($arg)*), $crate::host::VERBOSE)
+        $crate::print_log(format_args!($($arg)*))
     };
 }
 
 /// A critical diagnostic: retained and also printed to serial.
 #[macro_export]
 macro_rules! log {
-    ($($arg:tt)*) => { $crate::print_log(format_args!($($arg)*), true) };
+    ($($arg:tt)*) => { $crate::print_log(format_args!($($arg)*)) };
 }
 
 #[doc(hidden)]
-pub fn print_log(args: core::fmt::Arguments<'_>, serial: bool) {
+pub fn print_log(args: core::fmt::Arguments<'_>) {
     host::log::record(args);
-    if serial {
-        host::serial::record(args);
-    }
+    host::serial::record(args);
 }
 
 /// Text panicking prints outside `log!`, gathered by line: a thread that

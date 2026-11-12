@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fault/panic/shutdown diagnostics through l4hctl, including quiet builds.
+# Fault/panic/shutdown diagnostics through l4hctl, and serial output in every build.
 set -euo pipefail
 # e2fsprogs installs mkfs.ext4 and debugfs outside an ordinary user's PATH.
 export PATH="$PATH:/usr/sbin:/sbin"
@@ -26,3 +26,9 @@ L4H_QEMU_ARGS="-drive file=$out/result.img,if=none,id=logdisk,format=raw -device
 debugfs -R 'cat /result' "$out/result.img" 2>/dev/null >"$out/result"
 cat "$out/result"
 grep -qx 'LOGTEST: PASS' "$out/result"
+# Informational host messages and both dom0's and other guests' consoles
+# reach logd even with L4H_RELEASE=1 (as this test runs in CI).
+grep -aq 'l4h-root: .*core(s)' "$out/output.log"
+grep -aEq '\[vmmgr\] l4h-vmmgr: guest [0-9]+ power request' "$out/output.log"
+grep -aq 'LOGTEST: PASS' "$out/output.log"
+grep -aEq '\[vm[0-9]+\] LOGVM: ready' "$out/output.log"
