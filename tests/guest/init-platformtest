@@ -9,7 +9,7 @@ echo "PLATFORMTEST: initrd $slot"
 grep -q "platform_slot=$slot" /proc/cmdline || fail 'wrong l4h.conf'
 l4hctl pci > /tmp/pci || fail 'PCI list'
 grep -q 'owner blkd' /tmp/pci || fail 'PCI disk owner'
-grep -q 'owner netd' /tmp/pci || fail 'PCI NIC owner'
+grep -q 'owner nicd' /tmp/pci || fail 'PCI NIC owner'
 grep -q 'owner memd' /tmp/pci || fail 'PCI balloon owner'
 grep -q 'owner firmware' /tmp/pci || fail 'PCI unclaimed xHCI owner'
 echo "PLATFORMTEST: PCI_JSON $(l4hctl pci --json)"

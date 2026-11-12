@@ -178,7 +178,7 @@ assert len(pci) > 124, len(pci)
 assert len([p for p in pci if (p['vendor'], p['device']) == (0x1b36, 5)]) == 128
 bdfs = [p['pci'] for p in pci]
 assert bdfs == sorted(set(bdfs))
-assert {'none', 'blkd', 'netd', 'memd', 'firmware'} <= {p['owner'] for p in pci}
+assert {'none', 'blkd', 'nicd', 'memd', 'firmware'} <= {p['owner'] for p in pci}
 assert any((p['vendor'], p['device'], p['subsystem_vendor'], p['class']) == (0x1af4, 0x1041, 0x1af4, 2) for p in pci)
 capacity = pathlib.Path(disk).stat().st_size // 512
 end = (capacity - 2048) & ~7

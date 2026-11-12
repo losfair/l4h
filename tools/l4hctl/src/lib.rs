@@ -76,6 +76,7 @@ pub const PCI_OWNER_MEMD: u16 = 3;
 pub const PCI_OWNER_USBD: u16 = 4;
 pub const PCI_OWNER_FIRMWARE: u16 = 5;
 pub const PCI_OWNER_ROOT: u16 = 6;
+pub const PCI_OWNER_NICD: u16 = 7;
 
 /// A function from root's boot-time PCI inventory (CTL_PCI_LIST).
 #[repr(C)]
@@ -104,6 +105,7 @@ impl CtlPci {
             PCI_OWNER_USBD => "usbd",
             PCI_OWNER_FIRMWARE => "firmware",
             PCI_OWNER_ROOT => "root",
+            PCI_OWNER_NICD => "nicd",
             _ => "unknown",
         }
     }
