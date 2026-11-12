@@ -2514,6 +2514,9 @@ Common behaviour:
     not reported. Root has none of Linux's ACS quirks: root ports of Intel
     PCHs that keep ACS in vendor registers, or that Linux knows to
     isolate without the capability, are reported as not isolating.
+  - ACS is set once, at boot: root has no PCI hotplug, and a port reset
+    by a link going down and up again (which clears its ACS control) is
+    not set again or reported.
   - Without an MCFG (e.g. GCE, whose VMs have no IOMMU anyway) root says
     ACS is off. Without the IOMMU root leaves ACS alone: a device reaches
     all memory then.

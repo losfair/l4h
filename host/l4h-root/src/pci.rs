@@ -344,11 +344,14 @@ impl Pci {
         // The whole plan first: a window that cannot all be carved is not
         // carved at all.  Carving a block only splits Untypeds, so each
         // later block stays inside a free one (they are buddies).
-        let mut plan = l4h_host::fixed::ArrayVec::<(u64, u32), 128>::new();
+        // A block per bus with an odd-MiB base; more only if free device
+        // memory is split below 1 MiB, which then refuses the window.
+        let mut plan = l4h_host::fixed::ArrayVec::<(u64, u32), 256>::new();
         for b in crate::acs::blocks(start, end, w.base, |at| devmem.free_bits(at as usize)) {
-            if b.1 < 12 || plan.push(b).is_err() {
+            if b.1 < 12 {
                 return Err("not free device memory");
             }
+            plan.push(b).map_err(|_| "split into too many pieces of device memory")?;
         }
         for &(at, bits) in plan.iter() {
             let ok = alloc.global(|alloc| {
