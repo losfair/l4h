@@ -420,9 +420,20 @@ fn min_mss_check(rng: &mut Rng) {
             n += 1;
         });
         assert_eq!(n, 10);
-        // A GRO run keeps its segments' size, under MIN_MSS too; netd
-        // segments such a run before a link, as the peer would refuse it.
-        for mss in [10, offload::MIN_MSS - 1, offload::MIN_MSS, 1460] {
+        // A GRO run keeps its segments' size.  Segments under MIN_MSS
+        // start no run: netd (which takes uplink channels' frames as a
+        // link's) would refuse it; they go as they came.
+        for mss in [10, offload::MIN_MSS - 1] {
+            let (mut frame, mut hdr) = tcp_frame(rng, v6, false, 3 * mss, mss);
+            let t = offload::parse_tcp(&frame).unwrap();
+            frame[t.tcp + 13] = 0x10;
+            assert!(offload::sanitize_rx(&mut hdr, &frame, offload::UPLINK_MIN_MSS));
+            let mut segs: Vec<Vec<u8>> = Vec::new();
+            offload::segment(&frame, &hdr, &mut buf, |f, _| segs.push(f.to_vec()));
+            let mut gro = offload::Gro::new();
+            assert!(!gro.add(&segs[0], &[0u8; 12]), "a run of {mss}-byte segments started");
+        }
+        for mss in [offload::MIN_MSS, 1460] {
             let (mut frame, mut hdr) = tcp_frame(rng, v6, false, 3 * mss, mss);
             let t = offload::parse_tcp(&frame).unwrap();
             frame[t.tcp + 13] = 0x10;

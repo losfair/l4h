@@ -666,7 +666,8 @@ impl Netd {
                 Some(uplink::State::Broken) => net::UPLINK_BROKEN,
             };
             let generation = self.uplink_gen[n] as u64 & 0xff_ffff;
-            w[net::UPLINK_STATE].store(state | generation << 8, Ordering::Relaxed);
+            // The offer's words before the state that says they are this
+            // channel's (root reads the state first, with Acquire).
             if let Some(u) = u {
                 let mac = u.offer.mac6().iter().fold(0u64, |m, &b| (m << 8) | b as u64);
                 w[net::UPLINK_MAC].store(mac | (u.offer.mac_mode as u64) << 48, Ordering::Relaxed);
@@ -675,6 +676,7 @@ impl Netd {
                 w[net::UPLINK_TX].store(u.tx_frames, Ordering::Relaxed);
                 w[net::UPLINK_DROPS].store(u.drops, Ordering::Relaxed);
             }
+            w[net::UPLINK_STATE].store(state | generation << 8, Ordering::Release);
         }
         for (p, c) in self.ports.iter().zip(&to.ports) {
             let v = p.as_ref().map_or([0; 3], |p| [p.rx_frames, p.tx_frames, p.drops]);

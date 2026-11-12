@@ -97,20 +97,22 @@ impl<'a> Elf<'a> {
         if shentsize < 64 || shstrndx >= shnum || shoff.checked_add(shentsize * shnum).is_none_or(|end| end > d.len()) {
             return None;
         }
-        let range = |i: usize| -> Option<(usize, usize, u32)> {
+        // A section's bytes in the file; None for one with none there
+        // (SHT_NOBITS) or outside it.
+        let bytes = |i: usize| -> Option<(&'a [u8], u32)> {
             let o = shoff + i * shentsize;
+            if u32_at(d, o + 4) == 8 {
+                return None;
+            }
             let (off, size) = (usize::try_from(u64_at(d, o + 24)).ok()?, usize::try_from(u64_at(d, o + 32)).ok()?);
-            // SHT_NOBITS has no bytes in the file.
-            let ty = u32_at(d, o + 4);
-            (ty == 8 || off.checked_add(size).is_some_and(|end| end <= d.len())).then_some((off, size, u32_at(d, o)))
+            Some((d.get(off..off.checked_add(size)?)?, u32_at(d, o)))
         };
-        let (str_off, str_size, _) = range(shstrndx)?;
-        let names = &d[str_off..str_off + str_size];
+        let (names, _) = bytes(shstrndx)?;
         (0..shnum).find_map(|i| {
-            let (off, size, name_off) = range(i)?;
+            let (b, name_off) = bytes(i)?;
             let rest = names.get(name_off as usize..)?;
-            let end = rest.iter().position(|&b| b == 0)?;
-            (&rest[..end] == name.as_bytes() && u32_at(d, shoff + i * shentsize + 4) != 8).then(|| &d[off..off + size])
+            let end = rest.iter().position(|&c| c == 0)?;
+            (&rest[..end] == name.as_bytes()).then_some(b)
         })
     }
 

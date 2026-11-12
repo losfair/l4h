@@ -73,6 +73,9 @@ pub fn manifest(elf: &[u8]) -> Result<Manifest, &'static str> {
     // area and in ascending order, as l4h_task::component::create loads
     // images (it refuses others, which root must never ask it to).
     let (lo, hi) = e.bounds();
+    if e.segments().next().is_none() || !e.segments().any(|s| (s.vaddr..s.vaddr + s.memsz).contains(&e.entry)) {
+        return Err("its entry point is in no loadable segment");
+    }
     if hi.saturating_sub(lo) > 1 << m.image_max_bits {
         return Err("its image is larger than its manifest says");
     }

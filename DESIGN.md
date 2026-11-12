@@ -5183,6 +5183,8 @@ machine and guests of 256–512 MiB.
 | `tests/run-usbstress.sh` (`STRESS_SECS`, `STRESS_CYCLES`, `USBSTRESS_NATIVE=1`) | USB stress and benchmark: all disks busy while one is pulled and put back, guests destroyed under load, data intact; per-disk throughput and IOPS, optionally against a plain Linux VM |
 | `tests/run-usbnetbench.sh` (`NETBENCH_MB`, `NETBENCH_RUNS`, `USBSTRESS_NATIVE=1`) | USB Ethernet (QEMU's `usb-net`) given whole to a guest: receive and send throughput and ping against a peer on the build host, optionally against a plain Linux VM |
 | `tests/run-usbtest.sh` (`USBTEST_HC=nec`) | whole xHCI controller assignment: left to the firmware until claimed, HID, BOT and UAS disks, a hub, driver reload, destroy during I/O, a second guest (§9.7) |
+| `tests/run-nictest.sh` | NIC drivers outside netd: two NICs, NIC 1's driver panics and hangs and is restarted while NIC 0's uplink keeps working, unbind and rebind, a restart of dom0's uplink driver (`L4H_QEMU_IOMMU=intel\|amd`: confined) |
+| `tests/fuzz-uplink` (in `run-fuzz.sh`) | the uplink channel: honest peers against a model, a producer that scribbles over descriptors and data, a consumer that writes any tail |
 | `tests/run-nettest.sh`, `tests/run-router.sh` | switches, uplink, multi-NIC, isolation, MAC lock, NAT router VM (`NETTEST_LEGACY=1`: legacy virtio-net uplink) |
 | `tests/run-density.sh 30 256` | 30 guests on 4 cores stay responsive |
 | `tests/run-m6test.sh` | dom0 restart, CPU caps, steal time |

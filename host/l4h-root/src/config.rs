@@ -196,10 +196,10 @@ impl Config {
             test_early_panic: false,
             dom0_usb: [None; l4h_host::usb::MAX_GUEST_USB],
             test_usb_handoff_timeout: false,
-            nic_auto: true,
+            nic_auto: parse_usize(option_env!("L4H_NIC_AUTO"), 1) != 0,
             nic_bind: [None; l4h_host::net::MAX_UPLINKS],
-            nic_untrusted_without_iommu: false,
-            nic_max_restarts: 5,
+            nic_untrusted_without_iommu: parse_usize(option_env!("L4H_NIC_UNTRUSTED_WITHOUT_IOMMU"), 0) != 0,
+            nic_max_restarts: parse_usize(option_env!("L4H_NIC_MAX_RESTARTS"), 5),
         };
         let Some(text) = text else { return c };
         let Ok(text) = core::str::from_utf8(text) else {

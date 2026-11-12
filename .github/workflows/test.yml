@@ -171,6 +171,8 @@ jobs:
         run: tests/run-nettest.sh
       - name: Network over a legacy virtio-net uplink
         run: NETTEST_LEGACY=1 tests/run-nettest.sh
+      - name: NIC drivers outside netd (faults, hangs, restarts)
+        run: tests/run-nictest.sh && L4H_QEMU_IOMMU=intel tests/run-nictest.sh
       - name: Intel VT-d DMA and interrupt remapping
         run: tests/run-vtdtest.sh --qemu
       - name: Partition message rings

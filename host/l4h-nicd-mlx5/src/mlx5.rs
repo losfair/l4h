@@ -451,7 +451,8 @@ impl Mlx5 {
         o
     }
 
-    pub fn new(hw: &Hw) -> Self {
+    /// Bring the device up; Err if the firmware refuses a command.
+    pub fn new(hw: &Hw) -> Result<Self, &'static str> {
         let (cfg, hz) = (hw.config, hw.tsc_hz);
         let n = cfg.uplink;
         let table = Mmio(cfg.msix_table.va as usize);
@@ -463,10 +464,15 @@ impl Mlx5 {
         table.w32(8, cfg.msi_data);
         table.w32(12, 0);
         let dma = hw.dma();
-        let nic = Self::open(cfg.bars[0].va as usize, cfg.bars[0].len as usize, dma, hz)
-            .expect("mlx5 initialization");
+        let nic = match Self::open(cfg.bars[0].va as usize, cfg.bars[0].len as usize, dma, hz) {
+            Ok(nic) => nic,
+            Err(e) => {
+                l4h_rt::log!("nicd {}: mlx5 initialization failed: {:?}", n, e);
+                return Err("mlx5 initialization failed");
+            }
+        };
         l4h_rt::info!("nicd {}: mlx5 MAC {:02x?}", n, nic.mac);
-        nic
+        Ok(nic)
     }
 
     pub fn open(regs: usize, regs_len: usize, mut dma: Dma, hz: u64) -> Result<Self, Error> {
@@ -891,7 +897,7 @@ impl Mlx5 {
 /// The SDK's view of the driver (l4h_nicdrv::NicDriver).
 impl crate::sdk::NicDriver for Mlx5 {
     fn start(hw: &Hw) -> Result<Self, &'static str> {
-        Ok(Mlx5::new(hw))
+        Mlx5::new(hw)
     }
     fn offer(&self) -> Offer {
         Mlx5::offer(self)

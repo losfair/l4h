@@ -332,6 +332,12 @@ impl Writer {
         (d.size.saturating_sub(held), free)
     }
 
+    /// Bytes free now, if at least `descs` descriptors are too (else 0).
+    pub fn free_bytes(&self, d: &Dir, descs: u32) -> usize {
+        let (bytes, free) = self.room(d);
+        if free >= descs { bytes } else { 0 }
+    }
+
     /// Whether a frame of `len` bytes fits now.
     pub fn fits(&self, d: &Dir, len: usize) -> bool {
         self.space(d, len).is_some()

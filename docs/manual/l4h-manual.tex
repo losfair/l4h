@@ -539,6 +539,15 @@ Variable & Meaning & Default \\
 \texttt{pcie\_acs} & 1: with \texttt{iommu}, turn on PCIe Access Control
   Services, so that one device cannot reach another's registers past the
   IOMMU; 0: leave them as the firmware set them & 1 \\
+\texttt{nic\_auto} & 1: drive every NIC with the first driver of the bundle
+  that matches it; 0: only those \texttt{nic\_bind} names & 1 \\
+\texttt{nic\_bind} & \texttt{bus:dev.fn DRIVER}: drive that NIC with
+  \texttt{DRIVER}, or leave it to the firmware with \texttt{none}; one line
+  per NIC & none \\
+\texttt{nic\_max\_restarts} & restarts of a NIC's driver within an hour,
+  after which it stays stopped until \cmd{l4hctl nic restart} & 5 \\
+\texttt{nic\_untrusted\_without\_iommu} & 1: let NIC drivers dom0 loads run
+  without IOMMU confinement, as trusted code & 0 \\
 \bottomrule
 \end{tabularx}
 \caption{Host settings. Each defaults to its \texttt{L4H\_}-prefixed,

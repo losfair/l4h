@@ -45,4 +45,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=L4H_SERIAL_PORT");
     println!("cargo:rerun-if-env-changed=L4H_SERIAL_IRQ");
     println!("cargo:rerun-if-env-changed=L4H_FB_CONSOLE");
+    println!("cargo:rerun-if-env-changed=L4H_NIC_AUTO");
+    println!("cargo:rerun-if-env-changed=L4H_NIC_UNTRUSTED_WITHOUT_IOMMU");
+    println!("cargo:rerun-if-env-changed=L4H_NIC_MAX_RESTARTS");
 }

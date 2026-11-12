@@ -328,7 +328,7 @@ impl Netd {
             return None;
         }
         let w = self.published().uplinks.get(nic)?;
-        let s = w[net::UPLINK_STATE].load(Ordering::Relaxed);
+        let s = w[net::UPLINK_STATE].load(Ordering::Acquire);
         Some((s & 0xff, (s >> 8 & 0xff_ffff) as u32, w[net::UPLINK_MAC].load(Ordering::Relaxed)))
     }
 

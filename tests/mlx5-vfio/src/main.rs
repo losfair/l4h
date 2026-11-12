@@ -7,6 +7,10 @@ pub use l4h_host as host;
 macro_rules! info {
     ($($arg:tt)*) => { eprintln!($($arg)*) };
 }
+#[macro_export]
+macro_rules! log {
+    ($($arg:tt)*) => { eprintln!($($arg)*) };
+}
 
 #[allow(dead_code)]
 #[path = "../../../host/l4h-nicd-mlx5/src/mlx5.rs"]

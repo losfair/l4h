@@ -224,8 +224,10 @@ impl<D: NicDriver> Loop<D> {
         let mut blocked = false;
         let more = loop {
             while budget != 0 {
-                // Room for the largest frame, and for the run it may end.
-                if !self.rx.fits(&rx, net::MAX_FRAME) || (self.gro.pending() && !self.rx.fits(&rx, self.gro.pending_len())) {
+                // Room for the largest frame and the run it may end, each
+                // with the padding it may need, and for its segments.
+                let need = self.gro.pending_len() + 3 * net::MAX_FRAME;
+                if self.rx.free_bytes(&rx, 8) < need {
                     blocked = true;
                     break;
                 }
@@ -247,11 +249,17 @@ impl<D: NicDriver> Loop<D> {
             if !blocked && !self.gro_flush() {
                 blocked = true;
             }
+            // Blocked: the device's RX interrupt stays off until netd frees
+            // room (its signal brings the loop back), else a device that
+            // re-arms with completions waiting would interrupt at once.
+            if blocked {
+                break true;
+            }
             let dev = self.dev.as_mut().unwrap();
-            if dev.rx_done() && !blocked {
+            if dev.rx_done() {
                 break false;
             }
-            if budget == 0 || blocked {
+            if budget == 0 {
                 break true;
             }
         };
@@ -263,7 +271,8 @@ impl<D: NicDriver> Loop<D> {
         if blocked {
             // netd signals once it frees room, if it sees the flag.
             let w = &*self.rx;
-            if !uplink::arm(&self.chan.header().rx_full, || w.fits(&rx, net::MAX_FRAME)) {
+            let need = self.gro.pending_len() + 3 * net::MAX_FRAME;
+            if !uplink::arm(&self.chan.header().rx_full, || w.free_bytes(&rx, 8) >= need) {
                 self.rx_blocked = false;
             }
         }
@@ -356,7 +365,11 @@ impl<D: NicDriver> nicd::call::Server for Commands<'_, D> {
         match D::start(&l.hw) {
             Ok(d) => {
                 let offer = d.offer();
-                l.offer = offer.checked().unwrap_or(offer);
+                let Some(checked) = offer.checked() else {
+                    l4h_rt::log!("nicd {}: the driver's offer is out of bounds", l.hw.config.uplink);
+                    return Err(host::errno::EIO);
+                };
+                l.offer = checked;
                 l.chan.header().link_state.store(d.link().0, Ordering::Relaxed);
                 l.link = d.link().0;
                 l.chan.header().publish_offer(&offer);

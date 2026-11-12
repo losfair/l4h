@@ -81,7 +81,7 @@ pub const DEVICE_ATTRS: VmAttributes = VmAttributes::EXECUTE_NEVER;
 
 /// Mapping attributes for device memory written in bursts (ENA's LLQ):
 /// write-combining where the architecture has it.
-fn wc_attrs() -> VmAttributes {
+pub fn wc_attrs() -> VmAttributes {
     #[cfg(target_arch = "x86_64")]
     return VmAttributes::from_inner(sel4::sys::seL4_X86_VMAttributes::seL4_X86_WriteCombining);
     #[cfg(target_arch = "aarch64")]

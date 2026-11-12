@@ -36,7 +36,7 @@ use l4h_host::nicd::{self, Ids, Manifest, call::Request};
 use l4h_host::{self as host, net, uplink, wire, wiring};
 use sel4::{CapRights, ObjectBlueprint, VmAttributes, cap, cap_type};
 
-use crate::blkd::{BarCache, bar_pages, carve_bars, is_legacy_virtio, is_modern_virtio, keep_bits, map_bar_mask, mappable, virtio_bar_mask, virtio_regions};
+use crate::blkd::{BarCache, bar_pages, carve_bars, is_legacy_virtio, is_modern_virtio, keep_bits, mappable, virtio_bar_mask, virtio_regions};
 use crate::component::{self, Component, SpawnArgs, abs_of, root_cap};
 use crate::drivers::Drivers;
 use crate::iommu::Domain;
@@ -52,6 +52,9 @@ pub const MAX_NICS: usize = net::MAX_UPLINKS;
 const FLR_MS: u64 = 100;
 /// A nicd that has not answered a Ping for this long is hung: restarted.
 const HANG_SECS: u64 = 5;
+/// A nicd that has not come up this long after its start is restarted
+/// (an X550's link alone takes 7 s; mlx5's firmware longer).
+const START_SECS: u64 = 120;
 /// Restart backoff: 1 s, doubling, at most this.
 const BACKOFF_MAX_SECS: u64 = 60;
 /// Root slot owners (mem::Slots::track) of the nicds' objects, after
@@ -160,6 +163,12 @@ pub struct Nic {
     /// netd maps the channel and holds it (AddUplink posted, no
     /// RemoveUplink answered since).
     in_netd: bool,
+    /// AddUplink waits for room in netd's mailbox (`tick` posts it).
+    add_pending: bool,
+    /// When this instance was started (Starting has a time limit).
+    started_at: u64,
+    /// dom0 asked for the restart: not counted, and no backoff.
+    manual: bool,
     removing: bool,
     reset_until: u64,
     /// The header dwords an FLR clears (SAVED), while it runs.
@@ -232,6 +241,9 @@ pub fn found(d: pci::Device, ids: Ids, pin: Option<Option<&'static str>>, pci: &
         mac: None,
         generation: 0,
         in_netd: false,
+        add_pending: false,
+        started_at: 0,
+        manual: false,
         removing: false,
         reset_until: 0,
         saved: [0; 8],
@@ -345,9 +357,12 @@ fn group_of(h: &Host, d: pci::Device) -> ArrayVec<u16, 64> {
     // that is below it.
     let mut bus = d.bus;
     for _ in 0..256 {
+        // The bridge whose secondary bus this is: the immediate parent,
+        // then its parent, and so on (one higher up that isolates does
+        // not keep peers below a lower one apart).
         let up = functions.iter().copied().find(|&f| header(f) & 0x7f == 1 && {
-            let (sec, sub) = buses(f);
-            sec != 0 && (sec..=sub).contains(&bus)
+            let (sec, _) = buses(f);
+            sec != 0 && sec == bus
         });
         let Some(bridge) = up else { break };
         let (sec, sub) = buses(bridge);
@@ -357,7 +372,7 @@ fn group_of(h: &Host, d: pci::Device) -> ArrayVec<u16, 64> {
                 add(&mut group, f);
             }
         }
-        if bridge >> 8 == bus as u16 {
+        if (bridge >> 8) as u8 >= bus {
             break;
         }
         bus = (bridge >> 8) as u8;
@@ -382,6 +397,11 @@ fn confined(h: &Host, i: usize, driver: usize) -> bool {
         return false;
     }
     let n = &nics()[i];
+    // A device behind no IOMMU unit gets no domain: its DMA is
+    // untranslated.
+    if !matches!(n.dom, Some(d) if d != Domain::None) {
+        return false;
+    }
     n.group.iter().all(|&f| {
         if f == u16::MAX {
             return false;
@@ -443,7 +463,13 @@ fn allowed(h: &Host, i: usize, d: usize) -> Result<(), &'static str> {
 
 /// Bind NIC `i` to `driver`, or the first that matches, and start it.
 pub fn bind(h: &mut Host, i: usize, driver: Option<usize>) -> Result<(), &'static str> {
-    let n = nics().get(i).ok_or("no such NIC")?;
+    nics().get(i).ok_or("no such NIC")?;
+    // Its IOMMU domain, which confinement needs (made once).
+    if nics()[i].dom.is_none() {
+        let dom = h.iommu.attach(&mut h.alloc, &nics()[i].pci);
+        nics()[i].dom = Some(dom);
+    }
+    let n = &nics()[i];
     match (n.state, driver) {
         (State::Unbound | State::Failed, _) => {}
         // Another driver for a running NIC: stopped, then bound anew.
@@ -477,6 +503,14 @@ pub fn bind(h: &mut Host, i: usize, driver: Option<usize>) -> Result<(), &'stati
         }
     };
     allowed(h, i, d)?;
+    // Another NIC confined with this one in its group stays so only with
+    // the same driver here.
+    let me = bdf(&nics()[i].pci) as u16;
+    if nics().iter().enumerate().any(|(j, o)| j != i && o.confined && o.driver.is_some_and(|od| od != d)
+        && matches!(o.state, State::Starting | State::Up | State::Backoff | State::Stopping) && o.group.contains(&me)) {
+        return Err("another driver's NIC shares its isolation group, confined");
+    }
+    let n = &nics()[i];
     let m = drivers().drivers[d].manifest;
     let bars = bars_for(&n.pci, &m)?;
     let w = windowed(&n.pci, &m);
@@ -484,9 +518,14 @@ pub fn bind(h: &mut Host, i: usize, driver: Option<usize>) -> Result<(), &'stati
     if !carve_bars(&mut h.alloc, &mut h.devmem, &w, &mut n.bars, bars) {
         return Err("its BARs are not free device memory");
     }
+    // Carved for an earlier driver's smaller window: as much is all this
+    // one can have.
+    if (0..6u8).filter(|b| bars & 1 << b != 0).any(|b| (crate::blkd::bar_frames(&n.bars, b).len() * PAGE) < w.bars[b as usize].size as usize) {
+        return Err("its BARs were mapped for a driver with a smaller window: reboot to change");
+    }
     if n.msi.is_none() {
         let v = pci::vector_alloc().ok_or("no interrupt vector left")?;
-        let dom = *n.dom.get_or_insert_with(|| h.iommu.attach(&mut h.alloc, &nics()[i].pci));
+        let dom = n.dom.unwrap();
         let n = &mut nics()[i];
         let (a, data) = h.iommu.msi(dom, v);
         n.msi = Some((v, a, data));
@@ -537,8 +576,8 @@ pub fn restart(h: &mut Host, i: usize) -> Result<(), Errno> {
     let n = nics().get_mut(i).ok_or(ctl::ENOENT)?;
     match n.state {
         State::Starting | State::Up => {
+            n.manual = true;
             kill(h, i, Then::Restart, "restarted by dom0");
-            nics()[i].backoff_secs = 0;
         }
         State::Backoff | State::Failed if n.driver.is_some() => {
             n.retry_at = 0;
@@ -739,7 +778,16 @@ fn spawn(h: &mut Host, i: usize) -> Result<(), &'static str> {
             next += 1;
             keep.absolute_cptr_from_bits_with_depth(next - 1, kb)
         };
-        map_bar_mask(&comp, &mut h.alloc, &mut arena, &nics()[i].bars, bars, m.bars_wc & bars, |b| bar_va(b), &mut keep_slot);
+        // A BAR's frames were carved at the first bind, for that driver's
+        // window: this one maps no more of them than its own.
+        let msix_bar = 1u8 << pdev.msix.unwrap().table_bar;
+        for b in (0..6).filter(|b| bars & 1 << b != 0) {
+            let frames = crate::blkd::bar_frames(&nics()[i].bars, b);
+            let attrs = if (m.bars_wc & !msix_bar) & 1 << b != 0 { crate::blkd::wc_attrs() } else { crate::blkd::DEVICE_ATTRS };
+            for (p, f) in frames.take((w.bars[b as usize].size as usize).div_ceil(PAGE)).map(crate::devmem::granule).enumerate() {
+                comp.map_copy(&mut h.alloc, &mut arena, &abs_of(f), bar_va(b) + p * PAGE, CapRights::read_write(), attrs, keep_slot());
+            }
+        }
         for p in 0..dma_pages {
             let f = dma_cn.absolute_cptr_from_bits_with_depth(p as u64, dma_cn_bits);
             comp.map_copy(&mut h.alloc, &mut arena, &f, nicd::DMA_VA + p * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep_slot());
@@ -779,6 +827,8 @@ fn spawn(h: &mut Host, i: usize) -> Result<(), &'static str> {
         component::mint_edge(&abs_of(irq_ntfn), &wiring::IRQ_NICD, 0, &comp.obj()).expect("nicd IRQ notification");
         let _ = irq.irq_handler_clear();
         irq.irq_handler_set_notification(irq_ntfn).expect("nicd IRQ set notification");
+        // One the last instance left unacknowledged.
+        let _ = irq.irq_handler_ack();
         comp.give(nicd::NICD_SLOT_IRQ, irq, CapRights::all());
         if legacy {
             let n = &mut nics()[i];
@@ -791,11 +841,9 @@ fn spawn(h: &mut Host, i: usize) -> Result<(), &'static str> {
                 None => log!("l4h-root: nic {}: no I/O ports at {:#x}", i, pdev.bars[0].addr),
             }
         }
-        // netd's notification, for the channel; and netd's of it.
+        // netd's notification, for the channel (netd gets the nicd's
+        // below).
         h.netd.give_uplink_peer(&comp);
-        if h.netd.signal_uplink(i, &comp).is_err() {
-            return Err("netd refuses its channel");
-        }
         let timer = (m.flags & nicd::F_TIMER != 0).then(|| {
             let t = root_cap::<cap_type::Notification>(h.alloc.slots.alloc());
             component::mint_edge(&abs_of(t), &wiring::ROOT_NICD_TIMER, 0, &comp.obj()).expect("nicd timer");
@@ -811,13 +859,15 @@ fn spawn(h: &mut Host, i: usize) -> Result<(), &'static str> {
             return Err(why);
         }
     };
+    if h.netd.signal_uplink(i, &inst.comp).is_err() {
+        destroy(h, i, inst);
+        return Err("netd refuses its channel");
+    }
     // netd takes the fresh channel (it may already have been the uplink's).
     let n = &mut nics()[i];
     n.generation = n.generation.wrapping_add(1);
-    if h.netd.add_uplink(i, chan_bits).is_err() {
-        log!("l4h-root: nic {}: netd has no room for its channel; retried", i);
-    }
-    n.in_netd = true;
+    n.add_pending = h.netd.add_uplink(i, chan_bits).is_err();
+    n.in_netd = !n.add_pending;
     // The device: decoding and bus mastering on, MSI-X on.
     if legacy_of(&pdev, &m) {
         h.pci.enable_io(&pdev);
@@ -831,6 +881,7 @@ fn spawn(h: &mut Host, i: usize) -> Result<(), &'static str> {
     n.inst = Some(inst);
     n.state = State::Starting;
     n.ping_at = None;
+    n.started_at = crate::rdtsc();
     Ok(())
 }
 
@@ -875,6 +926,13 @@ fn flr(h: &Host, d: &pci::Device) -> u64 {
 /// over and netd has let go of the channel (`progress`).
 fn kill(h: &mut Host, i: usize, then: Then, why: &'static str) {
     let n = &mut nics()[i];
+    if n.state == State::Stopping {
+        // Stopped already: only what follows can change.
+        if n.then != Then::Fail {
+            n.then = then;
+        }
+        return;
+    }
     let Some(inst) = n.inst.as_mut() else { return };
     let _ = inst.comp.tcb.tcb_suspend();
     let p = n.pci;
@@ -894,6 +952,7 @@ fn kill(h: &mut Host, i: usize, then: Then, why: &'static str) {
     n.then = then;
     n.why = why;
     n.state = State::Stopping;
+    n.add_pending = false;
     if n.in_netd && !n.removing {
         n.removing = h.netd.remove_uplink(i);
         if !n.removing {
@@ -927,23 +986,14 @@ fn progress(h: &mut Host, i: usize) {
         n.reset_until = 0;
     }
     if let Some(inst) = n.inst.take() {
-        // Bus mastering was off before the reset, and was read back: the
-        // DMA region is unreachable, and can be reclaimed.
-        let (pa, len) = inst.dma;
-        if let Some(dom) = n.dom {
-            h.iommu.unmap(dom, pa, len);
-        }
-        for k in 0..RING {
-            if let Some(Op::Ctl(t)) = inst.ops[k] {
-                crate::vmmgr::op_done(h, t, Err(ctl::EIO));
-            }
-        }
-        h.alloc.release(inst.arena);
-        h.alloc.slots.free_owned(slot_owner(i));
-        h.asids.in_use -= 1;
+        destroy(h, i, inst);
     }
     let n = &mut nics()[i];
     match n.then {
+        Then::Restart if core::mem::take(&mut n.manual) => {
+            n.retry_at = 0;
+            n.state = State::Backoff;
+        }
         Then::Restart => {
             let now = crate::rdtsc();
             let hour = h.info.tsc_hz.saturating_mul(3600);
@@ -974,6 +1024,25 @@ fn progress(h: &mut Host, i: usize) {
             }
         }
     }
+}
+
+/// Free instance `inst` of NIC `i`'s nicd, which is suspended (or never
+/// started) and whose device cannot reach memory (bus mastering off and
+/// read back, or never on).
+fn destroy(h: &mut Host, i: usize, inst: Inst) {
+    let _ = inst.comp.tcb.tcb_suspend();
+    let (pa, len) = inst.dma;
+    if let Some(dom) = nics()[i].dom {
+        h.iommu.unmap(dom, pa, len);
+    }
+    for k in 0..RING {
+        if let Some(Op::Ctl(t)) = inst.ops[k] {
+            crate::vmmgr::op_done(h, t, Err(ctl::EIO));
+        }
+    }
+    h.alloc.release(inst.arena);
+    h.alloc.slots.free_owned(slot_owner(i));
+    h.asids.in_use -= 1;
 }
 
 /// Component `id`'s fault, if it is a nicd's: stop it, and restart it.
@@ -1071,13 +1140,27 @@ pub fn tick(h: &mut Host) {
         let n = &mut nics()[i];
         match n.state {
             State::Stopping => progress(h, i),
+            State::Starting => {
+                if n.add_pending {
+                    let bits = n.chan.as_ref().unwrap().data_bits;
+                    if h.netd.add_uplink(i, bits).is_ok() {
+                        let n = &mut nics()[i];
+                        n.add_pending = false;
+                        n.in_netd = true;
+                    }
+                }
+                let n = &nics()[i];
+                if now.wrapping_sub(n.started_at) > h.info.tsc_hz.saturating_mul(START_SECS) {
+                    kill(h, i, Then::Restart, "it did not come up in time");
+                }
+            }
             State::Backoff if now >= n.retry_at => {
                 if let Err(why) = spawn(h, i) {
                     let n = &mut nics()[i];
                     log!("l4h-root: nic {}: restart failed: {}", i, why);
                     n.state = State::Backoff;
                     n.retry_at = now + h.info.tsc_hz.saturating_mul(n.backoff_secs);
-                    n.backoff_secs = (n.backoff_secs * 2).min(BACKOFF_MAX_SECS);
+                    n.backoff_secs = (n.backoff_secs * 2).clamp(1, BACKOFF_MAX_SECS);
                 }
             }
             State::Up => {
@@ -1116,7 +1199,7 @@ pub fn fail_unready(h: &mut Host) {
     for i in 0..nics().len() {
         if matches!(nics()[i].state, State::Starting | State::Backoff | State::Stopping) {
             log!("l4h-root: nic {}: its driver did not come up in time", i);
-            if nics()[i].inst.is_some() {
+            if nics()[i].state != State::Stopping && nics()[i].inst.is_some() {
                 kill(h, i, Then::Fail, "it did not come up in time");
             }
             let n = &mut nics()[i];
@@ -1138,51 +1221,57 @@ pub fn mac(i: usize) -> Option<u64> {
 // ---------------------------------------------------------------------
 // Configuration-space requests (DESIGN.md §9.8, "Configuration space").
 
-/// Whether a write of `size` bytes at `off` of NIC `i`'s function passes
-/// root's filter: inside the manifest's windows, and outside what only
-/// root sets (the header, MSI, MSI-X, power management, ACS, ATS, PRI,
-/// PASID, SR-IOV, and the PCI Express capability but Device Control's
-/// relaxed ordering and no-snoop and Link Control's ASPM bits).
-fn write_allowed(h: &Host, n: &Nic, m: &Manifest, off: u16, size: u16) -> bool {
+/// The bits of its dword a write of `size` bytes at `off` of NIC `i`'s
+/// function may change, by root's filter: inside the manifest's windows,
+/// past the header, and in no capability but a vendor-specific one, AER,
+/// LTR, L1 PM substates, or PCI Express's Device Control relaxed ordering
+/// and no-snoop bits and Link Control's ASPM bits.  None if it may change
+/// nothing.
+fn write_allowed(h: &Host, n: &Nic, m: &Manifest, off: u16, size: u16) -> Option<u32> {
     let end = off + size;
     let inside = m.config_writes.iter().any(|w| w.len != 0 && off >= w.offset && end <= w.offset + w.len);
     if !inside || end > 4096 || off < 0x40 {
-        return false;
+        return None;
     }
     let d = &n.pci;
     let overlaps = |a: u16, len: u16| off < a + len && a < end;
-    // Standard capabilities.
+    let dword = off & !3;
+    // The bytes written, as bits of their dword.
+    let shift = (off & 3) * 8;
+    let mut bits = if size == 4 { u32::MAX } else { ((1u32 << (size * 8)) - 1) << shift };
+    // Standard capabilities, each taken to reach the next one up (or the
+    // end of the standard space): vendor-specific ones may be written,
+    // and two fields of PCI Express's; no other.
+    let mut caps: ArrayVec<(u16, u8), 48> = ArrayVec::new();
     let mut c = (h.pci.read32(d.bus, d.dev, d.func, 0x34) & 0xfc) as u16;
-    for _ in 0..48 {
-        if c < 0x40 {
-            break;
-        }
+    while c >= 0x40 && !caps.is_full() && !caps.iter().any(|&(o, _)| o == c) {
         let w = h.pci.read32(d.bus, d.dev, d.func, c as u8);
-        let len = match w & 0xff {
-            0x01 => 8,          // power management
-            0x05 => 24,         // MSI
-            0x11 => 12,         // MSI-X
-            0x10 => {
-                // PCI Express: Device Control's bits 4 (relaxed ordering)
-                // and 11 (no snoop), Link Control's ASPM (bits 0..1) only.
-                let devctl = c + 8;
-                let lnkctl = c + 0x10;
-                let ok = (off == devctl || off == devctl + 1) && size == 1
-                    || off == devctl && size == 2
-                    || off == lnkctl && size <= 2;
-                if overlaps(c, 0x3c) && !ok {
-                    return false;
-                }
-                0
-            }
-            _ => 0,
-        };
-        if len != 0 && overlaps(c, len) {
-            return false;
-        }
+        caps.must_push((c, w as u8));
         c = ((w >> 8) & 0xfc) as u16;
     }
-    // Extended capabilities.
+    for &(c, id) in caps.iter() {
+        let span = caps.iter().map(|&(o, _)| o).filter(|&o| o > c).min().unwrap_or(0x100) - c;
+        if !overlaps(c, span) {
+            continue;
+        }
+        match id {
+            0x09 => {}
+            0x10 => {
+                // Device Control's relaxed ordering (4) and no snoop (11),
+                // Link Control's ASPM (0..1); nothing else.
+                if dword == c + 8 {
+                    bits &= 1 << 4 | 1 << 11;
+                } else if dword == c + 0x10 {
+                    bits &= 0b11;
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    // Extended capabilities: AER, vendor-specific, LTR and L1 PM
+    // substates only.
     #[cfg(target_arch = "x86_64")]
     {
         let mut c = 0x100u16;
@@ -1192,10 +1281,10 @@ fn write_allowed(h: &Host, n: &Nic, m: &Manifest, off: u16, size: u16) -> bool {
                 break;
             }
             let next = (w >> 20) as u16 & 0xffc;
-            let denied = matches!(w & 0xffff, 0x0d | 0x0f | 0x10 | 0x13 | 0x1b);
+            let allowed = matches!(w & 0xffff, 0x01 | 0x0b | 0x18 | 0x1e);
             let len = if next > c { next - c } else { 4096 - c };
-            if denied && overlaps(c, len) {
-                return false;
+            if !allowed && overlaps(c, len) {
+                return None;
             }
             if next < 0x100 || next <= c {
                 break;
@@ -1203,7 +1292,7 @@ fn write_allowed(h: &Host, n: &Nic, m: &Manifest, off: u16, size: u16) -> bool {
             c = next;
         }
     }
-    true
+    (bits != 0).then_some(bits)
 }
 
 /// Answer NIC `i`'s configuration-space request, if it made a new one.
@@ -1242,7 +1331,8 @@ fn cfg_access(h: &mut Host, i: usize) {
         };
         match kind {
             nicd::CFG_READ => read(h).map(|v| (v & mask) >> shift).ok_or(ctl::EIO),
-            nicd::CFG_WRITE if write_allowed(h, n, &m, off, size) => {
+            nicd::CFG_WRITE if write_allowed(h, n, &m, off, size).is_some() => {
+                let mask = write_allowed(h, n, &m, off, size).unwrap() & mask;
                 match read(h) {
                     Some(old) => {
                         let v = old & !mask | (value << shift) & mask;
