@@ -84,6 +84,11 @@ jobs:
         run: tests/run-acstest.sh
       - name: Build seL4
         run: tools/build-kernel.sh
+      - name: Remote SC queries preserve FS/GS (debug and release kernels)
+        run: |
+          tests/run-tls-stalltest.sh
+          L4H_RELEASE=1 L4H_KERNEL_VARIANT=tls-release tools/build-kernel.sh
+          L4H_KERNEL_VARIANT=tls-release tests/run-tls-stalltest.sh
       - name: IPC goes through the wiring and l4h-ipc (clippy)
         run: tests/check-ipc.sh
       - name: VT-x kernel on a CPU without VMX (boots, refuses VCPU and EPT objects)
