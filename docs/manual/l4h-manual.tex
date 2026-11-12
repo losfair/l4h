@@ -762,13 +762,13 @@ l4h ships as one UEFI application, the same for every host: an EFI wrapper
 containing a standalone GRUB that carries the seL4 kernel,
 \texttt{l4h-root}, the guest kernel and its module tree
 (\cmd{tools/mkefi.sh OUT.efi}). It loads dom0's initramfs
-and the settings from the EFI system partition it was booted from:
+and the settings from the partition selected at boot:
 \begin{lstlisting}
 EFI/BOOT/BOOTX64.EFI   the l4h application
 l4h/dom0/initrd        dom0's initramfs (optional)
 l4h/l4h.conf           host settings (optional)
 \end{lstlisting}
-By default, including in released applications, GRUB first looks for
+At boot, GRUB first looks for
 \file{/EFI/L4H/grubenv} on every device. If exactly one exists, it selects
 the partition containing \file{/l4h} as described below. Multiple copies
 abort the boot attempt before any selector or slot's files are read.
@@ -791,34 +791,18 @@ keep that path absent on all other partitions. A present but invalid
 selector fails the boot; it never falls back to searching for slot files.
 Use unique filesystem UUIDs or labels for the slots.
 
-To override discovery at build time, build an application with
-\texttt{L4H\_ESP\_UUID} or \texttt{L4H\_ESP\_LABEL} to select its files'
-partition explicitly. This bypasses both the loading partition and the
-file search, and ignores the default selector path.
-
-To use a different run-time selector path, set one of those variables to
-locate a shared boot partition, and \texttt{L4H\_BOOT\_ENV} to an absolute
-path on it:
-\begin{lstlisting}
-L4H_ESP_UUID=AAAA-BBBB L4H_BOOT_ENV=/EFI/L4H/grubenv \
-    tools/mkefi.sh l4h.efi
-grub-editenv grubenv create
-grub-editenv grubenv set l4h_esp_uuid=1111-1111
-\end{lstlisting}
-Install \file{grubenv} at \file{/EFI/L4H/grubenv} on \texttt{AAAA-BBBB}.
 The application loads only \texttt{l4h\_esp\_uuid} and
 \texttt{l4h\_esp\_label} from that environment block; exactly one must
 select the partition containing \file{/l4h}. A front-stage GRUB can update
 it with \texttt{save\_env --file} before chainloading a slot. No slot's
 \file{l4h.conf} is read until selection finishes. A missing partition,
 unreadable block, or missing or conflicting selectors aborts this boot
-attempt and returns \texttt{EFI\_LOAD\_ERROR} to the front loader or
-firmware boot manager so it can try a fallback entry. The application
+attempt and returns \texttt{EFI\_LOAD\_ERROR} to the caller. A front
+loader can then update the selector and try the other slot. The application
 uses a small EFI wrapper because GRUB 2.12's \texttt{exit} always returns
 success, even with a numeric argument. The wrapper loads the embedded
 GRUB as a child and converts any return into a failed boot attempt.
-For both discovered and built-in selectors, only the chosen slot's config
-and initramfs are read and measured; GRUB
+Only the chosen slot's config and initramfs are read and measured; GRUB
 also measures the shared environment block into PCR~9. The selection
 also applies to \file{l4h-mk.conf} and its per-partition files.
 

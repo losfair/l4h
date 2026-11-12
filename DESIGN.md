@@ -4263,23 +4263,21 @@ injects these failures in a host built with `L4H_TEST_INJECT=1`;
 - **UEFI.** UEFI → EFI wrapper → GRUB (EFI) → multiboot2. `tools/mkefi.sh`
   builds l4h as one UEFI application containing a standalone GRUB whose
   memdisk holds the seL4 kernel, `l4h-root` (with the service ELFs), the
-  guest kernel and its module tree (§5.6). By default, including in the
-  released applications, GRUB looks for `/EFI/L4H/grubenv` on every device.
+  guest kernel and its module tree (§5.6). At boot, GRUB looks for
+  `/EFI/L4H/grubenv` on every device.
   Exactly one such file selects the partition containing dom0's initramfs
   and `l4h.conf` through its `l4h_esp_uuid` or `l4h_esp_label`. More than
   one selector file aborts the boot before any selector or slot is read.
   Only when no selector file exists does GRUB use the EFI partition it
   was loaded from or, since `$cmdpath` is empty under OVMF, the first
   partition with `/l4h/dom0/initrd` (or else `/l4h/l4h.conf`) (§10.1).
-  `L4H_ESP_UUID` or `L4H_ESP_LABEL` at application build time overrides
-  discovery and selects a partition explicitly. With
-  `L4H_BOOT_ENV=/EFI/L4H/grubenv`, that explicit partition instead locates
-  a shared GRUB environment block: only `l4h_esp_uuid` and `l4h_esp_label`
-  are imported, and exactly one must name the slot containing `/l4h`.
-  Missing or ambiguous selectors, an unreadable environment block, or a
-  failed explicit search abort this boot attempt before any slot's config
-  is sourced. The application returns `EFI_LOAD_ERROR` to its caller,
-  allowing a front loader or firmware boot manager to try the other slot.
+  From the shared GRUB environment block, only `l4h_esp_uuid` and
+  `l4h_esp_label` are imported, and exactly one must name the slot
+  containing `/l4h`. Missing or conflicting selector variables, an
+  unreadable environment block, or a failed slot search abort this boot
+  attempt before any slot's config is sourced. The application returns
+  `EFI_LOAD_ERROR` to its caller,
+  allowing a front loader to update the selector and try the other slot.
   GRUB 2.12's `exit` ignores arguments and returns success. A small outer
   EFI wrapper (`boot/grub-efi-wrapper.c`) loads the standalone GRUB as a
   child, preserving its device path. L4H boot never returns: any return
