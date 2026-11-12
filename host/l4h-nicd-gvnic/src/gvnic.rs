@@ -12,7 +12,7 @@
 //! entry and an interrupt doorbell; as Linux, the driver configures one
 //! per MSI-X entry but the last (the management vector, left masked),
 //! puts the TX queue on the first and the RX queue on the first of the
-//! second half.  netd has one interrupt per NIC, so both raise the same
+//! second half.  A driver has one interrupt, so both raise the same
 //! vector.  A DQO block masks itself when it fires and is re-armed
 //! through its doorbell.
 
@@ -20,12 +20,22 @@ use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::Ordering;
 
 use l4h_rt::host::fixed::ArrayVec;
-use l4h_rt::host::{self, net::{self, NicConfig}};
-use l4h_virtio::{Dma, Mmio, dma_fence};
+use l4h_rt::host::{self, net};
+use crate::sdk::{Hw, Offer};
+use l4h_virtio::{Mmio, dma_fence};
 
-use crate::nic::Partial;
-use crate::offload;
-use crate::pool::Frame;
+use crate::sdk::Partial;
+use crate::sdk::offload;
+use crate::sdk::Frame;
+
+
+/// What the driver drives and needs (l4h_host::nicd::Manifest).
+pub const MANIFEST: crate::sdk::Manifest = crate::sdk::Manifest {
+    bars: 1 << 0 | 1 << 2,
+    msix_min: 3,
+    dma_bits: 22,
+    ..crate::sdk::Manifest::empty().with_name("gvnic").with_matches(&[crate::sdk::PciMatch::id(0x1ae0, 0x0042)])
+};
 
 const HDR: usize = net::HDR_SIZE;
 
@@ -222,13 +232,28 @@ pub struct Gvnic {
 }
 
 impl Gvnic {
-    pub fn new(n: usize, c: &NicConfig, tsc_hz: u64, rx_partial: &'static mut Partial) -> Self {
-        let mut dma = Dma::new(net::nic_dma_va(n), c.dma_paddr, c.dma_size as usize);
-        let regs = Mmio(c.regs.va as usize);
-        let doorbells = Mmio(c.doorbells.va as usize);
-        // MSI-X: the queues' notification blocks on netd's vector, the
+    pub fn offer(&self) -> Offer {
+        let mut o = Offer::plain(self.mac);
+        o.tx_csum = self.csum as u32;
+        if self.tso {
+            o.tx_gso_mask = 1 << 1 | 1 << 4;
+            o.tx_gso_max = net::MAX_FRAME as u32;
+            o.tx_mss_min = TSO_MIN_MSS as u32;
+            o.tx_mss_max = TSO_MAX_MSS as u32;
+            o.tx_hdr_max = TSO_MAX_HDR as u32;
+        }
+        o
+    }
+
+    pub fn new(hw: &Hw, rx_partial: &'static mut Partial) -> Self {
+        let (c, tsc_hz) = (hw.config, hw.tsc_hz);
+        let n = c.uplink as usize;
+        let mut dma = hw.dma();
+        let regs = Mmio(c.bars[0].va as usize);
+        let doorbells = Mmio(c.bars[2].va as usize);
+        // MSI-X: the queues' notification blocks on the driver's vector, the
         // others and the management vector (link and reset events, which
-        // netd does not act on) masked.
+        // the driver does not act on) masked.
         let msix = Mmio(c.msix_table.va as usize);
         let entries = (c.msix_table.len / 16) as usize;
         let blocks = (entries - 1) & !1;
@@ -301,7 +326,7 @@ impl Gvnic {
         wr(info_va, &info);
         match g.try_exec("verify driver compatibility", Cmd::new(AQ_VERIFY_DRIVER_COMPATIBILITY).u64(0, 304).u64(8, info_pa)) {
             AQ_PASSED | AQ_UNIMPLEMENTED => {}
-            st => panic!("netd: NIC {}: gVNIC rejects this driver: status {:#x}", n, st),
+            st => panic!("nicd {}: gVNIC rejects this driver: status {:#x}", n, st),
         }
 
         // The device's description and options.
@@ -329,13 +354,13 @@ impl Gvnic {
         }
         if formats & (1 << OPT_DQO_RDA) == 0 {
             panic!(
-                "netd: NIC {}: gVNIC without the DQO RDA queue format (options {:#x}: gqi raw {} gqi rda {} gqi qpl {} dqo qpl {})",
+                "nicd {}: gVNIC without the DQO RDA queue format (options {:#x}: gqi raw {} gqi rda {} gqi qpl {} dqo qpl {})",
                 n, formats, formats >> OPT_GQI_RAW_ADDRESSING & 1, formats >> OPT_GQI_RDA & 1,
                 formats >> OPT_GQI_QPL & 1, formats >> OPT_DQO_QPL & 1
             );
         }
         if !tx_entries.is_power_of_two() || !rx_entries.is_power_of_two() || tx_entries < 64 || rx_entries < 64 {
-            panic!("netd: NIC {}: gVNIC ring sizes tx {} rx {}", n, tx_entries, rx_entries);
+            panic!("nicd {}: gVNIC ring sizes tx {} rx {}", n, tx_entries, rx_entries);
         }
 
         // Event counters and interrupt doorbell indices, written by the
@@ -353,12 +378,12 @@ impl Gvnic {
                 .u32(28, 0)
                 .u8(32, QUEUE_FORMAT_DQO_RDA),
         );
-        // Doorbell indices the device writes: netd writes the doorbells,
+        // Doorbell indices the device writes: the driver writes the doorbells,
         // so they must be in BAR 2.
         let db_index = |va: usize| {
             let i = u32::from_be(unsafe { read_volatile(va as *const u32) });
-            if i as u64 * 4 + 4 > c.doorbells.len {
-                panic!("netd: NIC {}: gVNIC doorbell {} outside BAR 2 ({} KiB)", n, i, c.doorbells.len >> 10);
+            if i as u64 * 4 + 4 > c.bars[2].len {
+                panic!("nicd {}: gVNIC doorbell {} outside BAR 2 ({} KiB)", n, i, c.bars[2].len >> 10);
             }
             i
         };
@@ -380,7 +405,7 @@ impl Gvnic {
         let rings = tx_entries as usize * (TX_DESC + TX_COMPL) + rx_entries as usize * (RX_DESC + RX_COMPL);
         let need = rings + 4 * 4096 + 2 * 128 + bufs * (net::MAX_FRAME + 64) + rx_bufs * (RX_BUF + 64);
         if need > dma.remaining() {
-            panic!("netd: NIC {}: gVNIC ring sizes tx {} rx {} need {} KiB of DMA memory, {} KiB left",
+            panic!("nicd {}: gVNIC ring sizes tx {} rx {} need {} KiB of DMA memory, {} KiB left",
                 n, tx_entries, rx_entries, need >> 10, dma.remaining() >> 10);
         }
 
@@ -438,7 +463,7 @@ impl Gvnic {
         let mac = g.mac;
         let link = g.r32(REG_DEVICE_STATUS) & DEVICE_STATUS_LINK != 0;
         l4h_rt::info!(
-            "netd: NIC {}: {:02x}:{:02x}.{} gVNIC rev {} dqo-rda, {} blocks, mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, mtu {}, rings tx {} rx {}, link {}",
+            "nicd {}: {:02x}:{:02x}.{} gVNIC rev {} dqo-rda, {} blocks, mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, mtu {}, rings tx {} rx {}, link {}",
             n, c.pci_bdf >> 8, (c.pci_bdf >> 3) & 0x1f, c.pci_bdf & 7, c.revision, blocks,
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
             mtu, tx_entries, rx_entries, if link { "up" } else { "down" },
@@ -472,7 +497,7 @@ impl Gvnic {
             self.w32(REG_ADMINQ_PFN, 0);
             while self.r32(REG_ADMINQ_PFN) != 0 {
                 if host::ticks::now() > end {
-                    panic!("netd: NIC {}: gVNIC does not release its admin queue", self.n);
+                    panic!("nicd {}: gVNIC does not release its admin queue", self.n);
                 }
             }
         } else {
@@ -483,7 +508,7 @@ impl Gvnic {
             while self.r32(REG_DEVICE_STATUS) & DEVICE_STATUS_IS_RESET == 0 {
                 if host::ticks::now() > end {
                     // Setting up the admin queue fails if this mattered.
-                    l4h_rt::log!("netd: NIC {}: gVNIC reports no reset (status {:#x})", self.n, self.r32(REG_DEVICE_STATUS));
+                    l4h_rt::log!("nicd {}: gVNIC reports no reset (status {:#x})", self.n, self.r32(REG_DEVICE_STATUS));
                     return;
                 }
             }
@@ -495,7 +520,7 @@ impl Gvnic {
     fn exec(&mut self, what: &str, cmd: Cmd) {
         let status = self.try_exec(what, cmd);
         if status != AQ_PASSED {
-            panic!("netd: NIC {}: gVNIC admin command '{}' failed: status {:#x}", self.n, what, status);
+            panic!("nicd {}: gVNIC admin command '{}' failed: status {:#x}", self.n, what, status);
         }
     }
 
@@ -511,7 +536,7 @@ impl Gvnic {
         while self.r32(REG_ADMINQ_EVENT_COUNTER) != self.adminq_prod {
             if host::ticks::now() > end {
                 panic!(
-                    "netd: NIC {}: gVNIC admin command '{}' timed out (device status {:#x}, events {})",
+                    "nicd {}: gVNIC admin command '{}' timed out (device status {:#x}, events {})",
                     self.n, what, self.r32(REG_DEVICE_STATUS), self.r32(REG_ADMINQ_EVENT_COUNTER)
                 );
             }
@@ -633,13 +658,6 @@ impl Gvnic {
     }
 
     // ---- transmit
-
-    /// Whether the device can segment this GSO frame (whole MSS and header
-    /// ranges); others are segmented by netd.
-    pub fn takes_gso(&self, hdr: &[u8; HDR]) -> bool {
-        let get16 = |off: usize| u16::from_le_bytes([hdr[off], hdr[off + 1]]) as usize;
-        (TSO_MIN_MSS..=TSO_MAX_MSS).contains(&get16(4)) && get16(2) <= TSO_MAX_HDR
-    }
 
     /// Handle the TX completions the device has written.
     fn reap_tx(&mut self) {
@@ -789,5 +807,36 @@ impl Gvnic {
             dma_fence(Ordering::Release);
             self.doorbell(self.tx_db, self.tx_tail);
         }
+    }
+}
+
+/// The SDK's view of the driver (l4h_nicdrv::NicDriver).
+impl crate::sdk::NicDriver for Gvnic {
+    fn start(hw: &Hw) -> Result<Self, &'static str> {
+        // The one frame being assembled, too large for the stack: start
+        // runs once.
+        static mut RX_PARTIAL: Partial = Partial::new();
+        Ok(Gvnic::new(hw, unsafe { &mut *core::ptr::addr_of_mut!(RX_PARTIAL) }))
+    }
+    fn offer(&self) -> Offer {
+        Gvnic::offer(self)
+    }
+    fn rx_begin(&mut self) {
+        Gvnic::rx_begin(self)
+    }
+    fn rx_done(&mut self) -> bool {
+        Gvnic::rx_done(self)
+    }
+    fn receive(&mut self, out: &mut [u8], hdr: &mut [u8; HDR]) -> Option<usize> {
+        Gvnic::receive(self, out, hdr)
+    }
+    fn transmit(&mut self, frame: &[u8], hdr: &[u8; HDR]) -> bool {
+        Gvnic::transmit(self, frame, hdr)
+    }
+    fn tx_interrupts(&mut self, on: bool) -> bool {
+        Gvnic::tx_interrupts(self, on)
+    }
+    fn kick_tx(&mut self) {
+        Gvnic::kick_tx(self)
     }
 }

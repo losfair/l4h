@@ -55,7 +55,7 @@ crate::badge_space! {
 
 crate::badge_space! {
     /// What every driver with a mailbox (crate::mailbox: blkd, netd,
-    /// usbd) sees on its bound notification from root.  Their spaces
+    /// usbd, nicd) sees on its bound notification from root.  Their spaces
     /// include it.
     pub mod driver {
         /// Root posted requests in the mailbox.
@@ -78,10 +78,23 @@ crate::badge_space! {
     pub mod netd: super::driver {
         /// Port p's client kicked: bit p.
         signals PORT: 0..crate::net::MAX_PORTS as u32;
-        /// Uplink NIC n's interrupt: bit n.
-        signals IRQ: 48..48 + crate::net::MAX_NICS as u32;
+        /// A nicd produced frames or freed room in its uplink channel
+        /// (crate::uplink): netd looks at every uplink.
+        signal UPLINK: 48;
         /// Link l's doorbell, and netd's own kick to read it later: bit l.
         signals LINK: 52..52 + crate::net::MAX_LINKS as u32;
+    }
+}
+
+crate::badge_space! {
+    /// A nicd's bound notification.
+    pub mod nicd: super::driver {
+        /// Its device's interrupt.
+        signal IRQ: 0;
+        /// netd sent frames or freed room in the uplink channel.
+        signal NETD: 1;
+        /// Root's periodic tick, for a driver whose manifest has F_TIMER.
+        signal TIMER: 2;
     }
 }
 

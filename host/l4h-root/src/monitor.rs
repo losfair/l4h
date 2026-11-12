@@ -185,7 +185,7 @@ fn run(h: &mut Host, line: &str) {
             log!(
                 "monitor: {} cores, {} MiB free of {} MiB ({} MiB reported to the hypervisor), {} disk(s), {} NIC(s)",
                 h.info.cores, h.alloc.free_bytes() >> 20, h.total_bytes >> 20, h.alloc.reported_bytes() >> 20,
-                h.disks.len(), h.netd.nics.len()
+                h.disks.len(), crate::nicd::nics().len()
             );
             return;
         }

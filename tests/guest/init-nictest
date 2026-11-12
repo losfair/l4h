@@ -1,0 +1,56 @@
+#!/bin/sh
+# dom0 init for tests/run-nictest.sh: two NICs, each driven by its own
+# nicd.  NIC 1's driver is made to panic, then to hang (test builds), and
+# unbound and bound again; dom0's uplink on NIC 0 must carry on through
+# all of it, and NIC 1 must come back by itself.
+slow=${L4H_TEST_SLOW:-1}
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mount -t tmpfs tmp /tmp
+fail() { echo "NICTEST: FAIL: $*"; l4hctl nic list; poweroff -f; }
+echo "NICTEST: start"
+l4hctl driver list
+l4hctl driver list | grep -q "virtio-net, ethernet, boot bundle" || fail "no virtio-net driver in the bundle"
+l4hctl nic list
+[ "$(l4hctl nic list | grep -c ', up, ')" = 2 ] || fail "both NICs up"
+ip link set lo up
+ip link set eth0 up
+udhcpc -i eth0 -n -q -t 5 -s /bin/udhcpc.script >/dev/null 2>&1 || fail "dhcp over NIC 0"
+ping -c 2 -W 2 10.0.2.2 >/dev/null || fail "ping over NIC 0"
+echo "NICTEST: uplink ok"
+# NIC 1's state, restarts.
+state() { l4hctl nic list | sed -n 's/^nic 1: .*driver [^,]*, \([a-z]*\),.* \([0-9]*\) restarts.*/\1 \2/p'; }
+wait_state() { # state restarts timeout
+    end=$(( $(date +%s) + $3 ))
+    while [ "$(state)" != "$1 $2" ]; do
+        [ "$(date +%s)" -lt "$end" ] || fail "nic 1 not '$1' after $2 restarts: $(state)"
+        sleep 1
+    done
+}
+# A ping over NIC 0 the whole time NIC 1's driver dies and comes back.
+ping -i 0.2 -c $((60 * slow)) -W 2 10.0.2.2 >/tmp/ping &
+pinger=$!
+l4hctl nic test-panic 1 || fail "test-panic"
+wait_state up 1 $((30 * slow))
+echo "NICTEST: panic: restarted"
+l4hctl nic test-hang 1 || fail "test-hang"
+wait_state up 2 $((40 * slow))
+echo "NICTEST: hang: restarted"
+l4hctl nic list | grep "^nic 1:" | grep -q "last: it stopped answering" || fail "hang reason"
+wait "$pinger"
+loss=$(sed -n 's/.* \([0-9]*\)% packet loss.*/\1/p' /tmp/ping)
+[ "${loss:-100}" -le 5 ] || { cat /tmp/ping; fail "NIC 0 lost $loss% while NIC 1's driver restarted"; }
+echo "NICTEST: containment ok ($loss% loss on NIC 0)"
+l4hctl nic unbind 1 || fail "unbind"
+wait_state unbound 2 10
+l4hctl nic bind 1 virtio-net || fail "bind"
+wait_state up 0 $((30 * slow))
+echo "NICTEST: rebind ok"
+# dom0's own uplink: a restart drops its carrier for a moment only.
+l4hctl nic restart 0 || fail "restart nic 0"
+sleep $((5 * slow))
+ping -c 3 -W 3 10.0.2.2 >/dev/null || fail "ping over NIC 0 after its restart"
+echo "NICTEST: uplink restart ok"
+echo "NICTEST: PASS"
+poweroff -f

@@ -7,7 +7,7 @@ use std::fs::File;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::FileExt;
 
-use l4h_host::{blk::PciRegion, net};
+use l4h_host::blk::PciRegion;
 
 const fn request(n: u64) -> u64 {
     (b';' as u64) << 8 | (100 + n)
@@ -186,7 +186,7 @@ impl Vfio {
         let mut config = [0u8; 16];
         device.read_exact_at(&mut config, config_offset).unwrap();
         let revision = config[8] as u32;
-        let va = net::nic_dma_va(0);
+        let va = l4h_host::DMA_VA;
         let flags = libc::MAP_PRIVATE
             | libc::MAP_ANONYMOUS
             | libc::MAP_FIXED_NOREPLACE

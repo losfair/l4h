@@ -1,11 +1,22 @@
 //! ConnectX-5 firmware command transport (NVIDIA Ethernet PRM, command interface).
 //! All firmware-visible storage belongs to the caller's IOMMU-mapped DMA arena.
 
-use crate::pool::Frame;
+use crate::sdk::{Frame, Hw, Offer};
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::Ordering;
 use l4h_virtio::{Dma, Mmio, dma_fence};
 use l4h_rt::host::net::LinkState;
+
+/// What the driver drives and needs (l4h_host::nicd::Manifest).
+pub const MANIFEST: crate::sdk::Manifest = crate::sdk::Manifest {
+    bars: 1 << 0,
+    bar_window_bits: 24,
+    msix_min: 1,
+    dma_bits: 25,
+    ..crate::sdk::Manifest::empty().with_name("mlx5").with_matches(&[crate::sdk::PciMatch::id(0x15b3, 0x1017)])
+};
+
+const HDR: usize = l4h_rt::host::net::HDR_SIZE;
 
 const BLOCK: usize = 4096;
 const BLOCKS: usize = 16;
@@ -433,7 +444,16 @@ impl Commands {
 }
 
 impl Mlx5 {
-    pub fn new(n: usize, cfg: &l4h_rt::host::net::NicConfig, hz: u64) -> Self {
+    /// No offloads; the device sends frames of 14..=1518 bytes.
+    pub fn offer(&self) -> Offer {
+        let mut o = Offer::plain(self.mac);
+        o.tx_frame_max = 1518;
+        o
+    }
+
+    pub fn new(hw: &Hw) -> Self {
+        let (cfg, hz) = (hw.config, hw.tsc_hz);
+        let n = cfg.uplink;
         let table = Mmio(cfg.msix_table.va as usize);
         for entry in 0..(cfg.msix_table.len / 16) as usize {
             table.w32(entry * 16 + 12, 1);
@@ -442,14 +462,10 @@ impl Mlx5 {
         table.w32(4, (cfg.msi_address >> 32) as u32);
         table.w32(8, cfg.msi_data);
         table.w32(12, 0);
-        let dma = Dma::new(
-            l4h_rt::host::net::nic_dma_va(n),
-            cfg.dma_paddr,
-            cfg.dma_size as usize,
-        );
-        let nic = Self::open(cfg.regs.va as usize, cfg.regs.len as usize, dma, hz)
+        let dma = hw.dma();
+        let nic = Self::open(cfg.bars[0].va as usize, cfg.bars[0].len as usize, dma, hz)
             .expect("mlx5 initialization");
-        l4h_rt::info!("mlx5 NIC {} MAC {:02x?}", n, nic.mac);
+        l4h_rt::info!("nicd {}: mlx5 MAC {:02x?}", n, nic.mac);
         nic
     }
 
@@ -869,5 +885,36 @@ impl Mlx5 {
             get(&rq, 0x60),
             get(&rq, 0x64)
         );
+    }
+}
+
+/// The SDK's view of the driver (l4h_nicdrv::NicDriver).
+impl crate::sdk::NicDriver for Mlx5 {
+    fn start(hw: &Hw) -> Result<Self, &'static str> {
+        Ok(Mlx5::new(hw))
+    }
+    fn offer(&self) -> Offer {
+        Mlx5::offer(self)
+    }
+    fn rx_begin(&mut self) {
+        Mlx5::rx_begin(self)
+    }
+    fn rx_done(&mut self) -> bool {
+        Mlx5::rx_done(self)
+    }
+    fn receive(&mut self, out: &mut [u8], hdr: &mut [u8; HDR]) -> Option<usize> {
+        Mlx5::receive(self, out, hdr)
+    }
+    fn transmit(&mut self, frame: &[u8], hdr: &[u8; HDR]) -> bool {
+        Mlx5::transmit(self, frame, hdr)
+    }
+    fn tx_interrupts(&mut self, on: bool) -> bool {
+        Mlx5::tx_interrupts(self, on)
+    }
+    fn kick_tx(&mut self) {
+        Mlx5::kick_tx(self)
+    }
+    fn link(&self) -> LinkState {
+        self.link
     }
 }

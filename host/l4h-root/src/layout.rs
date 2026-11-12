@@ -99,8 +99,11 @@ regions! {
     TRUSTD_RELAY = 0x7500_0002_0000, l4h_host::trust::RELAY_PAGES * PAGE;
     /// memd's status page (memd.rs).
     MEMD_STATUS = 0x7700_0000_0000, PAGE;
+    /// NIC driver images dom0 loaded (nicd.rs, CTL_DRIVER_LOAD), one
+    /// CTL_LOAD_MAX slot each.
+    DRIVER_IMAGES = 0x7b00_0000_0000, crate::drivers::MAX_DRIVERS * l4h_abi::CTL_LOAD_MAX as usize;
     /// The drivers' mailboxes, netd's then each disk and xHCI
-    /// controller's (mailbox.rs).
+    /// controller's, then the nicds' (mailbox.rs).
     MAILBOXES = 0x7a00_0000_0000, crate::mailbox::MAILBOXES * l4h_host::mailbox::MAILBOX_PAGES * PAGE;
     /// x86: each PCI function's ECAM page, by BDF (pci.rs): a multikernel
     /// partition's functions' pages, or root's whole ECAM windows, for

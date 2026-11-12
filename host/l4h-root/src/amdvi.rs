@@ -33,7 +33,7 @@ const PAGE: usize = 4096;
 const MAX_UNITS: usize = 16;
 /// Device IDs: PCI segment 0's bus/device/function numbers.
 const DEVICES: usize = 1 << 16;
-const MAX_ATTACHED: usize = pci::MAX_DISK_CTRLS + l4h_host::net::MAX_NICS + l4h_host::usb::MAX_USB_CTRLS + 1;
+const MAX_ATTACHED: usize = pci::MAX_DISK_CTRLS + l4h_host::net::MAX_UPLINKS + l4h_host::usb::MAX_USB_CTRLS + 1;
 /// I/O page table levels: 48-bit I/O addresses, which every IOMMU
 /// supports (EFR.HATS) and which cover all physical memory.
 const LEVELS: u64 = 4;

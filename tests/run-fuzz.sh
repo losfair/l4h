@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Host-side randomised tests of guest-facing parsers (virtqueues, netd's
-# offload and steering, usbd's records, blkd's windows).  Debug build: it checks overflow and
+# Host-side randomised tests of guest-facing parsers (virtqueues, the
+# uplink channel to the NIC drivers, netd's offload and steering, usbd's records, blkd's windows).  Debug build: it checks overflow and
 # pointer preconditions, which shipped (release) host builds do not
 # (DESIGN.md §10, "Integer arithmetic").
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 (cd "$root/tests/fuzz-virtq" && cargo +stable test -q && cargo +stable run -q -- "${1:-200000}")
 (cd "$root/tests/fuzz-steer" && cargo +stable test -q && cargo +stable run -q -- "${1:-200000}")
+(cd "$root/tests/fuzz-uplink" && cargo +stable run -q -- "${1:-200000}")
 # usbd's record checks and TRB layout: unit tests, then random records.
 out=$root/build/usbtest
 mkdir -p "$out"

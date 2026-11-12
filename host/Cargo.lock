@@ -347,10 +347,68 @@ dependencies = [
 ]
 
 [[package]]
+name = "l4h-netcore"
+version = "0.1.0"
+
+[[package]]
 name = "l4h-netd"
 version = "0.1.0"
 dependencies = [
+ "l4h-netcore",
  "l4h-partition",
+ "l4h-rt",
+]
+
+[[package]]
+name = "l4h-nicd-ena"
+version = "0.1.0"
+dependencies = [
+ "l4h-nicdrv",
+ "l4h-rt",
+ "l4h-virtio",
+]
+
+[[package]]
+name = "l4h-nicd-gvnic"
+version = "0.1.0"
+dependencies = [
+ "l4h-nicdrv",
+ "l4h-rt",
+ "l4h-virtio",
+]
+
+[[package]]
+name = "l4h-nicd-ixgbe"
+version = "0.1.0"
+dependencies = [
+ "l4h-nicdrv",
+ "l4h-rt",
+ "l4h-virtio",
+]
+
+[[package]]
+name = "l4h-nicd-mlx5"
+version = "0.1.0"
+dependencies = [
+ "l4h-nicdrv",
+ "l4h-rt",
+ "l4h-virtio",
+]
+
+[[package]]
+name = "l4h-nicd-virtio"
+version = "0.1.0"
+dependencies = [
+ "l4h-nicdrv",
+ "l4h-rt",
+ "l4h-virtio",
+]
+
+[[package]]
+name = "l4h-nicdrv"
+version = "0.1.0"
+dependencies = [
+ "l4h-netcore",
  "l4h-rt",
  "l4h-virtio",
 ]

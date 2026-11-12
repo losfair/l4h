@@ -167,12 +167,14 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
         abi::CTL_IOMMU_INFO | abi::CTL_DISK_INFO | abi::CTL_BLK_INFO | abi::CTL_SWITCH_CREATE | abi::CTL_SWITCH_ATTACH_UPLINK
         | abi::CTL_NIC_INFO | abi::CTL_SWITCH_INFO | abi::CTL_HOST_REBOOT | abi::CTL_RTC_SET
         | abi::CTL_EP_SET | abi::CTL_EP_DEL | abi::CTL_EP_LIST | abi::CTL_STEER_SET | abi::CTL_STEER_DEL
-        | abi::CTL_STEER_LIST | abi::CTL_PARTITION_INFO | abi::CTL_USB_INFO | abi::CTL_PCI_LIST => {
+        | abi::CTL_STEER_LIST | abi::CTL_PARTITION_INFO | abi::CTL_USB_INFO | abi::CTL_PCI_LIST
+        | abi::CTL_NIC_BIND | abi::CTL_NIC_UNBIND | abi::CTL_NIC_RESTART | abi::CTL_NIC_CTL_READ | abi::CTL_DRIVER_INFO
+        | abi::CTL_NIC_TEST => {
             resp.vals = host_op(h, req.op, a)?;
             resp.data = *root::result_data();
             Ok(())
         }
-        abi::CTL_BLK_WRITE => {
+        abi::CTL_BLK_WRITE | abi::CTL_NIC_CTL | abi::CTL_DRIVER_LOAD => {
             // From dom0's control data area, which root maps too.
             if h.guest(caller).and_then(|g| g.ctl_data()).is_none() { return Err(EINVAL); }
             resp.vals = host_op(h, req.op, a)?;

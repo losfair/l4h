@@ -285,8 +285,8 @@ fn program_irq(h: &mut Host, i: usize, vector: u64, dom: Domain) {
 /// quarantines the controller (the handoff cannot be undone), and the
 /// guest that got it meanwhile sees no controller (no magic).
 fn claim(h: &mut Host, i: usize) -> Result<(), Errno> {
-    let claimed = ctrls().iter().filter(|c| c.driver.is_some()).count();
-    let Some(&vector) = pci::VECTORS_USB.get(claimed) else { return Err(ctl::ENOSPC) };
+    // Kept until reboot, as the controller's usbd is.
+    let Some(vector) = pci::vector_alloc() else { return Err(ctl::ENOSPC) };
     let (slots, scratch, page) = match caps(h, i) {
         Ok(caps) => caps,
         Err(e) if e == ctl::EBUSY => return Err(e),

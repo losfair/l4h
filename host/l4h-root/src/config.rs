@@ -150,9 +150,26 @@ pub struct Config {
     pub dom0_usb: [Option<u32>; l4h_host::usb::MAX_GUEST_USB],
     /// `host::TEST_INJECT` only: usbd's legacy handoff times out.
     pub test_usb_handoff_timeout: bool,
+    /// Bind every NIC to the first driver of the bundle that matches
+    /// (`nic_auto`, default 1), but those `nic_bind` names.
+    pub nic_auto: bool,
+    /// `nic_bind = BDF DRIVER` (or `none`, to leave the NIC to the
+    /// firmware), one line each.
+    pub nic_bind: [Option<(u32, &'static str)>; l4h_host::net::MAX_UPLINKS],
+    /// Let drivers dom0 loads run unconfined, in the TCB (DESIGN.md §9.8).
+    pub nic_untrusted_without_iommu: bool,
+    /// Restarts of a NIC's driver within an hour, then it stays stopped.
+    pub nic_max_restarts: usize,
 }
 
 impl Config {
+    /// What `nic_bind` says of the NIC at `bdf`: a driver's name, None
+    /// (`none`) to leave it, or nothing.
+    pub fn nic_pin(&self, bdf: u32) -> Option<Option<&'static str>> {
+        let (_, d) = self.nic_bind.iter().flatten().find(|(b, _)| *b == bdf)?;
+        Some(if *d == "none" { None } else { Some(*d) })
+    }
+
     /// The settings built in, overridden by `text` (the `l4h-config`
     /// module).  Bad lines are reported and ignored.
     pub fn new(text: Option<&'static [u8]>) -> Self {
@@ -179,6 +196,10 @@ impl Config {
             test_early_panic: false,
             dom0_usb: [None; l4h_host::usb::MAX_GUEST_USB],
             test_usb_handoff_timeout: false,
+            nic_auto: true,
+            nic_bind: [None; l4h_host::net::MAX_UPLINKS],
+            nic_untrusted_without_iommu: false,
+            nic_max_restarts: 5,
         };
         let Some(text) = text else { return c };
         let Ok(text) = core::str::from_utf8(text) else {
@@ -268,6 +289,20 @@ impl Config {
                 true
             }
             "watchdog_secs" => num(&mut self.watchdog_secs),
+            "nic_auto" => flag(&mut self.nic_auto),
+            "nic_untrusted_without_iommu" => flag(&mut self.nic_untrusted_without_iommu),
+            "nic_max_restarts" => num(&mut self.nic_max_restarts),
+            "nic_bind" => {
+                let Some((b, d)) = value.split_once(char::is_whitespace) else { return false };
+                let (Some(b), d) = (try_parse_bdf(b), d.trim()) else { return false };
+                match self.nic_bind.iter_mut().find(|e| e.is_none_or(|(x, _)| x == b)) {
+                    Some(e) => {
+                        *e = Some((b, d));
+                        true
+                    }
+                    None => false,
+                }
+            }
             _ => false,
         }
     }

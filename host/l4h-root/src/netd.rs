@@ -1,6 +1,6 @@
-//! Networking: the netd component (switches and uplink NICs), the ports
-//! that connect guests' virtio-net devices to it, and the links to other
-//! partitions' netds.
+//! Networking: the netd component (the switches), the ports that connect
+//! guests' virtio-net devices to it, the uplinks (channels to the nicds
+//! that drive NICs, nicd.rs) and the links to other partitions' netds.
 
 use core::sync::atomic::Ordering;
 
@@ -12,10 +12,9 @@ use l4h_host::net::call::Request;
 use l4h_host::fixed::ArrayVec;
 use l4h_host::{self as host, net};
 
-use crate::blkd::{BAR_STRIDE, BarCache, VirtioRegions, bar_pages, carve_bars, is_legacy_virtio, is_modern_virtio, keep_bits, map_bar_mask, mappable, virtio_bar_mask, virtio_regions};
+use crate::blkd::keep_bits;
 use crate::component::{self, Component, SpawnArgs, abs_of};
 use crate::devmem::DevMem;
-use crate::iommu::Iommu;
 use crate::mailbox::{self, Mailbox};
 use l4h_host::mailbox::RING;
 use crate::mem::{Alloc, Arena, Dest, Slot, UtRegion};
@@ -28,19 +27,6 @@ use crate::{AsidPools, Host, HostInfo, ctl};
 static NETD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/l4h-netd.elf"));
 
 const PAGE: usize = 4096;
-fn nic_dma_bits(d: &pci::Device) -> usize {
-    if is_mlx5(d) { 25 } else { 22 }
-}
-
-// Map the init segment, MSI-X table and lower UAR aperture. An allocated
-// UAR beyond this mapping is rejected by the driver before any MMIO access.
-fn mapped_device(d: &pci::Device) -> pci::Device {
-    let mut mapped = *d;
-    if is_mlx5(d) {
-        mapped.bars[0].size = mapped.bars[0].size.min(BAR_STRIDE as u64);
-    }
-    mapped
-}
 /// Port memory: the channel plus three CNodes, of its frames (root's),
 /// of netd's mappings of them, and of the copies vmmgr gets.
 const PORT_BITS: usize = 22;
@@ -53,82 +39,7 @@ const _: () = assert!(PORT_CNODES * (64 << PORT_KEEP_BITS) + net::PORT_PAGES * P
 const _: () = assert!(
     l4h_partition::LINK_CHANNEL_SIZE as usize % PAGE == 0 && l4h_partition::LINK_CHANNEL_SIZE as usize <= net::LINK_CHANNEL_MAX
 );
-/// MSI vectors of NICs start here.
-const NIC_MSI_BASE: u64 = crate::pci::VECTOR_NIC_BASE;
 const NETD_ID: u32 = 0x200;
-
-pub fn is_virtio_net(d: &pci::Device) -> bool {
-    d.vendor == 0x1af4
-        && (d.device == 0x1041 || d.device == 0x1000)
-        && (is_modern_virtio(d) || is_legacy(d))
-        && d.msix.is_some()
-}
-
-/// A legacy virtio-net device, as on GCE.
-fn is_legacy(d: &pci::Device) -> bool {
-    d.device == 0x1000 && is_legacy_virtio(d)
-}
-
-/// Google Virtual NIC (gVNIC), as on GCE C3, N4, C4 and later: registers
-/// in BAR 0, doorbells in BAR 2.  It needs three MSI-X entries (two
-/// notification blocks and the management vector).
-pub fn is_gvnic(d: &pci::Device) -> bool {
-    let mem = |b: usize| !d.bars[b].is_io && d.bars[b].size != 0;
-    d.vendor == 0x1ae0 && d.device == 0x0042 && mem(0) && mem(2) && d.msix.is_some_and(|m| m.table_size >= 3)
-}
-
-/// Intel X550 (Linux ixgbe), as on Latitude.sh m4.metal servers:
-/// registers in BAR 0, MSI-X with an entry each for RX and TX.
-pub fn is_ixgbe(d: &pci::Device) -> bool {
-    // X550T, X550T1.
-    d.vendor == 0x8086
-        && matches!(d.device, 0x1563 | 0x15d1)
-        && !d.bars[0].is_io
-        && d.bars[0].size != 0
-        && d.msix.is_some_and(|m| m.table_size >= 2)
-}
-
-/// Amazon Elastic Network Adapter (Linux ena), as on every Nitro EC2
-/// instance: registers in BAR 0, MSI-X with the management entry and one
-/// for the I/O queues.
-pub fn is_ena(d: &pci::Device) -> bool {
-    d.vendor == 0x1d0f
-        && matches!(d.device, 0x0ec2 | 0x1ec2 | 0xec20 | 0xec21 | 0x0051)
-        && !d.bars[0].is_io
-        && d.bars[0].size != 0
-        && d.msix.is_some_and(|m| m.table_size >= 2)
-}
-
-/// ENA's low-latency queue memory, BAR 2, if netd's window for it holds
-/// it.  Without it, TX descriptors are in host memory.
-fn ena_llq(d: &pci::Device) -> bool {
-    let b = d.bars[2];
-    is_ena(d) && !b.is_io && b.size != 0 && b.size as usize <= BAR_STRIDE
-}
-
-pub fn is_mlx5(d: &pci::Device) -> bool {
-    let aperture = d.bars[0].size.min(BAR_STRIDE as u64);
-    d.vendor == 0x15b3 && d.device == 0x1017 && !d.bars[0].is_io
-        && aperture >= 0x10000
-        && d.msix.is_some_and(|m| m.table_bar == 0 && m.table_size >= 1
-            && m.table_offset as u64 + m.table_size as u64 * 16 <= aperture)
-}
-
-/// NICs netd can drive as an uplink: also, the BARs `spawn` maps can be.
-pub fn is_uplink(d: &pci::Device) -> bool {
-    (is_virtio_net(d) || is_gvnic(d) || is_ena(d) || is_ixgbe(d) || is_mlx5(d)) && mappable(&mapped_device(d), used_bars(d))
-}
-
-/// Carve the BARs `spawn` maps of uplink `d` into `cache`: whether it can
-/// be driven (blkd::carve_bars).
-pub fn carve(alloc: &mut Alloc, devmem: &mut DevMem, d: &pci::Device, cache: &mut BarCache) -> bool {
-    carve_bars(alloc, devmem, &mapped_device(d), cache, used_bars(d))
-}
-
-pub struct Nic {
-    pub pci: pci::Device,
-    pub switch: Option<u32>,
-}
 
 pub struct PortInfo {
     pub vm: usize,
@@ -177,15 +88,16 @@ pub struct Netd {
     /// netd faulted (`fault`): it is suspended, and commands to it go
     /// nowhere.
     failed: bool,
-    /// Removals in the ring, by number mod RING: the port, and what waits
-    /// for netd to let go of its memory (vmmgr::Zombie).
-    removals: [Option<(usize, Option<usize>)>; RING],
+    /// Removals in the ring, by number mod RING: a port and what waits
+    /// for netd to let go of its memory (vmmgr::Zombie), or an uplink.
+    removals: [Option<Removal>; RING],
     /// Ports being removed: netd may still use them (held), and the
     /// removal may wait for room in the ring (backlog), with its zombie.
     held: u64,
     backlog: u64,
     zombies: [Option<usize>; net::MAX_PORTS],
-    pub nics: ArrayVec<Nic, { net::MAX_NICS }>,
+    /// Each uplink's switch (nicd.rs numbers the uplinks).
+    uplinks: [Option<u32>; net::MAX_UPLINKS],
     pub ports: [Option<PortInfo>; net::MAX_PORTS],
     /// Switches 0..switches exist (they are never deleted).
     pub switches: u32,
@@ -193,6 +105,12 @@ pub struct Netd {
     pub endpoints: [Option<Endpoint>; net::MAX_STEER_ENDPOINTS],
     pub rules: [Option<SteerRule>; net::MAX_STEER_RULES],
     pub links: ArrayVec<Link, { net::MAX_LINKS }>,
+}
+
+#[derive(Clone, Copy)]
+enum Removal {
+    Port(usize, Option<usize>),
+    Uplink(usize),
 }
 
 pub fn bdf(d: &pci::Device) -> u32 {
@@ -211,106 +129,9 @@ pub fn inject_hang(h: &mut Host) {
     let _ = h.netd.post(Request::TestHang {});
 }
 
-/// The BARs netd maps of NIC `d`, bit b for BAR b.
-fn used_bars(d: &pci::Device) -> u8 {
-    if is_gvnic(d) {
-        1 | 1 << 2 | 1 << d.msix.unwrap().table_bar
-    } else if is_ena(d) {
-        1 | (ena_llq(d) as u8) << 2 | 1 << d.msix.unwrap().table_bar
-    } else if is_ixgbe(d) || is_mlx5(d) {
-        1 | 1 << d.msix.unwrap().table_bar
-    } else {
-        virtio_bar_mask(d)
-    }
-}
-
-/// Start netd with the uplink NICs `nics`, whose BARs `carve` carved
-/// into `bars`.
-pub fn spawn(
-    nics: &[pci::Device],
-    bars: &[BarCache],
-    pci: &Pci,
-    iommu: &mut Iommu,
-    alloc: &mut Alloc,
-    win: &mut Window,
-    asids: &mut AsidPools,
-    info: &HostInfo,
-) -> Netd {
-    let nr_nics = nics.len().min(net::MAX_NICS);
+/// Start netd, which has no device: uplinks come as nicds start.
+pub fn spawn(alloc: &mut Alloc, win: &mut Window, asids: &mut AsidPools, info: &HostInfo) -> Netd {
     let mut arena = alloc.arena(16 << 20).expect("netd arena");
-    // Plain integers: all zeros is a valid (empty) configuration.
-    let mut cfg: net::NetdConfig = unsafe { core::mem::zeroed() };
-    cfg.nr_nics = nr_nics as u32;
-    let mut dma = ArrayVec::<_, { net::MAX_NICS }>::new();
-    for (n, d) in nics[..nr_nics].iter().enumerate() {
-        let bar_va = |b: u8| net::nic_bar_va(n, b as usize);
-        let bar_region = |b: u8| l4h_host::blk::PciRegion { va: bar_va(b) as u64, len: d.bars[b as usize].size };
-        let none = l4h_host::blk::PciRegion { va: 0, len: 0 };
-        let gvnic = is_gvnic(d);
-        let ena = is_ena(d);
-        let ixgbe = is_ixgbe(d);
-        let mlx5 = is_mlx5(d);
-        let dma_bits = nic_dma_bits(d);
-        let VirtioRegions { common, notify, notify_mult, isr, device, msix_table } = if is_legacy(d) || gvnic || ena || ixgbe || mlx5 {
-            let msix = d.msix.unwrap();
-            VirtioRegions {
-                common: none,
-                notify: none,
-                notify_mult: 0,
-                isr: none,
-                device: none,
-                msix_table: l4h_host::blk::PciRegion {
-                    va: (bar_va(msix.table_bar) + msix.table_offset as usize) as u64,
-                    len: msix.table_size as u64 * 16,
-                },
-            }
-        } else {
-            virtio_regions(d, bar_va)
-        };
-        let s = alloc.slots.alloc();
-        let mut region = alloc.split(dma_bits, s).expect("NIC DMA memory");
-        let paddr = region.paddr;
-        let frames = alloc.slots.alloc_range((1 << dma_bits) / PAGE);
-        region
-            .retype(&FRAME_BP, frames.len(), Dest::new(crate::slot::CNODE.cap(), frames.start))
-            .expect("NIC DMA frames");
-        let _ = dma.push(frames);
-        // The NIC reaches its DMA memory only.
-        let dom = iommu.attach(alloc, d);
-        iommu.map(alloc, dom, paddr, 1 << dma_bits, true);
-        let (msi_address, msi_data) = iommu.msi(dom, NIC_MSI_BASE + n as u64);
-        cfg.nics[n] = net::NicConfig {
-            kind: if gvnic {
-                net::NIC_GVNIC
-            } else if ena {
-                net::NIC_ENA
-            } else if mlx5 {
-                net::NIC_MLX5
-            } else if ixgbe {
-                net::NIC_IXGBE
-            } else {
-                net::NIC_VIRTIO
-            },
-            revision: d.revision as u32,
-            pci_bdf: bdf(d),
-            msi_data,
-            msi_address,
-            common,
-            notify,
-            notify_off_multiplier: notify_mult,
-            legacy_io: if is_legacy(d) { d.bars[0].addr as u32 } else { 0 },
-            isr,
-            device,
-            msix_table,
-            regs: if gvnic || ena || ixgbe || mlx5 { l4h_host::blk::PciRegion { va: bar_va(0) as u64, len: mapped_device(d).bars[0].size } } else { none },
-            doorbells: if gvnic || ena_llq(d) { bar_region(2) } else { none },
-            dma_paddr: paddr as u64,
-            dma_size: 1 << dma_bits,
-        };
-    }
-    let cfg_bytes = unsafe {
-        core::slice::from_raw_parts(&cfg as *const net::NetdConfig as *const u8, core::mem::size_of::<net::NetdConfig>())
-    };
     let args = SpawnArgs {
         id: NETD_ID,
         kind: host::KIND_NETD,
@@ -318,7 +139,7 @@ pub fn spawn(
         prio: host::PRIO_SERVICE,
         budget_us: info.timeslice_us,
         period_us: info.timeslice_us,
-        config: cfg_bytes,
+        config: &[],
         ntfn: None,
         service_ep: None,
         cnode: None,
@@ -328,10 +149,7 @@ pub fn spawn(
         &args, alloc, &mut arena, win, &mut |alloc, vspace| asids.assign(alloc, vspace),
         &info.spawn_context(0),
     );
-
-    // Mapping caps of the mailbox and every NIC page: DMA buffers and BARs.
-    let pages = host::mailbox::MAILBOX_PAGES + nics[..nr_nics].iter().map(|d| (1 << nic_dma_bits(d)) / PAGE + bar_pages(&mapped_device(d), used_bars(d))).sum::<usize>();
-    let keep_bits = keep_bits(pages);
+    let keep_bits = keep_bits(host::mailbox::MAILBOX_PAGES);
     let keep = arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: keep_bits });
     let mut keep_next = 0u64;
     let mut keep_slot = || {
@@ -339,41 +157,6 @@ pub fn spawn(
         keep_next += 1;
         s
     };
-    let mut nic_list = ArrayVec::new();
-    for (n, d) in nics.into_iter().take(nr_nics).enumerate() {
-        // ENA's LLQ is written in 128-byte bursts.
-        let wc = (ena_llq(&d) as u8) << 2;
-        map_bar_mask(&comp, alloc, &mut arena, &bars[n], used_bars(&d), wc, |b| net::nic_bar_va(n, b as usize), &mut keep_slot);
-        for (i, s) in dma[n].clone().enumerate() {
-            let f = sel4::init_thread::Slot::<cap_type::Granule>::from_index(s).cap();
-            comp.map_copy(alloc, &mut arena, &abs_of(f), net::nic_dma_va(n) + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep_slot());
-        }
-        if is_legacy(&d) {
-            // In the 16-bit port space (is_legacy_virtio); the kernel
-            // refuses ports already given out, which the device can name.
-            let (base, len) = (d.bars[0].addr as u16, d.bars[0].size as u16);
-            match pci::io_ports(alloc, base, len) {
-                Some(io) => comp.give(net::NETD_SLOT_IOPORT_BASE + n as u64, io, CapRights::all()),
-                None => log!("l4h-root: NIC {:02x}:{:02x}.{}: no I/O ports at {:#x}", d.bus, d.dev, d.func, base),
-            }
-        }
-        // Interrupt.
-        let irq_slot = alloc.slots.alloc();
-        pci::msi_irq(
-            &d,
-            NIC_MSI_BASE + n as u64,
-            &abs_of(sel4::init_thread::Slot::<cap_type::Null>::from_index(irq_slot).cap()),
-        );
-        let irq = sel4::init_thread::Slot::<cap_type::IrqHandler>::from_index(irq_slot).cap();
-        let ntfn_slot = alloc.slots.alloc();
-        let ntfn = sel4::init_thread::Slot::<cap_type::Notification>::from_index(ntfn_slot).cap();
-        component::mint_edge(&abs_of(ntfn), &wiring::IRQ_NETD, n, &comp.obj()).expect("NIC IRQ notification");
-        irq.irq_handler_set_notification(ntfn).expect("NIC IRQ set notification");
-        comp.give(net::NETD_SLOT_IRQ_BASE + n as u64, irq, CapRights::all());
-        pci.enable(&d);
-        pci.enable_msix(&d);
-        let _ = nic_list.push(Nic { pci: *d, switch: None });
-    }
     let mailbox = Mailbox::new(&comp, mailbox::NETD_MAILBOX, &wiring::ROOT_NETD_CALL, &wiring::NETD_DONE, alloc, &mut arena, &mut keep_slot);
     component::start(&comp);
     Netd {
@@ -385,7 +168,7 @@ pub fn spawn(
         held: 0,
         backlog: 0,
         zombies: [None; net::MAX_PORTS],
-        nics: nic_list,
+        uplinks: [None; net::MAX_UPLINKS],
         ports: [const { None }; net::MAX_PORTS],
         switches: 0,
         endpoints: [None; net::MAX_STEER_ENDPOINTS],
@@ -415,7 +198,7 @@ impl Netd {
         self.failed
     }
 
-    /// Whether netd has published its NICs' MACs, or never will.
+    /// Whether netd serves, or never will.
     pub fn ready(&self) -> bool {
         self.failed || self.published().ready.load(Ordering::Acquire) != 0
     }
@@ -439,19 +222,114 @@ impl Netd {
         self.try_create_switch().expect("l4h-root: more switches than MAX_SWITCHES")
     }
 
+    /// Put uplink `nic` (nicd.rs) on `switch`.  Its MAC, if it has one
+    /// yet, must not be a port's of the switch (root gives dom0's uplink
+    /// port that MAC: two would be ambiguous).
     pub fn attach_uplink(&mut self, switch: u32, nic: usize) -> Result<(), Errno> {
         if switch >= self.switches {
             return Err(ctl::ENOENT);
         }
-        let n = self.nics.get_mut(nic).ok_or(ctl::ENOENT)?;
-        if n.switch.is_some() {
+        if nic >= crate::nicd::nics().len() {
+            return Err(ctl::ENOENT);
+        }
+        if self.uplinks[nic].is_some() {
             return Err(ctl::EBUSY);
         }
-        if !self.failed {
-            self.mailbox.send(&Request::AttachUplink { nic: nic as usize, switch: switch as usize }).ok_or(ctl::EBUSY)?;
+        if let Some(mac) = crate::nicd::mac(nic) {
+            if self.ports.iter().flatten().any(|p| p.switch == switch && p.mac == mac) {
+                return Err(ctl::EEXIST);
+            }
         }
-        n.switch = Some(switch);
+        if !self.failed {
+            self.mailbox.send(&Request::AttachUplink { nic, switch: switch as usize }).ok_or(ctl::EBUSY)?;
+        }
+        self.uplinks[nic] = Some(switch);
         Ok(())
+    }
+
+    /// The switch of uplink `nic`.
+    pub fn uplink_switch(&self, nic: usize) -> Option<u32> {
+        *self.uplinks.get(nic)?
+    }
+
+    /// The uplink on `switch`, if any.
+    pub fn uplink_on(&self, switch: u32) -> Option<usize> {
+        self.uplinks.iter().position(|&s| s == Some(switch))
+    }
+
+    /// Map uplink `nic`'s channel (root's frames in `frames`, radix
+    /// `bits`) into netd, for good.
+    pub fn map_uplink(&mut self, nic: usize, frames: cap::CNode, bits: usize, pages: usize, alloc: &mut Alloc) -> Result<(), Errno> {
+        if pages * PAGE > net::UPLINK_CHANNEL_MAX {
+            return Err(ctl::EINVAL);
+        }
+        let keep = self.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: bits });
+        let (comp, arena) = (&self.comp, &mut self.arena);
+        alloc.global(|alloc| {
+            for p in 0..pages {
+                let f = frames.absolute_cptr_from_bits_with_depth(p as u64, bits);
+                let dst = keep.absolute_cptr_from_bits_with_depth(p as u64, bits);
+                comp.map_copy(alloc, arena, &f, net::uplink_va(nic) + p * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, dst);
+            }
+        });
+        Ok(())
+    }
+
+    /// Give nicd `c` netd's notification, badged for uplinks.
+    pub fn give_uplink_peer(&self, c: &Component) {
+        c.give_edge(&wiring::NICD_NETD, 0, 0, &self.comp.obj());
+    }
+
+    /// Give netd uplink `nic`'s nicd's notification, replacing the last
+    /// instance's.  Err (and netd failed) if netd keeps filling the slot.
+    pub fn signal_uplink(&mut self, nic: usize, c: &Component) -> Result<(), Errno> {
+        if self.failed {
+            return Ok(());
+        }
+        if self.comp.give_edge_live(&wiring::NETD_NICD, nic, 0, &c.obj()).is_err() {
+            self.fail_inner();
+            return Err(ctl::EIO);
+        }
+        Ok(())
+    }
+
+    /// Post AddUplink: netd takes uplink `nic`'s fresh channel.
+    pub fn add_uplink(&mut self, nic: usize, data_bits: u32) -> Result<(), Errno> {
+        self.post(Request::AddUplink { nic, data_bits })
+    }
+
+    /// Post RemoveUplink: true if netd must answer it before the channel
+    /// is reused (nicd::netd_released then); false if netd has failed and
+    /// touches nothing.
+    pub fn remove_uplink(&mut self, nic: usize) -> bool {
+        if self.failed {
+            return false;
+        }
+        match self.mailbox.send(&Request::RemoveUplink { nic }) {
+            Some(k) => {
+                self.removals[k as usize % RING] = Some(Removal::Uplink(nic));
+                true
+            }
+            None => {
+                // A full ring: netd stopped taking commands, which a
+                // compromised netd might.  Fail it, so that it touches
+                // nothing.
+                log!("l4h-root: netd's mailbox is full: netd failed");
+                self.fail_inner();
+                false
+            }
+        }
+    }
+
+    /// Uplink `nic`'s channel as netd published it: (UPLINK_* state, the
+    /// AddUplink generation it is of, MAC | mac_mode << 48).
+    pub fn uplink_state(&self, nic: usize) -> Option<(u64, u32, u64)> {
+        if self.failed {
+            return None;
+        }
+        let w = self.published().uplinks.get(nic)?;
+        let s = w[net::UPLINK_STATE].load(Ordering::Relaxed);
+        Some((s & 0xff, (s >> 8 & 0xff_ffff) as u32, w[net::UPLINK_MAC].load(Ordering::Relaxed)))
     }
 
     /// The port a new port on `switch` would be.
@@ -526,11 +404,11 @@ impl Netd {
         // Only root grants a dom0 port the physical uplink's identity.
         // A bond keeps both permanent MACs but can send with either
         // member's MAC on either link. Do not unlock arbitrary sources.
-        let uplink = self.nics.iter().position(|n| n.switch == Some(switch));
+        let uplink = self.uplink_on(switch);
         let physical = g.dom0 && uplink.is_some_and(|n| self.nic_mac(n) == Some(mac))
             && !self.ports.iter().flatten().any(|p| p.vm == g.id && p.switch == switch && p.mac == mac);
         let alias = if physical && switch < 2 {
-            self.nics.iter().position(|n| n.switch == Some(1 - switch)).and_then(|n| self.nic_mac(n)).unwrap_or(0)
+            self.uplink_on(1 - switch).and_then(|n| self.nic_mac(n)).unwrap_or(0)
         } else { 0 };
         let flags = if lock { net::NETD_PORT_MAC_LOCK } else { 0 }
             | if isolated { net::NETD_PORT_ISOLATED } else { 0 }
@@ -570,7 +448,7 @@ impl Netd {
         while self.backlog != 0 && !self.failed {
             let p = self.backlog.trailing_zeros() as usize;
             let Some(k) = self.mailbox.send(&Request::RemovePort { port: p }) else { break };
-            self.removals[k as usize % RING] = Some((p, self.zombies[p].take()));
+            self.removals[k as usize % RING] = Some(Removal::Port(p, self.zombies[p].take()));
             self.backlog &= !(1 << p);
         }
     }
@@ -582,8 +460,11 @@ impl Netd {
             let n = &mut h.netd;
             let next = if n.failed { n.mailbox.abandon() } else { n.mailbox.answer().map(|(k, _)| k) };
             let Some(k) = next else { break };
-            let Some((p, zombie)) = n.removals[k as usize % RING].take() else { continue };
-            Self::released(h, p, zombie);
+            match n.removals[k as usize % RING].take() {
+                Some(Removal::Port(p, zombie)) => Self::released(h, p, zombie),
+                Some(Removal::Uplink(nic)) => crate::nicd::netd_released(h, nic),
+                None => {}
+            }
         }
         while h.netd.failed && h.netd.backlog != 0 {
             let p = h.netd.backlog.trailing_zeros() as usize;
@@ -617,16 +498,19 @@ impl Netd {
     /// quarantines disable their controllers: a suspended driver must not
     /// leave devices it programmed still bus-mastering.  `poll` then lets
     /// go of what it has not answered.
-    pub fn fail(&mut self, pci: &Pci) {
+    pub fn fail(&mut self, _pci: &Pci) {
+        self.fail_inner();
+    }
+
+    /// netd has no device: suspended, it touches nothing more, and the
+    /// nicds' channels are free of it (`poll` answers their removals).
+    fn fail_inner(&mut self) {
         if self.failed {
             return;
         }
         log!("l4h-root: netd failed: guest networking stops until reboot");
         self.failed = true;
         let _ = self.comp.tcb.tcb_suspend();
-        for nic in self.nics.iter() {
-            pci.disable(&nic.pci);
-        }
     }
 
     /// Give netd port `p`'s done notification, to guest `g`'s VMM, before
@@ -732,11 +616,9 @@ impl Netd {
         crate::sched_consumed(self.comp.sc)
     }
 
-    /// The MAC address of host NIC `n`, as netd published it.
+    /// The MAC address of host NIC `n`, as root checked it (nicd.rs).
     pub fn nic_mac(&self, n: usize) -> Option<u64> {
-        let p = self.published();
-        let m = p.nic_mac.get(n).filter(|_| n < self.nics.len() && p.ready.load(Ordering::Acquire) != 0)?;
-        Some(m.load(Ordering::Relaxed) & 0xffff_ffff_ffff)
+        crate::nicd::mac(n)
     }
 
     /// (rx frames, tx frames, drops) of port `p`, as netd published them.
@@ -762,8 +644,7 @@ fn steerable_ip(v6: bool, hi: u64, lo: u64) -> bool {
 impl Netd {
     /// The MAC of switch `sw`'s uplink NIC, if it has one.
     fn uplink_mac(&self, sw: u32) -> Option<u64> {
-        let n = self.nics.iter().position(|n| n.switch == Some(sw))?;
-        self.nic_mac(n)
+        self.nic_mac(self.uplink_on(sw)?)
     }
 
     /// Set the endpoint (switch, mac): a new one, or a new peer for an

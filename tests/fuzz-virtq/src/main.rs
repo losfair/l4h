@@ -5,7 +5,7 @@
 //! pool (which is all the VMM maps).  It must never touch memory outside
 //! the pool, accept a buffer outside it, panic or loop forever.  Also
 //! checks blk-mux's pool check (host/l4h-host/src/blk.rs, Pool), feeds
-//! netd's offload code (host/l4h-netd/src/offload.rs) random virtio-net
+//! netd's offload code (host/l4h-netcore/src/offload.rs) random virtio-net
 //! headers and checks its TCP segmentation, and checks that a virtio-blk
 //! reset waits for every request blkd has (host/l4h-vmm/src/blk.rs),
 //! whatever the guest puts in the avail ring, and that no request with a
@@ -36,7 +36,7 @@ mod guest {
 #[path = "../../../host/l4h-vmm/src/virtq.rs"]
 mod virtq;
 
-#[path = "../../../host/l4h-netd/src/offload.rs"]
+#[path = "../../../host/l4h-netcore/src/offload.rs"]
 mod offload;
 
 #[path = "../../../host/l4h-netd/src/pool.rs"]

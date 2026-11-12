@@ -6,26 +6,22 @@ extern crate self as l4h_rt;
 pub use l4h_host as host;
 #[macro_export]
 macro_rules! info { ($($arg:tt)*) => { eprintln!($($arg)*) }; }
+#[macro_export]
+macro_rules! log { ($($arg:tt)*) => { eprintln!($($arg)*) }; }
 pub mod sel4 {
     pub use crate::info as debug_println;
 }
-mod nic {
-    pub type Partial = l4h_host::fixed::ArrayVec<u8, { l4h_host::net::MAX_FRAME }>;
-}
 #[allow(dead_code)]
-#[path = "../../../host/l4h-netd/src/ena.rs"]
+#[path = "../../../host/l4h-nicd-ena/src/ena.rs"]
 mod ena;
-#[allow(dead_code)]
-#[path = "../../../host/l4h-netd/src/offload.rs"]
-mod offload;
-#[allow(dead_code)]
-#[path = "../../../host/l4h-netd/src/pool.rs"]
-mod pool;
+#[path = "../../nicdrv-vfio/sdk.rs"]
+mod sdk;
+use sdk::offload;
 mod vfio;
 
 use l4h_host::{
     blk::PciRegion,
-    net::{self, NicConfig},
+    net,
 };
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
@@ -434,22 +430,12 @@ fn main() {
     let bdf = u32::from_str_radix(&args[1][5..7], 16).unwrap() << 8
         | u32::from_str_radix(&args[1][8..10], 16).unwrap() << 3
         | u32::from_str_radix(&args[1][11..12], 16).unwrap();
-    let cfg = NicConfig {
-        kind: net::NIC_ENA,
-        revision: vfio.revision,
-        pci_bdf: bdf,
-        regs: vfio.regs,
-        doorbells: vfio.llq,
-        msix_table: PciRegion {
-            va: msix.as_ptr() as u64,
-            len: msix.len() as u64,
-        },
-        dma_paddr: vfio.dma_paddr,
-        dma_size: vfio.dma_size(),
-        ..Default::default()
-    };
+    let none = PciRegion { va: 0, len: 0 };
+    let msix_table = PciRegion { va: msix.as_ptr() as u64, len: msix.len() as u64 };
+    let hw = sdk::hw(sdk::config(bdf, vfio.revision, [vfio.regs, none, vfio.llq, none, none, none], msix_table,
+        vfio.dma_paddr, vfio.dma_size()), tsc_hz());
     let started = Instant::now();
-    let nic = ena::Ena::new(0, &cfg, tsc_hz(), Box::leak(Box::default()));
+    let nic = ena::Ena::new(&hw, Box::leak(Box::default()));
     // The driver's device reset may clear MSI-X table entries.
     vfio.enable_irqs();
     println!("init completed in {:?}", started.elapsed());
@@ -470,7 +456,7 @@ fn main() {
     };
     t.check(
         "ENA initialization and hardware checksum capability",
-        t.nic.csum && !t.nic.tso,
+        t.nic.csum && t.nic.offer().tx_gso_mask == 0,
     );
     let ok = t.arp();
     t.check("ARP to the test peer", ok);

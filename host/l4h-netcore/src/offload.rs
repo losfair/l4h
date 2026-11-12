@@ -1,9 +1,27 @@
 //! virtio-net offload metadata (struct virtio_net_hdr_v1) on frames that
 //! cross the switch: validation of what a guest sent, and TCP segmentation
-//! for receivers that cannot take large (GSO) frames.  Free of seL4
+//! for receivers that cannot take large (GSO) frames, and receive offload
+//! (GRO).  netd and the NIC drivers (l4h-nicdrv) share it.  Free of seL4
 //! dependencies so that it can be tested on the build machine.
 
 pub const HDR_SIZE: usize = 12;
+
+/// A frame to copy out: in one piece, or held in pieces (netd's pool).
+pub trait Frame {
+    fn len(&self) -> usize;
+    /// Copy the frame to `dst`, which is len() bytes long.
+    fn copy_to(&self, dst: &mut [u8]);
+}
+
+impl Frame for [u8] {
+    fn len(&self) -> usize {
+        <[u8]>::len(self)
+    }
+
+    fn copy_to(&self, dst: &mut [u8]) {
+        dst.copy_from_slice(self);
+    }
+}
 pub const F_NEEDS_CSUM: u8 = 1;
 pub const GSO_NONE: u8 = 0;
 pub const GSO_TCPV4: u8 = 1;
@@ -383,6 +401,11 @@ impl Gro {
         let seq = u32::from_be_bytes(frame[f.tcp + 4..f.tcp + 8].try_into().unwrap());
         let push = frame[f.tcp + 13] & 0x08 != 0;
         if self.f.is_none() {
+            // A run netd takes whole: segments it would refuse to cut
+            // (MIN_MSS) go as they came.
+            if payload < MIN_MSS {
+                return false;
+            }
             self.buf[..end].copy_from_slice(&frame[..end]);
             self.len = end;
             self.hdr = *hdr;
@@ -405,6 +428,15 @@ impl Gro {
         }
         self.closed = push || payload < self.mss;
         true
+    }
+
+    /// Whether a run is being built, and its bytes: what `flush` emits.
+    pub fn pending(&self) -> bool {
+        self.f.is_some()
+    }
+
+    pub fn pending_len(&self) -> usize {
+        self.len
     }
 
     /// Pass the run built so far to `emit` (as received if it is one

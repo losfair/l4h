@@ -25,7 +25,8 @@ use crate::vspace::{FRAME_BP, map_frame};
 const PAGE: usize = 4096;
 
 /// Mailboxes in layout::MAILBOXES: netd's, then each disk controller's,
-/// then each xHCI controller's, then vmmgr's.
+/// then each xHCI controller's, then each NIC's nicd's (one at a time),
+/// then vmmgr's.
 pub const NETD_MAILBOX: usize = 0;
 pub const fn blkd_mailbox(ctrl: usize) -> usize {
     1 + ctrl
@@ -33,7 +34,10 @@ pub const fn blkd_mailbox(ctrl: usize) -> usize {
 pub const fn usbd_mailbox(ctrl: usize) -> usize {
     1 + crate::pci::MAX_DISK_CTRLS + ctrl
 }
-pub const VMMGR_MAILBOX: usize = usbd_mailbox(l4h_host::usb::MAX_USB_CTRLS);
+pub const fn nicd_mailbox(nic: usize) -> usize {
+    usbd_mailbox(l4h_host::usb::MAX_USB_CTRLS) + nic
+}
+pub const VMMGR_MAILBOX: usize = nicd_mailbox(l4h_host::nicd::MAX_UPLINKS);
 pub const MAILBOXES: usize = VMMGR_MAILBOX + 1;
 
 /// Root's notification, bound to its TCB (main.rs).
@@ -88,6 +92,12 @@ impl<P: Protocol> Mailbox<P> {
         let k = self.client.send(req)?;
         self.kick.signal();
         Some(k)
+    }
+
+    /// Signal the peer without posting (a nicd's configuration request
+    /// is answered: l4h-root's nicd.rs).
+    pub fn kick(&self) {
+        self.kick.signal();
     }
 
     pub fn answer(&mut self) -> Option<(u64, mb::Reply)> {

@@ -87,8 +87,35 @@ impl<'a> Elf<'a> {
         })
     }
 
+    /// The bytes of section `name` (by the section header string table),
+    /// if the file has it, within the file.  Every offset and size is the
+    /// file's, so each is checked: a bad table gives None.
+    pub fn section(&self, name: &str) -> Option<&'a [u8]> {
+        let d = self.data;
+        let shoff = usize::try_from(u64_at(d, 40)).ok()?;
+        let (shentsize, shnum, shstrndx) = (u16_at(d, 58) as usize, u16_at(d, 60) as usize, u16_at(d, 62) as usize);
+        if shentsize < 64 || shstrndx >= shnum || shoff.checked_add(shentsize * shnum).is_none_or(|end| end > d.len()) {
+            return None;
+        }
+        let range = |i: usize| -> Option<(usize, usize, u32)> {
+            let o = shoff + i * shentsize;
+            let (off, size) = (usize::try_from(u64_at(d, o + 24)).ok()?, usize::try_from(u64_at(d, o + 32)).ok()?);
+            // SHT_NOBITS has no bytes in the file.
+            let ty = u32_at(d, o + 4);
+            (ty == 8 || off.checked_add(size).is_some_and(|end| end <= d.len())).then_some((off, size, u32_at(d, o)))
+        };
+        let (str_off, str_size, _) = range(shstrndx)?;
+        let names = &d[str_off..str_off + str_size];
+        (0..shnum).find_map(|i| {
+            let (off, size, name_off) = range(i)?;
+            let rest = names.get(name_off as usize..)?;
+            let end = rest.iter().position(|&b| b == 0)?;
+            (&rest[..end] == name.as_bytes() && u32_at(d, shoff + i * shentsize + 4) != 8).then(|| &d[off..off + size])
+        })
+    }
+
     /// Lowest and highest (exclusive) virtual address of loadable segments.
-    #[allow(dead_code)] // vmmgr's kimage.rs
+    #[allow(dead_code)] // vmmgr's kimage.rs, root's drivers.rs
     pub fn bounds(&self) -> (u64, u64) {
         let mut lo = u64::MAX;
         let mut hi = 0;

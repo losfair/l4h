@@ -1,5 +1,5 @@
 //! Frames netd holds: for a guest whose RX ring is full, or for an uplink
-//! NIC without a free TX buffer.  They live in one pool of fixed chunks,
+//! whose channel has no room.  They live in one pool of fixed chunks,
 //! sized here, each frame a chain of chunks; a backlog is a FIFO of such
 //! frames.  Every backlog takes from the same pool, so its limits are
 //! checks against it, and running out drops a frame instead of growing a
@@ -15,6 +15,7 @@
 use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+pub use crate::offload::Frame;
 use crate::offload::HDR_SIZE;
 use l4h_rt::host::net;
 
@@ -25,7 +26,7 @@ pub const CHUNKS: usize = BYTES / CHUNK;
 const NIL: u16 = u16::MAX;
 const _: () = assert!(CHUNKS < NIL as usize);
 /// Backlogs, at most: each guest port's and each NIC's.
-pub const BACKLOGS: usize = net::MAX_PORTS + net::MAX_NICS;
+pub const BACKLOGS: usize = net::MAX_PORTS + net::MAX_UPLINKS;
 /// Chunks kept for each backlog: two frames of any size.
 pub const RESERVED: usize = 2 * net::MAX_FRAME.div_ceil(CHUNK);
 /// Chunks the backlogs share beyond their reserves.
@@ -77,23 +78,6 @@ impl Fifo {
 
     pub fn is_empty(&self) -> bool {
         self.head == NIL
-    }
-}
-
-/// A frame to copy out: in one piece, or held in the pool.
-pub trait Frame {
-    fn len(&self) -> usize;
-    /// Copy the frame to `dst`, which is len() bytes long.
-    fn copy_to(&self, dst: &mut [u8]);
-}
-
-impl Frame for [u8] {
-    fn len(&self) -> usize {
-        <[u8]>::len(self)
-    }
-
-    fn copy_to(&self, dst: &mut [u8]) {
-        dst.copy_from_slice(self);
     }
 }
 

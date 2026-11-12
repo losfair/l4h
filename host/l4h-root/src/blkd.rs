@@ -1026,7 +1026,6 @@ pub struct VirtioRegions {
     pub notify_mult: u32,
     pub isr: blk::PciRegion,
     pub device: blk::PciRegion,
-    pub msix_table: blk::PciRegion,
 }
 
 pub fn virtio_regions(d: &pci::Device, bar_va: impl Fn(u8) -> usize) -> VirtioRegions {
@@ -1039,17 +1038,12 @@ pub fn virtio_regions(d: &pci::Device, bar_va: impl Fn(u8) -> usize) -> VirtioRe
         let va = bar_va(c.bar) + c.offset as usize;
         (blk::PciRegion { va: va as u64, len: c.length as u64 }, c.notify_off_multiplier)
     };
-    let msix = d.msix.unwrap();
     VirtioRegions {
         common: region(VIRTIO_PCI_CAP_COMMON_CFG).0,
         notify: region(VIRTIO_PCI_CAP_NOTIFY_CFG).0,
         notify_mult: region(VIRTIO_PCI_CAP_NOTIFY_CFG).1,
         isr: region(VIRTIO_PCI_CAP_ISR_CFG).0,
         device: region(VIRTIO_PCI_CAP_DEVICE_CFG).0,
-        msix_table: blk::PciRegion {
-            va: (bar_va(msix.table_bar) + msix.table_offset as usize) as u64,
-            len: msix.table_size as u64 * 16,
-        },
     }
 }
 

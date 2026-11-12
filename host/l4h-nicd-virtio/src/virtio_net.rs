@@ -3,13 +3,12 @@
 //! DMA buffers owned by this driver.
 
 use l4h_rt::host::fixed::ArrayVec;
-use l4h_rt::host::net::{self, NicConfig};
+use l4h_rt::host::net;
 use l4h_rt::ioport::Ports;
+use crate::sdk::{Config, Frame, Hw, Offer};
 use l4h_virtio::{
-    DESC_F_WRITE, Device, Dma, F_ACCESS_PLATFORM, F_VERSION_1, Mmio, STATUS_ACK, STATUS_DRIVER, STATUS_DRIVER_OK, STATUS_FAILED, Virtq, legacy,
+    DESC_F_WRITE, Device, F_ACCESS_PLATFORM, F_VERSION_1, Mmio, STATUS_ACK, STATUS_DRIVER, STATUS_DRIVER_OK, STATUS_FAILED, Virtq, legacy,
 };
-
-use crate::pool::Frame;
 
 const VIRTIO_NET_F_CSUM: u64 = 1 << 0;
 const VIRTIO_NET_F_GUEST_CSUM: u64 = 1 << 1;
@@ -21,6 +20,15 @@ const VIRTIO_NET_F_HOST_TSO6: u64 = 1 << 12;
 const VIRTIO_NET_F_MRG_RXBUF: u64 = 1 << 15;
 /// struct virtio_net_hdr_v1; legacy devices use the first 10 bytes
 /// (struct virtio_net_hdr, without num_buffers).
+
+/// What the driver drives and needs (l4h_host::nicd::Manifest).
+pub const MANIFEST: crate::sdk::Manifest = crate::sdk::Manifest {
+    flags: crate::sdk::nicd::F_VIRTIO | crate::sdk::nicd::F_LEGACY_IO,
+    msix_min: 1,
+    dma_bits: 22,
+    ..crate::sdk::Manifest::empty().with_name("virtio-net").with_matches(&[crate::sdk::PciMatch::id(0x1af4, 0x1041), crate::sdk::PciMatch::id(0x1af4, 0x1000)])
+};
+
 const HDR: usize = net::HDR_SIZE;
 const LEGACY_HDR: usize = 10;
 /// Receive buffers.  With receive TSO, a frame of up to 64 KiB spans
@@ -69,26 +77,23 @@ fn wanted(offered: u64) -> u64 {
     want
 }
 
-fn modern_device(c: &NicConfig) -> Device {
+fn modern_device(c: &Config) -> Device {
     Device {
         common: Mmio(c.common.va as usize),
         notify: Mmio(c.notify.va as usize),
         notify_mult: c.notify_off_multiplier,
         notify_len: c.notify.len as usize,
-        device: Mmio(c.device.va as usize),
+        device: Mmio(c.device_cfg.va as usize),
     }
 }
 
 impl VirtioNet {
-    pub fn new(n: usize, c: &NicConfig) -> Self {
-        let mut dma = Dma::new(net::nic_dma_va(n), c.dma_paddr, c.dma_size as usize);
-        let msix = Mmio(c.msix_table.va as usize);
-        msix.w32(0, c.msi_address as u32);
-        msix.w32(4, (c.msi_address >> 32) as u32);
-        msix.w32(8, c.msi_data);
-        msix.w32(12, 0);
-        let (mut rxq, txq, want, mac, ports, hdr_len) = if c.legacy_io != 0 {
-            let p = Ports { cap: net::NETD_SLOT_IOPORT_BASE + n as u64, base: c.legacy_io as u16 };
+    pub fn new(hw: &Hw) -> Result<Self, &'static str> {
+        let c = hw.config;
+        let n = c.uplink;
+        let mut dma = hw.dma();
+        hw.program_msix(1);
+        let (mut rxq, txq, want, mac, ports, hdr_len) = if let Some(p) = hw.io_ports() {
             p.out8(legacy::STATUS, 0);
             p.out8(legacy::STATUS, STATUS_ACK | STATUS_DRIVER);
             let want = wanted(p.in32(legacy::DEVICE_FEATURES) as u64);
@@ -99,31 +104,34 @@ impl VirtioNet {
                 let num = p.in16(legacy::QUEUE_SIZE);
                 if num == 0 {
                     p.out8(legacy::STATUS, STATUS_FAILED);
-                    panic!("netd: NIC {} has no queue {}", n, idx);
+                    return Err("a queue is missing");
                 }
                 let (va, pa) = dma.alloc(l4h_virtio::legacy_ring_size(num), 4096);
                 p.out32(legacy::QUEUE_PFN, (pa >> 12) as u32);
                 p.out16(legacy::QUEUE_VECTOR, 0);
                 if p.in16(legacy::QUEUE_VECTOR) != 0 {
-                    panic!("netd: NIC {} refuses MSI-X vector for queue {}", n, idx);
+                    return Err("the device refuses the MSI-X vector");
                 }
-                Virtq::legacy(idx, num, va)
+                Ok(Virtq::legacy(idx, num, va))
             };
-            let (rxq, txq) = (queue(0), queue(1));
+            let (rxq, txq) = (queue(0)?, queue(1)?);
             let mac: [u8; 6] = core::array::from_fn(|i| p.in8(legacy::DEVICE_CONFIG + i as u16));
             // A legacy header has num_buffers only with MRG_RXBUF.
             (rxq, txq, want, mac, Some(p), if want & VIRTIO_NET_F_MRG_RXBUF != 0 { HDR } else { LEGACY_HDR })
         } else {
+            if c.common.len == 0 || c.notify.len == 0 || c.device_cfg.len == 0 {
+                return Err("no virtio regions");
+            }
             let dev = modern_device(c);
-            if !dev.reset(l4h_rt::timeout_ms(l4h_virtio::RESET_MS)) { panic!("netd: NIC {} does not reset", n); }
+            if !dev.reset(l4h_rt::timeout_ms(l4h_virtio::RESET_MS)) { return Err("the device does not reset"); }
             let offered = dev.features();
             let want = F_VERSION_1 | wanted(offered) | (offered & F_ACCESS_PLATFORM);
             if offered & F_VERSION_1 == 0 || !dev.set_features(want) {
                 dev.fail();
-                panic!("netd: NIC {} rejects VERSION_1", n);
+                return Err("the device rejects VERSION_1");
             }
-            let rxq = dev.setup_queue(&mut dma, 0, RX_QUEUE, 0).expect("netd: rx queue");
-            let txq = dev.setup_queue(&mut dma, 1, RX_QUEUE, 0).expect("netd: tx queue");
+            let rxq = dev.setup_queue(&mut dma, 0, RX_QUEUE, 0).ok_or("no RX queue")?;
+            let txq = dev.setup_queue(&mut dma, 1, RX_QUEUE, 0).ok_or("no TX queue")?;
             let mac: [u8; 6] = core::array::from_fn(|i| dev.device.r8(i));
             (rxq, txq, want, mac, None, HDR)
         };
@@ -166,7 +174,7 @@ impl VirtioNet {
         nic.txq.set_interrupts(false);
         nic.kick(&nic.rxq);
         l4h_rt::info!(
-            "netd: NIC {}: {:02x}:{:02x}.{} virtio-net {}, mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, offloads tx{}{} rx{}{}{}",
+            "nicd {}: {:02x}:{:02x}.{} virtio-net {}, mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, offloads tx{}{} rx{}{}{}",
             n, c.pci_bdf >> 8, (c.pci_bdf >> 3) & 0x1f, c.pci_bdf & 7,
             if nic.ports.is_some() { "legacy" } else { "modern" },
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
@@ -175,7 +183,20 @@ impl VirtioNet {
             if want & (VIRTIO_NET_F_GUEST_TSO4 | VIRTIO_NET_F_GUEST_TSO6) != 0 { " tso" } else { "" },
             if nic.mrg { " mrg" } else { "" },
         );
-        nic
+        Ok(nic)
+    }
+
+    pub fn offer(&self) -> Offer {
+        let mut o = Offer::plain(self.mac);
+        o.tx_csum = self.csum as u32;
+        if self.tso {
+            o.tx_gso_mask = 1 << 1 | 1 << 4;
+            o.tx_gso_max = net::MAX_FRAME as u32;
+            o.tx_mss_min = 1;
+            o.tx_mss_max = 65535;
+            o.tx_hdr_max = 65535;
+        }
+        o
     }
 
     fn kick(&self, q: &Virtq) {
@@ -287,5 +308,33 @@ impl VirtioNet {
         if core::mem::take(&mut self.tx_kick) {
             self.kick(&self.txq);
         }
+    }
+}
+
+/// The SDK's view of the driver (l4h_nicdrv::NicDriver).
+impl crate::sdk::NicDriver for VirtioNet {
+    fn start(hw: &Hw) -> Result<Self, &'static str> {
+        VirtioNet::new(hw)
+    }
+    fn offer(&self) -> Offer {
+        VirtioNet::offer(self)
+    }
+    fn rx_begin(&mut self) {
+        VirtioNet::rx_begin(self)
+    }
+    fn rx_done(&mut self) -> bool {
+        VirtioNet::rx_done(self)
+    }
+    fn receive(&mut self, out: &mut [u8], hdr: &mut [u8; HDR]) -> Option<usize> {
+        VirtioNet::receive(self, out, hdr)
+    }
+    fn transmit(&mut self, frame: &[u8], hdr: &[u8; HDR]) -> bool {
+        VirtioNet::transmit(self, frame, hdr)
+    }
+    fn tx_interrupts(&mut self, on: bool) -> bool {
+        VirtioNet::tx_interrupts(self, on)
+    }
+    fn kick_tx(&mut self) {
+        VirtioNet::kick_tx(self)
     }
 }

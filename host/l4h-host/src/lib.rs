@@ -22,12 +22,14 @@ pub mod log;
 pub mod mailbox;
 pub mod memd;
 pub mod net;
+pub mod nicd;
 pub mod ring;
 pub mod root;
 pub mod seqlock;
 pub mod serial;
 pub mod spsc;
 pub mod trust;
+pub mod uplink;
 pub mod usb;
 pub mod vmmgr;
 pub mod wire;
@@ -144,6 +146,8 @@ pub const KIND_USBD: u32 = 8;
 /// trustd's flags server (trust::call): the trustd image, in spaces of its
 /// own.
 pub const KIND_FLAGS: u32 = 9;
+/// A NIC driver (nicd: crate::nicd).
+pub const KIND_NICD: u32 = 10;
 
 /// The kinds that serve calls: root calls memd, guests' VMMs call vmmgr,
 /// vmmgr and trustd call the flags server.  A caller blocked in a call

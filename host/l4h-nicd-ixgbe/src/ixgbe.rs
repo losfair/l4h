@@ -6,7 +6,7 @@
 //! Registers are little-endian words in BAR 0.  The driver resets the MAC
 //! (not the PHY: autonegotiation restarts with the settings the firmware
 //! left), then sets up queue 0 in each direction.  The RX queue raises MSI-X entry 0 and
-//! the TX queue entry 1; both entries carry netd's one vector for the NIC,
+//! the TX queue entry 1; both entries carry the driver's one vector for the NIC,
 //! so the two causes are masked and unmasked separately (EIMS/EIMC bits 0
 //! and 1) while sharing the interrupt.
 
@@ -14,11 +14,22 @@ use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::Ordering;
 
 use l4h_rt::host::fixed::ArrayVec;
-use l4h_rt::host::{self, net::{self, NicConfig}};
-use l4h_virtio::{Dma, Mmio, dma_fence};
+use l4h_rt::host::{self, net};
+use crate::sdk::{Hw, Offer, Partial};
+use l4h_virtio::{Mmio, dma_fence};
 
-use crate::offload;
-use crate::pool::Frame;
+use crate::sdk::offload;
+use crate::sdk::Frame;
+
+
+/// What the driver drives and needs (l4h_host::nicd::Manifest).
+pub const MANIFEST: crate::sdk::Manifest = crate::sdk::Manifest {
+    bars: 1 << 0,
+    msix_min: 2,
+    dma_bits: 22,
+    // X550T, X550T1.
+    ..crate::sdk::Manifest::empty().with_name("ixgbe").with_matches(&[crate::sdk::PciMatch::id(0x8086, 0x1563), crate::sdk::PciMatch::id(0x8086, 0x15d1)])
+};
 
 const HDR: usize = net::HDR_SIZE;
 
@@ -204,7 +215,7 @@ pub struct Ixgbe {
     /// Descriptors given back since the last tail write.
     rx_kick: bool,
     /// Pieces of a frame that spans several buffers.
-    rx_partial: &'static mut ArrayVec<u8, { net::MAX_FRAME }>,
+    rx_partial: &'static mut Partial,
     rx_partial_bad: bool,
 
     tx_ring: usize,
@@ -219,8 +230,23 @@ pub struct Ixgbe {
 }
 
 impl Ixgbe {
-    pub fn new(n: usize, c: &NicConfig, tsc_hz: u64, rx_partial: &'static mut ArrayVec<u8, { net::MAX_FRAME }>) -> Self {
-        let regs = Mmio(c.regs.va as usize);
+    pub fn offer(&self) -> Offer {
+        let mut o = Offer::plain(self.mac);
+        o.tx_csum = self.csum as u32;
+        if self.tso {
+            o.tx_gso_mask = 1 << 1 | 1 << 4;
+            o.tx_gso_max = net::MAX_FRAME as u32;
+            o.tx_mss_min = TSO_MIN_MSS as u32;
+            o.tx_mss_max = TSO_MAX_MSS as u32;
+            o.tx_hdr_max = TSO_MAX_HDR as u32;
+        }
+        o
+    }
+
+    pub fn new(hw: &Hw, rx_partial: &'static mut Partial) -> Self {
+        let (c, tsc_hz) = (hw.config, hw.tsc_hz);
+        let n = c.uplink as usize;
+        let regs = Mmio(c.bars[0].va as usize);
         let wait_us = |us: u64| {
             let end = host::ticks::now() + us * tsc_hz / 1_000_000;
             while host::ticks::now() < end {
@@ -249,7 +275,7 @@ impl Ixgbe {
         wait_us(2000);
         regs.w32(CTRL, regs.r32(CTRL) | CTRL_GIO_DIS);
         if !poll(STATUS, STATUS_GIO, 0, 100) {
-            l4h_rt::info!("netd: NIC {}: GIO primary still enabled; resetting anyway", n);
+            l4h_rt::info!("nicd {}: GIO primary still enabled; resetting anyway", n);
         }
 
         // MAC reset, holding this function's PHY semaphore as Linux does
@@ -264,11 +290,11 @@ impl Ixgbe {
         }
         wait_us(1000);
         if !poll(CTRL, CTRL_RST | CTRL_LNK_RST, 0, 10) {
-            panic!("netd: NIC {}: reset does not complete", n);
+            panic!("nicd {}: reset does not complete", n);
         }
         wait_us(100_000);
         if !poll(RDRXCTL, RDRXCTL_DMAIDONE, RDRXCTL_DMAIDONE, 100) {
-            l4h_rt::info!("netd: NIC {}: DMA init not done after reset", n);
+            l4h_rt::info!("nicd {}: DMA init not done after reset", n);
         }
         regs.w32(EIMC, 0x7fff_ffff);
         regs.r32(EICR);
@@ -280,7 +306,7 @@ impl Ixgbe {
         regs.w32(RAH0, (rah & 0xffff) | RAH_AV);
         regs.w32(CTRL_EXT, regs.r32(CTRL_EXT) | CTRL_EXT_NS_DIS | CTRL_EXT_DRV_LOAD);
 
-        let mut dma = Dma::new(net::nic_dma_va(n), c.dma_paddr, c.dma_size as usize);
+        let mut dma = hw.dma();
 
         // Receive: CRC stripped, frames up to MAX_FRAME accepted (they span
         // buffers), no RSC, RSS or NFS filtering.
@@ -307,7 +333,7 @@ impl Ixgbe {
         regs.w32(srrctl(0), (RX_BUF >> 10) as u32 | SRRCTL_DESCTYPE_ADV_ONEBUF | SRRCTL_DROP_EN);
         regs.w32(rxdctl(0), RXDCTL_ENABLE);
         if !poll(rxdctl(0), RXDCTL_ENABLE, RXDCTL_ENABLE, 10) {
-            panic!("netd: NIC {}: RX queue does not enable", n);
+            panic!("nicd {}: RX queue does not enable", n);
         }
         dma_fence(Ordering::Release);
         // All buffers but one: head == tail means empty.
@@ -329,10 +355,10 @@ impl Ixgbe {
         // WTHRESH 1, HTHRESH 1, PTHRESH 32, as Linux.
         regs.w32(txdctl(0), TXDCTL_ENABLE | 1 << 16 | 1 << 8 | 32);
         if !poll(txdctl(0), TXDCTL_ENABLE, TXDCTL_ENABLE, 10) {
-            panic!("netd: NIC {}: TX queue does not enable", n);
+            panic!("nicd {}: TX queue does not enable", n);
         }
 
-        // Interrupts: MSI-X entries 0 (RX) and 1 (TX), both netd's vector.
+        // Interrupts: MSI-X entries 0 (RX) and 1 (TX), both the driver's vector.
         let msix = Mmio(c.msix_table.va as usize);
         for e in 0..2 {
             msix.w32(e * 16, c.msi_address as u32);
@@ -360,7 +386,7 @@ impl Ixgbe {
             _ => "?",
         };
         l4h_rt::info!(
-            "netd: NIC {}: {:02x}:{:02x}.{} X550, mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, link {} {}",
+            "nicd {}: {:02x}:{:02x}.{} X550, mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, link {} {}",
             n, c.pci_bdf >> 8, (c.pci_bdf >> 3) & 0x1f, c.pci_bdf & 7,
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
             if up { "up" } else { "down" }, speed,
@@ -481,12 +507,6 @@ impl Ixgbe {
     }
 
     // ---- transmit
-
-    /// Whether the device can segment this GSO frame.
-    pub fn takes_gso(&self, hdr: &[u8; HDR]) -> bool {
-        let get16 = |off: usize| u16::from_le_bytes([hdr[off], hdr[off + 1]]) as usize;
-        self.tso && (TSO_MIN_MSS..=TSO_MAX_MSS).contains(&get16(4)) && get16(2) <= TSO_MAX_HDR
-    }
 
     fn reap_tx(&mut self) {
         while let Some(&(last, buf)) = self.tx_sent.first() {
@@ -679,4 +699,35 @@ fn swsm_acquire(regs: &Mmio, wait_us: &impl Fn(u64)) -> bool {
 fn swsm_release(regs: &Mmio) {
     regs.w32(SWFW_SYNC, regs.r32(SWFW_SYNC) & !SWFW_REGSMP);
     regs.w32(SWSM, regs.r32(SWSM) & !SWSM_SMBI);
+}
+
+/// The SDK's view of the driver (l4h_nicdrv::NicDriver).
+impl crate::sdk::NicDriver for Ixgbe {
+    fn start(hw: &Hw) -> Result<Self, &'static str> {
+        // The one frame being assembled, too large for the stack: start
+        // runs once.
+        static mut RX_PARTIAL: Partial = Partial::new();
+        Ok(Ixgbe::new(hw, unsafe { &mut *core::ptr::addr_of_mut!(RX_PARTIAL) }))
+    }
+    fn offer(&self) -> Offer {
+        Ixgbe::offer(self)
+    }
+    fn rx_begin(&mut self) {
+        Ixgbe::rx_begin(self)
+    }
+    fn rx_done(&mut self) -> bool {
+        Ixgbe::rx_done(self)
+    }
+    fn receive(&mut self, out: &mut [u8], hdr: &mut [u8; HDR]) -> Option<usize> {
+        Ixgbe::receive(self, out, hdr)
+    }
+    fn transmit(&mut self, frame: &[u8], hdr: &[u8; HDR]) -> bool {
+        Ixgbe::transmit(self, frame, hdr)
+    }
+    fn tx_interrupts(&mut self, on: bool) -> bool {
+        Ixgbe::tx_interrupts(self, on)
+    }
+    fn kick_tx(&mut self) {
+        Ixgbe::kick_tx(self)
+    }
 }

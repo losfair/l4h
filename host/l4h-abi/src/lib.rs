@@ -338,6 +338,40 @@ pub const CTL_BLK_ATTACH_EXTENTS: u32 = 39;
 pub const CTL_USB_INFO: u32 = 40;
 pub const CTL_USB_ATTACH: u32 = 41;
 pub const CTL_PCI_LIST: u32 = 42;
+/// NIC drivers (DESIGN.md §9.8).  Bind NIC args[0] to the driver named by
+/// args[1..3] (16 bytes, NUL padded; all zeros: the first that matches).
+pub const CTL_NIC_BIND: u32 = 43;
+pub const CTL_NIC_UNBIND: u32 = 44;
+/// Stop NIC args[0]'s driver and start a fresh one.
+pub const CTL_NIC_RESTART: u32 = 45;
+/// A control message for NIC args[0]'s driver: args[2] bytes at args[1]
+/// of the caller's control data area.  vals[0]: the answer's length,
+/// which CTL_NIC_CTL_READ returns.
+pub const CTL_NIC_CTL: u32 = 46;
+pub const CTL_NIC_CTL_READ: u32 = 47;
+/// Driver args[0] of the bundle: vals[0] = flags (DRIVER_BOOT) | class <<
+/// 8 | matches << 16, data = name (16 bytes) then SHA-256 (32).
+pub const CTL_DRIVER_INFO: u32 = 48;
+/// Load a driver image: args[1] bytes at args[0] of the caller's control
+/// data area.  vals[0]: its index.  Refused unless drivers are confined.
+pub const CTL_DRIVER_LOAD: u32 = 49;
+/// Test builds: make NIC args[0]'s driver panic (args[1] = 1) or hang (2).
+pub const CTL_NIC_TEST: u32 = 50;
+/// CTL_NIC_INFO: vals[0] BDF, [1] switch (u64::MAX: none), [2] MAC, [3]
+/// state | trust << 8 | driver << 16 (0xff: none) | restarts << 32 |
+/// isolation group size << 48, [4] vendor | device << 16, [5] the
+/// driver's frames received | sent << 32 (low 32 bits each); data: the
+/// driver's name, NUL, and why it last stopped.
+pub const NIC_STATE_UNBOUND: u64 = 0;
+pub const NIC_STATE_STARTING: u64 = 1;
+pub const NIC_STATE_UP: u64 = 2;
+pub const NIC_STATE_RESTARTING: u64 = 3;
+pub const NIC_STATE_FAILED: u64 = 4;
+/// Its driver runs outside the TCB (IOMMU, interrupt remapping, an
+/// isolation group of its own), or is trusted.
+pub const NIC_TRUST_CONFINED: u64 = 1;
+pub const NIC_TRUST_TRUSTED: u64 = 2;
+pub const DRIVER_BOOT: u64 = 1;
 pub const PCI_OWNER_NONE: u16 = 0;
 pub const PCI_OWNER_BLKD: u16 = 1;
 pub const PCI_OWNER_NETD: u16 = 2;
@@ -346,6 +380,8 @@ pub const PCI_OWNER_USBD: u16 = 4;
 pub const PCI_OWNER_FIRMWARE: u16 = 5;
 /// Root has disabled or quarantined the function; no active driver owns it.
 pub const PCI_OWNER_ROOT: u16 = 6;
+/// A NIC driver component (nicd).
+pub const PCI_OWNER_NICD: u16 = 7;
 
 /// A function from root's boot-time PCI inventory. No BARs, physical
 /// addresses or configuration access. Subsystem IDs are zero if absent.
