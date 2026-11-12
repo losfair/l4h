@@ -193,9 +193,10 @@ pub struct Nic {
     /// The header dwords an FLR clears (SAVED), as the firmware left them
     /// at boot: what root restores after a reset, whatever a driver did.
     saved: [u32; 8],
-    /// And of the PCI Express capability: its offset, Device Control,
-    /// Link Control, Device Control 2 and Link Control 2.
-    pcie_saved: Option<(u8, [u16; 4])>,
+    /// And of the PCI Express capability: its offset, how many of
+    /// PCIE_SAVED it has, and Device Control, Link Control, Device
+    /// Control 2 and Link Control 2.
+    pcie_saved: Option<(u8, usize, [u16; 4])>,
     then: Then,
     /// Restarts in the hour since `window_start`; the backoff.
     restarts: usize,
@@ -277,7 +278,7 @@ pub fn found(d: pci::Device, ids: Ids, pin: Option<Option<&'static str>>, pci: &
         removing: false,
         reset_until: 0,
         saved: core::array::from_fn(|k| pci.read32(d.bus, d.dev, d.func, SAVED[k])),
-        pcie_saved: pcie_cap_of(pci, &d).map(|c| (c, PCIE_SAVED.map(|o| pci.read16(d.bus, d.dev, d.func, c + o)))),
+        pcie_saved: pcie_saved_of(pci, &d).map(|(c, k)| (c, k, core::array::from_fn(|i| if i < k { pci.read16(d.bus, d.dev, d.func, c + PCIE_SAVED[i]) } else { 0 }))),
         then: Then::Restart,
         restarts: 0,
         window_start: 0,
@@ -998,6 +999,18 @@ fn legacy_of(d: &pci::Device, m: &Manifest) -> bool {
 /// Control 2.
 const PCIE_SAVED: [u8; 4] = [0x08, 0x10, 0x28, 0x30];
 
+/// The PCI Express capability's offset and how many of PCIE_SAVED it has:
+/// the controls 2 only from version 2 on (a version 1 capability, as
+/// QEMU's 82574L has at 0xe0, ends at 0x14), and all of it within the
+/// 256 bytes root reads.
+fn pcie_saved_of(pci: &pci::Pci, d: &pci::Device) -> Option<(u8, usize)> {
+    let c = pcie_cap_of(pci, d)?;
+    let version = pci.read32(d.bus, d.dev, d.func, c) >> 16 & 0xf;
+    let k = if version >= 2 { 4 } else { 2 };
+    let k = (0..=k).rev().find(|&k| k == 0 || c as usize + PCIE_SAVED[k - 1] as usize + 2 <= 0x100)?;
+    Some((c, k))
+}
+
 /// The PCI Express capability's offset, if the function has one.
 fn pcie_cap(h: &Host, d: &pci::Device) -> Option<u8> {
     pcie_cap_of(&h.pci, d)
@@ -1094,8 +1107,8 @@ fn progress(h: &mut Host, i: usize) {
         for (k, &off) in SAVED.iter().enumerate() {
             h.pci.write32(p.bus, p.dev, p.func, off, n.saved[k]);
         }
-        if let Some((c, v)) = n.pcie_saved {
-            for (k, &o) in PCIE_SAVED.iter().enumerate() {
+        if let Some((c, count, v)) = n.pcie_saved {
+            for (k, &o) in PCIE_SAVED[..count].iter().enumerate() {
                 h.pci.write16(p.bus, p.dev, p.func, c + o, v[k]);
             }
         }

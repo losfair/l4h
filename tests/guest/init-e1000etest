@@ -1,0 +1,45 @@
+#!/bin/sh
+# dom0 init for tests/run-e1000etest.sh: dom0's uplink is an Intel 82574L
+# (QEMU e1000e) driven by its own nicd, confined when there is an IOMMU.
+# DHCP, ping, and a TCP transfer each way to the host (tests/nic-peer.py,
+# which checks the data), before and after the driver restarts.
+slow=${L4H_TEST_SLOW:-1}
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mount -t tmpfs tmp /tmp
+fail() { echo "E1000ETEST: FAIL: $*"; l4hctl nic list; poweroff -f; }
+echo "E1000ETEST: start"
+l4hctl driver list | grep -q "e1000e, ethernet, boot bundle" || fail "no e1000e driver in the bundle"
+l4hctl nic list | sed 's/^/E1000ETEST: /'
+l4hctl iommu | sed 's/^/E1000ETEST: iommu: /'
+l4hctl nic list | grep -q "^nic 0: .* 8086:10d3, driver e1000e, up, " || fail "nic 0 not up with e1000e"
+ip link set lo up
+ip link set eth0 up
+# A transfer each way: the SHA-256 of what dom0 got and sent, for the host
+# to compare with the peer's.
+transfer() { # label
+    nc 10.0.2.2 "$E1000E_RX_PORT" > /tmp/rx || fail "$1: receive"
+    echo "E1000ETEST: $1 rx $(wc -c < /tmp/rx) $(sha256sum < /tmp/rx | cut -d' ' -f1)"
+    head -c "$E1000E_BYTES" /dev/urandom > /tmp/tx
+    nc 10.0.2.2 "$E1000E_TX_PORT" < /tmp/tx > /dev/null || fail "$1: send"
+    echo "E1000ETEST: $1 tx $(wc -c < /tmp/tx) $(sha256sum < /tmp/tx | cut -d' ' -f1)"
+    rm -f /tmp/rx /tmp/tx
+}
+udhcpc -i eth0 -n -q -t 5 -s /bin/udhcpc.script >/dev/null 2>&1 || fail "dhcp"
+ping -c 3 -W 2 10.0.2.2 >/dev/null || fail "ping"
+echo "E1000ETEST: uplink ok"
+transfer first
+# The driver restarts: its DMA region, mapped again for the new nicd, and
+# the device reset without FLR (QEMU's 82574L has none).
+l4hctl nic restart 0 || fail "restart"
+n=0
+until l4hctl nic list | grep -q "^nic 0: .*, up, .*last: restarted by dom0"; do
+    n=$((n + 1)); [ "$n" -lt $((30 * slow)) ] || fail "nic 0 not back after its restart"; sleep 1
+done
+udhcpc -i eth0 -n -q -t 5 -s /bin/udhcpc.script >/dev/null 2>&1 || fail "dhcp after restart"
+ping -c 3 -W 2 10.0.2.2 >/dev/null || fail "ping after restart"
+transfer restarted
+l4hctl nic list | sed 's/^/E1000ETEST: /'
+echo "E1000ETEST: done"
+poweroff -f

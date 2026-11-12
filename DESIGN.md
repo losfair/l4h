@@ -2372,6 +2372,25 @@ compiles the driver unchanged into a Linux program that drives a real port
 through VFIO (ARP, ICMP, DNS, UDP checksum offload, 4 KB and 60 KB TSO, both
 interrupt causes).
 
+**Intel 82574L.** `l4h-nicd-e1000e/src/e1000e.rs` follows Linux `e1000e` for the
+82574L and 82583V (8086:10d3, 150c), the parts of that family with MSI-X;
+QEMU emulates the 82574L as `e1000e`. (The older 8254x, QEMU's `e1000`, have
+INTx only, which a nicd does not take.) It resets the MAC under the software
+flag but not the PHY, which keeps its link, then sets up one RX and one TX
+queue of legacy descriptors: 512 RX buffers of 2 KiB (no long packets, so a
+frame fits one buffer), CRC stripping, promiscuous like the other uplinks.
+RX raises MSI-X entry 0 and TX entry 1, both the driver's vector, masked
+separately (IMS/IMC RXQ0 and TXQ0); causes auto-clear (EIAC) and auto-mask
+(IAM), moderated to about 20,000 per second. Root's tick (`F_TIMER`) reads
+the link. Receive: a TCP/UDP checksum the device verified, without an IPv4
+header error, becomes `DATA_VALID`. Transmit: a context descriptor carries
+checksum offload and TSO over IPv4/IPv6, as Linux `e1000_tso`; data
+descriptors take at most 8 KiB each. `tests/run-e1000etest.sh` makes it dom0's
+uplink in QEMU: DHCP, ping and 8 MiB TCP transfers each way checked against
+a host peer (`tests/nic-peer.py`), before and after a restart (QEMU's device
+has no FLR); with `L4H_QEMU_IOMMU=intel|amd` it is the QEMU test of a
+confined driver (virtio drivers never are), and must cause no IOMMU fault.
+
 **Tests.** `tests/fuzz-virtq` checks that GRO output segments back into
 exactly the frames that went in, and that corrupted or other-flow segments
 do not merge. `tests/run-nettest.sh` covers DHCP and ping over the QEMU
