@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Exercise the shipped mkefi configuration under OVMF with a front GRUB
-# chainloading two FAT slots. Check both selectors, runtime grubenv, disk
+# chainloading two FAT slots. Check discovered and built-in selectors, disk
 # growth with unchanged l4h.conf, odd sector counts, fallback after selection
 # failure, GRUB literals, and a PCI inventory larger than one page.
+# A software TPM checks measurement of the selector and selected files.
 # L4H_TEST_KERNEL may name an already-built compatible guest kernel.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -27,6 +28,7 @@ export L4H_GUEST_KERNEL=$guest_kernel L4H_GUEST_KMODS= L4H_MKSHIM=
 L4H_ESP_LABEL="$boot_label" L4H_BOOT_ENV="$runtime_env" "$root/tools/mkefi.sh" "$out/runtime.efi"
 L4H_ESP_UUID=1111-1111 "$root/tools/mkefi.sh" "$out/fixed-a.efi"
 L4H_ESP_LABEL=L4HSLOTB "$root/tools/mkefi.sh" "$out/fixed-b.efi"
+env -u L4H_ESP_UUID -u L4H_ESP_LABEL -u L4H_BOOT_ENV "$root/tools/mkefi.sh" "$out/default.efi"
 for slot in A B; do
     printf '%s\n' "$slot" > "$out/platform-slot"
     "$root/tools/mkinitramfs.sh" "$out/$slot.cpio.gz" "$root/tests/guest/init-platformtest" \
@@ -92,7 +94,7 @@ mmd -i "$bootpart" ::/EFI/BOOT ::/EFI/L4H
 mcopy -i "$bootpart" "$out/front.efi" ::/EFI/BOOT/BOOTX64.EFI
 for slot in A B; do
     if [ "$slot" = A ]; then part=$slota; else part=$slotb; fi
-    mmd -i "$part" ::/l4h ::/l4h/dom0
+    mmd -i "$part" ::/l4h ::/l4h/dom0 ::/EFI/L4H
     mcopy -i "$part" "$out/$slot.cpio.gz" ::/l4h/dom0/initrd
     mcopy -i "$part" "$out/$slot.conf" ::/l4h/l4h.conf
     mcopy -i "$part" "$out/runtime.efi" ::/EFI/l4h.efi
@@ -104,21 +106,31 @@ for i in $(seq 0 127); do
     devices+=(-device "pci-testdev,bus=bulk,addr=$addr,multifunction=on")
 done
 qemu=
+tpm=()
 trap 'if [ -n "$qemu" ]; then kill "$qemu" 2>/dev/null || true; wait "$qemu" 2>/dev/null || true; fi' EXIT
 run() {
     local name=$1 expected=$2 chain=$3 selector=$4 fault=${5:-}
+    local envpath=${6:-$runtime_env}
     grub-editenv "$out/frontenv" create
     grub-editenv "$out/frontenv" set "l4h_chain_uuid=$chain"
     mcopy -o -i "$bootpart" "$out/frontenv" ::/EFI/L4H/frontenv
     grub-editenv "$out/grubenv" create
     grub-editenv "$out/grubenv" set "$selector"
     if [ "$fault" = conflict ]; then grub-editenv "$out/grubenv" set l4h_esp_label=L4HSLOTB; fi
+    if [ "$fault" = extra ]; then
+        grub-editenv "$out/grubenv" set l4h_boot_ok=0 esp=invalid serial_port=0
+    fi
     if [ "$fault" = corrupt ]; then printf 'invalid environment block\n' > "$out/grubenv"; fi
-    mcopy -o -i "$bootpart" "$out/grubenv" "::$runtime_env"
-    if [ "$fault" = missing ]; then mdel -i "$bootpart" "::$runtime_env"; fi
+    mcopy -o -i "$bootpart" "$out/grubenv" "::$envpath"
+    if [ "$fault" = missing ]; then mdel -i "$bootpart" "::$envpath"; fi
+    if [ "$fault" = duplicate ] || [ "$fault" = slot ]; then
+        mcopy -o -i "$slota" "$out/grubenv" "::$envpath"
+    fi
+    if [ "$fault" = slot ]; then mdel -i "$bootpart" "::$envpath"; fi
+    if [ ${#tpm[@]} -ne 0 ]; then "$root/tools/swtpm.sh" "$out/tpm"; fi
     # Clear a previous run's completion marker before the child starts.
     : > "$out/$name.log"
-    timeout "${PLATFORMTEST_TIMEOUT:-120}" "$root/tools/run-uefi.sh" "$disk" "${devices[@]}" \
+    timeout "${PLATFORMTEST_TIMEOUT:-120}" "$root/tools/run-uefi.sh" "$disk" "${devices[@]}" "${tpm[@]}" \
         >"$out/$name.log" 2>&1 </dev/null &
     qemu=$!
     while kill -0 "$qemu" 2>/dev/null; do
@@ -130,6 +142,7 @@ run() {
     done
     wait "$qemu" || true
     qemu=
+    if [ "$fault" = duplicate ] || [ "$fault" = slot ]; then mdel -i "$slota" "::$envpath"; fi
     python3 - "$out/$name.log" "$expected" "$disk" <<'PY'
 import json, pathlib, re, sys
 log, expected, disk = sys.argv[1:]
@@ -202,6 +215,58 @@ run conflicting-selector fail 1111-1111 l4h_esp_uuid=1111-1111 conflict
 run option-as-selector fail 1111-1111 l4h_esp_uuid=--set=root
 run corrupt-env fail 1111-1111 l4h_esp_uuid=1111-1111 corrupt
 run missing-env fail 1111-1111 l4h_esp_uuid=1111-1111 missing
+# Release defaults: the same application can select A even though B also
+# has /l4h, or override the slot the front loader chainloaded it from.
+for part in "$slota" "$slotb"; do
+    mcopy -o -i "$part" "$out/default.efi" ::/EFI/l4h.efi
+done
+default_env=/EFI/L4H/grubenv
+run discovered-a A 1111-1111 l4h_esp_uuid=1111-1111 '' "$default_env"
+run discovered-b B 2222-2222 l4h_esp_label=L4HSLOTB '' "$default_env"
+run discovered-override A 2222-2222 l4h_esp_uuid=1111-1111 '' "$default_env"
+run discovered-on-slot A 2222-2222 l4h_esp_uuid=1111-1111 slot "$default_env"
+run discovered-whitelist A 1111-1111 l4h_esp_uuid=1111-1111 extra "$default_env"
+run discovered-missing-slot fail 1111-1111 l4h_esp_uuid=3333-3333 '' "$default_env"
+run discovered-empty fail 1111-1111 ignored=1 '' "$default_env"
+run discovered-conflict fail 1111-1111 l4h_esp_uuid=1111-1111 conflict "$default_env"
+run discovered-option fail 1111-1111 l4h_esp_uuid=--set=root '' "$default_env"
+run discovered-corrupt fail 1111-1111 ignored=1 corrupt "$default_env"
+run discovered-duplicate fail 1111-1111 l4h_esp_uuid=1111-1111 duplicate "$default_env"
+run discovered-absent B 1111-1111 ignored=1 missing "$default_env"
+# Built-in settings take precedence over a bad default selector.
+mcopy -o -i "$slota" "$out/fixed-a.efi" ::/EFI/l4h.efi
+run fixed-ignores-discovery A 1111-1111 ignored=1 corrupt "$default_env"
+mcopy -o -i "$slota" "$out/runtime.efi" ::/EFI/l4h.efi
+run runtime-ignores-discovery A 1111-1111 l4h_esp_uuid=1111-1111
+# PCR 9 must cover the discovered selector, including ignored variables,
+# while excluding the unchosen slot's settings and initramfs.
+mcopy -o -i "$slota" "$out/default.efi" ::/EFI/l4h.efi
+tpm=(-chardev "socket,id=tpm,path=$out/tpm/sock" -tpmdev emulator,id=tpm0,chardev=tpm -device tpm-crb,tpmdev=tpm0)
+run measured-a A 1111-1111 l4h_esp_uuid=1111-1111 '' "$default_env"
+cp "$out/B.conf" "$out/B-changed.conf"
+printf '# unchosen slot changed\n' >> "$out/B-changed.conf"
+printf 'unchosen initrd changed\n' > "$out/other-initrd"
+mcopy -o -i "$slotb" "$out/B-changed.conf" ::/l4h/l4h.conf
+mcopy -o -i "$slotb" "$out/other-initrd" ::/l4h/dom0/initrd
+run measured-other-slot A 1111-1111 l4h_esp_uuid=1111-1111 '' "$default_env"
+run measured-selector A 1111-1111 l4h_esp_uuid=1111-1111 extra "$default_env"
+python3 - "$root" "$out" <<'PY'
+import pathlib, re, runpy, sys
+root, out = map(pathlib.Path, sys.argv[1:])
+decode = runpy.run_path(str(root / 'tools/l4h-attest.py'))['cbor_decode']
+def pcr9(name):
+    text = (out / (name + '.log')).read_text(errors='replace')
+    evidence = bytes.fromhex(re.search(r'PLATFORMTEST: EVIDENCE ([0-9a-f]+)', text)[1])
+    return decode(evidence)['pcrs'][9]
+base = pcr9('measured-a')
+assert base != bytes(32)
+assert base == pcr9('measured-other-slot'), 'unchosen slot affected PCR 9'
+assert base != pcr9('measured-selector'), 'selector not measured into PCR 9'
+print('discovered selector measured, unchosen slot excluded from PCR 9: PASS')
+PY
+tpm=()
+mcopy -o -i "$slotb" "$out/B.conf" ::/l4h/l4h.conf
+mcopy -o -i "$slotb" "$out/B.cpio.gz" ::/l4h/dom0/initrd
 mcopy -o -i "$slota" "$out/return-success.efi" ::/EFI/l4h.efi
 run exit-status-control success 1111-1111 ignored=1
 echo 'PLATFORMTEST: PASS'

@@ -768,19 +768,37 @@ EFI/BOOT/BOOTX64.EFI   the l4h application
 l4h/dom0/initrd        dom0's initramfs (optional)
 l4h/l4h.conf           host settings (optional)
 \end{lstlisting}
+By default, including in released applications, GRUB first looks for
+\file{/EFI/L4H/grubenv} on every device. If exactly one exists, it selects
+the partition containing \file{/l4h} as described below. Multiple copies
+abort the boot attempt before any selector or slot's files are read.
+With no selector file, GRUB uses the loading partition.
 When the firmware does not say which partition that is (OVMF), GRUB uses
 the first partition with \file{l4h/dom0/initrd}, or else with
 \file{l4h/l4h.conf}. Files there override any appended to
 \texttt{l4h-root}. To change dom0, replace the files and
 reboot the host. dom0 itself may do so when it holds the boot disk.
 
-For A/B slots on separate FAT partitions, build an application with
+For A/B slots on separate FAT partitions, the released applications can
+be used unmodified. Create a GRUB environment block with exactly one of
+\texttt{l4h\_esp\_uuid} or \texttt{l4h\_esp\_label} set:
+\begin{lstlisting}
+grub-editenv grubenv create
+grub-editenv grubenv set l4h_esp_uuid=1111-1111
+\end{lstlisting}
+Install it at \file{/EFI/L4H/grubenv} on one shared boot partition, and
+keep that path absent on all other partitions. A present but invalid
+selector fails the boot; it never falls back to searching for slot files.
+Use unique filesystem UUIDs or labels for the slots.
+
+To override discovery at build time, build an application with
 \texttt{L4H\_ESP\_UUID} or \texttt{L4H\_ESP\_LABEL} to select its files'
 partition explicitly. This bypasses both the loading partition and the
-file search. Use unique filesystem UUIDs or labels.
+file search, and ignores the default selector path.
 
-For a run-time selector, set one of those variables to locate a shared
-boot partition, and \texttt{L4H\_BOOT\_ENV} to an absolute path on it:
+To use a different run-time selector path, set one of those variables to
+locate a shared boot partition, and \texttt{L4H\_BOOT\_ENV} to an absolute
+path on it:
 \begin{lstlisting}
 L4H_ESP_UUID=AAAA-BBBB L4H_BOOT_ENV=/EFI/L4H/grubenv \
     tools/mkefi.sh l4h.efi
@@ -799,7 +817,8 @@ firmware boot manager so it can try a fallback entry. The application
 uses a small EFI wrapper because GRUB 2.12's \texttt{exit} always returns
 success, even with a numeric argument. The wrapper loads the embedded
 GRUB as a child and converts any return into a failed boot attempt.
-Only the chosen slot's config and initramfs are read and measured; GRUB
+For both discovered and built-in selectors, only the chosen slot's config
+and initramfs are read and measured; GRUB
 also measures the shared environment block into PCR~9. The selection
 also applies to \file{l4h-mk.conf} and its per-partition files.
 
