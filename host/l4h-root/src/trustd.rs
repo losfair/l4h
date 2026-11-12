@@ -756,8 +756,14 @@ fn hw_access(h: &mut Host, op: u64, addr: usize, off: usize, width: usize, value
             if in_bars(h, addr, width, false) {
                 return Err("a BAR of a function root manages");
             }
-            let Some(hw) = h.trustd.as_mut().and_then(|t| t.hw.as_mut()) else { return Err("no ACPI start method") };
-            crate::acpi::Phys::new(&mut h.alloc, &mut h.devmem, &mut h.wins.a, &mut hw.frames).access(addr, width, write, value)
+            // ECAM root mapped for itself (pci::Pci::map_extended) is no
+            // longer device memory: through root's mapping.
+            if let Some(read) = h.pci.ecam_memory(addr, width, write, value) {
+                Some(read)
+            } else {
+                let Some(hw) = h.trustd.as_mut().and_then(|t| t.hw.as_mut()) else { return Err("no ACPI start method") };
+                crate::acpi::Phys::new(&mut h.alloc, &mut h.devmem, &mut h.wins.a, &mut hw.frames).access(addr, width, write, value)
+            }
         }
         trust::HW_IO_READ | trust::HW_IO_WRITE => {
             if !matches!(width, 1 | 2 | 4) || addr.checked_add(width).is_none_or(|e| e > 0x1_0000) {

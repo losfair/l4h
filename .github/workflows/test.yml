@@ -80,6 +80,8 @@ jobs:
         run: tests/run-alloctest.sh
       - name: Taint/seal service and verifier policy
         run: tests/run-trusttest.sh
+      - name: PCIe ACS setup against a model of configuration space
+        run: tests/run-acstest.sh
       - name: Build seL4
         run: tools/build-kernel.sh
       - name: IPC goes through the wiring and l4h-ipc (clippy)

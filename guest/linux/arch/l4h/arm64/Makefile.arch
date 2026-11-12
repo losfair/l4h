@@ -8,7 +8,11 @@ ARCH_INCLUDE := -I$(srctree)/$(SHARED_HEADERS) -I$(srctree)/$(SHARED_HEADERS)/sk
 ARCH_INCLUDE += -I$(srctree)/$(ARCH_DIR)/arm64/shared -I$(L4H_ABI_INCLUDE)
 KBUILD_CPPFLAGS += -I$(srctree)/$(ARCH_DIR)/arm64
 KBUILD_CPPFLAGS += -I$(srctree)/arch/arm64/include/uapi -I$(objtree)/arch/arm64/include/generated/uapi -I$(objtree)/arch/arm64/include/generated
-KBUILD_CFLAGS += -mcmodel=large -fno-pic -fno-pie -mgeneral-regs-only -mno-outline-atomics \
+# Kernel-mode NEON in C (lib/raid6), as arch/arm64/Makefile: such objects
+# drop -mgeneral-regs-only and get <arm_neon.h> (asm/neon.h).
+CC_FLAGS_FPU := -ffreestanding -isystem $(shell $(CC) -print-file-name=include)
+CC_FLAGS_NO_FPU := -mgeneral-regs-only
+KBUILD_CFLAGS += -mcmodel=large -fno-pic -fno-pie $(CC_FLAGS_NO_FPU) -mno-outline-atomics \
 	-fno-builtin -D__arch_um__ -D__arch_l4h__ $(ARCH_INCLUDE) \
 	-Dlongjmp=kernel_longjmp -Dsetjmp=kernel_setjmp
 KBUILD_AFLAGS += $(ARCH_INCLUDE)

@@ -20,6 +20,8 @@ macro_rules! log {
 
 #[cfg(target_arch = "x86_64")]
 mod acpi;
+#[cfg(target_arch = "x86_64")]
+mod acs;
 mod amdvi;
 mod blkd;
 mod bootmod;
@@ -499,7 +501,8 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     #[cfg(target_arch = "x86_64")]
     iommu::shared::map(&mut alloc, &mut devmem, info.tsc_hz / 1000);
     // PCI devices: disks can be passed through to guests.
-    let pci = pci::Pci::new(&mut alloc, &mut devmem);
+    #[allow(unused_mut)]
+    let mut pci = pci::Pci::new(&mut alloc, &mut devmem);
     // The IOMMU before any device is enabled: from here on, a device
     // reaches only memory root gives it (iommu.rs).
     #[cfg(target_arch = "x86_64")]
@@ -509,6 +512,31 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     };
     #[cfg(not(target_arch = "x86_64"))]
     let mut iommu = if cfg.iommu { iommu::Iommu::none() } else { iommu::Iommu::off() };
+    // PCIe ACS, also before any device is enabled: with it, peer requests
+    // go through the IOMMU too (acs.rs).  Without an IOMMU they would
+    // reach any memory anyway.
+    #[cfg(target_arch = "x86_64")]
+    if iommu.info()[0] == l4h_abi::IOMMU_ON {
+        if !cfg.pcie_acs {
+            log!("l4h-root: pcie_acs=0: devices behind a PCIe switch or root port may reach each other without the IOMMU");
+        } else {
+            // A partition has its ECAM pages already (pci::Pci::new).
+            let mut buf = [0; host::trust::MCFG_MAX];
+            let mcfg = if partition::get().is_some() {
+                Ok(None)
+            } else {
+                let mut phys = acpi::Phys::new(&mut alloc, &mut devmem, &mut wins.a, &mut acpi_frames);
+                acpi::find_len(bootinfo, &mut phys, b"MCFG", &mut buf)
+            };
+            let (windows, _) = match mcfg {
+                Ok(Some((t, len))) => host::trust::mcfg_windows(t, len),
+                _ => (ArrayVec::new(), false),
+            };
+            pci.enable_acs(&mut alloc, &mut devmem, &windows);
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    iommu.publish();
     // The statics' only references, taken once here; the root task is
     // single-threaded.
     let ctrls = unsafe { &mut *(&raw mut CTRLS) };

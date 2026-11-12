@@ -139,6 +139,9 @@ pub struct Config {
     pub iommu: bool,
     /// With it, remap their interrupts too.
     pub iommu_intremap: bool,
+    /// With it, turn on PCIe Access Control Services, so that peer
+    /// requests pass the IOMMU too (acs.rs).
+    pub pcie_acs: bool,
     /// `host::TEST_INJECT` only: panic early in root's boot.
     pub test_early_panic: bool,
     /// xHCI controllers (PCI addresses, comma-separated) every dom0 gets,
@@ -172,6 +175,7 @@ impl Config {
             watchdog_secs: parse_usize(option_env!("L4H_WATCHDOG_SECS"), 0),
             iommu: parse_usize(option_env!("L4H_IOMMU"), 1) != 0,
             iommu_intremap: parse_usize(option_env!("L4H_IOMMU_INTREMAP"), 1) != 0,
+            pcie_acs: parse_usize(option_env!("L4H_PCIE_ACS"), 1) != 0,
             test_early_panic: false,
             dom0_usb: [None; l4h_host::usb::MAX_GUEST_USB],
             test_usb_handoff_timeout: false,
@@ -245,6 +249,7 @@ impl Config {
             "fb_console" => flag(&mut self.fb_console),
             "iommu" => flag(&mut self.iommu),
             "iommu_intremap" => flag(&mut self.iommu_intremap),
+            "pcie_acs" => flag(&mut self.pcie_acs),
             "test_early_panic" => flag(&mut self.test_early_panic),
             "test_usb_handoff_timeout" => flag(&mut self.test_usb_handoff_timeout),
             "dom0_usb" => {
