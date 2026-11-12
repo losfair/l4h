@@ -69,7 +69,7 @@ impl Dev {
     fn poll(&mut self, mem: &GuestMem, vcpus: &Vcpus, more: u64) {
         match self {
             Dev::Blk(d) => d.poll(mem, vcpus, 0),
-            Dev::Net(d) => d.poll(mem, vcpus, 0),
+            Dev::Net(d) => d.poll(mem, vcpus, more),
             Dev::Gpu(d) => d.poll(mem, vcpus, more),
             Dev::Usb(_) => {}
         }
@@ -79,13 +79,18 @@ impl Dev {
     /// each), which this turn's `poll` takes up.
     fn take_more(&mut self) -> u64 {
         match self {
+            Dev::Net(d) => core::mem::take(&mut d.backend.more),
             Dev::Gpu(d) => core::mem::take(&mut d.backend.more),
             _ => 0,
         }
     }
 
     fn has_more(&self) -> bool {
-        matches!(self, Dev::Gpu(d) if d.backend.more != 0)
+        match self {
+            Dev::Net(d) => d.backend.more != 0,
+            Dev::Gpu(d) => d.backend.more != 0,
+            _ => false,
+        }
     }
 
     fn complete(&mut self, mem: &GuestMem, vcpus: &Vcpus) {

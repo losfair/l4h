@@ -156,7 +156,8 @@ pub struct GuestStatus {
     pub vcpus: u8,
     pub cap_pct: u8,
     pub ram_mb: u32,
-    /// CPU used in the last balancer period, permille of a core.
+    /// CPU used by all vCPUs and the VMM in the last balancer period,
+    /// permille of a core.
     pub cpu: u32,
     /// The cores of its first CORES vCPUs.
     pub cores: [u8; STATUS_CORES],

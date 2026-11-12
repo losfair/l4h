@@ -441,7 +441,7 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
         }
         abi::CTL_VM_STATS => {
             let g = h.guest(vm_arg(a[0])?).ok_or(ENOENT)?;
-            resp.vals[0] = g.vcpus.iter().map(|v| v.usage as u64).sum();
+            resp.vals[0] = g.vcpus.iter().map(|v| v.usage as u64).sum::<u64>() + g.vmm_usage as u64;
             resp.vals[1] = g.cpu_cap_pct as u64;
             Ok(())
         }

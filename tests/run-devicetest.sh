@@ -2,7 +2,8 @@
 # Production console rings, memory-hotplug scheduling and control failure
 # replies, dom0 boot planning, block reservations and service replies, and host log
 # publication, wraparound and concurrent readers/writers. Also exercises
-# endpoint fairness, malformed replies, hotplug retries and USB DMA ownership. --qemu
+# endpoint fairness, bounded network batches, VMM CPU budgets, malformed
+# replies, hotplug retries and USB DMA ownership. --qemu
 # also checks hypercalls under sustained console kicks.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -70,6 +71,11 @@ fn record_nic(d: Device, pci: &Pci, cfg: &Cfg) -> abi::CtlPci {
 ''')
 (out / 'usb-recovery.inc').write_text('impl Usbd {\n' + '\n'.join(
     method(usbd, sig) for sig in ['    fn recover_command(', '    fn set_deq(', '    fn cancel(', '    fn recover_all(']) + '\n}\n')
+# The VMM's production network backend and root's USB completion path.
+vmm_dev = (root / 'host/l4h-vmm/src/dev.rs').read_text()
+(out / 'vmm-backend.inc').write_text(function(vmm_dev, 'pub trait Backend {'))
+root_usb = (root / 'host/l4h-root/src/usb.rs').read_text()
+(out / 'usb-attach.inc').write_text(function(root_usb, 'fn quarantine(') + '\n' + function(root_usb, 'pub fn poll('))
 netd = (root / 'host/l4h-netd/src/main.rs').read_text()
 rx_full = function(netd, 'fn rx_full(').replace('    unsafe {', '    peer_before_load(p);\n    unsafe {', 1)
 (out / 'net-backlog.inc').write_text(next(line for line in netd.splitlines() if line.startswith('const BACKLOG_BUDGET:'))
@@ -149,6 +155,16 @@ rustc +stable --edition=2024 --test -L dependency="$out" \
 rustc +stable --edition=2024 --test -L dependency="$out" \
     --extern l4h_host="$out/libl4h_host.rlib" "$root/tests/ipc.rs" -o "$out/ipc-tests"
 "$out/ipc-tests" --test-threads=1
+L4H_VMM_BACKEND_TEST_SRC="$out/vmm-backend.inc" rustc +stable --edition=2024 --test -L dependency="$out" \
+    --extern l4h_host="$out/libl4h_host.rlib" "$root/tests/vmm-net.rs" -o "$out/vmm-net-tests"
+"$out/vmm-net-tests"
+L4H_USB_ATTACH_TEST_SRC="$out/usb-attach.inc" rustc +stable --edition=2024 --test -L dependency="$out" \
+    --extern l4h_host="$out/libl4h_host.rlib" "$root/tests/usb-attach.rs" -o "$out/usb-attach-tests"
+"$out/usb-attach-tests"
+rustc +stable --edition=2024 --test -L dependency="$out" \
+    --extern l4h_abi="$out/libl4h_abi.rlib" --extern l4h_host="$out/libl4h_host.rlib" \
+    "$root/tests/vmm-sched.rs" -o "$out/vmm-sched-tests"
+"$out/vmm-sched-tests" --test-threads=1
 rustc +stable --edition=2024 --test -L dependency="$out" \
     --extern l4h_abi="$out/libl4h_abi.rlib" --extern l4h_host="$out/libl4h_host.rlib" \
     "$root/tests/memhp.rs" -o "$out/memhp-tests"

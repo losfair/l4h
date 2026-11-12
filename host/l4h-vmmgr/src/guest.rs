@@ -217,7 +217,7 @@ pub struct Vcpu {
     /// CPU used in the last balancer period, in permille of a core.
     pub usage: u32,
     /// Under a CPU cap: SC_K's part of the vCPU's budget, in permille
-    /// (sched::budgets).
+    /// (sched::budget::plan, after reserving the VMM's part on vCPU 0).
     pub k_share: u32,
     /// Steal-time bookkeeping (counter ticks): time since the vCPU first
     /// ran, CPU it consumed; steal published so far (ns).
@@ -285,6 +285,13 @@ pub struct Guest {
     /// Large VMM objects reserved at creation, before VM_LOAD uses the arena.
     pub vmm_cnodes: Option<vmm::Cnodes>,
     pub vmm: Option<Component>,
+    /// Its host core and the last installed limits (the VMM stays on its
+    /// start core when the balancer moves a guest vCPU).
+    pub vmm_limits: Option<(usize, crate::sched::budget::Plan)>,
+    /// VMM's part of vCPU 0's capped budget, in permille.
+    pub vmm_share: u32,
+    /// VMM CPU used in the last balancer period, permille of a core.
+    pub vmm_usage: u32,
     /// CPU cap per vCPU in percent of a core (0 = none).
     pub cpu_cap_pct: u32,
     /// ASIDs held by its VSpaces (its own, its processes', its components').
@@ -1133,6 +1140,9 @@ pub fn create(
         console_ring: ArrayVec::new(),
         vmm_cnodes: None,
         vmm: None,
+        vmm_limits: None,
+        vmm_share: crate::sched::budget::VMM_SHARE_INIT,
+        vmm_usage: 0,
         cpu_cap_pct: 0,
         asids: 0,
         attest: false,

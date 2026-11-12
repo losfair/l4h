@@ -58,6 +58,9 @@ pub const TEST_INJECT: bool = match option_env!("L4H_TEST_INJECT") {
 pub const PRIO_LOGD: u64 = l4h_abi::PRIO_KERNEL + 1;
 pub const PRIO_VMM: u64 = l4h_abi::PRIO_KERNEL + 2;
 pub const PRIO_SERVICE: u64 = l4h_abi::PRIO_KERNEL + 3;
+/// A throttled VMM makes many short IPC turns: keep 16 MCS refills.
+pub const VMM_SC_BITS: usize = 9;
+pub const VMM_EXTRA_REFILLS: u64 = 14;
 
 /// Maximum devices attached to one guest.
 pub const MAX_GUEST_DEVICES: usize = l4h_abi::MAX_DEVICES;

@@ -1220,15 +1220,14 @@ Global on each core, with `P_K` = `PRIO_KERNEL` = 100:
 | `P_K` | guest kernel TCBs (`SC_K`) |
 | `P_U` = 99 | guest user TCBs (`SC_U`) |
 
-Other host services run with full budgets; guests' vCPUs are bounded by their
-SCs. A CPU cap bounds a guest's vCPUs only: what its VMM does for it
-(hypercalls, virtio queues, the display, the console) runs on the VMM's
-scheduling context at `P_K + 2`, on the core of the guest's first vCPU, and is
-not charged to the guest. memd charges hotplug to the guest's token bucket
-(§8.5); a guest that keeps its VMM busy still takes that core's time from
-other guests' vCPUs there. Because `P_K > P_U` for every guest, one guest's
-kernel work can
-briefly preempt another guest's user work, bounded by `SC_K` budgets.
+VMMs sharing a logical CPU split at most 25% of it equally, including when
+their guests are uncapped. They stay on the core where vCPU 0 started;
+moving that vCPU does not move the VMM. A CPU cap also charges the VMM's
+hypercalls, virtio queues, display and console work against vCPU 0's budget
+(§7.2). Other host services run with full budgets unless listed above.
+memd charges hotplug to the guest's token bucket (§8.5). Because
+`P_K > P_U` for every guest, one guest's kernel work can briefly preempt
+another guest's user work, bounded by `SC_K` budgets.
 
 ### 7.2 Budgets and CPU caps
 
@@ -1236,18 +1235,25 @@ briefly preempt another guest's user work, bounded by `SC_K` budgets.
   the full period as budget; sums across a core may exceed 100%
   (overcommit), and threads with budget left are scheduled round-robin
   within the guest band. CPU weights are not implemented.
-- **CPU caps** (`vm_set_sched`, `l4hctl sched`) give a vCPU one budget, a
-  percentage of the period, split between its SC_K and SC_U so that the
-  vCPU as a whole stays within the cap.
-  - Each SC needs at least 200 µs, so caps below 8% get a longer period:
-    1% is 400 µs every 40 ms. AArch64 capped vCPUs use at least a 40 ms
-    period to amortize emulated GIC timer delivery.
-  - The split adapts: when, in a balancer period, either SC used at least
+- **CPU caps** (`vm_set_sched`, `l4hctl sched`) give each vCPU one budget,
+  a percentage of the period, split between SC_K and SC_U. vCPU 0 shares
+  its budget with the guest's VMM, whose share is also bounded by its
+  core's VMM limit. Thus the guest and its VMM together stay within the
+  cap times the number of vCPUs.
+  - Each SC needs at least 200 µs. Below 12%, vCPU 0's three SCs need a
+    longer period (600 µs every 60 ms at 1%); other vCPUs' two SCs need
+    one below 8% (400 µs every 40 ms at 1%). AArch64 capped vCPUs use
+    at least a 40 ms period to amortize emulated GIC timer delivery.
+    VMM periods also grow as needed to give every VMM on the core at least
+    200 µs without exceeding their combined 25% limit. Shares shrink
+    before another VMM starts and are reclaimed when one stops or dies.
+  - The split adapts: when, in a balancer period, any SC used at least
     90% of its part, the budget is split in proportion to what each used
     (each keeps at least 200 µs). A vCPU alternates between its kernel and
     user threads, so when one SC runs out the other stalls too; the usage
     ratio survives that throttling, where splitting by "what the other
-    used" oscillated every period.
+    used" oscillated every period. For vCPU 0 the VMM's fraction adapts
+    too, starting at one quarter of the cap; its minimum remains 200 µs.
   - Splitting one budget between two strictly alternating SCs still loses
     capacity: whichever runs out first stalls the vCPU while the other's
     budget goes unused. In `tests/run-capperf.sh` (release seL4, nested
@@ -1256,15 +1262,17 @@ briefly preempt another guest's user work, bounded by `SC_K` budgets.
     the cap). About 2× is the split; the other 2× is not yet explained.
   - seL4 keeps the sliding-window limit of a reconfigured SC whose thread is
     runnable; an idle or unbound SC starts afresh with its new budget.
-    Since the split changes at most once per balancer period, that is at
-    most one period's budget extra per change. Samples covering more CPU
-    time than elapsed (consumption reported late) do not move the split.
+    That allows at most one period's budget extra per change. The split
+    changes at most once per balancer period; cap changes and VMM starts
+    or stops can also reconfigure SCs. Unchanged limits are never
+    reconfigured on ordinary IPC turns. Samples covering more CPU time
+    than elapsed (consumption reported late) do not move the split.
   - seL4 refuses to bind an exhausted SC to a blocked thread, so the guest
     waits for the refill on 100 µs timers when it moves a capped SC_U to
     another process, not with `seL4_Yield`, which would charge SC_K its
     whole remaining budget. A timer deadline that passes during those
     waits is kept as a pending event for after the bind.
-  - Capped SCs hold 16 refills (512-byte objects): with seL4's minimum of
+  - Guest and VMM SCs hold 16 refills (512-byte objects): with seL4's minimum of
     two, a budget used in many short pieces keeps being merged into later
     refills.
   - `tests/run-captest.sh` runs self-tests and fork loops in a guest capped
@@ -1333,7 +1341,8 @@ from the vCPU's first run and publishes it monotonically as `steal_ns`.
 The guest returns it as Linux's paravirt steal clock
 (`CONFIG_PARAVIRT_TIME_ACCOUNTING`), so it shows as `st` in /proc/stat and
 top: a guest capped at 25% sees about 75% steal (`tests/run-m6test.sh`).
-`l4hctl top` shows each VM's CPU use over the last period.
+`l4hctl top` and the host dashboard show each VM's CPU use over the last
+period, including its VMM's consumption.
 
 ### 7.5 Limits and memory sizing
 
@@ -2163,6 +2172,9 @@ firewalling belong in a VM.
   ENA, Intel X550 and ConnectX-5.
 - **vNICs.** Each vNIC is on one switch and appears as a separate `ethN`.
   There are 48 guest ports in all. Guest vNICs have one RX/TX queue pair.
+  A VMM processes at most 32 chains per RX or TX batch, counting malformed
+  or empty chains too. Remaining work gets another IPC turn without a new
+  kick, so a producer on another vCPU cannot keep a handler from returning.
 - **Switches and uplinks.** The API creates switches dynamically, up to 64
   (one per guest port and uplink, of which there are 16); switches are not deleted. Each is an L2
   broadcast domain with its own learned MAC table. A physical NIC can be
@@ -2871,7 +2883,10 @@ controller, one per claimed controller, and the guest forwards Linux's
   (`usb::Published`, for `l4hctl usb`). A controller once claimed stays
   with its usbd until reboot,
   `idle` (halted, bus mastering off, its DMA region kept) when no guest has
-  it, and `failed` if a reset or drain fails. Renesas uPD72020x without a
+  it, and `failed` if a claim, attachment, reset or drain fails. An
+  asynchronous attachment error quarantines the controller and becomes
+  visible through `CTL_USB_INFO` (`l4hctl usb`); its queue area stays with
+  the guest until destruction. Renesas uPD72020x without a
   firmware ROM and controllers without MSI are `unsupported`.
 - **Attach.** `root::call::usb_attach (guest, device, controller)`: vmmgr names
   both by number; root claims the controller if needed, makes the queue
@@ -5200,7 +5215,7 @@ machine and guests of 256–512 MiB.
 | `tests/run-acstest.sh` | PCIe ACS setup against a model of configuration space: implemented bits only, firmware bits kept, bits that do not stick, hostile capability lists, read-only checks; ECAM window block planning |
 | `tests/run-trusttest.sh` | taint/seal permissions, atomic gates, instances, seqlock snapshots and verifier policy |
 | `tests/run-alloctest.sh` | host allocator growth under fragmentation, reclaim, fixed-container panic safety and memd grant validation |
-| `tests/run-devicetest.sh [--qemu]` | console ordering, bounded sequence gaps, cursor wrap, draining and writer wakeups; endpoint fairness and malformed replies; checked wiring cannot be replaced; memory-hotplug completion and timed retry scheduling; USB DMA ownership on failed halt/disable; control completions after manager failure; block replies across nested calls; host log wraparound and concurrent writers; with QEMU, hypercalls under continuous console output |
+| `tests/run-devicetest.sh [--qemu]` | console ordering, bounded sequence gaps, cursor wrap, draining and writer wakeups; endpoint fairness and malformed replies; bounded VMM network batches; VMM CPU accounting, caps and lifecycle quotas; checked wiring cannot be replaced; memory-hotplug completion and timed retry scheduling; USB attachment failures and DMA ownership on failed halt/disable; control completions after manager failure; block replies across nested calls; host log wraparound and concurrent writers; with QEMU, hypercalls under continuous console output |
 | `tests/run-logtest.sh` | kernel faults, panics and shutdowns retained after VM destruction and queried/followed with l4hctl; also works with `L4H_RELEASE=1` |
 | `tests/run-abitest.sh` | guest ABI and seL4 extensions, from a module built against the module tree |
 | `python3 tests/bootmem-qemu.py` | boot RAM clearing, initial untyped watermarks, root-task entry and AArch64 TLS capture before the kernel lock; built debug kernel/root and GDB required, `L4H_ARCH=aarch64` also needs the loader and gdb-multiarch |

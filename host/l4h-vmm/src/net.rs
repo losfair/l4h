@@ -30,6 +30,9 @@ const HDR: usize = net::HDR_SIZE;
 const RX: usize = 0;
 const TX: usize = 1;
 const QUEUE_SIZE: u32 = 256;
+/// Count every chain, including malformed packets: a producer on another
+/// vCPU must not keep one handler from returning to the IPC loop.
+const BATCH: usize = 32;
 
 /// The buffers of one chain (see Queue::chain).
 type Chain = ArrayVec<Buf, { QUEUE_SIZE as usize }>;
@@ -47,6 +50,8 @@ pub struct Net {
     /// Transmit stopped at a full port ring: netd frees slots, then
     /// signals.
     tx_blocked: bool,
+    /// Queues whose batch ended before they were found empty.
+    pub more: u64,
     link: net::LinkState,
 }
 
@@ -56,7 +61,7 @@ impl Net {
         let link = net::LinkState(unsafe { addr_of!((*chan).link_state).read_volatile() });
         // Fresh port memory: both rings start empty.
         Net { chan, tx: Producer::new(net::RING_SIZE), rx: Consumer::new(net::RING_SIZE), kick, mac,
-            rx_queue: rx_queue.min(QUEUE_SIZE), tx_blocked: false, link }
+            rx_queue: rx_queue.min(QUEUE_SIZE), tx_blocked: false, more: 0, link }
     }
 
     fn link_config(&self, config: &mut [u8]) {
@@ -75,12 +80,15 @@ impl Net {
     fn transmit(&mut self, mem: &GuestMem, q: &mut Queue) -> (bool, bool) {
         let (mut returned, mut queued) = (false, false);
         self.tx_blocked = false;
-        loop {
+        self.more &= !(1 << TX);
+        let mut left = BATCH;
+        while left != 0 {
             if self.tx_full() {
                 self.tx_blocked = true;
                 break;
             }
             let Some(head) = q.pop(mem) else { break };
+            left -= 1;
             let mut bufs = Chain::new();
             if q.chain(mem, head, &mut bufs).is_ok() {
                 unsafe {
@@ -118,17 +126,25 @@ impl Net {
             q.push(mem, head, 0);
             returned = true;
         }
+        // One extra empty poll is harmless; reading avail again here
+        // would let the producer race the decision to sleep.
+        if left == 0 {
+            self.more |= 1 << TX;
+        }
         (returned, queued)
     }
 
     /// Port -> guest, while both have entries.
     fn receive(&mut self, mem: &GuestMem, q: &mut Queue) -> bool {
         let mut returned = false;
-        loop {
+        self.more &= !(1 << RX);
+        let mut left = BATCH;
+        while left != 0 {
             if unsafe { self.rx.ready(&(*self.chan).rx) } == 0 {
                 break;
             }
             let Some(chain) = q.pop(mem) else { break };
+            left -= 1;
             let mut bufs = Chain::new();
             let mut written = 0usize;
             if q.chain(mem, chain, &mut bufs).is_ok() {
@@ -166,6 +182,9 @@ impl Net {
             unsafe { self.rx.pop(&(*self.chan).rx) };
             q.push(mem, chain, written as u32);
             returned = true;
+        }
+        if left == 0 {
+            self.more |= 1 << RX;
         }
         // netd holds frames for this port until we free slots: tell it.
         if returned {
@@ -262,6 +281,7 @@ impl Backend for Net {
 
     fn reset(&mut self) {
         self.tx_blocked = false;
+        self.more = 0;
         unsafe {
             addr_of_mut!((*self.chan).rx_csum).write_volatile(0);
             addr_of_mut!((*self.chan).rx_gso).write_volatile(0);

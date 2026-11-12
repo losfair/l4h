@@ -7,9 +7,12 @@
 
 use l4h_host::fixed::{ArrayVec, Scratch};
 
-use crate::guest::{State, Vcpu};
+use crate::guest::{Guest, State, Vcpu};
 use crate::{HostInfo, Vmmgr};
 
+#[path = "sched/budget.rs"]
+pub mod budget;
+#[path = "sched/policy.rs"]
 mod policy;
 use crate::topology;
 
@@ -27,85 +30,84 @@ pub fn consumed(sc: sel4::cap::SchedContext) -> u64 {
     r.consumed
 }
 
-/// seL4's minimum budget is a few times the kernel WCET; stay well above.
-const MIN_BUDGET_US: u64 = 200;
-/// Size of a vCPU's scheduling contexts: room for seL4's minimum of 2
-/// refills plus EXTRA_REFILLS, 16 in all.  With few
-/// refills, a budget used in many short pieces, as a vCPU that is
-/// preempted and blocks often uses it, is merged into later refills and
-/// lost to the vCPU.
+/// Scheduling contexts keep 16 refills for many short IPC turns.
 pub const SC_BITS: usize = 9;
 const EXTRA_REFILLS: u64 = 14;
-/// SC_K's initial part of a capped vCPU's budget (permille).
 pub const K_SHARE_INIT: u32 = 500;
 
-/// Scheduling parameters of a vCPU, in µs: (period, SC_K budget, SC_U
-/// budget).  Uncapped (`cap_pct` 0 or 100), both SCs may use the whole
-/// period.  Under a cap the two SCs share one budget, `cap_pct` of the
-/// period, so that the vCPU as a whole never exceeds its cap; SC_K gets
-/// `k_share` permille of it.  Each SC needs at least MIN_BUDGET_US, so a
-/// small cap stretches the period instead (1% runs 400 µs every 40 ms).
-/// ARM virtual platforms use at least 40 ms under caps to amortize GIC
-/// timer delivery latency.
-pub fn budgets(timeslice_us: u64, cap_pct: u32, k_share: u32) -> (u64, u64, u64) {
-    if cap_pct == 0 || cap_pct >= 100 {
-        return (timeslice_us, timeslice_us, timeslice_us);
-    }
-    let cap = cap_pct as u64;
-    // ARM virtual platforms deliver the GIC timer through a userspace
-    // interrupt controller. Short periods lose useful runtime to that
-    // delivery latency; retain a useful quota even after splitting it.
-    let min_period = if cfg!(target_arch = "aarch64") { 40_000 } else { 0 };
-    let period = timeslice_us.max(min_period).max((2 * MIN_BUDGET_US * 100).div_ceil(cap));
-    let total = period * cap / 100;
-    let k = (total * k_share as u64 / 1000).clamp(MIN_BUDGET_US, total - MIN_BUDGET_US);
-    (period, k, total - k)
+fn min_period() -> u64 {
+    if cfg!(target_arch = "aarch64") { 40_000 } else { 0 }
 }
 
-/// A capped vCPU used `ck` and `cu` µs of SC_K and SC_U over `elapsed_us`:
-/// the new SC_K share, if its budget should move.
-///
-/// Once either SC used (nearly) all of its budget, the budget is split in
-/// proportion to what each used.  The other SC's use is not a measure of
-/// its demand: a vCPU alternates between its kernel and user threads
-/// (each syscall or fault runs the one, then the other), so when one SC
-/// runs out the other stalls too.  Giving the saturated SC "what the other
-/// used plus headroom" therefore starved the other one, which saturated in
-/// the next period: the split flipped every period, and a syscall-heavy
-/// guest capped at 50% used about 10% of a core.  The ratio of the two
-/// uses survives that throttling, so it is what the split follows.
-fn adapt_share(timeslice_us: u64, cap_pct: u32, k_share: u32, ck: u64, cu: u64, elapsed_us: u64) -> Option<u32> {
-    // More than the elapsed time: consumption from an earlier period
-    // reported late (vmmgr ran late), not a measure of this one.
-    if cap_pct == 0 || cap_pct >= 100 || ck + cu > elapsed_us || ck + cu == 0 {
-        return None;
-    }
-    let (period, bk, bu) = budgets(timeslice_us, cap_pct, k_share);
-    let total = bk + bu;
-    // Use per period.
-    let (uk, uu) = (ck * period / elapsed_us, cu * period / elapsed_us);
-    if uk * 10 < bk * 9 && uu * 10 < bu * 9 {
-        return None;
-    }
-    let new_k = (total * ck / (ck + cu)).clamp(MIN_BUDGET_US, total - MIN_BUDGET_US);
-    // Reconfigure only for a real change.
-    if new_k.abs_diff(bk) * 16 < total {
-        return None;
-    }
-    Some((new_k * 1000).div_ceil(total) as u32)
+fn plan(info: &HostInfo, g: &Guest, v: usize, peers: Option<usize>) -> budget::Plan {
+    budget::plan(info.timeslice_us, min_period(), g.cpu_cap_pct, g.vcpus[v].k_share,
+        peers.map(|n| (g.vmm_share, n)))
 }
 
-/// (Re)configure vCPU `v` of guest `gid` on `core` with cap `cap_pct`.
-pub fn configure(info: &HostInfo, gid: usize, v: usize, vcpu: &Vcpu, cap_pct: u32, core: usize) -> bool {
-    let (period, budget_k, budget_u) = budgets(info.timeslice_us, cap_pct, vcpu.k_share);
+fn pair(info: &HostInfo, gid: usize, v: usize, vcpu: &Vcpu, core: usize, p: budget::Plan) -> bool {
     let sc = info.sched_control(core);
-    let r = sc
-        .sched_control_configure_flags(vcpu.sc_k, budget_k, period, EXTRA_REFILLS, 0, 0)
-        .and_then(|_| sc.sched_control_configure_flags(vcpu.sc_u, budget_u, period, EXTRA_REFILLS, 0, 0));
+    let r = sc.sched_control_configure_flags(vcpu.sc_k, p.kernel, p.period, EXTRA_REFILLS, 0, 0)
+        .and_then(|_| sc.sched_control_configure_flags(vcpu.sc_u, p.user, p.period, EXTRA_REFILLS, 0, 0));
     if let Err(e) = r {
         l4h_rt::log!("l4h-vmmgr: configure guest {} vCPU {} on core {}: {:?}", gid, v, core, e);
     }
     r.is_ok()
+}
+
+fn active(g: &Guest) -> bool {
+    g.vmm.is_some() && g.state != State::Stopped
+}
+
+fn counts(h: &Vmmgr) -> [usize; topology::MAX_CPUS] {
+    let mut n = [0; topology::MAX_CPUS];
+    for g in h.guests.iter().flatten().filter(|g| active(g)) {
+        n[g.vmm_limits.expect("VMM limits").0] += 1;
+    }
+    n
+}
+
+fn configure_vmm(info: &HostInfo, g: &mut Guest, n: &[usize; topology::MAX_CPUS]) -> bool {
+    let (core, old) = g.vmm_limits.expect("VMM limits");
+    let p = plan(info, g, 0, Some(n[core]));
+    if p == old { return true; }
+    if (p.period, p.kernel, p.user) != (old.period, old.kernel, old.user)
+        && !pair(info, g.id, 0, &g.vcpus[0], g.vcpus[0].core, p) {
+        return false;
+    }
+    if (p.vmm_period, p.vmm) != (old.vmm_period, old.vmm) {
+        let r = info.sched_control(core).sched_control_configure_flags(
+            g.vmm.as_ref().expect("VMM").sc, p.vmm, p.vmm_period, l4h_host::VMM_EXTRA_REFILLS, 0, 0);
+        if let Err(e) = r {
+            l4h_rt::log!("l4h-vmmgr: configure guest {} VMM on core {}: {:?}", g.id, core, e);
+            return false;
+        }
+    }
+    g.vmm_limits = Some((core, p));
+    true
+}
+
+/// Reclaim the share of a stopped or destroyed VMM. Nothing reconfigures
+/// on an ordinary IPC turn: unchanged limits keep their existing refills.
+pub fn refresh_vmms(h: &mut Vmmgr) {
+    let n = counts(h);
+    for g in h.guests.iter_mut().flatten().filter(|g| active(g)) {
+        let _ = configure_vmm(&h.info, g, &n);
+    }
+}
+
+/// Reduce existing VMMs' shares before the new one can run. Its guest is
+/// temporarily outside h.guests (with_guest); count it explicitly.
+pub fn prepare_vmm(h: &mut Vmmgr, g: &mut Guest) -> budget::Plan {
+    let core = g.vcpus[0].core;
+    let mut n = counts(h);
+    n[core] += 1;
+    for other in h.guests.iter_mut().flatten().filter(|g| active(g)) {
+        assert!(configure_vmm(&h.info, other, &n), "VMM share before spawn");
+    }
+    let p = plan(&h.info, g, 0, Some(n[core]));
+    assert!(pair(&h.info, g.id, 0, &g.vcpus[0], core, p), "vCPU 0 budget before VMM");
+    g.vmm_limits = Some((core, p));
+    p
 }
 
 /// The CPUs of some vCPUs, printed as a list.
@@ -119,9 +121,15 @@ impl core::fmt::Debug for Cores<'_> {
 
 /// Apply a new CPU cap to every vCPU of guest `gid`.
 pub fn set_cap(h: &mut Vmmgr, gid: usize, cap_pct: u32) -> bool {
+    let n = counts(h);
     let Some(Some(g)) = h.guests.get_mut(gid) else { return false };
     g.cpu_cap_pct = cap_pct.min(100);
-    g.vcpus.iter().enumerate().all(|(v, vcpu)| configure(&h.info, gid, v, vcpu, g.cpu_cap_pct, vcpu.core))
+    let has_vmm = active(g);
+    let mut ok = if has_vmm { configure_vmm(&h.info, g, &n) } else { true };
+    for v in usize::from(has_vmm)..g.vcpus.len() {
+        ok &= pair(&h.info, gid, v, &g.vcpus[v], g.vcpus[v].core, plan(&h.info, g, v, None));
+    }
+    ok
 }
 
 const _: () = assert!(crate::MAX_GUESTS <= policy::MAX_GUESTS);
@@ -145,12 +153,17 @@ pub fn balance(h: &mut Vmmgr, elapsed_us: u64) {
         return;
     }
     let tsc_mhz = (h.info.tsc_hz / 1_000_000).max(1);
-    let timeslice_us = h.info.timeslice_us;
+    let n = counts(h);
     let migration = SAMPLES.with(|sample| {
         sample.clear();
         for g in h.guests.iter_mut().flatten() {
+            let cv = g.vmm.as_ref().map_or(0, |vmm| consumed(vmm.sc));
+            g.vmm_usage = if g.state == State::Running { (cv * 1000 / elapsed_us) as u32 } else { 0 };
+            let mut vmm_changed = false;
             for v in 0..g.vcpus.len() {
                 let page = g.event_page(v);
+                let peers = (v == 0 && active(g)).then(|| n[g.vmm_limits.expect("VMM limits").0]);
+                let old = plan(&h.info, g, v, peers);
                 let vcpu = &mut g.vcpus[v];
                 let (ck, cu) = (consumed(vcpu.sc_k), consumed(vcpu.sc_u));
                 let c = ck + cu;
@@ -158,9 +171,20 @@ pub fn balance(h: &mut Vmmgr, elapsed_us: u64) {
                     continue;
                 }
                 // A capped vCPU whose budget split changed.
-                if let Some(share) = adapt_share(timeslice_us, g.cpu_cap_pct, vcpu.k_share, ck, cu, elapsed_us) {
-                    vcpu.k_share = share;
-                    configure(&h.info, g.id, v, vcpu, g.cpu_cap_pct, vcpu.core);
+                if g.cpu_cap_pct > 0 {
+                    if let Some((ks, vs)) = budget::adapt(old, vcpu.k_share, g.vmm_share,
+                        [ck, cu, if peers.is_some() { cv } else { 0 }], elapsed_us) {
+                        let next = budget::plan(h.info.timeslice_us, min_period(), g.cpu_cap_pct, ks, peers.map(|n| (vs, n)));
+                        if budget::changed(old, next) {
+                            vcpu.k_share = ks;
+                            if peers.is_some() {
+                                g.vmm_share = vs;
+                                vmm_changed = true;
+                            } else {
+                                pair(&h.info, g.id, v, vcpu, vcpu.core, next);
+                            }
+                        }
+                    }
                 }
                 vcpu.cooldown = vcpu.cooldown.saturating_sub(1);
                 vcpu.usage = (c * 1000 / elapsed_us) as u32;
@@ -182,12 +206,14 @@ pub fn balance(h: &mut Vmmgr, elapsed_us: u64) {
                 // vCPUs, so the samples fit.
                 let _ = sample.push(policy::Sample { guest: g.id, vcpu: v, cpu: vcpu.core, used: c, movable: vcpu.cooldown == 0 });
             }
+            if vmm_changed { let _ = configure_vmm(&h.info, g, &n); }
         }
         if cores < 2 { None } else { policy::choose(&h.info.topology, sample, elapsed_us) }
     });
     let Some(policy::Migration { guest: gid, vcpu: v, src, dst }) = migration else { return };
     let Some(g) = h.guest(gid) else { return };
-    if configure(&h.info, gid, v, &g.vcpus[v], g.cpu_cap_pct, dst) {
+    let limits = if v == 0 && active(g) { g.vmm_limits.expect("VMM limits").1 } else { plan(&h.info, g, v, None) };
+    if pair(&h.info, gid, v, &g.vcpus[v], dst, limits) {
         info!(
             "l4h-vmmgr: balancer: guest {} vCPU {}: core {} -> {} (physical {} -> {})",
             gid, v, src, dst, h.info.topology.core(src), h.info.topology.core(dst)

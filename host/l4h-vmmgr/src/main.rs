@@ -398,7 +398,8 @@ impl Vmmgr {
         if g.attest {
             root::trust_register(g);
         }
-        let v = vmm::spawn(g, &mut self.alloc, &mut self.wins.a, &mut self.asids, &self.info);
+        let limits = sched::prepare_vmm(self, g);
+        let v = vmm::spawn(g, &mut self.alloc, &mut self.wins.a, &mut self.asids, &self.info, limits);
         component::start(&v);
         g.vmm = Some(v);
     }
@@ -490,6 +491,7 @@ impl Vmmgr {
         // Everything of ours first, then root drains the disks and takes
         // back the I/O pool (Guest::destroy).
         g.destroy(&mut self.alloc);
+        sched::refresh_vmms(self);
         info!("l4h-vmmgr: guest {} '{}' destroyed, {} MiB free", id, name, self.alloc.free_bytes() >> 20);
         Ok(())
     }
@@ -521,7 +523,7 @@ impl Vmmgr {
                         core::ptr::addr_of_mut!((*p).vcpus).write_volatile(g.vcpus.len() as u8);
                         core::ptr::addr_of_mut!((*p).cap_pct).write_volatile(g.cpu_cap_pct as u8);
                         core::ptr::addr_of_mut!((*p).ram_mb).write_volatile((g.owned_ram() >> 20) as u32);
-                        core::ptr::addr_of_mut!((*p).cpu).write_volatile(g.vcpus.iter().map(|v| v.usage).sum());
+                        core::ptr::addr_of_mut!((*p).cpu).write_volatile(g.vcpus.iter().map(|v| v.usage).sum::<u32>() + g.vmm_usage);
                         core::ptr::addr_of_mut!((*p).cores).write_volatile(cores);
                         core::ptr::addr_of_mut!((*p).name).write_volatile(name);
                     }
@@ -831,6 +833,7 @@ fn end_guest(h: &mut Vmmgr, id: usize, restart: bool) {
     if let Some(Some(g)) = h.guests.get_mut(id) {
         g.stop();
     }
+    sched::refresh_vmms(h);
     if h.guests.iter().flatten().all(|g| g.state != State::Running) {
         info!("l4h-vmmgr: all guests stopped");
     }

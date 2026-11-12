@@ -5,11 +5,65 @@ extern crate alloc;
 mod policy;
 #[path = "../host/l4h-task/src/topology.rs"]
 mod topology;
+#[path = "../host/l4h-vmmgr/src/sched/budget.rs"]
+mod budget;
 
 use policy::{Migration, Sample, choose};
 use topology::Topology;
 
 const PERIOD: u64 = 100_000;
+
+#[test]
+fn vmm_quota_and_guest_cap_hold_for_every_supported_peer_count() {
+    for peers in 1..=64 {
+        for cap in 0..=100 {
+            for minimum in [0, 40_000] {
+                for k in [0, 1, 250, 500, 750, 999, 1000] {
+                    for v in [0, 1, 250, 500, 750, 999, 1000] {
+                        let p = budget::plan(5000, minimum, cap, k, Some((v, peers)));
+                        assert!(p.kernel >= budget::MIN_US && p.user >= budget::MIN_US && p.vmm >= budget::MIN_US);
+                        assert!(p.vmm * 4 * peers as u64 <= p.vmm_period, "VMMs must leave at least 75% of a core");
+                        if cap > 0 {
+                            assert_eq!(p.period, p.vmm_period);
+                            assert_eq!(p.kernel + p.user + p.vmm, p.period * cap as u64 / 100);
+                        } else {
+                            assert_eq!((p.period, p.kernel, p.user), (5000, 5000, 5000));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn capped_vmm_and_kernel_shares_follow_their_measured_demand() {
+    let share = budget::VMM_SHARE_INIT;
+    let old = budget::plan(5000, 0, 50, 500, Some((share, 1)));
+    let (k, v) = budget::adapt(old, 500, share, [18_000, 18_000, 0], PERIOD).unwrap();
+    let cpu = budget::plan(5000, 0, 50, k, Some((v, 1)));
+    assert!(budget::changed(old, cpu));
+    assert_eq!(cpu.vmm, budget::MIN_US);
+    let (k, v) = budget::adapt(old, 500, share, [100, 100, 12_500], PERIOD).unwrap();
+    let io = budget::plan(5000, 0, 50, k, Some((v, 1)));
+    assert!(budget::changed(old, io));
+    assert_eq!(io.vmm, io.vmm_period / 4);
+    assert_eq!(io.kernel + io.user + io.vmm, io.period / 2);
+    assert_eq!(budget::adapt(old, 500, share, [10, 10, 10], PERIOD), None);
+    assert_eq!(budget::adapt(old, 500, share, [PERIOD, PERIOD, 0], PERIOD), None);
+    assert!(!budget::changed(old, old));
+}
+
+#[test]
+fn vcpus_without_a_vmm_keep_the_existing_two_context_budget() {
+    for cap in 1..100 {
+        let p = budget::plan(5000, 0, cap, 500, None);
+        assert_eq!(p.kernel + p.user, p.period * cap as u64 / 100);
+        assert_eq!(p.vmm, 0);
+    }
+    let p = budget::plan(5000, 0, 1, 500, None);
+    assert_eq!((p.period, p.kernel, p.user), (40_000, 200, 200));
+}
 
 fn vcpu(guest: usize, vcpu: usize, cpu: usize, used: u64) -> Sample {
     Sample { guest, vcpu, cpu, used, movable: true }

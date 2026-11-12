@@ -292,7 +292,7 @@ pub fn create(
     let service_ep = args.service_ep.unwrap_or_else(|| ctx.cap::<cap_type::Endpoint>(ObjectBlueprint::Endpoint));
     let reply = ctx.cap::<cap_type::Reply>(ObjectBlueprint::Reply);
     let sc = ctx.cap::<cap_type::SchedContext>(ObjectBlueprint::SchedContext {
-        size_bits: sel4::sys::seL4_MinSchedContextBits as usize,
+        size_bits: if args.kind == host::KIND_VMM { host::VMM_SC_BITS } else { sel4::sys::seL4_MinSchedContextBits as usize },
     });
     let ipcbuf = ctx.cap::<cap_type::Granule>(FRAME_BP);
     // A keeper: its thread, scheduling context, the endpoint and reply
@@ -464,7 +464,8 @@ pub fn create(
     tcb.tcb_configure(cnode, CNodeCapData::new(0, 64 - cnode_bits), vspace, host::IPCBUF_VA as u64, ipcbuf)
         .expect("component TCB configure");
     context.sched_control
-        .sched_control_configure_flags(sc, args.budget_us, args.period_us, 0, 0, 0)
+        .sched_control_configure_flags(sc, args.budget_us, args.period_us,
+            if args.kind == host::KIND_VMM { host::VMM_EXTRA_REFILLS } else { 0 }, 0, 0)
         .expect("component SC");
     // To the parent go the faults of the keeper, if there is one, or else
     // of the main thread.
