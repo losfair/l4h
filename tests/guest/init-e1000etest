@@ -14,6 +14,13 @@ l4hctl driver list | grep -q "e1000e, ethernet, boot bundle" || fail "no e1000e 
 l4hctl nic list | sed 's/^/E1000ETEST: /'
 l4hctl iommu | sed 's/^/E1000ETEST: iommu: /'
 l4hctl nic list | grep -q "^nic 0: .* 8086:10d3, driver e1000e, up, " || fail "nic 0 not up with e1000e"
+# A driver dom0 loads runs only confined: without an IOMMU root refuses
+# the load before it reads the image; with one, it checks the image (not
+# a driver here).
+if l4hctl iommu | grep -q "^state: *on"; then want="invalid argument"; else want="operation not permitted"; fi
+out=$(l4hctl driver load /bin/udhcpc.script 2>&1) && fail "driver load took a non-driver"
+echo "$out" | grep -q "$want" || fail "driver load: $out, not $want"
+echo "E1000ETEST: driver load refused ($want)"
 ip link set lo up
 ip link set eth0 up
 # A transfer each way: the SHA-256 of what dom0 got and sent, for the host

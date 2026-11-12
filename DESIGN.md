@@ -2497,7 +2497,8 @@ root restarts. Root and netd know no device kind. The design is issue
   neither the bridges nor the other partitions' functions, so none of its
   NICs is confined. Elsewhere a driver is
   TCB code, and only the measured boot bundle's may run (Wi-Fi drivers
-  never), unless `nic_untrusted_without_iommu = 1`.
+  never): a driver dom0 loads runs only confined, and is refused at load
+  on a host without an IOMMU and interrupt remapping.
 - **Faults and restarts.** A nicd that faults, refuses its device, breaks
   its channel, has its offer refused or leaves a liveness ping unanswered
   for 5 s is stopped without waiting on it: suspended, bus mastering off

@@ -513,13 +513,12 @@ fn allowed(h: &Host, i: usize, d: usize) -> Result<(), &'static str> {
     if confined(h, i, d) {
         return Ok(());
     }
-    // Not confined, the driver is TCB code: only a measured one, unless
-    // the operator accepts others (nic_untrusted_without_iommu).  Wi-Fi
+    // Not confined, the driver is TCB code: only a measured one.  Wi-Fi
     // drivers parse what anyone in radio range sends: never in the TCB.
     if drv.manifest.class == nicd::CLASS_WIFI {
         return Err("a Wi-Fi driver runs only confined (IOMMU, interrupt remapping, isolation group)");
     }
-    if !drv.boot && !h.cfg.nic_untrusted_without_iommu {
+    if !drv.boot {
         return Err("a driver dom0 loaded runs only confined (IOMMU, interrupt remapping, isolation group)");
     }
     Ok(())
@@ -1629,12 +1628,11 @@ static mut LOADED: usize = 0;
 /// control data area, copied into root's memory (dom0 could change its
 /// own), checked as the bundle's are, and added: its index.  Refused
 /// unless the host confines NIC drivers (an IOMMU with interrupt
-/// remapping), or the operator lets unmeasured drivers run in the TCB
-/// (nic_untrusted_without_iommu).  Each is logged with its SHA-256: it is
-/// not part of the measured boot image.
+/// remapping): it is not part of the measured boot image, and runs only
+/// confined (`allowed`).  Each is logged with its SHA-256.
 pub fn load_driver(h: &mut Host, off: u64, len: u64) -> Result<usize, Errno> {
     let [state, remap, ..] = h.iommu.info();
-    if (state != abi::IOMMU_ON || remap == 0) && !h.cfg.nic_untrusted_without_iommu {
+    if state != abi::IOMMU_ON || remap == 0 {
         return Err(ctl::EPERM);
     }
     let len = usize::try_from(len).ok().filter(|&l| l >= 64 && l as u64 <= abi::CTL_LOAD_MAX).ok_or(ctl::EINVAL)?;

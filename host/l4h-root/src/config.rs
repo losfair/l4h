@@ -156,8 +156,6 @@ pub struct Config {
     /// `nic_bind = BDF DRIVER` (or `none`, to leave the NIC to the
     /// firmware), one line each.
     pub nic_bind: [Option<(u32, &'static str)>; l4h_host::net::MAX_UPLINKS],
-    /// Let drivers dom0 loads run unconfined, in the TCB (DESIGN.md §9.8).
-    pub nic_untrusted_without_iommu: bool,
     /// Restarts of a NIC's driver within an hour, then it stays stopped.
     pub nic_max_restarts: usize,
 }
@@ -198,7 +196,6 @@ impl Config {
             test_usb_handoff_timeout: false,
             nic_auto: parse_usize(option_env!("L4H_NIC_AUTO"), 1) != 0,
             nic_bind: [None; l4h_host::net::MAX_UPLINKS],
-            nic_untrusted_without_iommu: parse_usize(option_env!("L4H_NIC_UNTRUSTED_WITHOUT_IOMMU"), 0) != 0,
             nic_max_restarts: parse_usize(option_env!("L4H_NIC_MAX_RESTARTS"), 5),
         };
         let Some(text) = text else { return c };
@@ -290,7 +287,6 @@ impl Config {
             }
             "watchdog_secs" => num(&mut self.watchdog_secs),
             "nic_auto" => flag(&mut self.nic_auto),
-            "nic_untrusted_without_iommu" => flag(&mut self.nic_untrusted_without_iommu),
             "nic_max_restarts" => num(&mut self.nic_max_restarts),
             "nic_bind" => {
                 let Some((b, d)) = value.split_once(char::is_whitespace) else { return false };
