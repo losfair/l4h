@@ -1,8 +1,11 @@
-//! Production PCI identity reader against configuration-space fixtures.
-//! There are deliberately no configuration-write or MMIO methods here.
+//! Production PCI identity reader and service handoff bookkeeping against
+//! configuration-space fixtures. No configuration writes or MMIO reads.
 use std::cell::Cell;
 use l4h_abi as abi;
+use l4h_host as host;
+use host::fixed::ArrayVec;
 
+#[derive(Clone, Copy)]
 pub struct Device {
     bus: u8, dev: u8, func: u8, vendor: u16, device: u16,
     class: u8, subclass: u8, prog_if: u8, revision: u8,
@@ -13,12 +16,12 @@ fn device() -> Device {
         class: 0x0c, subclass: 3, prog_if: 0x30, revision: 2 }
 }
 
-pub struct Pci { config: [u8; 256], reads: Cell<usize> }
+pub struct Pci { config: [u8; 256], reads: Cell<usize>, disabled: Cell<bool> }
 impl Pci {
     fn new(header: u8) -> Self {
         let mut config = [0; 256];
         config[0x0e] = header;
-        Self { config, reads: Cell::new(0) }
+        Self { config, reads: Cell::new(0), disabled: Cell::new(false) }
     }
     fn read32(&self, bus: u8, dev: u8, func: u8, off: u8) -> u32 {
         assert_eq!((bus, dev, func), (0xff, 0x1f, 7));
@@ -35,8 +38,58 @@ impl Pci {
     fn subsystem(&mut self, off: usize) {
         self.config[off..off + 4].copy_from_slice(&0x9876_abcd_u32.to_le_bytes());
     }
+    fn disable(&self, _: &Device) { self.disabled.set(true); }
 }
 include!(env!("L4H_PCI_IDENTITY_TEST_SRC"));
+
+macro_rules! log { ($($args:tt)*) => {} }
+type Nics = ArrayVec<Device, { host::net::MAX_NICS }>;
+type NicBars = ArrayVec<[Option<()>; 6], { host::net::MAX_NICS }>;
+mod netd {
+    pub fn bdf(p: &super::Device) -> u32 { (p.bus as u32) << 8 | (p.dev as u32) << 3 | p.func as u32 }
+    pub fn carve(allow: &mut bool, _: &mut (), _: &super::Device, bars: &mut [Option<()>; 6]) -> bool {
+        if *allow { bars[0] = Some(()); }
+        *allow
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum State { Firmware, Idle, Vm, Failed, Unsupported }
+struct Ctrl { pci: Device, state: State, driver: Option<()> }
+fn ctrls() -> std::sync::MutexGuard<'static, Vec<Ctrl>> {
+    static CTRLS: std::sync::Mutex<Vec<Ctrl>> = std::sync::Mutex::new(Vec::new());
+    CTRLS.lock().unwrap()
+}
+include!(env!("L4H_PCI_OWNERS_TEST_SRC"));
+
+#[test]
+fn failed_usb_controllers_belong_to_root_even_when_the_driver_remains() {
+    for (state, driver, owner) in [(State::Firmware, None, abi::PCI_OWNER_FIRMWARE),
+        (State::Unsupported, None, abi::PCI_OWNER_FIRMWARE), (State::Idle, Some(()), abi::PCI_OWNER_USBD),
+        (State::Vm, Some(()), abi::PCI_OWNER_USBD), (State::Failed, Some(()), abi::PCI_OWNER_ROOT),
+        (State::Failed, None, abi::PCI_OWNER_ROOT)] {
+        *ctrls() = vec![Ctrl { pci: device(), state, driver }];
+        assert_eq!(pci_owner(0xffff), owner);
+    }
+    assert_eq!(pci_owner(0), abi::PCI_OWNER_FIRMWARE);
+}
+
+#[test]
+fn disabled_nics_belong_to_root_until_a_driver_can_take_them() {
+    let pci = Pci::new(0);
+    let (mut nics, mut bars) = (Nics::new(), NicBars::new());
+    // BAR carving failed: root disabled it, but netd never got it.
+    assert_eq!(record_nic(device(), &pci, &mut nics, &mut bars, &mut false, &mut ()).owner, abi::PCI_OWNER_ROOT);
+    assert!(pci.disabled.get());
+    assert!(nics.is_empty() && bars.is_empty());
+    for _ in 0..host::net::MAX_NICS {
+        assert_eq!(record_nic(device(), &pci, &mut nics, &mut bars, &mut true, &mut ()).owner, abi::PCI_OWNER_NETD);
+    }
+    pci.disabled.set(false);
+    // netd is full: the next NIC is disabled and retained by root.
+    assert_eq!(record_nic(device(), &pci, &mut nics, &mut bars, &mut true, &mut ()).owner, abi::PCI_OWNER_ROOT);
+    assert!(pci.disabled.get());
+    assert_eq!((nics.len(), bars.len()), (host::net::MAX_NICS, host::net::MAX_NICS));
+}
 
 #[test]
 fn endpoint_and_cardbus_subsystem_ids_use_their_own_header_offsets() {

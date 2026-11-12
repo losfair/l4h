@@ -344,6 +344,8 @@ pub const PCI_OWNER_NETD: u16 = 2;
 pub const PCI_OWNER_MEMD: u16 = 3;
 pub const PCI_OWNER_USBD: u16 = 4;
 pub const PCI_OWNER_FIRMWARE: u16 = 5;
+/// Root has disabled or quarantined the function; no active driver owns it.
+pub const PCI_OWNER_ROOT: u16 = 6;
 
 /// A function from root's boot-time PCI inventory. No BARs, physical
 /// addresses or configuration access. Subsystem IDs are zero if absent.

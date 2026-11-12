@@ -12,7 +12,8 @@ use l4h_host::fixed::{ArrayVec, StaticCell};
 /// One small record per possible BDF, in .bss rather than on root's
 /// stack. Kept at boot: serving the inventory must never probe BARs or
 /// touch a device that a driver is now using.
-pub type Inventory = ArrayVec<abi::CtlPci, 65536>;
+const MAX_FUNCTIONS: usize = if cfg!(target_arch = "aarch64") { 16 << 8 } else { 256 << 8 };
+pub type Inventory = ArrayVec<abi::CtlPci, MAX_FUNCTIONS>;
 pub static INVENTORY: StaticCell<Inventory> = StaticCell::new(ArrayVec::new());
 
 #[cfg(target_arch = "x86_64")]
@@ -722,7 +723,7 @@ impl Iterator for Devices<'_> {
             }
             return None;
         }
-        let end = if cfg!(target_arch = "aarch64") { 16 << 8 } else { 256 << 8 };
+        let end = MAX_FUNCTIONS as u32;
         while self.next < end {
             let (bus, dev, func) = ((self.next >> 8) as u8, (self.next >> 3 & 0x1f) as u8, (self.next & 7) as u8);
             if func == 0 {

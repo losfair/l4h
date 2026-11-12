@@ -33,7 +33,8 @@ pathlib.Path(args[args.index('-o') + 1]).write_bytes(b'EFI fixture')
         env = {k: v for k, v in os.environ.items() if not k.startswith("L4H_")}
         env.update(PATH=f"{self.work}:{env['PATH']}", TEST_GRUB_CONFIG=str(self.config),
                    TEST_GRUB_MODULES=str(self.modules), L4H_GUEST_KERNEL="/bin/true",
-                   L4H_GUEST_KMODS="", L4H_MKSHIM="", **settings)
+                   L4H_GUEST_KMODS="", L4H_MKSHIM="")
+        env.update(settings)
         result = subprocess.run([str(ROOT / "tools/mkefi.sh"), str(self.work / "out.efi"),
                                  "/bin/true", "/bin/true"], env=env, capture_output=True, text=True)
         if result.returncode == 0 and shutil.which("grub-script-check"):
@@ -46,6 +47,8 @@ pathlib.Path(args[args.index('-o') + 1]).write_bytes(b'EFI fixture')
         self.assertIn('"$cmdpath"', config)
         self.assertIn('--file /l4h/dom0/initrd', config)
         self.assertNotIn('l4h_esp_uuid=', config)
+        self.assertNotIn('/boot/mk/', config)
+        self.assertNotIn('\ntrue\n', config)
 
     def test_uuid_and_label_select_before_sourcing_any_config(self):
         for key, flag, value in [("L4H_ESP_UUID", "--fs-uuid", "1234-ABCD"),
@@ -64,10 +67,28 @@ pathlib.Path(args[args.index('-o') + 1]).write_bytes(b'EFI fixture')
         self.assertLess(config.index('load_env --file "($esp)'), config.index('source '))
         self.assertIn('l4h: boot partition selection failed', config)
         self.assertIn('search_fs_uuid search_label', self.modules.read_text())
+        self.assertIn('\n    exit\n', config)
+        self.assertNotIn('halt', self.modules.read_text())
 
     def test_literals_are_escaped_for_grub(self):
         self.assertEqual(self.generate(L4H_ESP_LABEL='slot "$name"\\end').returncode, 0)
         self.assertIn(r'--label -- "slot \"\$name\"\\end"', self.config.read_text())
+
+    def test_backticks_are_literals_in_grub_labels_and_paths(self):
+        self.assertEqual(self.generate(L4H_ESP_LABEL='slot`A', L4H_BOOT_ENV='/EFI/grub`env').returncode, 0)
+        config = self.config.read_text()
+        self.assertIn('--label -- "slot`A"', config)
+        self.assertIn('load_env --file "($esp)/EFI/grub`env"', config)
+
+    def test_multikernel_block_is_emitted_only_when_available(self):
+        shim = self.work / 'mkshim'
+        shim.mkdir()
+        (shim / 'l4h-mkshim.elf').touch()
+        self.assertEqual(self.generate(L4H_MKSHIM=str(shim)).returncode, 0)
+        config = self.config.read_text()
+        self.assertIn('if [ -n "$esp" ]; then\nif [ -f "($esp)/l4h/l4h-mk.conf" ]; then', config)
+        self.assertIn('(memdisk)/boot/mk/l4h-mkshim.elf', config)
+        self.assertNotIn('\ntrue\n', config)
 
     def test_invalid_build_settings_fail(self):
         for settings in [dict(L4H_ESP_UUID="a", L4H_ESP_LABEL="b"),

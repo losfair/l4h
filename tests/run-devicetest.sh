@@ -42,6 +42,19 @@ def function(source, signature):
     return source[start:source.index('\n}', start) + len('\n}')]
 pci = (root / 'host/l4h-root/src/pci.rs').read_text()
 (out / 'pci-identity.inc').write_text('impl Pci {\n' + method(pci, '    pub fn identity(') + '\n}\n')
+root_main = (root / 'host/l4h-root/src/main.rs').read_text()
+start = root_main.index('        } else if netd::is_uplink(&d) {') + len('        } else if netd::is_uplink(&d) {')
+end = root_main.index('        } else if usb::is_xhci(&d) {', start)
+usb = (root / 'host/l4h-root/src/usb.rs').read_text()
+(out / 'pci-owners.inc').write_text(function(usb, 'pub fn pci_owner(') + '''
+fn record_nic(d: Device, pci: &Pci, nics: &mut Nics, nic_bars: &mut NicBars,
+              mut alloc: &mut bool, mut devmem: &mut ()) -> abi::CtlPci {
+    let mut entry = pci.identity(&d);
+    let record = &mut entry;
+''' + root_main[start:end] + '''
+    entry
+}
+''')
 (out / 'usb-recovery.inc').write_text('impl Usbd {\n' + '\n'.join(
     method(usbd, sig) for sig in ['    fn recover_command(', '    fn set_deq(', '    fn cancel(', '    fn recover_all(']) + '\n}\n')
 netd = (root / 'host/l4h-netd/src/main.rs').read_text()
@@ -112,8 +125,10 @@ rustc +stable --edition=2024 --crate-name l4h_abi --crate-type rlib \
 rustc +stable --edition=2024 --crate-name l4h_host --crate-type rlib \
     --extern l4h_abi="$out/libl4h_abi.rlib" \
     "$root/host/l4h-host/src/lib.rs" -o "$out/libl4h_host.rlib"
-L4H_PCI_IDENTITY_TEST_SRC="$out/pci-identity.inc" rustc +stable --edition=2024 --test \
-    --extern l4h_abi="$out/libl4h_abi.rlib" "$root/tests/pci-identity.rs" -o "$out/pci-identity-tests"
+L4H_PCI_IDENTITY_TEST_SRC="$out/pci-identity.inc" L4H_PCI_OWNERS_TEST_SRC="$out/pci-owners.inc" \
+    rustc +stable --edition=2024 --test -L dependency="$out" \
+    --extern l4h_abi="$out/libl4h_abi.rlib" --extern l4h_host="$out/libl4h_host.rlib" \
+    "$root/tests/pci-identity.rs" -o "$out/pci-identity-tests"
 "$out/pci-identity-tests"
 rustc +stable --edition=2024 --test -L dependency="$out" \
     --extern l4h_host="$out/libl4h_host.rlib" "$root/tests/mailbox.rs" -o "$out/mailbox-tests"

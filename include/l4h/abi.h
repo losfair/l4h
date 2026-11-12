@@ -674,6 +674,7 @@ enum l4h_ctl_op {
 #define L4H_PCI_OWNER_MEMD     3
 #define L4H_PCI_OWNER_USBD     4
 #define L4H_PCI_OWNER_FIRMWARE 5 /* xHCI not claimed by usbd */
+#define L4H_PCI_OWNER_ROOT     6 /* disabled or quarantined, no active driver */
 
 struct l4h_ctl_pci {
 	l4h_u16 bdf;

@@ -256,6 +256,9 @@ impl Pool {
     }
 }
 
+/// Disk windows must address whole blocks on every supported device.
+pub const WINDOW_ALIGN: u64 = 8;
+
 /// A checked, finite, 4 KiB aligned window in 512-byte sectors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DiskWindow {
@@ -266,29 +269,44 @@ pub struct DiskWindow {
 impl DiskWindow {
     pub fn new(start: u64, sectors: u64, capacity: u64) -> Option<Self> {
         let sectors = if sectors == 0 { capacity.checked_sub(start)? } else { sectors };
-        (start % 8 == 0 && sectors > 0 && sectors % 8 == 0
+        (start % WINDOW_ALIGN == 0 && sectors > 0 && sectors % WINDOW_ALIGN == 0
             && start.checked_add(sectors)? <= capacity).then_some(Self { start, sectors })
     }
 
     /// Explicit ranges in 512-byte sectors: start:count, start:end or
     /// start:end-N (leave N sectors at the end). Resolve against this
-    /// boot's capacity, with checked arithmetic and no rounding.
+    /// boot's capacity, rounding the end down to a complete block after
+    /// subtracting N. All numbers contain decimal digits only. At most
+    /// one end-relative range is allowed, after every fixed range in
+    /// physical disk order, so losing geometry cannot introduce overlaps.
     /// Invalid input never expands a range to the rest of the disk.
     pub fn parse_list<const N: usize>(text: &str, capacity: u64) -> Option<([Self; N], usize)> {
         let mut windows = [Self { start: 0, sectors: 0 }; N];
         let mut len = 0;
+        let mut end_start = None;
+        let number = |s: &str| {
+            if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) { s.parse::<u64>().ok() } else { None }
+        };
         for entry in text.split(',') {
             if len == N { return None; }
             let (start, sectors) = entry.split_once(':')?;
-            let start = start.parse::<u64>().ok()?;
-            let sectors = if sectors == "end" || sectors.starts_with("end-") {
-                let tail = if sectors == "end" { 0 } else { sectors[4..].parse::<u64>().ok()? };
-                capacity.checked_sub(tail)?.checked_sub(start)?
+            let start = number(start)?;
+            let relative = sectors == "end" || sectors.starts_with("end-");
+            let sectors = if relative {
+                let tail = if sectors == "end" { 0 } else { number(&sectors[4..])? };
+                (capacity.checked_sub(tail)? & !(WINDOW_ALIGN - 1)).checked_sub(start)?
             } else {
-                sectors.parse::<u64>().ok()?
+                number(sectors)?
             };
             if sectors == 0 { return None; }
             let window = Self::new(start, sectors, capacity)?;
+            if relative {
+                if end_start.replace(start).is_some() || windows[..len].iter().any(|w| w.start + w.sectors > start) {
+                    return None;
+                }
+            } else if end_start.is_some_and(|end| window.start + window.sectors > end) {
+                return None;
+            }
             if windows[..len].iter().any(|w| window.overlaps(*w)) { return None; }
             windows[len] = window;
             len += 1;

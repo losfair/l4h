@@ -34,7 +34,8 @@ pub fn host_op(h: &mut Host, op: u32, a: &[u64; 6], data: &mut [u8; abi::CTL_DAT
         abi::CTL_PCI_LIST => {
             // Cursor is the first BDF, not an index into the sparse
             // inventory. Past 0xffff is an empty page, without narrowing.
-            let entries = h.pci_inventory.iter().filter(|p| p.bdf as u64 >= a[0]).copied().map(|mut p| {
+            let start = h.pci_inventory.partition_point(|p| (p.bdf as u64) < a[0]);
+            let entries = h.pci_inventory[start..].iter().copied().map(|mut p| {
                 if p.owner == abi::PCI_OWNER_FIRMWARE {
                     p.owner = crate::usb::pci_owner(p.bdf);
                 }

@@ -198,16 +198,18 @@ fn dom0_partition_windows_preserve_offsets_and_reject_unsafe_ranges() {
 
 #[test]
 fn end_relative_windows_follow_capacity_and_keep_the_tail_outside() {
-    for capacity in [32768, 65536, 131072] {
-        for (suffix, tail) in [("end", 0), ("end-0", 0), ("end-2048", 2048)] {
+    for capacity in [32768, 32769, 32775, 65536, 131072, u64::MAX] {
+        for (suffix, tail) in [("end", 0), ("end-0", 0), ("end-1", 1), ("end-2048", 2048)] {
             let text = format!("2048:8192,16384:{suffix}");
             let (w, len) = DiskWindow::parse_list::<4>(&text, capacity).unwrap();
             assert_eq!(len, 2);
             assert_eq!(w[0], DiskWindow { start: 2048, sectors: 8192 });
-            assert_eq!(w[1], DiskWindow { start: 16384, sectors: capacity - tail - 16384 });
+            let end = (capacity - tail) & !(WINDOW_ALIGN - 1);
+            assert_eq!(w[1], DiskWindow { start: 16384, sectors: end - 16384 });
+            assert!(capacity - end >= tail && capacity - end < tail + WINDOW_ALIGN);
             let mut req = request();
             req.sector = w[1].sectors - 8;
-            assert_eq!(w[1].check_request(&req, pool(), 4096, false), Ok(capacity - tail - 8));
+            assert_eq!(w[1].check_request(&req, pool(), 4096, false), Ok(end - 8));
             req.sector += 8;
             assert_eq!(w[1].check_request(&req, pool(), 4096, false), Err(STATUS_IOERR));
         }
@@ -217,14 +219,31 @@ fn end_relative_windows_follow_capacity_and_keep_the_tail_outside() {
 #[test]
 fn end_relative_windows_reject_bad_syntax_empty_unaligned_and_overlapping_ranges() {
     for text in ["0:end-", "0:end--8", "0:ending", "0:end-8:8", "0:-8", "0:end-18446744073709551616",
-        "0:end-65537", "0:end-65536", "65536:end", "65544:end", "65528:end-8", "1:end", "8:end-1",
+        "0:end-65537", "0:end-65536", "65536:end", "65544:end", "65528:end-8", "1:end",
+        "0:end-+2048", "+8:end", "8:+8", "8: 8", "8:end- 8",
         "0:end,8:8", "8:16,16:end", "8:end,16:end", "8:end-8,"] {
         assert!(DiskWindow::parse_list::<4>(text, 65536).is_none(), "{text}");
     }
     assert!(DiskWindow::parse_list::<4>("8:end", 0).is_none());
-    assert!(DiskWindow::parse_list::<4>("8:end", u64::MAX).is_none());
-    assert!(DiskWindow::parse_list::<4>("8:end-8", 65537).is_none());
     assert!(DiskWindow::parse_list::<1>("8:8,24:end-8", 65536).is_none());
+}
+
+#[test]
+fn end_relative_windows_cannot_put_fixed_ranges_in_the_reserved_tail() {
+    // These would fit a particular disk, but an unresolved end would
+    // overlap the fixed suffix. Reject the layout regardless of geometry.
+    for text in ["16384:end-16384,1000000:8192", "1000000:8192,16384:end-16384",
+        "16384:end-16384,32768:end-32768"] {
+        for capacity in [0, 8, 1010000, UNKNOWN] {
+            assert!(DiskWindow::parse_list::<4>(text, capacity).is_none(), "{text} at {capacity}");
+        }
+    }
+    // Device order may differ from physical order; the fixed ranges must
+    // still be entirely before the end-relative range's start.
+    let (w, len) = DiskWindow::parse_list::<4>("16384:end-2048,2048:8192", 65536).unwrap();
+    assert_eq!(len, 2);
+    assert_eq!(w[0], DiskWindow { start: 16384, sectors: 47104 });
+    assert_eq!(w[1], DiskWindow { start: 2048, sectors: 8192 });
 }
 
 // Who may use which sectors: blk::Reservations with the attached clients,

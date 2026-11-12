@@ -134,16 +134,16 @@ fn windows_beyond_a_small_disk_are_planned_and_reserved_not_fatal() {
 #[test]
 fn end_relative_boot_ranges_are_finite_and_unresolved_ranges_stay_reserved() {
     let text = "2048:8192,16384:end-2048";
-    for capacity in [32768, 65536, 131072] {
+    for capacity in [32768, 32769, 32775, 65536, 131072] {
         let (windows, len, fits) = dom0_windows::<4>(text, capacity).unwrap();
         assert_eq!((len, fits), (2, true));
-        assert_eq!(windows[1], DiskWindow { start: 16384, sectors: capacity - 2048 - 16384 });
+        assert_eq!(windows[1], DiskWindow { start: 16384, sectors: ((capacity - 2048) & !7) - 16384 });
         assert_eq!(dom0_plan_reservation(windows[1].start, windows[1].sectors, capacity), Some(windows[1]));
     }
-    // Missing, too small or unaligned geometry: reserve the unresolved
+    // Missing or too small geometry: reserve the unresolved
     // data area, but never attach it or turn its zero length into a whole
     // disk. Other configured windows keep their device positions.
-    for capacity in [0, 8, 16384, 18432, 32769] {
+    for capacity in [0, 8, 16384, 18432] {
         let (windows, len, fits) = dom0_windows::<4>(text, capacity).unwrap();
         assert_eq!((len, fits), (2, false));
         assert_eq!(windows[1], DiskWindow { start: 16384, sectors: UNKNOWN_CAPACITY - 2048 - 16384 });
@@ -152,6 +152,26 @@ fn end_relative_boot_ranges_are_finite_and_unresolved_ranges_stay_reserved() {
         assert_eq!(windows[0], DiskWindow { start: 2048, sectors: 8192 });
     }
     assert!(dom0_windows::<4>("8:end,16:8", 65536).is_none());
+}
+
+#[test]
+fn accepted_window_lists_never_gain_overlaps_when_geometry_is_lost() {
+    for text in ["2048:8192,16384:end-2048", "16384:end-2048,2048:8192"] {
+        for capacity in [0, 8, 32768, 32769, 131072] {
+            let (w, len, fits) = dom0_windows::<4>(text, capacity).unwrap();
+            assert_eq!(len, 2);
+            assert_eq!(fits, capacity >= 32768);
+            assert!(!w[0].overlaps(w[1]));
+            for window in &w[..len] {
+                assert_eq!(dom0_plan_reservation(window.start, window.sectors, capacity), Some(*window));
+            }
+        }
+    }
+    for text in ["16384:end-16384,1000000:8192", "1000000:8192,16384:end-16384"] {
+        for capacity in [0, 8, 1010000, UNKNOWN_CAPACITY] {
+            assert!(dom0_windows::<4>(text, capacity).is_none(), "{text} at {capacity}");
+        }
+    }
 }
 
 #[test]

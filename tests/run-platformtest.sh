@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # Exercise the shipped mkefi configuration under OVMF with a front GRUB
 # chainloading two FAT slots. Check both selectors, runtime grubenv, disk
-# growth with unchanged l4h.conf, and a PCI inventory larger than one page.
+# growth with unchanged l4h.conf, odd sector counts, fallback after selection
+# failure, GRUB literals, and a PCI inventory larger than one page.
 # L4H_TEST_KERNEL may name an already-built compatible guest kernel.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 export PATH="$PATH:/usr/sbin:/sbin"
 source "$root/tools/host-profile.sh"
 out=$root/build/platformtest
+boot_label='L4H`BOOT'
+runtime_env='/EFI/L4H/grub`env'
 mkdir -p "$out"
 python3 "$root/tests/test_mkefi.py"
 if [ -n "${L4H_TEST_KERNEL:-}" ]; then
@@ -21,7 +24,7 @@ fi
 export L4H_GUEST_KERNEL=$guest_kernel L4H_GUEST_KMODS= L4H_MKSHIM=
 # The runtime image is identical in both slots. Fixed selectors also work
 # without a shared environment block, even with an empty cmdpath.
-L4H_ESP_LABEL=L4HBOOT L4H_BOOT_ENV=/EFI/L4H/grubenv "$root/tools/mkefi.sh" "$out/runtime.efi"
+L4H_ESP_LABEL="$boot_label" L4H_BOOT_ENV="$runtime_env" "$root/tools/mkefi.sh" "$out/runtime.efi"
 L4H_ESP_UUID=1111-1111 "$root/tools/mkefi.sh" "$out/fixed-a.efi"
 L4H_ESP_LABEL=L4HSLOTB "$root/tools/mkefi.sh" "$out/fixed-b.efi"
 for slot in A B; do
@@ -40,11 +43,17 @@ cat > "$out/front.cfg" <<'CFG'
 serial --port=0x3f8 --speed=115200
 terminal_input serial
 terminal_output serial
-search --no-floppy --set=bootpart --label L4HBOOT
+search --no-floppy --set=bootpart --label 'L4H`BOOT'
 load_env --file "($bootpart)/EFI/L4H/frontenv" l4h_chain_uuid
 search --no-floppy --set=slot --fs-uuid "$l4h_chain_uuid"
 chainloader "($slot)/EFI/l4h.efi"
 boot
+echo 'PLATFORMTEST: fallback'
+search --no-floppy --set=fallback --fs-uuid 2222-2222
+chainloader "($fallback)/EFI/fallback.efi"
+boot
+echo 'PLATFORMTEST: fallback failed'
+exit
 CFG
 grub-script-check "$out/front.cfg"
 grub-mkstandalone -O x86_64-efi -o "$out/front.efi" --compress=xz \
@@ -62,11 +71,12 @@ GPT
 bootpart=$disk@@1048576
 slota=$disk@@68157440
 slotb=$disk@@202375168
-for row in "$bootpart 131072 aaaaaaaa L4HBOOT" "$slota 262144 11111111 L4HSLOTA" "$slotb 262144 22222222 L4HSLOTB"; do
+for row in "$bootpart 131072 aaaaaaaa $boot_label" "$slota 262144 11111111 L4HSLOTA" "$slotb 262144 22222222 L4HSLOTB"; do
     read -r part sectors serial label <<< "$row"
     mformat -i "$part" -T "$sectors" -F -N "$serial" -v "$label" ::
     mmd -i "$part" ::/EFI
 done
+mcopy -i "$slotb" "$out/fixed-b.efi" ::/EFI/fallback.efi
 mmd -i "$bootpart" ::/EFI/BOOT ::/EFI/L4H
 mcopy -i "$bootpart" "$out/front.efi" ::/EFI/BOOT/BOOTX64.EFI
 for slot in A B; do
@@ -93,15 +103,15 @@ run() {
     grub-editenv "$out/grubenv" set "$selector"
     if [ "$fault" = conflict ]; then grub-editenv "$out/grubenv" set l4h_esp_label=L4HSLOTB; fi
     if [ "$fault" = corrupt ]; then printf 'invalid environment block\n' > "$out/grubenv"; fi
-    mcopy -o -i "$bootpart" "$out/grubenv" ::/EFI/L4H/grubenv
-    if [ "$fault" = missing ]; then mdel -i "$bootpart" ::/EFI/L4H/grubenv; fi
+    mcopy -o -i "$bootpart" "$out/grubenv" "::$runtime_env"
+    if [ "$fault" = missing ]; then mdel -i "$bootpart" "::$runtime_env"; fi
     # Clear a previous run's completion marker before the child starts.
     : > "$out/$name.log"
     timeout "${PLATFORMTEST_TIMEOUT:-120}" "$root/tools/run-uefi.sh" "$disk" "${devices[@]}" \
         >"$out/$name.log" 2>&1 </dev/null &
     qemu=$!
     while kill -0 "$qemu" 2>/dev/null; do
-        if grep -aq 'l4h-vmmgr: all guests stopped\|l4h: boot partition selection failed' "$out/$name.log"; then
+        if grep -aq 'l4h-vmmgr: all guests stopped' "$out/$name.log"; then
             kill "$qemu" 2>/dev/null || true
             break
         fi
@@ -109,16 +119,18 @@ run() {
     done
     wait "$qemu" || true
     qemu=
-    if [ "$expected" = fail ]; then
-        grep -aq 'l4h: boot partition selection failed' "$out/$name.log"
-        if grep -aq 'PLATFORMTEST: source\|PLATFORMTEST: initrd' "$out/$name.log"; then
-            echo "$name: read a slot after a failed selector" >&2; exit 1
-        fi
-    else
-        python3 - "$out/$name.log" "$expected" "$disk" <<'PY'
+    python3 - "$out/$name.log" "$expected" "$disk" <<'PY'
 import json, pathlib, re, sys
 log, expected, disk = sys.argv[1:]
 text = pathlib.Path(log).read_text(errors='replace')
+if expected == 'fail':
+    failure = text.index('l4h: boot partition selection failed')
+    fallback = text.index('PLATFORMTEST: fallback')
+    assert failure < fallback
+    assert not re.search(r'PLATFORMTEST: (source|initrd)', text[:fallback])
+    expected = 'B'
+else:
+    assert 'PLATFORMTEST: fallback' not in text
 assert f'PLATFORMTEST: PASS {expected}' in text, text[-6000:]
 assert 'PLATFORMTEST: FAIL' not in text
 other = 'B' if expected == 'A' else 'A'
@@ -132,21 +144,21 @@ assert bdfs == sorted(set(bdfs))
 assert {'none', 'blkd', 'netd', 'memd', 'firmware'} <= {p['owner'] for p in pci}
 assert any((p['vendor'], p['device'], p['subsystem_vendor'], p['class']) == (0x1af4, 0x1041, 0x1af4, 2) for p in pci)
 capacity = pathlib.Path(disk).stat().st_size // 512
-assert f'PLATFORMTEST: geometry {capacity} {capacity - 786432 - 2048}' in text
+end = (capacity - 2048) & ~7
+assert f'PLATFORMTEST: geometry {capacity} {end - 786432}' in text
 with open(disk, 'rb') as f:
-    for sector, byte in [(786432 - 8, 0xa5), (786432, 0x5a), (capacity - 2048 - 8, 0x6b), (capacity - 2048, 0xa5)]:
+    for sector, byte in [(786432 - 8, 0xa5), (786432, 0x5a), (end - 8, 0x6b), (end, 0xa5)]:
         f.seek(sector * 512)
         assert f.read(4096) == bytes([byte]) * 4096, sector
 print(f'{pathlib.Path(log).stem}: slot {expected}, {capacity} sectors, {len(pci)} PCI functions: PASS')
 PY
-    fi
 }
 guards() {
     python3 - "$disk" <<'PY'
 import os, sys
 with open(sys.argv[1], 'r+b') as f:
     capacity = os.fstat(f.fileno()).st_size // 512
-    for sector in [786432 - 8, capacity - 2048]:
+    for sector in [786432 - 8, (capacity - 2048) & ~7]:
         f.seek(sector * 512)
         f.write(b'\xa5' * 4096)
 PY
@@ -159,6 +171,9 @@ run runtime-override B 1111-1111 l4h_esp_uuid=2222-2222
 truncate -s 640M "$disk"
 guards
 run resized-a A 1111-1111 l4h_esp_uuid=1111-1111
+truncate -s $((640 * 1024 * 1024 + 512)) "$disk"
+guards
+run odd-sectors-a A 1111-1111 l4h_esp_uuid=1111-1111
 mcopy -o -i "$slota" "$out/fixed-a.efi" ::/EFI/l4h.efi
 mcopy -o -i "$slotb" "$out/fixed-b.efi" ::/EFI/l4h.efi
 run fixed-a A 1111-1111 ignored=1

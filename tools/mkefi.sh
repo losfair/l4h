@@ -18,7 +18,8 @@
 # With L4H_BOOT_ENV=/absolute/path/to/grubenv, that partition holds a shared
 # GRUB environment block. Its l4h_esp_uuid or l4h_esp_label selects the slot
 # containing /l4h. Only the selected slot's l4h.conf is sourced or loaded;
-# an explicit selector that cannot be resolved stops boot.
+# an explicit selector that cannot be resolved returns to the caller for
+# A/B fallback, before any slot's files are read.
 # Measured boot: the firmware measures this application, with everything
 # in it, into PCR 4; GRUB's tpm module measures what it reads (the files
 # above) into PCR 9 and its commands into PCR 8 (DESIGN.md §10.2).
@@ -49,6 +50,9 @@ mk_stanza= mk_files=()
 if [ -n "$mkshim" ] && [ -f "$mkshim/l4h-mkshim.elf" ]; then
     mk_stanza=$(mkshim_grub "(memdisk)/boot/mk" "(memdisk)/boot/l4h-root.elf" "(memdisk)/boot/vmlinux" \
         "${guest_kmods:+(memdisk)/boot/kmods.erofs}" '($esp)/l4h')
+    mk_stanza="if [ -n \"\$esp\" ]; then
+$mk_stanza
+fi"
     mk_files=("boot/mk/l4h-mkshim.elf=$mkshim/l4h-mkshim.elf")
     for k in $(seq 0 7); do
         [ -f "$mkshim/kernel-s$k.elf" ] && mk_files+=("boot/mk/kernel-s$k.elf=$mkshim/kernel-s$k.elf")
@@ -95,10 +99,7 @@ $acpi_cmd
 # heap now by reading a large file whole, which load_env does before it
 # rejects the file and frees the buffer.
 if load_env --file (memdisk)/boot/vmlinux; then true; fi
-if [ -n "\$esp" ]; then
-true
 $mk_stanza
-fi
 multiboot2 (memdisk)/boot/kernel.elf console_port=\$serial_port debug_port=\$serial_port\$fbcon
 module2 (memdisk)/boot/l4h-root.elf
 module2 (memdisk)/boot/vmlinux guest-kernel
@@ -113,7 +114,7 @@ else
     serial --port=\$serial_port --speed=115200
     terminal_output serial console
     echo "l4h: boot partition selection failed"
-    halt
+    exit
 fi
 CFG
 # seL4 and root load only the segments: drop the debug information.
@@ -122,7 +123,7 @@ objcopy --strip-debug "$guest_kernel" "$work/vmlinux"
 memdisk=("boot/vmlinux=$work/vmlinux")
 [ -n "$guest_kmods" ] && memdisk+=("boot/kmods.erofs=$guest_kmods")
 grub-mkstandalone -O x86_64-efi -o "$out" --compress=xz \
-    --modules="part_gpt fat search search_fs_file search_fs_uuid search_label multiboot2 serial terminal normal configfile test regexp echo loadenv halt efi_gop video video_fb tpm${acpi_cmd:+ acpi}" \
+    --modules="part_gpt fat search search_fs_file search_fs_uuid search_label multiboot2 serial terminal normal configfile test regexp echo loadenv efi_gop video video_fb tpm${acpi_cmd:+ acpi}" \
     --locales= --fonts= --themes= \
     "boot/grub/grub.cfg=$work/grub.cfg" \
     "boot/kernel.elf=$kernel" \

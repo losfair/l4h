@@ -16,7 +16,7 @@ echo "PLATFORMTEST: PCI_JSON $(l4hctl pci --json)"
 capacity=$(l4hctl disks | sed -n 's/^disk 0: .*sectors \([0-9]*\), attachments.*/\1/p')
 [ -n "$capacity" ] || fail 'host capacity'
 sectors=$(cat /sys/class/block/vda/size)
-[ "$sectors" -eq "$((capacity - 786432 - 2048))" ] || fail "window size $sectors of $capacity"
+[ "$sectors" -eq "$(((capacity - 2048) / 8 * 8 - 786432))" ] || fail "window size $sectors of $capacity"
 echo "PLATFORMTEST: geometry $capacity $sectors"
 head -c 4096 /dev/zero | tr '\000' '\132' | dd of=/dev/vda bs=4096 count=1 2>/dev/null || fail 'first block'
 head -c 4096 /dev/zero | tr '\000' '\153' | dd of=/dev/vda bs=4096 seek="$((sectors / 8 - 1))" count=1 2>/dev/null || fail 'last block'

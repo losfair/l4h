@@ -678,6 +678,7 @@ pub fn dom0_ctrls(h: &Host) -> ArrayVec<u64, { usb::MAX_GUEST_USB }> {
 /// The service that currently owns this xHCI controller's hardware.
 pub fn pci_owner(bdf: u16) -> u16 {
     match ctrls().iter().find(|c| crate::netd::bdf(&c.pci) == bdf as u32) {
+        Some(c) if c.state == State::Failed => abi::PCI_OWNER_ROOT,
         Some(c) if c.driver.is_some() => abi::PCI_OWNER_USBD,
         _ => abi::PCI_OWNER_FIRMWARE,
     }

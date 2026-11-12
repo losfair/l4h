@@ -31,7 +31,7 @@ const PAGE: usize = 4096;
 /// Disk windows start and end on a multiple of this many 512-byte sectors
 /// (4 KiB), the largest logical block size blkd supports: devices address
 /// whole blocks, so an unaligned window would reach outside itself.
-pub const WINDOW_ALIGN: u64 = 8;
+pub const WINDOW_ALIGN: u64 = blk::WINDOW_ALIGN;
 /// Reserve all addressable, aligned sectors when a boot disk's capacity
 /// is unknown or cannot form an aligned whole-disk window. This is never
 /// advertised as capacity to a guest.

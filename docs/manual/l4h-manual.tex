@@ -789,7 +789,9 @@ The application loads only \texttt{l4h\_esp\_uuid} and
 select the partition containing \file{/l4h}. A front-stage GRUB can update
 it with \texttt{save\_env --file} before chainloading a slot. No slot's
 \file{l4h.conf} is read until selection finishes. A missing partition,
-unreadable block, or missing or conflicting selectors stops boot.
+unreadable block, or missing or conflicting selectors aborts this boot
+attempt and returns to the front loader or firmware boot manager so it
+can try a fallback entry.
 Only the chosen slot's config and initramfs are read and measured; GRUB
 also measures the shared environment block into PCR~9. The selection
 also applies to \file{l4h-mk.conf} and its per-partition files.
@@ -1113,7 +1115,9 @@ with status 1 (Section~\ref{sec:errors}).
 including unhandled functions: BDF, vendor/device and subsystem IDs,
 class/subclass/programming interface, revision, and the assigned host
 service (\texttt{blkd}, \texttt{netd}, \texttt{memd}, \texttt{usbd},
-\texttt{firmware} for unclaimed xHCI, or \texttt{none}).
+\texttt{firmware} for unclaimed xHCI, \texttt{root} for quarantined USB
+controllers or disabled NICs that could not be handed to netd, or
+\texttt{none}).
 \cmd{l4hctl pci --json} returns the same inventory with numeric ID and
 class fields, for platform profiles and controller selection. Queries
 are read-only and do not probe BARs or change devices. Subsystem IDs
@@ -1443,12 +1447,17 @@ Alternatively, \texttt{dom0\_disk0\_windows=start:count,...} gives dom0
 separate filesystem devices from disk 0. Each window consumes one device
 slot. A window can also use \texttt{start:end} or
 \texttt{start:end-N}: root resolves its size from the physical disk on
-each host boot, leaving $N$ sectors at the end. For example,
+each host boot, leaving at least $N$ sectors at the end. For example,
 \texttt{dom0\_disk0\_windows=2097152:end-2048} exposes the data area
 after sector 2097152 while excluding the last 2048 sectors (including
 the backup GPT). Growing a cloud disk needs no config rewrite or extra
 reboot; the next host boot picks up its new size. The resolved size must
-be positive and 4\,KiB aligned; root does not round it.
+be positive. Root rounds the end down to a 4\,KiB boundary after
+subtracting $N$, leaving up to seven additional sectors outside the
+window. Numbers contain decimal digits only. At most one end-relative
+window is allowed; all fixed ranges must end at or before its start,
+even if they appear later in the list. This keeps the same layout valid
+when a driver cannot report the capacity.
 The complete dom0 plan, including its console, control, optional
 memory and attestation devices, disks and NICs, must fit in 64 slots;
 an oversized plan stops boot instead of dropping devices.

@@ -3366,13 +3366,18 @@ settings.
 
 - `dom0_disk0_windows=start:count,...` exposes each selected partition of
   an existing GPT installation as a separate filesystem device. Values are
-  in 512-byte sectors, multiples of eight, counts positive. `start:end`
-  extends to the disk's end; `start:end-N` leaves N sectors there, e.g.
+  in 512-byte sectors, decimal digits only. Starts and fixed counts must
+  be multiples of eight, with positive counts. `start:end` extends to the
+  disk's last complete block; `start:end-N` leaves at least N sectors there, e.g.
   `2097152:end-2048` leaves room for the backup GPT. Root resolves these
   against the capacity reported by blkd on each host boot, with checked
-  subtraction and no rounding; the resulting window must be positive and
-  4 KiB aligned. A disk enlarged between boots needs no config rewrite
-  (and no change to the config's PCR 9 measurement). The list replaces
+  subtraction and rounds the end down to a 4 KiB boundary, excluding at
+  most seven additional sectors. At most one end-relative window is
+  allowed, and every fixed range must end at or before its start,
+  regardless of list order. This rule prevents unresolved windows from
+  overlapping fixed ranges when geometry is lost. A disk enlarged between
+  boots needs no config rewrite (and no change to the config's PCR 9
+  measurement). The list replaces
   disk 0 and requires `dom0_disks` > 0 and `dom0_disk0_mb=0`. Invalid,
   overlapping or excessive ranges stop boot. A range beyond the disk's
   capacity, which is its driver's word, does not: it is logged and stays
@@ -3448,10 +3453,13 @@ none. dom0 runs no host hardware drivers.
 one, and a zero count ends the list. Root records every enumerated
 function at boot, including unhandled devices, with vendor/device,
 subsystem IDs, class/subclass/programming interface and revision. The
-16-byte records occupy a fixed 1 MiB table in root's .bss, enough for the
-whole BDF space. Queries touch no PCI configuration registers or BARs.
+16-byte records occupy a fixed table in root's .bss: 1 MiB for x86's whole
+BDF space, or 64 KiB for aarch64's 16 buses. Queries touch no PCI
+configuration registers or BARs and use a binary search to locate a page.
 The service owner is `none`, `blkd`, `netd`, `memd`, `firmware` (unclaimed
-xHCI) or `usbd`; guest assignment remains in the disk/NIC/USB queries.
+xHCI), `usbd`, or `root` for disabled NICs that were not handed to netd
+and quarantined USB controllers. Guest assignment remains in the
+disk/NIC/USB queries.
 Subsystem IDs come from an endpoint or CardBus header, or a bridge's
 optional subsystem-ID capability; absent IDs are zero. On a multikernel
 machine each dom0 sees its root's inventory. `l4hctl pci` prints the list;
@@ -4207,7 +4215,9 @@ injects these failures in a host built with `L4H_TEST_INJECT=1`;
   a shared GRUB environment block: only `l4h_esp_uuid` and `l4h_esp_label`
   are imported, and exactly one must name the slot containing `/l4h`.
   Missing or ambiguous selectors, an unreadable environment block, or a
-  failed explicit search stop boot before any slot's config is sourced.
+  failed explicit search abort this boot attempt before any slot's config
+  is sourced. The application exits to its caller, allowing a front
+  loader or firmware boot manager to try the other slot.
   A front-stage GRUB can update this block and chainload the slot's
   application even when `$cmdpath` is empty. Only the selected slot's
   config and initramfs are read; the shared environment block is also

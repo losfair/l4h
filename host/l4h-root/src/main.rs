@@ -548,6 +548,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
             let _ = ctrls.push(ctrl);
             record.owner = l4h_abi::PCI_OWNER_BLKD;
         } else if netd::is_uplink(&d) {
+            record.owner = l4h_abi::PCI_OWNER_ROOT;
             pci.disable(&d);
             let mut bars = [const { None }; 6];
             if nics.is_full() {
