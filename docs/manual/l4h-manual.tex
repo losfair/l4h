@@ -344,7 +344,7 @@ use them in either build.
 \section{The guest kernel configuration}
 
 \file{guest/linux/arch/l4h/configs/defconfig} gives a kernel that can boot a
-general-purpose distribution: virtio-blk and virtio-net, ext4, overlayfs,
+general-purpose distribution: virtio-blk and virtio-net, ext4, Btrfs, overlayfs,
 namespaces and cgroups (enough for systemd and containers), BPF with the
 JIT and tc and XDP programs, netfilter
 with NAT and nftables, bridges and veth, and paravirtual steal-time
@@ -353,6 +353,14 @@ router with a firewall, tagged VLANs, XFS and FAT) and its sandboxes
 (EROFS, dm-crypt, dm-verity with SHA-256, Docker through
 \texttt{iptables-nft}, the NFS client), so that the shipped kernel serves
 both.
+
+Btrfs supports multi-device data volumes and snapshots. USB/IP includes
+both the host driver to export a USB device from the VM that owns its
+controller and the virtual host controller to attach it in another VM.
+These are built in, so they are available with
+\texttt{lockdown=confidentiality} without loading modules. The kernel also
+includes IPv6 NAT and masquerading for legacy \texttt{ip6tables}, including
+dual-stack k3s guests.
 
 Software networking is built in: WireGuard and TUN/TAP; PPP with async and
 sync TTY channels, compression, MPPE, multilink, PPPoE, PPTP and PPPoL2TP;
