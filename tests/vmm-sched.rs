@@ -50,12 +50,13 @@ mod kernel {
         }
     }
     pub struct Buffer;
-    pub struct Consumed { pub error: u64, pub consumed: u64 }
+    pub struct Consumed { pub error: u64, pub consumed: u64, pub runnable: u64 }
     impl Buffer {
         pub fn inner_mut(&mut self) -> &mut Self { self }
         #[allow(non_snake_case)]
         pub fn seL4_SchedContext_Consumed(&mut self, sc: u64) -> Consumed {
-            Consumed { error: 0, consumed: crate::MODEL.with_borrow_mut(|m| m.used.remove(&sc).unwrap_or(0)) }
+            crate::MODEL.with_borrow_mut(|m| Consumed { error: 0,
+                consumed: m.used.remove(&sc).unwrap_or(0), runnable: u64::from(m.ready.get(&sc).copied().unwrap_or(true)) })
         }
     }
     pub fn with_ipc_buffer_mut<T>(f: impl FnOnce(&mut Buffer) -> T) -> T { f(&mut Buffer) }
@@ -66,6 +67,7 @@ const MAX_GUESTS: usize = 64;
 struct Model {
     limits: BTreeMap<u64, (usize, u64, u64, u64)>,
     used: BTreeMap<u64, u64>,
+    ready: BTreeMap<u64, bool>,
     calls: Vec<u64>,
     priorities: BTreeMap<u64, (u64, u64)>,
     priority_calls: Vec<(u64, &'static str, u64)>,
@@ -73,7 +75,7 @@ struct Model {
     fail_config: Option<u64>,
     suspended: Vec<u64>,
 }
-thread_local! { static MODEL: RefCell<Model> = RefCell::new(Model { limits: BTreeMap::new(), used: BTreeMap::new(), calls: Vec::new(),
+thread_local! { static MODEL: RefCell<Model> = RefCell::new(Model { limits: BTreeMap::new(), used: BTreeMap::new(), ready: BTreeMap::new(), calls: Vec::new(),
     priorities: BTreeMap::new(), priority_calls: Vec::new(), fail_priority: None, fail_config: None, suspended: Vec::new() }); }
 mod slot {
     pub struct Slot;
@@ -95,7 +97,8 @@ mod guest {
     pub struct Guest {
         pub id: usize, pub vmm: Option<Component>, pub state: State, pub cpu_cap_pct: u32,
         pub vcpus: Vec<Vcpu>, pub vmm_limits: Option<(usize, sched::budget::Plan)>,
-        pub vmm_share: u32, pub vmm_usage: u32, pub vmm_boosted: bool, pub events: Vec<Box<Event>>,
+        pub vmm_share: u32, pub vmm_usage: u32, pub vmm_boosted: bool,
+        pub vmm_guard: sched::budget::BoostGuard, pub vmm_limited: bool, pub events: Vec<Box<Event>>,
     }
     impl Guest {
         pub fn event_page(&self, v: usize) -> *mut Event { (&*self.events[v]) as *const Event as *mut Event }
@@ -110,7 +113,7 @@ use guest::{Component, Event, Guest, State, Vcpu};
 struct Vmmgr { info: HostInfo, guests: Vec<Option<Guest>> }
 impl Vmmgr { fn guest(&self, id: usize) -> Option<&Guest> { self.guests.get(id)?.as_ref() } }
 fn manager() -> Vmmgr {
-    MODEL.with_borrow_mut(|m| { m.limits.clear(); m.used.clear(); m.calls.clear(); m.priorities.clear();
+    MODEL.with_borrow_mut(|m| { m.limits.clear(); m.used.clear(); m.ready.clear(); m.calls.clear(); m.priorities.clear();
         m.priority_calls.clear(); m.fail_priority = None; m.fail_config = None; m.suspended.clear(); });
     Vmmgr { info: HostInfo { timeslice_us: 5000, tsc_hz: 1_000_000, cores: 1, topology: topology::Topology::flat(1) },
         guests: (0..MAX_GUESTS).map(|_| None).collect() }
@@ -121,6 +124,7 @@ fn create(id: usize, core: usize, cap: u32, vcpus: usize) -> Guest {
             sc_u: sel4::cap::SchedContext((id * 10 + v * 2 + 2) as u64), core, cooldown: 0,
             usage: 0, k_share: 500, wall_ticks: 0, run_ticks: 0, steal_ns: 0 }).collect(),
         vmm_limits: None, vmm_share: sched::budget::VMM_SHARE_INIT, vmm_usage: 0, vmm_boosted: true,
+        vmm_guard: Default::default(), vmm_limited: false,
         events: (0..vcpus).map(|_| Box::new(Event { idle_ticks: 0, steal_ns: 0 })).collect() }
 }
 fn spawn(h: &mut Vmmgr, id: usize, core: usize, cap: u32, vcpus: usize) {
@@ -145,7 +149,7 @@ fn assert_limits(h: &Vmmgr) {
         if g.cpu_cap_pct > 0 {
             assert!((p.kernel + p.user) as u128 * p.vmm_period as u128 + p.vmm as u128 * p.period as u128
                 <= (p.period * g.cpu_cap_pct as u64 / 100) as u128 * p.vmm_period as u128);
-        } else if g.vmm_boosted {
+        } else if !g.vmm_limited {
             assert_eq!((p.vmm, p.vmm_period), (5000, 5000));
         }
     }
@@ -261,8 +265,10 @@ fn dominating_vmms_share_a_background_allowance_and_cannot_restore_their_authori
     sched::balance(&mut h, 100_000);
     assert!(!h.guest(0).unwrap().vmm_boosted);
     // After quiescence only the parent restores priority, keeping MCP low.
-    MODEL.with_borrow_mut(|m| m.used.extend([(9, 1000), (1, 50_000)]));
-    sched::balance(&mut h, 100_000);
+    for _ in 0..10 {
+        MODEL.with_borrow_mut(|m| m.used.extend([(9, 1000), (1, 50_000)]));
+        sched::balance(&mut h, 100_000);
+    }
     assert!(h.guest(0).unwrap().vmm_boosted);
     MODEL.with_borrow(|m| assert_eq!(m.priorities[&9], (101, l4h_host::PRIO_VMM)));
     assert_limits(&h);
@@ -318,8 +324,10 @@ fn one_spinner_does_not_remove_its_quiet_neighbours_boost() {
     assert!(h.guest(1).unwrap().vmm_boosted);
     // Even a previously demoted neighbour recovers under pressure.
     h.guests[1].as_mut().unwrap().vmm_boosted = false;
-    MODEL.with_borrow_mut(|m| m.used.extend([(9, 99_000), (19, 0)]));
-    sched::balance(&mut h, 100_000);
+    for _ in 0..10 {
+        MODEL.with_borrow_mut(|m| m.used.extend([(9, 99_000), (19, 0)]));
+        sched::balance(&mut h, 100_000);
+    }
     assert!(h.guest(1).unwrap().vmm_boosted);
 }
 
@@ -334,6 +342,75 @@ fn steady_io_after_vcpu_migration_keeps_its_boost() {
     sched::balance(&mut h, 100_000);
     assert!(h.guest(0).unwrap().vmm_boosted);
     assert!(MODEL.with_borrow(|m| m.priority_calls.is_empty()));
+}
+
+#[test]
+fn a_lone_heavy_io_vmm_on_an_idle_core_keeps_its_full_budget() {
+    let mut h = manager();
+    h.info.cores = 2;
+    h.info.topology = topology::Topology::flat(2);
+    spawn(&mut h, 0, 1, 0, 1);
+    let before = MODEL.with_borrow(|m| m.calls.len());
+    MODEL.with_borrow_mut(|m| {
+        m.ready.extend([(1, false), (2, false)]);
+        m.used.insert(9, 90_000);
+    });
+    sched::balance(&mut h, 100_000);
+    let g = h.guest(0).unwrap();
+    assert!(g.vmm_boosted && !g.vmm_limited);
+    assert_eq!(MODEL.with_borrow(|m| m.calls.len()), before);
+    assert_limits(&h);
+}
+
+#[test]
+fn a_demoted_vmm_reclaims_idle_capacity_without_resetting_its_backoff() {
+    let mut h = manager();
+    h.info.cores = 2;
+    h.info.topology = topology::Topology::flat(2);
+    spawn(&mut h, 0, 1, 0, 1);
+    // A guest cannot hide runnable demand by forging its idle counter.
+    h.guests[0].as_mut().unwrap().events[0].idle_ticks = u64::MAX;
+    MODEL.with_borrow_mut(|m| m.used.insert(9, 90_000));
+    sched::balance(&mut h, 100_000);
+    assert!(h.guest(0).unwrap().vmm_limited);
+    MODEL.with_borrow_mut(|m| {
+        m.ready.extend([(1, false), (2, false)]);
+        m.used.insert(9, 50_000);
+    });
+    sched::balance(&mut h, 100_000);
+    let g = h.guest(0).unwrap();
+    assert!(!g.vmm_boosted && !g.vmm_limited);
+    assert_eq!((g.vmm_limits.unwrap().1.vmm, g.vmm_limits.unwrap().1.vmm_period), (5000, 5000));
+    MODEL.with_borrow_mut(|m| { m.ready.insert(2, true); m.used.insert(9, 90_000); });
+    sched::balance(&mut h, 100_000);
+    assert!(h.guest(0).unwrap().vmm_limited);
+    assert!(!h.guest(0).unwrap().vmm_boosted);
+    assert_limits(&h);
+}
+
+#[test]
+fn idle_peers_do_not_turn_a_40_percent_io_neighbour_into_an_offender() {
+    let mut h = manager();
+    h.info.cores = 2;
+    h.info.topology = topology::Topology::flat(2);
+    for id in 0..8 { spawn(&mut h, id, 1, 0, 1); }
+    for (a, b) in [(60_000, 40_000), (50_000, 40_000)] {
+        MODEL.with_borrow_mut(|m| m.used.extend([(9, a), (19, b)]));
+        sched::balance(&mut h, 100_000);
+        assert!(!h.guest(0).unwrap().vmm_boosted);
+        assert!(h.guest(1).unwrap().vmm_boosted);
+        assert!(!h.guest(1).unwrap().vmm_limited);
+        assert!(h.guests[2..8].iter().flatten().all(|g| g.vmm_boosted));
+    }
+    assert_limits(&h);
+}
+
+#[test]
+fn logd_remains_above_throttled_vmms_and_below_short_io_turns() {
+    assert!(l4h_abi::PRIO_KERNEL < l4h_host::PRIO_VMM_FAIR);
+    assert!(l4h_host::PRIO_VMM_FAIR < l4h_host::PRIO_LOGD);
+    assert!(l4h_host::PRIO_LOGD < l4h_host::PRIO_VMM);
+    assert!(l4h_host::PRIO_VMM < l4h_host::PRIO_SERVICE);
 }
 
 #[test]

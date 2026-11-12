@@ -294,6 +294,10 @@ pub struct Guest {
     pub vmm_usage: u32,
     /// Elevated I/O priority, withdrawn when VMMs dominate their core.
     pub vmm_boosted: bool,
+    /// Backoff after repeated priority abuse.
+    pub vmm_guard: crate::sched::budget::BoostGuard,
+    /// Only throttle the VMM while a guest on its core can run.
+    pub vmm_limited: bool,
     /// CPU cap per vCPU in percent of a core (0 = none).
     pub cpu_cap_pct: u32,
     /// ASIDs held by its VSpaces (its own, its processes', its components').
@@ -1146,6 +1150,8 @@ pub fn create(
         vmm_share: crate::sched::budget::VMM_SHARE_INIT,
         vmm_usage: 0,
         vmm_boosted: true,
+        vmm_guard: Default::default(),
+        vmm_limited: false,
         cpu_cap_pct: 0,
         asids: 0,
         attest: false,

@@ -22,13 +22,14 @@ pub const BALANCE_MS: u64 = 100;
 /// A vCPU that moved stays put for this many periods.
 const COOLDOWN: u32 = 10;
 
-pub fn consumed(sc: sel4::cap::SchedContext) -> u64 {
+pub fn consumed(sc: sel4::cap::SchedContext) -> (u64, bool) {
     let r = sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_SchedContext_Consumed(sc.bits()));
     if r.error != 0 {
         l4h_rt::log!("l4h-vmmgr: SchedContext_Consumed({:#x}) failed: {}", sc.bits(), r.error);
-        return 0;
+        // Unknown readiness must not be mistaken for spare capacity.
+        return (0, true);
     }
-    r.consumed
+    (r.consumed, r.runnable != 0)
 }
 
 pub const K_SHARE_INIT: u32 = 500;
@@ -40,7 +41,7 @@ fn min_period() -> u64 {
 fn plan(info: &HostInfo, g: &Guest, v: usize, has_vmm: bool, backgrounds: usize) -> budget::Plan {
     let p = budget::plan(info.timeslice_us, min_period(), g.cpu_cap_pct, g.vcpus[v].k_share,
         has_vmm.then_some(g.vmm_share));
-    if has_vmm && !g.vmm_boosted { budget::background(p, backgrounds) } else { p }
+    if has_vmm && g.vmm_limited { budget::background(p, backgrounds) } else { p }
 }
 
 fn pair(info: &HostInfo, gid: usize, v: usize, vcpu: &Vcpu, core: usize, p: budget::Plan) -> bool {
@@ -57,9 +58,9 @@ fn active(g: &Guest) -> bool {
     g.vmm.is_some() && g.state != State::Stopped
 }
 
-fn counts(h: &Vmmgr, background_only: bool) -> [usize; topology::MAX_CPUS] {
+fn counts(h: &Vmmgr) -> [usize; topology::MAX_CPUS] {
     let mut n = [0; topology::MAX_CPUS];
-    for g in h.guests.iter().flatten().filter(|g| active(g) && (!background_only || !g.vmm_boosted)) {
+    for g in h.guests.iter().flatten().filter(|g| active(g) && g.vmm_limited) {
         n[g.vmm_limits.expect("VMM limits").0] += 1;
     }
     n
@@ -110,7 +111,7 @@ impl core::fmt::Debug for Cores<'_> {
 
 /// Apply a new CPU cap to every vCPU of guest `gid`.
 pub fn set_cap(h: &mut Vmmgr, gid: usize, cap_pct: u32) -> Result<(), Errno> {
-    let n = counts(h, true);
+    let n = counts(h);
     let Some(Some(g)) = h.guests.get_mut(gid) else { return Err(ENOENT) };
     if g.state == State::Stopped { return Err(EINVAL); }
     g.cpu_cap_pct = cap_pct.min(100);
@@ -150,36 +151,47 @@ pub fn balance(h: &mut Vmmgr, elapsed_us: u64) {
         return;
     }
     let tsc_mhz = (h.info.tsc_hz / 1_000_000).max(1);
-    let backgrounds = counts(h, true);
-    let peers = counts(h, false);
+    let backgrounds = counts(h);
     let mut vmm_used = [0; crate::MAX_GUESTS];
+    let mut vmm_ready = [false; crate::MAX_GUESTS];
     let mut vmm_before = [None; crate::MAX_GUESTS];
     let mut core_vmm = [0u64; topology::MAX_CPUS];
+    let mut largest = [0u64; topology::MAX_CPUS];
+    let mut ready_vmms = [0usize; topology::MAX_CPUS];
+    let mut guest_ready = [false; topology::MAX_CPUS];
     let migration = SAMPLES.with(|sample| {
         sample.clear();
         for g in h.guests.iter_mut().flatten() {
-            let cv = g.vmm.as_ref().map_or(0, |vmm| consumed(vmm.sc));
+            let (cv, ready) = g.vmm.as_ref().map_or((0, false), |vmm| consumed(vmm.sc));
             vmm_used[g.id] = cv;
+            vmm_ready[g.id] = ready;
             vmm_before[g.id] = g.vmm_limits.map(|(_, p)| p);
             if active(g) {
-                core_vmm[g.vmm_limits.expect("VMM limits").0] += cv;
+                let core = g.vmm_limits.expect("VMM limits").0;
+                core_vmm[core] += cv;
+                largest[core] = largest[core].max(cv);
+                ready_vmms[core] += usize::from(ready);
             }
             g.vmm_usage = if active(g) { (cv * 1000 / elapsed_us) as u32 } else { 0 };
             for v in 0..g.vcpus.len() {
                 let page = g.event_page(v);
                 let has_vmm = v == 0 && active(g);
                 let old = if has_vmm { g.vmm_limits.expect("VMM limits").1 } else { plan(&h.info, g, v, false, 0) };
-                let (ck, cu) = (consumed(g.vcpus[v].sc_k), consumed(g.vcpus[v].sc_u));
+                let ((ck, kr), (cu, ur)) = (consumed(g.vcpus[v].sc_k), consumed(g.vcpus[v].sc_u));
                 let c = ck + cu;
                 if g.state != State::Running {
                     continue;
                 }
+                // Query kernel-owned runnable state, not guest idle
+                // counters or a consumption ratio. Idle/migrated vCPUs
+                // must not reserve CPU from I/O on this core.
+                guest_ready[g.vcpus[v].core] |= kr || ur;
                 // A capped vCPU whose budget split changed.
                 if g.cpu_cap_pct > 0 {
                     if let Some((ks, vs)) = budget::adapt(old, g.vcpus[v].k_share, g.vmm_share,
                         [ck, cu, if has_vmm { cv } else { 0 }], elapsed_us) {
                         let mut next = budget::plan(h.info.timeslice_us, min_period(), g.cpu_cap_pct, ks, has_vmm.then_some(vs));
-                        if has_vmm && !g.vmm_boosted {
+                        if has_vmm && g.vmm_limited {
                             next = budget::background(next, backgrounds[g.vmm_limits.expect("VMM limits").0]);
                         }
                         if budget::changed(old, next) {
@@ -223,7 +235,11 @@ pub fn balance(h: &mut Vmmgr, elapsed_us: u64) {
     });
     for g in h.guests.iter_mut().flatten().filter(|g| active(g)) {
         let core = g.vmm_limits.expect("VMM limits").0;
-        let boosted = budget::boost(g.vmm_boosted, vmm_used[g.id], core_vmm[core], peers[core], elapsed_us,
+        // logd is on core 0. A competing VMM may be runnable without
+        // having consumed CPU yet, or may have blocked after its work.
+        let contended = guest_ready[core] || core == 0 || core_vmm[core] > vmm_used[g.id]
+            || ready_vmms[core] > usize::from(vmm_ready[g.id]);
+        let boosted = g.vmm_guard.boost(g.vmm_boosted, vmm_used[g.id], core_vmm[core], largest[core], contended, elapsed_us,
             vmm_before[g.id].expect("VMM limits"));
         if boosted == g.vmm_boosted { continue; }
         let tcb = g.vmm.as_ref().expect("VMM").tcb;
@@ -244,7 +260,11 @@ pub fn balance(h: &mut Vmmgr, elapsed_us: u64) {
         info!("l4h-vmmgr: guest {} VMM priority {} on core {} (used {} us, VMMs {} us)",
             g.id, if boosted { l4h_host::PRIO_VMM } else { l4h_host::PRIO_VMM_FAIR }, core, vmm_used[g.id], core_vmm[core]);
     }
-    let backgrounds = counts(h, true);
+    for g in h.guests.iter_mut().flatten().filter(|g| active(g)) {
+        let core = g.vmm_limits.expect("VMM limits").0;
+        g.vmm_limited = !g.vmm_boosted && guest_ready[core];
+    }
+    let backgrounds = counts(h);
     for g in h.guests.iter_mut().flatten().filter(|g| active(g)) {
         let core = g.vmm_limits.expect("VMM limits").0;
         let p = plan(&h.info, g, 0, true, backgrounds[core]);

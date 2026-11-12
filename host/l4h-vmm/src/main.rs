@@ -69,7 +69,7 @@ impl Dev {
     fn poll(&mut self, mem: &GuestMem, vcpus: &Vcpus, more: u64) {
         match self {
             Dev::Blk(d) => d.poll(mem, vcpus, 0),
-            Dev::Net(d) => d.poll(mem, vcpus, more),
+            Dev::Net(_) => unreachable!("network polls are merged in net::signal"),
             Dev::Gpu(d) => d.poll(mem, vcpus, more),
             Dev::Usb(_) => {}
         }
@@ -79,7 +79,7 @@ impl Dev {
     /// each), which this turn's `poll` takes up.
     fn take_more(&mut self) -> u64 {
         match self {
-            Dev::Net(d) => core::mem::take(&mut d.backend.more),
+            Dev::Net(_) => unreachable!("network continuations belong to net::signal"),
             Dev::Gpu(d) => core::mem::take(&mut d.backend.more),
             _ => 0,
         }
@@ -96,7 +96,7 @@ impl Dev {
     fn complete(&mut self, mem: &GuestMem, vcpus: &Vcpus) {
         match self {
             Dev::Blk(d) => d.complete(mem, vcpus),
-            Dev::Net(d) => d.update_config(vcpus),
+            Dev::Net(_) => unreachable!("network completions are merged in net::signal"),
             Dev::Gpu(d) => d.complete(mem, vcpus),
             Dev::Usb(_) => {}
         }

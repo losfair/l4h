@@ -38,18 +38,38 @@ pub fn plan(timeslice: u64, min_period: u64, cap: u32, kernel_share: u32, vmm: O
     Plan { period, kernel, user: guest - kernel, vmm_period: period, vmm: vmm_budget }
 }
 
-/// Only VMMs contributing at least the core's average VMM consumption
-/// lose their boost, and only when VMMs consume 80% of wall time there.
-/// Idle capacity or a migrated vCPU is not evidence of contention.
-/// A throttled VMM regains its boost when it uses less than half its
-/// allowance, independently of other VMMs' consumption on that core.
-pub fn boost(was: bool, used: u64, core_vmm: u64, peers: usize, elapsed: u64, old: Plan) -> bool {
-    if elapsed == 0 { return was; }
-    if !was {
-        return used as u128 * old.vmm_period as u128 * 2 < old.vmm as u128 * elapsed as u128;
+/// Boost recovery requires uninterrupted quiescence. Repeated offenders
+/// wait 1, 2, 4, 8, then 16 seconds, so quiet/spin cycles cannot regain a
+/// full-priority context every other 100 ms sample.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BoostGuard {
+    demotions: u8,
+    quiet_us: u64,
+}
+
+impl BoostGuard {
+    /// Select the largest consumer, independent of how many idle VMMs
+    /// share its core. A lone VMM using otherwise idle CPU is not pressure.
+    pub fn boost(&mut self, was: bool, used: u64, core_vmm: u64, largest: u64,
+        contended: bool, elapsed: u64, old: Plan) -> bool {
+        if elapsed == 0 { return was; }
+        if was {
+            self.quiet_us = 0;
+            let crowded = core_vmm as u128 * 5 >= elapsed as u128 * 4;
+            if contended && crowded && used > 0 && used == largest {
+                self.demotions = self.demotions.saturating_add(1);
+                return false;
+            }
+            return true;
+        }
+        if used as u128 * old.vmm_period as u128 * 2 < old.vmm as u128 * elapsed as u128 {
+            self.quiet_us = self.quiet_us.saturating_add(elapsed);
+        } else {
+            self.quiet_us = 0;
+        }
+        let wait = 1_000_000u64 << self.demotions.saturating_sub(1).min(4);
+        self.quiet_us >= wait
     }
-    core_vmm as u128 * 5 < elapsed as u128 * 4
-        || used == 0 || (used as u128 * peers as u128) < core_vmm as u128
 }
 
 /// Only VMMs whose boost was withdrawn share this half-core limit.

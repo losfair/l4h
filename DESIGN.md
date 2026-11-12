@@ -312,6 +312,7 @@ support, since no device is passed into a guest.
 | 0041 | (x86, `KernelVTX`) VT-x keeps CR0.CD, CR0.NW and the reserved CR0 bits (28:19, 17, 15:6) in the CR0 guest/host mask, whatever userspace writes to `VMX_CONTROL_CR0_MASK`: VM entries and exits do not load these bits, so a guest MOV to CR0 that set CD or NW would leave the core's caches off for seL4 and every thread after it. A guest write to them now always exits. l4h's KVM already owns all of CR0 (`CR0_GUEST_HOST_MASK` is `~0` in `kvm/vmx.c`), so nothing changes for it. AMD-V needs no counterpart, as #VMEXIT reloads the host's whole CR0 from the host save area. Cherry-picked from upstream seL4 PR #1847 (open), without its CHANGES.md entry. |
 | 0042 | (x86, `KernelVTX`) VT-x guests set only the CR4 bits on an allowlist, `VCPU_GUEST_CR4_ALLOWED`, as they turn on only the VM-execution controls on 0039's lists. 0040 defines the list and applies it on AMD-V. The list holds the bits whose effects stay in guest mode, on state that VM entry and exit or seL4 switch: VME, PVI, TSD, DE, PSE, PAE, MCE, PGE, PCE, OSFXSR, OSXMMEXCPT, UMIP, LA57, FSGSBASE, PCIDE, OSXSAVE, SMEP and SMAP. Every other bit stays clear, including any a later CPU defines, because some enable state that nothing switches and that the next guest on the core would run with. PKE is one: PKRU is outside the XSAVE features seL4 enables (`KernelXSaveFeatureSet` 7), and the host runs with CR4.PKE clear. KL is another: LOADIWKEY sets the core's Key Locker wrapping key. PKS, CET, UINTR and FRED are left out for the same reason. On VT-x, the bits outside the list are always in `VMX_CONTROL_CR4_MASK`, so a guest changing one exits, and `GUEST_CR4` takes only listed bits and the fixed ones (VMXE). On AMD-V (0040), which has no CR4 mask, CR4 writes always exit and `WriteVMCB` keeps the bits outside the list clear. l4h's KVM already owns all of CR4 and hides PKU, CET, LAM and FRED, and Linux's KVM does not offer Key Locker, PKS or UINTR, so nothing changes for it. |
 | 0043 | (x86, `KernelVTX`) VT-x keeps CR8-load and CR8-store exiting on, as 0039 keeps MOV-DR exiting on. CR8 is the core's local APIC TPR: 0039 does not allow the TPR shadow, so with these exits off a guest MOV to or from CR8 reaches the TPR, which neither VM entry and exit nor seL4 switch. The next guest on the core would read the value, and a guest that raised it would mask the host's timer and IPIs on that core, in guest mode and after it. A guest's CR8 access is now a control-register exit to userspace, which emulates CR8 per VCPU. l4h's KVM already sets both exits (`kvm/vmx.c`), so nothing changes for it. AMD-V needs no counterpart, as `V_INTR_MASKING` is always on (0040) and a guest's CR8 is its VMCB's `V_TPR`. |
+| 0044 | (MCS) `SchedContext_Consumed` appends a `runnable` word: a bound thread is runnable and the SC has available budget. The existing consumed-time prefix and invocation labels stay unchanged, so older clients can ignore the new result. The snapshot is taken after synchronizing a remotely running context and needs only the SC capability. Vmmgr uses it to distinguish idle capacity from a guest waiting to run, without another syscall or trusting a guest's idle counter. Host builds need the matching kernel headers and kernel. |
 
 **Verification.** The MCS SMP x86_64 configuration is not covered by the
 seL4 proofs, with or without these patches. l4h benefits from seL4's design
@@ -1214,35 +1215,43 @@ Global on each core, with `P_K` = `PRIO_KERNEL` = 100:
 | Priority | Components |
 |----------|------------|
 | root task | l4h-root |
-| `P_K + 3` | l4h-netd (switches and NIC drivers), l4h-blkd (disk drivers), l4h-memd and l4h-vmmgr (both on core 0) |
-| `P_K + 2` | boosted l4h-vmm instances; l4h-trustd (last core, at most 5 ms per 20 ms) |
-| `P_K + 1` | l4h-logd (core 0, at most 1 ms per 5 ms); throttled VMMs (combined at most half their core) |
+| `P_K + 4` | l4h-netd (switches and NIC drivers), l4h-blkd (disk drivers), l4h-memd and l4h-vmmgr (both on core 0) |
+| `P_K + 3` | boosted l4h-vmm instances; l4h-trustd (last core, at most 5 ms per 20 ms) |
+| `P_K + 2` | l4h-logd (core 0, at most 1 ms per 5 ms), strictly above throttled VMMs |
+| `P_K + 1` | VMMs whose boost was withdrawn; their budgets are limited only while a guest on their core can run |
 | `P_K` | guest kernel TCBs (`SC_K`) |
 | `P_U` = 99 | guest user TCBs (`SC_U`) |
 
 Boosted, uncapped VMMs have full round-robin scheduling contexts. At each
 100 ms sample, vmmgr withdraws the boost only if VMMs consumed at least
-80% of wall time on their core, and only from VMMs contributing at least
-the average consumption of the active VMMs there. A quiet neighbour
-keeps its boost; steady I/O on an otherwise idle core is not contention,
-including after vCPU 0 migrates elsewhere.
+80% of wall time on their core and another guest or VMM needs CPU (or
+logd shares core 0). Only the largest consumer, including ties, loses
+its boost. Idle VMMs do not change that selection, so a spinner using
+60% does not demote an I/O neighbour using 40% merely because six other
+VMMs are idle.
 
 Throttled VMMs stay above guest kernels at `P_K + 1`, so a kernel spinning
-for a device reply cannot starve the VMM servicing it. Only these VMMs
-divide a combined half-core budget, leaving time for guest users. Their
-period grows if necessary to keep every SC above 200 µs. A guest cap can
-reduce the allowance further. Boosted VMMs, including idle ones, do not
-divide this allowance and reserve no share from one another.
+for a device reply cannot starve the VMM servicing it. While a guest on
+their core can run, these VMMs divide a combined half-core budget,
+leaving time for guest users. The kernel's `SchedContext_Consumed`
+runnable snapshot (0044) supplies that demand; a guest's reported idle
+counter does not. When no guest there can run, the extra limit is removed
+even during boost backoff: a busy VMM can use spare CPU rather than stay
+hard-capped on an idle core. Explicit guest caps still apply. Limited
+periods grow if necessary to keep every SC above 200 µs. Other VMMs,
+including idle ones, do not divide this allowance.
 
 Before demotion vmmgr lowers the VMM's MCP to `P_K + 1`, so its own TCB
-cannot restore priority `P_K + 2`. The manager restores the boost after
-the VMM uses less than half its own allowance in a later interval,
-regardless of other VMMs' use; the MCP stays low. A VMM saturating even a
-small allowance does not appear quiet merely because peers share the
-core. A VMM spinning before READY is protected and its CPU use appears
+cannot restore priority `P_K + 3`. Recovery requires continuous use below
+half its allowance for 1 second after the first demotion, then 2, 4, 8
+and at most 16 seconds after repeated demotions. Busy samples reset the
+quiet streak. Other VMMs' use does not block recovery, and the MCP stays
+low when the manager restores priority. This prevents 100 ms quiet/spin
+cycles regaining a full boost every other sample. A VMM spinning before
+READY is protected and its CPU use appears
 in management statistics. `tests/run-vmmfairtest.sh` checks progress with
-continuously runnable guest kernel and user threads in the real kernel,
-as well as the authority ceiling.
+continuously runnable guest kernel, user and logd-priority threads in the
+real kernel, the runnable-state snapshots, and the authority ceiling.
 `tests/run-vmmguardtest.sh` has an actual VMM spin before READY, try to
 undo demotion, and go quiet for a restored boost; a CPU-bound guest on
 the same core must boot and keep making progress throughout.
@@ -3812,7 +3821,7 @@ The chain has four links.
 2. **The host key.** `l4h-trustd` is the only component that maps the TPM,
    which root finds in the ACPI `TPM2` table (see **TPM interfaces**).
    trustd polls it at locality 0, sleeping on its E3 timer between polls
-   (20 µs up to 2 ms). It runs on the last core at `P_K + 1` with at most
+   (20 µs up to 2 ms). It runs on the last core at `P_K + 3` with at most
    5 ms of every 20 ms, so neither a slow TPM nor the firmware's AML can
    take a core from
    guests; the flags server takes at most a tenth of that core besides. At

@@ -7,6 +7,11 @@ fail() { echo "VMMGUARDTEST: FAIL: $*"; poweroff -f; exit 1; }
 bad=$(l4hctl create bad --initrd /bin/densvm.cpio.gz --mem 64 --cmdline 'console=hvc0 quiet') || fail bad
 [ "$bad" = 1 ] || fail 'wrong injected guest'
 ids=$bad
+# A lone busy VMM must use idle CPU, rather than retain a half-core cap.
+sleep 0.5
+spare=$(l4hctl top | awk '$2 == "bad" { split($3,a,"."); print a[1] }')
+[ "${spare:-0}" -ge 75 ] || fail "idle core limited busy VMM to ${spare:-0}%"
+echo "VMMGUARDTEST: lone pre-READY VMM uses $spare% of idle core"
 # Victim and the spinning VMM must share core 1 (placement is round robin).
 for n in 1 2 3; do
     id=$(l4hctl create "idle$n" --initrd /bin/densvm.cpio.gz --mem 64 --cmdline 'console=hvc0 quiet') || fail idle
@@ -33,7 +38,7 @@ for _ in $(seq 60); do
 done
 grep -q 'VMMGUARD: self-boost refused' /run/logs || fail 'no authority check'
 grep -q 'guest 1 VMM priority 101' /run/logs || fail 'parent did not demote VMM'
-grep -q 'guest 1 VMM priority 102' /run/logs || fail 'parent did not restore boost'
+grep -q 'guest 1 VMM priority 103' /run/logs || fail 'parent did not restore boost'
 grep -q 'VMMGUARD: parent restored boost with low authority' /run/logs || fail 'no restored-boost authority check'
 for id in $ids; do l4hctl destroy "$id" || fail destroy; done
 echo 'VMMGUARDTEST: PASS'

@@ -56,23 +56,46 @@ fn capped_vmm_and_kernel_shares_follow_their_measured_demand() {
 }
 
 #[test]
-fn only_heavy_vmm_contributors_lose_their_boost() {
+fn only_the_largest_contending_vmm_loses_its_boost() {
     let p = budget::plan(5000, 0, 0, 500, Some(250));
-    assert!(budget::boost(true, 20_000, 20_000, 1, PERIOD, p));
-    assert!(!budget::boost(true, 45_000, 90_000, 2, PERIOD, p));
-    // A migrated vCPU leaving no guest work on this core is not contention.
-    assert!(budget::boost(true, 10_000, 10_000, 1, PERIOD, p));
-    assert!(budget::boost(true, 1000, 99_000, 2, PERIOD, p));
-    assert!(!budget::boost(true, 98_000, 99_000, 2, PERIOD, p));
-    let p = budget::background(p, 2);
-    assert!(!budget::boost(false, 25_000, 25_000, 2, PERIOD, p));
-    // A quiet neighbour recovers even while the core is still dominated.
-    assert!(budget::boost(false, 1000, 99_000, 2, PERIOD, p));
-    assert!(!budget::boost(false, 12_500, 25_000, 2, PERIOD, p));
-    assert!(budget::boost(true, 0, 0, 1, 0, p));
-    assert!(!budget::boost(false, 0, 0, 1, 0, p));
+    let decide = |used, total, largest, contended, elapsed| {
+        budget::BoostGuard::default().boost(true, used, total, largest, contended, elapsed, p)
+    };
+    assert!(decide(20_000, 20_000, 20_000, true, PERIOD));
+    assert!(!decide(45_000, 90_000, 45_000, true, PERIOD));
+    assert!(decide(90_000, 90_000, 90_000, false, PERIOD));
+    assert!(decide(40_000, 100_000, 60_000, true, PERIOD));
+    assert!(!decide(60_000, 100_000, 60_000, true, PERIOD));
+    assert!(decide(0, 0, 0, true, 0));
     // Many spinning VMMs cannot evade the trigger by splitting the load.
-    assert!(!budget::boost(true, 1000, 64_000, 64, 80_000, p));
+    assert!(!decide(1000, 64_000, 1000, true, 80_000));
+}
+
+#[test]
+fn recovery_requires_continuous_quiet_and_ignores_neighbour_pressure() {
+    let p = budget::plan(5000, 0, 0, 500, Some(250));
+    let mut guard = budget::BoostGuard::default();
+    assert!(!guard.boost(true, 90_000, 90_000, 90_000, true, PERIOD, p));
+    let p = budget::background(p, 1);
+    for _ in 0..5 { assert!(!guard.boost(false, 0, 100_000, 100_000, true, PERIOD, p)); }
+    // Saturation resets the quiet streak rather than accumulating idle gaps.
+    assert!(!guard.boost(false, 50_000, 100_000, 50_000, true, PERIOD, p));
+    for _ in 0..9 { assert!(!guard.boost(false, 0, 100_000, 100_000, true, PERIOD, p)); }
+    assert!(guard.boost(false, 0, 100_000, 100_000, true, PERIOD, p));
+}
+
+#[test]
+fn quiet_spin_cycles_back_off_instead_of_stalling_guests_every_other_sample() {
+    let p = budget::plan(5000, 0, 0, 500, Some(250));
+    let mut guard = budget::BoostGuard::default();
+    let mut boosted = true;
+    let mut bursts = 0;
+    for _ in 0..10_000 {
+        let used = if boosted { bursts += 1; PERIOD } else { 0 };
+        let old = if boosted { p } else { budget::background(p, 1) };
+        boosted = guard.boost(boosted, used, PERIOD, PERIOD, true, PERIOD, old);
+    }
+    assert!(bursts > 1 && bursts < 100, "repeated full-priority bursts must occupy under 1% of this long run: {bursts}");
 }
 
 #[test]

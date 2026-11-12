@@ -1759,12 +1759,15 @@ adjustment. A workload that alternates between kernel and user code may
 use less than its cap when one part runs out before the other.
 
 Uncapped VMMs can use spare CPU time; idle VMs reserve no share from busy
-ones. If VMMs consume at least 80\% of a core, the balancer withdraws the
-I/O boost from its heavy contributors. Those VMMs share at most half
-the core while staying above guest kernels, so a kernel waiting for a
-device reply cannot starve its VMM. Quiet neighbours keep their boost.
-Only the manager can restore the boost, after a VMM uses less than half
-its own allowance; another busy VMM does not prevent that recovery.
+ones. If VMMs consume at least 80\% of a contended core, the balancer
+withdraws the I/O boost from the largest consumer, including ties.
+When a guest on that core can run, those VMMs share at most half the
+core while staying above guest kernels and below the logger. The extra
+limit is removed when no guest there can run, so heavy I/O can use spare
+CPU. Explicit guest caps still apply. Quiet neighbours keep their boost.
+Only the manager can restore it, after continuous use below half the
+allowance for 1 second, increasing to at most 16 seconds after repeated
+demotions. Another busy VMM does not prevent that recovery.
 
 \paragraph{Steal time.} Guests see the time they were ready to run but
 waiting for a core as \emph{steal}, in the \texttt{st} column of

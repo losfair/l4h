@@ -1,0 +1,53 @@
+From 29e8ebb537548ee33c56a9b57aa42614e87691f1 Mon Sep 17 00:00:00 2001
+From: Heyang Zhou <hello@su3.io>
+Date: Thu, 12 Nov 2026 15:09:26 +0100
+Subject: [PATCH] api: append runnable state to scheduling-context consumption
+
+CPU consumption alone cannot distinguish spare capacity from a guest waiting to run. Return a kernel-owned runnable/budget snapshot with the existing query so the host can preserve idle CPU for I/O without another syscall or trusting guest idle counters.
+
+Keep invocation labels and the consumed-time result prefix unchanged for existing clients. Append the flag after synchronizing a remote context, and use setMR to respect the reply storage available on each architecture.
+---
+ libsel4/include/interfaces/object-api.xml |  2 ++
+ src/object/schedcontext.c                 | 13 +++++++++++++
+ 2 files changed, 15 insertions(+)
+
+diff --git a/libsel4/include/interfaces/object-api.xml b/libsel4/include/interfaces/object-api.xml
+index e4e9a2b85..5f09e3274 100644
+--- a/libsel4/include/interfaces/object-api.xml
++++ b/libsel4/include/interfaces/object-api.xml
+@@ -1675,6 +1675,8 @@
+             <return><errorenumdesc/></return>
+             <param dir="out" name="consumed" type="seL4_Time"
+                 description="Amount consumed by this scheduling context."/>
++            <param dir="out" name="runnable" type="seL4_Word"
++                description="One if a bound thread is runnable and this context has available budget, otherwise zero. This is a snapshot, not a reservation."/>
+             <error name="seL4_IllegalOperation">
+                 <description>
+                     The <texttt text="_service"/> is a CPtr to a capability of the wrong type.
+diff --git a/src/object/schedcontext.c b/src/object/schedcontext.c
+index 621f82a79..d80e0eb14 100644
+--- a/src/object/schedcontext.c
++++ b/src/object/schedcontext.c
+@@ -177,6 +177,19 @@ static exception_t invokeSchedContext_Consumed(sched_context_t *sc, bool_t call)
+ {
+     setConsumed(sc, NODE_STATE(ksCurThread), call);
+ 
++    if (call) {
++        /* Append a snapshot after the existing consumed-time result.
++         * Older clients can keep reading that prefix. maybeStallSC has
++         * synchronized a remotely running context before this invocation. */
++        tcb_t *thread = NODE_STATE(ksCurThread);
++        word_t *buffer = lookupIPCBuffer(true, thread);
++        word_t length = seL4_MessageInfo_get_length(messageInfoFromWord(getRegister(thread, msgInfoRegister)));
++        bool_t runnable = sc->scTcb != NULL && isRunnable(sc->scTcb) && sc_active(sc) &&
++                          refill_ready(sc) && refill_sufficient(sc, 0);
++        length = setMR(thread, buffer, length, runnable);
++        setRegister(thread, msgInfoRegister, wordFromMessageInfo(seL4_MessageInfo_new(0, 0, 0, length)));
++    }
++
+     setThreadState(NODE_STATE(ksCurThread), ThreadState_Running);
+     return EXCEPTION_NONE;
+ }
+-- 
+2.47.3
+
