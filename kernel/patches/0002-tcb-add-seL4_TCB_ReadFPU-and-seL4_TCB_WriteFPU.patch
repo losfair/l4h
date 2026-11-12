@@ -1,4 +1,4 @@
-From ad69f7bafad7a0a41315ace5819b66ea15420981 Mon Sep 17 00:00:00 2001
+From ba43aeab608d437e6a5d02c65059e5b784bdfbc6 Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Sat, 17 Oct 2026 08:30:23 -0700
 Subject: [PATCH] tcb: add seL4_TCB_ReadFPU and seL4_TCB_WriteFPU
@@ -164,10 +164,10 @@ index 96d606761..b5f276425 100644
  uint32_t x86KSnumDrhu;
  
 diff --git a/src/object/tcb.c b/src/object/tcb.c
-index 6bfcdd7fa..65eff2fe3 100644
+index 0a264d9ec..0c19bf132 100644
 --- a/src/object/tcb.c
 +++ b/src/object/tcb.c
-@@ -844,6 +844,102 @@ static exception_t decodeSetFlags(cap_t cap, word_t length, bool_t call, word_t
+@@ -843,6 +843,102 @@ static exception_t decodeSetFlags(cap_t cap, word_t length, bool_t call, word_t
      return EXCEPTION_NONE;
  }
  
@@ -261,7 +261,7 @@ index 6bfcdd7fa..65eff2fe3 100644
 +     * A target running on another core has already been stalled off it by
 +     * remoteTCBStall() and reloads its FPU when it is switched to again. */
 +    if (owned && thread == NODE_STATE(ksCurThread)) {
-+        switchFpuOwner(thread, CURRENT_CPU_INDEX());
++        switchLocalFpuOwner(thread);
 +    }
 +    return EXCEPTION_NONE;
 +}
@@ -270,7 +270,7 @@ index 6bfcdd7fa..65eff2fe3 100644
  /* The following functions sit in the syscall error monad, but include the
   * exception cases for the preemptible bottom end, as they call the invoke
   * functions directly.  This is a significant deviation from the Haskell
-@@ -940,6 +1036,14 @@ exception_t decodeTCBInvocation(word_t invLabel, word_t length, cap_t cap,
+@@ -945,6 +1041,14 @@ exception_t decodeTCBInvocation(word_t invLabel, word_t length, cap_t cap,
      case TCBSetFlags:
          return decodeSetFlags(cap, length, call, buffer);
  
