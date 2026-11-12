@@ -63,11 +63,11 @@ else
 fi
 $mk_stanza
 multiboot2 "\$l4h/bios/kernel.elf" console_port=\$serial_port debug_port=\$serial_port\$fbcon
-module2 "\$l4h/bios/l4h-root.elf"
-module2 "\$l4h/bios/vmlinux" guest-kernel
-if [ -f "\$l4h/bios/kmods.erofs" ]; then module2 "\$l4h/bios/kmods.erofs" guest-kmods; fi
-if [ -f "\$l4h/dom0/initrd" ]; then module2 "\$l4h/dom0/initrd" dom0-initrd; fi
-if [ -f "\$l4h/l4h.conf" ]; then module2 "\$l4h/l4h.conf" l4h-config; fi
+module2 --nounzip "\$l4h/bios/l4h-root.elf"
+module2 --nounzip "\$l4h/bios/vmlinux" guest-kernel
+if [ -f "\$l4h/bios/kmods.erofs" ]; then module2 --nounzip "\$l4h/bios/kmods.erofs" guest-kmods; fi
+if [ -f "\$l4h/dom0/initrd" ]; then module2 --nounzip "\$l4h/dom0/initrd" dom0-initrd; fi
+if [ -f "\$l4h/l4h.conf" ]; then module2 --nounzip "\$l4h/l4h.conf" l4h-config; fi
 boot
 echo "l4h: boot failed"
 CFG

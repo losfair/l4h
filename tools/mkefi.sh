@@ -99,13 +99,16 @@ $acpi_cmd
 # rejects the file and frees the buffer.
 if load_env --file (memdisk)/boot/vmlinux; then true; fi
 $mk_stanza
+# --nounzip: every module is the file's bytes, which root measures and a
+# verifier hashes. Once gzio is loaded (probing devices loads it, for
+# btrfs, zfs or squash4) GRUB would otherwise gunzip a gzip initramfs.
 multiboot2 (memdisk)/boot/kernel.elf console_port=\$serial_port debug_port=\$serial_port\$fbcon
-module2 (memdisk)/boot/l4h-root.elf
-module2 (memdisk)/boot/vmlinux guest-kernel
-${guest_kmods:+module2 (memdisk)/boot/kmods.erofs guest-kmods}
+module2 --nounzip (memdisk)/boot/l4h-root.elf
+module2 --nounzip (memdisk)/boot/vmlinux guest-kernel
+${guest_kmods:+module2 --nounzip (memdisk)/boot/kmods.erofs guest-kmods}
 if [ -n "\$esp" ]; then
-    if [ -f "(\$esp)/l4h/dom0/initrd" ]; then module2 "(\$esp)/l4h/dom0/initrd" dom0-initrd; fi
-    if [ -f "(\$esp)/l4h/l4h.conf" ]; then module2 "(\$esp)/l4h/l4h.conf" l4h-config; fi
+    if [ -f "(\$esp)/l4h/dom0/initrd" ]; then module2 --nounzip "(\$esp)/l4h/dom0/initrd" dom0-initrd; fi
+    if [ -f "(\$esp)/l4h/l4h.conf" ]; then module2 --nounzip "(\$esp)/l4h/l4h.conf" l4h-config; fi
 fi
 boot
 echo "l4h: boot failed"
