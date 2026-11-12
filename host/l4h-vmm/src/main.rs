@@ -96,7 +96,7 @@ impl Dev {
     fn complete(&mut self, mem: &GuestMem, vcpus: &Vcpus) {
         match self {
             Dev::Blk(d) => d.complete(mem, vcpus),
-            Dev::Net(d) => d.complete(mem, vcpus),
+            Dev::Net(d) => d.update_config(vcpus),
             Dev::Gpu(d) => d.complete(mem, vcpus),
             Dev::Usb(_) => {}
         }
@@ -152,12 +152,15 @@ fn main(info: &'static Info) -> ! {
         let mut end = l4h_rt::timeout_ms(8000);
         let mut refused = false;
         while !end() {
-            let p = tcb.tcb_set_priority(tcb, host::PRIO_VMM);
-            let m = tcb.tcb_set_mc_priority(tcb, host::PRIO_VMM);
-            if p.is_err() && m.is_err() && !refused {
-                refused = true;
-                l4h_rt::log!("VMMGUARD: self-boost refused");
+            if !refused {
+                let p = tcb.tcb_set_priority(tcb, host::PRIO_VMM);
+                let m = tcb.tcb_set_mc_priority(tcb, host::PRIO_VMM);
+                if p.is_err() && m.is_err() {
+                    refused = true;
+                    l4h_rt::log!("VMMGUARD: self-boost refused");
+                }
             }
+            core::hint::spin_loop();
         }
         if !refused { l4h_rt::log!("VMMGUARD: FAIL: no demotion"); }
         tcb.tcb_set_priority(tcb, 0).expect("test yield to guest");
@@ -320,6 +323,10 @@ impl l4h_rt::ipc::Server for Vmm<'_> {
                 if badge & u.badge != 0 {
                     vcpus.raise(u.vcpu, u.event);
                 }
+                continue;
+            }
+            if let Dev::Net(d) = d {
+                net::signal(d, mem, vcpus, badge & recv::DONE != 0, badge & recv::KICK != 0);
                 continue;
             }
             if badge & recv::DONE != 0 {

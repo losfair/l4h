@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Exercise the VMM guard's kernel mechanism with two continuously runnable
- * threads. The VMM has only its own TCB capability, not root's authority. */
+/* Exercise the VMM guard against both guest scheduling bands. The VMM
+ * has only its own TCB capability, not root's authority. */
 #include <sel4/sel4.h>
 #include "vmm-priorities.h"
 
 __thread seL4_IPCBuffer *__sel4_ipc_buffer;
-static char tls[3][4096] __attribute__((aligned(64)));
-static char stacks[2][8192] __attribute__((aligned(16)));
+static char tls[4][4096] __attribute__((aligned(64)));
+static char stacks[3][8192] __attribute__((aligned(16)));
 char vmm_fair_stack[16384] __attribute__((aligned(16)));
 static seL4_BootInfo *bi;
 static seL4_CPtr ut, next_slot;
-static volatile seL4_Word progress[2] __attribute__((aligned(64)));
+static volatile seL4_Word progress[3] __attribute__((aligned(64)));
 static volatile seL4_Word phase, denied, escaped;
-static seL4_Word ipc_va[2];
+static seL4_Word ipc_va[3];
 
 static void say(const char *s) { while (*s) seL4_DebugPutChar(*s++); }
 static void fail(const char *s) {
@@ -29,9 +29,12 @@ static seL4_CPtr object(seL4_Word type, seL4_Word bits) {
 
 static void worker(seL4_Word id) {
     __sel4_ipc_buffer = (seL4_IPCBuffer *)ipc_va[id];
+    seL4_Word tested = 0;
     for (;;) {
-        seL4_Word n = __atomic_add_fetch(&progress[id], 1, __ATOMIC_RELAXED);
-        if (!id && __atomic_load_n(&phase, __ATOMIC_ACQUIRE) && !(n & 4095)) {
+        __atomic_add_fetch(&progress[id], 1, __ATOMIC_RELAXED);
+        seL4_Word current = __atomic_load_n(&phase, __ATOMIC_ACQUIRE);
+        if (!id && current != tested) {
+            tested = current;
             /* Slot 1 is this thread's TCB, including when used as authority. */
             int a = seL4_TCB_SetPriority(1, 1, VMM_PRIO);
             int b = seL4_TCB_SetMCPriority(1, 1, VMM_PRIO);
@@ -84,7 +87,7 @@ static void interval(void) {
 }
 
 void vmm_fair_main(seL4_BootInfo *bootinfo) {
-    seL4_Word tp = (seL4_Word)(tls[2] + sizeof(tls[2]) - 64);
+    seL4_Word tp = (seL4_Word)(tls[3] + sizeof(tls[3]) - 64);
     *(seL4_Word *)tp = tp;
     seL4_TCB_SetTLSBase(seL4_CapInitThreadTCB, tp);
     __sel4_ipc_buffer = bootinfo->ipcBuffer;
@@ -102,25 +105,35 @@ void vmm_fair_main(seL4_BootInfo *bootinfo) {
                                      0x8000000000ul, seL4_X86_Default_VMAttributes));
     CHECK(seL4_X86_PageTable_Map(object(seL4_X86_PageTableObject, 0), seL4_CapInitThreadVSpace,
                                  0x8000000000ul, seL4_X86_Default_VMAttributes));
-    seL4_CPtr vs = object(seL4_SchedContextObject, 9), us = object(seL4_SchedContextObject, 9);
-    seL4_CPtr user = start(1, us, VMM_FAIR);
+    seL4_CPtr vs = object(seL4_SchedContextObject, SC_BITS), us = object(seL4_SchedContextObject, SC_BITS);
+    seL4_CPtr ks = object(seL4_SchedContextObject, SC_BITS);
+    seL4_CPtr user = start(1, us, GUEST_USER);
+    seL4_CPtr kernel = start(2, ks, GUEST_KERNEL);
     seL4_CPtr vmm = start(0, vs, VMM_PRIO);
-    (void)consumed(vs); (void)consumed(us);
+    (void)consumed(vs); (void)consumed(us); (void)consumed(ks);
     interval();
-    if (consumed(vs) < 50000 || consumed(us) > 1000) fail("initial priority boost");
+    if (consumed(vs) < 50000 || consumed(us) > 1000 || consumed(ks) > 1000) fail("initial priority boost");
     CHECK(seL4_TCB_SetMCPriority(vmm, seL4_CapInitThreadTCB, VMM_FAIR));
     CHECK(seL4_TCB_SetPriority(vmm, seL4_CapInitThreadTCB, VMM_FAIR));
+    CHECK(seL4_SchedControl_ConfigureFlags(bi->schedcontrol.start + 1, vs, BG_BUDGET, BG_PERIOD, SC_REFILLS, 0, 0));
     __atomic_store_n(&phase, 1, __ATOMIC_RELEASE);
     interval();
-    if (consumed(vs) < 10000 || consumed(us) < 10000 || !__atomic_load_n(&progress[1], __ATOMIC_RELAXED)) fail("round-robin progress");
+    if (consumed(vs) < 10000 || consumed(ks) < 10000 || !__atomic_load_n(&progress[2], __ATOMIC_RELAXED)) fail("guest kernel starved VMM");
+    /* A kernel spinning for an I/O reply cannot prevent the VMM running.
+     * Once that kernel blocks, the VMM must leave time for guest users. */
+    CHECK(seL4_TCB_Suspend(kernel));
+    (void)consumed(vs); (void)consumed(us);
+    interval();
+    if (consumed(vs) < 10000 || consumed(us) < 10000 || !__atomic_load_n(&progress[1], __ATOMIC_RELAXED)) fail("guest user progress");
     if (!__atomic_load_n(&denied, __ATOMIC_RELAXED) || __atomic_load_n(&escaped, __ATOMIC_ACQUIRE)) fail("VMM regained authority");
     /* Its parent can restore the boost without restoring the VMM's MCP. */
     CHECK(seL4_TCB_SetPriority(vmm, seL4_CapInitThreadTCB, VMM_PRIO));
+    __atomic_store_n(&phase, 2, __ATOMIC_RELEASE);
     interval();
-    if (__atomic_load_n(&escaped, __ATOMIC_ACQUIRE)) fail("restored boost restored authority");
+    if (__atomic_load_n(&escaped, __ATOMIC_ACQUIRE) || __atomic_load_n(&denied, __ATOMIC_RELAXED) != 2) fail("restored boost restored authority");
     CHECK(seL4_TCB_Suspend(vmm));
     CHECK(seL4_TCB_Suspend(user));
-    say("VMMFAIR: PASS (guest progress, authority ceiling, parent boost)\n");
+    say("VMMFAIR: PASS (kernel/user progress, authority ceiling, parent boost)\n");
     for (;;) seL4_Yield();
 }
 

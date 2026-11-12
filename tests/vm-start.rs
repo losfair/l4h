@@ -1,13 +1,13 @@
 //! The production CTL_VM_START handler with a guest that records its boot.
 #[path = "../host/l4h-host/src/errno.rs"]
 mod errno;
-use errno::{EBUSY, EINVAL, ENOENT, ENOMEM, Errno};
+use errno::{EBUSY, EINVAL, EIO, ENOENT, ENOMEM, Errno};
 use l4h_abi as abi;
 
 const MAX_GUESTS: usize = 2;
 
 #[derive(PartialEq, Eq)]
-enum State { Created }
+enum State { Created, Stopped }
 struct Kernel { end: usize }
 struct Wins { a: () }
 
@@ -49,7 +49,7 @@ mod guest {
     }
 }
 
-struct Vmmgr { guests: [Option<Guest>; MAX_GUESTS], kernel: Option<Kernel>, alloc: (), wins: Wins, info: (), started: usize }
+struct Vmmgr { guests: [Option<Guest>; MAX_GUESTS], kernel: Option<Kernel>, alloc: (), wins: Wins, info: (), started: usize, fail_start: bool }
 impl Vmmgr {
     fn with_guest<R>(&mut self, id: usize, f: impl FnOnce(&mut Self, &mut Guest) -> R) -> Option<R> {
         let mut g = self.guests[id].take()?;
@@ -60,10 +60,12 @@ impl Vmmgr {
     fn can_afford(&self, _: usize, _: usize, _: usize) -> bool { true }
     /// As the production one, nothing here is refused: what the VMM takes
     /// was reserved.
-    fn spawn_vmm(&mut self, g: &mut Guest) {
+    fn spawn_vmm(&mut self, g: &mut Guest) -> Result<(), Errno> {
+        if self.fail_start { g.state = State::Stopped; return Err(EIO); }
         g.reserved = g.reserved.checked_sub(VMM + MAPS).expect("the VMM's memory was reserved");
         g.vmm = Some(());
         self.started += 1;
+        Ok(())
     }
 }
 
@@ -71,7 +73,7 @@ fn guest(root_pending: bool, host: usize) -> Guest {
     Guest { state: State::Created, vmm: None, root_pending, reserved: 0, host, boots: 0 }
 }
 fn vmmgr(g: Guest) -> Vmmgr {
-    Vmmgr { guests: [None, Some(g)], kernel: Some(Kernel { end: 0 }), alloc: (), wins: Wins { a: () }, info: (), started: 0 }
+    Vmmgr { guests: [None, Some(g)], kernel: Some(Kernel { end: 0 }), alloc: (), wins: Wins { a: () }, info: (), started: 0, fail_start: false }
 }
 fn start() -> abi::CtlReq {
     abi::CtlReq { op: abi::CTL_VM_START, args: [1, 0, 0, 0, 0, 0], ..unsafe { core::mem::zeroed() } }
@@ -116,4 +118,13 @@ fn start_of_a_started_guest_is_busy() {
     assert_eq!(execute(&mut h, 1, &start()), Err(EINVAL));
     let none = abi::CtlReq { args: [0, 0, 0, 0, 0, 0], ..start() };
     assert_eq!(execute(&mut h, 1, &none), Err(ENOENT));
+}
+
+#[test]
+fn scheduling_failure_is_reported_by_the_public_start_handler() {
+    let mut h = vmmgr(guest(false, BOOT + VMM + MAPS));
+    h.fail_start = true;
+    assert_eq!(execute(&mut h, 0, &start()), Err(EIO));
+    assert!(matches!(h.guests[1].as_ref().unwrap().state, State::Stopped));
+    assert_eq!(h.started, 0);
 }

@@ -53,16 +53,17 @@ pub const TEST_INJECT: bool = match option_env!("L4H_TEST_INJECT") {
 };
 
 /// Host priorities, around guest vCPUs' `PRIO_KERNEL`: logd above vCPUs,
-/// so that a busy guest cannot starve it, and below the VMMs, which it must
+/// so that a busy guest cannot starve it, and below boosted VMMs, which it must
 /// not delay; then the services VMMs call, and which root waits for.
 pub const PRIO_LOGD: u64 = l4h_abi::PRIO_KERNEL + 1;
 pub const PRIO_VMM: u64 = l4h_abi::PRIO_KERNEL + 2;
-/// A VMM dominating its core shares the guest-user scheduling band.
-pub const PRIO_VMM_FAIR: u64 = l4h_abi::PRIO_USER;
+/// Throttled VMMs stay above guest kernels; their combined SC budgets
+/// leave CPU time for guests. Their MCP still cannot restore the I/O boost.
+pub const PRIO_VMM_FAIR: u64 = l4h_abi::PRIO_KERNEL + 1;
 pub const PRIO_SERVICE: u64 = l4h_abi::PRIO_KERNEL + 3;
-/// A throttled VMM makes many short IPC turns: keep 16 MCS refills.
-pub const VMM_SC_BITS: usize = 9;
-pub const VMM_EXTRA_REFILLS: u64 = 14;
+/// Guest and VMM scheduling contexts keep 16 refills for short IPC turns.
+pub const GUEST_SC_BITS: usize = 9;
+pub const GUEST_EXTRA_REFILLS: u64 = 14;
 
 /// Maximum devices attached to one guest.
 pub const MAX_GUEST_DEVICES: usize = l4h_abi::MAX_DEVICES;

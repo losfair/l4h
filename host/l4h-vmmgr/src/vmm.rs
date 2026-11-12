@@ -119,13 +119,13 @@ pub fn spawn(
     asids: &mut AsidPools,
     host_info: &HostInfo,
     limits: crate::sched::budget::Plan,
-) -> Component {
+) -> sel4::Result<Component> {
     let backends = core::mem::take(&mut g.backends);
     let comp = CONFIG.with(|cfg| {
         *cfg = core::mem::MaybeUninit::zeroed();
         create(g, unsafe { cfg.assume_init_mut() }, &backends, alloc, win, asids, host_info, limits)
     });
-    map(g, &comp, &backends, alloc);
+    if let Ok(comp) = &comp { map(g, comp, &backends, alloc); }
     g.backends = backends;
     comp
 }
@@ -140,7 +140,7 @@ fn create(
     asids: &mut AsidPools,
     host_info: &HostInfo,
     limits: crate::sched::budget::Plan,
-) -> Component {
+) -> sel4::Result<Component> {
     cfg.guest_id = g.id as u32;
     cfg.nr_vcpus = g.vcpus.len() as u32;
     cfg.io_pool_gpa = g.pool.gpa as u64;
@@ -208,7 +208,7 @@ fn create(
         cnode: Some(g.vmm_cnodes.as_ref().expect("VMM CNodes").cspace),
         cnode_bits: None,
     };
-    component::create(
+    component::try_create(
         &args, alloc, &mut g.arena, win, &mut |alloc, vspace| asids.assign(alloc, vspace),
         &host_info.spawn_context(core),
     )

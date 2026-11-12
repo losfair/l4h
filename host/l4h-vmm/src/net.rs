@@ -10,8 +10,8 @@ use l4h_rt::host::net::{self, Port};
 use l4h_rt::host::spsc::{Consumer, Producer};
 use l4h_rt::sel4;
 
-use crate::dev::Backend;
-use crate::guest::GuestMem;
+use crate::dev::{Backend, Device};
+use crate::guest::{GuestMem, Vcpus};
 use crate::virtq::{Buf, Queue};
 
 const VIRTIO_ID_NET: u32 = 1;
@@ -33,6 +33,18 @@ const QUEUE_SIZE: u32 = 256;
 /// Count every chain, including malformed packets: a producer on another
 /// vCPU must not keep one handler from returning to the IPC loop.
 const BATCH: usize = 32;
+
+/// Merge completions, kicks and previously deferred work into one poll.
+/// Device::complete also retries queues, so using it here would process
+/// two batches before even returning to the server's notification loop.
+pub fn signal(d: &mut Device<Net>, mem: &GuestMem, vcpus: &Vcpus, done: bool, kicked: bool) {
+    let more = core::mem::take(&mut d.backend.more);
+    let retry = done && d.backend.pending();
+    if done { d.update_config(vcpus); }
+    if retry || kicked || more != 0 {
+        d.poll(mem, vcpus, more | if retry { (1 << RX) | (1 << TX) } else { 0 });
+    }
+}
 
 /// The buffers of one chain (see Queue::chain).
 type Chain = ArrayVec<Buf, { QUEUE_SIZE as usize }>;

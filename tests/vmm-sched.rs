@@ -27,7 +27,7 @@ mod kernel {
             pub fn tcb_set_priority(&self, authority: Self, priority: u64) -> Result<(), ()> {
                 assert_eq!(authority.0, 0);
                 crate::MODEL.with_borrow_mut(|m| {
-                    if m.fail_priority { return Err(()); }
+                    if m.fail_priority == Some(self.0) { return Err(()); }
                     m.priorities.get_mut(&self.0).unwrap().1 = priority;
                     m.priority_calls.push((self.0, "priority", priority));
                     Ok(())
@@ -42,9 +42,10 @@ mod kernel {
                 assert!(budget > 0 && budget <= period);
                 crate::MODEL.with_borrow_mut(|m| {
                     m.calls.push(sc.0);
+                    if m.fail_config == Some(sc.0) { return Err(()); }
                     m.limits.insert(sc.0, (self.0, budget, period, refills));
-                });
-                Ok(())
+                    Ok(())
+                })
             }
         }
     }
@@ -68,11 +69,12 @@ struct Model {
     calls: Vec<u64>,
     priorities: BTreeMap<u64, (u64, u64)>,
     priority_calls: Vec<(u64, &'static str, u64)>,
-    fail_priority: bool,
+    fail_priority: Option<u64>,
+    fail_config: Option<u64>,
     suspended: Vec<u64>,
 }
 thread_local! { static MODEL: RefCell<Model> = RefCell::new(Model { limits: BTreeMap::new(), used: BTreeMap::new(), calls: Vec::new(),
-    priorities: BTreeMap::new(), priority_calls: Vec::new(), fail_priority: false, suspended: Vec::new() }); }
+    priorities: BTreeMap::new(), priority_calls: Vec::new(), fail_priority: None, fail_config: None, suspended: Vec::new() }); }
 mod slot {
     pub struct Slot;
     pub const TCB: Slot = Slot;
@@ -109,7 +111,7 @@ struct Vmmgr { info: HostInfo, guests: Vec<Option<Guest>> }
 impl Vmmgr { fn guest(&self, id: usize) -> Option<&Guest> { self.guests.get(id)?.as_ref() } }
 fn manager() -> Vmmgr {
     MODEL.with_borrow_mut(|m| { m.limits.clear(); m.used.clear(); m.calls.clear(); m.priorities.clear();
-        m.priority_calls.clear(); m.fail_priority = false; m.suspended.clear(); });
+        m.priority_calls.clear(); m.fail_priority = None; m.fail_config = None; m.suspended.clear(); });
     Vmmgr { info: HostInfo { timeslice_us: 5000, tsc_hz: 1_000_000, cores: 1, topology: topology::Topology::flat(1) },
         guests: (0..MAX_GUESTS).map(|_| None).collect() }
 }
@@ -123,10 +125,10 @@ fn create(id: usize, core: usize, cap: u32, vcpus: usize) -> Guest {
 }
 fn spawn(h: &mut Vmmgr, id: usize, core: usize, cap: u32, vcpus: usize) {
     let mut g = create(id, core, cap, vcpus);
-    let p = sched::prepare_vmm(h, &mut g);
+    let p = sched::prepare_vmm(h, &mut g).unwrap();
     let sc = sel4::cap::SchedContext((id * 10 + 9) as u64);
     // These are exactly the limits passed to component::create, before Resume.
-    h.info.sched_control(core).sched_control_configure_flags(sc, p.vmm, p.vmm_period, l4h_host::VMM_EXTRA_REFILLS, 0, 0).unwrap();
+    h.info.sched_control(core).sched_control_configure_flags(sc, p.vmm, p.vmm_period, l4h_host::GUEST_EXTRA_REFILLS, 0, 0).unwrap();
     MODEL.with_borrow_mut(|m| { m.priorities.insert(sc.0, (l4h_host::PRIO_VMM, l4h_host::PRIO_VMM)); });
     g.vmm = Some(Component { sc, tcb: sel4::cap::Tcb(sc.0) });
     g.state = State::Running;
@@ -141,8 +143,9 @@ fn assert_limits(h: &Vmmgr) {
             assert_eq!(m.limits[&g.vmm.as_ref().unwrap().sc.0], (core, p.vmm, p.vmm_period, 14));
         });
         if g.cpu_cap_pct > 0 {
-            assert_eq!(p.kernel + p.user + p.vmm, p.period * g.cpu_cap_pct as u64 / 100);
-        } else {
+            assert!((p.kernel + p.user) as u128 * p.vmm_period as u128 + p.vmm as u128 * p.period as u128
+                <= (p.period * g.cpu_cap_pct as u64 / 100) as u128 * p.vmm_period as u128);
+        } else if g.vmm_boosted {
             assert_eq!((p.vmm, p.vmm_period), (5000, 5000));
         }
     }
@@ -177,7 +180,7 @@ fn changing_caps_reconfigures_the_vmm_and_both_guest_contexts() {
     let mut h = manager();
     spawn(&mut h, 0, 0, 0, 2);
     for cap in [50, 1, 99, 100, 0] {
-        assert!(sched::set_cap(&mut h, 0, cap));
+        assert_eq!(sched::set_cap(&mut h, 0, cap), Ok(()));
         assert_limits(&h);
         MODEL.with_borrow(|m| {
             let (_, k, period, _) = m.limits[&3];
@@ -240,7 +243,7 @@ fn a_guest_split_change_does_not_refill_an_unchanged_vmm_budget() {
 }
 
 #[test]
-fn dominating_vmms_lose_authority_before_their_priority_and_keep_their_budgets() {
+fn dominating_vmms_share_a_background_allowance_and_cannot_restore_their_authority() {
     let mut h = manager();
     spawn(&mut h, 0, 0, 0, 1);
     spawn(&mut h, 1, 0, 0, 1);
@@ -249,18 +252,19 @@ fn dominating_vmms_lose_authority_before_their_priority_and_keep_their_budgets()
     sched::balance(&mut h, 100_000);
     assert!(!h.guest(0).unwrap().vmm_boosted && !h.guest(1).unwrap().vmm_boosted);
     MODEL.with_borrow(|m| {
-        assert_eq!(m.priority_calls, vec![(9, "mcp", 99), (9, "priority", 99), (19, "mcp", 99), (19, "priority", 99)]);
-        assert_eq!(m.calls.len(), calls, "demotion must not refill an SC");
+        assert_eq!(m.priority_calls, vec![(9, "mcp", 101), (9, "priority", 101), (19, "mcp", 101), (19, "priority", 101)]);
+        assert_eq!(&m.calls[calls..], &[9, 19], "only VMM limits change on demotion");
+        assert_eq!(m.limits[&9].1 * 4, m.limits[&9].2);
     });
     // A continuously busy VMM must not oscillate back to high priority.
-    MODEL.with_borrow_mut(|m| m.used.extend([(9, 50_000), (1, 50_000)]));
+    MODEL.with_borrow_mut(|m| m.used.extend([(9, 25_000), (19, 25_000), (1, 50_000)]));
     sched::balance(&mut h, 100_000);
     assert!(!h.guest(0).unwrap().vmm_boosted);
     // After quiescence only the parent restores priority, keeping MCP low.
     MODEL.with_borrow_mut(|m| m.used.extend([(9, 1000), (1, 50_000)]));
     sched::balance(&mut h, 100_000);
     assert!(h.guest(0).unwrap().vmm_boosted);
-    MODEL.with_borrow(|m| assert_eq!(m.priorities[&9], (99, l4h_host::PRIO_VMM)));
+    MODEL.with_borrow(|m| assert_eq!(m.priorities[&9], (101, l4h_host::PRIO_VMM)));
     assert_limits(&h);
 }
 
@@ -272,14 +276,103 @@ fn a_vmm_spinning_before_guest_start_is_also_demoted() {
     MODEL.with_borrow_mut(|m| { m.used.insert(9, 100_000); });
     sched::balance(&mut h, 100_000);
     assert!(!h.guest(0).unwrap().vmm_boosted);
+    assert_eq!(h.guest(0).unwrap().vmm_usage, 1000, "pre-READY CPU must be visible to management");
 }
 
 #[test]
 fn a_failed_priority_reduction_stops_the_guest() {
     let mut h = manager();
     spawn(&mut h, 0, 0, 0, 1);
-    MODEL.with_borrow_mut(|m| { m.used.insert(9, 100_000); m.fail_priority = true; });
+    spawn(&mut h, 1, 0, 0, 1);
+    MODEL.with_borrow_mut(|m| { m.used.extend([(9, 50_000), (19, 50_000)]); m.fail_priority = Some(9); });
     sched::balance(&mut h, 100_000);
     assert_eq!(h.guest(0).unwrap().state, State::Stopped);
     MODEL.with_borrow(|m| assert_eq!(m.suspended, vec![9]));
+    assert!(!h.guest(1).unwrap().vmm_boosted, "later guests must still be protected this pass");
+}
+
+#[test]
+fn a_failed_priority_update_does_not_skip_a_chosen_migration() {
+    let mut h = manager();
+    h.info.cores = 2;
+    h.info.topology = topology::Topology::flat(2);
+    for id in 0..4 { spawn(&mut h, id, 0, 0, 1); }
+    for id in [0, 1, 3] { h.guests[id].as_mut().unwrap().vcpus[0].cooldown = 10; }
+    MODEL.with_borrow_mut(|m| {
+        m.used.extend([(9, 40_000), (19, 40_000), (21, 25_000), (31, 25_000)]);
+        m.fail_priority = Some(9);
+    });
+    sched::balance(&mut h, 100_000);
+    assert_eq!(h.guest(0).unwrap().state, State::Stopped);
+    assert_eq!(h.guest(2).unwrap().vcpus[0].core, 1);
+}
+
+#[test]
+fn one_spinner_does_not_remove_its_quiet_neighbours_boost() {
+    let mut h = manager();
+    spawn(&mut h, 0, 0, 0, 1);
+    spawn(&mut h, 1, 0, 0, 1);
+    MODEL.with_borrow_mut(|m| m.used.extend([(9, 99_000), (19, 1000)]));
+    sched::balance(&mut h, 100_000);
+    assert!(!h.guest(0).unwrap().vmm_boosted);
+    assert!(h.guest(1).unwrap().vmm_boosted);
+    // Even a previously demoted neighbour recovers under pressure.
+    h.guests[1].as_mut().unwrap().vmm_boosted = false;
+    MODEL.with_borrow_mut(|m| m.used.extend([(9, 99_000), (19, 0)]));
+    sched::balance(&mut h, 100_000);
+    assert!(h.guest(1).unwrap().vmm_boosted);
+}
+
+#[test]
+fn steady_io_after_vcpu_migration_keeps_its_boost() {
+    let mut h = manager();
+    h.info.cores = 2;
+    h.info.topology = topology::Topology::flat(2);
+    spawn(&mut h, 0, 0, 0, 1);
+    h.guests[0].as_mut().unwrap().vcpus[0].core = 1;
+    MODEL.with_borrow_mut(|m| m.used.extend([(9, 10_000), (1, 80_000)]));
+    sched::balance(&mut h, 100_000);
+    assert!(h.guest(0).unwrap().vmm_boosted);
+    assert!(MODEL.with_borrow(|m| m.priority_calls.is_empty()));
+}
+
+#[test]
+fn partial_scheduling_failures_stop_only_the_affected_guest_without_committing_shares() {
+    for failed in [1, 2, 9] {
+        let mut h = manager();
+        spawn(&mut h, 0, 0, 50, 1);
+        spawn(&mut h, 1, 0, 0, 1);
+        let g = h.guest(0).unwrap();
+        let before = (g.vcpus[0].k_share, g.vmm_share, g.vmm_limits);
+        MODEL.with_borrow_mut(|m| { m.fail_config = Some(failed); m.used.extend([(1, 100), (2, 100), (9, 12_500)]); });
+        sched::balance(&mut h, 100_000);
+        let g = h.guest(0).unwrap();
+        assert_eq!(g.state, State::Stopped);
+        assert_eq!((g.vcpus[0].k_share, g.vmm_share, g.vmm_limits), before);
+        assert_eq!(h.guest(1).unwrap().state, State::Running);
+    }
+}
+
+#[test]
+fn a_failed_cap_change_reports_io_error_and_stops_the_guest() {
+    let mut h = manager();
+    spawn(&mut h, 0, 0, 50, 1);
+    MODEL.with_borrow_mut(|m| m.fail_config = Some(9));
+    assert_eq!(sched::set_cap(&mut h, 0, 25), Err(l4h_host::errno::EIO));
+    assert_eq!(h.guest(0).unwrap().state, State::Stopped);
+    assert_eq!(sched::set_cap(&mut h, 63, 25), Err(l4h_host::errno::ENOENT));
+}
+
+#[test]
+fn a_failed_start_budget_stops_the_new_guest_instead_of_panicking() {
+    for failed in [11, 12] {
+        let mut h = manager();
+        spawn(&mut h, 0, 0, 0, 1);
+        let mut g = create(1, 0, 50, 1);
+        MODEL.with_borrow_mut(|m| m.fail_config = Some(failed));
+        assert!(sched::prepare_vmm(&mut h, &mut g).is_none());
+        assert_eq!(g.state, State::Stopped);
+        assert!(g.vmm_limits.is_none());
+        assert_eq!(h.guest(0).unwrap().state, State::Running);
+    }
 }

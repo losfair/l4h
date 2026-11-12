@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 extern crate self as l4h_rt;
 pub use l4h_host as host;
+use l4h_abi as abi;
 use std::cell::Cell;
 
 pub mod sel4 {
@@ -16,6 +17,8 @@ pub mod sel4 {
 #[path = "../host/l4h-vmm/src/mem.rs"] mod memory;
 mod guest {
     use super::*;
+    pub struct Vcpus { pub n: usize }
+    impl Vcpus { pub fn raise(&self, _: usize, _: u32) {} }
     pub struct GuestMem {
         pub inner: memory::GuestMem,
         pub reads: Cell<usize>,
@@ -53,10 +56,7 @@ mod guest {
 }
 #[derive(Debug)] struct AuditStop;
 #[path = "../host/l4h-vmm/src/virtq.rs"] mod virtq;
-mod dev {
-    use crate::{guest::GuestMem, virtq::Queue};
-    include!(env!("L4H_VMM_BACKEND_TEST_SRC"));
-}
+#[path = "../host/l4h-vmm/src/dev.rs"] mod dev;
 #[path = "../host/l4h-vmm/src/net.rs"] mod network;
 
 #[test]
@@ -80,7 +80,7 @@ fn transmit(invalid: bool) {
     assert!(queues[1].setup(&mem, 1, 256, 0, 0x1000, 0x2000));
     assert!(net.kick(&mem, &mut queues, 1));
     let batch = mem.reads.get();
-    assert!(batch > 0 && batch <= 256, "one handler must yield within a queue's size");
+    assert_eq!(batch, 32, "one handler must return after exactly one bounded batch");
     assert_eq!(net.more, 1 << 1);
     assert_eq!(queues[1].used_idx(), batch as u16);
     // No fresh signal is needed to process the next batch.
@@ -110,7 +110,7 @@ fn a_replenished_receive_ring_yields_and_keeps_its_next_turn() {
     assert!(queues[0].setup(&mem, 1, 256, 0, 0x1000, 0x2000));
     assert!(net.kick(&mem, &mut queues, 0));
     let batch = mem.reads.get();
-    assert!(batch > 0 && batch <= 256);
+    assert_eq!(batch, 32);
     assert_eq!(net.more, 1);
     assert!(net.kick(&mem, &mut queues, 0));
     assert_eq!(mem.reads.get(), 2 * batch);
@@ -122,5 +122,61 @@ fn a_replenished_receive_ring_yields_and_keeps_its_next_turn() {
     net.more = 3;
     net.reset();
     assert_eq!(net.more, 0);
+    unsafe { std::alloc::dealloc(chan.cast(), layout); }
+}
+
+#[test]
+fn simultaneous_done_kick_and_deferred_work_process_only_one_batch() {
+    use dev::Backend;
+    let mut bytes = vec![0u8; 0x4000];
+    let mem = guest::GuestMem {
+        inner: memory::GuestMem { base: bytes.as_mut_ptr() as usize, gpa: 0, size: bytes.len() as u64 },
+        reads: Cell::new(0), replenish: Cell::new(false), invalid: true, rx_peer: Cell::new(std::ptr::null_mut()),
+    };
+    let layout = std::alloc::Layout::new::<host::net::Port>();
+    let chan = unsafe { std::alloc::alloc_zeroed(layout).cast::<host::net::Port>() };
+    assert!(!chan.is_null());
+    let mut page = Box::new([0u64; 512]);
+    let regs = page.as_mut_ptr().cast::<abi::VirtioRegs>();
+    let backend = network::Net::new(chan as usize, sel4::cap::Notification, [2; 6], 256);
+    let mut d = dev::Device::new(regs as usize, 16, backend);
+    let cpus = guest::Vcpus { n: 1 };
+    unsafe {
+        (*regs).queues[1].ready = 1;
+        (*regs).queues[1].num = 1;
+        (*regs).queues[1].desc = 0;
+        (*regs).queues[1].driver = 0x1000;
+        (*regs).queues[1].device = 0x2000;
+        (*regs).driver_features = dev::VIRTIO_F_VERSION_1 | dev::VIRTIO_F_ACCESS_PLATFORM;
+        (*regs).status = 8;
+    }
+    assert_eq!(d.op(&mem, &cpus, abi::VIRTIO_OP_QUEUE, 1, 0), 0);
+    assert_eq!(d.op(&mem, &cpus, abi::VIRTIO_OP_STATUS, 0, 0), 0);
+    unsafe { (*regs).status = 12; }
+    assert_eq!(d.op(&mem, &cpus, abi::VIRTIO_OP_STATUS, 0, 0), 0);
+    mem.reads.set(0);
+    mem.replenish.set(true);
+    d.backend.more = 2;
+    unsafe {
+        (*chan).rx.head.store(1, std::sync::atomic::Ordering::Release);
+        (*regs).kick = 2;
+    }
+    network::signal(&mut d, &mem, &cpus, true, true);
+    assert_eq!(mem.reads.get(), 32, "DONE must not complete and then poll the same queue again");
+    assert_eq!(d.backend.more, 2);
+    network::signal(&mut d, &mem, &cpus, false, false);
+    assert_eq!(mem.reads.get(), 64, "the next IPC turn resumes without a new kick");
+    assert_eq!(d.backend.more, 2);
+    // A DONE without a kick still services newly available backend data.
+    d.backend.more = 0;
+    network::signal(&mut d, &mem, &cpus, true, false);
+    assert_eq!(mem.reads.get(), 96);
+    d.backend.reset();
+    unsafe {
+        (*chan).rx.head.store(0, std::sync::atomic::Ordering::Release);
+        (*chan).rx.tail.store(0, std::sync::atomic::Ordering::Release);
+    }
+    network::signal(&mut d, &mem, &cpus, true, false);
+    assert_eq!(mem.reads.get(), 96, "another device's DONE must not read idle guest queue cache lines");
     unsafe { std::alloc::dealloc(chan.cast(), layout); }
 }

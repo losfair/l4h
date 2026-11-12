@@ -22,6 +22,9 @@ sleep 1
 cpu=$(l4hctl top | awk '$2 == "victim" { split($3,a,"."); print a[1] }')
 [ "${cpu:-0}" -ge 15 ] || fail "victim got only ${cpu:-0}% CPU"
 echo "VMMGUARDTEST: victim progresses at $cpu% CPU on shared core"
+bad_cpu=$(l4hctl top | awk '$2 == "bad" { split($3,a,"."); print a[1] }')
+[ "${bad_cpu:-0}" -ge 10 ] || fail "pre-READY VMM CPU was hidden: ${bad_cpu:-0}%"
+echo "VMMGUARDTEST: pre-READY VMM reports $bad_cpu% CPU"
 for _ in $(seq 60); do
     l4hctl logs >/run/logs || fail logs
     grep -q 'VMMGUARD: FAIL' /run/logs && fail 'VMM regained authority'
@@ -29,7 +32,7 @@ for _ in $(seq 60); do
     sleep 0.2
 done
 grep -q 'VMMGUARD: self-boost refused' /run/logs || fail 'no authority check'
-grep -q 'guest 1 VMM priority 99' /run/logs || fail 'parent did not demote VMM'
+grep -q 'guest 1 VMM priority 101' /run/logs || fail 'parent did not demote VMM'
 grep -q 'guest 1 VMM priority 102' /run/logs || fail 'parent did not restore boost'
 grep -q 'VMMGUARD: parent restored boost with low authority' /run/logs || fail 'no restored-boost authority check'
 for id in $ids; do l4hctl destroy "$id" || fail destroy; done

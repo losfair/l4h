@@ -10,11 +10,16 @@ rustc +stable --edition=2024 --crate-name l4h_abi --crate-type rlib \
 rustc +stable --edition=2024 --crate-name l4h_host --crate-type rlib \
     --extern l4h_abi="$out/libl4h_abi.rlib" "$root/host/l4h-host/src/lib.rs" -o "$out/libl4h_host.rlib"
 cat >"$out/priorities.rs" <<'RS'
+#[allow(dead_code)]
+#[path = "../../host/l4h-vmmgr/src/sched/budget.rs"] mod budget;
 fn main() {
-    println!("#define VMM_PRIO {}\n#define VMM_FAIR {}", l4h_host::PRIO_VMM, l4h_host::PRIO_VMM_FAIR);
+    let p = budget::background(budget::plan(5000, 0, 0, 500, Some(250)), 1);
+    println!("#define VMM_PRIO {}\n#define VMM_FAIR {}\n#define GUEST_USER {}\n#define GUEST_KERNEL {}\n#define BG_BUDGET {}\n#define BG_PERIOD {}\n#define SC_BITS {}\n#define SC_REFILLS {}",
+        l4h_host::PRIO_VMM, l4h_host::PRIO_VMM_FAIR, l4h_abi::PRIO_USER, l4h_abi::PRIO_KERNEL,
+        p.vmm, p.vmm_period, l4h_host::GUEST_SC_BITS, l4h_host::GUEST_EXTRA_REFILLS);
 }
 RS
-rustc +stable --edition=2024 -L dependency="$out" --extern l4h_host="$out/libl4h_host.rlib" \
+rustc +stable --edition=2024 -L dependency="$out" --extern l4h_host="$out/libl4h_host.rlib" --extern l4h_abi="$out/libl4h_abi.rlib" \
     "$out/priorities.rs" -o "$out/priorities"
 "$out/priorities" >"$out/vmm-priorities.h"
 gcc -O2 -Wall -Wextra -Werror -static -nostdlib -ffreestanding -fno-pic -no-pie -fno-stack-protector \

@@ -384,24 +384,31 @@ impl Vmmgr {
             if !g.reserve(&mut h.alloc, g.start_bytes()) {
                 return Err(ctl::ENOMEM);
             }
-            h.spawn_vmm(g);
-            Ok(())
+            h.spawn_vmm(g)
         })
         .ok_or(ctl::ENOENT)?
     }
 
     /// Spawn `g`'s l4h-vmm, within `with_guest`.  The caller checked that
     /// `g` is created, without a VMM or a device root is attaching, and
-    /// reserved `Guest::start_bytes`: nothing here is refused, so a guest
-    /// that was booted for it starts.
-    pub fn spawn_vmm(&mut self, g: &mut Guest) {
+    /// reserved `Guest::start_bytes`. A scheduling failure stops this
+    /// guest and is reported to its caller without taking down vmmgr.
+    pub fn spawn_vmm(&mut self, g: &mut Guest) -> Result<(), Errno> {
+        let limits = sched::prepare_vmm(self, g).ok_or(ctl::EIO)?;
         if g.attest {
             root::trust_register(g);
         }
-        let limits = sched::prepare_vmm(self, g);
-        let v = vmm::spawn(g, &mut self.alloc, &mut self.wins.a, &mut self.asids, &self.info, limits);
+        let v = match vmm::spawn(g, &mut self.alloc, &mut self.wins.a, &mut self.asids, &self.info, limits) {
+            Ok(v) => v,
+            Err(e) => {
+                l4h_rt::log!("l4h-vmmgr: create guest {} VMM scheduling: {:?}", g.id, e);
+                g.stop();
+                return Err(ctl::EIO);
+            }
+        };
         component::start(&v);
         g.vmm = Some(v);
+        Ok(())
     }
 
     /// Give guest `id` (before it starts) a virtio-net device on `switch`.

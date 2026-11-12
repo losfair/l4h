@@ -1,5 +1,5 @@
-//! CPU caps and VMM priority policy, independent of seL4. Uncapped
-//! contexts remain work conserving; vCPU 0 pays for a capped guest's VMM.
+//! CPU caps and VMM priority policy, independent of seL4. Boosted,
+//! uncapped contexts remain work conserving; vCPU 0 pays for its capped VMM.
 
 /// Stay above seL4's minimum budget, derived from the kernel WCET.
 pub const MIN_US: u64 = 200;
@@ -38,20 +38,32 @@ pub fn plan(timeslice: u64, min_period: u64, cap: u32, kernel_share: u32, vmm: O
     Plan { period, kernel, user: guest - kernel, vmm_period: period, vmm: vmm_budget }
 }
 
-/// Elevated priority is for short I/O turns. If VMMs dominate a core,
-/// drop them to the guest-user band; unused CPU remains available there.
-/// Include relative use so higher-priority host work cannot hide a VMM
-/// monopolizing the time left to guests. Ignore less than one quantum
-/// for that comparison, since timer work alone can dominate an idle core.
-/// Restore the boost only after quiescence, preventing busy/quiet priority
-/// oscillation while a VMM still has sustained work.
-pub fn boost(was: bool, used: u64, core_vmm: u64, core_guest: u64, elapsed: u64, quantum: u64) -> bool {
+/// Only VMMs contributing at least the core's average VMM consumption
+/// lose their boost, and only when VMMs consume 80% of wall time there.
+/// Idle capacity or a migrated vCPU is not evidence of contention.
+/// A throttled VMM regains its boost when it uses less than half its
+/// allowance, independently of other VMMs' consumption on that core.
+pub fn boost(was: bool, used: u64, core_vmm: u64, peers: usize, elapsed: u64, old: Plan) -> bool {
     if elapsed == 0 { return was; }
-    let vmm = core_vmm as u128;
-    let crowded = vmm * 5 >= elapsed as u128 * 4
-        || (core_vmm >= quantum && vmm >= core_guest as u128 * 4);
-    if crowded { return false; }
-    was || used as u128 * 100 <= elapsed as u128 * 2
+    if !was {
+        return used as u128 * old.vmm_period as u128 * 2 < old.vmm as u128 * elapsed as u128;
+    }
+    core_vmm as u128 * 5 < elapsed as u128 * 4
+        || used == 0 || (used as u128 * peers as u128) < core_vmm as u128
+}
+
+/// Only VMMs whose boost was withdrawn share this half-core limit.
+/// It leaves time for guest users while priority above guest kernels lets
+/// the VMM service a guest kernel that spins waiting for a device reply.
+/// Other VMMs, including idle ones, do not divide this allowance.
+pub fn background(mut p: Plan, peers: usize) -> Plan {
+    assert!(peers > 0 && peers <= 64);
+    let divisor = 2 * peers as u64;
+    let period = p.vmm_period.max(MIN_US * divisor);
+    p.vmm = (p.vmm as u128 * period as u128 / p.vmm_period as u128)
+        .min((period / divisor) as u128) as u64;
+    p.vmm_period = period;
+    p
 }
 
 /// Adapt only once a context saturated. Consumption ratios survive

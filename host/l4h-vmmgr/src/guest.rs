@@ -1279,7 +1279,7 @@ pub fn create(
         let ktcb = ctx.cap::<cap_type::Tcb>(ObjectBlueprint::Tcb);
         let ep = ctx.cap::<cap_type::Endpoint>(ObjectBlueprint::Endpoint);
         let ntfn = ctx.cap::<cap_type::Notification>(ObjectBlueprint::Notification);
-        let sc_bits = crate::sched::SC_BITS;
+        let sc_bits = host::GUEST_SC_BITS;
         let sc_k = ctx.cap::<cap_type::SchedContext>(ObjectBlueprint::SchedContext { size_bits: sc_bits });
         let sc_u = ctx.cap::<cap_type::SchedContext>(ObjectBlueprint::SchedContext { size_bits: sc_bits });
         let ipcbuf = ctx.cap::<cap_type::Granule>(FRAME_BP);

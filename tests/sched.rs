@@ -56,18 +56,39 @@ fn capped_vmm_and_kernel_shares_follow_their_measured_demand() {
 }
 
 #[test]
-fn a_dominating_vmm_loses_its_boost_until_quiescent() {
-    assert!(budget::boost(true, 20_000, 20_000, 50_000, PERIOD, 5000));
-    assert!(!budget::boost(true, 45_000, 90_000, 10_000, PERIOD, 5000));
-    // A host service using the rest of the core must not hide starvation.
-    assert!(!budget::boost(true, 10_000, 10_000, 2000, PERIOD, 5000));
-    assert!(budget::boost(true, 1000, 1000, 0, PERIOD, 5000));
-    assert!(!budget::boost(false, 50_000, 50_000, 50_000, PERIOD, 5000));
-    assert!(budget::boost(false, 2000, 2000, 50_000, PERIOD, 5000));
-    assert!(!budget::boost(false, 2001, 2001, 50_000, PERIOD, 5000));
-    assert!(!budget::boost(false, 0, 90_000, 10_000, PERIOD, 5000));
-    assert!(budget::boost(true, 0, 0, 0, 0, 5000));
-    assert!(!budget::boost(false, 0, 0, 0, 0, 5000));
+fn only_heavy_vmm_contributors_lose_their_boost() {
+    let p = budget::plan(5000, 0, 0, 500, Some(250));
+    assert!(budget::boost(true, 20_000, 20_000, 1, PERIOD, p));
+    assert!(!budget::boost(true, 45_000, 90_000, 2, PERIOD, p));
+    // A migrated vCPU leaving no guest work on this core is not contention.
+    assert!(budget::boost(true, 10_000, 10_000, 1, PERIOD, p));
+    assert!(budget::boost(true, 1000, 99_000, 2, PERIOD, p));
+    assert!(!budget::boost(true, 98_000, 99_000, 2, PERIOD, p));
+    let p = budget::background(p, 2);
+    assert!(!budget::boost(false, 25_000, 25_000, 2, PERIOD, p));
+    // A quiet neighbour recovers even while the core is still dominated.
+    assert!(budget::boost(false, 1000, 99_000, 2, PERIOD, p));
+    assert!(!budget::boost(false, 12_500, 25_000, 2, PERIOD, p));
+    assert!(budget::boost(true, 0, 0, 1, 0, p));
+    assert!(!budget::boost(false, 0, 0, 1, 0, p));
+    // Many spinning VMMs cannot evade the trigger by splitting the load.
+    assert!(!budget::boost(true, 1000, 64_000, 64, 80_000, p));
+}
+
+#[test]
+fn background_vmms_share_half_a_core_without_exceeding_guest_caps() {
+    for peers in 1..=64 {
+        for cap in 0..=100 {
+            for minimum in [0, 40_000] {
+                let p = budget::plan(5000, minimum, cap, 500, Some(250));
+                let q = budget::background(p, peers);
+                assert!(q.vmm >= budget::MIN_US);
+                assert!(q.vmm * 2 * peers as u64 <= q.vmm_period);
+                assert!(q.vmm as u128 * p.vmm_period as u128 <= p.vmm as u128 * q.vmm_period as u128);
+                assert_eq!((q.kernel, q.user, q.period), (p.kernel, p.user, p.period));
+            }
+        }
+    }
 }
 
 #[test]
