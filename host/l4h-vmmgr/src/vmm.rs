@@ -144,9 +144,8 @@ fn create(
     cfg.io_pool_gpa = g.pool.gpa as u64;
     cfg.io_pool_size = g.pool.size as u64;
     cfg.dom0 = g.dom0 as u32;
-    // Guest consoles go to the serial port only when verbose: each byte is a
-    // kernel print (host::VERBOSE).
-    cfg.serial = host::VERBOSE as u32;
+    // Guest console lines are queued for logd in every build.
+    cfg.serial = 1;
     cfg.epoch_ns = host_info.epoch_ns;
     cfg.epoch_ticks = host_info.epoch_ticks;
     cfg.mem_dev = g.mem_dev.map_or(0, |d| d as u32 + 1);

@@ -90,7 +90,7 @@ jobs:
         run: tools/build-linux.sh vmlinux && ccache -s
       - name: Console rings, hotplug scheduling and hypercalls under console load
         run: tests/run-devicetest.sh --qemu
-      - name: Retained host faults and logs in release mode
+      - name: Retained host logs and serial output in release mode
         run: L4H_RELEASE=1 tests/run-logtest.sh
       - name: Serial output when components, l4h-logd or root fail
         run: tests/run-logdtest.sh

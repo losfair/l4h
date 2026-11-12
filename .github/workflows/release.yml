@@ -75,8 +75,7 @@ jobs:
               lmodern texlive-fonts-recommended
           make -C docs/manual
       - name: Build
-        # Release builds: no kernel assertions or debug syscalls, and the
-        # host prints critical errors only.
+        # Release builds: optimised host, no kernel assertions or debug syscalls.
         env:
           L4H_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
         run: |

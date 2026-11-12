@@ -17,7 +17,6 @@ python3 "$root/tests/skim-qemu.py"
 # Cover a CPU enumerating ARCH_CAPABILITIES but explicitly lacking RDCL_NO.
 L4H_QEMU_CPU=host,vendor=GenuineIntel,-vmx,+invtsc,+arch-capabilities,-rdctl-no,-pcid,-invpcid,-x2apic \
     python3 "$root/tests/skim-qemu.py"
-# Release binaries suppress guest serial output. This test records its
-# result on disk and exercises guest creation, faults and shutdown too.
+# Exercise guest creation, faults, shutdown and serial output in release mode too.
 L4H_RELEASE=1 L4H_SKIM_WINDOW=ON L4H_LAPIC_MODE=XAPIC L4H_PCID=OFF "$root/tools/build-kernel.sh"
 L4H_RELEASE=1 "$root/tests/run-logtest.sh"

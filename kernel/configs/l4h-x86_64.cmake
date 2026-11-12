@@ -37,14 +37,13 @@ set(KernelMultibootGFXHeight "768" CACHE STRING "")
 set(KernelHugePage ON CACHE BOOL "")
 set(KernelTimerTickMS "2" CACHE STRING "")
 # Debug builds by default; L4H_RELEASE=1 tools/build-kernel.sh turns
-# KernelDebugBuild (assertions, debug syscalls) off.  Printing stays on: the
-# host components log to the serial port through the kernel.
+# KernelDebugBuild (assertions, debug syscalls) off. Printing stays on for
+# kernel boot messages and fatal errors; host output goes through logd.
 set(KernelDebugBuild ON CACHE BOOL "")
 set(KernelPrinting ON CACHE BOOL "")
 # Every kernel print is a synchronous serial write with interrupts off, which
 # stalls the core for the whole message.  Spurious interrupts are harmless and
-# frequent under some hypervisors (QEMU/HVF): never report them.  Host
-# components print only critical errors in release builds (host::VERBOSE).
+# frequent under some hypervisors (QEMU/HVF): never report them.
 set(KernelIRQReporting OFF CACHE BOOL "")
 # Debug syscalls (some halt the machine) only for host components: guest
 # threads have an MCP of at most L4H_PRIO_KERNEL (100).
