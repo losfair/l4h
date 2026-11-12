@@ -34,6 +34,23 @@ if udhcpc -i eth0 -n -q -t 10 -s /bin/udhcpc.script >/dev/null 2>&1; then
         fail "download"
     fi
     rm -f /tmp/big
+    # The uplink's driver restarted (a nicd of its own, DESIGN.md §9.8):
+    # carrier comes back, and so do the address and the internet.
+    if l4hctl nic list >/dev/null 2>&1; then
+        step "uplink driver restart"
+        l4hctl nic list | sed 's/^/GCETEST: /'
+        l4hctl nic restart 0 || fail "nic restart"
+        n=0
+        until l4hctl nic list | grep -q "^nic 0: .*, up, .*last: restarted by dom0"; do
+            n=$((n + 1)); [ "$n" -lt 60 ] || break; sleep 1
+        done
+        if [ "$n" -lt 60 ] && udhcpc -i eth0 -n -q -t 10 -s /bin/udhcpc.script >/dev/null 2>&1 \
+            && wget -q -T 15 -O /tmp/idx http://deb.debian.org/debian/dists/trixie/Release 2>/dev/null; then
+            pass "uplink driver restarted in about $n s; DHCP and internet again"
+        else
+            fail "uplink after a driver restart: $(l4hctl nic list | head -1)"
+        fi
+    fi
 else
     fail "DHCP"
 fi
