@@ -145,6 +145,29 @@ fn wall_clock_ns(cfg: &VmmConfig, hz: u64) -> u64 {
 
 fn main(info: &'static Info) -> ! {
     let cfg: &VmmConfig = unsafe { info.config() };
+    // Real-parent regression test: a compromised VMM spins before READY,
+    // tries to undo demotion, then yields long enough to regain its boost.
+    if host::TEST_INJECT && matches!(option_env!("L4H_TEST_VMM_BUSY"), Some("1")) && cfg.guest_id == 1 {
+        let tcb = cap::<cap_type::Tcb>(host::SLOT_TCB);
+        let mut end = l4h_rt::timeout_ms(8000);
+        let mut refused = false;
+        while !end() {
+            let p = tcb.tcb_set_priority(tcb, host::PRIO_VMM);
+            let m = tcb.tcb_set_mc_priority(tcb, host::PRIO_VMM);
+            if p.is_err() && m.is_err() && !refused {
+                refused = true;
+                l4h_rt::log!("VMMGUARD: self-boost refused");
+            }
+        }
+        if !refused { l4h_rt::log!("VMMGUARD: FAIL: no demotion"); }
+        tcb.tcb_set_priority(tcb, 0).expect("test yield to guest");
+        if tcb.tcb_set_priority(tcb, host::PRIO_VMM).is_err() && tcb.tcb_set_mc_priority(tcb, host::PRIO_VMM).is_err() {
+            l4h_rt::log!("VMMGUARD: parent restored boost with low authority");
+        } else {
+            l4h_rt::log!("VMMGUARD: FAIL: regained authority");
+        }
+        loop { core::hint::spin_loop(); }
+    }
     let tsc_hz = info.header().tsc_hz;
     let mem = GuestMem { base: host::IO_POOL_VA, gpa: cfg.io_pool_gpa, size: cfg.io_pool_size };
     let vcpus = Vcpus { n: cfg.nr_vcpus as usize };

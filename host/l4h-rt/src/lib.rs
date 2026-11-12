@@ -173,7 +173,10 @@ pub fn init() -> &'static Info {
 fn audit(kind: u32) {
     sel4::sel4_cfg_if! {
         if #[sel4_cfg(DEBUG_BUILD)] {
-            if !host::AUDIT {
+            // The parent checks VMM copies and edges while installing
+            // them: the CPU guard may revoke our debug authority even
+            // before this startup audit would finish.
+            if !host::AUDIT || kind == host::KIND_VMM {
                 return;
             }
             for slot in 0..1u64 << host::CNODE_BITS {

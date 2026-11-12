@@ -1746,18 +1746,23 @@ the cap. The limit applies even when cores are idle. Caps can be changed
 while a VM runs.
 
 A vCPU's guest kernel and user code share its budget; vCPU 0 also pays for
-its VMM's hypercalls and device work. VMMs on a host core share at most
-25\% of it equally, even for uncapped VMs. Every 100\,ms, if any context
+its VMM's hypercalls and device work. Every 100\,ms, if any context
 used at least 90\% of its share, the host adjusts the split in
 proportion to the CPU time each consumed. Each part keeps at least
 200\,$\mu$s, so vCPU 0 uses a period longer than the usual 5\,ms below
 12\% (60\,ms at 1\%); other vCPUs need a longer period below 8\%
-(40\,ms at 1\%). VMM periods can grow further when many VMs share a core.
+(40\,ms at 1\%).
 AArch64 caps use at least a 40\,ms period to
 amortize emulated GIC timer delivery. Reconfiguring an idle or unbound scheduling context can
 grant a fresh budget, allowing up to one extra period's budget per
 adjustment. A workload that alternates between kernel and user code may
 use less than its cap when one part runs out before the other.
+
+Uncapped VMMs can use spare CPU time; idle VMs reserve no share from busy
+ones. Short I/O turns run above guest priority. If VMMs dominate a core,
+the balancer moves them to the guest-user priority so other guests can
+make progress. The VMM cannot raise its own priority after this change;
+the manager restores the boost after its activity subsides.
 
 \paragraph{Steal time.} Guests see the time they were ready to run but
 waiting for a core as \emph{steal}, in the \texttt{st} column of

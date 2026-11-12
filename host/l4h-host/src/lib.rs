@@ -57,6 +57,8 @@ pub const TEST_INJECT: bool = match option_env!("L4H_TEST_INJECT") {
 /// not delay; then the services VMMs call, and which root waits for.
 pub const PRIO_LOGD: u64 = l4h_abi::PRIO_KERNEL + 1;
 pub const PRIO_VMM: u64 = l4h_abi::PRIO_KERNEL + 2;
+/// A VMM dominating its core shares the guest-user scheduling band.
+pub const PRIO_VMM_FAIR: u64 = l4h_abi::PRIO_USER;
 pub const PRIO_SERVICE: u64 = l4h_abi::PRIO_KERNEL + 3;
 /// A throttled VMM makes many short IPC turns: keep 16 MCS refills.
 pub const VMM_SC_BITS: usize = 9;

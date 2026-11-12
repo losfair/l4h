@@ -14,20 +14,21 @@ use topology::Topology;
 const PERIOD: u64 = 100_000;
 
 #[test]
-fn vmm_quota_and_guest_cap_hold_for_every_supported_peer_count() {
-    for peers in 1..=64 {
+fn vmm_and_guest_share_caps_without_reserving_uncapped_cpu_time() {
+    for has_vmm in [false, true] {
         for cap in 0..=100 {
             for minimum in [0, 40_000] {
                 for k in [0, 1, 250, 500, 750, 999, 1000] {
                     for v in [0, 1, 250, 500, 750, 999, 1000] {
-                        let p = budget::plan(5000, minimum, cap, k, Some((v, peers)));
-                        assert!(p.kernel >= budget::MIN_US && p.user >= budget::MIN_US && p.vmm >= budget::MIN_US);
-                        assert!(p.vmm * 4 * peers as u64 <= p.vmm_period, "VMMs must leave at least 75% of a core");
-                        if cap > 0 {
-                            assert_eq!(p.period, p.vmm_period);
+                        let p = budget::plan(5000, minimum, cap, k, has_vmm.then_some(v));
+                        assert!(p.kernel >= budget::MIN_US && p.user >= budget::MIN_US);
+                        assert!(if has_vmm { p.vmm >= budget::MIN_US } else { p.vmm == 0 });
+                        if cap > 0 && (cap < 100 || has_vmm) {
+                            if has_vmm { assert_eq!(p.period, p.vmm_period); }
                             assert_eq!(p.kernel + p.user + p.vmm, p.period * cap as u64 / 100);
                         } else {
                             assert_eq!((p.period, p.kernel, p.user), (5000, 5000, 5000));
+                            assert_eq!(p.vmm, if has_vmm { 5000 } else { 0 });
                         }
                     }
                 }
@@ -39,19 +40,34 @@ fn vmm_quota_and_guest_cap_hold_for_every_supported_peer_count() {
 #[test]
 fn capped_vmm_and_kernel_shares_follow_their_measured_demand() {
     let share = budget::VMM_SHARE_INIT;
-    let old = budget::plan(5000, 0, 50, 500, Some((share, 1)));
+    let old = budget::plan(5000, 0, 50, 500, Some(share));
     let (k, v) = budget::adapt(old, 500, share, [18_000, 18_000, 0], PERIOD).unwrap();
-    let cpu = budget::plan(5000, 0, 50, k, Some((v, 1)));
+    let cpu = budget::plan(5000, 0, 50, k, Some(v));
     assert!(budget::changed(old, cpu));
     assert_eq!(cpu.vmm, budget::MIN_US);
     let (k, v) = budget::adapt(old, 500, share, [100, 100, 12_500], PERIOD).unwrap();
-    let io = budget::plan(5000, 0, 50, k, Some((v, 1)));
+    let io = budget::plan(5000, 0, 50, k, Some(v));
     assert!(budget::changed(old, io));
-    assert_eq!(io.vmm, io.vmm_period / 4);
+    assert_eq!(io.vmm, io.period / 2 - 2 * budget::MIN_US);
     assert_eq!(io.kernel + io.user + io.vmm, io.period / 2);
     assert_eq!(budget::adapt(old, 500, share, [10, 10, 10], PERIOD), None);
     assert_eq!(budget::adapt(old, 500, share, [PERIOD, PERIOD, 0], PERIOD), None);
     assert!(!budget::changed(old, old));
+}
+
+#[test]
+fn a_dominating_vmm_loses_its_boost_until_quiescent() {
+    assert!(budget::boost(true, 20_000, 20_000, 50_000, PERIOD, 5000));
+    assert!(!budget::boost(true, 45_000, 90_000, 10_000, PERIOD, 5000));
+    // A host service using the rest of the core must not hide starvation.
+    assert!(!budget::boost(true, 10_000, 10_000, 2000, PERIOD, 5000));
+    assert!(budget::boost(true, 1000, 1000, 0, PERIOD, 5000));
+    assert!(!budget::boost(false, 50_000, 50_000, 50_000, PERIOD, 5000));
+    assert!(budget::boost(false, 2000, 2000, 50_000, PERIOD, 5000));
+    assert!(!budget::boost(false, 2001, 2001, 50_000, PERIOD, 5000));
+    assert!(!budget::boost(false, 0, 90_000, 10_000, PERIOD, 5000));
+    assert!(budget::boost(true, 0, 0, 0, 0, 5000));
+    assert!(!budget::boost(false, 0, 0, 0, 0, 5000));
 }
 
 #[test]

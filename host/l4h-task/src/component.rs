@@ -47,8 +47,10 @@ pub struct Component {
 static AUDIT_SLOT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// Check what this task mints into its components (debug builds), looking
-/// at it in `slot`, an empty slot of its own CSpace kept for it.  Each
-/// component audits its whole CSpace itself (l4h_rt::init).
+/// at it in `slot`, an empty slot of its own CSpace kept for it.
+/// Other components also audit their whole CSpace themselves (l4h_rt::init).
+/// A VMM can lose debug authority during startup, so its parent checks
+/// its ordinary copies here as well as its declared edges.
 pub fn audit_in(slot: crate::mem::Slot) {
     AUDIT_SLOT.store(slot, core::sync::atomic::Ordering::Relaxed);
 }
@@ -63,12 +65,24 @@ impl Component {
         self.slot(idx)
             .copy(&self.local_cnode.absolute_cptr(src), rights)
             .unwrap_or_else(|e| panic!("component {} slot {} copy: {:?}", self.id, idx, e));
+        self.audit_vmm_copy(idx);
     }
 
     /// Give it a CNode, with `guard`: the one mint that is no edge.
     pub fn give_cnode(&self, idx: u64, cnode: cap::CNode, guard: CNodeCapData) {
         crate::edge::mint_cnode(&self.slot(idx), self.local_cnode, cnode, guard)
             .unwrap_or_else(|e| panic!("component {} slot {} mint: {:?}", self.id, idx, e));
+        self.audit_vmm_copy(idx);
+    }
+
+    fn audit_vmm_copy(&self, idx: u64) {
+        if self.kind == host::KIND_VMM {
+            if let Some(tag) = self.identify(idx) {
+                if let Err(why) = host::wiring::audit(self.kind, idx, tag) {
+                    panic!("component {} wiring audit: slot {} (tag {}) {}", self.id, idx, tag, why);
+                }
+            }
+        }
     }
 
     /// Mint instance `i` of `e`, which this component holds, from `src`

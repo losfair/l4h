@@ -491,7 +491,6 @@ impl Vmmgr {
         // Everything of ours first, then root drains the disks and takes
         // back the I/O pool (Guest::destroy).
         g.destroy(&mut self.alloc);
-        sched::refresh_vmms(self);
         info!("l4h-vmmgr: guest {} '{}' destroyed, {} MiB free", id, name, self.alloc.free_bytes() >> 20);
         Ok(())
     }
@@ -833,7 +832,6 @@ fn end_guest(h: &mut Vmmgr, id: usize, restart: bool) {
     if let Some(Some(g)) = h.guests.get_mut(id) {
         g.stop();
     }
-    sched::refresh_vmms(h);
     if h.guests.iter().flatten().all(|g| g.state != State::Running) {
         info!("l4h-vmmgr: all guests stopped");
     }
