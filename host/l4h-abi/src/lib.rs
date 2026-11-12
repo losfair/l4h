@@ -337,6 +337,34 @@ pub const CTL_PARTITION_INFO: u32 = 38;
 pub const CTL_BLK_ATTACH_EXTENTS: u32 = 39;
 pub const CTL_USB_INFO: u32 = 40;
 pub const CTL_USB_ATTACH: u32 = 41;
+pub const CTL_PCI_LIST: u32 = 42;
+pub const PCI_OWNER_NONE: u16 = 0;
+pub const PCI_OWNER_BLKD: u16 = 1;
+pub const PCI_OWNER_NETD: u16 = 2;
+pub const PCI_OWNER_MEMD: u16 = 3;
+pub const PCI_OWNER_USBD: u16 = 4;
+pub const PCI_OWNER_FIRMWARE: u16 = 5;
+/// Root has disabled or quarantined the function; no active driver owns it.
+pub const PCI_OWNER_ROOT: u16 = 6;
+
+/// A function from root's boot-time PCI inventory. No BARs, physical
+/// addresses or configuration access. Subsystem IDs are zero if absent.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CtlPci {
+    pub bdf: u16,
+    pub vendor: u16,
+    pub device: u16,
+    pub subsystem_vendor: u16,
+    pub subsystem_device: u16,
+    pub class: u8,
+    pub subclass: u8,
+    pub prog_if: u8,
+    pub revision: u8,
+    pub owner: u16,
+}
+const _: () = assert!(core::mem::size_of::<CtlPci>() == 16);
+
 pub const USB_STATE_FIRMWARE: u64 = 0;
 pub const USB_STATE_IDLE: u64 = 1;
 pub const USB_STATE_VM: u64 = 2;

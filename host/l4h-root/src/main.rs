@@ -255,6 +255,7 @@ pub struct Host {
     pub wins: Windows,
     pub asids: AsidPools,
     pub pci: pci::Pci,
+    pub pci_inventory: &'static mut pci::Inventory,
     pub iommu: iommu::Iommu,
     pub devmem: devmem::DevMem,
     /// Disk controllers, and their units as host disks.
@@ -514,7 +515,10 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     let mut nics = ArrayVec::<pci::Device, { host::net::MAX_NICS }>::new();
     let mut nic_bars = ArrayVec::<blkd::BarCache, { host::net::MAX_NICS }>::new();
     let mut balloon = None;
+    let pci_inventory = pci::INVENTORY.take();
     for d in pci.enumerate() {
+        pci_inventory.must_push(pci.identity(&d));
+        let record = pci_inventory.last_mut().unwrap();
         info!(
             "l4h-root: pci {:02x}:{:02x}.{} {:04x}:{:04x} class {:02x}{:02x}",
             d.bus, d.dev, d.func, d.vendor, d.device, d.class, d.subclass
@@ -542,7 +546,9 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
             pci.disable(&ctrl.pci);
             // Below MAX_DISK_CTRLS: checked above.
             let _ = ctrls.push(ctrl);
+            record.owner = l4h_abi::PCI_OWNER_BLKD;
         } else if netd::is_uplink(&d) {
+            record.owner = l4h_abi::PCI_OWNER_ROOT;
             pci.disable(&d);
             let mut bars = [const { None }; 6];
             if nics.is_full() {
@@ -550,14 +556,18 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
             } else if netd::carve(&mut alloc, &mut devmem, &d, &mut bars) {
                 nics.must_push(d);
                 nic_bars.must_push(bars);
+                record.owner = l4h_abi::PCI_OWNER_NETD;
             }
         } else if usb::is_xhci(&d) {
             // Left to the firmware, enabled as it is, until claimed.
             usb::found(d, &pci, &mut alloc, &mut devmem);
+            record.owner = l4h_abi::PCI_OWNER_FIRMWARE;
         } else if memd::is_balloon(&d) && balloon.is_none() && !partition::secondary() {
             balloon = Some(d);
+            record.owner = l4h_abi::PCI_OWNER_MEMD;
         }
     }
+    pci_inventory.sort_unstable_by_key(|p| p.bdf);
     // The boot disk first: dom0 takes the first dom0_disks host disks.
     if let Some(bdf) = cfg.boot_disk {
         match ctrls.iter().position(|c: &Controller| netd::bdf(&c.pci) == bdf) {
@@ -590,6 +600,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         wins,
         asids,
         pci,
+        pci_inventory,
         iommu,
         devmem,
         ctrls,
@@ -671,10 +682,10 @@ fn dom0_plan(h: &mut Host, ntfn: cap::Notification) -> Dom0Plan {
             if let Some(text) = h.cfg.dom0_disk0_windows {
                 // A list that is no list of windows is the config file's
                 // error; a disk too small for it is the disk's word.
-                let (windows, len, fits) = blkd::dom0_windows::<{ host::vmmgr::DOM0_MAX_DISKS }>(text, capacity)
+                let (windows, len, fits) = blkd::dom0_windows::<{ host::vmmgr::DOM0_MAX_DISKS }>(text, h.disks[d].capacity)
                     .expect("invalid dom0_disk0_windows");
                 if !fits {
-                    log!("l4h-root: dom0_disk0_windows do not fit disk 0 ({} sectors): windows beyond it are placeholders", capacity);
+                    log!("l4h-root: dom0_disk0_windows do not fit disk 0 ({} sectors): windows beyond it are placeholders", h.disks[d].capacity);
                 }
                 for w in &windows[..len] {
                     plan.disks.push(host::vmmgr::Dom0Disk { disk: 0, start: w.start, sectors: w.sectors })

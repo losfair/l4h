@@ -60,6 +60,47 @@ pub const CTL_PARTITION_INFO: u32 = 38;
 pub const CTL_BLK_ATTACH_EXTENTS: u32 = 39;
 pub const CTL_USB_INFO: u32 = 40;
 pub const CTL_USB_ATTACH: u32 = 41;
+pub const CTL_PCI_LIST: u32 = 42;
+pub const PCI_OWNER_NONE: u16 = 0;
+pub const PCI_OWNER_BLKD: u16 = 1;
+pub const PCI_OWNER_NETD: u16 = 2;
+pub const PCI_OWNER_MEMD: u16 = 3;
+pub const PCI_OWNER_USBD: u16 = 4;
+pub const PCI_OWNER_FIRMWARE: u16 = 5;
+pub const PCI_OWNER_ROOT: u16 = 6;
+
+/// A function from root's boot-time PCI inventory (CTL_PCI_LIST).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CtlPci {
+    pub bdf: u16,
+    pub vendor: u16,
+    pub device: u16,
+    pub subsystem_vendor: u16,
+    pub subsystem_device: u16,
+    pub class: u8,
+    pub subclass: u8,
+    pub prog_if: u8,
+    pub revision: u8,
+    /// PCI_OWNER_*: the host service, independently of guest assignment.
+    pub owner: u16,
+}
+
+impl CtlPci {
+    pub fn owner_name(&self) -> &'static str {
+        match self.owner {
+            PCI_OWNER_NONE => "none",
+            PCI_OWNER_BLKD => "blkd",
+            PCI_OWNER_NETD => "netd",
+            PCI_OWNER_MEMD => "memd",
+            PCI_OWNER_USBD => "usbd",
+            PCI_OWNER_FIRMWARE => "firmware",
+            PCI_OWNER_ROOT => "root",
+            _ => "unknown",
+        }
+    }
+}
+const _: () = assert!(std::mem::size_of::<CtlPci>() == 16);
 /// Extents of a disk made of them, and the least sectors of each when
 /// there are several.
 pub const BLK_MAX_EXTENTS: usize = 4096;
@@ -782,6 +823,12 @@ impl Ctl {
         let r = self.call(CTL_HOST_INFO, &[], &[], &[])?;
         let v = r.vals;
         Ok(HostInfo { cores: v[0], free: v[1], total: v[2], disks: v[3], vms: v[4], nics: v[5] })
+    }
+
+    /// Every PCI function root enumerated, in BDF order. This is a
+    /// read-only snapshot; queries never rescan or reconfigure hardware.
+    pub fn pci_list(&self) -> Result<Vec<CtlPci>> {
+        self.list(CTL_PCI_LIST, |p: &CtlPci| p.bdf as u32)
     }
 
     /// Create a VM, attach its disks and NICs, load its initrd and start

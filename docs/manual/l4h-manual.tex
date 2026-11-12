@@ -513,7 +513,8 @@ Variable & Meaning & Default \\
   a window; the rest stays free for other guests' windows. 0, or more than
   the disk: all of it & 0 \\
 \texttt{dom0\_disk0\_windows} & separate disk 0 filesystem windows,
-\texttt{start:count,...} in 512-byte sectors, aligned to 4 KiB & unset \\
+\texttt{start:count,...} in 512-byte sectors, aligned to 4 KiB;
+\texttt{start:end[-N]} runs to the end, less $N$ sectors & unset \\
 
 \texttt{dom0\_nics} & dom0's vNICs on switch 0 & 1 \\
 \texttt{dom0\_internal\_switches} & internal switches created at boot, each
@@ -754,9 +755,10 @@ the same. There is no measured boot on BIOS (Section~\ref{sec:bios}).
 \section{dom0 on the EFI system partition}
 \label{sec:esp}
 
-l4h ships as one UEFI application, the same for every host: a standalone
-GRUB that carries the seL4 kernel, \texttt{l4h-root}, the guest kernel and
-its module tree (\cmd{tools/mkefi.sh OUT.efi}). It loads dom0's initramfs
+l4h ships as one UEFI application, the same for every host: an EFI wrapper
+containing a standalone GRUB that carries the seL4 kernel,
+\texttt{l4h-root}, the guest kernel and its module tree
+(\cmd{tools/mkefi.sh OUT.efi}). It loads dom0's initramfs
 and the settings from the EFI system partition it was booted from:
 \begin{lstlisting}
 EFI/BOOT/BOOTX64.EFI   the l4h application
@@ -768,6 +770,35 @@ the first partition with \file{l4h/dom0/initrd}, or else with
 \file{l4h/l4h.conf}. Files there override any appended to
 \texttt{l4h-root}. To change dom0, replace the files and
 reboot the host. dom0 itself may do so when it holds the boot disk.
+
+For A/B slots on separate FAT partitions, build an application with
+\texttt{L4H\_ESP\_UUID} or \texttt{L4H\_ESP\_LABEL} to select its files'
+partition explicitly. This bypasses both the loading partition and the
+file search. Use unique filesystem UUIDs or labels.
+
+For a run-time selector, set one of those variables to locate a shared
+boot partition, and \texttt{L4H\_BOOT\_ENV} to an absolute path on it:
+\begin{lstlisting}
+L4H_ESP_UUID=AAAA-BBBB L4H_BOOT_ENV=/EFI/L4H/grubenv \
+    tools/mkefi.sh l4h.efi
+grub-editenv grubenv create
+grub-editenv grubenv set l4h_esp_uuid=1111-1111
+\end{lstlisting}
+Install \file{grubenv} at \file{/EFI/L4H/grubenv} on \texttt{AAAA-BBBB}.
+The application loads only \texttt{l4h\_esp\_uuid} and
+\texttt{l4h\_esp\_label} from that environment block; exactly one must
+select the partition containing \file{/l4h}. A front-stage GRUB can update
+it with \texttt{save\_env --file} before chainloading a slot. No slot's
+\file{l4h.conf} is read until selection finishes. A missing partition,
+unreadable block, or missing or conflicting selectors aborts this boot
+attempt and returns \texttt{EFI\_LOAD\_ERROR} to the front loader or
+firmware boot manager so it can try a fallback entry. The application
+uses a small EFI wrapper because GRUB 2.12's \texttt{exit} always returns
+success, even with a numeric argument. The wrapper loads the embedded
+GRUB as a child and converts any return into a failed boot attempt.
+Only the chosen slot's config and initramfs are read and measured; GRUB
+also measures the shared environment block into PCR~9. The selection
+also applies to \file{l4h-mk.conf} and its per-partition files.
 
 \file{l4h.conf} has one \texttt{key=value} per line (Table~\ref{tab:settings})
 and \texttt{\#} comments. GRUB also reads it, as a script, so write no
@@ -1083,6 +1114,21 @@ All objects are named by number: VM ids from \cmd{l4hctl list}, disks from
 with status 1 (Section~\ref{sec:errors}).
 
 \section{Host information}
+
+\cmd{l4hctl pci} lists every PCI function root enumerated at boot,
+including unhandled functions: BDF, vendor/device and subsystem IDs,
+class/subclass/programming interface, revision, and the assigned host
+service (\texttt{blkd}, \texttt{netd}, \texttt{memd}, \texttt{usbd},
+\texttt{firmware} for unclaimed xHCI, \texttt{root} for failed or
+quarantined disk/USB controllers or disabled NICs that could not be
+handed to netd, or
+\texttt{none}).
+\cmd{l4hctl pci --json} returns the same inventory with numeric ID and
+class fields, for platform profiles and controller selection. Queries
+are read-only and do not probe BARs or change devices. Subsystem IDs
+are zero when absent. On multikernel hosts the inventory is local to
+the calling dom0's partition. Disk, NIC and USB queries still report
+guest assignments independently of the host service.
 
 \cmd{l4hctl logs} prints retained host diagnostics, including guest kernel
 faults, host component faults, and power-off, reboot or panic requests.
@@ -1404,7 +1450,20 @@ at its start, and other guests' windows can take the rest.
 
 Alternatively, \texttt{dom0\_disk0\_windows=start:count,...} gives dom0
 separate filesystem devices from disk 0. Each window consumes one device
-slot. The complete dom0 plan, including its console, control, optional
+slot. A window can also use \texttt{start:end} or
+\texttt{start:end-N}: root resolves its size from the physical disk on
+each host boot, leaving at least $N$ sectors at the end. For example,
+\texttt{dom0\_disk0\_windows=2097152:end-2048} exposes the data area
+after sector 2097152 while excluding the last 2048 sectors (including
+the backup GPT). Growing a cloud disk needs no config rewrite or extra
+reboot; the next host boot picks up its new size. The resolved size must
+be positive. Root rounds the end down to a 4\,KiB boundary after
+subtracting $N$, leaving up to seven additional sectors outside the
+window. Numbers contain decimal digits only. At most one end-relative
+window is allowed; all fixed ranges must end at or before its start,
+even if they appear later in the list. This keeps the same layout valid
+when a driver cannot report the capacity.
+The complete dom0 plan, including its console, control, optional
 memory and attestation devices, disks and NICs, must fit in 64 slots;
 an oversized plan stops boot instead of dropping devices.
 A controller busy with another attachment or a provisioning write is
@@ -1417,6 +1476,9 @@ prevent Linux from booting; healthy disks or an initramfs remain usable.
 An automatically selected whole disk whose capacity is not a multiple of
 eight sectors also becomes a dummy device, with the whole disk reserved.
 Explicit windows must still be aligned and fit within the known capacity.
+An end-relative range that cannot resolve against the reported capacity
+is reserved conservatively and becomes a placeholder; it never grants
+access to a whole disk or a wrapped sector range.
 
 \paragraph{Failed disks.}\label{sec:disk-failed} When its owner is
 destroyed, a disk is reset before it becomes free. If the device does not
@@ -1812,7 +1874,8 @@ interfaces of x86 PCs and servers:
 It works like this:
 \begin{itemize}
   \item the firmware measures the l4h application, with seL4, every
-        host component and the guest kernel in it, into PCR~4. GRUB
+        host component and the guest kernel in it, into PCR~4, then
+        extends PCR~4 again when loading the embedded GRUB image. GRUB
         measures dom0's initramfs and \file{l4h.conf} into PCR~9;
   \item at boot, the host generates a signing key and has the TPM quote it,
         together with the PCRs, using the TPM's attestation key (AK). That

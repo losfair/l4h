@@ -3366,7 +3366,18 @@ settings.
 
 - `dom0_disk0_windows=start:count,...` exposes each selected partition of
   an existing GPT installation as a separate filesystem device. Values are
-  in 512-byte sectors, multiples of eight, counts positive. The list replaces
+  in 512-byte sectors, decimal digits only. Starts and fixed counts must
+  be multiples of eight, with positive counts. `start:end` extends to the
+  disk's last complete block; `start:end-N` leaves at least N sectors there, e.g.
+  `2097152:end-2048` leaves room for the backup GPT. Root resolves these
+  against the capacity reported by blkd on each host boot, with checked
+  subtraction and rounds the end down to a 4 KiB boundary, excluding at
+  most seven additional sectors. At most one end-relative window is
+  allowed, and every fixed range must end at or before its start,
+  regardless of list order. This rule prevents unresolved windows from
+  overlapping fixed ranges when geometry is lost. A disk enlarged between
+  boots needs no config rewrite (and no change to the config's PCR 9
+  measurement). The list replaces
   disk 0 and requires `dom0_disks` > 0 and `dom0_disk0_mb=0`. Invalid,
   overlapping or excessive ranges stop boot. A range beyond the disk's
   capacity, which is its driver's word, does not: it is logged and stays
@@ -3388,6 +3399,9 @@ settings.
   and overlap and lists them as dom0's (its controller serves nothing); a
   whole-disk reservation covers all aligned sectors. The same applies to an automatically selected whole disk whose
   capacity is not a multiple of eight sectors.
+  An end-relative range that cannot resolve against the reported capacity
+  is likewise a placeholder: its data area is conservatively reserved
+  against the largest aligned capacity, never attached with that size.
 - dom0 sees filesystem devices, not the physical partition table: GRUB reads
   the physical GPT before l4h starts, and both GPT headers stay intact.
   Mounts must use filesystem UUIDs or labels. Partition changes and boot
@@ -3427,12 +3441,32 @@ none. dom0 runs no host hardware drivers.
 
 | Area | Operations |
 |------|------------|
-| Host | `host_version` (the build version; the tag for a release); `host_info` (cores, free/total bytes, disk, VM and NIC counts); `host_reboot`; `rtc_set`; `iommu_info` (§9.5); `log_read` (§10) |
+| Host | `host_version` (the build version; the tag for a release); `host_info` (cores, free/total bytes, disk, VM and NIC counts); `pci_list` (boot inventory, IDs, class and service owner); `host_reboot`; `rtc_set`; `iommu_info` (§9.5); `log_read` (§10) |
 | Guests | `vm_create`, `vm_load`, `vm_start`, `vm_shutdown`, `vm_destroy`, `vm_list`, `vm_info` (cores of the first six vCPUs), `vm_stats` (CPU use and cap), `vm_set_sched`, `vm_set_mem`, `vm_mem_info` (§8.5), `vm_trust` (flags, §10.2) |
 | Block | `blk_attach` (disk, read-only and volatile flags, LBA window), `blk_write` (provisioning), `blk_info`, `disk_info` |
 | Network | `switch_create`, `switch_attach_uplink`, `nic_create` (MAC, MAC lock, isolation), `switch_info` (ports with VM and MAC, counters), `nic_info` (PCI address, switch, MAC) |
 | Console | `console_read` (offset, bytes and lost-byte count), `console_write` |
 | Display | `gpu_attach` (scanout size), `gpu_read` (the image, 1 MiB at a time, with size, format and frame; §9.6) |
+
+`CTL_PCI_LIST` takes an inclusive first BDF and returns up to 124
+`CtlPci` records in BDF order; the next page starts at the last BDF plus
+one, and a zero count ends the list. Root records every enumerated
+function at boot, including unhandled devices, with vendor/device,
+subsystem IDs, class/subclass/programming interface and revision. The
+16-byte records occupy a fixed table in root's .bss: 1 MiB for x86's whole
+BDF space, or 64 KiB for aarch64's 16 buses. Queries touch no PCI
+configuration registers or BARs and use a binary search to locate a page.
+The service owner is `none`, `blkd`, `netd`, `memd`, `firmware` (unclaimed
+xHCI), `usbd`, or `root` for disabled NICs that were not handed to netd
+and failed or quarantined disk/USB controllers, including disk reset
+failures during boot. Disk and USB ownership is resolved from the current
+controller state on each query. Guest assignment remains in the
+disk/NIC/USB queries.
+Subsystem IDs come from an endpoint or CardBus header, or a bridge's
+optional subsystem-ID capability; absent IDs are zero. On a multikernel
+machine each dom0 sees its root's inventory. `l4hctl pci` prints the list;
+`l4hctl pci --json` supplies numeric IDs and class fields for boot-time
+platform selection.
 
 A Rust userspace library and CLI live in `tools/l4hctl`; external
 orchestration runs in dom0. Devices are attached before start and removed
@@ -3539,7 +3573,8 @@ The chain has four links.
 
 1. **Measured boot.** The firmware measures the UEFI application into PCR 4.
    The application holds seL4, `l4h-root` and every host component (§11),
-   so one digest covers the whole host. GRUB's `tpm` module measures dom0's
+   so one digest covers the whole host. Loading its child GRUB image
+   extends PCR 4 again. GRUB's `tpm` module measures dom0's
    kernel, initramfs and `l4h.conf` into PCR 9, and its commands into PCR 8.
    Secure Boot is not needed: nothing is checked at boot; the verifier
    checks afterwards. A BIOS boot measures none of this (BIOS GRUB has no
@@ -4171,13 +4206,34 @@ injects these failures in a host built with `L4H_TEST_INJECT=1`;
 
 ## 11. Boot and deployment
 
-- **UEFI.** UEFI → GRUB (EFI) → multiboot2. `tools/mkefi.sh` builds l4h as
-  one UEFI application: a standalone GRUB whose memdisk holds the seL4
-  kernel, `l4h-root` (with the service ELFs), the guest kernel and its
-  module tree (§5.6). GRUB loads dom0's initramfs and `l4h.conf` from the
-  EFI partition it was loaded from or, since `$cmdpath` is empty under OVMF,
+- **UEFI.** UEFI → EFI wrapper → GRUB (EFI) → multiboot2. `tools/mkefi.sh`
+  builds l4h as one UEFI application containing a standalone GRUB whose
+  memdisk holds the seL4 kernel, `l4h-root` (with the service ELFs), the
+  guest kernel and its module tree (§5.6). GRUB loads dom0's initramfs and
+  `l4h.conf` from the EFI partition it was loaded from or, since `$cmdpath`
+  is empty under OVMF,
   the first partition with `/l4h/dom0/initrd` (or else `/l4h/l4h.conf`)
-  (§10.1). It passes
+  (§10.1). `L4H_ESP_UUID` or `L4H_ESP_LABEL` at application build time
+  selects a partition explicitly, bypassing both guesses. With
+  `L4H_BOOT_ENV=/EFI/L4H/grubenv`, that explicit partition instead locates
+  a shared GRUB environment block: only `l4h_esp_uuid` and `l4h_esp_label`
+  are imported, and exactly one must name the slot containing `/l4h`.
+  Missing or ambiguous selectors, an unreadable environment block, or a
+  failed explicit search abort this boot attempt before any slot's config
+  is sourced. The application returns `EFI_LOAD_ERROR` to its caller,
+  allowing a front loader or firmware boot manager to try the other slot.
+  GRUB 2.12's `exit` ignores arguments and returns success. A small outer
+  EFI wrapper (`boot/grub-efi-wrapper.c`) loads the standalone GRUB as a
+  child, preserving its device path. L4H boot never returns: any return
+  from GRUB is converted to `EFI_LOAD_ERROR`, after GRUB's normal cleanup
+  and unloading its image. Firmware measures both the wrapper (including
+  the embedded GRUB) and the child image into PCR 4.
+  A front-stage GRUB can update this block and chainload the slot's
+  application even when `$cmdpath` is empty. Only the selected slot's
+  config and initramfs are read; the shared environment block is also
+  measured into PCR 9 by GRUB's TPM module. This applies to the slot's
+  multikernel configuration and per-partition files too (§11.4).
+  It passes
   `console_port`/`debug_port` (0x3f8 or `serial_port`) explicitly, because
   UEFI firmware need not fill in the BIOS data area seL4 otherwise reads.
   Initramfs images for other guests come through the dom0 API. QEMU can also

@@ -12,6 +12,7 @@ arg() { sed -n "s/.* $1=\([^ ]*\).*/\1/p" /proc/cmdline; }
 cmd="console=hvc0 usbdevs=$(arg usbdevs) usbsha=$(arg usbsha) usbsha2=$(arg usbsha2) usbsha3=$(arg usbsha3)"
 l4hctl usb || fail "l4hctl usb"
 l4hctl usb | grep -q "usb 0: .*, firmware" || fail "the controller is not the firmware's before an attach"
+l4hctl pci | grep -q "^pci $(arg usbbdf) .*owner firmware$" || fail "PCI firmware owner"
 run() { # name, extra cmdline, what to wait for
     id=$(l4hctl create "$1" --initrd /bin/usbvm.cpio.gz --mem 256 --vcpus 2 --usb "$(arg usbbdf)" \
         --cmdline "$cmd $2") || fail "create $1"
@@ -21,9 +22,11 @@ run() { # name, extra cmdline, what to wait for
     [ $ok = 0 ] || fail "$1: no '$3'"
 }
 run first usbreload=1 "USBVM: PASS"
+l4hctl pci | grep -q "^pci $(arg usbbdf) .*owner usbd$" || fail "PCI usbd owner"
 l4hctl usb | grep -q "usb 0: .*, vm $id" || fail "the controller is not vm $id's"
 l4hctl destroy "$id" || fail "destroy"
 l4hctl usb | grep -q "usb 0: .*, idle" || fail "the controller is not idle after destroy"
+l4hctl pci | grep -q "^pci $(arg usbbdf) .*owner usbd$" || fail "PCI persistent usbd owner"
 # Destroy while the disks are busy, then a second guest.
 run busy usbbusy=1 "USBVM: busy"
 sleep 1
