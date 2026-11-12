@@ -132,8 +132,13 @@ pub fn map_frame(
 /// Map the 2 MiB page `frame` at `vaddr` (2 MiB aligned) in `vspace`,
 /// creating the page directory and PDPT from `ctx` as needed.
 pub fn map_large_page(ctx: &mut ObjCtx, vspace: cap::VSpace, frame: cap::LargePage, vaddr: usize, rights: CapRights) {
+    map_large_page_attrs(ctx, vspace, frame, vaddr, rights, VmAttributes::DEFAULT);
+}
+
+/// `map_large_page` with `attrs` (device memory: uncached).
+pub fn map_large_page_attrs(ctx: &mut ObjCtx, vspace: cap::VSpace, frame: cap::LargePage, vaddr: usize, rights: CapRights, attrs: VmAttributes) {
     loop {
-        match frame.frame_map(vspace, vaddr, rights.clone(), VmAttributes::DEFAULT) {
+        match frame.frame_map(vspace, vaddr, rights.clone(), attrs) {
             Ok(()) => return,
             Err(e) if is_failed_lookup(e) => ensure_pd(ctx, vspace, vaddr),
             Err(e) => panic!("frame_map({:#x}) failed: {:?}", vaddr, e),

@@ -62,6 +62,19 @@ impl DevMem {
     /// 4 KiB frames covering [paddr, paddr + size), which must be aligned to
     /// its power-of-two size (as PCI BARs are), in consecutive root slots.
     pub fn frames(&mut self, slots: &mut Slots, paddr: usize, size: usize) -> Option<Range<Slot>> {
+        self.carve(slots, paddr, size, 12)
+    }
+
+    /// `frames`, of 2 MiB frames: a large range costs few slots (PCI ECAM,
+    /// pci::Pci::map_extended).  `size` is at least 2 MiB.
+    #[cfg(target_arch = "x86_64")]
+    pub fn large_frames(&mut self, slots: &mut Slots, paddr: usize, size: usize) -> Option<Range<Slot>> {
+        assert!(size >= 1 << 21);
+        self.carve(slots, paddr, size, 21)
+    }
+
+    /// Frames of 2^`page_bits` bytes covering [paddr, paddr + size).
+    fn carve(&mut self, slots: &mut Slots, paddr: usize, size: usize, page_bits: usize) -> Option<Range<Slot>> {
         let size = size.max(4096).next_power_of_two();
         let bits = size.trailing_zeros() as usize;
         assert!(paddr % size == 0, "device range {:#x}+{:#x} not aligned", paddr, size);
@@ -91,12 +104,16 @@ impl DevMem {
             let _ = self.free.push(spare);
             r = keep;
         }
-        let n = size / 4096;
+        let n = size >> page_bits;
         let s = slots.alloc_range(n);
+        #[cfg(target_arch = "x86_64")]
+        let bp = if page_bits == 21 { crate::vspace::LARGE_PAGE_BP } else { FRAME_BP };
+        #[cfg(not(target_arch = "x86_64"))]
+        let bp = FRAME_BP;
         // The kernel caps fan-out per call (a framebuffer can be larger).
         for at in (0..n).step_by(crate::RETYPE_FAN_OUT) {
             let k = (n - at).min(crate::RETYPE_FAN_OUT);
-            r.cap.untyped_retype(&FRAME_BP, &Dest::new(crate::slot::CNODE.cap(), s.start).cnode, s.start + at, k).expect("device frames");
+            r.cap.untyped_retype(&bp, &Dest::new(crate::slot::CNODE.cap(), s.start).cnode, s.start + at, k).expect("device frames");
         }
         Some(s)
     }

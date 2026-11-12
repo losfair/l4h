@@ -72,11 +72,19 @@ impl Iommu {
         } else {
             Self::Amd(amdvi::AmdVi::init(bootinfo, phys, pci, ticks_per_ms, intremap, shared))
         };
-        if let Some(s) = shared.filter(|s| s.primary) {
-            let [state, remap, units, ..] = me.info();
+        me
+    }
+
+    /// Tell the other partitions, which wait for it in `init`, what the
+    /// primary made of the IOMMU: once it has also set ACS in the bridges,
+    /// which are all its (main.rs), so that no partition enables a device
+    /// below a port that does not yet isolate it.
+    #[cfg(target_arch = "x86_64")]
+    pub fn publish(&self) {
+        if let Some(s) = shared::get().filter(|s| s.primary) {
+            let [state, remap, units, ..] = self.info();
             s.set_ready(state, units as usize, remap != 0);
         }
-        me
     }
 
     pub fn info(&self) -> [u64; 6] {

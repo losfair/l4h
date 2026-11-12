@@ -534,6 +534,8 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
             pci.enable_acs(&mut alloc, &mut devmem, &windows);
         }
     }
+    #[cfg(target_arch = "x86_64")]
+    iommu.publish();
     // The statics' only references, taken once here; the root task is
     // single-threaded.
     let ctrls = unsafe { &mut *(&raw mut CTRLS) };

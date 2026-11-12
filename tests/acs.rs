@@ -225,3 +225,53 @@ fn bits_print_by_name() {
     assert_eq!(Bits(TB | EC | DT).to_string(), "TB EC DT");
     assert_eq!(Bits(0).to_string(), "none");
 }
+
+#[test]
+fn state_reads_without_writing() {
+    let m = Model::new(&[(PORT, Func::pcie(acs::ROOT_PORT, Some((SV | RR | CR, SV))))]);
+    let r = acs::state(&m, PORT);
+    assert_eq!(r, Acs::Present { cap: SV | RR | CR, before: SV, after: SV });
+    assert!(!r.isolates());
+    assert_eq!(*m.writes.borrow(), 0);
+    assert_eq!(acs::state(&Model::new(&[(PORT, Func::pcie(acs::ROOT_PORT, None))]), PORT), Acs::Absent);
+}
+
+/// Every byte of [start, end) once, in order, each block aligned to its
+/// size, of 2 MiB frames only where it holds whole ones.
+fn check_blocks(start: u64, end: u64) -> Vec<(u64, u32)> {
+    let blocks: Vec<_> = acs::blocks(start, end).collect();
+    let mut at = start;
+    for &(b, bits) in &blocks {
+        assert_eq!(b, at);
+        assert_eq!(b % (1 << bits), 0);
+        assert!(bits >= 12);
+        at += 1 << bits;
+    }
+    assert_eq!(at, end.max(start));
+    blocks
+}
+
+#[test]
+fn ecam_windows_map_in_few_aligned_blocks() {
+    // A whole 256 MiB window, at an aligned base: one block.
+    assert_eq!(check_blocks(0xb000_0000, 0xc000_0000), [(0xb000_0000, 28)]);
+    // Buses 00-7f and 80-ff of a split window.
+    assert_eq!(check_blocks(0xe000_0000, 0xe800_0000), [(0xe000_0000, 27)]);
+    assert_eq!(check_blocks(0xf000_0000 + (0x80 << 20), 0xf000_0000 + (0x100 << 20)), [(0xf800_0000, 27)]);
+    // Odd first and last buses, at a 1 MiB-aligned position: 1 MiB of
+    // 4 KiB frames at each end, 2 MiB frames between.
+    let b = check_blocks(0x8000_0000 + (1 << 20), 0x8000_0000 + (0x40 << 20) - (1 << 20));
+    assert_eq!(b.first(), Some(&(0x8010_0000, 20)));
+    assert_eq!(b.last(), Some(&(0x83e0_0000, 20)));
+    assert!(b.iter().filter(|&&(_, bits)| bits < 21).count() == 2);
+    assert!(b.len() <= 12);
+    // One bus; nothing.
+    assert_eq!(check_blocks(0x9000_0000, 0x9010_0000), [(0x9000_0000, 20)]);
+    assert!(check_blocks(0x9000_0000, 0x9000_0000).is_empty());
+    // Every window of whole buses ends where it should.
+    for lo in 0..=255u64 {
+        for hi in (lo..=255).step_by(7) {
+            check_blocks(0xc000_0000 + (lo << 20), 0xc000_0000 + ((hi + 1) << 20));
+        }
+    }
+}

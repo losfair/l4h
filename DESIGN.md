@@ -2489,23 +2489,35 @@ Common behaviour:
   enables ATS nowhere), P2P Request and Completion Redirect and Upstream
   Forwarding that the function implements, as Linux does, and reads the
   control back. ACS is in extended configuration space, which the
-  configuration ports do not reach: root maps the ECAM page (from the
-  MCFG) of each PCIe function on segment 0 for it. A multikernel
-  partition uses the pages it has (§11.4), so it sets ACS in its own
-  functions only; the bridges above them, which it maps read-only, keep
-  what the firmware set.
+  configuration ports do not reach, so root maps every segment-0 ECAM
+  window of the MCFG whole into `layout::ECAM_X86`, where a function's page
+  is at its BDF's: a few carves of 2 MiB frames (`acs::blocks`), as one
+  carve per function would split the device memory table into hundreds of
+  pieces on a large server and leave no room for the BARs carved next.
+  Other accesses still use the ports. A window with a base that is not
+  1 MiB aligned, that overlaps another, or that is not free device memory
+  is not used, and a function whose ECAM vendor and device ID differ from
+  the ports' is left alone, so a wrong MCFG gets no writes.
+  - **Partitions** (§11.4) use the ECAM pages they have. The shim gives
+    every bridge to partition 0, which so sets ACS in all root and switch
+    ports; it tells the other partitions the IOMMU is ready (`Iommu::publish`)
+    only after that, so none enables a device below a port that does not
+    yet isolate it. A secondary partition reads ACS in the bridges above
+    its functions, which it maps read-only, and reports any that do not
+    isolate.
   - A root port or switch downstream port with devices below it that
-    still does not isolate them (no ACS, or a bit that does not stick) is
-    logged at boot: those devices can reach each other's BARs without the
-    IOMMU. QEMU's `xio3130-downstream` ports have no ACS; its
-    `pcie-root-port` has it. Functions of one multi-function device
-    without ACS can reach each other too, which is not reported.
+    still does not isolate them (no ACS, a bit that does not stick, or an
+    extended space root cannot reach) is logged at boot: those devices can
+    reach each other's BARs without the IOMMU. QEMU's `xio3130-downstream`
+    ports have no ACS; its `pcie-root-port` has it. Functions of one
+    multi-function device without ACS can reach each other too, which is
+    not reported.
   - Without an MCFG (e.g. GCE, whose VMs have no IOMMU anyway) root says
     ACS is off. Without the IOMMU root leaves ACS alone: a device reaches
     all memory then.
-  - The ECAM pages root maps are root's, so trustd's AML can no longer
-    write them as memory; it still reaches the first 256 bytes of each
-    function through the configuration ports (§10.2).
+  - The ECAM windows root maps are no longer free device memory, so
+    trustd's AML reaches them through root's mapping
+    (`pci::Pci::ecam_memory`), under the same rules as before (§10.2).
 - **Tables** come from 2 MiB chunks of root memory (`layout::IOMMU_TABLES`)
   and are kept until reboot. Unmapping clears leaf entries and keeps the
   tables, so a pool slot attached again reuses them. Root stops if an IOMMU
@@ -2603,7 +2615,8 @@ Common behaviour:
   `tests/run-acstest.sh` checks the ACS setup against a model of
   configuration space: only the bits a function implements are set,
   firmware's other bits are kept, a bit that does not stick is reported,
-  and looping or out-of-range capability lists end.
+  looping or out-of-range capability lists end, and an ECAM window is
+  mapped in few aligned blocks that cover it exactly.
   `tests/run-vtdtest.sh` checks firmware parsing, address bounds, interrupt
   source validation and command encodings on the host; `--qemu` also runs
   virtio-blk, NVMe, VM lifecycle/unmapping, NIC and serial-monitor tests,
@@ -4992,7 +5005,7 @@ machine and guests of 256–512 MiB.
 | `tests/run-install-vm.sh debian-13-nocloud-amd64.qcow2 [release-directory] [1\|2]` | in a disposable UEFI/KVM VM, install from native Debian with one or two uplinks, verify each switch and network, then return to native Linux; uses prebuilt releases and `sudo -u "$L4H_QEMU_USER"` (defaults to the invoking user); `INSTALL_VM_SWAP_NAMES=1` with two NICs also tests exchanging eth0/eth1 names; `INSTALL_VM_FIRMWARE=bios INSTALL_VM_MEMORY=1G INSTALL_VM_CPUS=1` tests small-VM defaults through BIOS GRUB |
 | `tests/run-versiontest.sh` | host version metadata: release tags, development builds, overrides and worktrees |
 | `tests/run-flagstest.sh` | focused flags-only boot: console/display seals, kernel taints, userspace gates and instance reuse, on either architecture |
-| `tests/run-acstest.sh` | PCIe ACS setup against a model of configuration space: implemented bits only, firmware bits kept, bits that do not stick, hostile capability lists |
+| `tests/run-acstest.sh` | PCIe ACS setup against a model of configuration space: implemented bits only, firmware bits kept, bits that do not stick, hostile capability lists, read-only checks; ECAM window block planning |
 | `tests/run-trusttest.sh` | taint/seal permissions, atomic gates, instances, seqlock snapshots and verifier policy |
 | `tests/run-alloctest.sh` | host allocator growth under fragmentation, reclaim, fixed-container panic safety and memd grant validation |
 | `tests/run-devicetest.sh [--qemu]` | console ordering, bounded sequence gaps, cursor wrap, draining and writer wakeups; endpoint fairness and malformed replies; checked wiring cannot be replaced; memory-hotplug completion and timed retry scheduling; USB DMA ownership on failed halt/disable; control completions after manager failure; block replies across nested calls; host log wraparound and concurrent writers; with QEMU, hypercalls under continuous console output |

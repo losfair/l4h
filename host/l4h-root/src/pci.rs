@@ -31,6 +31,10 @@ pub struct Pci {
     /// reachable through them.  The ports reach only the first 256 bytes.
     #[cfg(target_arch = "x86_64")]
     ext: bool,
+    /// ECAM windows mapped whole (`map_extended`): MCFG base, and the
+    /// physical range of its buses.
+    #[cfg(target_arch = "x86_64")]
+    windows: l4h_host::fixed::ArrayVec<(u64, u64, u64), { l4h_host::trust::MAX_ECAM }>,
     #[cfg(target_arch = "aarch64")]
     next_bar: core::cell::Cell<u64>,
 }
@@ -262,7 +266,7 @@ impl Pci {
             .cap()
             .ioport_control_issue(CONFIG_ADDRESS as u64, CONFIG_DATA as u64 + 3, &dst)
             .expect("PCI config I/O ports");
-        let Some(d) = crate::partition::get() else { return Pci { port: s as u64, ecam: false, shared_ports: false, ext: false } };
+        let Some(d) = crate::partition::get() else { return Pci { port: s as u64, ecam: false, shared_ports: false, ext: false, windows: l4h_host::fixed::ArrayVec::new() } };
         let others = d.owners().iter().filter(|o| o.partition as u32 != d.index).map(|o| o.bdf);
         if d.ecam_base == 0 {
             // No ECAM: the ports, for what ECAM would reach.
@@ -278,7 +282,7 @@ impl Pci {
             }
             assert!(d.count == 1 || crate::iommu::shared::get().is_some(), "l4h-root: PCI configuration needs the partitions' lock");
             info!("l4h-root: no ECAM: PCI configuration through ports, under the partitions' lock");
-            return Pci { port: s as u64, ecam: false, shared_ports: true, ext: false };
+            return Pci { port: s as u64, ecam: false, shared_ports: true, ext: false, windows: l4h_host::fixed::ArrayVec::new() };
         }
         for f in d.funcs() {
             let paddr = d.ecam_base as usize + ((f.bdf as usize) << 12);
@@ -306,79 +310,143 @@ impl Pci {
             ECAM_MAPPED[bdf as usize / 64].fetch_or(1 << (bdf % 64), core::sync::atomic::Ordering::Relaxed);
         }
         info!("l4h-root: PCI configuration through ECAM");
-        Pci { port: s as u64, ecam: true, shared_ports: false, ext: true }
+        Pci { port: s as u64, ecam: true, shared_ports: false, ext: true, windows: l4h_host::fixed::ArrayVec::new() }
     }
 
-    /// Map the ECAM page of every PCI Express function on segment 0 that
-    /// the MCFG's window `w` covers, so that root reaches their extended
-    /// configuration space (acs.rs).  A partition has its pages already
-    /// (`new`).  Only the pages are new: other accesses still use the
-    /// ports.  Returns how many were mapped.  Such a page becomes root's,
-    /// so trustd's AML can no longer write it as memory (trustd::hw); it
-    /// still reaches the first 256 bytes through the ports.
-    pub fn map_extended(&mut self, alloc: &mut Alloc, devmem: &mut crate::devmem::DevMem, w: &l4h_host::trust::Ecam) -> usize {
+    /// Map ECAM window `w` (of the MCFG, segment 0) whole into ECAM_X86,
+    /// where each function's page is at its BDF's (`ecam_va`), so that
+    /// root reaches the extended configuration space of its PCI Express
+    /// functions (acs.rs); a partition has its own functions' pages
+    /// already (`new`).  Other accesses still use the ports.  The window
+    /// goes in a few carves of 2 MiB frames (acs::blocks), not one per
+    /// function, which would fill the device memory table on a large
+    /// server and leave no room for the BARs carved next.  Only functions
+    /// whose ECAM vendor and device ID match the ports' are used: a wrong
+    /// MCFG gets no writes.  Returns the functions found and those that
+    /// did not match.  The window becomes root's: trustd's AML reaches it
+    /// through `ecam_memory`.
+    pub fn map_extended(&mut self, alloc: &mut Alloc, devmem: &mut crate::devmem::DevMem, w: &l4h_host::trust::Ecam)
+        -> Result<(usize, usize), &'static str> {
+        use sel4::CapRights;
+        use crate::mem::ObjCtx;
         if crate::partition::get().is_some() || w.segment != 0 {
-            return 0;
+            return Err("not this partition's");
         }
-        let mut n = 0;
-        for bus in w.bus_lo..=w.bus_hi {
-            for dev in 0..32u8 {
-                if self.read32(bus, dev, 0, 0) & 0xffff == 0xffff {
-                    continue;
-                }
-                let funcs = if self.read8(bus, dev, 0, 0xe) & 0x80 != 0 { 8 } else { 1 };
-                for func in 0..funcs {
-                    let bdf = (bus as u16) << 8 | (dev as u16) << 3 | func as u16;
-                    if self.read32(bus, dev, func, 0) & 0xffff == 0xffff
-                        || crate::acs::pcie_type(self, bdf).is_none() {
-                        continue;
-                    }
-                    // In the window: the base is bus 0's (trust::Ecam::function).
-                    let Some(paddr) = w.base.checked_add((bdf as u64) << 12) else { continue };
-                    if crate::partition::map(alloc, devmem, paddr as usize, 4096, Self::ecam_va(bdf)).is_none() {
-                        log!("l4h-root: pci {:02x}:{:02x}.{}: no ECAM page at {:#x}", bus, dev, func, paddr);
-                        continue;
-                    }
-                    ECAM_MAPPED[bdf as usize / 64].fetch_or(1 << (bdf % 64), core::sync::atomic::Ordering::Relaxed);
-                    ECAM_WRITABLE[bdf as usize / 64].fetch_or(1 << (bdf % 64), core::sync::atomic::Ordering::Relaxed);
-                    n += 1;
-                }
-            }
-            if bus == u8::MAX {
-                break;
-            }
+        if w.base % (1 << 20) != 0 {
+            return Err("base not 1 MiB aligned");
         }
-        self.ext = n != 0;
-        n
+        let start = w.base.checked_add((w.bus_lo as u64) << 20).ok_or("past the address space")?;
+        let end = w.base.checked_add((w.bus_hi as u64 + 1) << 20).ok_or("past the address space")?;
+        if self.windows.is_full() {
+            return Err("too many windows");
+        }
+        let va = |pa: u64| crate::layout::ECAM_X86.base + (pa - w.base) as usize;
+        for (at, bits) in crate::acs::blocks(start, end) {
+            let ok = alloc.global(|alloc| {
+                if bits >= 21 {
+                    let frames = alloc.slots.global(|slots| devmem.large_frames(slots, at as usize, 1 << bits))?;
+                    for (i, s) in frames.enumerate() {
+                        let f = sel4::init_thread::Slot::<cap_type::LargePage>::from_index(s).cap();
+                        crate::vspace::map_large_page_attrs(&mut ObjCtx::global(alloc), slot::VSPACE.cap(), f,
+                            va(at) + (i << 21), CapRights::read_write(), crate::blkd::DEVICE_ATTRS);
+                    }
+                } else {
+                    let frames = alloc.slots.global(|slots| devmem.frames(slots, at as usize, 1 << bits))?;
+                    for (i, s) in frames.enumerate() {
+                        crate::vspace::map_frame(&mut ObjCtx::global(alloc), slot::VSPACE.cap(), crate::devmem::granule(s),
+                            va(at) + (i << 12), CapRights::read_write(), crate::blkd::DEVICE_ATTRS);
+                    }
+                }
+                Some(())
+            });
+            // What was mapped stays so, unused.
+            ok.ok_or("not free device memory, or the device memory table is full")?;
+        }
+        self.windows.must_push((w.base, start, end));
+        self.ext = true;
+        let (mut n, mut mismatched) = (0, 0);
+        for bdf in self.pcie_functions(w.bus_lo, w.bus_hi) {
+            let id = unsafe { (Self::ecam_va(bdf) as *const u32).read_volatile() };
+            if id != crate::acs::Config::read(self, bdf, 0) {
+                mismatched += 1;
+                continue;
+            }
+            ECAM_MAPPED[bdf as usize / 64].fetch_or(1 << (bdf % 64), core::sync::atomic::Ordering::Relaxed);
+            ECAM_WRITABLE[bdf as usize / 64].fetch_or(1 << (bdf % 64), core::sync::atomic::Ordering::Relaxed);
+            n += 1;
+        }
+        Ok((n, mismatched))
     }
 
-    /// Turn on ACS in every function root can reach that has it (acs.rs),
-    /// mapping their ECAM pages first if a partition has not, from the
-    /// MCFG's `windows`; and report the PCIe ports with functions below
-    /// them that it cannot make isolate them.
+    /// The PCI Express functions on buses lo..=hi, through the ports.
+    fn pcie_functions(&self, lo: u8, hi: u8) -> impl Iterator<Item = u16> + '_ {
+        (lo as u32..=hi as u32).flat_map(move |bus| (0..32u32).map(move |dev| (bus as u8, dev as u8)))
+            .filter(move |&(bus, dev)| self.read32(bus, dev, 0, 0) & 0xffff != 0xffff)
+            .flat_map(move |(bus, dev)| {
+                let funcs = if self.read8(bus, dev, 0, 0xe) & 0x80 != 0 { 8 } else { 1 };
+                (0..funcs).map(move |func| (bus as u16) << 8 | (dev as u16) << 3 | func as u16)
+            })
+            .filter(move |&bdf| crate::acs::Config::read(self, bdf, 0) & 0xffff != 0xffff
+                && crate::acs::pcie_type(self, bdf).is_some())
+    }
+
+    /// An access of trustd's AML (trustd::hw) to memory in an ECAM window
+    /// root mapped (`map_extended`), which device memory no longer has:
+    /// through root's mapping.  The caller has applied the AML's policy;
+    /// `width` is 1, 2, 4 or 8 and `paddr` aligned to it.  None if
+    /// `paddr` is in no such window.
+    pub fn ecam_memory(&self, paddr: usize, width: usize, write: bool, value: u64) -> Option<u64> {
+        let pa = paddr as u64;
+        let &(base, _, _) = self.windows.iter().find(|&&(_, s, e)| s <= pa && pa.checked_add(width as u64).is_some_and(|x| x <= e))?;
+        let p = crate::layout::ECAM_X86.base + (pa - base) as usize;
+        Some(unsafe {
+            match (width, write) {
+                (1, false) => (p as *const u8).read_volatile() as u64,
+                (2, false) => (p as *const u16).read_volatile() as u64,
+                (4, false) => (p as *const u32).read_volatile() as u64,
+                (_, false) => (p as *const u64).read_volatile(),
+                (1, true) => { (p as *mut u8).write_volatile(value as u8); 0 }
+                (2, true) => { (p as *mut u16).write_volatile(value as u16); 0 }
+                (4, true) => { (p as *mut u32).write_volatile(value as u32); 0 }
+                (_, true) => { (p as *mut u64).write_volatile(value); 0 }
+            }
+        })
+    }
+
+    /// Turn on ACS in every function root can write that has it (acs.rs),
+    /// mapping the MCFG's segment 0 `windows` first if a partition has
+    /// not; check it in the bridges above a partition's functions, which
+    /// it maps read-only; and report the PCIe ports with functions below
+    /// them that do not isolate them, including those root cannot reach.
     pub fn enable_acs(&mut self, alloc: &mut Alloc, devmem: &mut crate::devmem::DevMem, windows: &[l4h_host::trust::Ecam]) {
         use crate::acs::{self, Acs, Bits};
-        if crate::partition::get().is_none() {
-            match windows.iter().find(|w| w.segment == 0) {
-                Some(w) => {
-                    let n = self.map_extended(alloc, devmem, w);
-                    info!("l4h-root: ECAM at {:#x}, buses {:02x}-{:02x}: {} PCIe functions", w.base, w.bus_lo, w.bus_hi, n);
+        let partition = crate::partition::get().is_some();
+        if !partition {
+            let mut covered = [0u64; 4];
+            for w in windows.iter().filter(|w| w.segment == 0) {
+                let buses = w.bus_lo as usize..=w.bus_hi as usize;
+                if buses.clone().any(|b| covered[b / 64] & (1 << (b % 64)) != 0) {
+                    log!("l4h-root: ECAM at {:#x}, buses {:02x}-{:02x}, overlaps another window: unused", w.base, w.bus_lo, w.bus_hi);
+                    continue;
                 }
-                None => {
-                    log!("l4h-root: no ECAM for segment 0 (MCFG): PCIe ACS is off, and devices behind a PCIe switch or root port may reach each other without the IOMMU");
-                    return;
+                buses.for_each(|b| covered[b / 64] |= 1 << (b % 64));
+                match self.map_extended(alloc, devmem, w) {
+                    Ok((n, 0)) => info!("l4h-root: ECAM at {:#x}, buses {:02x}-{:02x}: {} PCIe functions", w.base, w.bus_lo, w.bus_hi, n),
+                    Ok((n, bad)) => log!("l4h-root: ECAM at {:#x}, buses {:02x}-{:02x}: {} PCIe functions, {} whose ECAM ID differs from the ports' (left alone)",
+                        w.base, w.bus_lo, w.bus_hi, n, bad),
+                    Err(why) => log!("l4h-root: ECAM at {:#x}, buses {:02x}-{:02x}: unused, {}", w.base, w.bus_lo, w.bus_hi, why),
                 }
             }
-        } else if !self.ext {
-            log!("l4h-root: no ECAM: PCIe ACS is off, and devices behind a PCIe switch or root port may reach each other without the IOMMU");
-            return;
+        }
+        if !self.ext {
+            log!("l4h-root: no usable ECAM (MCFG): PCIe ACS is off, and devices behind a PCIe switch or root port may reach each other without the IOMMU");
         }
         let (mut on, mut open) = (0, 0);
-        for bdf in self.extended() {
+        for bdf in self.reachable() {
             let (b, d, f) = (bdf >> 8, bdf >> 3 & 0x1f, bdf & 7);
             let ty = acs::pcie_type(self, bdf);
-            let r = acs::enable(self, bdf);
-            if let Acs::Present { cap, before, after } = r {
+            let r = if Self::bit(&ECAM_WRITABLE, bdf) { acs::enable(self, bdf) } else { acs::state(self, bdf) };
+            if let Acs::Present { cap, before, after } = r && after != before {
                 on += 1;
                 if after & cap & acs::ENABLE != cap & acs::ENABLE {
                     log!("l4h-root: pci {:02x}:{:02x}.{}: ACS control is {} after root set {}", b, d, f, Bits(after), Bits(before | cap & acs::ENABLE));
@@ -386,23 +454,33 @@ impl Pci {
                     info!("l4h-root: pci {:02x}:{:02x}.{}: ACS {} (was {})", b, d, f, Bits(after), Bits(before));
                 }
             }
-            let port = match ty {
-                Some(acs::ROOT_PORT) => "root port",
-                Some(acs::DOWNSTREAM_PORT) => "switch downstream port",
-                _ => continue,
-            };
-            if !r.isolates() && acs::has_children(self, bdf) {
+            if !r.isolates() && let Some(port) = port_name(ty) && acs::has_children(self, bdf) {
                 open += 1;
                 let why = if r == Acs::Absent { "has no ACS" } else { "does not isolate with ACS" };
                 log!("l4h-root: pci {:02x}:{:02x}.{}: {} {}: the devices below it may reach each other without the IOMMU", b, d, f, port, why);
             }
         }
-        info!("l4h-root: PCIe ACS on in {} functions; {} ports with devices do not isolate them", on, open);
+        // Ports whose extended space root cannot read at all: outside the
+        // windows, or whose ECAM ID did not match.  A partition's other
+        // functions are other partitions' business.
+        if !partition {
+            for bdf in self.pcie_functions(0, u8::MAX) {
+                if Self::bit(&ECAM_MAPPED, bdf) {
+                    continue;
+                }
+                if let Some(port) = port_name(acs::pcie_type(self, bdf)) && acs::has_children(self, bdf) {
+                    open += 1;
+                    log!("l4h-root: pci {:02x}:{:02x}.{}: {} without ECAM: its ACS cannot be set, and the devices below it may reach each other without the IOMMU",
+                        bdf >> 8, bdf >> 3 & 0x1f, bdf & 7, port);
+                }
+            }
+        }
+        info!("l4h-root: PCIe ACS set in {} functions; {} ports with devices do not isolate them", on, open);
     }
 
-    /// The functions whose extended configuration space root can write.
-    pub fn extended(&self) -> impl Iterator<Item = u16> + '_ {
-        (0..=u16::MAX).filter(move |&bdf| self.ext && Self::bit(&ECAM_WRITABLE, bdf) && Self::bit(&ECAM_MAPPED, bdf))
+    /// The functions whose extended configuration space root can read.
+    fn reachable(&self) -> impl Iterator<Item = u16> + '_ {
+        (0..=u16::MAX).filter(move |&bdf| self.ext && Self::bit(&ECAM_MAPPED, bdf))
     }
 
     fn ecam_va(bdf: u16) -> usize {
@@ -846,7 +924,7 @@ impl Pci {
     // QEMU virt, highmem-ecam=off: 16 MiB ECAM, buses 0..15.
     const ECAM_VA: usize = crate::layout::ECAM.base;
     pub fn new(alloc: &mut Alloc, devmem: &mut crate::devmem::DevMem) -> Self {
-        use sel4::{CapRights, VmAttributes};
+        use sel4::CapRights;
         use crate::mem::ObjCtx;
         let frames = devmem.frames(&mut alloc.slots, 0x3f00_0000, 1 << 24).expect("PCI ECAM frames");
         for (n, frame) in frames.map(crate::devmem::granule).enumerate() {
@@ -865,5 +943,16 @@ impl Pci {
     }
     pub fn write32(&self, bus: u8, dev: u8, func: u8, off: u8, value: u32) {
         unsafe { self.config(bus, dev, func, off).write_volatile(value); core::arch::asm!("dmb osh", options(nostack)); }
+    }
+}
+
+/// What the log calls a PCIe port of Device/Port Type `ty` (acs::pcie_type),
+/// if ACS isolation below it matters.
+#[cfg(target_arch = "x86_64")]
+fn port_name(ty: Option<u8>) -> Option<&'static str> {
+    match ty {
+        Some(crate::acs::ROOT_PORT) => Some("root port"),
+        Some(crate::acs::DOWNSTREAM_PORT) => Some("switch downstream port"),
+        _ => None,
     }
 }

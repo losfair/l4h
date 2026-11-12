@@ -131,6 +131,10 @@ def main():
                                ("pcie-pci", "on"), ("pcie-pci", "off"),
                                ("nested-pci", "on"), ("nested-pci", "off"),
                                ("pcie-switch", "on"), ("pcie-switch", "off")]:
+        # Fails on QEMU 10.0 whatever root does (see above): only on request.
+        if args.topology is None and args.iommu == "amd" and topology == "pcie-switch":
+            print(f"VTDNET: net-{topology}-{platform} skipped with AMD-Vi (--topology {topology} runs it)", flush=True)
+            continue
         if args.topology is None or topology == args.topology:
             run(topology, platform, args.tap, env, args.controllers, not args.no_intremap)
 

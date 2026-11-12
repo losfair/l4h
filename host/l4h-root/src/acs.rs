@@ -127,21 +127,58 @@ impl Acs {
     }
 }
 
+/// The ACS capability's offset and its capability and control registers.
+fn read_acs(c: &impl Config, bdf: u16) -> Result<(u16, u16, u16), Acs> {
+    if c.read_ext(bdf, 0x100).is_none() {
+        return Err(Acs::Unreachable);
+    }
+    let off = find_ext(c, bdf, EXT_ACS).ok_or(Acs::Absent)?;
+    // The capability register, then control, in one dword (off <= 0xffc).
+    let regs = c.read_ext(bdf, off + 4).ok_or(Acs::Unreachable)?;
+    Ok((off, regs as u16, (regs >> 16) as u16))
+}
+
+/// What function `bdf` has, without changing it (a bridge another
+/// partition owns, which root maps read-only).
+pub fn state(c: &impl Config, bdf: u16) -> Acs {
+    match read_acs(c, bdf) {
+        Ok((_, cap, ctrl)) => Acs::Present { cap, before: ctrl, after: ctrl },
+        Err(r) => r,
+    }
+}
+
 /// Turn on the ENABLE bits function `bdf` implements, keeping the others.
 pub fn enable(c: &impl Config, bdf: u16) -> Acs {
-    if c.read_ext(bdf, 0x100).is_none() {
-        return Acs::Unreachable;
-    }
-    let Some(off) = find_ext(c, bdf, EXT_ACS) else { return Acs::Absent };
-    // The capability register, then control, in one dword.
-    let Some(regs) = off.checked_add(4).and_then(|o| c.read_ext(bdf, o)) else { return Acs::Unreachable };
-    let (cap, before) = (regs as u16, (regs >> 16) as u16);
+    let (off, cap, before) = match read_acs(c, bdf) {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
     let want = before | (cap & ENABLE);
     if want != before && !c.write_ext(bdf, off + 4, (want as u32) << 16 | cap as u32) {
         return Acs::Unreachable;
     }
     let after = c.read_ext(bdf, off + 4).map_or(before, |r| (r >> 16) as u16);
     Acs::Present { cap, before, after }
+}
+
+/// The blocks that map [start, end) (page aligned), largest first where
+/// alignment allows: 2^bits bytes at each address, of 2 MiB frames where
+/// bits >= 21, else of 4 KiB ones.  An ECAM window of whole 2 MiB-aligned
+/// buses is a few carves of 2 MiB frames: one device Untyped split a few
+/// times, and a slot per 2 MiB, where a page per function would split
+/// the device memory table into hundreds of pieces (devmem.rs).
+pub fn blocks(start: u64, end: u64) -> impl Iterator<Item = (u64, u32)> {
+    let mut at = start;
+    core::iter::from_fn(move || {
+        if at >= end {
+            return None;
+        }
+        // A window is at most 256 MiB (256 buses); 1 GiB bounds the shift.
+        let bits = at.trailing_zeros().min(63 - (end - at).leading_zeros()).min(30);
+        let block = (at, bits);
+        at += 1 << bits;
+        Some(block)
+    })
 }
 
 /// Whether bridge `bdf` has a function on its secondary bus.
