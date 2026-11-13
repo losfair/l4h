@@ -87,6 +87,17 @@ impl Iommu {
         }
     }
 
+    /// The requester ID function `bdf`'s DMA is translated as: its own,
+    /// or one it shares with others (a conventional PCI bridge's, a
+    /// firmware alias), whose functions then share one domain.
+    pub fn requester(&self, bdf: u16) -> u16 {
+        match self {
+            Self::Amd(a) => a.requester(bdf),
+            #[cfg(target_arch = "x86_64")]
+            Self::Intel(i) => i.requester(bdf),
+        }
+    }
+
     pub fn info(&self) -> [u64; 6] {
         match self {
             Self::Amd(a) => a.info(),

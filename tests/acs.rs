@@ -351,3 +351,12 @@ fn a_port_with_acs_isolates_its_children() {
         assert_eq!(group_in(&m, &inventory, 0x0200), peers);
     }
 }
+
+#[test]
+fn an_endpoint_beside_a_bridge_without_acs_shares_its_group() {
+    // A bridge at 00:05.0 routing bus 2, a disk at 00:05.1 and the NIC
+    // at 02:00.0.
+    let m = Model::new(&[(0x0028, Func::pcie(acs::DOWNSTREAM_PORT, None).bridge(2).multi()),
+        (0x0029, Func::pcie(0, None)), (0x0200, Func::pcie(0, None))]);
+    assert_eq!(group_in(&m, &[0x0028, 0x0029, 0x0200], 0x0200), [0x0029, 0x0200]);
+}

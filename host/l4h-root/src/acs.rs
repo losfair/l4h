@@ -242,11 +242,15 @@ pub fn group<I: Iterator<Item = u16>>(c: &impl Config, functions: impl Fn() -> I
         if !(pcie_type(c, bridge).is_some() && state(c, bridge).isolates()) {
             let (sec, sub) = buses(bridge);
             below(sec, sub, &mut add);
-            // A bridge without ACS may route to its sibling functions'
-            // buses too.
-            for sib in functions().filter(|&f| f >> 3 == bridge >> 3 && f != bridge && header(f) & 0x7f == 1) {
-                let (s2, e2) = buses(sib);
-                below(s2, e2, &mut add);
+            // A bridge without ACS may route to its sibling functions,
+            // and below those that are bridges.
+            for sib in functions().filter(|&f| f >> 3 == bridge >> 3 && f != bridge) {
+                if header(sib) & 0x7f == 1 {
+                    let (s2, e2) = buses(sib);
+                    below(s2, e2, &mut add);
+                } else {
+                    add(sib);
+                }
             }
         }
         if (bridge >> 8) as u8 >= bus {

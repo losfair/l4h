@@ -2487,8 +2487,12 @@ root restarts. Root and netd know no device kind. The design is issue
   bridge on the path that does not isolate with ACS (§9.5), those of its
   multi-function siblings, and the other functions of a multi-function
   device without ACS: every function root found in the slot, as only
-  function 0 need set the multi-function bit. The walk covers the whole
-  inventory, so no bridge or peer is left out. Binding refuses a driver that would share a confined
+  function 0 need set the multi-function bit; a bridge without ACS adds
+  its slot's other functions, endpoints too. The walk covers the whole
+  inventory, so no bridge or peer is left out. The group also takes every
+  function the IOMMU translates as the NIC's requester (behind a PCI
+  bridge, or an IVHD alias), which shares its domain whatever ACS does.
+  Binding refuses a driver that would share a confined
   NIC's group, and every start checks again. A virtio NIC's driver is never
   confined: the device takes the IOMMU path only if the driver negotiates
   `ACCESS_PLATFORM`, which the driver, the untrusted party, decides.

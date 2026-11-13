@@ -307,6 +307,11 @@ impl AmdVi {
 
     /// CTL_IOMMU_INFO's values: state, interrupts remapped, IOMMUs,
     /// devices confined, devices behind no IOMMU, events logged.
+    /// The requester device `id` shares a domain by (IVHD aliases).
+    pub fn requester(&self, id: u16) -> u16 {
+        self.dev.as_ref().map_or(id, |d| d.alias[id as usize])
+    }
+
     pub fn info(&self) -> [u64; 6] {
         let remapped = self.active() && self.intremap;
         [self.state, remapped as u64, self.units.len() as u64, self.confined, self.unconfined, self.events]
