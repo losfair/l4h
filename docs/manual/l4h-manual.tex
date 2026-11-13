@@ -1761,15 +1761,19 @@ use less than its cap when one part runs out before the other.
 Uncapped VMMs can use spare CPU time; idle VMs reserve no share from busy
 ones. If VMMs consume at least 80\% of a contended core, the balancer
 withdraws the I/O boost from the largest consumer, including ties.
-Contention includes runnable guests or VMMs, at least one scheduling
+Contention includes other runnable guests or VMMs, at least one scheduling
 quantum of other VMM work, or the logger sharing core 0. Brief timer
 bookkeeping by idle VMMs does not suffice.
-Demoted VMMs share at most half the core while running guests have
+Demoted VMMs share at most half the core while other running guests have
 vCPUs assigned there, including when those vCPUs block or await a refill.
 They stay above guest kernels and below the logger. The extra limit is
-removed when no running guest has a vCPU on the core; the manager
-reinstalls it before a guest starts or moves there. This favours wakeup
-latency over reclaiming brief idle gaps while protection is active.
+removed when no other running guest has a vCPU on the core; the manager
+reinstalls it before another guest starts or moves there. A VMM's own
+vCPUs do not count as contention or reserve CPU against it, so a
+one-vCPU guest's sustained I/O does not impose this extra limit on itself.
+An idle other guest retains protection once the boost is withdrawn.
+This favours wakeup latency over reclaiming brief idle gaps while
+protection is active.
 Explicit guest caps still apply. Quiet neighbours keep their boost.
 Only the manager can restore it, after continuous use below half the
 allowance for 1 second, increasing to at most 16 seconds after repeated

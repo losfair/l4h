@@ -89,28 +89,32 @@ fn configure_vmm(info: &HostInfo, g: &mut Guest, p: budget::Plan) -> bool {
 
 /// Placement, not instantaneous readiness, controls an existing guard.
 /// A blocked or budget-depleted guest can wake before the next sample.
+/// Keep guest identities so a VMM never reserves CPU against its own guest.
 #[derive(Clone, Copy)]
 struct Arrival { guest: usize, cores: u64 }
 
-fn occupied(h: &Vmmgr, arrival: Option<Arrival>) -> [bool; topology::MAX_CPUS] {
-    let mut cores = [false; topology::MAX_CPUS];
+fn occupied(h: &Vmmgr, arrival: Option<Arrival>) -> [u64; topology::MAX_CPUS] {
+    let mut cores = [0; topology::MAX_CPUS];
     for g in h.guests.iter().flatten().filter(|g| g.state == State::Running) {
-        for v in &g.vcpus { cores[v.core] = true; }
+        for v in &g.vcpus { cores[v.core] |= 1u64 << g.id; }
     }
     if let Some(a) = arrival.filter(|a| h.guest(a.guest).is_some_and(|g| g.state != State::Stopped)) {
-        for (i, core) in cores.iter_mut().enumerate() { *core |= a.cores & (1u64 << i) != 0; }
+        for (i, core) in cores.iter_mut().enumerate() {
+            if a.cores & (1u64 << i) != 0 { *core |= 1u64 << a.guest; }
+        }
     }
     cores
 }
 
-/// Reconcile all limits together so only guarded VMMs on occupied cores
-/// divide the half-core pool. Stable placement/boost keeps the installed
-/// SCs unchanged, regardless of blocking and refill phase.
+/// Reconcile all limits together so guarded VMMs sharing a core with other
+/// guests divide the half-core pool. Stable placement/boost keeps the
+/// installed SCs unchanged, regardless of blocking and refill phase.
 fn protect(h: &mut Vmmgr, arrival: Option<Arrival>) {
     loop {
         let occupied = occupied(h, arrival);
         for g in h.guests.iter_mut().flatten().filter(|g| active(g)) {
-            g.vmm_limited = !g.vmm_boosted && occupied[g.vmm_limits.expect("VMM limits").0];
+            g.vmm_limited = !g.vmm_boosted
+                && occupied[g.vmm_limits.expect("VMM limits").0] & !(1u64 << g.id) != 0;
         }
         let backgrounds = counts(h);
         let mut failed = false;
@@ -186,6 +190,7 @@ pub fn set_cap(h: &mut Vmmgr, gid: usize, cap_pct: u32) -> Result<(), Errno> {
 }
 
 const _: () = assert!(crate::MAX_GUESTS <= policy::MAX_GUESTS);
+const _: () = assert!(crate::MAX_GUESTS <= u64::BITS as usize);
 const _: () = assert!(sel4::sel4_cfg_usize!(MAX_NUM_NODES) <= topology::MAX_CPUS);
 
 /// The balancer's samples, one per vCPU: too large for root's stack
@@ -213,7 +218,7 @@ pub fn balance(h: &mut Vmmgr, elapsed_us: u64) {
     let mut core_vmm = [0u64; topology::MAX_CPUS];
     let mut largest = [0u64; topology::MAX_CPUS];
     let mut ready_vmms = [0usize; topology::MAX_CPUS];
-    let mut guest_ready = [false; topology::MAX_CPUS];
+    let mut guest_ready = [0u64; topology::MAX_CPUS];
     let migration = SAMPLES.with(|sample| {
         sample.clear();
         for g in h.guests.iter_mut().flatten() {
@@ -239,8 +244,9 @@ pub fn balance(h: &mut Vmmgr, elapsed_us: u64) {
                 }
                 // Query kernel-owned runnable state, not guest idle
                 // counters or a consumption ratio. This can establish
-                // contention, but cannot clear an existing guard.
-                guest_ready[g.vcpus[v].core] |= kr || ur;
+                // contention for other guests, but cannot clear an
+                // existing guard. Own vCPUs are in the VMM's trust domain.
+                if kr || ur { guest_ready[g.vcpus[v].core] |= 1u64 << g.id; }
                 // A capped vCPU whose budget split changed.
                 if g.cpu_cap_pct > 0 {
                     if let Some((ks, vs)) = budget::adapt(old, g.vcpus[v].k_share, g.vmm_share,
@@ -294,7 +300,7 @@ pub fn balance(h: &mut Vmmgr, elapsed_us: u64) {
         // having consumed CPU yet, or may have blocked after meaningful
         // work. Timer bookkeeping of a few us is not pressure: require
         // at least one configured scheduling quantum of other VMM work.
-        let contended = guest_ready[core] || core == 0
+        let contended = guest_ready[core] & !(1u64 << g.id) != 0 || core == 0
             || core_vmm[core].saturating_sub(vmm_used[g.id]) >= h.info.timeslice_us
             || ready_vmms[core] > usize::from(vmm_ready[g.id]);
         let boosted = g.vmm_guard.boost(g.vmm_boosted, vmm_used[g.id], core_vmm[core], largest[core], contended, elapsed_us,
