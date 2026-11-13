@@ -342,9 +342,9 @@ fn a_port_with_acs_isolates_its_children() {
     let all = SV | RR | CR | UF;
     let port = |acs| Func::pcie(acs::ROOT_PORT, acs).bridge(2);
     let inventory = [PORT, 0x0010, 0x0200, 0x0300];
-    for (acs, peers) in [(Some((all, all)), vec![0x0200]), (None, vec![0x0200, 0x0300])] {
-        // A sibling port 00:01.1 (bus 3) of a port without ACS is reached
-        // through it too.
+    for (acs, peers) in [(Some((all, all)), vec![0x0200]), (None, vec![0x0009, 0x0200, 0x0300])] {
+        // A sibling port 00:01.1 (bus 3) of a port without ACS, and what
+        // is below it, is reached through it too.
         let m = Model::new(&[(PORT, port(acs).multi()), (0x0009, Func::pcie(acs::ROOT_PORT, None).bridge(3)),
             (0x0010, Func::pcie(0, None)), (0x0200, Func::pcie(0, None)), (0x0300, Func::pcie(0, None))]);
         let inventory = [inventory.as_slice(), &[0x0009]].concat();
@@ -359,4 +359,30 @@ fn an_endpoint_beside_a_bridge_without_acs_shares_its_group() {
     let m = Model::new(&[(0x0028, Func::pcie(acs::DOWNSTREAM_PORT, None).bridge(2).multi()),
         (0x0029, Func::pcie(0, None)), (0x0200, Func::pcie(0, None))]);
     assert_eq!(group_in(&m, &[0x0028, 0x0029, 0x0200], 0x0200), [0x0029, 0x0200]);
+}
+
+#[test]
+fn a_bridge_beside_a_function_without_acs_shares_what_is_below_it() {
+    // A bridge at 00:05.0 routing bus 2, the NIC at 00:05.1 and a disk
+    // at 02:00.0.
+    let m = Model::new(&[(0x0028, Func::pcie(acs::DOWNSTREAM_PORT, None).bridge(2).multi()),
+        (0x0029, Func::pcie(0, None)), (0x0200, Func::pcie(0, None))]);
+    assert_eq!(group_in(&m, &[0x0028, 0x0029, 0x0200], 0x0029), [0x0028, 0x0029, 0x0200]);
+}
+
+#[test]
+fn a_group_is_closed_under_reach_and_requester_aliases() {
+    // NIC A at 00:05.0 shares a slot without ACS with B at 00:05.1, which
+    // the IOMMU translates as disk C at 00:06.0; D at 00:07.0 is alone.
+    let m = Model::new(&[(0x0028, Func::pcie(0, None).multi()), (0x0029, Func::pcie(0, None)),
+        (0x0030, Func::pcie(0, None)), (0x0038, Func::pcie(0, None))]);
+    let inventory = [0x0028u16, 0x0029, 0x0030, 0x0038];
+    let alias = |f: u16| if f == 0x0029 { 0x0030 } else { f };
+    let mut out = [0u16; 8];
+    let n = acs::closure(&m, || inventory.iter().copied(), alias, 0x0028, &mut out).unwrap();
+    let mut g = out[..n].to_vec();
+    g.sort();
+    assert_eq!(g, [0x0028, 0x0029, 0x0030]);
+    // Too many members for `out`.
+    assert_eq!(acs::closure(&m, || inventory.iter().copied(), alias, 0x0028, &mut [0u16; 2]), None);
 }

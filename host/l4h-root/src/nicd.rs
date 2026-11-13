@@ -359,27 +359,16 @@ pub fn groups(h: &mut Host) {
 
 #[cfg(target_arch = "x86_64")]
 fn group_of(h: &Host, d: pci::Device) -> ArrayVec<u16, 64> {
-    let mut group = ArrayVec::new();
-    let mut add = |b: u16| {
-        if !group.contains(&b) && group.push(b).is_err() {
-            // More than a group holds: one too large to check counts as
-            // shared with something else.
-            let _ = group.pop();
-            let _ = group.push(u16::MAX);
-        }
-    };
-    let me = bdf(&d) as u16;
+    let mut out = [0u16; 64];
     // Every function root found, however many: one left out could be a
     // bridge or peer the walk must see.
     let functions = || h.pci_inventory.iter().map(|p| p.bdf);
-    crate::acs::group(&h.pci, functions, me, &mut add);
-    // And every function whose DMA the IOMMU translates as the same
-    // requester's: they share the NIC's domain, whatever ACS does.
-    let requester = h.iommu.requester(me);
-    for f in functions().filter(|&f| h.iommu.requester(f) == requester) {
-        add(f);
+    match crate::acs::closure(&h.pci, functions, |f| h.iommu.requester(f), bdf(&d) as u16, &mut out) {
+        Some(n) => out[..n].iter().copied().collect(),
+        // More than a group holds: one too large to check counts as
+        // shared with something else.
+        None => [u16::MAX].into_iter().collect(),
     }
-    group
 }
 
 #[cfg(target_arch = "aarch64")]
