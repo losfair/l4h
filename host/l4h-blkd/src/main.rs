@@ -12,6 +12,7 @@
 #![no_std]
 #![no_main]
 
+mod ahci;
 mod nvme;
 mod scsi;
 mod virtio;
@@ -84,6 +85,7 @@ pub trait Driver {
 
 /// The controller's driver.
 enum Drv {
+    Ahci(ahci::Ahci),
     Nvme(nvme::Nvme),
     Scsi(scsi::VirtioScsi),
     Virtio(virtio::VirtioBlk),
@@ -94,6 +96,7 @@ impl Deref for Drv {
 
     fn deref(&self) -> &(dyn Driver + 'static) {
         match self {
+            Drv::Ahci(d) => d,
             Drv::Nvme(d) => d,
             Drv::Scsi(d) => d,
             Drv::Virtio(d) => d,
@@ -104,6 +107,7 @@ impl Deref for Drv {
 impl DerefMut for Drv {
     fn deref_mut(&mut self) -> &mut (dyn Driver + 'static) {
         match self {
+            Drv::Ahci(d) => d,
             Drv::Nvme(d) => d,
             Drv::Scsi(d) => d,
             Drv::Virtio(d) => d,
@@ -597,6 +601,7 @@ fn main(info: &'static Info) -> ! {
     let cfg: &BlkdConfig = unsafe { info.config() };
     let id = info.header().id;
     let drv = match cfg.kind {
+        blk::BLKD_AHCI => Drv::Ahci(ahci::Ahci::new(id, cfg, info.header().tsc_hz)),
         blk::BLKD_NVME => Drv::Nvme(nvme::Nvme::new(id, cfg)),
         blk::BLKD_VIRTIO_SCSI => Drv::Scsi(scsi::VirtioScsi::new(id, cfg)),
         _ => Drv::Virtio(virtio::VirtioBlk::new(id, cfg)),

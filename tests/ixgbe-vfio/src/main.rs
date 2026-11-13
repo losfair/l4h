@@ -1,4 +1,4 @@
-//! Drive netd's Intel X550 driver (host/l4h-netd/src/ixgbe.rs, compiled
+//! Drive the Intel 82599/X550 driver (host/l4h-nicd-ixgbe/src/ixgbe.rs, compiled
 //! here unchanged) from Linux userspace through VFIO, on the real NIC.
 //! The port must be bound to vfio-pci and cabled to a network with an
 //! IPv4 gateway that reaches the internet.  Checks, in order:
@@ -157,6 +157,16 @@ fn vfio_open(bdf: &str) -> Vfio {
 
     // Memory decoding and bus mastering (PCI command register).
     let cfg = region(VFIO_PCI_CONFIG_REGION_INDEX);
+    // Root gives each nicd a read-only PCI snapshot. Use the real device's
+    // snapshot here too, so the driver selects the same MAC variant.
+    let snapshot = unsafe {
+        libc::mmap(host::nicd::CFG_VA as *mut _, 4096, libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE, -1, 0)
+    };
+    assert_eq!(snapshot as usize, host::nicd::CFG_VA, "mmap PCI snapshot");
+    let count = unsafe { libc::pread(dev, snapshot, 4096, cfg.offset as i64) };
+    assert!(count >= 64, "read PCI snapshot");
+    assert_eq!(unsafe { libc::mprotect(snapshot, 4096, libc::PROT_READ) }, 0);
     let mut cmd = [0u8; 2];
     unsafe { libc::pread(dev, cmd.as_mut_ptr() as *mut _, 2, cfg.offset as i64 + 4) };
     let v = u16::from_le_bytes(cmd) | 0x6;

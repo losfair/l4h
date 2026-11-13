@@ -590,6 +590,7 @@ fn run(args: &[String]) -> Result<i32> {
                     1 => "nvme".to_string(),
                     // Target and LUN.
                     2 => format!("virtio-scsi {}:{}", addr & 0xff, addr >> 8),
+                    3 => format!("ahci port {addr}"),
                     _ => "virtio-blk".to_string(),
                 };
                 let failed = if r.vals[2] != 0 { ", failed (quarantined)" } else { "" };

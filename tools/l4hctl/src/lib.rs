@@ -1049,7 +1049,7 @@ impl Ctl {
 pub struct DiskInfo {
     pub index: u64,
     pub bdf: u64,
-    /// virtio-scsi: target (bits 0-7) and LUN (from bit 8); else 0.
+    /// virtio-scsi: target (bits 0-7) and LUN (from bit 8); AHCI: SATA port; else 0.
     pub address: u64,
     pub owner: Option<u64>,
     pub failed: bool,

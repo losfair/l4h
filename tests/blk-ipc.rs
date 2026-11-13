@@ -111,7 +111,7 @@ pub mod mailbox {
 }
 
 mod production {
-    use crate::{nvme, scsi, virtio};
+    use crate::{ahci, nvme, scsi, virtio};
     include!(env!("L4H_BLKD_TEST_SRC"));
 
     pub fn run(info: &'static crate::Info) -> ! {
@@ -124,6 +124,18 @@ mod production {
     }
 }
 
+mod ahci {
+    pub struct Ahci(crate::MockDriver);
+    impl Ahci { pub fn new(id: u32, cfg: &crate::host::blk::BlkdConfig, _: u64) -> Self { Self(crate::MockDriver::new(id, cfg)) } }
+    impl crate::Driver for Ahci {
+        fn units(&self) -> usize { self.0.units() }
+        fn info(&self, u: usize) -> crate::DevInfo { self.0.info(u) }
+        fn can_start(&self) -> bool { self.0.can_start() }
+        fn start(&mut self, t: u64, u: usize, o: u32, s: u64, d: &[crate::Seg]) -> Result<(), u32> { self.0.start(t,u,o,s,d) }
+        fn kick(&mut self) { self.0.kick() }
+        fn reap(&mut self, d: &mut dyn FnMut(u64,u32)) { self.0.reap(d) }
+    }
+}
 mod nvme { pub type Nvme = crate::MockDriver; }
 mod scsi { pub type VirtioScsi = crate::MockDriver; }
 mod virtio { pub type VirtioBlk = crate::MockDriver; }

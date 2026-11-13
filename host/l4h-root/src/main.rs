@@ -376,7 +376,7 @@ impl Host {
             }
         };
         for c in 0..self.ctrls.len() {
-            if self.ctrls[c].kind != l4h_host::blk::BLKD_VIRTIO_SCSI {
+            if matches!(self.ctrls[c].kind, l4h_host::blk::BLKD_VIRTIO | l4h_host::blk::BLKD_NVME) {
                 add(self.disks, Disk::new(c, 0));
                 continue;
             }

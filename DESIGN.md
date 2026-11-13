@@ -2045,7 +2045,7 @@ rejects a 65th device, and restarts dom0 while a full guest survives.
 
 ### 9.2 Block: shared controllers, LBA windows and extent volumes
 
-Each physical virtio-blk, virtio-scsi or NVMe PCI controller has one
+Each physical virtio-blk, virtio-scsi, NVMe or AHCI PCI controller has one
 persistent `l4h-blkd`. `BLK_ATTACH` attaches a finite, 4 KiB aligned LBA
 window of a disk to a guest before it starts. A writable window overlaps no
 other window of its disk; read-only windows may overlap each other, so one
@@ -2204,14 +2204,35 @@ extent.
   is a command id for each, so none fails part way. The ids (and PRP lists,
   sized by the limit) suffice for a 4 MiB request at an 8 KiB limit, unless
   the device's queue is shallower.
+- **AHCI** needs a memory BAR 5, MSI and 64-bit DMA (`CAP.S64A`).
+  Each connected ATA port publishes one disk, with 48-bit LBA addressing
+  and its reported logical sector size. ATAPI devices and port multipliers
+  are skipped. Each port has a bounded queue and up to 32 NCQ slots.
+  A flush waits for that port's earlier requests and blocks its later
+  requests, while other ports continue.
+
+  Root owns BIOS/OS handoff and the HBA reset. The driver owns each port's
+  software slot table and writes only new bits to `PxCI` and `PxSACT`.
+  It acknowledges `PxIS` and that port's `HBA.IS` bit before reading the
+  completion snapshot. Data errors or connection changes stop the port
+  before its requests fail. A port whose DMA engines cannot stop escalates
+  to the controller's existing failure handling. Discovery is static, and
+  a failed port stays offline.
+
+  This adapter uses blkd's DMA and request lifecycle.
+  [ahci-driver 0.2.2](https://docs.rs/ahci-driver/0.2.2/ahci_driver/)
+  requires its own allocating controller lifecycle, which would duplicate
+  that ownership.
 - **Boot.** Host disks are numbered by controller in PCI order, then target
-  and LUN. Before anything enables a disk controller, root resets it
+  and LUN, or SATA port. Before anything enables a disk controller, root resets it
   through a mapping of its registers, with bus mastering off, since
   firmware may leave one running: NVMe clears CC.EN and waits up to CAP.TO
   for CSTS.RDY to clear, which aborts every command and deletes the queues;
-  virtio writes 0 to `device_status` and waits until it reads back 0. It
+  virtio writes 0 to `device_status` and waits until it reads back 0.
+  AHCI completes BIOS/OS handoff, sets `GHC.HR` and waits for it to clear,
+  without a PCI bridge reset. It
   then starts every
-  controller's blkd at boot and learns the virtio-scsi units there. A blkd
+  controller's blkd at boot and learns the virtio-scsi and ATA units there. A blkd
   that has not reported its units 180 seconds after the drivers were started
   is quarantined as one that faulted, and the host boots without its disks;
   after 30 seconds root says which drivers it still waits for. The bound is
@@ -2452,10 +2473,11 @@ Adapter of Nitro EC2 instances (1d0f:ec20 and the other IDs Linux takes).
   packet/checksum/GSO tests, 65,600 checked UDP echoes across the 16-bit
   index wrap, and fresh MSI-X delivery. See `tests/ec2.md`.
 
-**Intel X550.** `l4h-nicd-ixgbe/src/ixgbe.rs` follows Linux `ixgbe` for the X550
-(8086:1563, 15d1), as on Latitude.sh m4.metal servers. It resets the MAC
-under the SW/FW PHY semaphore but not the PHY, which renegotiates the link
-with the firmware's settings (about 7 s on 10GBASE-T), then sets up one RX
+**Intel 82599 and X550.** `l4h-nicd-ixgbe/src/ixgbe.rs` follows Linux `ixgbe`
+for the single-port 82599 SFP+ (8086:1557) and X550 (8086:1563, 15d1).
+It resets the MAC under the SW/FW PHY semaphore. The 82599 uses a link
+reset instead when the link is down. The link uses the firmware's settings
+(about 7 s on 10GBASE-T). The driver then sets up one RX
 and one TX queue of advanced descriptors: 512 RX buffers of 2 KiB (larger
 frames span buffers), CRC stripping, no RSC or RSS, promiscuous like the
 other uplinks. RX raises MSI-X entry 0 and TX entry 1, both programmed with
@@ -2468,7 +2490,14 @@ field loses the length and the IPv4 length and checksum are left to the
 device; data descriptors take at most 16 KiB each. `tests/ixgbe-vfio`
 compiles the driver unchanged into a Linux program that drives a real port
 through VFIO (ARP, ICMP, DNS, UDP checksum offload, 4 KB and 60 KB TSO, both
-interrupt causes).
+interrupt causes). The 82599 uses SWSM.SWESMBI for SW/FW arbitration,
+while X550 uses SWFW_SYNC.REGSMP. Its MAC reset preserves the SFP+/DAC
+link mode in AUTOC/AUTOC2 and restarts the link under the PHY semaphore.
+The receive packet buffer is 512 KiB on 82599 and 384 KiB on X550.
+Other 82599 device IDs are not advertised.
+
+The MAC layer owns reset, link mode and firmware arbitration. Both MAC
+types use the same queue and offload code.
 
 **Intel 82574L.** `l4h-nicd-e1000e/src/e1000e.rs` follows Linux `e1000e` for the
 82574L and 82583V (8086:10d3, 150c), the parts of that family with MSI-X;
@@ -3156,8 +3185,9 @@ whose components assume a static, Microkit-shaped system.
 | `l4h-root` | 1 | Boots the host and spawns the other components. Owns PCI, the IOMMU, interrupts, disks, reset and the RTC. Makes guests' I/O pools, disk channels and netd ports when vmmgr asks, and authorizes disk and NIC attachments. Serves the control ops on the host's disks, switches and NICs; runs the serial monitor and the dashboard. |
 | `l4h-vmmgr` | 1 | Builds guest CSpaces, kernel VSpaces, vCPUs and boot info from memory it gets from memd; loads the guest kernel and images; measures launches; spawns guests' VMMs. Runs lifecycle, the control API and the balancer (§10.3). |
 | `l4h-vmm` | 1 per guest | Serves virtio backends, console, display and hypercalls using the guest's I/O pool and host-owned pages. Never maps guest RAM. |
-| `l4h-blkd` | 1 per disk controller | Validates pool addresses and LBA windows and drives a virtio-blk, virtio-scsi or NVMe PCI controller for all its clients. |
-| `l4h-netd` | 1 | Runs all L2 switches, guest ports and the virtio-net, gVNIC, ENA, X550 and ConnectX-5 uplink drivers. |
+| `l4h-blkd` | 1 per disk controller | Validates pool addresses and LBA windows and drives a virtio-blk, virtio-scsi, NVMe or AHCI PCI controller for all its clients. |
+| `l4h-netd` | 1 | Runs L2 switches and guest ports, and exchanges frames with the NIC drivers (§9.8). |
+| `l4h-nicd-*` | 1 per uplink | Drives one NIC with root-granted BARs, interrupts and DMA memory, and exchanges frames with netd. |
 | `l4h-trustd` | 1 | Maintains taint/seal flags; with a TPM, quotes its signing key and signs guests' reports (§10.2). |
 | `l4h-memd` | 1 | Owns free memory and every guest's RAM blocks; gives root and vmmgr memory for host objects; serves memory hotplug; reports free memory to the hypervisor (§8.4). |
 | `l4h-usbd` | 1 per claimed xHCI controller | Drives a whole USB controller for the guest it is assigned to; validates its requests and pool segments (§9.7). |
@@ -4716,10 +4746,11 @@ curl -fsSL https://raw.githubusercontent.com/losfair/l4h/main/tools/install.sh |
   and userspace. `--check` runs it read-only. Some cloud VMs omit the
   `constant_tsc` flag; `--assume-stable-tsc` waives that check, assuming
   rather than verifying a stable TSC, which l4h uses directly.
-- **Supported layouts.** Headless systemd installations with a plain
-  ext4/XFS root on NVMe namespace 1 or a supported virtio disk, exposed to
-  dom0 as partition windows (§10.1), and one or two physical virtio-net,
-  gVNIC, ENA, X550 or ConnectX-5 NICs. Each NIC becomes the uplink of its own switch
+- **Supported layouts.** Headless systemd installations need a plain
+  ext4/XFS root on NVMe namespace 1, a supported virtio disk, or supported
+  AHCI SATA. dom0 sees its partition windows (§10.1).
+  There can be one or two physical virtio-net, gVNIC, ENA, 82599/X550 or
+  ConnectX-5 NICs. Each NIC becomes the uplink of its own switch
   (switch 0, then 1, in PCI address order), and dom0 gets one interface on
   each with the original name and MAC, so existing address, route and DNS
   settings apply. Software interfaces (WireGuard, PPP, GRE, TUN/TAP and the
@@ -4728,7 +4759,7 @@ curl -fsSL https://raw.githubusercontent.com/losfair/l4h/main/tools/install.sh |
   GENEVE and MAC/IP VLANs, plus nftables FIB lookups and redirects. Profiles
   tied to a PCI path or native driver may need adaptation. Rejected: NICs
   enslaved to a bond or bridge, LVM, encryption, RAID, Btrfs, a separate
-  `/usr`, SATA/USB storage, active AppArmor profiles and DKMS modules.
+  `/usr`, SAS/USB or unsupported AHCI storage, active AppArmor profiles and DKMS modules.
 - **Memory.** At least 768 MiB usable RAM. dom0 gets half the usable RAM
   (512 MiB to 8 GiB); `--memory MiB` overrides it, up to 60 GiB, keeping at
   least 256 MiB for l4h. Swap does not count. `--vcpus` sets dom0's vCPUs.
@@ -5323,7 +5354,7 @@ machine and guests of 256–512 MiB.
 | `tests/run-modtest.sh` | external kernel module relocation, load and unload |
 | `tests/run-bpftest.sh [vcpus]` | BPF JIT: the kernel's BPF test vectors, verified XDP and tc programs, direct tail calls patched in and out, XDP (generic) and tcx on lo |
 | `tests/run-android.sh`, `tests/run-androidtest.sh` | Android 17 boot to the lock screen; Android's kernel features (§5.8) |
-| `tests/run-blktest.sh` (`BLKTEST_DEV=nvme`, `scsi`, `scsi-legacy`, `scsi-luns`, `virtio-legacy`) | disk pass-through, data integrity |
+| `tests/run-blktest.sh` (`BLKTEST_DEV=nvme`, `scsi`, `scsi-legacy`, `scsi-luns`, `virtio-legacy`, `ahci`, `ahci-disks`) | disk windows and data integrity; AHCI adds static ATA ports behind an ATAPI device, parallel I/O and independent disks |
 | `tests/run-sharedblk.sh` | shared controllers: concurrent clients, windows, provisioning, destroy during I/O |
 | `tests/run-lvmblk.sh` | LVM linear volumes as extent disks: dm-linear agreement, split requests, overlap and provisioning refusal (needs `lvm2` on the build host) |
 | `tests/run-ctltest.sh` | VM lifecycle, console, clean shutdown, disk re-attach, windows, reclaim |

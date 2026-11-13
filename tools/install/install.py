@@ -14,6 +14,7 @@ import datetime
 import fcntl
 import hashlib
 import json
+import mmap
 import os
 from pathlib import Path, PurePosixPath
 import platform
@@ -247,11 +248,13 @@ class Preflight:
         config = (pci / "config").read_bytes()
         need(len(config) >= 64, "cannot read PCI capabilities for " + pci.name)
         # Walk the conventional capability list, with cycle and bounds checks.
-        offset, seen, msix, modern, virtio = config[0x34] & ~3, set(), 0, False, False
+        offset, seen, msix, msi, modern, virtio = config[0x34] & ~3, set(), 0, False, False, False
         while offset:
             need(0x40 <= offset <= min(len(config) - 4, 0xFC) and offset not in seen,
                  "invalid or unreadable PCI capability list for " + pci.name)
             seen.add(offset)
+            if config[offset] == 5:
+                msi = True
             if config[offset] == 0x11:
                 msix = (int.from_bytes(config[offset + 2:offset + 4], "little") & 0x7FF) + 1
             if config[offset] == 9:
@@ -264,7 +267,7 @@ class Preflight:
             bars.append((end - start + 1 if start else 0, bool(flags & 0x100)))
         need(len(bars) == 6, "cannot read PCI BARs for " + pci.name)
         return dict(bdf=pci.name[5:], vendor=number("vendor"), device=number("device"),
-                    cls=number("class"), msix=msix, modern=modern, bars=bars,
+                    cls=number("class"), msix=msix, msi=msi, modern=modern, bars=bars, sysfs=pci,
                     legacy=not virtio and bars[0][1] and bars[0][0] >= 0x20)
 
     def disk(self, block):
@@ -280,8 +283,19 @@ class Preflight:
             device in (0x1001, 0x1042) and (pci["modern"] or device == 0x1001 and pci["legacy"]) or
             device in (0x1004, 0x1048) and (pci["modern"] or device == 0x1004 and pci["legacy"]))
         nvme = pci["cls"] == 0x010802 and pci["bars"][0][0] >= 0x2000
-        need(pci["msix"] and (virtio or nvme), block["name"] +
-             ": L4H needs NVMe, virtio-blk or virtio-scsi with MSI-X; SATA/SAS/USB are unsupported")
+        ahci = pci["cls"] == 0x010601 and not pci["bars"][5][1] and pci["bars"][5][0] >= 0x180
+        need(pci["msix"] and (virtio or nvme) or ahci and pci["msi"], block["name"] +
+             ": L4H needs NVMe, virtio-blk or virtio-scsi with MSI-X, or AHCI with MSI")
+        if ahci:
+            try:
+                with (pci["sysfs"] / "resource5").open("rb", buffering=0) as resource:
+                    with mmap.mmap(resource.fileno(), 4, access=mmap.ACCESS_READ) as registers:
+                        cap = int.from_bytes(registers[:4], "little")
+            except (OSError, ValueError) as error:
+                raise Incompatible(block["name"] + ": cannot read AHCI capabilities: " + str(error)) from error
+            need(cap & (1 << 31), block["name"] + ": AHCI controller needs 64-bit DMA")
+            need(0x100 + ((cap & 31) + 1) * 0x80 <= pci["bars"][5][0],
+                 block["name"] + ": AHCI port registers exceed BAR 5")
         if nvme:
             need(self.read("/sys/class/block/" + name + "/nsid") == "1",
                  block["name"] + ": L4H supports only NVMe namespace 1")
@@ -454,10 +468,10 @@ class Preflight:
                 vendor == 0x1AF4 and device in (0x1000, 0x1041) and pci["msix"] >= 1
                 and (pci["modern"] or device == 0x1000 and pci["legacy"]) or
                 vendor == 0x1AE0 and device == 0x0042 and mem(0) and mem(2) and pci["msix"] >= 3 or
-                vendor == 0x8086 and device in (0x1563, 0x15D1) and mem(0) and pci["msix"] >= 2 or
+                vendor == 0x8086 and device in (0x1557, 0x1563, 0x15D1) and mem(0) and pci["msix"] >= 2 or
                 vendor == 0x1D0F and device in (0x0EC2, 0x1EC2, 0xEC20, 0xEC21, 0x0051) and mem(0) and pci["msix"] >= 2 or
                 vendor == 0x15B3 and device == 0x1017 and mem(0) and pci["msix"] >= 1)
-            need(supported, name + ": supported uplinks are virtio-net, gVNIC, ENA, Intel X550 and ConnectX-5")
+            need(supported, name + ": supported uplinks are virtio-net, gVNIC, ENA, Intel 82599 SFP+/X550 and ConnectX-5")
             need(not bond or vendor == 0x15B3 and device == 0x1017,
                  "bond migration currently needs two ConnectX-5 ports")
             need(bond or self.read(base + "/addr_assign_type") == "0",
