@@ -31,6 +31,7 @@ mod config;
 mod ctl;
 mod dashboard;
 mod devmem;
+mod drivers;
 mod iommu;
 mod layout;
 mod logd;
@@ -38,6 +39,7 @@ mod mailbox;
 mod memd;
 mod monitor;
 mod netd;
+mod nicd;
 mod partition;
 mod pci;
 mod reset;
@@ -327,7 +329,7 @@ impl Host {
     /// Whether every driver has published what boot reads (its units, its
     /// NICs' MACs), or never will.
     fn drivers_ready(&self) -> bool {
-        self.ctrls.iter().all(|c| c.ready()) && self.netd.ready()
+        self.ctrls.iter().all(|c| c.ready()) && self.netd.ready() && nicd::ready()
     }
 
     /// The drivers have had DRIVERS_SLOW_SECS: say which boot still waits
@@ -340,7 +342,10 @@ impl Host {
             }
         }
         if !self.netd.ready() {
-            log!("l4h-root: netd has not reported its NICs yet; boot waits {} s more at most", DRIVERS_READY_SECS - DRIVERS_SLOW_SECS);
+            log!("l4h-root: netd has not started yet; boot waits {} s more at most", DRIVERS_READY_SECS - DRIVERS_SLOW_SECS);
+        }
+        if !nicd::ready() {
+            log!("l4h-root: NIC drivers are not up yet; boot waits {} s more at most", DRIVERS_READY_SECS - DRIVERS_SLOW_SECS);
         }
     }
 
@@ -351,10 +356,11 @@ impl Host {
             blkd::unpublished(self, c);
         }
         if !self.netd.ready() {
-            log!("l4h-root: netd did not report its NICs");
+            log!("l4h-root: netd did not start");
             self.netd.fail(&self.pci);
             netd::Netd::poll(self);
         }
+        nicd::fail_unready(self);
     }
 
     /// Number the host disks, once their blkds are ready: one per unit of
@@ -389,6 +395,7 @@ impl Host {
             blkd::poll(self, c);
         }
         netd::Netd::poll(self);
+        nicd::poll(self);
         usb::poll(self);
         if let Some(v) = self.vmmgr.as_mut() {
             v.poll();
@@ -540,8 +547,8 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     // The statics' only references, taken once here; the root task is
     // single-threaded.
     let ctrls = unsafe { &mut *(&raw mut CTRLS) };
-    let mut nics = ArrayVec::<pci::Device, { host::net::MAX_NICS }>::new();
-    let mut nic_bars = ArrayVec::<blkd::BarCache, { host::net::MAX_NICS }>::new();
+    // The NIC drivers, which say which functions are network devices.
+    nicd::drivers().load(module("l4h-drivers"));
     let mut balloon = None;
     let pci_inventory = pci::INVENTORY.take();
     for d in pci.enumerate() {
@@ -568,24 +575,21 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
             // memory it was given is not known), and a reset, since bus
             // mastering is enabled again on attach.
             pci.disable(&d);
-            let v = pci::VECTOR_DISK_BASE + ctrls.len() as u64;
+            let Some(v) = pci::vector_alloc() else {
+                log!("l4h-root: no interrupt vector left for disk controller {:02x}:{:02x}.{}; ignoring it", d.bus, d.dev, d.func);
+                continue;
+            };
             let mut ctrl = Controller::new(d, v);
             blkd::reset(&mut ctrl, &pci, &mut alloc, &mut devmem, &mut wins.a, info.tsc_hz / 1000);
             pci.disable(&ctrl.pci);
             // Below MAX_DISK_CTRLS: checked above.
             let _ = ctrls.push(ctrl);
             record.owner = l4h_abi::PCI_OWNER_BLKD;
-        } else if netd::is_uplink(&d) {
+        } else if nicd::is_network(&d, &nicd::ids_of(&d, &pci), cfg.nic_pin(netd::bdf(&d)).is_some()) {
+            // Bound (and its driver started) once the host is up.
             record.owner = l4h_abi::PCI_OWNER_ROOT;
-            pci.disable(&d);
-            let mut bars = [const { None }; 6];
-            if nics.is_full() {
-                log!("l4h-root: more than {} NICs, ignoring {:02x}:{:02x}.{}", host::net::MAX_NICS, d.bus, d.dev, d.func);
-            } else if netd::carve(&mut alloc, &mut devmem, &d, &mut bars) {
-                nics.must_push(d);
-                nic_bars.must_push(bars);
-                record.owner = l4h_abi::PCI_OWNER_NETD;
-            }
+            let ids = nicd::ids_of(&d, &pci);
+            nicd::found(d, ids, cfg.nic_pin(netd::bdf(&d)), &pci);
         } else if usb::is_xhci(&d) {
             // Left to the firmware, enabled as it is, until claimed.
             usb::found(d, &pci, &mut alloc, &mut devmem);
@@ -620,7 +624,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         #[cfg(target_arch = "x86_64")]
         acpi_frames,
     );
-    let netd = netd::spawn(&nics, &nic_bars, &pci, &mut iommu, &mut alloc, &mut wins.a, &mut asids, &info);
+    let netd = netd::spawn(&mut alloc, &mut wins.a, &mut asids, &info);
 
     let mut h = Host {
         info,
@@ -652,6 +656,8 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         channels: None,
     };
     h.start_disks();
+    // The NICs' drivers, each a nicd of its own.
+    nicd::boot(&mut h);
     // The serial port and its interrupt (an I/O APIC pin) are partition 0's.
     if !partition::secondary() {
         h.monitor = uart.as_ref().and_then(|u| monitor::Monitor::new(&mut h.alloc, wd_ntfn, u.monitor, h.cfg.serial_port, h.cfg.serial_irq, &mut h.iommu));
@@ -735,10 +741,12 @@ fn dom0_plan(h: &mut Host, ntfn: cap::Notification) -> Dom0Plan {
     // uplink.
     let sw = 0;
     h.netd.create_switch();
+    // The first NIC with a driver (up or not yet), or the one uplink_nic
+    // names.
     let nic = match h.cfg.uplink_nic {
-        None => (!h.netd.nics.is_empty()).then_some(0),
+        None => (0..nicd::nics().len()).find(|&n| nicd::nics()[n].driver.is_some()),
         Some(bdf) => {
-            let n = h.netd.nics.iter().position(|n| netd::bdf(&n.pci) == bdf);
+            let n = nicd::nics().iter().position(|n| netd::bdf(&n.pci) == bdf);
             if n.is_none() {
                 log!("l4h-root: no uplink NIC at {:02x}:{:02x}.{}", bdf >> 8, (bdf >> 3) & 0x1f, bdf & 7);
             }
@@ -757,7 +765,7 @@ fn dom0_plan(h: &mut Host, ntfn: cap::Notification) -> Dom0Plan {
     // dom0's first vNIC takes the uplink NIC's MAC address: networks
     // like GCE's only deliver frames for the instance's own address, so
     // dom0 is then the host's router (DESIGN.md §9.3).
-    let uplink = h.netd.nics.iter().position(|n| n.switch == Some(sw));
+    let uplink = h.netd.uplink_on(sw);
     for i in 0..h.cfg.dom0_nics {
         let mac = if i == 0 { uplink.and_then(|n| h.netd.nic_mac(n)).unwrap_or(0) } else { 0 };
         add_nic(sw, mac);
@@ -765,7 +773,7 @@ fn dom0_plan(h: &mut Host, ntfn: cap::Notification) -> Dom0Plan {
     // The second uplink NIC, if any, on switch 1, then the internal
     // switches. dom0 finds its vNICs by MAC, not by their order.
     let uplink2 = h.cfg.uplink2_nic.and_then(|bdf| {
-        let n = h.netd.nics.iter().position(|n| netd::bdf(&n.pci) == bdf);
+        let n = nicd::nics().iter().position(|n| netd::bdf(&n.pci) == bdf);
         if n.is_none() {
             log!("l4h-root: no second uplink NIC at {:02x}:{:02x}.{}", bdf >> 8, (bdf >> 3) & 0x1f, bdf & 7);
         }
@@ -947,6 +955,7 @@ impl l4h_ipc::Server for Root<'_> {
             dashboard::Dashboard::tick(h);
             channel::tick(h);
             trustd::tick(h);
+            nicd::tick(h);
             h.iommu.poll();
             if h.cfg.watchdog_secs != 0 && rdtsc() >= self.next_watchdog {
                 watchdog_dump(h);
@@ -963,7 +972,7 @@ impl l4h_ipc::Server for Root<'_> {
         // A driver (it has no keeper) is failed here; trustd's start-up
         // stops.
         let h = &mut *self.h;
-        let _ = blkd::fault(h, id) || netd::Netd::fault(h, id) || crate::usb::fault(h, id);
+        let _ = blkd::fault(h, id) || netd::Netd::fault(h, id) || nicd::fault(h, id) || crate::usb::fault(h, id);
         trustd::fault(h, id);
     }
 

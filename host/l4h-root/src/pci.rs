@@ -149,23 +149,58 @@ where
     }
 }
 
-/// seL4 user interrupt vectors (CPU vector 0x30 + n, n <= 107 on x86),
-/// split between the users so that they never collide: NICs from 0, the
-/// serial port 8, disk controllers 16..80; multikernel doorbells from
-/// partition P (l4h_partition) at 88 + P for its link (to netd) and
-/// 96 + P for its control channel (to root).
-pub const VECTOR_NIC_BASE: u64 = 0;
+/// seL4 user interrupt vectors (CPU vector 0x30 + n, n < 108, on x86;
+/// GICv2m SPI 80 + n, n < 64, on aarch64), which root hands out from one
+/// pool as it drives devices (`vector_alloc`): a disk controller's, an
+/// xHCI's, a NIC's, each keeping its own until reboot.  No kind of device
+/// has a share of its own, so a host with many NICs and few disks has
+/// vectors for all of them.  Only those another party
+/// chose are kept out: the serial monitor's I/O APIC pin, and the
+/// multikernel doorbells, partition P's at LINK_VECTOR_BASE + P (its link
+/// to netd) and CONTROL_VECTOR_BASE + P (its control channel to root).
+#[cfg(target_arch = "x86_64")]
+pub const VECTORS: u64 = 108;
+#[cfg(target_arch = "aarch64")]
+pub const VECTORS: u64 = 64;
 #[cfg(target_arch = "x86_64")]
 pub const VECTOR_MONITOR: u64 = 8;
-pub const VECTOR_DISK_BASE: u64 = 16;
-/// xHCI controllers, as they are claimed: the vectors left between the
-/// NICs (MAX_NICS from 0), the monitor and the disks, and on x86 between
-/// the disks and the multikernel doorbells.
+
+/// The vectors handed out, a bit each (vector v: word v / 64).
+static VECTORS_USED: [core::sync::atomic::AtomicU64; 2] = {
+    let r = reserved_vectors();
+    [core::sync::atomic::AtomicU64::new(r as u64), core::sync::atomic::AtomicU64::new((r >> 64) as u64)]
+};
+
+const fn reserved_vectors() -> u128 {
+    #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
+    let mut used = !0u128 << VECTORS;
+    #[cfg(target_arch = "x86_64")]
+    {
+        used |= 1 << VECTOR_MONITOR;
+        let p = l4h_partition::MAX_PARTITIONS as u32;
+        used |= ((1u128 << p) - 1) << l4h_partition::LINK_VECTOR_BASE;
+        used |= ((1u128 << p) - 1) << l4h_partition::CONTROL_VECTOR_BASE;
+    }
+    used
+}
 #[cfg(target_arch = "x86_64")]
-pub const VECTORS_USB: [u64; 16] = [80, 81, 82, 83, 84, 85, 86, 87, 4, 5, 6, 7, 9, 10, 11, 12];
-#[cfg(target_arch = "aarch64")]
-pub const VECTORS_USB: [u64; 12] = [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
-const _: () = assert!(l4h_host::net::MAX_NICS <= 4);
+const _: () = assert!((l4h_partition::CONTROL_VECTOR_BASE as usize + l4h_partition::MAX_PARTITIONS) as u64 <= VECTORS);
+
+/// A free vector, now the caller's, lowest first; None when all are used.
+/// Root is one thread: a load and a store.
+pub fn vector_alloc() -> Option<u64> {
+    use core::sync::atomic::Ordering::Relaxed;
+    for (w, word) in VECTORS_USED.iter().enumerate() {
+        let used = word.load(Relaxed);
+        if used != u64::MAX {
+            let b = (!used).trailing_zeros() as u64;
+            word.store(used | 1 << b, Relaxed);
+            return Some(w as u64 * 64 + b);
+        }
+    }
+    None
+}
+
 /// Disk controllers beyond this many are left alone.
 #[cfg(target_arch = "x86_64")]
 pub const MAX_DISK_CTRLS: usize = 64;

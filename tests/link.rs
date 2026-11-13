@@ -47,7 +47,7 @@ pub mod host {
         }
     }
 }
-#[path = "../host/l4h-netd/src/offload.rs"]
+#[path = "../host/l4h-netcore/src/offload.rs"]
 mod offload;
 #[path = "../host/l4h-netd/src/link.rs"]
 mod link;

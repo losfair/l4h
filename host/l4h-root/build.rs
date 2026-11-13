@@ -1,5 +1,6 @@
 // Embeds the host components ($L4H_VMMGR_ELF, which embeds l4h-vmm, $L4H_BLKD_ELF, $L4H_NETD_ELF,
-// $L4H_TRUSTD_ELF, $L4H_MEMD_ELF, $L4H_LOGD_ELF, $L4H_USBD_ELF; built by tools/build-host.sh), empty
+// $L4H_TRUSTD_ELF, $L4H_MEMD_ELF, $L4H_LOGD_ELF, $L4H_USBD_ELF, and the NIC driver bundle
+// $L4H_DRIVERS_BIN; built by tools/build-host.sh), empty
 // placeholders when unset.  dom0 is not built in: it comes as boot
 // modules, or appended to the built ELF by tools/add-modules.py.  The other variables are the settings' defaults
 // (src/config.rs).
@@ -16,6 +17,7 @@ fn main() {
         ("L4H_MEMD_ELF", "l4h-memd.elf"),
         ("L4H_LOGD_ELF", "l4h-logd.elf"),
         ("L4H_USBD_ELF", "l4h-usbd.elf"),
+        ("L4H_DRIVERS_BIN", "l4h-drivers.bin"),
     ] {
         println!("cargo:rerun-if-env-changed={var}");
         let data = match env::var(var) {
@@ -43,4 +45,6 @@ fn main() {
     println!("cargo:rerun-if-env-changed=L4H_SERIAL_PORT");
     println!("cargo:rerun-if-env-changed=L4H_SERIAL_IRQ");
     println!("cargo:rerun-if-env-changed=L4H_FB_CONSOLE");
+    println!("cargo:rerun-if-env-changed=L4H_NIC_AUTO");
+    println!("cargo:rerun-if-env-changed=L4H_NIC_MAX_RESTARTS");
 }

@@ -1,5 +1,6 @@
-//! netd: the L2 virtual switches and the uplink NIC drivers (virtio-net,
-//! Google gVNIC, Amazon ENA and Intel X550).
+//! netd: the L2 virtual switches.  Uplink NICs are driven outside it, by
+//! nicds (crate::nicd), each joined to netd by an uplink channel
+//! (crate::uplink).
 //!
 //! A port channel is one shared region between netd and a client (a
 //! guest's l4h-vmm, one per virtio-net device) with a TX ring (client ->
@@ -56,8 +57,9 @@ pub const PORT_PAGES: usize = core::mem::size_of::<Port>().div_ceil(4096);
 
 /// Ports netd serves; port p kicks netd with badges::netd::PORT bit p.
 pub const MAX_PORTS: usize = 48;
-/// Uplink NICs; NIC n interrupts with badges::netd::IRQ bit n.
-pub const MAX_NICS: usize = 4;
+/// Uplinks: channels to nicds.  Any of them signals badges::netd::UPLINK,
+/// and netd looks at them all.
+pub const MAX_UPLINKS: usize = 16;
 /// Links to other partitions' netds (multikernel, DESIGN.md §11.4): one
 /// to each other partition.  Link l's doorbell (and netd's own kick to
 /// read on later) signals badges::netd::LINK bit l.
@@ -68,9 +70,9 @@ pub const LINK_CHANNEL_MAX: usize = 2 << 20;
 /// Switches: one per port and NIC is the most that can carry traffic at
 /// once.  Root refuses to create more, so netd keeps a fixed table of them
 /// indexed by switch number.
-pub const MAX_SWITCHES: usize = MAX_PORTS + MAX_NICS;
+pub const MAX_SWITCHES: usize = MAX_PORTS + MAX_UPLINKS;
 
-/// netd address space: port p at port_va(p); NIC n's BARs and DMA memory.
+/// netd address space: port p at port_va(p), link l's channel, uplink n's.
 pub const fn port_va(p: usize) -> usize {
     crate::SHARED_VA + p * 0x40_0000
 }
@@ -78,18 +80,15 @@ pub const fn port_va(p: usize) -> usize {
 pub const fn link_va(l: usize) -> usize {
     crate::SHARED_VA + 0x1000_0000 + l * LINK_CHANNEL_MAX
 }
-pub const fn nic_bar_va(n: usize, bar: usize) -> usize {
-    crate::MMIO_VA + n * 0x800_0000 + bar * 0x100_0000
+pub const fn uplink_va(n: usize) -> usize {
+    crate::MMIO_VA + n * UPLINK_CHANNEL_MAX
 }
-pub const fn nic_dma_va(n: usize) -> usize {
-    crate::DMA_VA + n * 0x200_0000
-}
+pub const UPLINK_CHANNEL_MAX: usize = crate::uplink::MAX_CHANNEL_SIZE.next_power_of_two();
 
-/// netd CSpace: IRQ handler of NIC n, notification of the client of port p
-/// (badged with its "done" bit).
-pub const NETD_SLOT_IRQ_BASE: u64 = 32;
-/// I/O port capability of a legacy virtio NIC n (NicConfig::legacy_io).
-pub const NETD_SLOT_IOPORT_BASE: u64 = 40;
+/// netd CSpace: uplink n's nicd's notification (badged
+/// badges::nicd::NETD), notification of the client of port p (badged with
+/// its "done" bit).
+pub const NETD_SLOT_UPLINK_BASE: u64 = 32;
 /// Link l: the IRQ handler of its doorbell; root's notification, badged
 /// for the link, which asks root to ring the peer's doorbell (netd cannot:
 /// only root holds IRQControl); and netd's own, badged as the doorbell.
@@ -118,7 +117,7 @@ crate::protocol! {
     /// Commands from l4h-root (crate::mailbox, crate::wire::protocol),
     /// which netd carries out in order.  Root has validated them, keeps
     /// their state, and reads only the answers' count: they are done.
-    /// Labels 4, 5 and 10 are unused: netd publishes its counters and MACs
+    /// Label 10 is unused: netd publishes its counters and uplinks' MACs
     /// instead (Published).
     pub mod call (from: Sender) {
         /// Port `port` on `switch`, with MAC `mac` (low 48 bits) and
@@ -127,6 +126,8 @@ crate::protocol! {
         /// netd no longer touches the port's memory, nor signals its
         /// client, once it has counted this done.
         RemovePort / remove_port = 2 from [Root] (port: usize) -> ();
+        /// Put uplink `nic` on `switch`.  It stays there across its nicd's
+        /// restarts (RemoveUplink, AddUplink).
         AttachUplink / attach_uplink = 3 from [Root] (nic: usize, switch: usize) -> ();
         /// Steering (DESIGN.md §9.3).  Root allocates the ids and
         /// validates; netd checks bounds and that targets exist, and
@@ -143,6 +144,14 @@ crate::protocol! {
         /// another) mapped at link_va(link) and the NETD_SLOT_LINK_*
         /// capabilities given.  Links last until the machine reboots.
         AddLink / add_link = 11 from [Root] (link: usize, switch: usize, size: u64, me: u32, peer: u32) -> ();
+        /// Uplink `nic`'s channel is mapped at uplink_va(nic), fresh (all
+        /// zeros), with data areas of 2^data_bits, and its nicd's
+        /// notification is at NETD_SLOT_UPLINK_BASE + nic.  netd reads the
+        /// offer once the nicd sets ready.
+        AddUplink / add_uplink = 4 from [Root] (nic: usize, data_bits: u32) -> ();
+        /// netd no longer touches uplink `nic`'s channel, nor signals its
+        /// nicd, once it has counted this done.  Its switch stays.
+        RemoveUplink / remove_uplink = 5 from [Root] (nic: usize) -> ();
         /// `crate::TEST_INJECT` only: panic.
         TestPanic / test_panic = 0x7e57 from [Root] () -> ();
         /// `crate::TEST_INJECT` only: stop for good without failing, as a
@@ -161,10 +170,14 @@ pub const MAX_STEER_RULES: usize = 128;
 /// counters are netd's word: root only reports them.
 #[repr(C)]
 pub struct Published {
-    /// Non-zero once nic_mac is written; it does not change after.
+    /// Non-zero once netd serves.
     pub ready: core::sync::atomic::AtomicU64,
-    /// Uplink NICs' MAC addresses (low 48 bits).
-    pub nic_mac: [core::sync::atomic::AtomicU64; MAX_NICS],
+    /// Per uplink (UPLINK_*): state | generation << 8 (AddUplinks seen),
+    /// the MAC of its offer (low 48 bits) | mac_mode << 48, its link state,
+    /// and rx frames, tx frames, drops.  The offer is the nicd's, as netd
+    /// checked it (uplink::Offer::checked): root checks the MAC again
+    /// before it uses it.
+    pub uplinks: [[core::sync::atomic::AtomicU64; 6]; MAX_UPLINKS],
     /// Per port: rx frames, tx frames, drops.
     pub ports: [[core::sync::atomic::AtomicU64; 3]; MAX_PORTS],
     /// Per rule: inbound frames, return frames.
@@ -172,12 +185,20 @@ pub struct Published {
 }
 const _: () = assert!(core::mem::size_of::<Published>() <= 4096);
 
-/// NicConfig::kind.
-pub const NIC_VIRTIO: u32 = 0;
-pub const NIC_GVNIC: u32 = 1;
-pub const NIC_IXGBE: u32 = 2;
-pub const NIC_ENA: u32 = 3;
-pub const NIC_MLX5: u32 = 4;
+/// Published::uplinks state: none, waiting for the offer, up (offer
+/// read), refused (the offer), broken (the nicd broke the channel).
+pub const UPLINK_NONE: u64 = 0;
+pub const UPLINK_WAITING: u64 = 1;
+pub const UPLINK_UP: u64 = 2;
+pub const UPLINK_REFUSED: u64 = 3;
+pub const UPLINK_BROKEN: u64 = 4;
+/// Published::uplinks words.
+pub const UPLINK_STATE: usize = 0;
+pub const UPLINK_MAC: usize = 1;
+pub const UPLINK_LINK: usize = 2;
+pub const UPLINK_RX: usize = 3;
+pub const UPLINK_TX: usize = 4;
+pub const UPLINK_DROPS: usize = 5;
 
 /// A single-word link snapshot. Speed 0 and duplex 0 mean unknown.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -199,46 +220,11 @@ impl LinkState {
     }
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct NicConfig {
-    pub kind: u32,
-    /// PCI revision ID (gVNIC: 0 takes the admin queue by page frame; ENA:
-    /// bit 0 has registers read directly).
-    pub revision: u32,
-    pub pci_bdf: u32,
-    pub msi_data: u32,
-    pub msi_address: u64,
-    pub common: crate::blk::PciRegion,
-    pub notify: crate::blk::PciRegion,
-    pub notify_off_multiplier: u32,
-    /// Legacy (virtio 0.9.5) device: the I/O port base of its registers,
-    /// with the capability in NETD_SLOT_IOPORT_BASE + n; 0 for a modern
-    /// device (common/notify/isr/device are then used).
-    pub legacy_io: u32,
-    pub isr: crate::blk::PciRegion,
-    pub device: crate::blk::PciRegion,
-    pub msix_table: crate::blk::PciRegion,
-    /// gVNIC: register BAR 0 and doorbell BAR 2; X550: register BAR 0;
-    /// ENA: register BAR 0 and, if netd can use it, the LLQ memory in BAR 2,
-    /// mapped write-combining.
-    pub regs: crate::blk::PciRegion,
-    pub doorbells: crate::blk::PciRegion,
-    pub dma_paddr: u64,
-    pub dma_size: u64,
-}
-
-#[repr(C)]
-pub struct NetdConfig {
-    pub nr_nics: u32,
-    pub reserved: u32,
-    pub nics: [NicConfig; MAX_NICS],
-}
-
 const _: () = assert!(PORT_PAGES * 4096 <= 0x40_0000 - 0x1_0000);
-const _: () = assert!(port_va(MAX_PORTS) <= link_va(0) && link_va(MAX_LINKS) <= crate::MMIO_VA);
+const _: () = assert!(port_va(MAX_PORTS) <= link_va(0) && link_va(MAX_LINKS) <= crate::MMIO_VA
+    && uplink_va(MAX_UPLINKS) <= crate::DMA_VA);
 const _: () = assert!(
-    NETD_SLOT_IOPORT_BASE as usize + MAX_NICS <= NETD_SLOT_LINK_IRQ_BASE as usize
+    NETD_SLOT_UPLINK_BASE as usize + MAX_UPLINKS <= NETD_SLOT_LINK_IRQ_BASE as usize
         && NETD_SLOT_LINK_IRQ_BASE as usize + MAX_LINKS <= NETD_SLOT_LINK_RING_BASE as usize
         && NETD_SLOT_LINK_RING_BASE as usize + MAX_LINKS <= NETD_SLOT_CLIENT_BASE as usize
         && NETD_SLOT_LINK_KICK_BASE as usize + MAX_LINKS <= 1 << crate::CNODE_BITS

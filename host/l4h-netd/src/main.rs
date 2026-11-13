@@ -1,9 +1,9 @@
-//! netd: L2 virtual switches (DESIGN.md §9.3) and the uplink NIC drivers.
+//! netd: L2 virtual switches (DESIGN.md §9.3).
 //!
 //! Every port belongs to one switch.  A port is a guest vNIC (a channel to
-//! that guest's l4h-vmm), an uplink NIC (virtio-net, gVNIC, ENA, X550 or ConnectX-5
-//! PCI, driven here) or, on a multikernel machine, a link to another
-//! partition's netd (link.rs).  Switches learn source MACs, forward known unicast to one
+//! that guest's l4h-vmm), an uplink (a channel to the nicd that drives a
+//! NIC, uplink.rs: netd has no device code) or, on a multikernel machine,
+//! a link to another partition's netd (link.rs).  Switches learn source MACs, forward known unicast to one
 //! port and flood everything else within the switch.  Guest ports can be
 //! locked to their configured MAC.  Nothing above L2 is looked at, except
 //! by steering rules dom0 sets (steer.rs), which pick a port by IP address,
@@ -16,30 +16,23 @@
 #![no_std]
 #![no_main]
 
-mod ena;
-mod gvnic;
-mod ixgbe;
 mod link;
-mod mlx5;
-mod nic;
-mod offload;
 mod pool;
 mod steer;
-mod virtio_net;
+mod uplink;
 
-use core::mem::MaybeUninit;
+use l4h_netcore::offload;
+
 use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{Ordering, fence};
 
 use l4h_rt::host::errno::Errno;
-use l4h_rt::host::fixed::ArrayVec;
-use l4h_rt::host::net::{self, NetdConfig};
+use l4h_rt::host::net;
 use l4h_rt::host::spsc::{Consumer, Producer};
 use l4h_rt::sel4;
 use l4h_rt::{Info, cap, host};
 use sel4::cap_type;
 
-use crate::nic::Nic;
 use crate::offload::{complete_csum, is_gso};
 use crate::pool::{Fifo, Frame, Pool};
 use crate::steer::Steer;
@@ -67,11 +60,11 @@ const BACKLOG_CHUNKS: usize = (2 << 20) / pool::CHUNK;
 /// rest.  Every look counts, whatever it gave (a frame, a record that was
 /// dropped, nothing), and reads at most two records (link::Link::recv).
 const LINK_BUDGET: usize = 256;
-/// Frames taken from an uplink NIC before netd turns to its other work
-/// and comes back for the rest (`Netd::nic_rx`): a NIC that receives
-/// faster than netd switches cannot starve the ports, the links and
-/// root's commands.
-const NIC_BUDGET: usize = 256;
+/// Looks at an uplink's channel before netd turns to its other work and
+/// comes back for the rest (`Netd::uplink_rx`): a nicd that receives
+/// faster than netd switches, or floods, cannot starve the ports, the
+/// links and root's commands.  Every look counts, frame or drop.
+const UPLINK_BUDGET: usize = 256;
 /// RX backlog attempts per port and turn, including failed puts. A peer
 /// can change its tail between the full check and the wakeup recheck.
 const BACKLOG_BUDGET: usize = net::RING_SIZE;
@@ -84,9 +77,6 @@ const LINK_TX_BYTES: usize = 128 << 10;
 const FRAME_BUFFER_SIZE: usize = net::MAX_FRAME + net::HDR_SIZE + 1;
 static mut BUF: [u8; FRAME_BUFFER_SIZE] = [0; FRAME_BUFFER_SIZE];
 static mut SEG_BUF: [u8; net::MAX_FRAME] = [0; net::MAX_FRAME];
-/// Receive offload per NIC, made by main: a new Gro is not all zeros, and
-/// would take its size in the image.
-static mut GRO: [MaybeUninit<offload::Gro>; net::MAX_NICS] = [const { MaybeUninit::uninit() }; net::MAX_NICS];
 static mut FDB_SLOTS_MEM: [FdbEntry; FDB_SLOTS] = [FdbEntry::FREE; FDB_SLOTS];
 static mut STEER: Steer = Steer::new();
 
@@ -235,10 +225,14 @@ impl Fdb {
 
 struct Netd {
     ports: [Option<GuestPort>; net::MAX_PORTS],
-    nics: ArrayVec<Nic, { net::MAX_NICS }>,
+    uplinks: [Option<uplink::Uplink>; net::MAX_UPLINKS],
+    /// The switch of each uplink: it stays while the uplink's nicd is
+    /// restarted (RemoveUplink, AddUplink).
+    uplink_switch: [Option<u32>; net::MAX_UPLINKS],
+    /// AddUplinks of each, which root reads to know a published state is
+    /// the current channel's.
+    uplink_gen: [u32; net::MAX_UPLINKS],
     links: [Option<link::Link>; net::MAX_LINKS],
-    /// Receive offload per NIC (taken out while it emits).
-    gro: [Option<&'static mut offload::Gro>; net::MAX_NICS],
     fdb: Fdb,
     /// Endpoints and steering rules.
     steer: &'static mut Steer,
@@ -262,7 +256,7 @@ fn mac_of(v: u64) -> [u8; 6] {
     [b[2], b[3], b[4], b[5], b[6], b[7]]
 }
 
-const _: () = assert!(net::MAX_PORTS <= 0x40 && net::MAX_LINKS <= 0x40 && net::MAX_NICS <= 0x80);
+const _: () = assert!(net::MAX_PORTS <= 0x40 && net::MAX_LINKS <= 0x40 && net::MAX_UPLINKS <= 32);
 // A link's channel fits where root maps it (net::link_va).
 const _: () = assert!(l4h_partition::LINK_CHANNEL_SIZE as usize <= net::LINK_CHANNEL_MAX);
 const _: () = assert!(
@@ -295,7 +289,7 @@ impl Netd {
     fn switch_of(&self, p: PortId) -> Option<u32> {
         match p {
             PortId::Guest(i) => self.ports[i].as_ref().map(|g| g.switch),
-            PortId::Uplink(n) => self.nics[n].switch,
+            PortId::Uplink(n) => self.uplinks[n].as_ref().and(self.uplink_switch[n]),
             PortId::Link(l) => self.links[l].as_ref().map(|k| k.switch),
         }
     }
@@ -311,7 +305,7 @@ impl Netd {
                     addr_of!((*p.chan).rx_gso).read_volatile() != 0,
                 )
             }),
-            PortId::Uplink(n) => self.nics[n].takes_gso(hdr),
+            PortId::Uplink(n) => self.uplinks[n].as_ref().is_some_and(|u| u.takes_gso(len, hdr)),
             PortId::Link(l) => offload::link_takes_gso(hdr)
                 && self.links[l].as_ref().is_some_and(|link| link.can_send_gso(len)),
         }
@@ -357,11 +351,9 @@ impl Netd {
                 }
             }
             PortId::Uplink(n) => {
-                let nic = &mut self.nics[n];
-                if !nic.csum {
-                    complete_csum(frame, hdr);
+                if let Some(u) = self.uplinks[n].as_mut() {
+                    u.send(frame, hdr, self.pool);
                 }
-                nic.send(frame, hdr, self.pool);
             }
             PortId::Link(l) => {
                 let Some(k) = self.links[l].as_mut() else { return };
@@ -396,7 +388,7 @@ impl Netd {
             if frame[12..14] != [0x88, 0x09] { return; }
             match from {
                 PortId::Guest(i) if self.ports[i].as_ref().is_some_and(|p| p.uplink) => {
-                    if let Some(n) = self.nics.iter().position(|n| n.switch == Some(switch)) {
+                    if let Some(n) = self.uplink_on(switch) {
                         self.deliver(PortId::Uplink(n), frame, hdr);
                     }
                 }
@@ -478,11 +470,11 @@ impl Netd {
             Some(to) if self.switch_of(to) == Some(switch) => self.deliver(to, frame, hdr),
             _ => {
                 // The switch's other ports: guests', uplinks, then links.
-                for k in 0..net::MAX_PORTS + self.nics.len() + net::MAX_LINKS {
+                for k in 0..net::MAX_PORTS + net::MAX_UPLINKS + net::MAX_LINKS {
                     let to = match k.checked_sub(net::MAX_PORTS) {
                         None => PortId::Guest(k),
-                        Some(n) if n < self.nics.len() => PortId::Uplink(n),
-                        Some(n) => PortId::Link(n - self.nics.len()),
+                        Some(n) if n < net::MAX_UPLINKS => PortId::Uplink(n),
+                        Some(n) => PortId::Link(n - net::MAX_UPLINKS),
                     };
                     if Some(to) != exclude && self.switch_of(to) == Some(switch) && !(isolated && self.is_isolated(to)) {
                         self.deliver(to, frame, hdr);
@@ -601,61 +593,59 @@ impl Netd {
         more
     }
 
-    /// Switch what uplink NIC `n` received, up to NIC_BUDGET frames.
-    /// Returns whether frames are left: the NIC's receive interrupt is
-    /// then off (or, where `rx_done` could not leave it off, raised), and
-    /// the caller comes back after netd's other work.  With none left the
-    /// interrupt is on again.
-    fn nic_rx(&mut self, n: usize) -> bool {
+    /// The uplink on `switch` (the first, if several).
+    fn uplink_on(&self, switch: u32) -> Option<usize> {
+        (0..net::MAX_UPLINKS).find(|&n| self.uplinks[n].is_some() && self.uplink_switch[n] == Some(switch))
+    }
+
+    /// Switch what uplink `n`'s nicd received, UPLINK_BUDGET looks at its
+    /// channel at most.  Returns whether it has frames left: the caller
+    /// comes back after netd's other work.  With none left netd asks the
+    /// nicd to signal when it has more.
+    fn uplink_rx(&mut self, n: usize) -> bool {
         let frame = core::mem::take(&mut self.buf);
-        self.nics[n].rx_begin();
-        let mut budget = NIC_BUDGET;
+        let mut budget = UPLINK_BUDGET;
         let more = loop {
-            let mut hdr = [0u8; net::HDR_SIZE];
-            while budget != 0 {
-                let Some(len) = self.nics[n].receive(&mut frame[..net::MAX_FRAME], &mut hdr) else { break };
-                budget -= 1;
-                if self.nics[n].switch.is_none() {
-                    continue;
-                }
-                if offload::sanitize_rx(&mut hdr, &frame[..len], offload::UPLINK_MIN_MSS) {
-                    // Merge TCP segments into one GSO frame where possible.
-                    if self.gro[n].as_mut().unwrap().add(&frame[..len], &hdr) {
-                        continue;
-                    }
-                    self.gro_flush(n);
-                    if self.gro[n].as_mut().unwrap().add(&frame[..len], &hdr) {
-                        continue;
-                    }
-                    self.forward(PortId::Uplink(n), &mut frame[..len], &mut hdr);
-                } else if is_gso(&hdr) {
-                    // A large frame the device checked but did not leave
-                    // a partial checksum in: forward its segments.
-                    let buf = core::mem::take(&mut self.seg_buf);
-                    offload::segment(&frame[..len], &hdr, buf, |f, h| self.forward(PortId::Uplink(n), f, h));
-                    self.seg_buf = buf;
-                }
-            }
-            self.gro_flush(n);
-            // Also with the budget spent: the device gets its buffers
-            // back, and says whether it has more frames.
-            if self.nics[n].rx_done() {
-                break false;
-            }
+            let Some(u) = self.uplinks[n].as_mut() else { break false };
             if budget == 0 {
                 break true;
             }
+            budget -= 1;
+            match u.recv(frame) {
+                Some(Some((len, mut hdr))) => {
+                    if self.uplink_switch[n].is_some() {
+                        self.forward(PortId::Uplink(n), &mut frame[..len], &mut hdr);
+                    }
+                }
+                Some(None) => {}
+                None if u.sleep() => break false,
+                None => {}
+            }
         };
         self.buf = frame;
-        self.nics[n].flush_tx(self.pool);
-        self.publish_links();
+        more
+    }
+
+    /// Everything about uplink `n` on a turn: its offer, its frames and
+    /// the room it freed.  Returns whether frames are left.
+    fn uplink_turn(&mut self, n: usize) -> bool {
+        let Some(u) = self.uplinks[n].as_mut() else { return false };
+        if u.poll_offer() {
+            self.publish_links();
+        }
+        let more = self.uplink_rx(n);
+        if let Some(u) = self.uplinks[n].as_mut() {
+            u.flush(self.pool);
+        }
         more
     }
 
     fn publish_links(&mut self) {
+        let links: [Option<(u32, net::LinkState)>; net::MAX_UPLINKS] =
+            core::array::from_fn(|n| Some((self.uplink_switch[n]?, self.uplinks[n].as_ref()?.link())));
         for p in self.ports.iter_mut().flatten().filter(|p| p.uplink) {
-            let link = self.nics.iter().find(|n| n.switch == Some(p.switch))
-                .map(|n| n.link()).unwrap_or(net::LinkState::DOWN);
+            let link = links.iter().flatten().find(|(sw, _)| *sw == p.switch)
+                .map(|&(_, l)| l).unwrap_or(net::LinkState::DOWN);
             unsafe {
                 if addr_of!((*p.chan).link_state).read_volatile() != link.0 {
                     addr_of_mut!((*p.chan).link_state).write_volatile(link.0);
@@ -665,15 +655,29 @@ impl Netd {
         }
     }
 
-    /// Forward the TCP run NIC `n`'s receive offload has built.
-    fn gro_flush(&mut self, n: usize) {
-        let Some(g) = self.gro[n].take() else { return };
-        g.flush(|f, h| self.forward(PortId::Uplink(n), f, h));
-        self.gro[n] = Some(g);
-    }
-
     /// Publish the counters root reports (net::Published).
     fn publish(&self, to: &net::Published) {
+        for (n, (u, w)) in self.uplinks.iter().zip(&to.uplinks).enumerate() {
+            let state = match u.as_ref().map(|u| u.state) {
+                None => net::UPLINK_NONE,
+                Some(uplink::State::Waiting) => net::UPLINK_WAITING,
+                Some(uplink::State::Up) => net::UPLINK_UP,
+                Some(uplink::State::Refused) => net::UPLINK_REFUSED,
+                Some(uplink::State::Broken) => net::UPLINK_BROKEN,
+            };
+            let generation = self.uplink_gen[n] as u64 & 0xff_ffff;
+            // The offer's words before the state that says they are this
+            // channel's (root reads the state first, with Acquire).
+            if let Some(u) = u {
+                let mac = u.offer.mac6().iter().fold(0u64, |m, &b| (m << 8) | b as u64);
+                w[net::UPLINK_MAC].store(mac | (u.offer.mac_mode as u64) << 48, Ordering::Relaxed);
+                w[net::UPLINK_LINK].store(u.link().0 as u64, Ordering::Relaxed);
+                w[net::UPLINK_RX].store(u.rx_frames, Ordering::Relaxed);
+                w[net::UPLINK_TX].store(u.tx_frames, Ordering::Relaxed);
+                w[net::UPLINK_DROPS].store(u.drops, Ordering::Relaxed);
+            }
+            w[net::UPLINK_STATE].store(state | generation << 8, Ordering::Release);
+        }
         for (p, c) in self.ports.iter().zip(&to.ports) {
             let v = p.as_ref().map_or([0; 3], |p| [p.rx_frames, p.tx_frames, p.drops]);
             for (w, v) in c.iter().zip(v) {
@@ -734,6 +738,7 @@ use l4h_rt::host::errno::EINVAL;
 struct Commands<'a> {
     d: &'a mut Netd,
     added: u64,
+    added_uplinks: u32,
 }
 
 impl net::call::Server for Commands<'_> {
@@ -780,8 +785,33 @@ impl net::call::Server for Commands<'_> {
     }
 
     fn attach_uplink(&mut self, _: net::Sender, nic: usize, switch: usize) -> Result<(), Errno> {
-        let nic = self.d.nics.get_mut(nic).filter(|_| switch < net::MAX_SWITCHES).ok_or(EINVAL)?;
-        nic.switch = Some(switch as u32);
+        if nic >= net::MAX_UPLINKS || switch >= net::MAX_SWITCHES {
+            return Err(EINVAL);
+        }
+        self.d.uplink_switch[nic] = Some(switch as u32);
+        self.d.publish_links();
+        Ok(())
+    }
+
+    fn add_uplink(&mut self, _: net::Sender, nic: usize, data_bits: u32) -> Result<(), Errno> {
+        let ok = nic < net::MAX_UPLINKS && self.d.uplinks[nic].is_none()
+            && (l4h_rt::host::uplink::MIN_DATA_BITS..=l4h_rt::host::uplink::MAX_DATA_BITS).contains(&data_bits)
+            && l4h_rt::host::uplink::channel_size(data_bits) <= net::UPLINK_CHANNEL_MAX;
+        if !ok {
+            return Err(EINVAL);
+        }
+        self.d.uplink_gen[nic] = self.d.uplink_gen[nic].wrapping_add(1);
+        self.d.uplinks[nic] = Some(uplink::Uplink::new(nic, data_bits));
+        self.added_uplinks |= 1 << nic;
+        Ok(())
+    }
+
+    fn remove_uplink(&mut self, _: net::Sender, nic: usize) -> Result<(), Errno> {
+        let d = &mut *self.d;
+        if let Some(mut u) = d.uplinks.get_mut(nic).and_then(|u| u.take()) {
+            u.clear(d.pool);
+            d.publish_links();
+        }
         Ok(())
     }
 
@@ -844,13 +874,13 @@ impl net::call::Server for Commands<'_> {
 }
 
 fn main(info: &'static Info) -> ! {
-    let cfg: &NetdConfig = unsafe { info.config() };
     // The statics are taken here, once.
     let mut d = Netd {
         ports: [const { None }; net::MAX_PORTS],
-        nics: ArrayVec::new(),
+        uplinks: [const { None }; net::MAX_UPLINKS],
+        uplink_switch: [None; net::MAX_UPLINKS],
+        uplink_gen: [0; net::MAX_UPLINKS],
         links: [const { None }; net::MAX_LINKS],
-        gro: [const { None }; net::MAX_NICS],
         fdb: Fdb {
             slots: unsafe { &mut *addr_of_mut!(FDB_SLOTS_MEM) },
             len: [0; net::MAX_SWITCHES],
@@ -865,28 +895,16 @@ fn main(info: &'static Info) -> ! {
         buf: unsafe { &mut *addr_of_mut!(BUF) },
         seg_buf: unsafe { &mut *addr_of_mut!(SEG_BUF) },
     };
-    let gro = unsafe { &mut *addr_of_mut!(GRO) };
-    for ((n, c), g) in cfg.nics[..(cfg.nr_nics as usize).min(net::MAX_NICS)].iter().enumerate().zip(gro) {
-        let _ = d.nics.push(Nic::new(n, c, d.tsc_hz));
-        d.gro[n] = Some(offload::Gro::init(g));
-    }
-    // Nothing calls a driver: it waits on its notification, for root's
-    // requests (badges::driver::CALL), interrupts and clients' kicks.
+    // Nothing calls netd: it waits on its notification, for root's
+    // requests (badges::driver::CALL), its clients' kicks and its nicds'.
     let ntfn = cap::<cap_type::Notification>(host::SLOT_NTFN);
-    l4h_rt::info!("netd: {} uplink NIC(s)", d.nics.len());
-
-    // Root reads the NICs' MACs here, and the counters, which publish()
-    // updates.
     let published = l4h_rt::mailbox::published::<net::Published>();
-    for (n, nic) in d.nics.iter().enumerate() {
-        published.nic_mac[n].store(nic.mac.iter().fold(0u64, |m, &b| (m << 8) | b as u64), Ordering::Relaxed);
-    }
     published.ready.store(1, Ordering::Release);
     l4h_rt::mailbox::signal();
-    let (mut deferred_tx, mut deferred_rx) = (0u64, 0u64);
+    let (mut deferred_tx, mut deferred_rx) = (0u64, 0u32);
     let mut badge = ntfn.wait().1;
     loop {
-        // Notification: port kicks and NIC interrupts. Deferred slots and
+        // Notification: port kicks and uplink signals. Deferred slots and
         // new client kicks use the same drain path.
         let ports = badge | core::mem::take(&mut deferred_tx);
         let backlogs = ports | core::mem::take(&mut d.deferred_ports);
@@ -900,18 +918,13 @@ fn main(info: &'static Info) -> ! {
                 d.rx_backlog(i);
             }
         }
-        // NIC interrupts, and the NICs whose last turn left frames (bit n:
-        // NIC n).  A turn takes NIC_BUDGET frames at most.
+        // Uplinks: any nicd's signal, and those whose last turn left
+        // frames (bit n: uplink n).  A turn takes UPLINK_BUDGET at most.
         let rx = core::mem::take(&mut deferred_rx);
-        for n in 0..d.nics.len() {
-            let irq = badge & host::badges::netd::IRQ.nth(n) != 0;
-            if (irq || rx & (1 << n) != 0) && d.nic_rx(n) {
+        let signalled = badge & host::badges::netd::UPLINK != 0;
+        for n in 0..net::MAX_UPLINKS {
+            if (signalled || rx & (1 << n) != 0) && d.uplink_turn(n) {
                 deferred_rx |= 1 << n;
-            }
-            if irq {
-                cap::<cap_type::IrqHandler>(net::NETD_SLOT_IRQ_BASE + n as u64)
-                    .irq_handler_ack()
-                    .expect("netd: IRQ ack");
             }
         }
         for l in 0..net::MAX_LINKS {
@@ -922,26 +935,31 @@ fn main(info: &'static Info) -> ! {
                 d.link_rx(l);
             }
         }
-        for nic in &mut d.nics {
-            nic.kick_tx();
-        }
         // Once per batch, so a peer that sleeps is woken once for all.
+        for u in d.uplinks.iter_mut().flatten() {
+            u.notify();
+        }
         for k in d.links.iter_mut().flatten() {
             k.doorbell();
+        }
+        if signalled {
+            d.publish_links();
         }
         d.signal_clients();
         d.publish(published);
         // Root's commands (host::mailbox), even if their signal was
         // coalesced.  Root reads the answers' count only: they are done.
-        let mut cmds = Commands { d: &mut d, added: 0 };
+        let mut cmds = Commands { d: &mut d, added: 0, added_uplinks: 0 };
         if l4h_rt::mailbox::serve(|label, args, out| net::call::serve(&mut cmds, label, args, net::Sender::Root, out)) {
             l4h_rt::mailbox::signal();
         }
         let added = cmds.added;
+        // A new channel's nicd may have written its offer already.
+        deferred_rx |= cmds.added_uplinks;
         // Root handed out an added port's channel before netd added it:
         // its VMM may have kicked already, and read the page's link state,
         // DOWN.  Serve the port as if kicked, and signal it.
-        // With slots or NIC frames deferred, poll for notifications
+        // With slots or uplink frames deferred, poll for notifications
         // (badge zero when idle) and come back for the rest.
         badge = if added != 0 {
             added

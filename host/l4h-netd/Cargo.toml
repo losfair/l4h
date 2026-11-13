@@ -5,6 +5,6 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+l4h-netcore = { path = "../l4h-netcore" }
 l4h-partition = { path = "../l4h-partition" }
 l4h-rt = { path = "../l4h-rt" }
-l4h-virtio = { path = "../l4h-virtio" }

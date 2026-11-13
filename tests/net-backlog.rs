@@ -7,7 +7,7 @@ use host::{net, spsc::Producer};
 use core::ptr::addr_of_mut;
 use core::sync::atomic::{Ordering, fence};
 use std::cell::Cell;
-mod offload { pub const HDR_SIZE: usize = 12; }
+#[path = "../host/l4h-netcore/src/offload.rs"] mod offload;
 #[path = "../host/l4h-netd/src/pool.rs"] mod pool;
 use pool::{Fifo, Frame, Pool};
 struct GuestPort { chan: *mut net::Port, rx: Producer, backlog: Fifo,

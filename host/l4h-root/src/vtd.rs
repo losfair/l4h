@@ -178,6 +178,11 @@ impl Vtd {
         Some(me)
     }
 
+    /// The requester `sid` shares a domain by (behind a PCI bridge).
+    pub fn requester(&self, sid: u16) -> u16 {
+        self.requesters.requester(sid)
+    }
+
     pub fn info(&self) -> [u64; 6] {
         [self.state, (self.state == abi::IOMMU_ON && self.intremap) as u64,
             self.units.len() as u64, self.confined, self.unconfined, self.events]

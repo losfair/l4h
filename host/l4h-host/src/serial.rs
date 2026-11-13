@@ -289,6 +289,7 @@ pub struct Lanes {
     service: [Lane<SMALL>; 5],
     blkd: [Lane<SMALL>; crate::log::MAX_BLKDS],
     usbd: [Lane<SMALL>; crate::log::MAX_USBDS],
+    nicd: [Lane<SMALL>; crate::log::MAX_NICDS],
 }
 
 pub const LANES_PAGES: usize = core::mem::size_of::<Lanes>() / PAGE;
@@ -331,6 +332,7 @@ pub fn lane_at(w: Writer) -> Option<crate::log::LaneAt> {
         Writer::Netd => at(offset_of!(Lanes, service) + 4 * small, SMALL),
         Writer::Blkd(c) => at(offset_of!(Lanes, blkd) + c as usize * small, SMALL),
         Writer::Usbd(i) => at(offset_of!(Lanes, usbd) + i as usize * small, SMALL),
+        Writer::Nicd(i) => at(offset_of!(Lanes, nicd) + i as usize * small, SMALL),
     })
 }
 
@@ -343,6 +345,7 @@ impl Lanes {
             service: [const { Lane::new() }; 5],
             blkd: [const { Lane::new() }; crate::log::MAX_BLKDS],
             usbd: [const { Lane::new() }; crate::log::MAX_USBDS],
+            nicd: [const { Lane::new() }; crate::log::MAX_NICDS],
         }
     }
 
@@ -361,6 +364,7 @@ impl Lanes {
             Writer::Netd => self.service[4].ring.view(),
             Writer::Blkd(c) => self.blkd.get(i(c))?.ring.view(),
             Writer::Usbd(u) => self.usbd.get(i(u))?.ring.view(),
+            Writer::Nicd(u) => self.nicd.get(i(u))?.ring.view(),
         })
     }
 

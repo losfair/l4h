@@ -17,7 +17,7 @@
 //! does no TSO here: netd segments.
 //!
 //! MSI-X entry 0 is the management vector (admin completions and the AENQ)
-//! and entry 1 the I/O queues'; both carry netd's one vector for the NIC.
+//! and entry 1 the I/O queues'; both carry the driver's one vector for the NIC.
 //! The device masks the I/O vector when it fires, until the driver
 //! unmasks it through the CQ's unmask register.
 
@@ -25,12 +25,31 @@ use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::Ordering;
 
 use l4h_rt::host::fixed::ArrayVec;
-use l4h_rt::host::{self, net::{self, NicConfig}};
+use l4h_rt::host::{self, net};
+use crate::sdk::{Hw, Offer};
 use l4h_virtio::{Dma, Mmio, dma_fence};
 
-use crate::nic::Partial;
-use crate::offload;
-use crate::pool::Frame;
+use crate::sdk::Partial;
+use crate::sdk::offload;
+use crate::sdk::Frame;
+
+
+/// What the driver drives and needs (l4h_host::nicd::Manifest).
+pub const MANIFEST: crate::sdk::Manifest = crate::sdk::Manifest {
+    bars: 1 << 0,
+    bars_opt: 1 << 2,
+    bars_wc: 1 << 2,
+    bar_window_bits: 24,
+    msix_min: 2,
+    dma_bits: 22,
+    ..crate::sdk::Manifest::empty().with_name("ena").with_matches(&[
+        crate::sdk::PciMatch::id(0x1d0f, 0x0ec2),
+        crate::sdk::PciMatch::id(0x1d0f, 0x1ec2),
+        crate::sdk::PciMatch::id(0x1d0f, 0xec20),
+        crate::sdk::PciMatch::id(0x1d0f, 0xec21),
+        crate::sdk::PciMatch::id(0x1d0f, 0x0051),
+    ])
+};
 
 const HDR: usize = net::HDR_SIZE;
 
@@ -289,7 +308,6 @@ pub struct Ena {
     n: usize,
     pub mac: [u8; 6],
     pub csum: bool,
-    pub tso: bool,
     regs: Mmio,
     regs_len: usize,
     tsc_hz: u64,
@@ -349,17 +367,24 @@ pub struct Ena {
 }
 
 impl Ena {
-    pub fn new(n: usize, c: &NicConfig, tsc_hz: u64, rx_partial: &'static mut Partial) -> Self {
-        let mut dma = Dma::new(net::nic_dma_va(n), c.dma_paddr, c.dma_size as usize);
-        let regs = Mmio(c.regs.va as usize);
+    pub fn offer(&self) -> Offer {
+        let mut o = Offer::plain(self.mac);
+        o.tx_csum = self.csum as u32;
+        o
+    }
+
+    pub fn new(hw: &Hw, rx_partial: &'static mut Partial) -> Self {
+        let (c, tsc_hz) = (hw.config, hw.tsc_hz);
+        let n = c.uplink as usize;
+        let mut dma = hw.dma();
+        let regs = Mmio(c.bars[0].va as usize);
         let (resp, resp_pa) = dma.alloc(8, 8);
         let mut e = Ena {
             n,
             mac: [0; 6],
             csum: false,
-            tso: false,
             regs,
-            regs_len: c.regs.len as usize,
+            regs_len: c.bars[0].len as usize,
             tsc_hz,
             readless: (c.revision & REVISION_NO_READLESS == 0).then_some(resp),
             mmio_seq: 0,
@@ -407,7 +432,7 @@ impl Ena {
         regs.w32(REG_MMIO_RESP_HI, (resp_pa >> 32) as u32);
         e.reset(resp_pa);
         // MSI-X, as Linux after the reset: the management and I/O vectors
-        // on netd's vector, any others masked.
+        // on the driver's vector, any others masked.
         let msix = Mmio(c.msix_table.va as usize);
         for i in 0..(c.msix_table.len / 16) as usize {
             msix.w32(i * 16, c.msi_address as u32);
@@ -419,7 +444,7 @@ impl Ena {
         let caps = e.r32(REG_CAPS);
         let width = (caps >> 8) & 0xff;
         if !(32..=64).contains(&width) || (width < 64 && c.dma_paddr + c.dma_size > 1 << width) {
-            panic!("netd: NIC {}: ENA DMA width {} does not reach memory at {:#x}", n, width, c.dma_paddr);
+            panic!("nicd {}: ENA DMA width {} does not reach memory at {:#x}", n, width, c.dma_paddr);
         }
 
         // Admin queue, its completion queue and the AENQ.
@@ -428,7 +453,7 @@ impl Ena {
         let (aenq, aenq_pa) = dma.alloc(AENQ_DEPTH as usize * ENTRY, 4096);
         (e.aq, e.acq, e.aenq) = (aq, acq, aenq);
         if e.r32(REG_DEV_STS) & DEV_STS_READY == 0 {
-            panic!("netd: NIC {}: ENA not ready after its reset", n);
+            panic!("nicd {}: ENA not ready after its reset", n);
         }
         let caps_of = |depth: u16| depth as u32 | (ENTRY as u32) << 16;
         regs.w32(REG_AQ_BASE_LO, aq_pa as u32);
@@ -458,7 +483,7 @@ impl Ena {
         put16(&mut info, 188, 1);
         wr(info_va, &info);
         if let Err(st) = e.try_exec(Cmd::feature(AQ_SET_FEATURE, FEAT_HOST_ATTR, 0).addr(20, info_pa)) {
-            l4h_rt::info!("netd: NIC {}: ENA refuses the host attributes: status {}", n, st);
+            l4h_rt::info!("nicd {}: ENA refuses the host attributes: status {}", n, st);
         }
 
         // The device's attributes, queue limits and offloads.
@@ -469,7 +494,7 @@ impl Ena {
         let (max_tx_depth, max_rx_depth, max_header, max_rx_descs) = if e.has(FEAT_MAX_QUEUES_EXT) {
             let q = e.exec("get queue limits", Cmd::feature(AQ_GET_FEATURE, FEAT_MAX_QUEUES_EXT, MAX_QUEUES_EXT_VERSION));
             if q[8] != MAX_QUEUES_EXT_VERSION {
-                panic!("netd: NIC {}: ENA queue limits version {}", n, q[8]);
+                panic!("nicd {}: ENA queue limits version {}", n, q[8]);
             }
             let (tx_sq, tx_cq) = (le32(&q, 28), le32(&q, 32));
             let (rx_sq, rx_cq) = (le32(&q, 36), le32(&q, 40));
@@ -497,7 +522,7 @@ impl Ena {
         // TX descriptors in the LLQ if the device has one, else in host
         // memory.
         let mut tx_depth = TX_DEPTH.min(pow2_floor(max_tx_depth));
-        let llq_bar = (c.doorbells.len != 0).then_some((c.doorbells.va as usize, c.doorbells.len as usize));
+        let llq_bar = (c.bars[2].len != 0).then_some((c.bars[2].va as usize, c.bars[2].len as usize));
         let llq = match llq_bar {
             Some(_) if e.has(FEAT_LLQ) => e.config_llq(),
             _ => None,
@@ -511,7 +536,7 @@ impl Ena {
         }
         let rx_depth = RX_DEPTH.min(pow2_floor(max_rx_depth));
         if tx_depth < 64 || rx_depth < 64 {
-            panic!("netd: NIC {}: ENA queue depths tx {} rx {}", n, tx_depth, rx_depth);
+            panic!("nicd {}: ENA queue depths tx {} rx {}", n, tx_depth, rx_depth);
         }
         (e.tx_sq, e.tx_cq_ring) = (Ring::new(tx_depth), Ring::new(tx_depth));
         (e.rx_sq, e.rx_cq_ring) = (Ring::new(rx_depth), Ring::new(rx_depth));
@@ -538,14 +563,14 @@ impl Ena {
         if let Some(log) = rss_log {
             let bytes = Self::rss_table_bytes(log) + 64;
             if need <= dma.remaining() && bytes > dma.remaining() - need {
-                l4h_rt::log!("netd: NIC {}: no DMA memory for an ENA RSS table of 2^{} entries: default table kept", n, log);
+                l4h_rt::log!("nicd {}: no DMA memory for an ENA RSS table of 2^{} entries: default table kept", n, log);
                 rss_log = None;
             } else {
                 need += bytes;
             }
         }
         if need > dma.remaining() {
-            panic!("netd: NIC {}: ENA queue depths tx {} rx {} need {} KiB of DMA memory, {} KiB left",
+            panic!("nicd {}: ENA queue depths tx {} rx {} need {} KiB of DMA memory, {} KiB left",
                 n, tx_depth, rx_depth, need >> 10, dma.remaining() >> 10);
         }
 
@@ -562,7 +587,7 @@ impl Ena {
         e.tx_db = db;
         if let (Some(_), Some((va, len))) = (llq, llq_bar) {
             if llq_off as usize + tx_depth as usize * LLQ_ENTRY > len {
-                panic!("netd: NIC {}: ENA LLQ at {:#x} outside its BAR ({} KiB)", n, llq_off, len >> 10);
+                panic!("nicd {}: ENA LLQ at {:#x} outside its BAR ({} KiB)", n, llq_off, len >> 10);
             }
             e.tx_llq = Some(va + llq_off as usize);
             e.tx_burst_left = e.tx_burst_max;
@@ -592,7 +617,7 @@ impl Ena {
         let mtu = (max_frame - 18) as u32;
         if e.has(FEAT_MTU) {
             if let Err(st) = e.try_exec(Cmd::feature(AQ_SET_FEATURE, FEAT_MTU, 0).u32(20, mtu)) {
-                l4h_rt::log!("netd: NIC {}: ENA refuses MTU {}: status {}", n, mtu, st);
+                l4h_rt::log!("nicd {}: ENA refuses MTU {}: status {}", n, mtu, st);
             }
         }
         for id in 0..e.rx_bufs.len() as u16 {
@@ -603,7 +628,7 @@ impl Ena {
 
         let mac = e.mac;
         l4h_rt::info!(
-            "netd: NIC {}: {:02x}:{:02x}.{} ENA {}.{} ctrl {:#x} rev {}, mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, mtu {}, tx {} ({}) rx {}, csum v4 {} v6 {}",
+            "nicd {}: {:02x}:{:02x}.{} ENA {}.{} ctrl {:#x} rev {}, mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, mtu {}, tx {} ({}) rx {}, csum v4 {} v6 {}",
             n, c.pci_bdf >> 8, (c.pci_bdf >> 3) & 0x1f, c.pci_bdf & 7, (ver >> 8) & 0xff, ver & 0xff, ctrl_ver, c.revision,
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], mtu, tx_depth,
             if e.tx_llq.is_some() { "llq" } else { "host" }, rx_depth, e.tx_csum_v4, e.tx_csum_v6,
@@ -634,12 +659,12 @@ impl Ena {
         let end = self.deadline_us(REG_READ_TIMEOUT_US);
         while rd16(resp) != seq {
             if host::ticks::now() > end {
-                panic!("netd: NIC {}: ENA readless read of register {:#x} timed out", self.n, off);
+                panic!("nicd {}: ENA readless read of register {:#x} timed out", self.n, off);
             }
         }
         dma_fence(Ordering::Acquire);
         if rd16(resp + 2) as usize != off {
-            panic!("netd: NIC {}: ENA readless read of register {:#x} answered {:#x}", self.n, off, rd16(resp + 2));
+            panic!("nicd {}: ENA readless read of register {:#x} answered {:#x}", self.n, off, rd16(resp + 2));
         }
         rd32(resp + 4)
     }
@@ -649,7 +674,7 @@ impl Ena {
     fn reset(&mut self, resp_pa: u64) {
         let sts = self.r32(REG_DEV_STS);
         if sts & DEV_STS_READY == 0 {
-            panic!("netd: NIC {}: ENA not ready (status {:#x})", self.n, sts);
+            panic!("nicd {}: ENA not ready (status {:#x})", self.n, sts);
         }
         let caps = self.r32(REG_CAPS);
         // In 100 ms.
@@ -670,7 +695,7 @@ impl Ena {
         let end = self.deadline_us(timeout_us);
         while (self.r32(REG_DEV_STS) & DEV_STS_RESET_IN_PROGRESS != 0) != on {
             if host::ticks::now() > end {
-                panic!("netd: NIC {}: ENA reset indication did not turn {}", self.n, if on { "on" } else { "off" });
+                panic!("nicd {}: ENA reset indication did not turn {}", self.n, if on { "on" } else { "off" });
             }
         }
     }
@@ -679,7 +704,7 @@ impl Ena {
     /// fatal, as for a virtio-net device that refuses its setup.
     fn exec(&mut self, what: &str, cmd: Cmd) -> [u8; ENTRY] {
         self.try_exec(cmd)
-            .unwrap_or_else(|st| panic!("netd: NIC {}: ENA admin command '{}' failed: status {}", self.n, what, st))
+            .unwrap_or_else(|st| panic!("nicd {}: ENA admin command '{}' failed: status {}", self.n, what, st))
     }
 
     /// Run one admin command and wait for it: its completion, or the
@@ -698,7 +723,7 @@ impl Ena {
             if host::ticks::now() > end {
                 let sts = self.r32(REG_DEV_STS);
                 panic!(
-                    "netd: NIC {}: ENA admin command {} (feature {}) timed out (status {:#x}{})",
+                    "nicd {}: ENA admin command {} (feature {}) timed out (status {:#x}{})",
                     self.n, cmd.0[2], cmd.0[17], sts, if sts & DEV_STS_FATAL_ERROR != 0 { ", fatal error" } else { "" }
                 );
             }
@@ -707,7 +732,7 @@ impl Ena {
         let r: [u8; ENTRY] = core::array::from_fn(|i| rd8(c + i));
         self.acq_ring.advance();
         if le16(&r, 0) & 0xfff != id {
-            panic!("netd: NIC {}: ENA completed admin command {}, not {}", self.n, le16(&r, 0) & 0xfff, id);
+            panic!("nicd {}: ENA completed admin command {}, not {}", self.n, le16(&r, 0) & 0xfff, id);
         }
         match r[2] {
             0 => Ok(r),
@@ -729,7 +754,7 @@ impl Ena {
             || !fits(28, LLQ_MULTIPLE_DESCS_PER_ENTRY)
         {
             l4h_rt::info!(
-                "netd: NIC {}: ENA LLQ unusable (queues {}, header {:#x} entry {:#x} descs {:#x} stride {:#x}): TX descriptors in host memory",
+                "nicd {}: ENA LLQ unusable (queues {}, header {:#x} entry {:#x} descs {:#x} stride {:#x}): TX descriptors in host memory",
                 self.n, num, le16(&l, 16), le16(&l, 20), le16(&l, 24), le16(&l, 28)
             );
             return None;
@@ -742,7 +767,7 @@ impl Ena {
             .u16(42, LLQ_MULTIPLE_DESCS_PER_ENTRY)
             .u16(48, LLQ_ACCEL_DISABLE_META_CACHING | LLQ_ACCEL_LIMIT_TX_BURST);
         if let Err(st) = self.try_exec(set) {
-            l4h_rt::log!("netd: NIC {}: ENA refuses the LLQ layout: status {}: TX descriptors in host memory", self.n, st);
+            l4h_rt::log!("nicd {}: ENA refuses the LLQ layout: status {}: TX descriptors in host memory", self.n, st);
             return None;
         }
         let burst = if accel & LLQ_ACCEL_LIMIT_TX_BURST != 0 { burst_bytes / LLQ_ENTRY as u16 } else { 0 };
@@ -782,24 +807,24 @@ impl Ena {
     }
 
     /// A register the device names by its offset (a doorbell, an unmask
-    /// register): netd writes it, so it must be in BAR 0.
+    /// register): the driver writes it, so it must be in BAR 0.
     fn reg_at(&self, off: u32) -> usize {
         if off as usize + 4 > self.regs_len {
-            panic!("netd: NIC {}: ENA register at {:#x} outside BAR 0 ({} KiB)", self.n, off, self.regs_len >> 10);
+            panic!("nicd {}: ENA register at {:#x} outside BAR 0 ({} KiB)", self.n, off, self.regs_len >> 10);
         }
         self.regs.0 + off as usize
     }
 
-    /// The size (log2 of the entries) of the RSS table netd would set:
+    /// The size (log2 of the entries) of the RSS table the driver would set:
     /// RSS_TABLE_LOG within the device's limits, or None if the device
-    /// does not say or its table is larger than netd makes one.
+    /// does not say or its table is larger than the driver makes one.
     fn rss_table_log(&mut self) -> Option<u16> {
         let t = self.try_exec(Cmd::feature(AQ_GET_FEATURE, FEAT_RSS_INDIRECTION_TABLE, 0)).ok()?;
         let log = RSS_TABLE_LOG.clamp(le16(&t, 8), le16(&t, 10).max(le16(&t, 8)));
         // The device's minimum can be any u16: past 15 the shift and size
         // of the table would wrap.
         if log > 15 {
-            l4h_rt::log!("netd: NIC {}: ENA RSS table of 2^{} entries: default table kept", self.n, log);
+            l4h_rt::log!("nicd {}: ENA RSS table of 2^{} entries: default table kept", self.n, log);
             return None;
         }
         Some(log)
@@ -825,7 +850,7 @@ impl Ena {
             .u16(24, log)
             .u32(28, u32::MAX);
         if let Err(st) = self.try_exec(set) {
-            l4h_rt::log!("netd: NIC {}: ENA refuses the RSS table: status {}", self.n, st);
+            l4h_rt::log!("nicd {}: ENA refuses the RSS table: status {}", self.n, st);
         }
     }
 
@@ -846,10 +871,10 @@ impl Ena {
             match rd16(e) {
                 AENQ_LINK_CHANGE => {
                     let up = rd32(e + 16) & 1 != 0;
-                    l4h_rt::info!("netd: NIC {}: ENA link {}", self.n, if up { "up" } else { "down" });
+                    l4h_rt::info!("nicd {}: ENA link {}", self.n, if up { "up" } else { "down" });
                 }
-                AENQ_FATAL_ERROR => l4h_rt::log!("netd: NIC {}: ENA reports a fatal error ({})", self.n, rd16(e + 2)),
-                AENQ_WARNING => l4h_rt::log!("netd: NIC {}: ENA warning {}", self.n, rd16(e + 2)),
+                AENQ_FATAL_ERROR => l4h_rt::log!("nicd {}: ENA reports a fatal error ({})", self.n, rd16(e + 2)),
+                AENQ_WARNING => l4h_rt::log!("nicd {}: ENA warning {}", self.n, rd16(e + 2)),
                 _ => {}
             }
             self.aenq_ring.advance();
@@ -1047,7 +1072,7 @@ impl Ena {
         if len > self.tx_buf {
             // Longer than the device's MTU: it cannot be sent.
             if !core::mem::replace(&mut self.tx_too_long, true) {
-                l4h_rt::log!("netd: NIC {}: ENA drops frames longer than {} bytes ({})", self.n, self.tx_buf, len);
+                l4h_rt::log!("nicd {}: ENA drops frames longer than {} bytes ({})", self.n, self.tx_buf, len);
             }
             return true;
         }
@@ -1131,4 +1156,35 @@ impl Ena {
 /// The largest power of two at most `v` (and at most 32768), 0 for 0.
 fn pow2_floor(v: u32) -> u16 {
     if v == 0 { 0 } else { 1 << (31 - v.leading_zeros()).min(15) }
+}
+
+/// The SDK's view of the driver (l4h_nicdrv::NicDriver).
+impl crate::sdk::NicDriver for Ena {
+    fn start(hw: &Hw) -> Result<Self, &'static str> {
+        // The one frame being assembled, too large for the stack: start
+        // runs once.
+        static mut RX_PARTIAL: Partial = Partial::new();
+        Ok(Ena::new(hw, unsafe { &mut *core::ptr::addr_of_mut!(RX_PARTIAL) }))
+    }
+    fn offer(&self) -> Offer {
+        Ena::offer(self)
+    }
+    fn rx_begin(&mut self) {
+        Ena::rx_begin(self)
+    }
+    fn rx_done(&mut self) -> bool {
+        Ena::rx_done(self)
+    }
+    fn receive(&mut self, out: &mut [u8], hdr: &mut [u8; HDR]) -> Option<usize> {
+        Ena::receive(self, out, hdr)
+    }
+    fn transmit(&mut self, frame: &[u8], hdr: &[u8; HDR]) -> bool {
+        Ena::transmit(self, frame, hdr)
+    }
+    fn tx_interrupts(&mut self, on: bool) -> bool {
+        Ena::tx_interrupts(self, on)
+    }
+    fn kick_tx(&mut self) {
+        Ena::kick_tx(self)
+    }
 }

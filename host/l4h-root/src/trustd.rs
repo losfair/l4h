@@ -823,8 +823,8 @@ fn partition_allows(addr: usize, width: usize) -> bool {
 }
 
 /// Whether root manages PCI function bus:dev.func, whose configuration
-/// the AML may then read but not write: the disk controllers and uplink
-/// NICs it drives, every xHCI controller (each is root's or the
+/// the AML may then read but not write: the disk controllers and the
+/// NICs it lists (nicd.rs), every xHCI controller (each is root's or the
 /// firmware's until claimed), the balloon device, IOMMUs, every bridge
 /// (the host bridge's and the PCI bridges' bus numbers and windows route
 /// the others; an ISA or LPC bridge's registers place the chipset's
@@ -833,7 +833,7 @@ fn partition_allows(addr: usize, width: usize) -> bool {
 #[cfg(target_arch = "x86_64")]
 fn managed(h: &Host, bus: u8, dev: u8, func: u8) -> bool {
     let is = |d: &crate::pci::Device| (d.bus, d.dev, d.func) == (bus, dev, func);
-    if h.ctrls.iter().any(|c| is(&c.pci)) || h.netd.nics.iter().any(|n| is(&n.pci)) || crate::usb::ctrls().iter().any(|c| is(&c.pci)) {
+    if h.ctrls.iter().any(|c| is(&c.pci)) || crate::nicd::nics().iter().any(|n| is(&n.pci)) || crate::usb::ctrls().iter().any(|c| is(&c.pci)) {
         return true;
     }
     let id = h.pci.read32(bus, dev, func, 0);
@@ -856,7 +856,7 @@ fn managed(h: &Host, bus: u8, dev: u8, func: u8) -> bool {
 #[cfg(target_arch = "x86_64")]
 fn in_bars(h: &Host, start: usize, len: usize, io: bool) -> bool {
     let end = start.saturating_add(len);
-    h.ctrls.iter().map(|c| &c.pci).chain(h.netd.nics.iter().map(|n| &n.pci)).chain(crate::usb::ctrls().iter().map(|c| &c.pci))
+    h.ctrls.iter().map(|c| &c.pci).chain(crate::nicd::nics().iter().map(|n| &n.pci)).chain(crate::usb::ctrls().iter().map(|c| &c.pci))
         .flat_map(|d| d.bars.iter())
         .any(|b| b.size != 0 && b.is_io == io && (b.addr as usize) < end && start < (b.addr as usize).saturating_add(b.size as usize))
 }

@@ -7,12 +7,24 @@ name = "ena-vfio"
 version = "0.1.0"
 dependencies = [
  "l4h-host",
+ "l4h-netcore",
  "l4h-virtio",
  "libc",
 ]
 
 [[package]]
+name = "l4h-abi"
+version = "0.1.0"
+
+[[package]]
 name = "l4h-host"
+version = "0.1.0"
+dependencies = [
+ "l4h-abi",
+]
+
+[[package]]
+name = "l4h-netcore"
 version = "0.1.0"
 
 [[package]]

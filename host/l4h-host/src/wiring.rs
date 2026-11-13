@@ -18,7 +18,7 @@
 use crate::badges;
 use crate::wire::{Bits, Protocol};
 use core::marker::PhantomData;
-use crate::{blk, mailbox, net, trust, usb, vmmgr};
+use crate::{blk, mailbox, net, nicd, trust, usb, vmmgr};
 use l4h_abi as abi;
 
 /// Who holds a capability, or is its target.
@@ -33,6 +33,7 @@ pub enum Party {
     Blkd,
     Netd,
     Usbd,
+    Nicd,
     Logd,
     Vmm,
     Guest,
@@ -52,6 +53,7 @@ impl Party {
             Party::Blkd => crate::KIND_BLKD,
             Party::Netd => crate::KIND_NETD,
             Party::Usbd => crate::KIND_USBD,
+            Party::Nicd => crate::KIND_NICD,
             Party::Logd => crate::KIND_LOGD,
             Party::Vmm => crate::KIND_VMM,
             Party::Root | Party::Guest | Party::Irq => return None,
@@ -207,7 +209,7 @@ pub mod p {
             }
         )*};
     }
-    parties!(Root, Vmmgr, Memd, Trustd, Flags, Blkd, Netd, Usbd, Logd, Vmm, Guest, Irq);
+    parties!(Root, Vmmgr, Memd, Trustd, Flags, Blkd, Netd, Usbd, Nicd, Logd, Vmm, Guest, Irq);
 }
 
 /// The objects as types.
@@ -290,6 +292,7 @@ const fn served(target: Party, object: Object) -> &'static str {
         (Blkd, Notification) => <blk::call::Proto as Protocol>::NAME,
         (Netd, Notification) => <net::call::Proto as Protocol>::NAME,
         (Usbd, Notification) => <usb::call::Proto as Protocol>::NAME,
+        (Nicd, Notification) => <nicd::call::Proto as Protocol>::NAME,
         (Vmmgr, Notification) => <vmmgr::call::Proto as Protocol>::NAME,
         _ => "none",
     }
@@ -370,6 +373,8 @@ pub const NETD_FAULT: E<p::Netd, p::Root, o::Endpoint> = E::new(edge("NETD_FAULT
     Field(COMPONENT_FAULT, badges::parent::ID), 1 << 16, Root, "netd's faults: root suspends it"));
 pub const USBD_FAULT: E<p::Usbd, p::Root, o::Endpoint> = E::new(edge("USBD_FAULT", Usbd, AtFault, Root, Endpoint, Fault,
     Field(COMPONENT_FAULT, badges::parent::ID), 1 << 16, Root, "a usbd's faults: root quarantines it"));
+pub const NICD_FAULT: E<p::Nicd, p::Root, o::Endpoint> = E::new(edge("NICD_FAULT", Nicd, AtFault, Root, Endpoint, Fault,
+    Field(COMPONENT_FAULT, badges::parent::ID), 1 << 16, Root, "a nicd's faults: root stops it and may restart it"));
 pub const LOGD_FAULT: E<p::Logd, p::Root, o::Endpoint> = E::new(edge("LOGD_FAULT", Logd, AtFault, Root, Endpoint, Fault,
     Field(COMPONENT_FAULT, badges::parent::ID), 1 << 16, Root, "logd's faults"));
 pub const VMM_FAULT: E<p::Vmm, p::Vmmgr, o::Endpoint> = E::new(edge("VMM_FAULT", Vmm, AtFault, Vmmgr, Endpoint, Fault,
@@ -400,6 +405,8 @@ pub const ROOT_NETD_CALL: E<p::Root, p::Netd, o::Notification, net::call::Proto>
     Fixed(badges::driver::CALL), 1, Root, "root posted in netd's mailbox (net::call)"));
 pub const ROOT_USBD_CALL: E<p::Root, p::Usbd, o::Notification, usb::call::Proto> = E::new(edge("ROOT_USBD_CALL", Root, Chosen, Usbd, Notification, Post,
     Fixed(badges::driver::CALL), 1, Root, "root posted in usbd's mailbox (usb::call)"));
+pub const ROOT_NICD_CALL: E<p::Root, p::Nicd, o::Notification, nicd::call::Proto> = E::new(edge("ROOT_NICD_CALL", Root, Chosen, Nicd, Notification, Post,
+    Fixed(badges::driver::CALL), 1, Root, "root posted in a nicd's mailbox, or answered its configuration request (nicd::call)"));
 pub const ROOT_VMMGR_CALL: E<p::Root, p::Vmmgr, o::Notification, vmmgr::call::Proto> = E::new(edge("ROOT_VMMGR_CALL", Root, Chosen, Vmmgr, Notification, Post,
     Fixed(badges::vmmgr::MAILBOX), 1, Root, "root posted notices in vmmgr's mailbox (vmmgr::call)"));
 pub const BLKD_DONE: E<p::Blkd, p::Root, o::Notification> = E::new(shared(edge("BLKD_DONE", Blkd, Slots(mailbox::SLOT_MAILBOX_DONE, 1), Root, Notification, Signal,
@@ -408,6 +415,8 @@ pub const NETD_DONE: E<p::Netd, p::Root, o::Notification> = E::new(shared(edge("
     Fixed(badges::root::MAILBOX), 1, Root, "netd answered in its mailbox")));
 pub const USBD_DONE: E<p::Usbd, p::Root, o::Notification> = E::new(shared(edge("USBD_DONE", Usbd, Slots(mailbox::SLOT_MAILBOX_DONE, 1), Root, Notification, Signal,
     Fixed(badges::root::MAILBOX), 1, Root, "usbd answered in its mailbox")));
+pub const NICD_DONE: E<p::Nicd, p::Root, o::Notification> = E::new(shared(edge("NICD_DONE", Nicd, Slots(mailbox::SLOT_MAILBOX_DONE, 1), Root, Notification, Signal,
+    Fixed(badges::root::MAILBOX), 1, Root, "a nicd answered in its mailbox, or made a configuration request")));
 pub const VMMGR_DONE: E<p::Vmmgr, p::Root, o::Notification> = E::new(shared(edge("VMMGR_DONE", Vmmgr, Slots(mailbox::SLOT_MAILBOX_DONE, 1), Root, Notification, Signal,
     Fixed(badges::root::MAILBOX), 1, Root, "vmmgr took root's notices")));
 
@@ -426,11 +435,19 @@ pub const NETD_VMM_DONE: E<p::Netd, p::Vmm, o::Notification> = E::new(shared(edg
 pub const USBD_VMM: E<p::Usbd, p::Vmm, o::Notification> = E::new(edge("USBD_VMM", Usbd, Slots(usb::USBD_SLOT_CLIENT_IRQ, usb::AREAS), Vmm, Notification, Signal,
     Bit(badges::vmm::USB), usb::MAX_GUEST_USB, Root, "the guest's USB controller n has completions"));
 
+// ---- Uplink channels (crate::uplink).
+pub const NETD_NICD: E<p::Netd, p::Nicd, o::Notification> = E::new(edge("NETD_NICD", Netd, Slots(net::NETD_SLOT_UPLINK_BASE, net::MAX_UPLINKS), Nicd,
+    Notification, Signal, Fixed(badges::nicd::NETD), 1, Root, "uplink n's channel has frames to send or room"));
+pub const NICD_NETD: E<p::Nicd, p::Netd, o::Notification> = E::new(edge("NICD_NETD", Nicd, Slots(nicd::NICD_SLOT_NETD, 1), Netd,
+    Notification, Signal, Fixed(badges::netd::UPLINK), 1, Root, "its channel has received frames or room"));
+
 // ---- Interrupts and doorbells.
 pub const IRQ_BLKD: E<p::Irq, p::Blkd, o::Notification> = E::new(edge("IRQ_BLKD", Irq, Bound, Blkd, Notification, Bind,
     Fixed(badges::blkd::IRQ), 1, Root, "its controller's interrupt"));
-pub const IRQ_NETD: E<p::Irq, p::Netd, o::Notification> = E::new(edge("IRQ_NETD", Irq, Bound, Netd, Notification, Bind,
-    Bit(badges::netd::IRQ), net::MAX_NICS, Root, "uplink NIC n's interrupt"));
+pub const IRQ_NICD: E<p::Irq, p::Nicd, o::Notification> = E::new(edge("IRQ_NICD", Irq, Bound, Nicd, Notification, Bind,
+    Fixed(badges::nicd::IRQ), 1, Root, "its device's interrupt"));
+pub const ROOT_NICD_TIMER: E<p::Root, p::Nicd, o::Notification> = E::new(edge("ROOT_NICD_TIMER", Root, Chosen, Nicd, Notification, Signal,
+    Fixed(badges::nicd::TIMER), 1, Root, "root's tick, for a driver that asked for a timer"));
 pub const IRQ_USBD: E<p::Irq, p::Usbd, o::Notification> = E::new(edge("IRQ_USBD", Irq, Bound, Usbd, Notification, Bind,
     Fixed(badges::usbd::IRQ), 1, Root, "its xHCI's interrupt"));
 pub const IRQ_MONITOR: E<p::Irq, p::Root, o::Notification> = E::new(edge("IRQ_MONITOR", Irq, Bound, Root, Notification, Bind,
@@ -472,11 +489,12 @@ pub const VMMGR_VCPU: E<p::Vmmgr, p::Guest, o::Vcpu> = E::new(shared(edge("VMMGR
 pub const EDGES: &[Edge] = &[
     ROOT_MEMD.0, VMMGR_MEMD.0, VMMGR_VMM_MEMD.0, VMM_MEMD.0, TRUSTD_ROOT.0, VMMGR_ROOT.0, VMM_VMMGR.0, ROOT_FLAGS.0, VMMGR_FLAGS.0,
     TRUSTD_FLAGS.0, GUEST_VMM.0,
-    TRUSTD_FAULT.0, BLKD_FAULT.0, NETD_FAULT.0, USBD_FAULT.0, LOGD_FAULT.0, VMM_FAULT.0, MEMD_KEEPER_FAULT.0,
+    TRUSTD_FAULT.0, BLKD_FAULT.0, NETD_FAULT.0, USBD_FAULT.0, NICD_FAULT.0, LOGD_FAULT.0, VMM_FAULT.0, MEMD_KEEPER_FAULT.0,
     VMMGR_KEEPER_FAULT.0, FLAGS_KEEPER_FAULT.0, GUEST_FAULT.0,
-    ROOT_BLKD_CALL.0, ROOT_NETD_CALL.0, ROOT_USBD_CALL.0, ROOT_VMMGR_CALL.0, BLKD_DONE.0, NETD_DONE.0, USBD_DONE.0, VMMGR_DONE.0,
+    ROOT_BLKD_CALL.0, ROOT_NETD_CALL.0, ROOT_USBD_CALL.0, ROOT_NICD_CALL.0, ROOT_VMMGR_CALL.0, BLKD_DONE.0, NETD_DONE.0, USBD_DONE.0,
+    NICD_DONE.0, VMMGR_DONE.0, NETD_NICD.0, NICD_NETD.0,
     VMM_BLKD_KICK.0, VMM_NETD_KICK.0, GUEST_USBD_KICK.0, BLKD_VMM_DONE.0, NETD_VMM_DONE.0, USBD_VMM.0,
-    IRQ_BLKD.0, IRQ_NETD.0, IRQ_USBD.0, IRQ_MONITOR.0, DOORBELL_ROOT.0, DOORBELL_NETD.0, NETD_LINK_SELF.0, NETD_LINK_RING.0,
+    IRQ_BLKD.0, IRQ_NICD.0, ROOT_NICD_TIMER.0, IRQ_USBD.0, IRQ_MONITOR.0, DOORBELL_ROOT.0, DOORBELL_NETD.0, NETD_LINK_SELF.0, NETD_LINK_RING.0,
     GUEST_TRUSTD.0, ROOT_TRUSTD_RELAY.0,
     GUEST_CTL.0, GUEST_VMM_KICK.0, GUEST_VMM_MEM.0, GUEST_VMM_CONSOLE.0, VMMGR_VMM.0, VMM_VCPU.0, GUEST_IPI.0, VMMGR_VCPU.0,
 ];
@@ -620,6 +638,7 @@ const fn space(target: Party, object: Object) -> Option<(&'static [Bits], u64)> 
         (Blkd, Notification) => (badges::blkd::OWN, badges::blkd::SIGNALS),
         (Netd, Notification) => (badges::netd::OWN, badges::netd::SIGNALS),
         (Usbd, Notification) => (badges::usbd::OWN, badges::usbd::SIGNALS),
+        (Nicd, Notification) => (badges::nicd::OWN, badges::nicd::SIGNALS),
         (Vmm, Endpoint | Notification) => (badges::vmm::OWN, badges::vmm::SIGNALS),
         (Trustd, Notification) => (badges::trustd::OWN, badges::trustd::SIGNALS),
         (Trustd, Kick) => (badges::trustd_kick::OWN, badges::trustd_kick::SIGNALS),
@@ -660,7 +679,7 @@ const fn check(edges: &[Edge]) -> Result<(), &'static str> {
                     return Err(e.name);
                 }
                 // Root never waits on a driver, nor on vmmgr or a VMM.
-                if same(e.holder, Root) && matches!(e.target, Blkd | Netd | Usbd | Vmmgr | Vmm) {
+                if same(e.holder, Root) && matches!(e.target, Blkd | Netd | Usbd | Nicd | Vmmgr | Vmm) {
                     return Err(e.name);
                 }
             }
@@ -755,7 +774,7 @@ const fn called(p: Party) -> bool {
 /// has a keeper to answer them if it fails, and has no fault edge to its
 /// parent; one they do not, faults to its parent.
 const fn keepers() -> Result<(), &'static str> {
-    let kinds = [Vmmgr, Memd, Trustd, Flags, Blkd, Netd, Usbd, Logd, Vmm];
+    let kinds = [Vmmgr, Memd, Trustd, Flags, Blkd, Netd, Usbd, Nicd, Logd, Vmm];
     let mut i = 0;
     while i < kinds.len() {
         let p = kinds[i];
@@ -851,7 +870,7 @@ mod tests {
         // Who calls its parent: trustd and vmmgr root, the VMMs vmmgr.
         assert!(parent_call(crate::KIND_TRUSTD).is_some() && parent_call(crate::KIND_VMMGR).is_some()
             && parent_call(crate::KIND_VMM).is_some());
-        for k in [crate::KIND_MEMD, crate::KIND_FLAGS, crate::KIND_BLKD, crate::KIND_NETD, crate::KIND_USBD, crate::KIND_LOGD] {
+        for k in [crate::KIND_MEMD, crate::KIND_FLAGS, crate::KIND_BLKD, crate::KIND_NETD, crate::KIND_USBD, crate::KIND_NICD, crate::KIND_LOGD] {
             assert!(parent_call(k).is_none());
         }
         assert_eq!(VMM_VMMGR.badge(7), badges::parent::COMPONENT | 7);

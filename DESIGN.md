@@ -2157,13 +2157,14 @@ The hypervisor implements Ethernet switching. Routing, NAT, DHCP and
 firewalling belong in a VM.
 
 - **Path.** Guest `virtio_net` → `l4h-vmm` → shared net port rings →
-  `l4h-netd` → destination port or uplink NIC. netd runs all switches and
-  the uplink NIC drivers in one component: modern and legacy virtio-net,
-  gVNIC, Amazon ENA, Intel X550 and ConnectX-5.
+  `l4h-netd` → destination port, or an uplink channel → the NIC's driver
+  (a nicd, §9.8). netd runs all switches and has no device code; each NIC
+  is driven by its own nicd: modern and legacy virtio-net, gVNIC, Amazon
+  ENA, Intel X550 and ConnectX-5.
 - **vNICs.** Each vNIC is on one switch and appears as a separate `ethN`.
   There are 48 guest ports in all. Guest vNICs have one RX/TX queue pair.
-- **Switches and uplinks.** The API creates switches dynamically, up to 52
-  (one per guest port and NIC); switches are not deleted. Each is an L2
+- **Switches and uplinks.** The API creates switches dynamically, up to 64
+  (one per guest port and uplink, of which there are 16); switches are not deleted. Each is an L2
   broadcast domain with its own learned MAC table. A physical NIC can be
   the uplink of one switch; a switch without one is internal. VLAN tags pass
   through untouched. VLAN-aware switching, jumbo MTUs on guest ports, static
@@ -2175,7 +2176,8 @@ firewalling belong in a VM.
   (vmmgr gets copies, which revoke nothing); root adds
   and removes ports with `net::call::add_port`/`remove_port`. The guest
   bounces buffers through its I/O pool, the VMM copies between pool and
-  port slots, and netd copies slot to slot or slot to NIC DMA buffer.
+  port slots, and netd copies slot to slot or between slots and uplink
+  channels (the nicd copies between its channel and its DMA buffers).
   The shared counts wrap as `u32`; each producer and consumer also keeps
   its slot privately (`l4h_host::spsc`), advancing modulo the ring size.
   A counter wrap therefore preserves unread entries in the 24-slot rings.
@@ -2186,10 +2188,10 @@ firewalling belong in a VM.
   in software.
   A guest port takes a GSO frame whole only if its driver accepted
   both large frames and partial checksums.
-- **Receive offloads.** netd's virtio-net driver negotiates `GUEST_CSUM`
+- **Receive offloads.** The virtio-net driver negotiates `GUEST_CSUM`
   and, with mergeable RX buffers (`MRG_RXBUF`, 256 × 4 KiB), `GUEST_TSO4/6`,
-  so a device with large frames delivers them whole. Frames from the uplink
-  then pass GRO (`offload::Gro`): consecutive full-size segments of one TCP
+  so a device with large frames delivers them whole. Frames from the device
+  then pass GRO (`offload::Gro`, in the nicd, on its own CPU time): consecutive full-size segments of one TCP
   flow, merged only where Linux's GRO would merge them, become one GSO frame
   with a partial checksum. Segments without a checksum verdict from the
   device are verified first. A guest thus takes one frame per up to 44
@@ -2298,25 +2300,25 @@ dom0's external IP, or owns a cloud alias IP outright.
   set EP IP[/PROTO[:PORT]] --to VM:NIC|PORT`, and `del`/`list`.
   `tests/fuzz-steer` checks the classifier and tables against a model.
 
-**gVNIC.** `l4h-netd/src/gvnic.rs` follows Linux `gve` with the DQO queue
+**gVNIC.** `l4h-nicd-gvnic/src/gvnic.rs` follows Linux `gve` with the DQO queue
 format and raw DMA addressing (DQO RDA), which C3 and later offer; a device
-without it (GQI only) makes netd panic. It configures the device through a
+without it (GQI only) makes its nicd refuse it. It configures the device through a
 big-endian admin queue in BAR 0 and rings little-endian doorbells in BAR 2.
 One TX queue with its completion queue, one RX buffer queue (2 KiB buffers)
 with its completion queue. As Linux, it configures a notification block per
-MSI-X entry but the last; the TX and RX blocks share netd's vector and the
+MSI-X entry but the last; the TX and RX blocks share the driver's vector and the
 management vector stays masked. A DQO block masks itself when it fires;
-netd re-arms RX after draining and TX only while frames wait. Transmit:
+the driver re-arms RX after draining and TX only while frames wait. Transmit:
 checksum offload and TSO through a context descriptor (the TCP checksum
 field loses the length, as in `gve_prep_tso`), for MSS 88–9728 and headers
-up to 255 bytes, else netd segments. Buffers are freed by packet
+up to 255 bytes (its offer), else netd segments. Buffers are freed by packet
 completions, or by reinjection completions after a miss completion.
 Receive: the device's checksum verdict (with its packet type map) becomes
 `DATA_VALID`, then GRO; the device's own coalescing (RSC) is off. On the
 revision 0 device of C3, releasing an admin queue that is not registered
-makes the device reset itself, so netd releases only a registered one.
+makes the device reset itself, so the driver releases only a registered one.
 
-**ENA.** `l4h-netd/src/ena.rs` follows Linux `ena` for the Elastic Network
+**ENA.** `l4h-nicd-ena/src/ena.rs` follows Linux `ena` for the Elastic Network
 Adapter of Nitro EC2 instances (1d0f:ec20 and the other IDs Linux takes).
 - It resets the device, reads registers readless (the device writes them to
   DMA memory) unless the PCI revision says otherwise, and configures it
@@ -2325,39 +2327,40 @@ Adapter of Nitro EC2 instances (1d0f:ec20 and the other IDs Linux takes).
   (Nitro accepts 1.0.0's host info but rejects CQ creation).
 - One TX and one RX queue, each a submission queue with its completion
   queue, on MSI-X entry 1; entry 0 is the management vector (admin
-  completions and AENQ events: netd logs link changes and errors and
-  acknowledges keep-alives). Both carry netd's one vector. The device masks
-  the I/O vector when it fires; netd unmasks it through the TX CQ's register
+  completions and AENQ events: the driver logs link changes and errors and
+  acknowledges keep-alives). Both carry the driver's one vector. The device masks
+  the I/O vector when it fires; the driver unmasks it through the TX CQ's register
   (with 20 µs RX and 64 µs TX coalescing) after draining RX, and while frames
   wait. An RSS table sends every frame to the RX queue.
 - Transmit uses the low-latency queue (LLQ) in BAR 2, which root maps
-  write-combining when it fits netd's 16 MiB window: one 128-byte entry per
+  write-combining when it fits the manifest's 16 MiB window: one 128-byte entry per
   frame with the metadata and buffer descriptors and the frame's first 96
   bytes, written in 64-bit stores, `sfence`, then the doorbell, at most the
   device's burst between doorbells. Without the BAR or Linux's LLQ layout,
   descriptors go to a ring in host memory. Every frame has a metadata
   descriptor; partial L4 checksums over IPv4/IPv6 are left to the device
   when offered. ENA does no TSO here: netd segments. TX buffers hold frames
-  up to the device's MTU, which netd sets to its maximum.
+  up to the device's MTU, which the driver sets to its maximum.
 - Receive: 2 KiB buffers, with a frame spanning several; a good L4 checksum
   on an unfragmented frame without an IPv4 header error becomes
   `DATA_VALID`.
 - Not implemented: the keep-alive watchdog and device reset on errors
-  (netd has no timer), and ENA Express.
+  (a nicd may ask root for a timer, `F_TIMER`, which ENA does not use
+  yet), and ENA Express.
 - Tested on a c6i.large's secondary ENI through Linux/VFIO (`tests/ena-vfio`,
   compiling the production driver unchanged) and in full UEFI/seL4 boots on
   c6i.xlarge (`tests/ec2-test.py`): LLQ and host-memory TX pass
   packet/checksum/GSO tests, 65,600 checked UDP echoes across the 16-bit
   index wrap, and fresh MSI-X delivery. See `tests/ec2.md`.
 
-**Intel X550.** `l4h-netd/src/ixgbe.rs` follows Linux `ixgbe` for the X550
+**Intel X550.** `l4h-nicd-ixgbe/src/ixgbe.rs` follows Linux `ixgbe` for the X550
 (8086:1563, 15d1), as on Latitude.sh m4.metal servers. It resets the MAC
 under the SW/FW PHY semaphore but not the PHY, which renegotiates the link
 with the firmware's settings (about 7 s on 10GBASE-T), then sets up one RX
 and one TX queue of advanced descriptors: 512 RX buffers of 2 KiB (larger
 frames span buffers), CRC stripping, no RSC or RSS, promiscuous like the
 other uplinks. RX raises MSI-X entry 0 and TX entry 1, both programmed with
-netd's vector, so EIMS/EIMC mask them separately; causes auto-clear (EIAC)
+the driver's vector, so EIMS/EIMC mask them separately; causes auto-clear (EIAC)
 and are moderated to about 20,000 per second. Receive: an L4 checksum the
 device verified (L4CS without TCPE, and no IPv4 header error) becomes
 `DATA_VALID`. Transmit: a context descriptor carries checksum offload for
@@ -2368,6 +2371,25 @@ compiles the driver unchanged into a Linux program that drives a real port
 through VFIO (ARP, ICMP, DNS, UDP checksum offload, 4 KB and 60 KB TSO, both
 interrupt causes).
 
+**Intel 82574L.** `l4h-nicd-e1000e/src/e1000e.rs` follows Linux `e1000e` for the
+82574L and 82583V (8086:10d3, 150c), the parts of that family with MSI-X;
+QEMU emulates the 82574L as `e1000e`. (The older 8254x, QEMU's `e1000`, have
+INTx only, which a nicd does not take.) It resets the MAC under the software
+flag but not the PHY, which keeps its link, then sets up one RX and one TX
+queue of legacy descriptors: 512 RX buffers of 2 KiB (no long packets, so a
+frame fits one buffer), CRC stripping, promiscuous like the other uplinks.
+RX raises MSI-X entry 0 and TX entry 1, both the driver's vector, masked
+separately (IMS/IMC RXQ0 and TXQ0); causes auto-clear (EIAC) and auto-mask
+(IAM), moderated to about 20,000 per second. Root's tick (`F_TIMER`) reads
+the link. Receive: a TCP/UDP checksum the device verified, without an IPv4
+header error, becomes `DATA_VALID`. Transmit: a context descriptor carries
+checksum offload and TSO over IPv4/IPv6, as Linux `e1000_tso`; data
+descriptors take at most 8 KiB each. `tests/run-e1000etest.sh` makes it dom0's
+uplink in QEMU: DHCP, ping and 8 MiB TCP transfers each way checked against
+a host peer (`tests/nic-peer.py`), before and after a restart (QEMU's device
+has no FLR); with `L4H_QEMU_IOMMU=intel|amd` it is the QEMU test of a
+confined driver (virtio drivers never are), and must cause no IOMMU fault.
+
 **Tests.** `tests/fuzz-virtq` checks that GRO output segments back into
 exactly the frames that went in, and that corrupted or other-flow segments
 do not merge. `tests/run-nettest.sh` covers DHCP and ping over the QEMU
@@ -2376,11 +2398,11 @@ uplink, internal switches, multiple vNICs, isolation and MAC lock
 uses a Debian router with nftables masquerade to connect an internal guest
 to the outside.
 
-**ConnectX-5.** `l4h-netd/src/mlx5.rs` supports PCI device 15b3:1017.
+**ConnectX-5.** `l4h-nicd-mlx5/src/mlx5.rs` supports PCI device 15b3:1017.
 Each PF uses one RX queue, one TX queue and one MSI-X event queue.
 The command transport follows the NVIDIA Ethernet PRM and Linux mlx5.
 The official libmlx5 VFIO provider requires Linux VFIO and libibverbs.
-Netd has neither Linux syscalls nor a heap, so this driver uses firmware
+A nicd has neither Linux syscalls nor a heap, so this driver uses firmware
 commands directly. The adapter stays in `mlx5.rs`. `tests/mlx5-vfio` runs
 that same command and queue code against a VFIO-bound PF on Linux.
 The PF has a 32 MiB DMA budget. A fixed 24 MiB pool supplies firmware
@@ -2388,8 +2410,8 @@ pages and reuses returned pages without a heap. Firmware can return fewer
 pages than requested, including zero. The driver checks returned addresses
 against its outstanding pool pages before reuse. The lower 16 MiB of BAR 0
 contains the init segment, MSI-X table and allocated UAR. The driver rejects
-a UAR outside that aperture. Netd completes checksums and segments TCP in
-software. The TX path accepts Ethernet frames up to 1518 bytes, including a VLAN tag.
+a UAR outside that aperture. netd completes checksums and segments TCP in
+software (the driver offers neither). The TX path accepts Ethernet frames up to 1518 bytes, including a VLAN tag.
 RDMA, SR-IOV, RSS and hardware TSO are outside this driver.
 The installer accepts `--uplink IFNAME` once or twice to select physical
 interfaces on machines with more ports. Other interfaces stay outside the
@@ -2398,6 +2420,114 @@ migration plan. Selected ports retain the existing PCI order and MAC rules.
 ConnectX-5 members. It reads each member's saved permanent MAC and preserves
 the distribution's bond configuration. The bond MAC must be one of those
 permanent MACs. Other master devices remain unsupported.
+
+### 9.8 NIC drivers outside netd
+
+Every NIC is driven by a nicd of its own: a component built from a driver
+of the bundle, outside netd and, with an IOMMU, outside the TCB. A driver
+that faults, hangs or misbehaves takes down only its own uplink, which
+root restarts. Root and netd know no device kind. The design is issue
+#134; this is its phase 1 (Wi-Fi is phase 2).
+
+- **Uplink channel** (`l4h_host::uplink`). One region of root's frames,
+  mapped by netd and the nicd (copies: neither can revoke the other's): a
+  header page with the driver's offer, its link state, ring indices and
+  waiting flags, then TX and RX rings of 1024 descriptors and two circular
+  data areas (4 MiB each by default). A descriptor holds a length and a
+  virtio-net header, never an offset: the consumer computes where a frame
+  is from its own cursor, so the only value it checks is the length. A
+  frame never wraps (a zero-length descriptor pads to the end). The
+  producer reckons free bytes from its own record of what it wrote and the
+  ring's tail, which it checks. `tests/fuzz-uplink` runs honest peers on
+  two threads against a model, a producer that scribbles over the
+  descriptors and data while the consumer reads, and a consumer that writes
+  any tail.
+- **What netd checks.** It copies each frame before it looks at it,
+  checks headers with `MIN_MSS` (as a partition link's: it cuts no frame
+  into more segments than a guest could make it), gives a nicd at most
+  256 looks per turn, refuses an offer of another ABI, and stops reading a
+  channel whose producer broke the protocol. It sends a driver only frames
+  inside its offer (checksum and GSO types, MSS and header bounds, frame
+  lengths) and segments and checksums the rest.
+- **The SDK** (`l4h-nicdrv`): the `NicDriver` trait (what netd's drivers
+  had: `start`, `offer`, `receive`, `transmit` and their interrupt
+  handshakes), `Hw` (BARs, DMA region, MSI-X, legacy ports, the
+  configuration snapshot and filtered configuration requests), and the
+  loop: device RX straight into GRO and the channel, channel TX into the
+  device while it takes frames (a refused frame stays in the channel, so
+  the channel is the backlog), notifications only when the other side
+  sleeps, root's mailbox. `driver!` puts the driver's manifest in the ELF
+  section `.l4h.driver`. A driver's device code (`driver.rs`'s view) also
+  compiles into the VFIO harnesses unchanged (`tests/nicdrv-vfio/sdk.rs`).
+- **Manifests and the bundle.** A manifest says which PCI IDs a driver
+  takes and what it needs: memory BARs required and optional, write-
+  combining BARs, a window per BAR, MSI-X entries, DMA region size, channel
+  size, firmware blob names, configuration-space write windows, image
+  size. Drivers ship in a bundle (`tools/mkdrivers.py`): the boot module
+  `l4h-drivers`, or the copy built into root. Root reads each manifest
+  with bounds checks, checks the device against it (BARs present and
+  mappable, MSI-X table inside a mapped BAR, virtio regions) and binds
+  (`nic_auto`, default on; `nic_bind = BDF DRIVER|none`).
+- **What a nicd gets.** Its BARs, windowed; a DMA region in its device's
+  IOMMU domain only; one interrupt vector from root's pool (§9.5),
+  remapped for its device; a snapshot of its configuration space; its
+  channel; a control page; read-only copies of its firmware blobs; a
+  mailbox. No PCI configuration capability, IRQControl, Untyped or
+  endpoint to netd. Configuration writes go through root
+  (`Published::cfg_req`), inside the manifest's windows, past the header,
+  and by an allow-list: vendor-specific capabilities (not virtio's, one of
+  which reaches a whole BAR), AER's status registers, LTR, L1 PM substates,
+  and in the PCI Express capability Device Control's relaxed ordering and
+  no-snoop bits and Link Control's ASPM bits; root merges the write into
+  the register's other bits.
+- **Confinement.** A nicd is outside the TCB (`confined` in `l4hctl nic
+  list`) when the IOMMU is on with interrupt remapping and its device's
+  isolation group holds only functions the host does not use or NICs of
+  the same driver. The group follows Linux's: the functions below every
+  bridge on the path that does not isolate with ACS (§9.5), those of its
+  multi-function siblings, and the other functions of a multi-function
+  device without ACS: every function root found in the slot, as only
+  function 0 need set the multi-function bit, and what is below those
+  that are bridges; a bridge without ACS adds its slot's other functions
+  the same way. The walk covers the whole inventory, so no bridge or peer
+  is left out. The group also takes every function the IOMMU translates
+  as a member's requester (behind a PCI bridge, or an IVHD alias), which
+  shares its domain whatever ACS does, and is closed under both: every
+  member's reach and aliases are in it. Binding refuses a driver that would share a confined
+  NIC's group, and every start checks again. A virtio NIC's driver is never
+  confined: the device takes the IOMMU path only if the driver negotiates
+  `ACCESS_PLATFORM`, which the driver, the untrusted party, decides.
+  Root tells a virtio device by the device (a virtio PCI id, or virtio 1.x
+  structures under any vendor's), not by the driver's manifest, which a
+  driver dom0 loaded writes itself. A multikernel partition sees
+  neither the bridges nor the other partitions' functions, so none of its
+  NICs is confined. Elsewhere a driver is
+  TCB code, and only the measured boot bundle's may run (Wi-Fi drivers
+  never): a driver dom0 loads runs only confined, and is refused at load
+  on a host without an IOMMU and interrupt remapping.
+- **Faults and restarts.** A nicd that faults, refuses its device, breaks
+  its channel, has its offer refused or leaves a liveness ping unanswered
+  for 5 s is stopped without waiting on it: suspended, bus mastering off
+  and read back, an FLR if the function has one (its header restored
+  after, from root's record of it at boot), netd told to let go of the
+  channel (RemoveUplink). Once both are done, its memory is reclaimed and a
+  new instance started after a backoff
+  (1 s doubling to 60 s), at most `nic_max_restarts` (5) an hour. The
+  channel, the DMA region (in the device's IOMMU domain for good: a device
+  no reset stopped reaches only it) and the uplink's switch stay; a later instance must offer the
+  same MAC, which root checks (unicast, unique) before dom0's uplink port
+  takes it.
+- **Control API.** `l4hctl nic list|bind|unbind|restart|ctl` and `l4hctl
+  driver list|load`. A driver dom0 loads (CTL_DRIVER_LOAD) is copied into
+  root's memory and checked as the bundle's; it is refused unless drivers
+  are confined.
+- **Tests.** `tests/run-nictest.sh` runs two NICs and makes NIC 1's driver
+  panic and hang: dom0's uplink on NIC 0 keeps working while root restarts
+  it, and NIC 1 is unbound, bound again and NIC 0's driver restarted.
+- **Not yet.** Zero-copy TX (the channel's TX area in the device's IOMMU
+  domain), multiqueue, measuring dom0-loaded drivers into the attestation
+  event log, and isolation groups and confinement on aarch64 (which has no
+  IOMMU support).
 
 ### 9.4 Console and other devices
 
@@ -5094,6 +5224,8 @@ machine and guests of 256–512 MiB.
 | `tests/run-usbstress.sh` (`STRESS_SECS`, `STRESS_CYCLES`, `USBSTRESS_NATIVE=1`) | USB stress and benchmark: all disks busy while one is pulled and put back, guests destroyed under load, data intact; per-disk throughput and IOPS, optionally against a plain Linux VM |
 | `tests/run-usbnetbench.sh` (`NETBENCH_MB`, `NETBENCH_RUNS`, `USBSTRESS_NATIVE=1`) | USB Ethernet (QEMU's `usb-net`) given whole to a guest: receive and send throughput and ping against a peer on the build host, optionally against a plain Linux VM |
 | `tests/run-usbtest.sh` (`USBTEST_HC=nec`) | whole xHCI controller assignment: left to the firmware until claimed, HID, BOT and UAS disks, a hub, driver reload, destroy during I/O, a second guest (§9.7) |
+| `tests/run-nictest.sh` | NIC drivers outside netd: two NICs, NIC 1's driver panics and hangs and is restarted while NIC 0's uplink keeps working, unbind and rebind, a restart of dom0's uplink driver (`L4H_QEMU_IOMMU=intel\|amd`: confined) |
+| `tests/fuzz-uplink` (in `run-fuzz.sh`) | the uplink channel: honest peers against a model, a producer that scribbles over descriptors and data, a consumer that writes any tail |
 | `tests/run-nettest.sh`, `tests/run-router.sh` | switches, uplink, multi-NIC, isolation, MAC lock, NAT router VM (`NETTEST_LEGACY=1`: legacy virtio-net uplink) |
 | `tests/run-density.sh 30 256` | 30 guests on 4 cores stay responsive |
 | `tests/run-m6test.sh` | dom0 restart, CPU caps, steal time |

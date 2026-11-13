@@ -190,7 +190,15 @@ const USAGE: &str = "usage: l4hctl <command>
                                there (default 60 s)
   cores VM                     host core of each vCPU of VM
   top                          CPU use of each VM
-  nics                         host NICs
+  nics | nic list              host NICs: driver, state, trust
+  nic bind NIC [DRIVER]        drive NIC with DRIVER (default: the first
+                               driver that matches); rebinds a bound NIC
+  nic unbind NIC | nic restart NIC
+  nic ctl NIC HEX              a control message for NIC's driver (bytes
+                               in hex); prints the answer in hex
+  driver list                  NIC drivers: name, origin, SHA-256
+  driver load FILE             load a NIC driver image (refused unless the
+                               host confines NIC drivers)
   switch-create                create an L2 switch; prints its id
   uplink SWITCH NIC            make host NIC the uplink of SWITCH
   switch SWITCH                ports and counters of SWITCH
@@ -324,6 +332,97 @@ fn gateway_mac(macs: &[u64]) -> Result<u64> {
         return err(format!("no neighbour entry for gateway {gw} on {}: reach it once, or give --peer MAC", f[0]));
     }
     err("dom0 has no default route on that switch: give --peer MAC")
+}
+
+/// A NUL-terminated string at the start of `b`.
+fn cstr_at(b: &[u8]) -> &str {
+    let n = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+    std::str::from_utf8(&b[..n]).unwrap_or("?")
+}
+
+fn cmd_nic(ctl: &Ctl, args: &[String]) -> Result<()> {
+    let nic = |i: usize| -> Result<u64> { parse_num(args.get(i).ok_or(Error("nic: missing NIC".into()))?) };
+    match args.first().map(String::as_str) {
+        Some("list") => {
+            let n = ctl.call(CTL_HOST_INFO, &[], &[], &[])?.vals[5];
+            for i in 0..n {
+                let r = ctl.call(CTL_NIC_INFO, &[i], &[], &[])?;
+                let (bdf, s) = (r.vals[0], r.vals[3]);
+                let sw = if r.vals[1] == u64::MAX { "-".to_string() } else { format!("switch {}", r.vals[1]) };
+                let state = ["unbound", "starting", "up", "restarting", "failed"].get((s & 0xff) as usize).copied().unwrap_or("?");
+                let trust = match s >> 8 & 0xff { 1 => "confined", 2 => "trusted (not confined)", _ => "-" };
+                let driver = cstr_at(&r.data);
+                let why = cstr_at(&r.data[driver.len() + 1..]);
+                println!(
+                    "nic {i}: pci {:02x}:{:02x}.{} {:04x}:{:04x}, driver {}, {state}, {trust}, mac {}, uplink of {sw}, {} restarts{}",
+                    bdf >> 8, (bdf >> 3) & 0x1f, bdf & 7, r.vals[4] & 0xffff, r.vals[4] >> 16 & 0xffff,
+                    if driver.is_empty() { "-" } else { driver }, fmt_mac(r.vals[2]), s >> 32 & 0xffff,
+                    if why.is_empty() { String::new() } else { format!(" (last: {why})") }
+                );
+            }
+        }
+        Some("bind") => {
+            let mut name = [0u8; 16];
+            let d = args.get(2).map_or("", String::as_str).as_bytes();
+            if d.len() > 15 {
+                return err("nic bind: driver name too long");
+            }
+            name[..d.len()].copy_from_slice(d);
+            let w = |k: usize| u64::from_le_bytes(name[k..k + 8].try_into().unwrap());
+            ctl.call(CTL_NIC_BIND, &[nic(1)?, w(0), w(8)], &[], &[])?;
+        }
+        Some("unbind") => {
+            ctl.call(CTL_NIC_UNBIND, &[nic(1)?], &[], &[])?;
+        }
+        Some("restart") => {
+            ctl.call(CTL_NIC_RESTART, &[nic(1)?], &[], &[])?;
+        }
+        Some("test-panic") => {
+            ctl.call(CTL_NIC_TEST, &[nic(1)?, 1], &[], &[])?;
+        }
+        Some("test-hang") => {
+            ctl.call(CTL_NIC_TEST, &[nic(1)?, 2], &[], &[])?;
+        }
+        Some("ctl") => {
+            let hex = args.get(2).ok_or(Error("nic ctl: missing HEX".into()))?;
+            let bytes = (0..hex.len() / 2)
+                .map(|k| u8::from_str_radix(&hex[2 * k..2 * k + 2], 16))
+                .collect::<std::result::Result<Vec<u8>, _>>()
+                .map_err(|_| Error("nic ctl: not hex".into()))?;
+            let n = nic(1)?;
+            ctl.call(CTL_NIC_CTL, &[n, 0, bytes.len() as u64], &[], &bytes)?;
+            let r = ctl.call(CTL_NIC_CTL_READ, &[n], &[], &[])?;
+            let out: String = r.data[..r.vals[0] as usize].iter().map(|b| format!("{b:02x}")).collect();
+            println!("{out}");
+        }
+        _ => return err("nic list | nic bind NIC [DRIVER] | nic unbind NIC | nic restart NIC | nic ctl NIC HEX"),
+    }
+    Ok(())
+}
+
+fn cmd_driver(ctl: &Ctl, args: &[String]) -> Result<()> {
+    match args.first().map(String::as_str) {
+        Some("list") => {
+            for i in 0.. {
+                let Ok(r) = ctl.call(CTL_DRIVER_INFO, &[i], &[], &[]) else { break };
+                let sha: String = r.data[16..48].iter().map(|b| format!("{b:02x}")).collect();
+                let origin = if r.vals[0] & 1 != 0 { "boot bundle" } else { "loaded" };
+                let class = match r.vals[0] >> 8 & 0xff { 1 => "ethernet", 2 => "wifi", _ => "?" };
+                println!("driver {i}: {}, {class}, {origin}, {} devices, sha256 {sha}", cstr_at(&r.data[..16]), r.vals[0] >> 16 & 0xffff);
+            }
+        }
+        Some("load") => {
+            let path = args.get(1).ok_or(Error("driver load: missing FILE".into()))?;
+            let image = std::fs::read(path).map_err(|e| Error(format!("{path}: {e}")))?;
+            if image.len() > CTL_LOAD_MAX {
+                return err(format!("{path}: larger than {} bytes", CTL_LOAD_MAX));
+            }
+            let r = ctl.call(CTL_DRIVER_LOAD, &[0, image.len() as u64], &[], &image)?;
+            println!("{}", r.vals[0]);
+        }
+        _ => return err("driver list | driver load FILE"),
+    }
+    Ok(())
 }
 
 fn cmd_ep(ctl: &Ctl, args: &[String]) -> Result<()> {
@@ -754,18 +853,9 @@ fn run(args: &[String]) -> Result<i32> {
             let cores: Vec<String> = r.vals[..vcpus.min(6)].iter().map(|c| c.to_string()).collect();
             println!("{}", cores.join(" "));
         }
-        "nics" => {
-            let n = ctl.call(CTL_HOST_INFO, &[], &[], &[])?.vals[5];
-            for i in 0..n {
-                let r = ctl.call(CTL_NIC_INFO, &[i], &[], &[])?;
-                let bdf = r.vals[0];
-                let sw = if r.vals[1] == u64::MAX { "-".to_string() } else { format!("switch {}", r.vals[1]) };
-                println!(
-                    "nic {i}: pci {:02x}:{:02x}.{}, mac {}, uplink of {sw}",
-                    bdf >> 8, (bdf >> 3) & 0x1f, bdf & 7, fmt_mac(r.vals[2])
-                );
-            }
-        }
+        "nics" => cmd_nic(&ctl, &["list".to_string()])?,
+        "nic" => cmd_nic(&ctl, &args[1..])?,
+        "driver" => cmd_driver(&ctl, &args[1..])?,
         "switch-create" => {
             println!("{}", ctl.call(CTL_SWITCH_CREATE, &[], &[], &[])?.vals[0]);
         }

@@ -11,7 +11,7 @@ pub mod shared;
 // One pool per guest device, one DMA allocation per controller/NIC, and
 // the balloon. Backends keep these records out of root's stack.
 pub const MAX_MAPPINGS: usize = crate::MAX_GUESTS * crate::vmmgr::MAX_GUEST_DEVICES
-    + pci::MAX_DISK_CTRLS + l4h_host::net::MAX_NICS + l4h_host::usb::MAX_USB_CTRLS + 1;
+    + pci::MAX_DISK_CTRLS + l4h_host::net::MAX_UPLINKS + l4h_host::usb::MAX_USB_CTRLS + 1;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Domain {
@@ -84,6 +84,17 @@ impl Iommu {
         if let Some(s) = shared::get().filter(|s| s.primary) {
             let [state, remap, units, ..] = self.info();
             s.set_ready(state, units as usize, remap != 0);
+        }
+    }
+
+    /// The requester ID function `bdf`'s DMA is translated as: its own,
+    /// or one it shares with others (a conventional PCI bridge's, a
+    /// firmware alias), whose functions then share one domain.
+    pub fn requester(&self, bdf: u16) -> u16 {
+        match self {
+            Self::Amd(a) => a.requester(bdf),
+            #[cfg(target_arch = "x86_64")]
+            Self::Intel(i) => i.requester(bdf),
         }
     }
 

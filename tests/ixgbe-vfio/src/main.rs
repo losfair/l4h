@@ -26,14 +26,11 @@ macro_rules! info {
 }
 
 #[allow(dead_code)]
-#[path = "../../../host/l4h-netd/src/ixgbe.rs"]
+#[path = "../../../host/l4h-nicd-ixgbe/src/ixgbe.rs"]
 mod ixgbe;
-#[allow(dead_code)]
-#[path = "../../../host/l4h-netd/src/offload.rs"]
-mod offload;
-#[allow(dead_code)]
-#[path = "../../../host/l4h-netd/src/pool.rs"]
-mod pool;
+#[path = "../../nicdrv-vfio/sdk.rs"]
+mod sdk;
+use sdk::offload;
 
 use std::ffi::CString;
 use std::net::Ipv4Addr;
@@ -41,7 +38,7 @@ use std::os::fd::RawFd;
 use std::time::{Duration, Instant};
 
 use l4h_host::blk::PciRegion;
-use l4h_host::net::{self, NicConfig};
+use l4h_host::net;
 
 const HDR: usize = net::HDR_SIZE;
 
@@ -143,7 +140,7 @@ fn vfio_open(bdf: &str) -> Vfio {
     assert!(regs != libc::MAP_FAILED, "mmap BAR 0");
 
     // DMA memory where netd has it, so that the driver's addresses work.
-    let va = net::nic_dma_va(0);
+    let va = l4h_host::DMA_VA;
     let p = unsafe {
         libc::mmap(
             va as *mut _,
@@ -455,18 +452,13 @@ fn main() {
     let bdf = u32::from_str_radix(&args[1][5..7], 16).unwrap() << 8
         | u32::from_str_radix(&args[1][8..10], 16).unwrap() << 3
         | u32::from_str_radix(&args[1][11..12], 16).unwrap();
-    let cfg = NicConfig {
-        kind: net::NIC_IXGBE,
-        pci_bdf: bdf,
-        regs: PciRegion { va: vfio.regs as u64, len: 4 << 20 },
-        // VFIO owns the MSI-X table; the driver's writes go to a copy.
-        msix_table: PciRegion { va: msix.as_ptr() as u64, len: msix.len() as u64 },
-        dma_paddr: DMA_IOVA,
-        dma_size: DMA_SIZE as u64,
-        ..Default::default()
-    };
+    let none = PciRegion { va: 0, len: 0 };
+    let regs = PciRegion { va: vfio.regs as u64, len: 4 << 20 };
+    // VFIO owns the MSI-X table; the driver's writes go to a copy.
+    let msix_table = PciRegion { va: msix.as_ptr() as u64, len: msix.len() as u64 };
+    let hw = sdk::hw(sdk::config(bdf, 0, [regs, none, none, none, none, none], msix_table, DMA_IOVA, DMA_SIZE as u64), hz);
     let t0 = Instant::now();
-    let mut nic = ixgbe::Ixgbe::new(0, &cfg, hz, Box::leak(Box::default()));
+    let mut nic = ixgbe::Ixgbe::new(&hw, Box::leak(Box::default()));
     println!("init took {:?}", t0.elapsed());
     if offload {
         nic.csum = true;

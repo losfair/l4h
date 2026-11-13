@@ -364,7 +364,7 @@ impl Dashboard {
                 break;
             }
             let mut uplink = ArrayString::<32>::new();
-            let _ = match h.netd.nics.iter().position(|n| n.switch == Some(sw)) {
+            let _ = match h.netd.uplink_on(sw) {
                 Some(n) => write!(uplink, "uplink nic {}", n),
                 None => uplink.write_str("internal"),
             };

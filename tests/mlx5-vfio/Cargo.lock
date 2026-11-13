@@ -14,6 +14,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "l4h-netcore"
+version = "0.1.0"
+
+[[package]]
 name = "l4h-virtio"
 version = "0.1.0"
 
@@ -28,6 +32,7 @@ name = "mlx5-vfio"
 version = "0.1.0"
 dependencies = [
  "l4h-host",
+ "l4h-netcore",
  "l4h-virtio",
  "libc",
 ]

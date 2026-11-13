@@ -27,7 +27,7 @@ pub fn host_op(h: &mut Host, op: u32, a: &[u64; 6], data: &mut [u8; abi::CTL_DAT
                 h.total_bytes as u64,
                 h.disks.len() as u64,
                 0,
-                h.netd.nics.len() as u64,
+                crate::nicd::nics().len() as u64,
             ];
         }
         abi::CTL_IOMMU_INFO => vals = h.iommu.info(),
@@ -40,6 +40,8 @@ pub fn host_op(h: &mut Host, op: u32, a: &[u64; 6], data: &mut [u8; abi::CTL_DAT
                     p.owner = abi::PCI_OWNER_ROOT;
                 } else if p.owner == abi::PCI_OWNER_FIRMWARE {
                     p.owner = crate::usb::pci_owner(p.bdf);
+                } else if let Some(o) = crate::nicd::pci_owner(p.bdf) {
+                    p.owner = o;
                 }
                 p
             });
@@ -107,13 +109,38 @@ pub fn host_op(h: &mut Host, op: u32, a: &[u64; 6], data: &mut [u8; abi::CTL_DAT
         abi::CTL_USB_INFO => vals = crate::usb::info(a[0] as usize, data)?,
         abi::CTL_SWITCH_CREATE => vals[0] = h.netd.try_create_switch()? as u64,
         abi::CTL_SWITCH_ATTACH_UPLINK => h.netd.attach_uplink(a[0].try_into().map_err(|_| ENOENT)?, a[1] as usize)?,
-        abi::CTL_NIC_INFO => {
-            let n = h.netd.nics.get(a[0] as usize).ok_or(ENOENT)?;
-            let p = &n.pci;
-            vals[0] = ((p.bus as u64) << 8) | ((p.dev as u64) << 3) | p.func as u64;
-            vals[1] = n.switch.map_or(u64::MAX, |s| s as u64);
-            vals[2] = h.netd.nic_mac(a[0] as usize).unwrap_or(0);
+        abi::CTL_NIC_INFO => vals = crate::nicd::info(h, usize::try_from(a[0]).map_err(|_| ENOENT)?, data)?,
+        abi::CTL_NIC_BIND => {
+            let i = usize::try_from(a[0]).map_err(|_| ENOENT)?;
+            let mut name = [0u8; 16];
+            name[..8].copy_from_slice(&a[1].to_le_bytes());
+            name[8..].copy_from_slice(&a[2].to_le_bytes());
+            let len = name.iter().position(|&c| c == 0).unwrap_or(16);
+            let driver = match core::str::from_utf8(&name[..len]).map_err(|_| EINVAL)? {
+                "" => None,
+                n => Some(crate::nicd::drivers().find(n).ok_or(ENOENT)?),
+            };
+            if let Err(why) = crate::nicd::bind(h, i, driver) {
+                log!("l4h-root: nic {}: not bound: {}", i, why);
+                return Err(EINVAL);
+            }
         }
+        abi::CTL_NIC_UNBIND => crate::nicd::unbind(h, usize::try_from(a[0]).map_err(|_| ENOENT)?)?,
+        abi::CTL_NIC_RESTART => crate::nicd::restart(h, usize::try_from(a[0]).map_err(|_| ENOENT)?)?,
+        abi::CTL_NIC_CTL => {
+            let t = crate::nicd::ctl_post(h, usize::try_from(a[0]).map_err(|_| ENOENT)?, a[1], a[2])?;
+            return Ok(Answer::Later(t));
+        }
+        abi::CTL_NIC_CTL_READ => vals[0] = crate::nicd::ctl_read(h, usize::try_from(a[0]).map_err(|_| ENOENT)?, data)?,
+        abi::CTL_NIC_TEST => crate::nicd::test(usize::try_from(a[0]).map_err(|_| ENOENT)?, a[1])?,
+        abi::CTL_DRIVER_INFO => {
+            let d = crate::nicd::drivers().drivers.get(usize::try_from(a[0]).map_err(|_| ENOENT)?).ok_or(ENOENT)?;
+            let m = &d.manifest;
+            vals[0] = (d.boot as u64) * abi::DRIVER_BOOT | (m.class as u64) << 8 | (m.nr_matches as u64) << 16;
+            data[..16].copy_from_slice(&m.name);
+            data[16..48].copy_from_slice(&d.sha256);
+        }
+        abi::CTL_DRIVER_LOAD => vals[0] = crate::nicd::load_driver(h, a[0], a[1])? as u64,
         abi::CTL_SWITCH_INFO => {
             let sw = u32::try_from(a[0]).map_err(|_| ENOENT)?;
             if sw >= h.netd.switches {
@@ -134,7 +161,7 @@ pub fn host_op(h: &mut Host, op: u32, a: &[u64; 6], data: &mut [u8; abi::CTL_DAT
                 n += 1;
             }
             vals[0] = n as u64;
-            vals[1] = h.netd.nics.iter().position(|n| n.switch == Some(sw)).map_or(u64::MAX, |i| i as u64);
+            vals[1] = h.netd.uplink_on(sw).map_or(u64::MAX, |i| i as u64);
         }
         abi::CTL_EP_SET => vals[0] = h.netd.ep_set(a[0].try_into().map_err(|_| ENOENT)?, a[1], a[2])? as u64,
         abi::CTL_EP_DEL => h.netd.ep_del(a[0].try_into().map_err(|_| ENOENT)?)?,

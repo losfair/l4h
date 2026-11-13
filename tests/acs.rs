@@ -36,7 +36,14 @@ impl Func {
 
     /// A bridge whose secondary bus is `secondary`.
     fn bridge(mut self, secondary: u8) -> Func {
+        self.space[0x0c / 4] |= 1 << 16;
         self.space[0x18 / 4] = (secondary as u32) << 8 | (secondary as u32) << 16;
+        self
+    }
+
+    /// Function 0 of a device with several (the multi-function bit).
+    fn multi(mut self) -> Func {
+        self.space[0x0c / 4] |= 0x80 << 16;
         self
     }
 
@@ -295,4 +302,87 @@ fn ecam_windows_map_in_few_aligned_blocks() {
     // No free memory at a block: the list ends with it, under 12 bits.
     let b: Vec<_> = acs::blocks(0xa000_0000, 0xa800_0000, 0xa000_0000, |at| if at >= 0xa400_0000 { 0 } else { 26 }).collect();
     assert_eq!(b, [(0xa000_0000, 26), (0xa400_0000, 0)]);
+}
+
+fn group_in(m: &Model, inventory: &[u16], me: u16) -> Vec<u16> {
+    let mut g = Vec::new();
+    acs::group(m, || inventory.iter().copied(), me, |b| if !g.contains(&b) { g.push(b) });
+    g.sort();
+    g
+}
+
+#[test]
+fn a_function_shares_its_group_with_function_0_without_acs() {
+    // virtio-blk at 00:05.0 says it has several functions; e1000e at
+    // 00:05.1 does not, as only function 0 need.
+    let m = Model::new(&[(0x0028, Func::pcie(0, None).multi()), (0x0029, Func::pcie(0, None))]);
+    assert_eq!(group_in(&m, &[0x0028, 0x0029], 0x0029), [0x0028, 0x0029]);
+    assert_eq!(group_in(&m, &[0x0028, 0x0029], 0x0028), [0x0028, 0x0029]);
+    // ACS on the function keeps it apart.
+    let all = SV | RR | CR | UF;
+    let m = Model::new(&[(0x0028, Func::pcie(0, None).multi()), (0x0029, Func::pcie(0, Some((all, all))))]);
+    assert_eq!(group_in(&m, &[0x0028, 0x0029], 0x0029), [0x0029]);
+}
+
+#[test]
+fn the_whole_inventory_is_walked() {
+    // 1024 functions before the bridge: a bridge without ACS routing bus
+    // 5, with the NIC and a disk below it.
+    let mut funcs: Vec<(u16, Func)> = (0..1024u16).map(|i| (0x1000 + i, Func::pcie(0, None))).collect();
+    funcs.push((0x0400, Func::pcie(acs::DOWNSTREAM_PORT, None).bridge(5)));
+    funcs.push((0x0500, Func::pcie(0, None)));
+    funcs.push((0x0508, Func::pcie(0, None)));
+    let inventory: Vec<u16> = funcs.iter().map(|f| f.0).collect();
+    let m = Model::new(&funcs);
+    assert_eq!(group_in(&m, &inventory, 0x0500), [0x0500, 0x0508]);
+}
+
+#[test]
+fn a_port_with_acs_isolates_its_children() {
+    let all = SV | RR | CR | UF;
+    let port = |acs| Func::pcie(acs::ROOT_PORT, acs).bridge(2);
+    let inventory = [PORT, 0x0010, 0x0200, 0x0300];
+    for (acs, peers) in [(Some((all, all)), vec![0x0200]), (None, vec![0x0009, 0x0200, 0x0300])] {
+        // A sibling port 00:01.1 (bus 3) of a port without ACS, and what
+        // is below it, is reached through it too.
+        let m = Model::new(&[(PORT, port(acs).multi()), (0x0009, Func::pcie(acs::ROOT_PORT, None).bridge(3)),
+            (0x0010, Func::pcie(0, None)), (0x0200, Func::pcie(0, None)), (0x0300, Func::pcie(0, None))]);
+        let inventory = [inventory.as_slice(), &[0x0009]].concat();
+        assert_eq!(group_in(&m, &inventory, 0x0200), peers);
+    }
+}
+
+#[test]
+fn an_endpoint_beside_a_bridge_without_acs_shares_its_group() {
+    // A bridge at 00:05.0 routing bus 2, a disk at 00:05.1 and the NIC
+    // at 02:00.0.
+    let m = Model::new(&[(0x0028, Func::pcie(acs::DOWNSTREAM_PORT, None).bridge(2).multi()),
+        (0x0029, Func::pcie(0, None)), (0x0200, Func::pcie(0, None))]);
+    assert_eq!(group_in(&m, &[0x0028, 0x0029, 0x0200], 0x0200), [0x0029, 0x0200]);
+}
+
+#[test]
+fn a_bridge_beside_a_function_without_acs_shares_what_is_below_it() {
+    // A bridge at 00:05.0 routing bus 2, the NIC at 00:05.1 and a disk
+    // at 02:00.0.
+    let m = Model::new(&[(0x0028, Func::pcie(acs::DOWNSTREAM_PORT, None).bridge(2).multi()),
+        (0x0029, Func::pcie(0, None)), (0x0200, Func::pcie(0, None))]);
+    assert_eq!(group_in(&m, &[0x0028, 0x0029, 0x0200], 0x0029), [0x0028, 0x0029, 0x0200]);
+}
+
+#[test]
+fn a_group_is_closed_under_reach_and_requester_aliases() {
+    // NIC A at 00:05.0 shares a slot without ACS with B at 00:05.1, which
+    // the IOMMU translates as disk C at 00:06.0; D at 00:07.0 is alone.
+    let m = Model::new(&[(0x0028, Func::pcie(0, None).multi()), (0x0029, Func::pcie(0, None)),
+        (0x0030, Func::pcie(0, None)), (0x0038, Func::pcie(0, None))]);
+    let inventory = [0x0028u16, 0x0029, 0x0030, 0x0038];
+    let alias = |f: u16| if f == 0x0029 { 0x0030 } else { f };
+    let mut out = [0u16; 8];
+    let n = acs::closure(&m, || inventory.iter().copied(), alias, 0x0028, &mut out).unwrap();
+    let mut g = out[..n].to_vec();
+    g.sort();
+    assert_eq!(g, [0x0028, 0x0029, 0x0030]);
+    // Too many members for `out`.
+    assert_eq!(acs::closure(&m, || inventory.iter().copied(), alias, 0x0028, &mut [0u16; 2]), None);
 }

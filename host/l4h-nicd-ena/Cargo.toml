@@ -1,0 +1,10 @@
+[package]
+name = "l4h-nicd-ena"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+l4h-nicdrv = { path = "../l4h-nicdrv" }
+l4h-rt = { path = "../l4h-rt" }
+l4h-virtio = { path = "../l4h-virtio" }

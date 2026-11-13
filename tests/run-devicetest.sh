@@ -43,7 +43,8 @@ def function(source, signature):
 pci = (root / 'host/l4h-root/src/pci.rs').read_text()
 (out / 'pci-identity.inc').write_text('impl Pci {\n' + method(pci, '    pub fn identity(') + '\n}\n')
 root_main = (root / 'host/l4h-root/src/main.rs').read_text()
-start = root_main.index('        } else if netd::is_uplink(&d) {') + len('        } else if netd::is_uplink(&d) {')
+nic_branch = '        } else if nicd::is_network(&d, &nicd::ids_of(&d, &pci), cfg.nic_pin(netd::bdf(&d)).is_some()) {'
+start = root_main.index(nic_branch) + len(nic_branch)
 end = root_main.index('        } else if usb::is_xhci(&d) {', start)
 usb = (root / 'host/l4h-root/src/usb.rs').read_text()
 root_ctl = (root / 'host/l4h-root/src/ctl.rs').read_text()
@@ -60,8 +61,7 @@ fn pci_page(h: &mut Host, first: u64, data: &mut [u8; abi::CTL_DATA_MAX]) -> usi
     }
     vals[0] as usize
 }
-fn record_nic(d: Device, pci: &Pci, nics: &mut Nics, nic_bars: &mut NicBars,
-              mut alloc: &mut bool, mut devmem: &mut ()) -> abi::CtlPci {
+fn record_nic(d: Device, pci: &Pci, cfg: &Cfg) -> abi::CtlPci {
     let mut entry = pci.identity(&d);
     let record = &mut entry;
 ''' + root_main[start:end] + '''

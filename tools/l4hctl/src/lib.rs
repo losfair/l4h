@@ -61,6 +61,14 @@ pub const CTL_BLK_ATTACH_EXTENTS: u32 = 39;
 pub const CTL_USB_INFO: u32 = 40;
 pub const CTL_USB_ATTACH: u32 = 41;
 pub const CTL_PCI_LIST: u32 = 42;
+pub const CTL_NIC_BIND: u32 = 43;
+pub const CTL_NIC_UNBIND: u32 = 44;
+pub const CTL_NIC_RESTART: u32 = 45;
+pub const CTL_NIC_CTL: u32 = 46;
+pub const CTL_NIC_CTL_READ: u32 = 47;
+pub const CTL_DRIVER_INFO: u32 = 48;
+pub const CTL_DRIVER_LOAD: u32 = 49;
+pub const CTL_NIC_TEST: u32 = 50;
 pub const PCI_OWNER_NONE: u16 = 0;
 pub const PCI_OWNER_BLKD: u16 = 1;
 pub const PCI_OWNER_NETD: u16 = 2;
@@ -68,6 +76,7 @@ pub const PCI_OWNER_MEMD: u16 = 3;
 pub const PCI_OWNER_USBD: u16 = 4;
 pub const PCI_OWNER_FIRMWARE: u16 = 5;
 pub const PCI_OWNER_ROOT: u16 = 6;
+pub const PCI_OWNER_NICD: u16 = 7;
 
 /// A function from root's boot-time PCI inventory (CTL_PCI_LIST).
 #[repr(C)]
@@ -96,6 +105,7 @@ impl CtlPci {
             PCI_OWNER_USBD => "usbd",
             PCI_OWNER_FIRMWARE => "firmware",
             PCI_OWNER_ROOT => "root",
+            PCI_OWNER_NICD => "nicd",
             _ => "unknown",
         }
     }

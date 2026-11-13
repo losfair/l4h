@@ -31,6 +31,7 @@ pub const VMM_PAGES: usize = MAX_VMMS * lane_pages(SMALL);
 /// a VMM per guest.
 pub const MAX_BLKDS: usize = 64;
 pub const MAX_USBDS: usize = crate::usb::MAX_USB_CTRLS;
+pub const MAX_NICDS: usize = crate::nicd::MAX_UPLINKS;
 pub const MAX_VMMS: usize = crate::memd::MAX_GUESTS;
 
 /// Component ids (root's `*_ID` constants, which root checks).
@@ -54,6 +55,7 @@ const _: () = {
         (crate::vmmgr::VMMGR_ID, 1),
         (LOGD_ID, 1),
         (crate::usb::USBD_ID_BASE, MAX_USBDS),
+        (crate::nicd::NICD_ID_BASE, MAX_NICDS),
         (VMM_ID_BASE, MAX_VMMS),
     ];
     let (mut i, mut end) = (0, 1);
@@ -77,6 +79,8 @@ pub enum Writer {
     Netd,
     Blkd(u32),
     Usbd(u32),
+    /// Uplink n's nicd.
+    Nicd(u32),
     /// Guest g's VMM, and what it prints of its guest's console.
     Vmm(u32),
     /// dom0's VMM in the serial ring, where dom0's console is (`serial`).
@@ -85,7 +89,7 @@ pub enum Writer {
 
 impl Writer {
     /// Every writer, in `index` order.
-    pub const COUNT: usize = 7 + MAX_BLKDS + MAX_USBDS + MAX_VMMS + 1;
+    pub const COUNT: usize = 7 + MAX_BLKDS + MAX_USBDS + MAX_NICDS + MAX_VMMS + 1;
 
     /// The writer that a component of `kind` and `id` is, if any.
     pub fn of(kind: u32, id: u32) -> Option<Writer> {
@@ -99,6 +103,7 @@ impl Writer {
             crate::KIND_NETD => Writer::Netd,
             crate::KIND_BLKD => Writer::Blkd(index(BLKD_ID_BASE, MAX_BLKDS)?),
             crate::KIND_USBD => Writer::Usbd(index(crate::usb::USBD_ID_BASE, MAX_USBDS)?),
+            crate::KIND_NICD => Writer::Nicd(index(crate::nicd::NICD_ID_BASE, MAX_NICDS)?),
             crate::KIND_VMM => Writer::Vmm(index(0, MAX_VMMS)?),
             _ => return None,
         })
@@ -115,7 +120,8 @@ impl Writer {
             Writer::Netd => 6,
             Writer::Blkd(c) => 7 + c as usize,
             Writer::Usbd(i) => 7 + MAX_BLKDS + i as usize,
-            Writer::Vmm(g) => 7 + MAX_BLKDS + MAX_USBDS + g as usize,
+            Writer::Nicd(i) => 7 + MAX_BLKDS + MAX_USBDS + i as usize,
+            Writer::Vmm(g) => 7 + MAX_BLKDS + MAX_USBDS + MAX_NICDS + g as usize,
             Writer::Dom0 => Self::COUNT - 1,
         }
     }
@@ -123,6 +129,7 @@ impl Writer {
     pub const fn from_index(i: usize) -> Option<Writer> {
         const B: usize = 7 + MAX_BLKDS;
         const U: usize = B + MAX_USBDS;
+        const N: usize = U + MAX_NICDS;
         Some(match i {
             0 => Writer::Root,
             1 => Writer::Logd,
@@ -133,7 +140,8 @@ impl Writer {
             6 => Writer::Netd,
             7..B => Writer::Blkd((i - 7) as u32),
             B..U => Writer::Usbd((i - B) as u32),
-            _ if i < Self::COUNT - 1 => Writer::Vmm((i - U) as u32),
+            U..N => Writer::Nicd((i - U) as u32),
+            _ if i < Self::COUNT - 1 => Writer::Vmm((i - N) as u32),
             _ if i == Self::COUNT - 1 => Writer::Dom0,
             _ => return None,
         })
@@ -156,6 +164,7 @@ impl Writer {
             Writer::Netd => NETD_ID,
             Writer::Blkd(c) => BLKD_ID_BASE + c,
             Writer::Usbd(i) => crate::usb::USBD_ID_BASE + i,
+            Writer::Nicd(i) => crate::nicd::NICD_ID_BASE + i,
             Writer::Vmm(g) => VMM_ID_BASE + g,
             Writer::Dom0 => u32::MAX,
         }
@@ -173,6 +182,7 @@ impl Writer {
             Writer::Netd => out.write_str("netd"),
             Writer::Blkd(c) => write!(out, "blkd{}", c),
             Writer::Usbd(i) => write!(out, "usbd{}", i),
+            Writer::Nicd(i) => write!(out, "nicd{}", i),
             Writer::Vmm(g) => write!(out, "vmm{}", g),
             Writer::Dom0 => out.write_str("dom0 vmm"),
         }
@@ -224,6 +234,7 @@ pub struct Ring {
     service: [Lane<SERVICE>; 5],
     blkd: [Lane<SMALL>; MAX_BLKDS],
     usbd: [Lane<SMALL>; MAX_USBDS],
+    nicd: [Lane<SMALL>; MAX_NICDS],
 }
 
 const _: () = {
@@ -276,6 +287,7 @@ pub fn lane_at(w: Writer) -> Option<LaneAt> {
         Writer::Netd => svc(4),
         Writer::Blkd(c) => LaneAt::new(offset_of!(Ring, blkd) + c as usize * small, SMALL),
         Writer::Usbd(i) => LaneAt::new(offset_of!(Ring, usbd) + i as usize * small, SMALL),
+        Writer::Nicd(i) => LaneAt::new(offset_of!(Ring, nicd) + i as usize * small, SMALL),
         Writer::Vmm(g) => LaneAt::new(offset_of!(Ring, vmm) + g as usize * small, SMALL),
         Writer::Dom0 => return None,
     })
@@ -291,6 +303,7 @@ impl Ring {
             service: [const { Lane::new() }; 5],
             blkd: [const { Lane::new() }; MAX_BLKDS],
             usbd: [const { Lane::new() }; MAX_USBDS],
+            nicd: [const { Lane::new() }; MAX_NICDS],
         }
     }
 
@@ -314,6 +327,7 @@ impl Ring {
             Writer::Netd => self.service[4].0.view(),
             Writer::Blkd(c) => self.blkd.get(i(c))?.0.view(),
             Writer::Usbd(u) => self.usbd.get(i(u))?.0.view(),
+            Writer::Nicd(u) => self.nicd.get(i(u))?.0.view(),
             Writer::Vmm(g) => self.vmm.get(i(g))?.0.view(),
             Writer::Dom0 => return None,
         })
@@ -1294,6 +1308,7 @@ mod tests {
                     Writer::Netd => crate::KIND_NETD,
                     Writer::Blkd(_) => crate::KIND_BLKD,
                     Writer::Usbd(_) => crate::KIND_USBD,
+                    Writer::Nicd(_) => crate::KIND_NICD,
                     _ => crate::KIND_VMM,
                 };
                 // A VMM's component id is its guest's.

@@ -7,23 +7,22 @@ pub use l4h_host as host;
 macro_rules! info {
     ($($arg:tt)*) => { eprintln!($($arg)*) };
 }
+#[macro_export]
+macro_rules! log {
+    ($($arg:tt)*) => { eprintln!($($arg)*) };
+}
 
 #[allow(dead_code)]
-#[path = "../../../host/l4h-netd/src/mlx5.rs"]
+#[path = "../../../host/l4h-nicd-mlx5/src/mlx5.rs"]
 mod mlx5;
-#[allow(dead_code)]
-#[path = "../../../host/l4h-netd/src/offload.rs"]
-mod offload;
-#[allow(dead_code)]
-#[path = "../../../host/l4h-netd/src/pool.rs"]
-mod pool;
+#[path = "../../nicdrv-vfio/sdk.rs"]
+mod sdk;
 
 use std::ffi::CString;
 
 use std::os::fd::RawFd;
 use std::time::{Duration, Instant};
 
-use l4h_host::net;
 
 // VFIO ioctls: _IO(';', 100 + n).
 const fn vfio(n: u64) -> u64 {
@@ -143,7 +142,7 @@ fn vfio_open(bdf: &str) -> Vfio {
     assert!(regs != libc::MAP_FAILED, "mmap BAR 0");
 
     // DMA memory where netd has it, so that the driver's addresses work.
-    let va = net::nic_dma_va(0);
+    let va = l4h_host::DMA_VA;
     let p = unsafe {
         libc::mmap(
             va as *mut _,
@@ -231,7 +230,7 @@ fn main() {
     let hz = tsc_hz();
     let vf = vfio_open(&bdf);
     let result = std::panic::catch_unwind(|| {
-        let dma = l4h_virtio::Dma::new(net::nic_dma_va(0), DMA_IOVA, DMA_SIZE);
+        let dma = l4h_virtio::Dma::new(l4h_host::DMA_VA, DMA_IOVA, DMA_SIZE);
         let mut nic =
             mlx5::Mlx5::open(vf.regs, 32 << 20, dma, hz).expect("initialize Ethernet queues");
         println!("MAC {:02x?}, Ethernet queues initialized", nic.mac);

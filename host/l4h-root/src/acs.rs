@@ -202,6 +202,100 @@ pub fn has_children(c: &impl Config, bdf: u16) -> bool {
     (0..256u16).any(|devfn| c.read((secondary as u16) << 8 | devfn, 0) & 0xffff != 0xffff)
 }
 
+/// The functions of `functions` (every one root found, as bus << 8 |
+/// device << 3 | function) that DMA from function `me` may reach without
+/// passing the IOMMU, each given to `add` (`me` among them, some more
+/// than once): the other functions of its device, unless ACS on `me`
+/// isolates them (and what is below those that are bridges), and, up the
+/// tree, everything below each bridge that does not isolate the ports
+/// under it.  A device's other functions are those found in its slot:
+/// only function 0 need say it has several.  This is one step: a caller
+/// wanting every function a group's members reach takes its closure.
+pub fn group<I: Iterator<Item = u16>>(c: &impl Config, functions: impl Fn() -> I, me: u16, mut add: impl FnMut(u16)) {
+    let header = |b: u16| (c.read(b, 0x0c) >> 16) as u8;
+    let buses = |b: u16| {
+        let r = c.read(b, 0x18);
+        ((r >> 8) as u8, (r >> 16) as u8)
+    };
+    let below = |sec: u8, sub: u8, add: &mut dyn FnMut(u16)| {
+        if sec != 0 {
+            for f in functions().filter(|&f| (sec..=sub).contains(&((f >> 8) as u8)) && header(f) & 0x7f == 0) {
+                add(f);
+            }
+        }
+    };
+    // The other functions of `f`'s device, and below those that are
+    // bridges.
+    let slot = |f: u16, add: &mut dyn FnMut(u16)| {
+        for sib in functions().filter(|&s| s >> 3 == f >> 3 && s != f) {
+            add(sib);
+            if header(sib) & 0x7f == 1 {
+                let (sec, sub) = buses(sib);
+                below(sec, sub, add);
+            }
+        }
+    };
+    add(me);
+    if !state(c, me).isolates() {
+        slot(me, &mut add);
+    }
+    let mut bus = (me >> 8) as u8;
+    for _ in 0..256 {
+        // The bridge whose secondary bus this is: the immediate parent,
+        // then its parent, and so on (one higher up that isolates does
+        // not keep peers below a lower one apart).
+        let Some(bridge) = functions().find(|&f| header(f) & 0x7f == 1 && {
+            let (sec, _) = buses(f);
+            sec != 0 && sec == bus
+        }) else {
+            break;
+        };
+        if !(pcie_type(c, bridge).is_some() && state(c, bridge).isolates()) {
+            let (sec, sub) = buses(bridge);
+            below(sec, sub, &mut add);
+            // A bridge without ACS may route to its sibling functions,
+            // and below those that are bridges.
+            slot(bridge, &mut add);
+        }
+        if (bridge >> 8) as u8 >= bus {
+            break;
+        }
+        bus = (bridge >> 8) as u8;
+    }
+}
+
+/// Function `me`'s isolation group, into `out`: the closure, over every
+/// member, of what it reaches past the IOMMU (`group`) and of the
+/// functions the IOMMU translates as its requester (`requester`), which
+/// share its domain whatever ACS does.  A peer may itself share another's
+/// domain, or reach further.  The number of members, or None if more than
+/// `out` holds.
+pub fn closure<I: Iterator<Item = u16>>(c: &impl Config, functions: impl Fn() -> I + Copy,
+    requester: impl Fn(u16) -> u16, me: u16, out: &mut [u16]) -> Option<usize> {
+    let mut len = 0;
+    let mut full = false;
+    let mut add = |out: &mut [u16], len: &mut usize, b: u16| {
+        if !out[..*len].contains(&b) {
+            match out.get_mut(*len) {
+                Some(slot) => { *slot = b; *len += 1; }
+                None => full = true,
+            }
+        }
+    };
+    add(out, &mut len, me);
+    let mut i = 0;
+    while i < len {
+        let m = out[i];
+        i += 1;
+        group(c, functions, m, |b| add(out, &mut len, b));
+        let r = requester(m);
+        for f in functions().filter(|&f| requester(f) == r) {
+            add(out, &mut len, f);
+        }
+    }
+    (!full).then_some(len)
+}
+
 /// The names of the bits set in `bits`, for the log.
 pub struct Bits(pub u16);
 
