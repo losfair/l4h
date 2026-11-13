@@ -384,23 +384,31 @@ impl Vmmgr {
             if !g.reserve(&mut h.alloc, g.start_bytes()) {
                 return Err(ctl::ENOMEM);
             }
-            h.spawn_vmm(g);
-            Ok(())
+            h.spawn_vmm(g)
         })
         .ok_or(ctl::ENOENT)?
     }
 
     /// Spawn `g`'s l4h-vmm, within `with_guest`.  The caller checked that
     /// `g` is created, without a VMM or a device root is attaching, and
-    /// reserved `Guest::start_bytes`: nothing here is refused, so a guest
-    /// that was booted for it starts.
-    pub fn spawn_vmm(&mut self, g: &mut Guest) {
+    /// reserved `Guest::start_bytes`. A scheduling failure stops this
+    /// guest and is reported to its caller without taking down vmmgr.
+    pub fn spawn_vmm(&mut self, g: &mut Guest) -> Result<(), Errno> {
+        let limits = sched::prepare_vmm(self, g).ok_or(ctl::EIO)?;
         if g.attest {
             root::trust_register(g);
         }
-        let v = vmm::spawn(g, &mut self.alloc, &mut self.wins.a, &mut self.asids, &self.info);
+        let v = match vmm::spawn(g, &mut self.alloc, &mut self.wins.a, &mut self.asids, &self.info, limits) {
+            Ok(v) => v,
+            Err(e) => {
+                l4h_rt::log!("l4h-vmmgr: create guest {} VMM scheduling: {:?}", g.id, e);
+                g.stop();
+                return Err(ctl::EIO);
+            }
+        };
         component::start(&v);
         g.vmm = Some(v);
+        Ok(())
     }
 
     /// Give guest `id` (before it starts) a virtio-net device on `switch`.
@@ -521,7 +529,7 @@ impl Vmmgr {
                         core::ptr::addr_of_mut!((*p).vcpus).write_volatile(g.vcpus.len() as u8);
                         core::ptr::addr_of_mut!((*p).cap_pct).write_volatile(g.cpu_cap_pct as u8);
                         core::ptr::addr_of_mut!((*p).ram_mb).write_volatile((g.owned_ram() >> 20) as u32);
-                        core::ptr::addr_of_mut!((*p).cpu).write_volatile(g.vcpus.iter().map(|v| v.usage).sum());
+                        core::ptr::addr_of_mut!((*p).cpu).write_volatile(g.vcpus.iter().map(|v| v.usage).sum::<u32>() + g.vmm_usage);
                         core::ptr::addr_of_mut!((*p).cores).write_volatile(cores);
                         core::ptr::addr_of_mut!((*p).name).write_volatile(name);
                     }
@@ -992,14 +1000,9 @@ struct VmmCalls<'a>(&'a mut Vmmgr);
 impl call::Server for VmmCalls<'_> {
     fn vmm_ready(&mut self, from: proto::Sender) -> Result<(), Errno> {
         let proto::Sender::Vmm(id) = from else { return Err(EINVAL) };
-        let g = self.0.guests.get_mut(id).and_then(|g| g.as_mut()).ok_or(l4h_host::wire::NO_REPLY)?;
         // Only a freshly built guest starts: a second VmmReady, or one from
         // the VMM of a running or stopped guest, must not reset vCPU 0.
-        if g.state != State::Created {
-            return Err(EINVAL);
-        }
-        g.start();
-        Ok(())
+        sched::start(self.0, id)
     }
 
     fn guest_power(&mut self, from: proto::Sender, how: u64) -> Result<(), Errno> {

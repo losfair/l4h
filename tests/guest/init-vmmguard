@@ -1,0 +1,47 @@
+#!/bin/sh
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mkdir -p /run
+fail() { echo "VMMGUARDTEST: FAIL: $*"; poweroff -f; exit 1; }
+bad=$(l4hctl create bad --initrd /bin/densvm.cpio.gz --mem 64 --cmdline 'console=hvc0 quiet') || fail bad
+[ "$bad" = 1 ] || fail 'wrong injected guest'
+ids=$bad
+# A lone busy VMM must use idle CPU, rather than retain a half-core cap.
+sleep 0.5
+spare=$(l4hctl top | awk '$2 == "bad" { split($3,a,"."); print a[1] }')
+[ "${spare:-0}" -ge 75 ] || fail "idle core limited busy VMM to ${spare:-0}%"
+echo "VMMGUARDTEST: lone pre-READY VMM uses $spare% of idle core"
+# Victim and the spinning VMM must share core 1 (placement is round robin).
+for n in 1 2 3; do
+    id=$(l4hctl create "idle$n" --initrd /bin/densvm.cpio.gz --mem 64 --cmdline 'console=hvc0 quiet') || fail idle
+    ids="$ids $id"
+    l4hctl console "$id" --until 'DENSVM: ready' --timeout 20 >/run/idle || fail idle-ready
+done
+victim=$(l4hctl create victim --initrd /bin/densvm.cpio.gz --mem 128 --cmdline 'console=hvc0 quiet WAKE=1 HOG=1') || fail victim
+ids="$ids $victim"
+[ "$(l4hctl cores "$bad")" = "$(l4hctl cores "$victim")" ] || fail placement
+l4hctl console "$victim" --until 'DENSVM: ready' --timeout 20 >/run/victim || { cat /run/victim; fail victim-ready; }
+grep -q 'VMMWAKE: PASS' /run/victim || fail 'interactive wakeups'
+grep 'VMMWAKE:' /run/victim
+l4hctl send "$victim" --wait 'DENSVM: pong progress' --timeout 5 progress >/run/pong || fail 'guest made no progress'
+sleep 1
+cpu=$(l4hctl top | awk '$2 == "victim" { split($3,a,"."); print a[1] }')
+[ "${cpu:-0}" -ge 15 ] || fail "victim got only ${cpu:-0}% CPU"
+echo "VMMGUARDTEST: victim progresses at $cpu% CPU on shared core"
+bad_cpu=$(l4hctl top | awk '$2 == "bad" { split($3,a,"."); print a[1] }')
+[ "${bad_cpu:-0}" -ge 10 ] || fail "pre-READY VMM CPU was hidden: ${bad_cpu:-0}%"
+echo "VMMGUARDTEST: pre-READY VMM reports $bad_cpu% CPU"
+for _ in $(seq 60); do
+    l4hctl logs >/run/logs || fail logs
+    grep -q 'VMMGUARD: FAIL' /run/logs && fail 'VMM regained authority'
+    if grep -q 'VMMGUARD: parent restored boost with low authority' /run/logs; then break; fi
+    sleep 0.2
+done
+grep -q 'VMMGUARD: self-boost refused' /run/logs || fail 'no authority check'
+grep -q 'guest 1 VMM priority 101' /run/logs || fail 'parent did not demote VMM'
+grep -q 'guest 1 VMM priority 103' /run/logs || fail 'parent did not restore boost'
+grep -q 'VMMGUARD: parent restored boost with low authority' /run/logs || fail 'no restored-boost authority check'
+for id in $ids; do l4hctl destroy "$id" || fail destroy; done
+echo 'VMMGUARDTEST: PASS'
+poweroff -f

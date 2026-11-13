@@ -274,8 +274,8 @@ impl<B: Backend> Device<B> {
         self.backend.notify_submissions();
     }
 
-    /// A backend signalled completions, maybe this one.
-    pub fn complete(&mut self, mem: &GuestMem, vcpus: &Vcpus) {
+    /// Publish backend configuration changes without processing queues.
+    pub fn update_config(&mut self, vcpus: &Vcpus) {
         let config = unsafe { core::slice::from_raw_parts_mut(
             (self.regs as usize + abi::VIRTIO_CONFIG_OFF) as *mut u8,
             abi::VIRTIO_CONFIG_SIZE,
@@ -291,6 +291,11 @@ impl<B: Backend> Device<B> {
                 vcpus.raise(self.irq_vcpu().min(vcpus.n - 1), self.event);
             }
         }
+    }
+
+    /// A backend signalled completions, maybe this one.
+    pub fn complete(&mut self, mem: &GuestMem, vcpus: &Vcpus) {
+        self.update_config(vcpus);
         if !self.backend.pending() {
             return;
         }

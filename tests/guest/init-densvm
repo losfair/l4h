@@ -4,6 +4,9 @@
 mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
+if [ "${WAKE:-0}" = 1 ]; then
+    /bin/vmm-wake || { poweroff -f; exit 1; }
+fi
 i=0
 while [ "$i" -lt "${HOG:-0}" ]; do
     (while :; do :; done) &

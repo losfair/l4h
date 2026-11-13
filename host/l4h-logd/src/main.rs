@@ -3,7 +3,7 @@
 //! rings without any seL4 call, so nothing can wake this task: it looks at
 //! the rings on a timer, and prints their records whole, in one order.
 //!
-//! It runs above guest vCPUs and below their VMMs, with a small budget, and
+//! It runs above guest vCPUs and throttled VMMs, below boosted VMMs, with a small budget, and
 //! sleeps while the UART sends a burst, so it neither starves nor spins.
 //! Root gives it the port and keeps the receive side.  If this task faults,
 //! serial output stops.

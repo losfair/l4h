@@ -69,7 +69,7 @@ impl Dev {
     fn poll(&mut self, mem: &GuestMem, vcpus: &Vcpus, more: u64) {
         match self {
             Dev::Blk(d) => d.poll(mem, vcpus, 0),
-            Dev::Net(d) => d.poll(mem, vcpus, 0),
+            Dev::Net(_) => unreachable!("network polls are merged in net::signal"),
             Dev::Gpu(d) => d.poll(mem, vcpus, more),
             Dev::Usb(_) => {}
         }
@@ -79,19 +79,24 @@ impl Dev {
     /// each), which this turn's `poll` takes up.
     fn take_more(&mut self) -> u64 {
         match self {
+            Dev::Net(_) => unreachable!("network continuations belong to net::signal"),
             Dev::Gpu(d) => core::mem::take(&mut d.backend.more),
             _ => 0,
         }
     }
 
     fn has_more(&self) -> bool {
-        matches!(self, Dev::Gpu(d) if d.backend.more != 0)
+        match self {
+            Dev::Net(d) => d.backend.more != 0,
+            Dev::Gpu(d) => d.backend.more != 0,
+            _ => false,
+        }
     }
 
     fn complete(&mut self, mem: &GuestMem, vcpus: &Vcpus) {
         match self {
             Dev::Blk(d) => d.complete(mem, vcpus),
-            Dev::Net(d) => d.complete(mem, vcpus),
+            Dev::Net(_) => unreachable!("network completions are merged in net::signal"),
             Dev::Gpu(d) => d.complete(mem, vcpus),
             Dev::Usb(_) => {}
         }
@@ -140,6 +145,32 @@ fn wall_clock_ns(cfg: &VmmConfig, hz: u64) -> u64 {
 
 fn main(info: &'static Info) -> ! {
     let cfg: &VmmConfig = unsafe { info.config() };
+    // Real-parent regression test: a compromised VMM spins before READY,
+    // tries to undo demotion, then yields long enough to regain its boost.
+    if host::TEST_INJECT && matches!(option_env!("L4H_TEST_VMM_BUSY"), Some("1")) && cfg.guest_id == 1 {
+        let tcb = cap::<cap_type::Tcb>(host::SLOT_TCB);
+        let mut end = l4h_rt::timeout_ms(12000);
+        let mut refused = false;
+        while !end() {
+            if !refused {
+                let p = tcb.tcb_set_priority(tcb, host::PRIO_VMM);
+                let m = tcb.tcb_set_mc_priority(tcb, host::PRIO_VMM);
+                if p.is_err() && m.is_err() {
+                    refused = true;
+                    l4h_rt::log!("VMMGUARD: self-boost refused");
+                }
+            }
+            core::hint::spin_loop();
+        }
+        if !refused { l4h_rt::log!("VMMGUARD: FAIL: no demotion"); }
+        tcb.tcb_set_priority(tcb, 0).expect("test yield to guest");
+        if tcb.tcb_set_priority(tcb, host::PRIO_VMM).is_err() && tcb.tcb_set_mc_priority(tcb, host::PRIO_VMM).is_err() {
+            l4h_rt::log!("VMMGUARD: parent restored boost with low authority");
+        } else {
+            l4h_rt::log!("VMMGUARD: FAIL: regained authority");
+        }
+        loop { core::hint::spin_loop(); }
+    }
     let tsc_hz = info.header().tsc_hz;
     let mem = GuestMem { base: host::IO_POOL_VA, gpa: cfg.io_pool_gpa, size: cfg.io_pool_size };
     let vcpus = Vcpus { n: cfg.nr_vcpus as usize };
@@ -292,6 +323,10 @@ impl l4h_rt::ipc::Server for Vmm<'_> {
                 if badge & u.badge != 0 {
                     vcpus.raise(u.vcpu, u.event);
                 }
+                continue;
+            }
+            if let Dev::Net(d) = d {
+                net::signal(d, mem, vcpus, badge & recv::DONE != 0, badge & recv::KICK != 0);
                 continue;
             }
             if badge & recv::DONE != 0 {

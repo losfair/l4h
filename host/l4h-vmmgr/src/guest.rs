@@ -217,7 +217,7 @@ pub struct Vcpu {
     /// CPU used in the last balancer period, in permille of a core.
     pub usage: u32,
     /// Under a CPU cap: SC_K's part of the vCPU's budget, in permille
-    /// (sched::budgets).
+    /// (sched::budget::plan, after reserving the VMM's part on vCPU 0).
     pub k_share: u32,
     /// Steal-time bookkeeping (counter ticks): time since the vCPU first
     /// ran, CPU it consumed; steal published so far (ns).
@@ -285,6 +285,20 @@ pub struct Guest {
     /// Large VMM objects reserved at creation, before VM_LOAD uses the arena.
     pub vmm_cnodes: Option<vmm::Cnodes>,
     pub vmm: Option<Component>,
+    /// Its host core and the last installed limits (the VMM stays on its
+    /// start core when the balancer moves a guest vCPU).
+    pub vmm_limits: Option<(usize, crate::sched::budget::Plan)>,
+    /// VMM's part of vCPU 0's capped budget, in permille.
+    pub vmm_share: u32,
+    /// VMM CPU used in the last balancer period, permille of a core.
+    pub vmm_usage: u32,
+    /// Elevated I/O priority, withdrawn when VMMs dominate their core.
+    pub vmm_boosted: bool,
+    /// Backoff after repeated priority abuse.
+    pub vmm_guard: crate::sched::budget::BoostGuard,
+    /// Throttle a demoted VMM while a running guest is assigned to its core,
+    /// including when that guest blocks or waits for a budget refill.
+    pub vmm_limited: bool,
     /// CPU cap per vCPU in percent of a core (0 = none).
     pub cpu_cap_pct: u32,
     /// ASIDs held by its VSpaces (its own, its processes', its components').
@@ -1133,6 +1147,12 @@ pub fn create(
         console_ring: ArrayVec::new(),
         vmm_cnodes: None,
         vmm: None,
+        vmm_limits: None,
+        vmm_share: crate::sched::budget::VMM_SHARE_INIT,
+        vmm_usage: 0,
+        vmm_boosted: true,
+        vmm_guard: Default::default(),
+        vmm_limited: false,
         cpu_cap_pct: 0,
         asids: 0,
         attest: false,
@@ -1266,7 +1286,7 @@ pub fn create(
         let ktcb = ctx.cap::<cap_type::Tcb>(ObjectBlueprint::Tcb);
         let ep = ctx.cap::<cap_type::Endpoint>(ObjectBlueprint::Endpoint);
         let ntfn = ctx.cap::<cap_type::Notification>(ObjectBlueprint::Notification);
-        let sc_bits = crate::sched::SC_BITS;
+        let sc_bits = host::GUEST_SC_BITS;
         let sc_k = ctx.cap::<cap_type::SchedContext>(ObjectBlueprint::SchedContext { size_bits: sc_bits });
         let sc_u = ctx.cap::<cap_type::SchedContext>(ObjectBlueprint::SchedContext { size_bits: sc_bits });
         let ipcbuf = ctx.cap::<cap_type::Granule>(FRAME_BP);

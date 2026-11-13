@@ -118,13 +118,14 @@ pub fn spawn(
     win: &mut Window,
     asids: &mut AsidPools,
     host_info: &HostInfo,
-) -> Component {
+    limits: crate::sched::budget::Plan,
+) -> sel4::Result<Component> {
     let backends = core::mem::take(&mut g.backends);
     let comp = CONFIG.with(|cfg| {
         *cfg = core::mem::MaybeUninit::zeroed();
-        create(g, unsafe { cfg.assume_init_mut() }, &backends, alloc, win, asids, host_info)
+        create(g, unsafe { cfg.assume_init_mut() }, &backends, alloc, win, asids, host_info, limits)
     });
-    map(g, &comp, &backends, alloc);
+    if let Ok(comp) = &comp { map(g, comp, &backends, alloc); }
     g.backends = backends;
     comp
 }
@@ -138,7 +139,8 @@ fn create(
     win: &mut Window,
     asids: &mut AsidPools,
     host_info: &HostInfo,
-) -> Component {
+    limits: crate::sched::budget::Plan,
+) -> sel4::Result<Component> {
     cfg.guest_id = g.id as u32;
     cfg.nr_vcpus = g.vcpus.len() as u32;
     cfg.io_pool_gpa = g.pool.gpa as u64;
@@ -198,15 +200,15 @@ fn create(
         kind: host::KIND_VMM,
         elf: VMM_ELF,
         prio: host::PRIO_VMM,
-        budget_us: host_info.timeslice_us,
-        period_us: host_info.timeslice_us,
+        budget_us: limits.vmm,
+        period_us: limits.vmm_period,
         config: cfg_bytes,
         ntfn: Some(g.vmm_ntfn),
         service_ep: Some(g.vmm_ep),
         cnode: Some(g.vmm_cnodes.as_ref().expect("VMM CNodes").cspace),
         cnode_bits: None,
     };
-    component::create(
+    component::try_create(
         &args, alloc, &mut g.arena, win, &mut |alloc, vspace| asids.assign(alloc, vspace),
         &host_info.spawn_context(core),
     )

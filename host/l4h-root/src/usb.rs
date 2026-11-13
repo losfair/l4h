@@ -68,7 +68,7 @@ pub enum State {
     Idle,
     /// Guest `vm` has it (its ATTACH may still wait for a REMOVE).
     Vm(usize),
-    /// Claim, reset or drain failed: quarantined until reboot.
+    /// Claim, attachment, reset or drain failed: quarantined until reboot.
     Failed,
     Unsupported(&'static str),
 }
@@ -500,10 +500,14 @@ pub fn poll(h: &mut Host) {
             match d.ops[k as usize % RING].take() {
                 None => {}
                 Some(Op::Claim) => claimed(h, i, &w),
-                // The guest finds no magic.
                 Some(Op::Attach) => {
                     if let (Err(e), false) = (wire::reply::<reply::Attach>(&w), failed) {
                         log!("l4h-root: xHCI {:02x}:{:02x}.{}: usbd refused the attachment ({:#x})", p.bus, p.dev, p.func, e);
+                        // As a refused claim or remove: report a terminal
+                        // failure through CTL_USB_INFO and stop DMA. The
+                        // guest keeps its area until GUEST_DEL; it never
+                        // sees magic for an attachment that did not start.
+                        quarantine(c, &h.pci);
                     }
                 }
                 Some(Op::Remove(idx)) => {

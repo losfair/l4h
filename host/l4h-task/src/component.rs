@@ -47,8 +47,9 @@ pub struct Component {
 static AUDIT_SLOT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// Check what this task mints into its components (debug builds), looking
-/// at it in `slot`, an empty slot of its own CSpace kept for it.  Each
-/// component audits its whole CSpace itself (l4h_rt::init).
+/// at it in `slot`, an empty slot of its own CSpace kept for it.
+/// Every component also audits its whole CSpace in l4h_rt::init.
+/// A VMM's ordinary copies and live installs are checked here too.
 pub fn audit_in(slot: crate::mem::Slot) {
     AUDIT_SLOT.store(slot, core::sync::atomic::Ordering::Relaxed);
 }
@@ -63,12 +64,28 @@ impl Component {
         self.slot(idx)
             .copy(&self.local_cnode.absolute_cptr(src), rights)
             .unwrap_or_else(|e| panic!("component {} slot {} copy: {:?}", self.id, idx, e));
+        self.audit_vmm_copy(idx);
     }
 
     /// Give it a CNode, with `guard`: the one mint that is no edge.
     pub fn give_cnode(&self, idx: u64, cnode: cap::CNode, guard: CNodeCapData) {
         crate::edge::mint_cnode(&self.slot(idx), self.local_cnode, cnode, guard)
             .unwrap_or_else(|e| panic!("component {} slot {} mint: {:?}", self.id, idx, e));
+        self.audit_vmm_copy(idx);
+    }
+
+    fn audit_vmm_copy(&self, idx: u64) {
+        self.audit_vmm_source(idx, &self.slot(idx));
+    }
+
+    fn audit_vmm_source(&self, idx: u64, source: &sel4::AbsoluteCPtr) {
+        if self.kind == host::KIND_VMM {
+            if let Some(tag) = self.identify_cap(source) {
+                if let Err(why) = host::wiring::audit(self.kind, idx, tag) {
+                    panic!("component {} wiring audit: slot {} (tag {}) {}", self.id, idx, tag, why);
+                }
+            }
+        }
     }
 
     /// Mint instance `i` of `e`, which this component holds, from `src`
@@ -104,12 +121,15 @@ impl Component {
         P: Protocol,
     {
         let idx = self.held(e, n);
-        // No `minted` audit: the component can replace it again at once.
+        // Check the stable source: a running child can replace its slot
+        // before we could inspect it after the mint.
+        self.audit_vmm_source(idx, src.cptr());
         self.live(idx, e.name, || crate::edge::mint(&self.slot(idx), e, i, src))
     }
 
     /// `give` into a running component, as `give_edge_live`.
     pub fn give_live(&self, idx: u64, src: impl sel4::HasCPtrWithDepth + Copy, rights: CapRights, what: &str) -> sel4::Result<()> {
+        self.audit_vmm_source(idx, &self.local_cnode.absolute_cptr(src));
         self.live(idx, what, || self.slot(idx).copy(&self.local_cnode.absolute_cptr(src), rights.clone()))
     }
 
@@ -165,6 +185,10 @@ impl Component {
     /// The type (seL4's cap tag) of what is in slot `idx`, which is not
     /// empty, in debug builds.
     fn identify(&self, idx: u64) -> Option<u32> {
+        self.identify_cap(&self.slot(idx))
+    }
+
+    fn identify_cap(&self, source: &sel4::AbsoluteCPtr) -> Option<u32> {
         sel4::sel4_cfg_if! {
             if #[sel4_cfg(DEBUG_BUILD)] {
                 let slot = AUDIT_SLOT.load(core::sync::atomic::Ordering::Relaxed);
@@ -172,14 +196,14 @@ impl Component {
                     return None;
                 }
                 let scratch = self.local_cnode.absolute_cptr(cap_at::<cap_type::Null>(slot));
-                if scratch.copy(&self.slot(idx), CapRights::all()).is_err() {
+                if scratch.copy(source, CapRights::all()).is_err() {
                     return None;
                 }
                 let t = cap_at::<cap_type::Null>(slot).debug_identify();
                 scratch.delete().expect("audit scratch slot");
                 Some(t)
             } else {
-                let _ = idx;
+                let _ = source;
                 None
             }
         }
@@ -280,6 +304,19 @@ pub fn create(
     assign_asid: &mut dyn FnMut(&mut Alloc, cap::VSpace),
     context: &SpawnContext,
 ) -> Component {
+    try_create(args, alloc, arena, win, assign_asid, context).expect("component scheduling")
+}
+
+/// As create, but let a VMM's parent isolate a scheduling failure to
+/// that guest. Its unstarted objects remain owned by the guest's arena.
+pub fn try_create(
+    args: &SpawnArgs,
+    alloc: &mut Alloc,
+    arena: &mut Arena,
+    win: &mut Window,
+    assign_asid: &mut dyn FnMut(&mut Alloc, cap::VSpace),
+    context: &SpawnContext,
+) -> sel4::Result<Component> {
     let local_cnode = alloc.slots.cnode();
     let elf = Elf::parse(args.elf).expect("component ELF");
     let mut ctx = ObjCtx::arena(alloc, arena);
@@ -292,7 +329,7 @@ pub fn create(
     let service_ep = args.service_ep.unwrap_or_else(|| ctx.cap::<cap_type::Endpoint>(ObjectBlueprint::Endpoint));
     let reply = ctx.cap::<cap_type::Reply>(ObjectBlueprint::Reply);
     let sc = ctx.cap::<cap_type::SchedContext>(ObjectBlueprint::SchedContext {
-        size_bits: sel4::sys::seL4_MinSchedContextBits as usize,
+        size_bits: if args.kind == host::KIND_VMM { host::GUEST_SC_BITS } else { sel4::sys::seL4_MinSchedContextBits as usize },
     });
     let ipcbuf = ctx.cap::<cap_type::Granule>(FRAME_BP);
     // A keeper: its thread, scheduling context, the endpoint and reply
@@ -455,6 +492,7 @@ pub fn create(
         let dst = c.slot(e.slot(0));
         crate::edge::mint_dyn(&dst, e, args.id as usize, &local_cnode.absolute_cptr(context.parent_ep))
             .expect("component's parent endpoint");
+        c.audit_vmm_copy(e.slot(0));
     }
     c.give(host::SLOT_NTFN, ntfn, CapRights::all());
     c.give(host::SLOT_SERVICE_EP, service_ep, CapRights::all());
@@ -464,8 +502,8 @@ pub fn create(
     tcb.tcb_configure(cnode, CNodeCapData::new(0, 64 - cnode_bits), vspace, host::IPCBUF_VA as u64, ipcbuf)
         .expect("component TCB configure");
     context.sched_control
-        .sched_control_configure_flags(sc, args.budget_us, args.period_us, 0, 0, 0)
-        .expect("component SC");
+        .sched_control_configure_flags(sc, args.budget_us, args.period_us,
+            if args.kind == host::KIND_VMM { host::GUEST_EXTRA_REFILLS } else { 0 }, 0, 0)?;
     // To the parent go the faults of the keeper, if there is one, or else
     // of the main thread.
     let fault = if keeper.is_some() { wiring::keeper_fault(args.kind) } else { wiring::parent_fault(args.kind) }
@@ -492,13 +530,17 @@ pub fn create(
             .expect("keeper sched params");
     }
     let fault_ep = keeper.map_or(root_fault, |(_, _, kep, ..)| kep);
-    tcb.tcb_set_sched_params(context.authority, args.prio, args.prio, sc, fault_ep)
-        .expect("component sched params");
+    let scheduled = tcb.tcb_set_sched_params(context.authority, args.prio, args.prio, sc, fault_ep);
+    // This scratch slot is outside the component's arena, including on
+    // failure. The TCB now owns its fault-handler reference on success.
+    local_cnode.absolute_cptr(root_fault).delete().expect("component fault slot");
+    alloc.slots.free(fault_slot);
+    scheduled?;
     tcb.tcb_bind_notification(ntfn).expect("component bind notification");
     let mut regs = sel4::UserContext::default();
     *regs.pc_mut() = elf.entry;
     tcb.tcb_write_all_registers(false, &mut regs).expect("component registers");
-    c
+    Ok(c)
 }
 
 pub fn start(c: &Component) {

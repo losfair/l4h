@@ -1214,21 +1214,105 @@ Global on each core, with `P_K` = `PRIO_KERNEL` = 100:
 | Priority | Components |
 |----------|------------|
 | root task | l4h-root |
-| `P_K + 3` | l4h-netd (switches and NIC drivers), l4h-blkd (disk drivers), l4h-memd and l4h-vmmgr (both on core 0) |
-| `P_K + 2` | l4h-vmm instances; l4h-trustd (last core, at most 5 ms per 20 ms) |
-| `P_K + 1` | l4h-logd (core 0, at most 1 ms per 5 ms): a busy guest must not starve it, and it must not delay a VMM |
+| `P_K + 4` | l4h-netd (switches and NIC drivers), l4h-blkd (disk drivers), l4h-memd and l4h-vmmgr (both on core 0) |
+| `P_K + 3` | boosted l4h-vmm instances; l4h-trustd (last core, at most 5 ms per 20 ms) |
+| `P_K + 2` | l4h-logd (core 0, at most 1 ms per 5 ms), strictly above throttled VMMs |
+| `P_K + 1` | VMMs whose boost was withdrawn; their budgets are limited while other running guests have vCPUs assigned to their core, including blocked vCPUs |
 | `P_K` | guest kernel TCBs (`SC_K`) |
 | `P_U` = 99 | guest user TCBs (`SC_U`) |
 
-Other host services run with full budgets; guests' vCPUs are bounded by their
-SCs. A CPU cap bounds a guest's vCPUs only: what its VMM does for it
-(hypercalls, virtio queues, the display, the console) runs on the VMM's
-scheduling context at `P_K + 2`, on the core of the guest's first vCPU, and is
-not charged to the guest. memd charges hotplug to the guest's token bucket
-(§8.5); a guest that keeps its VMM busy still takes that core's time from
-other guests' vCPUs there. Because `P_K > P_U` for every guest, one guest's
-kernel work can
-briefly preempt another guest's user work, bounded by `SC_K` budgets.
+Boosted, uncapped VMMs have full round-robin scheduling contexts. At each
+100 ms sample, vmmgr withdraws the boost only if VMMs consumed at least
+80% of wall time on their core and the host detects potential contention.
+Only the largest consumer, including ties, loses
+its boost. Idle VMMs do not change that selection, so a spinner using
+60% does not demote an I/O neighbour using 40% merely because six other
+VMMs are idle.
+
+The host uses the standard `SchedContext_Consumed` API, which reports CPU
+time. Zero use cannot distinguish a blocked thread from a starved one.
+Contention therefore means another running guest has a vCPU assigned to
+the core, another guarded VMM is on the core, other VMMs consumed at least
+one scheduling quantum (5 ms), or logd shares core 0. Boosted VMMs already
+share their priority band; a guarded VMM has lower priority and must be
+considered potential demand even if it consumed nothing. The host samples
+guarded membership before applying priority changes so iteration order
+cannot change these decisions. A few microseconds of idle VMM timer work
+alone do not establish VMM contention.
+
+This deliberately favours isolation over reclaiming every idle gap: an
+idle other guest placed on the core can cause a dominant I/O VMM to be
+demoted and limited. Its CPU counters cannot prove it will stay blocked,
+and a spinner can prevent a runnable guest from accumulating consumption.
+The policy requires no kernel ABI extension or guest-supplied idle hints.
+
+Throttled VMMs stay above guest kernels at `P_K + 1`, so a kernel spinning
+for a device reply cannot starve the VMM servicing it. They divide a
+combined half-core budget while another running guest has a vCPU assigned
+to that core. This protection is latched across blocking and budget
+refills; an interactive guest can wake between samples without waiting
+behind an unlimited VMM. Protection takes precedence over reclaiming
+brief idle gaps on such a core. Guest idle counters cannot clear it.
+
+The VMM and its own guest are one trust domain: its own vCPUs neither
+establish guest contention nor reserve a share against it. Counting those
+vCPUs would impose the half-core limit on a lone guest's sustained I/O.
+The placement masks retain guest identities, including arrivals before
+start or migration. An idle *other* guest still retains
+protection after contention establishes the guard. Its next wakeup must
+not wait behind a spinner until the next 100 ms sample. A compromised
+VMM can withhold service from its own guest regardless of CPU policy;
+these reservations protect other guests from it.
+
+When the core has no vCPUs assigned by other running guests, a demoted VMM
+can use a full scheduling context even during boost backoff. The manager
+installs protection before starting a guest or moving a vCPU onto the
+core, retains it on the source until a move commits, and reconciles it
+after the move. Stopping a core's last other guest releases its reservation at
+the next balance. Explicit guest caps still apply. Limited periods grow
+if necessary to keep every SC above 200 µs. Boosted VMMs do not divide
+this allowance.
+
+The priority state and budget state have separate inputs:
+
+| State | Priority | Uncapped VMM budget | Exit |
+|-------|----------|---------------------|------|
+| Boosted | `P_K + 3` | Full period | Dominance plus contention at a sample |
+| Guarded, other guests' vCPUs assigned | `P_K + 1` | Combined half core | Continuous VMM quiet, or removal of the core's last other guest vCPU |
+| Guarded, no other guests' vCPUs assigned | `P_K + 1` | Full period | Continuous VMM quiet, or another guest's vCPU arriving (protection first) |
+
+Only successful kernel priority/configuration calls commit installed
+priority or budget metadata. A failure stops the affected guest and
+leaves the manager able to protect other guests. Stable priority and
+placement do not reconfigure SCs when guest consumption changes.
+
+Before demotion vmmgr lowers the VMM's MCP to `P_K + 1`, so its own TCB
+cannot restore priority `P_K + 3`. Recovery requires continuous use below
+half its allowance for 1 second after the first demotion, then 2, 4, 8
+and at most 16 seconds after repeated demotions. Busy samples reset the
+quiet streak. A minute spent boosted without another demotion resets the
+backoff history; blocked time while guarded does not age it out. Other
+VMMs' use does not block recovery, and the MCP stays
+low when the manager restores priority. This prevents 100 ms quiet/spin
+cycles regaining a full boost every other sample. A VMM spinning before
+READY is protected and its CPU use appears
+in management statistics. `tests/run-vmmfairtest.sh` checks progress with
+continuously runnable guest kernel, user and logd-priority threads in the
+real kernel and the authority ceiling, using the standard kernel API.
+`tests/run-vmmguardtest.sh` has an actual VMM spin before READY, try to
+undo demotion, and go quiet for a restored boost. A guest on the same
+core must boot, wake every 10 ms for two seconds without 100 ms stalls,
+then make CPU-bound progress. Native manager tests cover zero-consumption
+peers, own-vCPU exclusion, timer-work thresholds, starved guarded VMMs,
+start/migration ordering, failures, and backoff expiry.
+
+VMMs stay on the core where vCPU 0 started; moving that vCPU does not move
+the VMM. A CPU cap charges the VMM's hypercalls, virtio queues, display
+and console work against vCPU 0's budget (§7.2).
+Other host services run with full budgets unless listed above.
+memd charges hotplug to the guest's token bucket (§8.5). Because
+`P_K > P_U` for every guest, one guest's kernel work can briefly preempt
+another guest's user work, bounded by `SC_K` budgets.
 
 ### 7.2 Budgets and CPU caps
 
@@ -1236,18 +1320,21 @@ briefly preempt another guest's user work, bounded by `SC_K` budgets.
   the full period as budget; sums across a core may exceed 100%
   (overcommit), and threads with budget left are scheduled round-robin
   within the guest band. CPU weights are not implemented.
-- **CPU caps** (`vm_set_sched`, `l4hctl sched`) give a vCPU one budget, a
-  percentage of the period, split between its SC_K and SC_U so that the
-  vCPU as a whole stays within the cap.
-  - Each SC needs at least 200 µs, so caps below 8% get a longer period:
-    1% is 400 µs every 40 ms. AArch64 capped vCPUs use at least a 40 ms
-    period to amortize emulated GIC timer delivery.
-  - The split adapts: when, in a balancer period, either SC used at least
+- **CPU caps** (`vm_set_sched`, `l4hctl sched`) give each vCPU one budget,
+  a percentage of the period, split between SC_K and SC_U. vCPU 0 shares
+  its budget with the guest's VMM. Thus the guest and its VMM together stay within the
+  cap times the number of vCPUs.
+  - Each SC needs at least 200 µs. Below 12%, vCPU 0's three SCs need a
+    longer period (600 µs every 60 ms at 1%); other vCPUs' two SCs need
+    one below 8% (400 µs every 40 ms at 1%). AArch64 capped vCPUs use
+    at least a 40 ms period to amortize emulated GIC timer delivery.
+  - The split adapts: when, in a balancer period, any SC used at least
     90% of its part, the budget is split in proportion to what each used
     (each keeps at least 200 µs). A vCPU alternates between its kernel and
     user threads, so when one SC runs out the other stalls too; the usage
     ratio survives that throttling, where splitting by "what the other
-    used" oscillated every period.
+    used" oscillated every period. For vCPU 0 the VMM's fraction adapts
+    too, starting at one quarter of the cap; its minimum remains 200 µs.
   - Splitting one budget between two strictly alternating SCs still loses
     capacity: whichever runs out first stalls the vCPU while the other's
     budget goes unused. In `tests/run-capperf.sh` (release seL4, nested
@@ -1256,15 +1343,23 @@ briefly preempt another guest's user work, bounded by `SC_K` budgets.
     the cap). About 2× is the split; the other 2× is not yet explained.
   - seL4 keeps the sliding-window limit of a reconfigured SC whose thread is
     runnable; an idle or unbound SC starts afresh with its new budget.
-    Since the split changes at most once per balancer period, that is at
-    most one period's budget extra per change. Samples covering more CPU
-    time than elapsed (consumption reported late) do not move the split.
+    That allows at most one period's budget extra per change. The split
+    changes at most once per balancer period; cap changes and the VMM's
+    start can also reconfigure its SCs. Guard transitions and changes in
+    the number of throttled VMMs can change their VMM allowances; ordinary
+    boosted VMMs starting or stopping do not change a neighbour's limits.
+    Unchanged limits are never
+    reconfigured on ordinary IPC turns. Samples covering more CPU time
+    than elapsed (consumption reported late) do not move the split.
+    A failed SC or priority update stops only that guest, including a
+    partial update. Adapted shares and cached plans are committed only
+    after configuration succeeds; the rest of the balancing pass continues.
   - seL4 refuses to bind an exhausted SC to a blocked thread, so the guest
     waits for the refill on 100 µs timers when it moves a capped SC_U to
     another process, not with `seL4_Yield`, which would charge SC_K its
     whole remaining budget. A timer deadline that passes during those
     waits is kept as a pending event for after the bind.
-  - Capped SCs hold 16 refills (512-byte objects): with seL4's minimum of
+  - Guest and VMM SCs hold 16 refills (512-byte objects): with seL4's minimum of
     two, a budget used in many short pieces keeps being merged into later
     refills.
   - `tests/run-captest.sh` runs self-tests and fork loops in a guest capped
@@ -1333,7 +1428,8 @@ from the vCPU's first run and publishes it monotonically as `steal_ns`.
 The guest returns it as Linux's paravirt steal clock
 (`CONFIG_PARAVIRT_TIME_ACCOUNTING`), so it shows as `st` in /proc/stat and
 top: a guest capped at 25% sees about 75% steal (`tests/run-m6test.sh`).
-`l4hctl top` shows each VM's CPU use over the last period.
+`l4hctl top` and the host dashboard show each VM's CPU use over the last
+period, including its VMM's consumption.
 
 ### 7.5 Limits and memory sizing
 
@@ -2163,6 +2259,9 @@ firewalling belong in a VM.
   ENA, Intel X550 and ConnectX-5.
 - **vNICs.** Each vNIC is on one switch and appears as a separate `ethN`.
   There are 48 guest ports in all. Guest vNICs have one RX/TX queue pair.
+  A VMM processes at most 32 chains per RX or TX batch, counting malformed
+  or empty chains too. Remaining work gets another IPC turn without a new
+  kick, so a producer on another vCPU cannot keep a handler from returning.
 - **Switches and uplinks.** The API creates switches dynamically, up to 64
   (one per guest port and uplink, of which there are 16); switches are not deleted. Each is an L2
   broadcast domain with its own learned MAC table. A physical NIC can be
@@ -2871,7 +2970,10 @@ controller, one per claimed controller, and the guest forwards Linux's
   (`usb::Published`, for `l4hctl usb`). A controller once claimed stays
   with its usbd until reboot,
   `idle` (halted, bus mastering off, its DMA region kept) when no guest has
-  it, and `failed` if a reset or drain fails. Renesas uPD72020x without a
+  it, and `failed` if a claim, attachment, reset or drain fails. An
+  asynchronous attachment error quarantines the controller and becomes
+  visible through `CTL_USB_INFO` (`l4hctl usb`); its queue area stays with
+  the guest until destruction. Renesas uPD72020x without a
   firmware ROM and controllers without MSI are `unsupported`.
 - **Attach.** `root::call::usb_attach (guest, device, controller)`: vmmgr names
   both by number; root claims the controller if needed, makes the queue
@@ -3366,7 +3468,11 @@ one way to do each part of it:
   in a slot that no edge it holds, and none of its own objects
   (`wiring::OWN`), gives it, or is of another type than the edge's
   object (`wiring::audit`); each later `give_edge` and `pass_edge`
-  checks the type of what it put there. At compile time no two edges share
+  checks the type of what it put there. A VMM's parent also checks ordinary
+  copies, the dynamically minted parent-call endpoint and live installs.
+  Live installs check the stable source capability before copying or
+  minting, since a running VMM can replace its destination slot immediately.
+  At compile time no two edges share
   a slot or a notification bit unless both are declared shared, every
   call's badge decodes as a sender its protocol accepts, every signal is
   in its receiver's badge space, root calls no driver, vmmgr or VMM (it
@@ -3765,7 +3871,7 @@ The chain has four links.
 2. **The host key.** `l4h-trustd` is the only component that maps the TPM,
    which root finds in the ACPI `TPM2` table (see **TPM interfaces**).
    trustd polls it at locality 0, sleeping on its E3 timer between polls
-   (20 µs up to 2 ms). It runs on the last core at `P_K + 1` with at most
+   (20 µs up to 2 ms). It runs on the last core at `P_K + 3` with at most
    5 ms of every 20 ms, so neither a slow TPM nor the firmware's AML can
    take a core from
    guests; the flags server takes at most a tenth of that core besides. At
@@ -5200,7 +5306,9 @@ machine and guests of 256–512 MiB.
 | `tests/run-acstest.sh` | PCIe ACS setup against a model of configuration space: implemented bits only, firmware bits kept, bits that do not stick, hostile capability lists, read-only checks; ECAM window block planning |
 | `tests/run-trusttest.sh` | taint/seal permissions, atomic gates, instances, seqlock snapshots and verifier policy |
 | `tests/run-alloctest.sh` | host allocator growth under fragmentation, reclaim, fixed-container panic safety and memd grant validation |
-| `tests/run-devicetest.sh [--qemu]` | console ordering, bounded sequence gaps, cursor wrap, draining and writer wakeups; endpoint fairness and malformed replies; checked wiring cannot be replaced; memory-hotplug completion and timed retry scheduling; USB DMA ownership on failed halt/disable; control completions after manager failure; block replies across nested calls; host log wraparound and concurrent writers; with QEMU, hypercalls under continuous console output |
+| `tests/run-devicetest.sh [--qemu]` | console ordering, bounded sequence gaps, cursor wrap, draining and writer wakeups; endpoint fairness and malformed replies; bounded VMM network batches; VMM CPU accounting, caps and priority protection; checked wiring cannot be replaced; memory-hotplug completion and timed retry scheduling; USB attachment failures and DMA ownership on failed halt/disable; control completions after manager failure; block replies across nested calls; host log wraparound and concurrent writers; with QEMU, hypercalls under continuous console output and VMM priority enforcement |
+| `tests/run-vmmfairtest.sh` | x86 real-kernel scheduling: a throttled VMM makes progress against a continuously runnable guest kernel and leaves time for guest users; it cannot restore its MCP or boost, and its parent can restore priority |
+| `tests/run-vmmguardtest.sh` | x86 production-manager priority protection against a VMM spinning before READY; a guest on its core boots and gets CPU, self-boosts fail, and restoring priority retains the lower authority |
 | `tests/run-logtest.sh` | kernel faults, panics and shutdowns retained after VM destruction and queried/followed with l4hctl; also works with `L4H_RELEASE=1` |
 | `tests/run-abitest.sh` | guest ABI and seL4 extensions, from a module built against the module tree |
 | `python3 tests/bootmem-qemu.py` | boot RAM clearing, initial untyped watermarks, root-task entry and AArch64 TLS capture before the kernel lock; built debug kernel/root and GDB required, `L4H_ARCH=aarch64` also needs the loader and gdb-multiarch |

@@ -14,7 +14,7 @@ use crate::guest::{GuestConfig, State};
 use crate::root::Later;
 use crate::{MAX_GUESTS, Then, Vmmgr, root};
 
-pub use l4h_host::errno::{EAGAIN, EBUSY, EINVAL, ENOENT, ENOMEM, ENOSPC, ENOSYS, EPERM, Errno};
+pub use l4h_host::errno::{EAGAIN, EBUSY, EINVAL, EIO, ENOENT, ENOMEM, ENOSPC, ENOSYS, EPERM, Errno};
 /// Not an errno: the request waits for root, which answers it later
 /// (`answer`).
 const DEFER: Errno = 1 << 32;
@@ -270,8 +270,7 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
                 if !crate::guest::boot(g, &mut h.alloc, &mut h.wins.a, &h.info, kernel, initrd, cmdline) {
                     return Err(EINVAL);
                 }
-                h.spawn_vmm(g);
-                Ok(())
+                h.spawn_vmm(g)
             })
             .ok_or(ENOENT)?
         }
@@ -425,7 +424,7 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
         abi::CTL_VM_SET_SCHED => {
             let id = vm_arg(a[0])?;
             let cap = u32::try_from(a[1]).ok().filter(|&c| c <= 100).ok_or(EINVAL)?;
-            if crate::sched::set_cap(h, id, cap) { Ok(()) } else { Err(ENOENT) }
+            crate::sched::set_cap(h, id, cap)
         }
         abi::CTL_VM_SHUTDOWN => {
             let id = vm_arg(a[0])?;
@@ -441,7 +440,7 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
         }
         abi::CTL_VM_STATS => {
             let g = h.guest(vm_arg(a[0])?).ok_or(ENOENT)?;
-            resp.vals[0] = g.vcpus.iter().map(|v| v.usage as u64).sum();
+            resp.vals[0] = g.vcpus.iter().map(|v| v.usage as u64).sum::<u64>() + g.vmm_usage as u64;
             resp.vals[1] = g.cpu_cap_pct as u64;
             Ok(())
         }

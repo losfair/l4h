@@ -1737,23 +1737,51 @@ l4hctl sched VM CAP             # cap each vCPU of VM at CAP% of a core
   1 web                37.5     0
   2 batch             100.0    25
 \end{lstlisting}
-CPU\% is per VM, in percent of one core, so it can exceed 100 for a VM with
-several vCPUs. CAP\% 0 means no cap.
+CPU\% includes the VM's VMM and all its vCPUs, in percent of one core, so
+it can exceed 100 for a VM with several vCPUs. CAP\% 0 means no cap.
 
 \paragraph{CPU caps.} \cmd{l4hctl sched VM CAP} limits every vCPU of a VM to
 \texttt{CAP} percent (1--100) of a core, enforced by seL4; \texttt{0} removes
 the cap. The limit applies even when cores are idle. Caps can be changed
 while a VM runs.
 
-A vCPU's guest kernel and user code share its budget. Every 100\,ms, if
-either used at least 90\% of its share, the host adjusts the split in
+A vCPU's guest kernel and user code share its budget; vCPU 0 also pays for
+its VMM's hypercalls and device work. Every 100\,ms, if any context
+used at least 90\% of its share, the host adjusts the split in
 proportion to the CPU time each consumed. Each part keeps at least
-200\,$\mu$s, so caps below 8\% use a period longer than the usual 5\,ms
-(40\,ms at 1\%). AArch64 caps use at least a 40\,ms period to
+200\,$\mu$s, so vCPU 0 uses a period longer than the usual 5\,ms below
+12\% (60\,ms at 1\%); other vCPUs need a longer period below 8\%
+(40\,ms at 1\%).
+AArch64 caps use at least a 40\,ms period to
 amortize emulated GIC timer delivery. Reconfiguring an idle or unbound scheduling context can
 grant a fresh budget, allowing up to one extra period's budget per
 adjustment. A workload that alternates between kernel and user code may
 use less than its cap when one part runs out before the other.
+
+Boosted, uncapped VMMs can use spare CPU time without reserving shares
+for idle VMs. If VMMs consume at least 80\% of a contended core, the balancer
+withdraws the I/O boost from the largest consumer, including ties.
+The host conservatively treats another running guest's vCPU placement,
+another guarded VMM, at least one scheduling quantum of other VMM work,
+or the logger sharing core 0 as contention. The standard kernel API reports
+CPU consumption, which cannot distinguish an idle thread from one that
+was denied CPU. An idle other guest on the core can therefore cause a
+dominant I/O VMM to be limited. Brief VMM timer work alone does not suffice.
+Demoted VMMs share at most half the core while other running guests have
+vCPUs assigned there, including when those vCPUs block or await a refill.
+They stay above guest kernels and below the logger. The extra limit is
+removed when no other running guest has a vCPU on the core; the manager
+reinstalls it before another guest starts or moves there. A VMM's own
+vCPUs do not count as contention or reserve CPU against it, so a
+one-vCPU guest's sustained I/O does not impose this extra limit on itself.
+An idle other guest retains protection once the boost is withdrawn.
+This favours wakeup latency over reclaiming brief idle gaps while
+protection is active.
+Explicit guest caps still apply. Quiet neighbours keep their boost.
+Only the manager can restore it, after continuous use below half the
+allowance for 1 second, increasing to at most 16 seconds after repeated
+demotions. A minute spent boosted without another demotion resets that
+history. Another busy VMM does not prevent recovery.
 
 \paragraph{Steal time.} Guests see the time they were ready to run but
 waiting for a core as \emph{steal}, in the \texttt{st} column of

@@ -530,7 +530,8 @@ enum l4h_ctl_op {
 	L4H_CTL_SWITCH_INFO = 14,
 	/* args: NIC index -> vals: bdf, switch (or -1), MAC */
 	L4H_CTL_NIC_INFO = 15,
-	/* args: vm, CPU cap per vCPU in percent of a core (0 = none) */
+	/* args: vm, CPU cap per vCPU in percent of a core (0 = none).
+	 * vCPU 0's cap includes its VMM's CPU time. */
 	L4H_CTL_VM_SET_SCHED = 16,
 	/* args: vm -> vals[v] = host core of vCPU v, for v < min(6, vCPUs) (the
 	 * vCPU count is in L4H_CTL_VM_LIST) */
@@ -539,7 +540,7 @@ enum l4h_ctl_op {
 	 * down or reboot cleanly */
 	L4H_CTL_VM_SHUTDOWN = 19,
 	/* args: vm -> vals[0] = CPU used in the last 100 ms (permille of a core,
-	 * all vCPUs), vals[1] = CPU cap (percent per vCPU, 0 = none) */
+	 * all vCPUs and the VMM), vals[1] = CPU cap (percent per vCPU, 0 = none) */
 	L4H_CTL_VM_STATS = 18,
     /* disk, sector, bytes (0 = flush, max L4H_CTL_LOAD_MAX), zero (0/1).
      * Writes the control data buffer or zeros to an UNATTACHED range.
@@ -692,7 +693,7 @@ struct l4h_ctl_pci {
 #define L4H_USB_STATE_FIRMWARE    0 /* not claimed: the firmware has it */
 #define L4H_USB_STATE_IDLE        1 /* claimed, halted, no VM */
 #define L4H_USB_STATE_VM          2 /* a VM has it */
-#define L4H_USB_STATE_FAILED      3 /* claim, reset or drain failed: until reboot */
+#define L4H_USB_STATE_FAILED      3 /* claim, attach, reset or drain failed: until reboot */
 #define L4H_USB_STATE_UNSUPPORTED 4
 
 struct l4h_ctl_extent {
