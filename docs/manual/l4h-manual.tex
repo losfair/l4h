@@ -546,8 +546,6 @@ Variable & Meaning & Default \\
   per NIC & none \\
 \texttt{nic\_max\_restarts} & restarts of a NIC's driver within an hour,
   after which it stays stopped until \cmd{l4hctl nic restart} & 5 \\
-\texttt{nic\_untrusted\_without\_iommu} & 1: let NIC drivers dom0 loads run
-  without IOMMU confinement, as trusted code & 0 \\
 \bottomrule
 \end{tabularx}
 \caption{Host settings. Each defaults to its \texttt{L4H\_}-prefixed,
