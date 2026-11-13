@@ -2486,7 +2486,9 @@ root restarts. Root and netd know no device kind. The design is issue
   the same driver. The group follows Linux's: the functions below every
   bridge on the path that does not isolate with ACS (§9.5), those of its
   multi-function siblings, and the other functions of a multi-function
-  device without ACS. Binding refuses a driver that would share a confined
+  device without ACS: every function root found in the slot, as only
+  function 0 need set the multi-function bit. The walk covers the whole
+  inventory, so no bridge or peer is left out. Binding refuses a driver that would share a confined
   NIC's group, and every start checks again. A virtio NIC's driver is never
   confined: the device takes the IOMMU path only if the driver negotiates
   `ACCESS_PLATFORM`, which the driver, the untrusted party, decides.

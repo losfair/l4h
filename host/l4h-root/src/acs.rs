@@ -202,6 +202,60 @@ pub fn has_children(c: &impl Config, bdf: u16) -> bool {
     (0..256u16).any(|devfn| c.read((secondary as u16) << 8 | devfn, 0) & 0xffff != 0xffff)
 }
 
+/// The functions of `functions` (every one root found, as bus << 8 |
+/// device << 3 | function) that DMA from function `me` may reach without
+/// passing the IOMMU, each given to `add` (`me` among them, some more
+/// than once): the other functions of its device, unless ACS on `me`
+/// isolates them, and, up the tree, everything below each bridge that
+/// does not isolate the ports under it.  A device's other functions are
+/// those found in its slot: only function 0 need say it has several.
+pub fn group<I: Iterator<Item = u16>>(c: &impl Config, functions: impl Fn() -> I, me: u16, mut add: impl FnMut(u16)) {
+    let header = |b: u16| (c.read(b, 0x0c) >> 16) as u8;
+    let buses = |b: u16| {
+        let r = c.read(b, 0x18);
+        ((r >> 8) as u8, (r >> 16) as u8)
+    };
+    let below = |sec: u8, sub: u8, add: &mut dyn FnMut(u16)| {
+        if sec != 0 {
+            for f in functions().filter(|&f| (sec..=sub).contains(&((f >> 8) as u8)) && header(f) & 0x7f == 0) {
+                add(f);
+            }
+        }
+    };
+    add(me);
+    if !state(c, me).isolates() {
+        for f in functions().filter(|&f| f >> 3 == me >> 3) {
+            add(f);
+        }
+    }
+    let mut bus = (me >> 8) as u8;
+    for _ in 0..256 {
+        // The bridge whose secondary bus this is: the immediate parent,
+        // then its parent, and so on (one higher up that isolates does
+        // not keep peers below a lower one apart).
+        let Some(bridge) = functions().find(|&f| header(f) & 0x7f == 1 && {
+            let (sec, _) = buses(f);
+            sec != 0 && sec == bus
+        }) else {
+            break;
+        };
+        if !(pcie_type(c, bridge).is_some() && state(c, bridge).isolates()) {
+            let (sec, sub) = buses(bridge);
+            below(sec, sub, &mut add);
+            // A bridge without ACS may route to its sibling functions'
+            // buses too.
+            for sib in functions().filter(|&f| f >> 3 == bridge >> 3 && f != bridge && header(f) & 0x7f == 1) {
+                let (s2, e2) = buses(sib);
+                below(s2, e2, &mut add);
+            }
+        }
+        if (bridge >> 8) as u8 >= bus {
+            break;
+        }
+        bus = (bridge >> 8) as u8;
+    }
+}
+
 /// The names of the bits set in `bits`, for the log.
 pub struct Bits(pub u16);
 

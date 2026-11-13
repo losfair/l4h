@@ -359,66 +359,17 @@ pub fn groups(h: &mut Host) {
 
 #[cfg(target_arch = "x86_64")]
 fn group_of(h: &Host, d: pci::Device) -> ArrayVec<u16, 64> {
-    use crate::acs;
-    let pci = &h.pci;
-    let me = bdf(&d) as u16;
     let mut group = ArrayVec::new();
-    let add = |g: &mut ArrayVec<u16, 64>, b: u16| {
-        if !g.contains(&b) && g.push(b).is_err() {
+    // Every function root found, however many: one left out could be a
+    // bridge or peer the walk must see.
+    crate::acs::group(&h.pci, || h.pci_inventory.iter().map(|p| p.bdf), bdf(&d) as u16, |b| {
+        if !group.contains(&b) && group.push(b).is_err() {
             // More than a group holds: one too large to check counts as
             // shared with something else.
-            let _ = g.pop();
-            let _ = g.push(u16::MAX);
+            let _ = group.pop();
+            let _ = group.push(u16::MAX);
         }
-    };
-    add(&mut group, me);
-    let functions: ArrayVec<u16, 1024> = h.pci_inventory.iter().map(|p| p.bdf).take(1024).collect();
-    let header = |b: u16| (pci.read32((b >> 8) as u8, (b >> 3 & 0x1f) as u8, (b & 7) as u8, 0x0c) >> 16) as u8;
-    let buses = |b: u16| {
-        let r = pci.read32((b >> 8) as u8, (b >> 3 & 0x1f) as u8, (b & 7) as u8, 0x18);
-        ((r >> 8) as u8, (r >> 16) as u8)
-    };
-    // A multi-function device whose function does not isolate its
-    // siblings (ACS on the function itself).
-    if header(me) & 0x80 != 0 && !acs::state(pci, me).isolates() {
-        for &f in functions.iter().filter(|&&f| f >> 3 == me >> 3) {
-            add(&mut group, f);
-        }
-    }
-    // Up the tree: each bridge above, and if it does not isolate, all
-    // that is below it.
-    let mut bus = d.bus;
-    for _ in 0..256 {
-        // The bridge whose secondary bus this is: the immediate parent,
-        // then its parent, and so on (one higher up that isolates does
-        // not keep peers below a lower one apart).
-        let up = functions.iter().copied().find(|&f| header(f) & 0x7f == 1 && {
-            let (sec, _) = buses(f);
-            sec != 0 && sec == bus
-        });
-        let Some(bridge) = up else { break };
-        let (sec, sub) = buses(bridge);
-        let isolates = acs::pcie_type(pci, bridge).is_some() && acs::state(pci, bridge).isolates();
-        if !isolates {
-            for &f in functions.iter().filter(|&&f| (sec..=sub).contains(&((f >> 8) as u8)) && header(f) & 0x7f == 0) {
-                add(&mut group, f);
-            }
-            // A bridge of a multi-function device without ACS may route to
-            // its sibling functions' buses too.
-            if header(bridge) & 0x80 != 0 {
-                for &sib in functions.iter().filter(|&&f| f >> 3 == bridge >> 3 && f != bridge && header(f) & 0x7f == 1) {
-                    let (s2, e2) = buses(sib);
-                    for &f in functions.iter().filter(|&&f| s2 != 0 && (s2..=e2).contains(&((f >> 8) as u8)) && header(f) & 0x7f == 0) {
-                        add(&mut group, f);
-                    }
-                }
-            }
-        }
-        if (bridge >> 8) as u8 >= bus {
-            break;
-        }
-        bus = (bridge >> 8) as u8;
-    }
+    });
     group
 }
 
