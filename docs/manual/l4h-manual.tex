@@ -1758,12 +1758,15 @@ grant a fresh budget, allowing up to one extra period's budget per
 adjustment. A workload that alternates between kernel and user code may
 use less than its cap when one part runs out before the other.
 
-Uncapped VMMs can use spare CPU time; idle VMs reserve no share from busy
-ones. If VMMs consume at least 80\% of a contended core, the balancer
+Boosted, uncapped VMMs can use spare CPU time without reserving shares
+for idle VMs. If VMMs consume at least 80\% of a contended core, the balancer
 withdraws the I/O boost from the largest consumer, including ties.
-Contention includes other runnable guests or VMMs, at least one scheduling
-quantum of other VMM work, or the logger sharing core 0. Brief timer
-bookkeeping by idle VMMs does not suffice.
+The host conservatively treats another running guest's vCPU placement,
+another guarded VMM, at least one scheduling quantum of other VMM work,
+or the logger sharing core 0 as contention. The standard kernel API reports
+CPU consumption, which cannot distinguish an idle thread from one that
+was denied CPU. An idle other guest on the core can therefore cause a
+dominant I/O VMM to be limited. Brief VMM timer work alone does not suffice.
 Demoted VMMs share at most half the core while other running guests have
 vCPUs assigned there, including when those vCPUs block or await a refill.
 They stay above guest kernels and below the logger. The extra limit is

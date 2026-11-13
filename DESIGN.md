@@ -312,7 +312,6 @@ support, since no device is passed into a guest.
 | 0041 | (x86, `KernelVTX`) VT-x keeps CR0.CD, CR0.NW and the reserved CR0 bits (28:19, 17, 15:6) in the CR0 guest/host mask, whatever userspace writes to `VMX_CONTROL_CR0_MASK`: VM entries and exits do not load these bits, so a guest MOV to CR0 that set CD or NW would leave the core's caches off for seL4 and every thread after it. A guest write to them now always exits. l4h's KVM already owns all of CR0 (`CR0_GUEST_HOST_MASK` is `~0` in `kvm/vmx.c`), so nothing changes for it. AMD-V needs no counterpart, as #VMEXIT reloads the host's whole CR0 from the host save area. Cherry-picked from upstream seL4 PR #1847 (open), without its CHANGES.md entry. |
 | 0042 | (x86, `KernelVTX`) VT-x guests set only the CR4 bits on an allowlist, `VCPU_GUEST_CR4_ALLOWED`, as they turn on only the VM-execution controls on 0039's lists. 0040 defines the list and applies it on AMD-V. The list holds the bits whose effects stay in guest mode, on state that VM entry and exit or seL4 switch: VME, PVI, TSD, DE, PSE, PAE, MCE, PGE, PCE, OSFXSR, OSXMMEXCPT, UMIP, LA57, FSGSBASE, PCIDE, OSXSAVE, SMEP and SMAP. Every other bit stays clear, including any a later CPU defines, because some enable state that nothing switches and that the next guest on the core would run with. PKE is one: PKRU is outside the XSAVE features seL4 enables (`KernelXSaveFeatureSet` 7), and the host runs with CR4.PKE clear. KL is another: LOADIWKEY sets the core's Key Locker wrapping key. PKS, CET, UINTR and FRED are left out for the same reason. On VT-x, the bits outside the list are always in `VMX_CONTROL_CR4_MASK`, so a guest changing one exits, and `GUEST_CR4` takes only listed bits and the fixed ones (VMXE). On AMD-V (0040), which has no CR4 mask, CR4 writes always exit and `WriteVMCB` keeps the bits outside the list clear. l4h's KVM already owns all of CR4 and hides PKU, CET, LAM and FRED, and Linux's KVM does not offer Key Locker, PKS or UINTR, so nothing changes for it. |
 | 0043 | (x86, `KernelVTX`) VT-x keeps CR8-load and CR8-store exiting on, as 0039 keeps MOV-DR exiting on. CR8 is the core's local APIC TPR: 0039 does not allow the TPR shadow, so with these exits off a guest MOV to or from CR8 reaches the TPR, which neither VM entry and exit nor seL4 switch. The next guest on the core would read the value, and a guest that raised it would mask the host's timer and IPIs on that core, in guest mode and after it. A guest's CR8 access is now a control-register exit to userspace, which emulates CR8 per VCPU. l4h's KVM already sets both exits (`kvm/vmx.c`), so nothing changes for it. AMD-V needs no counterpart, as `V_INTR_MASKING` is always on (0040) and a guest's CR8 is its VMCB's `V_TPR`. |
-| 0044 | (MCS) `SchedContext_Consumed` appends a `runnable` word: a bound thread is runnable and the SC has available budget. The existing consumed-time prefix and invocation labels stay unchanged, so older clients can ignore the new result. The snapshot is taken after synchronizing a remotely running context and needs only the SC capability. These remote queries require 0000's TLS-preserving stall/retry path: an older kernel can restore stale FS/GS bases in a sampled VMM. Vmmgr uses the snapshot to distinguish idle capacity from a guest waiting to run, without another syscall or trusting a guest's idle counter. Host builds need the matching kernel headers and kernel. |
 
 **Verification.** The MCS SMP x86_64 configuration is not covered by the
 seL4 proofs, with or without these patches. l4h benefits from seL4's design
@@ -1224,18 +1223,28 @@ Global on each core, with `P_K` = `PRIO_KERNEL` = 100:
 
 Boosted, uncapped VMMs have full round-robin scheduling contexts. At each
 100 ms sample, vmmgr withdraws the boost only if VMMs consumed at least
-80% of wall time on their core and another guest or VMM needs CPU (or
-logd shares core 0). Only the largest consumer, including ties, loses
+80% of wall time on their core and the host detects potential contention.
+Only the largest consumer, including ties, loses
 its boost. Idle VMMs do not change that selection, so a spinner using
 60% does not demote an I/O neighbour using 40% merely because six other
 VMMs are idle.
 
-Contention means another guest or VMM is runnable in the kernel's
-snapshot, other VMMs consumed at least one scheduling quantum (5 ms), or
-logd shares core 0. A few microseconds of idle VMM timer bookkeeping do
-not trigger demotion by themselves. The runnable snapshot (0044) can
-establish contention; it cannot predict whether a blocked thread will
-wake before the next sample.
+The host uses the standard `SchedContext_Consumed` API, which reports CPU
+time. Zero use cannot distinguish a blocked thread from a starved one.
+Contention therefore means another running guest has a vCPU assigned to
+the core, another guarded VMM is on the core, other VMMs consumed at least
+one scheduling quantum (5 ms), or logd shares core 0. Boosted VMMs already
+share their priority band; a guarded VMM has lower priority and must be
+considered potential demand even if it consumed nothing. The host samples
+guarded membership before applying priority changes so iteration order
+cannot change these decisions. A few microseconds of idle VMM timer work
+alone do not establish VMM contention.
+
+This deliberately favours isolation over reclaiming every idle gap: an
+idle other guest placed on the core can cause a dominant I/O VMM to be
+demoted and limited. Its CPU counters cannot prove it will stay blocked,
+and a spinner can prevent a runnable guest from accumulating consumption.
+The policy requires no kernel ABI extension or guest-supplied idle hints.
 
 Throttled VMMs stay above guest kernels at `P_K + 1`, so a kernel spinning
 for a device reply cannot starve the VMM servicing it. They divide a
@@ -1246,11 +1255,10 @@ behind an unlimited VMM. Protection takes precedence over reclaiming
 brief idle gaps on such a core. Guest idle counters cannot clear it.
 
 The VMM and its own guest are one trust domain: its own vCPUs neither
-establish guest contention nor reserve a share against it. Otherwise a
-single runnable sample during a one-vCPU guest's bulk transfer could
-halve its VMM's allowance until the transfer ends and recovery completes.
-The masks for readiness and placement retain guest identities, including
-arrivals before start or migration. An idle *other* guest still retains
+establish guest contention nor reserve a share against it. Counting those
+vCPUs would impose the half-core limit on a lone guest's sustained I/O.
+The placement masks retain guest identities, including arrivals before
+start or migration. An idle *other* guest still retains
 protection after contention establishes the guard. Its next wakeup must
 not wait behind a spinner until the next 100 ms sample. A compromised
 VMM can withhold service from its own guest regardless of CPU policy;
@@ -1276,7 +1284,7 @@ The priority state and budget state have separate inputs:
 Only successful kernel priority/configuration calls commit installed
 priority or budget metadata. A failure stops the affected guest and
 leaves the manager able to protect other guests. Stable priority and
-placement do not reconfigure SCs when readiness snapshots change.
+placement do not reconfigure SCs when guest consumption changes.
 
 Before demotion vmmgr lowers the VMM's MCP to `P_K + 1`, so its own TCB
 cannot restore priority `P_K + 3`. Recovery requires continuous use below
@@ -1290,14 +1298,13 @@ cycles regaining a full boost every other sample. A VMM spinning before
 READY is protected and its CPU use appears
 in management statistics. `tests/run-vmmfairtest.sh` checks progress with
 continuously runnable guest kernel, user and logd-priority threads in the
-real kernel, the runnable-state snapshots, and the authority ceiling.
+real kernel and the authority ceiling, using the standard kernel API.
 `tests/run-vmmguardtest.sh` has an actual VMM spin before READY, try to
 undo demotion, and go quiet for a restored boost. A guest on the same
 core must boot, wake every 10 ms for two seconds without 100 ms stalls,
-then make CPU-bound progress. Native manager tests cover readiness
-sequences, own-vCPU exclusion with and without idle peers, retaining a
-blocked other guest's reservation, start/migration ordering, failures,
-and backoff expiry.
+then make CPU-bound progress. Native manager tests cover zero-consumption
+peers, own-vCPU exclusion, timer-work thresholds, starved guarded VMMs,
+start/migration ordering, failures, and backoff expiry.
 
 VMMs stay on the core where vCPU 0 started; moving that vCPU does not move
 the VMM. A CPU cap charges the VMM's hypercalls, virtio queues, display

@@ -51,13 +51,13 @@ mod kernel {
         }
     }
     pub struct Buffer;
-    pub struct Consumed { pub error: u64, pub consumed: u64, pub runnable: u64 }
+    pub struct Consumed { pub error: u64, pub consumed: u64 }
     impl Buffer {
         pub fn inner_mut(&mut self) -> &mut Self { self }
         #[allow(non_snake_case)]
         pub fn seL4_SchedContext_Consumed(&mut self, sc: u64) -> Consumed {
             crate::MODEL.with_borrow_mut(|m| Consumed { error: 0,
-                consumed: m.used.remove(&sc).unwrap_or(0), runnable: u64::from(m.ready.get(&sc).copied().unwrap_or(true)) })
+                consumed: m.used.remove(&sc).unwrap_or(0) })
         }
     }
     pub fn with_ipc_buffer_mut<T>(f: impl FnOnce(&mut Buffer) -> T) -> T { f(&mut Buffer) }
@@ -68,7 +68,6 @@ const MAX_GUESTS: usize = 64;
 struct Model {
     limits: BTreeMap<u64, (usize, u64, u64, u64)>,
     used: BTreeMap<u64, u64>,
-    ready: BTreeMap<u64, bool>,
     calls: Vec<u64>,
     priorities: BTreeMap<u64, (u64, u64)>,
     priority_calls: Vec<(u64, &'static str, u64)>,
@@ -77,7 +76,7 @@ struct Model {
     suspended: Vec<u64>,
     operations: Vec<(char, u64)>,
 }
-thread_local! { static MODEL: RefCell<Model> = RefCell::new(Model { limits: BTreeMap::new(), used: BTreeMap::new(), ready: BTreeMap::new(), calls: Vec::new(),
+thread_local! { static MODEL: RefCell<Model> = RefCell::new(Model { limits: BTreeMap::new(), used: BTreeMap::new(), calls: Vec::new(),
     priorities: BTreeMap::new(), priority_calls: Vec::new(), fail_priority: None, fail_config: None, suspended: Vec::new(), operations: Vec::new() }); }
 mod slot {
     pub struct Slot;
@@ -120,7 +119,7 @@ use guest::{Component, Event, Guest, State, Vcpu};
 struct Vmmgr { info: HostInfo, guests: Vec<Option<Guest>> }
 impl Vmmgr { fn guest(&self, id: usize) -> Option<&Guest> { self.guests.get(id)?.as_ref() } }
 fn manager() -> Vmmgr {
-    MODEL.with_borrow_mut(|m| { m.limits.clear(); m.used.clear(); m.ready.clear(); m.calls.clear(); m.priorities.clear();
+    MODEL.with_borrow_mut(|m| { m.limits.clear(); m.used.clear(); m.calls.clear(); m.priorities.clear();
         m.priority_calls.clear(); m.fail_priority = None; m.fail_config = None; m.suspended.clear(); m.operations.clear(); });
     Vmmgr { info: HostInfo { timeslice_us: 5000, tsc_hz: 1_000_000, cores: 1, topology: topology::Topology::flat(1) },
         guests: (0..MAX_GUESTS).map(|_| None).collect() }
@@ -147,6 +146,15 @@ fn build(h: &mut Vmmgr, id: usize, core: usize, cap: u32, vcpus: usize) {
 fn spawn(h: &mut Vmmgr, id: usize, core: usize, cap: u32, vcpus: usize) {
     build(h, id, core, cap, vcpus);
     sched::start(h, id).unwrap();
+}
+// Set up a completed vCPU move while its VMM stays on its original core.
+fn place_vcpu(h: &mut Vmmgr, id: usize, core: usize) {
+    let v = &mut h.guests[id].as_mut().unwrap().vcpus[0];
+    v.core = core;
+    MODEL.with_borrow_mut(|m| {
+        m.limits.get_mut(&v.sc_k.0).unwrap().0 = core;
+        m.limits.get_mut(&v.sc_u.0).unwrap().0 = core;
+    });
 }
 fn assert_limits(h: &Vmmgr) {
     for g in h.guests.iter().flatten().filter(|g| g.state != State::Stopped) {
@@ -361,10 +369,7 @@ fn a_lone_heavy_io_vmm_on_an_idle_core_keeps_its_full_budget() {
     h.info.topology = topology::Topology::flat(2);
     spawn(&mut h, 0, 1, 0, 1);
     let before = MODEL.with_borrow(|m| m.calls.len());
-    MODEL.with_borrow_mut(|m| {
-        m.ready.extend([(1, false), (2, false)]);
-        m.used.insert(9, 90_000);
-    });
+    MODEL.with_borrow_mut(|m| m.used.insert(9, 90_000));
     sched::balance(&mut h, 100_000);
     let g = h.guest(0).unwrap();
     assert!(g.vmm_boosted && !g.vmm_limited);
@@ -373,23 +378,19 @@ fn a_lone_heavy_io_vmm_on_an_idle_core_keeps_its_full_budget() {
 }
 
 #[test]
-fn its_own_runnable_vcpus_do_not_demote_a_heavy_io_vmm() {
-    for (id, idle_peer) in [(0, false), (0, true), (MAX_GUESTS - 1, false), (MAX_GUESTS - 1, true)] {
+fn its_own_vcpus_do_not_demote_a_heavy_io_vmm() {
+    for id in [0, MAX_GUESTS - 1] {
         let mut h = manager();
         h.info.cores = 2;
         h.info.topology = topology::Topology::flat(2);
         spawn(&mut h, id, 1, 0, 2);
-        if idle_peer {
-            spawn(&mut h, 32, 1, 0, 1);
-            MODEL.with_borrow_mut(|m| m.ready.extend([(321, false), (322, false), (329, false)]));
-        }
         let before = MODEL.with_borrow(|m| m.calls.len());
         for _ in 0..100 {
-            // Both scheduling bands of both vCPUs are runnable. They
-            // belong to this VMM, not a guest needing isolation from it.
+            // Its two vCPUs belong to this VMM's trust domain. Their
+            // placement and activity must not reserve CPU against it.
             MODEL.with_borrow_mut(|m| {
                 m.used.insert((id * 10 + 9) as u64, 90_000);
-                if idle_peer { m.used.insert(329, 50); }
+                for sc in 1..=4 { m.used.insert((id * 10 + sc) as u64, 500); }
             });
             sched::balance(&mut h, 100_000);
             let g = h.guest(id).unwrap();
@@ -401,13 +402,12 @@ fn its_own_runnable_vcpus_do_not_demote_a_heavy_io_vmm() {
 }
 
 #[test]
-fn blocking_and_refill_snapshots_cannot_remove_an_existing_limit() {
+fn other_guests_with_zero_consumption_are_protected_without_refilling_contexts() {
     let mut h = manager();
     h.info.cores = 2;
     h.info.topology = topology::Topology::flat(2);
     spawn(&mut h, 0, 1, 0, 1);
     spawn(&mut h, MAX_GUESTS - 1, 1, 0, 1);
-    MODEL.with_borrow_mut(|m| m.ready.insert(639, false));
     // A guest cannot hide runnable demand by forging its idle counter.
     h.guests[0].as_mut().unwrap().events[0].idle_ticks = u64::MAX;
     MODEL.with_borrow_mut(|m| m.used.insert(9, 90_000));
@@ -415,11 +415,10 @@ fn blocking_and_refill_snapshots_cannot_remove_an_existing_limit() {
     assert!(h.guest(0).unwrap().vmm_limited);
     let before = MODEL.with_borrow(|m| m.calls.len());
     for tick in 0..1000 {
-        // Both blocked (including a capped SC waiting for refill), either
-        // scheduling band ready, and both ready must all retain protection.
+        // Zero consumption may mean blocked, awaiting refill or starved.
+        // Even small changes in either guest's use must retain protection.
         MODEL.with_borrow_mut(|m| {
-            m.ready.extend([(1, tick % 4 >= 2), (2, tick % 2 != 0)]);
-            m.ready.extend([(631, tick % 4 >= 2), (632, tick % 2 != 0)]);
+            m.used.extend([(1, tick % 2 * 500), (632, tick % 4 * 250)]);
             m.used.insert(9, 50_000);
         });
         sched::balance(&mut h, 100_000);
@@ -605,16 +604,13 @@ fn a_failed_migration_removes_its_destination_reservation() {
 }
 
 #[test]
-fn timer_bookkeeping_is_not_pressure_but_a_quantum_or_waiting_vmm_is() {
-    for (other_used, other_ready, guarded) in [(50, false, false), (4999, false, false), (5000, false, true), (0, true, true)] {
+fn peer_vmm_consumption_requires_a_quantum_when_no_other_guests_are_assigned() {
+    for (other_used, guarded) in [(50, false), (4999, false), (5000, true)] {
         let mut h = manager();
         h.info.cores = 2;
         h.info.topology = topology::Topology::flat(2);
         for id in 0..4 { spawn(&mut h, id, 1, 0, 1); }
-        MODEL.with_borrow_mut(|m| {
-            for id in 0..4 { m.ready.extend([(id*10+1, false), (id*10+2, false), (id*10+9, false)]); }
-            m.ready.insert(19, other_ready);
-        });
+        for id in 1..4 { place_vcpu(&mut h, id, 0); }
         for _ in 0..20 {
             let own_used = if h.guest(0).unwrap().vmm_limited { 50_000 } else { 90_000 };
             MODEL.with_borrow_mut(|m| m.used.extend([(9, own_used), (19, other_used)]));
@@ -627,15 +623,45 @@ fn timer_bookkeeping_is_not_pressure_but_a_quantum_or_waiting_vmm_is() {
 }
 
 #[test]
-fn many_idle_timers_still_do_not_remove_a_heavy_io_vmms_boost() {
+fn a_guarded_peer_with_zero_cpu_use_cannot_be_starved_by_a_boosted_vmm() {
+    for (offender, peer, quiet) in [(0, 1, 0), (1, 0, 0), (0, 1, 9), (1, 0, 9)] {
+        let mut h = manager();
+        h.info.cores = 2;
+        h.info.topology = topology::Topology::flat(2);
+        spawn(&mut h, offender, 1, 0, 1);
+        spawn(&mut h, peer, 1, 0, 1);
+        let peer_sc = (peer * 10 + 9) as u64;
+        let offender_sc = (offender * 10 + 9) as u64;
+        MODEL.with_borrow_mut(|m| m.used.insert(peer_sc, 90_000));
+        sched::balance(&mut h, 100_000);
+        assert!(!h.guest(peer).unwrap().vmm_boosted);
+        assert!(h.guest(offender).unwrap().vmm_boosted);
+        // Both vCPUs leave the VMMs' core, so guest placement no longer
+        // establishes contention. The guarded VMM still needs service.
+        for id in [offender, peer] { place_vcpu(&mut h, id, 0); }
+        for _ in 0..quiet { sched::balance(&mut h, 100_000); }
+        // At nine quiet samples the peer will recover this turn. Taking
+        // the contention snapshot first must give the same result in
+        // either guest order, including at that recovery boundary.
+        MODEL.with_borrow_mut(|m| m.used.insert(offender_sc, 90_000));
+        sched::balance(&mut h, 100_000);
+        assert!(!h.guest(offender).unwrap().vmm_boosted);
+        assert_eq!(h.guest(peer).unwrap().vmm_boosted, quiet == 9);
+        assert!(h.guests.iter().flatten().all(|g| !g.vmm_limited));
+        assert_limits(&h);
+    }
+}
+
+#[test]
+fn many_idle_vmm_timers_without_other_guest_vcpus_do_not_remove_a_heavy_io_vmms_boost() {
     let mut h = manager();
     h.info.cores = 2;
     h.info.topology = topology::Topology::flat(2);
     for id in 0..64 { spawn(&mut h, id, 1, 0, 1); }
+    for id in 1..64 { place_vcpu(&mut h, id, 0); }
     let before = MODEL.with_borrow(|m| m.calls.len());
     MODEL.with_borrow_mut(|m| {
         for id in 0..64 {
-            m.ready.extend([(id*10+1, false), (id*10+2, false), (id*10+9, false)]);
             m.used.insert(id*10+9, if id == 0 { 90_000 } else { 50 });
         }
     });
