@@ -8,13 +8,14 @@ source "virt/kvm/Kconfig"
 config KVM
 	bool "KVM on seL4 VCPUs"
 	default y
-	depends on !UML_ARM64 && "$(L4H_SEL4_VTX)" = "y"
+	depends on !UML_ARM64
 	select KVM_X86
 	help
 	  Provide /dev/kvm on hosts whose CPU has VT-x or AMD-V, for QEMU,
 	  Firecracker and cloud-hypervisor.  A kernel with this option boots
 	  everywhere: /dev/kvm only appears when the host hands out EPT roots.
-	  Building KVM requires seL4 headers configured with KernelVTX.
+	  The provider advertises support at runtime; the Linux image is shared
+	  by hosts with and without microkernel VCPU support.
 
 config KVM_X86
 	bool

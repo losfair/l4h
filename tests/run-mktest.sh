@@ -287,9 +287,9 @@ for k in $(seq 0 $((n - 1))); do
     a=$out/att/1/p$k
     python3 -c "import sys; sys.stdout.buffer.write(bytes.fromhex(open(sys.argv[1]).read().strip()))" \
         "$a/vm.report.hex" > "$a/vm.report"
-    vm_launch=$(python3 "$tool" measure "$out/vmlinux" --initrd "$out/vm.cpio.gz" \
+    vm_launch=$(python3 "$tool" measure "$out/vmlinux" --provider "${SEL4_PREFIX:-$root/build/sel4}/guest-provider/provider.bin" --initrd "$out/vm.cpio.gz" \
         --cmdline "console=hvc0 MKP=$k attest_nonce=$nonce")
-    dom0_launch=$(python3 "$tool" measure "$out/vmlinux" --initrd "$out/dom0.cpio.gz" \
+    dom0_launch=$(python3 "$tool" measure "$out/vmlinux" --provider "${SEL4_PREFIX:-$root/build/sel4}/guest-provider/provider.bin" --initrd "$out/dom0.cpio.gz" \
         --cmdline "${cmdline[k]}")
     python3 "$tool" verify "$a/vm.report" "$a/evidence" --data "$nonce" --launch "$vm_launch" --ek-ca "$ca" \
         > "$a/vm.json" 2>/dev/null || fail "partition $k: the VM's report"

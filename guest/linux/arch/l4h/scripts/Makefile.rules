@@ -3,14 +3,6 @@
 # arch/l4h: generic definitions
 # ===========================================================================
 
-# Objects built against libsel4 rather than kernel headers.
-SEL4_OBJS := $(foreach file,$(SEL4_OBJS),$(obj)/$(file))
-
-$(SEL4_OBJS:.o=.%): \
-	c_flags = -Wp,-MD,$(depfile) $(SEL4_CFLAGS) $(CFLAGS_$(basetarget).o)
-
-$(SEL4_OBJS): CHECKFLAGS := $(patsubst $(NOSTDINC_FLAGS),,$(CHECKFLAGS))
-
 # Objects built against the host C library (build-time generators only).
 USER_OBJS := $(foreach file,$(USER_OBJS),$(obj)/$(file))
 

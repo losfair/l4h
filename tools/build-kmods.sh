@@ -4,7 +4,7 @@
 #   <release>/        its modules and depmod's files
 #   <release>/build/  the tree to build external modules against: kbuild,
 #                     the headers, .config and Module.symvers, and l4h/abi
-#                     (l4h/abi.h) and l4h/sel4 (libsel4's headers), so that
+#                     (l4h/abi.h and the provider ABI), so that
 #                     "make -C /lib/modules/$(uname -r)/build M=$PWD" works
 #                     in a guest without further arguments
 # Usage: build-kmods.sh [out.erofs]   (default: kmods.erofs in the kernel
@@ -14,10 +14,9 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 source "$root/tools/guest-env.sh"
 arch=${L4H_ARCH:-x86_64}
 case "$arch" in
-    x86_64) host_dir=arch/x86; sel4=$root/build/sel4 ;;
-    aarch64) host_dir=arch/arm64; sel4=$root/build/sel4-aarch64 ;;
+    x86_64) host_dir=arch/x86 ;;
+    aarch64) host_dir=arch/arm64 ;;
 esac
-sel4=${SEL4_PREFIX:-$sel4}
 out=$(realpath -m "${1:-$l4h_linux_out/kmods.erofs}")
 src=$root/build/linux-6.18
 "$root/tools/build-linux.sh" vmlinux modules >"$root/build/linux-build.log" 2>&1 \
@@ -38,7 +37,6 @@ rm -f "$tree"
 (cd "$l4h_linux_out" && tar -cf - "$host_dir/include/generated" .config) | tar -xf - -C "$tree"
 mkdir -p "$tree/l4h"
 cp -r "$root/include" "$tree/l4h/abi"
-cp -r "$sel4/libsel4/include" "$tree/l4h/sel4"
 # Build for ARCH=l4h without saying so: SUBARCH would otherwise come from
 # uname -m, which names arm64 differently.
 {

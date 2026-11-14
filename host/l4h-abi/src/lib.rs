@@ -5,7 +5,7 @@
 
 #![no_std]
 
-pub const ABI_VERSION: u64 = 8;
+pub const ABI_VERSION: u64 = 9;
 
 pub const ROOT_CNODE_BITS: usize = 12;
 pub const L2_INDEX_BITS: usize = 18;
@@ -67,6 +67,8 @@ pub const SLOT_DYN_BASE: usize = 1024;
 pub const SPECIAL_BASE: u64 = 0x0000_7ff0_0000_0000;
 pub const BOOTINFO_VA: u64 = SPECIAL_BASE;
 pub const BOOTINFO_SIZE: u64 = 0x4000;
+pub const PROVIDER_VA: u64 = SPECIAL_BASE + 0x10000;
+pub const PROVIDER_MAX: u64 = 0xf0000;
 pub const fn vcpu_area_va(v: usize) -> u64 {
     SPECIAL_BASE + 0x10_0000 + v as u64 * 0x4000
 }
@@ -175,7 +177,9 @@ pub struct BootInfo {
     pub hp_gpa: u64,
     pub hp_count: u64,
     pub nr_ept_roots: u64,
-    pub reserved: [u64; 5],
+    pub provider_va: u64,
+    pub provider_size: u64,
+    pub reserved: [u64; 3],
     pub devices: [DevDesc; MAX_DEVICES],
     pub cmdline: [u8; CMDLINE_SIZE],
 }

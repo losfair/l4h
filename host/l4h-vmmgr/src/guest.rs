@@ -863,6 +863,8 @@ impl Guest {
         bi.boot_blocks = self.boot_blocks as u64;
         bi.nr_vspaces = self.vspaces.len() as u64;
         bi.nr_ept_roots = self.nr_ept_roots as u64;
+        bi.provider_va = abi::PROVIDER_VA;
+        bi.provider_size = crate::provider::IMAGE.len() as u64;
         if self.kmod_size != 0 {
             bi.kmod_va = abi::KMOD_VA;
             bi.kmod_size = self.kmod_size as u64;
@@ -928,7 +930,10 @@ impl Guest {
     fn measure(&self, win: &mut Window, entry: u64, kernel_end: usize, initrd: (usize, usize), cmdline: &[u8]) -> [u8; 32] {
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
-        h.update(b"l4h-launch-v1");
+        h.update(b"l4h-launch-v2");
+        h.update(abi::PROVIDER_VA.to_le_bytes());
+        h.update((crate::provider::IMAGE.len() as u64).to_le_bytes());
+        h.update(crate::provider::IMAGE);
         h.update((self.ram_base as u64).to_le_bytes());
         h.update(entry.to_le_bytes());
         h.update((kernel_end as u64).to_le_bytes());
@@ -1098,6 +1103,7 @@ pub fn create(
         + cfg.vspaces * PAGE
         + if host_info.vtx { abi::MAX_EPT_ROOTS * PAGE } else { 0 }
         + abi::BOOTINFO_SIZE as usize
+        + crate::provider::IMAGE.len().next_multiple_of(PAGE) + 3 * PAGE
         + if cfg.dom0 { abi::CTL_LOAD_MAX as usize } else { 0 }
         + vmm::arena_bytes(cfg.io_pool, cfg.vcpus, MAX_GUEST_DEVICES);
     // memd makes the block and hotplug CNodes, of a block it may need.

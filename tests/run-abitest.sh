@@ -22,7 +22,10 @@ if [ "${L4H_ARCH:-x86_64}" = aarch64 ]; then
     done
 fi
 cp "$root"/tests/guest/abitest/* "$out/mod/"
-make -s -C "$kbuild" M="$out/mod" "${cross[@]}" modules >"$out/build.log" 2>&1 \
+sel4=$root/build/sel4
+[ "${L4H_ARCH:-x86_64}" = aarch64 ] && sel4=$root/build/sel4-aarch64
+sel4=${SEL4_PREFIX:-$sel4}
+make -s -C "$kbuild" M="$out/mod" L4H_SEL4_INCLUDE="$sel4/libsel4/include" "${cross[@]}" modules >"$out/build.log" 2>&1 \
     || { cat "$out/build.log"; exit 1; }
 "$root/tools/mkinitramfs.sh" "$out/abitest.cpio.gz" "$root/tests/guest/init-abitest" \
     "$out/mod/l4h_abitest.ko" >/dev/null

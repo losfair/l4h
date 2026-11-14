@@ -17,9 +17,10 @@ import pathlib
 import sys
 
 root, out = map(pathlib.Path, sys.argv[1:])
-writer = (root / 'guest/linux/arch/l4h/os-sel4/sys.c').read_text()
-writer = writer.split('static unsigned int console_seq;', 1)[1].split('void l4h_power(int how)', 1)[0]
-(out / 'console-writer.inc').write_text('static unsigned int console_seq;' + writer)
+writer = (root / 'guest/provider/sys.c').read_text()
+start = writer.index('static void console_put(')
+end = writer.index('void l4h_power(int how)', start)
+(out / 'console-writer.inc').write_text(writer[start:end])
 driver = (root / 'guest/linux/arch/l4h/drivers/memhp.c').read_text()
 parts = []
 for signature in ['static long mem_call(', 'static void memhp_work_fn(struct work_struct *w)\n{', 'static irqreturn_t memhp_interrupt(']:

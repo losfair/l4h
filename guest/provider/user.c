@@ -13,8 +13,8 @@
  *
  * Registers are kept in UML pt_regs order (gp[HOST_*]).
  */
-#include "l4h_os.h"
-#include <generated/user_constants.h>
+#include "private.h"
+#include "registers.h"
 
 #ifdef __aarch64__
 #include "user-arm64.h"
@@ -199,7 +199,6 @@ void l4h_user_deschedule(struct l4h_uctx *u)
 	u->sc_vcpu = -1;
 }
 
-int l4h_debug_user;
 
 int l4h_user_run(struct l4h_uctx *u, unsigned long *gp, int read_regs_on_interrupt)
 {
@@ -303,10 +302,8 @@ int l4h_user_run(struct l4h_uctx *u, unsigned long *gp, int read_regs_on_interru
 	}
 
 	if (badge != u->badge) {
-		extern void l4h_uctx_describe(unsigned long badge);
-		static int once;
 
-		if (__atomic_exchange_n(&once, 1, __ATOMIC_ACQ_REL))
+		if (__atomic_exchange_n(&l4h_provider_state()->stray_once, 1, __ATOMIC_ACQ_REL))
 			for (;;)
 				seL4_Yield();
 
