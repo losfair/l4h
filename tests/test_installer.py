@@ -637,6 +637,20 @@ class InstallerTests(UpdateChecks, Harness):
         self.assertEqual(plan["uplinks"], [dict(ifname="ens3", bdf="00:05.0", mac="52:54:00:12:34:56")])
         self.assertIn("uplink_nic=00:05.0", installer.configuration(plan))
 
+    def test_rtl8125_uplink_needs_its_memory_bar(self):
+        # As the chip has them: I/O ports in BAR 0, registers in BAR 2.
+        for device in (0x8125, 0x3000):
+            self.machine.pci("00:05.0", 0x10EC, device, 0x020000, io_bar=True)
+            plan = self.check()
+            self.assertEqual(plan["uplinks"], [dict(ifname="ens3", bdf="00:05.0", mac="52:54:00:12:34:56")])
+        base = "/sys/devices/pci0000:00/0000:00:05.0/resource"
+        self.machine.write(base, "0xc000 0xc0ff 0x101\n" + "0 0 0\n" * 5)
+        self.rejected("supported uplinks")
+        self.machine.pci("00:05.0", 0x10EC, 0x8125, 0x020000, msix=False, msi=True)
+        self.rejected("supported uplinks")
+        self.machine.pci("00:05.0", 0x10EC, 0x8168, 0x020000)
+        self.rejected("supported uplinks")
+
     def test_two_uplinks_have_separate_switches_and_stable_mac_mappings(self):
         self.machine.nic("ens2", "00:03.0", "52:54:00:12:34:57")
         plan = self.check()

@@ -470,8 +470,11 @@ class Preflight:
                 vendor == 0x1AE0 and device == 0x0042 and mem(0) and mem(2) and pci["msix"] >= 3 or
                 vendor == 0x8086 and device in (0x1557, 0x1563, 0x15D1) and mem(0) and pci["msix"] >= 2 or
                 vendor == 0x1D0F and device in (0x0EC2, 0x1EC2, 0xEC20, 0xEC21, 0x0051) and mem(0) and pci["msix"] >= 2 or
-                vendor == 0x15B3 and device == 0x1017 and mem(0) and pci["msix"] >= 1)
-            need(supported, name + ": supported uplinks are virtio-net, gVNIC, ENA, Intel 82599 SFP+/X550 and ConnectX-5")
+                vendor == 0x15B3 and device == 0x1017 and mem(0) and pci["msix"] >= 1 or
+                # Realtek RTL8125 (A, B/BG, D, BP; Killer E3000): registers in BAR 2.
+                vendor == 0x10EC and device in (0x8125, 0x3000) and mem(2) and pci["msix"] >= 1)
+            need(supported, name + ": supported uplinks are virtio-net, gVNIC, ENA, Intel 82599 SFP+/X550, ConnectX-5"
+                 " and Realtek RTL8125")
             need(not bond or vendor == 0x15B3 and device == 0x1017,
                  "bond migration currently needs two ConnectX-5 ports")
             need(bond or self.read(base + "/addr_assign_type") == "0",

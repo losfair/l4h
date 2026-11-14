@@ -4818,8 +4818,8 @@ curl -fsSL https://raw.githubusercontent.com/losfair/l4h/main/tools/install.sh |
 - **Supported layouts.** Headless systemd installations need a plain
   ext4/XFS root on NVMe namespace 1, a supported virtio disk, or supported
   AHCI SATA. dom0 sees its partition windows (§10.1).
-  There can be one or two physical virtio-net, gVNIC, ENA, 82599/X550 or
-  ConnectX-5 NICs. Each NIC becomes the uplink of its own switch
+  There can be one or two physical virtio-net, gVNIC, ENA, 82599/X550,
+  ConnectX-5 or Realtek RTL8125 NICs. Each NIC becomes the uplink of its own switch
   (switch 0, then 1, in PCI address order), and dom0 gets one interface on
   each with the original name and MAC, so existing address, route and DNS
   settings apply. Software interfaces (WireGuard, PPP, GRE, TUN/TAP and the
