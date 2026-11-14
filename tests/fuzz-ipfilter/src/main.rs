@@ -112,6 +112,18 @@ fn udp(sport: u16, dport: u16) -> Vec<u8> {
     u
 }
 
+/// A DHCP client's message from UDP port `sport` to a server, for `mac`.
+fn dhcp(sport: u16, mac: [u8; 6]) -> Vec<u8> {
+    let mut u = udp(sport, 67);
+    u.truncate(8);
+    let mut m = vec![0u8; 240];
+    m[..3].copy_from_slice(&[1, 1, 6]);
+    m[28..34].copy_from_slice(&mac);
+    m[236..240].copy_from_slice(&[99, 130, 83, 99]);
+    u.extend(m);
+    u
+}
+
 /// A TCP header and `n` bytes of payload.
 fn tcp(n: usize) -> Vec<u8> {
     let mut t = vec![0u8; 20 + n];
@@ -263,12 +275,15 @@ fn random_frame(rng: &mut Rng) -> Vec<u8> {
         0 | 1 => {
             let proto = rng.pick(&[1, 6, 17, 47]);
             let l4 = match proto {
+                17 if rng.chance(30) => dhcp(rng.pick(&[68, 4000]), if rng.chance(80) { src } else { OTHER_MAC }),
                 17 => udp(rng.pick(&[53, 67, 68, 547, 4000]), rng.pick(&[53, 67, 68, 546])),
-                1 => icmp(rng.pick(&[0, 3, 5, 8])),
+                1 => icmp(rng.pick(&[0, 3, 5, 8, 9])),
                 6 => tcp(rng.pick(&[0, 100, 3000])),
                 _ => vec![0; 20],
             };
-            let frag = if rng.chance(20) { rng.below(100) as u16 } else { 0 };
+            // Offset, and sometimes more fragments.
+            let off = if rng.chance(20) { rng.below(100) as u16 } else { 0 };
+            let frag = off | if rng.chance(10) { 0x2000 } else { 0 };
             eth(src, 0x0800, &ip4(random_src4(rng), proto, frag, 4 * rng.below(3) as usize, &l4))
         }
         2 => {
@@ -287,7 +302,7 @@ fn random_frame(rng: &mut Rng) -> Vec<u8> {
                 6 => tcp(rng.pick(&[0, 100, 3000])),
                 17 => udp(rng.pick(&[546, 547, 4000]), rng.pick(&[546, 547])),
                 58 => {
-                    let kind = rng.pick(&[128, 131, 133, 134, 135, 136, 137, 143]);
+                    let kind = rng.pick(&[128, 131, 133, 134, 135, 136, 137, 138, 143]);
                     let target = random_src6(rng);
                     let opt = rng.pick(&[0, 1, 2]);
                     nd(kind, target, opt, if rng.chance(90) { src } else { OTHER_MAC })
@@ -313,7 +328,7 @@ fn random_frame(rng: &mut Rng) -> Vec<u8> {
         }
         _ => {
             let t = rng.pick(&[0x8100, 0x88a8, 0x88cc, 0x8863, 0x1234]);
-            eth(src, t, &ip4(random_src4(rng), 17, 0, 0, &udp(68, 67)))
+            eth(src, t, &ip4(random_src4(rng), 17, 0, 0, &dhcp(68, src)))
         }
     }
 }
@@ -366,23 +381,26 @@ fn check_properties(f: &Filter, frame: &[u8]) -> Verdict {
 }
 
 /// A plain model of the guards, for headers right after the IP header:
-/// a Router Advertisement or Redirect, or a DHCP or DHCPv6 server's
-/// message.
+/// a router's message (advertisement, redirect, renumbering), a DHCP or
+/// DHCPv6 server's, or a DHCP client's for another MAC or fragmented.
 fn server_or_router(frame: &[u8]) -> bool {
     let at = |i: usize| frame.get(i).copied();
     let port = |i: usize| Some(u16::from_be_bytes([at(i)?, at(i + 1)?]));
     match port(12) {
         Some(0x0800) if at(20).map(|b| b & 0x1f) == Some(0) && at(21) == Some(0) => {
             let l4 = 14 + (at(14).unwrap_or(0) & 15) as usize * 4;
+            let more = at(20).unwrap_or(0) & 0x20 != 0;
+            let chaddr = (l4 + 8 + 28..l4 + 8 + 34).map(at).collect::<Option<Vec<u8>>>();
             match at(23) {
+                Some(17) if port(l4 + 2) == Some(67) => more || chaddr.as_deref() != Some(&frame[6..12]),
                 Some(17) => port(l4) == Some(67) || port(l4 + 2) == Some(68),
-                Some(1) => at(l4) == Some(5),
+                Some(1) => matches!(at(l4), Some(5 | 9)),
                 _ => false,
             }
         }
         Some(0x86dd) => match at(20) {
             Some(17) => port(54) == Some(547) || port(56) == Some(546),
-            Some(58) => matches!(at(54), Some(134 | 137)),
+            Some(58) => matches!(at(54), Some(134 | 137 | 138)),
             _ => false,
         },
         _ => false,
@@ -506,17 +524,17 @@ mod tests {
         // A filter with no prefixes allows nothing but the exceptions.
         let none = Filter { on: true, ..Filter::OFF };
         assert_eq!(check(&none, &v4_frame([10, 0, 0, 5], 6, &[0; 20])), Spoofed);
-        assert_eq!(check(&none, &v4_frame([0, 0, 0, 0], 17, &udp(68, 67))), Pass);
+        assert_eq!(check(&none, &v4_frame([0, 0, 0, 0], 17, &dhcp(68, MAC))), Pass);
     }
 
     #[test]
     fn ipv4_unspecified_is_dhcp_only() {
         let f = filter();
-        assert_eq!(check(&f, &v4_frame([0, 0, 0, 0], 17, &udp(68, 67))), Pass);
+        assert_eq!(check(&f, &v4_frame([0, 0, 0, 0], 17, &dhcp(68, MAC))), Pass);
         assert_eq!(check(&f, &v4_frame([0, 0, 0, 0], 17, &udp(68, 53))), Denied);
         assert_eq!(check(&f, &v4_frame([0, 0, 0, 0], 1, &icmp(8))), Denied);
         // Not a first fragment: no ports to show it is DHCP.
-        assert_eq!(check(&f, &eth(MAC, 0x0800, &ip4([0, 0, 0, 0], 17, 4, 0, &udp(68, 67)))), Denied);
+        assert_eq!(check(&f, &eth(MAC, 0x0800, &ip4([0, 0, 0, 0], 17, 4, 0, &dhcp(68, MAC)))), Denied);
     }
 
     #[test]
@@ -528,6 +546,19 @@ mod tests {
         assert_eq!(check(&f, &v4_frame([10, 0, 0, 5], 17, &udp(1234, 68))), Denied);
         assert_eq!(check(&f, &v4_frame([10, 0, 0, 5], 17, &udp(1234, 53))), Pass);
         assert_eq!(check(&f, &v4_frame([10, 0, 0, 5], 1, &icmp(5))), Denied);
+        assert_eq!(check(&f, &v4_frame([10, 0, 0, 5], 1, &icmp(9))), Denied);
+        // A client's message for its own MAC, from any port; not for
+        // another's (a release or decline of its lease), not fragmented,
+        // not a bare UDP datagram.
+        assert_eq!(check(&f, &v4_frame([10, 0, 0, 5], 17, &dhcp(68, MAC))), Pass);
+        assert_eq!(check(&f, &v4_frame([10, 0, 0, 5], 17, &dhcp(4000, MAC))), Pass);
+        assert_eq!(check(&f, &v4_frame([10, 0, 0, 5], 17, &dhcp(68, OTHER_MAC))), Denied);
+        assert_eq!(check(&f, &v4_frame([0, 0, 0, 0], 17, &dhcp(68, OTHER_MAC))), Denied);
+        assert_eq!(check(&f, &eth(MAC, 0x0800, &ip4([10, 0, 0, 5], 17, 0x2000, 0, &dhcp(68, MAC)))), Denied);
+        assert_eq!(check(&f, &v4_frame([10, 0, 0, 5], 17, &udp(68, 67))), Denied);
+        let mut reply = dhcp(68, MAC);
+        reply[8] = 2;
+        assert_eq!(check(&f, &v4_frame([10, 0, 0, 5], 17, &reply)), Denied);
         assert_eq!(check(&f, &v4_frame([10, 0, 0, 5], 1, &icmp(0))), Pass);
         // A later fragment's bytes are payload, not a header.
         assert_eq!(check(&f, &eth(MAC, 0x0800, &ip4([10, 0, 0, 5], 17, 9, 0, &udp(67, 68)))), Pass);
@@ -629,6 +660,7 @@ mod tests {
         let f = filter();
         assert_eq!(check(&f, &v6_frame(v6(5), 58, &icmp(134))), Denied);
         assert_eq!(check(&f, &v6_frame(v6(5), 58, &nd(137, v6(1), 0, MAC))), Denied);
+        assert_eq!(check(&f, &v6_frame(v6(5), 58, &icmp(138))), Denied);
         assert_eq!(check(&f, &v6_frame(v6(5), 17, &udp(547, 546))), Denied);
         assert_eq!(check(&f, &v6_frame(v6(5), 17, &udp(1234, 546))), Denied);
         assert_eq!(check(&f, &v6_frame(v6(5), 17, &udp(546, 547))), Pass);
@@ -701,6 +733,13 @@ mod tests {
         let mut nonce = nd(135, v6(1), 1, MAC);
         nonce.extend_from_slice(&[14, 1, 1, 2, 3, 4, 5, 6]);
         assert_eq!(check(&f, &v6_frame(v6(5), 58, &nonce)), Pass);
+        // Fragmented (RFC 6980): a later fragment's options go unchecked.
+        for kind in [133, 135, 136] {
+            let mut fr = frag6(58, 0);
+            fr[3] |= 1;
+            fr.extend(nd(kind, v6(5), 0, MAC));
+            assert_eq!(check(&f, &v6_frame(v6(5), 44, &fr)), Denied, "{kind}");
+        }
         // Cut short of the target.
         assert_eq!(check(&f, &v6_frame(v6(5), 58, &nd(136, v6(5), 0, MAC)[..20])), Denied);
     }

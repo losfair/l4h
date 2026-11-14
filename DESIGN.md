@@ -2426,16 +2426,23 @@ dom0's external IP, or owns a cloud alias IP outright.
 only from the addresses dom0 gives it, so a guest cannot take another's
 IP address, answer ARP or Neighbor Discovery for it, or act as a router or
 DHCP server on its switch. The filter is checked in netd on every frame
-the guest sends, after the MAC lock (`ipfilter.rs`). Frames to the guest
+the guest sends, after the MAC lock (`ipfilter.rs`), which it needs: a
+filtered vNIC cannot be `nolock`, as a frame with another's MAC would take
+its traffic and pass the ARP and ND checks with it. Frames to the guest
 are not filtered.
 - **Addresses.** Up to 16 IPv4 or IPv6 prefixes a port
   (`L4H_CTL_IP_ADD`/`DEL`/`LIST`; root keeps the table, netd a copy). A
   filtered port starts with none; `l4hctl create --nic SW,ip=PREFIX` adds
   them before the VM starts, and `l4hctl ip add|del` changes them while it
-  runs, for example for a DHCP lease. Link-local IPv6 is not implied:
+  runs, for example for a DHCP lease. A change takes effect when netd
+  reads it, just after the op returns (root does not wait for netd);
+  netd takes commands in order, so an address moved from one port to
+  another is never both ports'. Link-local IPv6 is not implied:
   allowing all of `fe80::/10` would let a guest take another's.
 - **What passes.** IPv4 from an allowed source, or from 0.0.0.0 as a DHCP
-  client (UDP 68 → 67). ARP (Ethernet over IPv4) whose sender is allowed,
+  client (UDP 68 → 67). A message to a DHCP server (UDP 67) must be a
+  client's request for the frame's source MAC (`chaddr`), unfragmented:
+  one for another's could release or decline its lease. ARP (Ethernet over IPv4) whose sender is allowed,
   or 0.0.0.0 for an RFC 5227 probe of an allowed address, and whose sender
   MAC is the frame's source. IPv6 from an allowed source, or from `::` for
   duplicate address detection of an allowed address, router solicitations
@@ -2443,11 +2450,13 @@ are not filtered.
   its owner give it up.
 - **Neighbor Discovery.** IPv6's ARP: a Neighbor Advertisement's target
   must be allowed, and the link-layer address options of solicitations and
-  advertisements must be the frame's source MAC. ARP and ND claims follow
-  the prefixes: a guest given a /24 may answer for any address in it, the
-  gateway's included.
-- **Guards.** Router Advertisements and Redirects (ICMPv6 134, 137), ICMP
-  Redirects (5), and DHCP and DHCPv6 server or relay messages (UDP source
+  advertisements must be the frame's source MAC, and ND messages
+  unfragmented (RFC 6980), so no option hides in a later fragment. ARP
+  and ND claims follow the prefixes: a guest given a /24 may answer for
+  any address in it, the gateway's included.
+- **Guards.** Router Advertisements, Redirects and Router Renumbering
+  (ICMPv6 134, 137, 138), ICMP Redirects and Router Advertisements (5,
+  9), and DHCP and DHCPv6 server or relay messages (UDP source
   port 67 or 547, or to a client's port, 68 or 546, which clients take
   from any port) are dropped from any source. A router or DHCP server VM
   needs an unfiltered port.
@@ -2470,7 +2479,11 @@ are not filtered.
   endpoint's inbound one. The guards apply to it too.
 - **Not covered.** Only the outer header is checked: a tunnel (IP in IP,
   GRE, ESP) carries any inner source, which a receiver that decapsulates
-  it trusts as much as it trusts the tunnel.
+  it trusts as much as it trusts the tunnel. DHCP is checked by
+  `chaddr` alone: a client identifier (option 61), which servers prefer
+  for a lease, and DHCPv6's DUIDs are the guest's to choose, so a server
+  that should not be fooled into releasing another's lease checks them
+  against the MAC itself.
 - **Cost.** An unfiltered port pays a flag test; a filtered one parses the
   headers and compares against at most 16 prefixes. Drops count in the
   port's `drops`. `tests/fuzz-ipfilter` checks each rule, and that no

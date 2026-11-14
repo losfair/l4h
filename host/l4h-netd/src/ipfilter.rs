@@ -3,7 +3,9 @@
 //! dom0 gave it, and acts as no router or DHCP server.
 //!
 //! - IPv4: the source is an allowed address, or 0.0.0.0 for a DHCP client
-//!   (UDP 68 -> 67).
+//!   (UDP 68 -> 67).  A message to a DHCP server (UDP port 67) is a
+//!   client's, unfragmented, for the frame's source MAC (chaddr): one for
+//!   another's could release or decline its lease.
 //! - ARP: Ethernet over IPv4; the sender is an allowed address, or 0.0.0.0
 //!   for an RFC 5227 probe of an allowed address, and its MAC the frame's
 //!   source.
@@ -11,10 +13,12 @@
 //!   detection of an allowed address, router solicitations and MLD
 //!   reports.  A Neighbor Advertisement's target is an allowed address;
 //!   link-layer address options of Neighbor Discovery are the frame's
-//!   source MAC.  (A probe of another's address would make its owner give
+//!   source MAC, and its messages are unfragmented (RFC 6980), so that no
+//!   option is past what is checked.  (A probe of another's address would make its owner give
 //!   it up.)
-//! - Guards: Router Advertisements and Redirects (ICMPv6 134, 137), ICMPv4
-//!   Redirects (5), and DHCP or DHCPv6 server and relay messages (UDP
+//! - Guards: Router Advertisements, Redirects and Router Renumbering
+//!   (ICMPv6 134, 137, 138), ICMPv4 Redirects and Router Advertisements
+//!   (5, 9), and DHCP or DHCPv6 server and relay messages (UDP
 //!   source port 67 or 547, or to a client's port, 68 or 546) are dropped,
 //!   whatever their source.
 //! - Everything else is dropped: other EtherTypes, VLAN tags (whose frames
@@ -143,7 +147,7 @@ pub fn check(f: &Filter, frame: &[u8]) -> Verdict {
     let src: &[u8; 6] = frame[6..12].try_into().unwrap();
     let p = &frame[14..];
     match be16(frame, 12) {
-        0x0800 => ip4(f, p),
+        0x0800 => ip4(f, src, p),
         0x86dd => ip6(f, src, p),
         0x0806 => arp(f, src, p),
         _ => Verdict::Denied,
@@ -166,7 +170,7 @@ fn arp(f: &Filter, src: &[u8; 6], p: &[u8]) -> Verdict {
     if ok { Verdict::Pass } else { Verdict::Denied }
 }
 
-fn ip4(f: &Filter, p: &[u8]) -> Verdict {
+fn ip4(f: &Filter, mac: &[u8; 6], p: &[u8]) -> Verdict {
     if p.len() < 20 || p[0] >> 4 != 4 {
         return Verdict::Denied;
     }
@@ -177,6 +181,7 @@ fn ip4(f: &Filter, p: &[u8]) -> Verdict {
     let proto = p[9];
     // Only the first fragment has the upper-layer header, whole.
     let first = be16(p, 6) & 0x1fff == 0;
+    let more = be16(p, 6) & 0x2000 != 0;
     let l4 = &p[ihl..];
     if first {
         let need = match proto {
@@ -188,7 +193,11 @@ fn ip4(f: &Filter, p: &[u8]) -> Verdict {
             return Verdict::Denied;
         }
         let dhcp_server = proto == IPPROTO_UDP && (be16(l4, 0) == 67 || be16(l4, 2) == 68);
-        if dhcp_server || (proto == IPPROTO_ICMP && l4[0] == 5) {
+        // ICMP Redirect, Router Advertisement.
+        if dhcp_server || (proto == IPPROTO_ICMP && matches!(l4[0], 5 | 9)) {
+            return Verdict::Denied;
+        }
+        if proto == IPPROTO_UDP && be16(l4, 2) == 67 && (more || !dhcp_client(mac, &l4[8.min(l4.len())..])) {
             return Verdict::Denied;
         }
     }
@@ -198,6 +207,13 @@ fn ip4(f: &Filter, p: &[u8]) -> Verdict {
         return if dhcp { Verdict::Pass } else { Verdict::Denied };
     }
     if f.allows(false, &src) { Verdict::Pass } else { Verdict::Spoofed }
+}
+
+/// A BOOTP request (op 1, Ethernet) whose client hardware address is
+/// `mac`.  `m` is the UDP payload, with whatever padding the frame has:
+/// at worst a server sees a short message it drops.
+fn dhcp_client(mac: &[u8; 6], m: &[u8]) -> bool {
+    m.len() >= 34 && m[..3] == [1, 1, 6] && m[28..34] == *mac
 }
 
 fn ip6(f: &Filter, mac: &[u8; 6], p: &[u8]) -> Verdict {
@@ -244,11 +260,11 @@ fn ip6(f: &Filter, mac: &[u8; 6], p: &[u8]) -> Verdict {
             IPPROTO_UDP if l4.len() < 4 || be16(l4, 0) == 547 || be16(l4, 2) == 546 => return Verdict::Denied,
             IPPROTO_ICMPV6 => {
                 let Some(&kind) = l4.first() else { return Verdict::Denied };
-                // Router Advertisement, Redirect.
-                if kind == 134 || kind == 137 {
+                // Router Advertisement, Redirect, Router Renumbering.
+                if matches!(kind, 134 | 137 | 138) {
                     return Verdict::Denied;
                 }
-                if matches!(kind, 133 | 135 | 136) && !nd_ok(f, mac, kind, src == [0; 16], l4) {
+                if matches!(kind, 133 | 135 | 136) && (frag || !nd_ok(f, mac, kind, src == [0; 16], l4)) {
                     return Verdict::Denied;
                 }
                 icmp = Some(kind);

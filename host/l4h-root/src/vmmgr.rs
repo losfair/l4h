@@ -922,7 +922,7 @@ fn nic_add(h: &mut Host, id: usize, switch: u32, mac: u64, flags: u64) -> Result
     let id = guest_arg(id)?;
     // 48 bits, unicast; 0 asks root for one (the checks vmmgr makes before
     // it allocates for the port).
-    if !l4h_host::vmmgr::nic_mac_ok(mac) || flags & !l4h_host::vmmgr::NIC_FLAGS != 0 {
+    if !l4h_host::vmmgr::nic_mac_ok(mac) || !l4h_host::vmmgr::nic_flags_ok(flags) {
         return Err(ctl::EINVAL);
     }
     // As DiskAttach and UsbAttach with a failed driver: a port netd never

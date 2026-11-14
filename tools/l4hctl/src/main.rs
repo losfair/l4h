@@ -904,6 +904,9 @@ fn run(args: &[String]) -> Result<i32> {
                                 return err(format!("--nic: unknown option {opt}"));
                             }
                         }
+                        if n.flags & NIC_IP_FILTER != 0 && n.flags & NIC_NO_MAC_LOCK != 0 {
+                            return err("--nic: ipfilter needs the MAC lock (no nolock)".to_string());
+                        }
                         o.nics.push(n);
                     }
                     "--usb" => {

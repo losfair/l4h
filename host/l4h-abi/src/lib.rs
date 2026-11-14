@@ -449,7 +449,7 @@ pub const NIC_NO_MAC_LOCK: u64 = 1 << 0;
 pub const NIC_ISOLATED: u64 = 1 << 1;
 /// Send only IPv4, IPv6 and ARP from the addresses CTL_IP_ADD gives the
 /// port (none at first), and no router advertisements or DHCP server
-/// messages.
+/// messages.  Not with NIC_NO_MAC_LOCK.
 pub const NIC_IP_FILTER: u64 = 1 << 2;
 /// CTL_BLK_ATTACH flags. A volatile attachment offers the guest no flush
 /// and completes flushes at once: data the device caches can be lost on

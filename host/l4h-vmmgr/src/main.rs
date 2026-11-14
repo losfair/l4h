@@ -415,7 +415,7 @@ impl Vmmgr {
     /// with abi::NIC_* `flags`.  Returns the MAC.
     pub fn create_nic(&mut self, id: usize, switch: u32, mac: u64, flags: u64) -> Result<u64, Errno> {
         // What root would refuse, before anything is made for the port.
-        if !proto::nic_mac_ok(mac) || flags & !proto::NIC_FLAGS != 0 {
+        if !proto::nic_mac_ok(mac) || !proto::nic_flags_ok(flags) {
             return Err(ctl::EINVAL);
         }
         if !self.can_afford(1 << 20, 0, 0) {
