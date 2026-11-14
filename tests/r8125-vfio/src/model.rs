@@ -70,6 +70,8 @@ struct Tx {
 struct Shared {
     /// The PHY's registers by OCP address / 2.
     phy: Mutex<Vec<u16>>,
+    /// The EPHY's registers.
+    ephy: Mutex<[u16; 32]>,
     /// Frames to receive, with the status bits their descriptor gets.
     rx: Mutex<VecDeque<(Vec<u8>, u32)>>,
     tx: Mutex<Vec<Tx>>,
@@ -82,7 +84,6 @@ fn chip(bar: usize, s: Arc<Shared>) {
     // The values the chip itself last left in the two access windows: any
     // other is a request.
     let (mut gphy, mut ephy) = (0u32, 0u32);
-    let mut ephy_regs = [0u16; 32];
     let (mut rx_cur, mut tx_cur, mut polling) = (0usize, 0usize, false);
     while !s.stop.load(Ordering::Relaxed) {
         let cmd = r8(bar + 0x37);
@@ -107,11 +108,12 @@ fn chip(bar: usize, s: Arc<Shared>) {
         let v = r32(bar + 0x80);
         if v != ephy {
             let reg = ((v >> 16) & 0x1f) as usize;
+            let mut regs = s.ephy.lock().unwrap();
             ephy = if v & FLAG != 0 {
-                ephy_regs[reg] = v as u16;
+                regs[reg] = v as u16;
                 v & !FLAG
             } else {
-                FLAG | v | ephy_regs[reg] as u32
+                FLAG | v | regs[reg] as u32
             };
             w32(bar + 0x80, ephy);
         }
@@ -292,36 +294,55 @@ fn manifest() {
     assert!(m.valid(), "root takes the manifest");
     let ids = |device| l4h_host::nicd::Ids { vendor: 0x10ec, device, subvendor: 0x1849, subdevice: 0x8125, class: 0x020000, revision: 5 };
     assert!(m.matching(&ids(0x8125)).is_some() && m.matching(&ids(0x3000)).is_some() && m.matching(&ids(0x8168)).is_none());
-    assert_eq!(&m.firmware[0][..22], b"rtl_nic/rtl8125b-2.fw\0");
+    assert_eq!(&m.firmware[1][..22], b"rtl_nic/rtl8125b-2.fw\0");
 }
 
-#[test]
-fn model() {
-    // DMA memory and the configuration snapshot where root maps them.
-    let map = |at: usize, len: usize| {
-        let p = unsafe {
-            libc::mmap(at as *mut _, len, libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE, -1, 0)
+/// A chip of `xid` on the model, the firmware program (below) in bundle
+/// slot `fw_slot`, the driver started on it.
+struct Bench {
+    nic: r8125::R8125,
+    bar: usize,
+    s: Arc<Shared>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+fn bring_up(xid: u32, fw_slot: usize) -> Bench {
+    // DMA memory and the configuration snapshot where root maps them, once
+    // for the process: one chip at a time.
+    static MAPPED: std::sync::Once = std::sync::Once::new();
+    MAPPED.call_once(|| {
+        let map = |at: usize, len: usize| {
+            let p = unsafe {
+                libc::mmap(at as *mut _, len, libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE, -1, 0)
+            };
+            assert_eq!(p as usize, at, "mmap {at:#x}");
         };
-        assert_eq!(p as usize, at, "mmap {at:#x}");
-    };
-    map(l4h_host::DMA_VA, DMA_SIZE);
-    map(l4h_host::nicd::CFG_VA, 4096);
+        map(l4h_host::DMA_VA, DMA_SIZE);
+        map(l4h_host::nicd::CFG_VA, 4096);
+    });
     let bar = vec![0u32; BAR / 4].leak().as_mut_ptr() as usize;
-    w32(bar + 0x40, 0x641 << 20);
+    w32(bar + 0x40, xid << 20);
     w8(bar + 0xd3, 0x32);
     w16(bar + 0xe2, 0x0103);
     for (i, b) in MAC.iter().enumerate() {
         w8(bar + 0x19e0 + i, *b);
     }
+    // What only some chips' start clears.
+    w32(bar + 0xa80, u32::MAX);
+    w16(bar + 0x7a, 0xffff);
     let s = Arc::new(Shared::default());
     {
         let mut phy = s.phy.lock().unwrap();
         phy.resize(0x8000, 0);
         phy[0xa402 / 2] = 0x0004;
         phy[0xa434 / 2] = 0x0210;
+        // EEE at 2.5G advertised, legacy force mode on: what the chips
+        // that change them change.
+        phy[0xa6d4 / 2] = 0x0001;
+        phy[0xa5b4 / 2] = 0x8000;
     }
-    let chip_thread = {
+    let thread = {
         let s = s.clone();
         std::thread::spawn(move || chip(bar, s))
     };
@@ -347,11 +368,11 @@ fn model() {
     let msix = vec![0u8; 32 * 16].leak();
     let mut config = sdk::config(0x500, 0, [none, none, PciRegion { va: bar as u64, len: BAR as u64 }, none, none, none],
         PciRegion { va: msix.as_ptr() as u64, len: msix.len() as u64 }, DMA_IOVA, DMA_SIZE as u64);
-    config.firmware[0] = PciRegion { va: fw.as_ptr() as u64, len: fw.len() as u64 };
+    config.firmware[fw_slot] = PciRegion { va: fw.as_ptr() as u64, len: fw.len() as u64 };
     let hw = sdk::hw(config, super::tsc_hz());
     let nic = r8125::R8125::new(&hw).expect("bring-up");
 
-    // ---- bring-up
+    // What every chip does.
     assert_eq!(nic.mac, MAC);
     assert_eq!((r32(bar), r16(bar + 4)), (u32::from_le_bytes([MAC[0], MAC[1], MAC[2], MAC[3]]), u16::from_le_bytes([MAC[4], MAC[5]])));
     let link = NicDriver::link(&nic);
@@ -359,14 +380,13 @@ fn model() {
     {
         let phy = s.phy.lock().unwrap();
         let p = |a: usize| phy[a / 2];
-        assert_eq!((p(0xbc34), p(0xbc36), p(0xa420), p(0xa422)), (0x1234, 0x1235, 0, 0xbeef), "firmware program");
+        assert_eq!((p(0xbc34), p(0xbc36), p(0xa420), p(0xa422)), (0x1234, 0x1235, 0, 0xbeef), "firmware program from slot {fw_slot}");
         assert_eq!(p(0xa5d4) & 0x1180, 0x0080, "2.5G advertised, 5G and 10G not");
         assert_eq!(p(0xa408), 0x0de1, "10/100 and pause advertised");
         assert_eq!(p(0xa412) & 0x0300, 0x0200, "1000 full advertised");
         assert_ne!(p(0xa400) & 0x1000, 0, "autonegotiation on");
         assert_eq!(p(0xa430) & 1 << 2, 0, "ALDPS off");
         assert_ne!(p(0xa442) & 1 << 11, 0, "10M on");
-        assert_eq!((p(0xb87c), p(0xb87e)), (0x8551, 0x080e), "rtl8125_phy_param, a masked one last");
     }
     let rx_config = r32(bar + 0x44);
     assert_eq!(rx_config & 0x3f, 0x0f, "every frame, no error frames");
@@ -374,6 +394,103 @@ fn model() {
     assert_ne!(r16(bar + 0xe0) & 1 << 5, 0, "RX checksums");
     assert_eq!(r32(bar + 0x38), 3, "RX causes on, TX ones off");
     assert_eq!(r8(bar + 0x37) & 0x0c, 0x0c, "RX and TX on");
+    Bench { nic, bar, s, thread }
+}
+
+fn b_phy(s: &Shared, a: usize) -> u16 {
+    s.phy.lock().unwrap()[a / 2]
+}
+
+impl Bench {
+    fn phy(&self, a: usize) -> u16 {
+        b_phy(&self.s, a)
+    }
+
+    fn ephy(&self, r: usize) -> u16 {
+        self.s.ephy.lock().unwrap()[r]
+    }
+
+    fn finish(self) {
+        let Bench { mut nic, s, thread, .. } = self;
+        nic.stop();
+        s.stop.store(true, Ordering::Relaxed);
+        thread.join().unwrap();
+    }
+}
+
+/// A short UDP packet to the PTP event port: 52 bytes, 18 of them from the
+/// UDP header on.
+fn ptp() -> Vec<u8> {
+    let mut udp = vec![0u8; 8 + 10];
+    udp[0..2].copy_from_slice(&319u16.to_be_bytes());
+    udp[2..4].copy_from_slice(&319u16.to_be_bytes());
+    udp[4..6].copy_from_slice(&18u16.to_be_bytes());
+    let c = !fold(csum(pseudo(SRC, DST, 17, 18), &udp));
+    udp[6..8].copy_from_slice(&c.to_be_bytes());
+    ipv4(PEER, MAC, SRC, DST, 17, &udp)
+}
+
+/// The RTL8125A and D: their own steps of bring-up, and what differs in
+/// their data path (no TSO on the A, no UDP padding quirk on the D).
+#[test]
+fn variants() {
+    let _one = CHIP.lock().unwrap_or_else(|e| e.into_inner());
+    // RTL8125A.
+    let b = bring_up(0x609, 0);
+    assert_eq!(b.nic.chip, r8125::Chip::A);
+    let o = b.nic.offer();
+    assert_eq!((o.tx_gso_mask, o.tx_frame_max), (0, 1518), "no TSO on the A");
+    assert_eq!(r32(b.bar + 0x44) & 1 << 11, 0, "no pause slot");
+    assert_eq!((r32(b.bar + 0xa80), r16(b.bar + 0x7a)), (0, 0xffff), "coalescing cleared to 0xb00, INT_CFG1 left");
+    assert_eq!((b.ephy(0x04), b.ephy(0x0a), b.ephy(0x09)), (0xd000, 0x8653, 0xfe04), "the A's EPHY table");
+    assert_eq!(b.phy(0xad4c), 0x00a8, "rtl8125a_2_hw_phy_config");
+    assert_eq!((b.phy(0xa436), b.phy(0xb87c)), (0x81a2, 0x809c), "its last parameters");
+    assert_eq!(b.phy(0xa6d4) & 1, 0, "no EEE at 2.5G");
+    assert_eq!(b.phy(0xa5b4), 0x8000, "no legacy force mode step");
+    let mut rig = Rig { nic: b.nic, s: b.s.clone() };
+    let f = ptp();
+    rig.send(&f, &[0; HDR]);
+    assert_eq!(rig.sent(1)[0].frame.len(), f.len() + 47 - 18, "the A pads PTP");
+    // A GSO frame (netd sends none to the A): segmented, not offloaded.
+    let (g, h) = tcp4(&[7; 3000], 1448);
+    rig.send(&g, &h);
+    let t = rig.sent(3);
+    assert!(t.iter().all(|t| t.opts1 & 0x0ffe_0000 == 0 && l4_ok(&t.frame, 14)), "segmented in the driver");
+    Bench { nic: rig.nic, ..b }.finish();
+
+    // RTL8125D, both XIDs, each with its firmware.
+    for (xid, slot) in [(0x688, 2), (0x689, 3)] {
+        let b = bring_up(xid, slot);
+        assert_eq!(b.nic.chip, r8125::Chip::D);
+        assert_eq!(b.nic.offer().tx_gso_mask, 1 << 1 | 1 << 4, "TSO on the D");
+        assert_ne!(r32(b.bar + 0x44) & 1 << 11, 0, "pause slot");
+        assert_eq!((r32(b.bar + 0xa80), r16(b.bar + 0x7a)), (0, 0xffff), "coalescing cleared to 0xb00, INT_CFG1 left");
+        assert!((0..32).all(|r| b.ephy(r) == 0), "no EPHY table");
+        assert_eq!((b.phy(0xb87c), b.phy(0xad4c)), (0, 0), "none of the A's or B's parameters");
+        assert_eq!((b.phy(0xa6d4) & 1, b.phy(0xa5b4)), (1, 0), "EEE left, legacy force mode off");
+        let mut rig = Rig { nic: b.nic, s: b.s.clone() };
+        let f = ptp();
+        rig.send(&f, &[0; HDR]);
+        assert_eq!(rig.sent(1)[0].frame.len(), 60, "the D pads to ETH_ZLEN only");
+        Bench { nic: rig.nic, ..b }.finish();
+    }
+}
+
+/// The two tests share DMA memory: one chip at a time.
+static CHIP: Mutex<()> = Mutex::new(());
+
+#[test]
+fn model() {
+    let _one = CHIP.lock().unwrap_or_else(|e| e.into_inner());
+    let b = bring_up(0x641, 1);
+    assert_eq!(b.nic.chip, r8125::Chip::B);
+    assert_eq!((r32(b.bar + 0xa80), r16(b.bar + 0x7a)), (u32::MAX, 0), "coalescing cleared to 0xa80, INT_CFG1 cleared");
+    assert_eq!((b.ephy(0x0b), b.ephy(0x1e), b.ephy(0x02)), (0xa908, 0x20eb, 0x0020), "the B's EPHY table");
+    assert_eq!((b.phy(0xa6d4) & 1, b.phy(0xa5b4)), (1, 0), "EEE left, legacy force mode off");
+    assert_ne!(r32(b.bar + 0x44) & 1 << 11, 0, "pause slot");
+    let (nic, s, thread) = (b.nic, b.s, b.thread);
+
+    assert_eq!((b_phy(&s, 0xb87c), b_phy(&s, 0xb87e)), (0x8551, 0x080e), "rtl8125_phy_param, a masked one last");
     let o = nic.offer();
     assert_eq!((o.tx_gso_mask, o.tx_gso_max, o.tx_mss_min, o.tx_mss_max), (1 << 1 | 1 << 4, 64000, 1000, 2047));
     let mut rig = Rig { nic, s: s.clone() };
@@ -549,5 +666,5 @@ fn model() {
 
     rig.nic.stop();
     s.stop.store(true, Ordering::Relaxed);
-    chip_thread.join().unwrap();
+    thread.join().unwrap();
 }

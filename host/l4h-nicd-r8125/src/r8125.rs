@@ -1,7 +1,8 @@
-//! Realtek RTL8125B 2.5 GbE driver (Linux `r8169`, its RTL_GIGA_MAC_VER_63
-//! paths), for the RTL8125B and RTL8125BG (10ec:8125, and 10ec:3000 as the
-//! Killer E3000).  The RTL8125A and RTL8125D share the PCI ID; their MAC
-//! and PHY setup differ, and the driver refuses them (by the chip's XID).
+//! Realtek RTL8125 2.5 GbE driver (Linux `r8169`), for the RTL8125A, the
+//! RTL8125B and RTL8125BG, and the RTL8125D (10ec:8125, and 10ec:3000 as
+//! the Killer E3000): Linux's RTL_GIGA_MAC_VER_61, 63 and 64.  The chip's
+//! XID tells them apart (Chip); the RTL8125BP (VER_66), which also has
+//! the PCI ID and adds DASH management, is refused.
 //!
 //! Registers are little-endian in BAR 2 (BAR 0 is I/O ports, not used);
 //! the MSI-X table is in BAR 4, which root maps for it.  One RX and one TX
@@ -11,14 +12,15 @@
 //! frames take in order and give back as the chip completes them.
 //!
 //! Bring-up follows Linux's probe and open: the MAC's own init, a MAC
-//! reset, the PHY's parameters (and its firmware patch, if the bundle has
-//! `rtl_nic/rtl8125b-2.fw`), a PHY reset, the MAC start sequence, then
-//! autonegotiation advertising 10 to 2500 Mb/s with pause.  The PHY is
-//! reached through the GPHY OCP window (MDIO_MMD_VEND2 register r is OCP
-//! address r; page p, register r of the paged C22 view is p * 16 + (r -
-//! 16) * 2, page 0 the standard registers at 0xa400).  The chip's ASPM
-//! stays off and the link's L1 is disabled, as Linux does unless the
-//! system vendor marked ASPM safe.
+//! reset, the PHY's parameters (with the chip's PHY firmware patch, if the
+//! bundle has it), a PHY reset, the MAC start sequence, then
+//! autonegotiation advertising 10 to 2500 Mb/s with pause.  The chips
+//! differ in register values along the way, as Linux has them per
+//! mac_version.  The PHY is reached through the GPHY OCP window
+//! (MDIO_MMD_VEND2 register r is OCP address r; page p, register r of the
+//! paged C22 view is p * 16 + (r - 16) * 2, page 0 the standard registers
+//! at 0xa400).  The chip's ASPM stays off and the link's L1 is disabled,
+//! as Linux does unless the system vendor marked ASPM safe.
 //!
 //! Every cause shares MSI-X entry 0 (the chip's single-vector mode).  RX
 //! (RxOK, RxErr) and TX (TxOK, TxErr) causes are masked separately in
@@ -29,10 +31,12 @@
 //!
 //! Offloads: the chip's RX checksum verdict becomes DATA_VALID; TSO for
 //! TCP over IPv4 and IPv6 (untagged frames, MSS up to 2047, at most 64
-//! segments as Linux's RTL_GSO_MAX_SEGS_V2).  Linux 6.18 sends no other
-//! frame with checksum offload on this chip (rtl8169_features_check with
-//! rtl_quirk_packet_padto), so neither does this driver: NEEDS_CSUM frames
-//! are completed here, and short frames padded as Linux pads them.
+//! segments as Linux's RTL_GSO_MAX_SEGS_V2), but not on the RTL8125A,
+//! where Linux leaves TSO off (reports of TX timeouts).  Linux 6.18 sends
+//! no other frame with checksum offload on these chips
+//! (rtl8169_features_check with rtl_quirk_packet_padto), so neither does
+//! this driver: NEEDS_CSUM frames are completed here, and short frames
+//! padded as Linux pads them.
 
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::Ordering;
@@ -43,10 +47,10 @@ use l4h_virtio::{Mmio, dma_fence};
 
 use crate::sdk::offload;
 
-/// The PHY firmware patch Linux applies to the RTL8125B, from
-/// linux-firmware, if the driver bundle has it (Linux works without it,
+/// The PHY firmware patches Linux applies, from linux-firmware, by
+/// Chip::of's index, if the driver bundle has them (Linux works without,
 /// with a warning).
-const FW_8125B: &str = "rtl_nic/rtl8125b-2.fw";
+const FIRMWARE: [&str; 4] = ["rtl_nic/rtl8125a-3.fw", "rtl_nic/rtl8125b-2.fw", "rtl_nic/rtl8125d-1.fw", "rtl_nic/rtl8125d-2.fw"];
 
 /// What the driver drives and needs (l4h_host::nicd::Manifest).
 pub const MANIFEST: crate::sdk::Manifest = crate::sdk::Manifest {
@@ -61,11 +65,11 @@ pub const MANIFEST: crate::sdk::Manifest = crate::sdk::Manifest {
         crate::sdk::nicd::CfgWindow::NONE,
         crate::sdk::nicd::CfgWindow::NONE,
     ],
-    // RTL8125 (A, B, D: the XID tells), Killer E3000 (RTL8125BG).
+    // RTL8125 (A, B, D, BP: the XID tells), Killer E3000 (RTL8125BG).
     ..crate::sdk::Manifest::empty()
         .with_name("r8125")
         .with_matches(&[crate::sdk::PciMatch::id(0x10ec, 0x8125), crate::sdk::PciMatch::id(0x10ec, 0x3000)])
-        .with_firmware(&[FW_8125B])
+        .with_firmware(&FIRMWARE)
 };
 
 const HDR: usize = net::HDR_SIZE;
@@ -104,10 +108,47 @@ const RSS_CTRL: usize = 0x4500;
 const Q_NUM_CTRL: usize = 0x4800;
 const EEE_TXIDLE_TIMER: usize = 0x6048;
 
-/// TxConfig bits 30:20, masked as Linux's chip table masks them: the
-/// RTL8125B is 0x641 (RTL8125A 0x609, RTL8125D 0x688/0x689).
+/// TxConfig bits 30:20, masked as Linux's chip table masks them.
 const XID_MASK: u32 = 0x7cf;
-const XID_8125B: u32 = 0x641;
+
+/// The chips driven (Linux's mac_version).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Chip {
+    /// RTL_GIGA_MAC_VER_61.
+    A,
+    /// RTL_GIGA_MAC_VER_63, the RTL8125BG too.
+    B,
+    /// RTL_GIGA_MAC_VER_64.
+    D,
+}
+
+impl Chip {
+    /// The chip of an XID, and its firmware's index in FIRMWARE (Linux's
+    /// rtl_chip_infos).
+    fn of(xid: u32) -> Option<(Chip, usize)> {
+        match xid & XID_MASK {
+            0x609 => Some((Chip::A, 0)),
+            0x641 => Some((Chip::B, 1)),
+            0x688 => Some((Chip::D, 2)),
+            0x689 => Some((Chip::D, 3)),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Chip::A => "RTL8125A",
+            Chip::B => "RTL8125B",
+            Chip::D => "RTL8125D",
+        }
+    }
+
+    /// Linux sets TSO and scatter-gather on by default for all but the
+    /// RTL8125A (rtl_init_one).
+    fn tso(self) -> bool {
+        self != Chip::A
+    }
+}
 
 const CMD_STOP_REQ: u8 = 0x80;
 const CMD_RESET: u8 = 0x10;
@@ -195,6 +236,8 @@ const ANAR: u32 = PHY_BASE + 4 * 2;
 const GBCR: u32 = PHY_BASE + 9 * 2;
 const PHYSR: u32 = 0xa434;
 const AN_10GBT_CTRL: u32 = 0xa5d4;
+const AN_EEE_ADV2: u32 = 0xa6d4;
+const EEE_ADV_2500: u16 = 1 << 0;
 const BMCR_RESET: u16 = 1 << 15;
 const BMCR_ANENABLE: u16 = 1 << 12;
 const BMCR_PDOWN: u16 = 1 << 11;
@@ -257,11 +300,11 @@ fn csum_fold(mut s: u32) -> u16 {
     s as u16
 }
 
-/// The length Linux pads a frame without checksum offload to on the
-/// RTL8125B (rtl_quirk_packet_padto): ETH_ZLEN, and more for short UDP
-/// packets (rtl8125_quirk_udp_padto: PTP event and general messages, and
-/// a UDP header the frame cuts short).
-fn pad_to(frame: &[u8]) -> usize {
+/// The length Linux pads a frame without checksum offload to
+/// (rtl_quirk_packet_padto): ETH_ZLEN, and on the RTL8125A and B (`udp`)
+/// more for short UDP packets (rtl8125_quirk_udp_padto: PTP event and
+/// general messages, and a UDP header the frame cuts short).
+fn pad_to(frame: &[u8], quirk: bool) -> usize {
     let len = frame.len();
     let mut padto = 0;
     let udp = || -> Option<usize> {
@@ -272,7 +315,8 @@ fn pad_to(frame: &[u8]) -> usize {
             _ => None,
         }
     };
-    if len < 128 + MIN_PATCH_LEN
+    if quirk
+        && len < 128 + MIN_PATCH_LEN
         && let Some(t) = udp().filter(|&t| t <= len)
     {
         let data = len - t;
@@ -291,6 +335,7 @@ fn pad_to(frame: &[u8]) -> usize {
 
 pub struct R8125 {
     pub mac: [u8; 6],
+    pub chip: Chip,
     regs: Mmio,
     tsc_hz: u64,
     link: LinkState,
@@ -324,6 +369,10 @@ impl R8125 {
     pub fn offer(&self) -> Offer {
         let mut o = Offer::plain(self.mac);
         o.tx_csum = 1;
+        if !self.chip.tso() {
+            o.tx_frame_max = TX_FRAME_MAX as u32;
+            return o;
+        }
         o.tx_gso_mask = 1 << 1 | 1 << 4;
         o.tx_gso_max = TSO_MAX as u32;
         o.tx_mss_min = TSO_MIN_MSS as u32;
@@ -439,10 +488,10 @@ impl R8125 {
             return Err("the device does not answer");
         }
         let xid = (txconfig >> 20) & 0xfcf;
-        if xid & XID_MASK != XID_8125B {
-            l4h_rt::info!("nicd {}: RTL8125 XID {:03x} is not an RTL8125B", n, xid);
-            return Err("not an RTL8125B");
-        }
+        let Some((chip, fw_index)) = Chip::of(xid) else {
+            l4h_rt::info!("nicd {}: RTL8125 XID {:03x} is not an RTL8125A, B or D", n, xid);
+            return Err("not an RTL8125A, B or D");
+        };
         let mut dma = hw.dma();
         let (rx_ring, rx_ring_pa) = dma.alloc(RX_RING * DESC, 4096);
         let rx_bufs: [_; RX_RING] = core::array::from_fn(|_| dma.alloc(RX_BUF, 128));
@@ -451,6 +500,7 @@ impl R8125 {
         let (seg, _) = dma.alloc(SEG_BUF, 64);
         let mut r = R8125 {
             mac: [0; 6],
+            chip,
             regs,
             tsc_hz: hw.tsc_hz,
             link: LinkState::ethernet(false, 0),
@@ -484,9 +534,9 @@ impl R8125 {
         // Open (rtl8169_up): the PHY, then the MAC.
         r.phy_w(BMCR, r.phy_r(BMCR) & !BMCR_PDOWN);
         r.udelay(20_000);
-        let fw = c.firmware[0];
+        let fw = c.firmware[fw_index];
         let fw = (fw.len != 0).then(|| unsafe { core::slice::from_raw_parts(fw.va as *const u8, fw.len as usize) });
-        r.hw_phy_config(n, fw)?;
+        r.hw_phy_config(n, fw.map(|f| (FIRMWARE[fw_index], f)))?;
         r.phy_soft_reset();
         hw.program_msix(1);
         r.cleanup();
@@ -506,8 +556,8 @@ impl R8125 {
         r.link = r.read_link();
         let mac = r.mac;
         l4h_rt::info!(
-            "nicd {}: {:02x}:{:02x}.{} RTL8125B, mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, PHY firmware {}, link {} {}M",
-            n, c.pci_bdf >> 8, (c.pci_bdf >> 3) & 0x1f, c.pci_bdf & 7,
+            "nicd {}: {:02x}:{:02x}.{} {}, mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, PHY firmware {}, link {} {}M",
+            n, c.pci_bdf >> 8, (c.pci_bdf >> 3) & 0x1f, c.pci_bdf & 7, chip.name(),
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
             if fw.is_some() { "patched" } else { "not in the bundle" },
             if r.link.up() { "up" } else { "down" }, r.link.speed(),
@@ -515,9 +565,10 @@ impl R8125 {
         Ok(r)
     }
 
-    /// Linux rtl_init_rxcfg (VER_63).
+    /// Linux rtl_init_rxcfg: the pause slot from the RTL8125B on.
     fn init_rxcfg(&self) {
-        self.regs.w32(RX_CONFIG, RX_FETCH_DFLT | RX_DMA_BURST | RX_PAUSE_SLOT_ON);
+        let pause = if self.chip == Chip::A { 0 } else { RX_PAUSE_SLOT_ON };
+        self.regs.w32(RX_CONFIG, RX_FETCH_DFLT | RX_DMA_BURST | pause);
     }
 
     fn irq_mask_and_ack(&mut self) {
@@ -527,8 +578,13 @@ impl R8125 {
         self.commit();
     }
 
-    /// Linux rtl_wait_txrx_fifo_empty (VER_63).
+    /// Linux rtl_wait_txrx_fifo_empty: the RTL8125A waits for the FIFOs
+    /// alone; later chips are asked to stop and report it in IntrMitigate.
     fn wait_fifo_empty(&self) {
+        if self.chip == Chip::A {
+            self.wait(100, 42, |s| s.regs.r8(MCU) & MCU_RXTX_EMPTY == MCU_RXTX_EMPTY);
+            return;
+        }
         self.regs.w8(CHIP_CMD, self.regs.r8(CHIP_CMD) | CMD_STOP_REQ);
         self.wait(100, 42, |s| s.regs.r8(MCU) & MCU_RXTX_EMPTY == MCU_RXTX_EMPTY);
         self.wait(100, 42, |s| s.regs.r16(INTR_MITIGATE) & 0x0103 == 0x0103);
@@ -584,28 +640,111 @@ impl R8125 {
         self.lock_config();
     }
 
-    /// Linux rtl8125b_hw_phy_config, with r8169_apply_firmware first.
-    fn hw_phy_config(&mut self, n: usize, fw: Option<&[u8]>) -> Result<(), &'static str> {
-        if let Some(fw) = fw {
-            let Some(code) = fw_code(fw).filter(|c| fw_check(c)) else {
-                l4h_rt::info!("nicd {}: {} is not a valid PHY firmware: not applied", n, FW_8125B);
-                return self.phy_params();
-            };
-            if !self.fw_run(code) {
-                return Err("the PHY firmware does not finish");
-            }
-            // At least one firmware leaves another page selected.
-            self.ocp_base = PHY_BASE;
-            // A PHY reset may still be under way.
-            self.wait(50_000, 12, |s| s.phy_r(BMCR) & BMCR_RESET == 0);
+    /// Linux r8169_apply_firmware: run the program in `fw` (its name, its
+    /// bytes), if it is one.
+    fn apply_firmware(&mut self, n: usize, fw: Option<(&str, &[u8])>) -> Result<(), &'static str> {
+        let Some((name, fw)) = fw else { return Ok(()) };
+        let Some(code) = fw_code(fw).filter(|c| fw_check(c)) else {
+            l4h_rt::info!("nicd {}: {} is not a valid PHY firmware: not applied", n, name);
+            return Ok(());
+        };
+        if !self.fw_run(code) {
+            return Err("the PHY firmware does not finish");
         }
-        self.phy_params()
+        // At least one firmware leaves another page selected.
+        self.ocp_base = PHY_BASE;
+        // A PHY reset may still be under way.
+        self.wait(50_000, 12, |s| s.phy_r(BMCR) & BMCR_RESET == 0);
+        Ok(())
     }
 
-    fn phy_params(&self) -> Result<(), &'static str> {
-        // rtl8168g_enable_gphy_10m.
-        self.phy_modify_paged(0xa44, 0x11, 0, 1 << 11);
+    /// Linux rtl8125a_2_hw_phy_config, rtl8125b_hw_phy_config and
+    /// rtl8125d_hw_phy_config, with the firmware where each applies it.
+    fn hw_phy_config(&mut self, n: usize, fw: Option<(&str, &[u8])>) -> Result<(), &'static str> {
+        match self.chip {
+            Chip::A => {
+                self.phy_params_a_pre();
+                self.apply_firmware(n, fw)?;
+                self.phy_params_a_post();
+            }
+            Chip::B => {
+                self.apply_firmware(n, fw)?;
+                self.enable_gphy_10m();
+                self.phy_params_b();
+                self.legacy_force_mode();
+            }
+            Chip::D => {
+                self.apply_firmware(n, fw)?;
+                self.enable_gphy_10m();
+                self.legacy_force_mode();
+            }
+        }
+        // rtl8168g_disable_aldps.
+        self.phy_modify_paged(0xa43, 0x10, 1 << 2, 0);
+        // rtl8125_config_eee_phy.
+        self.phy_modify_paged(0xa43, 0x11, 0, 1 << 4);
+        self.phy_modify_paged(0xa6d, 0x14, 0x0010, 0x0000);
+        self.phy_modify_paged(0xa42, 0x14, 0x0080, 0x0000);
+        self.phy_modify_paged(0xa4a, 0x11, 0x0200, 0x0000);
+        Ok(())
+    }
 
+    /// rtl8168g_enable_gphy_10m.
+    fn enable_gphy_10m(&self) {
+        self.phy_modify_paged(0xa44, 0x11, 0, 1 << 11);
+    }
+
+    /// rtl8125_legacy_force_mode.
+    fn legacy_force_mode(&self) {
+        self.phy_modify_paged(0xa5b, 0x12, 1 << 15, 0);
+    }
+
+    /// rtl8125a_2_hw_phy_config up to its firmware.
+    fn phy_params_a_pre(&self) {
+        self.phy_modify_paged(0xad4, 0x17, 0x0000, 0x0010);
+        self.phy_modify_paged(0xad1, 0x13, 0x03ff, 0x03ff);
+        self.phy_modify_paged(0xad3, 0x11, 0x003f, 0x0006);
+        self.phy_modify_paged(0xac0, 0x14, 0x1100, 0x0000);
+        self.phy_modify_paged(0xacc, 0x10, 0x0003, 0x0002);
+        self.phy_modify_paged(0xad4, 0x10, 0x00e7, 0x0044);
+        self.phy_modify_paged(0xac1, 0x12, 0x0080, 0x0000);
+        self.phy_modify_paged(0xac8, 0x10, 0x0300, 0x0000);
+        self.phy_modify_paged(0xac5, 0x17, 0x0007, 0x0002);
+        self.phy_w(phy_paged(0xad4, 0x16), 0x00a8);
+        self.phy_w(phy_paged(0xac5, 0x16), 0x01ff);
+        self.phy_modify_paged(0xac8, 0x15, 0x00f0, 0x0030);
+
+        self.phy_param_b87(0x80a2, 0xffff, 0x0153);
+        self.phy_param_b87(0x809c, 0xffff, 0x0153);
+
+        // A table through page 0xa43's address (0x13) and data (0x14)
+        // registers, the data register taking one entry a write.
+        self.phy_w(phy_paged(0xa43, 0x13), 0x81b3);
+        for v in [0x0043, 0x00a7, 0x00d6, 0x00ec, 0x00f6, 0x00fb, 0x00fd, 0x00ff, 0x00bb, 0x0058, 0x0029, 0x0013, 0x0009, 0x0004, 0x0002] {
+            self.phy_w(phy_paged(0xa43, 0x14), v);
+        }
+        for _ in 0..25 {
+            self.phy_w(phy_paged(0xa43, 0x14), 0);
+        }
+
+        self.phy_param_a43(0x8257, 0xffff, 0x020f);
+        self.phy_param_a43(0x80ea, 0xffff, 0x7843);
+    }
+
+    /// rtl8125a_2_hw_phy_config after its firmware.
+    fn phy_params_a_post(&self) {
+        self.phy_modify_paged(0xd06, 0x14, 0x0000, 0x2000);
+        self.phy_param_a43(0x81a2, 0x0000, 0x0100);
+        self.phy_modify_paged(0xb54, 0x16, 0xff00, 0xdb00);
+        self.phy_modify_paged(0xa45, 0x12, 0x0001, 0x0000);
+        self.phy_modify_paged(0xa5d, 0x12, 0x0000, 0x0020);
+        self.phy_modify_paged(0xad4, 0x17, 0x0010, 0x0000);
+        self.phy_modify_paged(0xa86, 0x15, 0x0001, 0x0000);
+        self.enable_gphy_10m();
+    }
+
+    /// rtl8125b_hw_phy_config's own parameters.
+    fn phy_params_b(&self) {
         self.phy_modify_paged(0xac4, 0x13, 0x00f0, 0x0090);
         self.phy_modify_paged(0xad3, 0x10, 0x0003, 0x0001);
 
@@ -622,17 +761,6 @@ impl R8125 {
 
         self.phy_modify_paged(0xa4c, 0x15, 0x0000, 0x0040);
         self.phy_modify_paged(0xbf8, 0x12, 0xe000, 0xa000);
-
-        // rtl8125_legacy_force_mode.
-        self.phy_modify_paged(0xa5b, 0x12, 1 << 15, 0);
-        // rtl8168g_disable_aldps.
-        self.phy_modify_paged(0xa43, 0x10, 1 << 2, 0);
-        // rtl8125_config_eee_phy.
-        self.phy_modify_paged(0xa43, 0x11, 0, 1 << 4);
-        self.phy_modify_paged(0xa6d, 0x14, 0x0010, 0x0000);
-        self.phy_modify_paged(0xa42, 0x14, 0x0080, 0x0000);
-        self.phy_modify_paged(0xa4a, 0x11, 0x0200, 0x0000);
-        Ok(())
     }
 
     /// Linux genphy_soft_reset, autonegotiation on.
@@ -647,6 +775,11 @@ impl R8125 {
     /// genphy_config_advert): 10/100 half and full, 1000 full, 2500 full,
     /// pause and asymmetric pause; then autonegotiation restarts.
     fn config_aneg(&self) {
+        // The RTL8125A advertises no EEE at 2.5G (Linux, after Realtek's
+        // r8125: phy_disable_eee_mode); EEE is otherwise the PHY's default.
+        if self.chip == Chip::A {
+            self.phy_modify(AN_EEE_ADV2, EEE_ADV_2500, 0);
+        }
         self.phy_modify(AN_10GBT_CTRL, ADV_NBASET_MASK, ADV_2500);
         self.phy_modify(ANAR, ANAR_MASK, ANAR_ADV);
         self.phy_modify(GBCR, GBCR_MASK, GBCR_1000FULL);
@@ -693,9 +826,9 @@ impl R8125 {
         self.hw_reset();
     }
 
-    /// Linux rtl_hw_start with rtl_hw_start_8125 and rtl_hw_start_8125b
-    /// (ASPM and clock requests off, which Linux turns on only when it
-    /// controls the link's ASPM).
+    /// Linux rtl_hw_start with rtl_hw_start_8125 and the chip's
+    /// rtl_hw_start_8125a_2, _8125b or _8125d (ASPM and clock requests off,
+    /// which Linux turns on only when it controls the link's ASPM).
     fn hw_start(&mut self, cp_cmd: u16, rx_pa: u64, tx_pa: u64, hw: &Hw) {
         let regs = self.regs;
         self.unlock_config();
@@ -710,22 +843,47 @@ impl R8125 {
         // rtl_hw_start_8125: no interrupt coalescing, extended tally
         // counters.
         regs.w8(INT_CFG0, 0);
-        for r in (0xa00..0xa80).step_by(4) {
-            regs.w32(r, 0);
+        if self.chip == Chip::B {
+            for r in (0xa00..0xa80).step_by(4) {
+                regs.w32(r, 0);
+            }
+            regs.w16(INT_CFG1, 0);
+        } else {
+            for r in (0xa00..0xb00).step_by(4) {
+                regs.w32(r, 0);
+            }
         }
-        regs.w16(INT_CFG1, 0);
         self.mac_ocp_modify(0xea84, 0, 3);
 
-        // rtl_hw_start_8125b.  Linux also sets the ASPM entry latency
-        // (configuration byte 0x70f), which only matters with ASPM on.
-        for &(reg, mask, bits) in &[
-            (0x0b, 0xffff, 0xa908),
-            (0x1e, 0xffff, 0x20eb),
-            (0x4b, 0xffff, 0xa908),
-            (0x5e, 0xffff, 0x20eb),
-            (0x22, 0x0030, 0x0020),
-            (0x62, 0x0030, 0x0020),
-        ] {
+        // The chip's own start: its EPHY table.  Linux also sets the ASPM
+        // entry latency (configuration byte 0x70f), which only matters with
+        // ASPM on.
+        let ephy: &[(u32, u16, u16)] = match self.chip {
+            Chip::A => &[
+                (0x04, 0xffff, 0xd000),
+                (0x0a, 0xffff, 0x8653),
+                (0x23, 0xffff, 0xab66),
+                (0x20, 0xffff, 0x9455),
+                (0x21, 0xffff, 0x99ff),
+                (0x29, 0xffff, 0xfe04),
+                (0x44, 0xffff, 0xd000),
+                (0x4a, 0xffff, 0x8653),
+                (0x63, 0xffff, 0xab66),
+                (0x60, 0xffff, 0x9455),
+                (0x61, 0xffff, 0x99ff),
+                (0x69, 0xffff, 0xfe04),
+            ],
+            Chip::B => &[
+                (0x0b, 0xffff, 0xa908),
+                (0x1e, 0xffff, 0x20eb),
+                (0x4b, 0xffff, 0xa908),
+                (0x5e, 0xffff, 0x20eb),
+                (0x22, 0x0030, 0x0020),
+                (0x62, 0x0030, 0x0020),
+            ],
+            Chip::D => &[],
+        };
+        for &(reg, mask, bits) in ephy {
             self.ephy_w(reg, (self.ephy_r(reg) & !mask) | bits);
         }
 
@@ -744,8 +902,9 @@ impl R8125 {
         self.mac_ocp_modify(0xe860, 0x0000, 0x0080);
         // The legacy TX descriptor format.
         self.mac_ocp_modify(0xeb58, 0x0001, 0x0000);
-        self.mac_ocp_modify(0xe614, 0x0700, 0x0200);
-        self.mac_ocp_modify(0xe63e, 0x0c30, 0x0000);
+        let b = self.chip == Chip::B;
+        self.mac_ocp_modify(0xe614, 0x0700, if b { 0x0200 } else { 0x0300 });
+        self.mac_ocp_modify(0xe63e, 0x0c30, if b { 0x0000 } else { 0x0020 });
         self.mac_ocp_modify(0xc0b4, 0x0000, 0x000c);
         self.mac_ocp_modify(0xeb6a, 0x00ff, 0x0033);
         self.mac_ocp_modify(0xeb50, 0x03e0, 0x0040);
@@ -765,8 +924,11 @@ impl R8125 {
         if !self.wait(1000, 10, |s| s.mac_ocp_r(0xe00e) & 1 << 13 == 0) {
             l4h_rt::info!("nicd {}: MAC OCP 0xe00e stays busy", hw.config.uplink);
         }
-        // rtl8125b_config_eee_mac.
+        // rtl8125a_config_eee_mac, rtl8125b_config_eee_mac.
         self.mac_ocp_modify(0xe040, 0, 3);
+        if self.chip == Chip::A {
+            self.mac_ocp_modify(0xeb62, 0, 1 << 2 | 1 << 1);
+        }
         // rtl_disable_rxdvgate.
         regs.w32(MISC, regs.r32(MISC) & !MISC_RXDV_GATED_EN);
 
@@ -1039,7 +1201,11 @@ impl R8125 {
 
     pub fn transmit(&mut self, frame: &[u8], hdr: &[u8; HDR]) -> bool {
         if offload::is_gso(hdr) {
-            if let Some((opts1, opts2, v6)) = Self::tso(frame, hdr) {
+            // Not offered on the RTL8125A: netd segments, so this does not
+            // happen there, but the chip is not given one regardless.
+            if self.chip.tso()
+                && let Some((opts1, opts2, v6)) = Self::tso(frame, hdr)
+            {
                 let take = frame.len().next_multiple_of(TX_ALIGN);
                 if !self.make_room(1, take, take) {
                     return false;
@@ -1070,8 +1236,9 @@ impl R8125 {
                 return false;
             }
             let buf = unsafe { core::slice::from_raw_parts_mut(self.seg as *mut u8, SEG_BUF) };
+            let quirk = self.chip != Chip::D;
             offload::segment(frame, hdr, buf, |s, _| {
-                let len = s.len().max(pad_to(s));
+                let len = s.len().max(pad_to(s, quirk));
                 self.post_tx(s, len, 0, 0, |_| {});
             });
             return true;
@@ -1081,7 +1248,7 @@ impl R8125 {
         if frame.len() > TX_FRAME_MAX {
             return true;
         }
-        let len = frame.len().max(pad_to(frame));
+        let len = frame.len().max(pad_to(frame, self.chip != Chip::D));
         let take = len.next_multiple_of(TX_ALIGN);
         if !self.make_room(1, take, take) {
             return false;

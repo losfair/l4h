@@ -2277,7 +2277,7 @@ firewalling belong in a VM.
   `l4h-netd` → destination port, or an uplink channel → the NIC's driver
   (a nicd, §9.8). netd runs all switches and has no device code; each NIC
   is driven by its own nicd: modern and legacy virtio-net, gVNIC, Amazon
-  ENA, Intel X550, ConnectX-5 and Realtek RTL8125B.
+  ENA, Intel X550, ConnectX-5 and Realtek RTL8125.
 - **vNICs.** Each vNIC is on one switch and appears as a separate `ethN`.
   There are 48 guest ports in all. Guest vNICs have one RX/TX queue pair.
   A VMM processes at most 32 chains per RX or TX batch, counting malformed
@@ -2518,17 +2518,31 @@ a host peer (`tests/nic-peer.py`), before and after a restart (QEMU's device
 has no FLR); with `L4H_QEMU_IOMMU=intel|amd` it is the QEMU test of a
 confined driver (virtio drivers never are), and must cause no IOMMU fault.
 
-**Realtek RTL8125B.** `l4h-nicd-r8125/src/r8125.rs` follows Linux `r8169`'s
-RTL8125B paths (`RTL_GIGA_MAC_VER_63`) for the RTL8125B and RTL8125BG
-(10ec:8125, and 10ec:3000, the Killer E3000). The RTL8125A and RTL8125D
-have the same PCI ID but other MAC and PHY setup, and the driver refuses
-them by the chip's XID. Registers are in BAR 2, the MSI-X table in BAR 4.
+**Realtek RTL8125.** `l4h-nicd-r8125/src/r8125.rs` follows Linux `r8169`
+for the RTL8125A, the RTL8125B and RTL8125BG, and the RTL8125D
+(`RTL_GIGA_MAC_VER_61`, `63` and `64`; 10ec:8125, and 10ec:3000, the Killer
+E3000). The chip's XID tells them apart. The RTL8125BP has the same PCI ID
+and adds DASH management, and the driver refuses it. The chips differ
+only in bring-up register values, which the driver takes from Linux per
+chip:
+- RX configuration: no pause slot on the A.
+- FIFO drain: the A has no stop request.
+- Interrupt coalescing: the range cleared differs.
+- EPHY table: the A and B each have their own, the D has none.
+- MAC values: a few at 0xe614, 0xe63e and 0xeb62.
+- PHY setup: the A's is long, with its firmware midway; the B's is
+  medium; the D's is short.
+- Firmware: `rtl8125a-3`, `rtl8125b-2`, `rtl8125d-1` or `-2`.
+
+Two of Linux's choices for the A carry over: no TSO (reported TX
+timeouts) and no EEE at 2.5G. The UDP padding quirk applies to the A and
+B only. Registers are in BAR 2, the MSI-X table in BAR 4.
 Bring-up is Linux's probe and open: the MAC's init and reset, the PHY's
 parameters, a PHY reset, the MAC start sequence, then autonegotiation
 advertising 10 Mb/s to 2.5 Gb/s with pause; EEE stays at the PHY's default.
-The PHY is reached through the chip's GPHY OCP window. Before the
-parameters the driver runs the PHY firmware patch `rtl_nic/rtl8125b-2.fw`
-from linux-firmware, as Linux does, when the driver bundle has it
+The PHY is reached through the chip's GPHY OCP window. Where Linux
+does, the driver runs the chip's PHY firmware patch from linux-firmware
+(`rtl_nic/rtl8125*.fw`) when the driver bundle has it
 (`L4H_NIC_FIRMWARE=rtl_nic/rtl8125b-2.fw=FILE` for `tools/build-host.sh`).
 It checks the program's jumps first and bounds its steps. Without the
 patch it goes on, as Linux does. The chip's ASPM and clock requests stay
@@ -2543,7 +2557,7 @@ their status bits are acknowledged before they are unmasked. The chip's
 interrupt coalescing is off, as in Linux. Root's tick (`F_TIMER`) reads
 the link (BMSR, and PHYSR for the speed). A chip that reads all ones
 panics the driver, so root restarts it. Receive: the chip's TCP/UDP checksum
-verdict becomes `DATA_VALID`. Transmit: TSO over untagged IPv4 and IPv6
+verdict becomes `DATA_VALID`. Transmit: TSO (not on the A) over untagged IPv4 and IPv6
 (MSS 1000–2047 and TCP at most 127 bytes in, so 64 segments at most, as
 Linux's limits); for IPv6 the payload length and the checksum's length
 are cleared, as `tcp_v6_gso_csum_prep`. Linux 6.18 offloads no other
@@ -2561,7 +2575,8 @@ the device's RX checksums, checksums the driver completes, 4 KB and 60 KB
 TSO, RX and TX interrupts; `--firmware FILE` adds the PHY patch). Its
 `cargo test` runs the driver against a register-level model of the chip.
 The model answers the PHY window and clears reset, and moves both rings.
-It checks bring-up and the firmware interpreter, RX across ring wraps with
+It checks bring-up for each chip, with its own register values and
+firmware slot, and the firmware interpreter, RX across ring wraps with
 checksum verdicts and dropped frames, and TX across ring and area wraps
 with padding, completed checksums, TSO descriptors and segmentation. It
 also checks the bound on plain frames and the ring and area limits.
