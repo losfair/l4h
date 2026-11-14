@@ -143,7 +143,7 @@ pub fn host_op(h: &mut Host, op: u32, a: &[u64; 6], data: &mut [u8; abi::CTL_DAT
         abi::CTL_DRIVER_LOAD => vals[0] = crate::nicd::load_driver(h, a[0], a[1])? as u64,
         abi::CTL_FIRMWARE_INFO => {
             let f = crate::nicd::drivers().firmware.get(usize::try_from(a[0]).map_err(|_| ENOENT)?).ok_or(ENOENT)?;
-            vals[0] = (f.boot as u64) * abi::DRIVER_BOOT | (f.data.len() as u64) << 8;
+            vals[0] = f.data.len() as u64;
             data[..abi::FIRMWARE_NAME].copy_from_slice(&f.name[..abi::FIRMWARE_NAME]);
             data[abi::FIRMWARE_NAME..abi::FIRMWARE_NAME + 32].copy_from_slice(&f.sha256);
         }

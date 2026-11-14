@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Pack NIC driver images and firmware blobs into a driver bundle
+"""Pack NIC driver images into a driver bundle
 (host/l4h-root/src/drivers.rs): the l4h-drivers boot module, which root
-also has built in.
+also has built in.  It holds no firmware: dom0 loads that from the host's
+own linux-firmware (DESIGN.md §9.8).
 
-Usage: mkdrivers.py OUT DRIVER.elf... [--firmware NAME=FILE]...
+Usage: mkdrivers.py OUT DRIVER.elf...
 """
 import struct
 import sys
 
 MAGIC = b"L4HDRVS1"
 NAME = 48
-KIND_DRIVER, KIND_FIRMWARE = 1, 2
+KIND_DRIVER = 1
 ALIGN = 4096
 
 
@@ -18,18 +19,7 @@ def main(argv):
     if len(argv) < 2:
         sys.exit(__doc__)
     out, rest = argv[0], argv[1:]
-    entries = []
-    i = 0
-    while i < len(rest):
-        a = rest[i]
-        if a == "--firmware":
-            name, path = rest[i + 1].split("=", 1)
-            entries.append((name, KIND_FIRMWARE, open(path, "rb").read()))
-            i += 2
-            continue
-        data = open(a, "rb").read()
-        entries.append((a.rsplit("/", 1)[-1], KIND_DRIVER, data))
-        i += 1
+    entries = [(a.rsplit("/", 1)[-1], KIND_DRIVER, open(a, "rb").read()) for a in rest]
     for name, _, _ in entries:
         if len(name.encode()) >= NAME:
             sys.exit(f"mkdrivers: name too long: {name}")

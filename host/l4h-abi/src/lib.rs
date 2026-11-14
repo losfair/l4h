@@ -357,8 +357,8 @@ pub const CTL_DRIVER_INFO: u32 = 48;
 pub const CTL_DRIVER_LOAD: u32 = 49;
 /// Test builds: make NIC args[0]'s driver panic (args[1] = 1) or hang (2).
 pub const CTL_NIC_TEST: u32 = 50;
-/// Firmware blob args[0] root has: vals[0] = flags (DRIVER_BOOT) | its
-/// length << 8, data = its name (48 bytes, NUL padded) then SHA-256 (32).
+/// Firmware blob args[0] root has (all of them dom0's): vals[0] = its
+/// length, data = its name (48 bytes, NUL padded) then SHA-256 (32).
 pub const CTL_FIRMWARE_INFO: u32 = 51;
 /// The args[0]th firmware name a bound NIC's driver asks for and root has
 /// no blob of: data = the name (48 bytes, NUL padded).  ENOENT past them,

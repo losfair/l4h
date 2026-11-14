@@ -199,7 +199,7 @@ const USAGE: &str = "usage: l4hctl <command>
   driver list                  NIC drivers: name, origin, SHA-256
   driver load FILE             load a NIC driver image (refused unless the
                                host confines NIC drivers)
-  firmware list                firmware blobs: name, origin, size, SHA-256
+  firmware list                firmware blobs dom0 loaded: name, size, SHA-256
   firmware wanted              firmware the NICs' drivers ask for and the
                                host lacks, a name a line
   firmware load NAME FILE      give the drivers firmware NAME (refused unless
@@ -421,8 +421,7 @@ fn cmd_firmware(ctl: &Ctl, args: &[String]) -> Result<()> {
             for i in 0.. {
                 let Ok(r) = ctl.call(CTL_FIRMWARE_INFO, &[i], &[], &[]) else { break };
                 let sha: String = r.data[FIRMWARE_NAME..FIRMWARE_NAME + 32].iter().map(|b| format!("{b:02x}")).collect();
-                let origin = if r.vals[0] & 1 != 0 { "boot bundle" } else { "loaded" };
-                println!("firmware {i}: {}, {origin}, {} bytes, sha256 {sha}", cstr_at(&r.data[..FIRMWARE_NAME]), r.vals[0] >> 8);
+                println!("firmware {i}: {}, {} bytes, sha256 {sha}", cstr_at(&r.data[..FIRMWARE_NAME]), r.vals[0]);
             }
         }
         Some("wanted") => {

@@ -1694,7 +1694,7 @@ pub fn load_firmware(h: &mut Host, off: u64, len: u64) -> Result<usize, Errno> {
         true
     });
     let blob: &'static [u8] = unsafe { core::slice::from_raw_parts(base as *const u8, len) };
-    let r = match ok.then(|| drivers().add_firmware(name, blob, false)) {
+    let r = match ok.then(|| drivers().add_firmware(name, blob)) {
         Some(Ok(f)) => {
             core::mem::forget(arena);
             unsafe { FIRMWARE_LOADED = k + 1 };

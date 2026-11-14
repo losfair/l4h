@@ -2738,8 +2738,7 @@ root restarts. Root and netd know no device kind. The design is issue
   and runs without it is restarted to take it, like dom0's `nic restart`
   (not counted, no backoff), which drops the link once during boot. A
   driver must run without its firmware, as Linux's do when
-  linux-firmware is missing. The boot bundle may still carry firmware
-  (`tools/mkdrivers.py --firmware`); the build scripts add none.
+  linux-firmware is missing. The driver bundle holds drivers only.
 - **Tests.** `tests/run-nictest.sh` runs two NICs and makes NIC 1's driver
   panic and hang: dom0's uplink on NIC 0 keeps working while root restarts
   it, and NIC 1 is unbound, bound again and NIC 0's driver restarted.
