@@ -141,6 +141,22 @@ pub fn host_op(h: &mut Host, op: u32, a: &[u64; 6], data: &mut [u8; abi::CTL_DAT
             data[16..48].copy_from_slice(&d.sha256);
         }
         abi::CTL_DRIVER_LOAD => vals[0] = crate::nicd::load_driver(h, a[0], a[1])? as u64,
+        abi::CTL_FIRMWARE_INFO => {
+            let f = crate::nicd::drivers().firmware.get(usize::try_from(a[0]).map_err(|_| ENOENT)?).ok_or(ENOENT)?;
+            vals[0] = (f.boot as u64) * abi::DRIVER_BOOT | (f.data.len() as u64) << 8;
+            data[..abi::FIRMWARE_NAME].copy_from_slice(&f.name[..abi::FIRMWARE_NAME]);
+            data[abi::FIRMWARE_NAME..abi::FIRMWARE_NAME + 32].copy_from_slice(&f.sha256);
+        }
+        abi::CTL_FIRMWARE_WANTED => {
+            // None where a load would be refused (load_firmware).
+            let [state, remap, ..] = h.iommu.info();
+            if state != abi::IOMMU_ON || remap == 0 {
+                return Err(ENOENT);
+            }
+            let name = crate::nicd::firmware_wanted(usize::try_from(a[0]).map_err(|_| ENOENT)?).ok_or(ENOENT)?;
+            data[..abi::FIRMWARE_NAME].copy_from_slice(&name);
+        }
+        abi::CTL_FIRMWARE_LOAD => vals[0] = crate::nicd::load_firmware(h, a[0], a[1])? as u64,
         abi::CTL_SWITCH_INFO => {
             let sw = u32::try_from(a[0]).map_err(|_| ENOENT)?;
             if sw >= h.netd.switches {

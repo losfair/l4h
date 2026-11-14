@@ -35,6 +35,28 @@ until mount -t "$rootfstype" -o ro "$root" /newroot; do
     sleep 1
 done
 [ -x /newroot/sbin/init ] || fail 'root has no /sbin/init'
+# NIC firmware from the host's own linux-firmware (l4h carries none):
+# drivers that ask for it restart with it.  Not fatal: they run without,
+# as Linux's do.  The host lists none unless it confines NIC drivers.
+for name in $(l4hctl firmware wanted 2>/dev/null); do
+    loaded=''
+    for dir in /newroot/usr/lib/firmware /newroot/lib/firmware; do
+        file=$dir/$name
+        if [ -f "$file" ]; then
+            l4hctl firmware load "$name" "$file" >/dev/null && loaded=1
+        elif [ -f "$file.xz" ]; then
+            xzcat "$file.xz" > /run/l4h-firmware && l4hctl firmware load "$name" /run/l4h-firmware >/dev/null && loaded=1
+        elif [ -f "$file.zst" ]; then
+            chroot /newroot zstd -dcq -- "${file#/newroot}.zst" > /run/l4h-firmware &&
+                l4hctl firmware load "$name" /run/l4h-firmware >/dev/null && loaded=1
+        else
+            continue
+        fi
+        break
+    done
+    rm -f /run/l4h-firmware
+    [ -n "$loaded" ] || echo "l4h: NIC firmware $name not loaded; its driver runs without" >&2
+done
 # Expose only the running kernel's modules over the existing module tree.
 # /lib may be a symlink to /usr/lib; the installer checks that /usr is on root.
 mount -t erofs -o ro /dev/l4hkmod /newroot/lib/modules || fail 'cannot mount kernel modules'

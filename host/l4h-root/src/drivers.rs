@@ -17,7 +17,10 @@
 //! bundle, a driver whose ELF or manifest does not parse, is skipped and
 //! logged.  dom0 can load more drivers at runtime (CTL_DRIVER_LOAD), into
 //! memory of root's; those are not measured, and are refused unless the
-//! host confines NIC drivers (an IOMMU with interrupt remapping).
+//! host confines NIC drivers (an IOMMU with interrupt remapping).  dom0
+//! loads firmware the same way (CTL_FIRMWARE_LOAD), from its own
+//! /lib/firmware, so that l4h's image need not carry blobs it may not
+//! redistribute; only confined drivers are given it.
 
 use l4h_host::fixed::ArrayVec;
 use l4h_host::nicd::{self, Manifest};
@@ -50,6 +53,9 @@ pub struct Driver {
 pub struct Firmware {
     pub name: [u8; NAME],
     pub data: &'static [u8],
+    pub sha256: [u8; 32],
+    /// From the boot bundle; otherwise dom0 loaded it.
+    pub boot: bool,
 }
 
 pub struct Drivers {
@@ -135,8 +141,8 @@ impl Drivers {
                     }
                 }
                 KIND_FIRMWARE => {
-                    if !name.contains(&0) || self.firmware.push(Firmware { name, data }).is_err() {
-                        log!("l4h-root: driver bundle entry {}: firmware not kept", i);
+                    if let Err(why) = self.add_firmware(name, data, true) {
+                        log!("l4h-root: driver bundle entry {}: firmware not kept: {}", i, why);
                     }
                 }
                 _ => log!("l4h-root: driver bundle entry {}: unknown kind {}", i, kind),
@@ -169,13 +175,31 @@ impl Drivers {
         self.drivers.iter().position(|d| allowed(d) && d.manifest.matching(ids).is_some())
     }
 
-    /// Firmware blob `name` (NUL padded, as a manifest names it).
-    pub fn firmware(&self, name: &[u8; nicd::FIRMWARE_NAME]) -> Option<&'static [u8]> {
-        self.firmware.iter().find(|f| f.name[..nicd::FIRMWARE_NAME] == name[..]).map(|f| f.data)
+    /// Add firmware blob `name` (NUL padded): its index.  A name there
+    /// already is refused.
+    pub fn add_firmware(&mut self, name: [u8; NAME], data: &'static [u8], boot: bool) -> Result<usize, &'static str> {
+        if name[0] == 0 || name[nicd::FIRMWARE_NAME - 1] != 0 || name[nicd::FIRMWARE_NAME..].iter().any(|&b| b != 0) {
+            return Err("its name is empty or too long");
+        }
+        if self.firmware.iter().any(|f| f.name == name) {
+            return Err("a blob of that name is there already");
+        }
+        let sha256: [u8; 32] = Sha256::digest(data).into();
+        self.firmware.push(Firmware { name, data, sha256, boot }).map_err(|_| "too many firmware blobs")?;
+        info!("l4h-root: firmware {} ({}, {} bytes), sha256 {:02x}{:02x}{:02x}{:02x}...", self::name(&name),
+            if boot { "boot bundle" } else { "loaded by dom0" }, data.len(), sha256[0], sha256[1], sha256[2], sha256[3]);
+        Ok(self.firmware.len() - 1)
+    }
+
+    /// Firmware blob `name` (NUL padded, as a manifest names it), for a
+    /// driver that is `confined` or not: one dom0 loaded only for a
+    /// confined one, as dom0's drivers run only confined.
+    pub fn firmware(&self, name: &[u8; nicd::FIRMWARE_NAME], confined: bool) -> Option<&'static [u8]> {
+        self.firmware.iter().find(|f| f.name[..nicd::FIRMWARE_NAME] == name[..] && (f.boot || confined)).map(|f| f.data)
     }
 }
 
-const _: () = assert!(nicd::FIRMWARE_NAME <= NAME);
+const _: () = assert!(nicd::FIRMWARE_NAME <= NAME && l4h_abi::FIRMWARE_NAME == nicd::FIRMWARE_NAME);
 
 /// A NUL-padded name, for the log.
 pub fn name(n: &[u8]) -> &str {

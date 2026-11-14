@@ -714,7 +714,8 @@ fn spawn(h: &mut Host, i: usize) -> Result<(), &'static str> {
     reset_channel(h, i);
     let dma_bits = m.dma_bits as usize;
     let dma = 1usize << dma_bits;
-    let image = (1usize << m.image_max_bits) + m.firmware.iter().filter_map(|f| drivers().firmware(f)).map(|b| b.len()).sum::<usize>();
+    let confined = nics()[i].confined;
+    let image = (1usize << m.image_max_bits) + m.firmware.iter().filter_map(|f| drivers().firmware(f, confined)).map(|b| b.len()).sum::<usize>();
     // The image, its keep CNode (a slot a page of every mapping) and page
     // tables, a lot of each for the BAR windows.
     let maps = bars_for(&nics()[i].pci, &m).map_or(0, |b| bar_pages(&windowed(&nics()[i].pci, &m), b)) + dma / PAGE;
@@ -787,12 +788,12 @@ fn spawn(h: &mut Host, i: usize) -> Result<(), &'static str> {
             if name[0] == 0 {
                 continue;
             }
-            match drivers().firmware(name) {
+            match drivers().firmware(name, nics()[i].confined) {
                 Some(b) if b.len() <= nicd::FIRMWARE_MAX => {
                     blobs[k] = Some(b);
                     cfg.firmware[k] = host::blk::PciRegion { va: nicd::firmware_va(k) as u64, len: b.len() as u64 };
                 }
-                _ => log!("l4h-root: nic {}: no firmware {} in the bundle", i, crate::drivers::name(name)),
+                _ => log!("l4h-root: nic {}: no firmware {} (dom0 may load it)", i, crate::drivers::name(name)),
             }
         }
         let msix = pdev.msix.unwrap();
@@ -1626,6 +1627,99 @@ pub fn load_driver(h: &mut Host, off: u64, len: u64) -> Result<usize, Errno> {
             Err(if ok { ctl::EINVAL } else { ctl::ENOMEM })
         }
     }
+}
+
+/// Firmware blobs dom0 loaded, in FIRMWARE_IMAGES slots.
+static mut FIRMWARE_LOADED: usize = 0;
+
+/// CTL_FIRMWARE_WANTED: the `k`th name, NUL padded, that the driver of a
+/// bound NIC names in its manifest and that root has no blob of, for dom0
+/// to load (each once).
+pub fn firmware_wanted(k: usize) -> Option<[u8; nicd::FIRMWARE_NAME]> {
+    let mut seen: ArrayVec<[u8; nicd::FIRMWARE_NAME], { MAX_NICS * nicd::MAX_FIRMWARE }> = ArrayVec::new();
+    for n in nics().iter() {
+        let Some(d) = n.driver else { continue };
+        for name in drivers().drivers[d].manifest.firmware.iter() {
+            if name[0] != 0 && drivers().firmware(name, true).is_none() && !seen.contains(name) {
+                seen.must_push(*name);
+            }
+        }
+    }
+    seen.get(k).copied()
+}
+
+/// CTL_FIRMWARE_LOAD: a firmware blob from dom0's control data area at
+/// `off`, `len` bytes: its name (FIRMWARE_NAME bytes, NUL padded), then
+/// its bytes, copied into root's memory as load_driver copies a driver,
+/// and added: its index.  Refused unless the host confines NIC drivers,
+/// for the same reasons, and given only to confined drivers
+/// (Drivers::firmware).  The nicds of drivers that name it, running
+/// without it, are restarted to take it.
+pub fn load_firmware(h: &mut Host, off: u64, len: u64) -> Result<usize, Errno> {
+    let [state, remap, ..] = h.iommu.info();
+    if state != abi::IOMMU_ON || remap == 0 {
+        return Err(ctl::EPERM);
+    }
+    let total = usize::try_from(len).ok().filter(|&l| l > nicd::FIRMWARE_NAME && l as u64 <= abi::CTL_LOAD_MAX).ok_or(ctl::EINVAL)?;
+    let off = usize::try_from(off).ok().filter(|&o| o.checked_add(total).is_some_and(|e| e as u64 <= abi::CTL_LOAD_MAX)).ok_or(ctl::EINVAL)?;
+    // Copied out first: dom0 could change its own.
+    let mut name = [0u8; crate::drivers::NAME];
+    unsafe { core::ptr::copy_nonoverlapping((crate::vmmgr::CTL_DATA_VA + off) as *const u8, name.as_mut_ptr(), nicd::FIRMWARE_NAME) };
+    if drivers().firmware.iter().any(|f| f.name == name) {
+        return Err(ctl::EEXIST);
+    }
+    let (off, len) = (off + nicd::FIRMWARE_NAME, total - nicd::FIRMWARE_NAME);
+    let k = unsafe { FIRMWARE_LOADED };
+    if k >= crate::drivers::MAX_FIRMWARE || drivers().firmware.is_full() {
+        return Err(ctl::ENOSPC);
+    }
+    let pages = len.div_ceil(PAGE);
+    if !h.can_afford(pages * PAGE + (1 << 20), 0, pages + 8) {
+        return Err(ctl::ENOMEM);
+    }
+    let base = crate::layout::FIRMWARE_IMAGES.base + k * abi::CTL_LOAD_MAX as usize;
+    let mut arena = h.alloc.global(|alloc| alloc.arena(pages * PAGE + PAGE)).ok_or(ctl::ENOMEM)?;
+    let wins = &mut h.wins;
+    let ok = h.alloc.global(|alloc| {
+        for p in 0..pages {
+            let Some(s) = arena.try_object(alloc, FRAME_BP) else { return false };
+            let f = root_cap::<cap_type::Granule>(s);
+            crate::vspace::map_frame(&mut crate::mem::ObjCtx::global(alloc), sel4::init_thread::slot::VSPACE.cap(), f,
+                base + p * PAGE, CapRights::read_only(), VmAttributes::DEFAULT);
+            let n = (len - p * PAGE).min(PAGE);
+            wins.a.with_frame(&abs_of(f), |dst| unsafe {
+                core::ptr::copy_nonoverlapping((crate::vmmgr::CTL_DATA_VA + off + p * PAGE) as *const u8, dst, n)
+            });
+        }
+        true
+    });
+    let blob: &'static [u8] = unsafe { core::slice::from_raw_parts(base as *const u8, len) };
+    let r = match ok.then(|| drivers().add_firmware(name, blob, false)) {
+        Some(Ok(f)) => {
+            core::mem::forget(arena);
+            unsafe { FIRMWARE_LOADED = k + 1 };
+            f
+        }
+        r => {
+            if let Some(Err(why)) = r {
+                log!("l4h-root: firmware from dom0 refused: {}", why);
+            }
+            h.alloc.global(|alloc| alloc.release(arena));
+            return Err(if ok { ctl::EINVAL } else { ctl::ENOMEM });
+        }
+    };
+    // Its drivers' instances started without it: restart them (as dom0's
+    // `nic restart`: not counted, no backoff).  Unconfined ones are not
+    // given it, and keep running.
+    for i in 0..nics().len() {
+        let n = &nics()[i];
+        let names = n.driver.is_some_and(|d| drivers().drivers[d].manifest.firmware.iter().any(|f| f[..] == name[..nicd::FIRMWARE_NAME]));
+        if names && n.confined && matches!(n.state, State::Starting | State::Up) {
+            nics()[i].manual = true;
+            kill(h, i, Then::Restart, "dom0 loaded its firmware");
+        }
+    }
+    Ok(r)
 }
 
 /// The owner CTL_PCI_LIST reports for function `bdf`, if it is a NIC.

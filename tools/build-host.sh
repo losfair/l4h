@@ -35,9 +35,6 @@ drivers=()
 for d in "${nicds[@]}"; do drivers+=("$out/stripped/l4h-nicd-$d.elf"); done
 # shellcheck disable=SC2206
 drivers+=(${L4H_EXTRA_DRIVERS:-})
-# Firmware blobs the drivers may ask for: $L4H_NIC_FIRMWARE, NAME=FILE
-# words (e.g. rtl_nic/rtl8125b-2.fw=/lib/firmware/rtl_nic/rtl8125b-2.fw).
-for fw in ${L4H_NIC_FIRMWARE:-}; do drivers+=(--firmware "$fw"); done
 python3 "$root/tools/mkdrivers.py" "$out/stripped/l4h-drivers.bin.new" "${drivers[@]}"
 cmp -s "$out/stripped/l4h-drivers.bin.new" "$out/stripped/l4h-drivers.bin" \
     && rm "$out/stripped/l4h-drivers.bin.new" || mv "$out/stripped/l4h-drivers.bin.new" "$out/stripped/l4h-drivers.bin"

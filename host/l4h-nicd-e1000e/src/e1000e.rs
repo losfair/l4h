@@ -32,7 +32,12 @@ pub const MANIFEST: crate::sdk::Manifest = crate::sdk::Manifest {
     flags: crate::sdk::nicd::F_TIMER,
     // 82574L, 82583V.
     ..crate::sdk::Manifest::empty().with_name("e1000e").with_matches(&[crate::sdk::PciMatch::id(0x8086, 0x10d3), crate::sdk::PciMatch::id(0x8086, 0x150c)])
+        .with_firmware(if host::TEST_INJECT { &[TEST_FIRMWARE] } else { &[] })
 };
+
+/// Test builds: a firmware name for tests/run-nicfwtest.sh, which dom0
+/// loads; the driver only reports what it was given.
+const TEST_FIRMWARE: &str = "l4h-test/e1000e.fw";
 
 const HDR: usize = net::HDR_SIZE;
 
@@ -218,6 +223,12 @@ impl E1000e {
     pub fn new(hw: &Hw) -> Self {
         let (c, tsc_hz) = (hw.config, hw.tsc_hz);
         let n = c.uplink as usize;
+        if host::TEST_INJECT {
+            let f = c.firmware[0];
+            let sum = (f.len != 0).then(|| unsafe { core::slice::from_raw_parts(f.va as *const u8, f.len as usize) })
+                .map_or(0u32, |b| b.iter().map(|&x| x as u32).sum());
+            l4h_rt::info!("nicd {}: test firmware {}: {} bytes, byte sum {}", n, TEST_FIRMWARE, f.len, sum);
+        }
         let regs = Mmio(c.bars[0].va as usize);
         let wait_us = |us: u64| {
             let end = host::ticks::now() + us * tsc_hz / 1_000_000;

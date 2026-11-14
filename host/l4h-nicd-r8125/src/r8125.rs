@@ -13,8 +13,8 @@
 //! frames take in order and give back as the chip completes them.
 //!
 //! Bring-up follows Linux's probe and open: the MAC's own init, a MAC
-//! reset, the PHY's parameters (with the chip's PHY firmware patch, if the
-//! bundle has it), a PHY reset, the MAC start sequence, then
+//! reset, the PHY's parameters (with the chip's PHY firmware patch, if
+//! dom0 loaded it from the host's linux-firmware), a PHY reset, the MAC start sequence, then
 //! autonegotiation advertising 10 to 2500 Mb/s with pause.  The chips
 //! differ in register values along the way, as Linux has them per
 //! mac_version.  The PHY is reached through the GPHY OCP window
@@ -54,8 +54,8 @@ use l4h_virtio::{Mmio, dma_fence};
 use crate::sdk::offload;
 
 /// The PHY firmware patches Linux applies, from linux-firmware, by
-/// Chip::of's index, if the driver bundle has them (Linux works without,
-/// with a warning).
+/// Chip::of's index, if root has them: dom0 loads them from the host's
+/// /lib/firmware, as l4h ships none (Linux works without, with a warning).
 const FIRMWARE: [&str; 5] =
     ["rtl_nic/rtl8125a-3.fw", "rtl_nic/rtl8125b-2.fw", "rtl_nic/rtl8125d-1.fw", "rtl_nic/rtl8125d-2.fw", "rtl_nic/rtl8125bp-2.fw"];
 

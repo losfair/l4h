@@ -102,6 +102,9 @@ regions! {
     /// NIC driver images dom0 loaded (nicd.rs, CTL_DRIVER_LOAD), one
     /// CTL_LOAD_MAX slot each.
     DRIVER_IMAGES = 0x7b00_0000_0000, crate::drivers::MAX_DRIVERS * l4h_abi::CTL_LOAD_MAX as usize;
+    /// Firmware blobs dom0 loaded (nicd.rs, CTL_FIRMWARE_LOAD), one
+    /// CTL_LOAD_MAX slot each.
+    FIRMWARE_IMAGES = 0x7c00_0000_0000, crate::drivers::MAX_FIRMWARE * l4h_abi::CTL_LOAD_MAX as usize;
     /// The drivers' mailboxes, netd's then each disk and xHCI
     /// controller's, then the nicds' (mailbox.rs).
     MAILBOXES = 0x7a00_0000_0000, crate::mailbox::MAILBOXES * l4h_host::mailbox::MAILBOX_PAGES * PAGE;

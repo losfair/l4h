@@ -15,7 +15,7 @@
 //!    causes share MSI-X entry 0).
 //!
 //! --firmware FILE gives the driver the PHY patch (rtl_nic/rtl8125b-2.fw,
-//! uncompressed), as root gives it from the driver bundle.
+//! uncompressed), as root gives it once dom0 has loaded it.
 //!
 //! Usage (root): r8125-vfio PCI-ADDRESS OUR-IP GATEWAY-IP [--offload] [--firmware FILE]
 //! e.g. r8125-vfio 0000:05:00.0 192.168.1.50 192.168.1.1 --offload

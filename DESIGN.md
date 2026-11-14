@@ -2548,9 +2548,10 @@ parameters, a PHY reset, the MAC start sequence, then autonegotiation
 advertising 10 Mb/s to 2.5 Gb/s with pause; EEE stays at the PHY's default.
 The PHY is reached through the chip's GPHY OCP window. Where Linux
 does, the driver runs the chip's PHY firmware patch from linux-firmware
-(`rtl_nic/rtl8125*.fw`) when the driver bundle has it
-(`L4H_NIC_FIRMWARE=rtl_nic/rtl8125b-2.fw=FILE` for `tools/build-host.sh`).
-It checks the program's jumps first and bounds its steps. Without the
+(`rtl_nic/rtl8125*.fw`) when it is given it. l4h ships no firmware:
+dom0 loads it from the host's own `/lib/firmware` (Firmware below), on
+hosts that confine NIC drivers. It checks the program's jumps first and
+bounds its steps. Without the
 patch it goes on, as Linux does. The chip's ASPM and clock requests stay
 off. The driver turns the link's L1 off through Link Control, which
 Linux also does unless the system vendor marked ASPM safe.
@@ -2717,16 +2718,39 @@ root restarts. Root and netd know no device kind. The design is issue
   no reset stopped reaches only it) and the uplink's switch stay; a later instance must offer the
   same MAC, which root checks (unicast, unique) before dom0's uplink port
   takes it.
-- **Control API.** `l4hctl nic list|bind|unbind|restart|ctl` and `l4hctl
-  driver list|load`. A driver dom0 loads (CTL_DRIVER_LOAD) is copied into
-  root's memory and checked as the bundle's; it is refused unless drivers
-  are confined.
+- **Control API.** `l4hctl nic list|bind|unbind|restart|ctl`, `l4hctl
+  driver list|load` and `l4hctl firmware list|wanted|load`. A driver dom0
+  loads (CTL_DRIVER_LOAD) is copied into root's memory and checked as the
+  bundle's; it is refused unless drivers are confined. The l4hctl kernel
+  driver copies those requests' bytes (and `nic ctl`'s) into the control
+  data area.
+- **Firmware.** l4h's image carries no firmware: blobs such as Realtek's
+  PHY patches are not ours to redistribute. dom0's initrd loads what the
+  bound NICs' drivers name (CTL_FIRMWARE_WANTED) from the host's
+  `/usr/lib/firmware` or `/lib/firmware`, plain, `.xz` (BusyBox) or `.zst`
+  (the host's `zstd`), before it switches to the host's root
+  (`tools/install/init`). Root copies each blob into its memory, logs its
+  SHA-256 and refuses names it has (CTL_FIRMWARE_LOAD). As with dom0's
+  drivers, root refuses the load unless the host confines NIC drivers
+  (and then lists none as wanted). It gives a loaded blob only to confined
+  drivers: the blob is not in the measured boot image, and a PHY program
+  writes the NIC's microcontroller. A confined driver that names the blob
+  and runs without it is restarted to take it, like dom0's `nic restart`
+  (not counted, no backoff), which drops the link once during boot. A
+  driver must run without its firmware, as Linux's do when
+  linux-firmware is missing. The boot bundle may still carry firmware
+  (`tools/mkdrivers.py --firmware`); the build scripts add none.
 - **Tests.** `tests/run-nictest.sh` runs two NICs and makes NIC 1's driver
   panic and hang: dom0's uplink on NIC 0 keeps working while root restarts
   it, and NIC 1 is unbound, bound again and NIC 0's driver restarted.
+  `tests/run-nicfwtest.sh`'s test build has the e1000e driver name a
+  firmware. With an IOMMU, dom0 is told it is wanted and loads it; a
+  second load and a path-like name are refused, and the restarted driver
+  reports exactly the bytes loaded. Without an IOMMU nothing is wanted,
+  the load is refused, and the driver runs without it.
 - **Not yet.** Zero-copy TX (the channel's TX area in the device's IOMMU
-  domain), multiqueue, measuring dom0-loaded drivers into the attestation
-  event log, and isolation groups and confinement on aarch64 (which has no
+  domain), multiqueue, measuring dom0-loaded drivers and firmware into
+  the attestation event log, and isolation groups and confinement on aarch64 (which has no
   IOMMU support).
 
 ### 9.4 Console and other devices

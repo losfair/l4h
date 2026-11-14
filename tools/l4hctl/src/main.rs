@@ -199,6 +199,12 @@ const USAGE: &str = "usage: l4hctl <command>
   driver list                  NIC drivers: name, origin, SHA-256
   driver load FILE             load a NIC driver image (refused unless the
                                host confines NIC drivers)
+  firmware list                firmware blobs: name, origin, size, SHA-256
+  firmware wanted              firmware the NICs' drivers ask for and the
+                               host lacks, a name a line
+  firmware load NAME FILE      give the drivers firmware NAME (refused unless
+                               the host confines NIC drivers; drivers that
+                               ask for it restart)
   switch-create                create an L2 switch; prints its id
   uplink SWITCH NIC            make host NIC the uplink of SWITCH
   switch SWITCH                ports and counters of SWITCH
@@ -396,6 +402,60 @@ fn cmd_nic(ctl: &Ctl, args: &[String]) -> Result<()> {
             println!("{out}");
         }
         _ => return err("nic list | nic bind NIC [DRIVER] | nic unbind NIC | nic restart NIC | nic ctl NIC HEX"),
+    }
+    Ok(())
+}
+
+/// A firmware name as dom0 may look it up under /lib/firmware: no empty,
+/// `.` or `..` component, no absolute path, plain characters.
+fn firmware_name_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() < FIRMWARE_NAME
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-+/".contains(&b))
+        && name.split('/').all(|c| !c.is_empty() && c != "." && c != "..")
+}
+
+fn cmd_firmware(ctl: &Ctl, args: &[String]) -> Result<()> {
+    match args.first().map(String::as_str) {
+        Some("list") => {
+            for i in 0.. {
+                let Ok(r) = ctl.call(CTL_FIRMWARE_INFO, &[i], &[], &[]) else { break };
+                let sha: String = r.data[FIRMWARE_NAME..FIRMWARE_NAME + 32].iter().map(|b| format!("{b:02x}")).collect();
+                let origin = if r.vals[0] & 1 != 0 { "boot bundle" } else { "loaded" };
+                println!("firmware {i}: {}, {origin}, {} bytes, sha256 {sha}", cstr_at(&r.data[..FIRMWARE_NAME]), r.vals[0] >> 8);
+            }
+        }
+        Some("wanted") => {
+            for i in 0.. {
+                let Ok(r) = ctl.call(CTL_FIRMWARE_WANTED, &[i], &[], &[]) else { break };
+                let name = cstr_at(&r.data[..FIRMWARE_NAME]);
+                // The name comes from a driver's manifest: dom0 opens it as
+                // a path, so only plain ones are printed.
+                if firmware_name_ok(name) {
+                    println!("{name}");
+                } else {
+                    eprintln!("l4hctl: firmware name {name:?} skipped: not a plain path");
+                }
+            }
+        }
+        Some("load") => {
+            let (Some(name), Some(path)) = (args.get(1), args.get(2)) else {
+                return err("firmware load: NAME FILE");
+            };
+            if !firmware_name_ok(name) {
+                return err(format!("firmware load: {name:?} is not a firmware name"));
+            }
+            let blob = std::fs::read(path).map_err(|e| Error(format!("{path}: {e}")))?;
+            if blob.is_empty() || FIRMWARE_NAME + blob.len() > CTL_LOAD_MAX {
+                return err(format!("{path}: empty, or larger than {} bytes", CTL_LOAD_MAX - FIRMWARE_NAME));
+            }
+            let mut buf = vec![0u8; FIRMWARE_NAME];
+            buf[..name.len()].copy_from_slice(name.as_bytes());
+            buf.extend_from_slice(&blob);
+            let r = ctl.call(CTL_FIRMWARE_LOAD, &[0, buf.len() as u64], &[], &buf)?;
+            println!("{}", r.vals[0]);
+        }
+        _ => return err("firmware list | firmware wanted | firmware load NAME FILE"),
     }
     Ok(())
 }
@@ -857,6 +917,7 @@ fn run(args: &[String]) -> Result<i32> {
         "nics" => cmd_nic(&ctl, &["list".to_string()])?,
         "nic" => cmd_nic(&ctl, &args[1..])?,
         "driver" => cmd_driver(&ctl, &args[1..])?,
+        "firmware" => cmd_firmware(&ctl, &args[1..])?,
         "switch-create" => {
             println!("{}", ctl.call(CTL_SWITCH_CREATE, &[], &[], &[])?.vals[0]);
         }
@@ -1030,6 +1091,22 @@ fn main() {
         Err(Error(e)) => {
             eprintln!("l4hctl: {e}");
             exit(1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::firmware_name_ok;
+
+    #[test]
+    fn firmware_names_are_plain_paths() {
+        for ok in ["rtl_nic/rtl8125b-2.fw", "l4h-test/e1000e.fw", "a+b.bin"] {
+            assert!(firmware_name_ok(ok), "{ok}");
+        }
+        let long = "a".repeat(48);
+        for bad in ["", "/etc/shadow", "../x", "rtl_nic/../../x", "a//b", "./a", "a/", "a b", "a\nb", &long] {
+            assert!(!firmware_name_ok(bad), "{bad:?}");
         }
     }
 }

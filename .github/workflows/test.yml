@@ -180,6 +180,8 @@ jobs:
         run: tests/run-nictest.sh && L4H_QEMU_IOMMU=intel tests/run-nictest.sh
       - name: Intel 82574L driver, confined behind the Intel and AMD IOMMUs
         run: tests/run-e1000etest.sh && L4H_QEMU_IOMMU=intel tests/run-e1000etest.sh && L4H_QEMU_IOMMU=amd tests/run-e1000etest.sh
+      - name: NIC firmware loaded by dom0 (confined drivers only)
+        run: tests/run-nicfwtest.sh && L4H_QEMU_IOMMU=intel tests/run-nicfwtest.sh
       - name: Intel VT-d DMA and interrupt remapping
         run: tests/run-vtdtest.sh --qemu
       - name: Partition message rings
