@@ -3933,7 +3933,7 @@ none. dom0 runs no host hardware drivers.
 
 | Area | Operations |
 |------|------------|
-| Host | `host_version` (the build version; the tag for a release); `host_info` (cores, free/total bytes, disk, VM and NIC counts); `pci_list` (boot inventory, IDs, class and service owner); `host_reboot`; `rtc_set`; `iommu_info` (§9.5); `log_read` (§10) |
+| Host | `host_version` (build version and seL4/FL4 kernel); `host_info` (cores, free/total bytes, disk, VM and NIC counts); `pci_list` (boot inventory, IDs, class and service owner); `host_reboot`; `rtc_set`; `iommu_info` (§9.5); `log_read` (§10) |
 | Guests | `vm_create`, `vm_load`, `vm_start`, `vm_shutdown`, `vm_destroy`, `vm_list`, `vm_info` (cores of the first six vCPUs), `vm_stats` (CPU use and cap), `vm_set_sched`, `vm_set_mem`, `vm_mem_info` (§8.5), `vm_trust` (flags, §10.2) |
 | Block | `blk_attach` (disk, read-only and volatile flags, LBA window), `blk_write` (provisioning), `blk_info`, `disk_info` |
 | Network | `switch_create`, `switch_attach_uplink`, `nic_create` (MAC, MAC lock, isolation), `switch_info` (ports with VM and MAC, counters), `nic_info` (PCI address, switch, MAC) |
@@ -4798,7 +4798,10 @@ injects these failures in a host built with `L4H_TEST_INJECT=1`;
   No aarch64 binaries are published.
 - **Version.** Host builds use `L4H_VERSION` when set, otherwise `git
   describe --tags --match 'v*' --always --dirty`, or `unknown` without Git
-  metadata; release builds set it to the tag. `l4hctl version` reports it.
+  metadata; release builds set it to the tag. `l4hctl version` appends the
+  kernel selected by `SEL4_PREFIX`: `v2026.10.1 (seL4)` or
+  `v2026.10.1 (FL4)`. The installed `fl4-revision` identifies FL4;
+  the release tag itself stays unchanged.
 
 ### 11.1 Targets
 
@@ -5558,7 +5561,7 @@ Inside dom0, `l4hctl` with no arguments prints the control commands, for
 example:
 
 ```sh
-l4hctl version                       # running host's version, e.g. v2026.10.1
+l4hctl version                       # e.g. v2026.10.1 (seL4) or v2026.10.1 (FL4)
 l4hctl logs --follow                 # retained host diagnostics and VM stop reasons
 l4hctl create web --initrd /web.cpio.gz --mem 512 --vcpus 2 \
     --disk 0 --nic 0
@@ -5566,7 +5569,7 @@ l4hctl console 1 --follow
 ```
 
 When building `l4h-root` directly with Cargo, set `L4H_VERSION` explicitly;
-without it the host reports `unknown`.
+without it the host reports `unknown (seL4)` or `unknown (FL4)`.
 
 **Test environment.** The development machine has KVM, which QEMU uses
 only as a fast CPU to mimic a cloud VM: `-cpu host,-vmx,-svm -smp 4`, with

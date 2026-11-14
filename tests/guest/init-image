@@ -5,6 +5,7 @@ mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
 echo "IMAGETEST: dom0 up"
 echo "IMAGETEST: cmdline $(cat /proc/cmdline)"
+echo "IMAGETEST: version $(l4hctl version)"
 l4hctl info
 l4hctl disks
 l4hctl nics

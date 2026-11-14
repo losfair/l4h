@@ -904,7 +904,7 @@ impl IommuInfo {
 }
 
 impl Ctl {
-    /// The running host's build version; an error from a host that predates the call.
+    /// The running host's build version and kernel (seL4/FL4); an error from a host that predates the call.
     pub fn host_version(&self) -> Result<String> {
         let r = self.call(CTL_HOST_VERSION, &[], &[], &[])?;
         if r.vals[0] > CTL_DATA_MAX as u64 {

@@ -43,4 +43,23 @@ L4H_VERSION=v2026.10.1 check v2026.10.1
 git worktree add -q --detach "$tmp/worktree" HEAD
 version=$tmp/worktree/tools/version.sh
 check v2026.10.2
+
+# The control API adds the kernel from the selected installed prefix,
+# independently of the release tag or checkout location.
+mkdir -p "$tmp/host-out" "$tmp/prefix/libsel4/include/sel4"
+touch "$tmp/prefix/libsel4/include/sel4/config.h"
+rustc +stable --edition=2024 "$root/host/l4h-vmmgr/build.rs" -o "$tmp/host-build"
+check_host_version() {
+    local actual
+    actual=$(env -u L4H_VMM_ELF OUT_DIR="$tmp/host-out" SEL4_PREFIX="$tmp/prefix" "$tmp/host-build")
+    grep -Fxq "cargo:rustc-env=L4H_HOST_VERSION=$1" <<<"$actual" \
+        || { echo "VERSIONTEST: missing host version $1 in $actual" >&2; exit 1; }
+}
+check_host_version 'unknown (seL4)'
+L4H_VERSION=v2026.10.1 check_host_version 'v2026.10.1 (seL4)'
+printf '%s\n' frozen-fl4-revision >"$tmp/prefix/fl4-revision"
+check_host_version 'unknown (FL4)'
+L4H_VERSION= check_host_version 'unknown (FL4)'
+L4H_VERSION=v2026.10.1 check_host_version 'v2026.10.1 (FL4)'
+L4H_VERSION=v2026.10.2-dirty check_host_version 'v2026.10.2-dirty (FL4)'
 echo 'VERSIONTEST: PASS'

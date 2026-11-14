@@ -42,3 +42,6 @@ grep -aE "IMAGETEST|module '|l4h-kmod|disk [0-9]|nic [0-9]|memory:|cores:|l4h-ro
 grep -aq "l4h-kmod: module tree" "$log"
 grep -aq "IMAGETEST: cmdline .*imagetest=esp" "$log"
 grep -aq "IMAGETEST: network ok" "$log"
+kernel=seL4
+if grep -aq 'FL4: seL4 17.0 (MCS) API kernel' "$log"; then kernel=FL4; fi
+grep -aEq "IMAGETEST: version .+ \\($kernel\\)" "$log"

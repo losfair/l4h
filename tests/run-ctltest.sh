@@ -12,7 +12,11 @@ mkdir -p "$out/ctlroot"
 "$root/tools/build-l4hctl.sh"
 "$root/tests/build-flagstest.sh"
 export L4H_VERSION=$("$root/tools/version.sh")
-printf '%s\n' "$L4H_VERSION" > "$out/host-version"
+prefix=${SEL4_PREFIX:-$root/build/sel4}
+[ "${L4H_ARCH:-x86_64}" != aarch64 ] || prefix=$root/build/sel4-aarch64
+kernel=seL4
+[ ! -f "$prefix/fl4-revision" ] || kernel=FL4
+printf '%s (%s)\n' "$L4H_VERSION" "$kernel" > "$out/host-version"
 "$root/tools/mkinitramfs.sh" "$out/vm.cpio.gz" "$root/tests/guest/init-vm" >/dev/null
 rm -rf "$out/ctlroot"/* && mkdir -p "$out/ctlroot"
 cp "$out/vm.cpio.gz" "$out/ctlroot/"

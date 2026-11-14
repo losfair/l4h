@@ -1178,9 +1178,11 @@ does not survive a host reboot. Use \cmd{l4hctl console VM} for Linux console
 output and panic details. Querying host logs requires dom0 and its manager
 to be working; seL4's own debug output remains on the host serial console.
 
+The host version includes the selected kernel, \texttt{(seL4)} or
+\texttt{(FL4)}, after the release tag or development revision.
 \begin{lstlisting}
 # l4hctl version
-v2026.10.1
+v2026.10.1 (seL4)
 # l4hctl info
 cores:  4
 memory: 2950 MiB free of 3968 MiB
