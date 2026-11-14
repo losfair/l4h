@@ -194,6 +194,15 @@ pub fn host_op(h: &mut Host, op: u32, a: &[u64; 6], data: &mut [u8; abi::CTL_DAT
             vals[0] = h.netd.steer_set(ep, a[1], (a[2], a[3]), a[4])? as u64;
         }
         abi::CTL_STEER_DEL => h.netd.steer_del(a[0].try_into().map_err(|_| ENOENT)?)?,
+        abi::CTL_IP_ADD => h.netd.ip_add(a[0].try_into().map_err(|_| ENOENT)?, (a[1], a[2], a[3]))?,
+        abi::CTL_IP_DEL => h.netd.ip_del(a[0].try_into().map_err(|_| ENOENT)?, (a[1], a[2], a[3]))?,
+        abi::CTL_IP_LIST => {
+            let p = usize::try_from(a[0]).map_err(|_| ENOENT)?;
+            let port = h.netd.ports.get(p).and_then(|p| p.as_ref()).ok_or(ENOENT)?;
+            let ips = port.ips.iter().flatten().map(|&(prefix, ip_hi, ip_lo)| abi::CtlIp { prefix, ip_hi, ip_lo });
+            vals[0] = put_list(data, ips) as u64;
+            vals[1] = port.ip_filter as u64;
+        }
         abi::CTL_STEER_LIST => {
             let first = usize::try_from(a[0]).unwrap_or(usize::MAX);
             let mut rules = [abi::CtlSteer::default(); abi::CTL_DATA_MAX / core::mem::size_of::<abi::CtlSteer>()];

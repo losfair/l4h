@@ -145,6 +145,18 @@ pub const fn nic_mac_ok(mac: u64) -> bool {
     mac >> 48 == 0 && mac >> 40 & 1 == 0
 }
 
+/// The abi::NIC_* flags a vNIC can be created with.
+pub const NIC_FLAGS: u64 = l4h_abi::NIC_NO_MAC_LOCK | l4h_abi::NIC_ISOLATED | l4h_abi::NIC_IP_FILTER;
+
+/// Whether a vNIC can be created with `flags`: known ones, and no L3
+/// filter without the MAC lock, whose frames could take another port's MAC
+/// (and with it its traffic, and the MAC the filter's ARP and Neighbor
+/// Discovery checks compare with).
+pub const fn nic_flags_ok(flags: u64) -> bool {
+    use l4h_abi::{NIC_IP_FILTER, NIC_NO_MAC_LOCK};
+    flags & !NIC_FLAGS == 0 && flags & (NIC_IP_FILTER | NIC_NO_MAC_LOCK) != NIC_IP_FILTER | NIC_NO_MAC_LOCK
+}
+
 /// A guest as vmmgr reports it to root (for the dashboard and the
 /// monitor), under a sequence count: odd while it is being written.
 #[repr(C)]
@@ -267,5 +279,16 @@ mod tests {
         assert!(!nic_mac_ok(1 << 48));
         assert!(!nic_mac_ok(0x1_0200_0000_0001));
         assert!(!nic_mac_ok(u64::MAX));
+    }
+
+    #[test]
+    fn nic_flags() {
+        use l4h_abi::{NIC_IP_FILTER, NIC_ISOLATED, NIC_NO_MAC_LOCK};
+        assert!(nic_flags_ok(0));
+        assert!(nic_flags_ok(NIC_NO_MAC_LOCK | NIC_ISOLATED));
+        assert!(nic_flags_ok(NIC_IP_FILTER | NIC_ISOLATED));
+        // The filter's checks trust the MAC lock.
+        assert!(!nic_flags_ok(NIC_IP_FILTER | NIC_NO_MAC_LOCK));
+        assert!(!nic_flags_ok(1 << 3));
     }
 }

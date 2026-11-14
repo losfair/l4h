@@ -460,8 +460,8 @@ impl root_call::Server for Calls<'_> {
         disk_attach(self.0, guest, disk, flags, lba_start, lba_count, n, list)
     }
 
-    fn nic_add(&mut self, _: Sender, guest: usize, switch: u32, mac: u64, lock: bool, isolated: bool) -> Result<u64, Errno> {
-        nic_add(self.0, guest, switch, mac, lock, isolated)
+    fn nic_add(&mut self, _: Sender, guest: usize, switch: u32, mac: u64, flags: u64) -> Result<u64, Errno> {
+        nic_add(self.0, guest, switch, mac, flags)
     }
 
     fn trust_register(&mut self, _: Sender, guest: usize, ram: u64, vcpus: u32, launch: [u64; 4]) -> Result<(), Errno> {
@@ -918,11 +918,11 @@ fn disk_attach(h: &mut Host, id: usize, disk: usize, flags: u64, lba_start: u64,
 }
 
 /// `nic_add`: a port of `switch` for the guest.  Returns the MAC.
-fn nic_add(h: &mut Host, id: usize, switch: u32, mac: u64, lock: bool, isolated: bool) -> Result<u64, Errno> {
+fn nic_add(h: &mut Host, id: usize, switch: u32, mac: u64, flags: u64) -> Result<u64, Errno> {
     let id = guest_arg(id)?;
-    // 48 bits, unicast; 0 asks root for one (the check vmmgr makes before
+    // 48 bits, unicast; 0 asks root for one (the checks vmmgr makes before
     // it allocates for the port).
-    if !l4h_host::vmmgr::nic_mac_ok(mac) {
+    if !l4h_host::vmmgr::nic_mac_ok(mac) || !l4h_host::vmmgr::nic_flags_ok(flags) {
         return Err(ctl::EINVAL);
     }
     // As DiskAttach and UsbAttach with a failed driver: a port netd never
@@ -947,7 +947,7 @@ fn nic_add(h: &mut Host, id: usize, switch: u32, mac: u64, lock: bool, isolated:
         let mac = if mac == 0 { 0x02_4c_34_00_00_00 | part << 16 | ((id as u64) << 8) | p as u64 } else { mac };
         h.netd.give_port_done(p, g, &h.pci)?;
         let memory = crate::netd::Netd::port_memory(&mut h.alloc).inspect_err(|_| h.netd.take_port_done(p))?;
-        let (chan, kick) = h.netd.add_port(g, p, switch, mac, lock, isolated, memory, &mut h.alloc);
+        let (chan, kick) = h.netd.add_port(g, p, switch, mac, flags, memory, &mut h.alloc);
         g.ports.must_push(p);
         use root_call::caps::nic_add::{KICK, PORT_FRAMES};
         let given = give(h, PORT_FRAMES.passed_out(0, kind_of(&chan)), &abs_of(chan))

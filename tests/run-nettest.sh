@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # M5 gate: L2 switches with an uplink, guest-to-guest traffic, multiple
-# vNICs, switch isolation, isolated ports, MAC lock, steering (a port rule
-# between guests, an IP-wide rule on the uplink), and ports that outlive a
-# dom0 restart.
+# vNICs, switch isolation, isolated ports, MAC lock, L3 filtering,
+# steering (a port rule between guests, an IP-wide rule on the uplink),
+# and ports that outlive a dom0 restart.
 # NETTEST_LEGACY=1 makes the uplink a legacy-only virtio-net device, as on
 # GCE N2.
 set -euo pipefail
@@ -16,7 +16,8 @@ mkdir -p "$out"
 "$root/tools/build-l4hctl.sh"
 "$l4h_cc" -O2 -static -Wall -Wextra -Werror "$root/tests/guest/slow-protocol.c" -o "$out/slow-protocol"
 "$root/tools/mkinitramfs.sh" "$out/slowvm.cpio.gz" "$root/tests/guest/init-slowvm" "$out/slow-protocol" >/dev/null
-"$root/tools/mkinitramfs.sh" "$out/netvm.cpio.gz" "$root/tests/guest/init-netvm" >/dev/null
+"$root/tools/mkinitramfs.sh" "$out/netvm.cpio.gz" "$root/tests/guest/init-netvm" \
+    "$root/tests/guest/udhcpc.script" >/dev/null
 "$root/tools/mkinitramfs.sh" "$out/nettest.cpio.gz" "$root/tests/guest/init-nettest" \
     "$l4h_ctl" "$out/netvm.cpio.gz" \
     "$out/slow-protocol" "$out/slowvm.cpio.gz" \

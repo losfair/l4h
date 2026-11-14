@@ -674,6 +674,20 @@ enum l4h_ctl_op {
 	L4H_CTL_NIC_CTL = 46,
 	L4H_CTL_DRIVER_LOAD = 49,
 	L4H_CTL_FIRMWARE_LOAD = 53,
+	/* L3 filtering (DESIGN.md §9.3) of a port created with
+	 * L4H_NIC_IP_FILTER.  args: port, family (4 or 6) | prefix length << 8,
+	 * IP bits 127-64, IP bits 63-0 (IPv4 in bits 31-0), no bits set past
+	 * the length.  The port may send from the prefix, up to
+	 * L4H_MAX_PORT_IPS.  -ENOENT (no port), -EINVAL (malformed, or the
+	 * port is not filtered), -EEXIST, -ENOSPC, -EBUSY (netd's mailbox is
+	 * full).  Takes effect when netd reads the command, after the op
+	 * returns; commands to netd keep their order. */
+	L4H_CTL_IP_ADD = 54,
+	/* args as IP_ADD; -ENOENT if the port has no such prefix */
+	L4H_CTL_IP_DEL = 55,
+	/* args: port -> vals[0] = count, vals[1] = 1 if the port is filtered;
+	 * data: struct l4h_ctl_ip[] */
+	L4H_CTL_IP_LIST = 56,
 };
 
 #define L4H_PCI_OWNER_NONE     0 /* no host service assigned */
@@ -723,6 +737,9 @@ struct l4h_ctl_extent {
 
 #define L4H_NIC_NO_MAC_LOCK     (1ull << 0) /* allow any source MAC */
 #define L4H_NIC_ISOLATED        (1ull << 1) /* no frames to or from other isolated ports */
+#define L4H_NIC_IP_FILTER       (1ull << 2) /* send only from the addresses IP_ADD gives;
+                                             * not with L4H_NIC_NO_MAC_LOCK */
+#define L4H_MAX_PORT_IPS        16
 
 #define L4H_BLK_RO              (1ull << 0) /* read-only */
 #define L4H_BLK_VOLATILE        (1ull << 1) /* no flush: the guest sees no write cache */
@@ -751,6 +768,11 @@ struct l4h_ctl_steer {
 	l4h_u64 targets;
 	l4h_u64 in_frames;
 	l4h_u64 out_frames;
+};
+
+struct l4h_ctl_ip {
+	l4h_u64 prefix;         /* as L4H_CTL_IP_ADD args[1] */
+	l4h_u64 ip_hi, ip_lo;
 };
 
 enum l4h_vm_state {

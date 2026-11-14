@@ -78,12 +78,41 @@ grep -q "ping 192.168.1.1 ok" /tmp/g || fail "isolated port -> normal port"
 grep -q "ping 192.168.1.6 failed" /tmp/g || fail "isolated ports reach each other"
 echo "NETTEST: isolated ports ok"
 
+# L3 filtering (DESIGN.md §9.3).  I sends from the address it was given
+# and reaches A; J was given .10 but uses .11: its ARP and IP are dropped.
+# J has no IPv6, whose link-local address (never given) would be dropped
+# too: its drops are the IPv4 and ARP it sent.
+run i "" --nic "$sw1,ip=192.168.1.9" --cmdline "console=hvc0 IP0=192.168.1.9/24 PING=192.168.1.1"
+grep -q "ping 192.168.1.1 ok" /tmp/i || fail "filtered port, its own address"
+run j "" --nic "$sw1,ip=192.168.1.10" --cmdline "console=hvc0 ipv6.disable=1 IP0=192.168.1.11/24 PING=192.168.1.1"
+grep -q "ping 192.168.1.1 failed" /tmp/j || fail "a filtered port sent from another address"
+l4hctl switch "$sw1" | awk -v vm="$vm_j" '$2 == vm && $6 > 0 { f = 1 } END { exit !f }' \
+    || { l4hctl switch "$sw1"; fail "netd dropped none of j's frames"; }
+# K starts with no address and is given its own while it waits.
+vm_k=$(l4hctl create k $K --nic "$sw1,ipfilter" --cmdline "console=hvc0 IP0=192.168.1.12/24 PING=192.168.1.1 DELAY=$((3 * slow))") \
+    || fail "create k"
+l4hctl ip add "$vm_k:0" 192.168.1.12 || fail "ip add"
+l4hctl console "$vm_k" --until "NETVM: done" --timeout "$((60 * slow))" > /tmp/k || fail "k did not finish"
+grep -q "ping 192.168.1.1 ok" /tmp/k || { cat /tmp/k; fail "k after ip add"; }
+l4hctl ip list | tee /tmp/ips
+grep -q "192.168.1.9/32" /tmp/ips && grep -q "192.168.1.12/32" /tmp/ips || fail "ip list"
+l4hctl ip add "$vm_a:0" 192.168.1.1 2>/dev/null && fail "ip add on a port without a filter"
+l4hctl ip add "$vm_k:0" 192.168.1.12 2>/dev/null && fail "ip add twice"
+l4hctl ip add "$vm_k:0" 192.168.1.0/16 2>/dev/null && fail "ip add with host bits"
+l4hctl ip del "$vm_k:0" 192.168.1.12 || fail "ip del"
+l4hctl ip list "$vm_k:0" | grep -q "(none)" || fail "ip del left the prefix"
+# Room for the guests to come (aarch64 CI has less memory).
+for v in $vm_i $vm_j $vm_k; do l4hctl destroy "$v" || fail "destroy $v"; done
+echo "NETTEST: L3 filter ok"
+
 # Steering (DESIGN.md §9.3).  A port rule: frames from X (the peer) to A's
 # 192.168.1.1, TCP 80, go to T on another switch, which serves them as
 # 192.168.1.1; Y on A's switch is no peer and reaches A, which serves
-# nothing.  ICMP is not matched: X's ping reaches A.
+# nothing.  ICMP is not matched: X's ping reaches A.  The targets T and
+# T2 are filtered to their own link addresses: what they send as the
+# steered address passes as a rule's return traffic only.
 sw3=$(l4hctl switch-create) || fail "switch-create"
-run t "" --nic "$sw3" --cmdline "console=hvc0 IP0=169.254.9.2/16 LO=192.168.1.1/32 ONLINK=1 HTTPD=steered-to-t"
+run t "" --nic "$sw3,ip=169.254.9.2" --cmdline "console=hvc0 IP0=169.254.9.2/16 LO=192.168.1.1/32 ONLINK=1 HTTPD=steered-to-t"
 ep=$(l4hctl ep set "$sw1" "$vm_a:0" --peer 02:00:00:00:00:20) || fail "ep set"
 l4hctl steer set "$ep" 192.168.1.1/tcp:80 --to "$vm_t:0" >/dev/null || fail "steer set"
 l4hctl steer set "$ep" 192.168.1.1/tcp:80 --to 47 2>/dev/null && fail "steer to no port"
@@ -102,7 +131,7 @@ echo "NETTEST: port rule ok"
 # address only to answer ARP for it.
 ep0=$(l4hctl ep set 0 uplink) || fail "ep set uplink (peer gw)"
 ip addr add 10.0.2.16/32 dev eth0
-id=$(l4hctl create t2 $K --nic "$sw3" --cmdline "console=hvc0 IP0=169.254.9.3/16 LO=10.0.2.16/32 ONLINK=1 PING=10.0.2.2 DELAY=$((3 * slow))") || fail "create t2"
+id=$(l4hctl create t2 $K --nic "$sw3,ip=169.254.9.3" --cmdline "console=hvc0 IP0=169.254.9.3/16 LO=10.0.2.16/32 ONLINK=1 PING=10.0.2.2 DELAY=$((3 * slow))") || fail "create t2"
 l4hctl steer set "$ep0" 10.0.2.16 --to "$id:0" >/dev/null || fail "steer set ip-wide"
 l4hctl console "$id" --until "NETVM: done" --timeout "$((60 * slow))" > /tmp/t2 || fail "t2 did not finish"
 grep -q "ping 10.0.2.2 ok" /tmp/t2 || { cat /tmp/t2; fail "ip-wide rule: t2 -> slirp"; }
@@ -115,6 +144,12 @@ l4hctl destroy "$vm_t" && l4hctl destroy "$id" || fail "destroy t, t2"
 l4hctl ep del "$ep" && l4hctl ep del "$ep0" || fail "ep del"
 [ "$(l4hctl ep list | wc -l)" = 1 ] || fail "ep del"
 echo "NETTEST: steering ok"
+# DHCP through a filter: DH leases from slirp as 0.0.0.0 (a client's
+# requests, for its own MAC), then uses the lease within its /24.
+run dh "" --nic "0,ip=10.0.2.0/24" --cmdline "console=hvc0 DHCP=1 PING=10.0.2.2"
+grep -q "NETVM: dhcp ok" /tmp/dh && grep -q "ping 10.0.2.2 ok" /tmp/dh || { cat /tmp/dh; fail "dhcp through a filter"; }
+l4hctl destroy "$vm_dh" || fail "destroy dh"
+echo "NETTEST: dhcp through a filter ok"
 l4hctl switch "$sw1"
 l4hctl switch "$sw2"
 l4hctl list

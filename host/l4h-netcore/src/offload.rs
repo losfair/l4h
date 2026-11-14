@@ -105,8 +105,14 @@ fn check(hdr: &mut [u8; HDR_SIZE], frame: &[u8], min_mss: usize) -> bool {
     hdr[0] &= F_NEEDS_CSUM;
     hdr[10] = 0;
     hdr[11] = 0;
-    if hdr[0] & F_NEEDS_CSUM != 0 && get16(hdr, 6) + get16(hdr, 8) + 2 > frame.len() {
-        return false;
+    // The checksum is written where the sender says, after netd looked at
+    // the frame: never into the Ethernet header (its MACs are what the MAC
+    // lock checked and what the frame was switched by).
+    if hdr[0] & F_NEEDS_CSUM != 0 {
+        let start = get16(hdr, 6);
+        if ethertype(frame).is_none_or(|(_, l3)| start < l3) || start + get16(hdr, 8) + 2 > frame.len() {
+            return false;
+        }
     }
     match hdr[1] & !GSO_ECN {
         GSO_NONE => {
@@ -539,5 +545,30 @@ mod tests {
         let (mut g, mut gh) = (f, h);
         complete_csum(&mut g[..len], &mut gh);
         assert!(is_gso(&gh) && !sanitize_rx(&mut gh, &g[..len], MIN_MSS));
+    }
+
+    /// A partial checksum that would be written over the MACs (which the
+    /// MAC lock checked) or the EtherType is refused.
+    #[test]
+    fn checksums_start_past_the_ethernet_header() {
+        let mut f = [0u8; 64];
+        f[12..14].copy_from_slice(&[0x08, 0x00]);
+        let csum = |start: usize, offset: usize| {
+            let mut h = [0u8; HDR_SIZE];
+            h[0] = F_NEEDS_CSUM;
+            put16(&mut h, 6, start);
+            put16(&mut h, 8, offset);
+            h
+        };
+        for (start, offset) in [(0, 0), (6, 0), (12, 0), (13, 0), (0, 14)] {
+            assert!(!sanitize(&mut csum(start, offset), &f), "{start} {offset}");
+        }
+        assert!(sanitize(&mut csum(14, 0), &f));
+        assert!(sanitize(&mut csum(34, 6), &f));
+        // One VLAN tag: the network header starts past it.
+        f[12..18].copy_from_slice(&[0x81, 0x00, 0, 5, 0x08, 0x00]);
+        assert!(!sanitize(&mut csum(14, 0), &f));
+        assert!(sanitize(&mut csum(18, 0), &f));
+        assert!(!sanitize(&mut csum(14, 0), &f[..13]));
     }
 }

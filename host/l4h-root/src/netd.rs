@@ -11,6 +11,7 @@ use l4h_host::{badges, wiring};
 use l4h_host::net::call::Request;
 use l4h_host::fixed::ArrayVec;
 use l4h_host::{self as host, net};
+use l4h_abi as abi;
 
 use crate::blkd::keep_bits;
 use crate::component::{self, Component, SpawnArgs, abs_of};
@@ -45,6 +46,10 @@ pub struct PortInfo {
     pub vm: usize,
     pub switch: u32,
     pub mac: u64,
+    /// L3 filtering: the port sends only from these prefixes, by netd's
+    /// slot (net::call::ip_set), as CTL_IP_ADD's args 1-3.
+    pub ip_filter: bool,
+    pub ips: [Option<(u64, u64, u64)>; net::MAX_PORT_IPS],
 }
 
 /// A steering endpoint (DESIGN.md §9.3): an address on a switch and the
@@ -359,8 +364,7 @@ impl Netd {
         p: usize,
         switch: u32,
         mac: u64,
-        lock: bool,
-        isolated: bool,
+        nic_flags: u64,
         (s, region): (Slot, UtRegion),
         alloc: &mut Alloc,
     ) -> (cap::CNode, cap::Notification) {
@@ -403,14 +407,16 @@ impl Netd {
         let alias = if physical && switch < 2 {
             self.uplink_on(1 - switch).and_then(|n| self.nic_mac(n)).unwrap_or(0)
         } else { 0 };
-        let flags = if lock { net::NETD_PORT_MAC_LOCK } else { 0 }
-            | if isolated { net::NETD_PORT_ISOLATED } else { 0 }
+        let ip_filter = nic_flags & abi::NIC_IP_FILTER != 0;
+        let flags = if nic_flags & abi::NIC_NO_MAC_LOCK == 0 { net::NETD_PORT_MAC_LOCK } else { 0 }
+            | if nic_flags & abi::NIC_ISOLATED != 0 { net::NETD_PORT_ISOLATED } else { 0 }
+            | if ip_filter { net::NETD_PORT_IP_FILTER } else { 0 }
             | if physical { net::NETD_PORT_UPLINK } else { 0 };
         // The caller made sure of room in the ring (`room`).
         if self.post(Request::AddPort { port: p, switch: switch as usize, mac, flags, alias }).is_err() {
             log!("l4h-root: netd has no room for port {}", p);
         }
-        self.ports[p] = Some(PortInfo { vm: g.id, switch, mac });
+        self.ports[p] = Some(PortInfo { vm: g.id, switch, mac, ip_filter, ips: [None; net::MAX_PORT_IPS] });
         (chan, kick)
     }
 
@@ -730,6 +736,30 @@ impl Netd {
         self.rules.get(id).copied().flatten().ok_or(ctl::ENOENT)?;
         self.post(Request::SteerDel { rule: id })?;
         self.rules[id] = None;
+        Ok(())
+    }
+
+    /// Let filtered port `p` send from `prefix`, as CTL_IP_ADD's args 1-3.
+    pub fn ip_add(&mut self, p: usize, prefix: (u64, u64, u64)) -> Result<(), Errno> {
+        let port = self.ports.get(p).and_then(|p| p.as_ref()).ok_or(ctl::ENOENT)?;
+        if !port.ip_filter || !net::ip_prefix_ok(prefix.0, prefix.1, prefix.2) {
+            return Err(ctl::EINVAL);
+        }
+        if port.ips.contains(&Some(prefix)) {
+            return Err(ctl::EEXIST);
+        }
+        let slot = port.ips.iter().position(|s| s.is_none()).ok_or(ctl::ENOSPC)?;
+        let (prefix_word, ip_hi, ip_lo) = prefix;
+        self.post(Request::IpSet { port: p, slot, prefix: prefix_word, ip_hi, ip_lo })?;
+        self.ports[p].as_mut().unwrap().ips[slot] = Some(prefix);
+        Ok(())
+    }
+
+    pub fn ip_del(&mut self, p: usize, prefix: (u64, u64, u64)) -> Result<(), Errno> {
+        let port = self.ports.get(p).and_then(|p| p.as_ref()).ok_or(ctl::ENOENT)?;
+        let slot = port.ips.iter().position(|s| *s == Some(prefix)).ok_or(ctl::ENOENT)?;
+        self.post(Request::IpDel { port: p, slot })?;
+        self.ports[p].as_mut().unwrap().ips[slot] = None;
         Ok(())
     }
 

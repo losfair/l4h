@@ -370,6 +370,16 @@ pub const CTL_FIRMWARE_WANTED: u32 = 52;
 /// confined drivers that name it.
 pub const CTL_FIRMWARE_LOAD: u32 = 53;
 pub const FIRMWARE_NAME: usize = 48;
+/// L3 filtering (DESIGN.md §9.3) of a port made with NIC_IP_FILTER:
+/// args[0] port, [1] family (4, 6) | prefix length << 8, [2] and [3] the
+/// address's bits 127-64 and 63-0 (IPv4 in bits 31-0), no bits set past
+/// the length.  The port may send from the prefix (CTL_IP_ADD) or no
+/// longer (CTL_IP_DEL).
+pub const CTL_IP_ADD: u32 = 54;
+pub const CTL_IP_DEL: u32 = 55;
+/// args[0] port: vals[0] = count, vals[1] = 1 if the port is filtered;
+/// data = CtlIp[count].
+pub const CTL_IP_LIST: u32 = 56;
 /// CTL_NIC_INFO: vals[0] BDF, [1] switch (u64::MAX: none), [2] MAC, [3]
 /// state | trust << 8 | driver << 16 (0xff: none) | restarts << 32 |
 /// isolation group size << 48, [4] vendor | device << 16, [5] the
@@ -437,6 +447,10 @@ pub const IOMMU_ON: u64 = 2;
 pub const IOMMU_FAILED: u64 = 3;
 pub const NIC_NO_MAC_LOCK: u64 = 1 << 0;
 pub const NIC_ISOLATED: u64 = 1 << 1;
+/// Send only IPv4, IPv6 and ARP from the addresses CTL_IP_ADD gives the
+/// port (none at first), and no router advertisements or DHCP server
+/// messages.  Not with NIC_NO_MAC_LOCK.
+pub const NIC_IP_FILTER: u64 = 1 << 2;
 /// CTL_BLK_ATTACH flags. A volatile attachment offers the guest no flush
 /// and completes flushes at once: data the device caches can be lost on
 /// power failure, for disks whose contents do not outlive the VM.
@@ -474,6 +488,16 @@ pub struct CtlSteer {
     pub targets: u64,
     pub in_frames: u64,
     pub out_frames: u64,
+}
+
+/// An address a filtered port may send from (CTL_IP_LIST): `prefix` and
+/// the address as CTL_IP_ADD's args 1-3.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CtlIp {
+    pub prefix: u64,
+    pub ip_hi: u64,
+    pub ip_lo: u64,
 }
 
 pub const VM_CREATED: u32 = 1;

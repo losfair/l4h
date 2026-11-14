@@ -7,7 +7,9 @@
 //! port and flood everything else within the switch.  Guest ports can be
 //! locked to their configured MAC.  Nothing above L2 is looked at, except
 //! by steering rules dom0 sets (steer.rs), which pick a port by IP address,
-//! protocol and port and rewrite only MAC addresses.
+//! protocol and port and rewrite only MAC addresses, and by the L3 filters
+//! of ports that have one (ipfilter.rs), which drop frames from addresses
+//! dom0 did not give the port.
 //!
 //! netd has no heap (DESIGN.md §10): its tables are fixed arrays, its frame
 //! buffers statics, and the frames it holds take chunks of a fixed pool
@@ -16,6 +18,7 @@
 #![no_std]
 #![no_main]
 
+mod ipfilter;
 mod link;
 mod pool;
 mod steer;
@@ -79,6 +82,7 @@ static mut BUF: [u8; FRAME_BUFFER_SIZE] = [0; FRAME_BUFFER_SIZE];
 static mut SEG_BUF: [u8; net::MAX_FRAME] = [0; net::MAX_FRAME];
 static mut FDB_SLOTS_MEM: [FdbEntry; FDB_SLOTS] = [FdbEntry::FREE; FDB_SLOTS];
 static mut STEER: Steer = Steer::new();
+static mut FILTERS: [ipfilter::Filter; net::MAX_PORTS] = [ipfilter::Filter::OFF; net::MAX_PORTS];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PortId {
@@ -236,6 +240,8 @@ struct Netd {
     fdb: Fdb,
     /// Endpoints and steering rules.
     steer: &'static mut Steer,
+    /// Each guest port's L3 filter.
+    filters: &'static mut [ipfilter::Filter; net::MAX_PORTS],
     /// The chunks of the frames all backlogs hold.
     pool: &'static mut Pool,
     /// Ports with RX work left after their bounded wakeup recheck.
@@ -264,6 +270,7 @@ const _: () = assert!(
         && steer::MAX_RULES == net::MAX_STEER_RULES
         && net::MAX_PORTS <= steer::MAX_TARGETS
         && net::MAX_SWITCHES <= 64
+        && ipfilter::MAX_PREFIXES == net::MAX_PORT_IPS
 );
 
 impl PortId {
@@ -374,11 +381,32 @@ impl Netd {
         }
         let Some(switch) = self.switch_of(from) else { return };
         let src: [u8; 6] = frame[6..12].try_into().unwrap();
+        // A filtered port's frame from a steered address: only a rule's
+        // return path takes it.
+        let mut return_only = false;
         if let PortId::Guest(i) = from {
             let p = self.ports[i].as_mut().unwrap();
             if (p.lock && src != p.mac && p.alias != Some(src)) || !offload::sanitize(hdr, frame) {
                 p.drops += 1;
                 return;
+            }
+            if self.filters[i].on {
+                // A partial checksum is written where the guest said, after
+                // the filter looked: complete it first.  A GSO frame's goes
+                // into its TCP checksum (offload::sanitize), and its
+                // segments copy the headers the filter saw.
+                if !is_gso(hdr) {
+                    complete_csum(frame, hdr);
+                }
+                // A steering rule's target may send as the rule's address.
+                match ipfilter::check(&self.filters[i], frame) {
+                    ipfilter::Verdict::Pass => {}
+                    ipfilter::Verdict::Spoofed if self.steer.is_return(i, frame) => return_only = true,
+                    _ => {
+                        p.drops += 1;
+                        return;
+                    }
+                }
             }
             p.tx_frames += 1;
         }
@@ -422,7 +450,7 @@ impl Netd {
             PortId::Guest(i) => Some(i),
             PortId::Uplink(_) | PortId::Link(_) => None,
         };
-        if let Some(t) = self.steer.inbound(sw, guest, frame) {
+        if !return_only && let Some(t) = self.steer.inbound(sw, guest, frame) {
             self.deliver(PortId::Guest(t), frame, hdr);
             return;
         }
@@ -431,6 +459,13 @@ impl Netd {
             // nothing is learned, and isolation does not apply.
             let owner = self.fdb.find(ep.switch, &ep.mac).map(|i| PortId::of_code(self.fdb.slots[i].port));
             self.switch_frame(owner, false, ep.switch as u32, frame, hdr);
+            return;
+        }
+        // is_return said outbound takes it; never switch it as it is.
+        if return_only {
+            if let PortId::Guest(i) = from {
+                self.ports[i].as_mut().unwrap().drops += 1;
+            }
             return;
         }
         let isolated = self.is_isolated(from);
@@ -707,6 +742,7 @@ impl Netd {
             let code = PortId::Guest(i).code();
             self.fdb.remove_if(|e| e.port == code);
             self.steer.port_removed(i);
+            self.filters[i] = ipfilter::Filter::OFF;
         }
     }
 }
@@ -774,6 +810,7 @@ impl net::call::Server for Commands<'_> {
             drops: 0,
             backlog: Fifo::EMPTY,
         });
+        d.filters[i] = ipfilter::Filter { on: flags & net::NETD_PORT_IP_FILTER != 0, ..ipfilter::Filter::OFF };
         d.publish_links();
         self.added |= 1 << i;
         Ok(())
@@ -845,6 +882,22 @@ impl net::call::Server for Commands<'_> {
         Ok(())
     }
 
+    fn ip_set(&mut self, _: net::Sender, port: usize, slot: usize, prefix: u64, ip_hi: u64, ip_lo: u64) -> Result<(), Errno> {
+        let d = &mut *self.d;
+        let p = ipfilter::Prefix::from_words(prefix, ip_hi, ip_lo).ok_or(EINVAL)?;
+        match d.filters.get_mut(port) {
+            Some(f) if f.on && d.ports[port].is_some() => f.set(slot, p).then_some(()).ok_or(EINVAL),
+            _ => Err(EINVAL),
+        }
+    }
+
+    fn ip_del(&mut self, _: net::Sender, port: usize, slot: usize) -> Result<(), Errno> {
+        if let Some(f) = self.d.filters.get_mut(port) {
+            f.del(slot);
+        }
+        Ok(())
+    }
+
     fn add_link(&mut self, _: net::Sender, l: usize, switch: usize, size: u64, me: u32, peer: u32) -> Result<(), Errno> {
         let d = &mut *self.d;
         // One size, as root maps it: the rings' record limits, which
@@ -889,6 +942,7 @@ fn main(info: &'static Info) -> ! {
             sweep_at: 0,
         },
         steer: unsafe { &mut *addr_of_mut!(STEER) },
+        filters: unsafe { &mut *addr_of_mut!(FILTERS) },
         pool: pool::take(),
         deferred_ports: 0,
         tsc_hz: info.header().tsc_hz,

@@ -31,6 +31,7 @@ pub const CTL_SWITCH_INFO: u32 = 14;
 pub const CTL_NIC_INFO: u32 = 15;
 pub const NIC_NO_MAC_LOCK: u64 = 1;
 pub const NIC_ISOLATED: u64 = 2;
+pub const NIC_IP_FILTER: u64 = 4;
 /// CTL_BLK_ATTACH flags.
 pub const BLK_RO: u64 = 1;
 pub const BLK_VOLATILE: u64 = 2;
@@ -73,6 +74,9 @@ pub const CTL_FIRMWARE_INFO: u32 = 51;
 pub const CTL_FIRMWARE_WANTED: u32 = 52;
 pub const CTL_FIRMWARE_LOAD: u32 = 53;
 pub const FIRMWARE_NAME: usize = 48;
+pub const CTL_IP_ADD: u32 = 54;
+pub const CTL_IP_DEL: u32 = 55;
+pub const CTL_IP_LIST: u32 = 56;
 pub const PCI_OWNER_NONE: u16 = 0;
 pub const PCI_OWNER_BLKD: u16 = 1;
 pub const PCI_OWNER_NETD: u16 = 2;
@@ -240,6 +244,74 @@ impl std::fmt::Display for SteerMatch {
         }
         Ok(())
     }
+}
+
+/// An address prefix a filtered port may send from (CTL_IP_ADD).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IpPrefix {
+    pub ip: std::net::IpAddr,
+    pub len: u8,
+}
+
+impl IpPrefix {
+    /// `IP[/LEN]`; without a length, the one address.  Bits past the
+    /// length must be clear.
+    pub fn parse(s: &str) -> Result<IpPrefix> {
+        let bad = || Error(format!("bad prefix: {s} (IP[/LEN])"));
+        let (ip, len) = s.split_once('/').map_or((s, None), |(a, b)| (a, Some(b)));
+        let ip: std::net::IpAddr = ip.parse().map_err(|_| bad())?;
+        let max = if ip.is_ipv4() { 32 } else { 128 };
+        let len = match len {
+            Some(l) => l.parse().ok().filter(|&l| l <= max).ok_or_else(bad)?,
+            None => max,
+        };
+        let p = IpPrefix { ip, len };
+        let [_, hi, lo] = p.words();
+        let v = (hi as u128) << 64 | lo as u128;
+        let host = (max - len) as u32;
+        if host != 0 && v << (128 - host) != 0 {
+            return err(format!("bad prefix: {s}: bits set past /{len}"));
+        }
+        Ok(p)
+    }
+
+    /// CTL_IP_ADD's args 1-3.
+    pub fn words(&self) -> [u64; 3] {
+        let (family, hi, lo) = match self.ip {
+            std::net::IpAddr::V4(a) => (4, 0, u32::from(a) as u64),
+            std::net::IpAddr::V6(a) => {
+                let v = u128::from(a);
+                (6, (v >> 64) as u64, v as u64)
+            }
+        };
+        [family | (self.len as u64) << 8, hi, lo]
+    }
+
+    pub fn from_words(m: u64, hi: u64, lo: u64) -> IpPrefix {
+        let ip = if m as u8 == 6 {
+            std::net::IpAddr::V6((((hi as u128) << 64) | lo as u128).into())
+        } else {
+            std::net::IpAddr::V4((lo as u32).into())
+        };
+        IpPrefix { ip, len: (m >> 8) as u8 }
+    }
+}
+
+impl std::fmt::Display for IpPrefix {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}/{}", self.ip, self.len)
+    }
+}
+
+/// A vNIC of a VM being created: its switch, MAC (0: the host picks),
+/// NIC_* flags and, with NIC_IP_FILTER, the prefixes it may send from,
+/// set before the VM starts.
+#[derive(Clone, Debug, Default)]
+pub struct NicSpec {
+    pub switch: u64,
+    pub mac: u64,
+    pub flags: u64,
+    pub ips: Vec<IpPrefix>,
 }
 
 pub fn fmt_mac(m: u64) -> String {
@@ -485,6 +557,22 @@ fn read_screen(chunk: &mut [u8], mut read: impl FnMut(u64, &mut [u8]) -> Result<
 mod tests {
     use super::*;
 
+    #[test]
+    fn ip_prefixes() {
+        let p = IpPrefix::parse("10.0.0.5").unwrap();
+        assert_eq!(p.words(), [4 | 32 << 8, 0, 0x0a00_0005]);
+        assert_eq!(p.to_string(), "10.0.0.5/32");
+        assert_eq!(IpPrefix::parse("10.1.0.0/16").unwrap().words(), [4 | 16 << 8, 0, 0x0a01_0000]);
+        assert_eq!(IpPrefix::parse("0.0.0.0/0").unwrap().words(), [4, 0, 0]);
+        let v6 = IpPrefix::parse("2001:db8::/32").unwrap();
+        assert_eq!(v6.words(), [6 | 32 << 8, 0x2001_0db8_0000_0000, 0]);
+        assert_eq!(IpPrefix::from_words(6 | 32 << 8, 0x2001_0db8_0000_0000, 0), v6);
+        assert_eq!(IpPrefix::parse("fe80::1").unwrap().len, 128);
+        for bad in ["10.0.0.5/24", "10.0.0.0/33", "2001:db8::1/64", "::/129", "x", "10.0.0.0/", "10.0.0.0/-1"] {
+            assert!(IpPrefix::parse(bad).is_err(), "{bad}");
+        }
+    }
+
     /// A 2 x 2 display of format 2, frame 4, served 8 bytes at a time.
     fn display(off: u64, buf: &mut [u8], frame: u64) -> Result<(i64, [u64; 6])> {
         let img: Vec<u8> = (0..16).collect();
@@ -729,8 +817,7 @@ pub struct VmSpec<'a> {
     pub volumes: Vec<(u64, u64, Vec<(u64, u64)>)>,
     /// I/O pool in bytes (0: default, 4 MiB; a power of two, 1-256 MiB).
     pub io_pool: u64,
-    /// (switch, MAC or 0, NIC_* flags)
-    pub nics: Vec<(u64, u64, u64)>,
+    pub nics: Vec<NicSpec>,
     /// A virtio-gpu with one scanout of (width, height).
     pub gpu: Option<(u64, u64)>,
     /// Whole USB controllers ([`Ctl::usb_info`] indices).
@@ -876,8 +963,21 @@ impl Ctl {
                 self.attach_extents(vm, *disk, *flags, extents)?;
             }
             let mut macs = Vec::new();
-            for &(sw, mac, flags) in &o.nics {
-                macs.push(self.call(CTL_NIC_CREATE, &[vm, sw, mac, flags], &[], &[])?.vals[0]);
+            for n in &o.nics {
+                let mac = self.call(CTL_NIC_CREATE, &[vm, n.switch, n.mac, n.flags], &[], &[])?.vals[0];
+                if !n.ips.is_empty() {
+                    // The port is known by its MAC: two of this VM's on the
+                    // switch with one MAC would be ambiguous.
+                    let (ports, _) = self.switch_info(n.switch)?;
+                    let port = match ports.iter().filter(|p| p.vm as u64 == vm && p.mac == mac).collect::<Vec<_>>()[..] {
+                        [p] => p.port as u64,
+                        _ => return err(format!("vm {vm}: no one port with mac {} on switch {} for ip=", fmt_mac(mac), n.switch)),
+                    };
+                    for p in &n.ips {
+                        self.ip_add(port, p)?;
+                    }
+                }
+                macs.push(mac);
             }
             if let Some((w, h)) = o.gpu {
                 self.call(CTL_GPU_ATTACH, &[vm, w, h], &[], &[])?;
@@ -1014,6 +1114,31 @@ impl Ctl {
 
     pub fn steer_list(&self) -> Result<Vec<CtlSteer>> {
         self.list(CTL_STEER_LIST, |r: &CtlSteer| r.id)
+    }
+
+    /// Let filtered guest port `port` send from `p`.
+    pub fn ip_add(&self, port: u64, p: &IpPrefix) -> Result<()> {
+        let [w, hi, lo] = p.words();
+        self.call(CTL_IP_ADD, &[port, w, hi, lo], &[], &[]).map(|_| ())
+    }
+
+    pub fn ip_del(&self, port: u64, p: &IpPrefix) -> Result<()> {
+        let [w, hi, lo] = p.words();
+        self.call(CTL_IP_DEL, &[port, w, hi, lo], &[], &[]).map(|_| ())
+    }
+
+    /// Whether guest port `port` is filtered, and the prefixes it may
+    /// send from.
+    pub fn ip_list(&self, port: u64) -> Result<(bool, Vec<IpPrefix>)> {
+        let r = self.call(CTL_IP_LIST, &[port], &[], &[])?;
+        let n = (r.vals[0] as usize).min(CTL_DATA_MAX / 24);
+        let ips = (0..n)
+            .map(|i| {
+                let w = |k: usize| u64::from_ne_bytes(r.data[i * 24 + k * 8..][..8].try_into().unwrap());
+                IpPrefix::from_words(w(0), w(1), w(2))
+            })
+            .collect();
+        Ok((r.vals[1] != 0, ips))
     }
 
     /// All entries of a list op that takes the first id and returns a

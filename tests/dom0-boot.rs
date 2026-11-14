@@ -117,7 +117,7 @@ impl Vmmgr {
         self.disks.push(None);
         Ok(())
     }
-    fn create_nic(&mut self, _: usize, switch: u32, _: u64, _: bool, _: bool) -> Result<(), Errno> {
+    fn create_nic(&mut self, _: usize, switch: u32, _: u64, _: u64) -> Result<(), Errno> {
         self.add_device()?;
         self.nics.push(switch);
         Ok(())

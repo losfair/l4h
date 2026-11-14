@@ -103,6 +103,25 @@ pub const NETD_PORT_ISOLATED: u64 = 1 << 1;
 /// Root-selected dom0 port of the physical uplink, whose `alias` is its one
 /// additional allowed source MAC (0: none).  Ordinary guests cannot set it.
 pub const NETD_PORT_UPLINK: u64 = 1 << 2;
+/// The port sends only from the addresses IpSet gives it (DESIGN.md §9.3,
+/// L3 filtering); it starts with none.
+pub const NETD_PORT_IP_FILTER: u64 = 1 << 3;
+/// Prefixes a filtered port may send from.
+pub const MAX_PORT_IPS: usize = 16;
+
+/// Whether IpSet's (`prefix`, `ip_hi`, `ip_lo`) is an IPv4 or IPv6 prefix
+/// with no bits set past its length.
+pub fn ip_prefix_ok(prefix: u64, ip_hi: u64, ip_lo: u64) -> bool {
+    let (family, len) = (prefix as u8, (prefix >> 8) as u8 as u32);
+    let ip = (ip_hi as u128) << 64 | ip_lo as u128;
+    let bits = match family {
+        4 if ip >> 32 == 0 => 32,
+        6 => 128,
+        _ => return false,
+    };
+    // The host part: its bits shifted out of the top must be all there is.
+    prefix >> 16 == 0 && len <= bits && (len == bits || ip << (128 - (bits - len)) == 0)
+}
 
 use crate::badges::driver as recv;
 
@@ -139,6 +158,12 @@ crate::protocol! {
         /// `matches` is abi::CTL_STEER_SET's args[1]; `targets` a port mask.
         SteerSet / steer_set = 8 from [Root] (rule: usize, ep: usize, matches: u64, ip_hi: u64, ip_lo: u64, targets: u64) -> ();
         SteerDel / steer_del = 9 from [Root] (rule: usize) -> ();
+        /// L3 filtering: port `port` may send from the prefix in slot
+        /// `slot` (below MAX_PORT_IPS).  `prefix` is family | length << 8,
+        /// the address as SteerSet's.  netd ignores it for a port without
+        /// NETD_PORT_IP_FILTER.
+        IpSet / ip_set = 12 from [Root] (port: usize, slot: usize, prefix: u64, ip_hi: u64, ip_lo: u64) -> ();
+        IpDel / ip_del = 13 from [Root] (port: usize, slot: usize) -> ();
         /// Link `link` to partition `peer`, on `switch`, with a channel of
         /// `size` bytes (l4h_partition::LINK_CHANNEL_SIZE: netd refuses
         /// another) mapped at link_va(link) and the NETD_SLOT_LINK_*
@@ -229,3 +254,28 @@ const _: () = assert!(
         && NETD_SLOT_LINK_RING_BASE as usize + MAX_LINKS <= NETD_SLOT_CLIENT_BASE as usize
         && NETD_SLOT_LINK_KICK_BASE as usize + MAX_LINKS <= 1 << crate::CNODE_BITS
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ip_prefixes() {
+        assert!(ip_prefix_ok(4 | 32 << 8, 0, 0x0a00_0005));
+        assert!(ip_prefix_ok(4 | 24 << 8, 0, 0x0a00_0000));
+        assert!(!ip_prefix_ok(4 | 24 << 8, 0, 0x0a00_0001));
+        assert!(ip_prefix_ok(4, 0, 0));
+        assert!(!ip_prefix_ok(4, 0, 1));
+        assert!(!ip_prefix_ok(4 | 33 << 8, 0, 0));
+        assert!(!ip_prefix_ok(4 | 32 << 8, 0, 1 << 32));
+        assert!(!ip_prefix_ok(4 | 32 << 8, 1, 0));
+        assert!(ip_prefix_ok(6 | 128 << 8, u64::MAX, u64::MAX));
+        assert!(ip_prefix_ok(6 | 64 << 8, 0x2001_0db8_0000_0001, 0));
+        assert!(!ip_prefix_ok(6 | 64 << 8, 0x2001_0db8_0000_0001, 1));
+        assert!(ip_prefix_ok(6, 0, 0));
+        assert!(!ip_prefix_ok(6, 1 << 63, 0));
+        assert!(!ip_prefix_ok(6 | 129 << 8, 0, 0));
+        assert!(!ip_prefix_ok(5, 0, 0));
+        assert!(!ip_prefix_ok(4 | 1 << 16, 0, 0));
+    }
+}

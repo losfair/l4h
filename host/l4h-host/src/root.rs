@@ -142,9 +142,9 @@ crate::protocol! {
             (guest: usize, disk: usize, flags: u64, lba_start: u64, lba_count: u64, n: usize, list: u64) -> Later<()>;
         /// A port of `switch` for the guest, with MAC `mac` (0: choose; else
         /// 48 bits, not multicast): a CNode of copies of the port's frames (radix
-        /// vmmgr::PORT_RADIX) and netd's kick.  The MAC.  EIO once netd
-        /// has failed.
-        NicAdd / nic_add = 0x103 from [Vmmgr] (guest: usize, switch: u32, mac: u64, lock: bool, isolated: bool)
+        /// vmmgr::PORT_RADIX) and netd's kick, with abi::NIC_* `flags`.
+        /// The MAC.  EIO once netd has failed.
+        NicAdd / nic_add = 0x103 from [Vmmgr] (guest: usize, switch: u32, mac: u64, flags: u64)
             caps { Out PORT_FRAMES: CNode [0; 1], Out KICK: Notification [1; 1] } -> u64;
         /// The guest starts, with `ram` bytes, `vcpus` and its launch
         /// digest: its reports describe it from now on.  Whether it is
