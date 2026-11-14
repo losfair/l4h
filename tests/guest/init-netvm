@@ -3,6 +3,7 @@
 # kernel command line variables (passed to init as environment):
 #   IP0, IP1   address/prefix of eth0, eth1 (IP0 may list several, comma-separated)
 #   NEWMAC     MAC to set on eth0 before using it
+#   DHCP       lease eth0's address by DHCP
 #   GW         default gateway
 #   PING PING2 addresses to ping
 #   LO         addresses for lo (steered to this VM), comma-separated
@@ -19,6 +20,14 @@ if [ -n "$NEWMAC" ]; then ip link set eth0 address "$NEWMAC"; fi
 if [ -n "$IP0" ]; then
     for a in $(echo "$IP0" | tr , " "); do ip addr add "$a" dev eth0; done
     ip link set eth0 up
+fi
+if [ -n "$DHCP" ]; then
+    ip link set eth0 up
+    if udhcpc -i eth0 -n -q -t 5 -s /bin/udhcpc.script >/dev/null 2>&1; then
+        echo "NETVM: dhcp ok"
+    else
+        echo "NETVM: dhcp failed"
+    fi
 fi
 if [ -n "$IP1" ]; then ip addr add "$IP1" dev eth1; ip link set eth1 up; fi
 if [ -n "$GW" ]; then ip route add default via "$GW"; fi

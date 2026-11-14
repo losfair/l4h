@@ -2441,8 +2441,10 @@ are not filtered.
   allowing all of `fe80::/10` would let a guest take another's.
 - **What passes.** IPv4 from an allowed source, or from 0.0.0.0 as a DHCP
   client (UDP 68 → 67). A message to a DHCP server (UDP 67) must be a
-  client's request for the frame's source MAC (`chaddr`), unfragmented:
-  one for another's could release or decline its lease. ARP (Ethernet over IPv4) whose sender is allowed,
+  client's own request, unfragmented: for the frame's source MAC
+  (`chaddr`), so that releasing or declining another's lease takes more
+  than its MAC (see "Not covered"), and not relayed (`hops` and `giaddr`
+  0), as a relay picks the subnet a lease comes from. ARP (Ethernet over IPv4) whose sender is allowed,
   or 0.0.0.0 for an RFC 5227 probe of an allowed address, and whose sender
   MAC is the frame's source. IPv6 from an allowed source, or from `::` for
   duplicate address detection of an allowed address, router solicitations
@@ -2457,8 +2459,10 @@ are not filtered.
 - **Guards.** Router Advertisements, Redirects and Router Renumbering
   (ICMPv6 134, 137, 138), ICMP Redirects and Router Advertisements (5,
   9), and DHCP and DHCPv6 server or relay messages (UDP source
-  port 67 or 547, or to a client's port, 68 or 546, which clients take
-  from any port) are dropped from any source. A router or DHCP server VM
+  port 67 or 547, to a client's port, 68 or 546, which clients take
+  from any port, or a DHCPv6 server's or relay's message type to 547:
+  Advertise, Reply, Reconfigure, Relay-forward, Relay-reply) are dropped
+  from any source. A router or DHCP server VM
   needs an unfiltered port.
 - **Offload metadata.** A partial checksum is written at offsets the guest
   chose, after netd looked at the frame, and its value is the guest's to
@@ -2479,8 +2483,9 @@ are not filtered.
   endpoint's inbound one. The guards apply to it too.
 - **Not covered.** Only the outer header is checked: a tunnel (IP in IP,
   GRE, ESP) carries any inner source, which a receiver that decapsulates
-  it trusts as much as it trusts the tunnel. DHCP is checked by
-  `chaddr` alone: a client identifier (option 61), which servers prefer
+  it trusts as much as it trusts the tunnel. DHCP options are not
+  parsed (a server should ignore a relay agent's option 82 from a
+  client, `giaddr` 0), and leases are bound by `chaddr` alone: a client identifier (option 61), which servers prefer
   for a lease, and DHCPv6's DUIDs are the guest's to choose, so a server
   that should not be fooled into releasing another's lease checks them
   against the MAC itself.

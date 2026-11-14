@@ -4,8 +4,10 @@
 //!
 //! - IPv4: the source is an allowed address, or 0.0.0.0 for a DHCP client
 //!   (UDP 68 -> 67).  A message to a DHCP server (UDP port 67) is a
-//!   client's, unfragmented, for the frame's source MAC (chaddr): one for
-//!   another's could release or decline its lease.
+//!   client's, unfragmented, for the frame's source MAC (chaddr) and not
+//!   relayed (hops and giaddr 0): one for another's MAC could release or
+//!   decline its lease (a client identifier still can: DESIGN.md), and a
+//!   relay names the subnet to lease from.
 //! - ARP: Ethernet over IPv4; the sender is an allowed address, or 0.0.0.0
 //!   for an RFC 5227 probe of an allowed address, and its MAC the frame's
 //!   source.
@@ -14,13 +16,13 @@
 //!   reports.  A Neighbor Advertisement's target is an allowed address;
 //!   link-layer address options of Neighbor Discovery are the frame's
 //!   source MAC, and its messages are unfragmented (RFC 6980), so that no
-//!   option is past what is checked.  (A probe of another's address would make its owner give
-//!   it up.)
+//!   option is past what is checked.  (A probe of another's address would
+//!   make its owner give it up.)
 //! - Guards: Router Advertisements, Redirects and Router Renumbering
 //!   (ICMPv6 134, 137, 138), ICMPv4 Redirects and Router Advertisements
-//!   (5, 9), and DHCP or DHCPv6 server and relay messages (UDP
-//!   source port 67 or 547, or to a client's port, 68 or 546) are dropped,
-//!   whatever their source.
+//!   (5, 9), and DHCP or DHCPv6 server and relay messages (UDP source port
+//!   67 or 547, to a client's port, 68 or 546, or a DHCPv6 server's or
+//!   relay's message type to 547) are dropped, whatever their source.
 //! - Everything else is dropped: other EtherTypes, VLAN tags (whose frames
 //!   would carry IP past these checks), malformed headers, and an IPv6
 //!   first fragment whose headers do not reach the upper-layer header.
@@ -209,11 +211,18 @@ fn ip4(f: &Filter, mac: &[u8; 6], p: &[u8]) -> Verdict {
     if f.allows(false, &src) { Verdict::Pass } else { Verdict::Spoofed }
 }
 
-/// A BOOTP request (op 1, Ethernet) whose client hardware address is
-/// `mac`.  `m` is the UDP payload, with whatever padding the frame has:
-/// at worst a server sees a short message it drops.
+/// A BOOTP request (op 1, Ethernet) from the client itself (no relay
+/// hops, no giaddr) whose client hardware address is `mac`.  `m` is the
+/// UDP payload, with whatever padding the frame has: at worst a server
+/// sees a short message it drops.
 fn dhcp_client(mac: &[u8; 6], m: &[u8]) -> bool {
-    m.len() >= 34 && m[..3] == [1, 1, 6] && m[28..34] == *mac
+    m.len() >= 34 && m[..4] == [1, 1, 6, 0] && m[24..28] == [0; 4] && m[28..34] == *mac
+}
+
+/// DHCPv6 message types only servers and relays send: Advertise, Reply,
+/// Reconfigure, Relay-forward, Relay-reply.
+fn dhcp6_server_type(t: u8) -> bool {
+    matches!(t, 2 | 7 | 10 | 12 | 13)
 }
 
 fn ip6(f: &Filter, mac: &[u8; 6], p: &[u8]) -> Verdict {
@@ -258,6 +267,9 @@ fn ip6(f: &Filter, mac: &[u8; 6], p: &[u8]) -> Verdict {
     if first {
         match nh {
             IPPROTO_UDP if l4.len() < 4 || be16(l4, 0) == 547 || be16(l4, 2) == 546 => return Verdict::Denied,
+            IPPROTO_UDP if be16(l4, 2) == 547 && l4.get(8).is_none_or(|&t| dhcp6_server_type(t)) => {
+                return Verdict::Denied;
+            }
             IPPROTO_ICMPV6 => {
                 let Some(&kind) = l4.first() else { return Verdict::Denied };
                 // Router Advertisement, Redirect, Router Renumbering.

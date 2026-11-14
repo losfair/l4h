@@ -463,6 +463,9 @@ impl Netd {
         }
         // is_return said outbound takes it; never switch it as it is.
         if return_only {
+            if let PortId::Guest(i) = from {
+                self.ports[i].as_mut().unwrap().drops += 1;
+            }
             return;
         }
         let isolated = self.is_isolated(from);

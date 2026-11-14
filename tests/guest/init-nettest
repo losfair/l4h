@@ -80,9 +80,11 @@ echo "NETTEST: isolated ports ok"
 
 # L3 filtering (DESIGN.md §9.3).  I sends from the address it was given
 # and reaches A; J was given .10 but uses .11: its ARP and IP are dropped.
+# J has no IPv6, whose link-local address (never given) would be dropped
+# too: its drops are the IPv4 and ARP it sent.
 run i "" --nic "$sw1,ip=192.168.1.9" --cmdline "console=hvc0 IP0=192.168.1.9/24 PING=192.168.1.1"
 grep -q "ping 192.168.1.1 ok" /tmp/i || fail "filtered port, its own address"
-run j "" --nic "$sw1,ip=192.168.1.10" --cmdline "console=hvc0 IP0=192.168.1.11/24 PING=192.168.1.1"
+run j "" --nic "$sw1,ip=192.168.1.10" --cmdline "console=hvc0 ipv6.disable=1 IP0=192.168.1.11/24 PING=192.168.1.1"
 grep -q "ping 192.168.1.1 failed" /tmp/j || fail "a filtered port sent from another address"
 l4hctl switch "$sw1" | awk -v vm="$vm_j" '$2 == vm && $6 > 0 { f = 1 } END { exit !f }' \
     || { l4hctl switch "$sw1"; fail "netd dropped none of j's frames"; }
@@ -142,6 +144,12 @@ l4hctl destroy "$vm_t" && l4hctl destroy "$id" || fail "destroy t, t2"
 l4hctl ep del "$ep" && l4hctl ep del "$ep0" || fail "ep del"
 [ "$(l4hctl ep list | wc -l)" = 1 ] || fail "ep del"
 echo "NETTEST: steering ok"
+# DHCP through a filter: DH leases from slirp as 0.0.0.0 (a client's
+# requests, for its own MAC), then uses the lease within its /24.
+run dh "" --nic "0,ip=10.0.2.0/24" --cmdline "console=hvc0 DHCP=1 PING=10.0.2.2"
+grep -q "NETVM: dhcp ok" /tmp/dh && grep -q "ping 10.0.2.2 ok" /tmp/dh || { cat /tmp/dh; fail "dhcp through a filter"; }
+l4hctl destroy "$vm_dh" || fail "destroy dh"
+echo "NETTEST: dhcp through a filter ok"
 l4hctl switch "$sw1"
 l4hctl switch "$sw2"
 l4hctl list

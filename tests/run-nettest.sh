@@ -16,7 +16,8 @@ mkdir -p "$out"
 "$root/tools/build-l4hctl.sh"
 "$l4h_cc" -O2 -static -Wall -Wextra -Werror "$root/tests/guest/slow-protocol.c" -o "$out/slow-protocol"
 "$root/tools/mkinitramfs.sh" "$out/slowvm.cpio.gz" "$root/tests/guest/init-slowvm" "$out/slow-protocol" >/dev/null
-"$root/tools/mkinitramfs.sh" "$out/netvm.cpio.gz" "$root/tests/guest/init-netvm" >/dev/null
+"$root/tools/mkinitramfs.sh" "$out/netvm.cpio.gz" "$root/tests/guest/init-netvm" \
+    "$root/tests/guest/udhcpc.script" >/dev/null
 "$root/tools/mkinitramfs.sh" "$out/nettest.cpio.gz" "$root/tests/guest/init-nettest" \
     "$l4h_ctl" "$out/netvm.cpio.gz" \
     "$out/slow-protocol" "$out/slowvm.cpio.gz" \
