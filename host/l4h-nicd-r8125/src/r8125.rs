@@ -30,6 +30,11 @@
 //! link is read on root's tick (F_TIMER).  As in Linux, the chip's own
 //! interrupt coalescing is off.
 //!
+//! Left out, all power, performance or cosmetics: the PCIe read request
+//! size (4096 in Linux; root's filter keeps Device Control), the D3 PLL
+//! settings (suspend), the LED modes (the firmware's stay), and reading
+//! the tally counters.
+//!
 //! Offloads: the chip's RX checksum verdict becomes DATA_VALID; TSO for
 //! TCP over IPv4 and IPv6 (untagged frames, MSS up to 2047, at most 64
 //! segments as Linux's RTL_GSO_MAX_SEGS_V2), but not on the RTL8125A,
@@ -191,7 +196,6 @@ const RX_ACCEPT_MASK: u32 = 0x3f;
 const TX_CONFIG_VAL: u32 = 7 << 8 | 3 << 24;
 /// C+ command: what Linux keeps of it (CPCMD_MASK), RX checksums on.
 const CPCMD_MASK: u16 = 1 << 13 | 1 << 6 | 1 << 5 | 3;
-const CPCMD_RX_VLAN: u16 = 1 << 6;
 const CPCMD_RX_CSUM: u16 = 1 << 5;
 const OCP_FLAG: u32 = 1 << 31;
 const EPHYAR_FLAG: u32 = 1 << 31;
@@ -262,6 +266,7 @@ const BMCR_PDOWN: u16 = 1 << 11;
 const BMCR_ISOLATE: u16 = 1 << 10;
 const BMCR_ANRESTART: u16 = 1 << 9;
 const BMSR_LSTATUS: u16 = 1 << 2;
+const BMSR_ANEGCOMPLETE: u16 = 1 << 5;
 /// 10/100 half and full, pause and asymmetric pause, selector 802.3.
 const ANAR_ADV: u16 = 0x0de1;
 const ANAR_MASK: u16 = 0x0fe0;
@@ -387,8 +392,8 @@ impl R8125 {
     pub fn offer(&self) -> Offer {
         let mut o = Offer::plain(self.mac);
         o.tx_csum = 1;
+        o.tx_frame_max = TX_FRAME_MAX as u32;
         if !self.chip.tso() {
-            o.tx_frame_max = TX_FRAME_MAX as u32;
             return o;
         }
         o.tx_gso_mask = 1 << 1 | 1 << 4;
@@ -396,9 +401,6 @@ impl R8125 {
         o.tx_mss_min = TSO_MIN_MSS as u32;
         o.tx_mss_max = TD_MSS_MAX as u32;
         o.tx_hdr_max = GTTCPHO_MAX as u32;
-        // GSO frames are bounded by it too (Offer::checked); transmit
-        // drops plain frames past TX_FRAME_MAX.
-        o.tx_frame_max = TSO_MAX as u32;
         o
     }
 
@@ -561,17 +563,21 @@ impl R8125 {
         // Probe (rtl_init_one): the link's L1 off, RX defaults, interrupts
         // off, the MAC's own init, a reset, the MAC address.
         r.disable_l1(hw);
-        let cp_cmd = (r.regs.r16(CPLUS_CMD) & CPCMD_MASK & !CPCMD_RX_VLAN) | CPCMD_RX_CSUM;
+        // C+ command as the chip has it (RxVlan is not the 8125s' VLAN
+        // switch: RxConfig is), RX checksums on.
+        let cp_cmd = (r.regs.r16(CPLUS_CMD) & CPCMD_MASK) | CPCMD_RX_CSUM;
+        // DASH: whether its firmware runs, before the MAC's init takes the
+        // chip from it (Linux rtl_dash_is_enabled).
+        let dash = chip == Chip::BP;
+        let dash_on = dash && r.eri_read(0x128, ERIAR_OOB) & 1 != 0;
         r.init_rxcfg();
         r.irq_mask_and_ack();
         r.hw_init();
         r.hw_reset();
         r.mac = r.read_mac();
         r.set_mac();
-        // DASH: its firmware learns the driver runs (rtl8168_driver_start,
+        // DASH's firmware learns the driver runs (rtl8168_driver_start,
         // which Linux does at the end of probe and again at open).
-        let dash = chip == Chip::BP;
-        let dash_on = dash && r.eri_read(0x128, ERIAR_OOB) & 1 != 0;
         if dash {
             r.dash_command(OOB_CMD_DRIVER_START);
         }
@@ -843,10 +849,12 @@ impl R8125 {
     }
 
     /// The link as the PHY has it: BMSR (read twice: its link bit latches
-    /// low) and the speed it negotiated (PHYSR).
+    /// low), down until autonegotiation completes (Linux
+    /// genphy_update_link), and the speed it negotiated (PHYSR).
     fn read_link(&self) -> LinkState {
         self.phy_r(BMSR);
-        let up = self.phy_r(BMSR) & BMSR_LSTATUS != 0;
+        let bmsr = self.phy_r(BMSR);
+        let up = bmsr & BMSR_LSTATUS != 0 && bmsr & BMSR_ANEGCOMPLETE != 0;
         let speed = if up { physr_speed(self.phy_r(PHYSR)) } else { 0 };
         LinkState::ethernet(up, speed)
     }
@@ -1120,8 +1128,12 @@ impl R8125 {
     }
 
     pub fn rx_done(&mut self) -> bool {
-        // Statuses set by what was drained; one set later interrupts.
+        // Statuses set by what was drained; one set later interrupts.  The
+        // clear is posted: read it back before looking at the ring, or a
+        // frame that completes meanwhile has its status cleared after the
+        // look, and raises nothing.
         self.regs.w32(ISR, CAUSE_RX);
+        self.commit();
         self.set_imr(CAUSE_RX, true);
         if self.rx_status(self.rx_next) & DESC_OWN == 0 {
             self.set_imr(CAUSE_RX, false);
@@ -1201,7 +1213,9 @@ impl R8125 {
 
     pub fn tx_interrupts(&mut self, on: bool) -> bool {
         if on {
+            // As in rx_done: the clear lands before the look.
             self.regs.w32(ISR, CAUSE_TX);
+            self.commit();
         }
         self.set_imr(CAUSE_TX, on);
         self.tx_cons != self.tx_prod && self.tx_done(self.tx_cons % TX_RING)
@@ -1299,8 +1313,7 @@ impl R8125 {
             });
             return true;
         }
-        // The offer's frame bound is the GSO one; a plain frame is at most
-        // the MTU and a tag, as Linux sends it (no jumbo frames here).
+        // Past the offer (the loop counts those as drops): never sent.
         if frame.len() > TX_FRAME_MAX {
             return true;
         }

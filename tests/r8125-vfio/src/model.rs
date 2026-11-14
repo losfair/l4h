@@ -351,7 +351,8 @@ fn bring_up(xid: u32, fw_slot: usize) -> Bench {
     {
         let mut phy = s.phy.lock().unwrap();
         phy.resize(0x8000, 0);
-        phy[0xa402 / 2] = 0x0004;
+        // Link up, autonegotiation complete.
+        phy[0xa402 / 2] = 0x0024;
         phy[0xa434 / 2] = 0x0210;
         // EEE at 2.5G advertised, legacy force mode on: what the chips
         // that change them change.
@@ -532,6 +533,19 @@ fn model() {
     assert_eq!((b_phy(&s, 0xb87c), b_phy(&s, 0xb87e)), (0x8551, 0x080e), "rtl8125_phy_param, a masked one last");
     let o = nic.offer();
     assert_eq!((o.tx_gso_mask, o.tx_gso_max, o.tx_mss_min, o.tx_mss_max), (1 << 1 | 1 << 4, 64000, 1000, 2047));
+    // Plain frames up to the MTU and a tag; GSO ones to 64000, as netd
+    // takes the offer.
+    let c = o.checked().unwrap();
+    assert_eq!((c.tx_frame_max, c.tx_gso_max), (1518, 64000));
+    // The link: down while autonegotiation is not complete, though BMSR
+    // says up; up again once it is.
+    let mut nic = nic;
+    s.phy.lock().unwrap()[0xa402 / 2] = 0x0004;
+    NicDriver::timer(&mut nic);
+    assert!(!NicDriver::link(&nic).up(), "link down before autonegotiation completes");
+    s.phy.lock().unwrap()[0xa402 / 2] = 0x0024;
+    NicDriver::timer(&mut nic);
+    assert!(NicDriver::link(&nic).up(), "link up after");
     let mut rig = Rig { nic, s: s.clone() };
 
     // ---- receive: 1200 frames, twice round the ring and more.

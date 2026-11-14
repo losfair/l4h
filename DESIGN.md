@@ -2559,9 +2559,11 @@ One RX ring of 512 2 KiB buffers. A frame spanning buffers is dropped, as
 Linux drops it. One TX ring of 256 descriptors, a frame each, with frames
 copied into a 1 MiB circular area that completions free in order. Every
 cause shares MSI-X entry 0. RX and TX causes are masked separately, and
-their status bits are acknowledged before they are unmasked. The chip's
+their status bits are acknowledged, and the write read back, before
+they are unmasked and the ring is looked at again. The chip's
 interrupt coalescing is off, as in Linux. Root's tick (`F_TIMER`) reads
-the link (BMSR, and PHYSR for the speed). A chip that reads all ones
+the link (BMSR, down until autonegotiation completes, and PHYSR for the
+speed). A chip that reads all ones
 panics the driver, so root restarts it. Receive: the chip's TCP/UDP checksum
 verdict becomes `DATA_VALID`. Transmit: TSO (not on the A) over untagged IPv4 and IPv6
 (MSS 1000–2047 and TCP at most 127 bytes in, so 64 segments at most, as
@@ -2571,8 +2573,9 @@ checksum on this chip, since `rtl8169_features_check` declines every
 frame `rtl_quirk_packet_padto` pads. So the driver completes `NEEDS_CSUM`
 frames itself, pads as Linux pads (to 60 bytes, more for short PTP UDP
 packets), and segments tagged and ECN GSO frames itself (Linux gives the
-chip no `TSO_ECN`). It drops plain frames longer than 1518 bytes: the
-offer's frame bound is the GSO one, and the driver sends no jumbo frames.
+chip no `TSO_ECN`). It offers plain frames up to 1518 bytes (no jumbo
+frames); the offer's GSO bound is separate (`Offer::checked` caps it at
+a slot, not at the plain-frame bound).
 There is no TX watchdog yet (Linux resets the chip on a TX timeout).
 
 Not yet run on hardware. `tests/r8125-vfio` compiles the driver unchanged
