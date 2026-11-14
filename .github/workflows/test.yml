@@ -276,7 +276,7 @@ jobs:
         run: tests/mkdebian.sh
       - name: Debian with systemd
         run: tests/run-debian.sh
-      - name: NAT and transparent proxy router VM (IPv4/IPv6 TCP/UDP, lockdown)
+      - name: NAT router VM
         run: tests/run-router.sh
       - name: Workload (fio verify, parallel build, fsck, reboot)
         run: tests/run-workload.sh

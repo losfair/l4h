@@ -2672,12 +2672,7 @@ do not merge. `tests/run-nettest.sh` covers DHCP and ping over the QEMU
 uplink, internal switches, multiple vNICs, isolation and MAC lock
 (`NETTEST_LEGACY=1`: a legacy virtio-net uplink). `tests/run-router.sh`
 uses a Debian router with nftables masquerade to connect an internal guest
-to the outside. It also exercises native nftables `tproxy` and `socket
-transparent` under `lockdown=confidentiality` with module loading disabled:
-IPv4/IPv6 TCP and UDP from another VM reach transparent listeners, retain
-their original destination addresses and ports, and receive replies from
-those destinations. Named counters require both expressions to match in
-all four cases.
+to the outside.
 
 **ConnectX-5.** `l4h-nicd-mlx5/src/mlx5.rs` supports PCI device 15b3:1017.
 Each PF uses one RX queue, one TX queue and one MSI-X event queue.
@@ -5541,7 +5536,7 @@ machine and guests of 256–512 MiB.
 | `tests/run-nictest.sh` | NIC drivers outside netd: two NICs, NIC 1's driver panics and hangs and is restarted while NIC 0's uplink keeps working, unbind and rebind, a restart of dom0's uplink driver (`L4H_QEMU_IOMMU=intel\|amd`: confined) |
 | `tests/fuzz-uplink` (in `run-fuzz.sh`) | the uplink channel: honest peers against a model, a producer that scribbles over descriptors and data, a consumer that writes any tail |
 | `tests/fuzz-ipfilter` (in `run-fuzz.sh`) | netd's L3 filter: each rule, exception and guard; canonical prefixes; mutated frames never pass with another source |
-| `tests/run-nettest.sh`, `tests/run-router.sh` | switches, uplink, multi-NIC, isolation, MAC lock, L3 filtering, steering, NAT and native nftables TPROXY router VM (IPv4/IPv6 TCP/UDP, confidentiality lockdown, no modules; `NETTEST_LEGACY=1`: legacy virtio-net uplink) |
+| `tests/run-nettest.sh`, `tests/run-router.sh` | switches, uplink, multi-NIC, isolation, MAC lock, L3 filtering, steering, NAT router VM (`NETTEST_LEGACY=1`: legacy virtio-net uplink) |
 | `tests/run-density.sh 30 256` | 30 guests on 4 cores stay responsive |
 | `tests/run-m6test.sh` | dom0 restart, CPU caps, steal time |
 | `tests/run-vtdtest.sh [--qemu]` | VT-d DMAR parsing, table/interrupt formats and address bounds; with QEMU, DMA, lifecycle, NIC and serial tests |

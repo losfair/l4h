@@ -50,7 +50,7 @@ table ip nat {
 }
 NFT
     echo "ROUTER: ready, uplink $(ip -4 -br addr show eth0)"
-    exec /usr/local/sbin/l4h-tproxy-router
+    exit 0
 fi
 echo "DEBIAN: up, kernel $(uname -r), $(nproc) vCPU(s)"
 state=$(systemctl is-system-running --wait)

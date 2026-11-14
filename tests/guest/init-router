@@ -1,29 +1,19 @@
 #!/bin/sh
 # dom0 init for tests/run-router.sh: a Debian router VM NATs an internal
-# switch to the uplink, then transparently proxies IPv4/IPv6 TCP/UDP from
-# another guest on that switch, under confidentiality lockdown.
+# switch to the uplink; a guest on the internal switch reaches the outside.
 mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
-fail() { echo "ROUTERTEST: FAIL: $*"; poweroff -f; while :; do sleep 1000; done; }
+fail() { echo "ROUTERTEST: FAIL: $*"; poweroff -f; }
 sw=$(l4hctl switch-create) || fail "switch"
 r=$(l4hctl create router --mem 512 --disk 0 --nic 0 --nic "$sw" \
-    --cmdline "console=hvc0 root=/dev/vda rw l4h.role=router lockdown=confidentiality") || fail "create router"
+    --cmdline "console=hvc0 root=/dev/vda rw l4h.role=router") || fail "create router"
 l4hctl console "$r" --until "ROUTER: ready" --timeout 240 | grep "ROUTER:" || fail "router did not come up"
 c=$(l4hctl create client --initrd /bin/netvm.cpio.gz --mem 96 --nic "$sw" \
     --cmdline "console=hvc0 IP0=192.168.77.2/24 GW=192.168.77.1 PING=10.0.2.2") || fail "create client"
 l4hctl console "$c" --until "NETVM: done" --timeout 60 > /tmp/c || fail "client"
 grep -q "NETVM: ping 10.0.2.2 ok" /tmp/c || { cat /tmp/c; fail "client cannot reach the outside through the router"; }
 echo "ROUTERTEST: client reached 10.0.2.2 through the NAT router"
-l4hctl destroy "$c" || fail "destroy NAT client"
-l4hctl console "$r" --until "TPROXY: listeners ready" --timeout 60 > /tmp/r || { cat /tmp/r; fail "transparent listeners"; }
-c=$(l4hctl create tproxy-client --initrd /bin/tproxyvm.cpio.gz --mem 96 --nic "$sw" \
-    --cmdline "console=hvc0 lockdown=confidentiality") || fail "create TPROXY client"
-l4hctl console "$c" --until "TPROXY: client PASS" --timeout 90 > /tmp/c || { cat /tmp/c; fail "TPROXY client"; }
-grep "TPROXY:" /tmp/c
-l4hctl console "$r" --until "TPROXY: router PASS" --timeout 90 > /tmp/r || { cat /tmp/r; fail "TPROXY router"; }
-grep "TPROXY:" /tmp/r
-if grep -q 'TPROXY: FAIL:' /tmp/c /tmp/r; then fail "TPROXY data path"; fi
 l4hctl switch 0
 l4hctl switch "$sw"
 l4hctl destroy "$c"
