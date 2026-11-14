@@ -70,6 +70,9 @@ struct Tx {
 struct Shared {
     /// The PHY's registers by OCP address / 2.
     phy: Mutex<Vec<u16>>,
+    /// Extended register writes (type, address, value); DASH reads 0x128
+    /// as enabled.
+    eri: Mutex<Vec<(u32, u32, u32)>>,
     /// The EPHY's registers.
     ephy: Mutex<[u16; 32]>,
     /// Frames to receive, with the status bits their descriptor gets.
@@ -83,7 +86,7 @@ struct Shared {
 fn chip(bar: usize, s: Arc<Shared>) {
     // The values the chip itself last left in the two access windows: any
     // other is a request.
-    let (mut gphy, mut ephy) = (0u32, 0u32);
+    let (mut gphy, mut ephy, mut eri) = (0u32, 0u32, 0u32);
     let (mut rx_cur, mut tx_cur, mut polling) = (0usize, 0usize, false);
     while !s.stop.load(Ordering::Relaxed) {
         let cmd = r8(bar + 0x37);
@@ -116,6 +119,18 @@ fn chip(bar: usize, s: Arc<Shared>) {
                 FLAG | v | regs[reg] as u32
             };
             w32(bar + 0x80, ephy);
+        }
+        let v = r32(bar + 0x74);
+        if v != eri {
+            let (ty, addr) = ((v >> 16) & 3, v & 0xfff);
+            eri = if v & FLAG != 0 {
+                s.eri.lock().unwrap().push((ty, addr, r32(bar + 0x70)));
+                v & !FLAG
+            } else {
+                w32(bar + 0x70, ((ty, addr) == (2, 0x128)) as u32);
+                FLAG | v
+            };
+            w32(bar + 0x74, eri);
         }
         let rx_pa = (r32(bar + 0xe8) as u64) << 32 | r32(bar + 0xe4) as u64;
         if rx_pa != 0 && cmd & 0x08 != 0 {
@@ -295,6 +310,7 @@ fn manifest() {
     let ids = |device| l4h_host::nicd::Ids { vendor: 0x10ec, device, subvendor: 0x1849, subdevice: 0x8125, class: 0x020000, revision: 5 };
     assert!(m.matching(&ids(0x8125)).is_some() && m.matching(&ids(0x3000)).is_some() && m.matching(&ids(0x8168)).is_none());
     assert_eq!(&m.firmware[1][..22], b"rtl_nic/rtl8125b-2.fw\0");
+    assert_eq!(&m.firmware[4][..23], b"rtl_nic/rtl8125bp-2.fw\0");
 }
 
 /// A chip of `xid` on the model, the firmware program (below) in bundle
@@ -410,11 +426,12 @@ impl Bench {
         self.s.ephy.lock().unwrap()[r]
     }
 
-    fn finish(self) {
+    fn finish(self) -> Arc<Shared> {
         let Bench { mut nic, s, thread, .. } = self;
         nic.stop();
         s.stop.store(true, Ordering::Relaxed);
         thread.join().unwrap();
+        s
     }
 }
 
@@ -430,8 +447,9 @@ fn ptp() -> Vec<u8> {
     ipv4(PEER, MAC, SRC, DST, 17, &udp)
 }
 
-/// The RTL8125A and D: their own steps of bring-up, and what differs in
-/// their data path (no TSO on the A, no UDP padding quirk on the D).
+/// The RTL8125A, D and BP: their own steps of bring-up, and what differs
+/// in their data path (no TSO on the A, no UDP padding quirk on the D and
+/// BP), and the BP's DASH commands.
 #[test]
 fn variants() {
     let _one = CHIP.lock().unwrap_or_else(|e| e.into_inner());
@@ -472,8 +490,29 @@ fn variants() {
         let f = ptp();
         rig.send(&f, &[0; HDR]);
         assert_eq!(rig.sent(1)[0].frame.len(), 60, "the D pads to ETH_ZLEN only");
-        Bench { nic: rig.nic, ..b }.finish();
+        let s = Bench { nic: rig.nic, ..b }.finish();
+        assert!(s.eri.lock().unwrap().is_empty(), "no DASH on the D");
     }
+
+    // RTL8125BP: the D's MAC start, its own PHY parameters, DASH told the
+    // driver starts and stops.
+    let b = bring_up(0x681, 4);
+    assert_eq!(b.nic.chip, r8125::Chip::BP);
+    assert_eq!(b.nic.offer().tx_gso_mask, 1 << 1 | 1 << 4, "TSO on the BP");
+    assert_ne!(r32(b.bar + 0x44) & 1 << 11, 0, "pause slot");
+    assert_eq!((r32(b.bar + 0xa80), r16(b.bar + 0x7a)), (0, 0xffff), "coalescing cleared to 0xb00, INT_CFG1 left");
+    assert!((0..32).all(|r| b.ephy(r) == 0), "no EPHY table");
+    assert_eq!((b.phy(0xb87c), b.phy(0xb87e)), (0x808f, 0x9000), "rtl8125bp_hw_phy_config's rtl8125_phy_params");
+    assert_eq!((b.phy(0xa436), b.phy(0xa438)), (0x8174, 0x1800), "and its r8168g_phy_params");
+    assert_eq!((b.phy(0xa6d4) & 1, b.phy(0xa5b4)), (1, 0), "EEE left, legacy force mode off");
+    let start = [(2, 0x14, 5), (2, 0x18, 0), (2, 0x10, 1)];
+    assert_eq!(*b.s.eri.lock().unwrap(), start, "DASH: driver start");
+    let mut rig = Rig { nic: b.nic, s: b.s.clone() };
+    let f = ptp();
+    rig.send(&f, &[0; HDR]);
+    assert_eq!(rig.sent(1)[0].frame.len(), 60, "the BP pads to ETH_ZLEN only");
+    let s = Bench { nic: rig.nic, ..b }.finish();
+    assert_eq!(s.eri.lock().unwrap()[3..], [(2, 0x14, 6), (2, 0x18, 0), (2, 0x10, 1)], "DASH: driver stop");
 }
 
 /// The two tests share DMA memory: one chip at a time.

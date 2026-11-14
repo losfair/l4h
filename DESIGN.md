@@ -2519,20 +2519,26 @@ has no FLR); with `L4H_QEMU_IOMMU=intel|amd` it is the QEMU test of a
 confined driver (virtio drivers never are), and must cause no IOMMU fault.
 
 **Realtek RTL8125.** `l4h-nicd-r8125/src/r8125.rs` follows Linux `r8169`
-for the RTL8125A, the RTL8125B and RTL8125BG, and the RTL8125D
-(`RTL_GIGA_MAC_VER_61`, `63` and `64`; 10ec:8125, and 10ec:3000, the Killer
-E3000). The chip's XID tells them apart. The RTL8125BP has the same PCI ID
-and adds DASH management, and the driver refuses it. The chips differ
-only in bring-up register values, which the driver takes from Linux per
-chip:
+for the RTL8125A, the RTL8125B and RTL8125BG, the RTL8125D and the
+RTL8125BP (`RTL_GIGA_MAC_VER_61`, `63`, `64` and `66`; 10ec:8125, and
+10ec:3000, the Killer E3000). The chip's XID tells them apart. The chips
+differ only in bring-up register values, which the driver takes from
+Linux per chip:
 - RX configuration: no pause slot on the A.
 - FIFO drain: the A has no stop request.
 - Interrupt coalescing: the range cleared differs.
-- EPHY table: the A and B each have their own, the D has none.
+- EPHY table: the A and B each have their own, the D and BP have none.
 - MAC values: a few at 0xe614, 0xe63e and 0xeb62.
 - PHY setup: the A's is long, with its firmware midway; the B's is
-  medium; the D's is short.
-- Firmware: `rtl8125a-3`, `rtl8125b-2`, `rtl8125d-1` or `-2`.
+  medium; the D's and BP's are short.
+- Firmware: `rtl8125a-3`, `rtl8125b-2`, `rtl8125d-1` or `-2`,
+  `rtl8125bp-2`.
+
+The BP's MAC start is the D's. The BP also has DASH, Realtek's
+out-of-band management, and the driver sends DASH's firmware Linux's
+driver-start and driver-stop commands through the chip's extended
+registers. Linux's other DASH handling is for suspend and Wake-on-LAN,
+which a nicd does not do.
 
 Two of Linux's choices for the A carry over: no TSO (reported TX
 timeouts) and no EEE at 2.5G. The UDP padding quirk applies to the A and
@@ -2653,7 +2659,7 @@ root restarts. Root and netd know no device kind. The design is issue
 - **Manifests and the bundle.** A manifest says which PCI IDs a driver
   takes and what it needs: memory BARs required and optional, write-
   combining BARs, a window per BAR, MSI-X entries, DMA region size, channel
-  size, firmware blob names, configuration-space write windows, image
+  size, firmware blob names (8 at most), configuration-space write windows, image
   size. Drivers ship in a bundle (`tools/mkdrivers.py`): the boot module
   `l4h-drivers`, or the copy built into root. Root reads each manifest
   with bounds checks, checks the device against it (BARs present and

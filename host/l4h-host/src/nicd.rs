@@ -27,7 +27,8 @@ pub const MAX_UPLINKS: usize = crate::net::MAX_UPLINKS;
 /// else (l4h_task::elf::Elf::section), with bounds checks.
 pub const MANIFEST_SECTION: &str = ".l4h.driver";
 pub const MANIFEST_MAGIC: u32 = 0x4e43_4434; // "4DCN"
-pub const MANIFEST_ABI: u32 = 1;
+/// 2: eight firmware names (MAX_FIRMWARE), for the RTL8125's five.
+pub const MANIFEST_ABI: u32 = 2;
 
 /// Manifest::class.
 pub const CLASS_ETHERNET: u32 = 1;
@@ -109,7 +110,7 @@ impl CfgWindow {
 }
 
 pub const MAX_MATCHES: usize = 32;
-pub const MAX_FIRMWARE: usize = 4;
+pub const MAX_FIRMWARE: usize = 8;
 pub const FIRMWARE_NAME: usize = 48;
 pub const MAX_CFG_WINDOWS: usize = 4;
 pub const NAME_LEN: usize = 16;

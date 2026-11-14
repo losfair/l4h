@@ -1,8 +1,9 @@
 //! Realtek RTL8125 2.5 GbE driver (Linux `r8169`), for the RTL8125A, the
-//! RTL8125B and RTL8125BG, and the RTL8125D (10ec:8125, and 10ec:3000 as
-//! the Killer E3000): Linux's RTL_GIGA_MAC_VER_61, 63 and 64.  The chip's
-//! XID tells them apart (Chip); the RTL8125BP (VER_66), which also has
-//! the PCI ID and adds DASH management, is refused.
+//! RTL8125B and RTL8125BG, the RTL8125D and the RTL8125BP (10ec:8125, and
+//! 10ec:3000 as the Killer E3000): Linux's RTL_GIGA_MAC_VER_61, 63, 64 and
+//! 66.  The chip's XID tells them apart (Chip).  The RTL8125BP has DASH,
+//! Realtek's out-of-band management: the driver tells its firmware when
+//! it starts and stops, as Linux does.
 //!
 //! Registers are little-endian in BAR 2 (BAR 0 is I/O ports, not used);
 //! the MSI-X table is in BAR 4, which root maps for it.  One RX and one TX
@@ -50,7 +51,8 @@ use crate::sdk::offload;
 /// The PHY firmware patches Linux applies, from linux-firmware, by
 /// Chip::of's index, if the driver bundle has them (Linux works without,
 /// with a warning).
-const FIRMWARE: [&str; 4] = ["rtl_nic/rtl8125a-3.fw", "rtl_nic/rtl8125b-2.fw", "rtl_nic/rtl8125d-1.fw", "rtl_nic/rtl8125d-2.fw"];
+const FIRMWARE: [&str; 5] =
+    ["rtl_nic/rtl8125a-3.fw", "rtl_nic/rtl8125b-2.fw", "rtl_nic/rtl8125d-1.fw", "rtl_nic/rtl8125d-2.fw", "rtl_nic/rtl8125bp-2.fw"];
 
 /// What the driver drives and needs (l4h_host::nicd::Manifest).
 pub const MANIFEST: crate::sdk::Manifest = crate::sdk::Manifest {
@@ -92,6 +94,8 @@ const CONFIG2: usize = 0x53;
 const CONFIG3: usize = 0x54;
 const CONFIG5: usize = 0x56;
 const INT_CFG1: usize = 0x7a;
+const ERIDR: usize = 0x70;
+const ERIAR: usize = 0x74;
 const EPHYAR: usize = 0x80;
 const TX_POLL: usize = 0x90;
 const OCPDR: usize = 0xb0;
@@ -120,6 +124,9 @@ pub enum Chip {
     B,
     /// RTL_GIGA_MAC_VER_64.
     D,
+    /// RTL_GIGA_MAC_VER_66: the D's MAC start, its own PHY parameters,
+    /// DASH.
+    BP,
 }
 
 impl Chip {
@@ -131,6 +138,7 @@ impl Chip {
             0x641 => Some((Chip::B, 1)),
             0x688 => Some((Chip::D, 2)),
             0x689 => Some((Chip::D, 3)),
+            0x681 => Some((Chip::BP, 4)),
             _ => None,
         }
     }
@@ -140,7 +148,13 @@ impl Chip {
             Chip::A => "RTL8125A",
             Chip::B => "RTL8125B",
             Chip::D => "RTL8125D",
+            Chip::BP => "RTL8125BP",
         }
+    }
+
+    /// rtl8125_quirk_udp_padto applies to VER_61 to 63.
+    fn udp_pad_quirk(self) -> bool {
+        matches!(self, Chip::A | Chip::B)
     }
 
     /// Linux sets TSO and scatter-gather on by default for all but the
@@ -181,6 +195,10 @@ const CPCMD_RX_VLAN: u16 = 1 << 6;
 const CPCMD_RX_CSUM: u16 = 1 << 5;
 const OCP_FLAG: u32 = 1 << 31;
 const EPHYAR_FLAG: u32 = 1 << 31;
+const ERIAR_FLAG: u32 = 1 << 31;
+const ERIAR_OOB: u32 = 2 << 16;
+const OOB_CMD_DRIVER_START: u32 = 0x05;
+const OOB_CMD_DRIVER_STOP: u32 = 0x06;
 
 /// Interrupt causes (IntrMask/IntrStatus).
 const CAUSE_RX: u32 = 1 << 0 | 1 << 1;
@@ -469,6 +487,26 @@ impl R8125 {
         if self.wait(10, 100, |s| s.regs.r32(EPHYAR) & EPHYAR_FLAG != 0) { self.regs.r32(EPHYAR) as u16 } else { 0xffff }
     }
 
+    /// Linux _rtl_eri_write and _rtl_eri_read: the chip's extended
+    /// registers, of a type (ERIAR_OOB: the DASH firmware's).
+    fn eri_write(&self, addr: u32, mask: u32, v: u32, ty: u32) {
+        self.regs.w32(ERIDR, v);
+        self.regs.w32(ERIAR, ERIAR_FLAG | ty | mask << 12 | addr);
+        self.wait(100, 100, |s| s.regs.r32(ERIAR) & ERIAR_FLAG == 0);
+    }
+
+    fn eri_read(&self, addr: u32, ty: u32) -> u32 {
+        self.regs.w32(ERIAR, ty | 0xf << 12 | addr);
+        if self.wait(100, 100, |s| s.regs.r32(ERIAR) & ERIAR_FLAG != 0) { self.regs.r32(ERIDR) } else { u32::MAX }
+    }
+
+    /// rtl8125bp_driver_start and _stop: the command, then its doorbell.
+    fn dash_command(&self, cmd: u32) {
+        self.eri_write(0x14, 1, cmd, ERIAR_OOB);
+        self.eri_write(0x18, 1, 0, ERIAR_OOB);
+        self.eri_write(0x10, 1, 1, ERIAR_OOB);
+    }
+
     fn unlock_config(&self) {
         self.regs.w8(CFG9346, CFG9346_UNLOCK);
     }
@@ -489,8 +527,8 @@ impl R8125 {
         }
         let xid = (txconfig >> 20) & 0xfcf;
         let Some((chip, fw_index)) = Chip::of(xid) else {
-            l4h_rt::info!("nicd {}: RTL8125 XID {:03x} is not an RTL8125A, B or D", n, xid);
-            return Err("not an RTL8125A, B or D");
+            l4h_rt::info!("nicd {}: RTL8125 XID {:03x} is not an RTL8125 this driver knows", n, xid);
+            return Err("an unknown RTL8125 XID");
         };
         let mut dma = hw.dma();
         let (rx_ring, rx_ring_pa) = dma.alloc(RX_RING * DESC, 4096);
@@ -530,6 +568,13 @@ impl R8125 {
         r.hw_reset();
         r.mac = r.read_mac();
         r.set_mac();
+        // DASH: its firmware learns the driver runs (rtl8168_driver_start,
+        // which Linux does at the end of probe and again at open).
+        let dash = chip == Chip::BP;
+        let dash_on = dash && r.eri_read(0x128, ERIAR_OOB) & 1 != 0;
+        if dash {
+            r.dash_command(OOB_CMD_DRIVER_START);
+        }
 
         // Open (rtl8169_up): the PHY, then the MAC.
         r.phy_w(BMCR, r.phy_r(BMCR) & !BMCR_PDOWN);
@@ -556,10 +601,11 @@ impl R8125 {
         r.link = r.read_link();
         let mac = r.mac;
         l4h_rt::info!(
-            "nicd {}: {:02x}:{:02x}.{} {}, mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, PHY firmware {}, link {} {}M",
+            "nicd {}: {:02x}:{:02x}.{} {}, mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, PHY firmware {}{}, link {} {}M",
             n, c.pci_bdf >> 8, (c.pci_bdf >> 3) & 0x1f, c.pci_bdf & 7, chip.name(),
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
             if fw.is_some() { "patched" } else { "not in the bundle" },
+            if !dash { "" } else if dash_on { ", DASH enabled" } else { ", DASH disabled" },
             if r.link.up() { "up" } else { "down" }, r.link.speed(),
         );
         Ok(r)
@@ -658,8 +704,9 @@ impl R8125 {
         Ok(())
     }
 
-    /// Linux rtl8125a_2_hw_phy_config, rtl8125b_hw_phy_config and
-    /// rtl8125d_hw_phy_config, with the firmware where each applies it.
+    /// Linux rtl8125a_2_hw_phy_config, rtl8125b_hw_phy_config,
+    /// rtl8125d_hw_phy_config and rtl8125bp_hw_phy_config, with the
+    /// firmware where each applies it.
     fn hw_phy_config(&mut self, n: usize, fw: Option<(&str, &[u8])>) -> Result<(), &'static str> {
         match self.chip {
             Chip::A => {
@@ -676,6 +723,15 @@ impl R8125 {
             Chip::D => {
                 self.apply_firmware(n, fw)?;
                 self.enable_gphy_10m();
+                self.legacy_force_mode();
+            }
+            Chip::BP => {
+                self.apply_firmware(n, fw)?;
+                self.enable_gphy_10m();
+                self.phy_param_a43(0x8010, 0x0800, 0x0000);
+                self.phy_param_b87(0x8088, 0xff00, 0x9000);
+                self.phy_param_b87(0x808f, 0xff00, 0x9000);
+                self.phy_param_a43(0x8174, 0x2000, 0x1800);
                 self.legacy_force_mode();
             }
         }
@@ -827,7 +883,7 @@ impl R8125 {
     }
 
     /// Linux rtl_hw_start with rtl_hw_start_8125 and the chip's
-    /// rtl_hw_start_8125a_2, _8125b or _8125d (ASPM and clock requests off,
+    /// rtl_hw_start_8125a_2, _8125b or _8125d (the BP's too; ASPM and clock requests off,
     /// which Linux turns on only when it controls the link's ASPM).
     fn hw_start(&mut self, cp_cmd: u16, rx_pa: u64, tx_pa: u64, hw: &Hw) {
         let regs = self.regs;
@@ -881,7 +937,7 @@ impl R8125 {
                 (0x22, 0x0030, 0x0020),
                 (0x62, 0x0030, 0x0020),
             ],
-            Chip::D => &[],
+            Chip::D | Chip::BP => &[],
         };
         for &(reg, mask, bits) in ephy {
             self.ephy_w(reg, (self.ephy_r(reg) & !mask) | bits);
@@ -1236,7 +1292,7 @@ impl R8125 {
                 return false;
             }
             let buf = unsafe { core::slice::from_raw_parts_mut(self.seg as *mut u8, SEG_BUF) };
-            let quirk = self.chip != Chip::D;
+            let quirk = self.chip.udp_pad_quirk();
             offload::segment(frame, hdr, buf, |s, _| {
                 let len = s.len().max(pad_to(s, quirk));
                 self.post_tx(s, len, 0, 0, |_| {});
@@ -1248,7 +1304,7 @@ impl R8125 {
         if frame.len() > TX_FRAME_MAX {
             return true;
         }
-        let len = frame.len().max(pad_to(frame, self.chip != Chip::D));
+        let len = frame.len().max(pad_to(frame, self.chip.udp_pad_quirk()));
         let take = len.next_multiple_of(TX_ALIGN);
         if !self.make_room(1, take, take) {
             return false;
@@ -1267,6 +1323,10 @@ impl R8125 {
 
     pub fn stop(&mut self) {
         self.cleanup();
+        // rtl8169_down: DASH's firmware takes the chip back.
+        if self.chip == Chip::BP {
+            self.dash_command(OOB_CMD_DRIVER_STOP);
+        }
     }
 }
 
