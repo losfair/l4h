@@ -175,10 +175,10 @@ pub fn doorbell(alloc: &mut Alloc, vector: u32, ntfn: sel4::cap::Notification) -
 }
 
 /// Ring a peer's doorbell.
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(all(target_arch = "x86_64", l4h_kernel_multikernel)))]
 pub fn ring(_: u32, _: u32) {}
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", l4h_kernel_multikernel))]
 pub fn ring(peer_slot: u32, vector: u32) {
     let ctl = slot::IRQ_CONTROL.cap();
     let err = sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_IRQControl_SendPeer(ctl.bits(), peer_slot as u64, vector as u64));

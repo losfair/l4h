@@ -7,6 +7,17 @@
 use std::{env, fs, path::PathBuf};
 
 fn main() {
+    // Multikernel doorbells are an l4h seL4 extension that FL4 omits.
+    // Inspect the interface used to generate the bindings, so this also
+    // follows a different kernel's actual capabilities.
+    println!("cargo:rustc-check-cfg=cfg(l4h_kernel_multikernel)");
+    println!("cargo:rerun-if-env-changed=SEL4_PREFIX");
+    let prefix = PathBuf::from(env::var("SEL4_PREFIX").expect("SEL4_PREFIX"));
+    let arch_xml = prefix.join("libsel4/include/interfaces/object-api-arch.xml");
+    println!("cargo:rerun-if-changed={}", arch_xml.display());
+    if fs::read_to_string(&arch_xml).expect("kernel architecture interface").contains("id=\"X86IRQControlSendPeer\"") {
+        println!("cargo:rustc-cfg=l4h_kernel_multikernel");
+    }
     println!("cargo:rerun-if-env-changed=L4H_VERSION");
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     for (var, file) in [

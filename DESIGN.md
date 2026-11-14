@@ -989,6 +989,9 @@ vendor, as seL4 makes it).
   it gives VSpace roots, and `bootinfo.nr_ept_roots` says how many. With
   none the guest registers no `/dev/kvm`. Each KVM VM takes a root, so a
   guest runs at most 8 VMs at a time.
+  In a development build with `KernelVTX=OFF`, root omits the probe,
+  vmmgr gives out no EPT roots, and the Linux KVM option is unavailable
+  when building against that kernel's headers.
 - **Running a vCPU.** `KVM_RUN` calls `seL4_VMEnter` on the kTCB of the
   L4H vCPU it runs on; `vcpu_load` binds the VCPU and the VM's EPT root to
   that kTCB when they are not already. The exit is the call returning,
@@ -3930,7 +3933,7 @@ none. dom0 runs no host hardware drivers.
 
 | Area | Operations |
 |------|------------|
-| Host | `host_version` (the build version; the tag for a release); `host_info` (cores, free/total bytes, disk, VM and NIC counts); `pci_list` (boot inventory, IDs, class and service owner); `host_reboot`; `rtc_set`; `iommu_info` (§9.5); `log_read` (§10) |
+| Host | `host_version` (build version and seL4/FL4 kernel); `host_info` (cores, free/total bytes, disk, VM and NIC counts); `pci_list` (boot inventory, IDs, class and service owner); `host_reboot`; `rtc_set`; `iommu_info` (§9.5); `log_read` (§10) |
 | Guests | `vm_create`, `vm_load`, `vm_start`, `vm_shutdown`, `vm_destroy`, `vm_list`, `vm_info` (cores of the first six vCPUs), `vm_stats` (CPU use and cap), `vm_set_sched`, `vm_set_mem`, `vm_mem_info` (§8.5), `vm_trust` (flags, §10.2) |
 | Block | `blk_attach` (disk, read-only and volatile flags, LBA window), `blk_write` (provisioning), `blk_info`, `disk_info` |
 | Network | `switch_create`, `switch_attach_uplink`, `nic_create` (MAC, MAC lock, isolation), `switch_info` (ports with VM and MAC, counters), `nic_info` (PCI address, switch, MAC) |
@@ -4757,7 +4760,12 @@ injects these failures in a host built with `L4H_TEST_INJECT=1`;
   options fixed at build time. `tools/build-efi.sh` builds them into
   `build/efi/`: `l4h-generic.efi` (x2APIC, PCID: QEMU, GCE, EC2),
   `l4h-xapic-nopcid.efi` (Latitude.sh, below) and `l4h-skim-xapic-nopcid.efi`
-  (Meltdown isolation, xAPIC, no PCID). All variants share one `l4h-root`.
+  (Meltdown isolation, xAPIC, no PCID). These seL4 variants share one
+  `l4h-root`. It also builds `l4h-fl4.efi` with the pinned public FL4
+  kernel and a separately rebuilt host, Linux guest and module tree
+  (`tools/build-fl4-efi.sh`, §14.2). FL4 detects the CPU features at boot;
+  one application covers its x86_64 targets, with single-kernel boots
+  and no nested KVM.
 - **Platform discovery.** seL4 reads ACPI (MADT, cores, IOAPIC). `l4h-root`
   enumerates PCI over MCFG/ECAM or port I/O config and allocates MSI/MSI-X
   through `seL4_IRQControl_GetMSI`. A device names its own BAR addresses,
@@ -4769,9 +4777,9 @@ injects these failures in a host built with `L4H_TEST_INJECT=1`;
 - **Releases.** CI (`.github/workflows/release.yml`) builds, for x86_64, and
   attaches to the GitHub release of each pushed `v*` tag, with
   `SHA256SUMS`:
-  - all three applications, in release mode, with the components packed
+  - all four applications, in release mode, with the components packed
     without debug information;
-  - `l4h-bios-x86_64.tar.xz`: l4h's BIOS files, with each variant's kernel as
+  - `l4h-bios-x86_64.tar.xz`: l4h's BIOS files, with each seL4 variant's kernel as
     `kernel-VARIANT.elf`, for the installer;
   - `l4h-dom0-x86_64.tar.xz` (`tools/build-dom0.sh`): the dom0 userspace
     package, a static `l4hctl`, an example `l4h.conf` and the installer
@@ -4781,13 +4789,19 @@ injects these failures in a host built with `L4H_TEST_INJECT=1`;
     variant's kernel, its multikernel slot kernels `kernel-VARIANT-sK.elf`,
     the shim and the guest kernel `vmlinux`), for `addr2line` on fault
     addresses;
+  - `l4h-debug-fl4-x86_64.tar.xz`: the FL4 build unstripped (kernel,
+    root, host components, NIC drivers and guest `vmlinux`), with the
+    source commit in `fl4-revision`;
   - `l4h-attest.py`, the attestation verifier (§10.2);
   - `l4h-manual.pdf`, the user manual.
 
   No aarch64 binaries are published.
 - **Version.** Host builds use `L4H_VERSION` when set, otherwise `git
   describe --tags --match 'v*' --always --dirty`, or `unknown` without Git
-  metadata; release builds set it to the tag. `l4hctl version` reports it.
+  metadata; release builds set it to the tag. `l4hctl version` appends the
+  kernel selected by `SEL4_PREFIX`: `v2026.10.1 (seL4)` or
+  `v2026.10.1 (FL4)`. The installed `fl4-revision` identifies FL4;
+  the release tag itself stays unchanged.
 
 ### 11.1 Targets
 
@@ -5444,6 +5458,77 @@ tools/build-kernel.sh                 # patched seL4 -> build/sel4
 tests/run-selftest.sh 4               # build Linux + host, boot a 4-vCPU guest self-test
 ```
 
+To build without seL4's VT-x/AMD-V support for development, select a
+separate kernel and use its headers for both the host and Linux guest:
+
+```sh
+L4H_VTX=OFF L4H_KERNEL_VARIANT=no-vtx tools/build-kernel.sh
+export SEL4_PREFIX="$PWD/build/sel4-no-vtx"
+tools/build-host.sh
+L4H_KERNEL_VARIANT=no-vtx tests/run-selftest.sh 4
+```
+
+`SEL4_PREFIX` also selects the headers copied into the guest module tree.
+The Linux build disables KVM when these headers lack `CONFIG_VTX`.
+Rebuild both host and guest when changing this option: seL4's invocation
+labels differ. The shipped configurations still use `KernelVTX=ON`;
+`no-vtx` is not a release variant. `tests/run-novtxtest.sh` builds this
+development kernel and runs the guest self-test with 1 and 4 vCPUs.
+
+FL4 is also a release option on x86_64. `tools/build-fl4.sh` fetches the
+public source at `kernel/fl4/REVISION`. To try a different source commit,
+start from a frozen worktree rather than an FL4 checkout being edited:
+
+```sh
+git -C /path/to/FL4 worktree add --detach /path/to/FL4-l4h-frozen <commit>
+export L4H_FL4_SOURCE=/path/to/FL4-l4h-frozen
+tools/build-fl4.sh
+SEL4_PREFIX="$PWD/build/sel4-fl4" L4H_KERNEL_VARIANT=fl4 tests/run-selftest.sh 4
+```
+
+The tested FL4 revision is `86880d5b438625daee315ba8bd57cebce3cd155b`.
+`prepare-fl4.sh` clones the pinned public revision, or the frozen override,
+into `build/FL4-src` without applying any kernel patches. The source
+worktree is not edited.
+`build-fl4.sh` builds the kernel and FL4's own libsel4 together, installs
+them in `build/sel4-fl4`, and records the source commit in `fl4-revision`.
+FL4's own syscall XML is installed unchanged; the bindings use FL4's
+MCS syscall numbers.
+
+Rebuild the host, Linux guest and modules with this `SEL4_PREFIX`;
+FL4 is source compatible with the seL4 API, with different numbering and
+object sizes. The host uses the selected kernel's retype fan-out limit
+(256 on FL4). The guest's FPU scratch area starts after the 1 KiB IPC
+buffer, leaving 3 KiB for FL4's 2696-byte standard XSAVE image.
+Multikernel partitions and nested KVM are unavailable on FL4. It detects
+the APIC, PCID, FS/GS and FPU features at boot, so the shipped seL4 CPU
+variants do not apply.
+
+`L4H_RELEASE=1 tools/build-fl4-efi.sh` builds `build/efi/l4h-fl4.efi` and
+its matching `l4h-debug-fl4-x86_64.tar.xz`; `build-efi.sh` builds them after
+packaging the three seL4 variants. Each stack uses its own libsel4 headers,
+and the FL4 application carries no multikernel shim. To make a UEFI disk
+from the release binary, use `tools/mkimage.sh -e build/efi/l4h-fl4.efi
+-i dom0.cpio.gz -c l4h.conf build/l4h-fl4.raw`.
+
+`tests/run-fl4test.sh` runs the 1- and 4-vCPU self-tests,
+4-vCPU disk I/O, networking through a dom0 restart, and balloon reporting.
+With `L4H_RELEASE=1` it also runs the ABI/module-tree test: FL4's debug
+profile omits l4h's debug-syscall MCP filter, so the ABI test's deliberate
+untrapped `DebugHalt` probe requires FL4's release profile.
+Release CI runs this suite and boots the packaged `l4h-fl4.efi` through
+OVMF with `UEFI_EFI=build/efi/l4h-fl4.efi tests/run-uefitest.sh`, checking
+the module tree and dom0 networking. The tested revision includes upstream
+fixes for [INT gates](https://github.com/losfair/FL4/issues/1),
+[device alignment](https://github.com/losfair/FL4/issues/2),
+[retype configuration](https://github.com/losfair/FL4/issues/3),
+[rust-sel4 XML compatibility](https://github.com/losfair/FL4/issues/4),
+[speculative refill nontermination](https://github.com/losfair/FL4/issues/5),
+[a reschedule IPI left in service](https://github.com/losfair/FL4/issues/6),
+[SetTLSBase syscall trapping](https://github.com/losfair/FL4/issues/7), and
+[UEFI ACPI discovery](https://github.com/losfair/FL4/issues/8).
+The l4h integration applies no FL4 fixes.
+
 For AArch64, build the kernel and loader once, then select the guest ISA
 with `L4H_ARCH`. Linux outputs go to `build/linux-l4h-aarch64` and the
 kernel to `build/sel4-aarch64`.
@@ -5476,7 +5561,7 @@ Inside dom0, `l4hctl` with no arguments prints the control commands, for
 example:
 
 ```sh
-l4hctl version                       # running host's version, e.g. v2026.10.1
+l4hctl version                       # e.g. v2026.10.1 (seL4) or v2026.10.1 (FL4)
 l4hctl logs --follow                 # retained host diagnostics and VM stop reasons
 l4hctl create web --initrd /web.cpio.gz --mem 512 --vcpus 2 \
     --disk 0 --nic 0
@@ -5484,7 +5569,7 @@ l4hctl console 1 --follow
 ```
 
 When building `l4h-root` directly with Cargo, set `L4H_VERSION` explicitly;
-without it the host reports `unknown`.
+without it the host reports `unknown (seL4)` or `unknown (FL4)`.
 
 **Test environment.** The development machine has KVM, which QEMU uses
 only as a fast CPU to mimic a cloud VM: `-cpu host,-vmx,-svm -smp 4`, with
@@ -5503,6 +5588,8 @@ machine and guests of 256–512 MiB.
 | `python3 tests/test_installer.py` | installer preflight, verified downloads, EFI changes, updates and rollback without touching the host |
 | `tests/run-install-vm.sh debian-13-nocloud-amd64.qcow2 [release-directory] [1\|2]` | in a disposable UEFI/KVM VM, install from native Debian with one or two uplinks, verify each switch and network, then return to native Linux; uses prebuilt releases and `sudo -u "$L4H_QEMU_USER"` (defaults to the invoking user); `INSTALL_VM_SWAP_NAMES=1` with two NICs also tests exchanging eth0/eth1 names; `INSTALL_VM_FIRMWARE=bios INSTALL_VM_MEMORY=1G INSTALL_VM_CPUS=1` tests small-VM defaults through BIOS GRUB |
 | `tests/run-versiontest.sh` | host version metadata: release tags, development builds, overrides and worktrees |
+| `tests/run-novtxtest.sh` | builds the host and Linux guest with `KernelVTX=OFF` headers and boots the guest self-test with 1 and 4 vCPUs; Linux KVM stays disabled and root never probes a VCPU object |
+| `tests/run-fl4test.sh` | builds the pinned public FL4 revision (or a frozen `L4H_FL4_SOURCE` override); tests 1- and 4-vCPU Linux, 4-vCPU disk I/O, networking and balloon reporting; `L4H_RELEASE=1` also checks the ABI and guest module tree |
 | `tests/run-flagstest.sh` | focused flags-only boot: console/display seals, kernel taints, userspace gates and instance reuse, on either architecture |
 | `tests/run-acstest.sh` | PCIe ACS setup against a model of configuration space: implemented bits only, firmware bits kept, bits that do not stick, hostile capability lists, read-only checks; ECAM window block planning |
 | `tests/run-trusttest.sh` | taint/seal permissions, atomic gates, instances, seqlock snapshots and verifier policy |

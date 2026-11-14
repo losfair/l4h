@@ -25,6 +25,7 @@ static DESC: AtomicPtr<Descriptor> = AtomicPtr::new(core::ptr::null_mut());
 /// Take the descriptor from the boot module, if there is one.
 pub fn init(module: Option<&'static [u8]>) {
     let Some(m) = module else { return };
+    assert!(cfg!(l4h_kernel_multikernel), "this kernel does not support multikernel partitions");
     match Descriptor::from_bytes(m) {
         Some(d) => {
             DESC.store(d as *const Descriptor as *mut Descriptor, Ordering::Relaxed);

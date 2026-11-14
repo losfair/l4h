@@ -166,7 +166,8 @@ typedef int64_t l4h_s64;
 #define L4H_VCPU_IPCBUF_VA(v)   (L4H_VCPU_AREA_VA(v) + 0x0000)
 #define L4H_VCPU_EVENT_VA(v)    (L4H_VCPU_AREA_VA(v) + 0x1000)
 /* FPU transfers (seL4_TCB_ReadFPU/WriteFPU) use this offset in IPCBUF. */
-#define L4H_FPU_SCRATCH_OFFSET  2048
+/* Leave the IPC buffer's first KiB intact and allow up to 3 KiB of XSAVE. */
+#define L4H_FPU_SCRATCH_OFFSET  1024
 #define L4H_DEV_AREA_VA(d)      (L4H_SPECIAL_BASE + 0x10000000ull + (l4h_u64)(d) * 0x10000ull)
 /* Bulk data area of the control device (dom0 only, L4H_CTL_LOAD_MAX). */
 #define L4H_CTL_DATA_VA         (L4H_SPECIAL_BASE + 0x20000000ull)

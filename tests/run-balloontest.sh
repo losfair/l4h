@@ -25,7 +25,7 @@ L4H_DOM0_MEM_MB=256 L4H_DOM0_VCPUS=1 L4H_WATCHDOG_SECS=0 \
 
 baseline=${BALLOONTEST_BASELINE:-0}
 log=$root/build/qemu.log
-rm -f "$log"
+: >"$log"
 balloon=$((1 - baseline))
 [ "${BALLOONTEST_LEGACY:-0}" = 1 ] && [ "$baseline" = 0 ] && balloon=legacy
 L4H_BALLOON=$balloon L4H_MEM=${L4H_MEM:-4G} \

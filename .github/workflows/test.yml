@@ -229,6 +229,8 @@ jobs:
         run: tests/run-attesttest.sh
       - name: Virtqueue fuzzing
         run: tests/run-fuzz.sh
+      - name: Userspace without kernel VT-x/AMD-V support
+        run: tests/run-novtxtest.sh
       - name: Upload logs
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4

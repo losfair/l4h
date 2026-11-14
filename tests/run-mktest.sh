@@ -55,9 +55,11 @@ log=$root/build/mktest.log
 mkdir -p "$out"
 rm -f "$log"
 
-"$root/tools/build-linux.sh" vmlinux >"$root/build/linux-build.log" 2>&1 \
-    || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
-objcopy --strip-debug "$l4h_linux_out/vmlinux" "$out/vmlinux"
+if [ -z "$efi" ]; then
+    "$root/tools/build-linux.sh" vmlinux >"$root/build/linux-build.log" 2>&1 \
+        || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
+    objcopy --strip-debug "$l4h_linux_out/vmlinux" "$out/vmlinux"
+fi
 "$root/tools/build-l4hctl.sh" >/dev/null
 "$root/tools/mkinitramfs.sh" "$out/vm.cpio.gz" "$root/tests/guest/init-mkvm" "$l4h_ctl" >/dev/null
 dom0_initramfs() {  # dom0_initramfs [extra files...]

@@ -20,7 +20,7 @@ use crate::memd::MemdLink;
 pub type Slot = usize;
 
 /// Maximum objects retyped by one kernel invocation.
-pub const RETYPE_FAN_OUT: usize = 16384;
+pub const RETYPE_FAN_OUT: usize = sel4::sel4_cfg_usize!(RETYPE_FAN_OUT_LIMIT);
 
 /// Owner of the slots of global objects (`Slots::global`).
 pub const GLOBAL: u8 = u8::MAX;

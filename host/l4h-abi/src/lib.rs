@@ -76,7 +76,7 @@ pub const fn vcpu_ipcbuf_va(v: usize) -> u64 {
 pub const fn vcpu_event_va(v: usize) -> u64 {
     vcpu_area_va(v) + 0x1000
 }
-pub const FPU_SCRATCH_OFFSET: usize = 2048;
+pub const FPU_SCRATCH_OFFSET: usize = 1024;
 pub const fn dev_area_va(d: usize) -> u64 {
     SPECIAL_BASE + 0x1000_0000 + d as u64 * 0x1_0000
 }

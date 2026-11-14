@@ -3,24 +3,32 @@
 # built by tools/mkimage.sh, NVMe boot disk, virtio-net.  The application
 # holds the guest kernel and its module tree; GRUB loads dom0's initramfs
 # and l4h.conf from the EFI partition.
+# UEFI_EFI=app.efi tests a prebuilt application without rebuilding its stack.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 out=$root/build/guest
 mkdir -p "$out"
-"$root/tools/build-linux.sh" vmlinux >"$root/build/linux-build.log" 2>&1 \
-    || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
-"$root/tools/build-kmods.sh" >/dev/null
+efi=${UEFI_EFI:-}
+image_args=()
+if [ -n "$efi" ]; then
+    [ -f "$efi" ] || { echo "$efi: missing" >&2; exit 1; }
+    image_args=(-e "$efi")
+else
+    "$root/tools/build-linux.sh" vmlinux >"$root/build/linux-build.log" 2>&1 \
+        || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
+    "$root/tools/build-kmods.sh" >/dev/null
+    env -u L4H_DOM0_DISKS -u L4H_DOM0_CMDLINE "$root/tools/build-host.sh"
+fi
 (cd "$root/tools/l4hctl" && cargo +stable build -q --release)
 "$root/tools/mkinitramfs.sh" "$out/uefi.cpio.gz" "$root/tests/guest/init-image" \
     "$root/tools/l4hctl/target/release/l4hctl" "$root/tests/guest/udhcpc.script" >/dev/null
-env -u L4H_DOM0_DISKS -u L4H_DOM0_CMDLINE "$root/tools/build-host.sh"
 # The boot disk is a host disk too: keep it away from dom0.
 cat > "$out/uefi.conf" <<'CONF'
 # tests/run-uefitest.sh
 dom0_disks=0
 dom0_cmdline="console=hvc0 imagetest=esp"
 CONF
-"$root/tools/mkimage.sh" -i "$out/uefi.cpio.gz" \
+"$root/tools/mkimage.sh" "${image_args[@]}" -i "$out/uefi.cpio.gz" \
     -c "$out/uefi.conf" "$root/build/l4h.raw"
 log=$root/build/qemu-uefi.log
 timeout "${UEFITEST_TIMEOUT:-120}" "$root/tools/run-uefi.sh" "$root/build/l4h.raw" </dev/null >"$log" 2>&1 &
@@ -34,3 +42,6 @@ grep -aE "IMAGETEST|module '|l4h-kmod|disk [0-9]|nic [0-9]|memory:|cores:|l4h-ro
 grep -aq "l4h-kmod: module tree" "$log"
 grep -aq "IMAGETEST: cmdline .*imagetest=esp" "$log"
 grep -aq "IMAGETEST: network ok" "$log"
+kernel=seL4
+if grep -aq 'FL4: seL4 17.0 (MCS) API kernel' "$log"; then kernel=FL4; fi
+grep -aEq "IMAGETEST: version .+ \\($kernel\\)" "$log"

@@ -396,6 +396,10 @@ void l4h_user_mark_dirty(struct l4h_uctx *u, int seg)
 
 /* ---- FPU state, through the vCPU's FPU scratch area */
 
+_Static_assert(L4H_FPU_SCRATCH_OFFSET >= sizeof(seL4_IPCBuffer), "FPU scratch overlaps IPC buffer");
+_Static_assert(L4H_FPU_SCRATCH_OFFSET + seL4_FPUStateSize <= (1ul << seL4_PageBits),
+	       "FPU scratch must fit in its frame");
+
 int l4h_fpu_read(struct l4h_uctx *u, void *buf, unsigned long size)
 {
 	struct l4h_vcpu *v = l4h_this_vcpu();

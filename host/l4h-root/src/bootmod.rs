@@ -37,12 +37,10 @@ pub struct Module {
 pub const MAX_MODULES: usize = 16;
 
 /// Runs of module pages whose frames are in consecutive root slots, at
-/// most.  A boot loader module is carved in aligned chunks of at most
-/// RETYPE_FAN_OUT frames (64 MiB), each a run unless it continues the
-/// last: the MODULES region holds 1024 whole chunks, and the unaligned
-/// ends of each module add a few dozen more.  The appended segment is one
-/// run.  Pages past them have no known frame, and guests get no shared
-/// copy of them.
+/// most. A boot loader module is carved in aligned chunks of at most
+/// RETYPE_FAN_OUT frames; consecutive chunks merge into one run. The
+/// appended segment is one run. Pages past this fixed bookkeeping budget
+/// have no known frame, and guests get no shared copy of them.
 const MAX_RUNS: usize = 2048;
 
 /// Pages [va, va + 4096 * pages) of the root task, whose frames are root

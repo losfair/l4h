@@ -1261,20 +1261,23 @@ pub fn create(
     g.give_cnode(abi::SLOT_VSPACE_POOL, pool_cn, guard6.clone());
 
     // ---- EPT roots for the guest's KVM.
-    #[cfg(target_arch = "x86_64")]
-    if host_info.vtx {
-        let bp: ObjectBlueprint = sel4::ObjectBlueprintSeL4Arch::EPTPML4.into();
-        let ept_cn = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: abi::ROOT_CNODE_BITS });
-        for i in 0..abi::MAX_EPT_ROOTS {
-            let root = g.arena.object_cap::<cap_type::VSpace>(alloc, bp);
-            asids.assign(alloc, root);
-            ept_cn
-                .absolute_cptr_from_bits_with_depth(i as u64, abi::ROOT_CNODE_BITS)
-                .copy(&abs(root), CapRights::all())
-                .expect("EPT pool copy");
+    sel4::sel4_cfg_if! {
+        if #[sel4_cfg(all(ARCH_X86_64, VTX))] {
+            if host_info.vtx {
+                let bp: ObjectBlueprint = sel4::ObjectBlueprintSeL4Arch::EPTPML4.into();
+                let ept_cn = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: abi::ROOT_CNODE_BITS });
+                for i in 0..abi::MAX_EPT_ROOTS {
+                    let root = g.arena.object_cap::<cap_type::VSpace>(alloc, bp);
+                    asids.assign(alloc, root);
+                    ept_cn
+                        .absolute_cptr_from_bits_with_depth(i as u64, abi::ROOT_CNODE_BITS)
+                        .copy(&abs(root), CapRights::all())
+                        .expect("EPT pool copy");
+                }
+                g.nr_ept_roots = abi::MAX_EPT_ROOTS;
+                g.give_cnode(abi::SLOT_EPT_POOL, ept_cn, guard6.clone());
+            }
         }
-        g.nr_ept_roots = abi::MAX_EPT_ROOTS;
-        g.give_cnode(abi::SLOT_EPT_POOL, ept_cn, guard6.clone());
     }
     g.dev_cn = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: abi::ROOT_CNODE_BITS });
     g.give_cnode(abi::SLOT_DEV_CNODE, g.dev_cn, guard6);

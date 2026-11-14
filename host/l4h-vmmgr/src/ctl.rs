@@ -19,10 +19,7 @@ pub use l4h_host::errno::{EAGAIN, EBUSY, EINVAL, EIO, ENOENT, ENOMEM, ENOSPC, EN
 /// (`answer`).
 const DEFER: Errno = 1 << 32;
 
-const HOST_VERSION: &str = match option_env!("L4H_VERSION") {
-    Some(version) => version,
-    None => "unknown",
-};
+const HOST_VERSION: &str = env!("L4H_HOST_VERSION");
 const _: () = assert!(!HOST_VERSION.is_empty() && HOST_VERSION.len() <= abi::CTL_DATA_MAX);
 
 /// Execute the request in the control page of guest `caller` (dom0):
