@@ -6,6 +6,11 @@ extern crate self as l4h_host;
 extern crate self as sel4;
 extern crate self as l4h_ipc;
 
+#[macro_export]
+macro_rules! sel4_cfg_usize {
+    (RETYPE_FAN_OUT_LIMIT) => { 256 };
+}
+
 /// l4h_ipc::preserving, on the mock IPC buffer.
 pub fn preserving<R>(f: impl FnOnce() -> R) -> R {
     let regs = with_ipc_buffer(|b| b.msg);
@@ -75,8 +80,10 @@ impl<T> Cap<T> {
     pub fn bits(&self) -> u64 { self.0 }
     pub fn absolute_cptr<U>(&self, _: U) -> AbsoluteCPtr { AbsoluteCPtr { cnode: self.0 } }
     pub fn absolute_cptr_for_self(&self) -> AbsoluteCPtr { AbsoluteCPtr { cnode: self.0 } }
-    pub fn untyped_retype(&self, _: &ObjectBlueprint, dest: &AbsoluteCPtr, _: usize, _: usize) -> Result<(), ()> {
+    pub fn untyped_retype(&self, _: &ObjectBlueprint, dest: &AbsoluteCPtr, offset: usize, count: usize) -> Result<(), ()> {
+        assert!((1..=sel4_cfg_usize!(RETYPE_FAN_OUT_LIMIT)).contains(&count));
         RETYPES.with_borrow_mut(|v| v.push(dest.cnode));
+        RETYPE_WINDOWS.with_borrow_mut(|v| v.push((offset, count)));
         // Kernel invocations marshal their arguments into the IPC buffer.
         with_ipc_buffer_mut(|b| b.msg_regs_mut()[..6].fill(0xdead_beef));
         Ok(())
@@ -93,6 +100,7 @@ pub struct AbsoluteCPtr { cnode: u64 }
 
 thread_local! {
     static RETYPES: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+    static RETYPE_WINDOWS: std::cell::RefCell<Vec<(usize, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
     static DELETES: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -212,6 +220,27 @@ pub mod memd {
             }
         }
     }
+}
+
+#[test]
+fn retype_respects_kernel_fanout_and_keeps_contiguous_placement() {
+    RETYPE_WINDOWS.with_borrow_mut(|windows| windows.clear());
+    let base = 64 << 20;
+    let mut region = mem::UtRegion::fresh(cap::Untyped::from_bits(1), base, 24);
+    let dest = mem::Dest::new(slot::CNODE.cap(), 1024);
+    let count = 2 * sel4_cfg_usize!(RETYPE_FAN_OUT_LIMIT) + 1;
+    assert_eq!(region.retype(&ObjectBlueprint::Frame, count, dest), Some(base));
+    RETYPE_WINDOWS.with_borrow(|windows| {
+        assert!(windows.len() > 1);
+        let mut next = dest.offset;
+        for &(offset, n) in windows {
+            assert_eq!(offset, next);
+            next += n;
+        }
+        assert_eq!(next, dest.offset + count);
+    });
+    let next = mem::Dest { offset: dest.offset + count, ..dest };
+    assert_eq!(region.retype(&ObjectBlueprint::Frame, 1, next), Some(base + (count << 12)));
 }
 
 #[test]

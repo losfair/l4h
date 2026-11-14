@@ -5464,6 +5464,47 @@ labels differ. The shipped configurations still use `KernelVTX=ON`;
 `no-vtx` is not a release variant. `tests/run-novtxtest.sh` builds this
 development kernel and runs the guest self-test with 1 and 4 vCPUs.
 
+A development build path for FL4 is available on x86_64. Start from a
+frozen worktree, rather than an FL4 checkout that is being edited:
+
+```sh
+git -C /path/to/FL4 worktree add --detach /path/to/FL4-l4h-frozen <commit>
+export L4H_FL4_SOURCE=/path/to/FL4-l4h-frozen
+tools/build-fl4.sh
+SEL4_PREFIX="$PWD/build/sel4-fl4" L4H_KERNEL_VARIANT=fl4 tests/run-selftest.sh 4
+```
+
+The tested FL4 revision is `92bf414a3311268b2a1e6c67b8dd6be74d2d408d`.
+`prepare-fl4.sh` clones that frozen source into `build/FL4-src` without
+applying any kernel patches. The source worktree is not edited.
+`build-fl4.sh` builds the kernel and FL4's own libsel4 together, installs
+them in `build/sel4-fl4`, and records the source commit in `fl4-revision`.
+Its installed syscall XML includes an empty, unused master-API section
+for rust-sel4's parser; the MCS syscall numbers stay FL4's.
+
+Rebuild the host, Linux guest and modules with this `SEL4_PREFIX`;
+FL4 is source compatible with the seL4 API, with different numbering and
+object sizes. The host uses the selected kernel's retype fan-out limit
+(256 on FL4). The guest's FPU scratch area starts after the 1 KiB IPC
+buffer, leaving 3 KiB for FL4's 2696-byte standard XSAVE image.
+Multikernel partitions and nested KVM are unavailable on FL4. It detects
+the APIC, PCID, FS/GS and FPU features at boot, so the shipped seL4 CPU
+variants do not apply. No FL4 release artifact is built or published.
+
+`L4H_FL4_SOURCE=... tests/run-fl4test.sh` attempts the 1- and 4-vCPU self-tests.
+With `L4H_RELEASE=1` it also attempts the ABI/module-tree test: FL4's debug
+profile omits l4h's debug-syscall MCP filter, so the ABI test's deliberate
+untrapped `DebugHalt` probe requires FL4's release profile.
+The host and Linux guest build against the tested FL4 revision, and root
+and the host services boot on four QEMU cores. Complete runtime validation
+is blocked by FL4 issues; the integration does not carry fixes for them.
+The reports are [INT gates](https://github.com/losfair/FL4/issues/1),
+[device alignment](https://github.com/losfair/FL4/issues/2),
+[retype configuration](https://github.com/losfair/FL4/issues/3),
+[rust-sel4 XML compatibility](https://github.com/losfair/FL4/issues/4),
+[speculative refill nontermination](https://github.com/losfair/FL4/issues/5), and
+[a reschedule IPI left in service](https://github.com/losfair/FL4/issues/6).
+
 For AArch64, build the kernel and loader once, then select the guest ISA
 with `L4H_ARCH`. Linux outputs go to `build/linux-l4h-aarch64` and the
 kernel to `build/sel4-aarch64`.
@@ -5524,6 +5565,7 @@ machine and guests of 256–512 MiB.
 | `tests/run-install-vm.sh debian-13-nocloud-amd64.qcow2 [release-directory] [1\|2]` | in a disposable UEFI/KVM VM, install from native Debian with one or two uplinks, verify each switch and network, then return to native Linux; uses prebuilt releases and `sudo -u "$L4H_QEMU_USER"` (defaults to the invoking user); `INSTALL_VM_SWAP_NAMES=1` with two NICs also tests exchanging eth0/eth1 names; `INSTALL_VM_FIRMWARE=bios INSTALL_VM_MEMORY=1G INSTALL_VM_CPUS=1` tests small-VM defaults through BIOS GRUB |
 | `tests/run-versiontest.sh` | host version metadata: release tags, development builds, overrides and worktrees |
 | `tests/run-novtxtest.sh` | builds the host and Linux guest with `KernelVTX=OFF` headers and boots the guest self-test with 1 and 4 vCPUs; Linux KVM stays disabled and root never probes a VCPU object |
+| `L4H_FL4_SOURCE=... tests/run-fl4test.sh` | builds a private unmodified copy of a frozen FL4 worktree and tests rebuilt userspace on it; currently blocked by the FL4 issues above; `L4H_RELEASE=1` also checks the ABI and guest module tree |
 | `tests/run-flagstest.sh` | focused flags-only boot: console/display seals, kernel taints, userspace gates and instance reuse, on either architecture |
 | `tests/run-acstest.sh` | PCIe ACS setup against a model of configuration space: implemented bits only, firmware bits kept, bits that do not stick, hostile capability lists, read-only checks; ECAM window block planning |
 | `tests/run-trusttest.sh` | taint/seal permissions, atomic gates, instances, seqlock snapshots and verifier policy |

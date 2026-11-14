@@ -7,6 +7,10 @@
 #include "l4h_os.h"
 
 __thread seL4_IPCBuffer *__sel4_ipc_buffer;
+#ifdef CONFIG_KERNEL_INVOCATION_REPORT_ERROR_IPC
+/* libsel4's diagnostic stubs need this even when printing is disabled. */
+__thread char __sel4_print_error;
+#endif
 
 struct l4h_tls_block l4h_tls_blocks[L4H_MAX_VCPUS];
 struct l4h_vcpu l4h_vcpus[L4H_MAX_VCPUS];
