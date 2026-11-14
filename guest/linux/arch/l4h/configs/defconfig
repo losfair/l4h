@@ -176,6 +176,9 @@ CONFIG_NFT_CT=y
 CONFIG_NFT_NAT=y
 CONFIG_NFT_MASQ=y
 CONFIG_NFT_REDIR=y
+# Native transparent proxying without loading modules under lockdown.
+CONFIG_NFT_TPROXY=y
+CONFIG_NFT_SOCKET=y
 CONFIG_NFT_FIB_IPV4=y
 CONFIG_NFT_FIB_IPV6=y
 CONFIG_NFT_FIB_INET=y

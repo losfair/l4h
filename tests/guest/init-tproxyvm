@@ -1,0 +1,21 @@
+#!/bin/sh
+# A separate client of the router's transparent listeners. Neither destination
+# address belongs to a VM: only TPROXY can deliver these requests and reply.
+set -eu
+trap 'echo "TPROXY: FAIL: client setup or traffic"; poweroff -f; while :; do sleep 1000; done' 0
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+ip link set lo up
+ip addr add 192.168.77.2/24 dev eth0
+# BusyBox ip lacks the nodad address flag. Disable DAD before adding this
+# fixture's unique static address so the client can use it immediately.
+echo 0 > /proc/sys/net/ipv6/conf/eth0/accept_dad
+ip -6 addr add fd77::2/64 dev eth0
+ip link set eth0 up
+ip route add default via 192.168.77.1
+ip -6 route add default via fd77::1
+tproxy client
+trap - 0
+echo "TPROXY: client PASS"
+while :; do sleep 1000; done
