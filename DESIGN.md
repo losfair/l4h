@@ -2277,7 +2277,7 @@ firewalling belong in a VM.
   `l4h-netd` → destination port, or an uplink channel → the NIC's driver
   (a nicd, §9.8). netd runs all switches and has no device code; each NIC
   is driven by its own nicd: modern and legacy virtio-net, gVNIC, Amazon
-  ENA, Intel X550 and ConnectX-5.
+  ENA, Intel X550, ConnectX-5 and Realtek RTL8125B.
 - **vNICs.** Each vNIC is on one switch and appears as a separate `ethN`.
   There are 48 guest ports in all. Guest vNICs have one RX/TX queue pair.
   A VMM processes at most 32 chains per RX or TX batch, counting malformed
@@ -2517,6 +2517,54 @@ uplink in QEMU: DHCP, ping and 8 MiB TCP transfers each way checked against
 a host peer (`tests/nic-peer.py`), before and after a restart (QEMU's device
 has no FLR); with `L4H_QEMU_IOMMU=intel|amd` it is the QEMU test of a
 confined driver (virtio drivers never are), and must cause no IOMMU fault.
+
+**Realtek RTL8125B.** `l4h-nicd-r8125/src/r8125.rs` follows Linux `r8169`'s
+RTL8125B paths (`RTL_GIGA_MAC_VER_63`) for the RTL8125B and RTL8125BG
+(10ec:8125, and 10ec:3000, the Killer E3000). The RTL8125A and RTL8125D
+have the same PCI ID but other MAC and PHY setup, and the driver refuses
+them by the chip's XID. Registers are in BAR 2, the MSI-X table in BAR 4.
+Bring-up is Linux's probe and open: the MAC's init and reset, the PHY's
+parameters, a PHY reset, the MAC start sequence, then autonegotiation
+advertising 10 Mb/s to 2.5 Gb/s with pause; EEE stays at the PHY's default.
+The PHY is reached through the chip's GPHY OCP window. Before the
+parameters the driver runs the PHY firmware patch `rtl_nic/rtl8125b-2.fw`
+from linux-firmware, as Linux does, when the driver bundle has it
+(`L4H_NIC_FIRMWARE=rtl_nic/rtl8125b-2.fw=FILE` for `tools/build-host.sh`).
+It checks the program's jumps first and bounds its steps. Without the
+patch it goes on, as Linux does. The chip's ASPM and clock requests stay
+off. The driver turns the link's L1 off through Link Control, which
+Linux also does unless the system vendor marked ASPM safe.
+
+One RX ring of 512 2 KiB buffers. A frame spanning buffers is dropped, as
+Linux drops it. One TX ring of 256 descriptors, a frame each, with frames
+copied into a 1 MiB circular area that completions free in order. Every
+cause shares MSI-X entry 0. RX and TX causes are masked separately, and
+their status bits are acknowledged before they are unmasked. The chip's
+interrupt coalescing is off, as in Linux. Root's tick (`F_TIMER`) reads
+the link (BMSR, and PHYSR for the speed). A chip that reads all ones
+panics the driver, so root restarts it. Receive: the chip's TCP/UDP checksum
+verdict becomes `DATA_VALID`. Transmit: TSO over untagged IPv4 and IPv6
+(MSS 1000–2047 and TCP at most 127 bytes in, so 64 segments at most, as
+Linux's limits); for IPv6 the payload length and the checksum's length
+are cleared, as `tcp_v6_gso_csum_prep`. Linux 6.18 offloads no other
+checksum on this chip, since `rtl8169_features_check` declines every
+frame `rtl_quirk_packet_padto` pads. So the driver completes `NEEDS_CSUM`
+frames itself, pads as Linux pads (to 60 bytes, more for short PTP UDP
+packets), and segments tagged and ECN GSO frames itself (Linux gives the
+chip no `TSO_ECN`). It drops plain frames longer than 1518 bytes: the
+offer's frame bound is the GSO one, and the driver sends no jumbo frames.
+There is no TX watchdog yet (Linux resets the chip on a TX timeout).
+
+Not yet run on hardware. `tests/r8125-vfio` compiles the driver unchanged
+into a Linux program for a real port bound to vfio-pci (ARP, ICMP, DNS,
+the device's RX checksums, checksums the driver completes, 4 KB and 60 KB
+TSO, RX and TX interrupts; `--firmware FILE` adds the PHY patch). Its
+`cargo test` runs the driver against a register-level model of the chip.
+The model answers the PHY window and clears reset, and moves both rings.
+It checks bring-up and the firmware interpreter, RX across ring wraps with
+checksum verdicts and dropped frames, and TX across ring and area wraps
+with padding, completed checksums, TSO descriptors and segmentation. It
+also checks the bound on plain frames and the ring and area limits.
 
 **Tests.** `tests/fuzz-virtq` checks that GRO output segments back into
 exactly the frames that went in, and that corrupted or other-flow segments

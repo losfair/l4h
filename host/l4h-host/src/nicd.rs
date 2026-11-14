@@ -215,6 +215,22 @@ impl Manifest {
         self
     }
 
+    pub const fn with_firmware(mut self, names: &[&str]) -> Self {
+        assert!(names.len() <= MAX_FIRMWARE);
+        let mut i = 0;
+        while i < names.len() {
+            let b = names[i].as_bytes();
+            assert!(b.len() < FIRMWARE_NAME);
+            let mut k = 0;
+            while k < b.len() {
+                self.firmware[i][k] = b[k];
+                k += 1;
+            }
+            i += 1;
+        }
+        self
+    }
+
     /// Read a manifest from `bytes` (an ELF section): None unless it is
     /// whole, of this ABI, and within every bound.
     pub fn parse(bytes: &[u8]) -> Option<Manifest> {

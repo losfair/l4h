@@ -405,6 +405,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "l4h-nicd-r8125"
+version = "0.1.0"
+dependencies = [
+ "l4h-nicdrv",
+ "l4h-rt",
+ "l4h-virtio",
+]
+
+[[package]]
 name = "l4h-nicd-virtio"
 version = "0.1.0"
 dependencies = [
