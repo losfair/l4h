@@ -7,11 +7,10 @@ src=$root/build/linux-6.18
 kemu=$root/third_party/kemu
 arch=${L4H_ARCH:-x86_64}
 case "$arch" in
-    x86_64) out=$root/build/linux-l4h; sel4=$root/build/sel4 ;;
-    aarch64) out=$root/build/linux-l4h-aarch64; sel4=$root/build/sel4-aarch64 ;;
+    x86_64) out=$root/build/linux-l4h ;;
+    aarch64) out=$root/build/linux-l4h-aarch64 ;;
     *) echo "unsupported L4H_ARCH: $arch" >&2; exit 1 ;;
 esac
-sel4=${SEL4_PREFIX:-$sel4}
 if [ ! -d "$src" ]; then
     echo "missing $src: extract linux-6.18.y there (see DESIGN.md §14)" >&2
     exit 1
@@ -101,7 +100,6 @@ done
 exec 9>&-
 mkdir -p "$out"
 mk=(make -C "$src" O="$out" ARCH=l4h SUBARCH="$arch"
-    L4H_SEL4_INCLUDE="$sel4/libsel4/include"
     L4H_ABI_INCLUDE="$root/include")
 if [ "$arch" = aarch64 ]; then
     mk+=(CROSS_COMPILE="${CROSS_COMPILE:-aarch64-linux-gnu-}")

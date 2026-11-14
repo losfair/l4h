@@ -82,6 +82,8 @@ jobs:
         run: tests/run-trusttest.sh
       - name: PCIe ACS setup against a model of configuration space
         run: tests/run-acstest.sh
+      - name: Guest provider bootstrap validation
+        run: tests/run-providercheck.sh
       - name: Build seL4
         run: tools/build-kernel.sh
       - name: Remote SC queries preserve FS/GS (debug and release kernels)

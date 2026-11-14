@@ -436,7 +436,7 @@ in Table~\ref{tab:env} under QEMU). Without it, there is no
 \file{/dev/l4hkmod}.
 
 Modules can also use the l4h interface and seL4 directly: the tree has
-\file{l4h/abi/l4h/abi.h} and libsel4's headers, and the kernel exports its
+\file{l4h/abi/l4h/abi.h} and the stable guest/provider headers, and the kernel exports its
 capability slots and objects (\texttt{l4h\_slot\_alloc},
 \texttt{l4h\_obj\_alloc}), process address spaces
 (\texttt{l4h\_vspace\_get}) and the vCPUs' state.
@@ -841,8 +841,9 @@ Linux to check the host CPU.
 \end{caveat}
 
 \file{l4h-fl4.efi} is an additional x86\_64 release application built with
-the \href{https://github.com/losfair/FL4}{FL4 kernel}. It includes a host,
-guest kernel and module tree rebuilt against FL4's own libsel4. FL4 detects
+the \href{https://github.com/losfair/FL4}{FL4 kernel}. It includes a host and
+ABI provider built against FL4's own libsel4. All release applications share
+the same Linux guest kernel and module tree. FL4 detects
 CPU features at boot and supports single-kernel boots without nested KVM.
 Build it separately with \cmd{L4H\_RELEASE=1 tools/build-fl4-efi.sh}, or
 as part of \cmd{tools/build-efi.sh}. The source revision is pinned in
@@ -1960,13 +1961,15 @@ The provider is \texttt{l4h}.
 The verifier checks both with \cmd{tools/l4h-attest.py}, which is also a
 release file and needs Python's \texttt{cryptography} package:
 \begin{lstlisting}[language=bash]
-tools/l4h-attest.py measure vmlinux --initrd initrd --cmdline "console=hvc0"
+tools/l4h-attest.py measure vmlinux --provider guest-provider.bin \
+    --initrd initrd --cmdline "console=hvc0"
 tools/l4h-attest.py verify report evidence --data $NONCE --launch $DIGEST \
     --ak-name $AK --pcr 4=$PCR4 --ek-ca manufacturer-ca.pem
 \end{lstlisting}
 \cmd{measure} prints the launch digest a guest gets from those files;
 \file{vmlinux} is the host's guest kernel (in a release, the one in
-\file{l4h-debug-x86\_64.tar.xz}). With
+\file{l4h-debug-x86\_64.tar.xz}), and \file{guest-provider.bin} must come
+from the same host build (use the FL4 debug archive for FL4). With
 \cmd{l4hctl create}, the command line is the one given with
 \texttt{--cmdline}; for dom0, it is \texttt{dom0\_cmdline}. \cmd{verify}
 fails unless every check holds:
