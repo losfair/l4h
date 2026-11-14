@@ -176,6 +176,8 @@ impl Controller {
     pub fn new(pci: pci::Device, vector: u64) -> Self {
         let kind = if is_nvme(&pci) {
             blk::BLKD_NVME
+        } else if is_ahci(&pci) {
+            blk::BLKD_AHCI
         } else if is_virtio_scsi(&pci) {
             blk::BLKD_VIRTIO_SCSI
         } else {
@@ -303,8 +305,8 @@ impl Controller {
     /// MSI-X table.
     fn used_bars(&self) -> u8 {
         let d = &self.pci;
-        let regs = if self.kind == blk::BLKD_NVME { 1 } else if self.legacy_io().is_some() { 0 } else { virtio_bar_mask(d) };
-        regs | d.msix.map_or(0, |m| 1 << m.table_bar)
+        let regs = if self.kind == blk::BLKD_NVME { 1 } else if self.kind == blk::BLKD_AHCI { 1 << 5 } else if self.legacy_io().is_some() { 0 } else { virtio_bar_mask(d) };
+        regs | if self.kind == blk::BLKD_AHCI { 0 } else { d.msix.map_or(0, |m| 1 << m.table_bar) }
     }
 
     /// Base of the I/O BAR of a legacy virtio device.
@@ -324,6 +326,7 @@ impl Controller {
     pub fn kind_name(&self) -> &'static str {
         match self.kind {
             blk::BLKD_NVME => "nvme",
+            blk::BLKD_AHCI => "ahci",
             blk::BLKD_VIRTIO_SCSI => "virtio-scsi",
             _ => "virtio-blk",
         }
@@ -368,16 +371,25 @@ pub fn is_nvme(d: &pci::Device) -> bool {
     d.class == 0x01 && d.subclass == 0x08 && d.prog_if == 0x02 && d.msix.is_some() && d.bars[0].size >= 0x2000
 }
 
+/// Standard AHCI SATA functions with a memory ABAR and plain MSI.
+pub fn is_ahci(d: &pci::Device) -> bool {
+    d.class == 0x01 && d.subclass == 0x06 && d.prog_if == 0x01
+        && d.msi.is_some() && !d.bars[5].is_io && d.bars[5].size >= 0x180
+}
+
 /// Disks l4h can pass through: also, the BARs `start` maps can be.
 pub fn is_disk(d: &pci::Device) -> bool {
     let bars = if is_nvme(d) {
         1
+    } else if is_ahci(d) {
+        1 << 5
     } else if is_legacy_virtio(d) {
         0
     } else {
         virtio_bar_mask(d)
     };
-    (is_virtio_blk(d) || is_virtio_scsi(d) || is_nvme(d)) && mappable(d, bars | d.msix.map_or(0, |m| 1 << m.table_bar))
+    (is_virtio_blk(d) || is_virtio_scsi(d) || is_nvme(d) || is_ahci(d))
+        && mappable(d, bars | if is_ahci(d) { 0 } else { d.msix.map_or(0, |m| 1 << m.table_bar) })
 }
 
 /// Whether BARs `bars` (bit b for BAR b) of `d` are memory `bar_frames`
@@ -462,12 +474,12 @@ pub fn start(
     let legacy_io = disk.legacy_io();
     let d = &disk.pci;
     let bar_va = |b: u8| host::MMIO_VA + b as usize * BAR_STRIDE;
-    let msix = d.msix.unwrap();
-    let msix_table = blk::PciRegion {
-        va: (bar_va(msix.table_bar) + msix.table_offset as usize) as u64,
-        len: msix.table_size as u64 * 16,
+    let msix_table = if disk.kind == blk::BLKD_AHCI { blk::PciRegion::default() } else {
+        let msix = d.msix.unwrap();
+        blk::PciRegion { va: (bar_va(msix.table_bar) + msix.table_offset as usize) as u64, len: msix.table_size as u64 * 16 }
     };
-    let regions = (disk.kind != blk::BLKD_NVME && legacy_io.is_none()).then(|| virtio_regions(d, bar_va));
+    let regions = (matches!(disk.kind, blk::BLKD_VIRTIO | blk::BLKD_VIRTIO_SCSI) && legacy_io.is_none())
+        .then(|| virtio_regions(d, bar_va));
     let bars = disk.used_bars();
 
     let mut arena = alloc.arena(8 << 20).expect("blkd arena");
@@ -490,7 +502,8 @@ pub fn start(
     let mut cfg: blk::BlkdConfig = unsafe { core::mem::zeroed() };
     cfg.kind = disk.kind;
     cfg.legacy_io = legacy_io.unwrap_or(0) as u32;
-    cfg.bar0 = blk::PciRegion { va: bar_va(0) as u64, len: d.bars[0].size };
+    let register_bar = if disk.kind == blk::BLKD_AHCI { 5 } else { 0 };
+    cfg.bar0 = blk::PciRegion { va: bar_va(register_bar) as u64, len: d.bars[register_bar as usize].size };
     cfg.pci_bdf = bdf(d);
     let vector = disk.vector;
     (cfg.msi_address, cfg.msi_data) = iommu.msi(dom, vector);
@@ -558,7 +571,7 @@ pub fn start(
         pci.enable_io(d);
     }
     pci.enable(d);
-    pci.enable_msix(d);
+    if disk.kind == blk::BLKD_AHCI { pci.enable_msi(d, cfg.msi_address, cfg.msi_data); } else { pci.enable_msix(d); }
     let mailbox = Mailbox::new(&comp, mailbox::blkd_mailbox(ctrl), &wiring::ROOT_BLKD_CALL, &wiring::BLKD_DONE, alloc, &mut arena, &mut keep_slot);
     component::start(&comp);
 
@@ -974,8 +987,11 @@ pub fn reset(disk: &mut Controller, pci: &Pci, alloc: &mut Alloc, devmem: &mut D
         return ok;
     }
     let nvme = disk.kind == blk::BLKD_NVME;
+    let ahci = disk.kind == blk::BLKD_AHCI;
     let (bar, off) = if nvme {
         (0, 0)
+    } else if ahci {
+        (5, 0)
     } else {
         let c = disk.pci.virtio_caps.iter().find(|c| c.cfg_type == VIRTIO_PCI_CAP_COMMON_CFG).unwrap();
         (c.bar, c.offset as usize + VIRTIO_DEVICE_STATUS)
@@ -995,7 +1011,19 @@ pub fn reset(disk: &mut Controller, pci: &Pci, alloc: &mut Alloc, devmem: &mut D
             }
             true
         };
-        if nvme {
+        if ahci {
+            if r32(0) == u32::MAX { return false; }
+            // AHCI 1.3.1 BIOS/OS handoff, then HBA reset. HR clearing
+            // means every port's command/FIS engines have stopped.
+            if r32(0x24) & 1 != 0 {
+                let bohc = r32(0x28);
+                if bohc & 2 == 0 { w32(0x28, (bohc & !(1 << 3)) | 2); }
+                if !wait(2000, &|| r32(0x28) & (1 | (1 << 4)) == 0) { return false; }
+            }
+            w32(0x04, 1 << 31);
+            w32(0x04, (1 << 31) | 1);
+            wait(1000, &|| r32(0x04) & 1 == 0)
+        } else if nvme {
             if r32(NVME_CSTS) == u32::MAX {
                 return false;
             }

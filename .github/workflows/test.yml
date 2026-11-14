@@ -166,8 +166,8 @@ jobs:
         run: tests/run-usbtest.sh && USBTEST_HC=nec tests/run-usbtest.sh
       - name: Block pass-through (virtio-blk)
         run: tests/run-blktest.sh
-      - name: Block pass-through (NVMe)
-        run: BLKTEST_DEV=nvme tests/run-blktest.sh
+      - name: Block pass-through (NVMe and AHCI SATA)
+        run: BLKTEST_DEV=nvme tests/run-blktest.sh && BLKTEST_DEV=ahci-disks tests/run-blktest.sh
       - name: Legacy (virtio 0.9.5) virtio-blk and virtio-scsi
         run: BLKTEST_DEV=virtio-legacy tests/run-blktest.sh && BLKTEST_DEV=scsi-legacy tests/run-blktest.sh
       - name: Control API

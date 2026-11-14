@@ -111,7 +111,9 @@ fn dom0(no_tpm: bool) {
     let initrd = fs::read("/bin/flagsvm.cpio.gz").unwrap();
     let cmdline = fs::read_to_string("/proc/cmdline").unwrap();
     let nonce = cmdline.split_whitespace().find(|s| s.starts_with("attest_nonce=")).unwrap_or("");
-    let cmd = |mode| format!("console=hvc0 flags_mode={mode} flags_no_tpm={} {nonce}", no_tpm as u32);
+    // Keep boot chatter from filling the serial log before this short-lived
+    // guest's reports are drained. Userspace reports still reach hvc0.
+    let cmd = |mode| format!("console=hvc0 quiet flags_mode={mode} flags_no_tpm={} {nonce}", no_tpm as u32);
     let clean_cmd = cmd("clean");
     let sealed_cmd = cmd("sealed");
     let fresh_cmd = cmd("fresh");

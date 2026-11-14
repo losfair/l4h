@@ -19,7 +19,7 @@ rm -rf "$out/run" && mkdir -p "$out/run"
 "$root/tools/build-host.sh"
 "$root/tools/mkinitramfs.sh" "$out/run/vm.cpio.gz" "$root/tests/guest/init-attestvm" "$l4h_ctl" >/dev/null
 nonce=$(head -c 64 /dev/urandom | od -An -tx1 | tr -d ' \n')
-cmdline="console=hvc0 attest_nonce=$nonce"
+cmdline="console=hvc0 quiet attest_nonce=$nonce"
 cat > "$out/run/l4h.conf" <<CONF
 # tests/run-attesttest.sh
 dom0_disks=0

@@ -343,6 +343,8 @@ impl Dashboard {
             let mut kind = ArrayString::<40>::new();
             let _ = if c.kind == crate::host::blk::BLKD_VIRTIO_SCSI {
                 write!(kind, "{} {}:{}", c.kind_name(), d.address & 0xff, d.address >> 8)
+            } else if c.kind == crate::host::blk::BLKD_AHCI {
+                write!(kind, "{} port {}", c.kind_name(), d.address)
             } else {
                 kind.write_str(c.kind_name())
             };

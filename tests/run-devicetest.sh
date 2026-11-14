@@ -218,6 +218,12 @@ L4H_BLK_ATTACH_TEST_SRC="$out/blk-attach.inc" rustc +stable --edition=2024 --tes
 L4H_VM_START_TEST_SRC="$out/vm-start.inc" rustc +stable --edition=2024 --test -L dependency="$out" \
     --extern l4h_abi="$out/libl4h_abi.rlib" "$root/tests/vm-start.rs" -o "$out/vm-start-tests"
 "$out/vm-start-tests"
+rustc +stable --edition=2024 --crate-type rlib --crate-name l4h_virtio \
+    "$root/host/l4h-virtio/src/lib.rs" -o "$out/libl4h_virtio.rlib"
+rustc +stable --edition=2024 --test -L dependency="$out" \
+    --extern l4h_host="$out/libl4h_host.rlib" --extern actual_virtio="$out/libl4h_virtio.rlib" \
+    "$root/tests/ahci.rs" -o "$out/ahci-tests"
+"$out/ahci-tests"
 L4H_BLKD_TEST_SRC="$out/blkd-main.inc" rustc +stable --edition=2024 --test -L dependency="$out" \
     --extern l4h_host="$out/libl4h_host.rlib" \
     "$root/tests/blk-ipc.rs" -o "$out/blk-ipc-tests"

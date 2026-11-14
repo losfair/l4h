@@ -76,19 +76,25 @@ class Machine:
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.symlink_to(target)
 
-    def pci(self, bdf, vendor, device, cls, msix=True, modern=True, io_bar=False):
+    def pci(self, bdf, vendor, device, cls, msix=True, modern=True, io_bar=False, msi=False):
         base = "/sys/devices/pci0000:00/0000:" + bdf
         for name, value in (("vendor", vendor), ("device", device), ("class", cls)):
             self.write(base + "/" + name, hex(value))
         config = bytearray(256)
         config[0x34] = 0x40
-        config[0x40:0x44] = bytes([0x11 if msix else 1, 0x50, 3, 0])
+        config[0x40:0x44] = bytes([0x11 if msix else 5 if msi else 1, 0x50, 3 if msix else 0, 0])
         config[0x50:0x54] = bytes([9 if modern else 1, 0, 16, 1])
         self.write(base + "/config", config)
         bars = "0x1000 0x5fff 0x200\n" * 6
         if io_bar:  # A legacy virtio device's registers in I/O BAR 0.
             bars = "0xc000 0xc03f 0x101\n" + bars.split("\n", 1)[1]
         self.write(base + "/resource", bars)
+
+    def ahci(self, cap=(1 << 31) | (1 << 30) | 5, msi=True):
+        self.pci("00:04.0", 0x8086, 0x8D02, 0x010601, msix=False, modern=False, msi=msi)
+        base = "/sys/devices/pci0000:00/0000:00:04.0"
+        self.write(base + "/resource", "0 0 0\n" * 5 + "0xfb332000 0xfb3327ff 0x200\n")
+        self.write(base + "/resource5", cap.to_bytes(4, "little") + bytes(2044))
 
     def nic(self, name, bdf, mac):
         self.permanent_macs[name] = mac
@@ -553,9 +559,30 @@ class InstallerTests(UpdateChecks, Harness):
                 self.machine.mounts[0]["fstype"] = fstype
                 self.rejected("ext4 or XFS")
 
-    def test_sata_and_legacy_virtio(self):
-        self.machine.pci("00:04.0", 0x8086, 0x2922, 0x010601)
-        self.rejected("SATA")
+    def test_ahci_root_with_plain_msi_preserves_uuid_boot(self):
+        self.machine.ahci()
+        plan = self.check()
+        self.assertEqual(plan["boot_disk"], "00:04.0")
+        self.assertIn("root=UUID=1234-abcd", installer.configuration(plan))
+        self.assertEqual(self.machine.boot["order"], "0001,0002")
+
+    def test_ahci_needs_plain_msi_and_memory_registers(self):
+        self.machine.ahci(msi=False)
+        self.rejected("MSI")
+        self.machine.ahci()
+        base = "/sys/devices/pci0000:00/0000:00:04.0"
+        self.machine.write(base + "/resource", "0 0 0\n" * 5 + "0xf000 0xf7ff 0x101\n")
+        self.rejected("AHCI")
+
+    def test_ahci_needs_64_bit_dma(self):
+        self.machine.ahci(cap=5)
+        self.rejected("64-bit DMA")
+
+    def test_ahci_register_bar_covers_implemented_ports(self):
+        self.machine.ahci(cap=(1 << 31) | 31)
+        self.rejected("AHCI port registers")
+
+    def test_legacy_virtio_storage(self):
         # Legacy (0.9.5) virtio-blk and virtio-scsi: registers in I/O BAR 0.
         for device in (0x1001, 0x1004):
             with self.subTest(device=hex(device)):
@@ -603,6 +630,12 @@ class InstallerTests(UpdateChecks, Harness):
         self.machine.links.append(dict(ifname="br0", link_type="ether", linkinfo=dict(info_kind="bridge")))
         self.machine.links[1]["master"] = "br0"
         self.rejected("plain Ethernet uplink")
+
+    def test_82599_sfp_uplink_preserves_network_configuration(self):
+        self.machine.pci("00:05.0", 0x8086, 0x1557, 0x020000)
+        plan = self.check()
+        self.assertEqual(plan["uplinks"], [dict(ifname="ens3", bdf="00:05.0", mac="52:54:00:12:34:56")])
+        self.assertIn("uplink_nic=00:05.0", installer.configuration(plan))
 
     def test_two_uplinks_have_separate_switches_and_stable_mac_mappings(self):
         self.machine.nic("ens2", "00:03.0", "52:54:00:12:34:57")

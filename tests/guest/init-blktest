@@ -45,7 +45,17 @@ umount /mnt
 # writes stay on it.
 if [ -b /dev/vdb ]; then
     echo "BLKTEST: vdb $(cat /sys/block/vdb/size) sectors"
-    dd if=/tmp/pat4 of=/dev/vdb bs=1M oflag=direct 2>/dev/null || fail "vdb write"
+    mount -t ext4 /dev/vda /mnt || fail "vda for concurrent disks"
+    dd if=/tmp/pat4 of=/mnt/two-disks bs=1M oflag=direct 2>/dev/null &
+    first=$!
+    dd if=/tmp/pat4 of=/dev/vdb bs=1M oflag=direct 2>/dev/null &
+    second=$!
+    wait "$first" || fail "concurrent vda write"
+    wait "$second" || fail "concurrent vdb write"
+    sync
+    cmp /tmp/pat4 /mnt/two-disks || fail "concurrent vda readback"
+    umount /mnt || fail "vda after concurrent write"
+    echo "BLKTEST: concurrent disks: ok"
     dd if=/dev/vdb of=/tmp/rb bs=1M count=4 iflag=direct 2>/dev/null || fail "vdb read"
     cmp /tmp/pat4 /tmp/rb || fail "vdb readback mismatch"
     echo 3 > /proc/sys/vm/drop_caches

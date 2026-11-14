@@ -1,5 +1,4 @@
-//! nicd for the Intel X550 (Linux ixgbe), as on Latitude.sh m4.metal
-//! servers: registers in BAR 0, MSI-X with an entry each for RX and TX.
+//! nicd for Intel 82599 SFP+ and X550 (Linux ixgbe): registers in BAR 0, MSI-X with an entry each for RX and TX.
 
 #![no_std]
 #![no_main]

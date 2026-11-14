@@ -1,5 +1,5 @@
-//! Intel X550 10GbE driver (Linux `ixgbe`), as on Latitude.sh m4.metal
-//! servers: one RX and one TX queue with advanced descriptors, frames
+//! Intel 82599 SFP+ and X550 10GbE driver (Linux `ixgbe`):
+//! one RX and one TX queue with advanced descriptors, frames
 //! copied between the switch and DMA buffers owned by this driver, as for
 //! virtio-net.
 //!
@@ -27,8 +27,8 @@ pub const MANIFEST: crate::sdk::Manifest = crate::sdk::Manifest {
     bars: 1 << 0,
     msix_min: 2,
     dma_bits: 22,
-    // X550T, X550T1.
-    ..crate::sdk::Manifest::empty().with_name("ixgbe").with_matches(&[crate::sdk::PciMatch::id(0x8086, 0x1563), crate::sdk::PciMatch::id(0x8086, 0x15d1)])
+    // 82599 single-port SFP+, X550T, X550T1.
+    ..crate::sdk::Manifest::empty().with_name("ixgbe").with_matches(&[crate::sdk::PciMatch::id(0x8086, 0x1557), crate::sdk::PciMatch::id(0x8086, 0x1563), crate::sdk::PciMatch::id(0x8086, 0x15d1)])
 };
 
 const HDR: usize = net::HDR_SIZE;
@@ -73,7 +73,11 @@ const RSCDBU: usize = 0x03028;
 const RXPBSIZE0: usize = 0x03C00;
 const HLREG0: usize = 0x04240;
 const MHADD: usize = 0x04268;
+const AUTOC: usize = 0x042A0;
 const LINKS: usize = 0x042A4;
+const AUTOC2: usize = 0x042A8;
+const AUTOC_AN_RESTART: u32 = 1 << 12;
+const AUTOC2_LINK_DISABLE: u32 = 7 << 28;
 const DMATXCTL: usize = 0x04A80;
 const RFCTL: usize = 0x05008;
 const FCTRL: usize = 0x05080;
@@ -140,6 +144,7 @@ const FCTRL_UPE: u32 = 1 << 9;
 const FCTRL_BAM: u32 = 1 << 10;
 const RAH_AV: u32 = 1 << 31;
 const SWSM_SMBI: u32 = 1 << 0;
+const SWSM_SWESMBI: u32 = 1 << 1;
 const SWFW_REGSMP: u32 = 1 << 31;
 /// PHY semaphores of LAN functions 0 and 1 (GSSR).
 const GSSR_PHY0_SM: u32 = 1 << 1;
@@ -246,6 +251,8 @@ impl Ixgbe {
     pub fn new(hw: &Hw, rx_partial: &'static mut Partial) -> Self {
         let (c, tsc_hz) = (hw.config, hw.tsc_hz);
         let n = c.uplink as usize;
+        let pci = hw.cfg_snapshot();
+        let silicon = Mac::from_device_id(u16::from_le_bytes([pci[2], pci[3]]));
         let regs = Mmio(c.bars[0].va as usize);
         let wait_us = |us: u64| {
             let end = host::ticks::now() + us * tsc_hz / 1_000_000;
@@ -278,28 +285,7 @@ impl Ixgbe {
             l4h_rt::info!("nicd {}: GIO primary still enabled; resetting anyway", n);
         }
 
-        // MAC reset, holding this function's PHY semaphore as Linux does
-        // (firmware may be using the PHY).  The PHY keeps its link.
-        let lan = (regs.r32(STATUS) >> 2) & 3;
-        let phy_sm = GSSR_PHY0_SM << lan.min(1);
-        let held = swfw_acquire(&regs, phy_sm, &wait_us);
-        regs.w32(CTRL, regs.r32(CTRL) | CTRL_RST);
-        regs.r32(STATUS);
-        if held {
-            swfw_release(&regs, phy_sm, &wait_us);
-        }
-        wait_us(1000);
-        if !poll(CTRL, CTRL_RST | CTRL_LNK_RST, 0, 10) {
-            panic!("nicd {}: reset does not complete", n);
-        }
-        wait_us(100_000);
-        if !poll(RDRXCTL, RDRXCTL_DMAIDONE, RDRXCTL_DMAIDONE, 100) {
-            l4h_rt::info!("nicd {}: DMA init not done after reset", n);
-        }
-        regs.w32(EIMC, 0x7fff_ffff);
-        regs.r32(EICR);
-        // One packet buffer, as reset_hw_X540.
-        regs.w32(RXPBSIZE0, 384 << 10);
+        silicon.reset(&regs, &wait_us, &poll, n);
 
         let (ral, rah) = (regs.r32(RAL0), regs.r32(RAH0));
         let mac = [ral as u8, (ral >> 8) as u8, (ral >> 16) as u8, (ral >> 24) as u8, rah as u8, (rah >> 8) as u8];
@@ -386,8 +372,9 @@ impl Ixgbe {
             _ => "?",
         };
         l4h_rt::info!(
-            "nicd {}: {:02x}:{:02x}.{} X550, mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, link {} {}",
+            "nicd {}: {:02x}:{:02x}.{} {}, mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, link {} {}",
             n, c.pci_bdf >> 8, (c.pci_bdf >> 3) & 0x1f, c.pci_bdf & 7,
+            silicon.name(),
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
             if up { "up" } else { "down" }, speed,
         );
@@ -647,58 +634,118 @@ impl Ixgbe {
     }
 }
 
-/// Take the SW/FW semaphore for `mask` (Linux acquire_swfw_sync_X540,
-/// without its recovery of a semaphore other software left held).
-fn swfw_acquire(regs: &Mmio, mask: u32, wait_us: &impl Fn(u64)) -> bool {
-    for _ in 0..200 {
-        if !swsm_acquire(regs, wait_us) {
+/// MAC-specific reset and firmware arbitration. Queue and offload code is shared.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mac {
+    I82599,
+    X550,
+}
+
+impl Mac {
+    fn from_device_id(id: u16) -> Self {
+        match id {
+            0x1557 => Self::I82599,
+            0x1563 | 0x15d1 => Self::X550,
+            _ => unreachable!("ixgbe manifest matched an unsupported device"),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self { Self::I82599 => "82599", Self::X550 => "X550" }
+    }
+
+    fn reset(self, regs: &Mmio, wait_us: &impl Fn(u64), poll: &impl Fn(usize, u32, u32, u64) -> bool, n: usize) {
+        let lan = (regs.r32(STATUS) >> 2) & 3;
+        let phy_sm = GSSR_PHY0_SM << lan.min(1);
+        let saved_link = (self == Self::I82599).then(|| (regs.r32(AUTOC), regs.r32(AUTOC2)));
+        let held = self.swfw_acquire(regs, phy_sm, wait_us);
+        assert!(held, "nicd {}: PHY semaphore is busy", n);
+        let reset = if self == Self::I82599 && regs.r32(LINKS) & LINKS_UP == 0 { CTRL_LNK_RST } else { CTRL_RST };
+        regs.w32(CTRL, regs.r32(CTRL) | reset);
+        regs.r32(STATUS);
+        self.swfw_release(regs, phy_sm, wait_us);
+        wait_us(1000);
+        if !poll(CTRL, CTRL_RST | CTRL_LNK_RST, 0, 10) {
+            panic!("nicd {}: reset does not complete", n);
+        }
+        wait_us(100_000);
+        if !poll(RDRXCTL, RDRXCTL_DMAIDONE, RDRXCTL_DMAIDONE, 100) {
+            l4h_rt::info!("nicd {}: DMA init not done after reset", n);
+        }
+        regs.w32(EIMC, 0x7fff_ffff);
+        regs.r32(EICR);
+        // 82599 has 512 KiB of RX packet memory. X550 has 384 KiB.
+        regs.w32(RXPBSIZE0, match self { Self::I82599 => 512 << 10, Self::X550 => 384 << 10 });
+        if let Some((autoc, autoc2)) = saved_link {
+            // The SFP+/DAC link was configured by firmware or Linux. A MAC
+            // reset must not replace that mode with the EEPROM defaults.
+            assert!(self.swfw_acquire(regs, phy_sm, wait_us), "nicd {}: PHY semaphore is busy", n);
+            regs.w32(AUTOC2, autoc2 & !AUTOC2_LINK_DISABLE);
+            regs.w32(AUTOC, autoc | AUTOC_AN_RESTART);
+            regs.r32(STATUS);
+            self.swfw_release(regs, phy_sm, wait_us);
+        }
+    }
+
+    /// Take the PHY semaphore using the MAC's SW/FW arbitration.
+    /// Never clear a semaphore owned by firmware or another driver.
+    fn swfw_acquire(self, regs: &Mmio, mask: u32, wait_us: &impl Fn(u64)) -> bool {
+        for _ in 0..200 {
+            if !self.swsm_acquire(regs, wait_us) {
+                return false;
+            }
+            let sync = regs.r32(SWFW_SYNC);
+            if sync & (mask | mask << 5) == 0 {
+                regs.w32(SWFW_SYNC, sync | mask);
+                self.swsm_release(regs);
+                return true;
+            }
+            self.swsm_release(regs);
+            wait_us(5000);
+        }
+        false
+    }
+
+    fn swfw_release(self, regs: &Mmio, mask: u32, wait_us: &impl Fn(u64)) {
+        if self.swsm_acquire(regs, wait_us) {
+            regs.w32(SWFW_SYNC, regs.r32(SWFW_SYNC) & !mask);
+            self.swsm_release(regs);
+        }
+    }
+
+    fn swsm_acquire(self, regs: &Mmio, wait_us: &impl Fn(u64)) -> bool {
+        let mut ok = false;
+        for _ in 0..2000 {
+            // Reading SMBI as 0 sets it: the semaphore is ours.
+            if regs.r32(SWSM) & SWSM_SMBI == 0 {
+                ok = true;
+                break;
+            }
+            wait_us(50);
+        }
+        if !ok {
             return false;
         }
-        let sync = regs.r32(SWFW_SYNC);
-        if sync & (mask | mask << 5) == 0 {
-            regs.w32(SWFW_SYNC, sync | mask);
-            swsm_release(regs);
-            return true;
+        for _ in 0..2000 {
+            if self == Self::I82599 {
+                // 82599 uses SWESMBI in SWSM. X540/X550 instead acquire
+                // REGSMP by reading SWFW_SYNC (Linux ixgbe_common/X540).
+                regs.w32(SWSM, regs.r32(SWSM) | SWSM_SWESMBI);
+                if regs.r32(SWSM) & SWSM_SWESMBI != 0 { return true; }
+            } else if regs.r32(SWFW_SYNC) & SWFW_REGSMP == 0 {
+                return true;
+            }
+            wait_us(50);
         }
-        swsm_release(regs);
-        wait_us(5000);
+        self.swsm_release(regs);
+        false
     }
-    false
-}
 
-fn swfw_release(regs: &Mmio, mask: u32, wait_us: &impl Fn(u64)) {
-    if swsm_acquire(regs, wait_us) {
-        regs.w32(SWFW_SYNC, regs.r32(SWFW_SYNC) & !mask);
-        swsm_release(regs);
+    fn swsm_release(self, regs: &Mmio) {
+        if self == Self::X550 { regs.w32(SWFW_SYNC, regs.r32(SWFW_SYNC) & !SWFW_REGSMP); }
+        let mask = SWSM_SMBI | if self == Self::I82599 { SWSM_SWESMBI } else { 0 };
+        regs.w32(SWSM, regs.r32(SWSM) & !mask);
     }
-}
-
-fn swsm_acquire(regs: &Mmio, wait_us: &impl Fn(u64)) -> bool {
-    let mut ok = false;
-    for _ in 0..2000 {
-        // Reading SMBI as 0 sets it: the semaphore is ours.
-        if regs.r32(SWSM) & SWSM_SMBI == 0 {
-            ok = true;
-            break;
-        }
-        wait_us(50);
-    }
-    if !ok {
-        return false;
-    }
-    for _ in 0..2000 {
-        if regs.r32(SWFW_SYNC) & SWFW_REGSMP == 0 {
-            return true;
-        }
-        wait_us(50);
-    }
-    swsm_release(regs);
-    false
-}
-
-fn swsm_release(regs: &Mmio) {
-    regs.w32(SWFW_SYNC, regs.r32(SWFW_SYNC) & !SWFW_REGSMP);
-    regs.w32(SWSM, regs.r32(SWSM) & !SWSM_SMBI);
 }
 
 /// The SDK's view of the driver (l4h_nicdrv::NicDriver).
@@ -729,5 +776,37 @@ impl crate::sdk::NicDriver for Ixgbe {
     }
     fn kick_tx(&mut self) {
         Ixgbe::kick_tx(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sfp_mac_uses_sw_eeprom_semaphore_without_touching_reserved_gssr_bit() {
+        let mut words = vec![0u32; 0x11000 / 4];
+        let regs = Mmio(words.as_mut_ptr() as usize);
+        regs.w32(SWFW_SYNC, SWFW_REGSMP);
+        assert!(Mac::I82599.swsm_acquire(&regs, &|_| {}));
+        assert_ne!(regs.r32(SWSM) & SWSM_SWESMBI, 0);
+        Mac::I82599.swsm_release(&regs);
+        assert_eq!(regs.r32(SWSM) & (SWSM_SMBI | SWSM_SWESMBI), 0);
+        assert_eq!(regs.r32(SWFW_SYNC), SWFW_REGSMP);
+    }
+
+    #[test]
+    fn sfp_phy_semaphore_preserves_firmware_ownership() {
+        let mut words = vec![0u32; 0x11000 / 4];
+        let regs = Mmio(words.as_mut_ptr() as usize);
+        let firmware = GSSR_PHY0_SM << 5;
+        regs.w32(SWFW_SYNC, firmware);
+        assert!(!Mac::I82599.swfw_acquire(&regs, GSSR_PHY0_SM, &|_| {}));
+        assert_eq!(regs.r32(SWFW_SYNC), firmware);
+        regs.w32(SWFW_SYNC, 0);
+        assert!(Mac::I82599.swfw_acquire(&regs, GSSR_PHY0_SM, &|_| {}));
+        assert_eq!(regs.r32(SWFW_SYNC), GSSR_PHY0_SM);
+        Mac::I82599.swfw_release(&regs, GSSR_PHY0_SM, &|_| {});
+        assert_eq!(regs.r32(SWFW_SYNC), 0);
     }
 }

@@ -208,6 +208,7 @@ pub struct PciRegion {
 pub const BLKD_VIRTIO: u32 = 0;
 pub const BLKD_NVME: u32 = 1;
 pub const BLKD_VIRTIO_SCSI: u32 = 2;
+pub const BLKD_AHCI: u32 = 3;
 
 /// Configuration of one persistent physical-controller driver.
 #[repr(C)]
@@ -216,10 +217,10 @@ pub struct BlkdConfig {
     /// Legacy virtio device: base of its I/O BAR 0, reached with the
     /// capability in BLKD_SLOT_IOPORT; 0 for a modern device.
     pub legacy_io: u32,
-    /// NVMe: BAR0 (controller registers and doorbells).
+    /// Controller registers: NVMe BAR0, AHCI BAR5.
     pub bar0: PciRegion,
     pub pci_bdf: u32,
-    /// MSI data of MSI-X table entry 0 (the queue interrupt).
+    /// Controller interrupt: MSI-X entry zero, or plain MSI for AHCI.
     pub msi_data: u32,
     pub msi_address: u64,
     pub common: PciRegion,
