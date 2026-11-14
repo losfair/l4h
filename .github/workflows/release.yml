@@ -8,9 +8,8 @@
 # - l4h-dom0-x86_64.tar.xz, the dom0 userspace tools (tools/build-dom0.sh);
 # - l4h-attest.py, the verifier of attestation reports;
 # - l4h-manual.pdf, the user manual, showing the tag it was built for.
-# Before anything is kept, l4h-generic.efi boots as two multikernel
-# partitions under OVMF (tests/run-mktest.sh with MK_EFI): the shim and
-# slot kernels it carries, as shipped.
+# Tests run separately in test.yml; building and publishing never wait
+# for test results.
 # A pushed v* tag also publishes them, with their checksums, as a GitHub
 # release.  aarch64 has no shipped artifacts yet (DESIGN.md §11).
 name: release
@@ -47,7 +46,6 @@ jobs:
       contents: write
     container:
       image: debian:trixie
-      options: --device /dev/kvm
     steps:
       - name: Install git
         run: apt-get update -q && apt-get install -y -q --no-install-recommends git ca-certificates
@@ -84,14 +82,6 @@ jobs:
           tools/build-dom0.sh
           cp tools/l4h-attest.py docs/manual/l4h-manual.pdf build/efi/
           cd build/efi && sha256sum l4h-*.efi l4h-*.tar.xz l4h-attest.py l4h-manual.pdf > SHA256SUMS && cat SHA256SUMS
-      - name: Multikernel boot of the release application
-        run: MK_EFI=build/efi/l4h-generic.efi tests/run-mktest.sh
-      - name: FL4 Linux, devices, networking, balloon and ABI
-        run: L4H_RELEASE=1 tests/run-fl4test.sh | tee build/fl4test.log
-      - name: UEFI boot of the FL4 release application
-        run: |
-          UEFI_EFI=build/efi/l4h-fl4.efi tests/run-uefitest.sh
-          grep -aq 'FL4: seL4 17.0 (MCS) API kernel' build/qemu-uefi.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: l4h-x86_64
@@ -122,8 +112,4 @@ jobs:
           name: logs-release
           path: |
             build/efi/*.log
-            build/mktest.log
-            build/fl4test.log
-            build/qemu.log
-            build/qemu-uefi.log
             docs/manual/*.log

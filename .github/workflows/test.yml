@@ -192,8 +192,8 @@ jobs:
         run: tests/run-vtdtest.sh --qemu
       - name: Partition message rings
         run: tests/run-ringtest.sh
-      - name: Multikernel partitions (PCI through ECAM)
-        run: tests/run-mktest.sh
+      - name: Multikernel partitions through UEFI (PCI through ECAM)
+        run: MK_BOOT=uefi tests/run-mktest.sh
       - name: Multikernel partitions without MCFG (shared PCI ports)
         run: MK_MACHINE=pc tests/run-mktest.sh
       - name: Multikernel partitions sharing VT-d
@@ -231,6 +231,18 @@ jobs:
         run: tests/run-fuzz.sh
       - name: Userspace without kernel VT-x/AMD-V support
         run: tests/run-novtxtest.sh
+      - name: FL4 Linux, devices, networking, balloon and ABI
+        run: L4H_RELEASE=1 tests/run-fl4test.sh | tee build/fl4test.log
+      - name: UEFI boot of the FL4 application
+        env:
+          L4H_RELEASE: '1'
+          L4H_KERNEL_VARIANT: fl4
+          L4H_MKSHIM: ''
+        run: |
+          # Package the binaries already built by run-fl4test.sh.
+          tools/mkefi.sh build/l4h-fl4.efi
+          UEFI_EFI=build/l4h-fl4.efi tests/run-uefitest.sh
+          grep -aq 'FL4: seL4 17.0 (MCS) API kernel' build/qemu-uefi.log
       - name: Upload logs
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
