@@ -11,6 +11,7 @@ case "$arch" in
     aarch64) out=$root/build/linux-l4h-aarch64; sel4=$root/build/sel4-aarch64 ;;
     *) echo "unsupported L4H_ARCH: $arch" >&2; exit 1 ;;
 esac
+sel4=${SEL4_PREFIX:-$sel4}
 if [ ! -d "$src" ]; then
     echo "missing $src: extract linux-6.18.y there (see DESIGN.md §14)" >&2
     exit 1

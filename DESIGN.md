@@ -989,6 +989,9 @@ vendor, as seL4 makes it).
   it gives VSpace roots, and `bootinfo.nr_ept_roots` says how many. With
   none the guest registers no `/dev/kvm`. Each KVM VM takes a root, so a
   guest runs at most 8 VMs at a time.
+  In a development build with `KernelVTX=OFF`, root omits the probe,
+  vmmgr gives out no EPT roots, and the Linux KVM option is unavailable
+  when building against that kernel's headers.
 - **Running a vCPU.** `KVM_RUN` calls `seL4_VMEnter` on the kTCB of the
   L4H vCPU it runs on; `vcpu_load` binds the VCPU and the VM's EPT root to
   that kTCB when they are not already. The exit is the call returning,
@@ -5444,6 +5447,23 @@ tools/build-kernel.sh                 # patched seL4 -> build/sel4
 tests/run-selftest.sh 4               # build Linux + host, boot a 4-vCPU guest self-test
 ```
 
+To build without seL4's VT-x/AMD-V support for development, select a
+separate kernel and use its headers for both the host and Linux guest:
+
+```sh
+L4H_VTX=OFF L4H_KERNEL_VARIANT=no-vtx tools/build-kernel.sh
+export SEL4_PREFIX="$PWD/build/sel4-no-vtx"
+tools/build-host.sh
+L4H_KERNEL_VARIANT=no-vtx tests/run-selftest.sh 4
+```
+
+`SEL4_PREFIX` also selects the headers copied into the guest module tree.
+The Linux build disables KVM when these headers lack `CONFIG_VTX`.
+Rebuild both host and guest when changing this option: seL4's invocation
+labels differ. The shipped configurations still use `KernelVTX=ON`;
+`no-vtx` is not a release variant. `tests/run-novtxtest.sh` builds this
+development kernel and runs the guest self-test with 1 and 4 vCPUs.
+
 For AArch64, build the kernel and loader once, then select the guest ISA
 with `L4H_ARCH`. Linux outputs go to `build/linux-l4h-aarch64` and the
 kernel to `build/sel4-aarch64`.
@@ -5503,6 +5523,7 @@ machine and guests of 256–512 MiB.
 | `python3 tests/test_installer.py` | installer preflight, verified downloads, EFI changes, updates and rollback without touching the host |
 | `tests/run-install-vm.sh debian-13-nocloud-amd64.qcow2 [release-directory] [1\|2]` | in a disposable UEFI/KVM VM, install from native Debian with one or two uplinks, verify each switch and network, then return to native Linux; uses prebuilt releases and `sudo -u "$L4H_QEMU_USER"` (defaults to the invoking user); `INSTALL_VM_SWAP_NAMES=1` with two NICs also tests exchanging eth0/eth1 names; `INSTALL_VM_FIRMWARE=bios INSTALL_VM_MEMORY=1G INSTALL_VM_CPUS=1` tests small-VM defaults through BIOS GRUB |
 | `tests/run-versiontest.sh` | host version metadata: release tags, development builds, overrides and worktrees |
+| `tests/run-novtxtest.sh` | builds the host and Linux guest with `KernelVTX=OFF` headers and boots the guest self-test with 1 and 4 vCPUs; Linux KVM stays disabled and root never probes a VCPU object |
 | `tests/run-flagstest.sh` | focused flags-only boot: console/display seals, kernel taints, userspace gates and instance reuse, on either architecture |
 | `tests/run-acstest.sh` | PCIe ACS setup against a model of configuration space: implemented bits only, firmware bits kept, bits that do not stick, hostile capability lists, read-only checks; ECAM window block planning |
 | `tests/run-trusttest.sh` | taint/seal permissions, atomic gates, instances, seqlock snapshots and verifier policy |

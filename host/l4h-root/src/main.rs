@@ -487,10 +487,13 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         // Asked by trying, and a debug kernel prints its refusal on the
         // serial port itself: asked here, before logd prints anything, the
         // message cannot land inside a line of host output (§10.4).
-        #[cfg(target_arch = "x86_64")]
-        vtx: alloc.can_retype(&sel4::ObjectBlueprintArch::VCpu.into()),
-        #[cfg(not(target_arch = "x86_64"))]
-        vtx: false,
+        vtx: sel4::sel4_cfg_if! {
+            if #[sel4_cfg(all(ARCH_X86_64, VTX))] {
+                alloc.can_retype(&sel4::ObjectBlueprintArch::VCpu.into())
+            } else {
+                false
+            }
+        },
     };
     let mut asids = AsidPools { pools: [(slot::ASID_POOL.cap(), 1)].into_iter().collect(), in_use: 1 };
     let dashboard = dashboard::Dashboard::new(bootinfo, &mut alloc, &mut devmem, cfg.fb_console);

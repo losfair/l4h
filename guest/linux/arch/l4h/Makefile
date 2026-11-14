@@ -9,6 +9,11 @@
 L4H_SEL4_INCLUDE ?= $(wildcard $(srctree)/l4h/sel4)
 L4H_ABI_INCLUDE ?= $(wildcard $(srctree)/l4h/abi)
 
+# Kconfig tracks this value, including when the selected seL4 headers change.
+# KVM's libsel4 interface exists only with KernelVTX (VT-x and AMD-V).
+export L4H_SEL4_VTX := $(shell grep -Eq '^\#define[[:space:]]+CONFIG_VTX[[:space:]]+1$$' \
+	$(L4H_SEL4_INCLUDE)/kernel/gen_config.h 2>/dev/null && echo y)
+
 SUBARCH ?= x86_64
 ifeq ($(SUBARCH),aarch64)
 include $(srctree)/arch/l4h/arm64/Makefile.arch

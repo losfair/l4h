@@ -43,10 +43,18 @@ static const seL4_Word obj_type[L4H_OBJ_NR] = {
 	[L4H_OBJ_PT] = seL4_X86_PageTableObject,
 	[L4H_OBJ_PD] = seL4_X86_PageDirectoryObject,
 	[L4H_OBJ_PDPT] = seL4_X86_PDPTObject,
+#endif
+#ifdef CONFIG_VTX
 	[L4H_OBJ_VCPU] = seL4_X86_VCPUObject,
 	[L4H_OBJ_EPT_PT] = seL4_X86_EPTPTObject,
 	[L4H_OBJ_EPT_PD] = seL4_X86_EPTPDObject,
 	[L4H_OBJ_EPT_PDPT] = seL4_X86_EPTPDPTObject,
+#else
+	/* Unsupported types must not fall back to seL4_UntypedObject (0). */
+	[L4H_OBJ_VCPU] = seL4_ObjectTypeCount,
+	[L4H_OBJ_EPT_PT] = seL4_ObjectTypeCount,
+	[L4H_OBJ_EPT_PD] = seL4_ObjectTypeCount,
+	[L4H_OBJ_EPT_PDPT] = seL4_ObjectTypeCount,
 #endif
 };
 
@@ -73,11 +81,12 @@ int l4h_obj_bits(int type, int size_bits)
 	case L4H_OBJ_PT:
 	case L4H_OBJ_PD:
 	case L4H_OBJ_PDPT:
+		return seL4_PageBits;
+#ifdef CONFIG_VTX
 	case L4H_OBJ_EPT_PT:
 	case L4H_OBJ_EPT_PD:
 	case L4H_OBJ_EPT_PDPT:
 		return seL4_PageBits;
-#ifndef __aarch64__
 	case L4H_OBJ_VCPU:
 		return seL4_X86_VCPUBits;
 #endif

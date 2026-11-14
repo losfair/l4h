@@ -16,7 +16,7 @@ set(KernelLAPICMode "X2APIC" CACHE STRING "")
 set(KernelIOMMU OFF CACHE BOOL "")
 # VT-x for guests that run KVM (DESIGN.md §4.1).  Patch 0038 boots without
 # it on CPUs that lack it, and leaves it off with SKIM.  Never vary it
-# between variants: it renumbers the x86 invocation labels, and every
+# between shipped variants: it renumbers the x86 invocation labels, and every
 # variant shares one userspace.
 set(KernelVTX ON CACHE BOOL "")
 set(KernelX86_64VTX64BitGuests ON CACHE BOOL "")

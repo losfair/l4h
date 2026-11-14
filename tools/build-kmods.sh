@@ -17,6 +17,7 @@ case "$arch" in
     x86_64) host_dir=arch/x86; sel4=$root/build/sel4 ;;
     aarch64) host_dir=arch/arm64; sel4=$root/build/sel4-aarch64 ;;
 esac
+sel4=${SEL4_PREFIX:-$sel4}
 out=$(realpath -m "${1:-$l4h_linux_out/kmods.erofs}")
 src=$root/build/linux-6.18
 "$root/tools/build-linux.sh" vmlinux modules >"$root/build/linux-build.log" 2>&1 \
