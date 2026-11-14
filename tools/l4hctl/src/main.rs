@@ -19,7 +19,7 @@ struct CreateOpts {
     disks: Vec<(u64, u64, u64, u64)>,
     volumes: Vec<(u64, u64, Vec<(u64, u64)>)>,
     io_pool: u64,
-    nics: Vec<(u64, u64, u64)>,
+    nics: Vec<NicSpec>,
     gpu: Option<(u64, u64)>,
     usbs: Vec<u64>,
 }
@@ -52,8 +52,8 @@ fn cmd_create(ctl: &Ctl, o: &CreateOpts) -> Result<u64> {
         gpu: o.gpu,
         usbs: o.usbs.clone(),
     })?;
-    for (&(sw, _, _), mac) in o.nics.iter().zip(macs) {
-        eprintln!("vm {vm}: nic on switch {sw}, mac {}", fmt_mac(mac));
+    for (n, mac) in o.nics.iter().zip(macs) {
+        eprintln!("vm {vm}: nic on switch {}, mac {}", n.switch, fmt_mac(mac));
     }
     Ok(vm)
 }
@@ -174,7 +174,10 @@ const USAGE: &str = "usage: l4hctl <command>
          [--lv I:VG/LV[,ro][,volatile][,pv-start=SECTOR]]...
                                a linear LVM volume on disk I (see
                                lv-extents); disks of extents come last
-         [--nic SWITCH[,mac=MAC][,nolock][,isolated]]...
+         [--nic SWITCH[,mac=MAC][,nolock][,isolated][,ipfilter][,ip=PREFIX]...]...
+                               ipfilter: send only IP and ARP from the
+                               addresses given (ip=, which implies it, or
+                               ip add), and act as no router or DHCP server
          [--io-pool MB]        device I/O buffer pool (power of two, 1-256;
                                default 4, or room for the GPU's buffers)
          [--gpu WxH]           a virtio-gpu display of W x H pixels
@@ -218,6 +221,11 @@ const USAGE: &str = "usage: l4hctl <command>
                                icmp, esp or a number) to a guest port,
                                rewriting only MACs; prints the rule's id
   steer del RULE | steer list
+  ip add|del VM:NIC|PORT PREFIX...
+                               let a filtered port (--nic ...,ipfilter) send
+                               from IP[/LEN] (default: the one address), or
+                               no longer
+  ip list [VM:NIC|PORT]        filtered ports and their prefixes
   console VM [--follow] [--until STR] [--timeout SECS]
                                print the VM's console output
   screenshot VM FILE           save the VM's display as a PPM image
@@ -531,6 +539,45 @@ fn cmd_ep(ctl: &Ctl, args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// A guest port: `VM:NIC` or its number.
+fn port_arg(ctl: &Ctl, s: &str) -> Result<u64> {
+    match vm_port(ctl, s)? {
+        Some((port, _, _)) => Ok(port),
+        None => parse_num(s),
+    }
+}
+
+fn cmd_ip(ctl: &Ctl, args: &[String]) -> Result<()> {
+    match args.first().map(String::as_str) {
+        Some(op @ ("add" | "del")) if args.len() >= 3 => {
+            let port = port_arg(ctl, &args[1])?;
+            for a in &args[2..] {
+                let p = IpPrefix::parse(a)?;
+                if op == "add" { ctl.ip_add(port, &p)? } else { ctl.ip_del(port, &p)? }
+            }
+        }
+        Some("list") if args.len() <= 2 => {
+            let ports = all_ports(ctl)?;
+            let only = args.get(1).map(|a| port_arg(ctl, a)).transpose()?;
+            println!("{:>4} {:>3} {:<17} PREFIXES", "PORT", "VM", "MAC");
+            for &(port, vm, _, mac) in ports.iter().filter(|p| only.is_none_or(|o| o == p.0)) {
+                let (on, ips) = ctl.ip_list(port)?;
+                if !on {
+                    if only.is_some() {
+                        println!("{port:>4} {vm:>3} {:<17} (not filtered)", fmt_mac(mac));
+                    }
+                    continue;
+                }
+                let ips: Vec<String> = ips.iter().map(|p| p.to_string()).collect();
+                let ips = if ips.is_empty() { "(none)".to_string() } else { ips.join(" ") };
+                println!("{port:>4} {vm:>3} {:<17} {ips}", fmt_mac(mac));
+            }
+        }
+        _ => return err("ip add|del VM:NIC|PORT PREFIX... | ip list [VM:NIC|PORT]"),
+    }
+    Ok(())
+}
+
 fn cmd_steer(ctl: &Ctl, args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("set") if args.len() == 5 && args[3] == "--to" => {
@@ -837,23 +884,27 @@ fn run(args: &[String]) -> Result<i32> {
                         o.volumes.push((d, flags, lv_extents(&lv, pv_start)?));
                     }
                     "--nic" => {
-                        // SWITCH[,mac=MAC][,nolock][,isolated]
+                        // SWITCH[,mac=MAC][,nolock][,isolated][,ipfilter][,ip=PREFIX]...
                         let v = val()?;
                         let mut it = v.split(',');
-                        let sw = parse_num(it.next().unwrap())?;
-                        let (mut mac, mut flags) = (0, 0);
+                        let mut n = NicSpec { switch: parse_num(it.next().unwrap())?, ..NicSpec::default() };
                         for opt in it {
                             if let Some(m) = opt.strip_prefix("mac=") {
-                                mac = parse_mac(m)?;
+                                n.mac = parse_mac(m)?;
                             } else if opt == "nolock" {
-                                flags |= NIC_NO_MAC_LOCK;
+                                n.flags |= NIC_NO_MAC_LOCK;
                             } else if opt == "isolated" {
-                                flags |= NIC_ISOLATED;
+                                n.flags |= NIC_ISOLATED;
+                            } else if opt == "ipfilter" {
+                                n.flags |= NIC_IP_FILTER;
+                            } else if let Some(p) = opt.strip_prefix("ip=") {
+                                n.flags |= NIC_IP_FILTER;
+                                n.ips.push(IpPrefix::parse(p)?);
                             } else {
                                 return err(format!("--nic: unknown option {opt}"));
                             }
                         }
-                        o.nics.push((sw, mac, flags));
+                        o.nics.push(n);
                     }
                     "--usb" => {
                         let v = val()?;
@@ -943,6 +994,7 @@ fn run(args: &[String]) -> Result<i32> {
         }
         "ep" => cmd_ep(&ctl, &args[1..])?,
         "steer" => cmd_steer(&ctl, &args[1..])?,
+        "ip" => cmd_ip(&ctl, &args[1..])?,
         "shutdown" => {
             let vm = parse_num(args.get(1).ok_or(Error("shutdown: missing VM".into()))?)?;
             let how = if args.get(2).map(|s| s.as_str()) == Some("--reboot") { 1 } else { 0 };

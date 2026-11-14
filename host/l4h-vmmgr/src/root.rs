@@ -153,8 +153,8 @@ pub fn port_keep(alloc: &mut Alloc, arena: &mut Arena) -> Option<cap::CNode> {
 /// A port of netd's `switch` for guest `id`.  The VMM's mappings of it
 /// are kept in `keep` (`port_keep`), which is the backend's if root gives
 /// the port, and the caller's still if it refuses.
-pub fn nic_add(alloc: &mut Alloc, keep: cap::CNode, id: usize, switch: u32, mac: u64, lock: bool, isolated: bool) -> Result<Backend, Errno> {
-    let mac = errno(root().nic_add(id, switch, mac, lock, isolated))?.to_be_bytes();
+pub fn nic_add(alloc: &mut Alloc, keep: cap::CNode, id: usize, switch: u32, mac: u64, flags: u64) -> Result<Backend, Errno> {
+    let mac = errno(root().nic_add(id, switch, mac, flags))?.to_be_bytes();
     let chan = take(alloc, caps::nic_add::PORT_FRAMES, 0);
     let kick = take(alloc, caps::nic_add::KICK, 0);
     Ok(Backend::Net { chan, kick, mac: mac[2..8].try_into().unwrap(), keep })

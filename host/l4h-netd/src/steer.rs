@@ -518,6 +518,17 @@ impl Steer {
         Some(ep)
     }
 
+    /// Whether `outbound` would take this frame from guest port `port`:
+    /// the port may send it as the rule's address.
+    pub fn is_return(&self, port: usize, frame: &[u8]) -> bool {
+        if port >= MAX_TARGETS || self.targets & (1 << port) == 0 || frame.len() < 14 {
+            return false;
+        }
+        classify(frame, Side::Src)
+            .and_then(|flow| self.ret.lookup(port as u8, &flow))
+            .is_some_and(|r| self.rules[r as usize].is_some_and(|rule| self.eps[rule.ep as usize].is_some()))
+    }
+
     #[cfg(test)]
     pub fn table_lens(&self) -> (usize, usize) {
         (self.inbound.len(), self.ret.len())

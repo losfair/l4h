@@ -12,6 +12,8 @@
 //!   reaches the same target.
 //! - Mutated and truncated frames never panic (no read past the frame),
 //!   and steering changes only bytes 0..12.
+//! - `is_return` (netd's L3 filter) holds exactly for what `outbound`
+//!   steers.
 
 #![allow(dead_code)]
 
@@ -359,7 +361,10 @@ fn inbound(s: &mut Steer, sw: u8, from: Option<usize>, f: &mut [u8]) -> Option<(
 fn outbound(s: &mut Steer, port: usize, f: &mut [u8]) -> Option<(Endpoint, usize)> {
     let before = f.to_vec();
     let counts: Vec<u64> = s.rules.iter().map(|r| r.map_or(0, |r| r.out_frames)).collect();
+    // What netd's L3 filter asks (ipfilter.rs) agrees with what is steered.
+    let ret = s.is_return(port, f);
     let e = s.outbound(port, f);
+    assert_eq!(ret, e.is_some());
     assert_eq!(f.get(12..), before.get(12..));
     let rule = s.rules.iter().zip(&counts).position(|(r, &c)| r.is_some_and(|r| r.out_frames != c));
     match e {

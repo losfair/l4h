@@ -411,11 +411,11 @@ impl Vmmgr {
         Ok(())
     }
 
-    /// Give guest `id` (before it starts) a virtio-net device on `switch`.
-    /// Returns the MAC.
-    pub fn create_nic(&mut self, id: usize, switch: u32, mac: u64, lock: bool, isolated: bool) -> Result<u64, Errno> {
+    /// Give guest `id` (before it starts) a virtio-net device on `switch`,
+    /// with abi::NIC_* `flags`.  Returns the MAC.
+    pub fn create_nic(&mut self, id: usize, switch: u32, mac: u64, flags: u64) -> Result<u64, Errno> {
         // What root would refuse, before anything is made for the port.
-        if !proto::nic_mac_ok(mac) {
+        if !proto::nic_mac_ok(mac) || flags & !proto::NIC_FLAGS != 0 {
             return Err(ctl::EINVAL);
         }
         if !self.can_afford(1 << 20, 0, 0) {
@@ -439,7 +439,7 @@ impl Vmmgr {
                 Some(keep) => keep,
                 None => root::port_keep(&mut h.alloc, &mut g.arena).ok_or(ctl::ENOMEM)?,
             };
-            let backend = match root::nic_add(&mut h.alloc, keep, id, switch, mac, lock, isolated) {
+            let backend = match root::nic_add(&mut h.alloc, keep, id, switch, mac, flags) {
                 Ok(backend) => backend,
                 Err(e) => {
                     g.port_spare = Some(keep);
@@ -758,7 +758,7 @@ fn dom0_no_disk(h: &mut Vmmgr, id: usize, k: usize, e: Errno) -> bool {
 /// dom0's NICs and USB controllers, after which it starts.
 fn dom0_finish(h: &mut Vmmgr, id: usize) {
     for n in &h.cfg.dom0_nic[..h.cfg.dom0_nics as usize] {
-        let r = u32::try_from(n.switch).map_err(|_| ctl::EINVAL).and_then(|sw| h.create_nic(id, sw, n.mac, true, false));
+        let r = u32::try_from(n.switch).map_err(|_| ctl::EINVAL).and_then(|sw| h.create_nic(id, sw, n.mac, 0));
         if let Err(e) = r {
             l4h_rt::log!("l4h-vmmgr: cannot give dom0 a NIC on switch {}: error {}", n.switch, e);
         }

@@ -169,7 +169,8 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
         | abi::CTL_EP_SET | abi::CTL_EP_DEL | abi::CTL_EP_LIST | abi::CTL_STEER_SET | abi::CTL_STEER_DEL
         | abi::CTL_STEER_LIST | abi::CTL_PARTITION_INFO | abi::CTL_USB_INFO | abi::CTL_PCI_LIST
         | abi::CTL_NIC_BIND | abi::CTL_NIC_UNBIND | abi::CTL_NIC_RESTART | abi::CTL_NIC_CTL_READ | abi::CTL_DRIVER_INFO
-        | abi::CTL_NIC_TEST | abi::CTL_FIRMWARE_INFO | abi::CTL_FIRMWARE_WANTED => {
+        | abi::CTL_NIC_TEST | abi::CTL_FIRMWARE_INFO | abi::CTL_FIRMWARE_WANTED | abi::CTL_IP_ADD | abi::CTL_IP_DEL
+        | abi::CTL_IP_LIST => {
             resp.vals = host_op(h, req.op, a)?;
             resp.data = *root::result_data();
             Ok(())
@@ -418,7 +419,7 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
                 return Err(EINVAL);
             }
             let switch = u32::try_from(a[1]).map_err(|_| EINVAL)?;
-            resp.vals[0] = h.create_nic(id, switch, a[2], a[3] & abi::NIC_NO_MAC_LOCK == 0, a[3] & abi::NIC_ISOLATED != 0)?;
+            resp.vals[0] = h.create_nic(id, switch, a[2], a[3])?;
             Ok(())
         }
         abi::CTL_VM_SET_SCHED => {

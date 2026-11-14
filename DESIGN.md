@@ -28,7 +28,7 @@ with `make -C docs/manual`, or download `l4h-manual.pdf` from a
 |---|-------------|-------------------------|
 | R1 | No hardware virtualization. Paravirtualize, as Xen PV does. Avoid instruction emulation. | The guest kernel is a new Linux architecture, `ARCH=l4h`, that runs in ring 3 as an seL4 thread and calls seL4 directly. Guest user code runs unmodified. Its `syscall` instructions and exceptions reach the guest kernel as seL4 fault IPC. |
 | R2 | x86_64 first, but friendly to aarch64. | Each layer is split into ISA-independent and ISA-specific parts (§12). Nothing relies on an x86-only mechanism such as segmentation, rings 1/2 or Xen-style page-table validation. |
-| R3 | virtio-blk and virtio-net. Block devices are passed through. Network is multiplexed by virtual switches. | The guest runs stock Linux `virtio_blk`/`virtio_net` drivers over a paravirtual transport, `virtio-l4h`, with no trapped MMIO (§9). All device buffers live in a host-owned I/O pool (§8.1). The hypervisor provides **only L2 virtual switches**; a physical NIC is an uplink port on a switch, and routing and NAT are done by a VM. The one exception is stateless steering (§9.3): dom0 may have netd pick a port by IP address, protocol and port, rewriting only MAC addresses. |
+| R3 | virtio-blk and virtio-net. Block devices are passed through. Network is multiplexed by virtual switches. | The guest runs stock Linux `virtio_blk`/`virtio_net` drivers over a paravirtual transport, `virtio-l4h`, with no trapped MMIO (§9). All device buffers live in a host-owned I/O pool (§8.1). The hypervisor provides **only L2 virtual switches**; a physical NIC is an uplink port on a switch, and routing and NAT are done by a VM. The exceptions are stateless steering (§9.3), where dom0 may have netd pick a port by IP address, protocol and port, rewriting only MAC addresses, and per-port L3 source filtering, where netd drops a guest's frames from addresses dom0 did not give it. |
 | R4 | SMP guests. | Each vCPU is an seL4 kernel-context thread with its own scheduling context. IPIs are seL4 notifications (§6). |
 | R5 | Many guests per host, e.g. 30 guests on 4 CPUs. | MCS scheduling contexts give each vCPU a budget. Idle guests consume no CPU: the guest kernel is tickless and idle means blocked in `seL4_Recv`. A balancer moves vCPUs between cores (§7). Each guest makes its kernel objects from its own RAM (§8). |
 | R6 | A runtime management API for "dom0", the first guest started at boot. | `l4h-vmmgr` serves a control API through an `l4hctl` device that only dom0 receives (§10.1). dom0 has no device-driver duties. |
@@ -2363,7 +2363,8 @@ firewalling belong in a VM.
   join internal switches and Linux provides NAT or routing. QEMU guests can
   also sit directly on the uplink switch.
 
-**Steering.** The one exception to "nothing above L2": dom0 can hand part
+**Steering.** An exception to "nothing above L2" (L3 filtering, below, is
+the other): dom0 can hand part
 of one address's traffic to a port on any switch, without a router VM in
 the path. For example, a web VM on an internal switch serves TCP 80/443 of
 dom0's external IP, or owns a cloud alias IP outright.
@@ -2419,6 +2420,44 @@ dom0's external IP, or owns a cloud alias IP outright.
 - `l4hctl ep set SWITCH MAC|VM:NIC|uplink [--peer MAC|gw]`, `l4hctl steer
   set EP IP[/PROTO[:PORT]] --to VM:NIC|PORT`, and `del`/`list`.
   `tests/fuzz-steer` checks the classifier and tables against a model.
+
+**L3 filtering.** A vNIC created with `ipfilter` (`NIC_IP_FILTER`) sends
+only from the addresses dom0 gives it, so a guest cannot take another's
+IP address, answer ARP or Neighbor Discovery for it, or act as a router or
+DHCP server on its switch. The filter is checked in netd on every frame
+the guest sends, after the MAC lock (`ipfilter.rs`). Frames to the guest
+are not filtered.
+- **Addresses.** Up to 16 IPv4 or IPv6 prefixes a port
+  (`L4H_CTL_IP_ADD`/`DEL`/`LIST`; root keeps the table, netd a copy). A
+  filtered port starts with none; `l4hctl create --nic SW,ip=PREFIX` adds
+  them before the VM starts, and `l4hctl ip add|del` changes them while it
+  runs, for example for a DHCP lease. Link-local IPv6 is not implied:
+  allowing all of `fe80::/10` would let a guest take another's.
+- **What passes.** IPv4 from an allowed source, or from 0.0.0.0 as a DHCP
+  client (UDP 68 → 67). ARP (Ethernet over IPv4) whose sender is allowed or
+  0.0.0.0 (an RFC 5227 probe) and whose sender MAC is the frame's source.
+  IPv6 from an allowed source, or from `::` for router and neighbour
+  solicitations and MLD reports, unfragmented.
+- **Neighbor Discovery.** IPv6's ARP: a Neighbor Advertisement's target
+  must be allowed, and the link-layer address options of solicitations and
+  advertisements must be the frame's source MAC.
+- **Guards.** Router Advertisements and Redirects (ICMPv6 134, 137), ICMP
+  Redirects (5), and DHCP and DHCPv6 server or relay messages (UDP source
+  port 67, 547) are dropped from any source. A router or DHCP server VM
+  needs an unfiltered port.
+- **Everything else is dropped.** Other EtherTypes, VLAN-tagged frames
+  (the tag would carry IP past the checks), malformed headers, more than
+  eight IPv6 extension headers, and an IPv6 first fragment whose headers
+  stop short of the upper-layer one (RFC 7112), which could hide a Router
+  Advertisement. Later fragments carry no headers to guard; their source
+  is still checked.
+- **Steering.** A steering rule's target may send as the rule's address
+  (what `Steer::outbound` would take), without the address in its list.
+  The guards apply to it too.
+- **Cost.** An unfiltered port pays a flag test; a filtered one parses the
+  headers and compares against at most 16 prefixes. Drops count in the
+  port's `drops`. `tests/fuzz-ipfilter` checks each rule, and that no
+  mutated frame passes with another source.
 
 **gVNIC.** `l4h-nicd-gvnic/src/gvnic.rs` follows Linux `gve` with the DQO queue
 format and raw DMA addressing (DQO RDA), which C3 and later offer; a device
@@ -5460,7 +5499,8 @@ machine and guests of 256–512 MiB.
 | `tests/run-usbtest.sh` (`USBTEST_HC=nec`) | whole xHCI controller assignment: left to the firmware until claimed, HID, BOT and UAS disks, a hub, driver reload, destroy during I/O, a second guest (§9.7) |
 | `tests/run-nictest.sh` | NIC drivers outside netd: two NICs, NIC 1's driver panics and hangs and is restarted while NIC 0's uplink keeps working, unbind and rebind, a restart of dom0's uplink driver (`L4H_QEMU_IOMMU=intel\|amd`: confined) |
 | `tests/fuzz-uplink` (in `run-fuzz.sh`) | the uplink channel: honest peers against a model, a producer that scribbles over descriptors and data, a consumer that writes any tail |
-| `tests/run-nettest.sh`, `tests/run-router.sh` | switches, uplink, multi-NIC, isolation, MAC lock, NAT router VM (`NETTEST_LEGACY=1`: legacy virtio-net uplink) |
+| `tests/fuzz-ipfilter` (in `run-fuzz.sh`) | netd's L3 filter: each rule, exception and guard; canonical prefixes; mutated frames never pass with another source |
+| `tests/run-nettest.sh`, `tests/run-router.sh` | switches, uplink, multi-NIC, isolation, MAC lock, L3 filtering, steering, NAT router VM (`NETTEST_LEGACY=1`: legacy virtio-net uplink) |
 | `tests/run-density.sh 30 256` | 30 guests on 4 cores stay responsive |
 | `tests/run-m6test.sh` | dom0 restart, CPU caps, steal time |
 | `tests/run-vtdtest.sh [--qemu]` | VT-d DMAR parsing, table/interrupt formats and address bounds; with QEMU, DMA, lifecycle, NIC and serial tests |

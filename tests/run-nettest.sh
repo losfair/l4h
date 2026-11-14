@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # M5 gate: L2 switches with an uplink, guest-to-guest traffic, multiple
-# vNICs, switch isolation, isolated ports, MAC lock, steering (a port rule
-# between guests, an IP-wide rule on the uplink), and ports that outlive a
-# dom0 restart.
+# vNICs, switch isolation, isolated ports, MAC lock, L3 filtering,
+# steering (a port rule between guests, an IP-wide rule on the uplink),
+# and ports that outlive a dom0 restart.
 # NETTEST_LEGACY=1 makes the uplink a legacy-only virtio-net device, as on
 # GCE N2.
 set -euo pipefail

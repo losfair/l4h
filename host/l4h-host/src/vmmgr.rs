@@ -145,6 +145,9 @@ pub const fn nic_mac_ok(mac: u64) -> bool {
     mac >> 48 == 0 && mac >> 40 & 1 == 0
 }
 
+/// The abi::NIC_* flags a vNIC can be created with.
+pub const NIC_FLAGS: u64 = l4h_abi::NIC_NO_MAC_LOCK | l4h_abi::NIC_ISOLATED | l4h_abi::NIC_IP_FILTER;
+
 /// A guest as vmmgr reports it to root (for the dashboard and the
 /// monitor), under a sequence count: odd while it is being written.
 #[repr(C)]
