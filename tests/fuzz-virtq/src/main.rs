@@ -337,13 +337,14 @@ fn tcp_frame(rng: &mut Rng, v6: bool, vlan: bool, payload: usize, mss: usize) ->
 fn offload_check(rng: &mut Rng, n: u64) -> u64 {
     let mut buf = vec![0u8; 70000];
     let mut segs = 0u64;
-    // A guest may send a VLAN tag cut short, with a checksum request
-    // that sanitizes; the drivers must not read past it.
+    // A guest may send a VLAN tag cut short, with a checksum request: it
+    // has no L3 header for the checksum to start in, so sanitize refuses
+    // it and the drivers never see it.
     for len in 14..18 {
         let mut frame = vec![0u8; len];
         frame[12..14].copy_from_slice(&0x8100u16.to_be_bytes());
         let mut hdr = [offload::F_NEEDS_CSUM, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        assert!(offload::sanitize(&mut hdr, &frame));
+        assert!(!offload::sanitize(&mut hdr, &frame), "checksum in a truncated VLAN tag");
         assert!(offload::ethertype(&frame).is_none(), "truncated VLAN tag parsed");
     }
     for _ in 0..n {
