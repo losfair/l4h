@@ -840,11 +840,24 @@ variant. Updates preserve it; switching away from SKIM requires native
 Linux to check the host CPU.
 \end{caveat}
 
+\file{l4h-fl4.efi} is an additional x86\_64 release application built with
+the \href{https://github.com/losfair/FL4}{FL4 kernel}. It includes a host,
+guest kernel and module tree rebuilt against FL4's own libsel4. FL4 detects
+CPU features at boot and supports single-kernel boots without nested KVM.
+Build it separately with \cmd{L4H\_RELEASE=1 tools/build-fl4-efi.sh}, or
+as part of \cmd{tools/build-efi.sh}. The source revision is pinned in
+\file{kernel/fl4/REVISION}; \texttt{L4H\_FL4\_SOURCE} can select a detached
+worktree for development. To make a UEFI disk from this release binary:
+\begin{lstlisting}
+tools/mkimage.sh -e l4h-fl4.efi -i dom0.cpio.gz \
+    -c l4h.conf l4h-fl4.raw
+\end{lstlisting}
+
 Each tagged release on GitHub carries, for x86\_64:
 \begin{itemize}
-  \item all three applications, built in release mode, with the guest kernel
+  \item all four applications, built in release mode, with their guest kernel
         and its module tree in them;
-  \item \file{l4h-bios-x86\_64.tar.xz}: the same for BIOS machines
+  \item \file{l4h-bios-x86\_64.tar.xz}: the seL4 variants for BIOS machines
         (Section~\ref{sec:bios}), with each variant's kernel as
         \file{kernel-VARIANT.elf};
   \item \file{l4h-dom0-x86\_64.tar.xz}: a static \cmd{l4hctl} and an
@@ -857,6 +870,9 @@ Each tagged release on GitHub carries, for x86\_64:
         \file{kernel-VARIANT-sK.elf}, not \file{kernel-VARIANT.elf}. Its \file{vmlinux} is the guest kernel, from
         which verifiers compute launch digests
         (Section~\ref{sec:attest});
+  \item \file{l4h-debug-fl4-x86\_64.tar.xz}: the matching FL4 kernel,
+        host components, NIC drivers and guest kernel with debug information,
+        and the FL4 source commit in \file{fl4-revision};
   \item \file{l4h-attest.py}, which verifies attestation reports
         (Section~\ref{sec:attest});
   \item \file{SHA256SUMS}.

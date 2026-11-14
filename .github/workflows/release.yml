@@ -1,9 +1,10 @@
 # Build what l4h ships for x86_64 and keep it as workflow artifacts:
-# - the UEFI applications, one per seL4 variant, with the guest kernel and
-#   its module tree (tools/build-efi.sh);
+# - the UEFI applications, one per seL4 variant plus FL4, each with its
+#   matching guest kernel and module tree (tools/build-efi.sh);
 # - l4h-bios-x86_64.tar.xz, the same for BIOS machines (tools/mkbios.sh);
 # - l4h-debug-x86_64.tar.xz, the same build unstripped, for decoding fault
 #   addresses and computing launch digests;
+# - l4h-debug-fl4-x86_64.tar.xz, the FL4 stack unstripped and its source pin;
 # - l4h-dom0-x86_64.tar.xz, the dom0 userspace tools (tools/build-dom0.sh);
 # - l4h-attest.py, the verifier of attestation reports;
 # - l4h-manual.pdf, the user manual, showing the tag it was built for.
@@ -85,6 +86,12 @@ jobs:
           cd build/efi && sha256sum l4h-*.efi l4h-*.tar.xz l4h-attest.py l4h-manual.pdf > SHA256SUMS && cat SHA256SUMS
       - name: Multikernel boot of the release application
         run: MK_EFI=build/efi/l4h-generic.efi tests/run-mktest.sh
+      - name: FL4 Linux, devices, networking, balloon and ABI
+        run: L4H_RELEASE=1 tests/run-fl4test.sh | tee build/fl4test.log
+      - name: UEFI boot of the FL4 release application
+        run: |
+          UEFI_EFI=build/efi/l4h-fl4.efi tests/run-uefitest.sh
+          grep -aq 'FL4: seL4 17.0 (MCS) API kernel' build/qemu-uefi.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: l4h-x86_64
@@ -104,6 +111,7 @@ jobs:
               --title "l4h $GITHUB_REF_NAME" --generate-notes \
               build/efi/l4h-generic.efi build/efi/l4h-xapic-nopcid.efi \
               build/efi/l4h-skim-xapic-nopcid.efi \
+              build/efi/l4h-fl4.efi build/efi/l4h-debug-fl4-x86_64.tar.xz \
               build/efi/l4h-bios-x86_64.tar.xz \
               build/efi/l4h-dom0-x86_64.tar.xz build/efi/l4h-debug-x86_64.tar.xz \
               build/efi/l4h-attest.py build/efi/l4h-manual.pdf build/efi/SHA256SUMS
@@ -115,4 +123,7 @@ jobs:
           path: |
             build/efi/*.log
             build/mktest.log
+            build/fl4test.log
+            build/qemu.log
+            build/qemu-uefi.log
             docs/manual/*.log

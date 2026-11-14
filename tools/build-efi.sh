@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Build the shipped l4h UEFI applications, one per seL4 variant, into
-# build/efi/l4h-VARIANT.efi.  The host components, l4h-root and the guest
-# kernel with its module tree are the same in each (dom0's initramfs comes
-# from the EFI system partition, see tools/mkefi.sh); the seL4 kernels
+# Build the shipped l4h UEFI applications, one per seL4 variant plus FL4, into
+# build/efi/l4h-VARIANT.efi. The seL4 variants share their host components,
+# l4h-root and guest kernel with its module tree (dom0's initramfs comes
+# from the EFI system partition, see tools/mkefi.sh); their seL4 kernels
 # differ in options that seL4 fixes at build time:
 #   generic       x2APIC, PCID: QEMU/KVM and GCE
 #   xapic-nopcid  xAPIC, no PCID: machines whose firmware leaves x2APIC off
@@ -20,8 +20,11 @@
 # kernel-VARIANT-sK.elf, the shim and the guest kernel, vmlinux), to
 # decode fault addresses from a shipped application; verifiers compute
 # launch digests from vmlinux (l4h-attest.py measure).
+# FL4 has its own kernel, host, guest and module tree (build-fl4-efi.sh),
+# packaged as l4h-fl4.efi and l4h-debug-fl4-x86_64.tar.xz, without a shim.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
+export L4H_ARCH=x86_64
 out=$root/build/efi
 mkdir -p "$out"
 # The host components build to the cargo profile's directory.
@@ -33,16 +36,17 @@ variants=(
 )
 for v in "${variants[@]}"; do
     read -r name lapic pcid skim <<<"$v"
-    L4H_KERNEL_VARIANT=$name L4H_LAPIC_MODE=$lapic L4H_PCID=$pcid L4H_SKIM_WINDOW=$skim \
+    L4H_VTX=ON L4H_KERNEL_VARIANT=$name L4H_LAPIC_MODE=$lapic L4H_PCID=$pcid L4H_SKIM_WINDOW=$skim \
         "$root/tools/build-kernel.sh" >"$out/kernel-$name.log" 2>&1 \
         || { tail -20 "$out/kernel-$name.log"; exit 1; }
-    L4H_KERNEL_VARIANT=$name L4H_LAPIC_MODE=$lapic L4H_PCID=$pcid L4H_SKIM_WINDOW=$skim \
+    L4H_VTX=ON L4H_KERNEL_VARIANT=$name L4H_LAPIC_MODE=$lapic L4H_PCID=$pcid L4H_SKIM_WINDOW=$skim \
         "$root/tools/build-mkshim.sh" 8 >"$out/mkshim-$name.log" 2>&1 \
         || { tail -20 "$out/mkshim-$name.log"; exit 1; }
 done
 # libsel4 does not depend on these options: build the host against the
 # default kernel build, as the other scripts do.
-[ -d "$root/build/sel4" ] || "$root/tools/build-kernel.sh" >"$out/kernel.log" 2>&1
+L4H_KERNEL_VARIANT= L4H_VTX=ON "$root/tools/build-kernel.sh" >"$out/kernel.log" 2>&1
+export SEL4_PREFIX=$root/build/sel4
 "$root/tools/build-host.sh"
 "$root/tools/build-kmods.sh" >/dev/null
 debug=$(mktemp -d)
@@ -83,3 +87,6 @@ tar -C "$debug" -cJf "$out/l4h-bios-x86_64.tar.xz" l4h-bios-x86_64
 for f in l4h-debug-x86_64.tar.xz l4h-bios-x86_64.tar.xz; do
     echo "$out/$f: $(( $(stat -c %s "$out/$f") >> 10 )) KiB"
 done
+# FL4 renumbers the API and uses a different guest kernel and module tree.
+# Package the seL4 builds first, then rebuild the entire stack for FL4.
+"$root/tools/build-fl4-efi.sh"

@@ -4760,7 +4760,12 @@ injects these failures in a host built with `L4H_TEST_INJECT=1`;
   options fixed at build time. `tools/build-efi.sh` builds them into
   `build/efi/`: `l4h-generic.efi` (x2APIC, PCID: QEMU, GCE, EC2),
   `l4h-xapic-nopcid.efi` (Latitude.sh, below) and `l4h-skim-xapic-nopcid.efi`
-  (Meltdown isolation, xAPIC, no PCID). All variants share one `l4h-root`.
+  (Meltdown isolation, xAPIC, no PCID). These seL4 variants share one
+  `l4h-root`. It also builds `l4h-fl4.efi` with the pinned public FL4
+  kernel and a separately rebuilt host, Linux guest and module tree
+  (`tools/build-fl4-efi.sh`, §14.2). FL4 detects the CPU features at boot;
+  one application covers its x86_64 targets, with single-kernel boots
+  and no nested KVM.
 - **Platform discovery.** seL4 reads ACPI (MADT, cores, IOAPIC). `l4h-root`
   enumerates PCI over MCFG/ECAM or port I/O config and allocates MSI/MSI-X
   through `seL4_IRQControl_GetMSI`. A device names its own BAR addresses,
@@ -4772,9 +4777,9 @@ injects these failures in a host built with `L4H_TEST_INJECT=1`;
 - **Releases.** CI (`.github/workflows/release.yml`) builds, for x86_64, and
   attaches to the GitHub release of each pushed `v*` tag, with
   `SHA256SUMS`:
-  - all three applications, in release mode, with the components packed
+  - all four applications, in release mode, with the components packed
     without debug information;
-  - `l4h-bios-x86_64.tar.xz`: l4h's BIOS files, with each variant's kernel as
+  - `l4h-bios-x86_64.tar.xz`: l4h's BIOS files, with each seL4 variant's kernel as
     `kernel-VARIANT.elf`, for the installer;
   - `l4h-dom0-x86_64.tar.xz` (`tools/build-dom0.sh`): the dom0 userspace
     package, a static `l4hctl`, an example `l4h.conf` and the installer
@@ -4784,6 +4789,9 @@ injects these failures in a host built with `L4H_TEST_INJECT=1`;
     variant's kernel, its multikernel slot kernels `kernel-VARIANT-sK.elf`,
     the shim and the guest kernel `vmlinux`), for `addr2line` on fault
     addresses;
+  - `l4h-debug-fl4-x86_64.tar.xz`: the FL4 build unstripped (kernel,
+    root, host components, NIC drivers and guest `vmlinux`), with the
+    source commit in `fl4-revision`;
   - `l4h-attest.py`, the attestation verifier (§10.2);
   - `l4h-manual.pdf`, the user manual.
 
@@ -5464,8 +5472,9 @@ labels differ. The shipped configurations still use `KernelVTX=ON`;
 `no-vtx` is not a release variant. `tests/run-novtxtest.sh` builds this
 development kernel and runs the guest self-test with 1 and 4 vCPUs.
 
-A development build path for FL4 is available on x86_64. Start from a
-frozen worktree, rather than an FL4 checkout that is being edited:
+FL4 is also a release option on x86_64. `tools/build-fl4.sh` fetches the
+public source at `kernel/fl4/REVISION`. To try a different source commit,
+start from a frozen worktree rather than an FL4 checkout being edited:
 
 ```sh
 git -C /path/to/FL4 worktree add --detach /path/to/FL4-l4h-frozen <commit>
@@ -5474,13 +5483,14 @@ tools/build-fl4.sh
 SEL4_PREFIX="$PWD/build/sel4-fl4" L4H_KERNEL_VARIANT=fl4 tests/run-selftest.sh 4
 ```
 
-The tested FL4 revision is `92bf414a3311268b2a1e6c67b8dd6be74d2d408d`.
-`prepare-fl4.sh` clones that frozen source into `build/FL4-src` without
-applying any kernel patches. The source worktree is not edited.
+The tested FL4 revision is `86880d5b438625daee315ba8bd57cebce3cd155b`.
+`prepare-fl4.sh` clones the pinned public revision, or the frozen override,
+into `build/FL4-src` without applying any kernel patches. The source
+worktree is not edited.
 `build-fl4.sh` builds the kernel and FL4's own libsel4 together, installs
 them in `build/sel4-fl4`, and records the source commit in `fl4-revision`.
-Its installed syscall XML includes an empty, unused master-API section
-for rust-sel4's parser; the MCS syscall numbers stay FL4's.
+FL4's own syscall XML is installed unchanged; the bindings use FL4's
+MCS syscall numbers.
 
 Rebuild the host, Linux guest and modules with this `SEL4_PREFIX`;
 FL4 is source compatible with the seL4 API, with different numbering and
@@ -5489,21 +5499,32 @@ object sizes. The host uses the selected kernel's retype fan-out limit
 buffer, leaving 3 KiB for FL4's 2696-byte standard XSAVE image.
 Multikernel partitions and nested KVM are unavailable on FL4. It detects
 the APIC, PCID, FS/GS and FPU features at boot, so the shipped seL4 CPU
-variants do not apply. No FL4 release artifact is built or published.
+variants do not apply.
 
-`L4H_FL4_SOURCE=... tests/run-fl4test.sh` attempts the 1- and 4-vCPU self-tests.
-With `L4H_RELEASE=1` it also attempts the ABI/module-tree test: FL4's debug
+`L4H_RELEASE=1 tools/build-fl4-efi.sh` builds `build/efi/l4h-fl4.efi` and
+its matching `l4h-debug-fl4-x86_64.tar.xz`; `build-efi.sh` builds them after
+packaging the three seL4 variants. Each stack uses its own libsel4 headers,
+and the FL4 application carries no multikernel shim. To make a UEFI disk
+from the release binary, use `tools/mkimage.sh -e build/efi/l4h-fl4.efi
+-i dom0.cpio.gz -c l4h.conf build/l4h-fl4.raw`.
+
+`tests/run-fl4test.sh` runs the 1- and 4-vCPU self-tests,
+4-vCPU disk I/O, networking through a dom0 restart, and balloon reporting.
+With `L4H_RELEASE=1` it also runs the ABI/module-tree test: FL4's debug
 profile omits l4h's debug-syscall MCP filter, so the ABI test's deliberate
 untrapped `DebugHalt` probe requires FL4's release profile.
-The host and Linux guest build against the tested FL4 revision, and root
-and the host services boot on four QEMU cores. Complete runtime validation
-is blocked by FL4 issues; the integration does not carry fixes for them.
-The reports are [INT gates](https://github.com/losfair/FL4/issues/1),
+Release CI runs this suite and boots the packaged `l4h-fl4.efi` through
+OVMF with `UEFI_EFI=build/efi/l4h-fl4.efi tests/run-uefitest.sh`, checking
+the module tree and dom0 networking. The tested revision includes upstream
+fixes for [INT gates](https://github.com/losfair/FL4/issues/1),
 [device alignment](https://github.com/losfair/FL4/issues/2),
 [retype configuration](https://github.com/losfair/FL4/issues/3),
 [rust-sel4 XML compatibility](https://github.com/losfair/FL4/issues/4),
-[speculative refill nontermination](https://github.com/losfair/FL4/issues/5), and
-[a reschedule IPI left in service](https://github.com/losfair/FL4/issues/6).
+[speculative refill nontermination](https://github.com/losfair/FL4/issues/5),
+[a reschedule IPI left in service](https://github.com/losfair/FL4/issues/6),
+[SetTLSBase syscall trapping](https://github.com/losfair/FL4/issues/7), and
+[UEFI ACPI discovery](https://github.com/losfair/FL4/issues/8).
+The l4h integration applies no FL4 fixes.
 
 For AArch64, build the kernel and loader once, then select the guest ISA
 with `L4H_ARCH`. Linux outputs go to `build/linux-l4h-aarch64` and the
@@ -5565,7 +5586,7 @@ machine and guests of 256–512 MiB.
 | `tests/run-install-vm.sh debian-13-nocloud-amd64.qcow2 [release-directory] [1\|2]` | in a disposable UEFI/KVM VM, install from native Debian with one or two uplinks, verify each switch and network, then return to native Linux; uses prebuilt releases and `sudo -u "$L4H_QEMU_USER"` (defaults to the invoking user); `INSTALL_VM_SWAP_NAMES=1` with two NICs also tests exchanging eth0/eth1 names; `INSTALL_VM_FIRMWARE=bios INSTALL_VM_MEMORY=1G INSTALL_VM_CPUS=1` tests small-VM defaults through BIOS GRUB |
 | `tests/run-versiontest.sh` | host version metadata: release tags, development builds, overrides and worktrees |
 | `tests/run-novtxtest.sh` | builds the host and Linux guest with `KernelVTX=OFF` headers and boots the guest self-test with 1 and 4 vCPUs; Linux KVM stays disabled and root never probes a VCPU object |
-| `L4H_FL4_SOURCE=... tests/run-fl4test.sh` | builds a private unmodified copy of a frozen FL4 worktree and tests rebuilt userspace on it; currently blocked by the FL4 issues above; `L4H_RELEASE=1` also checks the ABI and guest module tree |
+| `tests/run-fl4test.sh` | builds the pinned public FL4 revision (or a frozen `L4H_FL4_SOURCE` override); tests 1- and 4-vCPU Linux, 4-vCPU disk I/O, networking and balloon reporting; `L4H_RELEASE=1` also checks the ABI and guest module tree |
 | `tests/run-flagstest.sh` | focused flags-only boot: console/display seals, kernel taints, userspace gates and instance reuse, on either architecture |
 | `tests/run-acstest.sh` | PCIe ACS setup against a model of configuration space: implemented bits only, firmware bits kept, bits that do not stick, hostile capability lists, read-only checks; ECAM window block planning |
 | `tests/run-trusttest.sh` | taint/seal permissions, atomic gates, instances, seqlock snapshots and verifier policy |

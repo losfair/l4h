@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 # Build FL4 and its own libsel4 through the seL4-compatible CMake interface.
-# FL4_SOURCE names the private copy of a frozen checkout (tools/build-fl4.sh).
+# FL4_SOURCE names the private copy of a pinned revision (tools/build-fl4.sh).
 list(APPEND CMAKE_MODULE_PATH "${FL4_SOURCE}/cmake")
 find_package(seL4 REQUIRED)
 project(l4h_fl4 C ASM)

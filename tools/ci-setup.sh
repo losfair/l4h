@@ -41,6 +41,9 @@ fi
 export PATH=$HOME/.cargo/bin:$PATH
 rustup toolchain install stable --profile minimal
 rustup component add rust-src --toolchain stable
+if [[ $want == *" x86_64 "* ]]; then
+    rustup target add --toolchain stable x86_64-unknown-none
+fi
 # Rust-for-Linux bindings for kemu in the x86_64 guest kernel.
 cargo +stable install --locked bindgen-cli --version 0.71.1
 (cd "$root/host" && rustup toolchain install)

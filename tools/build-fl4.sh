@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Build a frozen FL4 worktree for l4h development, without changing seL4's
-# default build or the release variants. L4H_FL4_SOURCE names that worktree.
+# Build the pinned FL4 kernel and its libsel4 in build/sel4-fl4.
+# L4H_FL4_SOURCE overrides the pin with a frozen worktree for development.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 source "$root/tools/prepare-fl4.sh"
@@ -33,17 +33,5 @@ for d in \
     "$out/libsel4/autoconf"; do
     cp -rL "$d/." "$prefix/libsel4/include/"
 done
-# rust-sel4 parses both API sections even in an MCS-only build. FL4 prunes
-# the unused master section; an empty one preserves every generated ID.
-python3 - "$prefix/libsel4/include/api/syscall.xml" <<'PY'
-from pathlib import Path
-import sys
-import xml.etree.ElementTree as ET
-
-path = Path(sys.argv[1])
-text = path.read_text()
-if ET.fromstring(text).find("api-master") is None:
-    path.write_text(text.replace("<syscalls>", "<syscalls>\n    <api-master/>"))
-PY
 printf '%s\n' "$base" >"$prefix/fl4-revision"
 echo "FL4 installed to $prefix (debug build: $debug)"
