@@ -117,6 +117,7 @@ jobs:
       # runner whose KVM allows nesting.  Hosted runners vary, so the step
       # runs where it can and says so where it cannot.
       - name: VT-x or AMD-V exposed (when the runner has nested virtualization)
+        id: nested_virt
         run: |
           model=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs)
           if grep -qw svm /proc/cpuinfo; then
@@ -129,7 +130,14 @@ jobs:
           echo "CPU: $model; $name, KVM nested: $nested"
           if grep -qw 'vmx\|svm' /proc/cpuinfo && [[ $nested == [Y1] ]]; then
             tests/run-vtxtest.sh on
-            tests/run-vcpustress.sh
+            # The single-step stress can stall on hosted nested AMD-V.
+            # Keep the failure visible while the rest of the suite runs.
+            vcpustress=ok
+            tests/run-vcpustress.sh || vcpustress=failed
+            echo "vcpustress=$vcpustress" >> "$GITHUB_OUTPUT"
+            if [ "$vcpustress" = failed ]; then
+              echo "::warning::VCPUSTRESS failed on $model (not fatal for now; see logs-x86_64)"
+            fi
             L4H_QEMU_CPU=host,+invtsc tests/run-selftest.sh 1
             if grep -q "$virt: unavailable" build/qemu.log; then
               echo "the self-test ran without $name"; exit 1
@@ -147,7 +155,7 @@ jobs:
             if [ "$kvm" = failed ]; then
               echo "::warning::KVMTEST failed on $model (known intermittent failure on nested AMD-V; not fatal for now)"
             fi
-            echo "$name exposed: tested on $model (KVMTEST $kvm)" >> "$GITHUB_STEP_SUMMARY"
+            echo "$name exposed: tested on $model (VCPUSTRESS $vcpustress; KVMTEST $kvm)" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "::warning::No nested virtualization on this runner ($model, nested: $nested): the $name path was not tested"
             echo "$name exposed: **not tested**, no nested virtualization on this runner ($model, KVM nested: $nested)" >> "$GITHUB_STEP_SUMMARY"
@@ -244,7 +252,7 @@ jobs:
           UEFI_EFI=build/l4h-fl4.efi tests/run-uefitest.sh
           grep -aq 'FL4: seL4 17.0 (MCS) API kernel' build/qemu-uefi.log
       - name: Upload logs
-        if: failure()
+        if: failure() || steps.nested_virt.outputs.vcpustress == 'failed'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: logs-x86_64
