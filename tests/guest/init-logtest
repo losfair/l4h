@@ -6,8 +6,19 @@ mount -t devtmpfs dev /dev
 mount -t tmpfs tmp /tmp
 mount /dev/vda /mnt || { echo "LOGTEST: FAIL: mount"; poweroff -f; }
 finish() {
-    echo "LOGTEST: $*" | tee /mnt/result
-    sync
+    if [ -n "${follower:-}" ]; then
+        kill "$follower" 2>/dev/null
+        wait "$follower" 2>/dev/null
+    fi
+    echo "LOGTEST: $*" > /mnt/result
+    # debugfs reads the disk without replaying ext4's journal. Checkpoint
+    # the metadata, including /result, before resetting the host.
+    if umount /mnt; then
+        echo "LOGTEST: $*"
+    else
+        echo "LOGTEST: FAIL: unmount result disk" | tee /mnt/result
+        sync
+    fi
     l4hctl host-reboot 2>/dev/null || poweroff -f
     while :; do sleep 10; done
 }
@@ -45,6 +56,4 @@ for action in fault panic off; do
     done
     echo "LOGTEST: $action retained after destroy and followed"
 done
-kill "$follower"
-wait "$follower" 2>/dev/null
 finish PASS
