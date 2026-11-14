@@ -45,7 +45,7 @@ fi
 if [ -f /bin/vm.cpio.gz ]; then
     # The host copies its console to the serial port.
     id=$(l4hctl create attestvm --initrd /bin/vm.cpio.gz --mem 64 \
-        --cmdline "console=hvc0 attest_nonce=$nonce") && \
+        --cmdline "console=hvc0 quiet attest_nonce=$nonce") && \
         l4hctl console "$id" --until "ATTESTVM: done" --timeout 60 >/dev/null
     sleep 1
 fi
