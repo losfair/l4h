@@ -6,8 +6,13 @@
 //!   plain model says they are canonical.
 //! - Generated frames, mutated and truncated, never panic (no read past
 //!   the frame), and the filter never passes a frame that is not IPv4,
-//!   IPv6 or ARP, or whose source is neither allowed nor unspecified; a
-//!   frame it calls spoofed has a source it does not allow.
+//!   IPv6 or ARP, whose source is neither allowed nor unspecified, or
+//!   that a router or DHCP server sends; a frame it calls spoofed has a
+//!   source it does not allow.
+//! - Frames go the way netd takes them, with random offload metadata
+//!   (l4h-netcore's sanitize, then the checksum completed for a filtered
+//!   port): whatever later ports and devices do with the metadata
+//!   (complete the checksum, segment) leaves the verdict as it was.
 
 #![allow(dead_code)]
 
@@ -15,6 +20,7 @@
 mod ipfilter;
 
 use ipfilter::{Filter, MAX_PREFIXES, Prefix, Verdict, check};
+use l4h_netcore::offload::{self, F_NEEDS_CSUM, GSO_TCPV4, GSO_TCPV6, HDR_SIZE};
 
 struct Rng(u64);
 impl Rng {
@@ -104,6 +110,14 @@ fn udp(sport: u16, dport: u16) -> Vec<u8> {
     u[2..4].copy_from_slice(&dport.to_be_bytes());
     u.extend_from_slice(b"payload");
     u
+}
+
+/// A TCP header and `n` bytes of payload.
+fn tcp(n: usize) -> Vec<u8> {
+    let mut t = vec![0u8; 20 + n];
+    t[..4].copy_from_slice(&[0x1f, 0x90, 0xc0, 0x00]);
+    t[12] = 0x50;
+    t
 }
 
 fn icmp(kind: u8) -> Vec<u8> {
@@ -251,6 +265,7 @@ fn random_frame(rng: &mut Rng) -> Vec<u8> {
             let l4 = match proto {
                 17 => udp(rng.pick(&[53, 67, 68, 547, 4000]), rng.pick(&[53, 67, 68, 546])),
                 1 => icmp(rng.pick(&[0, 3, 5, 8])),
+                6 => tcp(rng.pick(&[0, 100, 3000])),
                 _ => vec![0; 20],
             };
             let frag = if rng.chance(20) { rng.below(100) as u16 } else { 0 };
@@ -269,7 +284,8 @@ fn random_frame(rng: &mut Rng) -> Vec<u8> {
             }
             let upper = rng.pick(&[6, 17, 58, 58, 58]);
             let payload = match upper {
-                17 => udp(rng.pick(&[546, 547, 4000]), 547),
+                6 => tcp(rng.pick(&[0, 100, 3000])),
+                17 => udp(rng.pick(&[546, 547, 4000]), rng.pick(&[546, 547])),
                 58 => {
                     let kind = rng.pick(&[128, 131, 133, 134, 135, 136, 137, 143]);
                     let target = random_src6(rng);
@@ -333,10 +349,14 @@ fn check_properties(f: &Filter, frame: &[u8]) -> Verdict {
         0x0806 => {
             assert_eq!(v, Verdict::Pass, "ARP is never spoofed: passed or denied");
             assert_eq!(frame[22..28], frame[6..12], "ARP sender MAC");
+            if frame[28..32] == [0; 4] {
+                assert!(source_ok(f, false, &v4(frame[38..42].try_into().unwrap())), "probe of another's address");
+            }
             (false, v4(frame[28..32].try_into().unwrap()))
         }
         t => panic!("ethertype {t:#x} passed"),
     };
+    assert!(!server_or_router(frame), "a router's or DHCP server's frame passed");
     match v {
         Verdict::Pass => assert!(source_ok(f, is_v6, &ip), "passed from {ip:?}"),
         Verdict::Spoofed => assert!(ip != [0; 16] && !source_ok(f, is_v6, &ip), "spoofed from {ip:?}"),
@@ -345,8 +365,86 @@ fn check_properties(f: &Filter, frame: &[u8]) -> Verdict {
     v
 }
 
-fn run(rng: &mut Rng, iters: u64) -> [u64; 3] {
-    let mut counts = [0; 3];
+/// A plain model of the guards, for headers right after the IP header:
+/// a Router Advertisement or Redirect, or a DHCP or DHCPv6 server's
+/// message.
+fn server_or_router(frame: &[u8]) -> bool {
+    let at = |i: usize| frame.get(i).copied();
+    let port = |i: usize| Some(u16::from_be_bytes([at(i)?, at(i + 1)?]));
+    match port(12) {
+        Some(0x0800) if at(20).map(|b| b & 0x1f) == Some(0) && at(21) == Some(0) => {
+            let l4 = 14 + (at(14).unwrap_or(0) & 15) as usize * 4;
+            match at(23) {
+                Some(17) => port(l4) == Some(67) || port(l4 + 2) == Some(68),
+                Some(1) => at(l4) == Some(5),
+                _ => false,
+            }
+        }
+        Some(0x86dd) => match at(20) {
+            Some(17) => port(54) == Some(547) || port(56) == Some(546),
+            Some(58) => matches!(at(54), Some(134 | 137)),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Offload metadata a guest might send with `frame`: none, a partial
+/// checksum at its L4 header or anywhere, or GSO.
+fn random_hdr(rng: &mut Rng, frame: &[u8]) -> [u8; HDR_SIZE] {
+    let mut h = [0u8; HDR_SIZE];
+    let put = |h: &mut [u8; HDR_SIZE], i: usize, v: usize| h[i..i + 2].copy_from_slice(&(v as u16).to_le_bytes());
+    match rng.below(4) {
+        0 => {}
+        1 => {
+            h[0] = F_NEEDS_CSUM;
+            put(&mut h, 6, rng.below(frame.len() as u64 + 2) as usize);
+            put(&mut h, 8, rng.below(64) as usize);
+        }
+        _ => {
+            h[0] = F_NEEDS_CSUM;
+            let l4 = match frame.get(12..14) {
+                Some([0x86, 0xdd]) => 54,
+                _ => 14 + (frame.get(14).copied().unwrap_or(0x45) & 15) as usize * 4,
+            };
+            put(&mut h, 6, l4);
+            put(&mut h, 8, rng.pick(&[6, 16]));
+            if rng.chance(50) {
+                h[1] = if frame.get(12..14) == Some(&[0x86, 0xdd]) { GSO_TCPV6 } else { GSO_TCPV4 };
+                put(&mut h, 4, rng.pick(&[48, 536, 1448]));
+            }
+        }
+    }
+    h
+}
+
+/// A frame and its metadata as netd takes them from a guest port with
+/// filter `f` (Netd::forward): the verdict, or None if `sanitize` drops
+/// it.  The ports and devices it goes on to must see what was checked.
+fn forward(f: &Filter, frame: &mut [u8], hdr: &mut [u8; HDR_SIZE]) -> Option<Verdict> {
+    if frame.len() < 14 || !offload::sanitize(hdr, frame) {
+        return None;
+    }
+    if f.on && !offload::is_gso(hdr) {
+        offload::complete_csum(frame, hdr);
+    }
+    let v = check_properties(f, frame);
+    if v == Verdict::Denied {
+        return Some(v);
+    }
+    if offload::is_gso(hdr) {
+        let mut buf = vec![0u8; 2048];
+        offload::segment(frame, hdr, &mut buf, |seg, _| assert_eq!(check(f, seg), v, "a segment"));
+    } else {
+        let (mut g, mut gh) = (frame.to_vec(), *hdr);
+        offload::complete_csum(&mut g, &mut gh);
+        assert_eq!(check(f, &g), v, "after the checksum");
+    }
+    Some(v)
+}
+
+fn run(rng: &mut Rng, iters: u64) -> [u64; 4] {
+    let mut counts = [0; 4];
     let mut filt = random_filter(rng);
     for i in 0..iters {
         if i % 64 == 0 {
@@ -358,6 +456,11 @@ fn run(rng: &mut Rng, iters: u64) -> [u64; 3] {
         }
         let v = check_properties(&filt, &frame);
         counts[v as usize] += 1;
+        let mut hdr = random_hdr(rng, &frame);
+        // The last count: GSO frames sanitize took.
+        if forward(&filt, &mut frame, &mut hdr).is_some() && offload::is_gso(&hdr) {
+            counts[3] += 1;
+        }
         // Prefixes from words: canonical ones only.
         let any = rng.next();
         let w = rng.pick(&[4, 6, 4 | 32 << 8, 4 | 24 << 8, 6 | 64 << 8, 6 | 128 << 8, 4 | 33 << 8, 6 | 129 << 8, any]);
@@ -377,8 +480,8 @@ fn main() {
     let iters = std::env::args().nth(1).and_then(|a| a.parse().ok()).unwrap_or(200_000);
     let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64 | 1;
     let mut rng = Rng(seed);
-    let [pass, spoofed, denied] = run(&mut rng, iters);
-    println!("fuzz-ipfilter: {iters} frames (seed {seed:#x}): {pass} passed, {spoofed} spoofed, {denied} denied");
+    let [pass, spoofed, denied, gso] = run(&mut rng, iters);
+    println!("fuzz-ipfilter: {iters} frames (seed {seed:#x}): {pass} passed, {spoofed} spoofed, {denied} denied, {gso} GSO");
 }
 
 #[cfg(test)]
@@ -421,6 +524,9 @@ mod tests {
         let f = filter();
         // A DHCP server's reply and a redirect, from an allowed address.
         assert_eq!(check(&f, &v4_frame([10, 0, 0, 5], 17, &udp(67, 68))), Denied);
+        // Clients take a reply to their port from any port.
+        assert_eq!(check(&f, &v4_frame([10, 0, 0, 5], 17, &udp(1234, 68))), Denied);
+        assert_eq!(check(&f, &v4_frame([10, 0, 0, 5], 17, &udp(1234, 53))), Pass);
         assert_eq!(check(&f, &v4_frame([10, 0, 0, 5], 1, &icmp(5))), Denied);
         assert_eq!(check(&f, &v4_frame([10, 0, 0, 5], 1, &icmp(0))), Pass);
         // A later fragment's bytes are payload, not a header.
@@ -451,8 +557,10 @@ mod tests {
     fn arp() {
         let f = filter();
         assert_eq!(check(&f, &eth(MAC, 0x0806, &super::arp(MAC, [10, 0, 0, 5], [10, 0, 0, 1]))), Pass);
-        // An RFC 5227 probe.
+        // An RFC 5227 probe, of its own address only: the owner of another
+        // would give it up.
         assert_eq!(check(&f, &eth(MAC, 0x0806, &super::arp(MAC, [0, 0, 0, 0], [10, 0, 0, 5]))), Pass);
+        assert_eq!(check(&f, &eth(MAC, 0x0806, &super::arp(MAC, [0, 0, 0, 0], [10, 0, 0, 1]))), Denied);
         // Another's address, or another's MAC.
         assert_eq!(check(&f, &eth(MAC, 0x0806, &super::arp(MAC, [10, 0, 0, 1], [10, 0, 0, 2]))), Denied);
         assert_eq!(check(&f, &eth(MAC, 0x0806, &super::arp(OTHER_MAC, [10, 0, 0, 5], [10, 0, 0, 1]))), Denied);
@@ -500,6 +608,8 @@ mod tests {
         // Duplicate address detection, router solicitation, MLD reports
         // (behind a hop-by-hop header).
         assert_eq!(check(&f, &v6_frame([0; 16], 58, &nd(135, v6(5), 0, MAC))), Pass);
+        // Duplicate address detection of another's address fails its DAD.
+        assert_eq!(check(&f, &v6_frame([0; 16], 58, &nd(135, v6(1), 0, MAC))), Denied);
         assert_eq!(check(&f, &v6_frame([0; 16], 58, &nd(133, [0; 16], 0, MAC))), Pass);
         let mut mld = ext(58, 8);
         mld.extend_from_slice(&icmp(143));
@@ -520,6 +630,7 @@ mod tests {
         assert_eq!(check(&f, &v6_frame(v6(5), 58, &icmp(134))), Denied);
         assert_eq!(check(&f, &v6_frame(v6(5), 58, &nd(137, v6(1), 0, MAC))), Denied);
         assert_eq!(check(&f, &v6_frame(v6(5), 17, &udp(547, 546))), Denied);
+        assert_eq!(check(&f, &v6_frame(v6(5), 17, &udp(1234, 546))), Denied);
         assert_eq!(check(&f, &v6_frame(v6(5), 17, &udp(546, 547))), Pass);
         // Behind extension headers, and in a first fragment.
         let mut hidden = ext(60, 16);
@@ -620,11 +731,51 @@ mod tests {
         assert_eq!(check(&f, &v4_frame([10, 0, 0, 5], 6, &[0; 20])), Spoofed);
     }
 
+    /// A partial checksum aimed at the IPv4 source would rewrite it after
+    /// the check (to 10.0.0.9, with the padding chosen): netd completes it
+    /// first, so the filter sees what leaves, and sanitize keeps it out of
+    /// the Ethernet header.
+    #[test]
+    fn checksum_offsets_cannot_rewrite_what_was_checked() {
+        let f = filter();
+        let mut frame = v4_frame([10, 0, 0, 5], 6, &tcp(0));
+        frame.extend_from_slice(&[0; 2]);
+        let mut hdr = [0u8; HDR_SIZE];
+        hdr[0] = F_NEEDS_CSUM;
+        hdr[6..8].copy_from_slice(&28u16.to_le_bytes());
+        // Pick the padding so that the checksum written at 28 says 00 09.
+        let at = frame.len() - 2;
+        for pad in 0..=u16::MAX {
+            frame[at..].copy_from_slice(&pad.to_be_bytes());
+            let (mut g, mut gh) = (frame.clone(), hdr);
+            offload::complete_csum(&mut g, &mut gh);
+            if g[28..30] == [0, 9] {
+                break;
+            }
+        }
+        // Completed in a later place, the frame would leave as 10.0.0.9.
+        let (mut late, mut lh) = (frame.clone(), hdr);
+        assert!(offload::sanitize(&mut lh, &late));
+        assert_eq!(check(&f, &late), Pass);
+        offload::complete_csum(&mut late, &mut lh);
+        assert_eq!(late[26..30], [10, 0, 0, 9]);
+        assert_eq!(check(&f, &late), Spoofed);
+        // As netd takes it, the rewrite comes before the check, and
+        // nothing is left to write after it.
+        let (mut first, mut h) = (frame.clone(), hdr);
+        assert_eq!(forward(&f, &mut first, &mut h), Some(Spoofed));
+        assert_eq!((first[26..30].to_vec(), h[0] & F_NEEDS_CSUM), (vec![10, 0, 0, 9], 0));
+        // Into the source MAC: refused.
+        let mut mac = hdr;
+        mac[6..8].copy_from_slice(&6u16.to_le_bytes());
+        assert_eq!(forward(&f, &mut frame.clone(), &mut mac), None);
+    }
+
     #[test]
     fn random_frames() {
         let mut rng = Rng(0x1234_5678_9abc_def1);
-        let [pass, spoofed, denied] = run(&mut rng, 100_000);
-        // Every verdict comes up.
-        assert!(pass > 1000 && spoofed > 1000 && denied > 1000, "{pass} {spoofed} {denied}");
+        let [pass, spoofed, denied, gso] = run(&mut rng, 100_000);
+        // Every verdict comes up, and GSO frames that are segmented.
+        assert!(pass > 1000 && spoofed > 1000 && denied > 1000 && gso > 100, "{pass} {spoofed} {denied} {gso}");
     }
 }

@@ -966,9 +966,13 @@ impl Ctl {
             for n in &o.nics {
                 let mac = self.call(CTL_NIC_CREATE, &[vm, n.switch, n.mac, n.flags], &[], &[])?.vals[0];
                 if !n.ips.is_empty() {
+                    // The port is known by its MAC: two of this VM's on the
+                    // switch with one MAC would be ambiguous.
                     let (ports, _) = self.switch_info(n.switch)?;
-                    let port = ports.iter().find(|p| p.vm as u64 == vm && p.mac == mac)
-                        .ok_or(Error(format!("vm {vm}: no port with mac {}", fmt_mac(mac))))?.port as u64;
+                    let port = match ports.iter().filter(|p| p.vm as u64 == vm && p.mac == mac).collect::<Vec<_>>()[..] {
+                        [p] => p.port as u64,
+                        _ => return err(format!("vm {vm}: no one port with mac {} on switch {} for ip=", fmt_mac(mac), n.switch)),
+                    };
                     for p in &n.ips {
                         self.ip_add(port, p)?;
                     }

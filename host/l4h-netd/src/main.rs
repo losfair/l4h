@@ -381,21 +381,32 @@ impl Netd {
         }
         let Some(switch) = self.switch_of(from) else { return };
         let src: [u8; 6] = frame[6..12].try_into().unwrap();
+        // A filtered port's frame from a steered address: only a rule's
+        // return path takes it.
+        let mut return_only = false;
         if let PortId::Guest(i) = from {
             let p = self.ports[i].as_mut().unwrap();
             if (p.lock && src != p.mac && p.alias != Some(src)) || !offload::sanitize(hdr, frame) {
                 p.drops += 1;
                 return;
             }
-            // A steering rule's target may send as the rule's address.
-            let allowed = match ipfilter::check(&self.filters[i], frame) {
-                ipfilter::Verdict::Pass => true,
-                ipfilter::Verdict::Spoofed => self.steer.is_return(i, frame),
-                ipfilter::Verdict::Denied => false,
-            };
-            if !allowed {
-                p.drops += 1;
-                return;
+            if self.filters[i].on {
+                // A partial checksum is written where the guest said, after
+                // the filter looked: complete it first.  A GSO frame's goes
+                // into its TCP checksum (offload::sanitize), and its
+                // segments copy the headers the filter saw.
+                if !is_gso(hdr) {
+                    complete_csum(frame, hdr);
+                }
+                // A steering rule's target may send as the rule's address.
+                match ipfilter::check(&self.filters[i], frame) {
+                    ipfilter::Verdict::Pass => {}
+                    ipfilter::Verdict::Spoofed if self.steer.is_return(i, frame) => return_only = true,
+                    _ => {
+                        p.drops += 1;
+                        return;
+                    }
+                }
             }
             p.tx_frames += 1;
         }
@@ -439,7 +450,7 @@ impl Netd {
             PortId::Guest(i) => Some(i),
             PortId::Uplink(_) | PortId::Link(_) => None,
         };
-        if let Some(t) = self.steer.inbound(sw, guest, frame) {
+        if !return_only && let Some(t) = self.steer.inbound(sw, guest, frame) {
             self.deliver(PortId::Guest(t), frame, hdr);
             return;
         }
@@ -448,6 +459,10 @@ impl Netd {
             // nothing is learned, and isolation does not apply.
             let owner = self.fdb.find(ep.switch, &ep.mac).map(|i| PortId::of_code(self.fdb.slots[i].port));
             self.switch_frame(owner, false, ep.switch as u32, frame, hdr);
+            return;
+        }
+        // is_return said outbound takes it; never switch it as it is.
+        if return_only {
             return;
         }
         let isolated = self.is_isolated(from);

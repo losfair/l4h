@@ -5,14 +5,18 @@
 //! - IPv4: the source is an allowed address, or 0.0.0.0 for a DHCP client
 //!   (UDP 68 -> 67).
 //! - ARP: Ethernet over IPv4; the sender is an allowed address, or 0.0.0.0
-//!   (an RFC 5227 probe), and its MAC the frame's source.
+//!   for an RFC 5227 probe of an allowed address, and its MAC the frame's
+//!   source.
 //! - IPv6: the source is an allowed address, or :: for duplicate address
-//!   detection, router solicitations and MLD reports.  A Neighbor
-//!   Advertisement's target is an allowed address; link-layer address
-//!   options of Neighbor Discovery are the frame's source MAC.
+//!   detection of an allowed address, router solicitations and MLD
+//!   reports.  A Neighbor Advertisement's target is an allowed address;
+//!   link-layer address options of Neighbor Discovery are the frame's
+//!   source MAC.  (A probe of another's address would make its owner give
+//!   it up.)
 //! - Guards: Router Advertisements and Redirects (ICMPv6 134, 137), ICMPv4
 //!   Redirects (5), and DHCP or DHCPv6 server and relay messages (UDP
-//!   source port 67 or 547) are dropped, whatever their source.
+//!   source port 67 or 547, or to a client's port, 68 or 546) are dropped,
+//!   whatever their source.
 //! - Everything else is dropped: other EtherTypes, VLAN tags (whose frames
 //!   would carry IP past these checks), malformed headers, and an IPv6
 //!   first fragment whose headers do not reach the upper-layer header.
@@ -157,8 +161,9 @@ fn arp(f: &Filter, src: &[u8; 6], p: &[u8]) -> Verdict {
     if p.len() < 28 || p[..6] != [0, 1, 8, 0, 6, 4] || p[8..14] != *src {
         return Verdict::Denied;
     }
-    let spa = v4(&p[14..18]);
-    if spa == [0; 16] || f.allows(false, &spa) { Verdict::Pass } else { Verdict::Denied }
+    let (spa, tpa) = (v4(&p[14..18]), v4(&p[24..28]));
+    let ok = if spa == [0; 16] { f.allows(false, &tpa) } else { f.allows(false, &spa) };
+    if ok { Verdict::Pass } else { Verdict::Denied }
 }
 
 fn ip4(f: &Filter, p: &[u8]) -> Verdict {
@@ -182,7 +187,8 @@ fn ip4(f: &Filter, p: &[u8]) -> Verdict {
         if l4.len() < need {
             return Verdict::Denied;
         }
-        if (proto == IPPROTO_UDP && be16(l4, 0) == 67) || (proto == IPPROTO_ICMP && l4[0] == 5) {
+        let dhcp_server = proto == IPPROTO_UDP && (be16(l4, 0) == 67 || be16(l4, 2) == 68);
+        if dhcp_server || (proto == IPPROTO_ICMP && l4[0] == 5) {
             return Verdict::Denied;
         }
     }
@@ -235,14 +241,14 @@ fn ip6(f: &Filter, mac: &[u8; 6], p: &[u8]) -> Verdict {
     let mut icmp = None;
     if first {
         match nh {
-            IPPROTO_UDP if l4.len() < 4 || be16(l4, 0) == 547 => return Verdict::Denied,
+            IPPROTO_UDP if l4.len() < 4 || be16(l4, 0) == 547 || be16(l4, 2) == 546 => return Verdict::Denied,
             IPPROTO_ICMPV6 => {
                 let Some(&kind) = l4.first() else { return Verdict::Denied };
                 // Router Advertisement, Redirect.
                 if kind == 134 || kind == 137 {
                     return Verdict::Denied;
                 }
-                if matches!(kind, 133 | 135 | 136) && !nd_ok(f, mac, kind, l4) {
+                if matches!(kind, 133 | 135 | 136) && !nd_ok(f, mac, kind, src == [0; 16], l4) {
                     return Verdict::Denied;
                 }
                 icmp = Some(kind);
@@ -260,8 +266,9 @@ fn ip6(f: &Filter, mac: &[u8; 6], p: &[u8]) -> Verdict {
 
 /// A Router Solicitation, Neighbor Solicitation or Advertisement (`kind`)
 /// whose link-layer address options name `mac`, and an Advertisement's
-/// target one of the port's addresses.
-fn nd_ok(f: &Filter, mac: &[u8; 6], kind: u8, l4: &[u8]) -> bool {
+/// target, or a duplicate address detection's (from `dad`, the
+/// unspecified address), one of the port's addresses.
+fn nd_ok(f: &Filter, mac: &[u8; 6], kind: u8, dad: bool, l4: &[u8]) -> bool {
     let opts = match kind {
         133 => 8,
         _ => 24,
@@ -269,7 +276,7 @@ fn nd_ok(f: &Filter, mac: &[u8; 6], kind: u8, l4: &[u8]) -> bool {
     if l4.len() < opts {
         return false;
     }
-    if kind == 136 && !f.allows(true, l4[8..24].try_into().unwrap()) {
+    if (kind == 136 || (kind == 135 && dad)) && !f.allows(true, l4[8..24].try_into().unwrap()) {
         return false;
     }
     let mut o = &l4[opts..];

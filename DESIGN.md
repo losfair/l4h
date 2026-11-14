@@ -2303,7 +2303,8 @@ firewalling belong in a VM.
   A counter wrap therefore preserves unread entries in the 24-slot rings.
 - **Offloads.** Checksum and TSO metadata pass through in the virtio-net
   header. netd validates flags, checksum offsets and GSO type, including
-  that a GSO frame is TCP over IPv4/IPv6, and drops incoherent headers. A
+  that a GSO frame is TCP over IPv4/IPv6 and that no checksum starts in
+  the Ethernet header, and drops incoherent headers. A
   frame for a port that cannot take its offload is segmented and checksummed
   in software.
   A guest port takes a GSO frame whole only if its driver accepted
@@ -2434,17 +2435,29 @@ are not filtered.
   runs, for example for a DHCP lease. Link-local IPv6 is not implied:
   allowing all of `fe80::/10` would let a guest take another's.
 - **What passes.** IPv4 from an allowed source, or from 0.0.0.0 as a DHCP
-  client (UDP 68 → 67). ARP (Ethernet over IPv4) whose sender is allowed or
-  0.0.0.0 (an RFC 5227 probe) and whose sender MAC is the frame's source.
-  IPv6 from an allowed source, or from `::` for router and neighbour
-  solicitations and MLD reports, unfragmented.
+  client (UDP 68 → 67). ARP (Ethernet over IPv4) whose sender is allowed,
+  or 0.0.0.0 for an RFC 5227 probe of an allowed address, and whose sender
+  MAC is the frame's source. IPv6 from an allowed source, or from `::` for
+  duplicate address detection of an allowed address, router solicitations
+  and MLD reports, unfragmented. A probe of another's address would make
+  its owner give it up.
 - **Neighbor Discovery.** IPv6's ARP: a Neighbor Advertisement's target
   must be allowed, and the link-layer address options of solicitations and
-  advertisements must be the frame's source MAC.
+  advertisements must be the frame's source MAC. ARP and ND claims follow
+  the prefixes: a guest given a /24 may answer for any address in it, the
+  gateway's included.
 - **Guards.** Router Advertisements and Redirects (ICMPv6 134, 137), ICMP
   Redirects (5), and DHCP and DHCPv6 server or relay messages (UDP source
-  port 67, 547) are dropped from any source. A router or DHCP server VM
+  port 67 or 547, or to a client's port, 68 or 546, which clients take
+  from any port) are dropped from any source. A router or DHCP server VM
   needs an unfiltered port.
+- **Offload metadata.** A partial checksum is written at offsets the guest
+  chose, after netd looked at the frame, and its value is the guest's to
+  pick (with padding the receiver trims). For a filtered port netd
+  completes it before the filter, so the filter sees what leaves; a GSO
+  frame's checksum is pinned to its TCP header (`offload::sanitize`), and
+  its segments copy the checked headers. For every port, a checksum may
+  not start inside the Ethernet header, whose MACs the MAC lock checked.
 - **Everything else is dropped.** Other EtherTypes, VLAN-tagged frames
   (the tag would carry IP past the checks), malformed headers, more than
   eight IPv6 extension headers, and an IPv6 first fragment whose headers
@@ -2453,11 +2466,16 @@ are not filtered.
   is still checked.
 - **Steering.** A steering rule's target may send as the rule's address
   (what `Steer::outbound` would take), without the address in its list.
-  The guards apply to it too.
+  Such a frame takes only the rule's return path, never another
+  endpoint's inbound one. The guards apply to it too.
+- **Not covered.** Only the outer header is checked: a tunnel (IP in IP,
+  GRE, ESP) carries any inner source, which a receiver that decapsulates
+  it trusts as much as it trusts the tunnel.
 - **Cost.** An unfiltered port pays a flag test; a filtered one parses the
   headers and compares against at most 16 prefixes. Drops count in the
   port's `drops`. `tests/fuzz-ipfilter` checks each rule, and that no
-  mutated frame passes with another source.
+  mutated frame passes with another source or as a router's or server's,
+  however its offload metadata is completed later.
 
 **gVNIC.** `l4h-nicd-gvnic/src/gvnic.rs` follows Linux `gve` with the DQO queue
 format and raw DMA addressing (DQO RDA), which C3 and later offer; a device

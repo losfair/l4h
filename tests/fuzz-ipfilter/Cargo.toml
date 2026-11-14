@@ -6,6 +6,7 @@ version = "0.1.0"
 description = "Unit and randomised tests of netd's L3 source filter"
 
 [dependencies]
+l4h-netcore = { path = "../../host/l4h-netcore" }
 
 [profile.release]
 debug-assertions = true
