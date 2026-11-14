@@ -1,0 +1,47 @@
+#!/bin/sh
+# dom0 init for tests/run-nicfwtest.sh: firmware dom0 loads for a NIC
+# driver (CTL_FIRMWARE_LOAD).  In test builds the e1000e driver names
+# l4h-test/e1000e.fw.  With an IOMMU, dom0 is told it is wanted, loads
+# it, and the driver restarts with it; a second load and a path-like name
+# are refused.  Without one, nothing is wanted and a load is refused.
+slow=${L4H_TEST_SLOW:-1}
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mount -t tmpfs tmp /tmp
+fail() { echo "NICFWTEST: FAIL: $*"; l4hctl nic list; l4hctl firmware list; poweroff -f; }
+echo "NICFWTEST: start"
+n=0
+until l4hctl nic list | grep -q "^nic 0: .* driver e1000e, up, "; do
+    n=$((n + 1)); [ "$n" -lt $((30 * slow)) ] || fail "nic 0 not up with e1000e"; sleep 1
+done
+name=l4h-test/e1000e.fw
+# 4096 bytes of 0x5a: byte sum 368640.
+head -c 4096 /dev/zero | tr '\0' 'Z' > /tmp/fw
+wanted=$(l4hctl firmware wanted) || fail "firmware wanted"
+if l4hctl iommu | grep "^state: *on" >/dev/null; then
+    [ "$wanted" = "$name" ] || fail "wanted: '$wanted', not $name"
+    l4hctl firmware load "$name" /tmp/fw > /dev/null || fail "load"
+    out=$(l4hctl firmware load "$name" /tmp/fw 2>&1) && fail "a second load of $name"
+    echo "$out" | grep -q "exists" || fail "second load: $out"
+    out=$(l4hctl firmware load ../e1000e.fw /tmp/fw 2>&1) && fail "a path-like name"
+    l4hctl firmware list | grep -q "^firmware 0: $name, 4096 bytes, sha256 " || fail "not listed"
+    [ -z "$(l4hctl firmware wanted)" ] || fail "still wanted after the load"
+    n=0
+    until l4hctl nic list | grep -q "^nic 0: .*, up, .*last: dom0 loaded its firmware"; do
+        n=$((n + 1)); [ "$n" -lt $((30 * slow)) ] || fail "nic 0 not restarted with its firmware"; sleep 1
+    done
+    echo "NICFWTEST: loaded and restarted"
+else
+    [ -z "$wanted" ] || fail "wanted '$wanted' on a host that refuses loads"
+    out=$(l4hctl firmware load "$name" /tmp/fw 2>&1) && fail "load without an IOMMU"
+    echo "$out" | grep -q "operation not permitted" || fail "load: $out"
+    echo "NICFWTEST: refused without an IOMMU"
+fi
+ip link set lo up
+ip link set eth0 up
+udhcpc -i eth0 -n -q -t 5 -s /bin/udhcpc.script >/dev/null 2>&1 || fail "dhcp"
+ping -c 3 -W 2 10.0.2.2 >/dev/null || fail "ping"
+l4hctl nic list | sed 's/^/NICFWTEST: /'
+echo "NICFWTEST: PASS"
+poweroff -f

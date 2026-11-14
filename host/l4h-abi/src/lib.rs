@@ -357,6 +357,19 @@ pub const CTL_DRIVER_INFO: u32 = 48;
 pub const CTL_DRIVER_LOAD: u32 = 49;
 /// Test builds: make NIC args[0]'s driver panic (args[1] = 1) or hang (2).
 pub const CTL_NIC_TEST: u32 = 50;
+/// Firmware blob args[0] root has (all of them dom0's): vals[0] = its
+/// length, data = its name (48 bytes, NUL padded) then SHA-256 (32).
+pub const CTL_FIRMWARE_INFO: u32 = 51;
+/// The args[0]th firmware name a bound NIC's driver asks for and root has
+/// no blob of: data = the name (48 bytes, NUL padded).  ENOENT past them,
+/// and for all where CTL_FIRMWARE_LOAD would be refused.
+pub const CTL_FIRMWARE_WANTED: u32 = 52;
+/// Load a firmware blob: args[1] bytes at args[0] of the caller's control
+/// data area, its name (48 bytes, NUL padded) then its bytes.  vals[0]:
+/// its index.  Refused unless drivers are confined; root restarts the
+/// confined drivers that name it.
+pub const CTL_FIRMWARE_LOAD: u32 = 53;
+pub const FIRMWARE_NAME: usize = 48;
 /// CTL_NIC_INFO: vals[0] BDF, [1] switch (u64::MAX: none), [2] MAC, [3]
 /// state | trust << 8 | driver << 16 (0xff: none) | restarts << 32 |
 /// isolation group size << 48, [4] vendor | device << 16, [5] the

@@ -20,7 +20,7 @@ strip() {
     done
 }
 # The NIC drivers, built into root as on x86_64 (tools/build-host.sh).
-nicds=(virtio gvnic ena ixgbe e1000e mlx5)
+nicds=(virtio gvnic ena ixgbe e1000e mlx5 r8125)
 nicd_pkgs=()
 for d in "${nicds[@]}"; do nicd_pkgs+=(-p "l4h-nicd-$d"); done
 cargo build -q "${l4h_cargo_profile[@]}" --target aarch64-sel4 -p l4h-vmm -p l4h-blkd -p l4h-netd -p l4h-trustd -p l4h-memd -p l4h-logd -p l4h-usbd \

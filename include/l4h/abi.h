@@ -667,6 +667,13 @@ enum l4h_ctl_op {
 	 * every function root enumerated (this partition's, on multikernel).
 	 * No configuration-space accesses or BAR probing at query time. */
 	L4H_CTL_PCI_LIST = 42,
+	/* NIC drivers (DESIGN.md §9.8; l4h-abi's CTL_NIC_* and CTL_DRIVER_*
+	 * have the rest).  The ops below take bytes in the control data area,
+	 * which the l4hctl driver copies there: NIC_CTL args: nic, offset (0),
+	 * length; DRIVER_LOAD and FIRMWARE_LOAD args: offset (0), length. */
+	L4H_CTL_NIC_CTL = 46,
+	L4H_CTL_DRIVER_LOAD = 49,
+	L4H_CTL_FIRMWARE_LOAD = 53,
 };
 
 #define L4H_PCI_OWNER_NONE     0 /* no host service assigned */

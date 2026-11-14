@@ -2277,7 +2277,7 @@ firewalling belong in a VM.
   `l4h-netd` → destination port, or an uplink channel → the NIC's driver
   (a nicd, §9.8). netd runs all switches and has no device code; each NIC
   is driven by its own nicd: modern and legacy virtio-net, gVNIC, Amazon
-  ENA, Intel X550 and ConnectX-5.
+  ENA, Intel X550, ConnectX-5 and Realtek RTL8125.
 - **vNICs.** Each vNIC is on one switch and appears as a separate `ethN`.
   There are 48 guest ports in all. Guest vNICs have one RX/TX queue pair.
   A VMM processes at most 32 chains per RX or TX batch, counting malformed
@@ -2518,6 +2518,79 @@ a host peer (`tests/nic-peer.py`), before and after a restart (QEMU's device
 has no FLR); with `L4H_QEMU_IOMMU=intel|amd` it is the QEMU test of a
 confined driver (virtio drivers never are), and must cause no IOMMU fault.
 
+**Realtek RTL8125.** `l4h-nicd-r8125/src/r8125.rs` follows Linux `r8169`
+for the RTL8125A, the RTL8125B and RTL8125BG, the RTL8125D and the
+RTL8125BP (`RTL_GIGA_MAC_VER_61`, `63`, `64` and `66`; 10ec:8125, and
+10ec:3000, the Killer E3000). The chip's XID tells them apart. The chips
+differ only in bring-up register values, which the driver takes from
+Linux per chip:
+- RX configuration: no pause slot on the A.
+- FIFO drain: the A has no stop request.
+- Interrupt coalescing: the range cleared differs.
+- EPHY table: the A and B each have their own, the D and BP have none.
+- MAC values: a few at 0xe614, 0xe63e and 0xeb62.
+- PHY setup: the A's is long, with its firmware midway; the B's is
+  medium; the D's and BP's are short.
+- Firmware: `rtl8125a-3`, `rtl8125b-2`, `rtl8125d-1` or `-2`,
+  `rtl8125bp-2`.
+
+The BP's MAC start is the D's. The BP also has DASH, Realtek's
+out-of-band management, and the driver sends DASH's firmware Linux's
+driver-start and driver-stop commands through the chip's extended
+registers. Linux's other DASH handling is for suspend and Wake-on-LAN,
+which a nicd does not do.
+
+Two of Linux's choices for the A carry over: no TSO (reported TX
+timeouts) and no EEE at 2.5G. The UDP padding quirk applies to the A and
+B only. Registers are in BAR 2, the MSI-X table in BAR 4.
+Bring-up is Linux's probe and open: the MAC's init and reset, the PHY's
+parameters, a PHY reset, the MAC start sequence, then autonegotiation
+advertising 10 Mb/s to 2.5 Gb/s with pause; EEE stays at the PHY's default.
+The PHY is reached through the chip's GPHY OCP window. Where Linux
+does, the driver runs the chip's PHY firmware patch from linux-firmware
+(`rtl_nic/rtl8125*.fw`) when it is given it. l4h ships no firmware:
+dom0 loads it from the host's own `/lib/firmware` (Firmware below), on
+hosts that confine NIC drivers. It checks the program's jumps first and
+bounds its steps. Without the
+patch it goes on, as Linux does. The chip's ASPM and clock requests stay
+off. The driver turns the link's L1 off through Link Control, which
+Linux also does unless the system vendor marked ASPM safe.
+
+One RX ring of 512 2 KiB buffers. A frame spanning buffers is dropped, as
+Linux drops it. One TX ring of 256 descriptors, a frame each, with frames
+copied into a 1 MiB circular area that completions free in order. Every
+cause shares MSI-X entry 0. RX and TX causes are masked separately, and
+their status bits are acknowledged, and the write read back, before
+they are unmasked and the ring is looked at again. The chip's
+interrupt coalescing is off, as in Linux. Root's tick (`F_TIMER`) reads
+the link (BMSR, down until autonegotiation completes, and PHYSR for the
+speed). A chip that reads all ones
+panics the driver, so root restarts it. Receive: the chip's TCP/UDP checksum
+verdict becomes `DATA_VALID`. Transmit: TSO (not on the A) over untagged IPv4 and IPv6
+(MSS 1000–2047 and TCP at most 127 bytes in, so 64 segments at most, as
+Linux's limits); for IPv6 the payload length and the checksum's length
+are cleared, as `tcp_v6_gso_csum_prep`. Linux 6.18 offloads no other
+checksum on this chip, since `rtl8169_features_check` declines every
+frame `rtl_quirk_packet_padto` pads. So the driver completes `NEEDS_CSUM`
+frames itself, pads as Linux pads (to 60 bytes, more for short PTP UDP
+packets), and segments tagged and ECN GSO frames itself (Linux gives the
+chip no `TSO_ECN`). It offers plain frames up to 1518 bytes (no jumbo
+frames); the offer's GSO bound is separate (`Offer::checked` caps it at
+a slot, not at the plain-frame bound).
+There is no TX watchdog yet (Linux resets the chip on a TX timeout).
+
+Not yet run on hardware. `tests/r8125-vfio` compiles the driver unchanged
+into a Linux program for a real port bound to vfio-pci (ARP, ICMP, DNS,
+the device's RX checksums, checksums the driver completes, 4 KB and 60 KB
+TSO, RX and TX interrupts; `--firmware FILE` adds the PHY patch). Its
+`cargo test` runs the driver against a register-level model of the chip.
+The model answers the PHY window and clears reset, and moves both rings.
+It checks bring-up for each chip, with its own register values and
+firmware slot, and the firmware interpreter, RX across ring wraps with
+checksum verdicts and dropped frames, and TX across ring and area wraps
+with padding, completed checksums, TSO descriptors and segmentation. It
+also checks the bound on plain frames and the ring and area limits.
+
 **Tests.** `tests/fuzz-virtq` checks that GRO output segments back into
 exactly the frames that went in, and that corrupted or other-flow segments
 do not merge. `tests/run-nettest.sh` covers DHCP and ping over the QEMU
@@ -2590,7 +2663,7 @@ root restarts. Root and netd know no device kind. The design is issue
 - **Manifests and the bundle.** A manifest says which PCI IDs a driver
   takes and what it needs: memory BARs required and optional, write-
   combining BARs, a window per BAR, MSI-X entries, DMA region size, channel
-  size, firmware blob names, configuration-space write windows, image
+  size, firmware blob names (8 at most), configuration-space write windows, image
   size. Drivers ship in a bundle (`tools/mkdrivers.py`): the boot module
   `l4h-drivers`, or the copy built into root. Root reads each manifest
   with bounds checks, checks the device against it (BARs present and
@@ -2645,16 +2718,38 @@ root restarts. Root and netd know no device kind. The design is issue
   no reset stopped reaches only it) and the uplink's switch stay; a later instance must offer the
   same MAC, which root checks (unicast, unique) before dom0's uplink port
   takes it.
-- **Control API.** `l4hctl nic list|bind|unbind|restart|ctl` and `l4hctl
-  driver list|load`. A driver dom0 loads (CTL_DRIVER_LOAD) is copied into
-  root's memory and checked as the bundle's; it is refused unless drivers
-  are confined.
+- **Control API.** `l4hctl nic list|bind|unbind|restart|ctl`, `l4hctl
+  driver list|load` and `l4hctl firmware list|wanted|load`. A driver dom0
+  loads (CTL_DRIVER_LOAD) is copied into root's memory and checked as the
+  bundle's; it is refused unless drivers are confined. The l4hctl kernel
+  driver copies those requests' bytes (and `nic ctl`'s) into the control
+  data area.
+- **Firmware.** l4h's image carries no firmware: blobs such as Realtek's
+  PHY patches are not ours to redistribute. dom0's initrd loads what the
+  bound NICs' drivers name (CTL_FIRMWARE_WANTED) from the host's
+  `/usr/lib/firmware` or `/lib/firmware`, plain, `.xz` (BusyBox) or `.zst`
+  (the host's `zstd`), before it switches to the host's root
+  (`tools/install/init`). Root copies each blob into its memory, logs its
+  SHA-256 and refuses names it has (CTL_FIRMWARE_LOAD). As with dom0's
+  drivers, root refuses the load unless the host confines NIC drivers
+  (and then lists none as wanted). It gives a loaded blob only to confined
+  drivers: the blob is not in the measured boot image, and a PHY program
+  writes the NIC's microcontroller. A confined driver that names the blob
+  and runs without it is restarted to take it, like dom0's `nic restart`
+  (not counted, no backoff), which drops the link once during boot. A
+  driver must run without its firmware, as Linux's do when
+  linux-firmware is missing. The driver bundle holds drivers only.
 - **Tests.** `tests/run-nictest.sh` runs two NICs and makes NIC 1's driver
   panic and hang: dom0's uplink on NIC 0 keeps working while root restarts
   it, and NIC 1 is unbound, bound again and NIC 0's driver restarted.
+  `tests/run-nicfwtest.sh`'s test build has the e1000e driver name a
+  firmware. With an IOMMU, dom0 is told it is wanted and loads it; a
+  second load and a path-like name are refused, and the restarted driver
+  reports exactly the bytes loaded. Without an IOMMU nothing is wanted,
+  the load is refused, and the driver runs without it.
 - **Not yet.** Zero-copy TX (the channel's TX area in the device's IOMMU
-  domain), multiqueue, measuring dom0-loaded drivers into the attestation
-  event log, and isolation groups and confinement on aarch64 (which has no
+  domain), multiqueue, measuring dom0-loaded drivers and firmware into
+  the attestation event log, and isolation groups and confinement on aarch64 (which has no
   IOMMU support).
 
 ### 9.4 Console and other devices
@@ -4749,8 +4844,8 @@ curl -fsSL https://raw.githubusercontent.com/losfair/l4h/main/tools/install.sh |
 - **Supported layouts.** Headless systemd installations need a plain
   ext4/XFS root on NVMe namespace 1, a supported virtio disk, or supported
   AHCI SATA. dom0 sees its partition windows (§10.1).
-  There can be one or two physical virtio-net, gVNIC, ENA, 82599/X550 or
-  ConnectX-5 NICs. Each NIC becomes the uplink of its own switch
+  There can be one or two physical virtio-net, gVNIC, ENA, 82599/X550,
+  ConnectX-5 or Realtek RTL8125 NICs. Each NIC becomes the uplink of its own switch
   (switch 0, then 1, in PCI address order), and dom0 gets one interface on
   each with the original name and MAC, so existing address, route and DNS
   settings apply. Software interfaces (WireGuard, PPP, GRE, TUN/TAP and the

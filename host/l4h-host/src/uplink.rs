@@ -98,7 +98,8 @@ pub struct Offer {
     pub tx_mss_min: u32,
     pub tx_mss_max: u32,
     pub tx_hdr_max: u32,
-    /// Frame lengths it sends (ConnectX-5: 14..=1518).
+    /// Lengths of the frames it sends that are not GSO frames
+    /// (ConnectX-5: 14..=1518); tx_gso_max bounds those.
     pub tx_frame_min: u32,
     pub tx_frame_max: u32,
     /// It may deliver GSO frames (after GRO or device LRO).
@@ -144,9 +145,9 @@ impl Offer {
         self.tx_frame_max = self.tx_frame_max.min(max);
         self.tx_csum = (self.tx_csum != 0) as u32;
         self.rx_gso = (self.rx_gso != 0) as u32;
-        // GSO only with checksum offload, TCP only, within the frame bound.
+        // GSO only with checksum offload, TCP only, within a slot.
         self.tx_gso_mask &= (1 << 1) | (1 << 4);
-        self.tx_gso_max = self.tx_gso_max.min(self.tx_frame_max);
+        self.tx_gso_max = self.tx_gso_max.min(max);
         if self.tx_csum == 0 || self.tx_mss_min == 0 || self.tx_mss_min > self.tx_mss_max || self.tx_gso_max <= 1514 {
             self.tx_gso_mask = 0;
         }
@@ -696,6 +697,10 @@ mod tests {
         o.tx_hdr_max = 128;
         let c = o.checked().unwrap();
         assert_eq!((c.tx_gso_mask, c.tx_csum, c.tx_gso_max), (0x12, 1, MAX_FRAME as u32));
+        // The plain-frame bound does not bound GSO frames.
+        o.tx_frame_max = 1518;
+        o.tx_gso_max = 64000;
+        assert_eq!(o.checked().unwrap().tx_gso_max, 64000);
         let mut hdr = [0u8; HDR_SIZE];
         hdr[1] = 1;
         hdr[2..4].copy_from_slice(&54u16.to_le_bytes());

@@ -29,7 +29,8 @@
 struct l4hctl_call {
 	__u64 req;      /* struct l4h_ctl_req * */
 	__u64 resp;     /* struct l4h_ctl_resp * */
-	__u64 buf;      /* VM_LOAD / BLK_WRITE / BLK_ATTACH_EXTENTS: source bytes */
+	__u64 buf;      /* VM_LOAD / BLK_WRITE / BLK_ATTACH_EXTENTS / NIC_CTL /
+			 * DRIVER_LOAD / FIRMWARE_LOAD: source bytes */
 	__u64 len;
 };
 
@@ -130,6 +131,20 @@ static long l4hctl_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 			goto out;
 		}
 		req->args[3] = 0;
+	} else if (req->op == L4H_CTL_NIC_CTL || req->op == L4H_CTL_DRIVER_LOAD ||
+		   req->op == L4H_CTL_FIRMWARE_LOAD) {
+		/* The bytes at offset 0 of the data area: args[o] is the
+		 * offset, args[o + 1] the length. */
+		int o = req->op == L4H_CTL_NIC_CTL;
+
+		if (call.len > stage_size || req->args[o] != 0 || req->args[o + 1] != call.len) {
+			ret = -EINVAL;
+			goto out;
+		}
+		if (copy_from_user(stage, u64_to_user_ptr(call.buf), call.len)) {
+			ret = -EFAULT;
+			goto out;
+		}
 	}
 	ret = ctl_call();
 	if (ret)
