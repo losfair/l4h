@@ -3,12 +3,15 @@
  * A minimal seL4 root task for tests/run-vtxtest.sh: try to create the
  * objects that need VT-x (patch 0038) and report each result on the
  * kernel's debug console.  With VT-x it also binds the VCPU to a TCB,
- * which loads its VMCS.  Built freestanding against build/sel4's libsel4.
+ * which loads its VMCS. Built freestanding against the selected libsel4.
  */
 #include <sel4/sel4.h>
 #include <sel4/arch/vmenter.h>
 
 __thread seL4_IPCBuffer *__sel4_ipc_buffer;
+#ifdef CONFIG_KERNEL_INVOCATION_REPORT_ERROR_IPC
+__thread char __sel4_print_error;
+#endif
 static char tls[4096] __attribute__((aligned(64)));
 static char tls2[4096] __attribute__((aligned(64)));
 char vtxprobe_stack[16384] __attribute__((aligned(16)));
