@@ -5495,7 +5495,7 @@ tools/build-fl4.sh
 SEL4_PREFIX="$PWD/build/sel4-fl4" L4H_KERNEL_VARIANT=fl4 tests/run-selftest.sh 4
 ```
 
-The tested FL4 revision is `4b42efae3aa615fbe4377526434aa8b1feaf04d9`.
+The tested FL4 revision is `46b3cb61e7a8b337ef2f0ab688f0b9d785408320`.
 `prepare-fl4.sh` clones the pinned public revision, or the frozen override,
 into `build/FL4-src` without applying any kernel patches. The source
 worktree is not edited.
@@ -5554,8 +5554,9 @@ fixes for [INT gates](https://github.com/losfair/FL4/issues/1),
 [speculative refill nontermination](https://github.com/losfair/FL4/issues/5),
 [a reschedule IPI left in service](https://github.com/losfair/FL4/issues/6),
 [SetTLSBase syscall trapping](https://github.com/losfair/FL4/issues/7),
-[UEFI ACPI discovery](https://github.com/losfair/FL4/issues/8), and
-[VT-x/AMD-V support](https://github.com/losfair/FL4/pull/9).
+[UEFI ACPI discovery](https://github.com/losfair/FL4/issues/8),
+[VT-x/AMD-V support](https://github.com/losfair/FL4/pull/9), and
+[VMCS reuse and EPT retention across guest entries](https://github.com/losfair/FL4/pull/10).
 The l4h integration applies no FL4 fixes.
 
 For AArch64, build the kernel and loader once, then select the guest ISA
