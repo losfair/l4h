@@ -104,6 +104,8 @@ jobs:
         run: tests/run-schedtest.sh
       - name: Build Linux
         run: tools/build-linux.sh vmlinux && ccache -s
+      - name: Signed modules load under lockdown; unsigned modules are rejected
+        run: tests/run-signingtest.sh
       - name: Console rings, hotplug scheduling and hypercalls under console load
         run: tests/run-devicetest.sh --qemu
       - name: Retained host logs and serial output in release mode
