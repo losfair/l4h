@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""Exercise deterministic packaging and public module signing input replay."""
+"""Exercise deterministic archives, initramfs and Rust builds."""
 import gzip
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -13,9 +12,6 @@ import tomllib
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-spec = importlib.util.spec_from_file_location("module_signing", ROOT / "tools/module-signing.py")
-signing = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(signing)
 
 
 class ReproducibleTest(unittest.TestCase):
@@ -101,76 +97,6 @@ class ReproducibleTest(unittest.TestCase):
         subprocess.run(["rustc", "+stable", str(source), "-C", f"linker={ROOT / 'tools/linux-cc.sh'}",
                         "-o", str(binary)], check=True, env=env, capture_output=True)
         subprocess.run([str(binary)], check=True)
-
-    @unittest.skipUnless(shutil.which("openssl"), "needs OpenSSL")
-    def test_replay_prepares_only_a_public_certificate(self):
-        original, replay = self.work / "original", self.work / "replay"
-        saved = os.environ.pop("L4H_BUILD_INPUTS", None)
-        if saved is not None:
-            self.addCleanup(os.environ.__setitem__, "L4H_BUILD_INPUTS", saved)
-        self.addCleanup(lambda: os.environ.pop("L4H_BUILD_INPUTS", None))
-        signing.prepare(original)
-        public = signing.certificate(original).read_bytes()
-        self.assertNotIn(b"PRIVATE KEY", public)
-        self.assertIn(b"CERTIFICATE", public)
-        bundle = self.work / "inputs"
-        bundle.mkdir()
-        (bundle / "module-signing.pem").write_bytes(public)
-        os.environ["L4H_BUILD_INPUTS"] = str(bundle)
-        signing.prepare(replay)
-        self.assertEqual(signing.certificate(replay).read_bytes(), public)
-        self.assertFalse((replay / "certs/l4h-signing-private.pem").exists())
-
-    def test_replay_rejects_changed_or_missing_modules_before_signing(self):
-        bundle, tree = self.work / "inputs", self.work / "modules"
-        bundle.mkdir()
-        tree.mkdir()
-        (bundle / "modules.json").write_text(json.dumps({"module.ko": "wrong hash"}))
-        saved = os.environ.get("L4H_BUILD_INPUTS")
-        os.environ["L4H_BUILD_INPUTS"] = str(bundle)
-        if saved is not None:
-            self.addCleanup(os.environ.__setitem__, "L4H_BUILD_INPUTS", saved)
-        self.addCleanup(lambda: os.environ.pop("L4H_BUILD_INPUTS", None))
-        for present in (False, True):
-            if present:
-                (tree / "module.ko").write_bytes(b"changed module")
-            with self.assertRaisesRegex(SystemExit, "do not match.*module.ko"):
-                signing.install(self.work / "no-build", tree, self.work / "output")
-
-    @unittest.skipUnless((ROOT / "build/linux-l4h/scripts/sign-file").exists(), "needs a built Linux sign-file")
-    def test_signed_module_replay_and_tampered_signature(self):
-        saved = os.environ.pop("L4H_BUILD_INPUTS", None)
-        if saved is not None:
-            self.addCleanup(os.environ.__setitem__, "L4H_BUILD_INPUTS", saved)
-        self.addCleanup(lambda: os.environ.pop("L4H_BUILD_INPUTS", None))
-        original = self.work / "original"
-        signing.prepare(original)
-        (original / "scripts").mkdir()
-        shutil.copy2(ROOT / "build/linux-l4h/scripts/sign-file", original / "scripts/sign-file")
-        tree = self.work / "modules"
-        tree.mkdir()
-        module = tree / "module.ko"
-        unsigned = b"module bytes to authenticate\n"
-        module.write_bytes(unsigned)
-        bundle = self.work / "inputs"
-        signing.install(original, tree, bundle)
-        signed = module.read_bytes()
-        self.assertTrue(signed.endswith(b"~Module signature appended~\n"))
-        self.assertFalse(any(b"PRIVATE KEY" in p.read_bytes() for p in bundle.rglob("*") if p.is_file()))
-        os.environ["L4H_BUILD_INPUTS"] = str(bundle)
-        replay = self.work / "replay"
-        signing.prepare(replay)
-        shutil.copytree(original / "scripts", replay / "scripts")
-        module.write_bytes(unsigned)
-        signing.install(replay, tree, self.work / "replayed-inputs")
-        self.assertEqual(module.read_bytes(), signed)
-        signature = bundle / "signatures/module.ko.p7s"
-        signature.write_bytes(b"corrupted signature")
-        module.write_bytes(unsigned)
-        with self.assertRaises(subprocess.CalledProcessError):
-            signing.install(replay, tree, self.work / "bad-replay")
-        self.assertEqual(module.read_bytes(), unsigned)
-
 
 if __name__ == "__main__":
     unittest.main()

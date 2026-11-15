@@ -1,0 +1,27 @@
+#!/bin/sh
+fail() { echo "BUILTINTEST: FAIL $*"; poweroff -f; exit 1; }
+mount -t proc proc /proc || fail proc
+mount -t sysfs sys /sys || fail sysfs
+mount -t devtmpfs dev /dev || fail devtmpfs
+mount -t securityfs securityfs /sys/kernel/security || fail securityfs
+[ ! -e /dev/l4hkmod ] || fail 'module image present'
+for driver in drm virtio_gpu vkms; do
+    [ -d "/sys/module/$driver" ] || fail "$driver not built in"
+done
+[ "$(cat /sys/module/vkms/parameters/enable)" = N ] || fail 'VKMS enabled by default'
+for algorithm in bic westwood htcp bbr; do
+    grep -qw "$algorithm" /proc/sys/net/ipv4/tcp_available_congestion_control || fail "$algorithm unavailable"
+done
+case "$(cat /sys/kernel/security/lockdown)" in
+    *'[integrity]'*)
+        if insmod /bin/l4h_modtest.ko; then fail 'module accepted under lockdown'; fi
+        echo 'BUILTINTEST: PASS integrity'
+        ;;
+    *'[none]'*)
+        insmod /bin/l4h_modtest.ko || fail 'external module load'
+        rmmod l4h_modtest || fail 'external module unload'
+        echo 'BUILTINTEST: PASS normal'
+        ;;
+    *) fail 'unexpected lockdown state' ;;
+esac
+poweroff -f

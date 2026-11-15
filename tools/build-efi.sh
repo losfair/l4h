@@ -51,7 +51,6 @@ L4H_KERNEL_VARIANT= L4H_VTX=ON "$root/tools/build-kernel.sh" >"$out/kernel.log" 
 export SEL4_PREFIX=$root/build/sel4
 "$root/tools/build-host.sh"
 "$root/tools/build-kmods.sh" >/dev/null
-l4h_tar -C "$root/build" -cJf "$out/l4h-build-inputs-x86_64.tar.xz" build-inputs-x86_64
 debug=$(mktemp -d)
 trap 'rm -rf "$debug"' EXIT
 mkdir "$debug/l4h-debug-x86_64"

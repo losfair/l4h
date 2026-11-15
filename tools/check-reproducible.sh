@@ -21,13 +21,11 @@ for sub in kernel/seL4 third_party/rust-sel4 third_party/sddf third_party/kemu; 
     git -c protocol.file.allow=always -C "$rebuild" submodule update --init --reference "$root/$sub" -- "$sub"
 done
 ln -s "$root/.venv" "$rebuild/.venv"
-mkdir -p "$rebuild/build/replay" "$rebuild/build/tmp"
+mkdir -p "$rebuild/build/tmp"
 tarball=$root/build/dl/linux-$LINUX_VERSION.tar.xz
 echo "$LINUX_SHA256  $tarball" | sha256sum -c --quiet
 tar -C "$rebuild/build" -xJf "$tarball"
 mv "$rebuild/build/linux-$LINUX_VERSION" "$rebuild/build/linux-6.18"
-tar -C "$rebuild/build/replay" -xJf "$reference/l4h-build-inputs-x86_64.tar.xz"
-export L4H_BUILD_INPUTS=$rebuild/build/replay/build-inputs-x86_64
 export TMPDIR=$rebuild/build/tmp
 umask 077
 "$rebuild/tools/build-release.sh" >"$work/rebuild.log" 2>&1 || {

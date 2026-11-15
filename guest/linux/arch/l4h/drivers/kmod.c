@@ -6,8 +6,8 @@
  *
  *	mount -t erofs -o ro /dev/l4hkmod /lib/modules
  *
- * gives modprobe the kernel's modules, and /lib/modules/$(uname -r)/build
- * the tree to build external modules against.
+ * gives /lib/modules/$(uname -r)/build the tree to build external modules
+ * against. The default kernel builds all shipped drivers in.
  */
 #include <linux/bio.h>
 #include <linux/blkdev.h>

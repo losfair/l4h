@@ -741,8 +741,11 @@ arguments, including pool addresses, device indices and lifecycle state.
   bytes are included in the launch digest. KVM stays compiled into the common
   x86_64 image and is enabled only when the host supplies EPT roots. ABI 9
   introduces this bootstrap contract; old guest binaries cannot boot it.
-- **Its module tree.** `tools/build-kmods.sh` builds an EROFS image (LZMA,
-  about 9 MiB) of the kernel's `/lib/modules`: modules, depmod's files, and
+- **Its module build SDK.** All shipped drivers are built into Linux, so
+  their text and rodata are shared between guests rather than allocated
+  separately by each module loader. External modules remain supported.
+  `tools/build-kmods.sh` builds an EROFS image (LZMA) of the kernel's
+  `/lib/modules`: built-in driver metadata, depmod's files, and
   `<release>/build`, the tree to build external modules against (kbuild's
   `install-extmod-build` plus the headers it misses for `ARCH=l4h`: those
   outside `arch/l4h/include`, the ISA's own and the l4h ABI/provider headers). Its
@@ -753,35 +756,34 @@ arguments, including pool addresses, device indices and lifecycle state.
   `lockdown=integrity` or `lockdown=confidentiality` on their command line.
   The lockdown LSM initializes early, even with an explicit `lsm=` list,
   and exposes its state at `/sys/kernel/security/lockdown` when securityfs
-  is mounted. Lockdown is off by default. `modules_install` signs the
-  shipped modules with the build's key, whose certificate is built into
-  the kernel; the private key is not included in the module image.
-  Guests that enable lockdown reject unsigned external modules.
+  is mounted. Lockdown is off by default. The build generates no module
+  signing key or certificate and runs no signing step. Lockdown still
+  selects Linux's signature verifier, with an empty built-in trust store,
+  so guests that enable lockdown reject unsigned external modules.
 - **Shared read-only.** The boot module's own pages are mapped read-only
   into every guest at `L4H_KMOD_VA` (bootinfo `kmod_va`, `kmod_size`): one
   copy for all guests, nothing allocated or copied at boot. Each guest's
-  copies of the frame caps cost about 150 KiB with page tables for a 9 MiB
-  image. Root knows the frame of each module page (`bootmod.rs`). Guests
+  copies of the frame caps and page tables scale with the image's size.
+  Root knows the frame of each module page (`bootmod.rs`). Guests
   map the image's last page whole, so root clears what follows the image
   in it before any guest exists, and refuses an image that shares that page
   with another module. `drivers/kmod.c` exposes the image as the read-only
   block device `/dev/l4hkmod`; `mount -t erofs -o ro /dev/l4hkmod
-  /lib/modules` gives modprobe and module builds what they need.
+  /lib/modules` gives external module builds what they need.
 - **Kernel text and rodata are shared too.** Every guest maps the pages of
   the kernel's read-only segments from the boot module's frames, read-only,
   so a guest cannot change its own kernel's code. The linker script keeps
   whatever the kernel writes out of those segments (`__ro_after_init` data
   and the exception table, which is sorted at boot, go with the data) and
-  pads text to a page and rodata to a 2 MiB block, so on x86_64 the
-  11.7 MiB of text and 2.3 MiB of rodata are seven blocks, 14 MiB saved per
-  guest. A block wholly of such pages holds only those copies, and memd has
+  pads text to a page and rodata to a 2 MiB block. A block wholly of
+  such pages holds only those copies, and memd has
   no RAM block for it; blocks only partly read-only would get private
   copies (none with this layout). Shared blocks are guest-physical space on
-  top of the RAM a guest is given: a 256 MiB guest has 270 MiB of RAM in
-  its boot info. Writes to shared pages fault and stop the guest, so a
+  top of the private RAM a guest is given. Writes to shared pages fault
+  and stop the guest, so a
   kernel change that writes text or rodata shows at boot.
 - **Side channel.** Guests share the physical pages of kernel code and
-  modules, so one guest can time its access to them to learn which kernel
+  the module build SDK, so one guest can time its access to them to learn which kernel
   code another runs (Flush+Reload). These pages are never written once
   guests exist, so data stays out of reach.
 - **Modules may use the l4h ABI.** A module comes from the kernel's own
@@ -860,7 +862,7 @@ guest's command line asks for it:
 | userfaultfd, `MREMAP_DONTUNMAP`, `UFFDIO_MOVE` | ART's concurrent compacting GC | unused |
 | `/dev/rtc0` with alarms | the `CLOCK_*_ALARM` clocks | present |
 | dma-buf heaps, `sync_file` | gralloc buffers and fences | unused |
-| DRM with virtio-gpu (dumb buffers on render nodes, patch 0012; ARGB8888 on its plane, patch 0013) or vkms, modules | the display SurfaceFlinger composes for | no display until a driver is loaded |
+| DRM with virtio-gpu (dumb buffers on render nodes, patch 0012; ARGB8888 on its plane, patch 0013) or vkms, built in | the display SurfaceFlinger composes for | virtio-gpu probes an attached device; vkms needs `vkms.enable=1` |
 | evdev, uinput | input | no input devices |
 | zram with LZ4 | swap | unconfigured |
 | legacy iptables with netd's matches and targets, policy routing, `SOCK_DESTROY`, XFRM | netd | empty tables |
@@ -885,8 +887,10 @@ ashmem ioctls on memfds.
   builds, and a driver that maps device memory fails its probe. vkms
   composes planes in software, raises vblanks from an hrtimer and has only
   a writeback connector; screen capture over adb shows it. The display the
-  host can show is l4h-vmm's virtio-gpu (§9.6), with the `virtio_gpu`
-  module. DRM, vkms and virtio-gpu are modules.
+  host can show is l4h-vmm's virtio-gpu (§9.6), with the built-in
+  `virtio_gpu` driver. DRM and vkms are built in too. Patch 0017 makes
+  vkms opt-in with `vkms.enable=1`, so headless guests allocate no virtual
+  display and it does not compete with virtio-gpu.
 - **ashmem.** Android 17's libcutils allocates from `/dev/ashmem` unless
   `sys.use_memfd` is set and the kernel takes ashmem ioctls on memfds,
   which mainline does not. Patch 0010 is the C driver of the Android
@@ -928,8 +932,8 @@ Cuttlefish changes beyond what a bootloader and its launcher would give it:
   archive of l4h's and a bootconfig. Both ramdisks are legacy LZ4, which
   ends only with the data or a zero frame length, so four zero bytes end it
   before l4h's archive. That archive replaces the first-stage fstab (the
-  same partitions, without AVB: the device is unlocked) and the modules
-  first-stage init loads with l4h's `virtio_gpu` and its dependencies.
+  same partitions, without AVB: the device is unlocked) and clears the
+  vendor's first-stage module lists: l4h's display drivers are built in.
 - **The disk** is one GPT, whose partitions first-stage init finds by name
   on the platform device all virtio-l4h disks hang off
   (`androidboot.boot_devices=virtio-l4h`): misc, frp, metadata, odm, super
@@ -3100,8 +3104,8 @@ Common behaviour:
 
 `l4h-vmm` serves a virtio-gpu device (2D, one scanout; `gpu.rs`), which dom0
 gives a VM before it starts (`gpu_attach`, `l4hctl create --gpu WxH`), with
-that size as the preferred mode. The guest uses Linux's `virtio_gpu`
-module.
+that size as the preferred mode. Linux's built-in `virtio_gpu` driver
+probes the device automatically.
 
 - **Buffers stay in the I/O pool.** As every virtio-l4h device, it requires
   `VIRTIO_F_ACCESS_PLATFORM`, so a resource's backing is the pool pages the
@@ -5469,19 +5473,11 @@ Python dependencies are pinned in
 install the workflow's TeX packages. Native builds can use the same scripts,
 but different compiler, GRUB, BusyBox, EROFS or TeX versions can change bytes.
 
-The public `l4h-build-inputs-x86_64.tar.xz` release asset contains the module
-signing certificate, hashes of the unsigned stripped modules and their
-detached signatures. A fresh original build generates a private key once
-in its Linux output directory; that key is never published. A replay uses
-the public inputs instead, verifies the module hashes and signatures, and
-embeds the same certificate in Linux. Module signature checking and loading
-the shipped modules under lockdown remain enabled. Extract the asset and
-select its directory before rebuilding a release:
+All shipped Linux drivers are built in (§5.6). There is no module signing
+key, generated certificate or signature bundle to supply. Rebuild a release
+from its source commit with the published version:
 
 ```sh
-mkdir -p build/replay
-tar -C build/replay -xf l4h-build-inputs-x86_64.tar.xz
-export L4H_BUILD_INPUTS="$PWD/build/replay/build-inputs-x86_64"
 export L4H_VERSION=vRELEASE            # the tag used for the published release
 tools/build-release.sh
 ```

@@ -693,7 +693,7 @@ static void test_dma_heap(void)
 	close(heap);
 }
 
-/* ---- the display: vkms, from the module tree (/dev/l4hkmod).  It has
+/* ---- the display: built-in vkms, enabled with vkms.enable=1.  It has
  * no output, but its writeback connector returns what it composed. */
 
 struct dumb {
@@ -800,7 +800,6 @@ static void test_display(void)
 	double t0;
 	int fd;
 
-	CHECK(system("modprobe vkms") == 0, "modprobe vkms");
 	fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
 	CHECK(fd >= 0, "/dev/dri/card0");
 	CHECK(ioctl(fd, DRM_IOCTL_SET_CLIENT_CAP, &(struct drm_set_client_cap){ DRM_CLIENT_CAP_ATOMIC, 1 }) == 0 &&
@@ -941,7 +940,7 @@ static void test_defaults(void)
 	char buf[256];
 
 	CHECK(access("/proc/pressure", F_OK) < 0, "PSI is on without psi=1");
-	CHECK(access("/dev/dri", F_OK) < 0, "a display without vkms loaded");
+	CHECK(access("/dev/dri", F_OK) < 0, "a display without vkms.enable=1");
 	CHECK(read_file("/proc/bootconfig", buf, sizeof(buf)) == 0,
 	      "bootconfig without the bootconfig parameter: %s", buf);
 }

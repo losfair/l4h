@@ -37,7 +37,7 @@ jobs:
         run: python3 tests/test_installer.py
       - name: EFI slot selection configuration
         run: python3 tests/test_mkefi.py
-      - name: Reproducible archives, initramfs and module signing inputs
+      - name: Reproducible archives, initramfs and Rust paths
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends busybox-static cpio
@@ -104,8 +104,8 @@ jobs:
         run: tests/run-schedtest.sh
       - name: Build Linux
         run: tools/build-linux.sh vmlinux && ccache -s
-      - name: Signed modules load under lockdown; unsigned modules are rejected
-        run: tests/run-signingtest.sh
+      - name: Built-in drivers work without a module image under lockdown
+        run: tests/run-builtintest.sh
       - name: Console rings, hotplug scheduling and hypercalls under console load
         run: tests/run-devicetest.sh --qemu
       - name: Retained host logs and serial output in release mode
@@ -355,6 +355,8 @@ jobs:
         run: tests/check-ipc.sh
       - name: Build Linux
         run: tools/build-linux.sh vmlinux
+      - name: Built-in drivers work without a module image under lockdown
+        run: tests/run-builtintest.sh
       - name: Guest ABI and PCI (EL1)
         run: tests/run-abitest.sh
       - name: Boot RAM clearing and initial user context

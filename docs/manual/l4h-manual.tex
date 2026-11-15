@@ -382,8 +382,8 @@ dma-buf heaps, evdev and uinput, zram, the legacy iptables that netd uses,
 fs-verity and fscrypt. Those that would change other guests are off unless
 the command line asks for them (Section~\ref{sec:kparams}): an Android
 guest boots with \texttt{lsm=selinux psi=1 bootconfig}. Binder devices
-appear only in a mounted binderfs. The display is vkms, a module
-(\texttt{modprobe vkms}, Section~\ref{sec:kmods}): it composes in
+appear only in a mounted binderfs. The built-in vkms display is enabled
+with \texttt{vkms.enable=1}: it composes in
 software and has no output of its own, so you see it through screen
 capture in the guest, such as scrcpy over adb. The kernel has no suspend
 and no 32-bit compatibility, so Android needs a 64-bit-only build
@@ -394,8 +394,8 @@ x86\_64 build (\texttt{aosp\_cf\_x86\_64\_only\_phone-userdebug} on
 ci.android.com). Unpack its \texttt{-img-} archive into
 \texttt{build/cf17/img} and run \texttt{tests/run-android.sh}:
 \texttt{tools/mkandroid.sh} makes the initramfs (Cuttlefish's ramdisks,
-a first-stage fstab without verified boot, the \texttt{virtio\_gpu}
-modules, and the boot properties of a guest that renders in software)
+a first-stage fstab without verified boot, empty module lists for the
+built-in display drivers, and the boot properties of a guest that renders in software)
 and one disk with its partitions. dom0 creates the VM with
 \texttt{l4hctl create android --initrd initrd.img --mem 3072 --vcpus 4
 --io-pool 256 --disk 1 --gpu 720x1200 --cmdline "console=hvc0
@@ -419,21 +419,25 @@ different host image.
 \section{Kernel modules in guests}
 \label{sec:kmods}
 
-The host also gives every guest the kernel's module tree, read-only: its
-modules, and the tree to build more against. It is the block device
+All shipped drivers are built into Linux, sharing their text and rodata
+between guests. External modules are supported too. The host gives each
+guest a read-only build SDK and built-in driver metadata as the block device
 \file{/dev/l4hkmod}, an EROFS image of \file{/lib/modules}:
 \begin{lstlisting}[language=bash]
 mount -t erofs -o ro /dev/l4hkmod /lib/modules
-modprobe ...                                   # the kernel's own modules
 make -C /lib/modules/$(uname -r)/build M=$PWD  # an external module
 insmod my_module.ko
 \end{lstlisting}
 The build needs a compiler and make in the guest, as on any distribution;
 \texttt{ARCH=l4h} is implied. The tree is shared by all guests, so it
-costs the host its size, about 9~MiB, once. \cmd{tools/build-kmods.sh}
+costs the host its size once. \cmd{tools/build-kmods.sh}
 builds it, and the UEFI application carries it (\texttt{L4H\_GUEST\_KMODS}
 in Table~\ref{tab:env} under QEMU). Without it, there is no
 \file{/dev/l4hkmod}.
+
+The build generates no module signing key or certificate and runs no
+signing step. External unsigned modules load normally; guests booted with
+\texttt{lockdown=integrity} or \texttt{lockdown=confidentiality} reject them.
 
 Modules can also use the l4h interface and seL4 directly: the tree has
 \file{l4h/abi/l4h/abi.h} and the stable guest/provider headers, and the kernel exports its
@@ -1348,12 +1352,8 @@ helps when you debug a guest that dom0 cannot reach.
 \label{sec:display}
 
 A VM created with \texttt{--gpu WxH} has a virtio-gpu device with one
-display of that size, which it reports as its preferred mode. The guest
-needs the \texttt{virtio\_gpu} module, from the module tree
-(Section~\ref{sec:kmods}):
-\begin{lstlisting}
-modprobe virtio_gpu
-\end{lstlisting}
+display of that size, which it reports as its preferred mode. The built-in
+\texttt{virtio\_gpu} driver probes it automatically.
 It is a 2D device: guests draw in software, and there is no cursor plane,
 input device or EDID. The guest's buffers live in its I/O pool, which
 must hold four images of the display (for 1024x768, 16~MiB);
@@ -1907,7 +1907,7 @@ guest kernel accepts:
   \item[\texttt{l4h\_debug\_user}] Print the faults and exceptions of user
     processes.
 \end{description}
-For Android guests, these standard parameters turn on what is off by
+For Android guests, these parameters turn on what is off by
 default:
 \begin{description}[style=nextline]
   \item[\texttt{lsm=selinux}] Run SELinux, which Android's \texttt{init}
@@ -1916,6 +1916,9 @@ default:
   \item[\texttt{bootconfig}] Read the bootconfig appended to the
     initramfs, where Android's boot images put their
     \texttt{androidboot.*} settings.
+  \item[\texttt{vkms.enable=1}] Create a virtual display for software
+    composition and screen capture inside the guest. Leave this off when
+    using a host-provided virtio-gpu display.
 \end{description}
 
 \section{Attestation}

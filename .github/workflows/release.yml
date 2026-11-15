@@ -86,7 +86,7 @@ jobs:
           L4H_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
         run: |
           tools/build-release.sh
-      - name: Check public signing input replay
+      - name: Check reproducible packaging and Rust paths
         run: python3 tests/test_reproducible.py
       - name: Verify an independent rebuild
         env:
@@ -114,7 +114,6 @@ jobs:
               build/efi/l4h-fl4.efi build/efi/l4h-debug-fl4-x86_64.tar.xz \
               build/efi/l4h-bios-x86_64.tar.xz \
               build/efi/l4h-dom0-x86_64.tar.xz build/efi/l4h-debug-x86_64.tar.xz \
-              build/efi/l4h-build-inputs-x86_64.tar.xz \
               build/efi/l4h-attest.py build/efi/l4h-manual.pdf build/efi/SHA256SUMS
       - name: Upload logs
         if: failure()

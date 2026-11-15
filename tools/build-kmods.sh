@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Build the guest kernel's module tree, which every guest gets read-only as
+# Build the guest kernel's build SDK, which every guest gets read-only as
 # /dev/l4hkmod (DESIGN.md §5.6): an EROFS image of its /lib/modules,
-#   <release>/        its modules and depmod's files
+#   <release>/        built-in driver metadata and depmod's files
 #   <release>/build/  the tree to build external modules against: kbuild,
 #                     the headers, .config and Module.symvers, and l4h/abi
 #                     (l4h/abi.h and the provider ABI), so that
@@ -24,9 +24,7 @@ src=$root/build/linux-6.18
     || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
-# Sign stripped modules separately, so a replay can use public signatures.
-"$root/tools/build-linux.sh" modules_install INSTALL_MOD_PATH="$stage" INSTALL_MOD_STRIP=1 CONFIG_MODULE_SIG_ALL= >/dev/null
-python3 "$root/tools/module-signing.py" install "$l4h_linux_out" "$stage/lib/modules" "$root/build/build-inputs-$arch"
+"$root/tools/build-linux.sh" modules_install INSTALL_MOD_PATH="$stage" INSTALL_MOD_STRIP=1 >/dev/null
 release=$(cat "$l4h_linux_out/include/config/kernel.release")
 tree=$stage/lib/modules/$release/build
 rm -f "$tree"
@@ -54,11 +52,12 @@ mv "$tree/Makefile.new" "$tree/Makefile"
 find "$tree" -name '.*.cmd' -delete
 rm -f "$tree/scripts/mod/devicetable-offsets.s"
 # Reproducible: the image is part of the measured UEFI application.
-# Shared fragment/tail packing can corrupt signed module tails with the
-# pinned erofs-utils. Use independent file extents and verify their bytes.
+# Shared fragment/tail packing can corrupt files with the pinned
+# erofs-utils. Use independent file extents and verify the complete SDK.
 # EROFS treats SOURCE_DATE_EPOCH as an mtime clamp, so use zero here too.
 SOURCE_DATE_EPOCH=0 mkfs.erofs --quiet --workers=1 -zlzma,level=6 -C1048576 -T0 --all-root \
     -U 6c346800-6b6d-6f64-0000-000000000000 "$out.new" "$stage/lib/modules"
-python3 "$root/tools/module-signing.py" verify-image "$stage/lib/modules" "$out.new"
+fsck.erofs --extract="$stage/verify" "$out.new" >/dev/null
+diff -qr --no-dereference "$stage/lib/modules" "$stage/verify"
 mv "$out.new" "$out"
 echo "$out: $release, $(( $(stat -c %s "$out") >> 10 )) KiB"

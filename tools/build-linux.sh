@@ -100,7 +100,6 @@ for ((i = keep; i < ${#want[@]}; i++)); do
 done
 exec 9>&-
 mkdir -p "$out"
-python3 "$root/tools/module-signing.py" prepare "$out"
 mk=(make -C "$src" O="$out" ARCH=l4h SUBARCH="$arch"
     L4H_ABI_INCLUDE="$root/include"
     KCFLAGS="${KCFLAGS:-} $l4h_prefix_map"

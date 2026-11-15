@@ -15,7 +15,6 @@ export L4H_ARCH=x86_64 L4H_KERNEL_VARIANT=fl4 SEL4_PREFIX=$root/build/sel4-fl4
 "$root/tools/build-host.sh"
 if [ "${L4H_GUEST_BUILT:-0}" != 1 ]; then
     "$root/tools/build-kmods.sh" >/dev/null
-    l4h_tar -C "$root/build" -cJf "$out/l4h-build-inputs-x86_64.tar.xz" build-inputs-x86_64
 fi
 export L4H_GUEST_KERNEL=$root/build/linux-l4h/vmlinux
 export L4H_GUEST_KMODS=$root/build/linux-l4h/kmods.erofs
