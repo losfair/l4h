@@ -11,6 +11,7 @@
 # build directory, next to vmlinux).  Builds the kernel first.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
+source "$root/tools/reproducible-env.sh"
 source "$root/tools/guest-env.sh"
 arch=${L4H_ARCH:-x86_64}
 case "$arch" in
@@ -23,7 +24,9 @@ src=$root/build/linux-6.18
     || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
-"$root/tools/build-linux.sh" modules_install INSTALL_MOD_PATH="$stage" INSTALL_MOD_STRIP=1 >/dev/null
+# Sign stripped modules separately, so a replay can use public signatures.
+"$root/tools/build-linux.sh" modules_install INSTALL_MOD_PATH="$stage" INSTALL_MOD_STRIP=1 CONFIG_MODULE_SIG_ALL= >/dev/null
+python3 "$root/tools/module-signing.py" install "$l4h_linux_out" "$stage/lib/modules" "$root/build/build-inputs-$arch"
 release=$(cat "$l4h_linux_out/include/config/kernel.release")
 tree=$stage/lib/modules/$release/build
 rm -f "$tree"

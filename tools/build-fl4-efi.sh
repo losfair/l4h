@@ -5,6 +5,7 @@
 # with seL4. This application has no multikernel shim.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
+source "$root/tools/reproducible-env.sh"
 out=$root/build/efi
 mkdir -p "$out"
 source "$root/tools/host-profile.sh"
@@ -14,6 +15,7 @@ export L4H_ARCH=x86_64 L4H_KERNEL_VARIANT=fl4 SEL4_PREFIX=$root/build/sel4-fl4
 "$root/tools/build-host.sh"
 if [ "${L4H_GUEST_BUILT:-0}" != 1 ]; then
     "$root/tools/build-kmods.sh" >/dev/null
+    l4h_tar -C "$root/build" -cJf "$out/l4h-build-inputs-x86_64.tar.xz" build-inputs-x86_64
 fi
 export L4H_GUEST_KERNEL=$root/build/linux-l4h/vmlinux
 export L4H_GUEST_KMODS=$root/build/linux-l4h/kmods.erofs
@@ -31,5 +33,5 @@ cp "$root/host/target/x86_64-sel4-roottask/$l4h_profile/l4h-root.elf" \
 cp "$SEL4_PREFIX/bin/kernel.elf" "$SEL4_PREFIX/fl4-revision" "$symbols/"
 cp "$SEL4_PREFIX/guest-provider/provider.bin" "$symbols/guest-provider.bin"
 cp "$SEL4_PREFIX/guest-provider/provider.elf" "$symbols/guest-provider.elf"
-tar -C "$debug" -cJf "$out/l4h-debug-fl4-x86_64.tar.xz" l4h-debug-fl4-x86_64
+l4h_tar -C "$debug" -cJf "$out/l4h-debug-fl4-x86_64.tar.xz" l4h-debug-fl4-x86_64
 echo "$out/l4h-debug-fl4-x86_64.tar.xz: $(( $(stat -c %s "$out/l4h-debug-fl4-x86_64.tar.xz") >> 10 )) KiB"

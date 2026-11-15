@@ -5446,6 +5446,50 @@ notices.
 
 ### 14.2 Building and running
 
+Release builds use `tools/build-release.sh`. `tools/check-reproducible.sh`
+then builds the committed source again in a fresh checkout at a different
+absolute path and compares SHA-256 checksums of every published artifact,
+including the debug archives, dom0 initramfs and PDF manual. Release CI
+requires this comparison before publishing. A failed rebuild stays under
+`build/reproducibility.*` with its log.
+
+Reproduction needs the same build inputs and tool versions. The release
+workflow pins the Debian container by digest and its apt repositories to
+the 2026-11-14 snapshot. `rust-toolchain.toml` pins the Linux/dom0 Rust
+compiler; the host and shim have their own nightly pins. Cargo uses the
+checked-in lockfiles, Python dependencies are pinned in
+`tools/sel4-requirements.txt`, and downloaded sources have checksums in
+`tools/source-pins.sh`. Use the container and apt sources specified in
+`.github/workflows/release.yml`, then run `tools/ci-setup.sh x86_64` and
+install the workflow's TeX packages. Native builds can use the same scripts,
+but different compiler, GRUB, BusyBox, EROFS or TeX versions can change bytes.
+
+The public `l4h-build-inputs-x86_64.tar.xz` release asset contains the module
+signing certificate, hashes of the unsigned stripped modules and their
+detached signatures. A fresh original build generates a private key once
+in its Linux output directory; that key is never published. A replay uses
+the public inputs instead, verifies the module hashes and signatures, and
+embeds the same certificate in Linux. Module signature checking and loading
+the shipped modules under lockdown remain enabled. Extract the asset and
+select its directory before rebuilding a release:
+
+```sh
+mkdir -p build/replay
+tar -C build/replay -xf l4h-build-inputs-x86_64.tar.xz
+export L4H_BUILD_INPUTS="$PWD/build/replay/build-inputs-x86_64"
+export L4H_VERSION=vRELEASE            # the tag used for the published release
+tools/build-release.sh
+```
+
+`tools/reproducible-env.sh` defaults `SOURCE_DATE_EPOCH` to the source
+commit's timestamp (set it explicitly when building without Git metadata),
+fixes Linux's build counter/user/host and the locale, timezone and umask,
+and remaps checkout paths in C/Rust output. Archives sort entries and
+normalize ownership, modes and timestamps; initramfs also normalizes inode
+and device numbers. The manual uses the same source date. Scratch files
+default to `build/tmp`; an explicit `TMPDIR` is honored. Use the same
+`L4H_VERSION` and `SOURCE_DATE_EPOCH` as the original build when replaying.
+
 The build machine needs:
 
 - QEMU with KVM, used only as a fast CPU (VMX and SVM are hidden from the guest);

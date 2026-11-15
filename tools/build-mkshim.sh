@@ -8,6 +8,7 @@
 # Usage: build-mkshim.sh [N]
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
+source "$root/tools/reproducible-env.sh"
 n=${1:-8}
 out=$root/build/mkshim${L4H_KERNEL_VARIANT:+-$L4H_KERNEL_VARIANT}
 mkdir -p "$out"
@@ -20,6 +21,6 @@ for k in $(seq 0 $((n - 1))); do
 done
 cd "$root/boot/l4h-mkshim"
 profile=release
-cargo build -q --release
+cargo build "${l4h_cargo[@]}" -q --release
 objcopy -O elf32-i386 "target/x86_64-unknown-none/$profile/l4h-mkshim" "$out/l4h-mkshim.elf"
 echo "$out: l4h-mkshim.elf, kernel-s0..s$((n - 1)).elf"

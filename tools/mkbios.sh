@@ -22,6 +22,7 @@
 # as for tools/mkefi.sh.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
+source "$root/tools/reproducible-env.sh"
 out=$1
 source "$root/tools/host-profile.sh"
 rootserver=${2:-$root/host/target/x86_64-sel4-roottask/$l4h_profile/l4h-root.elf}

@@ -284,6 +284,8 @@ CONFIG_SECURITY_LOCKDOWN_LSM_EARLY=y
 CONFIG_LOCK_DOWN_KERNEL_FORCE_NONE=y
 # Keep the shipped modules loadable in guests that enable lockdown.
 CONFIG_MODULE_SIG_ALL=y
+# Prepared by tools/module-signing.py; public replay inputs need no private key.
+CONFIG_MODULE_SIG_KEY="certs/l4h-signing.pem"
 # Android guests (DESIGN.md §5.8).  What only Android uses is off until an
 # Android guest asks for it on its command line, so other guests run as
 # before: SELinux with lsm=selinux, PSI with psi=1, bootconfig with

@@ -2,12 +2,13 @@
 # Build a small busybox initramfs for l4h guests.
 # Usage: mkinitramfs.sh <out.cpio.gz> [init-script] [extra binaries for /bin...]
 set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+source "$root/tools/reproducible-env.sh"
 out=$1
 init=${2:-}
 shift 2 || shift $#
 busybox=${L4H_BUSYBOX:-$(command -v busybox)}
 if [ "${L4H_ARCH:-x86_64}" = aarch64 ] && [ -z "${L4H_BUSYBOX:-}" ]; then
-    root=$(cd "$(dirname "$0")/.." && pwd)
     busybox=$root/build/busybox-aarch64/usr/bin/busybox
     [ -f "$busybox" ] || { echo "Set L4H_BUSYBOX to a static AArch64 busybox, or run tools/ci-setup.sh aarch64" >&2; exit 1; }
 fi
@@ -38,5 +39,7 @@ chmod +x "$dir/init"
 for extra in "$@"; do
     cp "$extra" "$dir/bin/"
 done
-(cd "$dir" && find . | cpio -o -H newc --quiet | gzip -9) > "$out"
+chmod 755 "$dir"
+find "$dir" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
+(cd "$dir" && find . -print0 | sort -z | cpio --null -o -H newc --reproducible --owner=0:0 --quiet | gzip -n -9) > "$out"
 echo "initramfs: $out ($(stat -c %s "$out") bytes)"

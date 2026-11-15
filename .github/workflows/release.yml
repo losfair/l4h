@@ -41,17 +41,27 @@ jobs:
   x86_64:
     name: Release artifacts (x86_64)
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 180
     permissions:
       contents: write
     container:
-      image: debian:trixie
+      image: debian:trixie@sha256:9c6e381421d0f48d1b8133e573f33c185ee16cbf505eda9c4a8a4791b25ea8a6
     steps:
-      - name: Install git
-        run: apt-get update -q && apt-get install -y -q --no-install-recommends git ca-certificates
+      # Freeze apt inputs as well as the base image. Keep the snapshot when
+      # reproducing this revision, including the TeX and GRUB packages.
+      - name: Freeze Debian packages and install git
+        run: |
+          rm -f /etc/apt/sources.list.d/debian.sources
+          cat > /etc/apt/sources.list <<'SOURCES'
+          deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/20261114T000000Z/ trixie main
+          deb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/20261114T000000Z/ trixie-security main
+          SOURCES
+          apt-get update -q
+          apt-get install -y -q --no-install-recommends git ca-certificates
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           submodules: true
+          fetch-depth: 0
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: build/dl
@@ -65,23 +75,23 @@ jobs:
             ccache-x86_64-
       - name: Set up
         run: tools/ci-setup.sh x86_64
-      - name: Build the manual
-        env:
-          L4H_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+      - name: Install manual build tools
         run: |
           apt-get install -y -q --no-install-recommends \
               latexmk texlive-latex-recommended texlive-latex-extra texlive-pictures \
               lmodern texlive-fonts-recommended
-          make -C docs/manual
       - name: Build
         # Release builds: optimised host, no kernel assertions or debug syscalls.
         env:
           L4H_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
         run: |
-          L4H_RELEASE=1 tools/build-efi.sh
-          tools/build-dom0.sh
-          cp tools/l4h-attest.py docs/manual/l4h-manual.pdf build/efi/
-          cd build/efi && sha256sum l4h-*.efi l4h-*.tar.xz l4h-attest.py l4h-manual.pdf > SHA256SUMS && cat SHA256SUMS
+          tools/build-release.sh
+      - name: Check public signing input replay
+        run: python3 tests/test_reproducible.py
+      - name: Verify an independent rebuild
+        env:
+          L4H_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: tools/check-reproducible.sh
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: l4h-x86_64
@@ -104,6 +114,7 @@ jobs:
               build/efi/l4h-fl4.efi build/efi/l4h-debug-fl4-x86_64.tar.xz \
               build/efi/l4h-bios-x86_64.tar.xz \
               build/efi/l4h-dom0-x86_64.tar.xz build/efi/l4h-debug-x86_64.tar.xz \
+              build/efi/l4h-build-inputs-x86_64.tar.xz \
               build/efi/l4h-attest.py build/efi/l4h-manual.pdf build/efi/SHA256SUMS
       - name: Upload logs
         if: failure()
@@ -113,3 +124,5 @@ jobs:
           path: |
             build/efi/*.log
             docs/manual/*.log
+            build/reproducibility.*/rebuild.log
+            build/reproducibility.*/source/build/efi/*.log

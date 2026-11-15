@@ -25,6 +25,7 @@
 # packaged as l4h-fl4.efi and l4h-debug-fl4-x86_64.tar.xz, without a shim.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
+source "$root/tools/reproducible-env.sh"
 export L4H_ARCH=x86_64
 out=$root/build/efi
 mkdir -p "$out"
@@ -50,6 +51,7 @@ L4H_KERNEL_VARIANT= L4H_VTX=ON "$root/tools/build-kernel.sh" >"$out/kernel.log" 
 export SEL4_PREFIX=$root/build/sel4
 "$root/tools/build-host.sh"
 "$root/tools/build-kmods.sh" >/dev/null
+l4h_tar -C "$root/build" -cJf "$out/l4h-build-inputs-x86_64.tar.xz" build-inputs-x86_64
 debug=$(mktemp -d)
 trap 'rm -rf "$debug"' EXIT
 mkdir "$debug/l4h-debug-x86_64"
@@ -76,7 +78,7 @@ for v in "${variants[@]}"; do
 done
 # The shim does not depend on the variant.
 cp "$root/build/mkshim-generic/l4h-mkshim.elf" "$debug/l4h-debug-x86_64/"
-tar -C "$debug" -cJf "$out/l4h-debug-x86_64.tar.xz" l4h-debug-x86_64
+l4h_tar -C "$debug" -cJf "$out/l4h-debug-x86_64.tar.xz" l4h-debug-x86_64
 bios=$debug/l4h-bios-x86_64
 # Multikernel boot is UEFI-only in the release (the installer's BIOS
 # package has one kernel per variant).
@@ -86,7 +88,7 @@ for v in "${variants[@]}"; do
     read -r name _ <<<"$v"
     cp "$root/build/sel4-$name/bin/kernel.elf" "$bios/kernel-$name.elf"
 done
-tar -C "$debug" -cJf "$out/l4h-bios-x86_64.tar.xz" l4h-bios-x86_64
+l4h_tar -C "$debug" -cJf "$out/l4h-bios-x86_64.tar.xz" l4h-bios-x86_64
 for f in l4h-debug-x86_64.tar.xz l4h-bios-x86_64.tar.xz; do
     echo "$out/$f: $(( $(stat -c %s "$out/$f") >> 10 )) KiB"
 done

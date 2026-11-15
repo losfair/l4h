@@ -2,6 +2,10 @@
 # The title page shows the l4h version: L4H_VERSION when set, as in release
 # builds, otherwise what tools/version.sh derives from Git.
 VERSION := $(shell ../../tools/version.sh)
+export SOURCE_DATE_EPOCH ?= $(shell git show -s --format=%ct HEAD)
+export FORCE_SOURCE_DATE := 1
+export TZ := UTC
+export LC_ALL := C
 
 l4h-manual.pdf: l4h-manual.tex version.tex
 	latexmk -pdf -interaction=nonstopmode -halt-on-error l4h-manual.tex

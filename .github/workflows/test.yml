@@ -37,6 +37,11 @@ jobs:
         run: python3 tests/test_installer.py
       - name: EFI slot selection configuration
         run: python3 tests/test_mkefi.py
+      - name: Reproducible archives, initramfs and module signing inputs
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends busybox-static cpio
+          python3 tests/test_reproducible.py
       - name: Shell lint
         run: shellcheck tools/install.sh tools/install/init tests/run-install-vm.sh tests/guest/install-test tests/guest/install-curl-fixture
       - name: Shell lint, every script (errors, and "!" checks that set -e ignores)
