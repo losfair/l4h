@@ -1033,6 +1033,12 @@ static int l4h_handle_exit(struct kvm_vcpu *vcpu, fastpath_t fastpath)
 	struct vcpu_l4h *l = to_l4h(vcpu);
 	struct l4h_vmexit *x = &l->x;
 
+	/* A notification has no hardware exit reason. FL4 leaves it zero,
+	 * which would otherwise be decoded as an exception/NMI exit. */
+	if (!x->fault) {
+		++vcpu->stat.irq_exits;
+		return 1;
+	}
 	switch (x->reason) {
 	case EXIT_REASON_EXCEPTION_NMI:
 		return handle_exception(vcpu);

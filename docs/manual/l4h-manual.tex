@@ -844,7 +844,10 @@ Linux to check the host CPU.
 the \href{https://github.com/losfair/FL4}{FL4 kernel}. It includes a host and
 ABI provider built against FL4's own libsel4. All release applications share
 the same Linux guest kernel and module tree. FL4 detects
-CPU features at boot and supports single-kernel boots without nested KVM.
+CPU features at boot and supports KVM inside Linux guests on hosts with
+usable Intel VT-x or AMD-V. The same image boots with KVM disabled when
+hardware virtualization is unavailable. Multikernel partitions are not
+supported on FL4.
 Build it separately with \cmd{L4H\_RELEASE=1 tools/build-fl4-efi.sh}, or
 as part of \cmd{tools/build-efi.sh}. The source revision is pinned in
 \file{kernel/fl4/REVISION}; \texttt{L4H\_FL4\_SOURCE} can select a detached

@@ -15,7 +15,9 @@
 #         keeps VT-x off whatever the CPU has.
 # L4H_QEMU_CPU overrides the CPU model, L4H_KERNEL_VARIANT the kernel
 # (build/sel4-VARIANT) and L4H_QEMU_ACCEL the accelerator (tcg to try it
-# without KVM, on an xAPIC/no-PCID variant).  Needs tools/build-kernel.sh.
+# without KVM, on an xAPIC/no-PCID variant). Needs tools/build-kernel.sh,
+# or tools/build-fl4.sh with L4H_KERNEL_VARIANT=fl4 and SEL4_PREFIX pointing
+# to build/sel4-fl4. The kernel must provide seL4_DebugPutChar (debug build).
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 mode=${1:?usage: run-vtxtest.sh off|on|skim}
@@ -33,9 +35,10 @@ virt=vt-x
 if [ "$mode" != skim ] && grep -q '^vendor_id.*AuthenticAMD' /proc/cpuinfo; then
     virt=svm
 fi
-# The probe's object numbering must match the default libsel4 build, as
-# l4h-root's does on every variant.
-inc=$root/build/sel4/libsel4/include
+# The probe's object sizes and invocation numbers must match the kernel.
+# seL4 variants share the default libsel4; FL4 needs its own SEL4_PREFIX.
+prefix=${SEL4_PREFIX:-$root/build/sel4}
+inc=$prefix/libsel4/include
 kernel=$root/build/sel4${variant:+-$variant}/bin/kernel.elf
 out=$root/build/vtxtest${variant:+-$variant}
 mkdir -p "$out"
@@ -61,16 +64,25 @@ wait $qemu 2>/dev/null || true
 trap - EXIT
 fail() {
     echo "VTXTEST($mode): FAIL: $*" >&2
-    tr -d '\r' <"$log" | grep -a -E 'vt-x|svm|vtxprobe|fail|halting' >&2 || true
+    tr -d '\r' <"$log" | grep -a -E 'FL4:|vt-x|svm|vtxprobe|fail|halting' >&2 || true
     exit 1
 }
 grep -aq 'vtxprobe: done' "$log" || fail "the probe did not finish"
 # seL4_InvalidArgument is 1.
-case "$mode" in
-    off) grep -aq "$virt: unavailable; booting without it" "$log" || fail "$virt was not reported unavailable" ;;
-    skim) grep -aq 'vt-x: off with the SKIM window' "$log" || fail "SKIM did not turn VT-x off" ;;
-    on) ! grep -aq "$virt: unavailable\|$virt: off" "$log" || fail "$virt is off" ;;
-esac
+if [ -f "$prefix/fl4-revision" ]; then
+    backend=unavailable
+    if [ "$mode" = on ]; then
+        backend=VT-x
+        [ "$virt" != svm ] || backend=AMD-V
+    fi
+    grep -aq "FL4: virtualization $backend" "$log" || fail "FL4 did not report $backend"
+else
+    case "$mode" in
+        off) grep -aq "$virt: unavailable; booting without it" "$log" || fail "$virt was not reported unavailable" ;;
+        skim) grep -aq 'vt-x: off with the SKIM window' "$log" || fail "SKIM did not turn VT-x off" ;;
+        on) ! grep -aq "$virt: unavailable\|$virt: off" "$log" || fail "$virt is off" ;;
+    esac
+fi
 for object in vcpu ept_pml4 ept_pt; do
     if [ "$mode" = on ]; then
         grep -aq "vtxprobe: $object ok" "$log" || fail "$object was not created"
