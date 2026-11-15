@@ -5,7 +5,13 @@
 # Usage: ci-setup.sh [x86_64|aarch64|debian]...   (default: x86_64)
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
-source "$root/tools/reproducible-env.sh"
+export TMPDIR=${TMPDIR:-$root/build/tmp}
+mkdir -p "$TMPDIR"
+# Container runners can mount a checkout owned by the runner's host UID.
+# Trust these exact inputs before reading their Git metadata.
+for path in "$root" "$root/kernel/seL4" "$root/third_party/"{rust-sel4,sddf,kemu}; do
+    git config --global --add safe.directory "$path"
+done
 source "$root/tools/source-pins.sh"
 want=" ${*:-x86_64} "
 
@@ -22,6 +28,7 @@ pkgs=(git ca-certificates curl openssl xz-utils bzip2 wget sudo procps kmod
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
 apt-get install -y -q --no-install-recommends "${pkgs[@]}"
+source "$root/tools/reproducible-env.sh"
 
 # Rust: the root pin for Linux/dom0, stable for tests, and nightly for the host
 # (host/rust-toolchain.toml).
