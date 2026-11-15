@@ -19,12 +19,7 @@ img=${ANDROID_IMG:-$root/build/cf17/img}
     exit 1
 }
 out=$root/build/android
-"$root/tools/build-linux.sh" vmlinux modules >"$root/build/linux-build.log" 2>&1 \
-    || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
-rm -rf "$out/modules"
-"$root/tools/build-linux.sh" modules_install INSTALL_MOD_PATH="$out/modules" INSTALL_MOD_STRIP=1 >/dev/null
-release=$(cat "$l4h_linux_out/include/config/kernel.release")
-"$root/tools/mkandroid.sh" "$img" "$out/modules/lib/modules/$release" "$out"
+"$root/tools/mkandroid.sh" "$img" "$out"
 "$root/tools/build-l4hctl.sh"
 "$root/tools/mkinitramfs.sh" "$out/dom0.cpio.gz" "$root/tests/guest/init-android" \
     "$l4h_ctl" "$out/initrd.img" >/dev/null

@@ -217,7 +217,6 @@ CONFIG_EROFS_FS=y
 CONFIG_EROFS_FS_XATTR=y
 CONFIG_EROFS_FS_POSIX_ACL=y
 CONFIG_EROFS_FS_ZIP=y
-# The module tree the host gives every guest (/dev/l4hkmod).
 CONFIG_EROFS_FS_ZIP_LZMA=y
 CONFIG_XFS_FS=y
 CONFIG_XFS_POSIX_ACL=y
@@ -331,15 +330,12 @@ CONFIG_HW_RANDOM=y
 CONFIG_RTC_CLASS=y
 # CONFIG_RTC_HCTOSYS is not set
 # CONFIG_RTC_SYSTOHC is not set
-# Graphics buffers and fences, for gralloc and the compositor; evdev and
-# uinput.  The display is vkms, which composes in software and has no
-# output but its writeback connector. Enable its device with vkms.enable=1;
-# ordinary guests stay headless without allocating a virtual display.
+# Graphics buffers and fences for the built-in virtio-gpu display; evdev
+# and uinput for guest input.
 CONFIG_DMABUF_HEAPS=y
 CONFIG_DMABUF_HEAPS_SYSTEM=y
 CONFIG_SYNC_FILE=y
 CONFIG_DRM=y
-CONFIG_DRM_VKMS=y
 # The host's display (l4h-vmm's virtio-gpu, DESIGN.md §9.6).
 CONFIG_DRM_VIRTIO_GPU=y
 # CONFIG_HWMON is not set

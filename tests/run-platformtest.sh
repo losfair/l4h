@@ -23,7 +23,7 @@ else
 fi
 "$root/tools/build-host.sh" >"$out/host-build.log" 2>&1
 "$root/tools/build-l4hctl.sh"
-export L4H_GUEST_KERNEL=$guest_kernel L4H_GUEST_KMODS= L4H_MKSHIM=
+export L4H_GUEST_KERNEL=$guest_kernel L4H_GUEST_SDK= L4H_MKSHIM=
 # The same application in both slots uses the shared runtime selector.
 "$root/tools/mkefi.sh" "$out/l4h.efi"
 for slot in A B; do

@@ -57,9 +57,10 @@ for name in $(l4hctl firmware wanted 2>/dev/null); do
     rm -f /run/l4h-firmware
     [ -n "$loaded" ] || echo "l4h: NIC firmware $name not loaded; its driver runs without" >&2
 done
-# Expose only the running kernel's modules over the existing module tree.
-# /lib may be a symlink to /usr/lib; the installer checks that /usr is on root.
-mount -t erofs -o ro /dev/l4hkmod /newroot/lib/modules || fail 'cannot mount kernel modules'
+# The build SDK is read-only; users' module files stay on the root filesystem.
+module_build=/newroot/lib/modules/$(uname -r)/build
+mkdir -p "$module_build" || fail 'cannot create kernel SDK mountpoint'
+mount -t erofs -o ro /dev/l4hsdk "$module_build" || fail 'cannot mount kernel SDK'
 # Match each dom0 vNIC by the physical uplink's MAC, not enumeration order.
 # Move all of them to unused temporary names first, so eth0/eth1 swaps work.
 [ -n "$networks" ] || fail 'missing uplink interface mappings'

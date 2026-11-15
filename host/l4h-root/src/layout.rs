@@ -2,8 +2,7 @@
 //! a fixed address, in one table.  A region's size is the most that may be
 //! mapped in it, and whoever maps there keeps within it.  The regions are
 //! checked at compile time to be disjoint and below the top of user
-//! address space: two modules once chose the same address for different
-//! mappings, and root failed at boot only on hosts with a module image.
+//! address space.
 //!
 //! Component address spaces are laid out in `l4h_host` (vmmgr's also in its
 //! layout.rs), guests' in `include/l4h/abi.h`.

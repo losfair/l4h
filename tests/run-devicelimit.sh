@@ -32,7 +32,7 @@ for name, count in [('fits', 59), ('overflow', 60)]:
 with (out / 'disk.raw').open('wb') as disk:
     disk.truncate(64 << 20)
 PY
-export L4H_GUEST_KERNEL="$out/vmlinux" L4H_GUEST_KMODS="" L4H_DOM0_INITRD="$out/dom0.cpio.gz"
+export L4H_GUEST_KERNEL="$out/vmlinux" L4H_GUEST_SDK="" L4H_DOM0_INITRD="$out/dom0.cpio.gz"
 export L4H_MEM="${L4H_MEM:-2G}" L4H_SMP="${L4H_SMP:-2}"
 qemu=
 trap 'if [ -n "$qemu" ]; then kill "$qemu" 2>/dev/null || true; wait "$qemu" 2>/dev/null || true; fi' EXIT

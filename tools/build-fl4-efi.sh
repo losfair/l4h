@@ -14,10 +14,10 @@ export L4H_ARCH=x86_64 L4H_KERNEL_VARIANT=fl4 SEL4_PREFIX=$root/build/sel4-fl4
     || { tail -n 40 "$out/kernel-fl4.log"; exit 1; }
 "$root/tools/build-host.sh"
 if [ "${L4H_GUEST_BUILT:-0}" != 1 ]; then
-    "$root/tools/build-kmods.sh" >/dev/null
+    "$root/tools/build-sdk.sh" >/dev/null
 fi
 export L4H_GUEST_KERNEL=$root/build/linux-l4h/vmlinux
-export L4H_GUEST_KMODS=$root/build/linux-l4h/kmods.erofs
+export L4H_GUEST_SDK=$root/build/linux-l4h/sdk.erofs
 L4H_MKSHIM= "$root/tools/mkefi.sh" "$out/l4h-fl4.efi" \
     "$root/host/target/x86_64-sel4-roottask/$l4h_profile/l4h-root.elf" \
     "$SEL4_PREFIX/bin/kernel.elf"

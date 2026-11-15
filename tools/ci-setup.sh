@@ -15,7 +15,7 @@ done
 source "$root/tools/source-pins.sh"
 want=" ${*:-x86_64} "
 
-pkgs=(git ca-certificates curl openssl xz-utils bzip2 wget sudo procps kmod
+pkgs=(git ca-certificates curl xz-utils bzip2 wget sudo procps kmod
     build-essential gcc g++ make cmake ninja-build python3 python3-venv
     libxml2-utils device-tree-compiler clang libclang-dev
     flex bison bc libelf-dev libssl-dev pahole cpio rsync ccache
@@ -61,7 +61,7 @@ if [[ $want == *" aarch64 "* ]]; then
     # Extract the foreign BusyBox without replacing the build host's binary.
     dpkg --add-architecture arm64
     apt-get update -q
-    # install-extmod-build rebuilds the module signing tool for the guest.
+    # SDK helpers run natively on the guest.
     apt-get install -y -q --no-install-recommends libssl-dev:arm64
     busybox_pkg=$(mktemp -d)
     (cd "$busybox_pkg" && apt-get download busybox-static:arm64)

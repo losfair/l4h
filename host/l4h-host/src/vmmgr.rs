@@ -67,7 +67,7 @@ pub const CTL_DATA_RADIX: usize = CTL_DATA_PAGES.trailing_zeros() as usize;
 
 /// Where root maps things into vmmgr, above its image and stacks.
 ///
-/// The boot modules vmmgr loads from (guest kernel, module image, dom0's
+/// The boot modules vmmgr loads from (guest kernel, SDK image, dom0's
 /// initramfs), page after page.
 pub const MODULES_VA: usize = 0x5000_0000_0000;
 pub const MODULES_SIZE: usize = 64 << 30;
@@ -247,7 +247,7 @@ pub struct VmmgrConfig {
     pub modules_radix: u64,
     pub modules_pages: u64,
     pub kernel: ModuleRange,
-    pub kmods: ModuleRange,
+    pub sdk: ModuleRange,
     pub dom0_initrd: ModuleRange,
     pub dom0_mem: u64,
     pub dom0_vcpus: u64,

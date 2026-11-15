@@ -193,19 +193,14 @@ static CONFIG: l4h_host::fixed::Scratch<core::mem::MaybeUninit<VmmgrConfig>> =
 /// and trustd's flags.
 pub fn spawn(h: &mut Host, modules: &Modules, plan: &Dom0Plan) -> Vmmgr {
     // The modules, page after page at MODULES_VA, and their frames.
-    let mods = ["guest-kernel", "guest-kmods", "dom0-initrd"].map(|name| modules.iter().find(|m| m.name == name).map(|m| m.data));
+    let mods = ["guest-kernel", "guest-sdk", "dom0-initrd"].map(|name| modules.iter().find(|m| m.name == name).map(|m| m.data));
     let frames = modules.frames();
     let page_range = |d: &[u8]| {
         let p = d.as_ptr() as usize;
         (p & !(PAGE - 1))..(p + d.len()).next_multiple_of(PAGE)
     };
     // A module some page of which has no known frame stays root's.
-    let mut mods = mods.map(|m| m.filter(|d| !d.is_empty() && page_range(d).step_by(PAGE).all(|va| frames.get(va).is_some())));
-    if let Some(d) = mods[1] {
-        if !kmods_shareable(modules, &mut h.wins.a, d) {
-            mods[1] = None;
-        }
-    }
+    let mods = mods.map(|m| m.filter(|d| !d.is_empty() && page_range(d).step_by(PAGE).all(|va| frames.get(va).is_some())));
     let pages: usize = mods.iter().flatten().map(|d| page_range(d).len() / PAGE).sum();
     let radix = pages.max(1).next_power_of_two().trailing_zeros() as usize;
     assert!(pages * PAGE <= proto::MODULES_SIZE, "l4h-root: boot modules too large for vmmgr");
@@ -238,7 +233,7 @@ pub fn spawn(h: &mut Host, modules: &Modules, plan: &Dom0Plan) -> Vmmgr {
             *r = proto::ModuleRange { offset: (at + d.as_ptr() as usize % PAGE) as u64, len: d.len() as u64 };
             at += range.len();
         }
-        (cfg.kernel, cfg.kmods, cfg.dom0_initrd) = (ranges[0], ranges[1], ranges[2]);
+        (cfg.kernel, cfg.sdk, cfg.dom0_initrd) = (ranges[0], ranges[1], ranges[2]);
         // The config file's: vmmgr refuses what it cannot give.
         cfg.dom0_mem = (h.cfg.dom0_mem_mb as u64).saturating_mul(1 << 20);
         cfg.dom0_vcpus = h.cfg.dom0_vcpus as u64;
@@ -362,42 +357,6 @@ pub fn spawn(h: &mut Host, modules: &Modules, plan: &Dom0Plan) -> Vmmgr {
     component::start(&comp);
     info!("l4h-root: vmmgr started with {} MiB of boot modules", pages * PAGE >> 20);
     Vmmgr { comp, arena, mailbox, ops_waiting: [0; proto::MAX_PENDING / 64], attest: host::trust::AttestNotices::new(), monitor_waiting: None }
-}
-
-/// Whether guests may map the module image `data` in whole pages: it must
-/// start a page, and its last page holds nothing else.  Root clears what
-/// follows the image in that page (a boot loader leaves whatever was in
-/// memory there) before any guest exists.
-fn kmods_shareable(modules: &Modules, win: &mut crate::window::Window, data: &'static [u8]) -> bool {
-    if data.len() as u64 > abi::KMOD_MAX {
-        log!("l4h-root: module image of {} bytes ignored", data.len());
-        return false;
-    }
-    let frames = modules.frames();
-    let (start, end) = (data.as_ptr() as usize, data.as_ptr() as usize + data.len());
-    if start % PAGE != 0 {
-        log!("l4h-root: module image at {:#x}: not in whole pages of its boot module, ignored", start);
-        return false;
-    }
-    let rest = end.next_multiple_of(PAGE) - end;
-    // Mapped in the root task with the rest of the module's last page.
-    let tail = unsafe { core::slice::from_raw_parts(end as *const u8, rest) };
-    if tail.iter().any(|&b| b != 0) {
-        // Another module there would be lost, or leak to every guest.
-        let there = modules.iter().any(|m| {
-            let p = m.data.as_ptr() as usize;
-            p < end + rest && end < p + m.data.len()
-        });
-        if there {
-            log!("l4h-root: module image at {:#x} shares its last page, ignored", start);
-            return false;
-        }
-        let last = frames.get(end & !(PAGE - 1)).expect("module image frame");
-        win.with_frame(&abs_of(root_cap::<cap_type::Granule>(last)), |p| unsafe {
-            core::ptr::write_bytes(p.add(PAGE - rest), 0, rest)
-        });
-    }
-    true
 }
 
 /// Map frame `f` (a root slot) at `va` in the root task, for good.

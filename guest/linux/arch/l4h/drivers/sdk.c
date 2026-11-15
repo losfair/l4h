@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * The kernel's module tree (DESIGN.md §5.6): an EROFS image of its
- * /lib/modules, which the host maps read-only into every guest at
- * bootinfo.kmod_va.  It is the read-only block device /dev/l4hkmod, so
- *
- *	mount -t erofs -o ro /dev/l4hkmod /lib/modules
- *
- * gives /lib/modules/$(uname -r)/build the tree to build external modules
- * against. The default kernel builds all shipped drivers in.
+ * The kernel build SDK, shared read-only by all guests (DESIGN.md §5.6).
+ * Mount /dev/l4hsdk on /lib/modules/$(uname -r)/build to build modules.
  */
 #include <linux/bio.h>
 #include <linux/blkdev.h>
@@ -17,7 +11,7 @@
 static const u8 *image;
 static u64 image_size;
 
-static void kmod_submit_bio(struct bio *bio)
+static void sdk_submit_bio(struct bio *bio)
 {
 	u64 off = (u64)bio->bi_iter.bi_sector << SECTOR_SHIFT;
 	struct bvec_iter iter;
@@ -38,12 +32,12 @@ static void kmod_submit_bio(struct bio *bio)
 	bio_endio(bio);
 }
 
-static const struct block_device_operations kmod_fops = {
+static const struct block_device_operations sdk_fops = {
 	.owner = THIS_MODULE,
-	.submit_bio = kmod_submit_bio,
+	.submit_bio = sdk_submit_bio,
 };
 
-static int __init l4h_kmod_init(void)
+static int __init l4h_sdk_init(void)
 {
 	const struct l4h_bootinfo *bi = l4h_bootinfo;
 	struct queue_limits lim = {
@@ -53,11 +47,11 @@ static int __init l4h_kmod_init(void)
 	struct gendisk *disk;
 	int major, err;
 
-	if (!bi->kmod_size)
+	if (!bi->sdk_size)
 		return 0;
-	image = (const u8 *)(unsigned long)bi->kmod_va;
-	image_size = bi->kmod_size;
-	major = register_blkdev(0, "l4hkmod");
+	image = (const u8 *)(unsigned long)bi->sdk_va;
+	image_size = bi->sdk_size;
+	major = register_blkdev(0, "l4hsdk");
 	if (major < 0)
 		return major;
 	disk = blk_alloc_disk(&lim, NUMA_NO_NODE);
@@ -68,9 +62,9 @@ static int __init l4h_kmod_init(void)
 	disk->major = major;
 	disk->first_minor = 0;
 	disk->minors = 1;
-	disk->fops = &kmod_fops;
+	disk->fops = &sdk_fops;
 	disk->flags |= GENHD_FL_NO_PART;
-	strscpy(disk->disk_name, "l4hkmod");
+	strscpy(disk->disk_name, "l4hsdk");
 	set_capacity(disk, image_size >> SECTOR_SHIFT);
 	set_disk_ro(disk, true);
 	err = add_disk(disk);
@@ -78,11 +72,11 @@ static int __init l4h_kmod_init(void)
 		put_disk(disk);
 		goto out_unregister;
 	}
-	pr_info("l4h-kmod: module tree, %llu KiB\n", image_size >> 10);
+	pr_info("l4h-sdk: kernel SDK, %llu KiB\n", image_size >> 10);
 	return 0;
 
 out_unregister:
-	unregister_blkdev(major, "l4hkmod");
+	unregister_blkdev(major, "l4hsdk");
 	return err;
 }
-device_initcall(l4h_kmod_init);
+device_initcall(l4h_sdk_init);

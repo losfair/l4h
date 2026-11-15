@@ -286,8 +286,8 @@ Command & Result \\
   whenever the defconfig changed since, it runs \texttt{defconfig}; edit
   \file{build/linux-l4h/.config} or run, for example,
   \cmd{tools/build-linux.sh menuconfig} to change it. \\
-\cmd{tools/build-kmods.sh} & Builds the guest kernel and its module tree,
-  \file{build/linux-l4h/kmods.erofs} (Section~\ref{sec:kmods}). \\
+\cmd{tools/build-sdk.sh} & Builds the guest kernel and its build SDK,
+  \file{build/linux-l4h/sdk.erofs} (Section~\ref{sec:sdk}). \\
 \cmd{tools/build-host.sh} & Builds \texttt{l4h-vmm}, \texttt{l4h-blkd},
   \texttt{l4h-netd}, \texttt{l4h-vmmgr} (which embeds \texttt{l4h-vmm}) and
   the root task \texttt{l4h-root}, which embeds the others
@@ -382,10 +382,9 @@ dma-buf heaps, evdev and uinput, zram, the legacy iptables that netd uses,
 fs-verity and fscrypt. Those that would change other guests are off unless
 the command line asks for them (Section~\ref{sec:kparams}): an Android
 guest boots with \texttt{lsm=selinux psi=1 bootconfig}. Binder devices
-appear only in a mounted binderfs. The built-in vkms display is enabled
-with \texttt{vkms.enable=1}: it composes in
-software and has no output of its own, so you see it through screen
-capture in the guest, such as scrcpy over adb. The kernel has no suspend
+appear only in a mounted binderfs. The built-in virtio-gpu driver provides
+a display when the VM is created with \texttt{--gpu} (Section~\ref{sec:display}).
+The kernel has no suspend
 and no 32-bit compatibility, so Android needs a 64-bit-only build
 (DESIGN.md \S5.8).
 
@@ -416,51 +415,42 @@ directly and seL4's interface changes between versions: a kernel only works
 with the host it was built with. A different configuration therefore means a
 different host image.
 
-\section{Kernel modules in guests}
-\label{sec:kmods}
+\section{Kernel build SDK}
+\label{sec:sdk}
 
-All shipped drivers are built into Linux, sharing their text and rodata
-between guests. External modules are supported too. The host gives each
-guest a read-only build SDK and built-in driver metadata as the block device
-\file{/dev/l4hkmod}, an EROFS image of \file{/lib/modules}:
+All shipped drivers are built into Linux. The host embeds the build SDK
+and shares it read-only with every guest as \file{/dev/l4hsdk}. It contains
+Kbuild, headers, \file{.config}, \file{Module.symvers} and the l4h ABI
+headers, so users can build and load their own modules:
 \begin{lstlisting}[language=bash]
-mount -t erofs -o ro /dev/l4hkmod /lib/modules
-make -C /lib/modules/$(uname -r)/build M=$PWD  # an external module
+mkdir -p /lib/modules/$(uname -r)/build
+mount -t erofs -o ro /dev/l4hsdk /lib/modules/$(uname -r)/build
+make -C /lib/modules/$(uname -r)/build M=$PWD
 insmod my_module.ko
 \end{lstlisting}
-The build needs a compiler and make in the guest, as on any distribution;
-\texttt{ARCH=l4h} is implied. The tree is shared by all guests, so it
-costs the host its size once. \cmd{tools/build-kmods.sh}
-builds it, and the UEFI application carries it (\texttt{L4H\_GUEST\_KMODS}
-in Table~\ref{tab:env} under QEMU). Without it, there is no
-\file{/dev/l4hkmod}.
-
-The build generates no module signing key or certificate and runs no
-signing step. External unsigned modules load normally; guests booted with
-\texttt{lockdown=integrity} or \texttt{lockdown=confidentiality} reject them.
-
-Modules can also use the l4h interface and seL4 directly: the tree has
-\file{l4h/abi/l4h/abi.h} and the stable guest/provider headers, and the kernel exports its
-capability slots and objects (\texttt{l4h\_slot\_alloc},
-\texttt{l4h\_obj\_alloc}), process address spaces
-(\texttt{l4h\_vspace\_get}) and the vCPUs' state.
-\file{tests/guest/abitest} is an example.
+The build needs a compiler and make in the guest; \texttt{ARCH=l4h} and
+the guest ISA are selected by the SDK. The installer mounts it before
+starting dom0's init. The rest of \file{/lib/modules} stays writable.
+\cmd{tools/build-sdk.sh} builds the SDK. The build generates no signing
+key or certificate and runs no signing step. Guests booted with
+\texttt{lockdown=integrity} or \texttt{lockdown=confidentiality} reject
+unsigned modules.
 
 %======================================================================
 \chapter{Configuring dom0 and the host image}
 \label{ch:dom0}
 
 An l4h host boots from the seL4 kernel, \texttt{l4h-root}, the guest
-kernel and its module tree (Section~\ref{sec:kmods}). dom0's initramfs and
+kernel and its build SDK (Section~\ref{sec:sdk}). dom0's initramfs and
 \file{l4h.conf} are separate files:
 \begin{itemize}
-  \item On a UEFI machine, l4h's UEFI application carries the first four,
+  \item On a UEFI machine, l4h's UEFI application carries the first three,
         and the others sit next to it on the EFI system partition
         (Section~\ref{sec:esp}).
   \item Otherwise, and under QEMU on both x86\_64 and aarch64,
         \cmd{tools/add-modules.py IN.elf OUT.elf NAME=FILE...} appends
         the guest kernel and the others to a built \file{l4h-root.elf},
-        under the names \texttt{guest-kernel}, \texttt{guest-kmods},
+        under the names \texttt{guest-kernel}, \texttt{guest-sdk},
         \texttt{dom0-initrd} and \texttt{l4h-config}. No Rust is rebuilt.
         \cmd{tools/run-qemu.sh} and \cmd{tools/run-qemu-aarch64.sh} do
         this from the variables in Table~\ref{tab:env}.
@@ -479,8 +469,8 @@ Variable & Meaning & Default \\
   \texttt{ARCH=l4h} ELF; strip it with \cmd{objcopy --strip-debug} to keep
   the image small), for the QEMU scripts; for \cmd{tools/mkefi.sh} &
   none; \file{build/linux-l4h/vmlinux} \\
-\texttt{L4H\_GUEST\_KMODS} & its module tree, for the QEMU scripts and
-  \cmd{tools/mkefi.sh} & none; \file{kmods.erofs} next to the kernel \\
+\texttt{L4H\_GUEST\_SDK} & its build SDK, for the QEMU scripts and
+  \cmd{tools/mkefi.sh} & none; \file{sdk.erofs} next to the kernel \\
 \texttt{L4H\_DOM0\_INITRD} & dom0's initramfs, for the QEMU scripts; empty
   for none & none \\
 \texttt{L4H\_CONFIG} & an \file{l4h.conf}, for the QEMU scripts & none \\
@@ -676,7 +666,7 @@ files. Keep it if the installer reports incomplete rollback.
 
 The default is a one-time \texttt{BootNext} selection. Reboot when ready:
 the initramfs locates root by filesystem UUID despite changed disk names,
-mounts the matching module tree read-only over \file{/lib/modules},
+mounts the matching build SDK at \file{/lib/modules/\$(uname -r)/build},
 preserves each uplink's name and MAC, and starts the existing init.
 The distribution's fstab and network configuration are retained. After
 testing, stop workloads, run \cmd{sync}, then \cmd{l4hctl host-reboot}
@@ -771,7 +761,7 @@ the same. There is no measured boot on BIOS (Section~\ref{sec:bios}).
 
 l4h ships as one UEFI application, the same for every host: an EFI wrapper
 containing a standalone GRUB that carries the seL4 kernel,
-\texttt{l4h-root}, the guest kernel and its module tree
+\texttt{l4h-root}, the guest kernel and its build SDK
 (\cmd{tools/mkefi.sh OUT.efi}). It loads dom0's initramfs
 and the settings from the partition selected at boot:
 \begin{lstlisting}
@@ -847,7 +837,7 @@ Linux to check the host CPU.
 \file{l4h-fl4.efi} is an additional x86\_64 release application built with
 the \href{https://github.com/losfair/FL4}{FL4 kernel}. It includes a host and
 ABI provider built against FL4's own libsel4. All release applications share
-the same Linux guest kernel and module tree. FL4 detects
+the same Linux guest kernel and build SDK. FL4 detects
 CPU features at boot and supports single-kernel boots without nested KVM.
 Build it separately with \cmd{L4H\_RELEASE=1 tools/build-fl4-efi.sh}, or
 as part of \cmd{tools/build-efi.sh}. The source revision is pinned in
@@ -861,7 +851,7 @@ tools/mkimage.sh -e l4h-fl4.efi -i dom0.cpio.gz \
 Each tagged release on GitHub carries, for x86\_64:
 \begin{itemize}
   \item all four applications, built in release mode, with their guest kernel
-        and its module tree in them;
+        and its build SDK in them;
   \item \file{l4h-bios-x86\_64.tar.xz}: the seL4 variants for BIOS machines
         (Section~\ref{sec:bios}), with each variant's kernel as
         \file{kernel-VARIANT.elf};
@@ -901,7 +891,7 @@ BIOS GRUB cannot carry l4h in its core image, which must fit in a few
 hundred KiB, so on BIOS l4h's files live on a filesystem GRUB reads.
 \cmd{tools/mkbios.sh OUTDIR [l4h-root.elf] [kernel.elf]} builds them:
 \file{kernel.elf} (seL4), \file{l4h-root.elf}, \file{vmlinux},
-\file{kmods.erofs} and \file{grub.cfg}, the GRUB script that boots them
+\file{sdk.erofs} and \file{grub.cfg}, the GRUB script that boots them
 with multiboot2. They go in \file{bios/} of one directory, which holds
 dom0's files too:
 \begin{lstlisting}
@@ -931,7 +921,7 @@ it will start. They can come from anywhere dom0 can read: its initramfs, a
 disk or the network. The simplest dom0 carries them in its initramfs:
 
 \begin{lstlisting}[language=bash]
-tools/build-kmods.sh                           # the kernel and its module tree
+tools/build-sdk.sh                           # the kernel and its build SDK
 objcopy --strip-debug build/linux-l4h/vmlinux build/vmlinux
 (cd tools/l4hctl && cargo build --release)
 tools/mkinitramfs.sh build/vm.cpio.gz          # a guest: busybox with a shell
@@ -940,7 +930,7 @@ tools/mkinitramfs.sh build/dom0.cpio.gz my-dom0-init \
 tools/build-host.sh
 tools/add-modules.py host/target/x86_64-sel4-roottask/debug/l4h-root.elf \
     build/l4h-root-dom0.elf guest-kernel=build/vmlinux \
-    guest-kmods=build/linux-l4h/kmods.erofs \
+    guest-sdk=build/linux-l4h/sdk.erofs \
     dom0-initrd=build/dom0.cpio.gz l4h-config=my-l4h.conf
 \end{lstlisting}
 where \file{my-l4h.conf} holds, for example, \texttt{dom0\_mem\_mb=512}.
@@ -1815,7 +1805,7 @@ used up its cap; vCPUs that come for the lock after that still spin. The
 Boot a guest with \texttt{nopvspin} on its kernel command line to make its
 vCPUs always spin instead, which avoids the wake-up delay when every vCPU
 has a core to itself and no cap. Modules built for a kernel of the other
-kind do not load: rebuild them (Section~\ref{sec:kmods}).
+kind do not load: rebuild them (Section~\ref{sec:sdk}).
 
 %======================================================================
 \chapter{Recovery and the serial monitor}
@@ -1916,9 +1906,6 @@ default:
   \item[\texttt{bootconfig}] Read the bootconfig appended to the
     initramfs, where Android's boot images put their
     \texttt{androidboot.*} settings.
-  \item[\texttt{vkms.enable=1}] Create a virtual display for software
-    composition and screen capture inside the guest. Leave this off when
-    using a host-provided virtio-gpu display.
 \end{description}
 
 \section{Attestation}
@@ -2097,8 +2084,8 @@ needs 16~GiB. The Debian tests need \cmd{tests/mkdebian.sh} to have run once.
 Test & What it checks \\
 \midrule
 \endhead
-\cmd{run-abitest.sh} & the guest ABI and seL4 extensions, from a module
-  built against the module tree \\
+\cmd{run-abitest.sh} & the guest ABI and seL4 extensions, from a probe
+  built against the SDK \\
 \cmd{run-selftest.sh [vcpus]} & system calls, memory, signals, fork,
   threads, futexes, SMP stress \\
 \cmd{run-objtest.sh} & guest RAM blocks becoming seL4 objects and back

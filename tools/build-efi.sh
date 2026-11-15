@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the shipped l4h UEFI applications, one per seL4 variant plus FL4, into
 # build/efi/l4h-VARIANT.efi. The seL4 variants share their host components,
-# l4h-root and guest kernel with its module tree (dom0's initramfs comes
+# l4h-root and guest kernel with its build SDK (dom0's initramfs comes
 # from the EFI system partition, see tools/mkefi.sh); their seL4 kernels
 # differ in options that seL4 fixes at build time:
 #   generic       x2APIC, PCID: QEMU/KVM and GCE
@@ -21,7 +21,7 @@
 # decode fault addresses from a shipped application; verifiers compute
 # launch digests from vmlinux (l4h-attest.py measure).
 # FL4 has its own microkernel, host and ABI provider (build-fl4-efi.sh),
-# sharing the same Linux guest and module tree,
+# sharing the same Linux guest and build SDK,
 # packaged as l4h-fl4.efi and l4h-debug-fl4-x86_64.tar.xz, without a shim.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -50,7 +50,7 @@ done
 L4H_KERNEL_VARIANT= L4H_VTX=ON "$root/tools/build-kernel.sh" >"$out/kernel.log" 2>&1
 export SEL4_PREFIX=$root/build/sel4
 "$root/tools/build-host.sh"
-"$root/tools/build-kmods.sh" >/dev/null
+"$root/tools/build-sdk.sh" >/dev/null
 debug=$(mktemp -d)
 trap 'rm -rf "$debug"' EXIT
 mkdir "$debug/l4h-debug-x86_64"
@@ -91,11 +91,11 @@ l4h_tar -C "$debug" -cJf "$out/l4h-bios-x86_64.tar.xz" l4h-bios-x86_64
 for f in l4h-debug-x86_64.tar.xz l4h-bios-x86_64.tar.xz; do
     echo "$out/$f: $(( $(stat -c %s "$out/$f") >> 10 )) KiB"
 done
-# Reuse the same Linux kernel and module image; only the host and its small
+# Reuse the same Linux kernel and SDK; only the host and its small
 # embedded ABI provider are rebuilt against FL4.
-guest_hash=$(sha256sum "$root/build/linux-l4h/vmlinux" "$root/build/linux-l4h/kmods.erofs")
+guest_hash=$(sha256sum "$root/build/linux-l4h/vmlinux" "$root/build/linux-l4h/sdk.erofs")
 L4H_GUEST_BUILT=1 "$root/tools/build-fl4-efi.sh"
-if [ "$guest_hash" != "$(sha256sum "$root/build/linux-l4h/vmlinux" "$root/build/linux-l4h/kmods.erofs")" ]; then
-    echo 'FL4 packaging changed the common Linux kernel or module image' >&2
+if [ "$guest_hash" != "$(sha256sum "$root/build/linux-l4h/vmlinux" "$root/build/linux-l4h/sdk.erofs")" ]; then
+    echo 'FL4 packaging changed the common Linux kernel or SDK' >&2
     exit 1
 fi

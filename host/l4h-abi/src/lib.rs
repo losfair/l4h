@@ -5,7 +5,7 @@
 
 #![no_std]
 
-pub const ABI_VERSION: u64 = 9;
+pub const ABI_VERSION: u64 = 10;
 
 pub const ROOT_CNODE_BITS: usize = 12;
 pub const L2_INDEX_BITS: usize = 18;
@@ -83,8 +83,8 @@ pub const fn dev_area_va(d: usize) -> u64 {
     SPECIAL_BASE + 0x1000_0000 + d as u64 * 0x1_0000
 }
 pub const CTL_DATA_VA: u64 = SPECIAL_BASE + 0x2000_0000;
-pub const KMOD_VA: u64 = SPECIAL_BASE + 0x3000_0000;
-pub const KMOD_MAX: u64 = 0x1000_0000;
+pub const SDK_VA: u64 = SPECIAL_BASE + 0x3000_0000;
+pub const SDK_MAX: u64 = 0x1000_0000;
 pub const SPECIAL_END: u64 = SPECIAL_BASE + 0x4000_0000;
 
 pub const PRIO_KERNEL: u64 = 100;
@@ -172,8 +172,8 @@ pub struct BootInfo {
     pub io_pool_size: u64,
     pub boot_blocks: u64,
     pub cpu_id: [u64; 5],
-    pub kmod_va: u64,
-    pub kmod_size: u64,
+    pub sdk_va: u64,
+    pub sdk_size: u64,
     pub hp_gpa: u64,
     pub hp_count: u64,
     pub nr_ept_roots: u64,
@@ -859,7 +859,7 @@ pub mod usb {
     const _: () = assert!(XFER_SQ_OFF + XFER_SQ_SIZE * 2048 == CQ_OFF);
     const _: () = assert!(CQ_OFF + CQ_SIZE * 512 == EQ_OFF);
     const _: () = assert!(EQ_OFF + EQ_SIZE * 32 <= AREA_PAGES * 4096);
-    const _: () = assert!(area_va(MAX_GUEST_USB) <= super::KMOD_VA);
+    const _: () = assert!(area_va(MAX_GUEST_USB) <= super::SDK_VA);
     const _: () = assert!(core::mem::offset_of!(XferReq, segs) == 64);
     const _: () = assert!(core::mem::offset_of!(Cqe, iso) == 64);
     const _: () = assert!(core::mem::offset_of!(Info, usbd_waiting) == 64);

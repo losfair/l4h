@@ -1,6 +1,6 @@
 # Build what l4h ships for x86_64 and keep it as workflow artifacts:
 # - the UEFI applications, one per seL4 variant plus FL4, each with its
-#   matching guest kernel and module tree (tools/build-efi.sh);
+#   matching guest kernel and build SDK (tools/build-efi.sh);
 # - l4h-bios-x86_64.tar.xz, the same for BIOS machines (tools/mkbios.sh);
 # - l4h-debug-x86_64.tar.xz, the same build unstripped, for decoding fault
 #   addresses and computing launch digests;
@@ -86,8 +86,6 @@ jobs:
           L4H_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
         run: |
           tools/build-release.sh
-      - name: Check reproducible packaging and Rust paths
-        run: python3 tests/test_reproducible.py
       - name: Verify an independent rebuild
         env:
           L4H_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}

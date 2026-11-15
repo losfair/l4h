@@ -19,7 +19,7 @@
 #       and /l4h/l4h.conf
 #   -m  a multikernel configuration, copied into /l4h: l4h-mk.conf and
 #       each partition's pN/l4h.conf and pN/dom0/initrd (DESIGN.md §11.4)
-# L4H_SERIAL_PORT, L4H_FB_CONSOLE=1, L4H_GUEST_KERNEL and L4H_GUEST_KMODS
+# L4H_SERIAL_PORT, L4H_FB_CONSOLE=1, L4H_GUEST_KERNEL and L4H_GUEST_SDK
 # go to tools/mkefi.sh and tools/mkbios.sh.  L4H_ESP_MB
 # sizes the partition (default: the payload plus 64 MiB, room for larger
 # dom0 images later).

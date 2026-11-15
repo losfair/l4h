@@ -3,7 +3,7 @@
 # Starts directly at EL1 with virtualization disabled. Set
 # L4H_QEMU_VIRTUALIZATION=on to test the loader's EL2-to-EL1 path.
 # Usage: run-qemu-aarch64.sh <l4h-root.elf> [extra qemu args...]
-# The guest kernel and its module tree (L4H_GUEST_KERNEL, L4H_GUEST_KMODS),
+# The guest kernel and its build SDK (L4H_GUEST_KERNEL, L4H_GUEST_SDK),
 # dom0's initramfs (L4H_DOM0_INITRD) and an l4h.conf (L4H_CONFIG) are
 # appended to a copy of the root ELF (tools/dom0-modules.sh).
 set -euo pipefail

@@ -23,17 +23,16 @@
 #   - the first-stage fstab: the same partitions, without AVB (nothing is
 #     verified: the device is unlocked);
 #   - the first-stage module lists, built for another kernel, with empty
-#     lists and the built-in metadata from <modules dir> (lib/modules/<release>).
+#     lists.
 #     l4h's virtio-gpu driver and its dependencies are built into Linux;
 # and a bootconfig with the vendor's androidboot.* and what Cuttlefish's
 # launcher adds for a guest that renders in software (SwiftShader).
-# Usage: mkandroid.sh <image dir> <modules dir> <out dir>
+# Usage: mkandroid.sh <image dir> <out dir>
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 source "$root/tools/reproducible-env.sh"
 img=$(realpath "$1")
-mods=$(realpath "$2")
-out=$3
+out=$2
 for f in super.img init_boot.img vendor_boot.img; do
     [ -f "$img/$f" ] || { echo "$img/$f: not a Cuttlefish image" >&2; exit 1; }
 done
@@ -62,7 +61,6 @@ EOF
 for name in modules.dep modules.load modules.alias modules.softdep modules.options modules.blocklist; do
     : > "$dir/l4h/lib/modules/$name"
 done
-cp "$mods/modules.builtin" "$mods/modules.builtin.modinfo" "$dir/l4h/lib/modules/"
 # Owned by root, as the ramdisks it overlays are: the kernel applies the
 # owner and mode of a directory that is already there too.
 chmod -R u=rwX,go=rX "$dir/l4h"

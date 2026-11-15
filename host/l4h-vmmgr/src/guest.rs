@@ -311,8 +311,8 @@ pub struct Guest {
     loaded: Ranges,
     /// The launch digest, set at boot (DESIGN.md §10.2).
     pub launch: Option<[u8; 32]>,
-    /// Bytes of the module image mapped at KMOD_VA (kimage.rs), 0 if none.
-    pub kmod_size: usize,
+    /// Bytes of the SDK image mapped at SDK_VA (kimage.rs), 0 if none.
+    pub sdk_size: usize,
     /// Its virtio-gpu's scanout size, if it has one; the display area is
     /// mapped at gpu::self_display_va(id).
     pub gpu: Option<(u32, u32)>,
@@ -865,9 +865,9 @@ impl Guest {
         bi.nr_ept_roots = self.nr_ept_roots as u64;
         bi.provider_va = abi::PROVIDER_VA;
         bi.provider_size = crate::provider::IMAGE.len() as u64;
-        if self.kmod_size != 0 {
-            bi.kmod_va = abi::KMOD_VA;
-            bi.kmod_size = self.kmod_size as u64;
+        if self.sdk_size != 0 {
+            bi.sdk_va = abi::SDK_VA;
+            bi.sdk_size = self.sdk_size as u64;
         }
 
         bi.flags = if self.dom0 { abi::BOOT_DOM0 } else { 0 };
@@ -1164,7 +1164,7 @@ pub fn create(
         attest: false,
         loaded: Ranges::default(),
         launch: None,
-        kmod_size: 0,
+        sdk_size: 0,
         gpu: None,
         hp_gpa,
         hp_count,

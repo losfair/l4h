@@ -330,7 +330,7 @@ class Preflight:
             mount = self.mount(path)
             need(mount["maj:min"] == root_mount["maj:min"] and mount["target"] == "/",
                  path + " must be on the root filesystem, without a separate or bind mount")
-        for path in ("/lib/modules", "/dev", "/proc", "/sys", "/run"):
+        for path in ("/dev", "/proc", "/sys", "/run"):
             need(self.path(path).is_dir(), "missing root directory: " + path)
         need(os.access(self.path("/sbin/init"), os.X_OK), "no executable /sbin/init")
         crypttab = self.path("/etc/crypttab")
@@ -785,7 +785,7 @@ def download_efi(args, plan, dest):
     verify_efi(dest)
 
 
-BIOS_FILES = ("grub.cfg", "l4h-root.elf", "vmlinux", "kmods.erofs")
+BIOS_FILES = ("grub.cfg", "l4h-root.elf", "vmlinux", "sdk.erofs")
 
 
 def unpack_bios(archive, work, variant):

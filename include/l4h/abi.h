@@ -29,7 +29,7 @@ typedef int32_t l4h_s32;
 typedef int64_t l4h_s64;
 #endif
 
-#define L4H_ABI_VERSION 9
+#define L4H_ABI_VERSION 10
 
 /* ------------------------------------------------------------------------
  * Guest CSpace layout
@@ -176,10 +176,10 @@ typedef int64_t l4h_s64;
 #define L4H_CTL_DATA_VA         (L4H_SPECIAL_BASE + 0x20000000ull)
 /* Queue areas of USB controllers (L4H_USB_AREA_VA(n), n < L4H_MAX_GUEST_USB),
  * from L4H_SPECIAL_BASE + 0x28000000. */
-/* The kernel's modules and module build tree, read-only (bootinfo.kmod_size
- * bytes, at most L4H_KMOD_MAX). */
-#define L4H_KMOD_VA             (L4H_SPECIAL_BASE + 0x30000000ull)
-#define L4H_KMOD_MAX            0x10000000ull
+/* The kernel build SDK, read-only (bootinfo.sdk_size
+ * bytes, at most L4H_SDK_MAX). */
+#define L4H_SDK_VA             (L4H_SPECIAL_BASE + 0x30000000ull)
+#define L4H_SDK_MAX            0x10000000ull
 /* First VA above the special region that the guest may never use. */
 #define L4H_SPECIAL_END         (L4H_SPECIAL_BASE + 0x40000000ull)
 
@@ -312,11 +312,10 @@ struct l4h_bootinfo {
 	/* aarch64: the CPU's ID_AA64ISAR0/ISAR1/ISAR2/PFR0/PFR1_EL1, which the
 	 * guest cannot read at EL0; all zero if unknown.  Unused on x86_64. */
 	l4h_u64 cpu_id[5];
-	/* An EROFS image of the guest kernel's /lib/modules: its modules and
-	 * the tree to build more against (<release>/build), shared read-only
-	 * by all guests at kmod_va.  kmod_size is 0 if the host has none. */
-	l4h_u64 kmod_va;
-	l4h_u64 kmod_size;
+	/* The kernel build SDK, shared read-only at sdk_va.
+	 * sdk_size is 0 if the host has none. */
+	l4h_u64 sdk_va;
+	l4h_u64 sdk_size;
 	/* The memory hotplug region (L4H_SLOT_HP): hp_count hotplug blocks
 	 * from hp_gpa (128 MiB aligned, above the I/O pool). */
 	l4h_u64 hp_gpa;

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build l4h's files for BIOS (non-UEFI) machines: the seL4 kernel,
-# l4h-root (with the service ELFs), the guest kernel and its module tree,
+# l4h-root (with the service ELFs), the guest kernel and its build SDK,
 # and grub.cfg, the GRUB script that boots them with multiboot2 (DESIGN.md
 # §11).  BIOS GRUB cannot carry these in its core image as the UEFI
 # application does in its memdisk (tools/mkefi.sh): the core image must fit
@@ -18,7 +18,7 @@
 # (L4H_MKSHIM, default build/mkshim[-VARIANT]).
 # L4H_KERNEL_VARIANT selects a built seL4 variant when kernel.elf is omitted.
 # Usage: mkbios.sh <outdir> [l4h-root.elf] [kernel.elf]
-# L4H_GUEST_KERNEL, L4H_GUEST_KMODS, L4H_SERIAL_PORT and L4H_FB_CONSOLE are
+# L4H_GUEST_KERNEL, L4H_GUEST_SDK, L4H_SERIAL_PORT and L4H_FB_CONSOLE are
 # as for tools/mkefi.sh.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -28,14 +28,14 @@ source "$root/tools/host-profile.sh"
 rootserver=${2:-$root/host/target/x86_64-sel4-roottask/$l4h_profile/l4h-root.elf}
 kernel=${3:-$root/build/sel4${L4H_KERNEL_VARIANT:+-$L4H_KERNEL_VARIANT}/bin/kernel.elf}
 guest_kernel=${L4H_GUEST_KERNEL:-$root/build/linux-l4h/vmlinux}
-guest_kmods=${L4H_GUEST_KMODS-$(dirname "$guest_kernel")/kmods.erofs}
+guest_sdk=${L4H_GUEST_SDK-$(dirname "$guest_kernel")/sdk.erofs}
 mkshim=${L4H_MKSHIM-$root/build/mkshim${L4H_KERNEL_VARIANT:+-$L4H_KERNEL_VARIANT}}
 source "$root/tools/mkshim-grub.sh"
 mkdir -p "$out"
-rm -rf "$out/kmods.erofs" "$out/mk"
+rm -rf "$out/sdk.erofs" "$out/mk"
 mk_stanza=
 if [ -n "$mkshim" ] && [ -f "$mkshim/l4h-mkshim.elf" ]; then
-    mk_stanza=$(mkshim_grub '$l4h/bios/mk' '$l4h/bios/l4h-root.elf' '$l4h/bios/vmlinux' '$l4h/bios/kmods.erofs' '$l4h')
+    mk_stanza=$(mkshim_grub '$l4h/bios/mk' '$l4h/bios/l4h-root.elf' '$l4h/bios/vmlinux' '$l4h/bios/sdk.erofs' '$l4h')
     mkdir -p "$out/mk"
     cp "$mkshim"/l4h-mkshim.elf "$mkshim"/kernel-s*.elf "$out/mk/"
 fi
@@ -66,7 +66,7 @@ $mk_stanza
 multiboot2 "\$l4h/bios/kernel.elf" console_port=\$serial_port debug_port=\$serial_port\$fbcon
 module2 --nounzip "\$l4h/bios/l4h-root.elf"
 module2 --nounzip "\$l4h/bios/vmlinux" guest-kernel
-if [ -f "\$l4h/bios/kmods.erofs" ]; then module2 --nounzip "\$l4h/bios/kmods.erofs" guest-kmods; fi
+if [ -f "\$l4h/bios/sdk.erofs" ]; then module2 --nounzip "\$l4h/bios/sdk.erofs" guest-sdk; fi
 if [ -f "\$l4h/dom0/initrd" ]; then module2 --nounzip "\$l4h/dom0/initrd" dom0-initrd; fi
 if [ -f "\$l4h/l4h.conf" ]; then module2 --nounzip "\$l4h/l4h.conf" l4h-config; fi
 boot
@@ -76,5 +76,5 @@ cp "$kernel" "$out/kernel.elf"
 # seL4 and root load only the segments: drop the debug information.
 objcopy --strip-debug "$rootserver" "$out/l4h-root.elf"
 objcopy --strip-debug "$guest_kernel" "$out/vmlinux"
-[ -n "$guest_kmods" ] && cp "$guest_kmods" "$out/kmods.erofs"
+[ -n "$guest_sdk" ] && cp "$guest_sdk" "$out/sdk.erofs"
 echo "$out: $(( $(du -sk "$out" | cut -f1) )) KiB"

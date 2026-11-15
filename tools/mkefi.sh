@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build l4h as one UEFI application: an EFI wrapper containing a standalone
 # GRUB whose memdisk holds the seL4 kernel, l4h-root, the guest kernel that
-# dom0 and every VM run and its module tree (DESIGN.md §5.6). dom0's
+# dom0 and every VM run and its build SDK (DESIGN.md §5.6). dom0's
 # initramfs and settings come from the partition selected at boot
 # (DESIGN.md §11):
 #   /l4h/dom0/initrd    dom0's initramfs (optional)
@@ -25,8 +25,8 @@
 # L4H_KERNEL_VARIANT selects a built seL4 variant when kernel.elf is omitted.
 # Usage: mkefi.sh <out.efi> [l4h-root.elf] [kernel.elf]
 # L4H_GUEST_KERNEL is the guest kernel (default: build/linux-l4h/vmlinux)
-# and L4H_GUEST_KMODS its module tree (default: kmods.erofs next to it,
-# from tools/build-kmods.sh; empty for none).
+# and L4H_GUEST_SDK its build SDK (default: sdk.erofs next to it,
+# from tools/build-sdk.sh; empty for none).
 # L4H_SERIAL_PORT (default 0x3f8) and L4H_FB_CONSOLE=1 set the defaults of
 # the serial_port and fb_console settings, which l4h.conf overrides.
 # L4H_ACPI_TABLES (.aml files) has GRUB give l4h these ACPI tables too, and
@@ -41,7 +41,7 @@ source "$root/tools/host-profile.sh"
 rootserver=${2:-$root/host/target/x86_64-sel4-roottask/$l4h_profile/l4h-root.elf}
 kernel=${3:-$root/build/sel4${L4H_KERNEL_VARIANT:+-$L4H_KERNEL_VARIANT}/bin/kernel.elf}
 guest_kernel=${L4H_GUEST_KERNEL:-$root/build/linux-l4h/vmlinux}
-guest_kmods=${L4H_GUEST_KMODS-$(dirname "$guest_kernel")/kmods.erofs}
+guest_sdk=${L4H_GUEST_SDK-$(dirname "$guest_kernel")/sdk.erofs}
 mkshim=${L4H_MKSHIM-$root/build/mkshim${L4H_KERNEL_VARIANT:+-$L4H_KERNEL_VARIANT}}
 source "$root/tools/mkshim-grub.sh"
 source "$root/tools/efi-boot-config.sh"
@@ -49,7 +49,7 @@ boot_partition=$(efi_boot_partition)
 mk_stanza= mk_files=()
 if [ -n "$mkshim" ] && [ -f "$mkshim/l4h-mkshim.elf" ]; then
     mk_stanza=$(mkshim_grub "(memdisk)/boot/mk" "(memdisk)/boot/l4h-root.elf" "(memdisk)/boot/vmlinux" \
-        "${guest_kmods:+(memdisk)/boot/kmods.erofs}" '($esp)/l4h')
+        "${guest_sdk:+(memdisk)/boot/sdk.erofs}" '($esp)/l4h')
     mk_stanza="if [ -n \"\$esp\" ]; then
 $mk_stanza
 fi"
@@ -106,7 +106,7 @@ $mk_stanza
 multiboot2 (memdisk)/boot/kernel.elf console_port=\$serial_port debug_port=\$serial_port\$fbcon
 module2 --nounzip (memdisk)/boot/l4h-root.elf
 module2 --nounzip (memdisk)/boot/vmlinux guest-kernel
-${guest_kmods:+module2 --nounzip (memdisk)/boot/kmods.erofs guest-kmods}
+${guest_sdk:+module2 --nounzip (memdisk)/boot/sdk.erofs guest-sdk}
 if [ -n "\$esp" ]; then
     if [ -f "(\$esp)/l4h/dom0/initrd" ]; then module2 --nounzip "(\$esp)/l4h/dom0/initrd" dom0-initrd; fi
     if [ -f "(\$esp)/l4h/l4h.conf" ]; then module2 --nounzip "(\$esp)/l4h/l4h.conf" l4h-config; fi
@@ -124,7 +124,7 @@ CFG
 objcopy --strip-debug "$rootserver" "$work/l4h-root.elf"
 objcopy --strip-debug "$guest_kernel" "$work/vmlinux"
 memdisk=("boot/vmlinux=$work/vmlinux")
-[ -n "$guest_kmods" ] && memdisk+=("boot/kmods.erofs=$guest_kmods")
+[ -n "$guest_sdk" ] && memdisk+=("boot/sdk.erofs=$guest_sdk")
 grub-mkstandalone -O x86_64-efi -o "$work/grub.efi" --compress=xz \
     --modules="part_gpt fat search search_fs_file search_fs_uuid search_label multiboot2 serial terminal normal configfile test regexp echo loadenv efi_gop video video_fb tpm${acpi_cmd:+ acpi}" \
     --locales= --fonts= --themes= \

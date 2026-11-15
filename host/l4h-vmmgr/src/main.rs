@@ -169,9 +169,9 @@ pub struct Vmmgr {
     pub asids: AsidPools,
     pub guests: &'static mut [Option<Guest>; MAX_GUESTS],
     pub cfg: &'static VmmgrConfig,
-    /// The kernel all guests run, and its module image (kimage.rs).
+    /// The kernel all guests run, and its SDK image (kimage.rs).
     pub kernel: Option<kimage::Kernel>,
-    pub kmods: Option<kimage::Kmods>,
+    pub sdk: Option<kimage::Sdk>,
     /// dom0's initramfs, kept for restarts.
     pub dom0_initrd: &'static [u8],
     /// trustd's flags, if it runs.
@@ -242,8 +242,8 @@ impl Vmmgr {
 
     pub fn create_guest(&mut self, cfg: &GuestConfig) -> Option<usize> {
         let kernel = self.kernel.as_ref()?;
-        let kmods = self.kmods.as_ref().map_or(0, |k| k.bytes());
-        let bytes = cfg.ram.checked_add(cfg.io_pool)?.checked_add(kmods)?;
+        let sdk = self.sdk.as_ref().map_or(0, |k| k.bytes());
+        let bytes = cfg.ram.checked_add(cfg.io_pool)?.checked_add(sdk)?;
         if !self.can_afford(bytes, cfg.vspaces + 4 + if self.info.vtx { abi::MAX_EPT_ROOTS } else { 0 }, 0) {
             return None;
         }
@@ -254,7 +254,7 @@ impl Vmmgr {
         if let Ok(g) = &mut g {
             provider::map(g, &mut self.alloc, &mut self.wins.a);
         }
-        if let (Ok(g), Some(k)) = (&mut g, &self.kmods) {
+        if let (Ok(g), Some(k)) = (&mut g, &self.sdk) {
             k.map(g, &mut self.alloc);
         }
         self.alloc.slots.untrack();
@@ -590,7 +590,7 @@ fn main(info: &'static Info) -> ! {
             .inspect_err(|e| l4h_rt::log!("l4h-vmmgr: the guest kernel cannot be loaded: {}", e))
             .ok()
     });
-    let kmods = module(&cfg.kmods).and_then(|m| kimage::Kmods::new(&modules, m));
+    let sdk = module(&cfg.sdk).and_then(|m| kimage::Sdk::new(&modules, m));
     let mut h = Vmmgr {
         info,
         alloc,
@@ -599,7 +599,7 @@ fn main(info: &'static Info) -> ! {
         guests: GUESTS.take(),
         cfg,
         kernel,
-        kmods,
+        sdk,
         dom0_initrd: module(&cfg.dom0_initrd).unwrap_or(&[]),
         flags: root::Flags::new(cfg),
         root_ops: [const { None }; proto::MAX_PENDING],

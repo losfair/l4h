@@ -1,14 +1,6 @@
-//! The guest kernel l4h ships, which every guest runs (the boot module
-//! `guest-kernel`), and its module tree (`guest-kmods`): an EROFS image of
-//! its /lib/modules, with its modules and the tree to build more against,
-//! which every guest maps read-only (DESIGN.md §5.6).
-//!
-//! Both are shared: guests map read-only copies of the boot module's own
-//! frames rather than copies of its bytes.  Root maps the modules into
-//! vmmgr, and gives it a CNode of their frames (`Modules`).  Of the kernel,
-//! that is the RAM blocks of its image that lie wholly in read-only
-//! segments (text and rodata): those blocks have no memory of the guest's
-//! behind them.
+//! The shared guest kernel and its build SDK. Root supplies the boot
+//! modules' frames, so guests share the kernel's read-only blocks and
+//! the read-only SDK without copying their contents (DESIGN.md §5.6).
 
 use sel4::{CapRights, ObjectBlueprint, VmAttributes, cap_type};
 
@@ -122,27 +114,26 @@ impl Kernel {
     }
 }
 
-/// The module image: its boot module's pages, which each guest maps
+/// The build SDK: its boot module's pages, which each guest maps
 /// copies of.
-pub struct Kmods {
+pub struct Sdk {
     data: &'static [u8],
     frames: Modules,
 }
 
-impl Kmods {
-    /// The image in boot module `data`.  Root checked that guests may map
-    /// its last page whole (it cleared what follows the image in it).
+impl Sdk {
+    /// SDK images contain whole pages, so mapping them exposes no tail bytes.
     pub fn new(modules: &Modules, data: &'static [u8]) -> Option<Self> {
         let start = data.as_ptr() as usize;
-        if data.is_empty() || data.len() as u64 > abi::KMOD_MAX || (start..start + data.len()).step_by(PAGE).any(|va| modules.get(va).is_none()) {
-            l4h_rt::log!("l4h-vmmgr: module image at {:#x} of {} bytes ignored", start, data.len());
+        if start % PAGE != 0 || data.len() % PAGE != 0 || data.is_empty() || data.len() as u64 > abi::SDK_MAX || (start..start + data.len()).step_by(PAGE).any(|va| modules.get(va).is_none()) {
+            l4h_rt::log!("l4h-vmmgr: SDK image at {:#x} of {} bytes ignored", start, data.len());
             return None;
         }
         Some(Self { data, frames: *modules })
     }
 
     fn pages(&self) -> usize {
-        self.data.len().div_ceil(PAGE)
+        self.data.len() / PAGE
     }
 
     fn radix(&self) -> usize {
@@ -155,7 +146,7 @@ impl Kmods {
         (32 << self.radix()) + (self.pages().div_ceil(512) + self.pages().div_ceil(512 * 512) + 1) * PAGE
     }
 
-    /// Map the image read-only at KMOD_VA in guest `g`, and record it for
+    /// Map the image read-only at SDK_VA in guest `g`, and record it for
     /// the boot info.  The frame copies are kept in a CNode of the guest's
     /// arena, so destroying the guest deletes them.
     pub fn map(&self, g: &mut Guest, alloc: &mut Alloc) {
@@ -163,14 +154,14 @@ impl Kmods {
         let keep = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: radix });
         let tmp = alloc.slots.alloc();
         for i in 0..self.pages() {
-            let from = self.frames.get(self.data.as_ptr() as usize + i * PAGE).expect("module image frame");
+            let from = self.frames.get(self.data.as_ptr() as usize + i * PAGE).expect("SDK image frame");
             copy_read_only(&from, tmp);
             let frame = self_cap::<cap_type::Granule>(tmp);
-            let (vspace, va) = (g.vspace, abi::KMOD_VA as usize + i * PAGE);
+            let (vspace, va) = (g.vspace, abi::SDK_VA as usize + i * PAGE);
             map_frame(&mut g.ctx(alloc), vspace, frame, va, CapRights::read_only(), VmAttributes::DEFAULT);
-            keep.absolute_cptr_from_bits_with_depth(i as u64, radix).move_(&abs(frame)).expect("keep module image mapping");
+            keep.absolute_cptr_from_bits_with_depth(i as u64, radix).move_(&abs(frame)).expect("keep SDK image mapping");
         }
         alloc.slots.free(tmp);
-        g.kmod_size = self.data.len();
+        g.sdk_size = self.data.len();
     }
 }

@@ -4,7 +4,7 @@
 # l4h as several partitions (DESIGN.md §11.4) when the boot partition has
 # l4h-mk.conf, before the single-kernel lines.  The shim and its slot
 # kernels (tools/build-mkshim.sh) come from GRUB path $1; root, the guest
-# kernel and its module tree are $2, $3 and $4 (empty: none); l4h-mk.conf
+# kernel and its build SDK are $2, $3 and $4 (empty: none); l4h-mk.conf
 # and each partition's dom0 initramfs and l4h.conf come from $5:
 #   $5/l4h-mk.conf          the split (enables multikernel boot)
 #   $5/pN/dom0/initrd       partition N's dom0 initramfs
@@ -12,9 +12,9 @@
 #   $5/dom0/initrd, $5/l4h.conf   for partitions without their own
 # GRUB's own settings (serial port, fb_console) come from $5/l4h.conf, as
 # for one kernel; partition 0 owns the serial port and framebuffer.
-# Usage: mkshim_grub <shim dir> <root> <vmlinux> <kmods> <config dir>
+# Usage: mkshim_grub <shim dir> <root> <vmlinux> <sdk> <config dir>
 mkshim_grub() {
-    local files=$1 rootserver=$2 vmlinux=$3 kmods=$4 conf=$5
+    local files=$1 rootserver=$2 vmlinux=$3 sdk=$4 conf=$5
     cat <<CFG
 if [ -f "$conf/l4h-mk.conf" ]; then
     multiboot2 "$files/l4h-mkshim.elf" console_port=\$serial_port debug_port=\$serial_port\$fbcon
@@ -26,7 +26,7 @@ if [ -f "$conf/l4h-mk.conf" ]; then
     module2 --nounzip "$rootserver" l4h-root
     module2 --nounzip "$vmlinux" guest-kernel
 CFG
-    [ -n "$kmods" ] && echo "    if [ -f \"$kmods\" ]; then module2 --nounzip \"$kmods\" guest-kmods; fi"
+    [ -n "$sdk" ] && echo "    if [ -f \"$sdk\" ]; then module2 --nounzip \"$sdk\" guest-sdk; fi"
     cat <<CFG
     module2 --nounzip "$conf/l4h-mk.conf" l4h-mk.conf
     if [ -f "$conf/dom0/initrd" ]; then module2 --nounzip "$conf/dom0/initrd" dom0-initrd; fi

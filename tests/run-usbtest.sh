@@ -32,15 +32,12 @@ devs="${USBTEST_QEMU_EXTRA:-} -device $hc -device usb-kbd,bus=xhci.0,port=1
     -drive file=$out/usb2.img,if=none,id=u2,format=raw -device usb-storage,bus=xhci.0,port=4.1,drive=u2 -device usb-tablet,bus=xhci.0,port=4.2
     -drive file=$out/usb3.img,if=none,id=u3,format=raw -device usb-uas,bus=xhci.0,port=3,id=uas
     -device scsi-hd,bus=uas.0,scsi-id=0,lun=0,drive=u3"
-# The hostile driver, built against the module tree as a guest would.
+# The hostile driver, built against the local kernel tree.
 "$root/tools/build-linux.sh" vmlinux modules >"$root/build/linux-build.log" 2>&1 \
     || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
-"$root/tools/build-kmods.sh" >/dev/null
-rm -rf "$out/tree" "$out/mod" && mkdir -p "$out/tree" "$out/mod"
-fsck.erofs --extract="$out/tree" "$l4h_linux_out/kmods.erofs" >/dev/null
-kbuild=$out/tree/$(cat "$l4h_linux_out/include/config/kernel.release")/build
+mkdir -p "$out/mod"
 cp "$root"/tests/guest/usbabuse/* "$out/mod/"
-make -s -C "$kbuild" M="$out/mod" modules >"$out/build.log" 2>&1 || { cat "$out/build.log"; exit 1; }
+"$root/tools/build-linux.sh" M="$out/mod" modules >"$out/build.log" 2>&1 || { cat "$out/build.log"; exit 1; }
 "$root/tools/mkinitramfs.sh" "$out/usbvm.cpio.gz" "$root/tests/guest/init-usbvm" "$out/mod/usbabuse.ko" >/dev/null
 "$root/tools/mkinitramfs.sh" "$out/usbtest.cpio.gz" "$root/tests/guest/init-usbtest" \
     "$l4h_ctl" "$out/usbvm.cpio.gz" >/dev/null

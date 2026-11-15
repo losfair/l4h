@@ -2,7 +2,7 @@
 # Boot the seL4 kernel + l4h-root in QEMU. KVM is used only as a fast CPU;
 # VMX is hidden from the guest so seL4 runs exactly as on a cloud VM.
 # Usage: run-qemu.sh <rootserver.elf> [extra qemu args...]
-# The guest kernel and its module tree (L4H_GUEST_KERNEL, L4H_GUEST_KMODS),
+# The guest kernel and its build SDK (L4H_GUEST_KERNEL, L4H_GUEST_SDK),
 # dom0's initramfs (L4H_DOM0_INITRD) and an l4h.conf (L4H_CONFIG) are
 # appended to a copy of the root ELF (tools/dom0-modules.sh).
 set -euo pipefail

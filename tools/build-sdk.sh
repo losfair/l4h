@@ -1,14 +1,8 @@
 #!/usr/bin/env bash
-# Build the guest kernel's build SDK, which every guest gets read-only as
-# /dev/l4hkmod (DESIGN.md §5.6): an EROFS image of its /lib/modules,
-#   <release>/        built-in driver metadata and depmod's files
-#   <release>/build/  the tree to build external modules against: kbuild,
-#                     the headers, .config and Module.symvers, and l4h/abi
-#                     (l4h/abi.h and the provider ABI), so that
-#                     "make -C /lib/modules/$(uname -r)/build M=$PWD" works
-#                     in a guest without further arguments
-# Usage: build-kmods.sh [out.erofs]   (default: kmods.erofs in the kernel
-# build directory, next to vmlinux).  Builds the kernel first.
+# Build the guest kernel SDK, shared read-only as /dev/l4hsdk.
+# The EROFS image contains Kbuild, headers, .config, Module.symvers and
+# l4h/abi, so modules can be built without the kernel source tree.
+# Usage: build-sdk.sh [out.erofs] (default: sdk.erofs next to vmlinux).
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 source "$root/tools/reproducible-env.sh"
@@ -18,16 +12,14 @@ case "$arch" in
     x86_64) host_dir=arch/x86 ;;
     aarch64) host_dir=arch/arm64 ;;
 esac
-out=$(realpath -m "${1:-$l4h_linux_out/kmods.erofs}")
+out=$(realpath -m "${1:-$l4h_linux_out/sdk.erofs}")
 src=$root/build/linux-6.18
 "$root/tools/build-linux.sh" vmlinux modules >"$root/build/linux-build.log" 2>&1 \
     || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
-"$root/tools/build-linux.sh" modules_install INSTALL_MOD_PATH="$stage" INSTALL_MOD_STRIP=1 >/dev/null
 release=$(cat "$l4h_linux_out/include/config/kernel.release")
-tree=$stage/lib/modules/$release/build
-rm -f "$tree"
+tree=$stage/tree
 "$root/tools/build-linux.sh" run-command \
     KBUILD_RUN_COMMAND="\$(srctree)/scripts/package/install-extmod-build $tree" >/dev/null
 # What install-extmod-build leaves out for ARCH=l4h: the headers and
@@ -41,7 +33,7 @@ cp -r "$root/include" "$tree/l4h/abi"
 # Build for ARCH=l4h without saying so: SUBARCH would otherwise come from
 # uname -m, which names arm64 differently.
 {
-    echo "# l4h: external modules for the $arch ARCH=l4h kernel (tools/build-kmods.sh)"
+    echo "# l4h: external modules for the $arch ARCH=l4h kernel (tools/build-sdk.sh)"
     echo "ARCH ?= l4h"
     echo "override SUBARCH := $arch"
     cat "$tree/Makefile"
@@ -56,8 +48,8 @@ rm -f "$tree/scripts/mod/devicetable-offsets.s"
 # erofs-utils. Use independent file extents and verify the complete SDK.
 # EROFS treats SOURCE_DATE_EPOCH as an mtime clamp, so use zero here too.
 SOURCE_DATE_EPOCH=0 mkfs.erofs --quiet --workers=1 -zlzma,level=6 -C1048576 -T0 --all-root \
-    -U 6c346800-6b6d-6f64-0000-000000000000 "$out.new" "$stage/lib/modules"
+    -U 6c346800-7364-6b00-0000-000000000000 "$out.new" "$tree"
 fsck.erofs --extract="$stage/verify" "$out.new" >/dev/null
-diff -qr --no-dereference "$stage/lib/modules" "$stage/verify"
+diff -qr --no-dereference "$tree" "$stage/verify"
 mv "$out.new" "$out"
 echo "$out: $release, $(( $(stat -c %s "$out") >> 10 )) KiB"

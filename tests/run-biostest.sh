@@ -10,7 +10,7 @@ out=$root/build/guest
 mkdir -p "$out"
 "$root/tools/build-linux.sh" vmlinux >"$root/build/linux-build.log" 2>&1 \
     || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
-"$root/tools/build-kmods.sh" >/dev/null
+"$root/tools/build-sdk.sh" >/dev/null
 (cd "$root/tools/l4hctl" && cargo +stable build -q --release)
 "$root/tools/mkinitramfs.sh" "$out/bios.cpio.gz" "$root/tests/guest/init-image" \
     "$root/tools/l4hctl/target/release/l4hctl" "$root/tests/guest/udhcpc.script" >/dev/null
@@ -31,8 +31,7 @@ while kill -0 "$qemu" 2>/dev/null; do
     sleep 1
 done
 wait "$qemu" 2>/dev/null || true
-grep -aE "IMAGETEST|module '|l4h-kmod|dashboard|disk [0-9]|nic [0-9]|memory:|cores:|l4h-root: [0-9]+ core|panic" "$log" || true
-grep -aq "l4h-kmod: module tree" "$log"
+grep -aE "IMAGETEST|module '|dashboard|disk [0-9]|nic [0-9]|memory:|cores:|l4h-root: [0-9]+ core|panic" "$log" || true
 grep -aq "l4h-root: dashboard on 1024x768 framebuffer" "$log"
 grep -aq "IMAGETEST: cmdline .*imagetest=bios" "$log"
 grep -aq "IMAGETEST: network ok" "$log"

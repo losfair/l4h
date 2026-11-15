@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Boot l4h the way GCE does: UEFI firmware, GRUB multiboot2 from the image
 # built by tools/mkimage.sh, NVMe boot disk, virtio-net.  The application
-# holds the guest kernel and its module tree; GRUB loads dom0's initramfs
+# holds the guest kernel and its build SDK; GRUB loads dom0's initramfs
 # and l4h.conf from the EFI partition.
 # UEFI_EFI=app.efi tests a prebuilt application without rebuilding its stack.
 set -euo pipefail
@@ -16,7 +16,7 @@ if [ -n "$efi" ]; then
 else
     "$root/tools/build-linux.sh" vmlinux >"$root/build/linux-build.log" 2>&1 \
         || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
-    "$root/tools/build-kmods.sh" >/dev/null
+    "$root/tools/build-sdk.sh" >/dev/null
     env -u L4H_DOM0_DISKS -u L4H_DOM0_CMDLINE "$root/tools/build-host.sh"
 fi
 (cd "$root/tools/l4hctl" && cargo +stable build -q --release)
@@ -38,8 +38,7 @@ while kill -0 "$qemu" 2>/dev/null; do
     sleep 1
 done
 wait "$qemu" 2>/dev/null || true
-grep -aE "IMAGETEST|module '|l4h-kmod|disk [0-9]|nic [0-9]|memory:|cores:|l4h-root: [0-9]+ core|panic|Boot" "$log" || true
-grep -aq "l4h-kmod: module tree" "$log"
+grep -aE "IMAGETEST|module '|disk [0-9]|nic [0-9]|memory:|cores:|l4h-root: [0-9]+ core|panic|Boot" "$log" || true
 grep -aq "IMAGETEST: cmdline .*imagetest=esp" "$log"
 grep -aq "IMAGETEST: network ok" "$log"
 kernel=seL4
