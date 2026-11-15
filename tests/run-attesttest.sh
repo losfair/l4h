@@ -69,8 +69,8 @@ field "$log" "ATTESTVM: report" "$out/run/vm.report"
 grep -aq "ATTEST: tsm provider l4h" "$log" || fail "no configfs-tsm provider"
 grep -aq "ATTEST: tsm report matches" "$log" || fail "configfs-tsm report differs"
 grep -aq "ATTEST: tsm evidence matches" "$log" || fail "configfs-tsm evidence differs"
-dom0_launch=$(python3 "$attest" measure "$out/run/vmlinux" --initrd "$out/run/boot1.cpio.gz" --cmdline "$cmdline")
-vm_launch=$(python3 "$attest" measure "$out/run/vmlinux" --initrd "$out/run/vm.cpio.gz" --cmdline "$cmdline")
+dom0_launch=$(python3 "$attest" measure "$out/run/vmlinux" --provider "${SEL4_PREFIX:-$root/build/sel4}/guest-provider/provider.bin" --initrd "$out/run/boot1.cpio.gz" --cmdline "$cmdline")
+vm_launch=$(python3 "$attest" measure "$out/run/vmlinux" --provider "${SEL4_PREFIX:-$root/build/sel4}/guest-provider/provider.bin" --initrd "$out/run/vm.cpio.gz" --cmdline "$cmdline")
 ca=$out/tpm/ca/issuercert.pem
 python3 "$attest" verify "$out/run/dom0.report" "$out/run/evidence1" --data "$nonce" \
     --launch "$dom0_launch" --ek-ca "$ca" > "$out/run/dom0.json" || fail "dom0 report"

@@ -4,18 +4,13 @@
  * not need libsel4.  All capability arguments are CPtrs in the guest CSpace
  * (see l4h/abi.h).
  */
-#include "l4h_os.h"
+#include "private.h"
 
 __thread seL4_IPCBuffer *__sel4_ipc_buffer;
 #ifdef CONFIG_KERNEL_INVOCATION_REPORT_ERROR_IPC
 /* libsel4's diagnostic stubs need this even when printing is disabled. */
 __thread char __sel4_print_error;
 #endif
-
-struct l4h_tls_block l4h_tls_blocks[L4H_MAX_VCPUS];
-struct l4h_vcpu l4h_vcpus[L4H_MAX_VCPUS];
-const struct l4h_bootinfo *l4h_bootinfo;
-unsigned long long l4h_tsc_hz;
 
 struct l4h_vcpu *l4h_this_vcpu(void)
 {
@@ -97,9 +92,6 @@ int l4h_obj_bits(int type, int size_bits)
 	}
 	return -1;
 }
-
-const int l4h_pt_level_obj[L4H_NR_PT_LEVELS] = { L4H_OBJ_PT, L4H_OBJ_PD, L4H_OBJ_PDPT };
-const int l4h_pt_level_shift[L4H_NR_PT_LEVELS] = { 21, 30, 39 };
 
 int l4h_retype(unsigned long ut, int type, int size_bits, unsigned long node_index,
 	       int node_depth, unsigned long offset, unsigned long n)
@@ -302,7 +294,7 @@ unsigned long l4h_hypercall(unsigned long label, unsigned long *mrs, int n_in, i
 
 /* Record sequence numbers, shared by the vCPUs: the host prints the
  * records of all rings in this order. */
-static unsigned int console_seq;
+/* The sequence is private to this guest, shared by its vCPUs. */
 
 static void console_put(struct l4h_console_out *r, unsigned int off, const void *src, unsigned int n)
 {
@@ -338,7 +330,7 @@ static unsigned int console_out(const char *s, unsigned int len, int retry)
 		if (room > sizeof(rec))
 			n = len < room - sizeof(rec) ? len : room - (unsigned int)sizeof(rec);
 		if (n) {
-			rec.seq = __atomic_fetch_add(&console_seq, 1, __ATOMIC_RELAXED);
+			rec.seq = __atomic_fetch_add(&l4h_provider_state()->console_seq, 1, __ATOMIC_RELAXED);
 			rec.len = n;
 			console_put(r, head, &rec, sizeof(rec));
 			console_put(r, head + sizeof(rec), s, n);
@@ -399,5 +391,13 @@ void l4h_flush_icache(unsigned long start, unsigned long end)
 		l4h_BUG_ON(seL4_ARM_VSpace_Unify_Instruction(L4H_CPTR(L4H_SLOT_VSPACE), start, start + len));
 		start += len;
 	}
+}
+#endif
+
+#ifndef __aarch64__
+void l4h_flush_icache(unsigned long start, unsigned long end)
+{
+	(void)start;
+	(void)end;
 }
 #endif

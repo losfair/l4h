@@ -2,17 +2,9 @@
 #
 # ARCH=l4h: Linux guest kernel for the l4h hypervisor (derived from ARCH=um).
 #
-# Required on the command line (tools/build-linux.sh sets them):
-#   L4H_SEL4_INCLUDE  libsel4 include directory of the l4h seL4 build
-#   L4H_ABI_INCLUDE   directory containing l4h/abi.h
-# The module build tree that guests get (tools/build-kmods.sh) holds both.
-L4H_SEL4_INCLUDE ?= $(wildcard $(srctree)/l4h/sel4)
+# The kernel only needs the versioned l4h ABI; microkernel headers are
+# confined to guest/provider and never affect Linux's configuration.
 L4H_ABI_INCLUDE ?= $(wildcard $(srctree)/l4h/abi)
-
-# Kconfig tracks this value, including when the selected seL4 headers change.
-# KVM's libsel4 interface exists only with KernelVTX (VT-x and AMD-V).
-export L4H_SEL4_VTX := $(shell grep -Eq '^\#define[[:space:]]+CONFIG_VTX[[:space:]]+1$$' \
-	$(L4H_SEL4_INCLUDE)/kernel/gen_config.h 2>/dev/null && echo y)
 
 SUBARCH ?= x86_64
 ifeq ($(SUBARCH),aarch64)
@@ -24,9 +16,6 @@ ARCH_DIR := arch/l4h
 HOST_DIR := arch/x86
 HEADER_ARCH := x86
 
-ifeq ($(L4H_SEL4_INCLUDE),)
-$(error L4H_SEL4_INCLUDE must point at the libsel4 include directory)
-endif
 ifeq ($(L4H_ABI_INCLUDE),)
 $(error L4H_ABI_INCLUDE must point at the directory containing l4h/abi.h)
 endif
@@ -62,16 +51,6 @@ KBUILD_CPPFLAGS += -I$(srctree)/$(HOST_DIR)/include \
 		   -I$(objtree)/$(HOST_DIR)/include/generated \
 		   -I$(objtree)/$(HOST_DIR)/include/generated/uapi
 
-# Flags for os-sel4: freestanding code built against libsel4 instead of
-# kernel headers (the l4h analogue of UML's USER_CFLAGS).
-SEL4_CFLAGS := -O2 -g -std=gnu11 -ffreestanding -fno-common -fno-strict-aliasing \
-	-fno-stack-protector -fno-pic -fno-pie -mcmodel=large -m64 -mno-red-zone \
-	-mno-sse -mno-mmx -mno-sse2 -mno-avx -fno-asynchronous-unwind-tables \
-	-fno-delete-null-pointer-checks -Wall -Wno-unused-function \
-	-nostdinc -isystem $(shell $(CC) -print-file-name=include) \
-	-I$(L4H_SEL4_INCLUDE) -I$(L4H_ABI_INCLUDE) -I$(srctree)/$(SHARED_HEADERS) \
-	-I$(objtree)/include -D__L4H_OS__
-
 # Host-libc flags, only for the build-time generator x86/user-offsets.c.
 USER_CFLAGS = $(patsubst -I%,,$(filter-out -mcmodel=large -nostdinc -fno-builtin \
 		-D__arch_um__ -D__arch_l4h__,$(KBUILD_CFLAGS))) \
@@ -105,4 +84,4 @@ archclean:
 	$(Q)$(MAKE) -f $(srctree)/Makefile ARCH=$(HEADER_ARCH) clean
 
 endif
-export HEADER_ARCH SUBARCH USER_CFLAGS SEL4_CFLAGS
+export HEADER_ARCH SUBARCH USER_CFLAGS

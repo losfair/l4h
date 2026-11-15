@@ -6,6 +6,7 @@ import importlib.util
 from pathlib import Path
 import unittest
 import sys
+import struct
 
 sys.dont_write_bytecode = True
 from cryptography.hazmat.primitives import hashes
@@ -96,6 +97,22 @@ class Verify(unittest.TestCase):
         rep[2][2] = encode(c)
         with self.assertRaisesRegex(a.Fail, "signature"):
             self.check(rep)
+
+
+class Launch(unittest.TestCase):
+    def test_provider_changes_launch_identity(self):
+        # A minimal ELF with one loadable page. The Linux image, initramfs
+        # and command line stay identical while only its ABI provider changes.
+        kernel = bytearray(128)
+        kernel[:7] = b"\x7fELF\x02\x01\x01"
+        struct.pack_into("<HHIQQQIHHHHHH", kernel, 16,
+                         2, 62, 1, 0x60000078, 64, 0, 0, 64, 56, 1, 0, 0, 0)
+        struct.pack_into("<IIQQQQQQ", kernel, 64,
+                         1, 5, 0, 0x60000000, 0x60000000, 128, 4096, 4096)
+        original = a.launch_digest(kernel, b"initrd", "console=hvc0", b"provider-A")
+        for changed in [b"provider-B", b"provider-A\0"]:
+            with self.subTest(provider=changed):
+                self.assertNotEqual(original, a.launch_digest(kernel, b"initrd", "console=hvc0", changed))
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0
 obj-y := setjmp.o core.o syscalls.o syscall_table.o ptrace.o signal.o vdso.o vma.o neon.o
-$(obj)/user-offsets.s: c_flags = -Wp,-MD,$(depfile) $(SEL4_CFLAGS) -I$(srctree)/include
+$(obj)/user-offsets.s: c_flags = -Wp,-MD,$(depfile) -O2 -ffreestanding -mgeneral-regs-only -I$(srctree)/include
 targets += user-offsets.s
 include/generated/user_constants.h: $(obj)/user-offsets.s FORCE
 	$(call filechk,offsets,__USER_CONSTANT_H__)

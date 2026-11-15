@@ -29,7 +29,7 @@ typedef int32_t l4h_s32;
 typedef int64_t l4h_s64;
 #endif
 
-#define L4H_ABI_VERSION 8
+#define L4H_ABI_VERSION 9
 
 /* ------------------------------------------------------------------------
  * Guest CSpace layout
@@ -162,6 +162,9 @@ typedef int64_t l4h_s64;
 #define L4H_SPECIAL_BASE        0x00007ff000000000ull
 #define L4H_BOOTINFO_VA         L4H_SPECIAL_BASE
 #define L4H_BOOTINFO_SIZE       0x4000ull
+/* Immutable microkernel ABI provider, below the per-vCPU region. */
+#define L4H_PROVIDER_VA         (L4H_SPECIAL_BASE + 0x10000ull)
+#define L4H_PROVIDER_MAX        0xf0000ull
 #define L4H_VCPU_AREA_VA(v)     (L4H_SPECIAL_BASE + 0x100000ull + (l4h_u64)(v) * 0x4000ull)
 #define L4H_VCPU_IPCBUF_VA(v)   (L4H_VCPU_AREA_VA(v) + 0x0000)
 #define L4H_VCPU_EVENT_VA(v)    (L4H_VCPU_AREA_VA(v) + 0x1000)
@@ -319,7 +322,9 @@ struct l4h_bootinfo {
 	l4h_u64 hp_gpa;
 	l4h_u64 hp_count;
 	l4h_u64 nr_ept_roots;     /* L4H_SLOT_EPT_POOL */
-	l4h_u64 reserved[5];
+	l4h_u64 provider_va;
+	l4h_u64 provider_size;
+	l4h_u64 reserved[3];
 	struct l4h_dev_desc devices[L4H_MAX_DEVICES];
 	char cmdline[L4H_CMDLINE_SIZE];
 };

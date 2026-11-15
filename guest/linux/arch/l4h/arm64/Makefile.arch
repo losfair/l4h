@@ -16,12 +16,6 @@ KBUILD_CFLAGS += -mcmodel=large -fno-pic -fno-pie $(CC_FLAGS_NO_FPU) -mno-outlin
 	-fno-builtin -D__arch_um__ -D__arch_l4h__ $(ARCH_INCLUDE) \
 	-Dlongjmp=kernel_longjmp -Dsetjmp=kernel_setjmp
 KBUILD_AFLAGS += $(ARCH_INCLUDE)
-SEL4_CFLAGS := -O2 -g -std=gnu11 -ffreestanding -fno-common -fno-strict-aliasing \
-	-fno-stack-protector -fno-pic -fno-pie -mcmodel=large -mgeneral-regs-only \
-	-mno-outline-atomics -fno-asynchronous-unwind-tables -fno-delete-null-pointer-checks \
-	-Wall -Wno-unused-function -nostdinc -isystem $(shell $(CC) -print-file-name=include) \
-	-I$(L4H_SEL4_INCLUDE) -I$(L4H_ABI_INCLUDE) -I$(srctree)/$(SHARED_HEADERS) \
-	-I$(srctree)/$(ARCH_DIR)/arm64/shared -I$(objtree)/include -D__L4H_OS__
 core-y += $(ARCH_DIR)/arm64/
 # NEON crypto (ARMv8 Crypto Extensions AES, ...), selected per algorithm.
 core-$(CONFIG_CRYPTO) += arch/arm64/crypto/

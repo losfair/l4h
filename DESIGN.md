@@ -325,7 +325,8 @@ x86. aarch64 is the better long-term path to proof coverage.
 `arch/l4h` is derived from `arch/um` and `arch/x86/um`, which provide the
 separate-address-space kernel, x86 signal frames, ptrace, the syscall
 table, software page tables and a batched "TLB sync" to the host. The UML
-host layer (`os-Linux`) is replaced by `os-sel4`, built against libsel4.
+host layer (`os-Linux`) is replaced by `os-sel4`, which calls a mapped
+ABI provider built against the selected microkernel's libsel4.
 The Kconfig keeps `CONFIG_UML` defined, so generic code treats l4h like
 UML. The Linux base is 6.18 LTS.
 
@@ -356,7 +357,7 @@ arch/l4h/
   kernel/   boot, setup, irq, time, smp, process (switch_to), signal glue, ptrace glue
   kernel/   also the software page tables, TLB sync and VSpace mirror (tlb.c, vspace.c)
   kernel/skas/   uaccess, mm context and process/syscall glue
-  os-sel4/  freestanding boot, event and user-thread operations against libsel4
+  os-sel4/  boot and dispatch through the versioned guest ABI provider
   drivers/  virtio_l4h transport, hvc console, l4hctl, attestation, memory hotplug, RTC, RNG, kmod
   include/  kernel, shared and UAPI headers
   x86/      x86_64 signal frames, TLS, syscall table, vDSO and register glue
@@ -724,19 +725,27 @@ arguments, including pool addresses, device indices and lifecycle state.
 
 ### 5.6 One guest kernel, and its module tree
 
-- **l4h ships the guest kernel.** seL4's ABI is not stable: syscall
-  numbers, invocation labels, object types, message layouts and the user
-  context are compiled into `os-sel4` from l4h's seL4 build, and the guest
-  relies on the kernel extensions. A guest kernel only works with the host
-  it was built with, so guests do not bring their own. The UEFI application
-  holds one `vmlinux` (boot module `guest-kernel`), which dom0 and every VM
-  run. `vm_start` takes an initramfs and a command line; vmmgr parses the
-  kernel ELF once, at boot (`kimage.rs`), and loads it itself.
+- **One Linux image across microkernels.** Linux and its module SDK depend
+  only on the versioned l4h ABI (`include/l4h/guest.h`, `provider.h`), not on
+  libsel4. vmmgr embeds an immutable ABI provider built against the selected
+  microkernel's headers (`guest/provider`, `tools/build-guest-provider.sh`),
+  maps it RX at `L4H_PROVIDER_VA` in the guest kernel VSpace, and supplies its
+  address and length in bootinfo. Process VSpaces do not map it. A native C
+  operations table translates object types/sizes, invocations, fault and
+  register layouts, IPC/TLS and FPU transfers. Linux checks the descriptor
+  version, bounds and every required entry before its first call. Slots may
+  be appended within a version; shared structure layouts are fixed. The
+  provider linker refuses writable globals and oversized TLS. All mutable
+  state, including libsel4 TLS, belongs to each guest and vCPU. Linux callbacks
+  run on the caller's stack; calls add no host IPC round trip. The provider
+  bytes are included in the launch digest. KVM stays compiled into the common
+  x86_64 image and is enabled only when the host supplies EPT roots. ABI 9
+  introduces this bootstrap contract; old guest binaries cannot boot it.
 - **Its module tree.** `tools/build-kmods.sh` builds an EROFS image (LZMA,
   about 9 MiB) of the kernel's `/lib/modules`: modules, depmod's files, and
   `<release>/build`, the tree to build external modules against (kbuild's
   `install-extmod-build` plus the headers it misses for `ARCH=l4h`: those
-  outside `arch/l4h/include`, the ISA's own, `abi.h` and libsel4's). Its
+  outside `arch/l4h/include`, the ISA's own and the l4h ABI/provider headers). Its
   `Makefile` sets `ARCH=l4h`, so `make -C /lib/modules/$(uname -r)/build
   M=$PWD` works in a guest. The image is boot module `guest-kmods`, and is
   optional.
@@ -3795,7 +3804,7 @@ into the guest's boot blocks, builds the kernel VSpace and
 `struct l4h_bootinfo`, then starts vCPU0 at the entry point with `rdi`
 (`x0` on aarch64) pointing at boot info. It holds:
 
-- a magic number and the guest ABI version (`L4H_ABI_VERSION`, currently 8);
+- a magic number and the guest ABI version (`L4H_ABI_VERSION`, currently 9);
 - the guest id;
 - RAM size, direct-map base (`ram_base_va`), block and boot-block counts;
 - the kernel's end and the initramfs's GPA and size;
@@ -4095,9 +4104,9 @@ The chain has four links.
    swtpm, start takes 0.4 to 0.6 s; earlier guest requests are answered
    once it is done.
 3. **Reports on guests.** vmmgr measures each guest as it boots it, dom0
-   included. The launch digest is `SHA-256("l4h-launch-v1" ‖ ram_base_va ‖
-   entry ‖ kernel_end ‖ RAM[0, kernel_end) ‖ initrd size ‖ initrd ‖ cmdline
-   length ‖ cmdline)`, with u64 little-endian integers.
+   included. The launch digest is `SHA-256("l4h-launch-v2" ‖ provider_va ‖
+   provider length ‖ provider bytes ‖ ram_base_va ‖ entry ‖ kernel_end ‖
+   RAM[0, kernel_end) ‖ initrd size ‖ initrd ‖ cmdline length ‖ cmdline)`, with u64 little-endian integers.
    - vmmgr reads the image back from guest RAM before the guest starts, and
      `vm_start` fails if dom0 loaded anything outside the initramfs. vmmgr is
      in the host TCB for this: whoever builds a guest can make it run
@@ -4762,7 +4771,8 @@ injects these failures in a host built with `L4H_TEST_INJECT=1`;
   `l4h-xapic-nopcid.efi` (Latitude.sh, below) and `l4h-skim-xapic-nopcid.efi`
   (Meltdown isolation, xAPIC, no PCID). These seL4 variants share one
   `l4h-root`. It also builds `l4h-fl4.efi` with the pinned public FL4
-  kernel and a separately rebuilt host, Linux guest and module tree
+  kernel and a separately rebuilt host and ABI provider, sharing the same
+  Linux guest and module tree
   (`tools/build-fl4-efi.sh`, §14.2). FL4 detects the CPU features at boot;
   one application covers its x86_64 targets, with single-kernel boots
   and no nested KVM.
@@ -5459,7 +5469,7 @@ tests/run-selftest.sh 4               # build Linux + host, boot a 4-vCPU guest 
 ```
 
 To build without seL4's VT-x/AMD-V support for development, select a
-separate kernel and use its headers for both the host and Linux guest:
+separate kernel and use its headers for the host and embedded ABI provider:
 
 ```sh
 L4H_VTX=OFF L4H_KERNEL_VARIANT=no-vtx tools/build-kernel.sh
@@ -5468,10 +5478,9 @@ tools/build-host.sh
 L4H_KERNEL_VARIANT=no-vtx tests/run-selftest.sh 4
 ```
 
-`SEL4_PREFIX` also selects the headers copied into the guest module tree.
-The Linux build disables KVM when these headers lack `CONFIG_VTX`.
-Rebuild both host and guest when changing this option: seL4's invocation
-labels differ. The shipped configurations still use `KernelVTX=ON`;
+`SEL4_PREFIX` selects the host and ABI provider's libsel4 headers. Linux
+and the module SDK are unchanged when this option changes; KVM checks the
+host's EPT roots at runtime. The shipped configurations still use `KernelVTX=ON`;
 `no-vtx` is not a release variant. `tests/run-novtxtest.sh` builds this
 development kernel and runs the guest self-test with 1 and 4 vCPUs.
 
@@ -5495,9 +5504,10 @@ them in `build/sel4-fl4`, and records the source commit in `fl4-revision`.
 FL4's own syscall XML is installed unchanged; the bindings use FL4's
 MCS syscall numbers.
 
-Rebuild the host, Linux guest and modules with this `SEL4_PREFIX`;
-FL4 is source compatible with the seL4 API, with different numbering and
-object sizes. The host uses the selected kernel's retype fan-out limit
+Rebuild the host with this `SEL4_PREFIX`; its build also compiles the small
+ABI provider against FL4's libsel4. Linux and modules remain byte-identical
+to their seL4 builds. FL4 is source compatible with the seL4 API; the provider
+handles configuration-dependent invocation numbering and object sizes. The host uses the selected kernel's retype fan-out limit
 (256 on FL4). The guest's FPU scratch area starts after the 1 KiB IPC
 buffer, leaving 3 KiB for FL4's 2696-byte standard XSAVE image.
 Multikernel partitions and nested KVM are unavailable on FL4. It detects
@@ -5506,8 +5516,11 @@ variants do not apply.
 
 `L4H_RELEASE=1 tools/build-fl4-efi.sh` builds `build/efi/l4h-fl4.efi` and
 its matching `l4h-debug-fl4-x86_64.tar.xz`; `build-efi.sh` builds them after
-packaging the three seL4 variants. Each stack uses its own libsel4 headers,
-and the FL4 application carries no multikernel shim. To make a UEFI disk
+packaging the three seL4 variants. Each host/provider uses its own libsel4
+headers; all four applications carry the same Linux/module image. The FL4
+application carries no multikernel shim. Both debug archives include their
+matching `guest-provider.bin` and `guest-provider.elf`; use the binary with
+`l4h-attest.py measure --provider` and the ELF to decode provider faults. To make a UEFI disk
 from the release binary, use `tools/mkimage.sh -e build/efi/l4h-fl4.efi
 -i dom0.cpio.gz -c l4h.conf build/l4h-fl4.raw`.
 
@@ -5516,8 +5529,8 @@ from the release binary, use `tools/mkimage.sh -e build/efi/l4h-fl4.efi
 With `L4H_RELEASE=1` it also runs the ABI/module-tree test: FL4's debug
 profile omits l4h's debug-syscall MCP filter, so the ABI test's deliberate
 untrapped `DebugHalt` probe requires FL4's release profile.
-Release CI runs this suite and boots the packaged `l4h-fl4.efi` through
-OVMF with `UEFI_EFI=build/efi/l4h-fl4.efi tests/run-uefitest.sh`, checking
+Integration CI runs this suite and boots its packaged `l4h-fl4.efi` through
+OVMF with `UEFI_EFI=build/l4h-fl4.efi tests/run-uefitest.sh`, checking
 the module tree and dom0 networking. The tested revision includes upstream
 fixes for [INT gates](https://github.com/losfair/FL4/issues/1),
 [device alignment](https://github.com/losfair/FL4/issues/2),

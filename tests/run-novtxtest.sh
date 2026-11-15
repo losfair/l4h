@@ -12,8 +12,12 @@ if grep -q '^#define CONFIG_VTX ' "$SEL4_PREFIX/libsel4/include/kernel/gen_confi
 fi
 for vcpus in 1 4; do
     "$root/tests/run-selftest.sh" "$vcpus"
-    if grep -q '^CONFIG_KVM=y$' "$root/build/linux-l4h/.config"; then
-        echo 'NOVTXTEST: FAIL (Linux KVM enabled without KernelVTX)' >&2
+    if ! grep -q '^CONFIG_KVM=y$' "$root/build/linux-l4h/.config"; then
+        echo 'NOVTXTEST: FAIL (common Linux image lost KVM support)' >&2
+        exit 1
+    fi
+    if ! grep -aq 'no VT-x or AMD-V on this host' "$root/build/qemu.log"; then
+        echo 'NOVTXTEST: FAIL (KVM was not disabled at runtime)' >&2
         exit 1
     fi
     if grep -aq 'Untyped Retype: VT-x is not available' "$root/build/qemu.log"; then

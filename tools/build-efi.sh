@@ -20,7 +20,8 @@
 # kernel-VARIANT-sK.elf, the shim and the guest kernel, vmlinux), to
 # decode fault addresses from a shipped application; verifiers compute
 # launch digests from vmlinux (l4h-attest.py measure).
-# FL4 has its own kernel, host, guest and module tree (build-fl4-efi.sh),
+# FL4 has its own microkernel, host and ABI provider (build-fl4-efi.sh),
+# sharing the same Linux guest and module tree,
 # packaged as l4h-fl4.efi and l4h-debug-fl4-x86_64.tar.xz, without a shim.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -55,6 +56,8 @@ mkdir "$debug/l4h-debug-x86_64"
 cp "$root/host/target/x86_64-sel4-roottask/$l4h_profile/l4h-root.elf" \
     "$root"/host/target/x86_64-sel4/$l4h_profile/l4h-{vmmgr,vmm,blkd,netd,trustd,memd,logd,usbd}.elf \
     "$root/build/linux-l4h/vmlinux" "$debug/l4h-debug-x86_64/"
+cp "$SEL4_PREFIX/guest-provider/provider.bin" "$debug/l4h-debug-x86_64/guest-provider.bin"
+cp "$SEL4_PREFIX/guest-provider/provider.elf" "$debug/l4h-debug-x86_64/guest-provider.elf"
 for v in "${variants[@]}"; do
     read -r name _ <<<"$v"
     # mkefi.sh leaves multikernel boot out when the shim is missing: every
@@ -87,6 +90,11 @@ tar -C "$debug" -cJf "$out/l4h-bios-x86_64.tar.xz" l4h-bios-x86_64
 for f in l4h-debug-x86_64.tar.xz l4h-bios-x86_64.tar.xz; do
     echo "$out/$f: $(( $(stat -c %s "$out/$f") >> 10 )) KiB"
 done
-# FL4 renumbers the API and uses a different guest kernel and module tree.
-# Package the seL4 builds first, then rebuild the entire stack for FL4.
-"$root/tools/build-fl4-efi.sh"
+# Reuse the same Linux kernel and module image; only the host and its small
+# embedded ABI provider are rebuilt against FL4.
+guest_hash=$(sha256sum "$root/build/linux-l4h/vmlinux" "$root/build/linux-l4h/kmods.erofs")
+L4H_GUEST_BUILT=1 "$root/tools/build-fl4-efi.sh"
+if [ "$guest_hash" != "$(sha256sum "$root/build/linux-l4h/vmlinux" "$root/build/linux-l4h/kmods.erofs")" ]; then
+    echo 'FL4 packaging changed the common Linux kernel or module image' >&2
+    exit 1
+fi

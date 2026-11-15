@@ -7,8 +7,9 @@
 # AMD EPYC 4004 series; seL4 otherwise stops in its first boot checks.
 # L4H_SKIM_WINDOW=ON isolates kernel mappings on Meltdown-affected CPUs
 # (the kernel then leaves VT-x off at runtime, patch 0038).
-# L4H_VTX=OFF omits VT-x/AMD-V support for development builds. Host and
-# guest binaries must then be rebuilt against that build's libsel4.
+# L4H_VTX=OFF omits VT-x/AMD-V support for development builds. Rebuild the
+# host and embedded ABI provider against that build's libsel4. Linux and
+# modules are shared by all microkernel configurations.
 # L4H_KERNEL_VARIANT=NAME builds in build/kernel-NAME and installs to
 # build/sel4-NAME instead, leaving the default build alone
 # (tools/build-efi.sh builds the shipped variants so).

@@ -20,6 +20,7 @@ mod ctl_failure;
 mod gpu;
 mod guest;
 mod kimage;
+mod provider;
 mod layout;
 mod memd;
 mod root;
@@ -250,6 +251,9 @@ impl Vmmgr {
         self.alloc.slots.track(id);
         let asids = self.asids.in_use;
         let mut g = guest::create(id, cfg, &mut self.alloc, &mut self.asids, &self.info, kernel);
+        if let Ok(g) = &mut g {
+            provider::map(g, &mut self.alloc, &mut self.wins.a);
+        }
         if let (Ok(g), Some(k)) = (&mut g, &self.kmods) {
             k.map(g, &mut self.alloc);
         }

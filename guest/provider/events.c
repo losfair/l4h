@@ -10,7 +10,7 @@
  * while running kernel code, at the points where interrupts are re-enabled.
  * Detection there is a few memory reads; only real events cost a syscall.
  */
-#include "l4h_os.h"
+#include "private.h"
 
 unsigned long long l4h_rdtsc(void)
 {

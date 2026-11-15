@@ -2,7 +2,8 @@
 /*
  * seL4 VCPUs and EPT, for arch/l4h/kvm (x86_64).
  */
-#include "l4h_os.h"
+#include "private.h"
+#if defined(__x86_64__) && defined(CONFIG_VTX)
 #include <sel4/arch/vmenter.h>
 
 int l4h_vcpu_set_tcb(unsigned long vcpu, unsigned long tcb)
@@ -144,3 +145,127 @@ int l4h_ept_map_frame(unsigned long frame, unsigned long ept, unsigned long gpa,
 	return seL4_X86_Page_MapEPT(frame, ept, gpa, writable ? seL4_ReadWrite : seL4_CanRead,
 				    seL4_X86_EPT_Default_VMAttributes);
 }
+
+#else
+/* Every slot exists, including on providers without nested virtualization. */
+
+int l4h_vcpu_set_tcb(unsigned long vcpu, unsigned long tcb)
+{
+	(void)vcpu;
+	(void)tcb;
+	return seL4_IllegalOperation;
+}
+
+int l4h_tcb_set_ept(unsigned long tcb, unsigned long ept)
+{
+	(void)tcb;
+	(void)ept;
+	return seL4_IllegalOperation;
+}
+
+unsigned long l4h_vcpu_read(unsigned long vcpu, unsigned long field, int *err)
+{
+	(void)vcpu;
+	(void)field;
+	(void)err;
+	*err = seL4_IllegalOperation;
+	return 0;
+}
+
+int l4h_vcpu_write(unsigned long vcpu, unsigned long field, unsigned long value)
+{
+	(void)vcpu;
+	(void)field;
+	(void)value;
+	return seL4_IllegalOperation;
+}
+
+int l4h_vcpu_read_msr(unsigned long vcpu, unsigned long msr, unsigned long *value)
+{
+	(void)vcpu;
+	(void)msr;
+	(void)value;
+	return seL4_IllegalOperation;
+}
+
+int l4h_vcpu_write_msr(unsigned long vcpu, unsigned long msr, unsigned long value)
+{
+	(void)vcpu;
+	(void)msr;
+	(void)value;
+	return seL4_IllegalOperation;
+}
+
+int l4h_vcpu_write_cr2(unsigned long vcpu, unsigned long value)
+{
+	(void)vcpu;
+	(void)value;
+	return seL4_IllegalOperation;
+}
+
+int l4h_vcpu_write_xcr0(unsigned long vcpu, unsigned long long value)
+{
+	(void)vcpu;
+	(void)value;
+	return seL4_IllegalOperation;
+}
+
+int l4h_vcpu_flush_tlb(unsigned long vcpu)
+{
+	(void)vcpu;
+	return seL4_IllegalOperation;
+}
+
+int l4h_vcpu_read_vmcb(unsigned long vcpu, unsigned long offset, unsigned long count, unsigned long *words)
+{
+	(void)vcpu;
+	(void)offset;
+	(void)count;
+	(void)words;
+	return seL4_IllegalOperation;
+}
+
+int l4h_vcpu_write_vmcb(unsigned long vcpu, unsigned long offset, unsigned long value, unsigned long *written)
+{
+	(void)vcpu;
+	(void)offset;
+	(void)value;
+	(void)written;
+	return seL4_IllegalOperation;
+}
+
+int l4h_vcpu_write_regs(unsigned long vcpu, const unsigned long *gp)
+{
+	(void)vcpu;
+	(void)gp;
+	return seL4_IllegalOperation;
+}
+
+void l4h_vcpu_enter(struct l4h_vmexit *x, unsigned long rip, unsigned long controls, unsigned long intr_info)
+{
+	(void)x;
+	(void)rip;
+	(void)controls;
+	(void)intr_info;
+	panic("l4h: ABI provider does not support nested KVM\n");
+}
+
+int l4h_ept_map_table(int level, unsigned long table, unsigned long ept, unsigned long gpa)
+{
+	(void)level;
+	(void)table;
+	(void)ept;
+	(void)gpa;
+	return seL4_IllegalOperation;
+}
+
+int l4h_ept_map_frame(unsigned long frame, unsigned long ept, unsigned long gpa, int writable)
+{
+	(void)frame;
+	(void)ept;
+	(void)gpa;
+	(void)writable;
+	return seL4_IllegalOperation;
+}
+
+#endif

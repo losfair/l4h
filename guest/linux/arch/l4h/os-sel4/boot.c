@@ -26,7 +26,8 @@ static void vcpu_enter(int cpu)
 
 	t->vcpu = &l4h_vcpus[cpu];
 	t->cpu = cpu;
-	__sel4_ipc_buffer = l4h_vcpus[cpu].ipcbuf;
+	t->provider = &l4h_provider_context;
+	l4h_provider_ops->l4h_provider_init_cpu();
 	l4h_vcpus[cpu].online = 1;
 }
 
@@ -36,6 +37,7 @@ void l4h_boot(const struct l4h_bootinfo *bi)
 {
 	int cpu;
 
+	l4h_provider_setup(bi);
 	l4h_bootinfo = bi;
 	for (cpu = 0; cpu < L4H_MAX_VCPUS; cpu++)
 		vcpu_init_struct(cpu);
@@ -57,28 +59,4 @@ void l4h_secondary_boot(long cpu)
 	l4h_tls()->current = l4h_vcpus[cpu].start_task;
 	l4h_vcpus[cpu].start_fn((int)cpu);
 	l4h_power(L4H_POWER_CRASH);
-}
-
-extern char l4h_secondary_entry[];
-
-int l4h_start_vcpu(int cpu, unsigned long sp, void (*fn)(int cpu), void *task)
-{
-	struct l4h_vcpu *v = &l4h_vcpus[cpu];
-	seL4_UserContext regs = { 0 };
-
-	if (cpu <= 0 || (unsigned long)cpu >= l4h_bootinfo->nr_vcpus)
-		return -1;
-	v->start_task = task;
-	v->start_fn = fn;
-	v->start_sp = sp;
-#ifdef __aarch64__
-	regs.pc = (seL4_Word)l4h_secondary_entry;
-	regs.sp = sp;
-	regs.x0 = cpu;
-#else
-	regs.rip = (seL4_Word)l4h_secondary_entry;
-	regs.rsp = sp;
-	regs.rdi = cpu;
-#endif
-	return seL4_TCB_WriteRegisters(v->ktcb, 1, 0, sizeof(regs) / sizeof(seL4_Word), &regs);
 }
