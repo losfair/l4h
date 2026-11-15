@@ -12,6 +12,7 @@ debug=ON
 [ "${L4H_RELEASE:-0}" = 1 ] && debug=OFF
 cmake -DCMAKE_C_FLAGS="$l4h_prefix_map" -DCMAKE_ASM_FLAGS="$l4h_prefix_map" -G Ninja -S "$root/kernel/fl4" -B "$out" \
     -DFL4_SOURCE="$src" \
+    -DCARGO="$root/tools/cargo-fl4.sh" \
     -C "$root/kernel/configs/l4h-x86_64.cmake" \
     -DKernelVTX=OFF -DKernelDebugBuild="$debug" \
     -DKernelRetypeFanOutLimit=256 \

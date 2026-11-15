@@ -5460,6 +5460,8 @@ compiler; the host and shim have their own nightly pins. Cargo uses the
 checked-in lockfiles. `tools/cargo.sh` pins a newer Cargo build tool with
 the [fix for external path dependency hashes](https://github.com/rust-lang/cargo/commit/20319b9c23978ba630b838654378beccab20ec83)
 and enables `trim-paths`, while retaining the existing Rust compilers.
+FL4's CMake/Cargo build uses the stable compiler pinned in
+`kernel/fl4/rust-toolchain.toml` through `tools/cargo-fl4.sh`.
 Python dependencies are pinned in
 `tools/sel4-requirements.txt`, and downloaded sources have checksums in
 `tools/source-pins.sh`. Use the container and apt sources specified in
