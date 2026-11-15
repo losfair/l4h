@@ -54,9 +54,10 @@ mv "$tree/Makefile.new" "$tree/Makefile"
 find "$tree" -name '.*.cmd' -delete
 rm -f "$tree/scripts/mod/devicetable-offsets.s"
 # Reproducible: the image is part of the measured UEFI application.
-# Fragment packing must not depend on compression worker scheduling.
+# Shared fragment/tail packing can corrupt signed module tails with the
+# pinned erofs-utils. Use independent file extents and verify their bytes.
 # EROFS treats SOURCE_DATE_EPOCH as an mtime clamp, so use zero here too.
-SOURCE_DATE_EPOCH=0 mkfs.erofs --quiet --workers=1 -zlzma,level=6 -C1048576 -Eall-fragments,ztailpacking -T0 --all-root \
+SOURCE_DATE_EPOCH=0 mkfs.erofs --quiet --workers=1 -zlzma,level=6 -C1048576 -T0 --all-root \
     -U 6c346800-6b6d-6f64-0000-000000000000 "$out.new" "$stage/lib/modules"
 python3 "$root/tools/module-signing.py" verify-image "$stage/lib/modules" "$out.new"
 mv "$out.new" "$out"
