@@ -90,6 +90,18 @@ class ReproducibleTest(unittest.TestCase):
             binaries.append((app / "target/release/app").read_bytes())
         self.assertTrue(binaries[0] == binaries[1], "Rust output differs between checkout paths")
 
+    @unittest.skipUnless(shutil.which("rustc") and shutil.which("gcc"), "needs Rust and GCC")
+    def test_rust_host_linker_accepts_a_multiword_compiler(self):
+        cache = self.work / "ccache"
+        cache.write_text('#!/bin/sh\nexec "$@"\n')
+        cache.chmod(0o755)
+        source, binary = self.work / "host.rs", self.work / "host"
+        source.write_text('fn main() {}\n')
+        env = dict(self.env, PATH=f"{self.work}:{self.env['PATH']}", L4H_LINUX_CC="ccache gcc")
+        subprocess.run(["rustc", "+stable", str(source), "-C", f"linker={ROOT / 'tools/linux-cc.sh'}",
+                        "-o", str(binary)], check=True, env=env, capture_output=True)
+        subprocess.run([str(binary)], check=True)
+
     @unittest.skipUnless(shutil.which("openssl"), "needs OpenSSL")
     def test_replay_prepares_only_a_public_certificate(self):
         original, replay = self.work / "original", self.work / "replay"

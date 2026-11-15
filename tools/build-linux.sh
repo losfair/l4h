@@ -114,12 +114,12 @@ if [ "$arch" = aarch64 ]; then
 fi
 # L4H_LINUX_CC overrides the compiler, e.g. "ccache gcc" in CI.
 if [ -n "${L4H_LINUX_CC:-}" ]; then
-    mk+=(CC="$L4H_LINUX_CC")
+    mk+=(CC="$root/tools/linux-cc.sh")
     # A native compiler wrapped in ccache is still the host compiler.
     # Keep the commands equal so SDK installation does not cross-rebuild
     # host programs in its randomly named staging directory.
     if [ "$arch" = x86_64 ] && [ "$(uname -m)" = x86_64 ]; then
-        mk+=(HOSTCC="${HOSTCC:-$L4H_LINUX_CC}")
+        mk+=(HOSTCC="${HOSTCC:-$root/tools/linux-cc.sh}")
     fi
 fi
 # Regenerate the config when the defconfig changed.
