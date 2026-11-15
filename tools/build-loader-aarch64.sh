@@ -24,7 +24,7 @@ if [ "$(cat "$stamp" 2>/dev/null)" != "$want" ]; then
     echo "$want" > "$stamp"
 fi
 cd "$rs"
-CC=aarch64-linux-gnu-gcc SEL4_PREFIX=$root/build/sel4-aarch64 cargo build "${l4h_cargo[@]}" -q \
+CC=aarch64-linux-gnu-gcc SEL4_PREFIX=$root/build/sel4-aarch64 "$root/tools/cargo.sh" build "${l4h_cargo[@]}" -q \
     -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem \
     --target aarch64-unknown-none --release -p sel4-kernel-loader --target-dir "$root/build/loader-target"
-cargo build "${l4h_cargo[@]}" -q --release -p sel4-kernel-loader-add-payload --target-dir "$root/build/loader-target"
+"$root/tools/cargo.sh" build "${l4h_cargo[@]}" -q --release -p sel4-kernel-loader-add-payload --target-dir "$root/build/loader-target"

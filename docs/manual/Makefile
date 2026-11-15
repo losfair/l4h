@@ -12,7 +12,7 @@ l4h-manual.pdf: l4h-manual.tex version.tex
 
 # Rewritten only when the version changes, so latexmk reruns only then.
 version.tex: FORCE
-	@v='\newcommand{\lfourhversion}{\detokenize{$(VERSION)}}'; \
+	@v='\newcommand{\lfourhversion}{\detokenize{$(VERSION)}}% source date $(SOURCE_DATE_EPOCH)'; \
 	[ "$$(cat $@ 2>/dev/null)" = "$$v" ] || printf '%s\n' "$$v" > $@
 
 clean:

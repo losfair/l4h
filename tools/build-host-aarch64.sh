@@ -24,7 +24,7 @@ strip() {
 nicds=(virtio gvnic ena ixgbe e1000e mlx5 r8125)
 nicd_pkgs=()
 for d in "${nicds[@]}"; do nicd_pkgs+=(-p "l4h-nicd-$d"); done
-cargo build "${l4h_cargo[@]}" -q "${l4h_cargo_profile[@]}" --target aarch64-sel4 -p l4h-vmm -p l4h-blkd -p l4h-netd -p l4h-trustd -p l4h-memd -p l4h-logd -p l4h-usbd \
+"$root/tools/cargo.sh" build "${l4h_cargo[@]}" -q "${l4h_cargo_profile[@]}" --target aarch64-sel4 -p l4h-vmm -p l4h-blkd -p l4h-netd -p l4h-trustd -p l4h-memd -p l4h-logd -p l4h-usbd \
     "${nicd_pkgs[@]}"
 strip vmm blkd netd trustd memd logd usbd "${nicds[@]/#/nicd-}"
 drivers=()
@@ -35,6 +35,6 @@ python3 "$root/tools/mkdrivers.py" "$out/stripped/l4h-drivers.bin.new" "${driver
 cmp -s "$out/stripped/l4h-drivers.bin.new" "$out/stripped/l4h-drivers.bin" \
     && rm "$out/stripped/l4h-drivers.bin.new" || mv "$out/stripped/l4h-drivers.bin.new" "$out/stripped/l4h-drivers.bin"
 export L4H_DRIVERS_BIN=$out/stripped/l4h-drivers.bin
-cargo build "${l4h_cargo[@]}" -q "${l4h_cargo_profile[@]}" --target aarch64-sel4 -p l4h-vmmgr
+"$root/tools/cargo.sh" build "${l4h_cargo[@]}" -q "${l4h_cargo_profile[@]}" --target aarch64-sel4 -p l4h-vmmgr
 strip vmmgr
-cargo build "${l4h_cargo[@]}" -q "${l4h_cargo_profile[@]}" --target aarch64-sel4-roottask -p l4h-root "$@"
+"$root/tools/cargo.sh" build "${l4h_cargo[@]}" -q "${l4h_cargo_profile[@]}" --target aarch64-sel4-roottask -p l4h-root "$@"

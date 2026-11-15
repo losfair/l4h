@@ -20,8 +20,7 @@ case " ${CFLAGS:-} " in
     *" $l4h_prefix_map "*) ;;
     *) export CFLAGS="${CFLAGS:+$CFLAGS }$l4h_prefix_map" ;;
 esac
-# Command-line config arrays extend the crate's flags (in particular the
-# shim's linker script and the host's -Zunstable-options).
+# Config arrays extend each crate's existing compiler and linker flags.
 l4h_cargo=(--locked --config "build.rustflags=$(python3 - "$root" "${CARGO_HOME:-$HOME/.cargo}" "${RUSTUP_HOME:-$HOME/.rustup}" <<'PY'
 import json, sys
 print(json.dumps([f"--remap-path-prefix={path}={dest}" for path, dest in

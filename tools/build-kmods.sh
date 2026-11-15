@@ -49,8 +49,15 @@ cp -r "$root/include" "$tree/l4h/abi"
     cat "$tree/Makefile"
 } >"$tree/Makefile.new"
 mv "$tree/Makefile.new" "$tree/Makefile"
+# The extra headers copied above bring back kbuild's local command records.
+# The generated assembly is an intermediate for devicetable-offsets.h.
+find "$tree" -name '.*.cmd' -delete
+rm -f "$tree/scripts/mod/devicetable-offsets.s"
 # Reproducible: the image is part of the measured UEFI application.
-mkfs.erofs --quiet -zlzma,level=6 -C1048576 -Eall-fragments,ztailpacking -T0 --all-root \
+# Fragment packing must not depend on compression worker scheduling.
+# EROFS treats SOURCE_DATE_EPOCH as an mtime clamp, so use zero here too.
+SOURCE_DATE_EPOCH=0 mkfs.erofs --quiet --workers=1 -zlzma,level=6 -C1048576 -Eall-fragments,ztailpacking -T0 --all-root \
     -U 6c346800-6b6d-6f64-0000-000000000000 "$out.new" "$stage/lib/modules"
+python3 "$root/tools/module-signing.py" verify-image "$stage/lib/modules" "$out.new"
 mv "$out.new" "$out"
 echo "$out: $release, $(( $(stat -c %s "$out") >> 10 )) KiB"

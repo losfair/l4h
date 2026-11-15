@@ -85,11 +85,22 @@ def install(out, tree, bundle):
         stage.replace(bundle)
 
 
+def verify_image(tree, image):
+    # Check the packed bytes as well as the signatures before compression.
+    for module in sorted(tree.rglob("*.ko")):
+        relative = module.relative_to(tree)
+        packed = subprocess.check_output(["dump.erofs", "--cat", f"--path=/{relative}", str(image)])
+        if packed != module.read_bytes():
+            raise SystemExit(f"module image corrupted {relative}")
+
+
 if __name__ == "__main__":
     command, output, *args = sys.argv[1:]
     if command == "prepare":
         prepare(Path(output))
     elif command == "install":
         install(Path(output), *(Path(a) for a in args))
+    elif command == "verify-image":
+        verify_image(Path(output), Path(args[0]))
     else:
         raise SystemExit(f"unknown command: {command}")

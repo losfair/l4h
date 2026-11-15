@@ -45,6 +45,7 @@ fi
 # Rust-for-Linux bindings for kemu in the x86_64 guest kernel.
 (cd "$root" && cargo install --locked bindgen-cli --version 0.71.1)
 (cd "$root/host" && rustup toolchain install)
+"$root/tools/cargo.sh" --version
 
 if [[ $want == *" aarch64 "* ]]; then
     rustup target add --toolchain stable aarch64-unknown-linux-gnu

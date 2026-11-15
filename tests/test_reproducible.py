@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import tomllib
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -58,6 +59,32 @@ class ReproducibleTest(unittest.TestCase):
             images.append(image.read_bytes())
         self.assertEqual(*images)
         self.assertEqual(gzip.decompress(images[0])[:6], b"070701")
+
+    @unittest.skipUnless(shutil.which("cargo"), "needs Cargo")
+    def test_rust_crate_hashes_and_debug_info_ignore_checkout_path(self):
+        pin = tomllib.loads((ROOT / "host/rust-toolchain.toml").read_text())["toolchain"]["channel"]
+        compiler = subprocess.run(["rustup", "which", "--toolchain", pin, "rustc"], capture_output=True, text=True)
+        if compiler.returncode:
+            self.skipTest("needs the pinned nightly (installed by ci-setup.sh)")
+        binaries = []
+        for name in ("first", "a-longer-second-checkout"):
+            checkout = self.work / name
+            app, shared = checkout / "app", checkout / "shared"
+            for path in (app / "src", shared / "src"):
+                path.mkdir(parents=True)
+            (app / "Cargo.toml").write_text(
+                '[package]\nname="app"\nversion="0.1.0"\nedition="2021"\n'
+                '[workspace]\n[dependencies]\nshared={path="../shared"}\n'
+                '[profile.release]\ndebug=true\n')
+            (shared / "Cargo.toml").write_text('[package]\nname="shared"\nversion="0.1.0"\nedition="2021"\n')
+            (shared / "src/lib.rs").write_text('pub fn marker() -> &\'static str { file!() }\n')
+            (app / "src/main.rs").write_text('fn main() { println!("{}", shared::marker()); }\n')
+            env = dict(self.env, RUSTC=compiler.stdout.strip())
+            for args in (("generate-lockfile", "--offline"), ("build", "--offline", "--locked", "--release")):
+                subprocess.run([str(ROOT / "tools/cargo.sh"), *args], cwd=app, env=env,
+                               check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            binaries.append((app / "target/release/app").read_bytes())
+        self.assertTrue(binaries[0] == binaries[1], "Rust output differs between checkout paths")
 
     @unittest.skipUnless(shutil.which("openssl"), "needs OpenSSL")
     def test_replay_prepares_only_a_public_certificate(self):

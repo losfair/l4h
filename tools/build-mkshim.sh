@@ -21,6 +21,6 @@ for k in $(seq 0 $((n - 1))); do
 done
 cd "$root/boot/l4h-mkshim"
 profile=release
-cargo build "${l4h_cargo[@]}" -q --release
+"$root/tools/cargo.sh" build "${l4h_cargo[@]}" -q --release
 objcopy -O elf32-i386 "target/x86_64-unknown-none/$profile/l4h-mkshim" "$out/l4h-mkshim.elf"
 echo "$out: l4h-mkshim.elf, kernel-s0..s$((n - 1)).elf"
