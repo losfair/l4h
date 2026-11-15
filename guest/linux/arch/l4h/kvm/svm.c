@@ -1210,6 +1210,12 @@ static int l4h_handle_exit(struct kvm_vcpu *vcpu, fastpath_t fastpath)
 	struct l4h_vmexit *x = &to_svm(vcpu)->x;
 	u32 reason = x->reason;
 
+	/* A notification has no hardware exit reason. FL4 leaves it zero,
+	 * which would otherwise be decoded as an intercepted CR0 read. */
+	if (!x->fault) {
+		++vcpu->stat.irq_exits;
+		return 1;
+	}
 	if (reason == SVM_EXIT_WRITE_CR8)
 		return handle_cr8_write(vcpu);
 	if (reason >= SVM_EXIT_READ_CR0 && reason <= SVM_EXIT_WRITE_CR0 + 15)

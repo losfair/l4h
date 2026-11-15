@@ -241,7 +241,7 @@ jobs:
         run: tests/run-fuzz.sh
       - name: Userspace without kernel VT-x/AMD-V support
         run: tests/run-novtxtest.sh
-      - name: FL4 Linux, devices, networking, balloon and ABI
+      - name: FL4 Linux, devices, networking, balloon, ABI and nested KVM when available
         run: L4H_RELEASE=1 tests/run-fl4test.sh | tee build/fl4test.log
       - name: UEFI boot of the FL4 application
         env:

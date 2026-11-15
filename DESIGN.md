@@ -4775,7 +4775,7 @@ injects these failures in a host built with `L4H_TEST_INJECT=1`;
   Linux guest and module tree
   (`tools/build-fl4-efi.sh`, §14.2). FL4 detects the CPU features at boot;
   one application covers its x86_64 targets, with single-kernel boots
-  and no nested KVM.
+  and guest KVM where VT-x or AMD-V is available.
 - **Platform discovery.** seL4 reads ACPI (MADT, cores, IOAPIC). `l4h-root`
   enumerates PCI over MCFG/ECAM or port I/O config and allocates MSI/MSI-X
   through `seL4_IRQControl_GetMSI`. A device names its own BAR addresses,
@@ -5495,7 +5495,7 @@ tools/build-fl4.sh
 SEL4_PREFIX="$PWD/build/sel4-fl4" L4H_KERNEL_VARIANT=fl4 tests/run-selftest.sh 4
 ```
 
-The tested FL4 revision is `86880d5b438625daee315ba8bd57cebce3cd155b`.
+The tested FL4 revision is `4b42efae3aa615fbe4377526434aa8b1feaf04d9`.
 `prepare-fl4.sh` clones the pinned public revision, or the frozen override,
 into `build/FL4-src` without applying any kernel patches. The source
 worktree is not edited.
@@ -5510,9 +5510,16 @@ to their seL4 builds. FL4 is source compatible with the seL4 API; the provider
 handles configuration-dependent invocation numbering and object sizes. The host uses the selected kernel's retype fan-out limit
 (256 on FL4). The guest's FPU scratch area starts after the 1 KiB IPC
 buffer, leaving 3 KiB for FL4's 2696-byte standard XSAVE image.
-Multikernel partitions and nested KVM are unavailable on FL4. It detects
-the APIC, PCID, FS/GS and FPU features at boot, so the shipped seL4 CPU
-variants do not apply.
+FL4 enables `KernelVTX` and `KernelX86_64VTX64BitGuests` in its ABI and
+selects VT-x or AMD-V at boot. The existing KVM backends (§5.10) use its
+VCPU/EPT interface through the provider, including FL4's 32 KiB VCPU
+objects. Both KVM backends check the `VMEnter` result before decoding an
+exit reason: a notification has no hardware exit to emulate, and FL4 may
+leave its reason zero. When hardware virtualization is unavailable, root's
+VCPU probe fails and Linux boots with KVM disabled, using the same host,
+provider and Linux binaries. Multikernel partitions remain unavailable on
+FL4. It detects the APIC, PCID, FS/GS and FPU features at boot, so the
+shipped seL4 CPU variants do not apply.
 
 `L4H_RELEASE=1 tools/build-fl4-efi.sh` builds `build/efi/l4h-fl4.efi` and
 its matching `l4h-debug-fl4-x86_64.tar.xz`; `build-efi.sh` builds them after
@@ -5524,11 +5531,19 @@ matching `guest-provider.bin` and `guest-provider.elf`; use the binary with
 from the release binary, use `tools/mkimage.sh -e build/efi/l4h-fl4.efi
 -i dom0.cpio.gz -c l4h.conf build/l4h-fl4.raw`.
 
-`tests/run-fl4test.sh` runs the 1- and 4-vCPU self-tests,
+`tests/run-fl4test.sh` runs the 1- and 4-vCPU self-tests with VMX/SVM hidden,
 4-vCPU disk I/O, networking through a dom0 restart, and balloon reporting.
 With `L4H_RELEASE=1` it also runs the ABI/module-tree test: FL4's debug
 profile omits l4h's debug-syscall MCP filter, so the ABI test's deliberate
 untrapped `DebugHalt` probe requires FL4's release profile.
+On hosts with VMX/SVM and KVM nesting enabled it also runs the KVM test
+inside 1- and 4-vCPU Linux guests; failures are fatal. `L4H_FL4_KVM=1`
+requires these tests even when auto-detection cannot find nesting,
+and `L4H_FL4_KVM=0` skips them explicitly. Their serial logs are saved as
+`build/fl4-kvm-{1,4}.log`. The low-level VCPU/EPT probe also supports FL4:
+after a debug `tools/build-fl4.sh`, run `tests/run-vtxtest.sh off` and `on`
+with `SEL4_PREFIX="$PWD/build/sel4-fl4" L4H_KERNEL_VARIANT=fl4`. Debug runs
+of `tests/run-fl4test.sh` include these probes too.
 Integration CI runs this suite and boots its packaged `l4h-fl4.efi` through
 OVMF with `UEFI_EFI=build/l4h-fl4.efi tests/run-uefitest.sh`, checking
 the module tree and dom0 networking. The tested revision includes upstream
@@ -5538,8 +5553,9 @@ fixes for [INT gates](https://github.com/losfair/FL4/issues/1),
 [rust-sel4 XML compatibility](https://github.com/losfair/FL4/issues/4),
 [speculative refill nontermination](https://github.com/losfair/FL4/issues/5),
 [a reschedule IPI left in service](https://github.com/losfair/FL4/issues/6),
-[SetTLSBase syscall trapping](https://github.com/losfair/FL4/issues/7), and
-[UEFI ACPI discovery](https://github.com/losfair/FL4/issues/8).
+[SetTLSBase syscall trapping](https://github.com/losfair/FL4/issues/7),
+[UEFI ACPI discovery](https://github.com/losfair/FL4/issues/8), and
+[VT-x/AMD-V support](https://github.com/losfair/FL4/pull/9).
 The l4h integration applies no FL4 fixes.
 
 For AArch64, build the kernel and loader once, then select the guest ISA
@@ -5602,7 +5618,7 @@ machine and guests of 256–512 MiB.
 | `tests/run-install-vm.sh debian-13-nocloud-amd64.qcow2 [release-directory] [1\|2]` | in a disposable UEFI/KVM VM, install from native Debian with one or two uplinks, verify each switch and network, then return to native Linux; uses prebuilt releases and `sudo -u "$L4H_QEMU_USER"` (defaults to the invoking user); `INSTALL_VM_SWAP_NAMES=1` with two NICs also tests exchanging eth0/eth1 names; `INSTALL_VM_FIRMWARE=bios INSTALL_VM_MEMORY=1G INSTALL_VM_CPUS=1` tests small-VM defaults through BIOS GRUB |
 | `tests/run-versiontest.sh` | host version metadata: release tags, development builds, overrides and worktrees |
 | `tests/run-novtxtest.sh` | builds the host and Linux guest with `KernelVTX=OFF` headers and boots the guest self-test with 1 and 4 vCPUs; Linux KVM stays disabled and root never probes a VCPU object |
-| `tests/run-fl4test.sh` | builds the pinned public FL4 revision (or a frozen `L4H_FL4_SOURCE` override); tests 1- and 4-vCPU Linux, 4-vCPU disk I/O, networking and balloon reporting; `L4H_RELEASE=1` also checks the ABI and guest module tree |
+| `tests/run-fl4test.sh` | builds the pinned public FL4 revision (or a frozen `L4H_FL4_SOURCE` override); tests 1- and 4-vCPU Linux with VMX/SVM hidden, 4-vCPU disk I/O, networking and balloon reporting; `L4H_RELEASE=1` also checks the ABI and guest module tree; tests KVM inside 1- and 4-vCPU Linux guests when host nesting is available (`L4H_FL4_KVM=1` requires it, `0` skips it) |
 | `tests/run-flagstest.sh` | focused flags-only boot: console/display seals, kernel taints, userspace gates and instance reuse, on either architecture |
 | `tests/run-acstest.sh` | PCIe ACS setup against a model of configuration space: implemented bits only, firmware bits kept, bits that do not stick, hostile capability lists, read-only checks; ECAM window block planning |
 | `tests/run-trusttest.sh` | taint/seal permissions, atomic gates, instances, seqlock snapshots and verifier policy |

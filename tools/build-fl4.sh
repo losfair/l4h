@@ -12,7 +12,7 @@ debug=ON
 cmake -G Ninja -S "$root/kernel/fl4" -B "$out" \
     -DFL4_SOURCE="$src" \
     -C "$root/kernel/configs/l4h-x86_64.cmake" \
-    -DKernelVTX=OFF -DKernelDebugBuild="$debug" \
+    -DKernelVTX=ON -DKernelX86_64VTX64BitGuests=ON -DKernelDebugBuild="$debug" \
     -DKernelRetypeFanOutLimit=256 \
     -DLibSel4PrintInvocationErrors=0
 ninja -C "$out"
