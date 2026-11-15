@@ -23,12 +23,18 @@ trap 'cp "$saved" "$config"; rm "$saved"' EXIT
 "$root/build/linux-6.18/scripts/config" --file "$config" --enable MODULE_SIG_ALL
 linux olddefconfig
 linux rust/
-grep -qx 'pub const CONFIG_MODULE_SIG_ALL: u32 = 1;' "$bindings"
+if ! grep -qE 'CONFIG_MODULE_SIG_ALL[[:space:]]*:[[:space:]]*u32[[:space:]]*=[[:space:]]*1[[:space:]]*;' "$bindings"; then
+    echo 'RUSTCONFIGTEST: FAIL missing enabled configuration constant' >&2
+    exit 1
+fi
 cp "$saved" "$config"
 linux vmlinux modules
-if grep -q '^pub const CONFIG_MODULE_SIG_ALL:' "$bindings"; then
+if grep -qE 'CONFIG_MODULE_SIG_ALL[[:space:]]*:' "$bindings"; then
     echo 'RUSTCONFIGTEST: FAIL stale configuration constant' >&2
     exit 1
 fi
-test "$(sha256sum < "$l4h_linux_out/vmlinux")" = "$expected"
+if [ "$(sha256sum < "$l4h_linux_out/vmlinux")" != "$expected" ]; then
+    echo 'RUSTCONFIGTEST: FAIL kernel changed after restoring its configuration' >&2
+    exit 1
+fi
 echo 'RUSTCONFIGTEST: PASS'

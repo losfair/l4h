@@ -5460,7 +5460,8 @@ requires this comparison before publishing. A failed rebuild stays under
 Reproduction needs the same build inputs and tool versions. The release
 workflow pins the Debian container by digest and its apt repositories to
 the 2026-11-14 snapshot. `rust-toolchain.toml` pins the Linux/dom0 Rust
-compiler; the host and shim have their own nightly pins. Cargo uses the
+compiler and the formatter bindgen uses; the host and shim have their own
+nightly pins. Cargo uses the
 checked-in lockfiles. `tools/cargo.sh` pins a newer Cargo build tool with
 the [fix for external path dependency hashes](https://github.com/rust-lang/cargo/commit/20319b9c23978ba630b838654378beccab20ec83)
 and enables `trim-paths`, while retaining the existing Rust compilers.
