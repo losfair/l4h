@@ -16,5 +16,12 @@ if [ ! -x "$out/cargo" ]; then
 fi
 export RUSTC=${RUSTC:-$(rustup which rustc)}
 export RUSTDOC=${RUSTDOC:-$(rustup which rustdoc)}
-exec "$out/cargo" -Ztrim-paths --config 'profile.dev.trim-paths="all"' \
-    --config 'profile.release.trim-paths="all"' "$@"
+case "${RUSTC_WRAPPER:-}" in
+    ''|*/tools/rustc-reproducible.sh) ;;
+    *) export L4H_RUSTC_WRAPPER=$RUSTC_WRAPPER ;;
+esac
+export RUSTC_WRAPPER=$root/tools/rustc-reproducible.sh
+# Put all --config values after the subcommand: clap otherwise drops the
+# parent's values when the caller also supplies --config to `build`.
+exec "$out/cargo" "$@" --config 'profile.dev.trim-paths="all"' \
+    --config 'profile.release.trim-paths="all"'

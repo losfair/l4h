@@ -77,11 +77,15 @@ class ReproducibleTest(unittest.TestCase):
                 '[workspace]\n[dependencies]\nshared={path="../shared"}\n'
                 '[profile.release]\ndebug=true\n')
             (shared / "Cargo.toml").write_text('[package]\nname="shared"\nversion="0.1.0"\nedition="2021"\n')
-            (shared / "src/lib.rs").write_text('pub fn marker() -> &\'static str { file!() }\n')
+            (shared / "build.rs").write_text(
+                'fn main() { std::fs::write(std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("generated.rs"), '
+                '"pub fn marker() -> &\'static str { file!() }").unwrap(); }\n')
+            (shared / "src/lib.rs").write_text('include!(concat!(env!("OUT_DIR"), "/generated.rs"));\n')
             (app / "src/main.rs").write_text('fn main() { println!("{}", shared::marker()); }\n')
             env = dict(self.env, RUSTC=compiler.stdout.strip())
             for args in (("generate-lockfile", "--offline"), ("build", "--offline", "--locked", "--release")):
-                subprocess.run([str(ROOT / "tools/cargo.sh"), *args], cwd=app, env=env,
+                maps = json.dumps([f"--remap-path-prefix={checkout}=/l4h"])
+                subprocess.run([str(ROOT / "tools/cargo.sh"), *args, "--config", f"build.rustflags={maps}"], cwd=app, env=env,
                                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             binaries.append((app / "target/release/app").read_bytes())
         self.assertTrue(binaries[0] == binaries[1], "Rust output differs between checkout paths")
