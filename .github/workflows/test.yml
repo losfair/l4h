@@ -104,6 +104,8 @@ jobs:
         run: tests/run-schedtest.sh
       - name: Build Linux
         run: tools/build-linux.sh vmlinux && ccache -s
+      - name: Incremental Rust bindings track kernel configuration changes
+        run: tests/run-rustconfigtest.sh
       - name: Built-in drivers work without a module image under lockdown
         run: tests/run-builtintest.sh
       - name: Console rings, hotplug scheduling and hypercalls under console load
