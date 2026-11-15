@@ -22,17 +22,17 @@
 # l4h's that replaces in the vendor ramdisk
 #   - the first-stage fstab: the same partitions, without AVB (nothing is
 #     verified: the device is unlocked);
-#   - the modules first-stage init loads, built for another kernel, with
-#     those of the kernel in <modules dir> (lib/modules/<release>) that
-#     the display needs: virtio_gpu (l4h-vmm's) and what it depends on;
+#   - the first-stage module lists, built for another kernel, with empty
+#     lists.
+#     l4h's virtio-gpu driver and its dependencies are built into Linux;
 # and a bootconfig with the vendor's androidboot.* and what Cuttlefish's
 # launcher adds for a guest that renders in software (SwiftShader).
-# Usage: mkandroid.sh <image dir> <modules dir> <out dir>
+# Usage: mkandroid.sh <image dir> <out dir>
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
+source "$root/tools/reproducible-env.sh"
 img=$(realpath "$1")
-mods=$(realpath "$2")
-out=$3
+out=$2
 for f in super.img init_boot.img vendor_boot.img; do
     [ -f "$img/$f" ] || { echo "$img/$f: not a Cuttlefish image" >&2; exit 1; }
 done
@@ -56,33 +56,11 @@ vendor_dlkm /vendor_dlkm erofs ro wait,logical,first_stage_mount,slotselect
 odm_dlkm    /odm_dlkm    erofs ro wait,logical,first_stage_mount,slotselect
 system_dlkm /system_dlkm erofs ro wait,logical,first_stage_mount,slotselect
 EOF
-# virtio_gpu and its dependencies, in the order modprobe would load them.
-python3 - "$mods" "$dir/l4h/lib/modules" virtio_gpu <<'PY'
-import os, shutil, sys
-src, dst, want = sys.argv[1], sys.argv[2], sys.argv[3:]
-deps = {}
-for line in open(os.path.join(src, 'modules.dep')):
-    mod, _, rest = line.partition(':')
-    deps[mod] = rest.split()
-byname = {os.path.basename(m)[:-3].replace('-', '_'): m for m in deps}
-order = []
-def visit(m):
-    if m in order:
-        return
-    for d in deps[m]:
-        visit(d)
-    order.append(m)
-for w in want:
-    visit(byname[w])
-with open(os.path.join(dst, 'modules.dep'), 'w') as f:
-    for m in order:
-        shutil.copy(os.path.join(src, m), dst)
-        f.write(os.path.basename(m) + ':' + ''.join(' ' + os.path.basename(d) for d in deps[m]) + '\n')
-with open(os.path.join(dst, 'modules.load'), 'w') as f:
-    f.write(''.join(os.path.basename(m) + '\n' for m in order))
-for name in ('modules.alias', 'modules.softdep', 'modules.options', 'modules.blocklist'):
-    open(os.path.join(dst, name), 'w').close()
-PY
+# No first-stage modules: the display drivers are built in. Overlay the
+# vendor's lists so Android does not try to load its incompatible modules.
+for name in modules.dep modules.load modules.alias modules.softdep modules.options modules.blocklist; do
+    : > "$dir/l4h/lib/modules/$name"
+done
 # Owned by root, as the ramdisks it overlays are: the kernel applies the
 # owner and mode of a directory that is already there too.
 chmod -R u=rwX,go=rX "$dir/l4h"

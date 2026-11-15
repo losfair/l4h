@@ -1,15 +1,14 @@
 #!/bin/sh
-# dom0 init of tests/run-abitest.sh: the kernel's module tree from the
-# host, then the ABI test module, built against that tree.
+# dom0 init of tests/run-abitest.sh: expose the SDK and load the ABI probe.
 mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
-mkdir -p /lib/modules
-if mount -t erofs -o ro /dev/l4hkmod /lib/modules &&
-    [ -f "/lib/modules/$(uname -r)/build/Module.symvers" ] && [ -f "/lib/modules/$(uname -r)/modules.dep" ]; then
-    echo "ABITEST: module tree $(uname -r)"
+build=/lib/modules/$(uname -r)/build
+mkdir -p "$build"
+if mount -t erofs -o ro /dev/l4hsdk "$build" && [ -f "$build/Module.symvers" ]; then
+    echo "ABITEST: SDK $(uname -r)"
 else
-    echo "ABITEST: FAIL module tree"
+    echo "ABITEST: FAIL SDK"
 fi
 insmod /bin/l4h_abitest.ko
 poweroff -f

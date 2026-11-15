@@ -27,5 +27,5 @@ dom0_mem_mb=768
 dom0_vcpus=2
 dom0_cmdline="console=hvc0${L4H_EC2_PEER:+ ec2_peer=$L4H_EC2_PEER}"
 CONF
-L4H_GUEST_KMODS= "$root/tools/mkimage.sh" -i "$out/dom0.cpio.gz" \
+L4H_GUEST_SDK= "$root/tools/mkimage.sh" -i "$out/dom0.cpio.gz" \
     -c "$out/l4h.conf" "$out/l4h.raw"

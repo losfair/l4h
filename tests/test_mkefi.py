@@ -34,7 +34,7 @@ pathlib.Path(args[args.index('-o') + 1]).write_bytes(b'EFI fixture')
         env = {k: v for k, v in os.environ.items() if not k.startswith("L4H_")}
         env.update(PATH=f"{self.work}:{env['PATH']}", TEST_GRUB_CONFIG=str(self.config),
                    TEST_GRUB_MODULES=str(self.modules), L4H_GUEST_KERNEL="/bin/true",
-                   L4H_GUEST_KMODS="", L4H_MKSHIM="")
+                   L4H_GUEST_SDK="", L4H_MKSHIM="")
         env.update(settings)
         result = subprocess.run([str(ROOT / "tools/mkefi.sh"), str(self.work / "out.efi"),
                                  "/bin/true", "/bin/true"], env=env, capture_output=True, text=True)

@@ -3,6 +3,7 @@
 # modules never see these headers. vmmgr's build.rs embeds the raw image.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
+source "$root/tools/reproducible-env.sh"
 arch=${L4H_ARCH:-x86_64}
 case "$arch" in
     x86_64) cross=; prefix=$root/build/sel4

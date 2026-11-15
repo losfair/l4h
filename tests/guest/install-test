@@ -20,10 +20,8 @@ if [[ $(uname -r) == *-l4h ]]; then
     sha256sum --check native-files.sha256
     [[ $(cat marker) == native-linux ]]
     test -c /dev/l4hctl
-    test -b /dev/l4hkmod
-    test -d "/lib/modules/$(uname -r)"
-    [[ $(findmnt -n -o FSTYPE -T /lib/modules) == erofs ]]
-    [[ $(findmnt -n -o OPTIONS -T /lib/modules) == *ro* ]]
+    test -b /dev/l4hsdk
+    [[ $(findmnt -n -o OPTIONS -T "/lib/modules/$(uname -r)/build") == *ro* ]]
     l4hctl version
     l4hctl info
     l4hctl nics | tee host-nics.txt
@@ -62,7 +60,6 @@ if [[ $(uname -r) == *-l4h ]]; then
     cat install.sh | bash -s -- --release v0-install-test
     sha256sum --check installed-config.sha256
     sha256sum --check native-files.sha256
-    [[ $(findmnt -n -o OPTIONS -T /lib/modules) == *ro* ]]
     echo 'INSTALLVM: dom0 update preserved configuration and running modules'
     if [[ -f /boot/grub/custom.cfg ]]; then
         # BIOS dom0 can schedule another trial; UEFI dom0 leaves NVRAM alone.

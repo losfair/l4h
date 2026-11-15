@@ -5,11 +5,14 @@
 # Usage: ci-setup.sh [x86_64|aarch64|debian]...   (default: x86_64)
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
-# Downloads are pinned by checksum.
-LINUX_VERSION=6.18.63
-LINUX_SHA256=81764a545072d160748beff4d9de2e7d95aa9f16e8261110288f067a2cc61d71
-RUSTUP_VERSION=1.29.1
-RUSTUP_SHA256=dda7234360b7f578ca8b0ddcb80145646fa61a67c1720a5abc7051b35c9fcb71
+export TMPDIR=${TMPDIR:-$root/build/tmp}
+mkdir -p "$TMPDIR"
+# Container runners can mount a checkout owned by the runner's host UID.
+# Trust these exact inputs before reading their Git metadata.
+for path in "$root" "$root/kernel/seL4" "$root/third_party/"{rust-sel4,sddf,kemu}; do
+    git config --global --add safe.directory "$path"
+done
+source "$root/tools/source-pins.sh"
 want=" ${*:-x86_64} "
 
 pkgs=(git ca-certificates curl xz-utils bzip2 wget sudo procps kmod
@@ -25,8 +28,9 @@ pkgs=(git ca-certificates curl xz-utils bzip2 wget sudo procps kmod
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
 apt-get install -y -q --no-install-recommends "${pkgs[@]}"
+source "$root/tools/reproducible-env.sh"
 
-# Rust: stable for the dom0 tools and tests, the pinned nightly for the host
+# Rust: the root pin for Linux/dom0, stable for tests, and nightly for the host
 # (host/rust-toolchain.toml).
 if ! command -v rustup >/dev/null; then
     # rustup-init acts on its file name.
@@ -39,21 +43,25 @@ if ! command -v rustup >/dev/null; then
     rm -rf "$(dirname "$init")"
 fi
 export PATH=$HOME/.cargo/bin:$PATH
+(cd "$root" && rustup toolchain install)
 rustup toolchain install stable --profile minimal
 rustup component add rust-src --toolchain stable
 if [[ $want == *" x86_64 "* ]]; then
     rustup target add --toolchain stable x86_64-unknown-none
 fi
 # Rust-for-Linux bindings for kemu in the x86_64 guest kernel.
-cargo +stable install --locked bindgen-cli --version 0.71.1
+(cd "$root" && cargo install --locked bindgen-cli --version 0.71.1)
 (cd "$root/host" && rustup toolchain install)
+(cd "$root/kernel/fl4" && rustup toolchain install)
+"$root/tools/cargo.sh" --version
 
 if [[ $want == *" aarch64 "* ]]; then
     rustup target add --toolchain stable aarch64-unknown-linux-gnu
+    (cd "$root" && rustup target add aarch64-unknown-linux-gnu)
     # Extract the foreign BusyBox without replacing the build host's binary.
     dpkg --add-architecture arm64
     apt-get update -q
-    # install-extmod-build rebuilds the module signing tool for the guest.
+    # SDK helpers run natively on the guest.
     apt-get install -y -q --no-install-recommends libssl-dev:arm64
     busybox_pkg=$(mktemp -d)
     (cd "$busybox_pkg" && apt-get download busybox-static:arm64)
@@ -64,7 +72,7 @@ fi
 
 # seL4's build tools.
 [ -x "$root/.venv/bin/python" ] || python3 -m venv "$root/.venv"
-"$root/.venv/bin/pip" install -q "$root/kernel/seL4/tools/python-deps"
+"$root/.venv/bin/pip" install -q -r "$root/tools/sel4-requirements.txt"
 
 # Linux, unless already there.
 if [ ! -f "$root/build/linux-6.18/Makefile" ]; then

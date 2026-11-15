@@ -3,6 +3,7 @@
 # EL1 kernels) and its payload tool.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
+source "$root/tools/reproducible-env.sh"
 rs=$root/build/rust-sel4-src
 patches=("$root"/third_party/patches/rust-sel4/*.patch)
 base=$(git -C "$root/third_party/rust-sel4" rev-parse HEAD)
@@ -23,7 +24,7 @@ if [ "$(cat "$stamp" 2>/dev/null)" != "$want" ]; then
     echo "$want" > "$stamp"
 fi
 cd "$rs"
-CC=aarch64-linux-gnu-gcc SEL4_PREFIX=$root/build/sel4-aarch64 cargo build -q \
+CC=aarch64-linux-gnu-gcc SEL4_PREFIX=$root/build/sel4-aarch64 "$root/tools/cargo.sh" build "${l4h_cargo[@]}" -q \
     -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem \
     --target aarch64-unknown-none --release -p sel4-kernel-loader --target-dir "$root/build/loader-target"
-cargo build -q --release -p sel4-kernel-loader-add-payload --target-dir "$root/build/loader-target"
+"$root/tools/cargo.sh" build "${l4h_cargo[@]}" -q --release -p sel4-kernel-loader-add-payload --target-dir "$root/build/loader-target"

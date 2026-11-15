@@ -144,7 +144,7 @@ if [ -n "${MK_BOOT:-}" ]; then
     if [ -n "$efi" ]; then
         "$root/tools/mkimage.sh" -e "$efi" -i "$out/dom0.cpio.gz" -m "$out/esp" "$out/mk.raw" >/dev/null
     else
-        L4H_GUEST_KMODS= L4H_GUEST_KERNEL="$out/vmlinux" "$root/tools/mkimage.sh" -i "$out/dom0.cpio.gz" -m "$out/esp" \
+        L4H_GUEST_SDK= L4H_GUEST_KERNEL="$out/vmlinux" "$root/tools/mkimage.sh" -i "$out/dom0.cpio.gz" -m "$out/esp" \
             "$out/mk.raw" "$out/l4h-root.elf" >/dev/null
     fi
     # On the chipset's AHCI controller, which no partition drives.

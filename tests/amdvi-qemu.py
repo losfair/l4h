@@ -25,7 +25,7 @@ def main():
     config = OUT / "isolation.conf"
     config.write_text("dom0_mem_mb=128\ndom0_disks=0\nwatchdog_secs=0\niommu=1\niommu_intremap=1\n")
     env = dict(os.environ, L4H_QEMU_IOMMU="amd", L4H_DOM0_INITRD=str(initrd),
-               L4H_CONFIG=str(config), L4H_GUEST_KMODS="")
+               L4H_CONFIG=str(config), L4H_GUEST_SDK="")
     env.setdefault("L4H_GUEST_KERNEL", str(ROOT / "build/linux-l4h/vmlinux.stripped"))
     devices = ["-device", "i82801b11-bridge,id=br,bus=pcie.0,addr=0x1e",
                "-device", "edu,addr=7,dma_mask=0xffffffffffffffff",

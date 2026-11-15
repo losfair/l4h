@@ -125,7 +125,7 @@ def main():
     config = OUT / "net.conf"
     config.write_text(f"dom0_mem_mb=256\ndom0_disks=0\nwatchdog_secs=0\niommu=1\niommu_intremap={int(not args.no_intremap)}\n")
     env = dict(os.environ, L4H_QEMU_IOMMU=args.iommu, L4H_MEM="8G", L4H_SMP="4",
-               L4H_DOM0_INITRD=str(initrd), L4H_CONFIG=str(config), L4H_GUEST_KMODS="")
+               L4H_DOM0_INITRD=str(initrd), L4H_CONFIG=str(config), L4H_GUEST_SDK="")
     env.setdefault("L4H_GUEST_KERNEL", str(ROOT / "build/linux-l4h/vmlinux.stripped"))
     for topology, platform in [("root", "on"), ("pci", "on"), ("pci", "off"),
                                ("pcie-pci", "on"), ("pcie-pci", "off"),

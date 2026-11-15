@@ -3,14 +3,16 @@
 # L4H_FL4_SOURCE overrides the pin with a frozen worktree for development.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
+source "$root/tools/reproducible-env.sh"
 source "$root/tools/prepare-fl4.sh"
 out=$root/build/kernel-fl4
 prefix=$root/build/sel4-fl4
 export PATH=$root/.venv/bin:$PATH
 debug=ON
 [ "${L4H_RELEASE:-0}" = 1 ] && debug=OFF
-cmake -G Ninja -S "$root/kernel/fl4" -B "$out" \
+cmake -DCMAKE_C_FLAGS="$l4h_prefix_map" -DCMAKE_ASM_FLAGS="$l4h_prefix_map" -G Ninja -S "$root/kernel/fl4" -B "$out" \
     -DFL4_SOURCE="$src" \
+    -DCARGO="$root/tools/cargo-fl4.sh" \
     -C "$root/kernel/configs/l4h-x86_64.cmake" \
     -DKernelVTX=ON -DKernelX86_64VTX64BitGuests=ON -DKernelDebugBuild="$debug" \
     -DKernelRetypeFanOutLimit=256 \

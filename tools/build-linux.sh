@@ -3,6 +3,7 @@
 # Usage: build-linux.sh [make targets...]   (default: vmlinux)
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
+source "$root/tools/reproducible-env.sh"
 src=$root/build/linux-6.18
 kemu=$root/third_party/kemu
 arch=${L4H_ARCH:-x86_64}
@@ -100,13 +101,25 @@ done
 exec 9>&-
 mkdir -p "$out"
 mk=(make -C "$src" O="$out" ARCH=l4h SUBARCH="$arch"
-    L4H_ABI_INCLUDE="$root/include")
+    L4H_ABI_INCLUDE="$root/include"
+    KCFLAGS="${KCFLAGS:-} $l4h_prefix_map"
+    KAFLAGS="${KAFLAGS:-} $l4h_prefix_map"
+    HOSTCFLAGS="${HOSTCFLAGS:-} $l4h_prefix_map"
+    HOSTCXXFLAGS="${HOSTCXXFLAGS:-} $l4h_prefix_map"
+    KRUSTFLAGS="${KRUSTFLAGS:-} --remap-path-prefix=$root=/l4h --remap-path-prefix=${RUSTUP_HOME:-$HOME/.rustup}=/rustup"
+    HOSTRUSTFLAGS="${HOSTRUSTFLAGS:-} --remap-path-prefix=$root=/l4h")
 if [ "$arch" = aarch64 ]; then
     mk+=(CROSS_COMPILE="${CROSS_COMPILE:-aarch64-linux-gnu-}")
 fi
 # L4H_LINUX_CC overrides the compiler, e.g. "ccache gcc" in CI.
 if [ -n "${L4H_LINUX_CC:-}" ]; then
-    mk+=(CC="$L4H_LINUX_CC")
+    mk+=(CC="$root/tools/linux-cc.sh")
+    # A native compiler wrapped in ccache is still the host compiler.
+    # Keep the commands equal so SDK installation does not cross-rebuild
+    # host programs in its randomly named staging directory.
+    if [ "$arch" = x86_64 ] && [ "$(uname -m)" = x86_64 ]; then
+        mk+=(HOSTCC="${HOSTCC:-$root/tools/linux-cc.sh}")
+    fi
 fi
 # Regenerate the config when the defconfig changed.
 if [ ! -f "$out/.config" ] || [ "$root/guest/linux/arch/l4h/configs/defconfig" -nt "$out/.config" ]; then

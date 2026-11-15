@@ -358,7 +358,7 @@ arch/l4h/
   kernel/   also the software page tables, TLB sync and VSpace mirror (tlb.c, vspace.c)
   kernel/skas/   uaccess, mm context and process/syscall glue
   os-sel4/  boot and dispatch through the versioned guest ABI provider
-  drivers/  virtio_l4h transport, hvc console, l4hctl, attestation, memory hotplug, RTC, RNG, kmod
+  drivers/  virtio_l4h transport, hvc console, l4hctl, attestation, memory hotplug, RTC, RNG, SDK
   include/  kernel, shared and UAPI headers
   x86/      x86_64 signal frames, TLS, syscall table, vDSO and register glue
   arm64/    native AArch64 ABI, atomics, context switching and module relocations
@@ -395,7 +395,7 @@ hooks (§10.2), the Android features of §5.8 and x86's
   - vmalloc/module area and the vmemmap;
   - on x86_64, BPF JIT images in the 1 GiB below the kernel image (§5.7);
   - per-vCPU event pages and virtio-l4h device pages;
-  - the I/O pool (§8.1) and the shared module image (§5.6).
+  - the I/O pool (§8.1) and the shared build SDK (§5.6).
 - **Guest-process VSpaces** cache Linux `mm_struct` mappings in a fixed
   pool of 64 host-provided VSpace roots (§5.3). The guest makes their page
   tables and mapping slots from its own RAM. They hold only user mappings,
@@ -723,9 +723,9 @@ higher than `P_K`. Direct invocations are therefore safe by capability
 checks alone. Host hypercalls and device requests validate their
 arguments, including pool addresses, device indices and lifecycle state.
 
-### 5.6 One guest kernel, and its module tree
+### 5.6 One guest kernel and its build SDK
 
-- **One Linux image across microkernels.** Linux and its module SDK depend
+- **One Linux image across microkernels.** Linux and its build SDK depend
   only on the versioned l4h ABI (`include/l4h/guest.h`, `provider.h`), not on
   libsel4. vmmgr embeds an immutable ABI provider built against the selected
   microkernel's headers (`guest/provider`, `tools/build-guest-provider.sh`),
@@ -739,49 +739,43 @@ arguments, including pool addresses, device indices and lifecycle state.
   state, including libsel4 TLS, belongs to each guest and vCPU. Linux callbacks
   run on the caller's stack; calls add no host IPC round trip. The provider
   bytes are included in the launch digest. KVM stays compiled into the common
-  x86_64 image and is enabled only when the host supplies EPT roots. ABI 9
-  introduces this bootstrap contract; old guest binaries cannot boot it.
-- **Its module tree.** `tools/build-kmods.sh` builds an EROFS image (LZMA,
-  about 9 MiB) of the kernel's `/lib/modules`: modules, depmod's files, and
-  `<release>/build`, the tree to build external modules against (kbuild's
-  `install-extmod-build` plus the headers it misses for `ARCH=l4h`: those
-  outside `arch/l4h/include`, the ISA's own and the l4h ABI/provider headers). Its
-  `Makefile` sets `ARCH=l4h`, so `make -C /lib/modules/$(uname -r)/build
-  M=$PWD` works in a guest. The image is boot module `guest-kmods`, and is
-  optional.
+  x86_64 image and is enabled only when the host supplies EPT roots. ABI 10
+  defines this bootstrap contract; old guest binaries cannot boot it.
+- **Built-in drivers.** All shipped drivers are built into Linux, sharing
+  their text and rodata between guests.
+- **Build SDK.** `tools/build-sdk.sh` creates an EROFS image of Kbuild,
+  headers, `.config`, `Module.symvers` and the l4h ABI/provider headers.
+  It contains no loadable drivers. The SDK's `Makefile` selects `ARCH=l4h`
+  and the guest ISA, so `make -C /lib/modules/$(uname -r)/build M=$PWD`
+  builds user modules without the Linux source tree.
 - **Kernel lockdown.** Guests can enable Linux lockdown with
   `lockdown=integrity` or `lockdown=confidentiality` on their command line.
   The lockdown LSM initializes early, even with an explicit `lsm=` list,
   and exposes its state at `/sys/kernel/security/lockdown` when securityfs
-  is mounted. Lockdown is off by default. `modules_install` signs the
-  shipped modules with the build's key, whose certificate is built into
-  the kernel; the private key is not included in the module image.
-  Guests that enable lockdown reject unsigned external modules.
-- **Shared read-only.** The boot module's own pages are mapped read-only
-  into every guest at `L4H_KMOD_VA` (bootinfo `kmod_va`, `kmod_size`): one
-  copy for all guests, nothing allocated or copied at boot. Each guest's
-  copies of the frame caps cost about 150 KiB with page tables for a 9 MiB
-  image. Root knows the frame of each module page (`bootmod.rs`). Guests
-  map the image's last page whole, so root clears what follows the image
-  in it before any guest exists, and refuses an image that shares that page
-  with another module. `drivers/kmod.c` exposes the image as the read-only
-  block device `/dev/l4hkmod`; `mount -t erofs -o ro /dev/l4hkmod
-  /lib/modules` gives modprobe and module builds what they need.
+  is mounted. Lockdown is off by default. The build generates no module
+  signing key or certificate and runs no signing step. Lockdown still
+  selects Linux's signature verifier, with an empty built-in trust store,
+  so guests that enable lockdown reject unsigned external modules.
+- **Shared read-only.** The SDK is embedded as boot module `guest-sdk` and
+  mapped read-only into every guest at `L4H_SDK_VA` (`sdk_va`, `sdk_size`
+  in boot info). It occupies whole pages, shared once across all guests.
+  `drivers/sdk.c` exposes `/dev/l4hsdk`; mount it read-only on
+  `/lib/modules/$(uname -r)/build`. The installer does this before starting
+  dom0's init, leaving the rest of `/lib/modules` writable for user modules.
 - **Kernel text and rodata are shared too.** Every guest maps the pages of
   the kernel's read-only segments from the boot module's frames, read-only,
   so a guest cannot change its own kernel's code. The linker script keeps
   whatever the kernel writes out of those segments (`__ro_after_init` data
   and the exception table, which is sorted at boot, go with the data) and
-  pads text to a page and rodata to a 2 MiB block, so on x86_64 the
-  11.7 MiB of text and 2.3 MiB of rodata are seven blocks, 14 MiB saved per
-  guest. A block wholly of such pages holds only those copies, and memd has
+  pads text to a page and rodata to a 2 MiB block. A block wholly of
+  such pages holds only those copies, and memd has
   no RAM block for it; blocks only partly read-only would get private
   copies (none with this layout). Shared blocks are guest-physical space on
-  top of the RAM a guest is given: a 256 MiB guest has 270 MiB of RAM in
-  its boot info. Writes to shared pages fault and stop the guest, so a
+  top of the private RAM a guest is given. Writes to shared pages fault
+  and stop the guest, so a
   kernel change that writes text or rodata shows at boot.
 - **Side channel.** Guests share the physical pages of kernel code and
-  modules, so one guest can time its access to them to learn which kernel
+  the build SDK, so one guest can time its access to them to learn which kernel
   code another runs (Flush+Reload). These pages are never written once
   guests exist, so data stays out of reach.
 - **Modules may use the l4h ABI.** A module comes from the kernel's own
@@ -790,7 +784,7 @@ arguments, including pool addresses, device indices and lifecycle state.
   (`l4h_vspace_get`), kernel mappings of foreign frames
   (`l4h_kernel_map_frame`) and os-sel4's vCPU state. `tests/guest/abitest`
   tests the ABI and the kernel extensions below Linux this way.
-- **Measured.** The kernel and the module image are part of the UEFI
+- **Measured.** The kernel and SDK are part of the UEFI
   application, which PCR 4 covers. Launch digests (§10.2) also cover the
   kernel image in guest RAM.
 
@@ -860,7 +854,7 @@ guest's command line asks for it:
 | userfaultfd, `MREMAP_DONTUNMAP`, `UFFDIO_MOVE` | ART's concurrent compacting GC | unused |
 | `/dev/rtc0` with alarms | the `CLOCK_*_ALARM` clocks | present |
 | dma-buf heaps, `sync_file` | gralloc buffers and fences | unused |
-| DRM with virtio-gpu (dumb buffers on render nodes, patch 0012; ARGB8888 on its plane, patch 0013) or vkms, modules | the display SurfaceFlinger composes for | no display until a driver is loaded |
+| Built-in DRM virtio-gpu (dumb buffers on render nodes, patch 0012; ARGB8888 on its plane, patch 0013) | the display SurfaceFlinger composes for | probes an attached device |
 | evdev, uinput | input | no input devices |
 | zram with LZ4 | swap | unconfigured |
 | legacy iptables with netd's matches and targets, policy routing, `SOCK_DESTROY`, XFRM | netd | empty tables |
@@ -882,11 +876,9 @@ ashmem ioctls on memfds.
   initramfs right after `setup_arch()`, which records the initramfs.
 - **Display.** A guest has no device memory, only pages it shares with the
   host, so `ioremap()` returns NULL (as on UML) but `NO_IOMEM` is off: DRM
-  builds, and a driver that maps device memory fails its probe. vkms
-  composes planes in software, raises vblanks from an hrtimer and has only
-  a writeback connector; screen capture over adb shows it. The display the
-  host can show is l4h-vmm's virtio-gpu (§9.6), with the `virtio_gpu`
-  module. DRM, vkms and virtio-gpu are modules.
+  builds, and a driver that maps device memory fails its probe. The display
+  is l4h-vmm's virtio-gpu (§9.6), probed automatically by Linux's built-in
+  `virtio_gpu` driver.
 - **ashmem.** Android 17's libcutils allocates from `/dev/ashmem` unless
   `sys.use_memfd` is set and the kernel takes ashmem ioctls on memfds,
   which mainline does not. Patch 0010 is the C driver of the Android
@@ -928,8 +920,8 @@ Cuttlefish changes beyond what a bootloader and its launcher would give it:
   archive of l4h's and a bootconfig. Both ramdisks are legacy LZ4, which
   ends only with the data or a zero frame length, so four zero bytes end it
   before l4h's archive. That archive replaces the first-stage fstab (the
-  same partitions, without AVB: the device is unlocked) and the modules
-  first-stage init loads with l4h's `virtio_gpu` and its dependencies.
+  same partitions, without AVB: the device is unlocked) and clears the
+  vendor's first-stage module lists: l4h's display drivers are built in.
 - **The disk** is one GPT, whose partitions first-stage init finds by name
   on the platform device all virtio-l4h disks hang off
   (`androidboot.boot_devices=virtio-l4h`): misc, frp, metadata, odm, super
@@ -964,10 +956,9 @@ pages with a file descriptor passed back, userfaultfd faults from user code
 and kernel copies, signals during such a fault, `MREMAP_DONTUNMAP` filled
 back through userfaultfd, `UFFDIO_MOVE`, RTC alarms and setting, the alarm
 clocks, code written through one memfd mapping and run through another, a
-dma-buf heap, vkms (a mode, page flips, vblanks, and written-back frames
-matching the buffer shown), a PSI trigger, zram swap, SELinux, bootconfig
+dma-buf heap, a PSI trigger, zram swap, SELinux, bootconfig
 and uinput. A second boot without those parameters checks that SELinux,
-PSI, bootconfig and a display stay off.
+PSI and bootconfig stay off.
 
 ### 5.9 AArch64 userspace on x86_64 with kemu
 
@@ -3100,8 +3091,8 @@ Common behaviour:
 
 `l4h-vmm` serves a virtio-gpu device (2D, one scanout; `gpu.rs`), which dom0
 gives a VM before it starts (`gpu_attach`, `l4hctl create --gpu WxH`), with
-that size as the preferred mode. The guest uses Linux's `virtio_gpu`
-module.
+that size as the preferred mode. Linux's built-in `virtio_gpu` driver
+probes the device automatically.
 
 - **Buffers stay in the I/O pool.** As every virtio-l4h device, it requires
   `VIRTIO_F_ACCESS_PLATFORM`, so a resource's backing is the pool pages the
@@ -3804,7 +3795,7 @@ into the guest's boot blocks, builds the kernel VSpace and
 `struct l4h_bootinfo`, then starts vCPU0 at the entry point with `rdi`
 (`x0` on aarch64) pointing at boot info. It holds:
 
-- a magic number and the guest ABI version (`L4H_ABI_VERSION`, currently 9);
+- a magic number and the guest ABI version (`L4H_ABI_VERSION`, currently 10);
 - the guest id;
 - RAM size, direct-map base (`ram_base_va`), block and boot-block counts;
 - the kernel's end and the initramfs's GPA and size;
@@ -3813,7 +3804,7 @@ into the guest's boot blocks, builds the kernel VSpace and
 - the time-counter frequency (`tsc_hz`);
 - boot flags (`L4H_BOOT_DOM0`);
 - the device table;
-- the kernel module image's address and size (`kmod_va`, `kmod_size`);
+- the build SDK's address and size (`sdk_va`, `sdk_size`);
 - the command line;
 - on aarch64, the CPU feature ID registers.
 
@@ -3826,13 +3817,13 @@ with layout assertions.
 
 **Boot modules.** `tools/build-host.sh` builds the services and root, and
 `host/l4h-root/build.rs` embeds the services' ELFs (vmmgr's embeds
-l4h-vmm's). The guest kernel and its module tree (§5.6), dom0's initramfs
-and the host settings are named modules (`guest-kernel`, `guest-kmods`,
+l4h-vmm's). The guest kernel and its build SDK (§5.6), dom0's initramfs
+and the host settings are named modules (`guest-kernel`, `guest-sdk`,
 `dom0-initrd`, `l4h-config`); root has none built in. They come from:
 
 - **the boot loader** (deployment). l4h ships as one UEFI application per
   seL4 variant (§11), the same for every host. GRUB passes the guest kernel
-  and its module tree from its memdisk, and `/l4h/dom0/initrd` and
+  and its build SDK from its memdisk, and `/l4h/dom0/initrd` and
   `/l4h/l4h.conf` from the EFI partition, as boot modules; on BIOS, GRUB
   passes the same files from a directory on a filesystem. seL4 keeps them
   intact (patch 0021), and root keeps them mapped, since restarting dom0
@@ -3844,12 +3835,12 @@ and the host settings are named modules (`guest-kernel`, `guest-kmods`,
   writes the segment's address and size into an anchor static in root
   (`bootmod.rs`). The kernel or loader maps them with the rest of root; no
   Rust is rebuilt. The QEMU scripts do this from `L4H_GUEST_KERNEL`,
-  `L4H_GUEST_KMODS`, `L4H_DOM0_INITRD` and `L4H_CONFIG`
+  `L4H_GUEST_SDK`, `L4H_DOM0_INITRD` and `L4H_CONFIG`
   (`tools/dom0-modules.sh`).
 
 Boot loader modules win over appended ones of the same name. Without a
 `guest-kernel`, root starts no vmmgr and no guests and serves only the
-serial monitor. Root maps the guest kernel, its module tree and dom0's
+serial monitor. Root maps the guest kernel, its build SDK and dom0's
 initramfs read-only into vmmgr, which loads dom0 from them.
 
 **Settings.** dom0's memory, vCPUs, I/O pool, disks and its window of disk
@@ -4507,9 +4498,9 @@ root.
   of it (§10). Its requests still waiting for a driver are answered
   `ENOENT` then, so a control request waiting on them is answered; the
   token stays taken until the driver answers too, which root then drops.
-- **Boot modules.** Root maps the guest kernel, its module tree and dom0's
+- **Boot modules.** Root maps the guest kernel, its build SDK and dom0's
   initramfs read-only into vmmgr, with a CNode of their frames, so guests
-  can share the kernel's read-only blocks and the module tree (§5.6).
+  can share the kernel's read-only blocks and the build SDK (§5.6).
 - **dom0's devices.** Root makes the switches at boot, attaches the uplinks,
   and chooses dom0's disks and vNICs (`Dom0Plan`); vmmgr creates every dom0
   with them. A dom0 that cannot be built (memory, or a plan that does not
@@ -4710,7 +4701,7 @@ injects these failures in a host built with `L4H_TEST_INJECT=1`;
 - **UEFI.** UEFI → EFI wrapper → GRUB (EFI) → multiboot2. `tools/mkefi.sh`
   builds l4h as one UEFI application containing a standalone GRUB whose
   memdisk holds the seL4 kernel, `l4h-root` (with the service ELFs), the
-  guest kernel and its module tree (§5.6). At boot, GRUB looks for
+  guest kernel and its build SDK (§5.6). At boot, GRUB looks for
   `/EFI/L4H/grubenv` on every device.
   Exactly one such file selects the partition containing dom0's initramfs
   and `l4h.conf` through its `l4h_esp_uuid` or `l4h_esp_label`. More than
@@ -4745,7 +4736,7 @@ injects these failures in a host built with `L4H_TEST_INJECT=1`;
   only with SeaBIOS, such as DigitalOcean. BIOS GRUB's core image is read
   into conventional memory and must stay within a few hundred KiB, so it
   cannot hold l4h as a memdisk. `tools/mkbios.sh` builds l4h's files
-  instead: the seL4 kernel, `l4h-root`, the guest kernel, its module tree
+  instead: the seL4 kernel, `l4h-root`, the guest kernel, its build SDK
   and a `grub.cfg` that boots them like the UEFI script. They live in
   `bios/` of a directory `$l4h` that also holds `dom0/initrd` and
   `l4h.conf`. Two GRUBs can run that `grub.cfg`:
@@ -4772,7 +4763,7 @@ injects these failures in a host built with `L4H_TEST_INJECT=1`;
   (Meltdown isolation, xAPIC, no PCID). These seL4 variants share one
   `l4h-root`. It also builds `l4h-fl4.efi` with the pinned public FL4
   kernel and a separately rebuilt host and ABI provider, sharing the same
-  Linux guest and module tree
+  Linux guest and build SDK
   (`tools/build-fl4-efi.sh`, §14.2). FL4 detects the CPU features at boot;
   one application covers its x86_64 targets, with single-kernel boots
   and guest KVM where VT-x or AMD-V is available.
@@ -5017,7 +5008,7 @@ tables, devices and the shared pages another partition writes.
 freestanding multiboot1/multiboot2 image that GRUB (or QEMU's `-kernel`)
 loads at 272 MiB with these modules, each named by its last word:
 `kernel-s0` … `kernel-s7`, `l4h-root`, `l4h-mk.conf`, and `guest-kernel`,
-`guest-kmods`, `dom0-initrd`, `l4h-config` for every partition, where
+`guest-sdk`, `dom0-initrd`, `l4h-config` for every partition, where
 `pN:ROLE` replaces ROLE for partition N. It runs once on the boot CPU:
 
 1. parses the boot information and ACPI (MADT, SRAT, MCFG, FADT), scans
@@ -5427,7 +5418,7 @@ l4h/
   third_party/sddf/  submodule (design reference; no linked C drivers)
   third_party/kemu/  AArch64 userspace emulation in x86_64 guests (submodule)
   third_party/patches/  patches for rust-sel4
-  tools/             build-kernel.sh, build-linux.sh, build-kmods.sh, build-host.sh, mkefi.sh, build-efi.sh,
+  tools/             build-kernel.sh, build-linux.sh, build-sdk.sh, build-host.sh, mkefi.sh, build-efi.sh,
                      add-modules.py, mkbios.sh, mkimage.sh, run-qemu.sh, run-uefi.sh, run-bios.sh,
                      mkinitramfs.sh, install.sh, l4h-attest.py, swtpm.sh, and image builders for clouds
   tests/             integration tests driven by QEMU and console scripting, host-side unit tests, fuzzing
@@ -5445,6 +5436,51 @@ in `kernel/seL4` and `third_party`, retain their own licenses and copyright
 notices.
 
 ### 14.2 Building and running
+
+Release builds use `tools/build-release.sh`. `tools/check-reproducible.sh`
+then builds the committed source again in a fresh checkout at a different
+absolute path and compares SHA-256 checksums of every published artifact,
+including the debug archives, dom0 initramfs and PDF manual. Release CI
+requires this comparison before publishing. A failed rebuild stays under
+`build/reproducibility.*` with its log.
+
+Reproduction needs the same build inputs and tool versions. The release
+workflow pins the Debian container by digest and its apt repositories to
+the 2026-11-14 snapshot. `rust-toolchain.toml` pins the Linux/dom0 Rust
+compiler and the formatter bindgen uses; the host and shim have their own
+nightly pins. Cargo uses the
+checked-in lockfiles. `tools/cargo.sh` pins a newer Cargo build tool with
+the [fix for external path dependency hashes](https://github.com/rust-lang/cargo/commit/20319b9c23978ba630b838654378beccab20ec83)
+and enables `trim-paths`, while retaining the existing Rust compilers.
+Patch 0018 makes Linux's Rust bindings depend on the full configuration
+header, so incremental config changes produce the same generated constants
+and debug information as clean builds.
+FL4's CMake/Cargo build uses the stable compiler pinned in
+`kernel/fl4/rust-toolchain.toml` through `tools/cargo-fl4.sh`.
+Python dependencies are pinned in
+`tools/sel4-requirements.txt`, and downloaded sources have checksums in
+`tools/source-pins.sh`. Use the container and apt sources specified in
+`.github/workflows/release.yml`, then run `tools/ci-setup.sh x86_64` and
+install the workflow's TeX packages. Native builds can use the same scripts,
+but different compiler, GRUB, BusyBox, EROFS or TeX versions can change bytes.
+
+All shipped Linux drivers are built in (§5.6). There is no module signing
+key, generated certificate or signature bundle to supply. Rebuild a release
+from its source commit with the published version:
+
+```sh
+export L4H_VERSION=vRELEASE            # the tag used for the published release
+tools/build-release.sh
+```
+
+`tools/reproducible-env.sh` defaults `SOURCE_DATE_EPOCH` to the source
+commit's timestamp (set it explicitly when building without Git metadata),
+fixes Linux's build counter/user/host and the locale, timezone and umask,
+and remaps checkout paths in C/Rust output. Archives sort entries and
+normalize ownership, modes and timestamps; initramfs also normalizes inode
+and device numbers. The manual uses the same source date. Scratch files
+default to `build/tmp`; an explicit `TMPDIR` is honored. Use the same
+`L4H_VERSION` and `SOURCE_DATE_EPOCH` as the original build when replaying.
 
 The build machine needs:
 
@@ -5524,7 +5560,7 @@ shipped seL4 CPU variants do not apply.
 `L4H_RELEASE=1 tools/build-fl4-efi.sh` builds `build/efi/l4h-fl4.efi` and
 its matching `l4h-debug-fl4-x86_64.tar.xz`; `build-efi.sh` builds them after
 packaging the three seL4 variants. Each host/provider uses its own libsel4
-headers; all four applications carry the same Linux/module image. The FL4
+headers; all four applications carry the same Linux image and build SDK. The FL4
 application carries no multikernel shim. Both debug archives include their
 matching `guest-provider.bin` and `guest-provider.elf`; use the binary with
 `l4h-attest.py measure --provider` and the ELF to decode provider faults. To make a UEFI disk
@@ -5533,7 +5569,7 @@ from the release binary, use `tools/mkimage.sh -e build/efi/l4h-fl4.efi
 
 `tests/run-fl4test.sh` runs the 1- and 4-vCPU self-tests with VMX/SVM hidden,
 4-vCPU disk I/O, networking through a dom0 restart, and balloon reporting.
-With `L4H_RELEASE=1` it also runs the ABI/module-tree test: FL4's debug
+With `L4H_RELEASE=1` it also runs the ABI/SDK test: FL4's debug
 profile omits l4h's debug-syscall MCP filter, so the ABI test's deliberate
 untrapped `DebugHalt` probe requires FL4's release profile.
 On hosts with VMX/SVM and KVM nesting enabled it also runs the KVM test
@@ -5546,7 +5582,7 @@ with `SEL4_PREFIX="$PWD/build/sel4-fl4" L4H_KERNEL_VARIANT=fl4`. Debug runs
 of `tests/run-fl4test.sh` include these probes too.
 Integration CI runs this suite and boots its packaged `l4h-fl4.efi` through
 OVMF with `UEFI_EFI=build/l4h-fl4.efi tests/run-uefitest.sh`, checking
-the module tree and dom0 networking. The tested revision includes upstream
+the build SDK and dom0 networking. The tested revision includes upstream
 fixes for [INT gates](https://github.com/losfair/FL4/issues/1),
 [device alignment](https://github.com/losfair/FL4/issues/2),
 [retype configuration](https://github.com/losfair/FL4/issues/3),
@@ -5619,7 +5655,7 @@ machine and guests of 256–512 MiB.
 | `tests/run-install-vm.sh debian-13-nocloud-amd64.qcow2 [release-directory] [1\|2]` | in a disposable UEFI/KVM VM, install from native Debian with one or two uplinks, verify each switch and network, then return to native Linux; uses prebuilt releases and `sudo -u "$L4H_QEMU_USER"` (defaults to the invoking user); `INSTALL_VM_SWAP_NAMES=1` with two NICs also tests exchanging eth0/eth1 names; `INSTALL_VM_FIRMWARE=bios INSTALL_VM_MEMORY=1G INSTALL_VM_CPUS=1` tests small-VM defaults through BIOS GRUB |
 | `tests/run-versiontest.sh` | host version metadata: release tags, development builds, overrides and worktrees |
 | `tests/run-novtxtest.sh` | builds the host and Linux guest with `KernelVTX=OFF` headers and boots the guest self-test with 1 and 4 vCPUs; Linux KVM stays disabled and root never probes a VCPU object |
-| `tests/run-fl4test.sh` | builds the pinned public FL4 revision (or a frozen `L4H_FL4_SOURCE` override); tests 1- and 4-vCPU Linux with VMX/SVM hidden, 4-vCPU disk I/O, networking and balloon reporting; `L4H_RELEASE=1` also checks the ABI and guest module tree; tests KVM inside 1- and 4-vCPU Linux guests when host nesting is available (`L4H_FL4_KVM=1` requires it, `0` skips it) |
+| `tests/run-fl4test.sh` | builds the pinned public FL4 revision (or a frozen `L4H_FL4_SOURCE` override); tests 1- and 4-vCPU Linux with VMX/SVM hidden, 4-vCPU disk I/O, networking and balloon reporting; `L4H_RELEASE=1` also checks the ABI and guest build SDK; tests KVM inside 1- and 4-vCPU Linux guests when host nesting is available (`L4H_FL4_KVM=1` requires it, `0` skips it) |
 | `tests/run-flagstest.sh` | focused flags-only boot: console/display seals, kernel taints, userspace gates and instance reuse, on either architecture |
 | `tests/run-acstest.sh` | PCIe ACS setup against a model of configuration space: implemented bits only, firmware bits kept, bits that do not stick, hostile capability lists, read-only checks; ECAM window block planning |
 | `tests/run-trusttest.sh` | taint/seal permissions, atomic gates, instances, seqlock snapshots and verifier policy |
@@ -5628,7 +5664,7 @@ machine and guests of 256–512 MiB.
 | `tests/run-vmmfairtest.sh` | x86 real-kernel scheduling: a throttled VMM makes progress against a continuously runnable guest kernel and leaves time for guest users; it cannot restore its MCP or boost, and its parent can restore priority |
 | `tests/run-vmmguardtest.sh` | x86 production-manager priority protection against a VMM spinning before READY; a guest on its core boots and gets CPU, self-boosts fail, and restoring priority retains the lower authority |
 | `tests/run-logtest.sh` | kernel faults, panics and shutdowns retained after VM destruction and queried/followed with l4hctl; also works with `L4H_RELEASE=1` |
-| `tests/run-abitest.sh` | guest ABI and seL4 extensions, from a module built against the module tree |
+| `tests/run-abitest.sh` | guest ABI and seL4 extensions, from a probe built against the SDK |
 | `python3 tests/bootmem-qemu.py` | boot RAM clearing, initial untyped watermarks, root-task entry and AArch64 TLS capture before the kernel lock; built debug kernel/root and GDB required, `L4H_ARCH=aarch64` also needs the loader and gdb-multiarch |
 | `tests/run-selftest.sh [vcpus]` | syscalls, memory, signals, fork, threads, futex, SMP stress |
 | `tests/run-kemutest.sh [vcpus]` | AArch64 userspace on x86_64: kemu syscalls, signals, TLS, threads, fork/exec, ptrace, single-step, vector state and FP exception flags |

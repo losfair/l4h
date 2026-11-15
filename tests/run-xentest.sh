@@ -15,7 +15,7 @@ rm -f "$log"
     || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
 "$l4h_objcopy" --strip-debug "$l4h_linux_out/vmlinux" "$l4h_linux_out/vmlinux.stripped"
 "$l4h_host_build"
-L4H_GUEST_KERNEL=$l4h_linux_out/vmlinux.stripped L4H_GUEST_KMODS= \
+L4H_GUEST_KERNEL=$l4h_linux_out/vmlinux.stripped L4H_GUEST_SDK= \
     "$root/tools/mkefi.sh" "$out/l4h.efi" >/dev/null
 "$root/tools/mkinitramfs.sh" "$out/xenvm.cpio.gz" "$root/tests/guest/init-xenvm" >/dev/null
 

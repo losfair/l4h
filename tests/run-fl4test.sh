@@ -4,7 +4,7 @@
 # Exercise SMP, device memory, networking, free-page reporting and KVM.
 # KVM runs when the host exposes VMX/SVM and KVM nesting is enabled.
 # L4H_FL4_KVM=1 requires it; =0 skips it; the default is auto-detection.
-# L4H_RELEASE=1 also runs the ABI/module-tree test: FL4's debug profile
+# L4H_RELEASE=1 also runs the ABI/SDK test: FL4's debug profile
 # intentionally has no l4h debug-syscall MCP filter.
 set -euo pipefail
 # e2fsprogs installs mkfs.ext4 and debugfs outside an ordinary user's PATH.

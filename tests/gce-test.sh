@@ -44,7 +44,7 @@ gcc -O2 -static -pthread -o "$out/selftest" "$root/tests/guest/selftest.c"
     "$out/selftest.cpio.gz" "$out/disk.cpio.gz" "$out/vm.cpio.gz" >/dev/null
 L4H_DOM0_DISKS=0 L4H_DOM0_MEM_MB=1024 L4H_DOM0_CMDLINE=console=hvc0 L4H_WATCHDOG_SECS=${L4H_WATCHDOG_SECS:-0} \
     "$root/tools/build-host.sh"
-L4H_GUEST_KERNEL=$out/vmlinux L4H_GUEST_KMODS= \
+L4H_GUEST_KERNEL=$out/vmlinux L4H_GUEST_SDK= \
     "$root/tools/mkimage.sh" -i "$out/dom0.cpio.gz" "$out/$name.raw" >/dev/null
 "$root/tools/gce-image.sh" "$out/$name.raw" "$name" >/dev/null
 rm -f "$out/$name.raw"

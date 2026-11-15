@@ -2,6 +2,7 @@
 # Build the patched seL4 kernel for aarch64 (QEMU virt) into build/sel4-aarch64.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
+source "$root/tools/reproducible-env.sh"
 src=$root/build/seL4-src
 out=$root/build/kernel-aarch64
 prefix=$root/build/sel4-aarch64
@@ -12,7 +13,7 @@ debug=ON
 [ "${L4H_RELEASE:-0}" = 1 ] && debug=OFF
 config=$root/kernel/configs/l4h-aarch64.cmake
 [ "$config" -nt "$out/CMakeCache.txt" ] && rm -rf "$out"
-cmake -G Ninja -S "$src" -B "$out" \
+cmake -DCMAKE_C_FLAGS="$l4h_prefix_map" -DCMAKE_ASM_FLAGS="$l4h_prefix_map" -G Ninja -S "$src" -B "$out" \
     -C "$config" \
     -DKernelDebugBuild=$debug \
     -DQEMU_MEMORY="$l4h_memory_mb" \

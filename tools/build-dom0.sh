@@ -8,6 +8,7 @@
 #   install/           installer and static initramfs for existing Linux roots
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
+source "$root/tools/reproducible-env.sh"
 out=$root/build/efi
 mkdir -p "$out"
 "$root/tools/build-l4hctl.sh"
@@ -47,5 +48,5 @@ dom0_cmdline="console=hvc0"
 # serial_irq=3
 # uplink_nic=01:00.1
 CONF
-tar -C "$pkg" -cJf "$out/l4h-dom0-x86_64.tar.xz" l4h-dom0-x86_64
+l4h_tar -C "$pkg" -cJf "$out/l4h-dom0-x86_64.tar.xz" l4h-dom0-x86_64
 echo "$out/l4h-dom0-x86_64.tar.xz: $(( $(stat -c %s "$out/l4h-dom0-x86_64.tar.xz") >> 10 )) KiB"

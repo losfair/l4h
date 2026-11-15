@@ -27,6 +27,9 @@ CONFIG_PACKET=y
 CONFIG_UNIX=y
 CONFIG_INET=y
 CONFIG_TCP_CONG_ADVANCED=y
+CONFIG_TCP_CONG_BIC=y
+CONFIG_TCP_CONG_WESTWOOD=y
+CONFIG_TCP_CONG_HTCP=y
 CONFIG_TCP_CONG_BBR=y
 CONFIG_IP_SCTP=y
 CONFIG_NET_SCHED=y
@@ -214,7 +217,6 @@ CONFIG_EROFS_FS=y
 CONFIG_EROFS_FS_XATTR=y
 CONFIG_EROFS_FS_POSIX_ACL=y
 CONFIG_EROFS_FS_ZIP=y
-# The module tree the host gives every guest (/dev/l4hkmod).
 CONFIG_EROFS_FS_ZIP_LZMA=y
 CONFIG_XFS_FS=y
 CONFIG_XFS_POSIX_ACL=y
@@ -282,8 +284,10 @@ CONFIG_SECURITYFS=y
 CONFIG_SECURITY_LOCKDOWN_LSM=y
 CONFIG_SECURITY_LOCKDOWN_LSM_EARLY=y
 CONFIG_LOCK_DOWN_KERNEL_FORCE_NONE=y
-# Keep the shipped modules loadable in guests that enable lockdown.
-CONFIG_MODULE_SIG_ALL=y
+# Drivers are built in. Lockdown retains verification to reject external
+# modules, but there is no signing key, signing step or generated certificate.
+# CONFIG_MODULE_SIG_ALL is not set
+CONFIG_MODULE_SIG_KEY=""
 # Android guests (DESIGN.md §5.8).  What only Android uses is off until an
 # Android guest asks for it on its command line, so other guests run as
 # before: SELinux with lsm=selinux, PSI with psi=1, bootconfig with
@@ -326,17 +330,14 @@ CONFIG_HW_RANDOM=y
 CONFIG_RTC_CLASS=y
 # CONFIG_RTC_HCTOSYS is not set
 # CONFIG_RTC_SYSTOHC is not set
-# Graphics buffers and fences, for gralloc and the compositor; evdev and
-# uinput.  The display is vkms, which composes in software and has no
-# output but its writeback connector.  It is a module: loaded, it adds a
-# display to the guest.
+# Graphics buffers and fences for the built-in virtio-gpu display; evdev
+# and uinput for guest input.
 CONFIG_DMABUF_HEAPS=y
 CONFIG_DMABUF_HEAPS_SYSTEM=y
 CONFIG_SYNC_FILE=y
-CONFIG_DRM=m
-CONFIG_DRM_VKMS=m
+CONFIG_DRM=y
 # The host's display (l4h-vmm's virtio-gpu, DESIGN.md §9.6).
-CONFIG_DRM_VIRTIO_GPU=m
+CONFIG_DRM_VIRTIO_GPU=y
 # CONFIG_HWMON is not set
 CONFIG_INPUT_EVDEV=y
 # CONFIG_INPUT_KEYBOARD is not set
@@ -354,6 +355,7 @@ CONFIG_INPUT_UINPUT=y
 CONFIG_HID_SUPPORT=y
 CONFIG_HID=y
 CONFIG_HIDRAW=y
+CONFIG_I2C_HID=y
 CONFIG_USB_HID=y
 CONFIG_USB_SUPPORT=y
 CONFIG_USB=y

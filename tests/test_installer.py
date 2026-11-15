@@ -41,7 +41,7 @@ class Machine:
         self.write("/proc/1/comm", "systemd")
         self.write("/sys/devices/system/cpu/vulnerabilities/meltdown", "Not affected")
         self.write("/sbin/init", "init", 0o755)
-        for path in ("/lib/modules", "/dev", "/proc", "/sys", "/run", "/usr", "/etc", "/boot/efi"):
+        for path in ("/dev", "/proc", "/sys", "/run", "/usr", "/etc", "/boot/efi"):
             self.path(path).mkdir(parents=True, exist_ok=True)
         self.pci("00:04.0", 0x1AF4, 0x1042, 0x010000)
         self.links = [dict(ifname="lo", link_type="loopback")]
@@ -1141,7 +1141,7 @@ class BiosInstallerTests(UpdateChecks, Harness):
 
     def bios_package(self):
         bios = self.root / "bios"
-        for name in ("grub.cfg", "kmods.erofs"):
+        for name in ("grub.cfg", "sdk.erofs"):
             self.machine.write("/bios/" + name, "release " + name)
         for name in ("l4h-root.elf", "vmlinux"):
             self.machine.write("/bios/" + name, elf())
@@ -1247,7 +1247,7 @@ class BiosInstallerTests(UpdateChecks, Harness):
         self.assertEqual(self.machine.path("/boot/vmlinuz").read_text(), "native kernel")
         bios = self.machine.path("/boot/l4h/bios")
         self.assertEqual(sorted(p.name for p in bios.iterdir()),
-                         ["grub.cfg", "kernel.elf", "kmods.erofs", "l4h-root.elf", "vmlinux"])
+                         ["grub.cfg", "kernel.elf", "l4h-root.elf", "sdk.erofs", "vmlinux"])
         self.assertTrue((bios / "kernel.elf").read_bytes().endswith(b"generic"))
         self.assertEqual(self.machine.path("/boot/l4h/dom0/initrd").read_text(), "release install/initrd")
         self.assertIn("dom0_mem_mb=", self.machine.path("/boot/l4h/l4h.conf").read_text())

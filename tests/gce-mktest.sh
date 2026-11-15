@@ -49,7 +49,7 @@ printf 'dom0_cmdline="console=hvc0 MKP=0 MKPEER=1 MKURL=%s%s"\ndom0_mem_mb=512\n
 # VM's first NIC only: the second's gateway is its subnet's first address.
 printf 'dom0_cmdline="console=hvc0 MKP=1 MKPEER=0 MKGW=10.200.0.1 MKDNS=8.8.8.8 MKURL=%s%s"\ndom0_mem_mb=512\nuplink_nic=00:06.0\n' \
     "$url" "$stress" > "$out/esp/p1/l4h.conf"
-L4H_GUEST_KMODS= L4H_GUEST_KERNEL="$out/vmlinux" "$root/tools/mkimage.sh" -i "$out/dom0.cpio.gz" -m "$out/esp" \
+L4H_GUEST_SDK= L4H_GUEST_KERNEL="$out/vmlinux" "$root/tools/mkimage.sh" -i "$out/dom0.cpio.gz" -m "$out/esp" \
     "$out/$name.raw" "$out/l4h-root.elf" >/dev/null
 "$root/tools/gce-image.sh" "$out/$name.raw" "$name" >/dev/null
 rm -f "$out/$name.raw"

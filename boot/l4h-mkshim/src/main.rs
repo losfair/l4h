@@ -7,7 +7,7 @@
 //! - `kernel-s0` … `kernel-s7`: seL4 built for each slot (L4H_KERNEL_SLOT);
 //! - `l4h-root`: the root task, the same in every partition;
 //! - `l4h-mk.conf`: the split (conf.rs);
-//! - `guest-kernel`, `guest-kmods`, `dom0-initrd`, `l4h-config`: as for a
+//! - `guest-kernel`, `guest-sdk`, `dom0-initrd`, `l4h-config`: as for a
 //!   single kernel, for every partition; `pN:ROLE` replaces ROLE for
 //!   partition N alone.
 //!
@@ -346,8 +346,8 @@ extern "C" fn shim_main(magic: u32, info: u64) -> ! {
     for k in 0..n {
         let mut name: Str<16> = Str::new();
         let _ = write!(name, "kernel-s{}", k);
-        let kmod = bi.module(name.as_str()).unwrap_or_else(|| fail(format_args!("no {} module", name.as_str())));
-        entries[k] = load_kernel(kmod, plans[k].slot);
+        let kernel_mod = bi.module(name.as_str()).unwrap_or_else(|| fail(format_args!("no {} module", name.as_str())));
+        entries[k] = load_kernel(kernel_mod, plans[k].slot);
         let desc_bytes = unsafe {
             core::slice::from_raw_parts((&raw const DESCS[k]) as *const u8, core::mem::size_of::<Descriptor>())
         };
@@ -390,7 +390,7 @@ fn collect_modules(bi: &BootInfo, plans: &mut [Plan]) {
         p.mods.clear();
         p.mods.must_push((Str::from("l4h-root"), root.bytes()));
         p.mods.must_push((Str::from("l4h-partition"), &[]));
-        for role in ["guest-kernel", "guest-kmods", "dom0-initrd", "l4h-config"] {
+        for role in ["guest-kernel", "guest-sdk", "dom0-initrd", "l4h-config"] {
             let mut own: Str<32> = Str::new();
             let _ = write!(own, "p{}:{}", k, role);
             if let Some(m) = bi.module(own.as_str()).or_else(|| bi.module(role)) {

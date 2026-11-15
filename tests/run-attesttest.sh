@@ -36,7 +36,7 @@ boot() {  # boot <name> <tpm-crb|tpm-tis> [extra initramfs files...]
     shift 2
     "$root/tools/mkinitramfs.sh" "$out/run/$name.cpio.gz" "$root/tests/guest/init-attest" \
         "$l4h_ctl" "$out/run/vm.cpio.gz" "$@" >/dev/null
-    env "${image_env[@]}" L4H_GUEST_KERNEL="$out/run/vmlinux" L4H_GUEST_KMODS= \
+    env "${image_env[@]}" L4H_GUEST_KERNEL="$out/run/vmlinux" L4H_GUEST_SDK= \
         "$root/tools/mkimage.sh" -i "$out/run/$name.cpio.gz" -c "$out/run/l4h.conf" \
         "$out/run/$name.raw" >/dev/null
     "$root/tools/swtpm.sh" "$out/tpm"

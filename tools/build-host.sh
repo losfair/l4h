@@ -6,6 +6,7 @@
 # task's cargo build.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
+source "$root/tools/reproducible-env.sh"
 export L4H_VERSION=$("$root/tools/version.sh")
 cd "$root/host"
 # L4H_RELEASE=1 builds the shipped, optimised components (the cargo release
@@ -26,7 +27,7 @@ strip() {
 nicds=(virtio gvnic ena ixgbe e1000e mlx5 r8125)
 nicd_pkgs=()
 for d in "${nicds[@]}"; do nicd_pkgs+=(-p "l4h-nicd-$d"); done
-cargo build -q "${l4h_cargo_profile[@]}" --target x86_64-sel4 -p l4h-vmm -p l4h-blkd -p l4h-netd -p l4h-trustd -p l4h-memd -p l4h-logd -p l4h-usbd \
+"$root/tools/cargo.sh" build "${l4h_cargo[@]}" -q "${l4h_cargo_profile[@]}" --target x86_64-sel4 -p l4h-vmm -p l4h-blkd -p l4h-netd -p l4h-trustd -p l4h-memd -p l4h-logd -p l4h-usbd \
     "${nicd_pkgs[@]}"
 strip vmm blkd netd trustd memd logd usbd "${nicds[@]/#/nicd-}"
 # The NIC drivers, as the bundle root has built in (the l4h-drivers boot
@@ -40,6 +41,6 @@ cmp -s "$out/stripped/l4h-drivers.bin.new" "$out/stripped/l4h-drivers.bin" \
     && rm "$out/stripped/l4h-drivers.bin.new" || mv "$out/stripped/l4h-drivers.bin.new" "$out/stripped/l4h-drivers.bin"
 export L4H_DRIVERS_BIN=$out/stripped/l4h-drivers.bin
 # vmmgr embeds l4h-vmm, root embeds vmmgr.
-cargo build -q "${l4h_cargo_profile[@]}" --target x86_64-sel4 -p l4h-vmmgr
+"$root/tools/cargo.sh" build "${l4h_cargo[@]}" -q "${l4h_cargo_profile[@]}" --target x86_64-sel4 -p l4h-vmmgr
 strip vmmgr
-cargo build -q "${l4h_cargo_profile[@]}" -p l4h-root "$@"
+"$root/tools/cargo.sh" build "${l4h_cargo[@]}" -q "${l4h_cargo_profile[@]}" -p l4h-root "$@"
