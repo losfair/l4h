@@ -1954,16 +1954,14 @@ The provider is \texttt{l4h}.
 The verifier checks both with \cmd{tools/l4h-attest.py}, which is also a
 release file and needs Python's \texttt{cryptography} package:
 \begin{lstlisting}[language=bash]
-tools/l4h-attest.py measure vmlinux --provider guest-provider.bin \
-    --initrd initrd --cmdline "console=hvc0"
+tools/l4h-attest.py measure vmlinux --initrd initrd --cmdline "console=hvc0"
 tools/l4h-attest.py verify report evidence --data $NONCE --launch $DIGEST \
     --ak-name $AK --pcr 4=$PCR4 --ek-ca manufacturer-ca.pem
 \end{lstlisting}
 \cmd{measure} prints the launch digest a guest gets from those files;
 \file{vmlinux} is the host's guest kernel (in a release, the one in
-\file{l4h-debug-x86\_64.tar.xz}), and \file{guest-provider.bin} must come
-from the same host build (use the FL4 debug archive for FL4). With
-\cmd{l4hctl create}, the command line is the one given with
+\file{l4h-debug-x86\_64.tar.xz}). The ABI provider is covered by the host's
+EFI measurement. With \cmd{l4hctl create}, the command line is the one given with
 \texttt{--cmdline}; for dom0, it is \texttt{dom0\_cmdline}. \cmd{verify}
 fails unless every check holds:
 \begin{itemize}

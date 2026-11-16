@@ -28,7 +28,7 @@
 
 """Verifier side of l4h attestation (DESIGN.md §10.2).
 
-  l4h-attest.py measure KERNEL --provider F [--initrd F] [--cmdline S]
+  l4h-attest.py measure KERNEL [--initrd F] [--cmdline S]
       The launch digest of a guest booted with these files: what its
       reports carry as "launch".
   l4h-attest.py verify REPORT EVIDENCE [--data HEX] [--launch HEX]
@@ -252,8 +252,8 @@ def point(key):
 # ---- measure
 
 
-def launch_digest(kernel, initrd, cmdline, provider):
-    """The digest root computes at boot (guest.rs, Guest::measure)."""
+def launch_digest(kernel, initrd, cmdline):
+    """The digest vmmgr computes at boot (guest.rs, Guest::measure)."""
     if kernel[:4] != b"\x7fELF" or kernel[4] != 2 or kernel[5] != 1:
         raise Fail("kernel: not a 64-bit little-endian ELF")
     entry, phoff = struct.unpack_from("<QQ", kernel, 24)
@@ -274,9 +274,7 @@ def launch_digest(kernel, initrd, cmdline, provider):
     for v, _, data in loads:
         image[v - base:v - base + len(data)] = data
     cmd = cmdline.encode()[:2047]
-    h = hashlib.sha256(b"l4h-launch-v2")
-    h.update(struct.pack("<QQ", 0x00007ff000010000, len(provider)))
-    h.update(provider)
+    h = hashlib.sha256(b"l4h-launch-v1")
     h.update(struct.pack("<QQQ", base, entry, end))
     h.update(image)
     h.update(struct.pack("<Q", len(initrd)))
@@ -520,7 +518,6 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     m = sub.add_parser("measure")
     m.add_argument("kernel")
-    m.add_argument("--provider", required=True, help="matching guest-provider.bin from the debug archive")
     m.add_argument("--initrd")
     m.add_argument("--cmdline", default="")
     v = sub.add_parser("verify")
@@ -542,7 +539,7 @@ def main():
     try:
         if a.cmd == "measure":
             initrd = open(a.initrd, "rb").read() if a.initrd else b""
-            print(launch_digest(open(a.kernel, "rb").read(), initrd, a.cmdline, open(a.provider, "rb").read()).hex())
+            print(launch_digest(open(a.kernel, "rb").read(), initrd, a.cmdline).hex())
         elif a.cmd == "verify":
             pins = {}
             for p in a.pcr:

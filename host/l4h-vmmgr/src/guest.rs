@@ -930,10 +930,7 @@ impl Guest {
     fn measure(&self, win: &mut Window, entry: u64, kernel_end: usize, initrd: (usize, usize), cmdline: &[u8]) -> [u8; 32] {
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
-        h.update(b"l4h-launch-v2");
-        h.update(abi::PROVIDER_VA.to_le_bytes());
-        h.update((crate::provider::IMAGE.len() as u64).to_le_bytes());
-        h.update(crate::provider::IMAGE);
+        h.update(b"l4h-launch-v1");
         h.update((self.ram_base as u64).to_le_bytes());
         h.update(entry.to_le_bytes());
         h.update((kernel_end as u64).to_le_bytes());

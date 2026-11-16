@@ -738,8 +738,8 @@ arguments, including pool addresses, device indices and lifecycle state.
   provider linker refuses writable globals and oversized TLS. All mutable
   state, including libsel4 TLS, belongs to each guest and vCPU. Linux callbacks
   run on the caller's stack; calls add no host IPC round trip. The provider
-  bytes are included in the launch digest. KVM stays compiled into the common
-  x86_64 image and is enabled only when the host supplies EPT roots. ABI 10
+  is covered by the host's EFI measurement (§10.2). KVM stays compiled into
+  the common x86_64 image and is enabled only when the host supplies EPT roots. ABI 10
   defines this bootstrap contract; old guest binaries cannot boot it.
 - **Built-in drivers.** All shipped drivers are built into Linux, sharing
   their text and rodata between guests.
@@ -4095,9 +4095,11 @@ The chain has four links.
    swtpm, start takes 0.4 to 0.6 s; earlier guest requests are answered
    once it is done.
 3. **Reports on guests.** vmmgr measures each guest as it boots it, dom0
-   included. The launch digest is `SHA-256("l4h-launch-v2" ‖ provider_va ‖
-   provider length ‖ provider bytes ‖ ram_base_va ‖ entry ‖ kernel_end ‖
-   RAM[0, kernel_end) ‖ initrd size ‖ initrd ‖ cmdline length ‖ cmdline)`, with u64 little-endian integers.
+   included. The launch digest is `SHA-256("l4h-launch-v1" ‖ ram_base_va ‖
+   entry ‖ kernel_end ‖ RAM[0, kernel_end) ‖ initrd size ‖ initrd ‖ cmdline
+   length ‖ cmdline)`, with u64 little-endian integers. The immutable ABI
+   provider is part of the host's EFI measurement, so the launch digest
+   identifies the same workload across approved host builds.
    - vmmgr reads the image back from guest RAM before the guest starts, and
      `vm_start` fails if dom0 loaded anything outside the initramfs. vmmgr is
      in the host TCB for this: whoever builds a guest can make it run
@@ -5562,9 +5564,9 @@ its matching `l4h-debug-fl4-x86_64.tar.xz`; `build-efi.sh` builds them after
 packaging the three seL4 variants. Each host/provider uses its own libsel4
 headers; all four applications carry the same Linux image and build SDK. The FL4
 application carries no multikernel shim. Both debug archives include their
-matching `guest-provider.bin` and `guest-provider.elf`; use the binary with
-`l4h-attest.py measure --provider` and the ELF to decode provider faults. To make a UEFI disk
-from the release binary, use `tools/mkimage.sh -e build/efi/l4h-fl4.efi
+matching `guest-provider.bin` and `guest-provider.elf`; use the ELF to decode
+provider faults. To make a UEFI disk from the release binary, use
+`tools/mkimage.sh -e build/efi/l4h-fl4.efi
 -i dom0.cpio.gz -c l4h.conf build/l4h-fl4.raw`.
 
 `tests/run-fl4test.sh` runs the 1- and 4-vCPU self-tests with VMX/SVM hidden,
