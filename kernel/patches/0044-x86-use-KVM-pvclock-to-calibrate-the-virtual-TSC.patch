@@ -1,0 +1,156 @@
+From 886892ed0116a379307be6b9cd91d22fb3f9f039 Mon Sep 17 00:00:00 2001
+From: l4h <l4h@localhost>
+Date: Mon, 16 Nov 2026 20:52:11 +0100
+Subject: [PATCH] x86: use KVM pvclock to calibrate the virtual TSC
+
+GCE C3 exposes a physical CPUID.15 rate of 1900 MHz while its virtual TSC runs at 2700 MHz. Prefer the KVM pvclock scale, unregister the boot buffer after reading it, and do not use native CPUID or platform MSR rates under a hypervisor. Keep PIT calibration as the fallback.
+---
+ include/plat/pc99/plat/machine/kvm-clock.h | 90 ++++++++++++++++++++++
+ src/plat/pc99/machine/hardware.c           | 13 +++-
+ 2 files changed, 101 insertions(+), 2 deletions(-)
+ create mode 100644 include/plat/pc99/plat/machine/kvm-clock.h
+
+diff --git a/include/plat/pc99/plat/machine/kvm-clock.h b/include/plat/pc99/plat/machine/kvm-clock.h
+new file mode 100644
+index 000000000..62f0b957b
+--- /dev/null
++++ b/include/plat/pc99/plat/machine/kvm-clock.h
+@@ -0,0 +1,90 @@
++/*
++ * Copyright 2026, L4H contributors
++ *
++ * SPDX-License-Identifier: GPL-2.0-only
++ */
++
++#pragma once
++
++/* KVM's virtual TSC can differ from the physical rate in CPUID 0x15.
++ * Query its pvclock scale once at boot, then unregister the buffer before
++ * boot memory is reclaimed. See Documentation/virt/kvm/x86/msr.rst. */
++struct kvm_clock_info {
++    uint32_t version;
++    uint32_t pad;
++    uint64_t tsc_timestamp;
++    uint64_t system_time;
++    uint32_t mul;
++    int8_t shift;
++    uint8_t flags;
++    uint8_t reserved[2];
++};
++
++static BOOT_BSS volatile struct kvm_clock_info kvm_boot_clock ALIGN(32);
++
++BOOT_CODE static uint32_t kvm_clock_msr(void)
++{
++    if (!(x86_cpuid_ecx(1, 0) & BIT(31)) ||
++        x86_cpuid_ebx(0x40000000, 0) != CPUID_KVM_EBX ||
++        x86_cpuid_ecx(0x40000000, 0) != CPUID_KVM_ECX ||
++        x86_cpuid_edx(0x40000000, 0) != CPUID_KVM_EDX) {
++        return 0;
++    }
++    /* Old KVM advertised max leaf 0, meaning 0x40000001. */
++    uint32_t max_leaf = x86_cpuid_eax(0x40000000, 0);
++    if (max_leaf != 0 && max_leaf < 0x40000001) {
++        return 0;
++    }
++    uint32_t features = x86_cpuid_eax(0x40000001, 0);
++    if (features & BIT(3)) {
++        return 0x4b564d01;
++    }
++    return (features & BIT(0)) ? 0x12 : 0;
++}
++
++BOOT_CODE static uint32_t kvm_scale_mhz(uint32_t mul, int shift)
++{
++    if (mul == 0 || shift < -31 || shift > 31) {
++        return 0;
++    }
++    uint64_t khz = (1000000ull << 32) / mul;
++    if (shift < 0) {
++        if (khz > (~0ull >> -shift)) {
++            return 0;
++        }
++        khz <<= -shift;
++    } else {
++        khz >>= shift;
++    }
++    uint64_t mhz = khz / 1000 + (khz % 1000 >= 500);
++    return mhz <= 0xffffffffu ? (uint32_t)mhz : 0;
++}
++
++BOOT_CODE static uint32_t tsc_kvm_mhz(void)
++{
++    uint32_t msr = kvm_clock_msr();
++    if (msr == 0) {
++        return 0;
++    }
++    asm volatile("" ::: "memory");
++    x86_wrmsr(msr, kpptr_to_paddr((void *)&kvm_boot_clock) | 1);
++    asm volatile("" ::: "memory");
++    uint32_t mhz = 0;
++    /* The hypervisor may update the fields at any time while registered.
++     * Bound the retry even if it supplies no usable version/scale. */
++    for (unsigned i = 0; i < 10000; i++) {
++        uint32_t version = kvm_boot_clock.version;
++        asm volatile("" ::: "memory");
++        uint32_t mul = kvm_boot_clock.mul;
++        int shift = kvm_boot_clock.shift;
++        asm volatile("" ::: "memory");
++        if (version != 0 && !(version & 1) && version == kvm_boot_clock.version) {
++            mhz = kvm_scale_mhz(mul, shift);
++            break;
++        }
++    }
++    asm volatile("" ::: "memory");
++    x86_wrmsr(msr, 0);
++    asm volatile("" ::: "memory");
++    return mhz;
++}
+diff --git a/src/plat/pc99/machine/hardware.c b/src/plat/pc99/machine/hardware.c
+index c9b73b5bc..0b40012af 100644
+--- a/src/plat/pc99/machine/hardware.c
++++ b/src/plat/pc99/machine/hardware.c
+@@ -13,6 +13,7 @@
+ #include <plat/machine/pic.h>
+ #include <plat/machine/ioapic.h>
+ #include <plat/machine.h>
++#include <plat/machine/kvm-clock.h>
+ 
+ #include <plat/machine/intel-vtd.h>
+ 
+@@ -105,7 +106,8 @@ BOOT_CODE static inline uint32_t measure_tsc_khz(void)
+  * so the PIT cannot be relied on to measure it. */
+ BOOT_CODE static uint32_t tsc_cpuid_mhz(void)
+ {
+-    if (x86_cpuid_get_identity()->vendor != X86_VENDOR_INTEL) {
++    if ((x86_cpuid_ecx(1, 0) & BIT(31)) ||
++        x86_cpuid_get_identity()->vendor != X86_VENDOR_INTEL) {
+         return 0;
+     }
+     uint32_t max_leaf = x86_cpuid_eax(0x0, 0x0);
+@@ -135,6 +137,12 @@ BOOT_CODE static uint32_t tsc_measure_mhz(void)
+     return CONFIG_PC99_TSC_FREQUENCY / 1000000;
+ #endif
+ 
++    uint32_t kvm_mhz = tsc_kvm_mhz();
++    if (kvm_mhz != 0) {
++        printf("TSC frequency from KVM pvclock: %lu MHz\n", (long) kvm_mhz);
++        return kvm_mhz;
++    }
++
+     uint32_t cpuid_mhz = tsc_cpuid_mhz();
+     if (cpuid_mhz != 0) {
+         printf("TSC frequency from CPUID: %lu MHz\n", (long) cpuid_mhz);
+@@ -153,7 +161,8 @@ BOOT_CODE static uint32_t tsc_measure_mhz(void)
+     };
+ 
+     /* try to read the frequency from the platform info MSR */
+-    if (model_info->family == IA32_PREFETCHER_COMPATIBLE_FAMILIES_ID) {
++    if (!(x86_cpuid_ecx(1, 0) & BIT(31)) &&
++        model_info->family == IA32_PREFETCHER_COMPATIBLE_FAMILIES_ID) {
+         for (int i = 0; i < ARRAY_SIZE(valid_models); i++) {
+             if (model_info->model == valid_models[i]) {
+ 
+-- 
+2.47.3
+

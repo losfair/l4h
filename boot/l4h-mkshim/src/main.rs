@@ -29,6 +29,7 @@ mod conf;
 mod cpu;
 mod entry;
 mod io;
+mod kvm_clock;
 mod mem;
 mod pci;
 
