@@ -5340,6 +5340,42 @@ pessimistic.
 | dom0 ↔ host over a tap NIC (vhost) | 380–620 MB/s down, 410–490 MB/s up | 256 MiB with wget / a 256 KiB-write sender. A plain Linux VM on the same QEMU: 0.5–1.3 GB/s. |
 | dom0 ↔ host over QEMU user net | ~165 MB/s down, ~37 MB/s up | QEMU's user networking caps a plain Linux VM at ~440 / ~84 MB/s; it takes no TSO, so netd segments uploads. |
 
+**Comparing seL4 and FL4 with SMP Linux.** `tests/run-smpbench.py`
+builds matching release kernels and root tasks, uses one Linux/payload
+image on both backends, and pins QEMU threads to distinct physical cores.
+It measures compute, syscalls, page faults, fork/exit/wait, pipes and futexes
+with 1, 2 and 4 Linux vCPUs. Prepare the images once, then reuse them:
+
+```sh
+python3 tests/run-smpbench.py --prepare-only
+python3 tests/run-smpbench.py --skip-build --output build/smpbench/comparison
+```
+
+`tests/run-primitivebench.py` measures the microkernel APIs directly;
+`--source tests/primitive-smp.c` selects concurrent copy/map/delete cycles.
+`tests/run-forkbench.py` compares fork, vfork and shared-address-space clone
+lifecycles. Both accept `--nice -20` and verify QEMU's inherited priority;
+negative niceness requires permission to raise priority, or passwordless
+`sudo renice`. For the focused fork comparison, prepare its initramfs after
+the shared images above:
+
+```sh
+mkdir -p build/scratch build/forkbench
+export TMPDIR="$PWD/build/scratch"
+gcc -O2 -static -Wall -Wextra -Werror -o build/forkbench/forkbench tests/guest/forkbench.c
+tools/mkinitramfs.sh build/forkbench/initrd.cpio.gz tests/guest/init-forkbench build/forkbench/forkbench
+python3 tests/run-forkbench.py --variants sel4,fl4 --profile 0 --modes 0 --vcpus 1,2,4 --count 20000 --runs 5 --nice -20 --output build/forkbench/comparison
+```
+
+The fork runner uses physical host CPUs 2–7 for six QEMU vCPUs and 0–1
+for the emulator; these eight CPUs must be available on distinct physical
+cores. `--kernel NAME=ELF` adds a kernel variant. Diagnostic profiling and
+admission masks require a matching instrumented FL4 kernel; use
+`--profile 0` for ordinary kernels. Keep generated logs, images, CSVs and
+metadata under ignored `build/`. Benchmark findings are discussed in
+[FL4 issue #11](https://github.com/losfair/FL4/issues/11) and
+[FL4 PR #13](https://github.com/losfair/FL4/pull/13).
+
 **Guest cost** (`tests/run-vmbench.sh`, nested QEMU/KVM, debug builds; host
 memory beyond a booted guest's RAM, median latencies): 10 MiB of overhead
 whatever the RAM (the 4 MiB I/O pool and about 6 MiB of host objects);
@@ -5716,6 +5752,9 @@ machine and guests of 256–512 MiB.
 | `tests/run-attesttest.sh` | attestation with swtpm over CRB, FIFO and the AMD fTPM ACPI start method: reports on dom0 and a guest, host evidence, AK credential |
 | `tests/run-debian.sh`, `tests/run-workload.sh` | Debian + systemd, fio verify, parallel build, fsck (`tests/mkdebian.sh` first) |
 | `tests/run-bench.sh`, `tests/run-vmbench.sh`, `tests/run-startbench.sh` | micro-benchmarks, guest cost, start latency |
+| `tests/run-smpbench.py` | paired seL4/FL4 release comparison: identical Linux/payload images, pinned physical cores, concurrent CPU/syscall/fault/fork workloads and pinned pipe/futex handoffs; five boots per backend and 1/2/4 guest vCPUs by default; raw logs, CSV and image hashes (§13) |
+| `tests/run-primitivebench.py` | direct microkernel invocation and IPC/fault timings, including separate fault-delivery and reply/resume measurements; `--kernel-fl4` selects a serial-gate control; `--source tests/primitive-smp.c` runs concurrent batched copy/map/delete cycles on 1/2/4 cores (§13) |
+| `tests/run-forkbench.py` | pinned fork/vfork/shared-mm clone lifecycle controls; checked exit/wait status, configurable kernel variants, and optional FL4 diagnostic counters/admission masks; retained images, logs, affinities and raw samples (§13) |
 | `tests/run-fuzz.sh` | hostile-guest virtqueue fuzzing of l4h-vmm; usbd's record checks and TRB layout (`tests/usb.rs`, `tests/fuzz-usbreq`) |
 | `tests/run-skimtest.sh` | the skim-xapic-nopcid variant on a Meltdown-affected CPU without PCID/x2APIC: SKIM mappings and syscall state at the user/kernel boundary (`tests/skim-qemu.py`, GDB); VT-x stays off (`run-vtxtest.sh skim`) |
 | `tests/run-kvmbench.sh l4h\|linux` | KVM exit, EPT or nested page fault and guest compute timings (`tests/guest/kvmbench.c`) and boot times under QEMU, Firecracker and cloud-hypervisor, with L1 l4h's dom0 or the host's Linux kernel in QEMU, both on nested KVM with two vCPUs (§5.10); `KVMBENCH_CMDLINE` adds to dom0's command line |

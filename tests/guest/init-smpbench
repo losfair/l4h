@@ -1,0 +1,11 @@
+#!/bin/sh
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+echo "SMPBENCH: kernel=$(uname -r) online=$(cat /sys/devices/system/cpu/online)"
+if /bin/smpbench "$(nproc)" "${SMPBENCH_DIVISOR:-1}"; then
+    echo 'SMPBENCH: PASS'
+else
+    echo 'SMPBENCH: FAIL benchmark exit'
+fi
+poweroff -f

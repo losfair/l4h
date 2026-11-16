@@ -1,0 +1,11 @@
+#!/bin/sh
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+echo "FORKBENCH: kernel=$(uname -r) online=$(cat /sys/devices/system/cpu/online)"
+# Drain asynchronous boot-console output before profiling short workloads.
+sleep 2
+if ! /bin/forkbench "${FORKBENCH_WORKERS:-$(nproc)}" "${FORKBENCH_COUNT:-2000}" "${FORKBENCH_MODE:-0}" "${FORKBENCH_FORCE:-0}" "${FORKBENCH_PROFILE:-1}"; then
+    echo 'FORKBENCH: FAIL benchmark exit'
+fi
+poweroff -f
