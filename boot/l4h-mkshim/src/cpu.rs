@@ -97,12 +97,18 @@ fn median(s: &mut [u64]) -> u64 {
     s[s.len() / 2]
 }
 
-/// The TSC rate in kHz: from CPUID leaf 0x15 on Intel, as seL4 does
-/// (patch 0022), or measured against the PIT.
+/// The TSC rate in kHz: KVM's pvclock scale, native Intel CPUID 0x15,
+/// or the PIT, as seL4 does (patches 0022 and 0044).
 pub fn tsc_khz() -> u64 {
+    let mhz = crate::kvm_clock::tsc_mhz();
+    if mhz != 0 {
+        unsafe { TSC_PER_US = mhz as u64 };
+        return mhz as u64 * 1000;
+    }
     let v = cpuid(0, 0);
     let intel = v[1] == 0x756e_6547 && v[3] == 0x4965_6e69 && v[2] == 0x6c65_746e;
-    if intel && v[0] >= 0x15 {
+    let virtualized = cpuid(1, 0)[2] & (1 << 31) != 0;
+    if !virtualized && intel && v[0] >= 0x15 {
         let r = cpuid(0x15, 0);
         if r[0] != 0 && r[1] != 0 {
             let khz = if r[2] != 0 {

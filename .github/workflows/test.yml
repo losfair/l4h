@@ -88,6 +88,8 @@ jobs:
         run: tests/run-providercheck.sh
       - name: Build seL4
         run: tools/build-kernel.sh
+      - name: KVM TSC calibration and boot buffer lifetime
+        run: tests/run-kvmclocktest.sh
       - name: Remote SC queries preserve FS/GS (debug and release kernels)
         run: |
           tests/run-tls-stalltest.sh
