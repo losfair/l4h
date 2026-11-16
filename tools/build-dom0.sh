@@ -19,6 +19,7 @@ mkdir -p "$dir/bin" "$dir/share/licenses/l4hctl" "$dir/install"
 cp "$root/tools/l4hctl/target/release/l4hctl" "$dir/bin/l4hctl"
 cp "$root/tools/l4hctl/LICENSE" "$dir/share/licenses/l4hctl/LICENSE"
 cp "$root/tools/install/install.py" "$dir/install/"
+cp "$root/build/linux-l4h/include/config/kernel.release" "$dir/install/"
 # A distro initramfs contains drivers for its native kernel. The installer
 # needs only built-in L4H drivers, UUID lookup and switch_root, so ship a
 # small static initramfs that works for both apt and yum distributions.

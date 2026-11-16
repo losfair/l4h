@@ -130,6 +130,16 @@ class Machine:
             return self.target if args[1] == "get-default" else self.display_manager
         if args == ("/usr/local/bin/l4hctl", "info"):
             return "cores:  4\nmemory: 4096 MiB free of 7936 MiB\ndisks: 1\nvms: 1"
+        if args[:2] == ("mount", "--bind"):
+            view = Path(args[3])
+            view.rmdir()
+            view.symlink_to(args[2])
+            return ""
+        if args[0] == "umount":
+            view = Path(args[1])
+            view.unlink()
+            view.mkdir()
+            return ""
         if args[0] == "efibootmgr":
             if args[1] == "--verbose":
                 text = "BootOrder: {}\nBootCurrent: {}\n".format(self.boot["order"], self.boot["current"])
@@ -236,6 +246,7 @@ class Harness(unittest.TestCase):
     def package(self):
         for path in ("install/initrd", "bin/l4hctl", "share/licenses/l4hctl/LICENSE"):
             self.machine.write("/package/" + path, "release " + path)
+        self.machine.write("/package/install/kernel.release", "6.18.63-l4h\n")
         self.machine.write("/new.efi", "new EFI")
         return self.root / "package"
 
@@ -270,6 +281,57 @@ class MultikernelConfig(unittest.TestCase):
 
 class UpdateChecks:
     """The same update contract on both firmware layouts."""
+
+    def test_sdk_mountpoint_preserves_user_modules_and_usrmerge(self):
+        self.machine.write("/usr/lib/modules/native/user.ko", b"native module")
+        self.machine.write("/usr/lib/modules/6.18.63-l4h/user.ko", b"L4H module")
+        self.machine.link("/lib", Path("usr/lib"))
+        self.commit()
+        self.assertTrue(self.machine.path("/lib/modules/6.18.63-l4h/build").is_dir())
+        self.assertEqual(self.machine.path("/lib/modules/native/user.ko").read_bytes(), b"native module")
+        self.assertEqual(self.machine.path("/lib/modules/6.18.63-l4h/user.ko").read_bytes(), b"L4H module")
+
+    def test_sdk_mountpoint_rollback_removes_only_new_empty_directories(self):
+        self.machine.write("/lib/modules/native/user.ko", b"native module")
+        release = self.machine.path("/lib/modules/6.18.63-l4h")
+        release.mkdir()
+        real_copy = installer.atomic_copy
+
+        def fail_initrd(source, dest, mode):
+            if dest.name == "initrd":
+                raise OSError("disk full")
+            real_copy(source, dest, mode)
+
+        with patch.object(installer, "atomic_copy", side_effect=fail_initrd):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                self.commit()
+        self.assertTrue(release.is_dir())
+        self.assertFalse((release / "build").exists())
+        self.assertEqual(self.machine.path("/lib/modules/native/user.ko").read_bytes(), b"native module")
+
+    def test_sdk_mountpoint_rollback_keeps_new_user_files(self):
+        real_copy = installer.atomic_copy
+        module = self.machine.path("/lib/modules/6.18.63-l4h/build/user.ko")
+
+        def fail_after_user_write(source, dest, mode):
+            if dest.name == "initrd":
+                module.write_bytes(b"concurrent user module")
+                raise OSError("disk full")
+            real_copy(source, dest, mode)
+
+        with patch.object(installer, "atomic_copy", side_effect=fail_after_user_write):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                self.commit()
+        self.assertEqual(module.read_bytes(), b"concurrent user module")
+
+    def test_invalid_kernel_release_does_not_publish_files(self):
+        package = self.package()
+        (package / "install/kernel.release").write_text("../other-root\n")
+        with patch.object(self, "package", return_value=package):
+            with self.assertRaisesRegex(installer.Incompatible, "invalid kernel release"):
+                self.commit()
+        self.assertFalse(self.machine.path(installer.STATE).exists())
+        self.assertFalse(self.machine.path("/lib/modules").exists())
 
     def config(self):
         state = json.loads(self.machine.path(installer.STATE).read_text())
@@ -849,7 +911,7 @@ class InstallerTests(UpdateChecks, Harness):
         self.assertEqual(self.machine.boot["next"], "0000")
         self.assertEqual(self.machine.path("/boot/efi/EFI/BOOT/BOOTX64.EFI").read_text(), "native fallback")
         self.assertTrue(self.machine.path(installer.STATE).is_file())
-        self.assertFalse(any(c[0] in ("reboot", "mkfs", "mount") for c in self.machine.calls))
+        self.assertFalse(any(c[0] in ("reboot", "mkfs") for c in self.machine.calls))
 
     def test_update_reuses_entry_and_backup(self):
         self.commit()
