@@ -10,6 +10,7 @@ the distribution's GRUB (custom.cfg), selected once through GRUB's next_entry.
 """
 
 import argparse
+from contextlib import contextmanager
 import datetime
 import fcntl
 import hashlib
@@ -877,6 +878,36 @@ def atomic_copy(source, dest, mode=0o644):
         Path(name).unlink(missing_ok=True)
 
 
+@contextmanager
+def root_filesystem(root, command):
+    """Expose root without child mounts, including an older module image."""
+    view = Path(tempfile.mkdtemp(prefix="l4h-install-root-"))
+    mounted = False
+    try:
+        command("mount", "--bind", str(root), str(view))
+        mounted = True
+        yield view
+    finally:
+        if mounted:
+            command("umount", str(view))
+        # Never recursively remove a view: a failed unmount leaves root here.
+        view.rmdir()
+
+
+def prepare_sdk_mountpoint(view, release, created):
+    directory = view / "lib/modules" / release / "build"
+    for parent in reversed((directory, *directory.parents)):
+        if parent == view or view not in parent.parents:
+            continue
+        try:
+            parent.mkdir()
+        except FileExistsError:
+            if not parent.is_dir():
+                raise
+        else:
+            created.append(parent.relative_to(view))
+
+
 class EfiBoot:
     """The L4H application on the ESP, selected through a firmware boot entry."""
 
@@ -1053,6 +1084,9 @@ def commit(plan, package, payload, release, make_default, root=Path("/"), comman
 
     payload is the UEFI application, or the unpacked BIOS package."""
     path = lambda name: root / str(name).lstrip("/")
+    kernel_release = (package / "install/kernel.release").read_text().strip()
+    need(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}", kernel_release),
+         "invalid kernel release in dom0 package")
     for name, checksum in plan.get("snapshot", {}).items():
         safe_path(path(name))
         need((digest(path(name)) if path(name).is_file() else None) == checksum,
@@ -1102,8 +1136,11 @@ def commit(plan, package, payload, release, make_default, root=Path("/"), comman
         (backup / "boot.json").write_text(json.dumps(boot.saved, indent=2) + "\n")
         os.sync()
         changed = []
+        module_dirs = []
         try:
             boot.unchanged()
+            with root_filesystem(root, command) as view:
+                prepare_sdk_mountpoint(view, kernel_release, module_dirs)
             for index, (source, target, mode) in enumerate(files):
                 if target == STATE:
                     continue
@@ -1124,6 +1161,16 @@ def commit(plan, package, payload, release, make_default, root=Path("/"), comman
                         atomic_copy(backup / item["saved"], path(item["path"]), item["mode"])
                     else:
                         path(item["path"]).unlink(missing_ok=True)
+                except Exception as error:
+                    failures.append(str(error))
+            if module_dirs:
+                try:
+                    with root_filesystem(root, command) as view:
+                        for directory in reversed(module_dirs):
+                            try:
+                                (view / directory).rmdir()
+                            except OSError:
+                                pass  # Keep directories another tool filled with user files.
                 except Exception as error:
                     failures.append(str(error))
             for directory in sorted(missing_dirs, key=lambda p: len(p.parts), reverse=True):

@@ -35,6 +35,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Preflight, downloads, EFI transactions and rollback
         run: python3 tests/test_installer.py
+      - name: Read-only boot root and legacy module mounts
+        run: sudo python3 tests/test_installer_mounts.py
       - name: EFI slot selection configuration
         run: python3 tests/test_mkefi.py
       - name: Shell lint
