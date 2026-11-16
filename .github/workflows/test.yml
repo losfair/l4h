@@ -35,6 +35,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Preflight, downloads, EFI transactions and rollback
         run: python3 tests/test_installer.py
+      - name: Guest release compatibility, downloads and rollback
+        run: python3 tests/test_guest_release.py
       - name: Read-only boot root and legacy module mounts
         run: sudo python3 tests/test_installer_mounts.py
       - name: EFI slot selection configuration
@@ -232,11 +234,11 @@ jobs:
       - name: Serial monitor
         run: tests/run-monitor.sh
       - name: UEFI boot image
-        run: tests/run-uefitest.sh
+        run: L4H_GUEST_EXTERNAL=1 tests/run-uefitest.sh
       - name: A/B EFI slots, growing disk windows and PCI inventory
-        run: tests/run-platformtest.sh
+        run: L4H_GUEST_EXTERNAL=1 tests/run-platformtest.sh
       - name: BIOS boot of the same image
-        run: tests/run-biostest.sh
+        run: L4H_GUEST_EXTERNAL=1 tests/run-biostest.sh
       - name: Attestation (software TPM)
         run: tests/run-attesttest.sh
       - name: Virtqueue fuzzing
@@ -252,8 +254,8 @@ jobs:
           L4H_MKSHIM: ''
         run: |
           # Package the binaries already built by run-fl4test.sh.
-          tools/mkefi.sh build/l4h-fl4.efi
-          UEFI_EFI=build/l4h-fl4.efi tests/run-uefitest.sh
+          L4H_GUEST_EXTERNAL=1 tools/mkefi.sh build/l4h-fl4.efi
+          UEFI_EFI=build/l4h-fl4.efi UEFI_GUEST=build/efi/l4h-guest-x86_64.tar.xz tests/run-uefitest.sh
           grep -aq 'FL4: seL4 17.0 (MCS) API kernel' build/qemu-uefi.log
       - name: Upload logs
         if: failure() || steps.nested_virt.outputs.vcpustress == 'failed'

@@ -55,6 +55,7 @@ fi
 sudo cp "$root/tools/install.sh" "$guest/opt/l4h-install-test/"
 boot_files=(l4h-generic.efi)
 [[ $firmware == uefi ]] || boot_files=(l4h-bios-x86_64.tar.xz)
+boot_files+=(l4h-host-generic.json l4h-guest-x86_64.tar.xz)
 for file in l4h-dom0-x86_64.tar.xz "${boot_files[@]}"; do
     sudo cp "$release/$file" "$guest/opt/l4h-install-test/release/"
 done

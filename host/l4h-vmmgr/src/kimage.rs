@@ -59,6 +59,11 @@ pub struct Kernel {
 impl Kernel {
     pub fn parse(data: &'static [u8], modules: &Modules) -> Result<Self, &'static str> {
         let elf = Elf::parse(data)?;
+        // Pre-manifest development images still validate bootinfo themselves.
+        // Every independently released guest carries this section.
+        if let Some(requirements) = elf.section(".l4h.abi") {
+            crate::compat::check(requirements, crate::provider::IMAGE, abi::ABI_VERSION)?;
+        }
         let (lo, hi) = elf.bounds();
         if lo >= hi {
             return Err("no loadable segments");

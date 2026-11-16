@@ -24,16 +24,19 @@ for arg in args:
     if arg.startswith('boot/grub/grub.cfg='):
         shutil.copyfile(arg.split('=', 1)[1], os.environ['TEST_GRUB_CONFIG'])
 pathlib.Path(os.environ['TEST_GRUB_MODULES']).write_text(next(a for a in args if a.startswith('--modules=')))
+pathlib.Path(os.environ['TEST_GRUB_INPUTS']).write_text('\\n'.join(a for a in args if a.startswith('boot/')))
 pathlib.Path(args[args.index('-o') + 1]).write_bytes(b'EFI fixture')
 """)
         grub.chmod(0o755)
         self.config = self.work / "grub.cfg"
         self.modules = self.work / "modules"
+        self.inputs = self.work / "inputs"
 
     def generate(self, **settings):
         env = {k: v for k, v in os.environ.items() if not k.startswith("L4H_")}
         env.update(PATH=f"{self.work}:{env['PATH']}", TEST_GRUB_CONFIG=str(self.config),
                    TEST_GRUB_MODULES=str(self.modules), L4H_GUEST_KERNEL="/bin/true",
+                   TEST_GRUB_INPUTS=str(self.inputs),
                    L4H_GUEST_SDK="", L4H_MKSHIM="")
         env.update(settings)
         result = subprocess.run([str(ROOT / "tools/mkefi.sh"), str(self.work / "out.efi"),
@@ -68,7 +71,7 @@ pathlib.Path(args[args.index('-o') + 1]).write_bytes(b'EFI fixture')
         self.assertEqual(self.generate().returncode, 0)
         config = self.config.read_text()
         self.check_environment_import(config)
-        self.assertIn('l4h: boot partition selection failed', config)
+        self.assertIn('l4h_boot_error="boot partition selection failed"', config)
         self.assertIn('search_fs_uuid search_label', self.modules.read_text())
         self.assertIn('\n    exit\n', config)
         self.assertNotIn('halt', self.modules.read_text())
@@ -88,6 +91,27 @@ pathlib.Path(args[args.index('-o') + 1]).write_bytes(b'EFI fixture')
         subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-mno-red-zone",
                         str(ROOT / "tests/efi-wrapper.c"), "-o", str(binary)], check=True)
         subprocess.run([str(binary)], check=True)
+
+    def test_external_guest_needs_no_linux_build_or_embedded_payload(self):
+        result = self.generate(L4H_GUEST_EXTERNAL="1", L4H_GUEST_KERNEL="/missing/linux", L4H_GUEST_SDK="/missing/sdk")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = self.config.read_text()
+        self.assertIn('module2 --nounzip "($esp)/l4h/guest/vmlinux" guest-kernel', config)
+        self.assertIn('module2 --nounzip "($esp)/l4h/guest/sdk.erofs" guest-sdk', config)
+        self.assertNotIn('boot/vmlinux=', self.inputs.read_text())
+        self.assertNotIn('boot/sdk.erofs=', self.inputs.read_text())
+        self.assertLess(config.index('selected boot slot lacks'), config.index('multiboot2 '))
+        self.assertIn('load_env --file "($esp)/l4h/guest/vmlinux"', config)
+
+    def test_external_guest_is_shared_by_multikernel_partitions(self):
+        shim = self.work / 'mkshim'
+        shim.mkdir()
+        (shim / 'l4h-mkshim.elf').touch()
+        result = self.generate(L4H_GUEST_EXTERNAL="1", L4H_MKSHIM=str(shim))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = self.config.read_text()
+        self.assertEqual(config.count('"($esp)/l4h/guest/vmlinux" guest-kernel'), 2)
+        self.assertNotIn('(memdisk)/boot/vmlinux', config)
 
     def test_wrapper_is_a_relocatable_efi_application(self):
         self.assertEqual(self.generate().returncode, 0)

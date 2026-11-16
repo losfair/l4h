@@ -6,6 +6,8 @@ mkdir -p "$root/build/provider-check"
 gcc -O2 -Wall -Wextra -Werror -I"$root/include" "$root/tests/provider-table.c" \
     -o "$root/build/provider-check/provider-table"
 "$root/build/provider-check/provider-table" "$@"
+rustc +stable --edition=2024 --test "$root/tests/provider-compat.rs" -o "$root/build/provider-check/compat"
+"$root/build/provider-check/compat"
 if command -v aarch64-linux-gnu-gcc >/dev/null; then
     aarch64-linux-gnu-gcc -Wall -Wextra -Werror -I"$root/include" \
         -c "$root/tests/provider-table.c" -o "$root/build/provider-check/table-aarch64.o"

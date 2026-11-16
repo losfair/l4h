@@ -6,13 +6,17 @@ original=("$@")
 while (($#)); do
     case "$1" in
         -o|--output) out=$2; shift ;;
-        https://github.com/losfair/l4h/releases/download/v0-install-test/*) url=$1 ;;
+        https://github.com/losfair/l4h/releases/download/*) url=$1 ;;
     esac
     shift
 done
 if [[ -n $url && -n $out ]]; then
+    tag=${url%/*}; tag=${tag##*/}
+    host_tag=$(python3 -c 'import json; print(json.load(open("/opt/l4h-install-test/release/l4h-host-generic.json"))["release"])')
+    guest_tag=$(python3 -c 'import json; print(json.load(open("/opt/l4h-install-test/release/l4h-host-generic.json"))["guest_release"])')
+    [[ $tag == "$host_tag" || $tag == "$guest_tag" ]] || exit 22
     case ${url##*/} in
-        SHA256SUMS|l4h-dom0-x86_64.tar.xz|l4h-generic.efi|l4h-bios-x86_64.tar.xz)
+        SHA256SUMS|l4h-dom0-x86_64.tar.xz|l4h-generic.efi|l4h-bios-x86_64.tar.xz|l4h-host-generic.json|l4h-guest-x86_64.tar.xz)
             cp "/opt/l4h-install-test/release/${url##*/}" "$out" ;;
         *) exit 22 ;;
     esac

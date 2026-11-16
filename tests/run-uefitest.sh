@@ -10,6 +10,7 @@ out=$root/build/guest
 mkdir -p "$out"
 efi=${UEFI_EFI:-}
 image_args=()
+guest=${UEFI_GUEST:-}
 if [ -n "$efi" ]; then
     [ -f "$efi" ] || { echo "$efi: missing" >&2; exit 1; }
     image_args=(-e "$efi")
@@ -19,6 +20,11 @@ else
     "$root/tools/build-sdk.sh" >/dev/null
     env -u L4H_DOM0_DISKS -u L4H_DOM0_CMDLINE "$root/tools/build-host.sh"
 fi
+if [ "${L4H_GUEST_EXTERNAL:-0}" = 1 ] && [ -z "$guest" ]; then
+    "$root/tools/build-guest.sh"
+    guest=$root/build/efi/l4h-guest-x86_64.tar.xz
+fi
+[ -z "$guest" ] || image_args+=(-g "$guest")
 (cd "$root/tools/l4hctl" && cargo +stable build -q --release)
 "$root/tools/mkinitramfs.sh" "$out/uefi.cpio.gz" "$root/tests/guest/init-image" \
     "$root/tools/l4hctl/target/release/l4hctl" "$root/tests/guest/udhcpc.script" >/dev/null

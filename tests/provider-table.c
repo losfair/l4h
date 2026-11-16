@@ -20,6 +20,14 @@ int main(int argc, char **argv)
 #undef L4H_PROVIDER_OP
 	};
 	l4h_u64 size = sizeof(p) + 4096;
+	/* Published ABI 10/provider v1 layouts. Extending an operations table is
+	 * compatible; growing guest-owned arrays or callbacks is not. */
+	_Static_assert(sizeof(struct l4h_provider_context) == 72, "provider v1 callback layout");
+	_Static_assert(sizeof(struct l4h_vcpu) == 144, "provider v1 vCPU array stride");
+	_Static_assert(sizeof(struct l4h_uctx) == 104, "provider v1 user context");
+	_Static_assert(sizeof(struct l4h_vmexit) == 208, "provider v1 VM exit layout");
+	_Static_assert(sizeof(struct l4h_bootinfo) == 5376, "guest ABI 10 bootinfo");
+	_Static_assert(offsetof(struct l4h_provider, l4h_flush_icache) == 600, "provider v1 slot order");
 	_Static_assert(sizeof(struct l4h_tls) == L4H_TLS_SIZE, "assembly TLS stride");
 	_Static_assert(sizeof(struct l4h_tls_block) == 2 * L4H_TLS_SIZE, "assembly vCPU stride");
 #ifdef __aarch64__
@@ -46,6 +54,15 @@ int main(int argc, char **argv)
 	p.l4h_page_map = (__typeof__(p.l4h_page_map))(L4H_PROVIDER_VA + size);
 	assert(!l4h_provider_valid(&p, size));
 	p.l4h_page_map = (__typeof__(p.l4h_page_map))(L4H_PROVIDER_VA + size - 1);
+	assert(l4h_provider_valid(&p, size));
+	/* This guest knows only the v1 prefix of a provider with an extra slot. */
+	p.size += 8;
+#define L4H_PROVIDER_OP(ret, name, args, call) \
+	p.name = (__typeof__(p.name))(L4H_PROVIDER_VA + p.size);
+#define L4H_PROVIDER_NORETURN(name, args, call) L4H_PROVIDER_OP(void, name, args, call)
+#include <l4h/provider-ops.h>
+#undef L4H_PROVIDER_NORETURN
+#undef L4H_PROVIDER_OP
 	assert(l4h_provider_valid(&p, size));
 	for (int i = 1; i < argc; i++) {
 		FILE *f = fopen(argv[i], "rb");

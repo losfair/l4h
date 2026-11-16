@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Build the shipped l4h UEFI applications, one per seL4 variant plus FL4, into
-# build/efi/l4h-VARIANT.efi. The seL4 variants share their host components,
-# l4h-root and guest kernel with its build SDK (dom0's initramfs comes
-# from the EFI system partition, see tools/mkefi.sh); their seL4 kernels
+# build/efi/l4h-VARIANT.efi. The seL4 variants share their host components
+# and ABI provider. Linux and its SDK are separate release artifacts; this
+# script never builds them. The seL4 kernels
 # differ in options that seL4 fixes at build time:
 #   generic       x2APIC, PCID: QEMU/KVM and GCE
 #   xapic-nopcid  xAPIC, no PCID: machines whose firmware leaves x2APIC off
@@ -17,16 +17,17 @@
 # Linux installer installs one as kernel.elf.
 # build/efi/l4h-debug-x86_64.tar.xz holds the same build unstripped (root,
 # the components, each variant's kernel, its slot kernels as
-# kernel-VARIANT-sK.elf, the shim and the guest kernel, vmlinux), to
-# decode fault addresses from a shipped application; verifiers compute
-# launch digests from vmlinux (l4h-attest.py measure).
+# kernel-VARIANT-sK.elf, the shim and ABI provider), to
+# decode host fault addresses. Guest symbols come from build-guest.sh.
 # FL4 has its own microkernel, host and ABI provider (build-fl4-efi.sh),
-# sharing the same Linux guest and build SDK,
+# accepting the same independently released guest package,
 # packaged as l4h-fl4.efi and l4h-debug-fl4-x86_64.tar.xz, without a shim.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 source "$root/tools/reproducible-env.sh"
-export L4H_ARCH=x86_64
+export L4H_ARCH=x86_64 L4H_GUEST_EXTERNAL=1
+export L4H_VERSION=$("$root/tools/version.sh")
+export L4H_GUEST_RELEASE=${L4H_GUEST_RELEASE:-$L4H_VERSION}
 out=$root/build/efi
 mkdir -p "$out"
 # The host components build to the cargo profile's directory.
@@ -50,13 +51,12 @@ done
 L4H_KERNEL_VARIANT= L4H_VTX=ON "$root/tools/build-kernel.sh" >"$out/kernel.log" 2>&1
 export SEL4_PREFIX=$root/build/sel4
 "$root/tools/build-host.sh"
-"$root/tools/build-sdk.sh" >/dev/null
 debug=$(mktemp -d)
 trap 'rm -rf "$debug"' EXIT
 mkdir "$debug/l4h-debug-x86_64"
 cp "$root/host/target/x86_64-sel4-roottask/$l4h_profile/l4h-root.elf" \
     "$root"/host/target/x86_64-sel4/$l4h_profile/l4h-{vmmgr,vmm,blkd,netd,trustd,memd,logd,usbd}.elf \
-    "$root/build/linux-l4h/vmlinux" "$debug/l4h-debug-x86_64/"
+    "$debug/l4h-debug-x86_64/"
 cp "$SEL4_PREFIX/guest-provider/provider.bin" "$debug/l4h-debug-x86_64/guest-provider.bin"
 cp "$SEL4_PREFIX/guest-provider/provider.elf" "$debug/l4h-debug-x86_64/guest-provider.elf"
 for v in "${variants[@]}"; do
@@ -91,11 +91,12 @@ l4h_tar -C "$debug" -cJf "$out/l4h-bios-x86_64.tar.xz" l4h-bios-x86_64
 for f in l4h-debug-x86_64.tar.xz l4h-bios-x86_64.tar.xz; do
     echo "$out/$f: $(( $(stat -c %s "$out/$f") >> 10 )) KiB"
 done
-# Reuse the same Linux kernel and SDK; only the host and its small
-# embedded ABI provider are rebuilt against FL4.
-guest_hash=$(sha256sum "$root/build/linux-l4h/vmlinux" "$root/build/linux-l4h/sdk.erofs")
-L4H_GUEST_BUILT=1 "$root/tools/build-fl4-efi.sh"
-if [ "$guest_hash" != "$(sha256sum "$root/build/linux-l4h/vmlinux" "$root/build/linux-l4h/sdk.erofs")" ]; then
-    echo 'FL4 packaging changed the common Linux kernel or SDK' >&2
-    exit 1
-fi
+# Host manifests bind the payloads to their provider ABI. The default guest
+# release is a recommendation; installers may select another compatible one.
+for name in generic xapic-nopcid skim-xapic-nopcid; do
+    python3 "$root/tools/install/artifacts.py" host "$out/l4h-host-$name.json" \
+        --release "$L4H_VERSION" --guest-release "$L4H_GUEST_RELEASE" \
+        --provider "$SEL4_PREFIX/guest-provider/provider.bin" --abi-header "$root/include/l4h/abi.h" \
+        --payload "$out/l4h-$name.efi" --payload "$out/l4h-bios-x86_64.tar.xz"
+done
+"$root/tools/build-fl4-efi.sh"

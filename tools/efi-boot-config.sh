@@ -22,6 +22,7 @@ if [ -z "$l4h_boot_env" ]; then
 regexp --set=1:esp '^\(([^)]*)\)' "$cmdpath"
 if [ -z "$esp" ]; then search --no-floppy --set=esp --file /l4h/dom0/initrd; fi
 if [ -z "$esp" ]; then search --no-floppy --set=esp --file /l4h/l4h.conf; fi
+if [ -z "$esp" ]; then search --no-floppy --set=esp --file /l4h/guest/vmlinux; fi
 fi
 if [ -n "$l4h_boot_env" ]; then
 # Only these two variables may be imported from the shared boot selector.

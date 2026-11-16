@@ -28,6 +28,8 @@ import sys
 import tarfile
 import tempfile
 
+import artifacts
+
 
 ESP_TYPE = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
 EFI_GLOBAL = "8be4df61-93ca-11d2-aa0d-00e098032b8c"
@@ -556,7 +558,7 @@ class Preflight:
              "only x86_64 Linux is supported")
         safe_path(self.path(STATE))
         saved = json.loads(self.read(STATE))
-        need(isinstance(saved, dict) and saved.get("version", 1) in (1, 2), "unsupported installation record")
+        need(isinstance(saved, dict) and saved.get("version", 1) in (1, 2, 3), "unsupported installation record")
         dom0 = self.path("/sys/class/misc/l4hctl/dev").is_file()
         need(dom0 or not self.path("/sys/kernel/l4h").exists(), "updates must run from dom0 or native Linux")
         firmware = saved.get("firmware", "uefi")
@@ -657,8 +659,14 @@ class Preflight:
         plan["config_changed"] = text != original
         plan["config_mode"] = self.path(config).stat().st_mode & 0o777
         tracked = [STATE, config, payload]
+        if saved.get("version") == 3:
+            plan["guest_release"] = saved.get("guest_release")
+            need(artifacts.release_tag(plan["guest_release"]), "invalid installed guest release")
+            tracked.extend(directory / "guest" / name for name in (*artifacts.GUEST_FILES, "guest.json"))
         if firmware == "bios":
             tracked.append(Path(plan["grubdir"]) / "custom.cfg")
+        for p in tracked:
+            safe_path(self.path(p))
         plan["snapshot"] = {str(p): digest(self.path(p)) if self.path(p).is_file() else None for p in tracked}
         return plan
 
@@ -786,10 +794,11 @@ def download_efi(args, plan, dest):
     verify_efi(dest)
 
 
-BIOS_FILES = ("grub.cfg", "l4h-root.elf", "vmlinux", "sdk.erofs")
+BIOS_HOST_FILES = ("grub.cfg", "l4h-root.elf")
+BIOS_FILES = (*BIOS_HOST_FILES, "vmlinux", "sdk.erofs")
 
 
-def unpack_bios(archive, work, variant):
+def unpack_bios(archive, work, variant, split=False):
     """Unpack l4h-bios-x86_64.tar.xz's regular files into work; return its directory."""
     with tarfile.open(archive, "r:xz") as tar:
         for item in tar:
@@ -804,18 +813,65 @@ def unpack_bios(archive, work, variant):
                     shutil.copyfileobj(src, out)
     bios = work / BIOS_PACKAGE
     kernel = "kernel-" + variant + ".elf"
-    for name in BIOS_FILES + (kernel,):
+    for name in (BIOS_HOST_FILES if split else BIOS_FILES) + (kernel,):
         need((bios / name).is_file() and (bios / name).stat().st_size > 0, "BIOS package lacks " + name)
     verify_elf(bios / kernel, multiboot2=True)
     verify_elf(bios / "l4h-root.elf")
-    verify_elf(bios / "vmlinux")
+    if not split:
+        verify_elf(bios / "vmlinux")
     return bios
 
 
-def download_bios(args, plan, work):
+def download_bios(args, plan, work, split=False):
     archive = work / (BIOS_PACKAGE + ".tar.xz")
     release_file(args, archive.name, archive)
-    return unpack_bios(archive, work, plan["variant"])
+    return unpack_bios(archive, work, plan["variant"], split)
+
+
+def download_pair(args, plan, work):
+    """Resolve both pinned releases and validate their ABI before any writes."""
+    name = "l4h-host-" + plan["variant"] + ".json"
+    sums = [line.split() for line in args.checksums.read_text().splitlines()]
+    split = any(len(line) == 2 and line[1] == name for line in sums)
+    host = None
+    if split:
+        release_file(args, name, work / name)
+        host = artifacts.read_manifest(work / name, "host")
+        need(host["release"] == args.release and host["architecture"] == "x86_64", "host manifest identity mismatch")
+    else:
+        need(not args.guest_release, "this host release embeds its guest; --guest-release requires a split release")
+        need(not plan.get("guest_release"), "cannot downgrade a split installation to an embedded host release")
+    if plan["firmware"] == "uefi":
+        payload = work / "l4h.efi"
+        download_efi(args, plan, payload)
+        payload_name, payload_file = "l4h-" + plan["variant"] + ".efi", payload
+    else:
+        payload = download_bios(args, plan, work, split=split)
+        payload_name = BIOS_PACKAGE + ".tar.xz"
+        payload_file = work / payload_name
+    if not host:
+        return payload, None, None
+    need(host["files"].get(payload_name) == digest(payload_file), "host manifest payload checksum mismatch")
+    tag = args.guest_release or plan.get("guest_release") or host["guest_release"]
+    need(artifacts.release_tag(tag), "invalid guest release tag")
+    guest_args = argparse.Namespace(release=tag, checksums=args.checksums,
+                                    artifacts=args.guest_artifacts or args.artifacts)
+    if tag != args.release or args.guest_artifacts:
+        if guest_args.artifacts:
+            guest_args.checksums = guest_args.artifacts / "SHA256SUMS"
+        else:
+            guest_args.checksums = work / "guest-SHA256SUMS"
+            run("curl", "--fail", "--silent", "--show-error", "--location", "--proto", "=https",
+                "--proto-redir", "=https", "--retry", "3", "--output", str(guest_args.checksums),
+                "https://github.com/losfair/l4h/releases/download/" + tag + "/SHA256SUMS")
+    name = artifacts.GUEST_PACKAGE + ".tar.xz"
+    release_file(guest_args, name, work / name)
+    guest = artifacts.unpack_guest(work / name, work)
+    manifest = artifacts.verify_guest(guest)
+    need(manifest["release"] == tag, "guest manifest release identity mismatch")
+    artifacts.compatible(host, manifest)
+    print("Selected host {} and guest {} (Linux {})".format(args.release, tag, manifest["kernel_release"]))
+    return payload, host, guest
 
 
 def installed_variant(release, firmware, installed_hash):
@@ -1025,8 +1081,9 @@ class GrubBoot:
 
     def files(self):
         bios = self.l4h / "bios"
+        names = BIOS_FILES if (self.bios / "vmlinux").is_file() else BIOS_HOST_FILES
         return ([(self.bios / ("kernel-" + self.plan["variant"] + ".elf"), bios / "kernel.elf", 0o644)] +
-                [(self.bios / name, bios / name, 0o644) for name in BIOS_FILES])
+                [(self.bios / name, bios / name, 0o644) for name in names])
 
     def selection(self, temp):
         # Published after the files it boots; GRUB lists it from then on.
@@ -1079,12 +1136,18 @@ class GrubBoot:
             print("L4H is selected for the next boot only (GRUB next_entry); the native default is preserved.")
 
 
-def commit(plan, package, payload, release, make_default, root=Path("/"), command=run):
+def commit(plan, package, payload, release, make_default, root=Path("/"), command=run, *, host=None, guest=None):
     """Back up every destination, publish files, then select L4H for boot; undo on failure.
 
     payload is the UEFI application, or the unpacked BIOS package."""
     path = lambda name: root / str(name).lstrip("/")
-    kernel_release = (package / "install/kernel.release").read_text().strip()
+    guest_manifest = artifacts.verify_guest(guest) if guest is not None else None
+    if guest_manifest is not None:
+        need(host is not None, "guest package requires a host manifest")
+        artifacts.compatible(host, guest_manifest)
+        kernel_release = guest_manifest["kernel_release"]
+    else:
+        kernel_release = (package / "install/kernel.release").read_text().strip()
     need(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}", kernel_release),
          "invalid kernel release in dom0 package")
     for name, checksum in plan.get("snapshot", {}).items():
@@ -1099,6 +1162,8 @@ def commit(plan, package, payload, release, make_default, root=Path("/"), comman
         state = temp / "install.json"
         record = dict(version=2, firmware=plan["firmware"], variant=plan["variant"],
                       root_uuid=plan["root_uuid"], release=release, **boot.state())
+        if guest_manifest is not None:
+            record.update(version=3, guest_release=guest_manifest["release"], host=host, guest=guest_manifest)
         state.write_text(json.dumps(record, indent=2) + "\n")
         configs = ([(config, boot.l4h / "l4h.conf", plan.get("config_mode", 0o644))]
                    if not plan.get("update") or plan["config_changed"] else [])
@@ -1106,7 +1171,9 @@ def commit(plan, package, payload, release, make_default, root=Path("/"), comman
             mk = temp / "l4h-mk.conf"
             mk.write_text(plan["multikernel"])
             configs.append((mk, boot.l4h / "l4h-mk.conf", 0o644))
-        files = (boot.files() +
+        guest_files = ([(guest / name, boot.l4h / "guest" / name, 0o644)
+                        for name in (*artifacts.GUEST_FILES, "guest.json")] if guest is not None else [])
+        files = (guest_files + boot.files() +
                  [(package / "install/initrd", boot.l4h / "dom0/initrd", 0o644),
                   (package / "bin/l4hctl", Path("/usr/local/bin/l4hctl"), 0o755),
                   (package / "share/licenses/l4hctl/LICENSE", Path("/usr/local/share/licenses/l4hctl/LICENSE"), 0o644)] +
@@ -1195,9 +1262,11 @@ def arguments(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--release")
+    parser.add_argument("--guest-release", help="select a compatible guest release; updates otherwise preserve the installed guest")
     parser.add_argument("--checksums", type=Path)
     parser.add_argument("--artifacts", type=Path,
                         help="read release artifacts from this directory instead of downloading them")
+    parser.add_argument("--guest-artifacts", type=Path, help="read the guest package and SHA256SUMS from this directory")
     parser.add_argument("--esp")
     parser.add_argument("--uplink", action="append", metavar="IFNAME",
                         help="select a physical uplink; repeat for a second independent uplink")
@@ -1239,16 +1308,12 @@ def main():
     need(args.release and re.fullmatch(r"v[A-Za-z0-9][A-Za-z0-9._-]*", args.release) and args.checksums,
          "install through tools/install.sh with a verified release package")
     with tempfile.TemporaryDirectory() as work:
-        if plan["firmware"] == "uefi":
-            payload = Path(work) / "l4h.efi"
-            download_efi(args, plan, payload)
-        else:
-            payload = download_bios(args, plan, Path(work))
+        payload, host, guest = download_pair(args, plan, Path(work))
         # Serialize installers, then repeat preflight before any persistent write.
         with open("/run/l4h-install.lock", "w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             need(preflight.check() == plan, "system changed during download; rerun the installer")
-            commit(plan, package, payload, args.release, args.make_default)
+            commit(plan, package, payload, args.release, args.make_default, host=host, guest=guest)
 
 
 if __name__ == "__main__":

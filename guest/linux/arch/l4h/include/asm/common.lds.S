@@ -19,6 +19,8 @@
 
   RO_DATA(4096)
 
+  .l4h.abi : { KEEP(*(.l4h.abi)) }
+
   .rodata.l4h_pad : { KEEP(*(.l4h.pad.rodata)) . = ALIGN(L4H_LDS_BLOCK_SIZE); } =0
 
   .unprotected : { *(.unprotected) }

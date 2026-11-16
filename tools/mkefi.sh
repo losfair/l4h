@@ -23,6 +23,7 @@
 # what it reads (the files above) into PCR 9 and its commands into PCR 8
 # (DESIGN.md §10.2).
 # L4H_KERNEL_VARIANT selects a built seL4 variant when kernel.elf is omitted.
+# L4H_GUEST_EXTERNAL=1 omits Linux/SDK and loads /l4h/guest from the selected slot.
 # Usage: mkefi.sh <out.efi> [l4h-root.elf] [kernel.elf]
 # L4H_GUEST_KERNEL is the guest kernel (default: build/linux-l4h/vmlinux)
 # and L4H_GUEST_SDK its build SDK (default: sdk.erofs next to it,
@@ -42,14 +43,36 @@ rootserver=${2:-$root/host/target/x86_64-sel4-roottask/$l4h_profile/l4h-root.elf
 kernel=${3:-$root/build/sel4${L4H_KERNEL_VARIANT:+-$L4H_KERNEL_VARIANT}/bin/kernel.elf}
 guest_kernel=${L4H_GUEST_KERNEL:-$root/build/linux-l4h/vmlinux}
 guest_sdk=${L4H_GUEST_SDK-$(dirname "$guest_kernel")/sdk.erofs}
+# Published hosts load the independently released guest from the selected slot.
+# The default keeps embedded development images and their callers working.
+external=${L4H_GUEST_EXTERNAL:-0}
+case "$external" in 0|1) ;; *) echo 'L4H_GUEST_EXTERNAL must be 0 or 1' >&2; exit 2 ;; esac
+guest_path='(memdisk)/boot/vmlinux'
+sdk_path=${guest_sdk:+'(memdisk)/boot/sdk.erofs'}
+guest_check=
+if [ "$external" = 1 ]; then
+    guest_path='($esp)/l4h/guest/vmlinux'
+    sdk_path='($esp)/l4h/guest/sdk.erofs'
+    guest_check=$(cat <<'CHECK'
+if [ "$l4h_boot_ok" = 1 ]; then
+    if [ -z "$esp" -o ! -f "($esp)/l4h/guest/vmlinux" -o ! -f "($esp)/l4h/guest/sdk.erofs" ]; then
+        l4h_boot_error="selected boot slot lacks the guest kernel or SDK"
+        l4h_boot_ok=0
+    fi
+fi
+CHECK
+)
+fi
+sdk_module=
+[ -z "$sdk_path" ] || sdk_module="module2 --nounzip \"$sdk_path\" guest-sdk"
 mkshim=${L4H_MKSHIM-$root/build/mkshim${L4H_KERNEL_VARIANT:+-$L4H_KERNEL_VARIANT}}
 source "$root/tools/mkshim-grub.sh"
 source "$root/tools/efi-boot-config.sh"
 boot_partition=$(efi_boot_partition)
 mk_stanza= mk_files=()
 if [ -n "$mkshim" ] && [ -f "$mkshim/l4h-mkshim.elf" ]; then
-    mk_stanza=$(mkshim_grub "(memdisk)/boot/mk" "(memdisk)/boot/l4h-root.elf" "(memdisk)/boot/vmlinux" \
-        "${guest_sdk:+(memdisk)/boot/sdk.erofs}" '($esp)/l4h')
+    mk_stanza=$(mkshim_grub "(memdisk)/boot/mk" "(memdisk)/boot/l4h-root.elf" "$guest_path" \
+        "$sdk_path" '($esp)/l4h')
     mk_stanza="if [ -n \"\$esp\" ]; then
 $mk_stanza
 fi"
@@ -79,6 +102,8 @@ set timeout=0
 serial_port=${L4H_SERIAL_PORT:-0x3f8}
 fb_console=${L4H_FB_CONSOLE:-0}
 $boot_partition
+l4h_boot_error="boot partition selection failed"
+$guest_check
 if [ "\$l4h_boot_ok" = 1 ]; then
 if [ -n "\$esp" ]; then
     if [ -f "(\$esp)/l4h/l4h.conf" ]; then source "(\$esp)/l4h/l4h.conf"; fi
@@ -98,15 +123,15 @@ $acpi_cmd
 # allocations no longer fit (it did under OvmfXen).  Have GRUB grow the
 # heap now by reading a large file whole, which load_env does before it
 # rejects the file and frees the buffer.
-if load_env --file (memdisk)/boot/vmlinux; then true; fi
+if load_env --file "$guest_path"; then true; fi
 $mk_stanza
 # --nounzip: every module is the file's bytes, which root measures and a
 # verifier hashes. Once gzio is loaded (probing devices loads it, for
 # btrfs, zfs or squash4) GRUB would otherwise gunzip a gzip initramfs.
 multiboot2 (memdisk)/boot/kernel.elf console_port=\$serial_port debug_port=\$serial_port\$fbcon
 module2 --nounzip (memdisk)/boot/l4h-root.elf
-module2 --nounzip (memdisk)/boot/vmlinux guest-kernel
-${guest_sdk:+module2 --nounzip (memdisk)/boot/sdk.erofs guest-sdk}
+module2 --nounzip "$guest_path" guest-kernel
+$sdk_module
 if [ -n "\$esp" ]; then
     if [ -f "(\$esp)/l4h/dom0/initrd" ]; then module2 --nounzip "(\$esp)/l4h/dom0/initrd" dom0-initrd; fi
     if [ -f "(\$esp)/l4h/l4h.conf" ]; then module2 --nounzip "(\$esp)/l4h/l4h.conf" l4h-config; fi
@@ -116,15 +141,18 @@ echo "l4h: boot failed"
 else
     serial --port=\$serial_port --speed=115200
     terminal_output serial console
-    echo "l4h: boot partition selection failed"
+    echo "l4h: \$l4h_boot_error"
     exit
 fi
 CFG
 # seL4 and root load only the segments: drop the debug information.
 objcopy --strip-debug "$rootserver" "$work/l4h-root.elf"
-objcopy --strip-debug "$guest_kernel" "$work/vmlinux"
-memdisk=("boot/vmlinux=$work/vmlinux")
-[ -n "$guest_sdk" ] && memdisk+=("boot/sdk.erofs=$guest_sdk")
+memdisk=()
+if [ "$external" = 0 ]; then
+    objcopy --strip-debug "$guest_kernel" "$work/vmlinux"
+    memdisk+=("boot/vmlinux=$work/vmlinux")
+    [ -n "$guest_sdk" ] && memdisk+=("boot/sdk.erofs=$guest_sdk")
+fi
 grub-mkstandalone -O x86_64-efi -o "$work/grub.efi" --compress=xz \
     --modules="part_gpt fat search search_fs_file search_fs_uuid search_label multiboot2 serial terminal normal configfile test regexp echo loadenv efi_gop video video_fb tpm${acpi_cmd:+ acpi}" \
     --locales= --fonts= --themes= \

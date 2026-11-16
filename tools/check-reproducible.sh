@@ -5,6 +5,8 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 source "$root/tools/reproducible-env.sh"
 source "$root/tools/source-pins.sh"
+builder=build-release.sh
+if [ "${1:-}" = --guest ]; then builder=build-guest-release.sh; shift; fi
 reference=$(realpath "${1:-$root/build/efi}")
 export L4H_VERSION=$("$root/tools/version.sh")
 revision=$(git -C "$root" rev-parse HEAD)
@@ -28,7 +30,7 @@ tar -C "$rebuild/build" -xJf "$tarball"
 mv "$rebuild/build/linux-$LINUX_VERSION" "$rebuild/build/linux-6.18"
 export TMPDIR=$rebuild/build/tmp
 umask 077
-"$rebuild/tools/build-release.sh" >"$work/rebuild.log" 2>&1 || {
+"$rebuild/tools/$builder" >"$work/rebuild.log" 2>&1 || {
     tail -60 "$work/rebuild.log" >&2; exit 1;
 }
 diff -u "$reference/SHA256SUMS" "$rebuild/build/efi/SHA256SUMS"

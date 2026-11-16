@@ -94,12 +94,22 @@ for row in "$bootpart 131072 aaaaaaaa $boot_label" "$slota 262144 11111111 $slot
 done
 mmd -i "$bootpart" ::/EFI/BOOT ::/EFI/L4H
 mcopy -i "$bootpart" "$out/front.efi" ::/EFI/BOOT/BOOTX64.EFI
+if [ "${L4H_GUEST_EXTERNAL:-0}" = 1 ]; then
+    objcopy --strip-debug "$guest_kernel" "$out/vmlinux"
+    guest_sdk=${L4H_TEST_SDK:-$root/build/linux-l4h/sdk.erofs}
+    [ -f "$guest_sdk" ] || { echo "$guest_sdk: build the guest SDK first" >&2; exit 1; }
+fi
 for slot in A B; do
     if [ "$slot" = A ]; then part=$slota; else part=$slotb; fi
     mmd -i "$part" ::/l4h ::/l4h/dom0 ::/EFI/L4H
     mcopy -i "$part" "$out/$slot.cpio.gz" ::/l4h/dom0/initrd
     mcopy -i "$part" "$out/$slot.conf" ::/l4h/l4h.conf
     mcopy -i "$part" "$out/l4h.efi" ::/EFI/l4h.efi
+    if [ "${L4H_GUEST_EXTERNAL:-0}" = 1 ]; then
+        mmd -i "$part" ::/l4h/guest
+        mcopy -i "$part" "$out/vmlinux" ::/l4h/guest/vmlinux
+        mcopy -i "$part" "$guest_sdk" ::/l4h/guest/sdk.erofs
+    fi
 done
 # Enough unhandled functions to force CTL_PCI_LIST through multiple pages.
 devices=(-device pci-bridge,id=bulk,chassis_nr=1 -device qemu-xhci)
@@ -231,7 +241,20 @@ printf '# unchosen slot changed\n' >> "$out/B-changed.conf"
 printf 'unchosen initrd changed\n' > "$out/other-initrd"
 mcopy -o -i "$slotb" "$out/B-changed.conf" ::/l4h/l4h.conf
 mcopy -o -i "$slotb" "$out/other-initrd" ::/l4h/dom0/initrd
+if [ "${L4H_GUEST_EXTERNAL:-0}" = 1 ]; then
+    mcopy -o -i "$slotb" "$out/other-initrd" ::/l4h/guest/vmlinux
+    mcopy -o -i "$slotb" "$out/other-initrd" ::/l4h/guest/sdk.erofs
+fi
 run measured-other-slot A 1111-1111 l4h_esp_uuid=1111-1111
+if [ "${L4H_GUEST_EXTERNAL:-0}" = 1 ]; then
+    # Changing a selected SDK page must change PCR 9 even though the host
+    # application and guest launch image are the same.
+    cp "$guest_sdk" "$out/sdk-changed.erofs"
+    printf changed >> "$out/sdk-changed.erofs"
+    mcopy -o -i "$slota" "$out/sdk-changed.erofs" ::/l4h/guest/sdk.erofs
+    run measured-guest A 1111-1111 l4h_esp_uuid=1111-1111
+    mcopy -o -i "$slota" "$guest_sdk" ::/l4h/guest/sdk.erofs
+fi
 run measured-selector A 1111-1111 l4h_esp_uuid=1111-1111 extra
 python3 - "$root" "$out" <<'PY'
 import pathlib, re, runpy, sys
@@ -245,6 +268,8 @@ base = pcr9('measured-a')
 assert base != bytes(32)
 assert base == pcr9('measured-other-slot'), 'unchosen slot affected PCR 9'
 assert base != pcr9('measured-selector'), 'selector not measured into PCR 9'
+if (out / 'measured-guest.log').exists():
+    assert base != pcr9('measured-guest'), 'external guest SDK not measured into PCR 9'
 print('discovered selector measured, unchosen slot excluded from PCR 9: PASS')
 PY
 tpm=()

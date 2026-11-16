@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the shipped dom0 package, build/efi/l4h-dom0-x86_64.tar.xz: the
 # dom0 userspace tools, for a dom0 of any distribution (see the user
-# manual; the kernel is in the UEFI application, tools/mkefi.sh):
+# manual; Linux and its SDK are in the separate guest package):
 #   bin/l4hctl         the control CLI (static)
 #   share/licenses/l4hctl/LICENSE   the CLI's BSD 2-Clause license
 #   l4h.conf.example   host settings, for l4h/l4h.conf
@@ -18,8 +18,7 @@ dir=$pkg/l4h-dom0-x86_64
 mkdir -p "$dir/bin" "$dir/share/licenses/l4hctl" "$dir/install"
 cp "$root/tools/l4hctl/target/release/l4hctl" "$dir/bin/l4hctl"
 cp "$root/tools/l4hctl/LICENSE" "$dir/share/licenses/l4hctl/LICENSE"
-cp "$root/tools/install/install.py" "$dir/install/"
-cp "$root/build/linux-l4h/include/config/kernel.release" "$dir/install/"
+cp "$root/tools/install/install.py" "$root/tools/install/artifacts.py" "$dir/install/"
 # A distro initramfs contains drivers for its native kernel. The installer
 # needs only built-in L4H drivers, UUID lookup and switch_root, so ship a
 # small static initramfs that works for both apt and yum distributions.

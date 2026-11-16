@@ -14,6 +14,8 @@ l4h_install() {
 Usage: curl -fsSL https://raw.githubusercontent.com/losfair/l4h/main/tools/install.sh | bash -s -- [options]
   --check                 Check install/update compatibility; do not change the system
   --release TAG           Install a specific GitHub release (default: latest)
+  --guest-release TAG     Select a compatible guest Linux release (v* or guest-v*)
+                          Fresh installs use the host default; updates preserve the guest
   --esp PATH              Mounted EFI system partition (UEFI; otherwise auto-detect)
   --uplink IFNAME         Select a physical uplink for the initial installation;
                           repeat to select a second independent uplink
@@ -45,7 +47,7 @@ HELP
                 return ;;
             --check) check=1; args+=("$arg") ;;
             --make-default|--assume-stable-tsc) args+=("$arg") ;;
-            --release|--esp|--uplink|--uplink-bond|--memory|--vcpus|--variant|--partitions)
+            --release|--guest-release|--esp|--uplink|--uplink-bond|--memory|--vcpus|--variant|--partitions)
                 (($#)) || { echo "l4h: $arg needs a value" >&2; return 2; }
                 if [[ $arg == --release ]]; then release=$1; else args+=("$arg" "$1"); fi
                 shift ;;

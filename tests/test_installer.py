@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.dont_write_bytecode = True
+sys.path.insert(0, str(ROOT / "tools/install"))
 spec = importlib.util.spec_from_file_location("installer", ROOT / "tools/install/install.py")
 installer = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(installer)

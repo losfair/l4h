@@ -6,6 +6,7 @@ work=/opt/l4h-install-test
 exec > >(tee -a "$work/result.log" /dev/console) 2>&1
 trap 'echo "INSTALLVM: FAIL at line $LINENO"; sync; systemctl poweroff' ERR
 cd "$work"
+release=$(python3 -c 'import json; print(json.load(open("release/l4h-host-generic.json"))["release"])')
 if [[ $(uname -r) == *-l4h ]]; then
     echo "INSTALLVM: dom0 kernel $(uname -r)"
     if [[ $(cat phase) == updated-dom0 ]]; then
@@ -57,7 +58,7 @@ if [[ $(uname -r) == *-l4h ]]; then
     # Its read-only module mount and smaller RAM/CPU allocation must not
     # become first-install migration inputs or replace the saved settings.
     # shellcheck disable=SC2002
-    cat install.sh | bash -s -- --release v0-install-test
+    cat install.sh | bash -s -- --release "$release"
     sha256sum --check installed-config.sha256
     sha256sum --check native-files.sha256
     echo 'INSTALLVM: dom0 update preserved configuration and running modules'
@@ -132,7 +133,7 @@ elif [[ ! -f phase ]]; then
     cp release/SHA256SUMS release/SHA256SUMS.good
     sed -i 's/^[0-9a-f]/x/' release/SHA256SUMS
     # shellcheck disable=SC2002
-    if cat install.sh | bash -s -- --release v0-install-test; then
+    if cat install.sh | bash -s -- --release "$release"; then
         echo 'INSTALLVM: invalid checksum was accepted'
         false
     fi
@@ -146,7 +147,7 @@ elif [[ ! -f phase ]]; then
     useradd --no-create-home --shell /bin/bash l4h-install-test
     echo 'l4h-install-test ALL=(root) NOPASSWD: ALL' > /etc/sudoers.d/l4h-install-test
     chmod 440 /etc/sudoers.d/l4h-install-test
-    sudo -u l4h-install-test bash -c 'cat install.sh | bash -s -- --release v0-install-test'
+    sudo -u l4h-install-test bash -c 'cat install.sh | bash -s -- --release "$1"' -- "$release"
     if [[ -d /sys/firmware/efi ]]; then config=/boot/efi/l4h/l4h.conf; else config=/boot/l4h/l4h.conf; fi
     echo '# operator settings survive updates' >> "$config"
     sha256sum "$config" > installed-config.sha256
@@ -160,11 +161,11 @@ elif [[ ! -f phase ]]; then
     fi
     # Updating from native Linux must preserve the edited configuration too.
     # shellcheck disable=SC2002
-    cat install.sh | bash -s -- --release v0-install-test
+    cat install.sh | bash -s -- --release "$release"
     sha256sum --check installed-config.sha256
     echo 'INSTALLVM: native update preserved configuration'
     # shellcheck disable=SC2002
-    cat install.sh | bash -s -- --check --release v0-install-test
+    cat install.sh | bash -s -- --check --release "$release"
     sha256sum --check native-files.sha256
     if [[ ! -d /sys/firmware/efi ]]; then
         # BIOS: an L4H entry in custom.cfg, selected once through next_entry.

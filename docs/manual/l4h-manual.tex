@@ -288,6 +288,8 @@ Command & Result \\
   \cmd{tools/build-linux.sh menuconfig} to change it. \\
 \cmd{tools/build-sdk.sh} & Builds the guest kernel and its build SDK,
   \file{build/linux-l4h/sdk.erofs} (Section~\ref{sec:sdk}). \\
+\cmd{tools/build-guest-release.sh} & Packages Linux, its exact SDK and guest
+  debug symbols in \file{build/efi/l4h-guest-*.tar.xz}, without building a host. \\
 \cmd{tools/build-host.sh} & Builds \texttt{l4h-vmm}, \texttt{l4h-blkd},
   \texttt{l4h-netd}, \texttt{l4h-vmmgr} (which embeds \texttt{l4h-vmm}) and
   the root task \texttt{l4h-root}, which embeds the others
@@ -312,7 +314,8 @@ tests/run-selftest.sh 4          # builds Linux and the host, boots a 4-vCPU gue
 \end{lstlisting}
 
 \begin{caveat}
-The guest kernel needs the seL4 headers, so build the kernel before Linux.
+Linux and its SDK build independently of seL4/FL4. Build the microkernel
+before the host and its ABI provider, which use its headers.
 Rebuild the host (\cmd{tools/build-host.sh}) after changing an
 \texttt{L4H\_*} setting default, since they are compiled in. dom0 itself is
 never built into \texttt{l4h-root}: changing it needs no rebuild
@@ -408,12 +411,14 @@ AArch64 Linux binaries can be executed directly. Native AArch64 guest
 kernels leave kemu disabled. \cmd{tests/run-kemutest.sh} exercises the
 emulated ABI; it needs the AArch64 cross compiler and libc headers.
 
-Every guest runs this kernel: the one in the host's UEFI application
-(Chapter~\ref{ch:dom0}), or the one appended to \texttt{l4h-root} under
-QEMU. Guests cannot bring their own, because a guest kernel calls seL4
-directly and seL4's interface changes between versions: a kernel only works
-with the host it was built with. A different configuration therefore means a
-different host image.
+Every guest on one host runs its selected Linux image. Linux and its SDK
+are shipped together in \file{l4h-guest-x86\_64.tar.xz}, independently of
+the host. The host supplies an ABI provider built for its microkernel;
+compatible seL4 and FL4 hosts use the same guest package. Compatibility is
+checked by ABI versions, required provider operations and features, rather
+than by matching release tags. A different Linux configuration can use the
+same host if it preserves that contract. Updates take effect after a host
+reboot; selecting different kernels per VM is not supported.
 
 \section{Kernel build SDK}
 \label{sec:sdk}
@@ -756,16 +761,42 @@ cancels a pending trial, and removing \file{custom.cfg} removes the entry.
 If a boot hangs, the provider's recovery console or rescue system can do
 the same. There is no measured boot on BIOS (Section~\ref{sec:bios}).
 
+\subsection{Selecting a guest release}
+
+The installer accepts independent host and guest versions:
+\begin{lstlisting}[language=bash]
+tools/install.sh --release vHOST --guest-release guest-vGUEST
+\end{lstlisting}
+A fresh installation defaults to the guest named in the host manifest.
+An update preserves the installed guest unless \texttt{--guest-release}
+selects another. To update Linux alone, keep the installed host's
+\texttt{--release}. The installer verifies both packages, rejects
+incompatible ABIs before changing installed files, prepares the selected
+kernel's SDK mountpoint and records both releases and their hashes in
+\file{/var/lib/l4h/install.json}. Backups and failure rollback include the
+kernel and SDK together. Activating the update requires a host reboot.
+For A/B deployments, put the complete host/guest pair in the inactive slot.
+
+\cmd{tools/build-guest-release.sh} builds only guest artifacts;
+\texttt{L4H\_GUEST\_VERSION} sets their release identity. Tags beginning
+\texttt{guest-v} publish these independently. Full host releases include a
+default guest; setting \texttt{L4H\_GUEST\_RELEASE} when running
+\cmd{tools/build-release.sh} pins an existing guest and skips its build.
+\cmd{tools/check-reproducible.sh --guest} verifies a guest-only rebuild.
+
 \section{dom0 on the EFI system partition}
 \label{sec:esp}
 
-l4h ships as one UEFI application, the same for every host: an EFI wrapper
-containing a standalone GRUB that carries the seL4 kernel,
-\texttt{l4h-root}, the guest kernel and its build SDK
-(\cmd{tools/mkefi.sh OUT.efi}). It loads dom0's initramfs
-and the settings from the partition selected at boot:
+l4h ships a host UEFI application and a separate guest package. The EFI
+wrapper contains GRUB, the microkernel, \texttt{l4h-root}, its services and
+the matching ABI provider. It loads Linux, the SDK, dom0's initramfs and
+settings from the partition selected at boot:
+
 \begin{lstlisting}
-EFI/BOOT/BOOTX64.EFI   the l4h application
+EFI/BOOT/BOOTX64.EFI   the l4h host application
+l4h/guest/vmlinux      the selected guest Linux kernel
+l4h/guest/sdk.erofs    its matching build SDK
+l4h/guest/guest.json   guest version, ABI and checksums
 l4h/dom0/initrd        dom0's initramfs (optional)
 l4h/l4h.conf           host settings (optional)
 \end{lstlisting}
@@ -847,14 +878,18 @@ as part of \cmd{tools/build-efi.sh}. The source revision is pinned in
 \file{kernel/fl4/REVISION}; \texttt{L4H\_FL4\_SOURCE} can select a detached
 worktree for development. To make a UEFI disk from this release binary:
 \begin{lstlisting}
-tools/mkimage.sh -e l4h-fl4.efi -i dom0.cpio.gz \
+tools/mkimage.sh -e l4h-fl4.efi -g l4h-guest-x86_64.tar.xz \
+    -i dom0.cpio.gz \
     -c l4h.conf l4h-fl4.raw
 \end{lstlisting}
 
 Each tagged release on GitHub carries, for x86\_64:
 \begin{itemize}
-  \item all four applications, built in release mode, with their guest kernel
-        and its build SDK in them;
+  \item all four host applications, built in release mode, and
+        \file{l4h-host-VARIANT.json}, describing their ABI and default guest;
+  \item \file{l4h-guest-x86\_64.tar.xz}, the Linux kernel, matching SDK and
+        compatibility manifest, and \file{l4h-guest-debug-x86\_64.tar.xz},
+        the unstripped guest kernel;
   \item \file{l4h-bios-x86\_64.tar.xz}: the seL4 variants for BIOS machines
         (Section~\ref{sec:bios}), with each variant's kernel as
         \file{kernel-VARIANT.elf};
@@ -865,11 +900,11 @@ Each tagged release on GitHub carries, for x86\_64:
   \item \file{l4h-debug-x86\_64.tar.xz}: the same build with debug
         information, to turn fault addresses into source lines with
         \cmd{addr2line}. A multikernel partition~$K$ runs
-        \file{kernel-VARIANT-sK.elf}, not \file{kernel-VARIANT.elf}. Its \file{vmlinux} is the guest kernel, from
-        which verifiers compute launch digests
-        (Section~\ref{sec:attest});
+        \file{kernel-VARIANT-sK.elf}, not \file{kernel-VARIANT.elf}.
+        Guest symbols and the image for launch digests come from the selected
+        guest release's debug archive (Section~\ref{sec:attest});
   \item \file{l4h-debug-fl4-x86\_64.tar.xz}: the matching FL4 kernel,
-        host components, NIC drivers and guest kernel with debug information,
+        host components, NIC drivers and ABI provider with debug information,
         and the FL4 source commit in \file{fl4-revision};
   \item \file{l4h-attest.py}, which verifies attestation reports
         (Section~\ref{sec:attest});
@@ -1927,9 +1962,11 @@ interfaces of x86 PCs and servers:
 It works like this:
 \begin{itemize}
   \item the firmware measures the l4h application, with seL4, every
-        host component and the guest kernel in it, into PCR~4, then
+        host component and ABI provider in it, into PCR~4, then
         extends PCR~4 again when loading the embedded GRUB image. GRUB
-        measures dom0's initramfs and \file{l4h.conf} into PCR~9;
+        measures the selected slot's guest kernel, SDK, dom0 initramfs and
+        \file{l4h.conf} into PCR~9. A guest update therefore changes PCR~9
+        and the launch digest without replacing the host application;
   \item at boot, the host generates a signing key and has the TPM quote it,
         together with the PCRs, using the TPM's attestation key (AK). That
         quote is the \emph{host evidence};
@@ -1960,8 +1997,8 @@ tools/l4h-attest.py verify report evidence --data $NONCE --launch $DIGEST \
     --ak-name $AK --pcr 4=$PCR4 --ek-ca manufacturer-ca.pem
 \end{lstlisting}
 \cmd{measure} prints the launch digest a guest gets from those files;
-\file{vmlinux} is the host's guest kernel (in a release, the one in
-\file{l4h-debug-x86\_64.tar.xz}), and \file{guest-provider.bin} must come
+\file{vmlinux} is the selected guest kernel (from
+\file{l4h-guest-debug-x86\_64.tar.xz}), and \file{guest-provider.bin} must come
 from the same host build (use the FL4 debug archive for FL4). With
 \cmd{l4hctl create}, the command line is the one given with
 \texttt{--cmdline}; for dom0, it is \texttt{dom0\_cmdline}. \cmd{verify}

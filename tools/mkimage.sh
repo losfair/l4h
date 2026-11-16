@@ -11,12 +11,13 @@
 # and what BIOS-only clouds (DigitalOcean custom images, or written to the
 # disk from a rescue system) boot.
 # Usage: mkimage.sh [-e l4h.efi] [-b biosdir] [-i initrd] [-c l4h.conf]
-#                   [-m dir] <out.raw> [l4h-root.elf]
+#                   [-m dir] [-g guest-package] <out.raw> [l4h-root.elf]
 #   -e  use this application instead of building one from l4h-root.elf;
 #       without -b, the image then boots only under UEFI
 #   -b  use this directory from tools/mkbios.sh instead of building one
 #   -i, -c  dom0's initramfs and the settings, copied to /l4h/dom0/initrd
 #       and /l4h/l4h.conf
+#   -g  guest archive or unpacked directory for a host-only release image
 #   -m  a multikernel configuration, copied into /l4h: l4h-mk.conf and
 #       each partition's pN/l4h.conf and pN/dom0/initrd (DESIGN.md §11.4)
 # L4H_SERIAL_PORT, L4H_FB_CONSOLE=1, L4H_GUEST_KERNEL and L4H_GUEST_SDK
@@ -28,10 +29,11 @@ set -euo pipefail
 export PATH="$PATH:/usr/sbin:/sbin"
 for tool in mformat mmd mcopy sfdisk; do command -v "$tool" >/dev/null; done
 root=$(cd "$(dirname "$0")/.." && pwd)
-efi= bios= dom0_initrd= config= mk=
-while getopts e:b:i:c:m: o; do
+efi= bios= dom0_initrd= config= mk= guest=
+while getopts e:b:i:c:m:g: o; do
     case $o in
         m) mk=$OPTARG ;;
+        g) guest=$OPTARG ;;
         e) efi=$OPTARG ;;
         b) bios=$OPTARG ;;
         i) dom0_initrd=$OPTARG ;;
@@ -45,6 +47,13 @@ source "$root/tools/host-profile.sh"
 rootserver=${2:-$root/host/target/x86_64-sel4-roottask/$l4h_profile/l4h-root.elf}
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
+if [ -n "$guest" ]; then
+    if [ -f "$guest" ]; then
+        guest=$(python3 "$root/tools/install/artifacts.py" unpack "$guest" "$work")
+    else
+        python3 "$root/tools/install/artifacts.py" verify "$guest"
+    fi
+fi
 
 if [ -z "$bios" ] && [ -z "$efi" ]; then
     bios=$work/bios
@@ -56,15 +65,16 @@ if [ -z "$efi" ]; then
 fi
 grub_pc=/usr/lib/grub/i386-pc
 if [ -n "$bios" ]; then
-    for f in grub.cfg kernel.elf l4h-root.elf vmlinux; do
+    for f in grub.cfg kernel.elf l4h-root.elf; do
         [ -f "$bios/$f" ] || { echo "$bios/$f: missing (tools/mkbios.sh)" >&2; exit 1; }
     done
+    [ -f "$bios/vmlinux" ] || [ -n "$guest" ] || { echo 'host-only BIOS files require -g guest-package' >&2; exit 1; }
     [ -f "$grub_pc/boot.img" ] || { echo "$grub_pc: BIOS GRUB is not installed (grub-pc-bin)" >&2; exit 1; }
 fi
 
 # EFI system partition: FAT32, sized for the payload.
 payload=0
-for f in "$efi" $dom0_initrd $config ${bios:+"$bios"} ${mk:+"$mk"}; do
+for f in "$efi" $dom0_initrd $config ${bios:+"$bios"} ${mk:+"$mk"} ${guest:+"$guest"}; do
     payload=$(( payload + $(du -sb "$f" | cut -f1) ))
 done
 esp_mb=${L4H_ESP_MB:-$(( payload / 1048576 + 64 ))}
@@ -74,6 +84,10 @@ dd if=/dev/zero of="$work/esp.img" bs=1M count="$esp_mb" status=none
 mformat -i "$work/esp.img" -F -N "$serial" -v L4HEFI ::
 mmd -i "$work/esp.img" ::/EFI ::/EFI/BOOT ::/l4h ::/l4h/dom0
 mcopy -i "$work/esp.img" "$efi" ::/EFI/BOOT/BOOTX64.EFI
+if [ -n "$guest" ]; then
+    mmd -i "$work/esp.img" ::/l4h/guest
+    mcopy -i "$work/esp.img" "$guest"/vmlinux "$guest"/sdk.erofs "$guest"/kernel.release "$guest"/guest.json ::/l4h/guest/
+fi
 if [ -n "$bios" ]; then
     mmd -i "$work/esp.img" ::/l4h/bios
     mcopy -s -i "$work/esp.img" "$bios"/* ::/l4h/bios/

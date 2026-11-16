@@ -72,6 +72,20 @@ unsigned long long l4h_tsc_hz;
 const struct l4h_provider *l4h_provider_ops;
 struct l4h_provider_context l4h_provider_context;
 
+/* A distribution/loader contract, independent of Linux's module version.
+ * Keep this section in stripped images so installers and vmmgr can reject
+ * unsupported combinations before starting dom0. KVM remains optional. */
+__attribute__((section(".l4h.abi"), used))
+const struct {
+	char magic[8];
+	l4h_u64 guest_abi, provider_abi, provider_size, features;
+} l4h_guest_requirements = {
+	.magic = "L4HGABI1",
+	.guest_abi = L4H_ABI_VERSION,
+	.provider_abi = L4H_PROVIDER_VERSION,
+	.provider_size = sizeof(struct l4h_provider),
+};
+
 extern char l4h_secondary_entry[];
 extern void l4h_uctx_describe(unsigned long);
 

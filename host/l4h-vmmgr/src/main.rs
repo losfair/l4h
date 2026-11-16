@@ -15,6 +15,7 @@ macro_rules! info {
 }
 
 mod component;
+mod compat;
 mod ctl;
 mod ctl_failure;
 mod gpu;

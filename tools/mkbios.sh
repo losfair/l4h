@@ -29,13 +29,21 @@ rootserver=${2:-$root/host/target/x86_64-sel4-roottask/$l4h_profile/l4h-root.elf
 kernel=${3:-$root/build/sel4${L4H_KERNEL_VARIANT:+-$L4H_KERNEL_VARIANT}/bin/kernel.elf}
 guest_kernel=${L4H_GUEST_KERNEL:-$root/build/linux-l4h/vmlinux}
 guest_sdk=${L4H_GUEST_SDK-$(dirname "$guest_kernel")/sdk.erofs}
+external=${L4H_GUEST_EXTERNAL:-0}
+case "$external" in 0|1) ;; *) echo 'L4H_GUEST_EXTERNAL must be 0 or 1' >&2; exit 2 ;; esac
+guest_path='$l4h/bios/vmlinux'
+sdk_path='$l4h/bios/sdk.erofs'
+if [ "$external" = 1 ]; then
+    guest_path='$l4h/guest/vmlinux'
+    sdk_path='$l4h/guest/sdk.erofs'
+fi
 mkshim=${L4H_MKSHIM-$root/build/mkshim${L4H_KERNEL_VARIANT:+-$L4H_KERNEL_VARIANT}}
 source "$root/tools/mkshim-grub.sh"
 mkdir -p "$out"
-rm -rf "$out/sdk.erofs" "$out/mk"
+rm -rf "$out/sdk.erofs" "$out/vmlinux" "$out/mk"
 mk_stanza=
 if [ -n "$mkshim" ] && [ -f "$mkshim/l4h-mkshim.elf" ]; then
-    mk_stanza=$(mkshim_grub '$l4h/bios/mk' '$l4h/bios/l4h-root.elf' '$l4h/bios/vmlinux' '$l4h/bios/sdk.erofs' '$l4h')
+    mk_stanza=$(mkshim_grub '$l4h/bios/mk' '$l4h/bios/l4h-root.elf' "$guest_path" "$sdk_path" '$l4h')
     mkdir -p "$out/mk"
     cp "$mkshim"/l4h-mkshim.elf "$mkshim"/kernel-s*.elf "$out/mk/"
 fi
@@ -62,11 +70,21 @@ if [ "\$fb_console" = 1 ]; then
 else
     terminal_output serial
 fi
+if [ ! -f "$guest_path" ]; then
+    echo "l4h: guest kernel missing"
+    exit
+fi
+if [ "$external" = 1 ]; then
+    if [ ! -f "$sdk_path" ]; then
+        echo "l4h: guest SDK missing"
+        exit
+    fi
+fi
 $mk_stanza
 multiboot2 "\$l4h/bios/kernel.elf" console_port=\$serial_port debug_port=\$serial_port\$fbcon
 module2 --nounzip "\$l4h/bios/l4h-root.elf"
-module2 --nounzip "\$l4h/bios/vmlinux" guest-kernel
-if [ -f "\$l4h/bios/sdk.erofs" ]; then module2 --nounzip "\$l4h/bios/sdk.erofs" guest-sdk; fi
+module2 --nounzip "$guest_path" guest-kernel
+if [ -f "$sdk_path" ]; then module2 --nounzip "$sdk_path" guest-sdk; fi
 if [ -f "\$l4h/dom0/initrd" ]; then module2 --nounzip "\$l4h/dom0/initrd" dom0-initrd; fi
 if [ -f "\$l4h/l4h.conf" ]; then module2 --nounzip "\$l4h/l4h.conf" l4h-config; fi
 boot
@@ -75,6 +93,8 @@ CFG
 cp "$kernel" "$out/kernel.elf"
 # seL4 and root load only the segments: drop the debug information.
 objcopy --strip-debug "$rootserver" "$out/l4h-root.elf"
-objcopy --strip-debug "$guest_kernel" "$out/vmlinux"
-[ -n "$guest_sdk" ] && cp "$guest_sdk" "$out/sdk.erofs"
+if [ "$external" = 0 ]; then
+    objcopy --strip-debug "$guest_kernel" "$out/vmlinux"
+    [ -n "$guest_sdk" ] && cp "$guest_sdk" "$out/sdk.erofs"
+fi
 echo "$out: $(( $(du -sk "$out" | cut -f1) )) KiB"

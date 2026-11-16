@@ -21,7 +21,13 @@ cat > "$out/bios.conf" <<'CONF'
 dom0_disks=0
 dom0_cmdline="console=hvc0 imagetest=bios"
 CONF
-"$root/tools/mkimage.sh" -i "$out/bios.cpio.gz" \
+image_args=()
+if [ "${L4H_GUEST_EXTERNAL:-0}" = 1 ]; then
+    guest=${BIOS_GUEST:-$root/build/efi/l4h-guest-x86_64.tar.xz}
+    [ -f "$guest" ] || "$root/tools/build-guest.sh"
+    image_args=(-g "$guest")
+fi
+"$root/tools/mkimage.sh" "${image_args[@]}" -i "$out/bios.cpio.gz" \
     -c "$out/bios.conf" "$root/build/l4h-bios.raw"
 log=$root/build/qemu-bios.log
 timeout "${BIOSTEST_TIMEOUT:-120}" "$root/tools/run-bios.sh" "$root/build/l4h-bios.raw" </dev/null >"$log" 2>&1 &

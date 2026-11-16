@@ -723,7 +723,7 @@ higher than `P_K`. Direct invocations are therefore safe by capability
 checks alone. Host hypercalls and device requests validate their
 arguments, including pool addresses, device indices and lifecycle state.
 
-### 5.6 One guest kernel and its build SDK
+### 5.6 Guest releases and their build SDK
 
 - **One Linux image across microkernels.** Linux and its build SDK depend
   only on the versioned l4h ABI (`include/l4h/guest.h`, `provider.h`), not on
@@ -741,6 +741,27 @@ arguments, including pool addresses, device indices and lifecycle state.
   bytes are included in the launch digest. KVM stays compiled into the common
   x86_64 image and is enabled only when the host supplies EPT roots. ABI 10
   defines this bootstrap contract; old guest binaries cannot boot it.
+- **Independent releases.** The microkernel, host services and matching
+  provider belong to the host release. `tools/build-guest.sh` builds Linux,
+  its exact SDK and debug symbols without a microkernel build. The guest
+  package contains `vmlinux`, `sdk.erofs`, `kernel.release` and `guest.json`;
+  the SDK and kernel always move together. All guests on one host still run
+  its selected image and share its read-only pages. A host reboot activates
+  an installed update; choosing different kernels per VM is not implemented.
+- **Compatibility.** Every new guest ELF has an allocated `.l4h.abi` section:
+  the eight bytes `L4HGABI1`, then four little-endian u64 values (guest ABI,
+  provider ABI, minimum provider table bytes, required provider features).
+  The initial contract is guest ABI 10 / provider ABI 1. Required table
+  entries are a prefix; old guests accept appended operations on new hosts,
+  while guests needing new entries reject older hosts. Required feature bits
+  must be a subset of the provider's bits; KVM remains optional. Shared
+  bootinfo, device/event, register, TLS, callback and context layouts and
+  semantics must remain fixed within their ABI version. A breaking change
+  requires a version bump; release labels themselves are not ABI versions.
+  vmmgr checks declared requirements before booting any guest. Development
+  images predating this metadata retain their own bootstrap validation.
+  Package manifests bind ABI metadata and payload hashes, and the installer
+  checks both the manifests and the ELF before changing installed files.
 - **Built-in drivers.** All shipped drivers are built into Linux, sharing
   their text and rodata between guests.
 - **Build SDK.** `tools/build-sdk.sh` creates an EROFS image of Kbuild,
@@ -779,14 +800,17 @@ arguments, including pool addresses, device indices and lifecycle state.
   code another runs (Flush+Reload). These pages are never written once
   guests exist, so data stays out of reach.
 - **Modules may use the l4h ABI.** A module comes from the kernel's own
-  build, so it can call seL4 directly. The kernel exports its capability
+  build and uses the provider-backed Linux symbols. The kernel exports its capability
   allocator (`l4h_slot_alloc`, `l4h_obj_alloc`, …), process VSpaces
   (`l4h_vspace_get`), kernel mappings of foreign frames
   (`l4h_kernel_map_frame`) and os-sel4's vCPU state. `tests/guest/abitest`
   tests the ABI and the kernel extensions below Linux this way.
-- **Measured.** The kernel and SDK are part of the UEFI
-  application, which PCR 4 covers. Launch digests (§10.2) also cover the
-  kernel image in guest RAM.
+- **Measured.** Published UEFI applications contain the host and provider,
+  covered by PCR 4. GRUB reads the selected slot's external guest kernel and
+  SDK, extending PCR 9. Embedded development images also include them in
+  PCR 4. Launch digests (§10.2) cover the provider and kernel image in guest
+  RAM regardless of packaging. Verifiers must select expectations for both
+  the host and guest releases.
 
 ### 5.7 BPF JIT
 
@@ -4162,7 +4186,7 @@ The chain has four links.
      `--ek-ca` (no chain building);
    - the report verifies under K and carries the verifier's nonce and the
      expected launch digest. `measure` computes the digest from the kernel
-     (`vmlinux` in a release's debug archive), initramfs and command line.
+     (`vmlinux` in the selected guest release's debug archive), initramfs and command line.
 
    **AK enrollment.** A quote only proves something if the AK is in a real
    TPM. `make-credential` encrypts a secret to the EK (from its certificate)
@@ -4700,8 +4724,11 @@ injects these failures in a host built with `L4H_TEST_INJECT=1`;
 
 - **UEFI.** UEFI → EFI wrapper → GRUB (EFI) → multiboot2. `tools/mkefi.sh`
   builds l4h as one UEFI application containing a standalone GRUB whose
-  memdisk holds the seL4 kernel, `l4h-root` (with the service ELFs), the
-  guest kernel and its build SDK (§5.6). At boot, GRUB looks for
+  memdisk holds the microkernel and `l4h-root` (with the services and ABI
+  provider). Published applications load the guest kernel and SDK from
+  `/l4h/guest/vmlinux` and `/l4h/guest/sdk.erofs` on the selected slot.
+  `mkefi.sh` keeps an embedded development mode by default; release builders
+  set `L4H_GUEST_EXTERNAL=1`. At boot, GRUB looks for
   `/EFI/L4H/grubenv` on every device.
   Exactly one such file selects the partition containing dom0's initramfs
   and `l4h.conf` through its `l4h_esp_uuid` or `l4h_esp_label`. More than
@@ -4736,8 +4763,8 @@ injects these failures in a host built with `L4H_TEST_INJECT=1`;
   only with SeaBIOS, such as DigitalOcean. BIOS GRUB's core image is read
   into conventional memory and must stay within a few hundred KiB, so it
   cannot hold l4h as a memdisk. `tools/mkbios.sh` builds l4h's files
-  instead: the seL4 kernel, `l4h-root`, the guest kernel, its build SDK
-  and a `grub.cfg` that boots them like the UEFI script. They live in
+  instead: the seL4 kernel, `l4h-root` and a `grub.cfg` that boots them
+  with the separately installed `/l4h/guest` files. Host files live in
   `bios/` of a directory `$l4h` that also holds `dom0/initrd` and
   `l4h.conf`. Two GRUBs can run that `grub.cfg`:
   - the disk image's own (`tools/mkimage.sh`): its boot sector in the MBR
@@ -4763,7 +4790,7 @@ injects these failures in a host built with `L4H_TEST_INJECT=1`;
   (Meltdown isolation, xAPIC, no PCID). These seL4 variants share one
   `l4h-root`. It also builds `l4h-fl4.efi` with the pinned public FL4
   kernel and a separately rebuilt host and ABI provider, sharing the same
-  Linux guest and build SDK
+  separately distributed Linux guest and build SDK
   (`tools/build-fl4-efi.sh`, §14.2). FL4 detects the CPU features at boot;
   one application covers its x86_64 targets, with single-kernel boots
   and guest KVM where VT-x or AMD-V is available.
@@ -4778,20 +4805,24 @@ injects these failures in a host built with `L4H_TEST_INJECT=1`;
 - **Releases.** CI (`.github/workflows/release.yml`) builds, for x86_64, and
   attaches to the GitHub release of each pushed `v*` tag, with
   `SHA256SUMS`:
-  - all four applications, in release mode, with the components packed
-    without debug information;
+  - all four host applications, in release mode, with the components packed
+    without debug information, plus `l4h-host-VARIANT.json` describing each
+    host's ABI, provider, payload hashes and default guest release;
+  - `l4h-guest-x86_64.tar.xz`: independently installable Linux and matching
+    SDK with their manifest; `l4h-guest-debug-x86_64.tar.xz` holds the
+    unstripped guest `vmlinux` for debugging and launch measurements;
   - `l4h-bios-x86_64.tar.xz`: l4h's BIOS files, with each seL4 variant's kernel as
     `kernel-VARIANT.elf`, for the installer;
   - `l4h-dom0-x86_64.tar.xz` (`tools/build-dom0.sh`): the dom0 userspace
     package, a static `l4hctl`, an example `l4h.conf` and the installer
     (`install.py` and its static initramfs), for a dom0 of any distribution;
-    the kernel is in the UEFI application;
+    the kernel and SDK come from the selected guest release;
   - `l4h-debug-x86_64.tar.xz`: the unstripped build (root, components, each
     variant's kernel, its multikernel slot kernels `kernel-VARIANT-sK.elf`,
-    the shim and the guest kernel `vmlinux`), for `addr2line` on fault
+    the shim and ABI provider), for `addr2line` on fault
     addresses;
   - `l4h-debug-fl4-x86_64.tar.xz`: the FL4 build unstripped (kernel,
-    root, host components, NIC drivers and guest `vmlinux`), with the
+    root, host components, NIC drivers and ABI provider), with the
     source commit in `fl4-revision`;
   - `l4h-attest.py`, the attestation verifier (§10.2);
   - `l4h-manual.pdf`, the user manual.
@@ -5444,6 +5475,36 @@ including the debug archives, dom0 initramfs and PDF manual. Release CI
 requires this comparison before publishing. A failed rebuild stays under
 `build/reproducibility.*` with its log.
 
+`tools/build-guest-release.sh` publishes only the guest archives and their
+`SHA256SUMS`; `tools/check-reproducible.sh --guest` reproduces that set.
+`guest-v*` tags run `.github/workflows/guest-release.yml` without building a
+host. These releases do not replace the latest host release on GitHub.
+`L4H_GUEST_VERSION` sets the guest release identity. A full `v*` release
+builds a default guest with that tag; `L4H_GUEST_RELEASE=guest-vTAG
+tools/build-release.sh` instead pins an existing guest and skips Linux/SDK
+builds entirely. The host release workflow accepts the same pin through its
+`guest_release` dispatch input.
+
+Install a compatible pair with `tools/install.sh --release vHOST
+--guest-release guest-vGUEST`. Fresh installs use the host manifest's default
+when the guest is omitted. Updates preserve the recorded guest unless
+`--guest-release` selects another. To update only Linux, retain the installed
+host's `--release` and select a new guest. The installer verifies both release
+checksum lists, binds each kernel to its matching SDK, and records both
+versions and manifests in `/var/lib/l4h/install.json`. Its existing backup and
+failure rollback transaction now includes all guest files. As before, this
+uses recovery backups for failures handled by the installer. Deploy a complete
+pair to an inactive A/B slot when activation must survive a power loss.
+Legacy embedded installations can upgrade to a split release. Downgrading
+back to an embedded release requires restoring the earlier installation.
+
+For disk images, pass the guest archive (or verified unpacked directory):
+
+```sh
+tools/mkimage.sh -e build/efi/l4h-generic.efi \
+    -g build/efi/l4h-guest-x86_64.tar.xz -i dom0.cpio.gz -c l4h.conf build/l4h.raw
+```
+
 Reproduction needs the same build inputs and tool versions. The release
 workflow pins the Debian container by digest and its apt repositories to
 the 2026-11-14 snapshot. `rust-toolchain.toml` pins the Linux/dom0 Rust
@@ -5560,12 +5621,12 @@ shipped seL4 CPU variants do not apply.
 `L4H_RELEASE=1 tools/build-fl4-efi.sh` builds `build/efi/l4h-fl4.efi` and
 its matching `l4h-debug-fl4-x86_64.tar.xz`; `build-efi.sh` builds them after
 packaging the three seL4 variants. Each host/provider uses its own libsel4
-headers; all four applications carry the same Linux image and build SDK. The FL4
+headers; all four applications can boot the same separate guest package. The FL4
 application carries no multikernel shim. Both debug archives include their
 matching `guest-provider.bin` and `guest-provider.elf`; use the binary with
 `l4h-attest.py measure --provider` and the ELF to decode provider faults. To make a UEFI disk
 from the release binary, use `tools/mkimage.sh -e build/efi/l4h-fl4.efi
--i dom0.cpio.gz -c l4h.conf build/l4h-fl4.raw`.
+-g build/efi/l4h-guest-x86_64.tar.xz -i dom0.cpio.gz -c l4h.conf build/l4h-fl4.raw`.
 
 `tests/run-fl4test.sh` runs the 1- and 4-vCPU self-tests with VMX/SVM hidden,
 4-vCPU disk I/O, networking through a dom0 restart, and balloon reporting.
