@@ -155,7 +155,7 @@ const USAGE: &str = "usage: l4hctl <command>
                                current time, e.g. after NTP synchronizes)
   dashboard-title [TITLE]      text of the title bar on the host's screen
                                (up to 32 printable ASCII characters;
-                               default: "l4h" again), until the host reboots
+                               default: l4h again), until the host reboots
   disks                        host disks, owners, capacities and attachments
   pci [--json]                 host PCI functions, IDs, class and service owner
   usb [--json]                 host xHCI controllers: ports, state (firmware
