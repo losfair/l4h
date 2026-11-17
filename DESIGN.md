@@ -2320,7 +2320,11 @@ firewalling belong in a VM.
 - **Offloads.** Checksum and TSO metadata pass through in the virtio-net
   header. netd validates flags, checksum offsets and GSO type, including
   that a GSO frame is TCP over IPv4/IPv6 and that no checksum starts in
-  the Ethernet header, and drops incoherent headers. A
+  the Ethernet header, and drops incoherent headers. A GSO frame with no
+  more payload than one segment is a plain frame with a partial checksum,
+  as Linux takes it from virtio-net (`virtio_net_hdr_to_skb`): no receiver
+  or device's TSO is asked to cut a frame of headers alone or of one
+  segment, and the uplink's minimum frame length applies to it. A
   frame for a port that cannot take its offload is segmented and checksummed
   in software.
   A guest port takes a GSO frame whole only if its driver accepted
@@ -2740,7 +2744,9 @@ root restarts. Root and netd know no device kind. The design is issue
   256 looks per turn, refuses an offer of another ABI, and stops reading a
   channel whose producer broke the protocol. It sends a driver only frames
   inside its offer (checksum and GSO types, MSS and header bounds, frame
-  lengths) and segments and checksums the rest.
+  lengths, more than one segment of payload in a GSO frame) and segments
+  and checksums the rest; the nicd loop checks GSO frames against the
+  offer again before a driver programs TSO.
 - **The SDK** (`l4h-nicdrv`): the `NicDriver` trait (what netd's drivers
   had: `start`, `offer`, `receive`, `transmit` and their interrupt
   handshakes), `Hw` (BARs, DMA region, MSI-X, legacy ports, the

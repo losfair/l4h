@@ -155,12 +155,16 @@ impl Offer {
     }
 
     /// Whether the device takes GSO frame `hdr` of `len` bytes whole
-    /// (a checked offer).
+    /// (a checked offer).  Only a frame of more than one segment: a
+    /// device's segmentation offload is never asked to cut one with less
+    /// payload (offload::sanitize makes such a frame plain; netd segments
+    /// any other into the one frame it is).
     pub fn takes_gso(&self, len: usize, hdr: &[u8; HDR_SIZE]) -> bool {
         let get16 = |off: usize| u16::from_le_bytes([hdr[off], hdr[off + 1]]) as u32;
         let ty = hdr[1] & 0x7f;
         ty < 32 && self.tx_gso_mask & (1 << ty) != 0
             && len <= self.tx_gso_max as usize
+            && len > (get16(2) + get16(4)) as usize
             && (self.tx_mss_min..=self.tx_mss_max).contains(&get16(4))
             && get16(2) <= self.tx_hdr_max
     }
@@ -706,6 +710,10 @@ mod tests {
         hdr[2..4].copy_from_slice(&54u16.to_le_bytes());
         hdr[4..6].copy_from_slice(&1448u16.to_le_bytes());
         assert!(c.takes_gso(60000, &hdr));
+        // One segment, or headers alone, is not for the device to cut.
+        assert!(c.takes_gso(54 + 1449, &hdr));
+        assert!(!c.takes_gso(54 + 1448, &hdr));
+        assert!(!c.takes_gso(54, &hdr));
         hdr[1] = 3;
         assert!(!c.takes_gso(60000, &hdr), "UDP is not offered");
         o.abi = 2;

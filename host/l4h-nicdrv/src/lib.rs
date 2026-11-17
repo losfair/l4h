@@ -287,8 +287,14 @@ impl<D: NicDriver> Loop<D> {
         for _ in 0..TX_BUDGET {
             match self.tx.next(&tx) {
                 uplink::Next::Frame(f, hdr) => {
-                    let ok_len = (o.tx_frame_min as usize..=o.tx_frame_max as usize).contains(&f.len())
-                        || (offload::is_gso(&hdr) && f.len() <= o.tx_gso_max as usize);
+                    // A GSO frame only as the offer takes it (netd's own
+                    // check, `Offer::takes_gso`): no device's segmentation
+                    // offload is given less than two segments to cut.
+                    let ok_len = if offload::is_gso(&hdr) {
+                        o.takes_gso(f.len(), &hdr)
+                    } else {
+                        (o.tx_frame_min as usize..=o.tx_frame_max as usize).contains(&f.len())
+                    };
                     if ok_len && !dev.transmit(f, &hdr) {
                         // Completions may have come before the interrupt
                         // was on.
