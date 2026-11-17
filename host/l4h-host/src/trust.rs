@@ -562,6 +562,51 @@ pub const fn hw_config_write_protected(off: usize, width: usize) -> bool {
     false
 }
 
+/// Whether a configuration write [off, off + width) of a function whose
+/// configuration space `read8` reads meets its MSI or MSI-X capability
+/// (MSI's length by its Message Control: 64-bit addresses, per-vector
+/// masking).  A device the firmware left mastering the bus would send the
+/// AML's message as an interrupt where none is remapped.  A capability list
+/// that cannot be walked (a pointer into the header, more than 48 entries)
+/// refuses every write.
+pub fn hw_config_msi(off: usize, width: usize, read8: impl Fn(usize) -> u8) -> bool {
+    let end = off.saturating_add(width);
+    if read8(6) & 0x10 == 0 {
+        return false;
+    }
+    let mut ptr = (read8(0x34) & !3) as usize;
+    let mut hops = 0;
+    while ptr != 0 {
+        if ptr < 0x40 || hops == 48 {
+            return true;
+        }
+        let len = match read8(ptr) {
+            0x05 => {
+                let ctrl = read8(ptr + 2) as usize | (read8(ptr + 3) as usize) << 8;
+                10 + if ctrl & 0x80 != 0 { 4 } else { 0 } + if ctrl & 0x100 != 0 { 10 } else { 0 }
+            }
+            0x11 => 12,
+            _ => 0,
+        };
+        if off < ptr + len && ptr < end {
+            return true;
+        }
+        ptr = (read8(ptr + 1) & !3) as usize;
+        hops += 1;
+    }
+    false
+}
+
+/// The MSI-X table and pending bits of a function, as memory ranges:
+/// from its capability's Message Control `ctrl` and Table and PBA
+/// registers, with `bar` the address of a memory BAR (None if the BAR is
+/// not one).
+pub fn msix_blocks(ctrl: u16, table: u32, pba: u32, bar: impl Fn(u8) -> Option<u64>) -> [Option<(u64, u64)>; 2] {
+    let n = (ctrl & 0x7ff) as u64 + 1;
+    let at = |reg: u32, size: u64| bar((reg & 7) as u8).map(|b| (b.saturating_add((reg & !7) as u64), size));
+    [at(table, n * 16), at(pba, n.div_ceil(64) * 8)]
+}
+
 /// Whether the access [addr, addr + width) lies within [base, base + size).
 pub const fn hw_within(addr: usize, width: usize, base: u64, size: u64) -> bool {
     let (addr, width) = (addr as u64, width as u64);
@@ -571,10 +616,41 @@ pub const fn hw_within(addr: usize, width: usize, base: u64, size: u64) -> bool 
     }
 }
 
+/// Whether the access [addr, addr + width) meets [base, base + size).
+pub const fn hw_meets(addr: usize, width: usize, base: u64, size: u64) -> bool {
+    let (addr, end) = (addr as u64, (addr as u64).saturating_add(width as u64));
+    addr < base.saturating_add(size) && base < end
+}
+
 /// Addresses that are never RAM on a PC: the I/O APICs, the HPET, the
 /// TPM, the chipset's registers, the local APIC and the firmware's flash,
 /// below 4 GiB.
 pub const HW_CHIPSET: (u64, u64) = (0xfec0_0000, 0x0140_0000);
+
+/// I/O ports the AML never reaches, whatever the firmware's tables say
+/// (root adds the FADT's sleep and SMI ports): the keyboard controller's
+/// and port A's reset, APM's SMI command and data, the reset control
+/// register, and the legacy interrupt controllers and timer, the 8259
+/// PICs with their edge/level registers and the 8254 PIT, which only
+/// the kernel programs.
+pub const HW_REFUSED_PORTS: [(usize, usize); 9] =
+    [(0x20, 2), (0x40, 4), (0x60, 1), (0x64, 1), (0x92, 1), (0xa0, 2), (0xb2, 2), (0x4d0, 2), (0xcf9, 1)];
+
+/// The HPET's register block, where PCs put it: the AML never reaches it.
+/// Its comparators deliver interrupts as MSI writes the IOMMU does not
+/// remap (AMD-Vi passes a special device's through), so with it the AML
+/// could send any vector, NMI or INIT to any CPU, another partition's
+/// too.
+pub const HPET_DEFAULT: (u64, u64) = (0xfed0_0000, 0x400);
+
+/// The register block of the HPET table `table` (its first bytes): its
+/// base address, if in memory space, and the block's 1 KiB.
+pub fn hpet_block(table: &[u8]) -> Option<(u64, u64)> {
+    // The Generic Address Structure at 40: space 0 (memory), the address
+    // at 44.
+    let addr = u64::from_le_bytes(table.get(44..52)?.try_into().ok()?);
+    (*table.get(40)? == 0 && addr != 0).then_some((addr, 0x400))
+}
 
 /// An ECAM window of the MCFG: the configuration space of buses
 /// [bus_lo, bus_hi] of `segment`, a page per function from `base` (bus 0's).
@@ -822,6 +898,82 @@ mod tests {
         assert!(!hw_within(0xfebf_ffff, 2, HW_CHIPSET.0, HW_CHIPSET.1));
         assert!(!hw_within(usize::MAX, 2, 0, u64::MAX));
         assert!(!hw_within(8, 1, 4, u64::MAX));
+    }
+
+    #[test]
+    fn the_hpet_and_legacy_ports_are_refused() {
+        // Any byte of the block, from either side.
+        for (addr, width) in [(0xfed0_0000, 4), (0xfed0_0100, 8), (0xfed0_03fc, 4), (0xfecf_fffe, 4)] {
+            assert!(hw_meets(addr, width, HPET_DEFAULT.0, HPET_DEFAULT.1), "{addr:#x}+{width}");
+        }
+        for (addr, width) in [(0xfed0_0400, 4), (0xfecf_fffc, 4), (usize::MAX, 4)] {
+            assert!(!hw_meets(addr, width, HPET_DEFAULT.0, HPET_DEFAULT.1), "{addr:#x}+{width}");
+        }
+        // The table's address, in memory space only.
+        let mut t = [0u8; 56];
+        t[44..52].copy_from_slice(&0xfed0_1000u64.to_le_bytes());
+        assert_eq!(hpet_block(&t), Some((0xfed0_1000, 0x400)));
+        t[40] = 1;
+        assert_eq!(hpet_block(&t), None);
+        assert_eq!(hpet_block(&t[..50]), None);
+        // Port A's reset, the PICs, the PIT and the ELCR.
+        let refused = |p: usize, w: usize| HW_REFUSED_PORTS.iter().any(|&(q, n)| hw_meets(p, w, q as u64, n as u64));
+        for (port, width) in [(0x92, 1), (0x20, 1), (0x21, 1), (0xa0, 2), (0x40, 4), (0x43, 1), (0x4d0, 2), (0xcf8, 4)] {
+            assert!(refused(port, width), "{port:#x}+{width}");
+        }
+        for (port, width) in [(0x80, 1), (0x22, 1), (0x44, 4), (0x4d2, 2), (0xcfc, 4)] {
+            assert!(!refused(port, width), "{port:#x}+{width}");
+        }
+    }
+
+    #[test]
+    fn msi_and_msix_are_refused() {
+        // Power management at 0x40, MSI at 0x50, MSI-X at 0x70.
+        let space = |msi_ctrl: u16| {
+            let mut c = [0u8; 256];
+            c[6] = 0x10;
+            c[0x34] = 0x40;
+            c[0x40..0x42].copy_from_slice(&[0x01, 0x50]);
+            c[0x50..0x54].copy_from_slice(&[0x05, 0x70, msi_ctrl as u8, (msi_ctrl >> 8) as u8]);
+            c[0x70..0x72].copy_from_slice(&[0x11, 0x00]);
+            c
+        };
+        let msi = |c: &[u8; 256], off: usize, width: usize| hw_config_msi(off, width, |i| c.get(i).copied().unwrap_or(0xff));
+        // MSI's length: 10, 14 with 64-bit addresses, 20 or 24 maskable.
+        for (ctrl, len) in [(0u16, 10), (0x80, 14), (0x100, 20), (0x180, 24)] {
+            let c = space(ctrl);
+            assert!(msi(&c, 0x50, 4) && msi(&c, 0x50 + len - 1, 1), "{ctrl:#x}");
+            assert!(msi(&c, 0x4c, 8), "{ctrl:#x}: across its start");
+            assert!(!msi(&c, 0x50 + len, 1), "{ctrl:#x}: past its end");
+        }
+        let c = space(0x180);
+        // MSI-X's 12 bytes, not what follows them or comes before MSI.
+        for (off, width) in [(0x70, 2), (0x72, 2), (0x74, 4), (0x7b, 1)] {
+            assert!(msi(&c, off, width), "{off:#x}+{width}");
+        }
+        for (off, width) in [(0x40, 4), (0x4c, 4), (0x7c, 4), (0xfc, 4), (0x08, 4), (0x100, 4)] {
+            assert!(!msi(&c, off, width), "{off:#x}+{width}");
+        }
+        // No capability list: nothing; one that cannot be walked: all.
+        let mut c = space(0);
+        c[6] = 0;
+        assert!(!msi(&c, 0x50, 4));
+        let mut c = space(0);
+        c[0x71] = 0x20;
+        assert!(msi(&c, 0x80, 4));
+        let mut c = space(0);
+        c[0x71] = 0x40;
+        assert!(msi(&c, 0x80, 4));
+    }
+
+    #[test]
+    fn msix_tables_as_memory() {
+        let bar = |i: u8| match i { 0 => Some(0xfe00_0000), 2 => Some(0x40_0000_0000), _ => None };
+        // 8 vectors: 128 bytes of table, 8 of pending bits; 65: 1040, 16.
+        assert_eq!(msix_blocks(7, 0x2000, 0x3000 | 2, bar), [Some((0xfe00_2000, 128)), Some((0x40_0000_3000, 8))]);
+        assert_eq!(msix_blocks(64, 0, 0x800, bar), [Some((0xfe00_0000, 1040)), Some((0xfe00_0800, 16))]);
+        assert_eq!(msix_blocks(0, 1, 0, bar), [None, Some((0xfe00_0000, 8))]);
+        assert!(hw_meets(0xfe00_207c, 4, 0xfe00_2000, 128) && !hw_meets(0xfe00_2080, 4, 0xfe00_2000, 128));
     }
 
     fn mcfg(entries: &[(u64, u16, u8, u8)]) -> crate::fixed::ArrayVec<u8, 1024> {

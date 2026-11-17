@@ -4416,7 +4416,11 @@ runs the secondary's ActivateCredential calls (the relay):
     carved for itself or a driver (the AML's pages are carved into a frame
     table
     of their own, so whatever root carved, the IOMMU's registers among
-    it, is not free for them), and not a BAR of a PCI function root drives. On
+    it, is not free for them), not a BAR of a PCI function root drives
+    (the balloon's included), and not the HPET's registers (0xfed00000 and
+    the HPET table's): its comparators send MSIs that no IOMMU remaps
+    (AMD-Vi passes a special device's through), with which the AML could
+    send any vector, NMI or INIT to any CPU. On
     a machine split into partitions the others' RAM is device memory to this
     kernel and the descriptor does not list it, so there root serves memory
     only where none can be: the chipset's addresses from 0xfec00000 to 4 GiB,
@@ -4424,7 +4428,9 @@ runs the secondary's ActivateCredential calls (the relay):
     serves I/O ports seL4 has not handed out, except those that
     reset the machine, put it to sleep or enter SMM (0x60, 0x64, 0x92,
     0xb2–0xb3, 0xcf9 and the FADT's SMI command and PM1/PM2 control
-    blocks). PCI configuration,
+    blocks) and the legacy interrupt controllers and timer only the kernel
+    programs (the 8259s at 0x20 and 0xa0, their ELCR at 0x4d0, the 8254 at
+    0x40). PCI configuration,
     by ports or through the MCFG's ECAM windows, it serves for reading. Writes
     it refuses to every function root manages (disk controllers, uplink NICs,
     xHCI controllers, the balloon device, IOMMUs, every bridge, an ISA or LPC
@@ -4432,7 +4438,12 @@ runs the secondary's ActivateCredential calls (the relay):
     to functions of other segments, and in every function to the command
     register, the BARs and the expansion ROM's, so the AML neither moves a
     device root does not drive onto another's addresses nor lets one master
-    the bus. Root keeps up to 16 ECAM windows; if the MCFG lists more, or
+    the bus, and to the MSI and MSI-X capabilities; in memory it refuses
+    writes to every function's MSI-X table and pending bits, as found at
+    boot (none at all if there are more than root keeps): a function the
+    firmware left mastering the bus would send the AML's message as an
+    interrupt, where none is remapped any vector to any CPU. Root keeps up
+    to 16 ECAM windows; if the MCFG lists more, or
     cannot be read, it serves no memory write at all, since any could be a
     configuration write. Refused reads return all ones, and root logs refusals
     through `log::RateLimit`.

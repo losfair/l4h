@@ -260,6 +260,10 @@ pub struct Host {
     pub asids: AsidPools,
     pub pci: pci::Pci,
     pub pci_inventory: &'static mut pci::Inventory,
+    /// Every function's MSI-X table and pending bits, and whether all of
+    /// them fit (pci::MSIX_BLOCKS).
+    pub msix_blocks: &'static mut pci::MsixBlocks,
+    pub msix_complete: bool,
     pub iommu: iommu::Iommu,
     pub devmem: devmem::DevMem,
     /// Disk controllers, and their units as host disks.
@@ -281,6 +285,8 @@ pub struct Host {
     /// vmmgr does.
     pub next_instance: u64,
     pub memd: memd::Memd,
+    /// The virtio-balloon memd was given, if any.
+    pub balloon: Option<pci::Device>,
     pub reset: reset::Reset,
     pub rtc: rtc::Rtc,
     pub vmmgr: Option<vmmgr::Vmmgr>,
@@ -554,8 +560,12 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     nicd::drivers().load(module("l4h-drivers"));
     let mut balloon = None;
     let pci_inventory = pci::INVENTORY.take();
+    let (msix_blocks, mut msix_complete) = (pci::MSIX_BLOCKS.take(), true);
     for d in pci.enumerate() {
         pci_inventory.must_push(pci.identity(&d));
+        for b in pci.msix_blocks(&d).into_iter().flatten() {
+            msix_complete &= msix_blocks.push(b).is_ok();
+        }
         let record = pci_inventory.last_mut().unwrap();
         info!(
             "l4h-root: pci {:02x}:{:02x}.{} {:04x}:{:04x} class {:02x}{:02x}",
@@ -636,6 +646,8 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         asids,
         pci,
         pci_inventory,
+        msix_blocks,
+        msix_complete,
         iommu,
         devmem,
         ctrls,
@@ -651,6 +663,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         trustd,
         next_instance: 1,
         memd,
+        balloon,
         reset,
         rtc,
         vmmgr: None,
