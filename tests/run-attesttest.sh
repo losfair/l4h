@@ -159,7 +159,11 @@ echo "ATTESTTEST: taint, seals, at-most-once gates and reused instances verify"
 
 
 secret=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
-python3 "$attest" make-credential "$out/run/evidence1" "$secret" -o "$out/run/cred" || fail "make-credential"
+# The EK certificate is the host's word unless --ek-ca checks it.
+python3 "$attest" make-credential "$out/run/evidence1" "$secret" -o "$out/run/cred" 2>"$out/run/makecred.err" \
+    || fail "make-credential without --ek-ca"
+grep -q "EK certificate not verified (--ek-ca)" "$out/run/makecred.err" || fail "make-credential did not warn of an unchecked EK certificate"
+python3 "$attest" make-credential "$out/run/evidence1" "$secret" -o "$out/run/cred" --ek-ca "$ca" || fail "make-credential"
 boot boot2 tpm-tis "$out/run/cred"
 log=$out/boot2.log
 grep -aq "ATTEST: secret $secret" "$log" || fail "credential not activated"
@@ -179,7 +183,7 @@ for t in tpm2 ssdt; do
     iasl -p "$out/run/$t" "$root/tests/ftpm/$t.asl" >"$out/run/iasl.log" 2>&1 || fail "iasl $t.asl"
 done
 secret=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
-python3 "$attest" make-credential "$out/run/evidence1" "$secret" -o "$out/run/cred" || fail "make-credential"
+python3 "$attest" make-credential "$out/run/evidence1" "$secret" -o "$out/run/cred" --ek-ca "$ca" || fail "make-credential"
 image_env=(L4H_ACPI_TABLES="$out/run/tpm2.aml $out/run/ssdt.aml" L4H_ACPI_EXCLUDE=TPM2)
 qemu_extra=(-chardev file,id=dbg,path="$out/run/debugcon" -device isa-debugcon,iobase=0x402,chardev=dbg)
 boot boot3 tpm-crb "$out/run/cred"

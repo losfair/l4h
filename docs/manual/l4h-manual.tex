@@ -2000,12 +2000,19 @@ whether it is dom0, the PCRs, and the TPM's reset count.
 \paragraph{Enrolling the AK.} The quote proves nothing until the verifier
 knows that the AK belongs to a real TPM. Enroll each host once:
 \begin{lstlisting}[language=bash]
-tools/l4h-attest.py make-credential evidence $SECRET -o cred   # verifier
+tools/l4h-attest.py make-credential evidence $SECRET -o cred \
+    --ek-ca manufacturer-ca.pem                                 # verifier
 l4hctl attest activate cred                                     # guest
 \end{lstlisting}
 The guest prints \texttt{\$SECRET} back only if the TPM that holds the EK
-in the evidence's certificate also holds the AK. The verifier then pins the
-AK's name, as \cmd{verify} prints it, with \texttt{--ak-name}. The AK stays
+in the evidence's certificate also holds the AK. \texttt{--ek-ca} checks
+that certificate as \cmd{verify} does; without it the certificate is only
+the host's word (any key could be in it), and \cmd{make-credential} warns.
+It refuses an AK that is not a fixedTPM restricted signing key. The
+verifier then pins the AK's name, as \cmd{verify} prints it, with
+\texttt{--ak-name}: from then on the AK carries the trust, and the EK
+certificate in later evidence, which the host could swap for another TPM's,
+adds nothing. The AK stays
 the same across reboots. \cmd{tpm2\_makecredential} writes the same
 credential format. Each guest may activate 5 credentials at once, then one
 a second; beyond that the call fails with \texttt{EAGAIN} (``Resource

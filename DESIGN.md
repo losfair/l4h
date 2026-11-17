@@ -4221,13 +4221,20 @@ The chain has four links.
 
    **AK enrollment.** A quote only proves something if the AK is in a real
    TPM. `make-credential` encrypts a secret to the EK (`--ek`, else from its
-   certificate, else `ekpub`, which the verifier must first check against
-   the manufacturer's certificate for that key: a host could give its own)
-   bound to the AK's name (TPM2_MakeCredential). A guest decrypts it with
+   certificate, which `--ek-ca` checks as `verify` does, else `ekpub`,
+   which the verifier must first check against the manufacturer's
+   certificate for that key: a host could give its own; an unchecked
+   certificate or `ekpub` gets a warning) bound to the AK's name
+   (TPM2_MakeCredential), and only for an AK that is a fixedTPM
+   restricted signing key, since the credential activates for any object
+   of that name. A guest decrypts it with
    `l4hctl attest activate`, which runs TPM2_ActivateCredential with a
    PolicySecret(endorsement) session for the EK; only the TPM holding both
    keys can. The verifier then pins the AK's name (`--ak-name`), which is
-   stable across boots.
+   stable across boots. The evidence's EK certificate is unsigned and not
+   bound to the AK: once the AK is pinned, `--ek-ca` at `verify` shows
+   only that some TPM's certificate came along. The binding is the one
+   checked at enrollment, so `--ek-ca` belongs with `make-credential`.
 
    **Rate limit.** ActivateCredential is the only request that uses the TPM
    (about 80 ms on a discrete Infineon TPM), and trustd answers one request
