@@ -3867,9 +3867,16 @@ gives seL4 `fb_console` as a word of its own on the multiboot2 line (an
 unquoted variable, empty otherwise): GRUB joins the first word of an
 unquoted variable's value to the word before it, whatever blanks the value
 starts with, so a value " fb_console" after `debug_port=$serial_port` made
-`debug_port=0x3f8fb_console` (tests/run-uefitest.sh checks both). Root reports unknown keys
-and bad scalar values and keeps the defaults. The user manual lists the
-settings.
+`debug_port=0x3f8fb_console` (tests/run-uefitest.sh checks both). Sourcing
+the file cannot redirect GRUB: it keeps the partition (or BIOS directory)
+it chose across the `source`, and takes `serial_port` only as a decimal or
+`0x` hexadecimal number (else the built-in default), so that no word of the
+file reaches the kernel command line. GRUB reads no input (no
+`terminal_input serial`: it boots at once, with no menu), and every failed
+`boot` is followed by `exit`, so the EFI wrapper returns `EFI_LOAD_ERROR`
+for A/B fallback instead of leaving a GRUB shell on the serial port.
+Root reports unknown keys and bad scalar values and keeps the defaults.
+The user manual lists the settings.
 
 **dom0's disks.**
 
