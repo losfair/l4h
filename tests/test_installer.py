@@ -278,6 +278,46 @@ class MultikernelConfig(unittest.TestCase):
         with self.assertRaisesRegex(installer.Incompatible, "no NVMe controller left for partition 1"):
             installer.mk_configuration(2, [0], [self.nic("00:05.0", 0)], set())
 
+    def test_a_shared_isolation_group_stays_in_partition_0(self):
+        # A dual-port NIC without ACS: one group.  Its second port is not
+        # given to partition 1, whose split the shim would refuse.
+        devices = [self.nvme("00:04.0", 0), self.nvme("00:06.0", 0), self.nic("00:05.0", 0),
+                   dict(self.nic("01:00.0", 0), group={"01:00.0", "01:00.1"}),
+                   dict(self.nic("01:00.1", 0), group={"01:00.0", "01:00.1"}), dict(self.nic("02:00.0", 0), group={"02:00.0"})]
+        text = installer.mk_configuration(2, [0], devices, {"00:04.0", "00:05.0"})
+        self.assertIn("p1.pci = 0000:00:06.0, 0000:02:00.0\n", text)
+        with self.assertRaisesRegex(installer.Incompatible, "no NIC left for partition 1"):
+            installer.mk_configuration(2, [0], devices[:5], {"00:04.0", "00:05.0"})
+
+    def test_groups_from_sysfs(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            preflight = installer.Preflight(installer.arguments(["--check", "--partitions", "2"]), root, None)
+
+            def pci(bdf, cls, group=None):
+                d = root / "sys/bus/pci/devices" / ("0000:" + bdf)
+                d.mkdir(parents=True)
+                (d / "class").write_text(hex(cls))
+                if group is not None:
+                    (root / "sys/kernel/iommu_groups" / str(group)).mkdir(parents=True, exist_ok=True)
+                    (d / "iommu_group").symlink_to("../../../../kernel/iommu_groups/%d" % group)
+            plan = dict(firmware="uefi", boot_disk="00:04.0", uplinks=[dict(bdf="00:05.0")])
+            pci("00:04.0", 0x010802, 1)
+            pci("00:05.0", 0x020000, 2)
+            pci("00:06.0", 0x010802, 3)
+            # 00:07.0's group holds a function partition 0 keeps (an
+            # audio function of the same card, say).
+            pci("00:07.0", 0x020000, 4)
+            pci("00:07.1", 0x040300, 4)
+            pci("00:08.0", 0x020000, 5)
+            self.assertIn("p1.pci = 0000:00:06.0, 0000:00:08.0\n", preflight.multikernel(plan))
+            # Without an IOMMU in Linux, a slot is taken for a group.
+            shutil.rmtree(root / "sys")
+            for bdf, cls in (("00:04.0", 0x010802), ("00:05.0", 0x020000), ("00:06.0", 0x010802),
+                             ("00:07.0", 0x020000), ("00:07.1", 0x020000), ("00:08.0", 0x020000)):
+                pci(bdf, cls)
+            self.assertIn("p1.pci = 0000:00:06.0, 0000:00:08.0\n", preflight.multikernel(plan))
+
 
 class UpdateChecks:
     """The same update contract on both firmware layouts."""

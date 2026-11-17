@@ -30,6 +30,10 @@ struct Func {
     device: u16,
     class: u32,
     bridge: bool,
+    /// Linux's IOMMU group: the functions that reach each other past the
+    /// IOMMU (no ACS between them) or share a requester ID with it.  None
+    /// without an IOMMU in Linux.
+    group: Option<String>,
 }
 
 impl Func {
@@ -165,7 +169,9 @@ fn funcs(root: &Path) -> Result<Vec<Func>> {
         let hex = |name: &str| fs::read_to_string(e.path().join(name)).ok()
             .and_then(|c| u32::from_str_radix(c.trim().trim_start_matches("0x"), 16).ok()).unwrap_or(0);
         let class = hex("class");
-        out.push(Func { bdf: b, vendor: hex("vendor") as u16, device: hex("device") as u16, class, bridge: class >> 8 == 0x0604 });
+        let group = fs::read_link(e.path().join("iommu_group")).ok()
+            .and_then(|g| g.file_name().map(|n| n.to_string_lossy().into_owned()));
+        out.push(Func { bdf: b, vendor: hex("vendor") as u16, device: hex("device") as u16, class, bridge: class >> 8 == 0x0604, group });
     }
     out.sort_by_key(|f| f.bdf);
     Ok(out)
@@ -266,6 +272,29 @@ fn check(root: &Path, path: &str) -> Result<i32> {
     let ram = ram_bytes(root);
     let mut asked = 0;
     let mut ok = true;
+    // One IOMMU group, one partition (the shim checks again at boot, with
+    // root's rules: acs.rs): its functions reach each other past the
+    // IOMMU, or share one requester ID.  Without an IOMMU in Linux there
+    // are no groups to go by.
+    let mut groups: BTreeMap<&str, (u16, usize)> = BTreeMap::new();
+    for f in funcs.iter().filter(|f| !f.bridge) {
+        let Some(g) = f.group.as_deref() else { continue };
+        let k = fowner[&f.bdf];
+        match groups.get(g) {
+            Some(&(other, o)) if o != k => {
+                println!("{} (p{o}) and {} (p{k}) are in one IOMMU group ({g}): they can reach each other without the IOMMU",
+                    fmt_bdf(other), fmt_bdf(f.bdf));
+                ok = false;
+            }
+            Some(_) => {}
+            None => {
+                groups.insert(g, (f.bdf, k));
+            }
+        }
+    }
+    if n > 1 && funcs.iter().all(|f| f.group.is_none()) {
+        println!("no IOMMU groups (Linux has no IOMMU on): functions that reach each other cannot be checked here; the shim checks at boot");
+    }
     for k in 0..n {
         let c = part_cpus(k);
         let fs: Vec<&Func> = funcs.iter().filter(|f| fowner[&f.bdf] == k).collect();
@@ -347,6 +376,15 @@ mod tests {
             }
         }
 
+        /// Put function `bdf` in IOMMU group `group`, as sysfs links it.
+        fn group(&self, bdf: &str, group: u32) {
+            let dir = self.0.join(format!("sys/kernel/iommu_groups/{group}"));
+            fs::create_dir_all(&dir).unwrap();
+            let link = self.0.join(format!("sys/bus/pci/devices/0000:{bdf}/iommu_group"));
+            let _ = fs::remove_file(&link);
+            std::os::unix::fs::symlink(&dir, link).unwrap();
+        }
+
         fn check(&self) -> Result<i32> {
             super::check(&self.0, self.0.join("l4h-mk.conf").to_str().unwrap())
         }
@@ -396,6 +434,31 @@ mod tests {
     fn rejects_missing_cpu_without_mcfg() {
         let m = Machine::new();
         m.write("l4h-mk.conf", b"partitions = 2\np1.cpus = 0\np1.pci = 00:06.0\n");
+        assert_eq!(m.check().unwrap(), 1);
+    }
+
+    #[test]
+    fn rejects_a_split_iommu_group() {
+        let m = Machine::new();
+        // A dual-port NIC without ACS between its functions: function 0
+        // is p0's, function 1 would be p1's.
+        m.pci("00:05.0", 0x020000, 0x8086, 0x10fb);
+        m.pci("00:05.1", 0x020000, 0x8086, 0x10fb);
+        m.write("l4h-mk.conf", b"partitions = 2\np1.cpus = 2\np1.pci = 00:06.0, 00:05.1\n");
+        m.group("00:04.0", 1);
+        m.group("00:06.0", 2);
+        m.group("00:05.0", 3);
+        m.group("00:05.1", 3);
+        assert_eq!(m.check().unwrap(), 1);
+        // Both functions in p1: one group, one partition.
+        m.write("l4h-mk.conf", b"partitions = 2\np1.cpus = 2\np1.pci = 00:06.0, 00:05.0, 00:05.1\n");
+        assert_eq!(m.check().unwrap(), 0);
+        // Functions that isolate with ACS are groups of their own.
+        m.write("l4h-mk.conf", b"partitions = 2\np1.cpus = 2\np1.pci = 00:06.0, 00:05.1\n");
+        m.group("00:05.1", 4);
+        assert_eq!(m.check().unwrap(), 0);
+        // A disk controller of p1 in p0's disk's group.
+        m.group("00:06.0", 1);
         assert_eq!(m.check().unwrap(), 1);
     }
 

@@ -5131,8 +5131,18 @@ Every PCI function no other partition lists is partition 0's, so
 `partitions = 1` behaves like one l4h. The shim refuses, rather than
 guesses: a BDF that does not exist or is in two partitions, a bridge, a
 partition without a disk controller, functions behind a PCI(-X) bridge
-(one requester ID) split between partitions, and a partition 0 without the
-boot CPU. Without MCFG (GCE's i440FX machines) it scans through the ports
+(one requester ID) split between partitions, functions of one isolation
+group split between partitions, and a partition 0 without the
+boot CPU. An isolation group is root's (`acs.rs`, as for a confined NIC
+driver, §9.8): the functions of a multi-function device without ACS, and
+those below switch or root ports that do not isolate them, reach each
+other's BARs without passing the IOMMU, so a device of one partition could
+write another partition's devices. The shim first turns ACS on in every
+function, as partition 0's root does (§9.5), so that the ports are judged
+as they will be; without MCFG it cannot reach ACS, and nothing below a
+bridge isolates. `l4hctl mk-check` refuses functions of one Linux IOMMU
+group in two partitions, and the installer gives another partition only
+a device alone in its group (its slot, without an IOMMU in Linux). Without MCFG (GCE's i440FX machines) it scans through the ports
 0xcf8/0xcfc, and the descriptor's ECAM base is 0.
 
 **CPUs.** Each partition's MADT lists only its own LAPIC/x2APIC entries,

@@ -211,6 +211,28 @@ impl Pci {
     }
 }
 
+/// Root's ACS code (acs.rs) reads and writes through the shim's access:
+/// extended space through ECAM only, as in root.
+impl crate::acs::Config for Pci {
+    fn read(&self, bdf: u16, off: u8) -> u32 {
+        self.read32(bdf, off as u16)
+    }
+
+    fn read_ext(&self, bdf: u16, off: u16) -> Option<u32> {
+        (self.ecam.is_some() && (0x100..0x1000).contains(&off)).then(|| self.read32(bdf, off))
+    }
+
+    fn write_ext(&self, bdf: u16, off: u16, val: u32) -> bool {
+        let Some((_, start, end)) = self.ecam else { return false };
+        let bus = (bdf >> 8) as u8;
+        if bus < start || bus > end || !(0x100..0x1000).contains(&off) {
+            return false;
+        }
+        self.write32(bdf, off, val);
+        true
+    }
+}
+
 pub fn fmt_bdf(bdf: u16) -> impl core::fmt::Display {
     struct B(u16);
     impl core::fmt::Display for B {

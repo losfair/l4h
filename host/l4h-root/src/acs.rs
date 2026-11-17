@@ -378,6 +378,20 @@ pub fn closure<I: Iterator<Item = u16>>(c: &impl Config, functions: impl Fn() ->
     (!full).then_some(len)
 }
 
+/// A member of `me`'s isolation group (`closure`) that `owner` gives to
+/// another partition than `me`'s, if any: the multikernel shim refuses
+/// such a split, as a device could then reach another partition's
+/// devices past the IOMMU, or share a domain with them.  Bridges, which
+/// take no part in DMA, are no members here.  Err if the group has more
+/// members than `out` holds.  The shim's (boot/l4h-mkshim), not root's.
+#[allow(dead_code)]
+pub fn other_owner<I: Iterator<Item = u16>>(c: &impl Config, functions: impl Fn() -> I + Copy,
+    requester: impl Fn(u16) -> u16, owner: impl Fn(u16) -> u8, me: u16, out: &mut [u16]) -> Result<Option<u16>, ()> {
+    let n = closure(c, functions, requester, me, out).ok_or(())?;
+    let endpoint = |b: u16| (c.read(b, 0x0c) >> 16) as u8 & 0x7f == 0;
+    Ok(out[..n].iter().copied().find(|&f| endpoint(f) && owner(f) != owner(me)))
+}
+
 /// The names of the bits set in `bits`, for the log.
 pub struct Bits(pub u16);
 

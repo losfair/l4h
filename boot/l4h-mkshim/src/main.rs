@@ -24,6 +24,10 @@
 #![no_main]
 
 mod acpi;
+// Root's PCIe ACS rules and isolation groups, unchanged.
+#[path = "../../../host/l4h-root/src/acs.rs"]
+#[allow(dead_code)]
+mod acs;
 mod boot;
 mod conf;
 mod cpu;
@@ -188,7 +192,7 @@ extern "C" fn shim_main(magic: u32, info: u64) -> ! {
         }
     }
     assign_cpus(&conf, &cpus, bsp_index, &mut plans);
-    assign_funcs(&conf, &funcs, &mut plans);
+    assign_funcs(&conf, &pci, &funcs, &mut plans);
 
     // Clocks, once, before any kernel runs: no kernel touches the PIT.
     cpu::mask_pic();
@@ -499,7 +503,7 @@ fn assign_cpus(conf: &Conf, cpus: &[acpi::Cpu], bsp: usize, plans: &mut [Plan]) 
 
 /// Give each function to the partition that lists it, the rest to
 /// partition 0, and check the result.
-fn assign_funcs(conf: &Conf, funcs: &[pci::Func], plans: &mut [Plan]) {
+fn assign_funcs(conf: &Conf, pci: &pci::Pci, funcs: &[pci::Func], plans: &mut [Plan]) {
     let n = plans.len();
     let mut owner: Vec<u8, 1024> = Vec::new();
     for _ in funcs {
@@ -542,6 +546,28 @@ fn assign_funcs(conf: &Conf, funcs: &[pci::Func], plans: &mut [Plan]) {
                     _ => {}
                 }
             }
+        }
+    }
+    // Functions that reach each other past the IOMMU (a multi-function
+    // device or a switch or root port without ACS between them) are one
+    // isolation group, as root's confinement takes them (acs.rs): one
+    // partition must have them all, or a device of one could write
+    // another's registers.  ACS goes on first, as partition 0's root sets
+    // it in every function (DESIGN.md §9.5), so that the ports are judged
+    // as they will be; without ECAM nothing isolates.  Each group with a
+    // function of another partition than 0 is walked from that function.
+    for f in funcs {
+        let _ = acs::enable(pci, f.bdf);
+    }
+    let owner_of = |bdf: u16| funcs.iter().position(|f| f.bdf == bdf).map_or(0, |i| owner[i]);
+    let mut members = [0u16; 1024];
+    for (i, f) in funcs.iter().enumerate().filter(|&(i, _)| owner[i] != 0) {
+        match acs::other_owner(pci, || funcs.iter().map(|f| f.bdf), |b| b, owner_of, f.bdf, &mut members) {
+            Ok(None) => {}
+            Ok(Some(o)) => fail(format_args!(
+                "PCI functions {} (p{}) and {} (p{}) can reach each other without the IOMMU (no ACS between them)",
+                pci::fmt_bdf(f.bdf), owner[i], pci::fmt_bdf(o), owner_of(o))),
+            Err(()) => fail(format_args!("PCI function {}: isolation group too large", pci::fmt_bdf(f.bdf))),
         }
     }
     for (i, &k) in owner.iter().enumerate() {

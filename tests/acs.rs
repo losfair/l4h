@@ -557,3 +557,34 @@ fn a_group_is_closed_under_reach_and_requester_aliases() {
     // Too many members for `out`.
     assert_eq!(acs::closure(&m, || inventory.iter().copied(), alias, 0x0028, &mut [0u16; 2]), None);
 }
+
+#[test]
+fn the_shim_refuses_a_group_split_between_partitions() {
+    let owners = |p1: &'static [u16]| move |b: u16| if p1.contains(&b) { 1 } else { 0 };
+    let other = |m: &Model, inv: &[u16], p1: &'static [u16], me: u16| {
+        acs::other_owner(m, || inv.iter().copied(), |f| f, owners(p1), me, &mut [0u16; 16]).unwrap()
+    };
+    // 00:02.0's endpoint below a root port without ACS reaches across the
+    // root bus, to 00:01.0's: they cannot be in two partitions.
+    let (m, inv) = two_root_ports(None, Some((ALL, ALL)));
+    assert_eq!(other(&m, &inv, &[0x0300], 0x0300), Some(0x0200));
+    // With ACS on both ports each is alone, and may go anywhere.
+    let (m, inv) = two_root_ports(Some((ALL, ALL)), Some((ALL, ALL)));
+    assert_eq!(other(&m, &inv, &[0x0300], 0x0300), None);
+    // A multi-function device without ACS: its functions go together.
+    assert_eq!(other(&m, &inv, &[0x00fa], 0x00fa), Some(0x00f8));
+    assert_eq!(other(&m, &inv, &[0x00f8, 0x00fa], 0x00fa), None);
+    // A dual-port NIC whose functions both isolate with ACS may be split.
+    let both = SV | RR | CR | UF;
+    let m = Model::new(&[(0x0028, Func::pcie(0, Some((both, both))).multi()), (0x0029, Func::pcie(0, Some((both, both))))]);
+    assert_eq!(other(&m, &[0x0028, 0x0029], &[0x0029], 0x0029), None);
+    // A bridge in the slot takes no part: only what is below it does.
+    let m = Model::new(&[(0x0028, Func::pcie(0, None).multi()), (0x0029, Func::pcie(acs::DOWNSTREAM_PORT, None).bridge(2)),
+        (0x0200, Func::pcie(0, None))]);
+    let inv = [0x0028, 0x0029, 0x0200];
+    assert_eq!(other(&m, &inv, &[0x0028], 0x0028), Some(0x0200));
+    assert_eq!(other(&m, &inv, &[0x0028, 0x0200], 0x0028), None);
+    // A group larger than the caller's room is an error, not a pass.
+    let (m, inv) = two_root_ports(None, None);
+    assert_eq!(acs::other_owner(&m, || inv.iter().copied(), |f| f, owners(&[0x0300]), 0x0300, &mut [0u16; 2]), Err(()));
+}
