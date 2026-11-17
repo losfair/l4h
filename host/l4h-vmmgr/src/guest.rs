@@ -926,11 +926,13 @@ impl Guest {
 
     /// The launch digest (DESIGN.md §10.2): SHA-256 over the image as it is
     /// in guest RAM, the boot parameters that locate it, and the command
-    /// line.
+    /// line.  The initrd's address is among them: with kernel_end it fixes
+    /// boot_plan's blocks, which dom0 could otherwise change (moving the
+    /// initrd up) without changing the digest.
     fn measure(&self, win: &mut Window, entry: u64, kernel_end: usize, initrd: (usize, usize), cmdline: &[u8]) -> [u8; 32] {
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
-        h.update(b"l4h-launch-v1");
+        h.update(b"l4h-launch-v2");
         h.update((self.ram_base as u64).to_le_bytes());
         h.update(entry.to_le_bytes());
         h.update((kernel_end as u64).to_le_bytes());
@@ -944,6 +946,8 @@ impl Guest {
             }
         };
         range(&mut h, 0, kernel_end);
+        let initrd_gpa = if initrd.1 != 0 { initrd.0 as u64 } else { 0 };
+        h.update(initrd_gpa.to_le_bytes());
         h.update((initrd.1 as u64).to_le_bytes());
         range(&mut h, initrd.0, initrd.1);
         h.update((cmdline.len() as u64).to_le_bytes());

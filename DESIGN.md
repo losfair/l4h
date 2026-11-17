@@ -4112,9 +4112,13 @@ The chain has four links.
    swtpm, start takes 0.4 to 0.6 s; earlier guest requests are answered
    once it is done.
 3. **Reports on guests.** vmmgr measures each guest as it boots it, dom0
-   included. The launch digest is `SHA-256("l4h-launch-v1" ‖ ram_base_va ‖
-   entry ‖ kernel_end ‖ RAM[0, kernel_end) ‖ initrd size ‖ initrd ‖ cmdline
-   length ‖ cmdline)`, with u64 little-endian integers. The immutable ABI
+   included. The launch digest is `SHA-256("l4h-launch-v2" ‖ ram_base_va ‖
+   entry ‖ kernel_end ‖ RAM[0, kernel_end) ‖ initrd GPA ‖ initrd size ‖
+   initrd ‖ cmdline length ‖ cmdline)`, with u64 little-endian integers and
+   the initrd GPA 0 without an initrd. The GPA, with kernel_end, fixes which
+   RAM blocks hold the boot image: dom0 cannot move the initrd to change
+   them under the same digest. `l4h-attest.py measure` takes vmmgr's
+   default, 1 MiB past the kernel's end, or `--initrd-gpa`. The immutable ABI
    provider is part of the host's EFI measurement, so the launch digest
    identifies the same workload across approved host builds.
    - vmmgr reads the image back from guest RAM before the guest starts, and
@@ -4318,7 +4322,13 @@ checking taint alone leaves a session key exposed after its report.
   bits 0–63 only; `l4hctl list` shows seals. The verifier prints host names
   and Linux taint letters and accepts `--deny-taint` / `--require-seal` as
   comma-separated names, numbers and ranges; by default it denies
-  `console-in` (`--deny-taint ''` opts out). Bitmaps may grow: at least 32
+  `console-in` taint and requires a `console-in` seal (`--deny-taint ''`
+  and `--require-seal ''` opt out), so that input after the report cannot
+  have reached the guest unattested. Its CBOR decoder refuses duplicate
+  map keys, nesting deeper than 16 and items longer than the input;
+  `--ek-ca` takes one or more CA certificates and checks validity times,
+  that the issuer is a CA allowed to sign certificates, that the EK
+  certificate is not a CA's, and its EK extended key usage if it has one. Bitmaps may grow: at least 32
   bytes are required, and bits beyond their length count as clear.
 
 **Without a TPM.** trustd always starts, on both architectures. With no TPM,

@@ -1953,9 +1953,13 @@ It works like this:
 A guest can tell that its host offers attestation when
 \file{/dev/l4h-attest} exists. In a guest:
 \begin{lstlisting}[language=bash]
+l4hctl attest seal console-in             # no more console input
 l4hctl attest report $NONCE -o report     # NONCE: up to 64 bytes, in hex
 l4hctl attest evidence -o evidence
 \end{lstlisting}
+Seal \texttt{console-in} first, best from the initramfs's init: the
+verifier refuses by default a report whose guest took console input, or
+could still take it after the report.
 Without \texttt{-o}, the commands print hex. Standard tools can also get
 both from configfs-tsm: create a directory under
 \file{/sys/kernel/config/tsm/report}, write the data to \file{inblob}, and
@@ -1969,7 +1973,9 @@ tools/l4h-attest.py measure vmlinux --initrd initrd --cmdline "console=hvc0"
 tools/l4h-attest.py verify report evidence --data $NONCE --launch $DIGEST \
     --ak-name $AK --pcr 4=$PCR4 --ek-ca manufacturer-ca.pem
 \end{lstlisting}
-\cmd{measure} prints the launch digest a guest gets from those files;
+\cmd{measure} prints the launch digest a guest gets from those files,
+with the initramfs where the host puts it (1~MiB past the kernel's end;
+\texttt{--initrd-gpa} gives another address), which the digest includes;
 \file{vmlinux} is the host's guest kernel (in a release, the one in
 \file{l4h-debug-x86\_64.tar.xz}). The ABI provider is covered by the host's
 EFI measurement. With \cmd{l4hctl create}, the command line is the one given with
@@ -1979,7 +1985,14 @@ fails unless every check holds:
   \item the quote is the TPM's, over the host key that signed the report;
   \item the report carries the nonce and launch digest given;
   \item each PCR has the value given with \texttt{--pcr};
-  \item the EK certificate chains to the CA given with \texttt{--ek-ca}.
+  \item the guest took no console input and has sealed \texttt{console-in}
+        (\texttt{--deny-taint} and \texttt{--require-seal} change which
+        flags are checked; \texttt{--deny-taint ''} and
+        \texttt{--require-seal ''} turn the checks off);
+  \item the EK certificate was issued by a CA in the file given with
+        \texttt{--ek-ca} (one or more PEM certificates), both are valid
+        now, the issuer is a CA that may sign certificates, and the EK
+        certificate is not a CA's and is for an EK.
 \end{itemize}
 It then prints the claims as JSON: the guest's id, memory, vCPUs and
 whether it is dom0, the PCRs, and the TPM's reset count.

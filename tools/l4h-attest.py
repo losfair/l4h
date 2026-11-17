@@ -28,15 +28,17 @@
 
 """Verifier side of l4h attestation (DESIGN.md §10.2).
 
-  l4h-attest.py measure KERNEL [--initrd F] [--cmdline S]
+  l4h-attest.py measure KERNEL [--initrd F] [--cmdline S] [--initrd-gpa N]
       The launch digest of a guest booted with these files: what its
-      reports carry as "launch".
+      reports carry as "launch".  The initrd's address is part of it.
   l4h-attest.py verify REPORT EVIDENCE [--data HEX] [--launch HEX]
                 [--pcr N=HEX]... [--ak-name HEX] [--ek-ca PEM]
                 [--deny-taint SPEC] [--require-seal SPEC]
       Check a report (l4hctl attest report -o) against the host evidence
       (l4hctl attest evidence -o), and print what they claim as JSON.
       Without --ak-name the attestation key is not known to be a TPM's.
+      By default the guest must have sealed console-in and not taken
+      console input before: input after the report would be unattested.
       A multikernel host's report and evidence name the partition the
       guest runs in (version 2); verify prints it as "partition".
   l4h-attest.py make-credential EVIDENCE SECRET_HEX -o FILE [--ek PEM]
@@ -54,6 +56,7 @@ Needs the Python `cryptography` package.
 """
 
 import argparse
+import datetime
 import hashlib
 import hmac
 import json
@@ -82,17 +85,26 @@ class Fail(Exception):
 # ---- CBOR (RFC 8949), the subset trustd writes
 
 
+# Deeper than anything trustd writes (a report or evidence nests 3 deep).
+CBOR_MAX_DEPTH = 16
+
+
 def cbor_decode(b):
-    def item(i):
-        ib = b[i]
+    def take(i, n):
+        if i + n > len(b):
+            raise Fail("malformed CBOR")
+        return b[i:i + n], i + n
+
+    def item(i, depth):
+        if depth > CBOR_MAX_DEPTH:
+            raise Fail("CBOR nesting too deep")
+        (ib,), i = take(i, 1)
         major, info = ib >> 5, ib & 31
-        i += 1
         if info < 24:
             v = info
         elif info in (24, 25, 26, 27):
-            n = 1 << (info - 24)
-            v = int.from_bytes(b[i:i + n], "big")
-            i += n
+            raw, i = take(i, 1 << (info - 24))
+            v = int.from_bytes(raw, "big")
         else:
             raise Fail("unsupported CBOR item")
         if major == 0:
@@ -100,31 +112,41 @@ def cbor_decode(b):
         if major == 1:
             return -1 - v, i
         if major == 2:
-            return bytes(b[i:i + v]), i + v
+            raw, i = take(i, v)
+            return bytes(raw), i
         if major == 3:
-            return b[i:i + v].decode(), i + v
+            raw, i = take(i, v)
+            return bytes(raw).decode(), i
         if major == 4:
             out = []
             for _ in range(v):
-                x, i = item(i)
+                x, i = item(i, depth + 1)
                 out.append(x)
             return out, i
         if major == 5:
             out = {}
             for _ in range(v):
-                k, i = item(i)
-                out[k], i = item(i)
+                k, i = item(i, depth + 1)
+                # A key given twice could say one thing to one verifier and
+                # another to the next; a list or map is no key.
+                try:
+                    dup = k in out
+                except TypeError:
+                    dup = True
+                if dup:
+                    raise Fail("duplicate or invalid CBOR map key")
+                out[k], i = item(i, depth + 1)
             return out, i
         if major == 6:
-            x, i = item(i)
+            x, i = item(i, depth + 1)
             return ("tag", v, x), i
         if major == 7 and info in (20, 21):
             return info == 21, i
         raise Fail("unsupported CBOR item")
 
     try:
-        v, end = item(0)
-    except (IndexError, UnicodeDecodeError):
+        v, end = item(0, 0)
+    except (IndexError, UnicodeDecodeError, RecursionError):
         raise Fail("malformed CBOR")
     if end != len(b):
         raise Fail("trailing bytes after CBOR item")
@@ -256,8 +278,11 @@ def point(key):
 # ---- measure
 
 
-def launch_digest(kernel, initrd, cmdline):
-    """The digest vmmgr computes at boot (guest.rs, Guest::measure)."""
+def launch_digest(kernel, initrd, cmdline, initrd_gpa=None):
+    """The digest vmmgr computes at boot (guest.rs, Guest::measure).  The
+    initrd is where vmmgr puts it, 1 MiB past the kernel's end
+    (kimage::Kernel::initrd_gpa), unless `initrd_gpa` says otherwise; with
+    no initrd its address is 0."""
     if kernel[:4] != b"\x7fELF" or kernel[4] != 2 or kernel[5] != 1:
         raise Fail("kernel: not a 64-bit little-endian ELF")
     entry, phoff = struct.unpack_from("<QQ", kernel, 24)
@@ -278,10 +303,16 @@ def launch_digest(kernel, initrd, cmdline):
     for v, _, data in loads:
         image[v - base:v - base + len(data)] = data
     cmd = cmdline.encode()[:2047]
-    h = hashlib.sha256(b"l4h-launch-v1")
+    if not initrd:
+        gpa = 0
+    elif initrd_gpa is None:
+        gpa = end + (1 << 20)
+    else:
+        gpa = initrd_gpa
+    h = hashlib.sha256(b"l4h-launch-v2")
     h.update(struct.pack("<QQQ", base, entry, end))
     h.update(image)
-    h.update(struct.pack("<Q", len(initrd)))
+    h.update(struct.pack("<QQ", gpa, len(initrd)))
     h.update(initrd)
     h.update(struct.pack("<Q", len(cmd)))
     h.update(cmd)
@@ -318,6 +349,55 @@ def key_chain(ev, partition):
         seen.add(k)
         pcr = hashlib.sha256(pcr + key_binding(pt, k)).digest()
     return pcr, [e[0] for e in chain]
+
+
+# TCG's EK certificate extended key usage (tcg-kp-EKCertificate).
+EK_CERT_EKU = x509.ObjectIdentifier("2.23.133.8.1")
+
+
+def check_ek_cert(cert, cas, where, now=None):
+    """That `cert` is an EK certificate one of `cas` issued and that both
+    are valid now: the CA is a CA that may sign certificates, the EK
+    certificate is not a CA's, and if it limits its use, to an EK's."""
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+
+    def ext(c, kind):
+        try:
+            return c.extensions.get_extension_for_class(kind).value
+        except x509.ExtensionNotFound:
+            return None
+
+    def valid(c):
+        return c.not_valid_before_utc <= now <= c.not_valid_after_utc
+
+    try:
+        if not valid(cert):
+            raise Fail("EK certificate expired or not yet valid")
+        bc = ext(cert, x509.BasicConstraints)
+        if bc is not None and bc.ca:
+            raise Fail("EK certificate is a CA certificate")
+        eku = ext(cert, x509.ExtendedKeyUsage)
+        if eku is not None and EK_CERT_EKU not in eku:
+            raise Fail("EK certificate is not for an EK (extended key usage)")
+        why = "EK certificate not issued by %s" % where
+        for ca in cas:
+            try:
+                cert.verify_directly_issued_by(ca)
+            except (ValueError, TypeError, InvalidSignature):
+                continue
+            bc = ext(ca, x509.BasicConstraints)
+            ku = ext(ca, x509.KeyUsage)
+            if bc is None or not bc.ca:
+                why = "EK certificate issuer is not a CA"
+            elif ku is not None and not ku.key_cert_sign:
+                why = "EK certificate issuer may not sign certificates"
+            elif not valid(ca):
+                why = "EK certificate issuer expired or not yet valid"
+            else:
+                return
+        raise Fail(why)
+    except ValueError as e:
+        raise Fail("malformed certificate: %s" % e)
 
 
 def check_evidence(ev, pins, ak_name, ek_ca):
@@ -368,14 +448,17 @@ def check_evidence(ev, pins, ak_name, ek_ca):
             raise Fail("PCR %d is %s, not %s" % (i, pcrs.get(i, b"").hex(), want.hex()))
     ek = None
     if "ekcert" in ev:
-        cert = x509.load_der_x509_certificate(ev["ekcert"])
-        ek = {"subject": cert.subject.rfc4514_string(), "issuer": cert.issuer.rfc4514_string()}
+        try:
+            cert = x509.load_der_x509_certificate(ev["ekcert"])
+            ek = {"subject": cert.subject.rfc4514_string(), "issuer": cert.issuer.rfc4514_string()}
+        except (ValueError, TypeError):
+            raise Fail("malformed EK certificate")
         if ek_ca:
-            ca = x509.load_pem_x509_certificate(open(ek_ca, "rb").read())
             try:
-                cert.verify_directly_issued_by(ca)
-            except (ValueError, TypeError, InvalidSignature):
-                raise Fail("EK certificate not issued by %s" % ek_ca)
+                cas = x509.load_pem_x509_certificates(open(ek_ca, "rb").read())
+            except ValueError:
+                raise Fail("no CA certificate in %s" % ek_ca)
+            check_ek_cert(cert, cas, ek_ca)
             ek["verified"] = True
     elif ek_ca:
         raise Fail("no EK certificate in the evidence")
@@ -451,7 +534,7 @@ def check_flags(claims, deny_taint, require_seal):
     return {"taint_bits": flag_list(taint), "seal_bits": flag_list(seal)}
 
 
-def check_report(rep, key, data, launch, deny_taint="console-in", require_seal="", partition=None):
+def check_report(rep, key, data, launch, deny_taint="console-in", require_seal="console-in", partition=None):
     if not (isinstance(rep, tuple) and rep[:2] == ("tag", 18)) or len(rep[2]) != 4:
         raise Fail("report is not a COSE_Sign1")
     protected, _unprotected, payload, sig = rep[2]
@@ -546,6 +629,8 @@ def main():
     m.add_argument("kernel")
     m.add_argument("--initrd")
     m.add_argument("--cmdline", default="")
+    m.add_argument("--initrd-gpa", type=lambda x: int(x, 0),
+                   help="where dom0 loaded the initrd (default: 1 MiB past the kernel's end, as vmmgr does)")
     v = sub.add_parser("verify")
     v.add_argument("report")
     v.add_argument("evidence")
@@ -554,8 +639,9 @@ def main():
     v.add_argument("--pcr", action="append", default=[], help="N=HEX: expected sha256 PCR value")
     v.add_argument("--ak-name", help="the enrolled attestation key's name (hex)")
     v.add_argument("--deny-taint", default="console-in", help="deny host names, bit numbers or ranges (default: console-in; '' disables)")
-    v.add_argument("--require-seal", default="", help="require sealed host names, bit numbers or ranges")
-    v.add_argument("--ek-ca", help="CA certificate (PEM) that issued the EK certificate")
+    v.add_argument("--require-seal", default="console-in",
+                   help="require sealed host names, bit numbers or ranges (default: console-in; '' disables)")
+    v.add_argument("--ek-ca", help="CA certificates (PEM, one or more) one of which issued the EK certificate")
     c = sub.add_parser("make-credential")
     c.add_argument("evidence")
     c.add_argument("secret", help="hex, at most 32 bytes")
@@ -565,7 +651,7 @@ def main():
     try:
         if a.cmd == "measure":
             initrd = open(a.initrd, "rb").read() if a.initrd else b""
-            print(launch_digest(open(a.kernel, "rb").read(), initrd, a.cmdline).hex())
+            print(launch_digest(open(a.kernel, "rb").read(), initrd, a.cmdline, a.initrd_gpa).hex())
         elif a.cmd == "verify":
             pins = {}
             for p in a.pcr:

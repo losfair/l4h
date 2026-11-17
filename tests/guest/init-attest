@@ -8,6 +8,9 @@ mount -t devtmpfs dev /dev
 mount -t configfs none /sys/kernel/config
 nonce=$(sed -n 's/.*attest_nonce=\([0-9a-f]*\).*/\1/p' /proc/cmdline)
 echo "ATTEST: dom0 up"
+# Seal console input before the report, as a measured initramfs does: the
+# verifier requires it by default (input after the report is unattested).
+l4hctl attest seal console-in >/dev/null || echo "ATTEST: seal failed"
 if l4hctl attest report "$nonce" -o /tmp/report; then
     echo "ATTEST: dom0 report $(l4hctl attest report "$nonce")"
     echo "ATTEST: evidence $(l4hctl attest evidence)"
