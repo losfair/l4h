@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""Policy checks on signed reports, including old and future hosts."""
+"""Policy checks on signed reports, including old and future hosts, and
+which EK a credential is made for."""
+import contextlib
+import datetime
 import hashlib
 import importlib.util
+import io
 from pathlib import Path
+import struct
 import unittest
 import sys
 
 sys.dont_write_bytecode = True
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 
 spec = importlib.util.spec_from_file_location("attest", Path(__file__).resolve().parents[1] / "tools/l4h-attest.py")
@@ -96,6 +102,54 @@ class Verify(unittest.TestCase):
         rep[2][2] = encode(c)
         with self.assertRaisesRegex(a.Fail, "signature"):
             self.check(rep)
+
+
+def rsa_public(key, attrs):
+    """A TPMT_PUBLIC of an RSA 2048 key, as trustd's EK template gives."""
+    n = key.public_key().public_numbers().n.to_bytes(256, "big")
+    return (struct.pack(">HHI", 0x0001, 0x000B, attrs) + struct.pack(">H", 32) + bytes(32)
+            + struct.pack(">HHHHHI", 0x0006, 128, 0x0043, 0x0010, 2048, 0) + struct.pack(">H", 256) + n)
+
+
+class EvidenceEk(unittest.TestCase):
+    # fixedTPM, fixedParent, sensitiveDataOrigin, adminWithPolicy,
+    # restricted, decrypt.
+    EK_ATTRS = 1 << 1 | 1 << 4 | 1 << 5 | 1 << 7 | 1 << 16 | 1 << 17
+
+    @classmethod
+    def setUpClass(cls):
+        cls.ek = rsa.generate_private_key(65537, 2048)
+        cls.other = rsa.generate_private_key(65537, 2048)
+        name = x509.Name([x509.NameAttribute(x509.NameOID.COMMON_NAME, "ek")])
+        now = datetime.datetime.now(datetime.timezone.utc)
+        cls.cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(cls.other.public_key())
+                    .serial_number(1).not_valid_before(now).not_valid_after(now + datetime.timedelta(days=1))
+                    .sign(cls.other, hashes.SHA256()).public_bytes(serialization.Encoding.DER))
+
+    def ek_of(self, ev, pem=None):
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            ek = a.evidence_ek(ev, pem)
+        return ek.public_numbers(), err.getvalue()
+
+    def test_ekpub_without_certificate(self):
+        got, warning = self.ek_of({"ekpub": rsa_public(self.ek, self.EK_ATTRS)})
+        self.assertEqual(got, self.ek.public_key().public_numbers())
+        self.assertIn("only claims", warning)
+
+    def test_certificate_and_pem_come_first(self):
+        ev = {"ekcert": self.cert, "ekpub": rsa_public(self.ek, self.EK_ATTRS)}
+        self.assertEqual(self.ek_of(ev)[0], self.other.public_key().public_numbers())
+        pem = self.ek.public_key().public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
+        self.assertEqual(self.ek_of({"ekcert": self.cert}, pem)[0], self.ek.public_key().public_numbers())
+
+    def test_ekpub_must_be_a_restricted_decryption_key(self):
+        for attrs in (self.EK_ATTRS & ~(1 << 16), self.EK_ATTRS & ~(1 << 17), self.EK_ATTRS & ~(1 << 1)):
+            with self.assertRaisesRegex(a.Fail, "restricted decryption"):
+                self.ek_of({"ekpub": rsa_public(self.ek, attrs)})
+
+    def test_no_ek(self):
+        with self.assertRaisesRegex(a.Fail, "--ek"):
+            self.ek_of({})
 
 
 if __name__ == "__main__":

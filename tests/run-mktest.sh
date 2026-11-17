@@ -28,7 +28,9 @@
 # every dom0 and VM gets a report, the other partitions' through partition
 # 0's trustd, and tools/l4h-attest.py verifies each against its
 # partition's evidence; a second boot activates a credential made for the
-# attestation key in every partition (DESIGN.md §10.2).
+# attestation key in every partition (DESIGN.md §10.2).  With
+# SWTPM_EK_CERT=0 the TPM has no EK certificate: every partition's
+# evidence gives the EK's public area, and the credential is made for it.
 # MK_EFI=app.efi boots that UEFI application (MK_BOOT=uefi), as shipped
 # (build/efi/l4h-generic.efi from tools/build-efi.sh): its shim, slot
 # kernels and root instead of the ones this script builds.  A release
@@ -281,7 +283,8 @@ saved() {  # saved <boot>: into $out/att/<boot>/p<k>
 }
 saved 1
 tool=$root/tools/l4h-attest.py
-ca=$out/tpm/ca/issuercert.pem
+ca=(--ek-ca "$out/tpm/ca/issuercert.pem")
+[ "${SWTPM_EK_CERT:-1}" != 0 ] || ca=()
 json() { python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(eval(sys.argv[2]))" "$@"; }
 for k in $(seq 0 $((n - 1))); do
     a=$out/att/1/p$k
@@ -291,9 +294,9 @@ for k in $(seq 0 $((n - 1))); do
         --cmdline "console=hvc0 MKP=$k attest_nonce=$nonce")
     dom0_launch=$(python3 "$tool" measure "$out/vmlinux" --initrd "$out/dom0.cpio.gz" \
         --cmdline "${cmdline[k]}")
-    python3 "$tool" verify "$a/vm.report" "$a/evidence" --data "$nonce" --launch "$vm_launch" --ek-ca "$ca" \
+    python3 "$tool" verify "$a/vm.report" "$a/evidence" --data "$nonce" --launch "$vm_launch" "${ca[@]}" \
         > "$a/vm.json" 2>/dev/null || fail "partition $k: the VM's report"
-    python3 "$tool" verify "$a/dom0.report" "$a/evidence" --data "$nonce" --launch "$dom0_launch" --ek-ca "$ca" \
+    python3 "$tool" verify "$a/dom0.report" "$a/evidence" --data "$nonce" --launch "$dom0_launch" "${ca[@]}" \
         > "$a/dom0.json" 2>/dev/null || fail "partition $k: dom0's report"
     for w in vm dom0; do
         [ "$(json "$a/$w.json" 'd["guest"]["partition"]')" = "$k" ] || fail "partition $k: $w's report names another partition"
@@ -303,6 +306,11 @@ for k in $(seq 0 $((n - 1))); do
     before=$(json "$a/vm.json" 'd["host"]["keys_before"]')
     if [ "$k" = 0 ]; then [ "$before" = "[]" ] || fail "partition 0's key is not the first"; fi
     if [ "$k" != 0 ]; then [ "${before:0:2}" = "[0" ] || fail "partition $k's chain does not start with partition 0"; fi
+    # partition 0's TPM, said in every partition's evidence: ekpub only
+    # without an EK certificate.
+    ekpub=$(json "$a/vm.json" 'd["host"]["ekpub"] is not None')
+    [ "$ekpub" = "$([ ${#ca[@]} = 0 ] && echo True || echo False)" ] || fail "partition $k: ekpub $ekpub"
+    [ "$(json "$a/vm.json" 'd["host"]["vendor"]')" = $((0x49424d00)) ] || fail "partition $k: not swtpm's vendor"
     echo "MKTEST: partition $k: dom0's and the VM's reports verify (VM guest $(json "$a/vm.json" 'd["guest"]["guest"]'), keys before: $before)"
 done
 # One TPM: the same attestation key; and a report verifies only with its
@@ -311,7 +319,7 @@ p0=$out/att/1/p0 p1=$out/att/1/p1
 ak=$(json "$p0/dom0.json" 'd["host"]["ak_name"]')
 [ "$(json "$p1/dom0.json" 'd["host"]["ak_name"]')" = "$ak" ] || fail "partitions quoted by different AKs"
 ! python3 "$tool" verify "$p1/vm.report" "$p0/evidence" 2>/dev/null || fail "partition 1's report verified with partition 0's evidence"
-python3 "$tool" verify "$p1/vm.report" "$p1/evidence" --data "$nonce" --ak-name "$ak" --ek-ca "$ca"
+python3 "$tool" verify "$p1/vm.report" "$p1/evidence" --data "$nonce" --ak-name "$ak" "${ca[@]}"
 echo "MKTEST: reports verify and name their partitions"
 
 # ActivateCredential, partition 0's own and the others' through it.

@@ -44,7 +44,11 @@
       (TPM2_MakeCredential; the format of tpm2_makecredential).  A guest
       decrypts it with `l4hctl attest activate FILE`: the secret coming
       back proves the AK is in the TPM with that EK, so its name (printed
-      by verify) can be pinned with --ak-name.
+      by verify) can be pinned with --ak-name.  The EK is --ek, else the
+      key of the evidence's EK certificate, else the evidence's "ekpub"
+      (a TPM without a certificate in NV, such as AMD's fTPM): that one is
+      only what the host says, so check it against the manufacturer's
+      certificate for it first.
 
 Needs the Python `cryptography` package.
 """
@@ -384,6 +388,10 @@ def check_evidence(ev, pins, ak_name, ek_ca):
         "restart_count": q["restart_count"],
         "pcrs": {str(i): pcrs[i].hex() for i in sorted(pcrs)},
         "ek_cert": ek,
+        # What the host says, unsigned: the EK's TPMT_PUBLIC when the TPM
+        # has no EK certificate, and TPM_PT_MANUFACTURER.
+        "ekpub": ev["ekpub"].hex() if "ekpub" in ev else None,
+        "vendor": ev.get("vendor"),
     }
     return key, partition, host
 
@@ -491,6 +499,24 @@ def kdfe(z, label, party_u, party_v, bits):
     return out[:bits // 8]
 
 
+def evidence_ek(ev, ek_pem=None):
+    """The EK to make a credential for: `ek_pem`, else the key of the
+    evidence's EK certificate, else its EK public area (ekpub)."""
+    if ek_pem:
+        return serialization.load_pem_public_key(ek_pem)
+    if "ekcert" in ev:
+        return x509.load_der_x509_certificate(ev["ekcert"]).public_key()
+    if "ekpub" in ev:
+        attrs, ek = parse_public(ev["ekpub"])
+        # fixedTPM, restricted, decrypt: a storage key, as an EK is.
+        if attrs & (1 << 1 | 1 << 16 | 1 << 17) != (1 << 1 | 1 << 16 | 1 << 17):
+            raise Fail("ekpub is not a fixedTPM restricted decryption key")
+        print("l4h-attest: warning: the EK is the evidence's ekpub, which the host only claims: "
+              "check it against the TPM manufacturer's certificate", file=sys.stderr)
+        return ek
+    raise Fail("no EK certificate or ekpub in the evidence: give --ek")
+
+
 def make_credential(ek, name, secret):
     """TPM2_MakeCredential (TPM 2.0 Part 1, 24.4) for an EK with the
     default template (AES-128-CFB, sha256)."""
@@ -534,7 +560,7 @@ def main():
     c.add_argument("evidence")
     c.add_argument("secret", help="hex, at most 32 bytes")
     c.add_argument("-o", required=True)
-    c.add_argument("--ek", help="the EK's public key (PEM), if the evidence has no EK certificate")
+    c.add_argument("--ek", help="the EK's public key (PEM), instead of the evidence's EK certificate or ekpub")
     a = ap.parse_args()
     try:
         if a.cmd == "measure":
@@ -557,12 +583,7 @@ def main():
                 print("l4h-attest: warning: attestation key not pinned (--ak-name)", file=sys.stderr)
         else:
             ev = cbor_decode(open(a.evidence, "rb").read())
-            if a.ek:
-                ek = serialization.load_pem_public_key(open(a.ek, "rb").read())
-            elif "ekcert" in ev:
-                ek = x509.load_der_x509_certificate(ev["ekcert"]).public_key()
-            else:
-                raise Fail("no EK certificate in the evidence: give --ek")
+            ek = evidence_ek(ev, open(a.ek, "rb").read() if a.ek else None)
             secret = bytes.fromhex(a.secret)
             if not 0 < len(secret) <= 32:
                 raise Fail("the secret is 1 to 32 bytes")
