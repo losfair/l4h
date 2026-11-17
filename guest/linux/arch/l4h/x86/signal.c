@@ -62,9 +62,14 @@ static int copy_sc_from_user(struct pt_regs *regs,
 	GETREG(R15, r15);
 #endif
 
-	GETREG(EFLAGS, flags);
-
 #undef GETREG
+
+	/*
+	 * Only the flags user code may change (as ptrace's FLAG_MASK): not
+	 * IOPL, VIF, VIP or the others a sigreturn could otherwise set.
+	 */
+	regs->regs.gp[HOST_EFLAGS] = (regs->regs.gp[HOST_EFLAGS] & ~0x44dd5UL) |
+				     (sc.flags & 0x44dd5UL);
 
 	from_fp64 = (void __user *)sc.fpstate;
 

@@ -35,6 +35,7 @@
 #else
 #include <asm/ptrace.h>
 #endif
+#include <linux/capability.h>
 #include <linux/filter.h>
 #include <linux/futex.h>
 #include <linux/seccomp.h>
@@ -1761,6 +1762,103 @@ static void test_uaccess_kernel_strings(void)
 	}
 }
 
+/*
+ * /dev/l4h-attest needs CAP_SYS_ADMIN at each ioctl, as /dev/l4hctl: the
+ * taint and seal bitmaps are the whole guest's.  A child that drops the
+ * capability is refused on a descriptor its root parent opened.
+ */
+struct attest_ioc {
+	uint32_t op, blob_len, secret_len, out_len;
+	uint64_t data, out;
+};
+#define ATTEST_IOC _IOWR('L', 2, struct attest_ioc)
+
+static int attest_read_flags(int fd)
+{
+	unsigned char zero[32] = { 0 }, out[64];
+	struct attest_ioc c = { .op = 4 /* ACT, empty: read */, .blob_len = sizeof(zero),
+				.out_len = sizeof(out), .data = (uintptr_t)zero,
+				.out = (uintptr_t)out };
+
+	return ioctl(fd, ATTEST_IOC, &c) < 0 ? -errno : 0;
+}
+
+static void test_attest_cap(void)
+{
+	struct __user_cap_header_struct h = { .version = _LINUX_CAPABILITY_VERSION_3 };
+	struct __user_cap_data_struct d[2];
+	int fd = open("/dev/l4h-attest", O_RDWR), status, r;
+	pid_t pid;
+
+	CHECK(fd >= 0, "open /dev/l4h-attest: %s", strerror(errno));
+	r = attest_read_flags(fd);
+	CHECK(r == 0, "reading the flags as root: %s", strerror(-r));
+	pid = fork();
+	if (pid == 0) {
+		if (syscall(SYS_capget, &h, d) != 0)
+			_exit(10);
+		d[CAP_SYS_ADMIN / 32].effective &= ~(1u << (CAP_SYS_ADMIN % 32));
+		d[CAP_SYS_ADMIN / 32].permitted &= ~(1u << (CAP_SYS_ADMIN % 32));
+		if (syscall(SYS_capset, &h, d) != 0)
+			_exit(11);
+		r = attest_read_flags(fd);
+		_exit(r == -EPERM ? 0 : r == 0 ? 12 : 13);
+	}
+	CHECK(pid > 0, "fork: %s", strerror(errno));
+	waitpid(pid, &status, 0);
+	close(fd);
+	CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+	      "without CAP_SYS_ADMIN: exit %d (10, 11: capget/capset; 12: allowed; 13: not EPERM)",
+	      WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+}
+
+#ifdef __x86_64__
+/*
+ * rt_sigreturn takes only the flags user code may set (ptrace's
+ * FLAG_MASK): a handler that puts IOPL 3 or VIP in the saved context gets
+ * neither, while the arithmetic flags it sets come back.
+ */
+static volatile unsigned long efl_seen;
+
+static void efl_set_handler(int sig, siginfo_t *si, void *ctx)
+{
+	ucontext_t *uc = ctx;
+
+	uc->uc_mcontext.gregs[REG_EFL] |= 0x3000 /* IOPL 3 */ | 0x100000 /* VIP */ |
+					  0x80000 /* VIF */ | 0x1 /* CF */;
+}
+
+static void efl_get_handler(int sig, siginfo_t *si, void *ctx)
+{
+	efl_seen = ((ucontext_t *)ctx)->uc_mcontext.gregs[REG_EFL];
+}
+
+static void test_sigreturn_eflags(void)
+{
+	struct sigaction sa = { .sa_flags = SA_SIGINFO };
+	unsigned long after;
+	long pid = getpid(), tid = syscall(SYS_gettid);
+
+	sa.sa_sigaction = efl_set_handler;
+	sigaction(SIGUSR1, &sa, NULL);
+	sa.sa_sigaction = efl_get_handler;
+	sigaction(SIGUSR2, &sa, NULL);
+	/* The signal comes as tgkill returns; read the flags right after. */
+	asm volatile("syscall\n\tpushfq\n\tpopq %[f]"
+		     : [f] "=r"(after)
+		     : "a"((long)SYS_tgkill), "D"(pid), "S"(tid), "d"((long)SIGUSR1)
+		     : "rcx", "r11", "memory", "cc");
+	CHECK(after & 0x1, "CF the handler set was lost: %#lx", after);
+	CHECK(!(after & (0x3000 | 0x100000 | 0x80000)), "privileged flags after sigreturn: %#lx", after);
+	efl_seen = ~0UL;
+	syscall(SYS_tgkill, pid, tid, SIGUSR2);
+	CHECK(efl_seen != ~0UL, "second signal not delivered");
+	CHECK(!(efl_seen & (0x3000 | 0x100000 | 0x80000)), "privileged flags saved: %#lx", efl_seen);
+	signal(SIGUSR1, SIG_DFL);
+	signal(SIGUSR2, SIG_DFL);
+}
+#endif
+
 /* sched_getcpu() (the vDSO) agrees with the CPU a thread is pinned to. */
 static void test_getcpu(void)
 {
@@ -1869,6 +1967,10 @@ static const struct test tests[] = {
 	{ "futex_wake_op", test_futex_wake_op },
 	{ "futex_unaligned", test_futex_unaligned },
 	{ "uaccess_kstr", test_uaccess_kernel_strings },
+	{ "attest_cap", test_attest_cap },
+#ifdef __x86_64__
+	{ "sigreturn_efl", test_sigreturn_eflags },
+#endif
 	{ "getcpu", test_getcpu },
 	{ "smp_migrate_exit", test_smp_migrate_exit },
 	{ "files", test_files },

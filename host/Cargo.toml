@@ -31,3 +31,7 @@ ecdsa.opt-level = 3
 [profile.release]
 panic = "abort"
 debug = true
+# Defence in depth (DESIGN.md §10, "Integer arithmetic"): an overflow the
+# code's own checks missed stops the component instead of wrapping past
+# a bound check.
+overflow-checks = true

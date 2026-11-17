@@ -464,8 +464,21 @@ pub struct Screen {
 }
 
 impl Screen {
-    /// Pixel (x, y) as (r, g, b).
+    /// The bytes the display's rows take, if its geometry is sane: each
+    /// row of `width` 4-byte pixels fits in `stride`.
+    fn size(&self) -> Option<usize> {
+        if (self.stride as u64) < self.width as u64 * 4 {
+            return None;
+        }
+        (self.stride as usize).checked_mul(self.height as usize)
+    }
+
+    /// Pixel (x, y) as (r, g, b); None for a pixel outside the display or
+    /// its data, or an unknown format.
     pub fn rgb(&self, x: u32, y: u32) -> Option<(u8, u8, u8)> {
+        if x >= self.width || y >= self.height {
+            return None;
+        }
         // Byte positions of red, green and blue in each format.
         let (r, g, b) = match self.format {
             1 | 2 => (2, 1, 0),     // B8G8R8A8, B8G8R8X8
@@ -474,16 +487,24 @@ impl Screen {
             68 | 121 => (3, 2, 1),  // X8B8G8R8, A8B8G8R8
             _ => return None,
         };
-        let p = &self.data[y as usize * self.stride as usize + x as usize * 4..][..4];
+        let off = (y as usize).checked_mul(self.stride as usize)?.checked_add((x as usize).checked_mul(4)?)?;
+        let p = self.data.get(off..off.checked_add(4)?)?;
         Some((p[r], p[g], p[b]))
     }
 
     /// As a binary PPM (P6).
     pub fn ppm(&self) -> Result<Vec<u8>> {
+        if !matches!(self.format, 1..=4 | 67 | 134 | 68 | 121) {
+            return err(format!("unknown pixel format {}", self.format));
+        }
+        if self.size().is_none_or(|n| self.data.len() < n) {
+            return err(format!("screenshot: {}x{} with stride {} does not fit its {} bytes",
+                self.width, self.height, self.stride, self.data.len()));
+        }
         let mut out = format!("P6\n{} {}\n255\n", self.width, self.height).into_bytes();
         for y in 0..self.height {
             for x in 0..self.width {
-                let (r, g, b) = self.rgb(x, y).ok_or(Error(format!("unknown pixel format {}", self.format)))?;
+                let (r, g, b) = self.rgb(x, y).ok_or(Error(format!("screenshot: no pixel {x},{y}")))?;
                 out.extend_from_slice(&[r, g, b]);
             }
         }
@@ -515,6 +536,8 @@ fn read_screen(chunk: &mut [u8], mut read: impl FnMut(u64, &mut [u8]) -> Result<
         }
         let mut s = Screen { width: 0, height: 0, stride: 0, format: 0, frame: 0, data: Vec::new() };
         let mut torn = false;
+        // The display's bytes: 0 until known (nothing shown reads as 0).
+        let mut need = 0;
         loop {
             let off = s.data.len() as u64;
             let (status, v) = read(off, chunk)?;
@@ -528,6 +551,10 @@ fn read_screen(chunk: &mut [u8], mut read: impl FnMut(u64, &mut [u8]) -> Result<
             let n = v[0] as usize;
             if off == 0 {
                 (s.width, s.height, s.stride, s.format, s.frame) = (v[1] as u32, v[2] as u32, v[3] as u32, v[4] as u32, v[5]);
+                if s.format != 0 {
+                    need = s.size().ok_or_else(|| Error(format!("screenshot: bad geometry {}x{} with stride {}",
+                        s.width, s.height, s.stride)))?;
+                }
             } else if v[5] != s.frame {
                 torn = true;
                 break;
@@ -536,19 +563,23 @@ fn read_screen(chunk: &mut [u8], mut read: impl FnMut(u64, &mut [u8]) -> Result<
                 return err("screenshot: bad length");
             }
             s.data.extend_from_slice(&chunk[..n]);
-            if n == 0 || s.data.len() >= s.stride as usize * s.height as usize {
+            if n == 0 || s.data.len() >= need {
                 break;
             }
         }
         // A torn read says nothing yet, not even whether anything is shown.
         if torn {
-            if s.format != 0 && s.data.len() >= s.stride as usize * s.height as usize {
+            if s.format != 0 && s.data.len() >= need {
                 last = Some(s);
             }
             continue;
         }
         if s.format == 0 {
             return err("screenshot: the VM shows nothing");
+        }
+        // The host stopped before the whole display: not a picture.
+        if s.data.len() < need {
+            return err(format!("screenshot: truncated, {} of {} bytes", s.data.len(), need));
         }
         return Ok(s);
     }
@@ -608,6 +639,50 @@ mod tests {
         .unwrap();
         assert_eq!(s.frame, 6);
         assert_eq!(calls, 4);
+    }
+
+    #[test]
+    fn a_short_display_is_an_error() {
+        // The host stops after one chunk of two.
+        let mut chunk = [0u8; 8];
+        let e = read_screen(&mut chunk, |off, buf| {
+            if off == 0 { display(off, buf, 4) } else { Ok((0, [0, 2, 2, 8, 2, 4])) }
+        })
+        .err()
+        .unwrap();
+        assert!(e.0.contains("truncated, 8 of 16"), "{}", e.0);
+        // Rows narrower than their pixels, or too large to address.
+        for (w, h, stride) in [(4, 2, 8), (u32::MAX as u64, 1, 4)] {
+            let e = read_screen(&mut chunk, |_, buf| {
+                buf[..8].fill(0);
+                Ok((0, [8, w, h, stride, 2, 4]))
+            })
+            .err()
+            .unwrap();
+            assert!(e.0.contains("bad geometry"), "{}", e.0);
+        }
+    }
+
+    #[test]
+    fn pixels_outside_the_display_or_its_data() {
+        let s = Screen { width: 2, height: 2, stride: 8, format: 2, frame: 0, data: (0..16).collect() };
+        assert_eq!(s.rgb(1, 1), Some((14, 13, 12)));
+        assert_eq!(s.rgb(2, 0), None);
+        assert_eq!(s.rgb(0, 2), None);
+        assert_eq!(s.rgb(u32::MAX, u32::MAX), None);
+        assert_eq!(s.ppm().unwrap().len(), "P6\n2 2\n255\n".len() + 12);
+        // Data shorter than the geometry says, a stride too short for a
+        // row, an unknown format: errors, not panics.
+        let short = Screen { data: (0..12).collect(), ..s };
+        assert_eq!(short.rgb(1, 1), None);
+        assert!(short.ppm().unwrap_err().0.contains("does not fit"));
+        let narrow = Screen { width: 4, data: (0..16).collect(), ..short };
+        assert!(narrow.ppm().is_err());
+        let odd = Screen { width: 2, format: 99, data: (0..16).collect(), ..narrow };
+        assert!(odd.ppm().unwrap_err().0.contains("unknown pixel format"));
+        let huge = Screen { width: u32::MAX, height: u32::MAX, stride: u32::MAX, format: 2, frame: 0, data: vec![0; 16] };
+        assert_eq!(huge.rgb(u32::MAX - 1, u32::MAX - 1), None);
+        assert!(huge.ppm().is_err());
     }
 
     #[test]
