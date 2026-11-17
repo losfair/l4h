@@ -41,9 +41,16 @@ pub const ISOLATE: u16 = SV | RR | CR | UF;
 
 const EXT_ACS: u32 = 0x000d;
 const CAP_PCIE: u8 = 0x10;
+/// Direct Translated P2P: the function routes translated requests
+/// between its own functions, so it has peer paths inside it.
+pub const DT: u16 = 1 << 6;
 /// PCI Express Capabilities register, Device/Port Type.
+pub const ENDPOINT: u8 = 0;
+pub const LEGACY_ENDPOINT: u8 = 1;
 pub const ROOT_PORT: u8 = 4;
+pub const UPSTREAM_PORT: u8 = 5;
 pub const DOWNSTREAM_PORT: u8 = 6;
+pub const RC_ENDPOINT: u8 = 9;
 
 /// Configuration space of segment 0 functions, `bdf` as bus << 8 |
 /// device << 3 | function.
@@ -118,10 +125,35 @@ pub enum Acs {
 }
 
 impl Acs {
-    /// Whether a port with this isolates the functions below it.
-    pub fn isolates(self) -> bool {
-        match self {
-            Acs::Present { cap, after, .. } => after & cap & ISOLATE == cap & ISOLATE,
+    /// Whether a function of Device/Port Type `ty` (pcie_type) with this
+    /// keeps what it routes apart: a port the functions below it, an
+    /// endpoint (one of several in a device) its sibling functions.  What
+    /// the type must implement is required, not only what it happens to:
+    /// a capability that implements none of the bits is no isolation.
+    ///
+    /// - A root port must validate sources (SV); it has nothing above it
+    ///   to forward to (no UF) and may leave Redirect unimplemented if it
+    ///   cannot route peer requests at all.
+    /// - A switch downstream port must validate sources and forward
+    ///   upstream (SV and UF).
+    /// - An endpoint has no SV; one that routes between its functions
+    ///   (DT) must redirect (RR and CR), and one that implements neither
+    ///   says it has no path between them.
+    /// - A switch upstream port has no ACS and routes nothing between
+    ///   branches itself (its downstream ports do: group walks past it);
+    ///   PCI bridges and every other type never isolate.
+    ///
+    /// Every bit it implements of those that matter must also be on.
+    pub fn isolates(self, ty: Option<u8>) -> bool {
+        let Acs::Present { cap, after, .. } = self else {
+            return false;
+        };
+        let on = |bits: u16| after & cap & bits == cap & bits;
+        match ty {
+            Some(ROOT_PORT) => cap & SV == SV && on(ISOLATE),
+            Some(DOWNSTREAM_PORT) => cap & (SV | UF) == SV | UF && on(ISOLATE),
+            Some(ENDPOINT | LEGACY_ENDPOINT | RC_ENDPOINT) =>
+                (cap & DT == 0 || cap & (RR | CR) == RR | CR) && on(RR | CR | UF),
             _ => false,
         }
     }
@@ -204,15 +236,30 @@ pub fn has_children(c: &impl Config, bdf: u16) -> bool {
 
 /// The functions of `functions` (every one root found, as bus << 8 |
 /// device << 3 | function) that DMA from function `me` may reach without
-/// passing the IOMMU, each given to `add` (`me` among them, some more
-/// than once): the other functions of its device, unless ACS on `me`
-/// isolates them (and what is below those that are bridges), and, up the
-/// tree, everything below each bridge that does not isolate the ports
-/// under it.  A device's other functions are those found in its slot:
-/// only function 0 need say it has several.  This is one step: a caller
-/// wanting every function a group's members reach takes its closure.
+/// passing the IOMMU, or that may reach `me` so, each given to `add`
+/// (`me` among them, some more than once):
+///
+/// - the other functions of its device (and what is below those that are
+///   bridges), unless every function of the device isolates with ACS:
+///   one that does not reaches its siblings whatever their own ACS says.
+///   A device's other functions are those found in its slot: only
+///   function 0 need say it has several;
+/// - up the tree, everything below each bridge that does not isolate the
+///   ports under it, and the same for the other functions of each
+///   bridge's device;
+/// - where such a bridge is a root port (any bridge on a root bus) or a
+///   switch downstream port, a peer request from below it crosses the
+///   bus the bridge is on, so everything on that bus and below each
+///   bridge on it: and, the other way, everything below such a bridge on
+///   any bus the walk passes, as it reaches `me` in turn.
+///
+/// A switch upstream port is walked past: it routes nothing between the
+/// downstream ports on its secondary bus, which decide that themselves.
+/// This is one step: a caller wanting every function a group's members
+/// reach takes its closure.
 pub fn group<I: Iterator<Item = u16>>(c: &impl Config, functions: impl Fn() -> I, me: u16, mut add: impl FnMut(u16)) {
     let header = |b: u16| (c.read(b, 0x0c) >> 16) as u8;
+    let is_bridge = |b: u16| header(b) & 0x7f == 1;
     let buses = |b: u16| {
         let r = c.read(b, 0x18);
         ((r >> 8) as u8, (r >> 16) as u8)
@@ -224,43 +271,78 @@ pub fn group<I: Iterator<Item = u16>>(c: &impl Config, functions: impl Fn() -> I
             }
         }
     };
+    let below_bridge = |b: u16, add: &mut dyn FnMut(u16)| {
+        let (sec, sub) = buses(b);
+        below(sec, sub, add);
+    };
+    let isolates = |f: u16| state(c, f).isolates(pcie_type(c, f));
+    // The bridge whose secondary bus is `bus`, if any (none: a root bus).
+    let above = |bus: u8| functions().find(|&f| is_bridge(f) && {
+        let (sec, _) = buses(f);
+        sec != 0 && sec == bus
+    });
     // The other functions of `f`'s device, and below those that are
-    // bridges.
+    // bridges, if there are any and one of the device's functions does
+    // not isolate.
     let slot = |f: u16, add: &mut dyn FnMut(u16)| {
-        for sib in functions().filter(|&s| s >> 3 == f >> 3 && s != f) {
+        let sibs = || functions().filter(move |&s| s >> 3 == f >> 3 && s != f);
+        if sibs().next().is_none() || (isolates(f) && sibs().all(isolates)) {
+            return;
+        }
+        for sib in sibs() {
             add(sib);
-            if header(sib) & 0x7f == 1 {
-                let (sec, sub) = buses(sib);
-                below(sec, sub, add);
+            if is_bridge(sib) {
+                below_bridge(sib, add);
             }
         }
     };
+    // Whether a peer request from below bridge `b` may cross the bus `b`
+    // is on: it does not isolate, and is a root port or other bridge on a
+    // root bus, or a switch downstream port.
+    let crosses = |b: u16| {
+        let ty = pcie_type(c, b);
+        ty != Some(UPSTREAM_PORT) && !isolates(b)
+            && (ty == Some(DOWNSTREAM_PORT) || above((b >> 8) as u8).is_none())
+    };
+    // Everything on `bus`, and below each bridge on it.
+    let across = |bus: u8, add: &mut dyn FnMut(u16)| {
+        for f in functions().filter(|&f| (f >> 8) as u8 == bus) {
+            if is_bridge(f) {
+                below_bridge(f, add);
+            } else if header(f) & 0x7f == 0 {
+                add(f);
+            }
+        }
+    };
+    // What reaches across `bus` from below its bridges reaches `me`.
+    let crossing = |bus: u8, add: &mut dyn FnMut(u16)| {
+        for b in functions().filter(|&f| (f >> 8) as u8 == bus && is_bridge(f) && crosses(f)) {
+            below_bridge(b, add);
+        }
+    };
     add(me);
-    if !state(c, me).isolates() {
-        slot(me, &mut add);
-    }
+    slot(me, &mut add);
     let mut bus = (me >> 8) as u8;
+    crossing(bus, &mut add);
     for _ in 0..256 {
         // The bridge whose secondary bus this is: the immediate parent,
         // then its parent, and so on (one higher up that isolates does
         // not keep peers below a lower one apart).
-        let Some(bridge) = functions().find(|&f| header(f) & 0x7f == 1 && {
-            let (sec, _) = buses(f);
-            sec != 0 && sec == bus
-        }) else {
+        let Some(bridge) = above(bus) else {
             break;
         };
-        if !(pcie_type(c, bridge).is_some() && state(c, bridge).isolates()) {
-            let (sec, sub) = buses(bridge);
-            below(sec, sub, &mut add);
-            // A bridge without ACS may route to its sibling functions,
-            // and below those that are bridges.
-            slot(bridge, &mut add);
+        slot(bridge, &mut add);
+        if pcie_type(c, bridge) != Some(UPSTREAM_PORT) && !isolates(bridge) {
+            below_bridge(bridge, &mut add);
+            if crosses(bridge) {
+                across((bridge >> 8) as u8, &mut add);
+            }
         }
         if (bridge >> 8) as u8 >= bus {
             break;
         }
         bus = (bridge >> 8) as u8;
+        crossing(bus, &mut add);
     }
 }
 
@@ -302,7 +384,7 @@ pub struct Bits(pub u16);
 impl core::fmt::Display for Bits {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         let mut first = true;
-        for (bit, name) in [(SV, "SV"), (TB, "TB"), (RR, "RR"), (CR, "CR"), (UF, "UF"), (1 << 5, "EC"), (1 << 6, "DT")] {
+        for (bit, name) in [(SV, "SV"), (TB, "TB"), (RR, "RR"), (CR, "CR"), (UF, "UF"), (1 << 5, "EC"), (DT, "DT")] {
             if self.0 & bit != 0 {
                 write!(f, "{}{}", if first { "" } else { " " }, name)?;
                 first = false;

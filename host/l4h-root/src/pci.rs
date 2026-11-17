@@ -551,7 +551,7 @@ impl Pci {
                     info!("l4h-root: pci {:02x}:{:02x}.{}: ACS {} (was {})", b, d, f, Bits(after), Bits(before));
                 }
             }
-            if !r.isolates() && let Some(port) = port_name(ty) && acs::has_children(self, bdf) {
+            if !r.isolates(ty) && let Some(port) = port_name(ty) && acs::has_children(self, bdf) {
                 open += 1;
                 let why = if r == Acs::Absent { "has no ACS" } else { "does not isolate with ACS" };
                 log!("l4h-root: pci {:02x}:{:02x}.{}: {} {}: the devices below it may reach each other without the IOMMU", b, d, f, port, why);

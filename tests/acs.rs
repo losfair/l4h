@@ -2,12 +2,11 @@
 #[path = "../host/l4h-root/src/acs.rs"]
 mod acs;
 
-use acs::{Acs, Bits, Config, CR, RR, SV, TB, UF};
+use acs::{Acs, Bits, Config, CR, DT, RR, SV, TB, UF};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
 const EC: u16 = 1 << 5;
-const DT: u16 = 1 << 6;
 
 /// A function's configuration space, and which ACS control bits stick.
 #[derive(Clone)]
@@ -108,7 +107,7 @@ fn a_port_gets_every_bit_it_implements() {
     assert_eq!(m.func(PORT).ctrl(), SV | TB | RR | CR | UF);
     // The capability register is unchanged.
     assert_eq!(m.func(PORT).space[0x14c / 4] as u16, SV | TB | RR | CR | UF | EC | DT);
-    assert!(r.isolates());
+    assert!(r.isolates(Some(acs::DOWNSTREAM_PORT)));
 }
 
 #[test]
@@ -118,7 +117,7 @@ fn only_implemented_bits_are_set_and_count() {
     let m = Model::new(&[(PORT, Func::pcie(acs::ROOT_PORT, Some((SV | RR | CR, 0))))]);
     let r = acs::enable(&m, PORT);
     assert_eq!(r, Acs::Present { cap: SV | RR | CR, before: 0, after: SV | RR | CR });
-    assert!(r.isolates());
+    assert!(r.isolates(Some(acs::ROOT_PORT)));
 }
 
 #[test]
@@ -131,7 +130,7 @@ fn bits_firmware_set_are_kept() {
 fn nothing_is_written_when_all_is_on() {
     let all = SV | TB | RR | CR | UF;
     let m = Model::new(&[(PORT, Func::pcie(acs::DOWNSTREAM_PORT, Some((all, all))))]);
-    assert!(acs::enable(&m, PORT).isolates());
+    assert!(acs::enable(&m, PORT).isolates(Some(acs::DOWNSTREAM_PORT)));
     assert_eq!(*m.writes.borrow(), 0);
 }
 
@@ -142,7 +141,7 @@ fn a_bit_that_does_not_stick_is_reported() {
     let m = Model::new(&[(PORT, f)]);
     let r = acs::enable(&m, PORT);
     assert_eq!(r, Acs::Present { cap: SV | RR | CR | UF, before: 0, after: SV | CR | UF });
-    assert!(!r.isolates());
+    assert!(!r.isolates(Some(acs::DOWNSTREAM_PORT)));
 }
 
 #[test]
@@ -150,7 +149,7 @@ fn a_function_without_acs() {
     let m = Model::new(&[(PORT, Func::pcie(acs::ROOT_PORT, None))]);
     let r = acs::enable(&m, PORT);
     assert_eq!(r, Acs::Absent);
-    assert!(!r.isolates());
+    assert!(!r.isolates(Some(acs::ROOT_PORT)));
     assert_eq!(*m.writes.borrow(), 0);
 }
 
@@ -162,7 +161,7 @@ fn unreachable_or_read_only_extended_space() {
     m.ext = true;
     m.writable = false;
     assert_eq!(acs::enable(&m, PORT), Acs::Unreachable);
-    assert!(!Acs::Unreachable.isolates());
+    assert!(!Acs::Unreachable.isolates(Some(acs::ROOT_PORT)));
 }
 
 #[test]
@@ -241,7 +240,7 @@ fn state_reads_without_writing() {
     let m = Model::new(&[(PORT, Func::pcie(acs::ROOT_PORT, Some((SV | RR | CR, SV))))]);
     let r = acs::state(&m, PORT);
     assert_eq!(r, Acs::Present { cap: SV | RR | CR, before: SV, after: SV });
-    assert!(!r.isolates());
+    assert!(!r.isolates(Some(acs::ROOT_PORT)));
     assert_eq!(*m.writes.borrow(), 0);
     assert_eq!(acs::state(&Model::new(&[(PORT, Func::pcie(acs::ROOT_PORT, None))]), PORT), Acs::Absent);
 }
@@ -318,10 +317,177 @@ fn a_function_shares_its_group_with_function_0_without_acs() {
     let m = Model::new(&[(0x0028, Func::pcie(0, None).multi()), (0x0029, Func::pcie(0, None))]);
     assert_eq!(group_in(&m, &[0x0028, 0x0029], 0x0029), [0x0028, 0x0029]);
     assert_eq!(group_in(&m, &[0x0028, 0x0029], 0x0028), [0x0028, 0x0029]);
-    // ACS on the function keeps it apart.
+    // ACS on one function alone does not keep it apart: the other still
+    // reaches it, whichever is asked about.
     let all = SV | RR | CR | UF;
     let m = Model::new(&[(0x0028, Func::pcie(0, None).multi()), (0x0029, Func::pcie(0, Some((all, all))))]);
+    assert_eq!(group_in(&m, &[0x0028, 0x0029], 0x0029), [0x0028, 0x0029]);
+    assert_eq!(group_in(&m, &[0x0028, 0x0029], 0x0028), [0x0028, 0x0029]);
+    let m = Model::new(&[(0x0028, Func::pcie(0, Some((all, all))).multi()), (0x0029, Func::pcie(0, None))]);
+    assert_eq!(group_in(&m, &[0x0028, 0x0029], 0x0029), [0x0028, 0x0029]);
+    assert_eq!(group_in(&m, &[0x0028, 0x0029], 0x0028), [0x0028, 0x0029]);
+    // ACS on both does.
+    let m = Model::new(&[(0x0028, Func::pcie(0, Some((all, all))).multi()), (0x0029, Func::pcie(0, Some((all, all))))]);
     assert_eq!(group_in(&m, &[0x0028, 0x0029], 0x0029), [0x0029]);
+    assert_eq!(group_in(&m, &[0x0028, 0x0029], 0x0028), [0x0028]);
+}
+
+#[test]
+fn an_endpoint_that_routes_between_its_functions_must_redirect() {
+    let m = |cap| Model::new(&[(0x0028, Func::pcie(0, Some((cap, cap))).multi()), (0x0029, Func::pcie(0, Some((cap, cap))))]);
+    // Direct Translated P2P without Redirect: a path between them.
+    assert_eq!(group_in(&m(DT), &[0x0028, 0x0029], 0x0029), [0x0028, 0x0029]);
+    assert_eq!(group_in(&m(DT | RR | CR), &[0x0028, 0x0029], 0x0029), [0x0029]);
+    // A capability with no bits says there is no path between them.
+    assert_eq!(group_in(&m(0), &[0x0028, 0x0029], 0x0029), [0x0029]);
+    // Implemented but off.
+    let m = Model::new(&[(0x0028, Func::pcie(0, Some((RR | CR, RR))).multi()), (0x0029, Func::pcie(0, Some((0, 0))))]);
+    assert_eq!(group_in(&m, &[0x0028, 0x0029], 0x0029), [0x0028, 0x0029]);
+}
+
+#[test]
+fn a_port_must_implement_what_its_type_needs() {
+    let present = |cap: u16| Acs::Present { cap, before: 0, after: cap };
+    // A root port without Source Validation, whatever else it has.
+    assert!(!present(TB | EC).isolates(Some(acs::ROOT_PORT)));
+    assert!(!present(0).isolates(Some(acs::ROOT_PORT)));
+    assert!(!present(TB | RR | CR | UF).isolates(Some(acs::ROOT_PORT)));
+    assert!(present(SV).isolates(Some(acs::ROOT_PORT)));
+    assert!(present(SV | TB | RR | CR).isolates(Some(acs::ROOT_PORT)));
+    // A downstream port without Upstream Forwarding or Source Validation.
+    assert!(!present(SV | RR | CR).isolates(Some(acs::DOWNSTREAM_PORT)));
+    assert!(!present(RR | CR | UF).isolates(Some(acs::DOWNSTREAM_PORT)));
+    assert!(!present(TB | EC | DT).isolates(Some(acs::DOWNSTREAM_PORT)));
+    assert!(present(SV | UF).isolates(Some(acs::DOWNSTREAM_PORT)));
+    assert!(present(SV | RR | CR | UF).isolates(Some(acs::DOWNSTREAM_PORT)));
+    // Implemented and needed, but off.
+    assert!(!Acs::Present { cap: SV | UF, before: 0, after: SV }.isolates(Some(acs::DOWNSTREAM_PORT)));
+    // An upstream port, a PCI bridge, a PCIe-to-PCI bridge: never.
+    let all = SV | TB | RR | CR | UF;
+    for ty in [Some(acs::UPSTREAM_PORT), None, Some(7), Some(8), Some(10)] {
+        assert!(!present(all).isolates(ty), "{ty:?}");
+    }
+    // Endpoints.
+    for ty in [acs::ENDPOINT, acs::LEGACY_ENDPOINT, acs::RC_ENDPOINT] {
+        assert!(present(0).isolates(Some(ty)));
+        assert!(!present(DT).isolates(Some(ty)));
+        assert!(!present(DT | RR).isolates(Some(ty)));
+        assert!(present(DT | RR | CR).isolates(Some(ty)));
+        assert!(!Acs::Present { cap: RR | CR, before: 0, after: RR }.isolates(Some(ty)));
+        assert!(!Acs::Absent.isolates(Some(ty)));
+    }
+}
+
+#[test]
+fn a_port_missing_a_needed_bit_does_not_isolate_its_children() {
+    // A root port with ACS that has only TB and EC, a downstream port
+    // without UF: neither isolates.
+    for (cap, ty) in [(TB | EC, acs::ROOT_PORT), (SV | RR | CR, acs::DOWNSTREAM_PORT)] {
+        // Two devices below it, each alone in its slot.
+        let m = Model::new(&[(0x0008, Func::pcie(ty, Some((cap, cap))).bridge(2)), (0x0200, Func::pcie(0, None)),
+            (0x0208, Func::pcie(0, None))]);
+        let inventory = [0x0008, 0x0200, 0x0208];
+        assert_eq!(group_in(&m, &inventory, 0x0200), [0x0200, 0x0208], "{ty}");
+        assert!(!acs::state(&m, 0x0008).isolates(Some(ty)));
+    }
+}
+
+const ALL: u16 = SV | RR | CR | UF;
+
+/// Two root ports on bus 0, 00:01.0 (bus 2) and 00:02.0 (bus 3), each
+/// with an endpoint below it, and a root complex integrated endpoint at
+/// 00:14.0 and a multi-function one at 00:1f.0/2.
+fn two_root_ports(a: Option<(u16, u16)>, b: Option<(u16, u16)>) -> (Model, Vec<u16>) {
+    let m = Model::new(&[(0x0008, Func::pcie(acs::ROOT_PORT, a).bridge(2)), (0x0010, Func::pcie(acs::ROOT_PORT, b).bridge(3)),
+        (0x0200, Func::pcie(0, None)), (0x0300, Func::pcie(0, None)), (0x00a0, Func::pcie(acs::RC_ENDPOINT, None)),
+        (0x00f8, Func::pcie(acs::RC_ENDPOINT, None).multi()), (0x00fa, Func::pcie(acs::RC_ENDPOINT, None))]);
+    (m, vec![0x0008, 0x0010, 0x0200, 0x0300, 0x00a0, 0x00f8, 0x00fa])
+}
+
+#[test]
+fn a_root_port_without_acs_reaches_across_the_root_bus() {
+    // Neither isolates: one group of everything below and on bus 0.
+    let (m, inv) = two_root_ports(None, None);
+    let every = [0x00a0, 0x00f8, 0x00fa, 0x0200, 0x0300];
+    assert_eq!(group_in(&m, &inv, 0x0200), every);
+    assert_eq!(group_in(&m, &inv, 0x0300), every);
+    // Only 00:01.0 does not: what is below it reaches across bus 0, to
+    // the other port's endpoint and the integrated ones, and the other
+    // port's endpoint is reached by it.
+    let (m, inv) = two_root_ports(None, Some((ALL, ALL)));
+    assert_eq!(group_in(&m, &inv, 0x0200), every);
+    assert_eq!(group_in(&m, &inv, 0x0300), [0x0200, 0x0300]);
+    let (m, inv) = two_root_ports(Some((ALL, ALL)), None);
+    assert_eq!(group_in(&m, &inv, 0x0200), [0x0200, 0x0300]);
+    // An integrated endpoint is reached from below one without ACS.
+    let (m, inv) = two_root_ports(None, Some((ALL, ALL)));
+    assert_eq!(group_in(&m, &inv, 0x00a0), [0x00a0, 0x0200]);
+    // Both isolate: each endpoint alone.
+    let (m, inv) = two_root_ports(Some((ALL, ALL)), Some((SV | RR | CR, SV | RR | CR)));
+    assert_eq!(group_in(&m, &inv, 0x0200), [0x0200]);
+    assert_eq!(group_in(&m, &inv, 0x0300), [0x0300]);
+    assert_eq!(group_in(&m, &inv, 0x00a0), [0x00a0]);
+    // The integrated multi-function device without ACS is one group.
+    assert_eq!(group_in(&m, &inv, 0x00fa), [0x00f8, 0x00fa]);
+    // Closures agree whichever member is asked about.
+    let (m, inv) = two_root_ports(None, Some((ALL, ALL)));
+    for me in [0x0200u16, 0x0300, 0x00a0, 0x00f8] {
+        let mut out = [0u16; 16];
+        let n = acs::closure(&m, || inv.iter().copied(), |f| f, me, &mut out).unwrap();
+        let mut g = out[..n].to_vec();
+        g.sort();
+        assert_eq!(g, every, "{me:#06x}");
+    }
+}
+
+#[test]
+fn an_endpoint_on_the_root_bus_beside_an_empty_bridge_is_alone() {
+    // QEMU q35: an e1000e at 00:02.0, and a root port without ACS and a
+    // PCI bridge with nothing below them.
+    let m = Model::new(&[(0x0010, Func::pcie(acs::ENDPOINT, None)), (0x0008, Func::pcie(acs::ROOT_PORT, None).bridge(2)),
+        (0x00f0, Func::pcie(0, None).bridge(3)), (0x0000, Func::pcie(0, None))]);
+    let inv = [0x0000, 0x0008, 0x0010, 0x00f0];
+    assert_eq!(group_in(&m, &inv, 0x0010), [0x0010]);
+}
+
+/// A switch: root port 00:01.0 (bus 1), its upstream port 01:00.0 (bus 2),
+/// downstream ports 02:00.0 (bus 3) and 02:01.0 (bus 4), an endpoint
+/// below each, and another root port 00:02.0 (bus 5) with one below it.
+fn switch(root: Option<(u16, u16)>, d3: Option<(u16, u16)>, d4: Option<(u16, u16)>) -> (Model, Vec<u16>) {
+    let funcs = [(0x0008, Func::pcie(acs::ROOT_PORT, root).bridge(1)), (0x0100, Func::pcie(acs::UPSTREAM_PORT, None).bridge(2)),
+        (0x0200, Func::pcie(acs::DOWNSTREAM_PORT, d3).bridge(3)), (0x0208, Func::pcie(acs::DOWNSTREAM_PORT, d4).bridge(4)),
+        (0x0300, Func::pcie(0, None)), (0x0400, Func::pcie(0, None)),
+        (0x0010, Func::pcie(acs::ROOT_PORT, Some((ALL, ALL)))), (0x0500, Func::pcie(0, None))];
+    let mut m = Model::new(&funcs);
+    // The upstream port routes buses 2-4.
+    m.funcs.get_mut().get_mut(&0x0100).unwrap().space[0x18 / 4] = 2 << 8 | 4 << 16;
+    m.funcs.get_mut().get_mut(&0x0008).unwrap().space[0x18 / 4] = 1 << 8 | 4 << 16;
+    m.funcs.get_mut().get_mut(&0x0010).unwrap().space[0x0c / 4] |= 1 << 16;
+    m.funcs.get_mut().get_mut(&0x0010).unwrap().space[0x18 / 4] = 5 << 8 | 5 << 16;
+    (m, funcs.iter().map(|f| f.0).collect())
+}
+
+#[test]
+fn a_switch_isolates_with_acs_on_its_downstream_ports() {
+    // Every port isolates: each endpoint alone, the upstream port walked
+    // past.
+    let (m, inv) = switch(Some((ALL, ALL)), Some((ALL, ALL)), Some((ALL, ALL)));
+    assert_eq!(group_in(&m, &inv, 0x0300), [0x0300]);
+    assert_eq!(group_in(&m, &inv, 0x0400), [0x0400]);
+    assert_eq!(group_in(&m, &inv, 0x0500), [0x0500]);
+    // One downstream port without ACS: its endpoint reaches across the
+    // switch, and is reached in turn.
+    let (m, inv) = switch(Some((ALL, ALL)), None, Some((ALL, ALL)));
+    assert_eq!(group_in(&m, &inv, 0x0300), [0x0300, 0x0400]);
+    assert_eq!(group_in(&m, &inv, 0x0400), [0x0300, 0x0400]);
+    assert_eq!(group_in(&m, &inv, 0x0500), [0x0500]);
+    // A downstream port without UF.
+    let (m, inv) = switch(Some((ALL, ALL)), Some((ALL, ALL)), Some((SV | RR | CR, SV | RR | CR)));
+    assert_eq!(group_in(&m, &inv, 0x0300), [0x0300, 0x0400]);
+    // The root port without ACS: the whole switch, and across bus 0.
+    let (m, inv) = switch(None, Some((ALL, ALL)), Some((ALL, ALL)));
+    assert_eq!(group_in(&m, &inv, 0x0300), [0x0300, 0x0400, 0x0500]);
+    assert_eq!(group_in(&m, &inv, 0x0500), [0x0300, 0x0400, 0x0500]);
 }
 
 #[test]
@@ -339,15 +505,20 @@ fn the_whole_inventory_is_walked() {
 
 #[test]
 fn a_port_with_acs_isolates_its_children() {
-    let all = SV | RR | CR | UF;
     let port = |acs| Func::pcie(acs::ROOT_PORT, acs).bridge(2);
-    let inventory = [PORT, 0x0010, 0x0200, 0x0300];
-    for (acs, peers) in [(Some((all, all)), vec![0x0200]), (None, vec![0x0009, 0x0200, 0x0300])] {
-        // A sibling port 00:01.1 (bus 3) of a port without ACS, and what
-        // is below it, is reached through it too.
-        let m = Model::new(&[(PORT, port(acs).multi()), (0x0009, Func::pcie(acs::ROOT_PORT, None).bridge(3)),
+    let inventory = [PORT, 0x0009, 0x0010, 0x0200, 0x0300];
+    for (acs, sib, peers) in [
+        // Both functions isolate: alone.
+        (Some((ALL, ALL)), Some((ALL, ALL)), vec![0x0200]),
+        // The sibling port 00:01.1 (bus 3) does not: what is below it
+        // reaches what is below this one.
+        (Some((ALL, ALL)), None, vec![0x0009, 0x0200, 0x0300]),
+        // This port does not: across bus 0 too.
+        (None, Some((ALL, ALL)), vec![0x0009, 0x0010, 0x0200, 0x0300]),
+        (None, None, vec![0x0009, 0x0010, 0x0200, 0x0300]),
+    ] {
+        let m = Model::new(&[(PORT, port(acs).multi()), (0x0009, Func::pcie(acs::ROOT_PORT, sib).bridge(3)),
             (0x0010, Func::pcie(0, None)), (0x0200, Func::pcie(0, None)), (0x0300, Func::pcie(0, None))]);
-        let inventory = [inventory.as_slice(), &[0x0009]].concat();
         assert_eq!(group_in(&m, &inventory, 0x0200), peers);
     }
 }
