@@ -239,9 +239,16 @@ fn port_of(proto: u8, l4: &[u8], side: Side) -> Option<u16> {
 /// It is the classified side's own packet only if the quoted address on
 /// the mirrored side is the outer one.  If not, or if the quoted headers
 /// are cut short of its protocol, the outer flow stands.
-fn quoted(outer: Flow, inner: Option<Flow>) -> Flow {
+///
+/// `peer` is whether the quoted packet's other address is right too: a
+/// target's error (Side::Src) goes back to whoever sent what it quotes,
+/// so its outer destination is the quoted source.  Otherwise a target
+/// allowed only some port could quote a packet to that port and send the
+/// error, as the endpoint, to anyone.  An error coming in (Side::Dst) may
+/// be from any router on the way.
+fn quoted(outer: Flow, inner: Option<Flow>, peer: bool) -> Flow {
     match inner {
-        Some(f) if f.v6 == outer.v6 && f.ip == outer.ip && f.proto.is_some() => f,
+        Some(f) if peer && f.v6 == outer.v6 && f.ip == outer.ip && f.proto.is_some() => f,
         _ => outer,
     }
 }
@@ -254,6 +261,13 @@ fn ip4(p: &[u8], side: Side, icmp: bool) -> Option<Flow> {
     if ihl < 20 || ihl > p.len() {
         return None;
     }
+    // The packet ends where Total Length says; past it is Ethernet
+    // padding.  A quoted packet (icmp false) may be cut short of it.
+    let total = be16(p, 2) as usize;
+    if total < ihl || (icmp && total > p.len()) {
+        return None;
+    }
+    let p = &p[..total.min(p.len())];
     let mut ip = [0; 16];
     ip[12..].copy_from_slice(match side {
         Side::Src => &p[12..16],
@@ -269,7 +283,9 @@ fn ip4(p: &[u8], side: Side, icmp: bool) -> Option<Flow> {
     f.port = port_of(proto, l4, side);
     // Destination unreachable, time exceeded, parameter problem.
     if icmp && proto == IPPROTO_ICMP && l4.len() >= 8 && matches!(l4[0], 3 | 11 | 12) {
-        return Some(quoted(f, ip4(&l4[8..], side.mirror(), false)));
+        let q = &l4[8..];
+        let peer = side == Side::Dst || q.get(12..16) == Some(&p[16..20]);
+        return Some(quoted(f, ip4(q, side.mirror(), false), peer));
     }
     Some(f)
 }
@@ -278,6 +294,18 @@ fn ip6(p: &[u8], side: Side, icmp: bool) -> Option<Flow> {
     if p.len() < 40 || p[0] >> 4 != 6 {
         return None;
     }
+    // As for IPv4.  A TCP GSO frame may say 0 (Linux's for one past
+    // 64 KiB): it is taken whole.
+    let payload = be16(p, 4) as usize;
+    let p = if icmp && payload == 0 && p[6] == IPPROTO_TCP {
+        p
+    } else if icmp {
+        p.get(..40 + payload)?
+    } else if payload != 0 {
+        &p[..(40 + payload).min(p.len())]
+    } else {
+        p
+    };
     let mut ip = [0; 16];
     ip.copy_from_slice(match side {
         Side::Src => &p[8..24],
@@ -332,7 +360,9 @@ fn ip6(p: &[u8], side: Side, icmp: bool) -> Option<Flow> {
     // Destination unreachable, packet too big, time exceeded, parameter
     // problem.
     if icmp && nh == IPPROTO_ICMPV6 && l4.len() >= 8 && matches!(l4[0], 1..=4) {
-        return Some(quoted(f, ip6(&l4[8..], side.mirror(), false)));
+        let q = &l4[8..];
+        let peer = side == Side::Dst || q.get(8..24) == Some(&p[24..40]);
+        return Some(quoted(f, ip6(q, side.mirror(), false), peer));
     }
     Some(f)
 }

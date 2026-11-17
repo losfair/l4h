@@ -14,6 +14,7 @@
  * raises the device's event, and the vCPU runs other tasks meanwhile.
  */
 #include <linux/atomic.h>
+#include <linux/capability.h>
 #include <linux/fs.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
@@ -318,6 +319,13 @@ static long attest_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 
 	if (cmd != L4H_ATTEST_IOC)
 		return -ENOTTY;
+	/*
+	 * The taint and seal bitmaps are the whole guest's, and reports and
+	 * credentials speak for it: as /dev/l4hctl, only CAP_SYS_ADMIN (in
+	 * the initial namespace), whoever opened the device.
+	 */
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
 	if (copy_from_user(&c, (void __user *)arg, sizeof(c)))
 		return -EFAULT;
 	switch (c.op) {

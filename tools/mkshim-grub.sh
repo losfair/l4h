@@ -33,6 +33,7 @@ CFG
     if [ -f "$conf/l4h.conf" ]; then module2 --nounzip "$conf/l4h.conf" l4h-config; fi
     boot
     echo "l4h: multikernel boot failed"
+    exit
 fi
 CFG
 }

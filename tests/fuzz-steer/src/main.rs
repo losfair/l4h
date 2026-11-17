@@ -673,6 +673,123 @@ mod tests {
         }
     }
 
+    /// A plain IPv4 header and `payload`.
+    fn ipv4_packet(src: [u8; 4], dst: [u8; 4], proto: u8, payload: &[u8]) -> Vec<u8> {
+        let mut b = vec![0x45, 0];
+        b.extend_from_slice(&((20 + payload.len()) as u16).to_be_bytes());
+        b.extend_from_slice(&[0, 0, 0, 0, 64, proto, 0, 0]);
+        b.extend_from_slice(&src);
+        b.extend_from_slice(&dst);
+        b.extend_from_slice(payload);
+        b
+    }
+
+    fn tcp_ports(sport: u16, dport: u16) -> Vec<u8> {
+        let mut t = vec![0u8; 20];
+        t[..2].copy_from_slice(&sport.to_be_bytes());
+        t[2..4].copy_from_slice(&dport.to_be_bytes());
+        t[12] = 0x50;
+        t
+    }
+
+    /// An ICMP or ICMPv6 destination unreachable quoting `quoted`.
+    fn unreachable(v6: bool, quoted: &[u8]) -> Vec<u8> {
+        let mut m = vec![if v6 { 1 } else { 3 }, 0, 0, 0, 0, 0, 0, 0];
+        m.extend_from_slice(quoted);
+        m
+    }
+
+    /// A target a rule gives only TCP port 443 of an address: its errors
+    /// about that traffic go back to the client that sent it, and leave
+    /// as the endpoint; one quoting such a packet but sent to anyone else
+    /// is not the rule's (the target could otherwise send ICMP as the
+    /// endpoint to any address).  Errors from routers on the way about
+    /// the endpoint's own packets still come in to the target.
+    #[test]
+    fn a_target_errors_only_to_the_quoted_source() {
+        let mut s = setup();
+        let (server, client, third, router) = ([203, 0, 113, 5], [198, 51, 100, 7], [192, 0, 2, 99], [198, 51, 100, 200]);
+        assert!(s.rule_set(0, 0, m(6, 443), 1 << 3, port_mac(3)));
+        let m6 = Match { v6: true, proto: 6, port: 443, ip: v6(1) };
+        assert!(s.rule_set(1, 0, m6, 1 << 3, port_mac(3)));
+        for is6 in [false, true] {
+            let (srv, cli, oth, rtr) = if is6 {
+                (v6(1), v6(0x87), v6(0x99), v6(0xc8))
+            } else {
+                (super::v4(server), super::v4(client), super::v4(third), super::v4(router))
+            };
+            let pkt = |src: [u8; 16], dst: [u8; 16], proto: u8, payload: &[u8]| {
+                if is6 {
+                    ipv6_packet(src, dst, proto, payload)
+                } else {
+                    ipv4_packet(src[12..].try_into().unwrap(), dst[12..].try_into().unwrap(), proto, payload)
+                }
+            };
+            let icmp = icmp_proto(is6);
+            // The client's request, as the target got it.
+            let req = pkt(cli, srv, 6, &tcp_ports(40000, 443));
+            let to_client = pkt(srv, cli, icmp, &unreachable(is6, &req));
+            let mut f = frame(PEER, port_mac(3), is6, &to_client);
+            assert_eq!(classify(&f, Side::Src), Some(Flow { v6: is6, ip: srv, proto: Some(6), port: Some(443) }));
+            assert!(s.is_return(3, &f));
+            assert_eq!(s.outbound(3, &mut f), Some(ENDPOINTS[0]), "v6 {is6}");
+            // The same error to a third party: the outer flow (ICMP, no
+            // rule), not steered, nothing changed.
+            let spoofed = pkt(srv, oth, icmp, &unreachable(is6, &req));
+            let mut f = frame(PEER, port_mac(3), is6, &spoofed);
+            assert_eq!(classify(&f, Side::Src), Some(Flow { v6: is6, ip: srv, proto: Some(icmp), port: None }));
+            let before = f.clone();
+            assert!(!s.is_return(3, &f));
+            assert_eq!(s.outbound(3, &mut f), None, "v6 {is6}");
+            assert_eq!(f, before);
+            // Cut to the quoted header and 8 bytes, as errors often are.
+            let cut = &req[..req.len() - 12];
+            let mut f = frame(PEER, port_mac(3), is6, &pkt(srv, cli, icmp, &unreachable(is6, cut)));
+            assert_eq!(s.outbound(3, &mut f), Some(ENDPOINTS[0]));
+            let mut f = frame(PEER, port_mac(3), is6, &pkt(srv, oth, icmp, &unreachable(is6, cut)));
+            assert_eq!(s.outbound(3, &mut f), None);
+            // A router's error about the endpoint's reply comes in.
+            let reply = pkt(srv, cli, 6, &tcp_ports(443, 40000));
+            let mut f = frame(ENDPOINTS[0].mac, PEER, is6, &pkt(rtr, srv, icmp, &unreachable(is6, &reply)));
+            assert_eq!(s.inbound(0, None, &mut f), Some(3), "v6 {is6}");
+        }
+    }
+
+    /// Past the IP length is Ethernet padding: a TCP header there does
+    /// not pick a port's rule.
+    #[test]
+    fn padding_is_not_a_header() {
+        let mut s = setup();
+        assert!(s.rule_set(0, 0, m(6, 443), 1 << 3, port_mac(3)));
+        // An IPv4 packet whose Total Length ends at its header, the TCP
+        // ports in the padding.
+        let mut b = ipv4_packet([198, 51, 100, 7], [203, 0, 113, 5], 6, &[]);
+        b.extend_from_slice(&tcp_ports(40000, 443));
+        let mut f = frame(ENDPOINTS[0].mac, PEER, false, &b);
+        assert_eq!(classify(&f, Side::Dst), Some(Flow { v6: false, ip: v4([203, 0, 113, 5]), proto: Some(6), port: None }));
+        assert_eq!(s.inbound(0, None, &mut f), None);
+        // Whole, it is the rule's.
+        let b = ipv4_packet([198, 51, 100, 7], [203, 0, 113, 5], 6, &tcp_ports(40000, 443));
+        assert_eq!(s.inbound(0, None, &mut frame(ENDPOINTS[0].mac, PEER, false, &b)), Some(3));
+        // A Total Length past the frame: not classified.
+        let mut long = b.clone();
+        long[2..4].copy_from_slice(&41u16.to_be_bytes());
+        assert_eq!(classify(&frame(ENDPOINTS[0].mac, PEER, false, &long), Side::Dst), None);
+        // IPv6 likewise, a UDP header (Payload Length 0 is not TCP GSO).
+        assert!(s.rule_set(1, 0, Match { v6: true, proto: 17, port: 53, ip: v6(1) }, 1 << 4, port_mac(4)));
+        let mut udp = vec![0x9c, 0x40, 0, 53, 0, 8, 0, 0];
+        let mut b = ipv6_packet(v6(0xfe), v6(1), 17, &[]);
+        b.append(&mut udp);
+        let mut f = frame(ENDPOINTS[0].mac, PEER, true, &b);
+        assert_eq!(classify(&f, Side::Dst), Some(Flow { v6: true, ip: v6(1), proto: Some(17), port: None }));
+        assert_eq!(s.inbound(0, None, &mut f), None);
+        // TCP with Payload Length 0, a GSO frame past 64 KiB: whole.
+        let mut b = ipv6_packet(v6(0xfe), v6(1), 6, &tcp_ports(40000, 443));
+        b[4..6].copy_from_slice(&[0, 0]);
+        let f = frame(ENDPOINTS[0].mac, PEER, true, &b);
+        assert_eq!(classify(&f, Side::Dst), Some(Flow { v6: true, ip: v6(1), proto: Some(6), port: Some(443) }));
+    }
+
     #[test]
     fn match_words() {
         let ok = Match::from_words(4 | 6 << 8 | 443 << 16, 0, 0xcb00_7105).unwrap();

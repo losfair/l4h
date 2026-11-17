@@ -44,17 +44,25 @@ fi
 # for the distribution's GRUB; the core image has these modules built in.
 # vbe lets multiboot2 set up the framebuffer the kernel asks for, for the
 # dashboard and fb_console (patches 0011 and 0020).
+# As in tools/mkefi.sh: l4h.conf cannot move \$l4h or add kernel arguments
+# through serial_port, GRUB takes no input, and a failed boot exits.
+serial_default=${L4H_SERIAL_PORT:-0x3f8}
 cat > "$out/grub.cfg" <<CFG
 # l4h on BIOS (tools/mkbios.sh).  \$l4h is the directory that holds bios/,
 # dom0/initrd and l4h.conf.
 insmod multiboot2
 insmod serial
 insmod vbe
-serial_port=${L4H_SERIAL_PORT:-0x3f8}
+insmod regexp
+serial_port=$serial_default
 fb_console=${L4H_FB_CONSOLE:-0}
-if [ -f "\$l4h/l4h.conf" ]; then source "\$l4h/l4h.conf"; fi
+if [ -f "\$l4h/l4h.conf" ]; then
+    l4h_selected="\$l4h"
+    source "\$l4h/l4h.conf"
+    l4h="\$l4h_selected"
+fi
+if regexp '^(0x[0-9a-fA-F]+|[0-9]+)\$' "\$serial_port"; then true; else serial_port=$serial_default; fi
 serial --port=\$serial_port --speed=115200
-terminal_input serial
 fbcon=
 if [ "\$fb_console" = 1 ]; then
     terminal_output serial console
@@ -71,6 +79,7 @@ if [ -f "\$l4h/dom0/initrd" ]; then module2 --nounzip "\$l4h/dom0/initrd" dom0-i
 if [ -f "\$l4h/l4h.conf" ]; then module2 --nounzip "\$l4h/l4h.conf" l4h-config; fi
 boot
 echo "l4h: boot failed"
+exit
 CFG
 cp "$kernel" "$out/kernel.elf"
 # seL4 and root load only the segments: drop the debug information.

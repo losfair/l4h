@@ -104,7 +104,7 @@ set l4h=(\$root)/l4h
 CFG
     grub-mkimage -O i386-pc -o "$work/core.img" -p /l4h/bios -c "$work/early.cfg" \
         biosdisk part_gpt fat search search_fs_uuid normal configfile test echo \
-        multiboot2 serial terminal video video_fb vbe
+        multiboot2 serial terminal video video_fb vbe regexp
     # What grub-bios-setup does for a BIOS boot partition, on a file: boot.img
     # in the MBR (keeping the partition table), with the core image's LBA;
     # the core image's first sector, diskboot.img, with the LBA and length

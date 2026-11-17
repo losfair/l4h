@@ -35,6 +35,7 @@
 #else
 #include <asm/ptrace.h>
 #endif
+#include <linux/capability.h>
 #include <linux/filter.h>
 #include <linux/futex.h>
 #include <linux/seccomp.h>
@@ -1655,6 +1656,209 @@ static void test_futex_wake_op(void)
 	      atomic_load(&wake_op_word), total);
 }
 
+/*
+ * A robust futex list entry whose word is unaligned at a page's end
+ * (0xffd..0x1000): the kernel must not run an atomic update off the page
+ * through its direct map, into whatever physical page follows.  Its exit
+ * walk skips the entry, the word and the next page are left alone, and
+ * FUTEX_WAIT on that address is refused.
+ */
+struct robust_test {
+	struct robust_list_head head;
+	struct robust_list entry;
+};
+
+static void *robust_unaligned_fn(void *arg)
+{
+	struct robust_test *t = arg;
+
+	syscall(SYS_set_robust_list, &t->head, sizeof(t->head));
+	return NULL;
+}
+
+static void test_futex_unaligned(void)
+{
+	unsigned char *p = mmap(NULL, 2 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	unsigned char *word, want[4], next[64];
+	struct robust_test *t;
+	pthread_t th;
+	long r;
+	int i;
+
+	CHECK(p != MAP_FAILED, "mmap: %s", strerror(errno));
+	word = p + 4096 - 3;
+	memset(p + 4096, 0x5c, 4096);
+	memcpy(next, p + 4096, sizeof(next));
+	t = (struct robust_test *)p;
+	t->head.list.next = &t->entry;
+	t->entry.next = &t->head.list;
+	t->head.futex_offset = (long)(word - (unsigned char *)&t->entry);
+	t->head.list_op_pending = NULL;
+	for (i = 0; i < 3; i++)
+		word[i] = 0;
+	CHECK(pthread_create(&th, NULL, robust_unaligned_fn, t) == 0, "pthread_create");
+	pthread_join(th, NULL);
+	/* What the exit walk would have written had it taken the entry. */
+	memset(want, 0, sizeof(want));
+	CHECK(memcmp(word, want, 3) == 0, "unaligned robust word changed: %02x %02x %02x",
+	      word[0], word[1], word[2]);
+	CHECK(memcmp(p + 4096, next, sizeof(next)) == 0, "the page after the robust word changed");
+	errno = 0;
+	r = syscall(SYS_futex, word, FUTEX_WAIT, 0, NULL, NULL, 0);
+	CHECK(r == -1 && errno == EINVAL, "FUTEX_WAIT on an unaligned word: %ld (%s)", r, strerror(errno));
+	errno = 0;
+	r = syscall(SYS_futex, p + 4096 - 4, FUTEX_WAKE_OP, 1, NULL, word, FUTEX_OP(FUTEX_OP_SET, 1, FUTEX_OP_CMP_EQ, 0));
+	CHECK(r == -1 && errno == EINVAL, "FUTEX_WAKE_OP on an unaligned word: %ld (%s)", r, strerror(errno));
+	CHECK(memcmp(p + 4096, next, sizeof(next)) == 0, "the page after the futex word changed");
+	munmap(p, 2 * 4096);
+}
+
+/*
+ * A string argument at a kernel address fails at once with EFAULT, both
+ * where the kernel copies it (strncpy_from_user: execve, openat) and where
+ * it measures it first (strnlen_user via strndup_user: add_key, mount),
+ * not with ENOMEM from taking a negative error for a length.
+ */
+static void test_uaccess_kernel_strings(void)
+{
+	const char *bad = (const char *)~0UL;
+	const char *high = (const char *)(1UL << 63);
+	char *argv[] = { NULL };
+	long r;
+	int i;
+
+	for (i = 0; i < 2; i++) {
+		const char *s = i ? high : bad;
+
+		errno = 0;
+		r = syscall(SYS_execve, s, argv, argv);
+		CHECK(r == -1 && errno == EFAULT, "execve(%p): %ld (%s)", s, r, strerror(errno));
+		errno = 0;
+		r = syscall(SYS_openat, AT_FDCWD, s, O_RDONLY);
+		CHECK(r == -1 && errno == EFAULT, "openat(%p): %ld (%s)", s, r, strerror(errno));
+		errno = 0;
+		r = syscall(SYS_add_key, "user", s, "x", 1, -2 /* KEY_SPEC_PROCESS_KEYRING */);
+		CHECK(r == -1 && errno == EFAULT, "add_key(%p): %ld (%s)", s, r, strerror(errno));
+		errno = 0;
+		r = syscall(SYS_mount, "none", "/tmp", s, 0, NULL);
+		CHECK(r == -1 && errno == EFAULT, "mount type %p: %ld (%s)", s, r, strerror(errno));
+	}
+	/* A string ending right before an unmapped page still works. */
+	{
+		char *p = mmap(NULL, 2 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+		CHECK(p != MAP_FAILED, "mmap: %s", strerror(errno));
+		CHECK(munmap(p + 4096, 4096) == 0, "munmap: %s", strerror(errno));
+		memcpy(p + 4096 - 8, "/nonexi", 8);
+		errno = 0;
+		r = syscall(SYS_openat, AT_FDCWD, p + 4096 - 8, O_RDONLY);
+		CHECK(r == -1 && errno == ENOENT, "openat at a page's end: %ld (%s)", r, strerror(errno));
+		/* No NUL before the unmapped page: a fault. */
+		memcpy(p + 4096 - 8, "/nonexis", 8);
+		errno = 0;
+		r = syscall(SYS_openat, AT_FDCWD, p + 4096 - 8, O_RDONLY);
+		CHECK(r == -1 && errno == EFAULT, "openat across into an unmapped page: %ld (%s)", r, strerror(errno));
+		munmap(p, 4096);
+	}
+}
+
+/*
+ * /dev/l4h-attest needs CAP_SYS_ADMIN at each ioctl, as /dev/l4hctl: the
+ * taint and seal bitmaps are the whole guest's.  A child that drops the
+ * capability is refused on a descriptor its root parent opened.
+ */
+struct attest_ioc {
+	uint32_t op, blob_len, secret_len, out_len;
+	uint64_t data, out;
+};
+#define ATTEST_IOC _IOWR('L', 2, struct attest_ioc)
+
+static int attest_read_flags(int fd)
+{
+	unsigned char zero[32] = { 0 }, out[64];
+	struct attest_ioc c = { .op = 4 /* ACT, empty: read */, .blob_len = sizeof(zero),
+				.out_len = sizeof(out), .data = (uintptr_t)zero,
+				.out = (uintptr_t)out };
+
+	return ioctl(fd, ATTEST_IOC, &c) < 0 ? -errno : 0;
+}
+
+static void test_attest_cap(void)
+{
+	struct __user_cap_header_struct h = { .version = _LINUX_CAPABILITY_VERSION_3 };
+	struct __user_cap_data_struct d[2];
+	int fd = open("/dev/l4h-attest", O_RDWR), status, r;
+	pid_t pid;
+
+	CHECK(fd >= 0, "open /dev/l4h-attest: %s", strerror(errno));
+	r = attest_read_flags(fd);
+	CHECK(r == 0, "reading the flags as root: %s", strerror(-r));
+	pid = fork();
+	if (pid == 0) {
+		if (syscall(SYS_capget, &h, d) != 0)
+			_exit(10);
+		d[CAP_SYS_ADMIN / 32].effective &= ~(1u << (CAP_SYS_ADMIN % 32));
+		d[CAP_SYS_ADMIN / 32].permitted &= ~(1u << (CAP_SYS_ADMIN % 32));
+		if (syscall(SYS_capset, &h, d) != 0)
+			_exit(11);
+		r = attest_read_flags(fd);
+		_exit(r == -EPERM ? 0 : r == 0 ? 12 : 13);
+	}
+	CHECK(pid > 0, "fork: %s", strerror(errno));
+	waitpid(pid, &status, 0);
+	close(fd);
+	CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+	      "without CAP_SYS_ADMIN: exit %d (10, 11: capget/capset; 12: allowed; 13: not EPERM)",
+	      WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+}
+
+#ifdef __x86_64__
+/*
+ * rt_sigreturn takes only the flags user code may set (ptrace's
+ * FLAG_MASK): a handler that puts IOPL 3 or VIP in the saved context gets
+ * neither, while the arithmetic flags it sets come back.
+ */
+static volatile unsigned long efl_seen;
+
+static void efl_set_handler(int sig, siginfo_t *si, void *ctx)
+{
+	ucontext_t *uc = ctx;
+
+	uc->uc_mcontext.gregs[REG_EFL] |= 0x3000 /* IOPL 3 */ | 0x100000 /* VIP */ |
+					  0x80000 /* VIF */ | 0x1 /* CF */;
+}
+
+static void efl_get_handler(int sig, siginfo_t *si, void *ctx)
+{
+	efl_seen = ((ucontext_t *)ctx)->uc_mcontext.gregs[REG_EFL];
+}
+
+static void test_sigreturn_eflags(void)
+{
+	struct sigaction sa = { .sa_flags = SA_SIGINFO };
+	unsigned long after;
+	long pid = getpid(), tid = syscall(SYS_gettid);
+
+	sa.sa_sigaction = efl_set_handler;
+	sigaction(SIGUSR1, &sa, NULL);
+	sa.sa_sigaction = efl_get_handler;
+	sigaction(SIGUSR2, &sa, NULL);
+	/* The signal comes as tgkill returns; read the flags right after. */
+	asm volatile("syscall\n\tpushfq\n\tpopq %[f]"
+		     : [f] "=r"(after)
+		     : "a"((long)SYS_tgkill), "D"(pid), "S"(tid), "d"((long)SIGUSR1)
+		     : "rcx", "r11", "memory", "cc");
+	CHECK(after & 0x1, "CF the handler set was lost: %#lx", after);
+	CHECK(!(after & (0x3000 | 0x100000 | 0x80000)), "privileged flags after sigreturn: %#lx", after);
+	efl_seen = ~0UL;
+	syscall(SYS_tgkill, pid, tid, SIGUSR2);
+	CHECK(efl_seen != ~0UL, "second signal not delivered");
+	CHECK(!(efl_seen & (0x3000 | 0x100000 | 0x80000)), "privileged flags saved: %#lx", efl_seen);
+	signal(SIGUSR1, SIG_DFL);
+	signal(SIGUSR2, SIG_DFL);
+}
+#endif
+
 /* sched_getcpu() (the vDSO) agrees with the CPU a thread is pinned to. */
 static void test_getcpu(void)
 {
@@ -1761,6 +1965,12 @@ static const struct test tests[] = {
 	{ "threads", test_threads },
 	{ "futex", test_futex },
 	{ "futex_wake_op", test_futex_wake_op },
+	{ "futex_unaligned", test_futex_unaligned },
+	{ "uaccess_kstr", test_uaccess_kernel_strings },
+	{ "attest_cap", test_attest_cap },
+#ifdef __x86_64__
+	{ "sigreturn_efl", test_sigreturn_eflags },
+#endif
 	{ "getcpu", test_getcpu },
 	{ "smp_migrate_exit", test_smp_migrate_exit },
 	{ "files", test_files },

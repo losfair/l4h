@@ -4,6 +4,7 @@ mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
 nonce=$(sed -n 's/.*attest_nonce=\([0-9a-f]*\).*/\1/p' /proc/cmdline)
+l4hctl attest seal console-in >/dev/null || echo "ATTESTVM: seal failed"
 echo "ATTESTVM: report $(l4hctl attest report "$nonce")"
 echo "ATTESTVM: done"
 poweroff -f

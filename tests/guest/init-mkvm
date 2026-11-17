@@ -20,6 +20,7 @@ nonce=$(sed -n 's/.*attest_nonce=\([0-9a-f]*\).*/\1/p' /proc/cmdline)
 if [ -n "$nonce" ]; then
     mount -t sysfs sys /sys
     mount -t devtmpfs dev /dev
+    l4hctl attest seal console-in >/dev/null || echo "MKVM: seal failed"
     echo "MKVM: report $(l4hctl attest report "$nonce")"
 fi
 echo "MKVM: done"

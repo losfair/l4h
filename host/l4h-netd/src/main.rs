@@ -390,14 +390,18 @@ impl Netd {
                 p.drops += 1;
                 return;
             }
+            // A partial checksum is written where the guest said, after
+            // the filter and steering looked (at addresses and ports it
+            // could overwrite): complete it first wherever either looks.
+            // A GSO frame's goes into its TCP checksum (offload::sanitize),
+            // and its segments copy the headers they saw.  Elsewhere it is
+            // left to the receiver, or the device.
+            let steered = self.steer.switches & 1u64.checked_shl(switch).unwrap_or(0) != 0
+                || (i < steer::MAX_TARGETS && self.steer.targets & (1 << i) != 0);
+            if (self.filters[i].on || steered) && !is_gso(hdr) {
+                complete_csum(frame, hdr);
+            }
             if self.filters[i].on {
-                // A partial checksum is written where the guest said, after
-                // the filter looked: complete it first.  A GSO frame's goes
-                // into its TCP checksum (offload::sanitize), and its
-                // segments copy the headers the filter saw.
-                if !is_gso(hdr) {
-                    complete_csum(frame, hdr);
-                }
                 // A steering rule's target may send as the rule's address.
                 match ipfilter::check(&self.filters[i], frame) {
                     ipfilter::Verdict::Pass => {}

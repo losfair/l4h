@@ -83,6 +83,61 @@ pathlib.Path(args[args.index('-o') + 1]).write_bytes(b'EFI fixture')
         self.assertIn('(memdisk)/boot/mk/l4h-mkshim.elf', config)
         self.assertNotIn('\ntrue\n', config)
 
+    def test_slot_settings_cannot_redirect_or_take_input(self):
+        shim = self.work / 'mkshim'
+        shim.mkdir()
+        (shim / 'l4h-mkshim.elf').touch()
+        for settings in ({}, {'L4H_MKSHIM': str(shim)}):
+            self.assertEqual(self.generate(**settings).returncode, 0)
+            config = self.config.read_text()
+            # No input from the serial port: nothing to type into.
+            self.assertNotIn('terminal_input', config)
+            # Every failed boot exits to the wrapper (EFI_LOAD_ERROR).
+            lines = config.splitlines()
+            fails = [i for i, l in enumerate(lines) if 'boot failed' in l]
+            self.assertEqual(len(fails), 2 if settings else 1)
+            for i in fails:
+                self.assertEqual(lines[i + 1].strip(), 'exit', lines[i])
+            # $esp is kept across sourcing the slot's l4h.conf.
+            src = config.index('source "($esp)/l4h/l4h.conf"')
+            self.assertLess(config.rindex('l4h_selected_esp="$esp"', 0, src), src)
+            self.assertIn('esp="$l4h_selected_esp"', config[src:src + 200])
+            # serial_port is a number before anything uses it.
+            check = config.index("if regexp '^(0x[0-9a-fA-F]+|[0-9]+)$' \"$serial_port\"; then true; "
+                                 "else serial_port=0x3f8; fi")
+            self.assertLess(src, check)
+            self.assertLess(check, config.index('serial --port=$serial_port', src))
+            self.assertLess(check, config.index('console_port=$serial_port'))
+            self.assertIn('regexp', self.modules.read_text())
+            self.assertNotIn('\ntrue\n', config)
+        self.generate(L4H_SERIAL_PORT='0x2f8')
+        self.assertIn('else serial_port=0x2f8; fi', self.config.read_text())
+
+    def test_bios_config(self):
+        out = self.work / 'bios'
+        env = {k: v for k, v in os.environ.items() if not k.startswith("L4H_")}
+        env.update(L4H_GUEST_KERNEL="/bin/true", L4H_GUEST_SDK="", L4H_MKSHIM="")
+        if not shutil.which('objcopy'):
+            self.skipTest('no objcopy')
+        fixture = self.work / 'fixture.elf'
+        subprocess.run(['cc', '-x', 'c', '-', '-o', str(fixture)], input='int main(void){return 0;}', text=True, check=True)
+        env['L4H_GUEST_KERNEL'] = str(fixture)
+        subprocess.run([str(ROOT / 'tools/mkbios.sh'), str(out), str(fixture), str(fixture)], env=env, check=True,
+                       capture_output=True)
+        config = (out / 'grub.cfg').read_text()
+        if shutil.which("grub-script-check"):
+            subprocess.run(["grub-script-check", str(out / 'grub.cfg')], check=True)
+        self.assertNotIn('terminal_input', config)
+        self.assertIn('insmod regexp', config)
+        self.assertIn('echo "l4h: boot failed"\nexit\n', config)
+        src = config.index('source "$l4h/l4h.conf"')
+        self.assertLess(config.index('l4h_selected="$l4h"'), src)
+        self.assertIn('l4h="$l4h_selected"', config[src:src + 100])
+        self.assertLess(src, config.index("if regexp '^(0x[0-9a-fA-F]+|[0-9]+)$' \"$serial_port\""))
+        mkimage = (ROOT / 'tools/mkimage.sh').read_text()
+        core = mkimage[mkimage.index('grub-mkimage -O i386-pc'):]
+        self.assertIn('regexp', core[:core.index('\n    #')])
+
     def test_wrapper_status_device_path_and_cleanup(self):
         binary = self.work / "efi-wrapper-test"
         subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-mno-red-zone",

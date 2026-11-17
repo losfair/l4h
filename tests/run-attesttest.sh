@@ -127,12 +127,18 @@ for phase in clean injected gates fresh queued; do
 done
 python3 "$attest" verify "$out/run/clean.report" "$out/run/evidence1" --data "$nonce" \
     --require-seal console-out > "$out/run/clean.json" || fail "clean sealed report"
-! python3 "$attest" verify "$out/run/injected.report" "$out/run/evidence1" >/dev/null 2>&1 || fail "injected input accepted"
-python3 "$attest" verify "$out/run/injected.report" "$out/run/evidence1" --deny-taint '' > "$out/run/injected.json" || fail "allow input"
+! python3 "$attest" verify "$out/run/injected.report" "$out/run/evidence1" --require-seal '' >/dev/null 2>&1 \
+    || fail "injected input accepted"
+python3 "$attest" verify "$out/run/injected.report" "$out/run/evidence1" --deny-taint '' --require-seal '' \
+    > "$out/run/injected.json" || fail "allow input"
 python3 "$attest" verify "$out/run/gates.report" "$out/run/evidence1" --deny-taint 130,131 \
     --require-seal console-in,console-out,130,140-141 > "$out/run/gates.json" || fail "guest gates"
-python3 "$attest" verify "$out/run/fresh.report" "$out/run/evidence1" > "$out/run/fresh.json" || fail "new instance"
-python3 "$attest" verify "$out/run/queued.report" "$out/run/evidence1" --deny-taint '' > "$out/run/queued.json" || fail "pre-start input"
+# Unsealed (console-in): refused by default, as input could follow.
+! python3 "$attest" verify "$out/run/fresh.report" "$out/run/evidence1" >/dev/null 2>&1 || fail "unsealed report accepted"
+python3 "$attest" verify "$out/run/fresh.report" "$out/run/evidence1" --require-seal '' > "$out/run/fresh.json" \
+    || fail "new instance"
+python3 "$attest" verify "$out/run/queued.report" "$out/run/evidence1" --deny-taint '' --require-seal '' \
+    > "$out/run/queued.json" || fail "pre-start input"
 python3 - "$out/run" <<'CHECK'
 import json, sys
 from pathlib import Path

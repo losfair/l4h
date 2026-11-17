@@ -73,18 +73,28 @@ if [ -n "${L4H_ACPI_TABLES:-}" ]; then
 fi
 
 # l4h.conf is key=value lines, which GRUB sources as variable assignments:
-# it reads serial_port and fb_console itself.
+# it reads serial_port and fb_console itself.  Sourcing it must not change
+# which partition the rest is read from ($esp, kept across it), nor put
+# words of its own on the kernel's command line: serial_port is a number,
+# else the default.  GRUB takes no input: it boots straight away (no menu),
+# and on failure exits to the wrapper (EFI_LOAD_ERROR, for A/B fallback)
+# rather than to a shell anyone at the serial port could type into.
+serial_default=${L4H_SERIAL_PORT:-0x3f8}
 cat > "$work/grub.cfg" <<CFG
 set timeout=0
-serial_port=${L4H_SERIAL_PORT:-0x3f8}
+serial_port=$serial_default
 fb_console=${L4H_FB_CONSOLE:-0}
 $boot_partition
 if [ "\$l4h_boot_ok" = 1 ]; then
 if [ -n "\$esp" ]; then
-    if [ -f "(\$esp)/l4h/l4h.conf" ]; then source "(\$esp)/l4h/l4h.conf"; fi
+    if [ -f "(\$esp)/l4h/l4h.conf" ]; then
+        l4h_selected_esp="\$esp"
+        source "(\$esp)/l4h/l4h.conf"
+        esp="\$l4h_selected_esp"
+    fi
 fi
+if regexp '^(0x[0-9a-fA-F]+|[0-9]+)\$' "\$serial_port"; then true; else serial_port=$serial_default; fi
 serial --port=\$serial_port --speed=115200
-terminal_input serial
 fbcon=
 if [ "\$fb_console" = 1 ]; then
     terminal_output serial console
@@ -113,6 +123,7 @@ if [ -n "\$esp" ]; then
 fi
 boot
 echo "l4h: boot failed"
+exit
 else
     serial --port=\$serial_port --speed=115200
     terminal_output serial console

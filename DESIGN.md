@@ -176,7 +176,7 @@ guest's `arch/l4h` likewise builds only 64-bit kernels. Upstream seL4's own
   printing for boot messages and fatal errors. Host output goes through
   l4h-logd (§10.4).
 - `L4H_RELEASE=1` also builds the host components with Cargo's release
-  profile (optimised; overflow checks off: §10, "Integer arithmetic"), into
+  profile (optimised; overflow checks still on: §10, "Integer arithmetic"), into
   `host/target/<target>/release` rather than `debug`
   (`tools/host-profile.sh`, the one definition: every script that
   builds, packages or boots them sources it, the Python tests through
@@ -3482,10 +3482,7 @@ Notification takeover accepts an already-unbound main TCB, since it may
 have faulted during that poll, and repairs a binding already held by the
 keeper if its panic recovery retries. Other kernel errors still fail.
 
-**Integer arithmetic.** Shipped host components build without overflow
-checks (Cargo's release profile, §4.1), so an overflow wraps rather than
-panics, and a wrapped bound check passes. The code is correct by
-construction instead: arithmetic on a value a less-trusted party chose (a
+**Integer arithmetic.** The code is correct by construction: arithmetic on a value a less-trusted party chose (a
 guest's descriptors, registers and requests, a device's DMA writes and
 registers, a driver's or a peer partition's shared pages and answers, dom0's
 control requests, the config file, firmware tables) never overflows. Such a
@@ -3493,9 +3490,12 @@ value is validated where it comes in, so that the arithmetic after it is in
 range (`checked_add` and the like at that point), or is computed with the
 `wrapping_*` or `saturating_*` operation that is its meaning (sequence
 numbers wrap). Shifts by such a value are bounded first, and a divisor is
-checked for zero. Development builds check overflow as well, which catches
-what is missed in tests and in `tests/run-fuzz.sh`, whose parsers are the
-host's own.
+checked for zero. Every build also checks overflow (`overflow-checks =
+true` in the release profile too, §4.1), as defence in depth: an overflow
+that slipped past this stops the component (a panic, which aborts) instead
+of wrapping, where a wrapped bound check would pass. Tests and
+`tests/run-fuzz.sh`, whose parsers are the host's own, catch what is
+missed before it ships.
 
 **Shared rings.** A ring in memory shared with a less-trusted party (blkd's
 channels, netd's ports, usbd's queues) has one index per side, and each
@@ -3867,9 +3867,16 @@ gives seL4 `fb_console` as a word of its own on the multiboot2 line (an
 unquoted variable, empty otherwise): GRUB joins the first word of an
 unquoted variable's value to the word before it, whatever blanks the value
 starts with, so a value " fb_console" after `debug_port=$serial_port` made
-`debug_port=0x3f8fb_console` (tests/run-uefitest.sh checks both). Root reports unknown keys
-and bad scalar values and keeps the defaults. The user manual lists the
-settings.
+`debug_port=0x3f8fb_console` (tests/run-uefitest.sh checks both). Sourcing
+the file cannot redirect GRUB: it keeps the partition (or BIOS directory)
+it chose across the `source`, and takes `serial_port` only as a decimal or
+`0x` hexadecimal number (else the built-in default), so that no word of the
+file reaches the kernel command line. GRUB reads no input (no
+`terminal_input serial`: it boots at once, with no menu), and every failed
+`boot` is followed by `exit`, so the EFI wrapper returns `EFI_LOAD_ERROR`
+for A/B fallback instead of leaving a GRUB shell on the serial port.
+Root reports unknown keys and bad scalar values and keeps the defaults.
+The user manual lists the settings.
 
 **dom0's disks.**
 
@@ -4112,9 +4119,13 @@ The chain has four links.
    swtpm, start takes 0.4 to 0.6 s; earlier guest requests are answered
    once it is done.
 3. **Reports on guests.** vmmgr measures each guest as it boots it, dom0
-   included. The launch digest is `SHA-256("l4h-launch-v1" ‖ ram_base_va ‖
-   entry ‖ kernel_end ‖ RAM[0, kernel_end) ‖ initrd size ‖ initrd ‖ cmdline
-   length ‖ cmdline)`, with u64 little-endian integers. The immutable ABI
+   included. The launch digest is `SHA-256("l4h-launch-v2" ‖ ram_base_va ‖
+   entry ‖ kernel_end ‖ RAM[0, kernel_end) ‖ initrd GPA ‖ initrd size ‖
+   initrd ‖ cmdline length ‖ cmdline)`, with u64 little-endian integers and
+   the initrd GPA 0 without an initrd. The GPA, with kernel_end, fixes which
+   RAM blocks hold the boot image: dom0 cannot move the initrd to change
+   them under the same digest. `l4h-attest.py measure` takes vmmgr's
+   default, 1 MiB past the kernel's end, or `--initrd-gpa`. The immutable ABI
    provider is part of the host's EFI measurement, so the launch digest
    identifies the same workload across approved host builds.
    - vmmgr reads the image back from guest RAM before the guest starts, and
@@ -4318,7 +4329,13 @@ checking taint alone leaves a session key exposed after its report.
   bits 0–63 only; `l4hctl list` shows seals. The verifier prints host names
   and Linux taint letters and accepts `--deny-taint` / `--require-seal` as
   comma-separated names, numbers and ranges; by default it denies
-  `console-in` (`--deny-taint ''` opts out). Bitmaps may grow: at least 32
+  `console-in` taint and requires a `console-in` seal (`--deny-taint ''`
+  and `--require-seal ''` opt out), so that input after the report cannot
+  have reached the guest unattested. Its CBOR decoder refuses duplicate
+  map keys, nesting deeper than 16 and items longer than the input;
+  `--ek-ca` takes one or more CA certificates and checks validity times,
+  that the issuer is a CA allowed to sign certificates, that the EK
+  certificate is not a CA's, and its EK extended key usage if it has one. Bitmaps may grow: at least 32
   bytes are required, and bits beyond their length count as clear.
 
 **Without a TPM.** trustd always starts, on both architectures. With no TPM,

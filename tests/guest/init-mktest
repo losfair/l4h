@@ -61,6 +61,7 @@ if [ -n "${MKPEER:-}" ]; then
 fi
 if [ -n "$nonce" ]; then
     mkdir -p /tmp/att
+    l4hctl attest seal console-in >/dev/null || fail "seal console-in"
     l4hctl attest report "$nonce" -o /tmp/att/dom0.report || fail "dom0 report"
     l4hctl attest evidence -o /tmp/att/evidence || fail "evidence"
     if [ -f /bin/cred ]; then
