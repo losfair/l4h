@@ -8,6 +8,7 @@
 #include <linux/random.h>
 #include <linux/sched.h>
 #include <linux/timekeeping.h>
+#include <linux/uaccess.h>
 #include <asm/fpu/api.h>
 #include <asm/kemu.h>
 #include <asm/sigcontext.h>
@@ -70,7 +71,9 @@ KEMU_SYSCALL(__NR_fadvise64, sys_fadvise64_64)
 
 /*
  * User memory is in a separate seL4 VSpace: pin and map the page before
- * doing an atomic operation. Natural alignment keeps it within one page.
+ * doing an atomic operation. Natural alignment keeps it within one page:
+ * an access of any other size, or unaligned, or not in user space, is
+ * refused rather than run past the page into its neighbour.
  */
 int kemu_arch_cmpxchg(u64 addr, u32 size, const u64 *exp, const u64 *new, u64 *old)
 {
@@ -78,6 +81,9 @@ int kemu_arch_cmpxchg(u64 addr, u32 size, const u64 *exp, const u64 *new, u64 *o
 	void *base, *p;
 	int ret;
 
+	if (!size || (size & (size - 1)) || size > 16 || (addr & (size - 1)) ||
+	    !access_ok((void __user *)(unsigned long)addr, size))
+		return -EFAULT;
 	ret = get_user_pages_fast(addr & PAGE_MASK, 1, FOLL_WRITE, &page);
 	if (ret != 1)
 		return -EFAULT;
@@ -105,8 +111,15 @@ int kemu_arch_cmpxchg(u64 addr, u32 size, const u64 *exp, const u64 *new, u64 *o
 		old[1] = e >> 64;
 		break;
 	}
+	default:
+		ret = -EINVAL;
+		break;
 	}
 	kunmap_local(base);
+	if (ret < 0) {
+		put_page(page);
+		return ret;
+	}
 	set_page_dirty_lock(page);
 	put_page(page);
 	return 0;

@@ -1655,6 +1655,112 @@ static void test_futex_wake_op(void)
 	      atomic_load(&wake_op_word), total);
 }
 
+/*
+ * A robust futex list entry whose word is unaligned at a page's end
+ * (0xffd..0x1000): the kernel must not run an atomic update off the page
+ * through its direct map, into whatever physical page follows.  Its exit
+ * walk skips the entry, the word and the next page are left alone, and
+ * FUTEX_WAIT on that address is refused.
+ */
+struct robust_test {
+	struct robust_list_head head;
+	struct robust_list entry;
+};
+
+static void *robust_unaligned_fn(void *arg)
+{
+	struct robust_test *t = arg;
+
+	syscall(SYS_set_robust_list, &t->head, sizeof(t->head));
+	return NULL;
+}
+
+static void test_futex_unaligned(void)
+{
+	unsigned char *p = mmap(NULL, 2 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	unsigned char *word, want[4], next[64];
+	struct robust_test *t;
+	pthread_t th;
+	long r;
+	int i;
+
+	CHECK(p != MAP_FAILED, "mmap: %s", strerror(errno));
+	word = p + 4096 - 3;
+	memset(p + 4096, 0x5c, 4096);
+	memcpy(next, p + 4096, sizeof(next));
+	t = (struct robust_test *)p;
+	t->head.list.next = &t->entry;
+	t->entry.next = &t->head.list;
+	t->head.futex_offset = (long)(word - (unsigned char *)&t->entry);
+	t->head.list_op_pending = NULL;
+	for (i = 0; i < 3; i++)
+		word[i] = 0;
+	CHECK(pthread_create(&th, NULL, robust_unaligned_fn, t) == 0, "pthread_create");
+	pthread_join(th, NULL);
+	/* What the exit walk would have written had it taken the entry. */
+	memset(want, 0, sizeof(want));
+	CHECK(memcmp(word, want, 3) == 0, "unaligned robust word changed: %02x %02x %02x",
+	      word[0], word[1], word[2]);
+	CHECK(memcmp(p + 4096, next, sizeof(next)) == 0, "the page after the robust word changed");
+	errno = 0;
+	r = syscall(SYS_futex, word, FUTEX_WAIT, 0, NULL, NULL, 0);
+	CHECK(r == -1 && errno == EINVAL, "FUTEX_WAIT on an unaligned word: %ld (%s)", r, strerror(errno));
+	errno = 0;
+	r = syscall(SYS_futex, p + 4096 - 4, FUTEX_WAKE_OP, 1, NULL, word, FUTEX_OP(FUTEX_OP_SET, 1, FUTEX_OP_CMP_EQ, 0));
+	CHECK(r == -1 && errno == EINVAL, "FUTEX_WAKE_OP on an unaligned word: %ld (%s)", r, strerror(errno));
+	CHECK(memcmp(p + 4096, next, sizeof(next)) == 0, "the page after the futex word changed");
+	munmap(p, 2 * 4096);
+}
+
+/*
+ * A string argument at a kernel address fails at once with EFAULT, both
+ * where the kernel copies it (strncpy_from_user: execve, openat) and where
+ * it measures it first (strnlen_user via strndup_user: add_key, mount),
+ * not with ENOMEM from taking a negative error for a length.
+ */
+static void test_uaccess_kernel_strings(void)
+{
+	const char *bad = (const char *)~0UL;
+	const char *high = (const char *)(1UL << 63);
+	char *argv[] = { NULL };
+	long r;
+	int i;
+
+	for (i = 0; i < 2; i++) {
+		const char *s = i ? high : bad;
+
+		errno = 0;
+		r = syscall(SYS_execve, s, argv, argv);
+		CHECK(r == -1 && errno == EFAULT, "execve(%p): %ld (%s)", s, r, strerror(errno));
+		errno = 0;
+		r = syscall(SYS_openat, AT_FDCWD, s, O_RDONLY);
+		CHECK(r == -1 && errno == EFAULT, "openat(%p): %ld (%s)", s, r, strerror(errno));
+		errno = 0;
+		r = syscall(SYS_add_key, "user", s, "x", 1, -2 /* KEY_SPEC_PROCESS_KEYRING */);
+		CHECK(r == -1 && errno == EFAULT, "add_key(%p): %ld (%s)", s, r, strerror(errno));
+		errno = 0;
+		r = syscall(SYS_mount, "none", "/tmp", s, 0, NULL);
+		CHECK(r == -1 && errno == EFAULT, "mount type %p: %ld (%s)", s, r, strerror(errno));
+	}
+	/* A string ending right before an unmapped page still works. */
+	{
+		char *p = mmap(NULL, 2 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+		CHECK(p != MAP_FAILED, "mmap: %s", strerror(errno));
+		CHECK(munmap(p + 4096, 4096) == 0, "munmap: %s", strerror(errno));
+		memcpy(p + 4096 - 8, "/nonexi", 8);
+		errno = 0;
+		r = syscall(SYS_openat, AT_FDCWD, p + 4096 - 8, O_RDONLY);
+		CHECK(r == -1 && errno == ENOENT, "openat at a page's end: %ld (%s)", r, strerror(errno));
+		/* No NUL before the unmapped page: a fault. */
+		memcpy(p + 4096 - 8, "/nonexis", 8);
+		errno = 0;
+		r = syscall(SYS_openat, AT_FDCWD, p + 4096 - 8, O_RDONLY);
+		CHECK(r == -1 && errno == EFAULT, "openat across into an unmapped page: %ld (%s)", r, strerror(errno));
+		munmap(p, 4096);
+	}
+}
+
 /* sched_getcpu() (the vDSO) agrees with the CPU a thread is pinned to. */
 static void test_getcpu(void)
 {
@@ -1761,6 +1867,8 @@ static const struct test tests[] = {
 	{ "threads", test_threads },
 	{ "futex", test_futex },
 	{ "futex_wake_op", test_futex_wake_op },
+	{ "futex_unaligned", test_futex_unaligned },
+	{ "uaccess_kstr", test_uaccess_kernel_strings },
 	{ "getcpu", test_getcpu },
 	{ "smp_migrate_exit", test_smp_migrate_exit },
 	{ "files", test_files },

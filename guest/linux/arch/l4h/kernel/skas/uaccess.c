@@ -158,47 +158,29 @@ static int do_op_one_page(unsigned long addr, int len, int is_write,
 	return n;
 }
 
-static long buffer_op(unsigned long addr, int len, int is_write,
-		      int (*op)(unsigned long, int, void *), void *arg)
+/*
+ * Apply @op to [@addr, @addr + @len) a page at a time; what is left undone
+ * (0 if @op stopped early by returning > 0, as at the end of a string).
+ * Lengths are unsigned long throughout: a copy of 2 GiB or more must not
+ * turn negative or to 0, and each chunk is 1..PAGE_SIZE bytes, so a
+ * page-aligned @addr makes progress and @addr + @len wrapping does not
+ * end the loop early.
+ */
+static unsigned long buffer_op(unsigned long addr, unsigned long len, int is_write,
+			       int (*op)(unsigned long, int, void *), void *arg)
 {
-	long size, remain, n;
+	unsigned long remain = len;
 
-	size = min(PAGE_ALIGN(addr) - addr, (unsigned long) len);
-	remain = len;
+	while (remain != 0) {
+		int chunk = min_t(unsigned long, PAGE_SIZE - (addr & ~PAGE_MASK), remain);
+		int n = do_op_one_page(addr, chunk, is_write, op, arg);
 
-	n = do_op_one_page(addr, size, is_write, op, arg);
-	if (n != 0) {
-		remain = (n < 0 ? remain : 0);
-		goto out;
+		if (n != 0)
+			return n < 0 ? remain : 0;
+		addr += chunk;
+		remain -= chunk;
 	}
-
-	addr += size;
-	remain -= size;
-	if (remain == 0)
-		goto out;
-
-	while (addr < ((addr + remain) & PAGE_MASK)) {
-		n = do_op_one_page(addr, PAGE_SIZE, is_write, op, arg);
-		if (n != 0) {
-			remain = (n < 0 ? remain : 0);
-			goto out;
-		}
-
-		addr += PAGE_SIZE;
-		remain -= PAGE_SIZE;
-	}
-	if (remain == 0)
-		goto out;
-
-	n = do_op_one_page(addr, remain, is_write, op, arg);
-	if (n != 0) {
-		remain = (n < 0 ? remain : 0);
-		goto out;
-	}
-
 	return 0;
- out:
-	return remain;
 }
 
 static int copy_chunk_from_user(unsigned long from, int len, void *arg)
@@ -247,16 +229,20 @@ static int strncpy_chunk_from_user(unsigned long from, int len, void *arg)
 
 long strncpy_from_user(char *dst, const char __user *src, long count)
 {
-	long n;
+	unsigned long n;
 	char *ptr = dst;
 
+	/* As lib/strncpy_from_user.c. */
+	if (count <= 0)
+		return count < 0 ? -EINVAL : 0;
 	if (!access_ok(src, 1))
 		return -EFAULT;
-	n = buffer_op((unsigned long) src, count, 0, strncpy_chunk_from_user,
-		      &ptr);
+	n = buffer_op((unsigned long) src, (unsigned long) count, 0,
+		      strncpy_chunk_from_user, &ptr);
 	if (n != 0)
 		return -EFAULT;
-	return strnlen(dst, count);
+	/* The string's length, or count if it has no NUL within it. */
+	return ptr - dst;
 }
 EXPORT_SYMBOL(strncpy_from_user);
 
@@ -274,7 +260,8 @@ EXPORT_SYMBOL(__clear_user);
 
 static int strnlen_chunk(unsigned long str, int len, void *arg)
 {
-	int *len_ptr = arg, n;
+	unsigned long *len_ptr = arg;
+	int n;
 
 	n = strnlen((void *) str, len);
 	*len_ptr += n;
@@ -284,14 +271,20 @@ static int strnlen_chunk(unsigned long str, int len, void *arg)
 	return 0;
 }
 
+/*
+ * The string's size with its NUL, len + 1 if it has none within len bytes,
+ * or 0 on a fault: never a negative error, which callers such as
+ * strndup_user() would take for a length.
+ */
 long strnlen_user(const char __user *str, long len)
 {
-	int count = 0, n;
+	unsigned long count = 0;
 
+	if (len <= 0)
+		return 0;
 	if (!access_ok(str, 1))
-		return -EFAULT;
-	n = buffer_op((unsigned long) str, len, 0, strnlen_chunk, &count);
-	if (n == 0)
+		return 0;
+	if (buffer_op((unsigned long) str, (unsigned long) len, 0, strnlen_chunk, &count) == 0)
 		return count + 1;
 	return 0;
 }
@@ -320,8 +313,12 @@ int arch_futex_atomic_op_inuser(int op, u32 oparg, int *oval, u32 __user *uaddr)
 	struct page *page;
 	unsigned long addr = (unsigned long) uaddr;
 
+	/*
+	 * Naturally aligned, the word is within one page: the direct map
+	 * address below must not run into the next physical page.
+	 */
 	ret = -EFAULT;
-	if (!access_ok(uaddr, sizeof(*uaddr)))
+	if (!IS_ALIGNED(addr, sizeof(*uaddr)) || !access_ok(uaddr, sizeof(*uaddr)))
 		return -EFAULT;
 	preempt_disable();
 	page = pin_user_page(addr, 1);
@@ -418,7 +415,9 @@ int futex_atomic_cmpxchg_inatomic(u32 *uval, u32 __user *uaddr,
 	struct page *page;
 	int ret = -EFAULT;
 
-	if (!access_ok(uaddr, sizeof(*uaddr)))
+	/* Aligned, so within one page (see arch_futex_atomic_op_inuser). */
+	if (!IS_ALIGNED((unsigned long) uaddr, sizeof(*uaddr)) ||
+	    !access_ok(uaddr, sizeof(*uaddr)))
 		return -EFAULT;
 
 	preempt_disable();
