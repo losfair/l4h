@@ -42,11 +42,12 @@ done
 wait "$qemu" 2>/dev/null || true
 grep -aE "IMAGETEST|module '|disk [0-9]|nic [0-9]|memory:|cores:|l4h-root: [0-9]+ core|panic|Boot" "$log" || true
 grep -aq "IMAGETEST: cmdline .*imagetest=esp" "$log"
-# seL4's command line from GRUB: fb_console a word of its own, debug_port
-# the serial port alone, and the kernel took the option.  Only a kernel that
-# prints (not a release or FL4 application, UEFI_EFI) says its "Boot config".
-if [ -z "$efi" ] || grep -aq "Boot config: parsing cmdline" "$log"; then
-    grep -aq "Boot config: parsing cmdline '.*debug_port=0x3f8 fb_console\( \|'\)" "$log"
+# seL4 from GRUB's command line: debug_port the serial port alone (not with
+# fb_console glued on, "debug_port=0x3f8fb_console"), and fb_console taken.
+# Its "parsing cmdline" line comes before its console is up and never shows.
+# Only a kernel that prints (not a release or FL4 application, UEFI_EFI)
+# says its "Boot config".
+if [ -z "$efi" ] || grep -aq "Boot config: debug_port" "$log"; then
     grep -aq "Boot config: debug_port = 0x3f8\s*$" "$log"
     grep -aEq "Boot config: (console copied to the framebuffer|framebuffer not usable as a console)" "$log"
 fi
