@@ -2,7 +2,8 @@
 # A software TPM 2.0 for QEMU (swtpm), with an EK certificate from a local
 # CA, as a manufacturer provisions one.
 # Usage: swtpm.sh <state dir>
-# Creates the state on first use (the CA is <state dir>/ca/issuercert.pem)
+# Creates the state on first use (the CA is <state dir>/ca/issuercert.pem);
+# with SWTPM_EK_CERT=0, without an EK certificate in NV, as AMD's fTPM.
 # and runs swtpm in the background; QEMU connects to <state dir>/sock:
 #   -chardev socket,id=tpm,path=<state dir>/sock
 #   -tpmdev emulator,id=tpm0,chardev=tpm -device tpm-crb,tpmdev=tpm0
@@ -28,8 +29,10 @@ CONF
 --platform-version 1.0
 --platform-model QEMU
 CONF
+    cert=(--create-ek-cert)
+    [ "${SWTPM_EK_CERT:-1}" != 0 ] || cert=()
     swtpm_setup --tpm2 --tpmstate "$dir" --config "$dir/swtpm_setup.conf" \
-        --create-ek-cert --lock-nvram --overwrite >"$dir/setup.log" 2>&1 \
+        "${cert[@]}" --lock-nvram --overwrite >"$dir/setup.log" 2>&1 \
         || { cat "$dir/setup.log" >&2; exit 1; }
 fi
 rm -f "$dir/sock"

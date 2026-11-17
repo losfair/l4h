@@ -11,6 +11,7 @@ const ST_SESSIONS: u16 = 0x8002;
 const CC_ACTIVATE_CREDENTIAL: u32 = 0x147;
 const CC_CREATE_PRIMARY: u32 = 0x131;
 const CC_FLUSH_CONTEXT: u32 = 0x165;
+const CC_GET_CAPABILITY: u32 = 0x17a;
 const CC_GET_RANDOM: u32 = 0x17b;
 const CC_NV_READ: u32 = 0x14e;
 const CC_NV_READ_PUBLIC: u32 = 0x169;
@@ -22,6 +23,9 @@ const CC_START_AUTH_SESSION: u32 = 0x176;
 const CC_STARTUP: u32 = 0x144;
 
 const RC_INITIALIZE: u32 = 0x100;
+
+const CAP_TPM_PROPERTIES: u32 = 6;
+const PT_MANUFACTURER: u32 = 0x105;
 
 pub const RH_OWNER: u32 = 0x4000_0001;
 pub const RH_NULL: u32 = 0x4000_0007;
@@ -268,6 +272,20 @@ pub fn get_random(tpm: &mut Tpm, out: &mut [u8]) -> Result<(), Error> {
         at += n;
     }
     Ok(())
+}
+
+/// The TPM's manufacturer (TPM_PT_MANUFACTURER): its TCG vendor ID, up to
+/// four ASCII characters, big-endian and NUL-padded (0x414d4400 is "AMD").
+pub fn manufacturer(tpm: &mut Tpm) -> Result<u32, Error> {
+    let r = run(tpm, ST_NO_SESSIONS, CC_GET_CAPABILITY, |c| {
+        c.u32(CAP_TPM_PROPERTIES).u32(PT_MANUFACTURER).u32(1);
+    })?;
+    let mut p = Rsp::new(r, 0, false);
+    p.take(1)?; // moreData
+    if p.u32()? != CAP_TPM_PROPERTIES || p.u32()? == 0 || p.u32()? != PT_MANUFACTURER {
+        return Err(Error::Bad("no TPM_PT_MANUFACTURER"));
+    }
+    p.u32()
 }
 
 /// TPM2_CreatePrimary: the loaded key's handle, and its TPMT_PUBLIC as

@@ -5,7 +5,10 @@
 # attestation key, which dom0 decrypts on a second boot (TIS this time,
 # CRB the first).  A third boot has the TPM look like an AMD fTPM: the
 # ACPI start method, through a _DSM in AML (tests/ftpm), which trustd
-# runs for every command; GRUB swaps QEMU's TPM2 table for ours.
+# runs for every command; GRUB swaps QEMU's TPM2 table for ours.  Boots
+# four and five do the same with a TPM that has no EK certificate in NV, as
+# AMD's fTPM: the evidence gives the EK's public area instead, and the
+# credential is made for that.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 source "$root/tools/guest-env.sh"
@@ -26,7 +29,8 @@ dom0_disks=0
 dom0_cmdline="$cmdline"
 CONF
 # A fresh TPM, so that the EK certificate is the one from this CA.
-rm -rf "$out/tpm"
+rm -rf "$out/tpm" "$out/tpm-noek"
+tpm=$out/tpm
 attest=$root/tools/l4h-attest.py
 # Extra QEMU arguments, and environment for tools/mkimage.sh, of the next
 # boot.
@@ -39,10 +43,10 @@ boot() {  # boot <name> <tpm-crb|tpm-tis> [extra initramfs files...]
     env "${image_env[@]}" L4H_GUEST_KERNEL="$out/run/vmlinux" L4H_GUEST_SDK= \
         "$root/tools/mkimage.sh" -i "$out/run/$name.cpio.gz" -c "$out/run/l4h.conf" \
         "$out/run/$name.raw" >/dev/null
-    "$root/tools/swtpm.sh" "$out/tpm"
+    "$root/tools/swtpm.sh" "$tpm"
     local log=$out/$name.log  # build/*/*.log: kept by CI on failure
     timeout "${ATTESTTEST_TIMEOUT:-180}" "$root/tools/run-uefi.sh" "$out/run/$name.raw" \
-        -chardev socket,id=tpm,path="$out/tpm/sock" -tpmdev emulator,id=tpm0,chardev=tpm \
+        -chardev socket,id=tpm,path="$tpm/sock" -tpmdev emulator,id=tpm0,chardev=tpm \
         -device "$dev",tpmdev=tpm0 "${qemu_extra[@]}" </dev/null >"$log" 2>&1 &
     local qemu=$!
     while kill -0 "$qemu" 2>/dev/null; do
@@ -60,6 +64,28 @@ field() {  # field <log> <what> <out file>
     [ -s "$3" ] || { echo "no $2 in $1"; exit 1; }
 }
 fail() { echo "ATTESTTEST: FAIL: $*"; exit 1; }
+# What the evidence says of the TPM: swtpm's manufacturer (libtpms, "IBM"),
+# and the EK certificate or else the EK's public area, never both.
+tpm_claims() {  # tpm_claims <evidence> <verify json> cert|ekpub
+    python3 - "$attest" "$@" <<'CHECK' || fail "evidence $2: TPM claims"
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("attest", sys.argv[1])
+a = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(a)
+ev = a.cbor_decode(open(sys.argv[2], "rb").read())
+host = json.load(open(sys.argv[3]))["host"]
+assert ev["vendor"] == host["vendor"] == 0x49424D00, ev.get("vendor")
+keys = {"v", "ak", "key", "pcrs", "quote", "quotesig", "vendor"}
+if sys.argv[4] == "cert":
+    assert set(ev) == keys | {"ekcert"}, sorted(ev)
+    assert host["ekpub"] is None
+else:
+    assert set(ev) == keys | {"ekpub"}, sorted(ev)
+    assert host["ekpub"] == ev["ekpub"].hex() and host["ek_cert"] is None
+    attrs, ek = a.parse_public(ev["ekpub"])
+    assert isinstance(ek, a.rsa.RSAPublicKey) and ek.key_size == 2048, "not the RSA EK"
+CHECK
+}
 
 boot boot1 tpm-crb "$root/build/guest/flags-test" "$root/build/guest/flagsvm.cpio.gz"
 log=$out/boot1.log
@@ -90,6 +116,7 @@ printf '\x00' | dd of="$out/run/bad.report" bs=1 seek=40 conv=notrunc status=non
 ! python3 "$attest" verify "$out/run/vm.report" "$out/run/evidence1" --launch "$dom0_launch" 2>/dev/null \
     || fail "wrong launch digest accepted"
 ak=$(json "$out/run/dom0.json" 'd["host"]["ak_name"]')
+tpm_claims "$out/run/evidence1" "$out/run/dom0.json" cert
 echo "ATTESTTEST: reports verify; AK $ak"
 
 grep -aq "FLAGS: PASS" "$log" || fail "dom0 flags checks"
@@ -139,6 +166,7 @@ python3 "$attest" verify "$out/run/dom0.report2" "$out/run/evidence2" --data "$n
     --ek-ca "$ca" > "$out/run/dom0.json2" || fail "second boot report"
 [ "$(json "$out/run/dom0.json2" 'd["host"]["key"]')" != "$(json "$out/run/dom0.json" 'd["host"]["key"]')" ] \
     || fail "same host key on both boots"
+tpm_claims "$out/run/evidence2" "$out/run/dom0.json2" cert
 echo "ATTESTTEST: TIS, the credential and its rate limit work"
 
 for t in tpm2 ssdt; do
@@ -158,5 +186,35 @@ field "$log" "ATTEST: dom0 report" "$out/run/dom0.report3"
 field "$log" "ATTEST: evidence" "$out/run/evidence3"
 python3 "$attest" verify "$out/run/dom0.report3" "$out/run/evidence3" --data "$nonce" --ak-name "$ak" \
     --ek-ca "$ca" > "$out/run/dom0.json3" || fail "ACPI start report"
+tpm_claims "$out/run/evidence3" "$out/run/dom0.json3" cert
 echo "ATTESTTEST: ACPI start method: $starts commands through _DSM"
+
+# No EK certificate in NV, as AMD's fTPM (still the ACPI start method).
+tpm=$out/tpm-noek
+export SWTPM_EK_CERT=0
+boot boot4 tpm-crb
+log=$out/boot4.log
+field "$log" "ATTEST: dom0 report" "$out/run/dom0.report4"
+field "$log" "ATTEST: evidence" "$out/run/evidence4"
+python3 "$attest" verify "$out/run/dom0.report4" "$out/run/evidence4" --data "$nonce" \
+    > "$out/run/dom0.json4" 2>/dev/null || fail "report without an EK certificate"
+! python3 "$attest" verify "$out/run/dom0.report4" "$out/run/evidence4" --ek-ca "$ca" >/dev/null 2>&1 \
+    || fail "verified an EK certificate the evidence does not have"
+tpm_claims "$out/run/evidence4" "$out/run/dom0.json4" ekpub
+grep -aq "l4h-trustd: ready .*no EK certificate (the EK's public area instead)" "$log" || fail "trustd made no EK"
+secret=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+python3 "$attest" make-credential "$out/run/evidence4" "$secret" -o "$out/run/cred" 2>"$out/run/makecred.err" \
+    || fail "make-credential for ekpub"
+grep -q "ekpub, which the host only claims" "$out/run/makecred.err" || fail "make-credential did not warn of ekpub"
+boot boot5 tpm-crb "$out/run/cred"
+log=$out/boot5.log
+grep -aq "ATTEST: secret $secret" "$log" || fail "credential for ekpub not activated"
+field "$log" "ATTEST: evidence" "$out/run/evidence5"
+field "$log" "ATTEST: dom0 report" "$out/run/dom0.report5"
+python3 "$attest" verify "$out/run/dom0.report5" "$out/run/evidence5" --data "$nonce" \
+    --ak-name "$(json "$out/run/dom0.json4" 'd["host"]["ak_name"]')" > "$out/run/dom0.json5" 2>/dev/null \
+    || fail "second boot without an EK certificate"
+[ "$(json "$out/run/dom0.json5" 'd["host"]["ekpub"]')" = "$(json "$out/run/dom0.json4" 'd["host"]["ekpub"]')" ] \
+    || fail "ekpub differs between boots"
+echo "ATTESTTEST: no EK certificate: ekpub $(json "$out/run/dom0.json4" 'd["host"]["ekpub"][:16]')..., the credential for it activates"
 echo "ATTESTTEST: PASS"

@@ -4152,9 +4152,19 @@ The chain has four links.
      one answer.
    - `L4H_ATTEST_EVIDENCE` returns the host evidence, a CBOR map: K as a
      COSE_Key, the AK's `TPMT_PUBLIC`, the quote (`TPMS_ATTEST`) and its
-     signature, the quoted PCR values, and the EK certificate if the TPM has
-     one in NV. It is fixed at startup and comes in pieces: each request
-     gives the offset its answer starts at.
+     signature, the quoted PCR values, and the EK certificate (`ekcert`) if
+     the TPM has one in NV. A TPM without one (an AMD fTPM, whose
+     certificate the verifier fetches from AMD by the EK's public key) has
+     `ekpub` instead: the `TPMT_PUBLIC` of the EK ActivateCredential uses
+     (the default RSA template), which trustd then creates at start, not on
+     first use. `vendor` is `TPM_PT_MANUFACTURER` (`0x414d4400` is AMD).
+     Each is left out if the TPM fails to give it, and `ekpub` if the EK
+     certificate was too large to keep. Neither is covered by the quote:
+     they are the host's word, to find the certificate and pick a policy
+     by; only a credential made for an EK the manufacturer certifies, and
+     activated, ties the AK to a real TPM (below). It is fixed at startup
+     and comes in pieces: each request gives the offset its answer starts
+     at.
    - Linux exposes both as configfs-tsm reports (provider `l4h`: `inblob`,
      `outblob`, and the evidence as `auxblob`) and through
      `/dev/l4h-attest` (`l4hctl attest`).
@@ -4171,7 +4181,9 @@ The chain has four links.
      (`vmlinux` in a release's debug archive), initramfs and command line.
 
    **AK enrollment.** A quote only proves something if the AK is in a real
-   TPM. `make-credential` encrypts a secret to the EK (from its certificate)
+   TPM. `make-credential` encrypts a secret to the EK (`--ek`, else from its
+   certificate, else `ekpub`, which the verifier must first check against
+   the manufacturer's certificate for that key: a host could give its own)
    bound to the AK's name (TPM2_MakeCredential). A guest decrypts it with
    `l4hctl attest activate`, which runs TPM2_ActivateCredential with a
    PolicySecret(endorsement) session for the EK; only the TPM holding both

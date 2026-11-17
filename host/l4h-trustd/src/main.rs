@@ -7,8 +7,11 @@
 //! then extends PCR 15 with the same hash: the quote shows PCR 15 zero,
 //! so it is the first and only key trustd issued in this boot.  The key
 //! signs guests' reports; the quote, the attestation key and the EK
-//! certificate make the host evidence.  The TPM is only used at start,
-//! and for ActivateCredential.
+//! certificate make the host evidence.  A TPM without an EK certificate in
+//! NV (an AMD fTPM's is fetched from AMD by the EK's public key) gives the
+//! EK's public area instead, created at start, so that a verifier can
+//! find the certificate, or encrypt a credential to the EK.  The TPM is
+//! only used at start, and for ActivateCredential.
 //!
 //! Guests ask through their attestation device (l4h_attest_page): a kick,
 //! then the answer in the page and an event, so that a vCPU never waits
@@ -87,12 +90,18 @@ const ACTIVATE_TRIES: u32 = 4;
 
 /// The host evidence's room: the AK's public area, the key, 16 PCRs, the
 /// quote and its signature take about 1 KiB, the rest is for the EK
-/// certificate.
+/// certificate, or the EK's public area (at most EK_PUBLIC_MAX) when there
+/// is none.
 const EVIDENCE_MAX: usize = 8192;
 /// The largest EK certificate we put in the evidence (a few hundred bytes
 /// to 2 KiB in practice).  A larger one is left out: the evidence is
 /// still usable, without the certificate a verifier can check the TPM by.
 const EK_CERT_MAX: usize = 4096;
+/// An EK's TPMT_PUBLIC: about 360 bytes for RSA 2048 with the policy.
+const EK_PUBLIC_MAX: usize = 512;
+/// The evidence has one or the other; with a chain of 8 partitions' keys
+/// (72 bytes each), and the vendor, both fit.
+const _: () = assert!(EK_PUBLIC_MAX <= EK_CERT_MAX && 1024 + EK_CERT_MAX + 72 * trust::MAX_PARTITIONS + 16 <= EVIDENCE_MAX);
 
 /// The largest report payload: each key, and the longest encoding of its
 /// value.
@@ -152,11 +161,16 @@ struct Local {
     /// The attestation key's handle and public area.
     ak: u32,
     ak_public: Buf<512>,
-    /// The EK, created on first use (ActivateCredential), RSA unless the
-    /// TPM has an ECC EK certificate.
+    /// The EK, RSA unless the TPM has an ECC EK certificate: created at
+    /// start when the TPM has no EK certificate, for its public area in the
+    /// evidence, else on first use (ActivateCredential).
     ek: Option<u32>,
     ek_ecc: bool,
     ek_cert: Option<Buf<EK_CERT_MAX>>,
+    /// The EK's public area, when the TPM has no EK certificate.
+    ek_public: Option<Buf<EK_PUBLIC_MAX>>,
+    /// TPM_PT_MANUFACTURER.
+    vendor: Option<u32>,
     /// Multikernel: the keys extended into PCR 15, in order, with their
     /// partitions, and each partition's quote.
     chain: ArrayVec<(u32, [u8; 65]), { trust::MAX_PARTITIONS }>,
@@ -185,6 +199,16 @@ fn binding(partition: Option<u32>, p: &[u8; 65]) -> [u8; 32] {
     }
 }
 
+/// What the host says of its TPM in the evidence, unsigned: the EK
+/// certificate, or the EK's public area when there is none, and the
+/// manufacturer.
+#[derive(Clone, Copy)]
+struct TpmInfo<'a> {
+    ek_cert: Option<&'a [u8]>,
+    ek_public: Option<&'a [u8]>,
+    vendor: Option<u32>,
+}
+
 /// The host evidence for `point` into `out`, as the TPM answers: keys in
 /// the order of their encodings (RFC 8949 §4.2.1).  Multikernel (version
 /// 2): the partition, and the keys extended into PCR 15 before this one.
@@ -195,12 +219,13 @@ fn encode_evidence(
     point: &[u8; 65],
     pcrs: &[(u32, [u8; 32])],
     quote: &[u8],
-    ek_cert: Option<&[u8]>,
+    tpm: TpmInfo,
     sig: &[u8],
     mk: Option<(u32, &[(u32, [u8; 65])])>,
 ) -> Result<usize, Overflow> {
     let mut e = Enc::new(out);
-    e.map(6 + ek_cert.is_some() as usize + 2 * mk.is_some() as usize);
+    let optional = [tpm.ek_cert.is_some(), tpm.ek_public.is_some(), tpm.vendor.is_some()];
+    e.map(6 + optional.iter().filter(|&&o| o).count() + 2 * mk.is_some() as usize);
     e.text("v").uint(if mk.is_some() { 2 } else { 1 });
     e.text("ak").bytes(ak_public);
     // A COSE_Key (EC2, P-256).
@@ -215,9 +240,15 @@ fn encode_evidence(
             e.array(2).uint(*k as u64).bytes(p);
         }
     }
+    if let Some(p) = tpm.ek_public {
+        e.text("ekpub").bytes(p);
+    }
     e.text("quote").bytes(quote);
-    if let Some(c) = ek_cert {
+    if let Some(c) = tpm.ek_cert {
         e.text("ekcert").bytes(c);
+    }
+    if let Some(v) = tpm.vendor {
+        e.text("vendor").uint(v as u64);
     }
     e.text("quotesig").bytes(sig);
     if let Some((k, _)) = mk {
@@ -265,6 +296,26 @@ fn init(cfg: &TrustdConfig, hz: u64, partition: Option<u32>) -> Result<State, (&
         }
         c => c.and_then(|n| Buf::of(&cert[..n])),
     };
+    let vendor = tpm2::manufacturer(&mut tpm).map_err(|e| info!("l4h-trustd: GetCapability (manufacturer) failed: {}", e)).ok();
+    // No certificate: the EK ActivateCredential uses, now, for its public
+    // area.  An RSA key takes a hardware TPM seconds.
+    let (ek, ek_public) = match ek_cert {
+        Some(_) => (None, None),
+        None => match tpm2::create_primary(&mut tpm, tpm2::RH_ENDORSEMENT, Template::Ek { ecc: ek_ecc }) {
+            Ok((h, public)) => match Buf::of(public) {
+                Some(p) => (Some(h), Some(p)),
+                None => {
+                    info!("l4h-trustd: the EK's public area ({} bytes) is larger than {}: left out of the evidence", public.len(), EK_PUBLIC_MAX);
+                    (Some(h), None)
+                }
+            },
+            Err(e) => {
+                info!("l4h-trustd: CreatePrimary (EK) failed: {}: no EK in the evidence", e);
+                (None, None)
+            }
+        },
+    };
+    let tpm_info = TpmInfo { ek_cert: ek_cert.as_ref().map(|c| c.get()), ek_public: ek_public.as_ref().map(|p| p.get()), vendor };
 
     let (ak, ak_public) = step("CreatePrimary (AK)", tpm2::create_primary(&mut tpm, tpm2::RH_ENDORSEMENT, Template::Ak))?;
     let ak_public = Buf::<512>::of(ak_public).ok_or(("CreatePrimary (AK)", Error::Bad("public area too large")))?;
@@ -272,7 +323,7 @@ fn init(cfg: &TrustdConfig, hz: u64, partition: Option<u32>) -> Result<State, (&
     let mut evidence = [0u8; EVIDENCE_MAX];
     let (quote, sig) = step("Quote", tpm2::quote(&mut tpm, ak, &bound, QUOTE_PCRS))?;
     let mk = partition.map(|k| (k, &[][..]));
-    let evidence_len = encode_evidence(&mut evidence, ak_public.get(), &p, &pcrs, quote, ek_cert.as_ref().map(|c| c.get()), sig, mk)
+    let evidence_len = encode_evidence(&mut evidence, ak_public.get(), &p, &pcrs, quote, tpm_info, sig, mk)
         .map_err(|Overflow| ("evidence", Error::Bad("larger than EVIDENCE_MAX")))?;
     step("PCR_Extend", tpm2::pcr_extend(&mut tpm, KEY_PCR, &bound))?;
     let mut chain = ArrayVec::new();
@@ -280,16 +331,18 @@ fn init(cfg: &TrustdConfig, hz: u64, partition: Option<u32>) -> Result<State, (&
         let _ = chain.push((k, p));
     }
     info!(
-        "l4h-trustd: ready in {} ms: signing key {:02x}{:02x}{:02x}{:02x}..., {} EK certificate",
+        "l4h-trustd: ready in {} ms: signing key {:02x}{:02x}{:02x}{:02x}..., {}, TPM vendor {:08x}",
         (host::ticks::now() - t0) * 1000 / hz.max(1),
         key_id[0], key_id[1], key_id[2], key_id[3],
-        match (&ek_cert, ek_ecc) {
-            (None, _) => "no",
-            (Some(_), true) => "an ECC",
-            (Some(_), false) => "an RSA",
-        }
+        match (&ek_cert, ek_ecc, &ek_public) {
+            (Some(_), true, _) => "an ECC EK certificate",
+            (Some(_), false, _) => "an RSA EK certificate",
+            (None, _, Some(_)) => "no EK certificate (the EK's public area instead)",
+            (None, _, None) => "no EK certificate",
+        },
+        vendor.unwrap_or(0),
     );
-    let local = Local { tpm, ak, ak_public, ek: None, ek_ecc, ek_cert, chain, quotes: [const { None }; trust::MAX_PARTITIONS] };
+    let local = Local { tpm, ak, ak_public, ek, ek_ecc, ek_cert, ek_public, vendor, chain, quotes: [const { None }; trust::MAX_PARTITIONS] };
     Ok(State { key, key_id, partition, local: Some(local), evidence, evidence_len })
 }
 
@@ -426,8 +479,13 @@ impl Local {
     fn evidence(&self, k: u32, out: &mut [u8]) -> Result<usize, Errno> {
         let q = self.quotes[k as usize].as_ref().ok_or(EINVAL)?;
         let (_, point) = &self.chain[q.at];
-        encode_evidence(out, self.ak_public.get(), point, &q.pcrs, q.quote.get(), self.ek_cert.as_ref().map(|c| c.get()),
-            q.sig.get(), Some((k, &self.chain[..q.at]))).map_err(|Overflow| EIO)
+        let info = TpmInfo {
+            ek_cert: self.ek_cert.as_ref().map(|c| c.get()),
+            ek_public: self.ek_public.as_ref().map(|p| p.get()),
+            vendor: self.vendor,
+        };
+        encode_evidence(out, self.ak_public.get(), point, &q.pcrs, q.quote.get(), info, q.sig.get(), Some((k, &self.chain[..q.at])))
+            .map_err(|Overflow| EIO)
     }
 
     /// Quote partition `k`'s key `point` and extend PCR 15 with it, once:
