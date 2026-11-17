@@ -130,6 +130,10 @@ int poke_user(struct task_struct *child, long addr, long data)
 	if (bad_user_offset(addr))
 		return -EIO;
 
+	/* Change the registers as they are, not a copy older than the TCB's;
+	 * valid, they go back to the TCB when the child runs. */
+	l4h_sync_regs(child);
+
 	if (addr == FS_BASE || addr == GS_BASE) {
 		/* Keep the other base: user code may have changed it. */
 		int err;
@@ -210,6 +214,7 @@ int peek_user(struct task_struct *child, long addr, long data)
 		return -EIO;
 
 	tmp = 0;  /* Default return condition */
+	l4h_sync_regs(child);
 	if (addr == FS_BASE || addr == GS_BASE)
 		l4h_sync_seg(child);
 	if (addr < MAX_REG_OFFSET)

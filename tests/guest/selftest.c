@@ -594,6 +594,97 @@ static void test_ptrace(void)
 	}
 }
 
+/*
+ * PTRACE_GETREGS and PTRACE_SETREGS at a page fault's signal stop: what the
+ * child had in its registers, an error (not success) for a value the
+ * kernel refuses, and a change that the child resumes with.
+ */
+static void setregs_child(void)
+{
+	unsigned long out;
+
+	ptrace(PTRACE_TRACEME, 0, NULL, NULL);
+	/* movb $0, (%rax): 3 bytes, which the tracer skips. */
+	asm volatile("mov $0x1234567, %%r12\n\t"
+		     "movb $0, (%%rax)\n\t"
+		     "mov %%r12, %[out]\n\t"
+		     : [out] "=r"(out) : "a"(0UL) : "r12", "memory");
+	_exit(out == 0x7654321 ? 0 : 1);
+}
+
+static void test_ptrace_setregs(void)
+{
+	struct user_regs_struct r, bad;
+	unsigned long v;
+	int status;
+	pid_t pid = fork();
+
+	CHECK(pid >= 0, "fork: %s", strerror(errno));
+	if (pid == 0)
+		setregs_child();
+	if (waitpid(pid, &status, 0) != pid || !WIFSTOPPED(status) || WSTOPSIG(status) != SIGSEGV) {
+		kill(pid, SIGKILL);
+		waitpid(pid, NULL, 0);
+		CHECK(0, "no SIGSEGV stop: status %x", status);
+	}
+	CHECK(ptrace(PTRACE_GETREGS, pid, NULL, &r) == 0, "GETREGS: %s", strerror(errno));
+	CHECK(r.r12 == 0x1234567 && r.rax == 0, "GETREGS at the fault: r12 %#llx rax %#llx", r.r12, r.rax);
+	CHECK(peek_user(pid, offsetof(struct user_regs_struct, r12), &v) == 0 && v == 0x1234567,
+	      "PEEKUSER r12 at the fault: %#lx", v);
+	bad = r;
+	bad.cs = 0x10;
+	errno = 0;
+	CHECK(ptrace(PTRACE_SETREGS, pid, NULL, &bad) == -1 && errno == EIO, "SETREGS with cs 0x10: %s", strerror(errno));
+	bad = r;
+	bad.fs_base = 1UL << 63;
+	errno = 0;
+	CHECK(ptrace(PTRACE_SETREGS, pid, NULL, &bad) == -1 && errno == EIO,
+	      "SETREGS with a kernel fs base: %s", strerror(errno));
+	CHECK(peek_user(pid, offsetof(struct user_regs_struct, fs_base), &v) == 0 && v == r.fs_base,
+	      "the refused fs base was set: %#lx", v);
+	r.rip += 3;
+	r.r12 = 0x7654321;
+	CHECK(ptrace(PTRACE_SETREGS, pid, NULL, &r) == 0, "SETREGS: %s", strerror(errno));
+	CHECK(peek_user(pid, offsetof(struct user_regs_struct, rip), &v) == 0 && v == r.rip,
+	      "PEEKUSER rip after SETREGS: %#lx, set %#llx", v, r.rip);
+	/* Resume without the signal: past the store, with the new r12. */
+	CHECK(ptrace(PTRACE_CONT, pid, NULL, NULL) == 0, "CONT: %s", strerror(errno));
+	CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+	      "the child did not resume as set: status %x", status);
+}
+
+/* CLONE_SETTLS with a base past user space fails, as on x86, with clone
+ * and clone3: no child runs with an fs base the kernel would not report. */
+struct selftest_clone_args {
+	uint64_t flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls;
+};
+
+static void test_clone_settls(void)
+{
+	unsigned long tls[] = { 1UL << 63, 1UL << 47, ~0UL };
+	unsigned i;
+	long r;
+
+	for (i = 0; i < sizeof(tls) / sizeof(tls[0]); i++) {
+		struct selftest_clone_args args = { .flags = CLONE_SETTLS, .exit_signal = SIGCHLD, .tls = tls[i] };
+
+		errno = 0;
+		r = syscall(SYS_clone, CLONE_SETTLS | SIGCHLD, 0, NULL, NULL, tls[i]);
+		if (r == 0)
+			syscall(SYS_exit, 0);
+		if (r > 0)
+			waitpid(r, NULL, 0);
+		CHECK(r == -1 && errno == EPERM, "clone with tls %#lx: %ld (%s)", tls[i], r, strerror(errno));
+		errno = 0;
+		r = syscall(SYS_clone3, &args, sizeof(args));
+		if (r == 0)
+			syscall(SYS_exit, 0);
+		if (r > 0)
+			waitpid(r, NULL, 0);
+		CHECK(r == -1 && errno == EPERM, "clone3 with tls %#lx: %ld (%s)", tls[i], r, strerror(errno));
+	}
+}
+
 /* Stop with SIGSTOP without libc, which could touch the vector registers. */
 #define FPREGS_STOP \
 	"mov $39, %%eax\n\tsyscall\n\t"		/* getpid */ \
@@ -2034,6 +2125,8 @@ static const struct test tests[] = {
 	{ "signals_fpu", test_signals_fpu },
 #ifndef __aarch64__
 	{ "ptrace_fpregs", test_ptrace_fpregs },
+	{ "ptrace_setregs", test_ptrace_setregs },
+	{ "clone_settls", test_clone_settls },
 	{ "signal_regs", test_signal_regs },
 #endif
 	{ "timers", test_timers },
