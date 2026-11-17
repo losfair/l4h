@@ -13,6 +13,9 @@ echo "CTLTEST: version $version"
 l4hctl info || fail "info"
 l4hctl iommu | sed 's/^/CTLTEST: iommu /' || fail "iommu"
 l4hctl disks
+# Booted by QEMU itself, the host has no screen: no dashboard to title.
+if l4hctl dashboard-title ctltest 2>/tmp/err; then fail "title without a dashboard"; fi
+grep -q "no dashboard" /tmp/err || { cat /tmp/err; fail "title without a dashboard: wrong error"; }
 free0=""
 for i in 1 2 3; do
     id=$(l4hctl create vm$i --initrd /bin/vm.cpio.gz --mem 128 --vcpus 2) || fail "create $i"

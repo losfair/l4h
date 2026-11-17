@@ -3,7 +3,8 @@
 # from the image built by tools/mkimage.sh (the same image boots under
 # UEFI, tests/run-uefitest.sh), virtio-blk boot disk, virtio-net.  GRUB
 # loads l4h's files, dom0's initramfs and l4h.conf from the EFI partition,
-# and multiboot2 sets up a framebuffer through VBE for the dashboard.
+# and multiboot2 sets up a framebuffer through VBE for the dashboard, whose
+# title dom0 sets (tests/dashboard-qemu.py).
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 out=$root/build/guest
@@ -24,14 +25,22 @@ CONF
 "$root/tools/mkimage.sh" -i "$out/bios.cpio.gz" \
     -c "$out/bios.conf" "$root/build/l4h-bios.raw"
 log=$root/build/qemu-bios.log
-timeout "${BIOSTEST_TIMEOUT:-120}" "$root/tools/run-bios.sh" "$root/build/l4h-bios.raw" </dev/null >"$log" 2>&1 &
+qmp=$root/build/bios-qmp.sock
+rm -f "$qmp" "$log"
+timeout "${BIOSTEST_TIMEOUT:-180}" "$root/tools/run-bios.sh" "$root/build/l4h-bios.raw" \
+    -qmp "unix:$qmp,server=on,wait=off" </dev/null >"$log" 2>&1 &
 qemu=$!
+# dom0 gives the dashboard a title and takes it back: on the screen.
+python3 "$root/tests/dashboard-qemu.py" "$log" "$qmp" &
+screen=$!
 while kill -0 "$qemu" 2>/dev/null; do
     grep -aq "IMAGETEST: done\|l4h-vmmgr: all guests stopped" "$log" && { sleep 1; kill "$qemu"; break; }
     sleep 1
 done
 wait "$qemu" 2>/dev/null || true
+rm -f "$qmp"
 grep -aE "IMAGETEST|module '|dashboard|disk [0-9]|nic [0-9]|memory:|cores:|l4h-root: [0-9]+ core|panic" "$log" || true
 grep -aq "l4h-root: dashboard on 1024x768 framebuffer" "$log"
 grep -aq "IMAGETEST: cmdline .*imagetest=bios" "$log"
 grep -aq "IMAGETEST: network ok" "$log"
+wait "$screen"

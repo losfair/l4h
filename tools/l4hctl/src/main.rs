@@ -153,6 +153,9 @@ const USAGE: &str = "usage: l4hctl <command>
                                /boot/efi/l4h/l4h-mk.conf)
   rtc-set [UNIX_SECONDS]       set the machine RTC in UTC (default: dom0's
                                current time, e.g. after NTP synchronizes)
+  dashboard-title [TITLE]      text of the title bar on the host's screen
+                               (up to 32 printable ASCII characters;
+                               default: l4h again), until the host reboots
   disks                        host disks, owners, capacities and attachments
   pci [--json]                 host PCI functions, IDs, class and service owner
   usb [--json]                 host xHCI controllers: ports, state (firmware
@@ -686,6 +689,11 @@ fn run(args: &[String]) -> Result<i32> {
             };
             ctl.rtc_set(seconds)?;
         }
+        "dashboard-title" => match &args[1..] {
+            [] => ctl.dashboard_title("")?,
+            [title] => ctl.dashboard_title(title)?,
+            _ => return err("dashboard-title [TITLE]"),
+        },
         "disks" => {
             let n = ctl.call(CTL_HOST_INFO, &[], &[], &[])?.vals[3];
             for d in 0..n {

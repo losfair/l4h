@@ -167,7 +167,7 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
         | abi::CTL_STEER_LIST | abi::CTL_PARTITION_INFO | abi::CTL_USB_INFO | abi::CTL_PCI_LIST
         | abi::CTL_NIC_BIND | abi::CTL_NIC_UNBIND | abi::CTL_NIC_RESTART | abi::CTL_NIC_CTL_READ | abi::CTL_DRIVER_INFO
         | abi::CTL_NIC_TEST | abi::CTL_FIRMWARE_INFO | abi::CTL_FIRMWARE_WANTED | abi::CTL_IP_ADD | abi::CTL_IP_DEL
-        | abi::CTL_IP_LIST => {
+        | abi::CTL_IP_LIST | abi::CTL_DASHBOARD_TITLE => {
             resp.vals = host_op(h, req.op, a)?;
             resp.data = *root::result_data();
             Ok(())
