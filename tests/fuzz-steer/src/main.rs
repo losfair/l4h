@@ -614,6 +614,64 @@ mod tests {
         }
     }
 
+    /// Neighbor Discovery behind more extension headers than the
+    /// classifier walks, behind an authentication header, or behind one
+    /// cut short, is not taken for some other protocol: a wildcard rule
+    /// steers none of it, either way.
+    #[test]
+    fn ipv6_headers_not_walked_hide_no_neighbor_discovery() {
+        let mut s = setup();
+        let address = v6(1);
+        let peer = v6(0xfe);
+        let m = Match { v6: true, proto: 0, port: 0, ip: address };
+        assert!(s.rule_set(0, 0, m, 1 << 1, port_mac(1)));
+        let mut nd = vec![0; 24];
+        nd[0] = 135;
+        nd[8..24].copy_from_slice(&address);
+        // Destination options, 8 bytes, naming `next`.
+        let opt = |next: u8| vec![next, 0, 1, 4, 0, 0, 0, 0];
+        // An authentication header (RFC 4302) of 16 bytes: two words
+        // past the first two.
+        let ah = |next: u8| { let mut b = vec![next, 2]; b.resize(16, 0); b };
+        let cases: Vec<(&str, u8, Vec<u8>)> = vec![
+            ("three option headers", 60, [opt(60), opt(60), opt(58), nd.clone()].concat()),
+            ("hop-by-hop, routing, destination", 0, [opt(43), opt(60), opt(58), nd.clone()].concat()),
+            ("AH", 51, [ah(58), nd.clone()].concat()),
+            ("an option header and AH", 60, [opt(51), ah(58), nd.clone()].concat()),
+            ("AH twice", 51, [ah(51), ah(58), nd.clone()].concat()),
+            ("an option header cut short", 60, vec![58, 3, 0, 0, 0, 0, 0, 0]),
+            ("AH cut short", 51, vec![58, 9, 0, 0, 0, 0, 0, 0]),
+        ];
+        for (what, nh, payload) in &cases {
+            for side in [Side::Dst, Side::Src] {
+                let (src, dst) = if side == Side::Dst { (peer, address) } else { (address, peer) };
+                let packet = ipv6_packet(src, dst, *nh, payload);
+                let mut f = if side == Side::Dst {
+                    frame(ENDPOINTS[0].mac, PEER, true, &packet)
+                } else {
+                    frame(OTHER, port_mac(1), true, &packet)
+                };
+                let before = f.clone();
+                assert_eq!(classify(&f, side), None, "{what}, {side:?}");
+                if side == Side::Dst {
+                    assert_eq!(s.inbound(0, None, &mut f), None, "{what}");
+                } else {
+                    assert_eq!(s.outbound(1, &mut f), None, "{what}");
+                }
+                assert_eq!(f, before);
+            }
+        }
+        // What AH protects is classified past it: an echo to the address
+        // is the target's.
+        let packet = ipv6_packet(peer, address, 51, &[ah(58), vec![128, 0, 0, 0, 0, 0, 0, 1]].concat());
+        assert_eq!(classify(&frame(ENDPOINTS[0].mac, PEER, true, &packet), Side::Dst),
+            Some(Flow { v6: true, ip: address, proto: Some(58), port: None }));
+        assert_eq!(s.inbound(0, None, &mut frame(ENDPOINTS[0].mac, PEER, true, &packet)), Some(1));
+        for r in s.rules.iter().flatten() {
+            assert_eq!(r.out_frames, 0);
+        }
+    }
+
     #[test]
     fn ipv6_later_fragment_payload_cannot_select_tcp() {
         let mut s = setup();

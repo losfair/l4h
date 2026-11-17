@@ -2412,7 +2412,10 @@ dom0's external IP, or owns a cloud alias IP outright.
   takes an address from one endpoint only (`-EEXIST`), so a reply always
   leaves through the endpoint whose rule steered the request.
 - **What is classified.** Untagged IPv4 and IPv6 only; up to two IPv6
-  hop-by-hop, routing or destination-options headers are skipped. Ports
+  hop-by-hop, routing or destination-options headers, an authentication
+  header and a fragment header are skipped. An IPv6 packet with more
+  extension headers, or one cut short, is not classified: what follows
+  might be Neighbor Discovery, which no rule takes. Ports
   only from a first fragment: later fragments match proto and IP rules
   when the protocol is known. A later IPv6 fragment whose Next Header
   requires further parsing matches only IP rules; its payload is never
