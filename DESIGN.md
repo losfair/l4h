@@ -2084,7 +2084,8 @@ crosses
 at most one boundary, and blkd splits such a request into two device
 requests. If the device has no room for the second when the first starts,
 it waits ("carry") and starts before any new request; the guest gets one
-completion, with the first error. The overlap rule applies extent by
+completion, with the first error. A carried piece of a client being removed
+never starts: its pool is already cut off from the device, so it fails. The overlap rule applies extent by
 extent: dom0 can only reattach the physical extents of a removed LV once no
 guest holds them, and provisioning (`BLK_WRITE`) refuses every attached
 extent.
