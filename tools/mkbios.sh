@@ -58,12 +58,12 @@ terminal_input serial
 fbcon=
 if [ "\$fb_console" = 1 ]; then
     terminal_output serial console
-    fbcon=" fb_console"
+    fbcon=fb_console
 else
     terminal_output serial
 fi
 $mk_stanza
-multiboot2 "\$l4h/bios/kernel.elf" console_port=\$serial_port debug_port=\$serial_port\$fbcon
+multiboot2 "\$l4h/bios/kernel.elf" console_port=\$serial_port debug_port=\$serial_port \$fbcon
 module2 --nounzip "\$l4h/bios/l4h-root.elf"
 module2 --nounzip "\$l4h/bios/vmlinux" guest-kernel
 if [ -f "\$l4h/bios/sdk.erofs" ]; then module2 --nounzip "\$l4h/bios/sdk.erofs" guest-sdk; fi

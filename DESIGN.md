@@ -3862,7 +3862,12 @@ watchdog default to the `L4H_*` variables root was built with. `l4h.conf`
 overrides them: one `key=value` per line, lowercase without the prefix
 (`dom0_mem_mb=1024`, `uplink_nic=01:00.1`). GRUB sources the same file for
 `serial_port` and `fb_console`, so it is written as GRUB script: no spaces
-around `=`, values with spaces in double quotes. Root reports unknown keys
+around `=`, values with spaces in double quotes. With `fb_console=1` GRUB
+gives seL4 `fb_console` as a word of its own on the multiboot2 line (an
+unquoted variable, empty otherwise): GRUB joins the first word of an
+unquoted variable's value to the word before it, whatever blanks the value
+starts with, so a value " fb_console" after `debug_port=$serial_port` made
+`debug_port=0x3f8fb_console` (tests/run-uefitest.sh checks both). Root reports unknown keys
 and bad scalar values and keeps the defaults. The user manual lists the
 settings.
 
