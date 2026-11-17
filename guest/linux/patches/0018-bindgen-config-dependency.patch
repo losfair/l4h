@@ -11,9 +11,7 @@ Depend on the full configuration header for the binding generators.
 
 --- a/rust/Makefile
 +++ b/rust/Makefile
-@@ -373,13 +373,13 @@
-     sed -Ei 's/^pub struct hrtimer_restart\(/#[cfi_encoding="15hrtimer_restart"]\n&/' $@; \
-     sed -Ei 's/^pub struct irqreturn\(/#[cfi_encoding="9irqreturn"]\n&/' $@
+@@ -375,11 +375,11 @@
  $(obj)/bindings/bindings_generated.rs: $(src)/bindings/bindings_helper.h \
 -    $(src)/bindgen_parameters FORCE
 +    $(src)/bindgen_parameters include/generated/autoconf.h FORCE
