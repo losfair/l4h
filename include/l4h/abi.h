@@ -693,7 +693,16 @@ enum l4h_ctl_op {
 	/* args: port -> vals[0] = count, vals[1] = 1 if the port is filtered;
 	 * data: struct l4h_ctl_ip[] */
 	L4H_CTL_IP_LIST = 56,
+	/* args[0..3]: the title bar's text on the host's dashboard, in place
+	 * of "l4h": its bytes, little-endian, zero-padded: at most
+	 * L4H_DASHBOARD_TITLE_MAX of printable ASCII (0x20-0x7e), read up to
+	 * the first zero.  None restores "l4h".  Kept until set again or the
+	 * host reboots.  -EINVAL for another byte, -ENODEV if the host has no
+	 * dashboard (no boot framebuffer, or a secondary partition). */
+	L4H_CTL_DASHBOARD_TITLE = 57,
 };
+
+#define L4H_DASHBOARD_TITLE_MAX 32
 
 #define L4H_PCI_OWNER_NONE     0 /* no host service assigned */
 #define L4H_PCI_OWNER_BLKD     1

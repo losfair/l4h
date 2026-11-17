@@ -77,6 +77,8 @@ pub const FIRMWARE_NAME: usize = 48;
 pub const CTL_IP_ADD: u32 = 54;
 pub const CTL_IP_DEL: u32 = 55;
 pub const CTL_IP_LIST: u32 = 56;
+pub const CTL_DASHBOARD_TITLE: u32 = 57;
+pub const DASHBOARD_TITLE_MAX: usize = 32;
 pub const PCI_OWNER_NONE: u16 = 0;
 pub const PCI_OWNER_BLKD: u16 = 1;
 pub const PCI_OWNER_NETD: u16 = 2;
@@ -1040,6 +1042,29 @@ impl Ctl {
     /// they were; the RTC supplies the time on the next host boot.
     pub fn rtc_set(&self, seconds: u64) -> Result<()> {
         self.call(CTL_RTC_SET, &[seconds], &[], &[]).map(|_| ())
+    }
+
+    /// Show `title` in the title bar of the host's dashboard, in place of
+    /// "l4h" (dom0 only); an empty one restores "l4h".  At most
+    /// DASHBOARD_TITLE_MAX bytes of printable ASCII.  The host keeps it
+    /// until it is set again or the host reboots.
+    pub fn dashboard_title(&self, title: &str) -> Result<()> {
+        if title.len() > DASHBOARD_TITLE_MAX {
+            return err(format!("title longer than {DASHBOARD_TITLE_MAX} characters"));
+        }
+        if !title.bytes().all(|b| (0x20..0x7f).contains(&b)) {
+            return err("title must be printable ASCII");
+        }
+        let mut bytes = [0u8; DASHBOARD_TITLE_MAX];
+        bytes[..title.len()].copy_from_slice(title.as_bytes());
+        let args: [u64; DASHBOARD_TITLE_MAX / 8] =
+            std::array::from_fn(|i| u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap()));
+        let resp = self.raw_call(CTL_DASHBOARD_TITLE, &args, &[], 0, 0)?;
+        match resp.status {
+            0.. => Ok(()),
+            -19 => err("the host shows no dashboard (no boot framebuffer)"),
+            e => err(format!("request {CTL_DASHBOARD_TITLE} failed: {}", errno_name(-e))),
+        }
     }
 
     /// Ask the guest to power off or reboot cleanly (POWER_OFF, POWER_REBOOT).

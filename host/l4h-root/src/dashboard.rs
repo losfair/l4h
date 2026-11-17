@@ -2,7 +2,7 @@
 //! loader set one up (GRUB on UEFI): host resources, VMs, disks and
 //! network, refreshed every second.  Only character cells that changed
 //! are redrawn.  Nothing on it can be operated: VMs are managed from dom0
-//! or the serial monitor.
+//! or the serial monitor.  dom0 may give the title bar's text.
 
 use core::fmt::{self, Display, Write};
 use core::ops::Range;
@@ -21,6 +21,9 @@ use crate::vspace::map_frame;
 const FB_VA: usize = crate::layout::FRAMEBUFFER.base;
 /// Refresh period in timer ticks of the balancer (100 ms).
 const REFRESH_TICKS: u32 = 10;
+/// The title bar's text, until dom0 gives another (CTL_DASHBOARD_TITLE).
+const TITLE: &str = "l4h";
+const _: () = assert!(TITLE.len() <= l4h_abi::DASHBOARD_TITLE_MAX);
 
 /// The colors used, as an index so that a cell takes three bytes.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -105,6 +108,7 @@ pub struct Dashboard {
     shown: &'static mut [Cell],
     next: &'static mut [Cell],
     ticks: u32,
+    title: ArrayString<{ l4h_abi::DASHBOARD_TITLE_MAX }>,
     /// With `fb_console`: the framebuffer's frames, the lower half's page
     /// offset in them and where in the first of its pages it starts, and
     /// the pitch and size of what the kernel's console would cover.
@@ -192,7 +196,7 @@ impl Dashboard {
         // No character is 0: every cell is drawn the first time.
         shown.fill(Cell { ch: 0, ..BLANK });
         next.fill(BLANK);
-        let mut d = Dashboard { fb, pitch, sx, sy, cols, rows, shown, next, ticks: REFRESH_TICKS, console };
+        let mut d = Dashboard { fb, pitch, sx, sy, cols, rows, shown, next, ticks: REFRESH_TICKS, title: ArrayString::from_str_truncate(TITLE), console };
         // Clear the margins the cell grid does not cover.
         for y in 0..height {
             for x in 0..width {
@@ -207,6 +211,20 @@ impl Dashboard {
     pub fn console_area(&self) -> Option<crate::logd::FbArea> {
         let (frames, offset, width, height) = self.console.clone()?;
         Some(crate::logd::FbArea { frames, offset, pitch: self.pitch, width, height })
+    }
+
+    /// Show `title` in the title bar from the next tick on, or "l4h" again
+    /// for an empty one (dom0's CTL_DASHBOARD_TITLE): printable ASCII, all
+    /// the font has.
+    pub fn set_title(&mut self, title: &[u8]) -> Result<(), crate::ctl::Errno> {
+        if !title.iter().all(|b| (0x20..0x7f).contains(b)) {
+            return Err(crate::ctl::EINVAL);
+        }
+        // ASCII, checked above.
+        let title = core::str::from_utf8(title).map_err(|_| crate::ctl::EINVAL)?;
+        self.title = ArrayString::from_str_truncate(if title.is_empty() { TITLE } else { title });
+        self.ticks = REFRESH_TICKS;
+        Ok(())
     }
 
     fn put(&mut self, x: usize, y: usize, rgb: u32) {
@@ -260,7 +278,8 @@ impl Dashboard {
         let up = crate::host::ticks::now().wrapping_sub(h.info.epoch_ticks) / hz;
         // Title bar.
         self.fill_row(0, BAR_BG);
-        self.text(0, 1, "l4h", BAR_FG, BAR_BG);
+        let title = self.title;
+        self.text(0, 1, &title, BAR_FG, BAR_BG);
         let utc = (h.info.epoch_ns != 0).then(|| Utc(h.info.epoch_ns / 1_000_000_000 + up));
         let right = |w: &mut dyn Write| match &utc {
             Some(t) => write!(w, "{}   up {}", t, Duration(up)),

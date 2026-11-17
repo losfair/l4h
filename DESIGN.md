@@ -1481,6 +1481,14 @@ host, VMs (from vmmgr's status page), disks, switches. It redraws changed
 character cells only, in an 8x8 public-domain font. With `fb_console` it
 keeps to the upper half, and logd draws host output on the lower (§10.4).
 
+The title bar reads "l4h" until dom0 gives it other text, such as the
+machine's name, with `l4hctl dashboard-title` (`CTL_DASHBOARD_TITLE`): at
+most 32 characters of printable ASCII, all the font has, which reach root
+as integers like every host op. Root keeps the title until dom0 sets
+another or the host reboots, also while dom0 restarts; none restores
+"l4h". The op fails with `ENODEV` on a host without a dashboard. dom0 can
+draw nothing else on the screen.
+
 ---
 
 ## 8. Memory
@@ -3937,7 +3945,7 @@ none. dom0 runs no host hardware drivers.
 
 | Area | Operations |
 |------|------------|
-| Host | `host_version` (build version and seL4/FL4 kernel); `host_info` (cores, free/total bytes, disk, VM and NIC counts); `pci_list` (boot inventory, IDs, class and service owner); `host_reboot`; `rtc_set`; `iommu_info` (§9.5); `log_read` (§10) |
+| Host | `host_version` (build version and seL4/FL4 kernel); `host_info` (cores, free/total bytes, disk, VM and NIC counts); `pci_list` (boot inventory, IDs, class and service owner); `host_reboot`; `rtc_set`; `iommu_info` (§9.5); `log_read` (§10); `dashboard_title` (§7.7) |
 | Guests | `vm_create`, `vm_load`, `vm_start`, `vm_shutdown`, `vm_destroy`, `vm_list`, `vm_info` (cores of the first six vCPUs), `vm_stats` (CPU use and cap), `vm_set_sched`, `vm_set_mem`, `vm_mem_info` (§8.5), `vm_trust` (flags, §10.2) |
 | Block | `blk_attach` (disk, read-only and volatile flags, LBA window), `blk_write` (provisioning), `blk_info`, `disk_info` |
 | Network | `switch_create`, `switch_attach_uplink`, `nic_create` (MAC, MAC lock, isolation), `switch_info` (ports with VM and MAC, counters), `nic_info` (PCI address, switch, MAC) |

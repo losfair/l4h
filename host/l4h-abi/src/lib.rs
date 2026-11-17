@@ -384,6 +384,13 @@ pub const CTL_IP_DEL: u32 = 55;
 /// args[0] port: vals[0] = count, vals[1] = 1 if the port is filtered;
 /// data = CtlIp[count].
 pub const CTL_IP_LIST: u32 = 56;
+/// The title bar's text on the host's dashboard (DESIGN.md §7.7), in place
+/// of "l4h": args[0..4] its bytes, little-endian, zero-padded: at most
+/// DASHBOARD_TITLE_MAX of printable ASCII (0x20-0x7e), read up to the
+/// first zero.  None restores "l4h".  Kept until set again or the host
+/// reboots.  EINVAL for another byte, ENODEV without a dashboard.
+pub const CTL_DASHBOARD_TITLE: u32 = 57;
+pub const DASHBOARD_TITLE_MAX: usize = 32;
 /// CTL_NIC_INFO: vals[0] BDF, [1] switch (u64::MAX: none), [2] MAC, [3]
 /// state | trust << 8 | driver << 16 (0xff: none) | restarts << 32 |
 /// isolation group size << 48, [4] vendor | device << 16, [5] the

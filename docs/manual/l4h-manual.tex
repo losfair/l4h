@@ -1834,6 +1834,17 @@ such as GCE VMs, or booted directly by QEMU, run without it. With
 \cmd{tools/run-uefi.sh}, QEMU's display shows it when you drop
 \texttt{-nographic}.
 
+The title bar at the top reads ``l4h''. dom0 can put other text there, for
+example the machine's name, to tell one host's screen from another's:
+\begin{lstlisting}
+l4hctl dashboard-title "rack 4, node 12"
+# Back to "l4h":
+l4hctl dashboard-title
+\end{lstlisting}
+A title is at most 32 printable ASCII characters. The host keeps it until
+it is set again or the host reboots, so set it from dom0's boot scripts. On
+a host without a dashboard the command fails.
+
 \section{The serial monitor}
 
 \texttt{l4h-root} reads commands from the host's first serial port (COM1,

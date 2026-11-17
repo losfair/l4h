@@ -14,5 +14,15 @@ ip link set eth0 up
 if udhcpc -i eth0 -n -q -t 5 -s /bin/udhcpc.script >/dev/null 2>&1 && ping -c 2 -W 2 10.0.2.2 >/dev/null; then
     echo "IMAGETEST: network ok"
 fi
+if grep -q imagetest=bios /proc/cmdline; then
+    # The title bar of the dashboard: tests/dashboard-qemu.py looks at the
+    # screen after each line.
+    echo "IMAGETEST: title default"
+    sleep 5
+    l4hctl dashboard-title "biostest dashboard title" && echo "IMAGETEST: title set"
+    sleep 5
+    l4hctl dashboard-title && echo "IMAGETEST: title reset"
+    sleep 5
+fi
 echo "IMAGETEST: done"
 poweroff -f

@@ -232,6 +232,14 @@ pub fn host_op(h: &mut Host, op: u32, a: &[u64; 6], data: &mut [u8; abi::CTL_DAT
         // A secondary partition's RTC is the primary's (DESIGN.md §11.4).
         abi::CTL_RTC_SET if crate::partition::secondary() => crate::channel::rtc_set(h, a[0])?,
         abi::CTL_RTC_SET => h.rtc.set_secs(&mut h.wins.a, a[0])?,
+        abi::CTL_DASHBOARD_TITLE => {
+            let mut title = [0u8; abi::DASHBOARD_TITLE_MAX];
+            for (t, w) in title.chunks_exact_mut(8).zip(a) {
+                t.copy_from_slice(&w.to_le_bytes());
+            }
+            let len = title.iter().position(|&c| c == 0).unwrap_or(title.len());
+            h.dashboard.as_mut().ok_or(ENODEV)?.set_title(&title[..len])?;
+        }
         _ => return Err(ENOSYS),
     }
     Ok(Answer::Now(vals.into_iter().collect()))
