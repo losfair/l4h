@@ -17,7 +17,7 @@ mkshim_grub() {
     local files=$1 rootserver=$2 vmlinux=$3 sdk=$4 conf=$5
     cat <<CFG
 if [ -f "$conf/l4h-mk.conf" ]; then
-    multiboot2 "$files/l4h-mkshim.elf" console_port=\$serial_port debug_port=\$serial_port\$fbcon
+    multiboot2 "$files/l4h-mkshim.elf" console_port=\$serial_port debug_port=\$serial_port \$fbcon
     for k in 0 1 2 3 4 5 6 7; do
         if [ -f "$files/kernel-s\$k.elf" ]; then module2 --nounzip "$files/kernel-s\$k.elf" kernel-s\$k; fi
         if [ -f "$conf/p\$k/dom0/initrd" ]; then module2 --nounzip "$conf/p\$k/dom0/initrd" p\$k:dom0-initrd; fi

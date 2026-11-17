@@ -88,7 +88,7 @@ terminal_input serial
 fbcon=
 if [ "\$fb_console" = 1 ]; then
     terminal_output serial console
-    fbcon=" fb_console"
+    fbcon=fb_console
 else
     terminal_output serial
 fi
@@ -103,7 +103,7 @@ $mk_stanza
 # --nounzip: every module is the file's bytes, which root measures and a
 # verifier hashes. Once gzio is loaded (probing devices loads it, for
 # btrfs, zfs or squash4) GRUB would otherwise gunzip a gzip initramfs.
-multiboot2 (memdisk)/boot/kernel.elf console_port=\$serial_port debug_port=\$serial_port\$fbcon
+multiboot2 (memdisk)/boot/kernel.elf console_port=\$serial_port debug_port=\$serial_port \$fbcon
 module2 --nounzip (memdisk)/boot/l4h-root.elf
 module2 --nounzip (memdisk)/boot/vmlinux guest-kernel
 ${guest_sdk:+module2 --nounzip (memdisk)/boot/sdk.erofs guest-sdk}
