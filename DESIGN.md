@@ -2775,9 +2775,14 @@ root restarts. Root and netd know no device kind. The design is issue
   (`Published::cfg_req`), inside the manifest's windows, past the header,
   and by an allow-list: vendor-specific capabilities (not virtio's, one of
   which reaches a whole BAR), AER's status registers, LTR, L1 PM substates,
-  and in the PCI Express capability Device Control's relaxed ordering and
-  no-snoop bits and Link Control's ASPM bits; root merges the write into
-  the register's other bits.
+  and in the PCI Express capability Device Control's relaxed ordering bit
+  and Link Control's ASPM bits; root merges the write into the register's
+  other bits. Root clears Device Control's Enable No Snoop (on from reset)
+  before each start, and the driver cannot set it: a TLP that does not
+  snoop reads memory past the CPU's caches where the IOMMU does not force
+  snooping (VT-d without Snoop Control; AMD-Vi's entries force coherence),
+  which could return a recycled page's old contents from under the zeroes
+  still in cache.
 - **Confinement.** A nicd is outside the TCB (`confined` in `l4hctl nic
   list`) when the IOMMU is on with interrupt remapping and its device's
   isolation group holds only functions the host does not use or NICs of

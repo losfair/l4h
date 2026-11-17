@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Production console rings, memory-hotplug scheduling and control failure
-# replies, dom0 boot planning, block reservations and service replies, and host log
+# replies, root's filter of NIC drivers' configuration writes, dom0 boot
+# planning, block reservations and service replies, and host log
 # publication, wraparound and concurrent readers/writers. Also exercises
 # endpoint fairness, bounded network batches, VMM CPU budgets, malformed
 # replies, hotplug retries and USB DMA ownership. --qemu
@@ -44,6 +45,8 @@ def function(source, signature):
     return source[start:source.index('\n}', start) + len('\n}')]
 pci = (root / 'host/l4h-root/src/pci.rs').read_text()
 (out / 'pci-identity.inc').write_text('impl Pci {\n' + method(pci, '    pub fn identity(') + '\n}\n')
+nicd = (root / 'host/l4h-root/src/nicd.rs').read_text()
+(out / 'nicd-cfg.inc').write_text(function(nicd, 'fn cap_write_bits('))
 root_main = (root / 'host/l4h-root/src/main.rs').read_text()
 nic_branch = '        } else if nicd::is_network(&d, &nicd::ids_of(&d, &pci), cfg.nic_pin(netd::bdf(&d)).is_some()) {'
 start = root_main.index(nic_branch) + len(nic_branch)
@@ -151,6 +154,9 @@ L4H_PCI_IDENTITY_TEST_SRC="$out/pci-identity.inc" L4H_PCI_OWNERS_TEST_SRC="$out/
     --extern l4h_abi="$out/libl4h_abi.rlib" --extern l4h_host="$out/libl4h_host.rlib" \
     "$root/tests/pci-identity.rs" -o "$out/pci-identity-tests"
 "$out/pci-identity-tests"
+L4H_NICD_CFG_TEST_SRC="$out/nicd-cfg.inc" rustc +stable --edition=2024 --test \
+    "$root/tests/nicd-cfg.rs" -o "$out/nicd-cfg-tests"
+"$out/nicd-cfg-tests"
 rustc +stable --edition=2024 --test -L dependency="$out" \
     --extern l4h_host="$out/libl4h_host.rlib" "$root/tests/mailbox.rs" -o "$out/mailbox-tests"
 "$out/mailbox-tests"

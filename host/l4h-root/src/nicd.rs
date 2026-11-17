@@ -932,7 +932,12 @@ fn spawn(h: &mut Host, i: usize) -> Result<(), &'static str> {
     if n.in_netd {
         n.generation = n.generation.wrapping_add(1);
     }
-    // The device: decoding and bus mastering on, MSI-X on.
+    // The device: No Snoop off, which the driver cannot turn back on
+    // (`cap_write_bits`), then decoding and bus mastering on, MSI-X on.
+    if let Some(c) = pcie_cap(h, &pdev) {
+        let ctl = h.pci.read16(pdev.bus, pdev.dev, pdev.func, c + 8);
+        h.pci.write16(pdev.bus, pdev.dev, pdev.func, c + 8, ctl & !(1 << 11));
+    }
     if legacy_of(&pdev, &m) {
         h.pci.enable_io(&pdev);
     }
@@ -1342,11 +1347,8 @@ pub fn mac(i: usize) -> Option<u64> {
 
 /// The bits of its dword a write of `size` bytes at `off` of NIC `i`'s
 /// function may change, by root's filter: inside the manifest's windows,
-/// past the header, and in no capability but a vendor-specific one (not
-/// virtio's), AER's status registers, LTR, L1 PM substates, or PCI
-/// Express's Device Control relaxed ordering and no-snoop bits and Link
-/// Control's ASPM bits.  None if it may change
-/// nothing.
+/// past the header, and in no capability but those `cap_write_bits`
+/// allows.  None if it may change nothing.
 fn write_allowed(h: &Host, n: &Nic, m: &Manifest, off: u16, size: u16) -> Option<u32> {
     let end = off + size;
     let inside = m.config_writes.iter().any(|w| w.len != 0 && off >= w.offset && end <= w.offset + w.len);
@@ -1357,7 +1359,7 @@ fn write_allowed(h: &Host, n: &Nic, m: &Manifest, off: u16, size: u16) -> Option
     let dword = off & !3;
     // The bytes written, as bits of their dword.
     let shift = (off & 3) * 8;
-    let mut bits = if size == 4 { u32::MAX } else { ((1u32 << (size * 8)) - 1) << shift };
+    let bits = if size == 4 { u32::MAX } else { ((1u32 << (size * 8)) - 1) << shift };
     // Every capability, standard (below 0x100) and extended, by offset;
     // each taken to reach the next one up in its space, or the space's
     // end.  A write must lie inside one the driver may write: no byte
@@ -1389,13 +1391,29 @@ fn write_allowed(h: &Host, n: &Nic, m: &Manifest, off: u16, size: u16) -> Option
     }) else {
         return None;
     };
+    cap_write_bits(id, c, dword, d.vendor, bits)
+}
+
+/// Of `bits`, those of the dword at `dword` a nicd may change in
+/// capability `id` (extended ones marked 0x8000) at `c` of a function of
+/// `vendor`: a vendor-specific one (not virtio's), AER's status
+/// registers, LTR, L1 PM substates, or PCI Express's Device Control
+/// relaxed ordering bit and Link Control's ASPM bits.  None if none.
+fn cap_write_bits(id: u16, c: u16, dword: u16, vendor: u16, mut bits: u32) -> Option<u32> {
     match id {
         // Vendor-specific, but virtio's: one of those (PCI_CFG) reaches
         // the whole of a BAR, past the driver's window.
-        0x09 if d.vendor != 0x1af4 => {}
-        // PCI Express: Device Control's relaxed ordering (4) and no snoop
-        // (11), Link Control's ASPM (0..1); nothing else.
-        0x10 if dword == c + 8 => bits &= 1 << 4 | 1 << 11,
+        0x09 if vendor != 0x1af4 => {}
+        // PCI Express: Device Control's relaxed ordering (4), Link
+        // Control's ASPM (0..1); nothing else.  Not No Snoop (11), which
+        // root clears before each start (`spawn`): a TLP that does not snoop
+        // reads memory past the CPU's caches where the IOMMU does not
+        // force snooping (VT-d without Snoop Control), such as a recycled
+        // page's old contents under the zeroes still in cache.  Nor
+        // Phantom Functions (9), which would have the device use other
+        // functions' requester IDs, nor the payload sizes the bridges
+        // above it were set up for.
+        0x10 if dword == c + 8 => bits &= 1 << 4,
         0x10 if dword == c + 0x10 => bits &= 0b11,
         // AER: its status registers only (write 1 to clear), not the masks
         // or the severities.
