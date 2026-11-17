@@ -22,6 +22,9 @@ bool l4h_objmem_wait(void);
 void l4h_objmem_oom(void);
 /* Is guest RAM [gpa, gpa+size) in the direct map (not an object block)? */
 bool l4h_ram_mapped(unsigned long gpa, unsigned long size);
+/* May page `gpa` be mapped through L4H_FRAME_CPTR (RAM with its frames,
+ * not the kernel's image if `writable`)? */
+bool l4h_frame_mappable(unsigned long gpa, bool writable);
 /* Caller pins the whole aligned RAM block. Zero for boot-image blocks. */
 unsigned long l4h_large_frame(unsigned long gpa);
 void l4h_map_kernel_early(unsigned long frame, unsigned long va);

@@ -350,10 +350,15 @@ unsigned long segv(struct faultinfo fi, unsigned long ip, int is_user,
 	if (!err) {
 		/* No memory for the seL4 objects of the mapping: wait for a
 		 * block to be converted, or else it is guest OOM.  Either way
-		 * the access faults again. */
-		if (l4h_map_fault(current->mm, address) == -ENOMEM && !l4h_objmem_wait())
+		 * the access faults again.  Memory that is no frame of guest
+		 * RAM (a PFNMAP of the I/O pool, /dev/mem past RAM) never
+		 * comes: the access is a bus error, not a loop or an OOM. */
+		err = l4h_map_fault(current->mm, address);
+		if (err == -ENOMEM && !l4h_objmem_wait())
 			l4h_objmem_oom();
-		return 0;
+		if (err != -ENXIO)
+			return 0;
+		err = -EACCES;
 	}
 
 	/* The signal frame needs the registers. */

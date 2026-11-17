@@ -423,8 +423,8 @@ hooks (§10.2), the Android features of §5.8 and x86's
 - Kernel `*_nofault` accesses check that the address is mapped in the
   guest-kernel VSpace, since a fault there stops the guest. The direct map
   has holes where RAM blocks became seL4 objects (§8.3), so its range is
-  checked block by block (`l4h_kernel_range_ok()`, used by `/dev/mem` and
-  BPF `probe_read_kernel`). A block being converted is marked busy first,
+  checked block by block (`l4h_kernel_range_ok()`, used by BPF
+  `probe_read_kernel`). A block being converted is marked busy first,
   and its frames are revoked only once no access that found it mapped is
   still between its check and its access. For the same reason the x86_64
   `load_unaligned_zeropad()` (checksum tails, dcache name hashing,
@@ -1614,6 +1614,12 @@ pool, and host components map only host-owned pages.
   through two levels: root slot `L4H_SLOT_RAM_L1_BASE + n` is a level-1
   CNode (radix 9) for GiB `n`, whose slot `j` holds the level-2 CNode
   (radix 9) of block `512 n + j`, so `L4H_FRAME_CPTR(gpa)` names any frame.
+  The guest copies a frame through it only for RAM with its frames
+  (`l4h_frame_mappable`), and only readable for its kernel's image, whose
+  shared blocks hold read-only frames: past 64 GiB the CPtr names its other
+  root slots, and a page table entry (a driver's PFNMAP) may name any
+  address. A process's access to anything else is a bus error, not a fault
+  that repeats; the guest has no `/dev/mem`.
   The host installs the level-2 CNodes of boot blocks; the guest retypes
   its own for the others. Boot info carries `nr_blocks` and `boot_blocks`.
 - **Guest early boot** (`kernel/caps.c`, `l4h_caps_init`). memblock knows

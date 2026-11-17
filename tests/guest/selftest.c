@@ -23,7 +23,9 @@
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/sysmacros.h>
 #include <sys/time.h>
 #include <sys/uio.h>
 #include <sys/user.h>
@@ -1783,6 +1785,84 @@ static int attest_read_flags(int fd)
 	return ioctl(fd, ATTEST_IOC, &c) < 0 ? -errno : 0;
 }
 
+/*
+ * The exit status of a child that maps `prot` at guest-physical `off`
+ * through `fd` (MAP_SHARED, a PFNMAP), reads it, and, with `write`, writes
+ * it: first mapped readable and read, then made writable, with
+ * `mprotect_first`.
+ */
+static int pfnmap_access(int fd, unsigned long long off, int prot, int write, int mprotect_first)
+{
+	int status;
+	pid_t pid = fork();
+
+	if (pid < 0)
+		return -1;
+	if (pid == 0) {
+		volatile unsigned char *p = mmap(NULL, 4096, mprotect_first ? PROT_READ : prot,
+						 MAP_SHARED, fd, off);
+
+		alarm(10);
+		if (p == MAP_FAILED)
+			_exit(100);
+		(void)p[0];
+		if (mprotect_first && mprotect((void *)p, 4096, prot))
+			_exit(101);
+		if (write)
+			p[0] = p[0];
+		_exit(0);
+	}
+	if (waitpid(pid, &status, 0) != pid)
+		return -1;
+	return status;
+}
+
+/*
+ * There is no /dev/mem.  A user mapping of physical memory that is no
+ * frame of the guest's RAM (a driver's PFNMAP, here the test module's,
+ * past the 64 GiB the RAM CNodes cover, where the frame capability's
+ * address would name the guest kernel's other root slots and its own
+ * CNodes) is a bus error at the first access: never a copy of whatever
+ * capability that address names, nor a fault that repeats for ever or
+ * calls the OOM killer as if memory were short.  Nor is a write to the
+ * kernel's image, whose shared blocks have read-only frames: mapped
+ * writable, or readable and then made writable; reading it works.
+ */
+static void test_pfnmap_unbacked(void)
+{
+	static const unsigned long long offsets[] = { 64ULL << 30, 65ULL << 30, 448ULL << 30, (448ULL << 30) + (5 << 12) };
+	const char *node = "/tmp/selftest-mem";
+	unsigned i;
+	int fd, status;
+
+	unlink(node);
+	CHECK(mknod(node, S_IFCHR | 0600, makedev(1, 1)) == 0, "mknod: %s", strerror(errno));
+	fd = open(node, O_RDONLY);
+	unlink(node);
+	CHECK(fd < 0 && (errno == ENXIO || errno == ENODEV), "/dev/mem: %s", fd < 0 ? strerror(errno) : "opened");
+
+	fd = open("/dev/l4h_page_aging", O_RDWR);
+	if (fd < 0) {
+		printf("  pfnmap_unbacked: skipped (no test module)\n");
+		return;
+	}
+	for (i = 0; i < sizeof(offsets) / sizeof(offsets[0]); i++) {
+		status = pfnmap_access(fd, offsets[i], PROT_READ, 0, 0);
+		CHECK(status >= 0 && WIFSIGNALED(status) && WTERMSIG(status) == SIGBUS,
+		      "PFNMAP at %#llx: status %#x, not SIGBUS", offsets[i], status);
+	}
+	status = pfnmap_access(fd, 0, PROT_READ, 0, 0);
+	CHECK(status >= 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+	      "reading the kernel's image: status %#x", status);
+	status = pfnmap_access(fd, 0, PROT_READ | PROT_WRITE, 1, 0);
+	CHECK(status >= 0 && WIFSIGNALED(status) && WTERMSIG(status) == SIGBUS,
+	      "writing the kernel's image: status %#x, not SIGBUS", status);
+	status = pfnmap_access(fd, 0, PROT_READ | PROT_WRITE, 1, 1);
+	CHECK(status >= 0 && WIFSIGNALED(status) && WTERMSIG(status) == SIGBUS,
+	      "writing the kernel's image after mprotect: status %#x, not SIGBUS", status);
+	close(fd);
+}
+
 static void test_attest_cap(void)
 {
 	struct __user_cap_header_struct h = { .version = _LINUX_CAPABILITY_VERSION_3 };
@@ -1968,6 +2048,7 @@ static const struct test tests[] = {
 	{ "futex_unaligned", test_futex_unaligned },
 	{ "uaccess_kstr", test_uaccess_kernel_strings },
 	{ "attest_cap", test_attest_cap },
+	{ "pfnmap_unbacked", test_pfnmap_unbacked },
 #ifdef __x86_64__
 	{ "sigreturn_efl", test_sigreturn_eflags },
 #endif

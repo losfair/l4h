@@ -63,6 +63,9 @@ CONFIG_BTRFS_FS_POSIX_ACL=y
 # guest events, so it cannot finish on a single vCPU.
 # CONFIG_RAID6_PQ_BENCHMARK is not set
 # CONFIG_VT is not set
+# No /dev/mem: nothing of the guest's physical memory that is not its RAM
+# is for its processes (l4h_frame_mappable refuses it anyway).
+# CONFIG_DEVMEM is not set
 CONFIG_MAGIC_SYSRQ=y
 CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y
 CONFIG_DEBUG_INFO_BTF=y

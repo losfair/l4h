@@ -1007,6 +1007,27 @@ bool l4h_ram_mapped(unsigned long gpa, unsigned long size)
 }
 
 /*
+ * May guest-physical page `gpa` be mapped through L4H_FRAME_CPTR?  Only RAM
+ * whose frames are there.  Past the 64 GiB the RAM CNodes cover, the CPtr
+ * names the guest's other root slots (its process VSpaces, its devices, its
+ * own dynamic CNodes), whose capabilities a copy would hand out as frames;
+ * the I/O pool (the guest has its mappings, never a capability) and object
+ * blocks have none.  A page table entry may name any of these: a PFNMAP of
+ * the I/O pool (usbfs's mmap of a coherent buffer), or a driver's of any
+ * address.  `writable`: and never the kernel's image, below min_low_pfn.
+ * Its shared blocks have read-only frames, which seL4 maps read-only
+ * whatever rights are asked, so a write would fault again for ever; and no
+ * process or nested guest writes the kernel's image anyway.
+ */
+bool l4h_frame_mappable(unsigned long gpa, bool writable)
+{
+	if (writable && (gpa >> PAGE_SHIFT) < min_low_pfn)
+		return false;
+	return gpa < L4H_GPA_END && l4h_ram_mapped(gpa & PAGE_MASK, PAGE_SIZE);
+}
+EXPORT_SYMBOL_GPL(l4h_frame_mappable);
+
+/*
  * A *_nofault access: the check that its range is mapped and the access
  * itself, which faults the guest if a block's frames went in between.  A
  * conversion marks the block BLK_BUSY, then waits for the accesses in
