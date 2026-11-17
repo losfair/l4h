@@ -130,6 +130,25 @@ fn check(hdr: &mut [u8; HDR_SIZE], frame: &[u8], min_mss: usize) -> bool {
             if get16(hdr, 6) != f.tcp || get16(hdr, 8) != 16 {
                 return false;
             }
+            // The IP header's length covers the headers and lies within the
+            // frame, and IPv4 is not a fragment, so that what netd checks
+            // of the frame (ipfilter, steer) is what each segment says.
+            // An IPv6 one may say 0, Linux's for one past 64 KiB.
+            let be = |i: usize| u16::from_be_bytes([frame[i], frame[i + 1]]) as usize;
+            let ip_len = if f.v6 {
+                match be(f.ip + 4) {
+                    0 => None,
+                    n => Some(40 + n),
+                }
+            } else {
+                if be(f.ip + 6) & 0x3fff != 0 {
+                    return false;
+                }
+                Some(be(f.ip + 2))
+            };
+            if ip_len.is_some_and(|n| n < f.hdrs - f.ip || f.ip + n > frame.len()) {
+                return false;
+            }
             put16(hdr, 2, f.hdrs);
             true
         }

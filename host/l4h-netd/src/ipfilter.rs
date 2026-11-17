@@ -24,8 +24,10 @@
 //!   67 or 547, to a client's port, 68 or 546, or a DHCPv6 server's or
 //!   relay's message type to 547) are dropped, whatever their source.
 //! - Everything else is dropped: other EtherTypes, VLAN tags (whose frames
-//!   would carry IP past these checks), malformed headers, and an IPv6
-//!   first fragment whose headers do not reach the upper-layer header.
+//!   would carry IP past these checks), malformed headers, a packet longer
+//!   than its frame, and a first fragment whose headers do not reach the
+//!   whole upper-layer header (UDP's 8 bytes).  Only what the IP length
+//!   covers is looked at: Ethernet padding past it is not a header.
 //!
 //! This file is pure (no netd state, no I/O), so that tests/fuzz-ipfilter
 //! compiles it unchanged.
@@ -180,14 +182,22 @@ fn ip4(f: &Filter, mac: &[u8; 6], p: &[u8]) -> Verdict {
     if ihl < 20 || ihl > p.len() {
         return Verdict::Denied;
     }
+    // The packet is what its Total Length says: what follows is Ethernet
+    // padding, which the receiver drops, and must not pass for headers.
+    let total = be16(p, 2) as usize;
+    if total < ihl || total > p.len() {
+        return Verdict::Denied;
+    }
+    let p = &p[..total];
     let proto = p[9];
     // Only the first fragment has the upper-layer header, whole.
     let first = be16(p, 6) & 0x1fff == 0;
     let more = be16(p, 6) & 0x2000 != 0;
     let l4 = &p[ihl..];
     if first {
+        // The whole UDP header (RFC 7112 has a first fragment carry it).
         let need = match proto {
-            IPPROTO_UDP => 4,
+            IPPROTO_UDP => 8,
             IPPROTO_ICMP => 1,
             _ => 0,
         };
@@ -229,6 +239,14 @@ fn ip6(f: &Filter, mac: &[u8; 6], p: &[u8]) -> Verdict {
     if p.len() < 40 || p[0] >> 4 != 6 {
         return Verdict::Denied;
     }
+    // As for IPv4, the packet ends where its Payload Length says.  A TCP
+    // GSO frame may say 0 (Linux's for one past 64 KiB): it is then the
+    // bare header, which is all TCP needs here, as for its segments.
+    let total = 40 + be16(p, 4) as usize;
+    if total > p.len() {
+        return Verdict::Denied;
+    }
+    let p = &p[..total];
     let src: [u8; 16] = p[8..24].try_into().unwrap();
     let (mut nh, mut off) = (p[6], 40);
     // The upper-layer header, unless this is a later fragment.
@@ -266,7 +284,7 @@ fn ip6(f: &Filter, mac: &[u8; 6], p: &[u8]) -> Verdict {
     let mut icmp = None;
     if first {
         match nh {
-            IPPROTO_UDP if l4.len() < 4 || be16(l4, 0) == 547 || be16(l4, 2) == 546 => return Verdict::Denied,
+            IPPROTO_UDP if l4.len() < 8 || be16(l4, 0) == 547 || be16(l4, 2) == 546 => return Verdict::Denied,
             IPPROTO_UDP if be16(l4, 2) == 547 && l4.get(8).is_none_or(|&t| dhcp6_server_type(t)) => {
                 return Verdict::Denied;
             }

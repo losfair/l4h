@@ -847,6 +847,93 @@ mod tests {
         assert_eq!(forward(&f, &mut frame.clone(), &mut mac), None);
     }
 
+    /// Ethernet pads a short frame, and the receiver drops what is past
+    /// the IP length: a header there is not one.  A first fragment that
+    /// stops short of its upper-layer header, with a harmless one in the
+    /// padding, would pass while the real one comes in a later fragment.
+    #[test]
+    fn padding_is_not_a_header() {
+        let f = filter();
+        // IPv6: a first fragment of just its Fragment header, the padding
+        // holding a client's DHCPv6 Solicit, or an Echo Request.
+        let mut sol = udp(546, 547);
+        sol[8] = 1;
+        for (nh, hidden) in [(17, sol), (58, icmp(128))] {
+            let mut fr = eth(MAC, 0x86dd, &ip6(v6(5), 44, &frag6(nh, 0)));
+            // Whole, the same packet passes.
+            let mut whole = frag6(nh, 0);
+            whole.extend_from_slice(&hidden);
+            assert_eq!(check(&f, &v6_frame(v6(5), 44, &whole)), Pass, "{nh}");
+            fr[14 + 4..14 + 6].copy_from_slice(&8u16.to_be_bytes());
+            fr.extend_from_slice(&hidden);
+            assert_eq!(check(&f, &fr), Denied, "{nh} in the padding");
+        }
+        // A Payload Length past the frame.
+        let mut long = v6_frame(v6(5), 6, &tcp(0));
+        long[14 + 4..14 + 6].copy_from_slice(&21u16.to_be_bytes());
+        assert_eq!(check(&f, &long), Denied);
+        // IPv4: a UDP first fragment of 4 bytes, ports only, the rest of
+        // its header in the padding; and a Total Length past the frame,
+        // or short of the header.
+        let mut short = eth(MAC, 0x0800, &ip4([10, 0, 0, 5], 17, 0x2000, 0, &udp(4000, 53)[..4]));
+        assert_eq!(check(&f, &short), Denied);
+        short.extend_from_slice(&[0; 4]);
+        assert_eq!(check(&f, &short), Denied);
+        let mut over = v4_frame([10, 0, 0, 5], 6, &tcp(0));
+        over[14 + 2..14 + 4].copy_from_slice(&41u16.to_be_bytes());
+        assert_eq!(check(&f, &over), Denied);
+        over[14 + 2..14 + 4].copy_from_slice(&19u16.to_be_bytes());
+        assert_eq!(check(&f, &over), Denied);
+        // A short IPv4 packet padded to Ethernet's minimum is fine.
+        let mut padded = v4_frame([10, 0, 0, 5], 17, &udp(4000, 53));
+        padded.resize(60, 0);
+        assert_eq!(check(&f, &padded), Pass);
+        // A DHCP server's header hidden past an ICMP echo's Total Length
+        // is not looked at either way: the echo passes.
+        let mut echo = v4_frame([10, 0, 0, 5], 1, &icmp(8));
+        echo.extend_from_slice(&udp(67, 68));
+        assert_eq!(check(&f, &echo), Pass);
+    }
+
+    /// A GSO frame's IP lengths must describe it, and IPv4's must not be
+    /// a fragment: sanitize refuses one that does not.
+    #[test]
+    fn gso_frames_with_lengths_that_do_not_describe_them() {
+        let gso = |frame: &[u8], t: u8| {
+            let mut h = [0u8; HDR_SIZE];
+            h[0] = F_NEEDS_CSUM;
+            h[1] = t;
+            let l4 = if t == GSO_TCPV6 { 54 } else { 34 };
+            h[4..6].copy_from_slice(&536u16.to_le_bytes());
+            h[6..8].copy_from_slice(&(l4 as u16).to_le_bytes());
+            h[8..10].copy_from_slice(&16u16.to_le_bytes());
+            offload::sanitize(&mut h, frame)
+        };
+        let v4f = v4_frame([10, 0, 0, 5], 6, &tcp(3000));
+        assert!(gso(&v4f, GSO_TCPV4));
+        let mut bad = v4f.clone();
+        bad[14 + 2..14 + 4].copy_from_slice(&((v4f.len() - 14 + 1) as u16).to_be_bytes());
+        assert!(!gso(&bad, GSO_TCPV4));
+        bad[14 + 2..14 + 4].copy_from_slice(&39u16.to_be_bytes());
+        assert!(!gso(&bad, GSO_TCPV4));
+        let mut frag = v4f.clone();
+        frag[14 + 6] = 0x20;
+        assert!(!gso(&frag, GSO_TCPV4));
+        frag[14 + 6] = 0x40; // DF is fine
+        assert!(gso(&frag, GSO_TCPV4));
+        let v6f = v6_frame(v6(5), 6, &tcp(3000));
+        assert!(gso(&v6f, GSO_TCPV6));
+        let mut zero = v6f.clone();
+        zero[14 + 4..14 + 6].copy_from_slice(&[0, 0]);
+        assert!(gso(&zero, GSO_TCPV6));
+        assert_eq!(check(&filter(), &zero), Pass);
+        let mut bad = v6f.clone();
+        bad[14 + 4..14 + 6].copy_from_slice(&((v6f.len() - 54 + 1) as u16).to_be_bytes());
+        assert!(!gso(&bad, GSO_TCPV6));
+        bad[14 + 4..14 + 6].copy_from_slice(&19u16.to_be_bytes());
+        assert!(!gso(&bad, GSO_TCPV6));
+    }
+
     #[test]
     fn random_frames() {
         let mut rng = Rng(0x1234_5678_9abc_def1);

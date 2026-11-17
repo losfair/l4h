@@ -323,6 +323,13 @@ fn tcp_frame(rng: &mut Rng, v6: bool, vlan: bool, payload: usize, mss: usize) ->
     for _ in 0..payload {
         f.push(rng.next() as u8);
     }
+    // The IP length, as a sender sets it (what sanitize checks).
+    let (ip, len) = (if vlan { 18 } else { 14 }, f.len());
+    if v6 {
+        f[ip + 4..ip + 6].copy_from_slice(&((len - ip - 40) as u16).to_be_bytes());
+    } else {
+        f[ip + 2..ip + 4].copy_from_slice(&((len - ip) as u16).to_be_bytes());
+    }
     let mut h = [0u8; 12];
     h[0] = offload::F_NEEDS_CSUM;
     h[1] = if v6 { offload::GSO_TCPV6 } else { offload::GSO_TCPV4 };
@@ -365,6 +372,30 @@ fn offload_check(rng: &mut Rng, n: u64) -> u64 {
         let (frame, mut hdr) = tcp_frame(rng, v6, vlan, payload, mss);
         assert!(offload::sanitize(&mut hdr, &frame), "valid GSO frame refused");
         let t = offload::parse_tcp(&frame).unwrap();
+        // An IP length past the frame or short of the headers, or an IPv4
+        // fragment, is refused: netd checks what segments will say.
+        {
+            let at = if v6 { t.ip + 4 } else { t.ip + 2 };
+            let whole = u16::from_be_bytes([frame[at], frame[at + 1]]);
+            let short = if v6 { 19 } else { 39 };
+            for bad in [whole.wrapping_add(1), short] {
+                let mut f = frame.clone();
+                f[at..at + 2].copy_from_slice(&bad.to_be_bytes());
+                if !(v6 && bad == 0) {
+                    assert!(!offload::sanitize(&mut hdr.clone(), &f), "GSO IP length {bad} of {whole} taken");
+                }
+            }
+            if v6 {
+                // 0: Linux's for a frame past 64 KiB.
+                let mut f = frame.clone();
+                f[at..at + 2].copy_from_slice(&[0, 0]);
+                assert!(offload::sanitize(&mut hdr.clone(), &f), "GSO IPv6 payload length 0 refused");
+            } else {
+                let mut f = frame.clone();
+                f[t.ip + 6] |= 0x20;
+                assert!(!offload::sanitize(&mut hdr.clone(), &f), "IPv4 GSO fragment taken");
+            }
+        }
         let mut got = Vec::new();
         let mut count = 0;
         offload::segment(&frame, &hdr, &mut buf, |f, h| {
