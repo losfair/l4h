@@ -3075,8 +3075,10 @@ Common behaviour:
   descriptors and a completion word; older units use register invalidation
   if they support draining. Maps invalidate cached misses; unmaps invalidate
   the domain's IOTLB and wait for DMA reads and writes to drain.
-  Noncoherent table walkers get CLFLUSH and barriers. Command errors or a
-  one-second timeout stop root.
+  Noncoherent table walkers get CLFLUSH and barriers; with several
+  partitions, partition 0 writes the shim's zeroed root table and interrupt
+  remapping table in the shared region back from its caches before it
+  points a unit at them. Command errors or a one-second timeout stop root.
 - **Interrupts.** When firmware and every unit support it, root enables
   remapping with a 256-entry table per unit; each IRTE permits exactly one
   requester ID and vector (SHV=0 in the MSI address). Bridge aliases apply

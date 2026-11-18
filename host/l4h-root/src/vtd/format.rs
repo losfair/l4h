@@ -23,6 +23,22 @@ pub fn context(root: usize, domain: u16, levels: u8) -> [u64; 2] {
 pub const IR_SHARED_ENTRIES: usize = 2048;
 pub const IR_SHARED_SIZE: u64 = 10;
 
+/// A shared unit's pages (iommu/shared.rs, IOMMU_UNIT_SIZE bytes): its
+/// root table, its invalidation queue and its interrupt remapping table.
+pub const SHARED_ROOT: usize = 0;
+pub const SHARED_QUEUE: usize = 1;
+pub const SHARED_IRT: usize = 8;
+/// What of a shared unit's pages the unit walks as tables, as (byte
+/// offset, length): the whole root table, 256 buses' entries, and the
+/// whole interrupt remapping table.  The shim zeroed them with cached
+/// stores, and a noncoherent unit (ECAP.C = 0) reads memory, not the
+/// caches: partition 0 writes them back before it points the unit at
+/// them, or the unit could take stale memory for a present context table
+/// of a bus root never fills in, or for a present IRTE.  (Queued
+/// invalidation is coherent; context tables are written back as made.)
+pub const SHARED_WALKED: [(usize, usize); 2] =
+    [(SHARED_ROOT * 4096, 256 * 16), (SHARED_IRT * 4096, IR_SHARED_ENTRIES * 16)];
+
 /// Fixed, edge-triggered, physical delivery to xAPIC ID `dest` (the
 /// partition's first CPU, else 0), with exact requester-ID validation
 /// (SVT=01, SQ=00). No posted interrupts.

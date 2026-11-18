@@ -419,3 +419,28 @@ fn dma_ranges_cannot_wrap_or_alias_upper_address_bits() {
     assert_eq!(format::WRITE, 2);
     assert_eq!(format::SNOOP, 1 << 11);
 }
+
+#[test]
+fn shared_tables_are_written_back_whole_before_the_unit_walks_them() {
+    // The whole root table (256 buses' 16-byte entries) and every entry
+    // of the interrupt remapping table, inside the unit's 64 KiB
+    // (l4h_partition::IOMMU_UNIT_SIZE) and clear of its queue page.
+    let walked = format::SHARED_WALKED;
+    assert!(walked.contains(&(format::SHARED_ROOT * 4096, 4096)));
+    assert!(walked.contains(&(format::SHARED_IRT * 4096, 16 << (format::IR_SHARED_SIZE + 1))));
+    let queue = format::SHARED_QUEUE * 4096..(format::SHARED_QUEUE + 1) * 4096;
+    for (off, len) in walked {
+        assert!(off + len <= 64 << 10, "{off:#x}+{len:#x}");
+        assert!(off + len <= queue.start || off >= queue.end, "{off:#x}+{len:#x}");
+    }
+    // Partition 0 writes them back in enable(), for a shared unit, before
+    // any context entry is made or RTADDR and IRTA point the unit at them.
+    let src = include_str!("../host/l4h-root/src/vtd.rs");
+    let enable = &src[src.find("fn enable(").unwrap()..];
+    let enable = &enable[..enable.find("\n    }\n").unwrap()];
+    let flush = enable.find("for (off, len) in format::SHARED_WALKED").expect("enable() writes back the shared tables");
+    assert!(enable[flush..].contains("self.flush_cpu(unit + off, len)"));
+    for later in ["self.context_table(", "w64(RTADDR", "w64(IRTA"] {
+        assert!(flush < enable.find(later).unwrap(), "{later} before the write-back");
+    }
+}
