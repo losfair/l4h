@@ -39,6 +39,7 @@ extern crate alloc;
 mod aml;
 mod cbor;
 mod flags;
+mod key;
 mod relay;
 mod time;
 mod tpm;
@@ -541,7 +542,8 @@ fn serve(state: &mut Option<State>, relay: &mut Relay, served: &mut [Served; tru
             let r = match (local, head.op) {
                 (None, _) => Err(ENODEV),
                 (Some(l), trust::RELAY_KEY) => match <&[u8; 65]>::try_from(m.data) {
-                    Ok(p) if p[0] == 4 => l.quote_key(from, p, out),
+                    // On the curve, before PCR 15 binds it for good.
+                    Ok(p) if key::partition_key_ok(p) => l.quote_key(from, p, out),
                     _ => Err(EINVAL),
                 },
                 (Some(l), trust::RELAY_ACTIVATE) => {

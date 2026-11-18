@@ -1,0 +1,9 @@
+[package]
+name = "trustd-key"
+edition = "2024"
+license = "GPL-2.0-only"
+version = "0.1.0"
+description = "trustd's check of another partition's key (host/l4h-trustd/src/key.rs)"
+
+[dependencies]
+p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
