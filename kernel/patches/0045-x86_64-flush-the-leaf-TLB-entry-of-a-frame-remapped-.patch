@@ -1,0 +1,87 @@
+From 27f7cfc507f52d17bf03c7e8b76bc4095bd569ae Mon Sep 17 00:00:00 2001
+From: l4h <l4h@localhost>
+Date: Wed, 18 Nov 2026 14:30:29 +0000
+Subject: [PATCH] x86_64: flush the leaf TLB entry of a frame remapped in place
+
+Remapping a present 4 KiB, 2 MiB or 1 GiB leaf in place (a rights change of the same frame, or a different frame at the same address) only invalidated the paging-structure caches.  With PCIDs that reloads CR3 for the ASID and so flushes everything, but without them (the xapic-nopcid kernel) it is an INVLPG of address 0, which leaves the leaf entry of the remapped address cached on every core running the VSpace, the local one included when the caller remaps its own VSpace.  Write-protecting a page or a large page (fork, mprotect) then left it writable for the threads of the process on other cores.  Invalidate the translation of the remapped address on every core the VSpace ran on instead.
+---
+ src/arch/x86/64/kernel/vspace.c | 14 ++++++++++++--
+ src/arch/x86/kernel/vspace.c    | 20 +++++++++++++++++---
+ 2 files changed, 29 insertions(+), 5 deletions(-)
+
+diff --git a/src/arch/x86/64/kernel/vspace.c b/src/arch/x86/64/kernel/vspace.c
+index 20b860a47..6fefe9d5f 100644
+--- a/src/arch/x86/64/kernel/vspace.c
++++ b/src/arch/x86/64/kernel/vspace.c
+@@ -1482,9 +1482,18 @@ bool_t modeUnmapPage(vm_page_size_t page_size, vspace_root_t *vroot, vptr_t vadd
+     return false;
+ }
+ 
+-static exception_t updatePDPTE(asid_t asid, pdpte_t pdpte, pdpte_t *pdptSlot, vspace_root_t *vspace)
++static exception_t updatePDPTE(asid_t asid, vptr_t vaddr, pdpte_t pdpte, pdpte_t *pdptSlot,
++                               vspace_root_t *vspace)
+ {
++    pdpte_t old = *pdptSlot;
++
+     *pdptSlot = pdpte;
++    /* A huge leaf replaced in place may be cached on every core the VSpace
++     * ran on: without PCIDs the paging-structure invalidation leaves it. */
++    if (pdpte_get_page_size(old) == pdpte_pdpte_1g && pdpte_pdpte_1g_get_present(old)) {
++        invalidateTranslationSingleASID(vaddr, asid, SMP_TERNARY(tlb_bitmap_get(vspace), 0));
++        return EXCEPTION_NONE;
++    }
+     invalidatePageStructureCacheASID(pptr_to_paddr(vspace), asid,
+                                      SMP_TERNARY(tlb_bitmap_get(vspace), 0));
+     return EXCEPTION_NONE;
+@@ -1493,7 +1502,8 @@ static exception_t updatePDPTE(asid_t asid, pdpte_t pdpte, pdpte_t *pdptSlot, vs
+ static exception_t performX64ModeMap(cap_t cap, cte_t *ctSlot, pdpte_t pdpte, pdpte_t *pdptSlot, vspace_root_t *vspace)
+ {
+     ctSlot->cap = cap;
+-    return updatePDPTE(cap_frame_cap_get_capFMappedASID(cap), pdpte, pdptSlot, vspace);
++    return updatePDPTE(cap_frame_cap_get_capFMappedASID(cap), cap_frame_cap_get_capFMappedAddress(cap),
++                       pdpte, pdptSlot, vspace);
+ }
+ 
+ struct create_mapping_pdpte_return {
+diff --git a/src/arch/x86/kernel/vspace.c b/src/arch/x86/kernel/vspace.c
+index a2047b2e3..f571d916b 100644
+--- a/src/arch/x86/kernel/vspace.c
++++ b/src/arch/x86/kernel/vspace.c
+@@ -874,17 +874,31 @@ static exception_t performX86PageInvocationMapPTE(cap_t cap, cte_t *ctSlot, pte_
+     if (deferFlush && pteRightsLowered(old, pte)) {
+         return EXCEPTION_NONE;
+     }
+-    invalidatePageStructureCacheASID(pptr_to_paddr(vspace), asid,
+-                                     SMP_TERNARY(tlb_bitmap_get(vspace), 0));
++    /* The old leaf may be cached on every core the VSpace ran on, including
++     * those running it now.  Without PCIDs, invalidating the paging-structure
++     * caches is only an INVLPG of address 0 there: it leaves that entry. */
++    invalidateTranslationSingleASID(cap_frame_cap_get_capFMappedAddress(cap), asid,
++                                    SMP_TERNARY(tlb_bitmap_get(vspace), 0));
+     return EXCEPTION_NONE;
+ }
+ 
+ static exception_t performX86PageInvocationMapPDE(cap_t cap, cte_t *ctSlot, pde_t *pdSlot, pde_t pde,
+                                                   vspace_root_t *vspace)
+ {
++    pde_t old = *pdSlot;
++    asid_t asid = cap_frame_cap_get_capFMappedASID(cap);
++
+     ctSlot->cap = cap;
+     *pdSlot = pde;
+-    invalidatePageStructureCacheASID(pptr_to_paddr(vspace), cap_frame_cap_get_capFMappedASID(cap),
++    /* A large leaf replaced in place (a remap that changes its rights) may be
++     * cached, like a small one (performX86PageInvocationMapPTE()).  The slot
++     * holds no page table here (createSafeMappingEntries_PDE()). */
++    if (pde_get_page_size(old) == pde_pde_large && pde_pde_large_get_present(old)) {
++        invalidateTranslationSingleASID(cap_frame_cap_get_capFMappedAddress(cap), asid,
++                                        SMP_TERNARY(tlb_bitmap_get(vspace), 0));
++        return EXCEPTION_NONE;
++    }
++    invalidatePageStructureCacheASID(pptr_to_paddr(vspace), asid,
+                                      SMP_TERNARY(tlb_bitmap_get(vspace), 0));
+     return EXCEPTION_NONE;
+ }
+-- 
+2.47.3
+

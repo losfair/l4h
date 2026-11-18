@@ -719,45 +719,12 @@ impl Pci {
     }
 
     fn probe_bars(&self, bus: u8, dev: u8, func: u8) -> [Bar; 6] {
-        let mut bars = [Bar::default(); 6];
         let cmd = self.read16(bus, dev, func, 4);
         // Disable decoding while sizing.
         self.write16(bus, dev, func, 4, cmd & !3);
-        let mut i = 0;
-        while i < 6 {
-            let off = 0x10 + 4 * i as u8;
-            let orig = self.read32(bus, dev, func, off);
-            if orig & 1 != 0 {
-                self.write32(bus, dev, func, off, 0xffff_ffff);
-                let sz = self.read32(bus, dev, func, off) & !3;
-                self.write32(bus, dev, func, off, orig);
-                if sz != 0 {
-                    bars[i] = Bar { addr: (orig & !3) as u64, size: ((!sz).wrapping_add(1) & 0xffff) as u64, is_io: true };
-                }
-                i += 1;
-                continue;
-            }
-            let is64 = (orig >> 1) & 3 == 2;
-            self.write32(bus, dev, func, off, 0xffff_ffff);
-            let lo = self.read32(bus, dev, func, off) & !0xf;
-            self.write32(bus, dev, func, off, orig);
-            let mut addr = (orig & !0xf) as u64;
-            let mut mask = lo as u64 | 0xffff_ffff_0000_0000;
-            if is64 {
-                let orig_hi = self.read32(bus, dev, func, off + 4);
-                self.write32(bus, dev, func, off + 4, 0xffff_ffff);
-                let hi = self.read32(bus, dev, func, off + 4);
-                self.write32(bus, dev, func, off + 4, orig_hi);
-                addr |= (orig_hi as u64) << 32;
-                mask = ((hi as u64) << 32) | lo as u64;
-            }
-            if lo != 0 {
-                bars[i] = Bar { addr, size: (!mask).wrapping_add(1), is_io: false };
-            }
-            i += if is64 { 2 } else { 1 };
-        }
+        let sized = crate::barsize::size_bars(6, |off| self.read32(bus, dev, func, off), |off, v| self.write32(bus, dev, func, off, v));
         self.write16(bus, dev, func, 4, cmd);
-        bars
+        sized.map(|b| b.map_or(Bar::default(), |b| Bar { addr: b.addr, size: b.size, is_io: b.is_io }))
     }
 
     /// The MSI-X table and pending bits of `d`, where its BARs put them.

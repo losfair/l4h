@@ -373,13 +373,15 @@ fn offload_check(rng: &mut Rng, n: u64) -> u64 {
         let sent = hdr;
         assert!(offload::sanitize(&mut hdr, &frame), "valid GSO frame refused");
         let t = offload::parse_tcp(&frame).unwrap();
-        // An IP length past the frame or short of the headers, or an IPv4
-        // fragment, is refused: netd checks what segments will say.
+        // An IP length past the frame, short of its end (bytes a receiver
+        // taking the frame whole would trim, and segment would send) or of
+        // the headers, or an IPv4 fragment, is refused: netd checks what
+        // segments will say.
         {
             let at = if v6 { t.ip + 4 } else { t.ip + 2 };
             let whole = u16::from_be_bytes([frame[at], frame[at + 1]]);
             let short = if v6 { 19 } else { 39 };
-            for bad in [whole.wrapping_add(1), short] {
+            for bad in [whole.wrapping_add(1), whole.wrapping_sub(1), short] {
                 let mut f = frame.clone();
                 f[at..at + 2].copy_from_slice(&bad.to_be_bytes());
                 if !(v6 && bad == 0) {

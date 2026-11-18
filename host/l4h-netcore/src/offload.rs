@@ -159,23 +159,7 @@ fn check(hdr: &mut [u8; HDR_SIZE], frame: &[u8], min_mss: usize) -> bool {
             if get16(hdr, 6) != f.tcp || get16(hdr, 8) != 16 {
                 return false;
             }
-            // The IP header's length covers the headers and lies within the
-            // frame, and IPv4 is not a fragment, so that what netd checks
-            // of the frame (ipfilter, steer) is what each segment says.
-            // An IPv6 one may say 0, Linux's for one past 64 KiB.
-            let be = |i: usize| u16::from_be_bytes([frame[i], frame[i + 1]]) as usize;
-            let ip_len = if f.v6 {
-                match be(f.ip + 4) {
-                    0 => None,
-                    n => Some(40 + n),
-                }
-            } else {
-                if be(f.ip + 6) & 0x3fff != 0 {
-                    return false;
-                }
-                Some(be(f.ip + 2))
-            };
-            if ip_len.is_some_and(|n| n < f.hdrs - f.ip || f.ip + n > frame.len()) {
+            if !gso_ip_ok(frame, &f) {
                 return false;
             }
             // Too small to be GSO (Linux's virtio_net_hdr_to_skb): a frame
@@ -197,6 +181,23 @@ fn check(hdr: &mut [u8; HDR_SIZE], frame: &[u8], min_mss: usize) -> bool {
     }
 }
 
+/// Whether the IP header of GSO frame `frame` (TCP headers `f`) says
+/// what the frame is: IPv4 not a fragment, and the IP length ends where
+/// the frame does (an IPv6 one may say 0, Linux's for one past 64 KiB).
+/// What netd checks of the frame (ipfilter, steer) is then what each
+/// segment says, and a receiver taking the frame whole, which trims it to
+/// that length, gets the bytes `segment` and a device's TSO would send.
+fn gso_ip_ok(frame: &[u8], f: &TcpFrame) -> bool {
+    let be = |i: usize| u16::from_be_bytes([frame[i], frame[i + 1]]) as usize;
+    if f.v6 {
+        return match be(f.ip + 4) {
+            0 => true,
+            n => f.ip + 40 + n == frame.len(),
+        };
+    }
+    be(f.ip + 6) & 0x3fff == 0 && f.ip + be(f.ip + 2) == frame.len()
+}
+
 pub const F_DATA_VALID: u8 = 2;
 
 /// Check and normalise the header that came with a received `frame`: as
@@ -216,6 +217,23 @@ pub fn sanitize_rx(hdr: &mut [u8; HDR_SIZE], frame: &[u8], min_mss: usize) -> bo
         hdr[0] |= valid;
     }
     true
+}
+
+/// Whether an uplink's GSO frame that `sanitize_rx` refused for want of
+/// NEEDS_CSUM (a device's received run, its checksum complete) may be cut
+/// into segments with checksums of their own (`segment`): `hdr`, as it
+/// came from the device, describes the frame as `sanitize_rx` requires
+/// of a GSO frame, and its checksums hold, by the device's word
+/// (DATA_VALID) or checked here.  Any other frame is dropped: `segment`
+/// would give a frame that is corrupt, or not the TCP its header says,
+/// good checksums.
+pub fn valid_rx_gso(hdr: &[u8; HDR_SIZE], frame: &[u8], min_mss: usize) -> bool {
+    let t = hdr[1] & !GSO_ECN;
+    if hdr[0] & F_NEEDS_CSUM != 0 || !matches!(t, GSO_TCPV4 | GSO_TCPV6) || get16(hdr, 4) < min_mss.max(1) {
+        return false;
+    }
+    let Some(f) = parse_tcp(frame) else { return false };
+    f.v6 == (t == GSO_TCPV6) && frame.len() > f.hdrs && gso_ip_ok(frame, &f) && csum_ok(frame, hdr, &f)
 }
 
 pub fn is_gso(hdr: &[u8; HDR_SIZE]) -> bool {
@@ -703,4 +721,98 @@ mod tests {
         assert!(sanitize(&mut csum(18, 0), &f));
         assert!(!sanitize(&mut csum(14, 0), &f[..13]));
     }
+
+    /// A GSO frame's IP length is the frame's: bytes past it would be
+    /// trimmed by a receiver that takes the frame whole and sent by one
+    /// that cuts it.
+    #[test]
+    fn gso_frames_end_where_their_ip_length_does() {
+        let (mut f, len, h) = gso_frame(3000, 1448);
+        // Trailing bytes the IP length leaves out.
+        let short = (len - 14 - 100) as u16;
+        f[16..18].copy_from_slice(&short.to_be_bytes());
+        assert!(!sanitize(&mut h.clone(), &f[..len]));
+        assert!(!sanitize_rx(&mut h.clone(), &f[..len], UPLINK_MIN_MSS));
+        // Only the headers.
+        f[16..18].copy_from_slice(&40u16.to_be_bytes());
+        assert!(!sanitize(&mut h.clone(), &f[..len]));
+        // Past the frame.
+        f[16..18].copy_from_slice(&((len - 14 + 1) as u16).to_be_bytes());
+        assert!(!sanitize(&mut h.clone(), &f[..len]));
+        f[16..18].copy_from_slice(&((len - 14) as u16).to_be_bytes());
+        assert!(sanitize(&mut h.clone(), &f[..len]));
+    }
+
+    /// `gso_frame`'s frame as a device received it: complete checksums,
+    /// no offload but the GSO type and size.
+    fn received_gso(payload: usize, mss: usize) -> ([u8; 54 + 4000], usize, [u8; HDR_SIZE]) {
+        let (mut f, len, _) = gso_frame(payload, mss);
+        let c = !fold(sum(0, &f[14..34]));
+        f[24..26].copy_from_slice(&c.to_be_bytes());
+        f[50..52].copy_from_slice(&[0, 0]);
+        let t = parse_tcp(&f[..len]).unwrap();
+        let c = !fold(sum(pseudo(&f[..len], &t, len - t.tcp), &f[t.tcp..len]));
+        f[50..52].copy_from_slice(&c.to_be_bytes());
+        let mut h = [0u8; HDR_SIZE];
+        h[1] = GSO_TCPV4;
+        put16(&mut h, 4, mss);
+        (f, len, h)
+    }
+
+    /// An uplink's GSO frame without NEEDS_CSUM is segmented only if it is
+    /// the TCP it says and its checksums hold.
+    #[test]
+    fn received_gso_frames_are_cut_only_when_valid() {
+        let (f, len, h) = received_gso(3000, 1448);
+        let frame = &f[..len];
+        assert!(!sanitize_rx(&mut h.clone(), frame, UPLINK_MIN_MSS));
+        assert!(valid_rx_gso(&h, frame, UPLINK_MIN_MSS));
+        let mut segs = 0;
+        segment(frame, &h, &mut [0u8; 2048], |seg, sh| {
+            assert!(csum_ok(seg, sh, &parse_tcp(seg).unwrap()));
+            segs += 1;
+        });
+        assert_eq!(segs, 3);
+        // A bad TCP checksum, or a bad IPv4 header checksum: dropped,
+        // unless the device checked them (DATA_VALID).
+        for at in [50, 24] {
+            let mut bad = f;
+            bad[at] ^= 0x40;
+            assert!(!valid_rx_gso(&h, &bad[..len], UPLINK_MIN_MSS), "{at}");
+            let mut dv = h;
+            dv[0] = F_DATA_VALID;
+            assert!(valid_rx_gso(&dv, &bad[..len], UPLINK_MIN_MSS), "{at}");
+        }
+        // An IPv4 fragment, with its checksum fixed.
+        let mut frag = f;
+        frag[20] |= 0x20;
+        frag[24..26].copy_from_slice(&[0, 0]);
+        let c = !fold(sum(0, &frag[14..34]));
+        frag[24..26].copy_from_slice(&c.to_be_bytes());
+        assert!(!valid_rx_gso(&h, &frag[..len], UPLINK_MIN_MSS));
+        // Not TCP over the IP version it says, not a TCP type, no size.
+        for (t, mss) in [(GSO_TCPV6, 1448), (3, 1448), (0x7f, 1448), (GSO_NONE, 1448), (GSO_TCPV4, 0)] {
+            let mut x = h;
+            x[1] = t;
+            put16(&mut x, 4, mss);
+            assert!(!valid_rx_gso(&x, frame, UPLINK_MIN_MSS), "{t} {mss}");
+        }
+        // NEEDS_CSUM is sanitize_rx's to take or refuse.
+        let mut x = h;
+        x[0] = F_NEEDS_CSUM;
+        assert!(!valid_rx_gso(&x, frame, UPLINK_MIN_MSS));
+        // Bytes past the IP length, checksummed as received.
+        let (mut g, glen, gh) = received_gso(3000, 1448);
+        g[16..18].copy_from_slice(&((glen - 14 - 100) as u16).to_be_bytes());
+        g[24..26].copy_from_slice(&[0, 0]);
+        let c = !fold(sum(0, &g[14..34]));
+        g[24..26].copy_from_slice(&c.to_be_bytes());
+        let mut dv = gh;
+        dv[0] = F_DATA_VALID;
+        assert!(!valid_rx_gso(&dv, &g[..glen], UPLINK_MIN_MSS));
+        // Headers alone.
+        let (f, len, h) = received_gso(0, 1448);
+        assert!(!valid_rx_gso(&h, &f[..len], UPLINK_MIN_MSS));
+    }
+
 }

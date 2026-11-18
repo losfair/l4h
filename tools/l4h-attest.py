@@ -93,6 +93,12 @@ class Fail(Exception):
 MALFORMED = (KeyError, IndexError, TypeError, ValueError, AttributeError, struct.error)
 
 
+def is_int(x):
+    """A CBOR integer: not a CBOR true or false, which Python's bool, an
+    int that equals 1 or 0, would let through."""
+    return type(x) is int
+
+
 def checked(what):
     """Make `what` input that a function cannot parse a Fail."""
     def wrap(f):
@@ -230,39 +236,61 @@ def tpm_name(public):
     return public[2:4] + hashlib.sha256(public).digest()
 
 
+# TPMT_SYM_DEF_OBJECT: a symmetric algorithm of an object (TPMI_ALG_SYM_OBJECT,
+# TPM 2.0 Part 2, 9.27), with key bits and mode, or TPM_ALG_NULL.  XOR is
+# no object's.
+SYM_OBJECT = {0x0006, 0x0013, 0x0026}  # AES, SM4, CAMELLIA
+# The bytes of the details of an asymmetric scheme after its algorithm
+# (TPMU_ASYM_SCHEME): a hash algorithm, also a count for ECDAA, nothing for
+# RSAES.  TPM_ALG_NULL has none.
+RSA_SCHEMES = {0x0010: 0, 0x0014: 2, 0x0015: 0, 0x0016: 2, 0x0017: 2}
+ECC_SCHEMES = {0x0010: 0, 0x0018: 2, 0x0019: 2, 0x001A: 4, 0x001B: 2, 0x001C: 2, 0x001D: 2}
+# TPMT_KDF_SCHEME: MGF1, KDF1_SP800_56A, KDF2, KDF1_SP800_108, with a hash.
+KDF_SCHEMES = {0x0010: 0, 0x0007: 2, 0x0020: 2, 0x0021: 2, 0x0022: 2}
+
+
+def tpm_scheme(r, known, what):
+    alg = r.u16()
+    if alg not in known:
+        raise Fail("unknown %s %#x" % (what, alg))
+    r.take(known[alg])
+
+
+def tpm_end(r, what):
+    if r.at != len(r.b):
+        raise Fail("trailing bytes after the %s" % what)
+
+
 @checked("TPM public area")
 def parse_public(public):
     """(attributes, key) of a TPMT_PUBLIC with an RSA or ECC P-256 key."""
     r = Reader(public)
     alg, _name_alg, attrs = r.u16(), r.u16(), r.u32()
     r.tpm2b()  # authPolicy
+    if alg not in (0x0001, 0x0023):
+        raise Fail("unsupported key type %#x" % alg)
+    sym = r.u16()
+    if sym in SYM_OBJECT:
+        r.u16(), r.u16()  # keyBits, mode
+    elif sym != 0x0010:
+        raise Fail("unknown symmetric algorithm %#x" % sym)
     if alg == 0x0023:  # ECC
-        sym = r.u16()
-        if sym != 0x0010:
-            r.u16(), r.u16()
-        scheme = r.u16()
-        if scheme != 0x0010:
-            r.u16()
-        curve, kdf = r.u16(), r.u16()
-        if kdf != 0x0010:
-            r.u16()
+        tpm_scheme(r, ECC_SCHEMES, "ECC scheme")
+        curve = r.u16()
+        tpm_scheme(r, KDF_SCHEMES, "KDF scheme")
         if curve != 0x0003:
             raise Fail("not a P-256 key")
         x, y = r.tpm2b(), r.tpm2b()
+        tpm_end(r, "TPM public area")
         key = ec.EllipticCurvePublicNumbers(int.from_bytes(x, "big"), int.from_bytes(y, "big"), ec.SECP256R1()).public_key()
         return attrs, key
-    if alg == 0x0001:  # RSA
-        sym = r.u16()
-        if sym != 0x0010:
-            r.u16(), r.u16()
-        scheme = r.u16()
-        if scheme != 0x0010:
-            r.u16()
-        r.u16()  # keyBits
-        e = r.u32() or 65537
-        n = int.from_bytes(r.tpm2b(), "big")
-        return attrs, rsa.RSAPublicNumbers(e, n).public_key()
-    raise Fail("unsupported key type %#x" % alg)
+    # RSA
+    tpm_scheme(r, RSA_SCHEMES, "RSA scheme")
+    r.u16()  # keyBits
+    e = r.u32() or 65537
+    n = int.from_bytes(r.tpm2b(), "big")
+    tpm_end(r, "TPM public area")
+    return attrs, rsa.RSAPublicNumbers(e, n).public_key()
 
 
 def parse_quote(attest):
@@ -280,6 +308,7 @@ def parse_quote(attest):
             if bits[i // 8] >> (i % 8) & 1:
                 pcrs.append((alg, i))
     q["pcrs"], q["digest"] = pcrs, r.tpm2b()
+    tpm_end(r, "TPM quote")
     return q
 
 
@@ -288,7 +317,9 @@ def tpm_ecdsa(sig):
     r = Reader(sig)
     if r.u16() != 0x0018 or r.u16() != 0x000B:
         raise Fail("quote signature is not ECDSA with sha256")
-    return encode_dss_signature(int.from_bytes(r.tpm2b(), "big"), int.from_bytes(r.tpm2b(), "big"))
+    sig_r, sig_s = r.tpm2b(), r.tpm2b()
+    tpm_end(r, "quote signature")
+    return encode_dss_signature(int.from_bytes(sig_r, "big"), int.from_bytes(sig_s, "big"))
 
 
 @checked("host key")
@@ -367,7 +398,7 @@ def key_chain(ev, partition):
         raise Fail("multikernel evidence without its key chain")
     pcr, seen = bytes(32), {partition}
     for i, e in enumerate(chain):
-        if not (isinstance(e, list) and len(e) == 2 and isinstance(e[0], int) and isinstance(e[1], bytes)
+        if not (isinstance(e, list) and len(e) == 2 and is_int(e[0]) and 0 <= e[0] < 8 and isinstance(e[1], bytes)
                 and len(e[1]) == 65 and e[1][0] == 4):
             raise Fail("malformed key chain")
         k, pt = e
@@ -456,10 +487,10 @@ def check_evidence(ev, pins, ak_name, ek_ca):
     """The host's signing key and what the evidence shows about it."""
     if not isinstance(ev, dict):
         raise Fail("evidence is not a CBOR map")
-    if ev.get("v") not in (1, 2):
+    if not is_int(ev.get("v")) or ev["v"] not in (1, 2):
         raise Fail("unknown evidence version")
     partition = ev.get("partition") if ev["v"] == 2 else None
-    if ev["v"] == 2 and not (isinstance(partition, int) and 0 <= partition < 8):
+    if ev["v"] == 2 and not (is_int(partition) and 0 <= partition < 8):
         raise Fail("multikernel evidence without a valid partition")
     ak_key, name = attestation_key(ev)
     if ak_name is not None and name != ak_name:
@@ -473,6 +504,8 @@ def check_evidence(ev, pins, ak_name, ek_ca):
     if q["extra"] != key_binding(point(key), partition):
         raise Fail("the quote is not over this host key")
     pcrs = ev["pcrs"]
+    if not isinstance(pcrs, dict) or not all(is_int(i) and isinstance(v, bytes) for i, v in pcrs.items()):
+        raise Fail("PCRs are not a map of PCR numbers to values")
     if any(alg != 0x000B for alg, _ in q["pcrs"]) or [i for _, i in q["pcrs"]] != sorted(pcrs):
         raise Fail("quoted PCRs differ from the evidence's")
     if hashlib.sha256(b"".join(pcrs[i] for i in sorted(pcrs))).digest() != q["digest"]:
@@ -596,8 +629,10 @@ def check_report(rep, key, data, launch, deny_taint="console-in", require_seal="
     c = cbor_decode(payload)
     if not isinstance(c, dict):
         raise Fail("report claims are not a CBOR map")
-    if c.get("v") not in (1, 2):
+    if not is_int(c.get("v")) or c["v"] not in (1, 2):
         raise Fail("unknown report version")
+    if "partition" in c and not is_int(c["partition"]):
+        raise Fail("report partition is not an integer")
     # Version 2: a multikernel partition's, as its evidence says.
     if (c["v"] == 2) != (partition is not None) or c.get("partition") != partition:
         raise Fail("report is for partition %s, the evidence for %s" % (c.get("partition"), partition))

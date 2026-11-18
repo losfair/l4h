@@ -35,6 +35,8 @@ def encode(x):
         return bytes([0x60 + len(b)]) + b
     if isinstance(x, dict):
         return bytes([0xa0 + len(x)]) + b"".join(encode(k) + encode(v) for k, v in x.items())
+    if x is True or x is False:
+        return b"\xf5" if x else b"\xf4"
     assert 0 <= x < 24
     return bytes([x])
 
@@ -399,6 +401,143 @@ class Enrollment(unittest.TestCase):
                 self.assertEqual(r.returncode, 1)
                 self.assertRegex(r.stderr, "^l4h-attest: .*%s" % why)
                 self.assertNotIn("Traceback", r.stderr)
+
+
+def quote(extra, pcrs):
+    """A TPMS_ATTEST of a quote of sha256 PCRs `pcrs` (index: value)."""
+    sel = bytearray(3)
+    for i in pcrs:
+        sel[i // 8] |= 1 << (i % 8)
+    digest = hashlib.sha256(b"".join(pcrs[i] for i in sorted(pcrs))).digest()
+    return (struct.pack(">IH", 0xFF544347, 0x8018) + struct.pack(">H", 0) + struct.pack(">H", len(extra)) + extra
+            + struct.pack(">QIIBQ", 1, 2, 3, 1, 4) + struct.pack(">IHB", 1, 0x000B, 3) + bytes(sel)
+            + struct.pack(">H", 32) + digest)
+
+
+def tpm_signature(key, data):
+    r, s_ = decode_dss_signature(key.sign(data, ec.ECDSA(hashes.SHA256())))
+    return struct.pack(">HH", 0x0018, 0x000B) + struct.pack(">H", 32) + r.to_bytes(32, "big") + struct.pack(">H", 32) + s_.to_bytes(32, "big")
+
+
+class Evidence(unittest.TestCase):
+    """The evidence's integers are integers, not CBOR's true or false, and
+    its TPM structures end where they should."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.ak = ec.generate_private_key(ec.SECP256R1())
+        cls.host = ec.generate_private_key(ec.SECP256R1())
+        cls.other = ec.generate_private_key(ec.SECP256R1())
+        cls.ek = rsa.generate_private_key(65537, 2048)
+
+    def evidence(self, partition=None, chain=None, **over):
+        n = self.host.public_key().public_numbers()
+        key = {1: 2, -1: 1, -2: n.x.to_bytes(32, "big"), -3: n.y.to_bytes(32, "big")}
+        binding = a.key_binding(a.point(self.host.public_key()), partition)
+        pcr15 = bytes(32)
+        for k, pt in chain or []:
+            pcr15 = hashlib.sha256(pcr15 + a.key_binding(pt, k)).digest()
+        pcrs = {0: bytes([7]) * 32, a.KEY_PCR: pcr15}
+        q = quote(binding, pcrs)
+        ev = {"v": 1 if partition is None else 2, "ak": ecc_public(self.ak, Enrollment.AK_ATTRS), "key": key,
+              "pcrs": pcrs, "quote": q, "quotesig": tpm_signature(self.ak, q)}
+        if partition is not None:
+            ev["partition"] = partition
+            ev["chain"] = [list(e) for e in chain or []]
+        ev.update(over)
+        return ev
+
+    def check(self, ev):
+        return a.check_evidence(ev, {}, None, None)
+
+    def test_good(self):
+        key, partition, host = self.check(self.evidence())
+        self.assertEqual((key.public_numbers(), partition), (self.host.public_key().public_numbers(), None))
+        other = a.point(self.other.public_key())
+        key, partition, host = self.check(self.evidence(1, [(0, other)]))
+        self.assertEqual((partition, host["partition"], host["keys_before"]), (1, 1, [0]))
+        self.assertIs(type(host["partition"]), int)
+
+    def test_booleans_are_not_integers(self):
+        with self.assertRaisesRegex(a.Fail, "evidence version"):
+            self.check(self.evidence(v=True))
+        # Bound to partition 1, as true would be.
+        ev = self.evidence(1, [(0, a.point(self.other.public_key()))])
+        with self.assertRaisesRegex(a.Fail, "valid partition"):
+            self.check({**ev, "partition": True})
+        # Partition 0's key first, as false would be.
+        ev = self.evidence(1, [(0, a.point(self.other.public_key()))])
+        with self.assertRaisesRegex(a.Fail, "malformed key chain"):
+            self.check({**ev, "chain": [[False, a.point(self.other.public_key())]]})
+        for k in (-1, 8):
+            with self.assertRaisesRegex(a.Fail, "malformed key chain"):
+                self.check({**ev, "chain": [[k, a.point(self.other.public_key())]]})
+        ev = self.evidence()
+        pcrs = dict(ev["pcrs"])
+        pcrs[True] = pcrs.pop(0)
+        with self.assertRaisesRegex(a.Fail, "PCRs"):
+            self.check({**ev, "pcrs": pcrs})
+
+    def test_trailing_bytes(self):
+        ev = self.evidence()
+        for field in ("ak", "quote", "quotesig"):
+            bad = {**ev, field: ev[field] + b"\0"}
+            if field == "quote":
+                bad["quotesig"] = tpm_signature(self.ak, bad["quote"])
+            with self.assertRaisesRegex(a.Fail, "trailing bytes", msg=field):
+                self.check(bad)
+        with self.assertRaisesRegex(a.Fail, "trailing bytes"):
+            a.parse_public(rsa_public(self.ek, EvidenceEk.EK_ATTRS) + b"\0")
+
+    def test_public_area_parameters(self):
+        n = self.ak.public_key().public_numbers()
+        point = struct.pack(">H", 32) + n.x.to_bytes(32, "big") + struct.pack(">H", 32) + n.y.to_bytes(32, "big")
+
+        def ecc(params):
+            return struct.pack(">HHI", 0x0023, 0x000B, Enrollment.AK_ATTRS) + struct.pack(">H", 0) + params + point
+
+        good = (
+            struct.pack(">HHHHH", 0x0010, 0x0018, 0x000B, 0x0003, 0x0010),  # ECDSA
+            struct.pack(">HHHHHH", 0x0010, 0x001A, 0x000B, 1, 0x0003, 0x0010),  # ECDAA, with a count
+            struct.pack(">HHHHHHH", 0x0006, 128, 0x0043, 0x0010, 0x0003, 0x0007, 0x000B),  # AES, MGF1
+        )
+        for params in good:
+            _, key = a.parse_public(ecc(params))
+            self.assertEqual(key.public_numbers(), n, params.hex())
+        bad = (
+            struct.pack(">HHHHH", 0x000A, 0x0018, 0x000B, 0x0003, 0x0010),  # XOR is no object's
+            struct.pack(">HHHHHH", 0x0001, 128, 0x0043, 0x0018, 0x000B, 0x0003),  # RSA is not symmetric
+            struct.pack(">HHHHH", 0x0010, 0x0042, 0x000B, 0x0003, 0x0010),  # unknown scheme
+            struct.pack(">HHHHH", 0x0010, 0x0018, 0x000B, 0x0003, 0x0042),  # unknown KDF
+        )
+        for params in bad:
+            with self.assertRaisesRegex(a.Fail, "unknown", msg=params.hex()):
+                a.parse_public(ecc(params))
+        # RSAES has no details: the key bits come next.
+        k = self.ek
+        m = k.public_key().public_numbers().n.to_bytes(256, "big")
+        rsaes = (struct.pack(">HHI", 0x0001, 0x000B, EvidenceEk.EK_ATTRS) + struct.pack(">H", 0)
+                 + struct.pack(">HHHHHI", 0x0006, 128, 0x0043, 0x0015, 2048, 0) + struct.pack(">H", 256) + m)
+        self.assertEqual(a.parse_public(rsaes)[1].public_numbers(), k.public_key().public_numbers())
+
+    def test_report_integers(self):
+        v = Verify()
+        v.key = self.host
+        rep = v.signed(taint=bitmap(), seal=bitmap(0))
+        v.check(rep)
+        for claims in ({"v": True}, {"v": 2, "partition": True}):
+            with self.assertRaisesRegex(a.Fail, "version|partition", msg=repr(claims)):
+                a.check_report(signed_claims(self.host, claims), self.host.public_key(), None, None,
+                               partition=1 if "partition" in claims else None)
+
+
+def signed_claims(key, extra):
+    """A report with the claims Verify.signed() gives, and `extra`."""
+    c = {"v": 1, "host": hashlib.sha256(a.point(key.public_key())).digest(), "taint": bitmap(), "seal": bitmap(0), **extra}
+    p, protected = encode(c), b"\xa1\x01\x26"
+    tbs = b"\x84\x6aSignature1" + a.cbor_bytes(protected) + b"\x40" + a.cbor_bytes(p)
+    r, s_ = decode_dss_signature(key.sign(tbs, ec.ECDSA(hashes.SHA256())))
+    return ("tag", 18, [protected, {}, p, r.to_bytes(32, "big") + s_.to_bytes(32, "big")])
 
 
 class Malformed(unittest.TestCase):

@@ -93,6 +93,55 @@ const FW_PAGES: usize = (24 << 20) / 4096;
 const QUEUE: usize = 64;
 const BUFFER: usize = 2048;
 
+/// A completion queue entry's fields the data path reads.
+#[derive(Clone, Copy, Debug)]
+struct Cqe {
+    opcode: u8,
+    syndrome: u8,
+    slot: usize,
+    len: usize,
+}
+
+/// CQE opcode of a receive that failed (PRM: MLX5_CQE_RESP_ERR).
+const CQE_RESP_ERR: u8 = 0xe;
+/// Error CQE syndromes after which the queue is in error and must be
+/// recreated (as Linux's mlx5e: local QP operation, local protection,
+/// work request flushed).
+const SYNDROMES_FATAL: [u8; 3] = [0x02, 0x04, 0x05];
+
+/// What a receive completion holds: a frame of `len` bytes in buffer
+/// `slot`, nothing to deliver (None: a frame the 2 KiB buffer could not
+/// hold, reported as a local length error or with a byte count beyond
+/// `room`), or a queue that no longer works.
+fn rx_frame(cqe: Cqe, room: usize) -> Result<Option<(usize, usize)>, Error> {
+    match cqe.opcode {
+        0..=2 if cqe.len <= room => Ok(Some((cqe.slot, cqe.len))),
+        0..=2 => Ok(None),
+        CQE_RESP_ERR if !SYNDROMES_FATAL.contains(&cqe.syndrome) => Ok(None),
+        opcode => Err(Error::InvalidCompletion { opcode, syndrome: cqe.syndrome }),
+    }
+}
+
+/// The next frame of the receive queue `rx`, copied into `out`: frames
+/// that cannot be delivered are dropped, and every completed buffer is
+/// given back to the device (the queue's WQEs are fixed, one per buffer
+/// of `buffers`; `producer` and its doorbell at `db` hand them back).
+fn receive_frame(rx: &mut Completion, buffers: usize, producer: &mut u32, db: usize, out: &mut [u8]) -> Option<usize> {
+    loop {
+        let cqe = rx.pop_cqe()?;
+        let frame = rx_frame(cqe, out.len().min(BUFFER)).expect("mlx5 RX completion");
+        if let Some((slot, len)) = frame {
+            unsafe { core::ptr::copy_nonoverlapping((buffers + slot * BUFFER) as *const u8, out.as_mut_ptr(), len) };
+        }
+        *producer = producer.wrapping_add(1);
+        dma_fence(Ordering::Release);
+        write32(db, *producer & 0xffff);
+        if let Some((_, len)) = frame {
+            return Some(len);
+        }
+    }
+}
+
 struct Completion {
     ring: usize,
     db: usize,
@@ -107,24 +156,29 @@ impl Completion {
         let v = unsafe { read_volatile(p as *const u8) };
         v & 1 == ((self.consumer / QUEUE as u32) as u8 & 1)
     }
-    fn pop(&mut self) -> Result<Option<(usize, usize)>, Error> {
+    /// The next completion, consumed: (opcode, syndrome, WQE slot, byte count).
+    fn pop_cqe(&mut self) -> Option<Cqe> {
         if !self.ready() {
-            return Ok(None);
+            return None;
         }
         dma_fence(Ordering::Acquire);
         let p = self.ring + (self.consumer as usize % QUEUE) * 64;
-        let opcode = (read32(p + 60) & 0xff) as u8 >> 4;
-        let len = read32(p + 44) as usize;
-        let slot = (read32(p + 60) >> 16) as usize % QUEUE;
+        let cqe = Cqe {
+            opcode: (read32(p + 60) & 0xff) as u8 >> 4,
+            syndrome: unsafe { read_volatile((p + 55) as *const u8) },
+            slot: (read32(p + 60) >> 16) as usize % QUEUE,
+            len: read32(p + 44) as usize,
+        };
         self.consumer = self.consumer.wrapping_add(1);
         write32(self.db, self.consumer & 0xffffff);
-        if !matches!(opcode, 0 | 1 | 2) {
-            return Err(Error::InvalidCompletion {
-                opcode,
-                syndrome: unsafe { read_volatile((p + 55) as *const u8) },
-            });
+        Some(cqe)
+    }
+    fn pop(&mut self) -> Result<Option<(usize, usize)>, Error> {
+        let Some(cqe) = self.pop_cqe() else { return Ok(None) };
+        if !matches!(cqe.opcode, 0 | 1 | 2) {
+            return Err(Error::InvalidCompletion { opcode: cqe.opcode, syndrome: cqe.syndrome });
         }
-        Ok(Some((slot, len)))
+        Ok(Some((cqe.slot, cqe.len)))
     }
     fn arm(&mut self, uar: usize) {
         let v = (self.sequence & 3) << 28 | (self.consumer & 0xffffff);
@@ -731,19 +785,8 @@ impl Mlx5 {
     }
 
     pub fn receive(&mut self, out: &mut [u8], hdr: &mut [u8; 12]) -> Option<usize> {
-        let (slot, len) = self.rx.pop().expect("mlx5 RX completion")?;
-        assert!(len <= BUFFER && len <= out.len(), "mlx5 oversized receive");
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                (self.buffers_rx.0 + slot * BUFFER) as *const u8,
-                out.as_mut_ptr(),
-                len,
-            )
-        };
+        let len = receive_frame(&mut self.rx, self.buffers_rx.0, &mut self.rx_producer, self.queue_db, out)?;
         hdr.fill(0);
-        self.rx_producer = self.rx_producer.wrapping_add(1);
-        dma_fence(Ordering::Release);
-        write32(self.queue_db, self.rx_producer & 0xffff);
         Some(len)
     }
 
@@ -922,5 +965,116 @@ impl crate::sdk::NicDriver for Mlx5 {
     }
     fn link(&self) -> LinkState {
         self.link
+    }
+}
+
+// Run on Linux through tests/mlx5-vfio (cargo test), which builds this file.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::vec::Vec;
+
+    /// A completion queue, its doorbell record and the receive buffers, in
+    /// ordinary memory.
+    struct Queue {
+        ring: Vec<u64>,
+        db: Vec<u32>,
+        buffers: Vec<u8>,
+        rx: Completion,
+        producer: u32,
+        written: usize,
+    }
+
+    impl Queue {
+        fn new() -> Box<Queue> {
+            let mut q = Box::new(Queue {
+                ring: std::vec![0; QUEUE * 8],
+                db: std::vec![0; 2],
+                buffers: std::vec![0; QUEUE * BUFFER],
+                rx: Completion { ring: 0, db: 0, number: 1, consumer: 0, sequence: 0 },
+                producer: QUEUE as u32,
+                written: 0,
+            });
+            // Hardware-owned on the first pass: the owner bit is 1.
+            for i in 0..QUEUE {
+                q.cqe_bytes(i)[63] = 1;
+            }
+            q.rx.ring = q.ring.as_ptr() as usize;
+            q.rx.db = q.db.as_ptr() as usize;
+            q
+        }
+        fn cqe_bytes(&mut self, i: usize) -> &mut [u8] {
+            let ring = unsafe { core::slice::from_raw_parts_mut(self.ring.as_mut_ptr() as *mut u8, QUEUE * 64) };
+            &mut ring[i * 64..i * 64 + 64]
+        }
+        /// Complete the next WQE with `opcode`, `syndrome` and byte count `len`.
+        fn complete(&mut self, opcode: u8, syndrome: u8, len: u32, fill: u8) {
+            let (n, slot) = (self.written, self.written % QUEUE);
+            self.buffers[slot * BUFFER..slot * BUFFER + BUFFER].fill(fill);
+            let e = self.cqe_bytes(n % QUEUE);
+            e.fill(0);
+            e[44..48].copy_from_slice(&len.to_be_bytes());
+            e[55] = syndrome;
+            e[60..62].copy_from_slice(&(slot as u16).to_be_bytes());
+            e[63] = opcode << 4 | ((n / QUEUE) as u8 & 1);
+            self.written += 1;
+        }
+        fn receive(&mut self, out: &mut [u8]) -> Option<usize> {
+            let (buffers, db) = (self.buffers.as_ptr() as usize, self.db.as_ptr() as usize);
+            receive_frame(&mut self.rx, buffers, &mut self.producer, db, out)
+        }
+        fn doorbell(&self) -> u32 {
+            u32::from_be(unsafe { read_volatile(self.db.as_ptr()) })
+        }
+    }
+
+    #[test]
+    fn frames_too_long_or_failed_are_dropped_and_reposted() {
+        let mut q = Queue::new();
+        let mut out = [0u8; 1600];
+        // A local length error (a frame longer than the buffer), a byte
+        // count beyond the buffer, one beyond the caller's room, then a frame.
+        q.complete(CQE_RESP_ERR, 0x01, 0, 0xee);
+        q.complete(2, 0, 4096, 0xee);
+        q.complete(2, 0, 1601, 0xee);
+        q.complete(2, 0, 1514, 0x5a);
+        assert_eq!(q.receive(&mut out), Some(1514));
+        assert!(out[..1514].iter().all(|&b| b == 0x5a));
+        // Every buffer went back to the device, and every CQE was consumed.
+        assert_eq!(q.producer, QUEUE as u32 + 4);
+        assert_eq!(q.doorbell(), (QUEUE as u32 + 4) & 0xffff);
+        assert_eq!(q.rx.consumer, 4);
+        assert_eq!(q.receive(&mut out), None);
+    }
+
+    #[test]
+    fn dropped_completions_wrap_the_queue() {
+        let mut q = Queue::new();
+        let mut out = [0u8; BUFFER];
+        for round in 0..3 * QUEUE {
+            if round % 2 == 0 {
+                q.complete(CQE_RESP_ERR, 0x01, 0, 0);
+                assert_eq!(q.receive(&mut out), None);
+            } else {
+                q.complete(2, 0, 64, round as u8);
+                assert_eq!(q.receive(&mut out), Some(64));
+                assert_eq!(out[0], round as u8);
+            }
+        }
+        assert_eq!(q.producer, (QUEUE as u32) * 4);
+    }
+
+    #[test]
+    fn rx_completion_classes() {
+        let cqe = |opcode, syndrome, len| Cqe { opcode, syndrome, slot: 3, len };
+        assert_eq!(rx_frame(cqe(2, 0, 2048), BUFFER), Ok(Some((3, 2048))));
+        assert_eq!(rx_frame(cqe(2, 0, 2049), BUFFER), Ok(None));
+        assert_eq!(rx_frame(cqe(CQE_RESP_ERR, 0x01, 0), BUFFER), Ok(None));
+        assert_eq!(rx_frame(cqe(CQE_RESP_ERR, 0x10, 0), BUFFER), Ok(None));
+        // A queue in error, a requester error or an invalid CQE on the
+        // receive queue: the driver restarts.
+        for (opcode, syndrome) in [(CQE_RESP_ERR, 0x02), (CQE_RESP_ERR, 0x04), (CQE_RESP_ERR, 0x05), (0xd, 0x01), (0xf, 0)] {
+            assert_eq!(rx_frame(cqe(opcode, syndrome, 0), BUFFER), Err(Error::InvalidCompletion { opcode, syndrome }));
+        }
     }
 }
