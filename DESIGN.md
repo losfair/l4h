@@ -2782,11 +2782,16 @@ root restarts. Root and netd know no device kind. The design is issue
   mailbox. No PCI configuration capability, IRQControl, Untyped or
   endpoint to netd. Configuration writes go through root
   (`Published::cfg_req`), inside the manifest's windows, past the header,
-  and by an allow-list: vendor-specific capabilities (not virtio's, one of
-  which reaches a whole BAR), AER's status registers, LTR, L1 PM substates,
-  and in the PCI Express capability Device Control's relaxed ordering bit
-  and Link Control's ASPM bits; root merges the write into the register's
-  other bits. Root clears Device Control's Enable No Snoop (on from reset)
+  and by an allow-list: vendor-specific capabilities past their headers
+  (not a virtio device's, of any vendor: one of those reaches a whole BAR),
+  AER's status registers, LTR's latencies, L1 PM substates' controls, and
+  in the PCI Express capability Device Control's relaxed ordering bit and
+  Link Control's ASPM bits; root merges the write into the register's
+  other bits. Root walks the whole capability list of the space written
+  on each write and takes a capability to end where its header or kind
+  says, never past the next one: no capability header, nor a byte between
+  capabilities, is writable, and a list with a loop, a stray pointer or a
+  length that does not fit lets nothing be written. Root clears Device Control's Enable No Snoop (on from reset)
   before each start, and the driver cannot set it: a TLP that does not
   snoop reads memory past the CPU's caches where the IOMMU does not force
   snooping (VT-d without Snoop Control; AMD-Vi's entries force coherence),

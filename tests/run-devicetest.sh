@@ -46,7 +46,7 @@ def function(source, signature):
 pci = (root / 'host/l4h-root/src/pci.rs').read_text()
 (out / 'pci-identity.inc').write_text('impl Pci {\n' + method(pci, '    pub fn identity(') + '\n}\n')
 nicd = (root / 'host/l4h-root/src/nicd.rs').read_text()
-(out / 'nicd-cfg.inc').write_text(function(nicd, 'fn cap_write_bits('))
+(out / 'nicd-cfg.inc').write_text('\n'.join(function(nicd, f) for f in ['fn cap_holding(', 'fn cap_len(', 'fn cap_write_bits(']))
 root_main = (root / 'host/l4h-root/src/main.rs').read_text()
 nic_branch = '        } else if nicd::is_network(&d, &nicd::ids_of(&d, &pci), cfg.nic_pin(netd::bdf(&d)).is_some()) {'
 start = root_main.index(nic_branch) + len(nic_branch)
