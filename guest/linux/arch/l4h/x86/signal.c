@@ -39,6 +39,18 @@ static int copy_sc_from_user(struct pt_regs *regs,
 	if (err)
 		return err;
 
+	/*
+	 * The FPU state first, before any register changes.  regs.fp must
+	 * hold the thread's state before user memory overwrites it: a fault
+	 * midway leaves the rest as the thread had it, not an older copy.
+	 */
+	from_fp64 = (void __user *)sc.fpstate;
+	l4h_fpu_fetch(current);
+	err = copy_from_user(regs->regs.fp, from_fp64, host_fp_size);
+	l4h_fpu_dirty(current);
+	if (err)
+		return 1;
+
 #define GETREG(regno, regname) regs->regs.gp[HOST_##regno] = sc.regname
 
 	GETREG(DI, di);
@@ -70,13 +82,6 @@ static int copy_sc_from_user(struct pt_regs *regs,
 	 */
 	regs->regs.gp[HOST_EFLAGS] = (regs->regs.gp[HOST_EFLAGS] & ~0x44dd5UL) |
 				     (sc.flags & 0x44dd5UL);
-
-	from_fp64 = (void __user *)sc.fpstate;
-
-	err = copy_from_user(regs->regs.fp, from_fp64, host_fp_size);
-	l4h_fpu_dirty(current);
-	if (err)
-		return 1;
 
 	return 0;
 }
