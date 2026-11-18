@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 # Host-side randomised tests of guest-facing parsers (virtqueues, the
-# uplink channel to the NIC drivers, netd's offload, steering and L3 filter, usbd's records, blkd's windows).  Debug build: it checks overflow, as
+# uplink channel to the NIC drivers, netd's offload, the mlx5 driver's
+# receive completions, steering and L3 filter, usbd's records, blkd's windows).  Debug build: it checks overflow, as
 # shipped (release) host builds also do (overflow-checks, DESIGN.md §10,
 # "Integer arithmetic"), and pointer preconditions, which release builds
 # do not.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
+# netd's offload checks (l4h-netcore's unit tests), and the mlx5 driver's
+# receive completions (built for Linux by its VFIO harness).
+cargo +stable test -q --manifest-path "$root/host/l4h-netcore/Cargo.toml"
+cargo +stable test -q --manifest-path "$root/tests/mlx5-vfio/Cargo.toml"
 (cd "$root/tests/fuzz-virtq" && cargo +stable test -q && cargo +stable run -q -- "${1:-200000}")
 (cd "$root/tests/fuzz-steer" && cargo +stable test -q && cargo +stable run -q -- "${1:-200000}")
 (cd "$root/tests/fuzz-ipfilter" && cargo +stable test -q && cargo +stable run -q -- "${1:-200000}")

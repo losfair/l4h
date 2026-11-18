@@ -157,6 +157,8 @@ impl<D: NicDriver> Loop<D> {
     /// channel had no room.
     fn deliver(&mut self, len: usize, hdr: &mut [u8; HDR]) -> bool {
         let rx = self.chan.rx();
+        // As the device said it: sanitize_rx changes it even when refusing.
+        let raw = *hdr;
         let coherent = offload::sanitize_rx(hdr, &self.scratch[..len], offload::UPLINK_MIN_MSS);
         let mss = u16::from_le_bytes([hdr[4], hdr[5]]) as usize;
         if coherent && (!offload::is_gso(hdr) || mss >= offload::MIN_MSS) {
@@ -178,9 +180,20 @@ impl<D: NicDriver> Loop<D> {
         if !self.gro_flush() {
             return false;
         }
-        if offload::is_gso(hdr) {
+        // A coherent GSO frame with segments netd does not cut, or one
+        // without NEEDS_CSUM that still describes the frame and whose
+        // checksums hold: the device's received run.  Not any other, whose
+        // segments would carry checksums the frame did not have.
+        let gso = if coherent && offload::is_gso(hdr) {
+            Some(*hdr)
+        } else if !coherent && offload::valid_rx_gso(&raw, &self.scratch[..len], offload::UPLINK_MIN_MSS) {
+            Some(raw)
+        } else {
+            None
+        };
+        if let Some(gso) = gso {
             let (w, mut wrote, mut lost) = (&mut *self.rx, 0, 0);
-            offload::segment(&self.scratch[..len], hdr, &mut self.seg[..], |f, h| {
+            offload::segment(&self.scratch[..len], &gso, &mut self.seg[..], |f, h| {
                 if w.write(&rx, f, h) { wrote += 1 } else { lost += 1 }
             });
             count(nicd::RX_FRAMES, wrote);
