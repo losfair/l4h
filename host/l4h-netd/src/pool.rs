@@ -100,6 +100,16 @@ impl Frame for Held<'_> {
             c = self.pool.next[c as usize];
         }
     }
+
+    unsafe fn copy_to_shared(&self, dst: *mut u8) {
+        let (mut c, mut at) = (self.first, 0);
+        while at < self.len() {
+            let n = (self.len() - at).min(CHUNK);
+            unsafe { crate::offload::copy_volatile(self.pool.data[c as usize].as_ptr(), dst.add(at), n) };
+            c = self.pool.next[c as usize];
+            at += n;
+        }
+    }
 }
 
 /// The pool, all chunks free.  There is one, taken once.

@@ -200,25 +200,66 @@ fn a_reader_that_starts_at_an_unaligned_count_reads_no_header_there() {
     assert!(lost > 0 && rx.tail % 8 == 0 && rx.is_empty());
 }
 
+/// Write a record header at ring offset `pos`.
+fn put_record(tx: &MsgRing, pos: u64, len: u32, ty: u32) {
+    unsafe {
+        ((tx.va + MSG_RING_HEADER + pos as usize) as *mut u32).write_volatile(len);
+        ((tx.va + MSG_RING_HEADER + pos as usize + 4) as *mut u32).write_volatile(ty);
+    }
+}
+
 #[test]
 fn padding_after_padding_is_not_read_record_by_record() {
     let (tx, mut rx) = ring(64 << 10);
-    // The peer fills its ring with padding records of 8 bytes and
-    // publishes as many as a reader may be behind.
-    let n = (tx.cap - 2 * MsgRing::max_room(tx.cap)) / 8;
-    for i in 0..n {
-        unsafe {
-            ((tx.va + MSG_RING_HEADER + 8 * i as usize) as *mut u32).write_volatile(8);
-            ((tx.va + MSG_RING_HEADER + 8 * i as usize + 4) as *mut u32).write_volatile(MSG_PAD);
-        }
-    }
-    set_head(&tx, 8 * n);
+    let cap = tx.cap;
     let mut buf = vec![0u8; 256];
     let mut lost = 0;
-    // One call reads two of them and gives up on the rest.
+    // Padding to the ring's end, then padding again at its start: the
+    // second is a broken writer's, and what it published is lost.
+    let start = cap - 64;
+    rx.tail = start;
+    put_record(&tx, start, 64, MSG_PAD);
+    put_record(&tx, 0, 64, MSG_PAD);
+    set_head(&tx, start + 128);
     assert_eq!(rx.recv(&mut buf, &mut lost), None);
-    assert_eq!(lost, 8 * n - 16);
+    assert_eq!(lost, 64);
     assert!(rx.is_empty());
+    // Padding records of 8 bytes, as many as a reader may be behind: the
+    // first does not reach the ring's end, and nothing more is read.
+    let (tx, mut rx) = ring(64 << 10);
+    let n = (tx.cap - 2 * MsgRing::max_room(tx.cap)) / 8;
+    for i in 0..n {
+        put_record(&tx, 8 * i, 8, MSG_PAD);
+    }
+    set_head(&tx, 8 * n);
+    let mut lost = 0;
+    assert_eq!(rx.recv(&mut buf, &mut lost), None);
+    assert_eq!(lost, 8 * n);
+    assert!(rx.is_empty());
+}
+
+#[test]
+fn a_record_past_the_count_published_is_not_read() {
+    let (tx, mut rx) = ring(64 << 10);
+    let cap = tx.cap;
+    let mut buf = vec![0u8; 256];
+    let mut lost = 0;
+    // The peer publishes 8 bytes of a record that says it is the whole
+    // ring: the reader neither returns it nor moves its tail past the
+    // head, so the next count it sees is not a lap behind.
+    put_record(&tx, 0, cap as u32, MSG_FRAME);
+    set_head(&tx, 8);
+    assert_eq!(rx.recv(&mut buf, &mut lost), None);
+    assert_eq!((rx.tail, lost), (8, 8));
+    assert_eq!(rx.recv(&mut buf, &mut lost), None);
+    assert_eq!(lost, 8);
+    // A record longer than what is published, one byte at a time.
+    let (tx, mut rx) = ring(64 << 10);
+    let mut lost = 0;
+    put_record(&tx, 0, 24, MSG_FRAME);
+    set_head(&tx, 16);
+    assert_eq!(rx.recv(&mut buf, &mut lost), None);
+    assert_eq!((rx.tail, lost), (16, 16));
 }
 
 #[test]

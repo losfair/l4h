@@ -970,7 +970,7 @@ pub fn channel_message(h: &mut Host, peer: u32, ty: u32, msg: &[u8]) {
     // the write leaves it even, and wraps.
     host::seqlock::write(&slot.seq, |_| {
         unsafe {
-            core::ptr::copy_nonoverlapping(msg.as_ptr(), (va + trust::RELAY_SLOT_HEADER) as *mut u8, msg.len());
+            host::gpu::copy_volatile(msg.as_ptr(), (va + trust::RELAY_SLOT_HEADER) as *mut u8, msg.len());
         }
         slot.len.store(msg.len() as u32, core::sync::atomic::Ordering::Relaxed);
     });
@@ -987,8 +987,10 @@ pub fn relay(h: &mut Host, peer: u32, len: usize) -> u64 {
     if len > trust::RELAY_MSG_MAX || (secondary && peer != 0) || (!secondary && peer == 0) {
         return u64::MAX;
     }
-    let msg = unsafe { core::slice::from_raw_parts(relay_va(trust::RELAY_SLOT_HEADER) as *const u8, len) };
-    if cs.send(peer, ty, &[msg]) { 0 } else { u64::MAX }
+    // trustd's page: it may write it meanwhile, so a copy, not a slice.
+    let mut msg = [0u8; trust::RELAY_MSG_MAX];
+    unsafe { host::gpu::copy_volatile(relay_va(trust::RELAY_SLOT_HEADER) as *const u8, msg.as_mut_ptr(), len) };
+    if cs.send(peer, ty, &[&msg[..len]]) { 0 } else { u64::MAX }
 }
 
 /// Root's timer: guests' allowance of attestation notices is new

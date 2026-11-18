@@ -3526,6 +3526,15 @@ of wrapping, where a wrapped bound check would pass. Tests and
 `tests/run-fuzz.sh`, whose parsers are the host's own, catch what is
 missed before it ships.
 
+**Shared bytes.** Bytes in memory a less-trusted party can write while a
+component reads them (guest memory, a nicd's channel data area, a peer
+partition's ring, trustd's relay page) are copied with volatile accesses
+(`l4h_host::gpu::copy_volatile`, `offload::Frame::copy_to_shared`,
+`uplink::Shared`), never borrowed as a Rust slice nor copied with
+`copy_nonoverlapping`: the compiler may take a slice's bytes as
+unchanging, or read them twice, so that what was checked is not what is
+used. The component then checks its own copy.
+
 **Shared rings.** A ring in memory shared with a less-trusted party (blkd's
 channels, netd's ports, usbd's queues) has one index per side, and each
 side keeps its own privately and only publishes it (`l4h_host::spsc`): the

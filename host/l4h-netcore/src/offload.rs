@@ -11,6 +11,13 @@ pub trait Frame {
     fn len(&self) -> usize;
     /// Copy the frame to `dst`, which is len() bytes long.
     fn copy_to(&self, dst: &mut [u8]);
+    /// Copy the frame to `dst` with volatile writes: memory another
+    /// component may read or write meanwhile (an uplink channel's data
+    /// area, a guest port's ring), never to be taken as a Rust slice.
+    ///
+    /// # Safety
+    /// `dst` is valid for len() bytes.
+    unsafe fn copy_to_shared(&self, dst: *mut u8);
 }
 
 impl Frame for [u8] {
@@ -20,6 +27,28 @@ impl Frame for [u8] {
 
     fn copy_to(&self, dst: &mut [u8]) {
         dst.copy_from_slice(self);
+    }
+
+    unsafe fn copy_to_shared(&self, dst: *mut u8) {
+        unsafe { copy_volatile(self.as_ptr(), dst, self.len()) };
+    }
+}
+
+/// Copy `n` bytes with volatile accesses, eight bytes at a time: one side
+/// is memory another component may write or read meanwhile.
+///
+/// # Safety
+/// `src` and `dst` are valid for `n` bytes.
+pub unsafe fn copy_volatile(src: *const u8, dst: *mut u8, n: usize) {
+    let mut i = 0;
+    // Eight bytes at a time, aligned or not: one load and one store each.
+    while i + 8 <= n {
+        unsafe { (dst.add(i) as *mut [u8; 8]).write_volatile((src.add(i) as *const [u8; 8]).read_volatile()) };
+        i += 8;
+    }
+    while i < n {
+        unsafe { dst.add(i).write_volatile(src.add(i).read_volatile()) };
+        i += 1;
     }
 }
 pub const F_NEEDS_CSUM: u8 = 1;

@@ -1648,7 +1648,7 @@ pub fn ctl_post(h: &mut Host, i: usize, off: u64, len: u64) -> Result<usize, Err
     let page = inst.ctl_page;
     // dom0's bytes, copied: the nicd never sees dom0's memory.
     h.wins.a.with_frame(&abs_of(page), |p| unsafe {
-        core::ptr::copy_nonoverlapping((crate::vmmgr::CTL_DATA_VA + off) as *const u8, p, len)
+        host::gpu::copy_volatile((crate::vmmgr::CTL_DATA_VA + off) as *const u8, p, len)
     });
     let t = crate::vmmgr::op_new(h, None, crate::pci::MAX_DISK_CTRLS + i)?;
     let inst = nics()[i].inst.as_mut().unwrap();
@@ -1661,7 +1661,8 @@ pub fn ctl_post(h: &mut Host, i: usize, off: u64, len: u64) -> Result<usize, Err
 pub fn ctl_read(h: &mut Host, i: usize, data: &mut [u8; abi::CTL_DATA_MAX]) -> Result<u64, Errno> {
     let inst = nics().get(i).and_then(|n| n.inst.as_ref()).ok_or(ctl::ENOENT)?;
     let len = inst.ctl_len.min(abi::CTL_DATA_MAX);
-    h.wins.a.with_frame(&abs_of(inst.ctl_page), |p| unsafe { core::ptr::copy_nonoverlapping(p, data.as_mut_ptr(), len) });
+    // The nicd's page: it may write it meanwhile.
+    h.wins.a.with_frame(&abs_of(inst.ctl_page), |p| unsafe { host::gpu::copy_volatile(p, data.as_mut_ptr(), len) });
     Ok(len as u64)
 }
 

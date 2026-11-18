@@ -24,9 +24,13 @@
 //! consumer writes but the ring's tail, which it checks.
 //!
 //! The data area stays writable by its producer while the consumer reads
-//! it: a consumer that must trust a frame's bytes copies them first.
-//! netd does (it validates the headers of what it copied).  The driver
-//! trusts netd, which is in the TCB.
+//! it, and by the consumer while the producer writes it: a frame there is
+//! a `Shared` (a `SharedMut` while it is written), copied with volatile
+//! accesses, never a Rust slice the compiler may take as unchanging (or
+//! read twice).  A consumer that must trust a frame's bytes copies them
+//! first: netd does (it validates the headers of what it copied).  The
+//! driver trusts netd, which is in the TCB, and may borrow netd's frames
+//! (`Shared::as_slice`).
 //!
 //! Notifications follow the guest ports' protocol, with a flag for each
 //! side that waits: a consumer that found its ring empty sets its `*_idle`
@@ -41,8 +45,76 @@
 
 use core::sync::atomic::{AtomicU32, Ordering, fence};
 
+use crate::gpu::copy_volatile;
 use crate::net::{HDR_SIZE, MAX_FRAME};
 use crate::spsc::{Consumer, Producer, RingIdx};
+
+/// A frame in a channel's data area, which the other side may write while
+/// it is read.
+#[derive(Clone, Copy)]
+pub struct Shared<'a> {
+    ptr: *const u8,
+    len: usize,
+    _area: core::marker::PhantomData<&'a [u8]>,
+}
+
+impl<'a> Shared<'a> {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn as_ptr(&self) -> *const u8 {
+        self.ptr
+    }
+
+    /// Copy the frame to the start of `dst`, which holds it.
+    pub fn copy_to(&self, dst: &mut [u8]) {
+        assert!(dst.len() >= self.len);
+        unsafe { copy_volatile(self.ptr, dst.as_mut_ptr(), self.len) };
+    }
+
+    /// The frame as a slice, for a consumer whose producer does not write
+    /// it before `Reader::release`: a nicd, of netd's frames.
+    ///
+    /// # Safety
+    /// Nothing writes the frame while the slice lives.
+    pub unsafe fn as_slice(&self) -> &'a [u8] {
+        unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+/// Room for a frame in a channel's data area, which the consumer may write
+/// (a broken tail) while it is written.
+pub struct SharedMut<'a> {
+    ptr: *mut u8,
+    len: usize,
+    _area: core::marker::PhantomData<&'a mut [u8]>,
+}
+
+impl SharedMut<'_> {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// For volatile writes of up to len() bytes.
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.ptr
+    }
+
+    /// Copy `src` to the start of the room, which holds it.
+    pub fn copy_from(&mut self, src: &[u8]) {
+        assert!(src.len() <= self.len);
+        unsafe { copy_volatile(src.as_ptr(), self.ptr, src.len()) };
+    }
+}
 
 pub const ABI_VERSION: u32 = 1;
 pub const PAGE: usize = 4096;
@@ -375,17 +447,17 @@ impl Writer {
     }
 
     /// Reserve room for a frame of up to `max` bytes, written through the
-    /// returned slice and published with `commit` (the bytes it took):
+    /// returned room and published with `commit` (the bytes it took):
     /// none if it does not fit.  Room is for the whole `max`, as a frame
     /// never wraps.
-    pub fn reserve(&mut self, d: &Dir, max: usize) -> Option<&mut [u8]> {
+    pub fn reserve(&mut self, d: &Dir, max: usize) -> Option<SharedMut<'_>> {
         let pad = self.space(d, max)?;
         if pad != 0 {
             self.put(d, 0, [0; 3]);
             self.pos += pad as u64;
         }
         let off = (self.pos % d.size as u64) as usize;
-        Some(unsafe { core::slice::from_raw_parts_mut(d.data.add(off), max) })
+        Some(SharedMut { ptr: unsafe { d.data.add(off) }, len: max, _area: core::marker::PhantomData })
     }
 
     /// Publish the frame `reserve` gave room for, of `len` bytes (no more
@@ -398,8 +470,8 @@ impl Writer {
 
     /// Copy one frame in; false if it does not fit.
     pub fn write(&mut self, d: &Dir, frame: &[u8], hdr: &[u8; HDR_SIZE]) -> bool {
-        let Some(buf) = self.reserve(d, frame.len()) else { return false };
-        buf.copy_from_slice(frame);
+        let Some(mut buf) = self.reserve(d, frame.len()) else { return false };
+        buf.copy_from(frame);
         self.commit(d, frame.len(), hdr);
         true
     }
@@ -419,7 +491,7 @@ impl Default for Writer {
 /// What the consumer found next.
 pub enum Next<'a> {
     /// A frame, in the peer's memory: it may change while it is read.
-    Frame(&'a [u8], [u8; HDR_SIZE]),
+    Frame(Shared<'a>, [u8; HDR_SIZE]),
     /// A descriptor the consumer refused (reserved flags): skipped and
     /// freed, nothing else is wrong.
     Dropped,
@@ -498,7 +570,7 @@ impl Reader {
                 hdr[i * 4..i * 4 + 4].copy_from_slice(&w.load(Ordering::Relaxed).to_le_bytes());
             }
             self.cur = len;
-            let frame = unsafe { core::slice::from_raw_parts(d.data.add(off) as *const u8, len) };
+            let frame = Shared { ptr: unsafe { d.data.add(off) as *const u8 }, len, _area: core::marker::PhantomData };
             return Next::Frame(frame, hdr);
         }
     }
@@ -569,7 +641,8 @@ mod tests {
         loop {
             match r.next(d) {
                 Next::Frame(f, h) => {
-                    let v = f.to_vec();
+                    let mut v = vec![0; f.len()];
+                    f.copy_to(&mut v);
                     r.release(d);
                     out.push((v, h));
                 }
@@ -670,7 +743,7 @@ mod tests {
         assert!(matches!(r.next(&d), Next::Frame(..)));
         unsafe { &*d.descs }.len.store(5000, Ordering::Relaxed);
         r.release(&d);
-        assert!(matches!(r.next(&d), Next::Frame(f, _) if f == &frame(200, 2)[..]));
+        assert!(matches!(r.next(&d), Next::Frame(f, _) if unsafe { f.as_slice() } == &frame(200, 2)[..]));
     }
 
     #[test]

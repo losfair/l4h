@@ -287,6 +287,9 @@ impl<D: NicDriver> Loop<D> {
         for _ in 0..TX_BUDGET {
             match self.tx.next(&tx) {
                 uplink::Next::Frame(f, hdr) => {
+                    // netd's frame: netd, in the TCB, does not write it
+                    // before the release below.
+                    let f = unsafe { f.as_slice() };
                     // A GSO frame only as the offer takes it (netd's own
                     // check, `Offer::takes_gso`): no device's segmentation
                     // offload is given less than two segments to cut.

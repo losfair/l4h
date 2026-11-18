@@ -618,7 +618,8 @@ impl Netd {
             let (n, mut hdr) = unsafe {
                 let slot = addr_of!((*chan).tx_slots[tx.slot()]);
                 let n = (addr_of!((*slot).len).read_volatile() as usize).min(net::MAX_FRAME);
-                core::ptr::copy_nonoverlapping(addr_of!((*slot).data) as *const u8, frame.as_mut_ptr(), n);
+                // The guest can write the slot meanwhile.
+                offload::copy_volatile(addr_of!((*slot).data) as *const u8, frame.as_mut_ptr(), n);
                 let hdr = addr_of!((*slot).hdr).read_volatile();
                 tx.pop(&(*chan).tx);
                 (n, hdr)
@@ -770,7 +771,8 @@ fn rx_put(p: &mut GuestPort, frame: &(impl Frame + ?Sized), hdr: &[u8; net::HDR_
     }
     unsafe {
         let slot = addr_of_mut!((*p.chan).rx_slots[p.rx.slot()]);
-        frame.copy_to(core::slice::from_raw_parts_mut(addr_of_mut!((*slot).data) as *mut u8, frame.len()));
+        // The guest can read and write the slot meanwhile.
+        frame.copy_to_shared(addr_of_mut!((*slot).data) as *mut u8);
         addr_of_mut!((*slot).hdr).write_volatile(*hdr);
         addr_of_mut!((*slot).len).write_volatile(frame.len() as u32);
         p.rx.push(&(*p.chan).rx);
