@@ -602,6 +602,65 @@ pub const MSG_FRAME: u32 = 6;
 pub const MSG_FRAME_GSO: u32 = 7;
 pub const LINK_FRAME_MAX: usize = 9216;
 
+/// The ECAM of PCI segment 0 the shim gives the partitions
+/// (`Descriptor::ecam_base`, `ecam_bus_start`, `ecam_bus_end`), from the
+/// MCFG's `entries` (base, segment, first bus, last bus): the window as
+/// (base, first bus, last bus), and how many of segment 0's entries it
+/// leaves out.  An entry whose buses are none, or whose base is not 1 MiB
+/// aligned or puts its last bus past the address space, is no window: a
+/// function's page is at base + (bdf << 12), and only the entry's buses
+/// decode.  Entries with one base (bus 0's) whose buses meet or overlap
+/// are one window; of windows that stay apart, the first.
+pub fn segment0_ecam(entries: impl Iterator<Item = (u64, u16, u8, u8)> + Clone) -> (Option<(u64, u8, u8)>, usize) {
+    let valid = |&(base, segment, lo, hi): &(u64, u16, u8, u8)| {
+        segment == 0 && lo <= hi && base % (1 << 20) == 0 && base.checked_add((hi as u64 + 1) << 20).is_some()
+    };
+    let Some((base, _, mut lo, mut hi)) = entries.clone().find(valid) else {
+        return (None, entries.filter(|e| e.1 == 0).count());
+    };
+    // Grow it by what meets it, until nothing more does.
+    loop {
+        let (was_lo, was_hi) = (lo, hi);
+        for (_, _, l, h) in entries.clone().filter(valid).filter(|e| e.0 == base) {
+            if l as u16 <= hi as u16 + 1 && lo as u16 <= h as u16 + 1 {
+                (lo, hi) = (lo.min(l), hi.max(h));
+            }
+        }
+        if (lo, hi) == (was_lo, was_hi) {
+            break;
+        }
+    }
+    let inside = |e: &(u64, u16, u8, u8)| valid(e) && e.0 == base && lo <= e.2 && e.3 <= hi;
+    (Some((base, lo, hi)), entries.filter(|e| e.1 == 0 && !inside(e)).count())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::segment0_ecam;
+
+    #[test]
+    fn segment0_ecam_takes_only_what_decodes() {
+        let ecam = |e: &[(u64, u16, u8, u8)]| segment0_ecam(e.iter().copied());
+        assert_eq!(ecam(&[]), (None, 0));
+        assert_eq!(ecam(&[(0xe000_0000, 0, 0, 0xff)]), (Some((0xe000_0000, 0, 0xff)), 0));
+        // Another segment's is not segment 0's, and leaves nothing out.
+        assert_eq!(ecam(&[(0x8_0000_0000, 1, 0, 0xff), (0xe000_0000, 0, 0x10, 0x3f)]), (Some((0xe000_0000, 0x10, 0x3f)), 0));
+        // No buses, a base not 1 MiB aligned, a last bus past the address
+        // space: no window.
+        assert_eq!(ecam(&[(0xe000_0000, 0, 9, 3)]), (None, 1));
+        assert_eq!(ecam(&[(0xe008_0000, 0, 0, 0xff), (0xf000_0000, 0, 0, 0x7f)]), (Some((0xf000_0000, 0, 0x7f)), 1));
+        assert_eq!(ecam(&[(u64::MAX << 20, 0, 0, 1)]), (None, 1));
+        // A segment split in entries of one base, in any order: one window.
+        assert_eq!(ecam(&[(0xe000_0000, 0, 0x80, 0xff), (0xe000_0000, 0, 0x40, 0x7f), (0xe000_0000, 0, 0, 0x3f)]),
+            (Some((0xe000_0000, 0, 0xff)), 0));
+        assert_eq!(ecam(&[(0xe000_0000, 0, 0, 0x7f), (0xe000_0000, 0, 0x10, 0x20)]), (Some((0xe000_0000, 0, 0x7f)), 0));
+        // Windows apart (another base, or a bus between): the first, and
+        // the others counted out.
+        assert_eq!(ecam(&[(0xe000_0000, 0, 0, 0x7f), (0x3_8000_0000, 0, 0x80, 0xff)]), (Some((0xe000_0000, 0, 0x7f)), 1));
+        assert_eq!(ecam(&[(0xe000_0000, 0, 0, 0x3f), (0xe000_0000, 0, 0x41, 0xff)]), (Some((0xe000_0000, 0, 0x3f)), 1));
+    }
+}
+
 const _: () = assert!(core::mem::size_of::<Func>() == 160);
 const _: () = assert!(LINK_VECTOR_BASE as usize + MAX_PARTITIONS <= CONTROL_VECTOR_BASE as usize);
 const _: () = assert!(8 + LINK_FRAME_MAX as u64 <= MsgRing::max_room(LINK_CHANNEL_SIZE / 2 - MSG_RING_HEADER as u64));

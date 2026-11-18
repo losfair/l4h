@@ -5202,7 +5202,13 @@ as they will be; without MCFG it cannot reach ACS, and nothing below a
 bridge isolates. `l4hctl mk-check` refuses functions of one Linux IOMMU
 group in two partitions, and the installer gives another partition only
 a device alone in its group (its slot, without an IOMMU in Linux). Without MCFG (GCE's i440FX machines) it scans through the ports
-0xcf8/0xcfc, and the descriptor's ECAM base is 0.
+0xcf8/0xcfc, and the descriptor's ECAM base is 0. Of the MCFG it takes
+segment 0's window (`l4h_partition::segment0_ecam`): entries with no
+buses or a base not 1 MiB aligned are none, and entries of one base whose
+buses meet are one window; if segment 0 has windows apart (another base,
+or buses between), the shim uses the first and warns that the buses only
+the others decode are left out, their functions in no partition. It never
+reads or writes configuration space outside its window's buses.
 
 **CPUs.** Each partition's MADT lists only its own LAPIC/x2APIC entries,
 its first CPU first, so seL4 starts exactly those. Partition 0 keeps the

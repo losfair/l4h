@@ -66,7 +66,12 @@ impl Pci {
 
     pub fn write32(&self, bdf: u16, off: u16, v: u32) {
         match self.ecam {
-            Some((base, _, _)) => {
+            Some((base, start, end)) => {
+                // Below or past the window is not configuration space.
+                let bus = (bdf >> 8) as u8;
+                if bus < start || bus > end {
+                    return;
+                }
                 let p = UC_ALIAS + base + (((bdf as u64) << 12) | (off as u64 & 0xffc));
                 unsafe { (p as *mut u32).write_volatile(v) }
             }

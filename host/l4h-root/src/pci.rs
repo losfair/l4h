@@ -374,10 +374,8 @@ impl Pci {
             return Pci { port: s as u64, ecam: false, shared_ports: true, ext: false, windows: l4h_host::fixed::ArrayVec::new() };
         }
         for f in d.funcs() {
-            let paddr = d.ecam_base as usize + ((f.bdf as usize) << 12);
-            if (f.bdf >> 8) as u8 > d.ecam_bus_end
-                || crate::partition::map(alloc, _devmem, paddr, 4096, Self::ecam_va(f.bdf)).is_none()
-            {
+            let paddr = Self::ecam_page_of(d, f.bdf);
+            if paddr.is_none_or(|paddr| crate::partition::map(alloc, _devmem, paddr, 4096, Self::ecam_va(f.bdf)).is_none()) {
                 panic!("PCI function {:02x}:{:02x}.{}: no ECAM page", f.bdf >> 8, (f.bdf >> 3) & 0x1f, f.bdf & 7);
             }
             ECAM_MAPPED[f.bdf as usize / 64].fetch_or(1 << (f.bdf % 64), core::sync::atomic::Ordering::Relaxed);
@@ -390,9 +388,9 @@ impl Pci {
         // The IOMMU code reads them like any function (device scopes,
         // requester aliases).
         for bdf in d.upstream().iter().copied().chain(others) {
-            let paddr = d.ecam_base as usize + ((bdf as usize) << 12);
-            if (bdf >> 8) as u8 > d.ecam_bus_end || crate::partition::map_rights(alloc, _devmem, paddr, 4096,
-                Self::ecam_va(bdf), sel4::CapRights::read_only()).is_none() {
+            let paddr = Self::ecam_page_of(d, bdf);
+            if paddr.is_none_or(|paddr| crate::partition::map_rights(alloc, _devmem, paddr, 4096,
+                Self::ecam_va(bdf), sel4::CapRights::read_only()).is_none()) {
                 log!("l4h-root: another partition's PCI function {:02x}:{:02x}.{}: no ECAM page", bdf >> 8, (bdf >> 3) & 0x1f, bdf & 7);
                 continue;
             }
@@ -400,6 +398,15 @@ impl Pci {
         }
         info!("l4h-root: PCI configuration through ECAM");
         Pci { port: s as u64, ecam: true, shared_ports: false, ext: true, windows: l4h_host::fixed::ArrayVec::new() }
+    }
+
+    /// The physical address of function `bdf`'s ECAM page in the shim's
+    /// window (the descriptor's), if the window decodes its bus: below its
+    /// first bus is not configuration space, but may be anything (the MCFG's
+    /// base is bus 0's, l4h_host::trust::Ecam).
+    fn ecam_page_of(d: &l4h_partition::Descriptor, bdf: u16) -> Option<usize> {
+        (d.ecam_bus_start..=d.ecam_bus_end).contains(&((bdf >> 8) as u8)).then_some(())?;
+        d.ecam_base.checked_add((bdf as u64) << 12).filter(|&pa| pa % 4096 == 0 && pa < 1 << 52).map(|pa| pa as usize)
     }
 
     /// Map ECAM window `w` (of the MCFG, segment 0) whole into ECAM_X86,
