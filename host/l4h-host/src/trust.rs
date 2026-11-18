@@ -717,14 +717,50 @@ pub fn mcfg_windows(table: &[u8], len: usize) -> (crate::fixed::ArrayVec<Ecam, M
 /// The ECAM windows root knows of, from the firmware's MCFG (`mcfg`: its
 /// first bytes and its own length; None if there is none), and whether
 /// they are known to be all the ECAM there is: never without a MCFG that
-/// lists one, since a host bridge's ECAM can be described by its `_CBA`
-/// alone (the PCI Firmware Specification, as Linux reads it), which
-/// root does not read.  The AML then gets no memory write: any could be a
+/// lists one, nor if the firmware's AML may describe ECAM of its own
+/// (`aml_ecam`, AmlScan::may_describe_ecam).  A host bridge's ECAM can be
+/// given by its `_CBA` alone (the PCI Firmware Specification, as Linux
+/// reads it: a hot-pluggable host bridge's, which a static MCFG cannot
+/// list, even one there at boot), and root does not run AML to know
+/// where.  The AML then gets no memory write: any could be a
 /// configuration write root cannot check.
-pub fn ecam_windows(mcfg: Option<(&[u8], usize)>) -> (crate::fixed::ArrayVec<Ecam, MAX_ECAM>, bool) {
+pub fn ecam_windows(mcfg: Option<(&[u8], usize)>, aml_ecam: bool) -> (crate::fixed::ArrayVec<Ecam, MAX_ECAM>, bool) {
     match mcfg {
         None => (crate::fixed::ArrayVec::new(), false),
+        Some(_) if aml_ecam => (crate::fixed::ArrayVec::new(), false),
         Some((t, len)) => mcfg_windows(t, len),
+    }
+}
+
+/// What the firmware's AML could say of ECAM, read a piece at a time:
+/// the bytes of the FADT, DSDT and SSDTs root gives trustd (acpi::aml_tables),
+/// all the static namespace there is.  A plain search of the bytes, not a
+/// parse: `_CBA` anywhere (every object of that name a table defines, by
+/// `Name` or `Method`, alone or at the end of a path, has its four
+/// characters), and Load or LoadTable (ExtOpPrefix 0x5b, then 0x20 or
+/// 0x1f), with which the firmware could bring in tables root never reads,
+/// and a `_CBA` in them.  The same bytes in a string, a buffer or an
+/// integer are taken for them too: that only refuses the AML memory
+/// writes on a machine that did not need it, never serves one it should
+/// not.  A pair of pieces is read as one.
+#[derive(Default)]
+pub struct AmlScan {
+    last: u32,
+    pub cba: bool,
+    pub load: bool,
+}
+
+impl AmlScan {
+    pub fn feed(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.last = self.last << 8 | b as u32;
+            self.cba |= self.last == u32::from_be_bytes(*b"_CBA");
+            self.load |= matches!(self.last & 0xffff, 0x5b20 | 0x5b1f);
+        }
+    }
+
+    pub fn may_describe_ecam(&self) -> bool {
+        self.cba || self.load
     }
 }
 
@@ -1048,19 +1084,70 @@ mod tests {
         // _CBA alone (the PCI Firmware Specification; Linux's
         // Documentation/PCI/acpi-info.rst), at an address root cannot
         // check a write against.
-        assert!(!ecam_windows(None).1);
+        assert!(!ecam_windows(None, false).1);
         // A MCFG with no entry, one shorter than its header, one whose
         // entries have no buses, or one ending in part of an entry, lists
         // no (or not every) window either.
         let one = mcfg(&[(0xe000_0000, 0, 0, 0xff)]);
-        assert!(!ecam_windows(Some((&one[..MCFG_HEADER], MCFG_HEADER))).1);
-        assert!(!ecam_windows(Some((&one[..36], 36))).1);
+        assert!(!ecam_windows(Some((&one[..MCFG_HEADER], MCFG_HEADER)), false).1);
+        assert!(!ecam_windows(Some((&one[..36], 36)), false).1);
         let none = mcfg(&[(0xe000_0000, 0, 9, 3)]);
-        assert!(!ecam_windows(Some((&none, none.len()))).1);
-        assert!(!ecam_windows(Some((&one[..MCFG_HEADER + 8], MCFG_HEADER + 8))).1);
+        assert!(!ecam_windows(Some((&none, none.len())), false).1);
+        assert!(!ecam_windows(Some((&one[..MCFG_HEADER + 8], MCFG_HEADER + 8)), false).1);
         // A whole MCFG with a window is complete.
-        let (w, complete) = ecam_windows(Some((&one, one.len())));
+        let (w, complete) = ecam_windows(Some((&one, one.len())), false);
         assert!(complete && w.len() == 1);
+    }
+
+    #[test]
+    fn a_cba_beside_the_mcfg_is_ecam_root_does_not_know() {
+        // A whole MCFG for segment 0's boot host bridge, and the DSDT of
+        // another (a hot-pluggable one, present at boot) whose ECAM only
+        // its _CBA gives:
+        //   Device (PC01) { Name (_HID, EisaId ("PNP0A08"))
+        //                   Method (_CBA) { Return (0xD0000000) } }
+        let one = mcfg(&[(0xe000_0000, 0, 0, 0x7f)]);
+        let dsdt: &[u8] = &[
+            0x5b, 0x82, 0x1a, b'P', b'C', b'0', b'1', // Device (PC01)
+            0x08, b'_', b'H', b'I', b'D', 0x0c, 0x41, 0xd0, 0x0a, 0x08, // Name (_HID, EisaId)
+            0x14, 0x0b, b'_', b'C', b'B', b'A', 0x00, // Method (_CBA, 0)
+            0xa4, 0x0c, 0x00, 0x00, 0x00, 0xd0, // Return (0xD0000000)
+        ];
+        // Read whole, or split anywhere, even inside the name.
+        for at in 0..=dsdt.len() {
+            let mut n = AmlScan::default();
+            n.feed(&dsdt[..at]);
+            n.feed(&dsdt[at..]);
+            assert!(n.cba, "split at {at}");
+            assert!(!ecam_windows(Some((&one, one.len())), n.may_describe_ecam()).1, "split at {at}");
+        }
+        // As a Name, or reached by a path, too.
+        for aml in [&[0x08, b'_', b'C', b'B', b'A', 0x0c, 0, 0, 0, 0xd0][..], b"\\_SB_PC01_CBA"] {
+            let mut n = AmlScan::default();
+            n.feed(aml);
+            assert!(n.cba);
+        }
+        // Tables that may Load or LoadTable others root never reads, in
+        // whatever pieces.
+        //   Load (\_SB.TBL1, Local0); LoadTable ("OEM1", "", "", "", "", 0)
+        for aml in [&[0x5b, 0x20, b'\\', b'.', b'_', b'S', b'B', b'_', b'T', b'B', b'L', b'1', 0x60][..], &[0x5b, 0x1f, 0x0d, b'O', b'E', b'M', b'1', 0][..]] {
+            for at in 0..=aml.len() {
+                let mut n = AmlScan::default();
+                n.feed(&aml[..at]);
+                n.feed(&aml[at..]);
+                assert!(n.load && !ecam_windows(Some((&one, one.len())), n.may_describe_ecam()).1, "split at {at}");
+            }
+        }
+        // Tables without either leave the MCFG's windows complete; other
+        // extended opcodes (Device 0x5b82, Mutex 0x5b01) are not Load.
+        let mut n = AmlScan::default();
+        n.feed(&dsdt[..18]);
+        n.feed(b"_CB");
+        n.feed(b"_CRS_CBX");
+        n.feed(&[0x5b, 0x01, b'M', b'T', b'X', b'0', 0x00, 0x5b, 0x21]);
+        assert!(!n.may_describe_ecam() && ecam_windows(Some((&one, one.len())), n.may_describe_ecam()).1);
+        // Without a MCFG it stays incomplete whatever the AML says.
+        assert!(!ecam_windows(None, false).1);
     }
 
     #[test]

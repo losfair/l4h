@@ -85,8 +85,9 @@ struct Hw {
     frames: crate::acpi::Frames,
     /// The MCFG's ECAM windows, of every segment, and whether these are
     /// all of them (trust::ecam_windows).  If the firmware has no MCFG,
-    /// lists no window, or more than root keeps, no memory write is
-    /// served: any could be a configuration write.
+    /// lists no window, or more than root keeps, or its AML may give ECAM
+    /// of its own (a _CBA), no memory write is served: any could be a
+    /// configuration write.
     ecam: ArrayVec<trust::Ecam, { trust::MAX_ECAM }>,
     ecam_complete: bool,
     /// I/O ports that reset the machine, put it to sleep, enter SMM or
@@ -136,13 +137,31 @@ impl Hw {
         }
         // Every ECAM window, or the AML writes no memory: a write into
         // one root does not know of would go unchecked.  No MCFG is not
-        // no ECAM: a host bridge's _CBA can describe one alone.
+        // no ECAM, nor is a MCFG all of it: a host bridge's _CBA can
+        // describe one alone, so the AML's tables are searched for one,
+        // and for loading others (trust::AmlScan).
+        let mut scan = trust::AmlScan::default();
+        let scanned = crate::acpi::aml_tables(bootinfo, phys, |phys, pa, len| {
+            let mut buf = [0; 512];
+            let mut done = 0;
+            while done < len {
+                let n = (len - done).min(buf.len());
+                phys.read_into(pa.checked_add(done)?, &mut buf[..n])?;
+                scan.feed(&buf[..n]);
+                done += n;
+            }
+            Some(())
+        });
         let mut buf = [0; trust::MCFG_MAX];
-        if let Ok(mcfg) = crate::acpi::find_len(bootinfo, phys, b"MCFG", &mut buf) {
-            (hw.ecam, hw.ecam_complete) = trust::ecam_windows(mcfg);
+        if let (Ok(mcfg), Some(_)) = (crate::acpi::find_len(bootinfo, phys, b"MCFG", &mut buf), scanned) {
+            (hw.ecam, hw.ecam_complete) = trust::ecam_windows(mcfg, scan.may_describe_ecam());
         }
         if !hw.ecam_complete {
-            log!("l4h-root: no MCFG, one that cannot be read, lists no ECAM window or more than {}: the TPM's AML gets no memory writes", trust::MAX_ECAM);
+            log!("l4h-root: the TPM's AML gets no memory writes: ECAM root may not know of ({})",
+                if scanned.is_none() { "the AML cannot be read" }
+                else if scan.cba { "the AML names a _CBA" }
+                else if scan.load { "the AML may load tables" }
+                else { "no MCFG, one that cannot be read, or that lists no ECAM window or more than root keeps" });
         }
         hw
     }
