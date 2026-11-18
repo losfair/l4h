@@ -106,6 +106,7 @@ static int attest_call_locked(u32 op, const u8 *in, size_t in_len, size_t blob_l
 	do {
 		/* 0 is "none" (outstanding, and the page's initial seq). */
 		u32 s = ++seq ?: ++seq, n;
+		s32 status;
 		long left;
 
 		if (READ_ONCE(page->state) & L4H_ATTEST_FAILED) {
@@ -132,8 +133,12 @@ static int attest_call_locked(u32 op, const u8 *in, size_t in_len, size_t blob_l
 			break;
 		}
 		smp_rmb();
-		if (READ_ONCE(page->status)) {
-			ret = READ_ONCE(page->status);
+		/* Read once: the host's page.  An errno, or the host failed; a
+		 * status that changed under a second read must not pass for
+		 * success with no answer (a taint lost, flush_taints()). */
+		status = READ_ONCE(page->status);
+		if (status) {
+			ret = status < 0 && status >= -MAX_ERRNO ? status : -EIO;
 			break;
 		}
 		n = READ_ONCE(page->out_len);
