@@ -423,8 +423,8 @@ hooks (§10.2), the Android features of §5.8 and x86's
 - Kernel `*_nofault` accesses check that the address is mapped in the
   guest-kernel VSpace, since a fault there stops the guest. The direct map
   has holes where RAM blocks became seL4 objects (§8.3), so its range is
-  checked block by block (`l4h_kernel_range_ok()`, used by `/dev/mem` and
-  BPF `probe_read_kernel`). A block being converted is marked busy first,
+  checked block by block (`l4h_kernel_range_ok()`, used by BPF
+  `probe_read_kernel`). A block being converted is marked busy first,
   and its frames are revoked only once no access that found it mapped is
   still between its check and its access. For the same reason the x86_64
   `load_unaligned_zeropad()` (checksum tails, dcache name hashing,
@@ -1614,6 +1614,12 @@ pool, and host components map only host-owned pages.
   through two levels: root slot `L4H_SLOT_RAM_L1_BASE + n` is a level-1
   CNode (radix 9) for GiB `n`, whose slot `j` holds the level-2 CNode
   (radix 9) of block `512 n + j`, so `L4H_FRAME_CPTR(gpa)` names any frame.
+  The guest copies a frame through it only for RAM with its frames
+  (`l4h_frame_mappable`), and only readable for its kernel's image, whose
+  shared blocks hold read-only frames: past 64 GiB the CPtr names its other
+  root slots, and a page table entry (a driver's PFNMAP) may name any
+  address. A process's access to anything else is a bus error, not a fault
+  that repeats; the guest has no `/dev/mem`.
   The host installs the level-2 CNodes of boot blocks; the guest retypes
   its own for the others. Boot info carries `nr_blocks` and `boot_blocks`.
 - **Guest early boot** (`kernel/caps.c`, `l4h_caps_init`). memblock knows
@@ -2084,7 +2090,8 @@ crosses
 at most one boundary, and blkd splits such a request into two device
 requests. If the device has no room for the second when the first starts,
 it waits ("carry") and starts before any new request; the guest gets one
-completion, with the first error. The overlap rule applies extent by
+completion, with the first error. A carried piece of a client being removed
+never starts: its pool is already cut off from the device, so it fails. The overlap rule applies extent by
 extent: dom0 can only reattach the physical extents of a removed LV once no
 guest holds them, and provisioning (`BLK_WRITE`) refuses every attached
 extent.
@@ -2319,7 +2326,11 @@ firewalling belong in a VM.
 - **Offloads.** Checksum and TSO metadata pass through in the virtio-net
   header. netd validates flags, checksum offsets and GSO type, including
   that a GSO frame is TCP over IPv4/IPv6 and that no checksum starts in
-  the Ethernet header, and drops incoherent headers. A
+  the Ethernet header, and drops incoherent headers. A GSO frame with no
+  more payload than one segment is a plain frame with a partial checksum,
+  as Linux takes it from virtio-net (`virtio_net_hdr_to_skb`): no receiver
+  or device's TSO is asked to cut a frame of headers alone or of one
+  segment, and the uplink's minimum frame length applies to it. A
   frame for a port that cannot take its offload is segmented and checksummed
   in software.
   A guest port takes a GSO frame whole only if its driver accepted
@@ -2407,7 +2418,10 @@ dom0's external IP, or owns a cloud alias IP outright.
   takes an address from one endpoint only (`-EEXIST`), so a reply always
   leaves through the endpoint whose rule steered the request.
 - **What is classified.** Untagged IPv4 and IPv6 only; up to two IPv6
-  hop-by-hop, routing or destination-options headers are skipped. Ports
+  hop-by-hop, routing or destination-options headers, an authentication
+  header and a fragment header are skipped. An IPv6 packet with more
+  extension headers, or one cut short, is not classified: what follows
+  might be Neighbor Discovery, which no rule takes. Ports
   only from a first fragment: later fragments match proto and IP rules
   when the protocol is known. A later IPv6 fragment whose Next Header
   requires further parsing matches only IP rules; its payload is never
@@ -2739,7 +2753,9 @@ root restarts. Root and netd know no device kind. The design is issue
   256 looks per turn, refuses an offer of another ABI, and stops reading a
   channel whose producer broke the protocol. It sends a driver only frames
   inside its offer (checksum and GSO types, MSS and header bounds, frame
-  lengths) and segments and checksums the rest.
+  lengths, more than one segment of payload in a GSO frame) and segments
+  and checksums the rest; the nicd loop checks GSO frames against the
+  offer again before a driver programs TSO.
 - **The SDK** (`l4h-nicdrv`): the `NicDriver` trait (what netd's drivers
   had: `start`, `offer`, `receive`, `transmit` and their interrupt
   handshakes), `Hw` (BARs, DMA region, MSI-X, legacy ports, the
@@ -2768,9 +2784,14 @@ root restarts. Root and netd know no device kind. The design is issue
   (`Published::cfg_req`), inside the manifest's windows, past the header,
   and by an allow-list: vendor-specific capabilities (not virtio's, one of
   which reaches a whole BAR), AER's status registers, LTR, L1 PM substates,
-  and in the PCI Express capability Device Control's relaxed ordering and
-  no-snoop bits and Link Control's ASPM bits; root merges the write into
-  the register's other bits.
+  and in the PCI Express capability Device Control's relaxed ordering bit
+  and Link Control's ASPM bits; root merges the write into the register's
+  other bits. Root clears Device Control's Enable No Snoop (on from reset)
+  before each start, and the driver cannot set it: a TLP that does not
+  snoop reads memory past the CPU's caches where the IOMMU does not force
+  snooping (VT-d without Snoop Control; AMD-Vi's entries force coherence),
+  which could return a recycled page's old contents from under the zeroes
+  still in cache.
 - **Confinement.** A nicd is outside the TCB (`confined` in `l4hctl nic
   list`) when the IOMMU is on with interrupt remapping and its device's
   isolation group holds only functions the host does not use or NICs of
@@ -4206,13 +4227,20 @@ The chain has four links.
 
    **AK enrollment.** A quote only proves something if the AK is in a real
    TPM. `make-credential` encrypts a secret to the EK (`--ek`, else from its
-   certificate, else `ekpub`, which the verifier must first check against
-   the manufacturer's certificate for that key: a host could give its own)
-   bound to the AK's name (TPM2_MakeCredential). A guest decrypts it with
+   certificate, which `--ek-ca` checks as `verify` does, else `ekpub`,
+   which the verifier must first check against the manufacturer's
+   certificate for that key: a host could give its own; an unchecked
+   certificate or `ekpub` gets a warning) bound to the AK's name
+   (TPM2_MakeCredential), and only for an AK that is a fixedTPM
+   restricted signing key, since the credential activates for any object
+   of that name. A guest decrypts it with
    `l4hctl attest activate`, which runs TPM2_ActivateCredential with a
    PolicySecret(endorsement) session for the EK; only the TPM holding both
    keys can. The verifier then pins the AK's name (`--ak-name`), which is
-   stable across boots.
+   stable across boots. The evidence's EK certificate is unsigned and not
+   bound to the AK: once the AK is pinned, `--ek-ca` at `verify` shows
+   only that some TPM's certificate came along. The binding is the one
+   checked at enrollment, so `--ek-ca` belongs with `make-credential`.
 
    **Rate limit.** ActivateCredential is the only request that uses the TPM
    (about 80 ms on a discrete Infineon TPM), and trustd answers one request
@@ -4404,7 +4432,11 @@ runs the secondary's ActivateCredential calls (the relay):
     carved for itself or a driver (the AML's pages are carved into a frame
     table
     of their own, so whatever root carved, the IOMMU's registers among
-    it, is not free for them), and not a BAR of a PCI function root drives. On
+    it, is not free for them), not a BAR of a PCI function root drives
+    (the balloon's included), and not the HPET's registers (0xfed00000 and
+    the HPET table's): its comparators send MSIs that no IOMMU remaps
+    (AMD-Vi passes a special device's through), with which the AML could
+    send any vector, NMI or INIT to any CPU. On
     a machine split into partitions the others' RAM is device memory to this
     kernel and the descriptor does not list it, so there root serves memory
     only where none can be: the chipset's addresses from 0xfec00000 to 4 GiB,
@@ -4412,7 +4444,9 @@ runs the secondary's ActivateCredential calls (the relay):
     serves I/O ports seL4 has not handed out, except those that
     reset the machine, put it to sleep or enter SMM (0x60, 0x64, 0x92,
     0xb2–0xb3, 0xcf9 and the FADT's SMI command and PM1/PM2 control
-    blocks). PCI configuration,
+    blocks) and the legacy interrupt controllers and timer only the kernel
+    programs (the 8259s at 0x20 and 0xa0, their ELCR at 0x4d0, the 8254 at
+    0x40). PCI configuration,
     by ports or through the MCFG's ECAM windows, it serves for reading. Writes
     it refuses to every function root manages (disk controllers, uplink NICs,
     xHCI controllers, the balloon device, IOMMUs, every bridge, an ISA or LPC
@@ -4420,7 +4454,12 @@ runs the secondary's ActivateCredential calls (the relay):
     to functions of other segments, and in every function to the command
     register, the BARs and the expansion ROM's, so the AML neither moves a
     device root does not drive onto another's addresses nor lets one master
-    the bus. Root keeps up to 16 ECAM windows; if the MCFG lists more, or
+    the bus, and to the MSI and MSI-X capabilities; in memory it refuses
+    writes to every function's MSI-X table and pending bits, as found at
+    boot (none at all if there are more than root keeps): a function the
+    firmware left mastering the bus would send the AML's message as an
+    interrupt, where none is remapped any vector to any CPU. Root keeps up
+    to 16 ECAM windows; if the MCFG lists more, or
     cannot be read, it serves no memory write at all, since any could be a
     configuration write. Refused reads return all ones, and root logs refusals
     through `log::RateLimit`.
@@ -5098,8 +5137,18 @@ Every PCI function no other partition lists is partition 0's, so
 `partitions = 1` behaves like one l4h. The shim refuses, rather than
 guesses: a BDF that does not exist or is in two partitions, a bridge, a
 partition without a disk controller, functions behind a PCI(-X) bridge
-(one requester ID) split between partitions, and a partition 0 without the
-boot CPU. Without MCFG (GCE's i440FX machines) it scans through the ports
+(one requester ID) split between partitions, functions of one isolation
+group split between partitions, and a partition 0 without the
+boot CPU. An isolation group is root's (`acs.rs`, as for a confined NIC
+driver, §9.8): the functions of a multi-function device without ACS, and
+those below switch or root ports that do not isolate them, reach each
+other's BARs without passing the IOMMU, so a device of one partition could
+write another partition's devices. The shim first turns ACS on in every
+function, as partition 0's root does (§9.5), so that the ports are judged
+as they will be; without MCFG it cannot reach ACS, and nothing below a
+bridge isolates. `l4hctl mk-check` refuses functions of one Linux IOMMU
+group in two partitions, and the installer gives another partition only
+a device alone in its group (its slot, without an IOMMU in Linux). Without MCFG (GCE's i440FX machines) it scans through the ports
 0xcf8/0xcfc, and the descriptor's ECAM base is 0.
 
 **CPUs.** Each partition's MADT lists only its own LAPIC/x2APIC entries,

@@ -292,8 +292,17 @@ impl Blkd {
     }
 
     /// Start the carried piece if the device has room: whether it did.
+    /// A piece of a client being drained (`remove`) is never started: root
+    /// has already cut its pool off from the device, so it fails instead,
+    /// and the request completes with the first piece.
     fn start_carry(&mut self) -> bool {
-        if self.carry.is_none() || !self.drv.can_start() { return false; }
+        let Some(t) = self.carry.as_ref().map(|c| c.t) else { return false };
+        if self.pending[t].is_some_and(|p| self.drains[p.client].is_some()) {
+            self.carry = None;
+            finish(&mut self.pending[..], &mut self.clients[..], t, blk::STATUS_IOERR);
+            return false;
+        }
+        if !self.drv.can_start() { return false; }
         let c = self.carry.take().unwrap();
         let r = self.drv.start((c.t as u64) << 1 | 1, c.unit, c.op, c.sector, &c.segs);
         if let Err(status) = r { finish(&mut self.pending[..], &mut self.clients[..], c.t, status); }

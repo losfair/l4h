@@ -88,20 +88,31 @@ struct Hw {
     /// write is served: any could be a configuration write.
     ecam: ArrayVec<trust::Ecam, { trust::MAX_ECAM }>,
     ecam_complete: bool,
-    /// I/O ports that reset the machine, put it to sleep or enter SMM:
-    /// (first, count).
-    ports: ArrayVec<(usize, usize), 16>,
+    /// I/O ports that reset the machine, put it to sleep, enter SMM or
+    /// program the legacy interrupt controllers and timer: (first, count).
+    ports: ArrayVec<(usize, usize), 24>,
+    /// Memory it never reaches: the HPETs' registers (trust::HPET_DEFAULT).
+    mmio: ArrayVec<(u64, u64), 2>,
 }
 
 #[cfg(target_arch = "x86_64")]
 impl Hw {
     /// From the firmware's tables, read with `phys`.
     fn find(bootinfo: &sel4::BootInfoPtr, phys: &mut crate::acpi::Phys) -> Hw {
-        let mut hw = Hw { frames: crate::acpi::Frames::hw(), ecam: ArrayVec::new(), ecam_complete: true, ports: ArrayVec::new() };
-        // The keyboard controller's and port A's reset, APM's SMI command
-        // and data, the reset control register.
-        for r in [(0x60, 1), (0x64, 1), (0x92, 1), (0xb2, 2), (0xcf9, 1)] {
+        let mut hw = Hw {
+            frames: crate::acpi::Frames::hw(), ecam: ArrayVec::new(), ecam_complete: true, ports: ArrayVec::new(),
+            mmio: ArrayVec::new(),
+        };
+        for r in trust::HW_REFUSED_PORTS {
             let _ = hw.ports.push(r);
+        }
+        // The HPET where PCs have it, and where its table says it is.
+        let _ = hw.mmio.push(trust::HPET_DEFAULT);
+        let mut buf = [0; 56];
+        if let Some(b) = crate::acpi::find(bootinfo, phys, b"HPET", &mut buf).and_then(trust::hpet_block) {
+            if b != trust::HPET_DEFAULT {
+                let _ = hw.mmio.push(b);
+            }
         }
         let mut buf = [0; crate::acpi::FADT_LEN];
         if let Some(f) = crate::acpi::find(bootinfo, phys, b"FACP", &mut buf) {
@@ -697,16 +708,22 @@ pub fn done(h: &mut Host, id: usize) {
 /// - memory that is free device memory: not RAM, and not what root carved
 ///   for itself or a driver, which its frame table cannot have again.  On
 ///   a machine split into partitions, only where it is known to be no
-///   partition's memory (`partition_allows`);
+///   partition's memory (`partition_allows`).  Never the HPET's
+///   registers (trust::HPET_DEFAULT);
 /// - I/O ports seL4 has not issued, other than those that reset the
-///   machine, put it to sleep or enter SMM;
+///   machine, put it to sleep, enter SMM or program the legacy interrupt
+///   controllers and timer (trust::HW_REFUSED_PORTS);
 /// - of the BARs of the functions root drives, nothing;
 /// - PCI configuration, by the configuration mechanism or through ECAM:
 ///   reads; writes only to functions root does not manage (`managed`),
 ///   and in no function to the command register, the BARs or the
 ///   expansion ROM's (trust::hw_config_write_protected), so that the AML
 ///   neither moves a device onto another's addresses nor lets one master
-///   the bus.
+///   the bus, nor to the MSI and MSI-X capabilities (`msi_cap`), and in
+///   memory never to an MSI-X table or its pending bits
+///   (pci::MSIX_BLOCKS): a function the firmware left mastering the bus
+///   would send the AML's message as an interrupt, where none is
+///   remapped any vector to any CPU.
 ///
 /// Refusals are logged a few a second at most.
 #[cfg(target_arch = "x86_64")]
@@ -738,9 +755,18 @@ fn hw_access(h: &mut Host, op: u64, addr: usize, off: usize, width: usize, value
             if !partition_allows(addr, width) {
                 return Err("not known to be outside the partitions' memory");
             }
+            if hw.mmio.iter().any(|&(base, size)| trust::hw_meets(addr, width, base, size)) {
+                return Err("the HPET, whose interrupts the IOMMU does not remap");
+            }
             if write {
                 if !hw.ecam_complete {
                     return Err("a memory write, with more ECAM windows than root knows");
+                }
+                if !h.msix_complete {
+                    return Err("a memory write, with more MSI-X tables than root knows");
+                }
+                if h.msix_blocks.iter().any(|&(base, size)| trust::hw_meets(addr, width, base, size)) {
+                    return Err("a function's MSI-X table or pending bits");
                 }
                 if let Some((segment, b, d, f, o)) = hw.ecam_function(addr) {
                     if trust::hw_config_write_protected(o, width) {
@@ -750,6 +776,9 @@ fn hw_access(h: &mut Host, op: u64, addr: usize, off: usize, width: usize, value
                     // function of another is.
                     if segment != 0 || managed(h, b, d, f) {
                         return Err("configuration of a function root manages");
+                    }
+                    if msi_cap(h, b, d, f, o, width) {
+                        return Err("a function's MSI or MSI-X capability");
                     }
                 }
             }
@@ -789,6 +818,9 @@ fn hw_access(h: &mut Host, op: u64, addr: usize, off: usize, width: usize, value
             if write && managed(h, bus, dev, func) {
                 return Err("configuration of a function root manages");
             }
+            if write && msi_cap(h, bus, dev, func, off, width) {
+                return Err("a function's MSI or MSI-X capability");
+            }
             let (word, shift) = (off as u8 & !3, (off % 4) * 8);
             let old = h.pci.read32(bus, dev, func, word);
             let mask = if width == 4 { u32::MAX } else { ((1u32 << (8 * width)) - 1) << shift };
@@ -800,6 +832,13 @@ fn hw_access(h: &mut Host, op: u64, addr: usize, off: usize, width: usize, value
         _ => return Err("no such access"),
     };
     r.ok_or("in use, or not device memory")
+}
+
+/// Whether a configuration write [off, off + width) of bus:dev.func meets
+/// its MSI or MSI-X capability (trust::hw_config_msi).
+#[cfg(target_arch = "x86_64")]
+fn msi_cap(h: &Host, bus: u8, dev: u8, func: u8, off: usize, width: usize) -> bool {
+    trust::hw_config_msi(off, width, |i| (h.pci.read32(bus, dev, func, i as u8 & !3) >> (i % 4 * 8)) as u8)
 }
 
 /// Whether memory [addr, addr + width) may be the AML's on this machine,
@@ -852,11 +891,14 @@ fn managed(h: &Host, bus: u8, dev: u8, func: u8) -> bool {
 }
 
 /// Whether [start, start + len), memory or (`io`) ports, meets a BAR of a
-/// function root drives: what its drivers reach is not the AML's.
+/// function root drives (memd's balloon too, every BAR, including the
+/// legacy ports of a transitional one memd drives through its modern
+/// interface): what its drivers reach is not the AML's.
 #[cfg(target_arch = "x86_64")]
 fn in_bars(h: &Host, start: usize, len: usize, io: bool) -> bool {
     let end = start.saturating_add(len);
     h.ctrls.iter().map(|c| &c.pci).chain(crate::nicd::nics().iter().map(|n| &n.pci)).chain(crate::usb::ctrls().iter().map(|c| &c.pci))
+        .chain(h.balloon.iter())
         .flat_map(|d| d.bars.iter())
         .any(|b| b.size != 0 && b.is_io == io && (b.addr as usize) < end && start < (b.addr as usize).saturating_add(b.size as usize))
 }

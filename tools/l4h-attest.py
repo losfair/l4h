@@ -42,15 +42,20 @@
       A multikernel host's report and evidence name the partition the
       guest runs in (version 2); verify prints it as "partition".
   l4h-attest.py make-credential EVIDENCE SECRET_HEX -o FILE [--ek PEM]
+                [--ek-ca PEM]
       A credential for the host's attestation key, encrypted to its EK
       (TPM2_MakeCredential; the format of tpm2_makecredential).  A guest
       decrypts it with `l4hctl attest activate FILE`: the secret coming
       back proves the AK is in the TPM with that EK, so its name (printed
-      by verify) can be pinned with --ak-name.  The EK is --ek, else the
-      key of the evidence's EK certificate, else the evidence's "ekpub"
-      (a TPM without a certificate in NV, such as AMD's fTPM): that one is
-      only what the host says, so check it against the manufacturer's
-      certificate for it first.
+      by verify) can be pinned with --ak-name.  The AK must be a fixedTPM
+      restricted signing key, as verify requires.  The EK is --ek, else
+      the key of the evidence's EK certificate, which --ek-ca checks as
+      verify does (without it the certificate is only what the host
+      says), else the evidence's "ekpub" (a TPM without a certificate in
+      NV, such as AMD's fTPM): that one is only what the host says, so
+      check it against the manufacturer's certificate for it first.  The
+      EK certificate in later evidence is not bound to the AK: only the
+      credential enrolled with a checked EK is.
 
 Needs the Python `cryptography` package.
 """
@@ -80,6 +85,25 @@ KEY_PCR = 15
 
 class Fail(Exception):
     pass
+
+
+# What parsing data from the host can raise besides Fail: a field missing
+# or of the wrong type, a number out of range (an off-curve point among
+# them), a structure cut short.
+MALFORMED = (KeyError, IndexError, TypeError, ValueError, AttributeError, struct.error)
+
+
+def checked(what):
+    """Make `what` input that a function cannot parse a Fail."""
+    def wrap(f):
+        def g(*args, **kwargs):
+            try:
+                return f(*args, **kwargs)
+            except MALFORMED as e:
+                raise Fail("malformed %s (%s: %s)" % (what, type(e).__name__, e))
+        g.__name__, g.__doc__ = f.__name__, f.__doc__
+        return g
+    return wrap
 
 
 # ---- CBOR (RFC 8949), the subset trustd writes
@@ -199,11 +223,14 @@ class Reader:
 
 def tpm_name(public):
     """The name of a TPMT_PUBLIC: its nameAlg, then its digest (sha256)."""
+    if not isinstance(public, bytes) or len(public) < 4:
+        raise Fail("malformed TPM public area")
     if struct.unpack(">H", public[2:4])[0] != 0x000B:
         raise Fail("name algorithm is not sha256")
     return public[2:4] + hashlib.sha256(public).digest()
 
 
+@checked("TPM public area")
 def parse_public(public):
     """(attributes, key) of a TPMT_PUBLIC with an RSA or ECC P-256 key."""
     r = Reader(public)
@@ -264,6 +291,7 @@ def tpm_ecdsa(sig):
     return encode_dss_signature(int.from_bytes(r.tpm2b(), "big"), int.from_bytes(r.tpm2b(), "big"))
 
 
+@checked("host key")
 def cose_p256(k):
     """A P-256 key from a COSE_Key (EC2)."""
     if k.get(1) != 2 or k.get(-1) != 1:
@@ -278,6 +306,7 @@ def point(key):
 # ---- measure
 
 
+@checked("kernel")
 def launch_digest(kernel, initrd, cmdline, initrd_gpa=None):
     """The digest vmmgr computes at boot (guest.rs, Guest::measure).  The
     initrd is where vmmgr puts it, 1 MiB past the kernel's end
@@ -400,13 +429,10 @@ def check_ek_cert(cert, cas, where, now=None):
         raise Fail("malformed certificate: %s" % e)
 
 
-def check_evidence(ev, pins, ak_name, ek_ca):
-    """The host's signing key and what the evidence shows about it."""
-    if ev.get("v") not in (1, 2):
-        raise Fail("unknown evidence version")
-    partition = ev.get("partition") if ev["v"] == 2 else None
-    if ev["v"] == 2 and not (isinstance(partition, int) and 0 <= partition < 8):
-        raise Fail("multikernel evidence without a valid partition")
+@checked("evidence")
+def attestation_key(ev):
+    """The evidence's attestation key and its name: a fixedTPM restricted
+    signing key (ECC), the only kind whose quotes the TPM made."""
     ak = ev["ak"]
     attrs, ak_key = parse_public(ak)
     # A restricted signing key of the TPM only signs what the TPM made.
@@ -414,7 +440,28 @@ def check_evidence(ev, pins, ak_name, ek_ca):
         raise Fail("attestation key is not a fixedTPM restricted signing key")
     if not isinstance(ak_key, ec.EllipticCurvePublicKey):
         raise Fail("attestation key is not ECC")
-    name = tpm_name(ak)
+    return ak_key, tpm_name(ak)
+
+
+def load_cas(ek_ca):
+    try:
+        with open(ek_ca, "rb") as f:
+            return x509.load_pem_x509_certificates(f.read())
+    except ValueError:
+        raise Fail("no CA certificate in %s" % ek_ca)
+
+
+@checked("evidence")
+def check_evidence(ev, pins, ak_name, ek_ca):
+    """The host's signing key and what the evidence shows about it."""
+    if not isinstance(ev, dict):
+        raise Fail("evidence is not a CBOR map")
+    if ev.get("v") not in (1, 2):
+        raise Fail("unknown evidence version")
+    partition = ev.get("partition") if ev["v"] == 2 else None
+    if ev["v"] == 2 and not (isinstance(partition, int) and 0 <= partition < 8):
+        raise Fail("multikernel evidence without a valid partition")
+    ak_key, name = attestation_key(ev)
     if ak_name is not None and name != ak_name:
         raise Fail("attestation key is not the pinned one (name %s)" % name.hex())
     try:
@@ -454,11 +501,7 @@ def check_evidence(ev, pins, ak_name, ek_ca):
         except (ValueError, TypeError):
             raise Fail("malformed EK certificate")
         if ek_ca:
-            try:
-                cas = x509.load_pem_x509_certificates(open(ek_ca, "rb").read())
-            except ValueError:
-                raise Fail("no CA certificate in %s" % ek_ca)
-            check_ek_cert(cert, cas, ek_ca)
+            check_ek_cert(cert, load_cas(ek_ca), ek_ca)
             ek["verified"] = True
     elif ek_ca:
         raise Fail("no EK certificate in the evidence")
@@ -534,10 +577,13 @@ def check_flags(claims, deny_taint, require_seal):
     return {"taint_bits": flag_list(taint), "seal_bits": flag_list(seal)}
 
 
+@checked("report")
 def check_report(rep, key, data, launch, deny_taint="console-in", require_seal="console-in", partition=None):
-    if not (isinstance(rep, tuple) and rep[:2] == ("tag", 18)) or len(rep[2]) != 4:
+    if not (isinstance(rep, tuple) and rep[:2] == ("tag", 18)) or not isinstance(rep[2], list) or len(rep[2]) != 4:
         raise Fail("report is not a COSE_Sign1")
     protected, _unprotected, payload, sig = rep[2]
+    if not all(isinstance(x, bytes) for x in (protected, payload, sig)):
+        raise Fail("report is not a COSE_Sign1")
     if cbor_decode(protected) != {1: -7}:
         raise Fail("report is not ES256")
     tbs = b"\x84\x6aSignature1" + cbor_bytes(protected) + b"\x40" + cbor_bytes(payload)
@@ -548,6 +594,8 @@ def check_report(rep, key, data, launch, deny_taint="console-in", require_seal="
     except InvalidSignature:
         raise Fail("report signature does not verify")
     c = cbor_decode(payload)
+    if not isinstance(c, dict):
+        raise Fail("report claims are not a CBOR map")
     if c.get("v") not in (1, 2):
         raise Fail("unknown report version")
     # Version 2: a multikernel partition's, as its evidence says.
@@ -582,13 +630,31 @@ def kdfe(z, label, party_u, party_v, bits):
     return out[:bits // 8]
 
 
-def evidence_ek(ev, ek_pem=None):
+@checked("evidence")
+def evidence_ek(ev, ek_pem=None, ek_ca=None):
     """The EK to make a credential for: `ek_pem`, else the key of the
-    evidence's EK certificate, else its EK public area (ekpub)."""
+    evidence's EK certificate, checked against the CA certificates in file
+    `ek_ca` if given, else its EK public area (ekpub)."""
+    if not isinstance(ev, dict):
+        raise Fail("evidence is not a CBOR map")
     if ek_pem:
         return serialization.load_pem_public_key(ek_pem)
     if "ekcert" in ev:
-        return x509.load_der_x509_certificate(ev["ekcert"]).public_key()
+        try:
+            cert = x509.load_der_x509_certificate(ev["ekcert"])
+        except (ValueError, TypeError):
+            raise Fail("malformed EK certificate")
+        if ek_ca:
+            check_ek_cert(cert, load_cas(ek_ca), ek_ca)
+        else:
+            # Anyone can make a certificate: the credential would go to
+            # whatever key the host chose, and the AK it enrolls be
+            # anyone's.
+            print("l4h-attest: warning: EK certificate not verified (--ek-ca): the EK is only what the host says",
+                  file=sys.stderr)
+        return cert.public_key()
+    if ek_ca:
+        raise Fail("no EK certificate in the evidence")
     if "ekpub" in ev:
         attrs, ek = parse_public(ev["ekpub"])
         # fixedTPM, restricted, decrypt: a storage key, as an EK is.
@@ -603,6 +669,8 @@ def evidence_ek(ev, ek_pem=None):
 def make_credential(ek, name, secret):
     """TPM2_MakeCredential (TPM 2.0 Part 1, 24.4) for an EK with the
     default template (AES-128-CFB, sha256)."""
+    if not isinstance(ek, (rsa.RSAPublicKey, ec.EllipticCurvePublicKey)):
+        raise Fail("the EK is neither an RSA nor an ECC key")
     if isinstance(ek, rsa.RSAPublicKey):
         seed = os.urandom(32)
         enc_secret = ek.encrypt(seed, padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=b"IDENTITY\0"))
@@ -647,6 +715,7 @@ def main():
     c.add_argument("secret", help="hex, at most 32 bytes")
     c.add_argument("-o", required=True)
     c.add_argument("--ek", help="the EK's public key (PEM), instead of the evidence's EK certificate or ekpub")
+    c.add_argument("--ek-ca", help="CA certificates (PEM, one or more) one of which issued the EK certificate")
     a = ap.parse_args()
     try:
         if a.cmd == "measure":
@@ -669,11 +738,14 @@ def main():
                 print("l4h-attest: warning: attestation key not pinned (--ak-name)", file=sys.stderr)
         else:
             ev = cbor_decode(open(a.evidence, "rb").read())
-            ek = evidence_ek(ev, open(a.ek, "rb").read() if a.ek else None)
+            ek = evidence_ek(ev, open(a.ek, "rb").read() if a.ek else None, a.ek_ca)
             secret = bytes.fromhex(a.secret)
             if not 0 < len(secret) <= 32:
                 raise Fail("the secret is 1 to 32 bytes")
-            open(a.o, "wb").write(make_credential(ek, tpm_name(ev["ak"]), secret))
+            # Only a TPM's restricted signing key is worth enrolling: the
+            # credential activates for any object of that name.
+            _, name = attestation_key(ev)
+            open(a.o, "wb").write(make_credential(ek, name, secret))
     except Fail as e:
         print("l4h-attest: %s" % e, file=sys.stderr)
         sys.exit(1)

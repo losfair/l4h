@@ -9,3 +9,7 @@ description = "dom0 command-line client of the l4h control API"
 
 [profile.release]
 opt-level = "s"
+# As the host's (host/Cargo.toml): an overflow in the arithmetic on what
+# the host or the machine's tables say stops the command instead of
+# wrapping past a bound.
+overflow-checks = true

@@ -149,6 +149,18 @@ fn check(hdr: &mut [u8; HDR_SIZE], frame: &[u8], min_mss: usize) -> bool {
             if ip_len.is_some_and(|n| n < f.hdrs - f.ip || f.ip + n > frame.len()) {
                 return false;
             }
+            // Too small to be GSO (Linux's virtio_net_hdr_to_skb): a frame
+            // of one segment, or of headers alone, goes on as a plain one
+            // with its partial checksum.  No receiver, and no device's
+            // segmentation offload, is ever given one: hardware TSO with
+            // no payload beyond one segment is outside what the datasheets
+            // allow, and a plain frame meets the uplink's minimum length.
+            if frame.len() - f.hdrs <= get16(hdr, 4) {
+                hdr[1] = GSO_NONE;
+                put16(hdr, 2, 0);
+                put16(hdr, 4, 0);
+                return true;
+            }
             put16(hdr, 2, f.hdrs);
             true
         }
@@ -528,6 +540,34 @@ mod tests {
         put16(&mut h, 8, 16);
         assert!(sanitize(&mut h, &f[..len]));
         (f, len, h)
+    }
+
+    /// A GSO frame of one segment or none is a plain frame with a partial
+    /// checksum (as Linux takes it from virtio-net): no device gets a TSO
+    /// request without payload to cut, or a frame under the minimum.
+    #[test]
+    fn a_gso_frame_of_one_segment_is_plain() {
+        for (payload, mss) in [(0, 1448), (1, 1448), (1448, 1448), (MIN_MSS, MIN_MSS)] {
+            let (mut f, len, h) = gso_frame(payload, mss);
+            assert!(!is_gso(&h) && h[0] == F_NEEDS_CSUM, "{payload} {mss}");
+            assert_eq!((get16(&h, 2), get16(&h, 4), get16(&h, 6), get16(&h, 8)), (0, 0, 34, 16));
+            // Its checksum completes as a plain frame's does.
+            let mut ch = h;
+            complete_csum(&mut f[..len], &mut ch);
+            let t = parse_tcp(&f[..len]).unwrap();
+            assert_eq!(ch[0], 0);
+            assert_eq!(fold(sum(pseudo(&f[..len], &t, len - t.tcp), &f[t.tcp..len])), 0xffff, "{payload} {mss}");
+            // So does a receiver's: an uplink's frame of one segment too.
+            let (f, len, _) = gso_frame(payload, mss);
+            let mut rx = [F_NEEDS_CSUM, GSO_TCPV4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            put16(&mut rx, 4, mss);
+            put16(&mut rx, 6, 34);
+            put16(&mut rx, 8, 16);
+            assert!(sanitize_rx(&mut rx, &f[..len], UPLINK_MIN_MSS) && !is_gso(&rx));
+        }
+        // More than one segment stays GSO.
+        let (_, _, h) = gso_frame(1449, 1448);
+        assert!(is_gso(&h) && get16(&h, 2) == 54 && get16(&h, 4) == 1448);
     }
 
     #[test]

@@ -15,6 +15,10 @@ use l4h_host::fixed::{ArrayVec, StaticCell};
 const MAX_FUNCTIONS: usize = if cfg!(target_arch = "aarch64") { 16 << 8 } else { 256 << 8 };
 pub type Inventory = ArrayVec<abi::CtlPci, MAX_FUNCTIONS>;
 pub static INVENTORY: StaticCell<Inventory> = StaticCell::new(ArrayVec::new());
+/// Every function's MSI-X table and pending bits, as memory ranges found
+/// at boot (`msix_blocks`): the AML writes none (trustd::hw).
+pub type MsixBlocks = ArrayVec<(u64, u64), 1024>;
+pub static MSIX_BLOCKS: StaticCell<MsixBlocks> = StaticCell::new(ArrayVec::new());
 
 #[cfg(target_arch = "x86_64")]
 const CONFIG_ADDRESS: u16 = 0xcf8;
@@ -754,6 +758,15 @@ impl Pci {
         }
         self.write16(bus, dev, func, 4, cmd);
         bars
+    }
+
+    /// The MSI-X table and pending bits of `d`, where its BARs put them.
+    pub fn msix_blocks(&self, d: &Device) -> [Option<(u64, u64)>; 2] {
+        let Some(m) = d.msix else { return [None; 2] };
+        let ctrl = self.read16(d.bus, d.dev, d.func, m.cap + 2);
+        let pba = self.read32(d.bus, d.dev, d.func, m.cap + 8);
+        let bar = |i: u8| d.bars.get(i as usize).filter(|b| b.size != 0 && !b.is_io).map(|b| b.addr);
+        l4h_host::trust::msix_blocks(ctrl, m.table_offset | m.table_bar as u32, pba, bar)
     }
 
     /// The capabilities of a function with BARs `bars`.  The device says

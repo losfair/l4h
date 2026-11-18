@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Test-only access to the reclaim hook: smaps reads the software PTE and
- * cannot observe a hardware access. Loaded only by the test runners. */
+ * cannot observe a hardware access; and a PFNMAP of any address (mmap).
+ * Loaded only by the test runners. */
 #include <linux/mm.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
@@ -80,9 +81,19 @@ out:
 	return young;
 }
 
+/* A PFNMAP of any guest-physical address (the offset), as a driver's
+ * remap_pfn_range() makes: the self-test maps memory that is no frame of
+ * guest RAM, and the kernel's image, through it. */
+static int aging_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	return remap_pfn_range(vma, vma->vm_start, vma->vm_pgoff,
+			       vma->vm_end - vma->vm_start, vma->vm_page_prot);
+}
+
 static const struct file_operations aging_fops = {
 	.owner = THIS_MODULE,
 	.unlocked_ioctl = aging_ioctl,
+	.mmap = aging_mmap,
 };
 
 static struct miscdevice aging_device = {

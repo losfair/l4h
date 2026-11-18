@@ -324,7 +324,7 @@ echo "MKTEST: reports verify and name their partitions"
 
 # ActivateCredential, partition 0's own and the others' through it.
 secret=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
-python3 "$tool" make-credential "$p1/evidence" "$secret" -o "$out/cred" || fail "make-credential"
+python3 "$tool" make-credential "$p1/evidence" "$secret" -o "$out/cred" "${ca[@]}" || fail "make-credential"
 dom0_initramfs "$out/cred"
 run_qemu
 saved 2

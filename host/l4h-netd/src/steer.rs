@@ -314,25 +314,41 @@ fn ip6(p: &[u8], side: Side, icmp: bool) -> Option<Flow> {
     let mut f = Flow { v6: true, ip, proto: None, port: None };
     let (mut nh, mut off) = (p[6], 40);
     let mut opts = 0;
-    let mut frag = false;
+    let (mut frag, mut ah) = (false, false);
+    // Past the extension headers walked, or where one is cut short, the
+    // upper-layer header is not known, and might be Neighbor Discovery:
+    // such a packet is not classified, and stays on its link as ND does.
     loop {
         match nh {
             // Hop-by-hop, routing, destination options: at most two.
             0 | 43 | 60 => {
                 if opts == 2 || off + 8 > p.len() {
-                    return Some(f);
+                    return None;
                 }
                 let len = (p[off + 1] as usize + 1) * 8;
                 if off + len > p.len() {
-                    return Some(f);
+                    return None;
                 }
                 opts += 1;
+                (nh, off) = (p[off], off + len);
+            }
+            // Authentication header, in 4-byte units past the first two:
+            // once.
+            51 => {
+                if ah || off + 8 > p.len() {
+                    return None;
+                }
+                let len = (p[off + 1] as usize + 2) * 4;
+                if off + len > p.len() {
+                    return None;
+                }
+                ah = true;
                 (nh, off) = (p[off], off + len);
             }
             // Fragment: once.
             44 => {
                 if frag || off + 8 > p.len() {
-                    return Some(f);
+                    return None;
                 }
                 frag = true;
                 let first = be16(p, off + 2) >> 3 == 0;
@@ -341,7 +357,7 @@ fn ip6(p: &[u8], side: Side, icmp: bool) -> Option<Flow> {
                     // Headers after Fragment occur only in the first
                     // fragment.  Here the bytes are payload, even if Next
                     // Header names an extension we normally skip.
-                    f.proto = (!matches!(nh, 0 | 43 | 44 | 60)).then_some(nh);
+                    f.proto = (!matches!(nh, 0 | 43 | 44 | 51 | 60)).then_some(nh);
                     return Some(f);
                 }
             }

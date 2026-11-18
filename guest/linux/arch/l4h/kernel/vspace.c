@@ -204,6 +204,8 @@ static void as_drop_large(struct l4h_as *as, unsigned long va)
 	}
 }
 
+static struct l4h_as kernel_as;
+
 /*
  * Map `phys` at `va`.  With `defer`, a remap that lowers the rights of the
  * frame leaves the TLBs to as_flush_deferred(): a TLB sync lowers many in a
@@ -219,6 +221,12 @@ static int as_map_page(struct l4h_as *as, unsigned long va, unsigned long phys, 
 	int err;
 
 	as_drop_large(as, va);
+	/* No frame the guest may map (l4h_frame_mappable): not a lack of
+	 * memory, and never a CPtr past the RAM CNodes, nor the kernel's
+	 * image writable in a process.  Before the remap of the same frame,
+	 * which would add write to a read-only one. */
+	if (!l4h_frame_mappable(phys, (prot & L4H_PROT_WRITE) && as != &kernel_as))
+		return -ENXIO;
 	e = xa_load(&as->pages, vpn);
 	if (e && entry_pfn(e) == pfn) {
 		/* Same frame.  The entry mirrors the VSpace: a mapping with the
@@ -380,9 +388,7 @@ static void as_reset(struct l4h_as *as, bool may_sleep)
 	}
 }
 
-/* ---- the guest-kernel VSpace (vmalloc, modules, ...) */
-
-static struct l4h_as kernel_as;
+/* ---- the guest-kernel VSpace (vmalloc, modules, ...): kernel_as */
 static DEFINE_RAW_SPINLOCK(kernel_as_lock);
 
 int os_map_memory(void *virt, unsigned long phys, unsigned long len, int r, int w, int x)
@@ -936,7 +942,9 @@ static int map_fault_entry(struct mm_struct *mm, unsigned long va,
  * After a successful page fault, install the leaf for `address` directly,
  * with the protection the TLB sync uses: clean pages are read-only to
  * emulate the dirty bit.  Returns -ENOMEM if there was no memory for the
- * seL4 objects the mapping needs.
+ * seL4 objects the mapping needs, -ENXIO if the entry names memory that is
+ * not a frame of the guest's RAM (l4h_frame_mappable), which no wait
+ * brings.
  */
 int l4h_map_fault(struct mm_struct *mm, unsigned long address)
 {
@@ -991,7 +999,7 @@ int l4h_map_fault(struct mm_struct *mm, unsigned long address)
 	pte_unmap_unlock(pte, ptl);
 out_unlock:
 	mmap_read_unlock(mm);
-	return err == -ENOMEM ? err : 0;
+	return err == -ENOMEM || err == -ENXIO ? err : 0;
 }
 
 

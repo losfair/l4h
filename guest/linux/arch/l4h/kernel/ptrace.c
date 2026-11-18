@@ -81,18 +81,24 @@ long arch_ptrace(struct task_struct *child, long request,
 		ret = poke_user(child, addr, data);
 		break;
 
+	/*
+	 * The whole set, as the regset (genregs_get/genregs_set) and x86's
+	 * copy_regset_*_user() do it: from the registers as they are (read
+	 * from the TCB if they are only there), and with the first
+	 * error, a fault on the buffer or a value putreg() refuses (a
+	 * selector, or a base past user space), not success.  The registers
+	 * before it are set.
+	 */
 #ifdef PTRACE_GETREGS
 	case PTRACE_GETREGS: { /* Get all gp regs from the child. */
 		if (!access_ok(p, MAX_REG_OFFSET)) {
 			ret = -EIO;
 			break;
 		}
+		l4h_sync_regs(child);
 		l4h_sync_seg(child);
-		for ( i = 0; i < MAX_REG_OFFSET; i += sizeof(long) ) {
-			__put_user(getreg(child, i), p);
-			p++;
-		}
-		ret = 0;
+		for (i = 0, ret = 0; i < MAX_REG_OFFSET && !ret; i += sizeof(long))
+			ret = __put_user(getreg(child, i), p++);
 		break;
 	}
 #endif
@@ -103,14 +109,14 @@ long arch_ptrace(struct task_struct *child, long request,
 			ret = -EIO;
 			break;
 		}
+		l4h_sync_regs(child);
 		l4h_sync_seg(child);
-		for ( i = 0; i < MAX_REG_OFFSET; i += sizeof(long) ) {
-			__get_user(tmp, p);
-			putreg(child, i, tmp);
-			p++;
-		}
 		l4h_seg_dirty(child);
-		ret = 0;
+		for (i = 0, ret = 0; i < MAX_REG_OFFSET && !ret; i += sizeof(long)) {
+			ret = __get_user(tmp, p++);
+			if (!ret)
+				ret = putreg(child, i, tmp);
+		}
 		break;
 	}
 #endif

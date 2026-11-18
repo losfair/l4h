@@ -346,8 +346,11 @@ fn refused_provisioning_reports_its_errno() {
     assert_eq!(wire::reply::<reply::Write>(&r), Err(errno::EINVAL));
 }
 
-#[test]
-fn a_split_request_waits_for_room_and_drains_on_remove() {
+/// Run a request split across two extents on a device with room for one
+/// piece: `between` are root's requests after the one during which the
+/// client publishes it, then the client is removed.  The replies, the
+/// pieces started, and the client's completion.
+fn run_split(between: &[(u64, [u64; 6])]) -> (Vec<[u64; 5]>, Vec<(u64, u64, u64)>, (u32, u64, u32)) {
     let _lock = lock();
     map_client();
     // Guest sectors 0..8192 are disk sectors 40960.., then 8192...
@@ -363,7 +366,9 @@ fn a_split_request_waits_for_room_and_drains_on_remove() {
         // the device has room for one piece; then remove the client.
         let (add, extent, remove) = (post(Request::Add { client: 0, unit: 0, dom0: false, n: 2 }),
             post(Request::Extent { client: 0, k: 0 }), post(Request::Remove { client: 0 }));
-        k.requests = [(add.0, add.1, false), (extent.0, extent.1, true), (remove.0, remove.1, false)].into();
+        k.requests = [(add.0, add.1, false), (extent.0, extent.1, true)].into();
+        k.requests.extend(between.iter().map(|&(l, a)| (l, a, false)));
+        k.requests.push_back((remove.0, remove.1, false));
         k.replies.clear();
         (k.retry, k.status, k.kicks, k.room) = (false, 0, 0, 1);
         k.started.clear();
@@ -375,14 +380,32 @@ fn a_split_request_waits_for_room_and_drains_on_remove() {
     let (cq, resp) = unsafe { ((*channel()).cq.head.load(Ordering::Relaxed), (*channel()).resps[0]) };
     unmap_client();
     assert!(stopped.is::<Finished>(), "service failed before sending every reply");
-    KERNEL.with_borrow(|k| {
-        assert_eq!(k.replies[0][0], 0, "the extents attach");
-        assert_eq!(k.replies[2][0], 0, "remove drains the carried piece");
-        // Pending slot 0: piece 0 at the end of the first extent, piece 1
-        // at the start of the second, once the first completed.
-        assert_eq!(k.started, [(0, 49144, 4096), (1, 8192, 4096)]);
-    });
-    assert_eq!((cq, resp.id, resp.status), (1, 7, blk::STATUS_OK));
+    KERNEL.with_borrow(|k| (k.replies.clone(), k.started.clone(), (cq, resp.id, resp.status)))
+}
+
+#[test]
+fn a_split_request_waits_for_room() {
+    // A flush waits for the device's room, which reaps the first piece;
+    // the carried one then starts before anything else.
+    let (replies, started, done) = run_split(&[post(Request::Flush { unit: 0 })]);
+    assert_eq!(replies[0][0], 0, "the extents attach");
+    assert_eq!(replies.last().unwrap()[0], 0, "remove drains");
+    // Pending slot 0: piece 0 at the end of the first extent, piece 1
+    // at the start of the second, once the first completed.
+    assert_eq!(started, [(0, 49144, 4096), (1, 8192, 4096)]);
+    assert_eq!(done, (1, 7, blk::STATUS_OK));
+}
+
+#[test]
+fn a_removed_clients_carried_piece_never_starts() {
+    // The client is removed while its second piece waits for room: root
+    // has cut its pool off from the device, so the piece fails instead of
+    // starting, and the request completes with the first.
+    let (replies, started, done) = run_split(&[]);
+    assert_eq!(replies[0][0], 0, "the extents attach");
+    assert_eq!(replies[2][0], 0, "remove drains");
+    assert_eq!(started, [(0, 49144, 4096)]);
+    assert_eq!(done, (1, 7, blk::STATUS_IOERR));
 }
 
 #[test]

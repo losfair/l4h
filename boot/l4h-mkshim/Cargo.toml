@@ -21,5 +21,9 @@ opt-level = 1
 panic = "abort"
 opt-level = 2
 debug = true
+# As the host's (host/Cargo.toml): an overflow in the arithmetic on the
+# firmware's tables and the modules' ELF headers stops the boot instead of
+# wrapping past a bound.
+overflow-checks = true
 
 [workspace]

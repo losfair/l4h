@@ -223,6 +223,9 @@ static int map_small(struct l4h_ept *e, unsigned long gfn, unsigned long pfn, bo
 		unmap_small(e, gfn);
 	}
 	unmap_large(e, gfn & ~(PAGES_2M - 1));
+	/* Never a CPtr past the RAM CNodes (a memslot over a PFNMAP). */
+	if (!l4h_frame_mappable(pfn << PAGE_SHIFT, writable))
+		return -ENXIO;
 	slot = l4h_cap_copy(L4H_FRAME_CPTR(pfn << PAGE_SHIFT), L4H_RIGHTS_ALL);
 	if (!slot)
 		return -ENOMEM;

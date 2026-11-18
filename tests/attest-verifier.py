@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""Policy checks on signed reports, including old and future hosts, and
-which EK a credential is made for."""
+"""Policy checks on signed reports, including old and future hosts, which
+EK a credential is made for and which AK it enrolls, and malformed input."""
 import contextlib
+import os
+import subprocess
+import tempfile
 import datetime
 import hashlib
 import importlib.util
@@ -288,6 +291,168 @@ class EvidenceEk(unittest.TestCase):
     def test_no_ek(self):
         with self.assertRaisesRegex(a.Fail, "--ek"):
             self.ek_of({})
+
+
+def ecc_public(key, attrs):
+    """A TPMT_PUBLIC of an ECC P-256 signing key (ECDSA, sha256)."""
+    n = key.public_key().public_numbers()
+    return (struct.pack(">HHI", 0x0023, 0x000B, attrs) + struct.pack(">H", 0)
+            + struct.pack(">HHHHH", 0x0010, 0x0018, 0x000B, 0x0003, 0x0010)
+            + struct.pack(">H", 32) + n.x.to_bytes(32, "big") + struct.pack(">H", 32) + n.y.to_bytes(32, "big"))
+
+
+class Enrollment(unittest.TestCase):
+    """make-credential: an EK certificate is the host's word unless a CA
+    the verifier trusts issued it, and only a TPM's restricted signing key
+    is enrolled."""
+    # fixedTPM, fixedParent, sensitiveDataOrigin, userWithAuth,
+    # restricted, sign.
+    AK_ATTRS = 1 << 1 | 1 << 4 | 1 << 5 | 1 << 6 | 1 << 16 | 1 << 18
+
+    @classmethod
+    def setUpClass(cls):
+        cls.ca_key = ec.generate_private_key(ec.SECP256R1())
+        cls.ek = rsa.generate_private_key(65537, 2048)
+        cls.ak = ec.generate_private_key(ec.SECP256R1())
+        now = datetime.datetime.now(datetime.timezone.utc)
+
+        def cert(subject, key, issuer_key, ca):
+            b = (x509.CertificateBuilder().subject_name(EkCertificate.name(subject)).issuer_name(EkCertificate.name("ca"))
+                 .public_key(key.public_key()).serial_number(x509.random_serial_number())
+                 .not_valid_before(now - datetime.timedelta(days=1)).not_valid_after(now + datetime.timedelta(days=1))
+                 .add_extension(x509.BasicConstraints(ca=ca, path_length=None), critical=True))
+            return b.sign(issuer_key, hashes.SHA256())
+        cls.ca = cert("ca", cls.ca_key, cls.ca_key, True)
+        cls.issued = cert("ek", cls.ek, cls.ca_key, False).public_bytes(serialization.Encoding.DER)
+        # The host's own: a CA of its making that "issued" its key.
+        forger = ec.generate_private_key(ec.SECP256R1())
+        cls.forged = cert("ek", cls.ek, forger, False).public_bytes(serialization.Encoding.DER)
+        tmp = tempfile.NamedTemporaryFile("wb", suffix=".pem", delete=False)
+        tmp.write(cls.ca.public_bytes(serialization.Encoding.PEM))
+        tmp.close()
+        cls.ca_pem = tmp.name
+
+    @classmethod
+    def tearDownClass(cls):
+        os.unlink(cls.ca_pem)
+
+    def ek_of(self, ev, ek_ca=None):
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            ek = a.evidence_ek(ev, None, ek_ca)
+        return ek.public_numbers(), err.getvalue()
+
+    def test_certificate_checked_with_ek_ca(self):
+        got, warning = self.ek_of({"ekcert": self.issued}, self.ca_pem)
+        self.assertEqual(got, self.ek.public_key().public_numbers())
+        self.assertNotIn("l4h-attest: warning", warning)
+        with self.assertRaisesRegex(a.Fail, "not issued by"):
+            self.ek_of({"ekcert": self.forged}, self.ca_pem)
+        # Asked for, a certificate must be there: ekpub is not one.
+        with self.assertRaisesRegex(a.Fail, "no EK certificate"):
+            self.ek_of({"ekpub": rsa_public(self.ek, EvidenceEk.EK_ATTRS)}, self.ca_pem)
+        with self.assertRaisesRegex(a.Fail, "malformed EK certificate"):
+            self.ek_of({"ekcert": b"\x30\x00"}, self.ca_pem)
+
+    def test_unchecked_certificate_warns(self):
+        for cert in (self.issued, self.forged):
+            got, warning = self.ek_of({"ekcert": cert})
+            self.assertEqual(got, self.ek.public_key().public_numbers())
+            self.assertIn("EK certificate not verified (--ek-ca)", warning)
+
+    def test_only_a_restricted_signing_key_is_enrolled(self):
+        key, name = a.attestation_key({"ak": ecc_public(self.ak, self.AK_ATTRS)})
+        self.assertEqual(key.public_numbers(), self.ak.public_key().public_numbers())
+        self.assertEqual(name, a.tpm_name(ecc_public(self.ak, self.AK_ATTRS)))
+        for attrs in (self.AK_ATTRS & ~(1 << 16), self.AK_ATTRS & ~(1 << 18), self.AK_ATTRS & ~(1 << 1)):
+            with self.assertRaisesRegex(a.Fail, "fixedTPM restricted signing"):
+                a.attestation_key({"ak": ecc_public(self.ak, attrs)})
+        with self.assertRaisesRegex(a.Fail, "not ECC"):
+            a.attestation_key({"ak": rsa_public(self.ek, self.AK_ATTRS)})
+
+    def run_tool(self, *args):
+        tool = Path(__file__).resolve().parents[1] / "tools/l4h-attest.py"
+        return subprocess.run([sys.executable, str(tool), *args], capture_output=True, text=True)
+
+    def test_cli(self):
+        with tempfile.TemporaryDirectory() as d:
+            ev = os.path.join(d, "evidence")
+            out = os.path.join(d, "cred")
+            body = {"ak": ecc_public(self.ak, self.AK_ATTRS), "ekcert": self.forged}
+            with open(ev, "wb") as f:
+                f.write(encode(body))
+            r = self.run_tool("make-credential", ev, "00" * 32, "-o", out, "--ek-ca", self.ca_pem)
+            self.assertEqual((r.returncode, r.stderr.strip()), (1, "l4h-attest: EK certificate not issued by %s" % self.ca_pem))
+            self.assertFalse(os.path.exists(out))
+            with open(ev, "wb") as f:
+                f.write(encode({**body, "ekcert": self.issued}))
+            r = self.run_tool("make-credential", ev, "00" * 32, "-o", out, "--ek-ca", self.ca_pem)
+            self.assertEqual(r.returncode, 0)
+            self.assertNotIn("l4h-attest: warning", r.stderr)
+            self.assertTrue(os.path.getsize(out) > 0)
+            # An AK that is not a restricted signing key, and a malformed
+            # one: refused, as l4h-attest's errors.
+            for ak, why in ((ecc_public(self.ak, self.AK_ATTRS & ~(1 << 16)), "restricted signing key"),
+                            (b"\x00\x23", "truncated")):
+                with open(ev, "wb") as f:
+                    f.write(encode({**body, "ekcert": self.issued, "ak": ak}))
+                r = self.run_tool("make-credential", ev, "00" * 32, "-o", out + "2", "--ek-ca", self.ca_pem)
+                self.assertEqual(r.returncode, 1)
+                self.assertRegex(r.stderr, "^l4h-attest: .*%s" % why)
+                self.assertNotIn("Traceback", r.stderr)
+
+
+class Malformed(unittest.TestCase):
+    """Whatever the host sends, a check fails with Fail, never another
+    exception: a caller that handles Fail is not crashed, and the tool
+    says what was wrong."""
+
+    def test_evidence(self):
+        ak = ecc_public(ec.generate_private_key(ec.SECP256R1()), Enrollment.AK_ATTRS)
+        # Off the curve: a point (1, 1).
+        off_curve = ak[:-68] + struct.pack(">H", 32) + (1).to_bytes(32, "big") + struct.pack(">H", 32) + (1).to_bytes(32, "big")
+        for ev in ([], "v", {"v": 1}, {"v": 1, "ak": 5}, {"v": 1, "ak": b"\x00"}, {"v": 1, "ak": ak[:20]},
+                   {"v": 1, "ak": off_curve}, {"v": 1, "ak": ak}, {"v": 1, "ak": ak, "quotesig": b"", "quote": b""},
+                   {"v": 2, "partition": 0, "ak": ak}):
+            with self.assertRaises(a.Fail, msg=repr(ev)[:80]):
+                a.check_evidence(ev, {}, None, None)
+        for ev in ([], {"ak": 5}, {"ekcert": 5}, {"ekpub": b"\x00\x01"}):
+            with self.assertRaises(a.Fail, msg=repr(ev)), contextlib.redirect_stderr(io.StringIO()):
+                a.evidence_ek(ev)
+        for ev in ({}, {"ak": None}, {"ak": b"\x00\x23\x00"}):
+            with self.assertRaises(a.Fail, msg=repr(ev)):
+                a.attestation_key(ev)
+        with self.assertRaises(a.Fail):
+            a.tpm_name(b"\x00")
+        with self.assertRaises(a.Fail):
+            a.cose_p256({1: 2, -1: 1, -2: b"\x01", -3: b"\x01"})
+        with self.assertRaises(a.Fail):
+            a.cose_p256({1: 2, -1: 1, -2: 5})
+        with self.assertRaises(a.Fail):
+            a.make_credential(object(), b"\x00\x0b" + bytes(32), b"s")
+
+    def test_report(self):
+        key = ec.generate_private_key(ec.SECP256R1()).public_key()
+        for rep in (None, ("tag", 18, 5), ("tag", 18, [1, 2, 3, 4]), ("tag", 18, [b"\xa1\x01\x26", {}, 5, bytes(64)]),
+                    ("tag", 18, [b"\xa1\x01\x26", {}, b"", bytes(64)])):
+            with self.assertRaises(a.Fail, msg=repr(rep)):
+                a.check_report(rep, key, None, None)
+        # Signed, but claims that are not a map, or lack the host.
+        v = Verify()
+        v.key = ec.generate_private_key(ec.SECP256R1())
+        for claims in (b"\x05", encode({"v": 1})):
+            protected = b"\xa1\x01\x26"
+            tbs = b"\x84\x6aSignature1" + a.cbor_bytes(protected) + b"\x40" + a.cbor_bytes(claims)
+            r, s_ = decode_dss_signature(v.key.sign(tbs, ec.ECDSA(hashes.SHA256())))
+            rep = ("tag", 18, [protected, {}, claims, r.to_bytes(32, "big") + s_.to_bytes(32, "big")])
+            with self.assertRaises(a.Fail, msg=repr(claims)):
+                a.check_report(rep, v.key.public_key(), None, None)
+
+    def test_kernel(self):
+        k = Launch.kernel()
+        # Cut in the ELF header, and in the program header.
+        for bad in (k[:30], k[:60], k[:64 + 20]):
+            with self.assertRaises(a.Fail):
+                a.launch_digest(bad, b"", "")
 
 
 if __name__ == "__main__":

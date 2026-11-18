@@ -370,6 +370,7 @@ fn offload_check(rng: &mut Rng, n: u64) -> u64 {
         let mss = 500 + rng.below(1000) as usize;
         let payload = rng.below(20000) as usize;
         let (frame, mut hdr) = tcp_frame(rng, v6, vlan, payload, mss);
+        let sent = hdr;
         assert!(offload::sanitize(&mut hdr, &frame), "valid GSO frame refused");
         let t = offload::parse_tcp(&frame).unwrap();
         // An IP length past the frame or short of the headers, or an IPv4
@@ -382,20 +383,28 @@ fn offload_check(rng: &mut Rng, n: u64) -> u64 {
                 let mut f = frame.clone();
                 f[at..at + 2].copy_from_slice(&bad.to_be_bytes());
                 if !(v6 && bad == 0) {
-                    assert!(!offload::sanitize(&mut hdr.clone(), &f), "GSO IP length {bad} of {whole} taken");
+                    assert!(!offload::sanitize(&mut sent.clone(), &f), "GSO IP length {bad} of {whole} taken");
                 }
             }
             if v6 {
                 // 0: Linux's for a frame past 64 KiB.
                 let mut f = frame.clone();
                 f[at..at + 2].copy_from_slice(&[0, 0]);
-                assert!(offload::sanitize(&mut hdr.clone(), &f), "GSO IPv6 payload length 0 refused");
+                assert!(offload::sanitize(&mut sent.clone(), &f), "GSO IPv6 payload length 0 refused");
             } else {
                 let mut f = frame.clone();
                 f[t.ip + 6] |= 0x20;
-                assert!(!offload::sanitize(&mut hdr.clone(), &f), "IPv4 GSO fragment taken");
+                assert!(!offload::sanitize(&mut sent.clone(), &f), "IPv4 GSO fragment taken");
             }
         }
+        // One segment or none: a plain frame with its partial checksum,
+        // which no device is asked to segment.
+        if payload <= mss {
+            assert!(!offload::is_gso(&hdr) && hdr[0] == offload::F_NEEDS_CSUM, "GSO frame of {payload} <= {mss} kept");
+            assert_eq!(hdr[2..6], [0; 4]);
+            continue;
+        }
+        assert!(offload::is_gso(&hdr), "GSO frame of {payload} > {mss} made plain");
         let mut got = Vec::new();
         let mut count = 0;
         offload::segment(&frame, &hdr, &mut buf, |f, h| {
@@ -503,9 +512,13 @@ fn gro_check(rng: &mut Rng, n: u64) -> u64 {
         let (mut frame, mut hdr) = tcp_frame(rng, v6, vlan, payload, mss);
         let t = offload::parse_tcp(&frame).unwrap();
         frame[t.tcp + 13] = if rng.below(2) == 0 { 0x10 } else { 0x18 };
+        // A frame of one segment sanitizes into a plain one: cut it as
+        // its sender asked, which is the one segment it is.
+        let sent = hdr;
         assert!(offload::sanitize(&mut hdr, &frame));
+        assert_eq!(offload::is_gso(&hdr), payload > mss);
         let mut segs: Vec<Vec<u8>> = Vec::new();
-        offload::segment(&frame, &hdr, &mut buf, |f, _| segs.push(f.to_vec()));
+        offload::segment(&frame, &sent, &mut buf, |f, _| segs.push(f.to_vec()));
         // As received: no flags (checked here), or DATA_VALID.
         let mut rx = [0u8; 12];
         if rng.below(2) == 0 {
