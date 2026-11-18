@@ -208,7 +208,16 @@ int fpu_copy_uabi_to_guest_fpstate(struct fpu_guest *gfpu, const void *buf, u64 
 			return -EINVAL;
 	if (x->i387.mxcsr & ~mxcsr_mask)
 		return -EINVAL;
-	memcpy(&gfpu->fpstate->regs.xsave, buf, gfpu->fpstate->size);
+	/*
+	 * `buf` is KVM_SET_XSAVE's copy of uabi_size bytes (x86.c), less
+	 * than the state when the XSAVE area outgrows struct kvm_xsave (AMX
+	 * tiles): the rest, which KVM_GET_XSAVE cannot show either, is
+	 * reset, never read past the copy.
+	 */
+	memcpy(&gfpu->fpstate->regs.xsave, buf, min(gfpu->uabi_size, gfpu->fpstate->size));
+	if (gfpu->fpstate->size > gfpu->uabi_size)
+		memset((void *)&gfpu->fpstate->regs.xsave + gfpu->uabi_size, 0,
+		       gfpu->fpstate->size - gfpu->uabi_size);
 	return 0;
 }
 
