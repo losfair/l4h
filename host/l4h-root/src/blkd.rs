@@ -97,9 +97,8 @@ const VIRTIO_PCI_CAP_NOTIFY_CFG: u8 = 2;
 const VIRTIO_PCI_CAP_ISR_CFG: u8 = 3;
 const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
 
-/// A disk controller (PCI device) and its persistent blkd.  Its disks are
-/// the units blkd finds: one, or each logical unit of a virtio-scsi
-/// controller.
+/// A disk controller (PCI device) and its persistent blkd. Its disks are
+/// the units blkd finds, including SCSI LUNs and NVMe namespaces.
 pub struct Controller {
     pub pci: pci::Device,
     pub kind: u32,

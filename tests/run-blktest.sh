@@ -6,6 +6,8 @@
 # virtio-blk (virtio-legacy: a legacy-only one, as under hypervisors whose
 # virtio predates 1.0); BLKTEST_LBA=4096 gives either 4 KiB blocks.  scsi-luns adds
 # a second disk as another LUN of the same target, behind a CD-ROM.
+# nvme-namespaces gives one controller two nonconsecutive namespaces and
+# uses 4 KiB blocks for the second one.
 # ahci and ahci-disks use SATA ports (the latter has two disks and an ATAPI
 # device); their temporary disk images are removed when the test ends.
 set -euo pipefail
@@ -14,8 +16,8 @@ out=$root/build/guest
 mkdir -p "$out"
 diskout=$out
 case "${BLKTEST_DEV:-}" in
-    ahci|ahci-disks)
-        diskout=$(mktemp -d "$out/ahci.XXXXXXXX")
+    ahci|ahci-disks|nvme-namespaces)
+        diskout=$(mktemp -d "$out/$BLKTEST_DEV.XXXXXXXX")
         trap 'rm -rf "$diskout"' EXIT ;;
 esac
 mkdir -p "$diskout/blkroot"
@@ -34,6 +36,13 @@ ahci|ahci-disks)
       fi ;;
 nvme) lba=${BLKTEST_LBA:-512}
       dev="-device nvme,drive=d0,serial=l4h0,logical_block_size=$lba,physical_block_size=$lba" ;;
+nvme-namespaces)
+      lba=${BLKTEST_LBA:-512}
+      truncate -s 16M "$diskout/blk2.img"
+      dev="-device nvme,id=nvme0,serial=l4h0
+           -device nvme-ns,bus=nvme0,drive=d0,nsid=1,logical_block_size=$lba,physical_block_size=$lba
+           -drive file=$diskout/blk2.img,if=none,id=d1,format=raw
+           -device nvme-ns,bus=nvme0,drive=d1,nsid=3,logical_block_size=4096,physical_block_size=4096" ;;
 scsi-luns)
       lba=${BLKTEST_LBA:-512}
       truncate -s 0 "$diskout/blk2.img"; truncate -s 16M "$diskout/blk2.img"
@@ -55,7 +64,7 @@ L4H_QEMU_ARGS="-drive file=$diskout/blk.img,if=none,id=d0,format=raw $dev" \
 L4H_DOM0_VCPUS=${1:-1} "$root/tools/run-dom0.sh" "$out/blktest.cpio.gz" "console=hvc0" 120 \
     | grep -E "BLKTEST|blkd|ahci|virtio|l4h-root|vda" || true
 grep -q "BLKTEST: PASS" "$root/build/qemu.log"
-if [[ ${BLKTEST_DEV:-} = scsi-luns || ${BLKTEST_DEV:-} = ahci-disks ]]; then
+if [[ ${BLKTEST_DEV:-} = scsi-luns || ${BLKTEST_DEV:-} = ahci-disks || ${BLKTEST_DEV:-} = nvme-namespaces ]]; then
     grep -q "BLKTEST: second disk independent: ok" "$root/build/qemu.log"
 fi
 debugfs -R "cat /guest.txt" "$diskout/blk.img" 2>/dev/null | grep -q "written by the l4h guest"

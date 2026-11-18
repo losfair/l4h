@@ -472,8 +472,11 @@ pub fn run<D: NicDriver>(info: &'static Info) -> ! {
         if badge & badges::driver::CALL != 0 {
             l.serve();
         }
-        if l.dev.is_some() {
+        if let Some(dev) = l.dev.as_mut() {
             let irq_seen = badge & badges::nicd::IRQ != 0;
+            if irq_seen {
+                dev.irq_received();
+            }
             // netd freed room: receive again.
             if irq_seen || l.rx_more || (l.rx_blocked && badge & badges::nicd::NETD != 0) {
                 l.receive();

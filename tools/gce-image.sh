@@ -21,19 +21,19 @@ if [ "${1:-}" = --sev ]; then
 fi
 disk=$1
 name=${2:-l4h-$(date +%Y%m%d-%H%M)}
-dir=$(dirname "$disk")
+dir=$(dirname -- "$disk")
 tarball=$dir/$name.tar.gz
 # GCE requires the member to be named disk.raw.
-ln -f "$disk" "$dir/disk.raw" 2>/dev/null || cp --sparse=always "$disk" "$dir/disk.raw"
-tar -C "$dir" -Sczf "$tarball" disk.raw
-rm -f "$dir/disk.raw"
+tar -C "$dir" -hSczf "$tarball" --transform='s|^.*$|disk.raw|' -- "$(basename -- "$disk")"
 features=UEFI_COMPATIBLE,GVNIC
 machine="--machine-type=n2-standard-4"
 nic=VIRTIO_NET
+image_args=
 if [ "$sev" = 1 ]; then
-    features=UEFI_COMPATIBLE,GVNIC,SEV_CAPABLE
-    machine="--machine-type=n2d-standard-4 --confidential-compute-type=SEV --maintenance-policy=TERMINATE"
+    features+=,SEV_CAPABLE
+    machine='--machine-type=n2d-standard-4 --min-cpu-platform="AMD Milan" --confidential-compute-type=SEV --maintenance-policy=TERMINATE'
     nic=GVNIC
+    image_args=" --boot-disk-interface=NVME --no-shielded-secure-boot --no-service-account --no-scopes"
 fi
 cat <<CMDS
 $tarball: $(du -h "$tarball" | cut -f1)
@@ -44,8 +44,8 @@ To deploy (replace BUCKET, PROJECT and ZONE):
       --source-uri=gs://BUCKET/$name.tar.gz \\
       --guest-os-features=$features
   gcloud compute instances create $name --project=PROJECT --zone=ZONE \\
-      $machine --image=$name \\
+      $machine --image=$name$image_args \\
       --network-interface=nic-type=$nic \\
       --metadata=serial-port-enable=TRUE
-  gcloud compute connect-to-serial-port $name --zone=ZONE
+  gcloud compute connect-to-serial-port $name --project=PROJECT --zone=ZONE
 CMDS

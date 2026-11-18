@@ -17,6 +17,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use production::{DevInfo, Driver, Seg};
 
+#[path = "../host/l4h-blkd/src/nvme/namespaces.rs"]
+mod nvme_namespaces;
+
 #[macro_export]
 macro_rules! info { ($($a:tt)*) => {{ let _ = format_args!($($a)*); }}; }
 #[macro_export]
