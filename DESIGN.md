@@ -5145,9 +5145,12 @@ Every PCI function no other partition lists is partition 0's, so
 `partitions = 1` behaves like one l4h. The shim refuses, rather than
 guesses: a BDF that does not exist or is in two partitions, a bridge, a
 partition without a disk controller, functions behind a PCI(-X) bridge
-(one requester ID) split between partitions, functions of one isolation
-group split between partitions, and a partition 0 without the
-boot CPU. An isolation group is root's (`acs.rs`, as for a confined NIC
+(one requester ID) split between partitions, functions an AMD IVRS gives
+one requester ID (its alias entries, `acs::IvrsAliases`, which root's
+AMD-Vi domains follow) split between partitions, functions of one
+isolation group split between partitions, and a partition 0 without the
+boot CPU. Partition 0's root also refuses to attach a device whose
+requester another partition's function shares. An isolation group is root's (`acs.rs`, as for a confined NIC
 driver, §9.8): the functions of a multi-function device without ACS, and
 those below switch or root ports that do not isolate them, reach each
 other's BARs without passing the IOMMU, so a device of one partition could

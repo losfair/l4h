@@ -410,3 +410,114 @@ impl core::fmt::Display for Bits {
         Ok(())
     }
 }
+
+/// Alias entries of an AMD IVRS, at most: one per PCI(-X) bridge that
+/// takes its functions' requests as its own.
+#[allow(dead_code)]
+pub const MAX_IVRS_ALIASES: usize = 64;
+
+/// The requester IDs an AMD IVRS gives functions in place of their own:
+/// IVHD device entries 0x42 (one function) and 0x43..0x04 (a range), of
+/// the IVHD root reads for each IOMMU (amdvi.rs `parse`: the highest type
+/// known, PCI segment 0).  Root translates a function's DMA in its
+/// alias's domain, so the shim (boot/l4h-mkshim) groups the functions
+/// that share one (`closure`'s `requester`): the firmware may alias what
+/// the bridges' types do not show.  A later entry for an ID that names no
+/// alias is not taken off: grouping more refuses splits root would allow,
+/// never the other way.  The shim's, not root's.
+#[allow(dead_code)]
+pub struct IvrsAliases {
+    /// (first, last, alias), in table order: the last that covers an ID
+    /// wins, as in root's table.
+    ranges: [(u16, u16, u16); MAX_IVRS_ALIASES],
+    len: usize,
+}
+
+#[allow(dead_code)]
+impl IvrsAliases {
+    /// Read them from `ivrs`, the whole table.  None if it is malformed or
+    /// has more than MAX_IVRS_ALIASES.
+    pub fn parse(ivrs: &[u8]) -> Option<IvrsAliases> {
+        let u16_at = |b: &[u8], o: usize| -> Option<u16> { Some(u16::from_le_bytes([*b.get(o)?, *b.get(o + 1)?])) };
+        // The table its header says, and every block in it whole: the
+        // walk below then never stops short of an alias.
+        if ivrs.get(..4)? != b"IVRS" {
+            return None;
+        }
+        let len = u32::from_le_bytes(ivrs.get(4..8)?.try_into().ok()?) as usize;
+        let ivrs = ivrs.get(..len).filter(|t| t.len() >= 48)?;
+        let mut at = 48;
+        while at < ivrs.len() {
+            let len = u16_at(ivrs, at + 2)? as usize;
+            if len < 4 || len > ivrs.len() - at {
+                return None;
+            }
+            at += len;
+        }
+        let blocks = || {
+            let mut at = 48;
+            core::iter::from_fn(move || {
+                let len = u16_at(ivrs, at + 2)? as usize;
+                let block = ivrs.get(at..at + len).filter(|_| len >= 4)?;
+                at += len;
+                Some(block)
+            })
+        };
+        let ivhd = |b: &[u8]| matches!(b[0], 0x10 | 0x11 | 0x40) && b.len() >= 24 && u16_at(b, 16) == Some(0);
+        let mut me = IvrsAliases { ranges: [(0, 0, 0); MAX_IVRS_ALIASES], len: 0 };
+        for b in blocks().filter(|b| ivhd(b)) {
+            // Root reads one IVHD per IOMMU: the highest type.
+            let id = u16_at(b, 4);
+            if blocks().any(|o| ivhd(o) && u16_at(o, 4) == id && o[0] > b[0]) {
+                continue;
+            }
+            let header = if b[0] == 0x10 { 24 } else { 40 };
+            let mut e = b.get(header..)?;
+            let mut range: Option<(u16, Option<u16>)> = None;
+            while let Some(&kind) = e.first() {
+                let len = match kind {
+                    0..=0x7f => 4 << (kind >> 6),
+                    0xf0 => *e.get(21)? as usize + 22,
+                    // Root skips the rest of the IVHD: an alias could
+                    // follow, unread.  Refused.
+                    _ => return None,
+                };
+                let ent = e.get(..len)?;
+                e = &e[len..];
+                let id = u16_at(ent, 1)?;
+                match kind {
+                    // A range starts inside none, and ends up from its start.
+                    0x03 | 0x47 | 0x43 if range.is_some() => return None,
+                    0x03 | 0x47 => range = Some((id, None)),
+                    0x43 => range = Some((id, Some(u16_at(ent, 5)?))),
+                    0x04 => {
+                        let (first, alias) = range.take()?;
+                        if first > id {
+                            return None;
+                        }
+                        if let Some(alias) = alias {
+                            me.push(first, id, alias)?;
+                        }
+                    }
+                    0x42 => me.push(id, id, u16_at(ent, 5)?)?,
+                    _ => {}
+                }
+            }
+            if range.is_some() {
+                return None;
+            }
+        }
+        Some(me)
+    }
+
+    fn push(&mut self, first: u16, last: u16, alias: u16) -> Option<()> {
+        *self.ranges.get_mut(self.len)? = (first, last, alias);
+        self.len += 1;
+        Some(())
+    }
+
+    /// The requester ID function `bdf`'s DMA reaches the IOMMU with.
+    pub fn requester(&self, bdf: u16) -> u16 {
+        self.ranges[..self.len].iter().rev().find(|r| (r.0..=r.1).contains(&bdf)).map_or(bdf, |r| r.2)
+    }
+}

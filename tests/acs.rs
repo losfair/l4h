@@ -588,3 +588,110 @@ fn the_shim_refuses_a_group_split_between_partitions() {
     let (m, inv) = two_root_ports(None, None);
     assert_eq!(acs::other_owner(&m, || inv.iter().copied(), |f| f, owners(&[0x0300]), 0x0300, &mut [0u16; 2]), Err(()));
 }
+
+/// An IVRS whose IVHD blocks (type, IOMMU id, device entries) are given.
+fn ivrs(blocks: &[(u8, u16, &[&[u8]])]) -> Vec<u8> {
+    let mut t = vec![0u8; 48];
+    t[..4].copy_from_slice(b"IVRS");
+    for &(ty, id, entries) in blocks {
+        let header = if ty == 0x10 { 24 } else { 40 };
+        let mut b = vec![0u8; header];
+        b[0] = ty;
+        b[4..6].copy_from_slice(&id.to_le_bytes());
+        for e in entries {
+            b.extend_from_slice(e);
+        }
+        let len = b.len() as u16;
+        b[2..4].copy_from_slice(&len.to_le_bytes());
+        t.extend_from_slice(&b);
+    }
+    let len = t.len() as u32;
+    t[4..8].copy_from_slice(&len.to_le_bytes());
+    t
+}
+
+fn entry(kind: u8, id: u16, alias: u16) -> Vec<u8> {
+    let mut e = vec![kind, id as u8, (id >> 8) as u8, 0];
+    if kind >= 0x40 {
+        e.extend_from_slice(&[0, alias as u8, (alias >> 8) as u8, 0]);
+    }
+    e
+}
+
+#[test]
+fn ivrs_aliases_are_requester_ids() {
+    // 0x42: 03:00.0 as 02:00.0; 0x43..0x04: 05:00.0..=05:1f.7 as 04:00.0.
+    let a = entry(0x42, 0x0300, 0x0200);
+    let start = entry(0x43, 0x0500, 0x0400);
+    let end = entry(0x04, 0x05ff, 0);
+    let plain = entry(0x02, 0x0600, 0);
+    let t = ivrs(&[(0x11, 0, &[&plain, &a, &start, &end])]);
+    let al = acs::IvrsAliases::parse(&t).unwrap();
+    assert_eq!(al.requester(0x0300), 0x0200);
+    assert_eq!((al.requester(0x0500), al.requester(0x05ff)), (0x0400, 0x0400));
+    assert_eq!((al.requester(0x0600), al.requester(0x0200), al.requester(0x0700)), (0x0600, 0x0200, 0x0700));
+    // Only the highest type of an IOMMU's IVHDs counts, as for root: a
+    // type 0x10 block for the same IOMMU is not read.
+    let t = ivrs(&[(0x10, 0, &[&entry(0x42, 0x0900, 0x0800)]), (0x40, 0, &[&a])]);
+    let al = acs::IvrsAliases::parse(&t).unwrap();
+    assert_eq!((al.requester(0x0900), al.requester(0x0300)), (0x0900, 0x0200));
+    // A range end without a start, or a cut entry: malformed.
+    assert!(acs::IvrsAliases::parse(&ivrs(&[(0x11, 0, &[&end])])).is_none());
+    assert!(acs::IvrsAliases::parse(&ivrs(&[(0x11, 0, &[&a[..6]])])).is_none());
+    // A range ended before it starts, never ended, or started inside
+    // another: malformed.
+    let back = entry(0x04, 0x04ff, 0);
+    let start5 = entry(0x43, 0x0500, 0x0400);
+    assert!(acs::IvrsAliases::parse(&ivrs(&[(0x11, 0, &[&start5, &back])])).is_none());
+    assert!(acs::IvrsAliases::parse(&ivrs(&[(0x11, 0, &[&start5])])).is_none());
+    assert!(acs::IvrsAliases::parse(&ivrs(&[(0x11, 0, &[&entry(0x03, 0x0100, 0), &start5, &end])])).is_none());
+    // An entry type root does not know, then an alias: refused, not read
+    // as far as the unknown one.
+    assert!(acs::IvrsAliases::parse(&ivrs(&[(0x11, 0, &[&[0x80, 0, 0, 0], &a])])).is_none());
+    // The table: its signature, a header of 48 bytes, the length it
+    // declares, and every block whole within it.
+    let good = ivrs(&[(0x11, 0, &[&a]), (0x11, 1, &[&start, &end])]);
+    assert!(acs::IvrsAliases::parse(&good).is_some());
+    let mut t = good.clone();
+    t[0] = b'X';
+    assert!(acs::IvrsAliases::parse(&t).is_none());
+    assert!(acs::IvrsAliases::parse(&good[..40]).is_none());
+    let mut t = good.clone();
+    t[4..8].copy_from_slice(&(good.len() as u32 + 1).to_le_bytes());
+    assert!(acs::IvrsAliases::parse(&t).is_none());
+    let mut t = good.clone();
+    t[4..8].copy_from_slice(&40u32.to_le_bytes());
+    assert!(acs::IvrsAliases::parse(&t).is_none());
+    // The second block cut short by the table's length, or claiming
+    // more than is left: refused, not taken as the end (its aliases
+    // would go unread).
+    let first = 40 + 8;
+    let mut t = good.clone();
+    t.truncate(48 + first + 6);
+    let len = t.len() as u32;
+    t[4..8].copy_from_slice(&len.to_le_bytes());
+    assert!(acs::IvrsAliases::parse(&t).is_none());
+    let mut t = good.clone();
+    t[48 + first + 2..48 + first + 4].copy_from_slice(&0x1000u16.to_le_bytes());
+    assert!(acs::IvrsAliases::parse(&t).is_none());
+    let mut t = good.clone();
+    t[48 + first + 2..48 + first + 4].copy_from_slice(&2u16.to_le_bytes());
+    assert!(acs::IvrsAliases::parse(&t).is_none());
+    // More aliases than the shim keeps: refused, not cut short.
+    let many: Vec<Vec<u8>> = (0..=acs::MAX_IVRS_ALIASES as u16).map(|i| entry(0x42, 0x1000 + i, 0x0f00)).collect();
+    let refs: Vec<&[u8]> = many.iter().map(|e| e.as_slice()).collect();
+    assert!(acs::IvrsAliases::parse(&ivrs(&[(0x11, 0, &refs)])).is_none());
+}
+
+#[test]
+fn the_shim_refuses_a_split_of_an_ivrs_alias() {
+    // Two root ports with ACS: their endpoints may go to two partitions,
+    // unless the firmware says 03:00.0's requests carry 02:00.0's ID.
+    let (m, inv) = two_root_ports(Some((ALL, ALL)), Some((ALL, ALL)));
+    let owners = |b: u16| if b == 0x0300 { 1 } else { 0 };
+    let a = entry(0x42, 0x0300, 0x0200);
+    let al = acs::IvrsAliases::parse(&ivrs(&[(0x11, 0, &[&a])])).unwrap();
+    let mut out = [0u16; 16];
+    assert_eq!(acs::other_owner(&m, || inv.iter().copied(), |f| f, owners, 0x0300, &mut out), Ok(None));
+    assert_eq!(acs::other_owner(&m, || inv.iter().copied(), |f| al.requester(f), owners, 0x0300, &mut out), Ok(Some(0x0200)));
+}

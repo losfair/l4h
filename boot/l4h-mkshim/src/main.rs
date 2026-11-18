@@ -192,7 +192,11 @@ extern "C" fn shim_main(magic: u32, info: u64) -> ! {
         }
     }
     assign_cpus(&conf, &cpus, bsp_index, &mut plans);
-    assign_funcs(&conf, &pci, &funcs, &mut plans);
+    // The requester IDs AMD-Vi takes functions' DMA as (IVRS aliases):
+    // root's domains follow them (amdvi.rs).
+    let aliases = acpi.find(b"IVRS").map(|t| acs::IvrsAliases::parse(acpi::table(t))
+        .unwrap_or_else(|| fail(format_args!("IVRS: malformed, or more than {} aliases", acs::MAX_IVRS_ALIASES))));
+    assign_funcs(&conf, &pci, &funcs, aliases.as_ref(), &mut plans);
 
     // Clocks, once, before any kernel runs: no kernel touches the PIT.
     cpu::mask_pic();
@@ -503,7 +507,7 @@ fn assign_cpus(conf: &Conf, cpus: &[acpi::Cpu], bsp: usize, plans: &mut [Plan]) 
 
 /// Give each function to the partition that lists it, the rest to
 /// partition 0, and check the result.
-fn assign_funcs(conf: &Conf, pci: &pci::Pci, funcs: &[pci::Func], plans: &mut [Plan]) {
+fn assign_funcs(conf: &Conf, pci: &pci::Pci, funcs: &[pci::Func], aliases: Option<&acs::IvrsAliases>, plans: &mut [Plan]) {
     let n = plans.len();
     let mut owner: Vec<u8, 1024> = Vec::new();
     for _ in funcs {
@@ -550,7 +554,8 @@ fn assign_funcs(conf: &Conf, pci: &pci::Pci, funcs: &[pci::Func], plans: &mut [P
     }
     // Functions that reach each other past the IOMMU (a multi-function
     // device or a switch or root port without ACS between them) are one
-    // isolation group, as root's confinement takes them (acs.rs): one
+    // isolation group, as root's confinement takes them (acs.rs), and so
+    // are functions the IVRS gives one requester ID (`aliases`): one
     // partition must have them all, or a device of one could write
     // another's registers.  ACS goes on first, as partition 0's root sets
     // it in every function (DESIGN.md §9.5), so that the ports are judged
@@ -562,7 +567,7 @@ fn assign_funcs(conf: &Conf, pci: &pci::Pci, funcs: &[pci::Func], plans: &mut [P
     let owner_of = |bdf: u16| funcs.iter().position(|f| f.bdf == bdf).map_or(0, |i| owner[i]);
     let mut members = [0u16; 1024];
     for (i, f) in funcs.iter().enumerate().filter(|&(i, _)| owner[i] != 0) {
-        match acs::other_owner(pci, || funcs.iter().map(|f| f.bdf), |b| b, owner_of, f.bdf, &mut members) {
+        match acs::other_owner(pci, || funcs.iter().map(|f| f.bdf), |b| aliases.map_or(b, |a| a.requester(b)), owner_of, f.bdf, &mut members) {
             Ok(None) => {}
             Ok(Some(o)) => fail(format_args!(
                 "PCI functions {} (p{}) and {} (p{}) can reach each other without the IOMMU (no ACS between them)",
