@@ -4462,7 +4462,10 @@ runs the secondary's ActivateCredential calls (the relay):
     to functions of other segments, and in every function to the command
     register, the BARs and the expansion ROM's, so the AML neither moves a
     device root does not drive onto another's addresses nor lets one master
-    the bus, and to the MSI and MSI-X capabilities; in memory it refuses
+    the bus, to extended configuration space (past 0x100: ACS, which a
+    confined device's isolation may rest on in a function root does not
+    drive, SR-IOV, ATS, Resizable BAR), and to the MSI and MSI-X
+    capabilities; in memory it refuses
     writes to every function's MSI-X table and pending bits, as found at
     boot (none at all if there are more than root keeps): a function the
     firmware left mastering the bus would send the AML's message as an
