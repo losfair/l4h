@@ -64,6 +64,11 @@ pub struct RootGuest {
     /// The pool, disk channels and port memory: revoked at GUEST_DEL.
     pub arena: Arena,
     pub pool: Pool,
+    /// The CNode of the pool's frames, carved from an Untyped of the
+    /// arena's own: (that Untyped's physical address, the CNode's root
+    /// slot).  It holds the frames' original capabilities, so a pool
+    /// kept out of use keeps it too (`keep_pool_cnode`).
+    pub pool_cnode: (usize, Slot),
     /// Its l4h-vmm's notification, which root makes: backends signal it
     /// (badged).
     pub vmm_ntfn: component::Obj<component::p::Vmm, component::o::Notification>,
@@ -568,11 +573,12 @@ pub enum ZombiePool {
     /// still run the guest's commands), freed after its disks' drains, or
     /// not among the guest's regions.
     Gone,
-    /// Still in the guest's arena, at this address, and freed with it: no
+    /// Still in the guest's arena, at `pool`, and freed with it: no
     /// IOMMU cut it off (it is pinned if a disk could not be stopped,
-    /// `Zombie::pin`), or no zombie counts its disks' drains (the arena is
-    /// lost, and the pool with it).
-    InArena(usize),
+    /// `Zombie::pin`, with the CNode of its frames: `RootGuest::pool_cnode`),
+    /// or no zombie counts its disks' drains (the arena is lost, and the
+    /// pool with it).
+    InArena { pool: usize, cnode_ut: usize, cnode_slot: Slot },
     /// Cut off from the devices' IOMMU domains and taken out of the
     /// arena, but not freed yet: a disk controller may still finish what
     /// the guest had started (blkd's drain), and its domain may meanwhile
@@ -584,15 +590,16 @@ pub enum ZombiePool {
 
 impl ZombiePool {
     /// Guest pool `pool`, in `arena`, at deletion: where it waits, and what
-    /// is to be freed at once.  `cut`: no device's IOMMU domain maps it any
+    /// is to be freed at once.  `cnode`: its `RootGuest::pool_cnode`, which
+    /// stays in the arena.  `cut`: no device's IOMMU domain maps it any
     /// more.  `disks`: a disk controller may still run the guest's
     /// commands.  `zombie`: a zombie will count those disks' drains.  The
     /// pool is freed at once only if it is cut off and no disk can reach it
     /// again; it is taken out of the arena to wait for the drains only if a
     /// zombie counts them.
-    pub fn at_deletion(arena: &mut Arena, pool: usize, cut: bool, disks: bool, zombie: bool) -> (Self, Option<Arena>) {
+    pub fn at_deletion(arena: &mut Arena, pool: usize, cnode: (usize, Slot), cut: bool, disks: bool, zombie: bool) -> (Self, Option<Arena>) {
         if !cut || (disks && !zombie) {
-            return (Self::InArena(pool), None);
+            return (Self::InArena { pool, cnode_ut: cnode.0, cnode_slot: cnode.1 }, None);
         }
         let Some(k) = arena.owned.iter().position(|o| o.1 == pool) else { return (Self::Gone, None) };
         let (slot, paddr, bits) = arena.owned.remove(k);
@@ -628,11 +635,15 @@ pub fn zombie_done(h: &mut Host, z: Option<usize>, pool_reusable: bool) {
             h.alloc.reclaim(a);
             None
         }
-        ZombiePool::InArena(p) => Some(p),
+        ZombiePool::InArena { pool, cnode_ut, cnode_slot } => Some((pool, cnode_ut, cnode_slot)),
         ZombiePool::Gone => None,
     };
     let pin = zb.pin;
-    let pinned = h.alloc.reclaim_pinning(zb.arena, |p| pin && Some(p) == in_arena);
+    let kept = in_arena.filter(|_| pin);
+    if let Some((_, _, cnode_slot)) = kept {
+        keep_pool_cnode(h, cnode_slot);
+    }
+    let pinned = h.alloc.reclaim_pinning(zb.arena, |p| kept.is_some_and(|(pool, cnode_ut, _)| p == pool || p == cnode_ut));
     h.alloc.slots.free_owned(zombie_owner(z));
     if pinned != 0 {
         log!("l4h-root: {} MiB of I/O pool kept out of use: a disk of a deleted guest could not be stopped", pinned >> 20);
@@ -662,6 +673,18 @@ pub fn zombie_disk_done(h: &mut Host, z: Option<usize>, pool_reusable: bool) {
 
 fn guest_arg(id: usize) -> Result<usize, Errno> {
     if id < MAX_GUESTS { Ok(id) } else { Err(ctl::ENOENT) }
+}
+
+/// Keep the CNode of a pinned I/O pool's frames, in root slot `slot`, for
+/// good: its capabilities are the frames' last, and deleting a shared DMA
+/// frame's last makes its memory private again while the device that
+/// could not be stopped may still write it.  The slot it leaves is freed
+/// with the guest's or zombie's others.
+fn keep_pool_cnode(h: &mut Host, slot: Slot) {
+    let keep = h.alloc.slots.global(|s| s.alloc());
+    abs_of(root_cap::<cap_type::Null>(keep))
+        .move_(&abs_of(root_cap::<cap_type::Null>(slot)))
+        .expect("keep pinned pool CNode");
 }
 
 /// Run `f` on guest `id` with root slot allocations tracked into it.
@@ -696,12 +719,13 @@ fn guest_new(h: &mut Host, id: usize, size: usize, gpa: usize, dom0: bool) -> Re
     }
     let bits = size.trailing_zeros() as usize;
     let radix = bits - 12;
-    if !h.can_afford(size + (32 << radix) + PAGE, 0, 4) {
+    if !h.can_afford(size + (32 << radix) + PAGE, 0, 6) {
         return Err(ctl::ENOMEM);
     }
     h.alloc.slots.track(id);
     let r = (|| {
-        let mut arena = h.alloc.arena(32 << radix).ok_or(ctl::ENOMEM)?;
+        // The pool's CNode has an Untyped of its own (below).
+        let mut arena = h.alloc.arena(PAGE).ok_or(ctl::ENOMEM)?;
         // Its VMM's notification, which backends signal: root's, so that
         // it is a notification whatever vmmgr does.
         let vmm_ntfn = arena.object_cap::<cap_type::Notification>(&mut h.alloc, ObjectBlueprint::Notification);
@@ -714,8 +738,24 @@ fn guest_new(h: &mut Host, id: usize, size: usize, gpa: usize, dom0: bool) -> Re
         };
         let paddr = region.paddr;
         arena.own(pool_slot, paddr, bits);
-        let frames = arena.object_cap::<cap_type::CNode>(&mut h.alloc, ObjectBlueprint::CNode { size_bits: radix });
-        region.retype(&FRAME_BP, size / PAGE, Dest { cnode: abs_of(frames), offset: 0 }).expect("I/O pool frames");
+        // The CNode that holds the frames, in an Untyped of its own: a
+        // pool kept out of use keeps it unrevoked, with the pool's
+        // (guest_del, zombie_done), and the arena's regions go.
+        let cnode_bp = ObjectBlueprint::CNode { size_bits: radix };
+        let cnode_ut_bits = cnode_bp.physical_size_bits();
+        let cnode_ut_slot = h.alloc.slots.alloc();
+        let Some(mut cnode_ut) = h.alloc.split(cnode_ut_bits, cnode_ut_slot) else {
+            h.alloc.reclaim(arena);
+            return Err(ctl::ENOMEM);
+        };
+        arena.own(cnode_ut_slot, cnode_ut.paddr, cnode_ut_bits);
+        let frames_slot = h.alloc.slots.alloc();
+        cnode_ut.retype(&cnode_bp, 1, Dest::new(crate::slot::CNODE.cap(), frames_slot)).expect("I/O pool CNode");
+        let frames = root_cap::<cap_type::CNode>(frames_slot);
+        region
+            .retype_dma(h.alloc.shared_dma, &FRAME_BP, size / PAGE, Dest { cnode: abs_of(frames), offset: 0 })
+            .expect("I/O pool frames");
+        let pool_cnode = (cnode_ut.paddr, frames_slot);
         use root_call::caps::guest_new::{ATTEST_KICK, ATTEST_PAGE, POOL_FRAMES, VMM_NTFN};
         // trustd fills root's slots, which then go with the others.
         let (page_slot, kick_slot) = (h.alloc.slots.alloc(), h.alloc.slots.alloc());
@@ -754,6 +794,7 @@ fn guest_new(h: &mut Host, id: usize, size: usize, gpa: usize, dom0: bool) -> Re
             dom0,
             arena,
             pool: Pool { gpa, paddr, size },
+            pool_cnode,
             vmm_ntfn: component::Obj::claim(component::p::Vmm, component::o::Notification, abs_of(vmm_ntfn)),
             disks: ArrayVec::new(),
             ports: ArrayVec::new(),
@@ -801,8 +842,11 @@ fn guest_del(h: &mut Host, id: usize) -> Result<u64, Errno> {
     }
     let waits = g.disks.len() + g.ports.len();
     if waits == 0 {
-        let pool = g.pool.paddr;
-        let kept = h.alloc.reclaim_pinning(g.arena, |p| !cut && p == pool);
+        let (pool, (cnode_ut, cnode_slot)) = (g.pool.paddr, g.pool_cnode);
+        if !cut {
+            keep_pool_cnode(h, cnode_slot);
+        }
+        let kept = h.alloc.reclaim_pinning(g.arena, |p| !cut && (p == pool || p == cnode_ut));
         h.alloc.slots.free_owned(id);
         return Ok(kept as u64);
     }
@@ -816,7 +860,7 @@ fn guest_del(h: &mut Host, id: usize) -> Result<u64, Errno> {
     // stops it.  Without a zombie's place, the pool stays with the rest of
     // the guest's memory, for good, as no drain can then be counted.
     let z = h.zombies.iter().position(Option::is_none);
-    let (pool, now) = ZombiePool::at_deletion(&mut g.arena, g.pool.paddr, cut, !g.disks.is_empty(), z.is_some());
+    let (pool, now) = ZombiePool::at_deletion(&mut g.arena, g.pool.paddr, g.pool_cnode, cut, !g.disks.is_empty(), z.is_some());
     if let Some(a) = now {
         h.alloc.reclaim(a);
     }

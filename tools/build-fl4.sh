@@ -35,5 +35,9 @@ for d in \
     "$out/libsel4/autoconf"; do
     cp -rL "$d/." "$prefix/libsel4/include/"
 done
+# rust-sel4 generates its invocations from interfaces/object-api*.xml
+# alone: install the architecture interface with FL4's extensions
+# (seL4_Untyped_RetypeShared) appended, as FL4's own invocation.h has them.
+cp "$out/libsel4/arch-invocation-labels.xml" "$prefix/libsel4/include/interfaces/object-api-arch.xml"
 printf '%s\n' "$base" >"$prefix/fl4-revision"
 echo "FL4 installed to $prefix (debug build: $debug)"

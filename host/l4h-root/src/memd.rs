@@ -103,6 +103,8 @@ impl Memd {
     /// given its DMA pages only: one that translates them through the
     /// IOMMU (QEMU's `iommu_platform=on`) cannot report.
     pub fn attach_balloon(&mut self, d: &pci::Device, pci: &Pci, iommu: &mut Iommu, alloc: &mut Alloc, devmem: &mut DevMem) {
+        // Reports would drop encrypted memory (main.rs leaves the device).
+        assert!(!alloc.shared_dma, "free page reporting with shared DMA");
         let mut cfg = BalloonConfig::default();
         let legacy = crate::blkd::is_legacy_virtio(d);
         if legacy {

@@ -5687,14 +5687,33 @@ tools/build-fl4.sh
 SEL4_PREFIX="$PWD/build/sel4-fl4" L4H_KERNEL_VARIANT=fl4 tests/run-selftest.sh 4
 ```
 
-The tested FL4 revision is `9600a928b177b8fb208c290db50a0f40e8ff3970`.
+The tested FL4 revision is `d382963fb8af9579ddf83c57514065695d780fc0`.
 `prepare-fl4.sh` clones the pinned public revision, or the frozen override,
 into `build/FL4-src` without applying any kernel patches. The source
 worktree is not edited.
 `build-fl4.sh` builds the kernel and FL4's own libsel4 together, installs
 them in `build/sel4-fl4`, and records the source commit in `fl4-revision`.
 FL4's own syscall XML is installed unchanged; the bindings use FL4's
-MCS syscall numbers.
+MCS syscall numbers. The architecture interface is installed with FL4's
+extensions appended (`arch-invocation-labels.xml`, from which FL4's own
+`invocation.h` is generated), since the Rust bindings are generated from
+the XML alone; `l4h-task`'s build enables `seL4_Untyped_RetypeShared`
+when the interface has it.
+
+On an AMD SEV guest, FL4 keeps RAM private (encrypted) and says in the
+BootInfo (`SEL4_BOOTINFO_HEADER_SHARED_DMA`) that devices reach only
+frames shared with the hypervisor. Root then makes every DMA buffer with
+`UtRegion::retype_dma`, which uses `RetypeShared` on the same watermark
+as other objects (up to 256 4 KiB frames, or one 2 MiB frame, per call):
+blkd's, nicd's and usbd's DMA regions, the guests' I/O pools and the
+IOMMU tables. Queue memory only the CPU touches stays private. A shared
+frame becomes private again when its last capability goes, so a pool a
+device could not be stopped from writing is not revoked but kept, with the
+CNode of its frames (an Untyped of its own), in global slots for good
+(`Alloc::reclaim_pinning`). Root leaves a virtio-balloon unused there: a
+page the hypervisor dropped reads back as the decryption of zeroes, not as
+zeroes. `tools/gce-image.sh --sev` prints the commands for an N2D
+Confidential VM with SEV.
 
 Rebuild the host with this `SEL4_PREFIX`; its build also compiles the small
 ABI provider against FL4's libsel4. Linux and modules remain byte-identical

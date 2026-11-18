@@ -273,6 +273,31 @@ impl UtRegion {
         self.used = off + (count << bits);
         Some(self.paddr + off)
     }
+
+    /// `retype` for frames that devices reach by DMA (`bp` is a 4 KiB or
+    /// 2 MiB frame): shared with the hypervisor (`crate::retype_shared`)
+    /// when `shared` (`Alloc::shared_dma`), ordinary frames otherwise.
+    /// Shared frames take the same watermark as other objects.
+    pub fn retype_dma(&mut self, shared: bool, bp: &ObjectBlueprint, count: usize, dest: Dest) -> Option<usize> {
+        if !shared {
+            return self.retype(bp, count, dest);
+        }
+        let bits = bp.physical_size_bits();
+        assert!(bits == 12 || bits == 21, "unsupported shared DMA frame size 2^{}", bits);
+        let off = self.fit(bits, count)?;
+        // The kernel makes at most 256 4 KiB frames, or one 2 MiB frame,
+        // per call.
+        let limit = if bits == 12 { RETYPE_FAN_OUT.min(256) } else { 1 };
+        let mut done = 0;
+        while done < count {
+            let n = (count - done).min(limit);
+            crate::retype_shared(self.cap, bits, &dest.cnode, dest.offset + done, n)
+                .unwrap_or_else(|e| panic!("shared retype 2^{} x{} failed: {:?}", bits, n, e));
+            done += n;
+        }
+        self.used = off + (count << bits);
+        Some(self.paddr + off)
+    }
 }
 
 pub fn cnode_dest(cnode: cap::CNode) -> sel4::AbsoluteCPtr {
@@ -364,6 +389,10 @@ pub struct Alloc {
     /// Split blocks: (paddr, size bits, slot of their Untyped), sorted.
     parents: &'static mut ArrayVec<(usize, usize, Slot), ALLOC_BLOCKS>,
     pub memd: Option<MemdLink>,
+    /// Devices reach only memory shared with the hypervisor (FL4 on a
+    /// confidential VM, SEL4_BOOTINFO_HEADER_SHARED_DMA): DMA frames are
+    /// made with `UtRegion::retype_dma`.  Set by the task at boot.
+    pub shared_dma: bool,
     /// Grants from memd that we hold, whole or split: (paddr, size bits).
     grants: &'static mut ArrayVec<(usize, usize), ALLOC_GRANTS>,
 }
@@ -404,14 +433,14 @@ fn untyped_at(s: Slot) -> cap::Untyped {
 impl Alloc {
     pub fn new(slots: Slots, storage: &'static mut AllocStorage, bootinfo: &sel4::BootInfo) -> Self {
         let AllocStorage { blocks, parents, grants } = storage;
-        Self::with_tables(Alloc { slots, pool: UtPool::empty(), blocks, parents, memd: None, grants }, bootinfo)
+        Self::with_tables(Alloc { slots, pool: UtPool::empty(), blocks, parents, memd: None, shared_dma: false, grants }, bootinfo)
     }
 
     /// An allocator with no memory until it is given a link to memd
     /// (vmmgr's: all it has are grants).
     pub fn empty(slots: Slots, storage: &'static mut AllocStorage) -> Self {
         let AllocStorage { blocks, parents, grants } = storage;
-        Alloc { slots, pool: UtPool::empty(), blocks, parents, memd: None, grants }
+        Alloc { slots, pool: UtPool::empty(), blocks, parents, memd: None, shared_dma: false, grants }
     }
 
     /// A new allocator for `bootinfo`, with this one's slots and tables:
@@ -421,7 +450,7 @@ impl Alloc {
         blocks.clear();
         parents.clear();
         grants.clear();
-        Self::with_tables(Alloc { slots, pool: UtPool::empty(), blocks, parents, memd: None, grants }, bootinfo)
+        Self::with_tables(Alloc { slots, pool: UtPool::empty(), blocks, parents, memd: None, shared_dma: false, grants }, bootinfo)
     }
 
     fn with_tables(mut a: Self, bootinfo: &sel4::BootInfo) -> Self {
@@ -595,8 +624,13 @@ impl Alloc {
 
     /// `reclaim`, except that the Untypeds at a physical address for which
     /// `pin` is true never return to the free pool: a device that could not
-    /// be stopped may still write to them.  Their objects are destroyed all
-    /// the same.  Returns the bytes kept out of use.
+    /// be stopped may still write to them.  They are not revoked either:
+    /// they move, with their objects, to global slots for good (deleting
+    /// shared DMA frames makes their memory private again, which a device
+    /// still writing must not see), leaving the owner's slots empty.  The
+    /// caller keeps capabilities to those objects held elsewhere that must
+    /// not go (`Slots::free_owned` would delete them).  Returns the bytes
+    /// kept out of use.
     pub fn reclaim_pinning(&mut self, arena: Arena, pin: impl Fn(usize) -> bool) -> usize {
         self.reclaim_inner(arena, pin, false)
     }
@@ -605,14 +639,21 @@ impl Alloc {
         let mut pinned = 0;
         for &(slot, paddr, bits) in arena.owned.iter() {
             let cap = untyped_at(slot);
+            if pin(paddr) {
+                let s = self.slots.global(|s| s.alloc());
+                self.slots.cnode().absolute_cptr(untyped_at(s)).move_(&self.slots.cnode().absolute_cptr(cap)).expect("keep pinned untyped");
+                if free_slots {
+                    self.slots.free(slot);
+                }
+                pinned += 1 << bits;
+                continue;
+            }
             self.slots.cnode().absolute_cptr(cap).revoke().expect("revoke arena untyped");
             if self.blocks.is_full() {
                 self.merge_up_to(usize::MAX);
             }
-            if pin(paddr) || self.blocks.is_full() {
-                if !pin(paddr) {
-                    log!("l4h-task: free block table full, {} KiB lost", (1usize << bits) >> 10);
-                }
+            if self.blocks.is_full() {
+                log!("l4h-task: free block table full, {} KiB lost", (1usize << bits) >> 10);
                 pinned += 1 << bits;
                 continue;
             }

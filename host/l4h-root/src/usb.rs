@@ -319,7 +319,9 @@ fn claim(h: &mut Host, i: usize) -> Result<(), Errno> {
     };
     let n_dma = dma / PAGE;
     let dma_cn = arena.object_cap::<cap_type::CNode>(&mut h.alloc, ObjectBlueprint::CNode { size_bits: bits - 12 });
-    region.retype(&FRAME_BP, n_dma, Dest { cnode: abs_of(dma_cn), offset: 0 }).expect("usbd DMA frames");
+    region
+        .retype_dma(h.alloc.shared_dma, &FRAME_BP, n_dma, Dest { cnode: abs_of(dma_cn), offset: 0 })
+        .expect("usbd DMA frames");
 
     let c = &mut ctrls()[i];
     let d = c.pci;
