@@ -693,10 +693,12 @@ impl Ecam {
 
 /// The ECAM windows of `table`, the first bytes of a MCFG that is `len`
 /// bytes long, and whether they are all of them: false if the table has
-/// more than MAX_ECAM, or `table` is not the whole of it.
+/// more than MAX_ECAM, `table` is not the whole of it, it is shorter than
+/// its header or ends in part of an entry, or it lists no window at all
+/// (`ecam_windows`).
 pub fn mcfg_windows(table: &[u8], len: usize) -> (crate::fixed::ArrayVec<Ecam, MAX_ECAM>, bool) {
     let mut windows = crate::fixed::ArrayVec::new();
-    let mut complete = table.len() >= len;
+    let mut complete = table.len() >= len && len >= MCFG_HEADER && (len - MCFG_HEADER) % MCFG_ENTRY == 0;
     for e in table.get(MCFG_HEADER..).unwrap_or(&[]).chunks_exact(MCFG_ENTRY) {
         let w = Ecam {
             base: u64::from_le_bytes([e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7]]),
@@ -708,7 +710,22 @@ pub fn mcfg_windows(table: &[u8], len: usize) -> (crate::fixed::ArrayVec<Ecam, M
             complete = false;
         }
     }
+    let complete = complete && !windows.is_empty();
     (windows, complete)
+}
+
+/// The ECAM windows root knows of, from the firmware's MCFG (`mcfg`: its
+/// first bytes and its own length; None if there is none), and whether
+/// they are known to be all the ECAM there is: never without a MCFG that
+/// lists one, since a host bridge's ECAM can be described by its `_CBA`
+/// alone (the PCI Firmware Specification, as Linux reads it), which
+/// root does not read.  The AML then gets no memory write: any could be a
+/// configuration write root cannot check.
+pub fn ecam_windows(mcfg: Option<(&[u8], usize)>) -> (crate::fixed::ArrayVec<Ecam, MAX_ECAM>, bool) {
+    match mcfg {
+        None => (crate::fixed::ArrayVec::new(), false),
+        Some((t, len)) => mcfg_windows(t, len),
+    }
 }
 
 /// ActivateCredential's rate limit, per guest instance and, at a primary,
@@ -1022,7 +1039,28 @@ mod tests {
         let (w, complete) = mcfg_windows(&t, t.len());
         assert_eq!((w.len(), complete), (MAX_ECAM, false));
         let (w, complete) = mcfg_windows(&[], 0);
-        assert!(w.is_empty() && complete);
+        assert!(w.is_empty() && !complete);
+    }
+
+    #[test]
+    fn no_listed_ecam_is_not_no_ecam() {
+        // No MCFG: a host bridge's ECAM can still be described by its
+        // _CBA alone (the PCI Firmware Specification; Linux's
+        // Documentation/PCI/acpi-info.rst), at an address root cannot
+        // check a write against.
+        assert!(!ecam_windows(None).1);
+        // A MCFG with no entry, one shorter than its header, one whose
+        // entries have no buses, or one ending in part of an entry, lists
+        // no (or not every) window either.
+        let one = mcfg(&[(0xe000_0000, 0, 0, 0xff)]);
+        assert!(!ecam_windows(Some((&one[..MCFG_HEADER], MCFG_HEADER))).1);
+        assert!(!ecam_windows(Some((&one[..36], 36))).1);
+        let none = mcfg(&[(0xe000_0000, 0, 9, 3)]);
+        assert!(!ecam_windows(Some((&none, none.len()))).1);
+        assert!(!ecam_windows(Some((&one[..MCFG_HEADER + 8], MCFG_HEADER + 8))).1);
+        // A whole MCFG with a window is complete.
+        let (w, complete) = ecam_windows(Some((&one, one.len())));
+        assert!(complete && w.len() == 1);
     }
 
     #[test]

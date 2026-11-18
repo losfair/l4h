@@ -4488,10 +4488,11 @@ runs the secondary's ActivateCredential calls (the relay):
     boot (none at all if there are more than root keeps): a function the
     firmware left mastering the bus would send the AML's message as an
     interrupt, where none is remapped any vector to any CPU. Root keeps up
-    to 16 ECAM windows; if the MCFG lists more, or
-    cannot be read, it serves no memory write at all, since any could be a
-    configuration write. Refused reads return all ones, and root logs refusals
-    through `log::RateLimit`.
+    to 16 ECAM windows; if the MCFG lists more, none, or
+    cannot be read, or there is no MCFG (a host bridge's `_CBA` can still
+    describe ECAM, which root does not read), it serves no memory write at
+    all, since any could be a configuration write. Refused reads return all
+    ones, and root logs refusals through `log::RateLimit`.
   - The interpreter runs in trustd, not root, because it can panic on some
     AML. If trustd's main thread faults, root suspends only it, revokes the
     guests' kick capabilities, marks every attestation page failed and

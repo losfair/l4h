@@ -84,8 +84,9 @@ struct Hw {
     /// The device pages it touched, a table of its own (acpi::Frames::hw).
     frames: crate::acpi::Frames,
     /// The MCFG's ECAM windows, of every segment, and whether these are
-    /// all of them.  If the firmware lists more than root keeps, no memory
-    /// write is served: any could be a configuration write.
+    /// all of them (trust::ecam_windows).  If the firmware has no MCFG,
+    /// lists no window, or more than root keeps, no memory write is
+    /// served: any could be a configuration write.
     ecam: ArrayVec<trust::Ecam, { trust::MAX_ECAM }>,
     ecam_complete: bool,
     /// I/O ports that reset the machine, put it to sleep, enter SMM or
@@ -100,7 +101,7 @@ impl Hw {
     /// From the firmware's tables, read with `phys`.
     fn find(bootinfo: &sel4::BootInfoPtr, phys: &mut crate::acpi::Phys) -> Hw {
         let mut hw = Hw {
-            frames: crate::acpi::Frames::hw(), ecam: ArrayVec::new(), ecam_complete: true, ports: ArrayVec::new(),
+            frames: crate::acpi::Frames::hw(), ecam: ArrayVec::new(), ecam_complete: false, ports: ArrayVec::new(),
             mmio: ArrayVec::new(),
         };
         for r in trust::HW_REFUSED_PORTS {
@@ -134,15 +135,14 @@ impl Hw {
             }
         }
         // Every ECAM window, or the AML writes no memory: a write into
-        // one root does not know of would go unchecked.
+        // one root does not know of would go unchecked.  No MCFG is not
+        // no ECAM: a host bridge's _CBA can describe one alone.
         let mut buf = [0; trust::MCFG_MAX];
-        match crate::acpi::find_len(bootinfo, phys, b"MCFG", &mut buf) {
-            Ok(None) => {}
-            Ok(Some((t, len))) => (hw.ecam, hw.ecam_complete) = trust::mcfg_windows(t, len),
-            Err(crate::acpi::Unreadable) => hw.ecam_complete = false,
+        if let Ok(mcfg) = crate::acpi::find_len(bootinfo, phys, b"MCFG", &mut buf) {
+            (hw.ecam, hw.ecam_complete) = trust::ecam_windows(mcfg);
         }
         if !hw.ecam_complete {
-            log!("l4h-root: the MCFG cannot be read, or lists more than {} ECAM windows: the TPM's AML gets no memory writes", trust::MAX_ECAM);
+            log!("l4h-root: no MCFG, one that cannot be read, lists no ECAM window or more than {}: the TPM's AML gets no memory writes", trust::MAX_ECAM);
         }
         hw
     }
