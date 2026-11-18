@@ -11,20 +11,22 @@
 # NIC_TYPE=GVNIC gives the instance a gVNIC, which C3, N4 and C4 require.
 # "-lssd" machine types come with their local SSDs; LOCAL_SSD=0 asks for
 # none on others (N4 has none).
-# --sev builds FL4 and tests an AMD SEV VM with gVNIC and NVMe persistent
-# disks. The test requires active SEV, shared DMA and a disk write/readback.
-# Usage: gce-test.sh [--sev] PROJECT [ZONE] [MACHINE_TYPE]
+# --sev and --sev-snp build FL4 and test AMD confidential VMs with
+# gVNIC and NVMe persistent disks. Both require the selected technology,
+# shared DMA and a disk write/readback.
+# Usage: gce-test.sh [--sev|--sev-snp] PROJECT [ZONE] [MACHINE_TYPE]
 # e.g.   BOOT_DISK_INTERFACE=NVME NIC_TYPE=GVNIC gce-test.sh PROJECT us-west1-b c3-standard-4-lssd
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 source "$root/tools/host-profile.sh"
-sev=0
-if [ "${1:-}" = --sev ]; then
-    sev=1
-    shift
-fi
+confidential=
+default_zone=us-west1-b
+case "${1:-}" in
+    --sev) confidential=SEV; shift ;;
+    --sev-snp) confidential=SEV_SNP; default_zone=us-central1-a; shift ;;
+esac
 project=$1
-zone=${2:-us-west1-b}
+zone=${2:-$default_zone}
 machine=${3:-n2-standard-4}
 region=${zone%-*}
 nic=${NIC_TYPE:-VIRTIO_NET}
@@ -37,19 +39,19 @@ if [ -n "${SCSI_DISK_GB:-}" ]; then
     disk_args=(--create-disk="size=${SCSI_DISK_GB}GB,type=pd-balanced,interface=SCSI,auto-delete=yes")
 fi
 features=UEFI_COMPATIBLE,GVNIC
-if [ "$sev" = 1 ]; then
+if [ -n "$confidential" ]; then
     machine=${3:-n2d-standard-4}
-    case "$machine" in
-        n2d-*|c2d-*) cpu="AMD Milan" ;;
-        c3d-*) cpu="AMD Genoa" ;;
-        *) echo "Unsupported AMD SEV machine type: $machine" >&2; exit 2 ;;
+    case "$confidential:$machine" in
+        SEV:n2d-*|SEV:c2d-*|SEV_SNP:n2d-*) cpu="AMD Milan" ;;
+        SEV:c3d-*) cpu="AMD Genoa" ;;
+        *) echo "Unsupported $confidential machine type: $machine" >&2; exit 2 ;;
     esac
     nic=GVNIC
     ssd=
     BOOT_DISK_INTERFACE=NVME
     disk_args=(--create-disk=size=10GB,type=pd-balanced,interface=NVME,auto-delete=yes)
-    features+=,SEV_CAPABLE
-    gce_args=(--confidential-compute-type=SEV --min-cpu-platform="$cpu" --maintenance-policy=TERMINATE
+    features+=,${confidential}_CAPABLE
+    gce_args=(--confidential-compute-type="$confidential" --min-cpu-platform="$cpu" --maintenance-policy=TERMINATE
         --no-service-account --no-scopes)
     export SEL4_PREFIX="$root/build/sel4-fl4" L4H_KERNEL_VARIANT=fl4
 fi
@@ -60,7 +62,7 @@ log=$out/$name.serial.log
 
 # ---- image
 kernel_build=build-kernel.sh
-[ "$sev" = 1 ] && kernel_build=build-fl4.sh
+[ -n "$confidential" ] && kernel_build=build-fl4.sh
 "$root/tools/$kernel_build" >"$root/build/kernel-build.log" 2>&1 \
     || { tail -20 "$root/build/kernel-build.log"; exit 1; }
 "$root/tools/build-linux.sh" vmlinux >"$root/build/linux-build.log" 2>&1 \
@@ -78,12 +80,19 @@ L4H_DOM0_DISKS=0 L4H_DOM0_MEM_MB=1024 L4H_DOM0_CMDLINE=console=hvc0 L4H_WATCHDOG
     "$root/tools/build-host.sh"
 export L4H_GUEST_KERNEL=$out/vmlinux L4H_GUEST_SDK=
 image_args=()
-if [ "$sev" = 1 ]; then
+if [ "$confidential" = SEV_SNP ]; then
+    L4H_DOM0_INITRD="$out/dom0.cpio.gz" "$root/tools/mkfl4-efi.sh" "$out/$name.efi" \
+        "$root/host/target/x86_64-sel4-roottask/$l4h_profile/l4h-root.elf" "$SEL4_PREFIX/bin/kernel.elf"
+    image_args=(-e "$out/$name.efi")
+elif [ "$confidential" = SEV ]; then
     L4H_MKSHIM= "$root/tools/mkefi.sh" "$out/$name.efi" \
         "$root/host/target/x86_64-sel4-roottask/$l4h_profile/l4h-root.elf" "$SEL4_PREFIX/bin/kernel.elf"
     image_args=(-e "$out/$name.efi")
 fi
-"$root/tools/mkimage.sh" "${image_args[@]}" -i "$out/dom0.cpio.gz" "$out/$name.raw" >/dev/null
+if [ "$confidential" != SEV_SNP ]; then
+    image_args+=(-i "$out/dom0.cpio.gz")
+fi
+"$root/tools/mkimage.sh" "${image_args[@]}" "$out/$name.raw" >/dev/null
 "$root/tools/gce-image.sh" "$out/$name.raw" "$name" >/dev/null
 rm -f "$out/$name.raw"
 
@@ -106,11 +115,11 @@ gcloud compute instances create "$name" --project="$project" --zone="$zone" \
     $ssd --network-interface=nic-type="$nic" \
     "${disk_args[@]}" \
     --metadata=serial-port-enable=TRUE --no-shielded-secure-boot --quiet
-if [ "$sev" = 1 ]; then
+if [ -n "$confidential" ]; then
     actual=$(gcloud compute instances describe "$name" --project="$project" --zone="$zone" \
         --format='value(confidentialInstanceConfig.confidentialInstanceType)')
-    if [ "$actual" != SEV ]; then
-        echo "$name: expected confidential compute type SEV, got '$actual'" >&2
+    if [ "$actual" != "$confidential" ]; then
+        echo "$name: expected confidential compute type $confidential, got '$actual'" >&2
         exit 1
     fi
 fi
@@ -124,12 +133,21 @@ while [ $SECONDS -lt $end ]; do
     # Serial lines end in CR LF.
     grep -aqE 'GCETEST: (PASS|FAIL)[[:space:]]*$' "$log" && break
 done
-grep -aE 'GCETEST|Got framebuffer|AMD SEV guest|DMA memory shared|l4h-root: [0-9]+ core|panic|fault' "$log" || true
+grep -aE 'GCETEST|Got framebuffer|AMD SEV(-SNP)? guest|DMA memory shared|l4h-root: [0-9]+ core|panic|fault' "$log" || true
 echo "serial log: $log"
 grep -aqE 'GCETEST: PASS[[:space:]]*$' "$log"
-if [ "$sev" = 1 ]; then
-    for marker in "FL4: AMD SEV guest, C-bit [0-9]+" "l4h-root: DMA memory shared with the hypervisor" "GCETEST: ok: disk [0-9]+ pass-through"; do
+if [ -n "$confidential" ]; then
+    technology=${confidential/_/-}
+    for marker in "FL4: AMD $technology guest, C-bit [0-9]+" "l4h-root: DMA memory shared with the hypervisor" "GCETEST: ok: disk [0-9]+ pass-through"; do
         grep -aqE "$marker" "$log" || { echo "Missing serial marker: $marker" >&2; exit 1; }
     done
-    echo "GCE FL4 SEV: PASS"
+    if [ "$confidential" = SEV_SNP ]; then
+        expected_cores=$(gcloud compute machine-types describe "$machine" --project="$project" --zone="$zone" --format='value(guestCpus)')
+        if [[ ! $expected_cores =~ ^[0-9]+$ ]] ||
+           ! grep -aqF "SELFTEST: start ($expected_cores CPUs online)" "$log"; then
+            echo "$name: guest self-test did not report the instance's $expected_cores vCPUs online" >&2
+            exit 1
+        fi
+    fi
+    echo "GCE FL4 $technology: PASS"
 fi

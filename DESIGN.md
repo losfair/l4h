@@ -5699,7 +5699,7 @@ tools/build-fl4.sh
 SEL4_PREFIX="$PWD/build/sel4-fl4" L4H_KERNEL_VARIANT=fl4 tests/run-selftest.sh 4
 ```
 
-The tested FL4 revision is `bbc69db5c33f5b80795a940c6f6b8e938038b50e`.
+The tested FL4 revision is `7e47ae7578201b0c26d3a4e897418d4cb69049ba`.
 `prepare-fl4.sh` clones the pinned public revision, or the frozen override,
 into `build/FL4-src` without applying any kernel patches. The source
 worktree is not edited.
@@ -5742,6 +5742,19 @@ networking and NVMe write/readback:
 ```sh
 tests/gce-test.sh --sev PROJECT
 ```
+
+For SEV-SNP use `tests/gce-test.sh --sev-snp PROJECT [ZONE] [MACHINE_TYPE]`.
+It defaults to `n2d-standard-4` in `us-central1-a` and also checks that
+the guest self-test ran with all of the instance's vCPUs online.
+The SNP image uses FL4's native UEFI loader to hand off in long mode
+with private page tables. The CR3 switch runs from a trampoline below
+4 GiB so it stays mapped even when firmware puts the loader above 4 GiB.
+`tools/mkfl4-efi.sh` builds the loader from the pinned FL4 source
+and embeds the FL4 kernel and the root task. The guest kernel, SDK,
+dom0 initramfs and settings are supplied through
+`tools/dom0-modules.sh`. Package the resulting EFI application with
+`tools/mkimage.sh -e` and use `tools/gce-image.sh --sev-snp` for the
+`SEV_SNP_CAPABLE` image tag and matching instance configuration.
 
 Rebuild the host with this `SEL4_PREFIX`; its build also compiles the small
 ABI provider against FL4's libsel4. Linux and modules remain byte-identical

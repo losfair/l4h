@@ -6,6 +6,7 @@
 
 #![no_std]
 
+#[cfg(not(target_arch = "x86_64"))]
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::Ordering;
 #[cfg(not(target_arch = "aarch64"))]
@@ -78,27 +79,49 @@ const QUEUE_DEVICE: usize = 0x30;
 #[derive(Clone, Copy)]
 pub struct Mmio(pub usize);
 
+// FL4's SEV-SNP #VC handler emulates scalar MOV. Explicit loads and stores
+// keep LLVM from folding volatile MMIO into memory-operand TEST, AND or MOVBE.
+macro_rules! mmio_access {
+    ($read:ident, $write:ident, $ty:ty, $reg:ident, $value:literal) => {
+        pub fn $read(&self, off: usize) -> $ty {
+            let addr = self.0 + off;
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                let value: $ty;
+                core::arch::asm!(
+                    concat!("mov ", $value, ", [{addr}]"),
+                    value = out($reg) value, addr = in(reg) addr,
+                    options(nostack, preserves_flags),
+                );
+                value
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            unsafe { read_volatile(addr as *const $ty) }
+        }
+
+        pub fn $write(&self, off: usize, value: $ty) {
+            let addr = self.0 + off;
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                core::arch::asm!(
+                    concat!("mov [{addr}], ", $value),
+                    value = in($reg) value, addr = in(reg) addr,
+                    options(nostack, preserves_flags),
+                );
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            unsafe { write_volatile(addr as *mut $ty, value) }
+        }
+    };
+}
+
 impl Mmio {
-    pub fn r8(&self, off: usize) -> u8 {
-        unsafe { read_volatile((self.0 + off) as *const u8) }
-    }
-    pub fn r16(&self, off: usize) -> u16 {
-        unsafe { read_volatile((self.0 + off) as *const u16) }
-    }
-    pub fn r32(&self, off: usize) -> u32 {
-        unsafe { read_volatile((self.0 + off) as *const u32) }
-    }
+    mmio_access!(r8, w8, u8, reg_byte, "{value}");
+    mmio_access!(r16, w16, u16, reg, "{value:x}");
+    mmio_access!(r32, w32, u32, reg, "{value:e}");
+
     pub fn r64(&self, off: usize) -> u64 {
         self.r32(off) as u64 | ((self.r32(off + 4) as u64) << 32)
-    }
-    pub fn w8(&self, off: usize, v: u8) {
-        unsafe { write_volatile((self.0 + off) as *mut u8, v) }
-    }
-    pub fn w16(&self, off: usize, v: u16) {
-        unsafe { write_volatile((self.0 + off) as *mut u16, v) }
-    }
-    pub fn w32(&self, off: usize, v: u32) {
-        unsafe { write_volatile((self.0 + off) as *mut u32, v) }
     }
     pub fn w64(&self, off: usize, v: u64) {
         self.w32(off, v as u32);

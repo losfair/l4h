@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Package a disk image from tools/mkimage.sh for Google Compute Engine and
 # print the commands that import it and start a VM.  Nothing is uploaded.
-# Usage: gce-image.sh [--sev] <disk.raw> [image-name]
+# Usage: gce-image.sh [--sev|--sev-snp] <disk.raw> [image-name]
 #
 # Supported machine shapes: N2/N2D/C2 etc. with
 #   --network-interface=nic-type=VIRTIO_NET, and C3/N4/C4 etc. with
@@ -13,12 +13,14 @@
 # --sev: for an image that boots l4h-fl4.efi (FL4, which shares DMA memory
 # with the hypervisor) on an AMD SEV Confidential VM: the image is marked
 # SEV_CAPABLE and the instance is an N2D with SEV, on gVNIC.
+# --sev-snp: for an image built with tools/mkfl4-efi.sh, deployed in
+# an SEV-SNP zone as an N2D with SEV_SNP and the SEV_SNP_CAPABLE image tag.
 set -euo pipefail
-sev=0
-if [ "${1:-}" = --sev ]; then
-    sev=1
-    shift
-fi
+confidential=
+case "${1:-}" in
+    --sev) confidential=SEV; shift ;;
+    --sev-snp) confidential=SEV_SNP; shift ;;
+esac
 disk=$1
 name=${2:-l4h-$(date +%Y%m%d-%H%M)}
 dir=$(dirname -- "$disk")
@@ -29,9 +31,9 @@ features=UEFI_COMPATIBLE,GVNIC
 machine="--machine-type=n2-standard-4"
 nic=VIRTIO_NET
 image_args=
-if [ "$sev" = 1 ]; then
-    features+=,SEV_CAPABLE
-    machine='--machine-type=n2d-standard-4 --min-cpu-platform="AMD Milan" --confidential-compute-type=SEV --maintenance-policy=TERMINATE'
+if [ -n "$confidential" ]; then
+    features+=,${confidential}_CAPABLE
+    machine="--machine-type=n2d-standard-4 --min-cpu-platform=\"AMD Milan\" --confidential-compute-type=$confidential --maintenance-policy=TERMINATE"
     nic=GVNIC
     image_args=" --boot-disk-interface=NVME --no-shielded-secure-boot --no-service-account --no-scopes"
 fi
