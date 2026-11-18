@@ -248,6 +248,17 @@ pub fn complete_csum(frame: &mut [u8], hdr: &mut [u8; HDR_SIZE]) {
     hdr[0] &= !F_NEEDS_CSUM;
 }
 
+/// Complete a plain frame's partial checksum before netd looks at its
+/// addresses and ports (ipfilter, steer): its sender, a guest, a nicd or
+/// a peer partition, says where it goes (`check`: anywhere past the
+/// Ethernet header), so it could rewrite them after the look.  A GSO
+/// frame's is its TCP checksum (`check`) and stays, for `segment`.
+pub fn settle_csum(frame: &mut [u8], hdr: &mut [u8; HDR_SIZE]) {
+    if !is_gso(hdr) {
+        complete_csum(frame, hdr);
+    }
+}
+
 /// Split a GSO TCP frame (validated by `sanitize`) into MSS-sized frames
 /// with complete checksums, built in `buf`, and pass each to `emit`.  It
 /// takes any nonzero gso_size: the bound on segments is where a frame
@@ -540,6 +551,39 @@ mod tests {
         put16(&mut h, 8, 16);
         assert!(sanitize(&mut h, &f[..len]));
         (f, len, h)
+    }
+
+    /// A plain frame from an uplink may say its checksum goes over the
+    /// TCP destination port (or an address): settled before netd looks,
+    /// what it looked at is what is delivered.  A GSO one's goes nowhere
+    /// but its TCP checksum.
+    #[test]
+    fn a_partial_checksum_settles_before_netd_looks() {
+        let (mut f, len, _) = gso_frame(100, 1448);
+        let mut h = [F_NEEDS_CSUM, GSO_NONE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        // csum_start at the TCP header, csum_offset 2: its destination port.
+        put16(&mut h, 6, 34);
+        put16(&mut h, 8, 2);
+        assert!(sanitize_rx(&mut h, &f[..len], UPLINK_MIN_MSS) && h[0] & F_NEEDS_CSUM != 0);
+        settle_csum(&mut f[..len], &mut h);
+        assert_eq!(h[0] & F_NEEDS_CSUM, 0);
+        let looked = f;
+        // Nothing left for a receiver to write.
+        complete_csum(&mut f[..len], &mut h);
+        assert_eq!(f[..len], looked[..len]);
+        // A GSO frame's checksum is the TCP one, or it is dropped.
+        let (f, len, _) = gso_frame(3000, 1448);
+        for (start, off) in [(34, 2), (14, 16), (30, 16), (34, 0)] {
+            let mut rx = [F_NEEDS_CSUM, GSO_TCPV4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            put16(&mut rx, 4, 1448);
+            put16(&mut rx, 6, start);
+            put16(&mut rx, 8, off);
+            assert!(!sanitize_rx(&mut rx, &f[..len], UPLINK_MIN_MSS), "{start} {off}");
+        }
+        let (mut f, len, mut h) = gso_frame(3000, 1448);
+        let before = f;
+        settle_csum(&mut f[..len], &mut h);
+        assert!(is_gso(&h) && h[0] & F_NEEDS_CSUM != 0 && f[..len] == before[..len]);
     }
 
     /// A GSO frame of one segment or none is a plain frame with a partial

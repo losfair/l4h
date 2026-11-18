@@ -2495,8 +2495,11 @@ are not filtered.
   needs an unfiltered port.
 - **Offload metadata.** A partial checksum is written at offsets the guest
   chose, after netd looked at the frame, and its value is the guest's to
-  pick (with padding the receiver trims). For a filtered port netd
-  completes it before the filter, so the filter sees what leaves; a GSO
+  pick (with padding the receiver trims). For a filtered or steered port
+  netd completes it before the filter, so the filter sees what leaves, and
+  so it does for an uplink's or a peer partition's frame on a steered
+  switch, whose sender picks the offsets too: inbound steering's target
+  gets the addresses and ports it was picked by (`offload::settle_csum`); a GSO
   frame's checksum is pinned to its TCP header (`offload::sanitize`), and
   its segments copy the checked headers. For every port, a checksum may
   not start inside the Ethernet header, whose MACs the MAC lock checked.

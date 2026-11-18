@@ -398,8 +398,8 @@ impl Netd {
             // left to the receiver, or the device.
             let steered = self.steer.switches & 1u64.checked_shl(switch).unwrap_or(0) != 0
                 || (i < steer::MAX_TARGETS && self.steer.targets & (1 << i) != 0);
-            if (self.filters[i].on || steered) && !is_gso(hdr) {
-                complete_csum(frame, hdr);
+            if self.filters[i].on || steered {
+                offload::settle_csum(frame, hdr);
             }
             if self.filters[i].on {
                 // A steering rule's target may send as the rule's address.
@@ -454,6 +454,13 @@ impl Netd {
             PortId::Guest(i) => Some(i),
             PortId::Uplink(_) | PortId::Link(_) => None,
         };
+        // So is an uplink's or a peer partition's on a steered switch:
+        // the nicd (outside the TCB when confined) or the peer says where
+        // its partial checksum goes as a guest does, and inbound steering
+        // picks the target by the addresses and ports it could overwrite.
+        if guest.is_none() && self.steer.switches & 1u64.checked_shl(switch).unwrap_or(0) != 0 {
+            offload::settle_csum(frame, hdr);
+        }
         if !return_only && let Some(t) = self.steer.inbound(sw, guest, frame) {
             self.deliver(PortId::Guest(t), frame, hdr);
             return;
