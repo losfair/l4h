@@ -7,6 +7,7 @@ use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use l4h_host::errno::Errno;
+use l4h_virtio::Mmio;
 use sel4::{CapRights, VmAttributes, cap, cap_type};
 
 use l4h_host::mailbox::RING;
@@ -997,9 +998,10 @@ pub fn reset(disk: &mut Controller, pci: &Pci, alloc: &mut Alloc, devmem: &mut D
     };
     let frame = crate::devmem::granule(bar_frames(&disk.bars, bar).start + off / PAGE);
     pci.enable_memory(&disk.pci);
-    let ok = win.with_frame_attrs(&abs_of(frame), DEVICE_ATTRS, |page| unsafe {
-        let r32 = |o: usize| (page.add(o) as *const u32).read_volatile();
-        let w32 = |o: usize, v: u32| (page.add(o) as *mut u32).write_volatile(v);
+    let ok = win.with_frame_attrs(&abs_of(frame), DEVICE_ATTRS, |page| {
+        let mmio = Mmio(page as usize);
+        let r32 = |o| mmio.r32(o);
+        let w32 = |o, v| mmio.w32(o, v);
         let wait = |ms: u64, done: &dyn Fn() -> bool| {
             let end = host::ticks::now() + ms * ticks_per_ms;
             while !done() {
@@ -1032,9 +1034,9 @@ pub fn reset(disk: &mut Controller, pci: &Pci, alloc: &mut Alloc, devmem: &mut D
             w32(NVME_CC, r32(NVME_CC) & !(1 | (3 << 14)));
             wait(to_ms, &|| r32(NVME_CSTS) & 1 == 0)
         } else {
-            let status = page.add(off % PAGE);
-            status.write_volatile(0);
-            wait(VIRTIO_RESET_MS, &|| status.read_volatile() == 0)
+            let status = off % PAGE;
+            mmio.w8(status, 0);
+            wait(VIRTIO_RESET_MS, &|| mmio.r8(status) == 0)
         }
     });
     if !ok {
