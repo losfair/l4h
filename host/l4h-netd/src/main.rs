@@ -398,8 +398,8 @@ impl Netd {
             // left to the receiver, or the device.
             let steered = self.steer.switches & 1u64.checked_shl(switch).unwrap_or(0) != 0
                 || (i < steer::MAX_TARGETS && self.steer.targets & (1 << i) != 0);
-            if (self.filters[i].on || steered) && !is_gso(hdr) {
-                complete_csum(frame, hdr);
+            if self.filters[i].on || steered {
+                offload::settle_csum(frame, hdr);
             }
             if self.filters[i].on {
                 // A steering rule's target may send as the rule's address.
@@ -454,6 +454,13 @@ impl Netd {
             PortId::Guest(i) => Some(i),
             PortId::Uplink(_) | PortId::Link(_) => None,
         };
+        // So is an uplink's or a peer partition's on a steered switch:
+        // the nicd (outside the TCB when confined) or the peer says where
+        // its partial checksum goes as a guest does, and inbound steering
+        // picks the target by the addresses and ports it could overwrite.
+        if guest.is_none() && self.steer.switches & 1u64.checked_shl(switch).unwrap_or(0) != 0 {
+            offload::settle_csum(frame, hdr);
+        }
         if !return_only && let Some(t) = self.steer.inbound(sw, guest, frame) {
             self.deliver(PortId::Guest(t), frame, hdr);
             return;
@@ -611,7 +618,8 @@ impl Netd {
             let (n, mut hdr) = unsafe {
                 let slot = addr_of!((*chan).tx_slots[tx.slot()]);
                 let n = (addr_of!((*slot).len).read_volatile() as usize).min(net::MAX_FRAME);
-                core::ptr::copy_nonoverlapping(addr_of!((*slot).data) as *const u8, frame.as_mut_ptr(), n);
+                // The guest can write the slot meanwhile.
+                offload::copy_volatile(addr_of!((*slot).data) as *const u8, frame.as_mut_ptr(), n);
                 let hdr = addr_of!((*slot).hdr).read_volatile();
                 tx.pop(&(*chan).tx);
                 (n, hdr)
@@ -763,7 +771,8 @@ fn rx_put(p: &mut GuestPort, frame: &(impl Frame + ?Sized), hdr: &[u8; net::HDR_
     }
     unsafe {
         let slot = addr_of_mut!((*p.chan).rx_slots[p.rx.slot()]);
-        frame.copy_to(core::slice::from_raw_parts_mut(addr_of_mut!((*slot).data) as *mut u8, frame.len()));
+        // The guest can read and write the slot meanwhile.
+        frame.copy_to_shared(addr_of_mut!((*slot).data) as *mut u8);
         addr_of_mut!((*slot).hdr).write_volatile(*hdr);
         addr_of_mut!((*slot).len).write_volatile(frame.len() as u32);
         p.rx.push(&(*p.chan).rx);

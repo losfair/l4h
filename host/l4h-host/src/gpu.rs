@@ -37,19 +37,20 @@ pub const fn resource_bytes(width: u32, height: u32) -> Option<u64> {
     }
 }
 
-/// Copy `n` bytes with volatile accesses, whole words while both
-/// pointers are aligned, then byte by byte: the other side may be writing
-/// meanwhile (a seqlock tells).
+/// Copy `n` bytes with volatile accesses, eight bytes at a time, then
+/// byte by byte: the other side may be writing meanwhile (a seqlock
+/// tells, or nothing does: guest memory, a channel's data area).  Never a
+/// slice or `copy_nonoverlapping` over such memory, which the compiler
+/// may take as unchanging, or read twice.
 ///
 /// # Safety
 /// `src` and `dst` must be valid for `n` bytes.
 pub unsafe fn copy_volatile(src: *const u8, dst: *mut u8, n: usize) {
     let mut i = 0;
-    if src as usize % 8 == 0 && dst as usize % 8 == 0 {
-        while i + 8 <= n {
-            unsafe { (dst.add(i) as *mut u64).write_volatile((src.add(i) as *const u64).read_volatile()) };
-            i += 8;
-        }
+    // Eight bytes at a time, aligned or not: one load and one store each.
+    while i + 8 <= n {
+        unsafe { (dst.add(i) as *mut [u8; 8]).write_volatile((src.add(i) as *const [u8; 8]).read_volatile()) };
+        i += 8;
     }
     while i < n {
         unsafe { dst.add(i).write_volatile(src.add(i).read_volatile()) };
@@ -104,12 +105,15 @@ mod tests {
             assert_eq!(&d[..n], &s[..n], "{n}");
             assert!(d[n..].iter().all(|&b| b == 0xff), "{n}");
         }
-        // Unaligned: byte by byte.
-        let mut dst = [0u8; 17];
-        let s = [7u8; 20];
-        unsafe { copy_volatile(s.as_ptr().wrapping_add(1), dst.as_mut_ptr().wrapping_add(1), 15) };
-        assert_eq!(dst[0], 0);
-        assert!(dst[1..16].iter().all(|&b| b == 7));
-        assert_eq!(dst[16], 0);
+        // Unaligned, and misaligned against each other: every byte, none
+        // past the end.
+        let s: std::vec::Vec<u8> = (0..64u8).map(|i| i.wrapping_mul(37) | 1).collect();
+        for (from, to, n) in [(1, 1, 15), (1, 3, 40), (5, 0, 33), (0, 7, 50), (3, 6, 8)] {
+            let mut dst = [0u8; 64];
+            unsafe { copy_volatile(s.as_ptr().wrapping_add(from), dst.as_mut_ptr().wrapping_add(to), n) };
+            assert!(dst[..to].iter().all(|&b| b == 0), "{from} {to} {n}");
+            assert_eq!(&dst[to..to + n], &s[from..from + n], "{from} {to} {n}");
+            assert!(dst[to + n..].iter().all(|&b| b == 0), "{from} {to} {n}");
+        }
     }
 }

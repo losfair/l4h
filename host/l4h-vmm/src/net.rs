@@ -6,6 +6,7 @@ use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{Ordering, fence};
 
 use l4h_rt::host::fixed::ArrayVec;
+use l4h_rt::host::gpu::copy_volatile;
 use l4h_rt::host::net::{self, Port};
 use l4h_rt::host::spsc::{Consumer, Producer};
 use l4h_rt::sel4;
@@ -116,7 +117,9 @@ impl Net {
                         let mut s = 0;
                         if off < HDR {
                             let h = (HDR - off).min(len);
-                            core::ptr::copy_nonoverlapping(src, hdr.add(off), h);
+                            // Guest memory and netd's slot: either side
+                            // may write them meanwhile.
+                            copy_volatile(src, hdr.add(off), h);
                             off += h;
                             s = h;
                             len -= h;
@@ -125,7 +128,7 @@ impl Net {
                             ok = false;
                             break;
                         }
-                        core::ptr::copy_nonoverlapping(src.add(s), data.add(n), len);
+                        copy_volatile(src.add(s), data.add(n), len);
                         n += len;
                     }
                     if ok && off == HDR && n >= 14 {
@@ -174,11 +177,11 @@ impl Net {
                         let dst = mem.bytes(b.gpa, n);
                         let mut i = 0;
                         while i < n && written + i < HDR {
-                            *dst.add(i) = hdr[written + i];
+                            dst.add(i).write_volatile(hdr[written + i]);
                             i += 1;
                         }
                         if i < n {
-                            core::ptr::copy_nonoverlapping(data.add(written + i - HDR), dst.add(i), n - i);
+                            copy_volatile(data.add(written + i - HDR), dst.add(i), n - i);
                         }
                         written += n;
                         if written == total {

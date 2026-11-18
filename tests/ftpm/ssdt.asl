@@ -8,6 +8,11 @@
  * none with this start method, so the start bit the OS sets too does
  * nothing, as with an fTPM, whose CRB registers are plain memory.  Each
  * start also writes 'S' to the isa-debugcon port, for the test to count.
+ * OVMF drives tpm-crb directly before ExitBootServices and leaves
+ * locality 0 assigned: _INI, which the OS evaluates before its first
+ * command, gives it back, or the OS's own start bit would start a
+ * command before _DSM does (and _DSM would then start the response as a
+ * second one).
  */
 DefinitionBlock ("", "SSDT", 2, "L4H", "FTPM", 1)
 {
@@ -30,6 +35,14 @@ DefinitionBlock ("", "SSDT", 2, "L4H", "FTPM", 1)
             Field (DBGP, ByteAcc, NoLock, Preserve)
             {
                 DBGC, 8,
+            }
+
+            Method (_INI, 0, NotSerialized)
+            {
+                // OVMF drives tpm-crb directly before ExitBootServices and
+                // leaves locality 0 assigned; release it before the first
+                // command so only _DSM can start one.
+                LCTL = 2
             }
 
             Method (_DSM, 4, Serialized)

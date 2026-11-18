@@ -25,7 +25,7 @@ int aarch64_insn_read(void *addr, u32 *insnp)
 /* One single-copy-atomic store: other vCPUs may run the instruction. */
 int aarch64_insn_write(void *addr, u32 insn)
 {
-	if (!l4h_kernel_range_ok((unsigned long)addr, sizeof(__le32)))
+	if (!l4h_kernel_range_ok((unsigned long)addr, sizeof(__le32), true))
 		return -EFAULT;
 	WRITE_ONCE(*(__le32 *)addr, cpu_to_le32(insn));
 	return 0;

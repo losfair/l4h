@@ -25,7 +25,7 @@ unsigned long l4h_load_unaligned_zeropad_cross(const void *addr)
 	unsigned long ret;
 
 	/* The bytes in the next page, when it is mapped. */
-	if (l4h_nofault_begin(next, a + sizeof(long) - next)) {
+	if (l4h_nofault_begin(next, a + sizeof(long) - next, false)) {
 		ret = load_word(a);
 		l4h_nofault_end();
 		return ret;

@@ -126,7 +126,7 @@ VMs on both.
  create mode 100644 src/arch/x86/object/svm.c
 
 diff --git a/include/arch/x86/arch/model/statedata.h b/include/arch/x86/arch/model/statedata.h
-index 9a1aee2b6..12e16e5e1 100644
+index bb829b28c..c6f6bd17e 100644
 --- a/include/arch/x86/arch/model/statedata.h
 +++ b/include/arch/x86/arch/model/statedata.h
 @@ -49,6 +49,16 @@ NODE_STATE_TYPE_DECLARE(modeNodeState, mode);
@@ -495,7 +495,7 @@ index 2f82c8fe8..de1f9f21b 100644
      SEL4_VMENTER_FAULT_EBX,
      SEL4_VMENTER_FAULT_ECX,
 diff --git a/src/arch/x86/64/c_traps.c b/src/arch/x86/64/c_traps.c
-index 0bb0b4a3b..905ce5a2e 100644
+index aa5f0f42f..34543e02d 100644
 --- a/src/arch/x86/64/c_traps.c
 +++ b/src/arch/x86/64/c_traps.c
 @@ -271,6 +271,9 @@ static void NORETURN restore_user_context_internal(bool_t lock_held)
@@ -677,7 +677,7 @@ index e4f90c304..cac8d03f1 100644
      cte->cap = cap;
      /* Over a not-present entry, which no TLB holds (SDM 29.3.2): no invept. */
 diff --git a/src/arch/x86/model/statedata.c b/src/arch/x86/model/statedata.c
-index da0b07c6f..a651c405e 100644
+index 45b6fafab..4cdc30196 100644
 --- a/src/arch/x86/model/statedata.c
 +++ b/src/arch/x86/model/statedata.c
 @@ -59,7 +59,14 @@ uint32_t x86KSFirstValidIODomain;

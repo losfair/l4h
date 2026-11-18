@@ -51,13 +51,13 @@ static inline int __access_ok(const void __user *ptr, unsigned long size)
  * Between l4h_nofault_begin() and l4h_nofault_end() no RAM block that the
  * check found mapped loses its frames (kernel/caps.c).
  */
-extern bool l4h_kernel_range_ok(unsigned long addr, unsigned long size);
-extern bool l4h_nofault_begin(unsigned long addr, unsigned long size);
+extern bool l4h_kernel_range_ok(unsigned long addr, unsigned long size, bool write);
+extern bool l4h_nofault_begin(unsigned long addr, unsigned long size, bool write);
 extern void l4h_nofault_end(void);
 
 #define __get_kernel_nofault(dst, src, type, err_label)			\
 do {									\
-	if (!l4h_nofault_begin((unsigned long)(src), sizeof(type))) {	\
+	if (!l4h_nofault_begin((unsigned long)(src), sizeof(type), false)) { \
 		*((type *)dst) = (type) 0;				\
 		goto err_label;						\
 	}								\
@@ -67,7 +67,7 @@ do {									\
 
 #define __put_kernel_nofault(dst, src, type, err_label)			\
 do {									\
-	if (!l4h_nofault_begin((unsigned long)(dst), sizeof(type)))	\
+	if (!l4h_nofault_begin((unsigned long)(dst), sizeof(type), true)) \
 		goto err_label;						\
 	put_unaligned(*((type *)src), (type *)(dst));			\
 	l4h_nofault_end();						\

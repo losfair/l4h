@@ -547,11 +547,19 @@ pub const HW_PCI_WRITE: u64 = 5;
 /// the BARs and the expansion ROM's.  The firmware's AML never writes
 /// them, in any function, by the configuration mechanism or through ECAM:
 /// with them trustd could move a device root does not drive onto another's
-/// addresses, or have it write memory.  Whether a write of `width` bytes
-/// at configuration offset `off` touches one.
+/// addresses, or have it write memory.  Nor extended configuration space
+/// (past 0x100, through ECAM only): ACS, which root turns on so that
+/// confined devices are isolated from their peers (DESIGN.md §9.5), and
+/// SR-IOV, ATS, PASID, Resizable BAR and the like, which would let a
+/// device root does not drive bypass the IOMMU or decode elsewhere; the
+/// AML's PCI_Config regions end at 0x100.  Whether a write of `width`
+/// bytes at configuration offset `off` touches one.
 pub const fn hw_config_write_protected(off: usize, width: usize) -> bool {
     const PROTECTED: [(usize, usize); 3] = [(0x04, 0x06), (0x10, 0x28), (0x30, 0x34)];
     let end = off.saturating_add(width);
+    if end > 0x100 {
+        return true;
+    }
     let mut i = 0;
     while i < PROTECTED.len() {
         if off < PROTECTED[i].1 && PROTECTED[i].0 < end {
@@ -882,12 +890,18 @@ mod tests {
             assert!(hw_config_write_protected(off, width), "{off:#x}+{width}");
         }
         // Status, the cache line size and latency, subsystem ids, the
-        // interrupt line and what is past the header are the AML's.
-        for (off, width) in [(6, 2), (0xc, 4), (0x28, 4), (0x2c, 4), (0x34, 4), (0x3c, 1), (0x40, 4), (0xfc, 4), (0xffc, 4)] {
+        // interrupt line and the capabilities past the header are the
+        // AML's.
+        for (off, width) in [(6, 2), (0xc, 4), (0x28, 4), (0x2c, 4), (0x34, 4), (0x3c, 1), (0x40, 4), (0xfc, 4), (0xfe, 2)] {
             assert!(!hw_config_write_protected(off, width), "{off:#x}+{width}");
         }
+        // Extended configuration space (ACS, SR-IOV, ATS...) is not, nor
+        // a write that runs into it.
+        for (off, width) in [(0x100, 4), (0x148, 2), (0x14c, 4), (0x200, 1), (0xffc, 4), (0xfc, 8), (0xff, 2)] {
+            assert!(hw_config_write_protected(off, width), "{off:#x}+{width}");
+        }
         assert!(hw_config_write_protected(0, usize::MAX));
-        assert!(!hw_config_write_protected(usize::MAX, 4));
+        assert!(hw_config_write_protected(usize::MAX, 4));
     }
 
     #[test]

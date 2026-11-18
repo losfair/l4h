@@ -11,6 +11,13 @@ pub trait Frame {
     fn len(&self) -> usize;
     /// Copy the frame to `dst`, which is len() bytes long.
     fn copy_to(&self, dst: &mut [u8]);
+    /// Copy the frame to `dst` with volatile writes: memory another
+    /// component may read or write meanwhile (an uplink channel's data
+    /// area, a guest port's ring), never to be taken as a Rust slice.
+    ///
+    /// # Safety
+    /// `dst` is valid for len() bytes.
+    unsafe fn copy_to_shared(&self, dst: *mut u8);
 }
 
 impl Frame for [u8] {
@@ -20,6 +27,28 @@ impl Frame for [u8] {
 
     fn copy_to(&self, dst: &mut [u8]) {
         dst.copy_from_slice(self);
+    }
+
+    unsafe fn copy_to_shared(&self, dst: *mut u8) {
+        unsafe { copy_volatile(self.as_ptr(), dst, self.len()) };
+    }
+}
+
+/// Copy `n` bytes with volatile accesses, eight bytes at a time: one side
+/// is memory another component may write or read meanwhile.
+///
+/// # Safety
+/// `src` and `dst` are valid for `n` bytes.
+pub unsafe fn copy_volatile(src: *const u8, dst: *mut u8, n: usize) {
+    let mut i = 0;
+    // Eight bytes at a time, aligned or not: one load and one store each.
+    while i + 8 <= n {
+        unsafe { (dst.add(i) as *mut [u8; 8]).write_volatile((src.add(i) as *const [u8; 8]).read_volatile()) };
+        i += 8;
+    }
+    while i < n {
+        unsafe { dst.add(i).write_volatile(src.add(i).read_volatile()) };
+        i += 1;
     }
 }
 pub const F_NEEDS_CSUM: u8 = 1;
@@ -246,6 +275,17 @@ pub fn complete_csum(frame: &mut [u8], hdr: &mut [u8; HDR_SIZE]) {
         frame[at..at + 2].copy_from_slice(&c.to_be_bytes());
     }
     hdr[0] &= !F_NEEDS_CSUM;
+}
+
+/// Complete a plain frame's partial checksum before netd looks at its
+/// addresses and ports (ipfilter, steer): its sender, a guest, a nicd or
+/// a peer partition, says where it goes (`check`: anywhere past the
+/// Ethernet header), so it could rewrite them after the look.  A GSO
+/// frame's is its TCP checksum (`check`) and stays, for `segment`.
+pub fn settle_csum(frame: &mut [u8], hdr: &mut [u8; HDR_SIZE]) {
+    if !is_gso(hdr) {
+        complete_csum(frame, hdr);
+    }
 }
 
 /// Split a GSO TCP frame (validated by `sanitize`) into MSS-sized frames
@@ -540,6 +580,39 @@ mod tests {
         put16(&mut h, 8, 16);
         assert!(sanitize(&mut h, &f[..len]));
         (f, len, h)
+    }
+
+    /// A plain frame from an uplink may say its checksum goes over the
+    /// TCP destination port (or an address): settled before netd looks,
+    /// what it looked at is what is delivered.  A GSO one's goes nowhere
+    /// but its TCP checksum.
+    #[test]
+    fn a_partial_checksum_settles_before_netd_looks() {
+        let (mut f, len, _) = gso_frame(100, 1448);
+        let mut h = [F_NEEDS_CSUM, GSO_NONE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        // csum_start at the TCP header, csum_offset 2: its destination port.
+        put16(&mut h, 6, 34);
+        put16(&mut h, 8, 2);
+        assert!(sanitize_rx(&mut h, &f[..len], UPLINK_MIN_MSS) && h[0] & F_NEEDS_CSUM != 0);
+        settle_csum(&mut f[..len], &mut h);
+        assert_eq!(h[0] & F_NEEDS_CSUM, 0);
+        let looked = f;
+        // Nothing left for a receiver to write.
+        complete_csum(&mut f[..len], &mut h);
+        assert_eq!(f[..len], looked[..len]);
+        // A GSO frame's checksum is the TCP one, or it is dropped.
+        let (f, len, _) = gso_frame(3000, 1448);
+        for (start, off) in [(34, 2), (14, 16), (30, 16), (34, 0)] {
+            let mut rx = [F_NEEDS_CSUM, GSO_TCPV4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            put16(&mut rx, 4, 1448);
+            put16(&mut rx, 6, start);
+            put16(&mut rx, 8, off);
+            assert!(!sanitize_rx(&mut rx, &f[..len], UPLINK_MIN_MSS), "{start} {off}");
+        }
+        let (mut f, len, mut h) = gso_frame(3000, 1448);
+        let before = f;
+        settle_csum(&mut f[..len], &mut h);
+        assert!(is_gso(&h) && h[0] & F_NEEDS_CSUM != 0 && f[..len] == before[..len]);
     }
 
     /// A GSO frame of one segment or none is a plain frame with a partial

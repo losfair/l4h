@@ -1356,72 +1356,163 @@ fn write_allowed(h: &Host, n: &Nic, m: &Manifest, off: u16, size: u16) -> Option
         return None;
     }
     let d = &n.pci;
-    let dword = off & !3;
+    let read = |at: u16| -> Option<u32> {
+        if at < 0x100 {
+            Some(h.pci.read32(d.bus, d.dev, d.func, at as u8))
+        } else {
+            #[cfg(target_arch = "x86_64")]
+            { h.pci.read_ext32(bdf(d) as u16, at) }
+            #[cfg(not(target_arch = "x86_64"))]
+            { None }
+        }
+    };
+    let (c, id, len) = cap_holding(read, off, end)?;
     // The bytes written, as bits of their dword.
     let shift = (off & 3) * 8;
     let bits = if size == 4 { u32::MAX } else { ((1u32 << (size * 8)) - 1) << shift };
-    // Every capability, standard (below 0x100) and extended, by offset;
-    // each taken to reach the next one up in its space, or the space's
-    // end.  A write must lie inside one the driver may write: no byte
-    // outside any capability, nor in another kind, is.
-    let mut caps: ArrayVec<(u16, u16), 96> = ArrayVec::new();
-    let mut c = (h.pci.read32(d.bus, d.dev, d.func, 0x34) & 0xfc) as u16;
-    while c >= 0x40 && c < 0x100 && !caps.is_full() && !caps.iter().any(|&(o, _)| o == c) {
-        let w = h.pci.read32(d.bus, d.dev, d.func, c as u8);
-        caps.must_push((c, w as u8 as u16));
-        c = ((w >> 8) & 0xfc) as u16;
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        let mut c = 0x100u16;
-        while c >= 0x100 && !caps.is_full() && !caps.iter().any(|&(o, _)| o == c) {
-            let Some(w) = h.pci.read_ext32(bdf(d) as u16, c) else { break };
-            if w == 0 || w == u32::MAX {
-                break;
-            }
-            // Extended ids are marked apart from standard ones.
-            caps.must_push((c, 0x8000 | (w & 0x7fff) as u16));
-            c = (w >> 20) as u16 & 0xffc;
+    // Any vendor's virtio device: a virtio vendor-specific capability
+    // (PCI_CFG) reaches the whole of a BAR.
+    cap_write_bits(id, c, len, off & !3, d.vendor == 0x1af4 || is_virtio(d), bits)
+}
+
+/// The capability holding bytes `off..end` of a function's configuration
+/// space, by `read` of its dwords (None for one it cannot read): its
+/// offset, its id (extended ones marked 0x8000) and its length.  The
+/// list walked is that of the space `off` is in (standard below 0x100,
+/// extended above).  A capability ends where its header or its kind says
+/// (`cap_len`), never past the next one up in its space nor the space's
+/// end.  None if the bytes are in none, or the list is not well formed:
+/// no capability list (Status), a pointer into the header or the other
+/// space or not 4-byte aligned, a loop, a capability
+/// overlapping the next or of a length its kind does not allow, an
+/// extended id past 0x7fff.  The list is root's to check, not the
+/// device's to stretch: nothing past what it parses is taken as part of
+/// a capability.
+fn cap_holding(read: impl Fn(u16) -> Option<u32>, off: u16, end: u16) -> Option<(u16, u16, u16)> {
+    let ext = off >= 0x100;
+    let (lo, space_end) = if ext { (0x100u16, 0x1000u16) } else { (0x40, 0x100) };
+    // Each capability's start, by dword: a loop stops at the first one
+    // seen again, and the starts give where each capability must end.
+    let mut seen = [0u64; 16];
+    // The capability starting nearest below `off`, and its first dword.
+    let mut at: Option<(u16, u32)> = None;
+    let mut c = if ext {
+        match read(0x100) {
+            None | Some(0) | Some(u32::MAX) => return None,
+            Some(_) => 0x100,
         }
-    }
-    let space_end = |c: u16| if c < 0x100 { 0x100 } else { 0x1000 };
-    let Some(&(c, id)) = caps.iter().find(|&&(c, _)| {
-        let next = caps.iter().map(|&(o, _)| o).filter(|&o| o > c && o < space_end(c)).min().unwrap_or(space_end(c));
-        off >= c && end <= next
-    }) else {
+    } else if read(0x04)? & 1 << 20 == 0 {
+        // No capability list (Status): 0x34 is no pointer.
         return None;
+    } else {
+        (read(0x34)? & 0xfc) as u16
     };
-    cap_write_bits(id, c, dword, d.vendor, bits)
+    while c != 0 {
+        if c < lo || c >= space_end || c % 4 != 0 {
+            return None;
+        }
+        let (word, bit) = (c as usize / 4 / 64, c as usize / 4 % 64);
+        if seen[word] & 1 << bit != 0 {
+            return None;
+        }
+        seen[word] |= 1 << bit;
+        let w = read(c)?;
+        if ext && w == u32::MAX {
+            return None;
+        }
+        if c <= off && at.is_none_or(|(a, _)| c > a) {
+            at = Some((c, w));
+        }
+        // An extended pointer's low bits are reserved as 0: one that sets
+        // them is not well formed.
+        c = if ext { (w >> 20) as u16 } else { ((w >> 8) & 0xfc) as u16 };
+    }
+    let (c, w) = at?;
+    let next_up = (c / 4 + 1..space_end / 4).find(|&d| seen[d as usize / 64] & 1 << (d % 64) != 0).map_or(space_end, |d| d * 4);
+    let id = if ext {
+        if w & 0x8000 != 0 {
+            return None;
+        }
+        0x8000 | (w & 0xffff) as u16
+    } else {
+        w as u8 as u16
+    };
+    let len = cap_len(id, w, || read(c + 4), next_up - c)?;
+    (end <= c + len).then_some((c, id, len))
+}
+
+/// The length of capability `id` whose first dword is `w` (`second` reads
+/// its second), `room` bytes before the next one up: what its header
+/// declares for a vendor-specific one, its kind's for LTR and L1 PM
+/// substates, the room for the others (their writable registers are
+/// fixed, `cap_write_bits`).  None if it would not fit, or the header
+/// declares less than the header (read only inside the room).
+fn cap_len(id: u16, w: u32, second: impl Fn() -> Option<u32>, room: u16) -> Option<u16> {
+    let len = match id {
+        0x09 => match (w >> 16) as u8 as u16 {
+            l if l >= 3 => l,
+            _ => return None,
+        },
+        // Its second header only if it is there: not past the space.
+        0x800b if room >= 8 => match (second()? >> 20) as u16 {
+            l if l >= 8 => l,
+            _ => return None,
+        },
+        0x800b => return None,
+        0x8018 => 8,
+        0x801e => 0x10,
+        _ => room,
+    };
+    (len <= room).then_some(len)
 }
 
 /// Of `bits`, those of the dword at `dword` a nicd may change in
-/// capability `id` (extended ones marked 0x8000) at `c` of a function of
-/// `vendor`: a vendor-specific one (not virtio's), AER's status
-/// registers, LTR, L1 PM substates, or PCI Express's Device Control
-/// relaxed ordering bit and Link Control's ASPM bits.  None if none.
-fn cap_write_bits(id: u16, c: u16, dword: u16, vendor: u16, mut bits: u32) -> Option<u32> {
-    match id {
+/// capability `id` (extended ones marked 0x8000) at `c`, `len` bytes
+/// long (`cap_holding`), of a function that is a virtio device or not:
+/// past the header of a vendor-specific one (not virtio's), AER's status
+/// registers, LTR's latencies, L1 PM substates' controls, or PCI
+/// Express's Device Control relaxed ordering bit and Link Control's ASPM
+/// bits.  Never a capability's header (its id, version, next pointer and
+/// length), nor a byte past its end.  None if none.
+fn cap_write_bits(id: u16, c: u16, len: u16, dword: u16, virtio: bool, bits: u32) -> Option<u32> {
+    // The bytes from `c` the driver may write, and of their dword the bits.
+    let (from, to, mask) = match id {
         // Vendor-specific, but virtio's: one of those (PCI_CFG) reaches
-        // the whole of a BAR, past the driver's window.
-        0x09 if vendor != 0x1af4 => {}
+        // the whole of a BAR, past the driver's window.  Past the id,
+        // next pointer and length.
+        0x09 if !virtio => (3, len, u32::MAX),
         // PCI Express: Device Control's relaxed ordering (4), Link
         // Control's ASPM (0..1); nothing else.  Not No Snoop (11), which
-        // root clears before each start (`spawn`): a TLP that does not snoop
-        // reads memory past the CPU's caches where the IOMMU does not
-        // force snooping (VT-d without Snoop Control), such as a recycled
-        // page's old contents under the zeroes still in cache.  Nor
-        // Phantom Functions (9), which would have the device use other
-        // functions' requester IDs, nor the payload sizes the bridges
-        // above it were set up for.
-        0x10 if dword == c + 8 => bits &= 1 << 4,
-        0x10 if dword == c + 0x10 => bits &= 0b11,
-        // AER: its status registers only (write 1 to clear), not the masks
-        // or the severities.
-        0x8001 if dword == c + 4 || dword == c + 0x10 => {}
-        // Vendor-specific, LTR, L1 PM substates.
-        0x800b | 0x8018 | 0x801e => {}
+        // root clears before each start (`spawn`): a TLP that does not
+        // snoop reads memory past the CPU's caches where the IOMMU does
+        // not force snooping (VT-d without Snoop Control), such as a
+        // recycled page's old contents under the zeroes still in cache.
+        // Nor Phantom Functions (9), which would have the device use
+        // other functions' requester IDs, nor the payload sizes the
+        // bridges above it were set up for.
+        0x10 if dword == c + 8 => (8, 0xc, 1 << 4),
+        0x10 if dword == c + 0x10 => (0x10, 0x14, 0b11),
+        // AER: its status registers only (write 1 to clear), not the
+        // masks or the severities.
+        0x8001 if dword == c + 4 => (4, 8, u32::MAX),
+        0x8001 if dword == c + 0x10 => (0x10, 0x14, u32::MAX),
+        // Vendor-specific: past both headers.
+        0x800b => (8, len, u32::MAX),
+        // LTR: the maximum snoop and no-snoop latencies.
+        0x8018 => (4, 8, u32::MAX),
+        // L1 PM substates: its two control registers, not its
+        // capabilities.
+        0x801e => (8, 0x10, u32::MAX),
         _ => return None,
+    };
+    let (from, to) = (c + from, c + to.min(len));
+    let mut keep = 0u32;
+    for b in 0..4 {
+        if (from..to).contains(&(dword + b)) {
+            keep |= 0xff << (b * 8);
+        }
     }
+    let bits = bits & mask & keep;
     (bits != 0).then_some(bits)
 }
 
@@ -1557,7 +1648,7 @@ pub fn ctl_post(h: &mut Host, i: usize, off: u64, len: u64) -> Result<usize, Err
     let page = inst.ctl_page;
     // dom0's bytes, copied: the nicd never sees dom0's memory.
     h.wins.a.with_frame(&abs_of(page), |p| unsafe {
-        core::ptr::copy_nonoverlapping((crate::vmmgr::CTL_DATA_VA + off) as *const u8, p, len)
+        host::gpu::copy_volatile((crate::vmmgr::CTL_DATA_VA + off) as *const u8, p, len)
     });
     let t = crate::vmmgr::op_new(h, None, crate::pci::MAX_DISK_CTRLS + i)?;
     let inst = nics()[i].inst.as_mut().unwrap();
@@ -1570,7 +1661,8 @@ pub fn ctl_post(h: &mut Host, i: usize, off: u64, len: u64) -> Result<usize, Err
 pub fn ctl_read(h: &mut Host, i: usize, data: &mut [u8; abi::CTL_DATA_MAX]) -> Result<u64, Errno> {
     let inst = nics().get(i).and_then(|n| n.inst.as_ref()).ok_or(ctl::ENOENT)?;
     let len = inst.ctl_len.min(abi::CTL_DATA_MAX);
-    h.wins.a.with_frame(&abs_of(inst.ctl_page), |p| unsafe { core::ptr::copy_nonoverlapping(p, data.as_mut_ptr(), len) });
+    // The nicd's page: it may write it meanwhile.
+    h.wins.a.with_frame(&abs_of(inst.ctl_page), |p| unsafe { host::gpu::copy_volatile(p, data.as_mut_ptr(), len) });
     Ok(len as u64)
 }
 

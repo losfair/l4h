@@ -144,16 +144,18 @@ static int copy_sc_to_user(struct sigcontext __user *to,
 		return 0;
 
 	BUILD_BUG_ON(sizeof(int) != FP_XSTATE_MAGIC2_SIZE);
-	__put_user(host_fp_size + FP_XSTATE_MAGIC2_SIZE,
-		   &to_fp64->fpstate.sw_reserved.extended_size);
-	__put_user(host_fp_size, &to_fp64->fpstate.sw_reserved.xstate_size);
-	__put_user(l4h_xfeatures, &to_fp64->fpstate.sw_reserved.xfeatures);
+	err = __put_user(host_fp_size + FP_XSTATE_MAGIC2_SIZE,
+			 &to_fp64->fpstate.sw_reserved.extended_size);
+	err |= __put_user(host_fp_size, &to_fp64->fpstate.sw_reserved.xstate_size);
+	err |= __put_user(l4h_xfeatures, &to_fp64->fpstate.sw_reserved.xfeatures);
 
-	__put_user(FP_XSTATE_MAGIC1, &to_fp64->fpstate.sw_reserved.magic1);
-	__put_user(FP_XSTATE_MAGIC2,
-		   (int __user *)((void __user *)to_fp64 + host_fp_size));
+	err |= __put_user(FP_XSTATE_MAGIC1, &to_fp64->fpstate.sw_reserved.magic1);
+	err |= __put_user(FP_XSTATE_MAGIC2,
+			  (int __user *)((void __user *)to_fp64 + host_fp_size));
 
-	return 0;
+	/* A frame without its magic would have the handler take garbage
+	 * for XSAVE state: none is delivered instead. */
+	return err ? 1 : 0;
 }
 
 /* The initial FPU state: XSTATE_BV 0 makes XRSTOR load x87, SSE and AVX

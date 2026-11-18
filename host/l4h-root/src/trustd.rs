@@ -716,10 +716,12 @@ pub fn done(h: &mut Host, id: usize) {
 /// - of the BARs of the functions root drives, nothing;
 /// - PCI configuration, by the configuration mechanism or through ECAM:
 ///   reads; writes only to functions root does not manage (`managed`),
-///   and in no function to the command register, the BARs or the
-///   expansion ROM's (trust::hw_config_write_protected), so that the AML
-///   neither moves a device onto another's addresses nor lets one master
-///   the bus, nor to the MSI and MSI-X capabilities (`msi_cap`), and in
+///   and in no function to the command register, the BARs, the
+///   expansion ROM's or extended configuration space
+///   (trust::hw_config_write_protected), so that the AML neither moves a
+///   device onto another's addresses nor lets one master the bus, nor
+///   turns off ACS, nor enables SR-IOV or ATS, nor to the MSI and MSI-X
+///   capabilities (`msi_cap`), and in
 ///   memory never to an MSI-X table or its pending bits
 ///   (pci::MSIX_BLOCKS): a function the firmware left mastering the bus
 ///   would send the AML's message as an interrupt, where none is
@@ -770,7 +772,7 @@ fn hw_access(h: &mut Host, op: u64, addr: usize, off: usize, width: usize, value
                 }
                 if let Some((segment, b, d, f, o)) = hw.ecam_function(addr) {
                     if trust::hw_config_write_protected(o, width) {
-                        return Err("a function's command register, BARs or ROM");
+                        return Err("a function's command register, BARs, ROM or extended configuration");
                     }
                     // Root reads only segment 0, and cannot tell what a
                     // function of another is.
@@ -968,7 +970,7 @@ pub fn channel_message(h: &mut Host, peer: u32, ty: u32, msg: &[u8]) {
     // the write leaves it even, and wraps.
     host::seqlock::write(&slot.seq, |_| {
         unsafe {
-            core::ptr::copy_nonoverlapping(msg.as_ptr(), (va + trust::RELAY_SLOT_HEADER) as *mut u8, msg.len());
+            host::gpu::copy_volatile(msg.as_ptr(), (va + trust::RELAY_SLOT_HEADER) as *mut u8, msg.len());
         }
         slot.len.store(msg.len() as u32, core::sync::atomic::Ordering::Relaxed);
     });
@@ -985,8 +987,10 @@ pub fn relay(h: &mut Host, peer: u32, len: usize) -> u64 {
     if len > trust::RELAY_MSG_MAX || (secondary && peer != 0) || (!secondary && peer == 0) {
         return u64::MAX;
     }
-    let msg = unsafe { core::slice::from_raw_parts(relay_va(trust::RELAY_SLOT_HEADER) as *const u8, len) };
-    if cs.send(peer, ty, &[msg]) { 0 } else { u64::MAX }
+    // trustd's page: it may write it meanwhile, so a copy, not a slice.
+    let mut msg = [0u8; trust::RELAY_MSG_MAX];
+    unsafe { host::gpu::copy_volatile(relay_va(trust::RELAY_SLOT_HEADER) as *const u8, msg.as_mut_ptr(), len) };
+    if cs.send(peer, ty, &[&msg[..len]]) { 0 } else { u64::MAX }
 }
 
 /// Root's timer: guests' allowance of attestation notices is new

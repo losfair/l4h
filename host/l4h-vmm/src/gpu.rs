@@ -10,7 +10,7 @@
 use core::sync::atomic::{Ordering, fence};
 
 use l4h_rt::host::fixed::ArrayVec;
-use l4h_rt::host::gpu::{DisplayHeader, IMAGE_OFFSET, STATE_PAGES, VMM_GPU_STATE_VA, display_pages, image_bytes, resource_bytes};
+use l4h_rt::host::gpu::{DisplayHeader, IMAGE_OFFSET, copy_volatile, STATE_PAGES, VMM_GPU_STATE_VA, display_pages, image_bytes, resource_bytes};
 
 use crate::dev::Backend;
 use crate::guest::GuestMem;
@@ -268,7 +268,8 @@ impl Gpu {
             let skip = off - ent.off as u64;
             let n = ((ent.len as u64 - skip) as usize).min(len - done);
             let src = mem.bytes(ent.gpa + skip, n);
-            unsafe { core::ptr::copy_nonoverlapping(src, out.add(done), n) };
+            // Guest memory: the guest may write it meanwhile.
+            unsafe { copy_volatile(src, out.add(done), n) };
             done += n;
             off += n as u64;
             e += 1;

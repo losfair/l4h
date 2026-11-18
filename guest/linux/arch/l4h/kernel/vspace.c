@@ -26,6 +26,7 @@
 #include <linux/list.h>
 #include <linux/export.h>
 #include <linux/vmalloc.h>
+#include <asm/sections.h>
 #include <asm/tlbflush.h>
 #include <asm/pgtable.h>
 #include <as-layout.h>
@@ -190,6 +191,22 @@ release:
 	return err;
 }
 
+static struct l4h_as kernel_as;
+
+/*
+ * Delete the frame capability of entry `e`, just erased from `as`, which
+ * unmaps it.  In kernel_as only once no *_nofault access is between its
+ * check and its access (l4h_nofault_begin()): one may have found the page
+ * there just before the erase, and a kernel access to an unmapped page
+ * faults the guest for good.
+ */
+static void as_delete_erased(struct l4h_as *as, void *e)
+{
+	if (as == &kernel_as)
+		l4h_wait_nofault_accesses();
+	l4h_slot_delete(entry_slot(e));
+}
+
 /* A partial update drops the whole hardware large leaf. The unchanged
  * neighbors remain valid Linux mappings and refault as small pages. This
  * also makes demotion allocation-free when a TLB sync runs out of memory. */
@@ -199,12 +216,10 @@ static void as_drop_large(struct l4h_as *as, unsigned long va)
 
 	if (e) {
 		xa_erase(&as->large, va >> PMD_SHIFT);
-		l4h_slot_delete(entry_slot(e));
+		as_delete_erased(as, e);
 		as->nr_pages--;
 	}
 }
-
-static struct l4h_as kernel_as;
 
 /*
  * Map `phys` at `va`.  With `defer`, a remap that lowers the rights of the
@@ -247,7 +262,7 @@ static int as_map_page(struct l4h_as *as, unsigned long va, unsigned long phys, 
 	}
 	if (e) {
 		xa_erase(&as->pages, vpn);
-		l4h_slot_delete(entry_slot(e));
+		as_delete_erased(as, e);
 		as->nr_pages--;
 	}
 	slot = l4h_cap_copy(L4H_FRAME_CPTR(phys), L4H_RIGHTS_ALL);
@@ -281,13 +296,13 @@ static void as_unmap_range(struct l4h_as *as, unsigned long start, unsigned long
 
 	xa_for_each_range(&as->large, vpn, e, start >> PMD_SHIFT, (end - 1) >> PMD_SHIFT) {
 		xa_erase(&as->large, vpn);
-		l4h_slot_delete(entry_slot(e));
+		as_delete_erased(as, e);
 		as->nr_pages--;
 	}
 	xa_for_each_range(&as->pages, vpn, e, start >> PAGE_SHIFT, (end - 1) >> PAGE_SHIFT) {
 		xa_erase(&as->pages, vpn);
 		/* Deleting the frame capability removes the mapping. */
-		l4h_slot_delete(entry_slot(e));
+		as_delete_erased(as, e);
 		as->nr_pages--;
 	}
 }
@@ -465,12 +480,21 @@ unsigned long l4h_kernel_map_frame(unsigned long frame, unsigned long va)
 }
 EXPORT_SYMBOL_GPL(l4h_kernel_map_frame);
 
-/* Is [addr, addr+size) mapped in the guest-kernel VSpace? */
-bool l4h_kernel_range_ok(unsigned long addr, unsigned long size)
+/*
+ * Is [addr, addr+size) mapped in the guest-kernel VSpace, and with `write`
+ * writable?  Not the kernel's text and rodata, which every guest maps
+ * read-only from one shared copy, nor the boot info, nor a kernel_as page
+ * mapped without write: a write there faults the guest for good.
+ */
+bool l4h_kernel_range_ok(unsigned long addr, unsigned long size, bool write)
 {
 	unsigned long end = addr + size;
+	void *e;
 
-	if (end < addr)
+	/* Nothing to access is no mapped range: no caller asks for it. */
+	if (!size || end < addr)
+		return false;
+	if (write && addr < (unsigned long)__init_begin && end > (unsigned long)_text)
 		return false;
 	/* Blocks converted to seL4 objects left holes in the direct map. */
 	if (addr >= uml_physmem && end <= high_physmem)
@@ -481,9 +505,10 @@ bool l4h_kernel_range_ok(unsigned long addr, unsigned long size)
 	if (addr >= uml_physmem && l4h_hp_contains(addr - uml_physmem, size))
 		return l4h_ram_mapped(addr - uml_physmem, size);
 	if (addr >= L4H_SPECIAL_BASE && end <= L4H_SPECIAL_BASE + L4H_BOOTINFO_SIZE)
-		return true;
+		return !write;
 	for (addr &= PAGE_MASK; addr < end; addr += PAGE_SIZE) {
-		if (!xa_load(&kernel_as.pages, addr >> PAGE_SHIFT))
+		e = xa_load(&kernel_as.pages, addr >> PAGE_SHIFT);
+		if (!e || (write && !(entry_prot(e) & L4H_PROT_WRITE)))
 			return false;
 	}
 	return true;

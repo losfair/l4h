@@ -2495,8 +2495,11 @@ are not filtered.
   needs an unfiltered port.
 - **Offload metadata.** A partial checksum is written at offsets the guest
   chose, after netd looked at the frame, and its value is the guest's to
-  pick (with padding the receiver trims). For a filtered port netd
-  completes it before the filter, so the filter sees what leaves; a GSO
+  pick (with padding the receiver trims). For a filtered or steered port
+  netd completes it before the filter, so the filter sees what leaves, and
+  so it does for an uplink's or a peer partition's frame on a steered
+  switch, whose sender picks the offsets too: inbound steering's target
+  gets the addresses and ports it was picked by (`offload::settle_csum`); a GSO
   frame's checksum is pinned to its TCP header (`offload::sanitize`), and
   its segments copy the checked headers. For every port, a checksum may
   not start inside the Ethernet header, whose MACs the MAC lock checked.
@@ -2782,11 +2785,16 @@ root restarts. Root and netd know no device kind. The design is issue
   mailbox. No PCI configuration capability, IRQControl, Untyped or
   endpoint to netd. Configuration writes go through root
   (`Published::cfg_req`), inside the manifest's windows, past the header,
-  and by an allow-list: vendor-specific capabilities (not virtio's, one of
-  which reaches a whole BAR), AER's status registers, LTR, L1 PM substates,
-  and in the PCI Express capability Device Control's relaxed ordering bit
-  and Link Control's ASPM bits; root merges the write into the register's
-  other bits. Root clears Device Control's Enable No Snoop (on from reset)
+  and by an allow-list: vendor-specific capabilities past their headers
+  (not a virtio device's, of any vendor: one of those reaches a whole BAR),
+  AER's status registers, LTR's latencies, L1 PM substates' controls, and
+  in the PCI Express capability Device Control's relaxed ordering bit and
+  Link Control's ASPM bits; root merges the write into the register's
+  other bits. Root walks the whole capability list of the space written
+  on each write and takes a capability to end where its header or kind
+  says, never past the next one: no capability header, nor a byte between
+  capabilities, is writable, and a list with a loop, a stray pointer or a
+  length that does not fit lets nothing be written. Root clears Device Control's Enable No Snoop (on from reset)
   before each start, and the driver cannot set it: a TLP that does not
   snoop reads memory past the CPU's caches where the IOMMU does not force
   snooping (VT-d without Snoop Control; AMD-Vi's entries force coherence),
@@ -3517,6 +3525,15 @@ that slipped past this stops the component (a panic, which aborts) instead
 of wrapping, where a wrapped bound check would pass. Tests and
 `tests/run-fuzz.sh`, whose parsers are the host's own, catch what is
 missed before it ships.
+
+**Shared bytes.** Bytes in memory a less-trusted party can write while a
+component reads them (guest memory, a nicd's channel data area, a peer
+partition's ring, trustd's relay page) are copied with volatile accesses
+(`l4h_host::gpu::copy_volatile`, `offload::Frame::copy_to_shared`,
+`uplink::Shared`), never borrowed as a Rust slice nor copied with
+`copy_nonoverlapping`: the compiler may take a slice's bytes as
+unchanging, or read them twice, so that what was checked is not what is
+used. The component then checks its own copy.
 
 **Shared rings.** A ring in memory shared with a less-trusted party (blkd's
 channels, netd's ports, usbd's queues) has one index per side, and each
@@ -4454,7 +4471,10 @@ runs the secondary's ActivateCredential calls (the relay):
     to functions of other segments, and in every function to the command
     register, the BARs and the expansion ROM's, so the AML neither moves a
     device root does not drive onto another's addresses nor lets one master
-    the bus, and to the MSI and MSI-X capabilities; in memory it refuses
+    the bus, to extended configuration space (past 0x100: ACS, which a
+    confined device's isolation may rest on in a function root does not
+    drive, SR-IOV, ATS, Resizable BAR), and to the MSI and MSI-X
+    capabilities; in memory it refuses
     writes to every function's MSI-X table and pending bits, as found at
     boot (none at all if there are more than root keeps): a function the
     firmware left mastering the bus would send the AML's message as an
@@ -5137,9 +5157,12 @@ Every PCI function no other partition lists is partition 0's, so
 `partitions = 1` behaves like one l4h. The shim refuses, rather than
 guesses: a BDF that does not exist or is in two partitions, a bridge, a
 partition without a disk controller, functions behind a PCI(-X) bridge
-(one requester ID) split between partitions, functions of one isolation
-group split between partitions, and a partition 0 without the
-boot CPU. An isolation group is root's (`acs.rs`, as for a confined NIC
+(one requester ID) split between partitions, functions an AMD IVRS gives
+one requester ID (its alias entries, `acs::IvrsAliases`, which root's
+AMD-Vi domains follow) split between partitions, functions of one
+isolation group split between partitions, and a partition 0 without the
+boot CPU. Partition 0's root also refuses to attach a device whose
+requester another partition's function shares. An isolation group is root's (`acs.rs`, as for a confined NIC
 driver, §9.8): the functions of a multi-function device without ACS, and
 those below switch or root ports that do not isolate them, reach each
 other's BARs without passing the IOMMU, so a device of one partition could

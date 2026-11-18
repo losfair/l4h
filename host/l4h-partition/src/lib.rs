@@ -439,7 +439,7 @@ impl MsgRing {
             (self.data(pos + 4) as *mut u32).write_volatile(ty);
             let mut at = self.data(pos + 8);
             for p in payload {
-                core::ptr::copy_nonoverlapping(p.as_ptr(), at, p.len());
+                copy_volatile(p.as_ptr(), at, p.len());
                 at = at.add(p.len());
             }
         }
@@ -460,6 +460,25 @@ impl MsgRing {
         // a reader going to sleep, at least one sees the other.
         core::sync::atomic::fence(Ordering::SeqCst);
         self.wake().load(Ordering::Relaxed) != 0 && self.wake().swap(0, Ordering::AcqRel) != 0
+    }
+}
+
+/// Copy `n` bytes from or into a ring, which the other partition may
+/// write meanwhile: volatile accesses, eight bytes at a time, so that the
+/// compiler neither assumes the bytes stay put nor reads them twice.
+///
+/// # Safety
+/// `src` and `dst` must be valid for `n` bytes.
+unsafe fn copy_volatile(src: *const u8, dst: *mut u8, n: usize) {
+    let mut i = 0;
+    // Eight bytes at a time, aligned or not: one load and one store each.
+    while i + 8 <= n {
+        unsafe { (dst.add(i) as *mut [u8; 8]).write_volatile((src.add(i) as *const [u8; 8]).read_volatile()) };
+        i += 8;
+    }
+    while i < n {
+        unsafe { dst.add(i).write_volatile(src.add(i).read_volatile()) };
+        i += 1;
     }
 }
 
@@ -519,12 +538,17 @@ impl MsgReader {
                 ((self.ring.data(pos) as *const u32).read_volatile() as u64, (self.ring.data(pos + 4) as *const u32).read_volatile())
             };
             let room = len.next_multiple_of(8);
-            if len < 8 || pos + room > self.ring.cap {
+            // The record lies inside the ring and inside what the writer
+            // published (a longer one would take the tail past the head,
+            // and every later count for a lap behind); padding fills
+            // the rest of the ring exactly (`MsgRing::send`).
+            if len < 8 || pos + room > self.ring.cap || room > head.wrapping_sub(self.tail)
+                || (ty == MSG_PAD && pos + room != self.ring.cap) {
                 return self.lose(head, lost);
             }
             let n = (len as usize - 8).min(buf.len());
             if ty != MSG_PAD {
-                unsafe { core::ptr::copy_nonoverlapping(self.ring.data(pos + 8), buf.as_mut_ptr(), n) };
+                unsafe { copy_volatile(self.ring.data(pos + 8), buf.as_mut_ptr(), n) };
             }
             // Overwritten while it was copied, or being overwritten: lost.
             // The copy before the head that says so.

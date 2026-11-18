@@ -159,8 +159,9 @@ impl Uplink {
         // cannot hold netd here (it signals again when it frees room).
         for _ in 0..4 {
             while let Some(f) = pool.front(&self.backlog) {
-                let Some(buf) = self.tx.reserve(&tx, f.len()) else { break };
-                f.copy_to(buf);
+                let Some(mut buf) = self.tx.reserve(&tx, f.len()) else { break };
+                // The nicd can read and write the area meanwhile.
+                unsafe { f.copy_to_shared(buf.as_mut_ptr()) };
                 let (len, hdr) = (f.len(), f.hdr);
                 self.tx.commit(&tx, len, &hdr);
                 pool.pop(&mut self.backlog);
@@ -198,7 +199,7 @@ impl Uplink {
             Next::Frame(f, mut hdr) => {
                 // A copy first: the nicd can write the area while netd reads.
                 let len = f.len();
-                buf[..len].copy_from_slice(f);
+                f.copy_to(&mut buf[..len]);
                 self.rx.release(&rx);
                 self.signal = true;
                 if len < 14 || !offload::sanitize_rx(&mut hdr, &buf[..len], offload::MIN_MSS) {

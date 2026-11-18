@@ -32,7 +32,7 @@ VMX operation (where INIT is blocked).
  5 files changed, 81 insertions(+), 20 deletions(-)
 
 diff --git a/include/arch/x86/arch/model/statedata.h b/include/arch/x86/arch/model/statedata.h
-index 76e62cc76..9a1aee2b6 100644
+index e98dd9d08..bb829b28c 100644
 --- a/include/arch/x86/arch/model/statedata.h
 +++ b/include/arch/x86/arch/model/statedata.h
 @@ -81,6 +81,12 @@ extern uint32_t x86KSnumIODomainIDBits;
@@ -77,7 +77,7 @@ index 01f66b2a3..687370642 100644
  
  deriveCap_ret_t Mode_deriveCap(cte_t *slot, cap_t cap);
 diff --git a/src/arch/x86/model/statedata.c b/src/arch/x86/model/statedata.c
-index e30f57e3e..da0b07c6f 100644
+index c09b90159..45b6fafab 100644
 --- a/src/arch/x86/model/statedata.c
 +++ b/src/arch/x86/model/statedata.c
 @@ -59,6 +59,7 @@ uint32_t x86KSFirstValidIODomain;

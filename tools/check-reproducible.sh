@@ -17,11 +17,27 @@ trap 'status=$?; if [ "$status" = 0 ]; then rm -rf "$work"; else echo "Rebuild r
 rebuild=$work/source
 git clone -q --shared --no-checkout "$root" "$rebuild"
 git -C "$rebuild" checkout -q --detach "$revision"
+# From the local clones only: the rebuild needs no network (a GitHub
+# timeout here once failed a release check).
 for sub in kernel/seL4 third_party/rust-sel4 third_party/sddf third_party/kemu; do
-    git -c protocol.file.allow=always -C "$rebuild" submodule update --init --reference "$root/$sub" -- "$sub"
+    git -c protocol.file.allow=always -c "submodule.$sub.url=$root/$sub" \
+        -C "$rebuild" submodule update --init --reference "$root/$sub" -- "$sub"
 done
 ln -s "$root/.venv" "$rebuild/.venv"
 mkdir -p "$rebuild/build/tmp"
+# FL4 too, from the tree build-release.sh prepared, as prepare-fl4.sh
+# leaves one (branch l4h at the pinned revision, vendor/seL4, its stamp):
+# prepare-fl4.sh then takes it as is.
+fl4_rev=$(cat "$rebuild/kernel/fl4/REVISION")
+if [ -d "$root/build/FL4-src/.git" ]; then
+    git clone -q --shared --no-checkout "$root/build/FL4-src" "$rebuild/build/FL4-src"
+    git -C "$rebuild/build/FL4-src" checkout -q -B l4h "$fl4_rev"
+    git -c protocol.file.allow=always \
+        -c "submodule.vendor/seL4.url=$root/build/FL4-src/vendor/seL4" \
+        -C "$rebuild/build/FL4-src" submodule update --init \
+        --reference "$root/build/FL4-src/vendor/seL4" -- vendor/seL4
+    echo "$fl4_rev" >"$rebuild/build/FL4-src/.git/l4h-source"
+fi
 tarball=$root/build/dl/linux-$LINUX_VERSION.tar.xz
 echo "$LINUX_SHA256  $tarball" | sha256sum -c --quiet
 tar -C "$rebuild/build" -xJf "$tarball"

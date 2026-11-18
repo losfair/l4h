@@ -417,6 +417,9 @@ int l4h_fpu_write(struct l4h_uctx *u, const void *buf, unsigned long size)
 	if (size > seL4_FPUStateSize)
 		size = seL4_FPUStateSize;
 	memcpy((char *)v->ipcbuf + L4H_FPU_SCRATCH_OFFSET, buf, size);
+	/* The scratch area held the last state read on this vCPU, maybe
+	 * another task's: none of it goes into this one. */
+	memset((char *)v->ipcbuf + L4H_FPU_SCRATCH_OFFSET + size, 0, seL4_FPUStateSize - size);
 	return seL4_TCB_WriteFPU(u->tcb, VCPU_CAP(v->id, L4H_VCPU_IPCBUF), L4H_FPU_SCRATCH_OFFSET);
 }
 

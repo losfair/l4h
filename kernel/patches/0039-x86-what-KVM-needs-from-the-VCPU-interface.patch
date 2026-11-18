@@ -556,7 +556,7 @@ index 66a50080b..56caf8a78 100644
  
      c_exit_hook();
 diff --git a/src/arch/x86/64/c_traps.c b/src/arch/x86/64/c_traps.c
-index 6dba95cbf..0bb0b4a3b 100644
+index 6dba95cbf..aa5f0f42f 100644
 --- a/src/arch/x86/64/c_traps.c
 +++ b/src/arch/x86/64/c_traps.c
 @@ -16,6 +16,12 @@
@@ -566,7 +566,7 @@ index 6dba95cbf..0bb0b4a3b 100644
 +    /* Before the lock: while this core waits for it, an invocation on
 +     * another core can take the VMCS (ClearCurrentVCPU), and then the VCPU
 +     * is no longer this core's. */
-+    word_t error = failValid ? vmread(VMX_DATA_INSTRUCTION_ERROR) : 0;
++    word_t UNUSED error = failValid ? vmread(VMX_DATA_INSTRUCTION_ERROR) : 0;
 +    vcpu_load_host_xcr0(ARCH_NODE_STATE(x86KSCurrentVCPU));
 +
      NODE_LOCK_SYS;

@@ -37,6 +37,10 @@ const MAX_ATTACHED: usize = pci::MAX_DISK_CTRLS + l4h_host::net::MAX_UPLINKS + l
 /// I/O page table levels: 48-bit I/O addresses, which every IOMMU
 /// supports (EFR.HATS) and which cover all physical memory.
 const LEVELS: u64 = 4;
+/// The end of the I/O address space LEVELS tables translate: an address
+/// past it would be taken modulo it by `walk`, and so land in another
+/// address's entry.
+const IOVA_END: usize = 1 << (12 + 9 * LEVELS);
 /// Table memory (the device table, I/O page tables, command buffers and
 /// event logs) is carved from 2 MiB chunks, kept until reboot.
 const CHUNK_BITS: usize = 21;
@@ -251,6 +255,18 @@ pub struct AmdVi {
     region: Option<Shared>,
 }
 
+/// The last-level entry mapping page `at`, read and with `write` written,
+/// over entry `old`: overlapping firmware ranges keep the union of their
+/// permissions.  A page is mapped at its own address only (`walk` takes
+/// none past IOVA_END), so an entry already present maps `at` already:
+/// another address's would merge two into one entry.
+fn leaf_pte(old: u64, at: usize, write: bool) -> u64 {
+    let new = at as u64 & PTE_ADDR;
+    assert!(new == at as u64, "iommu: page {:#x} is not one an entry maps", at);
+    assert!(old & PTE_PR == 0 || old & PTE_ADDR == new, "iommu: page {:#x} over an entry for {:#x}", at, old & PTE_ADDR);
+    old | new | PTE_PR | PTE_FC | PTE_IR | if write { PTE_IW } else { 0 }
+}
+
 pub fn device_id(d: &pci::Device) -> u16 {
     ((d.bus as u16) << 8) | ((d.dev as u16) << 3) | d.func as u16
 }
@@ -428,6 +444,14 @@ impl AmdVi {
                     };
                     let (start, len) = (u64_at(b, 16) as usize, u64_at(b, 24) as usize);
                     let end = start.checked_add(len)?.checked_next_multiple_of(PAGE)?;
+                    // Empty, or past the I/O address space (no entry
+                    // could map it where it is): the firmware's DMA
+                    // would not be kept, nor `map` kept off the range.
+                    // Malformed, as with too many ranges.
+                    if len == 0 || end > IOVA_END {
+                        log!("l4h-root: iommu: unity range {:#x}+{:#x} empty or past {:#x}", start, len, IOVA_END);
+                        return None;
+                    }
                     let u = Unity { first, last, start: start & !(PAGE - 1), end, write: write || exclusion };
                     info!("l4h-root: iommu: unity range {:#x}..{:#x} for devices {:#06x}..={:#06x}", u.start, u.end, first, last);
                     if self.unity.push(u).is_err() {
@@ -465,6 +489,9 @@ impl AmdVi {
                 0x03 | 0x47 => range = Some((id, flags, None)),
                 0x04 => {
                     let (first, flags, alias) = range.take()?;
+                    if first > id {
+                        return None;
+                    }
                     for i in first..=id {
                         dev.set(i, flags, alias.unwrap_or(i));
                     }
@@ -489,7 +516,8 @@ impl AmdVi {
                 _ => {}
             }
         }
-        Some(())
+        // A range never ended: malformed, as one ended twice is.
+        range.is_none().then_some(())
     }
 
     /// Map the IOMMUs' registers, build the tables, enable translation.
@@ -840,6 +868,13 @@ impl AmdVi {
             return Domain::NONE;
         }
         let alias = self.dev.as_ref().unwrap().alias[id as usize];
+        // A requester another partition's function also reaches the IOMMU
+        // as is that partition's domain: joining it would hand this
+        // device's DMA and the other's to one page table.  The shim
+        // refuses such a split, IVRS aliases included (acs::IvrsAliases).
+        let table = &self.dev.as_ref().unwrap().alias;
+        assert!(!crate::partition::foreign_requester(alias, |b| table[b as usize]),
+            "l4h-root: iommu: {:02x}:{:02x}.{} shares requester {:#06x} with another partition's function", d.bus, d.dev, d.func, alias);
         let existing = self.dev.as_ref().unwrap().attached.iter().find(|d| d.dev[1] == alias).copied();
         let mut dom = existing.unwrap_or_else(|| self.group_domain(alloc, alias));
         dom.dev = [id, alias];
@@ -860,7 +895,7 @@ impl AmdVi {
             return;
         }
         assert!(pa % PAGE == 0 && len % PAGE == 0);
-        let end = pa.checked_add(len).expect("iommu: invalid DMA range");
+        let end = pa.checked_add(len).filter(|&e| e <= IOVA_END).expect("iommu: invalid DMA range");
         // Permanent firmware mappings cannot also be recyclable DMA pools.
         assert!(!self.unity.iter().any(|u| u.covers_group(d.dev[1], self.dev.as_ref().unwrap())
             && pa < u.end && u.start < end), "iommu: allocated DMA memory overlaps an IVMD range");
@@ -873,11 +908,9 @@ impl AmdVi {
 
     fn map_range(&mut self, alloc: &mut Alloc, d: Domain, pa: usize, len: usize, write: bool) {
         assert!(pa % PAGE == 0 && len % PAGE == 0);
-        let leaf = PTE_PR | PTE_FC | PTE_IR | if write { PTE_IW } else { 0 };
         for at in (pa..pa + len).step_by(PAGE) {
             let pte = self.walk(Some(alloc), d, at).unwrap();
-            // Overlapping firmware ranges retain the union of permissions.
-            unsafe { pte.write_volatile(pte.read_volatile() | at as u64 | leaf) };
+            unsafe { pte.write_volatile(leaf_pte(pte.read_volatile(), at, write)) };
         }
     }
 
@@ -900,6 +933,7 @@ impl AmdVi {
     /// The last-level entry for `iova` in domain `d`, making the tables
     /// down to it with `alloc` (else None if one is missing).
     fn walk(&mut self, mut alloc: Option<&mut Alloc>, d: Domain, iova: usize) -> Option<*mut u64> {
+        assert!(iova < IOVA_END, "iommu: I/O address {:#x} past the page tables' reach", iova);
         let mut table = self.table(d.root as u64);
         for level in (2..=LEVELS).rev() {
             let e = unsafe { table.add(iova >> (12 + 9 * (level - 1)) & 511) };

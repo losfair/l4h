@@ -60,9 +60,16 @@ impl Mem {
     }
 }
 
-fn inside(d: &Dir, f: &[u8]) -> bool {
+fn inside(d: &Dir, at: *const u8, len: usize) -> bool {
     let (lo, hi) = (d.data as usize, d.data as usize + d.size);
-    f.as_ptr() as usize >= lo && f.as_ptr() as usize + f.len() <= hi
+    at as usize >= lo && at as usize + len <= hi
+}
+
+/// A frame's bytes, copied out as netd copies them.
+fn bytes(f: &uplink::Shared) -> Vec<u8> {
+    let mut v = vec![0u8; f.len()];
+    f.copy_to(&mut v);
+    v
 }
 
 fn frame_of(seq: u64, len: usize) -> Vec<u8> {
@@ -118,10 +125,10 @@ fn honest(seed: u64, frames: u64) {
     while want < frames {
         match r.next(&d) {
             Next::Frame(f, h) => {
-                assert!(inside(&d, f));
+                assert!(inside(&d, f.as_ptr(), f.len()));
                 let seq = u64::from_le_bytes(h[4..12].try_into().unwrap());
                 assert_eq!(seq, want, "out of order");
-                assert!(f == &frame_of(seq, f.len())[..], "frame {seq} damaged");
+                assert!(bytes(&f) == frame_of(seq, f.len()), "frame {seq} damaged");
                 r.release(&d);
                 want += 1;
                 if rng.below(64) == 0 {
@@ -173,9 +180,9 @@ fn hostile_producer(seed: u64, steps: u64) {
         match r.next(&d) {
             Next::Frame(f, _) => {
                 assert!(!broken, "a frame after the ring broke");
-                assert!(inside(&d, f) && !f.is_empty() && f.len() <= MAX_FRAME);
+                assert!(inside(&d, f.as_ptr(), f.len()) && !f.is_empty() && f.len() <= MAX_FRAME);
                 // Read every byte, as netd's copy does.
-                let _ = f.iter().fold(0u8, |a, &b| a ^ b);
+                let _ = bytes(&f).iter().fold(0u8, |a, &b| a ^ b);
                 r.release(&d);
             }
             Next::Broken => broken = true,
@@ -207,10 +214,10 @@ fn hostile_consumer(seed: u64, steps: u64) {
         let tail = idx.tail.load(Ordering::Acquire);
         let used = head.wrapping_sub(tail);
         let len = 1 + rng.below(MAX_FRAME as u64) as usize;
-        if let Some(buf) = w.reserve(&d, len) {
+        if let Some(mut buf) = w.reserve(&d, len) {
             assert!(used <= uplink::DESCS as u32, "room while the tail is broken");
-            assert!(inside(&d, buf) && buf.len() == len);
-            buf.fill(0x5a);
+            assert!(inside(&d, buf.as_mut_ptr(), buf.len()) && buf.len() == len);
+            buf.copy_from(&vec![0x5a; len]);
             w.commit(&d, len, &[0; HDR_SIZE]);
         }
         head = idx.head.load(Ordering::Relaxed);
