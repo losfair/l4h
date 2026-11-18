@@ -13,6 +13,8 @@ use l4h_virtio::{dma_fence, Dma, Mmio};
 
 use crate::{DevInfo, Driver, MAX_PIECES, MAX_REQUEST, Seg};
 
+mod namespaces;
+
 const PAGE: u64 = 4096;
 
 const REG_CAP: usize = 0x00;
@@ -280,28 +282,13 @@ impl Nvme {
     }
 
     fn discover_namespaces(&mut self, version: u32, max_nsid: u32) {
-        let mut ids = ArrayVec::<u32, { blk::MAX_UNITS }>::new();
         let data = Mmio(self.ident.0);
-        if version >= 0x0001_0100 && self.admin_status(Cmd {
-            opcode: ADMIN_IDENTIFY, prp1: self.ident.1, cdw10: IDENTIFY_ACTIVE_NAMESPACES, ..Default::default()
-        }) == 0 {
-            let mut last = 0;
-            for i in 0..blk::MAX_UNITS {
-                let id = data.r32(4 * i);
-                // The active namespace list is ascending, with zero padding.
-                if id <= last || id == u32::MAX {
-                    break;
-                }
-                let _ = ids.push(id);
-                last = id;
-            }
-        } else {
-            // NVMe 1.0 has no active namespace list. Probe contiguous
-            // IDs up to the controller's reported maximum and our unit limit.
-            for id in 1..=max_nsid.min(blk::MAX_UNITS as u32) {
-                let _ = ids.push(id);
-            }
-        }
+        let ids = namespaces::ids(version, max_nsid, || {
+            let status = self.admin_status(Cmd {
+                opcode: ADMIN_IDENTIFY, prp1: self.ident.1, cdw10: IDENTIFY_ACTIVE_NAMESPACES, ..Default::default()
+            });
+            (status == 0).then_some((0..blk::MAX_UNITS).map(|i| data.r32(4 * i)))
+        });
         for &id in &ids {
             let status = self.admin_status(Cmd {
                 opcode: ADMIN_IDENTIFY, nsid: id, prp1: self.ident.1, cdw10: IDENTIFY_NAMESPACE, ..Default::default()

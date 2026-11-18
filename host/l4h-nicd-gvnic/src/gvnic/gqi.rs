@@ -35,6 +35,8 @@ pub(super) struct Gqi {
     tx_head: u32,
     tx_tail: u32,
     tx_posted: u32,
+    /// TX completion head at the last interrupt arm or acknowledgement.
+    tx_irq_head: Option<u32>,
     rx_ring: usize,
     rx_buf: usize,
     rx_db: u32,
@@ -44,6 +46,7 @@ pub(super) struct Gqi {
     rx_seq: u16,
     rx_more: bool,
     rx_bad: bool,
+    rx_masked: bool,
 }
 
 impl Gqi {
@@ -54,18 +57,33 @@ impl Gqi {
         let tx_entries = be16(desc, 10) as usize;
         let rx_entries = be16(desc, 12) as usize;
         let tx_pages = be16(desc, 20) as usize;
+        // Each slot uses one half of a registered page. Copying the packet
+        // before reposting the slot lets both halves be used independently.
+        let rx_pages = (rx_entries * RX_BUFFER).div_ceil(PAGE);
         let max_pages = u64::from_be_bytes(desc[0..8].try_into().unwrap());
-        assert!(tx_pages > 0 && (tx_pages + rx_entries) as u64 <= max_pages, "gVNIC: invalid page counts");
+        assert!(tx_pages > 0 && (tx_pages + rx_pages) as u64 <= max_pages, "gVNIC: invalid page counts");
+        // Allow for alignment before the first page, between the packet
+        // buffers, page lists and rings, and before the queue resources.
+        let need = PAGE - 1 + (tx_pages + rx_pages) * PAGE
+            + (tx_pages * 8).next_multiple_of(PAGE) + (rx_pages * 8).next_multiple_of(PAGE)
+            + (tx_entries * TX_DESC).next_multiple_of(PAGE)
+            + (rx_entries * RX_DESC).next_multiple_of(PAGE)
+            + (rx_entries * 8).next_multiple_of(64) + 2 * 64;
+        assert!(
+            need <= dma.remaining(),
+            "nicd {}: gVNIC GQI rings tx {} rx {} ({} TX and {} RX pages) need {} KiB of DMA memory, {} KiB left",
+            g.n, tx_entries, rx_entries, tx_pages, rx_pages, need.div_ceil(1024), dma.remaining() / 1024,
+        );
 
         let tx_buf = Self::register(g, dma, TX_QPL, tx_pages);
-        let rx_buf = Self::register(g, dma, RX_QPL, rx_entries);
+        let rx_buf = Self::register(g, dma, RX_QPL, rx_pages);
         let (tx_ring, tx_ring_pa) = dma.alloc(tx_entries * TX_DESC, PAGE);
         let (rx_ring, rx_ring_pa) = dma.alloc(rx_entries * RX_DESC, PAGE);
         let (rx_data, rx_data_pa) = dma.alloc(rx_entries * 8, PAGE);
         let (tx_res, tx_res_pa) = dma.alloc(64, 64);
         let (rx_res, rx_res_pa) = dma.alloc(64, 64);
         for i in 0..rx_entries {
-            wr64(rx_data + i * 8, ((i * PAGE) as u64).to_be());
+            wr64(rx_data + i * 8, ((i * RX_BUFFER) as u64).to_be());
         }
 
         g.exec(
@@ -87,9 +105,9 @@ impl Gqi {
             doorbells: g.doorbells, irq_db: g.irq_db, mtu: be16(desc, 16),
             tx_ring, tx_buf, tx_counter: Mmio(counters + counter_index * 4),
             tx_db: db_index(tx_res), tx_mask: tx_entries as u32 - 1, tx_slots,
-            tx_head: 0, tx_tail: 0, tx_posted: 0,
+            tx_head: 0, tx_tail: 0, tx_posted: 0, tx_irq_head: None,
             rx_ring, rx_buf, rx_db: db_index(rx_res), rx_mask: rx_entries as u32 - 1,
-            rx_head: 0, rx_posted: rx_entries as u32, rx_seq: 1, rx_more: false, rx_bad: false,
+            rx_head: 0, rx_posted: rx_entries as u32, rx_seq: 1, rx_more: false, rx_bad: false, rx_masked: false,
         };
         q.ring(q.irq_db[NTFY_TX], IRQ_MASK);
         q.ring(q.rx_db, q.rx_posted);
@@ -156,9 +174,20 @@ impl Gqi {
     }
 
     pub(super) fn tx_interrupts(&mut self, on: bool) -> bool {
-        self.ring(self.irq_db[NTFY_TX], if on { IRQ_ACK_EVENT } else { IRQ_MASK });
-        dma_fence(Ordering::SeqCst);
-        on && self.tx_completion() != self.tx_head
+        if !on {
+            if self.tx_irq_head.take().is_some() {
+                self.ring(self.irq_db[NTFY_TX], IRQ_MASK);
+            }
+            return false;
+        }
+        // If TX is still blocked after consuming completions, acknowledge
+        // the event and arm again for more. An idle retry can keep its arm.
+        if self.tx_irq_head != Some(self.tx_head) {
+            self.tx_irq_head = Some(self.tx_head);
+            self.ring(self.irq_db[NTFY_TX], IRQ_ACK_EVENT);
+            dma_fence(Ordering::SeqCst);
+        }
+        self.tx_completion() != self.tx_head
     }
 
     pub(super) fn kick_tx(&mut self) {
@@ -175,8 +204,19 @@ impl Gqi {
         (flags & 7 == self.rx_seq).then_some((slot, flags))
     }
 
-    pub(super) fn rx_begin(&self) {
-        self.ring(self.irq_db[NTFY_RX], IRQ_MASK);
+    pub(super) fn rx_begin(&mut self) {
+        // TX and RX share an MSI-X vector. A poll with no RX work can
+        // leave the queue armed.
+        if !self.rx_masked && self.rx_next().is_some() {
+            self.mask_rx();
+        }
+    }
+
+    pub(super) fn mask_rx(&mut self) {
+        if !self.rx_masked {
+            self.ring(self.irq_db[NTFY_RX], IRQ_MASK);
+            self.rx_masked = true;
+        }
     }
 
     pub(super) fn rx_done(&mut self) -> bool {
@@ -186,10 +226,13 @@ impl Gqi {
             dma_fence(Ordering::Release);
             self.ring(self.rx_db, fill);
         }
-        self.ring(self.irq_db[NTFY_RX], IRQ_ACK_EVENT);
-        dma_fence(Ordering::SeqCst);
+        if self.rx_masked {
+            self.ring(self.irq_db[NTFY_RX], IRQ_ACK_EVENT);
+            self.rx_masked = false;
+            dma_fence(Ordering::SeqCst);
+        }
         if self.rx_next().is_some() {
-            self.rx_begin();
+            self.mask_rx();
             return false;
         }
         true
@@ -197,6 +240,8 @@ impl Gqi {
 
     pub(super) fn receive(&mut self, out: &mut [u8], partial: &mut Partial) -> Option<usize> {
         while let Some((slot, flags)) = self.rx_next() {
+            // A packet may have arrived after rx_begin checked the ring.
+            self.mask_rx();
             dma_fence(Ordering::Acquire);
             let len = u16::from_be(rd16(self.rx_ring + slot * RX_DESC + 60)) as usize;
             let pad = if self.rx_more { 0 } else { RX_PAD };
@@ -206,7 +251,7 @@ impl Gqi {
             self.rx_more = more;
             self.rx_bad |= flags & RX_ERROR != 0 || len < pad || len > RX_BUFFER;
             if !self.rx_bad {
-                let va = self.rx_buf + slot * PAGE + pad;
+                let va = self.rx_buf + slot * RX_BUFFER + pad;
                 let data = unsafe { core::slice::from_raw_parts(va as *const u8, len - pad) };
                 if !more && partial.is_empty() && data.len() <= out.len() {
                     out[..data.len()].copy_from_slice(data);

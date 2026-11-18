@@ -35,7 +35,7 @@ mod gqi;
 pub const MANIFEST: crate::sdk::Manifest = crate::sdk::Manifest {
     bars: 1 << 0 | 1 << 2,
     msix_min: 3,
-    dma_bits: 23,
+    dma_bits: 22,
     ..crate::sdk::Manifest::empty().with_name("gvnic").with_matches(&[crate::sdk::PciMatch::id(0x1ae0, 0x0042)])
 };
 
@@ -591,8 +591,8 @@ impl Gvnic {
         (u16::from_le(rd16(d + 4)) >> 14 & 1 != self.rx_compl_gen).then_some(d)
     }
 
-    pub fn rx_begin(&self) {
-        if let Some(gqi) = &self.gqi {
+    pub fn rx_begin(&mut self) {
+        if let Some(gqi) = &mut self.gqi {
             gqi.rx_begin();
         }
         // The block masked itself when it fired.
@@ -856,6 +856,13 @@ impl crate::sdk::NicDriver for Gvnic {
     }
     fn offer(&self) -> Offer {
         Gvnic::offer(self)
+    }
+    fn irq_received(&mut self) {
+        if let Some(gqi) = &mut self.gqi {
+            // The queues share a vector, so acknowledge a possible RX
+            // interrupt even if the poll finds no RX descriptor ready.
+            gqi.mask_rx();
+        }
     }
     fn rx_begin(&mut self) {
         Gvnic::rx_begin(self)

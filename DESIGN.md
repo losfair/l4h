@@ -2533,7 +2533,10 @@ are not filtered.
 format and raw DMA addressing (DQO RDA), which C3 and later offer. N2D
 Confidential VMs offer GQI with registered queue page lists (GQI QPL).
 The driver registers DMA pages for each queue and uses offsets into
-those lists in its packet descriptors. GQI uses software checksums and
+those lists in its packet descriptors. QPL receive buffers use two slots
+per page. GQI leaves RX interrupts armed during empty polls and
+acknowledges hardware interrupts on the shared vector. TX interrupts are
+armed only while waiting for space. GQI uses software checksums and
 segmentation. The driver uses the same big-endian admin queue for both
 formats. BAR 2 doorbells are big-endian for GQI and little-endian for DQO.
 DQO has one TX queue with its completion queue and one RX buffer queue

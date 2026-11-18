@@ -22,6 +22,8 @@ pub trait NicDriver: Sized {
     fn start(hw: &Hw) -> Result<Self, &'static str>;
     /// What the device takes and gives (written to the channel once).
     fn offer(&self) -> Offer;
+    /// The device raised its interrupt. Polling calls do not invoke this.
+    fn irq_received(&mut self) {}
     /// RX interrupts off while the loop drains the device.
     fn rx_begin(&mut self);
     /// RX interrupts on again; false if frames arrived meanwhile (the loop
