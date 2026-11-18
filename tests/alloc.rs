@@ -78,8 +78,8 @@ pub struct Cap<T>(u64, core::marker::PhantomData<T>);
 impl<T> Cap<T> {
     pub fn from_bits(bits: u64) -> Self { Self(bits, core::marker::PhantomData) }
     pub fn bits(&self) -> u64 { self.0 }
-    pub fn absolute_cptr<U>(&self, _: U) -> AbsoluteCPtr { AbsoluteCPtr { cnode: self.0 } }
-    pub fn absolute_cptr_for_self(&self) -> AbsoluteCPtr { AbsoluteCPtr { cnode: self.0 } }
+    pub fn absolute_cptr<U>(&self, c: Cap<U>) -> AbsoluteCPtr { AbsoluteCPtr { cnode: self.0, path: c.0 } }
+    pub fn absolute_cptr_for_self(&self) -> AbsoluteCPtr { AbsoluteCPtr { cnode: self.0, path: 0 } }
     pub fn untyped_retype(&self, _: &ObjectBlueprint, dest: &AbsoluteCPtr, offset: usize, count: usize) -> Result<(), ()> {
         assert!((1..=sel4_cfg_usize!(RETYPE_FAN_OUT_LIMIT)).contains(&count));
         RETYPES.with_borrow_mut(|v| v.push(dest.cnode));
@@ -90,24 +90,44 @@ impl<T> Cap<T> {
     }
 }
 
+/// FL4's seL4_Untyped_RetypeShared (l4h_task::retype_shared), with its
+/// limits: up to 256 4 KiB frames, or one 2 MiB frame, per call.
+pub fn retype_shared(untyped: cap::Untyped, size_bits: usize, dst: &AbsoluteCPtr, dst_offset: usize, count: usize) -> Result<(), ()> {
+    assert!((size_bits == 12 && (1..=256).contains(&count)) || (size_bits == 21 && count == 1), "2^{size_bits} x{count}");
+    SHARED_RETYPES.with_borrow_mut(|v| v.push((untyped.bits(), size_bits, dst.cnode, dst_offset, count)));
+    with_ipc_buffer_mut(|b| b.msg_regs_mut()[..6].fill(0xdead_beef));
+    Ok(())
+}
+
 pub mod cap {
     pub type Untyped = crate::Cap<crate::cap_type::Untyped>;
     pub type CNode = crate::Cap<crate::cap_type::CNode>;
 }
 
+/// A slot: the CNode it is in, and its index there (0 for the CNode itself).
 #[derive(Clone, Copy)]
-pub struct AbsoluteCPtr { cnode: u64 }
+pub struct AbsoluteCPtr { cnode: u64, path: u64 }
 
 thread_local! {
     static RETYPES: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
     static RETYPE_WINDOWS: std::cell::RefCell<Vec<(usize, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
     static DELETES: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Slots deleted, revoked, and moved (to, from).
+    static DELETED_SLOTS: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+    static REVOKES: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+    static MOVES: std::cell::RefCell<Vec<(u64, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// retype_shared calls: (untyped, size bits, destination CNode, offset, count).
+    static SHARED_RETYPES: std::cell::RefCell<Vec<(u64, usize, u64, usize, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 impl AbsoluteCPtr {
-    pub fn delete(&self) -> Result<(), ()> { DELETES.with_borrow_mut(|v| v.push(self.cnode)); Ok(()) }
-    pub fn revoke(&self) -> Result<(), ()> { Ok(()) }
-    pub fn move_(&self, _: &Self) -> Result<(), ()> { Ok(()) }
+    pub fn delete(&self) -> Result<(), ()> {
+        DELETES.with_borrow_mut(|v| v.push(self.cnode));
+        DELETED_SLOTS.with_borrow_mut(|v| v.push(self.path));
+        Ok(())
+    }
+    pub fn revoke(&self) -> Result<(), ()> { REVOKES.with_borrow_mut(|v| v.push(self.path)); Ok(()) }
+    pub fn move_(&self, src: &Self) -> Result<(), ()> { MOVES.with_borrow_mut(|v| v.push((self.path, src.path))); Ok(()) }
 }
 
 pub mod init_thread {
@@ -130,6 +150,7 @@ pub enum ObjectBlueprint {
     Untyped { size_bits: usize },
     CNode { size_bits: usize },
     Frame,
+    LargePage,
 }
 
 impl ObjectBlueprint {
@@ -138,6 +159,7 @@ impl ObjectBlueprint {
             Self::Untyped { size_bits } => *size_bits,
             Self::CNode { size_bits } => size_bits + 5,
             Self::Frame => 12,
+            Self::LargePage => 21,
         }
     }
 
@@ -476,4 +498,89 @@ fn grants_a_failed_memd_does_not_take_stay_in_use() {
     // What is left serves requests without memd (GRANTS is empty).
     let _rest = [alloc.arena(16 * MIB).unwrap(), alloc.arena(16 * MIB).unwrap()];
     assert_eq!(alloc.local_free_bytes(), 0);
+}
+
+/// DMA frames: ordinary ones without shared DMA; shared ones in the
+/// kernel's batches (256 4 KiB frames, one 2 MiB frame), placed on the
+/// region's watermark after its other objects, as `retype` places them.
+#[test]
+fn retype_dma_batches_4k_and_2m_and_shares_watermark() {
+    RETYPE_WINDOWS.with_borrow_mut(Vec::clear);
+    SHARED_RETYPES.with_borrow_mut(Vec::clear);
+    let base = 64 << 20;
+    let mut region = mem::UtRegion::fresh(cap::Untyped::from_bits(7), base, 24);
+    let cnode = slot::CNODE.cap().bits();
+
+    assert_eq!(region.retype_dma(false, &ObjectBlueprint::Frame, 3, mem::Dest::new(slot::CNODE.cap(), 1024)), Some(base));
+    RETYPE_WINDOWS.with_borrow(|w| assert_eq!(w, &[(1024, 3)]));
+    SHARED_RETYPES.with_borrow(|v| assert!(v.is_empty(), "no shared frames unless asked"));
+
+    // A 16 KiB CNode after the three pages, then shared pages after it.
+    let cn = ObjectBlueprint::CNode { size_bits: 9 };
+    assert_eq!(region.retype(&cn, 1, mem::Dest::new(slot::CNODE.cap(), 2000)), Some(base + (16 << 10)));
+    let count = 2 * 256 + 3;
+    assert_eq!(region.retype_dma(true, &ObjectBlueprint::Frame, count, mem::Dest::new(slot::CNODE.cap(), 4096)), Some(base + (32 << 10)));
+    SHARED_RETYPES.with_borrow(|v| {
+        assert_eq!(v, &[(7, 12, cnode, 4096, 256), (7, 12, cnode, 4352, 256), (7, 12, cnode, 4608, 3)]);
+    });
+    RETYPE_WINDOWS.with_borrow(|w| assert_eq!(w.len(), 2, "shared frames are not retyped as ordinary ones"));
+
+    // 2 MiB frames one per call, aligned past the 4 KiB ones.
+    SHARED_RETYPES.with_borrow_mut(Vec::clear);
+    let dest = mem::Dest::new(slot::CNODE.cap(), 8192);
+    assert_eq!(region.retype_dma(true, &ObjectBlueprint::LargePage, 3, dest), Some(base + (4 << 20)));
+    SHARED_RETYPES.with_borrow(|v| {
+        assert_eq!(v, &[(7, 21, cnode, 8192, 1), (7, 21, cnode, 8193, 1), (7, 21, cnode, 8194, 1)]);
+    });
+    // The watermark is shared: the next object comes after them, and
+    // what does not fit makes no kernel call.
+    assert_eq!(region.retype(&ObjectBlueprint::Frame, 1, mem::Dest::new(slot::CNODE.cap(), 9000)), Some(base + (10 << 20)));
+    assert!(region.retype_dma(true, &ObjectBlueprint::LargePage, 3, dest).is_none());
+    SHARED_RETYPES.with_borrow(|v| assert_eq!(v.len(), 3));
+}
+
+/// A pinned Untyped (a deleted guest's I/O pool a device may still write,
+/// and the CNode of its frames) is not revoked: it keeps its objects, in a
+/// global slot that the guest's `free_owned` leaves alone, and stays out
+/// of the free memory.  The rest of the arena is revoked and reused.
+#[test]
+fn reclaim_pinning_keeps_pinned_untyped_unrevoked() {
+    let boot = BootInfo(vec![Desc { paddr: 1 << 30, bits: 26 }]);
+    let mut alloc = mem::Alloc::new(
+        mem::Slots::new(Cap::from_bits(31), Box::leak(Box::new(mem::SlotStorage::<16, 1024>::new())), 64..1024),
+        Box::leak(Box::new(mem::AllocStorage::new())),
+        &boot,
+    );
+    let free = alloc.free_bytes();
+    alloc.slots.track(3);
+    let mut arena = alloc.arena(1 << 20).unwrap();
+    let pool_slot = alloc.slots.alloc();
+    let mut pool = alloc.split(22, pool_slot).unwrap();
+    arena.own(pool_slot, pool.paddr, 22);
+    let cnode_slot = alloc.slots.alloc();
+    let cnode_ut = alloc.split(15, cnode_slot).unwrap();
+    arena.own(cnode_slot, cnode_ut.paddr, 15);
+    let frames = mem::Dest { cnode: Cap::<cap_type::CNode>::from_bits(500).absolute_cptr_for_self(), offset: 0 };
+    assert_eq!(pool.retype_dma(true, &ObjectBlueprint::Frame, 1024, frames), Some(pool.paddr));
+    alloc.slots.untrack();
+    let (pool_paddr, cnode_paddr, region_slot) = (pool.paddr, cnode_ut.paddr, arena.owned[0].0);
+    assert_eq!(alloc.free_bytes(), free - (1 << 20) - (4 << 20) - (1 << 15));
+
+    REVOKES.with_borrow_mut(Vec::clear);
+    MOVES.with_borrow_mut(Vec::clear);
+    DELETED_SLOTS.with_borrow_mut(Vec::clear);
+    let kept = alloc.reclaim_pinning(arena, |p| p == pool_paddr || p == cnode_paddr);
+    assert_eq!(kept, (4 << 20) + (1 << 15));
+    REVOKES.with_borrow(|v| assert_eq!(v, &[region_slot as u64], "only the arena's own region is revoked"));
+    let kept_at = |slot: usize| MOVES.with_borrow(|v| v.iter().find(|m| m.1 == slot as u64).map(|m| m.0)).unwrap();
+    let (pool_kept, cnode_kept) = (kept_at(pool_slot), kept_at(cnode_slot));
+    let slots = alloc.slots.available();
+    alloc.slots.free_owned(3);
+    DELETED_SLOTS.with_borrow(|v| {
+        assert!(!v.contains(&pool_kept) && !v.contains(&cnode_kept), "the kept Untypeds are not the guest's");
+        assert!(v.contains(&(pool_slot as u64)) && v.contains(&(cnode_slot as u64)), "their old slots are freed");
+    });
+    // The arena region's slot, emptied when its block moved, and the two.
+    assert_eq!(alloc.slots.available(), slots + 3);
+    assert_eq!(alloc.free_bytes(), free - kept);
 }

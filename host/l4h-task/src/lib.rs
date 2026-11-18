@@ -40,3 +40,44 @@ pub mod window;
 pub fn cap_at<T: sel4::CapType>(slot: usize) -> sel4::Cap<T> {
     sel4::Cap::from_bits(slot as u64)
 }
+
+/// Retype `count` frames of 2^`size_bits` bytes (4 KiB or 2 MiB) from
+/// `untyped` into `dst`, from slot `dst_offset` on, shared with the
+/// hypervisor so that devices can reach them by DMA on a confidential VM
+/// (FL4's seL4_Untyped_RetypeShared: at most 256 4 KiB frames, or one
+/// 2 MiB frame, per call).  Callers go through `mem::UtRegion::retype_dma`,
+/// which keeps the watermark.
+#[cfg(l4h_kernel_shared_dma)]
+pub fn retype_shared(
+    untyped: sel4::cap::Untyped,
+    size_bits: usize,
+    dst: &sel4::AbsoluteCPtr,
+    dst_offset: usize,
+    count: usize,
+) -> sel4::Result<()> {
+    let err = sel4::with_ipc_buffer_mut(|ipc| {
+        ipc.inner_mut().seL4_Untyped_RetypeShared(
+            untyped.bits(),
+            size_bits as u64,
+            dst.root().bits(),
+            dst.path().bits(),
+            dst.path().depth() as u64,
+            dst_offset as u64,
+            count as u64,
+        )
+    });
+    sel4::Error::from_sys(err).map_or(Ok(()), Err)
+}
+
+/// A kernel without shared frames refuses them, as FL4 does off a
+/// confidential VM (seL4_IllegalOperation).
+#[cfg(not(l4h_kernel_shared_dma))]
+pub fn retype_shared(
+    _untyped: sel4::cap::Untyped,
+    _size_bits: usize,
+    _dst: &sel4::AbsoluteCPtr,
+    _dst_offset: usize,
+    _count: usize,
+) -> sel4::Result<()> {
+    Err(sel4::Error::IllegalOperation)
+}

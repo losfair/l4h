@@ -7,6 +7,7 @@
 #![allow(dead_code)]
 
 const MAX_GUESTS: usize = 64;
+type Slot = usize;
 mod mem {
     pub const GLOBAL: u64 = 1 << 20;
 }
@@ -44,11 +45,13 @@ impl Slots {
         self.freed.push(owner);
     }
 }
-/// What was given back, in order: each region's paddr, and the pinned ones.
+/// What was given back, in order: each region's paddr, and the pinned ones;
+/// the root slots of the pool CNodes kept for good.
 #[derive(Default)]
 pub struct Alloc {
     reclaimed: Vec<usize>,
     pinned: Vec<usize>,
+    kept: Vec<usize>,
     slots: Slots,
 }
 impl Alloc {
@@ -72,15 +75,24 @@ pub struct Host {
     zombies: Vec<Option<Zombie>>,
     alloc: Alloc,
 }
+fn keep_pool_cnode(h: &mut Host, slot: Slot) {
+    h.alloc.kept.push(slot);
+}
 
 const POOL: usize = 0x4000_0000;
 const CHANNELS: usize = 0x5000_0000;
+/// The Untyped of the pool's frames' CNode, and the CNode's root slot.
+const CNODE_UT: usize = 0x6000_0000;
+const CNODE_SLOT: usize = 40;
+const CNODE: (usize, Slot) = (CNODE_UT, CNODE_SLOT);
 
-/// Guest memory: its channels' region and its I/O pool.
+/// Guest memory: its channels' region, its I/O pool and the Untyped of
+/// the pool's CNode.
 fn arena() -> Arena {
     let mut a = Arena::new();
     a.own(1, CHANNELS, 21);
     a.own(2, POOL, 24);
+    a.own(3, CNODE_UT, 17);
     a
 }
 
@@ -89,7 +101,7 @@ fn arena() -> Arena {
 fn host(disks: usize, ports: usize, cut: bool) -> Host {
     let mut h = Host { zombies: (0..MAX_GUESTS).map(|_| None).collect(), alloc: Alloc::default() };
     let mut a = arena();
-    let (pool, now) = ZombiePool::at_deletion(&mut a, POOL, cut, disks != 0, true);
+    let (pool, now) = ZombiePool::at_deletion(&mut a, POOL, CNODE, cut, disks != 0, true);
     if let Some(now) = now {
         h.alloc.reclaim(now);
     }
@@ -105,7 +117,8 @@ fn a_cut_pool_waits_for_every_disk_and_not_for_netd() {
     zombie_disk_done(&mut h, Some(0), true);
     assert!(h.alloc.reclaimed.is_empty(), "one disk still drains");
     zombie_disk_done(&mut h, Some(0), true);
-    assert_eq!(h.alloc.reclaimed, [POOL, CHANNELS], "the pool, then the rest with the zombie");
+    assert_eq!(h.alloc.reclaimed, [POOL, CHANNELS, CNODE_UT], "the pool, then the rest with the zombie");
+    assert!(h.alloc.pinned.is_empty() && h.alloc.kept.is_empty());
     assert!(h.zombies[0].is_none());
     assert_eq!(h.alloc.slots.freed, [MAX_GUESTS]);
 }
@@ -117,7 +130,7 @@ fn a_cut_pool_goes_before_a_port_netd_has_not_let_go() {
     assert_eq!(h.alloc.reclaimed, [POOL]);
     assert!(h.zombies[0].is_some(), "netd still maps the port");
     zombie_done(&mut h, Some(0), true);
-    assert_eq!(h.alloc.reclaimed, [POOL, CHANNELS]);
+    assert_eq!(h.alloc.reclaimed, [POOL, CHANNELS, CNODE_UT]);
 }
 
 /// guest_del's choice for every case: the pool is freed at once only if no
@@ -129,22 +142,22 @@ fn where_the_pool_goes_at_deletion() {
         for disks in [false, true] {
             for zombie in [false, true] {
                 let mut a = arena();
-                let (pool, now) = ZombiePool::at_deletion(&mut a, POOL, cut, disks, zombie);
+                let (pool, now) = ZombiePool::at_deletion(&mut a, POOL, CNODE, cut, disks, zombie);
                 let case = format!("cut {cut}, disks {disks}, zombie {zombie}");
                 match (cut, disks, zombie) {
                     (false, ..) | (true, true, false) => {
-                        assert!(matches!(pool, ZombiePool::InArena(POOL)), "{case}");
+                        assert!(matches!(pool, ZombiePool::InArena { pool: POOL, cnode_ut: CNODE_UT, cnode_slot: CNODE_SLOT }), "{case}");
                         assert!(now.is_none() && a == arena(), "{case}: nothing leaves the arena");
                     }
                     (true, false, _) => {
                         assert!(matches!(pool, ZombiePool::Gone), "{case}");
                         assert_eq!(now, Some(Arena { owned: vec![(2, POOL, 24)] }), "{case}: freed at once");
-                        assert_eq!(a.owned, [(1, CHANNELS, 21)], "{case}");
+                        assert_eq!(a.owned, [(1, CHANNELS, 21), (3, CNODE_UT, 17)], "{case}");
                     }
                     (true, true, true) => {
                         assert!(matches!(&pool, ZombiePool::Cut(p) if p.owned == [(2, POOL, 24)]), "{case}");
                         assert!(now.is_none(), "{case}: not freed while disks drain");
-                        assert_eq!(a.owned, [(1, CHANNELS, 21)], "{case}");
+                        assert_eq!(a.owned, [(1, CHANNELS, 21), (3, CNODE_UT, 17)], "{case}");
                     }
                 }
             }
@@ -152,16 +165,30 @@ fn where_the_pool_goes_at_deletion() {
     }
     // A pool the arena does not own is not the zombie's to free.
     let mut a = Arena::new();
-    let (pool, now) = ZombiePool::at_deletion(&mut a, POOL, true, true, true);
+    let (pool, now) = ZombiePool::at_deletion(&mut a, POOL, CNODE, true, true, true);
     assert!(matches!(pool, ZombiePool::Gone) && now.is_none());
 }
 
 #[test]
 fn a_pool_no_iommu_cut_off_stays_and_is_pinned_if_a_disk_was_not_stopped() {
     let mut h = host(1, 0, false);
-    assert!(matches!(h.zombies[0].as_ref().unwrap().pool, ZombiePool::InArena(POOL)));
+    assert!(matches!(h.zombies[0].as_ref().unwrap().pool, ZombiePool::InArena { pool: POOL, .. }));
     zombie_disk_done(&mut h, Some(0), false);
-    assert_eq!((h.alloc.reclaimed.as_slice(), h.alloc.pinned.as_slice()), (&[CHANNELS][..], &[POOL][..]));
+    // The CNode holding the frames' capabilities stays with the pool, and
+    // leaves the zombie's slots before they are freed.
+    assert_eq!((h.alloc.reclaimed.as_slice(), h.alloc.pinned.as_slice()), (&[CHANNELS][..], &[POOL, CNODE_UT][..]));
+    assert_eq!(h.alloc.kept, [CNODE_SLOT]);
+    assert_eq!(h.alloc.slots.freed, [MAX_GUESTS]);
+}
+
+/// A pool no IOMMU cut off whose disks all stopped goes with the rest,
+/// its CNode too.
+#[test]
+fn a_pool_no_iommu_cut_off_goes_if_its_disks_stopped() {
+    let mut h = host(1, 0, false);
+    zombie_disk_done(&mut h, Some(0), true);
+    assert_eq!(h.alloc.reclaimed, [CHANNELS, POOL, CNODE_UT]);
+    assert!(h.alloc.pinned.is_empty() && h.alloc.kept.is_empty());
 }
 
 /// A disk removal the zombie does not wait for counts for nothing: not for
@@ -180,7 +207,7 @@ fn a_removal_more_than_the_disks_changes_nothing() {
     zombie_done(&mut h, Some(0), true);
     assert_eq!(h.alloc.reclaimed, [POOL], "one port is still netd's");
     zombie_done(&mut h, Some(0), true);
-    assert_eq!(h.alloc.reclaimed, [POOL, CHANNELS]);
+    assert_eq!(h.alloc.reclaimed, [POOL, CHANNELS, CNODE_UT]);
     assert!(h.zombies[0].is_none());
 }
 
@@ -208,7 +235,7 @@ fn every_order_of_removals() {
             assert_eq!(pool_freed, disks == 2, "{o:?}: the pool goes at the last disk");
             assert_eq!(h.alloc.reclaimed.contains(&CHANNELS), all == 4, "{o:?}: the rest at the last removal");
         }
-        assert_eq!(h.alloc.reclaimed.len(), 2, "{o:?}: each once");
+        assert_eq!(h.alloc.reclaimed.len(), 3, "{o:?}: each once");
     }
 }
 

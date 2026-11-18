@@ -491,7 +491,7 @@ pub fn start(
     let n_dma = (1 << DMA_BITS) / PAGE;
     let dma_frames = alloc.slots.alloc_range(n_dma);
     dma_region
-        .retype(&FRAME_BP, n_dma, Dest::new(crate::slot::CNODE.cap(), dma_frames.start))
+        .retype_dma(alloc.shared_dma, &FRAME_BP, n_dma, Dest::new(crate::slot::CNODE.cap(), dma_frames.start))
         .expect("blkd DMA frames");
     arena.own(dma_slot, dma_paddr, DMA_BITS);
     // The device reaches this memory, and the pools of attached clients.

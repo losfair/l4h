@@ -666,7 +666,7 @@ fn alloc_dma(h: &mut Host, i: usize, bits: usize) -> Result<(), &'static str> {
         let cn_bits = keep_bits(pages);
         let cn_slot = alloc.object(ObjectBlueprint::CNode { size_bits: cn_bits });
         let frames = root_cap::<cap_type::CNode>(cn_slot);
-        region.retype(&FRAME_BP, pages, Dest { cnode: abs_of(frames), offset: 0 })?;
+        region.retype_dma(alloc.shared_dma, &FRAME_BP, pages, Dest { cnode: abs_of(frames), offset: 0 })?;
         Some(DmaRegion { frames, bits: cn_bits, paddr: region.paddr, size: 1 << bits })
     }).ok_or("no memory for its DMA region")?;
     h.iommu.map(&mut h.alloc, dom, r.paddr, r.size, true);

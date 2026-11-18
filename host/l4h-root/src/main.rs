@@ -429,6 +429,13 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     info!("l4h-root: CPU physical cores {:?}", topology.physical());
     let slots = Slots::new(slot::CNODE.cap(), SLOT_STORAGE.take(), bootinfo.empty().range());
     let mut alloc = Alloc::new(slots, ALLOC_STORAGE.take(), bootinfo);
+    // SEL4_BOOTINFO_HEADER_SHARED_DMA (FL4 on a confidential VM): devices
+    // reach only frames shared with the hypervisor.
+    const SHARED_DMA: u64 = 9;
+    alloc.shared_dma = bootmod::extra_chunk(bootinfo, SHARED_DMA).is_some();
+    if alloc.shared_dma {
+        info!("l4h-root: DMA memory shared with the hypervisor");
+    }
     let total_bytes = alloc.free_bytes();
     info!("l4h-root: {} core(s), {} MiB free memory", cores, total_bytes >> 20);
 
@@ -607,7 +614,11 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
             // Left to the firmware, enabled as it is, until claimed.
             usb::found(d, &pci, &mut alloc, &mut devmem);
             record.owner = l4h_abi::PCI_OWNER_FIRMWARE;
-        } else if memd::is_balloon(&d) && balloon.is_none() && !partition::secondary() {
+        } else if memd::is_balloon(&d) && balloon.is_none() && !partition::secondary() && !alloc.shared_dma {
+            // Not with encrypted memory: a reported page the hypervisor
+            // dropped reads back as the decryption of zeroes, not as
+            // zeroes, and seL4 expects free memory it has cleared to
+            // stay clear (§8.6, "Zeroing").
             balloon = Some(d);
             record.owner = l4h_abi::PCI_OWNER_MEMD;
         }

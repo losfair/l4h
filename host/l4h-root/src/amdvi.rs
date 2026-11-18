@@ -737,7 +737,10 @@ impl AmdVi {
         let pa = alloc.global(|alloc| {
             let (ut, page) = (alloc.slots.alloc(), alloc.slots.alloc());
             let mut region = alloc.split(CHUNK_BITS, ut).expect("l4h-root: iommu: no memory for tables");
-            let pa = region.retype(&LARGE_PAGE_BP, 1, crate::mem::Dest::new(crate::slot::CNODE.cap(), page)).expect("iommu table chunk");
+            // The IOMMU reads its tables by DMA: shared on a confidential VM.
+            let pa = region
+                .retype_dma(alloc.shared_dma, &LARGE_PAGE_BP, 1, crate::mem::Dest::new(crate::slot::CNODE.cap(), page))
+                .expect("iommu table chunk");
             let cap = sel4::init_thread::Slot::<sel4::cap_type::LargePage>::from_index(page).cap();
             map_large_page(&mut crate::mem::ObjCtx::global(alloc), slot::VSPACE.cap(), cap, va, sel4::CapRights::read_write());
             pa
