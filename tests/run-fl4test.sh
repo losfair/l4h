@@ -2,8 +2,11 @@
 # Boot the complete l4h stack on the pinned FL4 revision, or on a frozen
 # worktree selected by L4H_FL4_SOURCE.
 # Exercise SMP, device memory, networking, free-page reporting and KVM.
-# KVM runs when the host exposes VMX/SVM and KVM nesting is enabled.
-# L4H_FL4_KVM=1 requires it; =0 skips it; the default is auto-detection.
+# KVM runs when the host exposes VMX/SVM and KVM nesting is enabled, and
+# FL4 found the speculation mitigations it requires for VM exits (IBPB
+# and the like; a nested host may hide them, and FL4 then leaves
+# virtualization off).  L4H_FL4_KVM=1 requires it; =0 skips it; the
+# default is auto-detection.
 # L4H_RELEASE=1 also runs the ABI/SDK test: FL4's debug profile
 # intentionally has no l4h debug-syscall MCP filter.
 set -euo pipefail
@@ -46,6 +49,11 @@ done
 if [ "${L4H_RELEASE:-0}" = 1 ]; then
     "$root/tests/run-abitest.sh"
 fi
+# The boots above logged what FL4 found: without the mitigations it
+# requires, no VM-exit path is enabled, whatever the CPU flags say.
+if [ "${L4H_FL4_KVM:-auto}" = auto ] && grep -aq 'FL4: speculation mitigations: incomplete:' "$root/build/qemu.log"; then
+    kvm=0
+fi
 if [ "$kvm" = 1 ]; then
     if [ "${L4H_RELEASE:-0}" != 1 ]; then
         "$root/tests/run-vtxtest.sh" on
@@ -56,6 +64,6 @@ if [ "$kvm" = 1 ]; then
         cp "$root/build/qemu.log" "$root/build/fl4-kvm-$vcpus.log"
     done
 else
-    echo 'FL4TEST: KVM SKIP (nesting unavailable or L4H_FL4_KVM=0)'
+    echo 'FL4TEST: KVM SKIP (nesting or speculation mitigations unavailable, or L4H_FL4_KVM=0)'
 fi
 echo 'FL4TEST: PASS'
