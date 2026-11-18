@@ -3,6 +3,7 @@
 #include <linux/ptrace.h>
 #include <linux/syscalls.h>
 #include <linux/signal.h>
+#include <linux/sched/signal.h>
 #include <linux/uaccess.h>
 #include <asm/ucontext.h>
 #include <asm/elf.h>
@@ -27,6 +28,10 @@ int setup_signal_stack_si(unsigned long top, struct ksignal *ksig,
 	struct sigcontext_header sc = {};
 	struct fpsimd_context fp = {};
 	int err;
+	/* A frame that does not fit on the alternate stack is not written
+	 * below it (as x86/signal.c). */
+	if (on_sig_stack(top) && !on_sig_stack((unsigned long)frame))
+		return -EFAULT;
 	if (!access_ok(frame, sizeof(*frame)))
 		return -EFAULT;
 	memcpy(sc.user.regs, regs->regs.gp, sizeof(sc.user.regs));
