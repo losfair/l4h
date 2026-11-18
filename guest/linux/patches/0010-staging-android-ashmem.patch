@@ -12,7 +12,7 @@ no page-size compatibility (PAGE_ALIGN for __PAGE_ALIGN).
 diff -urN a/drivers/staging/android/ashmem.c b/drivers/staging/android/ashmem.c
 --- a/drivers/staging/android/ashmem.c	1969-12-31 16:00:00.000000000 -0800
 +++ b/drivers/staging/android/ashmem.c	2026-10-25 01:35:53.118737631 -0700
-@@ -0,0 +1,1012 @@
+@@ -0,0 +1,1015 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/* mm/ashmem.c
 + *
@@ -771,7 +771,7 @@ diff -urN a/drivers/staging/android/ashmem.c b/drivers/staging/android/ashmem.c
 +			    void __user *p)
 +{
 +	struct ashmem_pin pin;
-+	size_t pgstart, pgend;
++	size_t pgstart, pgend, size, len;
 +	int ret = -EINVAL;
 +	struct ashmem_range *range = NULL;
 +
@@ -790,21 +790,23 @@ diff -urN a/drivers/staging/android/ashmem.c b/drivers/staging/android/ashmem.c
 +	if (!asma->file)
 +		goto out_unlock;
 +
++	/*
++	 * In size_t: an area can be 4 GiB or more, which the 32-bit fields
++	 * of struct ashmem_pin cannot say (ASHMEM_SET_SIZE keeps
++	 * PAGE_ALIGN(asma->size) from wrapping).  The range is a page at
++	 * least, inside the area.
++	 */
++	size = PAGE_ALIGN(asma->size);
++	if (pin.offset >= size || (pin.offset & ~PAGE_MASK))
++		goto out_unlock;
++
 +	/* per custom, you can pass zero for len to mean "everything onward" */
-+	if (!pin.len)
-+		pin.len = PAGE_ALIGN(asma->size) - pin.offset;
-+
-+	if ((pin.offset | pin.len) & ~PAGE_MASK)
-+		goto out_unlock;
-+
-+	if (((__u32)-1) - pin.offset < pin.len)
-+		goto out_unlock;
-+
-+	if (PAGE_ALIGN(asma->size) < pin.offset + pin.len)
++	len = pin.len ? pin.len : size - pin.offset;
++	if ((len & ~PAGE_MASK) || len > size - pin.offset)
 +		goto out_unlock;
 +
 +	pgstart = pin.offset / PAGE_SIZE;
-+	pgend = pgstart + (pin.len / PAGE_SIZE) - 1;
++	pgend = pgstart + (len / PAGE_SIZE) - 1;
 +
 +	switch (cmd) {
 +	case ASHMEM_PIN:
@@ -855,7 +857,8 @@ diff -urN a/drivers/staging/android/ashmem.c b/drivers/staging/android/ashmem.c
 +	case ASHMEM_SET_SIZE:
 +		ret = -EINVAL;
 +		mutex_lock(&ashmem_mutex);
-+		if (!asma->file) {
++		/* A size whose page alignment wraps is no size. */
++		if (!asma->file && PAGE_ALIGN((size_t)arg) >= (size_t)arg) {
 +			ret = 0;
 +			asma->size = (size_t)arg;
 +		}

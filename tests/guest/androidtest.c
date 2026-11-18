@@ -5,7 +5,7 @@
  * userfaultfd with MREMAP_DONTUNMAP and UFFDIO_MOVE (ART's garbage
  * collector), alarm timers and the RTC, memfd code mapped twice (ART's
  * JIT), dma-buf heaps, PSI triggers (lmkd), SELinux, bootconfig, uinput and
- * zram swap.  Booted with androidtest=default, it checks that a guest
+ * zram swap, and ashmem's bounds.  Booted with androidtest=default, it checks that a guest
  * which does not ask for them sees none of SELinux, PSI or bootconfig.
  * Prints "ANDROIDTEST: PASS" or "ANDROIDTEST: FAIL".
  */
@@ -39,6 +39,18 @@
 #include <linux/userfaultfd.h>
 
 #define PAGE 4096
+
+/* drivers/staging/android/uapi/ashmem.h (guest/linux/patches/0010). */
+struct ashmem_pin {
+	uint32_t offset;
+	uint32_t len;
+};
+#define ASHMEM_SET_SIZE		_IOW(0x77, 3, size_t)
+#define ASHMEM_PIN		_IOW(0x77, 7, struct ashmem_pin)
+#define ASHMEM_UNPIN		_IOW(0x77, 8, struct ashmem_pin)
+#define ASHMEM_GET_PIN_STATUS	_IO(0x77, 9)
+#define ASHMEM_IS_UNPINNED	0
+#define ASHMEM_IS_PINNED	1
 
 static int failures;
 
@@ -810,6 +822,86 @@ static void test_uinput(void)
 	close(fd);
 }
 
+/* ashmem_pin_unpin(cmd, offset, len): the ioctl's result, or -errno. */
+static int ashmem_range(int fd, unsigned long cmd, uint32_t offset, uint32_t len)
+{
+	struct ashmem_pin pin = { .offset = offset, .len = len };
+	int r = ioctl(fd, cmd, &pin);
+
+	return r < 0 ? -errno : r;
+}
+
+/* An area of `size` bytes, its first page mapped.  MAP_NORESERVE: the
+ * shmem file behind it is not charged in full, so a sparse 4 GiB area
+ * fits a guest with less memory. */
+static int ashmem_area(size_t size, void **map)
+{
+	int fd = open("/dev/ashmem", O_RDWR | O_CLOEXEC);
+
+	if (fd < 0)
+		return -1;
+	if (ioctl(fd, ASHMEM_SET_SIZE, size) < 0)
+		goto fail;
+	*map = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_NORESERVE, fd, 0);
+	if (*map == MAP_FAILED)
+		goto fail;
+	return fd;
+fail:
+	close(fd);
+	return -1;
+}
+
+/*
+ * ashmem's pin ranges are 32-bit offsets and lengths into an area whose
+ * size is a size_t: a length of 0 means "to the end", also of an area of
+ * 4 GiB or more, and a range is a page at least, inside the area.
+ */
+static void test_ashmem(void)
+{
+	int fd = open("/dev/ashmem", O_RDWR | O_CLOEXEC);
+	void *map;
+
+	CHECK(fd >= 0, "open /dev/ashmem");
+	/* A size whose page alignment wraps is refused. */
+	errno = 0;
+	CHECK(ioctl(fd, ASHMEM_SET_SIZE, (size_t)-1) < 0 && errno == EINVAL, "ASHMEM_SET_SIZE(SIZE_MAX)");
+	CHECK(ioctl(fd, ASHMEM_SET_SIZE, (size_t)-PAGE + 1) < 0 && errno == EINVAL,
+	      "ASHMEM_SET_SIZE(SIZE_MAX - PAGE + 2)");
+	close(fd);
+
+	/* One page: no range starts at its end, or past it. */
+	fd = ashmem_area(PAGE, &map);
+	CHECK(fd >= 0, "one-page area");
+	CHECK(ashmem_range(fd, ASHMEM_UNPIN, PAGE, 0) == -EINVAL, "unpin from the end, to the end");
+	CHECK(ashmem_range(fd, ASHMEM_UNPIN, PAGE, PAGE) == -EINVAL, "unpin past the end");
+	CHECK(ashmem_range(fd, ASHMEM_UNPIN, 0, 2 * PAGE) == -EINVAL, "unpin beyond the end");
+	CHECK(ashmem_range(fd, ASHMEM_UNPIN, 0, 1) == -EINVAL, "unaligned length");
+	CHECK(ashmem_range(fd, ASHMEM_UNPIN, 0, 0) == 0, "unpin all");
+	CHECK(ashmem_range(fd, ASHMEM_GET_PIN_STATUS, 0, 0) == ASHMEM_IS_UNPINNED, "unpinned");
+	CHECK(ashmem_range(fd, ASHMEM_PIN, 0, 0) >= 0, "pin all");
+	CHECK(ashmem_range(fd, ASHMEM_GET_PIN_STATUS, 0, PAGE) == ASHMEM_IS_PINNED, "pinned");
+	munmap(map, PAGE);
+	close(fd);
+
+	/* 4 GiB, sparse: "to the end" is the whole area, not nothing. */
+	fd = ashmem_area(4UL << 30, &map);
+	CHECK(fd >= 0, "4 GiB area");
+	CHECK(ashmem_range(fd, ASHMEM_UNPIN, 0, 0) == 0, "unpin 4 GiB");
+	CHECK(ashmem_range(fd, ASHMEM_GET_PIN_STATUS, 0xfffff000, PAGE) == ASHMEM_IS_UNPINNED,
+	      "last page unpinned");
+	CHECK(ashmem_range(fd, ASHMEM_PIN, 0, PAGE) >= 0, "pin the first page");
+	CHECK(ashmem_range(fd, ASHMEM_GET_PIN_STATUS, 0, PAGE) == ASHMEM_IS_PINNED, "first page pinned");
+	CHECK(ashmem_range(fd, ASHMEM_GET_PIN_STATUS, PAGE, PAGE) == ASHMEM_IS_UNPINNED,
+	      "second page still unpinned");
+	CHECK(ashmem_range(fd, ASHMEM_UNPIN, 0xfffff000, 2 * PAGE) == -EINVAL, "range past 4 GiB");
+	CHECK(ashmem_range(fd, ASHMEM_PIN, 0, 0) >= 0, "pin 4 GiB");
+	CHECK(ashmem_range(fd, ASHMEM_GET_PIN_STATUS, 0xfffff000, PAGE) == ASHMEM_IS_PINNED,
+	      "last page pinned");
+	*(volatile char *)map = 1;
+	munmap(map, PAGE);
+	close(fd);
+}
+
 static void run(const char *name, void (*fn)(void))
 {
 	int before = failures;
@@ -848,6 +940,7 @@ int main(void)
 		run("selinux", test_selinux_android);
 		run("bootconfig", test_bootconfig);
 		run("uinput", test_uinput);
+		run("ashmem", test_ashmem);
 	} else {
 		run("selinux_off", test_selinux_default);
 		run("defaults", test_defaults);
