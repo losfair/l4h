@@ -23,6 +23,7 @@ mod acpi;
 #[cfg(target_arch = "x86_64")]
 mod acs;
 mod amdvi;
+mod barsize;
 mod blkd;
 mod bootmod;
 mod channel;

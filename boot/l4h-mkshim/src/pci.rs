@@ -165,49 +165,26 @@ impl Pci {
     }
 
     fn size_bars(&self, bdf: u16, n: usize) -> [Bar; 6] {
-        let mut bars = [Bar::default(); 6];
         let cmd = self.read16(bdf, 4);
         self.write16(bdf, 4, cmd & !3);
-        let mut i = 0;
-        while i < n {
-            let off = 0x10 + 4 * i as u16;
-            let orig = self.read32(bdf, off);
-            self.write32(bdf, off, 0xffff_ffff);
-            let lo = self.read32(bdf, off);
-            self.write32(bdf, off, orig);
-            if orig & 1 != 0 {
-                let sz = lo & !3;
-                if sz != 0 {
-                    bars[i] = Bar { addr: (orig & !3) as u64, size: ((!sz).wrapping_add(1) & 0xffff) as u64, flags: BAR_IO, _pad: 0 };
-                }
-                i += 1;
-                continue;
-            }
-            let is64 = (orig >> 1) & 3 == 2;
-            let mut addr = (orig & !0xf) as u64;
-            let mut mask = (lo & !0xf) as u64 | 0xffff_ffff_0000_0000;
-            if is64 && i + 1 < n {
-                let orig_hi = self.read32(bdf, off + 4);
-                self.write32(bdf, off + 4, 0xffff_ffff);
-                let hi = self.read32(bdf, off + 4);
-                self.write32(bdf, off + 4, orig_hi);
-                addr |= (orig_hi as u64) << 32;
-                mask = (hi as u64) << 32 | (lo & !0xf) as u64;
-            }
-            if lo & !0xf != 0 {
+        let sized = crate::barsize::size_bars(n, |off| self.read32(bdf, off as u16), |off, v| self.write32(bdf, off as u16, v));
+        self.write16(bdf, 4, cmd);
+        sized.map(|b| match b {
+            None => Bar::default(),
+            Some(b) => {
                 let mut flags = 0;
-                if is64 {
+                if b.is_io {
+                    flags |= BAR_IO;
+                }
+                if b.is64 {
                     flags |= BAR_64;
                 }
-                if orig & 8 != 0 {
+                if b.prefetch {
                     flags |= BAR_PREFETCH;
                 }
-                bars[i] = Bar { addr, size: (!mask).wrapping_add(1), flags, _pad: 0 };
+                Bar { addr: b.addr, size: b.size, flags, _pad: 0 }
             }
-            i += if is64 { 2 } else { 1 };
-        }
-        self.write16(bdf, 4, cmd);
-        bars
+        })
     }
 }
 

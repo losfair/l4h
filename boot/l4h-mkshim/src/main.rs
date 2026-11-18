@@ -28,6 +28,9 @@ mod acpi;
 #[path = "../../../host/l4h-root/src/acs.rs"]
 #[allow(dead_code)]
 mod acs;
+// Root's BAR sizing, unchanged.
+#[path = "../../../host/l4h-root/src/barsize.rs"]
+mod barsize;
 mod boot;
 mod conf;
 mod cpu;
