@@ -1482,6 +1482,10 @@ asks for one), `l4h-root` draws a read-only status screen every second:
 host, VMs (from vmmgr's status page), disks, switches. It redraws changed
 character cells only, in an 8x8 public-domain font. With `fb_console` it
 keeps to the upper half, and logd draws host output on the lower (§10.4).
+Root carves the framebuffer's own pages only, from however many device
+Untypeds hold them, never an aligned power-of-two block around it: across
+a large boundary that block would be GiBs of other devices' BARs, and
+more frames than root has slots.
 
 The title bar reads "l4h" until dom0 gives it other text, such as the
 machine's name, with `l4hctl dashboard-title` (`CTL_DASHBOARD_TITLE`): at
