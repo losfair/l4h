@@ -1,4 +1,4 @@
-//! nicd for Google Virtual NIC (gVNIC), as on GCE C3, N4, C4 and later:
+//! nicd for Google Virtual NIC (gVNIC), using DQO RDA or GQI QPL:
 //! registers in BAR 0, doorbells in BAR 2, two notification blocks and the
 //! management vector in MSI-X.
 

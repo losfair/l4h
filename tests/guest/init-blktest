@@ -41,8 +41,7 @@ for i in 1 2 3 4 5 6 7 8; do
 done
 echo "BLKTEST: parallel direct I/O through the I/O pool: ok"
 umount /mnt
-# A second disk on the same controller (BLKTEST_DEV=scsi-luns): its
-# writes stay on it.
+# Writes to the second disk on a shared controller stay on that disk.
 if [ -b /dev/vdb ]; then
     echo "BLKTEST: vdb $(cat /sys/block/vdb/size) sectors"
     mount -t ext4 /dev/vda /mnt || fail "vda for concurrent disks"

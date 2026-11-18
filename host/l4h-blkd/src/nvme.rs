@@ -1,4 +1,4 @@
-//! NVMe PCI driver: one I/O queue pair, namespace 1.
+//! NVMe PCI driver: one I/O queue pair shared by the controller's namespaces.
 //!
 //! A request becomes one or more NVMe commands: pieces join a command as
 //! long as they fit one PRP list (every piece but the first starts on a
@@ -16,6 +16,7 @@ use crate::{DevInfo, Driver, MAX_PIECES, MAX_REQUEST, Seg};
 const PAGE: u64 = 4096;
 
 const REG_CAP: usize = 0x00;
+const REG_VS: usize = 0x08;
 const REG_CC: usize = 0x14;
 const REG_CSTS: usize = 0x1c;
 const REG_AQA: usize = 0x24;
@@ -40,6 +41,9 @@ const ADMIN_CREATE_SQ: u8 = 0x01;
 const ADMIN_CREATE_CQ: u8 = 0x05;
 const ADMIN_IDENTIFY: u8 = 0x06;
 const ADMIN_SET_FEATURES: u8 = 0x09;
+const IDENTIFY_NAMESPACE: u32 = 0;
+const IDENTIFY_CONTROLLER: u32 = 1;
+const IDENTIFY_ACTIVE_NAMESPACES: u32 = 2;
 
 struct Sq {
     va: usize,
@@ -120,6 +124,13 @@ struct Request {
     status: u32,
 }
 
+#[derive(Clone, Copy)]
+struct Namespace {
+    id: u32,
+    lba_shift: u32,
+    blocks: u64,
+}
+
 pub struct Nvme {
     id: u32,
     io_errors: l4h_rt::ErrorLimit,
@@ -137,8 +148,7 @@ pub struct Nvme {
     prp_len: usize,
     reqs: [Request; MAX_REQS],
     free_reqs: ArrayVec<u16, MAX_REQS>,
-    lba_shift: u32,
-    nsze: u64,
+    namespaces: ArrayVec<Namespace, { blk::MAX_UNITS }>,
     max_bytes: u64,
     /// Pages a command may span: its PRP list has one entry fewer.
     cmd_pages: u64,
@@ -215,8 +225,7 @@ impl Nvme {
             prp_len: 0,
             reqs: [Request::default(); MAX_REQS],
             free_reqs,
-            lba_shift: 9,
-            nsze: 0,
+            namespaces: ArrayVec::new(),
             max_bytes: (MAX_CMD_PAGES as u64 - 1) * PAGE,
             cmd_pages: 0,
             max_cmds: 0,
@@ -224,7 +233,7 @@ impl Nvme {
         };
 
         // Identify controller: transfer limit, volatile write cache.
-        n.admin(Cmd { opcode: ADMIN_IDENTIFY, prp1: n.ident.1, cdw10: 1, ..Default::default() });
+        n.admin(Cmd { opcode: ADMIN_IDENTIFY, prp1: n.ident.1, cdw10: IDENTIFY_CONTROLLER, ..Default::default() });
         let id_ctrl = Mmio(n.ident.0);
         let mdts = id_ctrl.r8(77);
         // MDTS (the device's) in units of 2^(12 + CAP.MPSMIN): from 2^64 on, no limit.
@@ -250,15 +259,7 @@ impl Nvme {
         if need > cids {
             l4h_rt::log!("nvme {:#x}: {} command ids for up to {} per request: large requests may fail", id, cids, need);
         }
-        // Identify namespace 1: size and LBA format.
-        n.admin(Cmd { opcode: ADMIN_IDENTIFY, nsid: 1, prp1: n.ident.1, cdw10: 0, ..Default::default() });
-        let id_ns = Mmio(n.ident.0);
-        n.nsze = id_ns.r64(0);
-        let flbas = (id_ns.r8(26) & 0xf) as usize;
-        n.lba_shift = id_ns.r8(128 + 4 * flbas + 2) as u32;
-        if !(9..=12).contains(&n.lba_shift) {
-            panic!("nvme {:#x}: unsupported LBA size 2^{}", id, n.lba_shift);
-        }
+        n.discover_namespaces(regs.r32(REG_VS), id_ctrl.r32(516));
         // One I/O queue pair on interrupt vector 0.
         n.admin(Cmd { opcode: ADMIN_SET_FEATURES, cdw10: 7, cdw11: 0, ..Default::default() });
         n.admin(Cmd {
@@ -278,8 +279,61 @@ impl Nvme {
         n
     }
 
+    fn discover_namespaces(&mut self, version: u32, max_nsid: u32) {
+        let mut ids = ArrayVec::<u32, { blk::MAX_UNITS }>::new();
+        let data = Mmio(self.ident.0);
+        if version >= 0x0001_0100 && self.admin_status(Cmd {
+            opcode: ADMIN_IDENTIFY, prp1: self.ident.1, cdw10: IDENTIFY_ACTIVE_NAMESPACES, ..Default::default()
+        }) == 0 {
+            let mut last = 0;
+            for i in 0..blk::MAX_UNITS {
+                let id = data.r32(4 * i);
+                // The active namespace list is ascending, with zero padding.
+                if id <= last || id == u32::MAX {
+                    break;
+                }
+                let _ = ids.push(id);
+                last = id;
+            }
+        } else {
+            // NVMe 1.0 has no active namespace list. Probe contiguous
+            // IDs up to the controller's reported maximum and our unit limit.
+            for id in 1..=max_nsid.min(blk::MAX_UNITS as u32) {
+                let _ = ids.push(id);
+            }
+        }
+        for &id in &ids {
+            let status = self.admin_status(Cmd {
+                opcode: ADMIN_IDENTIFY, nsid: id, prp1: self.ident.1, cdw10: IDENTIFY_NAMESPACE, ..Default::default()
+            });
+            if status != 0 {
+                l4h_rt::log!("nvme {:#x}: namespace {} identify failed: status {:#x}", self.id, id, status);
+                continue;
+            }
+            let blocks = data.r64(0);
+            if blocks == 0 {
+                continue;
+            }
+            let flbas = (data.r8(26) & 0xf) as usize;
+            let lba_shift = data.r8(128 + 4 * flbas + 2) as u32;
+            if !(9..=12).contains(&lba_shift) {
+                l4h_rt::log!("nvme {:#x}: namespace {} has unsupported LBA size 2^{}", self.id, id, lba_shift);
+                continue;
+            }
+            let _ = self.namespaces.push(Namespace { id, lba_shift, blocks });
+        }
+        l4h_rt::info!("nvme {:#x}: version {:#x}, {} namespaces found", self.id, version, self.namespaces.len());
+    }
+
+    fn admin(&mut self, c: Cmd) {
+        let status = self.admin_status(c);
+        if status != 0 {
+            panic!("nvme {:#x}: admin command {:#x} failed: status {:#x}", self.id, c.opcode, status);
+        }
+    }
+
     /// Run an admin command to completion (polled).
-    fn admin(&mut self, mut c: Cmd) {
+    fn admin_status(&mut self, mut c: Cmd) -> u16 {
         c.cid = 0xffff;
         self.asq.push(&c);
         self.asq.ring();
@@ -289,16 +343,13 @@ impl Nvme {
             res.is_some()
         });
         self.acq.ring();
-        let (_, status) = res.unwrap();
-        if status != 0 {
-            panic!("nvme {:#x}: admin command {:#x} failed: status {:#x}", self.id, c.opcode, status);
-        }
+        res.unwrap().1
     }
 
     /// Issue one I/O command for `pieces` (PRP-compatible) at `lba`.
-    fn issue(&mut self, req: u16, opcode: u8, lba: u64, pieces: &[Seg]) -> Result<(), u32> {
+    fn issue(&mut self, req: u16, opcode: u8, ns: Namespace, lba: u64, pieces: &[Seg]) -> Result<(), u32> {
         let bytes: u64 = pieces.iter().map(|p| p.len as u64).sum();
-        if bytes & ((1 << self.lba_shift) - 1) != 0 {
+        if bytes & ((1 << ns.lba_shift) - 1) != 0 {
             return Err(blk::STATUS_IOERR);
         }
         let cid = self.free_cids.pop().ok_or(blk::STATUS_IOERR)?;
@@ -324,11 +375,11 @@ impl Nvme {
             1 => Mmio(list_va).r64(0),
             _ => list_pa,
         };
-        let nlb = (bytes >> self.lba_shift) as u32 - 1;
+        let nlb = (bytes >> ns.lba_shift) as u32 - 1;
         self.sq.push(&Cmd {
             opcode,
             cid,
-            nsid: 1,
+            nsid: ns.id,
             prp1: pieces[0].pa,
             prp2,
             cdw10: lba as u32,
@@ -344,16 +395,17 @@ impl Nvme {
 
 impl Driver for Nvme {
     fn units(&self) -> usize {
-        1
+        self.namespaces.len()
     }
 
-    fn info(&self, _unit: usize) -> DevInfo {
+    fn info(&self, unit: usize) -> DevInfo {
+        let ns = self.namespaces[unit];
         DevInfo {
-            capacity: self.nsze.min(u64::MAX >> 3) << (self.lba_shift - 9),
-            block_size: 1 << self.lba_shift,
+            capacity: ns.blocks.min(u64::MAX >> 3) << (ns.lba_shift - 9),
+            block_size: 1 << ns.lba_shift,
             read_only: false,
             flush: self.flush,
-            address: 0,
+            address: u64::from(ns.id - 1),
             seg_max: MAX_PIECES,
         }
     }
@@ -362,20 +414,21 @@ impl Driver for Nvme {
         !self.free_reqs.is_empty() && self.free_cids.len() >= self.max_cmds
     }
 
-    fn start(&mut self, tag: u64, _unit: usize, op: u32, sector: u64, data: &[Seg]) -> Result<(), u32> {
+    fn start(&mut self, tag: u64, unit: usize, op: u32, sector: u64, data: &[Seg]) -> Result<(), u32> {
+        let ns = *self.namespaces.get(unit).ok_or(blk::STATUS_IOERR)?;
         let r = self.free_reqs.pop().ok_or(blk::STATUS_IOERR)?;
         self.reqs[r as usize] = Request { tag, pending: 0, status: blk::STATUS_OK };
         let result = (|| {
             if op == blk::OP_FLUSH {
-                return self.issue_flush(r);
+                return self.issue_flush(r, ns.id);
             }
             let opcode = if op == blk::OP_READ { OP_READ } else { OP_WRITE };
             // Never round a sector down to the block holding it.
-            if (sector << 9) & ((1 << self.lba_shift) - 1) != 0 {
+            if (sector << 9) & ((1 << ns.lba_shift) - 1) != 0 {
                 return Err(blk::STATUS_IOERR);
             }
-            let mut lba = (sector << 9) >> self.lba_shift;
-            let (max_bytes, cmd_pages, block) = (self.max_bytes, self.cmd_pages, (1u64 << self.lba_shift) - 1);
+            let mut lba = (sector << 9) >> ns.lba_shift;
+            let (max_bytes, cmd_pages, block) = (self.max_bytes, self.cmd_pages, (1u64 << ns.lba_shift) - 1);
             let len = |cmd: &[Seg]| cmd.iter().map(|p| p.len as u64).sum::<u64>();
             // Count the commands first: all are issued, or none.
             let mut cmds = 0;
@@ -387,8 +440,8 @@ impl Driver for Nvme {
                 return Err(blk::STATUS_IOERR);
             }
             split(data, max_bytes, cmd_pages, |cmd| {
-                self.issue(r, opcode, lba, cmd)?;
-                lba += len(cmd) >> self.lba_shift;
+                self.issue(r, opcode, ns, lba, cmd)?;
+                lba += len(cmd) >> ns.lba_shift;
                 Ok(())
             })
         })();
@@ -478,9 +531,9 @@ fn split(data: &[Seg], max_bytes: u64, cmd_pages: u64, mut f: impl FnMut(&[Seg])
 }
 
 impl Nvme {
-    fn issue_flush(&mut self, r: u16) -> Result<(), u32> {
+    fn issue_flush(&mut self, r: u16, nsid: u32) -> Result<(), u32> {
         let cid = self.free_cids.pop().ok_or(blk::STATUS_IOERR)?;
-        self.sq.push(&Cmd { opcode: OP_FLUSH, cid, nsid: 1, ..Default::default() });
+        self.sq.push(&Cmd { opcode: OP_FLUSH, cid, nsid, ..Default::default() });
         self.cmd_req[cid as usize] = r;
         self.cid_busy[cid as usize] = true;
         self.reqs[r as usize].pending += 1;

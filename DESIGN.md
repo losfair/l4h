@@ -2220,7 +2220,9 @@ extent.
   and each command keeps its queue for completion and retry. Provisioning
   uses queue zero. Indirect descriptors are used when offered; otherwise
   each command slot owns a fixed run of ring descriptors.
-- **NVMe** uses namespace 1 and one I/O queue pair of up to 1024 entries.
+- **NVMe** discovers up to 16 active namespaces, each published as a disk.
+  Controllers without the active namespace list are probed in namespace
+  ID order. All namespaces share one I/O queue pair of up to 1024 entries.
   A request becomes commands cut at the device's transfer limit (MDTS) and
   wherever its pieces cannot share one PRP list; it starts only once there
   is a command id for each, so none fails part way. The ids (and PRP lists,
@@ -2528,13 +2530,16 @@ are not filtered.
   however its offload metadata is completed later.
 
 **gVNIC.** `l4h-nicd-gvnic/src/gvnic.rs` follows Linux `gve` with the DQO queue
-format and raw DMA addressing (DQO RDA), which C3 and later offer; a device
-without it (GQI only) makes its nicd refuse it. It configures the device through a
-big-endian admin queue in BAR 0 and rings little-endian doorbells in BAR 2.
-One TX queue with its completion queue, one RX buffer queue (2 KiB buffers)
-with its completion queue. As Linux, it configures a notification block per
-MSI-X entry but the last; the TX and RX blocks share the driver's vector and the
-management vector stays masked. A DQO block masks itself when it fires;
+format and raw DMA addressing (DQO RDA), which C3 and later offer. N2D
+Confidential VMs offer GQI with registered queue page lists (GQI QPL).
+The driver registers DMA pages for each queue and uses offsets into
+those lists in its packet descriptors. GQI uses software checksums and
+segmentation. The driver uses the same big-endian admin queue for both
+formats. BAR 2 doorbells are big-endian for GQI and little-endian for DQO.
+DQO has one TX queue with its completion queue and one RX buffer queue
+(2 KiB buffers) with its completion queue. The driver configures a notification
+block per MSI-X entry except the last. The TX and RX blocks share the driver's
+vector, and the management vector stays masked. A DQO block masks itself when it fires;
 the driver re-arms RX after draining and TX only while frames wait. Transmit:
 checksum offload and TSO through a context descriptor (the TCP checksum
 field loses the length, as in `gve_prep_tso`), for MSS 88–9728 and headers
@@ -4927,6 +4932,9 @@ injects these failures in a host built with `L4H_TEST_INJECT=1`;
      (0.9.5) device, and N2 attaches the boot disk and SCSI persistent disks
      to one legacy virtio-scsi controller without indirect descriptors, as
      targets 1, 2, ... (LUN 0), each a host disk.
+   - N2D Confidential VMs use gVNIC (GQI QPL) and attach persistent disks
+     as NVMe namespaces on one controller. L4H discovers the active
+     namespaces and publishes each as a separate host disk.
    - C3, C3D, N4, C4 and later need gVNIC (DQO) and attach every disk, the
      boot disk included, as NVMe. C3's gVNIC is revision 0 (admin queue by
      page frame number) with DQO RDA, 1024-entry rings, MTU 1460 and 9 MSI-X
@@ -5712,8 +5720,24 @@ device could not be stopped from writing is not revoked but kept, with the
 CNode of its frames (an Untyped of its own), in global slots for good
 (`Alloc::reclaim_pinning`). Root leaves a virtio-balloon unused there: a
 page the hypervisor dropped reads back as the decryption of zeroes, not as
-zeroes. `tools/gce-image.sh --sev` prints the commands for an N2D
-Confidential VM with SEV.
+zeroes.
+
+For an AMD SEV Confidential VM, build `l4h-fl4.efi` with
+`tools/build-fl4-efi.sh`, then package it as a UEFI disk image:
+
+```sh
+tools/mkimage.sh -e build/efi/l4h-fl4.efi -i dom0.cpio.gz build/l4h-sev.raw
+tools/gce-image.sh --sev build/l4h-sev.raw l4h-sev
+```
+
+The printed deployment commands select base AMD SEV, gVNIC and an NVMe
+boot disk. Use NVMe for any additional disks. The smoke test builds a
+test dom0 and checks the SEV configuration, FL4's active C-bit, shared DMA,
+networking and NVMe write/readback:
+
+```sh
+tests/gce-test.sh --sev PROJECT
+```
 
 Rebuild the host with this `SEL4_PREFIX`; its build also compiles the small
 ABI provider against FL4's libsel4. Linux and modules remain byte-identical

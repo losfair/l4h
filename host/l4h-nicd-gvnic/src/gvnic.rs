@@ -1,14 +1,15 @@
 //! Google Virtual NIC (gVNIC) driver, after Linux `gve`.  GCE machine
 //! types from the third generation on (C3, N4, C4, ...) have only this NIC.
-//! The driver uses the DQO queue format with raw DMA addressing (DQO_RDA),
+//! The driver prefers the DQO queue format with raw DMA addressing (DQO_RDA),
 //! which those machines offer: one TX queue with its completion queue and
 //! one RX buffer queue with its completion queue.  Frames are copied
 //! between the switch and DMA buffers owned by this driver, as for
-//! virtio-net.
+//! virtio-net. N2D Confidential VMs use GQI with queue page lists (gqi.rs).
 //!
 //! The device is configured through big-endian registers in BAR 0 and an
-//! admin queue of 64-byte commands; queue and interrupt doorbells are
-//! little-endian words in BAR 2.  Each notification block is an MSI-X
+//! admin queue of 64-byte commands. Queue and interrupt doorbells in
+//! BAR 2 are little-endian for DQO and big-endian for GQI.
+//! Each notification block is an MSI-X
 //! entry and an interrupt doorbell; as Linux, the driver configures one
 //! per MSI-X entry but the last (the management vector, left masked),
 //! puts the TX queue on the first and the RX queue on the first of the
@@ -28,12 +29,13 @@ use crate::sdk::Partial;
 use crate::sdk::offload;
 use crate::sdk::Frame;
 
+mod gqi;
 
 /// What the driver drives and needs (l4h_host::nicd::Manifest).
 pub const MANIFEST: crate::sdk::Manifest = crate::sdk::Manifest {
     bars: 1 << 0 | 1 << 2,
     msix_min: 3,
-    dma_bits: 22,
+    dma_bits: 23,
     ..crate::sdk::Manifest::empty().with_name("gvnic").with_matches(&[crate::sdk::PciMatch::id(0x1ae0, 0x0042)])
 };
 
@@ -65,7 +67,7 @@ const AQ_CREATE_RX_QUEUE: u32 = 0x6;
 const AQ_GET_PTYPE_MAP: u32 = 0xe;
 const AQ_PASSED: u32 = 1;
 const AQ_UNIMPLEMENTED: u32 = 0xffff_fffe;
-/// Driver capability flags (word 1): the DQO RDA queue format.
+const DRIVER_CAP_GQI_QPL: u64 = 1 << 0;
 const DRIVER_CAP_DQO_RDA: u64 = 1 << 3;
 const DEVICE_DESCRIPTOR_VERSION: u32 = 1;
 const OPT_GQI_RAW_ADDRESSING: u16 = 0x1;
@@ -201,6 +203,7 @@ pub struct Gvnic {
     adminq_prod: u32,
     /// Interrupt doorbell index of each notification block.
     irq_db: [u32; 2],
+    gqi: Option<gqi::Gqi>,
     ptypes: [(u8, u8); NUM_PTYPES],
 
     tx_ring: usize,
@@ -233,6 +236,9 @@ pub struct Gvnic {
 
 impl Gvnic {
     pub fn offer(&self) -> Offer {
+        if let Some(gqi) = &self.gqi {
+            return gqi.offer(self.mac);
+        }
         let mut o = Offer::plain(self.mac);
         o.tx_csum = self.csum as u32;
         if self.tso {
@@ -275,6 +281,7 @@ impl Gvnic {
             adminq: dma.alloc(ADMINQ_SIZE, 4096),
             adminq_prod: 0,
             irq_db: [0; 2],
+            gqi: None,
             ptypes: [(0, 0); NUM_PTYPES],
             tx_ring: 0,
             tx_mask: 0,
@@ -320,7 +327,7 @@ impl Gvnic {
         let mut info = [0u8; 304];
         // Unknown OS type 0 (Linux is 1), driver version 1.0.0.
         info[1] = 1;
-        info[16..24].copy_from_slice(&DRIVER_CAP_DQO_RDA.to_be_bytes());
+        info[16..24].copy_from_slice(&(DRIVER_CAP_DQO_RDA | DRIVER_CAP_GQI_QPL).to_be_bytes());
         info[48..51].copy_from_slice(b"l4h");
         info[176..179].copy_from_slice(b"l4h");
         wr(info_va, &info);
@@ -352,9 +359,10 @@ impl Gvnic {
             }
             off += 8 + len;
         }
-        if formats & (1 << OPT_DQO_RDA) == 0 {
+        let dqo = formats & (1 << OPT_DQO_RDA) != 0;
+        if !dqo && formats & (1 << OPT_GQI_QPL) == 0 {
             panic!(
-                "nicd {}: gVNIC without the DQO RDA queue format (options {:#x}: gqi raw {} gqi rda {} gqi qpl {} dqo qpl {})",
+                "nicd {}: gVNIC has no supported queue format (options {:#x}: gqi raw {} gqi rda {} gqi qpl {} dqo qpl {})",
                 n, formats, formats >> OPT_GQI_RAW_ADDRESSING & 1, formats >> OPT_GQI_RDA & 1,
                 formats >> OPT_GQI_QPL & 1, formats >> OPT_DQO_QPL & 1
             );
@@ -365,7 +373,7 @@ impl Gvnic {
 
         // Event counters and interrupt doorbell indices, written by the
         // device.
-        let (_, counters_pa) = dma.alloc(counters.max(1) * 4, 4096);
+        let (counters_va, counters_pa) = dma.alloc(counters.max(1) * 4, 4096);
         let (irq_db_va, irq_db_pa) = dma.alloc(blocks * IRQ_DB_STRIDE, 4096);
         g.exec(
             "configure device resources",
@@ -376,7 +384,7 @@ impl Gvnic {
                 .u32(20, blocks as u32)
                 .u32(24, IRQ_DB_STRIDE as u32)
                 .u32(28, 0)
-                .u8(32, QUEUE_FORMAT_DQO_RDA),
+                .u8(32, if dqo { QUEUE_FORMAT_DQO_RDA } else { gqi::QUEUE_FORMAT }),
         );
         // Doorbell indices the device writes: the driver writes the doorbells,
         // so they must be in BAR 2.
@@ -389,6 +397,14 @@ impl Gvnic {
         };
         for (db, blk) in g.irq_db.iter_mut().zip([tx_blk, rx_blk]) {
             *db = db_index(irq_db_va + blk * IRQ_DB_STRIDE);
+        }
+        if !dqo {
+            g.gqi = Some(gqi::Gqi::new(&mut g, &mut dma, &d, [tx_blk, rx_blk], counters_va, db_index));
+            l4h_rt::info!(
+                "nicd {}: {:02x}:{:02x}.{} gVNIC rev {} gqi-qpl, mtu {}, rings tx {} rx {}",
+                n, c.pci_bdf >> 8, (c.pci_bdf >> 3) & 0x1f, c.pci_bdf & 7, c.revision, mtu, tx_entries, rx_entries,
+            );
+            return g;
         }
         // Packet types: which received frames had their checksums checked.
         let (ptype_va, ptype_pa) = dma.alloc(NUM_PTYPES * 2, 4096);
@@ -576,10 +592,16 @@ impl Gvnic {
     }
 
     pub fn rx_begin(&self) {
+        if let Some(gqi) = &self.gqi {
+            gqi.rx_begin();
+        }
         // The block masked itself when it fired.
     }
 
     pub fn rx_done(&mut self) -> bool {
+        if let Some(gqi) = &mut self.gqi {
+            return gqi.rx_done();
+        }
         if self.rx_pending().is_some() {
             return false;
         }
@@ -605,6 +627,10 @@ impl Gvnic {
     }
 
     pub fn receive(&mut self, out: &mut [u8], hdr: &mut [u8; HDR]) -> Option<usize> {
+        if let Some(gqi) = &mut self.gqi {
+            *hdr = [0; HDR];
+            return gqi.receive(out, self.rx_partial);
+        }
         loop {
             let d = self.rx_pending()?;
             dma_fence(Ordering::Acquire);
@@ -717,6 +743,9 @@ impl Gvnic {
     }
 
     pub fn tx_interrupts(&mut self, on: bool) -> bool {
+        if let Some(gqi) = &mut self.gqi {
+            return gqi.tx_interrupts(on);
+        }
         if on {
             self.irq(NTFY_TX, ITR_ENABLE | (TX_ITR_US / 2) << ITR_INTERVAL_SHIFT);
         }
@@ -736,6 +765,9 @@ impl Gvnic {
     }
 
     pub fn transmit(&mut self, frame: &(impl Frame + ?Sized), hdr: &[u8; HDR]) -> bool {
+        if let Some(gqi) = &mut self.gqi {
+            return gqi.transmit(frame);
+        }
         let get16 = |off: usize| u16::from_le_bytes([hdr[off], hdr[off + 1]]) as usize;
         let gso = offload::is_gso(hdr);
         let descs = 1 + gso as u32 + frame.len().div_ceil(TX_MAX_BUF) as u32;
@@ -803,6 +835,10 @@ impl Gvnic {
     }
 
     pub fn kick_tx(&mut self) {
+        if let Some(gqi) = &mut self.gqi {
+            gqi.kick_tx();
+            return;
+        }
         if core::mem::take(&mut self.tx_kick) {
             dma_fence(Ordering::Release);
             self.doorbell(self.tx_db, self.tx_tail);

@@ -370,10 +370,8 @@ impl Host {
     }
 
     /// Number the host disks, once their blkds are ready: one per unit of
-    /// each controller, in PCI order.  A controller that did not reset
-    /// stays disabled: its disk (virtio-blk and NVMe have one) keeps its
-    /// number and fails with EIO, and a virtio-scsi one has no units to
-    /// report.
+    /// each controller, in PCI order. A disabled virtio-blk or NVMe
+    /// controller still reserves its first disk number, which fails with EIO.
     fn number_disks(&mut self) {
         let add = |disks: &mut ArrayVec<Disk, MAX_DISKS>, d: Disk| {
             let (unit, ctrl) = (d.unit, d.ctrl);
@@ -382,13 +380,14 @@ impl Host {
             }
         };
         for c in 0..self.ctrls.len() {
-            if matches!(self.ctrls[c].kind, l4h_host::blk::BLKD_VIRTIO | l4h_host::blk::BLKD_NVME) {
+            let ctrl = &self.ctrls[c];
+            let units = ctrl.info(0).1;
+            if ctrl.kind == l4h_host::blk::BLKD_VIRTIO || (ctrl.kind == l4h_host::blk::BLKD_NVME && units == 0) {
                 add(self.disks, Disk::new(c, 0));
                 continue;
             }
-            let units = self.ctrls[c].info(0).1;
             for u in 0..units {
-                if let Some(d) = self.ctrls[c].info(u).0 {
+                if let Some(d) = ctrl.info(u).0 {
                     add(self.disks, Disk { ctrl: c, ..d });
                 }
             }
