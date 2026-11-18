@@ -13,19 +13,19 @@ Subject: [PATCH 36/36] x86: IRQControl_SendPeer, an interrupt to another
  5 files changed, 75 insertions(+)
 
 diff --git a/include/arch/x86/arch/model/statedata.h b/include/arch/x86/arch/model/statedata.h
-index eeb488edd..76e62cc76 100644
+index eeb488edd..e98dd9d08 100644
 --- a/include/arch/x86/arch/model/statedata.h
 +++ b/include/arch/x86/arch/model/statedata.h
 @@ -86,6 +86,11 @@ extern uint16_t x86KSconsolePort;
  #endif
  #if defined(CONFIG_PRINTING) || defined(CONFIG_DEBUG_BUILD)
  extern uint16_t x86KSdebugPort;
+ #endif
 +/* APIC IDs of other kernels' CPUs that IRQControl_SendPeer may signal
 + * (peers= on the command line). */
 +#define X86_MAX_PEERS 8
 +extern word_t x86KSnumPeers;
 +extern uint32_t x86KSpeerApicIds[X86_MAX_PEERS];
- #endif
  
  extern x86_irq_state_t x86KSIRQState[];
 diff --git a/libsel4/arch_include/x86/interfaces/object-api-arch.xml b/libsel4/arch_include/x86/interfaces/object-api-arch.xml
@@ -98,16 +98,16 @@ index eb8767002..29d84e862 100644
      printf("Boot config: no_legacy_irq = %s\n", cmdline_opt->no_legacy_irq ? "true" : "false");
  
 diff --git a/src/arch/x86/model/statedata.c b/src/arch/x86/model/statedata.c
-index ecd3c6377..e30f57e3e 100644
+index ecd3c6377..c09b90159 100644
 --- a/src/arch/x86/model/statedata.c
 +++ b/src/arch/x86/model/statedata.c
 @@ -66,6 +66,8 @@ uint16_t x86KSconsolePort;
  #endif
  #if defined(CONFIG_PRINTING) || defined(CONFIG_DEBUG_BUILD)
  uint16_t x86KSdebugPort;
+ #endif
 +word_t x86KSnumPeers;
 +uint32_t x86KSpeerApicIds[X86_MAX_PEERS];
- #endif
  
  /* State data tracking what IRQ source is related to each
 diff --git a/src/arch/x86/object/interrupt.c b/src/arch/x86/object/interrupt.c
