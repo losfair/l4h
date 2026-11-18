@@ -987,8 +987,12 @@ EXPORT_SYMBOL_GPL(l4h_large_frame);
  */
 bool l4h_ram_mapped(unsigned long gpa, unsigned long size)
 {
-	unsigned long b, last = (gpa + size - 1) >> L4H_BLOCK_SHIFT;
+	unsigned long b, last;
 
+	/* No range, or one that wraps: none of RAM's. */
+	if (!size || gpa + size < gpa)
+		return false;
+	last = (gpa + size - 1) >> L4H_BLOCK_SHIFT;
 	if (!blocks)
 		return true;
 	for (b = gpa >> L4H_BLOCK_SHIFT; b <= last; b++) {
@@ -1034,13 +1038,19 @@ EXPORT_SYMBOL_GPL(l4h_frame_mappable);
  * progress (wait_nofault_accesses()), so none that found it mapped runs
  * after its frames are revoked.
  */
-bool l4h_nofault_begin(unsigned long addr, unsigned long size)
+bool l4h_nofault_begin(unsigned long addr, unsigned long size, bool write)
 {
+	/* Not preempted in between: the check's xa_load() is under RCU, and
+	 * a waiter (wait_nofault_accesses(), maybe holding kernel_as_lock
+	 * with interrupts off) never spins on a task that is not running,
+	 * while what runs instead on this CPU wants that lock. */
+	preempt_disable_notrace();
 	atomic_inc(&nofault_accesses);
 	smp_mb__after_atomic();
-	if (l4h_kernel_range_ok(addr, size))
+	if (l4h_kernel_range_ok(addr, size, write))
 		return true;
 	atomic_dec(&nofault_accesses);
+	preempt_enable_notrace();
 	return false;
 }
 EXPORT_SYMBOL(l4h_nofault_begin);
@@ -1049,15 +1059,22 @@ void l4h_nofault_end(void)
 {
 	smp_mb__before_atomic();
 	atomic_dec(&nofault_accesses);
+	preempt_enable_notrace();
 }
 EXPORT_SYMBOL(l4h_nofault_end);
 
 static void wait_nofault_accesses(void)
 {
-	/* Orders the caller's BLK_BUSY before the read of the count. */
+	/* Orders the caller's BLK_BUSY (or erase of a kernel_as entry,
+	 * vspace.c) before the read of the count. */
 	smp_mb();
 	while (atomic_read(&nofault_accesses))
 		cpu_relax();
+}
+
+void l4h_wait_nofault_accesses(void)
+{
+	wait_nofault_accesses();
 }
 
 /* ---- conversion between frame blocks and object blocks */

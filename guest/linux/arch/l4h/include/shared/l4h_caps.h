@@ -22,6 +22,9 @@ bool l4h_objmem_wait(void);
 void l4h_objmem_oom(void);
 /* Is guest RAM [gpa, gpa+size) in the direct map (not an object block)? */
 bool l4h_ram_mapped(unsigned long gpa, unsigned long size);
+/* Wait for the *_nofault accesses between their check and their access
+ * (l4h_nofault_begin()): before a frame they may have found is deleted. */
+void l4h_wait_nofault_accesses(void);
 /* May page `gpa` be mapped through L4H_FRAME_CPTR (RAM with its frames,
  * not the kernel's image if `writable`)? */
 bool l4h_frame_mappable(unsigned long gpa, bool writable);
