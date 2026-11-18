@@ -727,13 +727,14 @@ impl Pci {
         sized.map(|b| b.map_or(Bar::default(), |b| Bar { addr: b.addr, size: b.size, is_io: b.is_io }))
     }
 
-    /// The MSI-X table and pending bits of `d`, where its BARs put them.
-    pub fn msix_blocks(&self, d: &Device) -> [Option<(u64, u64)>; 2] {
-        let Some(m) = d.msix else { return [None; 2] };
-        let ctrl = self.read16(d.bus, d.dev, d.func, m.cap + 2);
-        let pba = self.read32(d.bus, d.dev, d.func, m.cap + 8);
-        let bar = |i: u8| d.bars.get(i as usize).filter(|b| b.size != 0 && !b.is_io).map(|b| b.addr);
-        l4h_host::trust::msix_blocks(ctrl, m.table_offset | m.table_bar as u32, pba, bar)
+    /// Every MSI-X table and pending bit array of `d`, of each MSI-X
+    /// capability it has, where its BARs put them, bridges' too, each
+    /// passed to `push`: false if they may not be all
+    /// (trust::function_msix_blocks).  Not `d.msix`, which is only what a
+    /// driver can use.
+    pub fn msix_blocks(&self, d: &Device, push: impl FnMut((u64, u64)) -> bool) -> bool {
+        // Offsets below 0x100: function_msix_blocks reads no further.
+        l4h_host::trust::function_msix_blocks(|off| self.read32(d.bus, d.dev, d.func, off as u8), push)
     }
 
     /// The capabilities of a function with BARs `bars`.  The device says

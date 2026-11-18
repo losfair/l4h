@@ -281,6 +281,7 @@ support, since no device is passed into a guest.
 | 0014 | (x86, MCS) Every core re-measured the TSC and APIC timer rates from one PIT wraparound and overwrote the shared values; a virtualised PIT can end that wait early (about one GCE boot in three). Rates are measured once, on the boot core, as the median of 5 wraparounds. Countdown conversion from TSC to APIC ticks uses both rates rather than their truncated ratio, and a delay too long for the 32-bit count fires early and is reprogrammed. |
 | 0028 | (x86_64) seL4's user segments are laid out as Linux's, so `sysretq` and `iretq` both return with CS 0x33 / SS 0x2b. `sysretq` previously returned with a data-slot CS that faulted when user code reloaded it with `iretq` (.NET's `RtlRestoreContext`). |
 | 0045 | (x86_64) A frame map that replaces a present 4 KiB, 2 MiB or 1 GiB leaf in place (a rights change, or another frame at that address) invalidated only the paging-structure caches. With PCIDs that reloads CR3 for the ASID, a full flush, but without them (the `xapic-nopcid` kernel) it is an `INVLPG` of address 0, which leaves the remapped address's leaf entry cached on the cores running that VSpace: a page write-protected by `fork` or `mprotect` stayed writable for the process's threads on other cores. The address's translation is now invalidated on every core the VSpace ran on. |
+| 0046 | (x86) The kernel reserved the register pages of only the I/O APICs it drives: none with `no_legacy_irq`, otherwise the first `KernelMaxNumIOAPIC` (1) the MADT lists. Every other I/O APIC's page was free user device memory, from which its redirection entries send any vector, NMI or INIT to any CPU. Every MADT I/O APIC's page (up to 64; more refuses to boot, as FL4 does) is now reserved, only the parts no reserved region covers yet so the regions stay sorted and apart; which I/O APICs the kernel drives is unchanged. |
 
 **Performance:**
 
@@ -4464,7 +4465,12 @@ runs the secondary's ActivateCredential calls (the relay):
     (the balloon's included), and not the HPET's registers (0xfed00000 and
     the HPET table's): its comparators send MSIs that no IOMMU remaps
     (AMD-Vi passes a special device's through), with which the AML could
-    send any vector, NMI or INIT to any CPU. On
+    send any vector, NMI or INIT to any CPU. Nor, for the same reason, the
+    I/O APICs' and local APICs' registers: 0xfec00000–0xfec00fff,
+    0xfee00000–0xfeefffff and the page of every I/O APIC the MADT lists
+    (seL4 keeps those it does not drive out of device memory too, patch
+    0046); if the MADT cannot be read whole or lists more than 32, it
+    serves no memory write. On
     a machine split into partitions the others' RAM is device memory to this
     kernel and the descriptor does not list it, so there root serves memory
     only where none can be: the chipset's addresses from 0xfec00000 to 4 GiB,
@@ -4487,12 +4493,18 @@ runs the secondary's ActivateCredential calls (the relay):
     drive, SR-IOV, ATS, Resizable BAR), and to the MSI and MSI-X
     capabilities; in memory it refuses
     writes to every function's MSI-X table and pending bits, as found at
-    boot (none at all if there are more than root keeps): a function the
+    boot, of every MSI-X capability of every function, bridges' (whose two
+    BARs root reads but never sizes) included, wherever its BARs put them
+    (none at all if there are more than root keeps, or a capability list it
+    cannot walk): a function the
     firmware left mastering the bus would send the AML's message as an
-    interrupt, where none is remapped any vector to any CPU. Root keeps up
+    interrupt, where none is remapped any vector to any CPU. For the same
+    reason it serves no memory write if the MCFG has a segment other than
+    0, whose functions root never reads. Root keeps up
     to 16 ECAM windows; if the MCFG lists more, or
     cannot be read, it serves no memory write at all, since any could be a
-    configuration write. Refused reads return all ones, and root logs refusals
+    configuration write. On a machine split into partitions, it refuses
+    configuration writes to every function that is not the partition's. Refused reads return all ones, and root logs refusals
     through `log::RateLimit`.
   - The interpreter runs in trustd, not root, because it can panic on some
     AML. If trustd's main thread faults, root suspends only it, revokes the

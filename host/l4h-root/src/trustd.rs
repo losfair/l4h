@@ -88,11 +88,20 @@ struct Hw {
     /// write is served: any could be a configuration write.
     ecam: ArrayVec<trust::Ecam, { trust::MAX_ECAM }>,
     ecam_complete: bool,
+    /// The MCFG has a window of a segment other than 0, whose functions
+    /// root never reads: their MSI-X tables are not in Host::msix_blocks,
+    /// so no memory write is served.
+    other_segments: bool,
     /// I/O ports that reset the machine, put it to sleep, enter SMM or
     /// program the legacy interrupt controllers and timer: (first, count).
     ports: ArrayVec<(usize, usize), 24>,
-    /// Memory it never reaches: the HPETs' registers (trust::HPET_DEFAULT).
-    mmio: ArrayVec<(u64, u64), 2>,
+    /// Memory it never reaches: the HPETs' registers (trust::HPET_DEFAULT),
+    /// the I/O APICs' and the local APICs' (trust::IOAPIC_DEFAULT,
+    /// trust::LAPIC_MSI, and each I/O APIC's page the MADT lists).
+    mmio: ArrayVec<(u64, u64), { 4 + trust::MAX_IOAPIC_PAGES }>,
+    /// Whether `mmio` has every I/O APIC: if the MADT cannot be read, or
+    /// lists more than root keeps, no memory write is served.
+    mmio_complete: bool,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -100,19 +109,38 @@ impl Hw {
     /// From the firmware's tables, read with `phys`.
     fn find(bootinfo: &sel4::BootInfoPtr, phys: &mut crate::acpi::Phys) -> Hw {
         let mut hw = Hw {
-            frames: crate::acpi::Frames::hw(), ecam: ArrayVec::new(), ecam_complete: true, ports: ArrayVec::new(),
-            mmio: ArrayVec::new(),
+            frames: crate::acpi::Frames::hw(), ecam: ArrayVec::new(), ecam_complete: true, other_segments: false,
+            ports: ArrayVec::new(), mmio: ArrayVec::new(), mmio_complete: true,
         };
         for r in trust::HW_REFUSED_PORTS {
             let _ = hw.ports.push(r);
         }
-        // The HPET where PCs have it, and where its table says it is.
-        let _ = hw.mmio.push(trust::HPET_DEFAULT);
+        // The HPET where PCs have it, and where its table says it is; the
+        // chipset's I/O APIC's page, the local APICs' megabyte, and every
+        // I/O APIC the MADT lists elsewhere: a seL4 kernel may have left one in device
+        // memory (another kernel's, or one past those it drives).
+        for b in [trust::HPET_DEFAULT, trust::IOAPIC_DEFAULT, trust::LAPIC_MSI] {
+            let _ = hw.mmio.push(b);
+        }
         let mut buf = [0; 56];
         if let Some(b) = crate::acpi::find(bootinfo, phys, b"HPET", &mut buf).and_then(trust::hpet_block) {
             if b != trust::HPET_DEFAULT {
                 let _ = hw.mmio.push(b);
             }
+        }
+        let mut buf = [0; 32 << 10];
+        let (pages, complete) = match crate::acpi::find_len(bootinfo, phys, b"APIC", &mut buf) {
+            Ok(Some((t, len))) => trust::madt_ioapic_pages(t, len),
+            _ => (ArrayVec::new(), false),
+        };
+        hw.mmio_complete = complete;
+        for &(base, size) in pages.iter() {
+            if !trust::hw_within(base as usize, size as usize, trust::IOAPIC_DEFAULT.0, trust::IOAPIC_DEFAULT.1) {
+                hw.mmio_complete &= hw.mmio.push((base, size)).is_ok();
+            }
+        }
+        if !hw.mmio_complete {
+            log!("l4h-root: the MADT cannot be read, or lists more than {} I/O APICs: the TPM's AML gets no memory writes", trust::MAX_IOAPIC_PAGES);
         }
         let mut buf = [0; crate::acpi::FADT_LEN];
         if let Some(f) = crate::acpi::find(bootinfo, phys, b"FACP", &mut buf) {
@@ -143,6 +171,10 @@ impl Hw {
         }
         if !hw.ecam_complete {
             log!("l4h-root: the MCFG cannot be read, or lists more than {} ECAM windows: the TPM's AML gets no memory writes", trust::MAX_ECAM);
+        }
+        hw.other_segments = hw.ecam.iter().any(|w| w.segment != 0);
+        if hw.other_segments {
+            log!("l4h-root: the MCFG has PCI segments other than 0, whose functions root does not read: the TPM's AML gets no memory writes");
         }
         hw
     }
@@ -708,8 +740,9 @@ pub fn done(h: &mut Host, id: usize) {
 /// - memory that is free device memory: not RAM, and not what root carved
 ///   for itself or a driver, which its frame table cannot have again.  On
 ///   a machine split into partitions, only where it is known to be no
-///   partition's memory (`partition_allows`).  Never the HPET's
-///   registers (trust::HPET_DEFAULT);
+///   partition's memory (`partition_allows`).  Never the HPET's, the
+///   I/O APICs' or the local APICs' registers (trust::HPET_DEFAULT,
+///   trust::IOAPIC_DEFAULT, trust::LAPIC_MSI, the MADT's I/O APICs);
 /// - I/O ports seL4 has not issued, other than those that reset the
 ///   machine, put it to sleep, enter SMM or program the legacy interrupt
 ///   controllers and timer (trust::HW_REFUSED_PORTS);
@@ -725,7 +758,9 @@ pub fn done(h: &mut Host, id: usize) {
 ///   memory never to an MSI-X table or its pending bits
 ///   (pci::MSIX_BLOCKS): a function the firmware left mastering the bus
 ///   would send the AML's message as an interrupt, where none is
-///   remapped any vector to any CPU.
+///   remapped any vector to any CPU.  So no memory write at all where
+///   root may not know every one: a PCI segment other than 0, a
+///   capability list it cannot walk, an MADT it cannot read whole.
 ///
 /// Refusals are logged a few a second at most.
 #[cfg(target_arch = "x86_64")]
@@ -758,14 +793,20 @@ fn hw_access(h: &mut Host, op: u64, addr: usize, off: usize, width: usize, value
                 return Err("not known to be outside the partitions' memory");
             }
             if hw.mmio.iter().any(|&(base, size)| trust::hw_meets(addr, width, base, size)) {
-                return Err("the HPET, whose interrupts the IOMMU does not remap");
+                return Err("the HPET or an APIC, whose interrupts the IOMMU does not remap");
             }
             if write {
                 if !hw.ecam_complete {
                     return Err("a memory write, with more ECAM windows than root knows");
                 }
+                if hw.other_segments {
+                    return Err("a memory write, with PCI segments root does not read");
+                }
+                if !hw.mmio_complete {
+                    return Err("a memory write, with I/O APICs root may not know of");
+                }
                 if !h.msix_complete {
-                    return Err("a memory write, with more MSI-X tables than root knows");
+                    return Err("a memory write, with MSI-X tables root may not know of");
                 }
                 if h.msix_blocks.iter().any(|&(base, size)| trust::hw_meets(addr, width, base, size)) {
                     return Err("a function's MSI-X table or pending bits");
@@ -870,10 +911,17 @@ fn partition_allows(addr: usize, width: usize) -> bool {
 /// (the host bridge's and the PCI bridges' bus numbers and windows route
 /// the others; an ISA or LPC bridge's registers place the chipset's
 /// power and reset blocks), and the function that holds the FADT's reset
-/// register.  So is a function root cannot read.
+/// register.  So is a function root cannot read, and on a machine split
+/// into partitions, one that is not this partition's.
 #[cfg(target_arch = "x86_64")]
 fn managed(h: &Host, bus: u8, dev: u8, func: u8) -> bool {
     let is = |d: &crate::pci::Device| (d.bus, d.dev, d.func) == (bus, dev, func);
+    // Another partition's function, or one in none: not this one's to let
+    // the AML write (root reads another's bridges, and partition 0 every
+    // function).
+    if !crate::pci::ours((bus as u16) << 8 | (dev as u16) << 3 | func as u16) {
+        return true;
+    }
     if h.ctrls.iter().any(|c| is(&c.pci)) || crate::nicd::nics().iter().any(|n| is(&n.pci)) || crate::usb::ctrls().iter().any(|c| is(&c.pci)) {
         return true;
     }

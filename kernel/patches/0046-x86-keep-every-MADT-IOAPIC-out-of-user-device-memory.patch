@@ -1,0 +1,185 @@
+From ca72657b578c989f29f0423621d6890a430a4ef7 Mon Sep 17 00:00:00 2001
+From: l4h <l4h@localhost>
+Date: Wed, 18 Nov 2026 20:40:56 +0000
+Subject: [PATCH] x86: keep every MADT I/O APIC out of user device memory
+
+The kernel reserved the register pages of the I/O APICs it drives only: with no_legacy_irq (the partitions after the first, whose I/O APICs are another kernel's) none, and otherwise the first CONFIG_MAX_NUM_IOAPIC (1 by default) of those the MADT lists. Every other I/O APIC's page was free user device memory, and an I/O APIC's redirection entries send any vector, NMI or INIT to any CPU, another kernel's included, which no IOMMU remaps for an I/O APIC the kernel does not drive. Record every MADT I/O APIC, up to MAX_NUM_MADT_IOAPIC, reserve each one's page once the kernel window is mapped (only the parts no reserved region covers yet, so that the reserved regions stay sorted and apart), and refuse to boot when the MADT lists more, as FL4 does. Which I/O APICs the kernel drives is unchanged.
+---
+ include/arch/x86/arch/bootinfo.h        |  6 ++-
+ include/arch/x86/arch/kernel/boot_sys.h |  6 +++
+ include/plat/pc99/plat/machine/acpi.h   |  4 +-
+ src/arch/x86/kernel/boot_sys.c          | 50 ++++++++++++++++++++++++-
+ src/plat/pc99/machine/acpi.c            | 10 ++++-
+ 5 files changed, 72 insertions(+), 4 deletions(-)
+
+diff --git a/include/arch/x86/arch/bootinfo.h b/include/arch/x86/arch/bootinfo.h
+index b039b4316..1b97d278f 100644
+--- a/include/arch/x86/arch/bootinfo.h
++++ b/include/arch/x86/arch/bootinfo.h
+@@ -16,5 +16,9 @@
+  *      - iommus (MAX_NUM_DRHU)
+  *      - apic (1)
+  *      - the reserved MSI region (1)
++ * - up to 2 for each other I/O APIC the MADT lists (MAX_NUM_MADT_IOAPIC),
++ *   kept from user device memory but not driven: the parts of its page
++ *   the regions above do not cover
+  */
+-#define MAX_NUM_RESV_REG (MAX_NUM_FREEMEM_REG + CONFIG_MAX_NUM_IOAPIC + MAX_NUM_DRHU + 2)
++#define MAX_NUM_MADT_IOAPIC 64
++#define MAX_NUM_RESV_REG (MAX_NUM_FREEMEM_REG + CONFIG_MAX_NUM_IOAPIC + MAX_NUM_DRHU + 2 + 2 * MAX_NUM_MADT_IOAPIC)
+diff --git a/include/arch/x86/arch/kernel/boot_sys.h b/include/arch/x86/arch/kernel/boot_sys.h
+index d53402c25..7b9633ec0 100644
+--- a/include/arch/x86/arch/kernel/boot_sys.h
++++ b/include/arch/x86/arch/kernel/boot_sys.h
+@@ -6,6 +6,7 @@
+ 
+ #pragma once
+ 
++#include <arch/bootinfo.h>
+ #include <arch/kernel/multiboot.h>
+ #include <arch/kernel/multiboot2.h>
+ 
+@@ -16,6 +17,11 @@ typedef struct boot_state {
+     ui_info_t    ui_info;     /* info about userland images */
+     uint32_t     num_ioapic;  /* number of IOAPICs detected */
+     paddr_t      ioapic_paddr[CONFIG_MAX_NUM_IOAPIC];
++    /* Every I/O APIC the MADT lists, driven or not (num_madt_ioapic counts
++     * them all, the first MAX_NUM_MADT_IOAPIC are kept): none is ever
++     * user device memory. */
++    uint32_t     num_madt_ioapic;
++    paddr_t      madt_ioapic_paddr[MAX_NUM_MADT_IOAPIC];
+     uint32_t     num_drhu; /* number of IOMMUs */
+     paddr_t      drhu_list[MAX_NUM_DRHU]; /* list of physical addresses of the IOMMUs */
+     acpi_rmrr_list_t rmrr_list;
+diff --git a/include/plat/pc99/plat/machine/acpi.h b/include/plat/pc99/plat/machine/acpi.h
+index f6517ab04..e3e5dc549 100644
+--- a/include/plat/pc99/plat/machine/acpi.h
++++ b/include/plat/pc99/plat/machine/acpi.h
+@@ -59,7 +59,9 @@ uint32_t acpi_madt_scan(
+     acpi_rsdp_t *acpi_rsdp,
+     cpu_id_t    *cpu_list,
+     uint32_t    *num_ioapic,
+-    paddr_t     *ioapic_addrs
++    paddr_t     *ioapic_addrs,
++    uint32_t    *num_madt_ioapic,
++    paddr_t     *madt_ioapic_addrs
+ );
+ 
+ typedef struct acpi_rmrr_entry {
+diff --git a/src/arch/x86/kernel/boot_sys.c b/src/arch/x86/kernel/boot_sys.c
+index d9e4a2035..72badaee7 100644
+--- a/src/arch/x86/kernel/boot_sys.c
++++ b/src/arch/x86/kernel/boot_sys.c
+@@ -251,6 +251,35 @@ BOOT_CODE static paddr_t load_boot_module(word_t boot_module_start, word_t boot_
+     return load_paddr;
+ }
+ 
++/* Reserve what of [reg.start, reg.end) no reserved region covers yet:
++ * reserve_region() keeps the regions sorted and apart only if each new
++ * one meets none, and a page the MADT lists may already be reserved in
++ * part (an I/O APIC the kernel drives, at an address not page aligned)
++ * or whole (an entry listed twice). */
++static BOOT_CODE bool_t reserve_uncovered(p_region_t reg)
++{
++    while (reg.start < reg.end) {
++        word_t i = 0;
++        while (i < ndks_boot.resv_count && ndks_boot.reserved[i].end <= reg.start) {
++            i++;
++        }
++        if (i == ndks_boot.resv_count || ndks_boot.reserved[i].start >= reg.end) {
++            return reserve_region(reg);
++        }
++        if (ndks_boot.reserved[i].start > reg.start) {
++            /* The gap below region i; then region i covers reg.start. */
++            if (!reserve_region((p_region_t) {
++            reg.start, ndks_boot.reserved[i].start
++        })) {
++                return false;
++            }
++            continue;
++        }
++        reg.start = ndks_boot.reserved[i].end;
++    }
++    return true;
++}
++
+ static BOOT_CODE bool_t try_boot_sys_node(cpu_id_t cpu_id)
+ {
+     if (!map_kernel_window(
+@@ -261,6 +290,18 @@ static BOOT_CODE bool_t try_boot_sys_node(cpu_id_t cpu_id)
+         )) {
+         return false;
+     }
++    /* The I/O APICs the kernel does not drive (all, with no_legacy_irq;
++     * those past CONFIG_MAX_NUM_IOAPIC) stay out of user device memory
++     * too: their redirection entries send any vector, NMI or INIT to any
++     * CPU, another kernel's included. */
++    for (word_t i = 0; i < boot_state.num_madt_ioapic; i++) {
++        paddr_t page = ROUND_DOWN(boot_state.madt_ioapic_paddr[i], PAGE_BITS);
++        if (!reserve_uncovered((p_region_t) {
++        page, page + BIT(PAGE_BITS)
++    })) {
++            return false;
++        }
++    }
+     setCurrentVSpaceRoot(kpptr_to_paddr(X86_KERNEL_VSPACE_ROOT), 0);
+     /* Sync up the compilers view of the world here to force the PD to actually
+      * be set *right now* instead of delayed */
+@@ -551,11 +592,18 @@ static BOOT_CODE bool_t try_boot_sys(void)
+ 
+     /* query available CPUs from ACPI */
+     boot_state.num_cpus = acpi_madt_scan(&boot_state.acpi_rsdp, boot_state.cpus, &boot_state.num_ioapic,
+-                                         boot_state.ioapic_paddr);
++                                         boot_state.ioapic_paddr, &boot_state.num_madt_ioapic,
++                                         boot_state.madt_ioapic_paddr);
+     if (boot_state.num_cpus == 0) {
+         printf("No CPUs detected\n");
+         return false;
+     }
++    if (boot_state.num_madt_ioapic > MAX_NUM_MADT_IOAPIC) {
++        /* One left out would be user device memory. */
++        printf("The MADT lists %u IOAPICs, more than the %d kept from user space\n",
++               (unsigned int)boot_state.num_madt_ioapic, (int)MAX_NUM_MADT_IOAPIC);
++        return false;
++    }
+ 
+     if (cmdline_opt.no_legacy_irq) {
+         /* Another kernel's I/O APICs, if a firmware table still lists them. */
+diff --git a/src/plat/pc99/machine/acpi.c b/src/plat/pc99/machine/acpi.c
+index 044a8fadc..7aee29044 100644
+--- a/src/plat/pc99/machine/acpi.c
++++ b/src/plat/pc99/machine/acpi.c
+@@ -298,7 +298,9 @@ BOOT_CODE uint32_t acpi_madt_scan(
+     acpi_rsdp_t *acpi_rsdp,
+     cpu_id_t    *cpu_list,
+     uint32_t    *num_ioapic,
+-    paddr_t     *ioapic_paddrs
++    paddr_t     *ioapic_paddrs,
++    uint32_t    *num_madt_ioapic,
++    paddr_t     *madt_ioapic_paddrs
+ )
+ {
+     unsigned int        entries;
+@@ -315,6 +317,7 @@ BOOT_CODE uint32_t acpi_madt_scan(
+ 
+     num_cpu = 0;
+     *num_ioapic = 0;
++    *num_madt_ioapic = 0;
+ 
+     assert(acpi_rsdt_mapped->header.length >= sizeof(acpi_header_t));
+     /* Divide by uint32_t explicitly as this is the size as mandated by the ACPI standard */
+@@ -400,6 +403,11 @@ BOOT_CODE uint32_t acpi_madt_scan(
+                         ioapic_paddrs[*num_ioapic] = madt_ioapic->ioapic_addr;
+                         (*num_ioapic)++;
+                     }
++                    /* Every one, to keep its registers from user space. */
++                    if (*num_madt_ioapic < MAX_NUM_MADT_IOAPIC) {
++                        madt_ioapic_paddrs[*num_madt_ioapic] = madt_ioapic->ioapic_addr;
++                    }
++                    (*num_madt_ioapic)++;
+                     break;
+                 case MADT_ISO: {
+                     if (!acpi_madt_valid(acpi_madt_header, madt_str_iso, sizeof(acpi_madt_iso_t))) {
+-- 
+2.47.3
+
