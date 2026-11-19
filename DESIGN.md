@@ -503,7 +503,8 @@ hooks (§10.2), the Android features of §5.8 and x86's
   reach it.
 - **VSpace pool.** x86_64 seL4 has only 4096 ASIDs (8 pools of 512), so
   each guest gets a fixed pool of 64 pre-assigned VSpace roots, recycled
-  least recently used first. An mm that loses its VSpace simply refaults.
+  least recently activated first. A running task pins its VSpace and reuses
+  it between user stops. An mm that loses its VSpace simply refaults.
   `arch_exit_mmap()` releases its VSpace and page-table objects when the
   last user exits, not at `destroy_context()`: lazy `active_mm` references
   and OOM bookkeeping can outlive `waitpid()`. A vCPU that finds every
@@ -5742,7 +5743,7 @@ tools/build-fl4.sh
 SEL4_PREFIX="$PWD/build/sel4-fl4" L4H_KERNEL_VARIANT=fl4 tests/run-selftest.sh 4
 ```
 
-The tested FL4 revision is `d5c80484cc800f3625769e3c3a02feeb62f7c4dc`.
+The tested FL4 revision is `ff9025063a62329da80290c221c0ed9b1474e04a`.
 `prepare-fl4.sh` clones the pinned public revision, or the frozen override,
 into `build/FL4-src` without applying any kernel patches. The source
 worktree is not edited.

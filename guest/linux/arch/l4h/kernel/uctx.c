@@ -266,24 +266,35 @@ static bool prepare_user(struct task_struct *t)
 			l4h_user_deschedule(u);
 	}
 
-	mm_running_enter(t, mm);
-	root = l4h_mm_activate(mm, &gen);
-	if (!root) {
-		/* The vCPU may have changed: redo the above. */
-		cond_resched();
-		return false;
-	}
-	if (u->vspace != root || th->vs_gen != gen) {
-		int err;
+	/*
+	 * Once the TCB is bound to this mm's generation, the running count
+	 * pins the VSpace until switch-out or exec/exit. Reuse it across
+	 * stops without taking the global VSpace pool lock. Poll here for
+	 * events that the pool lock's IRQ restore would otherwise deliver.
+	 */
+	if (likely(th->running_mm == mm && u->vspace &&
+		   th->vs_gen == READ_ONCE(mm->context.l4h.gen))) {
+		l4h_poll_events();
+	} else {
+		mm_running_enter(t, mm);
+		root = l4h_mm_activate(mm, &gen);
+		if (!root) {
+			/* The vCPU may have changed: redo the above. */
+			cond_resched();
+			return false;
+		}
+		if (u->vspace != root || th->vs_gen != gen) {
+			int err;
 
-		if (u->state == L4H_UCTX_FRESH && !u->vspace)
-			err = l4h_tcb_configure_user(u->tcb, EMPTY_CNODE, root);
-		else
-			err = l4h_tcb_set_space(u->tcb, u->fault_ep, EMPTY_CNODE, root);
-		if (err)
-			panic("l4h: binding user context to VSpace failed: %d\n", err);
-		u->vspace = root;
-		th->vs_gen = gen;
+			if (u->state == L4H_UCTX_FRESH && !u->vspace)
+				err = l4h_tcb_configure_user(u->tcb, EMPTY_CNODE, root);
+			else
+				err = l4h_tcb_set_space(u->tcb, u->fault_ep, EMPTY_CNODE, root);
+			if (err)
+				panic("l4h: binding user context to VSpace failed: %d\n", err);
+			u->vspace = root;
+			th->vs_gen = gen;
+		}
 	}
 
 	if (u->fp_state == L4H_FP_DIRTY) {
