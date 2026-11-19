@@ -289,6 +289,21 @@ pub fn group<I: Iterator<Item = u16>>(c: &impl Config, functions: impl Fn() -> I
         if sibs().next().is_none() || (isolates(f) && sibs().all(isolates)) {
             return;
         }
+        // AMD's 1482 dummy host bridge is function zero in the same slot
+        // as GPP root ports. The dummy has no ACS capability. Keep the
+        // ports separate only when each one validates and redirects traffic.
+        let first = f & !7;
+        let isolated_port = |b| b == first || (pcie_type(c, b) == Some(ROOT_PORT)
+            && matches!(state(c, b), Acs::Present { cap, after, .. }
+                if cap & ISOLATE == ISOLATE && after & ISOLATE == ISOLATE));
+        if c.read(first, 0) == 0x1482_1022
+            && c.read(first, 8) >> 8 == 0x060000
+            && above((f >> 8) as u8).is_none()
+            && isolated_port(f)
+            && sibs().all(isolated_port)
+        {
+            return;
+        }
         for sib in sibs() {
             add(sib);
             if is_bridge(sib) {

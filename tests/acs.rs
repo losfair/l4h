@@ -559,6 +559,31 @@ fn a_group_is_closed_under_reach_and_requester_aliases() {
 }
 
 #[test]
+fn amd_dummy_host_bridge_does_not_join_isolated_root_ports() {
+    let mut dummy = Func::pcie(0, None).multi();
+    dummy.space[0] = 0x1482_1022;
+    dummy.space[1] = 0;
+    dummy.space[2] = 0x0600_0000;
+    let acs = SV | RR | CR | UF;
+    let model = |second_ctrl| Model::new(&[
+        (0x8008, dummy.clone()),
+        (0x8009, Func::pcie(acs::ROOT_PORT, Some((acs, acs))).bridge(0x81)),
+        (0x800a, Func::pcie(acs::ROOT_PORT, Some((acs, second_ctrl))).bridge(0x82)),
+        (0x8100, Func::pcie(0, None)),
+        (0x8200, Func::pcie(0, None)),
+    ]);
+    let inventory = || [0x8008, 0x8009, 0x800a, 0x8100, 0x8200].into_iter();
+    let owner = |f| u8::from(f == 0x8200);
+    let mut out = [0u16; 8];
+    let separated = model(acs);
+    assert_eq!(acs::other_owner(&separated, inventory, |f| f, owner, 0x8200, &mut out), Ok(None));
+    let missing_redirect = model(acs & !RR);
+    assert!(acs::other_owner(&missing_redirect, inventory, |f| f, owner, 0x8200, &mut out).unwrap().is_some());
+    let alias = |f| if f == 0x8200 { 0x8100 } else { f };
+    assert_eq!(acs::other_owner(&separated, inventory, alias, owner, 0x8200, &mut out), Ok(Some(0x8100)));
+}
+
+#[test]
 fn the_shim_refuses_a_group_split_between_partitions() {
     let owners = |p1: &'static [u16]| move |b: u16| if p1.contains(&b) { 1 } else { 0 };
     let other = |m: &Model, inv: &[u16], p1: &'static [u16], me: u16| {
