@@ -365,30 +365,49 @@ pub const fn frames_bits(pages: usize) -> usize {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Setup {
     pub bytes: usize,
+    /// Root CNode slots of what it makes: the CNodes, the Untypeds of
+    /// the arenas they come from, the DMA region's, the page tables of
+    /// netd's mapping, and the IOMMU's table chunks.
+    pub slots: usize,
     /// The largest single object: the DMA region, or a frames CNode.
     pub min_block_bits: usize,
 }
+
+/// Untypeds an arena of root's (or netd's, growing) may take to make a
+/// channel or a DMA region's CNode: one per power of two of its size, and
+/// those it grows by.
+const SETUP_ARENA_SLOTS: usize = 32;
 
 pub fn setup(chan_pages: Option<usize>, dma_pages: Option<usize>) -> Setup {
     const PAGE: usize = 4096;
     // Page tables mapping `pages` contiguous pages, and a directory and a
     // pointer table at either end.
-    let tables = |pages: usize| (pages.div_ceil(512) + 3) * PAGE;
-    let (mut bytes, mut min_block_bits) = (0, 0);
+    let table_count = |pages: usize| pages.div_ceil(512) + 3;
+    let tables = |pages: usize| table_count(pages) * PAGE;
+    let (mut bytes, mut slots, mut min_block_bits) = (0, 0, 0);
     if let Some(pages) = chan_pages {
         let bits = frames_bits(pages);
         // Root's frames and their CNode (as root's arena asks: twice the
         // CNode and a page, for alignment), netd's keep CNode and page
         // tables.
         bytes += pages * PAGE + (64 << bits) + PAGE + (32 << bits) + tables(pages);
+        // The frames are in their CNode, not in root's: root's CNode
+        // holds the CNodes, the arenas' Untypeds, netd's page tables and
+        // a slot map_copy moves each frame through.
+        slots += 2 + 2 * SETUP_ARENA_SLOTS + table_count(pages) + 1;
         min_block_bits = min_block_bits.max(bits + 5);
     }
     if let Some(pages) = dma_pages {
         let bits = frames_bits(pages);
         bytes += pages * PAGE + (32 << bits) + tables(pages);
+        // The region's Untyped, its frames' CNode and its arena's
+        // Untypeds; for the IOMMU's tables, the Untyped and the large
+        // page of each chunk (one more than the tables fill, as the
+        // current one may be full), and a page directory.
+        slots += 2 + SETUP_ARENA_SLOTS + 2 * (table_count(pages).div_ceil(512) + 1) + 1;
         min_block_bits = min_block_bits.max(bits + 5).max((pages * PAGE).trailing_zeros() as usize);
     }
-    Setup { bytes, min_block_bits }
+    Setup { bytes, slots, min_block_bits }
 }
 
 /// nicd CSpace: its device's IRQ handler, its legacy I/O ports, and netd's
@@ -587,7 +606,7 @@ mod tests {
     #[test]
     fn a_setup_covers_what_a_first_start_makes() {
         const PAGE: usize = 4096;
-        assert_eq!(setup(None, None), Setup { bytes: 0, min_block_bits: 0 });
+        assert_eq!(setup(None, None), Setup { bytes: 0, slots: 0, min_block_bits: 0 });
         let channels = [crate::uplink::MIN_DATA_BITS, crate::uplink::DEFAULT_DATA_BITS, crate::uplink::MAX_DATA_BITS];
         for chan in channels {
             for dma_bits in [MIN_DMA_BITS, 22, MAX_DMA_BITS] {
@@ -602,8 +621,16 @@ mod tests {
                 let d = setup(None, Some(dma));
                 assert!(d.bytes >= dma * PAGE + (32 << db) + tables(dma), "{dma}: {d:?}");
                 assert!(d.min_block_bits >= dma_bits as usize && d.min_block_bits >= db + 5);
+                // Root CNode slots: the CNodes, an Untyped or more for
+                // each arena and region, netd's page tables, and two for
+                // each IOMMU table chunk; never the frames themselves,
+                // which are in their CNodes.
+                assert!(c.slots >= 2 + 2 + tables(chan) / PAGE, "{chan}: {c:?}");
+                assert!(d.slots >= 2 + 1 + 2 * (tables(dma) / PAGE).div_ceil(512), "{dma}: {d:?}");
+                assert!(c.slots < chan && d.slots < 1024, "{chan} {dma}: {c:?} {d:?}");
                 let both = setup(Some(chan), Some(dma));
                 assert_eq!(both.bytes, c.bytes + d.bytes);
+                assert_eq!(both.slots, c.slots + d.slots);
                 assert_eq!(both.min_block_bits, c.min_block_bits.max(d.min_block_bits));
             }
         }

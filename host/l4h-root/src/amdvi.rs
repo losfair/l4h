@@ -26,7 +26,7 @@ use l4h_abi as abi;
 
 use crate::mem::Alloc;
 use crate::pci;
-use crate::iommu::{mappings::Mappings, shared::Shared, MAX_MAPPINGS};
+use crate::iommu::{mappings::Mappings, shared::Shared, tables::{self, CHUNK_BITS, CHUNK_PAGES, Pages}, MAX_MAPPINGS};
 
 const PAGE: usize = 4096;
 /// IOMMUs driven, at most (an EPYC has one per root complex, up to 8).
@@ -43,8 +43,6 @@ const LEVELS: u64 = 4;
 const IOVA_END: usize = 1 << (12 + 9 * LEVELS);
 /// Table memory (the device table, I/O page tables, command buffers and
 /// event logs) is carved from 2 MiB chunks, kept until reboot.
-const CHUNK_BITS: usize = 21;
-const CHUNK_PAGES: usize = 1 << (CHUNK_BITS - 12);
 const MAX_CHUNKS: usize = crate::layout::IOMMU_TABLES.size >> CHUNK_BITS;
 /// Unity-mapped ranges the firmware asks for (IVMD), at most.
 const MAX_UNITY: usize = 32;
@@ -229,8 +227,8 @@ impl DevInfo {
 
 pub struct AmdVi {
     units: ArrayVec<Unit, MAX_UNITS>,
-    /// Pages of the last chunk handed out.
-    used: usize,
+    /// Pages of the chunks handed out.
+    pages: Pages,
     devtab: usize,
     unity: ArrayVec<Unity, MAX_UNITY>,
     /// The domain of devices with only "all devices" unity ranges.
@@ -298,7 +296,7 @@ impl AmdVi {
     pub fn none() -> Self {
         AmdVi {
             units: ArrayVec::new(),
-            used: 0,
+            pages: Pages::new(),
             devtab: 0,
             unity: ArrayVec::new(),
             shared: None,
@@ -547,7 +545,7 @@ impl AmdVi {
             Some(s) => s.at(s.tables().start),
             None => {
                 let c = self.chunk(phys.alloc);
-                self.used = CHUNK_PAGES;
+                self.pages.take_chunk(self.chunks().len());
                 c
             }
         };
@@ -717,21 +715,30 @@ impl AmdVi {
 
     /// A zeroed page of table memory: (virtual, physical) address.
     fn page(&mut self, alloc: &mut Alloc) -> (usize, usize) {
-        if self.chunks().is_empty() || self.used == CHUNK_PAGES {
+        if self.pages.spare(self.chunks().len()) == 0 {
             self.chunk(alloc);
-            self.used = 0;
         }
-        let &(va, pa) = self.chunks().last().unwrap();
-        let off = self.used * PAGE;
-        self.used += 1;
+        let n = self.chunks().len();
+        let (c, off) = self.pages.take(n).unwrap();
+        let (va, pa) = self.chunks()[c];
         (va + off, pa + off)
     }
 
     /// A new chunk, zeroed, mapped in root's address space.
     fn chunk(&mut self, alloc: &mut Alloc) -> (usize, usize) {
+        match self.add_chunk(alloc) {
+            Ok(c) => c,
+            Err(why) => panic!("l4h-root: iommu: {}", why),
+        }
+    }
+
+    /// `chunk`, or why there is none.
+    fn add_chunk(&mut self, alloc: &mut Alloc) -> Result<(usize, usize), &'static str> {
         use crate::vspace::{LARGE_PAGE_BP, map_large_page};
         use sel4::init_thread::slot;
-        assert!(!self.chunks().is_full(), "l4h-root: iommu: out of table space");
+        if self.chunks().is_full() {
+            return Err("out of table space");
+        }
         let va = crate::layout::IOMMU_TABLES.base + (self.chunks().len() << CHUNK_BITS);
         // Root's for good, whichever guest's mapping needs it: the chunk's
         // slots, and those of the page directory every 1 GiB of chunks
@@ -739,17 +746,67 @@ impl AmdVi {
         // deleted with it.
         let pa = alloc.global(|alloc| {
             let (ut, page) = (alloc.slots.alloc(), alloc.slots.alloc());
-            let mut region = alloc.split(CHUNK_BITS, ut).expect("l4h-root: iommu: no memory for tables");
+            let Some(mut region) = alloc.split(CHUNK_BITS, ut) else {
+                alloc.slots.free(ut);
+                alloc.slots.free(page);
+                return None;
+            };
             // The IOMMU reads its tables by DMA: shared on a confidential VM.
             let pa = region
                 .retype_dma(alloc.shared_dma, &LARGE_PAGE_BP, 1, crate::mem::Dest::new(crate::slot::CNODE.cap(), page))
                 .expect("iommu table chunk");
             let cap = sel4::init_thread::Slot::<sel4::cap_type::LargePage>::from_index(page).cap();
             map_large_page(&mut crate::mem::ObjCtx::global(alloc), slot::VSPACE.cap(), cap, va, sel4::CapRights::read_write());
-            pa
-        });
+            Some(pa)
+        }).ok_or("no memory for tables")?;
         let _ = self.dev.as_mut().unwrap().chunks.push((va, pa));
-        (va, pa)
+        Ok((va, pa))
+    }
+
+    /// Make sure that `pages` table pages can be had (`attach_pages`,
+    /// `table_pages`) besides those held: false if there is not the
+    /// memory for them.  Chunks added stay.
+    pub fn reserve(&mut self, alloc: &mut Alloc, pages: usize) -> bool {
+        if !self.active() {
+            return true;
+        }
+        for _ in 0..self.pages.short(self.chunks().len(), pages) {
+            if let Err(why) = self.add_chunk(alloc) {
+                log!("l4h-root: iommu: {}", why);
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Table pages attaching device `d` may take (`attach`): a new
+    /// domain's root, its interrupt table, and the tables of its group's
+    /// unity ranges.
+    pub fn attach_pages(&self, d: &pci::Device) -> usize {
+        if !self.active() {
+            return 0;
+        }
+        let id = device_id(d);
+        if !self.covered(id) {
+            return 0;
+        }
+        let dev = self.dev.as_ref().unwrap();
+        let alias = dev.alias[id as usize];
+        if dev.attached.iter().any(|d| d.dev[1] == alias) {
+            return 0;
+        }
+        let unity: usize = self.unity.iter().filter(|u| u.covers_group(alias, dev))
+            .map(|u| tables::map_pages(u.start, u.end - u.start, LEVELS as usize)).sum();
+        1 + self.intremap as usize + unity
+    }
+
+    /// Table pages mapping `len` bytes may take, wherever they are.
+    pub fn table_pages(&self, len: usize) -> usize {
+        if !self.active() { 0 } else { tables::map_pages_any(len, LEVELS as usize) }
+    }
+
+    pub fn pages(&mut self) -> &mut Pages {
+        &mut self.pages
     }
 
     /// Table memory at `pa`.

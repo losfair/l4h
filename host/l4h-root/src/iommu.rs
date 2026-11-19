@@ -6,6 +6,7 @@ use crate::vtd;
 
 pub mod mappings;
 pub mod shared;
+pub mod tables;
 
 
 // One pool per guest device, one DMA allocation per controller/NIC, and
@@ -113,6 +114,61 @@ impl Iommu {
             Self::Intel(i) => i.ioapic_irq(index, vector),
             _ => Ok(None),
         }
+    }
+
+    /// Make sure that `pages` page-table pages (`attach_pages`,
+    /// `map_pages`) can be had besides those held, before an operation
+    /// that maps: false if root has not the memory for them, which the
+    /// operation refuses (attach and map would panic).
+    #[must_use]
+    pub fn reserve(&mut self, alloc: &mut Alloc, pages: usize) -> bool {
+        match self {
+            Self::Amd(a) => a.reserve(alloc, pages),
+            #[cfg(target_arch = "x86_64")]
+            Self::Intel(i) => i.reserve(alloc, pages),
+        }
+    }
+
+    /// Keep `pages` pages `reserve` made for a mapping made later, until
+    /// `unhold`: other reservations do not count them.
+    pub fn hold(&mut self, pages: usize) {
+        self.pages().hold(pages);
+    }
+
+    pub fn unhold(&mut self, pages: usize) {
+        self.pages().unhold(pages);
+    }
+
+    fn pages(&mut self) -> &mut tables::Pages {
+        match self {
+            Self::Amd(a) => a.pages(),
+            #[cfg(target_arch = "x86_64")]
+            Self::Intel(i) => i.pages(),
+        }
+    }
+
+    /// Page-table pages `attach` of `device` may take, at most.
+    pub fn attach_pages(&self, device: &pci::Device) -> usize {
+        match self {
+            Self::Amd(a) => a.attach_pages(device),
+            #[cfg(target_arch = "x86_64")]
+            Self::Intel(i) => i.attach_pages(),
+        }
+    }
+
+    /// Page-table pages mapping `len` bytes in a domain not known yet (of
+    /// a device not attached yet) may take, at most.
+    pub fn table_pages(&self, len: usize) -> usize {
+        match self {
+            Self::Amd(a) => a.table_pages(len),
+            #[cfg(target_arch = "x86_64")]
+            Self::Intel(i) => i.table_pages(len),
+        }
+    }
+
+    /// Page-table pages `map` of `len` bytes in `domain` may take, at most.
+    pub fn map_pages(&self, domain: Domain, len: usize) -> usize {
+        if domain == Domain::None { 0 } else { self.table_pages(len) }
     }
 
     pub fn attach(&mut self, alloc: &mut Alloc, device: &pci::Device) -> Domain {

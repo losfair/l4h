@@ -451,10 +451,18 @@ impl Guest {
     /// finds in its level-1 CNode) holding 512 frames retyped from the
     /// block's Untyped, mapped in the direct map.  The block becomes a
     /// boot block: the guest gets no Untyped for it.  False if memd has
-    /// failed.
+    /// failed, or the host has no memory for its objects (the callers
+    /// reserved it, `block_frames_cost`), with nothing filled.
     fn block_frames(&mut self, alloc: &mut Alloc, b: usize) -> bool {
         if self.is_filled(b) {
             return true;
+        }
+        // Its level-2 CNode and the page tables of its direct map (a
+        // pointer table, a directory and a table at worst), whose
+        // allocations (map_frame's) panic: the room checked first, as
+        // its callers count it.
+        if !self.arena.reserve(alloc, self.block_frames_cost(b..b + 1).0) {
+            return false;
         }
         // A copy of the block's Untyped, which memd revokes at destroy.
         // First: a failed memd leaves nothing to undo.
@@ -463,7 +471,11 @@ impl Guest {
             alloc.slots.free(ut);
             return false;
         };
-        let l2 = self.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: abi::RAM_L2_BITS });
+        let Some(l2) = try_cnode(&mut self.arena, alloc, abi::RAM_L2_BITS) else {
+            let _ = abs(self_cap::<cap_type::Null>(ut)).delete();
+            alloc.slots.free(ut);
+            return false;
+        };
         self.ram_l1[b >> abi::RAM_L2_BITS]
             .absolute_cptr_from_bits_with_depth((b & ((1 << abi::RAM_L2_BITS) - 1)) as u64, abi::RAM_L2_BITS)
             .copy(&abs(l2), CapRights::all())

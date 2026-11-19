@@ -7,7 +7,8 @@
 # (alloc_channel, alloc_dma) and netd mapping (map_uplink), its USB
 # controller claim and attachment (usb.rs claim, attach) and disk
 # attachment (blkd.rs prepare, attach), and vmmgr's guest creation
-# (create, share_block) and SDK mapping (Sdk::map), must not use them.
+# (create, share_block, and block_frames, which dom0's own boot reaches)
+# and SDK mapping (Sdk::map), must not use them.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 fail=0
@@ -41,6 +42,7 @@ check host/l4h-root/src/blkd.rs prepare
 check host/l4h-root/src/blkd.rs attach
 check host/l4h-vmmgr/src/guest.rs create
 check host/l4h-vmmgr/src/guest.rs share_block
+check host/l4h-vmmgr/src/guest.rs block_frames
 check host/l4h-vmmgr/src/kimage.rs map
 # The nicd's and usbd's own CSpace CNodes are made before
 # component::create, which would make them with one.  (The body is read

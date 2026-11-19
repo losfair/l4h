@@ -20,13 +20,11 @@ use core::sync::atomic::{Ordering, compiler_fence};
 use l4h_host::fixed::{ArrayVec, StaticCell};
 use l4h_abi as abi;
 use crate::{mem::Alloc, pci};
-use crate::iommu::{mappings, shared::Shared, MAX_MAPPINGS};
+use crate::iommu::{mappings, shared::Shared, tables::{self, CHUNK_BITS, Pages}, MAX_MAPPINGS};
 use dmar::{Dmar, MAX_IOAPICS, MAX_UNITS};
 use format::{ADDR, PRESENT, READ, WRITE};
 
 const PAGE: usize = 4096;
-const CHUNK_BITS: usize = 21;
-const CHUNK_PAGES: usize = 1 << (CHUNK_BITS - 12);
 const MAX_CHUNKS: usize = crate::layout::IOMMU_TABLES.size >> CHUNK_BITS;
 const MMIO_STRIDE: usize = 1 << 16;
 const EVENTS_PER_POLL: usize = 8;
@@ -116,7 +114,7 @@ pub struct Vtd {
     ioapic_ids: ArrayVec<u8, MAX_IOAPICS>,
     units: ArrayVec<Unit, MAX_UNITS>,
     chunks: Option<&'static mut ArrayVec<(usize, usize), MAX_CHUNKS>>,
-    used: usize,
+    pages: Pages,
     coherent: bool,
     cache_line: usize,
     ticks_per_ms: u64,
@@ -142,7 +140,7 @@ impl Vtd {
         let mut me = Self {
             dmar: DMAR.take(), requesters: requester::Requesters::empty(), ioapic_ids: ArrayVec::new(),
             mappings: MAPPINGS.take(),
-            units: ArrayVec::new(), chunks: None, used: CHUNK_PAGES,
+            units: ArrayVec::new(), chunks: None, pages: Pages::new(),
             coherent: true, cache_line: 64, ticks_per_ms, intremap: false, state: abi::IOMMU_FAILED,
             confined: 0, unconfined: 0, events: 0,
             shared, next_context: shared.map_or(0, |s| s.tables().start), irtes: 0..format::IR_ENTRIES,
@@ -433,34 +431,78 @@ impl Vtd {
         self.flush_cpu(ptr as usize, 8);
     }
 
-    fn page(&mut self, alloc: &mut Alloc) -> (usize, usize) {
-        if self.used == CHUNK_PAGES {
-            use crate::vspace::{LARGE_PAGE_BP, map_large_page};
-            use sel4::init_thread::slot;
-            let chunks = self.chunks.as_mut().unwrap();
-            assert!(!chunks.is_full(), "VT-d: out of table space");
-            let va = crate::layout::IOMMU_TABLES.base + (chunks.len() << CHUNK_BITS);
-            // Root's for good, whichever guest's mapping needs it: the
-            // chunk's slots, and those of the page directory every 1 GiB
-            // of chunks takes, must not be recorded as that guest's, or
-            // they would be deleted with it.
-            let pa = alloc.global(|alloc| {
-                let (ut, page) = (alloc.slots.alloc(), alloc.slots.alloc());
-                let mut region = alloc.split(CHUNK_BITS, ut).expect("VT-d: no memory for tables");
-                // The IOMMU reads its tables by DMA: shared on a confidential VM.
-                let pa = region
-                    .retype_dma(alloc.shared_dma, &LARGE_PAGE_BP, 1, crate::mem::Dest::new(crate::slot::CNODE.cap(), page))
-                    .expect("VT-d table chunk");
-                let cap = sel4::init_thread::Slot::<sel4::cap_type::LargePage>::from_index(page).cap();
-                map_large_page(&mut crate::mem::ObjCtx::global(alloc), slot::VSPACE.cap(), cap, va, sel4::CapRights::read_write());
-                pa
-            });
-            chunks.push((va, pa)).ok().unwrap();
-            self.used = 0;
+    /// A new chunk of table memory, mapped in root's address space.
+    fn add_chunk(&mut self, alloc: &mut Alloc) -> Result<(), &'static str> {
+        use crate::vspace::{LARGE_PAGE_BP, map_large_page};
+        use sel4::init_thread::slot;
+        let chunks = self.chunks.as_mut().unwrap();
+        if chunks.is_full() {
+            return Err("VT-d: out of table space");
         }
-        let &(va, pa) = self.chunks.as_ref().unwrap().last().unwrap();
-        let off = self.used * PAGE;
-        self.used += 1;
+        let va = crate::layout::IOMMU_TABLES.base + (chunks.len() << CHUNK_BITS);
+        // Root's for good, whichever guest's mapping needs it: the
+        // chunk's slots, and those of the page directory every 1 GiB
+        // of chunks takes, must not be recorded as that guest's, or
+        // they would be deleted with it.
+        let pa = alloc.global(|alloc| {
+            let (ut, page) = (alloc.slots.alloc(), alloc.slots.alloc());
+            let Some(mut region) = alloc.split(CHUNK_BITS, ut) else {
+                alloc.slots.free(ut);
+                alloc.slots.free(page);
+                return None;
+            };
+            // The IOMMU reads its tables by DMA: shared on a confidential VM.
+            let pa = region
+                .retype_dma(alloc.shared_dma, &LARGE_PAGE_BP, 1, crate::mem::Dest::new(crate::slot::CNODE.cap(), page))
+                .expect("VT-d table chunk");
+            let cap = sel4::init_thread::Slot::<sel4::cap_type::LargePage>::from_index(page).cap();
+            map_large_page(&mut crate::mem::ObjCtx::global(alloc), slot::VSPACE.cap(), cap, va, sel4::CapRights::read_write());
+            Some(pa)
+        }).ok_or("VT-d: no memory for tables")?;
+        chunks.push((va, pa)).ok().unwrap();
+        Ok(())
+    }
+
+    /// Make sure that `pages` table pages can be had (`attach_pages`,
+    /// `table_pages`) besides those held: false if there is not the
+    /// memory for them.  Chunks added stay.
+    pub fn reserve(&mut self, alloc: &mut Alloc, pages: usize) -> bool {
+        let Some(chunks) = self.chunks.as_ref() else { return true };
+        for _ in 0..self.pages.short(chunks.len(), pages) {
+            if let Err(why) = self.add_chunk(alloc) {
+                log!("l4h-root: {}", why);
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Table pages attaching a device may take: its bus's context table
+    /// and its domain's root.
+    pub fn attach_pages(&self) -> usize {
+        if self.state != abi::IOMMU_ON { 0 } else { 2 }
+    }
+
+    /// Table pages mapping `len` bytes may take, wherever they are.
+    pub fn table_pages(&self, len: usize) -> usize {
+        if self.state != abi::IOMMU_ON { return 0; }
+        let levels = self.units.iter().map(|u| u.levels as usize).max().unwrap_or(0);
+        tables::map_pages_any(len, levels)
+    }
+
+    pub fn pages(&mut self) -> &mut Pages {
+        &mut self.pages
+    }
+
+    fn page(&mut self, alloc: &mut Alloc) -> (usize, usize) {
+        if self.pages.spare(self.chunks.as_ref().unwrap().len()) == 0 {
+            if let Err(why) = self.add_chunk(alloc) {
+                panic!("{}", why);
+            }
+        }
+        let chunks = self.chunks.as_ref().unwrap();
+        let (c, off) = self.pages.take(chunks.len()).unwrap();
+        let (va, pa) = chunks[c];
         assert!(pa.checked_add(off + PAGE).is_some_and(|end| end as u64 <= 1u64 << self.dmar.haw),
             "VT-d: table memory exceeds host address width");
         // seL4 zeroed this memory; publish those zeros to noncoherent walkers.

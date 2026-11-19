@@ -719,6 +719,12 @@ fn checked(h: &mut Host, c: usize, token: usize, id: usize, instance: u64, disk:
             if g.disks.is_full() {
                 return Err(ctl::ENOSPC);
             }
+            // The IOMMU's tables mapping the guest's pool for the
+            // controller (`attach`), whose map would panic without them.
+            let pages = h.iommu.map_pages(h.ctrls[c].dom, g.pool.size);
+            if !h.iommu.reserve(&mut h.alloc, pages) {
+                return Err(ctl::ENOMEM);
+            }
             // Room for what the attachment makes, before blkd is given
             // anything: none of it can fail after.
             let keep = prepare(&mut h.ctrls[c], g, n, &mut h.alloc)?;

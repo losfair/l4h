@@ -309,6 +309,12 @@ fn claim(h: &mut Host, i: usize) -> Result<(), Errno> {
     if !h.can_afford(dma + cnodes + room + (4 << 20), 1, 4096) {
         return Err(ctl::ENOMEM);
     }
+    // The IOMMU's tables for its domain and its DMA region, whose attach
+    // and map would panic without them.
+    let pages = h.iommu.attach_pages(&ctrls()[i].pci) + h.iommu.table_pages(dma);
+    if !h.iommu.reserve(&mut h.alloc, pages) {
+        return Err(ctl::ENOMEM);
+    }
     // usbd's image, stacks and tables (about 1 MiB of statics), and its
     // CNodes.
     let mut arena = h.alloc.arena((4 << 20) + cnodes).ok_or(ctl::ENOMEM)?;
@@ -479,6 +485,8 @@ fn send(d: &mut Usbd, req: Request, op: Op) {
 fn post_attach(h: &mut Host, i: usize) {
     let c = &mut ctrls()[i];
     let (Some(d), Some(pool)) = (c.driver.as_mut(), c.pool) else { return };
+    // The tables `attach` held for it.
+    h.iommu.unhold(h.iommu.map_pages(c.dom, pool.2));
     h.iommu.map(&mut h.alloc, c.dom, pool.1, pool.2, true);
     h.pci.bus_master(&c.pci, true);
     d.waiting = false;
@@ -585,6 +593,13 @@ pub fn attach(h: &mut Host, i: usize, g: &mut RootGuest) -> Result<Attached, Err
     if !h.can_afford((uabi::AREA_PAGES + 8) * PAGE + host::map_tables(uabi::AREA_PAGES), 0, 2 * (1 << QUEUE_RADIX) + 8) {
         return Err(ctl::ENOMEM);
     }
+    // The IOMMU's tables mapping the pool (`post_attach`, maybe once
+    // usbd has answered what came before), whose map would panic without
+    // them: held for it from here.
+    let pool_pages = h.iommu.map_pages(c.dom, g.pool.size);
+    if !h.iommu.reserve(&mut h.alloc, pool_pages) {
+        return Err(ctl::ENOMEM);
+    }
     // usbd's page tables mapping the area, from its arena (whose
     // allocations panic), for good: room first.
     if !h.alloc.global(|alloc| d.arena.reserve(alloc, host::map_tables(uabi::AREA_PAGES))) {
@@ -639,6 +654,7 @@ pub fn attach(h: &mut Host, i: usize, g: &mut RootGuest) -> Result<Attached, Err
         let _ = d.comp.slot(usb::USBD_SLOT_CLIENT_IRQ + idx as u64).delete();
         return Err(ctl::ENOMEM);
     };
+    h.iommu.hold(pool_pages);
     let guest_frames = area.guest;
     d.areas[idx] = Some(area);
     let kick = root_cap::<cap_type::Notification>(h.alloc.slots.alloc());
@@ -688,8 +704,11 @@ pub fn remove(h: &mut Host, i: usize) -> bool {
     }
     let _ = d.comp.slot(usb::USBD_SLOT_CLIENT_IRQ + idx as u64).delete();
     let pool = c.pool.take();
-    if let Some((_, pa, len)) = pool.filter(|_| !d.waiting) {
-        h.iommu.unmap(c.dom, pa, len);
+    match pool {
+        Some((_, pa, len)) if !d.waiting => h.iommu.unmap(c.dom, pa, len),
+        // Never mapped: the tables held for it are free again.
+        Some((_, _, len)) => h.iommu.unhold(h.iommu.map_pages(c.dom, len)),
+        None => {}
     }
     if !attached {
         // Quarantined: usbd is suspended.

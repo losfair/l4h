@@ -237,7 +237,7 @@ impl Vmmgr {
     pub fn can_afford(&self, bytes: usize, asids: usize, slots: usize) -> bool {
         bytes.checked_add(RESERVE_BYTES).is_some_and(|b| self.alloc.free_bytes() >= b)
             && self.asids.available() >= asids
-            && self.alloc.slots.available() >= RESERVE_SLOTS + slots
+            && slots.checked_add(RESERVE_SLOTS).is_some_and(|s| self.alloc.slots.available() >= s)
     }
 
     pub fn create_guest(&mut self, cfg: &GuestConfig) -> Option<usize> {
@@ -823,6 +823,14 @@ fn dom0_start(h: &mut Vmmgr, id: usize) {
     let cmdline = &cmdline[..cmdline.iter().position(|&c| c == 0).unwrap_or(cmdline.len())];
     let booted = h.with_guest(id, |h, g| {
         let kernel = h.kernel.as_ref().unwrap();
+        // As CTL_VM_START: the boot blocks it fills with frames, reserved
+        // first (block_frames's allocations panic).
+        let Some((bytes, slots)) = g.boot_cost(kernel.end, (kernel.initrd_gpa(), h.dom0_initrd.len())) else {
+            return false;
+        };
+        if !h.can_afford(bytes, 0, slots) || !g.reserve(&mut h.alloc, bytes) {
+            return false;
+        }
         guest::boot_with(g, &mut h.alloc, &mut h.wins.a, &h.info, kernel, h.dom0_initrd, cmdline)
     });
     if booted != Some(true) {
