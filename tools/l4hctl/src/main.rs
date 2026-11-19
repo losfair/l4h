@@ -648,11 +648,15 @@ fn run(args: &[String]) -> Result<i32> {
             cmd_logs(&ctl, follow)?;
         }
         "info" => {
-            let r = ctl.call(CTL_HOST_INFO, &[], &[], &[])?;
-            println!("cores:  {}", r.vals[0]);
-            println!("memory: {} MiB free of {} MiB", r.vals[1] >> 20, r.vals[2] >> 20);
-            println!("disks:  {}", r.vals[3]);
-            println!("vms:    {}", r.vals[4]);
+            let info = ctl.host_info()?;
+            // install.py and the cloud test inits parse this line.
+            println!("cores:  {}", info.cores);
+            if info.physical_cores != info.cores {
+                println!("physical cores: {}", info.physical_cores);
+            }
+            println!("memory: {} MiB free of {} MiB", info.free >> 20, info.total >> 20);
+            println!("disks:  {}", info.disks);
+            println!("vms:    {}", info.vms);
             // A host that predates CTL_IOMMU_INFO: no line.
             if let Ok(i) = ctl.iommu_info() {
                 let irq = if i.state != IOMMU_ON { "" } else if i.intremap { ", interrupts remapped" } else { ", interrupts not remapped" };

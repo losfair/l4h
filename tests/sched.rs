@@ -281,3 +281,24 @@ fn repeated_steps_converge_on_smt_and_flat_hosts() {
         }
     }
 }
+
+#[test]
+fn physical_cores_counts_distinct_cores() {
+    // CTL_HOST_INFO reports this as the host's physical cores.
+    for (ids, want) in [
+        (&[0, 0, 1, 1][..], 2),
+        (&[0, 0, 1, 1, 2, 2][..], 3),
+        (&[4, 9, 4, 12, 9][..], 3),
+        (&[42, 7, 42, 99, 7, 42][..], 3),
+        (&[0, 1, 2, 3][..], 4),
+        (&[5][..], 1),
+    ] {
+        let t = Topology::from_ids(ids);
+        assert_eq!(t.physical_cores(), want, "{ids:?}");
+        let (cpus, physical, order) = t.raw();
+        assert_eq!(Topology::from_raw(cpus, physical, order).physical_cores(), want, "{ids:?}");
+    }
+    for cpus in [0, 1, 4, topology::MAX_CPUS] {
+        assert_eq!(Topology::flat(cpus).physical_cores(), cpus);
+    }
+}

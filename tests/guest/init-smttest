@@ -5,6 +5,12 @@ mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
 fail() { echo "SMTTEST: FAIL: $*"; poweroff -f; }
 
+# CTL_HOST_INFO reports both counts; "cores:" stays the logical one.
+info=$(l4hctl info) || fail "info"
+echo "$info" | grep -qx 'cores: *4' || fail "unexpected logical cores: $info"
+echo "$info" | grep -qx 'physical cores: *2' || fail "unexpected physical cores: $info"
+echo "SMTTEST: host reports 4 CPUs on 2 physical cores"
+
 # The runner checks root's initial CPU log, before any balancing, so the
 # placement assertion does not race with boot-time migrations.
 id=$(l4hctl create spread --initrd /bin/densvm.cpio.gz --mem 128 --vcpus 4 \
