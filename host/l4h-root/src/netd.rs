@@ -266,12 +266,30 @@ impl Netd {
     }
 
     /// Map uplink `nic`'s channel (root's frames in `frames`, radix
-    /// `bits`) into netd, for good.
+    /// `bits`) into netd, for good.  ENOMEM, with nothing mapped, if
+    /// netd's arena cannot grow to hold the keep CNode and page tables:
+    /// they are made before any mapping, whose allocations panic.
     pub fn map_uplink(&mut self, nic: usize, frames: cap::CNode, bits: usize, pages: usize, alloc: &mut Alloc) -> Result<(), Errno> {
         if pages * PAGE > net::UPLINK_CHANNEL_MAX {
             return Err(ctl::EINVAL);
         }
-        let keep = self.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: bits });
+        // A page table for every 512 pages, and a directory and a pointer
+        // table at either end.
+        let tables = (pages.div_ceil(512) + 4) * PAGE;
+        if !self.arena.reserve(alloc, (32 << bits) + tables) {
+            return Err(ctl::ENOMEM);
+        }
+        let Some(slot) = self.arena.try_object(alloc, ObjectBlueprint::CNode { size_bits: bits }) else {
+            return Err(ctl::ENOMEM);
+        };
+        let keep = cap::CNode::from_bits(slot as u64);
+        // What the CNode's alignment took may leave too little for the
+        // tables: the CNode's memory stays the arena's, its slot is freed.
+        if !self.arena.reserve(alloc, tables) {
+            let _ = alloc.slots.cnode().absolute_cptr(keep).delete();
+            alloc.slots.free(slot);
+            return Err(ctl::ENOMEM);
+        }
         let (comp, arena) = (&self.comp, &mut self.arena);
         alloc.global(|alloc| {
             for p in 0..pages {

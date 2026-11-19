@@ -648,27 +648,35 @@ fn alloc_channel(h: &mut Host, i: usize, data_bits: u32) -> Result<(), &'static 
     let size = uplink::channel_size(data_bits);
     let pages = size / PAGE;
     let bits = keep_bits(pages);
-    let chan = h.alloc.global(|alloc| -> Option<Chan> {
+    let (arena, slot) = h.alloc.global(|alloc| {
         let mut arena = alloc.arena(size + (64 << bits) + PAGE)?;
-        let frames = arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: bits });
+        let Some(slot) = arena.try_object(alloc, ObjectBlueprint::CNode { size_bits: bits }) else {
+            alloc.release(arena);
+            return None;
+        };
+        let frames = root_cap::<cap_type::CNode>(slot);
         // In batches: each fits a region of the arena.
         let mut done = 0;
         while done < pages {
             let k = (pages - done).min(256);
             if arena.retype(alloc, &FRAME_BP, k, Dest { cnode: abs_of(frames), offset: done }).is_none() {
-                alloc.release(arena);
+                alloc.release_objects(arena, &[slot]);
                 return None;
             }
             done += k;
         }
-        // Root's until reboot: the arena is never released.
-        core::mem::forget(arena);
-        Some(Chan { frames, bits, pages, data_bits })
+        Some((arena, slot))
     }).ok_or("no memory for its channel")?;
-    nics()[i].chan = Some(chan);
-    // netd maps it once, for good.
-    let c = nics()[i].chan.as_ref().unwrap();
-    h.netd.map_uplink(i, c.frames, c.bits, c.pages, &mut h.alloc).map_err(|_| "netd cannot map its channel")
+    let frames = root_cap::<cap_type::CNode>(slot);
+    // netd maps it once, for good; it is the NIC's only then.
+    if h.netd.map_uplink(i, frames, bits, pages, &mut h.alloc).is_err() {
+        h.alloc.global(|alloc| alloc.release_objects(arena, &[slot]));
+        return Err("netd cannot map its channel");
+    }
+    // Root's until reboot: the arena is never released.
+    core::mem::forget(arena);
+    nics()[i].chan = Some(Chan { frames, bits, pages, data_bits });
+    Ok(())
 }
 
 /// Make NIC `i`'s DMA region, 2^bits bytes, and map it in its device's
@@ -676,17 +684,11 @@ fn alloc_channel(h: &mut Host, i: usize, data_bits: u32) -> Result<(), &'static 
 fn alloc_dma(h: &mut Host, i: usize, bits: usize) -> Result<(), &'static str> {
     let dom = nics()[i].dom.unwrap();
     let r = h.alloc.global(|alloc| -> Option<DmaRegion> {
-        let slot = alloc.slots.alloc();
-        let Some(mut region) = alloc.split(bits, slot) else {
-            alloc.slots.free(slot);
-            return None;
-        };
-        let pages = (1usize << bits) / PAGE;
-        let cn_bits = keep_bits(pages);
-        let cn_slot = alloc.object(ObjectBlueprint::CNode { size_bits: cn_bits });
-        let frames = root_cap::<cap_type::CNode>(cn_slot);
-        region.retype_dma(alloc.shared_dma, &FRAME_BP, pages, Dest { cnode: abs_of(frames), offset: 0 })?;
-        Some(DmaRegion { frames, bits: cn_bits, paddr: region.paddr, size: 1 << bits })
+        let shared = alloc.shared_dma;
+        let d = alloc.dma_frames(bits, shared, &FRAME_BP)?;
+        // Root's until reboot, with the region: never released.
+        core::mem::forget(d.arena);
+        Some(DmaRegion { frames: root_cap::<cap_type::CNode>(d.frames), bits: d.frames_bits, paddr: d.paddr, size: 1 << bits })
     }).ok_or("no memory for its DMA region")?;
     h.iommu.map(&mut h.alloc, dom, r.paddr, r.size, true);
     nics()[i].dma = Some(r);
@@ -724,18 +726,18 @@ fn spawn(h: &mut Host, i: usize) -> Result<(), &'static str> {
     allowed(h, i, d)?;
     group_free(i, d)?;
     nics()[i].confined = confined(h, i, d);
-    let n = &nics()[i];
     let m = drivers().drivers[d].manifest;
     let elf = drivers().drivers[d].elf;
-    if n.chan.is_none() {
-        alloc_channel(h, i, m.channel_bits())?;
-    }
-    reset_channel(h, i);
     let dma_bits = m.dma_bits as usize;
     let dma = 1usize << dma_bits;
     let confined = nics()[i].confined;
+    // Everything that can refuse comes before anything is made for good
+    // (the channel, the DMA region).
     let bars = bars_for(&nics()[i].pci, &m)?;
     let w = windowed(&nics()[i].pci, &m);
+    if nics()[i].dma.is_some_and(|r| r.size != dma) {
+        return Err("its DMA region was made for a driver that wanted another size: reboot to change");
+    }
     // Firmware blobs: copies in frames of its own, read-only to it.
     let mut blobs: [Option<&'static [u8]>; nicd::MAX_FIRMWARE] = [None; nicd::MAX_FIRMWARE];
     for (k, name) in m.firmware.iter().enumerate() {
@@ -744,21 +746,27 @@ fn spawn(h: &mut Host, i: usize) -> Result<(), &'static str> {
         }
     }
     // The image, the firmware copies, its keep CNode (a slot a page of
-    // every mapping, one object) and page tables: refused here rather
-    // than run out half way, where root's allocations panic.
+    // every mapping, one object) and page tables, and at its first start
+    // its channel with netd's mapping and its DMA region with the CNode
+    // of its frames and the IOMMU's tables: refused here rather than run
+    // out half way, where root's allocations panic.
     let fw: ArrayVec<usize, { nicd::MAX_FIRMWARE }> = blobs.iter().flatten().map(|b| b.len()).collect();
-    let budget = nicd::budget(m.image_max_bits, &fw, bar_pages(&w, bars), dma / PAGE, nics()[i].chan.as_ref().unwrap().pages);
-    let new_dma = if nics()[i].dma.is_none() { dma } else { 0 };
-    if !h.can_afford(budget.bytes + new_dma, 1, budget.slots) || h.alloc.largest_block_bits().is_none_or(|b| b < budget.min_block_bits) {
+    let chan_pages = nics()[i].chan.as_ref().map_or(uplink::channel_size(m.channel_bits()) / PAGE, |c| c.pages);
+    let budget = nicd::budget(m.image_max_bits, &fw, bar_pages(&w, bars), dma / PAGE, chan_pages);
+    let setup = nicd::setup(nics()[i].chan.is_none().then_some(chan_pages), nics()[i].dma.is_none().then_some(dma / PAGE));
+    let min_block_bits = budget.min_block_bits.max(setup.min_block_bits);
+    if budget.bytes.checked_add(setup.bytes).is_none_or(|b| !h.can_afford(b, 1, budget.slots))
+        || h.alloc.largest_block_bits().is_none_or(|b| b < min_block_bits) {
         return Err("no memory for it");
     }
+    if nics()[i].chan.is_none() {
+        alloc_channel(h, i, m.channel_bits())?;
+    }
+    reset_channel(h, i);
     if nics()[i].dma.is_none() {
         alloc_dma(h, i, dma_bits)?;
     }
     let dma_region = nics()[i].dma.unwrap();
-    if dma_region.size != dma {
-        return Err("its DMA region was made for a driver that wanted another size: reboot to change");
-    }
     // Another driver's buffers and descriptors are not this one's to see.
     if nics()[i].dma_driver.is_some_and(|o| o != d) {
         for p in 0..dma / PAGE {
@@ -784,6 +792,12 @@ fn spawn(h: &mut Host, i: usize) -> Result<(), &'static str> {
             return Err("no memory for it");
         };
         let keep = root_cap::<cap_type::CNode>(keep);
+        // Its CSpace's CNode, the next largest: component::create would
+        // make it with an allocation that panics.
+        let Some(cspace) = arena.try_object(&mut h.alloc, ObjectBlueprint::CNode { size_bits: host::CNODE_BITS }) else {
+            h.alloc.reclaim(arena);
+            return Err("no memory for it");
+        };
         let DmaRegion { frames: dma_cn, bits: dma_cn_bits, paddr: dma_paddr, .. } = dma_region;
         let dma_pages = dma / PAGE;
 
@@ -852,7 +866,7 @@ fn spawn(h: &mut Host, i: usize) -> Result<(), &'static str> {
             config: cfg_bytes,
             ntfn: None,
             service_ep: None,
-            cnode: None,
+            cnode: Some(root_cap::<cap_type::CNode>(cspace)),
             cnode_bits: None,
         };
         // Spread across the cores, netd's core (0) last.
