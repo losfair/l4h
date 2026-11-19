@@ -559,28 +559,45 @@ fn a_group_is_closed_under_reach_and_requester_aliases() {
 }
 
 #[test]
-fn amd_dummy_host_bridge_does_not_join_isolated_root_ports() {
-    let mut dummy = Func::pcie(0, None).multi();
-    dummy.space[0] = 0x1482_1022;
-    dummy.space[1] = 0;
-    dummy.space[2] = 0x0600_0000;
+fn a_host_bridge_does_not_join_isolated_root_ports_in_its_slot() {
+    let mut host_bridge = Func::pcie(0, None).multi();
+    host_bridge.space[0] = 0x149f_1022; // Genoa/Bergamo host bridge.
+    host_bridge.space[1] = 0;
+    host_bridge.space[2] = 0x0600_0000;
     let acs = SV | RR | CR | UF;
-    let model = |second_ctrl| Model::new(&[
-        (0x8008, dummy.clone()),
-        (0x8009, Func::pcie(acs::ROOT_PORT, Some((acs, acs))).bridge(0x81)),
-        (0x800a, Func::pcie(acs::ROOT_PORT, Some((acs, second_ctrl))).bridge(0x82)),
-        (0x8100, Func::pcie(0, None)),
-        (0x8200, Func::pcie(0, None)),
+    let port = |secondary, ctrl| {
+        let mut port = Func::pcie(acs::ROOT_PORT, Some((acs, ctrl))).bridge(secondary);
+        port.space[2] = 0x0604_0000;
+        port.space[0x18 / 4] |= 0x80;
+        port
+    };
+    let model = |first: Func, left: Func, right: Func| Model::new(&[
+        (0x8008, first), (0x8009, left), (0x800a, right),
+        (0x8100, Func::pcie(0, None)), (0x8200, Func::pcie(0, None)),
     ]);
     let inventory = || [0x8008, 0x8009, 0x800a, 0x8100, 0x8200].into_iter();
     let owner = |f| u8::from(f == 0x8200);
-    let mut out = [0u16; 8];
-    let separated = model(acs);
-    assert_eq!(acs::other_owner(&separated, inventory, |f| f, owner, 0x8200, &mut out), Ok(None));
-    let missing_redirect = model(acs & !RR);
-    assert!(acs::other_owner(&missing_redirect, inventory, |f| f, owner, 0x8200, &mut out).unwrap().is_some());
+    let other = |m, alias: fn(u16) -> u16| {
+        acs::other_owner(m, inventory, alias, owner, 0x8200, &mut [0u16; 8]).unwrap()
+    };
+
+    let separated = model(host_bridge.clone(), port(0x81, acs), port(0x82, acs));
+    assert_eq!(other(&separated, |f| f), None);
     let alias = |f| if f == 0x8200 { 0x8100 } else { f };
-    assert_eq!(acs::other_owner(&separated, inventory, alias, owner, 0x8200, &mut out), Ok(Some(0x8100)));
+    assert_eq!(other(&separated, alias), Some(0x8100));
+
+    let missing_redirect = model(host_bridge.clone(), port(0x81, acs), port(0x82, acs & !RR));
+    assert!(other(&missing_redirect, |f| f).is_some());
+
+    let mut integrated_endpoint = Func::pcie(acs::RC_ENDPOINT, None).multi();
+    integrated_endpoint.space[2] = host_bridge.space[2];
+    let mixed = model(integrated_endpoint, port(0x81, acs), port(0x82, acs));
+    assert_eq!(other(&mixed, |f| f), Some(0x8008));
+
+    let mut overlapping = port(0x81, acs);
+    overlapping.space[0x18 / 4] += 1 << 16;
+    let ambiguous = model(host_bridge, overlapping, port(0x82, acs));
+    assert!(other(&ambiguous, |f| f).is_some());
 }
 
 #[test]
