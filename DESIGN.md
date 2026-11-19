@@ -503,7 +503,8 @@ hooks (§10.2), the Android features of §5.8 and x86's
   reach it.
 - **VSpace pool.** x86_64 seL4 has only 4096 ASIDs (8 pools of 512), so
   each guest gets a fixed pool of 64 pre-assigned VSpace roots, recycled
-  least recently used first. An mm that loses its VSpace simply refaults.
+  least recently activated first. A running task pins its VSpace and reuses
+  it between user stops. An mm that loses its VSpace simply refaults.
   `arch_exit_mmap()` releases its VSpace and page-table objects when the
   last user exits, not at `destroy_context()`: lazy `active_mm` references
   and OOM bookkeeping can outlive `waitpid()`. A vCPU that finds every

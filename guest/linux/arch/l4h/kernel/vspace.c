@@ -569,7 +569,7 @@ static void vs_detach(struct vs_slot *s)
 /*
  * Empty a detached entry and free it.  That is one seL4 delete per mapping
  * and page table, so it runs without vs_lock and with interrupts as the
- * caller has them: every vCPU that returns to user mode takes vs_lock.
+ * caller has them: vCPUs that need to activate a VSpace take vs_lock.
  */
 static void vs_reset_free(struct vs_slot *s, bool may_sleep)
 {
