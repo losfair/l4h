@@ -46,6 +46,19 @@ pub const MAX_CORES: usize = 64;
 /// ASID pools: SLOT_ASID_POOL + i, `VmmgrConfig::asid_pools` of them.
 pub const SLOT_ASID_POOL: u64 = SLOT_SCHED_CONTROL + MAX_CORES as u64;
 pub const MAX_ASID_POOLS: usize = 8;
+
+/// How many ASID pools root makes for vmmgr when it starts it, of the
+/// `total` the kernel can have, root having made `root` (at least one,
+/// its boot pool) to assign its own components' ASIDs from: fresh ones,
+/// up to MAX_ASID_POOLS.  The two never share a pool: each would count
+/// the ASIDs the other assigns there as free, and the one that found
+/// none left where it counted some would panic (root's ASID pools are
+/// the host's, vmmgr's its control plane's).
+pub const fn vmmgr_asid_pools(total: usize, root: usize) -> usize {
+    let root = if root == 0 { 1 } else { root };
+    let left = total.saturating_sub(root);
+    if left < MAX_ASID_POOLS { left } else { MAX_ASID_POOLS }
+}
 /// memd's endpoint for guest g's l4h-vmm (badged as memd::Sender::Vmm(g)),
 /// which vmmgr copies into it: SLOT_VMM_MEMD_EP + g.
 pub const SLOT_VMM_MEMD_EP: u64 = SLOT_ASID_POOL + MAX_ASID_POOLS as u64;
@@ -240,7 +253,8 @@ pub struct VmmgrConfig {
     pub trust: u64,
     /// The kernel makes VT-x objects: guests get EPT roots.
     pub vtx: u64,
-    /// ASID pools in its CSpace, and the ASIDs already used in each.
+    /// ASID pools in its CSpace, and the ASIDs already used in each: fresh
+    /// pools of its own (`vmmgr_asid_pools`), so none.
     pub asid_pools: u64,
     pub asids_used: [u64; MAX_ASID_POOLS],
     /// The CNode at SLOT_MODULES: its radix, and the pages mapped.
@@ -279,6 +293,26 @@ mod tests {
         assert!(!nic_mac_ok(1 << 48));
         assert!(!nic_mac_ok(0x1_0200_0000_0001));
         assert!(!nic_mac_ok(u64::MAX));
+    }
+
+    #[test]
+    fn asid_pools_are_never_shared() {
+        // x86_64: 8 pools.  Root keeps its boot pool, vmmgr gets the
+        // other seven.  AArch64 (64 pools here): vmmgr gets
+        // MAX_ASID_POOLS, root may make more of the rest.
+        assert_eq!(vmmgr_asid_pools(8, 1), 7);
+        assert_eq!(vmmgr_asid_pools(64, 1), MAX_ASID_POOLS);
+        // Root counts as having its boot pool even before it lists one.
+        assert_eq!(vmmgr_asid_pools(8, 0), 7);
+        assert_eq!(vmmgr_asid_pools(8, 8), 0);
+        assert_eq!(vmmgr_asid_pools(1, 1), 0);
+        for total in 1..=128 {
+            for root in 0..=total {
+                let v = vmmgr_asid_pools(total, root);
+                assert!(root.max(1) + v <= total, "{total} pools, root {root}: vmmgr {v}");
+                assert!(v <= MAX_ASID_POOLS);
+            }
+        }
     }
 
     #[test]

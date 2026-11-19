@@ -382,10 +382,13 @@ pub fn try_create(
     // only if a writable segment covers them.  Segments come in ascending
     // order of address (as the ELF spec requires of PT_LOAD), so a page
     // two segments share is the last one's: the page before is reused.
+    // An empty segment has no page, even at an unaligned address (where
+    // its range would still hold the page it starts in).
     let page_range = |vaddr: u64, memsz: u64| (vaddr as usize & !(PAGE - 1))..(vaddr + memsz) as usize;
-    let writable = |page: usize| elf.segments().any(|s| s.writable && page_range(s.vaddr, s.memsz).contains(&page));
+    let segments = || elf.segments().filter(|s| s.memsz != 0);
+    let writable = |page: usize| segments().any(|s| s.writable && page_range(s.vaddr, s.memsz).contains(&page));
     let mut last: Option<(usize, cap::Granule)> = None;
-    for seg in elf.segments() {
+    for seg in segments() {
         let range = page_range(seg.vaddr, seg.memsz);
         assert!(last.is_none_or(|(p, _)| p <= range.start), "component ELF segments out of order");
         assert!(range.end <= host::INFO_VA, "component ELF reaches its info area and stacks");

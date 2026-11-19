@@ -164,6 +164,51 @@ pub const MAX_DMA_BITS: u8 = 26;
 pub const MAX_BAR_WINDOW_BITS: u8 = 26;
 pub const MAX_HEAP_BITS: u8 = 24;
 pub const MAX_IMAGE_BITS: u8 = 26;
+/// Loadable segments a driver image may have (a static Rust ELF has three
+/// to five): root, at priority 255, looks through them for every page it
+/// loads (l4h_task::component::create).
+pub const MAX_LOAD_SEGMENTS: usize = 32;
+
+/// Whether the loadable segments of a driver image, (vaddr, memsz) in the
+/// order of its program headers, with entry point `entry`, are what
+/// l4h_task::component::create loads (it refuses others, which root must
+/// never ask it to) within 2^`image_max_bits` bytes, counted in the whole
+/// pages it gives them as `budget` does, below `limit` (the info area):
+/// at most MAX_LOAD_SEGMENTS, none empty, in ascending order, the entry
+/// point in one.  Otherwise why not.
+pub fn image_ok(segments: impl Iterator<Item = (u64, u64)>, entry: u64, image_max_bits: u8, limit: u64) -> Result<(), &'static str> {
+    const PAGE: u64 = 4096;
+    let (mut n, mut lo, mut hi, mut end, mut has_entry) = (0, u64::MAX, 0, 0, false);
+    for (vaddr, memsz) in segments {
+        n += 1;
+        if n > MAX_LOAD_SEGMENTS {
+            return Err("it has too many loadable segments");
+        }
+        // An empty segment at an unaligned address would still be given
+        // the page it starts in.
+        if memsz == 0 {
+            return Err("it has an empty loadable segment");
+        }
+        let seg_end = vaddr.checked_add(memsz).ok_or("its image is outside a component's image area")?;
+        if vaddr & !(PAGE - 1) < end & !(PAGE - 1) {
+            return Err("its segments are out of order");
+        }
+        end = seg_end;
+        (lo, hi) = (lo.min(vaddr), hi.max(seg_end));
+        has_entry |= (vaddr..seg_end).contains(&entry);
+    }
+    if !has_entry {
+        return Err("its entry point is in no loadable segment");
+    }
+    let top = hi.checked_next_multiple_of(PAGE).ok_or("its image is outside a component's image area")?;
+    if lo < PAGE || top > limit {
+        return Err("its image is outside a component's image area");
+    }
+    if top - (lo & !(PAGE - 1)) > 1 << image_max_bits {
+        return Err("its image is larger than its manifest says");
+    }
+    Ok(())
+}
 
 impl Manifest {
     /// A manifest with nothing in it but its header: drivers fill it in
@@ -597,6 +642,59 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn driver_images_load_as_root_loads_them() {
+        const LIMIT: u64 = crate::INFO_VA as u64;
+        let ok = |segs: &[(u64, u64)], entry: u64, bits: u8| image_ok(segs.iter().copied(), entry, bits, LIMIT);
+        // A static Rust ELF: text, rodata, data and bss.
+        let normal = [(0x20_0000, 0x1_2345), (0x22_0000, 0x4000), (0x22_4000, 0x800), (0x22_5000, 0x3000)];
+        assert_eq!(ok(&normal, 0x20_0100, 16), Err("its image is larger than its manifest says"));
+        assert_eq!(ok(&normal, 0x20_0100, 22), Ok(()));
+        assert_eq!(ok(&normal, 0x30_0000, 22), Err("its entry point is in no loadable segment"));
+        assert_eq!(ok(&[], 0x20_0000, 22), Err("its entry point is in no loadable segment"));
+        // Segments sharing a page, in order; out of order.
+        assert_eq!(ok(&[(0x1000, 0x800), (0x1800, 0x800)], 0x1000, 16), Ok(()));
+        assert_eq!(ok(&[(0x3000, 0x1000), (0x1000, 0x1000)], 0x1000, 16), Err("its segments are out of order"));
+        // Below the first page, or reaching the info area.
+        assert_eq!(ok(&[(0x800, 0x100)], 0x800, 16), Err("its image is outside a component's image area"));
+        assert_eq!(ok(&[(LIMIT - 0x1000, 0x1001)], LIMIT - 0x1000, 16), Err("its image is outside a component's image area"));
+        assert_eq!(ok(&[(LIMIT - 0x1000, 0x1000)], LIMIT - 0x1000, 16), Ok(()));
+    }
+
+    #[test]
+    fn a_driver_image_has_few_loadable_segments() {
+        // MAX_LOAD_SEGMENTS, then one more: root scans every segment for
+        // each page it loads.
+        let segs = |n: u64| (0..n).map(|k| (0x1000 + k * 0x1000, 0x1000));
+        assert_eq!(image_ok(segs(MAX_LOAD_SEGMENTS as u64), 0x1000, 22, crate::INFO_VA as u64), Ok(()));
+        assert_eq!(image_ok(segs(MAX_LOAD_SEGMENTS as u64 + 1), 0x1000, 22, crate::INFO_VA as u64), Err("it has too many loadable segments"));
+        // Thousands of them (a 1 MiB image could hold 18,000): refused
+        // after the first too many, not walked whole.
+        let walked = core::cell::Cell::new(0);
+        let many = (0..20_000u64).map(|k| { walked.set(walked.get() + 1); (0x1000 + k * 0x1000, 0x1000) });
+        assert_eq!(image_ok(many, 0x1000, 26, crate::INFO_VA as u64), Err("it has too many loadable segments"));
+        assert_eq!(walked.get(), MAX_LOAD_SEGMENTS + 1);
+    }
+
+    #[test]
+    fn a_driver_image_has_no_empty_segment() {
+        // Unaligned, an empty segment would still take its page.
+        let segs = [(0x1000, 0x800), (0x2800, 0)];
+        assert_eq!(image_ok(segs.iter().copied(), 0x1000, 16, crate::INFO_VA as u64), Err("it has an empty loadable segment"));
+    }
+
+    #[test]
+    fn a_driver_image_is_counted_in_whole_pages() {
+        // 2^16 bytes of segment, but from the middle of a page: 17 pages,
+        // one more than `budget` gives an image of 2^16 bytes.
+        let segs = [(0x1800, 1 << 16)];
+        assert_eq!(image_ok(segs.iter().copied(), 0x1800, 16, crate::INFO_VA as u64), Err("its image is larger than its manifest says"));
+        assert_eq!(image_ok([(0x1000, 1 << 16)].into_iter(), 0x1000, 16, crate::INFO_VA as u64), Ok(()));
+        // Two segments, each in part of a page: their pages count whole.
+        let segs = [(0x1800, 0x7800), (0x9000, (1 << 16) - 0x7800)];
+        assert_eq!(image_ok(segs.iter().copied(), 0x1800, 16, crate::INFO_VA as u64), Err("its image is larger than its manifest says"));
+    }
 
     /// What a NIC's first start makes for good, within `setup`: the
     /// channel's frames and their CNode as root's arena asks for them,

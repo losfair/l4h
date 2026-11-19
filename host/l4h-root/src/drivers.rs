@@ -72,26 +72,11 @@ pub fn manifest(elf: &[u8]) -> Result<Manifest, &'static str> {
     let e = Elf::parse(elf)?;
     let s = e.section(nicd::MANIFEST_SECTION).ok_or("no manifest section")?;
     let m = Manifest::parse(s).ok_or("its manifest is out of bounds or of another ABI")?;
-    // The image's memory, within what the manifest says, below the info
-    // area and in ascending order, as l4h_task::component::create loads
-    // images (it refuses others, which root must never ask it to).
-    let (lo, hi) = e.bounds();
-    if e.segments().next().is_none() || !e.segments().any(|s| (s.vaddr..s.vaddr + s.memsz).contains(&e.entry)) {
-        return Err("its entry point is in no loadable segment");
-    }
-    if hi.saturating_sub(lo) > 1 << m.image_max_bits {
-        return Err("its image is larger than its manifest says");
-    }
-    if lo < 0x1000 || hi > l4h_host::INFO_VA as u64 {
-        return Err("its image is outside a component's image area");
-    }
-    let mut end = 0;
-    for s in e.segments() {
-        if s.vaddr & !0xfff < end & !0xfff {
-            return Err("its segments are out of order");
-        }
-        end = s.vaddr + s.memsz;
-    }
+    // The image's memory, within what the manifest says in the whole
+    // pages it takes, below the info area, in few non-empty segments in
+    // ascending order, as l4h_task::component::create loads images (it
+    // refuses others, which root must never ask it to).
+    nicd::image_ok(e.segments().map(|s| (s.vaddr, s.memsz)), e.entry, m.image_max_bits, l4h_host::INFO_VA as u64)?;
     Ok(m)
 }
 
