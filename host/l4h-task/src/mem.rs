@@ -336,6 +336,11 @@ impl<const N: usize> UtPool<N> {
         self.regions.iter().map(|r| r.size() - r.used).sum()
     }
 
+    /// Whether an object of 2^bits bytes fits in a region.
+    pub fn fits(&self, bits: usize) -> bool {
+        self.regions.iter().any(|r| r.fit(bits, 1).is_some())
+    }
+
     /// Add `r`, keeping the regions sorted by size (small objects come
     /// from small regions, so that big ones stay intact).  Gives it back
     /// if the pool is full.
@@ -413,8 +418,11 @@ impl AllocStorage {
 
 const SMALL_POOL_BITS: usize = 24;
 /// Regions of the global pool: SMALL_POOL_BITS each, refilled when it has
-/// less than half of one free; a full region is dropped from it.
+/// less than half of one free; a full region is dropped from it.  Without
+/// blocks that large (fragmented memory), smaller ones, down to 4 KiB.
 const POOL_REGIONS: usize = 8;
+/// Free bytes below which the pool takes any block it can get.
+const POOL_LOW: usize = 1 << 20;
 /// Free blocks, and split blocks, the allocator can keep track of: more
 /// than the boot Untypeds (seL4 hands out at most 230), and room for the
 /// pieces of hundreds of grants.
@@ -463,9 +471,31 @@ impl Alloc {
         a
     }
 
-    /// Keep the small-object pool stocked, preserving message registers.
+    /// Keep the small-object pool stocked, preserving message registers:
+    /// with a region of SMALL_POOL_BITS when it has less than half of one
+    /// free, if there is a block that large, here or in memd.
     pub fn refill(&mut self) {
-        if self.pool.free_bytes() >= 1 << (SMALL_POOL_BITS - 1) {
+        self.stock(12, false);
+    }
+
+    /// `refill`, and make sure that the pool has room for an object of
+    /// 2^bits bytes (`object`).  When there is no block of SMALL_POOL_BITS
+    /// (or 2^bits, if larger), here or in memd, and the pool cannot serve
+    /// the object or has less than POOL_LOW bytes left, it takes the
+    /// largest smaller block there is, down to 2^bits: memory fragmented
+    /// into 2 MiB blocks, which guests leave, must not make the next host
+    /// object panic while there is plenty of it.  Above POOL_LOW the pool
+    /// waits for a large block, without calling memd (its status says
+    /// when it has one), so that it does not fill with small regions, nor
+    /// drop regions that still have room (`add_pool_block`).
+    pub fn refill_for(&mut self, bits: usize) {
+        self.stock(bits, true);
+    }
+
+    fn stock(&mut self, bits: usize, fallback: bool) {
+        let bits = bits.max(12);
+        let fits = self.pool.fits(bits);
+        if fits && self.pool.free_bytes() >= 1 << (SMALL_POOL_BITS - 1) {
             return;
         }
         // Root and vmmgr refill before dispatching received calls and
@@ -475,18 +505,74 @@ impl Alloc {
             // Regions too full to be of use leave the pool; their objects
             // stay, as global objects do.
             self.pool.regions.retain(|r| r.size() - r.used >= 4096);
-            if self.pool.regions.is_full() {
-                let (i, _) = self.pool.regions.iter().enumerate().min_by_key(|(_, r)| r.size() - r.used).unwrap();
-                self.pool.regions.remove(i);
+            let urgent = fallback && (!self.pool.fits(bits) || self.pool.free_bytes() < POOL_LOW);
+            let want = SMALL_POOL_BITS.max(bits);
+            // What memd may have: its status names the largest block it
+            // has without merging (a lower bound); an unreadable status
+            // tells nothing, so a grant is tried.
+            let memd = self.memd.map(|m| m.status().map_or(usize::MAX, |s| match s.largest_block as usize {
+                0 => 0,
+                b => b.trailing_zeros() as usize,
+            }));
+            let local = self.blocks.iter().map(|b| b.size_bits).max().unwrap_or(0);
+            let avail = local.max(memd.unwrap_or(0));
+            // A block of the preferred size: when there is one, or one
+            // merging could make (in memd, whose status does not count
+            // those, only with the pool short).
+            if (urgent || avail >= want || memd.is_none()) && self.add_pool_block(want, urgent) {
+                return;
             }
-            let s = self.slots.global(|s| s.alloc());
-            match self.split(SMALL_POOL_BITS, s) {
-                Some(r) => {
-                    let _ = self.pool.add(r);
+            if !urgent {
+                return;
+            }
+            // That split merged what local buddies it could: blocks that
+            // may now be larger.
+            let local = self.blocks.iter().map(|b| b.size_bits).max().unwrap_or(0);
+            let avail = local.max(memd.unwrap_or(0));
+            // Fragmented: the largest smaller block there is, if any is
+            // large enough for the object.  memd has none below 2 MiB:
+            // smaller ones are local blocks, which no call to it is made for.
+            let mut b = avail.min(want - 1);
+            while b >= bits {
+                if b < BLOCK_BITS {
+                    b = b.min(local);
+                    if b < bits {
+                        break;
+                    }
                 }
-                None => self.slots.global(|sl| sl.free(s)),
+                if self.add_pool_block(b, true) {
+                    return;
+                }
+                b -= 1;
             }
         })
+    }
+
+    /// Add a block of 2^bits bytes to the pool.  A full pool drops the
+    /// region with the least room for it, whose room is lost (its objects
+    /// stay): only when `urgent`, or when that room is at most a sixteenth
+    /// of the new block.  False, with nothing dropped, if no block could
+    /// be had.
+    fn add_pool_block(&mut self, bits: usize, urgent: bool) -> bool {
+        let drop = if self.pool.regions.is_full() {
+            let (i, r) = self.pool.regions.iter().enumerate().min_by_key(|(_, r)| r.size() - r.used).unwrap();
+            if !urgent && (r.size() - r.used) * 16 > 1 << bits {
+                return false;
+            }
+            Some(i)
+        } else {
+            None
+        };
+        let s = self.slots.global(|s| s.alloc());
+        let Some(r) = self.split(bits, s) else {
+            self.slots.global(|sl| sl.free(s));
+            return false;
+        };
+        if let Some(i) = drop {
+            self.pool.regions.remove(i);
+        }
+        let _ = self.pool.add(r);
+        true
     }
 
     fn local_bytes(&self) -> usize {
@@ -602,7 +688,7 @@ impl Alloc {
 
     /// Allocate a single object into a fresh local slot.
     pub fn object(&mut self, bp: ObjectBlueprint) -> Slot {
-        self.refill();
+        self.refill_for(bp.physical_size_bits());
         let s = self.slots.alloc();
         self.pool
             .retype(&bp, 1, Dest::new(self.slots.cnode(), s))

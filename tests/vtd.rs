@@ -10,6 +10,8 @@ mod format;
 mod requester;
 #[path = "../host/l4h-root/src/iommu/mappings.rs"]
 mod mappings;
+#[path = "../host/l4h-root/src/iommu/tables.rs"]
+mod tables;
 use dmar::Dmar;
 
 #[test]
@@ -443,4 +445,80 @@ fn shared_tables_are_written_back_whole_before_the_unit_walks_them() {
     for later in ["self.context_table(", "w64(RTADDR", "w64(IRTA"] {
         assert!(flush < enable.find(later).unwrap(), "{later} before the write-back");
     }
+}
+
+/// The tables a walk makes for [pa, pa + len): one per distinct index at
+/// each level below the root, as Vtd::walk and AmdVi::walk make them.
+fn walked_tables(pa: usize, len: usize, levels: usize) -> usize {
+    let mut seen = std::collections::HashSet::new();
+    for at in (pa..pa + len).step_by(4096) {
+        for l in 1..levels {
+            seen.insert((l, at >> (12 + 9 * l)));
+        }
+    }
+    seen.len()
+}
+
+#[test]
+fn table_page_bounds_cover_every_walk() {
+    const MIB: usize = 1 << 20;
+    for levels in [3, 4, 5] {
+        for (pa, len) in [(0, 4096), (0x1ff000, 8192), (2 * MIB, 2 * MIB), (MIB, 4 * MIB), ((1 << 30) - 4096, 8192),
+            ((1 << 39) - 2 * MIB, 4 * MIB), (0x1234_5000, 64 * MIB + 4096)] {
+            let walked = walked_tables(pa, len, levels);
+            assert_eq!(tables::map_pages(pa, len, levels), walked, "{pa:#x}+{len:#x} levels {levels}");
+            assert!(tables::map_pages_any(len, levels) >= walked, "{pa:#x}+{len:#x} levels {levels}");
+        }
+        // Wherever a range starts, the bound holds.
+        for len in [4096, 2 * MIB, 6 * MIB] {
+            for start in (0..4 * MIB).step_by(1 << 16) {
+                assert!(tables::map_pages_any(len, levels) >= walked_tables((1 << 30) - start, len, levels));
+            }
+        }
+    }
+    assert_eq!(tables::map_pages(0x1000, 0, 4), 0);
+    assert_eq!(tables::map_pages_any(0, 4), 0);
+}
+
+/// An IOMMU's table pages: a reservation counts what is held for later
+/// mappings and asks for as many chunks as the pages need, across
+/// chunks; pages are handed out in order, a chunk at a time.
+#[test]
+fn table_pages_are_reserved_before_they_are_needed() {
+    use tables::{CHUNK_PAGES, Pages};
+    let mut p = Pages::new();
+    // No chunk yet: one for a page, two for one page more than a chunk.
+    assert_eq!(p.short(0, 0), 0);
+    assert_eq!(p.short(0, 1), 1);
+    assert_eq!(p.short(0, CHUNK_PAGES + 1), 2);
+    assert_eq!(p.take(0), None);
+    assert_eq!(p.take(1), Some((0, 0)));
+    assert_eq!(p.take(1), Some((0, 4096)));
+    assert_eq!(p.spare(1), CHUNK_PAGES - 2);
+    // Held pages are not anyone else's.
+    p.hold(CHUNK_PAGES - 3);
+    assert_eq!(p.short(1, 1), 0);
+    assert_eq!(p.short(1, 2), 1);
+    // Mapping what was held takes them: then they are free again.
+    p.unhold(CHUNK_PAGES - 3);
+    for k in 2..CHUNK_PAGES {
+        assert_eq!(p.take(1), Some((0, k * 4096)));
+    }
+    assert_eq!(p.take(1), None);
+    assert_eq!(p.short(1, 1), 1);
+    // Reserved chunks ahead are used in order.
+    assert_eq!(p.take(3), Some((1, 0)));
+    for _ in 1..CHUNK_PAGES {
+        p.take(3).unwrap();
+    }
+    assert_eq!(p.take(3), Some((2, 0)));
+    // A chunk taken whole (AMD-Vi's device table) leaves none of its pages.
+    let mut p = Pages::new();
+    p.take_chunk(1);
+    assert_eq!(p.spare(1), 0);
+    assert_eq!(p.take(2), Some((1, 0)));
+    // Unholding more than held, or holding without bound, cannot wrap.
+    p.unhold(5);
+    p.hold(usize::MAX);
+    assert!(p.short(2, 1) >= usize::MAX / CHUNK_PAGES - 1);
 }

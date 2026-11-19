@@ -509,8 +509,16 @@ fn group_free(i: usize, d: usize) -> Result<(), &'static str> {
 /// Bind NIC `i` to `driver`, or the first that matches, and start it.
 pub fn bind(h: &mut Host, i: usize, driver: Option<usize>) -> Result<(), &'static str> {
     nics().get(i).ok_or("no such NIC")?;
-    // Its IOMMU domain, which confinement needs (made once).
+    if driver.is_some_and(|d| drivers().drivers[d].manifest.matching(&nics()[i].ids).is_none()) {
+        return Err("the driver does not match the device");
+    }
+    // Its IOMMU domain, which confinement needs (made once), with the
+    // tables it takes: refused without the memory for them.
     if nics()[i].dom.is_none() {
+        let pages = h.iommu.attach_pages(&nics()[i].pci);
+        if !h.iommu.reserve(&mut h.alloc, pages) {
+            return Err("no memory for its IOMMU tables");
+        }
         let dom = h.iommu.attach(&mut h.alloc, &nics()[i].pci);
         nics()[i].dom = Some(dom);
     }
@@ -755,9 +763,18 @@ fn spawn(h: &mut Host, i: usize) -> Result<(), &'static str> {
     let budget = nicd::budget(m.image_max_bits, &fw, bar_pages(&w, bars), dma / PAGE, chan_pages);
     let setup = nicd::setup(nics()[i].chan.is_none().then_some(chan_pages), nics()[i].dma.is_none().then_some(dma / PAGE));
     let min_block_bits = budget.min_block_bits.max(setup.min_block_bits);
-    if budget.bytes.checked_add(setup.bytes).is_none_or(|b| !h.can_afford(b, 1, budget.slots))
+    let slots = budget.slots.checked_add(setup.slots);
+    if budget.bytes.checked_add(setup.bytes).zip(slots).is_none_or(|(b, s)| !h.can_afford(b, 1, s))
         || h.alloc.largest_block_bits().is_none_or(|b| b < min_block_bits) {
         return Err("no memory for it");
+    }
+    // The IOMMU's tables mapping its DMA region (alloc_dma), whose map
+    // would panic without them.
+    if nics()[i].dma.is_none() {
+        let pages = h.iommu.map_pages(nics()[i].dom.unwrap(), dma);
+        if !h.iommu.reserve(&mut h.alloc, pages) {
+            return Err("no memory for its IOMMU tables");
+        }
     }
     if nics()[i].chan.is_none() {
         alloc_channel(h, i, m.channel_bits())?;

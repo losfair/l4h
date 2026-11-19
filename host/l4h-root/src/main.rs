@@ -305,7 +305,7 @@ impl Host {
     pub fn can_afford(&self, bytes: usize, asids: usize, slots: usize) -> bool {
         bytes.checked_add(RESERVE_BYTES).is_some_and(|b| self.alloc.free_bytes() >= b)
             && self.asids.available() >= asids
-            && self.alloc.slots.available() >= RESERVE_SLOTS + slots
+            && slots.checked_add(RESERVE_SLOTS).is_some_and(|s| self.alloc.slots.available() >= s)
             && self.alloc.slots.largest_range() >= RESERVE_RANGE
     }
 

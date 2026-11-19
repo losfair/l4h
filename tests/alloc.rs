@@ -213,6 +213,11 @@ pub mod memd {
         pub static FREE: std::cell::Cell<Free> = const { std::cell::Cell::new(Free::Unexpected) };
         /// The batches `free` was called with: (physical address, size bits).
         pub static FREED: std::cell::RefCell<Vec<Vec<(usize, usize)>>> = const { std::cell::RefCell::new(Vec::new()) };
+        /// The largest block memd can grant (2^bits bytes): a larger
+        /// request fails, and takes nothing from GRANTS.
+        pub static MAX_BITS: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+        /// Calls to `alloc`: (size bits asked for, whether granted).
+        pub static ALLOCS: std::cell::RefCell<Vec<(usize, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
     }
 
     #[derive(Clone, Copy)]
@@ -226,8 +231,13 @@ pub mod memd {
 
     impl MemdLink {
         pub fn status(&self) -> Option<Status> { STATUS.get() }
-        pub fn alloc(&self, _: usize, _: usize) -> Option<usize> {
-            let paddr = GRANTS.with_borrow_mut(|g| g.pop().expect("unexpected memd allocation"));
+        pub fn alloc(&self, bits: usize, _: usize) -> Option<usize> {
+            let paddr = if bits > MAX_BITS.get() {
+                None
+            } else {
+                GRANTS.with_borrow_mut(|g| g.pop().expect("unexpected memd allocation"))
+            };
+            ALLOCS.with_borrow_mut(|a| a.push((bits, paddr.is_some())));
             crate::with_ipc_buffer_mut(|b| {
                 b.msg_regs_mut()[..2].copy_from_slice(&[if paddr.is_some() { 0 } else { u64::MAX }, paddr.unwrap_or(0) as u64]);
             });
@@ -711,4 +721,102 @@ fn a_full_arena_owns_its_pool_the_pool_cnode_and_every_port() {
         arena.own(s, (1 << 32) + k * (4 << 20), 22);
     }
     assert_eq!(arena.owned.len(), regions + 2 + MAX_GUEST_DEVICES);
+}
+
+/// Memory fragmented into 2 MiB blocks (memd has no 16 MiB one, though it
+/// has plenty of memory): the global pool takes them, rather than panic
+/// once its first region is used up.  Without a large block, it takes
+/// another only when it is short (under 1 MiB, or no room for the
+/// object), calls memd for none in between, and never drops a region
+/// that still has room for one of the same size.
+#[test]
+fn the_global_pool_refills_from_fragmented_memory() {
+    use memd::{ALLOCS, GRANTS, MAX_BITS, STATUS, Status};
+    const MIB: usize = 1 << 20;
+    let mut alloc = mem::Alloc::empty(
+        mem::Slots::new(Cap::from_bits(21), Box::leak(Box::new(mem::SlotStorage::<512, 32768>::new())), 64..32768),
+        Box::leak(Box::new(mem::AllocStorage::new())),
+    );
+    alloc.memd = Some(memd::MemdLink);
+    STATUS.set(Some(Status { free_bytes: 512 << 20, reported_bytes: 0, largest_block: 2 << 20 }));
+    MAX_BITS.set(21);
+    // 2 MiB blocks, none a buddy of another.
+    let grants: Vec<_> = (0..32).map(|i| Some((1usize << 32) + i * 4 * MIB)).rev().collect();
+    GRANTS.with_borrow_mut(|g| *g = grants);
+    ALLOCS.with_borrow_mut(Vec::clear);
+
+    // The first object takes a 2 MiB grant, after asking for 16 MiB.
+    alloc.object(ObjectBlueprint::Frame);
+    ALLOCS.with_borrow(|a| assert_eq!(a.as_slice(), [(24, false), (24, false), (24, false), (21, true)]));
+    assert_eq!(alloc.pool.regions.len(), 1);
+    assert_eq!(alloc.pool.free_bytes(), 2 * MIB - 4096);
+
+    // With 1 MiB or more left, refills ask memd nothing.
+    ALLOCS.with_borrow_mut(Vec::clear);
+    while alloc.pool.free_bytes() >= MIB {
+        alloc.object(ObjectBlueprint::Frame);
+        alloc.refill();
+    }
+    ALLOCS.with_borrow(|a| assert!(a.is_empty(), "{a:?}"));
+    assert_eq!(alloc.pool.regions.len(), 1);
+    // Under 1 MiB, the next takes another 2 MiB block.
+    alloc.object(ObjectBlueprint::Frame);
+    ALLOCS.with_borrow(|a| assert_eq!(a.as_slice(), [(24, false), (24, false), (24, false), (21, true)]));
+    assert_eq!(alloc.pool.regions.len(), 2);
+
+    // A 2 MiB object fits the new region, untouched.  The next is larger
+    // than any room the pool has: a block for it.
+    ALLOCS.with_borrow_mut(Vec::clear);
+    alloc.object(ObjectBlueprint::CNode { size_bits: 16 });
+    ALLOCS.with_borrow(|a| assert!(a.is_empty(), "{a:?}"));
+    alloc.object(ObjectBlueprint::CNode { size_bits: 16 });
+    ALLOCS.with_borrow(|a| assert_eq!(a.last(), Some(&(21, true))));
+
+    // 16 MiB more of small objects: the pool goes through 2 MiB blocks
+    // one at a time, using each up before it takes the next, and wastes
+    // none of them.
+    let grants = GRANTS.with_borrow(Vec::len);
+    for _ in 0..4096 {
+        alloc.object(ObjectBlueprint::Frame);
+        alloc.refill();
+        assert!(alloc.pool.regions.len() <= 2);
+    }
+    let taken = grants - GRANTS.with_borrow(Vec::len);
+    assert!(taken <= 9, "{taken} blocks for 16 MiB");
+    ALLOCS.with_borrow(|a| assert!(a.iter().filter(|&&(_, ok)| ok).all(|&(bits, _)| bits == 21)));
+
+    // memd with a 16 MiB block again: the pool takes it as before, with
+    // less than 8 MiB.
+    MAX_BITS.set(usize::MAX);
+    STATUS.set(Some(Status { free_bytes: 512 << 20, reported_bytes: 0, largest_block: 16 << 20 }));
+    GRANTS.with_borrow_mut(|g| g.push(Some(1 << 33)));
+    ALLOCS.with_borrow_mut(Vec::clear);
+    alloc.refill();
+    ALLOCS.with_borrow(|a| assert_eq!(a.as_slice(), [(24, true)]));
+    assert!(alloc.pool.free_bytes() >= 16 * MIB);
+    STATUS.set(None);
+}
+
+/// A pool short of room for an object takes the block that merging
+/// local buddies makes: the merge the preferred size's split does first
+/// (two free 2 MiB halves of a 4 MiB block) counts in the smaller blocks
+/// it falls back to, or a 4 MiB object would find none.
+#[test]
+fn the_pool_falls_back_to_a_block_merged_for_the_preferred_size() {
+    const MIB: usize = 1 << 20;
+    let boot = BootInfo(vec![Desc { paddr: 64 * MIB, bits: 22 }]);
+    let mut alloc = mem::Alloc::new(
+        mem::Slots::new(Cap::from_bits(21), Box::leak(Box::new(mem::SlotStorage::<512, 32768>::new())), 64..32768),
+        Box::leak(Box::new(mem::AllocStorage::new())),
+        &boot,
+    );
+    assert_eq!(alloc.pool.regions.len(), 0);
+    // Split into two 2 MiB halves, both free again: no block is 4 MiB.
+    let arena = alloc.arena(2 * MIB).unwrap();
+    alloc.reclaim(arena);
+    assert_eq!(alloc.largest_block_bits(), Some(21));
+    // A 4 MiB object: the split for the pool's 16 MiB merges the halves.
+    alloc.object(ObjectBlueprint::CNode { size_bits: 17 });
+    assert_eq!(alloc.pool.regions.len(), 1);
+    assert_eq!(alloc.local_free_bytes(), 0);
 }
