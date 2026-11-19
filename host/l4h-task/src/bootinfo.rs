@@ -2,12 +2,7 @@
 
 use sel4::BootInfoPtr;
 
-pub struct Untyped {
-    pub cap: sel4::cap::Untyped,
-    pub paddr: usize,
-    pub size_bits: usize,
-    pub is_device: bool,
-}
+use crate::mem::Untyped;
 
 /// The contents of the extra BootInfo chunk with this ID, after its header.
 pub fn extra_chunk(bootinfo: &BootInfoPtr, id: u64) -> Option<&'static [u8]> {

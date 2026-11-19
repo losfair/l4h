@@ -171,22 +171,20 @@ pub struct Desc {
     bits: usize,
 }
 
-impl Desc {
-    pub fn is_device(&self) -> bool { false }
-    pub fn paddr(&self) -> usize { self.paddr }
-    pub fn size_bits(&self) -> usize { self.bits }
-}
+struct BootMemory(Vec<Desc>);
 
-pub struct BootInfo(Vec<Desc>);
-pub struct UntypedSlots;
+impl IntoIterator for &BootMemory {
+    type Item = mem::Untyped;
+    type IntoIter = std::vec::IntoIter<Self::Item>;
 
-impl BootInfo {
-    pub fn untyped_list(&self) -> &[Desc] { &self.0 }
-    pub fn untyped(&self) -> UntypedSlots { UntypedSlots }
-}
-
-impl UntypedSlots {
-    pub fn index(&self, i: usize) -> init_thread::Slot<cap_type::Untyped> { init_thread::Slot::from_index(32 + i) }
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter().enumerate().map(|(i, desc)| mem::Untyped {
+            cap: init_thread::Slot::<cap_type::Untyped>::from_index(32 + i).cap(),
+            paddr: desc.paddr,
+            size_bits: desc.bits,
+            is_device: false,
+        }).collect::<Vec<_>>().into_iter()
+    }
 }
 
 pub mod memd {
@@ -279,7 +277,7 @@ fn retype_respects_kernel_fanout_and_keeps_contiguous_placement() {
 fn arena_growth_on_fragmented_memory_and_reclaim() {
     // Disjoint 2 MiB blocks with occupied holes between them; no buddies
     // can merge.  Slots and allocator tables are taken only once.
-    let boot = BootInfo((0..48).map(|i| Desc { paddr: (64 << 20) + i * (4 << 20), bits: 21 }).collect());
+    let boot = BootMemory((0..48).map(|i| Desc { paddr: (64 << 20) + i * (4 << 20), bits: 21 }).collect());
     let mut alloc = mem::Alloc::new(
         mem::Slots::new(slot::CNODE.cap(), SLOT_STORAGE.take(), 1024..CNODE_SLOTS), ALLOC_STORAGE.take(), &boot,
     );
@@ -320,7 +318,7 @@ fn arena_growth_on_fragmented_memory_and_reclaim() {
     // fragmented fixture.
     // VM_LOAD reserves one block's CNode and paging overhead before
     // making objects: a full arena must refuse despite free host RAM.
-    let boot = BootInfo((0..256).map(|i| Desc { paddr: (64 << 20) + i * (4 << 20), bits: 21 }).collect());
+    let boot = BootMemory((0..256).map(|i| Desc { paddr: (64 << 20) + i * (4 << 20), bits: 21 }).collect());
     let mut alloc = alloc.renew(&boot);
     let mut arena = alloc.arena(4 << 20).unwrap();
     let load_bytes = (32 << 10) + 2 * 4096;
@@ -343,7 +341,7 @@ fn arena_growth_on_fragmented_memory_and_reclaim() {
     // the boot-block reservation still fits, but the VMM's does not.
     // A large I/O pool needs a 2 MiB mapping CNode as well, which total
     // free bytes alone cannot promise.  Keep its CNodes from creation.
-    let boot = BootInfo((0..256).map(|i| Desc { paddr: (64 << 20) + i * (4 << 20), bits: 21 }).collect());
+    let boot = BootMemory((0..256).map(|i| Desc { paddr: (64 << 20) + i * (4 << 20), bits: 21 }).collect());
     let mut alloc = alloc.renew(&boot);
     let mut arena = alloc.arena(8 << 20).unwrap();
     for bits in [12, 16, 12] {
@@ -371,7 +369,7 @@ fn arena_growth_on_fragmented_memory_and_reclaim() {
     // On whole memory, the same reservations grow the arena by an eighth
     // at a time, so its regions stay few: thousands of loads (several
     // GiB of guest RAM) fit, where 1 MiB regions filled the table.
-    let boot = BootInfo(vec![Desc { paddr: 1 << 30, bits: 29 }]);
+    let boot = BootMemory(vec![Desc { paddr: 1 << 30, bits: 29 }]);
     let mut alloc = alloc.renew(&boot);
     let mut arena = alloc.arena(4 << 20).unwrap();
     for _ in 0..4000 {
@@ -391,13 +389,13 @@ fn arena_growth_on_fragmented_memory_and_reclaim() {
     request[0] = 7;
     request[1] = 0;
     with_ipc_buffer_mut(|b| b.msg_regs_mut().copy_from_slice(&request));
-    let boot = BootInfo(vec![Desc { paddr: 1 << 30, bits: 25 }]);
+    let boot = BootMemory(vec![Desc { paddr: 1 << 30, bits: 25 }]);
     let mut alloc = alloc.renew(&boot);
     with_ipc_buffer(|b| assert_eq!(b.msg_regs(), &request));
     assert_eq!(alloc.pool.free_bytes(), 16 << 20);
 
     for grant in [Some(1 << 30), None] {
-        alloc = alloc.renew(&BootInfo(vec![]));
+        alloc = alloc.renew(&BootMemory(vec![]));
         alloc.memd = Some(memd::MemdLink);
         memd::GRANTS.with_borrow_mut(|g| *g = if grant.is_some() { vec![grant] } else { vec![None, None] });
         with_ipc_buffer_mut(|b| b.msg_regs_mut().copy_from_slice(&request));
@@ -413,7 +411,7 @@ fn independent_allocators_use_their_own_cnodes_and_storage() {
     let mut root = mem::Alloc::new(
         mem::Slots::new(Cap::from_bits(1), Box::leak(Box::new(mem::SlotStorage::<2, 128>::new())), 64..128),
         Box::leak(Box::new(mem::AllocStorage::new())),
-        &BootInfo(vec![Desc { paddr: 1 << 30, bits: 25 }]),
+        &BootMemory(vec![Desc { paddr: 1 << 30, bits: 25 }]),
     );
     let mut manager = mem::Alloc::empty(
         mem::Slots::new(Cap::from_bits(11), Box::leak(Box::new(mem::SlotStorage::<4, 256>::new())), 128..256),
@@ -555,7 +553,7 @@ fn retype_dma_batches_4k_and_2m_and_shares_watermark() {
 /// of the free memory.  The rest of the arena is revoked and reused.
 #[test]
 fn reclaim_pinning_keeps_pinned_untyped_unrevoked() {
-    let boot = BootInfo(vec![Desc { paddr: 1 << 30, bits: 26 }]);
+    let boot = BootMemory(vec![Desc { paddr: 1 << 30, bits: 26 }]);
     let mut alloc = mem::Alloc::new(
         mem::Slots::new(Cap::from_bits(31), Box::leak(Box::new(mem::SlotStorage::<16, 1024>::new())), 64..1024),
         Box::leak(Box::new(mem::AllocStorage::new())),
@@ -604,7 +602,7 @@ fn reclaim_pinning_keeps_pinned_untyped_unrevoked() {
 #[test]
 fn a_given_up_load_frees_its_frames_slots() {
     const PAGES: usize = 256;
-    let boot = BootInfo(vec![Desc { paddr: 1 << 30, bits: 26 }]);
+    let boot = BootMemory(vec![Desc { paddr: 1 << 30, bits: 26 }]);
     let mut alloc = mem::Alloc::new(
         mem::Slots::new(Cap::from_bits(41), Box::leak(Box::new(mem::SlotStorage::<64, 4096>::new())), 64..4096),
         Box::leak(Box::new(mem::AllocStorage::new())),
@@ -631,7 +629,7 @@ fn a_given_up_load_frees_its_frames_slots() {
         assert_eq!(alloc.free_bytes(), free, "round {round}: memory leaked");
     }
     // Out of memory half way: the frames made so far are freed too.
-    let boot = BootInfo(vec![Desc { paddr: 1 << 30, bits: 20 }]);
+    let boot = BootMemory(vec![Desc { paddr: 1 << 30, bits: 20 }]);
     let mut alloc = alloc.renew(&boot);
     for round in 0..4 {
         let mut arena = alloc.arena(4096).unwrap();
@@ -656,19 +654,19 @@ fn a_given_up_load_frees_its_frames_slots() {
 /// region had taken the memory, and with it root.
 #[test]
 fn a_dma_region_that_does_not_fit_keeps_nothing() {
-    let new = |boot: &BootInfo| mem::Alloc::new(
+    let new = |boot: &BootMemory| mem::Alloc::new(
         mem::Slots::new(Cap::from_bits(51), Box::leak(Box::new(mem::SlotStorage::<64, 4096>::new())), 64..4096),
         Box::leak(Box::new(mem::AllocStorage::new())),
         boot,
     );
     // Only disjoint 2 MiB blocks: no 4 MiB region.
-    let mut alloc = new(&BootInfo((0..16).map(|i| Desc { paddr: (64 << 20) + i * (4 << 20), bits: 21 }).collect()));
+    let mut alloc = new(&BootMemory((0..16).map(|i| Desc { paddr: (64 << 20) + i * (4 << 20), bits: 21 }).collect()));
     let (slots, free) = (alloc.slots.available(), alloc.free_bytes());
     assert!(alloc.dma_frames(22, false, &ObjectBlueprint::Frame).is_none());
     assert_eq!((alloc.slots.available(), alloc.free_bytes()), (slots, free));
     // The region fits, the CNode of its frames does not: a 2 MiB block and
     // nothing else, again and again.
-    let mut alloc = alloc.renew(&BootInfo(vec![Desc { paddr: 64 << 20, bits: 21 }]));
+    let mut alloc = alloc.renew(&BootMemory(vec![Desc { paddr: 64 << 20, bits: 21 }]));
     let (slots, free) = (alloc.slots.available(), alloc.free_bytes());
     for round in 0..4 {
         assert!(alloc.dma_frames(21, false, &ObjectBlueprint::Frame).is_none(), "round {round}");
@@ -678,7 +676,7 @@ fn a_dma_region_that_does_not_fit_keeps_nothing() {
     assert!(alloc.dma_frames(11, false, &ObjectBlueprint::Frame).is_none());
     // Room for it: a 4 MiB region, its 1024 frames in a CNode of 1024
     // slots, given back (by a caller that gives up) to what there was.
-    let mut alloc = alloc.renew(&BootInfo(vec![Desc { paddr: 1 << 30, bits: 26 }]));
+    let mut alloc = alloc.renew(&BootMemory(vec![Desc { paddr: 1 << 30, bits: 26 }]));
     // Counted from the end of the first round, which splits blocks whose
     // parents keep slots.
     let (mut slots, mut free) = (0, 0);
@@ -702,7 +700,7 @@ fn a_dma_region_that_does_not_fit_keeps_nothing() {
 /// panicked root.
 #[test]
 fn a_full_arena_owns_its_pool_the_pool_cnode_and_every_port() {
-    let new = |boot: &BootInfo| mem::Alloc::new(
+    let new = |boot: &BootMemory| mem::Alloc::new(
         mem::Slots::new(Cap::from_bits(51), Box::leak(Box::new(mem::SlotStorage::<64, 4096>::new())), 1024..4096),
         Box::leak(Box::new(mem::AllocStorage::new())),
         boot,
@@ -710,7 +708,7 @@ fn a_full_arena_owns_its_pool_the_pool_cnode_and_every_port() {
     // Disjoint 1 MiB blocks (their Untypeds in slots 32..288), more than
     // an arena has regions: it grows a block at a time until its regions
     // are all taken.
-    let mut alloc = new(&BootInfo((0..256).map(|i| Desc { paddr: (64 << 20) + i * (2 << 20), bits: 20 }).collect()));
+    let mut alloc = new(&BootMemory((0..256).map(|i| Desc { paddr: (64 << 20) + i * (2 << 20), bits: 20 }).collect()));
     let mut arena = alloc.arena(1 << 20).unwrap();
     assert!(!arena.reserve(&mut alloc, 512 << 20));
     assert!(arena.pool.regions.is_full());
@@ -804,7 +802,7 @@ fn the_global_pool_refills_from_fragmented_memory() {
 #[test]
 fn the_pool_falls_back_to_a_block_merged_for_the_preferred_size() {
     const MIB: usize = 1 << 20;
-    let boot = BootInfo(vec![Desc { paddr: 64 * MIB, bits: 22 }]);
+    let boot = BootMemory(vec![Desc { paddr: 64 * MIB, bits: 22 }]);
     let mut alloc = mem::Alloc::new(
         mem::Slots::new(Cap::from_bits(21), Box::leak(Box::new(mem::SlotStorage::<512, 32768>::new())), 64..32768),
         Box::leak(Box::new(mem::AllocStorage::new())),

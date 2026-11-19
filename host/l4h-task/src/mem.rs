@@ -19,6 +19,14 @@ use crate::memd::MemdLink;
 
 pub type Slot = usize;
 
+/// One untyped capability supplied when the host starts.
+pub struct Untyped {
+    pub cap: cap::Untyped,
+    pub paddr: usize,
+    pub size_bits: usize,
+    pub is_device: bool,
+}
+
 /// Maximum objects retyped by one kernel invocation.
 pub const RETYPE_FAN_OUT: usize = sel4::sel4_cfg_usize!(RETYPE_FAN_OUT_LIMIT);
 
@@ -439,9 +447,9 @@ fn untyped_at(s: Slot) -> cap::Untyped {
 }
 
 impl Alloc {
-    pub fn new(slots: Slots, storage: &'static mut AllocStorage, bootinfo: &sel4::BootInfoPtr) -> Self {
+    pub fn new(slots: Slots, storage: &'static mut AllocStorage, untypeds: impl IntoIterator<Item = Untyped>) -> Self {
         let AllocStorage { blocks, parents, grants } = storage;
-        Self::with_tables(Alloc { slots, pool: UtPool::empty(), blocks, parents, memd: None, shared_dma: false, grants }, bootinfo)
+        Self::with_tables(Alloc { slots, pool: UtPool::empty(), blocks, parents, memd: None, shared_dma: false, grants }, untypeds)
     }
 
     /// An allocator with no memory until it is given a link to memd
@@ -451,18 +459,18 @@ impl Alloc {
         Alloc { slots, pool: UtPool::empty(), blocks, parents, memd: None, shared_dma: false, grants }
     }
 
-    /// A new allocator for `bootinfo`, with this one's slots and tables:
+    /// A new allocator for `untypeds`, with this one's slots and tables:
     /// storage is reused without allocating another set of tables.
-    pub fn renew(self, bootinfo: &sel4::BootInfoPtr) -> Self {
+    pub fn renew(self, untypeds: impl IntoIterator<Item = Untyped>) -> Self {
         let Alloc { slots, blocks, parents, grants, .. } = self;
         blocks.clear();
         parents.clear();
         grants.clear();
-        Self::with_tables(Alloc { slots, pool: UtPool::empty(), blocks, parents, memd: None, shared_dma: false, grants }, bootinfo)
+        Self::with_tables(Alloc { slots, pool: UtPool::empty(), blocks, parents, memd: None, shared_dma: false, grants }, untypeds)
     }
 
-    fn with_tables(mut a: Self, bootinfo: &sel4::BootInfoPtr) -> Self {
-        for desc in crate::bootinfo::untypeds(bootinfo) {
+    fn with_tables(mut a: Self, untypeds: impl IntoIterator<Item = Untyped>) -> Self {
+        for desc in untypeds {
             if !desc.is_device {
                 a.blocks.must_push(UtRegion::fresh(desc.cap, desc.paddr, desc.size_bits));
             }

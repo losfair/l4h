@@ -428,7 +428,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     );
     info!("l4h-root: CPU physical cores {:?}", topology.physical());
     let slots = Slots::new(slot::CNODE.cap(), SLOT_STORAGE.take(), bootinfo.empty().range());
-    let mut alloc = Alloc::new(slots, ALLOC_STORAGE.take(), bootinfo);
+    let mut alloc = Alloc::new(slots, ALLOC_STORAGE.take(), l4h_task::bootinfo::untypeds(bootinfo));
     // SEL4_BOOTINFO_HEADER_SHARED_DMA (FL4 on a confidential VM): devices
     // reach only frames shared with the hypervisor.
     const SHARED_DMA: u64 = 9;
