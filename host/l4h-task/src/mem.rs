@@ -439,7 +439,7 @@ fn untyped_at(s: Slot) -> cap::Untyped {
 }
 
 impl Alloc {
-    pub fn new(slots: Slots, storage: &'static mut AllocStorage, bootinfo: &sel4::BootInfo) -> Self {
+    pub fn new(slots: Slots, storage: &'static mut AllocStorage, bootinfo: &sel4::BootInfoPtr) -> Self {
         let AllocStorage { blocks, parents, grants } = storage;
         Self::with_tables(Alloc { slots, pool: UtPool::empty(), blocks, parents, memd: None, shared_dma: false, grants }, bootinfo)
     }
@@ -453,7 +453,7 @@ impl Alloc {
 
     /// A new allocator for `bootinfo`, with this one's slots and tables:
     /// storage is reused without allocating another set of tables.
-    pub fn renew(self, bootinfo: &sel4::BootInfo) -> Self {
+    pub fn renew(self, bootinfo: &sel4::BootInfoPtr) -> Self {
         let Alloc { slots, blocks, parents, grants, .. } = self;
         blocks.clear();
         parents.clear();
@@ -461,10 +461,10 @@ impl Alloc {
         Self::with_tables(Alloc { slots, pool: UtPool::empty(), blocks, parents, memd: None, shared_dma: false, grants }, bootinfo)
     }
 
-    fn with_tables(mut a: Self, bootinfo: &sel4::BootInfo) -> Self {
-        for (i, desc) in bootinfo.untyped_list().iter().enumerate() {
-            if !desc.is_device() {
-                a.blocks.must_push(UtRegion::fresh(bootinfo.untyped().index(i).cap(), desc.paddr(), desc.size_bits()));
+    fn with_tables(mut a: Self, bootinfo: &sel4::BootInfoPtr) -> Self {
+        for desc in crate::bootinfo::untypeds(bootinfo) {
+            if !desc.is_device {
+                a.blocks.must_push(UtRegion::fresh(desc.cap, desc.paddr, desc.size_bits));
             }
         }
         a.refill();

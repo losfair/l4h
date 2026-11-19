@@ -172,28 +172,6 @@ fn appended(bootinfo: &sel4::BootInfoPtr, out: &mut Modules, runs: &mut ArrayVec
     }
 }
 
-/// The contents of the extra bootinfo chunk `id`, after its header.
-pub fn extra_chunk(bootinfo: &sel4::BootInfoPtr, id: u64) -> Option<&'static [u8]> {
-    // rust-sel4's extra() skips IDs it does not know: walk the chunks here.
-    let granule = sel4::FrameObjectType::GRANULE.bytes();
-    let extra: &'static [u8] = unsafe {
-        core::slice::from_raw_parts(bootinfo.ptr().cast::<u8>().add(granule), bootinfo.footprint_size() - granule)
-    };
-    let word = |i: usize| u64::from_le_bytes(extra[i..i + 8].try_into().unwrap());
-    let mut off = 0;
-    while off + 16 <= extra.len() {
-        let (chunk, len) = (word(off), word(off + 8) as usize);
-        if len < 16 || len > extra.len() - off {
-            break;
-        }
-        if chunk == id {
-            return Some(&extra[off + 16..off + len]);
-        }
-        off += len;
-    }
-    None
-}
-
 #[cfg(not(target_arch = "x86_64"))]
 fn loader_modules(
     _bootinfo: &sel4::BootInfoPtr,
@@ -225,7 +203,7 @@ fn loader_modules(
     // paddr, size and a 64-byte name (seL4_X86_BootModules_t).
     const BOOT_MODULES: u64 = 8;
     const ENTRY: usize = 16 + 64;
-    let Some(c) = extra_chunk(bootinfo, BOOT_MODULES) else { return };
+    let Some(c) = l4h_task::bootinfo::extra_chunk(bootinfo, BOOT_MODULES) else { return };
     let word = |i: usize| u64::from_le_bytes(c[i..i + 8].try_into().unwrap()) as usize;
     let count = if c.len() >= 8 { word(0).min((c.len() - 8) / ENTRY) } else { 0 };
     let mut va = region.base;

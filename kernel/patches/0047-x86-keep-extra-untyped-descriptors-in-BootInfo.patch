@@ -1,0 +1,141 @@
+From e57eef6649d7c5fc43e60ff50e6acd6c9f53efba Mon Sep 17 00:00:00 2001
+From: l4h <l4h@localhost>
+Date: Thu, 19 Nov 2026 16:12:41 +0800
+Subject: [PATCH] x86: keep extra untyped descriptors in BootInfo
+
+---
+ include/kernel/boot.h                 |  8 ++++++++
+ libsel4/include/sel4/bootinfo_types.h |  2 ++
+ src/arch/x86/kernel/boot.c            | 16 +++++++++++++++-
+ src/kernel/boot.c                     | 18 ++++++++++++++++--
+ 4 files changed, 41 insertions(+), 3 deletions(-)
+
+diff --git a/include/kernel/boot.h b/include/kernel/boot.h
+index 511b3ac..1bce4e3 100644
+--- a/include/kernel/boot.h
++++ b/include/kernel/boot.h
+@@ -20,6 +20,11 @@ typedef cte_t *slot_ptr_t;
+ #define SLOT_PTR(pptr, pos) (((slot_ptr_t)(pptr)) + (pos))
+ #define pptr_of_cap(cap) ((pptr_t)cap_get_capPtr(cap))
+ 
++/* Additional descriptors fit in the existing x86 BootInfo extra frames. */
++#ifdef CONFIG_ARCH_X86
++#define X86_EXTRA_UNTYPED_CAPS 256
++#endif
++
+ /* (node-local) state accessed only during bootstrapping */
+ 
+ typedef struct ndks_boot {
+@@ -27,6 +32,9 @@ typedef struct ndks_boot {
+     word_t resv_count;
+     region_t   freemem[MAX_NUM_FREEMEM_REG];
+     seL4_BootInfo      *bi_frame;
++#ifdef CONFIG_ARCH_X86
++    uint8_t *extra_untypeds;
++#endif
+     seL4_SlotPos slot_pos_cur;
+ } ndks_boot_t;
+ 
+diff --git a/libsel4/include/sel4/bootinfo_types.h b/libsel4/include/sel4/bootinfo_types.h
+index 331de31..3d4d4e3 100644
+--- a/libsel4/include/sel4/bootinfo_types.h
++++ b/libsel4/include/sel4/bootinfo_types.h
+@@ -109,6 +109,8 @@ typedef enum {
+     SEL4_BOOTINFO_HEADER_AARCH64_ID_REGS    = 7, /* seL4_AArch64IdRegs */
+     SEL4_BOOTINFO_HEADER_X86_BOOT_MODULES   = 8, /* seL4_X86_BootModules */
+     /* Add more IDs here, the two elements below must always be at the end. */
++    SEL4_BOOTINFO_HEADER_X86_EXTRA_UNTYPEDS = 10, /* seL4_UntypedDesc[], slots follow untyped.end */
++
+     SEL4_BOOTINFO_HEADER_NUM,
+     SEL4_FORCE_LONG_ENUM(seL4_BootInfoID)
+ } seL4_BootInfoID;
+diff --git a/src/arch/x86/kernel/boot.c b/src/arch/x86/kernel/boot.c
+index 8f8216b..fad920b 100644
+--- a/src/arch/x86/kernel/boot.c
++++ b/src/arch/x86/kernel/boot.c
+@@ -145,6 +145,7 @@ BOOT_CODE bool_t init_sys_state(
+                           + extra_mods->count * sizeof(extra_mods->modules[0]);
+         extra_bi_size += extra_mods_size;
+     }
++    extra_bi_size += sizeof(seL4_BootInfoHeader) + X86_EXTRA_UNTYPED_CAPS * sizeof(seL4_UntypedDesc);
+     word_t extra_bi_size_bits = calculate_extra_bi_size_bits(extra_bi_size);
+ 
+     /* The region of the initial thread is the user image + ipcbuf and boot info */
+@@ -341,10 +342,23 @@ BOOT_CODE bool_t init_sys_state(
+     ndks_boot.bi_frame->numIOPTLevels = -1;
+ #endif
+ 
+-    /* create all of the untypeds. Both devices and kernel window memory */
++    /* Keep the first descriptors in seL4_BootInfo. Spill the remaining
++     * descriptors into an extra chunk and describe only slots we used. */
++    uint8_t *untyped_chunk = (uint8_t *)(rootserver.extra_bi + extra_bi_offset);
++    ndks_boot.extra_untypeds = untyped_chunk + sizeof(seL4_BootInfoHeader);
+     if (!create_untypeds(root_cnode_cap)) {
+         return false;
+     }
++    word_t extra_count = ndks_boot.slot_pos_cur - ndks_boot.bi_frame->untyped.end;
++    if (extra_count) {
++        seL4_BootInfoHeader header = {
++            .id = SEL4_BOOTINFO_HEADER_X86_EXTRA_UNTYPEDS,
++            .len = sizeof(header) + extra_count * sizeof(seL4_UntypedDesc),
++        };
++        memcpy(untyped_chunk, &header, sizeof(header));
++        extra_bi_offset += header.len;
++    }
++    ndks_boot.bi_frame->extraLen = extra_bi_offset;
+ 
+     /* finalise the bootinfo frame */
+     bi_finalise();
+diff --git a/src/kernel/boot.c b/src/kernel/boot.c
+index 7e19829..29f2dd6 100644
+--- a/src/kernel/boot.c
++++ b/src/kernel/boot.c
+@@ -734,13 +734,23 @@ BOOT_CODE static bool_t provide_untyped_cap(
+     }
+ 
+     word_t i = ndks_boot.slot_pos_cur - first_untyped_slot;
++    void *entry = NULL;
+     if (i < CONFIG_MAX_NUM_BOOTINFO_UNTYPED_CAPS) {
+-        ndks_boot.bi_frame->untypedList[i] = (seL4_UntypedDesc) {
++        entry = &ndks_boot.bi_frame->untypedList[i];
++    }
++#ifdef CONFIG_ARCH_X86
++    else if (i - CONFIG_MAX_NUM_BOOTINFO_UNTYPED_CAPS < X86_EXTRA_UNTYPED_CAPS) {
++        entry = ndks_boot.extra_untypeds + (i - CONFIG_MAX_NUM_BOOTINFO_UNTYPED_CAPS) * sizeof(seL4_UntypedDesc);
++    }
++#endif
++    if (entry) {
++        seL4_UntypedDesc desc = {
+             .paddr    = pptr_to_paddr((void *)pptr),
+             .sizeBits = size_bits,
+             .isDevice = device_memory,
+             .padding  = {0}
+         };
++        memcpy(entry, &desc, sizeof(desc));
+         word_t free_index = MAX_FREE_INDEX(size_bits);
+         if (clear_memory) {
+             clear_boot_memory(pptr, size_bits);
+@@ -753,7 +763,11 @@ BOOT_CODE static bool_t provide_untyped_cap(
+         ret = provide_cap(root_cnode_cap, ut_cap);
+     } else {
+         printf("Kernel init: Too many untyped regions for boot info\n");
++#ifdef CONFIG_ARCH_X86
++        ret = false;
++#else
+         ret = true;
++#endif
+     }
+     return ret;
+ }
+@@ -886,7 +900,7 @@ BOOT_CODE bool_t create_untypeds(cap_t root_cnode_cap)
+ 
+     ndks_boot.bi_frame->untyped = (seL4_SlotRegion) {
+         .start = first_untyped_slot,
+-        .end   = ndks_boot.slot_pos_cur
++        .end   = MIN(ndks_boot.slot_pos_cur, first_untyped_slot + CONFIG_MAX_NUM_BOOTINFO_UNTYPED_CAPS)
+     };
+ 
+     return true;
+-- 
+2.54.0 (Apple Git-157)
+

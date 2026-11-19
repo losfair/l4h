@@ -242,7 +242,7 @@ fn tsc_hz(bootinfo: &sel4::BootInfoPtr) -> u64 {
 fn cpu_id(bootinfo: &sel4::BootInfoPtr) -> [u64; 5] {
     // SEL4_BOOTINFO_HEADER_AARCH64_ID_REGS
     const ID_REGS: u64 = 7;
-    match bootmod::extra_chunk(bootinfo, ID_REGS) {
+    match l4h_task::bootinfo::extra_chunk(bootinfo, ID_REGS) {
         Some(c) if c.len() >= 5 * 8 => core::array::from_fn(|i| u64::from_le_bytes(c[8 * i..8 * i + 8].try_into().unwrap())),
         _ => [0; 5],
     }
@@ -432,7 +432,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     // SEL4_BOOTINFO_HEADER_SHARED_DMA (FL4 on a confidential VM): devices
     // reach only frames shared with the hypervisor.
     const SHARED_DMA: u64 = 9;
-    alloc.shared_dma = bootmod::extra_chunk(bootinfo, SHARED_DMA).is_some();
+    alloc.shared_dma = l4h_task::bootinfo::extra_chunk(bootinfo, SHARED_DMA).is_some();
     if alloc.shared_dma {
         info!("l4h-root: DMA memory shared with the hypervisor");
     }
