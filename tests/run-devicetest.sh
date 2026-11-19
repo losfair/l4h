@@ -5,8 +5,8 @@
 # planning, block reservations and service replies, and host log
 # publication, wraparound and concurrent readers/writers. Also exercises
 # endpoint fairness, bounded network batches, VMM CPU budgets, malformed
-# replies, hotplug retries and USB DMA ownership, and the CONSOLE_OUT
-# taint of dom0's console and display reads. --qemu
+# replies, hotplug retries, USB DMA ownership and 64-bit addressing, and
+# the CONSOLE_OUT taint of dom0's console and display reads. --qemu
 # also checks hypercalls under sustained console kicks.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -89,6 +89,11 @@ component = (root / 'host/l4h-task/src/component.rs').read_text()
     '    fn audit_vmm_copy(', '    fn audit_vmm_source(', '    pub fn give_live(']) + '\n}\n')
 root_usb = (root / 'host/l4h-root/src/usb.rs').read_text()
 (out / 'usb-attach.inc').write_text(function(root_usb, 'fn quarantine(') + '\n' + function(root_usb, 'pub fn poll('))
+# Root's own read of 64-bit addressing, and the start of attach, which
+# refuses a pool a 32-bit controller cannot reach.
+start = root_usb.index('pub fn attach(')
+end = root_usb.index('    let d = c.driver.as_mut().expect("claimed usbd");', start)
+(out / 'usb-ac64.inc').write_text(function(root_usb, 'fn caps(') + '\n' + root_usb[start:end] + '    let _ = h;\n    Ok(Attached)\n}\n')
 netd = (root / 'host/l4h-netd/src/main.rs').read_text()
 rx_full = function(netd, 'fn rx_full(').replace('    unsafe {', '    peer_before_load(p);\n    unsafe {', 1)
 (out / 'net-backlog.inc').write_text(next(line for line in netd.splitlines() if line.startswith('const BACKLOG_BUDGET:'))
@@ -206,6 +211,9 @@ L4H_VMM_AUDIT_TEST_SRC="$out/vmm-audit.inc" rustc +stable --edition=2024 --test 
 L4H_USB_ATTACH_TEST_SRC="$out/usb-attach.inc" rustc +stable --edition=2024 --test -L dependency="$out" \
     --extern l4h_host="$out/libl4h_host.rlib" "$root/tests/usb-attach.rs" -o "$out/usb-attach-tests"
 "$out/usb-attach-tests"
+L4H_USB_AC64_TEST_SRC="$out/usb-ac64.inc" rustc +stable --edition=2024 --test -L dependency="$out" \
+    --extern l4h_abi="$out/libl4h_abi.rlib" --extern l4h_host="$out/libl4h_host.rlib" "$root/tests/usb-ac64.rs" -o "$out/usb-ac64-tests"
+"$out/usb-ac64-tests"
 rustc +stable --edition=2024 --test -L dependency="$out" \
     --extern l4h_abi="$out/libl4h_abi.rlib" --extern l4h_host="$out/libl4h_host.rlib" \
     "$root/tests/vmm-sched.rs" -o "$out/vmm-sched-tests"
