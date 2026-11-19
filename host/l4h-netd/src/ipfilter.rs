@@ -252,6 +252,8 @@ fn ip6(f: &Filter, mac: &[u8; 6], p: &[u8]) -> Verdict {
     // The upper-layer header, unless this is a later fragment.
     let mut first = true;
     let mut frag = false;
+    // More fragments follow (not an atomic fragment, RFC 6946).
+    let mut more = false;
     let mut n = 0;
     // Hop-by-hop, routing, fragment, destination options, AH, mobility,
     // HIP, shim6.
@@ -266,6 +268,7 @@ fn ip6(f: &Filter, mac: &[u8; 6], p: &[u8]) -> Verdict {
             44 => {
                 frag = true;
                 first = be16(p, off + 2) >> 3 == 0;
+                more = be16(p, off + 2) & 1 != 0;
                 8
             }
             51 => (p[off + 1] as usize + 2) * 4,
@@ -285,7 +288,9 @@ fn ip6(f: &Filter, mac: &[u8; 6], p: &[u8]) -> Verdict {
     if first {
         match nh {
             IPPROTO_UDP if l4.len() < 8 || be16(l4, 0) == 547 || be16(l4, 2) == 546 => return Verdict::Denied,
-            IPPROTO_UDP if be16(l4, 2) == 547 && l4.get(8).is_none_or(|&t| dhcp6_server_type(t)) => {
+            // As for DHCP (IPv4): the type in a first fragment is not
+            // necessarily what the server reassembles.
+            IPPROTO_UDP if be16(l4, 2) == 547 && (more || l4.get(8).is_none_or(|&t| dhcp6_server_type(t))) => {
                 return Verdict::Denied;
             }
             IPPROTO_ICMPV6 => {

@@ -701,6 +701,17 @@ mod tests {
             assert_eq!(check(&f, &v6_frame(v6(5), 17, &u)), v, "type {t}");
         }
         assert_eq!(check(&f, &v6_frame(v6(5), 17, &udp(4000, 547)[..8])), Denied);
+        // A client's type in the first of several fragments is not
+        // necessarily the type the server reassembles; an atomic fragment
+        // is the whole message (padding_is_not_a_header).
+        for (more, v) in [(0, Pass), (1, Denied)] {
+            let mut fragmented = frag6(17, 0);
+            fragmented[3] |= more;
+            let mut u = udp(4000, 547);
+            u[8] = 1;
+            fragmented.extend(u);
+            assert_eq!(check(&f, &v6_frame(v6(5), 44, &fragmented)), v, "fragmented DHCPv6 to a server, M={more}");
+        }
         // Behind extension headers, and in a first fragment.
         let mut hidden = ext(60, 16);
         hidden.extend(ext(43, 8));

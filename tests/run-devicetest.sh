@@ -5,7 +5,8 @@
 # planning, block reservations and service replies, and host log
 # publication, wraparound and concurrent readers/writers. Also exercises
 # endpoint fairness, bounded network batches, VMM CPU budgets, malformed
-# replies, hotplug retries and USB DMA ownership. --qemu
+# replies, hotplug retries, USB DMA ownership and 64-bit addressing, and
+# the CONSOLE_OUT taint of dom0's console and display reads. --qemu
 # also checks hypercalls under sustained console kicks.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -88,6 +89,11 @@ component = (root / 'host/l4h-task/src/component.rs').read_text()
     '    fn audit_vmm_copy(', '    fn audit_vmm_source(', '    pub fn give_live(']) + '\n}\n')
 root_usb = (root / 'host/l4h-root/src/usb.rs').read_text()
 (out / 'usb-attach.inc').write_text(function(root_usb, 'fn quarantine(') + '\n' + function(root_usb, 'pub fn poll('))
+# Root's own read of 64-bit addressing, and the start of attach, which
+# refuses a pool a 32-bit controller cannot reach.
+start = root_usb.index('pub fn attach(')
+end = root_usb.index('    let d = c.driver.as_mut().expect("claimed usbd");', start)
+(out / 'usb-ac64.inc').write_text(function(root_usb, 'fn caps(') + '\n' + root_usb[start:end] + '    let _ = h;\n    Ok(Attached)\n}\n')
 netd = (root / 'host/l4h-netd/src/main.rs').read_text()
 rx_full = function(netd, 'fn rx_full(').replace('    unsafe {', '    peer_before_load(p);\n    unsafe {', 1)
 (out / 'net-backlog.inc').write_text(next(line for line in netd.splitlines() if line.startswith('const BACKLOG_BUDGET:'))
@@ -103,7 +109,12 @@ start = usbd.index('            abi::OP_SLOT_DISABLE => {')
 start = usbd.index('{', start)
 end = usbd.index('\n            abi::OP_ADDRESS =>', start)
 disable = usbd[start:end].rstrip().removesuffix(',')
-(out / 'usb-lifetime.inc').write_text('impl Usbd {\n' + reset + '\nfn disable(&mut self, r: &Request) -> i32 ' + disable + '\n}\n')
+start = usbd.index('            abi::OP_DEV_RESET => {')
+start = usbd.index('{', start)
+end = usbd.index('\n            abi::OP_EP_RESET =>', start)
+dev_reset = usbd[start:end].rstrip().removesuffix(',')
+(out / 'usb-lifetime.inc').write_text('impl Usbd {\n' + reset + '\nfn disable(&mut self, r: &Request) -> i32 ' + disable
+    + '\nfn dev_reset(&mut self, r: &Request) -> i32 ' + dev_reset + '\n}\n')
 # Keep the production boot sequence and reservation lifecycle intact.
 vmmgr = (root / 'host/l4h-vmmgr/src/main.rs').read_text()
 start = vmmgr.index('pub fn boot_dom0(')
@@ -143,6 +154,25 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq) -> Result<(), Errno>
 ''' + ctl[start:end] + '''
         _ => unreachable!(),
     }
+}
+''')
+# What dom0's console and display reads disclose, and their taint.
+start = ctl.index('        abi::CTL_CONSOLE_READ => {')
+end = ctl.index('        abi::CTL_USB_ATTACH => {', start)
+gpu_start = ctl.index('        abi::CTL_GPU_READ => {')
+gpu_end = ctl.index('        abi::CTL_CONSOLE_WRITE => {', gpu_start)
+gpu = (root / 'host/l4h-vmmgr/src/gpu.rs').read_text()
+(out / 'console-taint.inc').write_text(vm_arg + '''
+fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlResp) -> Result<(), Errno> {
+    let a = &req.args;
+    match req.op {
+''' + ctl[start:end] + ctl[gpu_start:gpu_end] + '''
+        _ => unreachable!(),
+    }
+}
+mod gpu {
+    use super::*;
+''' + function(gpu, 'pub fn read(') + '''
 }
 ''')
 PY
@@ -186,6 +216,9 @@ L4H_VMM_AUDIT_TEST_SRC="$out/vmm-audit.inc" rustc +stable --edition=2024 --test 
 L4H_USB_ATTACH_TEST_SRC="$out/usb-attach.inc" rustc +stable --edition=2024 --test -L dependency="$out" \
     --extern l4h_host="$out/libl4h_host.rlib" "$root/tests/usb-attach.rs" -o "$out/usb-attach-tests"
 "$out/usb-attach-tests"
+L4H_USB_AC64_TEST_SRC="$out/usb-ac64.inc" rustc +stable --edition=2024 --test -L dependency="$out" \
+    --extern l4h_abi="$out/libl4h_abi.rlib" --extern l4h_host="$out/libl4h_host.rlib" "$root/tests/usb-ac64.rs" -o "$out/usb-ac64-tests"
+"$out/usb-ac64-tests"
 rustc +stable --edition=2024 --test -L dependency="$out" \
     --extern l4h_abi="$out/libl4h_abi.rlib" --extern l4h_host="$out/libl4h_host.rlib" \
     "$root/tests/vmm-sched.rs" -o "$out/vmm-sched-tests"
@@ -238,6 +271,10 @@ L4H_BLK_ATTACH_TEST_SRC="$out/blk-attach.inc" rustc +stable --edition=2024 --tes
 L4H_VM_START_TEST_SRC="$out/vm-start.inc" rustc +stable --edition=2024 --test -L dependency="$out" \
     --extern l4h_abi="$out/libl4h_abi.rlib" "$root/tests/vm-start.rs" -o "$out/vm-start-tests"
 "$out/vm-start-tests"
+L4H_CONSOLE_TAINT_TEST_SRC="$out/console-taint.inc" rustc +stable --edition=2024 --test -L dependency="$out" \
+    --extern l4h_abi="$out/libl4h_abi.rlib" --extern l4h_host="$out/libl4h_host.rlib" \
+    "$root/tests/console-taint.rs" -o "$out/console-taint-tests"
+"$out/console-taint-tests"
 rustc +stable --edition=2024 --crate-type rlib --crate-name l4h_virtio \
     "$root/host/l4h-virtio/src/lib.rs" -o "$out/libl4h_virtio.rlib"
 rustc +stable --edition=2024 --test -L dependency="$out" \

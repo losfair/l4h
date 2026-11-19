@@ -77,11 +77,13 @@ pub enum State {
 pub struct Ctrl {
     pub pci: pci::Device,
     pub state: State,
-    /// USB 2 and USB 3 ports, 64-bit addressing: known once usbd has
-    /// answered the CLAIM.
-    claimed: bool,
+    /// USB 2 and USB 3 ports: known once usbd has answered the CLAIM.
     pub usb2: u16,
     pub usb3: u16,
+    /// 64-bit addressing (HCCPARAMS1.AC64): read by `claim` itself, so
+    /// that `attach` refuses a pool the controller cannot reach while the
+    /// CLAIM is still in flight too (usbd would refuse its ATTACH, which
+    /// quarantines the controller).
     ac64: bool,
     bars: BarCache,
     driver: Option<Usbd>,
@@ -187,7 +189,7 @@ pub fn found(d: pci::Device, pci: &pci::Pci, alloc: &mut crate::mem::Alloc, devm
     };
     info!("l4h-root: xHCI {:02x}:{:02x}.{} {:04x}:{:04x}: left to the firmware{}", d.bus, d.dev, d.func,
         d.vendor, d.device, if let State::Unsupported(w) = state { w } else { "" });
-    cs.must_push(Ctrl { pci: d, state, claimed: false, usb2: 0, usb3: 0, bars, driver: None, dom: Domain::NONE, pool: None, ac64: false });
+    cs.must_push(Ctrl { pci: d, state, usb2: 0, usb3: 0, bars, driver: None, dom: Domain::NONE, pool: None, ac64: false });
 }
 
 /// Stop the controller for good: usbd suspended, no DMA, no decoding, no
@@ -203,10 +205,10 @@ fn quarantine(c: &mut Ctrl, pci: &pci::Pci) {
 }
 
 /// The controller's capability registers, through a temporary mapping of
-/// BAR 0's first page: (max slots, scratchpad buffers, page size).  EIO if
-/// it has none root can use; EBUSY if it is not ready within CAP_WAIT_MS
-/// (the firmware is resetting it).
-fn caps(h: &mut Host, i: usize) -> Result<(u32, u32, u32), Errno> {
+/// BAR 0's first page: (max slots, scratchpad buffers, page size, 64-bit
+/// addressing).  EIO if it has none root can use; EBUSY if it is not ready
+/// within CAP_WAIT_MS (the firmware is resetting it).
+fn caps(h: &mut Host, i: usize) -> Result<(u32, u32, u32, bool), Errno> {
     let c = &mut ctrls()[i];
     let frames = bar_frames(&c.bars, 0);
     h.pci.enable_memory(&c.pci);
@@ -230,14 +232,14 @@ fn caps(h: &mut Host, i: usize) -> Result<(u32, u32, u32), Errno> {
             }
             core::hint::spin_loop();
         }
-        let (hcs1, hcs2) = (r32(4), r32(8));
+        let (hcs1, hcs2, hcc1) = (r32(4), r32(8), r32(0x10));
         let slots = hcs1 & 0xff;
         let scratch = ((hcs2 >> 21) & 0x1f) << 5 | (hcs2 >> 27);
         let pagesize = (r32(caplength + 0x08) & 0xffff).trailing_zeros();
         if slots == 0 || pagesize > 4 {
             return Err(ctl::EIO);
         }
-        Ok((slots, scratch, 4096 << pagesize))
+        Ok((slots, scratch, 4096 << pagesize, hcc1 & 1 != 0))
     })
 }
 
@@ -285,7 +287,7 @@ fn program_irq(h: &mut Host, i: usize, vector: u64, dom: Domain) {
 /// quarantines the controller (the handoff cannot be undone), and the
 /// guest that got it meanwhile sees no controller (no magic).
 fn claim(h: &mut Host, i: usize) -> Result<(), Errno> {
-    let (slots, scratch, page) = match caps(h, i) {
+    let (slots, scratch, page, ac64) = match caps(h, i) {
         Ok(caps) => caps,
         Err(e) if e == ctl::EBUSY => return Err(e),
         Err(e) => {
@@ -428,6 +430,7 @@ fn claim(h: &mut Host, i: usize) -> Result<(), Errno> {
     let mut u = Usbd { comp, arena, mailbox: mbox, ops: [None; RING], areas: [const { None }; usb::AREAS], idx: 0, waiting: false };
     send(&mut u, Request::Claim {}, Op::Claim);
     c.driver = Some(u);
+    c.ac64 = ac64;
     c.state = State::Idle;
     info!("l4h-root: xHCI {:02x}:{:02x}.{}: claiming it, {} KiB of DMA memory", d.bus, d.dev, d.func, dma >> 10);
     Ok(())
@@ -448,8 +451,7 @@ fn claimed(h: &mut Host, i: usize, w: &[u64]) {
             return;
         }
     };
-    (c.usb2, c.usb3, c.ac64) = (got.usb2, got.usb3, got.ac64);
-    c.claimed = true;
+    (c.usb2, c.usb3) = (got.usb2, got.usb3);
     route_intel_ports(&d, &h.pci);
     // An owner's ATTACH turns it back on.
     h.pci.bus_master(&d, false);
@@ -584,8 +586,8 @@ pub fn attach(h: &mut Host, i: usize, g: &mut RootGuest) -> Result<Attached, Err
         return Err(ctl::ENOSPC);
     }
     let c = &mut ctrls()[i];
-    // usbd checks it too, if it has not answered the CLAIM yet.
-    if c.claimed && !c.ac64 && g.pool.paddr.checked_add(g.pool.size).is_none_or(|e| e > 1 << 32) {
+    // usbd checks it too.
+    if !c.ac64 && g.pool.paddr.checked_add(g.pool.size).is_none_or(|e| e > 1 << 32) {
         return Err(ctl::EINVAL);
     }
     let d = c.driver.as_mut().expect("claimed usbd");

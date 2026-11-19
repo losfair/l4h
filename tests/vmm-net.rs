@@ -180,3 +180,102 @@ fn simultaneous_done_kick_and_deferred_work_process_only_one_batch() {
     assert_eq!(mem.reads.get(), 96, "another device's DONE must not read idle guest queue cache lines");
     unsafe { std::alloc::dealloc(chan.cast(), layout); }
 }
+
+/// Counts the queue work the device model hands it.
+struct Kicks { kicks: usize, accepted: Option<u64> }
+impl dev::Backend for Kicks {
+    fn device_id(&self) -> u32 { 1 }
+    fn features(&self) -> u64 { 0 }
+    fn num_queues(&self) -> usize { 2 }
+    fn queue_max(&self, _: usize) -> u32 { 256 }
+    fn init_config(&self, _: &mut [u8]) {}
+    fn kick(&mut self, _: &guest::GuestMem, _: &mut [virtq::Queue], _: usize) -> bool { self.kicks += 1; false }
+    fn complete(&mut self, _: &guest::GuestMem, _: &mut [virtq::Queue]) -> bool { false }
+    fn pending(&self) -> bool { false }
+    fn reset(&mut self) { self.accepted = None; }
+    fn features_accepted(&mut self, f: u64) { self.accepted = Some(f); }
+}
+
+const REQUIRED: u64 = dev::VIRTIO_F_VERSION_1 | dev::VIRTIO_F_ACCESS_PLATFORM;
+
+/// A device with the counting backend: (device, its register page, memory).
+fn kick_device() -> (dev::Device<Kicks>, Box<[u64; 512]>, guest::GuestMem, Vec<u8>) {
+    let mut bytes = vec![0u8; 0x4000];
+    let mem = guest::GuestMem {
+        inner: memory::GuestMem { base: bytes.as_mut_ptr() as usize, gpa: 0, size: bytes.len() as u64 },
+        reads: Cell::new(0), replenish: Cell::new(false), invalid: false, rx_peer: Cell::new(std::ptr::null_mut()),
+    };
+    let mut page = Box::new([0u64; 512]);
+    let d = dev::Device::new(page.as_mut_ptr() as usize, 16, Kicks { kicks: 0, accepted: None });
+    (d, page, mem, bytes)
+}
+
+fn regs(page: &mut [u64; 512]) -> *mut abi::VirtioRegs { page.as_mut_ptr().cast() }
+
+/// The guest kicks queue 0: how many queue kicks the backend has had.
+fn kick(d: &mut dev::Device<Kicks>, page: &mut [u64; 512], mem: &guest::GuestMem) -> usize {
+    unsafe { (*regs(page)).kick = 1; }
+    d.poll(mem, &guest::Vcpus { n: 1 }, 0);
+    d.backend.kicks
+}
+
+/// The guest writes `status` to its page, then commits it.
+fn status(d: &mut dev::Device<Kicks>, page: &mut [u64; 512], mem: &guest::GuestMem, status: u32) -> u64 {
+    unsafe {
+        (*regs(page)).driver_features = REQUIRED;
+        (*regs(page)).status = status;
+    }
+    d.op(mem, &guest::Vcpus { n: 1 }, abi::VIRTIO_OP_STATUS, 0, 0)
+}
+
+#[test]
+fn driver_ok_only_written_to_the_page_starts_no_queue_work() {
+    let (mut d, mut page, mem, _bytes) = kick_device();
+    // No status op at all: features were never accepted.
+    unsafe { (*regs(&mut page)).status = 1 | 2 | 4; }
+    assert_eq!(kick(&mut d, &mut page, &mem), 0, "a DRIVER_OK the device never accepted reached the backend");
+    assert_eq!(d.backend.accepted, None);
+    // The op refuses DRIVER_OK without FEATURES_OK (NEEDS_RESET); writing
+    // it back to the page does not undo the refusal.
+    assert_eq!(status(&mut d, &mut page, &mem, 1 | 2 | 4), u64::MAX);
+    assert_ne!(unsafe { (*regs(&mut page)).status } & 64, 0);
+    unsafe { (*regs(&mut page)).status = 1 | 2 | 4; }
+    assert_eq!(kick(&mut d, &mut page, &mem), 0, "the refused DRIVER_OK came back through the page");
+}
+
+#[test]
+fn a_refused_queue_keeps_driver_ok_out_until_reset() {
+    let (mut d, mut page, mem, _bytes) = kick_device();
+    assert_eq!(status(&mut d, &mut page, &mem, 1 | 2 | 8), 0);
+    assert_eq!(d.backend.accepted, Some(REQUIRED));
+    unsafe {
+        (*regs(&mut page)).queues[0].ready = 1;
+        (*regs(&mut page)).queues[0].num = 3;
+    }
+    assert_eq!(d.op(&mem, &guest::Vcpus { n: 1 }, abi::VIRTIO_OP_QUEUE, 0, 0), u64::MAX);
+    assert_eq!(status(&mut d, &mut page, &mem, 1 | 2 | 8 | 4), u64::MAX);
+    unsafe { (*regs(&mut page)).status = 1 | 2 | 8 | 4; }
+    assert_eq!(kick(&mut d, &mut page, &mem), 0, "DRIVER_OK bypassed the queue error");
+    // Reset clears the lockout.
+    assert_eq!(status(&mut d, &mut page, &mem, 0), 0);
+    assert_eq!(status(&mut d, &mut page, &mem, 1 | 2 | 8), 0);
+    assert_eq!(status(&mut d, &mut page, &mem, 1 | 2 | 8 | 4), 0);
+    assert!(kick(&mut d, &mut page, &mem) > 0);
+}
+
+#[test]
+fn failed_or_cleared_driver_ok_stops_queue_work() {
+    let (mut d, mut page, mem, _bytes) = kick_device();
+    assert_eq!(status(&mut d, &mut page, &mem, 1 | 2 | 8), 0);
+    // FAILED with DRIVER_OK: the driver gave up on the device.
+    assert_eq!(status(&mut d, &mut page, &mem, 1 | 2 | 8 | 4 | 128), 0);
+    assert_eq!(kick(&mut d, &mut page, &mem), 0, "a FAILED device still processed queues");
+    // Accepted: DRIVER_OK polls every queue, then each kick is served.
+    assert_eq!(status(&mut d, &mut page, &mem, 1 | 2 | 8 | 4), 0);
+    let accepted = d.backend.kicks;
+    assert!(accepted > 0, "DRIVER_OK polls the queues");
+    assert_eq!(kick(&mut d, &mut page, &mem), accepted + 1);
+    // Clearing DRIVER_OK through the op stops queue work again.
+    assert_eq!(status(&mut d, &mut page, &mem, 1 | 2 | 8), 0);
+    assert_eq!(kick(&mut d, &mut page, &mem), accepted + 1, "queue work after DRIVER_OK was cleared");
+}

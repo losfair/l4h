@@ -866,12 +866,18 @@ impl Usbd {
                 let Some((cc, _)) = self.command(Trb { param: 0, status: 0, control: CMD_RESET_DEVICE << 10 | (s as u32) << 24 }) else {
                     return abi::ST_TIMEOUT;
                 };
-                // Every endpoint but ep0 is disabled now (refused, the slot
-                // has none: it is in the Default state, xHCI 1.2 §4.6.11).
+                // A controller that refuses it should have no endpoint but
+                // ep0 (the slot is in the Default state, xHCI 1.2 §4.6.11);
+                // as for Disable Slot, only a successful reset stops it
+                // owning the rings.
+                if cc != CC_SUCCESS {
+                    return cc_status(cc);
+                }
+                // Every endpoint but ep0 is disabled now.
                 for dci in 2..32 {
                     self.drop_ep(s, dci);
                 }
-                if cc == CC_SUCCESS { abi::ST_OK } else { cc_status(cc) }
+                abi::ST_OK
             }
             abi::OP_EP_RESET => self.ep_reset(r.slot, arg[0]),
             abi::OP_STREAMS_ALLOC => self.streams(r.slot, r.drop, arg[0]),

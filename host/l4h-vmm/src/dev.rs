@@ -68,6 +68,9 @@ pub struct Device<B: Backend> {
     /// A queue was refused (an address outside the I/O pool, a bad size):
     /// DRIVER_OK fails until the device is reset.
     queue_error: bool,
+    /// DRIVER_OK as VIRTIO_OP_STATUS accepted it: the status in the
+    /// guest's page is only what the driver asked for.
+    driver_ok: bool,
     pub backend: B,
 }
 
@@ -84,6 +87,7 @@ impl<B: Backend> Device<B> {
             features: backend.features() | VIRTIO_F_VERSION_1 | VIRTIO_F_ACCESS_PLATFORM,
             features_ok: false,
             queue_error: false,
+            driver_ok: false,
             backend,
         };
         unsafe {
@@ -141,6 +145,7 @@ impl<B: Backend> Device<B> {
         self.next_queue = 0;
         self.features_ok = false;
         self.queue_error = false;
+        self.driver_ok = false;
         self.set_status(0);
     }
 
@@ -179,10 +184,12 @@ impl<B: Backend> Device<B> {
                 if s & STATUS_DRIVER_OK != 0 && (!self.features_ok || self.queue_error) {
                     // A queue outside the I/O pool, or features never
                     // accepted: the device stays unusable until reset.
+                    self.driver_ok = false;
                     self.set_status((s & !STATUS_DRIVER_OK) | STATUS_NEEDS_RESET);
                     return u64::MAX;
                 }
-                if s & STATUS_DRIVER_OK != 0 && s & STATUS_FAILED == 0 {
+                self.driver_ok = s & STATUS_DRIVER_OK != 0 && s & STATUS_FAILED == 0;
+                if self.driver_ok {
                     // Buffers may have been queued before DRIVER_OK.
                     self.poll(mem, vcpus, u64::MAX);
                 }
@@ -211,6 +218,7 @@ impl<B: Backend> Device<B> {
                 if !self.queues[q].setup(mem, regs.num, self.backend.queue_max(q), regs.desc, regs.driver, regs.device) {
                     unsafe { addr_of_mut!((*self.regs).queues[q].ready).write_volatile(0) };
                     self.queue_error = true;
+                    self.driver_ok = false;
                     return u64::MAX;
                 }
                 self.poll(mem, vcpus, u64::MAX);
@@ -259,7 +267,7 @@ impl<B: Backend> Device<B> {
             return;
         }
         let bits = kick.swap(0, Ordering::SeqCst) | extra;
-        if self.status() & STATUS_DRIVER_OK == 0 {
+        if !self.driver_ok {
             return;
         }
         let count = self.backend.num_queues();
@@ -286,7 +294,7 @@ impl<B: Backend> Device<B> {
                 let generation = addr_of!((*self.regs).config_generation).read_volatile();
                 addr_of_mut!((*self.regs).config_generation).write_volatile(generation.wrapping_add(1));
             }
-            if self.status() & STATUS_DRIVER_OK != 0 {
+            if self.driver_ok {
                 self.isr().fetch_or(abi::VIRTIO_ISR_CONFIG, Ordering::SeqCst);
                 vcpus.raise(self.irq_vcpu().min(vcpus.n - 1), self.event);
             }

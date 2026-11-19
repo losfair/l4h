@@ -4308,7 +4308,9 @@ checking taint alone leaves a session key exposed after its report.
 
 - `CONSOLE_WRITE` takes `CONSOLE_IN` before injecting bytes, including input
   queued before start. `CONSOLE_READ` and `GPU_READ` take `CONSOLE_OUT`
-  before disclosing text or pixels. Empty operations do not taint; a write
+  before disclosing text or pixels, or how much the guest wrote or drew
+  (the console's head, the display's frame counter and format). Empty
+  operations do not taint while the guest has output nothing; a write
   that finds its ring full does. Every call checks seals, empty ones
   included. An image copied into dom0's data area taints even if it changed
   and the read returns `-EAGAIN`. dom0's own console is exempt. The serial
