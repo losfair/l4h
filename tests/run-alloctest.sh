@@ -2,7 +2,8 @@
 # Host-side allocator fragmentation, reclaim and container panic checks,
 # the I/O pool sizing rules (host/l4h-host/src/iopool.rs), l4h-host's rings, and the
 # virtio-gpu display's size arithmetic and copies (host/l4h-host/src/gpu.rs),
-# and memd's grant validation and capability revocation.
+# memd's grant validation and capability revocation, and the carving of
+# device memory (host/l4h-root/src/devmem/span.rs).
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 mkdir -p "$root/build/alloctest"
@@ -10,6 +11,8 @@ rustc +stable --edition=2024 --test "$root/tests/alloc.rs" -o "$root/build/alloc
 "$root/build/alloctest/unit-tests"
 rustc +stable --edition=2024 --test "$root/tests/memd.rs" -o "$root/build/alloctest/memd-tests"
 "$root/build/alloctest/memd-tests"
+rustc +stable --edition=2024 --test "$root/tests/devmem.rs" -o "$root/build/alloctest/devmem-tests"
+"$root/build/alloctest/devmem-tests"
 rustc +stable --edition=2024 --test "$root/host/l4h-host/src/iopool.rs" -o "$root/build/alloctest/iopool-tests"
 "$root/build/alloctest/iopool-tests"
 rustc +stable --edition=2024 --test "$root/host/l4h-host/src/gpu.rs" -o "$root/build/alloctest/gpu-tests"

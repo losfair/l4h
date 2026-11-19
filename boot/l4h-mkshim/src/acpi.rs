@@ -133,18 +133,13 @@ impl Acpi {
         out
     }
 
-    /// The ECAM of segment 0: base, first and last bus.
-    pub fn ecam(&self) -> Option<(u64, u8, u8)> {
-        let t = table(self.find(b"MCFG")?);
-        let mut off = 44;
-        while off + 16 <= t.len() {
-            let e = &t[off..off + 16];
-            if rd16(e, 8) == 0 {
-                return Some((rd64(e, 0), e[10], e[11]));
-            }
-            off += 16;
-        }
-        None
+    /// The ECAM of segment 0: base, first and last bus
+    /// (l4h_partition::segment0_ecam), and how many of segment 0's MCFG
+    /// entries it leaves out.
+    pub fn ecam(&self) -> (Option<(u64, u8, u8)>, usize) {
+        let Some(t) = self.find(b"MCFG").map(table) else { return (None, 0) };
+        let entries = t.get(44..).unwrap_or(&[]).chunks_exact(16).map(|e| (rd64(e, 0), rd16(e, 8), e[10], e[11]));
+        l4h_partition::segment0_ecam(entries)
     }
 
     /// The CMOS register of the century, from the FADT (0: none).

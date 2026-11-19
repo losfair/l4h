@@ -56,9 +56,7 @@ const CFI: u32 = 1 << 23;
 const EAFL: u32 = 1 << 28;
 const QI_ERRORS: u32 = (1 << 4) | (1 << 5) | (1 << 6);
 // A unit's pages in the shared region.
-const SHARED_ROOT: usize = 0;
-const SHARED_QUEUE: usize = 1;
-const SHARED_IRT: usize = 8;
+use format::{SHARED_IRT, SHARED_QUEUE, SHARED_ROOT};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Domain {
@@ -295,7 +293,15 @@ impl Vtd {
             if self.units[n].control & EAFL != 0 { self.set_control(n, EAFL, false); }
             if self.units[n].control & CFI != 0 { self.set_control(n, CFI, false); }
             self.units[n].root = match self.shared {
-                Some(s) => s.unit_page(n, SHARED_ROOT).1,
+                Some(s) => {
+                    // The shim's zeros, to memory: before any entry is
+                    // made and the unit walks them (format::SHARED_WALKED).
+                    let unit = s.unit_page(n, 0).0;
+                    for (off, len) in format::SHARED_WALKED {
+                        self.flush_cpu(unit + off, len);
+                    }
+                    s.unit_page(n, SHARED_ROOT).1
+                }
                 None => self.page(alloc).1,
             };
         }

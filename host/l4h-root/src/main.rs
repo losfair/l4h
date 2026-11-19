@@ -570,9 +570,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     let (msix_blocks, mut msix_complete) = (pci::MSIX_BLOCKS.take(), true);
     for d in pci.enumerate() {
         pci_inventory.must_push(pci.identity(&d));
-        for b in pci.msix_blocks(&d).into_iter().flatten() {
-            msix_complete &= msix_blocks.push(b).is_ok();
-        }
+        msix_complete &= pci.msix_blocks(&d, |b| msix_blocks.push(b).is_ok());
         let record = pci_inventory.last_mut().unwrap();
         info!(
             "l4h-root: pci {:02x}:{:02x}.{} {:04x}:{:04x} class {:02x}{:02x}",

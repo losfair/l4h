@@ -168,10 +168,14 @@ extern "C" fn shim_main(magic: u32, info: u64) -> ! {
     };
     // Without MCFG (GCE's i440FX), PCI configuration through ports: the
     // partitions' roots then share them under a lock (ecam_base 0).
-    let pci = pci::Pci::new(acpi.ecam());
-    match acpi.ecam() {
+    let (ecam, left_out) = acpi.ecam();
+    let pci = pci::Pci::new(ecam);
+    match ecam {
         Some((base, start, end)) => println!("PCI configuration through ECAM at {:#x}, buses {}-{}", base, start, end),
         None => println!("no MCFG: PCI configuration through ports 0xcf8/0xcfc"),
+    }
+    if left_out > 0 {
+        println!("warning: {} of the MCFG's segment 0 entries are not this ECAM window: the buses only they decode are left out, their functions in no partition", left_out);
     }
     let funcs = pci.scan();
 
@@ -278,7 +282,7 @@ extern "C" fn shim_main(magic: u32, info: u64) -> ! {
     unsafe { phys_mut(out.start, part::IOMMU_REGION_SIZE as usize).fill(0) };
 
     // Descriptors.
-    let ecam = acpi.ecam().unwrap_or((0, 0, 0));
+    let ecam = ecam.unwrap_or((0, 0, 0));
     let mut parts_info = [part::PartInfo::default(); MAX_PARTITIONS];
     for (k, p) in plans.iter_mut().enumerate() {
         p.block = out.start + part::IOMMU_REGION_SIZE + k as u64 * OUT_BLOCK;

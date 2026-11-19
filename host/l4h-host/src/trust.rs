@@ -615,6 +615,78 @@ pub fn msix_blocks(ctrl: u16, table: u32, pba: u32, bar: impl Fn(u8) -> Option<u
     [at(table, n * 16), at(pba, n.div_ceil(64) * 8)]
 }
 
+/// The BARs of a function with header type `header`: six of type 0, two
+/// of a PCI-to-PCI bridge (type 1), none of a CardBus bridge.
+pub const fn bar_count(header: u8) -> usize {
+    match header & 0x7f {
+        0 => 6,
+        1 => 2,
+        _ => 0,
+    }
+}
+
+/// Where a function's memory BAR `i` (of `bar_count`) decodes, from its
+/// registers as `config` reads a dword at an offset: None for an I/O BAR,
+/// one past the function's BARs, or a 64-bit one in the last register,
+/// whose upper half is not a BAR.  Not sized: reading is all it takes.
+pub fn bar_address(config: &impl Fn(usize) -> u32, header: u8, i: u8) -> Option<u64> {
+    let n = bar_count(header);
+    // The lower half of a 64-bit BAR before it says what register `i` is.
+    let mut at = 0;
+    while at < n {
+        let lo = config(0x10 + 4 * at);
+        let is64 = lo & 1 == 0 && (lo >> 1) & 3 == 2;
+        if at == i as usize {
+            return match (lo & 1 != 0, is64) {
+                (true, _) => None,
+                (false, false) => Some((lo & !0xf) as u64),
+                (false, true) if at + 1 < n => Some((lo & !0xf) as u64 | (config(0x10 + 4 * at + 4) as u64) << 32),
+                (false, true) => None,
+            };
+        }
+        at += if is64 { 2 } else { 1 };
+    }
+    None
+}
+
+/// Every MSI-X table and pending bit array of a function, each passed to
+/// `push`, from its configuration space as `config` reads a dword at an
+/// offset: of every MSI-X capability its list has, in the BARs of its
+/// header type (bridges' too), whatever the BAR's size.  False if they may
+/// not be all: the capability list cannot be walked (a pointer into the
+/// header, a capability past the first 256 bytes, more than 48 entries),
+/// or `push` refused one.  A function the firmware left mastering the bus
+/// sends what is written there as interrupts.
+pub fn function_msix_blocks(config: impl Fn(usize) -> u32, mut push: impl FnMut((u64, u64)) -> bool) -> bool {
+    let header = (config(0xc) >> 16) as u8 & 0x7f;
+    if config(4) >> 16 & 0x10 == 0 {
+        return true;
+    }
+    let read8 = |off: usize| (config(off & !3) >> (off % 4 * 8)) as u8;
+    let mut ptr = (read8(0x34) & !3) as usize;
+    let mut hops = 0;
+    while ptr != 0 {
+        if ptr < 0x40 || hops == 48 {
+            return false;
+        }
+        if read8(ptr) == 0x11 {
+            if ptr + 12 > 0x100 {
+                return false;
+            }
+            let ctrl = (config(ptr) >> 16) as u16;
+            let bar = |i: u8| bar_address(&config, header, i);
+            for b in msix_blocks(ctrl, config(ptr + 4), config(ptr + 8), bar).into_iter().flatten() {
+                if !push(b) {
+                    return false;
+                }
+            }
+        }
+        ptr = (read8(ptr + 1) & !3) as usize;
+        hops += 1;
+    }
+    true
+}
+
 /// Whether the access [addr, addr + width) lies within [base, base + size).
 pub const fn hw_within(addr: usize, width: usize, base: u64, size: u64) -> bool {
     let (addr, width) = (addr as u64, width as u64);
@@ -650,6 +722,58 @@ pub const HW_REFUSED_PORTS: [(usize, usize); 9] =
 /// could send any vector, NMI or INIT to any CPU, another partition's
 /// too.
 pub const HPET_DEFAULT: (u64, u64) = (0xfed0_0000, 0x400);
+
+/// The page where PCs put the chipset's I/O APIC, as HPET_DEFAULT is
+/// the HPET's (every other one is the MADT's, `madt_ioapic_pages`), and
+/// the local APICs' and MSIs' megabyte: the AML reaches neither.  An I/O APIC's redirection entries and a local
+/// APIC's interrupt command register send any vector, NMI, INIT or SIPI,
+/// and neither the IOMMU (an I/O APIC is a special device AMD-Vi passes
+/// through, and none is remapped on another partition's or C seL4's
+/// I/O APIC) nor the kernel stands in between.  The TPM (0xfed4_0000) and
+/// AMD's FCH (its SPI and eSPI at 0xfec1_0000 and 0xfec2_0000, the rest
+/// at 0xfed8_0000), whose registers an fTPM's start method may use, are
+/// outside both.
+pub const IOAPIC_DEFAULT: (u64, u64) = (0xfec0_0000, 0x1000);
+pub const LAPIC_MSI: (u64, u64) = (0xfee0_0000, 0x10_0000);
+/// The I/O APICs root keeps of the MADT for `madt_ioapic_pages`.  A table
+/// with more is not truncated: it says so, and root then refuses every
+/// memory write of the AML.
+pub const MAX_IOAPIC_PAGES: usize = 32;
+
+/// The register pages of the I/O APICs the MADT `table` lists (its first
+/// bytes; the table is `len` bytes long), and whether they are all of
+/// them: false if `table` is not the whole table, an entry runs past its
+/// end, or it lists more than MAX_IOAPIC_PAGES I/O APICs.  An I/O APIC
+/// entry (type 1) has its address at 4.
+pub fn madt_ioapic_pages(table: &[u8], len: usize) -> (crate::fixed::ArrayVec<(u64, u64), MAX_IOAPIC_PAGES>, bool) {
+    let mut pages = crate::fixed::ArrayVec::new();
+    let mut complete = table.len() >= len && len >= 44;
+    let t = &table[..table.len().min(len)];
+    let mut at = 44;
+    while at < t.len() {
+        let Some(&[ty, n]) = t.get(at..at + 2).map(|h| <&[u8; 2]>::try_from(h).unwrap()) else {
+            complete = false;
+            break;
+        };
+        let Some(e) = t.get(at..at + n as usize).filter(|e| e.len() >= 2) else {
+            complete = false;
+            break;
+        };
+        if ty == 1 {
+            match e.get(4..8) {
+                Some(a) if n >= 12 => {
+                    let page = u32::from_le_bytes(a.try_into().unwrap()) as u64 & !0xfff;
+                    if !pages.iter().any(|&(p, _)| p == page) && pages.push((page, 0x1000)).is_err() {
+                        complete = false;
+                    }
+                }
+                _ => complete = false,
+            }
+        }
+        at += e.len();
+    }
+    (pages, complete)
+}
 
 /// The register block of the HPET table `table` (its first bytes): its
 /// base address, if in memory space, and the block's 1 KiB.
@@ -821,7 +945,9 @@ impl Default for AttestNotices {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
+    use std::vec;
 
     #[test]
     fn a_record_is_one_instances() {
@@ -988,6 +1114,141 @@ mod tests {
         assert_eq!(msix_blocks(64, 0, 0x800, bar), [Some((0xfe00_0000, 1040)), Some((0xfe00_0800, 16))]);
         assert_eq!(msix_blocks(0, 1, 0, bar), [None, Some((0xfe00_0000, 8))]);
         assert!(hw_meets(0xfe00_207c, 4, 0xfe00_2000, 128) && !hw_meets(0xfe00_2080, 4, 0xfe00_2000, 128));
+    }
+
+    /// A function's configuration space: header type, BAR registers, and
+    /// MSI-X capabilities at `caps` (offset, Table register, PBA
+    /// register, next), linked from 0x34.
+    fn function(header: u8, bars: &[(usize, u32)], caps: &[(usize, u32, u32, u8)]) -> [u8; 256] {
+        let mut c = [0u8; 256];
+        c[0xe] = header;
+        for &(i, v) in bars {
+            c[0x10 + 4 * i..0x14 + 4 * i].copy_from_slice(&v.to_le_bytes());
+        }
+        if let Some(&(first, ..)) = caps.first() {
+            c[6] = 0x10;
+            c[0x34] = first as u8;
+        }
+        for &(at, table, pba, next) in caps {
+            // Message Control: 8 vectors.
+            c[at..at + 4].copy_from_slice(&[0x11, next, 7, 0]);
+            c[at + 4..at + 8].copy_from_slice(&table.to_le_bytes());
+            c[at + 8..at + 12].copy_from_slice(&pba.to_le_bytes());
+        }
+        c
+    }
+
+    fn blocks_of(c: &[u8; 256], room: usize) -> (std::vec::Vec<(u64, u64)>, bool) {
+        let mut v = std::vec::Vec::new();
+        let complete = function_msix_blocks(|o| u32::from_le_bytes(c[o..o + 4].try_into().unwrap()), |b| {
+            v.push(b);
+            v.len() <= room
+        });
+        (v, complete)
+    }
+
+    #[test]
+    fn every_msix_table_of_every_function_or_none_trusted() {
+        // A PCIe root port (type 1) with MSI-X in its 64-bit BAR0: never
+        // sized, its table and pending bits are still known.
+        let port = function(1, &[(0, 0xfe10_0004), (1, 0x2)], &[(0x80, 0x1000, 0x1800, 0)]);
+        assert_eq!(blocks_of(&port, 8), (vec![(0x2_fe10_1000, 128), (0x2_fe10_1800, 8)], true));
+        // A bridge has two BARs: BIR 2 is none, and its bus numbers
+        // (0x18) are not a BAR's upper half.
+        let port = function(1, &[(0, 0xfe10_0000), (1, 0xfe20_0000), (2, 0x0003_0201)], &[(0x80, 2, 1, 0)]);
+        assert_eq!(blocks_of(&port, 8), (vec![(0xfe20_0000, 8)], true));
+        let config = |o: usize| u32::from_le_bytes(port[o..o + 4].try_into().unwrap());
+        assert_eq!(bar_address(&|o| if o == 0x14 { 0xfe20_0004 } else { config(o) }, 1, 1), None);
+        // A 64-bit BAR in the last register of a type 0 function is none.
+        assert_eq!(bar_address(&|o| if o == 0x24 { 4 } else { 0 }, 0, 5), None);
+        assert_eq!(bar_count(2), 0);
+        // Every MSI-X capability, not just the first; a table in a BAR of
+        // any size; I/O BARs hold none.
+        let f = function(0, &[(0, 0xfd00_0000), (2, 0xe001), (4, 0xfc00_000c), (5, 0x10)],
+            &[(0x40, 0x2000, 0x3000, 0x60), (0x60, 4 | 0x100, 2 | 0x200, 0)]);
+        assert_eq!(blocks_of(&f, 8),
+            (vec![(0xfd00_2000, 128), (0xfd00_3000, 8), (0x10_fc00_0100, 128)], true));
+        // No capability list: nothing to know.
+        let mut none = function(0, &[(0, 0xfd00_0000)], &[]);
+        assert_eq!(blocks_of(&none, 8), (vec![], true));
+        // A list that cannot be walked, or a table that does not fit, or
+        // no room left: not all known.
+        none[6] = 0x10;
+        none[0x34] = 0x20;
+        assert!(!blocks_of(&none, 8).1, "a pointer into the header");
+        let looped = function(0, &[(0, 0xfd00_0000)], &[(0x40, 0, 0, 0x60), (0x60, 0, 0, 0x40)]);
+        assert!(!blocks_of(&looped, 64).1, "a loop");
+        let mut late = none;
+        late[0x34] = 0xf8;
+        late[0xf8..0xfc].copy_from_slice(&[0x11, 0, 7, 0]);
+        assert!(!blocks_of(&late, 8).1, "past 256 bytes");
+        let f = function(0, &[(0, 0xfd00_0000)], &[(0x40, 0, 0, 0)]);
+        assert!(!blocks_of(&f, 1).1, "no room");
+    }
+
+    fn madt(entries: &[&[u8]]) -> std::vec::Vec<u8> {
+        let mut t = vec![0u8; 44];
+        t[..4].copy_from_slice(b"APIC");
+        for e in entries {
+            t.extend_from_slice(e);
+        }
+        let len = t.len() as u32;
+        t[4..8].copy_from_slice(&len.to_le_bytes());
+        t
+    }
+
+    fn ioapic(id: u8, addr: u32) -> [u8; 12] {
+        let mut e = [1, 12, id, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        e[4..8].copy_from_slice(&addr.to_le_bytes());
+        e
+    }
+
+    #[test]
+    fn every_ioapic_and_local_apic_refused() {
+        // Every I/O APIC's page, once; local APICs (type 0) are not.
+        let t = madt(&[&[0, 8, 0, 0, 1, 0, 0, 0], &ioapic(0, 0xfec0_0000), &ioapic(1, 0xfec0_1000),
+            &ioapic(2, 0x9d00_0400), &ioapic(3, 0x9d00_0000)]);
+        let (pages, complete) = madt_ioapic_pages(&t, t.len());
+        assert!(complete);
+        assert_eq!(&pages[..], &[(0xfec0_0000, 0x1000), (0xfec0_1000, 0x1000), (0x9d00_0000, 0x1000)]);
+        // A table read in part, an entry past its end or too short for an
+        // address, or more I/O APICs than are kept: not all of them.
+        assert!(!madt_ioapic_pages(&t[..t.len() - 1], t.len()).1);
+        let mut bad = madt(&[&ioapic(0, 0xfec0_0000)]);
+        bad.truncate(bad.len() - 2);
+        assert!(!madt_ioapic_pages(&bad, bad.len()).1);
+        let short = madt(&[&[1, 6, 0, 0, 0, 0]]);
+        assert!(!madt_ioapic_pages(&short, short.len()).1);
+        let many: std::vec::Vec<[u8; 12]> = (0..=MAX_IOAPIC_PAGES as u32).map(|i| ioapic(i as u8, 0x9000_0000 + (i << 12))).collect();
+        let t = madt(&many.iter().map(|e| &e[..]).collect::<std::vec::Vec<_>>());
+        let (pages, complete) = madt_ioapic_pages(&t, t.len());
+        assert_eq!((pages.len(), complete), (MAX_IOAPIC_PAGES, false));
+        assert!(!madt_ioapic_pages(&[], 0).1);
+        // The chipset's I/O APIC, a local APIC's ICR and any MSI address
+        // are refused; the HPET is apart, the TPM and AMD's FCH are not.
+        for (addr, width) in [(0xfec0_0000, 4), (0xfec0_0010, 4), (0xfec0_0ffc, 4), (0xfebf_fffc, 8)] {
+            assert!(hw_meets(addr, width, IOAPIC_DEFAULT.0, IOAPIC_DEFAULT.1), "{addr:#x}");
+        }
+        // Another I/O APIC is the MADT's to name: its page, outside the
+        // default one, is refused as the table lists it (trustd's Hw).
+        let t = madt(&[&ioapic(0, 0xfec0_0000), &ioapic(1, 0xfec0_1000)]);
+        let (pages, _) = madt_ioapic_pages(&t, t.len());
+        let refused = |addr: usize| hw_meets(addr, 4, IOAPIC_DEFAULT.0, IOAPIC_DEFAULT.1)
+            || pages.iter().any(|&(b, s)| hw_meets(addr, 4, b, s));
+        assert!(!hw_within(0xfec0_1000, 0x1000, IOAPIC_DEFAULT.0, IOAPIC_DEFAULT.1));
+        for addr in [0xfec0_1000, 0xfec0_1010, 0xfec0_1ffc] {
+            assert!(refused(addr), "{addr:#x}");
+        }
+        for addr in [0xfec0_2000, 0xfec1_0000, 0xfec2_0000, 0xfecf_fffc] {
+            assert!(!refused(addr), "{addr:#x}");
+        }
+        for (addr, width) in [(0xfee0_0300, 4), (0xfee0_0310, 4), (0xfeef_f000, 8)] {
+            assert!(hw_meets(addr, width, LAPIC_MSI.0, LAPIC_MSI.1), "{addr:#x}");
+        }
+        for addr in [0xfed0_0000, 0xfed4_0000, 0xfed4_0024, 0xfed8_0300, 0xfef0_0000, 0xfebf_fffc, 0xfec1_0000, 0xfec2_0000] {
+            assert!(!hw_meets(addr, 4, IOAPIC_DEFAULT.0, IOAPIC_DEFAULT.1)
+                && !hw_meets(addr, 4, LAPIC_MSI.0, LAPIC_MSI.1), "{addr:#x}");
+        }
     }
 
     fn mcfg(entries: &[(u64, u16, u8, u8)]) -> crate::fixed::ArrayVec<u8, 1024> {

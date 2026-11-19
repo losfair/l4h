@@ -13,6 +13,7 @@ use l4h_host::font;
 use sel4::{CapRights, VmAttributes};
 
 use crate::Host;
+use crate::component::abs_of;
 use crate::devmem::DevMem;
 use crate::mem::{Alloc, ObjCtx};
 use crate::vspace::map_frame;
@@ -161,18 +162,32 @@ impl Dashboard {
             info!("l4h-root: framebuffer of {} MiB is too large", len >> 20);
             return None;
         }
-        // Device frames come in aligned power-of-two blocks.
-        let mut size = len.next_power_of_two();
-        while addr + len - (addr & !(size - 1)) > size {
-            size = size.checked_mul(2)?;
+        // Its pages and no more: the smallest aligned power-of-two block
+        // around a framebuffer that crosses a large boundary is as large
+        // as that boundary, up to GiBs of others' BARs and more frames
+        // than root has slots.  They may lie in several device Untypeds,
+        // whose frames come in chunks, each moved to its place in
+        // consecutive slots (logd maps the console's, FbArea).
+        let span = crate::devmem::span::pages(addr, len)?;
+        let pages = span.len() / 4096;
+        let frames = alloc.slots.global(|slots| slots.alloc_range(pages));
+        let mut next = frames.start;
+        let carved = devmem.frames_range(alloc, span.start, span.len(), |alloc, chunk| {
+            for s in chunk {
+                abs_of(crate::devmem::granule(next)).move_(&abs_of(crate::devmem::granule(s))).expect("framebuffer frame");
+                alloc.slots.free(s);
+                next += 1;
+            }
+        });
+        if carved.is_none() {
+            // Not device memory, or not all free: what was carved stays so.
+            (next..frames.end).for_each(|s| alloc.slots.free(s));
+            info!("l4h-root: framebuffer at {:#x} is not free device memory", addr);
+            return None;
         }
-        let base = addr & !(size - 1);
-        let first = (addr - base) / 4096;
-        let pages = (addr - base + len).div_ceil(4096) - first;
-        let frames = alloc.slots.global(|slots| devmem.frames(slots, base, size))?;
         let wc = write_combining();
         alloc.global(|alloc| {
-            for (i, s) in (frames.start + first..frames.start + first + pages).enumerate() {
+            for (i, s) in frames.clone().enumerate() {
                 let f = crate::devmem::granule(s);
                 map_frame(&mut ObjCtx::global(alloc), sel4::init_thread::slot::VSPACE.cap(), f, FB_VA + i * 4096, CapRights::read_write(), wc);
             }
@@ -184,7 +199,7 @@ impl Dashboard {
         let console = fb_console.then(|| {
             let at = (addr & 4095) + top * pitch;
             let end = (addr & 4095) + (height / 16) * 16 * pitch;
-            let frames = frames.start + first + at / 4096..frames.start + first + end.div_ceil(4096);
+            let frames = frames.start + at / 4096..frames.start + end.div_ceil(4096);
             (frames, at % 4096, width, (height / 16) * 16 - top)
         });
         let height = if fb_console { height / 2 } else { height };

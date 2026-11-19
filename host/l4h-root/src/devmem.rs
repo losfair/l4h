@@ -1,6 +1,8 @@
 //! Device memory: frames for physical address ranges (PCI BARs), carved out
 //! of the device Untypeds by repeated halving.
 
+pub mod span;
+
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -162,10 +164,7 @@ impl DevMem {
             let r = self.free.iter().find(|r| r.paddr <= at && at < r.paddr + (1 << r.size_bits))?;
             // The largest aligned block at `at` inside both r and the
             // range, of at most RETYPE_FAN_OUT frames.
-            let bits = (at.trailing_zeros() as usize)
-                .min(usize::BITS as usize - 1 - (end - at).leading_zeros() as usize)
-                .min(r.size_bits)
-                .min(12 + crate::RETYPE_FAN_OUT.trailing_zeros() as usize);
+            let bits = span::block_bits(at, end, r.size_bits, 12 + crate::RETYPE_FAN_OUT.trailing_zeros() as usize);
             let frames = alloc.slots.global(|slots| self.frames(slots, at, 1 << bits))?;
             f(alloc, frames);
             at += 1 << bits;
