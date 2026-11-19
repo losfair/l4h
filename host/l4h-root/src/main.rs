@@ -604,10 +604,14 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
             let _ = ctrls.push(ctrl);
             record.owner = l4h_abi::PCI_OWNER_BLKD;
         } else if nicd::is_network(&d, &nicd::ids_of(&d, &pci), cfg.nic_pin(netd::bdf(&d)).is_some()) {
-            // Bound (and its driver started) once the host is up.
-            record.owner = l4h_abi::PCI_OWNER_ROOT;
+            // Bound (and its driver started) once the host is up.  One
+            // past MAX_NICS is left as the firmware set it up, not
+            // disabled: not root's, and no NIC's confinement counts it
+            // as stopped.
             let ids = nicd::ids_of(&d, &pci);
-            nicd::found(d, ids, cfg.nic_pin(netd::bdf(&d)), &pci);
+            if nicd::found(d, ids, cfg.nic_pin(netd::bdf(&d)), &pci) {
+                record.owner = l4h_abi::PCI_OWNER_ROOT;
+            }
         } else if usb::is_xhci(&d) {
             // Left to the firmware, enabled as it is, until claimed.
             usb::found(d, &pci, &mut alloc, &mut devmem);

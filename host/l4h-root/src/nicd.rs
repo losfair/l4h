@@ -14,8 +14,9 @@
 //!
 //! A nicd is outside the TCB (`confined`) when its device has an IOMMU
 //! domain, interrupt remapping, and an isolation group (`group`) of its
-//! own or shared only with functions of the same driver.  Elsewhere its
-//! driver is trusted code, which only the boot bundle's may be.
+//! own or shared only with bridges and NICs of the same driver or stopped.
+//! Elsewhere its driver is trusted code, which only the boot bundle's may
+//! be.
 //!
 //! Root never waits on a nicd.  A nicd that faults, refuses to start,
 //! breaks its channel or stops taking frames is stopped (`kill`): its
@@ -158,6 +159,10 @@ pub struct Nic {
     pub why: &'static str,
     /// Outside the TCB (module doc).
     pub confined: bool,
+    /// Left as the firmware set it up at boot (configured for no driver,
+    /// or none took it then), not disabled: no confined NIC may share its
+    /// group until root has stopped it (`kill`).
+    firmware_live: bool,
     /// Its isolation group: functions that may reach each other without
     /// the IOMMU, by BDF.
     group: ArrayVec<u16, 64>,
@@ -249,7 +254,8 @@ pub fn found(d: pci::Device, ids: Ids, pin: Option<Option<&'static str>>, pci: &
     }
     // Off until its driver starts, if one will: one no driver takes, or
     // that the configuration leaves to the firmware, stays as it is.
-    if pin != Some(None) && drivers().matching(&ids, |_| true).is_some() {
+    let firmware_live = !(pin != Some(None) && drivers().matching(&ids, |_| true).is_some());
+    if !firmware_live {
         pci.disable(&d);
     }
     ns.must_push(Nic {
@@ -259,6 +265,7 @@ pub fn found(d: pci::Device, ids: Ids, pin: Option<Option<&'static str>>, pci: &
         state: State::Unbound,
         why: "",
         confined: false,
+        firmware_live,
         group: ArrayVec::new(),
         bars: [const { None }; 6],
         dom: None,
@@ -388,8 +395,9 @@ fn is_virtio(d: &pci::Device) -> bool {
 }
 
 /// Whether NIC `i` would be confined bound to `driver`: an IOMMU with
-/// interrupt remapping, and every other function of its group unused by
-/// the host or a NIC of the same driver.
+/// interrupt remapping, and every other function of its group a bridge
+/// or a NIC of the same driver or unbound and stopped (not left live by
+/// the firmware, `firmware_live`).
 fn confined(h: &Host, i: usize, driver: usize) -> bool {
     let [state, remap, ..] = h.iommu.info();
     if state != abi::IOMMU_ON || remap == 0 {
@@ -415,18 +423,29 @@ fn confined(h: &Host, i: usize, driver: usize) -> bool {
     if !matches!(n.dom, Some(d) if d != Domain::None) {
         return false;
     }
-    n.group.iter().all(|&f| {
-        if f == u16::MAX {
-            return false;
-        }
-        if f == bdf(&n.pci) as u16 {
-            return true;
-        }
-        if let Some(o) = nics().iter().find(|o| bdf(&o.pci) as u16 == f) {
-            return o.driver.is_none() || o.driver == Some(driver);
-        }
-        h.pci_inventory.iter().find(|p| p.bdf == f).is_none_or(|p| matches!(p.owner, abi::PCI_OWNER_NONE | abi::PCI_OWNER_ROOT))
-    })
+    // Every other member must be a NIC that may share it or a bridge
+    // (acs::confined_group): a function the host leaves alone is not
+    // stopped, and may decode its BARs and master the bus as the firmware
+    // left it.
+    #[cfg(target_arch = "x86_64")]
+    {
+        use crate::acs::{Config as _, Peer};
+        let me = bdf(&n.pci) as u16;
+        crate::acs::confined_group(&n.group, |f| {
+            if f == me {
+                Peer::Me
+            } else if let Some(o) = nics().iter().find(|o| bdf(&o.pci) as u16 == f) {
+                Peer::Nic(o.driver == Some(driver) || (o.driver.is_none() && !o.firmware_live))
+            } else if h.pci_inventory.iter().any(|p| p.bdf == f) {
+                Peer::Other((h.pci.read(f, 0x0c) >> 16) as u8)
+            } else {
+                Peer::Unknown
+            }
+        })
+    }
+    // No IOMMU there (group_of).
+    #[cfg(not(target_arch = "x86_64"))]
+    false
 }
 
 // ---------------------------------------------------------------------
@@ -1036,6 +1055,7 @@ fn kill(h: &mut Host, i: usize, then: Then, why: &'static str) {
     log!("l4h-root: nic {} ({:02x}:{:02x}.{}): nicd stopped: {}", i, p.bus, p.dev, p.func, why);
     h.pci.disable(&p);
     h.pci.bus_master(&p, false);
+    n.firmware_live = false;
     if let Some(irq) = n.irq {
         let _ = irq.irq_handler_clear();
     }

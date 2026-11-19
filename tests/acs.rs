@@ -2,7 +2,7 @@
 #[path = "../host/l4h-root/src/acs.rs"]
 mod acs;
 
-use acs::{Acs, Bits, Config, CR, DT, RR, SV, TB, UF};
+use acs::{Acs, Bits, Config, Peer, CR, DT, RR, SV, TB, UF};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -587,6 +587,99 @@ fn the_shim_refuses_a_group_split_between_partitions() {
     // A group larger than the caller's room is an error, not a pass.
     let (m, inv) = two_root_ports(None, None);
     assert_eq!(acs::other_owner(&m, || inv.iter().copied(), |f| f, owners(&[0x0300]), 0x0300, &mut [0u16; 2]), Err(()));
+}
+
+/// Whether NIC `me` is confined (root's nicd::confined, past its IOMMU
+/// checks): its group as root computes it (`closure`, with `alias` as
+/// the IOMMU's requester IDs), each member looked up as root does.
+/// `nics` are the other NICs root drives, each with whether it may share
+/// the group (Peer::Nic); the other functions of `inv` are what root found
+/// and left alone, whoever owns them.
+fn nic_confined(m: &Model, inv: &[u16], alias: impl Fn(u16) -> u16, me: u16, nics: &[(u16, bool)]) -> bool {
+    let mut out = [0u16; 64];
+    let group: Vec<u16> = match acs::closure(m, || inv.iter().copied(), alias, me, &mut out) {
+        Some(n) => out[..n].to_vec(),
+        None => vec![u16::MAX],
+    };
+    acs::confined_group(&group, |f| {
+        if f == me {
+            Peer::Me
+        } else if let Some(&(_, ok)) = nics.iter().find(|n| n.0 == f) {
+            Peer::Nic(ok)
+        } else if inv.contains(&f) {
+            Peer::Other((m.read(f, 0x0c) >> 16) as u8)
+        } else {
+            Peer::Unknown
+        }
+    })
+}
+
+#[test]
+fn a_nic_alone_or_beside_bridges_is_confined() {
+    // QEMU q35: an e1000e alone on bus 0, beside an empty root port and
+    // PCI bridge, and the host bridge.
+    let m = Model::new(&[(0x0010, Func::pcie(acs::ENDPOINT, None)), (0x0008, Func::pcie(acs::ROOT_PORT, None).bridge(2)),
+        (0x00f0, Func::pcie(0, None).bridge(3)), (0x0000, Func::pcie(0, None))]);
+    assert!(nic_confined(&m, &[0x0000, 0x0008, 0x0010, 0x00f0], |f| f, 0x0010, &[]));
+    // Below a root port with ACS, beside another with ACS in its slot.
+    let m = Model::new(&[(PORT, Func::pcie(acs::ROOT_PORT, Some((ALL, ALL))).bridge(2).multi()),
+        (0x0009, Func::pcie(acs::ROOT_PORT, Some((ALL, ALL))).bridge(3)), (0x0010, Func::pcie(0, None)),
+        (0x0200, Func::pcie(0, None)), (0x0300, Func::pcie(0, None))]);
+    assert!(nic_confined(&m, &[PORT, 0x0009, 0x0010, 0x0200, 0x0300], |f| f, 0x0200, &[]));
+    // In a slot without ACS with an empty bridge: the bridge is a member,
+    // and does no DMA.
+    let m = Model::new(&[(0x0028, Func::pcie(acs::DOWNSTREAM_PORT, None).bridge(2).multi()), (0x0029, Func::pcie(0, None))]);
+    assert!(nic_confined(&m, &[0x0028, 0x0029], |f| f, 0x0029, &[]));
+}
+
+#[test]
+fn a_nic_beside_an_endpoint_root_leaves_alone_is_not_confined() {
+    // An onboard NIC at 00:1f.6 in the chipset's slot without ACS, beside
+    // an LPC bridge (an endpoint, class 0601) at 00:1f.0 and an SMBus
+    // controller at 00:1f.4 that root does not drive: the firmware left
+    // them as they were.
+    let m = Model::new(&[(0x00f8, Func::pcie(acs::RC_ENDPOINT, None).multi()), (0x00fc, Func::pcie(acs::RC_ENDPOINT, None)),
+        (0x00fe, Func::pcie(acs::RC_ENDPOINT, None))]);
+    assert!(!nic_confined(&m, &[0x00f8, 0x00fc, 0x00fe], |f| f, 0x00fe, &[]));
+    // Below a root port without ACS: a GPU (or a disk controller past
+    // MAX_DISK_CTRLS, or a NIC past MAX_NICS) below the other port, and
+    // the integrated endpoints, are reached across bus 0.
+    let (m, inv) = two_root_ports(None, Some((ALL, ALL)));
+    assert!(!nic_confined(&m, &inv, |f| f, 0x0200, &[]));
+    // Both ports isolate, but the IOMMU translates the NIC as another
+    // endpoint (an IVHD alias): that endpoint shares its domain.
+    let (m, inv) = two_root_ports(Some((ALL, ALL)), Some((ALL, ALL)));
+    assert!(nic_confined(&m, &inv, |f| f, 0x0200, &[]));
+    assert!(!nic_confined(&m, &inv, |f| if f == 0x0200 { 0x0300 } else { f }, 0x0200, &[]));
+}
+
+#[test]
+fn a_nic_shares_its_group_only_with_nics_that_may() {
+    // A dual-port NIC without ACS: the other port unbound and stopped, or
+    // of the same driver, keeps it confined; another driver's, or one
+    // left live by the firmware, does not.
+    let m = Model::new(&[(0x0028, Func::pcie(0, None).multi()), (0x0029, Func::pcie(0, None))]);
+    let inv = [0x0028, 0x0029];
+    assert!(nic_confined(&m, &inv, |f| f, 0x0029, &[(0x0028, true)]));
+    assert!(!nic_confined(&m, &inv, |f| f, 0x0029, &[(0x0028, false)]));
+    // Not a NIC root drives: an endpoint like any other.
+    assert!(!nic_confined(&m, &inv, |f| f, 0x0029, &[]));
+}
+
+#[test]
+fn a_group_root_cannot_vouch_for_is_not_confined() {
+    // A member root did not find, a group too large to check, no group.
+    assert!(!acs::confined_group(&[0x0010, 0x0018], |f| if f == 0x0010 { Peer::Me } else { Peer::Unknown }));
+    assert!(!acs::confined_group(&[0x0010, u16::MAX], |f| if f == 0x0010 { Peer::Me } else { Peer::Other(1) }));
+    assert!(!acs::confined_group(&[], |_| Peer::Me));
+    // Bridges of either header layout bit (multi-function or not).
+    assert!(acs::confined_group(&[0x0010, 0x0008, 0x00f0], |f| match f {
+        0x0010 => Peer::Me,
+        0x0008 => Peer::Other(0x81),
+        _ => Peer::Other(0x01),
+    }));
+    // A CardBus bridge (header type 2) is not one.
+    assert!(!acs::confined_group(&[0x0010, 0x0008], |f| if f == 0x0010 { Peer::Me } else { Peer::Other(2) }));
 }
 
 /// An IVRS whose IVHD blocks (type, IOMMU id, device entries) are given.
