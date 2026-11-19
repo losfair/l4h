@@ -37,6 +37,7 @@ mod cpu;
 mod entry;
 mod io;
 mod kvm_clock;
+mod madt;
 mod mem;
 mod pci;
 
@@ -799,8 +800,9 @@ fn place_memory(bi: &mut BootInfo, conf: &Conf, acpi: &acpi::Acpi, plans: &mut [
 }
 
 /// The partition's ACPI copy: the firmware's tables, but a MADT of its
-/// own CPUs (and, for partition 0, the I/O APICs), and for the others no
-/// TPM.  Returns the new RSDP's address.
+/// own CPUs and every I/O APIC (and, for partition 0, the interrupt
+/// source overrides: madt::keep), and for the others no TPM.  Returns
+/// the new RSDP's address.
 fn build_acpi(a: &acpi::Acpi, cpus: &[acpi::Cpu], p: &Plan, k: usize) -> u64 {
     let base = p.block + OUT_ACPI;
     let rsdp = base;
@@ -835,13 +837,7 @@ fn build_acpi(a: &acpi::Acpi, cpus: &[acpi::Cpu], p: &Plan, k: usize) -> u64 {
         if l < 2 || off + l > t.len() {
             break;
         }
-        let keep = match ty {
-            0 | 9 => false,
-            // I/O APIC, interrupt source override, NMI source, I/O SAPIC.
-            1 | 2 | 3 | 6 => k == 0,
-            _ => true,
-        };
-        if keep {
+        if madt::keep(ty, k) {
             put(&t[off..off + l], &mut len);
         }
         off += l;

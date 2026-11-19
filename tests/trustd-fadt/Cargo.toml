@@ -1,0 +1,11 @@
+[package]
+name = "trustd-fadt"
+edition = "2024"
+license = "GPL-2.0-only"
+version = "0.1.0"
+description = "trustd's copy of the FADT (host/l4h-trustd/src/fadt.rs)"
+
+[dependencies]
+# As host/l4h-trustd/Cargo.toml, but without the interpreter (which needs
+# nightly Rust): the FADT is the crate's alone.
+acpi = { git = "https://github.com/rust-osdev/acpi", rev = "a69a4df", default-features = false }

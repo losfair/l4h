@@ -715,11 +715,22 @@ fn spawn(h: &mut Host, i: usize) -> Result<(), &'static str> {
     let dma_bits = m.dma_bits as usize;
     let dma = 1usize << dma_bits;
     let confined = nics()[i].confined;
-    let image = (1usize << m.image_max_bits) + m.firmware.iter().filter_map(|f| drivers().firmware(f, confined)).map(|b| b.len()).sum::<usize>();
-    // The image, its keep CNode (a slot a page of every mapping) and page
-    // tables, a lot of each for the BAR windows.
-    let maps = bars_for(&nics()[i].pci, &m).map_or(0, |b| bar_pages(&windowed(&nics()[i].pci, &m), b)) + dma / PAGE;
-    if !h.can_afford(image + (4 << 20) + maps * 64 + maps / 512 * PAGE, 1, 1024) {
+    let bars = bars_for(&nics()[i].pci, &m)?;
+    let w = windowed(&nics()[i].pci, &m);
+    // Firmware blobs: copies in frames of its own, read-only to it.
+    let mut blobs: [Option<&'static [u8]>; nicd::MAX_FIRMWARE] = [None; nicd::MAX_FIRMWARE];
+    for (k, name) in m.firmware.iter().enumerate() {
+        if name[0] != 0 {
+            blobs[k] = drivers().firmware(name, confined).filter(|b| b.len() <= nicd::FIRMWARE_MAX);
+        }
+    }
+    // The image, the firmware copies, its keep CNode (a slot a page of
+    // every mapping, one object) and page tables: refused here rather
+    // than run out half way, where root's allocations panic.
+    let fw: ArrayVec<usize, { nicd::MAX_FIRMWARE }> = blobs.iter().flatten().map(|b| b.len()).collect();
+    let budget = nicd::budget(m.image_max_bits, &fw, bar_pages(&w, bars), dma / PAGE, nics()[i].chan.as_ref().unwrap().pages);
+    let new_dma = if nics()[i].dma.is_none() { dma } else { 0 };
+    if !h.can_afford(budget.bytes + new_dma, 1, budget.slots) || h.alloc.largest_block_bits().is_none_or(|b| b < budget.min_block_bits) {
         return Err("no memory for it");
     }
     if nics()[i].dma.is_none() {
@@ -739,14 +750,21 @@ fn spawn(h: &mut Host, i: usize) -> Result<(), &'static str> {
     nics()[i].dma_driver = Some(d);
     let n = &nics()[i];
     let pdev = n.pci;
-    let bars = bars_for(&pdev, &m)?;
-    let w = windowed(&pdev, &m);
     let (vector, msi_address, msi_data) = n.msi.unwrap();
     let chan_bits = n.chan.as_ref().unwrap().data_bits;
 
     h.alloc.slots.track(slot_owner(i));
     let built = (|| -> Result<Inst, &'static str> {
-        let mut arena = h.alloc.arena(image + (2 << 20)).ok_or("no memory for it")?;
+        let image = (1usize << m.image_max_bits) + fw.iter().sum::<usize>();
+        let kb = budget.keep_bits;
+        let mut arena = h.alloc.arena(image + (1 << (kb + 5)) + (2 << 20)).ok_or("no memory for it")?;
+        // Its keep CNode first, the largest object: without a block that
+        // large, nothing is made.
+        let Some(keep) = arena.try_object(&mut h.alloc, ObjectBlueprint::CNode { size_bits: kb }) else {
+            h.alloc.reclaim(arena);
+            return Err("no memory for it");
+        };
+        let keep = root_cap::<cap_type::CNode>(keep);
         let DmaRegion { frames: dma_cn, bits: dma_cn_bits, paddr: dma_paddr, .. } = dma_region;
         let dma_pages = dma / PAGE;
 
@@ -782,18 +800,11 @@ fn spawn(h: &mut Host, i: usize) -> Result<(), &'static str> {
             reserved: 0,
             firmware: [none; nicd::MAX_FIRMWARE],
         };
-        // Firmware blobs: copies in frames of its own, read-only to it.
-        let mut blobs: [Option<&'static [u8]>; nicd::MAX_FIRMWARE] = [None; nicd::MAX_FIRMWARE];
         for (k, name) in m.firmware.iter().enumerate() {
-            if name[0] == 0 {
-                continue;
-            }
-            match drivers().firmware(name, nics()[i].confined) {
-                Some(b) if b.len() <= nicd::FIRMWARE_MAX => {
-                    blobs[k] = Some(b);
-                    cfg.firmware[k] = host::blk::PciRegion { va: nicd::firmware_va(k) as u64, len: b.len() as u64 };
-                }
-                _ => log!("l4h-root: nic {}: no firmware {} (dom0 may load it)", i, crate::drivers::name(name)),
+            match blobs[k] {
+                Some(b) => cfg.firmware[k] = host::blk::PciRegion { va: nicd::firmware_va(k) as u64, len: b.len() as u64 },
+                None if name[0] != 0 => log!("l4h-root: nic {}: no firmware {} (dom0 may load it)", i, crate::drivers::name(name)),
+                None => {}
             }
         }
         let msix = pdev.msix.unwrap();
@@ -831,10 +842,6 @@ fn spawn(h: &mut Host, i: usize) -> Result<(), &'static str> {
             &mut |alloc, vspace| h.asids.assign(alloc, vspace), &h.info.spawn_context(core));
 
         let chan = nics()[i].chan.as_ref().unwrap();
-        let fw_pages: usize = blobs.iter().flatten().map(|b| b.len().div_ceil(PAGE)).sum();
-        let pages = bar_pages(&w, bars) + dma_pages + chan.pages + fw_pages + 2 + host::mailbox::MAILBOX_PAGES;
-        let kb = keep_bits(pages);
-        let keep = arena.object_cap::<cap_type::CNode>(&mut h.alloc, ObjectBlueprint::CNode { size_bits: kb });
         let mut next = 0u64;
         let mut keep_slot = || {
             next += 1;
@@ -1708,15 +1715,19 @@ pub fn load_driver(h: &mut Host, off: u64, len: u64) -> Result<usize, Errno> {
     let base = crate::layout::DRIVER_IMAGES.base + k * abi::CTL_LOAD_MAX as usize;
     let mut arena = h.alloc.global(|alloc| alloc.arena(pages * PAGE + PAGE)).ok_or(ctl::ENOMEM)?;
     let wins = &mut h.wins;
+    // The frames' slots, freed with the arena if it is not kept.
+    let mut frames: ArrayVec<usize, { abi::CTL_LOAD_MAX as usize / PAGE }> = ArrayVec::new();
     let ok = h.alloc.global(|alloc| {
         for p in 0..pages {
             let Some(s) = arena.try_object(alloc, FRAME_BP) else { return false };
+            frames.must_push(s);
             let f = root_cap::<cap_type::Granule>(s);
             crate::vspace::map_frame(&mut crate::mem::ObjCtx::global(alloc), sel4::init_thread::slot::VSPACE.cap(), f,
                 base + p * PAGE, CapRights::read_only(), VmAttributes::DEFAULT);
             let n = (len - p * PAGE).min(PAGE);
+            // Volatile: dom0 may write its control data area meanwhile.
             wins.a.with_frame(&abs_of(f), |dst| unsafe {
-                core::ptr::copy_nonoverlapping((crate::vmmgr::CTL_DATA_VA + off + p * PAGE) as *const u8, dst, n)
+                host::gpu::copy_volatile((crate::vmmgr::CTL_DATA_VA + off + p * PAGE) as *const u8, dst, n)
             });
         }
         true
@@ -1732,8 +1743,9 @@ pub fn load_driver(h: &mut Host, off: u64, len: u64) -> Result<usize, Errno> {
             if let Some(Err(why)) = r {
                 log!("l4h-root: driver image from dom0 refused: {}", why);
             }
-            // Its frames go, and with them root's mapping of them.
-            h.alloc.global(|alloc| alloc.release(arena));
+            // Its frames go, and with them root's mapping of them, and
+            // their slots.
+            h.alloc.global(|alloc| alloc.release_objects(arena, &frames));
             Err(if ok { ctl::EINVAL } else { ctl::ENOMEM })
         }
     }
@@ -1774,7 +1786,7 @@ pub fn load_firmware(h: &mut Host, off: u64, len: u64) -> Result<usize, Errno> {
     let off = usize::try_from(off).ok().filter(|&o| o.checked_add(total).is_some_and(|e| e as u64 <= abi::CTL_LOAD_MAX)).ok_or(ctl::EINVAL)?;
     // Copied out first: dom0 could change its own.
     let mut name = [0u8; crate::drivers::NAME];
-    unsafe { core::ptr::copy_nonoverlapping((crate::vmmgr::CTL_DATA_VA + off) as *const u8, name.as_mut_ptr(), nicd::FIRMWARE_NAME) };
+    unsafe { host::gpu::copy_volatile((crate::vmmgr::CTL_DATA_VA + off) as *const u8, name.as_mut_ptr(), nicd::FIRMWARE_NAME) };
     if drivers().firmware.iter().any(|f| f.name == name) {
         return Err(ctl::EEXIST);
     }
@@ -1790,15 +1802,19 @@ pub fn load_firmware(h: &mut Host, off: u64, len: u64) -> Result<usize, Errno> {
     let base = crate::layout::FIRMWARE_IMAGES.base + k * abi::CTL_LOAD_MAX as usize;
     let mut arena = h.alloc.global(|alloc| alloc.arena(pages * PAGE + PAGE)).ok_or(ctl::ENOMEM)?;
     let wins = &mut h.wins;
+    // The frames' slots, freed with the arena if it is not kept.
+    let mut frames: ArrayVec<usize, { abi::CTL_LOAD_MAX as usize / PAGE }> = ArrayVec::new();
     let ok = h.alloc.global(|alloc| {
         for p in 0..pages {
             let Some(s) = arena.try_object(alloc, FRAME_BP) else { return false };
+            frames.must_push(s);
             let f = root_cap::<cap_type::Granule>(s);
             crate::vspace::map_frame(&mut crate::mem::ObjCtx::global(alloc), sel4::init_thread::slot::VSPACE.cap(), f,
                 base + p * PAGE, CapRights::read_only(), VmAttributes::DEFAULT);
             let n = (len - p * PAGE).min(PAGE);
+            // Volatile: dom0 may write its control data area meanwhile.
             wins.a.with_frame(&abs_of(f), |dst| unsafe {
-                core::ptr::copy_nonoverlapping((crate::vmmgr::CTL_DATA_VA + off + p * PAGE) as *const u8, dst, n)
+                host::gpu::copy_volatile((crate::vmmgr::CTL_DATA_VA + off + p * PAGE) as *const u8, dst, n)
             });
         }
         true
@@ -1814,7 +1830,7 @@ pub fn load_firmware(h: &mut Host, off: u64, len: u64) -> Result<usize, Errno> {
             if let Some(Err(why)) = r {
                 log!("l4h-root: firmware from dom0 refused: {}", why);
             }
-            h.alloc.global(|alloc| alloc.release(arena));
+            h.alloc.global(|alloc| alloc.release_objects(arena, &frames));
             return Err(if ok { ctl::EINVAL } else { ctl::ENOMEM });
         }
     };

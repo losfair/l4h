@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Production console rings, memory-hotplug scheduling and control failure
 # replies, root's filter of NIC drivers' configuration writes, AMD-Vi leaf
-# entries, dom0 boot
+# entries and IVHD device entries, dom0 boot
 # planning, block reservations and service replies, and host log
 # publication, wraparound and concurrent readers/writers. Also exercises
 # endpoint fairness, bounded network batches, VMM CPU budgets, malformed
@@ -51,6 +51,9 @@ nicd = (root / 'host/l4h-root/src/nicd.rs').read_text()
 amdvi = (root / 'host/l4h-root/src/amdvi.rs').read_text()
 (out / 'amdvi-pte.inc').write_text('\n'.join(line for line in amdvi.splitlines()
     if line.startswith(('const PTE_', 'const LEVELS:', 'const IOVA_END:'))) + '\n' + function(amdvi, 'fn leaf_pte('))
+# The IVHD device entries, read into the real DevInfo::set.
+(out / 'amdvi-ivhd.inc').write_text(function(amdvi, 'impl DevInfo {') + '\n' + function(amdvi, 'fn u16_at(')
+    + '\nimpl AmdVi {\n' + method(amdvi, '    fn devices(') + '\n}\n')
 root_main = (root / 'host/l4h-root/src/main.rs').read_text()
 nic_branch = '        } else if nicd::is_network(&d, &nicd::ids_of(&d, &pci), cfg.nic_pin(netd::bdf(&d)).is_some()) {'
 start = root_main.index(nic_branch) + len(nic_branch)
@@ -164,6 +167,9 @@ L4H_NICD_CFG_TEST_SRC="$out/nicd-cfg.inc" rustc +stable --edition=2024 --test \
 L4H_AMDVI_PTE_TEST_SRC="$out/amdvi-pte.inc" rustc +stable --edition=2024 --test \
     "$root/tests/amdvi-pte.rs" -o "$out/amdvi-pte-tests"
 "$out/amdvi-pte-tests"
+L4H_AMDVI_IVHD_TEST_SRC="$out/amdvi-ivhd.inc" rustc +stable --edition=2024 --test \
+    "$root/tests/amdvi-ivhd.rs" -o "$out/amdvi-ivhd-tests"
+"$out/amdvi-ivhd-tests"
 rustc +stable --edition=2024 --test -L dependency="$out" \
     --extern l4h_host="$out/libl4h_host.rlib" "$root/tests/mailbox.rs" -o "$out/mailbox-tests"
 "$out/mailbox-tests"

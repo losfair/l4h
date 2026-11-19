@@ -806,6 +806,17 @@ impl Alloc {
         self.reclaim_inner(arena, |_| false, true);
     }
 
+    /// `release`, and free `objects`, the slots of objects made from the
+    /// arena (`Arena::try_object`): revoking its Untypeds deleted them, but
+    /// their slots stay allocated otherwise, a leak each time a caller
+    /// gives up on an arena.
+    pub fn release_objects(&mut self, arena: Arena, objects: &[Slot]) {
+        self.release(arena);
+        for &s in objects {
+            self.slots.free(s);
+        }
+    }
+
     /// Carve a per-guest arena of at least `bytes` out of the free blocks.
     pub fn arena(&mut self, bytes: usize) -> Option<Arena> {
         let mut arena = Arena::new();

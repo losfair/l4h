@@ -17,7 +17,6 @@ use acpi::aml::namespace::{AmlName, NamespaceLevelKind};
 use acpi::aml::object::{Object, WrappedObject};
 use acpi::aml::{AmlError, NoSendInterpreter};
 use acpi::registers::FixedRegisters;
-use acpi::sdt::fadt::Fadt;
 use acpi::{Handle, PciAddress, RawPhysicalMapping};
 
 use l4h_rt::host::fixed::ArrayVec;
@@ -322,9 +321,10 @@ impl Start {
             let _ = ranges.push((r.paddr as usize, r.size as usize, trust::TPM_VA + i * trust::RANGE_STRIDE));
         }
         let hw = Hw { ranges, hz };
-        // The FADT as the crate reads it (a packed struct).
-        let fadt: &Fadt = unsafe { &*(fadt.as_ptr() as *const Fadt) };
-        let registers = FixedRegisters::new(fadt, hw.clone()).map_err(|_| "FADT PM1 registers")?;
+        // The FADT as the crate reads it (a packed struct), no further
+        // than the table goes.
+        let fadt = crate::fadt::fadt(fadt)?;
+        let registers = FixedRegisters::new(&fadt, hw.clone()).map_err(|_| "FADT PM1 registers")?;
         let interp = NoSendInterpreter::new(hw, dsdt[8], Arc::new(registers), None);
         interp.load_table(&dsdt[36..]).map_err(aml_err("loading the DSDT"))?;
         for t in tables {

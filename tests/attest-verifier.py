@@ -478,6 +478,41 @@ class Evidence(unittest.TestCase):
         with self.assertRaisesRegex(a.Fail, "PCRs"):
             self.check({**ev, "pcrs": pcrs})
 
+    def test_pcr_values_are_digests(self):
+        # The TPM quoted PCRs 0..16 after trustd extended PCR 15 with the
+        # real host key; the evidence moves the boundaries between the
+        # values so that their concatenation, and so the digest, stays the
+        # same, but PCR 15 reads as zero.
+        n = self.host.public_key().public_numbers()
+        key = {1: 2, -1: 1, -2: n.x.to_bytes(32, "big"), -3: n.y.to_bytes(32, "big")}
+        real = {i: bytes([i + 1]) * 32 for i in range(16)}
+        real[16] = bytes(32)
+        q = quote(a.key_binding(a.point(self.host.public_key()), None), real)
+        shifted = {i: real[i] for i in range(14)}
+        shifted[14] = real[14] + real[15]
+        shifted[a.KEY_PCR] = bytes(32)
+        shifted[16] = b""
+        self.assertEqual(b"".join(shifted[i] for i in sorted(shifted)), b"".join(real[i] for i in sorted(real)))
+        ev = {"v": 1, "ak": ecc_public(self.ak, Enrollment.AK_ATTRS), "key": key, "pcrs": shifted, "quote": q,
+              "quotesig": tpm_signature(self.ak, q)}
+        pins = {i: real[i] for i in range(14)}
+        with self.assertRaisesRegex(a.Fail, "PCRs are not a map"):
+            a.check_evidence(ev, pins, None, None)
+        for bad in (b"", bytes(31), bytes(33), bytes(64)):
+            ev = self.evidence()
+            with self.assertRaisesRegex(a.Fail, "PCRs are not a map", msg=len(bad)):
+                self.check({**ev, "pcrs": {**ev["pcrs"], 0: bad}})
+
+    def test_host_key_fields(self):
+        n = self.host.public_key().public_numbers()
+        x, y = n.x.to_bytes(32, "big"), n.y.to_bytes(32, "big")
+        self.assertEqual(a.cose_p256({1: 2, -1: 1, -2: x, -3: y}).public_numbers(), n)
+        for k in ({1: 2, -1: True, -2: x, -3: y}, {1: 2.0, -1: 1, -2: x, -3: y}, {1: 2, -1: 1.0, -2: x, -3: y},
+                  {1: 2, -1: 1, -2: b"\0" + x, -3: y}, {1: 2, -1: 1, -2: x, -3: y[1:]},
+                  {1: 2, -1: 1, -2: n.x, -3: y}, {1: 2, -1: 1, -2: x, -3: list(y)}, {1: 2, -1: 1, -2: x}):
+            with self.assertRaises(a.Fail, msg=repr(k)[:60]):
+                a.cose_p256(k)
+
     def test_trailing_bytes(self):
         ev = self.evidence()
         for field in ("ak", "quote", "quotesig"):

@@ -474,9 +474,12 @@ impl AmdVi {
             let len = match kind {
                 0..=0x7f => 4 << (kind >> 6),
                 0xf0 => *e.get(21)? as usize + 22,
+                // Its length is unknown, and so is what follows: an alias
+                // or a special device left unread would be enabled wrong.
+                // Malformed, as the shim finds it (acs::IvrsAliases).
                 _ => {
-                    info!("l4h-root: iommu: IVHD entry type {:#x} not known, rest of the IVHD skipped", kind);
-                    return Some(());
+                    log!("l4h-root: iommu: IVHD entry type {:#x} not known", kind);
+                    return None;
                 }
             };
             let ent = e.get(..len)?;

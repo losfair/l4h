@@ -5212,8 +5212,11 @@ reads or writes configuration space outside its window's buses.
 
 **CPUs.** Each partition's MADT lists only its own LAPIC/x2APIC entries,
 its first CPU first, so seL4 starts exactly those. Partition 0 keeps the
-I/O APICs, interrupt source overrides and the PCAT_COMPAT flag; the others
-have none and use MSI/MSI-X only. Root programs every MSI (and IRTE) for
+interrupt source overrides and the PCAT_COMPAT flag; the others have none
+and use MSI/MSI-X only. Every partition keeps the I/O APIC entries: the
+others' kernels (`no_legacy_irq`) drive none of them, but keep each one's
+page out of user device memory (patch 0046, FL4) and know of it only from
+the MADT. Root programs every MSI (and IRTE) for
 the partition's first CPU (`partition::msi_dest`): the boot CPU in
 partition 0, the one with the lowest APIC ID in the others. MSI addresses
 and the IRTEs root writes have 8-bit destinations, so the shim refuses a

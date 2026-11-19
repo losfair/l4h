@@ -304,6 +304,53 @@ pub const fn firmware_va(i: usize) -> usize {
 pub const FIRMWARE_MAX: usize = 64 << 20;
 const _: () = assert!(CHANNEL_VA + crate::uplink::MAX_CHANNEL_SIZE <= CTL_VA && bar_va(6) <= crate::DMA_VA);
 
+/// What starting a nicd takes of root (l4h-root nicd.rs, `spawn`), known
+/// before any of it is made, so that root refuses instead of running out
+/// half way (its allocations panic).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Budget {
+    /// Pages it maps of root's frames: BAR windows, DMA region, channel,
+    /// firmware copies, control and configuration pages, mailbox.  Each
+    /// mapping's cap is kept in one slot of its keep CNode.
+    pub pages: usize,
+    /// Radix of the keep CNode: 2^keep_bits slots of 32 bytes, one object.
+    pub keep_bits: usize,
+    /// Memory: the image, the firmware copies, the keep CNode, page
+    /// tables and the component's objects.
+    pub bytes: usize,
+    /// Root CNode slots of its objects: frames, page tables and the rest.
+    pub slots: usize,
+    /// The largest single object (the keep CNode, or the component's
+    /// CNode): a free block at least this large (2^bits) must exist.
+    pub min_block_bits: usize,
+}
+
+/// The Budget of a nicd whose driver's image takes up to
+/// 2^`image_max_bits` bytes, given firmware blobs of `firmware` bytes
+/// each, mapping `bar_pages` pages of BAR windows, `dma_pages` of DMA
+/// region and `chan_pages` of channel.
+pub fn budget(image_max_bits: u8, firmware: &[usize], bar_pages: usize, dma_pages: usize, chan_pages: usize) -> Budget {
+    const PAGE: usize = 4096;
+    // Ranges mapped apart, each of which may need a page table (and a
+    // directory, and a pointer table) of its own at either end: ELF
+    // segments, BARs, DMA region, channel, firmware blobs, control page,
+    // snapshot, mailbox, info pages, IPC buffers, stacks, log lanes.
+    const REGIONS: usize = 32;
+    // Its other objects: thread, keeper, scheduling contexts, endpoints,
+    // notifications, VSpace root, info pages, IPC buffers, stacks (frames
+    // each), and what alignment wastes of the arena.
+    const OBJECT_BYTES: usize = 4 << 20;
+    const OBJECT_SLOTS: usize = 1024;
+    let fw_pages: usize = firmware.iter().map(|b| b.div_ceil(PAGE)).sum();
+    let pages = bar_pages + dma_pages + chan_pages + fw_pages + 2 + crate::mailbox::MAILBOX_PAGES;
+    let keep_bits = pages.next_power_of_two().trailing_zeros().max(1) as usize;
+    let elf_pages = (1usize << image_max_bits) / PAGE;
+    let tables = (pages + elf_pages) / 512 + 3 * REGIONS;
+    let bytes = (elf_pages + fw_pages + tables) * PAGE + (1 << (keep_bits + 5)) + (1 << (crate::CNODE_BITS + 5)) + OBJECT_BYTES;
+    let slots = elf_pages + fw_pages + tables + OBJECT_SLOTS;
+    Budget { pages, keep_bits, bytes, slots, min_block_bits: keep_bits.max(crate::CNODE_BITS) + 5 }
+}
+
 /// nicd CSpace: its device's IRQ handler, its legacy I/O ports, and netd's
 /// notification (badged badges::netd::UPLINK) for its channel.  A
 /// configuration-space request (`Published::cfg_req`) is signalled on
@@ -454,6 +501,42 @@ pub const fn cfg_request(seq: u32, kind: u64, offset: u16, size: u8) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    /// Every allocation `spawn` makes, as it makes them, within the
+    /// budget: the image's frames (one root slot each), the firmware
+    /// copies (one each), the keep CNode (one object, 2^(keep_bits + 5)
+    /// bytes, a slot for each mapping) and a page table for every 512
+    /// pages it maps, at least.
+    #[test]
+    fn a_budget_covers_what_spawn_makes() {
+        const PAGE: usize = 4096;
+        let channels = [crate::uplink::MIN_DATA_BITS, crate::uplink::DEFAULT_DATA_BITS, crate::uplink::MAX_DATA_BITS];
+        for image_bits in [16, 22, MAX_IMAGE_BITS] {
+            for dma_bits in [MIN_DMA_BITS, 22, MAX_DMA_BITS] {
+                for chan in channels {
+                    for fw in [&[][..], &[1, PAGE + 1][..], &[1 << 20; MAX_FIRMWARE][..], &[FIRMWARE_MAX; MAX_FIRMWARE][..]] {
+                        for bars in [0, 4, 1 << (MAX_BAR_WINDOW_BITS - 12), 6 << (MAX_BAR_WINDOW_BITS - 12)] {
+                            let dma = (1usize << dma_bits) / PAGE;
+                            let chan = crate::uplink::channel_size(chan) / PAGE;
+                            let b = budget(image_bits, fw, bars, dma, chan);
+                            let case = (image_bits, dma_bits, chan, fw.len(), bars);
+                            let fw_pages: usize = fw.iter().map(|n| n.div_ceil(PAGE)).sum();
+                            let mapped = bars + dma + chan + fw_pages + 2 + crate::mailbox::MAILBOX_PAGES;
+                            let elf_pages = (1usize << image_bits) / PAGE;
+                            assert_eq!(b.pages, mapped, "{case:?}");
+                            assert!(1usize << b.keep_bits >= mapped, "{case:?}: a mapping without a keep slot");
+                            let keep = 1usize << (b.keep_bits + 5);
+                            let tables = (mapped + elf_pages) / 512;
+                            let cnode = 1usize << (crate::CNODE_BITS + 5);
+                            assert!(b.bytes >= (elf_pages + fw_pages + tables) * PAGE + keep + cnode, "{case:?}: bytes {:#x}", b.bytes);
+                            assert!(b.slots >= elf_pages + fw_pages + tables, "{case:?}: slots {}", b.slots);
+                            assert!(b.min_block_bits >= b.keep_bits + 5 && b.min_block_bits >= crate::CNODE_BITS + 5, "{case:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     use super::*;
 
     const fn m() -> Manifest {
