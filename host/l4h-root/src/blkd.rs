@@ -582,24 +582,65 @@ pub fn start(
     disk.dom = dom;
 }
 
+/// What attaching a client of `extents` extents makes: in the guest's
+/// arena, its frames (blk::attach_pages) and the keep CNode of blkd's
+/// mappings of them; in blkd's, the page tables of those mappings.
+fn attach_bytes(extents: usize) -> (usize, usize) {
+    let pages = blk::attach_pages(extents);
+    (pages * PAGE + (32 << blk::ATTACH_KEEP_BITS), host::map_tables(blk::CHANNEL_PAGES) + host::map_tables(pages - blk::CHANNEL_PAGES))
+}
+
+/// Room for an attachment of `extents` extents in the guest's arena and
+/// blkd's (`attach_bytes`), and its keep CNode, the largest object: made
+/// before blkd is given anything, as `attach`'s allocations panic.
+/// ENOMEM, with no CNode, if either arena cannot grow; what they grew by
+/// stays theirs.
+fn prepare(ctrl: &mut Controller, client: &mut RootGuest, extents: usize, alloc: &mut Alloc) -> Result<cap::CNode, Errno> {
+    let (bytes, tables) = attach_bytes(extents);
+    let driver = ctrl.driver.as_mut().expect("started blkd");
+    // blkd's page tables outlive the guest, as its mappings' slots do.
+    if !alloc.global(|alloc| driver.arena.reserve(alloc, tables)) || !client.arena.reserve(alloc, bytes) {
+        return Err(ctl::ENOMEM);
+    }
+    let Some(slot) = client.arena.try_object(alloc, sel4::ObjectBlueprint::CNode { size_bits: blk::ATTACH_KEEP_BITS }) else {
+        return Err(ctl::ENOMEM);
+    };
+    let keep = sel4::init_thread::Slot::<cap_type::CNode>::from_index(slot).cap();
+    // What the CNode's alignment took may leave too little for the frames:
+    // the CNode's memory stays the arena's, its slot is freed.
+    if !client.arena.reserve(alloc, bytes - (32 << blk::ATTACH_KEEP_BITS)) {
+        drop_keep(keep, alloc);
+        return Err(ctl::ENOMEM);
+    }
+    Ok(keep)
+}
+
+/// Give up a keep CNode `prepare` made.
+fn drop_keep(keep: cap::CNode, alloc: &mut Alloc) {
+    let _ = abs_of(keep).delete();
+    alloc.slots.free(keep.bits() as Slot);
+}
+
 /// Attach a disk of host disk `disk` that blkd allowed in slot `i`
 /// (`checked`), a window or `extents` extents, to one client of its
 /// running shared controller, whose blkd has been given the client's done
-/// notification.  Returns the channel frames (the client's) and a kick
-/// capability (in a slot of its own) for the client's l4h-vmm.
+/// notification.  `keep` and the room for the rest are `prepare`'s.
+/// Returns the channel frames (the client's) and a kick capability (in a
+/// slot of its own) for the client's l4h-vmm.
 #[allow(clippy::too_many_arguments)]
 fn attach(ctrl: &mut Controller, i: usize, disk: usize, client: &mut RootGuest, window: blk::DiskWindow,
-    extents: usize, read_only: bool, volatile: bool, alloc: &mut Alloc, iommu: &mut Iommu) -> (Channel, cap::Notification) {
+    extents: usize, read_only: bool, volatile: bool, keep: cap::CNode, alloc: &mut Alloc, iommu: &mut Iommu) -> (Channel, cap::Notification) {
+    const KEEP_BITS: usize = blk::ATTACH_KEEP_BITS;
     let reserved = ctrl.clients[i].as_ref().is_some_and(|a| a.reserved);
     let driver = ctrl.driver.as_mut().expect("started blkd");
+    // Frames and blkd's page tables, within the room `prepare` made.
     let chan: Channel = (0..blk::CHANNEL_PAGES)
         .map(|_| client.arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP)).collect();
-    let keep = client.arena.object_cap::<cap_type::CNode>(alloc, sel4::ObjectBlueprint::CNode { size_bits: 10 });
     // Initial values are delivered via the service call, not guest-chosen IDs.
     for (page, f) in chan.iter().enumerate() {
         alloc.global(|alloc| driver.comp.map_copy(alloc, &mut driver.arena, &abs_of(*f), blk::channel_va(i) + page * PAGE,
             CapRights::read_write(), VmAttributes::DEFAULT,
-            keep.absolute_cptr_from_bits_with_depth(page as u64, 10)));
+            keep.absolute_cptr_from_bits_with_depth(page as u64, KEEP_BITS)));
     }
     // The pages of the disk's extent table that blkd builds; no one else
     // maps them.
@@ -607,7 +648,7 @@ fn attach(ctrl: &mut Controller, i: usize, disk: usize, client: &mut RootGuest, 
         let f = client.arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP);
         alloc.global(|alloc| driver.comp.map_copy(alloc, &mut driver.arena, &abs_of(f), blk::extent_va(i) + page * PAGE,
             CapRights::read_write(), VmAttributes::DEFAULT,
-            keep.absolute_cptr_from_bits_with_depth((blk::CHANNEL_PAGES + k) as u64, 10)));
+            keep.absolute_cptr_from_bits_with_depth((blk::CHANNEL_PAGES + k) as u64, KEEP_BITS)));
     }
     let kick_slot = alloc.slots.alloc();
     let kick = sel4::init_thread::Slot::<cap_type::Notification>::from_index(kick_slot).cap();
@@ -672,20 +713,25 @@ fn checked(h: &mut Host, c: usize, token: usize, id: usize, instance: u64, disk:
             return Err(ctl::EIO);
         }
         if h.guests[id].as_ref().is_none_or(|g| g.instance != instance) { return Err(ctl::ENOENT); }
-        if !h.can_afford(1 << 20, 0, 0) { return Err(ctl::ENOMEM); }
+        let (bytes, tables) = attach_bytes(n);
+        if !h.can_afford((1 << 20) + bytes + tables, 0, blk::attach_pages(n) + 16) { return Err(ctl::ENOMEM); }
         crate::vmmgr::with_guest(h, id, |h, g| {
             if g.disks.is_full() {
                 return Err(ctl::ENOSPC);
             }
+            // Room for what the attachment makes, before blkd is given
+            // anything: none of it can fail after.
+            let keep = prepare(&mut h.ctrls[c], g, n, &mut h.alloc)?;
             // Client i's completions go to the guest's VMM, given before
-            // anything is allocated for it: a blkd that keeps filling the
-            // slot misbehaves, as one whose answer names a bad slot.
+            // its channel is made: a blkd that keeps filling the slot
+            // misbehaves, as one whose answer names a bad slot.
             let driver = h.ctrls[c].driver.as_ref().expect("started blkd");
             if driver.comp.give_edge_live(&wiring::BLKD_VMM_DONE, i, 0, &g.vmm_ntfn).is_err() {
+                drop_keep(keep, &mut h.alloc);
                 quarantine(&mut h.ctrls[c], &h.pci);
                 return Err(ctl::EIO);
             }
-            let (chan, kick) = attach(&mut h.ctrls[c], i, disk, g, window, n, read_only, volatile, &mut h.alloc, &mut h.iommu);
+            let (chan, kick) = attach(&mut h.ctrls[c], i, disk, g, window, n, read_only, volatile, keep, &mut h.alloc, &mut h.iommu);
             g.disks.must_push((c, i));
             activate(&mut h.ctrls[c], unit, i, g, chan, kick, token, &mut h.wins.a)
         })

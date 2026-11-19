@@ -111,6 +111,16 @@ pub const DMA_VA: usize = 0x3800_0000_0000;
 /// IO_POOL_VA + (g - io_pool_gpa).  l4h-vmm never maps guest RAM.
 pub const IO_POOL_VA: usize = 0x4000_0000_0000;
 
+/// Bytes of the paging structures mapping `pages` contiguous pages
+/// anywhere in a 4-level address space, at most: a page table for every
+/// 512 pages and one more where they cross a table's boundary, and a
+/// directory and a pointer table at either end.  What an arena is
+/// reserved for (Arena::reserve) before such a mapping, whose
+/// allocations panic.
+pub const fn map_tables(pages: usize) -> usize {
+    (pages.div_ceil(512) + 5) * 4096
+}
+
 /// Component CSpace: one CNode of 2^CNODE_BITS slots resolving the whole
 /// CPtr, so a CPtr is simply a slot number.
 pub const CNODE_BITS: usize = 12;
@@ -348,5 +358,27 @@ pub mod ticks {
         let v: u64;
         unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) v, options(nomem, nostack)) };
         v
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `map_tables` covers the page tables, directories and pointer tables
+    /// a mapping of `pages` pages at any address needs, counted one by one:
+    /// those a mapping at a boundary of each level crosses most.
+    #[test]
+    fn map_tables_covers_any_mapping() {
+        const PAGE: usize = 4096;
+        // Distinct tables of the level whose entries each map 2^shift bytes.
+        let spanned = |va: usize, pages: usize, shift: u32| (va + pages * PAGE - 1) / (512 << shift) - va / (512 << shift) + 1;
+        for pages in [1, 2, 16, 128, 511, 512, 513, 1024, 1025, 4096] {
+            for va in [SHARED_VA, SHARED_VA + PAGE, SHARED_VA + (2 << 20) - PAGE, SHARED_VA + (1 << 30) - PAGE,
+                SHARED_VA + (512 << 30) - PAGE, DMA_VA - PAGE * pages / 2] {
+                let tables = spanned(va, pages, 12) + spanned(va, pages, 21) + spanned(va, pages, 30);
+                assert!(map_tables(pages) >= tables * PAGE, "{pages} pages at {va:#x}: {tables} tables");
+            }
+        }
     }
 }

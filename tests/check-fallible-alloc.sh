@@ -4,9 +4,10 @@
 # Alloc::dma_frames arena): Arena::object(_cap) and Alloc::object panic,
 # and a panic of root is the whole host's, one of vmmgr its control
 # plane's.  Each function named here, as l4h-root's nicd start
-# (alloc_channel, alloc_dma) and netd mapping (map_uplink), and vmmgr's
-# guest creation (create, share_block) and SDK mapping (Sdk::map), must
-# not use them.
+# (alloc_channel, alloc_dma) and netd mapping (map_uplink), its USB
+# controller claim and attachment (usb.rs claim, attach) and disk
+# attachment (blkd.rs prepare, attach), and vmmgr's guest creation
+# (create, share_block) and SDK mapping (Sdk::map), must not use them.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 fail=0
@@ -34,14 +35,22 @@ check() {
 check host/l4h-root/src/nicd.rs alloc_channel
 check host/l4h-root/src/nicd.rs alloc_dma
 check host/l4h-root/src/netd.rs map_uplink
+check host/l4h-root/src/usb.rs claim
+check host/l4h-root/src/usb.rs attach
+check host/l4h-root/src/blkd.rs prepare
+check host/l4h-root/src/blkd.rs attach
 check host/l4h-vmmgr/src/guest.rs create
 check host/l4h-vmmgr/src/guest.rs share_block
 check host/l4h-vmmgr/src/kimage.rs map
-# The nicd's own CSpace CNode is made before component::create, which
-# would make it with one.
-if ! body "$root/host/l4h-root/src/nicd.rs" spawn | grep -q 'cnode: Some('; then
-    echo "check-fallible-alloc: nicd spawn leaves its CNode to component::create" >&2
-    fail=1
-fi
+# The nicd's and usbd's own CSpace CNodes are made before
+# component::create, which would make them with one.  (The body is read
+# whole first: grep -q stopping early would fail the pipe under pipefail.)
+for at in nicd.rs:spawn usb.rs:claim; do
+    b=$(body "$root/host/l4h-root/src/${at%%:*}" "${at#*:}")
+    if ! grep -q 'cnode: Some(' <<<"$b"; then
+        echo "check-fallible-alloc: ${at%%:*} ${at#*:} leaves its CNode to component::create" >&2
+        fail=1
+    fi
+done
 [ "$fail" = 0 ] && echo "check-fallible-alloc: ok"
 exit "$fail"

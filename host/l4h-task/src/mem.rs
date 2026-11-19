@@ -893,14 +893,15 @@ impl Alloc {
 /// preferring an eighth of its size once that is more, so that its
 /// regions stay few.  Smaller blocks can still serve it under fragmentation.
 const ARENA_GROW_BITS: usize = 20;
-/// Regions of an arena, and the Untypeds it owns besides (the I/O pool,
-/// netd ports: at most one per device).
+/// Regions of an arena, and the Untypeds it owns besides (`Arena::own`):
+/// the I/O pool and its mapping CNode's, and netd ports, at most one per
+/// device.
 const ARENA_REGIONS: usize = 96;
 /// What alignment may leave unusable at the end of a region, for
 /// Arena::reserve: the largest object allocated in quantity (a 16 KiB RAM
 /// CNode) and the space before it.
 pub const ARENA_TAIL: usize = 32 << 10;
-const ARENA_OWNED: usize = ARENA_REGIONS + 1 + l4h_host::MAX_GUEST_DEVICES;
+const ARENA_OWNED: usize = ARENA_REGIONS + 2 + l4h_host::MAX_GUEST_DEVICES;
 
 /// A DMA region and the CNode of its frames (`Alloc::dma_frames`).
 pub struct DmaFrames {
@@ -931,7 +932,8 @@ impl Arena {
     }
 
     /// Own the Untyped in `slot` besides the arena's regions (at most one
-    /// per device and the I/O pool).
+    /// per device, the I/O pool and the Untyped of its mapping CNode:
+    /// ARENA_OWNED holds them with every region).
     pub fn own(&mut self, slot: Slot, paddr: usize, bits: usize) {
         self.owned.must_push((slot, paddr, bits));
     }

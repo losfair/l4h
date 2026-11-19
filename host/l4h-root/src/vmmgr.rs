@@ -933,7 +933,8 @@ fn nic_add(h: &mut Host, id: usize, switch: u32, mac: u64, flags: u64) -> Result
     if h.netd.failed() {
         return Err(ctl::EIO);
     }
-    if !h.can_afford(8 << 20, 0, 0) {
+    // The port's CNodes, kick and memory, and netd's page tables.
+    if !h.can_afford(8 << 20, 0, l4h_host::net::PORT_PAGES / 512 + 16) {
         return Err(ctl::ENOMEM);
     }
     with_guest(h, id, |h, g| {
@@ -948,6 +949,10 @@ fn nic_add(h: &mut Host, id: usize, switch: u32, mac: u64, flags: u64) -> Result
         // partitions of a machine, which a link may put on one L2.
         let part = crate::partition::get().map_or(0, |d| d.index as u64);
         let mac = if mac == 0 { 0x02_4c_34_00_00_00 | part << 16 | ((id as u64) << 8) | p as u64 } else { mac };
+        // netd's mapping of the port cannot fail once it is given.
+        if !h.netd.port_room(&mut h.alloc) {
+            return Err(ctl::ENOMEM);
+        }
         h.netd.give_port_done(p, g, &h.pci)?;
         let memory = crate::netd::Netd::port_memory(&mut h.alloc).inspect_err(|_| h.netd.take_port_done(p))?;
         let (chan, kick) = h.netd.add_port(g, p, switch, mac, flags, memory, &mut h.alloc);

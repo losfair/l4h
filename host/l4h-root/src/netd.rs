@@ -371,8 +371,17 @@ impl Netd {
         }
     }
 
+    /// Room in netd's arena for the page tables of a port's mapping
+    /// (`add_port`), whose allocations panic: false if it cannot grow.
+    /// Taken before the guest's device; what it grew by stays netd's.
+    pub fn port_room(&mut self, alloc: &mut Alloc) -> bool {
+        // Global, as the tables are: they outlive the guest.
+        alloc.global(|alloc| self.arena.reserve(alloc, host::map_tables(net::PORT_PAGES)))
+    }
+
     /// Connect a guest device of `g` to `switch` as port `p` (free_port,
-    /// then give_port_done), using `memory` (port_memory).  Returns for the guest's l4h-vmm a
+    /// then give_port_done), using `memory` (port_memory) and the room
+    /// port_room made.  Returns for the guest's l4h-vmm a
     /// CNode of copies of the port's frames (radix PORT_KEEP_BITS) and a
     /// kick capability, in a slot of its own.
     #[allow(clippy::too_many_arguments)]

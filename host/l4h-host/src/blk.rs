@@ -410,6 +410,17 @@ pub fn table_pages(n: usize) -> [core::ops::Range<usize>; 2] {
     [first, second]
 }
 
+/// Radix of the CNode root keeps blkd's mappings of a client's frames in
+/// (l4h-root's blkd::attach): a slot for each of `attach_pages`.
+pub const ATTACH_KEEP_BITS: usize = 10;
+
+/// The frames root makes for a client of `n` extents (0 for a window) and
+/// blkd maps: its channel, and the pages of its extent table that blkd
+/// builds (`table_pages`).
+pub fn attach_pages(n: usize) -> usize {
+    CHANNEL_PAGES + table_pages(n.max(1)).iter().map(|r| r.len()).sum::<usize>()
+}
+
 /// Up to two pieces of one request, in different extents: (device sector,
 /// bytes), and how many there are.
 pub type Pieces = ([(u64, u64); 2], usize);
@@ -614,5 +625,23 @@ impl<const N: usize> Reservations<N> {
     pub fn unattached<'a>(&self, active: &impl Fn(usize) -> Option<Hold<'a>>, unit: usize, window: DiskWindow) -> bool {
         let w = [Extent { start: window.start, sectors: window.sectors, offset: 0 }];
         !(0..N).flat_map(|i| [active(i), self.hold(i)]).flatten().any(|h| h.unit == unit && overlap(&w, h.extents))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every frame of an attachment has its slot in root's keep CNode,
+    /// for any number of extents: past it, the mapping of the last frames
+    /// would land outside the CNode.
+    #[test]
+    fn an_attachment_fits_its_keep_cnode() {
+        for n in [0, 1, 2, 3, 100, 170, 171, 1000, 2048, MAX_EXTENTS - 1, MAX_EXTENTS] {
+            let pages = attach_pages(n);
+            assert_eq!(pages, CHANNEL_PAGES + table_pages(n.max(1)).into_iter().flatten().count(), "{n}");
+            assert!(pages <= 1 << ATTACH_KEEP_BITS, "{n} extents: {pages} pages");
+        }
+        assert_eq!(attach_pages(0), attach_pages(1));
     }
 }

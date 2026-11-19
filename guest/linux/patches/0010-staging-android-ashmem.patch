@@ -12,7 +12,7 @@ no page-size compatibility (PAGE_ALIGN for __PAGE_ALIGN).
 diff -urN a/drivers/staging/android/ashmem.c b/drivers/staging/android/ashmem.c
 --- a/drivers/staging/android/ashmem.c	1969-12-31 16:00:00.000000000 -0800
 +++ b/drivers/staging/android/ashmem.c	2026-10-25 01:35:53.118737631 -0700
-@@ -0,0 +1,1015 @@
+@@ -0,0 +1,1019 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/* mm/ashmem.c
 + *
@@ -552,15 +552,19 @@ diff -urN a/drivers/staging/android/ashmem.c b/drivers/staging/android/ashmem.c
 +
 +	mutex_lock(&ashmem_mutex);
 +
++	/*
++	 * does the application expect PROT_READ to imply PROT_EXEC?  Before
++	 * the check: a holder of a region whose PROT_EXEC was removed must
++	 * not add it back with READ_IMPLIES_EXEC.
++	 */
++	if ((prot & PROT_READ) && (current->personality & READ_IMPLIES_EXEC))
++		prot |= PROT_EXEC;
++
 +	/* the user can only remove, not add, protection bits */
 +	if ((asma->prot_mask & prot) != prot) {
 +		ret = -EINVAL;
 +		goto out;
 +	}
-+
-+	/* does the application expect PROT_READ to imply PROT_EXEC? */
-+	if ((prot & PROT_READ) && (current->personality & READ_IMPLIES_EXEC))
-+		prot |= PROT_EXEC;
 +
 +	asma->prot_mask = prot;
 +
