@@ -335,6 +335,12 @@ pub(crate) fn abs(c: impl sel4::HasCPtrWithDepth) -> sel4::AbsoluteCPtr {
     slot::CNODE.cap().absolute_cptr(c)
 }
 
+/// A CNode of 2^bits slots from `arena`, or None if the host is out of
+/// memory or too fragmented for it (Arena::object panics).
+fn try_cnode(arena: &mut Arena, alloc: &mut Alloc, bits: usize) -> Option<cap::CNode> {
+    arena.try_object(alloc, ObjectBlueprint::CNode { size_bits: bits }).map(self_cap::<cap_type::CNode>)
+}
+
 pub(crate) fn self_cap<T: sel4::CapType>(s: Slot) -> sel4::Cap<T> {
     sel4::init_thread::Slot::<T>::from_index(s).cap()
 }
@@ -471,9 +477,12 @@ impl Guest {
 
     /// Fill shared block `b` with read-only copies of the kernel's frames
     /// for it, mapped in the direct map.  It has no Untyped: nothing of it
-    /// is the guest's.
-    fn share_block(&mut self, alloc: &mut Alloc, kernel: &Kernel, b: usize) {
-        let l2 = self.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: abi::RAM_L2_BITS });
+    /// is the guest's.  False, with nothing filled, if there is no memory
+    /// for its level-2 CNode.
+    fn share_block(&mut self, alloc: &mut Alloc, kernel: &Kernel, b: usize) -> bool {
+        let Some(l2) = try_cnode(&mut self.arena, alloc, abi::RAM_L2_BITS) else {
+            return false;
+        };
         self.ram_l1[b >> abi::RAM_L2_BITS]
             .absolute_cptr_from_bits_with_depth((b & ((1 << abi::RAM_L2_BITS) - 1)) as u64, abi::RAM_L2_BITS)
             .copy(&abs(l2), CapRights::all())
@@ -489,6 +498,7 @@ impl Guest {
             self.ram_frame(gpa).move_(&abs(frame)).expect("move shared frame");
         }
         alloc.slots.free(tmp);
+        true
     }
 
     /// Make guest RAM [gpa, gpa + len) host frames, to load an image into
@@ -1028,30 +1038,37 @@ impl Guest {
     }
 }
 
-/// Create a guest with no image.  Slots allocated here and in later
-/// operations on the guest must be tracked into `Guest::slots` by the
-/// caller (see `Alloc::slots`).  On failure, returns the partly built
-/// guest, if there is one, for the caller to destroy.
-pub fn create(
-    id: usize,
-    cfg: &GuestConfig,
-    alloc: &mut Alloc,
-    asids: &mut AsidPools,
-    host_info: &HostInfo,
-    kernel: &Kernel,
-) -> Result<Guest, Option<Guest>> {
+/// What creating a guest of `cfg` takes, checked and computed before
+/// anything is made (`create`, and vmmgr's `can_afford` before it).
+pub struct Plan {
+    /// The guest's own blocks, and the kernel's shared blocks it gets.
+    pub owned: usize,
+    pub shared: u64,
+    pub nr_blocks: usize,
+    pub pool_gpa: usize,
+    pub hp_gpa: usize,
+    pub hp_count: usize,
+    /// Bytes of its arena at creation.
+    pub estimate: usize,
+    /// vmmgr's slots of its objects at creation, at most.
+    pub slots: usize,
+}
+
+/// The Plan of a guest of `cfg`, or None if the control API asked for one
+/// that cannot be.
+pub fn plan(cfg: &GuestConfig, host_info: &HostInfo, kernel: &Kernel) -> Option<Plan> {
     // Every value comes from the control API: check before computing.
     if cfg.vcpus < 1 || cfg.vcpus > abi::MAX_VCPUS || cfg.ram < RAM_MIN || cfg.ram > RAM_MAX {
-        return Err(None);
+        return None;
     }
     if cfg.vspaces > MAX_VSPACES {
-        return Err(None);
+        return None;
     }
     if cfg.ram_base % PAGE != 0 || cfg.ram_base != kernel.ram_base {
-        return Err(None);
+        return None;
     }
     if !cfg.io_pool.is_power_of_two() || cfg.io_pool < IO_POOL_MIN || cfg.io_pool > IO_POOL_MAX {
-        return Err(None);
+        return None;
     }
     let ram_base = cfg.ram_base;
     // The guest's own blocks, and the kernel's shared blocks on top, of
@@ -1069,19 +1086,19 @@ pub fn create(
     }
     let nr_blocks = owned + shared.count_ones() as usize;
     if nr_blocks > abi::MAX_BLOCKS {
-        return Err(None);
+        return None;
     }
     let ram = nr_blocks * BLOCK;
     // The I/O pool follows RAM in guest-physical space and in the direct map.
     let pool_gpa = ram.next_multiple_of(IO_POOL_ALIGN);
     if ram_base == 0 || ram_base.checked_add(pool_gpa + cfg.io_pool).is_none_or(|end| end as u64 > abi::SPECIAL_BASE) {
-        return Err(None);
+        return None;
     }
     // The hotplug region fills guest-physical space above the pool.
     let hp_gpa = (pool_gpa + cfg.io_pool).next_multiple_of(abi::HP_SIZE);
     let hp_count = (abi::GPA_END.saturating_sub(hp_gpa) / abi::HP_SIZE).min(abi::HP_MAX);
     if ram_base.checked_add(hp_gpa + hp_count * abi::HP_SIZE).is_none_or(|end| end as u64 > abi::SPECIAL_BASE) {
-        return Err(None);
+        return None;
     }
 
     // Host-side objects for this guest (its arena grows if this is too
@@ -1093,7 +1110,6 @@ pub fn create(
     // block's own memory and a slot: the guest makes its own RAM CNodes,
     // page tables and objects from it.
     let n_l1 = nr_blocks.div_ceil(1 << abi::RAM_L2_BITS);
-    let block_radix = (nr_blocks.next_power_of_two().trailing_zeros() as usize).max(1);
     let pool_pages = cfg.io_pool / PAGE;
     let estimate = (32 << abi::ROOT_CNODE_BITS) * 4
         + n_l1 * (32 << abi::RAM_L2_BITS)
@@ -1107,6 +1123,33 @@ pub fn create(
         + crate::provider::IMAGE.len().next_multiple_of(PAGE) + 3 * PAGE
         + if cfg.dom0 { abi::CTL_LOAD_MAX as usize } else { 0 }
         + vmm::arena_bytes(cfg.io_pool, cfg.vcpus, MAX_GUEST_DEVICES);
+    // A slot each: the CNodes, VSpaces and EPT roots, the vCPUs' objects,
+    // the boot info and provider frames, and page tables.
+    let slots = 64 + n_l1 + cfg.vspaces + abi::MAX_EPT_ROOTS + cfg.vcpus * 16
+        + (abi::BOOTINFO_SIZE as usize + crate::provider::IMAGE.len()).div_ceil(PAGE)
+        + (pool_pages + nr_blocks.min(64) * BLOCK_FRAMES).div_ceil(512) + 3 * 16;
+    Some(Plan { owned, shared, nr_blocks, pool_gpa, hp_gpa, hp_count, estimate, slots })
+}
+
+/// Create a guest with no image.  Slots allocated here and in later
+/// operations on the guest must be tracked into `Guest::slots` by the
+/// caller (see `Alloc::slots`).  On failure, returns the partly built
+/// guest, if there is one, for the caller to destroy.
+pub fn create(
+    id: usize,
+    cfg: &GuestConfig,
+    alloc: &mut Alloc,
+    asids: &mut AsidPools,
+    host_info: &HostInfo,
+    kernel: &Kernel,
+) -> Result<Guest, Option<Guest>> {
+    let Some(Plan { owned, shared, nr_blocks, pool_gpa, hp_gpa, hp_count, estimate, .. }) = plan(cfg, host_info, kernel) else {
+        return Err(None);
+    };
+    let ram_base = cfg.ram_base;
+    let n_l1 = nr_blocks.div_ceil(1 << abi::RAM_L2_BITS);
+    let block_radix = (nr_blocks.next_power_of_two().trailing_zeros() as usize).max(1);
+    let pool_pages = cfg.io_pool / PAGE;
     // memd makes the block and hotplug CNodes, of a block it may need.
     if alloc.free_bytes() < estimate + (owned + 1) * BLOCK {
         return Err(None);
@@ -1115,9 +1158,11 @@ pub fn create(
 
     // Guest root CNode.
     let cnode_slot = alloc.slots.alloc();
-    arena
-        .retype(alloc, &ObjectBlueprint::CNode { size_bits: abi::ROOT_CNODE_BITS }, 1, Dest::new(crate::slot::CNODE.cap(), cnode_slot))
-        .expect("guest CNode");
+    if arena.retype(alloc, &ObjectBlueprint::CNode { size_bits: abi::ROOT_CNODE_BITS }, 1, Dest::new(crate::slot::CNODE.cap(), cnode_slot)).is_none() {
+        // Its slot is the guest's, freed with the others.
+        alloc.reclaim(arena);
+        return Err(None);
+    }
     let vspace_slot = arena.object(alloc, PML4_BP);
     let vspace = self_cap::<cap_type::VSpace>(vspace_slot);
     asids.assign(alloc, vspace);
@@ -1179,10 +1224,19 @@ pub fn create(
         return Err(Some(g));
     };
     g.vmm_cnodes = Some(cnodes);
+    // The CNode of the I/O pool's mappings, as large as the VMM's pool
+    // CNode (2 MiB for a 256 MiB pool): made now, while memd still has the
+    // blocks that guest_create below takes for RAM.
+    let pool_radix = cfg.io_pool.trailing_zeros() as usize - 12;
+    let Some(keep) = try_cnode(&mut g.arena, alloc, pool_radix) else {
+        return Err(Some(g));
+    };
 
     let guard34 = CNodeCapData::new(0, abi::ROOT_GUARD_BITS);
     let guard6 = CNodeCapData::new(0, abi::L2_INDEX_BITS - abi::ROOT_CNODE_BITS);
-    let meta = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: abi::ROOT_CNODE_BITS });
+    let Some(meta) = try_cnode(&mut g.arena, alloc, abi::ROOT_CNODE_BITS) else {
+        return Err(Some(g));
+    };
     l4h_task::edge::mint_cnode(&meta.absolute_cptr_from_bits_with_depth(0, abi::ROOT_CNODE_BITS), slot::CNODE.cap(), g.cnode, guard34)
         .expect("meta CNode");
     g.give_cnode(abi::SLOT_META, meta, guard6.clone());
@@ -1197,7 +1251,9 @@ pub fn create(
     // level-2 RAM CNodes.
     let guard0 = CNodeCapData::new(0, 0);
     for n in 0..n_l1 {
-        let cn = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: abi::RAM_L2_BITS });
+        let Some(cn) = try_cnode(&mut g.arena, alloc, abi::RAM_L2_BITS) else {
+            return Err(Some(g));
+        };
         g.give_cnode(abi::SLOT_RAM_L1_BASE + n, cn, guard0.clone());
         g.ram_l1.must_push(cn);
     }
@@ -1219,8 +1275,8 @@ pub fn create(
     g.give_cnode(abi::SLOT_HP, hp_cn, CNodeCapData::new(0, abi::HP_L1_GUARD));
     g.nr_blocks = nr_blocks;
     for b in 0..nr_blocks.min(64) {
-        if g.is_shared(b) {
-            g.share_block(alloc, kernel, b);
+        if g.is_shared(b) && !g.share_block(alloc, kernel, b) {
+            return Err(Some(g));
         }
     }
     // ---- Hypercall endpoint (served by l4h-vmm).
@@ -1232,7 +1288,6 @@ pub fn create(
     // map after RAM in the direct map.  The guest gets these mappings
     // only, never a capability to the pool.  And the VMM's notification,
     // which root's backends signal: root's too.
-    let pool_radix = cfg.io_pool.trailing_zeros() as usize - 12;
     let new = match root::guest_new(alloc, id, cfg.io_pool, pool_gpa, cfg.dom0) {
         Ok(new) => new,
         Err(_) => return Err(Some(g)),
@@ -1243,7 +1298,6 @@ pub fn create(
     g.give_edge(&wiring::GUEST_VMM_CONSOLE, &g.vmm_ntfn_obj());
     g.pool = IoPool { gpa: pool_gpa, size: cfg.io_pool, frames: new.pool_frames, radix: pool_radix };
     let tmp = alloc.slots.alloc();
-    let keep = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: pool_radix });
     for i in 0..pool_pages {
         abs(self_cap::<cap_type::Null>(tmp)).copy(&g.pool.frame(i), CapRights::all()).expect("pool frame copy");
         let frame = self_cap::<cap_type::Granule>(tmp);
@@ -1255,7 +1309,9 @@ pub fn create(
 
 
     // ---- VSpace pool for guest processes and device CNode.
-    let pool_cn = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: abi::ROOT_CNODE_BITS });
+    let Some(pool_cn) = try_cnode(&mut g.arena, alloc, abi::ROOT_CNODE_BITS) else {
+        return Err(Some(g));
+    };
     for i in 0..cfg.vspaces {
         let vs = g.arena.object_cap::<cap_type::VSpace>(alloc, PML4_BP);
         asids.assign(alloc, vs);
@@ -1272,7 +1328,9 @@ pub fn create(
         if #[sel4_cfg(all(ARCH_X86_64, VTX))] {
             if host_info.vtx {
                 let bp: ObjectBlueprint = sel4::ObjectBlueprintSeL4Arch::EPTPML4.into();
-                let ept_cn = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: abi::ROOT_CNODE_BITS });
+                let Some(ept_cn) = try_cnode(&mut g.arena, alloc, abi::ROOT_CNODE_BITS) else {
+                    return Err(Some(g));
+                };
                 for i in 0..abi::MAX_EPT_ROOTS {
                     let root = g.arena.object_cap::<cap_type::VSpace>(alloc, bp);
                     asids.assign(alloc, root);
@@ -1286,7 +1344,10 @@ pub fn create(
             }
         }
     }
-    g.dev_cn = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: abi::ROOT_CNODE_BITS });
+    let Some(dev_cn) = try_cnode(&mut g.arena, alloc, abi::ROOT_CNODE_BITS) else {
+        return Err(Some(g));
+    };
+    g.dev_cn = dev_cn;
     g.give_cnode(abi::SLOT_DEV_CNODE, g.dev_cn, guard6);
 
     // ---- vCPUs.

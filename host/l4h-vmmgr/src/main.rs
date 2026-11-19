@@ -242,21 +242,25 @@ impl Vmmgr {
 
     pub fn create_guest(&mut self, cfg: &GuestConfig) -> Option<usize> {
         let kernel = self.kernel.as_ref()?;
+        // Its RAM and I/O pool, the arena and slots of its objects, the
+        // block memd may need for its CNodes, and the SDK's mapping.
+        let plan = guest::plan(cfg, &self.info, kernel)?;
         let sdk = self.sdk.as_ref().map_or(0, |k| k.bytes());
-        let bytes = cfg.ram.checked_add(cfg.io_pool)?.checked_add(sdk)?;
-        if !self.can_afford(bytes, cfg.vspaces + 4 + if self.info.vtx { abi::MAX_EPT_ROOTS } else { 0 }, 0) {
+        let bytes = cfg.ram.checked_add(cfg.io_pool)?.checked_add(sdk)?.checked_add(plan.estimate)?.checked_add(guest::BLOCK)?;
+        if !self.can_afford(bytes, cfg.vspaces + 4 + if self.info.vtx { abi::MAX_EPT_ROOTS } else { 0 }, plan.slots) {
             return None;
         }
         let id = (0..MAX_GUESTS).find(|&i| self.guest(i).is_none())?;
         self.alloc.slots.track(id);
         let asids = self.asids.in_use;
-        let mut g = guest::create(id, cfg, &mut self.alloc, &mut self.asids, &self.info, kernel);
-        if let Ok(g) = &mut g {
-            provider::map(g, &mut self.alloc, &mut self.wins.a);
-        }
-        if let (Ok(g), Some(k)) = (&mut g, &self.sdk) {
-            k.map(g, &mut self.alloc);
-        }
+        let g = match guest::create(id, cfg, &mut self.alloc, &mut self.asids, &self.info, kernel) {
+            Ok(mut g) => {
+                let mapped = provider::map(&mut g, &mut self.alloc, &mut self.wins.a)
+                    && self.sdk.as_ref().is_none_or(|k| k.map(&mut g, &mut self.alloc));
+                if mapped { Ok(g) } else { Err(Some(g)) }
+            }
+            Err(partial) => Err(partial),
+        };
         self.alloc.slots.untrack();
         match g {
             Ok(mut g) => {

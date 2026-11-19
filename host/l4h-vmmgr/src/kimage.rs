@@ -148,10 +148,24 @@ impl Sdk {
 
     /// Map the image read-only at SDK_VA in guest `g`, and record it for
     /// the boot info.  The frame copies are kept in a CNode of the guest's
-    /// arena, so destroying the guest deletes them.
-    pub fn map(&self, g: &mut Guest, alloc: &mut Alloc) {
+    /// arena, so destroying the guest deletes them.  False, with nothing
+    /// mapped, if the guest's arena cannot grow to hold the CNode (up to
+    /// 2 MiB) and the page tables: made first, as mapping panics.
+    #[must_use]
+    pub fn map(&self, g: &mut Guest, alloc: &mut Alloc) -> bool {
         let radix = self.radix();
-        let keep = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: radix });
+        let tables = self.bytes() - (32 << radix);
+        if !g.reserve(alloc, self.bytes()) {
+            return false;
+        }
+        let Some(keep) = g.arena.try_object(alloc, ObjectBlueprint::CNode { size_bits: radix }) else {
+            return false;
+        };
+        let keep = self_cap::<cap_type::CNode>(keep);
+        // What the CNode's alignment took: its slot stays the guest's.
+        if !g.reserve(alloc, tables) {
+            return false;
+        }
         let tmp = alloc.slots.alloc();
         for i in 0..self.pages() {
             let from = self.frames.get(self.data.as_ptr() as usize + i * PAGE).expect("SDK image frame");
@@ -163,5 +177,6 @@ impl Sdk {
         }
         alloc.slots.free(tmp);
         g.sdk_size = self.data.len();
+        true
     }
 }

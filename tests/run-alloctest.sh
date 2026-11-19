@@ -2,10 +2,13 @@
 # Host-side allocator fragmentation, reclaim and container panic checks,
 # the I/O pool sizing rules (host/l4h-host/src/iopool.rs), l4h-host's rings, and the
 # virtio-gpu display's size arithmetic and copies (host/l4h-host/src/gpu.rs),
-# memd's grant validation and capability revocation, and the carving of
-# device memory (host/l4h-root/src/devmem/span.rs).
+# memd's grant validation and capability revocation, the carving of
+# device memory (host/l4h-root/src/devmem/span.rs), and that the paths
+# dom0 drives make their CNodes with allocations that can fail
+# (tests/check-fallible-alloc.sh).
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
+bash "$root/tests/check-fallible-alloc.sh"
 mkdir -p "$root/build/alloctest"
 rustc +stable --edition=2024 --test "$root/tests/alloc.rs" -o "$root/build/alloctest/unit-tests"
 "$root/build/alloctest/unit-tests"
