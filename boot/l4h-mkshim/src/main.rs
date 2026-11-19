@@ -694,9 +694,12 @@ fn place_memory(bi: &mut BootInfo, conf: &Conf, acpi: &acpi::Acpi, plans: &mut [
         p.slot = Range::new(part::SLOT_BASE + k as u64 * part::SLOT_STRIDE, part::SLOT_BASE + (k as u64 + 1) * part::SLOT_STRIDE);
         slots.add(p.slot);
     }
+    let mut payload_ram = free;
+    for slot in slots.list.iter() {
+        payload_ram.remove(*slot);
+    }
     // The boot loader's modules stay where they are, unless one is in a
     // slot: that one moves out of the way first.
-    let mut originals = Ranges::new();
     for m in bi.mods.iter() {
         let r = Range::new(io::align_down(m.start, 4096), align_up(m.end, 4096));
         free.remove(r);
@@ -717,8 +720,6 @@ fn place_memory(bi: &mut BootInfo, conf: &Conf, acpi: &acpi::Acpi, plans: &mut [
             m.end = dst + r.len();
             // Its old place is RAM again (the slot it was in).
             free.add(Range::new(io::align_down(r.start, 4096), align_up(r.end, 4096)));
-        } else {
-            originals.add(Range::new(io::align_down(m.start, 4096), align_up(m.end, 4096)));
         }
     }
     for p in plans.iter() {
@@ -753,7 +754,13 @@ fn place_memory(bi: &mut BootInfo, conf: &Conf, acpi: &acpi::Acpi, plans: &mut [
         p.low = Range::new(at, at + size);
         p.ram.add(p.slot);
         p.ram.add(p.low);
+        payload_ram.remove(p.low);
     }
+    // Only the shared region, slots and low chunks are written before all
+    // module copies finish. Reclaim the source pages with their neighbors
+    // when assigning the remaining RAM in 2 MiB pieces.
+    payload_ram.remove(Range::new(out, out + out_size));
+    free = payload_ram;
     // The rest: secondaries first, each its configured size or an even
     // share, preferring its CPUs' NUMA node; partition 0 the remainder.
     let affinity = acpi.mem_affinity();
@@ -790,11 +797,6 @@ fn place_memory(bi: &mut BootInfo, conf: &Conf, acpi: &acpi::Acpi, plans: &mut [
         if got < want && target != u64::MAX {
             fail(format_args!("p{}.mem: {} MiB short", k, (want - got) >> 20));
         }
-    }
-    // The modules the boot loader loaded are dead once copied: partition 0
-    // gets their memory.
-    for r in originals.list.iter() {
-        plans[0].ram.add(*r);
     }
     Range::new(out, out + out_size)
 }

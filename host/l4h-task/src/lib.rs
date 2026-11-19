@@ -26,6 +26,7 @@ pub fn print_log(args: core::fmt::Arguments<'_>) {
     l4h_host::serial::record(args);
 }
 
+pub mod bootinfo;
 pub mod component;
 pub mod edge;
 pub mod elf;

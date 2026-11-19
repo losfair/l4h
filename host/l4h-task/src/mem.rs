@@ -19,6 +19,14 @@ use crate::memd::MemdLink;
 
 pub type Slot = usize;
 
+/// One untyped capability supplied when the host starts.
+pub struct Untyped {
+    pub cap: cap::Untyped,
+    pub paddr: usize,
+    pub size_bits: usize,
+    pub is_device: bool,
+}
+
 /// Maximum objects retyped by one kernel invocation.
 pub const RETYPE_FAN_OUT: usize = sel4::sel4_cfg_usize!(RETYPE_FAN_OUT_LIMIT);
 
@@ -424,7 +432,7 @@ const POOL_REGIONS: usize = 8;
 /// Free bytes below which the pool takes any block it can get.
 const POOL_LOW: usize = 1 << 20;
 /// Free blocks, and split blocks, the allocator can keep track of: more
-/// than the boot Untypeds (seL4 hands out at most 230), and room for the
+/// than the untypeds supplied at boot, and room for the
 /// pieces of hundreds of grants.
 const ALLOC_BLOCKS: usize = 4096;
 /// Grants held at once: 16 GiB of host objects in 16 MiB grants.
@@ -439,9 +447,9 @@ fn untyped_at(s: Slot) -> cap::Untyped {
 }
 
 impl Alloc {
-    pub fn new(slots: Slots, storage: &'static mut AllocStorage, bootinfo: &sel4::BootInfo) -> Self {
+    pub fn new(slots: Slots, storage: &'static mut AllocStorage, untypeds: impl IntoIterator<Item = Untyped>) -> Self {
         let AllocStorage { blocks, parents, grants } = storage;
-        Self::with_tables(Alloc { slots, pool: UtPool::empty(), blocks, parents, memd: None, shared_dma: false, grants }, bootinfo)
+        Self::with_tables(Alloc { slots, pool: UtPool::empty(), blocks, parents, memd: None, shared_dma: false, grants }, untypeds)
     }
 
     /// An allocator with no memory until it is given a link to memd
@@ -451,20 +459,20 @@ impl Alloc {
         Alloc { slots, pool: UtPool::empty(), blocks, parents, memd: None, shared_dma: false, grants }
     }
 
-    /// A new allocator for `bootinfo`, with this one's slots and tables:
+    /// A new allocator for `untypeds`, with this one's slots and tables:
     /// storage is reused without allocating another set of tables.
-    pub fn renew(self, bootinfo: &sel4::BootInfo) -> Self {
+    pub fn renew(self, untypeds: impl IntoIterator<Item = Untyped>) -> Self {
         let Alloc { slots, blocks, parents, grants, .. } = self;
         blocks.clear();
         parents.clear();
         grants.clear();
-        Self::with_tables(Alloc { slots, pool: UtPool::empty(), blocks, parents, memd: None, shared_dma: false, grants }, bootinfo)
+        Self::with_tables(Alloc { slots, pool: UtPool::empty(), blocks, parents, memd: None, shared_dma: false, grants }, untypeds)
     }
 
-    fn with_tables(mut a: Self, bootinfo: &sel4::BootInfo) -> Self {
-        for (i, desc) in bootinfo.untyped_list().iter().enumerate() {
-            if !desc.is_device() {
-                a.blocks.must_push(UtRegion::fresh(bootinfo.untyped().index(i).cap(), desc.paddr(), desc.size_bits()));
+    fn with_tables(mut a: Self, untypeds: impl IntoIterator<Item = Untyped>) -> Self {
+        for desc in untypeds {
+            if !desc.is_device {
+                a.blocks.must_push(UtRegion::fresh(desc.cap, desc.paddr, desc.size_bits));
             }
         }
         a.refill();

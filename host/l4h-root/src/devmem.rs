@@ -13,8 +13,8 @@ use l4h_host::fixed::ArrayVec;
 use crate::mem::{Alloc, Dest, Slot, Slots};
 use crate::vspace::FRAME_BP;
 
-/// Free device regions, at most: the boot device Untypeds
-/// (KernelMaxNumBootinfoUntypedCaps, 230) and the halves split off them.
+/// Free device regions include the base and extra boot device Untypeds
+/// and the halves split off them.
 /// Carving a range leaves at most one free half per halving, and the
 /// ranges carved (BARs, boot modules, ACPI pages) are few and mostly
 /// contiguous, so this leaves ample room.  A carve that would overflow it
@@ -44,14 +44,14 @@ pub fn granule(s: Slot) -> cap::Granule {
 }
 
 impl DevMem {
-    pub fn from_bootinfo(bootinfo: &sel4::BootInfo) -> Self {
+    pub fn from_bootinfo(bootinfo: &sel4::BootInfoPtr) -> Self {
         assert!(!FREE_TAKEN.swap(true, Ordering::Relaxed), "device memory taken twice");
         // The flag gives out the only reference; the root task is
         // single-threaded.
         let free = unsafe { &mut *(&raw mut FREE) };
-        for (i, desc) in bootinfo.untyped_list().iter().enumerate() {
-            if desc.is_device() {
-                let r = Region { cap: bootinfo.untyped().index(i).cap(), paddr: desc.paddr(), size_bits: desc.size_bits() };
+        for desc in l4h_task::bootinfo::untypeds(bootinfo) {
+            if desc.is_device {
+                let r = Region { cap: desc.cap, paddr: desc.paddr, size_bits: desc.size_bits };
                 if free.push(r).is_err() {
                     log!("l4h-root: more than {} device untypeds, ignoring the rest", DEVMEM_REGIONS);
                     break;

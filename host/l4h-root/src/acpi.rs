@@ -199,7 +199,7 @@ impl Tables {
         // SEL4_BOOTINFO_HEADER_X86_ACPI_RSDP
         const ACPI_RSDP: u64 = 3;
         let none = Tables { root: 0, wide: false, count: 0 };
-        let Some(rsdp) = crate::bootmod::extra_chunk(bootinfo, ACPI_RSDP) else { return none };
+        let Some(rsdp) = l4h_task::bootinfo::extra_chunk(bootinfo, ACPI_RSDP) else { return none };
         if rsdp.len() < 20 || &rsdp[..8] != b"RSD PTR " {
             return none;
         }
