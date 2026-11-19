@@ -32,10 +32,34 @@ struct GuestConfig {
     ram_base: usize,
     dom0: bool,
 }
-struct Kernel { ram_base: usize }
+const KERNEL_END: usize = 2 << 20;
+const INITRD_GPA: usize = 3 << 20;
+const INITRD: &[u8] = b"dom0 initrd";
+const BOOT_BYTES: usize = 64 << 10;
+const BOOT_SLOTS: usize = 16;
+
+struct Kernel { ram_base: usize, end: usize }
+impl Kernel {
+    fn initrd_gpa(&self) -> usize { INITRD_GPA }
+}
+struct Alloc { slots: usize, reservable: usize }
 struct Windows { a: () }
 struct Info { tsc_hz: u64 }
-struct Guest { devices: Vec<()>, booted: bool, instance: u64 }
+struct Guest { devices: Vec<()>, booted: bool, instance: u64, reserved: usize }
+impl Guest {
+    fn boot_cost(&self, kernel_end: usize, initrd: (usize, usize)) -> Option<(usize, usize)> {
+        // The fixture has one loadable kernel and initrd.
+        (kernel_end == KERNEL_END && initrd == (INITRD_GPA, INITRD.len()))
+            .then_some((BOOT_BYTES, BOOT_SLOTS))
+    }
+    fn reserve(&mut self, alloc: &mut Alloc, bytes: usize) -> bool {
+        let needed = bytes.saturating_sub(self.reserved);
+        if needed > alloc.reservable { return false; }
+        alloc.reservable -= needed;
+        self.reserved += needed;
+        true
+    }
+}
 #[derive(Clone, Copy)]
 enum Then { Dom0Boot { k: usize } }
 
@@ -43,7 +67,7 @@ pub struct Vmmgr {
     cfg: &'static VmmgrConfig,
     kernel: Option<Kernel>,
     dom0_initrd: &'static [u8],
-    alloc: (),
+    alloc: Alloc,
     wins: Windows,
     info: Info,
     guest: Option<Guest>,
@@ -71,8 +95,12 @@ pub struct Vmmgr {
 
 impl Vmmgr {
     fn create_guest(&mut self, _: &GuestConfig) -> Option<usize> {
-        self.guest = Some(Guest { devices: vec![(); self.builtins], booted: false, instance: 1 });
+        self.guest = Some(Guest { devices: vec![(); self.builtins], booted: false, instance: 1, reserved: 0 });
         Some(0)
+    }
+    fn can_afford(&self, bytes: usize, asids: usize, slots: usize) -> bool {
+        assert_eq!((bytes, asids, slots), (BOOT_BYTES, 0, BOOT_SLOTS));
+        slots <= self.alloc.slots
     }
     fn destroy_guest(&mut self, _: usize) -> Result<(), Errno> {
         self.destroyed = true;
@@ -142,7 +170,8 @@ impl Vmmgr {
 
 mod guest {
     use super::*;
-    pub fn boot_with(g: &mut Guest, _: &mut (), _: &mut (), _: &Info, _: &Kernel, _: &[u8], _: &[u8]) -> bool {
+    pub fn boot_with(g: &mut Guest, _: &mut Alloc, _: &mut (), _: &Info, _: &Kernel, _: &[u8], _: &[u8]) -> bool {
+        assert_eq!(g.reserved, BOOT_BYTES, "boot blocks must be reserved before loading the image");
         g.booted = true;
         true
     }
@@ -167,8 +196,9 @@ fn fixture(builtins: usize, windows: usize, other_disks: usize, nics: usize) -> 
     cfg.dom0_nics = nics as u64;
     for i in 0..nics { cfg.dom0_nic[i] = Dom0Nic { switch: i as u64, mac: 0 }; }
     Vmmgr {
-        cfg: Box::leak(cfg), kernel: Some(Kernel { ram_base: 0 }), dom0_initrd: &[],
-        alloc: (), wins: Windows { a: () }, info: Info { tsc_hz: 1000 }, guest: None, builtins,
+        cfg: Box::leak(cfg), kernel: Some(Kernel { ram_base: 0, end: KERNEL_END }), dom0_initrd: INITRD,
+        alloc: Alloc { slots: BOOT_SLOTS, reservable: BOOT_BYTES },
+        wins: Windows { a: () }, info: Info { tsc_hz: 1000 }, guest: None, builtins,
         dom0_wait: None, dom0_usb_wait: None, busy_usbs: Vec::new(), usb_attempts: Vec::new(), pending: Vec::new(), busy_disks: Vec::new(), destroyed: false,
         disk_attempts: Vec::new(), disks: Vec::new(), nics: Vec::new(), fail_disks: Vec::new(),
         usbs: Vec::new(), fail_usbs: Vec::new(), started: false,
@@ -201,6 +231,26 @@ fn fails_before_boot(h: &mut Vmmgr, message: &str) {
     assert!(h.destroyed);
     assert!(!h.started);
     assert!(!h.guest.as_ref().unwrap().booted);
+}
+
+#[test]
+fn dom0_is_released_when_its_boot_blocks_cannot_be_reserved() {
+    let mut h = fixture(2, 0, 0, 0);
+    h.alloc.slots -= 1;
+    fails_before_boot(&mut h, "its image does not fit");
+    assert_eq!(h.alloc.reservable, BOOT_BYTES, "a refused budget must not reserve memory");
+
+    let mut h = fixture(2, 0, 0, 0);
+    h.alloc.reservable -= 1;
+    fails_before_boot(&mut h, "its image does not fit");
+}
+
+#[test]
+fn dom0_is_released_when_its_image_does_not_fit() {
+    let mut h = fixture(2, 0, 0, 0);
+    h.kernel.as_mut().unwrap().end = INITRD_GPA + 1;
+    fails_before_boot(&mut h, "its image does not fit");
+    assert_eq!(h.alloc.reservable, BOOT_BYTES);
 }
 
 #[test]
