@@ -7,6 +7,7 @@ version.workspace = true
 [dependencies]
 l4h-abi.workspace = true
 l4h-rt = { path = "../l4h-rt" }
+l4h-virtio = { path = "../l4h-virtio" }
 p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 sha2.workspace = true
 # The AML interpreter for the ACPI start method (AMD fTPM).  Pinned past
