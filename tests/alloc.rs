@@ -23,6 +23,8 @@ macro_rules! log { ($($arg:tt)*) => { println!($($arg)*) }; }
 
 #[path = "../host/l4h-host/src/fixed.rs"]
 pub mod fixed;
+#[path = "../host/l4h-task/src/bootinfo.rs"]
+mod bootinfo;
 #[path = "../host/l4h-task/src/mem.rs"]
 mod mem;
 
@@ -169,6 +171,89 @@ impl ObjectBlueprint {
 pub struct Desc {
     paddr: usize,
     bits: usize,
+}
+
+impl Desc {
+    fn paddr(&self) -> usize { self.paddr }
+    fn size_bits(&self) -> usize { self.bits }
+    fn is_device(&self) -> bool { false }
+}
+
+pub struct FrameObjectType;
+pub struct BootGranule;
+
+impl FrameObjectType {
+    pub const GRANULE: BootGranule = BootGranule;
+}
+
+impl BootGranule {
+    fn bytes(&self) -> usize { 4096 }
+}
+
+pub struct BootInfoPtr {
+    bytes: &'static [u8],
+    descriptors: Vec<Desc>,
+}
+
+struct UntypedSlots(usize);
+
+impl UntypedSlots {
+    fn range(&self) -> std::ops::Range<usize> { 32..32 + self.0 }
+    fn index(&self, index: usize) -> init_thread::Slot<cap_type::Untyped> {
+        init_thread::Slot::from_index(self.range().start + index)
+    }
+}
+
+impl BootInfoPtr {
+    fn ptr(&self) -> *const u8 { self.bytes.as_ptr() }
+    fn footprint_size(&self) -> usize { self.bytes.len() }
+    fn untyped_list(&self) -> &[Desc] { &self.descriptors }
+    fn untyped(&self) -> UntypedSlots { UntypedSlots(self.descriptors.len()) }
+}
+
+pub fn cap_at<T: CapType>(slot: usize) -> Cap<T> { Cap::from_bits(slot as u64) }
+
+fn bootinfo_fixture(extra: &[u8]) -> BootInfoPtr {
+    let mut bytes = vec![0; 4096];
+    bytes.extend_from_slice(extra);
+    BootInfoPtr {
+        bytes: bytes.leak(),
+        descriptors: (0..230).map(|i| Desc { paddr: i << 12, bits: 12 }).collect(),
+    }
+}
+
+#[test]
+fn bootinfo_overflow_keeps_untyped_slots_contiguous() {
+    let mut extra = Vec::new();
+    // An unrelated chunk precedes the overflow descriptors.
+    for word in [99u64, 16, 10, 48] {
+        extra.extend_from_slice(&word.to_le_bytes());
+    }
+    for (paddr, bits, device) in [(0x200000u64, 21, false), (0xfec00000, 12, true)] {
+        extra.extend_from_slice(&paddr.to_le_bytes());
+        extra.extend_from_slice(&[bits, u8::from(device), 0, 0, 0, 0, 0, 0]);
+    }
+    let bootinfo = bootinfo_fixture(&extra);
+    let untypeds: Vec<_> = bootinfo::untypeds(&bootinfo).collect();
+    assert_eq!(untypeds.len(), 232);
+    assert_eq!(untypeds[229].cap.bits(), 261);
+    let overflow: Vec<_> = untypeds[230..].iter().map(|u| {
+        (u.cap.bits(), u.paddr, u.size_bits, u.is_device)
+    }).collect();
+    assert_eq!(overflow, [(262, 0x200000, 21, false), (263, 0xfec00000, 12, true)]);
+}
+
+#[test]
+fn bootinfo_ignores_missing_empty_and_truncated_overflow() {
+    for (extra, chunk) in [
+        (vec![], None),
+        ([10u64, 16].into_iter().flat_map(u64::to_le_bytes).collect(), Some(&[][..])),
+        ([10u64, 32, 0].into_iter().flat_map(u64::to_le_bytes).collect(), None),
+    ] {
+        let bootinfo = bootinfo_fixture(&extra);
+        assert_eq!(bootinfo::extra_chunk(&bootinfo, 10), chunk);
+        assert_eq!(bootinfo::untypeds(&bootinfo).count(), 230);
+    }
 }
 
 struct BootMemory(Vec<Desc>);

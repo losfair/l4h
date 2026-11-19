@@ -432,7 +432,7 @@ const POOL_REGIONS: usize = 8;
 /// Free bytes below which the pool takes any block it can get.
 const POOL_LOW: usize = 1 << 20;
 /// Free blocks, and split blocks, the allocator can keep track of: more
-/// than the boot Untypeds (seL4 hands out at most 230), and room for the
+/// than the untypeds supplied at boot, and room for the
 /// pieces of hundreds of grants.
 const ALLOC_BLOCKS: usize = 4096;
 /// Grants held at once: 16 GiB of host objects in 16 MiB grants.
