@@ -290,7 +290,7 @@ impl Vmmgr {
     /// start, meanwhile.
     pub fn attach_disk(&mut self, id: usize, disk: usize, flags: u64, lba_start: u64, lba_count: u64,
         extents: (u64, u64), then: Then) -> Result<(), Errno> {
-        if !self.can_afford(1 << 20, 0, 0) { return Err(ctl::ENOMEM); }
+        if !self.can_afford((1 << 20) + guest::DEVICE_BYTES, 0, guest::DEVICE_SLOTS) { return Err(ctl::ENOMEM); }
         let instance = self.guest(id).ok_or(ctl::ENOENT)?.instance;
         self.with_guest(id, |h, g| {
             // Like every other attach path (attach_usb, create_nic, ...):
@@ -303,6 +303,11 @@ impl Vmmgr {
             }
             if g.devices.len() >= MAX_GUEST_DEVICES {
                 return Err(ctl::ENOSPC);
+            }
+            // Room for the device, which is added once root has answered
+            // (add_disk, which makes sure of it again).
+            if !g.reserve(&mut h.alloc, guest::DEVICE_BYTES) {
+                return Err(ctl::ENOMEM);
             }
             // Root checks the window and the disk's other users, and makes
             // the channel; the device is added once it has.
@@ -352,13 +357,18 @@ impl Vmmgr {
     /// Give guest `id` (before it starts) the whole USB controller `ctrl`
     /// (DESIGN.md §9.7).  Root claims it on its first attachment.
     pub fn attach_usb(&mut self, id: usize, ctrl: usize) -> Result<(), Errno> {
-        if !self.can_afford(1 << 20, 0, 0) { return Err(ctl::ENOMEM); }
+        if !self.can_afford((1 << 20) + guest::USB_BYTES, 0, l4h_abi::usb::AREA_PAGES + guest::DEVICE_SLOTS) { return Err(ctl::ENOMEM); }
         self.with_guest(id, |h, g| {
             if g.state != State::Created || g.vmm.is_some() || g.root_pending {
                 return Err(ctl::EBUSY);
             }
             if g.devices.len() >= MAX_GUEST_DEVICES || g.usbs >= host::usb::MAX_GUEST_USB {
                 return Err(ctl::ENOSPC);
+            }
+            // Room for the device before root gives the controller, which
+            // stays the guest's.
+            if !g.reserve(&mut h.alloc, guest::USB_BYTES) {
+                return Err(ctl::ENOMEM);
             }
             let d = g.devices.len();
             let (frames, kick, n) = root::usb_attach(&mut h.alloc, id, ctrl)?;
@@ -373,10 +383,12 @@ impl Vmmgr {
 
     /// Keep a failed boot disk's position without a channel or DMA access.
     pub fn attach_dummy_disk(&mut self, id: usize) -> Result<(), Errno> {
+        if !self.can_afford(guest::DEVICE_BYTES, 0, guest::DEVICE_SLOTS) { return Err(ctl::ENOMEM); }
         self.with_guest(id, |h, g| {
             // As every attach path: not once the VMM, which was given the
             // devices there were, is spawned.
             if g.state != State::Created || g.vmm.is_some() || g.root_pending { return Err(ctl::EBUSY); }
+            if !g.reserve(&mut h.alloc, guest::DEVICE_BYTES) { return Err(ctl::ENOMEM); }
             let d = g.add_device(&mut h.alloc, guest::DevKind::Virtio(2)).ok_or(ctl::ENOSPC)?;
             g.backends.must_push((d, vmm::Backend::UnavailableBlk));
             Ok(())
@@ -426,7 +438,7 @@ impl Vmmgr {
         if !proto::nic_mac_ok(mac) || !proto::nic_flags_ok(flags) {
             return Err(ctl::EINVAL);
         }
-        if !self.can_afford(1 << 20, 0, 0) {
+        if !self.can_afford((1 << 20) + guest::DEVICE_BYTES, 0, guest::DEVICE_SLOTS) {
             return Err(ctl::ENOMEM);
         }
         self.with_guest(id, |h, g| {
@@ -447,6 +459,11 @@ impl Vmmgr {
                 Some(keep) => keep,
                 None => root::port_keep(&mut h.alloc, &mut g.arena).ok_or(ctl::ENOMEM)?,
             };
+            // Then room for the device, before root gives the port.
+            if !g.reserve(&mut h.alloc, guest::DEVICE_BYTES) {
+                g.port_spare = Some(keep);
+                return Err(ctl::ENOMEM);
+            }
             let backend = match root::nic_add(&mut h.alloc, keep, id, switch, mac, flags) {
                 Ok(backend) => backend,
                 Err(e) => {
@@ -477,7 +494,7 @@ impl Vmmgr {
         let pages = host::gpu::display_pages(width, height);
         // The display area's mappings in vmmgr: a slot and page tables,
         // from the global allocator.
-        if !self.can_afford(bytes + gpu::table_bytes(pages), 0, pages) {
+        if !self.can_afford(bytes + gpu::table_bytes(pages) + guest::DEVICE_BYTES, 0, pages + guest::DEVICE_SLOTS) {
             return Err(ctl::ENOMEM);
         }
         self.with_guest(id, |h, g| {
@@ -826,6 +843,12 @@ fn add_disk(h: &mut Vmmgr, g: &mut Guest, d: usize, backend: vmm::Backend) -> Re
     if g.state != State::Created || g.vmm.is_some() || g.devices.len() != d {
         root::disk_backend_drop(&mut h.alloc, backend);
         return Err(ctl::EBUSY);
+    }
+    // attach_disk made room, which what ran meanwhile (other guests'
+    // requests too) may have used: its bytes and slots.
+    if h.alloc.slots.available() < guest::DEVICE_SLOTS || !g.reserve(&mut h.alloc, guest::DEVICE_BYTES) {
+        root::disk_backend_drop(&mut h.alloc, backend);
+        return Err(ctl::ENOMEM);
     }
     let Some(added) = g.add_device(&mut h.alloc, guest::DevKind::Virtio(2)) else {
         root::disk_backend_drop(&mut h.alloc, backend);

@@ -1766,8 +1766,9 @@ pub fn load_driver(h: &mut Host, off: u64, len: u64) -> Result<usize, Errno> {
         }
         true
     });
-    let image: &'static [u8] = unsafe { core::slice::from_raw_parts(base as *const u8, len) };
-    match ok.then(|| drivers().add(image, false)) {
+    // Read only once every page is mapped, and kept only by the driver it
+    // makes, whose frames are never given back.
+    match ok.then(|| drivers().add(unsafe { core::slice::from_raw_parts(base as *const u8, len) }, false)) {
         Some(Ok(d)) => {
             core::mem::forget(arena);
             unsafe { LOADED = k + 1 };
@@ -1853,8 +1854,8 @@ pub fn load_firmware(h: &mut Host, off: u64, len: u64) -> Result<usize, Errno> {
         }
         true
     });
-    let blob: &'static [u8] = unsafe { core::slice::from_raw_parts(base as *const u8, len) };
-    let r = match ok.then(|| drivers().add_firmware(name, blob)) {
+    // As load_driver's image: read once mapped, kept only if added.
+    let r = match ok.then(|| drivers().add_firmware(name, unsafe { core::slice::from_raw_parts(base as *const u8, len) })) {
         Some(Ok(f)) => {
             core::mem::forget(arena);
             unsafe { FIRMWARE_LOADED = k + 1 };

@@ -296,12 +296,22 @@ fn claim(h: &mut Host, i: usize) -> Result<(), Errno> {
         }
     };
     let dma = usb::dma_bytes(slots, scratch, page);
-    if !h.can_afford(dma + (8 << 20), 1, 4096) {
+    let bits = dma.trailing_zeros() as usize;
+    let n_dma = dma / PAGE;
+    let bar_pages = (ctrls()[i].pci.bars[0].size as usize).div_ceil(PAGE);
+    let kb = keep_bits(n_dma + bar_pages + host::mailbox::MAILBOX_PAGES);
+    // Its CNodes: of its DMA frames, of its mappings (a slot a page of
+    // every mapping), and its CSpace's.
+    let cnodes = (32 << (bits - 12)) + (32 << kb) + (32 << host::CNODE_BITS);
+    // usbd's image, stacks and tables, and the page tables of its BAR's
+    // and DMA region's mappings.
+    let room = (4 << 20) + host::map_tables(bar_pages) + host::map_tables(n_dma);
+    if !h.can_afford(dma + cnodes + room + (4 << 20), 1, 4096) {
         return Err(ctl::ENOMEM);
     }
-    // usbd's image, stacks and tables (about 1 MiB of statics).
-    let mut arena = h.alloc.arena(4 << 20).ok_or(ctl::ENOMEM)?;
-    let bits = dma.trailing_zeros() as usize;
+    // usbd's image, stacks and tables (about 1 MiB of statics), and its
+    // CNodes.
+    let mut arena = h.alloc.arena((4 << 20) + cnodes).ok_or(ctl::ENOMEM)?;
     let dma_slot = h.alloc.slots.alloc();
     let Some(mut region) = h.alloc.split(bits, dma_slot) else {
         h.alloc.slots.free(dma_slot);
@@ -311,17 +321,39 @@ fn claim(h: &mut Host, i: usize) -> Result<(), Errno> {
     };
     let dma_paddr = region.paddr;
     arena.own(dma_slot, dma_paddr, bits);
+    // The CNodes, the largest objects, before anything is taken for good:
+    // without room for them, nothing is made (component::create would make
+    // its CSpace's with an allocation that panics).
+    let Some(dma_cn) = arena.try_object(&mut h.alloc, ObjectBlueprint::CNode { size_bits: bits - 12 }) else {
+        h.alloc.release(arena);
+        return Err(ctl::ENOMEM);
+    };
+    let Some(keep) = arena.try_object(&mut h.alloc, ObjectBlueprint::CNode { size_bits: kb }) else {
+        h.alloc.release_objects(arena, &[dma_cn]);
+        return Err(ctl::ENOMEM);
+    };
+    let Some(cspace) = arena.try_object(&mut h.alloc, ObjectBlueprint::CNode { size_bits: host::CNODE_BITS }) else {
+        h.alloc.release_objects(arena, &[dma_cn, keep]);
+        return Err(ctl::ENOMEM);
+    };
+    let objects = [dma_cn, keep, cspace];
+    let (dma_cn, keep) = (root_cap::<cap_type::CNode>(dma_cn), root_cap::<cap_type::CNode>(keep));
+    if region.retype_dma(h.alloc.shared_dma, &FRAME_BP, n_dma, Dest { cnode: abs_of(dma_cn), offset: 0 }).is_none() {
+        h.alloc.release_objects(arena, &objects);
+        return Err(ctl::ENOMEM);
+    }
+    // What the CNodes' alignment took may leave too little for the rest,
+    // whose allocations (component::create, map_copy, Mailbox::new) panic.
+    if !arena.reserve(&mut h.alloc, room) {
+        h.alloc.release_objects(arena, &objects);
+        return Err(ctl::ENOMEM);
+    }
     // Its vector, kept until reboot as the controller's usbd is: taken
     // once nothing before it can fail (a failed claim is tried again).
     let Some(vector) = pci::vector_alloc() else {
-        h.alloc.release(arena);
+        h.alloc.release_objects(arena, &objects);
         return Err(ctl::ENOSPC);
     };
-    let n_dma = dma / PAGE;
-    let dma_cn = arena.object_cap::<cap_type::CNode>(&mut h.alloc, ObjectBlueprint::CNode { size_bits: bits - 12 });
-    region
-        .retype_dma(h.alloc.shared_dma, &FRAME_BP, n_dma, Dest { cnode: abs_of(dma_cn), offset: 0 })
-        .expect("usbd DMA frames");
 
     let c = &mut ctrls()[i];
     let d = c.pci;
@@ -350,16 +382,13 @@ fn claim(h: &mut Host, i: usize) -> Result<(), Errno> {
         config: cfg_bytes,
         ntfn: None,
         service_ep: None,
-        cnode: None,
+        cnode: Some(root_cap::<cap_type::CNode>(cspace)),
         cnode_bits: None,
     };
     let comp = component::create(
         &args, &mut h.alloc, &mut arena, &mut h.wins.a, &mut |alloc, vspace| h.asids.assign(alloc, vspace),
         &h.info.spawn_context(0),
     );
-    let bar_pages = (d.bars[0].size as usize).div_ceil(PAGE);
-    let kb = keep_bits(n_dma + bar_pages + host::mailbox::MAILBOX_PAGES);
-    let keep = arena.object_cap::<cap_type::CNode>(&mut h.alloc, ObjectBlueprint::CNode { size_bits: kb });
     let mut next = 0u64;
     let mut keep_slot = || {
         next += 1;
@@ -553,7 +582,12 @@ pub fn attach(h: &mut Host, i: usize, g: &mut RootGuest) -> Result<Attached, Err
     }
     let d = c.driver.as_mut().expect("claimed usbd");
     let Some(idx) = (0..usb::AREAS).find(|&k| d.areas[k].is_none()) else { return Err(ctl::EBUSY) };
-    if !h.can_afford((uabi::AREA_PAGES + 8) * PAGE, 0, 2 * (1 << QUEUE_RADIX) + 8) {
+    if !h.can_afford((uabi::AREA_PAGES + 8) * PAGE + host::map_tables(uabi::AREA_PAGES), 0, 2 * (1 << QUEUE_RADIX) + 8) {
+        return Err(ctl::ENOMEM);
+    }
+    // usbd's page tables mapping the area, from its arena (whose
+    // allocations panic), for good: room first.
+    if !h.alloc.global(|alloc| d.arena.reserve(alloc, host::map_tables(uabi::AREA_PAGES))) {
         return Err(ctl::ENOMEM);
     }
     // Completions go to the guest's VMM, which raises the device's event:
@@ -568,12 +602,18 @@ pub fn attach(h: &mut Host, i: usize, g: &mut RootGuest) -> Result<Attached, Err
     // (usbd may use them after the guest is gone, until REMOVE is done).
     let area = h.alloc.global(|alloc| -> Option<Area> {
         let mut arena = alloc.arena((uabi::AREA_PAGES + 4) * PAGE)?;
-        let frames = arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: QUEUE_RADIX });
-        let guest = arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: QUEUE_RADIX });
+        let Some(frames) = arena.try_object(alloc, ObjectBlueprint::CNode { size_bits: QUEUE_RADIX }) else {
+            alloc.release(arena);
+            return None;
+        };
+        let Some(guest) = arena.try_object(alloc, ObjectBlueprint::CNode { size_bits: QUEUE_RADIX }) else {
+            alloc.release_objects(arena, &[frames]);
+            return None;
+        };
+        let (frames, guest) = (root_cap::<cap_type::CNode>(frames), root_cap::<cap_type::CNode>(guest));
         let ok = arena.retype(alloc, &FRAME_BP, uabi::AREA_PAGES, Dest { cnode: abs_of(frames), offset: 0 }).is_some();
         if !ok {
-            alloc.release(arena);
-            [frames.bits(), guest.bits()].iter().for_each(|&s| alloc.slots.free(s as Slot));
+            alloc.release_objects(arena, &[frames.bits() as Slot, guest.bits() as Slot]);
             return None;
         }
         // usbd maps each frame's own capability (invoked from a slot of

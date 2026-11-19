@@ -684,3 +684,31 @@ fn a_dma_region_that_does_not_fit_keeps_nothing() {
         assert_eq!((alloc.slots.available(), alloc.free_bytes()), (slots, free), "round {round}");
     }
 }
+
+/// A guest's arena in root (vmmgr.rs, guest_new and nic_add) owns, besides
+/// its regions, the I/O pool, the Untyped of the pool's mapping CNode and
+/// a netd port per device (Arena::own).  With every region taken, there is
+/// still room for all of them: one fewer, and the last port's own()
+/// panicked root.
+#[test]
+fn a_full_arena_owns_its_pool_the_pool_cnode_and_every_port() {
+    let new = |boot: &BootInfo| mem::Alloc::new(
+        mem::Slots::new(Cap::from_bits(51), Box::leak(Box::new(mem::SlotStorage::<64, 4096>::new())), 1024..4096),
+        Box::leak(Box::new(mem::AllocStorage::new())),
+        boot,
+    );
+    // Disjoint 1 MiB blocks (their Untypeds in slots 32..288), more than
+    // an arena has regions: it grows a block at a time until its regions
+    // are all taken.
+    let mut alloc = new(&BootInfo((0..256).map(|i| Desc { paddr: (64 << 20) + i * (2 << 20), bits: 20 }).collect()));
+    let mut arena = alloc.arena(1 << 20).unwrap();
+    assert!(!arena.reserve(&mut alloc, 512 << 20));
+    assert!(arena.pool.regions.is_full());
+    let regions = arena.owned.len();
+    assert_eq!(regions, arena.pool.regions.len());
+    for k in 0..2 + MAX_GUEST_DEVICES {
+        let s = alloc.slots.alloc();
+        arena.own(s, (1 << 32) + k * (4 << 20), 22);
+    }
+    assert_eq!(arena.owned.len(), regions + 2 + MAX_GUEST_DEVICES);
+}

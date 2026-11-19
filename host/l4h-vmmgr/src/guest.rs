@@ -62,6 +62,18 @@ const BLOCK_FRAMES_BYTES: usize = 2 * (32 << abi::RAM_L2_BITS);
 const BLOCK_FRAMES_SLOTS: usize = 3;
 /// Devices a guest can have (console, control, virtio).
 pub use l4h_host::MAX_GUEST_DEVICES;
+
+/// What adding a device takes from the guest's arena (`Guest::add_device`):
+/// its shared page and the page tables mapping it in the guest.  Reserved
+/// before anything is made for the device elsewhere (root's backend):
+/// add_device's allocations panic.
+pub const DEVICE_BYTES: usize = PAGE + host::map_tables(1);
+/// The same for a USB controller (`Guest::add_usb`), whose pages are
+/// root's: the page tables mapping its queue area.
+pub const USB_BYTES: usize = host::map_tables(abi::usb::AREA_PAGES);
+/// Slots of ours either takes: the page, the guest's copy and the page
+/// tables (and, for USB, a copy of each page).
+pub const DEVICE_SLOTS: usize = 8;
 /// VSpaces of a guest's processes (the guest's VSpace pool), at most.
 pub const MAX_VSPACES: usize = 64;
 
@@ -567,7 +579,8 @@ impl Guest {
     }
 
     /// Add a device: a shared page mapped in the guest at its device area
-    /// and a kick capability (badged notification of l4h-vmm).
+    /// and a kick capability (badged notification of l4h-vmm).  Its
+    /// allocations panic: the caller reserves DEVICE_BYTES first.
     pub fn add_device(&mut self, alloc: &mut Alloc, kind: DevKind) -> Option<usize> {
         let d = self.devices.len();
         if d >= MAX_GUEST_DEVICES || self.state != State::Created {
@@ -635,7 +648,7 @@ impl Guest {
 
     /// Add USB controller `n`: its queue area (frames in `frames`, radix
     /// USB_QUEUE_RADIX) at abi::usb::area_va(n), the pages usbd writes
-    /// read-only, and usbd's kick.
+    /// read-only, and usbd's kick.  The caller reserves USB_BYTES first.
     pub fn add_usb(&mut self, alloc: &mut Alloc, n: usize, frames: cap::CNode, kick: cap::Notification) -> Option<usize> {
         let d = self.devices.len();
         if d >= MAX_GUEST_DEVICES || self.state != State::Created || n != self.usbs {

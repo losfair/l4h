@@ -82,12 +82,13 @@ fn cnode(g: &mut Guest, alloc: &mut Alloc, radix: usize) -> Result<cap::CNode, E
 }
 
 /// Make what `parts` lacks of a GPU of `n` frames: its second CNode.
+/// Room for its device (guest::DEVICE_BYTES) is left after the frames.
 fn complete(g: &mut Guest, alloc: &mut Alloc, parts: &mut Parts, n: usize) -> Result<cap::CNode, Errno> {
     let keep = match parts.keep {
         Some(keep) => keep,
         None => *parts.keep.insert(cnode(g, alloc, parts.radix)?),
     };
-    if !g.reserve(alloc, n.saturating_sub(parts.made) * PAGE) {
+    if !g.reserve(alloc, n.saturating_sub(parts.made) * PAGE + crate::guest::DEVICE_BYTES) {
         return Err(ENOMEM);
     }
     while parts.made < n {

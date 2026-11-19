@@ -1,4 +1,4 @@
-From 9b77435c4d71a98f667156b81fb56936701f4c6d Mon Sep 17 00:00:00 2001
+From 2f9fa2fcf7ad68b30f4ef6584682f3ae51ffc097 Mon Sep 17 00:00:00 2001
 From: Heyang Zhou <hello@su3.io>
 Date: Fri, 30 Oct 2026 09:40:18 -0700
 Subject: [PATCH] vspace: derive 4 KiB aliases of 2 MiB RAM frames and sample
@@ -9,7 +9,8 @@ Subject: [PATCH] vspace: derive 4 KiB aliases of 2 MiB RAM frames and sample
  .../x86/interfaces/object-api-arch.xml        |  35 +++++-
  src/arch/arm/64/kernel/vspace.c               |  97 +++++++++++++-
  src/arch/x86/kernel/vspace.c                  | 118 ++++++++++++++++--
- 4 files changed, 263 insertions(+), 23 deletions(-)
+ src/fastpath/fastpath.c                       |   6 +-
+ 5 files changed, 267 insertions(+), 25 deletions(-)
 
 diff --git a/libsel4/arch_include/arm/interfaces/object-api-arch.xml b/libsel4/arch_include/arm/interfaces/object-api-arch.xml
 index 36420301b..a02bfb6c2 100644
@@ -429,6 +430,24 @@ index 88ee42395..ab660365a 100644
      case X86PageMap: { /* Map */
          word_t          vaddr;
          word_t          vtop;
+diff --git a/src/fastpath/fastpath.c b/src/fastpath/fastpath.c
+index e25bd8fb8..5fb7cc0e0 100644
+--- a/src/fastpath/fastpath.c
++++ b/src/fastpath/fastpath.c
+@@ -755,9 +755,11 @@ void NORETURN fastpath_vm_fault(vm_fault_type_t type)
+     dom_t dom;
+ 
+ #if defined(CONFIG_ARCH_AARCH64) && !defined(CONFIG_ARM_HYPERVISOR_SUPPORT)
+-    /* Access-flag faults may be resolved inside the kernel. */
++    /* Access-flag faults of 4 KiB and 2 MiB leaves may be resolved inside
++     * the kernel (handleAccessFlagFault). */
+     word_t fault = type == ARMDataAbort ? getDFSR() : getIFSR();
+-    if ((fault & MASK(6)) == 0xb) {
++    word_t fsc = fault & MASK(6);
++    if (fsc == 0xb || fsc == 0xa) {
+         vm_fault_slowpath(type);
+     }
+ #endif
 -- 
 2.47.3
 
