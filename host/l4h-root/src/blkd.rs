@@ -273,7 +273,9 @@ impl Controller {
             let f = sel4::init_thread::Slot::<cap_type::Granule>::from_index(s).cap();
             let n = PAGE.min(len - i * PAGE);
             win.with_frame(&abs_of(f), |p| unsafe {
-                if let Some(from) = from { core::ptr::copy_nonoverlapping(from.add(i * PAGE), p, n); }
+                // Volatile: `from` is dom0's control data area, which it
+                // may write meanwhile.
+                if let Some(from) = from { host::gpu::copy_volatile(from.add(i * PAGE), p, n); }
                 else { core::ptr::write_bytes(p, 0, n); }
             });
         }

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Fixed-size flags service invariants, signed verifier policy checks and
-# trustd's check of another partition's key.
+# Fixed-size flags service invariants, signed verifier policy checks,
+# trustd's check of another partition's key and its copy of the FADT.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 out=$root/build/trusttest
@@ -13,3 +13,4 @@ rustc +stable --edition=2024 --test "$root/tests/trust.rs" -L dependency="$out" 
 "$out/trust-tests"
 python3 "$root/tests/attest-verifier.py"
 cargo +stable test -q --manifest-path "$root/tests/trustd-key/Cargo.toml"
+cargo +stable test -q --manifest-path "$root/tests/trustd-fadt/Cargo.toml"

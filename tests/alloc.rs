@@ -584,3 +584,57 @@ fn reclaim_pinning_keeps_pinned_untyped_unrevoked() {
     assert_eq!(alloc.slots.available(), slots + 3);
     assert_eq!(alloc.free_bytes(), free - kept);
 }
+
+/// CTL_DRIVER_LOAD and CTL_FIRMWARE_LOAD (nicd.rs) copy up to a megabyte
+/// into frames of an arena, and give the arena up when the image is
+/// refused or memory runs out half way.  Revoking its Untypeds deletes
+/// the frames, but their slots in root's CNode must be freed too: dom0
+/// could otherwise refuse image after image until root's CNode is full,
+/// and root panics at its next allocation.
+#[test]
+fn a_given_up_load_frees_its_frames_slots() {
+    const PAGES: usize = 256;
+    let boot = BootInfo(vec![Desc { paddr: 1 << 30, bits: 26 }]);
+    let mut alloc = mem::Alloc::new(
+        mem::Slots::new(Cap::from_bits(41), Box::leak(Box::new(mem::SlotStorage::<64, 4096>::new())), 64..4096),
+        Box::leak(Box::new(mem::AllocStorage::new())),
+        &boot,
+    );
+    // The first round splits blocks, whose parents keep their slots for
+    // the next: count from its end.
+    let (mut slots, mut free) = (0, 0);
+    // Far more refused images than the CNode has slots for 256 frames each.
+    for round in 0..64 {
+        let mut arena = alloc.arena(PAGES * 4096 + 4096).unwrap();
+        let mut frames = Vec::new();
+        for _ in 0..PAGES {
+            frames.push(arena.try_object(&mut alloc, ObjectBlueprint::Frame).unwrap());
+        }
+        REVOKES.with_borrow_mut(Vec::clear);
+        let owned: Vec<u64> = arena.owned.iter().map(|o| o.0 as u64).collect();
+        alloc.release_objects(arena, &frames);
+        REVOKES.with_borrow(|v| assert_eq!(v, &owned, "the frames go with the arena's Untypeds"));
+        if round == 0 {
+            (slots, free) = (alloc.slots.available(), alloc.free_bytes());
+        }
+        assert_eq!(alloc.slots.available(), slots, "round {round}: slots leaked");
+        assert_eq!(alloc.free_bytes(), free, "round {round}: memory leaked");
+    }
+    // Out of memory half way: the frames made so far are freed too.
+    let boot = BootInfo(vec![Desc { paddr: 1 << 30, bits: 20 }]);
+    let mut alloc = alloc.renew(&boot);
+    for round in 0..4 {
+        let mut arena = alloc.arena(4096).unwrap();
+        let mut frames = Vec::new();
+        while let Some(s) = arena.try_object(&mut alloc, ObjectBlueprint::Frame) {
+            frames.push(s);
+            assert!(frames.len() <= PAGES);
+        }
+        assert!(!frames.is_empty());
+        alloc.release_objects(arena, &frames);
+        if round == 0 {
+            slots = alloc.slots.available();
+        }
+        assert_eq!(alloc.slots.available(), slots, "round {round}: slots leaked");
+    }
+}

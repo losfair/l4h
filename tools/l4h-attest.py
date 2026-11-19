@@ -325,9 +325,12 @@ def tpm_ecdsa(sig):
 @checked("host key")
 def cose_p256(k):
     """A P-256 key from a COSE_Key (EC2)."""
-    if k.get(1) != 2 or k.get(-1) != 1:
+    if not (is_int(k.get(1)) and k[1] == 2 and is_int(k.get(-1)) and k[-1] == 1):
         raise Fail("host key is not an EC2 P-256 COSE_Key")
-    return ec.EllipticCurvePublicNumbers(int.from_bytes(k[-2], "big"), int.from_bytes(k[-3], "big"), ec.SECP256R1()).public_key()
+    x, y = k.get(-2), k.get(-3)
+    if not (isinstance(x, bytes) and isinstance(y, bytes) and len(x) == 32 and len(y) == 32):
+        raise Fail("host key coordinates are not 32 bytes each")
+    return ec.EllipticCurvePublicNumbers(int.from_bytes(x, "big"), int.from_bytes(y, "big"), ec.SECP256R1()).public_key()
 
 
 def point(key):
@@ -504,7 +507,10 @@ def check_evidence(ev, pins, ak_name, ek_ca):
     if q["extra"] != key_binding(point(key), partition):
         raise Fail("the quote is not over this host key")
     pcrs = ev["pcrs"]
-    if not isinstance(pcrs, dict) or not all(is_int(i) and isinstance(v, bytes) for i, v in pcrs.items()):
+    # Each a sha256 PCR's value, 32 bytes: the quote signs only their
+    # concatenation, which values of other lengths could split elsewhere
+    # (PCR 15 zero, its real value appended to PCR 14's).
+    if not isinstance(pcrs, dict) or not all(is_int(i) and isinstance(v, bytes) and len(v) == 32 for i, v in pcrs.items()):
         raise Fail("PCRs are not a map of PCR numbers to values")
     if any(alg != 0x000B for alg, _ in q["pcrs"]) or [i for _, i in q["pcrs"]] != sorted(pcrs):
         raise Fail("quoted PCRs differ from the evidence's")

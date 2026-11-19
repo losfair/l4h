@@ -38,6 +38,7 @@ extern crate alloc;
 
 mod aml;
 mod cbor;
+mod fadt;
 mod flags;
 mod key;
 mod relay;
