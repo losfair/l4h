@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! Run usbd's production reset and Disable Slot paths with narrow hardware
-//! mocks. Publishing a completion transfers DMA-buffer ownership to Linux.
+//! Run usbd's production reset, Disable Slot and Reset Device paths with
+//! narrow hardware mocks. Publishing a completion transfers DMA-buffer ownership to Linux.
 #![allow(dead_code)]
 extern crate self as l4h_rt;
 use core::ptr::{addr_of_mut, write_volatile};
@@ -12,6 +12,7 @@ macro_rules! log { ($($arg:tt)*) => { println!($($arg)*) }; }
 
 const CC_SUCCESS: u32 = 1;
 const CMD_DISABLE_SLOT: u32 = 10;
+const CMD_RESET_DEVICE: u32 = 17;
 fn cc_status(_: u32) -> i32 { abi::ST_IO }
 struct Trb { param: u64, status: u32, control: u32 }
 struct Request { slot: u16 }
@@ -45,6 +46,8 @@ impl Client {
 struct Usbd {
     hardware: Hardware, client: Option<Client>, resets: u64, dead: bool,
     slots: [Slot; 2], disable_result: Option<(u32, u32)>, completions: usize,
+    /// The command the test expects, and the endpoints dropped.
+    expected: u32, dropped: usize,
 }
 impl Usbd {
     fn new() -> Self {
@@ -53,6 +56,7 @@ impl Usbd {
             client: Some(Client { info: Box::new(unsafe { std::mem::zeroed() }), resets: 0, notify: false }),
             resets: 0, dead: false, slots: [Slot::EMPTY, Slot { enabled: true }],
             disable_result: Some((CC_SUCCESS, 1)), completions: 0,
+            expected: CMD_DISABLE_SLOT, dropped: 0,
         }
     }
     fn hc(&mut self) -> &mut Hardware { &mut self.hardware }
@@ -63,12 +67,13 @@ impl Usbd {
     fn drop_ep(&mut self, _: usize, dci: usize) {
         assert!(!self.hardware.running, "CQ completion would release a buffer still owned by DMA");
         if dci == 1 { self.completions += 1; }
+        self.dropped += 1;
     }
     fn client_slot(&self, s: u16) -> Option<usize> {
         (s == 1 && self.slots[1].enabled).then_some(1)
     }
     fn command(&mut self, trb: Trb) -> Option<(u32, u32)> {
-        assert_eq!(trb.control, CMD_DISABLE_SLOT << 10 | 1 << 24);
+        assert_eq!(trb.control, self.expected << 10 | 1 << 24);
         assert_eq!(self.completions, 0, "no buffer returned before Disable Slot");
         if self.disable_result.is_some_and(|(cc, _)| cc == CC_SUCCESS) {
             self.hardware.running = false;
@@ -114,5 +119,22 @@ fn only_successful_disable_releases_endpoints_and_dcbaa() {
         assert_eq!(driver.completions, success as usize);
         assert_eq!(driver.slots[1].enabled, !success);
         assert_eq!(driver.hardware.dcbaa, !success);
+    }
+}
+
+#[test]
+fn only_successful_device_reset_releases_endpoint_rings() {
+    // A refused Reset Device leaves the controller owning the slot's
+    // rings, as a refused Disable Slot does (`drop_ep` asserts it).
+    for result in [None, Some((17, 1)), Some((CC_SUCCESS, 1))] {
+        let mut driver = Usbd::new();
+        driver.expected = CMD_RESET_DEVICE;
+        driver.disable_result = result;
+        let status = driver.dev_reset(&Request { slot: 1 });
+        let success = result.is_some_and(|(cc, _)| cc == CC_SUCCESS);
+        assert_eq!(status, match result { None => abi::ST_TIMEOUT, Some((CC_SUCCESS, _)) => abi::ST_OK, _ => abi::ST_IO });
+        assert_eq!(driver.dropped, if success { 30 } else { 0 }, "endpoints 2..31 dropped");
+        assert_eq!(driver.completions, 0, "ep0 stays");
+        assert!(driver.slots[1].enabled, "the slot stays enabled");
     }
 }

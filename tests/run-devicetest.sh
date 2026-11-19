@@ -109,7 +109,12 @@ start = usbd.index('            abi::OP_SLOT_DISABLE => {')
 start = usbd.index('{', start)
 end = usbd.index('\n            abi::OP_ADDRESS =>', start)
 disable = usbd[start:end].rstrip().removesuffix(',')
-(out / 'usb-lifetime.inc').write_text('impl Usbd {\n' + reset + '\nfn disable(&mut self, r: &Request) -> i32 ' + disable + '\n}\n')
+start = usbd.index('            abi::OP_DEV_RESET => {')
+start = usbd.index('{', start)
+end = usbd.index('\n            abi::OP_EP_RESET =>', start)
+dev_reset = usbd[start:end].rstrip().removesuffix(',')
+(out / 'usb-lifetime.inc').write_text('impl Usbd {\n' + reset + '\nfn disable(&mut self, r: &Request) -> i32 ' + disable
+    + '\nfn dev_reset(&mut self, r: &Request) -> i32 ' + dev_reset + '\n}\n')
 # Keep the production boot sequence and reservation lifecycle intact.
 vmmgr = (root / 'host/l4h-vmmgr/src/main.rs').read_text()
 start = vmmgr.index('pub fn boot_dom0(')
