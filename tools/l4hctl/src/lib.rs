@@ -942,9 +942,11 @@ pub const POWER_OFF: u64 = 0;
 pub const POWER_REBOOT: u64 = 1;
 
 /// Host resources, from [`Ctl::host_info`].
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostInfo {
     pub cores: u64,
+    /// Distinct physical cores; `cores` on a host that predates it.
+    pub physical_cores: u64,
     pub free: u64,
     pub total: u64,
     pub disks: u64,
@@ -999,8 +1001,7 @@ impl Ctl {
 
     pub fn host_info(&self) -> Result<HostInfo> {
         let r = self.call(CTL_HOST_INFO, &[], &[], &[])?;
-        let v = r.vals;
-        Ok(HostInfo { cores: v[0], free: v[1], total: v[2], disks: v[3], vms: v[4], nics: v[5] })
+        Ok(parse_host_info(r.vals, &r.data))
     }
 
     /// Every PCI function root enumerated, in BDF order. This is a
@@ -1557,5 +1558,38 @@ mod steer_tests {
         for s in ["203.0.113.5/icmp:1", "203.0.113.5/tcp:0", "203.0.113.5/0", "nope", "1.2.3.4/tcp:70000"] {
             assert!(SteerMatch::parse(s).is_err(), "{s}");
         }
+    }
+}
+
+/// CTL_HOST_INFO's answer. An older host leaves data[0..8] zero, and a
+/// count above the logical cores is not believed: both give `cores`.
+fn parse_host_info(v: [u64; 6], data: &[u8]) -> HostInfo {
+    let physical = u64::from_le_bytes(data[..8].try_into().unwrap());
+    let physical_cores = if physical == 0 || physical > v[0] { v[0] } else { physical };
+    HostInfo { cores: v[0], physical_cores, free: v[1], total: v[2], disks: v[3], vms: v[4], nics: v[5] }
+}
+
+#[cfg(test)]
+mod host_info_tests {
+    use super::*;
+
+    fn info(cores: u64, physical: u64) -> HostInfo {
+        let mut data = [0; CTL_DATA_MAX];
+        data[..8].copy_from_slice(&physical.to_le_bytes());
+        parse_host_info([cores, 1 << 30, 2 << 30, 1, 2, 3], &data)
+    }
+
+    #[test]
+    fn physical_cores_from_data() {
+        let i = info(4, 2);
+        assert_eq!(i, HostInfo { cores: 4, physical_cores: 2, free: 1 << 30, total: 2 << 30, disks: 1, vms: 2, nics: 3 });
+        assert_eq!(info(8, 8).physical_cores, 8);
+    }
+
+    #[test]
+    fn older_or_bad_hosts_fall_back_to_logical_cores() {
+        assert_eq!(info(6, 0).physical_cores, 6);
+        assert_eq!(info(4, 5).physical_cores, 4);
+        assert_eq!(info(4, u64::MAX).physical_cores, 4);
     }
 }

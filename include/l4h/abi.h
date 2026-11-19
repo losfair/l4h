@@ -490,7 +490,7 @@ struct l4h_ctl_sync {
 };
 
 enum l4h_ctl_op {
-	/* -> vals: cores, free bytes, total bytes, nr disks, nr vms, nr NICs */
+	/* -> vals: cores, free bytes, total bytes, nr disks, nr vms, nr NICs; data[0..8]: physical cores (u64, little-endian; 0 on older hosts) */
 	L4H_CTL_HOST_INFO = 1,
 	/* args: ram bytes (rounded up to 2 MiB), vcpus, -, -, I/O pool bytes
 	 * (0 = default, else a power of two from 1 MiB to 256 MiB); data:
