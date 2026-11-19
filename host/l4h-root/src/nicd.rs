@@ -435,7 +435,7 @@ fn confined(h: &Host, i: usize, driver: usize) -> bool {
             if f == me {
                 Peer::Me
             } else if let Some(o) = nics().iter().find(|o| bdf(&o.pci) as u16 == f) {
-                Peer::Nic(o.driver == Some(driver) || (o.driver.is_none() && !o.firmware_live))
+                Peer::nic(o.driver, o.firmware_live, driver)
             } else if h.pci_inventory.iter().any(|p| p.bdf == f) {
                 Peer::Other((h.pci.read(f, 0x0c) >> 16) as u8)
             } else {
@@ -589,7 +589,16 @@ pub fn bind(h: &mut Host, i: usize, driver: Option<usize>) -> Result<(), &'stati
         let (a, data) = h.iommu.msi(dom, v);
         n.msi = Some((v, a, data));
     }
+    // Root's from now on: one the firmware left live is stopped first,
+    // so that it is not left decoding and mastering the bus as the
+    // firmware set it up if its nicd does not start (kill stops it
+    // otherwise), where a peer would count it as stopped.
     let n = &mut nics()[i];
+    if n.firmware_live {
+        h.pci.disable(&n.pci);
+        h.pci.bus_master(&n.pci, false);
+        n.firmware_live = false;
+    }
     n.driver = Some(d);
     n.confined = confined(h, i, d);
     n.restarts = 0;
@@ -799,9 +808,11 @@ fn spawn(h: &mut Host, i: usize) -> Result<(), &'static str> {
 
     h.alloc.slots.track(slot_owner(i));
     let built = (|| -> Result<Inst, &'static str> {
-        let image = (1usize << m.image_max_bits) + fw.iter().sum::<usize>();
+        // All of its budget: the image's and the firmware copies' pages,
+        // page tables, the CNodes and its other objects.
         let kb = budget.keep_bits;
-        let mut arena = h.alloc.arena(image + (1 << (kb + 5)) + (2 << 20)).ok_or("no memory for it")?;
+        let cnodes = (1usize << (kb + 5)) + (1 << (host::CNODE_BITS + 5));
+        let mut arena = h.alloc.arena(budget.bytes).ok_or("no memory for it")?;
         // Its keep CNode first, the largest object: without a block that
         // large, nothing is made.
         let Some(keep) = arena.try_object(&mut h.alloc, ObjectBlueprint::CNode { size_bits: kb }) else {
@@ -815,6 +826,13 @@ fn spawn(h: &mut Host, i: usize) -> Result<(), &'static str> {
             h.alloc.reclaim(arena);
             return Err("no memory for it");
         };
+        // What the CNodes' alignment took may leave too little for the
+        // rest, whose allocations (component::create, map_copy, the
+        // firmware, control and snapshot pages, Mailbox::new) panic.
+        if !arena.reserve(&mut h.alloc, budget.bytes - cnodes) {
+            h.alloc.reclaim(arena);
+            return Err("no memory for it");
+        }
         let DmaRegion { frames: dma_cn, bits: dma_cn_bits, paddr: dma_paddr, .. } = dma_region;
         let dma_pages = dma / PAGE;
 

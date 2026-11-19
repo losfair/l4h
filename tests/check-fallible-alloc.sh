@@ -45,12 +45,19 @@ check host/l4h-vmmgr/src/guest.rs share_block
 check host/l4h-vmmgr/src/guest.rs block_frames
 check host/l4h-vmmgr/src/kimage.rs map
 # The nicd's and usbd's own CSpace CNodes are made before
-# component::create, which would make them with one.  (The body is read
+# component::create, which would make them with one, and the room for
+# the rest of what they take is reserved after them.  (The body is read
 # whole first: grep -q stopping early would fail the pipe under pipefail.)
 for at in nicd.rs:spawn usb.rs:claim; do
     b=$(body "$root/host/l4h-root/src/${at%%:*}" "${at#*:}")
     if ! grep -q 'cnode: Some(' <<<"$b"; then
         echo "check-fallible-alloc: ${at%%:*} ${at#*:} leaves its CNode to component::create" >&2
+        fail=1
+    fi
+    # What the CNodes' alignment took is made up for before the
+    # allocations that panic (component::create, map_copy, Mailbox::new).
+    if ! grep -q 'arena\.reserve(' <<<"$b"; then
+        echo "check-fallible-alloc: ${at%%:*} ${at#*:} does not reserve its arena's room after its CNodes" >&2
         fail=1
     fi
 done

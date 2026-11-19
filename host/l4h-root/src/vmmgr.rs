@@ -215,6 +215,10 @@ pub fn spawn(h: &mut Host, modules: &Modules, plan: &Dom0Plan) -> Vmmgr {
         .arena((32 << bits) + 2 * (32 << radix) + (pages / 512 + 64) * PAGE + (4 << 20))
         .expect("memory for vmmgr");
     let mut ranges = [proto::ModuleRange::default(); 3];
+    // Its ASID pools: fresh ones of its own, made now (none can be made
+    // without ASIDControl, which stays here).  Its own VSpace's ASID is
+    // root's, as every component's.
+    let pools = h.asids.hand_over(&mut h.alloc);
     let comp = CONFIG.with(|cfg| {
         *cfg = core::mem::MaybeUninit::zeroed();
         let cfg = unsafe { cfg.assume_init_mut() };
@@ -252,14 +256,8 @@ pub fn spawn(h: &mut Host, modules: &Modules, plan: &Dom0Plan) -> Vmmgr {
         let cmdline = h.cfg.dom0_cmdline.as_bytes();
         let n = cmdline.len().min(abi::CMDLINE_SIZE - 1);
         cfg.dom0_cmdline[..n].copy_from_slice(&cmdline[..n]);
-        // The ASID pools: all there can be, made now (none can be made
-        // without ASIDControl, which stays here).
-        h.asids.make_all(&mut h.alloc);
-        let pools = h.asids.pools();
+        // Fresh: no ASID used in any (asids_used stays zero).
         cfg.asid_pools = pools.len() as u64;
-        for (i, &(_, used)) in pools.iter().enumerate() {
-            cfg.asids_used[i] = used as u64;
-        }
         let cfg_bytes = unsafe {
             core::slice::from_raw_parts(cfg as *const VmmgrConfig as *const u8, core::mem::size_of::<VmmgrConfig>())
         };
@@ -295,7 +293,7 @@ pub fn spawn(h: &mut Host, modules: &Modules, plan: &Dom0Plan) -> Vmmgr {
     for core in 0..h.info.cores {
         comp.give(proto::SLOT_SCHED_CONTROL + core as u64, h.info.sched_control(core), CapRights::all());
     }
-    for (i, &(pool, _)) in h.asids.pools().iter().enumerate() {
+    for (i, &pool) in pools.iter().enumerate() {
         comp.give(proto::SLOT_ASID_POOL + i as u64, pool, CapRights::all());
     }
     crate::memd::give_vmmgr(&mut h.alloc, &mut arena, &comp);

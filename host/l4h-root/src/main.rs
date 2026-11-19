@@ -151,25 +151,38 @@ impl HostInfo {
 }
 
 /// ASID pools; x86_64 seL4 has 8 pools of 512 ASIDs each in total.  Root
-/// assigns ASIDs to its components until vmmgr runs, and then gives it
-/// every pool (`make_all`).
+/// assigns its components' ASIDs from its own (its boot pool, and more if
+/// it needs them), and makes vmmgr pools of its own (`hand_over`), which it
+/// never assigns from: neither counts the other's ASIDs.
 pub struct AsidPools {
-    pools: ArrayVec<(cap::AsidPool, usize), { 1 << sel4::sys::seL4_NumASIDPoolsBits }>,
-    /// ASIDs assigned to live VSpaces (exact: guests return theirs).
+    pools: ArrayVec<(cap::AsidPool, usize), MAX_ASID_POOLS>,
+    /// Pools made for vmmgr, which are none of root's.
+    given: usize,
+    /// ASIDs assigned to live VSpaces of root's pools (exact: components
+    /// return theirs).
     pub in_use: usize,
 }
 
-const ASID_CAPACITY: usize = (1 << sel4::sys::seL4_NumASIDPoolsBits) * ASIDS_PER_POOL;
+const MAX_ASID_POOLS: usize = 1 << sel4::sys::seL4_NumASIDPoolsBits;
 
 const ASIDS_PER_POOL: usize = 1 << sel4::sys::seL4_ASIDPoolIndexBits;
 
 impl AsidPools {
+    pub fn new(boot: cap::AsidPool, used: usize) -> Self {
+        AsidPools { pools: [(boot, used)].into_iter().collect(), given: 0, in_use: used }
+    }
+
+    /// Root's: every pool the kernel can have but vmmgr's.
+    fn capacity(&self) -> usize {
+        (MAX_ASID_POOLS - self.given) * ASIDS_PER_POOL
+    }
+
     pub fn available(&self) -> usize {
-        ASID_CAPACITY.saturating_sub(self.in_use)
+        self.capacity().saturating_sub(self.in_use)
     }
 
     pub fn assign(&mut self, alloc: &mut Alloc, vspace: cap::VSpace) {
-        assert!(self.in_use < ASID_CAPACITY, "out of ASIDs");
+        assert!(self.in_use < self.capacity(), "out of ASIDs");
         self.in_use += 1;
         for (pool, used) in self.pools.iter_mut() {
             if *used < ASIDS_PER_POOL {
@@ -188,13 +201,14 @@ impl AsidPools {
                 return;
             }
         }
+        // Every pool full: in_use < capacity, so one more can be made.
         let pool = self.make(alloc);
         pool.asid_pool_assign(vspace).expect("ASID assign");
-        // At most seL4_NumASIDPoolsBits pools: in_use < ASID_CAPACITY.
         self.pools.must_push((pool, 1));
     }
 
     fn make(&mut self, alloc: &mut Alloc) -> cap::AsidPool {
+        assert!(self.pools.len() + self.given < MAX_ASID_POOLS, "out of ASID pools");
         let (ut_slot, pool_slot) = alloc.slots.global(|slots| (slots.alloc(), slots.alloc()));
         let ut = alloc.split(sel4::sys::seL4_ASIDPoolBits as usize, ut_slot).expect("ASID pool memory");
         slot::ASID_CONTROL
@@ -204,18 +218,17 @@ impl AsidPools {
         sel4::init_thread::Slot::<cap_type::AsidPool>::from_index(pool_slot).cap()
     }
 
-    /// Make every pool vmmgr can take.
-    pub fn make_all(&mut self, alloc: &mut Alloc) {
-        assert!(self.pools.len() <= l4h_host::vmmgr::MAX_ASID_POOLS);
-        while !self.pools.is_full() && self.pools.len() < l4h_host::vmmgr::MAX_ASID_POOLS {
+    /// Make vmmgr's pools, fresh, once (l4h_host::vmmgr::vmmgr_asid_pools):
+    /// from now on root's capacity is the pools left.
+    pub fn hand_over(&mut self, alloc: &mut Alloc) -> ArrayVec<cap::AsidPool, { l4h_host::vmmgr::MAX_ASID_POOLS }> {
+        assert!(self.given == 0, "vmmgr's ASID pools made twice");
+        let mut out = ArrayVec::new();
+        for _ in 0..l4h_host::vmmgr::vmmgr_asid_pools(MAX_ASID_POOLS, self.pools.len()) {
             let pool = self.make(alloc);
-            self.pools.must_push((pool, 0));
+            out.must_push(pool);
+            self.given += 1;
         }
-    }
-
-    /// The pools, and the ASIDs used in each.
-    pub fn pools(&self) -> &[(cap::AsidPool, usize)] {
-        &self.pools
+        out
     }
 }
 
@@ -508,7 +521,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
             }
         },
     };
-    let mut asids = AsidPools { pools: [(slot::ASID_POOL.cap(), 1)].into_iter().collect(), in_use: 1 };
+    let mut asids = AsidPools::new(slot::ASID_POOL.cap(), 1);
     let dashboard = dashboard::Dashboard::new(bootinfo, &mut alloc, &mut devmem, cfg.fb_console);
     let logd = if uart.is_some() || outgoing.is_some() {
         let rings = partition::Rings::new(&mut alloc, &mut devmem);

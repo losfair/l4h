@@ -571,13 +571,19 @@ pub const fn hw_config_write_protected(off: usize, width: usize) -> bool {
 }
 
 /// Whether a configuration write [off, off + width) of a function whose
-/// configuration space `read8` reads meets its MSI or MSI-X capability
-/// (MSI's length by its Message Control: 64-bit addresses, per-vector
-/// masking).  A device the firmware left mastering the bus would send the
-/// AML's message as an interrupt where none is remapped.  A capability list
-/// that cannot be walked (a pointer into the header, more than 48 entries)
-/// refuses every write.
-pub fn hw_config_msi(off: usize, width: usize, read8: impl Fn(usize) -> u8) -> bool {
+/// configuration space `read8` reads meets one of the capabilities the
+/// firmware's AML never writes: MSI or MSI-X (MSI's length by its Message
+/// Control: 64-bit addresses, per-vector masking), as a device the
+/// firmware left mastering the bus would send the AML's message as an
+/// interrupt where none is remapped; PCI Express (its 0x3c bytes, within
+/// the first 256), whose Device Control turns on phantom functions, which
+/// would have the device's DMA reach memory as another function's, No
+/// Snoop and relaxed ordering, or resets it (Initiate FLR), and whose
+/// Device Control 2 turns on ID-based ordering and the like; and power
+/// management (8 bytes), whose PMCSR puts the device in D3hot, resetting
+/// it.  A capability list that cannot be walked (a pointer into the
+/// header, more than 48 entries) refuses every write.
+pub fn hw_config_cap_protected(off: usize, width: usize, read8: impl Fn(usize) -> u8) -> bool {
     let end = off.saturating_add(width);
     if read8(6) & 0x10 == 0 {
         return false;
@@ -589,10 +595,12 @@ pub fn hw_config_msi(off: usize, width: usize, read8: impl Fn(usize) -> u8) -> b
             return true;
         }
         let len = match read8(ptr) {
+            0x01 => 8,
             0x05 => {
                 let ctrl = read8(ptr + 2) as usize | (read8(ptr + 3) as usize) << 8;
                 10 + if ctrl & 0x80 != 0 { 4 } else { 0 } + if ctrl & 0x100 != 0 { 10 } else { 0 }
             }
+            0x10 => 0x3c,
             0x11 => 12,
             _ => 0,
         };
@@ -715,6 +723,57 @@ pub const HW_CHIPSET: (u64, u64) = (0xfec0_0000, 0x0140_0000);
 /// the kernel programs.
 pub const HW_REFUSED_PORTS: [(usize, usize); 9] =
     [(0x20, 2), (0x40, 4), (0x60, 1), (0x64, 1), (0x92, 1), (0xa0, 2), (0xb2, 2), (0x4d0, 2), (0xcf9, 1)];
+
+/// The FADT's registers that put the machine to sleep or turn it off, and
+/// its SMI command port: SMI_CMD, PM1a/b_CNT_BLK and PM2_CNT_BLK (I/O
+/// ports), and X_PM1a/b_CNT_BLK, X_PM2_CNT_BLK and SLEEP_CONTROL_REG
+/// (generic addresses, in I/O or memory space).  The AML reaches none of
+/// them, in either space: SLP_TYP and SLP_EN written to any of them
+/// suspend or power off the whole machine, every partition with it.
+#[derive(Default, Debug)]
+pub struct FadtSleep {
+    /// I/O ports: (first, count).
+    pub ports: crate::fixed::ArrayVec<(usize, usize), FADT_SLEEP_PORTS>,
+    /// Memory: (address, length).
+    pub mmio: crate::fixed::ArrayVec<(u64, u64), FADT_SLEEP_MMIO>,
+}
+
+/// The FADT's legacy blocks (4) and generic addresses (4), at most, in I/O
+/// space; the generic addresses in memory space.
+pub const FADT_SLEEP_PORTS: usize = 8;
+pub const FADT_SLEEP_MMIO: usize = 4;
+
+/// FadtSleep of the FADT `f` (as many of its bytes as the table has: a
+/// field past its end is none).
+pub fn fadt_sleep(f: &[u8]) -> FadtSleep {
+    let mut out = FadtSleep::default();
+    let u8_at = |i: usize| f.get(i).map_or(0, |&b| b as usize);
+    let u32_at = |i: usize| f.get(i..i + 4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()) as usize);
+    // SMI_CMD, PM1a/b_CNT_BLK (with PM1_CNT_LEN) and PM2_CNT_BLK (with
+    // PM2_CNT_LEN), in I/O space.
+    for (at, len) in [(48, 1), (64, u8_at(89)), (68, u8_at(89)), (72, u8_at(90))] {
+        let port = u32_at(at);
+        if port != 0 && port < 0x1_0000 {
+            out.ports.must_push((port, len.max(1)));
+        }
+    }
+    // X_PM1a/b_CNT_BLK, X_PM2_CNT_BLK and SLEEP_CONTROL_REG: a generic
+    // address of 12 bytes (space, bit width, bit offset, access size,
+    // address).  Its length: its bits, or its access size, at least a
+    // byte (firmware leaves one or the other 0).
+    for at in [172, 184, 196, 244] {
+        let Some(g) = f.get(at..at + 12) else { continue };
+        let addr = u64::from_le_bytes(g[4..12].try_into().unwrap());
+        let access = match g[3] { a @ 1..=4 => 1u64 << (a - 1), _ => 0 };
+        let len = ((g[1] as u64).div_ceil(8) + (g[2] as u64) / 8).max(access).max(1);
+        match g[0] {
+            0 if addr != 0 => out.mmio.must_push((addr, len)),
+            1 if addr != 0 && addr < 0x1_0000 => out.ports.must_push((addr as usize, len as usize)),
+            _ => {}
+        }
+    }
+    out
+}
 
 /// The HPET's register block, where PCs put it: the AML never reaches it.
 /// Its comparators deliver interrupts as MSI writes the IOMMU does not
@@ -1078,7 +1137,7 @@ mod tests {
             c[0x70..0x72].copy_from_slice(&[0x11, 0x00]);
             c
         };
-        let msi = |c: &[u8; 256], off: usize, width: usize| hw_config_msi(off, width, |i| c.get(i).copied().unwrap_or(0xff));
+        let msi = |c: &[u8; 256], off: usize, width: usize| hw_config_cap_protected(off, width, |i| c.get(i).copied().unwrap_or(0xff));
         // MSI's length: 10, 14 with 64-bit addresses, 20 or 24 maskable.
         for (ctrl, len) in [(0u16, 10), (0x80, 14), (0x100, 20), (0x180, 24)] {
             let c = space(ctrl);
@@ -1091,7 +1150,7 @@ mod tests {
         for (off, width) in [(0x70, 2), (0x72, 2), (0x74, 4), (0x7b, 1)] {
             assert!(msi(&c, off, width), "{off:#x}+{width}");
         }
-        for (off, width) in [(0x40, 4), (0x4c, 4), (0x7c, 4), (0xfc, 4), (0x08, 4), (0x100, 4)] {
+        for (off, width) in [(0x48, 4), (0x4c, 4), (0x7c, 4), (0xfc, 4), (0x08, 4), (0x100, 4)] {
             assert!(!msi(&c, off, width), "{off:#x}+{width}");
         }
         // No capability list: nothing; one that cannot be walked: all.
@@ -1104,6 +1163,76 @@ mod tests {
         let mut c = space(0);
         c[0x71] = 0x40;
         assert!(msi(&c, 0x80, 4));
+    }
+
+    #[test]
+    fn pcie_and_power_management_capabilities_are_refused() {
+        // Power management at 0x40, a vendor capability at 0x48, PCI
+        // Express at 0x60, MSI-X at 0xb0.
+        let mut c = [0u8; 256];
+        c[6] = 0x10;
+        c[0x34] = 0x40;
+        c[0x40..0x42].copy_from_slice(&[0x01, 0x48]);
+        c[0x48..0x4a].copy_from_slice(&[0x09, 0x60]);
+        c[0x60..0x62].copy_from_slice(&[0x10, 0xb0]);
+        c[0xb0..0xb2].copy_from_slice(&[0x11, 0x00]);
+        let refused = |off: usize, width: usize| hw_config_cap_protected(off, width, |i| c.get(i).copied().unwrap_or(0xff));
+        // PMCSR (D3hot), Device Control (phantom functions, No Snoop,
+        // Initiate FLR), Link Control, Device Control 2, and the last
+        // bytes of either capability.
+        for (off, width) in [(0x44, 2), (0x40, 4), (0x47, 1), (0x68, 2), (0x69, 1), (0x70, 2), (0x88, 2), (0x9b, 1)] {
+            assert!(refused(off, width), "{off:#x}+{width}");
+        }
+        // The vendor capability, and what lies between the capabilities.
+        for (off, width) in [(0x48, 4), (0x4c, 4), (0x9c, 4), (0xa0, 4), (0xbc, 4), (0xfc, 4)] {
+            assert!(!refused(off, width), "{off:#x}+{width}");
+        }
+    }
+
+    #[test]
+    fn the_fadt_sleep_registers_are_refused_in_either_space() {
+        let gas = |t: &mut [u8], at: usize, space: u8, bits: u8, access: u8, addr: u64| {
+            t[at..at + 4].copy_from_slice(&[space, bits, 0, access]);
+            t[at + 4..at + 12].copy_from_slice(&addr.to_le_bytes());
+        };
+        // SMI_CMD at 0xb2, PM1a_CNT at 0x404 (2 bytes), PM2_CNT at 0x450
+        // (1); X_PM1a_CNT in memory (an AMD FCH's), X_PM1b_CNT in I/O
+        // space, X_PM2_CNT in memory with only its access size, and
+        // SLEEP_CONTROL_REG (ACPI 5.0, hardware-reduced) in memory.
+        let mut t = [0u8; 276];
+        t[48..52].copy_from_slice(&0xb2u32.to_le_bytes());
+        t[64..68].copy_from_slice(&0x404u32.to_le_bytes());
+        t[72..76].copy_from_slice(&0x450u32.to_le_bytes());
+        t[89] = 2;
+        t[90] = 1;
+        gas(&mut t, 172, 0, 16, 2, 0xfed8_0804);
+        gas(&mut t, 184, 1, 16, 2, 0x804);
+        gas(&mut t, 196, 0, 0, 1, 0xfed8_0850);
+        gas(&mut t, 244, 0, 8, 1, 0xfe00_0a10);
+        let s = fadt_sleep(&t);
+        assert_eq!(&s.ports[..], &[(0xb2, 1), (0x404, 2), (0x450, 1), (0x804, 2)]);
+        assert_eq!(&s.mmio[..], &[(0xfed8_0804, 2), (0xfed8_0850, 1), (0xfe00_0a10, 1)]);
+        // SLEEP_CONTROL_REG in I/O space too.
+        gas(&mut t, 244, 1, 8, 0, 0x4b0);
+        assert_eq!(fadt_sleep(&t).ports.last(), Some(&(0x4b0, 1)));
+        // A table cut short (a revision 2 FADT's 244 bytes): no
+        // SLEEP_CONTROL_REG, the X_ blocks still.
+        let s = fadt_sleep(&t[..244]);
+        assert_eq!(s.mmio.len(), 2);
+        assert_eq!(s.ports.len(), 4);
+        // Every field, either space: within the room there is.
+        let mut t = [0u8; 276];
+        for at in [48, 64, 68, 72] {
+            t[at..at + 4].copy_from_slice(&0x400u32.to_le_bytes());
+        }
+        for at in [172, 184, 196, 244] {
+            gas(&mut t, at, 1, 32, 3, 0x500);
+        }
+        assert_eq!(fadt_sleep(&t).ports.len(), FADT_SLEEP_PORTS);
+        for at in [172, 184, 196, 244] {
+            gas(&mut t, at, 0, 32, 3, 0xfed8_0000);
+        }
+        assert_eq!(fadt_sleep(&t).mmio.len(), FADT_SLEEP_MMIO);
     }
 
     #[test]

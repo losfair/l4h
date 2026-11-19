@@ -442,6 +442,18 @@ pub enum Peer {
     Unknown,
 }
 
+impl Peer {
+    /// Another NIC root drives, with driver `peer` (None: unbound), still
+    /// as the firmware left it if `firmware_live` (decoding, mastering the
+    /// bus, never stopped), by a NIC whose driver is `driver`: it may share
+    /// the group only stopped, unbound or with the same driver.  A peer
+    /// the firmware left live never may, even bound to the same driver
+    /// (bound, its nicd may have failed to start before it was stopped).
+    pub fn nic(peer: Option<usize>, firmware_live: bool, driver: usize) -> Peer {
+        Peer::Nic(!firmware_live && peer.is_none_or(|p| p == driver))
+    }
+}
+
 /// Whether a NIC whose isolation group (`closure`; u16::MAX for one too
 /// large to check) is `group` is confined: every member is the NIC, a NIC
 /// that may share it, or a bridge.  Bridges take no part in DMA (as for

@@ -709,6 +709,25 @@ fn a_nic_shares_its_group_only_with_nics_that_may() {
 }
 
 #[test]
+fn a_peer_the_firmware_left_live_never_shares_a_group() {
+    // Driver 3 here; the peer port as root's nicd.rs sees it: its driver
+    // (None: unbound) and whether the firmware left it live.
+    const D: usize = 3;
+    let nic = |driver, live| match Peer::nic(driver, live, D) { Peer::Nic(ok) => ok, _ => unreachable!() };
+    assert!(nic(None, false));
+    assert!(nic(Some(D), false));
+    assert!(!nic(Some(D + 1), false));
+    assert!(!nic(None, true));
+    // Bound to the same driver whose nicd never started (a failed
+    // spawn): still as the firmware left it, not stopped.
+    assert!(!nic(Some(D), true));
+    let m = Model::new(&[(0x0028, Func::pcie(0, None).multi()), (0x0029, Func::pcie(0, None))]);
+    let inv = [0x0028, 0x0029];
+    assert!(!nic_confined(&m, &inv, |f| f, 0x0029, &[(0x0028, nic(Some(D), true))]));
+    assert!(nic_confined(&m, &inv, |f| f, 0x0029, &[(0x0028, nic(Some(D), false))]));
+}
+
+#[test]
 fn a_group_root_cannot_vouch_for_is_not_confined() {
     // A member root did not find, a group too large to check, no group.
     assert!(!acs::confined_group(&[0x0010, 0x0018], |f| if f == 0x0010 { Peer::Me } else { Peer::Unknown }));

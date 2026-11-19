@@ -121,10 +121,11 @@ impl HostInfo {
 
 const ASIDS_PER_POOL: usize = 1 << sel4::sys::seL4_ASIDPoolIndexBits;
 
-/// The ASID pools root gave us: all there are, so none can be made.
+/// The ASID pools root gave us: fresh ones of our own, which root never
+/// assigns from (l4h_host::vmmgr::vmmgr_asid_pools); none can be made.
 pub struct AsidPools {
     pools: ArrayVec<(cap::AsidPool, usize), { proto::MAX_ASID_POOLS }>,
-    /// ASIDs assigned to live VSpaces, root's components' included.
+    /// ASIDs assigned to live VSpaces of these pools.
     pub in_use: usize,
 }
 

@@ -1450,9 +1450,10 @@ period, including its VMM's consumption.
   for what it makes for the guest (§10.3). Every size and address in a
   control request is range-checked before any arithmetic on it, and a
   request that fails half way gives back what it took.
-- x86_64 seL4 has 4096 ASIDs, and a guest holds 66: its kernel VSpace, 64
-  process VSpaces and its VMM. That allows about 61 guests;
-  `MAX_GUESTS` is 64.
+- x86_64 seL4 has 4096 ASIDs, 3584 of them (seven pools) vmmgr's, the
+  rest root's, and a guest holds 66: its kernel VSpace, 64 process
+  VSpaces and its VMM (74 with VT-x's EPT roots). That allows about 54
+  guests (48 with EPT roots); `MAX_GUESTS` is 64.
 - Free root CNode slots are kept in a bitmap, so the slot ranges of vNIC
   ports and disk DMA buffers can be allocated again as ranges after
   destroy.
@@ -4479,15 +4480,17 @@ runs the secondary's ActivateCredential calls (the relay):
     0xfee00000–0xfeefffff and the page of every I/O APIC the MADT lists
     (seL4 keeps those it does not drive out of device memory too, patch
     0046); if the MADT cannot be read whole or lists more than 32, it
-    serves no memory write. On
+    serves no memory write. Nor the FADT's sleep registers in memory space
+    (X_PM1a/b and X_PM2 control blocks, SLEEP_CONTROL_REG): SLP_EN there
+    suspends or powers off the machine, as through the ports below. On
     a machine split into partitions the others' RAM is device memory to this
     kernel and the descriptor does not list it, so there root serves memory
     only where none can be: the chipset's addresses from 0xfec00000 to 4 GiB,
     the ECAM window and the memory BARs of the partition's own functions. It
     serves I/O ports seL4 has not handed out, except those that
     reset the machine, put it to sleep or enter SMM (0x60, 0x64, 0x92,
-    0xb2–0xb3, 0xcf9 and the FADT's SMI command and PM1/PM2 control
-    blocks) and the legacy interrupt controllers and timer only the kernel
+    0xb2–0xb3, 0xcf9 and the FADT's SMI command, PM1/PM2 control blocks
+    and SLEEP_CONTROL_REG) and the legacy interrupt controllers and timer only the kernel
     programs (the 8259s at 0x20 and 0xa0, their ELCR at 0x4d0, the 8254 at
     0x40). PCI configuration,
     by ports or through the MCFG's ECAM windows, it serves for reading. Writes
@@ -4499,8 +4502,11 @@ runs the secondary's ActivateCredential calls (the relay):
     device root does not drive onto another's addresses nor lets one master
     the bus, to extended configuration space (past 0x100: ACS, which a
     confined device's isolation may rest on in a function root does not
-    drive, SR-IOV, ATS, Resizable BAR), and to the MSI and MSI-X
-    capabilities; in memory it refuses
+    drive, SR-IOV, ATS, Resizable BAR), to the MSI and MSI-X
+    capabilities, to the PCI Express capability (Device Control's phantom
+    functions, which would have a device's DMA reach memory as another
+    function's, No Snoop and Initiate FLR) and to power management's
+    (D3hot resets the device); in memory it refuses
     writes to every function's MSI-X table and pending bits, as found at
     boot, of every MSI-X capability of every function, bridges' (whose two
     BARs root reads but never sizes) included, wherever its BARs put them
@@ -4578,9 +4584,11 @@ its VMM or dom0 does not run with all of that. Only vmmgr and trustd call
 root.
 
 - **vmmgr holds** memd grants for guest objects, the guests' CNodes,
-  VSpaces, vCPUs and VMMs, copies of every core's SchedControl, and the ASID
-  pools (root makes all eight at boot and hands them over, keeping
-  ASIDControl). It runs guest creation, image loading and the launch digest,
+  VSpaces, vCPUs and VMMs, copies of every core's SchedControl, and ASID
+  pools of its own (root keeps its boot pool for its components, makes
+  vmmgr fresh ones, seven on x86_64, and hands them over, keeping
+  ASIDControl; the two never assign from one pool, as each would count
+  the other's ASIDs as free). It runs guest creation, image loading and the launch digest,
   start, shutdown and destroy, dom0's boot and restart, the balancer and
   steal time (§7), memory targets (§8.5) and the control API. Guests' VMMs
   call it, and guest kernels and VMMs fault to it: a guest whose kernel or

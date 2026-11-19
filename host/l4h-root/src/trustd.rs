@@ -94,7 +94,9 @@ struct Hw {
     other_segments: bool,
     /// I/O ports that reset the machine, put it to sleep, enter SMM or
     /// program the legacy interrupt controllers and timer: (first, count).
-    ports: ArrayVec<(usize, usize), 24>,
+    ports: ArrayVec<(usize, usize), { trust::HW_REFUSED_PORTS.len() + trust::FADT_SLEEP_PORTS }>,
+    /// The FADT's sleep registers in memory space (trust::fadt_sleep).
+    sleep: ArrayVec<(u64, u64), { trust::FADT_SLEEP_MMIO }>,
     /// Memory it never reaches: the HPETs' registers (trust::HPET_DEFAULT),
     /// the I/O APICs' and the local APICs' (trust::IOAPIC_DEFAULT,
     /// trust::LAPIC_MSI, and each I/O APIC's page the MADT lists).
@@ -110,10 +112,10 @@ impl Hw {
     fn find(bootinfo: &sel4::BootInfoPtr, phys: &mut crate::acpi::Phys) -> Hw {
         let mut hw = Hw {
             frames: crate::acpi::Frames::hw(), ecam: ArrayVec::new(), ecam_complete: true, other_segments: false,
-            ports: ArrayVec::new(), mmio: ArrayVec::new(), mmio_complete: true,
+            ports: ArrayVec::new(), sleep: ArrayVec::new(), mmio: ArrayVec::new(), mmio_complete: true,
         };
         for r in trust::HW_REFUSED_PORTS {
-            let _ = hw.ports.push(r);
+            hw.ports.must_push(r);
         }
         // The HPET where PCs have it, and where its table says it is; the
         // chipset's I/O APIC's page, the local APICs' megabyte, and every
@@ -143,22 +145,15 @@ impl Hw {
             log!("l4h-root: the MADT cannot be read, or lists more than {} I/O APICs: the TPM's AML gets no memory writes", trust::MAX_IOAPIC_PAGES);
         }
         let mut buf = [0; crate::acpi::FADT_LEN];
+        // The FADT's sleep registers and SMI command port, in I/O or
+        // memory space (each fits: room for every one).
         if let Some(f) = crate::acpi::find(bootinfo, phys, b"FACP", &mut buf) {
-            let u8_at = |i: usize| f.get(i).map_or(0, |&b| b as usize);
-            let u32_at = |i: usize| f.get(i..i + 4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()) as usize);
-            // SMI_CMD, PM1a/b_CNT_BLK (sleep), PM2_CNT_BLK.
-            for (at, len) in [(48, 1), (64, u8_at(89)), (68, u8_at(89)), (72, u8_at(90))] {
-                let port = u32_at(at);
-                if port != 0 && port < 0x1_0000 {
-                    let _ = hw.ports.push((port, len.max(1)));
-                }
+            let sleep = trust::fadt_sleep(f);
+            for &r in sleep.ports.iter() {
+                hw.ports.must_push(r);
             }
-            // X_PM1a/b_CNT_BLK and X_PM2_CNT_BLK in I/O space (space 1).
-            for at in [172, 184, 196] {
-                let addr = f.get(at + 4..at + 12).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
-                if u8_at(at) == 1 && addr != 0 && addr < 0x1_0000 {
-                    let _ = hw.ports.push((addr as usize, (u8_at(at + 1) / 8).max(1)));
-                }
+            for &r in sleep.mmio.iter() {
+                hw.sleep.must_push(r);
             }
         }
         // Every ECAM window, or the AML writes no memory: a write into
@@ -742,7 +737,8 @@ pub fn done(h: &mut Host, id: usize) {
 ///   a machine split into partitions, only where it is known to be no
 ///   partition's memory (`partition_allows`).  Never the HPET's, the
 ///   I/O APICs' or the local APICs' registers (trust::HPET_DEFAULT,
-///   trust::IOAPIC_DEFAULT, trust::LAPIC_MSI, the MADT's I/O APICs);
+///   trust::IOAPIC_DEFAULT, trust::LAPIC_MSI, the MADT's I/O APICs), nor
+///   the FADT's sleep registers there (trust::fadt_sleep);
 /// - I/O ports seL4 has not issued, other than those that reset the
 ///   machine, put it to sleep, enter SMM or program the legacy interrupt
 ///   controllers and timer (trust::HW_REFUSED_PORTS);
@@ -754,7 +750,8 @@ pub fn done(h: &mut Host, id: usize) {
 ///   (trust::hw_config_write_protected), so that the AML neither moves a
 ///   device onto another's addresses nor lets one master the bus, nor
 ///   turns off ACS, nor enables SR-IOV or ATS, nor to the MSI and MSI-X
-///   capabilities (`msi_cap`), and in
+///   capabilities, nor to PCI Express's (phantom functions, No Snoop,
+///   FLR) or power management's (D3hot) (`cap_protected`), and in
 ///   memory never to an MSI-X table or its pending bits
 ///   (pci::MSIX_BLOCKS): a function the firmware left mastering the bus
 ///   would send the AML's message as an interrupt, where none is
@@ -795,6 +792,9 @@ fn hw_access(h: &mut Host, op: u64, addr: usize, off: usize, width: usize, value
             if hw.mmio.iter().any(|&(base, size)| trust::hw_meets(addr, width, base, size)) {
                 return Err("the HPET or an APIC, whose interrupts the IOMMU does not remap");
             }
+            if hw.sleep.iter().any(|&(base, size)| trust::hw_meets(addr, width, base, size)) {
+                return Err("a register that puts the machine to sleep or turns it off");
+            }
             if write {
                 if !hw.ecam_complete {
                     return Err("a memory write, with more ECAM windows than root knows");
@@ -820,8 +820,8 @@ fn hw_access(h: &mut Host, op: u64, addr: usize, off: usize, width: usize, value
                     if segment != 0 || managed(h, b, d, f) {
                         return Err("configuration of a function root manages");
                     }
-                    if msi_cap(h, b, d, f, o, width) {
-                        return Err("a function's MSI or MSI-X capability");
+                    if cap_protected(h, b, d, f, o, width) {
+                        return Err("a function's MSI, MSI-X, PCI Express or power management capability");
                     }
                 }
             }
@@ -861,8 +861,8 @@ fn hw_access(h: &mut Host, op: u64, addr: usize, off: usize, width: usize, value
             if write && managed(h, bus, dev, func) {
                 return Err("configuration of a function root manages");
             }
-            if write && msi_cap(h, bus, dev, func, off, width) {
-                return Err("a function's MSI or MSI-X capability");
+            if write && cap_protected(h, bus, dev, func, off, width) {
+                return Err("a function's MSI, MSI-X, PCI Express or power management capability");
             }
             let (word, shift) = (off as u8 & !3, (off % 4) * 8);
             let old = h.pci.read32(bus, dev, func, word);
@@ -878,10 +878,11 @@ fn hw_access(h: &mut Host, op: u64, addr: usize, off: usize, width: usize, value
 }
 
 /// Whether a configuration write [off, off + width) of bus:dev.func meets
-/// its MSI or MSI-X capability (trust::hw_config_msi).
+/// its MSI, MSI-X, PCI Express or power management capability
+/// (trust::hw_config_cap_protected).
 #[cfg(target_arch = "x86_64")]
-fn msi_cap(h: &Host, bus: u8, dev: u8, func: u8, off: usize, width: usize) -> bool {
-    trust::hw_config_msi(off, width, |i| (h.pci.read32(bus, dev, func, i as u8 & !3) >> (i % 4 * 8)) as u8)
+fn cap_protected(h: &Host, bus: u8, dev: u8, func: u8, off: usize, width: usize) -> bool {
+    trust::hw_config_cap_protected(off, width, |i| (h.pci.read32(bus, dev, func, i as u8 & !3) >> (i % 4 * 8)) as u8)
 }
 
 /// Whether memory [addr, addr + width) may be the AML's on this machine,
