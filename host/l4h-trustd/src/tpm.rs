@@ -4,7 +4,7 @@
 //! (AMD fTPM) and Pluton's doorbells.  Commands are polled: trustd takes no
 //! interrupt.
 
-use core::ptr::{read_volatile, write_volatile};
+use l4h_virtio::Mmio;
 
 use l4h_rt::host;
 use l4h_rt::host::trust::{START_ACPI, START_PLUTON, TPM_TIS, TrustdConfig};
@@ -88,19 +88,19 @@ const REQ_IDLE: u32 = 0x02;
 const STS_FATAL: u32 = 0x01;
 
 fn r8(a: usize) -> u8 {
-    unsafe { read_volatile(a as *const u8) }
+    Mmio(a).r8(0)
 }
 
 fn w8(a: usize, v: u8) {
-    unsafe { write_volatile(a as *mut u8, v) }
+    Mmio(a).w8(0, v)
 }
 
 fn r32(a: usize) -> u32 {
-    unsafe { read_volatile(a as *const u32) }
+    Mmio(a).r32(0)
 }
 
 fn w32(a: usize, v: u32) {
-    unsafe { write_volatile(a as *mut u32, v) }
+    Mmio(a).w32(0, v)
 }
 
 impl Tpm {
@@ -282,7 +282,7 @@ impl Tpm {
         }
         w32(ctrl + CRB_CTRL_CANCEL, 0);
         for (i, &b) in self.cbuf[..cmd].iter().enumerate() {
-            unsafe { write_volatile((self.cmd.0 + i) as *mut u8, b) };
+            w8(self.cmd.0 + i, b);
         }
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         // The start register, also with the other start methods (the
@@ -294,7 +294,7 @@ impl Tpm {
         self.doorbell(false)?;
         self.wait("response", |_| r32(ctrl + CRB_CTRL_START) & 1 == 0)?;
         let base = self.rsp.0;
-        let byte = |i: usize| unsafe { read_volatile((base + i) as *const u8) };
+        let byte = |i: usize| r8(base + i);
         for (i, b) in self.rbuf[..10].iter_mut().enumerate() {
             *b = byte(i);
         }
