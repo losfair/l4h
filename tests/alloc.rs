@@ -638,3 +638,49 @@ fn a_given_up_load_frees_its_frames_slots() {
         assert_eq!(alloc.slots.available(), slots, "round {round}: slots leaked");
     }
 }
+
+/// A NIC's DMA region (root's nicd.rs, alloc_dma): an Untyped of its own,
+/// all frames, and the CNode of those frames from an arena of its own.
+/// When either does not fit, nothing is kept and nothing panics: the
+/// CNode came from the global pool, whose allocation panicked once the
+/// region had taken the memory, and with it root.
+#[test]
+fn a_dma_region_that_does_not_fit_keeps_nothing() {
+    let new = |boot: &BootInfo| mem::Alloc::new(
+        mem::Slots::new(Cap::from_bits(51), Box::leak(Box::new(mem::SlotStorage::<64, 4096>::new())), 64..4096),
+        Box::leak(Box::new(mem::AllocStorage::new())),
+        boot,
+    );
+    // Only disjoint 2 MiB blocks: no 4 MiB region.
+    let mut alloc = new(&BootInfo((0..16).map(|i| Desc { paddr: (64 << 20) + i * (4 << 20), bits: 21 }).collect()));
+    let (slots, free) = (alloc.slots.available(), alloc.free_bytes());
+    assert!(alloc.dma_frames(22, false, &ObjectBlueprint::Frame).is_none());
+    assert_eq!((alloc.slots.available(), alloc.free_bytes()), (slots, free));
+    // The region fits, the CNode of its frames does not: a 2 MiB block and
+    // nothing else, again and again.
+    let mut alloc = alloc.renew(&BootInfo(vec![Desc { paddr: 64 << 20, bits: 21 }]));
+    let (slots, free) = (alloc.slots.available(), alloc.free_bytes());
+    for round in 0..4 {
+        assert!(alloc.dma_frames(21, false, &ObjectBlueprint::Frame).is_none(), "round {round}");
+        assert_eq!((alloc.slots.available(), alloc.free_bytes()), (slots, free), "round {round}");
+    }
+    // A region smaller than its frames is no region.
+    assert!(alloc.dma_frames(11, false, &ObjectBlueprint::Frame).is_none());
+    // Room for it: a 4 MiB region, its 1024 frames in a CNode of 1024
+    // slots, given back (by a caller that gives up) to what there was.
+    let mut alloc = alloc.renew(&BootInfo(vec![Desc { paddr: 1 << 30, bits: 26 }]));
+    // Counted from the end of the first round, which splits blocks whose
+    // parents keep slots.
+    let (mut slots, mut free) = (0, 0);
+    for round in 0..8 {
+        RETYPES.with_borrow_mut(Vec::clear);
+        let d = alloc.dma_frames(22, false, &ObjectBlueprint::Frame).unwrap();
+        assert_eq!((d.frames_bits, d.paddr % (4 << 20)), (10, 0));
+        RETYPES.with_borrow(|v| assert!(v.contains(&(d.frames as u64)), "frames go to their CNode"));
+        alloc.release_objects(d.arena, &[d.frames]);
+        if round == 0 {
+            (slots, free) = (alloc.slots.available(), alloc.free_bytes());
+        }
+        assert_eq!((alloc.slots.available(), alloc.free_bytes()), (slots, free), "round {round}");
+    }
+}

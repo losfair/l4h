@@ -458,6 +458,17 @@ class Evidence(unittest.TestCase):
         self.assertEqual((partition, host["partition"], host["keys_before"]), (1, 1, [0]))
         self.assertIs(type(host["partition"]), int)
 
+    def test_secondary_partition_needs_a_key_chain(self):
+        # Partition 0 quotes first and extends PCR 15 with its key before
+        # serving any other partition: a secondary partition's evidence
+        # with no key before its own (PCR 15 still zero) cannot be.
+        for p in range(1, 8):
+            with self.assertRaisesRegex(a.Fail, "key chain is empty"):
+                self.check(self.evidence(p, []))
+        # Partition 0's own evidence has none, and needs none.
+        key, partition, host = self.check(self.evidence(0, []))
+        self.assertEqual((partition, host["keys_before"]), (0, []))
+
     def test_booleans_are_not_integers(self):
         with self.assertRaisesRegex(a.Fail, "evidence version"):
             self.check(self.evidence(v=True))

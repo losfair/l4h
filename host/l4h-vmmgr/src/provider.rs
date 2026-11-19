@@ -12,8 +12,14 @@ use crate::window::Window;
 
 pub static IMAGE: &[u8] = include_bytes!(env!("L4H_GUEST_PROVIDER"));
 
-pub fn map(g: &mut Guest, alloc: &mut Alloc, win: &mut Window) {
+/// False, with nothing mapped, if the guest's arena cannot grow to hold
+/// the frames and page tables: reserved first, as mapping panics.
+#[must_use]
+pub fn map(g: &mut Guest, alloc: &mut Alloc, win: &mut Window) -> bool {
     assert!(IMAGE.len() <= abi::PROVIDER_MAX as usize && IMAGE.len() >= 32);
+    if !g.reserve(alloc, IMAGE.len().next_multiple_of(4096) + 3 * 4096) {
+        return false;
+    }
     for (i, data) in IMAGE.chunks(4096).enumerate() {
         let frame = g.arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP);
         win.with_frame(&abs(frame), |p| unsafe {
@@ -24,4 +30,5 @@ pub fn map(g: &mut Guest, alloc: &mut Alloc, win: &mut Window) {
         map_frame(&mut g.ctx(alloc), vspace, frame, abi::PROVIDER_VA as usize + i * 4096,
             CapRights::read_only(), VmAttributes::DEFAULT);
     }
+    true
 }

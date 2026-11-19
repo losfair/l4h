@@ -817,6 +817,43 @@ impl Alloc {
         }
     }
 
+    /// A DMA region of 2^bits bytes in an Untyped of its own, all of it
+    /// frames of `bp` (shared ones if `shared`), and the CNode of those
+    /// frames, made from an arena of its own: or None if memory is short
+    /// or too fragmented, with nothing kept.  Not from the global pool,
+    /// whose allocations panic.  The caller keeps the result's arena for
+    /// as long as the region, or gives both back with `release_objects`
+    /// (arena, [frames]).
+    pub fn dma_frames(&mut self, bits: usize, shared: bool, bp: &ObjectBlueprint) -> Option<DmaFrames> {
+        let pages = 1usize << bits.checked_sub(bp.physical_size_bits())?;
+        let frames_bits = (pages.next_power_of_two().trailing_zeros() as usize).max(1);
+        // The region first, the largest: the smallest free block that
+        // holds it, before the CNode's arena splits one.
+        let slot = self.slots.alloc();
+        let Some(mut region) = self.split(bits, slot) else {
+            self.slots.free(slot);
+            return None;
+        };
+        let Some(mut arena) = self.arena(32 << frames_bits) else {
+            let mut alone = Arena::new();
+            alone.own(slot, region.paddr, bits);
+            self.release(alone);
+            return None;
+        };
+        // The arena's from here: revoked and given back with it.
+        arena.own(slot, region.paddr, bits);
+        let Some(frames) = arena.try_object(self, ObjectBlueprint::CNode { size_bits: frames_bits }) else {
+            self.release(arena);
+            return None;
+        };
+        let dest = Dest::new(sel4::Cap::from_bits(frames as u64), 0);
+        if region.retype_dma(shared, bp, pages, dest).is_none() {
+            self.release_objects(arena, &[frames]);
+            return None;
+        }
+        Some(DmaFrames { paddr: region.paddr, frames, frames_bits, arena })
+    }
+
     /// Carve a per-guest arena of at least `bytes` out of the free blocks.
     pub fn arena(&mut self, bytes: usize) -> Option<Arena> {
         let mut arena = Arena::new();
@@ -864,6 +901,16 @@ const ARENA_REGIONS: usize = 96;
 /// CNode) and the space before it.
 pub const ARENA_TAIL: usize = 32 << 10;
 const ARENA_OWNED: usize = ARENA_REGIONS + 1 + l4h_host::MAX_GUEST_DEVICES;
+
+/// A DMA region and the CNode of its frames (`Alloc::dma_frames`).
+pub struct DmaFrames {
+    pub paddr: usize,
+    /// The CNode of its frames, in a slot of ours: radix `frames_bits`.
+    pub frames: Slot,
+    pub frames_bits: usize,
+    /// The CNode's memory, and the region's Untyped.
+    pub arena: Arena,
+}
 
 /// Untyped memory dedicated to one guest (or host component).
 ///

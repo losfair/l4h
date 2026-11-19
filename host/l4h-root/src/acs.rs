@@ -392,6 +392,42 @@ pub fn other_owner<I: Iterator<Item = u16>>(c: &impl Config, functions: impl Fn(
     Ok(out[..n].iter().copied().find(|&f| endpoint(f) && owner(f) != owner(me)))
 }
 
+/// What a member of a NIC's isolation group is to root, for
+/// `confined_group`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Peer {
+    /// The NIC itself.
+    Me,
+    /// Another NIC root drives: whether it may share the group with this
+    /// one's driver (it has no driver, or the same one).
+    Nic(bool),
+    /// Any other function root found, with its header type (offset 0x0e).
+    Other(u8),
+    /// A function root did not find.
+    Unknown,
+}
+
+/// Whether a NIC whose isolation group (`closure`; u16::MAX for one too
+/// large to check) is `group` is confined: every member is the NIC, a NIC
+/// that may share it, or a bridge.  Bridges take no part in DMA (as for
+/// `other_owner`): they are members only as `group` walks the path.  Any
+/// other function may be a target of the NIC's peer-to-peer requests, or
+/// share its IOMMU domain, whoever owns it: one root left as the firmware
+/// set it up, or found too late to be driven, may decode its BARs and
+/// master the bus all the same.  One root does not know is refused too.
+pub fn confined_group(group: &[u16], peer: impl Fn(u16) -> Peer) -> bool {
+    !group.is_empty()
+        && group.iter().all(|&f| {
+            f != u16::MAX
+                && match peer(f) {
+                    Peer::Me => true,
+                    Peer::Nic(ok) => ok,
+                    Peer::Other(header) => header & 0x7f == 1,
+                    Peer::Unknown => false,
+                }
+        })
+}
+
 /// The names of the bits set in `bits`, for the log.
 pub struct Bits(pub u16);
 

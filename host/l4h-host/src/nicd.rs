@@ -351,6 +351,46 @@ pub fn budget(image_max_bits: u8, firmware: &[usize], bar_pages: usize, dma_page
     Budget { pages, keep_bits, bytes, slots, min_block_bits: keep_bits.max(crate::CNODE_BITS) + 5 }
 }
 
+/// Radix of a CNode with a slot for each of `pages` frames (l4h-root's
+/// blkd::keep_bits).
+pub const fn frames_bits(pages: usize) -> usize {
+    let b = pages.next_power_of_two().trailing_zeros() as usize;
+    if b < 1 { 1 } else { b }
+}
+
+/// What a NIC's first start makes of root besides its nicd's Budget, for
+/// good: its channel (`chan_pages`, if not made yet) with netd's mapping
+/// of it, and its DMA region (`dma_pages`, if not made yet) with the
+/// CNode of its frames and the IOMMU's page tables.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Setup {
+    pub bytes: usize,
+    /// The largest single object: the DMA region, or a frames CNode.
+    pub min_block_bits: usize,
+}
+
+pub fn setup(chan_pages: Option<usize>, dma_pages: Option<usize>) -> Setup {
+    const PAGE: usize = 4096;
+    // Page tables mapping `pages` contiguous pages, and a directory and a
+    // pointer table at either end.
+    let tables = |pages: usize| (pages.div_ceil(512) + 3) * PAGE;
+    let (mut bytes, mut min_block_bits) = (0, 0);
+    if let Some(pages) = chan_pages {
+        let bits = frames_bits(pages);
+        // Root's frames and their CNode (as root's arena asks: twice the
+        // CNode and a page, for alignment), netd's keep CNode and page
+        // tables.
+        bytes += pages * PAGE + (64 << bits) + PAGE + (32 << bits) + tables(pages);
+        min_block_bits = min_block_bits.max(bits + 5);
+    }
+    if let Some(pages) = dma_pages {
+        let bits = frames_bits(pages);
+        bytes += pages * PAGE + (32 << bits) + tables(pages);
+        min_block_bits = min_block_bits.max(bits + 5).max((pages * PAGE).trailing_zeros() as usize);
+    }
+    Setup { bytes, min_block_bits }
+}
+
 /// nicd CSpace: its device's IRQ handler, its legacy I/O ports, and netd's
 /// notification (badged badges::netd::UPLINK) for its channel.  A
 /// configuration-space request (`Published::cfg_req`) is signalled on
@@ -538,6 +578,36 @@ mod tests {
     }
 
     use super::*;
+
+    /// What a NIC's first start makes for good, within `setup`: the
+    /// channel's frames and their CNode as root's arena asks for them,
+    /// netd's keep CNode and page tables, the DMA region, its frames'
+    /// CNode and the IOMMU's page tables; nothing once both are made.
+    /// Its largest objects need a block that large.
+    #[test]
+    fn a_setup_covers_what_a_first_start_makes() {
+        const PAGE: usize = 4096;
+        assert_eq!(setup(None, None), Setup { bytes: 0, min_block_bits: 0 });
+        let channels = [crate::uplink::MIN_DATA_BITS, crate::uplink::DEFAULT_DATA_BITS, crate::uplink::MAX_DATA_BITS];
+        for chan in channels {
+            for dma_bits in [MIN_DMA_BITS, 22, MAX_DMA_BITS] {
+                let chan = crate::uplink::channel_size(chan) / PAGE;
+                let dma = (1usize << dma_bits) / PAGE;
+                let tables = |pages: usize| pages.div_ceil(512) * PAGE;
+                let (cb, db) = (frames_bits(chan), frames_bits(dma));
+                assert!(1 << cb >= chan && 1 << db >= dma);
+                let c = setup(Some(chan), None);
+                assert!(c.bytes >= chan * PAGE + (64 << cb) + PAGE + (32 << cb) + tables(chan), "{chan}: {c:?}");
+                assert!(c.min_block_bits >= cb + 5);
+                let d = setup(None, Some(dma));
+                assert!(d.bytes >= dma * PAGE + (32 << db) + tables(dma), "{dma}: {d:?}");
+                assert!(d.min_block_bits >= dma_bits as usize && d.min_block_bits >= db + 5);
+                let both = setup(Some(chan), Some(dma));
+                assert_eq!(both.bytes, c.bytes + d.bytes);
+                assert_eq!(both.min_block_bits, c.min_block_bits.max(d.min_block_bits));
+            }
+        }
+    }
 
     const fn m() -> Manifest {
         Manifest::empty().with_name("test").with_matches(&[PciMatch::id(0x8086, 0x1563), PciMatch {

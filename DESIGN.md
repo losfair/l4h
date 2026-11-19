@@ -2816,8 +2816,13 @@ root restarts. Root and netd know no device kind. The design is issue
   still in cache.
 - **Confinement.** A nicd is outside the TCB (`confined` in `l4hctl nic
   list`) when the IOMMU is on with interrupt remapping and its device's
-  isolation group holds only functions the host does not use or NICs of
-  the same driver. The group follows Linux's: the functions below every
+  isolation group holds, besides bridges (which take no part in DMA),
+  only NICs of the same driver or unbound ones root has stopped: any
+  other endpoint, even one the host does not use (a NIC left to the
+  firmware, or that no driver took at boot, too), is left as the
+  firmware set it up and may decode its BARs or master the bus, so it is
+  a peer the NIC could reach past the IOMMU, or share its domain with. The group follows
+  Linux's: the functions below every
   bridge on the path that does not isolate with ACS (§9.5), those of its
   multi-function siblings, and the other functions of a multi-function
   device without ACS: every function root found in the slot, as only

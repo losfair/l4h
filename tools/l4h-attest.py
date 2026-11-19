@@ -527,6 +527,10 @@ def check_evidence(ev, pins, ak_name, ek_ca):
         want, before = key_chain(ev, partition)
         if partition == 0 and before:
             raise Fail("partition 0's key is not the first of this boot")
+        # Partition 0 quotes and extends its key before serving any other
+        # partition: another's chain starts with it, never empty.
+        if partition != 0 and not before:
+            raise Fail("key chain is empty: partition %d's key cannot be the first of this boot" % partition)
         if pcrs.get(KEY_PCR) != want:
             raise Fail("PCR %d is not the chain of the %d keys before partition %d's" % (KEY_PCR, len(before), partition))
     for i, want in pins.items():
