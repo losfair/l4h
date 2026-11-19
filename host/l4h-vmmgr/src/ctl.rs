@@ -343,7 +343,9 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
             let off = a[1].min(head);
             let start = off.max(head.saturating_sub(host::CONSOLE_RING_DATA as u64));
             let n = (head - start).min(abi::CTL_DATA_MAX as u64) as usize;
-            if let Some(t) = &h.flags { t.act(g, caller, abi::FLAG_CONSOLE_OUT, n != 0)?; }
+            // The answer gives `head` even when it copies nothing: how
+            // much the guest wrote is its output too.
+            if let Some(t) = &h.flags { t.act(g, caller, abi::FLAG_CONSOLE_OUT, head != 0)?; }
             for i in 0..n {
                 let idx = (start as usize + i) % host::CONSOLE_RING_DATA;
                 resp.data[i] = unsafe { addr_of!((*ring).data[idx]).read_volatile() };
