@@ -159,6 +159,7 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
             // Root's free memory and memd's, and ours; the guests are ours.
             resp.vals[1] += h.alloc.local_free_bytes() as u64;
             resp.vals[4] = h.guests.iter().flatten().count() as u64;
+            resp.data[..8].copy_from_slice(&(h.info.topology.physical_cores() as u64).to_le_bytes());
             Ok(())
         }
         abi::CTL_IOMMU_INFO | abi::CTL_DISK_INFO | abi::CTL_BLK_INFO | abi::CTL_SWITCH_CREATE | abi::CTL_SWITCH_ATTACH_UPLINK

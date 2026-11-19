@@ -54,6 +54,15 @@ impl Topology {
         &self.physical[..self.cpus]
     }
 
+    /// Number of distinct physical cores among the online CPUs.
+    pub fn physical_cores(&self) -> usize {
+        self.physical[..self.cpus]
+            .iter()
+            .enumerate()
+            .filter(|&(cpu, &core)| core as usize == cpu)
+            .count()
+    }
+
     pub fn core(&self, cpu: usize) -> usize {
         self.physical[cpu] as usize
     }
@@ -183,6 +192,7 @@ mod tests {
         assert_eq!((0..8).map(|n| t.placement(n)).collect::<Vec<_>>(), [0, 2, 1, 3, 0, 2, 1, 3]);
         assert!(t.same_core(0, 1));
         assert!(!t.same_core(1, 2));
+        assert_eq!(t.physical_cores(), 2);
     }
 
     #[test]
@@ -190,8 +200,12 @@ mod tests {
         let t = Topology::from_ids(&[42, 7, 42, 99, 7, 42]);
         assert_eq!(t.physical(), [0, 1, 0, 3, 1, 0]);
         assert_eq!((0..6).map(|n| t.placement(n)).collect::<Vec<_>>(), [0, 1, 3, 2, 4, 5]);
+        assert_eq!(t.physical_cores(), 3);
         let flat = Topology::flat(4);
         assert_eq!((0..4).map(|n| flat.placement(n)).collect::<Vec<_>>(), [0, 1, 2, 3]);
+        assert_eq!(flat.physical_cores(), 4);
+        let (cpus, physical, order) = t.raw();
+        assert_eq!(Topology::from_raw(cpus, physical, order).physical_cores(), 3);
     }
 
     #[cfg(target_arch = "x86_64")]

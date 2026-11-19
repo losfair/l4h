@@ -300,6 +300,8 @@ pub struct CtlSync {
     pub done: u32,
 }
 
+/// -> vals: cores, free bytes, total bytes, nr disks, nr vms, nr NICs;
+/// data[0..8]: physical cores (u64, little-endian; 0 on older hosts).
 pub const CTL_HOST_INFO: u32 = 1;
 pub const CTL_VM_CREATE: u32 = 2;
 pub const CTL_VM_LOAD: u32 = 3;
