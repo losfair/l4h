@@ -196,6 +196,7 @@ const USAGE: &str = "usage: l4hctl <command>
                                there (default 60 s)
   cores VM                     host core of each vCPU of VM
   top                          CPU use of each VM
+  cpus                         CPU use of each host core, by the VMs on it
   nics | nic list              host NICs: driver, state, trust
   nic bind NIC [DRIVER]        drive NIC with DRIVER (default: the first
                                driver that matches); rebinds a bound NIC
@@ -965,6 +966,27 @@ fn run(args: &[String]) -> Result<i32> {
                     );
                     first = vm.id as u64 + 1;
                 }
+            }
+        }
+        "cpus" => {
+            // Each host core's guest load over the last balancer period:
+            // the vCPUs and VMMs placed on it, by VM.
+            let cores = ctl.host_info()?.cores as usize;
+            let mut by_core: Vec<Vec<(String, u64)>> = vec![Vec::new(); cores];
+            for vm in ctl.vm_list()?.into_iter().filter(|v| v.state == VM_RUNNING) {
+                let stats = ctl.vm_vcpu_stats(vm.id)?;
+                for (core, used) in stats.per_core(cores).into_iter().enumerate() {
+                    if used > 0 {
+                        by_core[core].push((vm.name.clone(), used));
+                    }
+                }
+            }
+            println!("{:>4} {:>6}  {}", "CORE", "CPU%", "VMS");
+            for (core, vms) in by_core.iter_mut().enumerate() {
+                vms.sort_by(|a, b| b.1.cmp(&a.1));
+                let total: u64 = vms.iter().map(|v| v.1).sum();
+                let list: Vec<String> = vms.iter().map(|(n, u)| format!("{n}:{:.1}", *u as f64 / 10.0)).collect();
+                println!("{:>4} {:>6.1}  {}", core, total as f64 / 10.0, list.join(" "));
             }
         }
         "cores" => {

@@ -475,6 +475,25 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
             resp.vals[3] = hp.plugged as u64 * hp_size;
             Ok(())
         }
+        abi::CTL_VM_VCPU_STATS => {
+            let g = h.guest(vm_arg(a[0])?).ok_or(ENOENT)?;
+            let first = usize::try_from(a[1]).map_err(|_| EINVAL)?;
+            let sz = core::mem::size_of::<abi::CtlVcpuStat>();
+            let mut n = 0;
+            for v in g.vcpus.iter().skip(first).take(abi::CTL_DATA_MAX / sz) {
+                let s = abi::CtlVcpuStat { core: v.core as u32, usage: v.usage, steal_ns: v.steal_ns };
+                unsafe {
+                    core::ptr::copy_nonoverlapping(&s as *const abi::CtlVcpuStat as *const u8, resp.data.as_mut_ptr().add(n * sz), sz);
+                }
+                n += 1;
+            }
+            resp.vals[0] = n as u64;
+            (resp.vals[1], resp.vals[2]) = match (g.vmm.is_some() && g.state != State::Stopped, g.vmm_limits) {
+                (true, Some((core, _))) => (core as u64, g.vmm_usage as u64),
+                _ => (u64::MAX, u64::MAX),
+            };
+            Ok(())
+        }
         abi::CTL_VM_INFO => {
             let g = h.guest(vm_arg(a[0])?).ok_or(ENOENT)?;
             for (v, vcpu) in g.vcpus.iter().take(6).enumerate() {
