@@ -146,6 +146,15 @@ typedef int64_t l4h_s64;
  * nr_ept_roots is also how the guest learns whether it has. */
 #define L4H_SLOT_EPT_POOL       644
 #define L4H_MAX_EPT_ROOTS       8
+/* On aarch64 the EPT pool holds Stage-2 VSpace roots
+ * (seL4_ARM_Stage2VSpaceObject) instead.  With a GICv2 host
+ * (arm_virt.gic_version == 2, arm_virt.gicv_size >= 8192), root slot
+ * L4H_SLOT_GICV is a CNode whose slots [0, L4H_GICV_PAGES) hold the 4 KiB
+ * device frames of the GICv2 virtual CPU interface (GICV), for the guest's
+ * KVM to map into its VMs' Stage-2 space.  Empty otherwise. */
+#define L4H_SLOT_GICV           645
+#define L4H_GICV_PAGES          2
+#define L4H_GICV_CPTR(i)        L4H_CPTR2(L4H_SLOT_GICV, i)
 
 /* Root slots [L4H_SLOT_DYN_BASE, 4096) are free for the guest. */
 #define L4H_SLOT_DYN_BASE       1024
@@ -285,6 +294,26 @@ struct l4h_dev_desc {
 	l4h_u64 data_size;
 };
 
+/* What the guest's KVM needs to know of the host's EL2 (FL4's
+ * SEL4_BOOTINFO_HEADER_AARCH64_VIRT_INFO, without the GICV address). */
+#define L4H_ARM_VIRT_READY      (1ull << 0)
+#define L4H_ARM_VIRT_EL2_VHE    (1ull << 1)
+#define L4H_ARM_VIRT_VMID16     (1ull << 2)
+
+struct l4h_arm_virt_info {
+	l4h_u64 flags;          /* L4H_ARM_VIRT_* */
+	l4h_u64 ipa_bits;       /* Stage-2 input address size: 40, 44 or 48 */
+	l4h_u64 gic_version;    /* 2 or 3 */
+	l4h_u64 vgic_vtr;       /* ICH_VTR_EL2 (GICv3) or GICH_VTR (GICv2) */
+	l4h_u64 gicv_size;      /* 0 or 8192: frames in L4H_SLOT_GICV */
+	l4h_u64 midr_el1;
+	l4h_u64 ctr_el0;
+	l4h_u64 id_aa64mmfr0;
+	l4h_u64 id_aa64mmfr1;
+	l4h_u64 id_aa64mmfr2;
+	l4h_u64 id_aa64dfr0;
+	l4h_u64 id_aa64dfr1;
+};
 
 struct l4h_bootinfo {
 	l4h_u64 magic;
@@ -326,7 +355,13 @@ struct l4h_bootinfo {
 	l4h_u64 reserved[3];
 	struct l4h_dev_desc devices[L4H_MAX_DEVICES];
 	char cmdline[L4H_CMDLINE_SIZE];
+	/* aarch64 hardware virtualization (FL4 at EL2); all zero on x86_64
+	 * or without it. */
+	struct l4h_arm_virt_info arm_virt;
 };
+
+_Static_assert(sizeof(struct l4h_arm_virt_info) == 96, "l4h_arm_virt_info layout");
+_Static_assert(sizeof(struct l4h_bootinfo) <= L4H_BOOTINFO_SIZE, "l4h_bootinfo fits its page");
 
 #define L4H_BOOT_DOM0           (1ull << 0)
 

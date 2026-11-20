@@ -70,6 +70,9 @@ int l4h_cnode_revoke(unsigned long cap, int depth);
 #define L4H_PROT_DEFER_FLUSH	8
 /* Native 2 MiB leaf; also selects the ARM instruction-cache range. */
 #define L4H_PROT_LARGE		16
+/* Device memory (non-cacheable), for Stage-2 maps of device frames such
+ * as GICv2's GICV (l4h_arm_s2_map_frame). */
+#define L4H_PROT_DEVICE		32
 int l4h_page_map(unsigned long frame, unsigned long vspace, unsigned long va, int prot);
 /* `n` 4 KiB aliases of large `frame` from byte `offset`, into slots like
  * l4h_retype()'s. */
@@ -238,6 +241,143 @@ void l4h_vcpu_enter(struct l4h_vmexit *x, unsigned long rip, unsigned long contr
 		    unsigned long intr_info);
 int l4h_ept_map_table(int level, unsigned long table, unsigned long ept, unsigned long gpa);
 int l4h_ept_map_frame(unsigned long frame, unsigned long ept, unsigned long gpa, int writable);
+
+/* ---- FL4 VCPUs and Stage-2 (AArch64 at EL2, arch/l4h/kvm on arm64;
+ * L4H_PROVIDER_ARM_VIRT).  The provider translates these to FL4's
+ * seL4_ARM_VCPU and Stage-2 invocations. */
+
+/* VCPU registers: FL4's seL4_VCPUReg numbering. */
+enum {
+	L4H_ARM_VCPUREG_SCTLR = 0,
+	L4H_ARM_VCPUREG_CPACR = 1,
+	L4H_ARM_VCPUREG_TCR = 2,
+	L4H_ARM_VCPUREG_TTBR0 = 3,
+	L4H_ARM_VCPUREG_TTBR1 = 4,
+	L4H_ARM_VCPUREG_MAIR = 5,
+	L4H_ARM_VCPUREG_AMAIR = 6,
+	L4H_ARM_VCPUREG_CIDR = 7,
+	L4H_ARM_VCPUREG_AFSR0 = 8,
+	L4H_ARM_VCPUREG_AFSR1 = 9,
+	L4H_ARM_VCPUREG_ESR = 10,
+	L4H_ARM_VCPUREG_FAR = 11,
+	L4H_ARM_VCPUREG_PAR = 12,
+	L4H_ARM_VCPUREG_VBAR = 13,
+	L4H_ARM_VCPUREG_TPIDR_EL1 = 14,
+	L4H_ARM_VCPUREG_VMPIDR_EL2 = 15,
+	L4H_ARM_VCPUREG_SP_EL1 = 16,
+	L4H_ARM_VCPUREG_ELR_EL1 = 17,
+	L4H_ARM_VCPUREG_SPSR_EL1 = 18,
+	L4H_ARM_VCPUREG_CSSELR_EL1 = 19,
+	L4H_ARM_VCPUREG_VDISR_EL2 = 20,
+	L4H_ARM_VCPUREG_CNTV_CTL = 21,
+	L4H_ARM_VCPUREG_CNTV_CVAL = 22,
+	L4H_ARM_VCPUREG_CNTVOFF = 23,
+	L4H_ARM_VCPUREG_CNTKCTL_EL1 = 24,
+	L4H_ARM_VCPUREG_VPIDR_EL2 = 25,
+	L4H_ARM_VCPUREG_HCR_EL2 = 26,
+	L4H_ARM_VCPUREG_VSESR_EL2 = 27,
+	L4H_ARM_VCPUREG_ACTLR_EL1 = 28,
+	L4H_ARM_VCPUREG_MDSCR_EL1 = 29,
+	L4H_ARM_VCPUREG_MDCCINT_EL1 = 30,
+	L4H_ARM_VCPUREG_FAR_EL2 = 31,
+	L4H_ARM_VCPUREG_HPFAR_EL2 = 32,
+	L4H_ARM_VCPUREG_ESR_EL2 = 33,
+	L4H_ARM_VCPUREG_VGIC_VTR = 34,
+	L4H_ARM_VCPUREG_VGIC_HCR = 35,
+	L4H_ARM_VCPUREG_VGIC_VMCR = 36,
+	L4H_ARM_VCPUREG_VGIC_MISR = 37,
+	L4H_ARM_VCPUREG_VGIC_EISR = 38,
+	L4H_ARM_VCPUREG_VGIC_ELRSR = 39,
+	L4H_ARM_VCPUREG_VGIC_AP0R0 = 40,
+	L4H_ARM_VCPUREG_VGIC_AP0R1 = 41,
+	L4H_ARM_VCPUREG_VGIC_AP0R2 = 42,
+	L4H_ARM_VCPUREG_VGIC_AP0R3 = 43,
+	L4H_ARM_VCPUREG_VGIC_AP1R0 = 44,
+	L4H_ARM_VCPUREG_VGIC_AP1R1 = 45,
+	L4H_ARM_VCPUREG_VGIC_AP1R2 = 46,
+	L4H_ARM_VCPUREG_VGIC_AP1R3 = 47,
+	L4H_ARM_VCPUREG_VGIC_LR0 = 48,
+	L4H_ARM_VCPUREG_VGIC_LR1 = 49,
+	L4H_ARM_VCPUREG_VGIC_LR2 = 50,
+	L4H_ARM_VCPUREG_VGIC_LR3 = 51,
+	L4H_ARM_VCPUREG_VGIC_LR4 = 52,
+	L4H_ARM_VCPUREG_VGIC_LR5 = 53,
+	L4H_ARM_VCPUREG_VGIC_LR6 = 54,
+	L4H_ARM_VCPUREG_VGIC_LR7 = 55,
+	L4H_ARM_VCPUREG_VGIC_LR8 = 56,
+	L4H_ARM_VCPUREG_VGIC_LR9 = 57,
+	L4H_ARM_VCPUREG_VGIC_LR10 = 58,
+	L4H_ARM_VCPUREG_VGIC_LR11 = 59,
+	L4H_ARM_VCPUREG_VGIC_LR12 = 60,
+	L4H_ARM_VCPUREG_VGIC_LR13 = 61,
+	L4H_ARM_VCPUREG_VGIC_LR14 = 62,
+	L4H_ARM_VCPUREG_VGIC_LR15 = 63,
+	L4H_ARM_VCPUREG_NR = 64,
+};
+
+/* l4h_arm_vcpu_read_state/write_state: the groups of struct
+ * l4h_arm_vcpu_state they transfer. */
+#define L4H_ARM_VCPU_STATE_EL1_SYSREGS	(1ull << 0)
+#define L4H_ARM_VCPU_STATE_HYP		(1ull << 1)
+#define L4H_ARM_VCPU_STATE_TIMER	(1ull << 2)
+#define L4H_ARM_VCPU_STATE_VGIC		(1ull << 3)
+#define L4H_ARM_VCPU_STATE_GPRS		(1ull << 4)
+#define L4H_ARM_VCPU_STATE_ALL		0x1full
+
+/* A VCPU's state in a RAM frame, at a 64-byte aligned offset: FL4's
+ * seL4_ARM_VCPUState.  regs[] by L4H_ARM_VCPUREG_*; gprs[] X0..X30,
+ * SP_EL0, ELR_EL1 (PC), SPSR_EL1, FAULT_IP, TPIDR_EL0, TPIDRRO_EL0. */
+struct l4h_arm_vcpu_state {
+	l4h_u64 regs[64];
+	l4h_u64 gprs[37];
+	l4h_u64 vppi_masked;
+	l4h_u64 reserved[26];
+};
+_Static_assert(sizeof(struct l4h_arm_vcpu_state) == 1024, "l4h_arm_vcpu_state layout");
+
+/* Why l4h_arm_vcpu_run returned. */
+enum l4h_arm_vcpu_stop {
+	L4H_ARM_STOP_NONE = 0,
+	L4H_ARM_STOP_VMFAULT,		/* Stage-2 abort: ipa, esr, is_prefetch */
+	L4H_ARM_STOP_VCPUFAULT,		/* trapped instruction: esr (ESR_EL2) */
+	L4H_ARM_STOP_VGIC_MAINT,	/* VGIC maintenance: vgic_idx if valid */
+	L4H_ARM_STOP_VPPI,		/* virtual PPI (timer): vppi_irq */
+	L4H_ARM_STOP_INTERRUPT,		/* an event of this vCPU stopped the guest */
+	L4H_ARM_STOP_OTHER,		/* another fault */
+};
+
+struct l4h_arm_vmexit {
+	int stop;		/* enum l4h_arm_vcpu_stop */
+	int is_prefetch;
+	int vgic_idx_valid;
+	unsigned int vgic_idx;
+	unsigned long esr;
+	unsigned long ipa;
+	unsigned long fault_ip;
+	unsigned long vppi_irq;
+};
+
+int l4h_arm_vcpu_set_tcb(unsigned long vcpu, unsigned long tcb);
+int l4h_arm_vcpu_read_reg(unsigned long vcpu, unsigned long field, unsigned long *val);
+int l4h_arm_vcpu_write_reg(unsigned long vcpu, unsigned long field, unsigned long val);
+int l4h_arm_vcpu_inject_irq(unsigned long vcpu, unsigned int virq, unsigned int prio,
+			    unsigned int group, unsigned int index);
+int l4h_arm_vcpu_ack_vppi(unsigned long vcpu, unsigned long irq);
+/* Bulk state (L4H_ARM_VCPU_STATE_* groups in `mask`) to or from the
+ * struct l4h_arm_vcpu_state at `offset` in RAM frame `frame`. */
+int l4h_arm_vcpu_read_state(unsigned long vcpu, unsigned long frame, unsigned long offset,
+			    unsigned long mask);
+int l4h_arm_vcpu_write_state(unsigned long vcpu, unsigned long frame, unsigned long offset,
+			     unsigned long mask);
+/* A Stage-2 page table (L4H_OBJ_EPT_*) into `s2_root` (an L4H_SLOT_EPT_POOL
+ * root) at `ipa`, and a frame with L4H_PROT_* rights. */
+int l4h_arm_s2_map_table(unsigned long table, unsigned long s2_root, unsigned long ipa);
+int l4h_arm_s2_map_frame(unsigned long frame, unsigned long s2_root, unsigned long ipa, int prot);
+/* Run the guest TCB `u` (bound to a VCPU, its VSpace a Stage-2 root) on this
+ * vCPU, as l4h_user_run does a user context, until it faults or an event
+ * of this vCPU arrives.  Its registers are the VCPU's state
+ * (l4h_arm_vcpu_write_state), not gp[].  Returns x->stop. */
+int l4h_arm_vcpu_run(struct l4h_uctx *u, struct l4h_arm_vmexit *x);
 
 /* ---- events, timers, idle */
 unsigned long long l4h_rdtsc(void);

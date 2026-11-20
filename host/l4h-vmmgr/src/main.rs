@@ -81,6 +81,12 @@ pub struct HostInfo {
     pub vtx: bool,
     /// AArch64 feature ID registers for the guests' bootinfo.
     pub cpu_id: [u64; 5],
+    /// AArch64 hardware virtualization for the guests' bootinfo
+    /// (VmmgrConfig::arm_virt); all zero on x86_64.
+    pub arm_virt: l4h_abi::ArmVirtInfo,
+    /// GICv2's GICV frames are at proto::SLOT_GICV_FRAMES, for the guests'
+    /// abi::SLOT_GICV (VmmgrConfig::has_gicv_frames).
+    pub has_gicv_frames: bool,
     /// vmmgr's endpoint: VMMs call it, guest kernels fault to it.
     pub hyp_ep: cap::Endpoint,
     pub timeslice_us: u64,
@@ -600,6 +606,8 @@ fn main(info: &'static Info) -> ! {
         tsc_hz: cfg.tsc_hz,
         vtx: cfg.vtx != 0,
         cpu_id: cfg.cpu_id,
+        arm_virt: cfg.arm_virt,
+        has_gicv_frames: cfg.has_gicv_frames != 0,
         hyp_ep: cap::Endpoint::from_bits(host::SLOT_SERVICE_EP),
         timeslice_us: cfg.timeslice_us,
         epoch_ns: cfg.epoch_ns,

@@ -62,6 +62,8 @@ pub const SLOT_VSPACE_POOL: usize = 640;
 pub const SLOT_DEV_CNODE: usize = 641;
 pub const SLOT_EPT_POOL: usize = 644;
 pub const MAX_EPT_ROOTS: usize = 8;
+pub const SLOT_GICV: usize = 645;
+pub const GICV_PAGES: usize = 2;
 pub const SLOT_DYN_BASE: usize = 1024;
 
 pub const SPECIAL_BASE: u64 = 0x0000_7ff0_0000_0000;
@@ -151,6 +153,27 @@ pub struct DevDesc {
     pub data_size: u64,
 }
 
+pub const ARM_VIRT_READY: u64 = 1 << 0;
+pub const ARM_VIRT_EL2_VHE: u64 = 1 << 1;
+pub const ARM_VIRT_VMID16: u64 = 1 << 2;
+
+/// `struct l4h_arm_virt_info`.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct ArmVirtInfo {
+    pub flags: u64,
+    pub ipa_bits: u64,
+    pub gic_version: u64,
+    pub vgic_vtr: u64,
+    pub gicv_size: u64,
+    pub midr_el1: u64,
+    pub ctr_el0: u64,
+    pub id_aa64mmfr0: u64,
+    pub id_aa64mmfr1: u64,
+    pub id_aa64mmfr2: u64,
+    pub id_aa64dfr0: u64,
+    pub id_aa64dfr1: u64,
+}
 
 #[repr(C)]
 pub struct BootInfo {
@@ -182,6 +205,7 @@ pub struct BootInfo {
     pub reserved: [u64; 3],
     pub devices: [DevDesc; MAX_DEVICES],
     pub cmdline: [u8; CMDLINE_SIZE],
+    pub arm_virt: ArmVirtInfo,
 }
 
 pub const BOOT_DOM0: u64 = 1 << 0;
@@ -604,9 +628,11 @@ const _: () = assert!(core::mem::size_of::<AttestFlags>() == 64);
 const _: () = assert!(core::mem::size_of::<DevDesc>() == 48);
 const _: () = assert!(
     core::mem::size_of::<BootInfo>()
-        == 32 * 8 + MAX_DEVICES * 48 + CMDLINE_SIZE
-
+        == 32 * 8 + MAX_DEVICES * 48 + CMDLINE_SIZE + 96
 );
+const _: () = assert!(core::mem::size_of::<ArmVirtInfo>() == 96);
+const _: () = assert!(core::mem::offset_of!(BootInfo, cmdline) == 32 * 8 + MAX_DEVICES * 48);
+const _: () = assert!(core::mem::offset_of!(BootInfo, arm_virt) == 32 * 8 + MAX_DEVICES * 48 + CMDLINE_SIZE);
 const _: () = assert!(core::mem::size_of::<BootInfo>() as u64 <= BOOTINFO_SIZE);
 const _: () = assert!(core::mem::size_of::<VirtioRegs>() == 88 + 16 * 40);
 const _: () = assert!(core::mem::size_of::<VirtioRegs>() <= VIRTIO_CONFIG_OFF);
@@ -890,4 +916,43 @@ pub mod usb {
     const _: () = assert!(core::mem::offset_of!(XferReq, segs) == 64);
     const _: () = assert!(core::mem::offset_of!(Cqe, iso) == 64);
     const _: () = assert!(core::mem::offset_of!(Info, usbd_waiting) == 64);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::mem::{offset_of, size_of};
+
+    #[test]
+    fn arm_virt_info_layout() {
+        assert_eq!(size_of::<ArmVirtInfo>(), 96);
+        assert_eq!(offset_of!(ArmVirtInfo, flags), 0);
+        assert_eq!(offset_of!(ArmVirtInfo, ipa_bits), 8);
+        assert_eq!(offset_of!(ArmVirtInfo, gic_version), 16);
+        assert_eq!(offset_of!(ArmVirtInfo, vgic_vtr), 24);
+        assert_eq!(offset_of!(ArmVirtInfo, gicv_size), 32);
+        assert_eq!(offset_of!(ArmVirtInfo, midr_el1), 40);
+        assert_eq!(offset_of!(ArmVirtInfo, ctr_el0), 48);
+        assert_eq!(offset_of!(ArmVirtInfo, id_aa64mmfr0), 56);
+        assert_eq!(offset_of!(ArmVirtInfo, id_aa64mmfr1), 64);
+        assert_eq!(offset_of!(ArmVirtInfo, id_aa64mmfr2), 72);
+        assert_eq!(offset_of!(ArmVirtInfo, id_aa64dfr0), 80);
+        assert_eq!(offset_of!(ArmVirtInfo, id_aa64dfr1), 88);
+        assert_eq!(ArmVirtInfo::default().flags | ArmVirtInfo::default().gicv_size, 0);
+    }
+
+    #[test]
+    fn bootinfo_layout() {
+        // The fields before arm_virt keep their offsets (ABI append-only).
+        assert_eq!(offset_of!(BootInfo, cpu_id), 17 * 8);
+        assert_eq!(offset_of!(BootInfo, nr_ept_roots), 26 * 8);
+        assert_eq!(offset_of!(BootInfo, reserved), 29 * 8);
+        assert_eq!(offset_of!(BootInfo, devices), 32 * 8);
+        assert_eq!(offset_of!(BootInfo, cmdline), 32 * 8 + MAX_DEVICES * 48);
+        assert_eq!(offset_of!(BootInfo, arm_virt), 32 * 8 + MAX_DEVICES * 48 + CMDLINE_SIZE);
+        assert_eq!(size_of::<BootInfo>(), 32 * 8 + MAX_DEVICES * 48 + CMDLINE_SIZE + 96);
+        assert!(size_of::<BootInfo>() as u64 <= BOOTINFO_SIZE);
+        assert_eq!(SLOT_GICV, SLOT_EPT_POOL + 1);
+        assert!(SLOT_GICV < SLOT_DYN_BASE);
+    }
 }

@@ -125,6 +125,12 @@ pub struct HostInfo {
     /// The kernel makes VCPU objects: the CPU has VT-x or AMD-V and the
     /// kernel uses it (patches 0038 and 0040).
     pub vtx: bool,
+    /// AArch64 hardware virtualization (FL4 at EL2), as the guests'
+    /// bootinfo has it: zero on x86_64, or without EL2.
+    pub arm_virt: l4h_abi::ArmVirtInfo,
+    /// GICv2's virtual CPU interface (GICV), two 4 KiB device frames,
+    /// for the guests' L4H_SLOT_GICV: with `vtx` on a GICv2 host only.
+    pub gicv_frames: Option<[cap::Granule; l4h_abi::GICV_PAGES]>,
 }
 
 impl HostInfo {
@@ -264,6 +270,68 @@ fn cpu_id(bootinfo: &sel4::BootInfoPtr) -> [u64; 5] {
 #[cfg(target_arch = "x86_64")]
 fn cpu_id(_bootinfo: &sel4::BootInfoPtr) -> [u64; 5] {
     [0; 5]
+}
+
+/// FL4's EL2 virtualization metadata (SEL4_BOOTINFO_HEADER_AARCH64_VIRT_INFO,
+/// seL4_AArch64VirtInfo: 13 words), as the guests' bootinfo has it, and
+/// the physical address of GICv2's GICV (0 if none).  All zero without
+/// the chunk: a kernel at EL1.
+#[cfg(target_arch = "aarch64")]
+fn arm_virt_info(bootinfo: &sel4::BootInfoPtr) -> (l4h_abi::ArmVirtInfo, u64) {
+    const VIRT_INFO: u64 = 11;
+    let Some(c) = l4h_task::bootinfo::extra_chunk(bootinfo, VIRT_INFO).filter(|c| c.len() >= 13 * 8) else {
+        return (l4h_abi::ArmVirtInfo::default(), 0);
+    };
+    let w: [u64; 13] = core::array::from_fn(|i| u64::from_le_bytes(c[8 * i..8 * i + 8].try_into().unwrap()));
+    let info = l4h_abi::ArmVirtInfo {
+        flags: w[0],
+        ipa_bits: w[1],
+        gic_version: w[2],
+        vgic_vtr: w[3],
+        gicv_size: w[5],
+        midr_el1: w[6],
+        ctr_el0: w[7],
+        id_aa64mmfr0: w[8],
+        id_aa64mmfr1: w[9],
+        id_aa64mmfr2: w[10],
+        id_aa64dfr0: w[11],
+        id_aa64dfr1: w[12],
+    };
+    (info, w[4])
+}
+
+/// Whether FL4 makes VCPUs (it runs at EL2), asked by trying, as for VT-x.
+#[cfg(target_arch = "aarch64")]
+fn arm_vcpus(alloc: &mut Alloc, arm_virt: &l4h_abi::ArmVirtInfo) -> bool {
+    arm_virt.flags & l4h_abi::ARM_VIRT_READY != 0
+        && alloc.can_retype_raw(sel4::sys::_object::seL4_ARM_VCPUObject as u64, 12)
+}
+
+/// The two 4 KiB frames of GICv2's GICV for the guests' KVM, or None (and
+/// gicv_size 0 in `arm_virt`) where there are none to give.
+#[cfg(target_arch = "aarch64")]
+fn gicv_frames(
+    alloc: &mut Alloc,
+    devmem: &mut devmem::DevMem,
+    vtx: bool,
+    arm_virt: &mut l4h_abi::ArmVirtInfo,
+    gicv_paddr: u64,
+) -> Option<[cap::Granule; l4h_abi::GICV_PAGES]> {
+    const GICV_BYTES: u64 = (l4h_abi::GICV_PAGES * 4096) as u64;
+    let usable = vtx && arm_virt.gic_version == 2 && gicv_paddr != 0 && arm_virt.gicv_size >= GICV_BYTES;
+    let frames = usable
+        .then(|| devmem.frames(&mut alloc.slots, gicv_paddr as usize, GICV_BYTES as usize))
+        .flatten()
+        .map(|r| core::array::from_fn(|i| devmem::granule(r.start + i)));
+    if frames.is_none() {
+        if usable {
+            log!("l4h-root: no device memory for GICV at {:#x}; guests get no GICv2 VGIC", gicv_paddr);
+        }
+        arm_virt.gicv_size = 0;
+    } else {
+        arm_virt.gicv_size = GICV_BYTES;
+    }
+    frames
 }
 
 /// All state of the root task.
@@ -488,6 +556,35 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     if !partition::secondary() {
         rtc.find_century(bootinfo, &mut acpi::Phys::new(&mut alloc, &mut devmem, &mut wins.a, &mut acpi_frames));
     }
+    // Asked by trying, and a debug kernel prints its refusal on the
+    // serial port itself: asked here, before logd prints anything, the
+    // message cannot land inside a line of host output (§10.4).
+    #[cfg(target_arch = "x86_64")]
+    let (vtx, arm_virt, gicv_frames) = (
+        sel4::sel4_cfg_if! {
+            if #[sel4_cfg(VTX)] {
+                alloc.can_retype(&sel4::ObjectBlueprintArch::VCpu.into())
+            } else {
+                false
+            }
+        },
+        l4h_abi::ArmVirtInfo::default(),
+        None,
+    );
+    #[cfg(target_arch = "aarch64")]
+    let (vtx, arm_virt, gicv_frames) = {
+        let (mut arm_virt, gicv_paddr) = arm_virt_info(bootinfo);
+        let vtx = arm_vcpus(&mut alloc, &arm_virt);
+        let frames = gicv_frames(&mut alloc, &mut devmem, vtx, &mut arm_virt, gicv_paddr);
+        info!(
+            "l4h-root: aarch64 virt={} ipa={} gicv={} vtr={:#x} gicv_frames={}",
+            vtx, arm_virt.ipa_bits, arm_virt.gic_version, arm_virt.vgic_vtr, frames.is_some()
+        );
+        if !vtx {
+            arm_virt = l4h_abi::ArmVirtInfo::default();
+        }
+        (vtx, arm_virt, frames)
+    };
     let info = HostInfo {
         cores,
         topology,
@@ -510,16 +607,9 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         timeslice_us: 5000,
         epoch_ns: if partition::secondary() { partition::epoch_ns(tsc_hz) } else { rtc.read_ns(&mut wins.a) },
         epoch_ticks: rdtsc(),
-        // Asked by trying, and a debug kernel prints its refusal on the
-        // serial port itself: asked here, before logd prints anything, the
-        // message cannot land inside a line of host output (§10.4).
-        vtx: sel4::sel4_cfg_if! {
-            if #[sel4_cfg(all(ARCH_X86_64, VTX))] {
-                alloc.can_retype(&sel4::ObjectBlueprintArch::VCpu.into())
-            } else {
-                false
-            }
-        },
+        vtx,
+        arm_virt,
+        gicv_frames,
     };
     let mut asids = AsidPools::new(slot::ASID_POOL.cap(), 1);
     let dashboard = dashboard::Dashboard::new(bootinfo, &mut alloc, &mut devmem, cfg.fb_console);

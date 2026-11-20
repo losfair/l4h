@@ -898,6 +898,10 @@ impl Guest {
         bi.boot_blocks = self.boot_blocks as u64;
         bi.nr_vspaces = self.vspaces.len() as u64;
         bi.nr_ept_roots = self.nr_ept_roots as u64;
+        bi.arm_virt = host_info.arm_virt;
+        if !host_info.has_gicv_frames {
+            bi.arm_virt.gicv_size = 0;
+        }
         bi.provider_va = abi::PROVIDER_VA;
         bi.provider_size = crate::provider::IMAGE.len() as u64;
         if self.sdk_size != 0 {
@@ -1143,18 +1147,38 @@ pub fn plan(cfg: &GuestConfig, host_info: &HostInfo, kernel: &Kernel) -> Option<
         + (cfg.io_pool / 512 + 2 * PAGE)
         + cfg.vcpus * (16 << 10)
         + cfg.vspaces * PAGE
-        + if host_info.vtx { abi::MAX_EPT_ROOTS * PAGE } else { 0 }
+        + kvm_bytes(host_info)
         + abi::BOOTINFO_SIZE as usize
         + crate::provider::IMAGE.len().next_multiple_of(PAGE) + 3 * PAGE
         + if cfg.dom0 { abi::CTL_LOAD_MAX as usize } else { 0 }
         + vmm::arena_bytes(cfg.io_pool, cfg.vcpus, MAX_GUEST_DEVICES);
     // A slot each: the CNodes, VSpaces and EPT roots, the vCPUs' objects,
     // the boot info and provider frames, and page tables.
-    let slots = 64 + n_l1 + cfg.vspaces + abi::MAX_EPT_ROOTS + cfg.vcpus * 16
+    let slots = 64 + n_l1 + cfg.vspaces + abi::MAX_EPT_ROOTS + abi::GICV_PAGES + cfg.vcpus * 16
         + (abi::BOOTINFO_SIZE as usize + crate::provider::IMAGE.len()).div_ceil(PAGE)
         + (pool_pages + nr_blocks.min(64) * BLOCK_FRAMES).div_ceil(512) + 3 * 16;
     Some(Plan { owned, shared, nr_blocks, pool_gpa, hp_gpa, hp_count, estimate, slots })
 }
+
+/// Host memory for the guest's KVM: its EPT roots (4 KiB EPT PML4s on
+/// x86_64, 8 KiB Stage-2 roots on AArch64), and on a GICv2 host the CNode
+/// of the GICV frames.
+fn kvm_bytes(host_info: &HostInfo) -> usize {
+    if !host_info.vtx {
+        return 0;
+    }
+    #[cfg(target_arch = "aarch64")]
+    let bytes = abi::MAX_EPT_ROOTS * (1 << STAGE2_ROOT_BITS)
+        + if host_info.has_gicv_frames { 32 << abi::ROOT_CNODE_BITS } else { 0 };
+    #[cfg(target_arch = "x86_64")]
+    let bytes = abi::MAX_EPT_ROOTS * PAGE;
+    bytes
+}
+
+/// seL4_ARM_Stage2VSpaceBits: FL4's Stage-2 root, two concatenated 4 KiB
+/// tables (and its ASID).
+#[cfg(target_arch = "aarch64")]
+const STAGE2_ROOT_BITS: usize = 13;
 
 /// Create a guest with no image.  Slots allocated here and in later
 /// operations on the guest must be tracked into `Guest::slots` by the
@@ -1367,6 +1391,38 @@ pub fn create(
                 g.nr_ept_roots = abi::MAX_EPT_ROOTS;
                 g.give_cnode(abi::SLOT_EPT_POOL, ept_cn, guard6.clone());
             }
+        }
+    }
+    // ---- Stage-2 roots for the guest's KVM (FL4 at EL2), and GICv2's
+    // virtual CPU interface for its VMs.
+    #[cfg(target_arch = "aarch64")]
+    if host_info.vtx {
+        let Some(ept_cn) = try_cnode(&mut g.arena, alloc, abi::ROOT_CNODE_BITS) else {
+            return Err(Some(g));
+        };
+        let s2_type = sel4::sys::_object::seL4_ARM_Stage2VSpaceObject as u64;
+        for i in 0..abi::MAX_EPT_ROOTS {
+            let root = g.arena.object_cap_raw::<cap_type::VSpace>(alloc, s2_type, STAGE2_ROOT_BITS);
+            asids.assign(alloc, root);
+            ept_cn
+                .absolute_cptr_from_bits_with_depth(i as u64, abi::ROOT_CNODE_BITS)
+                .copy(&abs(root), CapRights::all())
+                .expect("Stage-2 pool copy");
+        }
+        g.nr_ept_roots = abi::MAX_EPT_ROOTS;
+        g.give_cnode(abi::SLOT_EPT_POOL, ept_cn, guard6.clone());
+        if host_info.has_gicv_frames {
+            let Some(gicv_cn) = try_cnode(&mut g.arena, alloc, abi::ROOT_CNODE_BITS) else {
+                return Err(Some(g));
+            };
+            for i in 0..abi::GICV_PAGES {
+                let frame = cap::Granule::from_bits(proto::SLOT_GICV_FRAMES + i as u64);
+                gicv_cn
+                    .absolute_cptr_from_bits_with_depth(i as u64, abi::ROOT_CNODE_BITS)
+                    .copy(&abs(frame), CapRights::read_write())
+                    .expect("GICV frame copy");
+            }
+            g.give_cnode(abi::SLOT_GICV, gicv_cn, guard6.clone());
         }
     }
     let Some(dev_cn) = try_cnode(&mut g.arena, alloc, abi::ROOT_CNODE_BITS) else {

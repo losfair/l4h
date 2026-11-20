@@ -233,6 +233,8 @@ pub fn spawn(h: &mut Host, modules: &Modules, plan: &Dom0Plan) -> Vmmgr {
         cfg.watchdog_secs = h.cfg.watchdog_secs as u64;
         cfg.trust = h.trustd.is_some() as u64;
         cfg.vtx = h.info.vtx as u64;
+        cfg.arm_virt = h.info.arm_virt;
+        cfg.has_gicv_frames = h.info.gicv_frames.is_some() as u64;
         cfg.modules_radix = radix as u64;
         cfg.modules_pages = pages as u64;
         let mut at = 0;
@@ -295,6 +297,13 @@ pub fn spawn(h: &mut Host, modules: &Modules, plan: &Dom0Plan) -> Vmmgr {
     }
     for (i, &pool) in pools.iter().enumerate() {
         comp.give(proto::SLOT_ASID_POOL + i as u64, pool, CapRights::all());
+    }
+    // The GICv2 virtual CPU interface, which the guests' KVM maps into
+    // its VMs (L4H_SLOT_GICV).
+    if let Some(frames) = h.info.gicv_frames {
+        for (i, f) in frames.into_iter().enumerate() {
+            comp.give(proto::SLOT_GICV_FRAMES + i as u64, f, CapRights::read_write());
+        }
     }
     crate::memd::give_vmmgr(&mut h.alloc, &mut arena, &comp);
 

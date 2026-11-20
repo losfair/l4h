@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * seL4 VCPUs and EPT, for arch/l4h/kvm (x86_64).
+ * seL4 VCPUs and EPT, for arch/l4h/kvm (x86_64), and FL4 VCPUs and
+ * Stage-2 (AArch64).
  */
 #include "private.h"
 #if defined(__x86_64__) && defined(CONFIG_VTX)
@@ -266,6 +267,254 @@ int l4h_ept_map_frame(unsigned long frame, unsigned long ept, unsigned long gpa,
 	(void)gpa;
 	(void)writable;
 	return seL4_IllegalOperation;
+}
+
+#endif
+
+/*
+ * FL4 VCPUs and Stage-2 (AArch64 at EL2), for arch/l4h/kvm on arm64.
+ *
+ * A VM's vCPU is a TCB of the guest kernel's, bound to a VCPU and with a
+ * Stage-2 root (L4H_SLOT_EPT_POOL) as its VSpace.  It runs like a user
+ * context (user.c): this vCPU's kernel thread lends it SC_U and receives
+ * its faults on the vCPU endpoint, through the badged fault endpoint in
+ * u->fault_ep.  Its registers are the VCPU's (l4h_arm_vcpu_write_state),
+ * never gp[].
+ */
+#ifdef L4H_ARM_VIRT
+
+int l4h_arm_vcpu_set_tcb(unsigned long vcpu, unsigned long tcb)
+{
+	return seL4_ARM_VCPU_SetTCB(vcpu, tcb);
+}
+
+int l4h_arm_vcpu_read_reg(unsigned long vcpu, unsigned long field, unsigned long *val)
+{
+	seL4_ARM_VCPU_ReadRegs_t r = seL4_ARM_VCPU_ReadRegs(vcpu, field);
+
+	*val = r.error ? 0 : r.value;
+	return r.error;
+}
+
+int l4h_arm_vcpu_write_reg(unsigned long vcpu, unsigned long field, unsigned long val)
+{
+	return seL4_ARM_VCPU_WriteRegs(vcpu, field, val);
+}
+
+int l4h_arm_vcpu_inject_irq(unsigned long vcpu, unsigned int virq, unsigned int prio,
+			    unsigned int group, unsigned int index)
+{
+	/* The invocation's narrow fields would truncate silently. */
+	if (virq > 0xffff || prio > 0xff || group > 0xff || index > 0xff)
+		return seL4_RangeError;
+	return seL4_ARM_VCPU_InjectIRQ(vcpu, virq, prio, group, index);
+}
+
+int l4h_arm_vcpu_ack_vppi(unsigned long vcpu, unsigned long irq)
+{
+	return seL4_ARM_VCPU_AckVPPI(vcpu, irq);
+}
+
+int l4h_arm_vcpu_read_state(unsigned long vcpu, unsigned long frame, unsigned long offset,
+			    unsigned long mask)
+{
+	return seL4_ARM_VCPU_ReadState(vcpu, frame, offset, mask);
+}
+
+int l4h_arm_vcpu_write_state(unsigned long vcpu, unsigned long frame, unsigned long offset,
+			     unsigned long mask)
+{
+	return seL4_ARM_VCPU_WriteState(vcpu, frame, offset, mask);
+}
+
+int l4h_arm_s2_map_table(unsigned long table, unsigned long s2_root, unsigned long ipa)
+{
+	return seL4_ARM_PageTable_Map(table, s2_root, ipa, seL4_ARM_Default_VMAttributes);
+}
+
+int l4h_arm_s2_map_frame(unsigned long frame, unsigned long s2_root, unsigned long ipa, int prot)
+{
+	seL4_CapRights_t r = (prot & L4H_PROT_WRITE) ? seL4_ReadWrite :
+			     (prot & (L4H_PROT_READ | L4H_PROT_EXEC)) ? seL4_CanRead : seL4_NoRights;
+	seL4_ARM_VMAttributes attr = ((prot & L4H_PROT_DEVICE) ? 0 : seL4_ARM_PageCacheable) |
+				     ((prot & L4H_PROT_EXEC) ? 0 : seL4_ARM_ExecuteNever);
+	int err = seL4_ARM_Page_Map(frame, s2_root, ipa, r, attr);
+
+	/* The guest fetches what its host wrote through the data side. */
+	if (!err && (prot & L4H_PROT_EXEC) && !(prot & L4H_PROT_DEVICE))
+		err = seL4_ARM_Page_Unify_Instruction(frame, 0, (prot & L4H_PROT_LARGE) ? 1ul << 21 : 4096);
+	return err;
+}
+
+int l4h_arm_vcpu_run(struct l4h_uctx *u, struct l4h_arm_vmexit *x)
+{
+	struct l4h_vcpu *v = l4h_this_vcpu();
+	seL4_MessageInfo_t info;
+	seL4_Word badge;
+	unsigned long len;
+
+	l4h_BUG_ON(u->fault_ep_vcpu != v->id);
+	l4h_bind_sc(v, u);
+	switch (u->state) {
+	case L4H_UCTX_FRESH:
+		/* Its registers are the VCPU's, written beforehand. */
+		l4h_BUG_ON(seL4_TCB_Resume(u->tcb));
+		info = seL4_Recv(v->ep, &badge, u->reply);
+		break;
+	case L4H_UCTX_PREEMPTED:
+		/* A fault it raises before we block here is queued on the
+		 * endpoint and received now. */
+		info = seL4_Recv(v->ep, &badge, u->reply);
+		break;
+	case L4H_UCTX_FAULTED:
+		info = seL4_ReplyRecv(v->ep, seL4_MessageInfo_new(0, 0, 0, 0), &badge, u->reply);
+		break;
+	default:
+		panic("l4h_arm_vcpu_run: bad uctx state %d\n", u->state);
+	}
+
+	*x = (struct l4h_arm_vmexit){ 0 };
+	if (!(badge & L4H_EP_BADGE_TASK)) {
+		/* An event preempted the guest: as in l4h_user_run(), take
+		 * SC_U away now, and collect a fault queued meanwhile. */
+		__atomic_or_fetch(&v->ntfn_pending, badge, __ATOMIC_RELEASE);
+		l4h_user_deschedule(u);
+		for (;;) {
+			badge = 0;
+			info = seL4_NBRecv(v->ep, &badge, u->reply);
+			if (!badge || (badge & L4H_EP_BADGE_TASK))
+				break;
+			__atomic_or_fetch(&v->ntfn_pending, badge, __ATOMIC_RELEASE);
+		}
+		if (!(badge & L4H_EP_BADGE_TASK)) {
+			u->state = L4H_UCTX_PREEMPTED;
+			u->stop = L4H_STOP_INTERRUPT;
+			x->stop = L4H_ARM_STOP_INTERRUPT;
+			return x->stop;
+		}
+		/* Report the fault now; the event stays in ntfn_pending. */
+	}
+	if (badge != u->badge)
+		panic("l4h: VM fault from unexpected context %lx (running %lx)\n",
+		      (unsigned long)badge, u->badge);
+
+	u->state = L4H_UCTX_FAULTED;
+	len = seL4_MessageInfo_get_length(info);
+	switch (seL4_MessageInfo_get_label(info)) {
+	case seL4_Fault_VMFault:
+		x->stop = L4H_ARM_STOP_VMFAULT;
+		x->fault_ip = seL4_GetMR(seL4_VMFault_IP);
+		x->ipa = seL4_GetMR(seL4_VMFault_Addr);
+		x->is_prefetch = !!seL4_GetMR(seL4_VMFault_PrefetchFault);
+		x->esr = seL4_GetMR(seL4_VMFault_FSR);
+		break;
+	case seL4_Fault_VCPUFault:
+		x->stop = L4H_ARM_STOP_VCPUFAULT;
+		x->esr = seL4_GetMR(seL4_VCPUFault_HSR);
+		break;
+	case seL4_Fault_VGICMaintenance:
+		x->stop = L4H_ARM_STOP_VGIC_MAINT;
+		x->vgic_idx_valid = len >= 1;
+		x->vgic_idx = len >= 1 ? seL4_GetMR(seL4_VGICMaintenance_IDX) : 0;
+		break;
+	case seL4_Fault_VPPIEvent:
+		x->stop = L4H_ARM_STOP_VPPI;
+		x->vppi_irq = seL4_GetMR(seL4_VPPIEvent_IRQ);
+		break;
+	default:
+		x->stop = L4H_ARM_STOP_OTHER;
+		break;
+	}
+	u->stop = L4H_STOP_EXCEPTION;
+	return x->stop;
+}
+
+#else
+/* Every slot exists, including on providers without FL4's EL2 VCPUs. */
+
+int l4h_arm_vcpu_set_tcb(unsigned long vcpu, unsigned long tcb)
+{
+	(void)vcpu;
+	(void)tcb;
+	return seL4_IllegalOperation;
+}
+
+int l4h_arm_vcpu_read_reg(unsigned long vcpu, unsigned long field, unsigned long *val)
+{
+	(void)vcpu;
+	(void)field;
+	*val = 0;
+	return seL4_IllegalOperation;
+}
+
+int l4h_arm_vcpu_write_reg(unsigned long vcpu, unsigned long field, unsigned long val)
+{
+	(void)vcpu;
+	(void)field;
+	(void)val;
+	return seL4_IllegalOperation;
+}
+
+int l4h_arm_vcpu_inject_irq(unsigned long vcpu, unsigned int virq, unsigned int prio,
+			    unsigned int group, unsigned int index)
+{
+	(void)vcpu;
+	(void)virq;
+	(void)prio;
+	(void)group;
+	(void)index;
+	return seL4_IllegalOperation;
+}
+
+int l4h_arm_vcpu_ack_vppi(unsigned long vcpu, unsigned long irq)
+{
+	(void)vcpu;
+	(void)irq;
+	return seL4_IllegalOperation;
+}
+
+int l4h_arm_vcpu_read_state(unsigned long vcpu, unsigned long frame, unsigned long offset,
+			    unsigned long mask)
+{
+	(void)vcpu;
+	(void)frame;
+	(void)offset;
+	(void)mask;
+	return seL4_IllegalOperation;
+}
+
+int l4h_arm_vcpu_write_state(unsigned long vcpu, unsigned long frame, unsigned long offset,
+			     unsigned long mask)
+{
+	(void)vcpu;
+	(void)frame;
+	(void)offset;
+	(void)mask;
+	return seL4_IllegalOperation;
+}
+
+int l4h_arm_s2_map_table(unsigned long table, unsigned long s2_root, unsigned long ipa)
+{
+	(void)table;
+	(void)s2_root;
+	(void)ipa;
+	return seL4_IllegalOperation;
+}
+
+int l4h_arm_s2_map_frame(unsigned long frame, unsigned long s2_root, unsigned long ipa, int prot)
+{
+	(void)frame;
+	(void)s2_root;
+	(void)ipa;
+	(void)prot;
+	return seL4_IllegalOperation;
+}
+
+int l4h_arm_vcpu_run(struct l4h_uctx *u, struct l4h_arm_vmexit *x)
+{
+	(void)u;
+	(void)x;
+	panic("l4h: ABI provider does not support AArch64 KVM\n");
 }
 
 #endif

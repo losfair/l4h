@@ -8,6 +8,8 @@ const struct l4h_provider l4h_provider_table = {
 	.size = sizeof(struct l4h_provider),
 #if defined(__x86_64__) && defined(CONFIG_VTX)
 	.features = L4H_PROVIDER_VTX,
+#elif defined(L4H_ARM_VIRT)
+	.features = L4H_PROVIDER_ARM_VIRT,
 #endif
 #define L4H_PROVIDER_OP(ret, name, args, call) .name = name,
 #define L4H_PROVIDER_NORETURN(name, args, call) .name = name,

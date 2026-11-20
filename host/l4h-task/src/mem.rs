@@ -282,6 +282,24 @@ impl UtRegion {
         Some(self.paddr + off)
     }
 
+    /// `retype` for an object type rust-sel4 has no blueprint for (FL4's
+    /// AArch64 VCPU and Stage-2 VSpace on a kernel configured without
+    /// hypervisor support): seL4 type number `obj_type`, of 2^size_bits
+    /// bytes, fixed-size (no API size).  Same placement, fan-out and
+    /// watermark as `retype`.
+    pub fn retype_raw(&mut self, obj_type: u64, size_bits: usize, count: usize, dest: Dest) -> Option<usize> {
+        let off = self.fit(size_bits, count)?;
+        let mut done = 0;
+        while done < count {
+            let n = (count - done).min(RETYPE_FAN_OUT);
+            retype_raw(self.cap, obj_type, &dest.cnode, dest.offset + done, n)
+                .unwrap_or_else(|e| panic!("retype type {} x{} failed: {:?}", obj_type, n, e));
+            done += n;
+        }
+        self.used = off + (count << size_bits);
+        Some(self.paddr + off)
+    }
+
     /// `retype` for frames that devices reach by DMA (`bp` is a 4 KiB or
     /// 2 MiB frame): shared with the hypervisor (`crate::retype_shared`)
     /// when `shared` (`Alloc::shared_dma`), ordinary frames otherwise.
@@ -306,6 +324,30 @@ impl UtRegion {
         self.used = off + (count << bits);
         Some(self.paddr + off)
     }
+}
+
+/// seL4_Untyped_Retype of `count` fixed-size objects of seL4 type
+/// `obj_type`, which rust-sel4's ObjectBlueprint cannot name.
+fn retype_raw(
+    untyped: cap::Untyped,
+    obj_type: u64,
+    dst: &sel4::AbsoluteCPtr,
+    dst_offset: usize,
+    count: usize,
+) -> sel4::Result<()> {
+    let err = sel4::with_ipc_buffer_mut(|ipc| {
+        ipc.inner_mut().seL4_Untyped_Retype(
+            untyped.bits(),
+            obj_type,
+            0,
+            dst.root().bits(),
+            dst.path().bits(),
+            dst.path().depth() as u64,
+            dst_offset as u64,
+            count as u64,
+        )
+    });
+    sel4::Error::from_sys(err).map_or(Ok(()), Err)
 }
 
 pub fn cnode_dest(cnode: cap::CNode) -> sel4::AbsoluteCPtr {
@@ -373,6 +415,19 @@ impl<const N: usize> UtPool<N> {
             .min()
             .map(|(_, _, i)| i)?;
         self.regions[idx].retype(bp, count, dest)
+    }
+
+    /// `retype` of fixed-size objects of a raw seL4 type
+    /// (`UtRegion::retype_raw`).
+    pub fn retype_raw(&mut self, obj_type: u64, size_bits: usize, count: usize, dest: Dest) -> Option<usize> {
+        let idx = self
+            .regions
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| r.fit(size_bits, count).map(|off| (off - r.used, r.size_bits, i)))
+            .min()
+            .map(|(_, _, i)| i)?;
+        self.regions[idx].retype_raw(obj_type, size_bits, count, dest)
     }
 }
 
@@ -692,6 +747,18 @@ impl Alloc {
             return false;
         };
         r.cap.untyped_retype(bp, &cnode_dest(self.slots.cnode()), dest, 1).is_ok()
+    }
+
+    /// `can_retype` for a raw seL4 object type of 2^size_bits bytes
+    /// (`UtRegion::retype_raw`): FL4's AArch64 VCPU, which it refuses
+    /// without EL2.
+    pub fn can_retype_raw(&mut self, obj_type: u64, size_bits: usize) -> bool {
+        let ut = self.slots.alloc();
+        let dest = self.slots.alloc();
+        let Some(r) = self.split(size_bits, ut) else {
+            return false;
+        };
+        retype_raw(r.cap, obj_type, &cnode_dest(self.slots.cnode()), dest, 1).is_ok()
     }
 
     /// Allocate a single object into a fresh local slot.
@@ -1046,6 +1113,27 @@ impl Arena {
         self.pool.retype(bp, count, dest)
     }
 
+    /// `retype` of fixed-size objects of a raw seL4 type
+    /// (`UtRegion::retype_raw`), growing the arena as `retype` does.
+    pub fn retype_raw(
+        &mut self,
+        alloc: &mut Alloc,
+        obj_type: u64,
+        size_bits: usize,
+        count: usize,
+        dest: Dest,
+    ) -> Option<usize> {
+        if let Some(p) = self.pool.retype_raw(obj_type, size_bits, count, dest) {
+            return Some(p);
+        }
+        let need = count << size_bits;
+        let eighth = (self.bytes() / 8).max(1).ilog2() as usize;
+        if !self.grow(alloc, need.next_power_of_two().trailing_zeros() as usize, eighth) {
+            return None;
+        }
+        self.pool.retype_raw(obj_type, size_bits, count, dest)
+    }
+
     /// Add a region of 2^bits bytes, preferably `preferred` bits, at
     /// least `minimum` (and ARENA_GROW_BITS): the preferred size may be
     /// unavailable even when a smaller block can satisfy the request, so
@@ -1110,6 +1198,17 @@ impl Arena {
 
     pub fn object_cap<T: sel4::CapType>(&mut self, alloc: &mut Alloc, bp: ObjectBlueprint) -> sel4::Cap<T> {
         let s = self.object(alloc, bp);
+        sel4::Cap::<T>::from_bits(s as u64)
+    }
+
+    /// `object_cap` for a raw seL4 type of 2^size_bits bytes
+    /// (`UtRegion::retype_raw`).
+    pub fn object_cap_raw<T: sel4::CapType>(&mut self, alloc: &mut Alloc, obj_type: u64, size_bits: usize) -> sel4::Cap<T> {
+        let s = alloc.slots.alloc();
+        if self.retype_raw(alloc, obj_type, size_bits, 1, Dest::new(alloc.slots.cnode(), s)).is_none() {
+            alloc.slots.free(s);
+            panic!("out of host memory allocating object type {}", obj_type);
+        }
         sel4::Cap::<T>::from_bits(s as u64)
     }
 }
