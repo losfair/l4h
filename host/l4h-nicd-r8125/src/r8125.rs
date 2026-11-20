@@ -23,12 +23,15 @@
 //! at 0xa400).  The chip's ASPM stays off and the link's L1 is disabled,
 //! as Linux does unless the system vendor marked ASPM safe.
 //!
-//! Every cause shares MSI-X entry 0 (the chip's single-vector mode).  RX
-//! (RxOK, RxErr) and TX (TxOK, TxErr) causes are masked separately in
-//! IntrMask; their status bits are acknowledged before they are unmasked,
-//! so that a completion after the drain raises a fresh interrupt.  The
-//! link is read on root's tick (F_TIMER).  As in Linux, the chip's own
-//! interrupt coalescing is off.
+//! Every cause shares MSI-X entry 0 (the chip's single-vector mode), which
+//! raises a new message only on a zero to non-zero transition of
+//! `IntrStatus & IntrMask`.  On an interrupt (`irq_received`), every cause is
+//! masked and every status bit acknowledged (as Linux's `rtl8169_interrupt`
+//! does) so a completed TX cause cannot stay asserted across `rx_done` and
+//! swallow later RX edges; `rx_done` and `tx_interrupts` then re-arm their
+//! own causes in `IntrMask` after acknowledging them.  The link is read on
+//! root's tick (F_TIMER).  As in Linux, the chip's own interrupt coalescing
+//! is off.
 //!
 //! Left out, all power, performance or cosmetics: the PCIe read request
 //! size (4096 in Linux; root's filter keeps Device Control), the D3 PLL
@@ -1119,8 +1122,18 @@ impl R8125 {
     }
 
     fn set_imr(&mut self, causes: u32, on: bool) {
-        self.imr = if on { self.imr | causes } else { self.imr & !causes };
-        self.regs.w32(IMR, self.imr);
+        let imr = if on { self.imr | causes } else { self.imr & !causes };
+        if imr != self.imr {
+            self.imr = imr;
+            self.regs.w32(IMR, imr);
+        }
+    }
+
+    /// Mask and acknowledge every cause on the shared MSI-X vector (Linux
+    /// rtl8169_interrupt), so `(ISR & IMR)` drops to zero before `rx_done`
+    /// and `tx_interrupts` re-arm their causes.
+    pub fn irq_received(&mut self) {
+        self.irq_mask_and_ack();
     }
 
     pub fn rx_begin(&mut self) {
@@ -1128,13 +1141,13 @@ impl R8125 {
     }
 
     pub fn rx_done(&mut self) -> bool {
-        // Statuses set by what was drained; one set later interrupts.  The
-        // clear is posted: read it back before looking at the ring, or a
-        // frame that completes meanwhile has its status cleared after the
-        // look, and raises nothing.
+        // Acknowledge statuses from what was drained, unmask RX, and commit
+        // both posted writes before looking at the ring: any frame completed
+        // before the unmask is seen here, and any later one raises a fresh
+        // interrupt.
         self.regs.w32(ISR, CAUSE_RX);
-        self.commit();
         self.set_imr(CAUSE_RX, true);
+        self.commit();
         if self.rx_status(self.rx_next) & DESC_OWN == 0 {
             self.set_imr(CAUSE_RX, false);
             return false;
@@ -1213,11 +1226,13 @@ impl R8125 {
 
     pub fn tx_interrupts(&mut self, on: bool) -> bool {
         if on {
-            // As in rx_done: the clear lands before the look.
+            // As in rx_done: both posted writes land before the look.
             self.regs.w32(ISR, CAUSE_TX);
+            self.set_imr(CAUSE_TX, true);
             self.commit();
+        } else {
+            self.set_imr(CAUSE_TX, false);
         }
-        self.set_imr(CAUSE_TX, on);
         self.tx_cons != self.tx_prod && self.tx_done(self.tx_cons % TX_RING)
     }
 
@@ -1391,6 +1406,9 @@ impl crate::sdk::NicDriver for R8125 {
     }
     fn offer(&self) -> Offer {
         R8125::offer(self)
+    }
+    fn irq_received(&mut self) {
+        R8125::irq_received(self)
     }
     fn rx_begin(&mut self) {
         R8125::rx_begin(self)

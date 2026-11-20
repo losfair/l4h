@@ -4,8 +4,9 @@
 //! registers are a table the test reads back), clears the reset bit, and
 //! moves both descriptor rings: frames the test queues go into RX buffers
 //! the driver owns no more, and TX descriptors are taken while the
-//! doorbell says so (or held, to fill the ring).  Interrupts are not
-//! modelled.  What it checks: bring-up (MAC address, PHY parameters,
+//! doorbell says so (or held, to fill the ring).  Single-vector MSI-X
+//! edge delivery is modelled on `(ISR & IMR)` transitioning from zero to
+//! non-zero.  What it checks: bring-up (MAC address, PHY parameters,
 //! autonegotiation advertisement, a firmware program run through the
 //! paged PHY view), RX across ring wraps with checksum verdicts and the
 //! frames the driver drops, TX across ring and area wraps with Linux's
@@ -16,7 +17,7 @@
 use std::collections::VecDeque;
 use std::net::Ipv4Addr;
 use std::ptr::{read_volatile, write_volatile};
-use std::sync::atomic::{AtomicBool, Ordering, fence};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, fence};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -80,6 +81,24 @@ struct Shared {
     tx: Mutex<Vec<Tx>>,
     hold: AtomicBool,
     stop: AtomicBool,
+    /// Interrupt status register and single-vector MSI-X edge count: an
+    /// interrupt fires only when (ISR & IMR) transitions from 0 to non-zero.
+    isr: AtomicU32,
+    irqs: AtomicU64,
+    /// Incremented after each pass of the chip thread, so tests can wait for
+    /// register writes and descriptor updates to be observed.
+    tick: AtomicU64,
+}
+
+impl Shared {
+    fn sync(&self) {
+        let start = self.tick.load(Ordering::Acquire);
+        let end = Instant::now() + Duration::from_secs(5);
+        while self.tick.load(Ordering::Acquire) < start + 2 {
+            assert!(Instant::now() < end, "chip thread stalled");
+            std::thread::yield_now();
+        }
+    }
 }
 
 /// The chip's side, until `stop`.
@@ -88,12 +107,31 @@ fn chip(bar: usize, s: Arc<Shared>) {
     // other is a request.
     let (mut gphy, mut ephy, mut eri) = (0u32, 0u32, 0u32);
     let (mut rx_cur, mut tx_cur, mut polling) = (0usize, 0usize, false);
+    let (mut isr, mut irq_line) = (0u32, false);
+    let isr_w1c = unsafe { &*((bar + 0x3c) as *const AtomicU32) };
+    let update_irq = |isr: &mut u32, irq_line: &mut bool| {
+        let ack = isr_w1c.swap(0, Ordering::AcqRel);
+        if ack != 0 {
+            *isr &= !ack;
+        }
+        let imr = r32(bar + 0x38);
+        s.isr.store(*isr, Ordering::Release);
+        let level = (*isr & imr) != 0;
+        if level && !*irq_line {
+            s.irqs.fetch_add(1, Ordering::Release);
+        }
+        *irq_line = level;
+    };
     while !s.stop.load(Ordering::Relaxed) {
         let cmd = r8(bar + 0x37);
         if cmd & 0x10 != 0 {
             w8(bar + 0x37, cmd & !0x10);
             (rx_cur, tx_cur, polling) = (0, 0, false);
+            (isr, irq_line) = (0, false);
+            isr_w1c.store(0, Ordering::Release);
+            s.isr.store(0, Ordering::Release);
         }
+        update_irq(&mut isr, &mut irq_line);
         let v = r32(bar + 0xb8);
         if v != gphy {
             // The address's bit 0 (always clear) shares bit 15 with the data.
@@ -149,6 +187,7 @@ fn chip(bar: usize, s: Arc<Shared>) {
                 unsafe { core::ptr::copy_nonoverlapping(f.as_ptr(), buf as *mut u8, f.len()) };
                 fence(Ordering::Release);
                 w32(d, status | (o1 & RING_END) | (f.len() + 4) as u32);
+                isr |= if status & (1 << 21) != 0 { 1 << 1 } else { 1 << 0 };
                 rx_cur = if o1 & RING_END != 0 { 0 } else { rx_cur + 1 };
                 q.pop_front();
             }
@@ -174,9 +213,12 @@ fn chip(bar: usize, s: Arc<Shared>) {
                 s.tx.lock().unwrap().push(Tx { frame, opts1: o1, opts2: r32(d + 4) });
                 fence(Ordering::Release);
                 w32(d, o1 & !OWN);
+                isr |= 1 << 2;
                 tx_cur = if o1 & RING_END != 0 { 0 } else { tx_cur + 1 };
             }
         }
+        update_irq(&mut isr, &mut irq_line);
+        s.tick.fetch_add(1, Ordering::Release);
         std::hint::spin_loop();
     }
 }
@@ -720,4 +762,135 @@ fn model() {
     rig.nic.stop();
     s.stop.store(true, Ordering::Relaxed);
     thread.join().unwrap();
+}
+
+/// Regression test for the single-vector MSI-X edge-swallow stall:
+/// all causes share entry 0 and an MSI-X message is only raised when
+/// (ISR & IMR) transitions from 0 to non-zero.  If a TX interrupt wakes
+/// nicdrv and leaves TxOK asserted in ISR while IMR still enables CAUSE_TX
+/// across rx_begin()/rx_done(), an RX frame arriving before
+/// tx_interrupts(false) sees (ISR & IMR) stay non-zero (no new edge), and
+/// after tx_interrupts(false) clears CAUSE_TX, (ISR & IMR) stays RxOK != 0
+/// forever so RX never interrupts again while TX keeps working.
+#[test]
+fn single_vector_msix_tx_irq_does_not_stall_rx() {
+    let _one = CHIP.lock().unwrap_or_else(|e| e.into_inner());
+    let b = bring_up(0x641, 1);
+    let mut rig = Rig { nic: b.nic, s: b.s.clone() };
+    rig.s.sync();
+    assert_eq!(rig.s.irqs.load(Ordering::Acquire), 0);
+
+    // 1. Fill TX ring while chip holds TX, then arm TX interrupts as nicdrv does.
+    rig.s.hold.store(true, Ordering::Relaxed);
+    let tx_frame = padded(&[0x55; 14], 64);
+    let mut queued = 0;
+    while rig.nic.transmit(&tx_frame, &[0; HDR]) {
+        queued += 1;
+    }
+    rig.nic.kick_tx();
+    assert!(!rig.nic.tx_interrupts(true), "nothing completed yet");
+    rig.s.sync();
+    assert_eq!(rig.s.irqs.load(Ordering::Acquire), 0);
+
+    // 2. Chip completes TX -> TxOK fires single-vector MSI-X #1.
+    rig.s.hold.store(false, Ordering::Relaxed);
+    rig.sent(queued);
+    rig.s.sync();
+    let irqs_after_tx = rig.s.irqs.load(Ordering::Acquire);
+    assert_eq!(irqs_after_tx, 1, "TX completion must raise MSI-X");
+
+    // 3. nicdrv wakes on IRQ: irq_received() -> receive() -> transmit().
+    NicDriver::irq_received(&mut rig.nic);
+    rig.s.sync();
+    rig.nic.rx_begin();
+    rig.s.sync();
+    let mut buf = vec![0u8; l4h_host::net::MAX_FRAME];
+    let mut hdr = [0u8; HDR];
+    assert!(rig.nic.receive(&mut buf, &mut hdr).is_none());
+    assert!(rig.nic.rx_done(), "RX ring is empty");
+    rig.s.sync();
+
+    // 4. Before transmit() finishes and calls tx_interrupts(false), an RX
+    // frame arrives from the wire.
+    let rx1 = padded(&[0xaa; 14], 64);
+    rig.s.rx.lock().unwrap().push_back((rx1.clone(), FS | LS));
+    rig.s.sync();
+
+    // 5. transmit() finishes and disables TX interrupts; TX itself still works.
+    rig.nic.tx_interrupts(false);
+    rig.s.sync();
+    rig.send(&tx_frame, &[0; HDR]);
+    rig.sent(1);
+    rig.s.sync();
+
+    // 6. Another RX frame arrives while nicdrv would be sleeping.
+    let rx2 = padded(&[0xbb; 14], 64);
+    rig.s.rx.lock().unwrap().push_back((rx2.clone(), FS | LS));
+    rig.s.sync();
+
+    let irqs_after_rx = rig.s.irqs.load(Ordering::Acquire);
+    assert!(
+        irqs_after_rx > irqs_after_tx,
+        "RX frames must raise a fresh MSI-X after a TX interrupt (irqs stayed at {irqs_after_rx}, ISR={:#x}, IMR={:#x})",
+        rig.s.isr.load(Ordering::Acquire),
+        r32(b.bar + 0x38),
+    );
+
+    // 7. Next nicdrv turn wakes on the RX MSI-X and receives both frames.
+    NicDriver::irq_received(&mut rig.nic);
+    rig.nic.rx_begin();
+    let n1 = rig.nic.receive(&mut buf, &mut hdr).expect("first RX frame");
+    assert_eq!(&buf[..n1], &rx1[..]);
+    let n2 = rig.nic.receive(&mut buf, &mut hdr).expect("second RX frame");
+    assert_eq!(&buf[..n2], &rx2[..]);
+    assert!(rig.nic.receive(&mut buf, &mut hdr).is_none());
+    assert!(rig.nic.rx_done());
+    rig.s.sync();
+
+    // 8. Combined rx_blocked + tx_blocked: RX stays masked while blocked,
+    // TX completion still raises MSI-X, and once netd frees room and rx_done
+    // re-arms RX, subsequent RX frames raise MSI-X again.
+    rig.nic.rx_begin(); // rx_blocked: rx_done is not called
+    rig.s.hold.store(true, Ordering::Relaxed);
+    let mut queued = 0;
+    while rig.nic.transmit(&tx_frame, &[0; HDR]) {
+        queued += 1;
+    }
+    rig.nic.kick_tx();
+    assert!(!rig.nic.tx_interrupts(true));
+    rig.s.sync();
+    let irqs_before_tx2 = rig.s.irqs.load(Ordering::Acquire);
+    rig.s.hold.store(false, Ordering::Relaxed);
+    rig.sent(queued);
+    rig.s.sync();
+    let irqs_after_tx2 = rig.s.irqs.load(Ordering::Acquire);
+    assert_eq!(irqs_after_tx2, irqs_before_tx2 + 1, "TX interrupt while RX is blocked");
+    // Wake on TX IRQ, RX still blocked (no rx_done), TX unblocks.
+    NicDriver::irq_received(&mut rig.nic);
+    rig.nic.rx_begin();
+    rig.nic.tx_interrupts(false);
+    rig.s.sync();
+    assert_eq!(r32(b.bar + 0x38), 0, "both causes stay masked while RX is blocked");
+    // RX frame arrives while blocked: must not interrupt until netd frees room.
+    let rx3 = padded(&[0xcc; 14], 64);
+    rig.s.rx.lock().unwrap().push_back((rx3.clone(), FS | LS));
+    rig.s.sync();
+    assert_eq!(rig.s.irqs.load(Ordering::Acquire), irqs_after_tx2, "no RX IRQ while rx_blocked");
+    // netd frees room: drain rx3 and re-arm RX via rx_done.
+    let n3 = rig.nic.receive(&mut buf, &mut hdr).expect("buffered RX frame");
+    assert_eq!(&buf[..n3], &rx3[..]);
+    assert!(rig.nic.rx_done());
+    rig.s.sync();
+    // Subsequent RX frame raises MSI-X cleanly.
+    let rx4 = padded(&[0xdd; 14], 64);
+    rig.s.rx.lock().unwrap().push_back((rx4.clone(), FS | LS));
+    rig.s.sync();
+    assert_eq!(rig.s.irqs.load(Ordering::Acquire), irqs_after_tx2 + 1, "RX IRQ resumes after rx_blocked clears");
+    NicDriver::irq_received(&mut rig.nic);
+    rig.nic.rx_begin();
+    let n4 = rig.nic.receive(&mut buf, &mut hdr).expect("fourth RX frame");
+    assert_eq!(&buf[..n4], &rx4[..]);
+    assert!(rig.nic.rx_done());
+
+    Bench { nic: rig.nic, ..b }.finish();
 }
