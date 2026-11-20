@@ -641,7 +641,15 @@ binds SC_U to it, never after.
   runs too long without polling; interrupt delivery relies on the guest's
   polling points.
 - **Idle.** kTCB calls `seL4_Wait(N_v)`, consuming no CPU, which is what
-  makes 30 mostly-idle guests on 4 cores practical.
+  makes 30 mostly-idle guests on 4 cores practical. Before it blocks, an
+  idle vCPU polls for an adaptive window (`arch/l4h/kernel/time.c`), as
+  KVM's halt polling does: with `TIF_POLLING_NRFLAG` set, a vCPU waking it
+  (reschedule or function-call IPI) only sets `need_resched`, so neither the
+  sender's `seL4_Signal` nor the blocked kTCB's wakeup happens; host events
+  are seen in the event page. The window grows while blocks end within
+  `l4h_idle_poll_us` (default 50; 0 turns polling off) and drops to zero
+  after a longer one, so a mostly idle vCPU stops polling at once: an idle
+  6-vCPU guest uses 0.02 host cores either way.
 
 **Exceptions.** A UserException fault carries the vector and error code,
 mapped to signals: #GP to SIGSEGV, #UD to SIGILL, #DE to SIGFPE, `int3` to
@@ -5606,9 +5614,20 @@ crc32c verification, direct I/O, libaio, queue depth 16 (13.4k IOPS, all
 verified); busybox built with `make -j4` in 124 s; a clean `e2fsck -f` on
 the host; a checksum intact after a second boot.
 
+**Idle polling** (§5.4, 2026-11-20, Ryzen 7 7700 under QEMU/KVM,
+`run-smpbench.py` divisor 4, medians of three boots, the same FL4 kernel and
+seL4 for both guests): cross-vCPU round trips drop from 11.5 to 5.6–5.8 µs
+for pipes and from 6.5 to 1.2 µs (FL4) or 6.7 to 3.6 µs (seL4) for futexes at
+4 vCPUs; at 6 vCPUs futexes go from 5.5 to 1.2 µs (FL4) and 7.8 to 2.0 µs
+(seL4). Same-vCPU round trips are unchanged; getpid and fork_wait are up
+to 4% lower, 4-vCPU fault_4k is too noisy to tell (the runs spread over
+±20%), and the short 6-vCPU compute phase varies by up to 8% as it does
+without polling.
+
 **Next steps for I/O latency:** place each guest's VMM, blkd and netd work on
 the guest's core, or use passive servers on the caller's scheduling context;
-poll briefly before blocking; measure on single-level cloud hypervisors,
+poll briefly before blocking in the host components too (guest vCPUs do,
+§5.4); measure on single-level cloud hypervisors,
 where exits are about 20× cheaper; remove the VMM's network copy by making
 the I/O pool itself a netd port region.
 
