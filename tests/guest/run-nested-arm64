@@ -1,0 +1,26 @@
+#!/bin/sh
+# run-nested-arm64 VMM: boot /nested's arm64 kernel and initramfs
+# (tests/run-kvmtest-arm64.sh) with two vCPUs under VMM (firecracker or
+# cloud-hypervisor), its console on stdout.
+args="panic=-1 earlycon"
+case $1 in
+firecracker)
+	cat >/tmp/fc.json <<JSON
+{
+  "boot-source": {
+    "kernel_image_path": "/nested/Image",
+    "initrd_path": "/nested/initrd.cpio.gz",
+    "boot_args": "console=ttyS0 $args reboot=k"
+  },
+  "drives": [],
+  "machine-config": { "vcpu_count": 2, "mem_size_mib": 256 }
+}
+JSON
+	exec /usr/bin/firecracker --no-api --no-seccomp --config-file /tmp/fc.json </dev/null ;;
+cloud-hypervisor)
+	exec /usr/bin/cloud-hypervisor --kernel /nested/Image --initramfs /nested/initrd.cpio.gz \
+		--cmdline "console=ttyAMA0 $args" --cpus boot=2 --memory size=256M \
+		--serial tty --console off </dev/null ;;
+esac
+echo "run-nested-arm64: unknown VMM $1" >&2
+exit 2

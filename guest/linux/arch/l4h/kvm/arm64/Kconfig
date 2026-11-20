@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# KVM in the AArch64 l4h guest kernel: arch/arm64/kvm's common code with a
+# backend on FL4's EL2 VCPUs and Stage-2 VSpaces (arch/l4h/kvm/arm64).
+
+source "virt/kvm/Kconfig"
+
+config KVM
+	bool "KVM on FL4 VCPUs"
+	default y
+	select KVM_ARM64
+	help
+	  Provide /dev/kvm where FL4 runs at EL2 (VHE) and hands out Stage-2
+	  roots, for QEMU, Firecracker and cloud-hypervisor.  A kernel with
+	  this option boots everywhere: /dev/kvm only appears when the host
+	  hands out Stage-2 roots (bootinfo.nr_ept_roots).
+
+config KVM_ARM64
+	bool
+	select KVM_COMMON
+	select KVM_GENERIC_HARDWARE_ENABLING
+	select KVM_GENERIC_MMU_NOTIFIER
+	select KVM_MMIO
+	select KVM_GENERIC_DIRTYLOG_READ_PROTECT
+	select VIRT_XFER_TO_GUEST_WORK
+	select HAVE_KVM_MSI
+	select HAVE_KVM_DIRTY_RING_ACQ_REL
+	select NEED_KVM_DIRTY_RING_WITH_BITMAP
+	select HAVE_KVM_IRQCHIP
+	select HAVE_KVM_IRQ_ROUTING
+	select HAVE_KVM_READONLY_MEM
+	select HAVE_KVM_VCPU_RUN_PID_CHANGE
+	select SCHED_INFO
+	select VHOST_TASK

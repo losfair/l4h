@@ -1,0 +1,680 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+/*
+ * arm64's pgtable-hwdef.h for arch/arm64/kvm in the l4h guest kernel,
+ * generated from it by wrapping every definition in #ifndef: the guest
+ * kernel's own page table macros (asm/pgtable.h) win.  Regenerate with
+ * arch/l4h/kvm/arm64/gen-pgtable-hwdef.py when Linux is updated.
+ */
+#ifndef __L4H_KVM_ASM_PGTABLE_HWDEF_H
+#define __L4H_KVM_ASM_PGTABLE_HWDEF_H
+/* SPDX-License-Identifier: GPL-2.0-only */
+/*
+ * Copyright (C) 2012 ARM Ltd.
+ */
+
+#include <asm/memory.h>
+
+#ifndef PTDESC_ORDER
+#define PTDESC_ORDER 3
+#endif
+
+/* Number of VA bits resolved by a single translation table level */
+#ifndef PTDESC_TABLE_SHIFT
+#define PTDESC_TABLE_SHIFT	(PAGE_SHIFT - PTDESC_ORDER)
+#endif
+
+/*
+ * Number of page-table levels required to address 'va_bits' wide
+ * address, without section mapping. We resolve the top (va_bits - PAGE_SHIFT)
+ * bits with PTDESC_TABLE_SHIFT bits at each page table level. Hence:
+ *
+ *  levels = DIV_ROUND_UP((va_bits - PAGE_SHIFT), PTDESC_TABLE_SHIFT)
+ *
+ * where DIV_ROUND_UP(n, d) => (((n) + (d) - 1) / (d))
+ *
+ * We cannot include linux/kernel.h which defines DIV_ROUND_UP here
+ * due to build issues. So we open code DIV_ROUND_UP here:
+ *
+ *	((((va_bits) - PAGE_SHIFT) + PTDESC_TABLE_SHIFT - 1) / PTDESC_TABLE_SHIFT)
+ *
+ * which gets simplified as :
+ */
+#ifndef ARM64_HW_PGTABLE_LEVELS
+#define ARM64_HW_PGTABLE_LEVELS(va_bits) \
+	(((va_bits) - PTDESC_ORDER - 1) / PTDESC_TABLE_SHIFT)
+#endif
+
+/*
+ * Size mapped by an entry at level n ( -1 <= n <= 3)
+ * We map PTDESC_TABLE_SHIFT at all translation levels and PAGE_SHIFT bits
+ * in the final page. The maximum number of translation levels supported by
+ * the architecture is 5. Hence, starting at level n, we have further
+ * ((4 - n) - 1) levels of translation excluding the offset within the page.
+ * So, the total number of bits mapped by an entry at level n is :
+ *
+ *  ((4 - n) - 1) * PTDESC_TABLE_SHIFT + PAGE_SHIFT
+ *
+ * Rearranging it a bit we get :
+ *   (4 - n) * PTDESC_TABLE_SHIFT + PTDESC_ORDER
+ */
+#ifndef ARM64_HW_PGTABLE_LEVEL_SHIFT
+#define ARM64_HW_PGTABLE_LEVEL_SHIFT(n)	(PTDESC_TABLE_SHIFT * (4 - (n)) + PTDESC_ORDER)
+#endif
+
+
+/*
+ * PMD_SHIFT determines the size a level 2 page table entry can map.
+ */
+#if CONFIG_PGTABLE_LEVELS > 2
+#endif
+
+/*
+ * PUD_SHIFT determines the size a level 1 page table entry can map.
+ */
+#if CONFIG_PGTABLE_LEVELS > 3
+#endif
+
+#if CONFIG_PGTABLE_LEVELS > 4
+#ifndef P4D_SHIFT
+#define P4D_SHIFT		ARM64_HW_PGTABLE_LEVEL_SHIFT(0)
+#endif
+#ifndef P4D_SIZE
+#define P4D_SIZE		(_AC(1, UL) << P4D_SHIFT)
+#endif
+#ifndef P4D_MASK
+#define P4D_MASK		(~(P4D_SIZE-1))
+#endif
+#ifndef PTRS_PER_P4D
+#define PTRS_PER_P4D		(1 << PTDESC_TABLE_SHIFT)
+#endif
+#endif
+
+/*
+ * PGDIR_SHIFT determines the size a top-level page table entry can map
+ * (depending on the configuration, this level can be -1, 0, 1 or 2).
+ */
+
+/*
+ * Contiguous page definitions.
+ */
+#ifndef CONT_PTE_SHIFT
+#define CONT_PTE_SHIFT		(CONFIG_ARM64_CONT_PTE_SHIFT + PAGE_SHIFT)
+#endif
+#ifndef CONT_PTES
+#define CONT_PTES		(1 << (CONT_PTE_SHIFT - PAGE_SHIFT))
+#endif
+#ifndef CONT_PTE_SIZE
+#define CONT_PTE_SIZE		(CONT_PTES * PAGE_SIZE)
+#endif
+#ifndef CONT_PTE_MASK
+#define CONT_PTE_MASK		(~(CONT_PTE_SIZE - 1))
+#endif
+
+#ifndef CONT_PMD_SHIFT
+#define CONT_PMD_SHIFT		(CONFIG_ARM64_CONT_PMD_SHIFT + PMD_SHIFT)
+#endif
+#ifndef CONT_PMDS
+#define CONT_PMDS		(1 << (CONT_PMD_SHIFT - PMD_SHIFT))
+#endif
+#ifndef CONT_PMD_SIZE
+#define CONT_PMD_SIZE		(CONT_PMDS * PMD_SIZE)
+#endif
+#ifndef CONT_PMD_MASK
+#define CONT_PMD_MASK		(~(CONT_PMD_SIZE - 1))
+#endif
+
+/*
+ * Hardware page table definitions.
+ *
+ * Level -1 descriptor (PGD).
+ */
+#ifndef PGD_TYPE_TABLE
+#define PGD_TYPE_TABLE		(_AT(pgdval_t, 3) << 0)
+#endif
+#ifndef PGD_TYPE_MASK
+#define PGD_TYPE_MASK		(_AT(pgdval_t, 3) << 0)
+#endif
+#ifndef PGD_TABLE_AF
+#define PGD_TABLE_AF		(_AT(pgdval_t, 1) << 10)	/* Ignored if no FEAT_HAFT */
+#endif
+#ifndef PGD_TABLE_PXN
+#define PGD_TABLE_PXN		(_AT(pgdval_t, 1) << 59)
+#endif
+#ifndef PGD_TABLE_UXN
+#define PGD_TABLE_UXN		(_AT(pgdval_t, 1) << 60)
+#endif
+
+/*
+ * Level 0 descriptor (P4D).
+ */
+#ifndef P4D_TYPE_TABLE
+#define P4D_TYPE_TABLE		(_AT(p4dval_t, 3) << 0)
+#endif
+#ifndef P4D_TYPE_MASK
+#define P4D_TYPE_MASK		(_AT(p4dval_t, 3) << 0)
+#endif
+#ifndef P4D_TYPE_SECT
+#define P4D_TYPE_SECT		(_AT(p4dval_t, 1) << 0)
+#endif
+#ifndef P4D_SECT_RDONLY
+#define P4D_SECT_RDONLY		(_AT(p4dval_t, 1) << 7)		/* AP[2] */
+#endif
+#ifndef P4D_TABLE_AF
+#define P4D_TABLE_AF		(_AT(p4dval_t, 1) << 10)	/* Ignored if no FEAT_HAFT */
+#endif
+#ifndef P4D_TABLE_PXN
+#define P4D_TABLE_PXN		(_AT(p4dval_t, 1) << 59)
+#endif
+#ifndef P4D_TABLE_UXN
+#define P4D_TABLE_UXN		(_AT(p4dval_t, 1) << 60)
+#endif
+
+/*
+ * Level 1 descriptor (PUD).
+ */
+#ifndef PUD_TYPE_TABLE
+#define PUD_TYPE_TABLE		(_AT(pudval_t, 3) << 0)
+#endif
+#ifndef PUD_TYPE_MASK
+#define PUD_TYPE_MASK		(_AT(pudval_t, 3) << 0)
+#endif
+#ifndef PUD_TYPE_SECT
+#define PUD_TYPE_SECT		(_AT(pudval_t, 1) << 0)
+#endif
+#ifndef PUD_SECT_RDONLY
+#define PUD_SECT_RDONLY		(_AT(pudval_t, 1) << 7)		/* AP[2] */
+#endif
+#ifndef PUD_TABLE_AF
+#define PUD_TABLE_AF		(_AT(pudval_t, 1) << 10)	/* Ignored if no FEAT_HAFT */
+#endif
+#ifndef PUD_TABLE_PXN
+#define PUD_TABLE_PXN		(_AT(pudval_t, 1) << 59)
+#endif
+#ifndef PUD_TABLE_UXN
+#define PUD_TABLE_UXN		(_AT(pudval_t, 1) << 60)
+#endif
+
+/*
+ * Level 2 descriptor (PMD).
+ */
+#ifndef PMD_TYPE_MASK
+#define PMD_TYPE_MASK		(_AT(pmdval_t, 3) << 0)
+#endif
+#ifndef PMD_TYPE_TABLE
+#define PMD_TYPE_TABLE		(_AT(pmdval_t, 3) << 0)
+#endif
+#ifndef PMD_TYPE_SECT
+#define PMD_TYPE_SECT		(_AT(pmdval_t, 1) << 0)
+#endif
+#ifndef PMD_TABLE_AF
+#define PMD_TABLE_AF		(_AT(pmdval_t, 1) << 10)	/* Ignored if no FEAT_HAFT */
+#endif
+
+/*
+ * Section
+ */
+#ifndef PMD_SECT_USER
+#define PMD_SECT_USER		(_AT(pmdval_t, 1) << 6)		/* AP[1] */
+#endif
+#ifndef PMD_SECT_RDONLY
+#define PMD_SECT_RDONLY		(_AT(pmdval_t, 1) << 7)		/* AP[2] */
+#endif
+#ifndef PMD_SECT_S
+#define PMD_SECT_S		(_AT(pmdval_t, 3) << 8)
+#endif
+#ifndef PMD_SECT_AF
+#define PMD_SECT_AF		(_AT(pmdval_t, 1) << 10)
+#endif
+#ifndef PMD_SECT_NG
+#define PMD_SECT_NG		(_AT(pmdval_t, 1) << 11)
+#endif
+#ifndef PMD_SECT_CONT
+#define PMD_SECT_CONT		(_AT(pmdval_t, 1) << 52)
+#endif
+#ifndef PMD_SECT_PXN
+#define PMD_SECT_PXN		(_AT(pmdval_t, 1) << 53)
+#endif
+#ifndef PMD_SECT_UXN
+#define PMD_SECT_UXN		(_AT(pmdval_t, 1) << 54)
+#endif
+#ifndef PMD_TABLE_PXN
+#define PMD_TABLE_PXN		(_AT(pmdval_t, 1) << 59)
+#endif
+#ifndef PMD_TABLE_UXN
+#define PMD_TABLE_UXN		(_AT(pmdval_t, 1) << 60)
+#endif
+
+/*
+ * AttrIndx[2:0] encoding (mapping attributes defined in the MAIR* registers).
+ */
+#ifndef PMD_ATTRINDX
+#define PMD_ATTRINDX(t)		(_AT(pmdval_t, (t)) << 2)
+#endif
+#ifndef PMD_ATTRINDX_MASK
+#define PMD_ATTRINDX_MASK	(_AT(pmdval_t, 7) << 2)
+#endif
+
+/*
+ * Level 3 descriptor (PTE).
+ */
+#ifndef PTE_VALID
+#define PTE_VALID		(_AT(pteval_t, 1) << 0)
+#endif
+#ifndef PTE_TYPE_MASK
+#define PTE_TYPE_MASK		(_AT(pteval_t, 3) << 0)
+#endif
+#ifndef PTE_TYPE_PAGE
+#define PTE_TYPE_PAGE		(_AT(pteval_t, 3) << 0)
+#endif
+#ifndef PTE_USER
+#define PTE_USER		(_AT(pteval_t, 1) << 6)		/* AP[1] */
+#endif
+#ifndef PTE_RDONLY
+#define PTE_RDONLY		(_AT(pteval_t, 1) << 7)		/* AP[2] */
+#endif
+#ifndef PTE_SHARED
+#define PTE_SHARED		(_AT(pteval_t, 3) << 8)		/* SH[1:0], inner shareable */
+#endif
+#ifndef PTE_AF
+#define PTE_AF			(_AT(pteval_t, 1) << 10)	/* Access Flag */
+#endif
+#ifndef PTE_NG
+#define PTE_NG			(_AT(pteval_t, 1) << 11)	/* nG */
+#endif
+#ifndef PTE_GP
+#define PTE_GP			(_AT(pteval_t, 1) << 50)	/* BTI guarded */
+#endif
+#ifndef PTE_DBM
+#define PTE_DBM			(_AT(pteval_t, 1) << 51)	/* Dirty Bit Management */
+#endif
+#ifndef PTE_CONT
+#define PTE_CONT		(_AT(pteval_t, 1) << 52)	/* Contiguous range */
+#endif
+#ifndef PTE_PXN
+#define PTE_PXN			(_AT(pteval_t, 1) << 53)	/* Privileged XN */
+#endif
+#ifndef PTE_UXN
+#define PTE_UXN			(_AT(pteval_t, 1) << 54)	/* User XN */
+#endif
+#ifndef PTE_SWBITS_MASK
+#define PTE_SWBITS_MASK		_AT(pteval_t, (BIT(63) | GENMASK(58, 55)))
+#endif
+
+#ifndef PTE_ADDR_LOW
+#define PTE_ADDR_LOW		(((_AT(pteval_t, 1) << (50 - PAGE_SHIFT)) - 1) << PAGE_SHIFT)
+#endif
+#ifdef CONFIG_ARM64_PA_BITS_52
+#ifdef CONFIG_ARM64_64K_PAGES
+#ifndef PTE_ADDR_HIGH
+#define PTE_ADDR_HIGH		(_AT(pteval_t, 0xf) << 12)
+#endif
+#ifndef PTE_ADDR_HIGH_SHIFT
+#define PTE_ADDR_HIGH_SHIFT	36
+#endif
+#ifndef PHYS_TO_PTE_ADDR_MASK
+#define PHYS_TO_PTE_ADDR_MASK	(PTE_ADDR_LOW | PTE_ADDR_HIGH)
+#endif
+#else
+#ifndef PTE_ADDR_HIGH
+#define PTE_ADDR_HIGH		(_AT(pteval_t, 0x3) << 8)
+#endif
+#ifndef PTE_ADDR_HIGH_SHIFT
+#define PTE_ADDR_HIGH_SHIFT	42
+#endif
+#ifndef PHYS_TO_PTE_ADDR_MASK
+#define PHYS_TO_PTE_ADDR_MASK	GENMASK_ULL(49, 8)
+#endif
+#endif
+#endif
+
+/*
+ * AttrIndx[2:0] encoding (mapping attributes defined in the MAIR* registers).
+ */
+#ifndef PTE_ATTRINDX
+#define PTE_ATTRINDX(t)		(_AT(pteval_t, (t)) << 2)
+#endif
+#ifndef PTE_ATTRINDX_MASK
+#define PTE_ATTRINDX_MASK	(_AT(pteval_t, 7) << 2)
+#endif
+
+/*
+ * PIIndex[3:0] encoding (Permission Indirection Extension)
+ */
+#ifndef PTE_PI_IDX_0
+#define PTE_PI_IDX_0	6	/* AP[1], USER */
+#endif
+#ifndef PTE_PI_IDX_1
+#define PTE_PI_IDX_1	51	/* DBM */
+#endif
+#ifndef PTE_PI_IDX_2
+#define PTE_PI_IDX_2	53	/* PXN */
+#endif
+#ifndef PTE_PI_IDX_3
+#define PTE_PI_IDX_3	54	/* UXN */
+#endif
+
+/*
+ * POIndex[2:0] encoding (Permission Overlay Extension)
+ */
+#ifndef PTE_PO_IDX_0
+#define PTE_PO_IDX_0	(_AT(pteval_t, 1) << 60)
+#endif
+#ifndef PTE_PO_IDX_1
+#define PTE_PO_IDX_1	(_AT(pteval_t, 1) << 61)
+#endif
+#ifndef PTE_PO_IDX_2
+#define PTE_PO_IDX_2	(_AT(pteval_t, 1) << 62)
+#endif
+
+#ifndef PTE_PO_IDX_MASK
+#define PTE_PO_IDX_MASK		GENMASK_ULL(62, 60)
+#endif
+
+
+/*
+ * Memory Attribute override for Stage-2 (MemAttr[3:0])
+ */
+#ifndef PTE_S2_MEMATTR
+#define PTE_S2_MEMATTR(t)	(_AT(pteval_t, (t)) << 2)
+#endif
+
+/*
+ * Hierarchical permission for Stage-1 tables
+ */
+#ifndef S1_TABLE_AP
+#define S1_TABLE_AP		(_AT(pmdval_t, 3) << 61)
+#endif
+
+#ifndef TTBR_CNP_BIT
+#define TTBR_CNP_BIT		(UL(1) << 0)
+#endif
+
+/*
+ * TCR flags.
+ */
+#ifndef TCR_T0SZ_OFFSET
+#define TCR_T0SZ_OFFSET		0
+#endif
+#ifndef TCR_T1SZ_OFFSET
+#define TCR_T1SZ_OFFSET		16
+#endif
+#ifndef TCR_T0SZ
+#define TCR_T0SZ(x)		((UL(64) - (x)) << TCR_T0SZ_OFFSET)
+#endif
+#ifndef TCR_T1SZ
+#define TCR_T1SZ(x)		((UL(64) - (x)) << TCR_T1SZ_OFFSET)
+#endif
+#ifndef TCR_TxSZ
+#define TCR_TxSZ(x)		(TCR_T0SZ(x) | TCR_T1SZ(x))
+#endif
+#ifndef TCR_TxSZ_WIDTH
+#define TCR_TxSZ_WIDTH		6
+#endif
+#ifndef TCR_T0SZ_MASK
+#define TCR_T0SZ_MASK		(((UL(1) << TCR_TxSZ_WIDTH) - 1) << TCR_T0SZ_OFFSET)
+#endif
+#ifndef TCR_T1SZ_MASK
+#define TCR_T1SZ_MASK		(((UL(1) << TCR_TxSZ_WIDTH) - 1) << TCR_T1SZ_OFFSET)
+#endif
+
+#ifndef TCR_EPD0_SHIFT
+#define TCR_EPD0_SHIFT		7
+#endif
+#ifndef TCR_EPD0_MASK
+#define TCR_EPD0_MASK		(UL(1) << TCR_EPD0_SHIFT)
+#endif
+#ifndef TCR_IRGN0_SHIFT
+#define TCR_IRGN0_SHIFT		8
+#endif
+#ifndef TCR_IRGN0_MASK
+#define TCR_IRGN0_MASK		(UL(3) << TCR_IRGN0_SHIFT)
+#endif
+#ifndef TCR_IRGN0_NC
+#define TCR_IRGN0_NC		(UL(0) << TCR_IRGN0_SHIFT)
+#endif
+#ifndef TCR_IRGN0_WBWA
+#define TCR_IRGN0_WBWA		(UL(1) << TCR_IRGN0_SHIFT)
+#endif
+#ifndef TCR_IRGN0_WT
+#define TCR_IRGN0_WT		(UL(2) << TCR_IRGN0_SHIFT)
+#endif
+#ifndef TCR_IRGN0_WBnWA
+#define TCR_IRGN0_WBnWA		(UL(3) << TCR_IRGN0_SHIFT)
+#endif
+
+#ifndef TCR_EPD1_SHIFT
+#define TCR_EPD1_SHIFT		23
+#endif
+#ifndef TCR_EPD1_MASK
+#define TCR_EPD1_MASK		(UL(1) << TCR_EPD1_SHIFT)
+#endif
+#ifndef TCR_IRGN1_SHIFT
+#define TCR_IRGN1_SHIFT		24
+#endif
+#ifndef TCR_IRGN1_MASK
+#define TCR_IRGN1_MASK		(UL(3) << TCR_IRGN1_SHIFT)
+#endif
+#ifndef TCR_IRGN1_NC
+#define TCR_IRGN1_NC		(UL(0) << TCR_IRGN1_SHIFT)
+#endif
+#ifndef TCR_IRGN1_WBWA
+#define TCR_IRGN1_WBWA		(UL(1) << TCR_IRGN1_SHIFT)
+#endif
+#ifndef TCR_IRGN1_WT
+#define TCR_IRGN1_WT		(UL(2) << TCR_IRGN1_SHIFT)
+#endif
+#ifndef TCR_IRGN1_WBnWA
+#define TCR_IRGN1_WBnWA		(UL(3) << TCR_IRGN1_SHIFT)
+#endif
+
+#ifndef TCR_IRGN_NC
+#define TCR_IRGN_NC		(TCR_IRGN0_NC | TCR_IRGN1_NC)
+#endif
+#ifndef TCR_IRGN_WBWA
+#define TCR_IRGN_WBWA		(TCR_IRGN0_WBWA | TCR_IRGN1_WBWA)
+#endif
+#ifndef TCR_IRGN_WT
+#define TCR_IRGN_WT		(TCR_IRGN0_WT | TCR_IRGN1_WT)
+#endif
+#ifndef TCR_IRGN_WBnWA
+#define TCR_IRGN_WBnWA		(TCR_IRGN0_WBnWA | TCR_IRGN1_WBnWA)
+#endif
+#ifndef TCR_IRGN_MASK
+#define TCR_IRGN_MASK		(TCR_IRGN0_MASK | TCR_IRGN1_MASK)
+#endif
+
+
+#ifndef TCR_ORGN0_SHIFT
+#define TCR_ORGN0_SHIFT		10
+#endif
+#ifndef TCR_ORGN0_MASK
+#define TCR_ORGN0_MASK		(UL(3) << TCR_ORGN0_SHIFT)
+#endif
+#ifndef TCR_ORGN0_NC
+#define TCR_ORGN0_NC		(UL(0) << TCR_ORGN0_SHIFT)
+#endif
+#ifndef TCR_ORGN0_WBWA
+#define TCR_ORGN0_WBWA		(UL(1) << TCR_ORGN0_SHIFT)
+#endif
+#ifndef TCR_ORGN0_WT
+#define TCR_ORGN0_WT		(UL(2) << TCR_ORGN0_SHIFT)
+#endif
+#ifndef TCR_ORGN0_WBnWA
+#define TCR_ORGN0_WBnWA		(UL(3) << TCR_ORGN0_SHIFT)
+#endif
+
+#ifndef TCR_ORGN1_SHIFT
+#define TCR_ORGN1_SHIFT		26
+#endif
+#ifndef TCR_ORGN1_MASK
+#define TCR_ORGN1_MASK		(UL(3) << TCR_ORGN1_SHIFT)
+#endif
+#ifndef TCR_ORGN1_NC
+#define TCR_ORGN1_NC		(UL(0) << TCR_ORGN1_SHIFT)
+#endif
+#ifndef TCR_ORGN1_WBWA
+#define TCR_ORGN1_WBWA		(UL(1) << TCR_ORGN1_SHIFT)
+#endif
+#ifndef TCR_ORGN1_WT
+#define TCR_ORGN1_WT		(UL(2) << TCR_ORGN1_SHIFT)
+#endif
+#ifndef TCR_ORGN1_WBnWA
+#define TCR_ORGN1_WBnWA		(UL(3) << TCR_ORGN1_SHIFT)
+#endif
+
+#ifndef TCR_ORGN_NC
+#define TCR_ORGN_NC		(TCR_ORGN0_NC | TCR_ORGN1_NC)
+#endif
+#ifndef TCR_ORGN_WBWA
+#define TCR_ORGN_WBWA		(TCR_ORGN0_WBWA | TCR_ORGN1_WBWA)
+#endif
+#ifndef TCR_ORGN_WT
+#define TCR_ORGN_WT		(TCR_ORGN0_WT | TCR_ORGN1_WT)
+#endif
+#ifndef TCR_ORGN_WBnWA
+#define TCR_ORGN_WBnWA		(TCR_ORGN0_WBnWA | TCR_ORGN1_WBnWA)
+#endif
+#ifndef TCR_ORGN_MASK
+#define TCR_ORGN_MASK		(TCR_ORGN0_MASK | TCR_ORGN1_MASK)
+#endif
+
+#ifndef TCR_SH0_SHIFT
+#define TCR_SH0_SHIFT		12
+#endif
+#ifndef TCR_SH0_MASK
+#define TCR_SH0_MASK		(UL(3) << TCR_SH0_SHIFT)
+#endif
+#ifndef TCR_SH0_INNER
+#define TCR_SH0_INNER		(UL(3) << TCR_SH0_SHIFT)
+#endif
+
+#ifndef TCR_SH1_SHIFT
+#define TCR_SH1_SHIFT		28
+#endif
+#ifndef TCR_SH1_MASK
+#define TCR_SH1_MASK		(UL(3) << TCR_SH1_SHIFT)
+#endif
+#ifndef TCR_SH1_INNER
+#define TCR_SH1_INNER		(UL(3) << TCR_SH1_SHIFT)
+#endif
+#ifndef TCR_SHARED
+#define TCR_SHARED		(TCR_SH0_INNER | TCR_SH1_INNER)
+#endif
+
+#ifndef TCR_TG0_SHIFT
+#define TCR_TG0_SHIFT		14
+#endif
+#ifndef TCR_TG0_MASK
+#define TCR_TG0_MASK		(UL(3) << TCR_TG0_SHIFT)
+#endif
+#ifndef TCR_TG0_4K
+#define TCR_TG0_4K		(UL(0) << TCR_TG0_SHIFT)
+#endif
+#ifndef TCR_TG0_64K
+#define TCR_TG0_64K		(UL(1) << TCR_TG0_SHIFT)
+#endif
+#ifndef TCR_TG0_16K
+#define TCR_TG0_16K		(UL(2) << TCR_TG0_SHIFT)
+#endif
+
+#ifndef TCR_TG1_SHIFT
+#define TCR_TG1_SHIFT		30
+#endif
+#ifndef TCR_TG1_MASK
+#define TCR_TG1_MASK		(UL(3) << TCR_TG1_SHIFT)
+#endif
+#ifndef TCR_TG1_16K
+#define TCR_TG1_16K		(UL(1) << TCR_TG1_SHIFT)
+#endif
+#ifndef TCR_TG1_4K
+#define TCR_TG1_4K		(UL(2) << TCR_TG1_SHIFT)
+#endif
+#ifndef TCR_TG1_64K
+#define TCR_TG1_64K		(UL(3) << TCR_TG1_SHIFT)
+#endif
+
+#ifndef TCR_IPS_SHIFT
+#define TCR_IPS_SHIFT		32
+#endif
+#ifndef TCR_IPS_MASK
+#define TCR_IPS_MASK		(UL(7) << TCR_IPS_SHIFT)
+#endif
+#ifndef TCR_A1
+#define TCR_A1			(UL(1) << 22)
+#endif
+#ifndef TCR_ASID16
+#define TCR_ASID16		(UL(1) << 36)
+#endif
+#ifndef TCR_TBI0
+#define TCR_TBI0		(UL(1) << 37)
+#endif
+#ifndef TCR_TBI1
+#define TCR_TBI1		(UL(1) << 38)
+#endif
+#ifndef TCR_HA
+#define TCR_HA			(UL(1) << 39)
+#endif
+#ifndef TCR_HD
+#define TCR_HD			(UL(1) << 40)
+#endif
+#ifndef TCR_HPD0_SHIFT
+#define TCR_HPD0_SHIFT		41
+#endif
+#ifndef TCR_HPD0
+#define TCR_HPD0		(UL(1) << TCR_HPD0_SHIFT)
+#endif
+#ifndef TCR_HPD1_SHIFT
+#define TCR_HPD1_SHIFT		42
+#endif
+#ifndef TCR_HPD1
+#define TCR_HPD1		(UL(1) << TCR_HPD1_SHIFT)
+#endif
+#ifndef TCR_TBID0
+#define TCR_TBID0		(UL(1) << 51)
+#endif
+#ifndef TCR_TBID1
+#define TCR_TBID1		(UL(1) << 52)
+#endif
+#ifndef TCR_NFD0
+#define TCR_NFD0		(UL(1) << 53)
+#endif
+#ifndef TCR_NFD1
+#define TCR_NFD1		(UL(1) << 54)
+#endif
+#ifndef TCR_E0PD0
+#define TCR_E0PD0		(UL(1) << 55)
+#endif
+#ifndef TCR_E0PD1
+#define TCR_E0PD1		(UL(1) << 56)
+#endif
+#ifndef TCR_TCMA0
+#define TCR_TCMA0		(UL(1) << 57)
+#endif
+#ifndef TCR_TCMA1
+#define TCR_TCMA1		(UL(1) << 58)
+#endif
+#ifndef TCR_DS
+#define TCR_DS			(UL(1) << 59)
+#endif
+
+/*
+ * TTBR.
+ */
+#ifdef CONFIG_ARM64_PA_BITS_52
+/*
+ * TTBR_ELx[1] is RES0 in this configuration.
+ */
+#ifndef TTBR_BADDR_MASK_52
+#define TTBR_BADDR_MASK_52	GENMASK_ULL(47, 2)
+#endif
+#endif
+
+#ifdef CONFIG_ARM64_VA_BITS_52
+/* Must be at least 64-byte aligned to prevent corruption of the TTBR */
+#ifndef TTBR1_BADDR_4852_OFFSET
+#define TTBR1_BADDR_4852_OFFSET	(((UL(1) << (52 - PGDIR_SHIFT)) - \
+				 (UL(1) << (48 - PGDIR_SHIFT))) * 8)
+#endif
+#endif
+
+#endif /* __L4H_KVM_ASM_PGTABLE_HWDEF_H */

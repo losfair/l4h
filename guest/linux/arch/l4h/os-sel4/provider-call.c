@@ -82,8 +82,15 @@ void l4h_provider_setup(const struct l4h_bootinfo *bi)
 	if (bi->magic != L4H_BOOTINFO_MAGIC || bi->abi_version != L4H_ABI_VERSION ||
 	    bi->provider_va != L4H_PROVIDER_VA || !l4h_provider_valid(p, bi->provider_size))
 		__builtin_trap();
+	/* Stage-2 roots on arm64 (FL4 at EL2), EPT roots on x86_64: the
+	 * provider must drive the VCPUs the host hands out. */
+#ifdef __aarch64__
+	if (bi->nr_ept_roots && !(p->features & L4H_PROVIDER_ARM_VIRT))
+		__builtin_trap();
+#else
 	if (bi->nr_ept_roots && !(p->features & L4H_PROVIDER_VTX))
 		__builtin_trap();
+#endif
 	l4h_provider_ops = p;
 	l4h_provider_context = (struct l4h_provider_context) {
 		.bootinfo = bi, .vcpus = l4h_vcpus, .tsc_hz = bi->tsc_hz,

@@ -32,4 +32,6 @@ config GENERIC_HWEIGHT
 	def_bool y
 config GENERIC_CSUM
 	def_bool y
+
+source "arch/l4h/kvm/arm64/Kconfig"
 endif
