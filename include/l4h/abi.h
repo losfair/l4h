@@ -700,6 +700,11 @@ enum l4h_ctl_op {
 	 * host reboots.  -EINVAL for another byte, -ENODEV if the host has no
 	 * dashboard (no boot framebuffer, or a secondary partition). */
 	L4H_CTL_DASHBOARD_TITLE = 57,
+	/* args: vm, first vCPU -> data: struct l4h_ctl_vcpu_stat[] from that
+	 * vCPU on, vals[0] = count, vals[1] = the VMM's host core,
+	 * vals[2] = the VMM's CPU in the last 100 ms (permille of a core);
+	 * both VMM values ~0 without a running VMM */
+	L4H_CTL_VM_VCPU_STATS = 58,
 };
 
 #define L4H_DASHBOARD_TITLE_MAX 32
@@ -782,6 +787,15 @@ struct l4h_ctl_steer {
 	l4h_u64 targets;
 	l4h_u64 in_frames;
 	l4h_u64 out_frames;
+};
+
+/* One vCPU over the last balancer period (100 ms): where it ran and how
+ * much.  The cores of all running vCPUs and VMMs give each host core's
+ * guest load. */
+struct l4h_ctl_vcpu_stat {
+	l4h_u32 core;           /* host core (logical CPU) it is placed on */
+	l4h_u32 usage;          /* CPU used, permille of that core */
+	l4h_u64 steal_ns;       /* time runnable but not running, since start */
 };
 
 struct l4h_ctl_ip {

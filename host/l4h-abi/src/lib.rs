@@ -393,6 +393,11 @@ pub const CTL_IP_LIST: u32 = 56;
 /// reboots.  EINVAL for another byte, ENODEV without a dashboard.
 pub const CTL_DASHBOARD_TITLE: u32 = 57;
 pub const DASHBOARD_TITLE_MAX: usize = 32;
+/// args[0] VM, [1] first vCPU: data = CtlVcpuStat[] from that vCPU on,
+/// vals[0] = count, [1] the VMM's host core, [2] the VMM's CPU in the last
+/// balancer period (permille of a core); both u64::MAX without a running
+/// VMM.
+pub const CTL_VM_VCPU_STATS: u32 = 58;
 /// CTL_NIC_INFO: vals[0] BDF, [1] switch (u64::MAX: none), [2] MAC, [3]
 /// state | trust << 8 | driver << 16 (0xff: none) | restarts << 32 |
 /// isolation group size << 48, [4] vendor | device << 16, [5] the
@@ -513,6 +518,17 @@ pub struct CtlIp {
     pub ip_lo: u64,
 }
 
+/// One vCPU over the last balancer period (DESIGN.md §7): the host core
+/// (logical CPU) it is placed on, the CPU it used there in permille of
+/// that core, and its steal time since it started.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct CtlVcpuStat {
+    pub core: u32,
+    pub usage: u32,
+    pub steal_ns: u64,
+}
+
 pub const VM_CREATED: u32 = 1;
 pub const VM_RUNNING: u32 = 2;
 pub const VM_STOPPED: u32 = 3;
@@ -599,6 +615,8 @@ const _: () = assert!(core::mem::size_of::<CtlReq>() <= CTL_SYNC_OFF);
 const _: () = assert!(CTL_SYNC_OFF + core::mem::size_of::<CtlSync>() <= CTL_RESP_OFF);
 const _: () = assert!(CTL_RESP_OFF + core::mem::size_of::<CtlResp>() <= 4096);
 const _: () = assert!(core::mem::size_of::<CtlVm>() == 56);
+const _: () = assert!(core::mem::size_of::<CtlVcpuStat>() == 16);
+const _: () = assert!(MAX_VCPUS * core::mem::size_of::<CtlVcpuStat>() <= CTL_DATA_MAX);
 const _: () = assert!(core::mem::size_of::<MemPage>() == 128);
 const _: () = assert!(HP_L1_GUARD == 3 && MAX_RAM_L1 << 30 >> HP_SHIFT == HP_MAX);
 

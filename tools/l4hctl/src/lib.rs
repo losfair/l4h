@@ -78,6 +78,7 @@ pub const CTL_IP_ADD: u32 = 54;
 pub const CTL_IP_DEL: u32 = 55;
 pub const CTL_IP_LIST: u32 = 56;
 pub const CTL_DASHBOARD_TITLE: u32 = 57;
+pub const CTL_VM_VCPU_STATS: u32 = 58;
 pub const DASHBOARD_TITLE_MAX: usize = 32;
 pub const PCI_OWNER_NONE: u16 = 0;
 pub const PCI_OWNER_BLKD: u16 = 1;
@@ -1159,6 +1160,21 @@ impl Ctl {
         Ok((r.vals[0], r.vals[1]))
     }
 
+    /// Each vCPU's host core and CPU over the last 100 ms, and the VMM's
+    /// (`CTL_VM_VCPU_STATS`): an error from a host that predates the call.
+    pub fn vm_vcpu_stats(&self, vm: u64) -> Result<VcpuStats> {
+        let mut out = VcpuStats::default();
+        loop {
+            let r = self.call(CTL_VM_VCPU_STATS, &[vm, out.vcpus.len() as u64], &[], &[])?;
+            let page = parse_vcpu_stats(r.vals, &r.data);
+            out.vmm = page.vmm;
+            if page.vcpus.is_empty() {
+                return Ok(out);
+            }
+            out.vcpus.extend(page.vcpus);
+        }
+    }
+
     /// Host taint and seal bits (0-63) of this VM instance.
     pub fn vm_trust(&self, vm: u64) -> Result<(u64, u64)> {
         let r = self.call(CTL_VM_TRUST, &[vm], &[], &[])?;
@@ -1558,6 +1574,83 @@ mod steer_tests {
         for s in ["203.0.113.5/icmp:1", "203.0.113.5/tcp:0", "203.0.113.5/0", "nope", "1.2.3.4/tcp:70000"] {
             assert!(SteerMatch::parse(s).is_err(), "{s}");
         }
+    }
+}
+
+/// One vCPU over the last balancer period: its host core (logical CPU),
+/// the CPU it used there (permille of that core) and its steal time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VcpuStat {
+    pub core: u64,
+    pub usage: u64,
+    pub steal_ns: u64,
+}
+
+/// A VM's vCPUs, and its VMM's (host core, permille) while it runs.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VcpuStats {
+    pub vcpus: Vec<VcpuStat>,
+    pub vmm: Option<(u64, u64)>,
+}
+
+impl VcpuStats {
+    /// What the VM used of each of `cores` host cores, in permille of it:
+    /// its vCPUs and its VMM where they are placed.
+    pub fn per_core(&self, cores: usize) -> Vec<u64> {
+        let mut out = vec![0; cores];
+        let placed = self.vcpus.iter().map(|v| (v.core, v.usage)).chain(self.vmm);
+        for (core, usage) in placed {
+            if let Some(c) = out.get_mut(core as usize) {
+                *c += usage;
+            }
+        }
+        out
+    }
+}
+
+/// One page of CTL_VM_VCPU_STATS: vals[0] records of 16 bytes (u32 core,
+/// u32 usage, u64 steal_ns, little-endian); vals[1..3] the VMM's core and
+/// use, u64::MAX without one.
+fn parse_vcpu_stats(v: [u64; 6], data: &[u8]) -> VcpuStats {
+    let n = (v[0] as usize).min(data.len() / 16);
+    let vcpus = data[..n * 16]
+        .chunks_exact(16)
+        .map(|r| VcpuStat {
+            core: u32::from_le_bytes(r[0..4].try_into().unwrap()) as u64,
+            usage: u32::from_le_bytes(r[4..8].try_into().unwrap()) as u64,
+            steal_ns: u64::from_le_bytes(r[8..16].try_into().unwrap()),
+        })
+        .collect();
+    let vmm = (v[1] != u64::MAX).then_some((v[1], v[2]));
+    VcpuStats { vcpus, vmm }
+}
+
+#[cfg(test)]
+mod vcpu_stats_tests {
+    use super::*;
+
+    fn record(core: u32, usage: u32, steal: u64) -> Vec<u8> {
+        [core.to_le_bytes().as_slice(), &usage.to_le_bytes(), &steal.to_le_bytes()].concat()
+    }
+
+    #[test]
+    fn records_and_the_vmm() {
+        let mut data = [0; CTL_DATA_MAX];
+        let recs = [record(3, 950, 7), record(1, 20, 0)].concat();
+        data[..recs.len()].copy_from_slice(&recs);
+        let s = parse_vcpu_stats([2, 3, 40, 0, 0, 0], &data);
+        assert_eq!(s.vcpus, vec![VcpuStat { core: 3, usage: 950, steal_ns: 7 }, VcpuStat { core: 1, usage: 20, steal_ns: 0 }]);
+        assert_eq!(s.vmm, Some((3, 40)));
+        // Core 3 has the vCPU and the VMM; a core past the host's is dropped.
+        assert_eq!(s.per_core(4), vec![0, 20, 0, 990]);
+        assert_eq!(s.per_core(2), vec![0, 20]);
+    }
+
+    #[test]
+    fn no_vmm_and_a_count_past_the_data() {
+        let s = parse_vcpu_stats([1000, u64::MAX, u64::MAX, 0, 0, 0], &[0; 32]);
+        assert_eq!(s.vcpus.len(), 2);
+        assert_eq!(s.vmm, None);
     }
 }
 

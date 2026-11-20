@@ -4020,7 +4020,7 @@ none. dom0 runs no host hardware drivers.
 | Area | Operations |
 |------|------------|
 | Host | `host_version` (build version and seL4/FL4 kernel); `host_info` (cores, free/total bytes, disk, VM and NIC counts); `pci_list` (boot inventory, IDs, class and service owner); `host_reboot`; `rtc_set`; `iommu_info` (§9.5); `log_read` (§10); `dashboard_title` (§7.7) |
-| Guests | `vm_create`, `vm_load`, `vm_start`, `vm_shutdown`, `vm_destroy`, `vm_list`, `vm_info` (cores of the first six vCPUs), `vm_stats` (CPU use and cap), `vm_set_sched`, `vm_set_mem`, `vm_mem_info` (§8.5), `vm_trust` (flags, §10.2) |
+| Guests | `vm_create`, `vm_load`, `vm_start`, `vm_shutdown`, `vm_destroy`, `vm_list`, `vm_info` (cores of the first six vCPUs), `vm_stats` (CPU use and cap), `vm_vcpu_stats` (each vCPU's core, CPU use and steal, and the VMM's core and use: each host core's guest load), `vm_set_sched`, `vm_set_mem`, `vm_mem_info` (§8.5), `vm_trust` (flags, §10.2) |
 | Block | `blk_attach` (disk, read-only and volatile flags, LBA window), `blk_write` (provisioning), `blk_info`, `disk_info` |
 | Network | `switch_create`, `switch_attach_uplink`, `nic_create` (MAC, MAC lock, isolation), `switch_info` (ports with VM and MAC, counters), `nic_info` (PCI address, switch, MAC) |
 | Console | `console_read` (offset, bytes and lost-byte count), `console_write` |
