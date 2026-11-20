@@ -44,6 +44,18 @@ echo "M6TEST: capped at 25%: ${after}%"
 # (21% on x86/KVM).  The upper bound is what shows the cap holds.
 lo=15
 [ "$slow" -gt 1 ] && lo=10
+# A reading under the floor is taken again, up to twice: aarch64/TCG read
+# 8% once on a shared runner, against 13-23% in the 25 runs before it and
+# 17% on the same tree an hour earlier.  A cap set too tight stays under
+# the floor on every try; a reading over the upper bound fails at once.
+tries=1
+while [ "$after" -lt "$lo" ] && [ "$tries" -lt 3 ]; do
+    echo "M6TEST: capped reading ${after}% under ${lo}%, resampling"
+    sleep 2
+    after=$(cpu hog)
+    tries=$((tries + 1))
+    echo "M6TEST: capped at 25%: ${after}%"
+done
 [ "$after" -ge "$lo" ] && [ "$after" -le 35 ] || fail "cap not applied (${after}%)"
 l4hctl sched "$id" 0
 sleep 2
