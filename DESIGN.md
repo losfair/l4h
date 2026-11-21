@@ -5525,6 +5525,13 @@ python3 tests/run-smpbench.py --prepare-only
 python3 tests/run-smpbench.py --skip-build --output build/smpbench/comparison
 ```
 
+Both guest benchmarks boot Linux with `quiet`, and smpbench prints its
+results only at the end: l4h-logd writes console output to the serial port
+one byte per I/O port invocation, about 23 KB/s, so the boot log (12 KB)
+would still be draining during the first half second of measurements, and
+each result line during the next phase, slowing syscalls (on seL4 and,
+under the serial gate, on FL4 on every core; logd's own core in any case).
+
 `tests/run-primitivebench.py` measures the microkernel APIs directly;
 `--source tests/primitive-smp.c` selects concurrent copy/map/delete cycles.
 `tests/run-forkbench.py` compares fork, vfork and shared-address-space clone

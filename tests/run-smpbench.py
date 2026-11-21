@@ -192,7 +192,9 @@ def boot(args, env, backend, vcpus, repetition):
     dest.mkdir()
     config = dest / "l4h.conf"
     config.write_text(f"dom0_vcpus={vcpus}\ndom0_mem_mb=512\nwatchdog_secs=0\n"
-                      f"dom0_cmdline=console=hvc0 SMPBENCH_DIVISOR={args.divisor}\n")
+                      # quiet: logd drains the guest's boot log during the
+                      # first measurements otherwise (smpbench.c).
+                      f"dom0_cmdline=console=hvc0 quiet SMPBENCH_DIVISOR={args.divisor}\n")
     image = dest / "root-dom0.elf"
     run([str(ROOT / "tools/add-modules.py"), str(args.images / backend / "root.elf"),
          str(image), f"guest-kernel={args.images / 'linux.elf'}",

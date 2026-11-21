@@ -71,15 +71,25 @@ static void reap(pid_t pid)
 	check(WIFEXITED(status) && WEXITSTATUS(status) == 0, "worker status");
 }
 
+/* Results wait for the end of the run: the host writes console output to
+ * the serial port slowly (about 23 KB/s) and through the microkernel, and a
+ * result line printed between phases is still draining during the next
+ * one, slowing every vCPU's syscalls. */
+static char results[8192];
+static size_t results_len;
+
 static void report(const char *metric, uint64_t elapsed, uint64_t ops,
 		   const char *unit, int latency, uint64_t checksum)
 {
 	check(elapsed > 0, "elapsed time");
 	double value = latency ? (double)elapsed / ops / 1000.0 :
 		(double)ops * 1e9 / elapsed;
-	printf("SMPBENCH: phase=%s metric=%s workers=%u value=%.6f unit=%s "
-	       "elapsed_ns=%" PRIu64 " operations=%" PRIu64 " checksum=%" PRIu64 "\n",
-	       phase, metric, workers, value, unit, elapsed, ops, checksum);
+	int n = snprintf(results + results_len, sizeof(results) - results_len,
+			 "SMPBENCH: phase=%s metric=%s workers=%u value=%.6f unit=%s "
+			 "elapsed_ns=%" PRIu64 " operations=%" PRIu64 " checksum=%" PRIu64 "\n",
+			 phase, metric, workers, value, unit, elapsed, ops, checksum);
+	check(n > 0 && (size_t)n < sizeof(results) - results_len, "result buffer");
+	results_len += n;
 }
 
 enum workload { COMPUTE, SYSCALL, FAULT, FORK };
@@ -306,6 +316,7 @@ int main(int argc, char **argv)
 			futex_pingpong(1, 10000 / divisor);
 		}
 	}
+	fputs(results, stdout);
 	puts("SMPBENCH: done");
 	return 0;
 }
