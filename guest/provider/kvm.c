@@ -340,10 +340,66 @@ int l4h_arm_s2_map_frame(unsigned long frame, unsigned long s2_root, unsigned lo
 				     ((prot & L4H_PROT_EXEC) ? 0 : seL4_ARM_ExecuteNever);
 	int err = seL4_ARM_Page_Map(frame, s2_root, ipa, r, attr);
 
-	/* The guest fetches what its host wrote through the data side. */
-	if (!err && (prot & L4H_PROT_EXEC) && !(prot & L4H_PROT_DEVICE))
+	/* The guest fetches what its host wrote through the data side; with
+	 * CTR_EL0.IDC and DIC the hardware keeps them coherent itself. */
+	if (!err && (prot & L4H_PROT_EXEC) && !(prot & L4H_PROT_DEVICE) &&
+	    (l4h_bootinfo->arm_virt.ctr_el0 & (3ull << 28)) != (3ull << 28))
 		err = seL4_ARM_Page_Unify_Instruction(frame, 0, (prot & L4H_PROT_LARGE) ? 1ul << 21 : 4096);
 	return err;
+}
+
+_Static_assert(L4H_VCPU_STATE_OFFSET >= L4H_FPU_SCRATCH_OFFSET + seL4_FPUStateSize,
+	       "VCPU state overlaps FPU scratch");
+_Static_assert(L4H_VCPU_STATE_OFFSET + sizeof(struct l4h_arm_vcpu_state) <= (1ul << seL4_PageBits),
+	       "VCPU state must fit in IPC buffer frame");
+_Static_assert(L4H_VCPU_STATE_OFFSET % 64 == 0, "VCPU state alignment");
+
+int l4h_arm_vcpu_enter(unsigned long vcpu, unsigned long in_mask, unsigned long out_mask,
+		       struct l4h_arm_vmexit *x)
+{
+	seL4_ARM_VCPU_Run_t r = seL4_ARM_VCPU_Run(vcpu, L4H_VCPU_STATE_OFFSET, in_mask, out_mask);
+
+	*x = (struct l4h_arm_vmexit){ 0 };
+	if (r.error) {
+		x->stop = L4H_ARM_STOP_OTHER;
+		return x->stop;
+	}
+	switch (r.stop) {
+	case seL4_ARM_VCPURunStop_Interrupt:
+		/* The events that stopped it, taken off the notification. */
+		if (r.w1)
+			__atomic_or_fetch(&l4h_this_vcpu()->ntfn_pending, r.w1, __ATOMIC_RELEASE);
+		x->stop = L4H_ARM_STOP_INTERRUPT;
+		break;
+	case seL4_ARM_VCPURunStop_VMFault:
+		x->stop = L4H_ARM_STOP_VMFAULT;
+		x->esr = r.w1;
+		x->ipa = r.w2;
+		x->far = r.w3;
+		x->is_prefetch = (r.w1 >> 26) == 0x20;
+		break;
+	case seL4_ARM_VCPURunStop_VCPUFault:
+		x->stop = L4H_ARM_STOP_VCPUFAULT;
+		x->esr = r.w1;
+		x->far = r.w2;
+		x->hpfar = r.w3;
+		break;
+	case seL4_ARM_VCPURunStop_VGICMaint:
+		x->stop = L4H_ARM_STOP_VGIC_MAINT;
+		if (r.w1) {
+			x->vgic_idx_valid = 1;
+			x->vgic_idx = (unsigned int)__builtin_ctzll(r.w1);
+		}
+		break;
+	case seL4_ARM_VCPURunStop_VPPI:
+		x->stop = L4H_ARM_STOP_VPPI;
+		x->vppi_irq = r.w1;
+		break;
+	default:
+		x->stop = L4H_ARM_STOP_OTHER;
+		break;
+	}
+	return x->stop;
 }
 
 int l4h_arm_vcpu_run(struct l4h_uctx *u, struct l4h_arm_vmexit *x)
@@ -513,6 +569,16 @@ int l4h_arm_s2_map_frame(unsigned long frame, unsigned long s2_root, unsigned lo
 int l4h_arm_vcpu_run(struct l4h_uctx *u, struct l4h_arm_vmexit *x)
 {
 	(void)u;
+	(void)x;
+	panic("l4h: ABI provider does not support AArch64 KVM\n");
+}
+
+int l4h_arm_vcpu_enter(unsigned long vcpu, unsigned long in_mask, unsigned long out_mask,
+		       struct l4h_arm_vmexit *x)
+{
+	(void)vcpu;
+	(void)in_mask;
+	(void)out_mask;
 	(void)x;
 	panic("l4h: ABI provider does not support AArch64 KVM\n");
 }

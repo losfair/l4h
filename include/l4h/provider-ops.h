@@ -82,3 +82,4 @@ L4H_PROVIDER_OP(int, l4h_arm_vcpu_write_state, (unsigned long vcpu, unsigned lon
 L4H_PROVIDER_OP(int, l4h_arm_s2_map_table, (unsigned long table, unsigned long s2_root, unsigned long ipa), (table, s2_root, ipa))
 L4H_PROVIDER_OP(int, l4h_arm_s2_map_frame, (unsigned long frame, unsigned long s2_root, unsigned long ipa, int prot), (frame, s2_root, ipa, prot))
 L4H_PROVIDER_OP(int, l4h_arm_vcpu_run, (struct l4h_uctx *u, struct l4h_arm_vmexit *x), (u, x))
+L4H_PROVIDER_OP(int, l4h_arm_vcpu_enter, (unsigned long vcpu, unsigned long in_mask, unsigned long out_mask, struct l4h_arm_vmexit *x), (vcpu, in_mask, out_mask, x))

@@ -19,6 +19,8 @@ here is that host's EL1 half, with FL4 as its world switch:
 - arch_timer.c: the virtual timer interrupt is FL4's VPPI exit, injected
   through the vgic, not a host interrupt mapped to the guest's; the
   physical timer is emulated.
+- guest.c, reset.c: a vCPU's FP/SIMD registers stay in FL4 between
+  entries; ONE_REG and a reset tell the backend before they reach them.
 - kvm_main.c: the PIO page 0016 adds is x86_64's alone.
 
 --- a/virt/kvm/kvm_main.c
@@ -368,3 +370,40 @@ here is that host's EL1 half, with FL4 as its world switch:
  
  static phys_addr_t __stage2_range_addr_end(phys_addr_t addr, phys_addr_t end,
  					   phys_addr_t size)
+--- a/arch/arm64/kvm/guest.c
++++ b/arch/arm64/kvm/guest.c
+@@ -206,6 +206,11 @@
+ 	if (!addr)
+ 		return -EINVAL;
+ 
++#ifdef CONFIG_L4H
++	/* FL4 has the FP/SIMD registers until we ask. */
++	if (off >= KVM_REG_ARM_CORE_REG(fp_regs))
++		l4h_arm_vcpu_sync_fp(vcpu, false);
++#endif
+ 	if (copy_to_user(uaddr, addr, KVM_REG_SIZE(reg->id)))
+ 		return -EFAULT;
+ 
+@@ -272,6 +277,10 @@
+ 		}
+ 	}
+ 
++#ifdef CONFIG_L4H
++	if (off >= KVM_REG_ARM_CORE_REG(fp_regs))
++		l4h_arm_vcpu_sync_fp(vcpu, true);
++#endif
+ 	memcpy(addr, valp, KVM_REG_SIZE(reg->id));
+ 
+ 	if (*vcpu_cpsr(vcpu) & PSR_MODE32_BIT) {
+--- a/arch/arm64/kvm/reset.c
++++ b/arch/arm64/kvm/reset.c
+@@ -220,6 +220,9 @@
+ 	/* Reset core registers */
+ 	memset(vcpu_gp_regs(vcpu), 0, sizeof(*vcpu_gp_regs(vcpu)));
+ 	memset(&vcpu->arch.ctxt.fp_regs, 0, sizeof(vcpu->arch.ctxt.fp_regs));
++#ifdef CONFIG_L4H
++	l4h_arm_vcpu_reset_fp(vcpu);
++#endif
+ 	vcpu->arch.ctxt.spsr_abt = 0;
+ 	vcpu->arch.ctxt.spsr_und = 0;
+ 	vcpu->arch.ctxt.spsr_irq = 0;

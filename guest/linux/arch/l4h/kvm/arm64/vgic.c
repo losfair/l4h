@@ -2,7 +2,7 @@
 /*
  * The VGIC's hardware side: the list registers and controls of the loaded
  * vCPU, which FL4 keeps for its VCPU (VGIC_* of seL4_VCPUReg) and we in
- * its `state` page (vcpu.c), loaded into the CPU on entry.
+ * its `state` (vcpu.c), sent to FL4 on the next entry when they change.
  *
  * GICv3: what VHE hyp code does with ICH_*_EL2 (hyp/vgic-v3-sr.c), here
  * on `state`; arch/arm64/kvm's ICH_* register accesses come here too
@@ -26,6 +26,15 @@
 static u64 *vreg(struct l4h_arm_vcpu *v, int r)
 {
 	return &v->state->regs[r];
+}
+
+/* A write: FL4 gets the VGIC group on the next entry if it changed it. */
+static void vset(struct l4h_arm_vcpu *v, int r, u64 val)
+{
+	if (*vreg(v, r) != val) {
+		*vreg(v, r) = val;
+		v->vgic_dirty = true;
+	}
 }
 
 static struct l4h_arm_vcpu *loaded(void)
@@ -73,10 +82,10 @@ void __vgic_v3_save_state(struct vgic_v3_cpu_if *cpu_if)
 	 * guest did not run (an event stopped it first) after we wrote the
 	 * LRs.  A consumed LR has its state bits clear anyway.
 	 */
-	*vreg(v, L4H_ARM_VCPUREG_VGIC_HCR) = cpu_if->vgic_hcr & ~ICH_HCR_EL2_En;
+	vset(v, L4H_ARM_VCPUREG_VGIC_HCR, cpu_if->vgic_hcr & ~ICH_HCR_EL2_En);
 	for (i = 0; i < cpu_if->used_lrs; i++) {
 		cpu_if->vgic_lr[i] = *vreg(v, L4H_ARM_VCPUREG_VGIC_LR0 + i);
-		*vreg(v, L4H_ARM_VCPUREG_VGIC_LR0 + i) = 0;
+		vset(v, L4H_ARM_VCPUREG_VGIC_LR0 + i, 0);
 	}
 }
 
@@ -87,9 +96,9 @@ void __vgic_v3_restore_state(struct vgic_v3_cpu_if *cpu_if)
 
 	if (!v)
 		return;
-	*vreg(v, L4H_ARM_VCPUREG_VGIC_HCR) = cpu_if->vgic_hcr;
+	vset(v, L4H_ARM_VCPUREG_VGIC_HCR, cpu_if->vgic_hcr);
 	for (i = 0; i < cpu_if->used_lrs; i++)
-		*vreg(v, L4H_ARM_VCPUREG_VGIC_LR0 + i) = cpu_if->vgic_lr[i];
+		vset(v, L4H_ARM_VCPUREG_VGIC_LR0 + i, cpu_if->vgic_lr[i]);
 }
 
 /* The guest's GIC is enabled (ICH_HCR_EL2.En) whenever it has one. */
@@ -98,7 +107,7 @@ void __vgic_v3_activate_traps(struct vgic_v3_cpu_if *cpu_if)
 	struct l4h_arm_vcpu *v = loaded();
 
 	if (v)
-		*vreg(v, L4H_ARM_VCPUREG_VGIC_HCR) = cpu_if->vgic_hcr;
+		vset(v, L4H_ARM_VCPUREG_VGIC_HCR, cpu_if->vgic_hcr);
 }
 
 void __vgic_v3_deactivate_traps(struct vgic_v3_cpu_if *cpu_if)
@@ -106,7 +115,7 @@ void __vgic_v3_deactivate_traps(struct vgic_v3_cpu_if *cpu_if)
 	struct l4h_arm_vcpu *v = loaded();
 
 	if (v)
-		*vreg(v, L4H_ARM_VCPUREG_VGIC_HCR) = 0;
+		vset(v, L4H_ARM_VCPUREG_VGIC_HCR, 0);
 }
 
 void __vgic_v3_save_vmcr_aprs(struct vgic_v3_cpu_if *cpu_if)
@@ -130,10 +139,10 @@ void __vgic_v3_restore_vmcr_aprs(struct vgic_v3_cpu_if *cpu_if)
 
 	if (!v)
 		return;
-	*vreg(v, L4H_ARM_VCPUREG_VGIC_VMCR) = cpu_if->vgic_vmcr;
+	vset(v, L4H_ARM_VCPUREG_VGIC_VMCR, cpu_if->vgic_vmcr);
 	for (i = 0; i < 4; i++) {
-		*vreg(v, L4H_ARM_VCPUREG_VGIC_AP0R0 + i) = cpu_if->vgic_ap0r[i];
-		*vreg(v, L4H_ARM_VCPUREG_VGIC_AP1R0 + i) = cpu_if->vgic_ap1r[i];
+		vset(v, L4H_ARM_VCPUREG_VGIC_AP0R0 + i, cpu_if->vgic_ap0r[i]);
+		vset(v, L4H_ARM_VCPUREG_VGIC_AP1R0 + i, cpu_if->vgic_ap1r[i]);
 	}
 }
 
@@ -188,7 +197,7 @@ bool l4h_sysreg_vgic(u32 enc, u64 *val, bool write)
 	v = loaded();
 	if (write) {
 		if (v)
-			*vreg(v, r) = *val;
+			vset(v, r, *val);
 	} else {
 		*val = v ? *vreg(v, r) : 0;
 	}
@@ -262,7 +271,7 @@ void l4h_kvm_writel(u32 val, volatile void __iomem *addr)
 		return;
 	r = gich_reg(v, off, &shift);
 	if (r)
-		*r = (*r & ~(0xffffffffull << shift)) | ((u64)val << shift);
+		vset(v, r - v->state->regs, (*r & ~(0xffffffffull << shift)) | ((u64)val << shift));
 }
 
 void __iomem *l4h_kvm_ioremap(phys_addr_t phys, size_t size)

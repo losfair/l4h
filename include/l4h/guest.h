@@ -355,6 +355,8 @@ struct l4h_arm_vmexit {
 	unsigned long ipa;
 	unsigned long fault_ip;
 	unsigned long vppi_irq;
+	unsigned long far;	/* FAR_EL2 of a Stage-2 abort or trap */
+	unsigned long hpfar;	/* HPFAR_EL2 of a trap */
 };
 
 int l4h_arm_vcpu_set_tcb(unsigned long vcpu, unsigned long tcb);
@@ -378,6 +380,13 @@ int l4h_arm_s2_map_frame(unsigned long frame, unsigned long s2_root, unsigned lo
  * of this vCPU arrives.  Its registers are the VCPU's state
  * (l4h_arm_vcpu_write_state), not gp[].  Returns x->stop. */
 int l4h_arm_vcpu_run(struct l4h_uctx *u, struct l4h_arm_vmexit *x);
+/* Run VCPU `vcpu` (bound to a TCB of ours on a Stage-2 root) on this
+ * vCPU's own thread until an exit or one of its events (FL4's
+ * seL4_ARM_VCPU_Run): the state groups in `in_mask` go in from, and those
+ * in `out_mask` come back to, the struct l4h_arm_vcpu_state at
+ * L4H_VCPU_STATE_OFFSET in this vCPU's IPC buffer.  Returns x->stop. */
+int l4h_arm_vcpu_enter(unsigned long vcpu, unsigned long in_mask, unsigned long out_mask,
+		       struct l4h_arm_vmexit *x);
 
 /* ---- events, timers, idle */
 unsigned long long l4h_rdtsc(void);

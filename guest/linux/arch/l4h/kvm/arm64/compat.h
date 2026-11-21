@@ -240,6 +240,10 @@ int l4h_arm_vcpu_create(struct kvm_vcpu *vcpu);
 void l4h_arm_vcpu_destroy(struct kvm_vcpu *vcpu);
 void l4h_arm_vcpu_load(struct kvm_vcpu *vcpu);
 void l4h_arm_vcpu_put(struct kvm_vcpu *vcpu);
+/* vcpu->arch.ctxt.fp_regs made current before KVM reads it (write: and
+ * modifies it), or reset (it went into FL4 lazily, vcpu.c). */
+void l4h_arm_vcpu_sync_fp(struct kvm_vcpu *vcpu, bool write);
+void l4h_arm_vcpu_reset_fp(struct kvm_vcpu *vcpu);
 void l4h_kvm_timer_sync(struct kvm_vcpu *vcpu, bool *level);
 
 /* MPIDR of a guest kernel vCPU: its number (arch/l4h/kvm/arm64/init.c). */

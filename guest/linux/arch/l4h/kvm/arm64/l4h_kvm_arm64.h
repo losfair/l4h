@@ -39,22 +39,24 @@ struct l4h_s2 {
 
 /*
  * A KVM vCPU on FL4: a VCPU object bound to a TCB of ours whose VSpace is
- * the VM's Stage-2 root and whose faults reach this vCPU's endpoint, run
- * with the vCPU's user scheduling context as a user context would be
- * (guest/provider kvm.c, l4h_arm_vcpu_run()).  `state` is what FL4 holds
- * for it, in a page of ours (l4h_arm_vcpu_read_state/write_state): the
- * registers KVM would find in the CPU while the vCPU is loaded.
+ * the VM's Stage-2 root, entered from our vCPU's own thread
+ * (seL4_ARM_VCPU_Run, guest/provider kvm.c l4h_arm_vcpu_enter()).  `state`
+ * is what FL4 holds for it as we last saw it: the registers KVM would find
+ * in the CPU while the vCPU is loaded.  Entries transfer only the groups
+ * that changed, through our vCPU's IPC buffer (vcpu.c).
  */
 struct l4h_arm_vcpu {
 	struct kvm_vcpu *vcpu;
 	struct l4h_obj vcpu_obj;
 	struct l4h_obj tcb_obj;
-	struct l4h_obj reply_obj;
-	struct l4h_uctx uctx;
-	struct l4h_arm_vcpu_state *state;	/* our page */
-	unsigned long state_frame;		/* its frame capability */
+	struct l4h_uctx uctx;			/* the TCB, for its FP state */
+	struct l4h_arm_vcpu_state *state;
 	unsigned long s2_root;			/* the TCB's VSpace */
 	bool vppi_masked;			/* FL4 holds PPI 27 masked */
+	bool synced;		/* FL4's VCPU holds `state` (groups we send) */
+	bool timer_dirty;	/* the TIMER group changed since the last entry */
+	bool vgic_dirty;	/* the VGIC group changed since the last entry */
+	int fp_state;		/* L4H_FP_*: where the guest's FP/SIMD state is */
 };
 
 static inline struct l4h_s2 *to_s2(struct kvm *kvm)

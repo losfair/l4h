@@ -1134,15 +1134,18 @@ a backend in `arch/l4h/kvm/arm64` (patch `0019-kvm-arm64-on-l4h.patch`):
   registers no `/dev/kvm`. The ID registers guests see are the boot CPU's
   without what FL4 does not switch for them (SVE, SME, MTE, pointer
   authentication, MOPS, FGT, ECV, FWB, the PMU, AArch32).
-- **vCPUs.** Each KVM vCPU is an FL4 VCPU bound to a TCB whose VSpace is the
-  VM's Stage-2 root and whose faults reach the running vCPU's endpoint; it
-  runs as a user context does (`l4h_arm_vcpu_run()`), with that vCPU's user
-  scheduling context. KVM keeps the VM's registers in memory; around each
-  entry they go into a page FL4 transfers the VCPU's state through
-  (`ReadState`/`WriteState`), which also holds what a VHE host keeps in the
-  CPU while a vCPU is loaded (the virtual timer, the VGIC list registers),
-  so that KVM's system register accesses reach it. FL4's exits become KVM's
-  (Stage-2 aborts, traps, VGIC maintenance, events).
+- **vCPUs.** Each KVM vCPU is an FL4 VCPU bound to a TCB of ours whose
+  VSpace is the VM's Stage-2 root. The vCPU thread enters it itself, on its
+  own scheduling context (`seL4_ARM_VCPU_Run`, `l4h_arm_vcpu_enter()`),
+  until the guest exits or one of its events stops it. KVM keeps the VM's
+  registers in memory, and a copy of what FL4 holds, which also has what a
+  VHE host keeps in the CPU while a vCPU is loaded (the virtual timer, the
+  VGIC list registers), so that KVM's system register accesses reach it.
+  Each entry sends FL4 only the state groups that changed since it last had
+  them and takes back those the guest changes, through the state area of
+  the vCPU's IPC buffer (`L4H_VCPU_STATE_OFFSET`); FP/SIMD stays in the TCB
+  until KVM reads or resets it. FL4's exits become KVM's (Stage-2 aborts,
+  traps, VGIC maintenance, events).
 - **Memory.** FL4's Stage-2 VSpace caches the leaves of KVM's software
   table, kept in step after each change by wrappers of KVM's Stage-2
   operations, as the EPT does for x86_64 above.

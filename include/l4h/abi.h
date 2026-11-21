@@ -180,6 +180,9 @@ typedef int64_t l4h_s64;
 /* FPU transfers (seL4_TCB_ReadFPU/WriteFPU) use this offset in IPCBUF. */
 /* Leave the IPC buffer's first KiB intact and allow up to 3 KiB of XSAVE. */
 #define L4H_FPU_SCRATCH_OFFSET  1024
+/* FL4 VCPU state transfers on AArch64 (seL4_ARM_VCPU_Run) use this offset
+ * in IPCBUF: 64-byte aligned, after the FPU scratch area. */
+#define L4H_VCPU_STATE_OFFSET   2048
 #define L4H_DEV_AREA_VA(d)      (L4H_SPECIAL_BASE + 0x10000000ull + (l4h_u64)(d) * 0x10000ull)
 /* Bulk data area of the control device (dom0 only, L4H_CTL_LOAD_MAX). */
 #define L4H_CTL_DATA_VA         (L4H_SPECIAL_BASE + 0x20000000ull)
