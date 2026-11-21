@@ -5004,6 +5004,13 @@ injects these failures in a host built with `L4H_TEST_INJECT=1`;
      SSD (4 KiB blocks) passed through, and 12 small guests;
      `SCSI_DISK_GB=10` also reads the boot disk and writes an extra blank
      one.
+   - `tests/gce-bench.sh PROJECT [ZONE] [MACHINE_TYPE]` measures guest
+     syscall latency under FL4 (release build): getpid on 1..N pinned
+     processes (`tests/guest/syscallbench.c`, `VCPUS=n` dom0 vCPUs,
+     default 2), on an NVMe boot disk and a gVNIC (N4's requirements).
+     On n4-standard-4/-8 (Emerald Rapids) FL4 #61 and the isolated reply
+     objects (`l4h_obj_alloc()`) took getpid from 1.97 to 0.97 us on one
+     vCPU, 2.35 to 1.20 us on two and 1.60 to 1.35 us on four cores.
 3. **AWS EC2.** c6i.xlarge boots the generic UEFI image with ENA and NVMe
    EBS. `tools/ec2-image.py` imports a raw disk through the EBS direct API
    and registers a private UEFI/ENA AMI. `tests/build-ec2.sh` and
@@ -5769,7 +5776,7 @@ tools/build-fl4.sh
 SEL4_PREFIX="$PWD/build/sel4-fl4" L4H_KERNEL_VARIANT=fl4 tests/run-selftest.sh 4
 ```
 
-The tested FL4 revision is `6d1355e9f658718b124185d136591e4b2b2542c9`.
+The tested FL4 revision is `039fb24c363b6e5deebab6fca54dc40e8f597ebb`.
 `prepare-fl4.sh` clones the pinned public revision, or the frozen override,
 into `build/FL4-src` without applying any kernel patches. The source
 worktree is not edited.

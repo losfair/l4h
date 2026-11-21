@@ -51,7 +51,7 @@ driver compromise does not let the attacker tamper with VMs.
 
 - Generic QEMU/KVM with virtio-blk/virtio-scsi/nvme and virtio-net
 - AWS: c6i
-- GCP: n2, c3
+- GCP: n2, c3, n4
 - Bare metal: Latitude m4.metal.small
 
 ## Features
