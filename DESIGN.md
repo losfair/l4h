@@ -1070,6 +1070,13 @@ vendor, as seL4 makes it).
   RDTSCP/RDPID (seL4 does not switch `TSC_AUX`), hardware breakpoints in
   the guest, and the speculation-control MSRs (hidden from guests, which
   get no IBPB between nested VMs either). SMM is not built.
+- **5-level paging** is hidden (CPUID LA57). FL4 pages with 4 levels and
+  keeps CR4.LA57 out of the CR4 a guest runs with, without an error. A
+  nested guest that turned it on walked its 5-level tables as 4-level ones
+  and triple-faulted (issue #213), which hit `-cpu host` and every kernel
+  built with `CONFIG_X86_5LEVEL`. Without LA57, KVM treats CR4.LA57 as
+  reserved, so a VMM that forces `+la57` gets a #GP in the guest, and KVM
+  checks canonical addresses in 48 bits, as FL4 does.
 - **Huge pages.** A new memslot asks for THP behind it (`MADV_HUGEPAGE`,
   unless the VMM said `MADV_NOHUGEPAGE`), for 2 MiB EPT leaves: the guest
   kernel's THP mode is `madvise`, and Firecracker, unlike QEMU, does not
