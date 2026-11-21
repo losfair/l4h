@@ -344,11 +344,20 @@ static unsigned long ctxt_to_state(struct kvm_vcpu *vcpu, struct l4h_arm_vcpu *v
 		mask |= L4H_ARM_VCPU_STATE_TIMER;
 	}
 
-	if (!v->synced || v->vgic_dirty) {
+	if (!v->synced || v->vgic_vmcr_dirty ||
+	    (v->vgic_lr_dirty && l4h_bootinfo->arm_virt.gic_version == 2)) {
 		for (i = L4H_ARM_VCPUREG_VGIC_HCR; i <= L4H_ARM_VCPUREG_VGIC_LR15; i++)
 			st->regs[i] = cur->regs[i];
-		v->vgic_dirty = false;
+		v->vgic_vmcr_dirty = false;
+		v->vgic_lr_dirty = false;
 		mask |= L4H_ARM_VCPU_STATE_VGIC;
+	} else if (v->vgic_lr_dirty) {
+		/* GICv3's hot path: VMCR and the priorities stay in FL4. */
+		st->regs[L4H_ARM_VCPUREG_VGIC_HCR] = cur->regs[L4H_ARM_VCPUREG_VGIC_HCR];
+		for (i = L4H_ARM_VCPUREG_VGIC_LR0; i <= L4H_ARM_VCPUREG_VGIC_LR15; i++)
+			st->regs[i] = cur->regs[i];
+		v->vgic_lr_dirty = false;
+		mask |= L4H_ARM_VCPU_STATE_VGIC_LR;
 	}
 	return mask;
 }
@@ -384,10 +393,16 @@ static void state_to_ctxt(struct kvm_vcpu *vcpu, struct l4h_arm_vcpu *v,
 		ctxt_sys_reg(ctxt, CNTKCTL_EL1) = st->regs[L4H_ARM_VCPUREG_CNTKCTL_EL1];
 		v->vppi_masked = !!(st->vppi_masked & 1);
 	}
-	/* Not vgic_dirty: FL4 has these. */
-	if (mask & L4H_ARM_VCPU_STATE_VGIC)
+	/* Not dirty: FL4 has these. */
+	if (mask & L4H_ARM_VCPU_STATE_VGIC) {
 		for (i = L4H_ARM_VCPUREG_VGIC_HCR; i <= L4H_ARM_VCPUREG_VGIC_LR15; i++)
 			cur->regs[i] = st->regs[i];
+	} else if (mask & L4H_ARM_VCPU_STATE_VGIC_LR) {
+		cur->regs[L4H_ARM_VCPUREG_VGIC_HCR] = st->regs[L4H_ARM_VCPUREG_VGIC_HCR];
+		cur->regs[L4H_ARM_VCPUREG_VGIC_ELRSR] = st->regs[L4H_ARM_VCPUREG_VGIC_ELRSR];
+		for (i = L4H_ARM_VCPUREG_VGIC_LR0; i <= L4H_ARM_VCPUREG_VGIC_LR15; i++)
+			cur->regs[i] = st->regs[i];
+	}
 }
 
 /*
@@ -402,9 +417,11 @@ static void sync_vtimer(struct kvm_vcpu *vcpu, struct l4h_arm_vcpu *v)
 	bool level;
 
 	l4h_kvm_timer_sync(vcpu, &level);
+	/* Unmasked by the next entry's TIMER group (vppi_masked), not
+	 * with a call of its own. */
 	if (v->vppi_masked && !level) {
-		WARN_ON_ONCE(l4h_arm_vcpu_ack_vppi(v->vcpu_obj.cptr, 27));
 		v->vppi_masked = false;
+		v->timer_dirty = true;
 	}
 }
 
@@ -439,11 +456,15 @@ int __kvm_vcpu_run(struct kvm_vcpu *vcpu)
 	}
 	in = ctxt_to_state(vcpu, v, st);
 	out = L4H_ARM_VCPU_STATE_GPRS | L4H_ARM_VCPU_STATE_EL1_SYSREGS | L4H_ARM_VCPU_STATE_TIMER;
-	/* On GICv3 the guest touches ICH_* only with VGIC_HCR set; on GICv2
-	 * the mapped GICV page updates GICH_VMCR even when GICH_HCR is 0. */
-	if (v->state->regs[L4H_ARM_VCPUREG_VGIC_HCR] ||
-	    (l4h_bootinfo->arm_virt.gic_version == 2 && irqchip_in_kernel(vcpu->kvm)))
-		out |= L4H_ARM_VCPU_STATE_VGIC;
+	/* GICv3: the guest changes the LRs only with VGIC_HCR set, and VMCR
+	 * and the priorities stay in FL4 (vgic.c pull_vmcr()).  GICv2: the
+	 * mapped GICV page updates GICH_VMCR even when GICH_HCR is 0. */
+	if (l4h_bootinfo->arm_virt.gic_version == 2) {
+		if (v->state->regs[L4H_ARM_VCPUREG_VGIC_HCR] || irqchip_in_kernel(vcpu->kvm))
+			out |= L4H_ARM_VCPU_STATE_VGIC;
+	} else if (v->state->regs[L4H_ARM_VCPUREG_VGIC_HCR]) {
+		out |= L4H_ARM_VCPU_STATE_VGIC_LR;
+	}
 
 	l4h_arm_vcpu_enter(v->vcpu_obj.cptr, in, out, &x);
 

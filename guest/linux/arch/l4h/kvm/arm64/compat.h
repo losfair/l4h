@@ -244,6 +244,10 @@ void l4h_arm_vcpu_put(struct kvm_vcpu *vcpu);
  * modifies it), or reset (it went into FL4 lazily, vcpu.c). */
 void l4h_arm_vcpu_sync_fp(struct kvm_vcpu *vcpu, bool write);
 void l4h_arm_vcpu_reset_fp(struct kvm_vcpu *vcpu);
+/* GICv3's VMCR and active priorities, which FL4 keeps (vgic.c). */
+void l4h_vgic_v3_pull_vmcr(struct kvm_vcpu *vcpu);
+void l4h_vgic_v3_set_vmcr(struct kvm_vcpu *vcpu, u32 vmcr);
+void l4h_vgic_v3_set_apr(struct kvm_vcpu *vcpu, u8 apr, u8 idx, u32 val);
 void l4h_kvm_timer_sync(struct kvm_vcpu *vcpu, bool *level);
 
 /* MPIDR of a guest kernel vCPU: its number (arch/l4h/kvm/arm64/init.c). */

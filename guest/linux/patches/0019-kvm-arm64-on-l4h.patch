@@ -24,6 +24,9 @@ here is that host's EL1 half, with FL4 as its world switch:
   physical timer is emulated.
 - guest.c, reset.c: a vCPU's FP/SIMD registers stay in FL4 between
   entries; ONE_REG and a reset tell the backend before they reach them.
+- vgic-v3.c, vgic-sys-reg-v3.c: GICv3's VMCR and active priorities stay
+  in FL4 (no save on vcpu_put); reading or setting them goes through the
+  backend.
 - kvm_main.c: the PIO page 0016 adds is x86_64's alone.
 
 --- a/virt/kvm/kvm_main.c
@@ -489,3 +492,48 @@ here is that host's EL1 half, with FL4 as its world switch:
  	vcpu->arch.ctxt.spsr_abt = 0;
  	vcpu->arch.ctxt.spsr_und = 0;
  	vcpu->arch.ctxt.spsr_irq = 0;
+--- a/arch/arm64/kvm/vgic/vgic-v3.c
++++ b/arch/arm64/kvm/vgic/vgic-v3.c
+@@ -220,6 +220,9 @@
+ 	vmcr |= (vmcrp->grpen1 << ICH_VMCR_ENG1_SHIFT) & ICH_VMCR_ENG1_MASK;
+ 
+ 	cpu_if->vgic_vmcr = vmcr;
++#ifdef CONFIG_L4H
++	l4h_vgic_v3_set_vmcr(vcpu, vmcr);
++#endif
+ }
+ 
+ void vgic_v3_get_vmcr(struct kvm_vcpu *vcpu, struct vgic_vmcr *vmcrp)
+@@ -228,6 +231,10 @@
+ 	u32 model = vcpu->kvm->arch.vgic.vgic_model;
+ 	u32 vmcr;
+ 
++#ifdef CONFIG_L4H
++	/* FL4 has VMCR (arch/l4h/kvm/arm64/vgic.c). */
++	l4h_vgic_v3_pull_vmcr(vcpu);
++#endif
+ 	vmcr = cpu_if->vgic_vmcr;
+ 
+ 	if (model == KVM_DEV_TYPE_ARM_VGIC_V2) {
+--- a/arch/arm64/kvm/vgic-sys-reg-v3.c
++++ b/arch/arm64/kvm/vgic-sys-reg-v3.c
+@@ -213,12 +213,19 @@
+ 		vgicv3->vgic_ap1r[idx] = val;
+ 	else
+ 		vgicv3->vgic_ap0r[idx] = val;
++#ifdef CONFIG_L4H
++	l4h_vgic_v3_set_apr(vcpu, apr, idx, val);
++#endif
+ }
+ 
+ static u64 get_apr_reg(struct kvm_vcpu *vcpu, u8 apr, u8 idx)
+ {
+ 	struct vgic_v3_cpu_if *vgicv3 = &vcpu->arch.vgic_cpu.vgic_v3;
+ 
++#ifdef CONFIG_L4H
++	/* FL4 has the active priorities (arch/l4h/kvm/arm64/vgic.c). */
++	l4h_vgic_v3_pull_vmcr(vcpu);
++#endif
+ 	if (apr)
+ 		return vgicv3->vgic_ap1r[idx];
+ 	else

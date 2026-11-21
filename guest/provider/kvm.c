@@ -327,6 +327,14 @@ int l4h_arm_vcpu_write_state(unsigned long vcpu, unsigned long frame, unsigned l
 	return seL4_ARM_VCPU_WriteState(vcpu, frame, offset, mask);
 }
 
+int l4h_arm_vcpu_read_state_self(unsigned long vcpu, unsigned long mask)
+{
+	struct l4h_vcpu *v = l4h_this_vcpu();
+
+	return seL4_ARM_VCPU_ReadState(vcpu, VCPU_CAP(v->id, L4H_VCPU_IPCBUF),
+				       L4H_VCPU_STATE_OFFSET, mask);
+}
+
 int l4h_arm_s2_map_table(unsigned long table, unsigned long s2_root, unsigned long ipa)
 {
 	return seL4_ARM_PageTable_Map(table, s2_root, ipa, seL4_ARM_Default_VMAttributes);
@@ -545,6 +553,13 @@ int l4h_arm_vcpu_write_state(unsigned long vcpu, unsigned long frame, unsigned l
 	(void)vcpu;
 	(void)frame;
 	(void)offset;
+	(void)mask;
+	return seL4_IllegalOperation;
+}
+
+int l4h_arm_vcpu_read_state_self(unsigned long vcpu, unsigned long mask)
+{
+	(void)vcpu;
 	(void)mask;
 	return seL4_IllegalOperation;
 }

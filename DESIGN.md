@@ -1143,8 +1143,11 @@ a backend in `arch/l4h/kvm/arm64` (patch `0019-kvm-arm64-on-l4h.patch`):
   VGIC list registers), so that KVM's system register accesses reach it.
   Each entry sends FL4 only the state groups that changed since it last had
   them and takes back those the guest changes, through the state area of
-  the vCPU's IPC buffer (`L4H_VCPU_STATE_OFFSET`); FP/SIMD stays in the TCB
-  until KVM reads or resets it. FL4's exits become KVM's (Stage-2 aborts,
+  the vCPU's IPC buffer (`L4H_VCPU_STATE_OFFSET`); on GICv3 that is the list
+  registers alone (`VGIC_LR`), VGIC_HCR set only while an interrupt is
+  injected or something must trap, and VMCR and the active priorities stay
+  in FL4 until KVM reads them. FP/SIMD stays in the TCB until KVM reads or
+  resets it. FL4's exits become KVM's (Stage-2 aborts,
   traps, VGIC maintenance, events).
 - **Memory.** FL4's Stage-2 VSpace caches the leaves of KVM's software
   table, kept in step after each change by wrappers of KVM's Stage-2

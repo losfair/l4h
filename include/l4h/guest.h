@@ -322,6 +322,10 @@ enum {
 #define L4H_ARM_VCPU_STATE_TIMER	(1ull << 2)
 #define L4H_ARM_VCPU_STATE_VGIC		(1ull << 3)
 #define L4H_ARM_VCPU_STATE_GPRS		(1ull << 4)
+/* VGIC's subset that changes on the hot path: VGIC_HCR, VGIC_ELRSR (out)
+ * and the list registers, not VMCR and the active priorities, which FL4
+ * keeps in the CPU. */
+#define L4H_ARM_VCPU_STATE_VGIC_LR	(1ull << 5)
 #define L4H_ARM_VCPU_STATE_ALL		0x1full
 
 /* A VCPU's state in a RAM frame, at a 64-byte aligned offset: FL4's
@@ -371,6 +375,9 @@ int l4h_arm_vcpu_read_state(unsigned long vcpu, unsigned long frame, unsigned lo
 			    unsigned long mask);
 int l4h_arm_vcpu_write_state(unsigned long vcpu, unsigned long frame, unsigned long offset,
 			     unsigned long mask);
+/* l4h_arm_vcpu_read_state() into the state area of this vCPU's IPC buffer
+ * (L4H_VCPU_STATE_OFFSET), as l4h_arm_vcpu_enter() leaves it. */
+int l4h_arm_vcpu_read_state_self(unsigned long vcpu, unsigned long mask);
 /* A Stage-2 page table (L4H_OBJ_EPT_*) into `s2_root` (an L4H_SLOT_EPT_POOL
  * root) at `ipa`, and a frame with L4H_PROT_* rights. */
 int l4h_arm_s2_map_table(unsigned long table, unsigned long s2_root, unsigned long ipa);

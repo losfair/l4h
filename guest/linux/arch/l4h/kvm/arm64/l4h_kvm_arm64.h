@@ -55,7 +55,11 @@ struct l4h_arm_vcpu {
 	bool vppi_masked;			/* FL4 holds PPI 27 masked */
 	bool synced;		/* FL4's VCPU holds `state` (groups we send) */
 	bool timer_dirty;	/* the TIMER group changed since the last entry */
-	bool vgic_dirty;	/* the VGIC group changed since the last entry */
+	/* Since the last entry: VMCR or the active priorities changed (the
+	 * whole VGIC group goes), or only VGIC_HCR or the LRs (on GICv3,
+	 * VGIC_LR goes; FL4 keeps VMCR and the priorities in the CPU). */
+	bool vgic_vmcr_dirty;
+	bool vgic_lr_dirty;
 	int fp_state;		/* L4H_FP_*: where the guest's FP/SIMD state is */
 };
 
