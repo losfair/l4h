@@ -19,6 +19,7 @@
 #include <linux/spinlock.h>
 #include <linux/threads.h>
 #include <linux/sched/clock.h>
+#include <linux/sched/idle.h>
 #include <linux/sched_clock.h>
 #include <linux/percpu.h>
 #include <linux/delay.h>
@@ -161,7 +162,56 @@ void __init time_init(void)
 
 /* ---- idle */
 
+/*
+ * Before an idle vCPU blocks it polls for a while, as KVM guests' haltpoll
+ * and the host's halt polling do.  It polls with TIF_POLLING_NRFLAG set, so
+ * a vCPU waking it (a reschedule, or a function call IPI) only sets
+ * need_resched and sends no IPI: no seL4_Signal on the sender, no wakeup of
+ * a blocked kernel thread on this core.  Host events are seen in the event
+ * page.  The window adapts as KVM's halt polling does: it grows while a
+ * block ends within l4h_idle_poll_us and drops to zero after a longer one,
+ * so a mostly idle vCPU stops polling at once.  Polling time is CPU used,
+ * not idle time.  l4h_idle_poll_us=0 turns it off.
+ */
+static unsigned long l4h_idle_poll_us = 50;
+static DEFINE_PER_CPU(u64, l4h_idle_poll_window);
+
+static int __init l4h_idle_poll_setup(char *s)
+{
+	return kstrtoul(s, 0, &l4h_idle_poll_us) == 0;
+}
+__setup("l4h_idle_poll_us=", l4h_idle_poll_setup);
+
+/* Poll for up to `window` TSC ticks; true if there is work. */
+static bool l4h_idle_poll(u64 window)
+{
+	u64 t0 = l4h_rdtsc();
+
+	if (!current_set_polling_and_test()) {
+		while (!tif_need_resched() && !l4h_events_pending() &&
+		       l4h_rdtsc() - t0 < window)
+			cpu_relax();
+	}
+	/* A waker that saw the flag set need_resched instead of signalling:
+	 * test again once it is clear. */
+	return current_clr_polling_and_test() || l4h_events_pending();
+}
+
 void os_idle_sleep(void)
 {
+	u64 max = l4h_idle_poll_us * (l4h_tsc_hz / USEC_PER_SEC);
+	u64 *window = this_cpu_ptr(&l4h_idle_poll_window);
+	u64 t0, blocked;
+
+	if (*window && l4h_idle_poll(*window))
+		return;
+	t0 = l4h_rdtsc();
 	l4h_idle_wait();
+	blocked = l4h_rdtsc() - t0;
+	/* A wakeup a longer poll would have caught grows the window, from
+	 * an eighth of the maximum; a long block ends polling. */
+	if (blocked <= max)
+		*window = min(*window ? *window * 2 : max / 8, max);
+	else
+		*window = 0;
 }
