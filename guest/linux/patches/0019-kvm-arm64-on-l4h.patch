@@ -15,6 +15,9 @@ here is that host's EL1 half, with FL4 as its world switch:
 - kvm_host.h: the backend's state of a VM and of a vCPU.
 - mmu.c: KVM_PGT_FN() calls the backend's wrappers, which keep FL4's
   Stage-2 VSpace in step with KVM's software table after each change.
+  get_user_mapping_size() walks l4h's software page tables, so that a
+  THP backs a 2 MiB Stage-2 block, where FL4 has a large frame for it
+  (otherwise its Stage-2 has 4 KiB leaves, and so must KVM's).
   GICv2's GICH is the VCPU's VGIC registers in FL4 (gich.h).
 - arch_timer.c: the virtual timer interrupt is FL4's VPPI exit, injected
   through the vgic, not a host interrupt mapped to the guest's; the
@@ -370,6 +373,85 @@ here is that host's EL1 half, with FL4 as its world switch:
  
  static phys_addr_t __stage2_range_addr_end(phys_addr_t addr, phys_addr_t end,
  					   phys_addr_t size)
+@@ -820,6 +825,70 @@
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_L4H
++/*
++ * The guest kernel's page tables are l4h's software ones, not the CPU's
++ * format kvm_pgtable_get_leaf() walks: find the leaf mapping `addr` with
++ * the generic accessors, so that THPs give 2 MiB Stage-2 blocks where FL4
++ * can map one (stage2.c map_large()).
++ */
++static int get_user_mapping_size(struct kvm *kvm, u64 addr)
++{
++	unsigned long flags;
++	int ret = -EAGAIN;
++	pgd_t *pgdp, pgd;
++	p4d_t *p4dp, p4d;
++	pud_t *pudp, pud;
++	pmd_t *pmdp, pmd;
++	pte_t *ptep, pte;
++
++	/* Against a concurrent teardown of the userspace page tables. */
++	local_irq_save(flags);
++	pgdp = pgd_offset(kvm->mm, addr);
++	pgd = READ_ONCE(*pgdp);
++	if (pgd_none(pgd) || pgd_bad(pgd))
++		goto out;
++	p4dp = p4d_offset(&pgd, addr);
++	p4d = READ_ONCE(*p4dp);
++	if (p4d_none(p4d) || p4d_bad(p4d))
++		goto out;
++	pudp = pud_offset(&p4d, addr);
++	pud = READ_ONCE(*pudp);
++	if (pud_none(pud))
++		goto out;
++	if (pud_leaf(pud)) {
++		if (!pud_present(pud))
++			goto out;
++		ret = l4h_large_frame((pud_val(pud) & PUD_MASK) + (addr & (PUD_SIZE - PMD_SIZE)))
++		      ? PMD_SIZE : PAGE_SIZE;
++		goto out;
++	}
++	if (!pud_present(pud) || pud_bad(pud))
++		goto out;
++	pmdp = pmd_offset(&pud, addr);
++	pmd = READ_ONCE(*pmdp);
++	if (pmd_none(pmd))
++		goto out;
++	if (pmd_leaf(pmd)) {
++		if (!pmd_present(pmd))
++			goto out;
++		/* Only claim a 2 MiB block when FL4 has a large frame cap for
++		 * it: otherwise stage2.c falls back to 4 KiB leaves, whose L3
++		 * permission faults mismatch KVM's L2 block and livelock. */
++		ret = l4h_large_frame(pmd_pfn(pmd) << PAGE_SHIFT) ? PMD_SIZE : PAGE_SIZE;
++		goto out;
++	}
++	if (!pmd_present(pmd) || pmd_bad(pmd))
++		goto out;
++	ptep = pte_offset_kernel(&pmd, addr);
++	pte = READ_ONCE(*ptep);
++	if (pte_present(pte))
++		ret = PAGE_SIZE;
++out:
++	local_irq_restore(flags);
++	return ret;
++}
++#else
+ static struct kvm_pgtable_mm_ops kvm_user_mm_ops = {
+ 	/* We shouldn't need any other callback to walk the PT */
+ 	.phys_to_virt		= kvm_host_va,
+@@ -866,6 +935,7 @@
+ 
+ 	return BIT(ARM64_HW_PGTABLE_LEVEL_SHIFT(level));
+ }
++#endif
+ 
+ static struct kvm_pgtable_mm_ops kvm_s2_mm_ops = {
+ 	.zalloc_page		= stage2_memcache_zalloc_page,
 --- a/arch/arm64/kvm/guest.c
 +++ b/arch/arm64/kvm/guest.c
 @@ -206,6 +206,11 @@

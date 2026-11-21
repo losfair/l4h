@@ -6,6 +6,7 @@
 #ifndef __L4H_KVM_ARM64_STAGE2_H
 #define __L4H_KVM_ARM64_STAGE2_H
 #include <asm/kvm_pgtable.h>
+#include <l4h_caps.h>
 
 int l4h_kvm_pgtable_stage2_init(struct kvm_pgtable *pgt, struct kvm_s2_mmu *mmu,
 				struct kvm_pgtable_mm_ops *mm_ops);
