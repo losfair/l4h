@@ -418,6 +418,11 @@ int __kvm_vcpu_run(struct kvm_vcpu *vcpu)
 	struct l4h_arm_vmexit x;
 	int ret = ARM_EXCEPTION_IRQ;
 
+	/* An event taken off the notification earlier would not end
+	 * seL4_ARM_VCPU_Run, and interrupts are off until it returns. */
+	if (l4h_events_pending())
+		return ARM_EXCEPTION_IRQ;
+
 	/* Pending exceptions and PC increments, as hyp code applies them. */
 	__kvm_adjust_pc(vcpu);
 

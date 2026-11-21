@@ -292,7 +292,7 @@ impl UtRegion {
         let mut done = 0;
         while done < count {
             let n = (count - done).min(RETYPE_FAN_OUT);
-            retype_raw(self.cap, obj_type, &dest.cnode, dest.offset + done, n)
+            crate::retype_raw(self.cap, obj_type, &dest.cnode, dest.offset + done, n)
                 .unwrap_or_else(|e| panic!("retype type {} x{} failed: {:?}", obj_type, n, e));
             done += n;
         }
@@ -324,30 +324,6 @@ impl UtRegion {
         self.used = off + (count << bits);
         Some(self.paddr + off)
     }
-}
-
-/// seL4_Untyped_Retype of `count` fixed-size objects of seL4 type
-/// `obj_type`, which rust-sel4's ObjectBlueprint cannot name.
-fn retype_raw(
-    untyped: cap::Untyped,
-    obj_type: u64,
-    dst: &sel4::AbsoluteCPtr,
-    dst_offset: usize,
-    count: usize,
-) -> sel4::Result<()> {
-    let err = sel4::with_ipc_buffer_mut(|ipc| {
-        ipc.inner_mut().seL4_Untyped_Retype(
-            untyped.bits(),
-            obj_type,
-            0,
-            dst.root().bits(),
-            dst.path().bits(),
-            dst.path().depth() as u64,
-            dst_offset as u64,
-            count as u64,
-        )
-    });
-    sel4::Error::from_sys(err).map_or(Ok(()), Err)
 }
 
 pub fn cnode_dest(cnode: cap::CNode) -> sel4::AbsoluteCPtr {
@@ -758,7 +734,7 @@ impl Alloc {
         let Some(r) = self.split(size_bits, ut) else {
             return false;
         };
-        retype_raw(r.cap, obj_type, &cnode_dest(self.slots.cnode()), dest, 1).is_ok()
+        crate::retype_raw(r.cap, obj_type, &cnode_dest(self.slots.cnode()), dest, 1).is_ok()
     }
 
     /// Allocate a single object into a fresh local slot.
