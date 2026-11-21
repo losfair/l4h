@@ -5011,6 +5011,11 @@ injects these failures in a host built with `L4H_TEST_INJECT=1`;
      On n4-standard-4/-8 (Emerald Rapids) FL4 #61 and the isolated reply
      objects (`l4h_obj_alloc()`) took getpid from 1.97 to 0.97 us on one
      vCPU, 2.35 to 1.20 us on two and 1.60 to 1.35 us on four cores.
+     `--sev-snp` boots it as an SEV-SNP confidential VM (default
+     n2d-standard-4, AMD Milan) from FL4's native UEFI loader with dom0
+     embedded. There FL4 #62's retpolines and Safe RET, in place of an
+     IBPB at every native entry, took getpid from 3.66 to 1.41 us on one
+     vCPU.
 3. **AWS EC2.** c6i.xlarge boots the generic UEFI image with ENA and NVMe
    EBS. `tools/ec2-image.py` imports a raw disk through the EBS direct API
    and registers a private UEFI/ENA AMI. `tests/build-ec2.sh` and
@@ -5776,7 +5781,7 @@ tools/build-fl4.sh
 SEL4_PREFIX="$PWD/build/sel4-fl4" L4H_KERNEL_VARIANT=fl4 tests/run-selftest.sh 4
 ```
 
-The tested FL4 revision is `43f3ca177b70bf06643de9e87eb8719db9db771d`.
+The tested FL4 revision is `3a786adb839502a987772c2ed19970c956f5efb8`.
 `prepare-fl4.sh` clones the pinned public revision, or the frozen override,
 into `build/FL4-src` without applying any kernel patches. The source
 worktree is not edited.

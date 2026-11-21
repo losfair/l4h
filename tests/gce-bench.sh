@@ -7,15 +7,31 @@
 # instance and a bucket object (KEEP=1 keeps the instance and image).
 # VCPUS=n gives dom0 n vCPUs (default 2).
 # L4H_FL4_SOURCE=<detached FL4 worktree> builds that FL4 instead of the pin.
-# Usage: gce-bench.sh PROJECT [ZONE] [MACHINE_TYPE]
+# --sev-snp boots an AMD SEV-SNP confidential VM (default n2d-standard-4
+# on AMD Milan) from FL4's native UEFI loader, with dom0 embedded, as
+# tests/gce-test.sh --sev-snp does.
+# Usage: gce-bench.sh [--sev-snp] PROJECT [ZONE] [MACHINE_TYPE]
 # e.g.   gce-bench.sh PROJECT us-central1-a n4-standard-4
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 export L4H_RELEASE=1 L4H_ARCH=x86_64 L4H_KERNEL_VARIANT=fl4 SEL4_PREFIX=$root/build/sel4-fl4
 source "$root/tools/host-profile.sh"
+snp=
+if [ "${1:-}" = --sev-snp ]; then
+    snp=1
+    shift
+fi
 project=$1
 zone=${2:-us-central1-a}
 machine=${3:-n4-standard-4}
+features=UEFI_COMPATIBLE,GVNIC
+gce_args=(--boot-disk-size=10GB)
+if [ -n "$snp" ]; then
+    machine=${3:-n2d-standard-4}
+    features+=,SEV_SNP_CAPABLE
+    gce_args+=(--confidential-compute-type=SEV_SNP --min-cpu-platform="AMD Milan"
+        --maintenance-policy=TERMINATE)
+fi
 region=${zone%-*}
 name=l4h-bench-$(date +%Y%m%d-%H%M%S)
 bucket=gs://$project-l4h-test
@@ -35,9 +51,16 @@ L4H_DOM0_DISKS=0 L4H_DOM0_VCPUS=${VCPUS:-2} L4H_DOM0_MEM_MB=1024 L4H_DOM0_CMDLIN
     "$root/tools/build-host.sh" >"$out/host-build.log" 2>&1 \
     || { tail -20 "$out/host-build.log"; exit 1; }
 export L4H_GUEST_KERNEL=$out/vmlinux L4H_GUEST_SDK=
-L4H_MKSHIM='' "$root/tools/mkefi.sh" "$out/$name.efi" \
-    "$root/host/target/x86_64-sel4-roottask/$l4h_profile/l4h-root.elf" "$SEL4_PREFIX/bin/kernel.elf" >/dev/null
-"$root/tools/mkimage.sh" -e "$out/$name.efi" -i "$out/dom0.cpio.gz" "$out/$name.raw" >/dev/null
+rootelf=$root/host/target/x86_64-sel4-roottask/$l4h_profile/l4h-root.elf
+if [ -n "$snp" ]; then
+    L4H_DOM0_INITRD="$out/dom0.cpio.gz" "$root/tools/mkfl4-efi.sh" "$out/$name.efi" \
+        "$rootelf" "$SEL4_PREFIX/bin/kernel.elf" >"$out/efi-build.log" 2>&1 \
+        || { tail -20 "$out/efi-build.log"; exit 1; }
+    "$root/tools/mkimage.sh" -e "$out/$name.efi" "$out/$name.raw" >/dev/null
+else
+    L4H_MKSHIM='' "$root/tools/mkefi.sh" "$out/$name.efi" "$rootelf" "$SEL4_PREFIX/bin/kernel.elf" >/dev/null
+    "$root/tools/mkimage.sh" -e "$out/$name.efi" -i "$out/dom0.cpio.gz" "$out/$name.raw" >/dev/null
+fi
 rm -f "$out/$name.efi"
 "$root/tools/gce-image.sh" "$out/$name.raw" "$name" >/dev/null
 rm -f "$out/$name.raw"
@@ -55,9 +78,9 @@ gcloud storage buckets describe "$bucket" --project="$project" >/dev/null 2>&1 \
 gcloud storage cp "$out/$name.tar.gz" "$bucket/" --project="$project" --quiet
 rm -f "$out/$name.tar.gz"
 gcloud compute images create "$name" --project="$project" \
-    --source-uri="$bucket/$name.tar.gz" --guest-os-features=UEFI_COMPATIBLE,GVNIC --quiet
+    --source-uri="$bucket/$name.tar.gz" --guest-os-features="$features" --quiet
 gcloud compute instances create "$name" --project="$project" --zone="$zone" \
-    --machine-type="$machine" --image="$name" --boot-disk-interface=NVME --boot-disk-size=10GB \
+    "${gce_args[@]}" --machine-type="$machine" --image="$name" --boot-disk-interface=NVME \
     --network-interface=nic-type=GVNIC --no-service-account --no-scopes \
     --metadata=serial-port-enable=TRUE --no-shielded-secure-boot --quiet
 
@@ -69,6 +92,6 @@ while [ $SECONDS -lt $end ]; do
         >"$log" 2>/dev/null || continue
     grep -aqE 'SYSCALLBENCH: (PASS|FAIL)' "$log" && break
 done
-grep -aE 'SYSCALLBENCH|FL4: speculation|l4h-root: [0-9]+ core|panic|fault' "$log" || true
+grep -aE 'SYSCALLBENCH|FL4: speculation|FL4: AMD SEV|l4h-root: [0-9]+ core|panic|fault' "$log" || true
 echo "serial log: $log"
 grep -aqE 'SYSCALLBENCH: PASS' "$log"
