@@ -78,8 +78,9 @@ def main():
                     dest=a.output/f'r{rep:02d}-{variant}-{n}cpu-m{mode}'
                     dest.mkdir()
                     conf=dest/'l4h.conf'
+                    # quiet: logd would drain the boot log during the run.
                     conf.write_text(f'dom0_vcpus={n}\ndom0_mem_mb=512\nwatchdog_secs=0\n'
-                                    f'dom0_cmdline=console=hvc0 FORKBENCH_COUNT={a.count} FORKBENCH_MODE={mode} '
+                                    f'dom0_cmdline=console=hvc0 quiet FORKBENCH_COUNT={a.count} FORKBENCH_MODE={mode} '
                                     f'FORKBENCH_WORKERS={a.workers or n} FORKBENCH_FORCE={forces.get(variant,0)} FORKBENCH_PROFILE={a.profile}\n')
                     image=dest/'root-dom0.elf'
                     smp.run([str(ROOT/'tools/add-modules.py'),str(inputs/variant/'root.elf'),str(image),
