@@ -158,7 +158,7 @@ void l4h_user_sync_regs(struct l4h_uctx *u, unsigned long *gp)
 }
 
 /* Bind this vCPU's SC_U to u.  Switch-out releases it before migration. */
-static void bind_sc(struct l4h_vcpu *v, struct l4h_uctx *u)
+void l4h_bind_sc(struct l4h_vcpu *v, struct l4h_uctx *u)
 {
 	int err, waited = 0;
 
@@ -216,7 +216,7 @@ int l4h_user_run(struct l4h_uctx *u, unsigned long *gp, int read_regs_on_interru
 	 * whenever this kernel thread does not, and that is not only once we
 	 * block in Recv below.  Under a CPU cap SC_K runs out of budget while
 	 * SC_U still has some, and the context then runs ahead, possibly into
-	 * its next fault, between bind_sc() and Recv.  Writing gp[] after
+	 * its next fault, between l4h_bind_sc() and Recv.  Writing gp[] after
 	 * binding would then roll its registers back to the state they had
 	 * when it was preempted, and turn a queued fault into one reporting
 	 * those stale registers (resuming 2 bytes into an instruction after
@@ -229,7 +229,7 @@ int l4h_user_run(struct l4h_uctx *u, unsigned long *gp, int read_regs_on_interru
 		err = write_regs(u, gp, 0);
 		l4h_BUG_ON(err);
 	}
-	bind_sc(v, u);
+	l4h_bind_sc(v, u);
 
 	switch (u->state) {
 	case L4H_UCTX_FRESH:

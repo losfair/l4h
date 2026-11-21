@@ -6,7 +6,7 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 source "$root/tools/reproducible-env.sh"
 export L4H_VERSION=$("$root/tools/version.sh")
 cd "$root/host"
-export SEL4_PREFIX=$root/build/sel4-aarch64
+export SEL4_PREFIX=${SEL4_PREFIX:-$root/build/sel4-aarch64}
 export CC_aarch64_sel4=aarch64-linux-gnu-gcc CC_aarch64_sel4_roottask=aarch64-linux-gnu-gcc
 # The cargo profile, as for tools/build-host.sh.
 source "$root/tools/host-profile.sh"

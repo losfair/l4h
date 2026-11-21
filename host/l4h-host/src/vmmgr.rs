@@ -37,6 +37,10 @@ pub const SLOT_MODULES: u64 = 19;
 /// The CNode of dom0's control data area (CTL_DATA_PAGES frames): host
 /// memory that root allocates once, mapped into every dom0.
 pub const SLOT_CTL_DATA: u64 = 20;
+/// GICv2 GICV frames (`VmmgrConfig::has_gicv_frames`): SLOT_GICV_FRAMES +
+/// i, i < l4h_abi::GICV_PAGES, for the guests' L4H_SLOT_GICV.
+pub const SLOT_GICV_FRAMES: u64 = 21;
+const _: () = assert!(SLOT_GICV_FRAMES + l4h_abi::GICV_PAGES as u64 <= SLOT_XCHG);
 /// Exchange slots: SLOT_XCHG + i.
 pub const SLOT_XCHG: u64 = 32;
 pub const XCHG_SLOTS: usize = 32;
@@ -274,6 +278,11 @@ pub struct VmmgrConfig {
     pub dom0_usbs: u64,
     pub dom0_usb: [u64; crate::usb::MAX_GUEST_USB],
     pub dom0_cmdline: [u8; l4h_abi::CMDLINE_SIZE],
+    /// AArch64 hardware virtualization (FL4 at EL2) for the guests'
+    /// bootinfo; all zero on x86_64.
+    pub arm_virt: l4h_abi::ArmVirtInfo,
+    /// Nonzero if the GICv2 GICV frames are at SLOT_GICV_FRAMES.
+    pub has_gicv_frames: u64,
 }
 const _: () = assert!(crate::CONFIG_OFFSET + core::mem::size_of::<VmmgrConfig>() <= crate::INFO_SIZE);
 

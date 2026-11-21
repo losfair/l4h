@@ -18,6 +18,14 @@ fn main() {
     if fs::read_to_string(&arch_xml).expect("kernel architecture interface").contains("id=\"X86IRQControlSendPeer\"") {
         println!("cargo:rustc-cfg=l4h_kernel_multikernel");
     }
+    // FL4's AArch64 VCPUs and Stage-2 VSpaces, which a C seL4 built
+    // without them does not name.
+    println!("cargo:rustc-check-cfg=cfg(l4h_arm_virt)");
+    let arm_objtype = prefix.join("libsel4/include/sel4/arch/objecttype.h");
+    println!("cargo:rerun-if-changed={}", arm_objtype.display());
+    if fs::read_to_string(&arm_objtype).is_ok_and(|s| s.contains("seL4_ARM_Stage2VSpaceObject")) {
+        println!("cargo:rustc-cfg=l4h_arm_virt");
+    }
     println!("cargo:rerun-if-env-changed=L4H_VERSION");
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     for (var, file) in [

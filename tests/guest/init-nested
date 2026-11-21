@@ -5,14 +5,22 @@
 /bin/busybox mount -t devtmpfs dev /dev
 /bin/busybox mount -t tmpfs tmp /tmp
 echo "NESTED: up, $(/bin/busybox uname -r), $(/bin/busybox nproc) CPUs"
-# Memory, both vCPUs and the timer: a page-touching job on each CPU.
-for cpu in 0 1; do
-	/bin/busybox taskset -c $cpu /bin/busybox dd if=/dev/zero of=/tmp/f$cpu bs=1M count=40 2>/dev/null &
+# Memory, both vCPUs and the timer: a page-touching job on each CPU, each
+# of which must finish and write all of its 40 MiB.
+/bin/busybox taskset -c 0 /bin/busybox dd if=/dev/zero of=/tmp/f0 bs=1M count=40 2>/dev/null &
+pid0=$!
+/bin/busybox taskset -c 1 /bin/busybox dd if=/dev/zero of=/tmp/f1 bs=1M count=40 2>/dev/null &
+pid1=$!
+ok=1
+wait $pid0 || { echo "NESTED: FAILED: dd on CPU 0 exited with $?"; ok=0; }
+wait $pid1 || { echo "NESTED: FAILED: dd on CPU 1 exited with $?"; ok=0; }
+for f in /tmp/f0 /tmp/f1; do
+	size=$(/bin/busybox stat -c %s $f 2>/dev/null)
+	[ "$size" = 41943040 ] || { echo "NESTED: FAILED: $f has ${size:-no} bytes, not 41943040"; ok=0; }
 done
-wait
 /bin/busybox sleep 1
 echo "NESTED: $(/bin/busybox du -sm /tmp | /bin/busybox cut -f1) MiB written"
-echo "NESTED: done"
+[ $ok = 1 ] && echo "NESTED: done"
 # Firecracker stops on a keyboard-controller reset, the others on power off.
 case " $(/bin/busybox cat /proc/cmdline) " in
 *" reboot=k "*) /bin/busybox reboot -f ;;

@@ -4,6 +4,11 @@ cmake_minimum_required(VERSION 3.16)
 # FL4_SOURCE names the private copy of a pinned revision (tools/build-fl4.sh).
 list(APPEND CMAKE_MODULE_PATH "${FL4_SOURCE}/cmake")
 find_package(seL4 REQUIRED)
+# AArch64 is cross-compiled: the platform settings choose the toolchain
+# (CROSS_COMPILER_PREFIX), which project() needs (tools/build-fl4-aarch64.sh).
+if(KernelPlatform STREQUAL "qemu-arm-virt")
+  sel4_configure_platform_settings()
+endif()
 project(l4h_fl4 C ASM)
 sel4_import_kernel()
 sel4_import_libsel4()

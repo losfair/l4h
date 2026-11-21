@@ -7,6 +7,8 @@
 #define L4H_PROVIDER_MAGIC 0x315244565048344cull /* L4HPVDR1 */
 #define L4H_PROVIDER_VERSION 1
 #define L4H_PROVIDER_VTX (1ull << 0)
+/* FL4 AArch64 at EL2: the l4h_arm_* operations work. */
+#define L4H_PROVIDER_ARM_VIRT (1ull << 1)
 
 /* Native 64-bit C ABI. Slots are append-only and shared layouts are fixed
  * within a version; gp[] uses Linux's native register-array order. The host maps this

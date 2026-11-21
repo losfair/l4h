@@ -43,7 +43,13 @@ static const seL4_Word obj_type[L4H_OBJ_NR] = {
 	[L4H_OBJ_PD] = seL4_X86_PageDirectoryObject,
 	[L4H_OBJ_PDPT] = seL4_X86_PDPTObject,
 #endif
-#ifdef CONFIG_VTX
+#if defined(L4H_ARM_VIRT)
+	/* Stage-2 tables are ordinary page tables mapped into a Stage-2 root. */
+	[L4H_OBJ_VCPU] = seL4_ARM_VCPUObject,
+	[L4H_OBJ_EPT_PT] = seL4_ARM_PageTableObject,
+	[L4H_OBJ_EPT_PD] = seL4_ARM_PageTableObject,
+	[L4H_OBJ_EPT_PDPT] = seL4_ARM_PageTableObject,
+#elif defined(CONFIG_VTX)
 	[L4H_OBJ_VCPU] = seL4_X86_VCPUObject,
 	[L4H_OBJ_EPT_PT] = seL4_X86_EPTPTObject,
 	[L4H_OBJ_EPT_PD] = seL4_X86_EPTPDObject,
@@ -81,7 +87,14 @@ int l4h_obj_bits(int type, int size_bits)
 	case L4H_OBJ_PD:
 	case L4H_OBJ_PDPT:
 		return seL4_PageBits;
-#ifdef CONFIG_VTX
+#if defined(L4H_ARM_VIRT)
+	case L4H_OBJ_EPT_PT:
+	case L4H_OBJ_EPT_PD:
+	case L4H_OBJ_EPT_PDPT:
+		return seL4_PageBits;
+	case L4H_OBJ_VCPU:
+		return seL4_ARM_VCPUBits;
+#elif defined(CONFIG_VTX)
 	case L4H_OBJ_EPT_PT:
 	case L4H_OBJ_EPT_PD:
 	case L4H_OBJ_EPT_PDPT:

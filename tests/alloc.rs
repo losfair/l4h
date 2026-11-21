@@ -101,6 +101,15 @@ pub fn retype_shared(untyped: cap::Untyped, size_bits: usize, dst: &AbsoluteCPtr
     Ok(())
 }
 
+/// seL4_Untyped_Retype of a raw object type (l4h_task::retype_raw).
+pub fn retype_raw(_untyped: cap::Untyped, _obj_type: u64, dst: &AbsoluteCPtr, dst_offset: usize, count: usize) -> Result<(), ()> {
+    assert!((1..=sel4_cfg_usize!(RETYPE_FAN_OUT_LIMIT)).contains(&count));
+    RETYPES.with_borrow_mut(|v| v.push(dst.cnode));
+    RETYPE_WINDOWS.with_borrow_mut(|v| v.push((dst_offset, count)));
+    with_ipc_buffer_mut(|b| b.msg_regs_mut()[..6].fill(0xdead_beef));
+    Ok(())
+}
+
 pub mod cap {
     pub type Untyped = crate::Cap<crate::cap_type::Untyped>;
     pub type CNode = crate::Cap<crate::cap_type::CNode>;

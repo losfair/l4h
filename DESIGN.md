@@ -1121,6 +1121,45 @@ vendor, as seL4 makes it).
 - **Test.** `tests/run-kvmtest.sh`, `tests/run-kvmbench.sh`,
   `tests/run-vtxtest.sh`, `tests/run-vcpustress.sh` (§14.3).
 
+**AArch64 on FL4.** Where FL4 runs at EL2 (VHE), the AArch64 guest kernel
+provides `/dev/kvm` too. It builds `arch/arm64/kvm`'s code (`arm.c`, the
+Stage-2 MMU and `hyp/pgtable.c`, the vgic, the arch timer, `sys_regs.c`,
+`virt/kvm`) as the EL1 half of a VHE host, whose world switch is FL4's, with
+a backend in `arch/l4h/kvm/arm64` (patch `0019-kvm-arm64-on-l4h.patch`):
+
+- **Enabling.** FL4 reports EL2 in its bootinfo (`arm_virt`), and l4h-root
+  retypes an FL4 VCPU at boot to confirm it; vmmgr then gives every guest 8
+  Stage-2 roots at `L4H_SLOT_EPT_POOL` and, on GICv2, the GICV frames at
+  `L4H_SLOT_GICV`. At EL1, or without the roots, KVM finds no hyp mode and
+  registers no `/dev/kvm`. The ID registers guests see are the boot CPU's
+  without what FL4 does not switch for them (SVE, SME, MTE, pointer
+  authentication, MOPS, FGT, ECV, FWB, the PMU, AArch32).
+- **vCPUs.** Each KVM vCPU is an FL4 VCPU bound to a TCB of ours whose
+  VSpace is the VM's Stage-2 root. The vCPU thread enters it itself, on its
+  own scheduling context (`seL4_ARM_VCPU_Run`, `l4h_arm_vcpu_enter()`),
+  until the guest exits or one of its events stops it. KVM keeps the VM's
+  registers in memory, and a copy of what FL4 holds, which also has what a
+  VHE host keeps in the CPU while a vCPU is loaded (the virtual timer, the
+  VGIC list registers), so that KVM's system register accesses reach it.
+  Each entry sends FL4 only the state groups that changed since it last had
+  them and takes back those the guest changes, through the state area of
+  the vCPU's IPC buffer (`L4H_VCPU_STATE_OFFSET`); on GICv3 that is the list
+  registers alone (`VGIC_LR`), VGIC_HCR set only while an interrupt is
+  injected or something must trap, and VMCR and the active priorities stay
+  in FL4 until KVM reads them. FP/SIMD stays in the TCB until KVM reads or
+  resets it. FL4's exits become KVM's (Stage-2 aborts,
+  traps, VGIC maintenance, events).
+- **Memory.** FL4's Stage-2 VSpace caches the leaves of KVM's software
+  table, kept in step after each change by wrappers of KVM's Stage-2
+  operations, as the EPT does for x86_64 above.
+- **Interrupts.** The vgic's list registers are FL4's; GICv2 guests use the
+  host's GICV frames directly. The virtual timer fires as a VPPI exit,
+  injected through the vgic, with PPI 27 kept masked in FL4 until the
+  guest's timer stops asserting it; the physical timer is emulated.
+- **Test.** `tests/run-kvmtest-arm64.sh` (`L4H_QEMU_GIC_VERSION` 3 or 2):
+  MMIO, PSCI, dirty logging, ONE_REG, SMP, the vgic and the timer, then a
+  2-vCPU Linux under Firecracker and cloud-hypervisor.
+
 ---
 
 ## 6. SMP guests
@@ -5781,7 +5820,7 @@ tools/build-fl4.sh
 SEL4_PREFIX="$PWD/build/sel4-fl4" L4H_KERNEL_VARIANT=fl4 tests/run-selftest.sh 4
 ```
 
-The tested FL4 revision is `3a786adb839502a987772c2ed19970c956f5efb8`.
+The tested FL4 revision is `991586ba83a689c7f27bd167f8b257337be84778`.
 `prepare-fl4.sh` clones the pinned public revision, or the frozen override,
 into `build/FL4-src` without applying any kernel patches. The source
 worktree is not edited.

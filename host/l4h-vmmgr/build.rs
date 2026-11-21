@@ -7,6 +7,14 @@ fn main() {
     println!("cargo:rerun-if-env-changed=SEL4_PREFIX");
     let prefix = PathBuf::from(env::var("SEL4_PREFIX").expect("SEL4_PREFIX"));
     println!("cargo:rerun-if-changed={}", prefix.join("libsel4/include/sel4/config.h").display());
+    // FL4's AArch64 VCPUs and Stage-2 VSpaces, which a C seL4 built
+    // without them does not name.
+    println!("cargo:rustc-check-cfg=cfg(l4h_arm_virt)");
+    let arm_objtype = prefix.join("libsel4/include/sel4/arch/objecttype.h");
+    println!("cargo:rerun-if-changed={}", arm_objtype.display());
+    if fs::read_to_string(&arm_objtype).is_ok_and(|s| s.contains("seL4_ARM_Stage2VSpaceObject")) {
+        println!("cargo:rustc-cfg=l4h_arm_virt");
+    }
     let fl4 = prefix.join("fl4-revision");
     let kernel = if fl4.is_file() {
         println!("cargo:rerun-if-changed={}", fl4.display());

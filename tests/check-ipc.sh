@@ -12,7 +12,7 @@ export L4H_VERSION=$("$root/tools/version.sh")
 cd "$root/host"
 arch=${L4H_ARCH:-x86_64}
 if [ "$arch" = aarch64 ]; then
-    export SEL4_PREFIX=$root/build/sel4-aarch64
+    export SEL4_PREFIX=${SEL4_PREFIX:-$root/build/sel4-aarch64}
     export CC_aarch64_sel4=aarch64-linux-gnu-gcc CC_aarch64_sel4_roottask=aarch64-linux-gnu-gcc
 fi
 lint=(-A clippy::all -D clippy::disallowed_methods)

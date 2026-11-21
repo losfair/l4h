@@ -82,3 +82,28 @@ pub fn retype_shared(
 ) -> sel4::Result<()> {
     Err(sel4::Error::IllegalOperation)
 }
+
+/// seL4_Untyped_Retype of `count` fixed-size objects of seL4 type
+/// `obj_type`, which rust-sel4's ObjectBlueprint cannot name.  Callers
+/// go through `mem::UtRegion::retype_raw`, which keeps the watermark.
+pub fn retype_raw(
+    untyped: sel4::cap::Untyped,
+    obj_type: u64,
+    dst: &sel4::AbsoluteCPtr,
+    dst_offset: usize,
+    count: usize,
+) -> sel4::Result<()> {
+    let err = sel4::with_ipc_buffer_mut(|ipc| {
+        ipc.inner_mut().seL4_Untyped_Retype(
+            untyped.bits(),
+            obj_type,
+            0,
+            dst.root().bits(),
+            dst.path().bits(),
+            dst.path().depth() as u64,
+            dst_offset as u64,
+            count as u64,
+        )
+    });
+    sel4::Error::from_sys(err).map_or(Ok(()), Err)
+}

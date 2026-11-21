@@ -19,6 +19,16 @@
 		panic("l4h provider: %s:%d: %s\n", __FILE__, __LINE__, #c); \
 } while (0)
 
+/* FL4 on AArch64: its libsel4 has the Stage-2 VSpace and the EL2 VCPU
+ * (the guests' KVM needs the kernel at EL2, which FL4 detects at boot). */
+#if defined(__aarch64__) && defined(seL4_ARM_Stage2VSpaceBits)
+#define L4H_ARM_VIRT 1
+#endif
+
+/* Bind this vCPU's SC_U to the TCB of u (user.c). */
+struct l4h_vcpu;
+void l4h_bind_sc(struct l4h_vcpu *v, struct l4h_uctx *u);
+
 void *memcpy(void *, const void *, size_t);
 void *memset(void *, int, size_t);
 #define L4H_PROVIDER_OP(ret, name, args, call) ret name args;

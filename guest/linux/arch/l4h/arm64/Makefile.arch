@@ -21,11 +21,14 @@ core-y += $(ARCH_DIR)/arm64/
 core-$(CONFIG_CRYPTO) += arch/arm64/crypto/
 # The arm64 BPF JIT, with arm64/bpf_jit.c.
 core-$(CONFIG_BPF_JIT) += arch/arm64/net/
+# KVM: arch/arm64/kvm on FL4's EL2 VCPUs (arch/l4h/kvm/arm64).
+core-$(CONFIG_KVM) += arch/arm64/kvm/ $(ARCH_DIR)/kvm/arm64/
 all: vmlinux
 archheaders:
 	$(Q)$(MAKE) -f $(srctree)/Makefile ARCH=arm64 asm-generic archheaders
 archprepare:
 	$(Q)$(MAKE) $(build)=$(ARCH_DIR)/arm64 include/generated/user_constants.h
+	$(Q)$(MAKE) $(build)=arch/arm64/tools kapi
 export LDS_START := 0x60000000
 export LDS_ELF_ARCH := aarch64
 export LDS_ELF_FORMAT := elf64-littleaarch64
