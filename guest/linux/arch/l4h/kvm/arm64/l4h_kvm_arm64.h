@@ -60,6 +60,9 @@ struct l4h_arm_vcpu {
 	 * VGIC_LR goes; FL4 keeps VMCR and the priorities in the CPU). */
 	bool vgic_vmcr_dirty;
 	bool vgic_lr_dirty;
+	/* `state` has FL4's VMCR and priorities, read since the guest last
+	 * ran (vgic.c pull_vmcr()). */
+	bool vgic_vmcr_fresh;
 	int fp_state;		/* L4H_FP_*: where the guest's FP/SIMD state is */
 };
 

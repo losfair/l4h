@@ -1395,7 +1395,7 @@ pub fn create(
     }
     // ---- Stage-2 roots for the guest's KVM (FL4 at EL2), and GICv2's
     // virtual CPU interface for its VMs.
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", l4h_arm_virt))]
     if host_info.vtx {
         let Some(ept_cn) = try_cnode(&mut g.arena, alloc, abi::ROOT_CNODE_BITS) else {
             return Err(Some(g));

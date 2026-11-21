@@ -12,7 +12,9 @@ here is that host's EL1 half, with FL4 as its world switch:
   exception or a PC increment to a VCPU's saved state.
 - arm.c: no hyp setup; the backend's hooks where a vCPU is created,
   destroyed, loaded and put.
-- kvm_host.h: the backend's state of a VM and of a vCPU.
+- kvm_host.h: the backend's state of a VM and of a vCPU; no hardware
+  breakpoints or watchpoints in KVM_GUESTDBG_VALID_MASK (FL4 does not
+  switch them), for KVM_SET_GUEST_DEBUG and KVM_CAP_SET_GUEST_DEBUG2.
 - mmu.c: KVM_PGT_FN() calls the backend's wrappers, which keep FL4's
   Stage-2 VSpace in step with KVM's software table after each change.
   get_user_mapping_size() walks l4h's software page tables, so that a
@@ -23,10 +25,12 @@ here is that host's EL1 half, with FL4 as its world switch:
   through the vgic, not a host interrupt mapped to the guest's; the
   physical timer is emulated.
 - guest.c, reset.c: a vCPU's FP/SIMD registers stay in FL4 between
-  entries; ONE_REG and a reset tell the backend before they reach them.
+  entries; ONE_REG and a reset tell the backend before they reach them
+  (ONE_REG fails if FL4 cannot give them).
 - vgic-v3.c, vgic-sys-reg-v3.c: GICv3's VMCR and active priorities stay
   in FL4 (no save on vcpu_put); reading or setting them goes through the
-  backend.
+  backend, a set only changing KVM's copy once FL4's is known, and a
+  device attribute access reads them once, failing if it cannot.
 - kvm_main.c: the PIO page 0016 adds is x86_64's alone.
 
 --- a/virt/kvm/kvm_main.c
@@ -73,6 +77,24 @@ here is that host's EL1 half, with FL4 as its world switch:
  	struct kvm_cpu_context ctxt;
  
  	/*
+@@ -1066,10 +1074,17 @@
+ 
+ #define vcpu_sve_state_size(vcpu) sve_state_size_from_vl((vcpu)->arch.sve_max_vl)
+ 
++#ifdef CONFIG_L4H
++/* FL4 does not switch the breakpoint and watchpoint registers. */
++#define KVM_GUESTDBG_VALID_MASK (KVM_GUESTDBG_ENABLE | \
++				 KVM_GUESTDBG_USE_SW_BP | \
++				 KVM_GUESTDBG_SINGLESTEP)
++#else
+ #define KVM_GUESTDBG_VALID_MASK (KVM_GUESTDBG_ENABLE | \
+ 				 KVM_GUESTDBG_USE_SW_BP | \
+ 				 KVM_GUESTDBG_USE_HW | \
+ 				 KVM_GUESTDBG_SINGLESTEP)
++#endif
+ 
+ #define kvm_has_sve(kvm)	(system_supports_sve() &&		\
+ 				 test_bit(KVM_ARCH_FLAG_GUEST_HAS_SVE, &(kvm)->arch.flags))
 --- a/arch/arm64/kvm/Makefile
 +++ b/arch/arm64/kvm/Makefile
 @@ -5,6 +5,34 @@
@@ -457,25 +479,32 @@ here is that host's EL1 half, with FL4 as its world switch:
  	.zalloc_page		= stage2_memcache_zalloc_page,
 --- a/arch/arm64/kvm/guest.c
 +++ b/arch/arm64/kvm/guest.c
-@@ -206,6 +206,11 @@
+@@ -206,6 +206,15 @@
  	if (!addr)
  		return -EINVAL;
  
 +#ifdef CONFIG_L4H
 +	/* FL4 has the FP/SIMD registers until we ask. */
-+	if (off >= KVM_REG_ARM_CORE_REG(fp_regs))
-+		l4h_arm_vcpu_sync_fp(vcpu, false);
++	if (off >= KVM_REG_ARM_CORE_REG(fp_regs)) {
++		int err = l4h_arm_vcpu_sync_fp(vcpu, false);
++
++		if (err)
++			return err;
++	}
 +#endif
  	if (copy_to_user(uaddr, addr, KVM_REG_SIZE(reg->id)))
  		return -EFAULT;
  
-@@ -272,6 +277,10 @@
+@@ -272,6 +281,13 @@
  		}
  	}
  
 +#ifdef CONFIG_L4H
-+	if (off >= KVM_REG_ARM_CORE_REG(fp_regs))
-+		l4h_arm_vcpu_sync_fp(vcpu, true);
++	if (off >= KVM_REG_ARM_CORE_REG(fp_regs)) {
++		err = l4h_arm_vcpu_sync_fp(vcpu, true);
++		if (err)
++			goto out;
++	}
 +#endif
  	memcpy(addr, valp, KVM_REG_SIZE(reg->id));
  
@@ -494,17 +523,19 @@ here is that host's EL1 half, with FL4 as its world switch:
  	vcpu->arch.ctxt.spsr_irq = 0;
 --- a/arch/arm64/kvm/vgic/vgic-v3.c
 +++ b/arch/arm64/kvm/vgic/vgic-v3.c
-@@ -220,6 +220,9 @@
+@@ -219,6 +219,11 @@
+ 	vmcr |= (vmcrp->grpen0 << ICH_VMCR_ENG0_SHIFT) & ICH_VMCR_ENG0_MASK;
  	vmcr |= (vmcrp->grpen1 << ICH_VMCR_ENG1_SHIFT) & ICH_VMCR_ENG1_MASK;
  
- 	cpu_if->vgic_vmcr = vmcr;
 +#ifdef CONFIG_L4H
-+	l4h_vgic_v3_set_vmcr(vcpu, vmcr);
++	/* FL4 has VMCR (arch/l4h/kvm/arm64/vgic.c): ours changes with it. */
++	if (l4h_vgic_v3_set_vmcr(vcpu, vmcr))
++		return;
 +#endif
+ 	cpu_if->vgic_vmcr = vmcr;
  }
  
- void vgic_v3_get_vmcr(struct kvm_vcpu *vcpu, struct vgic_vmcr *vmcrp)
-@@ -228,6 +231,10 @@
+@@ -228,6 +233,10 @@
  	u32 model = vcpu->kvm->arch.vgic.vgic_model;
  	u32 vmcr;
  
@@ -517,16 +548,19 @@ here is that host's EL1 half, with FL4 as its world switch:
  	if (model == KVM_DEV_TYPE_ARM_VGIC_V2) {
 --- a/arch/arm64/kvm/vgic-sys-reg-v3.c
 +++ b/arch/arm64/kvm/vgic-sys-reg-v3.c
-@@ -213,12 +213,19 @@
+@@ -209,6 +209,11 @@
+ {
+ 	struct vgic_v3_cpu_if *vgicv3 = &vcpu->arch.vgic_cpu.vgic_v3;
+ 
++#ifdef CONFIG_L4H
++	/* FL4 has the active priorities: ours change with them. */
++	if (l4h_vgic_v3_set_apr(vcpu, apr, idx, val))
++		return;
++#endif
+ 	if (apr)
  		vgicv3->vgic_ap1r[idx] = val;
  	else
- 		vgicv3->vgic_ap0r[idx] = val;
-+#ifdef CONFIG_L4H
-+	l4h_vgic_v3_set_apr(vcpu, apr, idx, val);
-+#endif
- }
- 
- static u64 get_apr_reg(struct kvm_vcpu *vcpu, u8 apr, u8 idx)
+@@ -219,6 +224,10 @@
  {
  	struct vgic_v3_cpu_if *vgicv3 = &vcpu->arch.vgic_cpu.vgic_v3;
  
@@ -537,3 +571,20 @@ here is that host's EL1 half, with FL4 as its world switch:
  	if (apr)
  		return vgicv3->vgic_ap1r[idx];
  	else
+@@ -480,6 +489,16 @@
+ 		.addr	= attr->addr,
+ 	};
+ 
++#ifdef CONFIG_L4H
++	/* One snapshot of FL4's VMCR and priorities for the whole access
++	 * (arch/l4h/kvm/arm64/vgic.c), or none and an error. */
++	{
++		int err = l4h_vgic_v3_pull_vmcr(vcpu);
++
++		if (err)
++			return err;
++	}
++#endif
+ 	if (is_write)
+ 		return kvm_sys_reg_set_user(vcpu, &reg, gic_v3_icc_reg_descs,
+ 					    ARRAY_SIZE(gic_v3_icc_reg_descs));

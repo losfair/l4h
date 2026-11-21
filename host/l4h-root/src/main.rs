@@ -301,10 +301,16 @@ fn arm_virt_info(bootinfo: &sel4::BootInfoPtr) -> (l4h_abi::ArmVirtInfo, u64) {
 }
 
 /// Whether FL4 makes VCPUs (it runs at EL2), asked by trying, as for VT-x.
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", l4h_arm_virt))]
 fn arm_vcpus(alloc: &mut Alloc, arm_virt: &l4h_abi::ArmVirtInfo) -> bool {
     arm_virt.flags & l4h_abi::ARM_VIRT_READY != 0
         && alloc.can_retype_raw(sel4::sys::_object::seL4_ARM_VCPUObject as u64, 12)
+}
+
+/// A kernel without AArch64 VCPUs (C seL4 built without them).
+#[cfg(all(target_arch = "aarch64", not(l4h_arm_virt)))]
+fn arm_vcpus(_alloc: &mut Alloc, _arm_virt: &l4h_abi::ArmVirtInfo) -> bool {
+    false
 }
 
 /// The two 4 KiB frames of GICv2's GICV for the guests' KVM, or None (and

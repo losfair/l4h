@@ -417,9 +417,33 @@ static void test_hvc(void)
 
 	vm_create(1, -1);
 	start(T_HVC, 0);
+	/* A version (major >= 1) in the low 32 bits: not a negative error
+	 * code, sign-extended or not, nor reserved bit 31. */
 	check("hvc PSCI_VERSION", !run_vcpu(0, &log, NULL) && log.nreports == 1 &&
-	      log.reports[0] >= 0x10000);
+	      !(log.reports[0] >> 31) && log.reports[0] >= 0x10000);
 	printf("KVMTEST: PSCI version %#llx\n", (unsigned long long)log.reports[0]);
+	vm_destroy(1);
+}
+
+/* No hardware breakpoints or watchpoints (FL4 does not switch them):
+ * none offered, and KVM_GUESTDBG_USE_HW refused; software breakpoints stay. */
+static void test_guest_debug(void)
+{
+	struct kvm_guest_debug dbg = { .control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_HW };
+	int r;
+
+	check("no hardware breakpoints", ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_GUEST_DEBUG_HW_BPS) == 0);
+	check("no hardware watchpoints", ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_GUEST_DEBUG_HW_WPS) == 0);
+	r = ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_SET_GUEST_DEBUG2);
+	check("SET_GUEST_DEBUG2 omits USE_HW", r > 0 && !(r & KVM_GUESTDBG_USE_HW) &&
+	      (r & KVM_GUESTDBG_USE_SW_BP));
+	vm_create(1, -1);
+	r = ioctl(vcpus[0], KVM_SET_GUEST_DEBUG, &dbg);
+	check("KVM_GUESTDBG_USE_HW refused", r == -1 && errno == EINVAL);
+	dbg.control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_SW_BP;
+	check("KVM_GUESTDBG_USE_SW_BP accepted", ioctl(vcpus[0], KVM_SET_GUEST_DEBUG, &dbg) == 0);
+	dbg.control = 0;
+	check("guest debugging off", ioctl(vcpus[0], KVM_SET_GUEST_DEBUG, &dbg) == 0);
 	vm_destroy(1);
 }
 
@@ -558,6 +582,7 @@ int main(int argc, char **argv)
 		die("open /dev/kvm");
 	test_mmio();
 	test_hvc();
+	test_guest_debug();
 	test_dirty();
 	test_onereg();
 	test_smp();

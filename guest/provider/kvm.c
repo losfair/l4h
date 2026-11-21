@@ -361,6 +361,13 @@ _Static_assert(L4H_VCPU_STATE_OFFSET >= L4H_FPU_SCRATCH_OFFSET + seL4_FPUStateSi
 _Static_assert(L4H_VCPU_STATE_OFFSET + sizeof(struct l4h_arm_vcpu_state) <= (1ul << seL4_PageBits),
 	       "VCPU state must fit in IPC buffer frame");
 _Static_assert(L4H_VCPU_STATE_OFFSET % 64 == 0, "VCPU state alignment");
+_Static_assert(L4H_ARM_VCPU_STATE_EL1_SYSREGS == seL4_ARM_VCPUState_EL1_SYSREGS &&
+	       L4H_ARM_VCPU_STATE_HYP == seL4_ARM_VCPUState_HYP &&
+	       L4H_ARM_VCPU_STATE_TIMER == seL4_ARM_VCPUState_TIMER &&
+	       L4H_ARM_VCPU_STATE_VGIC == seL4_ARM_VCPUState_VGIC &&
+	       L4H_ARM_VCPU_STATE_GPRS == seL4_ARM_VCPUState_GPRS &&
+	       L4H_ARM_VCPU_STATE_VGIC_LR == seL4_ARM_VCPUState_VGIC_LR &&
+	       L4H_ARM_VCPU_STATE_ALL == seL4_ARM_VCPUState_ALL, "VCPU state groups");
 
 int l4h_arm_vcpu_enter(unsigned long vcpu, unsigned long in_mask, unsigned long out_mask,
 		       struct l4h_arm_vmexit *x)

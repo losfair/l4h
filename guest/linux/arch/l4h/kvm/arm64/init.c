@@ -57,15 +57,24 @@ bool l4h_kvm_available(void)
  * MPAM, RAS, the PMU, and the EL1 registers of FEAT_TCR2/S1PIE/S1POE/
  * SCTLR2.  KVM further narrows them to what it offers (sys_regs.c).
  */
+/* The IPA sizes FL4's Stage-2 roots have (40, 44 or 48 bits): a bootinfo
+ * between them gets the smaller. */
+static unsigned int l4h_ipa_bits(u64 ipa_bits)
+{
+	if (ipa_bits >= 48)
+		return 48;
+	if (ipa_bits >= 44)
+		return 44;
+	return 40;
+}
+
 static u64 l4h_parange(u64 ipa_bits)
 {
-	switch (ipa_bits) {
+	switch (l4h_ipa_bits(ipa_bits)) {
 	case 48:
 		return ID_AA64MMFR0_EL1_PARANGE_48;
 	case 44:
 		return ID_AA64MMFR0_EL1_PARANGE_44;
-	case 42:
-		return ID_AA64MMFR0_EL1_PARANGE_42;
 	default:
 		return ID_AA64MMFR0_EL1_PARANGE_40;
 	}
@@ -214,14 +223,15 @@ void kvm_nvhe_dump_backtrace(unsigned long hyp_offset)
 {
 }
 
+/* FL4 does not switch the breakpoint and watchpoint registers. */
 int get_num_brps(void)
 {
-	return SYS_FIELD_GET(ID_AA64DFR0_EL1, BRPs, l4h_bootinfo->arm_virt.id_aa64dfr0) + 1;
+	return 0;
 }
 
 int get_num_wrps(void)
 {
-	return SYS_FIELD_GET(ID_AA64DFR0_EL1, WRPs, l4h_bootinfo->arm_virt.id_aa64dfr0) + 1;
+	return 0;
 }
 
 u64 cpu_logical_map(unsigned int cpu)
@@ -382,7 +392,7 @@ static int __init l4h_kvm_arm64_setup(void)
 	timecounter_init(&l4h_timer_info.timecounter, &l4h_cyclecounter, 0);
 	if (!l4h_kvm_available())
 		return 0;
-	l4h_kvm_ipa_bits = l4h_bootinfo->arm_virt.ipa_bits;
+	l4h_kvm_ipa_bits = l4h_ipa_bits(l4h_bootinfo->arm_virt.ipa_bits);
 	__boot_cpu_mode[0] = __boot_cpu_mode[1] = BOOT_CPU_MODE_EL2;
 	l4h_s2_pool_init(l4h_bootinfo->nr_ept_roots);
 	l4h_vgic_init();

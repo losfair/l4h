@@ -63,23 +63,30 @@ static bool is_lr_reg(int r)
  * we do not take them back on exits or vcpu_put, but when KVM reads them
  * (vgic-v3.c's VMCR, the APR sysregs, the ICH_* emulation).
  */
-static void pull_vmcr(struct l4h_arm_vcpu *v)
+/* 0 when `state` has them (also when it is newer than FL4's, FL4 has none
+ * yet, or they were read since the guest last ran), -EIO when FL4 could
+ * not give them: `state` is unchanged. */
+static int pull_vmcr(struct l4h_arm_vcpu *v)
 {
 	const struct l4h_arm_vcpu_state *st;
-	int i;
+	int i, err;
 
-	if (!v->synced || v->vgic_vmcr_dirty || l4h_bootinfo->arm_virt.gic_version != 3)
-		return;
+	if (!v->synced || v->vgic_vmcr_dirty || v->vgic_vmcr_fresh ||
+	    l4h_bootinfo->arm_virt.gic_version != 3)
+		return 0;
 	preempt_disable();
 	st = (const void *)((const char *)l4h_this_vcpu()->ipcbuf + L4H_VCPU_STATE_OFFSET);
-	if (!WARN_ON_ONCE(l4h_arm_vcpu_read_state_self(v->vcpu_obj.cptr, L4H_ARM_VCPU_STATE_VGIC))) {
+	err = l4h_arm_vcpu_read_state_self(v->vcpu_obj.cptr, L4H_ARM_VCPU_STATE_VGIC);
+	if (!WARN_ON_ONCE(err)) {
 		*vreg(v, L4H_ARM_VCPUREG_VGIC_VMCR) = st->regs[L4H_ARM_VCPUREG_VGIC_VMCR];
 		for (i = 0; i < 4; i++) {
 			*vreg(v, L4H_ARM_VCPUREG_VGIC_AP0R0 + i) = st->regs[L4H_ARM_VCPUREG_VGIC_AP0R0 + i];
 			*vreg(v, L4H_ARM_VCPUREG_VGIC_AP1R0 + i) = st->regs[L4H_ARM_VCPUREG_VGIC_AP1R0 + i];
 		}
+		v->vgic_vmcr_fresh = true;
 	}
 	preempt_enable();
+	return err ? -EIO : 0;
 }
 
 static struct l4h_arm_vcpu *loaded(void)
@@ -87,21 +94,45 @@ static struct l4h_arm_vcpu *loaded(void)
 	return this_cpu_read(l4h_loaded_vcpu);
 }
 
+static bool is_v3(void)
+{
+	return l4h_bootinfo->arm_virt.gic_version == 3;
+}
+
+/*
+ * ICH_VTR_EL2 or GICH_VTR as KVM sees them: at most the 16 LRs FL4's
+ * state transfers (ListRegs is 5 bits wide on GICv3, 6 on GICv2).
+ */
+static u64 abi_vgic_vtr(bool v3)
+{
+	u64 vtr = l4h_bootinfo->arm_virt.vgic_vtr, mask = v3 ? 0x1f : 0x3f;
+
+	if ((vtr & mask) > 15)
+		vtr = (vtr & ~mask) | 15;
+	return vtr;
+}
+
 static unsigned int nr_lrs(void)
 {
-	return min_t(unsigned int, (l4h_bootinfo->arm_virt.vgic_vtr & 0x1f) + 1, 16);
+	return (abi_vgic_vtr(is_v3()) & (is_v3() ? 0x1f : 0x3f)) + 1;
 }
 
 /* The empty list registers, from their state bits: FL4's VGIC_ELRSR is
  * the CPU's at the last exit, stale after we write the LRs. */
 static u64 elrsr(struct l4h_arm_vcpu *v, bool v3)
 {
-	u64 mask = v3 ? ICH_LR_STATE : GICH_LR_STATE, r = 0;
+	u64 state = v3 ? ICH_LR_STATE : GICH_LR_STATE, hw = v3 ? ICH_LR_HW : GICH_LR_HW;
+	u64 eoi = v3 ? ICH_LR_EOI : GICH_LR_EOI, r = 0;
 	unsigned int i;
 
-	for (i = 0; i < nr_lrs(); i++)
-		if (!(*vreg(v, L4H_ARM_VCPUREG_VGIC_LR0 + i) & mask))
+	/* As the hardware: an LR without state that still asks for a
+	 * maintenance interrupt on EOI (EOI set, not HW) is not empty. */
+	for (i = 0; i < nr_lrs(); i++) {
+		u64 lr = *vreg(v, L4H_ARM_VCPUREG_VGIC_LR0 + i);
+
+		if (!(lr & state) && ((lr & hw) || !(lr & eoi)))
 			r |= 1ull << i;
+	}
 	return r;
 }
 
@@ -215,41 +246,52 @@ static struct l4h_arm_vcpu *vmcr_owner(struct kvm_vcpu *vcpu)
 	return vcpu->arch.l4h;
 }
 
-void l4h_vgic_v3_pull_vmcr(struct kvm_vcpu *vcpu)
+int l4h_vgic_v3_pull_vmcr(struct kvm_vcpu *vcpu)
 {
 	struct vgic_v3_cpu_if *cpu_if = &vcpu->arch.vgic_cpu.vgic_v3;
 	struct l4h_arm_vcpu *v = vmcr_owner(vcpu);
 	int i;
 
 	if (!v || !v->synced)
-		return;
-	pull_vmcr(v);
+		return 0;
+	/* On failure KVM keeps its own copy, not ours. */
+	if (pull_vmcr(v))
+		return -EIO;
 	cpu_if->vgic_vmcr = *vreg(v, L4H_ARM_VCPUREG_VGIC_VMCR);
 	for (i = 0; i < 4; i++) {
 		cpu_if->vgic_ap0r[i] = *vreg(v, L4H_ARM_VCPUREG_VGIC_AP0R0 + i);
 		cpu_if->vgic_ap1r[i] = *vreg(v, L4H_ARM_VCPUREG_VGIC_AP1R0 + i);
 	}
+	return 0;
 }
 
-void l4h_vgic_v3_set_vmcr(struct kvm_vcpu *vcpu, u32 vmcr)
+/* Before KVM changes its copy: nonzero, and it must not. */
+int l4h_vgic_v3_set_vmcr(struct kvm_vcpu *vcpu, u32 vmcr)
 {
 	struct l4h_arm_vcpu *v = vmcr_owner(vcpu);
 
 	if (!v)
-		return;
-	/* The whole group goes to FL4: the priorities as the guest left them. */
-	pull_vmcr(v);
+		return 0;
+	/* The whole group goes to FL4: the priorities as the guest left
+	 * them, or nothing (rather than our older copy of them). */
+	if (pull_vmcr(v))
+		return -EIO;
 	vset_vmcr(v, L4H_ARM_VCPUREG_VGIC_VMCR, vmcr);
+	return 0;
 }
 
-void l4h_vgic_v3_set_apr(struct kvm_vcpu *vcpu, u8 apr, u8 idx, u32 val)
+int l4h_vgic_v3_set_apr(struct kvm_vcpu *vcpu, u8 apr, u8 idx, u32 val)
 {
 	struct l4h_arm_vcpu *v = vmcr_owner(vcpu);
 
-	if (!v || idx > 3)
-		return;
-	pull_vmcr(v);
+	if (!v)
+		return 0;
+	if (idx > 3)
+		return -EINVAL;
+	if (pull_vmcr(v))
+		return -EIO;
 	vset_vmcr(v, (apr ? L4H_ARM_VCPUREG_VGIC_AP1R0 : L4H_ARM_VCPUREG_VGIC_AP0R0) + idx, val);
+	return 0;
 }
 
 void __vgic_v3_init_lrs(void)
@@ -259,7 +301,7 @@ void __vgic_v3_init_lrs(void)
 /* ICH_VTR_EL2; the guest's GIC is always the system register one. */
 u64 __vgic_v3_get_gic_config(void)
 {
-	return l4h_bootinfo->arm_virt.vgic_vtr;
+	return abi_vgic_vtr(true);
 }
 
 bool l4h_sysreg_vgic(u32 enc, u64 *val, bool write)
@@ -270,7 +312,7 @@ bool l4h_sysreg_vgic(u32 enc, u64 *val, bool write)
 	switch (enc) {
 	case SYS_ICH_VTR_EL2:
 		if (!write)
-			*val = l4h_bootinfo->arm_virt.vgic_vtr;
+			*val = abi_vgic_vtr(true);
 		return true;
 	case SYS_ICH_HCR_EL2:
 		r = L4H_ARM_VCPUREG_VGIC_HCR;
@@ -302,14 +344,18 @@ bool l4h_sysreg_vgic(u32 enc, u64 *val, bool write)
 	}
 	v = loaded();
 	if (write) {
+		/* VMCR and the priorities go to FL4 together: the others as
+		 * the guest left them, or none. */
 		if (v && is_lr_reg(r))
 			vset_lr(v, r, *val);
-		else if (v)
+		else if (v && !pull_vmcr(v))
 			vset_vmcr(v, r, *val);
 	} else {
+		/* Without FL4's, our copy (the last we had or sent). */
 		if (v && (r == L4H_ARM_VCPUREG_VGIC_VMCR ||
-			  (r >= L4H_ARM_VCPUREG_VGIC_AP0R0 && r <= L4H_ARM_VCPUREG_VGIC_AP1R3)))
-			pull_vmcr(v);
+			  (r >= L4H_ARM_VCPUREG_VGIC_AP0R0 && r <= L4H_ARM_VCPUREG_VGIC_AP1R3)) &&
+		    pull_vmcr(v))
+			pr_warn_ratelimited("ICH register %d: FL4's copy unavailable, using ours\n", r);
 		*val = v ? *vreg(v, r) : 0;
 	}
 	return true;
@@ -356,7 +402,7 @@ u32 l4h_kvm_readl(const volatile void __iomem *addr)
 	if (!is_gich(addr, &off))
 		return readl_relaxed(addr);
 	if (off == GICH_VTR)
-		return l4h_bootinfo->arm_virt.vgic_vtr;
+		return abi_vgic_vtr(false);
 	if (!v)
 		return 0;
 	if (off == GICH_ELRSR0)

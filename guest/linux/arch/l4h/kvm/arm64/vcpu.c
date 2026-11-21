@@ -172,22 +172,27 @@ void kvm_vcpu_put_vhe(struct kvm_vcpu *vcpu)
  * KVM changed it (L4H_FP_DIRTY) and stays there (L4H_FP_IN_TCB), the guest
  * running with it, until KVM reads it (ONE_REG, guest.c) or resets it.
  */
-void l4h_arm_vcpu_sync_fp(struct kvm_vcpu *vcpu, bool write)
+int l4h_arm_vcpu_sync_fp(struct kvm_vcpu *vcpu, bool write)
 {
 	struct l4h_arm_vcpu *v = to_l4h(vcpu);
+	int err;
 
 	if (!v)
-		return;
+		return 0;
 	if (v->fp_state == L4H_FP_IN_TCB) {
 		/* The IPC buffer's FPU scratch area is this vCPU of ours'. */
 		preempt_disable();
-		WARN_ON(l4h_fpu_read(&v->uctx, &vcpu->arch.ctxt.fp_regs,
-				     sizeof(vcpu->arch.ctxt.fp_regs)));
+		err = l4h_fpu_read(&v->uctx, &vcpu->arch.ctxt.fp_regs,
+				   sizeof(vcpu->arch.ctxt.fp_regs));
 		preempt_enable();
+		/* The TCB keeps them: fp_regs is not theirs, nor to be sent. */
+		if (WARN_ON_ONCE(err))
+			return -EIO;
 		v->fp_state = L4H_FP_IN_REGS;
 	}
 	if (write)
 		v->fp_state = L4H_FP_DIRTY;
+	return 0;
 }
 
 void l4h_arm_vcpu_reset_fp(struct kvm_vcpu *vcpu)
@@ -393,6 +398,14 @@ static void state_to_ctxt(struct kvm_vcpu *vcpu, struct l4h_arm_vcpu *v,
 		ctxt_sys_reg(ctxt, CNTKCTL_EL1) = st->regs[L4H_ARM_VCPUREG_CNTKCTL_EL1];
 		v->vppi_masked = !!(st->vppi_masked & 1);
 	}
+	/* HCR_EL2.VSE, which the CPU clears once it took the virtual SError
+	 * (the rest of HYP is ours).  Another CPU may set or clear VI and VF
+	 * in hcr_el2 meanwhile (vcpu_interrupt_line()): clear VSE atomically,
+	 * as it does those. */
+	if ((mask & L4H_ARM_VCPU_STATE_HYP) && !(st->regs[L4H_ARM_VCPUREG_HCR_EL2] & HCR_VSE)) {
+		cur->regs[L4H_ARM_VCPUREG_HCR_EL2] &= ~HCR_VSE;
+		clear_bit(__ffs(HCR_VSE), vcpu_hcr(vcpu));
+	}
 	/* Not dirty: FL4 has these. */
 	if (mask & L4H_ARM_VCPU_STATE_VGIC) {
 		for (i = L4H_ARM_VCPUREG_VGIC_HCR; i <= L4H_ARM_VCPUREG_VGIC_LR15; i++)
@@ -466,6 +479,11 @@ int __kvm_vcpu_run(struct kvm_vcpu *vcpu)
 		out |= L4H_ARM_VCPU_STATE_VGIC_LR;
 	}
 
+	/* A pending virtual SError: whether the guest took it. */
+	if (v->state->regs[L4H_ARM_VCPUREG_HCR_EL2] & HCR_VSE)
+		out |= L4H_ARM_VCPU_STATE_HYP;
+	/* The guest may change VMCR and the priorities in FL4. */
+	v->vgic_vmcr_fresh = false;
 	l4h_arm_vcpu_enter(v->vcpu_obj.cptr, in, out, &x);
 
 	if (x.stop == L4H_ARM_STOP_OTHER) {

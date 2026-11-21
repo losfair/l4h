@@ -353,8 +353,11 @@ static unsigned long sync_at(struct kvm_pgtable *pgt, struct l4h_s2 *s, u64 ipa)
 
 	if (kvm_pgtable_get_leaf(pgt, ipa, &pte, &level))
 		pte = 0;
-	if (!kvm_pte_valid(pte) || level < 1 || !(leaf_prot(pte) & (L4H_PROT_READ | L4H_PROT_WRITE))) {
-		/* Nothing mapped (or no access): neither a page nor a block. */
+	if (!kvm_pte_valid(pte) || level < 1 || !(leaf_prot(pte) & (L4H_PROT_READ | L4H_PROT_WRITE)) ||
+	    !(pte & KVM_PTE_LEAF_ATTR_LO_S2_AF)) {
+		/* Nothing mapped (or no access), or made old (aging): neither
+		 * a page nor a block, so that the next access faults and
+		 * makes it young again (as x86's EPT access tracking). */
 		if (xa_load(&s->large, gfn >> 9))
 			unmap_range_2m(s, gfn & ~(PAGES_2M - 1));
 		unmap_small(s, gfn);
@@ -489,7 +492,12 @@ void l4h_kvm_pgtable_stage2_mkyoung(struct kvm_pgtable *pgt, u64 addr,
 bool l4h_kvm_pgtable_stage2_test_clear_young(struct kvm_pgtable *pgt, u64 addr, u64 size,
 					     bool mkold)
 {
-	return kvm_pgtable_stage2_test_clear_young(pgt, addr, size, mkold);
+	bool young = kvm_pgtable_stage2_test_clear_young(pgt, addr, size, mkold);
+
+	/* FL4's Stage-2 has no access flag of its own to clear. */
+	if (mkold && young)
+		sync_mapped(pgt, addr, size);
+	return young;
 }
 
 int l4h_kvm_pgtable_stage2_flush(struct kvm_pgtable *pgt, u64 addr, u64 size)

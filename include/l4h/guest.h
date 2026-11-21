@@ -326,7 +326,9 @@ enum {
  * and the list registers, not VMCR and the active priorities, which FL4
  * keeps in the CPU. */
 #define L4H_ARM_VCPU_STATE_VGIC_LR	(1ull << 5)
-#define L4H_ARM_VCPU_STATE_ALL		0x1full
+#define L4H_ARM_VCPU_STATE_ALL		(L4H_ARM_VCPU_STATE_EL1_SYSREGS | L4H_ARM_VCPU_STATE_HYP | \
+					 L4H_ARM_VCPU_STATE_TIMER | L4H_ARM_VCPU_STATE_VGIC | \
+					 L4H_ARM_VCPU_STATE_GPRS | L4H_ARM_VCPU_STATE_VGIC_LR)
 
 /* A VCPU's state in a RAM frame, at a 64-byte aligned offset: FL4's
  * seL4_ARM_VCPUState.  regs[] by L4H_ARM_VCPUREG_*; gprs[] X0..X30,
