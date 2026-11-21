@@ -219,6 +219,15 @@ const struct kvm_x86_nested_ops l4h_nested_ops = {
 void __init l4h_kvm_set_cpu_caps(void)
 {
 	kvm_set_cpu_caps();
+	/*
+	 * FL4 pages with 4 levels and keeps CR4.LA57 out of the CR4 a guest
+	 * runs with, without an error: a guest that turned it on walked its
+	 * 5-level tables as 4-level ones and triple-faulted (#213).  Without
+	 * LA57 KVM also treats CR4.LA57 as reserved, so a VMM that forces it
+	 * gets a #GP in the guest, and checks canonical addresses in 48 bits,
+	 * as FL4 does.
+	 */
+	kvm_cpu_cap_clear(X86_FEATURE_LA57);
 	kvm_cpu_cap_clear(X86_FEATURE_VMX);
 	kvm_cpu_cap_clear(X86_FEATURE_SVM);
 	kvm_cpu_cap_clear(X86_FEATURE_PDCM);

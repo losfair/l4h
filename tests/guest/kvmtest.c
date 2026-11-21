@@ -584,6 +584,36 @@ static int smap_paging(int kvm)
 	return 0;
 }
 
+/*
+ * No 5-level paging (#213): FL4 pages with 4 levels and keeps CR4.LA57 out
+ * of the CR4 a guest runs with, so a guest that set it walked 5-level tables
+ * as 4-level ones.  KVM must neither offer LA57 nor take CR4.LA57.
+ */
+static int five_level(int kvm)
+{
+	struct {
+		struct kvm_cpuid2 c;
+		struct kvm_cpuid_entry2 e[100];
+	} cpuid = { .c.nent = 100 };
+	struct kvm_sregs sregs;
+	uint32_t i;
+	struct vm vm;
+
+	CHECK(ioctl(kvm, KVM_GET_SUPPORTED_CPUID, &cpuid) == 0, "KVM_GET_SUPPORTED_CPUID");
+	for (i = 0; i < cpuid.c.nent; i++)
+		CHECK(!(cpuid.e[i].function == 7 && cpuid.e[i].index == 0 &&
+			(cpuid.e[i].ecx & (1u << 16))), "5-level paging: LA57 offered");
+	if (vm_create(&vm, kvm))
+		return -1;
+	CHECK(ioctl(vm.vcpu, KVM_GET_SREGS, &sregs) == 0, "KVM_GET_SREGS");
+	sregs.cr4 |= (1 << 5) | (1 << 12);	/* PAE, LA57 */
+	CHECK(ioctl(vm.vcpu, KVM_SET_SREGS, &sregs) < 0 && errno == EINVAL,
+	      "5-level paging: KVM took CR4.LA57");
+	vm_destroy(&vm);
+	printf("KVMTEST: no 5-level paging ok\n");
+	return 0;
+}
+
 struct mover {
 	pthread_t target;
 	volatile int stop;
@@ -875,6 +905,7 @@ int main(void)
 	fpu_migrate(kvm);
 	xcr0(kvm);
 	smap_paging(kvm);
+	five_level(kvm);
 	state_between_runs(kvm);
 	rdpmc(kvm);
 	nmi_singlestep_event(kvm);
