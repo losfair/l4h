@@ -1,0 +1,13 @@
+#!/bin/sh
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+echo "SYSCALLBENCH: start online=$(cat /sys/devices/system/cpu/online)"
+# Let the boot log drain first: console output slows syscalls (run-smpbench.py).
+sleep 3
+if /bin/syscallbench; then
+    echo 'SYSCALLBENCH: PASS'
+else
+    echo 'SYSCALLBENCH: FAIL benchmark exit'
+fi
+poweroff -f

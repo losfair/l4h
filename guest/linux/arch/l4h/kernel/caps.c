@@ -550,9 +550,44 @@ EXPORT_SYMBOL_GPL(l4h_slot_delete);
 
 /* ---- objects */
 
+/*
+ * A reply object is written by the kernel on both entries of every guest
+ * syscall (the fault and the ReplyRecv answering it), and the reply objects
+ * of tasks on different vCPUs would otherwise share cache lines: 32 bytes
+ * each, retyped one after another from the same chunk.  Each gets an
+ * Untyped of 128 bytes of its own (a pair of lines: Intel's spatial
+ * prefetcher fetches lines in pairs), and is retyped from that.  On GCE N4
+ * getpid on 4 vCPUs (4 cores) went from 1.60 to 1.35 us per call.
+ */
+#define ISOLATED_BITS 7
+
+static struct chunk *__obj_retype_isolated(int type, int size_bits, unsigned long slot,
+					   unsigned long *pad)
+{
+	unsigned long ut = __slot_alloc();
+	struct chunk *ch;
+
+	if (!ut)
+		return NULL;
+	ch = __obj_retype(L4H_OBJ_UNTYPED, ISOLATED_BITS, ut >> L4H_L2_INDEX_BITS, L4H_ROOT_DEPTH,
+			  ut & (L2_SLOTS - 1));
+	if (ch && l4h_retype(ut, type, size_bits, slot >> L4H_L2_INDEX_BITS, L4H_ROOT_DEPTH,
+			     slot & (L2_SLOTS - 1), 1)) {
+		WARN_ON(l4h_cnode_delete(ut, 64));
+		__obj_put(ch);
+		ch = NULL;
+	}
+	if (!ch) {
+		__slot_free(ut);
+		return NULL;
+	}
+	*pad = ut;
+	return ch;
+}
+
 int l4h_obj_alloc(int type, int size_bits, struct l4h_obj *out)
 {
-	unsigned long flags, slot;
+	unsigned long flags, slot, pad = 0;
 	struct chunk *ch;
 	int err = -ENOMEM;
 
@@ -562,14 +597,18 @@ int l4h_obj_alloc(int type, int size_bits, struct l4h_obj *out)
 	slot = __slot_alloc();
 	if (!slot)
 		goto out;
-	ch = __obj_retype(type, size_bits, slot >> L4H_L2_INDEX_BITS, L4H_ROOT_DEPTH,
-			  slot & (L2_SLOTS - 1));
+	if (type == L4H_OBJ_REPLY)
+		ch = __obj_retype_isolated(type, size_bits, slot, &pad);
+	else
+		ch = __obj_retype(type, size_bits, slot >> L4H_L2_INDEX_BITS, L4H_ROOT_DEPTH,
+				  slot & (L2_SLOTS - 1));
 	if (!ch) {
 		__slot_free(slot);
 		goto out;
 	}
 	out->cptr = slot;
 	out->chunk = ch;
+	out->pad = pad;
 	err = 0;
 out:
 	raw_spin_unlock_irqrestore(&caps_lock, flags);
@@ -584,12 +623,19 @@ void l4h_obj_free(struct l4h_obj *o)
 	if (!o->cptr)
 		return;
 	WARN_ON(l4h_cnode_delete(o->cptr, 64));
+	if (o->pad)
+		WARN_ON(l4h_cnode_delete(o->pad, 64));
 	raw_spin_lock_irqsave(&caps_lock, flags);
 	__slot_free(o->cptr);
+	if (o->pad) {
+		__slot_free(o->pad);
+		__l2_trim(o->pad);
+	}
 	__obj_put(o->chunk);
 	__l2_trim(o->cptr);
 	raw_spin_unlock_irqrestore(&caps_lock, flags);
 	o->cptr = 0;
+	o->pad = 0;
 }
 EXPORT_SYMBOL_GPL(l4h_obj_free);
 

@@ -6,6 +6,7 @@
 struct l4h_obj {
 	unsigned long cptr;	/* 0 if none */
 	void *chunk;		/* the Untyped chunk it was retyped from */
+	unsigned long pad;	/* its own Untyped (l4h_obj_alloc()), or 0 */
 };
 
 unsigned long l4h_slot_alloc(void);
