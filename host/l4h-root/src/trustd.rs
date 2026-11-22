@@ -118,11 +118,10 @@ struct Tdx {
 }
 
 impl Tdx {
-    /// From the BootInfo record, if root may give trustd TDX: not in a
-    /// machine split into partitions (FL4 runs alone), and only with a
-    /// kernel that has TdxControl and shares frames with the VMM.
-    fn find(bootinfo: &sel4::BootInfoPtr, alloc: &mut Alloc) -> Option<Tdx> {
-        let c = l4h_task::bootinfo::extra_chunk(bootinfo, TDX_INFO)?;
+    /// From the BootInfo TDX_INFO payload `c`, if root may give trustd TDX:
+    /// not in a machine split into partitions (FL4 runs alone), and only
+    /// with a kernel that has TdxControl and shares frames with the VMM.
+    fn find(c: &[u8], alloc: &mut Alloc) -> Option<Tdx> {
         if c.len() < 40 {
             log!("l4h-root: TDX_INFO record of {} bytes, ignored", c.len());
             return None;
@@ -162,22 +161,25 @@ impl Tdx {
 }
 
 /// What the boot loader passed on for trustd besides the TPM: the event
-/// logs, and the TD.
+/// logs, whether BootInfo identifies a TD (even if its TDX resources are
+/// unusable), and the usable TD resources.
 struct Extra {
     ev: EventLog,
     cc: EventLog,
+    in_td: bool,
     tdx: Option<Tdx>,
 }
 
 impl Extra {
-    const NONE: Extra = Extra { ev: EventLog::NONE, cc: EventLog::NONE, tdx: None };
+    const NONE: Extra = Extra { ev: EventLog::NONE, cc: EventLog::NONE, in_td: false, tdx: None };
 
-    fn find(bootinfo: &sel4::BootInfoPtr, alloc: &mut Alloc, devmem: &mut DevMem) -> Extra {
+    fn find(bootinfo: &sel4::BootInfoPtr, alloc: &mut Alloc, devmem: &mut DevMem, tdx_info: Option<&[u8]>) -> Extra {
+        let in_td = tdx_info.is_some();
         let ev = EventLog::find(bootinfo, alloc, devmem, TPM_EVENT_LOG);
-        let tdx = Tdx::find(bootinfo, alloc);
+        let tdx = tdx_info.and_then(|c| Tdx::find(c, alloc));
         // The CC event log is the TD's: without TDX nothing quotes it.
         let cc = if tdx.is_some() { EventLog::find(bootinfo, alloc, devmem, CC_EVENT_LOG) } else { EventLog::NONE };
-        Extra { ev, cc, tdx }
+        Extra { ev, cc, in_td, tdx }
     }
 }
 
@@ -387,7 +389,7 @@ impl Layout {
             partitions: crate::partition::get().map_or(1, |d| d.count),
             event_log_size: extra.ev.size,
             event_log_flags: extra.ev.flags,
-            tdx_enabled: extra.tdx.is_some() as u32,
+            tdx: trust::tdx_mode(extra.in_td, extra.tdx.is_some()),
             tdx_gpaw: extra.tdx.as_ref().map_or(0, |t| t.gpaw),
             tdx_attributes: extra.tdx.as_ref().map_or(0, |t| t.attributes),
             tdx_quote_buf_size: if extra.tdx.is_some() { trust::TDX_QUOTE_BUF as u64 } else { 0 },
@@ -397,9 +399,11 @@ impl Layout {
     }
 }
 
-/// The TPM, from its ACPI table (DESIGN.md §10.2).
+/// The TPM, from its ACPI table (DESIGN.md §10.2).  In a TD (`in_td`),
+/// START_ACPI is refused as soon as the start method is decoded, before
+/// touching the CRB control area.
 #[cfg(target_arch = "x86_64")]
-fn find_tpm(bootinfo: &sel4::BootInfoPtr, phys: &mut crate::acpi::Phys) -> Option<Layout> {
+fn find_tpm(bootinfo: &sel4::BootInfoPtr, phys: &mut crate::acpi::Phys, in_td: bool) -> Option<Layout> {
     use crate::blkd::DEVICE_ATTRS;
     /// TPM 2.0 at its standard address (PC Client PTP), where the ACPI
     /// table gives none (FIFO interface).
@@ -431,6 +435,13 @@ fn find_tpm(bootinfo: &sel4::BootInfoPtr, phys: &mut crate::acpi::Phys) -> Optio
         13 => trust::START_PLUTON,
         _ => return unusable("unsupported start method"),
     };
+    // The ACPI start method runs the firmware's AML with root's hardware
+    // access (Hw): in a TD that is the cloud's code, which the TD does not
+    // trust.  Refuse it before reading the CRB control area.
+    if !trust::tpm_start_allowed(in_td, l.start) {
+        log!("l4h-root: refusing ACPI start TPM (AML) in a TDX guest");
+        return None;
+    }
     if control == 0 {
         return unusable("no control area");
     }
@@ -486,27 +497,31 @@ pub fn spawn(
     }
     #[cfg(target_arch = "x86_64")]
     {
+        // Identify a TD from trusted BootInfo TDX_INFO once, independently
+        // of TDX resource availability and before the secondary early return.
+        let tdx_info = l4h_task::bootinfo::extra_chunk(bootinfo, TDX_INFO);
+        let in_td = tdx_info.is_some();
         // A secondary's TPM is the primary's, over the control channel.
         let to_primary = crate::partition::get()
             .is_some_and(|d| d.channels().iter().any(|c| c.peer == 0 && c.kind & l4h_partition::CHANNEL_CONTROL != 0));
         if crate::partition::secondary() {
+            if in_td {
+                log!("l4h-root: a TD split into partitions: flags only");
+                return flags_only(alloc, win, asids, info, &Extra { in_td: true, ..Extra::NONE });
+            }
             let iface = if to_primary { trust::TPM_REMOTE } else { trust::TPM_NONE };
             return without_tpm(alloc, win, asids, info, iface, &Extra::NONE);
         }
         // Whether or not the TPM below is usable.
-        let ev = Extra::find(bootinfo, alloc, devmem);
-        let mut frames = frames;
-        let mut phys = crate::acpi::Phys::new(alloc, devmem, win, &mut frames);
-        let Some(l) = find_tpm(bootinfo, &mut phys) else {
-            return flags_only(alloc, win, asids, info, &ev);
-        };
-        // The ACPI start method runs the firmware's AML with root's
-        // hardware access (Hw): in a TD that is the cloud's code, which the
-        // TD does not trust.  TDX attests without it.
-        if ev.tdx.is_some() && l.start == trust::START_ACPI {
-            log!("l4h-root: refusing ACPI start TPM (AML) in a TDX guest");
+        let ev = Extra::find(bootinfo, alloc, devmem, tdx_info);
+        if ev.in_td && ev.tdx.is_none() {
             return flags_only(alloc, win, asids, info, &ev);
         }
+        let mut frames = frames;
+        let mut phys = crate::acpi::Phys::new(alloc, devmem, win, &mut frames);
+        let Some(l) = find_tpm(bootinfo, &mut phys, ev.in_td) else {
+            return flags_only(alloc, win, asids, info, &ev);
+        };
         // The pages of each range, which stay in `frames`.
         for &(base, size) in &l.ranges {
             if (0..size / PAGE).any(|p| phys.frame(base + p * PAGE).is_none()) {
@@ -733,8 +748,9 @@ fn finish(
     }
     let kick = arena.object_cap::<cap_type::Notification>(alloc, ObjectBlueprint::Notification);
     comp.give(trust::SLOT_KICK, kick, CapRights::all());
-    // The relay pages, shared with root, when there are other partitions.
-    let multikernel = crate::partition::get().is_some_and(|d| d.count > 1);
+    // The relay pages, shared with root, when there are other partitions
+    // (never in a TD).
+    let multikernel = !extra.in_td && crate::partition::get().is_some_and(|d| d.count > 1);
     let relay = multikernel.then(|| {
         for p in 0..trust::RELAY_PAGES {
             let f = arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP);

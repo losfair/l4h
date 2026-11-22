@@ -26,7 +26,7 @@
 //! lists, each with its partition: the primary's first, at most one per
 //! partition.  Reports and evidence then carry the partition (version 2).
 //!
-//! On an Intel TDX trust domain (TrustdConfig::tdx_enabled, never in a
+//! On an Intel TDX trust domain (TrustdConfig::tdx != TDX_NONE, never in a
 //! multikernel machine) the same key is also bound to the TD (tdx.rs,
 //! tdxrt.rs): a DCAP quote of a TDREPORT over its hash, taken while RTMR 3
 //! is zero, after which RTMR 3 is extended with it.  With a TPM, without
@@ -34,7 +34,9 @@
 //! quotes over a guest's report come in requests of their own.  The key's
 //! seed is then the CPU's alone (RDSEED, which the VMM can neither see nor
 //! change), and the key is bound to the TD before the TPM, if any, is
-//! touched; a TPM with the ACPI start method (the cloud's AML) is not used.
+//! touched; if TDX resources, CPU entropy or TD binding fail, trustd runs
+//! flags-only without touching the vTPM or partition relay.  A TPM with
+//! the ACPI start method (the cloud's AML) is not used.
 //!
 //! Nothing here allocates (DESIGN.md §10): requests are copied, and answers
 //! built, in fixed buffers, and the evidence is made once into one.  The
@@ -468,13 +470,12 @@ fn td_tpm(cfg: &TrustdConfig, hz: u64, key: SigningKey, t0: u64, partition: Opti
 }
 
 /// A key from the CPU alone (a TD's).
-fn cpu_key(seed: Option<[u8; 32]>) -> Option<SigningKey> {
-    let mut seed = seed?;
+fn cpu_key() -> Option<SigningKey> {
     loop {
+        let seed = cpu_seed()?;
         if let Ok(k) = SigningKey::from_bytes(&seed.into()) {
             return Some(k);
         }
-        seed = cpu_seed()?;
     }
 }
 
@@ -918,74 +919,88 @@ fn main(info: &'static Info) -> ! {
     let event_log = mapped_log(trust::EVENT_LOG_VA, cfg.event_log_size, trust::EVENT_LOG_MAX);
     let cc_event_log = mapped_log(trust::CC_EVENT_LOG_VA, cfg.cc_event_log_size, trust::CC_EVENT_LOG_MAX);
     let t0 = host::ticks::now();
-    let mut relay = Relay::new(cfg.partition, cfg.partitions);
+    // A known TD (TrustdConfig::in_td) takes precedence over TPM and relay
+    // paths and never falls back to a non-TD TPM or multikernel relay.
+    let in_td = cfg.in_td();
+    let mut relay = if in_td { None } else { Relay::new(cfg.partition, cfg.partitions) };
     let partition = relay.as_ref().map(|r| r.index);
-    // A TD (never one of several partitions): the CPU's entropy for the key.
-    let td = cfg.tdx_enabled != 0 && relay.is_none();
-    let cpu = if td { cpu_seed() } else { None };
-    if td && cpu.is_none() {
-        l4h_rt::log!("l4h-trustd: no RDSEED or RDRAND: no TDX attestation");
-    }
-    let td = td && cpu.is_some();
     // A secondary's key, until the primary quoted it.
     let mut starting = None;
     let mut tdx = None;
-    let mut state = match (cfg.iface, relay.as_mut()) {
-        (_, None) if td => {
-            // A TD: the CPU's key, bound to the TD (its TDREPORT while
-            // RTMR 3 is zero, then RTMR 3 extended with it) before anything
-            // of the host's vTPM is touched: what the cloud's vTPM or its
-            // ACPI code does cannot come first.  The vTPM, if any, then
-            // quotes the same key.
-            match cpu_key(cpu) {
-                Some(key) => {
-                    tdx = match Tdx::start(&point(&key), hz) {
-                        Ok(mut t) => match t.poll() {
-                            // Ask for the quote now: it comes while the TPM
-                            // is set up.
-                            Some(tdxrt::Event::Failed) => None,
-                            Some(tdxrt::Event::Ready) => {
-                                info!("l4h-trustd: TDX attestation ready");
-                                Some(t)
-                            }
-                            _ => Some(t),
-                        },
-                        Err(why) => {
-                            l4h_rt::log!("l4h-trustd: no TDX attestation: {}", why);
-                            None
-                        }
-                    };
-                    Some(td_tpm(cfg, hz, key, t0, partition))
-                }
-                None => {
+    let mut state = if in_td {
+        let capable = cfg.tdx_capable() && cfg.partitions == 1 && cfg.partition == 0;
+        if !capable {
+            l4h_rt::log!("l4h-trustd: TD without usable TDX attestation: flags only");
+        }
+        // Strict TD startup order:
+        // 1. CPU entropy -> key (failure never falls back to vTPM).
+        // 2. Synchronous TDREPORT + check_first_report + RTMR.EXTEND
+        //    (failure never touches vTPM or creates a TPM-only key).
+        // 3. Optional vTPM quotes the same bound key.
+        // 4. Start the GetQuote job with its full 120 s timeout after vTPM
+        //    setup and poll once.
+        match tdx::td_startup(
+            capable,
+            || {
+                let key = cpu_key();
+                if key.is_none() {
                     l4h_rt::log!("l4h-trustd: no key from RDSEED or RDRAND: no TDX attestation");
-                    None
                 }
+                key
+            },
+            |key| match Tdx::bind(&point(key)) {
+                Ok(bound) => Ok(bound),
+                Err(why) => {
+                    l4h_rt::log!("l4h-trustd: no TDX attestation: {}", why);
+                    Err(why)
+                }
+            },
+            |key| td_tpm(cfg, hz, key, t0, partition),
+            host::ticks::now,
+            |bound, now| {
+                let mut t = bound.start_quote(hz, now);
+                match t.poll() {
+                    Some(tdxrt::Event::Failed) => None,
+                    Some(tdxrt::Event::Ready) => {
+                        info!("l4h-trustd: TDX attestation ready");
+                        Some(t)
+                    }
+                    _ => Some(t),
+                }
+            },
+        ) {
+            None => None,
+            Some((state, quote)) => {
+                tdx = quote;
+                Some(state)
             }
         }
-        (trust::TPM_NONE, _) | (trust::TPM_REMOTE, None) => None,
-        (trust::TPM_REMOTE, Some(r)) => {
-            match start_remote(r, hz) {
-                Ok(k) => starting = Some(k),
-                Err(why) => l4h_rt::log!("l4h-trustd: no attestation: {}", why),
+    } else {
+        match (cfg.iface, relay.as_mut()) {
+            (trust::TPM_NONE, _) | (trust::TPM_REMOTE, None) => None,
+            (trust::TPM_REMOTE, Some(r)) => {
+                match start_remote(r, hz) {
+                    Ok(k) => starting = Some(k),
+                    Err(why) => l4h_rt::log!("l4h-trustd: no attestation: {}", why),
+                }
+                None
             }
-            None
-        }
-        _ => match tpm_key(cfg, hz) {
-            Ok((tpm, key)) => match init(tpm, key, t0, hz, partition) {
-                Ok(s) => Some(s),
+            _ => match tpm_key(cfg, hz) {
+                Ok((tpm, key)) => match init(tpm, key, t0, hz, partition) {
+                    Ok(s) => Some(s),
+                    Err((what, e)) => {
+                        l4h_rt::log!("l4h-trustd: TPM unusable, no attestation: {}: {}", what, e);
+                        None
+                    }
+                },
                 Err((what, e)) => {
                     l4h_rt::log!("l4h-trustd: TPM unusable, no attestation: {}: {}", what, e);
                     None
                 }
             },
-            Err((what, e)) => {
-                l4h_rt::log!("l4h-trustd: TPM unusable, no attestation: {}: {}", what, e);
-                None
-            }
-        },
+        }
     };
-    // A key bound to nothing (a TD that cannot attest, without a TPM).
+    // A key bound to nothing (a TD whose GetQuote failed, without a TPM).
     if state.as_ref().is_some_and(|s| !s.has_tpm) && tdx.is_none() {
         state = None;
     }

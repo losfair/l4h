@@ -4673,11 +4673,19 @@ TDREPORTs (`trust::TDX_REPORT_VA`), a 2 MiB frame shared with the VMM for
 GetQuote (`trust::TDX_QUOTE_VA`) and the firmware's CC event log
 (`CC_EVENT_LOG`, 13, as `TPM_EVENT_LOG`, at `trust::CC_EVENT_LOG_VA`).
 K's seed is the CPU's alone (RDSEED, else RDRAND: neither exits to the
-VMM). trustd binds K to the TD before it touches the TPM, if any, so that
-nothing of the cloud's vTPM comes before RTMR 3 is extended; the vTPM then
-quotes the same K, and if it fails trustd attests with TDX alone. A TPM
-with the ACPI start method is not used in a TD: its `_DSM` is the cloud's
-AML, run with root's hardware access; root gives trustd no such TPM there
+VMM). Root identifies a TD from BootInfo `TDX_INFO` independently of
+whether TDX capabilities or frames are usable; if a TD lacks usable TDX
+resources (or is partitioned), root and trustd run flags-only and never
+fall back to a local TPM or partition relay. trustd binds K to the TD
+before it touches the TPM, if any, so that nothing of the cloud's vTPM
+comes before RTMR 3 is extended; if CPU entropy or TD binding fails,
+trustd runs flags-only without initializing the vTPM. Once K is bound to
+RTMR 3, the optional vTPM quotes the same K (if it fails, trustd attests
+with TDX alone), and only afterwards does trustd start the 120 s
+GetQuote timer and first poll on the saved TDREPORT. A TPM with the ACPI
+start method is not used in a TD: its `_DSM` is the cloud's AML, run
+with root's hardware access; root refuses `START_ACPI` as soon as it
+decodes the start method, before reading the CRB control registers
 (trustd also ignores one). trustd then:
 
 - asks for a TDREPORT (TDG.MR.REPORT) with REPORTDATA

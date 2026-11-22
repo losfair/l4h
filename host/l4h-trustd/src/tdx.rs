@@ -226,6 +226,33 @@ pub fn check_quote(quote: &[u8], report: &[u8; REPORT_SIZE]) -> Result<usize, &'
     Ok(end)
 }
 
+// ---- TD startup sequencing (free of seL4, for tests).
+
+/// Execute the TD startup sequence in strict order:
+/// 1. Require TDX capability (else None, never touching vTPM).
+/// 2. Make the key from CPU entropy alone (else None).
+/// 3. Synchronously bind the key to the TD (TDREPORT + RTMR 3 extend).
+/// 4. Run optional vTPM binding on the same key.
+/// 5. Sample `now()` after optional vTPM finishes and start the GetQuote
+///    job with that timestamp.
+pub fn td_startup<K, B, S, Q, E>(
+    capable: bool,
+    make_key: impl FnOnce() -> Option<K>,
+    bind_td: impl FnOnce(&K) -> Result<B, E>,
+    bind_tpm: impl FnOnce(K) -> S,
+    now: impl FnOnce() -> u64,
+    start_quote: impl FnOnce(B, u64) -> Option<Q>,
+) -> Option<(S, Option<Q>)> {
+    if !capable {
+        return None;
+    }
+    let key = make_key()?;
+    let bound = bind_td(&key).ok()?;
+    let state = bind_tpm(key);
+    let quote = start_quote(bound, now());
+    Some((state, quote))
+}
+
 // ---- Guests' fresh quotes: one out at a time, the answer kept for its
 // owner's further pieces (tdxrt.rs).  What a request does is decided here,
 // free of seL4, for the tests.
@@ -572,5 +599,110 @@ mod tests {
         assert_eq!(&rest[..10], &[0x65, b'q', b'u', b'o', b't', b'e', 0x43, 1, 2, 3]);
         assert_eq!(&rest[10..19], &[0x66, b'r', b'e', b'p', b'o', b'r', b't', 0x58, 30]);
         assert_eq!(rest.len(), 19 + 30);
+    }
+
+    #[test]
+    fn td_startup_fails_closed_without_touching_tpm() {
+        // Missing TDX resources (TDX_UNAVAILABLE or partitioned TD): nothing runs.
+        let r: Option<(bool, Option<()>)> = td_startup(
+            false,
+            || unreachable!("must not make key when TDX is unavailable"),
+            |_: &u8| -> Result<(), ()> { unreachable!("must not bind TD") },
+            |_| unreachable!("must not touch vTPM"),
+            || unreachable!("must not sample clock"),
+            |_, _| unreachable!("must not start quote"),
+        );
+        assert_eq!(r, None);
+
+        // No CPU entropy / key generation failure: never touches TD bind or vTPM.
+        let r: Option<(bool, Option<()>)> = td_startup(
+            true,
+            || None::<u8>,
+            |_| -> Result<(), ()> { unreachable!("must not bind TD without key") },
+            |_| unreachable!("must not touch vTPM without key"),
+            || unreachable!("must not sample clock without key"),
+            |_, _| unreachable!("must not start quote without key"),
+        );
+        assert_eq!(r, None);
+
+        // TDREPORT / check_first_report / RTMR.EXTEND failure: never touches vTPM.
+        let r: Option<(bool, Option<()>)> = td_startup(
+            true,
+            || Some(1u8),
+            |_| -> Result<(), &'static str> { Err("RTMR 3 is not zero") },
+            |_| unreachable!("must not touch vTPM when TD bind fails"),
+            || unreachable!("must not sample clock when TD bind fails"),
+            |_, _| unreachable!("must not start quote when TD bind fails"),
+        );
+        assert_eq!(r, None);
+    }
+
+    #[test]
+    fn td_startup_order_and_clock_sampled_after_slow_tpm() {
+        use core::cell::{Cell, RefCell};
+
+        let clock = Cell::new(5_000u64);
+        let steps = RefCell::new(Vec::new());
+        let saved = report(&report_data(&key_binding(&point())), &[0; 48]);
+
+        let out = td_startup(
+            true,
+            || {
+                steps.borrow_mut().push("key");
+                Some(42u8)
+            },
+            |&k| -> Result<[u8; REPORT_SIZE], &'static str> {
+                assert_eq!(k, 42);
+                steps.borrow_mut().push("bind");
+                clock.set(clock.get() + 50);
+                Ok(saved)
+            },
+            |k| {
+                assert_eq!(k, 42);
+                steps.borrow_mut().push("tpm");
+                // Slow optional vTPM takes longer than the 120 s quote window.
+                clock.set(clock.get() + 150_000);
+                true
+            },
+            || {
+                steps.borrow_mut().push("now");
+                clock.get()
+            },
+            |rep, started_at| {
+                steps.borrow_mut().push("quote");
+                assert_eq!(rep, saved);
+                Some(started_at)
+            },
+        );
+
+        assert_eq!(steps.into_inner(), std::vec!["key", "bind", "tpm", "now", "quote"]);
+        // Clock was sampled strictly after optional vTPM finished (5000 + 50 + 150000).
+        assert_eq!(out, Some((true, Some(155_050))));
+    }
+
+    #[test]
+    fn td_startup_preserves_tdx_only_and_bound_tpm_only_modes() {
+        // Optional vTPM fails after TD binding succeeds -> TDX-only remains available.
+        let tdx_only = td_startup(
+            true,
+            || Some(7u8),
+            |_| -> Result<u8, ()> { Ok(9) },
+            |_| false,
+            || 100,
+            |b, t| Some((b, t)),
+        );
+        assert_eq!(tdx_only, Some((false, Some((9, 100)))));
+
+        // Optional vTPM succeeds after TD binding succeeds, but external GetQuote fails
+        // -> bound TPM-only remains available.
+        let bound_tpm_only: Option<(bool, Option<u8>)> = td_startup(
+            true,
+            || Some(7u8),
+            |_| -> Result<u8, ()> { Ok(9) },
+            |_| true,
+            || 100,
+            |_, _| None,
+        );
+        assert_eq!(bound_tpm_only, Some((true, None)));
     }
 }
