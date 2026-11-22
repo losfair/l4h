@@ -8,7 +8,7 @@
 # VCPUS=n gives dom0 n vCPUs (default 2).
 # L4H_FL4_SOURCE=<detached FL4 worktree> builds that FL4 instead of the pin.
 # --sev-snp boots an AMD SEV-SNP confidential VM (default n2d-standard-4
-# on AMD Milan) from FL4's native UEFI loader, with dom0 embedded, as
+# on AMD Milan) from FL4's native UEFI loader, with dom0 on the ESP, as
 # tests/gce-test.sh --sev-snp does.
 # --scale measures many-core scaling instead: syscallbench, then smpbench
 # at 1, 2, 4, ... and all dom0 vCPUs (tests/guest/init-smpscale), with dom0
@@ -72,15 +72,9 @@ L4H_DOM0_DISKS=0 L4H_DOM0_VCPUS=$vcpus L4H_DOM0_MEM_MB=$mem_mb L4H_DOM0_CMDLINE=
     || { tail -20 "$out/host-build.log"; exit 1; }
 export L4H_GUEST_KERNEL=$out/vmlinux L4H_GUEST_SDK=
 rootelf=$root/host/target/x86_64-sel4-roottask/$l4h_profile/l4h-root.elf
-if [ -n "$snp" ]; then
-    L4H_DOM0_INITRD="$out/dom0.cpio.gz" "$root/tools/mkfl4-efi.sh" "$out/$name.efi" \
-        "$rootelf" "$SEL4_PREFIX/bin/kernel.elf" >"$out/efi-build.log" 2>&1 \
-        || { tail -20 "$out/efi-build.log"; exit 1; }
-    "$root/tools/mkimage.sh" -e "$out/$name.efi" "$out/$name.raw" >/dev/null
-else
-    L4H_MKSHIM='' "$root/tools/mkefi.sh" "$out/$name.efi" "$rootelf" "$SEL4_PREFIX/bin/kernel.elf" >/dev/null
-    "$root/tools/mkimage.sh" -e "$out/$name.efi" -i "$out/dom0.cpio.gz" "$out/$name.raw" >/dev/null
-fi
+"$root/tools/mkfl4-release-efi.sh" "$out/$name.efi" "$rootelf" "$SEL4_PREFIX/bin/kernel.elf" >"$out/efi-build.log" 2>&1 \
+    || { tail -20 "$out/efi-build.log"; exit 1; }
+"$root/tools/mkimage.sh" -e "$out/$name.efi" -i "$out/dom0.cpio.gz" "$out/$name.raw" >/dev/null
 rm -f "$out/$name.efi"
 "$root/tools/gce-image.sh" "$out/$name.raw" "$name" >/dev/null
 rm -f "$out/$name.raw"

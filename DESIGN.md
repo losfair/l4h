@@ -4240,10 +4240,14 @@ A guest can prove to a remote verifier what it booted, and on which host.
 The chain has four links.
 
 1. **Measured boot.** The firmware measures the UEFI application into PCR 4.
-   The application holds seL4, `l4h-root` and every host component (§11),
-   so one digest covers the whole host. Loading its child GRUB image
-   extends PCR 4 again. GRUB's `tpm` module measures dom0's
+   The application holds the microkernel, `l4h-root` and every host component
+   (§11), so one digest covers the whole host. On seL4, loading the embedded
+   GRUB image extends PCR 4 again. GRUB's `tpm` module measures dom0's
    kernel, initramfs and `l4h.conf` into PCR 9, and its commands into PCR 8.
+   For the native FL4 release, firmware measures the EFI once. The loader
+   leaves PCR 8 untouched and extends PCR 9 only for each present external
+   file, in config-then-initramfs order. Use references for the native loader
+   when migrating an existing GRUB-based attestation policy.
    Secure Boot is not needed: nothing is checked at boot; the verifier
    checks afterwards. A BIOS boot measures none of this (BIOS GRUB has no
    `tpm` module), so such a host's quotes say nothing about what it booted.
@@ -5006,7 +5010,7 @@ injects these failures in a host built with `L4H_TEST_INJECT=1`;
 
 ## 11. Boot and deployment
 
-- **UEFI.** UEFI → EFI wrapper → GRUB (EFI) → multiboot2. `tools/mkefi.sh`
+- **seL4 UEFI.** UEFI → EFI wrapper → GRUB (EFI) → multiboot2. `tools/mkefi.sh`
   builds l4h as one UEFI application containing a standalone GRUB whose
   memdisk holds the seL4 kernel, `l4h-root` (with the service ELFs), the
   guest kernel and its build SDK (§5.6). At boot, GRUB looks for
@@ -5040,6 +5044,16 @@ injects these failures in a host built with `L4H_TEST_INJECT=1`;
   UEFI firmware need not fill in the BIOS data area seL4 otherwise reads.
   Initramfs images for other guests come through the dom0 API. QEMU can also
   use plain `-kernel` multiboot for development.
+- **FL4 UEFI.** Firmware starts `l4h-fl4.efi` directly. Its native loader
+  embeds FL4, the root task, the guest kernel and SDK, and uses the same
+  on-disk paths and A/B selector as the seL4 releases. It resolves filesystem
+  UUIDs by the FAT volume serial and labels through EFI. A front loader can
+  retry on `EFI_LOAD_ERROR`. With no selector, the loader prefers its loading
+  volume, then searches for the initramfs and finally the config. It reads
+  the config as data, forwards `fb_console` to FL4 and hands both optional
+  files to root. With a TPM it extends PCR 9 with the exact config and then
+  initramfs bytes that it passes to the kernel. In a trust domain it also
+  measures those files into RTMR[2], including with no vTPM.
 - **BIOS.** BIOS → GRUB (i386-pc) → multiboot2, for clouds whose VMs boot
   only with SeaBIOS, such as DigitalOcean. BIOS GRUB's core image is read
   into conventional memory and must stay within a few hundred KiB, so it
@@ -5162,7 +5176,7 @@ injects these failures in a host built with `L4H_TEST_INJECT=1`;
      vCPU, 2.35 to 1.20 us on two and 1.60 to 1.35 us on four cores.
      `--sev-snp` boots it as an SEV-SNP confidential VM (default
      n2d-standard-4, AMD Milan) from FL4's native UEFI loader with dom0
-     embedded. There FL4 #62's retpolines and Safe RET, in place of an
+     on the EFI system partition. There FL4 #62's retpolines and Safe RET, in place of an
      IBPB at every native entry, took getpid from 3.66 to 1.41 us on one
      vCPU.
 3. **AWS EC2.** c6i.xlarge boots the generic UEFI image with ENA and NVMe
@@ -5980,12 +5994,17 @@ the guest self-test ran with all of the instance's vCPUs online.
 The SNP image uses FL4's native UEFI loader to hand off in long mode
 with private page tables. The CR3 switch runs from a trampoline below
 4 GiB so it stays mapped even when firmware puts the loader above 4 GiB.
-`tools/mkfl4-efi.sh` builds the loader from the pinned FL4 source
-and embeds the FL4 kernel and the root task. The guest kernel, SDK,
-dom0 initramfs and settings are supplied through
-`tools/dom0-modules.sh`. Package the resulting EFI application with
-`tools/mkimage.sh -e` and use `tools/gce-image.sh --sev-snp` for the
-`SEV_SNP_CAPABLE` image tag and matching instance configuration.
+The released `l4h-fl4.efi` uses this handoff for ordinary UEFI, SEV-SNP
+and TDX. Outside TDX the handoff requires firmware using four-level paging.
+Package it with `tools/mkimage.sh -e l4h-fl4.efi -i dom0.cpio.gz -c l4h.conf build/l4h-snp.raw`.
+On GCE, `tools/gce-image.sh --sev-snp` sets the image tag and prints the
+matching instance configuration. To test an existing release application on
+GCE, run `UEFI_EFI=./l4h-fl4.efi tests/gce-test.sh --sev-snp PROJECT`.
+`tools/mkfl4-release-efi.sh` builds the release loader with the kernel's pinned
+FL4 source. The private EFI-library build adds a kernel command-line argument
+and exposes FL4's RTMR[2] file measurement to the caller. The kernel build
+uses the original pin. `tools/mkfl4-efi.sh` remains available for images with
+dom0 and settings built into the root task.
 
 Rebuild the host with this `SEL4_PREFIX`; its build also compiles the small
 ABI provider against FL4's libsel4. Linux and modules remain byte-identical

@@ -18,6 +18,8 @@
 # SEV-SNP), with Google's vTPM unless NO_VTPM=1, and requires TDX
 # attestation to be ready and its evidence in the serial log (dom0 prints
 # every attestation blob there, in hex, for tools/l4h-attest.py).
+# UEFI_EFI=app.efi boots that exact release application with the test dom0
+# and settings on its ESP, without rebuilding its kernel, host or SDK.
 # IMAGE_ONLY=1 stops once the image's .tar.gz is built, prints its path
 # and the deployment commands (tools/gce-image.sh), and uses no cloud
 # resources (PROJECT is then only a placeholder).
@@ -73,19 +75,24 @@ if [ -n "$confidential" ]; then
     fi
     export SEL4_PREFIX="$root/build/sel4-fl4" L4H_KERNEL_VARIANT=fl4
 fi
-name=l4h-test-$(date +%Y%m%d-%H%M%S)
+name=l4h-test-$(date +%Y%m%d-%H%M%S)-$RANDOM
 bucket=gs://$project-l4h-test
 out=$root/build/gce; mkdir -p "$out"
 log=$out/$name.serial.log
 
 # ---- image
-kernel_build=build-kernel.sh
-[ -n "$confidential" ] && kernel_build=build-fl4.sh
-"$root/tools/$kernel_build" >"$root/build/kernel-build.log" 2>&1 \
-    || { tail -20 "$root/build/kernel-build.log"; exit 1; }
-"$root/tools/build-linux.sh" vmlinux >"$root/build/linux-build.log" 2>&1 \
-    || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
-objcopy --strip-debug "$root/build/linux-l4h/vmlinux" "$out/vmlinux"
+efi=${UEFI_EFI:-}
+if [ -n "$efi" ]; then
+    [ -f "$efi" ] || { echo "$efi: missing EFI application" >&2; exit 1; }
+else
+    kernel_build=build-kernel.sh
+    [ -n "$confidential" ] && kernel_build=build-fl4.sh
+    "$root/tools/$kernel_build" >"$root/build/kernel-build.log" 2>&1 \
+        || { tail -20 "$root/build/kernel-build.log"; exit 1; }
+    "$root/tools/build-linux.sh" vmlinux >"$root/build/linux-build.log" 2>&1 \
+        || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
+    objcopy --strip-debug "$root/build/linux-l4h/vmlinux" "$out/vmlinux"
+fi
 (cd "$root/tools/l4hctl" && cargo +stable build -q --release)
 gcc -O2 -static -pthread -o "$out/selftest" "$root/tests/guest/selftest.c"
 "$root/tools/mkinitramfs.sh" "$out/selftest.cpio.gz" "$root/tests/guest/init-selftest" "$out/selftest" >/dev/null
@@ -94,22 +101,23 @@ gcc -O2 -static -pthread -o "$out/selftest" "$root/tests/guest/selftest.c"
 "$root/tools/mkinitramfs.sh" "$out/dom0.cpio.gz" "$root/tests/guest/init-gce" \
     "$root/tools/l4hctl/target/release/l4hctl" "$root/tests/guest/udhcpc.script" \
     "$out/selftest.cpio.gz" "$out/disk.cpio.gz" "$out/vm.cpio.gz" >/dev/null
-L4H_DOM0_DISKS=0 L4H_DOM0_MEM_MB=1024 L4H_DOM0_CMDLINE=console=hvc0 L4H_WATCHDOG_SECS=${L4H_WATCHDOG_SECS:-0} \
+cat > "$out/$name.conf" <<CONF
+dom0_disks=0
+dom0_mem_mb=1024
+dom0_cmdline="console=hvc0"
+watchdog_secs=${L4H_WATCHDOG_SECS:-0}
+CONF
+image_args=(-i "$out/dom0.cpio.gz" -c "$out/$name.conf")
+if [ -z "$efi" ]; then
     "$root/tools/build-host.sh"
-export L4H_GUEST_KERNEL=$out/vmlinux L4H_GUEST_SDK=
-image_args=()
-if [ "$confidential" = SEV_SNP ] || [ "$confidential" = TDX ]; then
-    L4H_DOM0_INITRD="$out/dom0.cpio.gz" "$root/tools/mkfl4-efi.sh" "$out/$name.efi" \
-        "$root/host/target/x86_64-sel4-roottask/$l4h_profile/l4h-root.elf" "$SEL4_PREFIX/bin/kernel.elf"
-    image_args=(-e "$out/$name.efi")
-elif [ "$confidential" = SEV ]; then
-    L4H_MKSHIM= "$root/tools/mkefi.sh" "$out/$name.efi" \
-        "$root/host/target/x86_64-sel4-roottask/$l4h_profile/l4h-root.elf" "$SEL4_PREFIX/bin/kernel.elf"
-    image_args=(-e "$out/$name.efi")
+    export L4H_GUEST_KERNEL=$out/vmlinux L4H_GUEST_SDK=
+    if [ -n "$confidential" ]; then
+        efi=$out/$name.efi
+        "$root/tools/mkfl4-release-efi.sh" "$efi" \
+            "$root/host/target/x86_64-sel4-roottask/$l4h_profile/l4h-root.elf" "$SEL4_PREFIX/bin/kernel.elf"
+    fi
 fi
-if [ "$confidential" != SEV_SNP ] && [ "$confidential" != TDX ]; then
-    image_args+=(-i "$out/dom0.cpio.gz")
-fi
+[ -z "$efi" ] || image_args+=(-e "$efi")
 "$root/tools/mkimage.sh" "${image_args[@]}" "$out/$name.raw" >/dev/null
 if [ "${IMAGE_ONLY:-0}" = 1 ]; then
     image_flag=()

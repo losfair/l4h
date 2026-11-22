@@ -260,13 +260,13 @@ jobs:
       - name: UEFI boot of the FL4 application
         env:
           L4H_RELEASE: '1'
-          L4H_KERNEL_VARIANT: fl4
-          L4H_MKSHIM: ''
         run: |
           # Package the binaries already built by run-fl4test.sh.
-          tools/mkefi.sh build/l4h-fl4.efi
+          tools/mkfl4-release-efi.sh build/l4h-fl4.efi
           UEFI_EFI=build/l4h-fl4.efi tests/run-uefitest.sh
           grep -aq 'FL4: seL4 17.0 (MCS) API kernel' build/qemu-uefi.log
+          grep -aq "IMAGETEST: SDK mounted" build/qemu-uefi.log
+          PLATFORM_FL4_EFI=build/l4h-fl4.efi tests/run-platformtest.sh
       - name: Upload logs
         if: failure() || steps.nested_virt.outputs.vcpustress == 'failed'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4

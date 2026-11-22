@@ -3,7 +3,8 @@
 # chainloading two FAT slots. Check runtime selectors, disk
 # growth with unchanged l4h.conf, odd sector counts, fallback after selection
 # failure, GRUB literals, and a PCI inventory larger than one page.
-# A software TPM checks measurement of the selector and selected files.
+# A software TPM checks the loader's measurements. PLATFORM_FL4_EFI may
+# name a prebuilt native FL4 application (including its guest and SDK).
 # L4H_TEST_KERNEL may name an already-built compatible guest kernel.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -15,17 +16,21 @@ slot_a_label='L4H$`SLOTA'
 runtime_env=/EFI/L4H/grubenv
 mkdir -p "$out"
 python3 "$root/tests/test_mkefi.py"
-if [ -n "${L4H_TEST_KERNEL:-}" ]; then
-    guest_kernel=$L4H_TEST_KERNEL
+if [ -n "${PLATFORM_FL4_EFI:-}" ]; then
+    rustc +stable --edition=2024 --test "$root/tests/fl4-efi-policy.rs" -o "$out/fl4-efi-policy"
+    "$out/fl4-efi-policy"
+    cp "$PLATFORM_FL4_EFI" "$out/l4h.efi"
 else
-    "$root/tools/build-linux.sh" vmlinux >"$out/linux-build.log" 2>&1
-    guest_kernel=$root/build/linux-l4h/vmlinux
+    if [ -n "${L4H_TEST_KERNEL:-}" ]; then
+        guest_kernel=$L4H_TEST_KERNEL
+    else
+        "$root/tools/build-linux.sh" vmlinux >"$out/linux-build.log" 2>&1
+        guest_kernel=$root/build/linux-l4h/vmlinux
+    fi
+    "$root/tools/build-host.sh" >"$out/host-build.log" 2>&1
+    L4H_GUEST_KERNEL=$guest_kernel L4H_GUEST_SDK= L4H_MKSHIM= "$root/tools/mkefi.sh" "$out/l4h.efi"
 fi
-"$root/tools/build-host.sh" >"$out/host-build.log" 2>&1
 "$root/tools/build-l4hctl.sh"
-export L4H_GUEST_KERNEL=$guest_kernel L4H_GUEST_SDK= L4H_MKSHIM=
-# The same application in both slots uses the shared runtime selector.
-"$root/tools/mkefi.sh" "$out/l4h.efi"
 for slot in A B; do
     printf '%s\n' "$slot" > "$out/platform-slot"
     "$root/tools/mkinitramfs.sh" "$out/$slot.cpio.gz" "$root/tests/guest/init-platformtest" \
@@ -156,14 +161,15 @@ if expected == 'success':
     print('exit-status-control: rejected EFI_SUCCESS: PASS')
     sys.exit(0)
 assert 'PLATFORMTEST: successful EFI return' not in text
-if expected in ('fail', 'retry'):
-    failure = text.index('l4h: boot partition selection failed')
+if expected in ('fail', 'file-error', 'retry'):
+    reason = 'cannot read /l4h/l4h.conf' if expected == 'file-error' else 'boot partition selection failed'
+    failure = text.index(reason)
     fallback = text.index('PLATFORMTEST: fallback')
     assert failure < fallback
     assert not re.search(r'PLATFORMTEST: (source|initrd)', text[:fallback])
-    if expected == 'fail':
+    if expected != 'retry':
         assert not re.search(r'PLATFORMTEST: (source|initrd)', text)
-        print(f'{pathlib.Path(log).stem}: EFI error returned before reading slot files: PASS')
+        print(f'{pathlib.Path(log).stem}: EFI error returned to caller: PASS')
         sys.exit(0)
     expected = 'B'
 else:
@@ -221,9 +227,20 @@ run conflicting-selector fail 1111-1111 l4h_esp_uuid=1111-1111 conflict
 run option-as-selector fail 1111-1111 l4h_esp_uuid=--set=root
 run corrupt-env fail 1111-1111 l4h_esp_uuid=1111-1111 corrupt
 run duplicate-env fail 1111-1111 l4h_esp_uuid=1111-1111 duplicate
-run missing-env B 1111-1111 ignored=1 missing
-# PCR 9 must cover the discovered selector, including ignored variables,
-# while excluding the unchosen slot's settings and initramfs.
+# GRUB's no-device search finds B first in this fixture. The native
+# loader uses the filesystem device supplied by the front chainloader.
+if [ -n "${PLATFORM_FL4_EFI:-}" ]; then
+    run missing-env A 1111-1111 ignored=1 missing
+    mdel -i "$slota" ::/l4h/l4h.conf
+    mmd -i "$slota" ::/l4h/l4h.conf
+    run invalid-slot-config file-error 1111-1111 l4h_esp_uuid=1111-1111
+    mrd -i "$slota" ::/l4h/l4h.conf
+    mcopy -i "$slota" "$out/A.conf" ::/l4h/l4h.conf
+else
+    run missing-env B 1111-1111 ignored=1 missing
+fi
+# Both loaders exclude the unchosen slot. GRUB also measures the selector
+# block, while the native loader measures only the two selected files.
 tpm=(-chardev "socket,id=tpm,path=$out/tpm/sock" -tpmdev emulator,id=tpm0,chardev=tpm -device tpm-crb,tpmdev=tpm0)
 run measured-a A 1111-1111 l4h_esp_uuid=1111-1111
 cp "$out/B.conf" "$out/B-changed.conf"
@@ -233,19 +250,28 @@ mcopy -o -i "$slotb" "$out/B-changed.conf" ::/l4h/l4h.conf
 mcopy -o -i "$slotb" "$out/other-initrd" ::/l4h/dom0/initrd
 run measured-other-slot A 1111-1111 l4h_esp_uuid=1111-1111
 run measured-selector A 1111-1111 l4h_esp_uuid=1111-1111 extra
-python3 - "$root" "$out" <<'PY'
-import pathlib, re, runpy, sys
-root, out = map(pathlib.Path, sys.argv[1:])
+python3 - "$root" "$out" "${PLATFORM_FL4_EFI:-}" <<'PY'
+import hashlib, pathlib, re, runpy, sys
+root, out = map(pathlib.Path, sys.argv[1:3])
 decode = runpy.run_path(str(root / 'tools/l4h-attest.py'))['cbor_decode']
-def pcr9(name):
+def pcrs(name):
     text = (out / (name + '.log')).read_text(errors='replace')
     evidence = bytes.fromhex(re.search(r'PLATFORMTEST: EVIDENCE ([0-9a-f]+)', text)[1])
-    return decode(evidence)['pcrs'][9]
-base = pcr9('measured-a')
+    return decode(evidence)['pcrs']
+baseline, other, selector = (pcrs('measured-' + case) for case in ('a', 'other-slot', 'selector'))
+base = baseline[9]
 assert base != bytes(32)
-assert base == pcr9('measured-other-slot'), 'unchosen slot affected PCR 9'
-assert base != pcr9('measured-selector'), 'selector not measured into PCR 9'
-print('discovered selector measured, unchosen slot excluded from PCR 9: PASS')
+assert base == other[9], 'unchosen slot affected PCR 9'
+if sys.argv[3]:
+    assert baseline[8] == other[8] == selector[8] == bytes(32), 'native loader changed PCR 8'
+    expected = bytes(32)
+    for file in ['A.conf', 'A.cpio.gz']:
+        digest = hashlib.sha256((out / file).read_bytes()).digest()
+        expected = hashlib.sha256(expected + digest).digest()
+    assert base == selector[9] == expected, 'incorrect native boot file measurements'
+else:
+    assert base != selector[9], 'selector not measured into PCR 9'
+print('selected slot PCR 9 measurements: PASS')
 PY
 tpm=()
 mcopy -o -i "$slotb" "$out/B.conf" ::/l4h/l4h.conf

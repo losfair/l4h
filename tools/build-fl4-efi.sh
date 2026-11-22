@@ -18,7 +18,7 @@ if [ "${L4H_GUEST_BUILT:-0}" != 1 ]; then
 fi
 export L4H_GUEST_KERNEL=$root/build/linux-l4h/vmlinux
 export L4H_GUEST_SDK=$root/build/linux-l4h/sdk.erofs
-L4H_MKSHIM= "$root/tools/mkefi.sh" "$out/l4h-fl4.efi" \
+"$root/tools/mkfl4-release-efi.sh" "$out/l4h-fl4.efi" \
     "$root/host/target/x86_64-sel4-roottask/$l4h_profile/l4h-root.elf" \
     "$SEL4_PREFIX/bin/kernel.elf"
 

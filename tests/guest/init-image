@@ -4,6 +4,10 @@ mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
 echo "IMAGETEST: dom0 up"
+if [ -b /dev/l4hsdk ] && mount -t erofs -o ro /dev/l4hsdk /mnt; then
+    [ -f /mnt/Module.symvers ] && echo "IMAGETEST: SDK mounted"
+    umount /mnt
+fi
 echo "IMAGETEST: cmdline $(cat /proc/cmdline)"
 echo "IMAGETEST: version $(l4hctl version)"
 l4hctl info

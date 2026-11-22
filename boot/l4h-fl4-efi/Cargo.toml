@@ -1,0 +1,24 @@
+[package]
+name = "l4h-fl4-efi"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-only"
+
+# The packager stages these two crates from kernel/fl4/REVISION in this
+# workspace. Cargo then identifies each crate by a checkout-relative path.
+[workspace]
+members = ["fl4/crates/fl4-efi", "fl4/crates/fl4-bootinfo"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-only"
+
+[dependencies]
+fl4-efi = { path = "fl4/crates/fl4-efi" }
+uefi = { version = "0.41.0", features = ["alloc", "global_allocator"] }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = "fat"
