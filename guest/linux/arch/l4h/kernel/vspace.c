@@ -279,31 +279,22 @@ static void as_run_op(struct l4h_as *as, struct l4h_frame_op *op)
 	}
 }
 
-/* Run the queued ops in as few kernel entries as the kernel takes: it may
- * run fewer than asked without an error (FL4 runs a batch beside its
- * serial gate up to an op it cannot run there), and those left are sent
- * again.  Ops after one that failed run on their own (the kernel undoes a
- * failed copy-and-map). */
+/* Run the queued ops: one kernel entry for all, then on their own those
+ * after one that failed (the kernel undoes a failed copy-and-map). */
 static void as_flush_batch(struct l4h_as *as)
 {
-	int n = as->nbatch, first = 0, done, err, i;
+	int n = as->nbatch, done, err = 0, i;
 
 	if (!n)
 		return;
 	as->nbatch = 0;
-	while (first < n) {
-		err = 0;
-		done = l4h_frame_batch(as->batch + first, n - first, as->root, &err);
-		if (done < 0 || done > n - first)
-			done = 0;
-		for (i = first; i < first + done; i++)
-			if (as->batch[i].op == L4H_FRAME_DELETE)
-				l4h_slot_free(as->batch[i].a);
-		first += done;
-		if (err || !done)
-			break;
-	}
-	for (i = first; i < n; i++)
+	done = l4h_frame_batch(as->batch, n, as->root, &err);
+	if (done < 0 || done > n)
+		done = 0;
+	for (i = 0; i < done; i++)
+		if (as->batch[i].op == L4H_FRAME_DELETE)
+			l4h_slot_free(as->batch[i].a);
+	for (i = done; i < n; i++)
 		as_run_op(as, &as->batch[i]);
 }
 
