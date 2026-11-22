@@ -4245,9 +4245,13 @@ The chain has four links.
    GRUB image extends PCR 4 again. GRUB's `tpm` module measures dom0's
    kernel, initramfs and `l4h.conf` into PCR 9, and its commands into PCR 8.
    For the native FL4 release, firmware measures the EFI once. The loader
-   leaves PCR 8 untouched and extends PCR 9 only for each present external
-   file, in config-then-initramfs order. Use references for the native loader
-   when migrating an existing GRUB-based attestation policy.
+   leaves PCR 8 untouched and extends PCR 9 with two events, always, in this
+   order: `l4h-config`, then `dom0-initrd`. Each hashes
+   `<name>\0present\0<the file's exact bytes>` when the file is there (even
+   empty) and `<name>\0absent` when it is not, so a file renamed to the other
+   slot, emptied or removed changes PCR 9, and no event hashes zero bytes
+   (EDK2's HashLogExtendEvent refuses those). Use references for the native
+   loader when migrating an existing GRUB-based attestation policy.
    Secure Boot is not needed: nothing is checked at boot; the verifier
    checks afterwards. A BIOS boot measures none of this (BIOS GRUB has no
    `tpm` module), so such a host's quotes say nothing about what it booted.
@@ -4368,18 +4372,25 @@ The chain has four links.
    - the quote's qualifying data is K's hash;
    - the PCR values match the quote's digest, and PCR 15 is zero;
    - the PCRs have the expected values (`--pcr`);
-   - the EK certificate is issued directly by the CA certificate given with
-     `--ek-ca` (no chain building);
+   - the EK certificate is issued by a CA certificate given with `--ek-ca`;
+     when the file also holds that CA's issuer (a manufacturer's
+     intermediate and root), every hop up to a self-signed root is checked
+     too (signature, validity, CA, keyCertSign);
+   - the AK is the enrolled one (`--ak-name`): without it `verify` refuses
+     TPM evidence unless given `--insecure-unpinned-ak`, as for reading the
+     AK's name before enrolling it;
    - the report verifies under K and carries the verifier's nonce and the
      expected launch digest;
    - with `--event-log`, the host's event log (TCG2 crypto agile format)
-     replays, in its SHA-256 bank, to the quoted PCRs 0–14; its events
+     replays, in its SHA-256 bank, to the quoted PCRs 0–14 and leaves PCR 15
+     (trustd's) zero, from a StartupLocality of 0 or 3; its events
      then say what the firmware measured (`l4h-attest.py event-log` lists
      them). `measure` computes the digest from the kernel
      (`vmlinux` in a release's debug archive), initramfs and command line.
 
    **AK enrollment.** A quote only proves something if the AK is in a real
-   TPM. `make-credential` encrypts a secret to the EK (`--ek`, else from its
+   TPM. `make-credential` (TPM or combined `{"v": 3}` evidence) encrypts a
+   secret to the EK (`--ek`, else from its
    certificate, which `--ek-ca` checks as `verify` does, else `ekpub`,
    which the verifier must first check against the manufacturer's
    certificate for that key: a host could give its own; an unchecked
@@ -4516,7 +4527,8 @@ checking taint alone leaves a session key exposed after its report.
   and `--require-seal ''` opt out), so that input after the report cannot
   have reached the guest unattested. Its CBOR decoder refuses duplicate
   map keys, nesting deeper than 16 and items longer than the input;
-  `--ek-ca` takes one or more CA certificates and checks validity times,
+  `--ek-ca` takes one or more CA certificates (intermediates with their
+  root: each hop is checked) and checks validity times,
   that the issuer is a CA allowed to sign certificates, that the EK
   certificate is not a CA's, and its EK extended key usage if it has one. Bitmaps may grow: at least 32
   bytes are required, and bits beyond their length count as clear.
@@ -4657,8 +4669,13 @@ multikernel machine. Root moves the kernel's `TdxControl` capability
 TDREPORTs (`trust::TDX_REPORT_VA`), a 2 MiB frame shared with the VMM for
 GetQuote (`trust::TDX_QUOTE_VA`) and the firmware's CC event log
 (`CC_EVENT_LOG`, 13, as `TPM_EVENT_LOG`, at `trust::CC_EVENT_LOG_VA`).
-K's seed is the CPU's (RDSEED, else RDRAND: neither exits to the VMM),
-hashed with the TPM's random bytes when there is a TPM. trustd then:
+K's seed is the CPU's alone (RDSEED, else RDRAND: neither exits to the
+VMM). trustd binds K to the TD before it touches the TPM, if any, so that
+nothing of the cloud's vTPM comes before RTMR 3 is extended; the vTPM then
+quotes the same K, and if it fails trustd attests with TDX alone. A TPM
+with the ACPI start method is not used in a TD: its `_DSM` is the cloud's
+AML, run with root's hardware access; root gives trustd no such TPM there
+(trustd also ignores one). trustd then:
 
 - asks for a TDREPORT (TDG.MR.REPORT) with REPORTDATA
   `SHA-384("l4h-trustd-key-tdx-v1" ‖ K) ‖ 0^16` and requires its RTMR 3
@@ -4687,12 +4704,20 @@ evidence as before, the TDX evidence on a TD without a TPM, or both as
 (and `--tdx-evidence` with `--tpm-evidence`, which must name the same K):
 the quote's ECDSA signature, the QE report binding its attestation key and
 signed by the PCK certificate, the PCK chain to the pinned
-`--intel-root-ca`, no debug or migratable TD, and with Intel's collateral
-(`fetch-collateral`, `--collateral-dir`: TCB info and QE identity under
-the TCB signing certificate, the PCK and root CRLs) the TCB status of the
-platform, the TDX module and the QE; then K's binding with RTMR 3 zero,
-`--mrtd`/`--rtmr` pins, and `--cc-event-log` replayed (SHA-384; register
-index 1–4 is RTMR 0–3) to RTMR 0–2. `verify-tdx-quote` checks a fresh
+`--intel-root-ca`, no debug or migratable TD (nor a TD 1.5 one bound to a
+service TD: MRSERVICETD zero), and Intel's collateral (`fetch-collateral`,
+`--collateral-dir`: TCB info and QE identity under the TCB signing
+certificate, the PCK and root CRLs, the root CRL checked against the
+root that issued each certificate) for the QE's identity (MRSIGNER,
+ISVPRODID, not a debug enclave), the TDX module's signer and the TCB
+status of the platform (a TD 1.5 quote's at launch and current, TEE_TCB_SVN
+and TEE_TCB_SVN2), the TDX module and the QE. Collateral is required: the
+QE report is signed by the platform's real PCK key for any enclave on an
+SGX machine with flexible launch control, so without QE identity anyone's
+enclave could sign quotes; `--insecure-skip-collateral` skips it for tests
+only. Then K's binding with RTMR 3 zero, `--mrtd`/`--rtmr` pins, and
+`--cc-event-log` replayed (SHA-384; register index 1–4 is RTMR 0–3) to
+RTMR 0–2, with RTMR 3 not extended. `verify-tdx-quote` checks a fresh
 quote. The VMM and the cloud's TPM are then outside the TCB for what TDX
 covers: memory and the TD's measurements; the quote says nothing of what
 the TPM's PCRs measure, and a verifier that needs both checks both.
@@ -5051,9 +5076,12 @@ injects these failures in a host built with `L4H_TEST_INJECT=1`;
   retry on `EFI_LOAD_ERROR`. With no selector, the loader prefers its loading
   volume, then searches for the initramfs and finally the config. It reads
   the config as data, forwards `fb_console` to FL4 and hands both optional
-  files to root. With a TPM it extends PCR 9 with the exact config and then
-  initramfs bytes that it passes to the kernel. In a trust domain it also
-  measures those files into RTMR[2], including with no vTPM.
+  files to root. With a TPM it extends PCR 9 with two events, the config's
+  slot then the initramfs's (`<name>\0present\0<exact bytes>`, or
+  `<name>\0absent`; §10.2), present or not; the bytes past the prefix are
+  what it passes to the kernel, from the same buffer. In a trust domain it
+  also measures the same two events into RTMR[2], including with no
+  vTPM.
 - **BIOS.** BIOS → GRUB (i386-pc) → multiboot2, for clouds whose VMs boot
   only with SeaBIOS, such as DigitalOcean. BIOS GRUB's core image is read
   into conventional memory and must stay within a few hundred KiB, so it
@@ -5944,7 +5972,7 @@ tools/build-fl4.sh
 SEL4_PREFIX="$PWD/build/sel4-fl4" L4H_KERNEL_VARIANT=fl4 tests/run-selftest.sh 4
 ```
 
-The tested FL4 revision is `b47224c290c4b8ce87abc13dcb6d0c65b4d4951b`.
+The tested FL4 revision is `17af57491d7140195f55aa9d57be5b81d7243a5a`.
 `prepare-fl4.sh` clones the pinned public revision, or the frozen override,
 into `build/FL4-src` without applying any kernel patches. The source
 worktree is not edited.

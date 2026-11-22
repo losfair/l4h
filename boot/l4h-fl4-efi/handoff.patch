@@ -1,51 +1,56 @@
 diff --git a/crates/fl4-efi/src/ccel.rs b/crates/fl4-efi/src/ccel.rs
-index 41d303b..eeec611 100644
+index 605a173..13dfbab 100644
 --- a/crates/fl4-efi/src/ccel.rs
 +++ b/crates/fl4-efi/src/ccel.rs
-@@ -103,7 +103,7 @@ pub use efi::*;
- mod efi {
-     use super::*;
-     use crate::tcg2::{final_snapshot, main_log, Raw, TpmLog, EFI_TCG2_EVENT_LOG_FORMAT_TCG_2, TCG_1_2, TRUNCATED};
--    use crate::{bs, config_table, fail, print, Con, Guid, Status, ACPI_10, ACPI_20, SUCCESS};
-+    use crate::{bs, config_table, print, Con, Guid, Status, ACPI_10, ACPI_20, SUCCESS};
-
-     pub const EFI_CC_MEASUREMENT_PROTOCOL_GUID: Guid = Guid(0x9675_1a3d, 0x72f4, 0x41a6, [0xa7, 0x94, 0xed, 0x5d, 0x0e, 0x67, 0xae, 0x6b]);
-     pub const EFI_CC_FINAL_EVENTS_TABLE_GUID: Guid = Guid(0xdd4a_4648, 0x2de7, 0x4665, [0x96, 0x4d, 0x21, 0xd9, 0xef, 0x5f, 0xb4, 0x46]);
-@@ -125,16 +125,16 @@ mod efi {
-     }
-
-     /// Measure a file the load options named into RTMR[2], so that a quote
--    /// covers it. A file that cannot be measured is not booted. Without the
--    /// protocol (not a measured confidential guest) nothing happens.
--    pub fn measure_file(path: &[u8], pa: u64, len: u64) {
--        let Some(cc) = protocol() else { return };
-+    /// covers it. A caller in a TD must be able to measure external files.
-+    pub fn measure_file(path: &[u8], pa: u64, len: u64) -> Result<(), Status> {
-+        let cc = protocol().ok_or((1usize << 63) | 3)?; // EFI_UNSUPPORTED
-         let mut event = [0u8; CC_EVENT_FIXED + 256];
-         cc_event(&mut event, path);
-         let r = unsafe { ((*cc).hash_log_extend_event)(cc, 0, pa, len, event.as_ptr()) };
-         if r != SUCCESS && r != VOLUME_FULL {
--            fail("cannot measure a boot file into RTMR[2]");
-+            return Err(r);
+@@ -163,6 +163,35 @@ mod efi {
          }
-+        Ok(())
      }
-
+ 
++    /// `EFI_UNSUPPORTED`: no `EFI_CC_MEASUREMENT_PROTOCOL`.
++    const UNSUPPORTED: Status = (1 << 63) | 3;
++    /// `EFI_INVALID_PARAMETER`: firmware refuses to hash nothing.
++    const INVALID_PARAMETER: Status = (1 << 63) | 2;
++
++    /// Measure caller-built bytes at `(pa, len)` into RTMR[2] as one event
++    /// named `name`, so that a quote covers them. Called only in a TD: bytes
++    /// that cannot be measured must not be booted, and neither must they
++    /// when firmware offers no `EFI_CC_MEASUREMENT_PROTOCOL`
++    /// (`measure_status`). The error, said on the console, is the caller's
++    /// to act on: it must not boot them.
++    pub fn measure_bytes(name: &[u8], pa: u64, len: u64) -> Result<(), Status> {
++        let Some(cc) = protocol() else {
++            say!("fl4-efi: {}", measure_status(false, 0).unwrap_err());
++            return Err(UNSUPPORTED);
++        };
++        if len == 0 {
++            say!("fl4-efi: refusing to measure empty bytes into RTMR[2]");
++            return Err(INVALID_PARAMETER);
++        }
++        let mut event = [0u8; CC_EVENT_FIXED + 256];
++        cc_event(&mut event, name);
++        let r = unsafe { ((*cc).hash_log_extend_event)(cc, 0, pa, len, event.as_ptr()) };
++        measure_status(true, r as u64).map_err(|e| {
++            say!("fl4-efi: {}", e);
++            r
++        })
++    }
++
      /// The log firmware keeps, found before ExitBootServices.
+     pub enum CcLog {
+         /// From the protocol, with the final events table.
 diff --git a/crates/fl4-efi/src/firmware.rs b/crates/fl4-efi/src/firmware.rs
-index 3243853..2b2ef37 100644
+index 3243853..b74d270 100644
 --- a/crates/fl4-efi/src/firmware.rs
 +++ b/crates/fl4-efi/src/firmware.rs
 @@ -66,6 +66,15 @@ impl Firmware<'_> {
          NonNull::new(protocol).ok_or(EFI_LOAD_ERROR)
      }
-
+ 
 +    /// Measure caller-selected external bytes when running in a trust domain.
 +    /// The caller may return to EFI if the firmware cannot extend RTMR[2].
 +    pub fn measure_cc_file(&self, name: &[u8], bytes: &[u8]) -> Result<(), Status> {
 +        if x86::is_tdx() {
-+            ccel::measure_file(name, bytes.as_ptr() as u64, bytes.len() as u64)?;
++            ccel::measure_bytes(name, bytes.as_ptr() as u64, bytes.len() as u64)?;
 +        }
 +        Ok(())
 +    }
@@ -76,33 +81,15 @@ index 3243853..2b2ef37 100644
 +        x86::boot(self.image, kernel, &files[..modules.len()], cmdline)
      }
  }
-
+ 
 diff --git a/crates/fl4-efi/src/x86.rs b/crates/fl4-efi/src/x86.rs
-index d01cb4b..5f0baf9 100644
+index 10d7327..5349281 100644
 --- a/crates/fl4-efi/src/x86.rs
 +++ b/crates/fl4-efi/src/x86.rs
-@@ -459,7 +459,7 @@ fn boot_files<'a>(li: &LoadedImage, opts: &'a Words, measure: bool) -> ([BootFil
-         if let Some(path) = opt.strip_prefix(b"rootserver=") {
-             let (pa, len) = read_file(li, path);
-             if measure {
--                ccel::measure_file(path, pa, len);
-+                ccel::measure_file(path, pa, len).unwrap_or_else(|_| fail("cannot measure a boot file into RTMR[2]"));
-             }
-             files[0] = (pa, len, path);
-         } else if let Some(path) = opt.strip_prefix(b"module=") {
-@@ -468,7 +468,7 @@ fn boot_files<'a>(li: &LoadedImage, opts: &'a Words, measure: bool) -> ([BootFil
-             }
-             let (pa, len) = read_file(li, path);
-             if measure {
--                ccel::measure_file(path, pa, len);
-+                ccel::measure_file(path, pa, len).unwrap_or_else(|_| fail("cannot measure a boot file into RTMR[2]"));
-             }
-             files[n] = (pa, len, path);
-             n += 1;
-@@ -500,6 +500,10 @@ fn boot_files<'a>(li: &LoadedImage, opts: &'a Words, measure: bool) -> ([BootFil
+@@ -503,6 +503,10 @@ fn boot_files<'a>(li: &LoadedImage, opts: &'a Words, measure: bool) -> ([BootFil
      (files, n)
  }
-
+ 
 +pub(super) fn is_tdx() -> bool {
 +    sev().0 == 0 && tdx_shared_mask() != 0
 +}
@@ -110,7 +97,7 @@ index d01cb4b..5f0baf9 100644
  pub unsafe fn start_default(image: Handle, system: *mut SystemTable) -> Status {
      unsafe { ST = system };
      (bs().set_watchdog_timer)(0, 0, 0, core::ptr::null());
-@@ -511,12 +515,12 @@ pub unsafe fn start_default(image: Handle, system: *mut SystemTable) -> Status {
+@@ -514,12 +518,12 @@ pub unsafe fn start_default(image: Handle, system: *mut SystemTable) -> Status {
      let li = unsafe { &*(li as *const LoadedImage) };
      let opts = options(li);
      // As in `boot`: only a guest that is not SEV can be a TD.
@@ -120,13 +107,13 @@ index d01cb4b..5f0baf9 100644
 -    boot(image, embedded::KERNEL, &files[..n])
 +    boot(image, embedded::KERNEL, &files[..n], c"")
  }
-
+ 
 -pub(super) fn boot(image: Handle, kernel: &[u8], files: &[BootFile<'_>]) -> ! {
 +pub(super) fn boot(image: Handle, kernel: &[u8], files: &[BootFile<'_>], cmdline: &core::ffi::CStr) -> ! {
      let cr4: u64;
      unsafe { asm!("mov {}, cr4", out(reg) cr4) };
      let (mask, cpuid, secrets) = sev();
-@@ -584,6 +588,10 @@ pub(super) fn boot(image: Handle, kernel: &[u8], files: &[BootFile<'_>]) -> ! {
+@@ -587,6 +591,10 @@ pub(super) fn boot(image: Handle, kernel: &[u8], files: &[BootFile<'_>]) -> ! {
          base: root + TABLE_BYTES,
          used: 8,
      };

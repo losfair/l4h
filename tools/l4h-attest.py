@@ -32,11 +32,16 @@
       The launch digest of a guest booted with these files: what its
       reports carry as "launch".  The initrd's address is part of it.
   l4h-attest.py verify REPORT EVIDENCE [--data HEX] [--launch HEX]
-                [--pcr N=HEX]... [--ak-name HEX] [--ek-ca PEM]
-                [--deny-taint SPEC] [--require-seal SPEC] [--event-log FILE]
+                [--pcr N=HEX]... [--ak-name HEX | --insecure-unpinned-ak]
+                [--ek-ca PEM] [--deny-taint SPEC] [--require-seal SPEC]
+                [--event-log FILE]
       Check a report (l4hctl attest report -o) against the host evidence
       (l4hctl attest evidence -o), and print what they claim as JSON.
-      Without --ak-name the attestation key is not known to be a TPM's.
+      TPM evidence needs --ak-name, the AK enrolled with make-credential:
+      without it the attestation key is not known to be a TPM's, which
+      only --insecure-unpinned-ak accepts (to read the AK's name before
+      enrolling it).  --ek-ca may hold intermediate CAs and their root:
+      each hop is checked.
       By default the guest must have sealed console-in and not taken
       console input before: input after the report would be unattested.
       A multikernel host's report and evidence name the partition the
@@ -44,23 +49,26 @@
       --event-log takes the host's UEFI TPM event log (l4hctl attest
       event-log -o): replayed, it must give the quoted PCRs 0-14, which
       nothing changes after the firmware's ExitBootServices (trustd quotes
-      before it extends PCR 15).  Its events then say what the firmware
-      measured.
+      before it extends PCR 15), and leave PCR 15 zero.  Its events then
+      say what the firmware measured.
       Intel TDX: EVIDENCE may also be the host's TDX evidence (l4hctl
       attest tdx-evidence -o) or the guest driver's TPM and TDX evidence
       together (configfs-tsm auxblob, {"v": 3, "tdx", "tpm"}); or give
       --tdx-evidence and --tpm-evidence, which must name the same key.
       A TDX quote is checked down to --intel-root-ca (Intel's SGX root
       CA, pinned; required), its TD must not be a debug TD
-      (--allow-debug) nor migratable (--allow-migratable), and with
-      --collateral-dir (fetch-collateral; the root CA's CRL too) its
-      TCB status, the QE's and the TDX module's must be UpToDate
-      (--allow-tcb-status S to accept more) and the PCK certificate not
-      revoked.  The quote's REPORTDATA must bind the host key and RTMR 3
-      be zero: trustd extends it with the key at once, so it was the
-      first of this boot.  --mrtd and --rtmr N=HEX pin measurements;
+      (--allow-debug) nor migratable or bound to a service TD
+      (--allow-migratable), and --collateral-dir (fetch-collateral; the
+      root CA's CRL too; required) must show the QE Intel's and the TDX
+      module Intel's, their TCB status and the platform's (a TD 1.5
+      quote's at launch and current) UpToDate (--allow-tcb-status S to
+      accept more) and no certificate revoked.  --insecure-skip-collateral
+      skips that, for tests only: without it anyone with an SGX machine
+      can forge a quote.  The quote's REPORTDATA must bind the host key
+      and RTMR 3 be zero: trustd extends it with the key at once, so it
+      was the first of this boot.  --mrtd and --rtmr N=HEX pin measurements;
       --cc-event-log (l4hctl attest tdx-event-log -o) must replay to
-      RTMR 0-2.
+      RTMR 0-2 and leave RTMR 3 zero.
   l4h-attest.py verify-tdx-quote ANSWER [--tdx-evidence F] [--data HEX]
                 [TDX options as verify]
       A guest's fresh TDX quote (l4hctl attest tdx-quote -o): its
@@ -80,7 +88,8 @@
       Intel's published root before pinning it.
   l4h-attest.py make-credential EVIDENCE SECRET_HEX -o FILE [--ek PEM]
                 [--ek-ca PEM]
-      A credential for the host's attestation key, encrypted to its EK
+      A credential for the host's attestation key (EVIDENCE: TPM or
+      combined evidence), encrypted to its EK
       (TPM2_MakeCredential; the format of tpm2_makecredential).  A guest
       decrypts it with `l4hctl attest activate FILE`: the secret coming
       back proves the AK is in the TPM with that EK, so its name (printed
@@ -274,6 +283,7 @@ EV_NO_ACTION = 3
 TPM_ALG_SHA256 = 0x000B
 SPEC_ID = b"Spec ID Event03\0"
 STARTUP_LOCALITY = b"StartupLocality\0"
+STARTUP_LOCALITIES = (0, 3)
 # PCRs nothing extends after ExitBootServices: trustd quotes them before
 # it extends KEY_PCR.
 EVENT_LOG_PCRS = range(KEY_PCR)
@@ -378,6 +388,10 @@ def replay_event_log(log):
             # Not extended; the startup locality (PFP 10.4.5.3) is PCR 0's
             # initial value.
             if e["data"][:len(STARTUP_LOCALITY)] == STARTUP_LOCALITY and len(e["data"]) == len(STARTUP_LOCALITY) + 1:
+                # TPM2_Startup comes from locality 0, or 3 with an H-CRTM
+                # (PFP 10.4.5.3): another value is no startup's.
+                if e["data"][-1] not in STARTUP_LOCALITIES:
+                    raise Fail("event %d: StartupLocality %d is neither 0 nor 3" % (n, e["data"][-1]))
                 if e["pcr"] == 0 and 0 not in extended:
                     pcrs[0] = bytes(31) + e["data"][-1:]
             continue
@@ -394,6 +408,10 @@ def check_event_log(log, quoted):
     """That the log replays to the quoted PCRs 0-14 (`quoted`, the
     evidence's {index: value}); the number of its events."""
     pcrs, events = replay_event_log(log)
+    # PCR 15 is trustd's alone: a log in which the firmware extended it
+    # would have the key's quote taken over a PCR 15 that was not zero.
+    if pcrs[KEY_PCR] != bytes(32):
+        raise Fail("the event log extends PCR %d, which is trustd's" % KEY_PCR)
     for i in EVENT_LOG_PCRS:
         if i not in quoted:
             raise Fail("PCR %d is not quoted: the event log cannot be checked" % i)
@@ -610,10 +628,19 @@ def key_chain(ev, partition):
 EK_CERT_EKU = x509.ObjectIdentifier("2.23.133.8.1")
 
 
+# The longest CA chain an EK certificate is checked along (manufacturers'
+# are two or three deep).
+EK_CHAIN_MAX = 8
+
+
 def check_ek_cert(cert, cas, where, now=None):
     """That `cert` is an EK certificate one of `cas` issued and that both
     are valid now: the CA is a CA that may sign certificates, the EK
-    certificate is not a CA's, and if it limits its use, to an EK's."""
+    certificate is not a CA's, and if it limits its use, to an EK's.
+    `cas` may hold the manufacturer's intermediate CAs and their root: a
+    CA whose issuer is among `cas` too must have been issued by it (each
+    hop checked as the first, up to a self-signed root); one whose issuer
+    is not is pinned as given."""
     now = now or datetime.datetime.now(datetime.timezone.utc)
 
     def ext(c, kind):
@@ -624,6 +651,49 @@ def check_ek_cert(cert, cas, where, now=None):
 
     def valid(c):
         return c.not_valid_before_utc <= now <= c.not_valid_after_utc
+
+    def signed_by(c, ca):
+        try:
+            c.verify_directly_issued_by(ca)
+            return True
+        except (ValueError, TypeError, InvalidSignature):
+            return False
+
+    def ca_why(ca, what):
+        """Why `ca` may not have issued `what`, or None."""
+        bc = ext(ca, x509.BasicConstraints)
+        ku = ext(ca, x509.KeyUsage)
+        if bc is None or not bc.ca:
+            return "%s issuer is not a CA" % what
+        if ku is not None and not ku.key_cert_sign:
+            return "%s issuer may not sign certificates" % what
+        if not valid(ca):
+            return "%s issuer expired or not yet valid" % what
+        return None
+
+    def up(ca, seen):
+        """Why the chain above `ca` (one of `cas`) does not hold, or None."""
+        if len(seen) > EK_CHAIN_MAX:
+            return "EK CA chain longer than %d" % EK_CHAIN_MAX
+        if ca.issuer == ca.subject:
+            # A root: its own signature must hold, never "pinned as given".
+            if signed_by(ca, ca):
+                return None
+            return "EK root CA %s self-signature does not verify" % ca.subject.rfc4514_string()
+        named = [p for p in cas if p.subject == ca.issuer]
+        if not named:
+            return None  # pinned as given: its issuer is not in the file
+        parents = [p for p in named if p not in seen]
+        if not parents:
+            return "EK CA chain loops"
+        why = "EK CA %s not issued by %s" % (ca.subject.rfc4514_string(), where)
+        for p in parents:
+            if not signed_by(ca, p):
+                continue
+            why = ca_why(p, "EK CA %s:" % ca.subject.rfc4514_string()) or up(p, seen + [p])
+            if why is None:
+                return None
+        return why
 
     try:
         if not valid(cert):
@@ -636,19 +706,10 @@ def check_ek_cert(cert, cas, where, now=None):
             raise Fail("EK certificate is not for an EK (extended key usage)")
         why = "EK certificate not issued by %s" % where
         for ca in cas:
-            try:
-                cert.verify_directly_issued_by(ca)
-            except (ValueError, TypeError, InvalidSignature):
+            if not signed_by(cert, ca):
                 continue
-            bc = ext(ca, x509.BasicConstraints)
-            ku = ext(ca, x509.KeyUsage)
-            if bc is None or not bc.ca:
-                why = "EK certificate issuer is not a CA"
-            elif ku is not None and not ku.key_cert_sign:
-                why = "EK certificate issuer may not sign certificates"
-            elif not valid(ca):
-                why = "EK certificate issuer expired or not yet valid"
-            else:
+            why = ca_why(ca, "EK certificate") or up(ca, [ca])
+            if why is None:
                 return
         raise Fail(why)
     except ValueError as e:
@@ -1217,12 +1278,14 @@ def masked(value, mask):
 
 
 @checked("TCB info")
-def tdx_tcb_status(info, fields, ext):
+def tdx_tcb_status(info, fields, ext, svn_field="tee_tcb_svn"):
     """The TCB status of the quote's platform (TCB info's tcbLevels, Intel's
     TDX quote verification): the first level that the PCK's SGX TCB and the
-    TD's TEE_TCB_SVN reach, and with a TDX module of major version 1 or
-    later, its module identity's first level its SVN reaches."""
-    svn = fields["tee_tcb_svn"]
+    TD's TEE_TCB_SVN (or `svn_field`: TEE_TCB_SVN2, a TD 1.5 quote's module
+    after a TD-preserving update) reach, and with a TDX module of major
+    version 1 or later, its module identity's first level its SVN
+    reaches."""
+    svn = fields[svn_field]
     comps, pcesvn = ext["tcb"]["components"], ext["tcb"]["pcesvn"]
     # TDX 1.0's module (TEE_TCB_SVN[1] zero) is tdxModule's; a later one,
     # its tdxModuleIdentities entry's alone (below).
@@ -1349,18 +1412,25 @@ def merged(*lists):
     return out
 
 
-def check_collateral(q, ext, leaf, pck_ca, roots, col, allowed, now, stale_ok):
-    """The quote's TCB status and its QE's, against Intel's collateral."""
+def check_collateral(q, ext, leaf, pck_ca, pck_root, roots, col, allowed, now, stale_ok):
+    """The quote's TCB status and its QE's, against Intel's collateral.
+    `pck_root`: the pinned root the PCK CA chains to."""
     for need in Collateral.REQUIRED:
         if need not in col.files:
             raise Fail("collateral without %s (fetch-collateral saves it)" % Collateral.NAMES[need])
     signer, root = tcb_signer(col.files["tcb_signing_chain"], roots, "the TCB signing certificate", now)
-    qe_signer, _ = (tcb_signer(col.files["qe_identity_signing_chain"], roots, "the QE identity signing certificate", now)
-                    if "qe_identity_signing_chain" in col.files else (signer, root))
-    revocable = [(pck_ca, "the PCK CA certificate"), (signer, "the TCB signing certificate")]
+    qe_signer, qe_root = (tcb_signer(col.files["qe_identity_signing_chain"], roots, "the QE identity signing certificate", now)
+                          if "qe_identity_signing_chain" in col.files else (signer, root))
+    # Each certificate the root CA CRL covers is checked against the root
+    # that issued it: the CRL must be that root's.  With several pinned
+    # roots (Intel rotating its root), one CRL cannot speak for a
+    # certificate of another root, which would then go unchecked.
+    revocable = [(pck_ca, pck_root, "the PCK CA certificate"), (signer, root, "the TCB signing certificate")]
     if qe_signer != signer:
-        revocable.append((qe_signer, "the QE identity signing certificate"))
-    check_crl(load_crl(col.files["root_ca_crl"], "root CA CRL"), root, revocable, "the root CA CRL", now, stale_ok)
+        revocable.append((qe_signer, qe_root, "the QE identity signing certificate"))
+    root_crl = load_crl(col.files["root_ca_crl"], "root CA CRL")
+    for r in merged([r for _, r, _ in revocable]):
+        check_crl(root_crl, r, [(c, n) for c, cr, n in revocable if cr == r], "the root CA CRL", now, stale_ok)
     check_crl(load_crl(col.files["pck_crl"], "PCK CRL"), pck_ca, [(leaf, "the PCK certificate")], "the PCK CRL", now, stale_ok)
 
     raw, info, sig = signed_json(col.files["tcb_info"], "tcbInfo", "TCB info")
@@ -1374,6 +1444,9 @@ def check_collateral(q, ext, leaf, pck_ca, roots, col, allowed, now, stale_ok):
     if hex_field(info, "pceId", 2, "TCB info") != ext["pceid"]:
         raise Fail("TCB info is for another PCE")
     level, module = tdx_tcb_status(info, q["fields"], ext)
+    # TD 1.5: TEE_TCB_SVN is the module's at the TD's launch, TEE_TCB_SVN2
+    # its current one (after a TD-preserving update).  Both must pass.
+    current = tdx_tcb_status(info, q["fields"], ext, "tee_tcb_svn2") if "tee_tcb_svn2" in q["fields"] else None
 
     raw, ident, sig = signed_json(col.files["qe_identity"], "enclaveIdentity", "QE identity")
     if not ecdsa_raw_ok(qe_signer.public_key(), sig, raw):
@@ -1386,21 +1459,29 @@ def check_collateral(q, ext, leaf, pck_ca, roots, col, allowed, now, stale_ok):
     statuses = {"tcb_status": level["tcbStatus"], "qe_tcb_status": qe["tcbStatus"]}
     if module is not None:
         statuses["tdx_module_tcb_status"] = module["tcbStatus"]
+    levels = [level, module]
+    if current is not None:
+        statuses["tcb_status_current"] = current[0]["tcbStatus"]
+        if current[1] is not None:
+            statuses["tdx_module_tcb_status_current"] = current[1]["tcbStatus"]
+        levels += list(current)
     for what, status in statuses.items():
         if status not in allowed:
             raise Fail("%s is %s (allow it with --allow-tcb-status)" % (what.replace("_", " "), status))
-    advisories = merged(level.get("advisoryIDs", []), (module or {}).get("advisoryIDs", []), qe.get("advisoryIDs", []))
+    advisories = merged(*[(lv or {}).get("advisoryIDs", []) for lv in levels], qe.get("advisoryIDs", []))
     return {**statuses, "advisory_ids": advisories, "tcb_date": level.get("tcbDate"),
             "tcb_evaluation_data_number": info.get("tcbEvaluationDataNumber")}
 
 
 class TdxPolicy:
     """What a TDX quote must show: Intel's root CA (pinned), the collateral
-    for its TCB status, debug or not, and measurements."""
+    for its TCB status (required unless `require_collateral` is False:
+    only for tests), debug or not, and measurements."""
 
     def __init__(self, roots, collateral=None, allowed=DEFAULT_TCB_STATUS, allow_debug=False, stale_ok=False,
-                 mrtd=None, rtmrs=None, cc_event_log=None, now=None, allow_migratable=False):
+                 mrtd=None, rtmrs=None, cc_event_log=None, now=None, allow_migratable=False, require_collateral=True):
         self.roots, self.collateral, self.allowed = roots, collateral, frozenset(allowed)
+        self.require_collateral = require_collateral
         self.allow_debug, self.stale_ok, self.allow_migratable = allow_debug, stale_ok, allow_migratable
         self.mrtd, self.rtmrs, self.cc_event_log = mrtd, rtmrs or {}, cc_event_log
         self.now = now or datetime.datetime.now(datetime.timezone.utc)
@@ -1413,6 +1494,14 @@ def verify_tdx_quote(q, policy):
     measurements and TCB status.  The parsed quote and what it says."""
     if not policy.roots:
         raise Fail("a TDX quote needs Intel's root CA (--intel-root-ca)")
+    # Without collateral nothing says the QE is Intel's (QE identity: its
+    # MRSIGNER, ISVPRODID, ISVSVN, a non-debug enclave) nor the TDX module
+    # (TCB info: MRSIGNERSEAM): any SGX machine with flexible launch control
+    # has the real PCE sign the report of an enclave of anyone's making,
+    # which then signs any quote.
+    if not policy.collateral and policy.require_collateral:
+        raise Fail("a TDX quote needs Intel's collateral (--collateral-dir, from fetch-collateral) to check the QE's "
+                   "identity and the TDX module's signer; --insecure-skip-collateral skips it, for tests only")
     p = parse_tdx_quote(q)
     if not ecdsa_raw_ok(p256_raw(p["att_key"]), p["sig"], p["signed"]):
         raise Fail("TDX quote signature does not verify")
@@ -1424,7 +1513,7 @@ def verify_tdx_quote(q, policy):
         raise Fail("the quote's PCK certificate chain lacks its CA")
     leaf, pck_ca = certs[0], certs[1]
     check_issued(leaf, pck_ca, "the PCK certificate", policy.now)
-    to_root(pck_ca, policy.roots, "the PCK CA certificate", policy.now)
+    pck_root = to_root(pck_ca, policy.roots, "the PCK CA certificate", policy.now)
     if not isinstance(leaf.public_key(), ec.EllipticCurvePublicKey) or not ecdsa_raw_ok(leaf.public_key(), p["qe_report_sig"], qe):
         raise Fail("the QE report is not signed by the PCK certificate")
     ext = sgx_extensions(leaf)
@@ -1436,6 +1525,10 @@ def verify_tdx_quote(q, policy):
     migratable = bool(f["td_attributes"][3] & 0x20)
     if migratable and not policy.allow_migratable:
         raise Fail("the TD is migratable: allow it with --allow-migratable")
+    # TD 1.5: a service TD (a migration TD among them) bound to this TD
+    # can read and move its state.
+    if "mrservicetd" in f and f["mrservicetd"] != bytes(48) and not policy.allow_migratable:
+        raise Fail("TD15 quote binds a non-zero MRSERVICETD: allow it with --allow-migratable")
     if policy.mrtd is not None and f["mrtd"] != policy.mrtd:
         raise Fail("MRTD is %s, not %s" % (f["mrtd"].hex(), policy.mrtd.hex()))
     for i, want in policy.rtmrs.items():
@@ -1456,7 +1549,8 @@ def verify_tdx_quote(q, policy):
     if policy.cc_event_log is not None:
         out["cc_event_log_events"] = check_cc_event_log(policy.cc_event_log, f)
     if policy.collateral:
-        out.update(check_collateral(p, ext, leaf, pck_ca, policy.roots, policy.collateral, policy.allowed, policy.now, policy.stale_ok))
+        out.update(check_collateral(p, ext, leaf, pck_ca, pck_root, policy.roots, policy.collateral, policy.allowed,
+                                    policy.now, policy.stale_ok))
     else:
         out["tcb_status"] = None
     return p, out
@@ -1530,6 +1624,9 @@ def check_cc_event_log(log, fields):
     """That the CC event log replays to the quote's RTMR 0-2 (RTMR 3 is
     trustd's key); the number of its events."""
     rtmrs, events = replay_cc_event_log(log)
+    # RTMR 3 is trustd's alone: the firmware must not have extended it.
+    if rtmrs[TDX_KEY_RTMR] != bytes(48):
+        raise Fail("the CC event log extends RTMR %d, which is trustd's" % TDX_KEY_RTMR)
     for i in range(3):
         if rtmrs[i] != fields["rtmr%d" % i]:
             raise Fail("CC event log does not match the quote: RTMR %d replays to %s, the quote has %s"
@@ -1741,6 +1838,9 @@ def add_tdx_options(v):
     v.add_argument("--allow-debug", action="store_true", help="accept a debug TD (its memory is open to the host)")
     v.add_argument("--allow-migratable", action="store_true", help="accept a migratable TD (TD_ATTRIBUTES.MIGRATABLE)")
     v.add_argument("--allow-stale-collateral", action="store_true", help="accept collateral and CRLs past their next update")
+    v.add_argument("--insecure-skip-collateral", action="store_true",
+                   help="INSECURE, for tests: check no collateral, so neither the QE's identity nor the TDX module's "
+                        "signer, the CRLs or the TCB status (anyone with an SGX machine can then forge a quote)")
     v.add_argument("--mrtd", help="expected MRTD (hex): the TD's initial memory, its firmware")
     v.add_argument("--rtmr", action="append", default=[], help="N=HEX (N 0-2): expected RTMR value")
     v.add_argument("--cc-event-log", help="the host's CC event log (l4hctl attest tdx-event-log -o): must replay to RTMR 0-2")
@@ -1770,12 +1870,13 @@ def tdx_policy(a):
         rtmrs[int(i)] = bytes.fromhex(val)
     return TdxPolicy(roots, col, allowed, a.allow_debug, a.allow_stale_collateral,
                      bytes.fromhex(a.mrtd) if a.mrtd else None, rtmrs,
-                     read(a.cc_event_log) if a.cc_event_log else None, allow_migratable=a.allow_migratable)
+                     read(a.cc_event_log) if a.cc_event_log else None, allow_migratable=a.allow_migratable,
+                     require_collateral=not a.insecure_skip_collateral)
 
 
 TDX_OPTIONS = ("intel_root_ca", "collateral_dir", "tcb_info", "qe_identity", "pck_crl", "tcb_signing_chain",
                "qe_identity_signing_chain", "root_ca_crl", "allow_tcb_status", "allow_debug", "allow_migratable",
-               "allow_stale_collateral", "mrtd", "rtmr", "cc_event_log")
+               "allow_stale_collateral", "insecure_skip_collateral", "mrtd", "rtmr", "cc_event_log")
 
 
 def tdx_options_given(a):
@@ -1786,7 +1887,9 @@ def tdx_options_given(a):
 
 def tdx_warnings(info):
     if info.get("tcb_status") is None:
-        print("l4h-attest: warning: TDX TCB status not checked (--collateral-dir)", file=sys.stderr)
+        print("l4h-attest: WARNING: INSECURE: --insecure-skip-collateral: the QE's identity (MRSIGNER, product, "
+              "SVN, debug), the TDX module's signer (MRSIGNERSEAM), the CRLs and the TCB status were NOT checked: "
+              "anyone with an SGX machine could have forged this TDX quote", file=sys.stderr)
 
 
 def main():
@@ -1806,7 +1909,10 @@ def main():
     v.add_argument("--data", help="expected report data (hex)")
     v.add_argument("--launch", help="expected launch digest (hex)")
     v.add_argument("--pcr", action="append", default=[], help="N=HEX: expected sha256 PCR value")
-    v.add_argument("--ak-name", help="the enrolled attestation key's name (hex)")
+    v.add_argument("--ak-name", help="the enrolled attestation key's name (hex): required with TPM evidence")
+    v.add_argument("--insecure-unpinned-ak", action="store_true",
+                   help="accept TPM evidence without --ak-name (its AK is then not known to be a TPM's: to read the "
+                        "AK's name before enrolling it, or for tests)")
     v.add_argument("--deny-taint", default="console-in", help="deny host names, bit numbers or ranges (default: console-in; '' disables)")
     v.add_argument("--require-seal", default="console-in",
                    help="require sealed host names, bit numbers or ranges (default: console-in; '' disables)")
@@ -1857,11 +1963,17 @@ def main():
             out, key, partition = {}, None, None
             ak_name = bytes.fromhex(a.ak_name) if a.ak_name else None
             if tpm_ev is not None:
+                # An AK not pinned is any key's: whoever made the evidence
+                # signed its quote.  Only an enrolled AK (make-credential,
+                # activate) is known to be in a TPM.
+                if ak_name is None and not a.insecure_unpinned_ak:
+                    raise Fail("the attestation key is not pinned: enroll it (make-credential, l4hctl attest activate) "
+                               "and give its name with --ak-name, or --insecure-unpinned-ak to accept any key")
                 key, partition, host = check_evidence(tpm_ev, pins, ak_name, a.ek_ca)
                 if a.event_log:
                     host["event_log_events"] = check_event_log(read(a.event_log), tpm_ev["pcrs"])
                 out["host"] = host
-            elif a.event_log or pins or a.ak_name or a.ek_ca:
+            elif a.event_log or pins or a.ak_name or a.ek_ca or a.insecure_unpinned_ak:
                 raise Fail("TPM options without TPM evidence")
             if tdx_ev is not None:
                 tdx_key, info = check_tdx_evidence(tdx_ev, tdx_policy(a))
@@ -1883,7 +1995,8 @@ def main():
             out["guest"] = check_report(cbor_decode(read(a.report)), key, data, launch, a.deny_taint, a.require_seal, partition)
             print(json.dumps(out, indent=2))
             if tpm_ev is not None and ak_name is None:
-                print("l4h-attest: warning: attestation key not pinned (--ak-name)", file=sys.stderr)
+                print("l4h-attest: WARNING: INSECURE: --insecure-unpinned-ak: the attestation key is not pinned "
+                      "(--ak-name), so not known to be a TPM's", file=sys.stderr)
             if tdx_ev is not None:
                 tdx_warnings(out["tdx"])
         elif a.cmd == "verify-tdx-quote":
@@ -1913,8 +2026,11 @@ def main():
                 q = raw
             fetch_collateral(q, a.o)
         else:
-            ev = cbor_decode(open(a.evidence, "rb").read())
-            ek = evidence_ek(ev, open(a.ek, "rb").read() if a.ek else None, a.ek_ca)
+            # TPM evidence, or the guest driver's combined evidence (v 3).
+            ev, _ = split_evidence(cbor_decode(read(a.evidence)))
+            if ev is None:
+                raise Fail("no TPM evidence in this file")
+            ek = evidence_ek(ev, read(a.ek) if a.ek else None, a.ek_ca)
             secret = bytes.fromhex(a.secret)
             if not 0 < len(secret) <= 32:
                 raise Fail("the secret is 1 to 32 bytes")

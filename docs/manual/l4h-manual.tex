@@ -1946,10 +1946,15 @@ It works like this:
         the microkernel, every host component, the guest kernel and its SDK.
         For a seL4 application, loading the embedded GRUB image extends PCR~4
         again. GRUB measures dom0's initramfs and \file{l4h.conf} into PCR~9.
-        The native FL4 loader extends PCR~9 with each present file, first
-        \file{l4h.conf}, then the initramfs, using their exact on-disk bytes.
+        The native FL4 loader always extends PCR~9 twice, in this order:
+        once for \file{l4h.conf} (\texttt{l4h-config}), then once for the
+        initramfs (\texttt{dom0-initrd}). Each event hashes
+        \texttt{<name>\textbackslash0present\textbackslash0} followed by the
+        file's exact on-disk bytes when the file exists (even if empty), and
+        \texttt{<name>\textbackslash0absent} when it does not. A file moved
+        to the other name, emptied or removed therefore changes PCR~9.
         It leaves PCR~8 untouched. In a trust domain it also extends RTMR~2
-        with these files independently of the vTPM;
+        with the same two events independently of the vTPM;
   \item at boot, the host generates a signing key and has the TPM quote it,
         together with the PCRs, using the TPM's attestation key (AK). That
         quote is the \emph{host evidence};
@@ -1980,7 +1985,7 @@ release file and needs Python's \texttt{cryptography} package:
 \begin{lstlisting}[language=bash]
 tools/l4h-attest.py measure vmlinux --initrd initrd --cmdline "console=hvc0"
 tools/l4h-attest.py verify report evidence --data $NONCE --launch $DIGEST \
-    --ak-name $AK --pcr 4=$PCR4 --ek-ca manufacturer-ca.pem
+    --ak-name $AK --pcr 4=$PCR4 --pcr 9=$PCR9
 \end{lstlisting}
 On a host booted by FL4's own UEFI loader, \cmd{l4hctl attest event-log -o
 eventlog} (or \file{/sys/kernel/l4h/attest/event\_log}) gives the
@@ -1997,17 +2002,22 @@ EFI measurement. With \cmd{l4hctl create}, the command line is the one given wit
 \texttt{--cmdline}; for dom0, it is \texttt{dom0\_cmdline}. \cmd{verify}
 fails unless every check holds:
 \begin{itemize}
-  \item the quote is the TPM's, over the host key that signed the report;
+  \item the quote is the TPM's, over the host key that signed the report,
+        and made by the enrolled AK given with \texttt{--ak-name}
+        (see below; without it \cmd{verify} refuses TPM evidence unless
+        given \texttt{--insecure-unpinned-ak}, which is only for reading the
+        AK's name before enrolling it);
   \item the report carries the nonce and launch digest given;
   \item each PCR has the value given with \texttt{--pcr};
   \item the guest took no console input and has sealed \texttt{console-in}
         (\texttt{--deny-taint} and \texttt{--require-seal} change which
         flags are checked; \texttt{--deny-taint ''} and
         \texttt{--require-seal ''} turn the checks off);
-  \item the EK certificate was issued by a CA in the file given with
-        \texttt{--ek-ca} (one or more PEM certificates), both are valid
-        now, the issuer is a CA that may sign certificates, and the EK
-        certificate is not a CA's and is for an EK.
+  \item with \texttt{--ek-ca}, the EK certificate was issued by a CA in
+        that file (one or more PEM certificates; a manufacturer's
+        intermediate CA together with its root, each hop then checked),
+        all are valid now, each issuer is a CA that may sign certificates,
+        and the EK certificate is not a CA's and is for an EK.
 \end{itemize}
 It then prints the claims as JSON: the guest's id, memory, vCPUs and
 whether it is dom0, the PCRs, and the TPM's reset count.
@@ -2015,6 +2025,8 @@ whether it is dom0, the PCRs, and the TPM's reset count.
 \paragraph{Enrolling the AK.} The quote proves nothing until the verifier
 knows that the AK belongs to a real TPM. Enroll each host once:
 \begin{lstlisting}[language=bash]
+tools/l4h-attest.py verify report evidence --data $NONCE \
+    --insecure-unpinned-ak                  # verifier: prints host.ak_name
 tools/l4h-attest.py make-credential evidence $SECRET -o cred \
     --ek-ca manufacturer-ca.pem                                 # verifier
 l4hctl attest activate cred                                     # guest
@@ -2060,17 +2072,25 @@ tools/l4h-attest.py verify report tdx-evidence --data $NONCE \
     --intel-root-ca intel_root_ca.pem --collateral-dir collateral \
     --cc-event-log ccel
 tools/l4h-attest.py verify report --tdx-evidence tdx-evidence \
-    --tpm-evidence evidence --intel-root-ca intel_root_ca.pem
+    --tpm-evidence evidence --ak-name $AK \
+    --intel-root-ca intel_root_ca.pem --collateral-dir collateral
 tools/l4h-attest.py verify-tdx-quote fresh --data $NONCE \
     --intel-root-ca intel_root_ca.pem --collateral-dir collateral
 \end{verbatim}
 It checks the quote down to Intel's root CA, that the TD is neither a
-debug TD nor migratable,
-the TCB status of the platform, the TDX module and the quoting enclave
+debug TD nor migratable (nor bound to a service TD),
+with the collateral that the quoting enclave and the TDX module are
+Intel's, and the TCB status of the platform (for a TD~1.5 quote both at
+launch and now), the TDX module and the quoting enclave
 (\texttt{UpToDate}, unless \texttt{--allow-tcb-status} accepts more), that
 the quote binds the host key, and that RTMR~3 was zero then: the host
 extends it with the key at once, so it is the first key of that boot.
-\texttt{--mrtd} and \texttt{--rtmr} pin the TD's measurements. TDX takes
+\texttt{--mrtd} and \texttt{--rtmr} pin the TD's measurements. The
+collateral is required: without it nothing tells Intel's quoting enclave
+from one anybody can run on an SGX machine. \texttt{--insecure-skip-collateral}
+skips it for tests only. A TPM driven through the ACPI start method is not
+used in a TD (its AML is the cloud's code): such a VM attests with TDX
+alone. TDX takes
 the cloud's hypervisor and vTPM out of what a report must trust for the
 TD's memory and its measurements; the TPM's PCRs still say what the
 firmware measured.

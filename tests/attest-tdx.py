@@ -332,10 +332,12 @@ class Tdx(unittest.TestCase):
         return ev
 
     def collateral(self, d, tcb=None, qe=None, pck_crl=None, chain=None, root_crl=None, tamper_tcb=False,
-                   no_root_crl=False, qe_chain=None, qe_key=None):
+                   no_root_crl=False, qe_chain=None, qe_key=None, tcb_key=None):
         files = {
-            "tcb_info.json": signed_doc("tcbInfo", tcb if tcb is not None else tcb_info(UP_TO_DATE), self.intel.tcb_key, tamper_tcb),
-            "qe_identity.json": signed_doc("enclaveIdentity", qe if qe is not None else qe_identity(), qe_key or self.intel.tcb_key),
+            "tcb_info.json": signed_doc("tcbInfo", tcb if tcb is not None else tcb_info(UP_TO_DATE), tcb_key or self.intel.tcb_key,
+                                        tamper_tcb),
+            "qe_identity.json": signed_doc("enclaveIdentity", qe if qe is not None else qe_identity(),
+                                           qe_key or tcb_key or self.intel.tcb_key),
             "pck_crl.pem": (pck_crl if pck_crl is not None else crl(self.intel.pck_ca, self.intel.pck_ca_key)).public_bytes(serialization.Encoding.PEM),
             "tcb_signing_chain.pem": chain or pem(self.intel.tcb, self.intel.root),
         }
@@ -353,6 +355,10 @@ class Tdx(unittest.TestCase):
         return a.Collateral(d)
 
     def policy(self, collateral=None, roots=None, **kw):
+        # The checks short of collateral, alone: they skip it explicitly
+        # (test_collateral_required: by default a quote needs it).
+        if collateral is None:
+            kw.setdefault("require_collateral", False)
         return a.TdxPolicy([self.intel.root] if roots is None else roots, collateral, **kw)
 
     def check(self, ev, collateral=None, **kw):
@@ -715,6 +721,117 @@ class Tdx(unittest.TestCase):
                 f(tpm)
         self.assertFalse(a.is_cc_event_log(tpm))
 
+    # ---- audit: collateral by default, TD 1.5's fields, the root CA CRL
+    # per root, RTMR 3 in the CC event log
+
+    def test_collateral_required(self):
+        """A quote whose QE report the real PCK key signed, for an enclave
+        of the attacker's making (SGX flexible launch control: the PCE
+        signs any enclave's report), which then signs any TD quote: only
+        QE identity tells it from Intel's QE."""
+        for name, qe in (("MRSIGNER", lambda r: r[:128] + b"\xee" * 32 + r[160:]),
+                         ("debug", lambda r: r[:48] + bytes([r[48] | 0x02]) + r[49:])):
+            forged = make_quote(self.intel, self.fields(), tamper={"qe_report": qe})
+            # Everything short of collateral holds: the PCK chain is real.
+            self.check(self.evidence(forged))
+            # By default: refused without collateral...
+            with self.assertRaisesRegex(a.Fail, "needs Intel's collateral", msg=name):
+                a.check_tdx_evidence(self.evidence(forged), a.TdxPolicy([self.intel.root]))
+            with self.assertRaisesRegex(a.Fail, "needs Intel's collateral", msg=name):
+                a.check_tdx_evidence(self.evidence(forged), a.TdxPolicy([self.intel.root], a.Collateral()))
+            # ...and by it.
+            with tempfile.TemporaryDirectory() as d:
+                col = self.collateral(d)
+                with self.assertRaisesRegex(a.Fail, "QE signer|QE attributes", msg=name):
+                    a.check_tdx_evidence(self.evidence(forged), a.TdxPolicy([self.intel.root], col))
+                # The honest quote passes with the same collateral.
+                a.check_tdx_evidence(self.evidence(), a.TdxPolicy([self.intel.root], col))
+        # A TDX module of another signer (MRSIGNERSEAM): only TCB info names
+        # Intel's.
+        q = make_quote(self.intel, self.fields(mrsignerseam=b"\xee" * 48))
+        with self.assertRaisesRegex(a.Fail, "needs Intel's collateral"):
+            a.check_tdx_evidence(self.evidence(q), a.TdxPolicy([self.intel.root]))
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaisesRegex(a.Fail, "TDX module signer"):
+                a.check_tdx_evidence(self.evidence(q), a.TdxPolicy([self.intel.root], self.collateral(d)))
+        # A guest's fresh quote too.
+        with self.assertRaisesRegex(a.Fail, "needs Intel's collateral"):
+            a.check_tdx_quote_answer(self.answer(), a.TdxPolicy([self.intel.root]))
+
+    def test_tee_tcb_svn2(self):
+        """TD 1.5: TEE_TCB_SVN is the module's at launch, TEE_TCB_SVN2 its
+        current one; an old current module is refused though the launch
+        one was up to date."""
+        levels = [tcb_level("UpToDate", tdx=(3, 0, 5) + (0,) * 13),
+                  tcb_level("OutOfDate", tdx=(1, 0, 1) + (0,) * 13, advisories=("INTEL-SA-01234",))]
+        old = bytes([2, 0, 5] + [0] * 13)
+        q = make_quote(self.intel, self.fields(tee_tcb_svn2=old), 5, 3)
+        with tempfile.TemporaryDirectory() as d:
+            col = self.collateral(d, tcb=tcb_info(levels))
+            self.refused(self.evidence(q), "tcb status current is OutOfDate", col)
+            _, info = self.check(self.evidence(q), col, allowed={"UpToDate", "OutOfDate"})
+            self.assertEqual((info["tcb_status"], info["tcb_status_current"]), ("UpToDate", "OutOfDate"))
+            self.assertEqual(info["advisory_ids"], ["INTEL-SA-01234"])
+            # The other way round: the launch module old, the current one
+            # new.
+            q = make_quote(self.intel, self.fields(tee_tcb_svn=old), 5, 3)
+            self.refused(self.evidence(q), "tcb status is OutOfDate", col)
+            # Below every level: refused.
+            q = make_quote(self.intel, self.fields(tee_tcb_svn2=bytes(16)), 5, 3)
+            self.refused(self.evidence(q), "no TCB level matches", col)
+            # TD 1.0 bodies have no TEE_TCB_SVN2: only the one status.
+            q = make_quote(self.intel, self.fields(tee_tcb_svn2=old), 5, 2)
+            _, info = self.check(self.evidence(q), col)
+            self.assertNotIn("tcb_status_current", info)
+            # The current module's identity is its own entry's.
+            ident = [{"id": "TDX_01", "mrsigner": MRSIGNERSEAM.hex(), "attributes": "0000000000000000",
+                      "attributesMask": "FFFFFFFFFFFFFFFF",
+                      "tcbLevels": [{"tcb": {"isvsvn": 2}, "tcbDate": "2025-01-01T00:00:00Z", "tcbStatus": "UpToDate"}]}]
+            col = self.collateral(d, tcb=tcb_info([tcb_level("UpToDate", tdx=(9, 9, 5) + (0,) * 13)], identities=ident))
+            q = make_quote(self.intel, self.fields(tee_tcb_svn=bytes([2, 1, 5] + [0] * 13),
+                                                   tee_tcb_svn2=bytes([2, 2, 5] + [0] * 13)), 5, 3)
+            self.refused(self.evidence(q), "no TDX module identity TDX_02", col)
+            q = make_quote(self.intel, self.fields(tee_tcb_svn=bytes([2, 1, 5] + [0] * 13),
+                                                   tee_tcb_svn2=bytes([2, 1, 5] + [0] * 13)), 5, 3)
+            _, info = self.check(self.evidence(q), col)
+            self.assertEqual(info["tdx_module_tcb_status_current"], "UpToDate")
+
+    def test_mrservicetd(self):
+        q = make_quote(self.intel, self.fields(mrservicetd=b"\x01" * 48), 5, 3)
+        self.refused(self.evidence(q), "non-zero MRSERVICETD")
+        _, info = self.check(self.evidence(q), allow_migratable=True)
+        self.assertEqual(info["mrservicetd"], (b"\x01" * 48).hex())
+        # A TD 1.0 body has none.
+        self.check(self.evidence(make_quote(self.intel, self.fields(mrservicetd=b"\x01" * 48), 5, 2)))
+
+    def test_root_ca_crl_per_root(self):
+        """Two pinned roots (Intel rotating its root): the PCK CA under one,
+        the TCB signing certificate under the other.  The root CA CRL is
+        one root's: it cannot clear the other root's certificate."""
+        intel = self.intel
+        b_key = ec.generate_private_key(ec.SECP256R1())
+        b_root = cert("Intel SGX Root CA", b_key, "Intel SGX Root CA", b_key, True, days=(-10, 3650))
+        b_tcb_key = ec.generate_private_key(ec.SECP256R1())
+        b_tcb = cert("Intel SGX TCB Signing", b_tcb_key, "Intel SGX Root CA", b_key, False, ku=key_usage(sign=True))
+        roots = [intel.root, b_root]
+        with tempfile.TemporaryDirectory() as d:
+            # Root B's CRL, which root A's PCK CA is not on (though root A
+            # revoked it): refused, not taken as clearing it.
+            col = self.collateral(d, chain=pem(b_tcb, b_root), tcb_key=b_tcb_key, root_crl=crl(b_root, b_key))
+            self.refused(self.evidence(), "root CA CRL is not signed by", col, roots=roots)
+            col = self.collateral(d, chain=pem(b_tcb, b_root), tcb_key=b_tcb_key,
+                                  root_crl=crl(intel.root, intel.root_key, [intel.pck_ca.serial_number]))
+            self.refused(self.evidence(), "root CA CRL is not signed by|PCK CA certificate is revoked", col, roots=roots)
+            # One root for all: as before.
+            col = self.collateral(d)
+            self.check(self.evidence(), col, roots=roots)
+            col = self.collateral(d, root_crl=crl(intel.root, intel.root_key, [intel.pck_ca.serial_number]))
+            self.refused(self.evidence(), "PCK CA certificate is revoked", col, roots=roots)
+
+    def test_cc_event_log_rtmr3(self):
+        log = ccel(CC_EVENTS + [(4, 0xD, b"firmware's RTMR 3")])
+        self.refused(self.evidence(), "extends RTMR 3, which is trustd's", cc_event_log=log)
+
     def test_quote_chain_with_nul_terminator(self):
         q = make_quote(self.intel, self.fields(), chain=pem(self.intel.pck, self.intel.pck_ca) + b"\x00\x00")
         self.check(self.evidence(q))
@@ -823,39 +940,52 @@ class Tdx(unittest.TestCase):
             self.assertEqual(out["tdx"]["tcb_status"], "UpToDate")
             self.assertEqual(out["tdx"]["cc_event_log_events"], len(CC_EVENTS))
             self.assertNotIn("warning", r.stderr)
-            # Without collateral: a warning.
+            # Without collateral: refused, unless skipped explicitly (with
+            # a warning).
             r = self.run_tool("verify", p["rep"], p["tdx"], "--intel-root-ca", root)
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("--collateral-dir", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            r = self.run_tool("verify", p["rep"], p["tdx"], "--intel-root-ca", root, "--insecure-skip-collateral")
             self.assertEqual(r.returncode, 0, r.stderr)
-            self.assertIn("TCB status not checked", r.stderr)
+            self.assertIn("INSECURE", r.stderr)
+            self.assertIn("NOT checked", r.stderr)
             # Without the root: refused.
             r = self.run_tool("verify", p["rep"], p["tdx"])
             self.assertEqual(r.returncode, 1)
             self.assertIn("--intel-root-ca", r.stderr)
             # Both, combined (the guest driver's v3) and side by side.
             for args in ((p["both"],), ("--tdx-evidence", p["tdx"], "--tpm-evidence", p["tpm"]), (p["tpm"], "--tdx-evidence", p["tdx"])):
-                r = self.run_tool("verify", p["rep"], *args, "--intel-root-ca", root)
+                r = self.run_tool("verify", p["rep"], *args, "--intel-root-ca", root, "--collateral-dir", col,
+                                  "--insecure-unpinned-ak")
                 self.assertEqual(r.returncode, 0, (args, r.stderr))
                 out = json.loads(r.stdout)
                 self.assertEqual(set(out), {"host", "tdx", "guest"})
                 self.assertEqual(out["host"]["key"], out["tdx"]["key"])
             # The TPM alone: as before, no TDX in the output.
-            r = self.run_tool("verify", p["rep"], p["tpm"])
+            r = self.run_tool("verify", p["rep"], p["tpm"], "--insecure-unpinned-ak")
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertEqual(set(json.loads(r.stdout)), {"host", "guest"})
+            # Its AK not pinned: refused by default.
+            r = self.run_tool("verify", p["rep"], p["tpm"])
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("--ak-name", r.stderr)
             # TPM evidence alone where TDX was asked for (a host that left
             # its TDX evidence out): refused, whichever TDX option.
             for opts in (("--intel-root-ca", root), ("--mrtd", "11" * 48), ("--rtmr", "0=" + "00" * 48),
                          ("--collateral-dir", col), ("--cc-event-log", p["log"]), ("--allow-debug",),
-                         ("--allow-migratable",), ("--root-ca-crl", root)):
-                r = self.run_tool("verify", p["rep"], p["tpm"], *opts)
+                         ("--allow-migratable",), ("--root-ca-crl", root), ("--insecure-skip-collateral",)):
+                r = self.run_tool("verify", p["rep"], p["tpm"], "--insecure-unpinned-ak", *opts)
                 self.assertEqual(r.returncode, 1, opts)
                 self.assertIn("TDX options without TDX evidence", r.stderr)
             # The two roots of trust speak of different keys, or the TPM's
             # of a partition.
-            r = self.run_tool("verify", p["rep"], "--tdx-evidence", p["tdx"], "--tpm-evidence", p["other_tpm"], "--intel-root-ca", root)
+            r = self.run_tool("verify", p["rep"], "--tdx-evidence", p["tdx"], "--tpm-evidence", p["other_tpm"], "--intel-root-ca", root,
+                              "--insecure-skip-collateral", "--insecure-unpinned-ak")
             self.assertEqual(r.returncode, 1)
             self.assertIn("different host keys", r.stderr)
-            r = self.run_tool("verify", p["rep"], "--tdx-evidence", p["tdx"], "--tpm-evidence", p["mk_tpm"], "--intel-root-ca", root)
+            r = self.run_tool("verify", p["rep"], "--tdx-evidence", p["tdx"], "--tpm-evidence", p["mk_tpm"], "--intel-root-ca", root,
+                              "--insecure-skip-collateral", "--insecure-unpinned-ak")
             self.assertEqual(r.returncode, 1)
             self.assertRegex(r.stderr, "single kernel|partition")
             # Two of one kind.
@@ -867,7 +997,7 @@ class Tdx(unittest.TestCase):
             self.assertIn("no evidence", r.stderr)
             # Another host's report.
             p2 = self.files(d, rep2=Host().report(b"cli"))
-            r = self.run_tool("verify", p2["rep2"], p["tdx"], "--intel-root-ca", root)
+            r = self.run_tool("verify", p2["rep2"], p["tdx"], "--intel-root-ca", root, "--insecure-skip-collateral")
             self.assertEqual(r.returncode, 1)
             self.assertIn("report", r.stderr)
             for r in (r,):
@@ -883,12 +1013,20 @@ class Tdx(unittest.TestCase):
                            other_ev={"v": 1, "key": other.cose_key(), "type": "tdx",
                                      "quote": make_quote(self.intel, self.fields(reportdata=a.tdx_key_binding(other.point) + bytes(16)))})
             r = self.run_tool("verify-tdx-quote", p["ans"], "--intel-root-ca", root, "--tdx-evidence", p["tdx"], "--data", b"fresh".hex())
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("--collateral-dir", r.stderr)
+            col = os.path.join(d, "col")
+            os.mkdir(col)
+            self.collateral(col)
+            r = self.run_tool("verify-tdx-quote", p["ans"], "--intel-root-ca", root, "--tdx-evidence", p["tdx"], "--data", b"fresh".hex(),
+                              "--collateral-dir", col)
             self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertNotIn("warning", r.stderr.lower())
             self.assertEqual(set(json.loads(r.stdout)), {"tdx", "guest"})
-            r = self.run_tool("verify-tdx-quote", p["ans"], "--intel-root-ca", root, "--tdx-evidence", p["other_ev"])
+            r = self.run_tool("verify-tdx-quote", p["ans"], "--intel-root-ca", root, "--tdx-evidence", p["other_ev"], "--collateral-dir", col)
             self.assertEqual(r.returncode, 1)
             self.assertIn("not the TDX evidence's", r.stderr)
-            r = self.run_tool("verify-tdx-quote", p["ans"], "--intel-root-ca", root, "--data", "00")
+            r = self.run_tool("verify-tdx-quote", p["ans"], "--intel-root-ca", root, "--data", "00", "--collateral-dir", col)
             self.assertEqual(r.returncode, 1)
             self.assertIn("nonce", r.stderr)
             r = self.run_tool("event-log", p["log"])

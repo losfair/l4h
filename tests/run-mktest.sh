@@ -294,9 +294,10 @@ for k in $(seq 0 $((n - 1))); do
         --cmdline "console=hvc0 MKP=$k attest_nonce=$nonce")
     dom0_launch=$(python3 "$tool" measure "$out/vmlinux" --initrd "$out/dom0.cpio.gz" \
         --cmdline "${cmdline[k]}")
-    python3 "$tool" verify "$a/vm.report" "$a/evidence" --data "$nonce" --launch "$vm_launch" "${ca[@]}" \
+    # The AK is not enrolled yet: read its name (pinned below).
+    python3 "$tool" verify "$a/vm.report" "$a/evidence" --data "$nonce" --launch "$vm_launch" "${ca[@]}" --insecure-unpinned-ak \
         > "$a/vm.json" 2>/dev/null || fail "partition $k: the VM's report"
-    python3 "$tool" verify "$a/dom0.report" "$a/evidence" --data "$nonce" --launch "$dom0_launch" "${ca[@]}" \
+    python3 "$tool" verify "$a/dom0.report" "$a/evidence" --data "$nonce" --launch "$dom0_launch" "${ca[@]}" --insecure-unpinned-ak \
         > "$a/dom0.json" 2>/dev/null || fail "partition $k: dom0's report"
     for w in vm dom0; do
         [ "$(json "$a/$w.json" 'd["guest"]["partition"]')" = "$k" ] || fail "partition $k: $w's report names another partition"
@@ -318,7 +319,7 @@ done
 p0=$out/att/1/p0 p1=$out/att/1/p1
 ak=$(json "$p0/dom0.json" 'd["host"]["ak_name"]')
 [ "$(json "$p1/dom0.json" 'd["host"]["ak_name"]')" = "$ak" ] || fail "partitions quoted by different AKs"
-! python3 "$tool" verify "$p1/vm.report" "$p0/evidence" 2>/dev/null || fail "partition 1's report verified with partition 0's evidence"
+! python3 "$tool" verify "$p1/vm.report" "$p0/evidence" --ak-name "$ak" 2>/dev/null || fail "partition 1's report verified with partition 0's evidence"
 python3 "$tool" verify "$p1/vm.report" "$p1/evidence" --data "$nonce" --ak-name "$ak" "${ca[@]}"
 echo "MKTEST: reports verify and name their partitions"
 

@@ -61,22 +61,41 @@ fn open_file(root: &mut Directory, path: &CStr16) -> uefi::Result<Option<Regular
     }
 }
 
-fn contents(mut file: RegularFile) -> uefi::Result<Vec<u8>> {
+/// `prefix`, then the file's bytes, in one allocation.
+fn contents(mut file: RegularFile, prefix: &[u8]) -> uefi::Result<Vec<u8>> {
     let len = usize::try_from(file.get_boxed_info::<FileInfo>()?.file_size())
         .map_err(|_| Status::BAD_BUFFER_SIZE)?;
+    let total = prefix
+        .len()
+        .checked_add(len)
+        .ok_or(Status::BAD_BUFFER_SIZE)?;
     let mut bytes = Vec::new();
     bytes
-        .try_reserve_exact(len)
+        .try_reserve_exact(total)
         .map_err(|_| Status::OUT_OF_RESOURCES)?;
-    bytes.resize(len, 0);
-    if file.read(&mut bytes)? != len {
+    bytes.extend_from_slice(prefix);
+    bytes.resize(total, 0);
+    if file.read(&mut bytes[prefix.len()..])? != len {
         return Err(Status::END_OF_FILE.into());
     }
     Ok(bytes)
 }
 
 pub fn read_optional(root: &mut Directory, path: &CStr16) -> uefi::Result<Option<Vec<u8>>> {
-    open_file(root, path)?.map(contents).transpose()
+    read_optional_with_prefix(root, path, &[])
+}
+
+/// The file at `path` after `prefix` (`policy::Slot::present`), so that the
+/// measured buffer is the whole and the file `[prefix.len()..]` of it,
+/// without a copy.
+pub fn read_optional_with_prefix(
+    root: &mut Directory,
+    path: &CStr16,
+    prefix: &[u8],
+) -> uefi::Result<Option<Vec<u8>>> {
+    open_file(root, path)?
+        .map(|file| contents(file, prefix))
+        .transpose()
 }
 
 fn selector_device(handles: &[Handle]) -> uefi::Result<Option<Handle>> {

@@ -32,8 +32,9 @@
 //! is zero, after which RTMR 3 is extended with it.  With a TPM, without
 //! one, or with both: reports need either, and the TDX evidence and fresh
 //! quotes over a guest's report come in requests of their own.  The key's
-//! seed is then the CPU's (RDSEED, which the VMM can neither see nor
-//! change) hashed with the TPM's, if there is one.
+//! seed is then the CPU's alone (RDSEED, which the VMM can neither see nor
+//! change), and the key is bound to the TD before the TPM, if any, is
+//! touched; a TPM with the ACPI start method (the cloud's AML) is not used.
 //!
 //! Nothing here allocates (DESIGN.md §10): requests are copied, and answers
 //! built, in fixed buffers, and the evidence is made once into one.  The
@@ -292,18 +293,20 @@ fn step<T>(what: &'static str, r: Result<T, Error>) -> Result<T, (&'static str, 
     r.map_err(|e| (what, e))
 }
 
-/// The TPM, started, and the signing key from its random bytes, hashed
-/// with the CPU's `cpu` (TDX) if given.
-fn tpm_key(cfg: &TrustdConfig, hz: u64, cpu: Option<&[u8; 32]>) -> Result<(Tpm, SigningKey), (&'static str, Error)> {
+/// The TPM, started.
+fn open_tpm(cfg: &TrustdConfig, hz: u64) -> Result<Tpm, (&'static str, Error)> {
     let mut tpm = step("interface", Tpm::new(cfg, hz))?;
     step("Startup", tpm2::startup(&mut tpm))?;
+    Ok(tpm)
+}
+
+/// The TPM and a key from its randomness (not a TD's: a TD's key is the
+/// CPU's, made and bound to RTMR 3 before the TPM is touched).
+fn tpm_key(cfg: &TrustdConfig, hz: u64) -> Result<(Tpm, SigningKey), (&'static str, Error)> {
+    let mut tpm = open_tpm(cfg, hz)?;
     let key = loop {
         let mut seed = [0u8; 32];
         step("GetRandom", tpm2::get_random(&mut tpm, &mut seed))?;
-        // Neither the TPM nor the CPU alone chooses the key.
-        if let Some(c) = cpu {
-            seed = Sha256::new().chain_update(c).chain_update(seed).finalize().into();
-        }
         if let Ok(k) = SigningKey::from_bytes(&seed.into()) {
             break k;
         }
@@ -442,7 +445,29 @@ fn cpu_seed() -> Option<[u8; 32]> {
     None
 }
 
-/// A key from the CPU alone (a TD without a usable TPM).
+/// A TD's state for `key`, already bound to the TD: quoted by the vTPM too
+/// if there is a usable one, else the key alone.  Never the ACPI start
+/// method's: its AML is the cloud's code, run with root's hardware access,
+/// which a TD does not trust (root gives none in a TD; this is a second
+/// line).
+fn td_tpm(cfg: &TrustdConfig, hz: u64, key: SigningKey, t0: u64, partition: Option<u32>) -> State {
+    if matches!(cfg.iface, trust::TPM_NONE | trust::TPM_REMOTE) {
+        return State::keyed(key, partition);
+    }
+    if cfg.start == trust::START_ACPI {
+        l4h_rt::log!("l4h-trustd: TPM with the ACPI start method ignored in a TD: TDX only");
+        return State::keyed(key, partition);
+    }
+    match open_tpm(cfg, hz).and_then(|tpm| init(tpm, key.clone(), t0, hz, partition)) {
+        Ok(s) => s,
+        Err((what, e)) => {
+            l4h_rt::log!("l4h-trustd: TPM unusable, TDX only: {}: {}", what, e);
+            State::keyed(key, partition)
+        }
+    }
+}
+
+/// A key from the CPU alone (a TD's).
 fn cpu_key(seed: Option<[u8; 32]>) -> Option<SigningKey> {
     let mut seed = seed?;
     loop {
@@ -904,7 +929,40 @@ fn main(info: &'static Info) -> ! {
     let td = td && cpu.is_some();
     // A secondary's key, until the primary quoted it.
     let mut starting = None;
+    let mut tdx = None;
     let mut state = match (cfg.iface, relay.as_mut()) {
+        (_, None) if td => {
+            // A TD: the CPU's key, bound to the TD (its TDREPORT while
+            // RTMR 3 is zero, then RTMR 3 extended with it) before anything
+            // of the host's vTPM is touched: what the cloud's vTPM or its
+            // ACPI code does cannot come first.  The vTPM, if any, then
+            // quotes the same key.
+            match cpu_key(cpu) {
+                Some(key) => {
+                    tdx = match Tdx::start(&point(&key), hz) {
+                        Ok(mut t) => match t.poll() {
+                            // Ask for the quote now: it comes while the TPM
+                            // is set up.
+                            Some(tdxrt::Event::Failed) => None,
+                            Some(tdxrt::Event::Ready) => {
+                                info!("l4h-trustd: TDX attestation ready");
+                                Some(t)
+                            }
+                            _ => Some(t),
+                        },
+                        Err(why) => {
+                            l4h_rt::log!("l4h-trustd: no TDX attestation: {}", why);
+                            None
+                        }
+                    };
+                    Some(td_tpm(cfg, hz, key, t0, partition))
+                }
+                None => {
+                    l4h_rt::log!("l4h-trustd: no key from RDSEED or RDRAND: no TDX attestation");
+                    None
+                }
+            }
+        }
         (trust::TPM_NONE, _) | (trust::TPM_REMOTE, None) => None,
         (trust::TPM_REMOTE, Some(r)) => {
             match start_remote(r, hz) {
@@ -913,33 +971,19 @@ fn main(info: &'static Info) -> ! {
             }
             None
         }
-        _ => match tpm_key(cfg, hz, cpu.as_ref()) {
-            Ok((tpm, key)) => match init(tpm, key.clone(), t0, hz, partition) {
+        _ => match tpm_key(cfg, hz) {
+            Ok((tpm, key)) => match init(tpm, key, t0, hz, partition) {
                 Ok(s) => Some(s),
                 Err((what, e)) => {
-                    l4h_rt::log!("l4h-trustd: TPM unusable, {}: {}: {}", if td { "TDX only" } else { "no attestation" }, what, e);
-                    td.then(|| State::keyed(key, partition))
+                    l4h_rt::log!("l4h-trustd: TPM unusable, no attestation: {}: {}", what, e);
+                    None
                 }
             },
             Err((what, e)) => {
-                l4h_rt::log!("l4h-trustd: TPM unusable, {}: {}: {}", if td { "TDX only" } else { "no attestation" }, what, e);
+                l4h_rt::log!("l4h-trustd: TPM unusable, no attestation: {}: {}", what, e);
                 None
             }
         },
-    };
-    // A TD without a TPM: the CPU's key.
-    if td && state.is_none() {
-        state = cpu_key(cpu).map(|k| State::keyed(k, partition));
-    }
-    let mut tdx = match state.as_ref().filter(|_| td) {
-        Some(s) => match Tdx::start(&point(&s.key), hz) {
-            Ok(t) => Some(t),
-            Err(why) => {
-                l4h_rt::log!("l4h-trustd: no TDX attestation: {}", why);
-                None
-            }
-        },
-        None => None,
     };
     // A key bound to nothing (a TD that cannot attest, without a TPM).
     if state.as_ref().is_some_and(|s| !s.has_tpm) && tdx.is_none() {
