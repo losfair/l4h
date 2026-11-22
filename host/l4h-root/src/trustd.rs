@@ -9,6 +9,11 @@
 //! a multikernel secondary, which has no TPM, trustd has the primary's
 //! trustd quote its key and run its ActivateCredential, through the relay
 //! pages and the control channel (trust::RELAY_*).
+//!
+//! On an Intel TDX trust domain (FL4's BootInfo TDX_INFO, never with other
+//! partitions) trustd also gets the TdxControl capability, a private page
+//! for TDREPORTs and a 2 MiB frame shared with the VMM for GetQuote, and the
+//! CC event log: with a TPM or without, it binds its key to both.
 #![cfg_attr(not(target_arch = "x86_64"), allow(dead_code, unused_imports))]
 
 
@@ -38,17 +43,24 @@ const PAGE: usize = 4096;
 pub use l4h_host::root::{FLAGS_ID, TRUSTD_ID};
 /// The registry page in the root task.
 const REGISTRY_VA: usize = crate::layout::TRUSTD_REGISTRY.base;
-/// Mapping capabilities trustd's ranges, AML and event log pages, and the
-/// flags server's pages, can need.
+/// Mapping capabilities trustd's ranges, AML and event log pages (TPM and
+/// CC), its TDX frames, and the flags server's pages, can need.
 const KEEP_BITS: usize = 12;
 /// SEL4_BOOTINFO_HEADER_TPM_EVENT_LOG (FL4's seL4_TpmEventLog: paddr,
 /// size, flags), not taken from libsel4, whose older revisions lack it.
 const TPM_EVENT_LOG: u64 = 12;
+/// SEL4_BOOTINFO_HEADER_CC_EVENT_LOG (FL4 on a TD: paddr, size, flags, as
+/// TPM_EVENT_LOG) and SEL4_BOOTINFO_HEADER_TDX_INFO (gpaw, attributes,
+/// td_ctls, num_vcpus, max_vcpus).
+const CC_EVENT_LOG: u64 = 13;
+const TDX_INFO: u64 = 14;
+const _: () = assert!(trust::CC_EVENT_LOG_MAX == trust::EVENT_LOG_MAX);
 
-/// The UEFI TPM event log the boot loader passed on, whose pages trustd
-/// maps read-only at trust::EVENT_LOG_VA: carved once, before trustd is
-/// made, so that every way it starts (with the TPM, or flags only after
-/// a TPM that failed) maps the same frames.
+/// An event log the boot loader passed on, whose pages trustd maps
+/// read-only (the UEFI TPM log at trust::EVENT_LOG_VA, the CC event log at
+/// trust::CC_EVENT_LOG_VA): carved once, before trustd is made, so that
+/// every way it starts (with the TPM, or flags only after a TPM that
+/// failed) maps the same frames.
 struct EventLog {
     size: u64,
     flags: u64,
@@ -59,12 +71,13 @@ struct EventLog {
 impl EventLog {
     const NONE: EventLog = EventLog { size: 0, flags: 0, frames: ArrayVec::new() };
 
-    /// From the BootInfo record, if there is one root can use: none is
-    /// no event log, never a failure.
-    fn find(bootinfo: &sel4::BootInfoPtr, alloc: &mut Alloc, devmem: &mut DevMem) -> EventLog {
-        let Some(c) = l4h_task::bootinfo::extra_chunk(bootinfo, TPM_EVENT_LOG) else { return EventLog::NONE };
+    /// From the BootInfo record `chunk` (TPM_EVENT_LOG, CC_EVENT_LOG), if
+    /// there is one root can use: none is no event log, never a failure.
+    fn find(bootinfo: &sel4::BootInfoPtr, alloc: &mut Alloc, devmem: &mut DevMem, chunk: u64) -> EventLog {
+        let what = if chunk == CC_EVENT_LOG { "CC" } else { "TPM" };
+        let Some(c) = l4h_task::bootinfo::extra_chunk(bootinfo, chunk) else { return EventLog::NONE };
         if c.len() < 24 {
-            log!("l4h-root: TPM event log record of {} bytes, ignored", c.len());
+            log!("l4h-root: {} event log record of {} bytes, ignored", what, c.len());
             return EventLog::NONE;
         }
         let word = |i: usize| u64::from_le_bytes(c[i..i + 8].try_into().unwrap());
@@ -75,7 +88,7 @@ impl EventLog {
             || paddr.checked_add((pages * PAGE) as u64).is_none()
             || alloc.slots.available() < pages + crate::CNODE_SLOTS / 2
         {
-            log!("l4h-root: TPM event log of {} bytes at {:#x} unusable, ignored", size, paddr);
+            log!("l4h-root: {} event log of {} bytes at {:#x} unusable, ignored", what, size, paddr);
             return EventLog::NONE;
         }
         let mut frames = ArrayVec::new();
@@ -86,11 +99,85 @@ impl EventLog {
             }
         });
         if carved.is_none() || frames.len() != pages {
-            log!("l4h-root: TPM event log at {:#x} is not device memory, ignored", paddr);
+            log!("l4h-root: {} event log at {:#x} is not device memory, ignored", what, paddr);
             return EventLog::NONE;
         }
-        info!("l4h-root: TPM event log: {} bytes{}", size, if flags & trust::EVENT_LOG_TRUNCATED != 0 { " (truncated)" } else { "" });
+        info!("l4h-root: {} event log: {} bytes{}", what, size, if flags & trust::EVENT_LOG_TRUNCATED != 0 { " (truncated)" } else { "" });
         EventLog { size, flags, frames }
+    }
+}
+
+/// The TD trustd attests with (BootInfo TDX_INFO), and the frame shared
+/// with the VMM for its quotes, made before trustd (as the event logs are).
+struct Tdx {
+    gpaw: u32,
+    attributes: u64,
+    /// The 2 MiB shared frame (trust::TDX_QUOTE_VA): a root slot that stays
+    /// its for good, as its Untyped does.
+    quote_frame: crate::mem::Slot,
+}
+
+impl Tdx {
+    /// From the BootInfo record, if root may give trustd TDX: not in a
+    /// machine split into partitions (FL4 runs alone), and only with a
+    /// kernel that has TdxControl and shares frames with the VMM.
+    fn find(bootinfo: &sel4::BootInfoPtr, alloc: &mut Alloc) -> Option<Tdx> {
+        let c = l4h_task::bootinfo::extra_chunk(bootinfo, TDX_INFO)?;
+        if c.len() < 40 {
+            log!("l4h-root: TDX_INFO record of {} bytes, ignored", c.len());
+            return None;
+        }
+        let word = |i: usize| u64::from_le_bytes(c[i * 8..i * 8 + 8].try_into().unwrap());
+        let (gpaw, attributes, td_ctls, vcpus, max_vcpus) = (word(0), word(1), word(2), word(3), word(4));
+        if !l4h_task::tdx::SUPPORTED {
+            log!("l4h-root: a TD, but this kernel's interface has no TdxControl: no TDX attestation");
+            return None;
+        }
+        if !alloc.shared_dma {
+            log!("l4h-root: a TD whose kernel shares no frames with the VMM: no TDX attestation");
+            return None;
+        }
+        if crate::partition::get().is_some_and(|d| d.count > 1) {
+            log!("l4h-root: a TD split into partitions: no TDX attestation");
+            return None;
+        }
+        let bits = trust::TDX_QUOTE_FRAME.trailing_zeros() as usize;
+        let quote_frame = alloc.global(|alloc| {
+            let (ut, page) = (alloc.slots.alloc(), alloc.slots.alloc());
+            let Some(mut region) = alloc.split(bits, ut) else {
+                alloc.slots.free(ut);
+                alloc.slots.free(page);
+                return None;
+            };
+            region.retype_dma(true, &crate::vspace::LARGE_PAGE_BP, 1, crate::mem::Dest::new(alloc.slots.cnode(), page))?;
+            Some(page)
+        });
+        let Some(quote_frame) = quote_frame else {
+            log!("l4h-root: no memory for the TDX quote buffer: no TDX attestation");
+            return None;
+        };
+        info!("l4h-root: Intel TDX: GPAW {}, attributes {:#x}, TD_CTLS {:#x}, {} of {} vCPUs", gpaw, attributes, td_ctls, vcpus, max_vcpus);
+        Some(Tdx { gpaw: gpaw as u32, attributes, quote_frame })
+    }
+}
+
+/// What the boot loader passed on for trustd besides the TPM: the event
+/// logs, and the TD.
+struct Extra {
+    ev: EventLog,
+    cc: EventLog,
+    tdx: Option<Tdx>,
+}
+
+impl Extra {
+    const NONE: Extra = Extra { ev: EventLog::NONE, cc: EventLog::NONE, tdx: None };
+
+    fn find(bootinfo: &sel4::BootInfoPtr, alloc: &mut Alloc, devmem: &mut DevMem) -> Extra {
+        let ev = EventLog::find(bootinfo, alloc, devmem, TPM_EVENT_LOG);
+        let tdx = Tdx::find(bootinfo, alloc);
+        // The CC event log is the TD's: without TDX nothing quotes it.
+        let cc = if tdx.is_some() { EventLog::find(bootinfo, alloc, devmem, CC_EVENT_LOG) } else { EventLog::NONE };
+        Extra { ev, cc, tdx }
     }
 }
 
@@ -107,6 +194,9 @@ pub struct Trustd {
     /// Multikernel: the kick, badged trust::RELAY_BADGE, to tell trustd about a
     /// message in its relay inbox.
     relay: Option<cap::Notification>,
+    /// TDX: the same kick, which root signals on its timer while trustd
+    /// asks it to (trust::Status::wake).
+    wake: Option<cap::Notification>,
     /// The two request pages of each guest id, mapped in trustd
     /// (trust::page_of), and which of them the id's guest has (the second:
     /// true).
@@ -271,7 +361,7 @@ impl Layout {
         (trust::TPM_VA + r * trust::RANGE_STRIDE + off) as u64
     }
 
-    fn config(&self, aml_size: usize, ev: &EventLog) -> TrustdConfig {
+    fn config(&self, aml_size: usize, extra: &Extra) -> TrustdConfig {
         let mut ranges = [trust::Range::default(); trust::MAX_RANGES];
         for (r, &(paddr, size)) in self.ranges.iter().enumerate() {
             ranges[r] = trust::Range { paddr: paddr as u64, size: size as u64 };
@@ -295,8 +385,14 @@ impl Layout {
             aml_size: aml_size as u64,
             partition: crate::partition::get().map_or(0, |d| d.index),
             partitions: crate::partition::get().map_or(1, |d| d.count),
-            event_log_size: ev.size,
-            event_log_flags: ev.flags,
+            event_log_size: extra.ev.size,
+            event_log_flags: extra.ev.flags,
+            tdx_enabled: extra.tdx.is_some() as u32,
+            tdx_gpaw: extra.tdx.as_ref().map_or(0, |t| t.gpaw),
+            tdx_attributes: extra.tdx.as_ref().map_or(0, |t| t.attributes),
+            tdx_quote_buf_size: if extra.tdx.is_some() { trust::TDX_QUOTE_BUF as u64 } else { 0 },
+            cc_event_log_size: extra.cc.size,
+            cc_event_log_flags: extra.cc.flags,
         }
     }
 }
@@ -395,10 +491,10 @@ pub fn spawn(
             .is_some_and(|d| d.channels().iter().any(|c| c.peer == 0 && c.kind & l4h_partition::CHANNEL_CONTROL != 0));
         if crate::partition::secondary() {
             let iface = if to_primary { trust::TPM_REMOTE } else { trust::TPM_NONE };
-            return without_tpm(alloc, win, asids, info, iface, &EventLog::NONE);
+            return without_tpm(alloc, win, asids, info, iface, &Extra::NONE);
         }
         // Whether or not the TPM below is usable.
-        let ev = EventLog::find(bootinfo, alloc, devmem);
+        let ev = Extra::find(bootinfo, alloc, devmem);
         let mut frames = frames;
         let mut phys = crate::acpi::Phys::new(alloc, devmem, win, &mut frames);
         let Some(l) = find_tpm(bootinfo, &mut phys) else {
@@ -489,19 +585,23 @@ pub fn spawn(
     #[cfg(not(target_arch = "x86_64"))]
     {
         // No TPM yet (flags only), but the event log the loader passed on.
-        let ev = if crate::partition::secondary() { EventLog::NONE } else { EventLog::find(bootinfo, alloc, devmem) };
+        let ev = if crate::partition::secondary() {
+            Extra::NONE
+        } else {
+            Extra { ev: EventLog::find(bootinfo, alloc, devmem, TPM_EVENT_LOG), ..Extra::NONE }
+        };
         flags_only(alloc, win, asids, info, &ev)
     }
 }
 
 /// The same flags service on machines with no usable TPM.
-fn flags_only(alloc: &mut Alloc, win: &mut Window, asids: &mut AsidPools, info: &HostInfo, ev: &EventLog) -> Option<Trustd> {
+fn flags_only(alloc: &mut Alloc, win: &mut Window, asids: &mut AsidPools, info: &HostInfo, ev: &Extra) -> Option<Trustd> {
     without_tpm(alloc, win, asids, info, trust::TPM_NONE, ev)
 }
 
-/// trustd with no TPM of its own: flags only, or (TPM_REMOTE) the
-/// primary's TPM through the relay.
-fn without_tpm(alloc: &mut Alloc, win: &mut Window, asids: &mut AsidPools, info: &HostInfo, iface: u32, ev: &EventLog) -> Option<Trustd> {
+/// trustd with no TPM of its own: flags only (or TDX alone), or
+/// (TPM_REMOTE) the primary's TPM through the relay.
+fn without_tpm(alloc: &mut Alloc, win: &mut Window, asids: &mut AsidPools, info: &HostInfo, iface: u32, ev: &Extra) -> Option<Trustd> {
     let cfg = TrustdConfig { iface, ..Layout::default().config(0, ev) };
     let (comp, flags_server, arena, keep) = create(&cfg, alloc, win, asids, info, 0)?;
     let mut next = 0;
@@ -509,7 +609,7 @@ fn without_tpm(alloc: &mut Alloc, win: &mut Window, asids: &mut AsidPools, info:
         let slot = keep.absolute_cptr_from_bits_with_depth(next, KEEP_BITS);
         next += 1;
         slot
-    }, iface == trust::TPM_NONE, ev, #[cfg(target_arch = "x86_64")] None)
+    }, iface == trust::TPM_NONE && ev.tdx.is_none(), ev, #[cfg(target_arch = "x86_64")] None)
 }
 
 /// Create trustd with configuration `cfg`, its flags server, and the CNode
@@ -588,7 +688,7 @@ fn finish(
     alloc: &mut Alloc,
     keep: &mut impl FnMut() -> sel4::AbsoluteCPtr,
     no_reports: bool,
-    ev: &EventLog,
+    extra: &Extra,
     #[cfg(target_arch = "x86_64")]
     hw: Option<Hw>,
 ) -> Option<Trustd> {
@@ -615,25 +715,35 @@ fn finish(
     comp.map_copy(alloc, &mut arena, &abs_of(status), trust::STATUS_VA, CapRights::read_write(), VmAttributes::DEFAULT, keep());
     // The TPM event log, read-only in trustd alone (under SEV-SNP the
     // kernel made its frames private: the default attributes keep them so).
-    for (p, &s) in ev.frames.iter().enumerate() {
-        comp.map_copy(alloc, &mut arena, &abs_of(crate::devmem::granule(s)), trust::EVENT_LOG_VA + p * PAGE,
-            CapRights::read_only(), VmAttributes::DEFAULT, keep());
+    for (log, va) in [(&extra.ev, trust::EVENT_LOG_VA), (&extra.cc, trust::CC_EVENT_LOG_VA)] {
+        for (p, &s) in log.frames.iter().enumerate() {
+            comp.map_copy(alloc, &mut arena, &abs_of(crate::devmem::granule(s)), va + p * PAGE,
+                CapRights::read_only(), VmAttributes::DEFAULT, keep());
+        }
+    }
+    if let Some(t) = &extra.tdx {
+        give_tdx(&comp, t, alloc, &mut arena, keep);
     }
     let kick = arena.object_cap::<cap_type::Notification>(alloc, ObjectBlueprint::Notification);
     comp.give(trust::SLOT_KICK, kick, CapRights::all());
     // The relay pages, shared with root, when there are other partitions.
-    let relay = crate::partition::get().filter(|d| d.count > 1).map(|_| {
+    let multikernel = crate::partition::get().is_some_and(|d| d.count > 1);
+    let relay = multikernel.then(|| {
         for p in 0..trust::RELAY_PAGES {
             let f = arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP);
             comp.map_copy(alloc, &mut arena, &abs_of(f), trust::RELAY_VA + p * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep());
             map_frame(&mut ObjCtx::global(alloc), sel4::init_thread::slot::VSPACE.cap(), f,
                 crate::layout::TRUSTD_RELAY.base + p * PAGE, CapRights::read_write(), VmAttributes::DEFAULT);
         }
+    });
+    // Root's kick, for the relay and for root's timer (TDX).
+    let root_kick = (multikernel || extra.tdx.is_some()).then(|| {
         let slot = alloc.slots.alloc();
         let badged = sel4::init_thread::Slot::<cap_type::Notification>::from_index(slot).cap();
         component::mint_edge(&abs_of(badged), &wiring::ROOT_TRUSTD_RELAY, 0, &Obj::claim(p::Trustd, o::Kick, abs_of(kick))).expect("relay kick");
         badged
     });
+    let (relay, wake) = (relay.and(root_kick), root_kick.filter(|_| extra.tdx.is_some()));
     // The flags: writable only in the flags server.
     let flags = core::array::from_fn(|p| {
         let f = arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP);
@@ -663,9 +773,32 @@ fn finish(
     alloc.slots.free(slot);
     component::start(&comp);
     Some(Trustd { comp, flags_server, arena, registry: REGISTRY_VA as *mut GuestRecord,
-        no_reports, failed: false, relay, pages, second: core::array::from_fn(|_| Cell::new(false)), status, kick, flags,
+        no_reports, failed: false, relay, wake, pages, second: core::array::from_fn(|_| Cell::new(false)), status, kick, flags,
         #[cfg(target_arch = "x86_64")] hw,
         #[cfg(target_arch = "x86_64")] hw_refusals: host::log::RateLimit::new() })
+}
+
+/// Give trustd the TD: the TdxControl capability (moved: root never uses
+/// it), a private page for TDG.MR.REPORT, read-only at TDX_REPORT_VA, and
+/// the shared quote frame, writable at TDX_QUOTE_VA; for the frames,
+/// unmapped copies besides, which the kernel's calls take.
+fn give_tdx(comp: &Component, t: &Tdx, alloc: &mut Alloc, arena: &mut Arena, keep: &mut impl FnMut() -> sel4::AbsoluteCPtr) {
+    use sel4::init_thread::Slot;
+    let control = abs_of(Slot::<cap_type::Null>::from_index(l4h_task::tdx::ROOT_SLOT).cap());
+    if comp.slot(trust::SLOT_TDX).move_(&control).is_err() {
+        log!("l4h-root: no TdxControl capability in slot {}: TDX attestation will fail", l4h_task::tdx::ROOT_SLOT);
+    }
+    let report = arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP);
+    comp.map_copy(alloc, arena, &abs_of(report), trust::TDX_REPORT_VA, CapRights::read_only(), VmAttributes::DEFAULT, keep());
+    comp.give(trust::SLOT_TDX_REPORT_FRAME, report, CapRights::all());
+    let frame = Slot::<cap_type::LargePage>::from_index(t.quote_frame).cap();
+    let s = alloc.slots.alloc();
+    let copy = Slot::<cap_type::LargePage>::from_index(s).cap();
+    abs_of(copy).copy(&abs_of(frame), CapRights::all()).expect("copy TDX quote frame");
+    crate::vspace::map_large_page(&mut ObjCtx::arena(alloc, arena), comp.vspace, copy, trust::TDX_QUOTE_VA, CapRights::read_write());
+    keep().move_(&abs_of(copy)).expect("keep TDX quote frame mapping");
+    alloc.slots.free(s);
+    comp.give(trust::SLOT_TDX_QUOTE_FRAME, frame, CapRights::all());
 }
 
 impl Trustd {
@@ -1113,9 +1246,21 @@ pub fn tick(h: &mut Host) {
     if let Some(v) = h.vmmgr.as_mut() {
         v.attest_tick();
     }
-    let Some(relay) = h.trustd.as_ref().filter(|t| !t.failed).and_then(|t| t.relay) else { return };
-    let out = unsafe { &*(relay_va(0) as *const trust::RelaySlot) };
-    if out.wake.load(core::sync::atomic::Ordering::Relaxed) != 0 {
-        relay.signal();
+    let Some(t) = h.trustd.as_ref().filter(|t| !t.failed) else { return };
+    let (relay, wake, status) = (t.relay, t.wake, t.status);
+    if let Some(relay) = relay {
+        let out = unsafe { &*(relay_va(0) as *const trust::RelaySlot) };
+        if out.wake.load(core::sync::atomic::Ordering::Relaxed) != 0 {
+            relay.signal();
+        }
+    }
+    // TDX: while trustd waits for the VMM's quote, or for its slot.
+    if let Some(wake) = wake {
+        let asked = h.wins.a.with_frame(&abs_of(status), |p| unsafe {
+            (*(p as *const trust::Status)).wake.load(core::sync::atomic::Ordering::Relaxed)
+        });
+        if asked != 0 {
+            wake.signal();
+        }
     }
 }

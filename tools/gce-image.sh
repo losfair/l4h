@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Package a disk image from tools/mkimage.sh for Google Compute Engine and
 # print the commands that import it and start a VM.  Nothing is uploaded.
-# Usage: gce-image.sh [--sev|--sev-snp] <disk.raw> [image-name]
+# Usage: gce-image.sh [--sev|--sev-snp|--tdx [--no-vtpm]] <disk.raw> [image-name]
 #
 # Supported machine shapes: N2/N2D/C2 etc. with
 #   --network-interface=nic-type=VIRTIO_NET, and C3/N4/C4 etc. with
@@ -15,11 +15,24 @@
 # SEV_CAPABLE and the instance is an N2D with SEV, on gVNIC.
 # --sev-snp: for an image built with tools/mkfl4-efi.sh, deployed in
 # an SEV-SNP zone as an N2D with SEV_SNP and the SEV_SNP_CAPABLE image tag.
+# --tdx: for an image that boots l4h-fl4.efi built with FL4's Intel TDX
+# support, deployed in a zone with Intel TDX (C3) as a C3 with TDX and the
+# TDX_CAPABLE image tag, on gVNIC with an NVMe boot disk.  trustd then
+# binds its key to a DCAP quote (l4hctl attest tdx-evidence) and, when the
+# instance has Google's Shielded VM vTPM (the default here, with
+# --shielded-vtpm), to the vTPM's quote as well: both roots of trust, one
+# key (l4h-attest.py verify takes either or both).  With --no-vtpm the
+# instance has no vTPM (--no-shielded-vtpm, and so
+# --no-shielded-integrity-monitoring, which needs it): TDX alone, whose
+# trust does not rest on the host's vTPM.
 set -euo pipefail
 confidential=
+vtpm=1
 case "${1:-}" in
     --sev) confidential=SEV; shift ;;
     --sev-snp) confidential=SEV_SNP; shift ;;
+    --tdx) confidential=TDX; shift
+        if [ "${1:-}" = --no-vtpm ]; then vtpm=0; shift; fi ;;
 esac
 disk=$1
 name=${2:-l4h-$(date +%Y%m%d-%H%M)}
@@ -31,7 +44,14 @@ features=UEFI_COMPATIBLE,GVNIC
 machine="--machine-type=n2-standard-4"
 nic=VIRTIO_NET
 image_args=
-if [ -n "$confidential" ]; then
+if [ "$confidential" = TDX ]; then
+    features+=,TDX_CAPABLE
+    machine="--machine-type=c3-standard-4 --confidential-compute-type=TDX --maintenance-policy=TERMINATE"
+    nic=GVNIC
+    # Integrity monitoring, on by default for UEFI images, needs the vTPM.
+    if [ "$vtpm" = 1 ]; then shielded=--shielded-vtpm; else shielded="--no-shielded-vtpm --no-shielded-integrity-monitoring"; fi
+    image_args=" --boot-disk-interface=NVME --no-shielded-secure-boot $shielded --no-service-account --no-scopes"
+elif [ -n "$confidential" ]; then
     features+=,${confidential}_CAPABLE
     machine="--machine-type=n2d-standard-4 --min-cpu-platform=\"AMD Milan\" --confidential-compute-type=$confidential --maintenance-policy=TERMINATE"
     nic=GVNIC

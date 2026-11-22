@@ -46,9 +46,38 @@
       nothing changes after the firmware's ExitBootServices (trustd quotes
       before it extends PCR 15).  Its events then say what the firmware
       measured.
-  l4h-attest.py event-log FILE
+      Intel TDX: EVIDENCE may also be the host's TDX evidence (l4hctl
+      attest tdx-evidence -o) or the guest driver's TPM and TDX evidence
+      together (configfs-tsm auxblob, {"v": 3, "tdx", "tpm"}); or give
+      --tdx-evidence and --tpm-evidence, which must name the same key.
+      A TDX quote is checked down to --intel-root-ca (Intel's SGX root
+      CA, pinned; required), its TD must not be a debug TD
+      (--allow-debug) nor migratable (--allow-migratable), and with
+      --collateral-dir (fetch-collateral; the root CA's CRL too) its
+      TCB status, the QE's and the TDX module's must be UpToDate
+      (--allow-tcb-status S to accept more) and the PCK certificate not
+      revoked.  The quote's REPORTDATA must bind the host key and RTMR 3
+      be zero: trustd extends it with the key at once, so it was the
+      first of this boot.  --mrtd and --rtmr N=HEX pin measurements;
+      --cc-event-log (l4hctl attest tdx-event-log -o) must replay to
+      RTMR 0-2.
+  l4h-attest.py verify-tdx-quote ANSWER [--tdx-evidence F] [--data HEX]
+                [TDX options as verify]
+      A guest's fresh TDX quote (l4hctl attest tdx-quote -o): its
+      REPORTDATA must bind the report it carries, and its RTMR 3 the host
+      key (extended once from zero); the report is then checked as verify
+      does.  With --tdx-evidence, the key must be the evidence's.
+  l4h-attest.py event-log FILE [--cc]
       The events of a UEFI TPM 2.0 event log (TCG2 crypto agile format)
-      and the SHA-256 PCR values they replay to, as JSON.
+      and the SHA-256 PCR values they replay to, as JSON; of a CC event
+      log (SHA-384, the default without SHA-256 digests), the RTMRs.
+  l4h-attest.py fetch-collateral EVIDENCE -o DIR
+      Intel's collateral for the TDX quote in EVIDENCE (TDX or combined
+      evidence, a tdx-quote answer or a raw quote), from Intel's PCS: TCB
+      info and QE identity with their signing chains, the PCK and root CA
+      CRLs, for --collateral-dir; and intel_root_ca.pem, the root PCS's chain
+      ends in, which is only what the network said: compare it with
+      Intel's published root before pinning it.
   l4h-attest.py make-credential EVIDENCE SECRET_HEX -o FILE [--ek PEM]
                 [--ek-ca PEM]
       A credential for the host's attestation key, encrypted to its EK
@@ -65,7 +94,8 @@
       EK certificate in later evidence is not bound to the AK: only the
       credential enrolled with a checked EK is.
 
-Needs the Python `cryptography` package.
+Needs the Python `cryptography` package (fetch-collateral, network access
+to api.trustedservices.intel.com).
 """
 
 import argparse
@@ -285,10 +315,13 @@ class LogReader:
 
 
 @checked("event log")
-def parse_event_log(log):
+def parse_event_log(log, zero_pad=False, cc=False):
     """The digest sizes the Spec ID event lists ({algorithm: size}) and the
     TCG_PCR_EVENT2s after it, each {"pcr", "type", "digests": {algorithm:
-    digest}, "data"}.  The whole log must be events: no bytes left over."""
+    digest}, "data"}.  The whole log must be events: no bytes left over,
+    but with `zero_pad` (a CC event log, which the ACPI CCEL table's area
+    leaves zero past its end) zero bytes after the last event.  `cc`: a CC
+    event log, whose header may name measurement register 1 (below)."""
     if not isinstance(log, bytes):
         raise Fail("event log is not bytes")
     r = LogReader(log)
@@ -296,7 +329,10 @@ def parse_event_log(log):
     # EV_NO_ACTION holding TCG_EfiSpecIDEventStruct.
     pcr, kind, _, size = r.u32(), r.u32(), r.take(20), r.u32()
     spec = LogReader(r.take(size))
-    if pcr != 0 or kind != EV_NO_ACTION or spec.take(16) != SPEC_ID:
+    # A CC event log's header is the same EV_NO_ACTION event, but EDK2's
+    # TdTcg2Dxe (GCE's TDVF) writes its MrIndex as 1 ("PCRIndex 0 maps to
+    # MrIndex 1"), others 0: neither extends anything.
+    if pcr not in ((0, 1) if cc else (0,)) or kind != EV_NO_ACTION or spec.take(16) != SPEC_ID:
         raise Fail("not a TCG2 crypto agile event log (no Spec ID Event03)")
     spec.take(4 + 4)  # platformClass, version, errata, uintnSize
     sizes = {}
@@ -312,6 +348,8 @@ def parse_event_log(log):
         raise Fail("Spec ID event has %d bytes past its end" % (len(spec.b) - spec.at))
     events = []
     while r.at < len(log):
+        if zero_pad and not any(log[r.at:]):
+            break
         at = r.at
         pcr, kind, count = r.u32(), r.u32(), r.u32()
         if count > len(sizes):
@@ -810,6 +848,805 @@ def check_report(rep, key, data, launch, deny_taint="console-in", require_seal="
     return {**{k: (v.hex() if isinstance(v, bytes) else v) for k, v in c.items()}, **flags}
 
 
+# ---- Intel TDX (DESIGN.md §10.2): the host's TDX evidence, its DCAP
+# quote (Intel TDX DCAP Quote Generation Library: v4 and v5), Intel's
+# collateral for it (PCS v4: TCB info, QE identity, CRLs), the CC event
+# log, and a guest's fresh quote over its report.
+
+TDX_KEY_DOMAIN = b"l4h-trustd-key-tdx-v1"
+TDX_REPORT_DOMAIN = b"l4h-tdx-report-v1"
+TDX_KEY_RTMR = 3
+INTEL_QE_VENDOR_ID = bytes.fromhex("939a7233f79c4ca9940a0db3957f0607")
+QUOTE_HEADER = 48
+TD10_BODY, TD15_BODY = 584, 648
+TEE_TYPE_TDX = 0x81
+ATT_KEY_ECDSA_P256 = 2
+# The certification data: the QE report's (holding the PCK certificate
+# chain's).
+CERT_QE_REPORT, CERT_PCK_CHAIN = 6, 5
+SGX_EXTENSIONS_OID = "1.2.840.113741.1.13.1"
+DEFAULT_TCB_STATUS = frozenset({"UpToDate"})
+PCS_TDX = "https://api.trustedservices.intel.com/tdx/certification/v4"
+PCS_SGX = "https://api.trustedservices.intel.com/sgx/certification/v4"
+INTEL_ROOT_CA_CRL = "https://certificates.trustedservices.intel.com/IntelSGXRootCA.der"
+# The TD quote body's fields: (name, offset, length).  TD 1.5's adds the
+# last two.
+TD_BODY_FIELDS = [
+    ("tee_tcb_svn", 0, 16), ("mrseam", 16, 48), ("mrsignerseam", 64, 48), ("seam_attributes", 112, 8),
+    ("td_attributes", 120, 8), ("xfam", 128, 8), ("mrtd", 136, 48), ("mrconfigid", 184, 48),
+    ("mrowner", 232, 48), ("mrownerconfig", 280, 48), ("rtmr0", 328, 48), ("rtmr1", 376, 48),
+    ("rtmr2", 424, 48), ("rtmr3", 472, 48), ("reportdata", 520, 64),
+    ("tee_tcb_svn2", 584, 16), ("mrservicetd", 600, 48),
+]
+
+
+def tdx_key_binding(point_bytes):
+    """What a TDX quote binds the host key to: its REPORTDATA's first 48
+    bytes, and what trustd extended RTMR 3 with."""
+    return hashlib.sha384(TDX_KEY_DOMAIN + point_bytes).digest()
+
+
+def tdx_rtmr_extended(binding):
+    """RTMR 3 after trustd extended it once, from zero, with `binding`."""
+    return hashlib.sha384(bytes(48) + binding).digest()
+
+
+def tdx_guest_report_data(report):
+    """REPORTDATA of a guest's fresh quote over its report (the COSE_Sign1's
+    bytes)."""
+    return hashlib.sha384(TDX_REPORT_DOMAIN + hashlib.sha256(report).digest()).digest() + bytes(16)
+
+
+class LeReader:
+    def __init__(self, b, what):
+        self.b, self.at, self.what = b, 0, what
+
+    def take(self, n):
+        if n > len(self.b) - self.at:
+            raise Fail("%s cut short" % self.what)
+        s = self.b[self.at:self.at + n]
+        self.at += n
+        return s
+
+    def u16(self):
+        return struct.unpack("<H", self.take(2))[0]
+
+    def u32(self):
+        return struct.unpack("<I", self.take(4))[0]
+
+
+@checked("TDX quote")
+def parse_tdx_quote(q):
+    """A TDX DCAP quote, v4 or v5, with ECDSA-P256 signatures, parsed in
+    full: every byte belongs to one of its parts."""
+    if not isinstance(q, bytes):
+        raise Fail("TDX quote is not bytes")
+    r = LeReader(q, "TDX quote")
+    header = r.take(QUOTE_HEADER)
+    version, key_type, tee_type = struct.unpack_from("<HHI", header)
+    if version not in (4, 5):
+        raise Fail("TDX quote version %d is neither 4 nor 5" % version)
+    if key_type != ATT_KEY_ECDSA_P256:
+        raise Fail("TDX quote attestation key is not ECDSA P-256")
+    if tee_type != TEE_TYPE_TDX:
+        raise Fail("not a TDX quote (TEE type %#x)" % tee_type)
+    # Bytes 8-11 are reserved in v4 and v5: the SVNs are the PCK
+    # certificate's and the QE report's (verify_tdx_quote).
+    if header[12:28] != INTEL_QE_VENDOR_ID:
+        raise Fail("TDX quote is not from Intel's QE (vendor %s)" % header[12:28].hex())
+    if version == 4:
+        size = TD10_BODY
+    else:
+        kind, size = r.u16(), r.u32()
+        if (kind, size) not in ((2, TD10_BODY), (3, TD15_BODY)):
+            raise Fail("TDX quote v5 body is neither TD 1.0's nor TD 1.5's (type %d, %d bytes)" % (kind, size))
+    body = r.take(size)
+    signed = q[:r.at]
+    sig_data = LeReader(r.take(r.u32()), "TDX quote signature data")
+    if r.at != len(q):
+        raise Fail("trailing bytes after the TDX quote")
+    sig, att_key = sig_data.take(64), sig_data.take(64)
+    if sig_data.u16() != CERT_QE_REPORT:
+        raise Fail("TDX quote certification data is not the QE report's")
+    cert = LeReader(sig_data.take(sig_data.u32()), "TDX quote QE report certification data")
+    if sig_data.at != len(sig_data.b):
+        raise Fail("trailing bytes after the TDX quote signature data")
+    qe_report, qe_report_sig = cert.take(384), cert.take(64)
+    qe_auth = cert.take(cert.u16())
+    if cert.u16() != CERT_PCK_CHAIN:
+        raise Fail("TDX quote has no PCK certificate chain")
+    chain = cert.take(cert.u32())
+    if cert.at != len(cert.b):
+        raise Fail("trailing bytes after the TDX quote certification data")
+    fields = {name: body[off:off + n] for name, off, n in TD_BODY_FIELDS if off + n <= len(body)}
+    return {"version": version, "body": body, "fields": fields,
+            "signed": signed, "sig": sig, "att_key": att_key, "qe_report": qe_report, "qe_report_sig": qe_report_sig,
+            "qe_auth": qe_auth, "pck_chain": chain}
+
+
+def p256_raw(xy):
+    """A P-256 key from its 64-byte x || y."""
+    try:
+        return ec.EllipticCurvePublicNumbers(int.from_bytes(xy[:32], "big"), int.from_bytes(xy[32:], "big"),
+                                             ec.SECP256R1()).public_key()
+    except ValueError:
+        raise Fail("invalid P-256 attestation key")
+
+
+def ecdsa_raw_ok(key, sig, data):
+    """Whether `sig` (r || s, 32 bytes each) is `key`'s ECDSA-SHA256 over
+    `data`."""
+    try:
+        key.verify(encode_dss_signature(int.from_bytes(sig[:32], "big"), int.from_bytes(sig[32:], "big")), data,
+                   ec.ECDSA(hashes.SHA256()))
+        return True
+    except InvalidSignature:
+        return False
+
+
+# ---- DER, for the PCK certificate's SGX extensions (Intel SGX PCK
+# Certificate and CRL Profile)
+
+
+def der_item(b, at=0):
+    """(tag, contents, end) of the DER item at `at`."""
+    if at + 2 > len(b):
+        raise Fail("malformed DER")
+    tag, n = b[at], b[at + 1]
+    at += 2
+    if n & 0x80:
+        k = n & 0x7F
+        if k == 0 or k > 4 or at + k > len(b):
+            raise Fail("malformed DER length")
+        n, at = int.from_bytes(b[at:at + k], "big"), at + k
+    if at + n > len(b):
+        raise Fail("malformed DER")
+    return tag, b[at:at + n], at + n
+
+
+def der_seq(b):
+    """The items of a DER SEQUENCE's contents."""
+    out, at = [], 0
+    while at < len(b):
+        tag, v, at = der_item(b, at)
+        out.append((tag, v))
+    return out
+
+
+def der_oid(v):
+    first, rest = divmod(v[0], 40) if v[0] < 80 else (2, v[0] - 80)
+    parts, n = [first, rest], 0
+    for c in v[1:]:
+        n = n << 7 | c & 0x7F
+        if not c & 0x80:
+            parts.append(n)
+            n = 0
+    return ".".join(map(str, parts))
+
+
+def der_int(v):
+    return int.from_bytes(v, "big", signed=True)
+
+
+@checked("PCK certificate SGX extensions")
+def sgx_extensions(cert):
+    """The PCK certificate's SGX extensions: FMSPC, PCE-ID, the PCK's TCB
+    (16 component SVNs, PCESVN, CPUSVN), PPID, SGX type."""
+    try:
+        ext = cert.extensions.get_extension_for_oid(x509.ObjectIdentifier(SGX_EXTENSIONS_OID)).value
+    except x509.ExtensionNotFound:
+        raise Fail("PCK certificate without SGX extensions")
+    tag, v, end = der_item(ext.value)
+    if tag != 0x30 or end != len(ext.value):
+        raise Fail("malformed SGX extensions")
+    out = {}
+    for tag, entry in der_seq(v):
+        items = der_seq(entry)
+        if tag != 0x30 or len(items) != 2 or items[0][0] != 0x06:
+            raise Fail("malformed SGX extension")
+        oid, (vtag, val) = der_oid(items[0][1]), items[1]
+        name = oid[len(SGX_EXTENSIONS_OID) + 1:] if oid.startswith(SGX_EXTENSIONS_OID + ".") else None
+        if name == "1":
+            out["ppid"] = val
+        elif name == "2":
+            comps, tcb = [None] * 16, {}
+            for t, e in der_seq(val):
+                sub = der_seq(e)
+                if t != 0x30 or len(sub) != 2 or sub[0][0] != 0x06:
+                    raise Fail("malformed SGX TCB extension")
+                sub_oid = der_oid(sub[0][1])
+                if not sub_oid.startswith(SGX_EXTENSIONS_OID + ".2.") or not sub_oid.rsplit(".", 1)[1].isdigit():
+                    raise Fail("malformed SGX TCB extension")
+                n = sub_oid.rsplit(".", 1)[1]
+                if 1 <= int(n) <= 16:
+                    comps[int(n) - 1] = der_int(sub[1][1])
+                elif n == "17":
+                    tcb["pcesvn"] = der_int(sub[1][1])
+                elif n == "18":
+                    tcb["cpusvn"] = sub[1][1]
+            if None in comps or "pcesvn" not in tcb:
+                raise Fail("SGX TCB extension incomplete")
+            out["tcb"] = {"components": comps, **tcb}
+        elif name == "3":
+            out["pceid"] = val
+        elif name == "4":
+            out["fmspc"] = val
+        elif name == "5":
+            out["sgx_type"] = der_int(val)
+    for k in ("fmspc", "pceid", "tcb"):
+        if k not in out:
+            raise Fail("PCK certificate SGX extensions lack %s" % k)
+    if len(out["fmspc"]) != 6 or len(out["pceid"]) != 2:
+        raise Fail("malformed FMSPC or PCE-ID")
+    return out
+
+
+# ---- Certificates and collateral
+
+
+def load_certs(data, what):
+    try:
+        # A quote's PEM chain may end in NULs.
+        certs = x509.load_pem_x509_certificates(data.rstrip(b"\x00"))
+    except ValueError:
+        certs = []
+    if not certs:
+        raise Fail("no certificate in %s" % what)
+    return certs
+
+
+def cert_ext(c, kind):
+    try:
+        return c.extensions.get_extension_for_class(kind).value
+    except x509.ExtensionNotFound:
+        return None
+
+
+def check_issued(cert, issuer, what, now, ca=False):
+    """That `issuer` (a CA that may sign certificates) signed `cert`, and
+    that both are valid at `now`; `ca`: `cert` is a CA's too."""
+    try:
+        cert.verify_directly_issued_by(issuer)
+    except (ValueError, TypeError, InvalidSignature):
+        raise Fail("%s not issued by %s" % (what, issuer.subject.rfc4514_string()))
+    for c, name in ((cert, what), (issuer, "the issuer of " + what)):
+        if not c.not_valid_before_utc <= now <= c.not_valid_after_utc:
+            raise Fail("%s expired or not yet valid" % name)
+    bc, ku = cert_ext(issuer, x509.BasicConstraints), cert_ext(issuer, x509.KeyUsage)
+    if bc is None or not bc.ca:
+        raise Fail("the issuer of %s is not a CA" % what)
+    if ku is not None and not ku.key_cert_sign:
+        raise Fail("the issuer of %s may not sign certificates" % what)
+    bc = cert_ext(cert, x509.BasicConstraints)
+    if ca and (bc is None or not bc.ca):
+        raise Fail("%s is not a CA" % what)
+    if not ca and bc is not None and bc.ca:
+        raise Fail("%s is a CA certificate" % what)
+
+
+def to_root(cert, roots, what, now):
+    """That `cert` (a CA's) is one of the pinned `roots`, or issued by one."""
+    for root in roots:
+        if cert == root:
+            if not root.not_valid_before_utc <= now <= root.not_valid_after_utc:
+                raise Fail("the Intel root CA expired or is not yet valid")
+            return root
+    why = None
+    for root in roots:
+        try:
+            check_issued(cert, root, what, now, ca=True)
+            return root
+        except Fail as e:
+            why = e
+    raise why or Fail("%s not issued by the pinned Intel root CA" % what)
+
+
+def load_crl(data, what):
+    try:
+        return x509.load_pem_x509_crl(data)
+    except ValueError:
+        try:
+            return x509.load_der_x509_crl(data)
+        except ValueError:
+            raise Fail("malformed CRL %s" % what)
+
+
+def check_crl(crl, issuer, certs, what, now, stale_ok):
+    """That `issuer` signed `crl`, which is current, and revokes none of
+    `certs` ((certificate, name) pairs)."""
+    if crl.issuer != issuer.subject or not crl.is_signature_valid(issuer.public_key()):
+        raise Fail("%s is not signed by %s" % (what, issuer.subject.rfc4514_string()))
+    ku = cert_ext(issuer, x509.KeyUsage)
+    if ku is not None and not ku.crl_sign:
+        raise Fail("the issuer of %s may not sign CRLs" % what)
+    if not stale_ok and (crl.next_update_utc is None or crl.next_update_utc < now or crl.last_update_utc > now):
+        raise Fail("%s is out of date" % what)
+    for c, name in certs:
+        if crl.get_revoked_certificate_by_serial_number(c.serial_number) is not None:
+            raise Fail("%s is revoked (%s)" % (name, what))
+
+
+def signed_json(text, field, what):
+    """The value of `field` in Intel's signed JSON `text` (bytes), as it is
+    written (the signature is over those bytes), its parsed value, and the
+    signature."""
+    try:
+        s = text.decode()
+        doc = json.loads(s)
+        key = '"%s"' % field
+        at = s.index(key) + len(key)
+        while s[at] in " \t\r\n:":
+            at += 1
+        value, end = json.JSONDecoder().raw_decode(s, at)
+        sig = bytes.fromhex(doc["signature"])
+    except (ValueError, KeyError, TypeError, IndexError, UnicodeDecodeError):
+        raise Fail("malformed %s" % what)
+    if not isinstance(doc, dict) or doc.get(field) != value or not isinstance(value, dict) or len(sig) != 64:
+        raise Fail("malformed %s" % what)
+    return s[at:end].encode(), value, sig
+
+
+def iso_time(t, what):
+    try:
+        d = datetime.datetime.fromisoformat(t.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        raise Fail("malformed %s" % what)
+    return d if d.tzinfo else d.replace(tzinfo=datetime.timezone.utc)
+
+
+def check_current(doc, what, now, stale_ok):
+    if stale_ok:
+        return
+    if not iso_time(doc.get("issueDate"), what + " issueDate") <= now <= iso_time(doc.get("nextUpdate"), what + " nextUpdate"):
+        raise Fail("%s is out of date (next update %s)" % (what, doc.get("nextUpdate")))
+
+
+def hex_field(doc, key, n, what):
+    v = doc.get(key)
+    try:
+        b = bytes.fromhex(v)
+    except (TypeError, ValueError):
+        raise Fail("malformed %s %s" % (what, key))
+    if len(b) != n:
+        raise Fail("malformed %s %s" % (what, key))
+    return b
+
+
+def masked(value, mask):
+    return bytes(a & b for a, b in zip(value, mask))
+
+
+@checked("TCB info")
+def tdx_tcb_status(info, fields, ext):
+    """The TCB status of the quote's platform (TCB info's tcbLevels, Intel's
+    TDX quote verification): the first level that the PCK's SGX TCB and the
+    TD's TEE_TCB_SVN reach, and with a TDX module of major version 1 or
+    later, its module identity's first level its SVN reaches."""
+    svn = fields["tee_tcb_svn"]
+    comps, pcesvn = ext["tcb"]["components"], ext["tcb"]["pcesvn"]
+    # TDX 1.0's module (TEE_TCB_SVN[1] zero) is tdxModule's; a later one,
+    # its tdxModuleIdentities entry's alone (below).
+    if svn[1] == 0:
+        mod = info.get("tdxModule")
+        if not isinstance(mod, dict):
+            raise Fail("TCB info has no tdxModule")
+        if hex_field(mod, "mrsigner", 48, "tdxModule") != fields["mrsignerseam"]:
+            raise Fail("TDX module signer (MRSIGNERSEAM) is not the one TCB info names")
+        if masked(fields["seam_attributes"], hex_field(mod, "attributesMask", 8, "tdxModule")) != hex_field(mod, "attributes", 8, "tdxModule"):
+            raise Fail("TDX module attributes are not the ones TCB info names")
+    level = None
+    for lv in info["tcbLevels"]:
+        t = lv["tcb"]
+        sgx = [c["svn"] for c in t["sgxtcbcomponents"]]
+        tdx = [c["svn"] for c in t["tdxtcbcomponents"]]
+        if len(sgx) != 16 or len(tdx) != 16 or not all(is_int(x) for x in sgx + tdx) or not is_int(t["pcesvn"]):
+            raise Fail("malformed TCB level")
+        start = 2 if svn[1] > 0 else 0
+        if all(c >= s for c, s in zip(comps, sgx)) and pcesvn >= t["pcesvn"] and all(svn[i] >= tdx[i] for i in range(start, 16)):
+            level = lv
+            break
+    if level is None:
+        raise Fail("no TCB level matches the platform (TCB status unknown: revoked or too old)")
+    module = None
+    if svn[1] > 0:
+        want = "TDX_%02X" % svn[1]
+        ident = [m for m in info.get("tdxModuleIdentities", []) if m.get("id") == want]
+        if not ident:
+            raise Fail("TCB info has no TDX module identity %s" % want)
+        m = ident[0]
+        if hex_field(m, "mrsigner", 48, want) != fields["mrsignerseam"]:
+            raise Fail("TDX module signer is not the one %s names" % want)
+        if masked(fields["seam_attributes"], hex_field(m, "attributesMask", 8, want)) != hex_field(m, "attributes", 8, want):
+            raise Fail("TDX module attributes are not the ones %s names" % want)
+        for lv in m["tcbLevels"]:
+            if is_int(lv["tcb"]["isvsvn"]) and svn[0] >= lv["tcb"]["isvsvn"]:
+                module = lv
+                break
+        if module is None:
+            raise Fail("no %s TCB level matches the TDX module's SVN %d" % (want, svn[0]))
+    return level, module
+
+
+@checked("QE identity")
+def qe_tcb_status(ident, qe_report):
+    """The QE's TCB status from QE identity, after its identity checks."""
+    misc = struct.unpack_from("<I", qe_report, 16)[0]
+    want_misc = struct.unpack("<I", hex_field(ident, "miscselect", 4, "QE identity"))[0]
+    misc_mask = struct.unpack("<I", hex_field(ident, "miscselectMask", 4, "QE identity"))[0]
+    if misc & misc_mask != want_misc:
+        raise Fail("QE MISCSELECT is not the one QE identity names")
+    if masked(qe_report[48:64], hex_field(ident, "attributesMask", 16, "QE identity")) != hex_field(ident, "attributes", 16, "QE identity"):
+        raise Fail("QE attributes are not the ones QE identity names")
+    if qe_report[128:160] != hex_field(ident, "mrsigner", 32, "QE identity"):
+        raise Fail("QE signer (MRSIGNER) is not Intel's")
+    prod, isvsvn = struct.unpack_from("<HH", qe_report, 256)
+    if not is_int(ident.get("isvprodid")) or prod != ident["isvprodid"]:
+        raise Fail("QE product ID is not the one QE identity names")
+    for lv in ident["tcbLevels"]:
+        if is_int(lv["tcb"]["isvsvn"]) and isvsvn >= lv["tcb"]["isvsvn"]:
+            return lv
+    raise Fail("no QE identity TCB level matches the QE's SVN %d" % isvsvn)
+
+
+class Collateral:
+    """Intel's collateral for TDX quotes, as files: TCB info, QE identity
+    (both signed by a TCB signing certificate the root CA issued: QE
+    identity's own chain if given, else TCB info's), the PCK CRL and the
+    root CA's CRL."""
+
+    NAMES = {"tcb_info": "tcb_info.json", "qe_identity": "qe_identity.json", "pck_crl": "pck_crl.pem",
+             "tcb_signing_chain": "tcb_signing_chain.pem", "root_ca_crl": "root_ca_crl.der",
+             "qe_identity_signing_chain": "qe_identity_signing_chain.pem"}
+    REQUIRED = ("tcb_info", "qe_identity", "tcb_signing_chain", "pck_crl", "root_ca_crl")
+
+    def __init__(self, directory=None, **paths):
+        self.files = {}
+        for key, name in self.NAMES.items():
+            path = paths.get(key) or (os.path.join(directory, name) if directory else None)
+            if path and (paths.get(key) or os.path.exists(path)):
+                try:
+                    with open(path, "rb") as f:
+                        self.files[key] = f.read()
+                except OSError as e:
+                    raise Fail("%s: %s" % (path, e.strerror))
+
+    def __bool__(self):
+        return bool(self.files)
+
+
+TCB_SIGNING_CN = "Intel SGX TCB Signing"
+
+
+def tcb_signer(chain, roots, what, now):
+    """The TCB signing certificate first in `chain`, issued by one of the
+    pinned `roots`, named and marked as one: the certificate and its root."""
+    signer = load_certs(chain, what)[0]
+    if signer in roots:
+        raise Fail("%s is a root CA" % what)
+    cn = signer.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)
+    if not cn or TCB_SIGNING_CN not in cn[0].value:
+        raise Fail("%s is not Intel's TCB signing certificate (%s)" % (what, signer.subject.rfc4514_string()))
+    ku = cert_ext(signer, x509.KeyUsage)
+    if ku is not None and not ku.digital_signature:
+        raise Fail("%s may not sign" % what)
+    why = None
+    for r in roots:
+        try:
+            check_issued(signer, r, what, now)
+            return signer, r
+        except Fail as e:
+            why = e
+    raise why or Fail("%s not issued by the pinned Intel root CA" % what)
+
+
+def merged(*lists):
+    """The items of `lists` in order, each once."""
+    out = []
+    for xs in lists:
+        for x in xs:
+            if x not in out:
+                out.append(x)
+    return out
+
+
+def check_collateral(q, ext, leaf, pck_ca, roots, col, allowed, now, stale_ok):
+    """The quote's TCB status and its QE's, against Intel's collateral."""
+    for need in Collateral.REQUIRED:
+        if need not in col.files:
+            raise Fail("collateral without %s (fetch-collateral saves it)" % Collateral.NAMES[need])
+    signer, root = tcb_signer(col.files["tcb_signing_chain"], roots, "the TCB signing certificate", now)
+    qe_signer, _ = (tcb_signer(col.files["qe_identity_signing_chain"], roots, "the QE identity signing certificate", now)
+                    if "qe_identity_signing_chain" in col.files else (signer, root))
+    revocable = [(pck_ca, "the PCK CA certificate"), (signer, "the TCB signing certificate")]
+    if qe_signer != signer:
+        revocable.append((qe_signer, "the QE identity signing certificate"))
+    check_crl(load_crl(col.files["root_ca_crl"], "root CA CRL"), root, revocable, "the root CA CRL", now, stale_ok)
+    check_crl(load_crl(col.files["pck_crl"], "PCK CRL"), pck_ca, [(leaf, "the PCK certificate")], "the PCK CRL", now, stale_ok)
+
+    raw, info, sig = signed_json(col.files["tcb_info"], "tcbInfo", "TCB info")
+    if not ecdsa_raw_ok(signer.public_key(), sig, raw):
+        raise Fail("TCB info signature does not verify")
+    if info.get("id") != "TDX" or info.get("version") != 3:
+        raise Fail("TCB info is not TDX's (version 3)")
+    check_current(info, "TCB info", now, stale_ok)
+    if hex_field(info, "fmspc", 6, "TCB info") != ext["fmspc"]:
+        raise Fail("TCB info is for FMSPC %s, the PCK certificate's is %s" % (info.get("fmspc"), ext["fmspc"].hex()))
+    if hex_field(info, "pceId", 2, "TCB info") != ext["pceid"]:
+        raise Fail("TCB info is for another PCE")
+    level, module = tdx_tcb_status(info, q["fields"], ext)
+
+    raw, ident, sig = signed_json(col.files["qe_identity"], "enclaveIdentity", "QE identity")
+    if not ecdsa_raw_ok(qe_signer.public_key(), sig, raw):
+        raise Fail("QE identity signature does not verify")
+    if ident.get("id") != "TD_QE" or ident.get("version") != 2:
+        raise Fail("QE identity is not TDX's QE's (version 2)")
+    check_current(ident, "QE identity", now, stale_ok)
+    qe = qe_tcb_status(ident, q["qe_report"])
+
+    statuses = {"tcb_status": level["tcbStatus"], "qe_tcb_status": qe["tcbStatus"]}
+    if module is not None:
+        statuses["tdx_module_tcb_status"] = module["tcbStatus"]
+    for what, status in statuses.items():
+        if status not in allowed:
+            raise Fail("%s is %s (allow it with --allow-tcb-status)" % (what.replace("_", " "), status))
+    advisories = merged(level.get("advisoryIDs", []), (module or {}).get("advisoryIDs", []), qe.get("advisoryIDs", []))
+    return {**statuses, "advisory_ids": advisories, "tcb_date": level.get("tcbDate"),
+            "tcb_evaluation_data_number": info.get("tcbEvaluationDataNumber")}
+
+
+class TdxPolicy:
+    """What a TDX quote must show: Intel's root CA (pinned), the collateral
+    for its TCB status, debug or not, and measurements."""
+
+    def __init__(self, roots, collateral=None, allowed=DEFAULT_TCB_STATUS, allow_debug=False, stale_ok=False,
+                 mrtd=None, rtmrs=None, cc_event_log=None, now=None, allow_migratable=False):
+        self.roots, self.collateral, self.allowed = roots, collateral, frozenset(allowed)
+        self.allow_debug, self.stale_ok, self.allow_migratable = allow_debug, stale_ok, allow_migratable
+        self.mrtd, self.rtmrs, self.cc_event_log = mrtd, rtmrs or {}, cc_event_log
+        self.now = now or datetime.datetime.now(datetime.timezone.utc)
+
+
+def verify_tdx_quote(q, policy):
+    """Check a TDX quote down to Intel's root CA: the attestation key's
+    signature over header and body, the QE report binding that key and
+    signed by the PCK certificate, the PCK chain, then the TD's attributes,
+    measurements and TCB status.  The parsed quote and what it says."""
+    if not policy.roots:
+        raise Fail("a TDX quote needs Intel's root CA (--intel-root-ca)")
+    p = parse_tdx_quote(q)
+    if not ecdsa_raw_ok(p256_raw(p["att_key"]), p["sig"], p["signed"]):
+        raise Fail("TDX quote signature does not verify")
+    qe = p["qe_report"]
+    if qe[320:352] != hashlib.sha256(p["att_key"] + p["qe_auth"]).digest() or qe[352:384] != bytes(32):
+        raise Fail("the QE report does not bind the quote's attestation key")
+    certs = load_certs(p["pck_chain"], "the quote's PCK certificate chain")
+    if len(certs) < 2:
+        raise Fail("the quote's PCK certificate chain lacks its CA")
+    leaf, pck_ca = certs[0], certs[1]
+    check_issued(leaf, pck_ca, "the PCK certificate", policy.now)
+    to_root(pck_ca, policy.roots, "the PCK CA certificate", policy.now)
+    if not isinstance(leaf.public_key(), ec.EllipticCurvePublicKey) or not ecdsa_raw_ok(leaf.public_key(), p["qe_report_sig"], qe):
+        raise Fail("the QE report is not signed by the PCK certificate")
+    ext = sgx_extensions(leaf)
+    f = p["fields"]
+    if f["td_attributes"][0] & 1 and not policy.allow_debug:
+        raise Fail("the TD is a debug TD (its memory is open to the host): allow it with --allow-debug")
+    # TD_ATTRIBUTES.MIGRATABLE (bit 29): a migration TD could move this TD's
+    # state elsewhere.
+    migratable = bool(f["td_attributes"][3] & 0x20)
+    if migratable and not policy.allow_migratable:
+        raise Fail("the TD is migratable: allow it with --allow-migratable")
+    if policy.mrtd is not None and f["mrtd"] != policy.mrtd:
+        raise Fail("MRTD is %s, not %s" % (f["mrtd"].hex(), policy.mrtd.hex()))
+    for i, want in policy.rtmrs.items():
+        if f["rtmr%d" % i] != want:
+            raise Fail("RTMR %d is %s, not %s" % (i, f["rtmr%d" % i].hex(), want.hex()))
+    out = {
+        "quote_version": p["version"],
+        "body": "TD15" if len(p["body"]) == TD15_BODY else "TD10",
+        "debug": bool(f["td_attributes"][0] & 1),
+        "migratable": migratable,
+        **{k: v.hex() for k, v in f.items() if k != "reportdata"},
+        "fmspc": ext["fmspc"].hex(),
+        "pceid": ext["pceid"].hex(),
+        "qe_svn": struct.unpack_from("<H", qe, 258)[0],
+        "pce_svn": ext["tcb"]["pcesvn"],
+        "pck_subject": leaf.subject.rfc4514_string(),
+    }
+    if policy.cc_event_log is not None:
+        out["cc_event_log_events"] = check_cc_event_log(policy.cc_event_log, f)
+    if policy.collateral:
+        out.update(check_collateral(p, ext, leaf, pck_ca, policy.roots, policy.collateral, policy.allowed, policy.now, policy.stale_ok))
+    else:
+        out["tcb_status"] = None
+    return p, out
+
+
+@checked("TDX evidence")
+def check_tdx_evidence(ev, policy):
+    """The host's signing key and what its TDX evidence shows about it: a
+    quote whose REPORTDATA binds the key, taken while RTMR 3 was zero (the
+    first key of this boot: trustd extends RTMR 3 with it at once)."""
+    if not isinstance(ev, dict) or ev.get("type") != "tdx":
+        raise Fail("not TDX evidence")
+    if not is_int(ev.get("v")) or ev["v"] != 1:
+        raise Fail("unknown TDX evidence version")
+    if set(ev) != {"v", "type", "key", "quote"}:
+        raise Fail("TDX evidence has unknown fields")
+    key = cose_p256(ev["key"])
+    p, out = verify_tdx_quote(ev["quote"], policy)
+    binding = tdx_key_binding(point(key))
+    if p["fields"]["reportdata"] != binding + bytes(16):
+        raise Fail("the TDX quote is not over this host key")
+    if p["fields"]["rtmr3"] != bytes(48):
+        raise Fail("RTMR 3 is not zero: not the first host key of this boot")
+    return key, {"key": hashlib.sha256(point(key)).hexdigest(), **out}
+
+
+@checked("TDX quote answer")
+def check_tdx_quote_answer(ans, policy):
+    """A guest's fresh quote (l4hctl attest tdx-quote): the host key, the
+    quote and the report it is over.  The quote's REPORTDATA must bind the
+    report, and its RTMR 3 the key (extended once from zero).  The key
+    (to check the report with) and what the quote says."""
+    if not isinstance(ans, dict) or set(ans) != {"key", "quote", "report"} or not isinstance(ans["report"], bytes):
+        raise Fail("not a TDX quote answer")
+    key = cose_p256(ans["key"])
+    p, out = verify_tdx_quote(ans["quote"], policy)
+    if p["fields"]["reportdata"] != tdx_guest_report_data(ans["report"]):
+        raise Fail("the TDX quote is not over this report")
+    if p["fields"]["rtmr3"] != tdx_rtmr_extended(tdx_key_binding(point(key))):
+        raise Fail("RTMR 3 does not hold this host key: not the first key of this boot")
+    return key, {"key": hashlib.sha256(point(key)).hexdigest(), **out}
+
+
+# ---- The CC event log (CCEL): a TCG2 crypto agile log whose digests are
+# SHA-384 and whose PCR index is the CC measurement register: 1-4 are RTMR
+# 0-3 (0, MRTD, is never extended).
+
+
+TPM_ALG_SHA384 = 0x000C
+
+
+def replay_cc_event_log(log):
+    """RTMR 0-3 as the log's events extend them from zero, and the events."""
+    sizes, events = parse_event_log(log, zero_pad=True, cc=True)
+    if sizes.get(TPM_ALG_SHA384) != 48:
+        raise Fail("the CC event log has no SHA-384 digests")
+    rtmrs = [bytes(48)] * 4
+    for n, e in enumerate(events):
+        if e["type"] == EV_NO_ACTION:
+            continue
+        if not 1 <= e["pcr"] <= 4:
+            raise Fail("CC event %d extends measurement register %d" % (n, e["pcr"]))
+        if TPM_ALG_SHA384 not in e["digests"]:
+            raise Fail("CC event %d has no SHA-384 digest" % n)
+        i = e["pcr"] - 1
+        rtmrs[i] = hashlib.sha384(rtmrs[i] + e["digests"][TPM_ALG_SHA384]).digest()
+    return rtmrs, events
+
+
+def check_cc_event_log(log, fields):
+    """That the CC event log replays to the quote's RTMR 0-2 (RTMR 3 is
+    trustd's key); the number of its events."""
+    rtmrs, events = replay_cc_event_log(log)
+    for i in range(3):
+        if rtmrs[i] != fields["rtmr%d" % i]:
+            raise Fail("CC event log does not match the quote: RTMR %d replays to %s, the quote has %s"
+                       % (i, rtmrs[i].hex(), fields["rtmr%d" % i].hex()))
+    return len(events)
+
+
+def cc_event_log_summary(log):
+    rtmrs, events = replay_cc_event_log(log)
+
+    def data(e):
+        d = e["data"]
+        return d.decode("ascii") if d and all(32 <= b < 127 for b in d) else d[:32].hex() + ("..." if len(d) > 32 else "")
+    return {
+        "algorithms": ["%#06x" % TPM_ALG_SHA384],
+        "events": [{"rtmr": e["pcr"] - 1 if e["type"] != EV_NO_ACTION else None,
+                    "type": EVENT_TYPES.get(e["type"], "%#x" % e["type"]),
+                    "sha384": e["digests"][TPM_ALG_SHA384].hex() if TPM_ALG_SHA384 in e["digests"] else None,
+                    "size": len(e["data"]), "data": data(e)} for e in events],
+        "rtmrs": {str(i): rtmrs[i].hex() for i in range(4)},
+    }
+
+
+def is_cc_event_log(log):
+    """A log with SHA-384 digests and no SHA-256 ones: a CCEL, not a TPM's."""
+    sizes, _ = parse_event_log(log, zero_pad=True, cc=True)
+    return TPM_ALG_SHA256 not in sizes and TPM_ALG_SHA384 in sizes
+
+
+# ---- Which evidence: the TPM's (v1, v2), TDX's (type "tdx"), or the
+# guest driver's both together (v3: {"v": 3, "tdx": ..., "tpm": ...}).
+
+
+@checked("evidence")
+def split_evidence(ev):
+    """(TPM evidence, TDX evidence), either None."""
+    if not isinstance(ev, dict):
+        raise Fail("evidence is not a CBOR map")
+    if ev.get("type") == "tdx":
+        return None, ev
+    if is_int(ev.get("v")) and ev["v"] == 3:
+        if set(ev) != {"v", "tdx", "tpm"}:
+            raise Fail("combined evidence is not {v, tdx, tpm}")
+        return ev["tpm"], ev["tdx"]
+    return ev, None
+
+
+def quote_of(doc):
+    """The TDX quote in TDX evidence, combined evidence or a quote answer."""
+    if isinstance(doc, dict):
+        if "quote" in doc and isinstance(doc["quote"], bytes):
+            return doc["quote"]
+        if isinstance(doc.get("tdx"), dict):
+            return quote_of(doc["tdx"])
+    raise Fail("no TDX quote in this file")
+
+
+# ---- fetch-collateral
+
+
+def pcs_get(url):
+    """(headers, body) of an HTTPS GET."""
+    import urllib.request
+    import urllib.error
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "l4h-attest"}), timeout=60) as r:
+            return {k.lower(): v for k, v in r.headers.items()}, r.read()
+    except (urllib.error.URLError, OSError) as e:
+        raise Fail("%s: %s" % (url, e))
+
+
+def issuer_chain(headers, name):
+    import urllib.parse
+    v = headers.get(name.lower())
+    if not v:
+        raise Fail("PCS answer without %s" % name)
+    return urllib.parse.unquote(v).encode()
+
+
+def fetch_collateral(quote, out, get=pcs_get, tdx_base=PCS_TDX, sgx_base=PCS_SGX, root_crl=INTEL_ROOT_CA_CRL):
+    """Save Intel's collateral for `quote` in directory `out` (Collateral's
+    names, and intel_root_ca.pem: the root of PCS's chain, which is only
+    what the network said: compare it with Intel's published root before
+    pinning it).  The files written."""
+    p = parse_tdx_quote(quote)
+    certs = load_certs(p["pck_chain"], "the quote's PCK certificate chain")
+    ext = sgx_extensions(certs[0])
+    if len(certs) < 2:
+        raise Fail("the quote's PCK certificate chain lacks its CA")
+    cn = certs[1].subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)
+    ca = "processor" if cn and "Processor" in cn[0].value else "platform"
+    os.makedirs(out, exist_ok=True)
+    files = {}
+    h, body = get("%s/tcb?fmspc=%s" % (tdx_base, ext["fmspc"].hex().upper()))
+    files["tcb_info.json"] = body
+    chain = issuer_chain(h, "TCB-Info-Issuer-Chain")
+    files["tcb_signing_chain.pem"] = chain
+    h, body = get("%s/qe/identity" % tdx_base)
+    files["qe_identity.json"] = body
+    files["qe_identity_signing_chain.pem"] = issuer_chain(h, "SGX-Enclave-Identity-Issuer-Chain")
+    h, body = get("%s/pckcrl?ca=%s&encoding=pem" % (sgx_base, ca))
+    files["pck_crl.pem"] = body
+    _, body = get(root_crl)
+    files["root_ca_crl.der"] = body
+    roots = [c for c in load_certs(chain, "the TCB info issuer chain") if c.subject == c.issuer]
+    if not roots:
+        raise Fail("the TCB info issuer chain has no root CA")
+    files["intel_root_ca.pem"] = roots[0].public_bytes(serialization.Encoding.PEM)
+    for name, data in files.items():
+        with open(os.path.join(out, name), "wb") as f:
+            f.write(data)
+    fp = hashlib.sha256(roots[0].public_bytes(serialization.Encoding.DER)).hexdigest()
+    print("l4h-attest: saved %s; intel_root_ca.pem (SHA-256 %s) is what PCS sent: check it against Intel's "
+          "published root before pinning it with --intel-root-ca" % (", ".join(sorted(files)), fp), file=sys.stderr)
+    return sorted(files)
+
+
 # ---- make-credential
 
 
@@ -889,6 +1726,69 @@ def make_credential(ek, name, secret):
     return b"\xba\xdc\xc0\xde\0\0\0\1" + struct.pack(">H", len(blob)) + blob + struct.pack(">H", len(enc_secret)) + enc_secret
 
 
+def add_tdx_options(v):
+    v.add_argument("--intel-root-ca", help="Intel's SGX root CA certificate (PEM), pinned: TDX quotes chain to it")
+    v.add_argument("--collateral-dir", help="Intel's collateral for the quote (fetch-collateral -o): TCB info, QE identity, CRLs")
+    v.add_argument("--tcb-info", help="TDX TCB info (JSON), instead of the collateral directory's")
+    v.add_argument("--qe-identity", help="TDX QE identity (JSON), instead of the collateral directory's")
+    v.add_argument("--pck-crl", help="the PCK CA's CRL (PEM or DER), instead of the collateral directory's")
+    v.add_argument("--tcb-signing-chain", help="the TCB signing certificate (PEM), instead of the collateral directory's")
+    v.add_argument("--qe-identity-signing-chain",
+                   help="QE identity's signing certificate (PEM), instead of the collateral directory's (default: TCB info's)")
+    v.add_argument("--root-ca-crl", help="the Intel root CA's CRL (DER or PEM), instead of the collateral directory's")
+    v.add_argument("--allow-tcb-status", action="append", default=[],
+                   help="also accept this TCB status (e.g. SWHardeningNeeded); repeatable or comma-separated")
+    v.add_argument("--allow-debug", action="store_true", help="accept a debug TD (its memory is open to the host)")
+    v.add_argument("--allow-migratable", action="store_true", help="accept a migratable TD (TD_ATTRIBUTES.MIGRATABLE)")
+    v.add_argument("--allow-stale-collateral", action="store_true", help="accept collateral and CRLs past their next update")
+    v.add_argument("--mrtd", help="expected MRTD (hex): the TD's initial memory, its firmware")
+    v.add_argument("--rtmr", action="append", default=[], help="N=HEX (N 0-2): expected RTMR value")
+    v.add_argument("--cc-event-log", help="the host's CC event log (l4hctl attest tdx-event-log -o): must replay to RTMR 0-2")
+
+
+def read(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError as e:
+        raise Fail("%s: %s" % (path, e.strerror))
+
+
+def tdx_policy(a):
+    roots = load_certs(read(a.intel_root_ca), a.intel_root_ca) if a.intel_root_ca else []
+    col = Collateral(a.collateral_dir, tcb_info=a.tcb_info, qe_identity=a.qe_identity, pck_crl=a.pck_crl,
+                     tcb_signing_chain=a.tcb_signing_chain, root_ca_crl=a.root_ca_crl,
+                     qe_identity_signing_chain=a.qe_identity_signing_chain)
+    allowed = set(DEFAULT_TCB_STATUS)
+    for s in a.allow_tcb_status:
+        allowed.update(x.strip() for x in s.split(",") if x.strip())
+    rtmrs = {}
+    for r in a.rtmr:
+        i, _, val = r.partition("=")
+        if i not in ("0", "1", "2"):
+            raise Fail("--rtmr: RTMR 0, 1 or 2 (RTMR 3 is the host key's)")
+        rtmrs[int(i)] = bytes.fromhex(val)
+    return TdxPolicy(roots, col, allowed, a.allow_debug, a.allow_stale_collateral,
+                     bytes.fromhex(a.mrtd) if a.mrtd else None, rtmrs,
+                     read(a.cc_event_log) if a.cc_event_log else None, allow_migratable=a.allow_migratable)
+
+
+TDX_OPTIONS = ("intel_root_ca", "collateral_dir", "tcb_info", "qe_identity", "pck_crl", "tcb_signing_chain",
+               "qe_identity_signing_chain", "root_ca_crl", "allow_tcb_status", "allow_debug", "allow_migratable",
+               "allow_stale_collateral", "mrtd", "rtmr", "cc_event_log")
+
+
+def tdx_options_given(a):
+    """Whether any TDX option was given: without TDX evidence they would be
+    checked against nothing."""
+    return any(getattr(a, o) for o in TDX_OPTIONS)
+
+
+def tdx_warnings(info):
+    if info.get("tcb_status") is None:
+        print("l4h-attest: warning: TDX TCB status not checked (--collateral-dir)", file=sys.stderr)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -900,7 +1800,9 @@ def main():
                    help="where dom0 loaded the initrd (default: 1 MiB past the kernel's end, as vmmgr does)")
     v = sub.add_parser("verify")
     v.add_argument("report")
-    v.add_argument("evidence")
+    v.add_argument("evidence", nargs="?", help="TPM, TDX or combined evidence (with --tpm-evidence or --tdx-evidence: optional)")
+    v.add_argument("--tpm-evidence", help="the host's TPM evidence (l4hctl attest evidence -o), checked with the TDX evidence")
+    v.add_argument("--tdx-evidence", help="the host's TDX evidence (l4hctl attest tdx-evidence -o), checked with the TPM evidence")
     v.add_argument("--data", help="expected report data (hex)")
     v.add_argument("--launch", help="expected launch digest (hex)")
     v.add_argument("--pcr", action="append", default=[], help="N=HEX: expected sha256 PCR value")
@@ -910,8 +1812,21 @@ def main():
                    help="require sealed host names, bit numbers or ranges (default: console-in; '' disables)")
     v.add_argument("--ek-ca", help="CA certificates (PEM, one or more) one of which issued the EK certificate")
     v.add_argument("--event-log", help="the host's UEFI TPM event log (l4hctl attest event-log -o): must replay to PCRs 0-14")
+    add_tdx_options(v)
+    tq = sub.add_parser("verify-tdx-quote")
+    tq.add_argument("answer", help="l4hctl attest tdx-quote -o: the host key, a fresh TDX quote and the report it is over")
+    tq.add_argument("--tdx-evidence", help="the host's TDX evidence: the answer's key must be its key")
+    tq.add_argument("--data", help="expected report data (hex)")
+    tq.add_argument("--launch", help="expected launch digest (hex)")
+    tq.add_argument("--deny-taint", default="console-in", help="as verify")
+    tq.add_argument("--require-seal", default="console-in", help="as verify")
+    add_tdx_options(tq)
     e = sub.add_parser("event-log")
     e.add_argument("log")
+    e.add_argument("--cc", action="store_true", help="a CC event log (SHA-384, RTMRs): the default when it has no SHA-256 digests")
+    fc = sub.add_parser("fetch-collateral")
+    fc.add_argument("evidence", help="TDX or combined evidence, a tdx-quote answer, or a raw quote")
+    fc.add_argument("-o", required=True, help="directory to save the collateral in")
     c = sub.add_parser("make-credential")
     c.add_argument("evidence")
     c.add_argument("secret", help="hex, at most 32 bytes")
@@ -928,20 +1843,75 @@ def main():
             for p in a.pcr:
                 i, _, val = p.partition("=")
                 pins[int(i)] = bytes.fromhex(val)
-            ev = cbor_decode(open(a.evidence, "rb").read())
+            tpm_ev, tdx_ev = split_evidence(cbor_decode(read(a.evidence))) if a.evidence else (None, None)
+            if a.tpm_evidence:
+                if tpm_ev is not None:
+                    raise Fail("two TPM evidences: the positional one and --tpm-evidence")
+                tpm_ev = cbor_decode(read(a.tpm_evidence))
+            if a.tdx_evidence:
+                if tdx_ev is not None:
+                    raise Fail("two TDX evidences: the positional one and --tdx-evidence")
+                tdx_ev = cbor_decode(read(a.tdx_evidence))
+            if tpm_ev is None and tdx_ev is None:
+                raise Fail("no evidence")
+            out, key, partition = {}, None, None
             ak_name = bytes.fromhex(a.ak_name) if a.ak_name else None
-            key, partition, host = check_evidence(ev, pins, ak_name, a.ek_ca)
-            if a.event_log:
-                host["event_log_events"] = check_event_log(open(a.event_log, "rb").read(), ev["pcrs"])
+            if tpm_ev is not None:
+                key, partition, host = check_evidence(tpm_ev, pins, ak_name, a.ek_ca)
+                if a.event_log:
+                    host["event_log_events"] = check_event_log(read(a.event_log), tpm_ev["pcrs"])
+                out["host"] = host
+            elif a.event_log or pins or a.ak_name or a.ek_ca:
+                raise Fail("TPM options without TPM evidence")
+            if tdx_ev is not None:
+                tdx_key, info = check_tdx_evidence(tdx_ev, tdx_policy(a))
+                # Both roots of trust must speak of the same key, and of the
+                # one machine trustd runs alone on.
+                if key is not None and point(key) != point(tdx_key):
+                    raise Fail("the TPM and TDX evidence are for different host keys")
+                if partition is not None:
+                    raise Fail("TDX evidence is a single kernel's, the TPM evidence partition %d's" % partition)
+                key = tdx_key
+                out["tdx"] = info
+            elif tdx_options_given(a):
+                # Evidence without the TDX quote the options ask about: a
+                # host that swapped TDX evidence for TPM evidence alone
+                # must not pass a TDX policy unchecked.
+                raise Fail("TDX options without TDX evidence")
             data = bytes.fromhex(a.data) if a.data is not None else None
             launch = bytes.fromhex(a.launch) if a.launch else None
-            guest = check_report(cbor_decode(open(a.report, "rb").read()), key, data, launch, a.deny_taint, a.require_seal,
-                                 partition)
-            print(json.dumps({"host": host, "guest": guest}, indent=2))
-            if ak_name is None:
+            out["guest"] = check_report(cbor_decode(read(a.report)), key, data, launch, a.deny_taint, a.require_seal, partition)
+            print(json.dumps(out, indent=2))
+            if tpm_ev is not None and ak_name is None:
                 print("l4h-attest: warning: attestation key not pinned (--ak-name)", file=sys.stderr)
+            if tdx_ev is not None:
+                tdx_warnings(out["tdx"])
+        elif a.cmd == "verify-tdx-quote":
+            policy = tdx_policy(a)
+            ans = cbor_decode(read(a.answer))
+            key, info = check_tdx_quote_answer(ans, policy)
+            if a.tdx_evidence:
+                ev_key, _ = check_tdx_evidence(cbor_decode(read(a.tdx_evidence)), policy)
+                if point(ev_key) != point(key):
+                    raise Fail("the quote answer's key is not the TDX evidence's")
+            data = bytes.fromhex(a.data) if a.data is not None else None
+            launch = bytes.fromhex(a.launch) if a.launch else None
+            guest = check_report(cbor_decode(ans["report"]), key, data, launch, a.deny_taint, a.require_seal)
+            print(json.dumps({"tdx": info, "guest": guest}, indent=2))
+            tdx_warnings(info)
         elif a.cmd == "event-log":
-            print(json.dumps(event_log_summary(open(a.log, "rb").read()), indent=2))
+            log = read(a.log)
+            if a.cc or is_cc_event_log(log):
+                print(json.dumps(cc_event_log_summary(log), indent=2))
+            else:
+                print(json.dumps(event_log_summary(log), indent=2))
+        elif a.cmd == "fetch-collateral":
+            raw = read(a.evidence)
+            try:
+                q = quote_of(cbor_decode(raw))
+            except Fail:
+                q = raw
+            fetch_collateral(q, a.o)
         else:
             ev = cbor_decode(open(a.evidence, "rb").read())
             ek = evidence_ek(ev, open(a.ek, "rb").read() if a.ek else None, a.ek_ca)
@@ -953,6 +1923,9 @@ def main():
             _, name = attestation_key(ev)
             open(a.o, "wb").write(make_credential(ek, name, secret))
     except Fail as e:
+        print("l4h-attest: %s" % e, file=sys.stderr)
+        sys.exit(1)
+    except ValueError as e:
         print("l4h-attest: %s" % e, file=sys.stderr)
         sys.exit(1)
 

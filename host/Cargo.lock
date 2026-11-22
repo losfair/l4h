@@ -482,6 +482,7 @@ dependencies = [
  "acpi",
  "l4h-abi",
  "l4h-rt",
+ "l4h-task",
  "l4h-virtio",
  "log",
  "p256",

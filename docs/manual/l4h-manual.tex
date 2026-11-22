@@ -2030,12 +2030,48 @@ from a known-good boot of the same l4h application on the same kind of
 machine. PCR~4 changes with the application and with the firmware's boot
 path; PCRs~8 and~9 change with dom0's files and \file{l4h.conf}.
 
+\paragraph{Intel TDX.} On a Google Cloud C3 Confidential VM with Intel TDX,
+booted with an \file{l4h-fl4.efi} built with FL4's TDX support
+(\cmd{tools/gce-image.sh --tdx}), the host binds the same signing key to a
+TDX quote as well, with the instance's vTPM or without one
+(\texttt{--no-vtpm}). In a guest:
+\begin{verbatim}
+l4hctl attest providers                   # tpm, tdx or tpm,tdx
+l4hctl attest tdx-evidence -o tdx-evidence
+l4hctl attest tdx-event-log -o ccel       # the TD firmware's CC event log
+l4hctl attest tdx-quote $NONCE -o fresh   # a fresh quote over a report
+\end{verbatim}
+The configfs-tsm \texttt{auxblob} is then the TDX evidence, or both
+evidences together on a VM with a vTPM. The verifier fetches Intel's
+collateral once per platform and pins Intel's SGX root CA, after comparing
+it with the one Intel publishes:
+\begin{verbatim}
+tools/l4h-attest.py fetch-collateral tdx-evidence -o collateral
+tools/l4h-attest.py verify report tdx-evidence --data $NONCE \
+    --intel-root-ca intel_root_ca.pem --collateral-dir collateral \
+    --cc-event-log ccel
+tools/l4h-attest.py verify report --tdx-evidence tdx-evidence \
+    --tpm-evidence evidence --intel-root-ca intel_root_ca.pem
+tools/l4h-attest.py verify-tdx-quote fresh --data $NONCE \
+    --intel-root-ca intel_root_ca.pem --collateral-dir collateral
+\end{verbatim}
+It checks the quote down to Intel's root CA, that the TD is neither a
+debug TD nor migratable,
+the TCB status of the platform, the TDX module and the quoting enclave
+(\texttt{UpToDate}, unless \texttt{--allow-tcb-status} accepts more), that
+the quote binds the host key, and that RTMR~3 was zero then: the host
+extends it with the key at once, so it is the first key of that boot.
+\texttt{--mrtd} and \texttt{--rtmr} pin the TD's measurements. TDX takes
+the cloud's hypervisor and vTPM out of what a report must trust for the
+TD's memory and its measurements; the TPM's PCRs still say what the
+firmware measured.
+
 \begin{caveat}
 A report is only as trustworthy as the host: seL4, the host components and
 the hardware. Without a supported IOMMU a malicious device could change any
 memory; with one, it is confined to its own memory and interrupts. On a cloud VM, the provider's hypervisor and virtual TPM are
 trusted as well. Disks and networks are dom0's choice and are not measured.
-Hosts without a TPM, and aarch64 hosts, offer no attestation.
+Hosts without a TPM or TDX, and aarch64 hosts, offer no attestation.
 \end{caveat}
 
 %======================================================================

@@ -74,6 +74,24 @@ pub struct TrustdConfig {
     /// (EVENT_LOG_TRUNCATED, EVENT_LOG_TCG_1_2).
     pub event_log_size: u64,
     pub event_log_flags: u64,
+    /// Intel TDX (FL4 on a trust domain, BootInfo TDX_INFO): 1 if trustd
+    /// has the TDX control capability (SLOT_TDX), the report frame at
+    /// TDX_REPORT_VA (SLOT_TDX_REPORT_FRAME) and the shared quote frame at
+    /// TDX_QUOTE_VA (SLOT_TDX_QUOTE_FRAME); 0 otherwise.  Never in a
+    /// multikernel machine, which FL4 does not run.
+    pub tdx_enabled: u32,
+    /// The TD's guest physical address width and TD attributes, as the
+    /// TDX module reported them (TDX_INFO).
+    pub tdx_gpaw: u32,
+    pub tdx_attributes: u64,
+    /// The bytes of the quote frame trustd hands GetQuote: the GHCI
+    /// header and the quote (TDX_QUOTE_BUF).
+    pub tdx_quote_buf_size: u64,
+    /// The firmware's CC event log (BootInfo CC_EVENT_LOG), mapped
+    /// read-only at CC_EVENT_LOG_VA: its exact length, 0 if none, and
+    /// its flags (EVENT_LOG_TRUNCATED).
+    pub cc_event_log_size: u64,
+    pub cc_event_log_flags: u64,
 }
 
 pub const TPM_VA: usize = crate::MMIO_VA;
@@ -116,6 +134,10 @@ pub struct Status {
     /// root, which unregisters a guest before it gives its id to another,
     /// gives the new guest the other page while this names the old one's.
     pub answering: AtomicU64,
+    /// Non-zero while trustd waits for something with no kick of its own
+    /// (a TDX quote the VMM is making, a request it deferred): root then
+    /// signals its kick on its timer (badge RELAY_BADGE), as for the relay.
+    pub wake: AtomicU64,
 }
 
 /// The relay between partitions' trustds (multikernel only, DESIGN.md
@@ -235,6 +257,31 @@ pub const AML_MAX: usize = 4 << 20;
 pub const EVENT_LOG_VA: usize = AML_VA + AML_MAX;
 pub const EVENT_LOG_MAX: usize = 1 << 20;
 const _: () = assert!(AML_VA + AML_MAX <= EVENT_LOG_VA && EVENT_LOG_VA + EVENT_LOG_MAX <= crate::MMIO_VA);
+/// The CC event log (CCEL, TrustdConfig::cc_event_log_size), which trustd
+/// gives guests as it is (abi::ATTEST_TDX_EVENT_LOG), right after the TPM
+/// event log.  At most CC_EVENT_LOG_MAX bytes.
+pub const CC_EVENT_LOG_VA: usize = EVENT_LOG_VA + EVENT_LOG_MAX;
+pub const CC_EVENT_LOG_MAX: usize = 1 << 20;
+/// TDX: the private page TDG.MR.REPORT writes the TDREPORT into
+/// (SLOT_TDX_REPORT_FRAME), read-only in trustd.
+pub const TDX_REPORT_VA: usize = CC_EVENT_LOG_VA + CC_EVENT_LOG_MAX;
+/// TDX: the 2 MiB frame shared with the VMM (SLOT_TDX_QUOTE_FRAME), for
+/// TDG.VP.VMCALL<GetQuote>: its first TDX_QUOTE_BUF bytes are the GHCI
+/// header (TdxQuoteHeader) and the TDREPORT, then the quote.  The VMM may
+/// write it at any time: trustd copies it once before it parses anything.
+pub const TDX_QUOTE_VA: usize = TDX_REPORT_VA + (2 << 20);
+pub const TDX_QUOTE_FRAME: usize = 2 << 20;
+pub const TDX_QUOTE_BUF: usize = 16384;
+const _: () = assert!(EVENT_LOG_VA + EVENT_LOG_MAX <= CC_EVENT_LOG_VA && CC_EVENT_LOG_VA + CC_EVENT_LOG_MAX <= TDX_REPORT_VA);
+const _: () = assert!(TDX_REPORT_VA + 4096 <= TDX_QUOTE_VA && TDX_QUOTE_VA % TDX_QUOTE_FRAME == 0);
+const _: () = assert!(TDX_QUOTE_VA + TDX_QUOTE_FRAME <= crate::MMIO_VA && TDX_QUOTE_BUF <= TDX_QUOTE_FRAME && TDX_QUOTE_BUF % 4096 == 0);
+/// TDX: the TdxControl capability, root's seL4_CapSMC on a TD, moved here.
+pub const SLOT_TDX: u64 = SLOT_FLAGS_CALL + 1;
+/// TDX: the report frame (TDX_REPORT_VA) and the quote frame (TDX_QUOTE_VA),
+/// unmapped copies for the kernel's TdxControl calls.
+pub const SLOT_TDX_REPORT_FRAME: u64 = SLOT_TDX + 1;
+pub const SLOT_TDX_QUOTE_FRAME: u64 = SLOT_TDX + 2;
+
 /// TrustdConfig::event_log_flags (seL4_TpmEventLog's): events are missing
 /// at the end of the log; the log is TCG 1.2 (SHA-1), not crypto agile.
 pub const EVENT_LOG_TRUNCATED: u64 = 1 << 0;

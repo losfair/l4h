@@ -4645,6 +4645,54 @@ runs the secondary's ActivateCredential calls (the relay):
 - **CRB with Pluton**, start method 13: the start and reply doorbells named
   in the TPM2 table, rung after each request. Untested: QEMU has no Pluton.
 
+**Intel TDX.** On FL4 in an Intel TDX trust domain (BootInfo `TDX_INFO`,
+14: GPAW, attributes, TD_CTLS, vCPUs), trustd binds the same key K to the
+TD, beside the TPM or without one; FL4 runs one kernel, so never in a
+multikernel machine. Root moves the kernel's `TdxControl` capability
+(its `seL4_CapSMC` slot) to trustd and gives it a private page for
+TDREPORTs (`trust::TDX_REPORT_VA`), a 2 MiB frame shared with the VMM for
+GetQuote (`trust::TDX_QUOTE_VA`) and the firmware's CC event log
+(`CC_EVENT_LOG`, 13, as `TPM_EVENT_LOG`, at `trust::CC_EVENT_LOG_VA`).
+K's seed is the CPU's (RDSEED, else RDRAND: neither exits to the VMM),
+hashed with the TPM's random bytes when there is a TPM. trustd then:
+
+- asks for a TDREPORT (TDG.MR.REPORT) with REPORTDATA
+  `SHA-384("l4h-trustd-key-tdx-v1" ‖ K) ‖ 0^16` and requires its RTMR 3
+  (offset 864) zero;
+- extends RTMR 3 with that hash (TDG.MR.RTMR.EXTEND), so that no other key
+  gets a quote with RTMR 3 zero;
+- has the VMM quote the TDREPORT (GHCI TDG.VP.VMCALL<GetQuote>), without
+  waiting: it looks at the shared frame whenever it wakes, and root kicks
+  it on its timer meanwhile (`trust::Status::wake`). Once the VMM is done
+  it copies the frame once and parses only the copy, and requires the
+  quote (DCAP v4, or v5 with a TD 1.0 or 1.5 body) to carry, field by
+  field, the TDREPORT it sent.
+
+Reports are the same COSE_Sign1 under K. `L4H_ATTEST_TDX_EVIDENCE` gives
+`{"v": 1, "key", "type": "tdx", "quote"}`, `L4H_ATTEST_TDX_EVENT_LOG` the CC
+event log, and `L4H_ATTEST_TDX_QUOTE` a fresh quote over a guest's report
+(`{"key", "quote", "report"}`, REPORTDATA `SHA-384("l4h-tdx-report-v1" ‖
+SHA-256(report)) ‖ 0^16`; its RTMR 3 shows K), rate limited as
+ActivateCredential and one at a time, guests taking turns: another
+guest's waits, its other requests do not. The page's state says which quotes reports are bound to
+(`L4H_ATTEST_HAS_TPM`, `L4H_ATTEST_HAS_TDX`); `L4H_ATTEST_NO_REPORTS` only
+when neither. The guest driver's configfs-tsm `auxblob` is the TPM
+evidence as before, the TDX evidence on a TD without a TPM, or both as
+`{"v": 3, "tdx", "tpm"}`; `/sys/kernel/l4h/attest/providers` and
+`tdx_event_log` show the rest. `l4h-attest.py verify` takes any of them
+(and `--tdx-evidence` with `--tpm-evidence`, which must name the same K):
+the quote's ECDSA signature, the QE report binding its attestation key and
+signed by the PCK certificate, the PCK chain to the pinned
+`--intel-root-ca`, no debug or migratable TD, and with Intel's collateral
+(`fetch-collateral`, `--collateral-dir`: TCB info and QE identity under
+the TCB signing certificate, the PCK and root CRLs) the TCB status of the
+platform, the TDX module and the QE; then K's binding with RTMR 3 zero,
+`--mrtd`/`--rtmr` pins, and `--cc-event-log` replayed (SHA-384; register
+index 1–4 is RTMR 0–3) to RTMR 0–2. `verify-tdx-quote` checks a fresh
+quote. The VMM and the cloud's TPM are then outside the TCB for what TDX
+covers: memory and the TD's measurements; the quote says nothing of what
+the TPM's PCRs measure, and a verifier that needs both checks both.
+
 **Trust.** A report is worth what the host TCB is worth: seL4, root, vmmgr,
 memd, trustd, blkd, netd and the guest's VMM (§3), all identified by PCR 4.
 dom0 decides what runs but cannot forge a report, because vmmgr computes the
@@ -5882,7 +5930,7 @@ tools/build-fl4.sh
 SEL4_PREFIX="$PWD/build/sel4-fl4" L4H_KERNEL_VARIANT=fl4 tests/run-selftest.sh 4
 ```
 
-The tested FL4 revision is `dc7d1ad8ccc6ca00671c1a0d38d4475b7f13f216`.
+The tested FL4 revision is `b47224c290c4b8ce87abc13dcb6d0c65b4d4951b`.
 `prepare-fl4.sh` clones the pinned public revision, or the frozen override,
 into `build/FL4-src` without applying any kernel patches. The source
 worktree is not edited.
