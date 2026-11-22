@@ -222,7 +222,7 @@ static struct l4h_as kernel_as;
  * there just before the erase, and a kernel access to an unmapped page
  * faults the guest for good.
  */
-static void as_queue(struct l4h_as *as, unsigned long op, unsigned long va, unsigned long a,
+static void as_queue(struct l4h_as *as, int op, unsigned long va, unsigned long a,
 		     unsigned long b, int prot);
 
 static void as_delete_erased(struct l4h_as *as, void *e)
@@ -347,7 +347,7 @@ static void as_reserve(struct l4h_as *as, int k)
 }
 
 /* Queue an op; the caller made room (as_reserve). */
-static void as_queue(struct l4h_as *as, unsigned long op, unsigned long va, unsigned long a,
+static void as_queue(struct l4h_as *as, int op, unsigned long va, unsigned long a,
 		     unsigned long b, int prot)
 {
 	if (WARN_ON_ONCE(as->nbatch == L4H_FRAME_BATCH_MAX))

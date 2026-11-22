@@ -193,7 +193,7 @@ int l4h_frame_batch(const struct l4h_frame_op *ops, int n, unsigned long vspace,
 
 	*err = 0;
 	while (done < n) {
-		unsigned long op = ops[done].op;
+		int op = ops[done].op;
 		int prot = ops[done].prot;
 		int words = op == L4H_FRAME_COPY_MAP ? 3 : op == L4H_FRAME_REMAP ? 2 : 1;
 		int k = 0, i;
@@ -214,7 +214,7 @@ int l4h_frame_batch(const struct l4h_frame_op *ops, int n, unsigned long vspace,
 			if (prot & L4H_PROT_DEFER_FLUSH)
 				attr |= seL4_X86_DeferFlush;
 		}
-		hdr = op | (unsigned long)k << FB_COUNT_SHIFT | 64ul << FB_DEPTH_SHIFT |
+		hdr = (unsigned long)op | (unsigned long)k << FB_COUNT_SHIFT | 64ul << FB_DEPTH_SHIFT |
 		      r << FB_MAP_RIGHTS_SHIFT | 15ul << FB_CAP_RIGHTS_SHIFT | attr << FB_ATTR_SHIFT |
 		      (op == L4H_FRAME_DELETE ? FB_DEFER_DELETE_FLUSH : 0);
 		seL4_SetMR(0, hdr);
