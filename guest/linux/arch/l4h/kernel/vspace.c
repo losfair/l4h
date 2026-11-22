@@ -279,8 +279,9 @@ static void as_run_op(struct l4h_as *as, struct l4h_frame_op *op)
 	}
 }
 
-/* Run the queued ops: one kernel entry for all, then on their own those
- * after one that failed (the kernel undoes a failed copy-and-map). */
+/* Run the queued ops: in as few kernel entries as runs of one kind allow
+ * (l4h_frame_batch), then on their own those after one that failed (the
+ * kernel undoes a failed copy-and-map). */
 static void as_flush_batch(struct l4h_as *as)
 {
 	int n = as->nbatch, done, err = 0, i;
