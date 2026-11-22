@@ -14,6 +14,44 @@ echo "GCETEST: dom0 up, Linux $(uname -r)"
 l4hctl info; l4hctl disks; l4hctl nics
 cores=$(l4hctl info | sed -n 's/^cores: *//p')
 
+# Attestation, before any console input (the reports' console-in taint
+# stays clear; nothing is sealed, so that the shell at the end takes
+# input: verify with --require-seal ''): each blob in hex on a line of its
+# own, "GCETEST: blob NAME HEX", for tools/l4h-attest.py.  The nonce is
+# the instance's id when the metadata server answers later, else zeros.
+if [ -e /dev/l4h-attest ]; then
+    step attestation
+    blob() {  # blob <name> <l4hctl attest args...>
+        name=$1; shift
+        if out=$(l4hctl attest "$@" 2>/tmp/err); then
+            echo "GCETEST: blob $name $out"
+            pass "attest $name: $(( ${#out} / 2 )) bytes"
+        else
+            echo "GCETEST: attest $name: $(cat /tmp/err)"
+            return 1
+        fi
+    }
+    nonce=$(printf '%0128d' 0)
+    # Each asked for whatever the host has: a TDX quote still on its way
+    # is waited for, a missing provider says so.
+    blob report report "$nonce"
+    blob evidence evidence
+    blob event-log event-log
+    blob tdx-evidence tdx-evidence && pass "TDX evidence"
+    blob tdx-event-log tdx-event-log
+    blob tdx-quote tdx-quote "$nonce"
+    echo "GCETEST: attest providers $(l4hctl attest providers 2>&1)"
+    # configfs-tsm: the report again, and the evidence (both providers
+    # together as {"v": 3, ...}).
+    mount -t configfs none /sys/kernel/config 2>/dev/null
+    r=/sys/kernel/config/tsm/report/g0
+    if mkdir $r 2>/dev/null; then
+        head -c 64 /dev/zero > $r/inblob
+        echo "GCETEST: blob tsm-auxblob $(od -An -v -tx1 $r/auxblob | tr -d ' \n')"
+        rmdir $r
+    fi
+fi
+
 step network
 ip link set lo up; ip link set eth0 up
 if udhcpc -i eth0 -n -q -t 10 -s /bin/udhcpc.script >/dev/null 2>&1; then
@@ -89,4 +127,6 @@ l4hctl info | sed 's/^/GCETEST: after destroy: /'
 
 echo "GCETEST: done, $ok ok, $bad failed"
 [ "$bad" = 0 ] && echo "GCETEST: PASS" || echo "GCETEST: FAIL"
-exec sleep 1000000
+# A shell on the console (the serial port), for a person to look further
+# (gcloud compute connect-to-serial-port).
+exec setsid cttyhack sh
