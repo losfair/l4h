@@ -74,6 +74,28 @@ static int find_blk(void)
 	return -1;
 }
 
+/* L4H_BOOT_TOPOLOGY: each vCPU's virtual core is below nr_vcpus; each
+ * event page holds the host's capacity hint (128..1024). */
+static int check_topology(void)
+{
+	const struct l4h_bootinfo *bi = l4h_bootinfo;
+	unsigned long v;
+
+	if (!(bi->flags & L4H_BOOT_TOPOLOGY)) {
+		pr_err("ABITEST: FAIL no L4H_BOOT_TOPOLOGY\n");
+		return -EIO;
+	}
+	for (v = 0; v < bi->nr_vcpus; v++) {
+		unsigned long long cap = READ_ONCE(l4h_vcpus[v].evt->host_cap);
+
+		if (bi->vcpu_core[v] >= bi->nr_vcpus || cap < 128 || cap > 1024) {
+			pr_err("ABITEST: FAIL vCPU %lu core %u host_cap %llu\n", v, bi->vcpu_core[v], cap);
+			return -EIO;
+		}
+	}
+	return 0;
+}
+
 static int __init abitest_init(void)
 {
 	struct abitest t = { .blk = find_blk() };
@@ -107,7 +129,7 @@ static int __init abitest_init(void)
 	/* The tests' user thread takes this vCPU's user scheduling context. */
 	if (l4h_vcpus[t.cpu].sc_owner)
 		l4h_user_deschedule(l4h_vcpus[t.cpu].sc_owner);
-	err = abitest_run(&t) ? -EIO : 0;
+	err = check_topology() ?: (abitest_run(&t) ? -EIO : 0);
 	/* The E3 test took the vCPU's timer. */
 	if (l4h_vcpus[t.cpu].timer_deadline)
 		l4h_timer_arm(l4h_vcpus[t.cpu].timer_deadline);

@@ -1,6 +1,8 @@
 #!/bin/sh
 # Init of guests created by tests/guest/init-density: optionally burn CPU
 # (HOG=n background loops), answer every console line with a pong.
+# "topo" prints the SMT siblings of CPUs 0 and 1; "smt" whether two
+# loops started together run on different cores.
 mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
@@ -16,6 +18,23 @@ echo "DENSVM: ready hog=${HOG:-0}"
 while read line; do
     case "$line" in
     stat) echo "DENSVM: stat $(head -1 /proc/stat)" ;;
+    topo)
+        t=/sys/devices/system/cpu
+        echo "DENSVM: topo $(cat $t/cpu0/topology/thread_siblings_list) $(cat $t/cpu1/topology/thread_siblings_list)"
+        ;;
+    smt)
+        (while :; do :; done) &
+        p1=$!
+        (while :; do :; done) &
+        p2=$!
+        sleep 3
+        c1=$(cut -d' ' -f39 /proc/$p1/stat)
+        c2=$(cut -d' ' -f39 /proc/$p2/stat)
+        kill $p1 $p2
+        k1=$(cat /sys/devices/system/cpu/cpu$c1/topology/core_id)
+        k2=$(cat /sys/devices/system/cpu/cpu$c2/topology/core_id)
+        if [ "$k1" != "$k2" ]; then echo "DENSVM: smt spread"; else echo "DENSVM: smt stacked on CPUs $c1 $c2"; fi
+        ;;
     *) echo "DENSVM: pong $line" ;;
     esac
 done

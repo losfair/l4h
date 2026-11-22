@@ -1,5 +1,6 @@
 //! Host CPU scheduling (DESIGN.md §7): per-guest CPU caps and a balancer
-//! that spreads busy vCPUs across physical cores before SMT siblings.
+//! that spreads busy vCPUs across physical cores before SMT siblings,
+//! keeping each guest's virtual cores whole (policy.rs).
 //!
 //! seL4 does not balance; every vCPU's two scheduling contexts (SC_K, SC_U)
 //! live on one core until `SchedControl_Configure` on another core's
@@ -158,6 +159,20 @@ pub fn prepare_vmm(h: &mut Vmmgr, g: &mut Guest) -> Option<budget::Plan> {
     Some(p)
 }
 
+/// CPUs and vCores for a new guest's `n` vCPUs (policy::place). Every
+/// vCPU of the guests not stopped weighs one, each VMM two.
+pub fn place(h: &Vmmgr, n: usize, stagger: usize) -> ArrayVec<(usize, usize), { l4h_abi::MAX_VCPUS }> {
+    let mut load = [0; topology::MAX_CPUS];
+    for g in h.guests.iter().flatten().filter(|g| g.state != State::Stopped) {
+        for v in &g.vcpus { load[v.core] += 1; }
+        if let Some((core, _)) = g.vmm_limits { load[core] += 2; }
+    }
+    let mut out = [(0, 0); l4h_abi::MAX_VCPUS];
+    let out = &mut out[..n.min(l4h_abi::MAX_VCPUS)];
+    policy::place(&h.info.topology, &load, stagger, out);
+    out.iter().copied().collect()
+}
+
 /// The CPUs of some vCPUs, printed as a list.
 pub struct Cores<'a>(pub &'a [Vcpu]);
 
@@ -190,6 +205,8 @@ pub fn set_cap(h: &mut Vmmgr, gid: usize, cap_pct: u32) -> Result<(), Errno> {
 
 const _: () = assert!(crate::MAX_GUESTS <= policy::MAX_GUESTS);
 const _: () = assert!(crate::MAX_GUESTS <= u64::BITS as usize);
+// policy::swap_moves keeps a guest's moved vCPUs in a word.
+const _: () = assert!(l4h_abi::MAX_VCPUS <= u64::BITS as usize);
 const _: () = assert!(sel4::sel4_cfg_usize!(MAX_NUM_NODES) <= topology::MAX_CPUS);
 
 /// The balancer's samples, one per vCPU: too large for root's stack
@@ -198,7 +215,8 @@ const _: () = assert!(sel4::sel4_cfg_usize!(MAX_NUM_NODES) <= topology::MAX_CPUS
 static SAMPLES: Scratch<ArrayVec<policy::Sample, { crate::MAX_GUESTS * l4h_abi::MAX_VCPUS }>> = Scratch::new(ArrayVec::new());
 
 /// One balancer step: sample consumption over the `elapsed_us` since the
-/// last step, move at most one vCPU.
+/// last step, move at most one vCPU or vCore, then tell each vCPU what
+/// capacity other guests leave it.
 ///
 /// A vCPU is *busy* if it used at least half of its fair share of its
 /// logical CPU (among the vCPUs active there). Balance their number per
@@ -278,10 +296,18 @@ pub fn balance(h: &mut Vmmgr, elapsed_us: u64) {
                 }
                 // Guests are below MAX_GUESTS and have at most MAX_VCPUS
                 // vCPUs, so the samples fit.
-                let _ = sample.push(policy::Sample { guest: g.id, vcpu: v, cpu: vcpu.core, used: c, movable: vcpu.cooldown == 0 });
+                let _ = sample.push(policy::Sample { guest: g.id, vcpu: v, vcore: vcpu.vcore, cpu: vcpu.core, used: c,
+                    movable: vcpu.cooldown == 0 });
             }
         }
-        if cores < 2 { None } else { policy::choose(&h.info.topology, sample, elapsed_us) }
+        let action = if cores < 2 { None } else { policy::choose(&h.info.topology, sample, elapsed_us) }?;
+        let mut moves = ArrayVec::<(usize, usize), { l4h_abi::MAX_VCPUS }>::new();
+        match action {
+            policy::Action::IntraCore { vcpu, dst, .. } => moves.must_push((vcpu, dst)),
+            policy::Action::VcoreSwap { guest, ps, pd } =>
+                policy::swap_moves(&h.info.topology, sample, elapsed_us, guest, ps, pd, |v, dst| { let _ = moves.push((v, dst)); }),
+        }
+        Some((action, moves))
     });
     let occupied = occupied(h, None);
     let mut guarded_vmms = [0usize; topology::MAX_CPUS];
@@ -321,29 +347,80 @@ pub fn balance(h: &mut Vmmgr, elapsed_us: u64) {
             g.id, if boosted { l4h_host::PRIO_VMM } else { l4h_host::PRIO_VMM_FAIR }, core, vmm_used[g.id], core_vmm[core]);
     }
     protect(h, None);
-    let Some(policy::Migration { guest: gid, vcpu: v, src, dst }) = migration else { return };
+    if let Some((action, moves)) = migration {
+        migrate(h, action, &moves);
+    }
+    publish_capacity(h, elapsed_us, &vmm_used);
+}
+
+/// Apply the balancer's choice: `moves` are its `(vCPU, CPU)` pairs.
+fn migrate(h: &mut Vmmgr, action: policy::Action, moves: &[(usize, usize)]) {
+    let (gid, cores) = match action {
+        policy::Action::IntraCore { guest, dst, .. } => (guest, 1u64 << dst),
+        policy::Action::VcoreSwap { guest, ps, pd } => (guest, (0..h.info.cores)
+            .filter(|&c| [ps, pd].contains(&h.info.topology.core(c))).fold(0, |m, c| m | 1u64 << c)),
+    };
     if !h.guest(gid).is_some_and(|g| g.state == State::Running) { return; }
     // Keep source protection until the move commits, and protect the
-    // destination before its first runnable guest arrives.
-    protect(h, Some(Arrival { guest: gid, cores: 1u64 << dst }));
+    // destinations before their first runnable guest arrives.
+    protect(h, Some(Arrival { guest: gid, cores }));
     let Some(g) = h.guest(gid) else { return };
     if g.state != State::Running { return; }
-    let limits = if v == 0 && active(g) { g.vmm_limits.expect("VMM limits").1 } else { plan(&h.info, g, v, false, 0) };
-    if pair(&h.info, gid, v, &g.vcpus[v], dst, limits) {
+    for &(v, dst) in moves {
+        let g = h.guests[gid].as_ref().unwrap();
+        let limits = if v == 0 && active(g) { g.vmm_limits.expect("VMM limits").1 } else { plan(&h.info, g, v, false, 0) };
+        if !pair(&h.info, gid, v, &g.vcpus[v], dst, limits) {
+            h.guests[gid].as_mut().unwrap().stop();
+            protect(h, None);
+            return;
+        }
+        let src = g.vcpus[v].core;
         info!(
             "l4h-vmmgr: balancer: guest {} vCPU {}: core {} -> {} (physical {} -> {})",
             gid, v, src, dst, h.info.topology.core(src), h.info.topology.core(dst)
         );
-        let g = h.guests[gid].as_mut().unwrap();
-        let vcpu = &mut g.vcpus[v];
+        let vcpu = &mut h.guests[gid].as_mut().unwrap().vcpus[v];
         vcpu.core = dst;
         vcpu.cooldown = COOLDOWN;
-        // The vCPU has left `src`: unmaps in the guest's VSpaces need not
-        // interrupt that core any longer, unless another of its vCPUs is
-        // there.
-        g.flush_tlb_bitmaps();
-    } else {
-        h.guests[gid].as_mut().unwrap().stop();
     }
+    // The vCPUs have left their sources: unmaps in the guest's VSpaces need
+    // not interrupt those cores any longer, unless another vCPU is there.
+    h.guests[gid].as_mut().unwrap().flush_tlb_bitmaps();
     protect(h, None);
+}
+
+/// Publish to each vCPU of a running guest the capacity other guests left
+/// it over the last period (policy::capacity, abi::EventPage::host_cap);
+/// the guest takes the rest as lost capacity of that CPU.
+fn publish_capacity(h: &mut Vmmgr, elapsed_us: u64, vmm_used: &[u64; crate::MAX_GUESTS]) {
+    let topology = &h.info.topology;
+    let mut total_cpu = [0u64; topology::MAX_CPUS];
+    let mut total_phys = [0u64; topology::MAX_CPUS];
+    SAMPLES.with(|sample| {
+        for s in sample.iter() { total_cpu[s.cpu] += s.used; }
+    });
+    for g in h.guests.iter().flatten().filter(|g| active(g)) {
+        total_cpu[g.vmm_limits.expect("VMM limits").0] += vmm_used[g.id];
+    }
+    for (c, &t) in total_cpu.iter().enumerate().take(h.info.cores) { total_phys[topology.core(c)] += t; }
+    for g in h.guests.iter_mut().flatten().filter(|g| g.state == State::Running) {
+        let mut own_cpu = [0u64; topology::MAX_CPUS];
+        let mut own_phys = [0u64; topology::MAX_CPUS];
+        SAMPLES.with(|sample| {
+            for s in sample.iter().filter(|s| s.guest == g.id) { own_cpu[s.cpu] += s.used; }
+        });
+        if active(g) { own_cpu[g.vmm_limits.expect("VMM limits").0] += vmm_used[g.id]; }
+        for (c, &t) in own_cpu.iter().enumerate().take(h.info.cores) { own_phys[topology.core(c)] += t; }
+        for v in 0..g.vcpus.len() {
+            let (c, p) = (g.vcpus[v].core, topology.core(g.vcpus[v].core));
+            let same = total_cpu[c].saturating_sub(own_cpu[c]);
+            let sibling = total_phys[p].saturating_sub(own_phys[p]).saturating_sub(same);
+            let cap = policy::capacity(g.vcpus[v].host_cap, same, sibling, elapsed_us);
+            if cap != g.vcpus[v].host_cap {
+                g.vcpus[v].host_cap = cap;
+                let page = g.event_page(v);
+                unsafe { core::ptr::addr_of_mut!((*page).host_cap).write_volatile(cap as u64) };
+            }
+        }
+    }
 }

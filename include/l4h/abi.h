@@ -262,7 +262,10 @@ struct l4h_event_page {
 	                        * idle or waiting for a spinlock, in
 	                        * time-counter ticks, cumulative (the host
 	                        * derives steal_ns from it) */
-	l4h_u64 reserved[6];
+	l4h_u64 host_cap;      /* written by the host: capacity left to this
+	                        * vCPU by other guests on its CPU and its SMT
+	                        * siblings, 128..=1024; 0: unknown (1024) */
+	l4h_u64 reserved[5];
 	struct l4h_console_out console;
 };
 
@@ -361,12 +364,16 @@ struct l4h_bootinfo {
 	/* aarch64 hardware virtualization (FL4 at EL2); all zero on x86_64
 	 * or without it. */
 	struct l4h_arm_virt_info arm_virt;
+	/* L4H_BOOT_TOPOLOGY: each vCPU's virtual core, 0..K.  vCPUs with the
+	 * same core are SMT siblings and stay on one host physical core. */
+	l4h_u8 vcpu_core[L4H_MAX_VCPUS];
 };
 
 _Static_assert(sizeof(struct l4h_arm_virt_info) == 96, "l4h_arm_virt_info layout");
 _Static_assert(sizeof(struct l4h_bootinfo) <= L4H_BOOTINFO_SIZE, "l4h_bootinfo fits its page");
 
 #define L4H_BOOT_DOM0           (1ull << 0)
+#define L4H_BOOT_TOPOLOGY       (1ull << 1)  /* vcpu_core is valid */
 
 /* ------------------------------------------------------------------------
  * virtio-l4h: the shared device page of an L4H_DEV_VIRTIO device.

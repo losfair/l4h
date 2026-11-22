@@ -6,10 +6,14 @@
  * all but vCPU 0 start inactive and are started here by writing their
  * registers.  IPIs are notifications: the reasons are kept in the target's
  * struct l4h_vcpu (see os-sel4/events.c).
+ *
+ * The vCPUs of one virtual core (l4h_bootinfo->vcpu_core) are SMT
+ * siblings: the host keeps them on one physical core (DESIGN.md §7.3).
  */
 
 #include <linux/cpu.h>
 #include <linux/delay.h>
+#include <linux/export.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
 #include <linux/irq_work.h>
@@ -17,6 +21,7 @@
 #include <linux/sched/mm.h>
 #include <linux/sched/task.h>
 #include <linux/sched/task_stack.h>
+#include <linux/sched/topology.h>
 #include <linux/smp.h>
 #include <linux/mm.h>
 #include <asm/current.h>
@@ -32,6 +37,41 @@
 #define IPI_IRQ_WORK		(1ul << 3)
 
 void l4h_timer_setup_cpu(void);
+
+unsigned int l4h_core_id[NR_CPUS];
+struct cpumask l4h_sibling_map[NR_CPUS];
+EXPORT_SYMBOL_GPL(l4h_core_id);
+EXPORT_SYMBOL_GPL(l4h_sibling_map);
+
+/* Before the scheduler sees @cpu online: join its online siblings, as
+ * x86 does at AP startup.  Without the host's topology, each vCPU is a
+ * core of its own. */
+static void l4h_topology_online(unsigned int cpu)
+{
+	const struct l4h_bootinfo *bi = l4h_bootinfo;
+	unsigned int other;
+
+	l4h_core_id[cpu] = bi->flags & L4H_BOOT_TOPOLOGY ? bi->vcpu_core[cpu] : cpu;
+	cpumask_set_cpu(cpu, &l4h_sibling_map[cpu]);
+	for_each_online_cpu(other) {
+		if (other == cpu || l4h_core_id[other] != l4h_core_id[cpu])
+			continue;
+		cpumask_set_cpu(cpu, &l4h_sibling_map[other]);
+		cpumask_set_cpu(other, &l4h_sibling_map[cpu]);
+	}
+}
+
+/* Other guests' use of this vCPU's CPU and SMT siblings, which the host
+ * publishes as the capacity left (0 from an older host: all of it). */
+unsigned long l4h_hw_pressure(int cpu)
+{
+	unsigned long cap = READ_ONCE(l4h_vcpus[cpu].evt->host_cap);
+
+	if (!cap)
+		return 0;
+	return SCHED_CAPACITY_SCALE - clamp(cap, 128UL, SCHED_CAPACITY_SCALE);
+}
+EXPORT_SYMBOL_GPL(l4h_hw_pressure);
 
 void arch_smp_send_reschedule(int cpu)
 {
@@ -138,6 +178,7 @@ void __init smp_prepare_cpus(unsigned int max_cpus)
 
 void __init smp_prepare_boot_cpu(void)
 {
+	l4h_topology_online(smp_processor_id());
 	set_cpu_online(smp_processor_id(), true);
 #ifdef CONFIG_PARAVIRT_SPINLOCKS
 	/* The table of blocked lock waiters comes from memblock, so it is
@@ -154,6 +195,7 @@ static void l4h_secondary_main(int cpu)
 	mmgrab(&init_mm);
 	idle->active_mm = &init_mm;
 
+	l4h_topology_online(cpu);
 	notify_cpu_starting(cpu);
 	l4h_timer_setup_cpu();
 	set_cpu_online(cpu, true);

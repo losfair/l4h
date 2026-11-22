@@ -1440,8 +1440,19 @@ seL4 does no load balancing, so `l4h-vmmgr` runs a balancer every 100 ms.
   assuming seL4 numbering describes siblings. Missing or inconsistent
   topology falls back to independent CPUs; AArch64 uses that flat
   topology.
-- **Initial placement** is round-robin, visiting one logical CPU per
-  physical core before its other SMT threads.
+- **Virtual cores.** A guest's vCPUs on one physical core form a *vCore*,
+  which the guest sees as one SMT core (`BootInfo::vcpu_core`, flag
+  `BOOT_TOPOLOGY`; numbered 0..K in order of placement). The host keeps
+  this true for the guest's lifetime: a vCPU only changes SMT thread within
+  its physical core, and a vCore only changes physical core as a whole.
+  arch/l4h builds Linux's sibling masks from it (`CONFIG_SCHED_SMT`,
+  `/sys/devices/system/cpu/cpu*/topology`), so the guest's scheduler fills
+  idle cores before siblings; without the flag each vCPU is its own core.
+- **Initial placement** (`policy::place`) fills one thread of every
+  physical core with the new guest before a second, choosing among equal
+  depths the core least loaded relative to its threads (each vCPU of a
+  guest not stopped weighs one, a VMM two), ties rotated per guest; within
+  the core, a CPU without this guest's vCPUs, then the least loaded.
 - **Balancing.** Each period vmmgr reads `SchedContext_Consumed` for both
   SCs of every vCPU, over the measured interval (root work can delay a
   period).
@@ -1449,16 +1460,40 @@ seL4 does no load balancing, so `l4h-vmmgr` runs a balancer every 100 ms.
     vCPUs active on its core, which still counts a starved vCPU on a
     crowded core.
   - The balancer evens out busy-vCPU counts per physical core first, then
-    per logical CPU. It moves at most one vCPU per period, reducing the sum
-    of squared counts at the first level that improves. A difference of one
-    on logical CPUs also permits a move from a CPU with at least two busy
-    vCPUs to a target below 50% utilization, if physical contention does not
-    worsen. Equal-load siblings stay put.
-  - Equivalent moves prefer guests with no other vCPU on the target
-    physical core, then logical CPU. A moved vCPU stays put for 1 s, and
-    vCPUs in cooldown still count towards contention.
-  - A move re-runs `SchedControl_Configure` on the target core's
-    SchedControl; `SC_K` and `SC_U` always move together.
+    per logical CPU, with one action per period that reduces the sum of
+    squared counts at the first level that improves: a *vCore swap* moves a
+    guest's vCore with more busy vCPUs to another physical core, trading
+    places with the guest's vCore there, if any (its busy vCPUs first, each
+    to the target CPU with the fewest busy vCPUs, then the least load); an
+    *intra-core* move shifts one vCPU between SMT siblings. Without a
+    physical gain, a swap or move also qualifies if it reduces the logical
+    sum, or if a source CPU with at least two busy vCPUs sees a target
+    below 50% utilization. Equal-load siblings stay put.
+  - On hybrid CPUs a vCore never moves to a core with fewer threads than
+    its vCPUs. Equivalent actions prefer moving a vCore to swapping one,
+    fewer vCPUs moved, then targets without the guest's vCPUs and with less
+    load. Moved vCPUs stay put for 1 s; vCPUs in cooldown still count
+    towards contention, and their vCore does not move.
+  - A swap protects the VMMs on both physical cores (§7.1) before it
+    re-runs `SchedControl_Configure` for each moved vCPU on its target
+    core's SchedControl; `SC_K` and `SC_U` always move together. A failed
+    configuration stops the guest; the TLB bitmaps are flushed once.
+- **Capacity hint.** Each period vmmgr also publishes, per vCPU of a
+  running guest, `EventPage::host_cap` in 128..=1024: 1024 less half of
+  the share of its CPU other guests and VMMs used, less 0.35 of their use
+  of its SMT siblings, averaged 50/50 with the previous value. arch/l4h
+  returns `1024 − host_cap` as `arch_scale_hw_pressure()`
+  (`CONFIG_SCHED_HW_PRESSURE`, patch `guest/linux/patches/0020`), so CFS
+  sees a contended vCPU's lower capacity; 0, from an older host, is none.
+- **Simulation.** `tests/dst-sched.rs` (in `tests/run-schedtest.sh`) runs
+  the production placement, balancer, capacity hint and budgets in a
+  deterministic closed-loop simulation of seL4 MCS refills, SMT throughput
+  sharing, guest schedulers (topology-aware, capacity-aware or flat) and
+  ten seeded scenarios, from bursty and overcommitted 8-vCPU guests to
+  hybrid topologies, a hostile VMM, caps and clock jitter. It checks caps,
+  whole vCores and contexts on their vCPU's CPU at every step, and bounds
+  throughput (against a static host), fairness, SMT waste, wake-up latency
+  and starvation.
 - **TLB bitmaps.** On x86_64 every CPU a VSpace has run on stays in its TLB
   bitmap until a flush of its whole PCID clears the CPUs not running it, so
   every page unmap in it sends each of those CPUs a shootdown IPI and waits
@@ -3930,11 +3965,12 @@ into the guest's boot blocks, builds the kernel VSpace and
 - the I/O pool's and the hotplug region's GPA and size;
 - the vCPU count and pre-assigned VSpace count;
 - the time-counter frequency (`tsc_hz`);
-- boot flags (`L4H_BOOT_DOM0`);
+- boot flags (`L4H_BOOT_DOM0`, `L4H_BOOT_TOPOLOGY`);
 - the device table;
 - the build SDK's address and size (`sdk_va`, `sdk_size`);
 - the command line;
 - on aarch64, the CPU feature ID registers.
+- with `L4H_BOOT_TOPOLOGY`, each vCPU's virtual core (`vcpu_core`, §7.3).
 
 Capability slots and special mappings, including event-page addresses, are
 defined by `include/l4h/abi.h`, the single source of truth, which the guest

@@ -94,7 +94,7 @@ pub struct HostInfo {
     /// the tick count when it was read.
     pub epoch_ns: u64,
     pub epoch_ticks: u64,
-    /// Round-robin placement of new guests.
+    /// New guests so far, to stagger their placement.
     placement: core::cell::Cell<usize>,
 }
 
@@ -112,11 +112,11 @@ impl HostInfo {
         }
     }
 
-    /// CPU for the next vCPU, visiting physical cores before SMT siblings.
-    pub fn next_core(&self) -> usize {
+    /// Rotate ties in the placement of each new guest (sched::place).
+    pub fn stagger(&self) -> usize {
         let c = self.placement.get();
-        self.placement.set(c + 1);
-        self.topology.placement(c)
+        self.placement.set(c.wrapping_add(1));
+        c
     }
 
     pub fn sched_control(&self, core: usize) -> cap::SchedControl {
@@ -260,7 +260,8 @@ impl Vmmgr {
         let id = (0..MAX_GUESTS).find(|&i| self.guest(i).is_none())?;
         self.alloc.slots.track(id);
         let asids = self.asids.in_use;
-        let g = match guest::create(id, cfg, &mut self.alloc, &mut self.asids, &self.info, kernel) {
+        let cores = sched::place(self, cfg.vcpus, self.info.stagger());
+        let g = match guest::create(id, cfg, &mut self.alloc, &mut self.asids, &self.info, kernel, &cores) {
             Ok(mut g) => {
                 let mapped = provider::map(&mut g, &mut self.alloc, &mut self.wins.a)
                     && self.sdk.as_ref().is_none_or(|k| k.map(&mut g, &mut self.alloc));

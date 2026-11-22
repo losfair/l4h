@@ -17,11 +17,17 @@ id=$(l4hctl create spread --initrd /bin/densvm.cpio.gz --mem 128 --vcpus 4 \
     --cmdline "console=hvc0 quiet") || fail "create spread"
 l4hctl console "$id" --until "DENSVM: ready" --timeout 60 >/dev/null || fail "boot spread"
 echo "SMTTEST: four-vCPU guest booted"
+# Its vCores (CPUs 2 and 3 of the host, then 1 and 0) are SMT siblings
+# in the guest too: CPUs 0/2 and 1/3, whose scheduler spreads over them.
+l4hctl send "$id" --wait "DENSVM: topo 0,2 1,3" --timeout 30 topo >/dev/null || fail "spread SMT siblings"
+echo "SMTTEST: guest SMT siblings 0,2 and 1,3"
+l4hctl send "$id" --wait "DENSVM: smt spread" --timeout 30 smt >/dev/null || fail "spread SMT scheduling"
+echo "SMTTEST: guest spreads two loops over its cores"
 l4hctl destroy "$id" || fail "destroy spread"
 
-# With dom0 on CPU 0, round-robin puts these on 2, 1, 3. Both busy
-# guests initially share a physical core. The old flat balancer left
-# them there because each logical CPU had only one busy vCPU.
+# Placement weighs what each core already runs (dom0's vCPU and VMM on
+# CPU 0), so these start on CPUs 2, 3 and 1. Either way, the two busy
+# guests must end on different physical cores and stay there.
 a=$(l4hctl create hog-a --initrd /bin/densvm.cpio.gz --mem 128 \
     --cmdline "console=hvc0 quiet HOG=1") || fail "create hog-a"
 l4hctl console "$a" --until "DENSVM: ready" --timeout 60 >/dev/null || fail "boot hog-a"

@@ -125,7 +125,9 @@ pub struct EventPage {
     pub pending: [u64; NR_EVENTS / 64],
     pub steal_ns: u64,
     pub idle_ticks: u64,
-    pub reserved: [u64; 6],
+    /// Capacity other guests leave this vCPU, 128..=1024 (0: unknown).
+    pub host_cap: u64,
+    pub reserved: [u64; 5],
     pub console: ConsoleOut,
 }
 
@@ -207,9 +209,12 @@ pub struct BootInfo {
     pub devices: [DevDesc; MAX_DEVICES],
     pub cmdline: [u8; CMDLINE_SIZE],
     pub arm_virt: ArmVirtInfo,
+    /// BOOT_TOPOLOGY: each vCPU's virtual core; equal cores are siblings.
+    pub vcpu_core: [u8; MAX_VCPUS],
 }
 
 pub const BOOT_DOM0: u64 = 1 << 0;
+pub const BOOT_TOPOLOGY: u64 = 1 << 1;
 
 pub const VIRTIO_MAGIC: u32 = 0x7634_686c;
 pub const VIRTIO_MAX_QUEUES: usize = 16;
@@ -634,7 +639,7 @@ const _: () = assert!(core::mem::size_of::<AttestFlags>() == 64);
 const _: () = assert!(core::mem::size_of::<DevDesc>() == 48);
 const _: () = assert!(
     core::mem::size_of::<BootInfo>()
-        == 32 * 8 + MAX_DEVICES * 48 + CMDLINE_SIZE + 96
+        == 32 * 8 + MAX_DEVICES * 48 + CMDLINE_SIZE + 96 + MAX_VCPUS
 );
 const _: () = assert!(core::mem::size_of::<ArmVirtInfo>() == 96);
 const _: () = assert!(core::mem::offset_of!(BootInfo, cmdline) == 32 * 8 + MAX_DEVICES * 48);
@@ -956,7 +961,8 @@ mod tests {
         assert_eq!(offset_of!(BootInfo, devices), 32 * 8);
         assert_eq!(offset_of!(BootInfo, cmdline), 32 * 8 + MAX_DEVICES * 48);
         assert_eq!(offset_of!(BootInfo, arm_virt), 32 * 8 + MAX_DEVICES * 48 + CMDLINE_SIZE);
-        assert_eq!(size_of::<BootInfo>(), 32 * 8 + MAX_DEVICES * 48 + CMDLINE_SIZE + 96);
+        assert_eq!(offset_of!(BootInfo, vcpu_core), 32 * 8 + MAX_DEVICES * 48 + CMDLINE_SIZE + 96);
+        assert_eq!(size_of::<BootInfo>(), 32 * 8 + MAX_DEVICES * 48 + CMDLINE_SIZE + 96 + MAX_VCPUS);
         assert!(size_of::<BootInfo>() as u64 <= BOOTINFO_SIZE);
         assert_eq!(SLOT_GICV, SLOT_EPT_POOL + 1);
         assert!(SLOT_GICV < SLOT_DYN_BASE);
