@@ -25,6 +25,22 @@
 #define L4H_ARM_VIRT 1
 #endif
 
+#if defined(__x86_64__) && defined(CONFIG_VTX)
+#define L4H_PROVIDER_FEATURES_VIRT L4H_PROVIDER_VTX
+#elif defined(L4H_ARM_VIRT)
+#define L4H_PROVIDER_FEATURES_VIRT L4H_PROVIDER_ARM_VIRT
+#else
+#define L4H_PROVIDER_FEATURES_VIRT 0
+#endif
+
+/* FL4's X86PML4FrameBatch, when this libsel4 has it (seL4's has not):
+ * tools/build-guest-provider.sh defines L4H_HAVE_FRAME_BATCH. */
+#if defined(__x86_64__) && defined(L4H_HAVE_FRAME_BATCH)
+#define L4H_PROVIDER_FEATURES_BATCH L4H_PROVIDER_FRAME_BATCH
+#else
+#define L4H_PROVIDER_FEATURES_BATCH 0
+#endif
+
 /* Bind this vCPU's SC_U to the TCB of u (user.c). */
 struct l4h_vcpu;
 void l4h_bind_sc(struct l4h_vcpu *v, struct l4h_uctx *u);

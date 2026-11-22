@@ -5,6 +5,8 @@
 extern struct l4h_tls_block l4h_tls_blocks[L4H_MAX_VCPUS];
 extern struct l4h_provider_context l4h_provider_context;
 extern const struct l4h_provider *l4h_provider_ops;
+/* Also in l4h_vspace.h, for vspace.c. */
+int l4h_provider_frame_batch(void);
 void l4h_provider_setup(const struct l4h_bootinfo *bi);
 void l4h_linux_main(void);
 void l4h_secondary_main(int cpu);

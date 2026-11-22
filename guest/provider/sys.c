@@ -171,6 +171,96 @@ int l4h_page_map(unsigned long frame, unsigned long vspace, unsigned long va, in
 #endif
 }
 
+/* FL4 X86PML4FrameBatch on `vspace`, x86_64 only: `ops` in runs of one op
+ * (and, for maps, one protection), a call per run.  Deletes defer their
+ * TLB invalidation to the end of their call. */
+#define FB_COUNT_SHIFT		8
+#define FB_DEPTH_SHIFT		16
+#define FB_MAP_RIGHTS_SHIFT	24
+#define FB_CAP_RIGHTS_SHIFT	28
+#define FB_ATTR_SHIFT		32
+#define FB_DEFER_DELETE_FLUSH	(1ul << 40)
+#define FB_MAX_WORDS		(seL4_MsgMaxLength - 1)
+
+int l4h_frame_batch(const struct l4h_frame_op *ops, int n, unsigned long vspace, int *err)
+{
+#if !L4H_PROVIDER_FEATURES_BATCH
+	(void)ops; (void)n; (void)vspace;
+	*err = seL4_IllegalOperation;
+	return 0;
+#else
+	int done = 0;
+
+	*err = 0;
+	while (done < n) {
+		int op = ops[done].op;
+		int prot = ops[done].prot;
+		int words = op == L4H_FRAME_COPY_MAP ? 3 : op == L4H_FRAME_REMAP ? 2 : 1;
+		int k = 0, i;
+		unsigned long r = 0, attr = 0, hdr, got, e;
+		seL4_MessageInfo_t info;
+
+		if (op != L4H_FRAME_COPY_MAP && op != L4H_FRAME_REMAP && op != L4H_FRAME_DELETE) {
+			*err = seL4_InvalidArgument;
+			return done;
+		}
+		while (done + k < n && (k + 1) * words <= FB_MAX_WORDS && ops[done + k].op == op &&
+		       (op == L4H_FRAME_DELETE || ops[done + k].prot == prot))
+			k++;
+		if (op != L4H_FRAME_DELETE) {
+			/* As l4h_page_map: seL4_CapRights words, then VM attributes. */
+			r = (prot & L4H_PROT_WRITE) ? 3 : (prot & (L4H_PROT_READ | L4H_PROT_EXEC)) ? 2 : 0;
+			attr = (prot & L4H_PROT_EXEC) ? seL4_X86_Default_VMAttributes : seL4_X86_ExecuteNever;
+			if (prot & L4H_PROT_DEFER_FLUSH)
+				attr |= seL4_X86_DeferFlush;
+		}
+		hdr = (unsigned long)op | (unsigned long)k << FB_COUNT_SHIFT | 64ul << FB_DEPTH_SHIFT |
+		      r << FB_MAP_RIGHTS_SHIFT | 15ul << FB_CAP_RIGHTS_SHIFT | attr << FB_ATTR_SHIFT |
+		      (op == L4H_FRAME_DELETE ? FB_DEFER_DELETE_FLUSH : 0);
+		seL4_SetMR(0, hdr);
+		for (i = 0; i < k; i++) {
+			const struct l4h_frame_op *o = &ops[done + i];
+
+			if (op == L4H_FRAME_COPY_MAP) {
+				seL4_SetMR(1 + 3 * i, o->a);
+				seL4_SetMR(2 + 3 * i, o->b);
+				seL4_SetMR(3 + 3 * i, o->va);
+			} else if (op == L4H_FRAME_REMAP) {
+				seL4_SetMR(1 + 2 * i, o->a);
+				seL4_SetMR(2 + 2 * i, o->va);
+			} else {
+				seL4_SetMR(1 + i, o->a);
+			}
+		}
+		seL4_SetCap(0, L4H_CNODE_CPTR);
+		info = seL4_Call(vspace, seL4_MessageInfo_new(X86PML4FrameBatch, 0, 1, 1 + words * k));
+		if (seL4_MessageInfo_get_label(info)) {
+			*err = seL4_MessageInfo_get_label(info);
+			return done;
+		}
+		/* (done, error): anything shorter is no answer to read. */
+		if (seL4_MessageInfo_get_length(info) < 2) {
+			*err = seL4_IllegalOperation;
+			return done;
+		}
+		got = seL4_GetMR(0);
+		e = seL4_GetMR(1);
+		if (got > (unsigned long)k)
+			got = 0;
+		done += got;
+		if (e) {
+			*err = e;
+			return done;
+		}
+		if (got != (unsigned long)k) {
+			*err = seL4_IllegalOperation;
+			return done;
+		}
+	}
+	return done;
+#endif
+}
+
 int l4h_page_derive_subframes(unsigned long frame, unsigned long offset, unsigned long node_index,
 			      int node_depth, unsigned long node_offset, unsigned long n)
 {

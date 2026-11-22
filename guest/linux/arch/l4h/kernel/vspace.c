@@ -26,6 +26,7 @@
 #include <linux/list.h>
 #include <linux/export.h>
 #include <linux/vmalloc.h>
+#include <linux/moduleparam.h>
 #include <asm/sections.h>
 #include <asm/tlbflush.h>
 #include <asm/pgtable.h>
@@ -87,7 +88,26 @@ struct l4h_as {
 	unsigned long nr_pages, nr_tables;
 	long charged;		/* as_cost() last added to the owner mm */
 	bool flush_pending;	/* rights lowered with L4H_PROT_DEFER_FLUSH */
+	/* Frame ops a TLB sync or a reset queued for one kernel
+	 * entry (l4h_frame_batch), in order; see as_flush_batch(). */
+	bool queueing;
+	int nbatch;
+	struct l4h_frame_op batch[L4H_FRAME_BATCH_MAX];
 };
+
+/* l4h_frame_batch=0 on the command line issues every frame op on its
+ * own (for A/B runs). */
+static bool frame_batch = true;
+core_param(l4h_frame_batch, frame_batch, bool, 0644);
+/* The provider batches in the kernel (L4H_PROVIDER_FRAME_BATCH), known at
+ * l4h_vspace_init(), which runs before the command line is parsed: the
+ * parameter alone cannot turn batching on without it. */
+static bool have_frame_batch;
+
+static bool batching(void)
+{
+	return have_frame_batch && READ_ONCE(frame_batch);
+}
 
 static void as_init(struct l4h_as *as, unsigned long root)
 {
@@ -102,6 +122,8 @@ static void as_init(struct l4h_as *as, unsigned long root)
 	as->nr_pages = as->nr_tables = 0;
 	as->charged = 0;
 	as->flush_pending = false;
+	as->queueing = false;
+	as->nbatch = 0;
 }
 
 /*
@@ -200,11 +222,137 @@ static struct l4h_as kernel_as;
  * there just before the erase, and a kernel access to an unmapped page
  * faults the guest for good.
  */
+static void as_queue(struct l4h_as *as, int op, unsigned long va, unsigned long a,
+		     unsigned long b, int prot);
+
 static void as_delete_erased(struct l4h_as *as, void *e)
 {
 	if (as == &kernel_as)
 		l4h_wait_nofault_accesses();
+	if (as->queueing) {
+		/* The slot is freed once the delete ran (as_flush_batch). */
+		as_queue(as, L4H_FRAME_DELETE, 0, entry_slot(e), 0, 0);
+		return;
+	}
 	l4h_slot_delete(entry_slot(e));
+}
+
+/* The leaf `e` of `as` at `vpn` still is the mapping through `slot`. */
+static bool as_entry_is(struct l4h_as *as, unsigned long vpn, unsigned long slot)
+{
+	void *e = xa_load(&as->pages, vpn);
+
+	return e && entry_slot(e) == slot;
+}
+
+/* The ops after `op` in the batch no longer use `slot`, which `op` freed:
+ * a TLB sync that retried a PTE can queue several ops on one slot. */
+static void as_forget_slot(struct l4h_frame_op *op, struct l4h_frame_op *end, unsigned long slot)
+{
+	for (op++; op < end; op++)
+		if ((op->op == L4H_FRAME_REMAP || op->op == L4H_FRAME_DELETE) && op->a == slot)
+			op->op = 0;
+}
+
+/* An op the batch did not run, on its own, with `end` the end of the
+ * batch; a map that fails leaves the page unmapped (its next access
+ * faults), as a failed sync map does. A slot is freed by its DELETE: an op
+ * that fails frees it itself only if no later op deletes it, and then no
+ * later op uses it. */
+static void as_run_op(struct l4h_as *as, struct l4h_frame_op *op, struct l4h_frame_op *end)
+{
+	unsigned long vpn = op->va >> PAGE_SHIFT;
+	struct l4h_frame_op *o;
+	bool deleted_later = false;
+	int err;
+
+	switch (op->op) {
+	case L4H_FRAME_COPY_MAP:
+		for (o = op + 1; o < end; o++)
+			deleted_later |= o->op == L4H_FRAME_DELETE && o->a == op->b;
+		if (l4h_cnode_copy(op->b, 64, op->a, 64, L4H_RIGHTS_ALL)) {
+			err = -ENOMEM;
+		} else {
+			for (;;) {
+				err = l4h_page_map(op->b, as->root, op->va, op->prot);
+				if (err != L4H_ERR_FAILED_LOOKUP)
+					break;
+				err = as_add_table(as, 0, op->va);
+				if (err)
+					break;
+			}
+			if (err)
+				WARN_ON(l4h_cnode_delete(op->b, 64));
+		}
+		if (!err)
+			break;
+		if (as_entry_is(as, vpn, op->b)) {
+			xa_erase(&as->pages, vpn);
+			as->nr_pages--;
+		}
+		/* A later DELETE frees the (now empty) slot; else free it here,
+		 * and no later op may use it. */
+		if (!deleted_later) {
+			l4h_slot_free(op->b);
+			as_forget_slot(op, end, op->b);
+		}
+		break;
+	case L4H_FRAME_REMAP:
+		if (!l4h_page_map(op->a, as->root, op->va, op->prot) || !as_entry_is(as, vpn, op->a))
+			break;
+		xa_erase(&as->pages, vpn);
+		as->nr_pages--;
+		for (o = op + 1; o < end; o++)
+			deleted_later |= o->op == L4H_FRAME_DELETE && o->a == op->a;
+		if (deleted_later) {
+			WARN_ON(l4h_cnode_delete(op->a, 64));
+		} else {
+			l4h_slot_delete(op->a);
+			as_forget_slot(op, end, op->a);
+		}
+		break;
+	case L4H_FRAME_DELETE:
+		l4h_slot_delete(op->a);
+		break;
+	}
+}
+
+/* Run the queued ops: in as few kernel entries as runs of one kind allow
+ * (l4h_frame_batch), then on their own those after one that failed (the
+ * kernel undoes a failed copy-and-map). */
+static void as_flush_batch(struct l4h_as *as)
+{
+	int n = as->nbatch, done, err = 0, i;
+
+	if (!n)
+		return;
+	as->nbatch = 0;
+	done = l4h_frame_batch(as->batch, n, as->root, &err);
+	if (done < 0 || done > n)
+		done = 0;
+	for (i = 0; i < done; i++)
+		if (as->batch[i].op == L4H_FRAME_DELETE)
+			l4h_slot_free(as->batch[i].a);
+	for (i = done; i < n; i++)
+		as_run_op(as, &as->batch[i], as->batch + n);
+}
+
+/* Room for `k` more ops: flush first if the queue lacks it. Callers make
+ * room before they read an entry they queue ops on, so that no flush
+ * (whose failures may free slots) runs between that read and the ops. */
+static void as_reserve(struct l4h_as *as, int k)
+{
+	if (as->queueing && as->nbatch + k > L4H_FRAME_BATCH_MAX)
+		as_flush_batch(as);
+}
+
+/* Queue an op; the caller made room (as_reserve). */
+static void as_queue(struct l4h_as *as, int op, unsigned long va, unsigned long a,
+		     unsigned long b, int prot)
+{
+	if (WARN_ON_ONCE(as->nbatch == L4H_FRAME_BATCH_MAX))
+		as_flush_batch(as);
+	as->batch[as->nbatch++] = (struct l4h_frame_op){ .op = op, .va = va, .a = a, .b = b, .prot = prot };
 }
 
 /* A partial update drops the whole hardware large leaf. The unchanged
@@ -213,11 +361,17 @@ static void as_delete_erased(struct l4h_as *as, void *e)
 static void as_drop_large(struct l4h_as *as, unsigned long va)
 {
 	void *e = xa_load(&as->large, va >> PMD_SHIFT);
+	bool queueing = as->queueing;
 
 	if (e) {
+		/* At once, not queued: the leaf table a small page here needs
+		 * next cannot be installed while the large leaf is. */
+		as_flush_batch(as);
+		as->queueing = false;
 		xa_erase(&as->large, va >> PMD_SHIFT);
 		as_delete_erased(as, e);
 		as->nr_pages--;
+		as->queueing = queueing;
 	}
 }
 
@@ -236,6 +390,7 @@ static int as_map_page(struct l4h_as *as, unsigned long va, unsigned long phys, 
 	int err;
 
 	as_drop_large(as, va);
+	as_reserve(as, 2);
 	/* No frame the guest may map (l4h_frame_mappable): not a lack of
 	 * memory, and never a CPtr past the RAM CNodes, nor the kernel's
 	 * image writable in a process.  Before the remap of the same frame,
@@ -251,6 +406,14 @@ static int as_map_page(struct l4h_as *as, unsigned long va, unsigned long phys, 
 
 		if (entry_prot(e) == eff_prot(prot))
 			return 0;
+		if (as->queueing) {
+			as_queue(as, L4H_FRAME_REMAP, va, entry_slot(e), 0,
+				 prot | (defer && lowered ? L4H_PROT_DEFER_FLUSH : 0));
+			if (defer && lowered)
+				as->flush_pending = true;
+			xa_store(&as->pages, vpn, mk_entry(entry_slot(e), pfn, prot), GFP_ATOMIC);
+			return 0;
+		}
 		err = l4h_page_map(entry_slot(e), as->root, va,
 				   prot | (defer && lowered ? L4H_PROT_DEFER_FLUSH : 0));
 		if (err)
@@ -264,6 +427,23 @@ static int as_map_page(struct l4h_as *as, unsigned long va, unsigned long phys, 
 		xa_erase(&as->pages, vpn);
 		as_delete_erased(as, e);
 		as->nr_pages--;
+	}
+	if (as->queueing) {
+		/* Its page table first, so that the queued map finds it. */
+		err = xa_load(&as->table_at[0], va >> l4h_pt_level_shift[0]) ? 0 : as_add_table(as, 0, va);
+		if (err)
+			return err;
+		slot = l4h_slot_alloc();
+		if (!slot)
+			return -ENOMEM;
+		err = xa_err(xa_store(&as->pages, vpn, mk_entry(slot, pfn, prot), GFP_ATOMIC));
+		if (err) {
+			l4h_slot_free(slot);
+			return err;
+		}
+		as_queue(as, L4H_FRAME_COPY_MAP, va, L4H_FRAME_CPTR(phys), slot, prot);
+		as->nr_pages++;
+		return 0;
 	}
 	slot = l4h_cap_copy(L4H_FRAME_CPTR(phys), L4H_RIGHTS_ALL);
 	if (!slot)
@@ -294,13 +474,21 @@ static void as_unmap_range(struct l4h_as *as, unsigned long start, unsigned long
 	unsigned long vpn;
 	void *e;
 
+	/* Each entry is read again after as_reserve(), whose flush may
+	 * have changed it. */
 	xa_for_each_range(&as->large, vpn, e, start >> PMD_SHIFT, (end - 1) >> PMD_SHIFT) {
-		xa_erase(&as->large, vpn);
+		as_reserve(as, 1);
+		e = xa_erase(&as->large, vpn);
+		if (!e)
+			continue;
 		as_delete_erased(as, e);
 		as->nr_pages--;
 	}
 	xa_for_each_range(&as->pages, vpn, e, start >> PAGE_SHIFT, (end - 1) >> PAGE_SHIFT) {
-		xa_erase(&as->pages, vpn);
+		as_reserve(as, 1);
+		e = xa_erase(&as->pages, vpn);
+		if (!e)
+			continue;
 		/* Deleting the frame capability removes the mapping. */
 		as_delete_erased(as, e);
 		as->nr_pages--;
@@ -379,6 +567,7 @@ static void as_reset(struct l4h_as *as, bool may_sleep)
 	int level;
 	void *e;
 
+	as_flush_batch(as);
 	list_for_each_entry_safe_reverse(t, n, &as->tables, link) {
 		list_del(&t->link);
 		l4h_obj_free(&t->obj);
@@ -389,18 +578,23 @@ static void as_reset(struct l4h_as *as, bool may_sleep)
 	as->nr_tables = 0;
 	/* Covered by those invalidations too. */
 	as->flush_pending = false;
+	as->queueing = batching() && as != &kernel_as;
 	xa_for_each(&as->large, vpn, e) {
+		as_reserve(as, 1);
 		xa_erase(&as->large, vpn);
-		l4h_slot_delete(entry_slot(e));
+		as_delete_erased(as, e);
 		if (!(--as->nr_pages % 1024) && may_sleep)
 			cond_resched();
 	}
 	xa_for_each(&as->pages, vpn, e) {
+		as_reserve(as, 1);
 		xa_erase(&as->pages, vpn);
-		l4h_slot_delete(entry_slot(e));
+		as_delete_erased(as, e);
 		if (!(--as->nr_pages % 1024) && may_sleep)
 			cond_resched();
 	}
+	as_flush_batch(as);
+	as->queueing = false;
 }
 
 /* ---- the guest-kernel VSpace (vmalloc, modules, ...): kernel_as */
@@ -778,12 +972,20 @@ static int map_pages(struct mm_id *mm_idp, unsigned long virt, unsigned long len
 	if (m->vs >= 0) {
 		struct l4h_as *as = &vs_pool[m->vs].as;
 
+		if (!from_sync)
+			as_flush_batch(as);
 		/* Size changes can remove mappings on the fault path too. */
 		if (!prot || from_sync || frame || xa_load(&as->large, virt >> PMD_SHIFT))
 			mm_flush_moved(m);
+		as->queueing = from_sync && batching();
 		if (!prot) {
 			as_unmap_range(as, virt, virt + len);
 		} else if (frame) {
+			/* Not queued: as_map_large() maps the leaf at once, so a
+			 * queued delete of what was there could run after it and
+			 * clear it. */
+			as_flush_batch(as);
+			as->queueing = false;
 			err = as_map_large(as, virt, phys, prot, frame);
 			if (err && from_sync) {
 				as_unmap_range(as, virt, virt + len);
@@ -799,6 +1001,7 @@ static int map_pages(struct mm_id *mm_idp, unsigned long virt, unsigned long len
 				}
 			}
 		}
+		as->queueing = false;
 		as_charge(as, mm);
 	}
 	raw_spin_unlock_irqrestore(&m->lock, flags);
@@ -819,6 +1022,12 @@ void l4h_mm_flush_deferred(struct mm_struct *mm)
 	unsigned long flags;
 
 	raw_spin_lock_irqsave(&m->lock, flags);
+	if (m->vs >= 0) {
+		/* Ops that failed in the batch and ran on their own may have
+		 * dropped pages or added tables. */
+		as_flush_batch(&vs_pool[m->vs].as);
+		as_charge(&vs_pool[m->vs].as, mm);
+	}
 	if (m->vs >= 0 && vs_pool[m->vs].as.flush_pending) {
 		struct l4h_as *as = &vs_pool[m->vs].as;
 
@@ -838,9 +1047,13 @@ int unmap(struct mm_id *mm_idp, unsigned long addr, unsigned long len)
 
 	raw_spin_lock_irqsave(&m->lock, flags);
 	if (m->vs >= 0) {
+		struct l4h_as *as = &vs_pool[m->vs].as;
+
 		mm_flush_moved(m);
-		as_unmap_range(&vs_pool[m->vs].as, addr, addr + len);
-		as_charge(&vs_pool[m->vs].as, mm);
+		as->queueing = batching();
+		as_unmap_range(as, addr, addr + len);
+		as->queueing = false;
+		as_charge(as, mm);
 	}
 	raw_spin_unlock_irqrestore(&m->lock, flags);
 	return 0;
@@ -855,6 +1068,8 @@ void unmap_large(struct mm_id *mm_idp, unsigned long addr)
 	unsigned long flags;
 
 	raw_spin_lock_irqsave(&m->lock, flags);
+	if (m->vs >= 0)
+		as_flush_batch(&vs_pool[m->vs].as);
 	if (m->vs >= 0 && xa_load(&vs_pool[m->vs].as.large, addr >> PMD_SHIFT)) {
 		mm_flush_moved(m);
 		as_drop_large(&vs_pool[m->vs].as, addr);
@@ -880,7 +1095,10 @@ int ptep_test_and_clear_young(struct vm_area_struct *vma, unsigned long addr,
 
 	raw_spin_lock_irqsave(&m->lock, flags);
 	if (m->vs >= 0) {
-		void *e = xa_load(&vs_pool[m->vs].as.pages, addr >> PAGE_SHIFT);
+		void *e;
+
+		as_flush_batch(&vs_pool[m->vs].as);
+		e = xa_load(&vs_pool[m->vs].as.pages, addr >> PAGE_SHIFT);
 
 		/* A pending sync may still name the old frame. */
 		if (e && entry_pfn(e) == pte_pfn(READ_ONCE(*ptep)))
@@ -905,9 +1123,11 @@ int pmdp_test_and_clear_young(struct vm_area_struct *vma, unsigned long addr,
 	addr &= PMD_MASK;
 	raw_spin_lock_irqsave(&m->lock, flags);
 	if (m->vs >= 0) {
-		void *large = xa_load(&vs_pool[m->vs].as.large, addr >> PMD_SHIFT);
+		void *large;
 		int accessed = 0;
 
+		as_flush_batch(&vs_pool[m->vs].as);
+		large = xa_load(&vs_pool[m->vs].as.large, addr >> PMD_SHIFT);
 		if (large && entry_pfn(large) == pfn) {
 			WARN_ON_ONCE(l4h_page_test_and_clear_accessed(entry_slot(large), &accessed));
 			young |= accessed;
@@ -1033,6 +1253,8 @@ void __init l4h_vspace_init(void)
 	int i;
 
 	as_init(&kernel_as, L4H_CPTR(L4H_SLOT_VSPACE));
+	/* Without kernel batches (seL4) queueing would only delay each op. */
+	have_frame_batch = l4h_provider_frame_batch();
 	nr_vs = l4h_bootinfo->nr_vspaces;
 	if (nr_vs < 1)
 		panic("l4h: no process VSpaces in boot info\n");

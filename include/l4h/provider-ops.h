@@ -84,3 +84,5 @@ L4H_PROVIDER_OP(int, l4h_arm_s2_map_frame, (unsigned long frame, unsigned long s
 L4H_PROVIDER_OP(int, l4h_arm_vcpu_run, (struct l4h_uctx *u, struct l4h_arm_vmexit *x), (u, x))
 L4H_PROVIDER_OP(int, l4h_arm_vcpu_enter, (unsigned long vcpu, unsigned long in_mask, unsigned long out_mask, struct l4h_arm_vmexit *x), (vcpu, in_mask, out_mask, x))
 L4H_PROVIDER_OP(int, l4h_arm_vcpu_read_state_self, (unsigned long vcpu, unsigned long mask), (vcpu, mask))
+/* Runs `n` frame ops on `vspace` in as few kernel entries as their kinds allow; returns how many succeeded, *err the error of the next. */
+L4H_PROVIDER_OP(int, l4h_frame_batch, (const struct l4h_frame_op *ops, int n, unsigned long vspace, int *err), (ops, n, vspace, err))

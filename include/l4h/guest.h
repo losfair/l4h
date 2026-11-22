@@ -73,7 +73,19 @@ int l4h_cnode_revoke(unsigned long cap, int depth);
 /* Device memory (non-cacheable), for Stage-2 maps of device frames such
  * as GICv2's GICV (l4h_arm_s2_map_frame). */
 #define L4H_PROT_DEVICE		32
+
+/* One entry of l4h_frame_batch (FL4 X86PML4FrameBatch). */
+#define L4H_FRAME_COPY_MAP	1	/* copy frame cap `a` into empty slot `b`, map it at `va` */
+#define L4H_FRAME_REMAP		2	/* map frame cap `a` (already at `va`) with `prot` */
+#define L4H_FRAME_DELETE	3	/* delete frame cap `a` */
+/* Ops per l4h_frame_batch() call (the provider splits them into kernel calls). */
+#define L4H_FRAME_BATCH_MAX	119
+struct l4h_frame_op {
+	unsigned long va, a, b;
+	int op, prot;
+};
 int l4h_page_map(unsigned long frame, unsigned long vspace, unsigned long va, int prot);
+int l4h_frame_batch(const struct l4h_frame_op *ops, int n, unsigned long vspace, int *err);
 /* `n` 4 KiB aliases of large `frame` from byte `offset`, into slots like
  * l4h_retype()'s. */
 int l4h_page_derive_subframes(unsigned long frame, unsigned long offset, unsigned long node_index,

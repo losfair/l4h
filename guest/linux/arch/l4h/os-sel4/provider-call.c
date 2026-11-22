@@ -99,6 +99,12 @@ void l4h_provider_setup(const struct l4h_bootinfo *bi)
 	};
 }
 
+/* Whether l4h_frame_batch batches in the kernel (vspace.c). */
+int l4h_provider_frame_batch(void)
+{
+	return !!(l4h_provider_ops->features & L4H_PROVIDER_FRAME_BATCH);
+}
+
 /* Preserve the Linux/module symbols and their calling convention. */
 #define L4H_PROVIDER_OP(ret, name, args, call) \
 	ret name args { return l4h_provider_ops->name call; }
