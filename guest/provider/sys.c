@@ -171,6 +171,45 @@ int l4h_page_map(unsigned long frame, unsigned long vspace, unsigned long va, in
 #endif
 }
 
+/* PROTOTYPE: FL4 CNode FrameBatch on the guest's CNode, x86_64 only. */
+int l4h_frame_batch(const struct l4h_frame_op *ops, int n, unsigned long vspace, int *err)
+{
+#ifdef __aarch64__
+	(void)ops; (void)n; (void)vspace;
+	*err = seL4_IllegalOperation;
+	return 0;
+#else
+	seL4_MessageInfo_t info;
+	int i;
+
+	if (n < 0 || n > L4H_FRAME_BATCH_MAX) {
+		*err = seL4_RangeError;
+		return 0;
+	}
+	seL4_SetMR(0, n);
+	for (i = 0; i < n; i++) {
+		int prot = ops[i].prot;
+		/* As l4h_page_map: seL4_CapRights words, then VM attributes. */
+		unsigned long r = (prot & L4H_PROT_WRITE) ? 3 : (prot & (L4H_PROT_READ | L4H_PROT_EXEC)) ? 2 : 0;
+		unsigned long attr = (prot & L4H_PROT_EXEC) ? seL4_X86_Default_VMAttributes : seL4_X86_ExecuteNever;
+
+		if (prot & L4H_PROT_DEFER_FLUSH)
+			attr |= seL4_X86_DeferFlush;
+		seL4_SetMR(1 + 3 * i, ops[i].op | r << 2 | attr << 6 | (ops[i].va & ~0xffful));
+		seL4_SetMR(2 + 3 * i, ops[i].a);
+		seL4_SetMR(3 + 3 * i, ops[i].b);
+	}
+	seL4_SetCap(0, vspace);
+	info = seL4_Call(L4H_CNODE_CPTR, seL4_MessageInfo_new(CNodeFrameBatch, 0, 1, 1 + 3 * n));
+	if (seL4_MessageInfo_get_label(info)) {
+		*err = seL4_MessageInfo_get_label(info);
+		return 0;
+	}
+	*err = seL4_GetMR(1);
+	return seL4_GetMR(0);
+#endif
+}
+
 int l4h_page_derive_subframes(unsigned long frame, unsigned long offset, unsigned long node_index,
 			      int node_depth, unsigned long node_offset, unsigned long n)
 {
