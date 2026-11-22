@@ -171,7 +171,7 @@ int l4h_page_map(unsigned long frame, unsigned long vspace, unsigned long va, in
 #endif
 }
 
-/* PROTOTYPE: FL4 CNode FrameBatch on the guest's CNode, x86_64 only. */
+/* FL4 CNode FrameBatch on the guest's CNode, x86_64 only. */
 int l4h_frame_batch(const struct l4h_frame_op *ops, int n, unsigned long vspace, int *err)
 {
 #ifdef __aarch64__

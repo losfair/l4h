@@ -88,15 +88,15 @@ struct l4h_as {
 	unsigned long nr_pages, nr_tables;
 	long charged;		/* as_cost() last added to the owner mm */
 	bool flush_pending;	/* rights lowered with L4H_PROT_DEFER_FLUSH */
-	/* PROTOTYPE: frame ops a TLB sync or a reset queued for one kernel
+	/* Frame ops a TLB sync or a reset queued for one kernel
 	 * entry (l4h_frame_batch), in order; see as_flush_batch(). */
 	bool queueing;
 	int nbatch;
 	struct l4h_frame_op batch[L4H_FRAME_BATCH_MAX];
 };
 
-/* PROTOTYPE: l4h_frame_batch=0 on the command line issues every frame op
- * on its own, as before. */
+/* l4h_frame_batch=0 on the command line issues every frame op on its
+ * own (for A/B runs). */
 static bool frame_batch = true;
 core_param(l4h_frame_batch, frame_batch, bool, 0644);
 

@@ -74,7 +74,7 @@ int l4h_cnode_revoke(unsigned long cap, int depth);
  * as GICv2's GICV (l4h_arm_s2_map_frame). */
 #define L4H_PROT_DEVICE		32
 
-/* PROTOTYPE: one entry of l4h_frame_batch (FL4 CNode FrameBatch). */
+/* One entry of l4h_frame_batch (FL4 CNode FrameBatch). */
 #define L4H_FRAME_COPY_MAP	1	/* copy frame cap `a` into empty slot `b`, map it at `va` */
 #define L4H_FRAME_REMAP		2	/* map frame cap `a` (already at `va`) with `prot` */
 #define L4H_FRAME_DELETE	3	/* delete frame cap `a` */
