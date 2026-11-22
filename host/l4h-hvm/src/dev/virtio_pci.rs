@@ -448,7 +448,9 @@ impl<B: Backend> Transport<B> {
         self.interrupt(mem, used, out);
     }
 
-    /// The backend signalled: its completions, and the queues they free.
+    /// The backend signalled: its completions.  What they free (the
+    /// queues, the I/O pool's pages) the caller retries, once every
+    /// device's are in (io::completed): `retry`.
     pub fn complete(&mut self, mem: &GuestMem, out: &mut impl FnMut(Irq)) {
         if self.backend.config_changed() && self.driver_ok() {
             self.generation = self.generation.wrapping_add(1);
@@ -459,6 +461,10 @@ impl<B: Backend> Transport<B> {
         }
         let used = self.backend.complete(mem, &mut self.queues);
         self.interrupt(mem, used, out);
+    }
+
+    /// Queues that waited for room the backend may now have: again.
+    pub fn retry(&mut self, mem: &GuestMem, out: &mut impl FnMut(Irq)) {
         let retry = self.backend.retry();
         if retry != 0 {
             self.poll(mem, retry, out);

@@ -37,7 +37,8 @@ pub enum Exit {
     Notified(u64),
     /// IN or OUT of `size` bytes at `port`; INS and OUTS (`string`, with
     /// REP), whose address size is `addr` bytes.
-    Io { port: u16, size: u8, input: bool, string: bool, rep: bool, addr: u8 },
+    /// OUTS's segment (`seg`), if the CPU said (else decode its prefixes).
+    Io { port: u16, size: u8, input: bool, string: bool, rep: bool, addr: u8, seg: Option<Seg> },
     /// An access to guest-physical `gpa` the EPT does not map: RAM not yet
     /// mapped, or a device.
     Mmio { gpa: u64, write: bool },
@@ -165,10 +166,15 @@ pub fn vmenter(rip: u64, controls: u64, event: u64) -> (bool, u64) {
     (info == 1, badge)
 }
 
-/// Message register `i` after VMEnter.
+/// The message registers of an exit (MRs 0-29), read at once: any
+/// invocation of the VCPU after VMEnter overwrites them.
 #[cfg(not(test))]
-pub fn mr(i: usize) -> u64 {
-    sel4::with_ipc_buffer(|b| b.msg_regs()[i])
+pub fn exit_mrs() -> [u64; 30] {
+    sel4::with_ipc_buffer(|b| {
+        let mut m = [0; 30];
+        m.copy_from_slice(&b.msg_regs()[..30]);
+        m
+    })
 }
 
 /// Write the 15 registers seL4 keeps.

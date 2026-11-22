@@ -97,7 +97,9 @@ fn put(b: &mut [u8], off: usize, n: usize, v: u64) {
 }
 
 fn overlap(a: (u64, u64), b: (u64, u64)) -> bool {
-    a.1 != 0 && b.1 != 0 && a.0 < b.0 + b.1 && b.0 < a.0 + a.1
+    // In 128 bits: ranges that run past 2^64 are compared as they are.
+    let end = |r: (u64, u64)| r.0 as u128 + r.1 as u128;
+    a.1 != 0 && b.1 != 0 && (a.0 as u128) < end(b) && (b.0 as u128) < end(a)
 }
 
 /// What the image is, from its first bytes (dom0 loaded it into RAM at
@@ -143,8 +145,11 @@ impl Kernel {
         let load = load_address(head[HDR_RELOCATABLE] != 0, le(&head, HDR_PREF_ADDRESS, 8), le(&head, HDR_KERNEL_ALIGNMENT, 4));
         let payload = len - setup_len;
         let size = le(&head, HDR_INIT_SIZE, 4).max(payload);
-        let mut k = Kernel { pieces: [(0, 0, 0, 0); 16], nr: 1, entry: load + 0x200, setup: Some(head) };
-        k.pieces[0] = (gpa + setup_len, load, payload, size);
+        // Where it runs, and its window there, must be addresses.
+        let entry = load.checked_add(0x200).filter(|_| load.checked_add(size).is_some()).ok_or(Error::Layout)?;
+        let src = gpa.checked_add(setup_len).ok_or(Error::Layout)?;
+        let mut k = Kernel { pieces: [(0, 0, 0, 0); 16], nr: 1, entry, setup: Some(head) };
+        k.pieces[0] = (src, load, payload, size);
         Ok(k)
     }
 
@@ -172,7 +177,10 @@ impl Kernel {
             if filesz > memsz || offset.checked_add(filesz).is_none_or(|e| e > len) || k.nr == k.pieces.len() {
                 return Err(Error::Format);
             }
-            k.pieces[k.nr] = (gpa + offset, paddr, filesz, memsz);
+            if paddr.checked_add(memsz).is_none() {
+                return Err(Error::Layout);
+            }
+            k.pieces[k.nr] = (gpa.checked_add(offset).ok_or(Error::Layout)?, paddr, filesz, memsz);
             k.nr += 1;
         }
         if k.nr == 0 {
@@ -246,7 +254,7 @@ pub fn load(mem: &GuestMem, kernel: &Kernel, image: (u64, u64), initrd: (u64, u6
         // The initrd: below the kernel's limit unless it can be above 4 GiB.
         let max = le(setup, HDR_INITRD_ADDR_MAX, 4);
         let above_4g = le(setup, HDR_XLOADFLAGS, 2) as u16 & XLF_CAN_BE_LOADED_ABOVE_4G != 0;
-        if initrd.1 != 0 && !above_4g && initrd.0 + initrd.1 - 1 > max {
+        if initrd.1 != 0 && !above_4g && initrd.0.checked_add(initrd.1 - 1).is_none_or(|last| last > max) {
             return Err(Error::Layout);
         }
     }
@@ -530,6 +538,22 @@ mod tests {
         let m = MAPPED[0].load(Ordering::SeqCst);
         assert_eq!(m & (0b11 << 8), 0b11 << 8, "blocks 8 and 9 mapped as written");
         assert!(MAPS.load(Ordering::SeqCst) >= 2);
+    }
+
+    /// Addresses that do not fit in 64 bits are refused, not wrapped.
+    #[test]
+    fn layouts_past_the_address_space() {
+        let (mem, _buf) = fake(16 << 20, 0);
+        let len = bzimage(&mem, 0x80_0000, b"payload!", 0x1000);
+        mem.write::<u8>(0x80_0000 + HDR_RELOCATABLE as u64, 0);
+        for pref in [u64::MAX - 0x100, u64::MAX - 0x800] {
+            mem.write::<u64>(0x80_0000 + HDR_PREF_ADDRESS as u64, pref);
+            assert_eq!(Kernel::parse(&mem, 0x80_0000, len).err(), Some(Error::Layout), "{pref:#x}");
+        }
+        mem.write::<u64>(0x80_0000 + HDR_PREF_ADDRESS as u64, 0x40_0000);
+        let k = Kernel::parse(&mem, 0x80_0000, len).unwrap();
+        assert_eq!(load(&mem, &k, (0x80_0000, len), (u64::MAX - 2, 6), b"", 0xe0000).err(), Some(Error::Layout));
+        assert!(!overlap((u64::MAX - 1, 4), (0, 1)) && overlap((u64::MAX - 1, 4), (u64::MAX, 1)));
     }
 
     #[test]

@@ -8,7 +8,7 @@
 
 use l4h_rt::sel4;
 
-use super::{Event, Exit, Gprs, Hw, SEL4_ORDER, exits, mr, vmenter, write_gprs};
+use super::{Event, Exit, Gprs, Hw, SEL4_ORDER, exits, vmenter, write_gprs};
 use crate::x86::decode::{Mode, Seg};
 use crate::x86::walk::{self, Paging};
 
@@ -131,7 +131,10 @@ impl Vmx {
         let sec = wr(vcpu, SECONDARY, SEC_EPT | SEC_VPID | SEC_WBINVD | SEC_UNRESTRICTED | SEC_INVPCID);
         assert!(sec & SEC_UNRESTRICTED != 0, "l4h-hvm: the CPU has no VT-x unrestricted guest");
         wr(vcpu, CR0_MASK, exits::VMX_CR0_OWNED);
-        wr(vcpu, CR4_MASK, 0);
+        // LA57 ours (on a CPU that has it): turning it on exits, and is
+        // refused (vcpu.rs: 4-level paging only), as on AMD-V, where every
+        // CR4 write exits.
+        wr(vcpu, CR4_MASK, exits::CR4_LA57);
         wr(vcpu, EXCEPTION_BITMAP, 0);
         let ppc = wr(vcpu, PRIMARY, PRI_HLT | PRI_TSC_OFFSET | PRI_SECONDARY) & !(PRI_IRQ_WINDOW | PRI_NMI_WINDOW);
         Vmx {
@@ -239,20 +242,22 @@ impl Hw for Vmx {
         }
         let controls = self.ppc | if irq_window { PRI_IRQ_WINDOW } else { 0 } | if nmi_window { PRI_NMI_WINDOW } else { 0 };
         let (fault, badge) = vmenter(self.rip, controls, info);
+        // Every word of the exit at once (a VCPU invocation overwrites them).
+        let m = super::exit_mrs();
         self.cache.n = 0;
         self.rsp = None;
-        self.rip = mr(0);
-        let left = mr(2);
-        self.rflags = mr(7);
-        self.intr = mr(8);
+        self.rip = m[0];
+        let left = m[2];
+        self.rflags = m[7];
+        self.intr = m[8];
         for (i, &x) in SEL4_ORDER.iter().enumerate() {
-            self.gp[x] = mr(10 + i);
+            self.gp[x] = m[10 + i];
         }
-        let (idt, idt_err) = (mr(27), mr(28));
+        let (idt, idt_err) = (m[27], m[28]);
         // What was not delivered, or was being delivered, goes in again.
         let vectoring = if left & INTR_VALID != 0 { left } else { idt };
         self.pending = if left & INTR_VALID != 0 { exits::vmx_event(left, error as u64) } else { exits::vmx_event(idt, idt_err) };
-        let ei = mr(25);
+        let ei = m[25];
         if exits::vmx_nmi_reblock(ei, vectoring) {
             self.intr |= exits::VMX_BLOCK_NMI;
             self.intr_dirty = true;
@@ -261,9 +266,9 @@ impl Hw for Vmx {
             self.len = 0;
             return Exit::Notified(badge);
         }
-        self.len = mr(5);
+        self.len = m[5];
         let vcpu = self.vcpu;
-        exits::vmx_exit(mr(3), mr(4), ei, mr(26), mr(6), || 2 << ((rd(vcpu, EXIT_INSTRUCTION_INFO) >> 7) & 3))
+        exits::vmx_exit(m[3], m[4], ei, m[26], m[6], || rd(vcpu, EXIT_INSTRUCTION_INFO))
     }
 
     fn take_pending(&mut self) -> Option<Event> {

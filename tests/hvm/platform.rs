@@ -52,6 +52,9 @@ struct Guest {
     long: Option<Entry>,
     real: Option<u8>,
     cr2: u64,
+    tpr: u8,
+    fs_base: u64,
+    flushes: u32,
 }
 
 impl Hw for Guest {
@@ -104,8 +107,8 @@ impl Hw for Guest {
     fn cpl(&mut self) -> u8 {
         0
     }
-    fn seg_base(&mut self, _s: Seg) -> u64 {
-        0
+    fn seg_base(&mut self, s: Seg) -> u64 {
+        if s == Seg::Fs { self.fs_base } else { 0 }
     }
     fn cr0(&mut self) -> u64 {
         self.cr0
@@ -134,10 +137,15 @@ impl Hw for Guest {
         true
     }
     fn set_tsc_offset(&mut self, _off: u64) {}
+    fn set_tpr(&mut self, tpr: u8) {
+        self.tpr = tpr;
+    }
     fn set_cr2(&mut self, v: u64) {
         self.cr2 = v;
     }
-    fn flush_tlb(&mut self) {}
+    fn flush_tlb(&mut self) {
+        self.flushes += 1;
+    }
     fn start_real_mode(&mut self, vector: u8) {
         self.real = Some(vector);
         (self.rip, self.cr0, self.efer, self.rflags) = (0, 0x10, 0, 2);
@@ -204,7 +212,7 @@ fn pio(c: &mut Vcpu<Guest>, v: usize, port: u16, size: u8, out: Option<u32>) -> 
     let rip = h.rip;
     h.g[0] = out.unwrap_or(0xffff_ffff) as u64;
     h.len = 1;
-    h.exits.push_back(Exit::Io { port, size, input: out.is_none(), string: false, rep: false, addr: 8 });
+    h.exits.push_back(Exit::Io { port, size, input: out.is_none(), string: false, rep: false, addr: 8, seg: None });
     turn(c, v);
     assert_eq!(c.hw().rip, rip + 1, "port {port:#x}: stepped over");
     (c.hw().g[0] & (u64::MAX >> (64 - 8 * size as u32))) as u32
@@ -692,12 +700,14 @@ fn guest_boots_and_uses_the_machine() {
     mmio(&mut c0, 0, LAPIC + 0x300, 4, Some(0x4400));
     mmio(&mut c1, 1, LAPIC + 0xf0, 4, Some(0x1ff));
     assert_eq!(c1.hw().events.last(), Some(&Event::Nmi));
+    mmio(&mut c1, 1, LAPIC + 0x80, 4, Some(0x20));
+    assert_eq!(c1.hw().tpr, 0x20);
     mmio(&mut c1, 1, LAPIC + 0x320, 4, Some(0x40));
     mmio(&mut c1, 1, LAPIC + 0x380, 4, Some(1_000_000));
     assert_ne!(sys::VCPU_TIMERS[1].load(Ordering::SeqCst), 0, "vCPU 1's timer armed");
     mmio(&mut c0, 0, LAPIC + 0x310, 4, Some(1 << 24));
     mmio(&mut c0, 0, LAPIC + 0x300, 4, Some(0x4000 | 0x77));
-    assert_ne!(vm().apics[1].irr[1].load(Ordering::SeqCst) & 1 << (0x77 - 64), 0);
+    assert_ne!(vm().apics[1].irr()[1] & 1 << (0x77 - 64), 0);
     mmio(&mut c0, 0, LAPIC + 0x300, 4, Some(0x4500));
     mmio(&mut c0, 0, LAPIC + 0x300, 4, Some(0x4600 | 0x9b));
     c1.hw().len = 1;
@@ -706,7 +716,8 @@ fn guest_boots_and_uses_the_machine() {
     turn(&mut c1, 1);
     assert_eq!(c1.hw().real, Some(0x9b));
     assert_eq!(sys::VCPU_TIMERS[1].load(Ordering::SeqCst), 0, "its timer stopped");
-    assert!(vm().apics[1].irr.iter().all(|w| w.load(Ordering::SeqCst) == 0), "the old request is gone");
+    assert_eq!(vm().apics[1].irr(), [0; 4], "the old request is gone");
+    assert_eq!(c1.hw().tpr, 0, "the TPR back to 0");
     assert!(!c1.hw().events[seen..].contains(&Event::Ext(0x77)));
 
     // ---- The UART: output into the console ring, input from the page.
@@ -738,6 +749,35 @@ fn guest_boots_and_uses_the_machine() {
     assert_eq!(c0.hw().rip, CODE + 2);
     assert_eq!(c0.hw().g[3] as u32, u32::from_le_bytes(*b"Auth"), "CPUID done");
 
+    // ---- MOV to CR0 and CR4: #GP checked before anything changes; a
+    // change of PG (or WP) flushes the guest's TLB; no LA57.
+    let mov_cr = |c: &mut Vcpu<Guest>, cr: u8, v: u64| -> Option<Event> {
+        let h = c.hw();
+        (h.g[0], h.len) = (v, 3);
+        h.exits.push_back(Exit::Cr { cr, write: true, reg: Some(0) });
+        let rip = h.rip;
+        turn(c, 0);
+        if c.hw().rip == rip { next_interrupt(c) } else { None }
+    };
+    let (pe, pg, wp) = (walk::CR0_PE, walk::CR0_PG, walk::CR0_WP);
+    let flushes = c0.hw().flushes;
+    assert_eq!(mov_cr(&mut c0, 0, pe | 0x10), None, "paging off");
+    assert_eq!(c0.hw().flushes, flushes + 1, "PG 1 to 0 flushes");
+    c0.hw().efer = walk::EFER_LME;
+    c0.hw().cr4 = 0;
+    assert_eq!(mov_cr(&mut c0, 0, pe | pg | 0x10), Some(Event::Exc(13, Some(0))), "long mode's paging without PAE");
+    assert_eq!((c0.hw().cr0, c0.hw().flushes), (pe | 0x10, flushes + 1), "nothing changed");
+    c0.hw().cr4 = walk::CR4_PAE;
+    assert_eq!(mov_cr(&mut c0, 0, pe | pg | 0x10), None);
+    c0.hw().efer |= walk::EFER_LMA;
+    assert_eq!(c0.hw().flushes, flushes + 2, "PG 0 to 1 flushes");
+    assert_eq!(mov_cr(&mut c0, 0, pe | pg | wp | 0x10), None);
+    assert_eq!(c0.hw().flushes, flushes + 3, "WP flushes");
+    assert_eq!(mov_cr(&mut c0, 0, pe | pg | wp | 0x10 | 1 << 29), Some(Event::Exc(13, Some(0))), "NW without CD");
+    assert_eq!(mov_cr(&mut c0, 4, walk::CR4_PAE | 1 << 12), Some(Event::Exc(13, Some(0))), "LA57");
+    assert_eq!(c0.hw().cr4, walk::CR4_PAE);
+    c0.hw().cr0 = pe | pg | 0x10;
+
     // ---- String I/O and MMIO through the guest's own page tables: an
     // element across two pages that are not contiguous, page faults with
     // CR2, and no port input taken for a fault.
@@ -764,7 +804,7 @@ fn guest_boots_and_uses_the_machine() {
         let reg = if input { 7 } else { 6 };
         (h.g[reg], h.g[1], h.len) = (at, count, 2);
         h.rflags = if df { h.rflags | 1 << 10 } else { h.rflags & !(1 << 10) };
-        h.exits.push_back(Exit::Io { port, size, input, string: true, rep: count != 1, addr: 8 });
+        h.exits.push_back(Exit::Io { port, size, input, string: true, rep: count != 1, addr: 8, seg: None });
         turn(c, 0);
     };
     pio(&mut c0, 0, 0xcf8, 4, Some(0x8000_0800));
@@ -785,6 +825,46 @@ fn guest_boots_and_uses_the_machine() {
     mem.write_bytes(B, &[0x00, 0x80]);
     string(&mut c0, 0xcf8, 4, false, 1, L + 0xffe, false);
     assert_eq!(pio(&mut c0, 0, 0xcf8, 4, None), 0x8000_1008, "OUTSD across two pages");
+    // A non-canonical address: #GP, no page fault, CR2 as it was.
+    let cr2 = c0.hw().cr2;
+    let rip = c0.hw().rip;
+    string(&mut c0, 0xcfc, 4, true, 1, 0x0000_8000_0000_0000, false);
+    assert_eq!(c0.hw().rip, rip);
+    assert_eq!(next_interrupt(&mut c0), Some(Event::Exc(13, Some(0))));
+    assert_eq!(c0.hw().cr2, cr2);
+
+    // OUTSD from FS: (its base not 0): the CPU's word for the segment
+    // (VT-x), or the instruction's prefix (AMD-V).
+    c0.hw().fs_base = 0x1000;
+    mem.write_bytes(A + 0x10, &0x8000_1010u32.to_le_bytes());
+    for seg in [Some(Seg::Fs), None] {
+        pio(&mut c0, 0, 0xcf8, 4, Some(0));
+        assert!(mem.write_bytes(CODE, &[0x64, 0x6f]));
+        let h = c0.hw();
+        (h.rip, h.g[6], h.len) = (CODE, L + 0x10 - 0x1000, 2);
+        h.rflags &= !(1 << 10);
+        h.exits.push_back(Exit::Io { port: 0xcf8, size: 4, input: false, string: true, rep: false, addr: 8, seg });
+        turn(&mut c0, 0);
+        assert_eq!(pio(&mut c0, 0, 0xcf8, 4, None), 0x8000_1010, "OUTSD from FS: ({seg:?})");
+    }
+    c0.hw().fs_base = 0;
+    // A 32-bit address in 64-bit mode: rDI and rCX written back
+    // zero-extended, as any 32-bit register write.
+    pio(&mut c0, 0, 0xcf8, 4, Some(0x8000_0800));
+    let h = c0.hw();
+    (h.g[7], h.g[1], h.len) = (0xdead_beef_0000_0000 | (L + 0x20), 0xdead_beef_0000_0001, 2);
+    h.exits.push_back(Exit::Io { port: 0xcfc, size: 4, input: true, string: true, rep: true, addr: 4, seg: None });
+    turn(&mut c0, 0);
+    assert_eq!((c0.hw().g[7], c0.hw().g[1]), (L + 0x24, 0), "zero-extended");
+    assert_eq!(mem.read::<u32>(A + 0x20), 0x1042_1af4);
+    // And a 16-bit one keeps the rest.
+    pio(&mut c0, 0, 0xcf8, 4, Some(0x8000_0800));
+    let h = c0.hw();
+    (h.g[7], h.g[1], h.len) = (0xdead_beef_0000_0020, 1, 2);
+    h.exits.push_back(Exit::Io { port: 0xcfc, size: 4, input: true, string: true, rep: false, addr: 2, seg: None });
+    turn(&mut c0, 0);
+    assert_eq!(c0.hw().g[7], 0xdead_beef_0000_0024);
+
     // INSW from the UART across into a page that is not there: #PF (a
     // write, not present) with CR2 at that page, the byte still unread.
     unsafe {
@@ -821,6 +901,14 @@ fn guest_boots_and_uses_the_machine() {
     mem.read_bytes(A + 0xffe, &mut lo);
     mem.read_bytes(B, &mut hi);
     assert_eq!([lo, hi].concat(), 0x34u32.to_le_bytes(), "MOVSD from MMIO to two pages");
+    // MOVSD with a 32-bit address (67): rSI and rDI zero-extended.
+    assert!(mem.write_bytes(CODE, &[0x67, 0xa5]));
+    let h = c0.hw();
+    (h.rip, h.g[6], h.g[7], h.len) = (CODE, 0x1234_0000_0000_0000 | (L + 0xffe), 0x5678_0000_0000_0000 | (L + 0x3000), 0);
+    h.exits.push_back(Exit::Mmio { gpa: 0xfec0_0000, write: true });
+    turn(&mut c0, 0);
+    assert_eq!((c0.hw().rip, c0.hw().g[6], c0.hw().g[7]), (CODE + 2, L + 0x1002, L + 0x3004));
+
     // REP STOSD downwards to IOREGSEL: the first element, then the next
     // below it, on the page that is not there: #PF there, one left.
     assert!(mem.write_bytes(CODE, &[0xf3, 0xab]));

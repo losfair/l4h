@@ -9,7 +9,7 @@
 
 use l4h_rt::sel4;
 
-use super::{Event, Exit, Gprs, Hw, SEL4_ORDER, exits, mr, vmenter, write_gprs};
+use super::{Event, Exit, Gprs, Hw, SEL4_ORDER, exits, vmenter, write_gprs};
 use crate::x86::decode::{Mode, Seg};
 use crate::x86::walk::{self, Paging};
 
@@ -57,6 +57,7 @@ const I1_HLT: u64 = 1 << 24;
 // misc2.
 const I2_VMMCALL: u64 = 1 << 1;
 const I2_RDTSCP: u64 = 1 << 7;
+const CR_WRITE_CR4: u64 = 1 << (16 + 4);
 const CR_WRITE_CR8: u64 = 1 << (16 + 8);
 const V_IRQ: u64 = 1 << 8;
 const V_INTR_PRIO: u64 = 0xf << 16;
@@ -121,7 +122,9 @@ impl Svm {
         };
         s.int_ctl = s.rd(INT_CTL);
         s.wr(INTERCEPT_MISC2, I2_VMMCALL | I2_RDTSCP);
-        s.wr(INTERCEPT_CR, CR_WRITE_CR8);
+        // CR4 writes (seL4 makes them exit anyway: LA57 and the rest are
+        // checked, vcpu.rs) and CR8's.
+        s.wr(INTERCEPT_CR, CR_WRITE_CR4 | CR_WRITE_CR8);
         s
     }
 
@@ -154,6 +157,8 @@ impl Svm {
     }
 
     fn reset_common(&mut self) {
+        // The TPR as at reset: 0 (V_TPR goes in with the next entry).
+        self.tpr = 0;
         self.wr(DR7, 0x400);
         self.wr(DR6, 0xffff_0ff0);
         self.wr(G_PAT, crate::x86::msr::PAT_DEFAULT);
@@ -213,19 +218,22 @@ impl Hw for Svm {
         }
         self.injected = ev;
         let (fault, badge) = vmenter(self.rip, misc1, evt);
+        // Every word of the exit first: reading or writing the VMCB below
+        // overwrites them.
+        let m = super::exit_mrs();
         self.valid = [false; CHUNKS];
-        self.rip = mr(0);
-        let left = mr(2);
-        self.rflags = mr(7);
-        self.int_state = mr(8);
+        self.rip = m[0];
+        let left = m[2];
+        self.rflags = m[7];
+        self.int_state = m[8];
         for (i, &x) in SEL4_ORDER.iter().enumerate() {
-            self.gp[x] = mr(10 + i);
+            self.gp[x] = m[10 + i];
         }
-        let (idt, idt_err) = (mr(27), mr(28));
+        let (idt, idt_err) = (m[27], m[28]);
         // Not delivered: again as it was asked for; being delivered: as
         // EXITINTINFO and its error code have it.
         self.pending = exits::svm_requeue(left, self.injected.take(), idt, idt_err);
-        let (rflags, own_step) = self.step.done(self.rflags);
+        let (rflags, stepped) = self.step.done(self.rflags);
         if rflags != self.rflags {
             self.rflags = rflags;
             self.wr(RFLAGS, rflags);
@@ -244,18 +252,26 @@ impl Hw for Svm {
             self.len = 0;
             return Exit::Notified(badge);
         }
-        let (code, info1, info2) = (mr(3), mr(4), mr(6));
+        let (code, info1, info2) = (m[3], m[4], m[6]);
         // Without next-RIP saving the CPU gives no length: an I/O exit
         // has the next RIP in EXITINFO2; vcpu.rs decodes the others.
-        self.len = exits::svm_len(code, mr(5), info2, self.rip);
-        match exits::svm_exit(code, info1, info2, own_step) {
-            Exit::NmiWindow => {
-                // Our single step's #DB: DR6.BS taken back.
-                let dr6 = self.rd(DR6);
-                self.wr(DR6, dr6 & !DR6_BS);
-                Exit::NmiWindow
+        self.len = exits::svm_len(code, m[5], info2, self.rip);
+        // A #DB while we stepped: ours alone, or the guest's (its own TF,
+        // breakpoints), which it gets without our single step's BS.
+        let mut dr6 = 0;
+        let mut own = false;
+        if code == 0x41 {
+            dr6 = self.rd(DR6);
+            if let Some(guest_tf) = stepped {
+                own = exits::svm_db_is_ours(guest_tf, dr6);
+                if !guest_tf {
+                    dr6 &= !DR6_BS;
+                    self.wr(DR6, dr6);
+                }
             }
-            Exit::Exception { vector: 1, error, .. } => Exit::Exception { vector: 1, error, dr6: self.rd(DR6) },
+        }
+        match exits::svm_exit(code, info1, info2, own) {
+            Exit::Exception { vector: 1, error, .. } => Exit::Exception { vector: 1, error, dr6 },
             Exit::Iret => {
                 self.iret_rip = Some(self.rip);
                 Exit::Iret

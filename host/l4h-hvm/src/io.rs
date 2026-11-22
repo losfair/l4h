@@ -182,10 +182,11 @@ pub fn kicked() {
     }
 }
 
-/// Backends' completions.  The disks share the I/O pool's bounce pages:
-/// every device's completions first, then each disk that waits for pages
-/// tries again, whichever slot freed them (a disk in an earlier slot
-/// would otherwise wait for a completion of its own that may never come).
+/// Backends' completions, in two passes.  The disks share the I/O pool's
+/// bounce pages: every device's completions first, then each device that
+/// waits for room tries again, whichever slot freed it (a disk in an
+/// earlier slot would otherwise wait for a completion of its own that may
+/// never come).
 pub fn completed() {
     let vm = vm();
     for (slot, d) in io().slots.iter_mut().enumerate() {
@@ -193,11 +194,8 @@ pub fn completed() {
         each!(d, t => t.complete(&vm.mem, &mut irq(slot)));
     }
     for (slot, d) in io().slots.iter_mut().enumerate() {
-        let Some(Dev::Blk(t)) = d.as_mut() else { continue };
-        let retry = t.backend.retry();
-        if retry != 0 {
-            t.poll(&vm.mem, retry, &mut irq(slot));
-        }
+        let Some(d) = d.as_mut() else { continue };
+        each!(d, t => t.retry(&vm.mem, &mut irq(slot)));
     }
 }
 

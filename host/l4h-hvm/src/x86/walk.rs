@@ -75,6 +75,8 @@ pub enum Error {
     Fault(PageFault),
     /// A table was outside RAM.
     BadTable,
+    /// Not a canonical (48-bit) address in long mode: #GP, not #PF.
+    NonCanonical,
 }
 
 /// The guest-physical address of `linear` for `access`, setting accessed
@@ -100,6 +102,9 @@ pub fn translate(p: &Paging, linear: u64, access: Access, mem: &mut impl Tables)
     };
     // (address of the entry, its size) at each level, with what the
     // entries allow so far.
+    if p.efer & EFER_LMA != 0 && (((linear << 16) as i64) >> 16) as u64 != linear {
+        return Err(Error::NonCanonical);
+    }
     let (mut table, levels, bytes): (u64, u32, u8) = if p.efer & EFER_LMA != 0 {
         (p.cr3 & ADDR, 4, 8)
     } else if p.cr4 & CR4_PAE != 0 {
@@ -225,6 +230,10 @@ mod tests {
         // A table outside RAM.
         m.0.insert(0x1008, (1 << 33) | P);
         assert_eq!(translate(&p, 1 << 39, R, &mut m), Err(Error::BadTable));
+        // Not canonical: #GP's, before any table.
+        assert_eq!(translate(&p, 1 << 47, R, &mut m), Err(Error::NonCanonical));
+        assert_eq!(translate(&p, 0xffff_7fff_ffff_f000, W, &mut m), Err(Error::NonCanonical));
+        assert_eq!(translate(&p, 0xffff_8000_0000_0000, R, &mut m).err(), Some(Error::Fault(PageFault { error: 0 })), "canonical high half");
     }
 
     /// SMAP refuses a supervisor data access to a user page, unless

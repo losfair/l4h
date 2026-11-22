@@ -3,6 +3,7 @@
 //! that it runs on the build host too (tests/hvm.rs).
 
 use super::{Event, Exit};
+use crate::x86::decode::Seg;
 
 // ---- VT-x.
 
@@ -17,6 +18,7 @@ pub const CR0_NE: u64 = 1 << 5;
 pub const CR0_NW: u64 = 1 << 29;
 pub const CR0_CD: u64 = 1 << 30;
 pub const CR0_PG: u64 = 1 << 31;
+pub const CR4_LA57: u64 = 1 << 12;
 /// The CR0 bits l4h-hvm owns on VT-x (the guest/host mask): seL4's CD and
 /// NW, NE, and PE and PG, so that every change of them exits and set_cr0
 /// keeps the IA-32e entry control with EFER.LMA (an AP's trampoline turns
@@ -52,8 +54,9 @@ pub fn vmx_nmi_reblock(exit_info: u64, vectoring: u64) -> bool {
 
 /// A VT-x exit: its basic reason, qualification, exit-interruption
 /// information and error code, the GPA of an EPT violation, and the
-/// address size of a string I/O instruction (`io_addr`, asked only then).
-pub fn vmx_exit(reason: u64, q: u64, exit_info: u64, exit_error: u64, gpa: u64, io_addr: impl FnOnce() -> u8) -> Exit {
+/// VM-exit instruction information of a string I/O instruction
+/// (`io_info`, asked only then: its address size and segment).
+pub fn vmx_exit(reason: u64, q: u64, exit_info: u64, exit_error: u64, gpa: u64, io_info: impl FnOnce() -> u64) -> Exit {
     if reason & (1 << 31) != 0 {
         return Exit::Fatal(reason);
     }
@@ -90,8 +93,10 @@ pub fn vmx_exit(reason: u64, q: u64, exit_info: u64, exit_error: u64, gpa: u64, 
         29 => Exit::Dr { dr: (q & 7) as u8, write: q & 16 == 0, reg: Some(((q >> 8) & 15) as u8) },
         30 => {
             let string = q & 16 != 0;
-            let addr = if string { io_addr() } else { 0 };
-            Exit::Io { port: (q >> 16) as u16, size: ((q & 7) + 1) as u8, input: q & 8 != 0, string, rep: q & 32 != 0, addr }
+            let info = if string { io_info() } else { 0 };
+            let addr = if string { 2 << ((info >> 7) & 3) } else { 0 };
+            let seg = if string { seg_of((info >> 15) & 7) } else { None };
+            Exit::Io { port: (q >> 16) as u16, size: ((q & 7) + 1) as u8, input: q & 8 != 0, string, rep: q & 32 != 0, addr, seg }
         }
         31 => Exit::Rdmsr,
         32 => Exit::Wrmsr,
@@ -101,11 +106,27 @@ pub fn vmx_exit(reason: u64, q: u64, exit_info: u64, exit_error: u64, gpa: u64, 
     }
 }
 
+/// A segment register by x86's number.
+pub fn seg_of(n: u64) -> Option<Seg> {
+    Some(match n {
+        0 => Seg::Es,
+        1 => Seg::Cs,
+        2 => Seg::Ss,
+        3 => Seg::Ds,
+        4 => Seg::Fs,
+        5 => Seg::Gs,
+        _ => return None,
+    })
+}
+
 // ---- AMD-V.
 
 pub const SVM_EVT_VALID: u64 = 1 << 31;
 pub const SVM_EVT_ERROR: u64 = 1 << 11;
 pub const RFLAGS_TF: u64 = 1 << 8;
+pub const RFLAGS_RF: u64 = 1 << 16;
+/// DR6's causes the guest has: B0-B3 (its breakpoints) and BD.
+pub const DR6_GUEST: u64 = 0x200f;
 
 /// An event in AMD-V's EXITINTINFO format (the error code in the high
 /// half), to go in again.
@@ -170,7 +191,7 @@ pub fn svm_exit(code: u64, info1: u64, info2: u64, own_step: bool) -> Exit {
                 2 => 4,
                 _ => 8,
             };
-            Exit::Io { port: (info1 >> 16) as u16, size, input: info1 & 1 != 0, string: info1 & 4 != 0, rep: info1 & 8 != 0, addr }
+            Exit::Io { port: (info1 >> 16) as u16, size, input: info1 & 1 != 0, string: info1 & 4 != 0, rep: info1 & 8 != 0, addr, seg: None }
         }
         0x7c => if info1 & 1 != 0 { Exit::Wrmsr } else { Exit::Rdmsr },
         0x7d => Exit::TaskSwitch,
@@ -184,14 +205,15 @@ pub fn svm_exit(code: u64, info1: u64, info2: u64, own_step: bool) -> Exit {
 
 /// AMD-V's NMI window without vNMI (svm_enable_nmi_window()): an NMI that
 /// waits for an IRET's completion or an interrupt shadow single-steps the
-/// guest over its instruction, with RFLAGS.TF set for that entry and its
-/// own TF back after it.  An NMI masked until an IRET waits for the IRET
+/// guest over its instruction, with RFLAGS.TF and RF set for that entry
+/// (RF: no instruction breakpoint again at its RIP) and its own TF and RF
+/// back after it.  An NMI masked until an IRET waits for the IRET
 /// intercept instead; an entry that injects an event does not step, as its
 /// frame would keep TF.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NmiStep {
-    /// Stepping: the guest's own TF.
-    pub guest_tf: Option<bool>,
+    /// Stepping: the guest's own TF and RF.
+    pub guest: Option<u64>,
 }
 
 impl NmiStep {
@@ -201,18 +223,24 @@ impl NmiStep {
         if !nmi_window || injecting || (nmi_masked && !awaiting_iret) || !(awaiting_iret || shadow) {
             return None;
         }
-        self.guest_tf = Some(rflags & RFLAGS_TF != 0);
-        Some(rflags | RFLAGS_TF)
+        self.guest = Some(rflags & (RFLAGS_TF | RFLAGS_RF));
+        Some(rflags | RFLAGS_TF | RFLAGS_RF)
     }
 
-    /// After the exit: the guest's RFLAGS (its TF back), and whether a #DB
-    /// would be ours (it had no TF of its own).
-    pub fn done(&mut self, rflags: u64) -> (u64, bool) {
-        match self.guest_tf.take() {
-            Some(tf) => ((rflags & !RFLAGS_TF) | if tf { RFLAGS_TF } else { 0 }, !tf),
-            None => (rflags, false),
+    /// After the exit: the guest's RFLAGS (its TF and RF back), and, if it
+    /// stepped, whether the guest had TF of its own.
+    pub fn done(&mut self, rflags: u64) -> (u64, Option<bool>) {
+        match self.guest.take() {
+            Some(g) => ((rflags & !(RFLAGS_TF | RFLAGS_RF)) | g, Some(g & RFLAGS_TF != 0)),
+            None => (rflags, None),
         }
     }
+}
+
+/// Whether a #DB during our single step is ours alone: the guest had no
+/// TF of its own, and no breakpoint of its (DR6's B0-B3, BD) hit.
+pub fn svm_db_is_ours(guest_tf: bool, dr6: u64) -> bool {
+    !guest_tf && dr6 & DR6_GUEST == 0
 }
 
 #[cfg(test)]
@@ -223,7 +251,7 @@ mod tests {
     fn vmx_owns_pe_and_pg_and_steps_over_instructions_only() {
         assert_eq!(VMX_CR0_OWNED & (CR0_PE | CR0_PG), CR0_PE | CR0_PG);
         assert_eq!(VMX_CR0_OWNED & (CR0_CD | CR0_NW), CR0_CD | CR0_NW);
-        let never = || -> u8 { panic!("asked for a string's address size") };
+        let never = || -> u64 { panic!("asked for a string's instruction information") };
         // External interrupt, INIT, SIPI, the host's NMI: no instruction.
         for r in [1, 3, 4] {
             assert_eq!(vmx_exit(r, 0, 0, 0, 0, never), Exit::Notified(0));
@@ -236,9 +264,10 @@ mod tests {
         assert_eq!(vmx_exit(16, 0, 0, 0, 0, never), Exit::Rdtsc);
         assert_eq!(vmx_exit(10, 0, 0, 0, 0, never), Exit::Cpuid);
         assert_eq!(vmx_exit(30, 0x3f8 << 16 | 8, 0, 0, 0, never),
-            Exit::Io { port: 0x3f8, size: 1, input: true, string: false, rep: false, addr: 0 });
-        assert_eq!(vmx_exit(30, 0x3f8 << 16 | 16 | 32 | 3, 0, 0, 0, || 4),
-            Exit::Io { port: 0x3f8, size: 4, input: false, string: true, rep: true, addr: 4 });
+            Exit::Io { port: 0x3f8, size: 1, input: true, string: false, rep: false, addr: 0, seg: None });
+        // OUTSD with a 32-bit address and FS: (instruction information).
+        assert_eq!(vmx_exit(30, 0x3f8 << 16 | 16 | 32 | 3, 0, 0, 0, || 1 << 7 | 4 << 15),
+            Exit::Io { port: 0x3f8, size: 4, input: false, string: true, rep: true, addr: 4, seg: Some(Seg::Fs) });
         assert_eq!(vmx_exit(48, 2, 0, 0, 0xfee0_0300, never), Exit::Mmio { gpa: 0xfee0_0300, write: true });
         assert_eq!(vmx_exit(1 << 31 | 33, 0, 0, 0, 0, never), Exit::Fatal(1 << 31 | 33));
     }
@@ -291,18 +320,26 @@ mod tests {
     #[test]
     fn svm_nmi_window_single_steps_and_gives_tf_back() {
         let mut s = NmiStep::default();
+        let (tf, rf) = (RFLAGS_TF, RFLAGS_RF);
         // Nothing to wait for, an event going in, or masked until an IRET.
         assert_eq!(s.arm(false, false, false, true, true, 2), None);
         assert_eq!(s.arm(true, true, false, true, true, 2), None);
         assert_eq!(s.arm(true, false, true, false, true, 2), None);
         assert_eq!(s.arm(true, false, false, false, false, 2), None);
-        assert_eq!(s.done(0x102), (0x102, false), "not stepping");
-        // An interrupt shadow: stepped with TF, TF taken back, the #DB ours.
-        assert_eq!(s.arm(true, false, false, false, true, 0x202), Some(0x302));
-        assert_eq!(s.done(0x302), (0x202, true));
-        // An IRET's completion, with the guest's own TF: kept, its #DB its.
-        assert_eq!(s.arm(true, false, true, true, false, 0x302), Some(0x302));
-        assert_eq!(s.done(0x302), (0x302, false));
-        assert_eq!(s.guest_tf, None);
+        assert_eq!(s.done(0x102), (0x102, None), "not stepping");
+        // An interrupt shadow: stepped with TF and RF, both taken back.
+        assert_eq!(s.arm(true, false, false, false, true, 0x202), Some(0x202 | tf | rf));
+        assert_eq!(s.done(0x202 | tf | rf), (0x202, Some(false)));
+        // The guest's own TF (and RF) kept.
+        assert_eq!(s.arm(true, false, true, true, false, 0x202 | tf), Some(0x202 | tf | rf));
+        assert_eq!(s.done(0x202 | tf), (0x202 | tf, Some(true)));
+        assert_eq!(s.arm(true, false, false, false, true, 0x202 | rf), Some(0x202 | tf | rf));
+        assert_eq!(s.done(0x202 | tf), (0x202 | rf, Some(false)));
+        assert_eq!(s.guest, None);
+        // Whose #DB: ours only without the guest's TF or breakpoints.
+        assert!(svm_db_is_ours(false, 1 << 14));
+        assert!(!svm_db_is_ours(true, 1 << 14), "its own TF");
+        assert!(!svm_db_is_ours(false, 1 << 14 | 1 << 2), "its breakpoint B2");
+        assert!(!svm_db_is_ours(false, 1 << 13), "its BD");
     }
 }

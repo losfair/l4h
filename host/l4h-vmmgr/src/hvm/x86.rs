@@ -463,6 +463,9 @@ pub fn spawn(
     comp.tcb.tcb_set_mc_priority(slot::TCB.cap(), hv::MCP)?;
     map(g, &comp, alloc);
     vcpus(g, &comp, alloc, host_info)?;
+    // It cannot audit itself (its MCP is below the debug syscalls'): we do,
+    // everything given, before it runs.
+    comp.audit_cspace();
     Ok(comp)
 }
 

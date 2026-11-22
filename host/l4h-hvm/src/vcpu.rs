@@ -33,6 +33,17 @@ const DF: u64 = 1 << 10;
 const AC: u64 = 1 << 18;
 const VEC_PF: u8 = 14;
 
+/// Register `old` with `v` written as an address of `addr` bytes: a
+/// 16-bit one keeps the rest; a 32-bit one is zero-extended, as every
+/// 32-bit register write; a 64-bit one is all of it.
+pub fn with_addr(old: u64, v: u64, addr: u8) -> u64 {
+    match addr {
+        2 => (old & !0xffff) | (v & 0xffff),
+        4 => v & 0xffff_ffff,
+        _ => v,
+    }
+}
+
 /// Up to two pieces (GPA, bytes) of an access at a linear address.
 struct Span {
     parts: [(u64, u64); 2],
@@ -42,7 +53,12 @@ const STRING_BATCH: u64 = 4096;
 
 /// The CR4 bits a guest may set: seL4's allowlist (VCPU_GUEST_CR4_ALLOWED)
 /// without LA57, which CPUID hides.
-const CR4_ALLOWED: u64 = 0x1fff | (1 << 16) | (1 << 17) | (1 << 18) | (1 << 20) | (1 << 21);
+const CR4_ALLOWED: u64 = 0x0fff | (1 << 16) | (1 << 17) | (1 << 18) | (1 << 20) | (1 << 21);
+const CR4_PCIDE: u64 = 1 << 17;
+const CR0_NW: u64 = 1 << 29;
+const CR0_CD: u64 = 1 << 30;
+/// CR0 bits whose change flushes the guest's TLB: PG, WP, CD, NW.
+const CR0_FLUSH: u64 = walk::CR0_PG | walk::CR0_WP | CR0_CD | CR0_NW;
 const CR4_FLUSH: u64 = (1 << 4) | (1 << 5) | (1 << 7) | (1 << 17) | (1 << 20) | (1 << 21);
 
 /// Guest RAM as the page walker reads it.
@@ -145,6 +161,7 @@ impl<H: Hw> Vcpu<H> {
             // gone, and its timer stops.
             self.lapic.init(sh);
             sh.clear_requests();
+            self.hw.set_tpr(0);
             self.arm_timer();
             self.wait_sipi = true;
             self.halted = false;
@@ -252,9 +269,9 @@ impl<H: Hw> Vcpu<H> {
     fn exit(&mut self, exit: Exit) {
         match exit {
             Exit::Notified(_) | Exit::IrqWindow | Exit::NmiWindow | Exit::Iret => {}
-            Exit::Io { port, size, input, string, rep, addr } => {
+            Exit::Io { port, size, input, string, rep, addr, seg } => {
                 if string {
-                    self.string_io(port, size, input, rep, addr);
+                    self.string_io(port, size, input, rep, addr, seg);
                 } else {
                     let g = self.hw.gprs();
                     if input {
@@ -408,15 +425,27 @@ impl<H: Hw> Vcpu<H> {
         let v = if long { v } else { v & 0xffff_ffff };
         match (cr, write) {
             (0, true) => {
-                // Reserved bits, PG without PE, NW without CD.
-                let bad = (v >> 32 != 0) || (v & walk::CR0_PG != 0 && v & 1 == 0) || (v & (1 << 29) != 0 && v & (1 << 30) == 0);
+                // Reserved bits, PG without PE, NW without CD, and long
+                // mode's paging without PAE: #GP before anything changes.
+                let p = self.hw.paging();
+                let bad = (v >> 32 != 0)
+                    || (v & walk::CR0_PG != 0 && v & 1 == 0)
+                    || (v & CR0_NW != 0 && v & CR0_CD == 0)
+                    || (v & walk::CR0_PG != 0 && p.cr0 & walk::CR0_PG == 0 && p.efer & walk::EFER_LME != 0 && p.cr4 & walk::CR4_PAE == 0);
                 if bad || !self.hw.set_cr0(v) {
                     return self.gp();
+                }
+                // Translations the guest's TLB holds change meaning (VPID
+                // keeps them across exits): flushed.
+                if (p.cr0 ^ v) & CR0_FLUSH != 0 {
+                    self.hw.flush_tlb();
                 }
             }
             (4, true) => {
                 let old = self.hw.cr4();
-                if v & !CR4_ALLOWED != 0 || (long && v & walk::CR4_PAE == 0) || !self.hw.set_cr4(v) {
+                // Nothing outside the allowed (no LA57: 4-level paging, as
+                // walk.rs has it); PAE kept and PCIDE only in long mode.
+                if v & !CR4_ALLOWED != 0 || (long && v & walk::CR4_PAE == 0) || (!long && v & CR4_PCIDE != 0) || !self.hw.set_cr4(v) {
                     return self.gp();
                 }
                 if (old ^ v) & CR4_FLUSH != 0 {
@@ -590,11 +619,13 @@ impl<H: Hw> Vcpu<H> {
     /// INS and OUTS, REP or not: through the guest's page tables, an
     /// element that spans two pages in two pieces.  INS reads the port
     /// only once its memory is known to be writable.
-    fn string_io(&mut self, port: u16, size: u8, input: bool, rep: bool, addr: u8) {
+    fn string_io(&mut self, port: u16, size: u8, input: bool, rep: bool, addr: u8, seg: Option<Seg>) {
         let mask = if addr >= 8 { u64::MAX } else { (1u64 << (8 * addr as u32)) - 1 };
         let mut count = if rep { self.hw.gprs()[1] & mask } else { 1 };
         let down = self.hw.rflags() & DF != 0;
-        let (reg, seg) = if input { (7, Seg::Es) } else { (6, Seg::Ds) };
+        // INS writes ES:rDI; OUTS reads rSI in DS or the segment its prefix
+        // names (the CPU's word for it, or the instruction's).
+        let (reg, seg) = if input { (7, Seg::Es) } else { (6, seg.or_else(|| self.prefix_seg()).unwrap_or(Seg::Ds)) };
         let base = if self.hw.mode() == Mode::Bits64 && seg != Seg::Fs && seg != Seg::Gs { 0 } else { self.hw.seg_base(seg) };
         let mut done = 0;
         while count != 0 && done < STRING_BATCH {
@@ -615,10 +646,10 @@ impl<H: Hw> Vcpu<H> {
             }
             let g = self.hw.gprs();
             let step = if down { (size as u64).wrapping_neg() } else { size as u64 };
-            g[reg] = (g[reg] & !mask) | (g[reg].wrapping_add(step) & mask);
+            g[reg] = with_addr(g[reg], g[reg].wrapping_add(step), addr);
             count -= 1;
             if rep {
-                g[1] = (g[1] & !mask) | (count & mask);
+                g[1] = with_addr(g[1], count, addr);
             }
             self.hw.mark_gprs();
             done += 1;
@@ -645,7 +676,7 @@ impl<H: Hw> Vcpu<H> {
                 self.fault(VEC_PF, Some(f.error));
                 None
             }
-            Err(walk::Error::BadTable) => {
+            Err(walk::Error::BadTable | walk::Error::NonCanonical) => {
                 self.gp();
                 None
             }
@@ -720,6 +751,13 @@ impl<H: Hw> Vcpu<H> {
             n += k;
         }
         (bytes, n)
+    }
+
+    /// The segment an override prefix of the instruction at CS:RIP names
+    /// (OUTS on AMD-V, which does not say).
+    fn prefix_seg(&mut self) -> Option<Seg> {
+        let (bytes, n) = self.fetch();
+        decode::prefix_seg(&bytes[..n])
     }
 
     /// The instruction at CS:RIP, decoded (#UD if we cannot).
@@ -805,13 +843,13 @@ impl<H: Hw> Vcpu<H> {
             }
             let step = if down { size.wrapping_neg() } else { size };
             let g = self.hw.gprs();
-            g[7] = (g[7] & !mask) | (g[7].wrapping_add(step) & mask);
+            g[7] = with_addr(g[7], g[7].wrapping_add(step), a);
             if insn.kind == Kind::Movs {
-                g[6] = (g[6] & !mask) | (g[6].wrapping_add(step) & mask);
+                g[6] = with_addr(g[6], g[6].wrapping_add(step), a);
             }
             count -= 1;
             if rep {
-                g[1] = (g[1] & !mask) | (count & mask);
+                g[1] = with_addr(g[1], count, a);
             }
             self.hw.mark_gprs();
             done += 1;

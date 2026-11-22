@@ -9,8 +9,10 @@
 # usable): QEMU gives the host the CPU's own.  QEMU's TCG cannot stand in:
 # its SVM has no next-RIP saving, which seL4 requires.  Without VT-x or
 # AMD-V the host refuses HVM guests (-ENODEV), which is checked, and the
-# test is skipped; where they are there (or HVMTEST_REQUIRE_HW=1), a
-# skip fails.
+# test is skipped.  Where the build host has them (VT-x or AMD-V in
+# /proc/cpuinfo, /dev/kvm usable), a skip fails unless HVMTEST_ALLOW_SKIP=1
+# (a run that hides them on purpose); elsewhere HVMTEST_REQUIRE_HW=1 makes
+# it fail.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 source "$root/tools/guest-env.sh"
@@ -35,12 +37,10 @@ rm -f "$out/hvm.img"
 truncate -s 64M "$out/hvm.img"
 slow=$l4h_test_slow
 require_hw=${HVMTEST_REQUIRE_HW:-0}
-# The host CPU with its VT-x or AMD-V, unless the caller chose a CPU
-# (L4H_QEMU_CPU, such as one without them): then only HVMTEST_REQUIRE_HW
-# makes a skip fail.
-if [ -z "${L4H_QEMU_CPU:-}" ] && grep -qwE 'vmx|svm' /proc/cpuinfo; then
-    export L4H_QEMU_CPU=host,+invtsc
-    if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then require_hw=1; fi
+if grep -qwE 'vmx|svm' /proc/cpuinfo && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+    # The host CPU with its VT-x or AMD-V, unless the caller chose one.
+    export L4H_QEMU_CPU=${L4H_QEMU_CPU:-host,+invtsc}
+    [ "${HVMTEST_ALLOW_SKIP:-0}" = 1 ] || require_hw=1
 fi
 echo "HVMTEST: -cpu ${L4H_QEMU_CPU:-(run-qemu.sh default)}"
 L4H_DOM0_DISKS=0 L4H_DOM0_MEM_MB=512 L4H_SMP=${L4H_SMP:-4} \

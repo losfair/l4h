@@ -574,32 +574,33 @@ pub const fn cap_tag(object: Object) -> u32 {
     }
 }
 
-/// seL4's tags of a CNode and of a TCB, the same on every architecture;
-/// architecture objects (frames, page tables, EPT roots, VCPUs) have odd
-/// tags, which vary by configuration.
+/// seL4's tags of a CNode and of a TCB, the same on every architecture,
+/// and of x86-64's VCPU and EPT PML4 (structures.bf of x86-64's mode).
 pub const CAP_NULL: u32 = 0;
 pub const CAP_CNODE: u32 = 10;
 pub const CAP_THREAD: u32 = 12;
+pub const CAP_X86_VCPU: u32 = 21;
+pub const CAP_X86_EPT_PML4: u32 = 29;
 
 /// What an HVM monitor's capability that is no edge is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Held {
     CNode,
     Thread,
-    /// An architecture object (odd tag).
-    Arch,
+    Vcpu,
+    EptPml4,
 }
 
 /// The capabilities vmmgr gives an l4h-hvm besides its edges and the
 /// standard slots: (first slot, count, what, for what).  Anything else
 /// there that does not call or signal is refused by `audit`.
 pub const HVM_HELD: [(u64, usize, Held, &str); 6] = [
-    (hvm::SLOT_EPT, 1, Held::Arch, "the guest's EPT root"),
+    (hvm::SLOT_EPT, 1, Held::EptPml4, "the guest's EPT root"),
     (hvm::SLOT_BLOCKS, 1, Held::CNode, "the CNode of its RAM blocks' Untypeds"),
     (hvm::SLOT_KEEP_EPT, 1, Held::CNode, "the CNode of its RAM blocks' EPT frames"),
     (hvm::SLOT_KEEP_HVM, 1, Held::CNode, "the CNode of its RAM blocks' own mappings"),
     (hvm::SLOT_VCPU_TCB, abi::MAX_VCPUS, Held::Thread, "its vCPU threads"),
-    (hvm::SLOT_VCPU_OBJ, abi::MAX_VCPUS, Held::Arch, "its VCPUs"),
+    (hvm::SLOT_VCPU_OBJ, abi::MAX_VCPUS, Held::Vcpu, "its VCPUs"),
 ];
 
 /// The HVM_HELD entry slot `slot` is in.
@@ -674,8 +675,10 @@ pub fn audit(kind: u32, slot: u64, tag: u32) -> Result<(), &'static str> {
             return Ok(());
         }
         return match (hvm_held(slot), tag) {
-            (Some(Held::CNode), CAP_CNODE) | (Some(Held::Thread), CAP_THREAD) => Ok(()),
-            (Some(Held::Arch), t) if t % 2 == 1 => Ok(()),
+            (Some(Held::CNode), CAP_CNODE)
+            | (Some(Held::Thread), CAP_THREAD)
+            | (Some(Held::Vcpu), CAP_X86_VCPU)
+            | (Some(Held::EptPml4), CAP_X86_EPT_PML4) => Ok(()),
             (Some(_), _) => Err("of another type than an HVM monitor has there"),
             (None, _) => Err("that an HVM monitor has nowhere there"),
         };
@@ -979,14 +982,22 @@ mod tests {
     #[test]
     fn an_hvm_monitors_held_capabilities_are_audited_by_slot_and_type() {
         let h = crate::KIND_HVM;
-        assert_eq!(audit(h, hvm::SLOT_EPT, 29), Ok(()));
+        assert_eq!(audit(h, hvm::SLOT_EPT, CAP_X86_EPT_PML4), Ok(()));
+        // Each architecture object only where it belongs: a VCPU is no EPT
+        // root, nor any other odd tag.
+        for t in [CAP_X86_VCPU, 19, 23, 1] {
+            assert!(audit(h, hvm::SLOT_EPT, t).is_err(), "tag {t} as the EPT root");
+        }
+        for t in [CAP_X86_EPT_PML4, 19, 23, 1] {
+            assert!(audit(h, hvm::SLOT_VCPU_OBJ, t).is_err(), "tag {t} as a VCPU");
+        }
         for s in [hvm::SLOT_BLOCKS, hvm::SLOT_KEEP_EPT, hvm::SLOT_KEEP_HVM] {
             assert_eq!(audit(h, s, CAP_CNODE), Ok(()));
             assert!(audit(h, s, CAP_THREAD).is_err() && audit(h, s, 1).is_err());
         }
         for v in [0, abi::MAX_VCPUS as u64 - 1] {
             assert_eq!(audit(h, hvm::SLOT_VCPU_TCB + v, CAP_THREAD), Ok(()));
-            assert_eq!(audit(h, hvm::SLOT_VCPU_OBJ + v, 21), Ok(()));
+            assert_eq!(audit(h, hvm::SLOT_VCPU_OBJ + v, CAP_X86_VCPU), Ok(()));
             assert!(audit(h, hvm::SLOT_VCPU_OBJ + v, CAP_CNODE).is_err());
             // Its waits' notifications, and the vCPUs' badged ones.
             assert_eq!(audit(h, hvm::SLOT_VCPU_WAIT + v, CAP_NOTIFICATION), Ok(()));

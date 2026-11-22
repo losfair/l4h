@@ -191,7 +191,7 @@ impl Lapic {
         if !self.enabled() {
             return None;
         }
-        let irr: [u64; 4] = core::array::from_fn(|i| shared.irr[i].load(Ordering::Acquire));
+        let irr = shared.irr();
         let v = Self::highest(&irr)?;
         ((v as u32 & 0xf0) > (self.ppr() & 0xf0)).then_some(v)
     }
@@ -199,9 +199,8 @@ impl Lapic {
     /// The CPU takes interrupt `v` (pending()): it moves from IRR to ISR.
     pub fn accept(&mut self, shared: &Shared, v: u8) {
         let (w, bit) = ((v / 64) as usize, 1u64 << (v % 64));
-        shared.irr[w].fetch_and(!bit, Ordering::AcqRel);
         self.isr[w] |= bit;
-        if shared.level[w].fetch_and(!bit, Ordering::AcqRel) & bit != 0 {
+        if shared.take(v) == Some(true) {
             self.tmr[w] |= bit;
         } else {
             self.tmr[w] &= !bit;
@@ -234,8 +233,7 @@ impl Lapic {
             ISR..=0x170 => self.word(&self.isr, off - ISR),
             TMR..=0x1f0 => self.word(&self.tmr, off - TMR),
             IRR..=0x270 => {
-                let irr: [u64; 4] = core::array::from_fn(|i| shared.irr[i].load(Ordering::Acquire));
-                self.word(&irr, off - IRR)
+                self.word(&shared.irr(), off - IRR)
             }
             ESR => 0,
             ICR_LO => self.icr as u32,
@@ -589,7 +587,7 @@ mod tests {
         // Masked: it fires without an interrupt.
         l.write(&s, 0, LVT_TIMER, (2 << 17) | LVT_MASKED | 0x20);
         l.wrmsr(&s, 0, MSR_TSC_DEADLINE, 1).unwrap();
-        s.irr.iter().for_each(|w| w.store(0, Ordering::Relaxed));
+        s.clear_requests();
         assert!(l.tick(&s, 2));
         assert_eq!(l.pending(&s), None);
     }

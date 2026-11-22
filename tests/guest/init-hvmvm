@@ -14,10 +14,10 @@ echo "HVMVM: clock $(cat /sys/devices/system/clocksource/clocksource0/current_cl
 # logind or acpid would.
 for i in /sys/class/input/input*; do
     [ "$(cat "$i/name" 2>/dev/null)" = "Power Button" ] || continue
-    for e in "$i"/event*; do button=/dev/input/${e##*/}; done
+    for e in "$i"/event*; do [ -e "$e" ] && button=/dev/input/${e##*/}; done
 done
 if [ -n "$button" ]; then
-    (dd if="$button" bs=24 count=1 >/dev/null 2>&1; echo "HVMVM: power button"; sync; poweroff -f) &
+    (dd if="$button" bs=24 count=1 >/dev/null 2>&1 && { echo "HVMVM: power button"; sync; poweroff -f; }) &
 else
     echo "HVMVM: no power button"
 fi

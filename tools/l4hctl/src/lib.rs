@@ -924,11 +924,12 @@ pub fn hvm_layout(kernel: &[u8], initrd_len: u64, ram: u64) -> Result<(u64, u64)
             return err("kernel: not an x86-64 ELF64 image");
         }
         let (phoff, phentsize, phnum) = (le(32, 8)? as usize, le(54, 2)? as usize, le(56, 2)? as usize);
-        let mut end = 0;
+        let mut end = 0u64;
         for i in 0..phnum {
-            let ph = phoff + i * phentsize;
+            let ph = phoff.checked_add(i * phentsize).ok_or(Error("kernel: bad program headers".into()))?;
             if le(ph, 4)? == 1 {
-                end = end.max(le(ph + 24, 8)?.saturating_add(le(ph + 40, 8)?));
+                let e = le(ph + 24, 8)?.checked_add(le(ph + 40, 8)?).ok_or(Error("kernel: segment past the address space".into()))?;
+                end = end.max(e);
             }
         }
         if end == 0 {
@@ -952,15 +953,17 @@ pub fn hvm_layout(kernel: &[u8], initrd_len: u64, ram: u64) -> Result<(u64, u64)
             p if le(0x234, 1)? == 0 || p % align == 0 => p,
             _ => 16 << 20,
         };
-        load + le(0x260, 4)?.max(payload)
+        load.checked_add(le(0x260, 4)?.max(payload)).ok_or(Error("kernel: placed past the address space".into()))?
     } else {
         return err("kernel: neither a bzImage nor an ELF vmlinux");
     };
-    let image = end.next_multiple_of(MIB2);
-    let initrd = (image + kernel.len() as u64).next_multiple_of(MIB2);
+    let past = || Error("kernel: placed past the address space".into());
+    let image = end.checked_next_multiple_of(MIB2).ok_or_else(past)?;
+    let initrd = image.checked_add(kernel.len() as u64).and_then(|e| e.checked_next_multiple_of(MIB2)).ok_or_else(past)?;
+    let need = initrd.checked_add(initrd_len).ok_or_else(past)?;
     let top = ram.min(LOW_RAM_MAX);
-    if initrd + initrd_len > top {
-        return err(format!("kernel and initrd need {} MiB of RAM below 3 GiB; the VM has {} MiB there", (initrd + initrd_len).div_ceil(1 << 20), top >> 20));
+    if need > top {
+        return err(format!("kernel and initrd need {} MiB of RAM below 3 GiB; the VM has {} MiB there", need.div_ceil(1 << 20), top >> 20));
     }
     Ok((image, initrd))
 }
@@ -1958,6 +1961,19 @@ mod hvm_layout_tests {
         assert_eq!(hvm_layout(&k, 0, 256 * MIB).unwrap().0, 56 * MIB, "relocatable, misaligned: 16 MiB");
         k[0x258..0x260].copy_from_slice(&(64 * MIB).to_le_bytes());
         assert_eq!(hvm_layout(&k, 0, 256 * MIB).unwrap().0, 104 * MIB);
+    }
+
+    /// Places that do not fit in 64 bits are errors, not overflows.
+    #[test]
+    fn layouts_past_the_address_space() {
+        let mut k = bzimage(10 * MIB as usize, 30, 40 * MIB as u32, 1);
+        k[0x234] = 0;
+        k[0x258..0x260].copy_from_slice(&(u64::MAX - MIB).to_le_bytes());
+        assert!(hvm_layout(&k, 0, 256 * MIB).is_err());
+        k[0x258..0x260].copy_from_slice(&(u64::MAX - 64 * MIB).to_le_bytes());
+        assert!(hvm_layout(&k, 0, 256 * MIB).is_err(), "its 2 MiB-aligned staging");
+        let k = bzimage(10 * MIB as usize, 30, 40 * MIB as u32, 1);
+        assert!(hvm_layout(&k, u64::MAX - 8, u64::MAX).is_err(), "an initrd past the end");
     }
 
     #[test]

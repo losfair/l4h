@@ -398,6 +398,25 @@ pub fn decode(bytes: &[u8], mode: Mode) -> Result<Insn, Error> {
     }
 }
 
+/// The segment the last override among the legacy prefixes of the
+/// instruction in `bytes` names, if any.
+pub fn prefix_seg(bytes: &[u8]) -> Option<Seg> {
+    let mut seg = None;
+    for &b in bytes.iter().take(MAX_LEN) {
+        seg = match b {
+            0x26 => Some(Seg::Es),
+            0x2e => Some(Seg::Cs),
+            0x36 => Some(Seg::Ss),
+            0x3e => Some(Seg::Ds),
+            0x64 => Some(Seg::Fs),
+            0x65 => Some(Seg::Gs),
+            0x66 | 0x67 | 0xf0 | 0xf2 | 0xf3 => seg,
+            _ => break,
+        };
+    }
+    seg
+}
+
 /// The length of the instruction in `bytes`, prefixes included: one that
 /// made a VM exit, for a CPU that did not say (AMD-V without next-RIP
 /// saving).  Those decode() knows, and the others that exit: HLT, PAUSE,
@@ -410,19 +429,22 @@ pub fn length(bytes: &[u8], mode: Mode) -> Option<u8> {
     }
     let mut c = Cursor { bytes, at: 0 };
     let mut addrsize_ovr = false;
+    let mut rex = 0;
     let mut op;
+    // Any number of legacy prefixes, repeated or not, and REX among them
+    // (which counts only right before the opcode), up to 15 bytes.
     loop {
         op = c.byte().ok()?;
         match op {
             0x67 => addrsize_ovr = true,
             0x66 | 0xf3 | 0xf2 | 0xf0 | 0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 => {}
+            0x40..=0x4f if mode == Mode::Bits64 => {
+                rex = op;
+                continue;
+            }
             _ => break,
         }
-    }
-    let mut rex = 0;
-    if mode == Mode::Bits64 && (0x40..0x50).contains(&op) {
-        rex = op;
-        op = c.byte().ok()?;
+        rex = 0;
     }
     let addr: u8 = match mode {
         Mode::Bits64 => if addrsize_ovr { 4 } else { 8 },
@@ -726,6 +748,19 @@ mod tests {
         assert_eq!(l(&[0x89, 0x03]), Some(2), "decode()'s own");
         assert_eq!(l(&[0x0f, 0x0b]), None, "UD2 does not exit");
         assert_eq!(l(&[0x0f]), None, "truncated");
+        // Redundant prefixes, and REX before one (ignored, still counted).
+        assert_eq!(l(&[0x66, 0x0f, 0xa2]), Some(3));
+        assert_eq!(l(&[0x2e, 0x0f, 0x32]), Some(3));
+        assert_eq!(l(&[0x26, 0x66, 0xf3, 0x0f, 0x30]), Some(5));
+        assert_eq!(l(&[0x48, 0x66, 0x0f, 0xa2]), Some(4));
+        assert_eq!(l(&[0xf3, 0xf3, 0xf3, 0x90]), Some(4));
+        assert_eq!(l(&[0x66, 0x67, 0x0f, 0x01, 0x38]), Some(5), "INVLPG [eax]");
+        assert_eq!(length(&[0x66, 0x0f, 0x01, 0x3e, 0x34, 0x12], Mode::Bits16), Some(6), "INVLPG [disp16]");
+        let mut long = [0x66u8; 16];
+        (long[13], long[14]) = (0x0f, 0xa2);
+        assert_eq!(l(&long[..15]), Some(15));
+        (long[14], long[15]) = (0x0f, 0xa2);
+        assert_eq!(l(&long), None, "over 15 bytes");
     }
 
     #[test]

@@ -1186,7 +1186,11 @@ create fails with `-ENODEV`. `l4hctl list` shows them as `hvm`.
   the debug syscalls' threshold, so a guest that took over its monitor
   has no more authority than a guest kernel. Its wiring is checked as
   every component's (`HVM_*` edges: vmmgr's `vmm_ready`/`guest_power`,
-  blkd and netd kicks, its own call endpoint and notifications).
+  blkd and netd kicks, its own call endpoint and notifications), with
+  what else it holds by slot and type (`wiring::HVM_HELD`: the EPT root,
+  the block and keep CNodes, the vCPU TCBs and VCPUs); vmmgr audits its
+  CSpace before it starts, as it cannot (debug syscalls need an MCP
+  above its own).
 - **Threads.** One thread per vCPU, bound to its seL4 VCPU
   (`VCPU_SetTCB`, `TCB_SetEPTRoot`), at `PRIO_KERNEL` on the vCPU's kernel
   SC (one SC: vmmgr's scheduler gives HVM vCPUs `sc_k` only), with its own

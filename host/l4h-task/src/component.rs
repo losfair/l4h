@@ -48,8 +48,10 @@ static AUDIT_SLOT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicU
 
 /// Check what this task mints into its components (debug builds), looking
 /// at it in `slot`, an empty slot of its own CSpace kept for it.
-/// Every component also audits its whole CSpace in l4h_rt::init.
-/// A VMM's ordinary copies and live installs are checked here too.
+/// Every component also audits its whole CSpace in l4h_rt::init, but an
+/// HVM monitor, whose MCP is below the debug syscalls': its parent does
+/// (Component::audit_cspace).  A VMM's ordinary copies and live installs
+/// are checked here too.
 pub fn audit_in(slot: crate::mem::Slot) {
     AUDIT_SLOT.store(slot, core::sync::atomic::Ordering::Relaxed);
 }
@@ -179,6 +181,38 @@ impl Component {
     fn minted<H, T, O: o::IsObject, P>(&self, e: &E<H, T, O, P>, idx: u64) {
         if let Some(t) = self.identify(idx) {
             assert!(t == wiring::cap_tag(O::OBJECT), "component {} slot {} ({}): not a capability to {:?}", self.id, idx, e.name, O::OBJECT);
+        }
+    }
+
+    /// Audit its whole CSpace as l4h_rt::init does a component's own
+    /// (debug builds): for a component that cannot (an HVM monitor, below
+    /// the debug syscalls' MCP), before it starts.  An empty slot is
+    /// CAP_NULL; a capability that cannot be looked at (copied) past the
+    /// standard slots stops the parent, as one the wiring does not give.
+    pub fn audit_cspace(&self) {
+        sel4::sel4_cfg_if! {
+            if #[sel4_cfg(DEBUG_BUILD)] {
+                let slot = AUDIT_SLOT.load(core::sync::atomic::Ordering::Relaxed);
+                if slot == 0 || !host::AUDIT {
+                    return;
+                }
+                let scratch = self.local_cnode.absolute_cptr(cap_at::<cap_type::Null>(slot));
+                for idx in 0..1u64 << self.cnode_bits {
+                    let tag = match scratch.copy(&self.slot(idx), CapRights::all()) {
+                        Ok(()) => {
+                            let t = cap_at::<cap_type::Null>(slot).debug_identify();
+                            scratch.delete().expect("audit scratch slot");
+                            t
+                        }
+                        Err(sel4::Error::FailedLookup) => host::wiring::CAP_NULL,
+                        Err(_) if idx < host::SLOT_FIRST_FREE => continue,
+                        Err(e) => panic!("component {} wiring audit: slot {} cannot be looked at: {:?}", self.id, idx, e),
+                    };
+                    if let Err(why) = host::wiring::audit(self.kind, idx, tag) {
+                        panic!("component {} wiring audit: slot {} (tag {}) {}", self.id, idx, tag, why);
+                    }
+                }
+            }
         }
     }
 

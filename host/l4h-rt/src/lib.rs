@@ -172,6 +172,11 @@ pub fn init() -> &'static Info {
 /// the layout are looked at: memd's and vmmgr's larger CNodes hold memory
 /// above them.
 fn audit(kind: u32) {
+    // An HVM monitor's MCP is below the debug syscalls' (l4h_host::hvm::MCP):
+    // vmmgr audited its CSpace before it started (Component::audit_cspace).
+    if kind == host::KIND_HVM {
+        return;
+    }
     sel4::sel4_cfg_if! {
         if #[sel4_cfg(DEBUG_BUILD)] {
             if !host::AUDIT {

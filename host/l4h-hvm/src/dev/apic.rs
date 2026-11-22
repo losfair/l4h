@@ -25,11 +25,11 @@ pub const PENDING_SIPI: u32 = 1 << 2;
 pub struct Shared {
     /// Its APIC ID (the vCPU's number).
     pub id: u32,
-    /// Fixed interrupts requested: vector v is bit v % 64 of irr[v / 64].
-    pub irr: [AtomicU64; 4],
-    /// Those of them that are level-triggered, whose EOI the I/O APIC
-    /// wants to hear about.
-    pub level: [AtomicU64; 4],
+    /// Fixed interrupts requested, two bits a vector, so that a request
+    /// and its trigger mode are set, taken and cleared at once: vector v's
+    /// are bits 2 (v % 32) (requested) and 2 (v % 32) + 1 (level-triggered:
+    /// the I/O APIC wants to hear of its EOI) of req[v / 32].
+    req: [AtomicU64; 8],
     /// PENDING_*.
     pub flags: AtomicU32,
     /// The vector of the last SIPI.
@@ -48,8 +48,7 @@ impl Shared {
     pub const fn new(id: u32) -> Self {
         Shared {
             id,
-            irr: [const { AtomicU64::new(0) }; 4],
-            level: [const { AtomicU64::new(0) }; 4],
+            req: [const { AtomicU64::new(0) }; 8],
             flags: AtomicU32::new(0),
             sipi: AtomicU8::new(0),
             ldr: AtomicU32::new(0),
@@ -62,19 +61,39 @@ impl Shared {
     /// Request fixed interrupt `vector` (level-triggered if `level`):
     /// whether the target should be woken.
     pub fn request(&self, vector: u8, level: bool) -> bool {
-        let (w, bit) = ((vector / 64) as usize, 1u64 << (vector % 64));
-        if level {
-            self.level[w].fetch_or(bit, Ordering::SeqCst);
-        }
-        self.irr[w].fetch_or(bit, Ordering::SeqCst) & bit == 0
+        let (w, shift) = ((vector / 32) as usize, 2 * (vector % 32) as u32);
+        let bits = if level { 0b11 } else { 0b01 };
+        self.req[w].fetch_or(bits << shift, Ordering::SeqCst) & (1 << shift) == 0
     }
 
-    /// Drop every fixed interrupt requested so far: at INIT, and while
-    /// it waits for SIPI (those are of a run that is over).
+    /// Take request `vector`: whether it was requested, and level-triggered.
+    pub fn take(&self, vector: u8) -> Option<bool> {
+        let (w, shift) = ((vector / 32) as usize, 2 * (vector % 32) as u32);
+        let old = self.req[w].fetch_and(!(0b11 << shift), Ordering::SeqCst) >> shift;
+        (old & 1 != 0).then_some(old & 2 != 0)
+    }
+
+    /// The IRR: vector v is bit v % 64 of word v / 64.
+    pub fn irr(&self) -> [u64; 4] {
+        let mut irr = [0u64; 4];
+        for (w, r) in self.req.iter().enumerate() {
+            let r = r.load(Ordering::Acquire);
+            for i in 0..32 {
+                if r & (1 << (2 * i)) != 0 {
+                    let v = w * 32 + i;
+                    irr[v / 64] |= 1 << (v % 64);
+                }
+            }
+        }
+        irr
+    }
+
+    /// Drop every fixed interrupt requested so far, with its trigger mode
+    /// (each word at once): at INIT, and while it waits for SIPI (those
+    /// are of a run that is over).
     pub fn clear_requests(&self) {
-        for w in 0..4 {
-            self.irr[w].store(0, Ordering::SeqCst);
-            self.level[w].store(0, Ordering::SeqCst);
+        for w in &self.req {
+            w.store(0, Ordering::SeqCst);
         }
     }
 
@@ -212,7 +231,7 @@ mod tests {
     fn physical_logical_and_shorthands() {
         let a = apics(4);
         assert_eq!(woken(&a, Message { dest: 2, ..FIXED }, None), [2]);
-        assert!(a[2].irr[0].load(Ordering::Relaxed) & (1 << 0x31) != 0);
+        assert!(a[2].irr()[0] & (1 << 0x31) != 0);
         // Already pending: no second wake.
         assert_eq!(woken(&a, Message { dest: 2, ..FIXED }, None), [] as [usize; 0]);
         assert_eq!(woken(&a, Message { dest: 0xff, vector: 0x40, ..FIXED }, None), [0, 1, 2, 3]);
@@ -238,6 +257,30 @@ mod tests {
         assert_eq!(woken(&a, Message { dest: 0x8, logical: true, vector: 0x71, ..FIXED }, None), [3]);
     }
 
+    /// A request and its trigger mode go together: cleared at once, and
+    /// taken at once, never one without the other.
+    #[test]
+    fn requests_with_their_trigger_mode() {
+        let a = Shared::new(0);
+        for v in [0x20u8, 0x5f, 0x60, 0xff] {
+            assert!(a.request(v, true));
+            assert!(!a.request(v, true), "already requested");
+        }
+        assert!(a.request(0x21, false));
+        assert_eq!(a.irr()[0] & (1 << 0x20 | 1 << 0x21), 1 << 0x20 | 1 << 0x21);
+        a.clear_requests();
+        assert_eq!(a.irr(), [0; 4]);
+        for v in [0x20u8, 0x5f, 0x60, 0xff] {
+            assert_eq!(a.take(v), None, "no trigger mode left behind for {v:#x}");
+        }
+        // An edge request after a level one of the same vector, cleared:
+        // edge again.
+        a.request(0x40, true);
+        a.clear_requests();
+        a.request(0x40, false);
+        assert_eq!(a.take(0x40), Some(false));
+    }
+
     #[test]
     fn modes_and_msi() {
         let a = apics(2);
@@ -254,7 +297,9 @@ mod tests {
         assert_eq!(woken(&a, Message { dest: 0, mode: DM_SMI, ..FIXED }, None), [] as [usize; 0]);
         // A level-triggered message marks the vector for EOI.
         woken(&a, Message { dest: 0, level: true, vector: 0x91, ..FIXED }, None);
-        assert!(a[0].level[2].load(Ordering::Relaxed) & (1 << (0x91 - 128)) != 0);
+        assert!(a[0].irr()[2] & (1 << (0x91 - 128)) != 0);
+        assert_eq!(a[0].take(0x91), Some(true));
+        assert_eq!(a[0].take(0x91), None, "taken");
         // MSI decoding.
         let m = Message::msi(0xfee0_1004, 0x4041).unwrap();
         assert_eq!((m.dest, m.logical, m.vector, m.mode, m.level), (1, true, 0x41, DM_FIXED, false));
