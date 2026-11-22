@@ -268,12 +268,12 @@ def qe_identity(isvsvn_levels=((8, "UpToDate"), (6, "OutOfDate")), mrsigner=MRSI
     }
 
 
-def ccel(events):
-    """A CC event log: the Spec ID header (SHA-384 only), then events
-    (mr index, type, data)."""
+def ccel(events, header_mr=0):
+    """A CC event log: the Spec ID header (SHA-384 only, its MrIndex
+    `header_mr`), then events (mr index, type, data)."""
     body = (b"Spec ID Event03\0" + struct.pack("<IBBBB", 0, 0, 2, 0, 2) + struct.pack("<I", 1)
             + struct.pack("<HH", SHA384, 48) + b"\0")
-    log = struct.pack("<II", 0, 3) + bytes(20) + struct.pack("<I", len(body)) + body
+    log = struct.pack("<II", header_mr, 3) + bytes(20) + struct.pack("<I", len(body)) + body
     for mr, kind, data in events:
         log += struct.pack("<IIIH", mr, kind, 1, SHA384) + hashlib.sha384(data).digest() + struct.pack("<I", len(data)) + data
     return log
@@ -686,6 +686,34 @@ class Tdx(unittest.TestCase):
         # The TPM's log stays strict.
         with self.assertRaises(a.Fail):
             a.parse_event_log(log + bytes(4))
+
+    def test_cc_event_log_header_mr_index(self):
+        # EDK2's TdTcg2Dxe (GCE's TDVF) writes the header's MrIndex as 1.
+        log = ccel(CC_EVENTS, header_mr=1)
+        _, info = self.check(self.evidence(), cc_event_log=log)
+        self.assertEqual(info["cc_event_log_events"], len(CC_EVENTS))
+        self.assertEqual(a.cc_event_log_summary(log)["rtmrs"]["1"], self.rtmrs[1].hex())
+        self.assertTrue(a.is_cc_event_log(log))
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "ccel")
+            with open(path, "wb") as f:
+                f.write(log)
+            for args in ((), ("--cc",)):
+                r = self.run_tool("event-log", path, *args)
+                self.assertEqual(r.returncode, 0, (args, r.stderr))
+                self.assertEqual(json.loads(r.stdout)["rtmrs"]["2"], self.rtmrs[2].hex())
+        # No other register.
+        for bad in (2, 4):
+            with self.assertRaisesRegex(a.Fail, "not a TCG2 crypto agile event log"):
+                a.replay_cc_event_log(ccel(CC_EVENTS, header_mr=bad))
+        # A TPM log's header stays at PCR 0.
+        body = (b"Spec ID Event03\0" + struct.pack("<IBBBB", 0, 0, 2, 0, 2) + struct.pack("<I", 1)
+                + struct.pack("<HH", SHA256, 32) + b"\0")
+        tpm = struct.pack("<II", 1, 3) + bytes(20) + struct.pack("<I", len(body)) + body
+        for f in (a.parse_event_log, a.replay_event_log):
+            with self.assertRaisesRegex(a.Fail, "not a TCG2 crypto agile event log"):
+                f(tpm)
+        self.assertFalse(a.is_cc_event_log(tpm))
 
     def test_quote_chain_with_nul_terminator(self):
         q = make_quote(self.intel, self.fields(), chain=pem(self.intel.pck, self.intel.pck_ca) + b"\x00\x00")

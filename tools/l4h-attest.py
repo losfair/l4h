@@ -315,12 +315,13 @@ class LogReader:
 
 
 @checked("event log")
-def parse_event_log(log, zero_pad=False):
+def parse_event_log(log, zero_pad=False, cc=False):
     """The digest sizes the Spec ID event lists ({algorithm: size}) and the
     TCG_PCR_EVENT2s after it, each {"pcr", "type", "digests": {algorithm:
     digest}, "data"}.  The whole log must be events: no bytes left over,
     but with `zero_pad` (a CC event log, which the ACPI CCEL table's area
-    leaves zero past its end) zero bytes after the last event."""
+    leaves zero past its end) zero bytes after the last event.  `cc`: a CC
+    event log, whose header may name measurement register 1 (below)."""
     if not isinstance(log, bytes):
         raise Fail("event log is not bytes")
     r = LogReader(log)
@@ -328,7 +329,10 @@ def parse_event_log(log, zero_pad=False):
     # EV_NO_ACTION holding TCG_EfiSpecIDEventStruct.
     pcr, kind, _, size = r.u32(), r.u32(), r.take(20), r.u32()
     spec = LogReader(r.take(size))
-    if pcr != 0 or kind != EV_NO_ACTION or spec.take(16) != SPEC_ID:
+    # A CC event log's header is the same EV_NO_ACTION event, but EDK2's
+    # TdTcg2Dxe (GCE's TDVF) writes its MrIndex as 1 ("PCRIndex 0 maps to
+    # MrIndex 1"), others 0: neither extends anything.
+    if pcr not in ((0, 1) if cc else (0,)) or kind != EV_NO_ACTION or spec.take(16) != SPEC_ID:
         raise Fail("not a TCG2 crypto agile event log (no Spec ID Event03)")
     spec.take(4 + 4)  # platformClass, version, errata, uintnSize
     sizes = {}
@@ -1506,7 +1510,7 @@ TPM_ALG_SHA384 = 0x000C
 
 def replay_cc_event_log(log):
     """RTMR 0-3 as the log's events extend them from zero, and the events."""
-    sizes, events = parse_event_log(log, zero_pad=True)
+    sizes, events = parse_event_log(log, zero_pad=True, cc=True)
     if sizes.get(TPM_ALG_SHA384) != 48:
         raise Fail("the CC event log has no SHA-384 digests")
     rtmrs = [bytes(48)] * 4
@@ -1551,7 +1555,7 @@ def cc_event_log_summary(log):
 
 def is_cc_event_log(log):
     """A log with SHA-384 digests and no SHA-256 ones: a CCEL, not a TPM's."""
-    sizes, _ = parse_event_log(log, zero_pad=True)
+    sizes, _ = parse_event_log(log, zero_pad=True, cc=True)
     return TPM_ALG_SHA256 not in sizes and TPM_ALG_SHA384 in sizes
 
 
