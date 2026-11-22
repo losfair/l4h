@@ -500,6 +500,13 @@ pub fn spawn(
         let Some(l) = find_tpm(bootinfo, &mut phys) else {
             return flags_only(alloc, win, asids, info, &ev);
         };
+        // The ACPI start method runs the firmware's AML with root's
+        // hardware access (Hw): in a TD that is the cloud's code, which the
+        // TD does not trust.  TDX attests without it.
+        if ev.tdx.is_some() && l.start == trust::START_ACPI {
+            log!("l4h-root: refusing ACPI start TPM (AML) in a TDX guest");
+            return flags_only(alloc, win, asids, info, &ev);
+        }
         // The pages of each range, which stay in `frames`.
         for &(base, size) in &l.ranges {
             if (0..size / PAGE).any(|p| phys.frame(base + p * PAGE).is_none()) {

@@ -102,3 +102,44 @@ pub fn fb_console(config: &[u8], default: bool) -> bool {
     }
     enabled
 }
+
+/// An external boot file the loader measures: its module name, and what it
+/// measures when the file is there (`present`, then the file's exact bytes)
+/// or not (`absent`).
+#[derive(Debug, PartialEq)]
+pub struct Slot {
+    pub name: &'static [u8],
+    pub present: &'static [u8],
+    pub absent: &'static [u8],
+}
+
+/// `l4h.conf`: `l4h-config\0present\0<bytes>` or `l4h-config\0absent`.
+pub const CONFIG_SLOT: Slot = Slot {
+    name: b"l4h-config",
+    present: b"l4h-config\0present\0",
+    absent: b"l4h-config\0absent",
+};
+
+/// dom0's initramfs: `dom0-initrd\0present\0<bytes>` or `dom0-initrd\0absent`.
+pub const INITRD_SLOT: Slot = Slot {
+    name: b"dom0-initrd",
+    present: b"dom0-initrd\0present\0",
+    absent: b"dom0-initrd\0absent",
+};
+
+/// Every slot, in the order measured: each is measured, present or not, so
+/// PCR 9 and RTMR[2] say which file each set of bytes was, and that a file
+/// was absent. A file renamed to the other slot, or emptied, measures
+/// differently, and no measurement hashes zero bytes (which EDK2's
+/// HashLogExtendEvent refuses).
+pub const SLOTS: [&Slot; 2] = [&CONFIG_SLOT, &INITRD_SLOT];
+
+/// What one slot's event hashes, in pieces: the domain-separated prefix,
+/// then the file's bytes (empty when absent). The loader measures one
+/// buffer holding both.
+pub fn measured<'a>(slot: &'a Slot, file: Option<&'a [u8]>) -> [&'a [u8]; 2] {
+    match file {
+        Some(bytes) => [slot.present, bytes],
+        None => [slot.absent, &[]],
+    }
+}

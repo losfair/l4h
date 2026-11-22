@@ -246,6 +246,75 @@ class EkCertificate(unittest.TestCase):
         with self.assertRaisesRegex(a.Fail, "not issued by"):
             self.check(self.ek(), [self.cert("ca", other, "ca", other, ca=True)])
 
+    def test_intermediate_and_root(self):
+        """A manufacturer's chain: EK <- intermediate <- root, both CAs in
+        the file.  Each hop is checked."""
+        root_key = ec.generate_private_key(ec.SECP256R1())
+        root = self.cert("root", root_key, "root", root_key, ca=True, key_usage=True)
+        inter = self.cert("ca", self.ca_key, "root", root_key, ca=True, key_usage=True)
+        for cas in ([inter, root], [root, inter]):
+            self.check(self.ek(), cas)
+        # The intermediate alone, its root not given: pinned as given.
+        self.check(self.ek(), [inter])
+        # The root alone does not issue the EK certificate.
+        with self.assertRaisesRegex(a.Fail, "not issued by"):
+            self.check(self.ek(), [root])
+        # A hop above the intermediate that does not hold: the root expired,
+        # not a CA, may not sign; the intermediate expired.
+        for bad_root, why in ((self.cert("root", root_key, "root", root_key, ca=True, days=(-3, -2)), "expired"),
+                              (self.cert("root", root_key, "root", root_key, ca=False), "not a CA"),
+                              (self.cert("root", root_key, "root", root_key, ca=True, key_usage=False), "may not sign")):
+            with self.assertRaisesRegex(a.Fail, why):
+                self.check(self.ek(), [self.cert("ca", self.ca_key, "root", root_key, ca=True), bad_root])
+        with self.assertRaisesRegex(a.Fail, "expired"):
+            self.check(self.ek(), [self.cert("ca", self.ca_key, "root", root_key, ca=True, days=(-3, -2)), root])
+        # An intermediate the named root did not sign (another key of the
+        # same name): refused, not taken as pinned.
+        forger = ec.generate_private_key(ec.SECP256R1())
+        forged = self.cert("ca", self.ca_key, "root", forger, ca=True)
+        with self.assertRaisesRegex(a.Fail, "not issued by"):
+            self.check(self.ek(), [forged, root])
+        # Three deep.
+        mid_key = ec.generate_private_key(ec.SECP256R1())
+        mid = self.cert("mid", mid_key, "root", root_key, ca=True)
+        low = self.cert("ca", self.ca_key, "mid", mid_key, ca=True)
+        self.check(self.ek(), [low, mid, root])
+        with self.assertRaisesRegex(a.Fail, "expired"):
+            self.check(self.ek(), [low, self.cert("mid", mid_key, "root", root_key, ca=True, days=(-3, -2)), root])
+        # Two CAs that issue each other (A <- B <- A): no root, refused,
+        # not taken as pinned.
+        k2 = ec.generate_private_key(ec.SECP256R1())
+        x = self.cert("ca", self.ca_key, "y", k2, ca=True)
+        y = self.cert("y", k2, "ca", self.ca_key, ca=True)
+        for cas in ([x, y], [y, x]):
+            with self.assertRaisesRegex(a.Fail, "EK CA chain loops"):
+                self.check(self.ek(), cas)
+
+    def test_root_self_signature(self):
+        """A CA that names itself its issuer is a root only if it signed
+        itself: one whose self-signature does not verify is refused, not
+        taken as pinned."""
+        root_key = ec.generate_private_key(ec.SECP256R1())
+        inter = self.cert("ca", self.ca_key, "root", root_key, ca=True)
+        # "root" by name, signed by another key.
+        forger = ec.generate_private_key(ec.SECP256R1())
+        broken = self.cert("root", root_key, "root", forger, ca=True)
+        with self.assertRaisesRegex(a.Fail, "EK root CA CN=root self-signature does not verify"):
+            self.check(self.ek(), [inter, broken])
+        # A CA issuing the EK certificate that claims to be self-signed but
+        # is not.
+        fake_root = self.cert("ca", self.ca_key, "ca", forger, ca=True)
+        with self.assertRaisesRegex(a.Fail, "self-signature does not verify"):
+            self.check(self.ek(), [fake_root])
+        # Its signature bytes tampered.
+        good = self.ca()
+        der = bytearray(good.public_bytes(serialization.Encoding.DER))
+        der[-5] ^= 1
+        tampered = x509.load_der_x509_certificate(bytes(der))
+        self.check(self.ek(), [good])
+        with self.assertRaisesRegex(a.Fail, "self-signature does not verify"):
+            self.check(self.ek(), [tampered])
+
 
 def rsa_public(key, attrs):
     """A TPMT_PUBLIC of an RSA 2048 key, as trustd's EK template gives."""
@@ -393,6 +462,17 @@ class Enrollment(unittest.TestCase):
             self.assertTrue(os.path.getsize(out) > 0)
             # An AK that is not a restricted signing key, and a malformed
             # one: refused, as l4h-attest's errors.
+            # The guest driver's combined evidence (v 3): its TPM part.
+            with open(ev, "wb") as f:
+                f.write(cbor({"v": 3, "tdx": {"v": 1, "type": "tdx"}, "tpm": {**body, "ekcert": self.issued}}))
+            r = self.run_tool("make-credential", ev, "00" * 32, "-o", out + "3", "--ek-ca", self.ca_pem)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertTrue(os.path.getsize(out + "3") > 0)
+            # TDX evidence alone has no TPM to make a credential for.
+            with open(ev, "wb") as f:
+                f.write(cbor({"v": 1, "type": "tdx", "key": {}, "quote": b""}))
+            r = self.run_tool("make-credential", ev, "00" * 32, "-o", out + "4")
+            self.assertEqual((r.returncode, r.stderr.strip()), (1, "l4h-attest: no TPM evidence in this file"))
             for ak, why in ((ecc_public(self.ak, self.AK_ATTRS & ~(1 << 16)), "restricted signing key"),
                             (b"\x00\x23", "truncated")):
                 with open(ev, "wb") as f:
@@ -725,6 +805,21 @@ class EventLog(unittest.TestCase):
         # Only before PCR 0 is extended.
         log = spec_id() + event2(*self.EVENTS[0]) + loc + b"".join(event2(*e) for e in self.EVENTS[1:])
         self.assertEqual(a.replay_event_log(log)[0][0], self.replayed()[0])
+        # Locality 0 too; no other (a TPM2_Startup comes from 0 or 3).
+        zero = event2(0, 3, b"StartupLocality\0\x00", digests={SHA256: bytes(32)})
+        self.assertEqual(a.replay_event_log(spec_id() + zero + b"".join(event2(*e) for e in self.EVENTS))[0][0],
+                         self.replayed()[0])
+        for bad in (1, 2, 4, 0xFF):
+            ev = event2(0, 3, b"StartupLocality\0" + bytes([bad]), digests={SHA256: bytes(32)})
+            with self.assertRaisesRegex(a.Fail, "StartupLocality %d is neither 0 nor 3" % bad):
+                a.replay_event_log(spec_id() + ev + b"".join(event2(*e) for e in self.EVENTS))
+
+    def test_pcr15_is_trustds(self):
+        """The firmware extending PCR 15 would have trustd's key quoted
+        over a PCR 15 it did not start from zero."""
+        events = self.EVENTS + [(a.KEY_PCR, 0xD, b"preloaded")]
+        with self.assertRaisesRegex(a.Fail, "extends PCR 15, which is trustd's"):
+            a.check_event_log(self.log(events), self.replayed())
 
     def test_no_action_not_extended(self):
         noise = event2(4, 3, b"NvIndexInstance\0", digests={SHA1: bytes(20), SHA256: b"\x55" * 32, SHA384: bytes(48)})
@@ -789,13 +884,24 @@ class EventLog(unittest.TestCase):
                 Path(paths[name]).write_bytes(data)
             tool = [sys.executable, str(Path(__file__).resolve().parents[1] / "tools/l4h-attest.py")]
             run = lambda *args: subprocess.run(tool + list(args), capture_output=True, text=True)
-            r = run("verify", paths["rep"], paths["ev"], "--event-log", paths["log"])
+            r = run("verify", paths["rep"], paths["ev"], "--event-log", paths["log"], "--insecure-unpinned-ak")
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertIn('"event_log_events": %d' % len(self.EVENTS), r.stdout)
+            self.assertIn("INSECURE: --insecure-unpinned-ak", r.stderr)
+            # The AK not pinned: refused by default; pinned, no warning.
             r = run("verify", paths["rep"], paths["ev"])
+            self.assertEqual(r.returncode, 1)
+            self.assertRegex(r.stderr, "^l4h-attest: the attestation key is not pinned: .*--ak-name")
+            self.assertEqual(r.stdout, "")
+            ak = a.tpm_name(ev["ak"]).hex()
+            r = run("verify", paths["rep"], paths["ev"], "--ak-name", ak)
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertNotIn("event_log_events", r.stdout)
-            r = run("verify", paths["rep"], paths["ev"], "--event-log", paths["bad"])
+            self.assertNotIn("warning", r.stderr.lower())
+            r = run("verify", paths["rep"], paths["ev"], "--ak-name", "000b" + "00" * 32)
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("not the pinned one", r.stderr)
+            r = run("verify", paths["rep"], paths["ev"], "--event-log", paths["bad"], "--ak-name", ak)
             self.assertEqual(r.returncode, 1)
             self.assertRegex(r.stderr, "^l4h-attest: event log does not match the quote: PCR 5 ")
             self.assertNotIn("Traceback", r.stderr)

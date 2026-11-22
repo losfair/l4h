@@ -98,10 +98,14 @@ grep -aq "ATTEST: tsm evidence matches" "$log" || fail "configfs-tsm evidence di
 dom0_launch=$(python3 "$attest" measure "$out/run/vmlinux" --initrd "$out/run/boot1.cpio.gz" --cmdline "$cmdline")
 vm_launch=$(python3 "$attest" measure "$out/run/vmlinux" --initrd "$out/run/vm.cpio.gz" --cmdline "$cmdline")
 ca=$out/tpm/ca/issuercert.pem
+# The AK is not enrolled yet: an unpinned AK is refused by default, and
+# accepted (to read its name) only when asked.
+! python3 "$attest" verify "$out/run/dom0.report" "$out/run/evidence1" --data "$nonce" \
+    --launch "$dom0_launch" --ek-ca "$ca" >/dev/null 2>&1 || fail "unpinned AK accepted"
 python3 "$attest" verify "$out/run/dom0.report" "$out/run/evidence1" --data "$nonce" \
-    --launch "$dom0_launch" --ek-ca "$ca" > "$out/run/dom0.json" || fail "dom0 report"
+    --launch "$dom0_launch" --ek-ca "$ca" --insecure-unpinned-ak > "$out/run/dom0.json" || fail "dom0 report"
 python3 "$attest" verify "$out/run/vm.report" "$out/run/evidence1" --data "$nonce" \
-    --launch "$vm_launch" --ek-ca "$ca" > "$out/run/vm.json" || fail "guest report"
+    --launch "$vm_launch" --ek-ca "$ca" --insecure-unpinned-ak > "$out/run/vm.json" || fail "guest report"
 json() { python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(eval(sys.argv[2]))" "$@"; }
 [ "$(json "$out/run/dom0.json" 'd["guest"]["dom0"]')" = True ] || fail "dom0 not marked dom0"
 [ "$(json "$out/run/vm.json" 'd["guest"]["dom0"]')" = False ] || fail "guest marked dom0"
@@ -112,10 +116,10 @@ json() { python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(eval
 # Tampering is caught.
 cp "$out/run/dom0.report" "$out/run/bad.report"
 printf '\x00' | dd of="$out/run/bad.report" bs=1 seek=40 conv=notrunc status=none
-! python3 "$attest" verify "$out/run/bad.report" "$out/run/evidence1" 2>/dev/null || fail "tampered report verified"
-! python3 "$attest" verify "$out/run/vm.report" "$out/run/evidence1" --launch "$dom0_launch" 2>/dev/null \
-    || fail "wrong launch digest accepted"
 ak=$(json "$out/run/dom0.json" 'd["host"]["ak_name"]')
+! python3 "$attest" verify "$out/run/bad.report" "$out/run/evidence1" --ak-name "$ak" 2>/dev/null || fail "tampered report verified"
+! python3 "$attest" verify "$out/run/vm.report" "$out/run/evidence1" --launch "$dom0_launch" --ak-name "$ak" 2>/dev/null \
+    || fail "wrong launch digest accepted"
 tpm_claims "$out/run/evidence1" "$out/run/dom0.json" cert
 echo "ATTESTTEST: reports verify; AK $ak"
 
@@ -125,19 +129,21 @@ grep -aq "FLAGVM: PASS" "$log" || fail "guest flags checks"
 for phase in clean injected gates fresh queued; do
     field "$log" "FLAGVM: $phase report" "$out/run/$phase.report"
 done
-python3 "$attest" verify "$out/run/clean.report" "$out/run/evidence1" --data "$nonce" \
+python3 "$attest" verify "$out/run/clean.report" "$out/run/evidence1" --data "$nonce" --ak-name "$ak" \
     --require-seal console-out > "$out/run/clean.json" || fail "clean sealed report"
-! python3 "$attest" verify "$out/run/injected.report" "$out/run/evidence1" --require-seal '' >/dev/null 2>&1 \
+! python3 "$attest" verify "$out/run/injected.report" "$out/run/evidence1" --ak-name "$ak" --require-seal '' >/dev/null 2>&1 \
     || fail "injected input accepted"
-python3 "$attest" verify "$out/run/injected.report" "$out/run/evidence1" --deny-taint '' --require-seal '' \
+python3 "$attest" verify "$out/run/injected.report" "$out/run/evidence1" --ak-name "$ak" --deny-taint '' --require-seal '' \
     > "$out/run/injected.json" || fail "allow input"
-python3 "$attest" verify "$out/run/gates.report" "$out/run/evidence1" --deny-taint 130,131 \
+python3 "$attest" verify "$out/run/gates.report" "$out/run/evidence1" --ak-name "$ak" --deny-taint 130,131 \
     --require-seal console-in,console-out,130,140-141 > "$out/run/gates.json" || fail "guest gates"
 # Unsealed (console-in): refused by default, as input could follow.
-! python3 "$attest" verify "$out/run/fresh.report" "$out/run/evidence1" >/dev/null 2>&1 || fail "unsealed report accepted"
-python3 "$attest" verify "$out/run/fresh.report" "$out/run/evidence1" --require-seal '' > "$out/run/fresh.json" \
+! python3 "$attest" verify "$out/run/fresh.report" "$out/run/evidence1" --ak-name "$ak" >/dev/null 2>&1 \
+    || fail "unsealed report accepted"
+python3 "$attest" verify "$out/run/fresh.report" "$out/run/evidence1" --ak-name "$ak" --require-seal '' \
+    > "$out/run/fresh.json" \
     || fail "new instance"
-python3 "$attest" verify "$out/run/queued.report" "$out/run/evidence1" --deny-taint '' --require-seal '' \
+python3 "$attest" verify "$out/run/queued.report" "$out/run/evidence1" --ak-name "$ak" --deny-taint '' --require-seal '' \
     > "$out/run/queued.json" || fail "pre-start input"
 python3 - "$out/run" <<'CHECK'
 import json, sys
@@ -206,9 +212,9 @@ boot boot4 tpm-crb
 log=$out/boot4.log
 field "$log" "ATTEST: dom0 report" "$out/run/dom0.report4"
 field "$log" "ATTEST: evidence" "$out/run/evidence4"
-python3 "$attest" verify "$out/run/dom0.report4" "$out/run/evidence4" --data "$nonce" \
+python3 "$attest" verify "$out/run/dom0.report4" "$out/run/evidence4" --data "$nonce" --insecure-unpinned-ak \
     > "$out/run/dom0.json4" 2>/dev/null || fail "report without an EK certificate"
-! python3 "$attest" verify "$out/run/dom0.report4" "$out/run/evidence4" --ek-ca "$ca" >/dev/null 2>&1 \
+! python3 "$attest" verify "$out/run/dom0.report4" "$out/run/evidence4" --ek-ca "$ca" --insecure-unpinned-ak >/dev/null 2>&1 \
     || fail "verified an EK certificate the evidence does not have"
 tpm_claims "$out/run/evidence4" "$out/run/dom0.json4" ekpub
 grep -aq "l4h-trustd: ready .*no EK certificate (the EK's public area instead)" "$log" || fail "trustd made no EK"
