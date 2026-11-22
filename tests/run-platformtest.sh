@@ -240,7 +240,9 @@ else
     run missing-env B 1111-1111 ignored=1 missing
 fi
 # Both loaders exclude the unchosen slot. GRUB also measures the selector
-# block, while the native loader measures only the two selected files.
+# block, while the native loader measures only the selected slot's two
+# files, each as one event: its module name, NUL, `present`, NUL, then the
+# file's exact bytes (l4h-config, then dom0-initrd).
 tpm=(-chardev "socket,id=tpm,path=$out/tpm/sock" -tpmdev emulator,id=tpm0,chardev=tpm -device tpm-crb,tpmdev=tpm0)
 run measured-a A 1111-1111 l4h_esp_uuid=1111-1111
 cp "$out/B.conf" "$out/B-changed.conf"
@@ -265,9 +267,9 @@ assert base == other[9], 'unchosen slot affected PCR 9'
 if sys.argv[3]:
     assert baseline[8] == other[8] == selector[8] == bytes(32), 'native loader changed PCR 8'
     expected = bytes(32)
-    for file in ['A.conf', 'A.cpio.gz']:
-        digest = hashlib.sha256((out / file).read_bytes()).digest()
-        expected = hashlib.sha256(expected + digest).digest()
+    for slot, file in [(b'l4h-config', 'A.conf'), (b'dom0-initrd', 'A.cpio.gz')]:
+        event = slot + b'\0present\0' + (out / file).read_bytes()
+        expected = hashlib.sha256(expected + hashlib.sha256(event).digest()).digest()
     assert base == selector[9] == expected, 'incorrect native boot file measurements'
 else:
     assert base != selector[9], 'selector not measured into PCR 9'

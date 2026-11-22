@@ -2016,8 +2016,9 @@ fails unless every check holds:
   \item with \texttt{--ek-ca}, the EK certificate was issued by a CA in
         that file (one or more PEM certificates; a manufacturer's
         intermediate CA together with its root, each hop then checked),
-        all are valid now, each issuer is a CA that may sign certificates,
-        and the EK certificate is not a CA's and is for an EK.
+        all are valid now, each issuer is a CA that may sign certificates
+        within its path length constraint, and the EK certificate is not a
+        CA's and is for an EK.
 \end{itemize}
 It then prints the claims as JSON: the guest's id, memory, vCPUs and
 whether it is dom0, the PCRs, and the TPM's reset count.

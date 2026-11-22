@@ -4375,7 +4375,9 @@ The chain has four links.
    - the EK certificate is issued by a CA certificate given with `--ek-ca`;
      when the file also holds that CA's issuer (a manufacturer's
      intermediate and root), every hop up to a self-signed root is checked
-     too (signature, validity, CA, keyCertSign);
+     too (signature, validity, CA, keyCertSign, pathLenConstraint;
+     self-issued rollover CAs do not count toward pathLenConstraint and
+     chain to a verifying issuer);
    - the AK is the enrolled one (`--ak-name`): without it `verify` refuses
      TPM evidence unless given `--insecure-unpinned-ak`, as for reading the
      AK's name before enrolling it;
@@ -4383,7 +4385,8 @@ The chain has four links.
      expected launch digest;
    - with `--event-log`, the host's event log (TCG2 crypto agile format)
      replays, in its SHA-256 bank, to the quoted PCRs 0–14 and leaves PCR 15
-     (trustd's) zero, from a StartupLocality of 0 or 3; its events
+     (trustd's) zero, from a StartupLocality of 0 or 3, or 4 when PCR 0's
+     first extended event is `EV_EFI_HCRTM_EVENT` (`"HCRTM"`); its events
      then say what the firmware measured (`l4h-attest.py event-log` lists
      them). `measure` computes the digest from the kernel
      (`vmlinux` in a release's debug archive), initramfs and command line.
@@ -4670,11 +4673,19 @@ TDREPORTs (`trust::TDX_REPORT_VA`), a 2 MiB frame shared with the VMM for
 GetQuote (`trust::TDX_QUOTE_VA`) and the firmware's CC event log
 (`CC_EVENT_LOG`, 13, as `TPM_EVENT_LOG`, at `trust::CC_EVENT_LOG_VA`).
 K's seed is the CPU's alone (RDSEED, else RDRAND: neither exits to the
-VMM). trustd binds K to the TD before it touches the TPM, if any, so that
-nothing of the cloud's vTPM comes before RTMR 3 is extended; the vTPM then
-quotes the same K, and if it fails trustd attests with TDX alone. A TPM
-with the ACPI start method is not used in a TD: its `_DSM` is the cloud's
-AML, run with root's hardware access; root gives trustd no such TPM there
+VMM). Root identifies a TD from BootInfo `TDX_INFO` independently of
+whether TDX capabilities or frames are usable; if a TD lacks usable TDX
+resources (or is partitioned), root and trustd run flags-only and never
+fall back to a local TPM or partition relay. trustd binds K to the TD
+before it touches the TPM, if any, so that nothing of the cloud's vTPM
+comes before RTMR 3 is extended; if CPU entropy or TD binding fails,
+trustd runs flags-only without initializing the vTPM. Once K is bound to
+RTMR 3, the optional vTPM quotes the same K (if it fails, trustd attests
+with TDX alone), and only afterwards does trustd start the 120 s
+GetQuote timer and first poll on the saved TDREPORT. A TPM with the ACPI
+start method is not used in a TD: its `_DSM` is the cloud's AML, run
+with root's hardware access; root refuses `START_ACPI` as soon as it
+decodes the start method, before reading the CRB control registers
 (trustd also ignores one). trustd then:
 
 - asks for a TDREPORT (TDG.MR.REPORT) with REPORTDATA

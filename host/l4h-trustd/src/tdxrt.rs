@@ -130,6 +130,33 @@ impl Job {
     }
 }
 
+/// A signing key synchronously bound to the TD (TDREPORT checked while
+/// RTMR 3 was zero, and RTMR 3 extended with its binding), ready for
+/// GetQuote once optional vTPM setup finishes.
+pub struct Bound {
+    point: [u8; 65],
+    rtmr3: [u8; 48],
+    report: [u8; REPORT_SIZE],
+}
+
+impl Bound {
+    /// Start the GetQuote job for this bound TDREPORT with a full 120 s
+    /// timeout from `now` (sampled after any synchronous vTPM setup).
+    pub fn start_quote(self, hz: u64, now: u64) -> Tdx {
+        // trustd is the only one to use the frame: anything there is from
+        // before it ran.
+        let bufs = unsafe { &mut *core::ptr::addr_of_mut!(BUFS) };
+        Tdx {
+            point: self.point,
+            rtmr3: self.rtmr3,
+            hz,
+            phase: Phase::Starting(Job::new(self.report, now, ms(hz, START_TIMEOUT_MS))),
+            slot: Slot::Idle,
+            bufs,
+        }
+    }
+}
+
 /// How a job stands.
 enum Progress {
     Waiting,
@@ -139,10 +166,10 @@ enum Progress {
 }
 
 impl Tdx {
-    /// Bind `point` (the signing key) to the TD: its TDREPORT, taken while
-    /// RTMR 3 is zero, then RTMR 3 extended with the binding, then the
-    /// quote asked for.  None if the TD cannot attest.
-    pub fn start(point: &[u8; 65], hz: u64) -> Result<Tdx, &'static str> {
+    /// Synchronously bind `point` (the signing key) to the TD: take its
+    /// TDREPORT while RTMR 3 is zero, then extend RTMR 3 with the binding.
+    /// Does not start the GetQuote timeout or touch the shared quote frame.
+    pub fn bind(point: &[u8; 65]) -> Result<Bound, &'static str> {
         let binding = tdx::key_binding(point);
         let data = tdx::report_data(&binding);
         let report = get_report(&data).map_err(|e| {
@@ -150,24 +177,13 @@ impl Tdx {
             "TDG.MR.REPORT failed"
         })?;
         tdx::check_first_report(&report, &data)?;
-        // Before the quote is asked for, so that no other key gets one with
-        // RTMR 3 zero.
+        // Before the vTPM or GetQuote is touched, so that no other key gets
+        // a quote with RTMR 3 zero.
         call::extend_rtmr(trust::SLOT_TDX, tdx::KEY_RTMR as u64, &binding).map_err(|e| {
             info!("l4h-trustd: TDG.MR.RTMR.EXTEND failed: {}", e);
             "TDG.MR.RTMR.EXTEND failed"
         })?;
-        // trustd is the only one to use the frame: anything there is from
-        // before it ran.
-        let bufs = unsafe { &mut *core::ptr::addr_of_mut!(BUFS) };
-        let now = host::ticks::now();
-        Ok(Tdx {
-            point: *point,
-            rtmr3: tdx::rtmr_extended(&binding),
-            hz,
-            phase: Phase::Starting(Job::new(report, now, ms(hz, START_TIMEOUT_MS))),
-            slot: Slot::Idle,
-            bufs,
-        })
+        Ok(Bound { point: *point, rtmr3: tdx::rtmr_extended(&binding), report })
     }
 
     pub fn ready(&self) -> bool {

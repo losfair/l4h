@@ -31,6 +31,30 @@ pub const START_ACPI: u32 = 2;
 /// The Pluton doorbells after each request (13).
 pub const START_PLUTON: u32 = 3;
 
+/// Intel TDX mode (TrustdConfig::tdx): not a TD, a TD with usable TDX
+/// attestation resources (SLOT_TDX, TDX_REPORT_VA, TDX_QUOTE_VA), or a TD
+/// without usable TDX resources (never fall back to a local TPM or relay).
+pub const TDX_NONE: u32 = 0;
+pub const TDX_ENABLED: u32 = 1;
+pub const TDX_UNAVAILABLE: u32 = 2;
+
+/// Encode TrustdConfig::tdx from BootInfo TDX_INFO presence and usable TDX
+/// attestation resources.
+pub const fn tdx_mode(in_td: bool, has_tdx: bool) -> u32 {
+    match (in_td, has_tdx) {
+        (false, _) => TDX_NONE,
+        (true, true) => TDX_ENABLED,
+        (true, false) => TDX_UNAVAILABLE,
+    }
+}
+
+/// Whether a TPM2 ACPI start method is allowed: in a TD, START_ACPI (the
+/// cloud's AML with root hardware access) is refused before reading the
+/// CRB control area.
+pub const fn tpm_start_allowed(in_td: bool, start: u32) -> bool {
+    !(in_td && start == START_ACPI)
+}
+
 /// A physical range trustd has mapped, at TPM_VA + i * RANGE_STRIDE for
 /// range i.  size 0: unused.
 #[repr(C)]
@@ -74,12 +98,11 @@ pub struct TrustdConfig {
     /// (EVENT_LOG_TRUNCATED, EVENT_LOG_TCG_1_2).
     pub event_log_size: u64,
     pub event_log_flags: u64,
-    /// Intel TDX (FL4 on a trust domain, BootInfo TDX_INFO): 1 if trustd
-    /// has the TDX control capability (SLOT_TDX), the report frame at
-    /// TDX_REPORT_VA (SLOT_TDX_REPORT_FRAME) and the shared quote frame at
-    /// TDX_QUOTE_VA (SLOT_TDX_QUOTE_FRAME); 0 otherwise.  Never in a
-    /// multikernel machine, which FL4 does not run.
-    pub tdx_enabled: u32,
+    /// Intel TDX mode (TDX_NONE, TDX_ENABLED, TDX_UNAVAILABLE): distinguishes
+    /// non-TD hosts from a TD (BootInfo TDX_INFO present) with or without
+    /// usable TDX capabilities and frames (SLOT_TDX, TDX_REPORT_VA,
+    /// TDX_QUOTE_VA).  Never in a multikernel machine, which FL4 does not run.
+    pub tdx: u32,
     /// The TD's guest physical address width and TD attributes, as the
     /// TDX module reported them (TDX_INFO).
     pub tdx_gpaw: u32,
@@ -92,6 +115,18 @@ pub struct TrustdConfig {
     /// its flags (EVENT_LOG_TRUNCATED).
     pub cc_event_log_size: u64,
     pub cc_event_log_flags: u64,
+}
+
+impl TrustdConfig {
+    /// Whether root identified an Intel TDX trust domain from BootInfo TDX_INFO.
+    pub const fn in_td(&self) -> bool {
+        self.tdx != TDX_NONE
+    }
+
+    /// Whether trustd has usable TDX attestation capabilities and frames.
+    pub const fn tdx_capable(&self) -> bool {
+        self.tdx == TDX_ENABLED
+    }
 }
 
 pub const TPM_VA: usize = crate::MMIO_VA;

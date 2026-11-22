@@ -280,10 +280,12 @@ class Reader:
 
 
 EV_NO_ACTION = 3
+EV_EFI_HCRTM_EVENT = 0x80000010
 TPM_ALG_SHA256 = 0x000B
 SPEC_ID = b"Spec ID Event03\0"
 STARTUP_LOCALITY = b"StartupLocality\0"
-STARTUP_LOCALITIES = (0, 3)
+STARTUP_LOCALITIES = (0, 3, 4)
+HCRTM_DATA = b"HCRTM"
 # PCRs nothing extends after ExitBootServices: trustd quotes them before
 # it extends KEY_PCR.
 EVENT_LOG_PCRS = range(KEY_PCR)
@@ -383,24 +385,47 @@ def replay_event_log(log):
         raise Fail("the event log has no SHA-256 digests")
     pcrs = {i: (b"\xff" if 17 <= i <= 22 else b"\x00") * 32 for i in range(24)}
     extended = set()
+    locality = None
+    need_hcrtm = False
     for n, e in enumerate(events):
         if e["type"] == EV_NO_ACTION:
-            # Not extended; the startup locality (PFP 10.4.5.3) is PCR 0's
-            # initial value.
+            # Not extended; the startup locality (PFP 1.06 rev52 10.4.5.3)
+            # is PCR 0's initial value.
             if e["data"][:len(STARTUP_LOCALITY)] == STARTUP_LOCALITY and len(e["data"]) == len(STARTUP_LOCALITY) + 1:
-                # TPM2_Startup comes from locality 0, or 3 with an H-CRTM
-                # (PFP 10.4.5.3): another value is no startup's.
-                if e["data"][-1] not in STARTUP_LOCALITIES:
-                    raise Fail("event %d: StartupLocality %d is neither 0 nor 3" % (n, e["data"][-1]))
-                if e["pcr"] == 0 and 0 not in extended:
-                    pcrs[0] = bytes(31) + e["data"][-1:]
+                loc = e["data"][-1]
+                # 0 or 3 without an H-CRTM sequence, or 4 with an H-CRTM
+                # sequence (PFP 1.06 rev52 3.3.4.1, 10.4.5.3); all other
+                # values are reserved by TCG.
+                if loc not in STARTUP_LOCALITIES:
+                    raise Fail("event %d: StartupLocality %d is not 0, 3 or 4" % (n, loc))
+                if locality == 4 or (loc == 4 and locality is not None):
+                    raise Fail("event %d: duplicate StartupLocality %d" % (n, loc))
+                if loc == 4:
+                    if e["pcr"] != 0 or 0 in extended:
+                        raise Fail("event %d: StartupLocality 4 must be on PCR 0 before it is extended" % n)
+                    pcrs[0] = bytes(31) + b"\x04"
+                    locality = 4
+                    need_hcrtm = True
+                elif e["pcr"] == 0 and 0 not in extended:
+                    pcrs[0] = bytes(31) + bytes([loc])
+                    locality = loc
             continue
+        if e["type"] == EV_EFI_HCRTM_EVENT:
+            # PFP 1.06 rev52 3.3.4.1, 10.4.5.3: EV_EFI_HCRTM_EVENT ("HCRTM")
+            # is valid once, as PCR 0's first extend after StartupLocality 4.
+            if not need_hcrtm or e["pcr"] != 0 or e["data"] != HCRTM_DATA:
+                raise Fail("event %d: unexpected EV_EFI_HCRTM_EVENT" % n)
+            need_hcrtm = False
+        elif need_hcrtm and e["pcr"] == 0:
+            raise Fail("event %d: StartupLocality 4 requires PCR 0's first event to be EV_EFI_HCRTM_EVENT" % n)
         if not 0 <= e["pcr"] < 24:
             raise Fail("event %d extends PCR %d" % (n, e["pcr"]))
         if TPM_ALG_SHA256 not in e["digests"]:
             raise Fail("event %d (PCR %d) has no SHA-256 digest" % (n, e["pcr"]))
         pcrs[e["pcr"]] = hashlib.sha256(pcrs[e["pcr"]] + e["digests"][TPM_ALG_SHA256]).digest()
         extended.add(e["pcr"])
+    if need_hcrtm:
+        raise Fail("StartupLocality 4 without a PCR 0 EV_EFI_HCRTM_EVENT")
     return pcrs, events
 
 
@@ -635,12 +660,13 @@ EK_CHAIN_MAX = 8
 
 def check_ek_cert(cert, cas, where, now=None):
     """That `cert` is an EK certificate one of `cas` issued and that both
-    are valid now: the CA is a CA that may sign certificates, the EK
-    certificate is not a CA's, and if it limits its use, to an EK's.
-    `cas` may hold the manufacturer's intermediate CAs and their root: a
-    CA whose issuer is among `cas` too must have been issued by it (each
-    hop checked as the first, up to a self-signed root); one whose issuer
-    is not is pinned as given."""
+    are valid now: the CA is a CA that may sign certificates within its
+    RFC 5280 pathLenConstraint, the EK certificate is not a CA's, and if
+    it limits its use, to an EK's.  `cas` may hold the manufacturer's
+    intermediate CAs (including self-issued key-rollover CAs) and their
+    root: a CA whose issuer is among `cas` too must have been issued by it
+    (each hop checked as the first, up to a self-signed root); a
+    non-self-issued CA whose issuer is not in `cas` is pinned as given."""
     now = now or datetime.datetime.now(datetime.timezone.utc)
 
     def ext(c, kind):
@@ -659,38 +685,48 @@ def check_ek_cert(cert, cas, where, now=None):
         except (ValueError, TypeError, InvalidSignature):
             return False
 
-    def ca_why(ca, what):
-        """Why `ca` may not have issued `what`, or None."""
+    def ca_why(ca, what, depth):
+        """Why `ca` may not have issued `what`, or None.
+        `depth`: non-self-issued intermediate CAs between `ca` and the leaf EK
+        certificate (RFC 5280 4.2.1.9, 6.1.4)."""
         bc = ext(ca, x509.BasicConstraints)
         ku = ext(ca, x509.KeyUsage)
         if bc is None or not bc.ca:
             return "%s issuer is not a CA" % what
+        if bc.path_length is not None and depth > bc.path_length:
+            return "%s issuer path length constraint (%d) exceeded" % (what, bc.path_length)
         if ku is not None and not ku.key_cert_sign:
             return "%s issuer may not sign certificates" % what
         if not valid(ca):
             return "%s issuer expired or not yet valid" % what
         return None
 
-    def up(ca, seen):
+    def up(ca, seen, depth):
         """Why the chain above `ca` (one of `cas`) does not hold, or None."""
         if len(seen) > EK_CHAIN_MAX:
             return "EK CA chain longer than %d" % EK_CHAIN_MAX
-        if ca.issuer == ca.subject:
-            # A root: its own signature must hold, never "pinned as given".
-            if signed_by(ca, ca):
-                return None
-            return "EK root CA %s self-signature does not verify" % ca.subject.rfc4514_string()
-        named = [p for p in cas if p.subject == ca.issuer]
+        self_issued = ca.issuer == ca.subject
+        if self_issued and signed_by(ca, ca):
+            return None
+        named = [p for p in cas if p.subject == ca.issuer and p != ca]
         if not named:
+            if self_issued:
+                # Subject == Issuer without a valid self-signature or another
+                # verifying issuer in `cas`: a broken root, never pinned.
+                return "EK root CA %s self-signature does not verify" % ca.subject.rfc4514_string()
             return None  # pinned as given: its issuer is not in the file
         parents = [p for p in named if p not in seen]
         if not parents:
             return "EK CA chain loops"
-        why = "EK CA %s not issued by %s" % (ca.subject.rfc4514_string(), where)
+        # RFC 5280 6.1.4: self-issued intermediate CAs (e.g. key rollover) do
+        # not count toward pathLenConstraint.
+        next_depth = depth + (0 if self_issued else 1)
+        why = ("EK root CA %s self-signature does not verify" % ca.subject.rfc4514_string()
+               if self_issued else "EK CA %s not issued by %s" % (ca.subject.rfc4514_string(), where))
         for p in parents:
             if not signed_by(ca, p):
                 continue
-            why = ca_why(p, "EK CA %s:" % ca.subject.rfc4514_string()) or up(p, seen + [p])
+            why = ca_why(p, "EK CA %s:" % ca.subject.rfc4514_string(), next_depth) or up(p, seen + [p], next_depth)
             if why is None:
                 return None
         return why
@@ -708,7 +744,7 @@ def check_ek_cert(cert, cas, where, now=None):
         for ca in cas:
             if not signed_by(cert, ca):
                 continue
-            why = ca_why(ca, "EK certificate") or up(ca, [ca])
+            why = ca_why(ca, "EK certificate", 0) or up(ca, [ca], 0)
             if why is None:
                 return
         raise Fail(why)

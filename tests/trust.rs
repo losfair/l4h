@@ -143,3 +143,21 @@ fn readers_never_mix_instances_or_see_a_seal_before_its_taint() {
     assert!(read > 0);
     assert_eq!(e.try_read().unwrap().instance, 99_999);
 }
+
+#[test]
+fn tdx_mode_and_acpi_start_boundary() {
+    // Non-TD, TD with usable resources, and TD whose resources failed:
+    // the last keeps its TD identity instead of collapsing into TDX_NONE.
+    assert_eq!(tdx_mode(false, false), TDX_NONE);
+    assert_eq!(tdx_mode(false, true), TDX_NONE);
+    assert_eq!(tdx_mode(true, true), TDX_ENABLED);
+    assert_eq!(tdx_mode(true, false), TDX_UNAVAILABLE);
+    assert_ne!(tdx_mode(true, false), TDX_NONE);
+
+    // START_ACPI (AML with root hardware access) is refused in a TD and
+    // allowed outside a TD; other CRB start methods remain allowed.
+    assert!(!tpm_start_allowed(true, START_ACPI));
+    assert!(tpm_start_allowed(true, START_CRB));
+    assert!(tpm_start_allowed(true, START_PLUTON));
+    assert!(tpm_start_allowed(false, START_ACPI));
+}
