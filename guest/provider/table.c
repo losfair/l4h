@@ -6,11 +6,7 @@ const struct l4h_provider l4h_provider_table = {
 	.magic = L4H_PROVIDER_MAGIC,
 	.version = L4H_PROVIDER_VERSION,
 	.size = sizeof(struct l4h_provider),
-#if defined(__x86_64__) && defined(CONFIG_VTX)
-	.features = L4H_PROVIDER_VTX,
-#elif defined(L4H_ARM_VIRT)
-	.features = L4H_PROVIDER_ARM_VIRT,
-#endif
+	.features = L4H_PROVIDER_FEATURES_VIRT | L4H_PROVIDER_FEATURES_BATCH,
 #define L4H_PROVIDER_OP(ret, name, args, call) .name = name,
 #define L4H_PROVIDER_NORETURN(name, args, call) .name = name,
 #include <l4h/provider-ops.h>

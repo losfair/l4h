@@ -184,7 +184,7 @@ int l4h_page_map(unsigned long frame, unsigned long vspace, unsigned long va, in
 
 int l4h_frame_batch(const struct l4h_frame_op *ops, int n, unsigned long vspace, int *err)
 {
-#ifdef __aarch64__
+#if !L4H_PROVIDER_FEATURES_BATCH
 	(void)ops; (void)n; (void)vspace;
 	*err = seL4_IllegalOperation;
 	return 0;

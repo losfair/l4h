@@ -1179,6 +1179,9 @@ void __init l4h_vspace_init(void)
 	int i;
 
 	as_init(&kernel_as, L4H_CPTR(L4H_SLOT_VSPACE));
+	/* Without kernel batches (seL4) queueing would only delay each op. */
+	if (!l4h_provider_frame_batch())
+		frame_batch = false;
 	nr_vs = l4h_bootinfo->nr_vspaces;
 	if (nr_vs < 1)
 		panic("l4h: no process VSpaces in boot info\n");
