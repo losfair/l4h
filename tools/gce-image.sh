@@ -22,8 +22,9 @@
 # instance has Google's Shielded VM vTPM (the default here, with
 # --shielded-vtpm), to the vTPM's quote as well: both roots of trust, one
 # key (l4h-attest.py verify takes either or both).  With --no-vtpm the
-# instance has no vTPM (--no-shielded-vtpm): TDX alone, whose trust does
-# not rest on the host's vTPM.
+# instance has no vTPM (--no-shielded-vtpm, and so
+# --no-shielded-integrity-monitoring, which needs it): TDX alone, whose
+# trust does not rest on the host's vTPM.
 set -euo pipefail
 confidential=
 vtpm=1
@@ -47,7 +48,8 @@ if [ "$confidential" = TDX ]; then
     features+=,TDX_CAPABLE
     machine="--machine-type=c3-standard-4 --confidential-compute-type=TDX --maintenance-policy=TERMINATE"
     nic=GVNIC
-    if [ "$vtpm" = 1 ]; then shielded=--shielded-vtpm; else shielded=--no-shielded-vtpm; fi
+    # Integrity monitoring, on by default for UEFI images, needs the vTPM.
+    if [ "$vtpm" = 1 ]; then shielded=--shielded-vtpm; else shielded="--no-shielded-vtpm --no-shielded-integrity-monitoring"; fi
     image_args=" --boot-disk-interface=NVME --no-shielded-secure-boot $shielded --no-service-account --no-scopes"
 elif [ -n "$confidential" ]; then
     features+=,${confidential}_CAPABLE

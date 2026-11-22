@@ -226,6 +226,59 @@ pub fn check_quote(quote: &[u8], report: &[u8; REPORT_SIZE]) -> Result<usize, &'
     Ok(end)
 }
 
+// ---- Guests' fresh quotes: one out at a time, the answer kept for its
+// owner's further pieces (tdxrt.rs).  What a request does is decided here,
+// free of seL4, for the tests.
+
+/// A guest's quote request: guest `id`, its instance, its data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Asker {
+    pub id: usize,
+    pub instance: u64,
+    pub data: [u8; 64],
+}
+
+/// The quote slot as a request sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Holding {
+    Idle,
+    /// A quote is out for this guest.
+    Quoting(Asker),
+    /// This guest's answer, `n` bytes, kept until `expires`.
+    Held { asker: Asker, n: usize, expires: u64 },
+}
+
+/// What a request does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    /// Answer from the kept answer; `release`: it was the last piece.
+    Serve { n: usize, release: bool },
+    /// Wait: the slot is another's.  `release`: free it first (its owner
+    /// asked afresh while others wait: they go first).
+    Defer { release: bool },
+    /// Ask for a new quote (whatever was kept is dropped).
+    Start,
+    /// A further piece of an answer no longer kept: ask from 0 again.
+    Again,
+}
+
+/// What request `me` at `offset` does to the slot `h` at `now`, with a
+/// page of `page` bytes; `others_waiting`: other guests' requests wait.
+pub fn decide(h: &Holding, me: &Asker, offset: usize, now: u64, others_waiting: bool, page: usize) -> Step {
+    match *h {
+        Holding::Quoting(_) => Step::Defer { release: false },
+        Holding::Held { asker, n, .. } if asker == *me && offset != 0 => Step::Serve { n, release: offset.saturating_add(page) >= n },
+        Holding::Held { asker, expires, .. } if asker.id != me.id && now < expires => Step::Defer { release: false },
+        // Its owner asks for a new quote while others wait: it would keep
+        // the slot for good, a quote a second.
+        Holding::Held { asker, .. } if asker.id == me.id && asker.instance == me.instance && offset == 0 && others_waiting => {
+            Step::Defer { release: true }
+        }
+        _ if offset != 0 => Step::Again,
+        _ => Step::Start,
+    }
+}
+
 // ---- What guests get.
 
 /// The key's COSE_Key (EC2, P-256) as main.rs writes it.
@@ -454,6 +507,40 @@ mod tests {
         let mut v5 = quote(5, BODY_TD10, &r, 64);
         v5[QUOTE_HEADER..QUOTE_HEADER + 2].copy_from_slice(&1u16.to_le_bytes());
         assert!(check_quote(&v5, &r).is_err(), "an SGX body");
+    }
+
+    fn asker(id: usize, instance: u64, d: u8) -> Asker {
+        Asker { id, instance, data: [d; 64] }
+    }
+
+    #[test]
+    fn the_quote_slot() {
+        let (a, b) = (asker(1, 10, 7), asker(2, 20, 7));
+        let page = 4032;
+        // Free: a request at 0 starts a quote; a further piece asks again.
+        assert_eq!(decide(&Holding::Idle, &a, 0, 0, false, page), Step::Start);
+        assert_eq!(decide(&Holding::Idle, &a, page, 0, false, page), Step::Again);
+        // One out: everyone waits, its owner too.
+        for who in [a, b] {
+            assert_eq!(decide(&Holding::Quoting(a), &who, 0, 0, true, page), Step::Defer { release: false });
+        }
+        // Kept for its owner: pieces, the last one frees it.
+        let held = Holding::Held { asker: a, n: 5000, expires: 100 };
+        assert_eq!(decide(&held, &a, page, 50, true, page), Step::Serve { n: 5000, release: true });
+        let big = Holding::Held { asker: a, n: 9000, expires: 100 };
+        assert_eq!(decide(&big, &a, page, 50, true, page), Step::Serve { n: 9000, release: false });
+        // Others wait for it until it expires, then take it.
+        assert_eq!(decide(&held, &b, 0, 50, false, page), Step::Defer { release: false });
+        assert_eq!(decide(&held, &b, 0, 100, false, page), Step::Start);
+        // Its owner asking afresh: a new quote, unless others wait, who
+        // then go first (no guest keeps the slot for good).
+        assert_eq!(decide(&held, &a, 0, 50, false, page), Step::Start);
+        assert_eq!(decide(&held, &a, 0, 50, true, page), Step::Defer { release: true });
+        // Another instance of the owner's id, or other data: not its answer.
+        let again = asker(1, 11, 7);
+        assert_eq!(decide(&held, &again, page, 50, false, page), Step::Again);
+        assert_eq!(decide(&held, &again, 0, 50, true, page), Step::Start);
+        assert_eq!(decide(&held, &asker(1, 10, 8), page, 50, false, page), Step::Again);
     }
 
     #[test]

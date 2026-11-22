@@ -22,7 +22,7 @@ use l4h_rt::host::trust;
 use l4h_rt::{host, info};
 use l4h_task::tdx as call;
 
-use crate::tdx::{self, Answer, REPORT_SIZE};
+use crate::tdx::{self, Answer, Asker, Holding, REPORT_SIZE, Step};
 use crate::{DEFER, PENDING};
 
 /// The key's quote: asked for again after the VMM's errors for up to
@@ -68,14 +68,6 @@ enum Phase {
     /// The evidence, its first `n` bytes.
     Ready(usize),
     Failed,
-}
-
-/// A guest's quote request.
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct Asker {
-    id: usize,
-    instance: u64,
-    data: [u8; abi::ATTEST_DATA_SIZE],
 }
 
 enum Slot {
@@ -325,11 +317,33 @@ impl Tdx {
         }
     }
 
+    /// The slot as a request sees it (tdx::decide).
+    fn holding(&self) -> Holding {
+        match self.slot {
+            Slot::Idle => Holding::Idle,
+            Slot::Quoting { asker, .. } => Holding::Quoting(asker),
+            Slot::Held { asker, n, expires } => Holding::Held { asker, n, expires },
+        }
+    }
+
+    /// Guest `id`'s (instance `instance`) answer is no longer wanted (the
+    /// guest went away, or was replaced, while its quote was out): the
+    /// slot is free for the others now, not when it expires.
+    pub fn release_held(&mut self, id: usize, instance: u64) {
+        if let Slot::Held { asker, .. } = self.slot {
+            if asker.id == id && asker.instance == instance {
+                self.slot = Slot::Idle;
+            }
+        }
+    }
+
     /// Guest `id`'s (instance `instance`) quote request `seq` with `data`
     /// and the page's `offset`: its kept answer (a further piece), or
     /// PENDING once its quote is asked for, DEFER while another guest's
-    /// is out or kept, or an errno.  `allow` counts it against the
-    /// guest's rate limit; `report` makes its report.
+    /// is out or kept, or an errno.  `others_waiting`: other guests'
+    /// requests wait, which go before this guest's new quote if it holds
+    /// the slot.  `allow` counts it against the guest's rate limit;
+    /// `report` makes its report.
     #[allow(clippy::too_many_arguments)]
     pub fn request(
         &mut self,
@@ -338,6 +352,7 @@ impl Tdx {
         seq: u32,
         data: &[u8; abi::ATTEST_DATA_SIZE],
         offset: usize,
+        others_waiting: bool,
         allow: impl FnOnce() -> bool,
         report: impl FnOnce(&mut [u8]) -> Result<usize, Errno>,
     ) -> Result<&[u8], Errno> {
@@ -346,21 +361,24 @@ impl Tdx {
         if !self.ready() {
             return Err(if self.starting() { DEFER } else { l4h_rt::host::errno::ENODEV });
         }
-        match self.slot {
-            Slot::Quoting { .. } => return Err(DEFER),
-            Slot::Held { asker, n, .. } if asker == me && offset != 0 => {
-                // The last piece: no longer kept.
-                if offset.saturating_add(abi::ATTEST_PAGE_DATA) >= n {
+        match tdx::decide(&self.holding(), &me, offset, now, others_waiting, abi::ATTEST_PAGE_DATA) {
+            Step::Serve { n, release } => {
+                if release {
                     self.slot = Slot::Idle;
                 }
                 return Ok(&self.bufs.answer[..n]);
             }
-            Slot::Held { asker, expires, .. } if asker.id != id && now < expires => return Err(DEFER),
-            _ => self.slot = Slot::Idle,
-        }
-        // A further piece of an answer no longer kept: ask again from 0.
-        if offset != 0 {
-            return Err(EAGAIN);
+            Step::Defer { release } => {
+                if release {
+                    self.slot = Slot::Idle;
+                }
+                return Err(DEFER);
+            }
+            Step::Again => {
+                self.slot = Slot::Idle;
+                return Err(EAGAIN);
+            }
+            Step::Start => self.slot = Slot::Idle,
         }
         if !allow() {
             return Err(EAGAIN);

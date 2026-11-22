@@ -64,7 +64,12 @@ if [ -n "$confidential" ]; then
     gce_args=(--confidential-compute-type="$confidential" ${cpu:+--min-cpu-platform="$cpu"} --maintenance-policy=TERMINATE
         --no-service-account --no-scopes)
     if [ "$confidential" = TDX ]; then
-        [ "${NO_VTPM:-0}" = 1 ] && gce_args+=(--no-shielded-vtpm) || gce_args+=(--shielded-vtpm)
+        # Integrity monitoring, on by default for UEFI images, needs the vTPM.
+        if [ "${NO_VTPM:-0}" = 1 ]; then
+            gce_args+=(--no-shielded-vtpm --no-shielded-integrity-monitoring)
+        else
+            gce_args+=(--shielded-vtpm)
+        fi
     fi
     export SEL4_PREFIX="$root/build/sel4-fl4" L4H_KERNEL_VARIANT=fl4
 fi

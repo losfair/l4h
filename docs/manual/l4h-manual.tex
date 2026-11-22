@@ -2055,7 +2055,8 @@ tools/l4h-attest.py verify report --tdx-evidence tdx-evidence \
 tools/l4h-attest.py verify-tdx-quote fresh --data $NONCE \
     --intel-root-ca intel_root_ca.pem --collateral-dir collateral
 \end{verbatim}
-It checks the quote down to Intel's root CA, that the TD is no debug TD,
+It checks the quote down to Intel's root CA, that the TD is neither a
+debug TD nor migratable,
 the TCB status of the platform, the TDX module and the quoting enclave
 (\texttt{UpToDate}, unless \texttt{--allow-tcb-status} accepts more), that
 the quote binds the host key, and that RTMR~3 was zero then: the host

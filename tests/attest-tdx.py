@@ -105,15 +105,21 @@ def name(cn):
     return x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn), x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Test Intel")])
 
 
-def cert(subject, key, issuer, issuer_key, ca, days=(-1, 365), ext=None, serial=None):
+def key_usage(sign=False, cert_sign=False, crl_sign=False):
+    return x509.KeyUsage(digital_signature=sign, content_commitment=False, key_encipherment=False,
+                         data_encipherment=False, key_agreement=False, key_cert_sign=cert_sign, crl_sign=crl_sign,
+                         encipher_only=False, decipher_only=False)
+
+
+def cert(subject, key, issuer, issuer_key, ca, days=(-1, 365), ext=None, serial=None, ku=None):
     b = (x509.CertificateBuilder().subject_name(name(subject)).issuer_name(name(issuer))
          .public_key(key.public_key()).serial_number(serial or x509.random_serial_number())
          .not_valid_before(NOW + datetime.timedelta(days=days[0])).not_valid_after(NOW + datetime.timedelta(days=days[1]))
          .add_extension(x509.BasicConstraints(ca=ca, path_length=None), critical=True))
-    if ca:
-        b = b.add_extension(x509.KeyUsage(digital_signature=False, content_commitment=False, key_encipherment=False,
-                                          data_encipherment=False, key_agreement=False, key_cert_sign=True, crl_sign=True,
-                                          encipher_only=False, decipher_only=False), critical=True)
+    if ku is not None:
+        b = b.add_extension(ku, critical=True)
+    elif ca:
+        b = b.add_extension(key_usage(cert_sign=True, crl_sign=True), critical=True)
     if ext is not None:
         b = b.add_extension(x509.UnrecognizedExtension(x509.ObjectIdentifier(a.SGX_EXTENSIONS_OID), ext), critical=False)
     return b.sign(issuer_key, hashes.SHA256())
@@ -163,7 +169,8 @@ class Intel:
         self.pck = cert("Intel SGX PCK Certificate", self.pck_key, "Intel SGX PCK Platform CA", self.pck_ca_key, False,
                         ext=sgx_extension(FMSPC, PCEID, PCK_COMPS, PCESVN))
         self.tcb_key = ec.generate_private_key(ec.SECP256R1())
-        self.tcb = cert("Intel SGX TCB Signing", self.tcb_key, "Intel SGX Root CA", self.root_key, False)
+        self.tcb = cert("Intel SGX TCB Signing", self.tcb_key, "Intel SGX Root CA", self.root_key, False,
+                        ku=key_usage(sign=True))
         self.att_key = ec.generate_private_key(ec.SECP256R1())
 
 
@@ -324,15 +331,22 @@ class Tdx(unittest.TestCase):
         ev.update(over)
         return ev
 
-    def collateral(self, d, tcb=None, qe=None, pck_crl=None, chain=None, root_crl=None, tamper_tcb=False):
+    def collateral(self, d, tcb=None, qe=None, pck_crl=None, chain=None, root_crl=None, tamper_tcb=False,
+                   no_root_crl=False, qe_chain=None, qe_key=None):
         files = {
             "tcb_info.json": signed_doc("tcbInfo", tcb if tcb is not None else tcb_info(UP_TO_DATE), self.intel.tcb_key, tamper_tcb),
-            "qe_identity.json": signed_doc("enclaveIdentity", qe if qe is not None else qe_identity(), self.intel.tcb_key),
+            "qe_identity.json": signed_doc("enclaveIdentity", qe if qe is not None else qe_identity(), qe_key or self.intel.tcb_key),
             "pck_crl.pem": (pck_crl if pck_crl is not None else crl(self.intel.pck_ca, self.intel.pck_ca_key)).public_bytes(serialization.Encoding.PEM),
             "tcb_signing_chain.pem": chain or pem(self.intel.tcb, self.intel.root),
         }
-        if root_crl is not None:
-            files["root_ca_crl.der"] = root_crl.public_bytes(serialization.Encoding.DER)
+        if not no_root_crl:
+            files["root_ca_crl.der"] = (root_crl if root_crl is not None else crl(self.intel.root, self.intel.root_key)).public_bytes(
+                serialization.Encoding.DER)
+        if qe_chain is not None:
+            files["qe_identity_signing_chain.pem"] = qe_chain
+        for n in ("root_ca_crl.der", "qe_identity_signing_chain.pem"):
+            if n not in files and os.path.exists(os.path.join(d, n)):
+                os.remove(os.path.join(d, n))
         for n, b in files.items():
             with open(os.path.join(d, n), "wb") as f:
                 f.write(b)
@@ -593,6 +607,107 @@ class Tdx(unittest.TestCase):
             col = self.collateral(d, root_crl=crl(intel.root, intel.root_key, [intel.tcb.serial_number]))
             self.refused(self.evidence(), "TCB signing certificate is revoked", col)
 
+    # ---- review fixes
+
+    def test_collateral_needs_root_crl_and_signers(self):
+        intel = self.intel
+        with tempfile.TemporaryDirectory() as d:
+            self.refused(self.evidence(), "without root_ca_crl.der", self.collateral(d, no_root_crl=True))
+            # A TCB signing certificate by another name, or not for signing.
+            other = cert("Intel SGX PCK Platform CA", intel.tcb_key, "Intel SGX Root CA", intel.root_key, False,
+                         ku=key_usage(sign=True))
+            self.refused(self.evidence(), "not Intel's TCB signing certificate", self.collateral(d, chain=pem(other)))
+            no_sign = cert("Intel SGX TCB Signing", intel.tcb_key, "Intel SGX Root CA", intel.root_key, False,
+                           ku=key_usage(cert_sign=False))
+            self.refused(self.evidence(), "may not sign", self.collateral(d, chain=pem(no_sign)))
+            # A CRL from a CA that may not sign CRLs.
+            ca_no_crl = cert("Intel SGX PCK Platform CA", intel.pck_ca_key, "Intel SGX Root CA", intel.root_key, True,
+                             ku=key_usage(cert_sign=True))
+            q = make_quote(intel, self.fields(), chain=pem(intel.pck, ca_no_crl))
+            self.refused(self.evidence(q), "may not sign CRLs", self.collateral(d, pck_crl=crl(ca_no_crl, intel.pck_ca_key)))
+
+    def test_qe_identity_signing_chain(self):
+        intel = self.intel
+        qe_key = ec.generate_private_key(ec.SECP256R1())
+        qe_cert = cert("Intel SGX TCB Signing", qe_key, "Intel SGX Root CA", intel.root_key, False, ku=key_usage(sign=True))
+        with tempfile.TemporaryDirectory() as d:
+            # QE identity signed by its own signing certificate, given.
+            self.check(self.evidence(), self.collateral(d, qe_chain=pem(qe_cert, intel.root), qe_key=qe_key))
+            # Without it, TCB info's certificate does not verify it.
+            self.refused(self.evidence(), "QE identity signature", self.collateral(d, qe_key=qe_key))
+            # Revoked by the root CA.
+            col = self.collateral(d, qe_chain=pem(qe_cert), qe_key=qe_key,
+                                  root_crl=crl(intel.root, intel.root_key, [qe_cert.serial_number]))
+            self.refused(self.evidence(), "QE identity signing certificate is revoked", col)
+
+    def test_migratable_td(self):
+        f = self.fields()
+        attrs = bytearray(f["td_attributes"])
+        attrs[3] |= 0x20
+        q = make_quote(self.intel, self.fields(td_attributes=bytes(attrs)))
+        self.refused(self.evidence(q), "migratable")
+        _, info = self.check(self.evidence(q), allow_migratable=True)
+        self.assertTrue(info["migratable"])
+        _, info = self.check(self.evidence())
+        self.assertFalse(info["migratable"])
+
+    def test_tdx_1_5_module_ignores_tdx_1_0_entry(self):
+        # TDX 1.5 (TEE_TCB_SVN[1] > 0): tdxModule (TDX 1.0's signer) is not
+        # this module's; its identity entry is.
+        svn = bytes([2, 1, 5] + [0] * 13)
+        q = make_quote(self.intel, self.fields(tee_tcb_svn=svn))
+        ident = [{"id": "TDX_01", "mrsigner": MRSIGNERSEAM.hex(), "attributes": "0000000000000000",
+                  "attributesMask": "FFFFFFFFFFFFFFFF",
+                  "tcbLevels": [{"tcb": {"isvsvn": 2}, "tcbDate": "2025-01-01T00:00:00Z", "tcbStatus": "UpToDate",
+                                 "advisoryIDs": ["INTEL-SA-01111", "INTEL-SA-00837"]}]}]
+        levels = [tcb_level("UpToDate", tdx=(9, 9, 5) + (0,) * 13, advisories=("INTEL-SA-00837",))]
+        with tempfile.TemporaryDirectory() as d:
+            col = self.collateral(d, tcb=tcb_info(levels, identities=ident, mrsigner=b"\x01" * 48))
+            _, info = self.check(self.evidence(q), col)
+            self.assertEqual(info["tdx_module_tcb_status"], "UpToDate")
+            # Advisories of the platform, the module and the QE, each once.
+            self.assertEqual(info["advisory_ids"], ["INTEL-SA-00837", "INTEL-SA-01111"])
+            # TDX 1.0 still checks tdxModule.
+            self.refused(self.evidence(), "TDX module signer",
+                         self.collateral(d, tcb=tcb_info(UP_TO_DATE, mrsigner=b"\x01" * 48)))
+
+    def test_svns_are_the_pck_and_qe_reports(self):
+        # Header bytes 8-11 are reserved: not the SVNs reported.
+        q = make_quote(self.intel, self.fields(), tamper={"header": lambda h: h[:8] + b"\xff" * 4 + h[12:]})
+        _, info = self.check(self.evidence(q))
+        self.assertEqual((info["pce_svn"], info["qe_svn"]), (PCESVN, 8))
+
+    def test_cc_event_log_zero_padding(self):
+        log = ccel(CC_EVENTS)
+        _, info = self.check(self.evidence(), cc_event_log=log + bytes(4096))
+        self.assertEqual(info["cc_event_log_events"], len(CC_EVENTS))
+        self.refused(self.evidence(), "event log", cc_event_log=log + bytes(100) + b"\x01")
+        self.assertTrue(a.is_cc_event_log(log + bytes(64)))
+        # The TPM's log stays strict.
+        with self.assertRaises(a.Fail):
+            a.parse_event_log(log + bytes(4))
+
+    def test_quote_chain_with_nul_terminator(self):
+        q = make_quote(self.intel, self.fields(), chain=pem(self.intel.pck, self.intel.pck_ca) + b"\x00\x00")
+        self.check(self.evidence(q))
+
+    def test_attestation_key_off_the_curve(self):
+        good = make_quote(self.intel, self.fields())
+        p = a.parse_tdx_quote(good)
+        at = good.index(p["att_key"])
+        bad = good[:at] + bytes(64) + good[at + 64:]
+        self.refused(self.evidence(bad), "invalid P-256 attestation key")
+
+    def test_sgx_tcb_extension_oids(self):
+        o = a.SGX_EXTENSIONS_OID
+        tcb = [der(0x30, der_oid("%s.2.%d" % (o, i + 1)) + der_int(1)) for i in range(16)]
+        tcb.append(der(0x30, der_oid("1.2.3.4") + der_int(1)))  # outside the TCB's OIDs
+        ext = der(0x30, der(0x30, der_oid(o + ".2") + der(0x30, b"".join(tcb)))
+                  + der(0x30, der_oid(o + ".3") + der(0x04, PCEID)) + der(0x30, der_oid(o + ".4") + der(0x04, FMSPC)))
+        c = cert("x", self.intel.pck_key, "y", self.intel.pck_ca_key, False, ext=ext)
+        with self.assertRaisesRegex(a.Fail, "malformed SGX TCB extension"):
+            a.sgx_extensions(c)
+
     # ---- a guest's fresh quote (ATTEST_TDX_QUOTE)
 
     def answer(self, report=None, rtmr3=None, reportdata=None, key=None):
@@ -699,6 +814,14 @@ class Tdx(unittest.TestCase):
             r = self.run_tool("verify", p["rep"], p["tpm"])
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertEqual(set(json.loads(r.stdout)), {"host", "guest"})
+            # TPM evidence alone where TDX was asked for (a host that left
+            # its TDX evidence out): refused, whichever TDX option.
+            for opts in (("--intel-root-ca", root), ("--mrtd", "11" * 48), ("--rtmr", "0=" + "00" * 48),
+                         ("--collateral-dir", col), ("--cc-event-log", p["log"]), ("--allow-debug",),
+                         ("--allow-migratable",), ("--root-ca-crl", root)):
+                r = self.run_tool("verify", p["rep"], p["tpm"], *opts)
+                self.assertEqual(r.returncode, 1, opts)
+                self.assertIn("TDX options without TDX evidence", r.stderr)
             # The two roots of trust speak of different keys, or the TPM's
             # of a partition.
             r = self.run_tool("verify", p["rep"], "--tdx-evidence", p["tdx"], "--tpm-evidence", p["other_tpm"], "--intel-root-ca", root)
@@ -774,6 +897,7 @@ class Tdx(unittest.TestCase):
             self.assertIn("check it against Intel's published root", err.getvalue())
             self.assertIn("fmspc=%s" % FMSPC.hex().upper(), asked[0])
             self.assertIn("intel_root_ca.pem", files)
+            self.assertIn("qe_identity_signing_chain.pem", files)
             with open(os.path.join(d, "intel_root_ca.pem"), "rb") as f:
                 self.assertEqual(x509.load_pem_x509_certificate(f.read()), intel.root)
             _, info = self.check(self.evidence(), a.Collateral(d))

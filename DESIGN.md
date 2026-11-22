@@ -4673,8 +4673,8 @@ Reports are the same COSE_Sign1 under K. `L4H_ATTEST_TDX_EVIDENCE` gives
 event log, and `L4H_ATTEST_TDX_QUOTE` a fresh quote over a guest's report
 (`{"key", "quote", "report"}`, REPORTDATA `SHA-384("l4h-tdx-report-v1" ‖
 SHA-256(report)) ‖ 0^16`; its RTMR 3 shows K), rate limited as
-ActivateCredential and one at a time: another guest's waits, its other
-requests do not. The page's state says which quotes reports are bound to
+ActivateCredential and one at a time, guests taking turns: another
+guest's waits, its other requests do not. The page's state says which quotes reports are bound to
 (`L4H_ATTEST_HAS_TPM`, `L4H_ATTEST_HAS_TDX`); `L4H_ATTEST_NO_REPORTS` only
 when neither. The guest driver's configfs-tsm `auxblob` is the TPM
 evidence as before, the TDX evidence on a TD without a TPM, or both as
@@ -4683,7 +4683,7 @@ evidence as before, the TDX evidence on a TD without a TPM, or both as
 (and `--tdx-evidence` with `--tpm-evidence`, which must name the same K):
 the quote's ECDSA signature, the QE report binding its attestation key and
 signed by the PCK certificate, the PCK chain to the pinned
-`--intel-root-ca`, no debug TD, and with Intel's collateral
+`--intel-root-ca`, no debug or migratable TD, and with Intel's collateral
 (`fetch-collateral`, `--collateral-dir`: TCB info and QE identity under
 the TCB signing certificate, the PCK and root CRLs) the TCB status of the
 platform, the TDX module and the QE; then K's binding with RTMR 3 zero,

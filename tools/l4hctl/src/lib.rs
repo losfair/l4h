@@ -1493,7 +1493,8 @@ pub mod attest {
             Some(2) if op == TDX_EVENT_LOG => "no TDX (CC) event log available".into(),
             Some(19) if tdx => "no TDX attestation on this host".into(),
             Some(11) if op == TDX_QUOTE => "TDX quotes rate limited or busy: try again".into(),
-            Some(22) if tdx => "the guest kernel or host does not know this TDX request".into(),
+            // -EINVAL from a guest kernel, -ENOSYS from a host, older than TDX.
+            Some(22 | 38) if tdx => "the guest kernel or host does not know this TDX request".into(),
             Some(2) => "no TPM event log available".into(),
             Some(19) => "no TPM: flags only".into(),
             Some(38) => "host has no taint/seal operations".into(),
@@ -1672,6 +1673,12 @@ pub mod attest {
             assert_eq!(msg(TDX_QUOTE, 11), "TDX quotes rate limited or busy: try again");
             assert!(msg(TDX_EVIDENCE, 5).starts_with("attestation request 7 failed"));
             assert!(msg(TDX_QUOTE, 5).starts_with("attestation request 9 failed"));
+            // An older host's -ENOSYS is about TDX, not taint/seal.
+            for op in [TDX_EVIDENCE, TDX_EVENT_LOG, TDX_QUOTE] {
+                assert_eq!(msg(op, 38), "the guest kernel or host does not know this TDX request");
+                assert_eq!(msg(op, 22), "the guest kernel or host does not know this TDX request");
+            }
+            assert_eq!(msg(ACT, 38), "host has no taint/seal operations");
         }
 
         #[test]

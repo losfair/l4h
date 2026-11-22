@@ -708,7 +708,8 @@ fn page_of(id: usize, r: &GuestRecord) -> usize {
 /// The result of guest `id`'s request `seq` in its page (the evidence, or
 /// what we built in `out`), or -errno.  `starting`: a secondary waits for
 /// its key's quote.  `event_log`, `cc_event_log`: the host's TPM and CC
-/// event logs, empty if none.  `tdx`: the TD's attestation.
+/// event logs, empty if none.  `tdx`: the TD's attestation; `others_waiting`:
+/// other guests' requests wait (TDX quotes take turns).
 #[allow(clippy::too_many_arguments)]
 fn execute<'a>(
     state: &'a mut Option<State>,
@@ -722,6 +723,7 @@ fn execute<'a>(
     last: &mut Answered,
     hz: u64,
     relay: Option<&mut Relay>,
+    others_waiting: bool,
     out: &'a mut [u8; ANSWER_MAX],
 ) -> Result<&'a [u8], Errno> {
     let p = page(page_of(id, r));
@@ -776,8 +778,8 @@ fn execute<'a>(
             let Some(t) = tdx.as_mut() else { return Err(ENODEV) };
             let d: [u8; abi::ATTEST_DATA_SIZE] = data.try_into().unwrap();
             let s = &*s;
-            return t.request(id, r.instance, seq, &d, tdxrt::offset(p), || last.quote.allow(host::ticks::now(), hz),
-                |buf| s.report(id, r, &d, buf));
+            return t.request(id, r.instance, seq, &d, tdxrt::offset(p), others_waiting,
+                || last.quote.allow(host::ticks::now(), hz), |buf| s.report(id, r, &d, buf));
         }
         abi::ATTEST_REPORT if !s.has_tpm && !tdx.as_ref().is_some_and(|t| t.ready()) => {
             return Err(if td_starting { DEFER } else { ENODEV });
@@ -958,6 +960,8 @@ fn main(info: &'static Info) -> ! {
     // Guests whose requests wait for the relay, or TDX.
     let mut deferred = 0u64;
     let status = unsafe { &*(trust::STATUS_VA as *const trust::Status) };
+    // The guest last looked at (round robin).
+    let mut last_guest = trust::MAX_RECORDS - 1;
     loop {
         // Root's timer, while we wait for what has no kick of our own.
         status.wake.store((deferred != 0 || tdx.as_ref().is_some_and(|t| t.busy())) as u64, Ordering::Relaxed);
@@ -979,9 +983,12 @@ fn main(info: &'static Info) -> ! {
                 }
             }
             Some(tdxrt::Event::Quoted { id, instance, seq, result }) => {
-                let t = tdx.as_ref().expect("a quote's TDX");
+                let t = tdx.as_mut().expect("a quote's TDX");
                 if answered[id].instance == instance && answer(id, instance, seq, result.map(|n| t.answer(n))) {
                     answered[id].seq = seq;
+                } else {
+                    // Gone, or replaced: its answer is kept for no one.
+                    t.release_held(id, instance);
                 }
             }
             None => {}
@@ -1028,8 +1035,15 @@ fn main(info: &'static Info) -> ! {
             None => {}
         }
         while kicked != 0 {
-            let id = kicked.trailing_zeros() as usize;
-            kicked &= kicked - 1;
+            // Round robin, from the guest after the last one served: no
+            // guest id goes first for good (a low one could otherwise keep
+            // the TDX quote slot from the others).
+            let guest = host::badges::trustd_kick::GUEST;
+            let Some(id) = (1..=trust::MAX_RECORDS).map(|k| (last_guest + k) % trust::MAX_RECORDS)
+                .find(|&i| kicked & guest.nth(i) != 0) else { break };
+            last_guest = id;
+            kicked &= !guest.nth(id);
+            let others_waiting = (kicked | deferred) & !guest.nth(id) != 0;
             let Some(r) = record(id) else { continue };
             let p = page(page_of(id, &r));
             // A new guest's page has root's state: ours, before we answer.
@@ -1043,7 +1057,8 @@ fn main(info: &'static Info) -> ! {
             if seq == last.seq {
                 continue;
             }
-            let result = execute(&mut state, &mut tdx, starting.is_some(), event_log, cc_event_log, id, seq, &r, last, hz, relay.as_mut(), &mut out);
+            let result = execute(&mut state, &mut tdx, starting.is_some(), event_log, cc_event_log, id, seq, &r, last, hz,
+                relay.as_mut(), others_waiting, &mut out);
             match result {
                 Err(DEFER) => {
                     deferred |= host::badges::trustd_kick::GUEST.nth(id);
