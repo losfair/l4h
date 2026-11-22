@@ -194,13 +194,13 @@ class EkCertificate(unittest.TestCase):
         cls.ek_key = ec.generate_private_key(ec.SECP256R1())
         cls.now = datetime.datetime.now(datetime.timezone.utc)
 
-    def cert(self, subject, key, issuer, issuer_key, ca=None, key_usage=None, eku=None, days=(-1, 1)):
+    def cert(self, subject, key, issuer, issuer_key, ca=None, path_length=None, key_usage=None, eku=None, days=(-1, 1)):
         b = (x509.CertificateBuilder().subject_name(self.name(subject)).issuer_name(self.name(issuer))
              .public_key(key.public_key()).serial_number(x509.random_serial_number())
              .not_valid_before(self.now + datetime.timedelta(days=days[0]))
              .not_valid_after(self.now + datetime.timedelta(days=days[1])))
         if ca is not None:
-            b = b.add_extension(x509.BasicConstraints(ca=ca, path_length=None), critical=True)
+            b = b.add_extension(x509.BasicConstraints(ca=ca, path_length=path_length), critical=True)
         if key_usage is not None:
             b = b.add_extension(x509.KeyUsage(digital_signature=False, content_commitment=False, key_encipherment=False,
                                               data_encipherment=False, key_agreement=False, key_cert_sign=key_usage,
@@ -314,6 +314,88 @@ class EkCertificate(unittest.TestCase):
         self.check(self.ek(), [good])
         with self.assertRaisesRegex(a.Fail, "self-signature does not verify"):
             self.check(self.ek(), [tampered])
+
+    def test_path_length_constraint(self):
+        """RFC 5280 pathLenConstraint counts non-self-issued intermediate CAs
+        along each candidate path; the leaf EK certificate does not count."""
+        # path_length=0 may directly issue the leaf EK certificate.
+        self.check(self.ek(), [self.ca(path_length=0)])
+        root_key = ec.generate_private_key(ec.SECP256R1())
+        mid_key = ec.generate_private_key(ec.SECP256R1())
+        root0 = self.cert("root", root_key, "root", root_key, ca=True, path_length=0)
+        root1 = self.cert("root", root_key, "root", root_key, ca=True, path_length=1)
+        root2 = self.cert("root", root_key, "root", root_key, ca=True, path_length=2)
+        inter = self.cert("ca", self.ca_key, "root", root_key, ca=True, path_length=0)
+        # 1 non-self-issued intermediate: path_length=0 rejects, 1 accepts.
+        with self.assertRaisesRegex(a.Fail, "path length constraint"):
+            self.check(self.ek(), [inter, root0])
+        self.check(self.ek(), [inter, root1])
+        # 2 non-self-issued intermediates: path_length=1 rejects, 2 accepts.
+        mid1 = self.cert("mid", mid_key, "root", root_key, ca=True, path_length=1)
+        mid0 = self.cert("mid", mid_key, "root", root_key, ca=True, path_length=0)
+        low = self.cert("ca", self.ca_key, "mid", mid_key, ca=True, path_length=0)
+        with self.assertRaisesRegex(a.Fail, "path length constraint"):
+            self.check(self.ek(), [low, mid1, root1])
+        with self.assertRaisesRegex(a.Fail, "path length constraint"):
+            self.check(self.ek(), [low, mid0, root2])
+        self.check(self.ek(), [low, mid1, root2])
+        # Pinned intermediate chain without root still enforces path_length.
+        with self.assertRaisesRegex(a.Fail, "path length constraint"):
+            self.check(self.ek(), [low, mid0])
+        self.check(self.ek(), [low, mid1])
+        # Alternative paths: one fails path_length, another passes, in any order.
+        alt_key = ec.generate_private_key(ec.SECP256R1())
+        alt_root = self.cert("alt", alt_key, "alt", alt_key, ca=True, path_length=1)
+        inter_alt = self.cert("ca", self.ca_key, "alt", alt_key, ca=True, path_length=0)
+        for cas in ([inter, root0, inter_alt, alt_root], [alt_root, inter_alt, root0, inter]):
+            self.check(self.ek(), cas)
+
+    def test_self_issued_rollover_and_order(self):
+        """Subject == Issuer is self-issued, not necessarily self-signed: a
+        rollover CA chains to a same-named verifying issuer and does not count
+        toward pathLenConstraint."""
+        old_key = ec.generate_private_key(ec.SECP256R1())
+        new_key = ec.generate_private_key(ec.SECP256R1())
+        old_root0 = self.cert("root", old_key, "root", old_key, ca=True, path_length=0)
+        old_root1 = self.cert("root", old_key, "root", old_key, ca=True, path_length=1)
+        new_root = self.cert("root", new_key, "root", old_key, ca=True, path_length=1)
+        inter = self.cert("ca", self.ca_key, "root", new_key, ca=True, path_length=0)
+        # Valid rollover chain works regardless of CA order in the bundle.
+        for cas in ([inter, new_root, old_root1], [old_root1, new_root, inter], [new_root, old_root1, inter]):
+            self.check(self.ek(), cas)
+        # Self-issued rollover directly issuing EK passes under path_length=0.
+        direct_new = self.cert("ca", self.ca_key, "ca", old_key, ca=True, path_length=0)
+        direct_old = self.cert("ca", old_key, "ca", old_key, ca=True, path_length=0)
+        for cas in ([direct_new, direct_old], [direct_old, direct_new]):
+            self.check(self.ek(), cas)
+        # Non-self-issued intermediate below rollover still counts toward old_root0.
+        with self.assertRaisesRegex(a.Fail, "path length constraint"):
+            self.check(self.ek(), [inter, new_root, old_root0])
+        # Rollover without its old root (or with an unrelated same-named root) fails.
+        other_key = ec.generate_private_key(ec.SECP256R1())
+        other_root = self.cert("root", other_key, "root", other_key, ca=True)
+        for cas in ([inter, new_root], [inter, new_root, other_root]):
+            with self.assertRaisesRegex(a.Fail, "self-signature does not verify"):
+                self.check(self.ek(), cas)
+        # Two mutually signing same-named CAs (no self-signed root): loop refused.
+        loop_a = self.cert("ca", self.ca_key, "ca", old_key, ca=True)
+        loop_b = self.cert("ca", old_key, "ca", self.ca_key, ca=True)
+        for cas in ([loop_a, loop_b], [loop_b, loop_a]):
+            with self.assertRaisesRegex(a.Fail, "EK CA chain loops"):
+                self.check(self.ek(), cas)
+        # Chain length boundary (EK_CHAIN_MAX) still holds.
+        keys = [self.ca_key] + [ec.generate_private_key(ec.SECP256R1()) for _ in range(a.EK_CHAIN_MAX)]
+        chain8 = [self.cert("c%d" % i, keys[i], "c%d" % (i + 1), keys[i + 1], ca=True) for i in range(a.EK_CHAIN_MAX - 1)]
+        chain8[0] = self.cert("ca", keys[0], "c1", keys[1], ca=True)
+        root8 = self.cert("c%d" % (a.EK_CHAIN_MAX - 1), keys[a.EK_CHAIN_MAX - 1],
+                          "c%d" % (a.EK_CHAIN_MAX - 1), keys[a.EK_CHAIN_MAX - 1], ca=True)
+        self.check(self.ek(), chain8 + [root8])
+        chain9 = chain8 + [self.cert("c%d" % (a.EK_CHAIN_MAX - 1), keys[a.EK_CHAIN_MAX - 1],
+                                     "c%d" % a.EK_CHAIN_MAX, keys[a.EK_CHAIN_MAX], ca=True),
+                           self.cert("c%d" % a.EK_CHAIN_MAX, keys[a.EK_CHAIN_MAX],
+                                     "c%d" % a.EK_CHAIN_MAX, keys[a.EK_CHAIN_MAX], ca=True)]
+        with self.assertRaisesRegex(a.Fail, "EK CA chain longer than %d" % a.EK_CHAIN_MAX):
+            self.check(self.ek(), chain9)
 
 
 def rsa_public(key, attrs):
@@ -805,14 +887,61 @@ class EventLog(unittest.TestCase):
         # Only before PCR 0 is extended.
         log = spec_id() + event2(*self.EVENTS[0]) + loc + b"".join(event2(*e) for e in self.EVENTS[1:])
         self.assertEqual(a.replay_event_log(log)[0][0], self.replayed()[0])
-        # Locality 0 too; no other (a TPM2_Startup comes from 0 or 3).
+        # Locality 0 too; reserved values (neither 0, 3 nor 4) are refused.
         zero = event2(0, 3, b"StartupLocality\0\x00", digests={SHA256: bytes(32)})
         self.assertEqual(a.replay_event_log(spec_id() + zero + b"".join(event2(*e) for e in self.EVENTS))[0][0],
                          self.replayed()[0])
-        for bad in (1, 2, 4, 0xFF):
+        for bad in (1, 2, 5, 0xFF):
             ev = event2(0, 3, b"StartupLocality\0" + bytes([bad]), digests={SHA256: bytes(32)})
-            with self.assertRaisesRegex(a.Fail, "StartupLocality %d is neither 0 nor 3" % bad):
+            with self.assertRaisesRegex(a.Fail, "StartupLocality %d is not 0, 3 or 4" % bad):
                 a.replay_event_log(spec_id() + ev + b"".join(event2(*e) for e in self.EVENTS))
+
+    def test_startup_locality_4_hcrtm(self):
+        """PFP 1.06 rev52 3.3.4.1 & 10.4.5.3: StartupLocality 4 and
+        EV_EFI_HCRTM_EVENT ("HCRTM") are symmetrically paired once on PCR 0's
+        first extend, allowing intervening EV_NO_ACTION or other-PCR events."""
+        loc = lambda v, pcr=0: event2(pcr, 3, b"StartupLocality\0" + bytes([v]), digests={SHA256: bytes(32)})
+        loc4 = loc(4)
+        # EventData is fixed 5-byte "HCRTM"; the bank digest is the hardware
+        # measurement, not SHA-256("HCRTM") (PFP 1.06 rev52 10.4.5.5).
+        hcrtm_digest = hashlib.sha256(b"hw-measured-hcrtm-components").digest()
+        hcrtm_ev = event2(0, a.EV_EFI_HCRTM_EVENT, b"HCRTM", digests={SHA256: hcrtm_digest})
+        tail = b"".join(event2(*e) for e in self.EVENTS)
+        pcr0 = hashlib.sha256(bytes(31) + b"\x04" + hcrtm_digest).digest()
+        want = self.replayed(events=self.EVENTS, pcr0=pcr0)
+
+        log = spec_id() + loc4 + hcrtm_ev + tail
+        pcrs, _ = a.replay_event_log(log)
+        self.assertEqual({i: pcrs[i] for i in range(15)}, want)
+        self.assertEqual(a.check_event_log(log, {**want, 15: bytes(32)}), len(self.EVENTS) + 2)
+
+        # Intervening EV_NO_ACTION metadata and another PCR's event are allowed.
+        no_action = event2(0, 3, b"SP800-155 Event3\0", digests={SHA256: bytes(32)})
+        other_pcr = (7, 0x80000001, b"pre-hcrtm pcr7")
+        log_interleaved = spec_id() + loc4 + no_action + event2(*other_pcr) + hcrtm_ev + tail
+        pcrs_interleaved, _ = a.replay_event_log(log_interleaved)
+        want_interleaved = self.replayed(events=[other_pcr] + list(self.EVENTS), pcr0=pcr0)
+        self.assertEqual({i: pcrs_interleaved[i] for i in range(15)}, want_interleaved)
+
+        # Symmetric rejections: missing/wrong/bare/duplicate H-CRTM or locality.
+        bad_logs = [
+            ("requires PCR 0's first event to be EV_EFI_HCRTM_EVENT", spec_id() + loc4 + tail),
+            ("unexpected EV_EFI_HCRTM_EVENT", spec_id() + loc4 + event2(0, a.EV_EFI_HCRTM_EVENT, b"HCRTM\0") + tail),
+            ("unexpected EV_EFI_HCRTM_EVENT", spec_id() + loc4 + event2(1, a.EV_EFI_HCRTM_EVENT, b"HCRTM") + tail),
+            ("unexpected EV_EFI_HCRTM_EVENT", spec_id() + hcrtm_ev + tail),
+            ("unexpected EV_EFI_HCRTM_EVENT", spec_id() + loc(0) + hcrtm_ev + tail),
+            ("unexpected EV_EFI_HCRTM_EVENT", spec_id() + loc(3) + hcrtm_ev + tail),
+            ("unexpected EV_EFI_HCRTM_EVENT", spec_id() + loc4 + hcrtm_ev + hcrtm_ev + tail),
+            ("without a PCR 0 EV_EFI_HCRTM_EVENT", spec_id() + loc4),
+            ("before it is extended", spec_id() + event2(*self.EVENTS[0]) + loc4 + hcrtm_ev),
+            ("must be on PCR 0", spec_id() + loc(4, pcr=1) + hcrtm_ev),
+            ("duplicate StartupLocality", spec_id() + loc(3) + loc4 + hcrtm_ev),
+            ("duplicate StartupLocality", spec_id() + loc4 + loc(0) + hcrtm_ev),
+            ("duplicate StartupLocality", spec_id() + loc4 + hcrtm_ev + loc(3) + tail),
+        ]
+        for why, bad in bad_logs:
+            with self.assertRaisesRegex(a.Fail, why):
+                a.replay_event_log(bad)
 
     def test_pcr15_is_trustds(self):
         """The firmware extending PCR 15 would have trustd's key quoted

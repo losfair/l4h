@@ -4375,7 +4375,9 @@ The chain has four links.
    - the EK certificate is issued by a CA certificate given with `--ek-ca`;
      when the file also holds that CA's issuer (a manufacturer's
      intermediate and root), every hop up to a self-signed root is checked
-     too (signature, validity, CA, keyCertSign);
+     too (signature, validity, CA, keyCertSign, pathLenConstraint;
+     self-issued rollover CAs do not count toward pathLenConstraint and
+     chain to a verifying issuer);
    - the AK is the enrolled one (`--ak-name`): without it `verify` refuses
      TPM evidence unless given `--insecure-unpinned-ak`, as for reading the
      AK's name before enrolling it;
@@ -4383,7 +4385,8 @@ The chain has four links.
      expected launch digest;
    - with `--event-log`, the host's event log (TCG2 crypto agile format)
      replays, in its SHA-256 bank, to the quoted PCRs 0–14 and leaves PCR 15
-     (trustd's) zero, from a StartupLocality of 0 or 3; its events
+     (trustd's) zero, from a StartupLocality of 0 or 3, or 4 when PCR 0's
+     first extended event is `EV_EFI_HCRTM_EVENT` (`"HCRTM"`); its events
      then say what the firmware measured (`l4h-attest.py event-log` lists
      them). `measure` computes the digest from the kernel
      (`vmlinux` in a release's debug archive), initramfs and command line.
