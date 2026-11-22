@@ -1,4 +1,6 @@
 //! The production CTL_VM_START handler with a guest that records its boot.
+// All of the host's errnos, which this handler returns only some of.
+#[allow(dead_code)]
 #[path = "../host/l4h-host/src/errno.rs"]
 mod errno;
 use errno::{EBUSY, EINVAL, EIO, ENOENT, ENOMEM, Errno};
@@ -25,6 +27,8 @@ struct Guest {
     reserved: usize,
     host: usize,
     boots: usize,
+    /// An HVM guest, and the (kernel, initrd, flags) it was booted with.
+    hvm: Option<Option<((u64, u64), (u64, u64), u64)>>,
 }
 impl Guest {
     fn boot_cost(&self, _: usize, _: (usize, usize)) -> Option<(usize, usize)> { Some((BOOT, 0)) }
@@ -36,6 +40,21 @@ impl Guest {
         self.host -= short;
         self.reserved += short;
         true
+    }
+}
+
+mod hvm {
+    /// As the production one: an HVM guest is booted once, with the
+    /// kernel dom0 loaded; flags it does not know are refused.  Its boot
+    /// blocks are its own RAM: no host memory.
+    pub fn boot(g: &mut super::Guest, _: &mut (), kernel: (u64, u64), initrd: (u64, u64), flags: u64, _: &[u8])
+        -> Result<(), super::Errno> {
+        let h = g.hvm.as_mut().expect("an HVM guest");
+        if flags != 0 || kernel.1 == 0 { return Err(super::EINVAL); }
+        if h.is_some() { return Err(super::EBUSY); }
+        *h = Some((kernel, initrd, flags));
+        g.boots += 1;
+        Ok(())
     }
 }
 
@@ -57,6 +76,7 @@ impl Vmmgr {
         self.guests[id] = Some(g);
         Some(r)
     }
+    fn guest(&self, id: usize) -> Option<&Guest> { self.guests.get(id)?.as_ref() }
     fn can_afford(&self, _: usize, _: usize, _: usize) -> bool { true }
     /// As the production one, nothing here is refused: what the VMM takes
     /// was reserved.
@@ -70,7 +90,7 @@ impl Vmmgr {
 }
 
 fn guest(root_pending: bool, host: usize) -> Guest {
-    Guest { state: State::Created, vmm: None, root_pending, reserved: 0, host, boots: 0 }
+    Guest { state: State::Created, vmm: None, root_pending, reserved: 0, host, boots: 0, hvm: None }
 }
 fn vmmgr(g: Guest) -> Vmmgr {
     Vmmgr { guests: [None, Some(g)], kernel: Some(Kernel { end: 0 }), alloc: (), wins: Wins { a: () }, info: (), started: 0, fail_start: false }
@@ -127,4 +147,24 @@ fn scheduling_failure_is_reported_by_the_public_start_handler() {
     assert_eq!(execute(&mut h, 0, &start()), Err(EIO));
     assert!(matches!(h.guests[1].as_ref().unwrap().state, State::Stopped));
     assert_eq!(h.started, 0);
+}
+
+/// An HVM guest boots the kernel dom0 loaded (args 3-5), once, and only
+/// with memory for its l4h-hvm reserved first.
+#[test]
+fn an_hvm_guest_starts_with_its_kernel() {
+    let mut g = guest(false, VMM);
+    g.hvm = Some(None);
+    let mut h = vmmgr(g);
+    let req = abi::CtlReq { args: [1, 0x400_0000, 6, 0x300_0000, 0x80_0000, 0], ..start() };
+    assert_eq!(execute(&mut h, 0, &req), Err(ENOMEM));
+    assert_eq!((h.guests[1].as_ref().unwrap().boots, h.started), (0, 0), "a refused start must not boot it");
+    h.guests[1].as_mut().unwrap().host += MAPS;
+    let bad = abi::CtlReq { args: [1, 0x400_0000, 6, 0x300_0000, 0x80_0000, 1], ..start() };
+    assert_eq!(execute(&mut h, 0, &bad), Err(EINVAL), "unknown boot flags");
+    assert_eq!(execute(&mut h, 0, &req), Ok(()));
+    let g = h.guests[1].as_ref().unwrap();
+    assert_eq!(g.hvm, Some(Some(((0x300_0000, 0x80_0000), (0x400_0000, 6), 0))));
+    assert_eq!((g.boots, h.started), (1, 1));
+    assert_eq!(execute(&mut h, 0, &req), Err(EBUSY));
 }

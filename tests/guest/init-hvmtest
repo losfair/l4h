@@ -1,0 +1,77 @@
+#!/bin/sh
+slow=${L4H_TEST_SLOW:-1}
+# dom0 init for tests/run-hvmtest.sh: HVM guests (DESIGN.md §5.11), an
+# unmodified x86-64 Linux, through l4hctl.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mount -t tmpfs tmp /tmp
+fail() { echo "HVMTEST: FAIL: $*"; l4hctl list; poweroff -f; }
+free() { l4hctl info | sed -n 's/memory: \([0-9]*\) MiB free.*/\1/p'; }
+# console ID PATTERN SECS: the console until PATTERN, into /tmp/out.
+console() { l4hctl console "$1" --until "$2" --timeout "$(($3 * slow))" > /tmp/out || { cat /tmp/out; fail "vm $1: no '$2'"; }; }
+expect() { grep -q "$1" /tmp/out || { cat /tmp/out; fail "$2"; }; }
+echo "HVMTEST: start"
+l4hctl info
+# Without the CPU's virtualization, HVM guests are refused (-ENODEV) and
+# the test has nothing more to check.
+if ! l4hctl create probe --hvm --kernel /bin/bzImage --mem 256 --cmdline "console=ttyS0 HVM=probe" > /tmp/id 2>/tmp/err; then
+    cat /tmp/err
+    grep -q "unsupported device" /tmp/err && { echo "HVMTEST: no VT-x or AMD-V"; poweroff -f; }
+    fail "probe create"
+fi
+l4hctl destroy "$(cat /tmp/id)" || fail "destroy probe"
+# What HVM guests do not have.
+if l4hctl create nogpu --hvm --kernel /bin/bzImage --mem 256 --gpu 64x64 2>/tmp/err; then fail "HVM guest with a GPU"; fi
+grep -q "not supported by this kind of VM" /tmp/err || { cat /tmp/err; fail "GPU refusal"; }
+l4hctl list | grep -q nogpu && fail "refused VM left behind"
+
+# A PV peer for the network, on a switch of its own.
+sw=$(l4hctl switch-create) || fail "switch-create"
+peer=$(l4hctl create peer --initrd /bin/netvm.cpio.gz --mem 96 --nic "$sw" \
+    --cmdline "console=hvc0 IP0=192.168.9.1/24") || fail "create peer"
+console "$peer" "NETVM: done" 120
+free0=$(free)
+echo "HVMTEST: $free0 MiB free"
+printf 'HVMMARK-l4h-disk' > /tmp/mark
+l4hctl disk-write 0 0 /tmp/mark || fail "disk-write"
+
+# 1: two vCPUs, disk, network, console, the ACPI power button.
+id=$(l4hctl create hvm1 --hvm --kernel /bin/bzImage --initrd /bin/hvmvm.cpio.gz --mem 256 --vcpus 2 \
+    --disk 0 --nic "$sw" --cmdline "console=ttyS0 DISK=write IP0=192.168.9.2/24 PING=192.168.9.1 BURN=3") \
+    || fail "create hvm1"
+echo "HVMTEST: created vm $id"
+l4hctl list | grep -q "hvm1 .* hvm" || { l4hctl list; fail "list does not show hvm"; }
+if l4hctl mem "$id" 512 2>/tmp/err; then fail "memory hotplug of an HVM guest"; fi
+console "$id" "HVMVM: ready" 900
+cat /tmp/out | grep -E "HVMVM|Linux version|smpboot|virtio|ACPI: (MADT|FADT|MCFG)|clocksource|x2apic|APIC" | head -60
+expect "HVMVM: up, .* cpus 2" "two vCPUs"
+expect "HVMVM: burned 3 s on 2 cpus" "SMP load"
+expect "HVMVM: vda .* marker HVMMARK-l4h-disk" "disk marker"
+expect "HVMVM: disk write ok" "disk write"
+expect "HVMVM: ping 192.168.9.1 ok" "network"
+l4hctl send "$id" "hello hvm" || fail "send"
+console "$id" "HVMVM: got hello hvm" 60
+echo "HVMTEST: console ok"
+l4hctl shutdown "$id" || fail "shutdown request"
+console "$id" "HVMVM: power button" 120
+i=0
+until l4hctl list | grep -q "hvm1 .* stopped"; do
+    i=$((i + 1)); [ $i -lt 600 ] || fail "hvm1 did not stop"; sleep 0.1
+done
+echo "HVMTEST: ACPI shutdown ok"
+l4hctl destroy "$id" || fail "destroy hvm1"
+[ "$(free)" = "$free0" ] || fail "memory leak: $free0 -> $(free) MiB"
+echo "HVMTEST: hvm1 reclaimed"
+
+# 2: the disk keeps what hvm1 wrote; destroyed while it runs.
+id=$(l4hctl create hvm2 --hvm --kernel /bin/bzImage --initrd /bin/hvmvm.cpio.gz --mem 192 --vcpus 1 \
+    --disk 0 --cmdline "console=ttyS0 DISK=check") || fail "create hvm2"
+console "$id" "HVMVM: ready" 900
+expect "HVMVM: disk check ok" "disk persistence"
+l4hctl destroy "$id" || fail "destroy hvm2"
+[ "$(free)" = "$free0" ] || fail "memory leak: $free0 -> $(free) MiB"
+echo "HVMTEST: hvm2 destroyed running and reclaimed"
+l4hctl destroy "$peer"
+echo "HVMTEST: PASS"
+poweroff -f

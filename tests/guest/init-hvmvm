@@ -1,0 +1,62 @@
+#!/bin/sh
+# Init of the HVM guests tests/guest/init-hvmtest creates: an unmodified
+# x86-64 Linux with virtio-pci devices and a 16550 console.  Kernel
+# command line variables (init's environment):
+#   DISK   write: write a pattern to /dev/vda; check: find it there
+#   IP0    eth0's address/prefix; PING an address to ping on it
+#   BURN   seconds every vCPU spins (SMP under load)
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev 2>/dev/null
+echo "HVMVM: up, kernel $(uname -r), cpus $(grep -c ^processor /proc/cpuinfo)"
+echo "HVMVM: clock $(cat /sys/devices/system/clocksource/clocksource0/current_clocksource), date $(date -u +%Y)"
+# The ACPI power button (l4hctl shutdown): power off, as a distribution's
+# logind or acpid would.
+for i in /sys/class/input/input*; do
+    [ "$(cat "$i/name" 2>/dev/null)" = "Power Button" ] || continue
+    for e in "$i"/event*; do button=/dev/input/${e##*/}; done
+done
+if [ -n "$button" ]; then
+    (dd if="$button" bs=24 count=1 >/dev/null 2>&1; echo "HVMVM: power button"; sync; poweroff -f) &
+else
+    echo "HVMVM: no power button"
+fi
+if [ -n "$BURN" ]; then
+    n=$(grep -c ^processor /proc/cpuinfo)
+    end=$(($(date +%s) + BURN))
+    for c in $(seq 1 "$n"); do (while [ "$(date +%s)" -lt $end ]; do :; done) & done
+    wait
+    echo "HVMVM: burned $BURN s on $n cpus"
+fi
+if [ -b /dev/vda ]; then
+    echo "HVMVM: vda $(cat /sys/block/vda/size) sectors, marker $(dd if=/dev/vda bs=16 count=1 2>/dev/null)"
+    # 3 MiB of a known pattern at 1 MiB, past the marker dom0 wrote.
+    seq 1 400000 | head -c 3145728 > /tmp/pattern
+    case "$DISK" in
+    write)
+        dd if=/tmp/pattern of=/dev/vda bs=1M seek=1 conv=fsync 2>/dev/null
+        echo 3 > /proc/sys/vm/drop_caches
+        if dd if=/dev/vda bs=1M skip=1 count=3 2>/dev/null | cmp -s - /tmp/pattern; then
+            echo "HVMVM: disk write ok"
+        else
+            echo "HVMVM: disk write failed"
+        fi
+        ;;
+    check)
+        if dd if=/dev/vda bs=1M skip=1 count=3 2>/dev/null | cmp -s - /tmp/pattern; then
+            echo "HVMVM: disk check ok"
+        else
+            echo "HVMVM: disk check failed"
+        fi
+        ;;
+    esac
+fi
+if [ -n "$IP0" ]; then
+    ip link set lo up
+    ip addr add "$IP0" dev eth0
+    ip link set eth0 up
+    if ping -c 3 -W 5 "$PING" >/dev/null 2>&1; then echo "HVMVM: ping $PING ok"; else echo "HVMVM: ping $PING failed"; fi
+fi
+echo "HVMVM: ready"
+while read -r line; do echo "HVMVM: got $line"; done
+sleep 1000000

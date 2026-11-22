@@ -27,9 +27,9 @@ strip() {
 nicds=(virtio gvnic ena ixgbe e1000e mlx5 r8125)
 nicd_pkgs=()
 for d in "${nicds[@]}"; do nicd_pkgs+=(-p "l4h-nicd-$d"); done
-"$root/tools/cargo.sh" build "${l4h_cargo[@]}" -q "${l4h_cargo_profile[@]}" --target x86_64-sel4 -p l4h-vmm -p l4h-blkd -p l4h-netd -p l4h-trustd -p l4h-memd -p l4h-logd -p l4h-usbd \
+"$root/tools/cargo.sh" build "${l4h_cargo[@]}" -q "${l4h_cargo_profile[@]}" --target x86_64-sel4 -p l4h-vmm -p l4h-hvm -p l4h-blkd -p l4h-netd -p l4h-trustd -p l4h-memd -p l4h-logd -p l4h-usbd \
     "${nicd_pkgs[@]}"
-strip vmm blkd netd trustd memd logd usbd "${nicds[@]/#/nicd-}"
+strip vmm hvm blkd netd trustd memd logd usbd "${nicds[@]/#/nicd-}"
 # The NIC drivers, as the bundle root has built in (the l4h-drivers boot
 # module replaces it).  Extra images: $L4H_EXTRA_DRIVERS (test drivers).
 drivers=()
@@ -40,7 +40,7 @@ python3 "$root/tools/mkdrivers.py" "$out/stripped/l4h-drivers.bin.new" "${driver
 cmp -s "$out/stripped/l4h-drivers.bin.new" "$out/stripped/l4h-drivers.bin" \
     && rm "$out/stripped/l4h-drivers.bin.new" || mv "$out/stripped/l4h-drivers.bin.new" "$out/stripped/l4h-drivers.bin"
 export L4H_DRIVERS_BIN=$out/stripped/l4h-drivers.bin
-# vmmgr embeds l4h-vmm, root embeds vmmgr.
+# vmmgr embeds l4h-vmm and l4h-hvm, root embeds vmmgr.
 "$root/tools/cargo.sh" build "${l4h_cargo[@]}" -q "${l4h_cargo_profile[@]}" --target x86_64-sel4 -p l4h-vmmgr
 strip vmmgr
 "$root/tools/cargo.sh" build "${l4h_cargo[@]}" -q "${l4h_cargo_profile[@]}" -p l4h-root "$@"

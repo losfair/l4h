@@ -19,6 +19,7 @@ mod ctl;
 mod ctl_failure;
 mod gpu;
 mod guest;
+mod hvm;
 mod kimage;
 mod provider;
 mod layout;
@@ -248,6 +249,9 @@ impl Vmmgr {
     }
 
     pub fn create_guest(&mut self, cfg: &GuestConfig) -> Option<usize> {
+        if cfg.hvm {
+            return self.create_hvm(cfg);
+        }
         let kernel = self.kernel.as_ref()?;
         // Its RAM and I/O pool, the arena and slots of its objects, the
         // block memd may need for its CNodes, and the SDK's mapping.
@@ -284,6 +288,37 @@ impl Vmmgr {
                     None => self.alloc.slots.free_owned(id),
                 }
                 info!("l4h-vmmgr: cannot create guest '{}': out of memory", cfg.name);
+                None
+            }
+        }
+    }
+
+    /// Create an HVM guest (hvm.rs), as create_guest.
+    fn create_hvm(&mut self, cfg: &GuestConfig) -> Option<usize> {
+        let plan = hvm::plan(cfg)?;
+        let bytes = cfg.ram.checked_add(cfg.io_pool)?.checked_add(plan.estimate)?.checked_add(guest::BLOCK)?;
+        if !self.can_afford(bytes, 2, plan.slots) {
+            return None;
+        }
+        let id = (0..MAX_GUESTS).find(|&i| self.guest(i).is_none())?;
+        self.alloc.slots.track(id);
+        let asids = self.asids.in_use;
+        let cores = sched::place(self, cfg.vcpus, self.info.stagger());
+        let g = hvm::create(id, cfg, &mut self.alloc, &mut self.asids, &self.info, &cores);
+        self.alloc.slots.untrack();
+        match g {
+            Ok(mut g) => {
+                g.asids = self.asids.in_use - asids;
+                self.guests[id] = Some(g);
+                Some(id)
+            }
+            Err(partial) => {
+                self.asids.in_use = asids;
+                match partial {
+                    Some(g) => g.destroy(&mut self.alloc),
+                    None => self.alloc.slots.free_owned(id),
+                }
+                info!("l4h-vmmgr: cannot create HVM guest '{}': out of memory", cfg.name);
                 None
             }
         }
@@ -367,6 +402,9 @@ impl Vmmgr {
     pub fn attach_usb(&mut self, id: usize, ctrl: usize) -> Result<(), Errno> {
         if !self.can_afford((1 << 20) + guest::USB_BYTES, 0, l4h_abi::usb::AREA_PAGES + guest::DEVICE_SLOTS) { return Err(ctl::ENOMEM); }
         self.with_guest(id, |h, g| {
+            if g.hvm.is_some() {
+                return Err(ctl::EOPNOTSUPP);
+            }
             if g.state != State::Created || g.vmm.is_some() || g.root_pending {
                 return Err(ctl::EBUSY);
             }
@@ -426,7 +464,12 @@ impl Vmmgr {
         if g.attest {
             root::trust_register(g);
         }
-        let v = match vmm::spawn(g, &mut self.alloc, &mut self.wins.a, &mut self.asids, &self.info, limits) {
+        let spawned = if g.hvm.is_some() {
+            hvm::spawn(g, &mut self.alloc, &mut self.wins.a, &mut self.asids, &self.info, limits)
+        } else {
+            vmm::spawn(g, &mut self.alloc, &mut self.wins.a, &mut self.asids, &self.info, limits)
+        };
+        let v = match spawned {
             Ok(v) => v,
             Err(e) => {
                 l4h_rt::log!("l4h-vmmgr: create guest {} VMM scheduling: {:?}", g.id, e);
@@ -506,6 +549,9 @@ impl Vmmgr {
             return Err(ctl::ENOMEM);
         }
         self.with_guest(id, |h, g| {
+            if g.hvm.is_some() {
+                return Err(ctl::EOPNOTSUPP);
+            }
             if g.state != State::Created || g.vmm.is_some() || g.gpu.is_some() || g.root_pending {
                 return Err(ctl::EBUSY);
             }
@@ -661,6 +707,7 @@ pub fn boot_dom0(h: &mut Vmmgr) {
         vspaces: 64,
         ram_base,
         dom0: true,
+        hvm: false,
     };
     let Some(id) = h.create_guest(&cfg) else {
         l4h_rt::log!("l4h-vmmgr: cannot create dom0; the serial monitor's restart-dom0 tries again");
@@ -923,6 +970,11 @@ fn set_timer(deadline: u64) {
 fn watchdog_dump(h: &Vmmgr) {
     for g in h.guests.iter().flatten() {
         if g.state != State::Running {
+            continue;
+        }
+        // An HVM guest's vCPU threads are l4h-hvm's: their registers are
+        // not the guest's.
+        if g.hvm.is_some() {
             continue;
         }
         for (v, vcpu) in g.vcpus.iter().enumerate() {

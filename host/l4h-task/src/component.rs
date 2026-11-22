@@ -79,7 +79,7 @@ impl Component {
     }
 
     fn audit_vmm_source(&self, idx: u64, source: &sel4::AbsoluteCPtr) {
-        if self.kind == host::KIND_VMM {
+        if self.kind == host::KIND_VMM || self.kind == host::KIND_HVM {
             if let Some(tag) = self.identify_cap(source) {
                 if let Err(why) = host::wiring::audit(self.kind, idx, tag) {
                     panic!("component {} wiring audit: slot {} (tag {}) {}", self.id, idx, tag, why);
@@ -329,7 +329,7 @@ pub fn try_create(
     let service_ep = args.service_ep.unwrap_or_else(|| ctx.cap::<cap_type::Endpoint>(ObjectBlueprint::Endpoint));
     let reply = ctx.cap::<cap_type::Reply>(ObjectBlueprint::Reply);
     let sc = ctx.cap::<cap_type::SchedContext>(ObjectBlueprint::SchedContext {
-        size_bits: if args.kind == host::KIND_VMM { host::GUEST_SC_BITS } else { sel4::sys::seL4_MinSchedContextBits as usize },
+        size_bits: if guest_kind(args.kind) { host::GUEST_SC_BITS } else { sel4::sys::seL4_MinSchedContextBits as usize },
     });
     let ipcbuf = ctx.cap::<cap_type::Granule>(FRAME_BP);
     // A keeper: its thread, scheduling context, the endpoint and reply
@@ -506,7 +506,7 @@ pub fn try_create(
         .expect("component TCB configure");
     context.sched_control
         .sched_control_configure_flags(sc, args.budget_us, args.period_us,
-            if args.kind == host::KIND_VMM { host::GUEST_EXTRA_REFILLS } else { 0 }, 0, 0)?;
+            if guest_kind(args.kind) { host::GUEST_EXTRA_REFILLS } else { 0 }, 0, 0)?;
     // To the parent go the faults of the keeper, if there is one, or else
     // of the main thread.
     let fault = if keeper.is_some() { wiring::keeper_fault(args.kind) } else { wiring::parent_fault(args.kind) }
@@ -544,6 +544,11 @@ pub fn try_create(
     *regs.pc_mut() = elf.entry;
     tcb.tcb_write_all_registers(false, &mut regs).expect("component registers");
     Ok(c)
+}
+
+/// A guest's own component (its l4h-vmm or l4h-hvm), scheduled as a guest's.
+fn guest_kind(kind: u32) -> bool {
+    kind == host::KIND_VMM || kind == host::KIND_HVM
 }
 
 pub fn start(c: &Component) {

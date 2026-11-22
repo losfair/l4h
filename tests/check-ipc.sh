@@ -16,6 +16,8 @@ if [ "$arch" = aarch64 ]; then
     export CC_aarch64_sel4=aarch64-linux-gnu-gcc CC_aarch64_sel4_roottask=aarch64-linux-gnu-gcc
 fi
 lint=(-A clippy::all -D clippy::disallowed_methods)
+hvm=()
+[ "$arch" = x86_64 ] && hvm=(-p l4h-hvm)
 cargo clippy -q --target "$arch-sel4" -p l4h-ipc -p l4h-task -p l4h-rt -p l4h-vmm -p l4h-blkd -p l4h-netd \
-    -p l4h-trustd -p l4h-memd -p l4h-logd -p l4h-usbd -p l4h-vmmgr -- "${lint[@]}"
+    -p l4h-trustd -p l4h-memd -p l4h-logd -p l4h-usbd -p l4h-vmmgr "${hvm[@]}" -- "${lint[@]}"
 cargo clippy -q --target "$arch-sel4-roottask" -p l4h-root -- "${lint[@]}"

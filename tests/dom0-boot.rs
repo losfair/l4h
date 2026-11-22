@@ -31,6 +31,7 @@ struct GuestConfig {
     vspaces: usize,
     ram_base: usize,
     dom0: bool,
+    hvm: bool,
 }
 const KERNEL_END: usize = 2 << 20;
 const INITRD_GPA: usize = 3 << 20;

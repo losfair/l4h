@@ -104,7 +104,8 @@ impl Writer {
             crate::KIND_BLKD => Writer::Blkd(index(BLKD_ID_BASE, MAX_BLKDS)?),
             crate::KIND_USBD => Writer::Usbd(index(crate::usb::USBD_ID_BASE, MAX_USBDS)?),
             crate::KIND_NICD => Writer::Nicd(index(crate::nicd::NICD_ID_BASE, MAX_NICDS)?),
-            crate::KIND_VMM => Writer::Vmm(index(0, MAX_VMMS)?),
+            // A guest's VMM, or the l4h-hvm in its place, writes the guest's lane.
+            crate::KIND_VMM | crate::KIND_HVM => Writer::Vmm(index(0, MAX_VMMS)?),
             _ => return None,
         })
     }

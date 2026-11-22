@@ -1,5 +1,6 @@
-// Embeds guests' l4h-vmm ($L4H_VMM_ELF, built by tools/build-host.sh), an
-// empty placeholder when unset.
+// Embeds guests' l4h-vmm ($L4H_VMM_ELF) and HVM guests' l4h-hvm
+// ($L4H_HVM_ELF, x86_64 only), built by tools/build-host.sh: an empty
+// placeholder when unset (no HVM guests then).
 use std::{env, fs, path::PathBuf};
 
 fn main() {
@@ -39,13 +40,15 @@ fn main() {
         .expect("build guest provider");
     assert!(status.success(), "guest provider build failed");
     println!("cargo:rustc-env=L4H_GUEST_PROVIDER={}", prefix.join("guest-provider/provider.bin").display());
-    println!("cargo:rerun-if-env-changed=L4H_VMM_ELF");
-    let data = match env::var("L4H_VMM_ELF") {
-        Ok(path) if !path.is_empty() => {
-            println!("cargo:rerun-if-changed={path}");
-            fs::read(&path).unwrap_or_else(|e| panic!("L4H_VMM_ELF={path}: {e}"))
-        }
-        _ => Vec::new(),
-    };
-    fs::write(out.join("l4h-vmm.elf"), data).unwrap();
+    for (var, file) in [("L4H_VMM_ELF", "l4h-vmm.elf"), ("L4H_HVM_ELF", "l4h-hvm.elf")] {
+        println!("cargo:rerun-if-env-changed={var}");
+        let data = match env::var(var) {
+            Ok(path) if !path.is_empty() => {
+                println!("cargo:rerun-if-changed={path}");
+                fs::read(&path).unwrap_or_else(|e| panic!("{var}={path}: {e}"))
+            }
+            _ => Vec::new(),
+        };
+        fs::write(out.join(file), data).unwrap();
+    }
 }

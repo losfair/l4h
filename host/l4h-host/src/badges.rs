@@ -147,6 +147,39 @@ crate::badge_space! {
 }
 
 crate::badge_space! {
+    /// A guest's l4h-hvm (crate::hvm): its vCPU threads' calls on the I/O
+    /// thread's endpoint, and signals on its bound notification, which is
+    /// the one root made for the guest's VMM: backends signal DONE on it as
+    /// for a VMM (the same bit, asserted below).
+    pub mod hvm {
+        /// A vCPU thread's call (crate::hvm::call).
+        flag CALL: 63;
+        /// A vCPU thread wrote a virtio queue notification.
+        signal KICK: 0;
+        /// A device backend (blkd, netd) has completions or room.
+        signal DONE: 1;
+        /// From l4h-vmmgr: console input, or a power request, in the
+        /// console page.
+        signal CTL: 2;
+        /// Console output to pass on; also the I/O thread's deadline
+        /// timer.
+        signal CONSOLE: 3;
+    }
+}
+const _: () = assert!(hvm::DONE == vmm::DONE);
+
+crate::badge_space! {
+    /// The bound notification of an l4h-hvm vCPU thread, which ends its
+    /// seL4_VMEnter (and its wait in HLT).
+    pub mod hvm_vcpu {
+        /// An interrupt, IPI, INIT or SIPI is pending in its local APIC.
+        signal EVENT: 0;
+        /// Its local APIC timer's deadline (seL4_TCB_SetTimer).
+        signal TIMER: 1;
+    }
+}
+
+crate::badge_space! {
     /// trustd's bound notification.
     pub mod trustd {
         /// Its deadline timer, which nothing else signals.

@@ -146,6 +146,28 @@ pub fn map_large_page_attrs(ctx: &mut ObjCtx, vspace: cap::VSpace, frame: cap::L
     }
 }
 
+/// Make the page directory (and the PDPT above it) that 2 MiB pages at
+/// `vaddr` go in, unless `vspace` has them: for an address space whose
+/// owner maps large pages there itself, without objects to make tables
+/// from (l4h-hvm's guest RAM).
+pub fn ensure_large_page_tables(ctx: &mut ObjCtx, vspace: cap::VSpace, vaddr: usize) {
+    let pd = ctx.cap::<cap_type::PageDirectory>(PD_BP);
+    loop {
+        match pd.page_directory_map(vspace, vaddr, VmAttributes::DEFAULT) {
+            Ok(()) => return,
+            Err(e) if is_failed_lookup(e) => {
+                let pdpt = ctx.cap::<cap_type::PDPT>(PDPT_BP);
+                pdpt.pdpt_map(vspace, vaddr, VmAttributes::DEFAULT)
+                    .unwrap_or_else(|e| panic!("pdpt_map({:#x}) failed: {:?}", vaddr, e));
+            }
+            // A directory is there already: the one made is left unused
+            // in the arena, which the caller counted.
+            Err(sel4::Error::DeleteFirst) => return,
+            Err(e) => panic!("page_directory_map({:#x}) failed: {:?}", vaddr, e),
+        }
+    }
+}
+
 fn ensure_pt(ctx: &mut ObjCtx, vspace: cap::VSpace, vaddr: usize) {
     let pt = ctx.cap::<cap_type::PageTable>(PT_BP);
     loop {

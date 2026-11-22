@@ -17,6 +17,7 @@ pub const ENODEV: Errno = 19;
 pub const EINVAL: Errno = 22;
 pub const ENOSPC: Errno = 28;
 pub const ENOSYS: Errno = 38;
+pub const EOPNOTSUPP: Errno = 95;
 pub const ETIMEDOUT: Errno = 110;
 /// The largest errno (Linux's MAX_ERRNO).  A reply's first word above it
 /// is no errno: a client takes it as a failed server (wire::reply), so
