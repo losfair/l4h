@@ -238,6 +238,11 @@ int l4h_frame_batch(const struct l4h_frame_op *ops, int n, unsigned long vspace,
 			*err = seL4_MessageInfo_get_label(info);
 			return done;
 		}
+		/* (done, error): anything shorter is no answer to read. */
+		if (seL4_MessageInfo_get_length(info) < 2) {
+			*err = seL4_IllegalOperation;
+			return done;
+		}
 		got = seL4_GetMR(0);
 		e = seL4_GetMR(1);
 		if (got > (unsigned long)k)

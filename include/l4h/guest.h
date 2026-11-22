@@ -81,8 +81,8 @@ int l4h_cnode_revoke(unsigned long cap, int depth);
 /* Ops per l4h_frame_batch() call (the provider splits them into kernel calls). */
 #define L4H_FRAME_BATCH_MAX	119
 struct l4h_frame_op {
-	unsigned long op, va, a, b;
-	int prot;
+	unsigned long va, a, b;
+	int op, prot;
 };
 int l4h_page_map(unsigned long frame, unsigned long vspace, unsigned long va, int prot);
 int l4h_frame_batch(const struct l4h_frame_op *ops, int n, unsigned long vspace, int *err);

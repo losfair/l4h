@@ -24,7 +24,7 @@ flags=(-O2 -g -std=gnu11 -ffreestanding -fno-common -fno-builtin -fno-strict-ali
     -Wno-unused-function -nostdinc -isystem "$("${cross}gcc" -print-file-name=include)"
     -I"$prefix/libsel4/include" -I"$root/include" -I"$root/guest/provider")
 # FL4's X86PML4FrameBatch, if this libsel4 has it (seL4's has not).
-if grep -qs '\bX86PML4FrameBatch\b' "$prefix/libsel4/include/sel4/arch/invocation.h"; then
+if grep -qsw 'X86PML4FrameBatch' "$prefix/libsel4/include/sel4/arch/invocation.h"; then
     flags+=(-DL4H_HAVE_FRAME_BATCH)
 fi
 objects=()
