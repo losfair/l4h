@@ -10,17 +10,24 @@
 # --sev-snp boots an AMD SEV-SNP confidential VM (default n2d-standard-4
 # on AMD Milan) from FL4's native UEFI loader, with dom0 embedded, as
 # tests/gce-test.sh --sev-snp does.
-# Usage: gce-bench.sh [--sev-snp] PROJECT [ZONE] [MACHINE_TYPE]
+# --scale measures many-core scaling instead: syscallbench, then smpbench
+# at 1, 2, 4, ... and all dom0 vCPUs (tests/guest/init-smpscale), with dom0
+# on every host CPU (VCPUS defaults to the machine's) and 8 GiB of RAM.
+# Usage: gce-bench.sh [--sev-snp] [--scale] PROJECT [ZONE] [MACHINE_TYPE]
 # e.g.   gce-bench.sh PROJECT us-central1-a n4-standard-4
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 export L4H_RELEASE=1 L4H_ARCH=x86_64 L4H_KERNEL_VARIANT=fl4 SEL4_PREFIX=$root/build/sel4-fl4
 source "$root/tools/host-profile.sh"
-snp=
-if [ "${1:-}" = --sev-snp ]; then
-    snp=1
+snp= scale=
+while :; do
+    case "${1:-}" in
+        --sev-snp) snp=1 ;;
+        --scale) scale=1 ;;
+        *) break ;;
+    esac
     shift
-fi
+done
 project=$1
 zone=${2:-us-central1-a}
 machine=${3:-n4-standard-4}
@@ -45,9 +52,22 @@ log=$out/$name.serial.log
     || { grep -E "error|undefined" "$out/linux-build.log"; exit 1; }
 objcopy --strip-debug "$root/build/linux-l4h/vmlinux" "$out/vmlinux"
 gcc -O2 -static -Wall -Wextra -Werror -o "$out/syscallbench" "$root/tests/guest/syscallbench.c"
-"$root/tools/mkinitramfs.sh" "$out/dom0.cpio.gz" "$root/tests/guest/init-syscallbench" \
-    "$out/syscallbench" >/dev/null
-L4H_DOM0_DISKS=0 L4H_DOM0_VCPUS=${VCPUS:-2} L4H_DOM0_MEM_MB=1024 L4H_DOM0_CMDLINE="console=hvc0 quiet" L4H_WATCHDOG_SECS=0 \
+if [ -n "$scale" ]; then
+    gcc -O2 -static -Wall -Wextra -Werror -o "$out/smpbench" "$root/tests/guest/smpbench.c"
+    "$root/tools/mkinitramfs.sh" "$out/dom0.cpio.gz" "$root/tests/guest/init-smpscale" \
+        "$out/syscallbench" "$out/smpbench" >/dev/null
+    marker=SCALEBENCH
+    vcpus=${VCPUS:-$(gcloud compute machine-types describe "$machine" --project="$project" \
+        --zone="$zone" --format='value(guestCpus)')}
+    mem_mb=8192
+else
+    "$root/tools/mkinitramfs.sh" "$out/dom0.cpio.gz" "$root/tests/guest/init-syscallbench" \
+        "$out/syscallbench" >/dev/null
+    marker=SYSCALLBENCH
+    vcpus=${VCPUS:-2}
+    mem_mb=1024
+fi
+L4H_DOM0_DISKS=0 L4H_DOM0_VCPUS=$vcpus L4H_DOM0_MEM_MB=$mem_mb L4H_DOM0_CMDLINE="console=hvc0 quiet" L4H_WATCHDOG_SECS=0 \
     "$root/tools/build-host.sh" >"$out/host-build.log" 2>&1 \
     || { tail -20 "$out/host-build.log"; exit 1; }
 export L4H_GUEST_KERNEL=$out/vmlinux L4H_GUEST_SDK=
@@ -90,8 +110,8 @@ while [ $SECONDS -lt $end ]; do
     sleep 15
     gcloud compute instances get-serial-port-output "$name" --project="$project" --zone="$zone" \
         >"$log" 2>/dev/null || continue
-    grep -aqE 'SYSCALLBENCH: (PASS|FAIL)' "$log" && break
+    grep -aqE "$marker: (PASS|FAIL)" "$log" && break
 done
-grep -aE 'SYSCALLBENCH|FL4: speculation|FL4: AMD SEV|l4h-root: [0-9]+ core|panic|fault' "$log" || true
+grep -aE "$marker|SYSCALLBENCH|SMPBENCH|FL4: speculation|FL4: AMD SEV|FL4: [0-9]+ core|l4h-root: [0-9]+ core|panic|fault" "$log" || true
 echo "serial log: $log"
-grep -aqE 'SYSCALLBENCH: PASS' "$log"
+grep -aqE "$marker: PASS" "$log"

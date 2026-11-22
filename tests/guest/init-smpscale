@@ -1,0 +1,27 @@
+#!/bin/sh
+# Many-core scaling for tests/gce-bench.sh --scale: syscallbench (getpid on
+# 1..N pinned processes), then smpbench (compute, getpid, page faults,
+# fork, pipe and futex ping-pong) at 1, 2, 4, ... and all guest CPUs.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+n=$(nproc)
+echo "SCALEBENCH: start online=$(cat /sys/devices/system/cpu/online)"
+# Let the boot log drain first: console output slows syscalls (run-smpbench.py).
+sleep 3
+ok=1
+/bin/syscallbench || ok=
+k=1
+while :; do
+    echo "SCALEBENCH: smpbench workers=$k"
+    /bin/smpbench "$k" | grep -E '^SMPBENCH: (phase=measured|FAIL)' || ok=
+    [ "$k" -ge "$n" ] && break
+    k=$((k * 2))
+    [ "$k" -gt "$n" ] && k=$n
+done
+if [ -n "$ok" ]; then
+    echo 'SCALEBENCH: PASS'
+else
+    echo 'SCALEBENCH: FAIL benchmark exit'
+fi
+poweroff -f
