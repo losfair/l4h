@@ -26,6 +26,15 @@
 //! lists, each with its partition: the primary's first, at most one per
 //! partition.  Reports and evidence then carry the partition (version 2).
 //!
+//! On an Intel TDX trust domain (TrustdConfig::tdx_enabled, never in a
+//! multikernel machine) the same key is also bound to the TD (tdx.rs,
+//! tdxrt.rs): a DCAP quote of a TDREPORT over its hash, taken while RTMR 3
+//! is zero, after which RTMR 3 is extended with it.  With a TPM, without
+//! one, or with both: reports need either, and the TDX evidence and fresh
+//! quotes over a guest's report come in requests of their own.  The key's
+//! seed is then the CPU's (RDSEED, which the VMM can neither see nor
+//! change) hashed with the TPM's, if there is one.
+//!
 //! Nothing here allocates (DESIGN.md §10): requests are copied, and answers
 //! built, in fixed buffers, and the evidence is made once into one.  The
 //! heap is the AML interpreter's (aml::HEAP).
@@ -42,6 +51,8 @@ mod fadt;
 mod flags;
 mod key;
 mod relay;
+mod tdx;
+mod tdxrt;
 mod time;
 mod tpm;
 mod tpm2;
@@ -61,6 +72,7 @@ use sel4::cap_type;
 
 use crate::cbor::{Enc, Overflow};
 use crate::relay::{Relay, Served, Wait};
+use crate::tdxrt::Tdx;
 use crate::tpm::{Error, Tpm};
 use crate::tpm2::Template;
 
@@ -187,9 +199,20 @@ struct State {
     partition: Option<u32>,
     /// None in a multikernel secondary: the primary's, through the relay.
     local: Option<Local>,
-    /// The host evidence: its first `evidence_len` bytes.
+    /// The key is bound to a TPM quote: `evidence` is the host evidence,
+    /// its first `evidence_len` bytes.  Not on a TD whose TPM failed or
+    /// that has none: its key is bound to the TD alone (Tdx).
+    has_tpm: bool,
     evidence: [u8; EVIDENCE_MAX],
     evidence_len: usize,
+}
+
+impl State {
+    /// A key with no TPM quote (TDX binds it).
+    fn keyed(key: SigningKey, partition: Option<u32>) -> State {
+        let key_id = Sha256::digest(point(&key)).into();
+        State { key, key_id, partition, local: None, has_tpm: false, evidence: [0; EVIDENCE_MAX], evidence_len: 0 }
+    }
 }
 
 /// What the TPM quotes for key `p`: the hash of the domain, the
@@ -269,17 +292,27 @@ fn step<T>(what: &'static str, r: Result<T, Error>) -> Result<T, (&'static str, 
     r.map_err(|e| (what, e))
 }
 
-fn init(cfg: &TrustdConfig, hz: u64, partition: Option<u32>) -> Result<State, (&'static str, Error)> {
-    let t0 = host::ticks::now();
+/// The TPM, started, and the signing key from its random bytes, hashed
+/// with the CPU's `cpu` (TDX) if given.
+fn tpm_key(cfg: &TrustdConfig, hz: u64, cpu: Option<&[u8; 32]>) -> Result<(Tpm, SigningKey), (&'static str, Error)> {
     let mut tpm = step("interface", Tpm::new(cfg, hz))?;
     step("Startup", tpm2::startup(&mut tpm))?;
     let key = loop {
         let mut seed = [0u8; 32];
         step("GetRandom", tpm2::get_random(&mut tpm, &mut seed))?;
+        // Neither the TPM nor the CPU alone chooses the key.
+        if let Some(c) = cpu {
+            seed = Sha256::new().chain_update(c).chain_update(seed).finalize().into();
+        }
         if let Ok(k) = SigningKey::from_bytes(&seed.into()) {
             break k;
         }
     };
+    Ok((tpm, key))
+}
+
+/// Bind `key` to the TPM (quote, then PCR 15), started at `t0`.
+fn init(mut tpm: Tpm, key: SigningKey, t0: u64, hz: u64, partition: Option<u32>) -> Result<State, (&'static str, Error)> {
     let p = point(&key);
     let key_id: [u8; 32] = Sha256::digest(p).into();
     let bound = binding(partition, &p);
@@ -345,7 +378,7 @@ fn init(cfg: &TrustdConfig, hz: u64, partition: Option<u32>) -> Result<State, (&
         vendor.unwrap_or(0),
     );
     let local = Local { tpm, ak, ak_public, ek, ek_ecc, ek_cert, ek_public, vendor, chain, quotes: [const { None }; trust::MAX_PARTITIONS] };
-    Ok(State { key, key_id, partition, local: Some(local), evidence, evidence_len })
+    Ok(State { key, key_id, partition, local: Some(local), has_tpm: true, evidence, evidence_len })
 }
 
 /// 32 random bytes from the CPU (RDRAND), for a secondary's key: it has
@@ -373,6 +406,51 @@ fn cpu_random(out: &mut [u8; 32]) -> bool {
 #[cfg(not(target_arch = "x86_64"))]
 fn cpu_random(_out: &mut [u8; 32]) -> bool {
     false
+}
+
+/// 32 bytes of the CPU's entropy for a TD's key: RDSEED where it has it
+/// (straight from the entropy source), else RDRAND.  In a TD neither
+/// exits to the VMM.
+#[cfg(target_arch = "x86_64")]
+fn cpu_seed() -> Option<[u8; 32]> {
+    #[allow(unused_unsafe)]
+    let ebx = unsafe { core::arch::x86_64::__cpuid_count(7, 0) }.ebx;
+    let mut out = [0u8; 32];
+    if ebx & (1 << 18) != 0 {
+        let seeded = out.chunks_mut(8).all(|chunk| {
+            // RDSEED fails while the entropy source refills: retry for a
+            // while, pausing.
+            let v = (0..1000).find_map(|_| {
+                let (v, ok): (u64, u8);
+                unsafe { core::arch::asm!("rdseed {v}", "setc {ok}", v = out(reg) v, ok = out(reg_byte) ok, options(nomem, nostack)) };
+                if ok == 0 {
+                    core::hint::spin_loop();
+                }
+                (ok != 0).then_some(v)
+            });
+            v.map(|v| chunk.copy_from_slice(&v.to_le_bytes())).is_some()
+        });
+        if seeded {
+            return Some(out);
+        }
+    }
+    cpu_random(&mut out).then_some(out)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn cpu_seed() -> Option<[u8; 32]> {
+    None
+}
+
+/// A key from the CPU alone (a TD without a usable TPM).
+fn cpu_key(seed: Option<[u8; 32]>) -> Option<SigningKey> {
+    let mut seed = seed?;
+    loop {
+        if let Ok(k) = SigningKey::from_bytes(&seed.into()) {
+            return Some(k);
+        }
+        seed = cpu_seed()?;
+    }
 }
 
 /// A multikernel secondary: a key of our own, which we ask the primary's
@@ -409,15 +487,33 @@ fn ready(key: SigningKey, partition: u32, answer: Result<&[u8], Errno>, t0: u64,
         (host::ticks::now() - t0) * 1000 / hz.max(1),
         key_id[0], key_id[1], key_id[2], key_id[3],
     );
-    Ok(State { key, key_id, partition: Some(partition), local: None, evidence, evidence_len: ev.len() })
+    Ok(State { key, key_id, partition: Some(partition), local: None, has_tpm: true, evidence, evidence_len: ev.len() })
 }
 
 /// No reports: tell every guest's driver.
 fn no_reports() {
-    for p in 0..trust::PAGES {
-        unsafe { addr_of_mut!((*page(p)).state).write_volatile(abi::ATTEST_NO_REPORTS) };
-    }
+    tdxrt::set_states(abi::ATTEST_NO_REPORTS);
     info!("l4h-trustd: no TPM: flags only");
+}
+
+/// What a request page's state says (abi::AttestPage::state): which
+/// quotes reports are bound to, or none at all (and none to come: not
+/// while a secondary's key or the TD's quote is on its way).
+fn page_state(state: &Option<State>, starting: bool, tdx: &Option<Tdx>) -> u32 {
+    let tpm = state.as_ref().is_some_and(|s| s.has_tpm);
+    let td = tdx.as_ref().is_some_and(|t| t.ready());
+    let coming = starting || tdx.as_ref().is_some_and(|t| t.starting());
+    let mut v = 0;
+    if tpm {
+        v |= abi::ATTEST_HAS_TPM;
+    }
+    if td {
+        v |= abi::ATTEST_HAS_TDX;
+    }
+    if !tpm && !td && !coming {
+        v |= abi::ATTEST_NO_REPORTS;
+    }
+    v
 }
 
 /// Guest `id`'s record, if it runs.
@@ -586,6 +682,9 @@ struct Answered {
     /// then one every ACTIVATE_INTERVAL_MS.  Beyond that, -EAGAIN without
     /// using the TPM.
     activate: trust::ActivateLimit,
+    /// TDX quotes (abi::ATTEST_TDX_QUOTE), limited as ActivateCredential:
+    /// each takes the VMM's quoting service.
+    quote: trust::ActivateLimit,
 }
 
 impl Answered {
@@ -608,12 +707,15 @@ fn page_of(id: usize, r: &GuestRecord) -> usize {
 
 /// The result of guest `id`'s request `seq` in its page (the evidence, or
 /// what we built in `out`), or -errno.  `starting`: a secondary waits for
-/// its key's quote.  `event_log`: the host's TPM event log, empty if none.
+/// its key's quote.  `event_log`, `cc_event_log`: the host's TPM and CC
+/// event logs, empty if none.  `tdx`: the TD's attestation.
 #[allow(clippy::too_many_arguments)]
 fn execute<'a>(
     state: &'a mut Option<State>,
+    tdx: &'a mut Option<Tdx>,
     starting: bool,
     event_log: &'static [u8],
+    cc_event_log: &'static [u8],
     id: usize,
     seq: u32,
     r: &GuestRecord,
@@ -650,8 +752,39 @@ fn execute<'a>(
         if in_len != 0 { return Err(EINVAL); }
         return if event_log.is_empty() { Err(ENOENT) } else { Ok(event_log) };
     }
-    if !matches!(op, abi::ATTEST_REPORT | abi::ATTEST_EVIDENCE | abi::ATTEST_ACTIVATE) { return Err(ENOSYS); }
+    // The TD's log, as the TPM's.
+    if op == abi::ATTEST_TDX_EVENT_LOG {
+        if in_len != 0 { return Err(EINVAL); }
+        return if cc_event_log.is_empty() { Err(ENOENT) } else { Ok(cc_event_log) };
+    }
+    if !matches!(op, abi::ATTEST_REPORT | abi::ATTEST_EVIDENCE | abi::ATTEST_ACTIVATE | abi::ATTEST_TDX_EVIDENCE | abi::ATTEST_TDX_QUOTE) {
+        return Err(ENOSYS);
+    }
     let Some(s) = state else { return Err(if starting { DEFER } else { ENODEV }) };
+    // TDX's requests, and the TPM's on a TD without one.
+    let td_starting = tdx.as_ref().is_some_and(|t| t.starting());
+    match op {
+        abi::ATTEST_TDX_EVIDENCE => {
+            return match tdx.as_ref() {
+                Some(t) if t.ready() => Ok(t.evidence().unwrap_or_default()),
+                _ if td_starting => Err(DEFER),
+                _ => Err(ENODEV),
+            };
+        }
+        abi::ATTEST_TDX_QUOTE => {
+            if data.len() != abi::ATTEST_DATA_SIZE { return Err(EINVAL); }
+            let Some(t) = tdx.as_mut() else { return Err(ENODEV) };
+            let d: [u8; abi::ATTEST_DATA_SIZE] = data.try_into().unwrap();
+            let s = &*s;
+            return t.request(id, r.instance, seq, &d, tdxrt::offset(p), || last.quote.allow(host::ticks::now(), hz),
+                |buf| s.report(id, r, &d, buf));
+        }
+        abi::ATTEST_REPORT if !s.has_tpm && !tdx.as_ref().is_some_and(|t| t.ready()) => {
+            return Err(if td_starting { DEFER } else { ENODEV });
+        }
+        abi::ATTEST_EVIDENCE | abi::ATTEST_ACTIVATE if !s.has_tpm => return Err(ENODEV),
+        _ => {}
+    }
     match op {
         abi::ATTEST_REPORT => {
             let mut d = [0u8; abi::ATTEST_DATA_SIZE];
@@ -736,6 +869,16 @@ fn write_answer(p: *mut abi::AttestPage, seq: u32, result: Result<&[u8], Errno>)
     }
 }
 
+/// A log root mapped read-only at `va` for good, `size` bytes of it (at
+/// most `max`), which nothing writes; empty if none.
+fn mapped_log(va: usize, size: u64, max: usize) -> &'static [u8] {
+    if size > 0 && size <= max as u64 {
+        unsafe { core::slice::from_raw_parts(va as *const u8, size as usize) }
+    } else {
+        &[]
+    }
+}
+
 fn main(info: &'static Info) -> ! {
     // The same image is the flags server, in spaces of its own.
     if info.header().kind == host::KIND_FLAGS {
@@ -745,14 +888,18 @@ fn main(info: &'static Info) -> ! {
     let hz = info.header().tsc_hz;
     // Root maps the event log read-only here for good, cfg.event_log_size
     // bytes of it (trust::EVENT_LOG_VA), and nothing writes it.
-    let event_log: &'static [u8] = if cfg.event_log_size > 0 && cfg.event_log_size <= trust::EVENT_LOG_MAX as u64 {
-        unsafe { core::slice::from_raw_parts(trust::EVENT_LOG_VA as *const u8, cfg.event_log_size as usize) }
-    } else {
-        &[]
-    };
+    let event_log = mapped_log(trust::EVENT_LOG_VA, cfg.event_log_size, trust::EVENT_LOG_MAX);
+    let cc_event_log = mapped_log(trust::CC_EVENT_LOG_VA, cfg.cc_event_log_size, trust::CC_EVENT_LOG_MAX);
     let t0 = host::ticks::now();
     let mut relay = Relay::new(cfg.partition, cfg.partitions);
     let partition = relay.as_ref().map(|r| r.index);
+    // A TD (never one of several partitions): the CPU's entropy for the key.
+    let td = cfg.tdx_enabled != 0 && relay.is_none();
+    let cpu = if td { cpu_seed() } else { None };
+    if td && cpu.is_none() {
+        l4h_rt::log!("l4h-trustd: no RDSEED or RDRAND: no TDX attestation");
+    }
+    let td = td && cpu.is_some();
     // A secondary's key, until the primary quoted it.
     let mut starting = None;
     let mut state = match (cfg.iface, relay.as_mut()) {
@@ -764,16 +911,42 @@ fn main(info: &'static Info) -> ! {
             }
             None
         }
-        _ => match init(cfg, hz, partition) {
-            Ok(s) => Some(s),
+        _ => match tpm_key(cfg, hz, cpu.as_ref()) {
+            Ok((tpm, key)) => match init(tpm, key.clone(), t0, hz, partition) {
+                Ok(s) => Some(s),
+                Err((what, e)) => {
+                    l4h_rt::log!("l4h-trustd: TPM unusable, {}: {}: {}", if td { "TDX only" } else { "no attestation" }, what, e);
+                    td.then(|| State::keyed(key, partition))
+                }
+            },
             Err((what, e)) => {
-                l4h_rt::log!("l4h-trustd: TPM unusable, no attestation: {}: {}", what, e);
+                l4h_rt::log!("l4h-trustd: TPM unusable, {}: {}: {}", if td { "TDX only" } else { "no attestation" }, what, e);
                 None
             }
         },
     };
+    // A TD without a TPM: the CPU's key.
+    if td && state.is_none() {
+        state = cpu_key(cpu).map(|k| State::keyed(k, partition));
+    }
+    let mut tdx = match state.as_ref().filter(|_| td) {
+        Some(s) => match Tdx::start(&point(&s.key), hz) {
+            Ok(t) => Some(t),
+            Err(why) => {
+                l4h_rt::log!("l4h-trustd: no TDX attestation: {}", why);
+                None
+            }
+        },
+        None => None,
+    };
+    // A key bound to nothing (a TD that cannot attest, without a TPM).
+    if state.as_ref().is_some_and(|s| !s.has_tpm) && tdx.is_none() {
+        state = None;
+    }
     if state.is_none() && starting.is_none() {
         no_reports();
+    } else {
+        tdxrt::set_states(page_state(&state, starting.is_some(), &tdx));
     }
     // Guests kick while we set up the TPM too: their bits wait in the
     // notification.
@@ -782,11 +955,37 @@ fn main(info: &'static Info) -> ! {
     let mut served = [Served::default(); trust::MAX_PARTITIONS];
     let mut relayed = [trust::ActivateLimit::default(); trust::MAX_PARTITIONS];
     let mut out = [0u8; ANSWER_MAX];
-    // Guests whose requests wait for the relay.
+    // Guests whose requests wait for the relay, or TDX.
     let mut deferred = 0u64;
+    let status = unsafe { &*(trust::STATUS_VA as *const trust::Status) };
     loop {
+        // Root's timer, while we wait for what has no kick of our own.
+        status.wake.store((deferred != 0 || tdx.as_ref().is_some_and(|t| t.busy())) as u64, Ordering::Relaxed);
         let (_, kicked) = kick.wait();
         let mut kicked = kicked | core::mem::take(&mut deferred);
+        // The TD's quote: the key's, or a guest's.
+        match tdx.as_mut().and_then(|t| t.poll()) {
+            Some(tdxrt::Event::Ready) => {
+                info!("l4h-trustd: TDX attestation ready");
+                tdxrt::set_states(page_state(&state, starting.is_some(), &tdx));
+            }
+            Some(tdxrt::Event::Failed) => {
+                tdx = None;
+                if state.as_ref().is_some_and(|s| !s.has_tpm) {
+                    state = None;
+                    no_reports();
+                } else {
+                    tdxrt::set_states(page_state(&state, starting.is_some(), &tdx));
+                }
+            }
+            Some(tdxrt::Event::Quoted { id, instance, seq, result }) => {
+                let t = tdx.as_ref().expect("a quote's TDX");
+                if answered[id].instance == instance && answer(id, instance, seq, result.map(|n| t.answer(n))) {
+                    answered[id].seq = seq;
+                }
+            }
+            None => {}
+        }
         // RELAY_BADGE is also guest 63's kick: both are looked at.
         match relay.as_mut() {
             Some(r) if r.primary() => {
@@ -798,7 +997,10 @@ fn main(info: &'static Info) -> ! {
                 Some((Wait::Key, got)) => {
                     let key = starting.take().expect("a key waits for its quote");
                     match ready(key, partition.unwrap_or(0), got, t0, hz) {
-                        Ok(s) => state = Some(s),
+                        Ok(s) => {
+                            state = Some(s);
+                            tdxrt::set_states(page_state(&state, false, &tdx));
+                        }
                         Err(why) => {
                             l4h_rt::log!("l4h-trustd: no attestation: {}", why);
                             no_reports();
@@ -830,9 +1032,8 @@ fn main(info: &'static Info) -> ! {
             kicked &= kicked - 1;
             let Some(r) = record(id) else { continue };
             let p = page(page_of(id, &r));
-            if state.is_none() && starting.is_none() {
-                unsafe { addr_of_mut!((*p).state).write_volatile(abi::ATTEST_NO_REPORTS) };
-            }
+            // A new guest's page has root's state: ours, before we answer.
+            unsafe { addr_of_mut!((*p).state).write_volatile(page_state(&state, starting.is_some(), &tdx)) };
             let seq = unsafe { addr_of!((*p).seq).read_volatile() };
             fence(Ordering::Acquire);
             let last = &mut answered[id];
@@ -842,7 +1043,7 @@ fn main(info: &'static Info) -> ! {
             if seq == last.seq {
                 continue;
             }
-            let result = execute(&mut state, starting.is_some(), event_log, id, seq, &r, last, hz, relay.as_mut(), &mut out);
+            let result = execute(&mut state, &mut tdx, starting.is_some(), event_log, cc_event_log, id, seq, &r, last, hz, relay.as_mut(), &mut out);
             match result {
                 Err(DEFER) => {
                     deferred |= host::badges::trustd_kick::GUEST.nth(id);

@@ -1420,6 +1420,11 @@ pub mod attest {
     const ACT: u32 = 4;
     const SEAL: u32 = 5;
     const EVENT_LOG: u32 = 6;
+    const TDX_EVIDENCE: u32 = 7;
+    const TDX_EVENT_LOG: u32 = 8;
+    const TDX_QUOTE: u32 = 9;
+    /// What the guest's driver says reports are bound to.
+    const PROVIDERS: &str = "/sys/kernel/l4h/attest/providers";
     pub const FLAG_BITS: usize = 256;
     pub const DATA_SIZE: usize = 64;
 
@@ -1483,7 +1488,12 @@ pub mod attest {
     }
 
     fn failed(op: u32, e: io::Error) -> Error {
+        let tdx = matches!(op, TDX_EVIDENCE | TDX_EVENT_LOG | TDX_QUOTE);
         Error(match e.raw_os_error() {
+            Some(2) if op == TDX_EVENT_LOG => "no TDX (CC) event log available".into(),
+            Some(19) if tdx => "no TDX attestation on this host".into(),
+            Some(11) if op == TDX_QUOTE => "TDX quotes rate limited or busy: try again".into(),
+            Some(22) if tdx => "the guest kernel or host does not know this TDX request".into(),
             Some(2) => "no TPM event log available".into(),
             Some(19) => "no TPM: flags only".into(),
             Some(38) => "host has no taint/seal operations".into(),
@@ -1569,6 +1579,44 @@ pub mod attest {
         call(EVENT_LOG, &[], 0)
     }
 
+    /// The host's Intel TDX evidence (CBOR): the DCAP quote over the
+    /// host's signing key.
+    pub fn tdx_evidence() -> Result<Vec<u8>> {
+        call(TDX_EVIDENCE, &[], 0)
+    }
+
+    /// The host's CC event log (CCEL), raw (TCG2 format, SHA-384):
+    /// replayed, it gives RTMR 0-2 of the TDX quotes.
+    pub fn tdx_event_log() -> Result<Vec<u8>> {
+        call(TDX_EVENT_LOG, &[], 0)
+    }
+
+    /// A fresh TDX quote over a report on this guest with `data` (at most
+    /// DATA_SIZE bytes, zero padded): CBOR {"key", "quote", "report"}.
+    pub fn tdx_quote(data: &[u8]) -> Result<Vec<u8>> {
+        if data.len() > DATA_SIZE {
+            return err(format!("report data is at most {DATA_SIZE} bytes"));
+        }
+        let mut d = [0u8; DATA_SIZE];
+        d[..data.len()].copy_from_slice(data);
+        call(TDX_QUOTE, &d, 0)
+    }
+
+    /// What reports are bound to: "tpm", "tdx", "tpm,tdx" or "none".
+    pub fn providers() -> Result<String> {
+        let s = std::fs::read_to_string(PROVIDERS).map_err(|e| Error(format!("{PROVIDERS}: {e} (does the guest kernel know TDX?)")))?;
+        parse_providers(&s)
+    }
+
+    /// The driver's providers file, checked.
+    pub fn parse_providers(s: &str) -> Result<String> {
+        let s = s.trim();
+        match s {
+            "tpm" | "tdx" | "tpm,tdx" | "none" => Ok(s.to_string()),
+            _ => err(format!("unexpected providers: {s:?}")),
+        }
+    }
+
     /// TPM2_ActivateCredential of a credential made for the host's
     /// attestation key, in the format of tpm2_makecredential (and
     /// tools/l4h-attest.py make-credential): magic 0xbadcc0de, version 1,
@@ -1609,6 +1657,35 @@ pub mod attest {
             assert_eq!(msg(2), "no TPM event log available");
             assert_eq!(msg(19), "no TPM: flags only");
             assert!(msg(5).starts_with("attestation request 6 failed"));
+            // The TPM's requests say what they always did.
+            for op in [REPORT, EVIDENCE, ACTIVATE] {
+                assert_eq!(failed(op, io::Error::from_raw_os_error(19)).0, "no TPM: flags only");
+            }
+        }
+
+        #[test]
+        fn tdx_error_messages() {
+            let msg = |op, n| failed(op, io::Error::from_raw_os_error(n)).0;
+            assert_eq!(msg(TDX_EVENT_LOG, 2), "no TDX (CC) event log available");
+            assert_eq!(msg(TDX_EVIDENCE, 19), "no TDX attestation on this host");
+            assert_eq!(msg(TDX_QUOTE, 19), "no TDX attestation on this host");
+            assert_eq!(msg(TDX_QUOTE, 11), "TDX quotes rate limited or busy: try again");
+            assert!(msg(TDX_EVIDENCE, 5).starts_with("attestation request 7 failed"));
+            assert!(msg(TDX_QUOTE, 5).starts_with("attestation request 9 failed"));
+        }
+
+        #[test]
+        fn tdx_quote_data_is_at_most_64_bytes() {
+            assert!(tdx_quote(&[0; DATA_SIZE + 1]).is_err_and(|e| e.0.contains("at most 64")));
+        }
+
+        #[test]
+        fn providers_file() {
+            for s in ["tpm\n", "tdx\n", "tpm,tdx\n", "none\n"] {
+                assert_eq!(parse_providers(s).unwrap(), s.trim());
+            }
+            assert!(parse_providers("sgx\n").is_err());
+            assert!(parse_providers("").is_err());
         }
     }
 }

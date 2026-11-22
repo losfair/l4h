@@ -1,0 +1,9 @@
+[package]
+name = "trustd-tdx"
+edition = "2024"
+license = "GPL-2.0-only"
+version = "0.1.0"
+description = "trustd's TDX binding, quote check and CBOR (host/l4h-trustd/src/tdx.rs)"
+
+[dependencies]
+sha2 = { version = "0.10", default-features = false }

@@ -588,6 +588,19 @@ pub const ATTEST_SEAL: u32 = 5;
 /// the host has none.  The same for every guest, dom0 or not, until the
 /// host reboots.
 pub const ATTEST_EVENT_LOG: u32 = 6;
+/// No data: the host's Intel TDX evidence (CBOR: the signing key and a
+/// DCAP quote binding it), in pieces like any result; -ENODEV if the host
+/// is not a TD trustd attests with.  The same for every guest until the
+/// host reboots.
+pub const ATTEST_TDX_EVIDENCE: u32 = 7;
+/// No data: the host's confidential computing event log (CCEL, raw TCG2
+/// format with SHA-384 digests), in pieces; -ENOENT if the host has none.
+pub const ATTEST_TDX_EVENT_LOG: u32 = 8;
+/// data = 64 bytes, as ATTEST_REPORT.  A fresh TDX quote over the report:
+/// CBOR {"key", "quote", "report"}, the quote's REPORTDATA
+/// SHA-384("l4h-tdx-report-v1" || SHA-256(report)) || 0^16.  Rate limited
+/// as ATTEST_ACTIVATE (-EAGAIN beyond it).
+pub const ATTEST_TDX_QUOTE: u32 = 9;
 pub const FLAG_BITS: usize = 256;
 pub const FLAG_HOST: usize = 0;
 pub const FLAG_GUEST: usize = 64;
@@ -609,7 +622,12 @@ pub struct AttestFlags {
 }
 pub const ATTEST_DATA_SIZE: usize = 64;
 pub const ATTEST_FAILED: u32 = 1;
+/// Neither a TPM nor TDX: ACT/SEAL work, reports -ENODEV.
 pub const ATTEST_NO_REPORTS: u32 = 2;
+/// Reports are bound to a TPM quote (ATTEST_EVIDENCE).
+pub const ATTEST_HAS_TPM: u32 = 4;
+/// Reports are bound to a TDX quote (ATTEST_TDX_EVIDENCE).
+pub const ATTEST_HAS_TDX: u32 = 8;
 pub const ATTEST_PAGE_DATA: usize = 4096 - 64;
 
 #[repr(C)]

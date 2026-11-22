@@ -7,6 +7,8 @@ version.workspace = true
 [dependencies]
 l4h-abi.workspace = true
 l4h-rt = { path = "../l4h-rt" }
+# Intel TDX control (l4h_task::tdx), which needs the kernel's interface.
+l4h-task = { path = "../l4h-task" }
 l4h-virtio = { path = "../l4h-virtio" }
 p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 sha2.workspace = true
