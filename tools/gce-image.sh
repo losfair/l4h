@@ -13,7 +13,7 @@
 # --sev: for an image that boots l4h-fl4.efi (FL4, which shares DMA memory
 # with the hypervisor) on an AMD SEV Confidential VM: the image is marked
 # SEV_CAPABLE and the instance is an N2D with SEV, on gVNIC.
-# --sev-snp: for an image built with tools/mkfl4-efi.sh, deployed in
+# --sev-snp: for an image booting the released l4h-fl4.efi, deployed in
 # an SEV-SNP zone as an N2D with SEV_SNP and the SEV_SNP_CAPABLE image tag.
 # --tdx: for an image that boots l4h-fl4.efi built with FL4's Intel TDX
 # support, deployed in a zone with Intel TDX (C3) as a C3 with TDX and the

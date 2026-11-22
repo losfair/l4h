@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Boot l4h the way GCE does: UEFI firmware, GRUB multiboot2 from the image
+# Boot l4h the way GCE does: UEFI firmware booting the application from the image
 # built by tools/mkimage.sh, NVMe boot disk, virtio-net.  The application
-# holds the guest kernel and its build SDK; GRUB loads dom0's initramfs
+# holds the guest kernel and its build SDK. The loader reads dom0's initramfs
 # and l4h.conf from the EFI partition.
 # UEFI_EFI=app.efi tests a prebuilt application without rebuilding its stack.
 set -euo pipefail

@@ -759,7 +759,7 @@ the same. There is no measured boot on BIOS (Section~\ref{sec:bios}).
 \section{dom0 on the EFI system partition}
 \label{sec:esp}
 
-l4h ships as one UEFI application, the same for every host: an EFI wrapper
+Each seL4 UEFI application is an EFI wrapper
 containing a standalone GRUB that carries the seL4 kernel,
 \texttt{l4h-root}, the guest kernel and its build SDK
 (\cmd{tools/mkefi.sh OUT.efi}). It loads dom0's initramfs
@@ -769,12 +769,12 @@ EFI/BOOT/BOOTX64.EFI   the l4h application
 l4h/dom0/initrd        dom0's initramfs (optional)
 l4h/l4h.conf           host settings (optional)
 \end{lstlisting}
-At boot, GRUB first looks for
-\file{/EFI/L4H/grubenv} on every device. If exactly one exists, it selects
+The seL4 and FL4 loaders first look for
+\file{/EFI/L4H/grubenv} on every filesystem they can read. If exactly one exists, it selects
 the partition containing \file{/l4h} as described below. Multiple copies
 abort the boot attempt before any selector or slot's files are read.
-With no selector file, GRUB uses the loading partition.
-When the firmware does not say which partition that is (OVMF), GRUB uses
+With no selector file, the loader uses the loading partition.
+When the firmware supplies no filesystem device, the loader uses
 the first partition with \file{l4h/dom0/initrd}, or else with
 \file{l4h/l4h.conf}. Files there override any appended to
 \texttt{l4h-root}. To change dom0, replace the files and
@@ -799,13 +799,13 @@ it with \texttt{save\_env --file} before chainloading a slot. No slot's
 \file{l4h.conf} is read until selection finishes. A missing partition,
 unreadable block, or missing or conflicting selectors aborts this boot
 attempt and returns \texttt{EFI\_LOAD\_ERROR} to the caller. A front
-loader can then update the selector and try the other slot. The application
-uses a small EFI wrapper because GRUB 2.12's \texttt{exit} always returns
+loader can then update the selector and try the other slot. The seL4
+applications use a small EFI wrapper because GRUB 2.12's \texttt{exit} always returns
 success, even with a numeric argument. The wrapper loads the embedded
 GRUB as a child and converts any return into a failed boot attempt.
-Only the chosen slot's config and initramfs are read and measured; GRUB
-also measures the shared environment block into PCR~9. The selection
-also applies to \file{l4h-mk.conf} and its per-partition files.
+Both loaders measure the chosen slot's config and initramfs. The seL4
+applications also measure the shared environment block into PCR~9 and use
+the selected partition for \file{l4h-mk.conf} and its per-partition files.
 
 \file{l4h.conf} has one \texttt{key=value} per line (Table~\ref{tab:settings})
 and \texttt{\#} comments. GRUB also reads it, as a script, so write no
@@ -835,8 +835,13 @@ Linux to check the host CPU.
 \end{caveat}
 
 \file{l4h-fl4.efi} is an additional x86\_64 release application built with
-the \href{https://github.com/losfair/FL4}{FL4 kernel}. It includes a host and
-ABI provider built against FL4's own libsel4. All release applications share
+the \href{https://github.com/losfair/FL4}{FL4 kernel}. Its native EFI loader
+supports x86\_64 UEFI, including AMD SEV-SNP and Intel TDX VMs.
+Outside TDX, FL4 requires firmware to hand off with four-level paging.
+It uses the same optional \file{/l4h/l4h.conf}, \file{/l4h/dom0/initrd}
+and A/B selector described above. It reads the settings as data and returns
+\texttt{EFI\_LOAD\_ERROR} if selection or reading a present file fails.
+The host and ABI provider use FL4's own libsel4. All release applications share
 the same Linux guest kernel and build SDK. FL4 detects
 CPU features at boot and supports KVM inside Linux guests on hosts with
 usable Intel VT-x or AMD-V. The same image boots with KVM disabled when
@@ -1937,10 +1942,14 @@ interfaces of x86 PCs and servers:
 \end{itemize}
 It works like this:
 \begin{itemize}
-  \item the firmware measures the l4h application, with seL4, every
-        host component and the guest kernel in it, into PCR~4, then
-        extends PCR~4 again when loading the embedded GRUB image. GRUB
-        measures dom0's initramfs and \file{l4h.conf} into PCR~9;
+  \item the firmware measures the l4h application into PCR~4. This covers
+        the microkernel, every host component, the guest kernel and its SDK.
+        For a seL4 application, loading the embedded GRUB image extends PCR~4
+        again. GRUB measures dom0's initramfs and \file{l4h.conf} into PCR~9.
+        The native FL4 loader extends PCR~9 with each present file, first
+        \file{l4h.conf}, then the initramfs, using their exact on-disk bytes.
+        It leaves PCR~8 untouched. In a trust domain it also extends RTMR~2
+        with these files independently of the vTPM;
   \item at boot, the host generates a signing key and has the TPM quote it,
         together with the PCRs, using the TPM's attestation key (AK). That
         quote is the \emph{host evidence};
@@ -2024,11 +2033,11 @@ credential format. Each guest may activate 5 credentials at once, then one
 a second; beyond that the call fails with \texttt{EAGAIN} (``Resource
 temporarily unavailable''): try again later.
 
-\paragraph{Choosing PCR values.} The host does not keep the firmware's event
-log yet, so the verifier compares PCR values with ones it trusts. Take them
-from a known-good boot of the same l4h application on the same kind of
-machine. PCR~4 changes with the application and with the firmware's boot
-path; PCRs~8 and~9 change with dom0's files and \file{l4h.conf}.
+\paragraph{Choosing PCR values.} Take reference values from a known-good boot
+of the same l4h application and firmware boot path. Firmware measures the
+application into PCR~4. When moving from a GRUB-based FL4 release to the
+native loader, update the expected PCRs~4, 8 and~9. On FL4 the verifier can
+also replay the firmware event log with \cmd{verify --event-log}.
 
 \paragraph{Intel TDX.} On a Google Cloud C3 Confidential VM with Intel TDX,
 booted with an \file{l4h-fl4.efi} built with FL4's TDX support

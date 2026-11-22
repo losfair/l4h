@@ -8,7 +8,7 @@
 #   xapic-nopcid  xAPIC, no PCID: machines whose firmware leaves x2APIC off
 #                 and CPUs without PCID (Latitude.sh m4.metal.small)
 #   skim-xapic-nopcid  SKIM, xAPIC, no PCID: Meltdown-affected CPUs
-# Each application also holds the multikernel shim and the variant's
+# Each seL4 application also holds the multikernel shim and the variant's
 # kernels for its 8 slots (tools/build-mkshim.sh), which GRUB boots when
 # the EFI system partition has /l4h/l4h-mk.conf (DESIGN.md §11.4).
 # L4H_RELEASE=1 builds release kernels and host components.
@@ -22,7 +22,8 @@
 # launch digests from vmlinux (l4h-attest.py measure).
 # FL4 has its own microkernel, host and ABI provider (build-fl4-efi.sh),
 # sharing the same Linux guest and build SDK,
-# packaged as l4h-fl4.efi and l4h-debug-fl4-x86_64.tar.xz, without a shim.
+# packaged with its native EFI loader as l4h-fl4.efi and matching debug
+# symbols as l4h-debug-fl4-x86_64.tar.xz.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 source "$root/tools/reproducible-env.sh"
