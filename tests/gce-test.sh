@@ -14,7 +14,14 @@
 # --sev and --sev-snp build FL4 and test AMD confidential VMs with
 # gVNIC and NVMe persistent disks. Both require the selected technology,
 # shared DMA and a disk write/readback.
-# Usage: gce-test.sh [--sev|--sev-snp] PROJECT [ZONE] [MACHINE_TYPE]
+# --tdx does the same on an Intel TDX C3 VM (FL4's UEFI loader, as for
+# SEV-SNP), with Google's vTPM unless NO_VTPM=1, and requires TDX
+# attestation to be ready and its evidence in the serial log (dom0 prints
+# every attestation blob there, in hex, for tools/l4h-attest.py).
+# IMAGE_ONLY=1 stops once the image's .tar.gz is built, prints its path
+# and the deployment commands (tools/gce-image.sh), and uses no cloud
+# resources (PROJECT is then only a placeholder).
+# Usage: gce-test.sh [--sev|--sev-snp|--tdx] PROJECT [ZONE] [MACHINE_TYPE]
 # e.g.   BOOT_DISK_INTERFACE=NVME NIC_TYPE=GVNIC gce-test.sh PROJECT us-west1-b c3-standard-4-lssd
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -24,6 +31,7 @@ default_zone=us-west1-b
 case "${1:-}" in
     --sev) confidential=SEV; shift ;;
     --sev-snp) confidential=SEV_SNP; default_zone=us-central1-a; shift ;;
+    --tdx) confidential=TDX; default_zone=us-central1-a; shift ;;
 esac
 project=$1
 zone=${2:-$default_zone}
@@ -41,9 +49,11 @@ fi
 features=UEFI_COMPATIBLE,GVNIC
 if [ -n "$confidential" ]; then
     machine=${3:-n2d-standard-4}
+    [ "$confidential" = TDX ] && machine=${3:-c3-standard-4}
     case "$confidential:$machine" in
         SEV:n2d-*|SEV:c2d-*|SEV_SNP:n2d-*) cpu="AMD Milan" ;;
         SEV:c3d-*) cpu="AMD Genoa" ;;
+        TDX:c3-*) cpu= ;;
         *) echo "Unsupported $confidential machine type: $machine" >&2; exit 2 ;;
     esac
     nic=GVNIC
@@ -51,8 +61,16 @@ if [ -n "$confidential" ]; then
     BOOT_DISK_INTERFACE=NVME
     disk_args=(--create-disk=size=10GB,type=pd-balanced,interface=NVME,auto-delete=yes)
     features+=,${confidential}_CAPABLE
-    gce_args=(--confidential-compute-type="$confidential" --min-cpu-platform="$cpu" --maintenance-policy=TERMINATE
+    gce_args=(--confidential-compute-type="$confidential" ${cpu:+--min-cpu-platform="$cpu"} --maintenance-policy=TERMINATE
         --no-service-account --no-scopes)
+    if [ "$confidential" = TDX ]; then
+        # Integrity monitoring, on by default for UEFI images, needs the vTPM.
+        if [ "${NO_VTPM:-0}" = 1 ]; then
+            gce_args+=(--no-shielded-vtpm --no-shielded-integrity-monitoring)
+        else
+            gce_args+=(--shielded-vtpm)
+        fi
+    fi
     export SEL4_PREFIX="$root/build/sel4-fl4" L4H_KERNEL_VARIANT=fl4
 fi
 name=l4h-test-$(date +%Y%m%d-%H%M%S)
@@ -80,7 +98,7 @@ L4H_DOM0_DISKS=0 L4H_DOM0_MEM_MB=1024 L4H_DOM0_CMDLINE=console=hvc0 L4H_WATCHDOG
     "$root/tools/build-host.sh"
 export L4H_GUEST_KERNEL=$out/vmlinux L4H_GUEST_SDK=
 image_args=()
-if [ "$confidential" = SEV_SNP ]; then
+if [ "$confidential" = SEV_SNP ] || [ "$confidential" = TDX ]; then
     L4H_DOM0_INITRD="$out/dom0.cpio.gz" "$root/tools/mkfl4-efi.sh" "$out/$name.efi" \
         "$root/host/target/x86_64-sel4-roottask/$l4h_profile/l4h-root.elf" "$SEL4_PREFIX/bin/kernel.elf"
     image_args=(-e "$out/$name.efi")
@@ -89,10 +107,22 @@ elif [ "$confidential" = SEV ]; then
         "$root/host/target/x86_64-sel4-roottask/$l4h_profile/l4h-root.elf" "$SEL4_PREFIX/bin/kernel.elf"
     image_args=(-e "$out/$name.efi")
 fi
-if [ "$confidential" != SEV_SNP ]; then
+if [ "$confidential" != SEV_SNP ] && [ "$confidential" != TDX ]; then
     image_args+=(-i "$out/dom0.cpio.gz")
 fi
 "$root/tools/mkimage.sh" "${image_args[@]}" "$out/$name.raw" >/dev/null
+if [ "${IMAGE_ONLY:-0}" = 1 ]; then
+    image_flag=()
+    case "$confidential" in
+        SEV) image_flag=(--sev) ;;
+        SEV_SNP) image_flag=(--sev-snp) ;;
+        TDX) image_flag=(--tdx); [ "${NO_VTPM:-0}" = 1 ] && image_flag+=(--no-vtpm) ;;
+    esac
+    "$root/tools/gce-image.sh" "${image_flag[@]}" "$out/$name.raw" "$name"
+    rm -f "$out/$name.raw"
+    echo "image: $out/$name.tar.gz"
+    exit 0
+fi
 "$root/tools/gce-image.sh" "$out/$name.raw" "$name" >/dev/null
 rm -f "$out/$name.raw"
 
@@ -133,12 +163,15 @@ while [ $SECONDS -lt $end ]; do
     # Serial lines end in CR LF.
     grep -aqE 'GCETEST: (PASS|FAIL)[[:space:]]*$' "$log" && break
 done
-grep -aE 'GCETEST|Got framebuffer|AMD SEV(-SNP)? guest|DMA memory shared|l4h-root: [0-9]+ core|panic|fault' "$log" || true
+grep -aE 'GCETEST|Got framebuffer|AMD SEV(-SNP)? guest|Intel TDX guest|DMA memory shared|l4h-trustd|l4h-root: [0-9]+ core|panic|fault' "$log" \
+    | grep -av 'GCETEST: blob ' || true
 echo "serial log: $log"
 grep -aqE 'GCETEST: PASS[[:space:]]*$' "$log"
 if [ -n "$confidential" ]; then
     technology=${confidential/_/-}
-    for marker in "FL4: AMD $technology guest, C-bit [0-9]+" "l4h-root: DMA memory shared with the hypervisor" "GCETEST: ok: disk [0-9]+ pass-through"; do
+    markers=("FL4: AMD $technology guest, C-bit [0-9]+")
+    [ "$confidential" = TDX ] && markers=("FL4: Intel TDX guest, GPAW [0-9]+" "l4h-trustd: TDX attestation ready" "GCETEST: ok: TDX evidence")
+    for marker in "${markers[@]}" "l4h-root: DMA memory shared with the hypervisor" "GCETEST: ok: disk [0-9]+ pass-through"; do
         grep -aqE "$marker" "$log" || { echo "Missing serial marker: $marker" >&2; exit 1; }
     done
     if [ "$confidential" = SEV_SNP ]; then

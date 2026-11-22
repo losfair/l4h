@@ -57,7 +57,7 @@ driver compromise does not let the attacker tamper with VMs.
 ## Features
 
 - Full support for x86\_64 multi-core guests
-- TPM-backed remote attestation for guest VM integrity
+- TPM- and Intel TDX-backed remote attestation for guest VM integrity
 - Memory hotplug
 - [kemu](https://github.com/losfair/kemu): In-kernel high-performance AArch64
   emulation, 10x+ faster than qemu-user (experimental)

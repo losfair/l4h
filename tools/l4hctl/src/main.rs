@@ -247,7 +247,17 @@ In any guest (flags work without a TPM):
   attest event-log [-o F]      the host's UEFI TPM event log (raw TCG2
                                format); hex, or binary to F
   attest activate F            decrypt the credential F (tpm2_makecredential
-                               format) for the host's attestation key";
+                               format) for the host's attestation key
+  attest providers             what reports are bound to: tpm, tdx,
+                               tpm,tdx or none
+  attest tdx-evidence [-o F]   the host's Intel TDX evidence; hex, or
+                               binary to F
+  attest tdx-event-log [-o F]  the host's CC event log (CCEL, SHA-384);
+                               hex, or binary to F
+  attest tdx-quote [HEX] [-o F]
+                               a fresh TDX quote over a report on this
+                               guest with HEX (up to 64 bytes); hex, or
+                               binary to F";
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
@@ -272,6 +282,11 @@ fn cmd_attest(args: &[String]) -> Result<i32> {
         }
     }
     let action = args.first().map(String::as_str);
+    if action == Some("providers") {
+        if out.is_some() || !pos.is_empty() { return err("attest providers takes no arguments"); }
+        println!("{}", attest::providers()?);
+        return Ok(0);
+    }
     if matches!(action, Some("flags" | "seal" | "act")) {
         if out.is_some() { return err("flags commands print bit lists; -o is for reports, evidence and the event log"); }
         let f = match action {
@@ -294,6 +309,10 @@ fn cmd_attest(args: &[String]) -> Result<i32> {
         (Some("evidence"), []) => attest::evidence()?,
         (Some("event-log"), []) => attest::event_log()?,
         (Some("activate"), [file]) => attest::activate(&read_file(file)?)?,
+        (Some("tdx-evidence"), []) => attest::tdx_evidence()?,
+        (Some("tdx-event-log"), []) => attest::tdx_event_log()?,
+        (Some("tdx-quote"), []) => attest::tdx_quote(&[])?,
+        (Some("tdx-quote"), [data]) => attest::tdx_quote(&unhex(data)?)?,
         _ => {
             eprintln!("{USAGE}");
             return Ok(2);

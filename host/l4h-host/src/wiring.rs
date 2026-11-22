@@ -465,7 +465,7 @@ pub const NETD_LINK_RING: E<p::Netd, p::Root, o::Notification> = E::new(edge("NE
 pub const GUEST_TRUSTD: E<p::Guest, p::Trustd, o::Kick> = E::new(shared(edge("GUEST_TRUSTD", Guest, Chosen, Trustd, Kick, Signal,
     Bit(badges::trustd_kick::GUEST), trust::MAX_RECORDS, Root, "guest g made a request in its attestation page")));
 pub const ROOT_TRUSTD_RELAY: E<p::Root, p::Trustd, o::Kick> = E::new(shared(edge("ROOT_TRUSTD_RELAY", Root, Chosen, Trustd, Kick, Signal,
-    Fixed(trust::RELAY_BADGE), 1, Root, "another partition's trustd answered or asked (guest 63's bit too)")));
+    Fixed(trust::RELAY_BADGE), 1, Root, "another partition's trustd answered or asked, or root's timer while trustd waits (trust::Status::wake; guest 63's bit too)")));
 
 // ---- vmmgr, the VMMs and the guests.
 pub const GUEST_CTL: E<p::Guest, p::Vmmgr, o::Notification> = E::new(edge("GUEST_CTL", Guest, Chosen, Vmmgr, Notification, Signal,

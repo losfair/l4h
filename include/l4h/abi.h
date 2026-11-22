@@ -1223,6 +1223,21 @@ enum l4h_hypercall {
  *   evidence quotes (0-14).  -ENOENT if the host has none (no TPM, no log,
  *   or a boot path that does not pass it on).  Every guest, dom0 or not,
  *   gets the same log until the host reboots.
+ * - L4H_ATTEST_TDX_EVIDENCE: no data.  On a host that is an Intel TDX
+ *   trust domain, the TDX evidence, a CBOR map: {"v": 1, "key": the
+ *   signing key (COSE_Key), "type": "tdx", "quote": a DCAP quote (v4 or
+ *   v5) whose REPORTDATA is SHA-384("l4h-trustd-key-tdx-v1" || key's SEC1
+ *   point) || 0^16, taken while RTMR 3 was zero; trustd then extended RTMR
+ *   3 with that hash.  -ENODEV without TDX.  The same for every guest.
+ * - L4H_ATTEST_TDX_EVENT_LOG: no data.  The firmware's CC event log
+ *   (CCEL: TCG2 crypto agile, SHA-384), raw, in pieces; replayed, it gives
+ *   RTMR 0-2.  -ENOENT if the host has none.
+ * - L4H_ATTEST_TDX_QUOTE: data = 64 bytes, as L4H_ATTEST_REPORT.  A fresh
+ *   TDX quote over this guest's report: CBOR {"key", "quote", "report"},
+ *   the quote's REPORTDATA SHA-384("l4h-tdx-report-v1" || SHA-256(report))
+ *   || 0^16.  Rate limited as L4H_ATTEST_ACTIVATE (-EAGAIN).  Its pieces
+ *   are kept for this guest a few seconds; a request at offset 0 makes a
+ *   new quote.
  *
  * status: 0 or -errno; -EIO: the TPM failed.
  */
@@ -1238,6 +1253,12 @@ enum l4h_attest_op {
 	L4H_ATTEST_SEAL = 5,
 	/* No data.  Returns the host's TPM event log; -ENOENT without one. */
 	L4H_ATTEST_EVENT_LOG = 6,
+	/* No data.  The TDX evidence; -ENODEV without TDX. */
+	L4H_ATTEST_TDX_EVIDENCE = 7,
+	/* No data.  The CC event log (CCEL); -ENOENT without one. */
+	L4H_ATTEST_TDX_EVENT_LOG = 8,
+	/* data: 64 bytes.  A fresh TDX quote over the report (CBOR). */
+	L4H_ATTEST_TDX_QUOTE = 9,
 };
 #define L4H_FLAG_BITS           256
 #define L4H_FLAG_HOST           0   /* 0-31 host; 32-63 reserved for host */
@@ -1260,7 +1281,9 @@ struct l4h_attest_flags {
 
 #define L4H_ATTEST_DATA_SIZE    64
 #define L4H_ATTEST_FAILED       1
-#define L4H_ATTEST_NO_REPORTS   2 /* no TPM: ACT/SEAL work, reports -ENODEV */
+#define L4H_ATTEST_NO_REPORTS   2 /* no TPM, no TDX: ACT/SEAL work, reports -ENODEV */
+#define L4H_ATTEST_HAS_TPM      4 /* reports bound to a TPM quote (op 2) */
+#define L4H_ATTEST_HAS_TDX      8 /* reports bound to a TDX quote (op 7) */
 #define L4H_ATTEST_PAGE_DATA    (4096 - 64)
 
 struct l4h_attest_page {
@@ -1273,7 +1296,7 @@ struct l4h_attest_page {
 	l4h_s32 status;
 	l4h_u32 total;          /* the whole result's length */
 	l4h_u32 out_len;        /* bytes of data in the reply, from offset */
-	l4h_u32 state;          /* host: L4H_ATTEST_FAILED / NO_REPORTS bits */
+	l4h_u32 state;          /* host: L4H_ATTEST_FAILED / NO_REPORTS / HAS_* bits */
 	l4h_u32 reserved[6];
 	l4h_u8 data[L4H_ATTEST_PAGE_DATA];
 };

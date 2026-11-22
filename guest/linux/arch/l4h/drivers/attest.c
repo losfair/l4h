@@ -6,12 +6,16 @@
  *
  * - configfs-tsm reports (/sys/kernel/config/tsm/report, provider "l4h"):
  *   inblob is the report data (up to 64 bytes, zero padded), outblob the
- *   report (COSE_Sign1), auxblob the host evidence (CBOR).
+ *   report (COSE_Sign1), auxblob the host evidence (CBOR): the TPM's
+ *   (L4H_ATTEST_EVIDENCE), the TDX evidence (L4H_ATTEST_TDX_EVIDENCE) on a
+ *   host with TDX and no TPM, or with both {"v": 3, "tdx": ..., "tpm": ...}.
  * - /dev/l4h-attest: ioctl(L4H_ATTEST_IOC) makes any request,
  *   ActivateCredential included, for tools such as l4hctl.
- * - /sys/kernel/l4h/attest/{taint,seal}: the flags, as bit lists, and
- *   event_log (root only): the host's UEFI TPM event log, read from the
- *   host a piece at a time as it is read (-ENOENT if the host has none).
+ * - /sys/kernel/l4h/attest/{taint,seal}: the flags, as bit lists;
+ *   providers: what reports are bound to (tpm, tdx, tpm,tdx or none);
+ *   event_log and tdx_event_log (root only): the host's UEFI TPM event log
+ *   and its CC event log, read from the host a piece at a time as they are
+ *   read (-ENOENT if the host has none).
  *
  * Requests are asynchronous: the caller sleeps until the host's answer
  * raises the device's event, and the vCPU runs other tasks meanwhile.
@@ -288,27 +292,96 @@ static int attest_evidence(u8 **out, size_t *out_len)
 	return attest_call(L4H_ATTEST_EVIDENCE, NULL, 0, 0, out, out_len);
 }
 
+static int attest_tdx_evidence(u8 **out, size_t *out_len)
+{
+	return attest_call(L4H_ATTEST_TDX_EVIDENCE, NULL, 0, 0, out, out_len);
+}
+
+/* An evidence request that found no such quote: -ENODEV, or -ENOSYS from a
+ * host older than TDX. */
+static bool no_evidence(int ret)
+{
+	return ret == -ENODEV || ret == -ENOSYS;
+}
+
+/*
+ * Both evidences in one deterministic CBOR map (RFC 8949 4.2.1):
+ * {"v": 3, "tdx": <TDX evidence>, "tpm": <TPM evidence>}, each a CBOR map
+ * as the host wrote it, spliced in whole.  Keys in the order of their
+ * encodings: "v" (shorter), then "tdx" before "tpm".
+ */
+static u8 *combine_evidence(const u8 *tdx, size_t tdx_len, const u8 *tpm, size_t tpm_len, size_t *len)
+{
+	static const u8 v3[] = { 0xa3, 0x61, 'v', 0x03 };
+	static const u8 k_tdx[] = { 0x63, 't', 'd', 'x' };
+	static const u8 k_tpm[] = { 0x63, 't', 'p', 'm' };
+	size_t n = sizeof(v3) + sizeof(k_tdx) + tdx_len + sizeof(k_tpm) + tpm_len;
+	u8 *b = kvmalloc(n, GFP_KERNEL), *p = b;
+
+	if (!b)
+		return NULL;
+	memcpy(p, v3, sizeof(v3));
+	p += sizeof(v3);
+	memcpy(p, k_tdx, sizeof(k_tdx));
+	p += sizeof(k_tdx);
+	memcpy(p, tdx, tdx_len);
+	p += tdx_len;
+	memcpy(p, k_tpm, sizeof(k_tpm));
+	p += sizeof(k_tpm);
+	memcpy(p, tpm, tpm_len);
+	*len = n;
+	return b;
+}
+
 #if IS_ENABLED(CONFIG_TSM_REPORTS)
 static int l4h_report_new(struct tsm_report *report, void *data)
 {
 	struct tsm_report_desc *desc = &report->desc;
-	u8 *out, *aux;
-	size_t len, aux_len;
-	int ret;
+	u8 *out, *aux = NULL, *tdx = NULL;
+	size_t len, aux_len = 0, tdx_len = 0;
+	int ret, tdx_ret;
 
 	ret = attest_report(desc->inblob, desc->inblob_len, &out, &len);
 	if (ret)
 		return ret;
+	/* Whichever quotes the host has: the TPM's alone as ever, TDX's
+	 * alone, or both together.  Asked for each, not taken from the page's
+	 * state, which a host still making its TDX quote has not set yet. */
 	ret = attest_evidence(&aux, &aux_len);
-	if (ret) {
-		kvfree(out);
-		return ret;
+	tdx_ret = attest_tdx_evidence(&tdx, &tdx_len);
+	if (ret && !no_evidence(ret))
+		goto fail;
+	if (tdx_ret && !no_evidence(tdx_ret)) {
+		ret = tdx_ret;
+		goto fail;
 	}
+	if (ret && tdx_ret)
+		goto fail;
+	if (ret) {
+		aux = tdx;
+		aux_len = tdx_len;
+		tdx = NULL;
+	} else if (!tdx_ret) {
+		u8 *both = combine_evidence(tdx, tdx_len, aux, aux_len, &aux_len);
+
+		kvfree(aux);
+		aux = both;
+		if (!aux) {
+			ret = -ENOMEM;
+			goto fail;
+		}
+	}
+	kvfree(tdx);
 	report->outblob = out;
 	report->outblob_len = len;
 	report->auxblob = aux;
 	report->auxblob_len = aux_len;
 	return 0;
+fail:
+	kvfree(tdx);
+	kvfree(aux);
+	kvfree(out);
+	return ret;
 }
 
 static bool l4h_report_attr_visible(int n)
@@ -371,7 +444,6 @@ static ssize_t flags_show(struct kobject *kobj, struct kobj_attribute *attr, cha
 }
 static struct kobj_attribute taint_attr = __ATTR(taint, 0444, flags_show, NULL);
 static struct kobj_attribute seal_attr = __ATTR(seal, 0444, flags_show, NULL);
-static struct attribute *flags_attrs[] = { &taint_attr.attr, &seal_attr.attr, NULL };
 
 /* The host's TPM event log, the pieces read: it can be a megabyte, and
  * is not kept in the guest. */
@@ -390,7 +462,47 @@ static ssize_t event_log_read(struct file *f, struct kobject *kobj, const struct
 }
 /* Root only, as /dev/l4h-attest. */
 static const BIN_ATTR_ADMIN_RO(event_log, 0);
-static const struct bin_attribute *const flags_bin_attrs[] = { &bin_attr_event_log, NULL };
+
+/* The host's CC event log (TDX), as the TPM's. */
+static ssize_t tdx_event_log_read(struct file *f, struct kobject *kobj, const struct bin_attribute *attr,
+				  char *buf, loff_t off, size_t count)
+{
+	ssize_t ret;
+
+	if (mutex_lock_killable(&attest_lock))
+		return -EINTR;
+	ret = flush_taints();
+	if (!ret)
+		ret = attest_read_locked(L4H_ATTEST_TDX_EVENT_LOG, off, buf, count);
+	mutex_unlock(&attest_lock);
+	return ret;
+}
+static const BIN_ATTR_ADMIN_RO(tdx_event_log, 0);
+static const struct bin_attribute *const flags_bin_attrs[] = { &bin_attr_event_log, &bin_attr_tdx_event_log, NULL };
+
+/* What the host binds reports to, as its page says after a request (an
+ * empty ACT): its state is the host's at that answer. */
+static ssize_t providers_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+	u8 bits[L4H_FLAG_BITS / 8] = {}, *out = NULL;
+	size_t len;
+	u32 state;
+	int ret = attest_call(L4H_ATTEST_ACT, bits, sizeof(bits), 0, &out, &len);
+
+	kvfree(out);
+	if (ret && ret != -ENOSYS)
+		return ret;
+	state = READ_ONCE(page->state);
+	if ((state & (L4H_ATTEST_HAS_TPM | L4H_ATTEST_HAS_TDX)) == (L4H_ATTEST_HAS_TPM | L4H_ATTEST_HAS_TDX))
+		return sysfs_emit(buf, "tpm,tdx\n");
+	if (state & L4H_ATTEST_HAS_TPM)
+		return sysfs_emit(buf, "tpm\n");
+	if (state & L4H_ATTEST_HAS_TDX)
+		return sysfs_emit(buf, "tdx\n");
+	return sysfs_emit(buf, "none\n");
+}
+static struct kobj_attribute providers_attr = __ATTR(providers, 0444, providers_show, NULL);
+static struct attribute *flags_attrs[] = { &taint_attr.attr, &seal_attr.attr, &providers_attr.attr, NULL };
 static const struct attribute_group flags_group = {
 	.name = "attest", .attrs = flags_attrs, .bin_attrs = flags_bin_attrs,
 };
@@ -415,6 +527,7 @@ static long attest_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 		return -EFAULT;
 	switch (c.op) {
 	case L4H_ATTEST_REPORT:
+	case L4H_ATTEST_TDX_QUOTE:
 		in_len = L4H_ATTEST_DATA_SIZE;
 		break;
 	case L4H_ATTEST_ACTIVATE:
@@ -434,6 +547,8 @@ static long attest_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 		break;
 	case L4H_ATTEST_EVIDENCE:
 	case L4H_ATTEST_EVENT_LOG:
+	case L4H_ATTEST_TDX_EVIDENCE:
+	case L4H_ATTEST_TDX_EVENT_LOG:
 		in_len = 0;
 		break;
 	default:
@@ -453,8 +568,10 @@ static long attest_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 		ret = attest_report(in, in_len, &out, &len);
 	else if (c.op == L4H_ATTEST_EVIDENCE)
 		ret = attest_evidence(&out, &len);
-	else if (c.op == L4H_ATTEST_EVENT_LOG)
-		ret = attest_call(L4H_ATTEST_EVENT_LOG, NULL, 0, 0, &out, &len);
+	else if (c.op == L4H_ATTEST_EVENT_LOG || c.op == L4H_ATTEST_TDX_EVIDENCE || c.op == L4H_ATTEST_TDX_EVENT_LOG)
+		ret = attest_call(c.op, NULL, 0, 0, &out, &len);
+	else if (c.op == L4H_ATTEST_TDX_QUOTE)
+		ret = attest_call(c.op, in, in_len, 0, &out, &len);
 	else
 		ret = attest_call(c.op, in, in_len, c.blob_len, &out, &len);
 	kfree(in);
