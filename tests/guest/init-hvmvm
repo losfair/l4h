@@ -24,14 +24,17 @@ fi
 if [ -n "$BURN" ]; then
     n=$(grep -c ^processor /proc/cpuinfo)
     end=$(($(date +%s) + BURN))
-    for c in $(seq 1 "$n"); do (while [ "$(date +%s)" -lt $end ]; do :; done) & done
-    wait
+    # Wait for these only: the power button's watcher runs on.
+    pids=
+    for c in $(seq 1 "$n"); do (while [ "$(date +%s)" -lt $end ]; do :; done) & pids="$pids $!"; done
+    for p in $pids; do wait "$p"; done
     echo "HVMVM: burned $BURN s on $n cpus"
 fi
 if [ -b /dev/vda ]; then
     echo "HVMVM: vda $(cat /sys/block/vda/size) sectors, marker $(dd if=/dev/vda bs=16 count=1 2>/dev/null)"
     # 3 MiB of a known pattern at 1 MiB, past the marker dom0 wrote.
-    seq 1 400000 | head -c 3145728 > /tmp/pattern
+    seq 1 600000 | head -c 3145728 > /tmp/pattern
+    [ "$(wc -c < /tmp/pattern)" -eq 3145728 ] || echo "HVMVM: pattern size wrong"
     case "$DISK" in
     write)
         dd if=/tmp/pattern of=/dev/vda bs=1M seek=1 conv=fsync 2>/dev/null

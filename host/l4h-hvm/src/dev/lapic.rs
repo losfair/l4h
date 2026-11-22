@@ -12,8 +12,8 @@ use core::sync::atomic::Ordering;
 use super::apic::{self, Message, Shared, Shorthand};
 
 /// The APIC timer's input clock, which CPUID leaf 0x15 says is the
-/// crystal's: 1 GHz, so that a count is a nanosecond.
-pub const TIMER_HZ: u64 = 1_000_000_000;
+/// crystal's (x86::cpuid::CRYSTAL_HZ, 25 MHz: a count is 40 ns).
+pub const TIMER_HZ: u64 = crate::x86::cpuid::CRYSTAL_HZ;
 
 /// IA32_APIC_BASE: the BSP flag, x2APIC mode, global enable.
 pub const BASE_BSP: u64 = 1 << 8;
@@ -560,23 +560,25 @@ mod tests {
     #[test]
     fn timer_modes() {
         let (mut l, s) = setup();
-        // One-shot, divide by 1: 1000 counts of 1 ns are 2000 TSC ticks.
+        // One-shot, divide by 1: 1000 counts of 40 ns are 80000 TSC ticks
+        // (2 GHz).
+        assert_eq!(TIMER_HZ, 25_000_000);
         l.write(&s, 0, TIMER_DIV, 0xb);
         l.write(&s, 0, LVT_TIMER, 0xec);
         assert!(l.write(&s, 100, TIMER_INIT, 1000).timer);
-        assert_eq!(l.deadline(), 2100);
-        assert_eq!(l.read(&s, 1100, TIMER_CUR), 500);
-        assert!(!l.tick(&s, 2099));
-        assert!(l.tick(&s, 2100));
+        assert_eq!(l.deadline(), 80_100);
+        assert_eq!(l.read(&s, 40_100, TIMER_CUR), 500);
+        assert!(!l.tick(&s, 80_099));
+        assert!(l.tick(&s, 80_100));
         assert_eq!(l.pending(&s), Some(0xec));
         assert_eq!(l.deadline(), 0);
         // Periodic, divide by 2: catches up without firing for each missed period.
         l.write(&s, 0, TIMER_DIV, 0);
         l.write(&s, 0, LVT_TIMER, (1 << 17) | 0xed);
         l.write(&s, 0, TIMER_INIT, 500);
-        assert_eq!(l.deadline(), 2000);
-        assert!(l.tick(&s, 7500));
-        assert_eq!(l.deadline(), 8000);
+        assert_eq!(l.deadline(), 80_000);
+        assert!(l.tick(&s, 300_000));
+        assert_eq!(l.deadline(), 320_000);
         // TSC-deadline: the MSR is the deadline; it reads 0 once fired.
         l.write(&s, 0, LVT_TIMER, (2 << 17) | 0xee);
         assert_eq!(l.deadline(), 0, "a mode change stops it");

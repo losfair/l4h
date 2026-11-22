@@ -45,6 +45,9 @@ pub struct Access {
     pub user: bool,
     /// An instruction fetch.
     pub fetch: bool,
+    /// RFLAGS.AC, which lets a supervisor data access reach user pages
+    /// under SMAP.
+    pub ac: bool,
 }
 
 /// A page fault, with the error code the CPU would push.
@@ -134,14 +137,12 @@ pub fn translate(p: &Paging, linear: u64, access: Access, mem: &mut impl Tables)
         if level == 1 || large {
             // Permission checks, as the CPU's (supervisor writes honour
             // read-only pages with CR0.WP; SMEP and SMAP for supervisor
-            // accesses to user pages; SMAP's AC override is not modelled:
-            // an emulated supervisor access to a user page with SMAP is
-            // refused).
+            // accesses to user pages, SMAP but for RFLAGS.AC).
             let denied = (access.write && !writable && (access.user || p.cr0 & CR0_WP != 0))
                 || (access.user && !user_ok)
                 || (access.fetch && !exec_ok)
                 || (!access.user && user_ok && access.fetch && p.cr4 & CR4_SMEP != 0)
-                || (!access.user && user_ok && !access.fetch && p.cr4 & CR4_SMAP != 0);
+                || (!access.user && user_ok && !access.fetch && !access.ac && p.cr4 & CR4_SMAP != 0);
             if denied {
                 return Err(fault(true));
             }
@@ -187,8 +188,8 @@ mod tests {
         }
     }
 
-    const R: Access = Access { write: false, user: false, fetch: false };
-    const W: Access = Access { write: true, user: false, fetch: false };
+    const R: Access = Access { write: false, user: false, fetch: false, ac: false };
+    const W: Access = Access { write: true, user: false, fetch: false, ac: false };
 
     fn long_mode() -> (Mem, Paging) {
         let mut m = Mem(BTreeMap::new());
@@ -224,6 +225,26 @@ mod tests {
         // A table outside RAM.
         m.0.insert(0x1008, (1 << 33) | P);
         assert_eq!(translate(&p, 1 << 39, R, &mut m), Err(Error::BadTable));
+    }
+
+    /// SMAP refuses a supervisor data access to a user page, unless
+    /// RFLAGS.AC; SMEP a supervisor fetch from one.
+    #[test]
+    fn smap_and_ac() {
+        let (mut m, p) = long_mode();
+        for e in [0x1000, 0x2000, 0x3000, 0x4028] {
+            *m.0.get_mut(&e).unwrap() |= US;
+        }
+        let p = Paging { cr4: p.cr4 | CR4_SMAP | CR4_SMEP, ..p };
+        assert_eq!(translate(&p, 0x5010, R, &mut m), Err(Error::Fault(PageFault { error: PF_P })));
+        assert_eq!(translate(&p, 0x5010, W, &mut m), Err(Error::Fault(PageFault { error: PF_P | PF_W })));
+        assert_eq!(translate(&p, 0x5010, Access { ac: true, ..R }, &mut m), Ok(0x9010));
+        assert_eq!(translate(&p, 0x5010, Access { ac: true, ..W }, &mut m), Ok(0x9010));
+        // AC does not let a supervisor fetch from it, and a user access
+        // needs none.
+        let f = Access { fetch: true, ac: true, ..R };
+        assert!(translate(&Paging { efer: p.efer & !EFER_NXE, ..p }, 0x5010, f, &mut m).is_err());
+        assert_eq!(translate(&p, 0x5010, Access { user: true, ..R }, &mut m), Ok(0x9010));
     }
 
     #[test]

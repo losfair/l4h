@@ -943,8 +943,15 @@ pub fn hvm_layout(kernel: &[u8], initrd_len: u64, ram: u64) -> Result<(u64, u64)
         }
         let setup = (match le(0x1f1, 1)? { 0 => 4, s => s } + 1) * 512;
         let payload = (kernel.len() as u64).checked_sub(setup).ok_or(Error("kernel: truncated bzImage".into()))?;
+        // As l4h-hvm's boot::load_address: a kernel that cannot be
+        // relocated runs at its preferred address, a relocatable one there
+        // if it is aligned as asked, else at 16 MiB.
         let (pref, align) = (le(0x258, 8)?, le(0x230, 4)?.max(1));
-        let load = if le(0x234, 1)? != 0 && pref != 0 && pref % align == 0 { pref } else { 16 << 20 };
+        let load = match pref {
+            0 => 16 << 20,
+            p if le(0x234, 1)? == 0 || p % align == 0 => p,
+            _ => 16 << 20,
+        };
         load + le(0x260, 4)?.max(payload)
     } else {
         return err("kernel: neither a bzImage nor an ELF vmlinux");
@@ -1936,6 +1943,21 @@ mod hvm_layout_tests {
         let (image, initrd) = hvm_layout(&k, 0, 256 * MIB).unwrap();
         assert!(image >= 16 * MIB + 50 * MIB - 31 * 512 && image % (2 * MIB) == 0);
         assert_eq!(initrd, (image + 50 * MIB).next_multiple_of(2 * MIB));
+    }
+
+    /// As l4h-hvm's boot::load_address: a kernel that cannot be relocated
+    /// runs at its preferred address, aligned or not; the image and the
+    /// initrd go above its window.
+    #[test]
+    fn non_relocatable_bzimage_at_its_preferred_address() {
+        let mut k = bzimage(10 * MIB as usize, 30, 40 * MIB as u32, 1);
+        k[0x234] = 0;
+        k[0x258..0x260].copy_from_slice(&(3 * MIB).to_le_bytes());
+        assert_eq!(hvm_layout(&k, 0, 256 * MIB).unwrap().0, (3 * MIB + 40 * MIB).next_multiple_of(2 * MIB));
+        k[0x234] = 1;
+        assert_eq!(hvm_layout(&k, 0, 256 * MIB).unwrap().0, 56 * MIB, "relocatable, misaligned: 16 MiB");
+        k[0x258..0x260].copy_from_slice(&(64 * MIB).to_le_bytes());
+        assert_eq!(hvm_layout(&k, 0, 256 * MIB).unwrap().0, 104 * MIB);
     }
 
     #[test]

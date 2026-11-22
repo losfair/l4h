@@ -115,6 +115,16 @@ end = usbd.index('\n            abi::OP_EP_RESET =>', start)
 dev_reset = usbd[start:end].rstrip().removesuffix(',')
 (out / 'usb-lifetime.inc').write_text('impl Usbd {\n' + reset + '\nfn disable(&mut self, r: &Request) -> i32 ' + disable
     + '\nfn dev_reset(&mut self, r: &Request) -> i32 ' + dev_reset + '\n}\n')
+# HVM guests' device room: the attach handlers and Guest::max_devices.
+vmmgr = (root / 'host/l4h-vmmgr/src/main.rs').read_text()
+handlers = []
+for f in ['    pub fn attach_dummy_disk(', '    pub fn create_nic(']:
+    start = vmmgr.index(f)
+    handlers.append(vmmgr[start:vmmgr.index('\n    }\n', start) + 7])
+(out / 'vmmgr-devices.inc').write_text('impl Vmmgr {\n' + '\n'.join(handlers) + '}\n')
+guest = (root / 'host/l4h-vmmgr/src/guest.rs').read_text()
+start = guest.index('    pub fn max_devices(')
+(out / 'max-devices.inc').write_text('impl Guest {\n' + guest[start:guest.index('\n    }\n', start) + 7] + '}\n')
 # Keep the production boot sequence and reservation lifecycle intact.
 vmmgr = (root / 'host/l4h-vmmgr/src/main.rs').read_text()
 start = vmmgr.index('pub fn boot_dom0(')
@@ -268,6 +278,10 @@ L4H_BLK_ATTACH_TEST_SRC="$out/blk-attach.inc" rustc +stable --edition=2024 --tes
     --extern l4h_abi="$out/libl4h_abi.rlib" --extern l4h_host="$out/libl4h_host.rlib" \
     "$root/tests/blk-attach.rs" -o "$out/blk-attach-tests"
 "$out/blk-attach-tests"
+L4H_DEVICES_SRC="$out/vmmgr-devices.inc" L4H_MAX_DEVICES_SRC="$out/max-devices.inc" rustc +stable --edition=2024 --test \
+    -L dependency="$out" --extern l4h_abi="$out/libl4h_abi.rlib" --extern l4h_host="$out/libl4h_host.rlib" \
+    "$root/tests/vmmgr-devices.rs" -o "$out/vmmgr-devices-tests"
+"$out/vmmgr-devices-tests"
 L4H_VM_START_TEST_SRC="$out/vm-start.inc" rustc +stable --edition=2024 --test -L dependency="$out" \
     --extern l4h_abi="$out/libl4h_abi.rlib" "$root/tests/vm-start.rs" -o "$out/vm-start-tests"
 "$out/vm-start-tests"

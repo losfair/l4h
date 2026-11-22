@@ -11,6 +11,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 pub const BLOCK_SHIFT: u32 = 21;
 pub const HIGH_RAM_BASE: u64 = 4 << 30;
 
+#[derive(Clone, Copy)]
 pub struct GuestMem {
     /// Where GPA 0 is mapped.
     pub base: usize,

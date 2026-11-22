@@ -50,6 +50,10 @@ pub fn start_bytes(_: &Guest) -> usize {
     0
 }
 
+pub fn start_slots(_: &Guest) -> usize {
+    0
+}
+
 pub fn spawn(_: &mut Guest, _: &mut Alloc, _: &mut crate::window::Window, _: &mut AsidPools, _: &HostInfo,
     _: crate::sched::budget::Plan) -> sel4::Result<crate::component::Component> {
     Err(sel4::Error::IllegalOperation)

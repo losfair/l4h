@@ -574,12 +574,114 @@ pub const fn cap_tag(object: Object) -> u32 {
     }
 }
 
+/// seL4's tags of a CNode and of a TCB, the same on every architecture;
+/// architecture objects (frames, page tables, EPT roots, VCPUs) have odd
+/// tags, which vary by configuration.
+pub const CAP_NULL: u32 = 0;
+pub const CAP_CNODE: u32 = 10;
+pub const CAP_THREAD: u32 = 12;
+
+/// What an HVM monitor's capability that is no edge is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Held {
+    CNode,
+    Thread,
+    /// An architecture object (odd tag).
+    Arch,
+}
+
+/// The capabilities vmmgr gives an l4h-hvm besides its edges and the
+/// standard slots: (first slot, count, what, for what).  Anything else
+/// there that does not call or signal is refused by `audit`.
+pub const HVM_HELD: [(u64, usize, Held, &str); 6] = [
+    (hvm::SLOT_EPT, 1, Held::Arch, "the guest's EPT root"),
+    (hvm::SLOT_BLOCKS, 1, Held::CNode, "the CNode of its RAM blocks' Untypeds"),
+    (hvm::SLOT_KEEP_EPT, 1, Held::CNode, "the CNode of its RAM blocks' EPT frames"),
+    (hvm::SLOT_KEEP_HVM, 1, Held::CNode, "the CNode of its RAM blocks' own mappings"),
+    (hvm::SLOT_VCPU_TCB, abi::MAX_VCPUS, Held::Thread, "its vCPU threads"),
+    (hvm::SLOT_VCPU_OBJ, abi::MAX_VCPUS, Held::Arch, "its VCPUs"),
+];
+
+/// The HVM_HELD entry slot `slot` is in.
+const fn hvm_held(slot: u64) -> Option<Held> {
+    let mut i = 0;
+    while i < HVM_HELD.len() {
+        let (first, n, held, _) = HVM_HELD[i];
+        if slot >= first && slot < first + n as u64 {
+            return Some(held);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// HVM_HELD's slots are the monitor's own: past the standard slots, in its
+/// CNode, apart from one another and from every slot an edge or its own
+/// objects (OWN) have in a monitor.
+const fn hvm_held_check() -> Result<(), &'static str> {
+    let mut i = 0;
+    while i < HVM_HELD.len() {
+        let (first, n, _, what) = HVM_HELD[i];
+        if first < crate::SLOT_FIRST_FREE || first + n as u64 > 1 << crate::CNODE_BITS {
+            return Err(what);
+        }
+        let mut j = 0;
+        while j < HVM_HELD.len() {
+            let (f2, n2, _, _) = HVM_HELD[j];
+            if i != j && first < f2 + n2 as u64 && f2 < first + n as u64 {
+                return Err(what);
+            }
+            j += 1;
+        }
+        let mut k = 0;
+        while k < EDGES.len() {
+            let e = &EDGES[k];
+            let mine = match e.holder.kind() {
+                Some(h) => h == crate::KIND_HVM,
+                None => false,
+            };
+            if mine && matches!(e.at, At::Slots(base, len) if first < base + len as u64 && base < first + n as u64) {
+                return Err(e.name);
+            }
+            k += 1;
+        }
+        let mut o = 0;
+        while o < OWN.len() {
+            let w = &OWN[o];
+            let mine = match w.kind {
+                None => true,
+                Some(k) => k == crate::KIND_HVM,
+            };
+            if mine && first < w.slot + w.len as u64 && w.slot < first + n as u64 {
+                return Err(w.what);
+            }
+            o += 1;
+        }
+        i += 1;
+    }
+    Ok(())
+}
+const _: () = assert!(hvm_held_check().is_ok(), "an HVM monitor's held capabilities overlap");
+
 /// What is wrong with a capability tagged `tag` in slot `slot` of a
 /// component of `kind`, if anything: one that calls or signals must be one
-/// the wiring gives it (expected), of its object's type.
+/// the wiring gives it (expected), of its object's type.  An HVM monitor's
+/// others past the standard slots are only those of HVM_HELD, each of its
+/// type.
 pub fn audit(kind: u32, slot: u64, tag: u32) -> Result<(), &'static str> {
     if tag != CAP_ENDPOINT && tag != CAP_NOTIFICATION {
-        return Ok(());
+        if kind != crate::KIND_HVM || slot < crate::SLOT_FIRST_FREE || tag == CAP_NULL {
+            return Ok(());
+        }
+        return match (hvm_held(slot), tag) {
+            (Some(Held::CNode), CAP_CNODE) | (Some(Held::Thread), CAP_THREAD) => Ok(()),
+            (Some(Held::Arch), t) if t % 2 == 1 => Ok(()),
+            (Some(_), _) => Err("of another type than an HVM monitor has there"),
+            (None, _) => Err("that an HVM monitor has nowhere there"),
+        };
+    }
+    if kind == crate::KIND_HVM && hvm_held(slot).is_some() {
+        return Err("where an HVM monitor holds no edge");
     }
     match expected(kind, slot) {
         Some(o) if cap_tag(o) == tag => Ok(()),
@@ -873,6 +975,36 @@ pub fn put_live<E: PartialEq>(full: &E, mut put: impl FnMut() -> Result<(), E>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_hvm_monitors_held_capabilities_are_audited_by_slot_and_type() {
+        let h = crate::KIND_HVM;
+        assert_eq!(audit(h, hvm::SLOT_EPT, 29), Ok(()));
+        for s in [hvm::SLOT_BLOCKS, hvm::SLOT_KEEP_EPT, hvm::SLOT_KEEP_HVM] {
+            assert_eq!(audit(h, s, CAP_CNODE), Ok(()));
+            assert!(audit(h, s, CAP_THREAD).is_err() && audit(h, s, 1).is_err());
+        }
+        for v in [0, abi::MAX_VCPUS as u64 - 1] {
+            assert_eq!(audit(h, hvm::SLOT_VCPU_TCB + v, CAP_THREAD), Ok(()));
+            assert_eq!(audit(h, hvm::SLOT_VCPU_OBJ + v, 21), Ok(()));
+            assert!(audit(h, hvm::SLOT_VCPU_OBJ + v, CAP_CNODE).is_err());
+            // Its waits' notifications, and the vCPUs' badged ones.
+            assert_eq!(audit(h, hvm::SLOT_VCPU_WAIT + v, CAP_NOTIFICATION), Ok(()));
+            assert_eq!(audit(h, crate::VCPU_NTFN_SLOT_BASE + v, CAP_NOTIFICATION), Ok(()));
+        }
+        // No call or signal where it holds objects; nothing else past the
+        // standard slots: an Untyped, a CNode or a TCB anywhere else.
+        assert!(audit(h, hvm::SLOT_EPT, CAP_ENDPOINT).is_err());
+        assert!(audit(h, hvm::SLOT_VCPU_TCB, CAP_NOTIFICATION).is_err());
+        assert_eq!(audit(h, hvm::SLOT_SCRATCH_UT, CAP_NULL), Ok(()), "empty");
+        for (s, tag) in [(hvm::SLOT_SCRATCH_UT, 2), (hvm::SLOT_SCRATCH_EPT, CAP_CNODE), (hvm::SLOT_VCPU_WAIT, CAP_THREAD), (4095, 1)] {
+            assert!(audit(h, s, tag).is_err(), "slot {s} tag {tag}");
+        }
+        // Standard slots, and other kinds, as before.
+        assert_eq!(audit(h, crate::SLOT_CNODE, CAP_CNODE), Ok(()));
+        assert_eq!(audit(crate::KIND_VMM, hvm::SLOT_BLOCKS, CAP_CNODE), Ok(()));
+        assert_eq!(hvm_held_check(), Ok(()));
+    }
 
     #[test]
     fn put_live_blames_only_a_full_slot() {

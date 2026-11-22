@@ -140,13 +140,7 @@ impl Kernel {
         if setup_len >= len {
             return Err(Error::Format);
         }
-        let load = if head[HDR_RELOCATABLE] != 0 {
-            let pref = le(&head, HDR_PREF_ADDRESS, 8);
-            let align = le(&head, HDR_KERNEL_ALIGNMENT, 4).max(1);
-            if pref != 0 && pref.is_multiple_of(align) { pref } else { LOAD_DEFAULT }
-        } else {
-            LOAD_DEFAULT
-        };
+        let load = load_address(head[HDR_RELOCATABLE] != 0, le(&head, HDR_PREF_ADDRESS, 8), le(&head, HDR_KERNEL_ALIGNMENT, 4));
         let payload = len - setup_len;
         let size = le(&head, HDR_INIT_SIZE, 4).max(payload);
         let mut k = Kernel { pieces: [(0, 0, 0, 0); 16], nr: 1, entry: load + 0x200, setup: Some(head) };
@@ -190,6 +184,19 @@ impl Kernel {
     /// Where the kernel goes, and what it takes there.
     fn pieces(&self) -> &[(u64, u64, u64, u64)] {
         &self.pieces[..self.nr]
+    }
+}
+
+/// Where a bzImage's kernel runs, and decompresses itself (init_size
+/// from there): its preferred address, which a kernel that cannot be
+/// relocated (`relocatable` false) must have, and a relocatable one gets
+/// if it is aligned as it asks; 16 MiB without one.  tools/l4hctl places
+/// the image and the initrd above it by the same rule (hvm_layout).
+pub fn load_address(relocatable: bool, pref: u64, align: u64) -> u64 {
+    match pref {
+        0 => LOAD_DEFAULT,
+        p if !relocatable || p.is_multiple_of(align.max(1)) => p,
+        _ => LOAD_DEFAULT,
     }
 }
 
@@ -454,6 +461,75 @@ mod tests {
         // Not x86-64.
         mem.write::<u16>(0x80_0000 + 18, 3);
         assert_eq!(Kernel::parse(&mem, 0x80_0000, 0x200).err(), Some(Error::Format));
+    }
+
+    /// A kernel that cannot be relocated runs at its preferred address,
+    /// whatever its alignment; the initrd must stay clear of its window.
+    #[test]
+    fn non_relocatable_bzimage_at_its_preferred_address() {
+        assert_eq!(load_address(false, 0x30_0000, 0x20_0000), 0x30_0000);
+        assert_eq!(load_address(true, 0x30_0000, 0x20_0000), LOAD_DEFAULT, "relocatable, misaligned");
+        assert_eq!(load_address(true, 0x40_0000, 0x20_0000), 0x40_0000);
+        assert_eq!(load_address(false, 0, 0x20_0000), LOAD_DEFAULT);
+        let (mem, _buf) = fake(16 << 20, 0);
+        let len = bzimage(&mem, 0x80_0000, b"fixed!!!", 0x20_0000);
+        mem.write::<u8>(0x80_0000 + HDR_RELOCATABLE as u64, 0);
+        mem.write::<u64>(0x80_0000 + HDR_PREF_ADDRESS as u64, 0x30_0000);
+        let k = Kernel::parse(&mem, 0x80_0000, len).unwrap();
+        // An initrd in [pref, pref + init_size) is refused; past it, fine.
+        assert_eq!(load(&mem, &k, (0x80_0000, len), (0x40_0000, 6), b"", 0xe0000).err(), Some(Error::Layout));
+        mem.write_bytes(0xc0_0000, b"initrd");
+        let e = load(&mem, &k, (0x80_0000, len), (0xc0_0000, 6), b"", 0xe0000).unwrap();
+        assert_eq!(e.rip, 0x30_0200);
+        let mut b = [0u8; 8];
+        mem.read_bytes(0x30_0000, &mut b);
+        assert_eq!(&b, b"fixed!!!");
+        mem.read_bytes(0xc0_0000, &mut b[..6]);
+        assert_eq!(&b[..6], b"initrd");
+    }
+
+    /// The image below where the kernel goes, which nothing mapped yet:
+    /// loading maps those blocks as it writes them (before the machine
+    /// exists), and the bytes are right.
+    #[test]
+    fn loading_maps_blocks_it_first_touches() {
+        use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        static MAPPED: [AtomicU64; 1] = [AtomicU64::new(0)];
+        static MAPS: AtomicUsize = AtomicUsize::new(0);
+        fn map(b: usize) -> bool {
+            MAPS.fetch_add(1, Ordering::SeqCst);
+            MAPPED[0].fetch_or(1 << b, Ordering::SeqCst);
+            true
+        }
+        let buf = std::vec![0u8; 32 << 20];
+        let mem = GuestMem { base: buf.as_ptr() as usize, low: 32 << 20, high: 0, mapped: &MAPPED, map };
+        // vmmgr filled the blocks up to the image (0 to 4 MiB): block 0,
+        // the image's at 2 MiB.
+        MAPPED[0].store(0b11, Ordering::SeqCst);
+        let mut e = [0u8; 0x200];
+        e[..4].copy_from_slice(b"\x7fELF");
+        e[4] = 2;
+        e[5] = 1;
+        put(&mut e, 18, 2, 62);
+        put(&mut e, 24, 8, 0x100_0000);
+        put(&mut e, 32, 8, 64);
+        put(&mut e, 54, 2, 56);
+        put(&mut e, 56, 2, 1);
+        put(&mut e, 64, 4, 1);
+        put(&mut e, 64 + 8, 8, 0x100);
+        put(&mut e, 64 + 24, 8, 0x100_0000);
+        put(&mut e, 64 + 32, 8, 8);
+        put(&mut e, 64 + 40, 8, 0x40_0000);
+        e[0x100..0x108].copy_from_slice(b"low src!");
+        assert!(mem.write_bytes(0x20_0000, &e));
+        let k = Kernel::parse(&mem, 0x20_0000, 0x200).unwrap();
+        let entry = load(&mem, &k, (0x20_0000, 0x200), (0, 0), b"", 0xe0000).unwrap();
+        assert_eq!(entry.rip, 0x100_0000);
+        assert_eq!(mem.read::<u64>(0x100_0000), u64::from_le_bytes(*b"low src!"));
+        assert_eq!(mem.read::<u64>(0x13f_fff8), 0, "the rest zeroed");
+        let m = MAPPED[0].load(Ordering::SeqCst);
+        assert_eq!(m & (0b11 << 8), 0b11 << 8, "blocks 8 and 9 mapped as written");
+        assert!(MAPS.load(Ordering::SeqCst) >= 2);
     }
 
     #[test]

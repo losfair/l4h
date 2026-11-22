@@ -156,15 +156,22 @@ impl Vm {
         io.eoi(vector, &mut |m| self.deliver(&m));
     }
 
-    /// The UART's interrupt line, after its state or input changed (a vCPU
-    /// thread).
+    /// The UART's interrupt line, after its input changed (a vCPU thread).
     pub fn sync_uart(&self) {
+        self.uart(|_, _| ());
+    }
+
+    /// Use the UART (a vCPU thread), and set its interrupt line as its
+    /// state is then: under its lock, so that lines follow states in
+    /// order (the lock order is the UART's, then the I/O APIC's; the I/O
+    /// thread takes neither).
+    pub fn uart<R>(&self, f: impl FnOnce(&mut Uart, &mut crate::console::Input) -> R) -> R {
+        let mut u = self.uart.lock();
         self.uart_stale.store(false, Ordering::SeqCst);
-        let level = {
-            let mut u = self.uart.lock();
-            u.irq(&mut crate::console::Input)
-        };
+        let r = f(&mut u, &mut crate::console::Input);
+        let level = u.irq(&mut crate::console::Input);
         self.set_line(crate::dev::uart::IRQ, level);
+        r
     }
 
     /// What the I/O thread left for a vCPU (vCPU 0).

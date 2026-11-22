@@ -153,11 +153,12 @@ pub fn cpuid(leaf: u32, sub: u32, ctx: &Ctx, host: &impl Fn(u32, u32) -> [u32; 4
                 _ => [0; 4],
             }
         }
-        // TSC and crystal: the crystal (the APIC timer's clock) at 1 GHz,
-        // the TSC at tsc_hz, to the kHz.
+        // TSC and crystal: the crystal (the APIC timer's clock) at
+        // CRYSTAL_HZ, the TSC at tsc_hz as a ratio Linux computes in 32
+        // bits (tsc_ratio).
         0x15 => {
-            let khz = (ctx.tsc_hz / 1000).min(u32::MAX as u64) as u32;
-            [1_000_000, khz, 1_000_000_000, 0]
+            let (den, num) = tsc_ratio(ctx.tsc_hz / 1000, CRYSTAL_HZ / 1000);
+            [den, num, CRYSTAL_HZ as u32, 0]
         }
         0x16 => {
             let mhz = (ctx.tsc_hz / 1_000_000).min(0xffff) as u32;
@@ -185,13 +186,50 @@ pub fn cpuid(leaf: u32, sub: u32, ctx: &Ctx, host: &impl Fn(u32, u32) -> [u32; 4
         0x8000_0007 => [0, 0, 0, bit(8)],
         0x8000_0008 => {
             let [a, b, _, _] = host(0x8000_0008, 0);
-            // Address sizes; of EBX's features CLZERO and XSAVEERPTR (no
-            // speculation controls); a core per vCPU.
+            // Address sizes: virtual 48 bits at most (no LA57), physical
+            // below 2^47 (seL4's EPT); of EBX's features CLZERO and
+            // XSAVEERPTR (no speculation controls); a core per vCPU.
+            let (phys, virt) = ((a & 0xff).min(MAX_PHYS_BITS), ((a >> 8) & 0xff).min(48));
             let ecx = if amd { (ctx.vcpus.max(1) - 1) & 0xff | (log2 << 12) } else { 0 };
-            [a & 0xffff, b & (bit(0) | bit(2)), ecx, 0]
+            [phys | virt << 8, b & (bit(0) | bit(2)), ecx, 0]
         }
-        _ => host(leaf, sub),
+        // The legacy cache descriptors; any other leaf (SGX, PT, RDT, AMX,
+        // key locker, hybrid, LBR, ...) is none.
+        2 => host(2, 0),
+        _ => [0; 4],
     }
+}
+
+/// The crystal clock CPUID 0x15 gives, which the local APIC timer runs at
+/// (dev/lapic.rs): 25 MHz, as many Intel parts have.
+pub const CRYSTAL_HZ: u64 = 25_000_000;
+/// Guest-physical addresses are below 2^47 (seL4's 4-level EPT).
+pub const MAX_PHYS_BITS: u32 = 47;
+
+const fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
+/// CPUID 0x15's (denominator, numerator) for a TSC of `tsc_khz` and a
+/// crystal of `crystal_khz`: Linux takes the TSC as `crystal_khz *
+/// numerator / denominator` in 32-bit arithmetic (tsc.c,
+/// native_calibrate_tsc()), which must not overflow; as exact as fits.
+pub fn tsc_ratio(tsc_khz: u64, crystal_khz: u64) -> (u32, u32) {
+    if tsc_khz == 0 || crystal_khz == 0 {
+        return (0, 0);
+    }
+    let g = gcd(tsc_khz, crystal_khz);
+    let (num, den) = (tsc_khz / g, crystal_khz / g);
+    let max_num = u32::MAX as u64 / crystal_khz;
+    if num <= max_num && den <= u32::MAX as u64 {
+        return (den as u32, num as u32);
+    }
+    let den = ((max_num * crystal_khz) / tsc_khz).max(1);
+    let num = ((tsc_khz * den + crystal_khz / 2) / crystal_khz).min(max_num);
+    (den as u32, num as u32)
 }
 
 #[cfg(test)]
@@ -238,10 +276,44 @@ mod tests {
         assert_eq!(cpuid(0xa, 0, &CTX, &host), [0; 4]);
     }
 
+    /// Linux's TSC from leaf 0x15, as it computes it (u32), for TSCs
+    /// whole and not, to over 10 GHz: no overflow, within 0.01%.
+    #[test]
+    fn tsc_ratio_fits_linux_arithmetic() {
+        for hz in [2_100_000_000u64, 3_600_000_000, 5_000_000_000, 2_100_345_678, 5_333_333_333, 1_000_000, 11_111_111_111,
+            25_000_000, 1_799_999_999, 4_294_967_295_000]
+        {
+            let [den, num, crystal, _] = cpuid(0x15, 0, &Ctx { tsc_hz: hz, ..CTX }, &host);
+            let crystal_khz = crystal / 1000;
+            let linux = crystal_khz.checked_mul(num).expect("no overflow") / den;
+            let khz = hz / 1000;
+            let err = (linux as i64 - khz as i64).unsigned_abs();
+            assert!(err * 10_000 <= khz, "{hz} Hz: Linux sees {linux} kHz, err {err}");
+        }
+        assert_eq!(tsc_ratio(2_100_000, 25_000), (1, 84));
+        assert_eq!(tsc_ratio(0, 25_000), (0, 0));
+    }
+
+    #[test]
+    fn address_sizes_and_unknown_leaves() {
+        // A host with LA57 and 52-bit physical addresses.
+        let big = |leaf: u32, sub: u32| if leaf == 0x8000_0008 { [52 | 57 << 8, 0, 0, 0] } else { host(leaf, sub) };
+        let a = cpuid(0x8000_0008, 0, &CTX, &big)[0];
+        assert_eq!((a & 0xff, (a >> 8) & 0xff), (47, 48));
+        let small = |leaf: u32, sub: u32| if leaf == 0x8000_0008 { [39 | 48 << 8, 0, 0, 0] } else { host(leaf, sub) };
+        let a = cpuid(0x8000_0008, 0, &CTX, &small)[0];
+        assert_eq!((a & 0xff, (a >> 8) & 0xff), (39, 48), "smaller ones kept");
+        for leaf in [3, 8, 9, 0xc, 0xe, 0xf, 0x10, 0x12, 0x14, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x20] {
+            assert_eq!(cpuid(leaf, 0, &CTX, &host), [0; 4], "leaf {leaf:#x}");
+        }
+        assert_eq!(cpuid(2, 0, &CTX, &host), host(2, 0));
+    }
+
     #[test]
     fn tsc_topology_xsave() {
         let [a, b, c, _] = cpuid(0x15, 0, &CTX, &host);
-        assert_eq!(c as u64 * b as u64 / a as u64, 2_100_000_000);
+        assert_eq!(c as u64, CRYSTAL_HZ);
+        assert_eq!((c / 1000).checked_mul(b).map(|x| x / a), Some(2_100_000), "Linux's 32-bit arithmetic");
         assert_eq!(cpuid(0x16, 0, &CTX, &host)[0], 2100);
         assert_eq!(cpuid(0xb, 0, &CTX, &host), [0, 1, 0x100, 2]);
         assert_eq!(cpuid(0xb, 1, &CTX, &host), [2, 4, 0x201, 2]);

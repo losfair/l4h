@@ -10,7 +10,23 @@ use l4h_rt::host::hvm as hv;
 use l4h_rt::{cap, sel4};
 use sel4::{CapRights, ObjectBlueprint, VmAttributes, cap_type};
 
-use crate::vm::vm;
+use crate::guest::GuestMem;
+use crate::sync::Global;
+
+/// What mapping needs, from before the machine (crate::vm) exists: the
+/// kernel's loading maps blocks too.
+struct Ctx {
+    mem: GuestMem,
+    radix: usize,
+    guest: u32,
+}
+
+static CTX: Global<Ctx> = Global::new();
+
+/// Set up mapping (once, on the I/O thread, before anything is loaded).
+pub fn init(mem: GuestMem, block_radix: u32, guest: u32) {
+    CTX.set(Ctx { mem, radix: block_radix as usize, guest });
+}
 
 const LARGE_PAGE: ObjectBlueprint = ObjectBlueprint::Arch(sel4::ObjectBlueprintX86::LargePage);
 
@@ -19,15 +35,14 @@ fn slot(c: u64) -> sel4::AbsoluteCPtr {
 }
 
 fn keep(cnode: u64, b: usize) -> sel4::AbsoluteCPtr {
-    let radix = vm().cfg.block_radix as usize;
-    cap::<cap_type::CNode>(cnode).absolute_cptr_from_bits_with_depth(b as u64, radix)
+    cap::<cap_type::CNode>(cnode).absolute_cptr_from_bits_with_depth(b as u64, CTX.get().radix)
 }
 
 /// Map block `b` if it is not yet (the I/O thread): false if it cannot be,
 /// which ends the guest.
 pub fn map_block(b: usize) -> bool {
-    let vm = vm();
-    let mem = &vm.mem;
+    let ctx = CTX.get();
+    let mem = &ctx.mem;
     if mem.is_mapped(b) {
         return true;
     }
@@ -59,7 +74,7 @@ pub fn map_block(b: usize) -> bool {
             true
         }
         Err(e) => {
-            l4h_rt::log!("l4h-hvm: guest {}: RAM block {} at {:#x}: {:?}", vm.cfg.guest_id, b, gpa, e);
+            l4h_rt::log!("l4h-hvm: guest {}: RAM block {} at {:#x}: {:?}", ctx.guest, b, gpa, e);
             false
         }
     }

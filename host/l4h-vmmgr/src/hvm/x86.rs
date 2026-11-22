@@ -411,6 +411,17 @@ pub fn start_bytes(g: &Guest) -> usize {
         + (g.vcpus.len() + g.devices.len() * 16 + host::CONSOLE_RING_PAGES + 1) * 2 * PAGE
 }
 
+/// vmmgr slots spawning l4h-hvm takes at most: one for each object it
+/// makes in the guest's arena (frames of the image, the stacks, TLS and
+/// IPC buffers; page tables), none smaller than a page but for the
+/// component's own few (TCB, SC, CNode, notification, endpoint, info and
+/// IPC pages), and the temporary ones (fault endpoint, scratch frame).
+/// The copies it maps (I/O pool, shared pages, RAM blocks) go to the keep
+/// CNodes made at creation, not to vmmgr's slots.
+pub fn start_slots(g: &Guest) -> usize {
+    start_bytes(g) / PAGE + 64
+}
+
 /// l4h-hvm's configuration under construction.
 static CONFIG: Scratch<core::mem::MaybeUninit<hv::HvmConfig>> = Scratch::new(core::mem::MaybeUninit::zeroed());
 

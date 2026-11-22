@@ -672,7 +672,7 @@ impl Guest {
     /// allocations panic: the caller reserves DEVICE_BYTES first.
     pub fn add_device(&mut self, alloc: &mut Alloc, kind: DevKind) -> Option<usize> {
         let d = self.devices.len();
-        if d >= MAX_GUEST_DEVICES || self.state != State::Created {
+        if d >= self.max_devices() || self.state != State::Created {
             return None;
         }
         if self.hvm.is_some() {
@@ -686,6 +686,12 @@ impl Guest {
             _ => Kick::Device,
         };
         self.add_device_with(alloc, kind, page, kick)
+    }
+
+    /// The devices it can have, its console included: an HVM guest's are
+    /// PCI functions of one bus (console and l4h_host::hvm::MAX_DEVICES).
+    pub fn max_devices(&self) -> usize {
+        if self.hvm.is_some() { l4h_host::hvm::MAX_DEVICES + 1 } else { MAX_GUEST_DEVICES }
     }
 
     /// Add a device with shared page `page`, which the guest kicks with

@@ -278,9 +278,10 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
                         return Err(EBUSY);
                     }
                     // Its l4h-hvm, reserved before anything is filled, so
-                    // that nothing after boot can be refused.
+                    // that nothing after boot can be refused: its memory
+                    // and the slots of its objects.
                     let bytes = g.start_bytes();
-                    if !h.can_afford(bytes, 1, 64) || !g.reserve(&mut h.alloc, bytes) {
+                    if !h.can_afford(bytes, 1, crate::hvm::start_slots(g)) || !g.reserve(&mut h.alloc, bytes) {
                         return Err(ENOMEM);
                     }
                     crate::hvm::boot(g, &mut h.alloc, (a[3], a[4]), (a[1], a[2]), a[5], cmdline)?;

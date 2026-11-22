@@ -51,6 +51,7 @@ struct Guest {
     events: Vec<Event>,
     long: Option<Entry>,
     real: Option<u8>,
+    cr2: u64,
 }
 
 impl Hw for Guest {
@@ -133,6 +134,9 @@ impl Hw for Guest {
         true
     }
     fn set_tsc_offset(&mut self, _off: u64) {}
+    fn set_cr2(&mut self, v: u64) {
+        self.cr2 = v;
+    }
     fn flush_tlb(&mut self) {}
     fn start_real_mode(&mut self, vector: u8) {
         self.real = Some(vector);
@@ -258,6 +262,11 @@ fn find_cap(c: &mut Vcpu<Guest>, slot: u64, id: u8, cfg_type: Option<u8>) -> u64
 /// vector per queue (entry i: vector `base + i`, to vCPU 0), `queues`
 /// queues of 16 at `rings` + 0x1000 * i.  BAR0's address.
 fn virtio_up(c: &mut Vcpu<Guest>, slot: u64, base: u8, queues: u16, rings: u64) -> u64 {
+    virtio_up_with(c, slot, base, queues, rings, true)
+}
+
+/// virtio_up, with MSI-X (`msix`) or INTx.
+fn virtio_up_with(c: &mut Vcpu<Guest>, slot: u64, base: u8, queues: u16, rings: u64, msix_on: bool) -> u64 {
     let bar0 = cfg_read(c, slot, 0x10, 4) & !0xf | cfg_read(c, slot, 0x14, 4) << 32;
     let bar2 = cfg_read(c, slot, 0x18, 4) & !0xf | cfg_read(c, slot, 0x1c, 4) << 32;
     assert!(bar0 >= hv::PCI_MMIO_BASE && bar2 >= hv::PCI_MMIO_BASE);
@@ -266,8 +275,10 @@ fn virtio_up(c: &mut Vcpu<Guest>, slot: u64, base: u8, queues: u16, rings: u64) 
     let msix = find_cap(c, slot, 0x11, None);
     let table = cfg_read(c, slot, msix + 4, 4);
     assert_eq!(table & 7, 2, "the MSI-X table is in BAR2");
-    cfg_write(c, slot, msix + 2, 2, 1 << 15);
-    for i in 0..queues as u64 + 1 {
+    if msix_on {
+        cfg_write(c, slot, msix + 2, 2, 1 << 15);
+    }
+    for i in 0..if msix_on { queues as u64 + 1 } else { 0 } {
         let e = bar2 + (table & !7) + 16 * i;
         mmio(c, 0, e, 4, Some(LAPIC));
         mmio(c, 0, e + 4, 4, Some(0));
@@ -292,8 +303,10 @@ fn virtio_up(c: &mut Vcpu<Guest>, slot: u64, base: u8, queues: u16, rings: u64) 
         mmio(c, 0, common + 0x16, 2, Some(q));
         assert!(mmio(c, 0, common + 0x18, 2, None) >= 16);
         mmio(c, 0, common + 0x18, 2, Some(16));
-        mmio(c, 0, common + 0x1a, 2, Some(q));
-        assert_eq!(mmio(c, 0, common + 0x1a, 2, None), q, "vector taken");
+        if msix_on {
+            mmio(c, 0, common + 0x1a, 2, Some(q));
+            assert_eq!(mmio(c, 0, common + 0x1a, 2, None), q, "vector taken");
+        }
         let r = rings + 0x1000 * q;
         mmio(c, 0, common + 0x20, 8, Some(r));
         mmio(c, 0, common + 0x28, 8, Some(r + 0x100));
@@ -402,18 +415,32 @@ fn guest_boots_and_uses_the_machine() {
     cfg.low_ram = RAM;
     cfg.boot_blocks = (RAM / (2 * MIB)) as u32;
     cfg.io_pool_gpa = hv::IO_POOL_GPA;
-    cfg.io_pool_size = 8 * MIB;
+    // A small I/O pool (8 pages), which two disks can fill.
+    cfg.io_pool_size = 32 << 10;
     (cfg.kernel_gpa, cfg.kernel_size) = (40 * MIB, kernel.len() as u64);
     (cfg.initrd_gpa, cfg.initrd_size) = (48 * MIB, 6);
     cfg.cmdline[..13].copy_from_slice(b"console=ttyS0");
     // 2026-01-01T00:00:00Z at tick 0.
     cfg.epoch_ns = 1_767_225_600 * 1_000_000_000;
-    cfg.nr_devices = 2;
+    // Slot 1 a disk, 2 a NIC, 3 another disk; 4 to 9 disks whose
+    // attachment failed (9 shares slot 1's INTx GSI).
+    let chan2: &'static mut blk::Channel = leak_zeroed();
+    chan2.capacity_sectors = 2048;
+    chan2.block_size = 512;
+    chan2.seg_max = 16;
+    chan2.ready = 1;
+    let chan2_ptr = chan2 as *mut blk::Channel;
+    cfg.nr_devices = 9;
     cfg.devices[0].kind = host::VDEV_BLK;
     cfg.devices[0].chan_va = chan_ptr as u64;
     cfg.devices[1].kind = host::VDEV_NET;
     cfg.devices[1].chan_va = port_ptr as u64;
     cfg.devices[1].mac[..6].copy_from_slice(&[2, 0, 0, 0, 0, 7]);
+    cfg.devices[2].kind = host::VDEV_BLK;
+    cfg.devices[2].chan_va = chan2_ptr as u64;
+    for d in 3..9 {
+        cfg.devices[d].kind = host::VDEV_BLK_UNAVAILABLE;
+    }
     let tsc_hz = 1_000_000_000;
     crate::vm::build(cfg, tsc_hz, mem, true, 7).expect("the machine");
     crate::io::init();
@@ -464,13 +491,13 @@ fn guest_boots_and_uses_the_machine() {
 
     // ---- PCI: the host bridge and the devices by 0xcf8/0xcfc, then ECAM.
     let mut ids = vec![];
-    for slot in 0..4u32 {
+    for slot in [0u32, 1, 2, 3, 9, 10] {
         pio(&mut c0, 0, 0xcf8, 4, Some(0x8000_0000 | slot << 11));
         ids.push(pio(&mut c0, 0, 0xcfc, 4, None));
     }
-    assert_eq!(ids, [0x0008_1b36, 0x1042_1af4, 0x1041_1af4, 0xffff_ffff]);
+    assert_eq!(ids, [0x0008_1b36, 0x1042_1af4, 0x1041_1af4, 0x1042_1af4, 0x1042_1af4, 0xffff_ffff]);
     assert_eq!(cfg_read(&mut c0, 1, 0, 4), 0x1042_1af4);
-    assert_eq!(cfg_read(&mut c0, 3, 0, 2), 0xffff, "an empty slot");
+    assert_eq!(cfg_read(&mut c0, 10, 0, 2), 0xffff, "an empty slot");
 
     // ---- virtio-blk: a write of 1 KiB at sector 4, read back.
     let rings = 0x10_0000;
@@ -506,6 +533,107 @@ fn guest_boots_and_uses_the_machine() {
     assert!(back.iter().all(|&b| b == 0xa5), "read back");
     assert_eq!(next_interrupt(&mut c0), Some(Event::Ext(0x40)));
     eoi(&mut c0);
+
+    // ---- The guest moves the disk's BAR0: notifications follow it, by
+    // the fast path and through the I/O thread.
+    let moved = hv::PCI_MMIO_BASE + 0x80_0000;
+    cfg_write(&mut c0, 1, 0x10, 4, moved);
+    assert_eq!(cfg_read(&mut c0, 1, 0x10, 4) & !0xf, moved);
+    mem.write::<u32>(0x30_0000, 1);
+    desc(mem, rings, 1, 0x31_0000, 512, 1, 2);
+    post(mem, rings, 0, 3);
+    notify(&mut c0, 1, moved, 0);
+    as_thread(None, crate::io::kicked);
+    assert_eq!(blkd(chan_ptr_mut(chan_ptr), &mut disk), 1, "a notification at the moved BAR0");
+    as_thread(None, crate::io::completed);
+    assert_eq!(mem.read::<u16>(rings + 0x200 + 2), 3);
+    assert_eq!(next_interrupt(&mut c0), Some(Event::Ext(0x40)));
+    eoi(&mut c0);
+    post(mem, rings, 0, 4);
+    as_thread(None, || crate::io::access(hv::SPACE_MMIO, moved + crate::dev::virtio_pci::NOTIFY, 2, true, 0));
+    assert_eq!(blkd(chan_ptr_mut(chan_ptr), &mut disk), 1, "a notification the I/O thread was given");
+    as_thread(None, crate::io::completed);
+    assert_eq!(mem.read::<u16>(rings + 0x200 + 2), 4);
+    assert_eq!(next_interrupt(&mut c0), Some(Event::Ext(0x40)));
+    eoi(&mut c0);
+
+    // ---- Two disks share the I/O pool: disk 3 fills it, disk 1's request
+    // waits; once disk 3's are done, disk 1's goes, with no further kick.
+    let rings3 = 0x18_0000;
+    let bar3 = virtio_up(&mut c0, 3, 0x48, 1, rings3);
+    for (i, head) in [0u64, 6].into_iter().enumerate() {
+        let hdr = 0x34_0000 + 0x100 * i as u64;
+        mem.write::<u32>(hdr, 1);
+        mem.write::<u64>(hdr + 8, 64 * i as u64);
+        desc(mem, rings3, head, hdr, 16, 1, head as u16 + 1);
+        for k in 0..4 {
+            desc(mem, rings3, head + 1 + k, 0x40_0000 + 0x1_0000 * i as u64 + 0x1000 * k, 4096, 1, (head + 2 + k) as u16);
+        }
+        desc(mem, rings3, head + 5, hdr + 0x80, 1, 2, 0);
+        post(mem, rings3, head as u16, i as u16 + 1);
+    }
+    notify(&mut c0, 3, bar3, 0);
+    as_thread(None, crate::io::kicked);
+    let chan2 = chan_ptr_mut(chan2_ptr);
+    assert_eq!(chan2.sq.head.load(Ordering::Acquire), 2, "disk 3's two requests (8 pages) went");
+    mem.write::<u32>(0x30_0000, 1);
+    desc(mem, rings, 0, 0x30_0000, 16, 1, 1);
+    desc(mem, rings, 1, 0x31_0000, 4096, 1, 2);
+    desc(mem, rings, 2, 0x30_0100, 1, 2, 0);
+    post(mem, rings, 0, 5);
+    notify(&mut c0, 1, moved, 0);
+    let sq1 = chan_ptr_mut(chan_ptr).sq.head.load(Ordering::Acquire);
+    as_thread(None, crate::io::kicked);
+    assert_eq!(chan_ptr_mut(chan_ptr).sq.head.load(Ordering::Acquire), sq1, "disk 1 waits for pages");
+    let mut disk3 = vec![0u8; 2048 * 512];
+    assert_eq!(blkd(chan2, &mut disk3), 2);
+    as_thread(None, crate::io::completed);
+    assert_eq!(chan_ptr_mut(chan_ptr).sq.head.load(Ordering::Acquire), sq1 + 1, "disk 1's request went once pages were free");
+    assert_eq!(blkd(chan_ptr_mut(chan_ptr), &mut disk), 1);
+    as_thread(None, crate::io::completed);
+    assert_eq!(mem.read::<u16>(rings + 0x200 + 2), 5);
+    assert_eq!(mem.read::<u16>(rings3 + 0x200 + 2), 2);
+    for _ in 0..2 {
+        assert!(matches!(next_interrupt(&mut c0), Some(Event::Ext(0x40 | 0x48))));
+        eoi(&mut c0);
+    }
+    assert_eq!(next_interrupt(&mut c0), None);
+
+    // ---- Shared INTx: disk 1 (MSI-X off now) and disk 9, both on GSI 17
+    // (I/O APIC pin 17, vector 0x61, level): one's ISR read leaves the
+    // line up while the other asserts it; either order.
+    let msix1 = find_cap(&mut c0, 1, 0x11, None);
+    cfg_write(&mut c0, 1, msix1 + 2, 2, 0);
+    let bar9 = virtio_up_with(&mut c0, 9, 0, 1, 0x1c_0000, false);
+    mmio(&mut c0, 0, 0xfec0_0000, 4, Some(0x10 + 2 * 17));
+    mmio(&mut c0, 0, 0xfec0_0010, 4, Some(0x61 | 1 << 15));
+    mmio(&mut c0, 0, 0xfec0_0000, 4, Some(0x11 + 2 * 17));
+    mmio(&mut c0, 0, 0xfec0_0010, 4, Some(0));
+    let mut idx = (5u16, 0u16);
+    for order in [[1u64, 9], [9, 1]] {
+        // Both assert: disk 9 at once (its attachment failed), disk 1 at
+        // its completion.
+        idx.1 += 1;
+        mem.write::<u32>(0x1d_0000, 0);
+        desc(mem, 0x1c_0000, 0, 0x1d_0000, 16, 1, 1);
+        desc(mem, 0x1c_0000, 1, 0x1d_0100, 1, 2, 0);
+        post(mem, 0x1c_0000, 0, idx.1);
+        notify(&mut c0, 9, bar9, 0);
+        idx.0 += 1;
+        post(mem, rings, 0, idx.0);
+        notify(&mut c0, 1, moved, 0);
+        as_thread(None, crate::io::kicked);
+        blkd(chan_ptr_mut(chan_ptr), &mut disk);
+        as_thread(None, crate::io::completed);
+        assert_eq!(next_interrupt(&mut c0), Some(Event::Ext(0x61)));
+        let bar = |s: u64| if s == 1 { moved } else { bar9 };
+        assert_eq!(mmio(&mut c0, 0, bar(order[0]) + 0x2000, 1, None), 1, "ISR of {}", order[0]);
+        eoi(&mut c0);
+        assert_eq!(next_interrupt(&mut c0), Some(Event::Ext(0x61)), "slot {} still asserts", order[1]);
+        assert_eq!(mmio(&mut c0, 0, bar(order[1]) + 0x2000, 1, None), 1);
+        eoi(&mut c0);
+        assert_eq!(next_interrupt(&mut c0), None, "both acknowledged");
+    }
 
     // ---- virtio-net: a frame out, a frame in.
     let rings = 0x40_0000;
@@ -555,6 +683,32 @@ fn guest_boots_and_uses_the_machine() {
     assert_eq!(c1.hw().real, Some(0x9a));
     assert_eq!(c1.state(), (false, true), "running, then halted");
 
+    // ---- vCPU 1 runs (in long mode, its timer armed), has an interrupt
+    // pending; INIT and SIPI again: none of that survives.
+    c1.hw().start_long_mode(&e);
+    c1.hw().rflags |= IF;
+    // Out of HLT by an NMI.
+    mmio(&mut c0, 0, LAPIC + 0x310, 4, Some(1 << 24));
+    mmio(&mut c0, 0, LAPIC + 0x300, 4, Some(0x4400));
+    mmio(&mut c1, 1, LAPIC + 0xf0, 4, Some(0x1ff));
+    assert_eq!(c1.hw().events.last(), Some(&Event::Nmi));
+    mmio(&mut c1, 1, LAPIC + 0x320, 4, Some(0x40));
+    mmio(&mut c1, 1, LAPIC + 0x380, 4, Some(1_000_000));
+    assert_ne!(sys::VCPU_TIMERS[1].load(Ordering::SeqCst), 0, "vCPU 1's timer armed");
+    mmio(&mut c0, 0, LAPIC + 0x310, 4, Some(1 << 24));
+    mmio(&mut c0, 0, LAPIC + 0x300, 4, Some(0x4000 | 0x77));
+    assert_ne!(vm().apics[1].irr[1].load(Ordering::SeqCst) & 1 << (0x77 - 64), 0);
+    mmio(&mut c0, 0, LAPIC + 0x300, 4, Some(0x4500));
+    mmio(&mut c0, 0, LAPIC + 0x300, 4, Some(0x4600 | 0x9b));
+    c1.hw().len = 1;
+    c1.hw().exits.push_back(Exit::Hlt);
+    let seen = c1.hw().events.len();
+    turn(&mut c1, 1);
+    assert_eq!(c1.hw().real, Some(0x9b));
+    assert_eq!(sys::VCPU_TIMERS[1].load(Ordering::SeqCst), 0, "its timer stopped");
+    assert!(vm().apics[1].irr.iter().all(|w| w.load(Ordering::SeqCst) == 0), "the old request is gone");
+    assert!(!c1.hw().events[seen..].contains(&Event::Ext(0x77)));
+
     // ---- The UART: output into the console ring, input from the page.
     for &b in b"hi\n" {
         pio(&mut c0, 0, 0x3f8, 1, Some(b as u32));
@@ -573,6 +727,114 @@ fn guest_boots_and_uses_the_machine() {
     assert_eq!(pio(&mut c0, 0, 0x3fd, 1, None) & 1, 1, "data ready");
     assert_eq!(pio(&mut c0, 0, 0x3f8, 1, None), b'x' as u32);
     assert_eq!(pio(&mut c0, 0, 0x3fd, 1, None) & 1, 0);
+
+    // ---- An instruction whose length the CPU did not give (AMD-V
+    // without next-RIP saving): decoded, RIP moved once.
+    assert!(mem.write_bytes(CODE, &[0x0f, 0xa2]));
+    let h = c0.hw();
+    (h.rip, h.g[0], h.g[1], h.len) = (CODE, 0, 0, 0);
+    h.exits.push_back(Exit::Cpuid);
+    turn(&mut c0, 0);
+    assert_eq!(c0.hw().rip, CODE + 2);
+    assert_eq!(c0.hw().g[3] as u32, u32::from_le_bytes(*b"Auth"), "CPUID done");
+
+    // ---- String I/O and MMIO through the guest's own page tables: an
+    // element across two pages that are not contiguous, page faults with
+    // CR2, and no port input taken for a fault.
+    const L: u64 = 0x4000_0000;
+    const A: u64 = 0x70_0000;
+    const B: u64 = 0x71_3000;
+    let (pml4, pdpt, pd0, pd1, pt) = (0x60_0000u64, 0x60_1000u64, 0x60_2000u64, 0x60_3000u64, 0x60_4000u64);
+    mem.write::<u64>(pml4, pdpt | 3);
+    mem.write::<u64>(pdpt, pd0 | 3);
+    mem.write::<u64>(pdpt + 8, pd1 | 3);
+    for i in 0..32 {
+        mem.write::<u64>(pd0 + 8 * i, (i << 21) | 0x83);
+    }
+    mem.write::<u64>(pd1, pt | 3);
+    mem.write::<u64>(pt, A | 3);
+    mem.write::<u64>(pt + 8, B | 3);
+    mem.write::<u64>(pt + 16, 0);
+    mem.write::<u64>(pt + 24, 0xfec0_0000 | 3);
+    let boot_cr3 = c0.hw().cr3;
+    c0.hw().cr3 = pml4;
+    // string(port, size, input, rep, count, rdi/rsi, df): one exit.
+    let string = |c: &mut Vcpu<Guest>, port: u16, size: u8, input: bool, count: u64, at: u64, df: bool| {
+        let h = c.hw();
+        let reg = if input { 7 } else { 6 };
+        (h.g[reg], h.g[1], h.len) = (at, count, 2);
+        h.rflags = if df { h.rflags | 1 << 10 } else { h.rflags & !(1 << 10) };
+        h.exits.push_back(Exit::Io { port, size, input, string: true, rep: count != 1, addr: 8 });
+        turn(c, 0);
+    };
+    pio(&mut c0, 0, 0xcf8, 4, Some(0x8000_0800));
+    for df in [false, true] {
+        mem.write_bytes(A + 0xffc, &[0; 4]);
+        mem.write_bytes(B, &[0; 4]);
+        let rip = c0.hw().rip;
+        string(&mut c0, 0xcfc, 4, true, 1, L + 0xffe, df);
+        assert_eq!(c0.hw().rip, rip + 2, "INSD done");
+        let (mut lo, mut hi) = ([0u8; 2], [0u8; 2]);
+        mem.read_bytes(A + 0xffe, &mut lo);
+        mem.read_bytes(B, &mut hi);
+        assert_eq!([lo, hi].concat(), 0x1042_1af4u32.to_le_bytes(), "INSD across two pages (DF {df})");
+        assert_eq!(c0.hw().g[7], if df { L + 0xffe - 4 } else { L + 0xffe + 4 });
+    }
+    // OUTSD of the same element to 0xcf8: read back.
+    mem.write_bytes(A + 0xffe, &[0x08, 0x10]);
+    mem.write_bytes(B, &[0x00, 0x80]);
+    string(&mut c0, 0xcf8, 4, false, 1, L + 0xffe, false);
+    assert_eq!(pio(&mut c0, 0, 0xcf8, 4, None), 0x8000_1008, "OUTSD across two pages");
+    // INSW from the UART across into a page that is not there: #PF (a
+    // write, not present) with CR2 at that page, the byte still unread.
+    unsafe {
+        (*page).input[1] = b'z';
+        (*page).in_head = 2;
+    }
+    as_thread(None, crate::io::control);
+    assert_eq!(pio(&mut c0, 0, 0x3fd, 1, None) & 1, 1);
+    let rip = c0.hw().rip;
+    string(&mut c0, 0x3f8, 2, true, 1, L + 0x1fff, false);
+    assert_eq!(c0.hw().rip, rip, "faulted, not done");
+    assert_eq!(next_interrupt(&mut c0), Some(Event::Exc(14, Some(2))));
+    assert_eq!(c0.hw().cr2, L + 0x2000);
+    assert_eq!(pio(&mut c0, 0, 0x3fd, 1, None) & 1, 1, "no input taken");
+    assert_eq!(pio(&mut c0, 0, 0x3f8, 1, None), b'z' as u32);
+    // MOVSD between RAM across two pages and the I/O APIC's IOREGSEL.
+    let movs = |c: &mut Vcpu<Guest>, rsi: u64, rdi: u64, gpa: u64, write: bool| {
+        assert!(vm().mem.write_bytes(CODE, &[0xa5]));
+        let h = c.hw();
+        (h.rip, h.g[6], h.g[7], h.len) = (CODE, rsi, rdi, 0);
+        h.rflags &= !(1 << 10);
+        h.exits.push_back(Exit::Mmio { gpa, write });
+        turn(c, 0);
+    };
+    mem.write_bytes(A + 0xffe, &[0x34, 0x00]);
+    mem.write_bytes(B, &[0x00, 0x00]);
+    movs(&mut c0, L + 0xffe, L + 0x3000, 0xfec0_0000, true);
+    assert_eq!(c0.hw().rip, CODE + 1);
+    c0.hw().cr3 = boot_cr3;
+    assert_eq!(mmio(&mut c0, 0, 0xfec0_0000, 4, None), 0x34, "MOVSD from two pages to MMIO");
+    c0.hw().cr3 = pml4;
+    movs(&mut c0, L + 0x3000, L + 0xffe, 0xfec0_0000, false);
+    let (mut lo, mut hi) = ([0u8; 2], [0u8; 2]);
+    mem.read_bytes(A + 0xffe, &mut lo);
+    mem.read_bytes(B, &mut hi);
+    assert_eq!([lo, hi].concat(), 0x34u32.to_le_bytes(), "MOVSD from MMIO to two pages");
+    // REP STOSD downwards to IOREGSEL: the first element, then the next
+    // below it, on the page that is not there: #PF there, one left.
+    assert!(mem.write_bytes(CODE, &[0xf3, 0xab]));
+    let h = c0.hw();
+    (h.rip, h.g[0], h.g[7], h.g[1], h.len) = (CODE, 0x21, L + 0x3000, 2, 0);
+    h.rflags |= 1 << 10;
+    h.exits.push_back(Exit::Mmio { gpa: 0xfec0_0000, write: true });
+    turn(&mut c0, 0);
+    assert_eq!((c0.hw().rip, c0.hw().g[1], c0.hw().g[7]), (CODE, 1, L + 0x3000 - 4), "one done");
+    assert_eq!(next_interrupt(&mut c0), Some(Event::Exc(14, Some(2))));
+    assert_eq!(c0.hw().cr2, L + 0x3000 - 4);
+    c0.hw().rflags &= !(1 << 10);
+    c0.hw().cr3 = boot_cr3;
+    assert_eq!(mmio(&mut c0, 0, 0xfec0_0000, 4, None), 0x21, "STOSD's first element");
 
     // ---- ACPI: the power button (l4hctl shutdown) as an SCI, then S5.
     mmio(&mut c0, 0, 0xfec0_0000, 4, Some(0x10 + 2 * 9));

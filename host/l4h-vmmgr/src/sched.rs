@@ -340,8 +340,11 @@ pub fn balance(h: &mut Vmmgr, elapsed_us: u64) {
             tcb.tcb_set_priority(crate::slot::TCB.cap(), l4h_host::PRIO_VMM)
         } else {
             // Lower authority first: every copy of its own TCB refers to
-            // this MCP, so the VMM cannot undo the priority reduction.
-            tcb.tcb_set_mc_priority(crate::slot::TCB.cap(), l4h_host::PRIO_VMM_FAIR)
+            // this MCP, so the VMM cannot undo the priority reduction.  An
+            // HVM guest's l4h-hvm keeps the lower MCP it has (hvm::MCP,
+            // below the debug syscalls'): never raised.
+            let mcp = if g.hvm.is_some() { l4h_host::hvm::MCP } else { l4h_host::PRIO_VMM_FAIR };
+            tcb.tcb_set_mc_priority(crate::slot::TCB.cap(), mcp)
                 .and_then(|_| tcb.tcb_set_priority(crate::slot::TCB.cap(), l4h_host::PRIO_VMM_FAIR))
         };
         if let Err(e) = r {

@@ -9,7 +9,7 @@
 
 use l4h_rt::sel4;
 
-use super::{Event, Exit, Gprs, Hw, SEL4_ORDER, mr, vmenter, write_gprs};
+use super::{Event, Exit, Gprs, Hw, SEL4_ORDER, exits, mr, vmenter, write_gprs};
 use crate::x86::decode::{Mode, Seg};
 use crate::x86::walk::{self, Paging};
 
@@ -65,6 +65,7 @@ const V_IGN_TPR: u64 = 1 << 20;
 const EVT_VALID: u64 = 1 << 31;
 const EVT_ERROR: u64 = 1 << 11;
 const IF: u64 = 1 << 9;
+const DR6_BS: u64 = 1 << 14;
 
 const MSR_FS_BASE: u32 = crate::x86::msr::FS_BASE;
 const MSR_GS_BASE: u32 = crate::x86::msr::GS_BASE;
@@ -86,6 +87,11 @@ pub struct Svm {
     nmi_masked: bool,
     iret_rip: Option<u64>,
     tpr: u8,
+    /// The event this entry injected, as it was asked for (MR2 keeps only
+    /// its low 32 bits: no error code).
+    injected: Option<Event>,
+    /// Single-stepping for an NMI window.
+    step: exits::NmiStep,
     /// INT_CTL as we last wrote it (the CPU does not change it under us:
     /// a VINTR exit comes before the virtual interrupt is taken).
     int_ctl: u64,
@@ -111,6 +117,7 @@ impl Svm {
         let mut s = Svm {
             vcpu, gp: [0; 16], gp_dirty: true, rip: 0, rflags: 2, int_state: 0, len: 0, pending: None,
             vmcb: [0; CHUNKS * CHUNK], valid: [false; CHUNKS], nmi_masked: false, iret_rip: None, tpr: 0, int_ctl: 0,
+            injected: None, step: exits::NmiStep::default(),
         };
         s.int_ctl = s.rd(INT_CTL);
         s.wr(INTERCEPT_MISC2, I2_VMMCALL | I2_RDTSCP);
@@ -146,20 +153,6 @@ impl Svm {
         self.wr(at + 8, base);
     }
 
-    fn event(info: u64) -> Option<Event> {
-        if info & EVT_VALID == 0 {
-            return None;
-        }
-        let v = info as u8;
-        match (info >> 8) & 7 {
-            0 => Some(Event::Ext(v)),
-            2 => Some(Event::Nmi),
-            // INT3 and INTO run again from their instruction, as INTn.
-            3 if v != 3 && v != 4 => Some(Event::Exc(v, (info & EVT_ERROR != 0).then_some((info >> 32) as u32))),
-            _ => None,
-        }
-    }
-
     fn reset_common(&mut self) {
         self.wr(DR7, 0x400);
         self.wr(DR6, 0xffff_0ff0);
@@ -181,7 +174,7 @@ impl Svm {
 }
 
 impl Hw for Svm {
-    fn enter(&mut self, ev: Option<Event>, irq_window: bool, _nmi_window: bool) -> Exit {
+    fn enter(&mut self, ev: Option<Event>, irq_window: bool, nmi_window: bool) -> Exit {
         if self.gp_dirty {
             write_gprs(self.vcpu, &self.gp);
             self.gp_dirty = false;
@@ -214,6 +207,11 @@ impl Hw for Svm {
         if self.nmi_masked && self.iret_rip.is_none() {
             misc1 |= I1_IRET;
         }
+        // The NMI window (exits::NmiStep).
+        if let Some(r) = self.step.arm(nmi_window, ev.is_some(), self.nmi_masked, self.iret_rip.is_some(), self.int_state & 1 != 0, self.rflags) {
+            self.wr(RFLAGS, r);
+        }
+        self.injected = ev;
         let (fault, badge) = vmenter(self.rip, misc1, evt);
         self.valid = [false; CHUNKS];
         self.rip = mr(0);
@@ -224,7 +222,14 @@ impl Hw for Svm {
             self.gp[x] = mr(10 + i);
         }
         let (idt, idt_err) = (mr(27), mr(28));
-        self.pending = if left & EVT_VALID != 0 { Self::event(left) } else { Self::event(idt | idt_err << 32) };
+        // Not delivered: again as it was asked for; being delivered: as
+        // EXITINTINFO and its error code have it.
+        self.pending = exits::svm_requeue(left, self.injected.take(), idt, idt_err);
+        let (rflags, own_step) = self.step.done(self.rflags);
+        if rflags != self.rflags {
+            self.rflags = rflags;
+            self.wr(RFLAGS, rflags);
+        }
         if self.pending == Some(Event::Nmi) {
             self.nmi_masked = false;
         }
@@ -240,44 +245,22 @@ impl Hw for Svm {
             return Exit::Notified(badge);
         }
         let (code, info1, info2) = (mr(3), mr(4), mr(6));
-        self.len = mr(5);
-        let reg = |info1: u64| (info1 & (1 << 63) != 0).then_some((info1 & 15) as u8);
-        match code {
-            0x00..=0x0f => Exit::Cr { cr: code as u8, write: false, reg: reg(info1) },
-            0x10..=0x1f => Exit::Cr { cr: (code - 0x10) as u8, write: true, reg: reg(info1) },
-            0x20..=0x2f => Exit::Dr { dr: (code - 0x20) as u8, write: false, reg: reg(info1) },
-            0x30..=0x3f => Exit::Dr { dr: (code - 0x30) as u8, write: true, reg: reg(info1) },
-            0x40..=0x5f => {
-                let vector = (code - 0x40) as u8;
-                let dr6 = if vector == 1 { self.rd(DR6) } else { 0 };
-                let error = matches!(vector, 8 | 10..=14 | 17 | 21 | 29 | 30).then_some(info1 as u32);
-                Exit::Exception { vector, error, dr6 }
+        // Without next-RIP saving the CPU gives no length: an I/O exit
+        // has the next RIP in EXITINFO2; vcpu.rs decodes the others.
+        self.len = exits::svm_len(code, mr(5), info2, self.rip);
+        match exits::svm_exit(code, info1, info2, own_step) {
+            Exit::NmiWindow => {
+                // Our single step's #DB: DR6.BS taken back.
+                let dr6 = self.rd(DR6);
+                self.wr(DR6, dr6 & !DR6_BS);
+                Exit::NmiWindow
             }
-            0x60..=0x63 => Exit::Nop,
-            0x64 => Exit::IrqWindow,
-            0x72 => Exit::Cpuid,
-            0x74 => {
+            Exit::Exception { vector: 1, error, .. } => Exit::Exception { vector: 1, error, dr6: self.rd(DR6) },
+            Exit::Iret => {
                 self.iret_rip = Some(self.rip);
                 Exit::Iret
             }
-            0x76 | 0x77 | 0x79 | 0x89 => Exit::Nop,
-            0x78 => Exit::Hlt,
-            0x7b => {
-                let size = if info1 & 0x10 != 0 { 1 } else if info1 & 0x20 != 0 { 2 } else { 4 };
-                let addr = match (info1 >> 7) & 7 {
-                    1 => 2,
-                    2 => 4,
-                    _ => 8,
-                };
-                Exit::Io { port: (info1 >> 16) as u16, size, input: info1 & 1 != 0, string: info1 & 4 != 0, rep: info1 & 8 != 0, addr }
-            }
-            0x7c => if info1 & 1 != 0 { Exit::Wrmsr } else { Exit::Rdmsr },
-            0x7d => Exit::TaskSwitch,
-            0x7f => Exit::Shutdown,
-            0x73 | 0x7a | 0x80..=0x88 | 0x8a..=0x8c | 0x8e => Exit::Undefined,
-            0x8d => Exit::Xsetbv,
-            0x400 => Exit::Mmio { gpa: info2, write: info1 & 2 != 0 },
-            c => Exit::Fatal(c),
+            e => e,
         }
     }
 
@@ -443,6 +426,10 @@ impl Hw for Svm {
         self.wr(TSC_OFFSET, off);
     }
 
+    fn set_cr2(&mut self, v: u64) {
+        super::vcpu_write_msr(self.vcpu, super::SEL4_MSR_CR2, v);
+    }
+
     fn set_tpr(&mut self, tpr: u8) {
         self.tpr = tpr;
     }
@@ -463,7 +450,8 @@ impl Hw for Svm {
         self.seg(GDTR, 0, 0, 0xffff, 0);
         self.seg(IDTR, 0, 0, 0xffff, 0);
         self.wr(EFER, EFER_SVME);
-        self.wr(CR0, 0x6000_0010);
+        // CD and NW off (seL4 keeps the CPU's so): ET, as at reset.
+        self.wr(CR0, 0x10);
         self.wr(CR4, 0);
         self.wr(CR3, 0);
         self.wr(RSP, 0);

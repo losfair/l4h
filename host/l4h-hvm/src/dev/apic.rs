@@ -69,6 +69,15 @@ impl Shared {
         self.irr[w].fetch_or(bit, Ordering::SeqCst) & bit == 0
     }
 
+    /// Drop every fixed interrupt requested so far: at INIT, and while
+    /// it waits for SIPI (those are of a run that is over).
+    pub fn clear_requests(&self) {
+        for w in 0..4 {
+            self.irr[w].store(0, Ordering::SeqCst);
+            self.level[w].store(0, Ordering::SeqCst);
+        }
+    }
+
     fn flag(&self, f: u32) -> bool {
         self.flags.fetch_or(f, Ordering::SeqCst) & f == 0
     }

@@ -28,8 +28,15 @@ const VEC_AC: u8 = 17;
 const CR0_TS: u64 = 1 << 3;
 const CR4_DE: u64 = 1 << 3;
 const CR4_OSXSAVE: u64 = 1 << 18;
-/// RFLAGS.DF.
+/// RFLAGS.DF and AC.
 const DF: u64 = 1 << 10;
+const AC: u64 = 1 << 18;
+const VEC_PF: u8 = 14;
+
+/// Up to two pieces (GPA, bytes) of an access at a linear address.
+struct Span {
+    parts: [(u64, u64); 2],
+}
 /// Iterations of a REP string instruction one exit does.
 const STRING_BATCH: u64 = 4096;
 
@@ -134,13 +141,18 @@ impl<H: Hw> Vcpu<H> {
             self.nmis = self.nmis.saturating_add(1);
         }
         if flags & PENDING_INIT != 0 {
+            // A reset of its local APIC: what was requested before is
+            // gone, and its timer stops.
             self.lapic.init(sh);
+            sh.clear_requests();
+            self.arm_timer();
             self.wait_sipi = true;
             self.halted = false;
             self.nmis = 0;
             self.inject = None;
         }
         if flags & PENDING_SIPI != 0 && self.wait_sipi {
+            sh.clear_requests();
             self.wait_sipi = false;
             self.hw.start_real_mode(sh.sipi.load(Ordering::SeqCst));
         }
@@ -148,6 +160,8 @@ impl<H: Hw> Vcpu<H> {
             vm.pending_work();
         }
         if self.wait_sipi {
+            // Only INIT and SIPI reach a vCPU that waits for SIPI.
+            sh.clear_requests();
             return self.block();
         }
         let now = vm::now();
@@ -211,8 +225,17 @@ impl<H: Hw> Vcpu<H> {
         self.fault(VEC_UD, None);
     }
 
+    /// Step over the instruction that exited: by the length the CPU
+    /// gave, or (AMD-V without next-RIP saving) its decoded length.
     fn skip(&mut self) {
-        let len = self.hw.instr_len();
+        let mut len = self.hw.instr_len();
+        if len == 0 {
+            let (bytes, n) = self.fetch();
+            len = decode::length(&bytes[..n], self.hw.mode()).unwrap_or(0) as u64;
+            if len == 0 {
+                self.fatal("no length for the instruction at", self.hw.rip());
+            }
+        }
         self.hw.skip(len);
     }
 
@@ -339,6 +362,14 @@ impl<H: Hw> Vcpu<H> {
             }
             Exit::Undefined => self.ud(),
             Exit::Nop => self.skip(),
+            Exit::Rdtsc => {
+                let t = vm::now().wrapping_add(self.tsc_offset);
+                let g = self.hw.gprs();
+                (g[0], g[2]) = (t & 0xffff_ffff, t >> 32);
+                self.hw.mark_gprs();
+                self.skip();
+            }
+            Exit::Rdpmc => self.gp(),
             Exit::TaskSwitch => self.fatal("task switch", 0),
             Exit::Fatal(r) => self.fatal("VM exit", r),
         }
@@ -515,11 +546,7 @@ impl<H: Hw> Vcpu<H> {
         match port {
             0x40..=0x43 | 0x61 => vm.pit.lock().read(port, now) as u32,
             0x70 | 0x71 => vm.rtc.lock().read(port, now) as u32,
-            uart::BASE..=0x3ff => {
-                let v = vm.uart.lock().read(port - uart::BASE, &mut crate::console::Input) as u32;
-                vm.sync_uart();
-                v
-            }
+            uart::BASE..=0x3ff => vm.uart(|u, input| u.read(port - uart::BASE, input)) as u32,
             pm::PM1_EVT..=0x60b => vm.pm.read(port, size, now, vm.tsc_hz),
             0xcf8 if size == 4 => vm.cf8.load(Ordering::SeqCst),
             0xcfc..=0xcff => match pci::cf8_offset(vm.cf8.load(Ordering::SeqCst), port) {
@@ -538,10 +565,7 @@ impl<H: Hw> Vcpu<H> {
         match port {
             0x40..=0x43 | 0x61 => vm.pit.lock().write(port, v as u8, now),
             0x70 | 0x71 => vm.rtc.lock().write(port, v as u8, now),
-            uart::BASE..=0x3ff => {
-                vm.uart.lock().write(port - uart::BASE, v as u8, &mut crate::console::Input);
-                vm.sync_uart();
-            }
+            uart::BASE..=0x3ff => vm.uart(|u, input| u.write(port - uart::BASE, v as u8, input)),
             pm::RESET if size == 1 => {
                 if vm.pm.write(port, size, v) == pm::Action::Reset {
                     self.power(abi::POWER_REBOOT);
@@ -563,7 +587,9 @@ impl<H: Hw> Vcpu<H> {
         }
     }
 
-    /// INS and OUTS, REP or not: through the guest's page tables.
+    /// INS and OUTS, REP or not: through the guest's page tables, an
+    /// element that spans two pages in two pieces.  INS reads the port
+    /// only once its memory is known to be writable.
     fn string_io(&mut self, port: u16, size: u8, input: bool, rep: bool, addr: u8) {
         let mask = if addr >= 8 { u64::MAX } else { (1u64 << (8 * addr as u32)) - 1 };
         let mut count = if rep { self.hw.gprs()[1] & mask } else { 1 };
@@ -573,16 +599,16 @@ impl<H: Hw> Vcpu<H> {
         let mut done = 0;
         while count != 0 && done < STRING_BATCH {
             let off = self.hw.gprs()[reg] & mask;
-            let Some(gpa) = self.translate(base.wrapping_add(off), input) else { return };
+            let Some(span) = self.span(base.wrapping_add(off), size as u64, input) else { return };
             let mut buf = [0u8; 4];
             if input {
                 let v = self.pio_read(port, size);
                 buf = v.to_le_bytes();
-                if !self.write_phys(gpa, &buf[..size as usize]) {
+                if !self.write_span(&span, &buf[..size as usize]) {
                     return self.gp();
                 }
             } else {
-                if !self.read_phys(gpa, &mut buf[..size as usize]) {
+                if !self.read_span(&span, &mut buf[..size as usize]) {
                     return self.gp();
                 }
                 self.pio_write(port, size, u32::from_le_bytes(buf));
@@ -605,24 +631,77 @@ impl<H: Hw> Vcpu<H> {
 
     // ---- Memory-mapped devices.
 
-    /// The linear address `la`'s GPA, injecting the page fault if it has
-    /// none.
+    /// The linear address `la`'s GPA for a data access, injecting the
+    /// page fault the guest takes if it has none (CR2 `la`), #GP if its
+    /// tables are outside RAM.
     fn translate(&mut self, la: u64, write: bool) -> Option<u64> {
         let p = self.hw.paging();
         let user = self.hw.cpl() == 3;
-        match walk::translate(&p, la, walk::Access { write, user, fetch: false }, &mut Ram) {
+        let ac = self.hw.rflags() & AC != 0;
+        match walk::translate(&p, la, walk::Access { write, user, fetch: false, ac }, &mut Ram) {
             Ok(g) => Some(g),
-            Err(_) => {
-                // A page fault the guest would take: rare enough here (the
-                // instruction itself just ran) to stop it than emulate.
+            Err(walk::Error::Fault(f)) => {
+                self.hw.set_cr2(la);
+                self.fault(VEC_PF, Some(f.error));
+                None
+            }
+            Err(walk::Error::BadTable) => {
                 self.gp();
                 None
             }
         }
     }
 
-    /// The instruction at CS:RIP, decoded (#UD if we cannot).
-    fn fetch_decode(&mut self) -> Option<decode::Insn> {
+    /// The GPAs of `len` bytes at linear `la`: one piece, or two where
+    /// they cross into the next page, each translated (the page fault of
+    /// either injected).
+    fn span(&mut self, la: u64, len: u64, write: bool) -> Option<Span> {
+        let first = (4096 - (la & 0xfff)).min(len);
+        let a = self.translate(la, write)?;
+        if first == len {
+            return Some(Span { parts: [(a, len), (0, 0)] });
+        }
+        let b = self.translate(la.wrapping_add(first), write)?;
+        Some(Span { parts: [(a, first), (b, len - first)] })
+    }
+
+    /// Bytes of a span: RAM, or a device for a whole piece.
+    fn read_span(&mut self, span: &Span, buf: &mut [u8]) -> bool {
+        let mut at = 0;
+        for &(gpa, n) in span.parts.iter().filter(|p| p.1 != 0) {
+            let piece = &mut buf[at..at + n as usize];
+            if !self.read_phys(gpa, piece) {
+                if !matches!(n, 1 | 2 | 4 | 8) {
+                    return false;
+                }
+                let v = self.mmio_read(gpa, n as u8);
+                piece.copy_from_slice(&v.to_le_bytes()[..n as usize]);
+            }
+            at += n as usize;
+        }
+        true
+    }
+
+    fn write_span(&mut self, span: &Span, buf: &[u8]) -> bool {
+        let mut at = 0;
+        for &(gpa, n) in span.parts.iter().filter(|p| p.1 != 0) {
+            let piece = &buf[at..at + n as usize];
+            if !self.write_phys(gpa, piece) {
+                if !matches!(n, 1 | 2 | 4 | 8) {
+                    return false;
+                }
+                let mut v = [0u8; 8];
+                v[..n as usize].copy_from_slice(piece);
+                self.mmio_write(gpa, n as u8, u64::from_le_bytes(v));
+            }
+            at += n as usize;
+        }
+        true
+    }
+
+    /// The bytes at CS:RIP that can be fetched (up to the longest
+    /// instruction).
+    fn fetch(&mut self) -> ([u8; decode::MAX_LEN], usize) {
         let mode = self.hw.mode();
         let base = if mode == Mode::Bits64 { 0 } else { self.hw.seg_base(Seg::Cs) };
         let la = base.wrapping_add(self.hw.rip());
@@ -632,7 +711,7 @@ impl<H: Hw> Vcpu<H> {
         let mut n = 0;
         while n < bytes.len() {
             let at = la.wrapping_add(n as u64);
-            let Ok(gpa) = walk::translate(&p, at, walk::Access { write: false, user, fetch: true }, &mut Ram) else { break };
+            let Ok(gpa) = walk::translate(&p, at, walk::Access { write: false, user, fetch: true, ac: false }, &mut Ram) else { break };
             let in_page = (4096 - (at & 0xfff)) as usize;
             let k = in_page.min(bytes.len() - n);
             if !vm().mem.read_bytes(gpa, &mut bytes[n..n + k]) {
@@ -640,6 +719,15 @@ impl<H: Hw> Vcpu<H> {
             }
             n += k;
         }
+        (bytes, n)
+    }
+
+    /// The instruction at CS:RIP, decoded (#UD if we cannot).
+    fn fetch_decode(&mut self) -> Option<decode::Insn> {
+        let mode = self.hw.mode();
+        let base = if mode == Mode::Bits64 { 0 } else { self.hw.seg_base(Seg::Cs) };
+        let la = base.wrapping_add(self.hw.rip());
+        let (bytes, n) = self.fetch();
         match decode::decode(&bytes[..n], mode) {
             Ok(i) => Some(i),
             Err(e) => {
@@ -694,14 +782,27 @@ impl<H: Hw> Vcpu<H> {
         let mut done = 0;
         while count != 0 && done < STRING_BATCH {
             let g = *self.hw.gprs();
-            let v = if insn.kind == Kind::Movs {
-                let Some(src) = self.translate(src_seg.wrapping_add(g[6] & mask), false) else { return };
-                self.phys_read(src, insn.size)
+            // Both sides translated before either is touched (an element
+            // that spans two pages in two pieces).
+            let src = if insn.kind == Kind::Movs {
+                let Some(s) = self.span(src_seg.wrapping_add(g[6] & mask), size, false) else { return };
+                Some(s)
             } else {
-                decode::trunc(g[0], insn.size)
+                None
             };
-            let Some(dst) = self.translate(es.wrapping_add(g[7] & mask), true) else { return };
-            self.phys_write(dst, insn.size, v);
+            let Some(dst) = self.span(es.wrapping_add(g[7] & mask), size, true) else { return };
+            let mut v = [0u8; 8];
+            match src {
+                Some(s) => {
+                    if !self.read_span(&s, &mut v[..size as usize]) {
+                        return self.gp();
+                    }
+                }
+                None => v = g[0].to_le_bytes(),
+            }
+            if !self.write_span(&dst, &v[..size as usize]) {
+                return self.gp();
+            }
             let step = if down { size.wrapping_neg() } else { size };
             let g = self.hw.gprs();
             g[7] = (g[7] & !mask) | (g[7].wrapping_add(step) & mask);
@@ -726,21 +827,6 @@ impl<H: Hw> Vcpu<H> {
 
     fn write_phys(&mut self, gpa: u64, buf: &[u8]) -> bool {
         vm().mem.write_bytes(gpa, buf)
-    }
-
-    /// A read of `size` bytes at `gpa`, RAM or a device.
-    fn phys_read(&mut self, gpa: u64, size: u8) -> u64 {
-        let mut b = [0u8; 8];
-        if self.read_phys(gpa, &mut b[..size as usize]) {
-            return u64::from_le_bytes(b);
-        }
-        self.mmio_read(gpa, size)
-    }
-
-    fn phys_write(&mut self, gpa: u64, size: u8, v: u64) {
-        if !self.write_phys(gpa, &v.to_le_bytes()[..size as usize]) {
-            self.mmio_write(gpa, size, v);
-        }
     }
 
     fn lapic_mmio(&self) -> bool {
@@ -784,11 +870,13 @@ impl<H: Hw> Vcpu<H> {
             }
             pci::MMIO_BASE..0xe000_0000 => {
                 // A queue notification: a bit for the I/O thread, no call.
-                let slot = ((gpa - pci::MMIO_BASE) / pci::SLOT_MMIO) as usize;
-                let base = vm.bar0.get(slot).map_or(0, |b| b.load(Ordering::Acquire));
-                let off = gpa.wrapping_sub(base);
-                if base != 0
-                    && off < virtio_pci::BAR0_SIZE
+                // The device whose BAR0 (where the guest put it) has it.
+                let hit = (1..=vm.cfg.nr_devices as usize).find_map(|slot| {
+                    let base = vm.bar0.get(slot)?.load(Ordering::Acquire);
+                    let off = gpa.checked_sub(base)?;
+                    (base != 0 && off < virtio_pci::BAR0_SIZE).then_some((slot, off))
+                });
+                if let Some((slot, off)) = hit
                     && off.is_multiple_of(NOTIFY_MULTIPLIER)
                     && let Some(q) = virtio_pci::Transport::<crate::dev::blk::Blk>::notify_queue(off)
                 {

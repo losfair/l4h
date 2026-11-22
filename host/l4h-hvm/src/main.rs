@@ -25,8 +25,10 @@ mod vcpu;
 mod vm;
 mod x86;
 
-/// l4h-vmm's virtqueues (l4h-vmm/src/virtq.rs), over guest RAM here.
+/// l4h-vmm's virtqueues (l4h-vmm/src/virtq.rs), over guest RAM here: as
+/// l4h-vmm has them (its style is l4h-vmm's).
 #[path = "../../l4h-vmm/src/virtq.rs"]
+#[allow(clippy::manual_is_multiple_of)]
 mod virtq;
 
 /// What virtq.rs takes guest memory from.
@@ -69,6 +71,8 @@ fn main(info: &'static Info) -> ! {
         MAPPED[b / 64].fetch_or(1 << (b % 64), Ordering::Relaxed);
     }
     let mem = guest::GuestMem { base: hv::RAM_VA, low: cfg.low_ram, high: cfg.high_ram, mapped: &MAPPED, map: sys::map };
+    // Mapping works before the machine is made: loading the kernel maps.
+    ept::init(mem, cfg.block_radix, cfg.guest_id);
     let amd = vcpu::host_cpuid(0, 0)[1] == u32::from_le_bytes(*b"Auth");
     let xcr0 = x86::cpuid::xcr0_supported(&vcpu::host_cpuid);
     // The kernel, its boot parameters and the ACPI tables.

@@ -8,7 +8,7 @@
 
 use l4h_rt::sel4;
 
-use super::{Event, Exit, Gprs, Hw, SEL4_ORDER, mr, vmenter, write_gprs};
+use super::{Event, Exit, Gprs, Hw, SEL4_ORDER, exits, mr, vmenter, write_gprs};
 use crate::x86::decode::{Mode, Seg};
 use crate::x86::walk::{self, Paging};
 
@@ -130,7 +130,7 @@ impl Vmx {
     pub fn new(vcpu: u64) -> Self {
         let sec = wr(vcpu, SECONDARY, SEC_EPT | SEC_VPID | SEC_WBINVD | SEC_UNRESTRICTED | SEC_INVPCID);
         assert!(sec & SEC_UNRESTRICTED != 0, "l4h-hvm: the CPU has no VT-x unrestricted guest");
-        wr(vcpu, CR0_MASK, CR0_NE | CR0_CD | CR0_NW);
+        wr(vcpu, CR0_MASK, exits::VMX_CR0_OWNED);
         wr(vcpu, CR4_MASK, 0);
         wr(vcpu, EXCEPTION_BITMAP, 0);
         let ppc = wr(vcpu, PRIMARY, PRI_HLT | PRI_TSC_OFFSET | PRI_SECONDARY) & !(PRI_IRQ_WINDOW | PRI_NMI_WINDOW);
@@ -212,21 +212,6 @@ impl Vmx {
             self.wr(GUEST_PDPTE0 + 2 * i, e);
         }
     }
-
-    fn event(info: u64, error: u64) -> Option<Event> {
-        if info & INTR_VALID == 0 {
-            return None;
-        }
-        let v = info as u8;
-        match (info >> 8) & 7 {
-            0 => Some(Event::Ext(v)),
-            2 => Some(Event::Nmi),
-            3 => Some(Event::Exc(v, (info & INTR_ERROR != 0).then_some(error as u32))),
-            // Software interrupts and exceptions run again from their
-            // instruction.
-            _ => None,
-        }
-    }
 }
 
 impl Hw for Vmx {
@@ -265,53 +250,20 @@ impl Hw for Vmx {
         }
         let (idt, idt_err) = (mr(27), mr(28));
         // What was not delivered, or was being delivered, goes in again.
-        self.pending = if left & INTR_VALID != 0 { Self::event(left, error as u64) } else { Self::event(idt, idt_err) };
+        let vectoring = if left & INTR_VALID != 0 { left } else { idt };
+        self.pending = if left & INTR_VALID != 0 { exits::vmx_event(left, error as u64) } else { exits::vmx_event(idt, idt_err) };
+        let ei = mr(25);
+        if exits::vmx_nmi_reblock(ei, vectoring) {
+            self.intr |= exits::VMX_BLOCK_NMI;
+            self.intr_dirty = true;
+        }
         if !fault {
             self.len = 0;
             return Exit::Notified(badge);
         }
-        let (reason, q) = (mr(3), mr(4));
         self.len = mr(5);
-        if reason & (1 << 31) != 0 {
-            return Exit::Fatal(reason);
-        }
-        match reason & 0xffff {
-            0 => {
-                let (ei, ee) = (mr(25), mr(26));
-                if (ei >> 8) & 7 == 2 {
-                    return Exit::Nop;
-                }
-                Exit::Exception { vector: ei as u8, error: (ei & INTR_ERROR != 0).then_some(ee as u32), dr6: q }
-            }
-            1 | 3 | 4 | 13 | 14 | 16 | 40 | 54 => Exit::Nop,
-            2 => Exit::Shutdown,
-            7 => Exit::IrqWindow,
-            8 => Exit::NmiWindow,
-            9 => Exit::TaskSwitch,
-            10 => Exit::Cpuid,
-            12 => Exit::Hlt,
-            15 | 18..=27 | 36 | 39 | 50 | 51 | 53 | 58 => Exit::Undefined,
-            28 => {
-                let (cr, reg) = ((q & 15) as u8, Some(((q >> 8) & 15) as u8));
-                match (q >> 4) & 3 {
-                    0 => Exit::Cr { cr, write: true, reg },
-                    1 => Exit::Cr { cr, write: false, reg },
-                    2 => Exit::Clts,
-                    _ => Exit::Lmsw((q >> 16) as u16),
-                }
-            }
-            29 => Exit::Dr { dr: (q & 7) as u8, write: q & 16 == 0, reg: Some(((q >> 8) & 15) as u8) },
-            30 => {
-                let string = q & 16 != 0;
-                let addr = if string { 2 << ((rd(self.vcpu, EXIT_INSTRUCTION_INFO) >> 7) & 3) } else { 0 };
-                Exit::Io { port: (q >> 16) as u16, size: ((q & 7) + 1) as u8, input: q & 8 != 0, string, rep: q & 32 != 0, addr }
-            }
-            31 => Exit::Rdmsr,
-            32 => Exit::Wrmsr,
-            48 => Exit::Mmio { gpa: mr(6), write: q & 2 != 0 },
-            55 => Exit::Xsetbv,
-            r => Exit::Fatal(r),
-        }
+        let vcpu = self.vcpu;
+        exits::vmx_exit(mr(3), mr(4), ei, mr(26), mr(6), || 2 << ((rd(vcpu, EXIT_INSTRUCTION_INFO) >> 7) & 3))
     }
 
     fn take_pending(&mut self) -> Option<Event> {
@@ -513,6 +465,10 @@ impl Hw for Vmx {
 
     fn set_tsc_offset(&mut self, off: u64) {
         self.wr(TSC_OFFSET, off);
+    }
+
+    fn set_cr2(&mut self, v: u64) {
+        super::vcpu_write_msr(self.vcpu, super::SEL4_MSR_CR2, v);
     }
 
     fn flush_tlb(&mut self) {

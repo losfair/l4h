@@ -344,7 +344,7 @@ impl Vmmgr {
             if g.state != State::Created || g.vmm.is_some() || g.root_pending {
                 return Err(ctl::EBUSY);
             }
-            if g.devices.len() >= MAX_GUEST_DEVICES {
+            if g.devices.len() >= g.max_devices() {
                 return Err(ctl::ENOSPC);
             }
             // Room for the device, which is added once root has answered
@@ -434,6 +434,7 @@ impl Vmmgr {
             // As every attach path: not once the VMM, which was given the
             // devices there were, is spawned.
             if g.state != State::Created || g.vmm.is_some() || g.root_pending { return Err(ctl::EBUSY); }
+            if g.devices.len() >= g.max_devices() { return Err(ctl::ENOSPC); }
             if !g.reserve(&mut h.alloc, guest::DEVICE_BYTES) { return Err(ctl::ENOMEM); }
             let d = g.add_device(&mut h.alloc, guest::DevKind::Virtio(2)).ok_or(ctl::ENOSPC)?;
             g.backends.must_push((d, vmm::Backend::UnavailableBlk));
@@ -498,7 +499,7 @@ impl Vmmgr {
             }
             // Everything that can fail comes before the device is added:
             // it stays with the guest until it is destroyed.
-            if g.devices.len() >= MAX_GUEST_DEVICES {
+            if g.devices.len() >= g.max_devices() {
                 return Err(ctl::ENOSPC);
             }
             let d = g.devices.len();
@@ -559,7 +560,7 @@ impl Vmmgr {
             if g.pool.size < l4h_abi::GPU_POOL_IMAGES * host::gpu::image_bytes(width, height) {
                 return Err(ctl::EINVAL);
             }
-            if g.devices.len() >= MAX_GUEST_DEVICES {
+            if g.devices.len() >= g.max_devices() {
                 return Err(ctl::ENOSPC);
             }
             let backend = gpu::attach(g, &mut h.alloc, width, height)?;

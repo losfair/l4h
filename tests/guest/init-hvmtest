@@ -33,7 +33,10 @@ peer=$(l4hctl create peer --initrd /bin/netvm.cpio.gz --mem 96 --nic "$sw" \
 console "$peer" "NETVM: done" 120
 free0=$(free)
 echo "HVMTEST: $free0 MiB free"
+# A marker in the disk's first 4 KiB (disk-write takes whole 4 KiB blocks).
 printf 'HVMMARK-l4h-disk' > /tmp/mark
+dd if=/dev/zero bs=1 count=$((4096 - 16)) >> /tmp/mark 2>/dev/null
+[ "$(wc -c < /tmp/mark)" -eq 4096 ] || fail "marker size"
 l4hctl disk-write 0 0 /tmp/mark || fail "disk-write"
 
 # 1: two vCPUs, disk, network, console, the ACPI power button.

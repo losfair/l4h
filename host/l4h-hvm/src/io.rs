@@ -7,7 +7,7 @@
 //! queue notifications (KICK), backend completions (DONE), vmmgr's console
 //! input and power requests (CTL), console output and its timer (CONSOLE).
 
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use l4h_abi as abi;
 use l4h_rt::host::{self, hvm as hv};
@@ -85,11 +85,20 @@ pub fn init() {
     }
 }
 
-/// What a device's interrupt does.
+/// The slots asserting INTA#, a bit each (the I/O thread's only).
+static INTX: AtomicU32 = AtomicU32::new(0);
+
+/// What a device's interrupt does: an MSI, or its INTA#, which shares a
+/// GSI with others (pci::intx_level).
 fn irq(slot: usize) -> impl FnMut(Irq) {
     move |i| match i {
         Irq::Msi(m) => vm().deliver(&m),
-        Irq::Intx(level) => vm().set_line(pci::intx_gsi(slot, 1), level),
+        Irq::Intx(level) => {
+            let bit = 1u32 << slot;
+            let asserted = if level { INTX.fetch_or(bit, Ordering::Relaxed) | bit } else { INTX.fetch_and(!bit, Ordering::Relaxed) & !bit };
+            let gsi = pci::intx_gsi(slot, 1);
+            vm().set_line(gsi, pci::intx_level(asserted, gsi));
+        }
     }
 }
 
@@ -173,11 +182,22 @@ pub fn kicked() {
     }
 }
 
+/// Backends' completions.  The disks share the I/O pool's bounce pages:
+/// every device's completions first, then each disk that waits for pages
+/// tries again, whichever slot freed them (a disk in an earlier slot
+/// would otherwise wait for a completion of its own that may never come).
 pub fn completed() {
     let vm = vm();
     for (slot, d) in io().slots.iter_mut().enumerate() {
         let Some(d) = d.as_mut() else { continue };
         each!(d, t => t.complete(&vm.mem, &mut irq(slot)));
+    }
+    for (slot, d) in io().slots.iter_mut().enumerate() {
+        let Some(Dev::Blk(t)) = d.as_mut() else { continue };
+        let retry = t.backend.retry();
+        if retry != 0 {
+            t.poll(&vm.mem, retry, &mut irq(slot));
+        }
     }
 }
 

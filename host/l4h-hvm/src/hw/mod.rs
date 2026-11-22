@@ -14,6 +14,7 @@ use l4h_rt::sel4;
 use crate::x86::decode::{Mode, Seg};
 use crate::x86::walk::Paging;
 
+pub mod exits;
 #[cfg(not(test))]
 pub mod svm;
 #[cfg(not(test))]
@@ -65,8 +66,12 @@ pub enum Exit {
     /// VMCALL or VMMCALL, MONITOR or MWAIT, RDTSCP, VMX or SVM
     /// instructions: #UD for the guest.
     Undefined,
-    /// INVD, WBINVD, PAUSE: nothing to do but skip.
+    /// INVD, WBINVD, PAUSE, INVLPG: nothing to do but skip.
     Nop,
+    /// RDTSC (if the CPU makes it exit).
+    Rdtsc,
+    /// RDPMC: #GP, as without performance counters.
+    Rdpmc,
     /// A task switch (not emulated: the guest stops).
     TaskSwitch,
     /// VM entry failed, or an exit we do not know: the raw reason.
@@ -93,7 +98,8 @@ pub trait Hw {
     fn rip(&self) -> u64;
     fn rflags(&self) -> u64;
     fn set_rflags(&mut self, v: u64);
-    /// The length of the instruction that exited, if the CPU said.
+    /// The length of the instruction that exited, if the CPU said (0 if
+    /// it did not: AMD-V without next-RIP saving).
     fn instr_len(&self) -> u64;
     /// Step over it: RIP past it, and no interrupt shadow.
     fn skip(&mut self, len: u64);
@@ -117,6 +123,8 @@ pub trait Hw {
     fn wrmsr(&mut self, msr: u32, v: u64) -> Option<bool>;
     fn set_xcr0(&mut self, v: u64) -> bool;
     fn set_tsc_offset(&mut self, off: u64);
+    /// CR2, for a page fault about to be injected.
+    fn set_cr2(&mut self, v: u64);
     /// The guest's TPR changed (AMD-V keeps it as V_TPR).
     fn set_tpr(&mut self, _tpr: u8) {}
     /// Flush the guest's own translations before it next runs.
@@ -178,6 +186,8 @@ pub fn write_gprs(vcpu: u64, g: &Gprs) {
 /// XCR0.
 #[cfg(not(test))]
 pub const SEL4_MSR_XCR0: u64 = 0xffff_fffe;
+#[cfg(not(test))]
+pub const SEL4_MSR_CR2: u64 = 0xffff_ffff;
 
 #[cfg(not(test))]
 pub fn vcpu_write_msr(vcpu: u64, msr: u64, v: u64) -> bool {

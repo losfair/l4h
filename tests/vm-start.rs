@@ -44,6 +44,8 @@ impl Guest {
 }
 
 mod hvm {
+    /// What the l4h-hvm spawn takes of vmmgr's slots (hvm::start_slots).
+    pub fn start_slots(_: &super::Guest) -> usize { 300 }
     /// As the production one: an HVM guest is booted once, with the
     /// kernel dom0 loaded; flags it does not know are refused.  Its boot
     /// blocks are its own RAM: no host memory.
@@ -68,7 +70,9 @@ mod guest {
     }
 }
 
-struct Vmmgr { guests: [Option<Guest>; MAX_GUESTS], kernel: Option<Kernel>, alloc: (), wins: Wins, info: (), started: usize, fail_start: bool }
+struct Vmmgr { guests: [Option<Guest>; MAX_GUESTS], kernel: Option<Kernel>, alloc: (), wins: Wins, info: (), started: usize, fail_start: bool,
+    /// vmmgr's free slots.
+    slots: usize }
 impl Vmmgr {
     fn with_guest<R>(&mut self, id: usize, f: impl FnOnce(&mut Self, &mut Guest) -> R) -> Option<R> {
         let mut g = self.guests[id].take()?;
@@ -77,7 +81,7 @@ impl Vmmgr {
         Some(r)
     }
     fn guest(&self, id: usize) -> Option<&Guest> { self.guests.get(id)?.as_ref() }
-    fn can_afford(&self, _: usize, _: usize, _: usize) -> bool { true }
+    fn can_afford(&self, _: usize, _: usize, slots: usize) -> bool { slots <= self.slots }
     /// As the production one, nothing here is refused: what the VMM takes
     /// was reserved.
     fn spawn_vmm(&mut self, g: &mut Guest) -> Result<(), Errno> {
@@ -93,7 +97,7 @@ fn guest(root_pending: bool, host: usize) -> Guest {
     Guest { state: State::Created, vmm: None, root_pending, reserved: 0, host, boots: 0, hvm: None }
 }
 fn vmmgr(g: Guest) -> Vmmgr {
-    Vmmgr { guests: [None, Some(g)], kernel: Some(Kernel { end: 0 }), alloc: (), wins: Wins { a: () }, info: (), started: 0, fail_start: false }
+    Vmmgr { guests: [None, Some(g)], kernel: Some(Kernel { end: 0 }), alloc: (), wins: Wins { a: () }, info: (), started: 0, fail_start: false, slots: usize::MAX }
 }
 fn start() -> abi::CtlReq {
     abi::CtlReq { op: abi::CTL_VM_START, args: [1, 0, 0, 0, 0, 0], ..unsafe { core::mem::zeroed() } }
@@ -157,6 +161,11 @@ fn an_hvm_guest_starts_with_its_kernel() {
     g.hvm = Some(None);
     let mut h = vmmgr(g);
     let req = abi::CtlReq { args: [1, 0x400_0000, 6, 0x300_0000, 0x80_0000, 0], ..start() };
+    // Too few of vmmgr's slots for l4h-hvm's objects: refused first.
+    h.slots = hvm::start_slots(h.guests[1].as_ref().unwrap()) - 1;
+    assert_eq!(execute(&mut h, 0, &req), Err(ENOMEM));
+    assert_eq!(h.guests[1].as_ref().unwrap().boots, 0);
+    h.slots = usize::MAX;
     assert_eq!(execute(&mut h, 0, &req), Err(ENOMEM));
     assert_eq!((h.guests[1].as_ref().unwrap().boots, h.started), (0, 0), "a refused start must not boot it");
     h.guests[1].as_mut().unwrap().host += MAPS;

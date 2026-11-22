@@ -1234,13 +1234,17 @@ create fails with `-ENODEV`. `l4hctl list` shows them as `hvm`.
   pair that reports itself absent, the PIT (channel 2, for calibration),
   a 16550A UART on COM1 (IRQ 4) that is the VM's console
   (`l4hctl console`/`send`), a CMOS RTC from the host's clock, and ACPI
-  tables (RSDP, XSDT, MADT, FADT with a PM block and the reset register,
-  MCFG, and a DSDT with `\_S5`, the PCI root and the power button).
-  `l4hctl shutdown` presses the power button (an SCI); the guest's S5
-  write powers it off. CPUID shows what seL4 lets a guest use (as the KVM
+  tables (RSDP, XSDT, MADT, FADT with a PM block, the fixed-hardware
+  power button and the reset register, MCFG, and a DSDT with `\_S5` and
+  the PCI root). `l4hctl shutdown` presses the power button (an SCI); the
+  guest's S5 write powers it off. `l4hctl shutdown --reboot` and a write
+  of the reset register reboot it (vmmgr's `guest_power(REBOOT)`) without
+  asking the guest. CPUID shows what seL4 lets a guest use (as the KVM
   inside PV guests does, §5.10), with TSC and APIC timer frequencies
-  (leaf 0x15), invariant TSC, x2APIC, TSC-deadline and the topology
-  leaves; MSRs outside a fixed table raise `#GP`. Instructions that touch
+  (leaf 0x15: a 25 MHz crystal, which the local APIC timer runs at, and
+  the TSC as a ratio Linux computes in 32 bits), invariant TSC, x2APIC,
+  TSC-deadline and the topology leaves; leaves it does not know are zero;
+  MSRs outside a fixed table raise `#GP`. Instructions that touch
   device MMIO are decoded and emulated (MOV, MOVZX/MOVSX, MOVS, STOS,
   CMP, TEST, OR, AND, XCHG), as are string port I/O, with a page walker
   for 4-level, PAE and unpaged guests.
@@ -1253,6 +1257,8 @@ create fails with `-ENODEV`. `l4hctl list` shows them as `hvm`.
   `hw/svm.rs`), chosen by CPUID's vendor, over seL4's VMCS and VMCB
   accessors; the guest's FPU state is seL4's (l4h-hvm itself never uses
   it), XCR0 goes through `VCPU_WriteMSR`.
+- **Not yet.** HVM guests have no launch digest (§10.2): they are not
+  measured, attested or sealed, and the l4h hypercalls are not theirs.
 - **Tests.** `tests/run-hvmunit.sh` tests the device models, the decoder,
   the page walker, boot and ACPI against a model of guest RAM, and the
   vCPU and I/O threads' code together under a scripted guest, with

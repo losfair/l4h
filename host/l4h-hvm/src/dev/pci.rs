@@ -206,9 +206,27 @@ pub const fn intx_gsi(slot: usize, pin: u8) -> usize {
     16 + (slot + pin as usize - 1) % 8
 }
 
+/// The level of GSI `gsi`, which the INTA# of every slot routed to it
+/// drives, wired-OR: `asserted` has a bit for each slot asserting it.
+pub fn intx_level(asserted: u32, gsi: usize) -> bool {
+    (0..SLOTS).any(|s| asserted & (1 << s) != 0 && intx_gsi(s, 1) == gsi)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_intx_is_wired_or() {
+        // Slots 1 and 9 share GSI 17; slot 2 has 18.
+        assert_eq!((intx_gsi(1, 1), intx_gsi(9, 1), intx_gsi(2, 1)), (17, 17, 18));
+        let both = 1 << 1 | 1 << 9;
+        assert!(intx_level(both, 17));
+        assert!(intx_level(both & !(1 << 1), 17), "one still asserts");
+        assert!(intx_level(both & !(1 << 9), 17));
+        assert!(!intx_level(0, 17));
+        assert!(!intx_level(both, 18));
+    }
 
     #[test]
     fn header_bars_and_caps() {

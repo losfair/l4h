@@ -171,18 +171,25 @@ impl Blk {
         q.push_deferred(mem, head, written);
     }
 
+    /// Whether a chain has room for a request's 16-byte header first and
+    /// its status byte last (in two buffers at least).
+    fn well_formed(bufs: &[Buf]) -> bool {
+        bufs.len() >= 2 && bufs[0].len >= 16 && bufs[bufs.len() - 1].len >= 1
+    }
+
     /// The data segments of a well-formed chain: what follows the 16-byte
-    /// header, and what precedes the status byte.
+    /// header, and what precedes the status byte (none of a chain that is
+    /// not).
     fn segments(bufs: &[Buf]) -> impl Iterator<Item = Buf> + '_ {
-        let n = bufs.len();
-        bufs.iter().enumerate().filter_map(move |(i, b)| {
+        let n = if Self::well_formed(bufs) { bufs.len() } else { 0 };
+        bufs[..n].iter().enumerate().filter_map(move |(i, b)| {
             let (mut gpa, mut len) = (b.gpa, b.len);
             if i == 0 {
-                gpa += 16;
-                len -= 16;
+                gpa = gpa.checked_add(16)?;
+                len = len.checked_sub(16)?;
             }
             if i == n - 1 {
-                len -= 1;
+                len = len.checked_sub(1)?;
             }
             (len != 0).then_some(Buf { gpa, len, write: b.write })
         })
@@ -325,6 +332,8 @@ impl Blk {
     }
 
     /// Response `id` of this generation: its request, if in flight.
+    /// The request blkd answered with `id`: no longer outstanding.  Its
+    /// bounce pages stay taken until `release`.
     fn retire(&mut self, id: u64) -> Option<(u16, Inflight)> {
         if (id >> 32) as u32 != self.generation {
             return None;
@@ -332,10 +341,15 @@ impl Blk {
         let head = id as u16;
         let inf = self.inflight.get_mut(head as usize)?.take()?;
         self.outstanding -= 1;
+        Some((head, inf))
+    }
+
+    /// Give back a retired request's bounce pages (after its data left
+    /// them).
+    fn release(&mut self, inf: &Inflight) {
         if inf.pages != 0 {
             unsafe { (*self.pool).free(inf.first as usize, inf.pages as usize) };
         }
-        Some((head, inf))
     }
 
     fn notify(&mut self) {
@@ -358,7 +372,9 @@ impl Blk {
             match self.next_resp() {
                 Some(r) => {
                     budget -= 1;
-                    self.retire(r.id);
+                    if let Some((_, inf)) = self.retire(r.id) {
+                        self.release(&inf);
+                    }
                 }
                 None => crate::yield_now(),
             }
@@ -444,6 +460,7 @@ impl Backend for Blk {
                 self.flush_inflight = false;
             }
             if !queue.ready {
+                self.release(&inf);
                 continue;
             }
             let status = match resp.status {
@@ -454,11 +471,14 @@ impl Backend for Blk {
             if status == VIRTIO_BLK_S_OK && inf.read {
                 // The chain again, for where the data goes: a guest that
                 // changed it meanwhile only misdirects its own data.
+                // It must still have a header and a status byte.
                 let mut bufs = ArrayVec::<Buf, { QUEUE_SIZE as usize }>::new();
-                if queue.chain(mem, head, &mut bufs).is_ok() && bufs.len() >= 2 {
+                if queue.chain(mem, head, &mut bufs).is_ok() && Self::well_formed(&bufs) {
                     self.copy(mem, &bufs, inf.first, inf.written as u64 - 1, false);
                 }
             }
+            // Its data is out of the bounce pages: they can go.
+            self.release(&inf);
             let written = if status == VIRTIO_BLK_S_OK { inf.written } else { 1 };
             Self::finish(mem, queue, head, inf.status_gpa, status, written);
         }
@@ -567,6 +587,39 @@ mod tests {
         mem.read_bytes(0xc000, &mut got);
         assert!(got.iter().all(|&x| x == 0x5a));
         assert_eq!(mem.read::<u32>(0x3000 + 4 + 8 + 4), 513, "used length");
+    }
+
+    /// A guest that rewrites a read's chain while blkd works on it (its
+    /// header descriptor's length 0, then a single descriptor) only loses
+    /// its data: no panic, the bounce pages come back, the request is done.
+    #[test]
+    fn a_chain_rewritten_under_a_read_is_harmless() {
+        let (mem, _buf) = fake(1 << 20, 0);
+        let (chan, _pool, mut b) = setup(1 << 20);
+        let chan = Box::leak(chan);
+        let mut qs: [Queue; 1] = Default::default();
+        assert!(qs[0].setup(&mem, 16, 128, 0x1000, 0x2000, 0x3000));
+        mem.write::<u32>(0x8000, blk::OP_READ);
+        mem.write::<u64>(0x8008, 0);
+        for (i, rewrite) in [(1u16, 0u8), (2, 1)] {
+            let head = 4 * (i - 1);
+            offer(&mem, head, &[(0x8000, 16, false), (0xc000, 4096, true), (0xb000, 1, true)], i);
+            b.kick(&mem, &mut qs, 0);
+            assert_eq!(unsafe { (*b.pool).free_pages() }, 15, "a bounce page taken");
+            let d = 0x1000 + 16 * head as u64;
+            match rewrite {
+                0 => mem.write::<u32>(d + 8, 0),
+                _ => mem.write::<u16>(d + 12, 0),
+            }
+            let req = chan.reqs[(i - 1) as usize];
+            chan.resps[(i - 1) as usize] = blk::Resp { id: req.id, status: blk::STATUS_OK, reserved: 0 };
+            chan.cq.head.store(i as u32, Ordering::Release);
+            assert_eq!(b.complete(&mem, &mut qs), 1);
+            assert_eq!(unsafe { (*b.pool).free_pages() }, 16, "bounce pages back");
+            assert_eq!(mem.read::<u16>(0x3002), i, "the request is done");
+        }
+        let segs: std::vec::Vec<Buf> = Blk::segments(&[Buf { gpa: 0, len: 3, write: false }, Buf { gpa: 8, len: 0, write: true }]).collect();
+        assert!(segs.is_empty());
     }
 
     #[test]

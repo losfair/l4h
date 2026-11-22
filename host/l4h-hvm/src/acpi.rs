@@ -4,8 +4,10 @@
 //! PM timer, SCI on IRQ 9, the reset register at 0xcf9), FACS, MADT (a
 //! local APIC per vCPU, the I/O APIC, the SCI's override, no 8259:
 //! PCAT_COMPAT clear), MCFG (ECAM of bus 0) and a DSDT with \_S5, the PCI
-//! host bridge \_SB.PCI0 (its windows and INTx routing, _PRT) and the
-//! power button \_SB.PWRB.  Free of seL4.
+//! host bridge \_SB.PCI0 (its windows and INTx routing, _PRT).  The power
+//! button is the fixed-hardware one (FADT's PWR_BUTTON clear, PM1's
+//! PWRBTN), which l4hctl shutdown presses: no control-method one beside
+//! it.  Free of seL4.
 
 use crate::dev::{ioapic, pci, pm};
 
@@ -249,11 +251,6 @@ fn dsdt_body(a: &mut Aml) {
                 });
             });
         });
-        a.device(b"PWRB", |a| {
-            a.name(b"_HID", |a| {
-                a.int(eisa_pnp(0x0c0c));
-            });
-        });
     });
 }
 
@@ -390,12 +387,14 @@ mod tests {
         let m = table(&out[..], MADT);
         assert_eq!(u32::from_le_bytes(m[40..44].try_into().unwrap()), 0, "PCAT_COMPAT clear");
         assert_eq!((m[44], m[45], m[46], m[47]), (0, 8, 0, 0));
-        // DSDT: \_S5_, PCI0's ids, PWRB.
+        // DSDT: \_S5_, PCI0's ids; the power button only the fixed one.
         let d = table(&out[..], DSDT);
         let has = |s: &[u8]| d.windows(s.len()).any(|w| w == s);
-        assert!(has(b"_S5_") && has(b"PCI0") && has(b"PWRB") && has(b"_PRT") && has(b"_CRS"));
+        assert!(has(b"_S5_") && has(b"PCI0") && has(b"_PRT") && has(b"_CRS"));
         assert!(has(&[0x0c, 0x41, 0xd0, 0x0a, 0x08]), "EisaId(PNP0A08)");
-        assert!(has(&[0x0c, 0x41, 0xd0, 0x0c, 0x0c]), "EisaId(PNP0C0C)");
+        assert!(!has(b"PWRB") && !has(&[0x0c, 0x41, 0xd0, 0x0c, 0x0c]), "no PNP0C0C");
+        let flags = u32::from_le_bytes(f[112..116].try_into().unwrap());
+        assert_eq!(flags & (1 << 4), 0, "PWR_BUTTON clear: the fixed power button");
     }
 
     #[test]

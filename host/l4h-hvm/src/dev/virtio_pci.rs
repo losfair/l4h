@@ -324,6 +324,13 @@ impl<B: Backend> Transport<B> {
     pub fn write(&mut self, mem: &GuestMem, bar: usize, off: u64, size: u8, val: u64, out: &mut impl FnMut(Irq)) {
         match (bar, off) {
             (0, COMMON..0x38) => self.write_common(mem, off, size, val, out),
+            // A notification that did not take vcpu.rs's fast path (an
+            // access the I/O thread was asked for, or VIRTIO_PCI_CAP_PCI_CFG).
+            (0, NOTIFY..ISR) => {
+                if let Some(q) = Self::notify_queue(off).filter(|_| off.is_multiple_of(NOTIFY_MULTIPLIER)) {
+                    self.poll(mem, 1 << q, out);
+                }
+            }
             (2, 0..PBA) => {
                 let i = (off / 16) as usize;
                 if i > self.nqueues() || i >= self.msix.len() {

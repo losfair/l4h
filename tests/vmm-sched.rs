@@ -100,6 +100,8 @@ mod guest {
         pub vcpus: Vec<Vcpu>, pub vmm_limits: Option<(usize, sched::budget::Plan)>,
         pub vmm_share: u32, pub vmm_usage: u32, pub vmm_boosted: bool,
         pub vmm_guard: sched::budget::BoostGuard, pub vmm_limited: bool, pub events: Vec<Box<Event>>,
+        /// An HVM guest (its monitor's MCP is l4h_host::hvm::MCP).
+        pub hvm: Option<()>,
     }
     impl Guest {
         pub fn event_page(&self, v: usize) -> *mut Event { (&*self.events[v]) as *const Event as *mut Event }
@@ -131,7 +133,7 @@ fn create(id: usize, core: usize, cap: u32, vcpus: usize) -> Guest {
             usage: 0, k_share: 500, wall_ticks: 0, run_ticks: 0, steal_ns: 0 }).collect(),
         vmm_limits: None, vmm_share: sched::budget::VMM_SHARE_INIT, vmm_usage: 0, vmm_boosted: true,
         vmm_guard: Default::default(), vmm_limited: false,
-        events: (0..vcpus).map(|_| Box::new(Event { idle_ticks: 0, steal_ns: 0, host_cap: 1024 })).collect() }
+        events: (0..vcpus).map(|_| Box::new(Event { idle_ticks: 0, steal_ns: 0, host_cap: 1024 })).collect(), hvm: None }
 }
 fn build(h: &mut Vmmgr, id: usize, core: usize, cap: u32, vcpus: usize) {
     let mut g = create(id, core, cap, vcpus);
@@ -325,6 +327,36 @@ fn dominating_vmms_share_a_background_allowance_and_cannot_restore_their_authori
     assert!(h.guest(0).unwrap().vmm_boosted);
     MODEL.with_borrow(|m| assert_eq!(m.priorities[&9], (101, l4h_host::PRIO_VMM)));
     assert_limits(&h);
+}
+
+/// An HVM guest's monitor (l4h-hvm) is demoted as a VMM is, but its MCP
+/// never rises above hvm::MCP (below the debug syscalls' threshold): only
+/// its priority changes.
+#[test]
+fn a_demoted_hvm_monitor_keeps_its_low_mcp() {
+    let mut h = manager();
+    build(&mut h, 0, 0, 0, 1);
+    {
+        let g = h.guests[0].as_mut().unwrap();
+        g.hvm = Some(());
+        for v in &mut g.vcpus { v.sc_u = None; }
+    }
+    MODEL.with_borrow_mut(|m| { m.priorities.insert(9, (l4h_host::hvm::MCP, l4h_host::PRIO_VMM)); });
+    sched::start(&mut h, 0).unwrap();
+    spawn(&mut h, 1, 0, 0, 1);
+    MODEL.with_borrow_mut(|m| { m.priority_calls.clear(); m.used.extend([(9, 45_000), (19, 45_000), (1, 10_000)]); });
+    sched::balance(&mut h, 100_000);
+    assert!(!h.guest(0).unwrap().vmm_boosted);
+    MODEL.with_borrow(|m| {
+        assert!(m.priority_calls.contains(&(9, "mcp", l4h_host::hvm::MCP)), "{:?}", m.priority_calls);
+        assert!(!m.priority_calls.iter().any(|&(t, what, p)| t == 9 && what == "mcp" && p > l4h_host::hvm::MCP));
+        assert!(m.priorities[&9].0 <= l4h_host::hvm::MCP && l4h_host::hvm::MCP < 101);
+    });
+    for _ in 0..10 {
+        MODEL.with_borrow_mut(|m| m.used.extend([(9, 1000), (1, 50_000)]));
+        sched::balance(&mut h, 100_000);
+    }
+    MODEL.with_borrow(|m| assert_eq!(m.priorities[&9].0, l4h_host::hvm::MCP, "the MCP stays low"));
 }
 
 #[test]

@@ -398,6 +398,57 @@ pub fn decode(bytes: &[u8], mode: Mode) -> Result<Insn, Error> {
     }
 }
 
+/// The length of the instruction in `bytes`, prefixes included: one that
+/// made a VM exit, for a CPU that did not say (AMD-V without next-RIP
+/// saving).  Those decode() knows, and the others that exit: HLT, PAUSE,
+/// IN, OUT, INS, OUTS, CPUID, RDMSR, WRMSR, RDTSC, RDPMC, INVD, WBINVD,
+/// CLTS, MOV to and from CR and DR, and 0F 01's (XSETBV, VMMCALL,
+/// RDTSCP, MONITOR, MWAIT, LMSW, INVLPG...).
+pub fn length(bytes: &[u8], mode: Mode) -> Option<u8> {
+    if let Ok(i) = decode(bytes, mode) {
+        return Some(i.len);
+    }
+    let mut c = Cursor { bytes, at: 0 };
+    let mut addrsize_ovr = false;
+    let mut op;
+    loop {
+        op = c.byte().ok()?;
+        match op {
+            0x67 => addrsize_ovr = true,
+            0x66 | 0xf3 | 0xf2 | 0xf0 | 0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 => {}
+            _ => break,
+        }
+    }
+    let mut rex = 0;
+    if mode == Mode::Bits64 && (0x40..0x50).contains(&op) {
+        rex = op;
+        op = c.byte().ok()?;
+    }
+    let addr: u8 = match mode {
+        Mode::Bits64 => if addrsize_ovr { 4 } else { 8 },
+        Mode::Bits32 => if addrsize_ovr { 2 } else { 4 },
+        Mode::Bits16 => if addrsize_ovr { 4 } else { 2 },
+    };
+    match op {
+        0xf4 | 0x90 | 0x6c..=0x6f | 0xec..=0xef => {}
+        0xe4..=0xe7 => {
+            c.byte().ok()?;
+        }
+        0x0f => match c.byte().ok()? {
+            0x06 | 0x08 | 0x09 | 0x30..=0x33 | 0xa2 => {}
+            0x20..=0x23 => {
+                c.byte().ok()?;
+            }
+            0x01 => {
+                modrm(&mut c, rex, addr).ok()?;
+            }
+            _ => return None,
+        },
+        _ => return None,
+    }
+    Some(c.at as u8)
+}
+
 /// An immediate of an operand of `size` bytes: 4 bytes, sign-extended,
 /// for a 64-bit one.
 fn imm_of(c: &mut Cursor, size: u8) -> Result<u64, Error> {
@@ -653,6 +704,28 @@ mod tests {
         assert_eq!(decode(&[0x48, 0x89, 0x08], Mode::Bits32), Err(Error::Unsupported));
         let i = decode(&[0x66, 0x89, 0x08], Mode::Bits32).unwrap();
         assert_eq!(i.size, 2);
+    }
+
+    #[test]
+    fn lengths_of_exiting_instructions() {
+        let l = |b: &[u8]| length(b, Mode::Bits64);
+        assert_eq!(l(&[0x0f, 0xa2, 0x90]), Some(2), "CPUID");
+        assert_eq!(l(&[0x0f, 0x32]), Some(2));
+        assert_eq!(l(&[0x0f, 0x30]), Some(2));
+        assert_eq!(l(&[0xf4]), Some(1), "HLT");
+        assert_eq!(l(&[0xf3, 0x90]), Some(2), "PAUSE");
+        assert_eq!(l(&[0x0f, 0x01, 0xd1]), Some(3), "XSETBV");
+        assert_eq!(l(&[0x0f, 0x01, 0x3c, 0x24]), Some(4), "INVLPG [rsp]");
+        assert_eq!(l(&[0x0f, 0x01, 0xb8, 0x44, 0x33, 0x22, 0x11]), Some(7), "INVLPG [rax+disp32]");
+        assert_eq!(l(&[0x0f, 0x22, 0xd8]), Some(3), "MOV CR3, rax");
+        assert_eq!(l(&[0x44, 0x0f, 0x20, 0xc0]), Some(4), "MOV rax, CR8");
+        assert_eq!(l(&[0x0f, 0x23, 0xf8]), Some(3), "MOV DR7, rax");
+        assert_eq!(l(&[0x66, 0xe5, 0x71]), Some(3), "IN ax, 0x71");
+        assert_eq!(l(&[0xf3, 0x6d]), Some(2), "REP INSD");
+        assert_eq!(l(&[0x0f, 0x06]), Some(2), "CLTS");
+        assert_eq!(l(&[0x89, 0x03]), Some(2), "decode()'s own");
+        assert_eq!(l(&[0x0f, 0x0b]), None, "UD2 does not exit");
+        assert_eq!(l(&[0x0f]), None, "truncated");
     }
 
     #[test]
