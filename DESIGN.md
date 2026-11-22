@@ -4308,6 +4308,20 @@ The chain has four links.
    - Linux exposes both as configfs-tsm reports (provider `l4h`: `inblob`,
      `outblob`, and the evidence as `auxblob`) and through
      `/dev/l4h-attest` (`l4hctl attest`).
+   - `L4H_ATTEST_EVENT_LOG` returns the firmware's UEFI TPM 2.0 event log
+     as the boot loader passed it on, raw, in pieces like the evidence, or
+     `-ENOENT` without one. Only FL4's own loader (`fl4-efi`) passes one,
+     as the BootInfo record `TPM_EVENT_LOG` (12: address, size, flags);
+     GRUB and the C seL4 kernel do not. Root carves its pages (at most
+     1 MiB, `trust::EVENT_LOG_MAX`) before it makes trustd and maps them
+     read-only in trustd alone (`trust::EVENT_LOG_VA`), whether trustd
+     then has the TPM or serves flags only, so every guest, dom0 or not,
+     gets the same log until the host reboots. It is neither in the
+     evidence nor signed: the verifier replays it and requires the quoted
+     PCRs 0–14, which nothing extends after ExitBootServices (trustd quotes
+     before it extends PCR 15). Linux gives it as
+     `/sys/kernel/l4h/attest/event_log` (root only, read from the host a
+     piece at a time, not kept) and `l4hctl attest event-log`.
 4. **Verification.** `tools/l4h-attest.py verify` checks that:
    - the AK is a fixedTPM restricted signing key, and the quote verifies
      under it;
@@ -4317,7 +4331,11 @@ The chain has four links.
    - the EK certificate is issued directly by the CA certificate given with
      `--ek-ca` (no chain building);
    - the report verifies under K and carries the verifier's nonce and the
-     expected launch digest. `measure` computes the digest from the kernel
+     expected launch digest;
+   - with `--event-log`, the host's event log (TCG2 crypto agile format)
+     replays, in its SHA-256 bank, to the quoted PCRs 0–14; its events
+     then say what the firmware measured (`l4h-attest.py event-log` lists
+     them). `measure` computes the digest from the kernel
      (`vmlinux` in a release's debug archive), initramfs and command line.
 
    **AK enrollment.** A quote only proves something if the AK is in a real
@@ -4466,7 +4484,8 @@ checking taint alone leaves a session key exposed after its report.
 **Without a TPM.** trustd always starts, on both architectures. With no TPM,
 an unsupported one, or a failed initialization, it is a flags-only service:
 ACT, SEAL and VM_TRUST work, while REPORT, EVIDENCE and ACTIVATE return
-`-ENODEV`. `L4H_ATTEST_NO_REPORTS` (set by root when no TPM was found, or by
+`-ENODEV`; EVENT_LOG still returns the log the boot loader passed on, if
+any (`-ENOENT` otherwise, which does not mean no reports). `L4H_ATTEST_NO_REPORTS` (set by root when no TPM was found, or by
 trustd on failure) tells Linux, which keeps `/dev/l4h-attest` and registers
 configfs-tsm only when reports work; `l4hctl attest report` says `no TPM:
 flags only`. Local seals still work, but have no remote proof. A later TPM
@@ -5827,7 +5846,7 @@ tools/build-fl4.sh
 SEL4_PREFIX="$PWD/build/sel4-fl4" L4H_KERNEL_VARIANT=fl4 tests/run-selftest.sh 4
 ```
 
-The tested FL4 revision is `991586ba83a689c7f27bd167f8b257337be84778`.
+The tested FL4 revision is `d45d64d44dfcc47eb4aeb74087aea599dcf9770f`.
 `prepare-fl4.sh` clones the pinned public revision, or the frozen override,
 into `build/FL4-src` without applying any kernel patches. The source
 worktree is not edited.

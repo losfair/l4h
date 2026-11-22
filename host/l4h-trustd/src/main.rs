@@ -64,7 +64,7 @@ use crate::relay::{Relay, Served, Wait};
 use crate::tpm::{Error, Tpm};
 use crate::tpm2::Template;
 
-use l4h_rt::host::errno::{EAGAIN, EINVAL, EIO, ENODEV, ENOSYS, ETIMEDOUT, Errno};
+use l4h_rt::host::errno::{EAGAIN, EINVAL, EIO, ENODEV, ENOENT, ENOSYS, ETIMEDOUT, Errno};
 /// Not errnos (all of those are below): execute() did not answer, as the
 /// request waits for the relay to be free (DEFER) or for its answer
 /// (PENDING).
@@ -608,11 +608,12 @@ fn page_of(id: usize, r: &GuestRecord) -> usize {
 
 /// The result of guest `id`'s request `seq` in its page (the evidence, or
 /// what we built in `out`), or -errno.  `starting`: a secondary waits for
-/// its key's quote.
+/// its key's quote.  `event_log`: the host's TPM event log, empty if none.
 #[allow(clippy::too_many_arguments)]
 fn execute<'a>(
     state: &'a mut Option<State>,
     starting: bool,
+    event_log: &'static [u8],
     id: usize,
     seq: u32,
     r: &GuestRecord,
@@ -641,6 +642,13 @@ fn execute<'a>(
         out[..32].copy_from_slice(&flags.taint);
         out[32..64].copy_from_slice(&flags.seal);
         return Ok(&out[..64]);
+    }
+    // The firmware's log, as root mapped it: with a TPM or without (flags
+    // only), every guest alike.  None is ENOENT, not ENODEV, which would
+    // tell the guest there are no reports.
+    if op == abi::ATTEST_EVENT_LOG {
+        if in_len != 0 { return Err(EINVAL); }
+        return if event_log.is_empty() { Err(ENOENT) } else { Ok(event_log) };
     }
     if !matches!(op, abi::ATTEST_REPORT | abi::ATTEST_EVIDENCE | abi::ATTEST_ACTIVATE) { return Err(ENOSYS); }
     let Some(s) = state else { return Err(if starting { DEFER } else { ENODEV }) };
@@ -735,6 +743,13 @@ fn main(info: &'static Info) -> ! {
     }
     let cfg: &TrustdConfig = unsafe { info.config() };
     let hz = info.header().tsc_hz;
+    // Root maps the event log read-only here for good, cfg.event_log_size
+    // bytes of it (trust::EVENT_LOG_VA), and nothing writes it.
+    let event_log: &'static [u8] = if cfg.event_log_size > 0 && cfg.event_log_size <= trust::EVENT_LOG_MAX as u64 {
+        unsafe { core::slice::from_raw_parts(trust::EVENT_LOG_VA as *const u8, cfg.event_log_size as usize) }
+    } else {
+        &[]
+    };
     let t0 = host::ticks::now();
     let mut relay = Relay::new(cfg.partition, cfg.partitions);
     let partition = relay.as_ref().map(|r| r.index);
@@ -827,7 +842,7 @@ fn main(info: &'static Info) -> ! {
             if seq == last.seq {
                 continue;
             }
-            let result = execute(&mut state, starting.is_some(), id, seq, &r, last, hz, relay.as_mut(), &mut out);
+            let result = execute(&mut state, starting.is_some(), event_log, id, seq, &r, last, hz, relay.as_mut(), &mut out);
             match result {
                 Err(DEFER) => {
                     deferred |= host::badges::trustd_kick::GUEST.nth(id);

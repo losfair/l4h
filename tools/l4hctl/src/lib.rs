@@ -1419,6 +1419,7 @@ pub mod attest {
     const ACTIVATE: u32 = 3;
     const ACT: u32 = 4;
     const SEAL: u32 = 5;
+    const EVENT_LOG: u32 = 6;
     pub const FLAG_BITS: usize = 256;
     pub const DATA_SIZE: usize = 64;
 
@@ -1450,16 +1451,44 @@ pub mod attest {
             data: data.as_ptr() as u64,
             out: out.as_mut_ptr() as u64,
         };
-        if unsafe { ioctl(dev.as_raw_fd(), IOC, &mut c as *mut Ioc) } < 0 {
+        let mut r = unsafe { ioctl(dev.as_raw_fd(), IOC, &mut c as *mut Ioc) };
+        // A longer result (an event log can be): the driver said how long
+        // (c.out_len); ask again with that much room, once.
+        if r < 0 {
             let e = io::Error::last_os_error();
-            return err(match e.raw_os_error() {
-                Some(19) => "no TPM: flags only".into(),
-                Some(38) => "host has no taint/seal operations".into(),
-                _ => format!("attestation request {op} failed: {e}"),
-            });
+            if let Some(n) = grown(e.raw_os_error(), c.out_len, out.len()) {
+                out.resize(n, 0);
+                c.out_len = n as u32;
+                c.out = out.as_mut_ptr() as u64;
+                r = unsafe { ioctl(dev.as_raw_fd(), IOC, &mut c as *mut Ioc) };
+            } else {
+                return Err(failed(op, e));
+            }
+        }
+        if r < 0 {
+            return Err(failed(op, io::Error::last_os_error()));
         }
         out.truncate(c.out_len as usize);
         Ok(out)
+    }
+
+    /// The most a result may need (an event log is at most 1 MiB).
+    const OUT_MAX: usize = 4 << 20;
+
+    /// The room to retry with after an error `errno` that said the result
+    /// is `need` bytes, with `have`: only for ENOSPC, and within OUT_MAX.
+    fn grown(errno: Option<i32>, need: u32, have: usize) -> Option<usize> {
+        let need = need as usize;
+        (errno == Some(28) && need > have && need <= OUT_MAX).then_some(need)
+    }
+
+    fn failed(op: u32, e: io::Error) -> Error {
+        Error(match e.raw_os_error() {
+            Some(2) => "no TPM event log available".into(),
+            Some(19) => "no TPM: flags only".into(),
+            Some(38) => "host has no taint/seal operations".into(),
+            _ => format!("attestation request {op} failed: {e}"),
+        })
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1534,6 +1563,12 @@ pub mod attest {
         call(EVIDENCE, &[], 0)
     }
 
+    /// The host's UEFI TPM 2.0 event log, raw (TCG2 crypto agile format):
+    /// replayed, it gives the PCRs the evidence quotes.
+    pub fn event_log() -> Result<Vec<u8>> {
+        call(EVENT_LOG, &[], 0)
+    }
+
     /// TPM2_ActivateCredential of a credential made for the host's
     /// attestation key, in the format of tpm2_makecredential (and
     /// tools/l4h-attest.py make-credential): magic 0xbadcc0de, version 1,
@@ -1550,6 +1585,31 @@ pub mod attest {
         let blob = tpm2b(8)?;
         let secret = tpm2b(10 + blob.len())?;
         call(ACTIVATE, &[blob, secret].concat(), blob.len())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn retries_only_a_longer_result() {
+            // ENOSPC with the result's length: room for it, up to OUT_MAX.
+            assert_eq!(grown(Some(28), 200 << 10, 64 << 10), Some(200 << 10));
+            assert_eq!(grown(Some(28), OUT_MAX as u32, 64 << 10), Some(OUT_MAX));
+            assert_eq!(grown(Some(28), OUT_MAX as u32 + 1, 64 << 10), None);
+            // Not shorter or equal (nothing to gain), nor other errors.
+            assert_eq!(grown(Some(28), 64 << 10, 64 << 10), None);
+            assert_eq!(grown(Some(2), 200 << 10, 64 << 10), None);
+            assert_eq!(grown(None, 200 << 10, 64 << 10), None);
+        }
+
+        #[test]
+        fn error_messages() {
+            let msg = |n| failed(EVENT_LOG, io::Error::from_raw_os_error(n)).0;
+            assert_eq!(msg(2), "no TPM event log available");
+            assert_eq!(msg(19), "no TPM: flags only");
+            assert!(msg(5).starts_with("attestation request 6 failed"));
+        }
     }
 }
 

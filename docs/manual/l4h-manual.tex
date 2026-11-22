@@ -1973,6 +1973,12 @@ tools/l4h-attest.py measure vmlinux --initrd initrd --cmdline "console=hvc0"
 tools/l4h-attest.py verify report evidence --data $NONCE --launch $DIGEST \
     --ak-name $AK --pcr 4=$PCR4 --ek-ca manufacturer-ca.pem
 \end{lstlisting}
+On a host booted by FL4's own UEFI loader, \cmd{l4hctl attest event-log -o
+eventlog} (or \file{/sys/kernel/l4h/attest/event\_log}) gives the
+firmware's TPM event log, the same in every guest; \texttt{verify
+--event-log eventlog} replays it and requires the quoted PCRs 0--14, and
+\cmd{tools/l4h-attest.py event-log eventlog} lists what the firmware
+measured.
 \cmd{measure} prints the launch digest a guest gets from those files,
 with the initramfs where the host puts it (1~MiB past the kernel's end;
 \texttt{--initrd-gpa} gives another address), which the digest includes;

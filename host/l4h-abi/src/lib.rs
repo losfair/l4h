@@ -578,6 +578,11 @@ pub const ATTEST_EVIDENCE: u32 = 2;
 pub const ATTEST_ACTIVATE: u32 = 3;
 pub const ATTEST_ACT: u32 = 4;
 pub const ATTEST_SEAL: u32 = 5;
+/// No data: the host's UEFI TPM 2.0 event log (raw, TCG2 crypto agile
+/// format), in pieces past ATTEST_PAGE_DATA like any result; -ENOENT if
+/// the host has none.  The same for every guest, dom0 or not, until the
+/// host reboots.
+pub const ATTEST_EVENT_LOG: u32 = 6;
 pub const FLAG_BITS: usize = 256;
 pub const FLAG_HOST: usize = 0;
 pub const FLAG_GUEST: usize = 64;

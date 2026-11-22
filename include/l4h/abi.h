@@ -1208,6 +1208,14 @@ enum l4h_hypercall {
  *   attestation key.  Returns the decrypted credential, which proves to a
  *   verifier that the attestation key is in the TPM with that EK.  It can
  *   take the TPM seconds.
+ * - L4H_ATTEST_EVENT_LOG: no data.  Returns the UEFI TPM 2.0 event log
+ *   the host firmware wrote, as the boot loader passed it on: the raw
+ *   binary log (TCG2 crypto agile format, or TCG 1.2 where the firmware
+ *   had only that), in pieces like any result longer than
+ *   L4H_ATTEST_PAGE_DATA.  Replaying it gives the values of the PCRs the
+ *   evidence quotes (0-14).  -ENOENT if the host has none (no TPM, no log,
+ *   or a boot path that does not pass it on).  Every guest, dom0 or not,
+ *   gets the same log until the host reboots.
  *
  * status: 0 or -errno; -EIO: the TPM failed.
  */
@@ -1221,6 +1229,8 @@ enum l4h_attest_op {
 	/* data: 32-byte bitmap, defined host bits or userspace bits only.
 	 * Returns l4h_attest_flags. */
 	L4H_ATTEST_SEAL = 5,
+	/* No data.  Returns the host's TPM event log; -ENOENT without one. */
+	L4H_ATTEST_EVENT_LOG = 6,
 };
 #define L4H_FLAG_BITS           256
 #define L4H_FLAG_HOST           0   /* 0-31 host; 32-63 reserved for host */

@@ -244,6 +244,8 @@ In any guest (flags work without a TPM):
   attest report [HEX] [-o F]   report on this guest with HEX (up to 64
                                bytes) as its data; hex, or binary to F
   attest evidence [-o F]       the host evidence; hex, or binary to F
+  attest event-log [-o F]      the host's UEFI TPM event log (raw TCG2
+                               format); hex, or binary to F
   attest activate F            decrypt the credential F (tpm2_makecredential
                                format) for the host's attestation key";
 
@@ -271,7 +273,7 @@ fn cmd_attest(args: &[String]) -> Result<i32> {
     }
     let action = args.first().map(String::as_str);
     if matches!(action, Some("flags" | "seal" | "act")) {
-        if out.is_some() { return err("flags commands print bit lists; -o is for reports and evidence"); }
+        if out.is_some() { return err("flags commands print bit lists; -o is for reports, evidence and the event log"); }
         let f = match action {
             Some("flags") if pos.is_empty() => attest::flags()?,
             Some("seal") if !pos.is_empty() => attest::seal(&attest::bitmap(&pos)?)?,
@@ -290,6 +292,7 @@ fn cmd_attest(args: &[String]) -> Result<i32> {
         (Some("report"), []) => attest::report(&[])?,
         (Some("report"), [data]) => attest::report(&unhex(data)?)?,
         (Some("evidence"), []) => attest::evidence()?,
+        (Some("event-log"), []) => attest::event_log()?,
         (Some("activate"), [file]) => attest::activate(&read_file(file)?)?,
         _ => {
             eprintln!("{USAGE}");

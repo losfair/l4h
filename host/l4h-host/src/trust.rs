@@ -69,6 +69,11 @@ pub struct TrustdConfig {
     /// when root is the only kernel (no relay).
     pub partition: u32,
     pub partitions: u32,
+    /// The UEFI TPM event log (BootInfo TPM_EVENT_LOG), mapped read-only
+    /// at EVENT_LOG_VA: its exact length, 0 if none, and its flags
+    /// (EVENT_LOG_TRUNCATED, EVENT_LOG_TCG_1_2).
+    pub event_log_size: u64,
+    pub event_log_flags: u64,
 }
 
 pub const TPM_VA: usize = crate::MMIO_VA;
@@ -224,6 +229,16 @@ pub const FLAGS_ACT: u64 = call::Request::Act { guest: 0, instance: 0, bits: [0;
 pub const FLAGS_SEAL: u64 = call::Request::Seal { guest: 0, instance: 0, bits: [0; 4], flags: 0 }.label();
 /// Most ACPI table bytes root gives trustd.
 pub const AML_MAX: usize = 4 << 20;
+/// The UEFI TPM event log the boot loader passed on (TrustdConfig), which
+/// trustd gives guests as it is (abi::ATTEST_EVENT_LOG), right after the
+/// ACPI tables.  At most EVENT_LOG_MAX bytes, as FL4 takes (MAX_TPM_LOG).
+pub const EVENT_LOG_VA: usize = AML_VA + AML_MAX;
+pub const EVENT_LOG_MAX: usize = 1 << 20;
+const _: () = assert!(AML_VA + AML_MAX <= EVENT_LOG_VA && EVENT_LOG_VA + EVENT_LOG_MAX <= crate::MMIO_VA);
+/// TrustdConfig::event_log_flags (seL4_TpmEventLog's): events are missing
+/// at the end of the log; the log is TCG 1.2 (SHA-1), not crypto agile.
+pub const EVENT_LOG_TRUNCATED: u64 = 1 << 0;
+pub const EVENT_LOG_TCG_1_2: u64 = 1 << 1;
 
 /// The flags server's scheduling context, and its keeper's: FLAGS_BUDGET_US
 /// of every FLAGS_PERIOD_US, at the highest priority.  A request takes

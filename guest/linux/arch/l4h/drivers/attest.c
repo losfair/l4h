@@ -9,6 +9,9 @@
  *   report (COSE_Sign1), auxblob the host evidence (CBOR).
  * - /dev/l4h-attest: ioctl(L4H_ATTEST_IOC) makes any request,
  *   ActivateCredential included, for tools such as l4hctl.
+ * - /sys/kernel/l4h/attest/{taint,seal}: the flags, as bit lists, and
+ *   event_log (root only): the host's UEFI TPM event log, read from the
+ *   host a piece at a time as it is read (-ENOENT if the host has none).
  *
  * Requests are asynchronous: the caller sleeps until the host's answer
  * raises the device's event, and the vCPU runs other tasks meanwhile.
@@ -83,6 +86,64 @@ static irqreturn_t attest_interrupt(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
+/* attest_lock held.  The host would write the answer to a request whose
+ * caller gave up over the next one: wait for it first. */
+static int attest_settle_locked(void)
+{
+	if (outstanding) {
+		if (wait_event_killable(answered, attest_answered(outstanding)))
+			return -EINTR;
+		outstanding = 0;
+	}
+	return 0;
+}
+
+/*
+ * One request, attest_lock held: `op` with `in_len` bytes of `in`
+ * (`blob_len` of them the credential blob), answered from byte `offset`
+ * of the result.  On success page->data holds *n bytes of a result of
+ * *total bytes.
+ */
+static int attest_request_locked(u32 op, const u8 *in, size_t in_len, size_t blob_len, size_t offset,
+				 size_t *total, u32 *n)
+{
+	/* 0 is "none" (outstanding, and the page's initial seq). */
+	u32 s = ++seq ?: ++seq;
+	s32 status;
+	long left;
+
+	if (READ_ONCE(page->state) & L4H_ATTEST_FAILED)
+		return -EIO;
+	WRITE_ONCE(page->op, op);
+	WRITE_ONCE(page->offset, offset);
+	WRITE_ONCE(page->in_len, in_len);
+	WRITE_ONCE(page->blob_len, blob_len);
+	if (in_len)
+		memcpy(page->data, in, in_len);
+	smp_wmb();
+	WRITE_ONCE(page->seq, s);
+	l4h_signal(kick_cap);
+	left = wait_event_killable_timeout(answered, attest_answered(s), ATTEST_TIMEOUT);
+	if (left <= 0) {
+		outstanding = s;
+		return left ? -EINTR : -ETIMEDOUT;
+	}
+	if (READ_ONCE(page->done) != s)
+		return -EIO;	/* the host failed */
+	smp_rmb();
+	/* Read once: the host's page.  An errno, or the host failed; a
+	 * status that changed under a second read must not pass for
+	 * success with no answer (a taint lost, flush_taints()). */
+	status = READ_ONCE(page->status);
+	if (status)
+		return status < 0 && status >= -MAX_ERRNO ? status : -EIO;
+	*n = READ_ONCE(page->out_len);
+	*total = READ_ONCE(page->total);
+	if (*n > L4H_ATTEST_PAGE_DATA)
+		return -EIO;
+	return 0;
+}
+
 /*
  * Run request `op` with `in_len` bytes of `in` (`blob_len` of them the
  * credential blob) and collect its result, which may take several
@@ -92,66 +153,29 @@ static int attest_call_locked(u32 op, const u8 *in, size_t in_len, size_t blob_l
 {
 	size_t total = 0, got = 0;
 	u8 *buf = NULL;
-	int ret = 0;
+	int ret;
 
 	if (in_len > L4H_ATTEST_PAGE_DATA)
 		return -EINVAL;
-	/* The host would write that answer over our request. */
-	if (outstanding) {
-		if (wait_event_killable(answered, attest_answered(outstanding))) {
-			return -EINTR;
-		}
-		outstanding = 0;
-	}
+	ret = attest_settle_locked();
+	if (ret)
+		return ret;
 	do {
-		/* 0 is "none" (outstanding, and the page's initial seq). */
-		u32 s = ++seq ?: ++seq, n;
-		s32 status;
-		long left;
+		size_t t;
+		u32 n;
 
-		if (READ_ONCE(page->state) & L4H_ATTEST_FAILED) {
-			ret = -EIO;
+		ret = attest_request_locked(op, in, in_len, blob_len, got, &t, &n);
+		if (ret)
 			break;
-		}
-		WRITE_ONCE(page->op, op);
-		WRITE_ONCE(page->offset, got);
-		WRITE_ONCE(page->in_len, in_len);
-		WRITE_ONCE(page->blob_len, blob_len);
-		if (in_len)
-			memcpy(page->data, in, in_len);
-		smp_wmb();
-		WRITE_ONCE(page->seq, s);
-		l4h_signal(kick_cap);
-		left = wait_event_killable_timeout(answered, attest_answered(s), ATTEST_TIMEOUT);
-		if (left <= 0) {
-			outstanding = s;
-			ret = left ? -EINTR : -ETIMEDOUT;
-			break;
-		}
-		if (READ_ONCE(page->done) != s) {
-			ret = -EIO;	/* the host failed */
-			break;
-		}
-		smp_rmb();
-		/* Read once: the host's page.  An errno, or the host failed; a
-		 * status that changed under a second read must not pass for
-		 * success with no answer (a taint lost, flush_taints()). */
-		status = READ_ONCE(page->status);
-		if (status) {
-			ret = status < 0 && status >= -MAX_ERRNO ? status : -EIO;
-			break;
-		}
-		n = READ_ONCE(page->out_len);
 		if (!buf) {
-			total = READ_ONCE(page->total);
+			total = t;
 			buf = kvmalloc(max_t(size_t, total, 1), GFP_KERNEL);
 			if (!buf) {
 				ret = -ENOMEM;
 				break;
 			}
 		}
-		if (n > L4H_ATTEST_PAGE_DATA || READ_ONCE(page->total) != total || got + n > total ||
-		    (!n && got < total)) {
+		if (t != total || got + n > total || (!n && got < total)) {
 			ret = -EIO;
 			break;
 		}
@@ -165,6 +189,41 @@ static int attest_call_locked(u32 op, const u8 *in, size_t in_len, size_t blob_l
 	*out = buf;
 	*out_len = total;
 	return 0;
+}
+
+/*
+ * Up to `count` bytes of the result of `op` (no data) from byte `off`
+ * into `buf`, attest_lock held, asking only for those pieces: the number
+ * read, 0 past its end, or -errno.
+ */
+static ssize_t attest_read_locked(u32 op, loff_t off, char *buf, size_t count)
+{
+	size_t got = 0;
+	int ret = attest_settle_locked();
+
+	if (ret)
+		return ret;
+	if (off < 0)
+		return -EINVAL;
+	while (got < count) {
+		size_t at = off + got, total;
+		u32 n;
+
+		/* The host's offsets are 32-bit: past any result. */
+		if (at > U32_MAX)
+			break;
+		ret = attest_request_locked(op, NULL, 0, 0, at, &total, &n);
+		if (ret)
+			return ret;
+		if (at >= total)
+			break;
+		if (!n || at + n > total)
+			return -EIO;
+		n = min_t(size_t, n, count - got);
+		memcpy(buf + got, page->data, n);
+		got += n;
+	}
+	return got;
 }
 
 /* attest_lock held. Put failed sends back: losing a taint on interruption
@@ -313,7 +372,28 @@ static ssize_t flags_show(struct kobject *kobj, struct kobj_attribute *attr, cha
 static struct kobj_attribute taint_attr = __ATTR(taint, 0444, flags_show, NULL);
 static struct kobj_attribute seal_attr = __ATTR(seal, 0444, flags_show, NULL);
 static struct attribute *flags_attrs[] = { &taint_attr.attr, &seal_attr.attr, NULL };
-static const struct attribute_group flags_group = { .name = "attest", .attrs = flags_attrs };
+
+/* The host's TPM event log, the pieces read: it can be a megabyte, and
+ * is not kept in the guest. */
+static ssize_t event_log_read(struct file *f, struct kobject *kobj, const struct bin_attribute *attr,
+			      char *buf, loff_t off, size_t count)
+{
+	ssize_t ret;
+
+	if (mutex_lock_killable(&attest_lock))
+		return -EINTR;
+	ret = flush_taints();
+	if (!ret)
+		ret = attest_read_locked(L4H_ATTEST_EVENT_LOG, off, buf, count);
+	mutex_unlock(&attest_lock);
+	return ret;
+}
+/* Root only, as /dev/l4h-attest. */
+static const BIN_ATTR_ADMIN_RO(event_log, 0);
+static const struct bin_attribute *const flags_bin_attrs[] = { &bin_attr_event_log, NULL };
+static const struct attribute_group flags_group = {
+	.name = "attest", .attrs = flags_attrs, .bin_attrs = flags_bin_attrs,
+};
 
 static long attest_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 {
@@ -353,6 +433,7 @@ static long attest_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 			return -EINVAL;
 		break;
 	case L4H_ATTEST_EVIDENCE:
+	case L4H_ATTEST_EVENT_LOG:
 		in_len = 0;
 		break;
 	default:
@@ -372,6 +453,8 @@ static long attest_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 		ret = attest_report(in, in_len, &out, &len);
 	else if (c.op == L4H_ATTEST_EVIDENCE)
 		ret = attest_evidence(&out, &len);
+	else if (c.op == L4H_ATTEST_EVENT_LOG)
+		ret = attest_call(L4H_ATTEST_EVENT_LOG, NULL, 0, 0, &out, &len);
 	else
 		ret = attest_call(c.op, in, in_len, c.blob_len, &out, &len);
 	kfree(in);

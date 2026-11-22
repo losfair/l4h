@@ -33,7 +33,7 @@
       reports carry as "launch".  The initrd's address is part of it.
   l4h-attest.py verify REPORT EVIDENCE [--data HEX] [--launch HEX]
                 [--pcr N=HEX]... [--ak-name HEX] [--ek-ca PEM]
-                [--deny-taint SPEC] [--require-seal SPEC]
+                [--deny-taint SPEC] [--require-seal SPEC] [--event-log FILE]
       Check a report (l4hctl attest report -o) against the host evidence
       (l4hctl attest evidence -o), and print what they claim as JSON.
       Without --ak-name the attestation key is not known to be a TPM's.
@@ -41,6 +41,14 @@
       console input before: input after the report would be unattested.
       A multikernel host's report and evidence name the partition the
       guest runs in (version 2); verify prints it as "partition".
+      --event-log takes the host's UEFI TPM event log (l4hctl attest
+      event-log -o): replayed, it must give the quoted PCRs 0-14, which
+      nothing changes after the firmware's ExitBootServices (trustd quotes
+      before it extends PCR 15).  Its events then say what the firmware
+      measured.
+  l4h-attest.py event-log FILE
+      The events of a UEFI TPM 2.0 event log (TCG2 crypto agile format)
+      and the SHA-256 PCR values they replay to, as JSON.
   l4h-attest.py make-credential EVIDENCE SECRET_HEX -o FILE [--ek PEM]
                 [--ek-ca PEM]
       A credential for the host's attestation key, encrypted to its EK
@@ -225,6 +233,152 @@ class Reader:
 
     def tpm2b(self):
         return self.take(self.u16())
+
+
+# ---- The UEFI TPM 2.0 event log (TCG PC Client Platform Firmware Profile,
+# crypto agile format: a TCG_PCR_EVENT holding the Spec ID event, then
+# TCG_PCR_EVENT2s; little-endian)
+
+
+EV_NO_ACTION = 3
+TPM_ALG_SHA256 = 0x000B
+SPEC_ID = b"Spec ID Event03\0"
+STARTUP_LOCALITY = b"StartupLocality\0"
+# PCRs nothing extends after ExitBootServices: trustd quotes them before
+# it extends KEY_PCR.
+EVENT_LOG_PCRS = range(KEY_PCR)
+EVENT_TYPES = {
+    0x0: "EV_PREBOOT_CERT", 0x1: "EV_POST_CODE", 0x3: "EV_NO_ACTION", 0x4: "EV_SEPARATOR", 0x5: "EV_ACTION",
+    0x6: "EV_EVENT_TAG", 0x7: "EV_S_CRTM_CONTENTS", 0x8: "EV_S_CRTM_VERSION", 0x9: "EV_CPU_MICROCODE",
+    0xA: "EV_PLATFORM_CONFIG_FLAGS", 0xB: "EV_TABLE_OF_DEVICES", 0xC: "EV_COMPACT_HASH", 0xD: "EV_IPL",
+    0xE: "EV_IPL_PARTITION_DATA", 0xF: "EV_NONHOST_CODE", 0x10: "EV_NONHOST_CONFIG", 0x11: "EV_NONHOST_INFO",
+    0x12: "EV_OMIT_BOOT_DEVICE_EVENTS", 0x80000001: "EV_EFI_VARIABLE_DRIVER_CONFIG",
+    0x80000002: "EV_EFI_VARIABLE_BOOT", 0x80000003: "EV_EFI_BOOT_SERVICES_APPLICATION",
+    0x80000004: "EV_EFI_BOOT_SERVICES_DRIVER", 0x80000005: "EV_EFI_RUNTIME_SERVICES_DRIVER",
+    0x80000006: "EV_EFI_GPT_EVENT", 0x80000007: "EV_EFI_ACTION", 0x80000008: "EV_EFI_PLATFORM_FIRMWARE_BLOB",
+    0x80000009: "EV_EFI_HANDOFF_TABLES", 0x8000000A: "EV_EFI_PLATFORM_FIRMWARE_BLOB2",
+    0x8000000B: "EV_EFI_HANDOFF_TABLES2", 0x8000000C: "EV_EFI_VARIABLE_BOOT2", 0x80000010: "EV_EFI_HCRTM_EVENT",
+    0x800000E0: "EV_EFI_VARIABLE_AUTHORITY", 0x800000E1: "EV_EFI_SPDM_FIRMWARE_BLOB",
+    0x800000E2: "EV_EFI_SPDM_FIRMWARE_CONFIG",
+}
+
+
+class LogReader:
+    def __init__(self, b):
+        self.b, self.at = b, 0
+
+    def take(self, n):
+        if n > len(self.b) - self.at:
+            raise Fail("event log cut short at byte %d" % self.at)
+        s = self.b[self.at:self.at + n]
+        self.at += n
+        return s
+
+    def u8(self):
+        return self.take(1)[0]
+
+    def u16(self):
+        return struct.unpack("<H", self.take(2))[0]
+
+    def u32(self):
+        return struct.unpack("<I", self.take(4))[0]
+
+
+@checked("event log")
+def parse_event_log(log):
+    """The digest sizes the Spec ID event lists ({algorithm: size}) and the
+    TCG_PCR_EVENT2s after it, each {"pcr", "type", "digests": {algorithm:
+    digest}, "data"}.  The whole log must be events: no bytes left over."""
+    if not isinstance(log, bytes):
+        raise Fail("event log is not bytes")
+    r = LogReader(log)
+    # The header: a TCG 1.2 TCG_PCR_EVENT (SHA-1 digest) of type
+    # EV_NO_ACTION holding TCG_EfiSpecIDEventStruct.
+    pcr, kind, _, size = r.u32(), r.u32(), r.take(20), r.u32()
+    spec = LogReader(r.take(size))
+    if pcr != 0 or kind != EV_NO_ACTION or spec.take(16) != SPEC_ID:
+        raise Fail("not a TCG2 crypto agile event log (no Spec ID Event03)")
+    spec.take(4 + 4)  # platformClass, version, errata, uintnSize
+    sizes = {}
+    for _ in range(spec.u32()):
+        alg, n = spec.u16(), spec.u16()
+        if alg in sizes or not 0 < n <= 64:
+            raise Fail("Spec ID event: bad digest algorithm %#06x (size %d)" % (alg, n))
+        sizes[alg] = n
+    if not sizes:
+        raise Fail("Spec ID event lists no digest algorithms")
+    spec.take(spec.u8())  # vendorInfo
+    if spec.at != len(spec.b):
+        raise Fail("Spec ID event has %d bytes past its end" % (len(spec.b) - spec.at))
+    events = []
+    while r.at < len(log):
+        at = r.at
+        pcr, kind, count = r.u32(), r.u32(), r.u32()
+        if count > len(sizes):
+            raise Fail("event at byte %d: %d digests, the log has %d algorithms" % (at, count, len(sizes)))
+        digests = {}
+        for _ in range(count):
+            alg = r.u16()
+            if alg not in sizes or alg in digests:
+                raise Fail("event at byte %d: unexpected digest algorithm %#06x" % (at, alg))
+            digests[alg] = r.take(sizes[alg])
+        data = r.take(r.u32())
+        events.append({"pcr": pcr, "type": kind, "digests": digests, "data": data})
+    return sizes, events
+
+
+def replay_event_log(log):
+    """The SHA-256 PCRs 0-23 that the log's events extend from TPM2_Startup
+    (PC Client: 17-22 start at all ones), and the events."""
+    sizes, events = parse_event_log(log)
+    if sizes.get(TPM_ALG_SHA256) != 32:
+        raise Fail("the event log has no SHA-256 digests")
+    pcrs = {i: (b"\xff" if 17 <= i <= 22 else b"\x00") * 32 for i in range(24)}
+    extended = set()
+    for n, e in enumerate(events):
+        if e["type"] == EV_NO_ACTION:
+            # Not extended; the startup locality (PFP 10.4.5.3) is PCR 0's
+            # initial value.
+            if e["data"][:len(STARTUP_LOCALITY)] == STARTUP_LOCALITY and len(e["data"]) == len(STARTUP_LOCALITY) + 1:
+                if e["pcr"] == 0 and 0 not in extended:
+                    pcrs[0] = bytes(31) + e["data"][-1:]
+            continue
+        if not 0 <= e["pcr"] < 24:
+            raise Fail("event %d extends PCR %d" % (n, e["pcr"]))
+        if TPM_ALG_SHA256 not in e["digests"]:
+            raise Fail("event %d (PCR %d) has no SHA-256 digest" % (n, e["pcr"]))
+        pcrs[e["pcr"]] = hashlib.sha256(pcrs[e["pcr"]] + e["digests"][TPM_ALG_SHA256]).digest()
+        extended.add(e["pcr"])
+    return pcrs, events
+
+
+def check_event_log(log, quoted):
+    """That the log replays to the quoted PCRs 0-14 (`quoted`, the
+    evidence's {index: value}); the number of its events."""
+    pcrs, events = replay_event_log(log)
+    for i in EVENT_LOG_PCRS:
+        if i not in quoted:
+            raise Fail("PCR %d is not quoted: the event log cannot be checked" % i)
+        if quoted[i] != pcrs[i]:
+            raise Fail("event log does not match the quote: PCR %d replays to %s, the quote has %s"
+                       % (i, pcrs[i].hex(), quoted[i].hex()))
+    return len(events)
+
+
+def event_log_summary(log):
+    pcrs, events = replay_event_log(log)
+    sizes, _ = parse_event_log(log)
+
+    def data(e):
+        d = e["data"]
+        return d.decode("ascii") if d and all(32 <= b < 127 for b in d) else d[:32].hex() + ("..." if len(d) > 32 else "")
+    return {
+        "algorithms": ["%#06x" % alg for alg in sizes],
+        "events": [{"pcr": e["pcr"], "type": EVENT_TYPES.get(e["type"], "%#x" % e["type"]),
+                    "sha256": e["digests"][TPM_ALG_SHA256].hex() if TPM_ALG_SHA256 in e["digests"] else None,
+                    "size": len(e["data"]), "data": data(e)} for e in events],
+        "pcrs": {str(i): pcrs[i].hex() for i in sorted({e["pcr"] for e in events if e["type"] != EV_NO_ACTION})},
+    }
 
 
 def tpm_name(public):
@@ -755,6 +909,9 @@ def main():
     v.add_argument("--require-seal", default="console-in",
                    help="require sealed host names, bit numbers or ranges (default: console-in; '' disables)")
     v.add_argument("--ek-ca", help="CA certificates (PEM, one or more) one of which issued the EK certificate")
+    v.add_argument("--event-log", help="the host's UEFI TPM event log (l4hctl attest event-log -o): must replay to PCRs 0-14")
+    e = sub.add_parser("event-log")
+    e.add_argument("log")
     c = sub.add_parser("make-credential")
     c.add_argument("evidence")
     c.add_argument("secret", help="hex, at most 32 bytes")
@@ -774,6 +931,8 @@ def main():
             ev = cbor_decode(open(a.evidence, "rb").read())
             ak_name = bytes.fromhex(a.ak_name) if a.ak_name else None
             key, partition, host = check_evidence(ev, pins, ak_name, a.ek_ca)
+            if a.event_log:
+                host["event_log_events"] = check_event_log(open(a.event_log, "rb").read(), ev["pcrs"])
             data = bytes.fromhex(a.data) if a.data is not None else None
             launch = bytes.fromhex(a.launch) if a.launch else None
             guest = check_report(cbor_decode(open(a.report, "rb").read()), key, data, launch, a.deny_taint, a.require_seal,
@@ -781,6 +940,8 @@ def main():
             print(json.dumps({"host": host, "guest": guest}, indent=2))
             if ak_name is None:
                 print("l4h-attest: warning: attestation key not pinned (--ak-name)", file=sys.stderr)
+        elif a.cmd == "event-log":
+            print(json.dumps(event_log_summary(open(a.log, "rb").read()), indent=2))
         else:
             ev = cbor_decode(open(a.evidence, "rb").read())
             ek = evidence_ek(ev, open(a.ek, "rb").read() if a.ek else None, a.ek_ca)
