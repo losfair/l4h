@@ -40,6 +40,8 @@ config UML
 	select IRQ_DOMAIN
 	select GENERIC_IRQ_IPI if SMP
 	select GENERIC_SMP_IDLE_THREAD
+	# vCPUs of one virtual core share a host physical core (asm/topology.h).
+	select ARCH_SUPPORTS_SCHED_SMT if SMP
 	select ARCH_USE_QUEUED_SPINLOCKS
 	select ARCH_USE_QUEUED_RWLOCKS
 	# mmap below the stack, at a random offset, as on x86_64 and arm64.

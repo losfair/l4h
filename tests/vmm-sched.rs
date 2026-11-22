@@ -90,11 +90,11 @@ mod guest {
     #[derive(Clone, Copy, PartialEq, Eq, Debug)] pub enum State { Created, Running, Stopped }
     pub struct Vcpu {
         pub sc_k: sel4::cap::SchedContext, pub sc_u: sel4::cap::SchedContext,
-        pub core: usize, pub cooldown: u32, pub usage: u32, pub k_share: u32,
+        pub core: usize, pub vcore: usize, pub host_cap: u32, pub cooldown: u32, pub usage: u32, pub k_share: u32,
         pub wall_ticks: u64, pub run_ticks: u64, pub steal_ns: u64,
     }
     pub struct Component { pub sc: sel4::cap::SchedContext, pub tcb: sel4::cap::Tcb }
-    pub struct Event { pub idle_ticks: u64, pub steal_ns: u64 }
+    pub struct Event { pub idle_ticks: u64, pub steal_ns: u64, pub host_cap: u64 }
     pub struct Guest {
         pub id: usize, pub vmm: Option<Component>, pub state: State, pub cpu_cap_pct: u32,
         pub vcpus: Vec<Vcpu>, pub vmm_limits: Option<(usize, sched::budget::Plan)>,
@@ -127,11 +127,11 @@ fn manager() -> Vmmgr {
 fn create(id: usize, core: usize, cap: u32, vcpus: usize) -> Guest {
     Guest { id, vmm: None, state: State::Created, cpu_cap_pct: cap,
         vcpus: (0..vcpus).map(|v| Vcpu { sc_k: sel4::cap::SchedContext((id * 10 + v * 2 + 1) as u64),
-            sc_u: sel4::cap::SchedContext((id * 10 + v * 2 + 2) as u64), core, cooldown: 0,
+            sc_u: sel4::cap::SchedContext((id * 10 + v * 2 + 2) as u64), core, vcore: v, host_cap: 1024, cooldown: 0,
             usage: 0, k_share: 500, wall_ticks: 0, run_ticks: 0, steal_ns: 0 }).collect(),
         vmm_limits: None, vmm_share: sched::budget::VMM_SHARE_INIT, vmm_usage: 0, vmm_boosted: true,
         vmm_guard: Default::default(), vmm_limited: false,
-        events: (0..vcpus).map(|_| Box::new(Event { idle_ticks: 0, steal_ns: 0 })).collect() }
+        events: (0..vcpus).map(|_| Box::new(Event { idle_ticks: 0, steal_ns: 0, host_cap: 1024 })).collect() }
 }
 fn build(h: &mut Vmmgr, id: usize, core: usize, cap: u32, vcpus: usize) {
     let mut g = create(id, core, cap, vcpus);
@@ -749,4 +749,122 @@ fn a_failed_start_budget_stops_the_new_guest_instead_of_panicking() {
         assert!(g.vmm_limits.is_none());
         assert_eq!(h.guest(0).unwrap().state, State::Running);
     }
+}
+
+// Two cores of two threads: CPUs 0/1 and 2/3.
+fn smt_manager() -> Vmmgr {
+    let mut h = manager();
+    h.info.cores = 4;
+    h.info.topology = topology::Topology::from_ids(&[0, 0, 1, 1]);
+    h
+}
+
+#[test]
+fn placement_weighs_guests_and_vmms_and_numbers_vcores() {
+    let mut h = smt_manager();
+    spawn(&mut h, 0, 0, 0, 1);
+    let cores = sched::place(&h, 4, 0);
+    assert_eq!(cores.as_slice(), [(2, 0), (1, 1), (3, 0), (0, 1)]);
+    h.guests[0].as_mut().unwrap().stop();
+    assert_eq!(sched::place(&h, 2, 1).as_slice(), [(2, 0), (0, 1)]);
+}
+
+/// Guest 0: vCPUs 0 and 1 (one vCore) busy on CPUs 0 and 1, beside guest
+/// 1's busy vCPU, which cannot move; its idle vCore (vCPUs 2, 3) on 2/3.
+fn busy_vcore(h: &mut Vmmgr) {
+    build(h, 0, 0, 0, 4);
+    {
+        let g = h.guests[0].as_mut().unwrap();
+        for (v, core) in [0, 1, 2, 3].into_iter().enumerate() {
+            g.vcpus[v].core = core;
+            g.vcpus[v].vcore = core / 2;
+        }
+    }
+    for v in 1..4 {
+        let g = h.guest(0).unwrap();
+        let p = sched::budget::plan(5000, 0, 0, 500, None);
+        h.info.sched_control(v).sched_control_configure_flags(g.vcpus[v].sc_k, p.kernel, p.period, 14, 0, 0).unwrap();
+        h.info.sched_control(v).sched_control_configure_flags(g.vcpus[v].sc_u, p.user, p.period, 14, 0, 0).unwrap();
+    }
+    sched::start(h, 0).unwrap();
+    spawn(h, 1, 0, 0, 1);
+    h.guests[1].as_mut().unwrap().vcpus[0].cooldown = 10;
+    MODEL.with_borrow_mut(|m| {
+        m.operations.clear();
+        m.used.extend([(1, 25_000), (2, 25_000), (3, 25_000), (4, 25_000), (11, 25_000), (12, 25_000)]);
+    });
+}
+
+#[test]
+fn a_vcore_swap_protects_both_cores_and_moves_the_whole_vcore() {
+    let mut h = smt_manager();
+    busy_vcore(&mut h);
+    sched::balance(&mut h, 100_000);
+    let g = h.guest(0).unwrap();
+    let cores: Vec<_> = g.vcpus.iter().map(|v| v.core).collect();
+    // The busy vCore takes core 1, one vCPU per thread; the idle one core 0.
+    let mut busy = cores[..2].to_vec();
+    busy.sort();
+    assert_eq!(busy, [2, 3]);
+    assert!(cores[2..].iter().all(|&c| c < 2), "{cores:?}");
+    assert!(g.vcpus.iter().all(|v| v.cooldown == 10));
+    assert_eq!(g.state, State::Running);
+    MODEL.with_borrow(|m| {
+        for v in &g.vcpus {
+            assert_eq!(m.limits[&v.sc_k.0].0, v.core);
+            assert_eq!(m.limits[&v.sc_u.0].0, v.core);
+        }
+        // Each vCPU moved once, both contexts, busiest first; no guest stopped.
+        assert_eq!(m.operations, [1, 2, 3, 4, 5, 6, 7, 8].map(|sc| ('c', sc)));
+    });
+    assert_limits(&h);
+}
+
+#[test]
+fn a_failed_vcore_swap_stops_the_guest() {
+    let mut h = smt_manager();
+    busy_vcore(&mut h);
+    MODEL.with_borrow_mut(|m| m.fail_config = Some(3));
+    sched::balance(&mut h, 100_000);
+    assert_eq!(h.guest(0).unwrap().state, State::Stopped);
+    assert_eq!(h.guest(1).unwrap().state, State::Running);
+    MODEL.with_borrow(|m| assert!(m.operations.contains(&('x', 0))));
+}
+
+#[test]
+fn host_capacity_reflects_other_guests_on_the_cpu_and_its_siblings() {
+    let mut h = smt_manager();
+    spawn(&mut h, 0, 0, 0, 1);
+    spawn(&mut h, 1, 0, 0, 1);
+    spawn(&mut h, 2, 1, 0, 1);
+    for id in 0..3 { h.guests[id].as_mut().unwrap().vcpus[0].cooldown = 10; }
+    let cap = |h: &Vmmgr, id: usize| (h.guest(id).unwrap().vcpus[0].host_cap, h.guest(id).unwrap().events[0].host_cap);
+    // Idle neighbours leave the full capacity, and nothing is rewritten.
+    sched::balance(&mut h, 100_000);
+    assert_eq!(cap(&h, 0), (1024, 1024));
+    // Guest 1 takes half of CPU 0 and guest 2 all of its sibling CPU 1.
+    MODEL.with_borrow_mut(|m| m.used.extend([(1, 50_000), (11, 25_000), (12, 25_000), (21, 50_000), (22, 50_000)]));
+    sched::balance(&mut h, 100_000);
+    // raw = 1024 - 512 * 0.5 - 350 * 1.0 = 418, halfway from 1024.
+    assert_eq!(cap(&h, 0), (721, 721));
+    // Guest 2 sees guest 0 and guest 1 on its sibling only: 1024 - 350.
+    assert_eq!(cap(&h, 2).0, (1024 + 674) / 2);
+    // Its own VMM is not another guest.
+    MODEL.with_borrow_mut(|m| m.used.extend([(29, 100_000)]));
+    let before = cap(&h, 2).0;
+    sched::balance(&mut h, 100_000);
+    assert!(cap(&h, 2).0 > before);
+    // A late report above the period on its own CPU is not a sibling's:
+    // 1024 - 512, without a sibling penalty.
+    h.guests[1].as_mut().unwrap().vcpus[0].cooldown = 10;
+    MODEL.with_borrow_mut(|m| m.used.extend([(11, 60_000), (12, 60_000)]));
+    h.guests[0].as_mut().unwrap().vcpus[0].host_cap = 1024;
+    sched::balance(&mut h, 100_000);
+    assert_eq!(cap(&h, 0), ((1024 + 512) / 2, 768));
+    // A stopped guest's page is left alone.
+    h.guests[0].as_mut().unwrap().stop();
+    MODEL.with_borrow_mut(|m| m.used.extend([(11, 100_000), (12, 100_000)]));
+    let before = cap(&h, 0);
+    sched::balance(&mut h, 100_000);
+    assert_eq!(cap(&h, 0), before);
 }

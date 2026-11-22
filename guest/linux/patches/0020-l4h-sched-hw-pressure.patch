@@ -1,0 +1,21 @@
+sched: hardware pressure on l4h
+
+The l4h host publishes, per vCPU, the capacity other guests leave it on
+its CPU and SMT siblings (l4h_event_page.host_cap); arch/l4h reports the
+rest as arch_scale_hw_pressure().  The scheduler averages it only with
+SCHED_HW_PRESSURE, which needs no cpufreq or thermal framework on l4h:
+that code (pelt.c, avg_hw) depends on neither.
+
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -609,8 +609,9 @@
+ 	bool
+ 	default y if ARM && ARM_CPU_TOPOLOGY
+ 	default y if ARM64
++	default y if L4H
+ 	depends on SMP
+-	depends on CPU_FREQ_THERMAL
++	depends on CPU_FREQ_THERMAL || L4H
+ 	help
+ 	  Select this option to enable HW pressure accounting in the
+ 	  scheduler. HW pressure is the value conveyed to the scheduler

@@ -224,6 +224,11 @@ pub struct Vcpu {
     pub sc_k: cap::SchedContext,
     pub sc_u: cap::SchedContext,
     pub core: usize,
+    /// Its virtual core (abi::BootInfo::vcpu_core): the guest's vCPUs of
+    /// one vCore share a physical core, alone of this guest's.
+    pub vcore: usize,
+    /// Capacity published in its event page (sched::publish_capacity).
+    pub host_cap: u32,
     /// Balancer periods before the vCPU may move again.
     pub cooldown: u32,
     /// CPU used in the last balancer period, in permille of a core.
@@ -909,7 +914,10 @@ impl Guest {
             bi.sdk_size = self.sdk_size as u64;
         }
 
-        bi.flags = if self.dom0 { abi::BOOT_DOM0 } else { 0 };
+        bi.flags = if self.dom0 { abi::BOOT_DOM0 } else { 0 } | abi::BOOT_TOPOLOGY;
+        for (v, vcpu) in self.vcpus.iter().enumerate() {
+            bi.vcpu_core[v] = vcpu.vcore as u8;
+        }
         bi.io_pool_gpa = self.pool.gpa as u64;
         bi.io_pool_size = self.pool.size as u64;
         bi.hp_gpa = self.hp_gpa as u64;
@@ -1191,6 +1199,7 @@ pub fn create(
     asids: &mut AsidPools,
     host_info: &HostInfo,
     kernel: &Kernel,
+    cores: &[(usize, usize)],
 ) -> Result<Guest, Option<Guest>> {
     let Some(Plan { owned, shared, nr_blocks, pool_gpa, hp_gpa, hp_count, estimate, .. }) = plan(cfg, host_info, kernel) else {
         return Err(None);
@@ -1432,8 +1441,7 @@ pub fn create(
     g.give_cnode(abi::SLOT_DEV_CNODE, g.dev_cn, guard6);
 
     // ---- vCPUs.
-    for v in 0..cfg.vcpus {
-        let core = host_info.next_core();
+    for (v, &(core, vcore)) in cores.iter().enumerate().take(cfg.vcpus) {
         let mut ctx = ObjCtx::arena(alloc, &mut g.arena);
         let ktcb = ctx.cap::<cap_type::Tcb>(ObjectBlueprint::Tcb);
         let ep = ctx.cap::<cap_type::Endpoint>(ObjectBlueprint::Endpoint);
@@ -1479,13 +1487,14 @@ pub fn create(
         mint_edge(&g.guest_slot(base + abi::VCPU_IPI), &wiring::GUEST_IPI, 0, &Obj::claim(p::Guest, o::Vcpu, abs(ntfn))).expect("vCPU IPI cap");
         g.give(base + abi::VCPU_IPCBUF, ipcbuf, CapRights::read_write());
         g.give(base + abi::VCPU_EVENT, event, CapRights::read_write());
-        g.vcpus.must_push(Vcpu { ktcb, ntfn, event, sc_k, sc_u, core, cooldown: 0, usage: 0, k_share: crate::sched::K_SHARE_INIT, wall_ticks: 0, run_ticks: 0, steal_ns: 0 });
+        g.vcpus.must_push(Vcpu { ktcb, ntfn, event, sc_k, sc_u, core, vcore, host_cap: 1024, cooldown: 0, usage: 0, k_share: crate::sched::K_SHARE_INIT, wall_ticks: 0, run_ticks: 0, steal_ns: 0 });
     }
 
     // ---- Event pages in vmmgr too (steal time).
     for v in 0..g.vcpus.len() {
         let ev = g.vcpus[v].event;
         g.map_in_self(alloc, ev, self_guest_va(id) + GUEST_EVENTS_OFF + v * PAGE);
+        unsafe { ptr::addr_of_mut!((*g.event_page(v)).host_cap).write_volatile(1024) };
     }
 
     // ---- Boot info frames (written at boot).

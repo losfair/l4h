@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# x86 boot-time discovery, placement and migration with two SMT cores.
+# x86 boot-time discovery, placement, the guest's SMT topology and
+# migration with two SMT cores.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 source "$root/tools/guest-env.sh"
@@ -15,4 +16,5 @@ L4H_SMP=4,sockets=1,cores=2,threads=2 L4H_DOM0_VCPUS=1 \
     | grep -E 'SMTTEST|CPU physical|initial CPUs|balancer|panic' || true
 grep -Fq 'CPU physical cores [0, 0, 2, 2]' "$root/build/qemu.log"
 grep -Fq "guest 1 'spread' initial CPUs [2, 1, 3, 0]" "$root/build/qemu.log"
+grep -Fq 'SMTTEST: guest SMT siblings 0,2 and 1,3' "$root/build/qemu.log"
 grep -q 'SMTTEST: PASS' "$root/build/qemu.log"
