@@ -38,9 +38,61 @@ const PAGE: usize = 4096;
 pub use l4h_host::root::{FLAGS_ID, TRUSTD_ID};
 /// The registry page in the root task.
 const REGISTRY_VA: usize = crate::layout::TRUSTD_REGISTRY.base;
-/// Mapping capabilities trustd's ranges and AML pages, and the flags
-/// server's pages, can need.
+/// Mapping capabilities trustd's ranges, AML and event log pages, and the
+/// flags server's pages, can need.
 const KEEP_BITS: usize = 12;
+/// SEL4_BOOTINFO_HEADER_TPM_EVENT_LOG (FL4's seL4_TpmEventLog: paddr,
+/// size, flags), not taken from libsel4, whose older revisions lack it.
+const TPM_EVENT_LOG: u64 = 12;
+
+/// The UEFI TPM event log the boot loader passed on, whose pages trustd
+/// maps read-only at trust::EVENT_LOG_VA: carved once, before trustd is
+/// made, so that every way it starts (with the TPM, or flags only after
+/// a TPM that failed) maps the same frames.
+struct EventLog {
+    size: u64,
+    flags: u64,
+    /// Its frames, in order: root slots that stay its for good.
+    frames: ArrayVec<crate::mem::Slot, { trust::EVENT_LOG_MAX / PAGE }>,
+}
+
+impl EventLog {
+    const NONE: EventLog = EventLog { size: 0, flags: 0, frames: ArrayVec::new() };
+
+    /// From the BootInfo record, if there is one root can use: none is
+    /// no event log, never a failure.
+    fn find(bootinfo: &sel4::BootInfoPtr, alloc: &mut Alloc, devmem: &mut DevMem) -> EventLog {
+        let Some(c) = l4h_task::bootinfo::extra_chunk(bootinfo, TPM_EVENT_LOG) else { return EventLog::NONE };
+        if c.len() < 24 {
+            log!("l4h-root: TPM event log record of {} bytes, ignored", c.len());
+            return EventLog::NONE;
+        }
+        let word = |i: usize| u64::from_le_bytes(c[i..i + 8].try_into().unwrap());
+        let (paddr, size, flags) = (word(0), word(8), word(16));
+        // The kernel's word; each page keeps a root slot, as boot modules do.
+        let pages = (size.min(trust::EVENT_LOG_MAX as u64) as usize).div_ceil(PAGE);
+        if paddr == 0 || paddr % PAGE as u64 != 0 || size == 0 || size > trust::EVENT_LOG_MAX as u64
+            || paddr.checked_add((pages * PAGE) as u64).is_none()
+            || alloc.slots.available() < pages + crate::CNODE_SLOTS / 2
+        {
+            log!("l4h-root: TPM event log of {} bytes at {:#x} unusable, ignored", size, paddr);
+            return EventLog::NONE;
+        }
+        let mut frames = ArrayVec::new();
+        let carved = devmem.frames_range(alloc, paddr as usize, pages * PAGE, |_, chunk| {
+            for s in chunk {
+                // frames_range carves exactly the pages asked for.
+                let _ = frames.push(s);
+            }
+        });
+        if carved.is_none() || frames.len() != pages {
+            log!("l4h-root: TPM event log at {:#x} is not device memory, ignored", paddr);
+            return EventLog::NONE;
+        }
+        info!("l4h-root: TPM event log: {} bytes{}", size, if flags & trust::EVENT_LOG_TRUNCATED != 0 { " (truncated)" } else { "" });
+        EventLog { size, flags, frames }
+    }
+}
 
 pub struct Trustd {
     comp: Component,
@@ -219,7 +271,7 @@ impl Layout {
         (trust::TPM_VA + r * trust::RANGE_STRIDE + off) as u64
     }
 
-    fn config(&self, aml_size: usize) -> TrustdConfig {
+    fn config(&self, aml_size: usize, ev: &EventLog) -> TrustdConfig {
         let mut ranges = [trust::Range::default(); trust::MAX_RANGES];
         for (r, &(paddr, size)) in self.ranges.iter().enumerate() {
             ranges[r] = trust::Range { paddr: paddr as u64, size: size as u64 };
@@ -243,6 +295,8 @@ impl Layout {
             aml_size: aml_size as u64,
             partition: crate::partition::get().map_or(0, |d| d.index),
             partitions: crate::partition::get().map_or(1, |d| d.count),
+            event_log_size: ev.size,
+            event_log_flags: ev.flags,
         }
     }
 }
@@ -341,18 +395,20 @@ pub fn spawn(
             .is_some_and(|d| d.channels().iter().any(|c| c.peer == 0 && c.kind & l4h_partition::CHANNEL_CONTROL != 0));
         if crate::partition::secondary() {
             let iface = if to_primary { trust::TPM_REMOTE } else { trust::TPM_NONE };
-            return without_tpm(alloc, win, asids, info, iface);
+            return without_tpm(alloc, win, asids, info, iface, &EventLog::NONE);
         }
+        // Whether or not the TPM below is usable.
+        let ev = EventLog::find(bootinfo, alloc, devmem);
         let mut frames = frames;
         let mut phys = crate::acpi::Phys::new(alloc, devmem, win, &mut frames);
         let Some(l) = find_tpm(bootinfo, &mut phys) else {
-            return flags_only(alloc, win, asids, info);
+            return flags_only(alloc, win, asids, info, &ev);
         };
         // The pages of each range, which stay in `frames`.
         for &(base, size) in &l.ranges {
             if (0..size / PAGE).any(|p| phys.frame(base + p * PAGE).is_none()) {
                 log!("l4h-root: TPM at {:#x} is not device memory, no attestation", base);
-                return flags_only(alloc, win, asids, info);
+                return flags_only(alloc, win, asids, info, &ev);
             }
         }
         // The AML's size.  Its pages are carved now, so that copying it
@@ -366,7 +422,7 @@ pub fn spawn(
                     Some(n) => n,
                     None => {
                         log!("l4h-root: cannot read the ACPI tables for the TPM, no attestation");
-                        return flags_only(alloc, win, asids, info);
+                        return flags_only(alloc, win, asids, info, &ev);
                     }
                 }
             }
@@ -384,7 +440,7 @@ pub fn spawn(
             },
             l.ranges[0].0
         );
-        let cfg = l.config(aml_size);
+        let cfg = l.config(aml_size, &ev);
         let (comp, flags_server, arena, keep) = create(&cfg, alloc, win, asids, info, aml_size)?;
         let mut keep_next = 0;
         let mut keep_slot = || {
@@ -425,34 +481,35 @@ pub fn spawn(
             if crate::acpi::aml_tables(bootinfo, &mut phys, copy) != Some(aml_size) {
                 log!("l4h-root: cannot copy the ACPI tables for the TPM, no attestation");
                 alloc.reclaim(arena);
-                return flags_only(alloc, win, asids, info);
+                return flags_only(alloc, win, asids, info, &ev);
             }
         }
-        finish(comp, flags_server, arena, alloc, &mut keep_slot, false, hw)
+        finish(comp, flags_server, arena, alloc, &mut keep_slot, false, &ev, hw)
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        let _ = (bootinfo, devmem);
-        flags_only(alloc, win, asids, info)
+        // No TPM yet (flags only), but the event log the loader passed on.
+        let ev = if crate::partition::secondary() { EventLog::NONE } else { EventLog::find(bootinfo, alloc, devmem) };
+        flags_only(alloc, win, asids, info, &ev)
     }
 }
 
 /// The same flags service on machines with no usable TPM.
-fn flags_only(alloc: &mut Alloc, win: &mut Window, asids: &mut AsidPools, info: &HostInfo) -> Option<Trustd> {
-    without_tpm(alloc, win, asids, info, trust::TPM_NONE)
+fn flags_only(alloc: &mut Alloc, win: &mut Window, asids: &mut AsidPools, info: &HostInfo, ev: &EventLog) -> Option<Trustd> {
+    without_tpm(alloc, win, asids, info, trust::TPM_NONE, ev)
 }
 
 /// trustd with no TPM of its own: flags only, or (TPM_REMOTE) the
 /// primary's TPM through the relay.
-fn without_tpm(alloc: &mut Alloc, win: &mut Window, asids: &mut AsidPools, info: &HostInfo, iface: u32) -> Option<Trustd> {
-    let cfg = TrustdConfig { iface, ..Layout::default().config(0) };
+fn without_tpm(alloc: &mut Alloc, win: &mut Window, asids: &mut AsidPools, info: &HostInfo, iface: u32, ev: &EventLog) -> Option<Trustd> {
+    let cfg = TrustdConfig { iface, ..Layout::default().config(0, ev) };
     let (comp, flags_server, arena, keep) = create(&cfg, alloc, win, asids, info, 0)?;
     let mut next = 0;
     finish(comp, flags_server, arena, alloc, &mut || {
         let slot = keep.absolute_cptr_from_bits_with_depth(next, KEEP_BITS);
         next += 1;
         slot
-    }, iface == trust::TPM_NONE, #[cfg(target_arch = "x86_64")] None)
+    }, iface == trust::TPM_NONE, ev, #[cfg(target_arch = "x86_64")] None)
 }
 
 /// Create trustd with configuration `cfg`, its flags server, and the CNode
@@ -531,6 +588,7 @@ fn finish(
     alloc: &mut Alloc,
     keep: &mut impl FnMut() -> sel4::AbsoluteCPtr,
     no_reports: bool,
+    ev: &EventLog,
     #[cfg(target_arch = "x86_64")]
     hw: Option<Hw>,
 ) -> Option<Trustd> {
@@ -555,6 +613,12 @@ fn finish(
     });
     let status = arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP);
     comp.map_copy(alloc, &mut arena, &abs_of(status), trust::STATUS_VA, CapRights::read_write(), VmAttributes::DEFAULT, keep());
+    // The TPM event log, read-only in trustd alone (under SEV-SNP the
+    // kernel made its frames private: the default attributes keep them so).
+    for (p, &s) in ev.frames.iter().enumerate() {
+        comp.map_copy(alloc, &mut arena, &abs_of(crate::devmem::granule(s)), trust::EVENT_LOG_VA + p * PAGE,
+            CapRights::read_only(), VmAttributes::DEFAULT, keep());
+    }
     let kick = arena.object_cap::<cap_type::Notification>(alloc, ObjectBlueprint::Notification);
     comp.give(trust::SLOT_KICK, kick, CapRights::all());
     // The relay pages, shared with root, when there are other partitions.

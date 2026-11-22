@@ -640,5 +640,171 @@ class Malformed(unittest.TestCase):
                 a.launch_digest(bad, b"", "")
 
 
+SHA1, SHA256, SHA384 = 0x0004, 0x000B, 0x000C
+SIZES = {SHA1: 20, SHA256: 32, SHA384: 48}
+
+
+def spec_id(algs=(SHA1, SHA256, SHA384), vendor=b""):
+    """The log's header: a TCG_PCR_EVENT holding the Spec ID event."""
+    body = (b"Spec ID Event03\0" + struct.pack("<IBBBB", 0, 0, 2, 0, 2) + struct.pack("<I", len(algs))
+            + b"".join(struct.pack("<HH", alg, SIZES[alg]) for alg in algs) + bytes([len(vendor)]) + vendor)
+    return struct.pack("<II", 0, 3) + bytes(20) + struct.pack("<I", len(body)) + body
+
+
+def event2(pcr, kind, data, algs=(SHA1, SHA256, SHA384), digests=None):
+    """A TCG_PCR_EVENT2 measuring `data` in every bank (or with `digests`)."""
+    if digests is None:
+        digests = {alg: hashlib.new({SHA1: "sha1", SHA256: "sha256", SHA384: "sha384"}[alg], data).digest() for alg in algs}
+    return (struct.pack("<III", pcr, kind, len(digests)) + b"".join(struct.pack("<H", alg) + d for alg, d in digests.items())
+            + struct.pack("<I", len(data)) + data)
+
+
+def cbor(x):
+    """Any CBOR the tools read: negative keys (COSE), tags (COSE_Sign1)."""
+    def head(major, n):
+        for limit, extra in ((24, 0), (1 << 8, 1), (1 << 16, 2), (1 << 32, 4), (1 << 64, 8)):
+            if n < limit:
+                code = n if not extra else {1: 24, 2: 25, 4: 26, 8: 27}[extra]
+                return bytes([major << 5 | code]) + (n.to_bytes(extra, "big") if extra else b"")
+    if isinstance(x, tuple):
+        return head(6, x[1]) + cbor(x[2])
+    if isinstance(x, bytes):
+        return head(2, len(x)) + x
+    if isinstance(x, str):
+        return head(3, len(x.encode())) + x.encode()
+    if isinstance(x, list):
+        return head(4, len(x)) + b"".join(map(cbor, x))
+    if isinstance(x, dict):
+        return head(5, len(x)) + b"".join(cbor(k) + cbor(v) for k, v in x.items())
+    if x is True or x is False:
+        return b"\xf5" if x else b"\xf4"
+    return head(0, x) if x >= 0 else head(1, -1 - x)
+
+
+def extend(pcr, *datas):
+    for d in datas:
+        pcr = hashlib.sha256(pcr + hashlib.sha256(d).digest()).digest()
+    return pcr
+
+
+class EventLog(unittest.TestCase):
+    """The UEFI TPM event log replays to the quoted PCRs 0-14."""
+
+    EVENTS = [(0, 0x8, b"crtm version"), (0, 0x80000008, b"firmware blob"), (7, 0x80000001, b"SecureBoot"),
+              (1, 0x80000002, b"BootOrder"), (4, 0x80000003, b"l4h efi app"), (2, 0x4, b"\0\0\0\0"),
+              (5, 0x80000007, b"Exit Boot Services Invocation")]
+
+    def log(self, events=EVENTS, header=None, extra=b""):
+        return (header if header is not None else spec_id()) + b"".join(event2(*e) for e in events) + extra
+
+    def replayed(self, events=EVENTS, pcr0=bytes(32)):
+        pcrs = {i: bytes(32) for i in range(15)}
+        pcrs[0] = pcr0
+        for i, _, d in events:
+            pcrs[i] = extend(pcrs[i], d)
+        return pcrs
+
+    def test_replay_banks(self):
+        pcrs, events = a.replay_event_log(self.log())
+        self.assertEqual(len(events), len(self.EVENTS))
+        want = self.replayed()
+        self.assertEqual({i: pcrs[i] for i in range(15)}, want)
+        # PC Client: 17-22 start at all ones, the rest at zeros.
+        self.assertEqual(pcrs[17], b"\xff" * 32)
+        self.assertEqual(pcrs[23], bytes(32))
+        # A SHA-256-only log too.
+        log = spec_id((SHA256,)) + b"".join(event2(*e, algs=(SHA256,)) for e in self.EVENTS)
+        self.assertEqual({i: a.replay_event_log(log)[0][i] for i in range(15)}, want)
+        self.assertEqual(a.check_event_log(self.log(), {**want, 15: bytes(32)}), len(self.EVENTS))
+
+    def test_startup_locality(self):
+        loc = event2(0, 3, b"StartupLocality\0\x03", digests={SHA1: bytes(20), SHA256: bytes(32), SHA384: bytes(48)})
+        log = spec_id() + loc + b"".join(event2(*e) for e in self.EVENTS)
+        pcrs, _ = a.replay_event_log(log)
+        self.assertEqual(pcrs[0], self.replayed(pcr0=bytes(31) + b"\x03")[0])
+        # Only before PCR 0 is extended.
+        log = spec_id() + event2(*self.EVENTS[0]) + loc + b"".join(event2(*e) for e in self.EVENTS[1:])
+        self.assertEqual(a.replay_event_log(log)[0][0], self.replayed()[0])
+
+    def test_no_action_not_extended(self):
+        noise = event2(4, 3, b"NvIndexInstance\0", digests={SHA1: bytes(20), SHA256: b"\x55" * 32, SHA384: bytes(48)})
+        log = spec_id() + noise + b"".join(event2(*e) for e in self.EVENTS) + noise
+        pcrs, events = a.replay_event_log(log)
+        self.assertEqual(len(events), len(self.EVENTS) + 2)
+        self.assertEqual({i: pcrs[i] for i in range(15)}, self.replayed())
+
+    def test_tampered_digest(self):
+        want = self.replayed()
+        log = bytearray(self.log())
+        # The SHA-256 digest of the event that measured the EFI application.
+        d = hashlib.sha256(b"l4h efi app").digest()
+        at = bytes(log).index(d)
+        log[at] ^= 1
+        with self.assertRaisesRegex(a.Fail, "PCR 4 replays to"):
+            a.check_event_log(bytes(log), want)
+        # And a quote that differs from an honest log.
+        with self.assertRaisesRegex(a.Fail, "PCR 7 replays to"):
+            a.check_event_log(self.log(), {**want, 7: bytes(32)})
+        with self.assertRaisesRegex(a.Fail, "PCR 3 is not quoted"):
+            a.check_event_log(self.log(), {i: v for i, v in want.items() if i != 3})
+
+    def test_malformed(self):
+        good = self.log()
+        cases = [
+            b"", good[:10], good[:len(spec_id()) - 1],
+            # Cut in the last event, and a byte past it.
+            good[:-1], good + b"\0",
+            # Not crypto agile (a TCG 1.2 log), and a Spec ID event with no
+            # algorithms or a repeated one.
+            struct.pack("<II", 0, 0x8) + bytes(20) + struct.pack("<I", 4) + b"abcd",
+            self.log(header=spec_id(())), self.log(header=spec_id((SHA256, SHA256))),
+            # An algorithm the header did not list; no SHA-256 at all.
+            spec_id((SHA1, SHA256)) + event2(0, 8, b"x", algs=(SHA1, SHA384)),
+            spec_id((SHA1,)) + event2(0, 8, b"x", algs=(SHA1,)),
+            # An event without a SHA-256 digest, one past PCR 23, an event
+            # size past the end.
+            spec_id() + event2(0, 8, b"x", algs=(SHA1,)),
+            spec_id() + event2(24, 8, b"x"),
+            spec_id() + struct.pack("<III", 0, 8, 0) + struct.pack("<I", 0xFFFFFFFF),
+            spec_id() + struct.pack("<III", 0, 8, 0xFFFFFFFF),
+        ]
+        for bad in cases:
+            with self.assertRaises(a.Fail, msg=bad[:80].hex()):
+                a.check_event_log(bad, self.replayed())
+
+    def test_verify_cli(self):
+        Evidence.setUpClass()
+        pcrs = {**self.replayed(), a.KEY_PCR: bytes(32)}
+        n = Evidence.host.public_key().public_numbers()
+        key = {1: 2, -1: 1, -2: n.x.to_bytes(32, "big"), -3: n.y.to_bytes(32, "big")}
+        q = quote(a.key_binding(a.point(Evidence.host.public_key()), None), pcrs)
+        ev = {"v": 1, "ak": ecc_public(Evidence.ak, Enrollment.AK_ATTRS), "key": key, "pcrs": pcrs, "quote": q,
+              "quotesig": tpm_signature(Evidence.ak, q)}
+        rep = signed_claims(Evidence.host, {"seal": bitmap(0), "taint": bitmap()})
+        with tempfile.TemporaryDirectory() as d:
+            paths = {}
+            for name, data in (("ev", cbor(ev)), ("rep", cbor(rep)), ("log", self.log()),
+                               ("bad", self.log(self.EVENTS[:-1]))):
+                paths[name] = os.path.join(d, name)
+                Path(paths[name]).write_bytes(data)
+            tool = [sys.executable, str(Path(__file__).resolve().parents[1] / "tools/l4h-attest.py")]
+            run = lambda *args: subprocess.run(tool + list(args), capture_output=True, text=True)
+            r = run("verify", paths["rep"], paths["ev"], "--event-log", paths["log"])
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn('"event_log_events": %d' % len(self.EVENTS), r.stdout)
+            r = run("verify", paths["rep"], paths["ev"])
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertNotIn("event_log_events", r.stdout)
+            r = run("verify", paths["rep"], paths["ev"], "--event-log", paths["bad"])
+            self.assertEqual(r.returncode, 1)
+            self.assertRegex(r.stderr, "^l4h-attest: event log does not match the quote: PCR 5 ")
+            self.assertNotIn("Traceback", r.stderr)
+            r = run("event-log", paths["log"])
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn('"EV_EFI_BOOT_SERVICES_APPLICATION"', r.stdout)
+            r = run("event-log", paths["bad"] + "x")
+            self.assertNotEqual(r.returncode, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
