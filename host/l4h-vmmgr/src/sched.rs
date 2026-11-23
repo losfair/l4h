@@ -163,8 +163,10 @@ pub fn start(h: &mut Vmmgr, gid: usize) -> Result<(), Errno> {
 fn hvm_monitor_core(h: &Vmmgr, g: &Guest) -> usize {
     let mut load = [0usize; topology::MAX_CPUS];
     for o in h.guests.iter().flatten().filter(|o| o.state != State::Stopped && o.id != g.id) {
-        for v in &o.vcpus { load[v.core] += 1; }
-        if let Some((core, _)) = o.vmm_limits { load[core] += 2; }
+        // A vCPU runs guest code whenever it is not halted; a VMM or
+        // monitor runs for its guest's I/O.  Sharing with a vCPU costs more.
+        for v in &o.vcpus { load[v.core] += 2; }
+        if let Some((core, _)) = o.vmm_limits { load[core] += 1; }
     }
     let own = g.vcpus.iter().fold(0u64, |m, v| m | (1 << v.core));
     (0..h.info.cores.min(topology::MAX_CPUS))
