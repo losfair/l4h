@@ -31,8 +31,13 @@
   l4h-attest.py measure KERNEL [--initrd F] [--cmdline S] [--initrd-gpa N]
       The launch digest of a guest booted with these files: what its
       reports carry as "launch".  The initrd's address is part of it.
+  l4h-attest.py measure-host [--efi FILE] [--config FILE] [--initrd FILE]
+      Expected host boot measurements: PCR 9 (SHA-256) and RTMR 2 (SHA-384)
+      for l4h.conf and dom0 initrd (policy.rs domain separation), and with
+      --efi the PE/COFF Authenticode SHA-256 and SHA-384 digests.
   l4h-attest.py verify REPORT EVIDENCE [--data HEX] [--launch HEX]
                 [--pcr N=HEX]... [--ak-name HEX | --insecure-unpinned-ak]
+                [--insecure-unpinned-measurements] [--ignore-tpm]
                 [--ek-ca PEM] [--deny-taint SPEC] [--require-seal SPEC]
                 [--event-log FILE]
       Check a report (l4hctl attest report -o) against the host evidence
@@ -280,7 +285,10 @@ class Reader:
 
 
 EV_NO_ACTION = 3
+EV_SEPARATOR = 4
 EV_EFI_HCRTM_EVENT = 0x80000010
+EV_SEPARATOR_ERR_SHA256 = hashlib.sha256(b"\xff\xff\xff\xff").digest()
+EV_SEPARATOR_ERR_SHA384 = hashlib.sha384(b"\xff\xff\xff\xff").digest()
 TPM_ALG_SHA256 = 0x000B
 SPEC_ID = b"Spec ID Event03\0"
 STARTUP_LOCALITY = b"StartupLocality\0"
@@ -422,6 +430,8 @@ def replay_event_log(log):
             raise Fail("event %d extends PCR %d" % (n, e["pcr"]))
         if TPM_ALG_SHA256 not in e["digests"]:
             raise Fail("event %d (PCR %d) has no SHA-256 digest" % (n, e["pcr"]))
+        if e["type"] == EV_SEPARATOR and e["digests"][TPM_ALG_SHA256] == EV_SEPARATOR_ERR_SHA256:
+            raise Fail("event %d: error EV_SEPARATOR (0xffffffff) in PCR %d" % (n, e["pcr"]))
         pcrs[e["pcr"]] = hashlib.sha256(pcrs[e["pcr"]] + e["digests"][TPM_ALG_SHA256]).digest()
         extended.add(e["pcr"])
     if need_hcrtm:
@@ -615,6 +625,117 @@ def launch_digest(kernel, initrd, cmdline, initrd_gpa=None):
     h.update(struct.pack("<Q", len(cmd)))
     h.update(cmd)
     return h.digest()
+
+
+# ---- measure-host
+
+
+HOST_SLOTS = (
+    ("l4h-config", b"l4h-config\0present\0", b"l4h-config\0absent"),
+    ("dom0-initrd", b"dom0-initrd\0present\0", b"dom0-initrd\0absent"),
+)
+
+
+@checked("PE/COFF image")
+def pe_authenticode_digests(pe):
+    """Microsoft PE/COFF Authenticode SHA-256 and SHA-384 digests (skipping
+    CheckSum, the Security Directory entry, and the trailing Attribute
+    Certificate Table)."""
+    if not isinstance(pe, bytes) or len(pe) < 64 or pe[:2] != b"MZ":
+        raise Fail("not a PE/COFF image (missing MZ header)")
+    e_lfanew = struct.unpack_from("<I", pe, 0x3C)[0]
+    if e_lfanew + 24 > len(pe) or pe[e_lfanew:e_lfanew + 4] != b"PE\0\0":
+        raise Fail("not a PE/COFF image (missing PE signature)")
+    coff = e_lfanew + 4
+    num_sections = struct.unpack_from("<H", pe, coff + 2)[0]
+    opt_size = struct.unpack_from("<H", pe, coff + 16)[0]
+    opt = coff + 20
+    if opt + opt_size > len(pe) or opt_size < 68:
+        raise Fail("PE/COFF optional header out of bounds")
+    magic = struct.unpack_from("<H", pe, opt)[0]
+    if magic == 0x10B:  # PE32
+        num_rva_off, dd_off = opt + 92, opt + 96
+    elif magic == 0x20B:  # PE32+
+        num_rva_off, dd_off = opt + 108, opt + 112
+    else:
+        raise Fail("unsupported PE/COFF magic %#x (expected PE32 or PE32+)" % magic)
+    checksum_off = opt + 64
+    size_of_headers = struct.unpack_from("<I", pe, opt + 60)[0]
+    sec_table = opt + opt_size
+    sec_table_end = sec_table + num_sections * 40
+    if size_of_headers < sec_table_end or size_of_headers > len(pe):
+        raise Fail("PE/COFF SizeOfHeaders out of bounds")
+    if num_rva_off + 4 > opt + opt_size:
+        raise Fail("PE/COFF optional header missing NumberOfRvaAndSizes")
+    num_rva = struct.unpack_from("<I", pe, num_rva_off)[0]
+    sec_dir_off = None
+    cert_off, cert_size = 0, 0
+    if num_rva > 4:
+        sec_dir_off = dd_off + 4 * 8
+        if sec_dir_off + 8 > opt + opt_size:
+            raise Fail("PE/COFF Security Directory entry out of bounds")
+        cert_off, cert_size = struct.unpack_from("<II", pe, sec_dir_off)
+        if cert_size > 0 and (cert_off < size_of_headers or cert_off + cert_size != len(pe)):
+            raise Fail("PE/COFF Attribute Certificate Table out of bounds")
+
+    h256, h384 = hashlib.sha256(), hashlib.sha384()
+
+    def feed(chunk):
+        h256.update(chunk)
+        h384.update(chunk)
+
+    feed(pe[:checksum_off])
+    if sec_dir_off is not None:
+        feed(pe[checksum_off + 4:sec_dir_off])
+        feed(pe[sec_dir_off + 8:size_of_headers])
+    else:
+        feed(pe[checksum_off + 4:size_of_headers])
+
+    sections = []
+    for i in range(num_sections):
+        s = sec_table + i * 40
+        raw_size, raw_ptr = struct.unpack_from("<II", pe, s + 16)
+        if raw_size == 0:
+            continue
+        if raw_ptr < size_of_headers or raw_ptr + raw_size > len(pe) - cert_size:
+            raise Fail("PE/COFF section %d out of bounds" % i)
+        sections.append((raw_ptr, raw_size))
+    sections.sort(key=lambda x: x[0])
+
+    total_hashed = size_of_headers
+    for raw_ptr, raw_size in sections:
+        feed(pe[raw_ptr:raw_ptr + raw_size])
+        total_hashed += raw_size
+
+    extra_end = len(pe) - cert_size
+    if total_hashed > extra_end:
+        raise Fail("PE/COFF sections overlap or exceed image size")
+    if extra_end > total_hashed:
+        feed(pe[total_hashed:extra_end])
+
+    return h256.digest(), h384.digest()
+
+
+def measure_host(efi=None, config=None, initrd=None):
+    """Compute expected PCR 9 (SHA-256) and RTMR 2 (SHA-384) values for
+    l4h-fl4-efi's external slots (policy.rs), and optional PE/COFF Authenticode
+    digests of the EFI image."""
+    pcr9 = bytes(32)
+    rtmr2 = bytes(48)
+    events = []
+    for (name, present_pfx, absent_val), content in zip(HOST_SLOTS, (config, initrd)):
+        data = (present_pfx + content) if content is not None else absent_val
+        d256 = hashlib.sha256(data).digest()
+        d384 = hashlib.sha384(data).digest()
+        pcr9 = hashlib.sha256(pcr9 + d256).digest()
+        rtmr2 = hashlib.sha384(rtmr2 + d384).digest()
+        events.append({"name": name, "present": content is not None, "sha256": d256.hex(), "sha384": d384.hex()})
+    out = {"pcr9": pcr9.hex(), "rtmr2": rtmr2.hex(), "events": events}
+    if efi is not None:
+        a256, a384 = pe_authenticode_digests(efi)
+        out["efi_authenticode_sha256"] = a256.hex()
+        out["efi_authenticode_sha384"] = a384.hex()
+    return out
 
 
 # ---- verify
@@ -842,6 +963,7 @@ def check_evidence(ev, pins, ak_name, ek_ca):
         **({} if partition is None else {"partition": partition, "keys_before": before}),
         "ak_name": name.hex(),
         "ak_pinned": ak_name is not None,
+        "measurements_pinned": 4 in pins and 9 in pins,
         "reset_count": q["reset_count"],
         "restart_count": q["restart_count"],
         "pcrs": {str(i): pcrs[i].hex() for i in sorted(pcrs)},
@@ -1554,8 +1676,11 @@ def verify_tdx_quote(q, policy):
         raise Fail("the QE report is not signed by the PCK certificate")
     ext = sgx_extensions(leaf)
     f = p["fields"]
-    if f["td_attributes"][0] & 1 and not policy.allow_debug:
-        raise Fail("the TD is a debug TD (its memory is open to the host): allow it with --allow-debug")
+    # TD_ATTRIBUTES bits 7:0 (TUD: debug and profiling bits): any non-zero bit
+    # opens the TD's state to the host.
+    if f["td_attributes"][0] != 0 and not policy.allow_debug:
+        raise Fail("the TD is a debug TD or has TUD attributes set (td_attributes[0]=%#04x): allow it with --allow-debug"
+                   % f["td_attributes"][0])
     # TD_ATTRIBUTES.MIGRATABLE (bit 29): a migration TD could move this TD's
     # state elsewhere.
     migratable = bool(f["td_attributes"][3] & 0x20)
@@ -1573,8 +1698,11 @@ def verify_tdx_quote(q, policy):
     out = {
         "quote_version": p["version"],
         "body": "TD15" if len(p["body"]) == TD15_BODY else "TD10",
-        "debug": bool(f["td_attributes"][0] & 1),
+        "debug": bool(f["td_attributes"][0] != 0),
         "migratable": migratable,
+        "sept_ve_disable": bool(f["td_attributes"][3] & 0x10),
+        "perfmon": bool(f["td_attributes"][7] & 0x80),
+        "measurements_pinned": policy.mrtd is not None and 1 in policy.rtmrs and 2 in policy.rtmrs,
         **{k: v.hex() for k, v in f.items() if k != "reportdata"},
         "fmspc": ext["fmspc"].hex(),
         "pceid": ext["pceid"].hex(),
@@ -1651,6 +1779,8 @@ def replay_cc_event_log(log):
             raise Fail("CC event %d extends measurement register %d" % (n, e["pcr"]))
         if TPM_ALG_SHA384 not in e["digests"]:
             raise Fail("CC event %d has no SHA-384 digest" % n)
+        if e["type"] == EV_SEPARATOR and e["digests"][TPM_ALG_SHA384] == EV_SEPARATOR_ERR_SHA384:
+            raise Fail("CC event %d: error EV_SEPARATOR (0xffffffff) in RTMR %d" % (n, e["pcr"] - 1))
         i = e["pcr"] - 1
         rtmrs[i] = hashlib.sha384(rtmrs[i] + e["digests"][TPM_ALG_SHA384]).digest()
     return rtmrs, events
@@ -1926,6 +2056,9 @@ def tdx_warnings(info):
         print("l4h-attest: WARNING: INSECURE: --insecure-skip-collateral: the QE's identity (MRSIGNER, product, "
               "SVN, debug), the TDX module's signer (MRSIGNERSEAM), the CRLs and the TCB status were NOT checked: "
               "anyone with an SGX machine could have forged this TDX quote", file=sys.stderr)
+    if not info.get("measurements_pinned", False):
+        print("l4h-attest: WARNING: INSECURE: --insecure-unpinned-measurements: MRTD, RTMR 1 and RTMR 2 were NOT all "
+              "pinned (--mrtd --rtmr 1=... --rtmr 2=...)", file=sys.stderr)
 
 
 def main():
@@ -1937,11 +2070,17 @@ def main():
     m.add_argument("--cmdline", default="")
     m.add_argument("--initrd-gpa", type=lambda x: int(x, 0),
                    help="where dom0 loaded the initrd (default: 1 MiB past the kernel's end, as vmmgr does)")
+    mh = sub.add_parser("measure-host")
+    mh.add_argument("--efi", help="UEFI application (PE/COFF): also compute Authenticode SHA-256 and SHA-384 digests")
+    mh.add_argument("--config", help="l4h.conf file (absent if omitted)")
+    mh.add_argument("--initrd", help="dom0 initrd file (absent if omitted)")
     v = sub.add_parser("verify")
     v.add_argument("report")
     v.add_argument("evidence", nargs="?", help="TPM, TDX or combined evidence (with --tpm-evidence or --tdx-evidence: optional)")
     v.add_argument("--tpm-evidence", help="the host's TPM evidence (l4hctl attest evidence -o), checked with the TDX evidence")
     v.add_argument("--tdx-evidence", help="the host's TDX evidence (l4hctl attest tdx-evidence -o), checked with the TPM evidence")
+    v.add_argument("--ignore-tpm", action="store_true",
+                   help="with TDX evidence, ignore the TPM part of combined (v=3) evidence and verify TDX alone")
     v.add_argument("--data", help="expected report data (hex)")
     v.add_argument("--launch", help="expected launch digest (hex)")
     v.add_argument("--pcr", action="append", default=[], help="N=HEX: expected sha256 PCR value")
@@ -1949,6 +2088,9 @@ def main():
     v.add_argument("--insecure-unpinned-ak", action="store_true",
                    help="accept TPM evidence without --ak-name (its AK is then not known to be a TPM's: to read the "
                         "AK's name before enrolling it, or for tests)")
+    v.add_argument("--insecure-unpinned-measurements", action="store_true",
+                   help="INSECURE: accept evidence without pinning platform measurements (--mrtd/--rtmr 1,2 for TDX; "
+                        "--pcr 4,9 for TPM)")
     v.add_argument("--deny-taint", default="console-in", help="deny host names, bit numbers or ranges (default: console-in; '' disables)")
     v.add_argument("--require-seal", default="console-in",
                    help="require sealed host names, bit numbers or ranges (default: console-in; '' disables)")
@@ -1960,6 +2102,8 @@ def main():
     tq.add_argument("--tdx-evidence", help="the host's TDX evidence: the answer's key must be its key")
     tq.add_argument("--data", help="expected report data (hex)")
     tq.add_argument("--launch", help="expected launch digest (hex)")
+    tq.add_argument("--insecure-unpinned-measurements", action="store_true",
+                    help="INSECURE: accept a TDX quote without pinning --mrtd, --rtmr 1=... and --rtmr 2=...")
     tq.add_argument("--deny-taint", default="console-in", help="as verify")
     tq.add_argument("--require-seal", default="console-in", help="as verify")
     add_tdx_options(tq)
@@ -1980,6 +2124,11 @@ def main():
         if a.cmd == "measure":
             initrd = open(a.initrd, "rb").read() if a.initrd else b""
             print(launch_digest(open(a.kernel, "rb").read(), initrd, a.cmdline, a.initrd_gpa).hex())
+        elif a.cmd == "measure-host":
+            efi = read(a.efi) if a.efi else None
+            config = read(a.config) if a.config else None
+            initrd = read(a.initrd) if a.initrd else None
+            print(json.dumps(measure_host(efi=efi, config=config, initrd=initrd), indent=2))
         elif a.cmd == "verify":
             pins = {}
             for p in a.pcr:
@@ -1994,6 +2143,12 @@ def main():
                 if tdx_ev is not None:
                     raise Fail("two TDX evidences: the positional one and --tdx-evidence")
                 tdx_ev = cbor_decode(read(a.tdx_evidence))
+            if a.ignore_tpm:
+                if tdx_ev is None:
+                    raise Fail("--ignore-tpm requires TDX evidence")
+                if a.tpm_evidence:
+                    raise Fail("--ignore-tpm cannot be used with --tpm-evidence")
+                tpm_ev = None
             if tpm_ev is None and tdx_ev is None:
                 raise Fail("no evidence")
             out, key, partition = {}, None, None
@@ -2005,6 +2160,9 @@ def main():
                 if ak_name is None and not a.insecure_unpinned_ak:
                     raise Fail("the attestation key is not pinned: enroll it (make-credential, l4hctl attest activate) "
                                "and give its name with --ak-name, or --insecure-unpinned-ak to accept any key")
+                if (4 not in pins or 9 not in pins) and not a.insecure_unpinned_measurements:
+                    raise Fail("TPM platform measurements are not pinned: pass --pcr 4=... and --pcr 9=..., "
+                               "or --insecure-unpinned-measurements")
                 key, partition, host = check_evidence(tpm_ev, pins, ak_name, a.ek_ca)
                 if a.event_log:
                     host["event_log_events"] = check_event_log(read(a.event_log), tpm_ev["pcrs"])
@@ -2012,7 +2170,11 @@ def main():
             elif a.event_log or pins or a.ak_name or a.ek_ca or a.insecure_unpinned_ak:
                 raise Fail("TPM options without TPM evidence")
             if tdx_ev is not None:
-                tdx_key, info = check_tdx_evidence(tdx_ev, tdx_policy(a))
+                policy = tdx_policy(a)
+                if (policy.mrtd is None or 1 not in policy.rtmrs or 2 not in policy.rtmrs) and not a.insecure_unpinned_measurements:
+                    raise Fail("TDX platform measurements are not pinned: pass --mrtd, --rtmr 1=... and --rtmr 2=..., "
+                               "or --insecure-unpinned-measurements")
+                tdx_key, info = check_tdx_evidence(tdx_ev, policy)
                 # Both roots of trust must speak of the same key, and of the
                 # one machine trustd runs alone on.
                 if key is not None and point(key) != point(tdx_key):
@@ -2033,10 +2195,16 @@ def main():
             if tpm_ev is not None and ak_name is None:
                 print("l4h-attest: WARNING: INSECURE: --insecure-unpinned-ak: the attestation key is not pinned "
                       "(--ak-name), so not known to be a TPM's", file=sys.stderr)
+            if tpm_ev is not None and not out["host"]["measurements_pinned"]:
+                print("l4h-attest: WARNING: INSECURE: --insecure-unpinned-measurements: PCR 4 and PCR 9 were NOT pinned "
+                      "(--pcr 4=... --pcr 9=...)", file=sys.stderr)
             if tdx_ev is not None:
                 tdx_warnings(out["tdx"])
         elif a.cmd == "verify-tdx-quote":
             policy = tdx_policy(a)
+            if (policy.mrtd is None or 1 not in policy.rtmrs or 2 not in policy.rtmrs) and not a.insecure_unpinned_measurements:
+                raise Fail("TDX platform measurements are not pinned: pass --mrtd, --rtmr 1=... and --rtmr 2=..., "
+                           "or --insecure-unpinned-measurements")
             ans = cbor_decode(read(a.answer))
             key, info = check_tdx_quote_answer(ans, policy)
             if a.tdx_evidence:

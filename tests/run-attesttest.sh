@@ -101,24 +101,29 @@ ca=$out/tpm/ca/issuercert.pem
 # The AK is not enrolled yet: an unpinned AK is refused by default, and
 # accepted (to read its name) only when asked.
 ! python3 "$attest" verify "$out/run/dom0.report" "$out/run/evidence1" --data "$nonce" \
-    --launch "$dom0_launch" --ek-ca "$ca" >/dev/null 2>&1 || fail "unpinned AK accepted"
+    --launch "$dom0_launch" --ek-ca "$ca" --insecure-unpinned-measurements >/dev/null 2>&1 || fail "unpinned AK accepted"
 python3 "$attest" verify "$out/run/dom0.report" "$out/run/evidence1" --data "$nonce" \
-    --launch "$dom0_launch" --ek-ca "$ca" --insecure-unpinned-ak > "$out/run/dom0.json" || fail "dom0 report"
+    --launch "$dom0_launch" --ek-ca "$ca" --insecure-unpinned-ak --insecure-unpinned-measurements \
+    > "$out/run/dom0.json" || fail "dom0 report"
 python3 "$attest" verify "$out/run/vm.report" "$out/run/evidence1" --data "$nonce" \
-    --launch "$vm_launch" --ek-ca "$ca" --insecure-unpinned-ak > "$out/run/vm.json" || fail "guest report"
+    --launch "$vm_launch" --ek-ca "$ca" --insecure-unpinned-ak --insecure-unpinned-measurements \
+    > "$out/run/vm.json" || fail "guest report"
 json() { python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(eval(sys.argv[2]))" "$@"; }
 [ "$(json "$out/run/dom0.json" 'd["guest"]["dom0"]')" = True ] || fail "dom0 not marked dom0"
 [ "$(json "$out/run/vm.json" 'd["guest"]["dom0"]')" = False ] || fail "guest marked dom0"
 [ "$(json "$out/run/vm.json" 'd["guest"]["ram"]')" = $((64 << 20)) ] || fail "guest RAM"
 # The firmware and GRUB measured the boot.
-[ "$(json "$out/run/dom0.json" 'd["host"]["pcrs"]["4"]')" != "$(printf '0%.0s' $(seq 64))" ] || fail "PCR 4 empty"
-[ "$(json "$out/run/dom0.json" 'd["host"]["pcrs"]["9"]')" != "$(printf '0%.0s' $(seq 64))" ] || fail "PCR 9 empty"
+pcr4=$(json "$out/run/dom0.json" 'd["host"]["pcrs"]["4"]')
+pcr9=$(json "$out/run/dom0.json" 'd["host"]["pcrs"]["9"]')
+[ "$pcr4" != "$(printf '0%.0s' $(seq 64))" ] || fail "PCR 4 empty"
+[ "$pcr9" != "$(printf '0%.0s' $(seq 64))" ] || fail "PCR 9 empty"
+pcr_pins=(--pcr "4=$pcr4" --pcr "9=$pcr9")
 # Tampering is caught.
 cp "$out/run/dom0.report" "$out/run/bad.report"
 printf '\x00' | dd of="$out/run/bad.report" bs=1 seek=40 conv=notrunc status=none
 ak=$(json "$out/run/dom0.json" 'd["host"]["ak_name"]')
-! python3 "$attest" verify "$out/run/bad.report" "$out/run/evidence1" --ak-name "$ak" 2>/dev/null || fail "tampered report verified"
-! python3 "$attest" verify "$out/run/vm.report" "$out/run/evidence1" --launch "$dom0_launch" --ak-name "$ak" 2>/dev/null \
+! python3 "$attest" verify "$out/run/bad.report" "$out/run/evidence1" --ak-name "$ak" "${pcr_pins[@]}" 2>/dev/null || fail "tampered report verified"
+! python3 "$attest" verify "$out/run/vm.report" "$out/run/evidence1" --launch "$dom0_launch" --ak-name "$ak" "${pcr_pins[@]}" 2>/dev/null \
     || fail "wrong launch digest accepted"
 tpm_claims "$out/run/evidence1" "$out/run/dom0.json" cert
 echo "ATTESTTEST: reports verify; AK $ak"
@@ -129,21 +134,21 @@ grep -aq "FLAGVM: PASS" "$log" || fail "guest flags checks"
 for phase in clean injected gates fresh queued; do
     field "$log" "FLAGVM: $phase report" "$out/run/$phase.report"
 done
-python3 "$attest" verify "$out/run/clean.report" "$out/run/evidence1" --data "$nonce" --ak-name "$ak" \
+python3 "$attest" verify "$out/run/clean.report" "$out/run/evidence1" --data "$nonce" --ak-name "$ak" "${pcr_pins[@]}" \
     --require-seal console-out > "$out/run/clean.json" || fail "clean sealed report"
-! python3 "$attest" verify "$out/run/injected.report" "$out/run/evidence1" --ak-name "$ak" --require-seal '' >/dev/null 2>&1 \
+! python3 "$attest" verify "$out/run/injected.report" "$out/run/evidence1" --ak-name "$ak" "${pcr_pins[@]}" --require-seal '' >/dev/null 2>&1 \
     || fail "injected input accepted"
-python3 "$attest" verify "$out/run/injected.report" "$out/run/evidence1" --ak-name "$ak" --deny-taint '' --require-seal '' \
+python3 "$attest" verify "$out/run/injected.report" "$out/run/evidence1" --ak-name "$ak" "${pcr_pins[@]}" --deny-taint '' --require-seal '' \
     > "$out/run/injected.json" || fail "allow input"
-python3 "$attest" verify "$out/run/gates.report" "$out/run/evidence1" --ak-name "$ak" --deny-taint 130,131 \
+python3 "$attest" verify "$out/run/gates.report" "$out/run/evidence1" --ak-name "$ak" "${pcr_pins[@]}" --deny-taint 130,131 \
     --require-seal console-in,console-out,130,140-141 > "$out/run/gates.json" || fail "guest gates"
 # Unsealed (console-in): refused by default, as input could follow.
-! python3 "$attest" verify "$out/run/fresh.report" "$out/run/evidence1" --ak-name "$ak" >/dev/null 2>&1 \
+! python3 "$attest" verify "$out/run/fresh.report" "$out/run/evidence1" --ak-name "$ak" "${pcr_pins[@]}" >/dev/null 2>&1 \
     || fail "unsealed report accepted"
-python3 "$attest" verify "$out/run/fresh.report" "$out/run/evidence1" --ak-name "$ak" --require-seal '' \
+python3 "$attest" verify "$out/run/fresh.report" "$out/run/evidence1" --ak-name "$ak" "${pcr_pins[@]}" --require-seal '' \
     > "$out/run/fresh.json" \
     || fail "new instance"
-python3 "$attest" verify "$out/run/queued.report" "$out/run/evidence1" --ak-name "$ak" --deny-taint '' --require-seal '' \
+python3 "$attest" verify "$out/run/queued.report" "$out/run/evidence1" --ak-name "$ak" "${pcr_pins[@]}" --deny-taint '' --require-seal '' \
     > "$out/run/queued.json" || fail "pre-start input"
 python3 - "$out/run" <<'CHECK'
 import json, sys
@@ -179,7 +184,7 @@ grep -aq "ATTEST: activated after a pause" "$log" || fail "activation not allowe
 field "$log" "ATTEST: dom0 report" "$out/run/dom0.report2"
 field "$log" "ATTEST: evidence" "$out/run/evidence2"
 python3 "$attest" verify "$out/run/dom0.report2" "$out/run/evidence2" --data "$nonce" --ak-name "$ak" \
-    --ek-ca "$ca" > "$out/run/dom0.json2" || fail "second boot report"
+    --ek-ca "$ca" --insecure-unpinned-measurements > "$out/run/dom0.json2" || fail "second boot report"
 [ "$(json "$out/run/dom0.json2" 'd["host"]["key"]')" != "$(json "$out/run/dom0.json" 'd["host"]["key"]')" ] \
     || fail "same host key on both boots"
 tpm_claims "$out/run/evidence2" "$out/run/dom0.json2" cert
@@ -201,7 +206,7 @@ grep -aq "ATTEST: secret $secret" "$log" || fail "credential not activated (ACPI
 field "$log" "ATTEST: dom0 report" "$out/run/dom0.report3"
 field "$log" "ATTEST: evidence" "$out/run/evidence3"
 python3 "$attest" verify "$out/run/dom0.report3" "$out/run/evidence3" --data "$nonce" --ak-name "$ak" \
-    --ek-ca "$ca" > "$out/run/dom0.json3" || fail "ACPI start report"
+    --ek-ca "$ca" --insecure-unpinned-measurements > "$out/run/dom0.json3" || fail "ACPI start report"
 tpm_claims "$out/run/evidence3" "$out/run/dom0.json3" cert
 echo "ATTESTTEST: ACPI start method: $starts commands through _DSM"
 
@@ -213,8 +218,9 @@ log=$out/boot4.log
 field "$log" "ATTEST: dom0 report" "$out/run/dom0.report4"
 field "$log" "ATTEST: evidence" "$out/run/evidence4"
 python3 "$attest" verify "$out/run/dom0.report4" "$out/run/evidence4" --data "$nonce" --insecure-unpinned-ak \
-    > "$out/run/dom0.json4" 2>/dev/null || fail "report without an EK certificate"
-! python3 "$attest" verify "$out/run/dom0.report4" "$out/run/evidence4" --ek-ca "$ca" --insecure-unpinned-ak >/dev/null 2>&1 \
+    --insecure-unpinned-measurements > "$out/run/dom0.json4" 2>/dev/null || fail "report without an EK certificate"
+! python3 "$attest" verify "$out/run/dom0.report4" "$out/run/evidence4" --ek-ca "$ca" --insecure-unpinned-ak \
+    --insecure-unpinned-measurements >/dev/null 2>&1 \
     || fail "verified an EK certificate the evidence does not have"
 tpm_claims "$out/run/evidence4" "$out/run/dom0.json4" ekpub
 grep -aq "l4h-trustd: ready .*no EK certificate (the EK's public area instead)" "$log" || fail "trustd made no EK"
@@ -228,7 +234,8 @@ grep -aq "ATTEST: secret $secret" "$log" || fail "credential for ekpub not activ
 field "$log" "ATTEST: evidence" "$out/run/evidence5"
 field "$log" "ATTEST: dom0 report" "$out/run/dom0.report5"
 python3 "$attest" verify "$out/run/dom0.report5" "$out/run/evidence5" --data "$nonce" \
-    --ak-name "$(json "$out/run/dom0.json4" 'd["host"]["ak_name"]')" > "$out/run/dom0.json5" 2>/dev/null \
+    --ak-name "$(json "$out/run/dom0.json4" 'd["host"]["ak_name"]')" --insecure-unpinned-measurements \
+    > "$out/run/dom0.json5" 2>/dev/null \
     || fail "second boot without an EK certificate"
 [ "$(json "$out/run/dom0.json5" 'd["host"]["ekpub"]')" = "$(json "$out/run/dom0.json4" 'd["host"]["ekpub"]')" ] \
     || fail "ekpub differs between boots"

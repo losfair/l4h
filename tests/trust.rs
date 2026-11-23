@@ -154,10 +154,42 @@ fn tdx_mode_and_acpi_start_boundary() {
     assert_eq!(tdx_mode(true, false), TDX_UNAVAILABLE);
     assert_ne!(tdx_mode(true, false), TDX_NONE);
 
-    // START_ACPI (AML with root hardware access) is refused in a TD and
-    // allowed outside a TD; other CRB start methods remain allowed.
+    // In a TD, all TPM start methods are refused (TDX ignores TPM completely);
+    // outside a TD, all supported start methods remain allowed.
     assert!(!tpm_start_allowed(true, START_ACPI));
-    assert!(tpm_start_allowed(true, START_CRB));
-    assert!(tpm_start_allowed(true, START_PLUTON));
+    assert!(!tpm_start_allowed(true, START_CRB));
+    assert!(!tpm_start_allowed(true, START_PLUTON));
     assert!(tpm_start_allowed(false, START_ACPI));
+    assert!(tpm_start_allowed(false, START_CRB));
+    assert!(tpm_start_allowed(false, START_PLUTON));
+}
+
+#[test]
+fn tpm_mmio_range_isolation() {
+    let pci_bars = [(0xfe00_0000u64, 0x20_000u64), (0x80_0000_0000, 0x4000)];
+    // Standard CRB/TIS, 64 KiB buffer, unaligned 64 KiB (68 KiB), and fTPM in reserved memory.
+    assert!(tpm_range_allowed(0xfed4_0000, 0x1000, &pci_bars));
+    assert!(tpm_range_allowed(0xfed4_0000, TPM_CRB_BUF_MAX, &pci_bars));
+    assert!(tpm_range_allowed(0xfed4_0000, TPM_RANGE_MAX, &pci_bars));
+    assert!(tpm_range_allowed(0x7f80_0000, 0x1000, &pci_bars));
+    // Adjacent to PCI BARs without overlapping.
+    assert!(tpm_range_allowed(0xfdff_f000, 0x1000, &pci_bars));
+    assert!(tpm_range_allowed(0xfe02_0000, 0x1000, &pci_bars));
+
+    // Empty, oversized (> TPM_RANGE_MAX), or wrapping ranges are refused.
+    assert!(!tpm_range_allowed(0xfed4_0000, 0, &pci_bars));
+    assert!(!tpm_range_allowed(0xfed4_0000, TPM_RANGE_MAX + 0x1000, &pci_bars));
+    assert!(!tpm_range_allowed(0xfed4_0000, RANGE_STRIDE, &pci_bars));
+    assert!(!tpm_range_allowed(usize::MAX - 0xfff, 0x2000, &pci_bars));
+
+    // Overlapping HPET, I/O APIC, or local APIC / MSI window are refused.
+    assert!(!tpm_range_allowed(HPET_DEFAULT.0 as usize, 0x1000, &pci_bars));
+    assert!(!tpm_range_allowed(IOAPIC_DEFAULT.0 as usize, 0x1000, &pci_bars));
+    assert!(!tpm_range_allowed(LAPIC_MSI.0 as usize, 0x1000, &pci_bars));
+    assert!(!tpm_range_allowed((LAPIC_MSI.0 as usize) - 0x1000, 0x2000, &pci_bars));
+
+    // Overlapping any PCI memory BAR is refused.
+    assert!(!tpm_range_allowed(0xfe00_0000, 0x1000, &pci_bars));
+    assert!(!tpm_range_allowed(0xfe01_f000, 0x2000, &pci_bars));
+    assert!(!tpm_range_allowed(0x80_0000_2000, 0x1000, &pci_bars));
 }

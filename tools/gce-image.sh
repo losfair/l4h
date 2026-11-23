@@ -17,14 +17,11 @@
 # an SEV-SNP zone as an N2D with SEV_SNP and the SEV_SNP_CAPABLE image tag.
 # --tdx: for an image that boots l4h-fl4.efi built with FL4's Intel TDX
 # support, deployed in a zone with Intel TDX (C3) as a C3 with TDX and the
-# TDX_CAPABLE image tag, on gVNIC with an NVMe boot disk.  trustd then
-# binds its key to a DCAP quote (l4hctl attest tdx-evidence) and, when the
-# instance has Google's Shielded VM vTPM (the default here, with
-# --shielded-vtpm), to the vTPM's quote as well: both roots of trust, one
-# key (l4h-attest.py verify takes either or both).  With --no-vtpm the
-# instance has no vTPM (--no-shielded-vtpm, and so
-# --no-shielded-integrity-monitoring, which needs it): TDX alone, whose
-# trust does not rest on the host's vTPM.
+# TDX_CAPABLE image tag, on gVNIC with an NVMe boot disk.  On a TDX guest,
+# l4h-fl4.efi, l4h-root and l4h-trustd ignore any cloud vTPM completely and
+# attest through TDX alone (l4hctl attest tdx-evidence / tdx-quote).  With
+# --no-vtpm the instance also omits GCE's Shielded VM vTPM
+# (--no-shielded-vtpm --no-shielded-integrity-monitoring).
 set -euo pipefail
 confidential=
 vtpm=1
