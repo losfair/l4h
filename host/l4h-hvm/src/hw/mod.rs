@@ -210,6 +210,15 @@ pub fn probe_xcr0(vcpu: u64, want: u64) -> u64 {
     got
 }
 
+/// FL4's VCPU MSR for leaving a VM exit's IBPB to the next switch to
+/// another address space.  This monitor's address space is its guest's
+/// alone (guest RAM, its I/O pool and rings, its own state), so guest
+/// branch predictions reaching it expose nothing of another domain;
+/// every other address space still gets the IBPB first.  An error (seL4,
+/// an FL4 without it) leaves the IBPB at every exit.
+#[cfg(not(test))]
+pub const FL4_MSR_VM_IBPB_DEFER: u64 = 0xffff_fffd;
+
 #[cfg(not(test))]
 pub fn vcpu_write_msr(vcpu: u64, msr: u64, v: u64) -> bool {
     sel4::with_ipc_buffer_mut(|b| b.inner_mut().seL4_X86_VCPU_WriteMSR(vcpu, msr, v)).error == 0

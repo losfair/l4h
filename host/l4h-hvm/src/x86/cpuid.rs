@@ -21,6 +21,8 @@ pub struct Ctx {
     pub xcr0: u64,
     /// The XCR0 features the VM's guests may enable (vm::Vm::xcr0).
     pub xcr0_max: u64,
+    /// The guest's CR4.PKE (CPUID's OSPKE).
+    pub pke: bool,
     /// INVPCID can be enabled for guests (VT-x's control stuck).
     pub invpcid: bool,
 }
@@ -29,16 +31,17 @@ const fn bit(n: u32) -> u32 {
     1 << n
 }
 
-/// The XSAVE features a guest may enable: x87, SSE, AVX and AVX-512's
-/// opmask, ZMM_Hi256 and Hi16_ZMM, where the VCPU takes them (the VM's
+/// The XSAVE features a guest may enable: x87, SSE, AVX, AVX-512's
+/// opmask, ZMM_Hi256 and Hi16_ZMM, and PKRU, where the VCPU takes them (the VM's
 /// `Ctx::xcr0_max`, which main.rs probes: FL4 does, seL4 with
 /// KernelXSaveFeatureSet 7 not).  On Zen 4 a guest that runs with
 /// AVX-512 left out of XCR0 gets no use of the op cache: every
 /// instruction goes through the decoders (tests/run-hvmbench.sh, 25-50%
 /// on throughput-bound code).
-pub const XCR0_ALLOWED: u64 = 0xe7;
-/// XCR0's AVX-512 state components.
+pub const XCR0_ALLOWED: u64 = 0x2e7;
+/// XCR0's AVX-512 state components, and PKRU.
 pub const XCR0_AVX512: u64 = 0xe0;
+pub const XCR0_PKRU: u64 = 1 << 9;
 
 /// The XCR0 features the guest may enable on this host.
 pub fn xcr0_supported(host: &impl Fn(u32, u32) -> [u32; 4]) -> u64 {
@@ -57,7 +60,7 @@ pub fn xcr0_valid(value: u64, supported: u64) -> bool {
 /// Bytes of an XSAVE area holding the features in `xcr0`.
 fn xsave_size(xcr0: u64, host: &impl Fn(u32, u32) -> [u32; 4]) -> u32 {
     let mut size = 576;
-    for f in 2..8u32 {
+    for f in 2..10u32 {
         if xcr0 & (1 << f) != 0 {
             let [sz, off, _, _] = host(0xd, f);
             size = size.max(off + sz);
@@ -128,15 +131,19 @@ pub fn cpuid(leaf: u32, sub: u32, ctx: &Ctx, host: &impl Fn(u32, u32) -> [u32; 4
                 // its state, Intel PT; INVPCID only where the VCPU can have it.
                 let hide_b = bit(1) | bit(2) | bit(12) | bit(14) | bit(15) | bit(25) | bit(26) | bit(27)
                     | if avx512 { 0 } else { avx512_b } | if ctx.invpcid { 0 } else { bit(10) };
-                // ECX: hide PKU, OSPKE, WAITPKG, CET_SS, LA57, RDPID, KL,
-                // SGX_LC, PKS; AVX-512's without its state.
-                let hide_c = bit(3) | bit(4) | bit(5) | bit(7) | bit(16) | bit(22) | bit(23) | bit(30) | bit(31)
-                    | if avx512 { 0 } else { avx512_c };
+                // ECX: hide WAITPKG, CET_SS, LA57, RDPID, KL, SGX_LC, PKS;
+                // AVX-512's without its state; PKU without PKRU's (the
+                // guest's protection keys in its XSAVE state, as KVM gives
+                // them), OSPKE as the guest's CR4.PKE has it.
+                let pku = ctx.xcr0_max & XCR0_PKRU != 0;
+                let hide_c = bit(4) | bit(5) | bit(7) | bit(16) | bit(22) | bit(23) | bit(30) | bit(31)
+                    | if avx512 { 0 } else { avx512_c } | if pku { 0 } else { bit(3) };
+                let c = (c & !hide_c) | if pku && ctx.pke { bit(4) } else { 0 };
                 // EDX: keep FSRM, MD_CLEAR, SERIALIZE: hide the rest (AVX-512,
                 // TSX controls, hybrid, PCONFIG, CET_IBT, AMX, speculation
                 // control and the capability MSRs).
                 let keep_d = bit(4) | bit(10) | bit(14);
-                [a.min(1), b & !hide_b, c & !hide_c, d & keep_d]
+                [a.min(1), b & !hide_b, c, d & keep_d]
             }
             // AVX-VNNI, and AVX512_BF16 with AVX-512's state.
             1 => {
@@ -168,7 +175,7 @@ pub fn cpuid(leaf: u32, sub: u32, ctx: &Ctx, host: &impl Fn(u32, u32) -> [u32; 4
                     let [a, b, _, _] = host(0xd, 2);
                     [a, b, 0, 0]
                 }
-                5..=7 if supported & (1 << sub) != 0 => {
+                5..=7 | 9 if supported & (1 << sub) != 0 => {
                     let [a, b, _, _] = host(0xd, sub);
                     [a, b, 0, 0]
                 }
@@ -289,7 +296,7 @@ mod tests {
         }
     }
 
-    const CTX: Ctx = Ctx { vcpu: 2, vcpus: 4, tsc_hz: 2_100_000_000, osxsave: false, xcr0: 1, xcr0_max: 7, invpcid: false };
+    const CTX: Ctx = Ctx { vcpu: 2, vcpus: 4, tsc_hz: 2_100_000_000, osxsave: false, xcr0: 1, xcr0_max: 7, pke: false, invpcid: false };
 
     /// An AMD host with everything set and extended leaves to 0x8000_0021.
     fn amd_host(leaf: u32, sub: u32) -> [u32; 4] {
@@ -317,7 +324,7 @@ mod tests {
         assert_eq!(b & (bit(16) | bit(30) | bit(31)), bit(16) | bit(30) | bit(31), "AVX-512 F, BW, VL");
         assert_eq!(b & (bit(26) | bit(27)), 0, "never PF, ER");
         assert_eq!(c & (bit(1) | bit(14)), bit(1) | bit(14), "VBMI, VPOPCNTDQ");
-        assert_eq!(c & (bit(3) | bit(4)), 0, "still no PKU");
+        assert_eq!(c & bit(4), 0, "OSPKE off");
         assert_eq!(cpuid(7, 1, &on, &h)[0] & bit(5), bit(5), "AVX512_BF16");
         assert_eq!(cpuid(0xd, 0, &Ctx { osxsave: true, xcr0: 0xe7, ..on }, &h), [0xe7, 2432, 2432, 0]);
         assert_eq!(cpuid(0xd, 6, &on, &h), [512, 896, 0, 0]);
@@ -328,7 +335,15 @@ mod tests {
         assert_eq!(cpuid(7, 1, &CTX, &h)[0] & bit(5), 0);
         assert_eq!(cpuid(0xd, 0, &CTX, &h)[0], 7);
         assert_eq!(cpuid(0xd, 5, &CTX, &h), [0; 4]);
-        assert_eq!(xcr0_supported(&h), 0xe7, "x87, SSE, AVX, AVX-512; not PKRU");
+        assert_eq!(xcr0_supported(&h), 0x2e7, "x87, SSE, AVX, AVX-512, PKRU");
+        // PKU with PKRU's state, OSPKE as the guest's CR4.PKE.
+        let with = Ctx { xcr0_max: 0x2e7, ..CTX };
+        assert_eq!(cpuid(7, 0, &with, &h)[2] & (bit(3) | bit(4)), bit(3));
+        assert_eq!(cpuid(7, 0, &Ctx { pke: true, ..with }, &h)[2] & (bit(3) | bit(4)), bit(3) | bit(4));
+        assert_eq!(cpuid(7, 0, &Ctx { pke: true, ..CTX }, &h)[2] & (bit(3) | bit(4)), 0, "no PKU without PKRU");
+        let h9 = |l: u32, s: u32| if (l, s) == (0xd, 9) { [8, 2440, 0, 0] } else { h(l, s) };
+        assert_eq!(cpuid(0xd, 9, &with, &h9), [8, 2440, 0, 0]);
+        assert_eq!(cpuid(0xd, 0, &Ctx { osxsave: true, xcr0: 0x2e7, ..with }, &h9)[1], 2448);
     }
 
     #[test]
