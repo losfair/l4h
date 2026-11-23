@@ -205,7 +205,10 @@ pub const SEL4_MSR_CR2: u64 = 0xffff_ffff;
 /// KernelXSaveFeatureSet 7).  Back to XCR0's reset value after.
 #[cfg(not(test))]
 pub fn probe_xcr0(vcpu: u64, want: u64) -> u64 {
-    let got = if vcpu_write_msr(vcpu, SEL4_MSR_XCR0, want) { want } else { want & 7 };
+    // The whole set, then without one group, then without both: a kernel
+    // may allow AVX-512 without PKRU or the other way round.
+    let tries = [want, want & !crate::x86::cpuid::XCR0_PKRU, want & !crate::x86::cpuid::XCR0_AVX512, want & 7];
+    let got = tries.into_iter().find(|&x| vcpu_write_msr(vcpu, SEL4_MSR_XCR0, x)).unwrap_or(want & 7);
     vcpu_write_msr(vcpu, SEL4_MSR_XCR0, 1);
     got
 }

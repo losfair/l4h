@@ -48,13 +48,27 @@ pub fn xcr0_supported(host: &impl Fn(u32, u32) -> [u32; 4]) -> u64 {
     if host(0, 0)[0] < 0xd || host(1, 0)[2] & bit(26) == 0 {
         return 0;
     }
-    host(0xd, 0)[0] as u64 & XCR0_ALLOWED
+    let mut x = host(0xd, 0)[0] as u64 & XCR0_ALLOWED;
+    let leaf7 = if host(0, 0)[0] >= 7 { host(7, 0) } else { [0; 4] };
+    // AVX-512's three components together, with AVX512F; PKRU with PKU.
+    if x & XCR0_AVX512 != XCR0_AVX512 || leaf7[1] & bit(16) == 0 {
+        x &= !XCR0_AVX512;
+    }
+    if leaf7[2] & bit(3) == 0 {
+        x &= !XCR0_PKRU;
+    }
+    x
 }
 
 /// Whether XSETBV of `value` to XCR0 is valid: x87 always, AVX with SSE,
-/// nothing outside what is supported.
+/// AVX-512's three components all or none and with AVX, nothing outside
+/// what is supported.
 pub fn xcr0_valid(value: u64, supported: u64) -> bool {
-    value & 1 != 0 && value & !supported == 0 && (value & 4 == 0 || value & 2 != 0)
+    let avx512 = value & XCR0_AVX512;
+    value & 1 != 0
+        && value & !supported == 0
+        && (value & 4 == 0 || value & 2 != 0)
+        && (avx512 == 0 || (avx512 == XCR0_AVX512 && value & 6 == 6))
 }
 
 /// Bytes of an XSAVE area holding the features in `xcr0`.
@@ -336,6 +350,16 @@ mod tests {
         assert_eq!(cpuid(0xd, 0, &CTX, &h)[0], 7);
         assert_eq!(cpuid(0xd, 5, &CTX, &h), [0; 4]);
         assert_eq!(xcr0_supported(&h), 0x2e7, "x87, SSE, AVX, AVX-512, PKRU");
+        // PKRU's state without PKU, AVX-512's without AVX512F: not offered.
+        let no = |leaf: u32, reg: usize, b: u32| move |l: u32, s: u32| {
+            let mut r = h(l, s);
+            if l == leaf && s == 0 {
+                r[reg] &= !b;
+            }
+            r
+        };
+        assert_eq!(xcr0_supported(&no(7, 2, bit(3))), 0xe7);
+        assert_eq!(xcr0_supported(&no(7, 1, bit(16))), 0x207);
         // PKU with PKRU's state, OSPKE as the guest's CR4.PKE.
         let with = Ctx { xcr0_max: 0x2e7, ..CTX };
         assert_eq!(cpuid(7, 0, &with, &h)[2] & (bit(3) | bit(4)), bit(3));
@@ -437,6 +461,11 @@ mod tests {
         assert_eq!(cpuid(0xd, 1, &CTX, &host)[0], 7, "not XSAVES");
         assert!(xcr0_valid(7, 7) && xcr0_valid(3, 7) && xcr0_valid(1, 7));
         assert!(!xcr0_valid(0, 7) && !xcr0_valid(5, 7) && !xcr0_valid(0xf, 7) && !xcr0_valid(7, 3));
+        // AVX-512: its three components together, and with SSE and AVX.
+        assert!(xcr0_valid(0xe7, 0x2e7) && xcr0_valid(0x2e7, 0x2e7) && xcr0_valid(0x207, 0x2e7));
+        for x in [0x21, 0xe1, 0xe3, 0x67, 0xa7] {
+            assert!(!xcr0_valid(x, 0x2e7), "{x:#x}");
+        }
         let sig = cpuid(0x4000_0000, 0, &CTX, &host);
         assert_eq!(&[sig[1].to_le_bytes(), sig[2].to_le_bytes(), sig[3].to_le_bytes()].concat(), b"KVMKVMKVM\0\0\0");
         assert_eq!(sig[0], 0x4000_0001);
