@@ -144,6 +144,11 @@ impl Net {
             q.push(mem, head, 0);
             returned = true;
         }
+        if returned {
+            // A turn that ended at its batch or at a full port polls on
+            // from here (keep_polling stamps only the turns that ran dry).
+            self.last_work[TX] = l4h_rt::host::ticks::now();
+        }
         if left == 0 || self.tx_blocked {
             // Back for more (complete, retry) without a notification:
             // ask for one all the same, in case that never comes.
@@ -181,8 +186,8 @@ impl Net {
             }
             // A frame waiting for buffers waits until the driver adds
             // some: copying it into the same ones again would do nothing.
-            if self.rx_short.is_some_and(|seen| q.avail_idx(mem) == seen) {
-                if !self.keep_polling(RX, returned) && q.enable_notify_more(mem) {
+            if let Some(seen) = self.rx_short.filter(|&seen| q.avail_idx(mem) == seen) {
+                if !self.keep_polling(RX, returned) && q.enable_notify_more(mem, seen) {
                     continue;
                 }
                 break;
@@ -253,8 +258,10 @@ impl Net {
                 // took and ask for a notification when the driver adds
                 // more (the event index would leave refills unannounced),
                 // unless it already has.
+                // Where the chains ran out, not the driver's index now:
+                // chains it added since are still to be tried.
+                self.rx_short = Some(q.last_avail());
                 q.unpop(heads.len() as u16);
-                self.rx_short = Some(q.avail_idx(mem));
                 left += 1;
                 continue;
             }
@@ -394,6 +401,21 @@ mod tests {
     extern crate std;
     use super::*;
     use crate::mem::tests::fake;
+
+    #[test]
+    fn notify_more_is_armed_where_the_chains_ran_out() {
+        // Chains the driver added after the device ran out at index 2, but
+        // before it armed the event: reported, not asked for again.
+        let (mem, _buf) = fake(1 << 20, 0);
+        let mut q = Queue::default();
+        assert!(q.setup(&mem, 16, 256, 0x1000, 0x2000, 0x3000));
+        q.set_event_idx(true);
+        mem.write::<u16>(0x2002, 3);
+        assert!(q.enable_notify_more(&mem, 2));
+        assert_eq!(mem.read::<u16>(0x3004 + 8 * 16), 2, "avail_event at the index seen");
+        assert!(!q.enable_notify_more(&mem, 3));
+        assert_eq!(mem.read::<u16>(0x3004 + 8 * 16), 3);
+    }
 
     #[test]
     fn mergeable_receive_spans_buffers_or_waits() {

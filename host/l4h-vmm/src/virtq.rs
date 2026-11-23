@@ -228,15 +228,16 @@ impl Queue {
         mem.read::<u16>(self.avail + 2) != self.last_avail
     }
 
-    /// Ask for a notification when the driver adds chains beyond those it
-    /// has now (vhost's, armed at the avail index it saw): for a device
-    /// that has chains but too few, as a receive queue for a frame that
-    /// spans more.  Whether some came meanwhile.
-    pub fn enable_notify_more(&mut self, mem: &GuestMem) -> bool {
+    /// Ask for a notification when the driver adds chains beyond its avail
+    /// index `seen`, the one the device last found too few at (vhost's,
+    /// armed at the avail index it saw): for a receive queue whose frame
+    /// spans more chains than there were.  `seen` is the caller's, not
+    /// read again here: chains added since are then reported, not asked
+    /// for.  Whether the driver is past `seen` (some came meanwhile).
+    pub fn enable_notify_more(&mut self, mem: &GuestMem, seen: u16) -> bool {
         if !self.ready {
             return false;
         }
-        let seen = mem.read::<u16>(self.avail + 2);
         if self.event_idx {
             mem.write::<u16>(self.used + 4 + 8 * self.num as u64, seen);
         } else {
@@ -244,6 +245,11 @@ impl Queue {
         }
         fence(Ordering::SeqCst);
         mem.read::<u16>(self.avail + 2) != seen
+    }
+
+    /// The avail index this queue has taken chains up to.
+    pub fn last_avail(&self) -> u16 {
+        self.last_avail
     }
 }
 
