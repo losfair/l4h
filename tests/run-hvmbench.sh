@@ -29,7 +29,7 @@ fi
 "$l4h_cc" -O2 -static -o "$out/mstime" "$root/tests/guest/mstime.c"
 "$root/tools/mkinitramfs.sh" "$out/benchvm.cpio.gz" "$root/tests/guest/init-benchvm" "$out/netbench" >/dev/null
 "$root/tools/mkinitramfs.sh" "$out/vmcmp.cpio.gz" "$root/tests/guest/init-vmcmp" \
-    "$out/vmcmp" "$out/bench" "$out/netbench" >/dev/null
+    "$out/vmcmp" "$out/bench" "$out/netbench" "$out/mstime" >/dev/null
 "$root/tools/mkinitramfs.sh" "$out/hvmbench.cpio.gz" "$root/tests/guest/init-hvmbench" \
     "$l4h_ctl" "$out/mstime" "$out/bzImage" "$out/vmcmp.cpio.gz" "$out/benchvm.cpio.gz" >/dev/null
 rm -f "$out/hvmbench.img" && truncate -s 1G "$out/hvmbench.img"
@@ -52,14 +52,15 @@ fi
 if [ "${HB_MODE:-l4h}" = kvm ]; then
     source "$root/tests/kvm-vmms.sh"
     "$root/tools/mkinitramfs.sh" "$out/kvmbase.cpio.gz" "$root/tests/guest/init-kvmbase" \
-        "$out/mstime" "$out/netbench" "$out/bzImage" "$out/vmcmp.cpio.gz" >/dev/null
+        "$out/mstime" "$out/netbench" "$out/bzImage" "$out/vmcmp.cpio.gz" "$out/benchvm.cpio.gz" >/dev/null
     kvm_vmms_append "$out/kvmbase.cpio.gz" qemu
     kernel=${KVMTEST_KERNEL:-/boot/vmlinuz-$(uname -r)}
     mods=$(mktemp -d)
     trap 'rm -rf "$mods"' EXIT
     mkdir -p "$mods/lib/kvm"
     for m in virt/lib/irqbypass arch/x86/kvm/kvm arch/x86/kvm/kvm-amd arch/x86/kvm/kvm-intel drivers/crypto/ccp/ccp \
-        drivers/block/virtio_blk drivers/net/tun drivers/net/tap drivers/vhost/vhost_iotlb drivers/vhost/vhost drivers/vhost/vhost_net; do
+        drivers/block/virtio_blk drivers/net/tun drivers/net/tap drivers/vhost/vhost_iotlb drivers/vhost/vhost drivers/vhost/vhost_net \
+        net/llc/llc net/802/stp net/bridge/bridge; do
         xz -dc "/lib/modules/$(uname -r)/kernel/$m.ko.xz" >"$mods/lib/kvm/$(basename "$m").ko"
     done
     (cd "$mods" && find . | cpio -o -H newc --quiet | gzip -1) >>"$out/kvmbase.cpio.gz"
@@ -68,15 +69,15 @@ if [ "${HB_MODE:-l4h}" = kvm ]; then
         -smp "${L4H_SMP:-4}" -m "${L4H_MEM:-3G}" -name kvmbase,debug-threads=on -mem-prealloc -display none -vga none -nic none -no-reboot -monitor none \
         -drive file="$out/hvmbench.img",if=none,id=d0,format=raw,cache=none,aio=native -device virtio-blk-pci,drive=d0,disable-legacy=on \
         -serial "file:$log" -kernel "$kernel" -initrd "$out/kvmbase.cpio.gz" \
-        -append "console=ttyS0 quiet panic=-1 HB_MEM=${HB_MEM:-1024} HB_REPS=${HB_REPS:-1}${HB_SPIN:+ HB_SPIN=1}${HB_CPUIDSPIN:+ HB_CPUIDSPIN=1}${HB_GUEST_ARGS:+ HB_GUEST_ARGS=$HB_GUEST_ARGS}${HB_KVMAMD_ARGS:+ HB_KVMAMD_ARGS=$HB_KVMAMD_ARGS}${HB_L1_THP:+ HB_L1_THP=$HB_L1_THP}${HB_KVM_ARGS:+ HB_KVM_ARGS=$HB_KVM_ARGS}${HB_L2QEMU_ARGS:+ HB_L2QEMU_ARGS=$HB_L2QEMU_ARGS}" </dev/null || true
+        -append "console=ttyS0 quiet panic=-1 HB_MEM=${HB_MEM:-1024} HB_REPS=${HB_REPS:-1}${HB_SPIN:+ HB_SPIN=1}${HB_CPUIDSPIN:+ HB_CPUIDSPIN=1}${HB_NETSPIN:+ HB_NETSPIN=1}${HB_GUEST_ARGS:+ HB_GUEST_ARGS=$HB_GUEST_ARGS}${HB_KVMAMD_ARGS:+ HB_KVMAMD_ARGS=$HB_KVMAMD_ARGS}${HB_L1_THP:+ HB_L1_THP=$HB_L1_THP}${HB_KVM_ARGS:+ HB_KVM_ARGS=$HB_KVM_ARGS}${HB_L2QEMU_ARGS:+ HB_L2QEMU_ARGS=$HB_L2QEMU_ARGS}" </dev/null || true
     grep -a "HVMBENCH" "$log" || true
     grep -aq "HVMBENCH: done" "$log"
     exit
 fi
 export L4H_QEMU_CPU=${L4H_QEMU_CPU:-host,+invtsc}
 L4H_MEM=${L4H_MEM:-3G} L4H_DOM0_DISKS=0 L4H_DOM0_MEM_MB=512 L4H_SMP=${L4H_SMP:-4} \
-L4H_QEMU_ARGS="-name l4h,debug-threads=on -mem-prealloc -drive file=$out/hvmbench.img,if=none,id=d0,format=raw,cache=none,aio=native -device virtio-blk-pci,drive=d0,disable-legacy=on" \
+L4H_QEMU_ARGS="-name l4h,debug-threads=on -mem-prealloc ${HB_QEMU_EXTRA:-} -drive file=$out/hvmbench.img,if=none,id=d0,format=raw,cache=none,aio=native -device virtio-blk-pci,drive=d0,disable-legacy=on" \
     "$root/tools/run-dom0.sh" "$out/hvmbench.cpio.gz" \
-    "console=hvc0 HB_MEM=${HB_MEM:-1024} HB_VCPUS=${HB_VCPUS:-1} HB_KINDS=${HB_KINDS:-pv,hvm} HB_REPS=${HB_REPS:-1}${HB_SPIN:+ HB_SPIN=1}${HB_CPUIDSPIN:+ HB_CPUIDSPIN=1}" \
+    "console=hvc0 HB_MEM=${HB_MEM:-1024} HB_VCPUS=${HB_VCPUS:-1} HB_KINDS=${HB_KINDS:-pv,hvm} HB_REPS=${HB_REPS:-1}${HB_SPIN:+ HB_SPIN=1}${HB_CPUIDSPIN:+ HB_CPUIDSPIN=1}${HB_NETSPIN:+ HB_NETSPIN=1}${HB_SINK:+ HB_SINK=$HB_SINK}" \
     ${HVMBENCH_TIMEOUT:-900} | grep -a "HVMBENCH" || true
 grep -aq "HVMBENCH: done" "$root/build/qemu.log"

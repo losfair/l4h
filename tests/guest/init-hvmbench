@@ -10,13 +10,20 @@ fail() { echo "HVMBENCH: FAIL: $*"; l4hctl list; poweroff -f; }
 mem=${HB_MEM:-1024} vcpus=${HB_VCPUS:-1} kinds=$(echo "${HB_KINDS:-pv,hvm}" | tr , " ") reps=${HB_REPS:-1}
 echo "HVMBENCH: start, guests ${mem} MiB, $vcpus vCPU"
 sw=$(l4hctl switch-create) || fail "switch-create"
-sink=$(l4hctl create sink --initrd /bin/benchvm.cpio.gz --mem 256 --nic "$sw" --cmdline "console=hvc0") || fail "sink"
+# The TCP sink: an HVM guest as the measured one (HB_SINK=pv: a PV guest),
+# as the nested-KVM baseline has guest to guest.
+if [ "${HB_SINK:-hvm}" = pv ]; then
+    sink=$(l4hctl create sink --initrd /bin/benchvm.cpio.gz --mem 256 --nic "$sw" --cmdline "console=hvc0") || fail "sink"
+else
+    sink=$(l4hctl create sink --hvm --kernel /bin/bzImage --initrd /bin/benchvm.cpio.gz --mem 256 --nic "$sw" \
+        --cmdline "console=ttyS0") || fail "sink"
+fi
 l4hctl console "$sink" --until "BENCHVM: ready" --timeout 120 >/dev/null || fail "sink not ready"
 for r in $(seq 1 "$reps"); do
 for kind in $kinds; do
     case $kind in
     pv)  args="--initrd /bin/vmcmp.cpio.gz"; cmd="console=hvc0${HB_SPIN:+ spin}" ;;
-    hvm) args="--hvm --kernel /bin/bzImage --initrd /bin/vmcmp.cpio.gz"; cmd="console=ttyS0${HB_SPIN:+ spin}${HB_CPUIDSPIN:+ cpuidspin}" ;;
+    hvm) args="--hvm --kernel /bin/bzImage --initrd /bin/vmcmp.cpio.gz"; cmd="console=ttyS0${HB_SPIN:+ spin}${HB_CPUIDSPIN:+ cpuidspin}${HB_NETSPIN:+ netspin}" ;;
     esac
     t0=$(mstime)
     id=$(l4hctl create "$kind$r" $args --cmdline "$cmd" --mem "$mem" --vcpus "$vcpus" --disk 0 --nic "$sw") || fail "create $kind"
