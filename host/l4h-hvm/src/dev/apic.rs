@@ -44,6 +44,18 @@ pub struct Shared {
     pub enabled: AtomicBool,
 }
 
+/// Bits 0, 2, .., 62 of `x` as bits 0..32 (the requested bits of a `req`
+/// word, without their trigger modes): every vCPU entry and halt poll
+/// looks at the IRR.
+fn even_bits(x: u64) -> u64 {
+    let mut x = x & 0x5555_5555_5555_5555;
+    x = (x | x >> 1) & 0x3333_3333_3333_3333;
+    x = (x | x >> 2) & 0x0f0f_0f0f_0f0f_0f0f;
+    x = (x | x >> 4) & 0x00ff_00ff_00ff_00ff;
+    x = (x | x >> 8) & 0x0000_ffff_0000_ffff;
+    (x | x >> 16) & 0xffff_ffff
+}
+
 impl Shared {
     pub const fn new(id: u32) -> Self {
         Shared {
@@ -78,11 +90,8 @@ impl Shared {
         let mut irr = [0u64; 4];
         for (w, r) in self.req.iter().enumerate() {
             let r = r.load(Ordering::Acquire);
-            for i in 0..32 {
-                if r & (1 << (2 * i)) != 0 {
-                    let v = w * 32 + i;
-                    irr[v / 64] |= 1 << (v % 64);
-                }
+            if r != 0 {
+                irr[w / 2] |= even_bits(r) << (32 * (w % 2));
             }
         }
         irr
@@ -213,6 +222,14 @@ pub fn deliver(apics: &[Shared], m: &Message, from: Option<usize>, mut wake: imp
 mod tests {
     extern crate std;
     use super::*;
+
+    #[test]
+    fn even_bits_takes_every_other_bit() {
+        for x in [0u64, 1, 2, 3, u64::MAX, 0x5555_5555_5555_5555, 0xaaaa_aaaa_aaaa_aaaa, 0x8000_0000_0000_0001, 0x1234_5678_9abc_def0] {
+            let want = (0..32).fold(0u64, |m, i| m | ((x >> (2 * i)) & 1) << i);
+            assert_eq!(even_bits(x), want, "{x:#x}");
+        }
+    }
     use std::vec::Vec;
 
     fn apics(n: u32) -> Vec<Shared> {
