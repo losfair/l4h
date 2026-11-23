@@ -59,12 +59,17 @@ pub struct VirtioBlk {
 impl VirtioBlk {
     pub fn new(id: u32, cfg: &BlkdConfig) -> Self {
         let mut dma = Dma::new(cfg.dma_va as usize, cfg.dma_paddr, cfg.dma_size as usize);
-        // MSI-X table entry 0 -> our interrupt, unmasked.
-        let msix = Mmio(cfg.msix_table.va as usize);
-        msix.w32(0, cfg.msi_address as u32);
-        msix.w32(4, (cfg.msi_address >> 32) as u32);
-        msix.w32(8, cfg.msi_data);
-        msix.w32(12, 0);
+        // MSI-X table entry 0 -> our interrupt, unmasked (skip when using INTx).
+        let queue_vec = if cfg.msix_table.len > 0 {
+            let msix = Mmio(cfg.msix_table.va as usize);
+            msix.w32(0, cfg.msi_address as u32);
+            msix.w32(4, (cfg.msi_address >> 32) as u32);
+            msix.w32(8, cfg.msi_data);
+            msix.w32(12, 0);
+            0
+        } else {
+            NO_VECTOR
+        };
         let wanted = |offered: u64| {
             offered & (VIRTIO_BLK_F_RO | VIRTIO_BLK_F_FLUSH | VIRTIO_BLK_F_BLK_SIZE | VIRTIO_BLK_F_SEG_MAX
                 | VIRTIO_BLK_F_DISCARD)
@@ -98,7 +103,7 @@ impl VirtioBlk {
                 dev.fail();
                 panic!("blkd {:#x}: features rejected", id);
             }
-            let vq = dev.setup_queue(&mut dma, 0, blk::RING_SIZE as u16, 0).expect("blkd: queue 0");
+            let vq = dev.setup_queue(&mut dma, 0, blk::RING_SIZE as u16, queue_vec).expect("blkd: queue 0");
             let capacity = dev.device.r64(CFG_CAPACITY as usize);
             let block_size =
                 if features & VIRTIO_BLK_F_BLK_SIZE != 0 { dev.device.r32(CFG_BLK_SIZE as usize).max(512) } else { 512 };

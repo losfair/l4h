@@ -50,6 +50,8 @@ pub struct VirtioNet {
     mrg: bool,
     /// Legacy devices are notified through I/O ports.
     ports: Option<Ports>,
+    /// Virtio PCI ISR register for level-triggered INTx devices without MSI-X.
+    isr: Option<Mmio>,
     /// Bytes of virtio-net header in front of each frame.
     hdr_len: usize,
     rxq: Virtq,
@@ -92,7 +94,11 @@ impl VirtioNet {
         let c = hw.config;
         let n = c.uplink;
         let mut dma = hw.dma();
-        hw.program_msix(1);
+        if c.msix_table.len > 0 {
+            hw.program_msix(1);
+        }
+        let queue_vec = if c.msix_table.len > 0 { 0 } else { l4h_virtio::NO_VECTOR };
+        let isr = (c.msix_table.len == 0 && c.isr.len > 0).then(|| Mmio(c.isr.va as usize));
         let (mut rxq, txq, want, mac, ports, hdr_len) = if let Some(p) = hw.io_ports() {
             p.out8(legacy::STATUS, 0);
             p.out8(legacy::STATUS, STATUS_ACK | STATUS_DRIVER);
@@ -125,13 +131,37 @@ impl VirtioNet {
             let dev = modern_device(c);
             if !dev.reset(l4h_rt::timeout_ms(l4h_virtio::RESET_MS)) { return Err("the device does not reset"); }
             let offered = dev.features();
-            let want = F_VERSION_1 | wanted(offered) | (offered & F_ACCESS_PLATFORM);
-            if offered & F_VERSION_1 == 0 || !dev.set_features(want) {
+            let mut want = F_VERSION_1 | wanted(offered) | (offered & F_ACCESS_PLATFORM);
+            if offered & F_VERSION_1 == 0 {
                 dev.fail();
                 return Err("the device rejects VERSION_1");
             }
-            let rxq = dev.setup_queue(&mut dma, 0, RX_QUEUE, 0).ok_or("no RX queue")?;
-            let txq = dev.setup_queue(&mut dma, 1, RX_QUEUE, 0).ok_or("no TX queue")?;
+            if !dev.set_features(want) {
+                // Fallback for hypervisors that advertise optional net features
+                // they reject during FEATURES_OK negotiation.
+                let mut ok = false;
+                for cand in [
+                    F_VERSION_1 | (offered & (VIRTIO_NET_F_MAC | (1 << 16) | (1 << 3) | F_ACCESS_PLATFORM)),
+                    F_VERSION_1 | (offered & (VIRTIO_NET_F_MAC | F_ACCESS_PLATFORM)),
+                    F_VERSION_1 | (offered & F_ACCESS_PLATFORM),
+                ] {
+                    dev.common.w8(0x14, 0);
+                    while dev.common.r8(0x14) != 0 { core::hint::spin_loop(); }
+                    dev.common.w8(0x14, STATUS_ACK);
+                    dev.common.w8(0x14, STATUS_ACK | STATUS_DRIVER);
+                    if dev.set_features(cand) {
+                        want = cand;
+                        ok = true;
+                        break;
+                    }
+                }
+                if !ok {
+                    dev.fail();
+                    return Err("the device rejects VERSION_1");
+                }
+            }
+            let rxq = dev.setup_queue(&mut dma, 0, RX_QUEUE, queue_vec).ok_or("no RX queue")?;
+            let txq = dev.setup_queue(&mut dma, 1, RX_QUEUE, queue_vec).ok_or("no TX queue")?;
             let mac: [u8; 6] = core::array::from_fn(|i| dev.device.r8(i));
             (rxq, txq, want, mac, None, HDR)
         };
@@ -154,6 +184,7 @@ impl VirtioNet {
             tso: want & (VIRTIO_NET_F_HOST_TSO4 | VIRTIO_NET_F_HOST_TSO6) == (VIRTIO_NET_F_HOST_TSO4 | VIRTIO_NET_F_HOST_TSO6),
             mrg: want & VIRTIO_NET_F_MRG_RXBUF != 0,
             ports,
+            isr,
             hdr_len,
             rxq,
             txq,
@@ -336,5 +367,10 @@ impl crate::sdk::NicDriver for VirtioNet {
     }
     fn kick_tx(&mut self) {
         VirtioNet::kick_tx(self)
+    }
+    fn irq_received(&mut self) {
+        if let Some(isr) = self.isr {
+            let _ = isr.r8(0);
+        }
     }
 }

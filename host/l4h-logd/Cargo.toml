@@ -6,3 +6,4 @@ version.workspace = true
 
 [dependencies]
 l4h-rt = { path = "../l4h-rt" }
+l4h-virtio = { path = "../l4h-virtio" }

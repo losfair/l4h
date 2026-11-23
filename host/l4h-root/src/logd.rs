@@ -65,12 +65,21 @@ pub fn init_uart(alloc: &mut Alloc, _devmem: &mut DevMem, base: u16) -> Option<U
     Some(Uart { monitor, out: monitor, out_base: base })
 }
 
-/// The PL011 of QEMU's virt machine.
+/// The PL011/SBSA UART discovered from the FDT (None on platforms without one,
+/// which then fall back to a virtio-console PCI device).
 #[cfg(target_arch = "aarch64")]
 pub fn init_uart(alloc: &mut Alloc, devmem: &mut DevMem, _base: u16) -> Option<Uart> {
-    const PL011: usize = 0x0900_0000;
-    let frame = devmem.frames(&mut alloc.slots, PL011, PAGE)?.start as u64;
+    let pl011 = crate::fdt::hw().pl011_base?;
+    let frame = devmem.frames(&mut alloc.slots, pl011, PAGE)?.start as u64;
     Some(Uart { monitor: frame, out: frame, out_base: 0 })
+}
+
+/// A modern virtio-console PCI device, used when no platform UART is present.
+pub fn is_virtio_console(d: &crate::pci::Device) -> bool {
+    d.vendor == 0x1af4
+        && d.device == 0x1043
+        && crate::blkd::is_modern_virtio(d)
+        && crate::blkd::mappable(d, crate::blkd::virtio_bar_mask(d))
 }
 
 /// logd as root keeps it.
@@ -92,6 +101,7 @@ pub struct FbArea {
 /// Spawn logd: serial output, or a secondary's trusted relay. This is the first
 /// component, so that a panic in the rest of root's boot is printed: root
 /// outranks it, and it runs once root stops or waits.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     alloc: &mut Alloc,
     win: &mut Window,
@@ -101,19 +111,34 @@ pub fn spawn(
     rings: &crate::partition::Rings,
     fb: Option<FbArea>,
     outgoing: Option<Range<Slot>>,
+    mut virtio_console: Option<(&crate::pci::Device, &crate::pci::Pci, &mut crate::iommu::Iommu, &mut DevMem)>,
 ) -> Option<Logd> {
     if LOGD_ELF.is_empty() {
         return None;
     }
+    const VIRTIO_DMA_BITS: usize = 16; // 64 KiB
     let fb_pages = fb.as_ref().map_or(0, |f| f.frames.len());
     // Every ring, partition 0's lanes and logd's own lane.
     let ring_pages = serial::MAX_RINGS * (serial::PAGES + l4h_partition::CONSOLE_RING_SIZE as usize / PAGE)
         + serial::LANES_PAGES + serial::PAGES;
-    let pages = fb_pages + ring_pages + 1;
+    let mut vcon_bars: crate::blkd::BarCache = [const { None }; 6];
+    let mut vcon_bar_mask = 0u8;
+    let mut vcon_bar_pages = 0usize;
+    let mut vcon_dma_pages = 0usize;
+    if let Some((d, _, _, devmem)) = virtio_console.as_mut() {
+        let mask = crate::blkd::virtio_bar_mask(d);
+        if crate::blkd::carve_bars(alloc, devmem, d, &mut vcon_bars, mask) {
+            vcon_bar_mask = mask;
+            vcon_bar_pages = crate::blkd::bar_pages(d, mask);
+            vcon_dma_pages = (1 << VIRTIO_DMA_BITS) / PAGE;
+        }
+    }
+    let pages = fb_pages + ring_pages + vcon_bar_pages + vcon_dma_pages + 1;
     let keep_bits = pages.next_power_of_two().trailing_zeros() as usize;
     let mut arena = alloc
         .arena((4 << 20) + (32 << keep_bits) + (pages / 512 + 8) * PAGE)
         .expect("memory for logd");
+    let none_reg = host::blk::PciRegion::default();
     let mut cfg = LogdConfig {
         tsc_hz: info.tsc_hz,
         uart_base: uart.map_or(0, |u| u.out_base),
@@ -128,7 +153,41 @@ pub fn spawn(
         fb_offset: 0,
         lanes: 1,
         relay: outgoing.is_some() as u32,
+        virtio_common: none_reg,
+        virtio_notify: none_reg,
+        virtio_device: none_reg,
+        virtio_notify_mult: 0,
+        _pad2: 0,
+        virtio_dma_va: 0,
+        virtio_dma_paddr: 0,
+        virtio_dma_size: 0,
     };
+    let bar_va = |b: u8| serial::VIRTIO_MMIO_VA + b as usize * crate::blkd::BAR_STRIDE;
+    let mut vcon_dma_frames: Option<Range<Slot>> = None;
+    if vcon_bar_mask != 0 {
+        if let Some((d, _, iommu, _)) = virtio_console.as_mut() {
+            let r = crate::blkd::virtio_regions(d, bar_va);
+            let dma_slot = alloc.slots.alloc();
+            let mut dma_region = alloc.split(VIRTIO_DMA_BITS, dma_slot).expect("logd virtio DMA");
+            let dma_paddr = dma_region.paddr;
+            let frames = alloc.slots.alloc_range(vcon_dma_pages);
+            dma_region
+                .retype_dma(alloc.shared_dma, &crate::vspace::FRAME_BP, vcon_dma_pages,
+                    crate::mem::Dest::new(crate::slot::CNODE.cap(), frames.start))
+                .expect("logd virtio DMA frames");
+            arena.own(dma_slot, dma_paddr, VIRTIO_DMA_BITS);
+            let dom = iommu.attach(alloc, d);
+            iommu.map(alloc, dom, dma_paddr, 1 << VIRTIO_DMA_BITS, true);
+            cfg.virtio_common = r.common;
+            cfg.virtio_notify = r.notify;
+            cfg.virtio_device = r.device;
+            cfg.virtio_notify_mult = r.notify_mult;
+            cfg.virtio_dma_va = serial::VIRTIO_DMA_VA as u64;
+            cfg.virtio_dma_paddr = dma_paddr as u64;
+            cfg.virtio_dma_size = (1 << VIRTIO_DMA_BITS) as u64;
+            vcon_dma_frames = Some(frames);
+        }
+    }
     if let Some(f) = &fb {
         cfg.fb_pitch = f.pitch as u32;
         cfg.fb_width = f.width as u32;
@@ -186,6 +245,16 @@ pub fn spawn(
     #[cfg(target_arch = "aarch64")]
     if let Some(uart) = uart {
         map(alloc, &mut arena, uart.out as Slot..uart.out as Slot + 1, serial::UART_VA, sel4::VmAttributes::EXECUTE_NEVER);
+    }
+    if let Some(frames) = vcon_dma_frames {
+        map(alloc, &mut arena, frames, serial::VIRTIO_DMA_VA, sel4::VmAttributes::DEFAULT);
+        for b in (0..6u8).filter(|b| vcon_bar_mask & (1 << b) != 0) {
+            let bf = crate::blkd::bar_frames(&vcon_bars, b);
+            map(alloc, &mut arena, bf, bar_va(b), crate::blkd::DEVICE_ATTRS);
+        }
+        if let Some((d, pci, _, _)) = virtio_console {
+            pci.enable(d);
+        }
     }
     component::start(&comp);
     Some(Logd { comp, _arena: arena })

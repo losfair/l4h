@@ -713,6 +713,10 @@ fn main(info: &'static Info) -> ! {
     l4h_rt::mailbox::signal();
     let mut badge = ntfn.wait().1;
     loop {
+        if badge & host::badges::blkd::IRQ != 0 && cfg.msix_table.len == 0 && cfg.isr.len > 0 {
+            // Read Virtio PCI ISR byte to deassert level-triggered INTx before reaping and acking.
+            let _ = l4h_virtio::Mmio(cfg.isr.va as usize).r8(0);
+        }
         b.reap();
         b.submit();
         if badge & host::badges::blkd::IRQ != 0 { irq.irq_handler_ack().expect("blkd IRQ ack"); }

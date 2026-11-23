@@ -528,6 +528,8 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     }
     let total_bytes = alloc.free_bytes();
     info!("l4h-root: {} core(s), {} MiB free memory", cores, total_bytes >> 20);
+    #[cfg(target_arch = "aarch64")]
+    fdt::init(bootinfo);
 
     let hyp_ep = alloc.object_cap::<cap_type::Endpoint>(ObjectBlueprint::Endpoint);
     // The watchdog timer signals a notification bound to the root TCB, which
@@ -622,10 +624,10 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     };
     let mut asids = AsidPools::new(slot::ASID_POOL.cap(), 1);
     let dashboard = dashboard::Dashboard::new(bootinfo, &mut alloc, &mut devmem, cfg.fb_console);
-    let logd = if uart.is_some() || outgoing.is_some() {
+    let mut logd = if uart.is_some() || outgoing.is_some() {
         let rings = partition::Rings::new(&mut alloc, &mut devmem);
         let fb = dashboard.as_ref().and_then(|d| d.console_area());
-        logd::spawn(&mut alloc, &mut wins.a, &mut asids, &info, uart.as_ref(), &rings, fb, outgoing)
+        logd::spawn(&mut alloc, &mut wins.a, &mut asids, &info, uart.as_ref(), &rings, fb, outgoing, None)
     } else { None };
     // From here on, memory comes from memd.
     let mut memd = memd::spawn(&mut alloc, &mut wins.a, &mut asids, &info);
@@ -680,6 +682,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     // The NIC drivers, which say which functions are network devices.
     nicd::drivers().load(module("l4h-drivers"));
     let mut balloon = None;
+    let mut virtio_console = None;
     let pci_inventory = pci::INVENTORY.take();
     let (msix_blocks, mut msix_complete) = (pci::MSIX_BLOCKS.take(), true);
     for d in pci.enumerate() {
@@ -727,6 +730,9 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
             // Left to the firmware, enabled as it is, until claimed.
             usb::found(d, &pci, &mut alloc, &mut devmem);
             record.owner = l4h_abi::PCI_OWNER_FIRMWARE;
+        } else if logd.is_none() && virtio_console.is_none() && logd::is_virtio_console(&d) {
+            virtio_console = Some(d);
+            record.owner = l4h_abi::PCI_OWNER_ROOT;
         } else if memd::is_balloon(&d) && balloon.is_none() && !partition::secondary() && !alloc.shared_dma {
             // Not with encrypted memory: a reported page the hypervisor
             // dropped reads back as the decryption of zeroes, not as
@@ -742,6 +748,13 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         match ctrls.iter().position(|c: &Controller| netd::bdf(&c.pci) == bdf) {
             Some(i) => ctrls[..=i].rotate_right(1),
             None => log!("l4h-root: no boot disk at {:02x}:{:02x}.{}", bdf >> 8, (bdf >> 3) & 0x1f, bdf & 7),
+        }
+    }
+    if logd.is_none() {
+        if let Some(d) = virtio_console {
+            let rings = partition::Rings::new(&mut alloc, &mut devmem);
+            let fb = dashboard.as_ref().and_then(|d| d.console_area());
+            logd = logd::spawn(&mut alloc, &mut wins.a, &mut asids, &info, None, &rings, fb, None, Some((&d, &pci, &mut iommu, &mut devmem)));
         }
     }
     if let Some(d) = balloon {
@@ -917,6 +930,10 @@ fn dom0_plan(h: &mut Host, ntfn: cap::Notification) -> Dom0Plan {
     // The second uplink NIC, if any, on switch 1, then the internal
     // switches. dom0 finds its vNICs by MAC, not by their order.
     let uplink2 = h.cfg.uplink2_nic.and_then(|bdf| {
+        if bdf == config::UPLINK2_AUTO {
+            return (0..nicd::nics().len())
+                .find(|&i| Some(i) != uplink && nicd::nics()[i].driver.is_some());
+        }
         let n = nicd::nics().iter().position(|n| netd::bdf(&n.pci) == bdf);
         if n.is_none() {
             log!("l4h-root: no second uplink NIC at {:02x}:{:02x}.{}", bdf >> 8, (bdf >> 3) & 0x1f, bdf & 7);

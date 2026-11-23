@@ -50,6 +50,10 @@ pub struct Pci {
     windows: l4h_host::fixed::ArrayVec<(u64, u64, u64), { l4h_host::trust::MAX_ECAM }>,
     #[cfg(target_arch = "aarch64")]
     next_bar: core::cell::Cell<u64>,
+    #[cfg(target_arch = "aarch64")]
+    ecam_buses: u8,
+    #[cfg(target_arch = "aarch64")]
+    bar_limit: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -70,6 +74,7 @@ pub struct Device {
     pub subclass: u8,
     pub prog_if: u8,
     pub revision: u8,
+    pub irq_pin: u8,
     pub bars: [Bar; 6],
     /// MSI-X capability: config offset, table BAR/offset, table size.
     pub msix: Option<Msix>,
@@ -263,6 +268,44 @@ pub fn io_ports(_alloc: &mut Alloc, _base: u16, _len: u16) -> Option<sel4::cap::
     None
 }
 
+/// Whether the platform supports MSI / MSI-X delivery.
+pub fn has_msix_support() -> bool {
+    #[cfg(target_arch = "x86_64")] { true }
+    #[cfg(target_arch = "aarch64")]
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        matches!(MSI_MODE.load(Relaxed), MSI_GICV2M | MSI_ITS)
+    }
+}
+
+/// Whether the platform routes legacy PCI INTx via FDT when MSI/MSI-X
+/// is unavailable (e.g. Apple Virtualization.framework GICv3 without ITS).
+pub fn has_intx_support() -> bool {
+    #[cfg(target_arch = "x86_64")] { false }
+    #[cfg(target_arch = "aarch64")]
+    {
+        !has_msix_support() && crate::fdt::hw().n_intx > 0
+    }
+}
+
+/// An IRQ handler for legacy PCI INTx of `d`, into `dst`, routed to `core`.
+pub fn intx_irq(d: &Device, core: usize, dst: &sel4::AbsoluteCPtr) -> Result<(), &'static str> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _ = (d, core, dst);
+        Err("PCI INTx not supported on x86_64")
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if d.irq_pin == 0 || crate::fdt::hw().n_intx == 0 {
+            return Err("no PCI INTx routing");
+        }
+        let intid = crate::fdt::hw().pci_intx_intid(d.dev, d.irq_pin);
+        slot::IRQ_CONTROL.cap().irq_control_get_trigger_core(intid, false, core as u64, dst)
+            .map_err(|_| "PCI INTx IRQ handler allocation failed")
+    }
+}
+
 /// An IRQ handler for MSI vector `vector` of `d`, into `dst`; why not,
 /// with `dst` left empty.  Callers make it before anything else of the
 /// device's, so a controller that cannot have one stays disabled (the ITS
@@ -283,8 +326,11 @@ pub fn msi_irq(d: &Device, vector: u64, dst: &sel4::AbsoluteCPtr) -> Result<(), 
             return Err("MSI vector out of range");
         }
         match MSI_MODE.load(Relaxed) {
-            MSI_GICV2M => slot::IRQ_CONTROL.cap().irq_control_get_trigger_core(80 + vector, true, 0, dst)
-                .map_err(|_| "GICv2m IRQ handler allocation failed"),
+            MSI_GICV2M => {
+                let (_, v2m_spi) = crate::fdt::hw().gicv2m.unwrap_or((crate::fdt::QEMU_V2M_BASE, 80));
+                slot::IRQ_CONTROL.cap().irq_control_get_trigger_core(v2m_spi as u64 + vector, true, 0, dst)
+                    .map_err(|_| "GICv2m IRQ handler allocation failed")
+            }
             // FL4's GetMSI: event `vector` of the function's requester ID
             // (no SMMU: its ITS DeviceID), as LPI `vector`, to core 0.
             #[cfg(l4h_kernel_its)]
@@ -361,13 +407,16 @@ pub fn msi_init(bootinfo: &sel4::BootInfoPtr) {
         // seL4_AArch64VirtInfo: 13 words, gic_version the third.
         let gic = extra_chunk(bootinfo, VIRT_INFO).filter(|c| c.len() >= 13 * 8).map(|c| word(c, 2));
         let v2m = extra_chunk(bootinfo, FDT).is_some_and(crate::fdt::has_qemu_gicv2m);
+        let has_intx = crate::fdt::hw().n_intx > 0;
         match gic {
             Some(2) if v2m => {
                 MSI_MODE.store(MSI_GICV2M, Relaxed);
                 log!("l4h-root: MSIs through QEMU virt's GICv2m (in the device tree)");
             }
             Some(2) => log!("l4h-root: warning: GICv2 without a GICv2m in the device tree: no MSIs"),
+            Some(v) if has_intx => log!("l4h-root: GICv{} without an ITS: PCI interrupts through FDT INTx", v),
             Some(v) => log!("l4h-root: warning: GICv{} without an ITS report: no MSIs", v),
+            None if has_intx => log!("l4h-root: PCI interrupts through FDT INTx"),
             None => log!("l4h-root: warning: no MSI controller reported: no MSIs"),
         }
         return;
@@ -948,9 +997,11 @@ impl Pci {
         for (n, b) in bars.iter_mut().enumerate() {
             if b.size == 0 || b.is_io { continue; }
             // The size is the device's: a power of two, and the BAR must fit.
+            let bar_limit = self.bar_limit;
+            let align = b.size.max(4096);
             let end = Some(b.size).filter(|s| s.is_power_of_two())
-                .and_then(|s| self.next_bar.get().checked_next_multiple_of(s)?.checked_add(s))
-                .filter(|&end| end <= 0x3eff_0000);
+                .and_then(|s| self.next_bar.get().checked_next_multiple_of(align)?.checked_add(s))
+                .filter(|&end| end <= bar_limit);
             let Some(end) = end else {
                 log!("l4h-root: pci {:02x}:{:02x}.{}: BAR {} of {:#x} bytes does not fit the MMIO aperture, unused", bus, dev, func, n, b.size);
                 *b = Bar::default();
@@ -965,6 +1016,7 @@ impl Pci {
             self.next_bar.set(addr + b.size);
         }
         let (msix, msi, virtio_caps) = self.caps(bus, dev, func, &bars);
+        let irq_pin = self.read8(bus, dev, func, 0x3d);
         Some(Device {
             bus,
             dev,
@@ -975,6 +1027,7 @@ impl Pci {
             subclass: (class >> 16) as u8,
             prog_if: (class >> 8) as u8,
             revision: class as u8,
+            irq_pin,
             bars,
             msix,
             msi,
@@ -982,10 +1035,17 @@ impl Pci {
         })
     }
 
-    /// Enable memory decoding and bus mastering, disable INTx.
+    /// Enable memory decoding and bus mastering; disable INTx (we use MSI-X or
+    /// enable INTx explicitly via `enable_intx` for interrupt-driven devices).
     pub fn enable(&self, d: &Device) {
         let cmd = self.read16(d.bus, d.dev, d.func, 4);
         self.write16(d.bus, d.dev, d.func, 4, cmd | 0x2 | 0x4 | 0x400);
+    }
+
+    /// Enable legacy INTx (clear PCI Command Interrupt Disable bit 10).
+    pub fn enable_intx(&self, d: &Device) {
+        let cmd = self.read16(d.bus, d.dev, d.func, 4);
+        self.write16(d.bus, d.dev, d.func, 4, cmd & !0x400);
     }
 
     /// Enable I/O space decoding (registers of a legacy virtio device).
@@ -1129,7 +1189,10 @@ pub fn msi_address() -> u64 {
         use core::sync::atomic::Ordering::Relaxed;
         match MSI_MODE.load(Relaxed) {
             MSI_ITS => ITS_DOORBELL.load(Relaxed),
-            MSI_GICV2M => 0x0802_0040,
+            MSI_GICV2M => {
+                let (v2m_base, _) = crate::fdt::hw().gicv2m.unwrap_or((crate::fdt::QEMU_V2M_BASE, 80));
+                v2m_base + 0x40
+            }
             _ => 0,
         }
     }
@@ -1139,33 +1202,51 @@ pub fn msi_data(vector: u64) -> u32 {
     // The ITS's event, or GICv2m's SPI.
     #[cfg(target_arch = "aarch64")]
     {
-        if MSI_MODE.load(core::sync::atomic::Ordering::Relaxed) == MSI_GICV2M { 80 + vector as u32 } else { vector as u32 }
+        if MSI_MODE.load(core::sync::atomic::Ordering::Relaxed) == MSI_GICV2M {
+            let (_, v2m_spi) = crate::fdt::hw().gicv2m.unwrap_or((crate::fdt::QEMU_V2M_BASE, 80));
+            v2m_spi + vector as u32
+        } else {
+            vector as u32
+        }
     }
 }
 
 #[cfg(target_arch = "aarch64")]
 impl Pci {
-    // QEMU virt, highmem-ecam=off: 16 MiB ECAM, buses 0..15.
+    // Up to 16 MiB ECAM window (buses 0..ecam_buses), discovered from FDT.
     const ECAM_VA: usize = crate::layout::ECAM.base;
     pub fn new(alloc: &mut Alloc, devmem: &mut crate::devmem::DevMem) -> Self {
         use sel4::{CapRights, VmAttributes};
         use crate::mem::ObjCtx;
-        let frames = devmem.frames(&mut alloc.slots, 0x3f00_0000, 1 << 24).expect("PCI ECAM frames");
+        let hw = crate::fdt::hw();
+        let (ecam_paddr, ecam_size) = hw.pci_ecam;
+        let (bar_start, bar_limit) = hw.pci_mmio32;
+        let frames = devmem.frames(&mut alloc.slots, ecam_paddr, ecam_size).expect("PCI ECAM frames");
         for (n, frame) in frames.map(crate::devmem::granule).enumerate() {
             crate::vspace::map_frame(&mut ObjCtx::global(alloc), slot::VSPACE.cap(), frame,
                 Self::ECAM_VA + n * 4096, CapRights::read_write(), VmAttributes::EXECUTE_NEVER);
         }
-        Self { next_bar: core::cell::Cell::new(0x1000_0000) }
+        Self {
+            next_bar: core::cell::Cell::new(bar_start),
+            ecam_buses: (ecam_size >> 20) as u8,
+            bar_limit,
+        }
     }
     fn config(&self, bus: u8, dev: u8, func: u8, off: u8) -> *mut u32 {
-        assert!(bus < 16);
+        assert!(bus < self.ecam_buses);
         (Self::ECAM_VA + ((bus as usize) << 20) + ((dev as usize) << 15)
             + ((func as usize) << 12) + (off as usize & !3)) as *mut u32
     }
     pub fn read32(&self, bus: u8, dev: u8, func: u8, off: u8) -> u32 {
+        if bus >= self.ecam_buses {
+            return u32::MAX;
+        }
         unsafe { self.config(bus, dev, func, off).read_volatile() }
     }
     pub fn write32(&self, bus: u8, dev: u8, func: u8, off: u8, value: u32) {
+        if bus >= self.ecam_buses {
+            return;
+        }
         unsafe { self.config(bus, dev, func, off).write_volatile(value); core::arch::asm!("dmb osh", options(nostack)); }
     }
 }

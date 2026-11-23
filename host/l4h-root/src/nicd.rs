@@ -317,9 +317,14 @@ fn windowed(d: &pci::Device, m: &Manifest) -> pci::Device {
 fn bars_for(d: &pci::Device, m: &Manifest) -> Result<u8, &'static str> {
     let w = windowed(d, m);
     let mem = |b: usize| !w.bars[b].is_io && w.bars[b].size != 0;
-    let msix = d.msix.ok_or("no MSI-X")?;
-    if (msix.table_size as u16) < m.msix_min {
-        return Err("too few MSI-X entries");
+    let allow_intx = pci::has_intx_support() && m.flags & nicd::F_VIRTIO != 0 && is_modern_virtio(d);
+    if pci::has_msix_support() {
+        let msix = d.msix.ok_or("no MSI-X")?;
+        if (msix.table_size as u16) < m.msix_min {
+            return Err("too few MSI-X entries");
+        }
+    } else if !allow_intx {
+        return Err("no MSI-X");
     }
     let mut bars = 0u8;
     for b in 0..6 {
@@ -339,10 +344,13 @@ fn bars_for(d: &pci::Device, m: &Manifest) -> Result<u8, &'static str> {
             return Err("not a virtio device the driver takes");
         }
     }
-    bars |= 1 << msix.table_bar;
-    // The table, whole, inside what is mapped of its BAR.
-    if msix.table_offset as u64 + msix.table_size as u64 * 16 > w.bars[msix.table_bar as usize].size {
-        return Err("its MSI-X table is outside the mapped BAR");
+    if pci::has_msix_support() {
+        let msix = d.msix.unwrap();
+        bars |= 1 << msix.table_bar;
+        // The table, whole, inside what is mapped of its BAR.
+        if msix.table_offset as u64 + msix.table_size as u64 * 16 > w.bars[msix.table_bar as usize].size {
+            return Err("its MSI-X table is outside the mapped BAR");
+        }
     }
     if !mappable(&w, bars) {
         return Err("a BAR is not mappable");
@@ -588,18 +596,30 @@ pub fn bind(h: &mut Host, i: usize, driver: Option<usize>) -> Result<(), &'stati
     // MSI controller left, or the ITS is full) the bind fails, and the
     // vector is free for another device.
     if n.msi.is_none() {
-        let v = pci::vector_alloc().ok_or("no interrupt vector left")?;
-        let s = h.alloc.slots.global(|s| s.alloc());
-        if let Err(why) = pci::msi_irq(&n.pci, v, &abs_of(root_cap::<cap_type::Null>(s))) {
-            h.alloc.slots.global(|sl| sl.free(s));
-            pci::vector_free(v);
-            return Err(why);
+        if pci::has_msix_support() {
+            let v = pci::vector_alloc().ok_or("no interrupt vector left")?;
+            let s = h.alloc.slots.global(|s| s.alloc());
+            if let Err(why) = pci::msi_irq(&n.pci, v, &abs_of(root_cap::<cap_type::Null>(s))) {
+                h.alloc.slots.global(|sl| sl.free(s));
+                pci::vector_free(v);
+                return Err(why);
+            }
+            let dom = n.dom.unwrap();
+            let n = &mut nics()[i];
+            let (a, data) = h.iommu.msi(dom, v);
+            n.msi = Some((v, a, data));
+            n.irq = Some(root_cap::<cap_type::IrqHandler>(s));
+        } else {
+            let core = if h.info.cores > 1 { 1 + i % (h.info.cores - 1) } else { 0 };
+            let s = h.alloc.slots.global(|s| s.alloc());
+            if let Err(why) = pci::intx_irq(&n.pci, core, &abs_of(root_cap::<cap_type::Null>(s))) {
+                h.alloc.slots.global(|sl| sl.free(s));
+                return Err(why);
+            }
+            let n = &mut nics()[i];
+            n.msi = Some((0, 0, 0));
+            n.irq = Some(root_cap::<cap_type::IrqHandler>(s));
         }
-        let dom = n.dom.unwrap();
-        let n = &mut nics()[i];
-        let (a, data) = h.iommu.msi(dom, v);
-        n.msi = Some((v, a, data));
-        n.irq = Some(root_cap::<cap_type::IrqHandler>(s));
     }
     // Root's from now on: one the firmware left live is stopped first,
     // so that it is not left decoding and mastering the bus as the
@@ -815,6 +835,7 @@ fn spawn(h: &mut Host, i: usize) -> Result<(), &'static str> {
     nics()[i].dma_driver = Some(d);
     let n = &nics()[i];
     let pdev = n.pci;
+    let use_msix = pci::has_msix_support() && pdev.msix.is_some();
     let (_, msi_address, msi_data) = n.msi.unwrap();
     let chan_bits = n.chan.as_ref().unwrap().data_bits;
 
@@ -863,7 +884,7 @@ fn spawn(h: &mut Host, i: usize) -> Result<(), &'static str> {
             flags: if nics()[i].confined { nicd::CONFINED } else { 0 },
             msi_address,
             msi_data,
-            msix_entries: pdev.msix.map_or(0, |m| m.table_size as u32),
+            msix_entries: if use_msix { pdev.msix.map_or(0, |m| m.table_size as u32) } else { 0 },
             msix_table: none,
             bars: core::array::from_fn(|b| if bars & 1 << b != 0 {
                 host::blk::PciRegion { va: bar_va(b as u8) as u64, len: w.bars[b].size }
@@ -887,11 +908,13 @@ fn spawn(h: &mut Host, i: usize) -> Result<(), &'static str> {
                 None => {}
             }
         }
-        let msix = pdev.msix.unwrap();
-        cfg.msix_table = host::blk::PciRegion {
-            va: (bar_va(msix.table_bar) + msix.table_offset as usize) as u64,
-            len: msix.table_size as u64 * 16,
-        };
+        if use_msix {
+            let msix = pdev.msix.unwrap();
+            cfg.msix_table = host::blk::PciRegion {
+                va: (bar_va(msix.table_bar) + msix.table_offset as usize) as u64,
+                len: msix.table_size as u64 * 16,
+            };
+        }
         if m.flags & nicd::F_VIRTIO != 0 && is_modern_virtio(&pdev) {
             let r = virtio_regions(&pdev, bar_va);
             (cfg.common, cfg.notify, cfg.notify_off_multiplier, cfg.isr, cfg.device_cfg) = (r.common, r.notify, r.notify_mult, r.isr, r.device);
@@ -929,7 +952,7 @@ fn spawn(h: &mut Host, i: usize) -> Result<(), &'static str> {
         };
         // A BAR's frames were carved at the first bind, for that driver's
         // window: this one maps no more of them than its own.
-        let msix_bar = 1u8 << pdev.msix.unwrap().table_bar;
+        let msix_bar = if use_msix { 1u8 << pdev.msix.unwrap().table_bar } else { 0 };
         for b in (0..6).filter(|b| bars & 1 << b != 0) {
             let frames = crate::blkd::bar_frames(&nics()[i].bars, b);
             let attrs = if (m.bars_wc & !msix_bar) & 1 << b != 0 { crate::blkd::wc_attrs() } else { crate::blkd::DEVICE_ATTRS };
@@ -1023,7 +1046,11 @@ fn spawn(h: &mut Host, i: usize) -> Result<(), &'static str> {
         h.pci.enable_io(&pdev);
     }
     h.pci.enable(&pdev);
-    h.pci.enable_msix(&pdev);
+    if use_msix {
+        h.pci.enable_msix(&pdev);
+    } else {
+        h.pci.enable_intx(&pdev);
+    }
     component::start(&inst.comp);
     let k = inst.mailbox.send(&Request::Start {}).expect("nicd mailbox room");
     inst.ops[k as usize % RING] = Some(Op::Start);

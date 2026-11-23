@@ -343,6 +343,7 @@ name = "l4h-logd"
 version = "0.1.0"
 dependencies = [
  "l4h-rt",
+ "l4h-virtio",
 ]
 
 [[package]]

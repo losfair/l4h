@@ -338,7 +338,7 @@ pub fn is_virtio_blk(d: &pci::Device) -> bool {
     d.vendor == VIRTIO_VENDOR
         && (d.device == 0x1042 || d.device == 0x1001)
         && (is_modern_virtio(d) || (d.device == 0x1001 && is_legacy_virtio(d)))
-        && d.msix.is_some()
+        && ((pci::has_msix_support() && d.msix.is_some()) || (pci::has_intx_support() && is_modern_virtio(d)))
 }
 
 /// A virtio 1.x device with the structures `virtio_regions` gives its
@@ -364,7 +364,7 @@ pub fn is_virtio_scsi(d: &pci::Device) -> bool {
     d.vendor == VIRTIO_VENDOR
         && (d.device == 0x1048 || d.device == 0x1004)
         && (is_modern_virtio(d) || (d.device == 0x1004 && is_legacy_virtio(d)))
-        && d.msix.is_some()
+        && ((pci::has_msix_support() && d.msix.is_some()) || (pci::has_intx_support() && is_modern_virtio(d)))
 }
 
 pub fn is_nvme(d: &pci::Device) -> bool {
@@ -479,17 +479,32 @@ pub fn start(
     // full) the controller stays disabled, nothing else is made and the
     // vector is free for another device.
     let p = disk.pci;
-    let irq = pci::vector_alloc().ok_or("no interrupt vector left").and_then(|vector| {
+    let use_msix = pci::has_msix_support() && p.msix.is_some();
+    let use_intx = pci::has_intx_support()
+        && matches!(disk.kind, blk::BLKD_VIRTIO | blk::BLKD_VIRTIO_SCSI)
+        && disk.legacy_io().is_none();
+    let irq = if use_intx {
         let irq_slot = alloc.slots.global(|s| s.alloc());
-        match pci::msi_irq(&p, vector, &abs_of(sel4::init_thread::Slot::<cap_type::Null>::from_index(irq_slot).cap())) {
-            Ok(()) => Ok((vector, irq_slot)),
+        match pci::intx_irq(&p, 0, &abs_of(sel4::init_thread::Slot::<cap_type::Null>::from_index(irq_slot).cap())) {
+            Ok(()) => Ok((None, irq_slot)),
             Err(why) => {
                 alloc.slots.global(|s| s.free(irq_slot));
-                pci::vector_free(vector);
                 Err(why)
             }
         }
-    });
+    } else {
+        pci::vector_alloc().ok_or("no interrupt vector left").and_then(|vector| {
+            let irq_slot = alloc.slots.global(|s| s.alloc());
+            match pci::msi_irq(&p, vector, &abs_of(sel4::init_thread::Slot::<cap_type::Null>::from_index(irq_slot).cap())) {
+                Ok(()) => Ok((Some(vector), irq_slot)),
+                Err(why) => {
+                    alloc.slots.global(|s| s.free(irq_slot));
+                    pci::vector_free(vector);
+                    Err(why)
+                }
+            }
+        })
+    };
     let (vector, irq_slot) = match irq {
         Ok(irq) => irq,
         Err(why) => {
@@ -502,7 +517,7 @@ pub fn start(
     let legacy_io = disk.legacy_io();
     let d = &disk.pci;
     let bar_va = |b: u8| host::MMIO_VA + b as usize * BAR_STRIDE;
-    let msix_table = if disk.kind == blk::BLKD_AHCI { blk::PciRegion::default() } else {
+    let msix_table = if disk.kind == blk::BLKD_AHCI || !use_msix { blk::PciRegion::default() } else {
         let msix = d.msix.unwrap();
         blk::PciRegion { va: (bar_va(msix.table_bar) + msix.table_offset as usize) as u64, len: msix.table_size as u64 * 16 }
     };
@@ -533,7 +548,9 @@ pub fn start(
     let register_bar = if disk.kind == blk::BLKD_AHCI { 5 } else { 0 };
     cfg.bar0 = blk::PciRegion { va: bar_va(register_bar) as u64, len: d.bars[register_bar as usize].size };
     cfg.pci_bdf = bdf(d);
-    (cfg.msi_address, cfg.msi_data) = iommu.msi(dom, vector);
+    if let Some(vector) = vector {
+        (cfg.msi_address, cfg.msi_data) = iommu.msi(dom, vector);
+    }
     if let Some(VirtioRegions { common, notify, notify_mult, isr, device, .. }) = regions {
         cfg.common = common;
         cfg.notify = notify;
@@ -596,7 +613,13 @@ pub fn start(
         pci.enable_io(d);
     }
     pci.enable(d);
-    if disk.kind == blk::BLKD_AHCI { pci.enable_msi(d, cfg.msi_address, cfg.msi_data); } else { pci.enable_msix(d); }
+    if disk.kind == blk::BLKD_AHCI {
+        pci.enable_msi(d, cfg.msi_address, cfg.msi_data);
+    } else if use_msix {
+        pci.enable_msix(d);
+    } else {
+        pci.enable_intx(d);
+    }
     let mailbox = Mailbox::new(&comp, mailbox::blkd_mailbox(ctrl), &wiring::ROOT_BLKD_CALL, &wiring::BLKD_DONE, alloc, &mut arena, &mut keep_slot);
     component::start(&comp);
 

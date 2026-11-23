@@ -1,0 +1,29 @@
+[package]
+name = "l4h-fl4-image"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-only"
+
+[dependencies]
+fl4-bootinfo = { path = "fl4-bootinfo" }
+
+[[bin]]
+name = "l4h-fl4-image"
+path = "src/main.rs"
+test = false
+bench = false
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+codegen-units = 1
+lto = "fat"
+overflow-checks = true
+
+[workspace]
+members = ["fl4-bootinfo"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-only"

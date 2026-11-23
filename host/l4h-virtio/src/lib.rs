@@ -186,6 +186,7 @@ impl Device {
         self.common.w8(DEVICE_STATUS, 0);
         loop {
             if self.common.r8(DEVICE_STATUS) == 0 {
+                self.common.w8(DEVICE_STATUS, STATUS_ACK);
                 self.common.w8(DEVICE_STATUS, STATUS_ACK | STATUS_DRIVER);
                 return true;
             }
@@ -248,7 +249,7 @@ impl Device {
         self.common.w64(QUEUE_DRIVER, avail_pa);
         self.common.w64(QUEUE_DEVICE, used_pa);
         self.common.w16(QUEUE_MSIX_VECTOR, vector);
-        if self.common.r16(QUEUE_MSIX_VECTOR) != vector {
+        if vector != NO_VECTOR && self.common.r16(QUEUE_MSIX_VECTOR) != vector {
             return None;
         }
         // Both factors are the device's (16 and 32 bits: no overflow), and

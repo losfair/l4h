@@ -92,6 +92,9 @@ const fn parse_bdf(s: Option<&str>) -> Option<u32> {
     }
 }
 
+/// Sentinel value for `uplink2_nic=auto` (pick the first NIC other than `uplink_nic`).
+pub const UPLINK2_AUTO: u32 = u32::MAX;
+
 pub struct Config {
     pub dom0_mem_mb: usize,
     pub dom0_vcpus: usize,
@@ -248,7 +251,14 @@ impl Config {
                 true
             }
             "uplink_nic" => bdf(&mut self.uplink_nic),
-            "uplink2_nic" => bdf(&mut self.uplink2_nic),
+            "uplink2_nic" => {
+                if value == "auto" {
+                    self.uplink2_nic = Some(UPLINK2_AUTO);
+                    true
+                } else {
+                    bdf(&mut self.uplink2_nic)
+                }
+            }
             "boot_disk" => bdf(&mut self.boot_disk),
             "serial_port" => match try_parse_usize(value) {
                 Some(p) if p <= 0xfff8 => {

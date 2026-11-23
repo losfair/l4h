@@ -114,7 +114,7 @@ pub mod mailbox {
 }
 
 mod production {
-    use crate::{ahci, nvme, scsi, virtio};
+    use crate::{ahci, l4h_virtio, nvme, scsi, virtio};
     include!(env!("L4H_BLKD_TEST_SRC"));
 
     pub fn run(info: &'static crate::Info) -> ! {
@@ -142,6 +142,12 @@ mod ahci {
 mod nvme { pub type Nvme = crate::MockDriver; }
 mod scsi { pub type VirtioScsi = crate::MockDriver; }
 mod virtio { pub type VirtioBlk = crate::MockDriver; }
+mod l4h_virtio {
+    pub struct Mmio(pub usize);
+    impl Mmio {
+        pub fn r8(&self, _: usize) -> u8 { 0 }
+    }
+}
 
 struct Kernel {
     ipc: sel4::IpcBuffer,

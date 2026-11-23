@@ -13,7 +13,7 @@ if [ -n "${L4H_FL4_SOURCE:-}" ]; then
     base=$(git -C "$frozen" rev-parse HEAD)
     clone_args+=(--shared)
 else
-    frozen=https://github.com/losfair/FL4.git
+    frozen=${L4H_FL4_URL:-https://github.com/losfair/FL4.git}
     base=$(cat "$root/kernel/fl4/REVISION")
 fi
 # A tree per revision ($base is a full commit ID), never changed once
