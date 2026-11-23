@@ -50,7 +50,7 @@
 /* Demand mode watermarks and polling intervals. */
 #define DEMAND_HEADROOM_MIN	(96ul << 20)
 #define DEMAND_POLL_ACTIVE	HZ
-#define DEMAND_POLL_IDLE	(10 * HZ)
+#define DEMAND_POLL_IDLE	(30 * HZ)
 #define DEMAND_SHRINK_HOLD	(60 * HZ)
 
 static_assert(L4H_HP_SHIFT == SECTION_SIZE_BITS);
@@ -497,8 +497,13 @@ static unsigned long reconcile_demand(unsigned int ceiling, unsigned int *np)
 	}
 
 	*np = n;
-	if (n > 0 || si_mem_available() < (long)(2 * headroom))
-		return DEMAND_POLL_ACTIVE;
+	if (surplus_since) {
+		unsigned long rem = time_before(jiffies, surplus_since + DEMAND_SHRINK_HOLD)
+			? (surplus_since + DEMAND_SHRINK_HOLD - jiffies)
+			: DEMAND_POLL_ACTIVE;
+
+		return min_t(unsigned long, rem, DEMAND_POLL_IDLE);
+	}
 	return DEMAND_POLL_IDLE;
 }
 

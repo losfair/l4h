@@ -1002,6 +1002,7 @@ fn rdtsc() -> u64 {
 
 /// The root task's timer period: dashboard, IOMMU faults and watchdog.
 const TIMER_MS: u64 = 100;
+const IDLE_TIMER_MS: u64 = 1000;
 
 /// How long boot waits for the drivers to publish their disks and MACs
 /// (finish_boot), from when the serve loop starts, right after they were
@@ -1019,7 +1020,11 @@ const DRIVERS_READY_SECS: u64 = 180;
 const DRIVERS_SLOW_SECS: u64 = 30;
 
 pub fn arm_timer(info: &HostInfo) -> u64 {
-    let deadline = rdtsc() + info.tsc_hz * TIMER_MS / 1000;
+    arm_timer_ms(info, TIMER_MS)
+}
+
+fn arm_timer_ms(info: &HostInfo, ms: u64) -> u64 {
+    let deadline = rdtsc() + info.tsc_hz * ms / 1000;
     set_timer(deadline);
     deadline
 }
@@ -1066,6 +1071,27 @@ fn serve(h: &mut Host, reply: ReplySlot, modules: &bootmod::Modules) -> ! {
     let after = |secs: u64| rdtsc().saturating_add(h.info.tsc_hz.saturating_mul(secs));
     let (drivers_deadline, drivers_slow) = (after(DRIVERS_READY_SECS), Some(after(DRIVERS_SLOW_SECS)));
     l4h_ipc::run(hyp_ep, reply, &mut Root { h, modules, booting: true, drivers_deadline, drivers_slow, next_watchdog, deadline })
+}
+
+impl Root<'_> {
+    fn needs_fast_tick(&mut self) -> bool {
+        let h = &mut *self.h;
+        self.booting
+            || h.dashboard.is_some()
+            || h.iommu.enabled()
+            || nicd::needs_fast_tick()
+            || trustd::needs_fast_tick(h)
+    }
+
+    fn shorten_timer_if_needed(&mut self) {
+        if self.needs_fast_tick() {
+            let fast = rdtsc() + self.h.info.tsc_hz * TIMER_MS / 1000;
+            if self.deadline > fast {
+                self.deadline = fast;
+                set_timer(fast);
+            }
+        }
+    }
 }
 
 impl l4h_ipc::Server for Root<'_> {
@@ -1122,7 +1148,10 @@ impl l4h_ipc::Server for Root<'_> {
                 watchdog_dump(h);
                 self.next_watchdog = watchdog_after(h);
             }
-            self.deadline = arm_timer(&h.info);
+            let ms = if self.needs_fast_tick() { TIMER_MS } else { IDLE_TIMER_MS };
+            self.deadline = arm_timer_ms(&self.h.info, ms);
+        } else {
+            self.shorten_timer_if_needed();
         }
     }
 
@@ -1135,10 +1164,15 @@ impl l4h_ipc::Server for Root<'_> {
         let h = &mut *self.h;
         let _ = blkd::fault(h, id) || netd::Netd::fault(h, id) || nicd::fault(h, id) || crate::usb::fault(h, id);
         trustd::fault(h, id);
+        self.shorten_timer_if_needed();
     }
 
     fn call(&mut self, from: host::root::Sender, _: u64, info: &sel4::MessageInfo) -> Option<sel4::MessageInfo> {
-        l4h_ipc::serve::<root_call::Proto>(info, |label, args, out| root_call::serve(&mut vmmgr::Calls(self.h), label, args, from, out))
+        l4h_ipc::serve::<root_call::Proto>(info, |label, args, out| {
+            let res = root_call::serve(&mut vmmgr::Calls(self.h), label, args, from, out);
+            self.shorten_timer_if_needed();
+            res
+        })
     }
 
     fn unknown(&mut self, badge: u64, info: &sel4::MessageInfo) {

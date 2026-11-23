@@ -28,7 +28,11 @@ use errno::{EINVAL, ENOMEM};
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Client { Root, Vmmgr }
 
-struct Memd { mem: Mem }
+struct Memd {
+    mem: Mem,
+    ticks_per_ms: u64,
+    armed_deadline: u64,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Kernel {
@@ -38,11 +42,12 @@ struct Kernel {
     /// A slot another thread of the client fills again as soon as it is
     /// emptied.
     refill: Option<u64>,
+    now: u64,
 }
 
 thread_local! {
     static KERNEL: RefCell<Kernel> = RefCell::new(Kernel {
-        caps: BTreeMap::new(), mrs: [0; 1 + 2 * XCHG_SLOTS], calls: 0, refill: None,
+        caps: BTreeMap::new(), mrs: [0; 1 + 2 * XCHG_SLOTS], calls: 0, refill: None, now: 1000,
     });
 }
 
@@ -82,6 +87,65 @@ pub mod cap_type {
     #[derive(Clone, Copy)] pub struct Null;
     #[derive(Clone, Copy)] pub struct CNode;
     #[derive(Clone, Copy)] pub struct Untyped;
+    #[derive(Clone, Copy)] pub struct Tcb;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MessageInfo {
+    label: u64,
+    length: usize,
+}
+
+impl MessageInfo {
+    pub fn new(label: u64, _: usize, _: usize, length: usize) -> Self {
+        Self { label, length }
+    }
+    pub fn label(&self) -> u64 { self.label }
+    pub fn length(&self) -> usize { self.length }
+}
+
+pub struct IpcBufferInner;
+impl IpcBufferInner {
+    #[allow(non_snake_case)]
+    pub fn seL4_TCB_SetTimer(&mut self, _tcb: u64, _deadline: u64, badge: u64) {
+        invoke(|k| {
+            k.mrs[0] = u64::MAX;
+            k.mrs[1] = badge;
+        });
+    }
+}
+
+pub struct IpcBuffer(IpcBufferInner);
+impl IpcBuffer {
+    pub fn inner_mut(&mut self) -> &mut IpcBufferInner { &mut self.0 }
+}
+
+pub fn with_ipc_buffer_mut<R>(f: impl FnOnce(&mut IpcBuffer) -> R) -> R {
+    let mut buf = IpcBuffer(IpcBufferInner);
+    f(&mut buf)
+}
+
+pub mod ipc {
+    use super::{MessageInfo, XCHG_SLOTS, kernel};
+
+    pub trait Server {
+        type Sender;
+        fn call(&mut self, from: Self::Sender, badge: u64, info: &MessageInfo) -> Option<MessageInfo>;
+    }
+
+    pub fn reply(words: &[u64]) -> MessageInfo {
+        kernel(|k| k.mrs[..words.len()].copy_from_slice(words));
+        MessageInfo::new(0, 0, 0, words.len())
+    }
+
+    pub fn serve<P>(info: &MessageInfo, f: impl FnOnce(u64, &[u64], &mut [u64]) -> Option<usize>) -> Option<MessageInfo> {
+        let len = info.length().min(1 + 2 * XCHG_SLOTS);
+        let mut args = [0u64; 1 + 2 * XCHG_SLOTS];
+        kernel(|k| args[..len].copy_from_slice(&k.mrs[..len]));
+        let mut out = [0u64; 1 + 2 * XCHG_SLOTS];
+        let n = f(info.label(), &args[..len], &mut out)?;
+        Some(reply(&out[..n]))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -97,6 +161,7 @@ impl CapRights { pub fn all() -> Self { Self } }
 pub enum ObjectBlueprint { Untyped { size_bits: usize } }
 
 impl<T> Cap<T> {
+    pub fn bits(&self) -> u64 { self.0 }
     pub fn absolute_cptr<U>(&self, c: Cap<U>) -> AbsoluteCPtr { AbsoluteCPtr(c.0) }
     pub fn absolute_cptr_for_self(&self) -> AbsoluteCPtr { AbsoluteCPtr(self.0) }
     pub fn untyped_retype(&self, b: &ObjectBlueprint, _: &AbsoluteCPtr, to: usize, n: usize) -> Result<(), ()> {
@@ -158,7 +223,8 @@ impl AbsoluteCPtr {
 pub mod host {
     pub use crate::{errno, fixed};
     pub const SLOT_CNODE: u64 = 1;
-    pub mod ticks { pub fn now() -> u64 { 1000 } }
+    pub const SLOT_TCB: u64 = 2;
+    pub mod ticks { pub fn now() -> u64 { crate::kernel(|k| k.now) } }
     pub mod memd {
         pub const BLOCK_BITS: usize = 21;
         pub const ORDERS: usize = 27;
@@ -261,8 +327,8 @@ impl Fixture {
         // PROT_READ | PROT_WRITE; MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE.
         let p = unsafe { mmap(TABLE_VA as *mut u8, 4096, 3, 0x100022, -1, 0) };
         assert_eq!(p as usize, TABLE_VA);
-        kernel(|k| { k.caps.clear(); k.calls = 0; k.mrs.fill(0); k.refill = None; });
-        let mut f = Self { d: Memd { mem: Mem::new(32) }, next_slot: 10_000, _table: guard };
+        kernel(|k| { k.caps.clear(); k.calls = 0; k.mrs.fill(0); k.refill = None; k.now = 1000; });
+        let mut f = Self { d: Memd { mem: Mem::new(32), ticks_per_ms: 1, armed_deadline: 0 }, next_slot: 10_000, _table: guard };
         // Boot handover from root: the table has no state or order for
         // this 8 MiB block yet. Root must still be allowed to return it.
         kernel(|k| { k.caps.insert(xchg(Client::Root, 0).0, (8 << BLOCK_BITS, 4 << BLOCK_BITS)); });
@@ -533,9 +599,9 @@ fn traditional_balloon_skips_clean_keeps_hot_pool_and_deflates_whole_block() {
     // 256 units (512 MiB) -> 256 * 24 = 6144 bytes -> 2 pages.
     let p = unsafe { mmap(TABLE_VA as *mut u8, 8192, 3, 0x100022, -1, 0) };
     assert_eq!(p as usize, TABLE_VA);
-    kernel(|k| { k.caps.clear(); k.calls = 0; k.mrs.fill(0); k.refill = None; });
+    kernel(|k| { k.caps.clear(); k.calls = 0; k.mrs.fill(0); k.refill = None; k.now = 1000; });
 
-    let mut d = Memd { mem: Mem::new(256) };
+    let mut d = Memd { mem: Mem::new(256), ticks_per_ms: 1, armed_deadline: 0 };
     // Boot handover: 256 MiB clean block at unit 0 (order 7: 128 * 2 MiB = 256 MiB).
     kernel(|k| { k.caps.insert(xchg(Client::Root, 0).0, (0, 128 << BLOCK_BITS)); });
     assert_eq!(d.free(Client::Root, &batch(&[(0, BLOCK_BITS + 7)])), 0);
@@ -608,4 +674,108 @@ fn traditional_balloon_skips_clean_keeps_hot_pool_and_deflates_whole_block() {
 
     assert_eq!(unsafe { munmap(TABLE_VA as *mut u8, 8192) }, 0);
     drop(guard);
+}
+
+#[test]
+fn next_report_deadline_is_zero_when_idle_and_tracks_aging_and_busy() {
+    let mut f = Fixture::new();
+    // Without a balloon device, no timer is needed.
+    assert_eq!(f.d.mem.next_report_deadline(100, 50, 10), 0);
+
+    // Traditional balloon: only Clean boot block present -> no inflate work -> 0.
+    f.d.mem.balloon = Some(balloon::Balloon {
+        traditional: true,
+        returns: false,
+        deflate_ok: true,
+        num_pages: (256 << 20) >> 12,
+        ..Default::default()
+    });
+    assert_eq!(f.d.mem.next_report_deadline(100, 50, 10), 0);
+    assert!(!f.d.mem.report_free(100, 50));
+
+    // Free page reporting mode: Clean boot block is immediately eligible, clamped to soonest = now + tick.
+    f.d.mem.balloon = Some(balloon::Balloon { returns: false, ..Default::default() });
+    assert_eq!(f.d.mem.next_report_deadline(100, 50, 10), 110);
+    assert!(f.d.mem.report_free(100, 50));
+    // While in flight (dev.busy()), deadline is now + tick.
+    assert_eq!(f.d.mem.next_report_deadline(100, 50, 10), 110);
+    assert!(!f.d.mem.report_free(110, 50));
+
+    // Once the device returns the report, no more un-reported blocks remain -> 0.
+    f.d.mem.balloon.as_mut().unwrap().returns = true;
+    assert!(f.d.mem.report_free(120, 50));
+    assert_eq!(f.d.mem.next_report_deadline(120, 50, 10), 0);
+
+    // Allocate and return a block so it enters `free` with `since = host::ticks::now()` (1000):
+    // deadline is since + delay = 1050 when > soonest, and clamped to soonest = now + tick when already aged.
+    let (root, slot) = f.grant(Client::Root, 2);
+    xchg(Client::Root, 0).move_(&abs(slot)).unwrap();
+    assert_eq!(f.d.free(Client::Root, &batch(&[(root, BLOCK_BITS + 2)])), 0);
+    assert_eq!(f.d.mem.next_report_deadline(1010, 50, 10), 1050);
+    assert_eq!(f.d.mem.next_report_deadline(1100, 50, 10), 1110);
+}
+
+impl Memd {
+    fn sync_timer(&mut self) {
+        let now = host::ticks::now();
+        let delay = 5_000 * self.ticks_per_ms;
+        let tick = 100 * self.ticks_per_ms;
+        let deadline = self.mem.next_report_deadline(now, delay, tick);
+        if deadline != self.armed_deadline {
+            let tcb = cap::<cap_type::Tcb>(host::SLOT_TCB);
+            sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_TCB_SetTimer(tcb.bits(), deadline, 1));
+            self.armed_deadline = deadline;
+        }
+    }
+}
+
+impl l4h_rt::ipc::Server for Memd {
+    type Sender = Client;
+
+    fn call(&mut self, from: Client, _: u64, info: &sel4::MessageInfo) -> Option<sel4::MessageInfo> {
+        l4h_rt::ipc::serve::<()>(info, |_label, args, out| {
+            let res = match self.alloc(from, args[0] as usize, args[1] as usize) {
+                Ok(paddrs) => {
+                    out[0] = 0;
+                    out[1] = paddrs.len() as u64;
+                    for (i, &paddr) in paddrs.iter().enumerate() {
+                        out[2 + i] = paddr;
+                    }
+                    Some(2 + paddrs.len())
+                }
+                Err(e) => {
+                    out[0] = e;
+                    Some(1)
+                }
+            };
+            self.sync_timer();
+            res
+        })
+    }
+}
+
+#[test]
+fn sync_timer_inside_serve_preserves_alloc_reply_mrs() {
+    use l4h_rt::ipc::Server;
+    let mut f = Fixture::new();
+    // Free-page-reporting balloon with Clean boot blocks: every call at a new `now`
+    // advances `next_report_deadline` to `now + tick`, firing `seL4_TCB_SetTimer`.
+    f.d.mem.balloon = Some(balloon::Balloon { returns: false, ..Default::default() });
+
+    for (idx, (now, expected_unit)) in [(1000u64, 8u64), (1050u64, 9u64)].into_iter().enumerate() {
+        kernel(|k| {
+            k.now = now;
+            k.mrs.fill(0);
+            k.mrs[0] = BLOCK_BITS as u64;
+            k.mrs[1] = 1;
+        });
+        let info = sel4::MessageInfo::new(0, 0, 0, 2);
+        let answer = f.d.call(Client::Root, 0, &info).expect("alloc reply");
+        assert_eq!(answer.length(), 3);
+        let (mr0, mr1, mr2) = kernel(|k| (k.mrs[0], k.mrs[1], k.mrs[2]));
+        assert_eq!((mr0, mr1, mr2), (0, 1, expected_unit << BLOCK_BITS));
+        assert_eq!(f.d.armed_deadline, now + 100);
+        // Clear exchange slot before the next alloc.
+        abs(20_000 + idx as u64).move_(&xchg(Client::Root, 0)).unwrap();
+    }
 }

@@ -107,6 +107,10 @@ impl Iommu {
         }
     }
 
+    pub fn enabled(&self) -> bool {
+        self.info()[0] == l4h_abi::IOMMU_ON
+    }
+
     /// None selects a legacy entry; Some contains a VT-d remapping index.
     #[cfg(target_arch = "x86_64")]
     pub fn ioapic_irq(&mut self, index: usize, vector: u64) -> Result<Option<u16>, &'static str> {

@@ -124,6 +124,7 @@ struct Memd {
     cnode_blocks: [Option<CnodeBlock>; MAX_GUESTS],
     ticks_per_ms: u64,
     ticks_per_us: u64,
+    armed_deadline: u64,
 }
 
 /// Who calls for memory of its own: l4h-root, or l4h-vmmgr.
@@ -461,8 +462,20 @@ impl Memd {
         if self.mem.balloon.is_none() {
             return ENODEV;
         }
-        arm_timer(self.ticks_per_ms);
+        self.sync_timer();
         0
+    }
+
+    fn sync_timer(&mut self) {
+        let now = host::ticks::now();
+        let delay = balloon::REPORT_DELAY_MS * self.ticks_per_ms;
+        let tick = TICK_MS * self.ticks_per_ms;
+        let deadline = self.mem.next_report_deadline(now, delay, tick);
+        if deadline != self.armed_deadline {
+            let tcb = cap::<cap_type::Tcb>(host::SLOT_TCB);
+            sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_TCB_SetTimer(tcb.bits(), deadline, recv::TIMER));
+            self.armed_deadline = deadline;
+        }
     }
 
     /// Whether guest g's VMM may make a call now: Err(EINVAL) for a guest
@@ -499,12 +512,6 @@ impl Memd {
     }
 }
 
-fn arm_timer(ticks_per_ms: u64) {
-    let tcb = cap::<cap_type::Tcb>(host::SLOT_TCB);
-    let deadline = host::ticks::now() + TICK_MS * ticks_per_ms;
-    sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_TCB_SetTimer(tcb.bits(), deadline, recv::TIMER));
-}
-
 fn main(info: &'static Info) -> ! {
     let cfg: &MemdConfig = unsafe { info.config() };
     let mut d = Memd {
@@ -513,6 +520,7 @@ fn main(info: &'static Info) -> ! {
         cnode_blocks: [None; MAX_GUESTS],
         ticks_per_ms: info.header().tsc_hz / 1000,
         ticks_per_us: (info.header().tsc_hz / 1_000_000).max(1),
+        armed_deadline: 0,
     };
     d.write_status();
     let ep = cap::<cap_type::Endpoint>(host::SLOT_SERVICE_EP);
@@ -528,10 +536,12 @@ impl l4h_rt::ipc::Server for Memd {
 
     /// The timer.
     fn signal(&mut self, _: u64) {
+        self.armed_deadline = 0;
         let delay = balloon::REPORT_DELAY_MS * self.ticks_per_ms;
-        self.mem.report_free(host::ticks::now(), delay);
-        self.write_status();
-        arm_timer(self.ticks_per_ms);
+        if self.mem.report_free(host::ticks::now(), delay) {
+            self.write_status();
+        }
+        self.sync_timer();
     }
 
     fn call(&mut self, from: Sender, _: u64, info: &sel4::MessageInfo) -> Option<sel4::MessageInfo> {
@@ -543,7 +553,11 @@ impl l4h_rt::ipc::Server for Memd {
                 return Some(l4h_rt::ipc::reply(&[e]));
             }
         }
-        let answer = l4h_rt::ipc::serve::<call::Proto>(info, |label, args, out| call::serve(self, label, args, from, out));
+        let answer = l4h_rt::ipc::serve::<call::Proto>(info, |label, args, out| {
+            let res = call::serve(self, label, args, from, out);
+            self.sync_timer();
+            res
+        });
         self.write_status();
         answer
     }

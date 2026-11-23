@@ -21,7 +21,19 @@ l4h_rt::component!(main, no_heap);
 
 /// A byte takes 87 us at 115200 baud.
 const BYTE_US: u64 = 90;
-const IDLE_MS: u64 = 10;
+const IDLE_MIN_MS: u64 = 10;
+const IDLE_MID_MS: u64 = 50;
+const IDLE_MAX_MS: u64 = 250;
+
+fn idle_ms(empty_polls: u32) -> u64 {
+    if empty_polls <= 20 {
+        IDLE_MIN_MS
+    } else if empty_polls <= 40 {
+        IDLE_MID_MS
+    } else {
+        IDLE_MAX_MS
+    }
+}
 
 
 fn sleep(ticks: u64) {
@@ -191,9 +203,13 @@ fn main(info: &'static Info) -> ! {
         // No UART authority in a secondary. The only writer of this
         // transport derives every record's provenance from its input lane.
         let outgoing = unsafe { &*(serial::RELAY_VA as *const Ring) };
+        let mut empty_polls = 0u32;
         loop {
-            if !merge.forward(host::ticks::now, outgoing) {
-                sleep(hz / 1000 * IDLE_MS);
+            if merge.forward(host::ticks::now, outgoing) {
+                empty_polls = 0;
+            } else {
+                empty_polls = empty_polls.saturating_add(1);
+                sleep((hz / 1000).max(1) * idle_ms(empty_polls));
             }
         }
     }
@@ -201,6 +217,7 @@ fn main(info: &'static Info) -> ! {
     let mut vcon = VirtioConsole::open(cfg);
     let mut screen = Screen::new(cfg);
     let vcon_wait = (hz / 1000).max(1);
+    let mut empty_polls = 0u32;
     loop {
         let printed = merge.pass(host::ticks::now, |line| {
             if let Some(s) = &mut screen {
@@ -213,8 +230,11 @@ fn main(info: &'static Info) -> ! {
                 v.send(line, vcon_wait);
             }
         });
-        if !printed {
-            sleep(hz / 1000 * IDLE_MS);
+        if printed {
+            empty_polls = 0;
+        } else {
+            empty_polls = empty_polls.saturating_add(1);
+            sleep((hz / 1000).max(1) * idle_ms(empty_polls));
         }
     }
 }

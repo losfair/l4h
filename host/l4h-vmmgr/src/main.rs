@@ -957,10 +957,28 @@ fn rdtsc() -> u64 {
 }
 
 /// vmmgr's periodic timer: balancer and watchdog.
-fn arm_timer(info: &HostInfo) -> u64 {
-    let deadline = rdtsc() + info.tsc_hz * sched::BALANCE_MS / 1000;
+const IDLE_BALANCE_MS: u64 = 500;
+const IDLE_TICKS_THRESHOLD: u32 = 10;
+
+fn arm_timer_ms(info: &HostInfo, ms: u64) -> u64 {
+    let deadline = rdtsc() + info.tsc_hz * ms / 1000;
     set_timer(deadline);
     deadline
+}
+
+fn is_idle(h: &Vmmgr) -> bool {
+    if h.dom0_wait.is_some() || h.dom0_usb_wait.is_some() {
+        return false;
+    }
+    h.guests.iter().flatten().all(|g| {
+        if g.state == State::Created {
+            return false;
+        }
+        if g.state == State::Running {
+            return g.vmm_boosted && g.vmm_usage < 50 && g.vcpus.iter().all(|v| v.usage < 50);
+        }
+        true
+    })
 }
 
 fn set_timer(deadline: u64) {
@@ -998,13 +1016,25 @@ struct Serve<'a> {
     next_watchdog: u64,
     last_balance: u64,
     deadline: u64,
+    idle_ticks: u32,
+}
+
+impl Serve<'_> {
+    fn wake_fast_balance(&mut self) {
+        self.idle_ticks = 0;
+        let fast = rdtsc() + self.h.info.tsc_hz * sched::BALANCE_MS / 1000;
+        if self.deadline > fast {
+            self.deadline = fast;
+            set_timer(fast);
+        }
+    }
 }
 
 fn serve(h: &mut Vmmgr, reply: ReplySlot) -> ! {
-    let deadline = arm_timer(&h.info);
+    let deadline = arm_timer_ms(&h.info, sched::BALANCE_MS);
     let next_watchdog = rdtsc() + h.info.tsc_hz * h.cfg.watchdog_secs;
     let hyp_ep = h.info.hyp_ep;
-    l4h_ipc::run(hyp_ep, reply, &mut Serve { h, next_watchdog, last_balance: rdtsc(), deadline })
+    l4h_ipc::run(hyp_ep, reply, &mut Serve { h, next_watchdog, last_balance: rdtsc(), deadline, idle_ticks: 0 })
 }
 
 impl l4h_ipc::Server for Serve<'_> {
@@ -1032,7 +1062,11 @@ impl l4h_ipc::Server for Serve<'_> {
         if badge & recv::CTL_KICK != 0 {
             ctl::kicked(h);
         }
+        if badge & (recv::MAILBOX | recv::CTL_KICK) != 0 {
+            self.wake_fast_balance();
+        }
         if badge & recv::TIMER != 0 {
+            let h = &mut *self.h;
             let now = rdtsc();
             sched::balance(h, (now - self.last_balance) * 1_000_000 / h.info.tsc_hz);
             self.last_balance = now;
@@ -1041,7 +1075,13 @@ impl l4h_ipc::Server for Serve<'_> {
                 self.next_watchdog = rdtsc() + h.info.tsc_hz * h.cfg.watchdog_secs;
             }
             dom0_retry(h);
-            self.deadline = arm_timer(&h.info);
+            if is_idle(h) {
+                self.idle_ticks = self.idle_ticks.saturating_add(1);
+            } else {
+                self.idle_ticks = 0;
+            }
+            let ms = if self.idle_ticks >= IDLE_TICKS_THRESHOLD { IDLE_BALANCE_MS } else { sched::BALANCE_MS };
+            self.deadline = arm_timer_ms(&h.info, ms);
         }
     }
 
@@ -1066,10 +1106,15 @@ impl l4h_ipc::Server for Serve<'_> {
         match from {
             // The VMMs' component ids are their guests'.
             proto::Sender::Vmm(g) if g < MAX_GUESTS => {
-                l4h_ipc::serve::<call::Proto>(info, |label, args, out| call::serve(&mut VmmCalls(self.h), label, args, from, out))
+                l4h_ipc::serve::<call::Proto>(info, |label, args, out| {
+                    let res = call::serve(&mut VmmCalls(self.h), label, args, from, out);
+                    self.wake_fast_balance();
+                    res
+                })
             }
             _ => {
                 self.unknown(badge, info);
+                self.wake_fast_balance();
                 Some(l4h_ipc::refuse())
             }
         }
