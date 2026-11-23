@@ -54,6 +54,13 @@ pub fn hotplug(g: usize) -> memd::GuestHp {
     unsafe { Status::read_at(proto::MEMD_STATUS_VA) }.map_or_else(memd::GuestHp::default, |st| st.hp[g])
 }
 
+/// Bytes of memd's free memory that are reported to the hypervisor, and
+/// that are untouched since boot.
+pub fn pool() -> (u64, u64) {
+    // A page memd was writing at every look reads as neither.
+    unsafe { Status::read_at(proto::MEMD_STATUS_VA) }.map_or((0, 0), |st| (st.reported_bytes, st.clean_bytes))
+}
+
 /// Give guest `g`'s l4h-vmm, `vmm`, its capability to memd: root made it
 /// (badged for the guest, wiring::VMMGR_VMM_MEMD), since ours cannot be
 /// minted again, and we pass it on (VMM_MEMD).

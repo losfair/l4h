@@ -860,18 +860,23 @@ pub fn parse_mib(s: &str) -> Result<u64> {
 
 /// A VM's memory (CTL_VM_MEM_INFO), in bytes of host memory: boot RAM,
 /// its hotplug region, and the target and plugged part of the region.
+/// Then of the host's free memory, the same for every VM: what is reported
+/// to the hypervisor, and what is untouched since boot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemInfo {
     pub boot: u64,
     pub region: u64,
     pub target: u64,
     pub plugged: u64,
+    pub reported: u64,
+    pub clean: u64,
 }
 
 impl Ctl {
     pub fn mem_info(&self, vm: u64) -> Result<MemInfo> {
         let r = self.call(CTL_VM_MEM_INFO, &[vm], &[], &[])?;
-        Ok(MemInfo { boot: r.vals[0], region: r.vals[1], target: r.vals[2], plugged: r.vals[3] })
+        let v = r.vals;
+        Ok(MemInfo { boot: v[0], region: v[1], target: v[2], plugged: v[3], reported: v[4], clean: v[5] })
     }
 
     /// Plug or unplug memory until the VM has `bytes` (boot RAM included,

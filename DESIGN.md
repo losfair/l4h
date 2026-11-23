@@ -2121,7 +2121,8 @@ Untypeds reclaims everything it made. Plugging does not involve
   RAM up to whole hotplug blocks, clamps it to the region, sets memd's
   target (`set_target`), signals the VMM (`badges::vmm::MEM`) and
   returns. `VM_MEM_INFO`: boot, region, target and plugged bytes, from
-  memd's status page; `VM_LIST` counts plugged memory. CLI: `l4hctl mem VM
+  memd's status page, then the reported and clean bytes of memd's free
+  memory; `VM_LIST` counts plugged memory. CLI: `l4hctl mem VM
   [MB] [--wait[=SECS]]`. Lowering a target revokes nothing: the guest gives
   back what it can, and `plugged > target` tells dom0 it cannot give back
   more (it may wait or destroy the VM). Targets and plugged state live in

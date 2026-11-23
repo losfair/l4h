@@ -484,6 +484,7 @@ impl Memd {
             seq: core::sync::atomic::AtomicU32::new(0),
             free_bytes: self.mem.free_bytes() as u64,
             reported_bytes: self.mem.reported_bytes() as u64,
+            clean_bytes: self.mem.clean_bytes() as u64,
             free_blocks: blocks as u64,
             largest_block: largest as u64,
             guest_bytes: ((guest_blocks + plugged) << BLOCK_BITS) as u64,

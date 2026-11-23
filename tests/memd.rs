@@ -178,30 +178,64 @@ pub mod host {
 mod balloon {
     pub const QUEUE_SIZE: usize = 32;
     pub const MAX_DESC_BITS: usize = 31;
-    /// A reporting device under the test's control: whether it returns
-    /// the report in flight when asked, and what memd did with it.
+    pub const MAX_PFNS: usize = 4096;
+    /// A reporting or traditional balloon device under the test's control.
     #[derive(Default)]
     pub struct Balloon {
+        pub traditional: bool,
         pub busy: bool,
         pub returns: bool,
-        /// Reports made, and times memd waited for one.
+        pub deflate_ok: bool,
+        pub num_pages: u32,
+        pub actual_pages: u32,
+        pub in_flight_pfns: u32,
+        /// Reports/inflates made, deflates made, and times memd waited.
         pub reports: usize,
+        pub deflates: usize,
+        pub deflated_ranges: Vec<(usize, usize)>,
         pub waits: usize,
     }
     impl Balloon {
+        pub fn is_traditional(&self) -> bool { self.traditional }
+        pub fn num_pages(&self) -> u32 { self.num_pages }
+        pub fn actual_pages(&self) -> u32 { self.actual_pages }
         pub fn busy(&self) -> bool { self.busy }
         pub fn capacity(&self) -> usize { QUEUE_SIZE }
         pub fn done(&mut self, wait: bool) -> bool {
             if self.busy {
                 self.waits += wait as usize;
-                self.busy = !self.returns;
+                if self.returns {
+                    self.busy = false;
+                    if self.traditional {
+                        self.actual_pages = self.actual_pages.saturating_add(self.in_flight_pfns);
+                        self.in_flight_pfns = 0;
+                    }
+                }
             }
             !self.busy
         }
         pub fn report(&mut self, ranges: &[(usize, usize)]) {
-            assert!(!self.busy && !ranges.is_empty());
+            assert!(!self.traditional && !self.busy && !ranges.is_empty());
             self.busy = true;
             self.reports += 1;
+        }
+        pub fn inflate(&mut self, ranges: &[(usize, usize)]) {
+            assert!(self.traditional && !self.busy && !ranges.is_empty());
+            let pfns: usize = ranges.iter().map(|&(_, len)| len >> 12).sum();
+            assert!(pfns > 0 && pfns <= MAX_PFNS);
+            self.in_flight_pfns = pfns as u32;
+            self.busy = true;
+            self.reports += 1;
+        }
+        pub fn deflate_sync(&mut self, paddr: usize, len: usize) -> bool {
+            assert!(self.traditional && !self.busy && len > 0);
+            if !self.deflate_ok {
+                return false;
+            }
+            self.actual_pages = self.actual_pages.saturating_sub((len >> 12) as u32);
+            self.deflates += 1;
+            self.deflated_ranges.push((paddr, len));
+            true
         }
     }
 }
@@ -491,4 +525,87 @@ fn a_device_that_returns_its_reports_keeps_getting_them() {
     f.d.mem.report_free(2 << 40, 0);
     let b = f.d.mem.balloon.as_ref().unwrap();
     assert_eq!((b.reports, b.waits), (2, 1));
+}
+
+#[test]
+fn traditional_balloon_skips_clean_keeps_hot_pool_and_deflates_whole_block() {
+    let guard = TABLE_LOCK.lock().unwrap();
+    // 256 units (512 MiB) -> 256 * 24 = 6144 bytes -> 2 pages.
+    let p = unsafe { mmap(TABLE_VA as *mut u8, 8192, 3, 0x100022, -1, 0) };
+    assert_eq!(p as usize, TABLE_VA);
+    kernel(|k| { k.caps.clear(); k.calls = 0; k.mrs.fill(0); k.refill = None; });
+
+    let mut d = Memd { mem: Mem::new(256) };
+    // Boot handover: 256 MiB clean block at unit 0 (order 7: 128 * 2 MiB = 256 MiB).
+    kernel(|k| { k.caps.insert(xchg(Client::Root, 0).0, (0, 128 << BLOCK_BITS)); });
+    assert_eq!(d.free(Client::Root, &batch(&[(0, BLOCK_BITS + 7)])), 0);
+    assert!(d.mem.state(0) == State::Clean);
+    assert_eq!(d.mem.clean_bytes(), 256 << 20);
+    assert_eq!(d.mem.available_bytes(), 256 << 20);
+
+    d.mem.balloon = Some(balloon::Balloon {
+        traditional: true,
+        returns: true,
+        deflate_ok: true,
+        num_pages: (256 << 20) >> 12,
+        ..Default::default()
+    });
+
+    // Clean boot handover memory is NEVER inflated in traditional mode.
+    d.mem.report_free(1 << 40, 0);
+    assert_eq!(d.mem.balloon.as_ref().unwrap().reports, 0);
+    assert_eq!(d.mem.reported_bytes(), 0);
+
+    // Allocate 64 x 2 MiB (128 MiB) via Vmmgr and return them -> State::Free.
+    let mut granted_units = Vec::new();
+    for _ in 0..2 {
+        let paddrs = d.alloc(Client::Vmmgr, BLOCK_BITS, 32).unwrap();
+        for addr in paddrs.iter() {
+            granted_units.push((*addr >> BLOCK_BITS) as u32);
+        }
+    }
+    for chunk in granted_units.chunks(32) {
+        let b: Vec<(u32, usize)> = chunk.iter().map(|&u| (u, BLOCK_BITS)).collect();
+        assert_eq!(d.free(Client::Vmmgr, &batch(&b)), 0);
+    }
+    // 128 MiB Clean + 128 MiB Free = 256 MiB uninflated; floor = HOST_RESERVE (32) + HOT_POOL (128) = 160 MiB.
+    // So up to 96 MiB of Free blocks can be inflated (in 16 MiB batches).
+    for step in 0..10 {
+        d.mem.report_free((1 << 40) + step * 1000, 0);
+    }
+    assert_eq!(d.mem.reported_bytes(), 96 << 20);
+    assert_eq!(d.mem.balloon.as_ref().unwrap().actual_pages, (96 << 20) >> 12);
+    assert_eq!(d.mem.available_bytes(), 256 << 20);
+
+    // Traditional mode priority: Free -> Reported (deflate_sync reuses already-resident pages) -> Clean.
+    // Uninflated Free is 32 MiB (16 x 2 MiB); Clean is 128 MiB; Reported is 96 MiB (48 x 2 MiB).
+    let mut held = Vec::new();
+    for _ in 0..16 {
+        let i = d.mem.take(0, State::Vmmgr).unwrap();
+        held.push(i);
+    }
+    assert_eq!(d.mem.balloon.as_ref().unwrap().deflates, 0);
+    assert_eq!(d.mem.clean_bytes(), 128 << 20);
+    // Next take must deflate from Reported BEFORE touching Clean virgin pages!
+    let deflated_unit = d.mem.take(0, State::Vmmgr).unwrap();
+    assert_eq!(d.mem.balloon.as_ref().unwrap().deflates, 1);
+    assert_eq!(
+        d.mem.balloon.as_ref().unwrap().deflated_ranges[0],
+        ((deflated_unit as usize) << BLOCK_BITS, 2 << 20)
+    );
+    assert_eq!(d.mem.reported_bytes(), 94 << 20);
+    assert_eq!(d.mem.clean_bytes(), 128 << 20);
+
+    // If deflate times out, balloon is disabled and remaining inflated blocks are no longer counted available,
+    // while untouched Clean memory (128 MiB) remains available.
+    d.mem.balloon.as_mut().unwrap().deflate_ok = false;
+    assert_eq!(d.mem.take(0, State::Vmmgr), None);
+    assert_eq!(d.mem.available_bytes(), 128 << 20);
+    assert_eq!(d.mem.free_bytes(), 128 << 20);
+    // Subsequent allocation falls back to Clean blocks.
+    assert!(d.mem.take(0, State::Vmmgr).is_some());
+    assert_eq!(d.mem.clean_bytes(), 126 << 20);
+
+    assert_eq!(unsafe { munmap(TABLE_VA as *mut u8, 8192) }, 0);
+    drop(guard);
 }

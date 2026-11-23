@@ -76,26 +76,27 @@ impl Memd {
             return EINVAL;
         }
         // Check them all first.
-        let mut blocks = [(0u32, 0usize); XCHG_SLOTS];
+        let mut blocks = [(0u32, 0usize, false); XCHG_SLOTS];
         for (n, &(paddr, bits)) in given.iter().enumerate() {
             let Some((i, k)) = self.mem.block_at(paddr, bits) else {
                 return EINVAL;
             };
+            let state = self.mem.state(i);
             let ours = match c {
-                Client::Root => matches!(self.mem.state(i), State::None | State::Root),
+                Client::Root => matches!(state, State::None | State::Root),
                 // Larger orders can name a retained parent Untyped with
                 // other clients' grants below it. Only revoke the grant
                 // we actually made, never a caller-selected ancestor.
-                Client::Vmmgr => self.mem.state(i) == State::Vmmgr && self.mem.order(i) == k,
+                Client::Vmmgr => state == State::Vmmgr && self.mem.order(i) == k,
             };
             // A repeated head would enter the free list twice. Reject the
             // whole batch before moving or revoking any capabilities.
-            if !ours || blocks[..n].iter().any(|&(head, _)| head == i) {
+            if !ours || blocks[..n].iter().any(|&(head, _, _)| head == i) {
                 return EINVAL;
             }
-            blocks[n] = (i, k);
+            blocks[n] = (i, k, c == Client::Root && state == State::None);
         }
-        for (n, &(i, k)) in blocks[..count].iter().enumerate() {
+        for (n, &(i, k, initial)) in blocks[..count].iter().enumerate() {
             match c {
                 Client::Root => abs(self.mem.slot(i, k)).move_(&returned(c, n)).expect("memd: move from exchange"),
                 Client::Vmmgr => {
@@ -103,7 +104,11 @@ impl Memd {
                     abs(self.mem.slot(i, k)).revoke().expect("memd: revoke vmmgr block");
                 }
             }
-            self.mem.add(i, k);
+            if initial {
+                self.mem.add_clean(i, k);
+            } else {
+                self.mem.add(i, k);
+            }
         }
         0
     }

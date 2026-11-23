@@ -45,6 +45,9 @@ fn untyped(s: Slot) -> sel4::cap::Untyped {
 }
 
 const NIL: u32 = u32::MAX;
+/// Uninflated free/clean memory kept hot beyond HOST_RESERVE in traditional
+/// balloon mode so short allocation bursts avoid inflate/deflate thrashing.
+pub const HOT_POOL: usize = 128 << 20;
 
 /// What a unit is.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -54,9 +57,12 @@ pub enum State {
     None = 0,
     /// Head of a free block, not reported; free since `since`.
     Free,
-    /// In the report in flight: not to be used until the device returns it.
+    /// Untouched boot handover block: never allocated, not resident on the
+    /// hypervisor in traditional balloon mode (never inflated).
+    Clean,
+    /// In the report or inflate in flight: not to be used until the device returns it.
     Reporting,
-    /// Reported: the hypervisor may have dropped the memory.
+    /// Reported to the hypervisor (or inflated in traditional balloon mode).
     Reported,
     /// Given to l4h-root.
     Root,
@@ -112,16 +118,18 @@ pub struct Mem {
     /// First slot of each order's blocks.
     first: [Slot; ORDERS],
     free: [List; ORDERS],
+    clean: [List; ORDERS],
     reported: [List; ORDERS],
     reporting: List,
     /// Merging below this order will find nothing until a block is freed.
     merged_below: usize,
     pub balloon: Option<Balloon>,
-    /// The device held a report longer than an allocation waits for one:
-    /// it gets no more reports and is not waited for again, so it stalls
-    /// memd once.  The blocks of that report stay out of use, since the
-    /// hypervisor may still drop their memory, until the device returns
-    /// them, if it ever does.
+    /// The device held a report or inflate/deflate longer than an allocation
+    /// waits for one: it gets no more reports and is not waited for again, so
+    /// it stalls memd once.  The blocks of that report stay out of use, since
+    /// the hypervisor may still drop their memory, until the device returns
+    /// them, if it ever does.  In traditional balloon mode, inflated blocks
+    /// also stay out of use once the device is given up on.
     reports_off: bool,
 }
 
@@ -144,12 +152,21 @@ impl Mem {
             table,
             first,
             free: [List::EMPTY; ORDERS],
+            clean: [List::EMPTY; ORDERS],
             reported: [List::EMPTY; ORDERS],
             reporting: List::EMPTY,
             merged_below: 0,
             balloon: None,
             reports_off: false,
         }
+    }
+
+    fn is_traditional(&self) -> bool {
+        self.balloon.as_ref().is_some_and(Balloon::is_traditional)
+    }
+
+    fn reported_usable(&self) -> bool {
+        !self.reports_off || !self.is_traditional()
     }
 
     /// The slot of the block of order k at unit i.
@@ -248,29 +265,41 @@ impl Mem {
         u.state = state;
         u.order = k as u8;
         u.since = since;
-        let mut l = if state == State::Reported { self.reported[k] } else { self.free[k] };
+        let mut l = match state {
+            State::Reported => self.reported[k],
+            State::Clean => self.clean[k],
+            _ => self.free[k],
+        };
         if front {
             self.push_front(&mut l, i);
         } else {
             self.push_back(&mut l, i);
         }
-        if state == State::Reported {
-            self.reported[k] = l;
-        } else {
-            self.free[k] = l;
+        match state {
+            State::Reported => self.reported[k] = l,
+            State::Clean => self.clean[k] = l,
+            _ => self.free[k] = l,
         }
     }
 
     /// Take the free block of order k at unit i off its list.
     fn unput(&mut self, i: u32, k: usize) {
-        if self.state(i) == State::Reported {
-            let mut l = self.reported[k];
-            self.unlink(&mut l, i);
-            self.reported[k] = l;
-        } else {
-            let mut l = self.free[k];
-            self.unlink(&mut l, i);
-            self.free[k] = l;
+        match self.state(i) {
+            State::Reported => {
+                let mut l = self.reported[k];
+                self.unlink(&mut l, i);
+                self.reported[k] = l;
+            }
+            State::Clean => {
+                let mut l = self.clean[k];
+                self.unlink(&mut l, i);
+                self.clean[k] = l;
+            }
+            _ => {
+                let mut l = self.free[k];
+                self.unlink(&mut l, i);
+                self.free[k] = l;
+            }
         }
     }
 
@@ -281,6 +310,21 @@ impl Mem {
         self.merged_below = 0;
     }
 
+    /// Add an untouched boot handover block of order k at unit i as `State::Clean`.
+    pub fn add_clean(&mut self, i: u32, k: usize) {
+        self.put(i, k, State::Clean, 0, false);
+        self.merged_below = 0;
+    }
+
+    /// Untouched boot handover memory, in bytes.
+    pub fn clean_bytes(&self) -> usize {
+        (0..ORDERS).map(|k| self.clean[k].len * bytes(k)).sum()
+    }
+
+    fn uninflated_free_bytes(&self) -> usize {
+        (0..ORDERS).map(|k| self.free[k].len * bytes(k)).sum()
+    }
+
     /// Free memory that can be used: the blocks of a report in flight
     /// come back, unless the device was given up on.
     pub fn free_bytes(&self) -> usize {
@@ -289,7 +333,9 @@ impl Mem {
 
     /// Free memory that can be taken without waiting for a report.
     pub fn available_bytes(&self) -> usize {
-        (0..ORDERS).map(|k| (self.free[k].len + self.reported[k].len) * bytes(k)).sum()
+        self.uninflated_free_bytes()
+            + self.clean_bytes()
+            + if self.reported_usable() { self.reported_bytes() } else { 0 }
     }
 
     /// Whether `bytes` can be taken now, without waiting for a report,
@@ -304,7 +350,7 @@ impl Mem {
         self.iter(self.reporting).map(|i| bytes(self.order(i))).sum()
     }
 
-    /// Free memory reported to the hypervisor, in bytes.
+    /// Free memory reported to (or inflated in) the hypervisor, in bytes.
     pub fn reported_bytes(&self) -> usize {
         (0..ORDERS).map(|k| self.reported[k].len * bytes(k)).sum()
     }
@@ -317,8 +363,9 @@ impl Mem {
             n = self.reporting.len;
             largest = self.iter(self.reporting).map(|i| bytes(self.order(i))).max().unwrap_or(0);
         }
+        let use_reported = self.reported_usable();
         for k in 0..ORDERS {
-            let m = self.free[k].len + self.reported[k].len;
+            let m = self.free[k].len + self.clean[k].len + if use_reported { self.reported[k].len } else { 0 };
             n += m;
             if m != 0 {
                 largest = largest.max(bytes(k));
@@ -330,7 +377,8 @@ impl Mem {
     /// Whether a block of order k or more can be taken now, without
     /// merging or waiting for a report.
     fn has_block(&self, k: usize) -> bool {
-        (k..ORDERS).any(|j| self.free[j].len + self.reported[j].len != 0)
+        let use_reported = self.reported_usable();
+        (k..ORDERS).any(|j| self.free[j].len + self.clean[j].len + if use_reported { self.reported[j].len } else { 0 } != 0)
     }
 
     /// An untouched Untyped of order k: its unit, whose state is now
@@ -343,11 +391,58 @@ impl Mem {
         if !self.has_block(k) {
             self.merge_up_to(k);
         }
-        // The smallest block that fits; of those, one not reported (its
-        // memory is there), the most recently freed.
-        let j = (k..ORDERS).find(|&j| self.free[j].len + self.reported[j].len != 0)?;
-        let i = if self.free[j].len != 0 { self.free[j].tail } else { self.reported[j].tail };
-        let (hint, since) = (self.state(i), self.table[i as usize].since);
+        let use_reported = self.reported_usable();
+        let traditional = self.is_traditional();
+        // Reporting mode (QEMU/KVM): smallest block that fits (Free -> Clean -> Reported).
+        // Traditional mode (Apple VZ): Free -> Reported (deflate_sync reuses already-resident
+        // host pages with zero new phys_footprint) -> Clean (virgin pages last).
+        let (j, i) = if traditional {
+            if let Some(j) = (k..ORDERS).find(|&j| self.free[j].len != 0) {
+                (j, self.free[j].tail)
+            } else if use_reported
+                && let Some(j) = (k..ORDERS).find(|&j| self.reported[j].len != 0)
+            {
+                (j, self.reported[j].tail)
+            } else if let Some(j) = (k..ORDERS).find(|&j| self.clean[j].len != 0) {
+                (j, self.clean[j].tail)
+            } else {
+                return None;
+            }
+        } else {
+            let j = (k..ORDERS).find(|&j| {
+                self.free[j].len + self.clean[j].len + if use_reported { self.reported[j].len } else { 0 } != 0
+            })?;
+            let i = if self.free[j].len != 0 {
+                self.free[j].tail
+            } else if self.clean[j].len != 0 {
+                self.clean[j].tail
+            } else {
+                self.reported[j].tail
+            };
+            (j, i)
+        };
+        let (mut hint, mut since) = (self.state(i), self.table[i as usize].since);
+        let mut deflated = false;
+        if hint == State::Reported && self.is_traditional() {
+            // Wait for any in-flight inflate before reusing the shared PFN DMA buffer.
+            self.finish_report(true);
+            if self.reports_off {
+                return None;
+            }
+            let paddr = (i as usize) << BLOCK_BITS;
+            let len = bytes(j);
+            if !self.balloon.as_mut().unwrap().deflate_sync(paddr, len) {
+                self.reports_off = true;
+                l4h_rt::log!(
+                    "memd: balloon: deflate timed out for {} MiB; disabling balloon",
+                    len >> 20
+                );
+                return None;
+            }
+            hint = State::Free;
+            since = host::ticks::now();
+            deflated = true;
+        }
         self.unput(i, j);
         for o in (k..j).rev() {
             // Split the block of order o + 1 at i: its halves go to the
@@ -358,10 +453,10 @@ impl Mem {
                 .expect("memd: split block");
             debug_assert_eq!(self.slot(buddy, o), self.slot(i, o) + 1);
             // The parent is kept, to merge the halves again when both
-            // are free.  The other half, freed as long ago as it, goes
-            // first in line to be reported.
+            // are free.  Newly deflated buddies enter the tail of `free`
+            // so they observe the full cooldown; clean buddies stay Clean.
             self.table[i as usize].split |= 1 << (o + 1);
-            self.put(buddy, o, hint, since, true);
+            self.put(buddy, o, hint, since, !deflated);
         }
         let u = &mut self.table[i as usize];
         u.state = state;
@@ -375,15 +470,22 @@ impl Mem {
         if k <= self.merged_below {
             return;
         }
+        let traditional = self.is_traditional();
+        // Pass 1: merge Free and Clean pairs (no deflate needed).
         for o in 0..k {
-            for reported in [false, true] {
-                let mut i = if reported { self.reported[o].head } else { self.free[o].head };
+            for list_state in [State::Free, State::Clean] {
+                let mut i = if list_state == State::Clean { self.clean[o].head } else { self.free[o].head };
                 while i != NIL {
                     let mut next = self.table[i as usize].next;
                     let buddy = i ^ (1 << o);
                     let parent = i & !(1 << o);
+                    let buddy_ok = if traditional {
+                        matches!(self.state(buddy), State::Free | State::Clean)
+                    } else {
+                        matches!(self.state(buddy), State::Free | State::Clean | State::Reported)
+                    };
                     let mergeable = self.table[parent as usize].split & (1 << (o + 1)) != 0
-                        && matches!(self.state(buddy), State::Free | State::Reported)
+                        && buddy_ok
                         && self.order(buddy) == o;
                     if mergeable {
                         if next == buddy {
@@ -395,12 +497,68 @@ impl Mem {
                 }
             }
         }
+        if traditional && self.has_block(k) {
+            return;
+        }
+        // Pass 2: merge Reported/Inflated pairs if usable (in traditional mode,
+        // `merge` deflates any inflated half before deleting it).
+        if self.reported_usable() {
+            for o in 0..k {
+                let mut i = self.reported[o].head;
+                while i != NIL {
+                    if !self.reported_usable() {
+                        return;
+                    }
+                    let mut next = self.table[i as usize].next;
+                    let buddy = i ^ (1 << o);
+                    let parent = i & !(1 << o);
+                    let mergeable = self.table[parent as usize].split & (1 << (o + 1)) != 0
+                        && matches!(self.state(buddy), State::Free | State::Clean | State::Reported)
+                        && self.order(buddy) == o;
+                    if mergeable {
+                        if next == buddy {
+                            next = self.table[buddy as usize].next;
+                        }
+                        if !self.merge(parent, o) {
+                            return;
+                        }
+                    }
+                    i = next;
+                }
+            }
+        }
         self.merged_below = k;
     }
 
     /// Merge the free halves of order o of the split block at `parent`.
-    fn merge(&mut self, parent: u32, o: usize) {
+    /// Returns false if a required traditional-balloon deflate timed out.
+    fn merge(&mut self, parent: u32, o: usize) -> bool {
         let buddy = parent + (1 << o);
+        if self.is_traditional()
+            && (self.state(parent) == State::Reported || self.state(buddy) == State::Reported)
+        {
+            self.finish_report(true);
+            if self.reports_off {
+                return false;
+            }
+            for h in [parent, buddy] {
+                if self.state(h) == State::Reported {
+                    let paddr = (h as usize) << BLOCK_BITS;
+                    let len = bytes(o);
+                    if !self.balloon.as_mut().unwrap().deflate_sync(paddr, len) {
+                        self.reports_off = true;
+                        l4h_rt::log!(
+                            "memd: balloon: deflate timed out during merge for {} MiB; disabling balloon",
+                            len >> 20
+                        );
+                        return false;
+                    }
+                    self.unput(h, o);
+                    self.put(h, o, State::Free, host::ticks::now(), false);
+                }
+            }
+        }
+        let clean = self.state(parent) == State::Clean && self.state(buddy) == State::Clean;
         let reported = self.state(parent) == State::Reported && self.state(buddy) == State::Reported;
         for h in [parent, buddy] {
             self.unput(h, o);
@@ -411,17 +569,65 @@ impl Mem {
         }
         self.table[buddy as usize].state = State::None;
         self.table[parent as usize].split &= !(1 << (o + 1));
-        let (state, since) = if reported { (State::Reported, 0) } else { (State::Free, host::ticks::now()) };
+        let (state, since) = if clean {
+            (State::Clean, 0)
+        } else if reported {
+            (State::Reported, 0)
+        } else {
+            (State::Free, host::ticks::now())
+        };
         self.put(parent, o + 1, state, since, false);
+        true
     }
 
-    /// Report the blocks that have been free for `delay` ticks to the
-    /// hypervisor, as many as one report holds, unless a report is in
-    /// flight.  Called periodically.
+    /// Report (or inflate) the blocks that have been free for `delay` ticks to
+    /// the hypervisor, unless a request is already in flight.  Called periodically.
     pub fn report_free(&mut self, now: u64, delay: u64) {
         self.finish_report(false);
         let Some(dev) = &self.balloon else { return };
         if dev.busy() || self.reports_off {
+            return;
+        }
+        if dev.is_traditional() {
+            let num_pages = dev.num_pages() as usize;
+            let mut actual_pages = dev.actual_pages() as usize;
+            let mut uninflated = self.clean_bytes() + self.uninflated_free_bytes();
+            let floor = HOST_RESERVE + HOT_POOL;
+            let mut ranges = [(0, 0); balloon::QUEUE_SIZE];
+            let mut n = 0;
+            let mut total_pfns = 0usize;
+            for k in 0..ORDERS {
+                let b_bytes = bytes(k);
+                let b_pages = b_bytes >> 12;
+                if b_pages > balloon::MAX_PFNS || uninflated < floor + b_bytes || actual_pages + b_pages > num_pages {
+                    break;
+                }
+                // Oldest first; State::Clean blocks are never inflated.
+                let mut i = self.free[k].head;
+                while i != NIL
+                    && n < balloon::QUEUE_SIZE
+                    && total_pfns + b_pages <= balloon::MAX_PFNS
+                    && uninflated >= floor + b_bytes
+                    && actual_pages + b_pages <= num_pages
+                    && now.saturating_sub(self.table[i as usize].since) >= delay
+                {
+                    let next = self.table[i as usize].next;
+                    ranges[n] = ((i as usize) << BLOCK_BITS, b_bytes);
+                    n += 1;
+                    total_pfns += b_pages;
+                    actual_pages += b_pages;
+                    uninflated -= b_bytes;
+                    self.unput(i, k);
+                    self.table[i as usize].state = State::Reporting;
+                    let mut l = self.reporting;
+                    self.push_back(&mut l, i);
+                    self.reporting = l;
+                    i = next;
+                }
+            }
+            if n != 0 {
+                self.balloon.as_mut().unwrap().inflate(&ranges[..n]);
+            }
             return;
         }
         let cap = dev.capacity();
@@ -434,21 +640,26 @@ impl Mem {
                 // Neither this order's blocks nor any larger fit.
                 break;
             }
-            // Oldest first.
-            let mut i = self.free[k].head;
-            while i != NIL && n + per <= cap && now.saturating_sub(self.table[i as usize].since) >= delay {
-                let next = self.table[i as usize].next;
-                let paddr = (i as usize) << BLOCK_BITS;
-                for p in 0..per {
-                    ranges[n] = (paddr + p * piece, piece);
-                    n += 1;
+            // Oldest first: Free (after delay) and Clean (boot handover).
+            for is_clean in [false, true] {
+                let mut i = if is_clean { self.clean[k].head } else { self.free[k].head };
+                while i != NIL
+                    && n + per <= cap
+                    && (is_clean || now.saturating_sub(self.table[i as usize].since) >= delay)
+                {
+                    let next = self.table[i as usize].next;
+                    let paddr = (i as usize) << BLOCK_BITS;
+                    for p in 0..per {
+                        ranges[n] = (paddr + p * piece, piece);
+                        n += 1;
+                    }
+                    self.unput(i, k);
+                    self.table[i as usize].state = State::Reporting;
+                    let mut l = self.reporting;
+                    self.push_back(&mut l, i);
+                    self.reporting = l;
+                    i = next;
                 }
-                self.unput(i, k);
-                self.table[i as usize].state = State::Reporting;
-                let mut l = self.reporting;
-                self.push_back(&mut l, i);
-                self.reporting = l;
-                i = next;
             }
         }
         if n != 0 {

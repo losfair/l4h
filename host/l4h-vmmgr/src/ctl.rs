@@ -531,6 +531,10 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
             resp.vals[1] = g.hp_count as u64 * hp_size;
             resp.vals[2] = hp.target as u64 * hp_size;
             resp.vals[3] = hp.plugged as u64 * hp_size;
+            // The host's free pool, the same for every VM.
+            let (reported, clean) = crate::memd::pool();
+            resp.vals[4] = reported;
+            resp.vals[5] = clean;
             Ok(())
         }
         abi::CTL_VM_VCPU_STATS => {
