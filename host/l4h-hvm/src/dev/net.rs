@@ -25,6 +25,7 @@ const VIRTIO_NET_F_GUEST_TSO4: u64 = 1 << 7;
 const VIRTIO_NET_F_GUEST_TSO6: u64 = 1 << 8;
 const VIRTIO_NET_F_HOST_TSO4: u64 = 1 << 11;
 const VIRTIO_NET_F_HOST_TSO6: u64 = 1 << 12;
+const VIRTIO_NET_F_MRG_RXBUF: u64 = 1 << 15;
 const VIRTIO_NET_F_STATUS: u64 = 1 << 16;
 const VIRTIO_NET_F_SPEED_DUPLEX: u64 = 1 << 63;
 const VIRTIO_NET_S_LINK_UP: u16 = 1;
@@ -46,6 +47,8 @@ pub struct Net {
     tx_blocked: bool,
     /// Queues whose turn ended with chains left.
     more: u64,
+    /// VIRTIO_NET_F_MRG_RXBUF: a frame may span several receive chains.
+    mrg: bool,
     config: [u8; 32],
 }
 
@@ -56,7 +59,7 @@ impl Net {
         let mut config = [0u8; 32];
         config[0..6].copy_from_slice(&mac);
         config[10..12].copy_from_slice(&((net::MTU_FRAME - 14) as u16).to_le_bytes());
-        let mut n = Net { chan, tx: Producer::new(net::RING_SIZE), rx: Consumer::new(net::RING_SIZE), kick, link, tx_blocked: false, more: 0, config };
+        let mut n = Net { chan, tx: Producer::new(net::RING_SIZE), rx: Consumer::new(net::RING_SIZE), kick, link, tx_blocked: false, more: 0, mrg: false, config };
         n.link_config();
         n
     }
@@ -147,54 +150,87 @@ impl Net {
             if unsafe { self.rx.ready(&(*self.chan).rx) } == 0 {
                 break;
             }
-            // Out of buffers with frames waiting: ask for a notification
-            // when the driver adds some (without it, the event index
-            // would leave refills unannounced), unless it already has.
-            let Some(head) = q.pop(mem) else {
-                if q.enable_notify(mem) {
+            left -= 1;
+            // The frame goes into one chain, or with mergeable buffers
+            // into as many as it takes (num_buffers in its header), all
+            // published together: the driver takes num_buffers entries.
+            let mut heads = ArrayVec::<(u16, u32), { QUEUE_SIZE as usize }>::new();
+            let (done, ok) = unsafe {
+                let slot = addr_of!((*self.chan).rx_slots[self.rx.slot()]);
+                let len = (addr_of!((*slot).len).read_volatile() as usize).min(net::MAX_FRAME);
+                let data = addr_of!((*slot).data) as *const u8;
+                let mut hdr = addr_of!((*slot).hdr).read_volatile();
+                hdr[10] = 1;
+                hdr[11] = 0;
+                let total = HDR + len;
+                let mut written = 0usize;
+                // Where num_buffers went, to be set once it is known.
+                let mut nb: [*mut u8; 2] = [core::ptr::null_mut(); 2];
+                let mut ok = true;
+                while written < total {
+                    let Some(head) = q.pop(mem) else { break };
+                    let mut bufs = Chain::new();
+                    let mut n_head = 0usize;
+                    if q.chain(mem, head, &mut bufs).is_err() {
+                        ok = false;
+                    } else {
+                        for b in bufs.iter().filter(|b| b.write) {
+                            let n = (b.len as usize).min(total - written);
+                            let dst = mem.bytes(b.gpa, n);
+                            let mut i = 0;
+                            while i < n && written + i < HDR {
+                                if written + i == 10 || written + i == 11 {
+                                    nb[written + i - 10] = dst.add(i);
+                                }
+                                dst.add(i).write_volatile(hdr[written + i]);
+                                i += 1;
+                            }
+                            if i < n {
+                                copy_volatile(data.add(written + i - HDR), dst.add(i), n - i);
+                            }
+                            written += n;
+                            n_head += n;
+                            if written == total {
+                                break;
+                            }
+                        }
+                    }
+                    heads.must_push((head, n_head as u32));
+                    if !ok || !self.mrg || heads.is_full() {
+                        break;
+                    }
+                }
+                if ok && written == total && heads.len() > 1 {
+                    let c = (heads.len() as u16).to_le_bytes();
+                    for (p, v) in nb.iter().zip(c) {
+                        if !p.is_null() {
+                            p.write_volatile(v);
+                        }
+                    }
+                }
+                (written == total, ok)
+            };
+            if !done && ok && !heads.is_full() && (self.mrg || heads.is_empty()) {
+                // Out of buffers with the frame waiting: give back what it
+                // took and ask for a notification when the driver adds
+                // more (the event index would leave refills unannounced),
+                // unless it already has.
+                q.unpop(heads.len() as u16);
+                if q.enable_notify_more(mem) {
+                    left += 1;
                     continue;
                 }
                 break;
-            };
-            left -= 1;
-            let mut bufs = Chain::new();
-            let mut written = 0usize;
-            if q.chain(mem, head, &mut bufs).is_ok() {
-                unsafe {
-                    let slot = addr_of!((*self.chan).rx_slots[self.rx.slot()]);
-                    let len = (addr_of!((*slot).len).read_volatile() as usize).min(net::MAX_FRAME);
-                    let data = addr_of!((*slot).data) as *const u8;
-                    // The slot's header, with num_buffers = 1.
-                    let mut hdr = addr_of!((*slot).hdr).read_volatile();
-                    hdr[10] = 1;
-                    hdr[11] = 0;
-                    let total = HDR + len;
-                    for b in bufs.iter().filter(|b| b.write) {
-                        let n = (b.len as usize).min(total - written);
-                        let dst = mem.bytes(b.gpa, n);
-                        let mut i = 0;
-                        while i < n && written + i < HDR {
-                            dst.add(i).write_volatile(hdr[written + i]);
-                            i += 1;
-                        }
-                        if i < n {
-                            copy_volatile(data.add(written + i - HDR), dst.add(i), n - i);
-                        }
-                        written += n;
-                        if written == total {
-                            break;
-                        }
-                    }
-                    if written < total {
-                        // Buffers too small: the frame is dropped.
-                        written = 0;
-                    }
-                }
+            }
+            // Delivered, or dropped (a bad chain, or one chain too small
+            // without mergeable buffers): those then complete empty.
+            for &(head, n) in &heads {
+                q.push_deferred(mem, head, if done && ok { n } else { 0 });
             }
             unsafe { self.rx.pop(&(*self.chan).rx) };
-            q.push(mem, head, written as u32);
             returned = true;
         }
+        q.publish_used(mem);
         if left == 0 {
             self.more |= 1 << RX;
         }
@@ -217,7 +253,7 @@ impl Backend for Net {
     fn features(&self) -> u64 {
         VIRTIO_NET_F_MAC | VIRTIO_NET_F_SPEED_DUPLEX | VIRTIO_NET_F_STATUS | VIRTIO_NET_F_MTU | VIRTIO_NET_F_CSUM
             | VIRTIO_NET_F_GUEST_CSUM | VIRTIO_NET_F_HOST_TSO4 | VIRTIO_NET_F_HOST_TSO6 | VIRTIO_NET_F_GUEST_TSO4
-            | VIRTIO_NET_F_GUEST_TSO6
+            | VIRTIO_NET_F_GUEST_TSO6 | VIRTIO_NET_F_MRG_RXBUF
     }
 
     fn num_queues(&self) -> usize {
@@ -233,6 +269,7 @@ impl Backend for Net {
     }
 
     fn features_accepted(&mut self, f: u64) {
+        self.mrg = f & VIRTIO_NET_F_MRG_RXBUF != 0;
         let gso = f & (VIRTIO_NET_F_GUEST_TSO4 | VIRTIO_NET_F_GUEST_TSO6) == (VIRTIO_NET_F_GUEST_TSO4 | VIRTIO_NET_F_GUEST_TSO6);
         unsafe {
             addr_of_mut!((*self.chan).rx_csum).write_volatile((f & VIRTIO_NET_F_GUEST_CSUM != 0) as u32);

@@ -91,6 +91,12 @@ impl Queue {
         Some(head)
     }
 
+    /// Give back the last `n` chains popped and not pushed: the driver
+    /// still owns none of them (vhost's vhost_discard_vq_desc).
+    pub fn unpop(&mut self, n: u16) {
+        self.last_avail = self.last_avail.wrapping_sub(n);
+    }
+
     /// Collect the buffers of the chain starting at `head`.  A driver must
     /// not offer a chain longer than the queue size, indirect descriptors
     /// included (virtio 1.x §2.7.5.3.1), so one that is longer, or longer
@@ -210,6 +216,24 @@ impl Queue {
         }
         fence(Ordering::SeqCst);
         mem.read::<u16>(self.avail + 2) != self.last_avail
+    }
+
+    /// Ask for a notification when the driver adds chains beyond those it
+    /// has now (vhost's, armed at the avail index it saw): for a device
+    /// that has chains but too few, as a receive queue for a frame that
+    /// spans more.  Whether some came meanwhile.
+    pub fn enable_notify_more(&mut self, mem: &GuestMem) -> bool {
+        if !self.ready {
+            return false;
+        }
+        let seen = mem.read::<u16>(self.avail + 2);
+        if self.event_idx {
+            mem.write::<u16>(self.used + 4 + 8 * self.num as u64, seen);
+        } else {
+            mem.write::<u16>(self.used, 0);
+        }
+        fence(Ordering::SeqCst);
+        mem.read::<u16>(self.avail + 2) != seen
     }
 }
 
