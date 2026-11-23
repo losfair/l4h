@@ -1248,9 +1248,12 @@ create fails with `-ENODEV`. `l4hctl list` shows them as `hvm`.
   (leaf 0x15: a 25 MHz crystal, which the local APIC timer runs at, and
   the TSC as a ratio Linux computes in 32 bits), invariant TSC, x2APIC,
   TSC-deadline and the topology leaves; leaves it does not know are zero;
-  MSRs outside a fixed table raise `#GP`. Linux reads leaf 0x15 on Intel
-  only: on AMD it calibrates the TSC against the PIT or the PM timer, which
-  fails when an exit takes longer than about 10 µs, as nested ones do.
+  MSRs outside a fixed table raise `#GP`. An emulated TSC deadline has at
+  least 1 ms of lead time from the WRMSR handler, so the guest can run
+  between timer interrupts. The MSR reads back the requested value until
+  the timer expires. Linux reads leaf 0x15 only on Intel. On AMD it
+  calibrates the TSC against the PIT or the PM timer, which fails when
+  an exit takes longer than about 10 µs, as nested ones do.
   So the hypervisor leaves carry KVM's signature with **kvmclock** alone
   (`KVM_FEATURE_CLOCKSOURCE2` and the stable bit; no other KVM feature),
   which every distribution kernel uses (`CONFIG_KVM_GUEST`): a vCPU's
@@ -6092,7 +6095,7 @@ tools/build-fl4.sh
 SEL4_PREFIX="$PWD/build/sel4-fl4" L4H_KERNEL_VARIANT=fl4 tests/run-selftest.sh 4
 ```
 
-The tested FL4 revision is `4c2122a7427931511d3fb6144d31f240a4f63b40`.
+The tested FL4 revision is `66c07cafd401848485de324f5dbc92f7394baa18`.
 `prepare-fl4.sh` clones the pinned public revision, or the frozen override,
 into `build/FL4-src` without applying any kernel patches. The source
 worktree is not edited.
