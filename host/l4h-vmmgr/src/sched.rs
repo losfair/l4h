@@ -155,23 +155,36 @@ pub fn start(h: &mut Vmmgr, gid: usize) -> Result<(), Errno> {
 
 /// The core an HVM guest's monitor (l4h-hvm, whose I/O thread does its
 /// devices' work) runs on: the least loaded core none of the guest's vCPUs
-/// is on (`place`'s weights), so that device work runs beside the vCPUs,
-/// as Linux's vhost workers do, rather than taking turns with them; vCPU
-/// 0's if they are on every core.  Its budget is the guest's VMM share all
+/// is on, preferring cores that are neither an SMT sibling of theirs nor
+/// core 0, so that device work runs beside the vCPUs, as Linux's vhost
+/// workers do, rather than taking turns with them; vCPU 0's if they are on
+/// every core.  Its budget is the guest's VMM share all
 /// the same (`plan`), and a core it shares with another guest limits it as
 /// any VMM sharing a core (`protect`).
 fn hvm_monitor_core(h: &Vmmgr, g: &Guest) -> usize {
     let mut load = [0usize; topology::MAX_CPUS];
     for o in h.guests.iter().flatten().filter(|o| o.state != State::Stopped && o.id != g.id) {
         // A vCPU runs guest code whenever it is not halted; a VMM or
-        // monitor runs for its guest's I/O.  Sharing with a vCPU costs more.
+        // monitor runs for its guest's I/O.  Sharing with a vCPU costs more
+        // here, the reverse of `place`'s weights: there a vCPU avoids the
+        // cores of VMMs, which wake to serve it; here the monitor is the
+        // one placed, and busy vCPUs are what would delay it.
         for v in &o.vcpus { load[v.core] += 2; }
         if let Some((core, _)) = o.vmm_limits { load[core] += 1; }
     }
     let own = g.vcpus.iter().fold(0u64, |m, v| m | (1 << v.core));
+    let topo = &h.info.topology;
+    // An SMT sibling of the guest's own vCPUs shares their core as a vCPU
+    // would; core 0 has the system's services (logd, netd, vmmgr), and
+    // vmm_guard counts a VMM there as contended (protect).
+    let weight = |c: usize| {
+        load[c]
+            + 2 * g.vcpus.iter().filter(|v| v.core != c && topo.same_core(v.core, c)).count()
+            + usize::from(c == 0)
+    };
     (0..h.info.cores.min(topology::MAX_CPUS))
         .filter(|&c| own & (1 << c) == 0)
-        .min_by_key(|&c| load[c])
+        .min_by_key(|&c| weight(c))
         .unwrap_or(g.vcpus[0].core)
 }
 
