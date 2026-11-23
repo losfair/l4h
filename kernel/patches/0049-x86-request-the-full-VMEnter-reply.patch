@@ -1,0 +1,45 @@
+From 731eab064d726555ce450e7eb492688fc8d79a44 Mon Sep 17 00:00:00 2001
+From: l4h <l4h@localhost>
+Date: Mon, 23 Nov 2026 11:14:13 +0100
+Subject: [PATCH] x86: request the full VMEnter reply from either l4h kernel
+
+---
+ .../x86_64/sel4/sel4_arch/syscalls.h                  | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/libsel4/sel4_arch_include/x86_64/sel4/sel4_arch/syscalls.h b/libsel4/sel4_arch_include/x86_64/sel4/sel4_arch/syscalls.h
+index 07968d418..7d450005a 100644
+--- a/libsel4/sel4_arch_include/x86_64/sel4/sel4_arch/syscalls.h
++++ b/libsel4/sel4_arch_include/x86_64/sel4/sel4_arch/syscalls.h
+@@ -553,6 +553,8 @@ LIBSEL4_INLINE_FUNC void seL4_Yield(void)
+ }
+
+ #ifdef CONFIG_VTX
++#include <sel4/arch/vmenter.h>
++
+ LIBSEL4_INLINE_FUNC seL4_Word seL4_VMEnter(seL4_Word *sender)
+ {
+     seL4_Word fault;
+@@ -562,7 +564,8 @@ LIBSEL4_INLINE_FUNC seL4_Word seL4_VMEnter(seL4_Word *sender)
+     seL4_Word mr2 = seL4_GetMR(2);
+     seL4_Word mr3 = seL4_GetMR(3);
+
+-    x64_sys_send_recv(seL4_SysVMEnter, 0, &badge, 0, &fault, &mr0, &mr1, &mr2, &mr3, 0);
++    x64_sys_send_recv(seL4_SysVMEnter, 0, &badge, SEL4_VMENTER_NUM_FAULT_MSGS,
++                      &fault, &mr0, &mr1, &mr2, &mr3, 0);
+
+     seL4_SetMR(0, mr0);
+     seL4_SetMR(1, mr1);
+@@ -573,6 +576,12 @@ LIBSEL4_INLINE_FUNC seL4_Word seL4_VMEnter(seL4_Word *sender)
+     }
+     return fault;
+ }
++
++/* l4h's seL4 VMEnter always returns the full frame. */
++LIBSEL4_INLINE_FUNC seL4_Word seL4_VMEnterFull(seL4_Word *sender)
++{
++    return seL4_VMEnter(sender);
++}
+ #endif
+
+ #ifdef CONFIG_PRINTING

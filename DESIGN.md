@@ -6082,7 +6082,7 @@ tools/build-fl4.sh
 SEL4_PREFIX="$PWD/build/sel4-fl4" L4H_KERNEL_VARIANT=fl4 tests/run-selftest.sh 4
 ```
 
-The tested FL4 revision is `93c4e377e31c456a4c79c3d7c854dab667e6ed3f`.
+The tested FL4 revision is `4c2122a7427931511d3fb6144d31f240a4f63b40`.
 `prepare-fl4.sh` clones the pinned public revision, or the frozen override,
 into `build/FL4-src` without applying any kernel patches. The source
 worktree is not edited.
@@ -6153,13 +6153,16 @@ buffer, leaving 3 KiB for FL4's 2696-byte standard XSAVE image.
 FL4 enables `KernelVTX` and `KernelX86_64VTX64BitGuests` in its ABI and
 selects VT-x or AMD-V at boot. The existing KVM backends (§5.10) use its
 VCPU/EPT interface through the provider, including FL4's 32 KiB VCPU
-objects. Both KVM backends check the `VMEnter` result before decoding an
-exit reason: a notification has no hardware exit to emulate, and FL4 may
-leave its reason zero. When hardware virtualization is unavailable, root's
-VCPU probe fails and Linux boots with KVM disabled, using the same host,
-provider and Linux binaries. Multikernel partitions remain unavailable on
-FL4. It detects the APIC, PCID, FS/GS and FPU features at boot, so the
-shipped seL4 CPU variants do not apply.
+objects. KVM and l4h-hvm request all 30 reply words from `VMEnter` so
+they receive the guest registers even when a notification was pending at
+entry. FL4 also accepts the stock seL4 call with a zero request word and
+its three-word notification reply. On l4h's patched seL4, `KernelVTX`
+already provides the full reply. Both KVM backends check
+the result before decoding a hardware exit. When hardware virtualization
+is unavailable, root's VCPU probe fails and Linux boots with KVM disabled,
+using the same host, provider and Linux binaries. Multikernel partitions remain
+unavailable on FL4. It detects the APIC, PCID, FS/GS and FPU features at boot,
+so the shipped seL4 CPU variants do not apply.
 
 `L4H_RELEASE=1 tools/build-fl4-efi.sh` builds `build/efi/l4h-fl4.efi` and
 its matching `l4h-debug-fl4-x86_64.tar.xz`; `build-efi.sh` builds them after

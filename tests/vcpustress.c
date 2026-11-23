@@ -335,6 +335,9 @@ static enum exit_kind exit_kind(seL4_Word fault, seL4_Word reason)
         /* Ended by a notification, or by whoever took the VCPU. */
         if (reason != (amd ? SVM_EXIT_INTR : VMX_EXIT_EXTINT))
             die("the reason of a VMEnter that a notification ended", reason);
+        seL4_Word gpa = seL4_GetMR(SEL4_VMENTER_FAULT_GUEST_PHYSICAL_MR);
+        if (gpa)
+            die("a notification reported a guest fault address", gpa);
         return EXIT_NOTIFICATION;
     }
     if (reason == (amd ? SVM_EXIT_IOIO : VMX_EXIT_IO))
@@ -358,7 +361,7 @@ static void runner(struct guest *gp)
         seL4_SetMR(SEL4_VMENTER_CALL_EIP_MR, rip);
         seL4_SetMR(SEL4_VMENTER_CALL_CONTROL_PPC_MR, 0);
         seL4_SetMR(SEL4_VMENTER_CALL_INTERRUPT_INFO_MR, 0);
-        seL4_Word fault = seL4_VMEnter(&badge);
+        seL4_Word fault = seL4_VMEnterFull(&badge);
         seL4_Word reason = seL4_GetMR(SEL4_VMENTER_FAULT_REASON_MR);
         seL4_Word r15 = seL4_GetMR(SEL4_VMENTER_FAULT_R15);
         unsigned long now = *gp->counter;

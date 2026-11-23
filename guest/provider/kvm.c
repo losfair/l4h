@@ -107,7 +107,7 @@ void l4h_vcpu_enter(struct l4h_vmexit *x, unsigned long rip, unsigned long contr
 	seL4_SetMR(SEL4_VMENTER_CALL_EIP_MR, rip);
 	seL4_SetMR(SEL4_VMENTER_CALL_CONTROL_PPC_MR, controls);
 	seL4_SetMR(SEL4_VMENTER_CALL_INTERRUPT_INFO_MR, intr_info);
-	x->fault = seL4_VMEnter(&badge) == SEL4_VMENTER_RESULT_FAULT;
+	x->fault = seL4_VMEnterFull(&badge) == SEL4_VMENTER_RESULT_FAULT;
 	if (!x->fault)
 		__atomic_or_fetch(&v->ntfn_pending, badge, __ATOMIC_RELEASE);
 	x->rip = seL4_GetMR(SEL4_VMENTER_CALL_EIP_MR);

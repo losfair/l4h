@@ -136,9 +136,12 @@ pub trait Hw {
     fn start_long_mode(&mut self, entry: &crate::boot::Entry);
 }
 
-/// seL4_VMEnter: MRs 0-2 (RIP, controls, event) in registers, the rest
-/// of the exit in the IPC buffer.  Whether it was an exit (else a
-/// notification), and the badge.
+#[cfg(not(test))]
+const VM_ENTER_WORDS: usize = 30;
+
+/// Request the full VMEnter reply. The inputs are RIP, controls and event.
+/// The first four reply words return in registers and the rest in the IPC
+/// buffer. The syscall also returns the fault indicator and notification badge.
 #[cfg(not(test))]
 pub fn vmenter(rip: u64, controls: u64, event: u64) -> (bool, u64) {
     let (mut mr0, mut mr1, mut mr2, mut mr3) = (rip, controls, event, 0u64);
@@ -151,7 +154,7 @@ pub fn vmenter(rip: u64, controls: u64, event: u64) -> (bool, u64) {
             "mov rsp, r14",
             in("rdx") sys,
             inout("rdi") 0u64 => badge,
-            inout("rsi") 0u64 => info,
+            inout("rsi") VM_ENTER_WORDS as u64 => info,
             inout("r10") mr0,
             inout("r8") mr1,
             inout("r9") mr2,
@@ -169,10 +172,10 @@ pub fn vmenter(rip: u64, controls: u64, event: u64) -> (bool, u64) {
 /// The message registers of an exit (MRs 0-29), read at once: any
 /// invocation of the VCPU after VMEnter overwrites them.
 #[cfg(not(test))]
-pub fn exit_mrs() -> [u64; 30] {
+pub fn exit_mrs() -> [u64; VM_ENTER_WORDS] {
     sel4::with_ipc_buffer(|b| {
-        let mut m = [0; 30];
-        m.copy_from_slice(&b.msg_regs()[..30]);
+        let mut m = [0; VM_ENTER_WORDS];
+        m.copy_from_slice(&b.msg_regs()[..VM_ENTER_WORDS]);
         m
     })
 }
