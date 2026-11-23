@@ -59,8 +59,15 @@ if udhcpc -i eth0 -n -q -t 10 -s /bin/udhcpc.script >/dev/null 2>&1; then
     name=$(wget -q -T 10 -O - --header 'Metadata-Flavor: Google' \
         http://169.254.169.254/computeMetadata/v1/instance/name 2>/dev/null)
     [ -n "$name" ] && pass "metadata server: instance $name" || fail "metadata server"
-    if wget -q -T 15 -O /tmp/idx http://deb.debian.org/debian/dists/trixie/Release 2>/dev/null; then
-        pass "internet: fetched $(wc -c < /tmp/idx) bytes from deb.debian.org"
+    # A new instance reaches the internet some seconds after it starts
+    # (the metadata server at once): l4h on C4A gets here within about a
+    # second of power-on. Allow a minute for the first connection.
+    tries=0
+    until wget -q -T 10 -O /tmp/idx http://deb.debian.org/debian/dists/trixie/Release 2>/dev/null; do
+        tries=$((tries + 1)); [ "$tries" -lt 6 ] || break
+    done
+    if [ "$tries" -lt 6 ]; then
+        pass "internet: fetched $(wc -c < /tmp/idx) bytes from deb.debian.org (after $tries retries)"
     else
         fail "internet (DNS or NAT)"
     fi

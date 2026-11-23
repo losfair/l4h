@@ -16,6 +16,11 @@
 #include "private.h"
 #include "registers.h"
 
+/* uctx->regs_dirty values beyond plain "dirty" */
+#define DIRTY_GP	1
+#define DIRTY_SEG	2	/* fs_base/gs_base changed by the kernel */
+/* arm64: the syscall stop's message had every register (user-arm64.h) */
+#define DIRTY_FULL_MSG	4
 #ifdef __aarch64__
 #include "user-arm64.h"
 #else
@@ -131,9 +136,6 @@ static void gp_to_syscall_msg(const unsigned long *gp)
 
 #endif
 
-/* uctx->regs_dirty values beyond plain "dirty" */
-#define DIRTY_GP	1
-#define DIRTY_SEG	2	/* fs_base/gs_base changed by the kernel */
 
 static int write_regs(struct l4h_uctx *u, const unsigned long *gp, int resume)
 {
@@ -248,7 +250,13 @@ int l4h_user_run(struct l4h_uctx *u, unsigned long *gp, int read_regs_on_interru
 		if (!u->regs_dirty) {
 			info = seL4_ReplyRecv(v->ep, seL4_MessageInfo_new(0, 0, 0, 0), &badge, u->reply);
 
-#ifndef __aarch64__
+#ifdef __aarch64__
+		} else if (u->stop == L4H_STOP_SYSCALL && gp_to_syscall_msg(u, gp)) {
+			/* Every register in the reply (user-arm64.h); TPIDR_EL0
+			 * too, so a TLS change needs no write either. */
+			info = seL4_ReplyRecv(v->ep, seL4_MessageInfo_new(0, 0, 0, L4H_TRAP_LENGTH),
+					      &badge, u->reply);
+#else
 		} else if (u->stop == L4H_STOP_SYSCALL && !(u->regs_dirty & DIRTY_SEG) &&
 			   gp[HOST_CX] == gp[HOST_IP] && gp[HOST_R11] == gp[HOST_EFLAGS]) {
 			/* seL4 resumes a syscall stop with sysretq, which loads rcx
@@ -323,7 +331,7 @@ int l4h_user_run(struct l4h_uctx *u, unsigned long *gp, int read_regs_on_interru
 	switch (seL4_MessageInfo_get_label(info)) {
 	case seL4_Fault_UnknownSyscall:
 #ifdef __aarch64__
-		syscall_msg_to_gp(u, gp);
+		syscall_msg_to_gp(u, gp, seL4_MessageInfo_get_length(info));
 #else
 		syscall_msg_to_gp(gp);
 #endif
