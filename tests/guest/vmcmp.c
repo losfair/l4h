@@ -160,6 +160,15 @@ static void bench_cache_bw(void)
 		for (int i = 0; i < 2048; i++)
 			sum += buf[i];
 	report("load 16 KiB in cache", sizeof(buf) * (double)reps / (now() - t) / 1e9, "GB/s");
+	/* REP STOSB is microcode, not bound by the op cache: L1 speed on
+	 * write-back memory, memory speed on write-through. */
+	t = now();
+	for (int r = 0; r < reps; r++) {
+		void *dst = (void *)buf;
+		size_t cnt = sizeof(buf);
+		__asm__ volatile("rep stosb" : "+D"(dst), "+c"(cnt) : "a"(r) : "memory");
+	}
+	report("rep stosb 16 KiB", sizeof(buf) * (double)reps / (now() - t) / 1e9, "GB/s");
 	if (sum == 42)
 		puts("");
 }

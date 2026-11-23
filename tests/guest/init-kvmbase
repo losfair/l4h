@@ -12,7 +12,10 @@ fail() { echo "HVMBENCH: FAIL: $*"; poweroff -f; }
 vendor=kvm-intel
 grep -qw svm /proc/cpuinfo && vendor="ccp kvm-amd"
 for m in irqbypass kvm $vendor virtio_blk tun tap vhost_iotlb vhost vhost_net; do
-    insmod "/lib/kvm/$m.ko" 2>/dev/null || [ "$m" = ccp ] || fail "insmod $m"
+    args=
+    [ "$m" = kvm-amd ] && args=$(echo "${HB_KVMAMD_ARGS:-}" | tr , ' ')
+    # shellcheck disable=SC2086
+    insmod "/lib/kvm/$m.ko" $args 2>/dev/null || [ "$m" = ccp ] || fail "insmod $m"
 done
 mem=${HB_MEM:-1024} reps=${HB_REPS:-1}
 echo "HVMBENCH: start (kvm), guests ${mem} MiB, 1 vCPU"
@@ -23,7 +26,7 @@ for r in $(seq 1 "$reps"); do
     /usr/bin/qemu-system-x86_64 -accel kvm -cpu host -m "$mem" -smp 1 -nodefaults -no-user-config \
         -display none -vga none -no-reboot -monitor none -serial stdio \
         -L /usr/share/seabios -L /usr/share/qemu \
-        -kernel /bin/bzImage -initrd /bin/vmcmp.cpio.gz -append "console=ttyS0${HB_SPIN:+ spin}" \
+        -kernel /bin/bzImage -initrd /bin/vmcmp.cpio.gz -append "console=ttyS0${HB_SPIN:+ spin}${HB_GUEST_ARGS:+ $HB_GUEST_ARGS}" \
         -drive file=/dev/vda,if=none,id=d0,format=raw,cache=none,aio=native -device virtio-blk-pci,drive=d0 \
         -netdev tap,id=n0,ifname=tap0,script=no,downscript=no,vhost=on -device virtio-net-pci,netdev=n0,romfile= \
         </dev/null > /tmp/out 2>&1 &

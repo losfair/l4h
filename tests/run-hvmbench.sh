@@ -4,7 +4,11 @@
 # HVM guest (DESIGN.md §5.11), with equal memory, vCPUs, disk and switch.
 # Needs nested VT-x or AMD-V.  HB_MODE=kvm runs the baseline instead:
 # the host's Linux kernel with KVM as L1 in the same QEMU, the guest under
-# QEMU there (tests/guest/init-kvmbase), with HB_MEM and HB_REPS.  Knobs: HB_MEM (MiB), HB_VCPUS, HB_KINDS
+# QEMU there (tests/guest/init-kvmbase), with HB_MEM and HB_REPS.
+# Both preallocate their RAM (-mem-prealloc): a host that backs it lazily
+# with THP and the huge zero page splits the 2 MiB mappings of RAM that
+# was read before it was written, as FL4's boot does (it zeroes only
+# what is not zero), and the guest then runs on 4K pages there.  Knobs: HB_MEM (MiB), HB_VCPUS, HB_KINDS
 # (pv,hvm), HB_REPS; L4H_KERNEL_VARIANT / L4H_FL4_SOURCE pick the kernel.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -45,17 +49,17 @@ if [ "${HB_MODE:-l4h}" = kvm ]; then
     (cd "$mods" && find . | cpio -o -H newc --quiet | gzip -1) >>"$out/kvmbase.cpio.gz"
     log=$root/build/hvmbench-kvm.log
     timeout "${HVMBENCH_TIMEOUT:-120}" qemu-system-x86_64 -accel kvm -cpu "${L4H_QEMU_CPU:-host,+invtsc}" \
-        -smp "${L4H_SMP:-4}" -m "${L4H_MEM:-6G}" -name kvmbase,debug-threads=on -display none -vga none -nic none -no-reboot -monitor none \
+        -smp "${L4H_SMP:-4}" -m "${L4H_MEM:-3G}" -name kvmbase,debug-threads=on -mem-prealloc -display none -vga none -nic none -no-reboot -monitor none \
         -drive file="$out/hvmbench.img",if=none,id=d0,format=raw,cache=none,aio=native -device virtio-blk-pci,drive=d0,disable-legacy=on \
         -serial "file:$log" -kernel "$kernel" -initrd "$out/kvmbase.cpio.gz" \
-        -append "console=ttyS0 quiet panic=-1 HB_MEM=${HB_MEM:-1024} HB_REPS=${HB_REPS:-1}${HB_SPIN:+ HB_SPIN=1}" </dev/null || true
+        -append "console=ttyS0 quiet panic=-1 HB_MEM=${HB_MEM:-1024} HB_REPS=${HB_REPS:-1}${HB_SPIN:+ HB_SPIN=1}${HB_GUEST_ARGS:+ HB_GUEST_ARGS=$HB_GUEST_ARGS}${HB_KVMAMD_ARGS:+ HB_KVMAMD_ARGS=$HB_KVMAMD_ARGS}" </dev/null || true
     grep -a "HVMBENCH" "$log" || true
     grep -aq "HVMBENCH: done" "$log"
     exit
 fi
 export L4H_QEMU_CPU=${L4H_QEMU_CPU:-host,+invtsc}
-L4H_MEM=${L4H_MEM:-6G} L4H_DOM0_DISKS=0 L4H_DOM0_MEM_MB=512 L4H_SMP=${L4H_SMP:-4} \
-L4H_QEMU_ARGS="-name l4h,debug-threads=on -drive file=$out/hvmbench.img,if=none,id=d0,format=raw,cache=none,aio=native -device virtio-blk-pci,drive=d0,disable-legacy=on" \
+L4H_MEM=${L4H_MEM:-3G} L4H_DOM0_DISKS=0 L4H_DOM0_MEM_MB=512 L4H_SMP=${L4H_SMP:-4} \
+L4H_QEMU_ARGS="-name l4h,debug-threads=on -mem-prealloc -drive file=$out/hvmbench.img,if=none,id=d0,format=raw,cache=none,aio=native -device virtio-blk-pci,drive=d0,disable-legacy=on" \
     "$root/tools/run-dom0.sh" "$out/hvmbench.cpio.gz" \
     "console=hvc0 HB_MEM=${HB_MEM:-1024} HB_VCPUS=${HB_VCPUS:-1} HB_KINDS=${HB_KINDS:-pv,hvm} HB_REPS=${HB_REPS:-1}${HB_SPIN:+ HB_SPIN=1}" \
     ${HVMBENCH_TIMEOUT:-900} | grep -a "HVMBENCH" || true
