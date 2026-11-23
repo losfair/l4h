@@ -42,6 +42,11 @@ pub fn signal_io(badge: u64) {
     cap::<cap_type::Notification>(slot).signal();
 }
 
+/// Take vCPU `v`'s notification if it is signalled, without waiting.
+pub fn poll(v: usize) {
+    let _ = cap::<cap_type::Notification>(hv::SLOT_VCPU_WAIT + v as u64).poll();
+}
+
 /// vCPU `v`'s thread waits for its notification (wake, its timer).
 pub fn wait(v: usize) {
     let _ = cap::<cap_type::Notification>(hv::SLOT_VCPU_WAIT + v as u64).wait();

@@ -232,10 +232,16 @@ impl<H: Hw> Vcpu<H> {
     /// Wait for something to do: an interrupt, the timer, INIT or SIPI.
     fn block(&mut self) {
         self.arm_timer();
-        let before = vm::now();
-        if self.halted && self.halt_poll(before) {
+        if self.halted && self.halt_poll(vm::now()) {
+            // What woke it may have signalled this thread too: taken now,
+            // so the next VMEnter does not return at once to say so (turn
+            // looks at the state itself).
+            crate::sys::poll(self.id);
             return;
         }
+        // Idle: the time blocked.  The poll ran on the vCPU's budget, as
+        // its run time (vmmgr's steal is wall - run - idle).
+        let before = vm::now();
         crate::sys::wait(self.id);
         let page = host::vmm_event_page_va(self.id) as *mut abi::EventPage;
         unsafe {
@@ -249,19 +255,23 @@ impl<H: Hw> Vcpu<H> {
     /// interrupt it can take, an NMI, INIT or SIPI, its timer.  Each block
     /// and wakeup costs host scheduling and, under a hypervisor, IPIs and
     /// halts of its own; a guest waiting on I/O is often woken within tens
-    /// of microseconds.  Whether it was woken.
+    /// of microseconds.  vCPU 0 also runs the VM's I/O APIC and UART work
+    /// (Vm::pending_work).  Whether it was woken.
     fn halt_poll(&self, start: u64) -> bool {
+        let vm = vm();
         let sh = shared(self.id);
-        let end = start.wrapping_add(vm().tsc_hz / 1_000_000 * HALT_POLL_US);
+        let ticks = vm.tsc_hz / 1_000_000 * HALT_POLL_US;
         loop {
             let now = vm::now();
             if sh.flags.load(Ordering::Relaxed) != 0
                 || (self.lapic.pending(sh).is_some() && self.hw.rflags() & (1 << 9) != 0)
                 || (self.armed != 0 && now >= self.armed)
+                || (self.id == 0
+                    && (vm.ioapic_stale.load(Ordering::Relaxed) || vm.uart_stale.load(Ordering::Relaxed)))
             {
                 return true;
             }
-            if now >= end {
+            if now.wrapping_sub(start) >= ticks {
                 return false;
             }
             core::hint::spin_loop();
@@ -680,6 +690,11 @@ impl<H: Hw> Vcpu<H> {
                 let gpa = v & !1;
                 if gpa & 3 != 0 || (v & 1 != 0 && !vm().mem.valid(gpa, 4)) {
                     return false;
+                }
+                // As KVM: the word starts clear, so that nothing left in
+                // it passes for an EOI the entry offered.
+                if v & 1 != 0 {
+                    vm().mem.write::<u32>(gpa, 0);
                 }
                 self.pv_eoi = v;
                 return true;
@@ -1159,7 +1174,8 @@ pub fn host_cpuid(leaf: u32, sub: u32) -> [u32; 4] {
         if (leaf as usize) < HOST_STD && (sub as usize) < HOST_SUBS {
             return t.std[leaf as usize][sub as usize];
         }
-        if (0x8000_0000..0x8000_0000 + HOST_EXT as u32).contains(&leaf) {
+        // Subleaf 0 only: no extended leaf it caches has others.
+        if sub == 0 && (0x8000_0000..0x8000_0000 + HOST_EXT as u32).contains(&leaf) {
             return t.ext[(leaf - 0x8000_0000) as usize];
         }
     }

@@ -71,6 +71,7 @@ pub mod sys {
     pub fn signal_io(badge: u64) {
         IO_SIGNALS.fetch_or(badge, Ordering::SeqCst);
     }
+    pub fn poll(_v: usize) {}
     pub fn wait(_v: usize) {
         WAITS.fetch_add(1, Ordering::SeqCst);
     }
