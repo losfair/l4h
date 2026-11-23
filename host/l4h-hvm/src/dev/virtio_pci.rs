@@ -94,6 +94,12 @@ pub trait Backend {
     fn more(&self) -> u64 {
         0
     }
+    /// Whether it may have work, from memory alone: the I/O thread spins
+    /// on it while devices poll (`more`), between its turns.  Those that
+    /// cannot tell say no, and are served at the next turn.
+    fn ready(&self, _mem: &GuestMem, _queues: &[Queue]) -> bool {
+        false
+    }
     /// Its configuration changed (a link went up or down).
     fn config_changed(&mut self) -> bool {
         false

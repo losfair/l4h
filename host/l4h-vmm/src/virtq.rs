@@ -91,6 +91,11 @@ impl Queue {
         Some(head)
     }
 
+    /// Whether the driver added chains not yet popped.
+    pub fn has_avail(&self, mem: &GuestMem) -> bool {
+        self.ready && mem.read::<u16>(self.avail + 2) != self.last_avail
+    }
+
     /// Give back the last `n` chains popped and not pushed: the driver
     /// still owns none of them (vhost's vhost_discard_vq_desc).
     pub fn unpop(&mut self, n: u16) {

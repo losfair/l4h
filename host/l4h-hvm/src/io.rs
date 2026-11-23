@@ -77,13 +77,16 @@ pub fn init() {
             }
             host::VDEV_NET => {
                 let kick = sys::kick(d.chan_kick_slot);
-                Dev::Net(Transport::new(slot, Net::new(d.chan_va as usize, kick, d.mac[..6].try_into().unwrap())))
+                Dev::Net(Transport::new(slot, Net::new(d.chan_va as usize, kick, d.mac[..6].try_into().unwrap(), vm.tsc_hz / 1_000_000 * NET_POLL_US)))
             }
             k => panic!("l4h-hvm: device kind {}", k),
         };
         io.slots[slot] = Some(dev);
     }
 }
+
+/// How long a network queue that ran dry is polled (Net::keep_polling).
+const NET_POLL_US: u64 = 50;
 
 /// The slots asserting INTA#, a bit each (the I/O thread's only).
 static INTX: AtomicU32 = AtomicU32::new(0);
@@ -231,6 +234,25 @@ pub fn console_turn() {
 /// The I/O thread's timer as console_turn last set it.
 pub fn timer() -> u64 {
     io().timer
+}
+
+/// While devices poll (more): spin, without the kernel, until one may
+/// have work, a vCPU kicked, or `spin` ticks pass.
+pub fn poll_spin(spin: u64) {
+    let vm = vm();
+    let end = vm::now().wrapping_add(spin);
+    loop {
+        for (slot, d) in io().slots.iter().enumerate() {
+            let Some(d) = d.as_ref() else { continue };
+            if vm.kicks.0[slot].load(Ordering::Relaxed) != 0 || each!(d, t => t.backend.ready(&vm.mem, &t.queues)) {
+                return;
+            }
+        }
+        if vm::now() >= end {
+            return;
+        }
+        core::hint::spin_loop();
+    }
 }
 
 /// Whether a device left work for another turn.

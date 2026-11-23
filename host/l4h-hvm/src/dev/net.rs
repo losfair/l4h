@@ -49,17 +49,25 @@ pub struct Net {
     more: u64,
     /// VIRTIO_NET_F_MRG_RXBUF: a frame may span several receive chains.
     mrg: bool,
+    /// How long a queue that ran dry is polled, notifications off, before
+    /// they are asked for again (ticks; 0: not at all), as vhost-net's
+    /// busy polling: a guest sending or refilling steadily adds entries
+    /// within microseconds, and each notification is an exit.  When each
+    /// queue last had work.
+    poll_ticks: u64,
+    last_work: [u64; 2],
     config: [u8; 32],
 }
 
 impl Net {
-    pub fn new(chan_va: usize, kick: Kick, mac: [u8; 6]) -> Self {
+    pub fn new(chan_va: usize, kick: Kick, mac: [u8; 6], poll_ticks: u64) -> Self {
         let chan = chan_va as *mut Port;
         let link = net::LinkState(unsafe { addr_of!((*chan).link_state).read_volatile() });
         let mut config = [0u8; 32];
         config[0..6].copy_from_slice(&mac);
         config[10..12].copy_from_slice(&((net::MTU_FRAME - 14) as u16).to_le_bytes());
-        let mut n = Net { chan, tx: Producer::new(net::RING_SIZE), rx: Consumer::new(net::RING_SIZE), kick, link, tx_blocked: false, more: 0, mrg: false, config };
+        let mut n = Net { chan, tx: Producer::new(net::RING_SIZE), rx: Consumer::new(net::RING_SIZE), kick, link, tx_blocked: false, more: 0, mrg: false,
+            poll_ticks, last_work: [0; 2], config };
         n.link_config();
         n
     }
@@ -89,6 +97,9 @@ impl Net {
                 break;
             }
             let Some(head) = q.pop(mem) else {
+                if self.keep_polling(TX) {
+                    break;
+                }
                 if q.enable_notify(mem) {
                     q.disable_notify(mem);
                     continue;
@@ -130,6 +141,9 @@ impl Net {
             q.push(mem, head, 0);
             returned = true;
         }
+        if returned {
+            self.last_work[TX] = l4h_rt::host::ticks::now();
+        }
         if left == 0 || self.tx_blocked {
             // Back for more (complete, retry) without a notification:
             // ask for one all the same, in case that never comes.
@@ -139,6 +153,16 @@ impl Net {
             q.enable_notify(mem);
         }
         (returned, queued)
+    }
+
+    /// Whether queue `q`, out of entries now, is still polled (`more`),
+    /// its notifications left off.
+    fn keep_polling(&mut self, q: usize) -> bool {
+        if self.poll_ticks == 0 || l4h_rt::host::ticks::now().wrapping_sub(self.last_work[q]) >= self.poll_ticks {
+            return false;
+        }
+        self.more |= 1 << q;
+        true
     }
 
     /// Port -> guest, while both have entries.
@@ -216,6 +240,9 @@ impl Net {
                 // more (the event index would leave refills unannounced),
                 // unless it already has.
                 q.unpop(heads.len() as u16);
+                if self.keep_polling(RX) {
+                    break;
+                }
                 if q.enable_notify_more(mem) {
                     left += 1;
                     continue;
@@ -231,6 +258,9 @@ impl Net {
             returned = true;
         }
         q.publish_used(mem);
+        if returned {
+            self.last_work[RX] = l4h_rt::host::ticks::now();
+        }
         if left == 0 {
             self.more |= 1 << RX;
         }
@@ -316,6 +346,14 @@ impl Backend for Net {
         self.more
     }
 
+    fn ready(&self, mem: &GuestMem, queues: &[Queue]) -> bool {
+        // Entries to send, frames to deliver and buffers for them, room
+        // again for frames waiting to be sent.
+        queues[TX].has_avail(mem)
+            || (queues[RX].has_avail(mem) && unsafe { self.rx.ready(&(*self.chan).rx) } != 0)
+            || (self.tx_blocked && !self.tx_full())
+    }
+
     fn config_changed(&mut self) -> bool {
         let link = net::LinkState(unsafe { addr_of!((*self.chan).link_state).read_volatile() });
         if link == self.link {
@@ -344,11 +382,57 @@ mod tests {
     use crate::mem::tests::fake;
 
     #[test]
+    fn mergeable_receive_spans_buffers_or_waits() {
+        let (mem, _buf) = fake(1 << 20, 0);
+        let port: &'static mut Port = unsafe { &mut *(std::alloc::alloc_zeroed(std::alloc::Layout::new::<Port>()) as *mut Port) };
+        let mut n = Net::new(port as *mut Port as usize, Kick, [2, 0, 0, 0, 0, 1], 0);
+        n.features_accepted(VIRTIO_NET_F_MRG_RXBUF);
+        let mut qs: [Queue; 2] = Default::default();
+        assert!(qs[RX].setup(&mem, 16, 256, 0x1000, 0x2000, 0x3000));
+        let d = |at: u64, gpa: u64, len: u32, flags: u16, next: u16| {
+            mem.write::<u64>(at, gpa);
+            mem.write::<u32>(at + 8, len);
+            mem.write::<u16>(at + 12, flags);
+            mem.write::<u16>(at + 14, next);
+        };
+        // A 3000-byte frame, two 1100-byte buffers: it waits, both given back.
+        port.rx_slots[0].len = 3000;
+        for (i, b) in port.rx_slots[0].data[..3000].iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        port.rx.head.store(1, Ordering::Release);
+        for k in 0..3u64 {
+            d(0x1000 + 16 * k, 0xa000 + 0x1000 * k, 1100, 2, 0);
+            mem.write::<u16>(0x2004 + 2 * k, k as u16);
+        }
+        mem.write::<u16>(0x2002, 2);
+        assert_eq!(n.kick(&mem, &mut qs, RX), 0);
+        assert_eq!(mem.read::<u16>(0x3002), 0, "nothing used");
+        assert_eq!(port.rx.tail.load(Ordering::Relaxed), 0, "the frame waits");
+        // A third buffer: three used entries, num_buffers 3, every byte.
+        mem.write::<u16>(0x2002, 3);
+        assert_eq!(n.kick(&mem, &mut qs, RX), 1 << RX);
+        assert_eq!(mem.read::<u16>(0x3002), 3);
+        let lens: std::vec::Vec<u32> = (0..3).map(|k| mem.read::<u32>(0x3008 + 8 * k)).collect();
+        assert_eq!(lens, [1100, 1100, (HDR + 3000 - 2200) as u32]);
+        assert_eq!(mem.read::<u16>(0xa000 + 10), 3, "num_buffers");
+        let mut got = std::vec::Vec::new();
+        for k in 0..3u64 {
+            let skip = if k == 0 { HDR as u64 } else { 0 };
+            for o in skip..lens[k as usize] as u64 {
+                got.push(mem.read::<u8>(0xa000 + 0x1000 * k + o));
+            }
+        }
+        assert_eq!(got.len(), 3000);
+        assert!(got.iter().enumerate().all(|(i, &b)| b == i as u8));
+    }
+
+    #[test]
     fn transmit_and_receive() {
         let (mem, _buf) = fake(1 << 20, 0);
         // Too large for the stack: zeroed on the heap.
         let port: &'static mut Port = unsafe { &mut *(std::alloc::alloc_zeroed(std::alloc::Layout::new::<Port>()) as *mut Port) };
-        let mut n = Net::new(port as *mut Port as usize, Kick, [2, 0, 0, 0, 0, 1]);
+        let mut n = Net::new(port as *mut Port as usize, Kick, [2, 0, 0, 0, 0, 1], 0);
         assert_eq!(&n.config()[..6], &[2, 0, 0, 0, 0, 1]);
         let mut qs: [Queue; 2] = Default::default();
         assert!(qs[RX].setup(&mem, 16, 256, 0x1000, 0x2000, 0x3000));
@@ -394,7 +478,7 @@ mod tests {
     fn hostile_queue_addresses() {
         let (mem, _buf) = fake(1 << 20, 0);
         let port: &'static mut Port = unsafe { &mut *(std::alloc::alloc_zeroed(std::alloc::Layout::new::<Port>()) as *mut Port) };
-        let mut n = Net::new(port as *mut Port as usize, Kick, [2, 0, 0, 0, 0, 1]);
+        let mut n = Net::new(port as *mut Port as usize, Kick, [2, 0, 0, 0, 0, 1], 0);
         let mut qs: [Queue; 2] = Default::default();
         // Rings outside RAM, or running off its end.
         for bad in [1u64 << 40, l4h_rt::host::hvm::IO_POOL_GPA, l4h_rt::host::hvm::PCI_MMIO_BASE, (1 << 20) - 8, u64::MAX - 7] {
