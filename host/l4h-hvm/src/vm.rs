@@ -25,8 +25,36 @@ use crate::guest::GuestMem;
 use crate::sync::{Global, SpinLock};
 pub use crate::sys::{me, now, set_me, signal_io};
 
+/// What the host CPU gives the guest, as its CPUID shows it.
+#[derive(Clone, Copy, Debug)]
+pub struct Host {
+    /// AMD-V rather than VT-x (the vendor, as seL4 chooses).
+    pub amd: bool,
+    /// The XCR0 features the guest may enable.
+    pub xcr0: u64,
+    /// PCIDs (CPUID 1 ECX bit 17), which CR4.PCIDE needs.
+    pub pcid: bool,
+    /// Physical-address bits (CPUID 0x8000_0008, x86::cpuid's clamp).
+    pub phys_bits: u32,
+}
+
+impl Host {
+    /// From the host's CPUID.
+    pub fn of(cpuid: &impl Fn(u32, u32) -> [u32; 4]) -> Host {
+        let ext = cpuid(0x8000_0000, 0)[0];
+        let phys = if ext >= 0x8000_0008 { cpuid(0x8000_0008, 0)[0] & 0xff } else { 36 };
+        Host {
+            amd: cpuid(0, 0)[1] == u32::from_le_bytes(*b"Auth"),
+            xcr0: crate::x86::cpuid::xcr0_supported(cpuid),
+            pcid: cpuid(1, 0)[2] & (1 << 17) != 0,
+            phys_bits: phys.min(crate::x86::cpuid::MAX_PHYS_BITS),
+        }
+    }
+}
+
 pub struct Vm {
     pub cfg: &'static HvmConfig,
+    pub host: Host,
     pub tsc_hz: u64,
     pub vcpus: usize,
     /// AMD-V rather than VT-x (the host CPU's vendor, as seL4 chooses).
@@ -52,6 +80,8 @@ pub struct Vm {
     pub entry: crate::boot::Entry,
     pub xcr0: u64,
     pub invpcid: AtomicBool,
+    /// The guest has PCIDs (CPUID 1 ECX bit 17: the host's).
+    pub pcid: AtomicBool,
 }
 
 pub static VM: Global<Vm> = Global::new();
@@ -74,7 +104,8 @@ pub enum BuildError {
 /// Make the machine (once, on the I/O thread, before any vCPU runs): load
 /// the kernel dom0 put in RAM with its boot parameters, write the ACPI
 /// tables, and publish the shared state as VM.
-pub fn build(cfg: &'static HvmConfig, tsc_hz: u64, mem: GuestMem, amd: bool, xcr0: u64) -> Result<(), BuildError> {
+pub fn build(cfg: &'static HvmConfig, tsc_hz: u64, mem: GuestMem, host: Host) -> Result<(), BuildError> {
+    let (amd, xcr0) = (host.amd, host.xcr0);
     let vcpus = (cfg.nr_vcpus as usize).clamp(1, hv::MAX_VCPUS);
     let kernel = crate::boot::Kernel::parse(&mem, cfg.kernel_gpa, cfg.kernel_size).map_err(BuildError::Kernel)?;
     let tables = unsafe { ACPI.get() };
@@ -86,6 +117,7 @@ pub fn build(cfg: &'static HvmConfig, tsc_hz: u64, mem: GuestMem, amd: bool, xcr
         crate::acpi::RSDP).map_err(BuildError::Load)?;
     VM.set(Vm {
         cfg,
+        host,
         tsc_hz,
         vcpus,
         amd,
@@ -106,6 +138,7 @@ pub fn build(cfg: &'static HvmConfig, tsc_hz: u64, mem: GuestMem, amd: bool, xcr
         entry,
         xcr0,
         invpcid: AtomicBool::new(false),
+        pcid: AtomicBool::new(host.pcid),
     });
     Ok(())
 }

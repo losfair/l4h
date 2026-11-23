@@ -201,18 +201,27 @@ impl Vmx {
         }
     }
 
-    /// Load the PAE PDPTEs from CR3, as the CPU does when it enables PAE
-    /// paging, which our emulation of a CR0 or CR4 write did.
-    fn load_pdptes(&mut self) {
-        let p = self.paging();
-        if p.cr0 & walk::CR0_PG == 0 || p.cr4 & walk::CR4_PAE == 0 || p.efer & walk::EFER_LMA != 0 {
-            return;
+    /// The PAE PDPTEs a MOV to CR0 or CR4 that ends in 32-bit PAE paging
+    /// loads (exits::needs_pae_pdptes), read and checked first, as the CPU
+    /// does: Some(None) if none are loaded, None for the MOV's #GP (not in
+    /// RAM, or a reserved bit set), before anything changes.
+    fn pdptes_for(&mut self, cr0: u64, cr4: u64) -> Option<Option<[u64; 4]>> {
+        let (old_cr0, old_cr4, efer) = (self.cr0(), self.cr4(), self.rd(GUEST_EFER));
+        if !exits::needs_pae_pdptes(old_cr0, cr0, old_cr4, cr4, efer) {
+            return Some(None);
         }
-        let mem = &crate::vm::vm().mem;
-        for i in 0..4 {
-            let at = (p.cr3 & 0xffff_ffe0) + 8 * i;
-            let e = if mem.valid(at, 8) { mem.read::<u64>(at) } else { 0 };
-            self.wr(GUEST_PDPTE0 + 2 * i, e);
+        let vm = crate::vm::vm();
+        let at = self.rd(GUEST_CR3) & 0xffff_ffe0;
+        if !vm.mem.valid(at, 32) {
+            return None;
+        }
+        let p: [u64; 4] = core::array::from_fn(|i| vm.mem.read::<u64>(at + 8 * i as u64));
+        exits::pae_pdptes_valid(&p, vm.host.phys_bits).then_some(Some(p))
+    }
+
+    fn load_pdptes(&mut self, p: Option<[u64; 4]>) {
+        for (i, &e) in p.iter().flatten().enumerate() {
+            self.wr(GUEST_PDPTE0 + 2 * i as u64, e);
         }
     }
 }
@@ -367,14 +376,18 @@ impl Hw for Vmx {
     }
 
     fn set_cr0(&mut self, v: u64) -> bool {
+        // Everything that can fail first, before any field changes: the
+        // PDPTEs it loads, and IA-32e mode without PAE.
+        let cr4 = self.cr4();
+        let Some(pdptes) = self.pdptes_for(v, cr4) else { return false };
         let old = self.rd(GUEST_CR0);
         let mut efer = self.rd(GUEST_EFER);
+        if efer & walk::EFER_LME != 0 && (old ^ v) & CR0_PG != 0 && v & CR0_PG != 0 && self.rd(GUEST_CR4) & walk::CR4_PAE == 0 {
+            // Entering IA-32e mode needs PAE.
+            return false;
+        }
         if efer & walk::EFER_LME != 0 {
             if old & CR0_PG == 0 && v & CR0_PG != 0 {
-                // Entering IA-32e mode needs PAE.
-                if self.rd(GUEST_CR4) & walk::CR4_PAE == 0 {
-                    return false;
-                }
                 efer |= walk::EFER_LMA;
                 self.entry_controls(ENTRY_IA32E, 0);
             } else if old & CR0_PG != 0 && v & CR0_PG == 0 {
@@ -386,19 +399,16 @@ impl Hw for Vmx {
         // The guest's CD and NW stay in the shadow: seL4 keeps them off.
         self.wr(CR0_SHADOW, v);
         self.wr(GUEST_CR0, (v | CR0_NE) & !(CR0_CD | CR0_NW));
-        if (old ^ v) & CR0_PG != 0 {
-            self.load_pdptes();
-        }
+        self.load_pdptes(pdptes);
         true
     }
 
     fn set_cr4(&mut self, v: u64) -> bool {
-        let old = self.rd(GUEST_CR4);
+        let cr0 = self.cr0();
+        let Some(pdptes) = self.pdptes_for(cr0, v) else { return false };
         self.wr(CR4_SHADOW, v);
         self.wr(GUEST_CR4, v | CR4_VMXE);
-        if (old ^ v) & walk::CR4_PAE != 0 {
-            self.load_pdptes();
-        }
+        self.load_pdptes(pdptes);
         true
     }
 

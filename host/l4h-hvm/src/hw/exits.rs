@@ -119,6 +119,28 @@ pub fn seg_of(n: u64) -> Option<Seg> {
     })
 }
 
+/// CR4 bits whose change makes a CPU in PAE paging load the PDPTEs again,
+/// and CR0's (SDM 4.4.1; KVM's kvm_set_cr0/cr4).
+const PDPTE_CR4: u64 = (1 << 5) | (1 << 7) | (1 << 4) | (1 << 20);
+const PDPTE_CR0: u64 = CR0_PG | CR0_CD | CR0_NW;
+
+/// Whether a MOV to CR0 or CR4 from (`old_cr0`, `old_cr4`) to (`cr0`,
+/// `cr4`), with `efer`, loads the PAE PDPTEs (32-bit PAE paging after it):
+/// they are checked then, and a bad one is the MOV's #GP.
+pub fn needs_pae_pdptes(old_cr0: u64, cr0: u64, old_cr4: u64, cr4: u64, efer: u64) -> bool {
+    cr0 & CR0_PG != 0
+        && cr4 & (1 << 5) != 0
+        && efer & (1 << 8) == 0
+        && ((old_cr0 ^ cr0) & PDPTE_CR0 != 0 || (old_cr4 ^ cr4) & PDPTE_CR4 != 0)
+}
+
+/// Whether PAE PDPTEs are valid (SDM table 4-8): a present one has none of
+/// its reserved bits (2:1, 8:5, and from `phys_bits` up).
+pub fn pae_pdptes_valid(pdptes: &[u64; 4], phys_bits: u32) -> bool {
+    let rsvd = 0x1e6u64 | (!0u64).checked_shl(phys_bits.min(63)).unwrap_or(0);
+    pdptes.iter().all(|&e| e & 1 == 0 || e & rsvd == 0)
+}
+
 // ---- AMD-V.
 
 pub const SVM_EVT_VALID: u64 = 1 << 31;
@@ -274,6 +296,36 @@ mod tests {
             Exit::Io { port: 0x3f8, size: 4, input: false, string: true, rep: true, addr: 4, seg: Some(Seg::Fs) });
         assert_eq!(vmx_exit(48, 2, 0, 0, 0xfee0_0300, never), Exit::Mmio { gpa: 0xfee0_0300, write: true });
         assert_eq!(vmx_exit(1 << 31 | 33, 0, 0, 0, 0, never), Exit::Fatal(1 << 31 | 33));
+    }
+
+    #[test]
+    fn pae_pdptes_checked_when_loaded() {
+        let good = [0x1001, 0x2001, 0, 0x3001 | 1 << 3 | 1 << 4 | 0xe00];
+        assert!(pae_pdptes_valid(&good, 40));
+        for bad in [1u64 << 1, 1 << 2, 1 << 5, 1 << 6, 1 << 7, 1 << 8, 1 << 40, 1 << 63] {
+            let mut p = good;
+            p[2] = 0x4001 | bad;
+            assert!(!pae_pdptes_valid(&p, 40), "{bad:#x}");
+        }
+        // Not present: its other bits are not looked at.
+        assert!(pae_pdptes_valid(&[0x1001, 0x1e6 | 1 << 50, 0, 0], 40));
+        assert!(pae_pdptes_valid(&[0x1001 | 1 << 46, 0, 0, 0], 47));
+        assert!(!pae_pdptes_valid(&[0x1001 | 1 << 47, 0, 0, 0], 47));
+        // Loaded when paging ends up 32-bit PAE and PG, CD, NW or PAE, PGE,
+        // PSE, SMEP change; never for long mode's.
+        let (pg, pae) = (CR0_PG, 1u64 << 5);
+        assert!(needs_pae_pdptes(CR0_PE, CR0_PE | pg, pae, pae, 0));
+        assert!(needs_pae_pdptes(CR0_PE | pg, CR0_PE | pg | CR0_CD, pae, pae, 0));
+        assert!(needs_pae_pdptes(CR0_PE | pg | CR0_CD | CR0_NW, CR0_PE | pg | CR0_CD, pae, pae, 0));
+        for b in [1u64 << 7, 1 << 4, 1 << 20] {
+            assert!(needs_pae_pdptes(CR0_PE | pg, CR0_PE | pg, pae, pae | b, 0), "CR4 bit {b:#x}");
+        }
+        assert!(needs_pae_pdptes(CR0_PE | pg, CR0_PE | pg, 0, pae, 0));
+        assert!(!needs_pae_pdptes(CR0_PE | pg, CR0_PE | pg | (1 << 16), pae, pae, 0), "WP alone");
+        assert!(!needs_pae_pdptes(CR0_PE | pg, CR0_PE | pg, pae, pae | 1 << 9, 0), "OSFXSR alone");
+        assert!(!needs_pae_pdptes(CR0_PE, CR0_PE | pg, pae, pae, 1 << 8), "long mode");
+        assert!(!needs_pae_pdptes(CR0_PE, CR0_PE | pg, 0, 0, 0), "32-bit paging");
+        assert!(!needs_pae_pdptes(CR0_PE | pg, CR0_PE, pae, pae, 0), "paging off");
     }
 
     #[test]

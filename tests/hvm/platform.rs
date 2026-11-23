@@ -100,8 +100,10 @@ impl Hw for Guest {
     fn nmi_blocked(&self) -> bool {
         false
     }
+    /// The CPU's CR0 (VT-x's GUEST_CR0) has no CD or NW, which seL4 keeps
+    /// off: only the guest's view (`cr0()`, the shadow) has them.
     fn paging(&mut self) -> Paging {
-        Paging { cr0: self.cr0, cr3: self.cr3, cr4: self.cr4, efer: self.efer }
+        Paging { cr0: self.cr0 & !(1 << 30 | 1 << 29), cr3: self.cr3, cr4: self.cr4, efer: self.efer }
     }
     fn mode(&mut self) -> Mode {
         match (self.efer & walk::EFER_LMA != 0, self.compat) {
@@ -456,7 +458,8 @@ fn guest_boots_and_uses_the_machine() {
         cfg.devices[d].kind = host::VDEV_BLK_UNAVAILABLE;
     }
     let tsc_hz = 1_000_000_000;
-    crate::vm::build(cfg, tsc_hz, mem, true, 7).expect("the machine");
+    let host = crate::vm::Host { amd: true, xcr0: 7, pcid: true, phys_bits: 40 };
+    crate::vm::build(cfg, tsc_hz, mem, host).expect("the machine");
     crate::io::init();
     let mem = &vm().mem;
 
@@ -798,9 +801,28 @@ fn guest_boots_and_uses_the_machine() {
     assert_eq!(c0.hw().flushes, flushes + 4, "CD flushes");
     assert_eq!(mov_cr(&mut c0, 0, pe | pg | wp | 0x10 | cd | nw), None);
     assert_eq!(c0.hw().flushes, flushes + 5, "NW flushes");
+    assert_eq!(mov_cr(&mut c0, 0, pe | pg | wp | 0x10), None);
+    assert_eq!(c0.hw().flushes, flushes + 6, "CD and NW off flush (as the guest saw CR0)");
     assert_eq!(mov_cr(&mut c0, 0, pe | pg | wp | 0x10 | nw), gp, "NW without CD");
     assert_eq!(mov_cr(&mut c0, 4, pae | 1 << 12), gp, "LA57");
     assert_eq!(c0.hw().cr4, pae);
+    // PCIDE: only with PCIDs, and turned on only with CR3[11:0] clear; once
+    // on, other bits change whatever CR3[11:0].
+    let rip = c0.hw().rip;
+    vm().pcid.store(false, Ordering::SeqCst);
+    assert_eq!(mov_cr(&mut c0, 4, pae | pcide), gp, "no PCIDs");
+    vm().pcid.store(true, Ordering::SeqCst);
+    let cr3 = c0.hw().cr3;
+    c0.hw().cr3 = cr3 | 0x5;
+    assert_eq!(mov_cr(&mut c0, 4, pae | pcide), gp, "CR3[11:0] not clear");
+    assert_eq!((c0.hw().cr4, c0.hw().rip), (pae, rip), "CR4 and RIP as they were");
+    c0.hw().cr3 = cr3;
+    assert_eq!(mov_cr(&mut c0, 4, pae | pcide), None, "PCIDE on");
+    c0.hw().cr3 = cr3 | 0x5;
+    assert_eq!(mov_cr(&mut c0, 4, pae | pcide | 1 << 7), None, "PGE with PCIDE on, CR3[11:0] set");
+    assert_eq!(c0.hw().cr4, pae | pcide | 1 << 7);
+    assert_eq!(mov_cr(&mut c0, 4, pae), None);
+    c0.hw().cr3 = cr3;
     c0.hw().cr0 = pe | pg | 0x10;
 
     // ---- String I/O and MMIO through the guest's own page tables: an
@@ -866,10 +888,11 @@ fn guest_boots_and_uses_the_machine() {
         pio(&mut c0, 0, 0xcf8, 4, Some(0));
         assert!(mem.write_bytes(CODE, code));
         let h = c0.hw();
-        (h.rip, h.g[6], h.len) = (CODE, L + 0x10 - 0x1000, 2);
+        (h.rip, h.g[6], h.len) = (CODE, L + 0x10 - 0x1000, code.len() as u64);
         h.rflags &= !(1 << 10);
         h.exits.push_back(Exit::Io { port: 0xcf8, size: 4, input: false, string: true, rep: false, addr: 8, seg });
         turn(&mut c0, 0);
+        assert_eq!(c0.hw().rip, CODE + code.len() as u64, "past all {} bytes", code.len());
         assert_eq!(pio(&mut c0, 0, 0xcf8, 4, None), 0x8000_1010, "OUTSD from FS: ({seg:?}, {code:x?})");
     }
     c0.hw().fs_base = 0;

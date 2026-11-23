@@ -450,8 +450,16 @@ impl<H: Hw> Vcpu<H> {
                 // Nothing outside the allowed (no LA57: 4-level paging, as
                 // walk.rs has it); in IA-32e mode (EFER.LMA, compatibility
                 // mode too) PAE kept, and PCIDE only there.
-                let lma = self.hw.paging().efer & walk::EFER_LMA != 0;
-                if v & !CR4_ALLOWED != 0 || (lma && v & walk::CR4_PAE == 0) || (!lma && v & CR4_PCIDE != 0) || !self.hw.set_cr4(v) {
+                // PCIDE needs PCIDs, and turning it on CR3[11:0] clear.
+                let p = self.hw.paging();
+                let lma = p.efer & walk::EFER_LMA != 0;
+                let pcide_on = old & CR4_PCIDE == 0 && v & CR4_PCIDE != 0;
+                if v & !CR4_ALLOWED != 0
+                    || (lma && v & walk::CR4_PAE == 0)
+                    || (v & CR4_PCIDE != 0 && (!lma || !vm().pcid.load(Ordering::Relaxed)))
+                    || (pcide_on && p.cr3 & 0xfff != 0)
+                    || !self.hw.set_cr4(v)
+                {
                     return self.gp();
                 }
                 if (old ^ v) & CR4_FLUSH != 0 {

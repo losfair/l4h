@@ -73,10 +73,10 @@ fn main(info: &'static Info) -> ! {
     let mem = guest::GuestMem { base: hv::RAM_VA, low: cfg.low_ram, high: cfg.high_ram, mapped: &MAPPED, map: sys::map };
     // Mapping works before the machine is made: loading the kernel maps.
     ept::init(mem, cfg.block_radix, cfg.guest_id);
-    let amd = vcpu::host_cpuid(0, 0)[1] == u32::from_le_bytes(*b"Auth");
-    let xcr0 = x86::cpuid::xcr0_supported(&vcpu::host_cpuid);
+    let host = vm::Host::of(&vcpu::host_cpuid);
+    let amd = host.amd;
     // The kernel, its boot parameters and the ACPI tables.
-    if let Err(e) = vm::build(cfg, tsc_hz, mem, amd, xcr0) {
+    if let Err(e) = vm::build(cfg, tsc_hz, mem, host) {
         stop(format_args!("guest {}: kernel image at {:#x}: {:?}", cfg.guest_id, cfg.kernel_gpa, e));
     }
     l4h_rt::info!("l4h-hvm: guest {}: {} vCPU(s) on {}, entry {:#x}", cfg.guest_id, vcpus, if amd { "AMD-V" } else { "VT-x" }, vm::vm().entry.rip);
