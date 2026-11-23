@@ -91,6 +91,11 @@ impl Queue {
         Some(head)
     }
 
+    /// The driver's avail index: how many chains it has added.
+    pub fn avail_idx(&self, mem: &GuestMem) -> u16 {
+        mem.read::<u16>(self.avail + 2)
+    }
+
     /// Whether the driver added chains not yet popped.
     pub fn has_avail(&self, mem: &GuestMem) -> bool {
         self.ready && mem.read::<u16>(self.avail + 2) != self.last_avail

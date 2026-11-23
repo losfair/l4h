@@ -240,7 +240,7 @@ pub fn timer() -> u64 {
 /// have work, a vCPU kicked, or `spin` ticks pass.
 pub fn poll_spin(spin: u64) {
     let vm = vm();
-    let end = vm::now().wrapping_add(spin);
+    let start = vm::now();
     loop {
         for (slot, d) in io().slots.iter().enumerate() {
             let Some(d) = d.as_ref() else { continue };
@@ -248,7 +248,7 @@ pub fn poll_spin(spin: u64) {
                 return;
             }
         }
-        if vm::now() >= end {
+        if vm::now().wrapping_sub(start) >= spin {
             return;
         }
         core::hint::spin_loop();

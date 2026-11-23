@@ -56,6 +56,9 @@ pub struct Net {
     /// queue last had work.
     poll_ticks: u64,
     last_work: [u64; 2],
+    /// The receive queue's avail index when a frame last found too few
+    /// buffers: it waits until the driver adds more.
+    rx_short: Option<u16>,
     config: [u8; 32],
 }
 
@@ -67,7 +70,7 @@ impl Net {
         config[0..6].copy_from_slice(&mac);
         config[10..12].copy_from_slice(&((net::MTU_FRAME - 14) as u16).to_le_bytes());
         let mut n = Net { chan, tx: Producer::new(net::RING_SIZE), rx: Consumer::new(net::RING_SIZE), kick, link, tx_blocked: false, more: 0, mrg: false,
-            poll_ticks, last_work: [0; 2], config };
+            poll_ticks, last_work: [0; 2], rx_short: None, config };
         n.link_config();
         n
     }
@@ -97,7 +100,7 @@ impl Net {
                 break;
             }
             let Some(head) = q.pop(mem) else {
-                if self.keep_polling(TX) {
+                if self.keep_polling(TX, returned) {
                     break;
                 }
                 if q.enable_notify(mem) {
@@ -141,9 +144,6 @@ impl Net {
             q.push(mem, head, 0);
             returned = true;
         }
-        if returned {
-            self.last_work[TX] = l4h_rt::host::ticks::now();
-        }
         if left == 0 || self.tx_blocked {
             // Back for more (complete, retry) without a notification:
             // ask for one all the same, in case that never comes.
@@ -156,9 +156,14 @@ impl Net {
     }
 
     /// Whether queue `q`, out of entries now, is still polled (`more`),
-    /// its notifications left off.
-    fn keep_polling(&mut self, q: usize) -> bool {
-        if self.poll_ticks == 0 || l4h_rt::host::ticks::now().wrapping_sub(self.last_work[q]) >= self.poll_ticks {
+    /// its notifications left off; `worked`: this turn took entries (the
+    /// poll starts now, not at the last turn that did).
+    fn keep_polling(&mut self, q: usize, worked: bool) -> bool {
+        let now = l4h_rt::host::ticks::now();
+        if worked {
+            self.last_work[q] = now;
+        }
+        if self.poll_ticks == 0 || now.wrapping_sub(self.last_work[q]) >= self.poll_ticks {
             return false;
         }
         self.more |= 1 << q;
@@ -174,6 +179,15 @@ impl Net {
             if unsafe { self.rx.ready(&(*self.chan).rx) } == 0 {
                 break;
             }
+            // A frame waiting for buffers waits until the driver adds
+            // some: copying it into the same ones again would do nothing.
+            if self.rx_short.is_some_and(|seen| q.avail_idx(mem) == seen) {
+                if !self.keep_polling(RX, returned) && q.enable_notify_more(mem) {
+                    continue;
+                }
+                break;
+            }
+            self.rx_short = None;
             left -= 1;
             // The frame goes into one chain, or with mergeable buffers
             // into as many as it takes (num_buffers in its header), all
@@ -240,14 +254,9 @@ impl Net {
                 // more (the event index would leave refills unannounced),
                 // unless it already has.
                 q.unpop(heads.len() as u16);
-                if self.keep_polling(RX) {
-                    break;
-                }
-                if q.enable_notify_more(mem) {
-                    left += 1;
-                    continue;
-                }
-                break;
+                self.rx_short = Some(q.avail_idx(mem));
+                left += 1;
+                continue;
             }
             // Delivered, or dropped (a bad chain, or one chain too small
             // without mergeable buffers): those then complete empty.
@@ -350,7 +359,9 @@ impl Backend for Net {
         // Entries to send, frames to deliver and buffers for them, room
         // again for frames waiting to be sent.
         queues[TX].has_avail(mem)
-            || (queues[RX].has_avail(mem) && unsafe { self.rx.ready(&(*self.chan).rx) } != 0)
+            || (queues[RX].has_avail(mem)
+                && unsafe { self.rx.ready(&(*self.chan).rx) } != 0
+                && self.rx_short.is_none_or(|seen| queues[RX].avail_idx(mem) != seen))
             || (self.tx_blocked && !self.tx_full())
     }
 
@@ -368,6 +379,9 @@ impl Backend for Net {
         // Nothing of the guest's is with netd: frames are copied.
         self.tx_blocked = false;
         self.more = 0;
+        self.mrg = false;
+        self.last_work = [0; 2];
+        self.rx_short = None;
         unsafe {
             addr_of_mut!((*self.chan).rx_csum).write_volatile(0);
             addr_of_mut!((*self.chan).rx_gso).write_volatile(0);
@@ -409,8 +423,11 @@ mod tests {
         assert_eq!(n.kick(&mem, &mut qs, RX), 0);
         assert_eq!(mem.read::<u16>(0x3002), 0, "nothing used");
         assert_eq!(port.rx.tail.load(Ordering::Relaxed), 0, "the frame waits");
+        assert!(!n.ready(&mem, &qs), "no work until the driver adds buffers");
+        assert_eq!(n.kick(&mem, &mut qs, RX), 0, "not copied again into the same buffers");
         // A third buffer: three used entries, num_buffers 3, every byte.
         mem.write::<u16>(0x2002, 3);
+        assert!(n.ready(&mem, &qs));
         assert_eq!(n.kick(&mem, &mut qs, RX), 1 << RX);
         assert_eq!(mem.read::<u16>(0x3002), 3);
         let lens: std::vec::Vec<u32> = (0..3).map(|k| mem.read::<u32>(0x3008 + 8 * k)).collect();
