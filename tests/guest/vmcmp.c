@@ -269,6 +269,15 @@ int main(int argc, char **argv)
 {
 	if (argc > 1 && !strcmp(argv[1], "spin"))
 		return spin();
+	if (argc > 1 && !strcmp(argv[1], "cpuidspin")) {
+		/* 3 s of CPUID exits, for counting from the host. */
+		double t0 = now();
+		unsigned a, b, c, d;
+		while (now() - t0 < 3)
+			for (int i = 0; i < 1000; i++)
+				__asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0), "c"(0));
+		return 0;
+	}
 	print_xcr0();
 	bench_frontend();
 	bench_fresh_page();

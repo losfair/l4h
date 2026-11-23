@@ -68,7 +68,7 @@ if [ "${HB_MODE:-l4h}" = kvm ]; then
         -smp "${L4H_SMP:-4}" -m "${L4H_MEM:-3G}" -name kvmbase,debug-threads=on -mem-prealloc -display none -vga none -nic none -no-reboot -monitor none \
         -drive file="$out/hvmbench.img",if=none,id=d0,format=raw,cache=none,aio=native -device virtio-blk-pci,drive=d0,disable-legacy=on \
         -serial "file:$log" -kernel "$kernel" -initrd "$out/kvmbase.cpio.gz" \
-        -append "console=ttyS0 quiet panic=-1 HB_MEM=${HB_MEM:-1024} HB_REPS=${HB_REPS:-1}${HB_SPIN:+ HB_SPIN=1}${HB_GUEST_ARGS:+ HB_GUEST_ARGS=$HB_GUEST_ARGS}${HB_KVMAMD_ARGS:+ HB_KVMAMD_ARGS=$HB_KVMAMD_ARGS}${HB_L1_THP:+ HB_L1_THP=$HB_L1_THP}${HB_KVM_ARGS:+ HB_KVM_ARGS=$HB_KVM_ARGS}${HB_L2QEMU_ARGS:+ HB_L2QEMU_ARGS=$HB_L2QEMU_ARGS}" </dev/null || true
+        -append "console=ttyS0 quiet panic=-1 HB_MEM=${HB_MEM:-1024} HB_REPS=${HB_REPS:-1}${HB_SPIN:+ HB_SPIN=1}${HB_CPUIDSPIN:+ HB_CPUIDSPIN=1}${HB_GUEST_ARGS:+ HB_GUEST_ARGS=$HB_GUEST_ARGS}${HB_KVMAMD_ARGS:+ HB_KVMAMD_ARGS=$HB_KVMAMD_ARGS}${HB_L1_THP:+ HB_L1_THP=$HB_L1_THP}${HB_KVM_ARGS:+ HB_KVM_ARGS=$HB_KVM_ARGS}${HB_L2QEMU_ARGS:+ HB_L2QEMU_ARGS=$HB_L2QEMU_ARGS}" </dev/null || true
     grep -a "HVMBENCH" "$log" || true
     grep -aq "HVMBENCH: done" "$log"
     exit
@@ -77,6 +77,6 @@ export L4H_QEMU_CPU=${L4H_QEMU_CPU:-host,+invtsc}
 L4H_MEM=${L4H_MEM:-3G} L4H_DOM0_DISKS=0 L4H_DOM0_MEM_MB=512 L4H_SMP=${L4H_SMP:-4} \
 L4H_QEMU_ARGS="-name l4h,debug-threads=on -mem-prealloc -drive file=$out/hvmbench.img,if=none,id=d0,format=raw,cache=none,aio=native -device virtio-blk-pci,drive=d0,disable-legacy=on" \
     "$root/tools/run-dom0.sh" "$out/hvmbench.cpio.gz" \
-    "console=hvc0 HB_MEM=${HB_MEM:-1024} HB_VCPUS=${HB_VCPUS:-1} HB_KINDS=${HB_KINDS:-pv,hvm} HB_REPS=${HB_REPS:-1}${HB_SPIN:+ HB_SPIN=1}" \
+    "console=hvc0 HB_MEM=${HB_MEM:-1024} HB_VCPUS=${HB_VCPUS:-1} HB_KINDS=${HB_KINDS:-pv,hvm} HB_REPS=${HB_REPS:-1}${HB_SPIN:+ HB_SPIN=1}${HB_CPUIDSPIN:+ HB_CPUIDSPIN=1}" \
     ${HVMBENCH_TIMEOUT:-900} | grep -a "HVMBENCH" || true
 grep -aq "HVMBENCH: done" "$root/build/qemu.log"

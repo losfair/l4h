@@ -15,6 +15,10 @@ echo "VMCMP: tsc $(dmesg | grep -m1 -o "tsc: Refined.*\|tsc: Detected.*\|kvm-clo
     echo "VMCMP: cmdline $(cat /proc/cmdline); HZ timer irqs $(grep -m1 -E 'LOC|timer' /proc/interrupts | tr -s ' ')"
 }
 echo "VMCMP: thp $(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || echo none)"
+if grep -qw cpuidspin /proc/cmdline; then
+    echo "VMCMP: cpuidspin start"
+    /bin/vmcmp cpuidspin
+fi
 if grep -qw spin /proc/cmdline; then
     echo "VMCMP: spin start"
     /bin/vmcmp spin

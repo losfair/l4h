@@ -34,7 +34,7 @@ for r in $(seq 1 "$reps"); do
     /usr/bin/qemu-system-x86_64 -accel kvm -cpu host -m "$mem" -smp 1 -nodefaults -no-user-config ${HB_L2QEMU_ARGS:-} \
         -display none -vga none -no-reboot -monitor none -serial stdio \
         -L /usr/share/seabios -L /usr/share/qemu \
-        -kernel /bin/bzImage -initrd /bin/vmcmp.cpio.gz -append "console=ttyS0${HB_SPIN:+ spin}${HB_GUEST_ARGS:+ $HB_GUEST_ARGS}" \
+        -kernel /bin/bzImage -initrd /bin/vmcmp.cpio.gz -append "console=ttyS0${HB_SPIN:+ spin}${HB_CPUIDSPIN:+ cpuidspin}${HB_GUEST_ARGS:+ $HB_GUEST_ARGS}" \
         -drive file=$disk,if=none,id=d0,format=raw,cache=none,aio=native -device virtio-blk-pci,drive=d0 \
         $nic </dev/null > /tmp/out 2>&1 &
     q=$!

@@ -16,7 +16,7 @@ for r in $(seq 1 "$reps"); do
 for kind in $kinds; do
     case $kind in
     pv)  args="--initrd /bin/vmcmp.cpio.gz"; cmd="console=hvc0${HB_SPIN:+ spin}" ;;
-    hvm) args="--hvm --kernel /bin/bzImage --initrd /bin/vmcmp.cpio.gz"; cmd="console=ttyS0${HB_SPIN:+ spin}" ;;
+    hvm) args="--hvm --kernel /bin/bzImage --initrd /bin/vmcmp.cpio.gz"; cmd="console=ttyS0${HB_SPIN:+ spin}${HB_CPUIDSPIN:+ cpuidspin}" ;;
     esac
     t0=$(mstime)
     id=$(l4hctl create "$kind$r" $args --cmdline "$cmd" --mem "$mem" --vcpus "$vcpus" --disk 0 --nic "$sw") || fail "create $kind"
