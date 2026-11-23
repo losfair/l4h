@@ -442,7 +442,8 @@ pub fn spawn(
         let bytes = unsafe {
             core::slice::from_raw_parts(cfg as *const hv::HvmConfig as *const u8, core::mem::size_of::<hv::HvmConfig>())
         };
-        let core = g.vcpus[0].core;
+        // sched::prepare_vmm's choice (hvm_monitor_core).
+        let core = g.vmm_limits.map_or(g.vcpus[0].core, |(core, _)| core);
         let args = SpawnArgs {
             id: g.id as u32,
             kind: host::KIND_HVM,

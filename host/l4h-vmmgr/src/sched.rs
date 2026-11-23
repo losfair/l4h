@@ -153,12 +153,33 @@ pub fn start(h: &mut Vmmgr, gid: usize) -> Result<(), Errno> {
     Ok(())
 }
 
+/// The core an HVM guest's monitor (l4h-hvm, whose I/O thread does its
+/// devices' work) runs on: the least loaded core none of the guest's vCPUs
+/// is on (`place`'s weights), so that device work runs beside the vCPUs,
+/// as Linux's vhost workers do, rather than taking turns with them; vCPU
+/// 0's if they are on every core.  Its budget is the guest's VMM share all
+/// the same (`plan`), and a core it shares with another guest limits it as
+/// any VMM sharing a core (`protect`).
+fn hvm_monitor_core(h: &Vmmgr, g: &Guest) -> usize {
+    let mut load = [0usize; topology::MAX_CPUS];
+    for o in h.guests.iter().flatten().filter(|o| o.state != State::Stopped && o.id != g.id) {
+        for v in &o.vcpus { load[v.core] += 1; }
+        if let Some((core, _)) = o.vmm_limits { load[core] += 2; }
+    }
+    let own = g.vcpus.iter().fold(0u64, |m, v| m | (1 << v.core));
+    (0..h.info.cores.min(topology::MAX_CPUS))
+        .filter(|&c| own & (1 << c) == 0)
+        .min_by_key(|&c| load[c])
+        .unwrap_or(g.vcpus[0].core)
+}
+
 /// Charge the VMM to vCPU 0 before it starts. Boosted VMMs have independent
 /// budgets; other guests reserve CPU only after protection is active.
 pub fn prepare_vmm(h: &mut Vmmgr, g: &mut Guest) -> Option<budget::Plan> {
-    let core = g.vcpus[0].core;
+    let vcore = g.vcpus[0].core;
+    let core = if g.hvm.is_some() { hvm_monitor_core(h, g) } else { vcore };
     let p = plan(&h.info, g, 0, true, 0);
-    if !pair(&h.info, g.id, 0, &g.vcpus[0], core, p) {
+    if !pair(&h.info, g.id, 0, &g.vcpus[0], vcore, p) {
         g.stop();
         return None;
     }
