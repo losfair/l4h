@@ -1,0 +1,52 @@
+--- a/fs/proc/meminfo.c
++++ b/fs/proc/meminfo.c
+@@ -31,6 +31,8 @@ static void show_val_kb(struct seq_file *m, const char *s, unsigned long num)
+ 	seq_write(m, " kB\n", 4);
+ }
+ 
++extern unsigned long l4h_memhp_claimable_pages(void);
++
+ static int meminfo_proc_show(struct seq_file *m, void *v)
+ {
+ 	struct sysinfo i;
+@@ -56,6 +58,13 @@ static int meminfo_proc_show(struct seq_file *m, void *v)
+ 	available = si_mem_available();
+ 	sreclaimable = global_node_page_state_pages(NR_SLAB_RECLAIMABLE_B);
+ 	sunreclaim = global_node_page_state_pages(NR_SLAB_UNRECLAIMABLE_B);
++	{
++		unsigned long claimable = l4h_memhp_claimable_pages();
++
++		i.totalram += claimable;
++		i.freeram += claimable;
++		available += claimable;
++	}
+ 
+ 	show_val_kb(m, "MemTotal:       ", i.totalram);
+ 	show_val_kb(m, "MemFree:        ", i.freeram);
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@ -2892,6 +2892,11 @@ SYSCALL_DEFINE3(getcpu, unsigned __user *, cpup, unsigned __user *, nodep,
+ 	return err ? -EFAULT : 0;
+ }
+ 
++unsigned long __weak l4h_memhp_claimable_pages(void)
++{
++	return 0;
++}
++
+ /**
+  * do_sysinfo - fill in sysinfo struct
+  * @info: pointer to buffer to fill
+@@ -2913,6 +2918,12 @@ static int do_sysinfo(struct sysinfo *info)
+ 	info->procs = nr_threads;
+ 
+ 	si_meminfo(info);
++	{
++		unsigned long claimable = l4h_memhp_claimable_pages();
++
++		info->totalram += claimable;
++		info->freeram += claimable;
++	}
+ 	si_swapinfo(info);
+ 
+ 	/*

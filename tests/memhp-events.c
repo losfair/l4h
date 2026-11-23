@@ -11,6 +11,7 @@
 
 typedef l4h_u32 u32;
 typedef int irqreturn_t;
+typedef struct { int v; } atomic_t;
 #define IRQ_HANDLED 1
 #define HZ 100
 #define RETRY_BUSY HZ
@@ -32,12 +33,15 @@ static unsigned int region_count = 4;
 static u32 mem_seq, mem_target;
 static unsigned long mem_kick;
 static unsigned long added[1], pending[1];
-static int mem_wq, memhp_mutex, system_wq;
+static int mem_wq, memhp_mutex, memhp_wq;
+static atomic_t plugged_blocks, ceiling_blocks;
+static bool demand_mode;
 static int queued_delay, requests, wakes;
 static bool immediate_completion, target_during_completion, target_before_publish;
 
 static irqreturn_t memhp_interrupt(int irq, void *data);
 static long mem_call(unsigned long op, unsigned int m);
+static void atomic_set(atomic_t *a, int v) { a->v = v; }
 static void mutex_lock(int *m) { (void)m; }
 static void mutex_unlock(int *m) { (void)m; }
 static void wake_up(int *q) { (void)q; wakes++; }
@@ -46,9 +50,9 @@ static void mod_delayed_work(int q, struct work_struct *w, unsigned long delay)
 	(void)q; (void)w;
 	queued_delay = delay;
 }
-static bool schedule_delayed_work(struct work_struct *w, unsigned long delay)
+static bool queue_delayed_work(int q, struct work_struct *w, unsigned long delay)
 {
-	(void)w;
+	(void)q; (void)w;
 	if (queued_delay >= 0)
 		return false;
 	queued_delay = delay;
@@ -68,9 +72,14 @@ static unsigned int find_first_zero_bit(const unsigned long *map, unsigned int n
 	for (m = 0; m < n && test_bit(m, map); m++);
 	return m;
 }
-static bool can_spare_block(void) { return false; }
-static int unplug(unsigned int m) { (void)m; assert(false); return 0; }
-static long plug(unsigned int m) { return mem_call(L4H_MEM_PLUG, m); }
+static unsigned long reconcile_demand(unsigned int ceiling, unsigned int *np)
+{
+	(void)ceiling; (void)np;
+	assert(false);
+	return 0;
+}
+static int unplug_one(void) { return -EBUSY; }
+static long plug_noreclaim(unsigned int m) { return mem_call(L4H_MEM_PLUG, m); }
 static void write_once(u32 *p, u32 value)
 {
 	if (p == &mem_target && target_before_publish) {
