@@ -43,8 +43,9 @@ if grep -qwE 'vmx|svm' /proc/cpuinfo && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
     [ "${HVMTEST_ALLOW_SKIP:-0}" = 1 ] || require_hw=1
 fi
 echo "HVMTEST: -cpu ${L4H_QEMU_CPU:-(run-qemu.sh default)}"
+rcu_stall='^\[vm[0-9]+\].*rcu: INFO: .* (self-detected stall on CPU|detected stalls on CPUs/tasks)'
 L4H_DOM0_DISKS=0 L4H_DOM0_MEM_MB=512 L4H_SMP=${L4H_SMP:-4} \
-L4H_TEST_FAIL_PATTERN='HVMTEST: FAIL:' \
+L4H_TEST_FAIL_PATTERN="HVMTEST: FAIL:|$rcu_stall" \
 L4H_QEMU_ARGS="-drive file=$out/hvm.img,if=none,id=d0,format=raw -device virtio-blk-pci,drive=d0,disable-legacy=on" \
     "$root/tools/run-dom0.sh" "$out/hvmtest.cpio.gz" "console=hvc0 L4H_TEST_SLOW=$slow" ${HVMTEST_TIMEOUT:-$((900 * slow))} \
     | grep -aE "HVMTEST|HVMVM|NETVM|l4hctl|vm [0-9]|l4h-hvm|panic|l4h-vmmgr: guest|svm|vmx" || true
@@ -56,5 +57,9 @@ if grep -aq "HVMTEST: no VT-x or AMD-V" "$root/build/qemu.log"; then
     fi
     echo "HVMTEST: SKIP (the host has no VT-x or AMD-V)"
     exit 0
+fi
+if grep -aE "$rcu_stall" "$root/build/qemu.log"; then
+    echo 'HVMTEST: FAIL: guest RCU stall' >&2
+    exit 1
 fi
 grep -aq "HVMTEST: PASS" "$root/build/qemu.log"

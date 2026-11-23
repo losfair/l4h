@@ -15,6 +15,12 @@ use super::apic::{self, Message, Shared, Shorthand};
 /// crystal's (x86::cpuid::CRYSTAL_HZ, 25 MHz: a count is 40 ns).
 pub const TIMER_HZ: u64 = crate::x86::cpuid::CRYSTAL_HZ;
 
+/// Leave time for the guest to run after programming an emulated deadline.
+/// On slow VM exits, a short deadline can already be due when WRMSR reaches
+/// the monitor. Delivering it immediately can keep the guest in its timer
+/// handler as it continually rearms the timer.
+const MIN_TSC_DEADLINE_US: u64 = 1_000;
+
 /// IA32_APIC_BASE: the BSP flag, x2APIC mode, global enable.
 pub const BASE_BSP: u64 = 1 << 8;
 pub const BASE_EXTD: u64 = 1 << 10;
@@ -92,7 +98,7 @@ pub struct Lapic {
     lvt: [u32; NR_LVT],
     timer_init: u32,
     timer_div: u32,
-    /// TSC-deadline MSR.
+    /// TSC-deadline MSR, before applying the minimum delay.
     tsc_deadline: u64,
     /// When the timer next fires (TSC), 0 if it does not; its period in
     /// TSC ticks for a periodic timer, and the TSC it last started at.
@@ -445,7 +451,12 @@ impl Lapic {
             MSR_TSC_DEADLINE => {
                 if self.timer_mode() == TimerMode::Deadline {
                     self.tsc_deadline = val;
-                    self.deadline = val;
+                    self.deadline = if val == 0 {
+                        0
+                    } else {
+                        let min_ticks = self.tsc_hz.div_ceil(1_000_000 / MIN_TSC_DEADLINE_US);
+                        val.max(now.saturating_add(min_ticks))
+                    };
                     return Some(Effects { timer: true, ..Default::default() });
                 }
                 Some(Effects::default())
@@ -577,18 +588,46 @@ mod tests {
         assert_eq!(l.deadline(), 80_000);
         assert!(l.tick(&s, 300_000));
         assert_eq!(l.deadline(), 320_000);
-        // TSC-deadline: the MSR is the deadline; it reads 0 once fired.
-        l.write(&s, 0, LVT_TIMER, (2 << 17) | 0xee);
+        // TSC-deadline mode stops the countdown timer. A deadline far enough
+        // in the future fires at the requested time, then the MSR reads 0.
+        let now = 300_000;
+        l.write(&s, now, LVT_TIMER, (2 << 17) | 0xee);
         assert_eq!(l.deadline(), 0, "a mode change stops it");
-        assert!(l.wrmsr(&s, 0, MSR_TSC_DEADLINE, 12345).unwrap().timer);
-        assert_eq!(l.rdmsr(&s, 0, MSR_TSC_DEADLINE), Some(12345));
-        assert!(l.tick(&s, 20000));
-        assert_eq!(l.rdmsr(&s, 0, MSR_TSC_DEADLINE), Some(0));
+        let deadline = 3_000_000;
+        assert!(l.wrmsr(&s, now, MSR_TSC_DEADLINE, deadline).unwrap().timer);
+        assert_eq!(l.deadline(), deadline);
+        assert_eq!(l.rdmsr(&s, now, MSR_TSC_DEADLINE), Some(deadline));
+        assert!(l.tick(&s, deadline));
+        assert_eq!(l.rdmsr(&s, deadline, MSR_TSC_DEADLINE), Some(0));
         // Masked: it fires without an interrupt.
-        l.write(&s, 0, LVT_TIMER, (2 << 17) | LVT_MASKED | 0x20);
-        l.wrmsr(&s, 0, MSR_TSC_DEADLINE, 1).unwrap();
+        l.write(&s, deadline, LVT_TIMER, (2 << 17) | LVT_MASKED | 0x20);
+        l.wrmsr(&s, deadline, MSR_TSC_DEADLINE, 2 * deadline).unwrap();
         s.clear_requests();
-        assert!(l.tick(&s, 2));
+        assert!(l.tick(&s, 2 * deadline));
         assert_eq!(l.pending(&s), None);
+    }
+
+    #[test]
+    fn deadline_timer_leaves_time_for_guest_execution() {
+        let (mut l, s) = setup();
+        l.write(&s, 0, LVT_TIMER, (2 << 17) | 0xee);
+        // The guest can read back its requested deadline. It gets at least
+        // 1 ms (2,000,000 ticks at 2 GHz) after each short or overdue write.
+        for (now, requested) in [(1_000_000, 999_999), (4_000_000, 4_000_001)] {
+            let earliest = now + 2_000_000;
+            assert!(l.wrmsr(&s, now, MSR_TSC_DEADLINE, requested).unwrap().timer);
+            assert_eq!(l.rdmsr(&s, now, MSR_TSC_DEADLINE), Some(requested));
+            assert_eq!(l.deadline(), earliest);
+            assert!(!l.tick(&s, earliest - 1));
+            assert_eq!(l.pending(&s), None);
+            assert!(l.tick(&s, earliest));
+            assert_eq!(l.pending(&s), Some(0xee));
+            assert_eq!(l.rdmsr(&s, earliest, MSR_TSC_DEADLINE), Some(0));
+            s.clear_requests();
+        }
+        l.wrmsr(&s, 7_000_000, MSR_TSC_DEADLINE, 7_000_001).unwrap();
+        assert!(l.wrmsr(&s, 7_000_002, MSR_TSC_DEADLINE, 0).unwrap().timer);
+        assert_eq!(l.deadline(), 0);
+        assert!(!l.tick(&s, 9_000_000));
     }
 }
