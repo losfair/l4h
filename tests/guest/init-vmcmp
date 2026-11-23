@@ -30,11 +30,12 @@ ip link set lo up
 ip addr add 192.168.9.3/24 dev eth0
 ip link set eth0 up
 ping -c 1 -W 5 192.168.9.2 >/dev/null
-ping -c 100 -i 0.005 192.168.9.2 | sed -n 's/.*= \([0-9.]*\)\/\([0-9.]*\)\/.*/BENCH: ping to sink           \2 ms\nBENCH: ping to sink (min)     \1 ms/p'
+ping -c 100 -i 0.005 192.168.9.2 | sed -n 's/.*= \([0-9.]*\)\/\([0-9.]*\)\/\([0-9.]*\).*/BENCH: ping to sink           \2 ms\nBENCH: ping to sink (min)     \1 ms\nBENCH: ping to sink (max)     \3 ms/p'
 if grep -qw netspin /proc/cmdline; then
-    echo "VMCMP: netspin start"
+    echo "VMCMP: netspin start $(grep eth0 /proc/net/dev | tr -s ' ') $(grep -c . /proc/interrupts)"
     netbench send 192.168.9.2 5001 12288
-    echo "VMCMP: netspin end"
+    echo "VMCMP: netspin end $(grep eth0 /proc/net/dev | tr -s ' ')"
+    grep -i "virtio\|LOC\|CAL\|RES" /proc/interrupts | tr -s ' ' | sed 's/^/VMCMP: irq /' 
 fi
 s=$(mstime)
 netbench send 192.168.9.2 5001 512
