@@ -21,14 +21,32 @@ const ROOT_TASK: &[u8] = include_bytes!(env!("L4H_EFI_ROOT_TASK"));
 const GUEST_KERNEL: &[u8] = include_bytes!(env!("L4H_EFI_GUEST_KERNEL"));
 const SDK: &[u8] = include_bytes!(env!("L4H_EFI_SDK"));
 
-/// Measure every external slot, in order, into PCR 9 (with a TPM) and
-/// RTMR[2] (in a trust domain): a present file as its slot's `present`
-/// prefix and its bytes (`buffer`, read after that prefix), a missing one as
-/// its slot's `absent` bytes. Never zero bytes, and never nothing.
+/// Measure every external slot, in order, into RTMR[2] (in a trust domain,
+/// ignoring any TPM) or PCR 9 (outside a trust domain, when a TPM is present):
+/// a present file as its slot's `present` prefix and its bytes (`buffer`, read
+/// after that prefix), a missing one as its slot's `absent` bytes. Never zero
+/// bytes, and never nothing.
 fn measure(
     firmware: &Firmware<'_>,
     slots: &[(&policy::Slot, Option<&[u8]>)],
 ) -> Result<(), Status> {
+    if firmware.is_tdx() {
+        for &(slot, buffer) in slots {
+            let bytes = buffer.unwrap_or(slot.absent);
+            // The one buffer is what policy::measured describes in pieces.
+            debug_assert!(
+                policy::measured(slot, buffer.and_then(|b| b.strip_prefix(slot.present))).concat()
+                    == bytes
+            );
+            // In a trust domain, skip TPM PCR 9 measurement and measure solely
+            // into RTMR[2]. `fw.boot_with_cmdline(...)` enters `fl4-efi::x86::boot`,
+            // which poisons TPM PCRs 0..15 with `EV_SEPARATOR(0xffffffff)` before
+            // `ExitBootServices` (if `EFI_TCG2_PROTOCOL` is exposed) and drops the
+            // TPM event log.
+            firmware.measure_cc_file(slot.name, bytes).map_err(Status)?;
+        }
+        return Ok(());
+    }
     let mut tpm = match boot::get_handle_for_protocol::<Tcg>() {
         Ok(handle) => Some(volume::protocol::<Tcg>(handle).map_err(|e| e.status())?),
         Err(e) if e.status() == Status::NOT_FOUND => None,
@@ -41,8 +59,6 @@ fn measure(
             policy::measured(slot, buffer.and_then(|b| b.strip_prefix(slot.present))).concat()
                 == bytes
         );
-        // TDX measures external bytes independently of an optional vTPM.
-        firmware.measure_cc_file(slot.name, bytes).map_err(Status)?;
         if let Some(tpm) = &mut tpm {
             // Match Monoid's EV_IPL events: the module name padded to 16 bytes.
             let mut label = [0; 16];

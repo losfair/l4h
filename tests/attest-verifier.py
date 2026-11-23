@@ -996,6 +996,13 @@ class EventLog(unittest.TestCase):
             with self.assertRaises(a.Fail, msg=bad[:80].hex()):
                 a.check_event_log(bad, self.replayed())
 
+    def test_error_separator_rejected(self):
+        # Normal EV_SEPARATOR (0x00000000) is already in EVENTS and passes;
+        # error EV_SEPARATOR (0xffffffff) must be rejected.
+        bad = self.log(self.EVENTS + [(4, 0x4, b"\xff\xff\xff\xff")])
+        with self.assertRaisesRegex(a.Fail, r"error EV_SEPARATOR \(0xffffffff\) in PCR 4"):
+            a.replay_event_log(bad)
+
     def test_verify_cli(self):
         Evidence.setUpClass()
         pcrs = {**self.replayed(), a.KEY_PCR: bytes(32)}
@@ -1005,6 +1012,7 @@ class EventLog(unittest.TestCase):
         ev = {"v": 1, "ak": ecc_public(Evidence.ak, Enrollment.AK_ATTRS), "key": key, "pcrs": pcrs, "quote": q,
               "quotesig": tpm_signature(Evidence.ak, q)}
         rep = signed_claims(Evidence.host, {"seal": bitmap(0), "taint": bitmap()})
+        pcr_pins = ["--pcr", "4=" + pcrs[4].hex(), "--pcr", "9=" + pcrs[9].hex()]
         with tempfile.TemporaryDirectory() as d:
             paths = {}
             for name, data in (("ev", cbor(ev)), ("rep", cbor(rep)), ("log", self.log()),
@@ -1013,24 +1021,33 @@ class EventLog(unittest.TestCase):
                 Path(paths[name]).write_bytes(data)
             tool = [sys.executable, str(Path(__file__).resolve().parents[1] / "tools/l4h-attest.py")]
             run = lambda *args: subprocess.run(tool + list(args), capture_output=True, text=True)
-            r = run("verify", paths["rep"], paths["ev"], "--event-log", paths["log"], "--insecure-unpinned-ak")
+            r = run("verify", paths["rep"], paths["ev"], "--event-log", paths["log"],
+                    "--insecure-unpinned-ak", "--insecure-unpinned-measurements")
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertIn('"event_log_events": %d' % len(self.EVENTS), r.stdout)
+            self.assertIn('"measurements_pinned": false', r.stdout)
             self.assertIn("INSECURE: --insecure-unpinned-ak", r.stderr)
-            # The AK not pinned: refused by default; pinned, no warning.
+            self.assertIn("INSECURE: --insecure-unpinned-measurements", r.stderr)
+            # The AK not pinned: refused by default; pinned without PCR 4 & 9: refused by default.
             r = run("verify", paths["rep"], paths["ev"])
             self.assertEqual(r.returncode, 1)
             self.assertRegex(r.stderr, "^l4h-attest: the attestation key is not pinned: .*--ak-name")
             self.assertEqual(r.stdout, "")
             ak = a.tpm_name(ev["ak"]).hex()
-            r = run("verify", paths["rep"], paths["ev"], "--ak-name", ak)
+            for partial in ((), ("--pcr", "4=" + pcrs[4].hex()), ("--pcr", "9=" + pcrs[9].hex())):
+                r = run("verify", paths["rep"], paths["ev"], "--ak-name", ak, *partial)
+                self.assertEqual(r.returncode, 1, partial)
+                self.assertIn("--insecure-unpinned-measurements", r.stderr)
+            # Pinned AK and pinned PCR 4 & 9: passes with no warning.
+            r = run("verify", paths["rep"], paths["ev"], "--ak-name", ak, *pcr_pins)
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertNotIn("event_log_events", r.stdout)
+            self.assertIn('"measurements_pinned": true', r.stdout)
             self.assertNotIn("warning", r.stderr.lower())
-            r = run("verify", paths["rep"], paths["ev"], "--ak-name", "000b" + "00" * 32)
+            r = run("verify", paths["rep"], paths["ev"], "--ak-name", "000b" + "00" * 32, *pcr_pins)
             self.assertEqual(r.returncode, 1)
             self.assertIn("not the pinned one", r.stderr)
-            r = run("verify", paths["rep"], paths["ev"], "--event-log", paths["bad"], "--ak-name", ak)
+            r = run("verify", paths["rep"], paths["ev"], "--event-log", paths["bad"], "--ak-name", ak, *pcr_pins)
             self.assertEqual(r.returncode, 1)
             self.assertRegex(r.stderr, "^l4h-attest: event log does not match the quote: PCR 5 ")
             self.assertNotIn("Traceback", r.stderr)

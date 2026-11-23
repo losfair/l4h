@@ -27,16 +27,13 @@
 //! partition.  Reports and evidence then carry the partition (version 2).
 //!
 //! On an Intel TDX trust domain (TrustdConfig::tdx != TDX_NONE, never in a
-//! multikernel machine) the same key is also bound to the TD (tdx.rs,
-//! tdxrt.rs): a DCAP quote of a TDREPORT over its hash, taken while RTMR 3
-//! is zero, after which RTMR 3 is extended with it.  With a TPM, without
-//! one, or with both: reports need either, and the TDX evidence and fresh
-//! quotes over a guest's report come in requests of their own.  The key's
-//! seed is then the CPU's alone (RDSEED, which the VMM can neither see nor
-//! change), and the key is bound to the TD before the TPM, if any, is
-//! touched; if TDX resources, CPU entropy or TD binding fail, trustd runs
-//! flags-only without touching the vTPM or partition relay.  A TPM with
-//! the ACPI start method (the cloud's AML) is not used.
+//! multikernel machine) any TPM is ignored completely and the key is bound
+//! to the TD alone (tdx.rs, tdxrt.rs): a DCAP quote of a TDREPORT over its
+//! hash, taken while RTMR 3 is zero, after which RTMR 3 is extended with it.
+//! The TDX evidence and fresh quotes over a guest's report come in requests
+//! of their own.  The key's seed is the CPU's alone (RDSEED, which the VMM
+//! can neither see nor change); if TDX resources, CPU entropy or TD binding
+//! fail, trustd runs flags-only without touching any TPM or partition relay.
 //!
 //! Nothing here allocates (DESIGN.md §10): requests are copied, and answers
 //! built, in fixed buffers, and the evidence is made once into one.  The
@@ -445,28 +442,6 @@ fn cpu_seed() -> Option<[u8; 32]> {
 #[cfg(not(target_arch = "x86_64"))]
 fn cpu_seed() -> Option<[u8; 32]> {
     None
-}
-
-/// A TD's state for `key`, already bound to the TD: quoted by the vTPM too
-/// if there is a usable one, else the key alone.  Never the ACPI start
-/// method's: its AML is the cloud's code, run with root's hardware access,
-/// which a TD does not trust (root gives none in a TD; this is a second
-/// line).
-fn td_tpm(cfg: &TrustdConfig, hz: u64, key: SigningKey, t0: u64, partition: Option<u32>) -> State {
-    if matches!(cfg.iface, trust::TPM_NONE | trust::TPM_REMOTE) {
-        return State::keyed(key, partition);
-    }
-    if cfg.start == trust::START_ACPI {
-        l4h_rt::log!("l4h-trustd: TPM with the ACPI start method ignored in a TD: TDX only");
-        return State::keyed(key, partition);
-    }
-    match open_tpm(cfg, hz).and_then(|tpm| init(tpm, key.clone(), t0, hz, partition)) {
-        Ok(s) => s,
-        Err((what, e)) => {
-            l4h_rt::log!("l4h-trustd: TPM unusable, TDX only: {}: {}", what, e);
-            State::keyed(key, partition)
-        }
-    }
 }
 
 /// A key from the CPU alone (a TD's).
@@ -914,14 +889,22 @@ fn main(info: &'static Info) -> ! {
     }
     let cfg: &TrustdConfig = unsafe { info.config() };
     let hz = info.header().tsc_hz;
-    // Root maps the event log read-only here for good, cfg.event_log_size
-    // bytes of it (trust::EVENT_LOG_VA), and nothing writes it.
-    let event_log = mapped_log(trust::EVENT_LOG_VA, cfg.event_log_size, trust::EVENT_LOG_MAX);
-    let cc_event_log = mapped_log(trust::CC_EVENT_LOG_VA, cfg.cc_event_log_size, trust::CC_EVENT_LOG_MAX);
     let t0 = host::ticks::now();
-    // A known TD (TrustdConfig::in_td) takes precedence over TPM and relay
+    // A known TD (TrustdConfig::in_td) completely ignores any TPM and relay
     // paths and never falls back to a non-TD TPM or multikernel relay.
     let in_td = cfg.in_td();
+    // Root maps the event log read-only here for good, cfg.event_log_size
+    // bytes of it (trust::EVENT_LOG_VA), and nothing writes it.
+    // Defense in depth: in a TD, never serve a TPM event log even if present.
+    let event_log = if in_td { &[] } else { mapped_log(trust::EVENT_LOG_VA, cfg.event_log_size, trust::EVENT_LOG_MAX) };
+    let cc_event_log = mapped_log(trust::CC_EVENT_LOG_VA, cfg.cc_event_log_size, trust::CC_EVENT_LOG_MAX);
+    let warn_flags = trust::EVENT_LOG_TRUNCATED | trust::EVENT_LOG_TCG_1_2;
+    if !in_td && cfg.event_log_flags & warn_flags != 0 {
+        l4h_rt::log!("l4h-trustd: warning: TPM event log has anomalous flags {:#x} (truncated/TCG 1.2)", cfg.event_log_flags);
+    }
+    if in_td && cfg.cc_event_log_flags & warn_flags != 0 {
+        l4h_rt::log!("l4h-trustd: warning: CC event log has anomalous flags {:#x} (truncated/TCG 1.2)", cfg.cc_event_log_flags);
+    }
     let mut relay = if in_td { None } else { Relay::new(cfg.partition, cfg.partitions) };
     let partition = relay.as_ref().map(|r| r.index);
     // A secondary's key, until the primary quoted it.
@@ -932,13 +915,10 @@ fn main(info: &'static Info) -> ! {
         if !capable {
             l4h_rt::log!("l4h-trustd: TD without usable TDX attestation: flags only");
         }
-        // Strict TD startup order:
-        // 1. CPU entropy -> key (failure never falls back to vTPM).
-        // 2. Synchronous TDREPORT + check_first_report + RTMR.EXTEND
-        //    (failure never touches vTPM or creates a TPM-only key).
-        // 3. Optional vTPM quotes the same bound key.
-        // 4. Start the GetQuote job with its full 120 s timeout after vTPM
-        //    setup and poll once.
+        // Strict TD startup order (never touching any TPM):
+        // 1. CPU entropy -> key.
+        // 2. Synchronous TDREPORT + check_first_report + RTMR.EXTEND.
+        // 3. Start the GetQuote job with its 120 s timeout and poll once.
         match tdx::td_startup(
             capable,
             || {
@@ -955,7 +935,6 @@ fn main(info: &'static Info) -> ! {
                     Err(why)
                 }
             },
-            |key| td_tpm(cfg, hz, key, t0, partition),
             host::ticks::now,
             |bound, now| {
                 let mut t = bound.start_quote(hz, now);
@@ -970,9 +949,9 @@ fn main(info: &'static Info) -> ! {
             },
         ) {
             None => None,
-            Some((state, quote)) => {
+            Some((key, quote)) => {
                 tdx = quote;
-                Some(state)
+                Some(State::keyed(key, None))
             }
         }
     } else {

@@ -487,6 +487,39 @@ class Tdx(unittest.TestCase):
         self.refused(self.evidence(q), "debug TD")
         _, info = self.check(self.evidence(q), allow_debug=True)
         self.assertTrue(info["debug"])
+        # High TUD bits in td_attributes[0] (e.g. 0x10, 0x20, 0x40, 0x80) are also refused.
+        for bit in (0x10, 0x20, 0x40, 0x80):
+            attrs = bytearray(8)
+            attrs[0] = bit
+            q = make_quote(self.intel, self.fields(td_attributes=bytes(attrs)))
+            self.refused(self.evidence(q), "debug TD")
+            _, info = self.check(self.evidence(q), allow_debug=True)
+            self.assertTrue(info["debug"])
+        # sept_ve_disable (bit 28 -> byte 3 bit 4 = 0x10) and perfmon (bit 63 -> byte 7 bit 7 = 0x80)
+        # are reported without rejecting sept_ve_disable == False.
+        _, info = self.check(self.evidence())
+        self.assertFalse(info["sept_ve_disable"])
+        self.assertFalse(info["perfmon"])
+        attrs = bytearray(8)
+        attrs[3] = 0x10
+        attrs[7] = 0x80
+        q = make_quote(self.intel, self.fields(td_attributes=bytes(attrs)))
+        _, info = self.check(self.evidence(q))
+        self.assertTrue(info["sept_ve_disable"])
+        self.assertTrue(info["perfmon"])
+
+    def test_cc_event_log_error_separator(self):
+        # Normal EV_SEPARATOR (0x00000000) is accepted.
+        good_events = CC_EVENTS + [(2, 0x4, b"\x00\x00\x00\x00")]
+        rtmrs = replay(good_events)
+        q = make_quote(self.intel, self.fields(rtmr0=rtmrs[0], rtmr1=rtmrs[1], rtmr2=rtmrs[2]))
+        _, info = self.check(self.evidence(q), cc_event_log=ccel(good_events))
+        self.assertEqual(info["cc_event_log_events"], len(good_events))
+        # Error EV_SEPARATOR (0xffffffff) is rejected.
+        bad_events = CC_EVENTS + [(2, 0x4, b"\xff\xff\xff\xff")]
+        bad_rtmrs = replay(bad_events)
+        q_bad = make_quote(self.intel, self.fields(rtmr0=bad_rtmrs[0], rtmr1=bad_rtmrs[1], rtmr2=bad_rtmrs[2]))
+        self.refused(self.evidence(q_bad), r"error EV_SEPARATOR \(0xffffffff\) in RTMR 1", cc_event_log=ccel(bad_events))
 
     def test_qe_report(self):
         # Its REPORTDATA binds another attestation key.
@@ -931,43 +964,70 @@ class Tdx(unittest.TestCase):
             col = os.path.join(d, "col")
             os.mkdir(col)
             self.collateral(col, tcb=tcb_info([tcb_level("UpToDate", tdx=(3, 0, 5) + (0,) * 13)]))
-            # TDX alone, with collateral and the CC event log.
+            tdx_pins = ["--mrtd", (b"\x11" * 48).hex(), "--rtmr", "1=" + self.rtmrs[1].hex(), "--rtmr", "2=" + self.rtmrs[2].hex()]
+            # TDX alone, with collateral, pinned measurements, and the CC event log.
             r = self.run_tool("verify", p["rep"], p["tdx"], "--intel-root-ca", root, "--collateral-dir", col,
-                              "--cc-event-log", p["log"], "--data", b"cli".hex(), "--rtmr", "1=" + self.rtmrs[1].hex())
+                              "--cc-event-log", p["log"], "--data", b"cli".hex(), *tdx_pins)
             self.assertEqual(r.returncode, 0, r.stderr)
             out = json.loads(r.stdout)
             self.assertEqual(set(out), {"tdx", "guest"})
             self.assertEqual(out["tdx"]["tcb_status"], "UpToDate")
             self.assertEqual(out["tdx"]["cc_event_log_events"], len(CC_EVENTS))
-            self.assertNotIn("warning", r.stderr)
-            # Without collateral: refused, unless skipped explicitly (with
-            # a warning).
-            r = self.run_tool("verify", p["rep"], p["tdx"], "--intel-root-ca", root)
+            self.assertTrue(out["tdx"]["measurements_pinned"])
+            self.assertNotIn("warning", r.stderr.lower())
+            # Unpinned TDX measurements are refused by default (missing any of mrtd, rtmr 1, rtmr 2).
+            for partial in (
+                (),
+                ("--mrtd", (b"\x11" * 48).hex()),
+                ("--mrtd", (b"\x11" * 48).hex(), "--rtmr", "1=" + self.rtmrs[1].hex()),
+                ("--rtmr", "1=" + self.rtmrs[1].hex(), "--rtmr", "2=" + self.rtmrs[2].hex()),
+            ):
+                r = self.run_tool("verify", p["rep"], p["tdx"], "--intel-root-ca", root, "--collateral-dir", col, *partial)
+                self.assertEqual(r.returncode, 1, partial)
+                self.assertIn("--insecure-unpinned-measurements", r.stderr)
+            # With --insecure-unpinned-measurements: passes with INSECURE warning and measurements_pinned=False.
+            r = self.run_tool("verify", p["rep"], p["tdx"], "--intel-root-ca", root, "--collateral-dir", col,
+                              "--insecure-unpinned-measurements")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("INSECURE: --insecure-unpinned-measurements", r.stderr)
+            self.assertFalse(json.loads(r.stdout)["tdx"]["measurements_pinned"])
+            # Without collateral: refused, unless skipped explicitly (with a warning).
+            r = self.run_tool("verify", p["rep"], p["tdx"], "--intel-root-ca", root, *tdx_pins)
             self.assertEqual(r.returncode, 1)
             self.assertIn("--collateral-dir", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
-            r = self.run_tool("verify", p["rep"], p["tdx"], "--intel-root-ca", root, "--insecure-skip-collateral")
+            r = self.run_tool("verify", p["rep"], p["tdx"], "--intel-root-ca", root, "--insecure-skip-collateral", *tdx_pins)
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertIn("INSECURE", r.stderr)
             self.assertIn("NOT checked", r.stderr)
             # Without the root: refused.
-            r = self.run_tool("verify", p["rep"], p["tdx"])
+            r = self.run_tool("verify", p["rep"], p["tdx"], *tdx_pins)
             self.assertEqual(r.returncode, 1)
             self.assertIn("--intel-root-ca", r.stderr)
             # Both, combined (the guest driver's v3) and side by side.
             for args in ((p["both"],), ("--tdx-evidence", p["tdx"], "--tpm-evidence", p["tpm"]), (p["tpm"], "--tdx-evidence", p["tdx"])):
                 r = self.run_tool("verify", p["rep"], *args, "--intel-root-ca", root, "--collateral-dir", col,
-                                  "--insecure-unpinned-ak")
+                                  "--insecure-unpinned-ak", "--insecure-unpinned-measurements")
                 self.assertEqual(r.returncode, 0, (args, r.stderr))
                 out = json.loads(r.stdout)
                 self.assertEqual(set(out), {"host", "tdx", "guest"})
                 self.assertEqual(out["host"]["key"], out["tdx"]["key"])
+            # --ignore-tpm on v=3 combined evidence verifies TDX alone without needing TPM options.
+            r = self.run_tool("verify", p["rep"], p["both"], "--ignore-tpm", "--intel-root-ca", root,
+                              "--collateral-dir", col, *tdx_pins)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(set(json.loads(r.stdout)), {"tdx", "guest"})
+            self.assertNotIn("warning", r.stderr.lower())
+            # --ignore-tpm on pure TPM evidence is refused.
+            r = self.run_tool("verify", p["rep"], p["tpm"], "--ignore-tpm")
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("--ignore-tpm requires TDX evidence", r.stderr)
             # The TPM alone: as before, no TDX in the output.
-            r = self.run_tool("verify", p["rep"], p["tpm"], "--insecure-unpinned-ak")
+            r = self.run_tool("verify", p["rep"], p["tpm"], "--insecure-unpinned-ak", "--insecure-unpinned-measurements")
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertEqual(set(json.loads(r.stdout)), {"host", "guest"})
             # Its AK not pinned: refused by default.
-            r = self.run_tool("verify", p["rep"], p["tpm"])
+            r = self.run_tool("verify", p["rep"], p["tpm"], "--insecure-unpinned-measurements")
             self.assertEqual(r.returncode, 1)
             self.assertIn("--ak-name", r.stderr)
             # TPM evidence alone where TDX was asked for (a host that left
@@ -975,17 +1035,17 @@ class Tdx(unittest.TestCase):
             for opts in (("--intel-root-ca", root), ("--mrtd", "11" * 48), ("--rtmr", "0=" + "00" * 48),
                          ("--collateral-dir", col), ("--cc-event-log", p["log"]), ("--allow-debug",),
                          ("--allow-migratable",), ("--root-ca-crl", root), ("--insecure-skip-collateral",)):
-                r = self.run_tool("verify", p["rep"], p["tpm"], "--insecure-unpinned-ak", *opts)
+                r = self.run_tool("verify", p["rep"], p["tpm"], "--insecure-unpinned-ak", "--insecure-unpinned-measurements", *opts)
                 self.assertEqual(r.returncode, 1, opts)
                 self.assertIn("TDX options without TDX evidence", r.stderr)
             # The two roots of trust speak of different keys, or the TPM's
             # of a partition.
             r = self.run_tool("verify", p["rep"], "--tdx-evidence", p["tdx"], "--tpm-evidence", p["other_tpm"], "--intel-root-ca", root,
-                              "--insecure-skip-collateral", "--insecure-unpinned-ak")
+                              "--insecure-skip-collateral", "--insecure-unpinned-ak", "--insecure-unpinned-measurements")
             self.assertEqual(r.returncode, 1)
             self.assertIn("different host keys", r.stderr)
             r = self.run_tool("verify", p["rep"], "--tdx-evidence", p["tdx"], "--tpm-evidence", p["mk_tpm"], "--intel-root-ca", root,
-                              "--insecure-skip-collateral", "--insecure-unpinned-ak")
+                              "--insecure-skip-collateral", "--insecure-unpinned-ak", "--insecure-unpinned-measurements")
             self.assertEqual(r.returncode, 1)
             self.assertRegex(r.stderr, "single kernel|partition")
             # Two of one kind.
@@ -997,7 +1057,7 @@ class Tdx(unittest.TestCase):
             self.assertIn("no evidence", r.stderr)
             # Another host's report.
             p2 = self.files(d, rep2=Host().report(b"cli"))
-            r = self.run_tool("verify", p2["rep2"], p["tdx"], "--intel-root-ca", root, "--insecure-skip-collateral")
+            r = self.run_tool("verify", p2["rep2"], p["tdx"], "--intel-root-ca", root, "--insecure-skip-collateral", *tdx_pins)
             self.assertEqual(r.returncode, 1)
             self.assertIn("report", r.stderr)
             for r in (r,):
@@ -1012,21 +1072,31 @@ class Tdx(unittest.TestCase):
             p = self.files(d, ans=self.answer(), tdx=self.evidence(), log=ccel(CC_EVENTS),
                            other_ev={"v": 1, "key": other.cose_key(), "type": "tdx",
                                      "quote": make_quote(self.intel, self.fields(reportdata=a.tdx_key_binding(other.point) + bytes(16)))})
-            r = self.run_tool("verify-tdx-quote", p["ans"], "--intel-root-ca", root, "--tdx-evidence", p["tdx"], "--data", b"fresh".hex())
+            tdx_pins = ["--mrtd", (b"\x11" * 48).hex(), "--rtmr", "1=" + self.rtmrs[1].hex(), "--rtmr", "2=" + self.rtmrs[2].hex()]
+            r = self.run_tool("verify-tdx-quote", p["ans"], "--intel-root-ca", root, "--tdx-evidence", p["tdx"], "--data", b"fresh".hex(),
+                              *tdx_pins)
             self.assertEqual(r.returncode, 1)
             self.assertIn("--collateral-dir", r.stderr)
             col = os.path.join(d, "col")
             os.mkdir(col)
             self.collateral(col)
+            # Unpinned measurements refused by default on verify-tdx-quote.
             r = self.run_tool("verify-tdx-quote", p["ans"], "--intel-root-ca", root, "--tdx-evidence", p["tdx"], "--data", b"fresh".hex(),
                               "--collateral-dir", col)
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("--insecure-unpinned-measurements", r.stderr)
+            r = self.run_tool("verify-tdx-quote", p["ans"], "--intel-root-ca", root, "--tdx-evidence", p["tdx"], "--data", b"fresh".hex(),
+                              "--collateral-dir", col, *tdx_pins)
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertNotIn("warning", r.stderr.lower())
-            self.assertEqual(set(json.loads(r.stdout)), {"tdx", "guest"})
-            r = self.run_tool("verify-tdx-quote", p["ans"], "--intel-root-ca", root, "--tdx-evidence", p["other_ev"], "--collateral-dir", col)
+            out = json.loads(r.stdout)
+            self.assertEqual(set(out), {"tdx", "guest"})
+            self.assertTrue(out["tdx"]["measurements_pinned"])
+            r = self.run_tool("verify-tdx-quote", p["ans"], "--intel-root-ca", root, "--tdx-evidence", p["other_ev"], "--collateral-dir", col,
+                              *tdx_pins)
             self.assertEqual(r.returncode, 1)
             self.assertIn("not the TDX evidence's", r.stderr)
-            r = self.run_tool("verify-tdx-quote", p["ans"], "--intel-root-ca", root, "--data", "00", "--collateral-dir", col)
+            r = self.run_tool("verify-tdx-quote", p["ans"], "--intel-root-ca", root, "--data", "00", "--collateral-dir", col, *tdx_pins)
             self.assertEqual(r.returncode, 1)
             self.assertIn("nonce", r.stderr)
             r = self.run_tool("event-log", p["log"])
@@ -1036,6 +1106,75 @@ class Tdx(unittest.TestCase):
             self.assertEqual(r.returncode, 1)
             self.assertIn("RTMR 0, 1 or 2", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
+
+    def test_measure_host_and_authenticode(self):
+        # Cross-check PCR 9 and RTMR 2 against policy.rs domain separation for
+        # absent/present/empty combinations.
+        def expected(cfg, initrd):
+            s1 = (b"l4h-config\0present\0" + cfg) if cfg is not None else b"l4h-config\0absent"
+            s2 = (b"dom0-initrd\0present\0" + initrd) if initrd is not None else b"dom0-initrd\0absent"
+            pcr9 = hashlib.sha256(hashlib.sha256(bytes(32) + hashlib.sha256(s1).digest()).digest()
+                                  + hashlib.sha256(s2).digest()).digest().hex()
+            rtmr2 = hashlib.sha384(hashlib.sha384(bytes(48) + hashlib.sha384(s1).digest()).digest()
+                                   + hashlib.sha384(s2).digest()).digest().hex()
+            return pcr9, rtmr2
+
+        for cfg, initrd in ((None, None), (b"", None), (b"fb_console=1\n", b"initrd-bytes"), (b"", b"")):
+            res = a.measure_host(config=cfg, initrd=initrd)
+            want_pcr9, want_rtmr2 = expected(cfg, initrd)
+            self.assertEqual((res["pcr9"], res["rtmr2"]), (want_pcr9, want_rtmr2))
+            self.assertEqual([e["present"] for e in res["events"]], [cfg is not None, initrd is not None])
+        # Empty file differs from absent file.
+        self.assertNotEqual(a.measure_host(config=b"")["rtmr2"], a.measure_host()["rtmr2"])
+
+        # Build a minimal valid PE32+ image with 1 section and optional Certificate Table.
+        def make_pe32plus(code=b"\x90" * 0x200, checksum=0x12345678, cert_blob=b""):
+            e_lfanew = 0x80
+            size_of_headers = 0x200
+            opt_size = 0xF0  # PE32+ with 16 data directories
+            buf = bytearray(size_of_headers + len(code) + len(cert_blob))
+            buf[0:2] = b"MZ"
+            struct.pack_into("<I", buf, 0x3C, e_lfanew)
+            buf[e_lfanew:e_lfanew + 4] = b"PE\0\0"
+            coff = e_lfanew + 4
+            struct.pack_into("<HH", buf, coff, 0x8664, 1)  # AMD64, 1 section
+            struct.pack_into("<H", buf, coff + 16, opt_size)
+            opt = coff + 20
+            struct.pack_into("<H", buf, opt, 0x20B)  # PE32+
+            struct.pack_into("<I", buf, opt + 60, size_of_headers)
+            struct.pack_into("<I", buf, opt + 64, checksum)
+            struct.pack_into("<I", buf, opt + 108, 16)  # NumberOfRvaAndSizes
+            if cert_blob:
+                cert_off = size_of_headers + len(code)
+                struct.pack_into("<II", buf, opt + 112 + 4 * 8, cert_off, len(cert_blob))
+                buf[cert_off:cert_off + len(cert_blob)] = cert_blob
+            sec = opt + opt_size
+            buf[sec:sec + 8] = b".text\0\0\0"
+            struct.pack_into("<II", buf, sec + 16, len(code), size_of_headers)
+            buf[size_of_headers:size_of_headers + len(code)] = code
+            return bytes(buf)
+
+        pe_unsigned = make_pe32plus(code=b"\x90" * 0x200, checksum=0x11111111, cert_blob=b"")
+        pe_signed = make_pe32plus(code=b"\x90" * 0x200, checksum=0x22222222, cert_blob=b"\x30\x82" + b"\xaa" * 62)
+        pe_tampered = make_pe32plus(code=b"\xcc" + b"\x90" * 0x1FF, checksum=0x11111111, cert_blob=b"")
+        d1 = a.pe_authenticode_digests(pe_unsigned)
+        d2 = a.pe_authenticode_digests(pe_signed)
+        d3 = a.pe_authenticode_digests(pe_tampered)
+        # Changing CheckSum or Certificate Table does not change Authenticode hash.
+        self.assertEqual(d1, d2)
+        # Changing code bytes changes both SHA-256 and SHA-384 digests.
+        self.assertNotEqual(d1[0], d3[0])
+        self.assertNotEqual(d1[1], d3[1])
+        # CLI measure-host end-to-end.
+        with tempfile.TemporaryDirectory() as d:
+            p = self.files(d, efi=pe_signed, cfg=b"dom0_disks=0\n", rd=b"cpio")
+            r = self.run_tool("measure-host", "--efi", p["efi"], "--config", p["cfg"], "--initrd", p["rd"])
+            self.assertEqual(r.returncode, 0, r.stderr)
+            out = json.loads(r.stdout)
+            self.assertEqual(out["efi_authenticode_sha256"], d1[0].hex())
+            self.assertEqual(out["efi_authenticode_sha384"], d1[1].hex())
+            want_pcr9, want_rtmr2 = expected(b"dom0_disks=0\n", b"cpio")
+            self.assertEqual((out["pcr9"], out["rtmr2"]), (want_pcr9, want_rtmr2))
 
     def test_fetch_collateral(self):
         intel = self.intel

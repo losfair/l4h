@@ -4770,28 +4770,22 @@ runs the secondary's ActivateCredential calls (the relay):
   in the TPM2 table, rung after each request. Untested: QEMU has no Pluton.
 
 **Intel TDX.** On FL4 in an Intel TDX trust domain (BootInfo `TDX_INFO`,
-14: GPAW, attributes, TD_CTLS, vCPUs), trustd binds the same key K to the
-TD, beside the TPM or without one; FL4 runs one kernel, so never in a
-multikernel machine. Root moves the kernel's `TdxControl` capability
-(its `seL4_CapSMC` slot) to trustd and gives it a private page for
-TDREPORTs (`trust::TDX_REPORT_VA`), a 2 MiB frame shared with the VMM for
-GetQuote (`trust::TDX_QUOTE_VA`) and the firmware's CC event log
-(`CC_EVENT_LOG`, 13, as `TPM_EVENT_LOG`, at `trust::CC_EVENT_LOG_VA`).
-K's seed is the CPU's alone (RDSEED, else RDRAND: neither exits to the
-VMM). Root identifies a TD from BootInfo `TDX_INFO` independently of
-whether TDX capabilities or frames are usable; if a TD lacks usable TDX
-resources (or is partitioned), root and trustd run flags-only and never
-fall back to a local TPM or partition relay. trustd binds K to the TD
-before it touches the TPM, if any, so that nothing of the cloud's vTPM
-comes before RTMR 3 is extended; if CPU entropy or TD binding fails,
-trustd runs flags-only without initializing the vTPM. Once K is bound to
-RTMR 3, the optional vTPM quotes the same K (if it fails, trustd attests
-with TDX alone), and only afterwards does trustd start the 120 s
-GetQuote timer and first poll on the saved TDREPORT. A TPM with the ACPI
-start method is not used in a TD: its `_DSM` is the cloud's AML, run
-with root's hardware access; root refuses `START_ACPI` as soon as it
-decodes the start method, before reading the CRB control registers
-(trustd also ignores one). trustd then:
+14: GPAW, attributes, TD_CTLS, vCPUs), `fl4-efi` skips TPM PCR 9
+measurements and, if firmware exposes `EFI_TCG2_PROTOCOL` (such as a cloud
+vTPM), poisons all Locality-0 static TPM PCRs 0–15 with an error
+`EV_SEPARATOR` (`0xffffffff`) before `ExitBootServices` and drops the TPM
+event log; at run time, root and trustd completely ignore any TPM (no TPM
+event log, no ACPI `TPM2` lookup or MMIO mapping) and bind K to the TD
+alone; FL4 runs one kernel, so never in a multikernel machine. Root moves the kernel's
+`TdxControl` capability (its `seL4_CapSMC` slot) to trustd and gives it a
+private page for TDREPORTs (`trust::TDX_REPORT_VA`), a 2 MiB frame shared
+with the VMM for GetQuote (`trust::TDX_QUOTE_VA`) and the firmware's CC
+event log (`CC_EVENT_LOG`, 13, at `trust::CC_EVENT_LOG_VA`). K's seed is
+the CPU's alone (RDSEED, else RDRAND: neither exits to the VMM). Root
+identifies a TD from BootInfo `TDX_INFO` independently of whether TDX
+capabilities or frames are usable; if a TD lacks usable TDX resources (or
+is partitioned), or if CPU entropy or TD binding fails, root and trustd run
+flags-only and never touch any TPM or partition relay. trustd then:
 
 - asks for a TDREPORT (TDG.MR.REPORT) with REPORTDATA
   `SHA-384("l4h-trustd-key-tdx-v1" ‖ K) ‖ 0^16` and requires its RTMR 3
@@ -6088,7 +6082,7 @@ tools/build-fl4.sh
 SEL4_PREFIX="$PWD/build/sel4-fl4" L4H_KERNEL_VARIANT=fl4 tests/run-selftest.sh 4
 ```
 
-The tested FL4 revision is `624600c954a06850de90170f1503ac2b0b243abe`.
+The tested FL4 revision is `f10d29277871ab667298009451483beac1171f5c`.
 `prepare-fl4.sh` clones the pinned public revision, or the frozen override,
 into `build/FL4-src` without applying any kernel patches. The source
 worktree is not edited.
