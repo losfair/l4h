@@ -46,6 +46,21 @@ pub const fn resource_bytes(width: u32, height: u32) -> Option<u64> {
 /// # Safety
 /// `src` and `dst` must be valid for `n` bytes.
 pub unsafe fn copy_volatile(src: *const u8, dst: *mut u8, n: usize) {
+    // REP MOVSB reads each byte once and writes it once, as the loop below
+    // does, at the CPU's fast string copy speed (ERMS/FSRM: several times
+    // the loop's on bulk data); the compiler sees no accesses to race on.
+    // DF is clear by the ABI.
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!("rep movsb", inout("rcx") n => _, inout("rsi") src => _, inout("rdi") dst => _,
+            options(nostack, preserves_flags));
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    copy_volatile_loop(src, dst, n);
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn copy_volatile_loop(src: *const u8, dst: *mut u8, n: usize) {
     let mut i = 0;
     // Eight bytes at a time, aligned or not: one load and one store each.
     while i + 8 <= n {

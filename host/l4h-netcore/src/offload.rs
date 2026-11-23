@@ -40,6 +40,21 @@ impl Frame for [u8] {
 /// # Safety
 /// `src` and `dst` are valid for `n` bytes.
 pub unsafe fn copy_volatile(src: *const u8, dst: *mut u8, n: usize) {
+    // REP MOVSB reads each byte once and writes it once, as the loop below
+    // does, at the CPU's fast string copy speed (ERMS/FSRM: several times
+    // the loop's on bulk data); the compiler sees no accesses to race on.
+    // DF is clear by the ABI.
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!("rep movsb", inout("rcx") n => _, inout("rsi") src => _, inout("rdi") dst => _,
+            options(nostack, preserves_flags));
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    copy_volatile_loop(src, dst, n);
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn copy_volatile_loop(src: *const u8, dst: *mut u8, n: usize) {
     let mut i = 0;
     // Eight bytes at a time, aligned or not: one load and one store each.
     while i + 8 <= n {
@@ -815,4 +830,21 @@ mod tests {
         assert!(!valid_rx_gso(&h, &f[..len], UPLINK_MIN_MSS));
     }
 
+}
+
+#[cfg(test)]
+mod copy_tests {
+    extern crate std;
+
+    #[test]
+    fn copy_volatile_copies_every_byte() {
+        let s: std::vec::Vec<u8> = (0..4096u32).map(|i| (i.wrapping_mul(37) | 1) as u8).collect();
+        for (from, to, n) in [(0, 0, 0), (1, 1, 15), (1, 3, 40), (5, 0, 33), (0, 7, 4000), (3, 6, 8), (0, 0, 4096)] {
+            let mut dst = std::vec![0u8; 4200];
+            unsafe { super::copy_volatile(s.as_ptr().wrapping_add(from), dst.as_mut_ptr().wrapping_add(to), n) };
+            assert!(dst[..to].iter().all(|&b| b == 0), "{from} {to} {n}");
+            assert_eq!(&dst[to..to + n], &s[from..from + n], "{from} {to} {n}");
+            assert!(dst[to + n..].iter().all(|&b| b == 0), "{from} {to} {n}");
+        }
+    }
 }
