@@ -81,12 +81,12 @@ pub const MAX_VSPACES: usize = 64;
 /// Where vmmgr maps a guest's pages for itself (layout::GUEST_PAGES):
 /// its control page, its console page, then from these offsets its
 /// console ring and the event page of each vCPU.
-fn self_guest_va(id: usize) -> usize {
+pub(crate) fn self_guest_va(id: usize) -> usize {
     assert!(id < crate::MAX_GUESTS);
     layout::GUEST_PAGES.base + id * layout::GUEST_STRIDE
 }
-const GUEST_RING_OFF: usize = 0x1_0000;
-const GUEST_EVENTS_OFF: usize = 0x2_0000;
+pub(crate) const GUEST_RING_OFF: usize = 0x1_0000;
+pub(crate) const GUEST_EVENTS_OFF: usize = 0x2_0000;
 const _: () = assert!(2 * PAGE <= GUEST_RING_OFF);
 const _: () = assert!(GUEST_RING_OFF + host::CONSOLE_RING_PAGES * PAGE <= GUEST_EVENTS_OFF);
 const _: () = assert!(GUEST_EVENTS_OFF + abi::MAX_VCPUS * PAGE <= layout::GUEST_STRIDE);
@@ -113,6 +113,8 @@ pub struct GuestConfig<'a> {
     /// Guest-virtual address of GPA 0 (from the kernel image).
     pub ram_base: usize,
     pub dom0: bool,
+    /// An HVM guest (hvm.rs): `ram_base` and `vspaces` do not apply.
+    pub hvm: bool,
 }
 
 /// How the guest kicks a device (Guest::add_device_with).
@@ -203,8 +205,8 @@ pub struct IoPool {
     pub gpa: usize,
     pub size: usize,
     /// The frames, slot i = page i (radix `radix`).
-    frames: cap::CNode,
-    radix: usize,
+    pub(crate) frames: cap::CNode,
+    pub(crate) radix: usize,
 }
 
 impl IoPool {
@@ -222,7 +224,9 @@ pub struct Vcpu {
     pub ntfn: cap::Notification,
     pub event: cap::Granule,
     pub sc_k: cap::SchedContext,
-    pub sc_u: cap::SchedContext,
+    /// The scheduling context of its user tasks: none for an HVM guest's
+    /// vCPU, which runs on SC_K alone (sched::pair).
+    pub sc_u: Option<cap::SchedContext>,
     pub core: usize,
     /// Its virtual core (abi::BootInfo::vcpu_core): the guest's vCPUs of
     /// one vCore share a physical core, alone of this guest's.
@@ -266,7 +270,7 @@ pub struct Guest {
     shared: u64,
     /// Blocks vmmgr filled with frames (boot blocks, shared blocks),
     /// one bit each; their level-2 RAM CNodes are in `ram_l1`.
-    filled: [u64; abi::MAX_BLOCKS / 64],
+    pub(crate) filled: [u64; abi::MAX_BLOCKS / 64],
     /// Level-1 RAM CNodes, one per GiB of guest-physical space.
     ram_l1: ArrayVec<cap::CNode, { abi::MAX_RAM_L1 }>,
     /// Blocks [0, boot_blocks) are host frames; set at boot.
@@ -346,6 +350,10 @@ pub struct Guest {
     /// What a GPU attach that ran out of host memory had made
     /// (gpu::attach): the next attach goes on from it.
     pub gpu_parts: Option<crate::gpu::Parts>,
+    /// An HVM guest (hvm.rs): what its l4h-hvm, in place of an l4h-vmm,
+    /// is given.  Its `cnode`, `vspace`, `dev_cn` and `vmm_ep` are null:
+    /// the guest has no capabilities.
+    pub hvm: Option<crate::hvm::Hvm>,
 }
 
 pub(crate) fn abs(c: impl sel4::HasCPtrWithDepth) -> sel4::AbsoluteCPtr {
@@ -354,7 +362,7 @@ pub(crate) fn abs(c: impl sel4::HasCPtrWithDepth) -> sel4::AbsoluteCPtr {
 
 /// A CNode of 2^bits slots from `arena`, or None if the host is out of
 /// memory or too fragmented for it (Arena::object panics).
-fn try_cnode(arena: &mut Arena, alloc: &mut Alloc, bits: usize) -> Option<cap::CNode> {
+pub(crate) fn try_cnode(arena: &mut Arena, alloc: &mut Alloc, bits: usize) -> Option<cap::CNode> {
     arena.try_object(alloc, ObjectBlueprint::CNode { size_bits: bits }).map(self_cap::<cap_type::CNode>)
 }
 
@@ -362,6 +370,67 @@ pub(crate) fn self_cap<T: sel4::CapType>(s: Slot) -> sel4::Cap<T> {
     sel4::init_thread::Slot::<T>::from_index(s).cap()
 }
 
+
+impl Guest {
+    /// A guest with nothing attached, built by `create` and hvm::create.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn blank(id: usize, name: &str, arena: Arena, cnode: cap::CNode, vspace: cap::VSpace, ram_base: usize,
+        shared: u64, pool_gpa: usize, dom0: bool, hp_gpa: usize, hp_count: usize) -> Guest {
+        Guest {
+            id,
+            instance: 0,
+            name: ArrayString::from_str_truncate(name),
+            arena,
+            cnode,
+            vspace,
+            ram_base,
+            nr_blocks: 0,
+            shared,
+            filled: [0; abi::MAX_BLOCKS / 64],
+            ram_l1: ArrayVec::new(),
+            boot_blocks: 0,
+            pool: IoPool { gpa: pool_gpa, size: 0, frames: cap::CNode::from_bits(0), radix: 0 },
+            ctl_data: false,
+            vcpus: ArrayVec::new(),
+            state: State::Created,
+            dom0,
+            root_pending: false,
+            ctl_taken: 0,
+            vspaces: ArrayVec::new(),
+            nr_ept_roots: 0,
+            bootinfo: ArrayVec::new(),
+            entry: 0,
+            vmm_ep: cap::Endpoint::from_bits(0),
+            vmm_ntfn: cap::Notification::from_bits(0),
+            dev_cn: cap::CNode::from_bits(0),
+            devices: ArrayVec::new(),
+            backends: ArrayVec::new(),
+            console_ring: ArrayVec::new(),
+            vmm_cnodes: None,
+            vmm: None,
+            vmm_limits: None,
+            vmm_share: crate::sched::budget::VMM_SHARE_INIT,
+            vmm_usage: 0,
+            vmm_boosted: true,
+            vmm_guard: Default::default(),
+            vmm_limited: false,
+            cpu_cap_pct: 0,
+            asids: 0,
+            attest: false,
+            loaded: Ranges::default(),
+            launch: None,
+            sdk_size: 0,
+            gpu: None,
+            hp_gpa,
+            hp_count,
+            mem_dev: None,
+            usbs: 0,
+            port_spare: None,
+            gpu_parts: None,
+            hvm: None,
+        }
+    }
+}
 
 impl Guest {
     pub fn ctx<'a>(&'a mut self, alloc: &'a mut Alloc) -> ObjCtx<'a> {
@@ -378,7 +447,7 @@ impl Guest {
         (self.nr_blocks - self.shared.count_ones() as usize) * BLOCK
     }
 
-    fn is_filled(&self, b: usize) -> bool {
+    pub(crate) fn is_filled(&self, b: usize) -> bool {
         self.filled[b / 64] & (1 << (b % 64)) != 0
     }
 
@@ -559,6 +628,9 @@ impl Guest {
     /// Copy `len` bytes from `from` (memory of vmmgr) into guest
     /// RAM at `gpa` (before boot), and record the range as loaded.
     pub fn load_ram(&mut self, alloc: &mut Alloc, win: &mut Window, gpa: usize, from: *const u8, len: usize) -> bool {
+        if self.hvm.is_some() {
+            return crate::hvm::load_ram(self, alloc, gpa, from, len);
+        }
         if !self.copy_ram(alloc, win, gpa, from, len) {
             return false;
         }
@@ -600,8 +672,11 @@ impl Guest {
     /// allocations panic: the caller reserves DEVICE_BYTES first.
     pub fn add_device(&mut self, alloc: &mut Alloc, kind: DevKind) -> Option<usize> {
         let d = self.devices.len();
-        if d >= MAX_GUEST_DEVICES || self.state != State::Created {
+        if d >= self.max_devices() || self.state != State::Created {
             return None;
+        }
+        if self.hvm.is_some() {
+            return crate::hvm::add_device(self, alloc, kind);
         }
         let page = self.arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP);
         let kick = match kind {
@@ -611,6 +686,12 @@ impl Guest {
             _ => Kick::Device,
         };
         self.add_device_with(alloc, kind, page, kick)
+    }
+
+    /// The devices it can have, its console included: an HVM guest's are
+    /// PCI functions of one bus (console and l4h_host::hvm::MAX_DEVICES).
+    pub fn max_devices(&self) -> usize {
+        if self.hvm.is_some() { l4h_host::hvm::MAX_DEVICES + 1 } else { MAX_GUEST_DEVICES }
     }
 
     /// Add a device with shared page `page`, which the guest kicks with
@@ -696,7 +777,7 @@ impl Guest {
 
     /// Map (a copy of) one of our frames into vmmgr.  The paging
     /// structures are global: the region is reused by later guests.
-    fn map_in_self(&mut self, alloc: &mut Alloc, frame: cap::Granule, va: usize) {
+    pub(crate) fn map_in_self(&mut self, alloc: &mut Alloc, frame: cap::Granule, va: usize) {
         self.map_abs_in_self(alloc, &abs(frame), va);
     }
 
@@ -766,6 +847,9 @@ impl Guest {
     /// What loading [gpa, gpa + len) costs before any block is filled.
     /// None for a range or state that load_ram refuses.
     pub fn load_cost(&self, gpa: usize, len: usize) -> Option<(usize, usize)> {
+        if self.hvm.is_some() {
+            return crate::hvm::load_cost(self, gpa, len);
+        }
         if !self.valid_gpa(gpa, len) || self.state != State::Created || self.boot_blocks != 0 {
             return None;
         }
@@ -810,6 +894,9 @@ impl Guest {
     /// Host memory spawning its l4h-vmm takes (Vmmgr::spawn_vmm), to
     /// reserve first: the VMM itself and its mappings of the backends.
     pub fn start_bytes(&self) -> usize {
+        if self.hvm.is_some() {
+            return crate::hvm::start_bytes(self);
+        }
         let maps: usize = self.backends.iter().map(|(_, b)| b.map_bytes()).sum();
         vmm::start_bytes(self.pool.size, self.vcpus.len(), self.devices.len()) + maps
     }
@@ -1009,6 +1096,14 @@ impl Guest {
     /// no others.  Processes moving between the guest's vCPUs are left to
     /// it: their VSpaces may still name the cores of other vCPUs.
     pub fn flush_tlb_bitmaps(&self) {
+        // An HVM guest's vCPU threads run in its l4h-hvm's VSpace; seL4
+        // tracks the cores of its EPT itself.
+        if self.hvm.is_some() {
+            if let Some(v) = &self.vmm {
+                crate::vspace::flush_tlb_bitmap(v.vspace);
+            }
+            return;
+        }
         crate::vspace::flush_tlb_bitmap(self.vspace);
         for &vs in &self.vspaces {
             crate::vspace::flush_tlb_bitmap(vs);
@@ -1017,6 +1112,12 @@ impl Guest {
 
     /// Start vCPU 0 at the kernel entry point.
     pub fn start(&mut self) {
+        // An l4h-hvm starts its vCPU threads itself, once this is answered.
+        if self.hvm.is_some() {
+            self.state = State::Running;
+            info!("l4h-vmmgr: guest {} '{}' started (HVM)", self.id, self.name);
+            return;
+        }
         let mut regs = sel4::UserContext::default();
         *regs.pc_mut() = self.entry;
         *regs.c_param_mut(0) = abi::BOOTINFO_VA;
@@ -1039,12 +1140,21 @@ impl Guest {
     pub fn stop(&mut self) {
         for v in &self.vcpus {
             let _ = abs(v.ktcb).revoke();
-            let _ = abs(v.sc_u).revoke();
+            if let Some(sc_u) = v.sc_u {
+                let _ = abs(sc_u).revoke();
+            }
+        }
+        // An l4h-hvm's threads hold each other's TCBs (its own, and its
+        // vCPU threads'): none may resume another once stopped.
+        if let (Some(v), true) = (&self.vmm, self.hvm.is_some()) {
+            let _ = abs(v.tcb).revoke();
         }
         for v in &self.vcpus {
             let _ = v.ktcb.tcb_suspend();
             let _ = v.sc_k.unbind();
-            let _ = v.sc_u.unbind();
+            if let Some(sc_u) = v.sc_u {
+                let _ = sc_u.unbind();
+            }
         }
         if let Some(v) = &self.vmm {
             let _ = v.tcb.tcb_suspend();
@@ -1225,58 +1335,7 @@ pub fn create(
     let vspace = self_cap::<cap_type::VSpace>(vspace_slot);
     asids.assign(alloc, vspace);
 
-    let mut g = Guest {
-        id,
-        instance: 0,
-        name: ArrayString::from_str_truncate(cfg.name),
-        arena,
-        cnode: self_cap::<cap_type::CNode>(cnode_slot),
-        vspace,
-        ram_base,
-        nr_blocks: 0,
-        shared,
-        filled: [0; abi::MAX_BLOCKS / 64],
-        ram_l1: ArrayVec::new(),
-        boot_blocks: 0,
-        pool: IoPool { gpa: pool_gpa, size: 0, frames: cap::CNode::from_bits(0), radix: 0 },
-        ctl_data: false,
-        vcpus: ArrayVec::new(),
-        state: State::Created,
-        dom0: cfg.dom0,
-        root_pending: false,
-        ctl_taken: 0,
-        vspaces: ArrayVec::new(),
-        nr_ept_roots: 0,
-        bootinfo: ArrayVec::new(),
-        entry: 0,
-        vmm_ep: cap::Endpoint::from_bits(0),
-        vmm_ntfn: cap::Notification::from_bits(0),
-        dev_cn: cap::CNode::from_bits(0),
-        devices: ArrayVec::new(),
-        backends: ArrayVec::new(),
-        console_ring: ArrayVec::new(),
-        vmm_cnodes: None,
-        vmm: None,
-        vmm_limits: None,
-        vmm_share: crate::sched::budget::VMM_SHARE_INIT,
-        vmm_usage: 0,
-        vmm_boosted: true,
-        vmm_guard: Default::default(),
-        vmm_limited: false,
-        cpu_cap_pct: 0,
-        asids: 0,
-        attest: false,
-        loaded: Ranges::default(),
-        launch: None,
-        sdk_size: 0,
-        gpu: None,
-        hp_gpa,
-        hp_count,
-        mem_dev: None,
-        usbs: 0,
-        port_spare: None,
-        gpu_parts: None,
-    };
+    let mut g = Guest::blank(id, cfg.name, arena, self_cap::<cap_type::CNode>(cnode_slot), vspace, ram_base, shared, pool_gpa, cfg.dom0, hp_gpa, hp_count);
 
     let Some(cnodes) = vmm::Cnodes::new(&mut g.arena, alloc, cfg.io_pool) else {
         return Err(Some(g));
@@ -1487,7 +1546,7 @@ pub fn create(
         mint_edge(&g.guest_slot(base + abi::VCPU_IPI), &wiring::GUEST_IPI, 0, &Obj::claim(p::Guest, o::Vcpu, abs(ntfn))).expect("vCPU IPI cap");
         g.give(base + abi::VCPU_IPCBUF, ipcbuf, CapRights::read_write());
         g.give(base + abi::VCPU_EVENT, event, CapRights::read_write());
-        g.vcpus.must_push(Vcpu { ktcb, ntfn, event, sc_k, sc_u, core, vcore, host_cap: 1024, cooldown: 0, usage: 0, k_share: crate::sched::K_SHARE_INIT, wall_ticks: 0, run_ticks: 0, steal_ns: 0 });
+        g.vcpus.must_push(Vcpu { ktcb, ntfn, event, sc_k, sc_u: Some(sc_u), core, vcore, host_cap: 1024, cooldown: 0, usage: 0, k_share: crate::sched::K_SHARE_INIT, wall_ticks: 0, run_ticks: 0, steal_ns: 0 });
     }
 
     // ---- Event pages in vmmgr too (steal time).

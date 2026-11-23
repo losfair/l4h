@@ -323,6 +323,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "l4h-hvm"
+version = "0.1.0"
+dependencies = [
+ "l4h-abi",
+ "l4h-rt",
+]
+
+[[package]]
 name = "l4h-ipc"
 version = "0.1.0"
 dependencies = [

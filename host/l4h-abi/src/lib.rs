@@ -333,8 +333,12 @@ pub struct CtlSync {
 /// -> vals: cores, free bytes, total bytes, nr disks, nr vms, nr NICs;
 /// data[0..8]: physical cores (u64, little-endian; 0 on older hosts).
 pub const CTL_HOST_INFO: u32 = 1;
+/// args: ram, vcpus, -, -, I/O pool, flags (VM_CREATE_*) -> vals[0] = vm,
+/// vals[1] = lowest GPA for the initrd (0 for an HVM guest).
 pub const CTL_VM_CREATE: u32 = 2;
 pub const CTL_VM_LOAD: u32 = 3;
+/// args: vm, initrd gpa, initrd size; for an HVM guest also kernel gpa,
+/// kernel size and boot flags (HVM_BOOT_*); data: cmdline.
 pub const CTL_VM_START: u32 = 4;
 pub const CTL_VM_DESTROY: u32 = 5;
 pub const CTL_VM_LIST: u32 = 6;
@@ -563,13 +567,24 @@ pub const VM_CREATED: u32 = 1;
 pub const VM_RUNNING: u32 = 2;
 pub const VM_STOPPED: u32 = 3;
 
+/// CTL_VM_CREATE args[5]: an HVM guest (DESIGN.md §5.11), which runs an
+/// unmodified x86-64 kernel with virtio-pci devices; USB, GPU and memory
+/// hotplug are refused (EOPNOTSUPP), as is the guest without VT-x or
+/// AMD-V (ENODEV).
+pub const VM_CREATE_HVM: u64 = 1 << 0;
+/// CTL_VM_START args[5] of an HVM guest: none are defined yet.
+pub const HVM_BOOT_FLAGS: u64 = 0;
+/// CtlVm::flags.
+pub const VM_FLAG_HVM: u32 = 1 << 0;
+
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct CtlVm {
     pub id: u32,
     pub state: u32,
     pub vcpus: u32,
-    pub reserved: u32,
+    /// VM_FLAG_*.
+    pub flags: u32,
     pub ram: u64,
     pub name: [u8; CTL_NAME_MAX],
 }
@@ -670,6 +685,7 @@ const _: () = assert!(core::mem::size_of::<CtlReq>() <= CTL_SYNC_OFF);
 const _: () = assert!(CTL_SYNC_OFF + core::mem::size_of::<CtlSync>() <= CTL_RESP_OFF);
 const _: () = assert!(CTL_RESP_OFF + core::mem::size_of::<CtlResp>() <= 4096);
 const _: () = assert!(core::mem::size_of::<CtlVm>() == 56);
+const _: () = assert!(core::mem::offset_of!(CtlVm, flags) == 12 && core::mem::offset_of!(CtlVm, ram) == 16);
 const _: () = assert!(core::mem::size_of::<CtlVcpuStat>() == 16);
 const _: () = assert!(MAX_VCPUS * core::mem::size_of::<CtlVcpuStat>() <= CTL_DATA_MAX);
 const _: () = assert!(core::mem::size_of::<MemPage>() == 128);

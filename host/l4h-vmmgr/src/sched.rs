@@ -46,8 +46,15 @@ fn plan(info: &HostInfo, g: &Guest, v: usize, has_vmm: bool, backgrounds: usize)
 
 fn pair(info: &HostInfo, gid: usize, v: usize, vcpu: &Vcpu, core: usize, p: budget::Plan) -> bool {
     let sc = info.sched_control(core);
-    let r = sc.sched_control_configure_flags(vcpu.sc_k, p.kernel, p.period, GUEST_EXTRA_REFILLS, 0, 0)
-        .and_then(|_| sc.sched_control_configure_flags(vcpu.sc_u, p.user, p.period, GUEST_EXTRA_REFILLS, 0, 0));
+    let r = match vcpu.sc_u {
+        Some(sc_u) => sc.sched_control_configure_flags(vcpu.sc_k, p.kernel, p.period, GUEST_EXTRA_REFILLS, 0, 0)
+            .and_then(|_| sc.sched_control_configure_flags(sc_u, p.user, p.period, GUEST_EXTRA_REFILLS, 0, 0)),
+        // An HVM guest's vCPU runs kernel and user alike on SC_K: the
+        // guest's whole part of the plan, which is the full period
+        // without a cap.
+        None => sc.sched_control_configure_flags(vcpu.sc_k, p.kernel.saturating_add(p.user).min(p.period), p.period,
+            GUEST_EXTRA_REFILLS, 0, 0),
+    };
     if let Err(e) = r {
         l4h_rt::log!("l4h-vmmgr: configure guest {} vCPU {} on core {}: {:?}", gid, v, core, e);
     }
@@ -249,7 +256,7 @@ pub fn balance(h: &mut Vmmgr, elapsed_us: u64) {
                 let page = g.event_page(v);
                 let has_vmm = v == 0 && active(g);
                 let old = if has_vmm { g.vmm_limits.expect("VMM limits").1 } else { plan(&h.info, g, v, false, 0) };
-                let (ck, cu) = (consumed(g.vcpus[v].sc_k), consumed(g.vcpus[v].sc_u));
+                let (ck, cu) = (consumed(g.vcpus[v].sc_k), g.vcpus[v].sc_u.map_or(0, consumed));
                 let c = ck + cu;
                 if g.state != State::Running {
                     continue;
@@ -333,8 +340,11 @@ pub fn balance(h: &mut Vmmgr, elapsed_us: u64) {
             tcb.tcb_set_priority(crate::slot::TCB.cap(), l4h_host::PRIO_VMM)
         } else {
             // Lower authority first: every copy of its own TCB refers to
-            // this MCP, so the VMM cannot undo the priority reduction.
-            tcb.tcb_set_mc_priority(crate::slot::TCB.cap(), l4h_host::PRIO_VMM_FAIR)
+            // this MCP, so the VMM cannot undo the priority reduction.  An
+            // HVM guest's l4h-hvm keeps the lower MCP it has (hvm::MCP,
+            // below the debug syscalls'): never raised.
+            let mcp = if g.hvm.is_some() { l4h_host::hvm::MCP } else { l4h_host::PRIO_VMM_FAIR };
+            tcb.tcb_set_mc_priority(crate::slot::TCB.cap(), mcp)
                 .and_then(|_| tcb.tcb_set_priority(crate::slot::TCB.cap(), l4h_host::PRIO_VMM_FAIR))
         };
         if let Err(e) = r {

@@ -14,7 +14,7 @@ use crate::guest::{GuestConfig, State};
 use crate::root::Later;
 use crate::{MAX_GUESTS, Then, Vmmgr, root};
 
-pub use l4h_host::errno::{EAGAIN, EBUSY, EINVAL, EIO, ENOENT, ENOMEM, ENOSPC, ENOSYS, EPERM, Errno};
+pub use l4h_host::errno::{EAGAIN, EBUSY, EINVAL, EIO, ENODEV, ENOENT, ENOMEM, ENOSPC, ENOSYS, EOPNOTSUPP, EPERM, Errno};
 /// Not an errno: the request waits for root, which answers it later
 /// (`answer`).
 const DEFER: Errno = 1 << 32;
@@ -190,9 +190,31 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
             if !(crate::guest::RAM_MIN..=crate::guest::RAM_MAX).contains(&ram) {
                 return Err(EINVAL);
             }
-            let io_pool = if a[4] != 0 { a[4] as usize } else { crate::guest::IO_POOL_DEFAULT };
+            if a[5] & !abi::VM_CREATE_HVM != 0 {
+                return Err(EINVAL);
+            }
+            let hvm = a[5] & abi::VM_CREATE_HVM != 0;
+            let io_pool = if a[4] != 0 {
+                a[4] as usize
+            } else if hvm {
+                l4h_host::hvm::IO_POOL_DEFAULT as usize
+            } else {
+                crate::guest::IO_POOL_DEFAULT
+            };
             if !io_pool.is_power_of_two() || !(crate::guest::IO_POOL_MIN..=crate::guest::IO_POOL_MAX).contains(&io_pool) {
                 return Err(EINVAL);
+            }
+            if hvm {
+                // Its own bounds: it boots unmodified kernels.
+                if !(l4h_host::hvm::RAM_MIN..=l4h_host::hvm::RAM_MAX).contains(&(ram as u64)) || vcpus > l4h_host::hvm::MAX_VCPUS {
+                    return Err(EINVAL);
+                }
+                if !crate::hvm::available(&h.info) {
+                    return Err(ENODEV);
+                }
+                let cfg = GuestConfig { name, ram, vcpus, io_pool, vspaces: 0, ram_base: 0, dom0: false, hvm: true };
+                resp.vals[0] = h.create_guest(&cfg).ok_or(ENOMEM)? as u64;
+                return Ok(());
             }
             // a[2] was the kernel's base VA, a[3] the seL4 object quota:
             // guests run the host's kernel, and their objects come from
@@ -207,6 +229,7 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
                 vspaces: 64,
                 ram_base,
                 dom0: false,
+                hvm: false,
             };
             let id = h.create_guest(&cfg).ok_or(ENOMEM)?;
             resp.vals[0] = id as u64;
@@ -249,6 +272,23 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
             }
             let initrd = (a[1] as usize, a[2] as usize);
             let cmdline = cstr(&req.data);
+            if h.guest(id).is_some_and(|g| g.hvm.is_some()) {
+                return h.with_guest(id, |h, g| {
+                    if g.state != State::Created || g.vmm.is_some() || g.root_pending {
+                        return Err(EBUSY);
+                    }
+                    // Its l4h-hvm, reserved before anything is filled, so
+                    // that nothing after boot can be refused: its memory
+                    // and the slots of its objects.
+                    let bytes = g.start_bytes();
+                    if !h.can_afford(bytes, 1, crate::hvm::start_slots(g)) || !g.reserve(&mut h.alloc, bytes) {
+                        return Err(ENOMEM);
+                    }
+                    crate::hvm::boot(g, &mut h.alloc, (a[3], a[4]), (a[1], a[2]), a[5], cmdline)?;
+                    h.spawn_vmm(g)
+                })
+                .ok_or(ENOENT)?;
+            }
             h.with_guest(id, |h, g| {
                 let kernel = h.kernel.as_ref().expect("guests run the host's kernel");
                 // As the attach paths: not once it has a VMM, nor while
@@ -296,7 +336,7 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
                         State::Stopped => abi::VM_STOPPED,
                     },
                     vcpus: g.vcpus.len() as u32,
-                    reserved: 0,
+                    flags: if g.hvm.is_some() { abi::VM_FLAG_HVM } else { 0 },
                     ram: (g.owned_ram() + crate::memd::hotplug(g.id).plugged as usize * abi::HP_SIZE) as u64,
                     name: [0; abi::CTL_NAME_MAX],
                 };
@@ -382,6 +422,7 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
             let g = h.guest(vm_arg(a[0])?).ok_or(ENOENT)?;
             let len = (a[1] as usize).min(abi::CTL_DATA_MAX);
             if let Some(t) = &h.flags { t.act(g, caller, abi::FLAG_CONSOLE_IN, len != 0)?; }
+            let hvm = g.hvm.is_some();
             let p = g.console_page();
             unsafe {
                 let mut head = addr_of!((*p).in_head).read_volatile();
@@ -397,6 +438,11 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
                 fence(Ordering::Release);
                 addr_of_mut!((*p).in_head).write_volatile(head);
                 resp.vals[0] = n as u64;
+            }
+            // An HVM guest's UART takes it in from its l4h-hvm.
+            if hvm && len != 0 {
+                let id = vm_arg(a[0])?;
+                h.with_guest(id, |h, g| crate::hvm::signal(g, &mut h.alloc));
             }
             Ok(())
         }
@@ -435,8 +481,13 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
                 return Err(EBUSY);
             }
             unsafe { addr_of_mut!((*g.console_page()).power_request).write_volatile(how + 1) };
-            // The console is device 0.
-            g.raise_event(&mut h.alloc, crate::guest::dev_event(0));
+            if g.hvm.is_some() {
+                // Its l4h-hvm presses the guest's ACPI power button.
+                h.with_guest(id, |h, g| crate::hvm::signal(g, &mut h.alloc));
+            } else {
+                // The console is device 0.
+                g.raise_event(&mut h.alloc, crate::guest::dev_event(0));
+            }
             Ok(())
         }
         abi::CTL_VM_STATS => {
@@ -448,6 +499,9 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
         abi::CTL_VM_SET_MEM => {
             let id = vm_arg(a[0])?;
             h.with_guest(id, |h, g| {
+                if g.hvm.is_some() {
+                    return Err(EOPNOTSUPP);
+                }
                 if g.mem_dev.is_none() {
                     return Err(EINVAL);
                 }

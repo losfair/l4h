@@ -16,6 +16,7 @@ pub mod errno;
 pub mod fixed;
 pub mod font;
 pub mod gpu;
+pub mod hvm;
 pub mod hypercall;
 pub mod iopool;
 pub mod log;
@@ -96,7 +97,7 @@ const _: () = assert!(KEEPER_STACK_TOP < STACK_TOP - VMMGR_STACK_SIZE);
 /// The size of the main stack of a component of `kind`.
 pub const fn stack_size(kind: u32) -> usize {
     match kind {
-        KIND_VMM => VMM_STACK_SIZE,
+        KIND_VMM | KIND_HVM => VMM_STACK_SIZE,
         KIND_VMMGR => VMMGR_STACK_SIZE,
         _ => STACK_SIZE,
     }
@@ -164,6 +165,9 @@ pub const KIND_USBD: u32 = 8;
 pub const KIND_FLAGS: u32 = 9;
 /// A NIC driver (nicd: crate::nicd).
 pub const KIND_NICD: u32 = 10;
+/// A guest's hardware-virtualized machine monitor (crate::hvm), in place
+/// of its l4h-vmm.
+pub const KIND_HVM: u32 = 11;
 
 /// The kinds that serve calls: root calls memd, guests' VMMs call vmmgr,
 /// vmmgr and trustd call the flags server.  A caller blocked in a call

@@ -22,6 +22,8 @@ const MIB: usize = 1 << 20;
 
 /// The two windows on frames of guests and VMMs (window.rs).
 pub const WINDOWS: Region = Region { base: 0x7000_0000_0000, size: 2 * PAGE };
+/// A 2 MiB window on the RAM blocks of HVM guests (hvm.rs), 2 MiB aligned.
+pub const LARGE_WINDOW: Region = Region { base: 0x7000_0020_0000, size: 2 * MIB };
 /// Each guest's console, control and event pages, GUEST_STRIDE apart
 /// (guest.rs).
 pub const GUEST_PAGES: Region = Region { base: 0x7100_0000_0000, size: crate::MAX_GUESTS * GUEST_STRIDE };
@@ -39,6 +41,8 @@ const fn disjoint(a: &Region, b: &Region) -> bool {
     a.end() <= b.base || b.end() <= a.base
 }
 
+const _: () = assert!(LARGE_WINDOW.base.is_multiple_of(2 * MIB) && disjoint(&LARGE_WINDOW, &WINDOWS)
+    && disjoint(&LARGE_WINDOW, &GUEST_PAGES) && disjoint(&LARGE_WINDOW, &DISPLAY) && disjoint(&LARGE_WINDOW, &FROM_ROOT));
 const _: () = assert!(
     disjoint(&WINDOWS, &GUEST_PAGES) && disjoint(&WINDOWS, &DISPLAY) && disjoint(&GUEST_PAGES, &DISPLAY)
         && disjoint(&FROM_ROOT, &WINDOWS) && disjoint(&FROM_ROOT, &GUEST_PAGES) && disjoint(&FROM_ROOT, &DISPLAY)

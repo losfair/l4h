@@ -89,7 +89,7 @@ mod guest {
     use super::*;
     #[derive(Clone, Copy, PartialEq, Eq, Debug)] pub enum State { Created, Running, Stopped }
     pub struct Vcpu {
-        pub sc_k: sel4::cap::SchedContext, pub sc_u: sel4::cap::SchedContext,
+        pub sc_k: sel4::cap::SchedContext, pub sc_u: Option<sel4::cap::SchedContext>,
         pub core: usize, pub vcore: usize, pub host_cap: u32, pub cooldown: u32, pub usage: u32, pub k_share: u32,
         pub wall_ticks: u64, pub run_ticks: u64, pub steal_ns: u64,
     }
@@ -100,6 +100,8 @@ mod guest {
         pub vcpus: Vec<Vcpu>, pub vmm_limits: Option<(usize, sched::budget::Plan)>,
         pub vmm_share: u32, pub vmm_usage: u32, pub vmm_boosted: bool,
         pub vmm_guard: sched::budget::BoostGuard, pub vmm_limited: bool, pub events: Vec<Box<Event>>,
+        /// An HVM guest (its monitor's MCP is l4h_host::hvm::MCP).
+        pub hvm: Option<()>,
     }
     impl Guest {
         pub fn event_page(&self, v: usize) -> *mut Event { (&*self.events[v]) as *const Event as *mut Event }
@@ -127,11 +129,11 @@ fn manager() -> Vmmgr {
 fn create(id: usize, core: usize, cap: u32, vcpus: usize) -> Guest {
     Guest { id, vmm: None, state: State::Created, cpu_cap_pct: cap,
         vcpus: (0..vcpus).map(|v| Vcpu { sc_k: sel4::cap::SchedContext((id * 10 + v * 2 + 1) as u64),
-            sc_u: sel4::cap::SchedContext((id * 10 + v * 2 + 2) as u64), core, vcore: v, host_cap: 1024, cooldown: 0,
+            sc_u: Some(sel4::cap::SchedContext((id * 10 + v * 2 + 2) as u64)), core, vcore: v, host_cap: 1024, cooldown: 0,
             usage: 0, k_share: 500, wall_ticks: 0, run_ticks: 0, steal_ns: 0 }).collect(),
         vmm_limits: None, vmm_share: sched::budget::VMM_SHARE_INIT, vmm_usage: 0, vmm_boosted: true,
         vmm_guard: Default::default(), vmm_limited: false,
-        events: (0..vcpus).map(|_| Box::new(Event { idle_ticks: 0, steal_ns: 0, host_cap: 1024 })).collect() }
+        events: (0..vcpus).map(|_| Box::new(Event { idle_ticks: 0, steal_ns: 0, host_cap: 1024 })).collect(), hvm: None }
 }
 fn build(h: &mut Vmmgr, id: usize, core: usize, cap: u32, vcpus: usize) {
     let mut g = create(id, core, cap, vcpus);
@@ -153,15 +155,22 @@ fn place_vcpu(h: &mut Vmmgr, id: usize, core: usize) {
     v.core = core;
     MODEL.with_borrow_mut(|m| {
         m.limits.get_mut(&v.sc_k.0).unwrap().0 = core;
-        m.limits.get_mut(&v.sc_u.0).unwrap().0 = core;
+        m.limits.get_mut(&v.sc_u.unwrap().0).unwrap().0 = core;
     });
 }
 fn assert_limits(h: &Vmmgr) {
     for g in h.guests.iter().flatten().filter(|g| g.state != State::Stopped) {
         let (core, p) = g.vmm_limits.unwrap();
         MODEL.with_borrow(|m| {
-            assert_eq!(m.limits[&g.vcpus[0].sc_k.0], (g.vcpus[0].core, p.kernel, p.period, 14));
-            assert_eq!(m.limits[&g.vcpus[0].sc_u.0], (g.vcpus[0].core, p.user, p.period, 14));
+            match g.vcpus[0].sc_u {
+                Some(sc_u) => {
+                    assert_eq!(m.limits[&g.vcpus[0].sc_k.0], (g.vcpus[0].core, p.kernel, p.period, 14));
+                    assert_eq!(m.limits[&sc_u.0], (g.vcpus[0].core, p.user, p.period, 14));
+                }
+                // An HVM guest's vCPU: one context with the guest's whole part.
+                None => assert_eq!(m.limits[&g.vcpus[0].sc_k.0],
+                    (g.vcpus[0].core, (p.kernel + p.user).min(p.period), p.period, 14)),
+            }
             assert_eq!(m.limits[&g.vmm.as_ref().unwrap().sc.0], (core, p.vmm, p.vmm_period, 14));
         });
         if g.cpu_cap_pct > 0 {
@@ -210,6 +219,34 @@ fn changing_caps_reconfigures_the_vmm_and_both_guest_contexts() {
             if cap > 0 && cap < 100 { assert_eq!(k + u, period * cap as u64 / 100); }
         });
     }
+}
+
+#[test]
+fn an_hvm_guests_vcpus_run_on_one_context_with_the_guests_whole_budget() {
+    let mut h = manager();
+    let mut g = create(0, 0, 0, 2);
+    for v in &mut g.vcpus {
+        v.sc_u = None;
+    }
+    let p = sched::prepare_vmm(&mut h, &mut g).unwrap();
+    let sc = sel4::cap::SchedContext(9);
+    h.info.sched_control(0).sched_control_configure_flags(sc, p.vmm, p.vmm_period, l4h_host::GUEST_EXTRA_REFILLS, 0, 0).unwrap();
+    MODEL.with_borrow_mut(|m| { m.priorities.insert(sc.0, (l4h_host::PRIO_VMM, l4h_host::PRIO_VMM)); });
+    g.vmm = Some(Component { sc, tcb: sel4::cap::Tcb(sc.0) });
+    h.guests[0] = Some(g);
+    sched::start(&mut h, 0).unwrap();
+    assert_limits(&h);
+    MODEL.with_borrow(|m| assert!(!m.limits.contains_key(&2), "no user context configured"));
+    for cap in [50, 1, 100, 0] {
+        assert_eq!(sched::set_cap(&mut h, 0, cap), Ok(()));
+        assert_limits(&h);
+        MODEL.with_borrow(|m| {
+            let (_, k, period, _) = m.limits[&1];
+            if cap > 0 && cap < 100 { assert!(k <= period * cap as u64 / 100); }
+        });
+    }
+    sched::balance(&mut h, 100_000);
+    assert_limits(&h);
 }
 
 #[test]
@@ -290,6 +327,36 @@ fn dominating_vmms_share_a_background_allowance_and_cannot_restore_their_authori
     assert!(h.guest(0).unwrap().vmm_boosted);
     MODEL.with_borrow(|m| assert_eq!(m.priorities[&9], (101, l4h_host::PRIO_VMM)));
     assert_limits(&h);
+}
+
+/// An HVM guest's monitor (l4h-hvm) is demoted as a VMM is, but its MCP
+/// never rises above hvm::MCP (below the debug syscalls' threshold): only
+/// its priority changes.
+#[test]
+fn a_demoted_hvm_monitor_keeps_its_low_mcp() {
+    let mut h = manager();
+    build(&mut h, 0, 0, 0, 1);
+    {
+        let g = h.guests[0].as_mut().unwrap();
+        g.hvm = Some(());
+        for v in &mut g.vcpus { v.sc_u = None; }
+    }
+    MODEL.with_borrow_mut(|m| { m.priorities.insert(9, (l4h_host::hvm::MCP, l4h_host::PRIO_VMM)); });
+    sched::start(&mut h, 0).unwrap();
+    spawn(&mut h, 1, 0, 0, 1);
+    MODEL.with_borrow_mut(|m| { m.priority_calls.clear(); m.used.extend([(9, 45_000), (19, 45_000), (1, 10_000)]); });
+    sched::balance(&mut h, 100_000);
+    assert!(!h.guest(0).unwrap().vmm_boosted);
+    MODEL.with_borrow(|m| {
+        assert!(m.priority_calls.contains(&(9, "mcp", l4h_host::hvm::MCP)), "{:?}", m.priority_calls);
+        assert!(!m.priority_calls.iter().any(|&(t, what, p)| t == 9 && what == "mcp" && p > l4h_host::hvm::MCP));
+        assert!(m.priorities[&9].0 <= l4h_host::hvm::MCP && l4h_host::hvm::MCP < 101);
+    });
+    for _ in 0..10 {
+        MODEL.with_borrow_mut(|m| m.used.extend([(9, 1000), (1, 50_000)]));
+        sched::balance(&mut h, 100_000);
+    }
+    MODEL.with_borrow(|m| assert_eq!(m.priorities[&9].0, l4h_host::hvm::MCP, "the MCP stays low"));
 }
 
 #[test]
@@ -784,7 +851,7 @@ fn busy_vcore(h: &mut Vmmgr) {
         let g = h.guest(0).unwrap();
         let p = sched::budget::plan(5000, 0, 0, 500, None);
         h.info.sched_control(v).sched_control_configure_flags(g.vcpus[v].sc_k, p.kernel, p.period, 14, 0, 0).unwrap();
-        h.info.sched_control(v).sched_control_configure_flags(g.vcpus[v].sc_u, p.user, p.period, 14, 0, 0).unwrap();
+        h.info.sched_control(v).sched_control_configure_flags(g.vcpus[v].sc_u.unwrap(), p.user, p.period, 14, 0, 0).unwrap();
     }
     sched::start(h, 0).unwrap();
     spawn(h, 1, 0, 0, 1);
@@ -812,7 +879,7 @@ fn a_vcore_swap_protects_both_cores_and_moves_the_whole_vcore() {
     MODEL.with_borrow(|m| {
         for v in &g.vcpus {
             assert_eq!(m.limits[&v.sc_k.0].0, v.core);
-            assert_eq!(m.limits[&v.sc_u.0].0, v.core);
+            assert_eq!(m.limits[&v.sc_u.unwrap().0].0, v.core);
         }
         // Each vCPU moved once, both contexts, busiest first; no guest stopped.
         assert_eq!(m.operations, [1, 2, 3, 4, 5, 6, 7, 8].map(|sc| ('c', sc)));

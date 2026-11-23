@@ -18,7 +18,7 @@
 use crate::badges;
 use crate::wire::{Bits, Protocol};
 use core::marker::PhantomData;
-use crate::{blk, mailbox, net, nicd, trust, usb, vmmgr};
+use crate::{blk, hvm, mailbox, net, nicd, trust, usb, vmmgr};
 use l4h_abi as abi;
 
 /// Who holds a capability, or is its target.
@@ -36,6 +36,8 @@ pub enum Party {
     Nicd,
     Logd,
     Vmm,
+    /// A guest's l4h-hvm (crate::hvm), in place of its VMM.
+    Hvm,
     Guest,
     /// An IRQ handler (a device's interrupt or another partition's
     /// doorbell), which signals the notification it is bound to.
@@ -56,6 +58,7 @@ impl Party {
             Party::Nicd => crate::KIND_NICD,
             Party::Logd => crate::KIND_LOGD,
             Party::Vmm => crate::KIND_VMM,
+            Party::Hvm => crate::KIND_HVM,
             Party::Root | Party::Guest | Party::Irq => return None,
         })
     }
@@ -71,7 +74,8 @@ pub enum Object {
     Notification,
     /// trustd's kick notification (trust::SLOT_KICK).
     Kick,
-    /// A guest vCPU's notification (abi::BADGE_*).
+    /// A guest vCPU's notification (abi::BADGE_*), or an l4h-hvm vCPU
+    /// thread's (badges::hvm_vcpu).
     Vcpu,
 }
 
@@ -209,7 +213,7 @@ pub mod p {
             }
         )*};
     }
-    parties!(Root, Vmmgr, Memd, Trustd, Flags, Blkd, Netd, Usbd, Nicd, Logd, Vmm, Guest, Irq);
+    parties!(Root, Vmmgr, Memd, Trustd, Flags, Blkd, Netd, Usbd, Nicd, Logd, Vmm, Hvm, Guest, Irq);
 }
 
 /// The objects as types.
@@ -289,6 +293,7 @@ const fn served(target: Party, object: Object) -> &'static str {
         (Vmmgr, Endpoint) => <vmmgr::call::Proto as Protocol>::NAME,
         (Flags, Endpoint) => <trust::call::Proto as Protocol>::NAME,
         (Vmm, Endpoint) => <crate::hypercall::call::Proto as Protocol>::NAME,
+        (Hvm, Endpoint) => <hvm::call::Proto as Protocol>::NAME,
         (Blkd, Notification) => <blk::call::Proto as Protocol>::NAME,
         (Netd, Notification) => <net::call::Proto as Protocol>::NAME,
         (Usbd, Notification) => <usb::call::Proto as Protocol>::NAME,
@@ -363,6 +368,12 @@ pub const TRUSTD_FLAGS: E<p::Trustd, p::Flags, o::Endpoint, trust::call::Proto> 
     Fixed(trust::Sender::Trustd.badge()), 1, Root, "trustd's main thread's flags for guests"));
 pub const GUEST_VMM: E<p::Guest, p::Vmm, o::Endpoint, crate::hypercall::call::Proto> = E::new(edge("GUEST_VMM", Guest, Slots(abi::SLOT_HYP_EP as u64, 1), Vmm, Endpoint, Call,
     Fixed(crate::hypercall::Sender::Guest.badge()), 1, Vmmgr, "the guest's hypercalls (hypercall::call)"));
+/// A guest has an l4h-vmm or an l4h-hvm, never both: vmmgr knows which,
+/// and both call it as the guest's VMM, with its id.
+pub const HVM_VMMGR: E<p::Hvm, p::Vmmgr, o::Endpoint, vmmgr::call::Proto> = E::new(copy(edge("HVM_VMMGR", Hvm, Slots(crate::SLOT_ROOT_EP, 1), Vmmgr, Endpoint, Call,
+    Field(badges::vmmgr::COMPONENT, badges::vmmgr::ID), MAX_GUESTS, Vmmgr, "an l4h-hvm's calls to vmmgr, as its guest's VMM (vmmgr::call)"), "VMM_VMMGR"));
+pub const HVM_CALL: E<p::Hvm, p::Hvm, o::Endpoint, hvm::call::Proto> = E::new(edge("HVM_CALL", Hvm, Slots(hvm::SLOT_SELF_CALL, 1), Hvm, Endpoint, Call,
+    Fixed(hvm::Sender::Vcpu.badge()), 1, Vmmgr, "an l4h-hvm's vCPU threads' calls to its I/O thread (hvm::call)"));
 
 // ---- Faults.
 pub const TRUSTD_FAULT: E<p::Trustd, p::Root, o::Endpoint> = E::new(edge("TRUSTD_FAULT", Trustd, AtFault, Root, Endpoint, Fault,
@@ -379,6 +390,8 @@ pub const LOGD_FAULT: E<p::Logd, p::Root, o::Endpoint> = E::new(edge("LOGD_FAULT
     Field(COMPONENT_FAULT, badges::parent::ID), 1 << 16, Root, "logd's faults"));
 pub const VMM_FAULT: E<p::Vmm, p::Vmmgr, o::Endpoint> = E::new(edge("VMM_FAULT", Vmm, AtFault, Vmmgr, Endpoint, Fault,
     Field(COMPONENT_FAULT, badges::parent::ID), MAX_GUESTS, Vmmgr, "a VMM's faults"));
+pub const HVM_FAULT: E<p::Hvm, p::Vmmgr, o::Endpoint> = E::new(edge("HVM_FAULT", Hvm, AtFault, Vmmgr, Endpoint, Fault,
+    Field(COMPONENT_FAULT, badges::parent::ID), MAX_GUESTS, Vmmgr, "an l4h-hvm's faults, its vCPU threads' too: the guest stops"));
 pub const MEMD_KEEPER_FAULT: E<p::Memd, p::Root, o::Endpoint> = E::new(edge("MEMD_KEEPER_FAULT", Memd, AtFault, Root, Endpoint, KeeperFault,
     Field(COMPONENT_FAULT, badges::parent::ID), 1 << 16, Root, "memd's keeper's faults"));
 pub const VMMGR_KEEPER_FAULT: E<p::Vmmgr, p::Root, o::Endpoint> = E::new(edge("VMMGR_KEEPER_FAULT", Vmmgr, AtFault, Root, Endpoint, KeeperFault,
@@ -425,6 +438,10 @@ const VMM_KICKS: At = Slots(crate::VMM_KICK_SLOT_BASE, crate::MAX_GUEST_DEVICES)
 pub const VMM_BLKD_KICK: E<p::Vmm, p::Blkd, o::Notification> = E::new(shared(edge("VMM_BLKD_KICK", Vmm, VMM_KICKS, Blkd, Notification, Signal,
     Fixed(badges::blkd::KICK), 1, Root, "a disk channel has requests (in its device's kick slot)")));
 pub const VMM_NETD_KICK: E<p::Vmm, p::Netd, o::Notification> = E::new(shared(edge("VMM_NETD_KICK", Vmm, VMM_KICKS, Netd, Notification, Signal,
+    Bit(badges::netd::PORT), net::MAX_PORTS, Root, "port p has frames to send (in its device's kick slot)")));
+pub const HVM_BLKD_KICK: E<p::Hvm, p::Blkd, o::Notification> = E::new(shared(edge("HVM_BLKD_KICK", Hvm, VMM_KICKS, Blkd, Notification, Signal,
+    Fixed(badges::blkd::KICK), 1, Root, "a disk channel has requests (in its device's kick slot; root mints it for the guest's VMM)")));
+pub const HVM_NETD_KICK: E<p::Hvm, p::Netd, o::Notification> = E::new(shared(edge("HVM_NETD_KICK", Hvm, VMM_KICKS, Netd, Notification, Signal,
     Bit(badges::netd::PORT), net::MAX_PORTS, Root, "port p has frames to send (in its device's kick slot)")));
 pub const GUEST_USBD_KICK: E<p::Guest, p::Usbd, o::Notification> = E::new(shared(edge("GUEST_USBD_KICK", Guest, Chosen, Usbd, Notification, Signal,
     Fixed(badges::usbd::KICK), 1, Root, "the guest's USB queues have requests (in its device CNode, passed on by vmmgr)")));
@@ -478,6 +495,14 @@ pub const GUEST_VMM_CONSOLE: E<p::Guest, p::Vmm, o::Notification> = E::new(edge(
     Notification, Signal, Fixed(badges::vmm::CONSOLE), 1, Vmmgr, "the guest wrote to its console ring"));
 pub const VMMGR_VMM: E<p::Vmmgr, p::Vmm, o::Notification> = E::new(edge("VMMGR_VMM", Vmmgr, Chosen, Vmm, Notification, Signal,
     Fixed(badges::vmm::MEM), 1, Vmmgr, "the guest's hotplug target changed"));
+pub const VMMGR_HVM: E<p::Vmmgr, p::Hvm, o::Notification> = E::new(edge("VMMGR_HVM", Vmmgr, Chosen, Hvm, Notification, Signal,
+    Fixed(badges::hvm::CTL), 1, Vmmgr, "console input or a power request for the guest (its console page)"));
+pub const HVM_KICK: E<p::Hvm, p::Hvm, o::Notification> = E::new(edge("HVM_KICK", Hvm, Slots(hvm::SLOT_SELF_KICK, 1), Hvm, Notification, Signal,
+    Fixed(badges::hvm::KICK), 1, Vmmgr, "a vCPU thread wrote a virtio queue notification"));
+pub const HVM_CONSOLE: E<p::Hvm, p::Hvm, o::Notification> = E::new(edge("HVM_CONSOLE", Hvm, Slots(hvm::SLOT_SELF_CONSOLE, 1), Hvm, Notification, Signal,
+    Fixed(badges::hvm::CONSOLE), 1, Vmmgr, "a vCPU thread wrote console output"));
+pub const HVM_VCPU: E<p::Hvm, p::Hvm, o::Vcpu> = E::new(edge("HVM_VCPU", Hvm, Slots(crate::VCPU_NTFN_SLOT_BASE, abi::MAX_VCPUS), Hvm, Vcpu, Signal,
+    Fixed(badges::hvm_vcpu::EVENT), 1, Vmmgr, "raise interrupts, IPIs, INIT and SIPI on vCPU v"));
 pub const VMM_VCPU: E<p::Vmm, p::Guest, o::Vcpu> = E::new(shared(edge("VMM_VCPU", Vmm, Slots(crate::VCPU_NTFN_SLOT_BASE, abi::MAX_VCPUS), Guest, Vcpu, Signal,
     Fixed(abi::BADGE_EVENT), 1, Vmmgr, "raise device events on vCPU v")));
 pub const GUEST_IPI: E<p::Guest, p::Guest, o::Vcpu> = E::new(edge("GUEST_IPI", Guest, Chosen, Guest, Vcpu, Signal,
@@ -497,6 +522,7 @@ pub const EDGES: &[Edge] = &[
     IRQ_BLKD.0, IRQ_NICD.0, ROOT_NICD_TIMER.0, IRQ_USBD.0, IRQ_MONITOR.0, DOORBELL_ROOT.0, DOORBELL_NETD.0, NETD_LINK_SELF.0, NETD_LINK_RING.0,
     GUEST_TRUSTD.0, ROOT_TRUSTD_RELAY.0,
     GUEST_CTL.0, GUEST_VMM_KICK.0, GUEST_VMM_MEM.0, GUEST_VMM_CONSOLE.0, VMMGR_VMM.0, VMM_VCPU.0, GUEST_IPI.0, VMMGR_VCPU.0,
+    HVM_VMMGR.0, HVM_CALL.0, HVM_FAULT.0, HVM_BLKD_KICK.0, HVM_NETD_KICK.0, VMMGR_HVM.0, HVM_KICK.0, HVM_CONSOLE.0, HVM_VCPU.0,
 ];
 
 /// A slot where a component keeps an IPC object of its own, which no
@@ -507,16 +533,20 @@ pub const EDGES: &[Edge] = &[
 pub struct Own {
     /// host::KIND_*, or every kind.
     pub kind: Option<u32>,
+    /// Slots [slot, slot + len).
     pub slot: u64,
+    pub len: usize,
     pub object: Object,
     pub what: &'static str,
 }
 
 pub const OWN: &[Own] = &[
-    Own { kind: None, slot: crate::SLOT_NTFN, object: Notification, what: "its notification" },
-    Own { kind: None, slot: crate::SLOT_SERVICE_EP, object: Endpoint, what: "its endpoint" },
-    Own { kind: None, slot: crate::SLOT_FAULT_EP, object: Endpoint, what: "its keeper's: the main thread's faults" },
-    Own { kind: Some(crate::KIND_TRUSTD), slot: trust::SLOT_KICK, object: Kick, what: "its kick notification" },
+    Own { kind: None, slot: crate::SLOT_NTFN, len: 1, object: Notification, what: "its notification" },
+    Own { kind: None, slot: crate::SLOT_SERVICE_EP, len: 1, object: Endpoint, what: "its endpoint" },
+    Own { kind: None, slot: crate::SLOT_FAULT_EP, len: 1, object: Endpoint, what: "its keeper's: the main thread's faults" },
+    Own { kind: Some(crate::KIND_TRUSTD), slot: trust::SLOT_KICK, len: 1, object: Kick, what: "its kick notification" },
+    Own { kind: Some(crate::KIND_HVM), slot: hvm::SLOT_VCPU_WAIT, len: abi::MAX_VCPUS, object: Vcpu,
+        what: "its vCPU threads' bound notifications, which they wait on" },
 ];
 
 /// What a component of `kind` may have in slot `slot` that calls or
@@ -527,7 +557,7 @@ pub fn expected(kind: u32, slot: u64) -> Option<Object> {
             && matches!(e.at, At::Slots(base, len) if slot >= base && slot < base + len as u64)
     });
     held.map(|e| e.object).or_else(|| {
-        OWN.iter().find(|o| o.slot == slot && o.kind.is_none_or(|k| k == kind)).map(|o| o.object)
+        OWN.iter().find(|o| slot >= o.slot && slot < o.slot + o.len as u64 && o.kind.is_none_or(|k| k == kind)).map(|o| o.object)
     })
 }
 
@@ -544,12 +574,117 @@ pub const fn cap_tag(object: Object) -> u32 {
     }
 }
 
+/// seL4's tags of a CNode and of a TCB, the same on every architecture,
+/// and of x86-64's VCPU and EPT PML4 (structures.bf of x86-64's mode).
+pub const CAP_NULL: u32 = 0;
+pub const CAP_CNODE: u32 = 10;
+pub const CAP_THREAD: u32 = 12;
+pub const CAP_X86_VCPU: u32 = 21;
+pub const CAP_X86_EPT_PML4: u32 = 29;
+
+/// What an HVM monitor's capability that is no edge is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Held {
+    CNode,
+    Thread,
+    Vcpu,
+    EptPml4,
+}
+
+/// The capabilities vmmgr gives an l4h-hvm besides its edges and the
+/// standard slots: (first slot, count, what, for what).  Anything else
+/// there that does not call or signal is refused by `audit`.
+pub const HVM_HELD: [(u64, usize, Held, &str); 6] = [
+    (hvm::SLOT_EPT, 1, Held::EptPml4, "the guest's EPT root"),
+    (hvm::SLOT_BLOCKS, 1, Held::CNode, "the CNode of its RAM blocks' Untypeds"),
+    (hvm::SLOT_KEEP_EPT, 1, Held::CNode, "the CNode of its RAM blocks' EPT frames"),
+    (hvm::SLOT_KEEP_HVM, 1, Held::CNode, "the CNode of its RAM blocks' own mappings"),
+    (hvm::SLOT_VCPU_TCB, abi::MAX_VCPUS, Held::Thread, "its vCPU threads"),
+    (hvm::SLOT_VCPU_OBJ, abi::MAX_VCPUS, Held::Vcpu, "its VCPUs"),
+];
+
+/// The HVM_HELD entry slot `slot` is in.
+const fn hvm_held(slot: u64) -> Option<Held> {
+    let mut i = 0;
+    while i < HVM_HELD.len() {
+        let (first, n, held, _) = HVM_HELD[i];
+        if slot >= first && slot < first + n as u64 {
+            return Some(held);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// HVM_HELD's slots are the monitor's own: past the standard slots, in its
+/// CNode, apart from one another and from every slot an edge or its own
+/// objects (OWN) have in a monitor.
+const fn hvm_held_check() -> Result<(), &'static str> {
+    let mut i = 0;
+    while i < HVM_HELD.len() {
+        let (first, n, _, what) = HVM_HELD[i];
+        if first < crate::SLOT_FIRST_FREE || first + n as u64 > 1 << crate::CNODE_BITS {
+            return Err(what);
+        }
+        let mut j = 0;
+        while j < HVM_HELD.len() {
+            let (f2, n2, _, _) = HVM_HELD[j];
+            if i != j && first < f2 + n2 as u64 && f2 < first + n as u64 {
+                return Err(what);
+            }
+            j += 1;
+        }
+        let mut k = 0;
+        while k < EDGES.len() {
+            let e = &EDGES[k];
+            let mine = match e.holder.kind() {
+                Some(h) => h == crate::KIND_HVM,
+                None => false,
+            };
+            if mine && matches!(e.at, At::Slots(base, len) if first < base + len as u64 && base < first + n as u64) {
+                return Err(e.name);
+            }
+            k += 1;
+        }
+        let mut o = 0;
+        while o < OWN.len() {
+            let w = &OWN[o];
+            let mine = match w.kind {
+                None => true,
+                Some(k) => k == crate::KIND_HVM,
+            };
+            if mine && first < w.slot + w.len as u64 && w.slot < first + n as u64 {
+                return Err(w.what);
+            }
+            o += 1;
+        }
+        i += 1;
+    }
+    Ok(())
+}
+const _: () = assert!(hvm_held_check().is_ok(), "an HVM monitor's held capabilities overlap");
+
 /// What is wrong with a capability tagged `tag` in slot `slot` of a
 /// component of `kind`, if anything: one that calls or signals must be one
-/// the wiring gives it (expected), of its object's type.
+/// the wiring gives it (expected), of its object's type.  An HVM monitor's
+/// others past the standard slots are only those of HVM_HELD, each of its
+/// type.
 pub fn audit(kind: u32, slot: u64, tag: u32) -> Result<(), &'static str> {
     if tag != CAP_ENDPOINT && tag != CAP_NOTIFICATION {
-        return Ok(());
+        if kind != crate::KIND_HVM || slot < crate::SLOT_FIRST_FREE || tag == CAP_NULL {
+            return Ok(());
+        }
+        return match (hvm_held(slot), tag) {
+            (Some(Held::CNode), CAP_CNODE)
+            | (Some(Held::Thread), CAP_THREAD)
+            | (Some(Held::Vcpu), CAP_X86_VCPU)
+            | (Some(Held::EptPml4), CAP_X86_EPT_PML4) => Ok(()),
+            (Some(_), _) => Err("of another type than an HVM monitor has there"),
+            (None, _) => Err("that an HVM monitor has nowhere there"),
+        };
+    }
+    if kind == crate::KIND_HVM && hvm_held(slot).is_some() {
+        return Err("where an HVM monitor holds no edge");
     }
     match expected(kind, slot) {
         Some(o) if cap_tag(o) == tag => Ok(()),
@@ -571,7 +706,7 @@ const fn own_check() -> Result<(), &'static str> {
                 (Some(k), Some(h)) => k == h,
                 _ => false,
             };
-            if kind_ok && matches!(e.at, At::Slots(base, len) if o.slot >= base && o.slot < base + len as u64) {
+            if kind_ok && matches!(e.at, At::Slots(base, len) if o.slot < base + len as u64 && base < o.slot + o.len as u64) {
                 return Err(e.name);
             }
             j += 1;
@@ -640,6 +775,8 @@ const fn space(target: Party, object: Object) -> Option<(&'static [Bits], u64)> 
         (Usbd, Notification) => (badges::usbd::OWN, badges::usbd::SIGNALS),
         (Nicd, Notification) => (badges::nicd::OWN, badges::nicd::SIGNALS),
         (Vmm, Endpoint | Notification) => (badges::vmm::OWN, badges::vmm::SIGNALS),
+        (Hvm, Endpoint | Notification) => (badges::hvm::OWN, badges::hvm::SIGNALS),
+        (Hvm, Vcpu) => (badges::hvm_vcpu::OWN, badges::hvm_vcpu::SIGNALS),
         (Trustd, Notification) => (badges::trustd::OWN, badges::trustd::SIGNALS),
         (Trustd, Kick) => (badges::trustd_kick::OWN, badges::trustd_kick::SIGNALS),
         (Flags, Endpoint) => (badges::flags::OWN, badges::flags::SIGNALS),
@@ -656,6 +793,7 @@ const fn accepts(target: Party, object: Object, badge: u64) -> bool {
         (Memd, Endpoint) => crate::memd::Sender::of_badge(badge).is_some(),
         (Flags, Endpoint) => trust::Sender::of_badge(badge).is_some(),
         (Vmm, Endpoint) => crate::hypercall::Sender::of_badge(badge).is_some(),
+        (Hvm, Endpoint) => hvm::Sender::of_badge(badge).is_some(),
         _ => false,
     }
 }
@@ -679,7 +817,7 @@ const fn check(edges: &[Edge]) -> Result<(), &'static str> {
                     return Err(e.name);
                 }
                 // Root never waits on a driver, nor on vmmgr or a VMM.
-                if same(e.holder, Root) && matches!(e.target, Blkd | Netd | Usbd | Nicd | Vmmgr | Vmm) {
+                if same(e.holder, Root) && matches!(e.target, Blkd | Netd | Usbd | Nicd | Vmmgr | Vmm | Hvm) {
                     return Err(e.name);
                 }
             }
@@ -774,7 +912,7 @@ const fn called(p: Party) -> bool {
 /// has a keeper to answer them if it fails, and has no fault edge to its
 /// parent; one they do not, faults to its parent.
 const fn keepers() -> Result<(), &'static str> {
-    let kinds = [Vmmgr, Memd, Trustd, Flags, Blkd, Netd, Usbd, Nicd, Logd, Vmm];
+    let kinds = [Vmmgr, Memd, Trustd, Flags, Blkd, Netd, Usbd, Nicd, Logd, Vmm, Hvm];
     let mut i = 0;
     while i < kinds.len() {
         let p = kinds[i];
@@ -842,6 +980,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_hvm_monitors_held_capabilities_are_audited_by_slot_and_type() {
+        let h = crate::KIND_HVM;
+        assert_eq!(audit(h, hvm::SLOT_EPT, CAP_X86_EPT_PML4), Ok(()));
+        // Each architecture object only where it belongs: a VCPU is no EPT
+        // root, nor any other odd tag.
+        for t in [CAP_X86_VCPU, 19, 23, 1] {
+            assert!(audit(h, hvm::SLOT_EPT, t).is_err(), "tag {t} as the EPT root");
+        }
+        for t in [CAP_X86_EPT_PML4, 19, 23, 1] {
+            assert!(audit(h, hvm::SLOT_VCPU_OBJ, t).is_err(), "tag {t} as a VCPU");
+        }
+        for s in [hvm::SLOT_BLOCKS, hvm::SLOT_KEEP_EPT, hvm::SLOT_KEEP_HVM] {
+            assert_eq!(audit(h, s, CAP_CNODE), Ok(()));
+            assert!(audit(h, s, CAP_THREAD).is_err() && audit(h, s, 1).is_err());
+        }
+        for v in [0, abi::MAX_VCPUS as u64 - 1] {
+            assert_eq!(audit(h, hvm::SLOT_VCPU_TCB + v, CAP_THREAD), Ok(()));
+            assert_eq!(audit(h, hvm::SLOT_VCPU_OBJ + v, CAP_X86_VCPU), Ok(()));
+            assert!(audit(h, hvm::SLOT_VCPU_OBJ + v, CAP_CNODE).is_err());
+            // Its waits' notifications, and the vCPUs' badged ones.
+            assert_eq!(audit(h, hvm::SLOT_VCPU_WAIT + v, CAP_NOTIFICATION), Ok(()));
+            assert_eq!(audit(h, crate::VCPU_NTFN_SLOT_BASE + v, CAP_NOTIFICATION), Ok(()));
+        }
+        // No call or signal where it holds objects; nothing else past the
+        // standard slots: an Untyped, a CNode or a TCB anywhere else.
+        assert!(audit(h, hvm::SLOT_EPT, CAP_ENDPOINT).is_err());
+        assert!(audit(h, hvm::SLOT_VCPU_TCB, CAP_NOTIFICATION).is_err());
+        assert_eq!(audit(h, hvm::SLOT_SCRATCH_UT, CAP_NULL), Ok(()), "empty");
+        for (s, tag) in [(hvm::SLOT_SCRATCH_UT, 2), (hvm::SLOT_SCRATCH_EPT, CAP_CNODE), (hvm::SLOT_VCPU_WAIT, CAP_THREAD), (4095, 1)] {
+            assert!(audit(h, s, tag).is_err(), "slot {s} tag {tag}");
+        }
+        // Standard slots, and other kinds, as before.
+        assert_eq!(audit(h, crate::SLOT_CNODE, CAP_CNODE), Ok(()));
+        assert_eq!(audit(crate::KIND_VMM, hvm::SLOT_BLOCKS, CAP_CNODE), Ok(()));
+        assert_eq!(hvm_held_check(), Ok(()));
+    }
+
+    #[test]
     fn put_live_blames_only_a_full_slot() {
         use core::cell::Cell;
         // Each case: put's answers in turn; the outcome, and whether the slot
@@ -869,7 +1045,10 @@ mod tests {
         assert_eq!(keepers(), Ok(()));
         // Who calls its parent: trustd and vmmgr root, the VMMs vmmgr.
         assert!(parent_call(crate::KIND_TRUSTD).is_some() && parent_call(crate::KIND_VMMGR).is_some()
-            && parent_call(crate::KIND_VMM).is_some());
+            && parent_call(crate::KIND_VMM).is_some() && parent_call(crate::KIND_HVM).is_some());
+        // An l4h-hvm calls vmmgr as its guest's VMM, and faults to it.
+        assert_eq!(HVM_VMMGR.badge(7), VMM_VMMGR.badge(7));
+        assert!(parent_fault(crate::KIND_HVM).is_some() && !crate::has_keeper(crate::KIND_HVM));
         for k in [crate::KIND_MEMD, crate::KIND_FLAGS, crate::KIND_BLKD, crate::KIND_NETD, crate::KIND_USBD, crate::KIND_NICD, crate::KIND_LOGD] {
             assert!(parent_call(k).is_none());
         }
@@ -917,6 +1096,13 @@ mod tests {
         assert_eq!(expected(crate::KIND_TRUSTD, trust::SLOT_KICK), Some(Kick));
         assert_eq!(expected(crate::KIND_BLKD, trust::SLOT_KICK), None);
         assert_eq!(expected(crate::KIND_NETD, crate::SLOT_NTFN), Some(Notification));
+        // An l4h-hvm's vCPU threads' own notifications, and nobody else's.
+        assert_eq!(expected(crate::KIND_HVM, hvm::SLOT_VCPU_WAIT + 3), Some(Vcpu));
+        assert_eq!(expected(crate::KIND_VMM, hvm::SLOT_VCPU_WAIT + 3), None);
+        assert_eq!(expected(crate::KIND_HVM, crate::VCPU_NTFN_SLOT_BASE + 1), Some(Vcpu));
+        assert_eq!(expected(crate::KIND_HVM, hvm::SLOT_SELF_CALL), Some(Endpoint));
+        assert_eq!(expected(crate::KIND_HVM, crate::VMM_KICK_SLOT_BASE + 2), Some(Notification));
+        assert_eq!(expected(crate::KIND_HVM, hvm::SLOT_VCPU_TCB), None);
     }
 
     #[test]

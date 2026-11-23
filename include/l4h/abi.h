@@ -538,9 +538,11 @@ enum l4h_ctl_op {
 	/* -> vals: cores, free bytes, total bytes, nr disks, nr vms, nr NICs; data[0..8]: physical cores (u64, little-endian; 0 on older hosts) */
 	L4H_CTL_HOST_INFO = 1,
 	/* args: ram bytes (rounded up to 2 MiB), vcpus, -, -, I/O pool bytes
-	 * (0 = default, else a power of two from 1 MiB to 256 MiB); data:
-	 * name -> vals[0] = vm, vals[1] = lowest GPA for the initrd (the
-	 * kernel lies below it) */
+	 * (0 = default, else a power of two from 1 MiB to 256 MiB), flags
+	 * (L4H_VM_CREATE_*); data: name -> vals[0] = vm, vals[1] = lowest
+	 * GPA for the initrd (the kernel lies below it; 0 for an HVM guest,
+	 * which places its images itself).  An HVM guest needs VT-x or AMD-V
+	 * (-ENODEV without). */
 
 	L4H_CTL_VM_CREATE = 2,
 	/* args: vm, dst gpa, src offset in the control data area, len
@@ -548,7 +550,10 @@ enum l4h_ctl_op {
 	L4H_CTL_VM_LOAD = 3,
 	/* args: vm, initrd gpa, initrd size; data: cmdline.  The host loads
 	 * its guest kernel and starts it.  Everything VM_LOAD wrote must lie
-	 * in the initrd, which the launch digest covers (DESIGN.md §10.2). */
+	 * in the initrd, which the launch digest covers (DESIGN.md §10.2).
+	 * An HVM guest (L4H_VM_CREATE_HVM) runs the kernel dom0 loaded too:
+	 * args[3] its gpa, args[4] its size (a bzImage or an ELF vmlinux),
+	 * args[5] boot flags (L4H_HVM_BOOT_*). */
 	L4H_CTL_VM_START = 4,
 	/* args: vm */
 	L4H_CTL_VM_DESTROY = 5,
@@ -854,14 +859,27 @@ enum l4h_vm_state {
 	L4H_VM_STOPPED = 3,
 };
 
+/* L4H_CTL_VM_CREATE args[5]: an HVM guest, which runs an unmodified
+ * x86-64 kernel in VT-x or AMD-V guest mode with standard virtio-pci
+ * devices (DESIGN.md §5.11) rather than ARCH=l4h.  It has no USB, GPU or
+ * memory hotplug (L4H_CTL_USB_ATTACH, L4H_CTL_GPU_ATTACH and
+ * L4H_CTL_VM_SET_MEM fail with -EOPNOTSUPP). */
+#define L4H_VM_CREATE_HVM	(1u << 0)
+/* L4H_CTL_VM_START args[5] of an HVM guest: none are defined yet. */
+#define L4H_HVM_BOOT_FLAGS	0u
+/* struct l4h_ctl_vm flags. */
+#define L4H_VM_FLAG_HVM		(1u << 0)
+
 struct l4h_ctl_vm {
 	l4h_u32 id;
 	l4h_u32 state;          /* enum l4h_vm_state */
 	l4h_u32 vcpus;
-	l4h_u32 reserved;
+	l4h_u32 flags;          /* L4H_VM_FLAG_* */
 	l4h_u64 ram;
 	char name[L4H_CTL_NAME_MAX];
 };
+_Static_assert(sizeof(struct l4h_ctl_vm) == 56, "l4h_ctl_vm layout (host/l4h-abi)");
+_Static_assert(__builtin_offsetof(struct l4h_ctl_vm, flags) == 12, "l4h_ctl_vm flags (host/l4h-abi)");
 
 /* ------------------------------------------------------------------------
  * Hypercalls: seL4_Call(L4H_SLOT_HYP_EP) with the label below, arguments

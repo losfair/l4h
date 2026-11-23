@@ -25,6 +25,7 @@ static THREAD_TCB: core::cell::Cell<u64> = core::cell::Cell::new(host::SLOT_TCB)
 pub use l4h_host as host;
 pub use l4h_ipc as ipc;
 pub use sel4;
+pub use sel4_initialize_tls::Region as TlsRegion;
 
 #[doc(hidden)]
 pub use one_shot_mutex;
@@ -171,6 +172,11 @@ pub fn init() -> &'static Info {
 /// the layout are looked at: memd's and vmmgr's larger CNodes hold memory
 /// above them.
 fn audit(kind: u32) {
+    // An HVM monitor's MCP is below the debug syscalls' (l4h_host::hvm::MCP):
+    // vmmgr audited its CSpace before it started (Component::audit_cspace).
+    if kind == host::KIND_HVM {
+        return;
+    }
     sel4::sel4_cfg_if! {
         if #[sel4_cfg(DEBUG_BUILD)] {
             if !host::AUDIT {
@@ -207,10 +213,26 @@ fn start_keeper() {
 /// Call only once, with a suspended TCB and a mapped stack. The entry
 /// must install that thread's IPC buffer before making any seL4 call.
 pub unsafe fn start_secondary(slot: u64, top: usize, entry: extern "C" fn() -> !) {
+    unsafe { start_at(slot, top, KEEPER_TLS.region(), entry as *const () as u64, 0) };
+}
+
+/// Start another thread of the component (TCB `slot`, suspended, in its
+/// VSpace and CSpace) at `entry(arg)`, on the stack below `top` and with
+/// its TLS in `tls`: for components with threads of their own, such as
+/// l4h-hvm's vCPU threads.
+///
+/// # Safety
+/// `tls` and the stack must be mapped, used by nothing else, and outlive
+/// the thread; the entry must call `thread_init` before any seL4 call.
+pub unsafe fn start_thread(slot: u64, top: usize, tls: sel4_initialize_tls::Region, entry: extern "C" fn(usize) -> !, arg: usize) {
+    unsafe { start_at(slot, top, tls, entry as *const () as u64, arg as u64) };
+}
+
+unsafe fn start_at(slot: u64, top: usize, tls: sel4_initialize_tls::Region, pc: u64, arg: u64) {
     let phdr = sel4_phdrs::locate_phdrs()
         .ok()
         .and_then(|p| p.find_by_type(sel4_phdrs::PT_TLS))
-        .expect("keeper: no TLS image");
+        .expect("thread: no TLS image");
     let image = sel4_initialize_tls::UncheckedTlsImage {
         vaddr: phdr.p_vaddr,
         filesz: phdr.p_filesz,
@@ -218,17 +240,30 @@ pub unsafe fn start_secondary(slot: u64, top: usize, entry: extern "C" fn() -> !
         align: phdr.p_align,
     }
     .check()
-    .expect("keeper: bad TLS image");
-    let tp = unsafe { image.initialize_inexact_reservation_region(&KEEPER_TLS.region()) }.expect("keeper TLS space");
+    .expect("thread: bad TLS image");
+    let tp = unsafe { image.initialize_inexact_reservation_region(&tls) }.expect("thread TLS space");
     let k = cap::<sel4::cap_type::Tcb>(slot);
     let mut regs = sel4::UserContext::default();
-    *regs.pc_mut() = entry as *const () as u64;
+    *regs.pc_mut() = pc;
+    *regs.c_param_mut(0) = arg;
     // As if called: x86-64 expects a return address pushed.
     *regs.sp_mut() = (if cfg!(target_arch = "x86_64") { top - 8 } else { top }) as u64;
-    k.tcb_write_all_registers(false, &mut regs).expect("keeper registers");
+    k.tcb_write_all_registers(false, &mut regs).expect("thread registers");
     // After the registers, which include the TLS base.
-    k.tcb_set_tls_base(tp as u64).expect("keeper TLS");
-    k.tcb_resume().expect("keeper start");
+    k.tcb_set_tls_base(tp as u64).expect("thread TLS");
+    k.tcb_resume().expect("thread start");
+}
+
+/// What a thread started with `start_thread` does first: its IPC buffer
+/// (mapped at `ipcbuf`) and its TCB's slot, for panics.
+///
+/// # Safety
+/// `ipcbuf` must be the thread's own IPC buffer, mapped writable.
+pub unsafe fn thread_init(tcb: u64, ipcbuf: usize) {
+    THREAD_TCB.set(tcb);
+    unsafe {
+        sel4::set_ipc_buffer((ipcbuf as *mut sel4::IpcBuffer).as_mut().unwrap());
+    }
 }
 
 /// The keeper: wait for the main thread to fault (its fault is never

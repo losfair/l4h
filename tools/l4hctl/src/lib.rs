@@ -355,7 +355,8 @@ pub struct CtlVm {
     pub id: u32,
     pub state: u32,
     pub vcpus: u32,
-    pub reserved: u32,
+    /// VM_FLAG_*.
+    pub flags: u32,
     pub ram: u64,
     pub name: [u8; CTL_NAME_MAX],
 }
@@ -401,6 +402,7 @@ pub fn errno_name(e: i64) -> &'static str {
         22 => "invalid argument",
         28 => "no space for devices",
         38 => "not supported",
+        95 => "not supported by this kind of VM",
         _ => "error",
     }
 }
@@ -900,6 +902,70 @@ pub struct VmSpec<'a> {
     pub gpu: Option<(u64, u64)>,
     /// Whole USB controllers ([`Ctl::usb_info`] indices).
     pub usbs: Vec<u64>,
+    /// An HVM guest's kernel (a bzImage or an ELF vmlinux for x86-64),
+    /// which it runs unmodified instead of the host's; None for an l4h
+    /// guest.  HVM guests have no GPU or USB.
+    pub kernel: Option<&'a [u8]>,
+}
+
+/// Where an HVM guest's kernel image and initrd go in its RAM (their
+/// GPAs): above where the kernel runs (from 16 MiB, or its ELF segments),
+/// each 2 MiB aligned, all in the RAM below the 3 GiB hole.
+pub fn hvm_layout(kernel: &[u8], initrd_len: u64, ram: u64) -> Result<(u64, u64)> {
+    const MIB2: u64 = 2 << 20;
+    const LOW_RAM_MAX: u64 = 3 << 30;
+    let le = |off: usize, n: usize| -> Result<u64> {
+        let b = off.checked_add(n).and_then(|end| kernel.get(off..end)).ok_or(Error("kernel: truncated header".into()))?;
+        Ok(b.iter().rev().fold(0, |v, &x| v << 8 | x as u64))
+    };
+    let end = if kernel.starts_with(b"\x7fELF") {
+        // ELF64 x86-64: its PT_LOAD segments' physical addresses.
+        if le(4, 1)? != 2 || le(5, 1)? != 1 || le(18, 2)? != 62 {
+            return err("kernel: not an x86-64 ELF64 image");
+        }
+        let (phoff, phentsize, phnum) = (le(32, 8)? as usize, le(54, 2)? as usize, le(56, 2)? as usize);
+        let mut end = 0u64;
+        for i in 0..phnum {
+            let ph = i.checked_mul(phentsize).and_then(|o| phoff.checked_add(o)).ok_or(Error("kernel: bad program headers".into()))?;
+            if le(ph, 4)? == 1 {
+                let e = le(ph + 24, 8)?.checked_add(le(ph + 40, 8)?).ok_or(Error("kernel: segment past the address space".into()))?;
+                end = end.max(e);
+            }
+        }
+        if end == 0 {
+            return err("kernel: ELF image without loadable segments");
+        }
+        end
+    } else if le(0x202, 4)? == u32::from_le_bytes(*b"HdrS") as u64 && le(0x1fe, 2)? == 0xaa55 {
+        // A bzImage: its payload runs from its preferred address (16 MiB
+        // unless it says otherwise) and takes init_size there.
+        if le(0x206, 2)? < 0x020c || le(0x236, 2)? & 1 == 0 {
+            return err("kernel: not a 64-bit bzImage (boot protocol 2.12+, XLF_KERNEL_64)");
+        }
+        let setup = (match le(0x1f1, 1)? { 0 => 4, s => s } + 1) * 512;
+        let payload = (kernel.len() as u64).checked_sub(setup).ok_or(Error("kernel: truncated bzImage".into()))?;
+        // As l4h-hvm's boot::load_address: a kernel that cannot be
+        // relocated runs at its preferred address, a relocatable one there
+        // if it is aligned as asked, else at 16 MiB.
+        let (pref, align) = (le(0x258, 8)?, le(0x230, 4)?.max(1));
+        let load = match pref {
+            0 => 16 << 20,
+            p if le(0x234, 1)? == 0 || p % align == 0 => p,
+            _ => 16 << 20,
+        };
+        load.checked_add(le(0x260, 4)?.max(payload)).ok_or(Error("kernel: placed past the address space".into()))?
+    } else {
+        return err("kernel: neither a bzImage nor an ELF vmlinux");
+    };
+    let past = || Error("kernel: placed past the address space".into());
+    let image = end.checked_next_multiple_of(MIB2).ok_or_else(past)?;
+    let initrd = image.checked_add(kernel.len() as u64).and_then(|e| e.checked_next_multiple_of(MIB2)).ok_or_else(past)?;
+    let need = initrd.checked_add(initrd_len).ok_or_else(past)?;
+    let top = ram.min(LOW_RAM_MAX);
+    if need > top {
+        return err(format!("kernel and initrd need {} MiB of RAM below 3 GiB; the VM has {} MiB there", need.div_ceil(1 << 20), top >> 20));
+    }
+    Ok((image, initrd))
 }
 
 /// An xHCI controller of the host, as [`Ctl::usb_info`] reports it.
@@ -934,11 +1000,18 @@ pub struct Vm {
     pub vcpus: u32,
     pub ram: u64,
     pub name: String,
+    /// An HVM guest.
+    pub hvm: bool,
 }
 
 pub const VM_CREATED: u32 = 1;
 pub const VM_RUNNING: u32 = 2;
 pub const VM_STOPPED: u32 = 3;
+/// CTL_VM_CREATE args[5]: an HVM guest, which runs an unmodified x86-64
+/// kernel (`VmSpec::kernel`) with standard virtio-pci devices.
+pub const VM_CREATE_HVM: u64 = 1 << 0;
+/// CtlVm::flags: an HVM guest.
+pub const VM_FLAG_HVM: u32 = 1 << 0;
 pub const POWER_OFF: u64 = 0;
 pub const POWER_REBOOT: u64 = 1;
 
@@ -1032,8 +1105,14 @@ impl Ctl {
             (p, n) => (p + (n << 22)).next_power_of_two(),
         };
         let io_pool = if o.io_pool != 0 { o.io_pool } else { io_pool };
-        let resp = self.call(CTL_VM_CREATE, &[o.mem, o.vcpus, 0, 0, io_pool], &name, &[])?;
+        let hvm = match o.kernel {
+            Some(k) => Some(hvm_layout(k, o.initrd.len() as u64, o.mem)?),
+            None => None,
+        };
+        let flags = if hvm.is_some() { VM_CREATE_HVM } else { 0 };
+        let resp = self.call(CTL_VM_CREATE, &[o.mem, o.vcpus, 0, 0, io_pool, flags], &name, &[])?;
         let (vm, initrd_gpa) = (resp.vals[0], resp.vals[1]);
+        let (kernel_gpa, initrd_gpa) = hvm.unwrap_or((0, initrd_gpa));
         let r = (|| {
             for &(disk, flags, start, sectors) in &o.disks {
                 self.call(CTL_BLK_ATTACH, &[vm, disk, flags, start, sectors], &[], &[])?;
@@ -1064,12 +1143,16 @@ impl Ctl {
             for &c in &o.usbs {
                 self.call(CTL_USB_ATTACH, &[vm, c], &[], &[])?;
             }
+            if let Some(k) = o.kernel {
+                load(self, vm, kernel_gpa, k)?;
+            }
             if !o.initrd.is_empty() {
                 load(self, vm, initrd_gpa, o.initrd)?;
             }
             let mut cmdline = o.cmdline.as_bytes().to_vec();
             cmdline.truncate(CTL_DATA_MAX - 1);
-            self.call(CTL_VM_START, &[vm, initrd_gpa, o.initrd.len() as u64], &cmdline, &[])?;
+            let kernel_len = o.kernel.map_or(0, |k| k.len() as u64);
+            self.call(CTL_VM_START, &[vm, initrd_gpa, o.initrd.len() as u64, kernel_gpa, kernel_len, 0], &cmdline, &[])?;
             Ok((vm, macs))
         })();
         if r.is_err() {
@@ -1098,6 +1181,7 @@ impl Ctl {
                     vcpus: vm.vcpus,
                     ram: vm.ram,
                     name: String::from_utf8_lossy(&vm.name[..name_len]).into_owned(),
+                    hvm: vm.flags & VM_FLAG_HVM != 0,
                 });
                 first = vm.id as u64 + 1;
             }
@@ -1828,5 +1912,117 @@ mod host_info_tests {
         assert_eq!(info(6, 0).physical_cores, 6);
         assert_eq!(info(4, 5).physical_cores, 4);
         assert_eq!(info(4, u64::MAX).physical_cores, 4);
+    }
+}
+
+#[cfg(test)]
+mod hvm_layout_tests {
+    use super::*;
+
+    const MIB: u64 = 1 << 20;
+
+    /// A bzImage header: `sects` setup sectors, `init` init_size.
+    fn bzimage(len: usize, sects: u8, init: u32, xlf: u16) -> Vec<u8> {
+        let mut k = vec![0u8; len];
+        k[0x1f1] = sects;
+        k[0x1fe..0x200].copy_from_slice(&0xaa55u16.to_le_bytes());
+        k[0x202..0x206].copy_from_slice(b"HdrS");
+        k[0x206..0x208].copy_from_slice(&0x020fu16.to_le_bytes());
+        k[0x234] = 1;
+        k[0x230..0x234].copy_from_slice(&(2 * MIB as u32).to_le_bytes());
+        k[0x236..0x238].copy_from_slice(&xlf.to_le_bytes());
+        k[0x258..0x260].copy_from_slice(&(16 * MIB).to_le_bytes());
+        k[0x260..0x264].copy_from_slice(&init.to_le_bytes());
+        k
+    }
+
+    #[test]
+    fn bzimage_goes_above_its_init_size() {
+        let k = bzimage(10 * MIB as usize, 30, 40 * MIB as u32, 1);
+        // 16 MiB + 40 MiB, then the image (10 MiB), then the initrd.
+        assert_eq!(hvm_layout(&k, 5 * MIB, 128 * MIB).unwrap(), (56 * MIB, 66 * MIB));
+        // A payload larger than init_size counts as itself.
+        let k = bzimage(50 * MIB as usize, 30, MIB as u32, 1);
+        let (image, initrd) = hvm_layout(&k, 0, 256 * MIB).unwrap();
+        assert!(image >= 16 * MIB + 50 * MIB - 31 * 512 && image % (2 * MIB) == 0);
+        assert_eq!(initrd, (image + 50 * MIB).next_multiple_of(2 * MIB));
+    }
+
+    /// As l4h-hvm's boot::load_address: a kernel that cannot be relocated
+    /// runs at its preferred address, aligned or not; the image and the
+    /// initrd go above its window.
+    #[test]
+    fn non_relocatable_bzimage_at_its_preferred_address() {
+        let mut k = bzimage(10 * MIB as usize, 30, 40 * MIB as u32, 1);
+        k[0x234] = 0;
+        k[0x258..0x260].copy_from_slice(&(3 * MIB).to_le_bytes());
+        assert_eq!(hvm_layout(&k, 0, 256 * MIB).unwrap().0, (3 * MIB + 40 * MIB).next_multiple_of(2 * MIB));
+        k[0x234] = 1;
+        assert_eq!(hvm_layout(&k, 0, 256 * MIB).unwrap().0, 56 * MIB, "relocatable, misaligned: 16 MiB");
+        k[0x258..0x260].copy_from_slice(&(64 * MIB).to_le_bytes());
+        assert_eq!(hvm_layout(&k, 0, 256 * MIB).unwrap().0, 104 * MIB);
+    }
+
+    /// Program headers anywhere a hostile image puts them: errors.
+    #[test]
+    fn elf_program_headers_out_of_bounds() {
+        let mut k = vec![0u8; 4096];
+        k[..4].copy_from_slice(b"\x7fELF");
+        k[4] = 2;
+        k[5] = 1;
+        k[18] = 62;
+        k[56..58].copy_from_slice(&2u16.to_le_bytes());
+        for (phoff, phentsize) in [(u64::MAX - 8, 56u16), (u64::MAX - 100, 0xffff), (4090, 56), (1 << 40, 56)] {
+            k[32..40].copy_from_slice(&phoff.to_le_bytes());
+            k[54..56].copy_from_slice(&phentsize.to_le_bytes());
+            assert!(hvm_layout(&k, 0, 128 * MIB).is_err(), "{phoff:#x} {phentsize}");
+        }
+    }
+
+    /// Places that do not fit in 64 bits are errors, not overflows.
+    #[test]
+    fn layouts_past_the_address_space() {
+        let mut k = bzimage(10 * MIB as usize, 30, 40 * MIB as u32, 1);
+        k[0x234] = 0;
+        k[0x258..0x260].copy_from_slice(&(u64::MAX - MIB).to_le_bytes());
+        assert!(hvm_layout(&k, 0, 256 * MIB).is_err());
+        k[0x258..0x260].copy_from_slice(&(u64::MAX - 64 * MIB).to_le_bytes());
+        assert!(hvm_layout(&k, 0, 256 * MIB).is_err(), "its 2 MiB-aligned staging");
+        let k = bzimage(10 * MIB as usize, 30, 40 * MIB as u32, 1);
+        assert!(hvm_layout(&k, u64::MAX - 8, u64::MAX).is_err(), "an initrd past the end");
+    }
+
+    #[test]
+    fn refused_layouts() {
+        // Not 64-bit, or too little RAM below the hole.
+        assert!(hvm_layout(&bzimage(MIB as usize, 30, 8 << 20, 0), 0, 128 * MIB).is_err());
+        let k = bzimage(10 * MIB as usize, 30, 40 * MIB as u32, 1);
+        assert!(hvm_layout(&k, 64 * MIB, 128 * MIB).is_err());
+        assert!(hvm_layout(&k, 64 * MIB, 4096 * MIB).is_ok());
+        // Only RAM below 3 GiB counts.
+        assert!(hvm_layout(&k, 3 * 1024 * MIB, 8192 * MIB).is_err());
+        assert!(hvm_layout(b"not a kernel", 0, 128 * MIB).is_err());
+        assert!(hvm_layout(&[0u8; 16], 0, 128 * MIB).is_err());
+    }
+
+    #[test]
+    fn elf_goes_above_its_segments() {
+        let mut k = vec![0u8; 4096];
+        k[..4].copy_from_slice(b"\x7fELF");
+        k[4] = 2;
+        k[5] = 1;
+        k[18] = 62;
+        k[32..40].copy_from_slice(&64u64.to_le_bytes());
+        k[54..56].copy_from_slice(&56u16.to_le_bytes());
+        k[56..58].copy_from_slice(&2u16.to_le_bytes());
+        for (i, (paddr, memsz)) in [(16 * MIB, 20 * MIB), (40 * MIB, 3 * MIB)].into_iter().enumerate() {
+            let ph = 64 + 56 * i;
+            k[ph..ph + 4].copy_from_slice(&1u32.to_le_bytes());
+            k[ph + 24..ph + 32].copy_from_slice(&paddr.to_le_bytes());
+            k[ph + 40..ph + 48].copy_from_slice(&memsz.to_le_bytes());
+        }
+        assert_eq!(hvm_layout(&k, MIB, 128 * MIB).unwrap(), (44 * MIB, 46 * MIB));
+        k[18] = 3;
+        assert!(hvm_layout(&k, MIB, 128 * MIB).is_err());
     }
 }

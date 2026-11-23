@@ -1167,6 +1167,111 @@ a backend in `arch/l4h/kvm/arm64` (patch `0019-kvm-arm64-on-l4h.patch`):
   MMIO, PSCI, dirty logging, ONE_REG, SMP, the vgic and the timer, then a
   2-vCPU Linux under Firecracker and cloud-hypervisor.
 
+### 5.11 HVM guests: unmodified x86-64 kernels
+
+Where the CPU has VT-x or AMD-V, a VM can instead be an **HVM guest**:
+an unmodified x86-64 kernel (a distribution's bzImage, or an ELF
+`vmlinux`) in hardware guest mode, on a small virtual PC with standard
+devices. `l4hctl create NAME --hvm --kernel F [--initrd F] [--mem MB]
+[--vcpus N] [--cmdline S] [--disk ...] [--nic ...] [--io-pool MB]`
+(`CTL_VM_CREATE` args[5] `VM_CREATE_HVM`; the kernel is loaded with
+`CTL_VM_LOAD` and named by `CTL_VM_START` args[3..5]). HVM guests have no
+USB, GPU or memory hotplug (`-EOPNOTSUPP`); without VT-x or AMD-V the
+create fails with `-ENODEV`. `l4hctl list` shows them as `hvm`.
+
+- **The monitor: `l4h-hvm`.** Each HVM guest gets its own component, as a
+  PV guest gets an l4h-vmm (`KIND_HVM`, embedded in vmmgr as
+  `L4H_HVM_ELF`, `no_std` without a heap). It is trusted by its guest only
+  and confined like it: every thread's MCP is `PRIO_KERNEL` (100), below
+  the debug syscalls' threshold, so a guest that took over its monitor
+  has no more authority than a guest kernel. Its wiring is checked as
+  every component's (`HVM_*` edges: vmmgr's `vmm_ready`/`guest_power`,
+  blkd and netd kicks, its own call endpoint and notifications), with
+  what else it holds by slot and type (`wiring::HVM_HELD`: the EPT root,
+  the block and keep CNodes, the vCPU TCBs and VCPUs); vmmgr audits its
+  CSpace before it starts, as it cannot (debug syscalls need an MCP
+  above its own).
+- **Threads.** One thread per vCPU, bound to its seL4 VCPU
+  (`VCPU_SetTCB`, `TCB_SetEPTRoot`), at `PRIO_KERNEL` on the vCPU's kernel
+  SC (one SC: vmmgr's scheduler gives HVM vCPUs `sc_k` only), with its own
+  64 KiB stack (and guard page), TLS and IPC buffer, and a bound
+  notification that ends `VMEnter` or its wait in HLT. The I/O thread
+  (the component's main thread, `PRIO_VMM`) owns the PCI devices and
+  their backends and serves the vCPU threads' slow paths by `seL4_Call`.
+  Hot paths take no call: an interrupt is an atomic IRR bit and a signal
+  of the target vCPU; a virtio queue notification posts a kick bit and
+  signals the I/O thread. Only vCPU threads take the few short spinlocks
+  (the I/O APIC, the UART, the PIT and RTC); the I/O thread never spins
+  behind a lower-priority vCPU, and leaves I/O APIC and UART work it
+  causes to vCPU 0 (it signals it).
+- **Memory.** RAM below the 32-bit hole, `[0, min(ram, 3 GiB))`, the rest
+  from 4 GiB; the hole holds the PCI MMIO window (`0xC000_0000`, 512 MiB),
+  ECAM (`0xE000_0000`, 1 MiB), the I/O APIC and the local APICs, none of
+  them in the EPT. Guest RAM is memd's 2 MiB blocks (§8.2), mapped as 2 MiB
+  EPT pages on first touch: vmmgr builds the EPT's upper levels and
+  l4h-hvm's own mapping of RAM (at `HVM_RAM_VA`), fills the blocks dom0
+  loaded and block 0, and gives the rest as Untypeds in a block CNode; an
+  EPT violation on RAM makes the I/O thread retype the block and map it
+  in both. The frames' caps stay in keep CNodes, which vmmgr revokes and
+  memd reclaims as for any guest (the destroy order is the PV one).
+- **DMA.** No device reaches guest RAM: netd copies frames into and out
+  of the queues l4h-hvm reads from guest RAM, and blkd moves disk data
+  through the guest's I/O pool (§8.1; 8 MiB by default for HVM), through
+  which l4h-hvm bounces each request (a 4 KiB page allocator; a request
+  that finds no room waits, and its queue stalls, until completions free
+  some). The device's `size_max`/`seg_max` keep a request within a
+  quarter of the pool (and blkd's maximum). No `VIRTIO_F_ACCESS_PLATFORM`:
+  the guest gives plain guest-physical addresses, which l4h-hvm checks
+  against its RAM (a queue naming anything else is broken, not followed).
+- **Boot.** The Linux 64-bit boot protocol: for a bzImage (2.12+,
+  `XLF_KERNEL_64`) the payload moves to its preferred address (16 MiB) and
+  runs from `startup_64` (+0x200); for an ELF `vmlinux` its `PT_LOAD`
+  segments go to their physical addresses. l4h-hvm writes the zero page
+  (setup header, E820, initrd, command line, `acpi_rsdp_addr`), a GDT and
+  identity page tables for the first 4 GiB in the first MiB, and starts
+  vCPU 0 in long mode with RSI at the zero page; the others wait for
+  INIT and SIPI and start in real mode, as on a PC. `l4hctl` stages the
+  image and the initrd above where the kernel runs.
+- **Platform.** Per-vCPU local APICs (xAPIC MMIO and x2APIC MSRs, TPR/CR8,
+  one-shot, periodic and TSC-deadline timers on seL4 deadline timers
+  (`TCB_SetTimer`), IPIs, NMI, INIT and SIPI), a 24-pin I/O APIC, an 8259
+  pair that reports itself absent, the PIT (channel 2, for calibration),
+  a 16550A UART on COM1 (IRQ 4) that is the VM's console
+  (`l4hctl console`/`send`), a CMOS RTC from the host's clock, and ACPI
+  tables (RSDP, XSDT, MADT, FADT with a PM block, the fixed-hardware
+  power button and the reset register, MCFG, and a DSDT with `\_S5` and
+  the PCI root). `l4hctl shutdown` presses the power button (an SCI); the
+  guest's S5 write powers it off. `l4hctl shutdown --reboot` and a write
+  of the reset register reboot it (vmmgr's `guest_power(REBOOT)`) without
+  asking the guest. CPUID shows what seL4 lets a guest use (as the KVM
+  inside PV guests does, §5.10), with TSC and APIC timer frequencies
+  (leaf 0x15: a 25 MHz crystal, which the local APIC timer runs at, and
+  the TSC as a ratio Linux computes in 32 bits), invariant TSC, x2APIC,
+  TSC-deadline and the topology leaves; leaves it does not know are zero;
+  MSRs outside a fixed table raise `#GP`. Instructions that touch
+  device MMIO are decoded and emulated (MOV, MOVZX/MOVSX, MOVS, STOS,
+  CMP, TEST, OR, AND, XCHG), as are string port I/O, with a page walker
+  for 4-level, PAE and unpaged guests.
+- **PCI.** One bus over ECAM and `0xCF8/0xCFC`: a host bridge at 00:00.0,
+  then each disk and NIC in its own slot, as modern virtio-pci devices
+  (1.0+, `1AF4:1042` block and `1AF4:1041` net): BAR0 (16 KiB: common,
+  notify, ISR and device configuration), BAR2 (8 KiB: MSI-X table and
+  PBA), an MSI-X vector per queue, INTx as a fallback.
+- **VT-x and AMD-V** are two backends behind one trait (`hw/vmx.rs`,
+  `hw/svm.rs`), chosen by CPUID's vendor, over seL4's VMCS and VMCB
+  accessors; the guest's FPU state is seL4's (l4h-hvm itself never uses
+  it), XCR0 goes through `VCPU_WriteMSR`.
+- **Not yet.** HVM guests have no launch digest (§10.2): they are not
+  measured, attested or sealed, and the l4h hypercalls are not theirs.
+- **Tests.** `tests/run-hvmunit.sh` tests the device models, the decoder,
+  the page walker, boot and ACPI against a model of guest RAM, and the
+  vCPU and I/O threads' code together under a scripted guest, with
+  seL4's side (`sys.rs`) modelled;
+  `tests/run-hvmtest.sh` boots an unmodified Linux (built by
+  `tools/build-linux-hvm.sh`) with two vCPUs, a disk, a NIC and its
+  console, shuts it down by ACPI and destroys a running one, checking the
+  host gets all its memory back.
+
 ---
 
 ## 6. SMP guests
@@ -6185,6 +6290,8 @@ machine and guests of 256–512 MiB.
 | `tests/run-blktest.sh` (`BLKTEST_DEV=nvme`, `scsi`, `scsi-legacy`, `scsi-luns`, `virtio-legacy`, `ahci`, `ahci-disks`) | disk windows and data integrity; AHCI adds static ATA ports behind an ATAPI device, parallel I/O and independent disks |
 | `tests/run-sharedblk.sh` | shared controllers: concurrent clients, windows, provisioning, destroy during I/O |
 | `tests/run-lvmblk.sh` | LVM linear volumes as extent disks: dm-linear agreement, split requests, overlap and provisioning refusal (needs `lvm2` on the build host) |
+| `tests/run-hvmunit.sh` | HVM guests' device models without seL4: decoder (illegal encodings included), page walker, bzImage/ELF loading, zero page and E820, ACPI checksums, ECAM, virtio-pci and MSI-X, local APIC/x2APIC/I/O APIC, UART, RTC, PIT, CPUID, I/O pool bounce and backpressure, hostile queue addresses; and the whole machine (vCPU and I/O thread code, blkd and netd modelled) under a scripted guest: boot state, CPUID/MSRs, PCI enumeration, virtio-blk and virtio-net with MSI-X, INIT/SIPI, the UART both ways, the ACPI power button and S5 |
+| `tests/run-hvmtest.sh` | an unmodified x86-64 Linux as an HVM guest (§5.11): SMP, virtio-blk write and read back, virtio-net, console output and input, ACPI shutdown, destroy while running, memory reclaim; needs nested VT-x or AMD-V under KVM (QEMU's TCG SVM lacks the next-RIP saving seL4 requires), and otherwise checks that HVM guests are refused (`-ENODEV`) and skips |
 | `tests/run-ctltest.sh` | VM lifecycle, console, clean shutdown, disk re-attach, windows, reclaim |
 | `tests/run-devicelimit.sh` | 64 devices per guest |
 | `tests/run-gputest.sh` | virtio-gpu drawing, screenshots, size checks and reclaim |

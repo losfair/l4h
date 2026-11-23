@@ -22,6 +22,8 @@ struct CreateOpts {
     nics: Vec<NicSpec>,
     gpu: Option<(u64, u64)>,
     usbs: Vec<u64>,
+    /// An HVM guest's kernel (--hvm --kernel).
+    kernel: Option<String>,
 }
 
 /// Where the PV on `disk` starts: dom0's only window on it, which holds
@@ -39,6 +41,10 @@ fn cmd_create(ctl: &Ctl, o: &CreateOpts) -> Result<u64> {
         Some(p) => read_file(p)?,
         None => Vec::new(),
     };
+    let kernel = match &o.kernel {
+        Some(p) => Some(read_file(p)?),
+        None => None,
+    };
     let (vm, macs) = ctl.create_vm(&VmSpec {
         name: &o.name,
         mem: o.mem,
@@ -51,6 +57,7 @@ fn cmd_create(ctl: &Ctl, o: &CreateOpts) -> Result<u64> {
         nics: o.nics.clone(),
         gpu: o.gpu,
         usbs: o.usbs.clone(),
+        kernel: kernel.as_deref(),
     })?;
     for (n, mac) in o.nics.iter().zip(macs) {
         eprintln!("vm {vm}: nic on switch {}, mac {}", n.switch, fmt_mac(mac));
@@ -172,6 +179,11 @@ const USAGE: &str = "usage: l4hctl <command>
                                create and start a VM, which runs the
                                host's kernel; prints its id (volatile: the
                                guest sees no write cache and never flushes)
+         [--hvm --kernel F]    an HVM VM (x86-64, VT-x or AMD-V), which runs
+                               the unmodified kernel F (a bzImage or an ELF
+                               vmlinux) with virtio-pci disks and NICs and a
+                               16550 UART for its console (default cmdline
+                               console=ttyS0); no --gpu, --usb or mem
          [--disk I[,ro][,volatile],extents=START:N+START:N...]...
                                a disk made of extents of disk I, in order
          [--lv I:VG/LV[,ro][,volatile][,pv-start=SECTOR]]...
@@ -808,7 +820,7 @@ fn run(args: &[String]) -> Result<i32> {
             ctl.disk_flush(disk)?;
         }
         "list" | "vms" => {
-            println!("{:>3} {:<16} {:>5} {:>8} {}", "ID", "NAME", "VCPUS", "MEM", "STATE / SEAL");
+            println!("{:>3} {:<16} {:>5} {:>8} {}", "ID", "NAME", "VCPUS", "MEM", "STATE [hvm] / SEAL");
             let mut first = 0u64;
             loop {
                 let r = ctl.call(CTL_VM_LIST, &[first], &[], &[])?;
@@ -829,13 +841,14 @@ fn run(args: &[String]) -> Result<i32> {
                     };
                     let seal = ctl.vm_trust(vm.id as u64).map(|(_, seal)| seal).unwrap_or(0);
                     let seal = if seal != 0 { format!(" seal={}", attest::format_bits(&seal.to_le_bytes())) } else { String::new() };
+                    let mode = if vm.flags & VM_FLAG_HVM != 0 { " hvm" } else { "" };
                     println!(
-                        "{:>3} {:<16} {:>5} {:>7}M {}{}",
+                        "{:>3} {:<16} {:>5} {:>7}M {}{}{}",
                         vm.id,
                         String::from_utf8_lossy(&vm.name[..name_len]),
                         vm.vcpus,
                         vm.ram >> 20,
-                        state, seal
+                        state, mode, seal
                     );
                     first = vm.id as u64 + 1;
                 }
@@ -855,7 +868,10 @@ fn run(args: &[String]) -> Result<i32> {
                 nics: Vec::new(),
                 gpu: None,
                 usbs: Vec::new(),
+                kernel: None,
             };
+            let mut hvm = false;
+            let mut cmdline = None;
             let mut it = args[2..].iter();
             while let Some(a) = it.next() {
                 let mut val = || it.next().cloned().ok_or(Error(format!("{a}: missing value")));
@@ -864,7 +880,9 @@ fn run(args: &[String]) -> Result<i32> {
                     "--mem" => o.mem = parse_mib(&val()?)?,
                     "--vcpus" => o.vcpus = parse_num(&val()?)?,
                     "--io-pool" => o.io_pool = parse_mib(&val()?)?,
-                    "--cmdline" => o.cmdline = val()?,
+                    "--cmdline" => cmdline = Some(val()?),
+                    "--hvm" => hvm = true,
+                    "--kernel" => o.kernel = Some(val()?),
                     "--disk" => {
                         // DISK[,ro][,volatile][,start=SECTOR][,sectors=N] (or DISK:ro),
                         // or DISK[,ro][,volatile],extents=START:N+...
@@ -956,6 +974,12 @@ fn run(args: &[String]) -> Result<i32> {
                     _ => return err(format!("create: unknown option {a}")),
                 }
             }
+            match (hvm, o.kernel.is_some()) {
+                (true, false) => return err("create: --hvm needs --kernel"),
+                (false, true) => return err("create: --kernel needs --hvm"),
+                _ => {}
+            }
+            o.cmdline = cmdline.unwrap_or_else(|| if hvm { "console=ttyS0".into() } else { o.cmdline });
             println!("{}", cmd_create(&ctl, &o)?);
         }
         "sched" => {

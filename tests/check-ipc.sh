@@ -16,6 +16,11 @@ if [ "$arch" = aarch64 ]; then
     export CC_aarch64_sel4=aarch64-linux-gnu-gcc CC_aarch64_sel4_roottask=aarch64-linux-gnu-gcc
 fi
 lint=(-A clippy::all -D clippy::disallowed_methods)
+hvm=()
+# l4h-hvm only builds against a kernel with VT-x/AMD-V.
+if [ "$arch" = x86_64 ] && grep -q '^#define CONFIG_VTX  *1$' "${SEL4_PREFIX:-$root/build/sel4}/libsel4/include/kernel/gen_config.h" 2>/dev/null; then
+    hvm=(-p l4h-hvm)
+fi
 cargo clippy -q --target "$arch-sel4" -p l4h-ipc -p l4h-task -p l4h-rt -p l4h-vmm -p l4h-blkd -p l4h-netd \
-    -p l4h-trustd -p l4h-memd -p l4h-logd -p l4h-usbd -p l4h-vmmgr -- "${lint[@]}"
+    -p l4h-trustd -p l4h-memd -p l4h-logd -p l4h-usbd -p l4h-vmmgr "${hvm[@]}" -- "${lint[@]}"
 cargo clippy -q --target "$arch-sel4-roottask" -p l4h-root -- "${lint[@]}"

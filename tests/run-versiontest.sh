@@ -67,7 +67,7 @@ chmod +x "$tmp/provider-project/tools/build-guest-provider.sh"
 rustc +stable --edition=2024 "$root/host/l4h-vmmgr/build.rs" -o "$tmp/host-build"
 check_host_version() {
     local actual
-    actual=$(env -u L4H_VMM_ELF OUT_DIR="$tmp/host-out" SEL4_PREFIX="$tmp/prefix" \
+    actual=$(env -u L4H_VMM_ELF -u L4H_HVM_ELF OUT_DIR="$tmp/host-out" SEL4_PREFIX="$tmp/prefix" \
         CARGO_MANIFEST_DIR="$tmp/provider-project/host/l4h-vmmgr" CARGO_CFG_TARGET_ARCH=x86_64 \
         "$tmp/host-build")
     grep -Fxq "cargo:rustc-env=L4H_HOST_VERSION=$1" <<<"$actual" \
