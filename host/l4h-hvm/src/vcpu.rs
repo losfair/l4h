@@ -328,7 +328,7 @@ impl<H: Hw> Vcpu<H> {
                 let (leaf, sub) = (self.hw.gprs()[0] as u32, self.hw.gprs()[1] as u32);
                 let ctx = cpuid::Ctx {
                     vcpu: self.id as u32, vcpus: vm().vcpus as u32, tsc_hz: vm().tsc_hz,
-                    osxsave: self.hw.cr4() & CR4_OSXSAVE != 0, xcr0: self.xcr0, invpcid: vm().invpcid.load(Ordering::Relaxed),
+                    osxsave: self.hw.cr4() & CR4_OSXSAVE != 0, xcr0: self.xcr0, xcr0_max: vm().xcr0, invpcid: vm().invpcid.load(Ordering::Relaxed),
                 };
                 let [a, b, c, d] = cpuid::cpuid(leaf, sub, &ctx, &host_cpuid);
                 let g = self.hw.gprs();

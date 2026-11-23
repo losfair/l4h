@@ -200,6 +200,16 @@ pub const SEL4_MSR_XCR0: u64 = 0xffff_fffe;
 #[cfg(not(test))]
 pub const SEL4_MSR_CR2: u64 = 0xffff_ffff;
 
+/// The XCR0 features the VCPUs take: `want` (the host's, cpuid.rs's
+/// XCR0_ALLOWED) if VCPU `vcpu` takes it, else x87, SSE and AVX (seL4's
+/// KernelXSaveFeatureSet 7).  Back to XCR0's reset value after.
+#[cfg(not(test))]
+pub fn probe_xcr0(vcpu: u64, want: u64) -> u64 {
+    let got = if vcpu_write_msr(vcpu, SEL4_MSR_XCR0, want) { want } else { want & 7 };
+    vcpu_write_msr(vcpu, SEL4_MSR_XCR0, 1);
+    got
+}
+
 #[cfg(not(test))]
 pub fn vcpu_write_msr(vcpu: u64, msr: u64, v: u64) -> bool {
     sel4::with_ipc_buffer_mut(|b| b.inner_mut().seL4_X86_VCPU_WriteMSR(vcpu, msr, v)).error == 0
