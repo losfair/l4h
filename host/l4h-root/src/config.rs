@@ -99,6 +99,10 @@ pub struct Config {
     /// for full receive rings on its vNICs (host::iopool::for_nics), at
     /// least 4 MiB.
     pub dom0_io_pool_mb: usize,
+    /// dom0's process VSpaces (address spaces resident at once, up to 256,
+    /// a page and an ASID each, at least one per vCPU); 0, the default:
+    /// vmmgr's (64).
+    pub dom0_vspaces: usize,
     /// Disks passed to dom0 at boot (the first n); the rest are free for
     /// the control API.
     pub dom0_disks: usize,
@@ -175,6 +179,7 @@ impl Config {
             dom0_mem_mb: parse_usize(option_env!("L4H_DOM0_MEM_MB"), 256),
             dom0_vcpus: parse_usize(option_env!("L4H_DOM0_VCPUS"), 1),
             dom0_io_pool_mb: parse_usize(option_env!("L4H_DOM0_IO_POOL_MB"), 0),
+            dom0_vspaces: parse_usize(option_env!("L4H_DOM0_VSPACES"), 0),
             dom0_disks: parse_usize(option_env!("L4H_DOM0_DISKS"), 64),
             dom0_disk0_mb: parse_usize(option_env!("L4H_DOM0_DISK0_MB"), 0),
             dom0_disk0_windows: option_env!("L4H_DOM0_DISK0_WINDOWS"),
@@ -233,6 +238,7 @@ impl Config {
             "dom0_mem_mb" => num(&mut self.dom0_mem_mb),
             "dom0_vcpus" => num(&mut self.dom0_vcpus),
             "dom0_io_pool_mb" => num(&mut self.dom0_io_pool_mb),
+            "dom0_vspaces" => num(&mut self.dom0_vspaces),
             "dom0_disks" => num(&mut self.dom0_disks),
             "dom0_disk0_mb" => num(&mut self.dom0_disk0_mb),
             "dom0_disk0_windows" => {

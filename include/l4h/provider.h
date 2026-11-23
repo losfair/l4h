@@ -6,12 +6,7 @@
 
 #define L4H_PROVIDER_MAGIC 0x315244565048344cull /* L4HPVDR1 */
 #define L4H_PROVIDER_VERSION 1
-#define L4H_PROVIDER_VTX (1ull << 0)
-/* FL4 AArch64 at EL2: the l4h_arm_* operations work. */
-#define L4H_PROVIDER_ARM_VIRT (1ull << 1)
-/* l4h_frame_batch batches in the kernel (FL4's X86PML4FrameBatch); without
- * it, it fails every op and the guest maps and unmaps one op at a time. */
-#define L4H_PROVIDER_FRAME_BATCH (1ull << 2)
+/* Feature bits (L4H_PROVIDER_VTX, ...): l4h/guest.h, for modules too. */
 
 /* Native 64-bit C ABI. Slots are append-only and shared layouts are fixed
  * within a version; gp[] uses Linux's native register-array order. The host maps this

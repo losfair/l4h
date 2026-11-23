@@ -226,7 +226,7 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
                 ram,
                 vcpus,
                 io_pool,
-                vspaces: 64,
+                vspaces: crate::guest::DEFAULT_VSPACES,
                 ram_base,
                 dom0: false,
                 hvm: false,

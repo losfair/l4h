@@ -99,6 +99,11 @@ void l4h_provider_setup(const struct l4h_bootinfo *bi)
 	};
 }
 
+unsigned long l4h_provider_features(void)
+{
+	return l4h_provider_ops->features;
+}
+
 /* Whether l4h_frame_batch batches in the kernel (vspace.c). */
 int l4h_provider_frame_batch(void)
 {

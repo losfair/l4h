@@ -258,7 +258,7 @@ impl Vmmgr {
         let plan = guest::plan(cfg, &self.info, kernel)?;
         let sdk = self.sdk.as_ref().map_or(0, |k| k.bytes());
         let bytes = cfg.ram.checked_add(cfg.io_pool)?.checked_add(sdk)?.checked_add(plan.estimate)?.checked_add(guest::BLOCK)?;
-        if !self.can_afford(bytes, cfg.vspaces + 4 + if self.info.vtx { abi::MAX_EPT_ROOTS } else { 0 }, plan.slots) {
+        if !self.can_afford(bytes, cfg.vspaces + 4 + guest::HIGH_VSPACES + if self.info.vtx { abi::MAX_EPT_ROOTS } else { 0 }, plan.slots) {
             return None;
         }
         let id = (0..MAX_GUESTS).find(|&i| self.guest(i).is_none())?;
@@ -705,7 +705,13 @@ pub fn boot_dom0(h: &mut Vmmgr) {
         ram: h.cfg.dom0_mem as usize,
         vcpus: h.cfg.dom0_vcpus as usize,
         io_pool: h.cfg.dom0_io_pool as usize,
-        vspaces: 64,
+        // The config file's: plan() refuses more than MAX_VSPACES, and
+        // fewer than one per vCPU, which this gives at least.
+        vspaces: match h.cfg.dom0_vspaces {
+            0 => guest::DEFAULT_VSPACES,
+            n => n as usize,
+        }
+        .max(h.cfg.dom0_vcpus as usize),
         ram_base,
         dom0: true,
         hvm: false,

@@ -15,6 +15,10 @@ CC_FLAGS_NO_FPU := -mgeneral-regs-only
 KBUILD_CFLAGS += -mcmodel=large -fno-pic -fno-pie $(CC_FLAGS_NO_FPU) -mno-outline-atomics \
 	-fno-builtin -D__arch_um__ -D__arch_l4h__ $(ARCH_INCLUDE) \
 	-Dlongjmp=kernel_longjmp -Dsetjmp=kernel_setjmp
+# FL4 gives threads their own PAC keys (l4h_tcb_set_pac), which a module
+# may turn on for the kernel thread it runs on: a return address signed
+# before then would no longer authenticate.  Never sign them.
+KBUILD_CFLAGS += $(call cc-option,-mbranch-protection=none)
 KBUILD_AFLAGS += $(ARCH_INCLUDE)
 core-y += $(ARCH_DIR)/arm64/
 # NEON crypto (ARMv8 Crypto Extensions AES, ...), selected per algorithm.

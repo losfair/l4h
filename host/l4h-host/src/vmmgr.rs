@@ -283,6 +283,8 @@ pub struct VmmgrConfig {
     pub arm_virt: l4h_abi::ArmVirtInfo,
     /// Nonzero if the GICv2 GICV frames are at SLOT_GICV_FRAMES.
     pub has_gicv_frames: u64,
+    /// dom0's process VSpaces; 0: vmmgr's default.
+    pub dom0_vspaces: u64,
 }
 const _: () = assert!(crate::CONFIG_OFFSET + core::mem::size_of::<VmmgrConfig>() <= crate::INFO_SIZE);
 

@@ -64,6 +64,8 @@ pub const SLOT_EPT_POOL: usize = 644;
 pub const MAX_EPT_ROOTS: usize = 8;
 pub const SLOT_GICV: usize = 645;
 pub const GICV_PAGES: usize = 2;
+/// With BOOT_HIGH_VSPACE: an ASID-assigned ArmHighVSpace (FL4, aarch64).
+pub const SLOT_HIGH_VSPACE: usize = 646;
 pub const SLOT_DYN_BASE: usize = 1024;
 
 pub const SPECIAL_BASE: u64 = 0x0000_7ff0_0000_0000;
@@ -215,6 +217,8 @@ pub struct BootInfo {
 
 pub const BOOT_DOM0: u64 = 1 << 0;
 pub const BOOT_TOPOLOGY: u64 = 1 << 1;
+/// SLOT_HIGH_VSPACE holds the guest's ArmHighVSpace.
+pub const BOOT_HIGH_VSPACE: u64 = 1 << 2;
 
 pub const VIRTIO_MAGIC: u32 = 0x7634_686c;
 pub const VIRTIO_MAX_QUEUES: usize = 16;
@@ -1000,5 +1004,8 @@ mod tests {
         assert!(size_of::<BootInfo>() as u64 <= BOOTINFO_SIZE);
         assert_eq!(SLOT_GICV, SLOT_EPT_POOL + 1);
         assert!(SLOT_GICV < SLOT_DYN_BASE);
+        assert_eq!(SLOT_HIGH_VSPACE, SLOT_GICV + 1);
+        assert!(SLOT_HIGH_VSPACE < SLOT_DYN_BASE);
+        assert_eq!(BOOT_HIGH_VSPACE & (BOOT_DOM0 | BOOT_TOPOLOGY), 0);
     }
 }

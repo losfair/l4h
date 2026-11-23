@@ -8,6 +8,7 @@
  *
  * Kernel thread switching keeps UML's setjmp/longjmp scheme.
  */
+#include <linux/export.h>
 #include <linux/kernel.h>
 #include <linux/kemu.h>
 #include <linux/sched.h>
@@ -35,6 +36,19 @@
 unsigned long host_fp_size;
 static atomic64_t uctx_ids = ATOMIC64_INIT(0);
 static DEFINE_XARRAY(uctx_by_badge);
+
+/* For a module's own user contexts: never a Linux thread's badge. */
+unsigned long l4h_uctx_alloc_badge(void)
+{
+	return L4H_EP_BADGE_TASK | atomic64_inc_return(&uctx_ids);
+}
+EXPORT_SYMBOL_GPL(l4h_uctx_alloc_badge);
+
+unsigned long l4h_empty_cnode_cptr(void)
+{
+	return EMPTY_CNODE;
+}
+EXPORT_SYMBOL_GPL(l4h_empty_cnode_cptr);
 
 /* Debug helper for os-sel4: describe the user context with `badge`. */
 void l4h_uctx_describe(unsigned long badge)
@@ -396,11 +410,36 @@ static void handle_exception(struct uml_pt_regs *regs, struct l4h_uctx *u)
 		force_sig_fault(sig, code, addr);
 }
 
-static void handle_page_fault_stop(struct uml_pt_regs *regs, struct l4h_uctx *u)
+/*
+ * The address a user fault is about.  FL4 with L4H_PROVIDER_ARM_TBI0 runs
+ * EL0 data accesses with TCR_EL1.TBI0, as arm64 Linux does (instruction
+ * fetches too only without TBID0, which FL4 sets with FEAT_PAuth): user
+ * code may load and store through pointers with a tag in their top byte,
+ * which the MMU ignores and FAR_EL1 may keep.  As arm64's
+ * do_page_fault() (untagged_addr()), a data abort that mapping a page can
+ * repair (translation, access flag, permission) is about the untagged
+ * page; instruction aborts and address size faults keep their address.
+ * Syscalls keep the default arm64 ABI without PR_TAGGED_ADDR_ENABLE:
+ * access_ok() refuses a tagged pointer (it lies above TASK_SIZE).
+ */
+static unsigned long fault_page_addr(unsigned long addr, unsigned long esr)
+{
+#ifdef CONFIG_UML_ARM64
+	unsigned long dfsc = esr & 0x3f;
+
+	if ((l4h_provider_features() & L4H_PROVIDER_ARM_TBI0) && (esr >> 26) == 0x24 /* EL0 data abort */ &&
+	    dfsc >= 0x04 && dfsc <= 0x0f)
+		return (unsigned long)sign_extend64(addr, 55);
+#endif
+	return addr;
+}
+
+static void handle_page_fault_stop(struct uml_pt_regs *regs, struct l4h_uctx *u,
+				   unsigned long raw_fsr)
 {
 	struct faultinfo fi = {
 		.error_code = u->fault_code | 4 /* user */,
-		.cr2 = u->fault_addr,
+		.cr2 = fault_page_addr(u->fault_addr, raw_fsr),
 		.trap_no = 14,
 	};
 
@@ -412,6 +451,7 @@ void userspace(struct uml_pt_regs *regs)
 {
 	struct task_struct *t = current;
 	struct l4h_uctx *u = &t->thread.uctx;
+	struct l4h_user_ext ext = { .size = sizeof(ext) };
 	int stop;
 
 	/* Handle any immediate reschedules or signals */
@@ -428,7 +468,8 @@ void userspace(struct uml_pt_regs *regs)
 			continue;
 		}
 
-		stop = l4h_user_run(u, regs->gp, 0);
+		/* For the page fault's raw syndrome; TPIDRRO_EL0 stays 0. */
+		stop = l4h_user_run_ex(u, regs->gp, 0, &ext);
 		/* The TCB now owns the FPU state again. */
 		if (u->fp_state == L4H_FP_IN_REGS)
 			u->fp_state = L4H_FP_IN_TCB;
@@ -440,7 +481,7 @@ void userspace(struct uml_pt_regs *regs)
 			handle_syscall(regs);
 			break;
 		case L4H_STOP_PAGEFAULT:
-			handle_page_fault_stop(regs, u);
+			handle_page_fault_stop(regs, u, ext.raw_fsr);
 			break;
 		case L4H_STOP_EXCEPTION:
 			l4h_sync_regs(t);

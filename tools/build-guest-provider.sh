@@ -9,7 +9,9 @@ case "$arch" in
     x86_64) cross=; prefix=$root/build/sel4
         isa=(-mcmodel=large -m64 -mno-red-zone -mno-sse -mno-mmx -mno-sse2 -mno-avx) ;;
     aarch64) cross=${CROSS_COMPILE:-aarch64-linux-gnu-}; prefix=$root/build/sel4-aarch64
-        isa=(-mcmodel=large -mgeneral-regs-only -mno-outline-atomics) ;;
+        # Never PAC-signed returns: a module may turn on PAC keys for
+        # the kernel thread that is in here (l4h_tcb_set_pac).
+        isa=(-mcmodel=large -mgeneral-regs-only -mno-outline-atomics -mbranch-protection=none) ;;
     *) echo "unsupported L4H_ARCH: $arch" >&2; exit 1 ;;
 esac
 prefix=${SEL4_PREFIX:-$prefix}

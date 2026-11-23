@@ -155,6 +155,11 @@ typedef int64_t l4h_s64;
 #define L4H_SLOT_GICV           645
 #define L4H_GICV_PAGES          2
 #define L4H_GICV_CPTR(i)        L4H_CPTR2(L4H_SLOT_GICV, i)
+/* With L4H_BOOT_HIGH_VSPACE (FL4 on aarch64, at EL1 or EL2): an
+ * ASID-assigned ArmHighVSpace (seL4_ARM_HighVSpaceObject), the TTBR1 EL0
+ * window [seL4_ARM_HighVSpaceBase, seL4_ARM_HighVSpaceTop) that the guest
+ * binds to its threads with seL4_TCB_SetHighVSpace.  Empty otherwise. */
+#define L4H_SLOT_HIGH_VSPACE    646
 
 /* Root slots [L4H_SLOT_DYN_BASE, 4096) are free for the guest. */
 #define L4H_SLOT_DYN_BASE       1024
@@ -374,6 +379,7 @@ _Static_assert(sizeof(struct l4h_bootinfo) <= L4H_BOOTINFO_SIZE, "l4h_bootinfo f
 
 #define L4H_BOOT_DOM0           (1ull << 0)
 #define L4H_BOOT_TOPOLOGY       (1ull << 1)  /* vcpu_core is valid */
+#define L4H_BOOT_HIGH_VSPACE    (1ull << 2)  /* L4H_SLOT_HIGH_VSPACE is filled */
 
 /* ------------------------------------------------------------------------
  * virtio-l4h: the shared device page of an L4H_DEV_VIRTIO device.

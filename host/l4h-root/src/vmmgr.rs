@@ -249,6 +249,7 @@ pub fn spawn(h: &mut Host, modules: &Modules, plan: &Dom0Plan) -> Vmmgr {
         cfg.dom0_mem = (h.cfg.dom0_mem_mb as u64).saturating_mul(1 << 20);
         cfg.dom0_vcpus = h.cfg.dom0_vcpus as u64;
         cfg.dom0_io_pool = plan.io_pool as u64;
+        cfg.dom0_vspaces = h.cfg.dom0_vspaces as u64;
         cfg.dom0_disks = plan.disks.len() as u64;
         cfg.dom0_disk[..plan.disks.len()].copy_from_slice(&plan.disks);
         cfg.dom0_nics = plan.nics.len() as u64;

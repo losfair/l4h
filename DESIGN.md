@@ -502,8 +502,9 @@ hooks (§10.2), the Android features of §5.8 and x86's
   ASID's TLB entries, so a page is never freed while another vCPU can still
   reach it.
 - **VSpace pool.** x86_64 seL4 has only 4096 ASIDs (8 pools of 512), so
-  each guest gets a fixed pool of 64 pre-assigned VSpace roots, recycled
-  least recently activated first. A running task pins its VSpace and reuses
+  each guest gets a fixed pool of pre-assigned VSpace roots (64; dom0's
+  `dom0_vspaces` config takes up to 256, and never fewer than its vCPUs),
+  recycled least recently activated first. A running task pins its VSpace and reuses
   it between user stops. An mm that loses its VSpace simply refaults.
   `arch_exit_mmap()` releases its VSpace and page-table objects when the
   last user exits, not at `destroy_context()`: lazy `active_mm` references
@@ -1166,6 +1167,49 @@ a backend in `arch/l4h/kvm/arm64` (patch `0019-kvm-arm64-on-l4h.patch`):
 - **Test.** `tests/run-kvmtest-arm64.sh` (`L4H_QEMU_GIC_VERSION` 3 or 2):
   MMIO, PSCI, dirty logging, ONE_REG, SMP, the vgic and the timer, then a
   2-vCPU Linux under Firecracker and cloud-hypervisor.
+
+**AArch64 on FL4: PAC keys and the high window.** FL4 runs EL0 data
+accesses with `TCR_EL1.TBI0` (instruction fetches too unless the CPU has
+FEAT_PAuth, which gets TBID0), and gives threads their own pointer
+authentication keys (`seL4_TCB_SetPACKeys`) and an `ArmHighVSpace`, a TTBR1
+window from `0xffff_ffe0_0000_0000` that only threads it is bound to see
+(`seL4_TCB_SetHighVSpace`); neither needs EL2. Guests get them through the
+provider, for modules that run EL0 code of their own beside Linux's:
+
+- **Window.** vmmgr gives every guest one ASID-assigned `ArmHighVSpace` at
+  `L4H_SLOT_HIGH_VSPACE` and says so in the boot info
+  (`L4H_BOOT_HIGH_VSPACE`). `l4h_pt_map` and `l4h_page_map` fill it as any
+  VSpace (level-2 and level-3 tables, 4 KiB and 2 MiB frames), and
+  `l4h_tcb_set_high_vspace` binds it to a thread, 0 to the calling vCPU's
+  kernel thread (`L4H_PROVIDER_ARM_HIGH_VSPACE`).
+- **PAC.** `l4h_tcb_set_pac` sets a thread's enables (`L4H_PAC_EN_*`) and
+  ten key words (`L4H_PROVIDER_ARM_PAC`); without FEAT_PAuth FL4 refuses
+  enables. Linux and the provider are built with
+  `-mbranch-protection=none`, so keys turned on for a kernel thread break
+  no signed return address. Linux's tasks keep no keys.
+- **User contexts.** Provider version 1's `struct l4h_uctx` and 37-word
+  gp[] stay as they are: `l4h_user_run()` gives contexts a zero
+  `TPIDRRO_EL0`. `l4h_user_run_ex()` takes a `struct l4h_user_ext`
+  (`size` first; the provider uses only the fields it covers): with
+  `L4H_USER_EXT_TLS_RO` the context's `TPIDRRO_EL0`, written with its
+  registers (after a change, `L4H_USER_EXT_TLS_RO_UPDATE` writes it
+  without a stale gp[] and without FL4's full syscall reply, which leaves
+  it out), and for a page fault the raw syndrome (`raw_fsr`, ESR_EL1)
+  beside the normalized `fault_code`. Each
+  vCPU's kernel thread has its vCPU id in `TPIDRRO_EL0`. The kernel
+  exports the provider's thread, mapping and register operations, and
+  `l4h_uctx_alloc_badge()` and `l4h_empty_cnode_cptr()` for contexts a
+  module makes itself (`tests/guest/highpac`); `l4h_vspace_get()` lends
+  a pool VSpace only while one per vCPU stays for Linux's processes (0
+  otherwise, which `l4h_vspace_put()` ignores).
+- **Tagged pointers.** With `L4H_PROVIDER_ARM_TBI0`, a user data abort
+  that a mapping can repair (translation, access flag, permission) is
+  about the untagged address, as arm64's `do_page_fault()`; instruction
+  aborts and address size faults keep theirs. Syscalls keep arm64's
+  default ABI, without `PR_TAGGED_ADDR_ENABLE`: a tagged pointer fails
+  `access_ok()`.
+- **Test.** `tests/run-highpactest-arm64.sh` (QEMU TCG, or hvf on an Apple
+  Silicon Mac).
 
 ### 5.11 HVM guests: unmodified kernels
 
