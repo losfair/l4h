@@ -1,0 +1,12 @@
+#!/bin/sh
+/bin/busybox mount -t proc proc /proc
+/bin/busybox mount -t sysfs sys /sys
+/bin/busybox mount -t tmpfs tmp /tmp
+/bin/busybox mount -t devtmpfs dev /dev
+/bin/busybox mkdir -p /mnt/fuse
+if [ "$(/bin/busybox stat -c '%t:%T' /dev/fuse 2>/dev/null)" != a:e5 ]; then
+	echo 'FUSETEST: FAIL (no /dev/fuse character device 10:229)'
+else
+	/bin/fusetest /mnt/fuse
+fi
+/bin/busybox poweroff -f
