@@ -78,12 +78,20 @@ impl Net {
         self.tx_blocked = false;
         self.more &= !(1 << TX);
         let mut left = BATCH;
+        // No notifications while we take what is there: one ends the run.
+        q.disable_notify(mem);
         while left != 0 {
             if self.tx_full() {
                 self.tx_blocked = true;
                 break;
             }
-            let Some(head) = q.pop(mem) else { break };
+            let Some(head) = q.pop(mem) else {
+                if q.enable_notify(mem) {
+                    q.disable_notify(mem);
+                    continue;
+                }
+                break;
+            };
             left -= 1;
             let mut bufs = Chain::new();
             if q.chain(mem, head, &mut bufs).is_ok() {
@@ -119,8 +127,13 @@ impl Net {
             q.push(mem, head, 0);
             returned = true;
         }
-        if left == 0 {
-            self.more |= 1 << TX;
+        if left == 0 || self.tx_blocked {
+            // Back for more (complete, retry) without a notification:
+            // ask for one all the same, in case that never comes.
+            if left == 0 {
+                self.more |= 1 << TX;
+            }
+            q.enable_notify(mem);
         }
         (returned, queued)
     }
@@ -134,7 +147,15 @@ impl Net {
             if unsafe { self.rx.ready(&(*self.chan).rx) } == 0 {
                 break;
             }
-            let Some(head) = q.pop(mem) else { break };
+            // Out of buffers with frames waiting: ask for a notification
+            // when the driver adds some (without it, the event index
+            // would leave refills unannounced), unless it already has.
+            let Some(head) = q.pop(mem) else {
+                if q.enable_notify(mem) {
+                    continue;
+                }
+                break;
+            };
             left -= 1;
             let mut bufs = Chain::new();
             let mut written = 0usize;

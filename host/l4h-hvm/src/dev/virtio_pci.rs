@@ -16,6 +16,9 @@ use crate::virtq::Queue;
 
 pub const VIRTIO_F_VERSION_1: u64 = 1 << 32;
 pub const VIRTIO_RING_F_INDIRECT_DESC: u64 = 1 << 28;
+/// The event index (virtq.rs): notifications and interrupts only when the
+/// other side's index passes the event, as Linux drivers and vhost use it.
+pub const VIRTIO_RING_F_EVENT_IDX: u64 = 1 << 29;
 pub const NO_VECTOR: u16 = 0xffff;
 pub const MAX_QUEUES: usize = 8;
 
@@ -213,7 +216,7 @@ impl<B: Backend> Transport<B> {
     }
 
     fn offered(&self) -> u64 {
-        self.backend.features() | VIRTIO_F_VERSION_1 | VIRTIO_RING_F_INDIRECT_DESC
+        self.backend.features() | VIRTIO_F_VERSION_1 | VIRTIO_RING_F_INDIRECT_DESC | VIRTIO_RING_F_EVENT_IDX
     }
 
     fn reset_regs(&mut self) {
@@ -382,6 +385,7 @@ impl<B: Backend> Transport<B> {
                 let r = self.regs[q];
                 let max = self.backend.queue_max(q) as u32;
                 if self.queues[q].setup(mem, r.size as u32, max, r.desc, r.driver, r.device) {
+                    self.queues[q].set_event_idx(self.driver_features & VIRTIO_RING_F_EVENT_IDX != 0);
                     self.regs[q].enabled = true;
                     if self.status & STATUS_DRIVER_OK != 0 {
                         self.poll(mem, 1 << q, out);
@@ -474,7 +478,7 @@ impl<B: Backend> Transport<B> {
     /// Interrupt for the queues in `used`, those whose drivers want it.
     fn interrupt(&mut self, mem: &GuestMem, used: u64, out: &mut impl FnMut(Irq)) {
         for q in 0..self.nqueues() {
-            if used & (1 << q) == 0 || !self.queues[q].ready || !self.queues[q].wants_interrupt(mem) {
+            if used & (1 << q) == 0 || !self.queues[q].ready || !self.queues[q].should_interrupt(mem) {
                 continue;
             }
             if self.msix_on() {
@@ -649,7 +653,7 @@ mod tests {
         t.write(&mem, 0, 0x00, 4, 1, &mut out);
         assert_eq!(t.read(0, 0x04, 4, &mut out), 1, "VERSION_1");
         t.write(&mem, 0, 0x00, 4, 0, &mut out);
-        assert_eq!(t.read(0, 0x04, 4, &mut out) as u64, (1 << 6) | VIRTIO_RING_F_INDIRECT_DESC);
+        assert_eq!(t.read(0, 0x04, 4, &mut out) as u64, (1 << 6) | VIRTIO_RING_F_INDIRECT_DESC | VIRTIO_RING_F_EVENT_IDX);
         // Without VERSION_1, FEATURES_OK does not stick.
         t.write(&mem, 0, 0x14, 1, 1 | 2 | 8, &mut out);
         assert_eq!(t.read(0, 0x14, 1, &mut out) & 8, 0);
