@@ -200,6 +200,11 @@ pub fn svm_exit(code: u64, info1: u64, info2: u64, own_step: bool) -> Exit {
         // INTR, NMI, SMI, INIT: the host's, no instruction of the guest's.
         0x60..=0x63 => Exit::Notified(0),
         0x64 => Exit::IrqWindow,
+        // A selective CR0 write (MOV to CR0 or LMSW changing more than TS
+        // and MP): FL4 always intercepts it, so CD and NW never reach the
+        // hardware CR0; seL4 leaves it off.  As a CR0 write (KVM's
+        // cr_interception); without a register (LMSW), vcpu.rs decodes.
+        0x65 => Exit::Cr { cr: 0, write: true, reg: reg(info1) },
         0x6e => Exit::Rdtsc,
         0x6f => Exit::Rdpmc,
         0x72 => Exit::Cpuid,
@@ -369,6 +374,8 @@ mod tests {
         assert_eq!(svm_exit(0x6f, 0, 0, false), Exit::Rdpmc);
         assert_eq!(svm_exit(0x13, 1 << 63 | 3, 0, false), Exit::Cr { cr: 3, write: true, reg: Some(3) });
         assert_eq!(svm_exit(0x13, 0, 0, false), Exit::Cr { cr: 3, write: true, reg: None });
+        assert_eq!(svm_exit(0x65, 1 << 63 | 7, 0, false), Exit::Cr { cr: 0, write: true, reg: Some(7) });
+        assert_eq!(svm_exit(0x65, 0, 0, false), Exit::Cr { cr: 0, write: true, reg: None });
         assert_eq!(svm_exit(0x7c, 1, 0, false), Exit::Wrmsr);
         assert_eq!(svm_exit(0x400, 2, 0xfec0_0000, false), Exit::Mmio { gpa: 0xfec0_0000, write: true });
     }

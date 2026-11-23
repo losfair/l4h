@@ -347,19 +347,24 @@ impl<H: Hw> Vcpu<H> {
                 self.skip();
             }
             Exit::Cr { cr, write, reg } => {
-                let Some(reg) = reg.or_else(|| self.decoded_reg(true)) else { return self.ud() };
+                let decoded = if reg.is_none() { self.fetch_decode().map(|i| i.kind) } else { None };
+                // AMD-V's selective CR0 write also stops an LMSW.
+                if let (0, true, Some(Kind::Lmsw { src: Some(r) })) = (cr, write, decoded) {
+                    let v = self.reg(r) as u16;
+                    return self.lmsw(v);
+                }
+                let reg = reg.or(match decoded {
+                    Some(Kind::MovCr { reg, .. }) => Some(reg),
+                    _ => None,
+                });
+                let Some(reg) = reg else { return self.ud() };
                 self.cr(cr, write, reg);
             }
             Exit::Clts => {
                 let cr0 = self.hw.cr0() & !CR0_TS;
                 if self.hw.set_cr0(cr0) { self.skip() } else { self.gp() }
             }
-            Exit::Lmsw(v) => {
-                // PE can be set, not cleared.
-                let cr0 = self.hw.cr0();
-                let n = (cr0 & !0xe) | (v as u64 & 0xf) | (cr0 & 1);
-                if self.hw.set_cr0(n) { self.skip() } else { self.gp() }
-            }
+            Exit::Lmsw(v) => self.lmsw(v),
             Exit::Dr { dr, write, reg } => {
                 let Some(reg) = reg.or_else(|| self.decoded_reg(false)) else { return self.ud() };
                 self.dr(dr, write, reg);
@@ -390,6 +395,13 @@ impl<H: Hw> Vcpu<H> {
             Exit::TaskSwitch => self.fatal("task switch", 0),
             Exit::Fatal(r) => self.fatal("VM exit", r),
         }
+    }
+
+    /// LMSW: PE can be set, not cleared.
+    fn lmsw(&mut self, v: u16) {
+        let cr0 = self.hw.cr0();
+        let n = (cr0 & !0xe) | (v as u64 & 0xf) | (cr0 & 1);
+        if self.hw.set_cr0(n) { self.skip() } else { self.gp() }
     }
 
     /// The register a MOV to or from CR (DR) names, decoding the
