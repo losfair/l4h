@@ -1248,7 +1248,17 @@ create fails with `-ENODEV`. `l4hctl list` shows them as `hvm`.
   (leaf 0x15: a 25 MHz crystal, which the local APIC timer runs at, and
   the TSC as a ratio Linux computes in 32 bits), invariant TSC, x2APIC,
   TSC-deadline and the topology leaves; leaves it does not know are zero;
-  MSRs outside a fixed table raise `#GP`. Instructions that touch
+  MSRs outside a fixed table raise `#GP`. Linux reads leaf 0x15 on Intel
+  only: on AMD it calibrates the TSC against the PIT or the PM timer, which
+  fails when an exit takes longer than about 10 µs, as nested ones do.
+  So the hypervisor leaves carry KVM's signature with **kvmclock** alone
+  (`KVM_FEATURE_CLOCKSOURCE2` and the stable bit; no other KVM feature),
+  which every distribution kernel uses (`CONFIG_KVM_GUEST`): a vCPU's
+  `pvclock_vcpu_time_info` is written once, where the guest names it
+  (`MSR_KVM_SYSTEM_TIME_NEW`), with the host TSC's rate, kvmclock time 0
+  at the VM's creation, and `tsc_timestamp` in that vCPU's TSC (rewritten
+  when the guest writes its TSC); `MSR_KVM_WALL_CLOCK_NEW` gets the wall
+  time then, from the RTC's clock (`x86/pvclock.rs`). Instructions that touch
   device MMIO are decoded and emulated (MOV, MOVZX/MOVSX, MOVS, STOS,
   CMP, TEST, OR, AND, XCHG), as are string port I/O, with a page walker
   for 4-level, PAE and unpaged guests.

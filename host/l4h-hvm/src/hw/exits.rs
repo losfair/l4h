@@ -80,7 +80,8 @@ pub fn vmx_exit(reason: u64, q: u64, exit_info: u64, exit_error: u64, gpa: u64, 
         13 | 14 | 40 | 54 => Exit::Nop,
         15 => Exit::Rdpmc,
         16 => Exit::Rdtsc,
-        18..=27 | 36 | 39 | 50 | 51 | 53 | 58 => Exit::Undefined,
+        18 => Exit::Hypercall,
+        19..=27 | 36 | 39 | 50 | 51 | 53 | 58 => Exit::Undefined,
         28 => {
             let (cr, reg) = ((q & 15) as u8, Some(((q >> 8) & 15) as u8));
             match (q >> 4) & 3 {
@@ -223,7 +224,8 @@ pub fn svm_exit(code: u64, info1: u64, info2: u64, own_step: bool) -> Exit {
         0x7c => if info1 & 1 != 0 { Exit::Wrmsr } else { Exit::Rdmsr },
         0x7d => Exit::TaskSwitch,
         0x7f => Exit::Shutdown,
-        0x73 | 0x7a | 0x80..=0x88 | 0x8a..=0x8c | 0x8e => Exit::Undefined,
+        0x81 => Exit::Hypercall,
+        0x73 | 0x7a | 0x80 | 0x82..=0x88 | 0x8a..=0x8c | 0x8e => Exit::Undefined,
         0x8d => Exit::Xsetbv,
         0x400 => Exit::Mmio { gpa: info2, write: info1 & 2 != 0 },
         c => Exit::Fatal(c),
@@ -377,6 +379,8 @@ mod tests {
         assert_eq!(svm_exit(0x65, 1 << 63 | 7, 0, false), Exit::Cr { cr: 0, write: true, reg: Some(7) });
         assert_eq!(svm_exit(0x65, 0, 0, false), Exit::Cr { cr: 0, write: true, reg: None });
         assert_eq!(svm_exit(0x7c, 1, 0, false), Exit::Wrmsr);
+        assert_eq!(svm_exit(0x81, 0, 0, false), Exit::Hypercall, "VMMCALL");
+        assert_eq!(svm_exit(0x80, 0, 0, false), Exit::Undefined, "VMRUN");
         assert_eq!(svm_exit(0x400, 2, 0xfec0_0000, false), Exit::Mmio { gpa: 0xfec0_0000, write: true });
     }
 

@@ -501,6 +501,61 @@ fn guest_boots_and_uses_the_machine() {
     turn(&mut c0, 0);
     assert_eq!(c0.hw().g[0], LAPIC | 0x900, "APIC base: enabled, BSP");
 
+    // ---- kvmclock: the signature, then the time info and the wall clock
+    // where the guest names them, as Linux's kvmclock_init() reads them.
+    let h = c0.hw();
+    (h.g[0], h.g[1], h.len) = (0x4000_0000, 0, 2);
+    h.exits.push_back(Exit::Cpuid);
+    turn(&mut c0, 0);
+    let g = c0.hw().g;
+    assert_eq!(&[(g[3] as u32).to_le_bytes(), (g[1] as u32).to_le_bytes(), (g[2] as u32).to_le_bytes()].concat(), b"KVMKVMKVM\0\0\0", "EBX, ECX, EDX");
+    let (clock, wall) = (0x50_0000u64, 0x50_0100u64);
+    mem.write_bytes(clock, &[0xee; 32]);
+    let wrmsr = |c: &mut Vcpu<Guest>, msr: u32, v: u64| {
+        let h = c.hw();
+        (h.g[1], h.g[0], h.g[2], h.len) = (msr as u64, v & 0xffff_ffff, v >> 32, 2);
+        h.exits.push_back(Exit::Wrmsr);
+        turn(c, 0);
+    };
+    wrmsr(&mut c0, 0x4b56_4d01, clock | 1);
+    let version = mem.read::<u32>(clock);
+    assert!(version != 0 && version & 1 == 0, "a stable version: {version}");
+    assert_eq!(mem.read::<u32>(clock + 4), 0, "pad");
+    assert_eq!(mem.read::<u64>(clock + 8), vm().clock_base, "tsc_timestamp: the clock base in the guest's TSC (offset 0)");
+    assert_eq!(mem.read::<u64>(clock + 16), 0, "system_time");
+    let (mul, shift) = (mem.read::<u32>(clock + 24), mem.read::<u8>(clock + 28) as i8);
+    assert_eq!(crate::x86::pvclock::tsc_khz(mul, shift), tsc_hz / 1000, "the guest's TSC rate (pvclock_tsc_khz)");
+    assert_eq!(mem.read::<u8>(clock + 29), 1, "PVCLOCK_TSC_STABLE_BIT");
+    let h = c0.hw();
+    (h.g[1], h.len) = (0x4b56_4d01, 2);
+    h.exits.push_back(Exit::Rdmsr);
+    turn(&mut c0, 0);
+    assert_eq!(c0.hw().g[0], clock | 1, "the MSR reads back");
+    // A TSC write moves tsc_timestamp with it: kvmclock time is unchanged.
+    wrmsr(&mut c0, 0x10, crate::vm::now() + 5_000);
+    assert_eq!(mem.read::<u64>(clock + 8), vm().clock_base + 5_000);
+    assert!(mem.read::<u32>(clock) > version, "a new version");
+    wrmsr(&mut c0, 0x10, crate::vm::now());
+    // The wall time at kvmclock time 0: 2026-01-01 plus the clock base.
+    wrmsr(&mut c0, 0x4b56_4d00, wall);
+    let (wv, sec, nsec) = (mem.read::<u32>(wall), mem.read::<u32>(wall + 4), mem.read::<u32>(wall + 8));
+    let want = 1_767_225_600 * 1_000_000_000 + vm().clock_base * 1_000_000_000 / tsc_hz;
+    assert!(wv != 0 && wv & 1 == 0);
+    assert_eq!(sec as u64 * 1_000_000_000 + nsec as u64, want, "wall clock");
+    // Off: nothing more is written.
+    wrmsr(&mut c0, 0x4b56_4d01, 0);
+    mem.write_bytes(clock, &[0; 32]);
+    wrmsr(&mut c0, 0x10, crate::vm::now());
+    assert_eq!(mem.read::<u64>(clock + 8), 0, "a disabled clock is left");
+    // A hypercall (ptp_kvm's KVM_HC_CLOCK_PAIRING): -KVM_ENOSYS.
+    let h = c0.hw();
+    (h.g[0], h.len) = (9, 3);
+    h.exits.push_back(Exit::Hypercall);
+    let rip = h.rip;
+    turn(&mut c0, 0);
+    assert_eq!(c0.hw().g[0] as i64, -1000);
+    assert_eq!(c0.hw().rip, rip + 3, "past the VMMCALL");
+
     // ---- The local APIC on, and an interrupt-enabled guest.
     mmio(&mut c0, 0, LAPIC + 0xf0, 4, Some(0x1ff));
     mmio(&mut c0, 0, LAPIC + 0x80, 4, Some(0));

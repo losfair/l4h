@@ -82,6 +82,11 @@ pub struct Vm {
     pub invpcid: AtomicBool,
     /// The guest has PCIDs (CPUID 1 ECX bit 17: the host's).
     pub pcid: AtomicBool,
+    /// kvmclock (x86/pvclock.rs): its time 0 in the host's TSC, the scale
+    /// to nanoseconds, and the wall time then (ns since 1970).
+    pub clock_base: u64,
+    pub clock_scale: (u32, i8),
+    pub wall_base_ns: u64,
 }
 
 pub static VM: Global<Vm> = Global::new();
@@ -104,6 +109,14 @@ pub enum BuildError {
 /// Make the machine (once, on the I/O thread, before any vCPU runs): load
 /// the kernel dom0 put in RAM with its boot parameters, write the ACPI
 /// tables, and publish the shared state as VM.
+/// The wall time at host TSC `t`, in ns since 1970: `epoch_ns` at TSC
+/// `epoch_ticks` (0 if unknown: 2000-01-01, as the RTC has it).
+pub fn wall_ns(epoch_ns: u64, epoch_ticks: u64, tsc_hz: u64, t: u64) -> u64 {
+    let epoch = if epoch_ns == 0 { 946_684_800_000_000_000 } else { epoch_ns as i128 };
+    let d = (t as i128 - epoch_ticks as i128) * 1_000_000_000 / tsc_hz.max(1) as i128;
+    (epoch as i128 + d).max(0) as u64
+}
+
 pub fn build(cfg: &'static HvmConfig, tsc_hz: u64, mem: GuestMem, host: Host) -> Result<(), BuildError> {
     let (amd, xcr0) = (host.amd, host.xcr0);
     let vcpus = (cfg.nr_vcpus as usize).clamp(1, hv::MAX_VCPUS);
@@ -115,6 +128,7 @@ pub fn build(cfg: &'static HvmConfig, tsc_hz: u64, mem: GuestMem, host: Host) ->
     }
     let entry = crate::boot::load(&mem, &kernel, (cfg.kernel_gpa, cfg.kernel_size), (cfg.initrd_gpa, cfg.initrd_size), &cfg.cmdline,
         crate::acpi::RSDP).map_err(BuildError::Load)?;
+    let t0 = now();
     VM.set(Vm {
         cfg,
         host,
@@ -138,6 +152,9 @@ pub fn build(cfg: &'static HvmConfig, tsc_hz: u64, mem: GuestMem, host: Host) ->
         entry,
         xcr0,
         invpcid: AtomicBool::new(false),
+        clock_base: t0,
+        clock_scale: crate::x86::pvclock::time_scale(tsc_hz),
+        wall_base_ns: wall_ns(cfg.epoch_ns, cfg.epoch_ticks, tsc_hz, t0),
         pcid: AtomicBool::new(host.pcid),
     });
     Ok(())

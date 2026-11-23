@@ -19,7 +19,7 @@ use crate::dev::{ioapic, pci, pm, uart};
 use crate::hw::{Event, Exit, Hw};
 use crate::vm::{self, vm};
 use crate::x86::decode::{self, Kind, Mode, Seg};
-use crate::x86::{cpuid, msr, walk};
+use crate::x86::{cpuid, msr, pvclock, walk};
 
 const VEC_DB: u8 = 1;
 const VEC_UD: u8 = 6;
@@ -96,6 +96,11 @@ pub struct Vcpu<H: Hw> {
     lapic: Lapic,
     msrs: msr::Msrs,
     tsc_offset: u64,
+    /// MSR_KVM_SYSTEM_TIME_NEW and MSR_KVM_WALL_CLOCK_NEW as written
+    /// (x86/pvclock.rs), and the version last written to either.
+    kvm_time: u64,
+    kvm_wall: u64,
+    kvm_version: u32,
     halted: bool,
     wait_sipi: bool,
     nmis: u32,
@@ -127,6 +132,7 @@ impl<H: Hw> Vcpu<H> {
         let vm = vm();
         let mut c = Vcpu {
             id: v, hw, lapic: Lapic::new(v as u32, v == 0, vm.tsc_hz), msrs: msr::Msrs::new(vm.amd), tsc_offset: 0,
+            kvm_time: 0, kvm_wall: 0, kvm_version: 0,
             halted: false, wait_sipi: v != 0, nmis: 0, inject: None, dr: [0; 4], dr6: 0xffff_0ff0, dr7: 0x400, xcr0: 1, armed: 0,
         };
         c.lapic.init(shared(v));
@@ -382,6 +388,16 @@ impl<H: Hw> Vcpu<H> {
                 l4h_rt::log!("l4h-hvm: guest {} vCPU {}: triple fault at rip {:#x}", vm().cfg.guest_id, self.id, self.hw.rip());
                 self.power(abi::POWER_REBOOT)
             }
+            // kvmclock's KVM signature (x86/pvclock.rs) makes Linux try
+            // hypercalls whatever the feature bits say (ptp_kvm's
+            // KVM_HC_CLOCK_PAIRING): none is there, as KVM answers one it
+            // does not know (-KVM_ENOSYS; -KVM_EPERM outside ring 0).
+            Exit::Hypercall => {
+                let r: i64 = if self.hw.cpl() != 0 { -1 } else { -1000 };
+                self.hw.gprs()[0] = r as u64;
+                self.hw.mark_gprs();
+                self.skip();
+            }
             Exit::Undefined => self.ud(),
             Exit::Nop => self.skip(),
             Exit::Rdtsc => {
@@ -547,6 +563,8 @@ impl<H: Hw> Vcpu<H> {
                 return Some(if d == 0 { 0 } else { d.wrapping_add(self.tsc_offset) });
             }
             lapic::MSR_APIC_BASE | 0x800..=0x8ff => return self.lapic.rdmsr(sh, vm::now(), m),
+            pvclock::MSR_SYSTEM_TIME => return Some(self.kvm_time),
+            pvclock::MSR_WALL_CLOCK => return Some(self.kvm_wall),
             _ => {}
         }
         if let Some(r) = self.hw.rdmsr(m) {
@@ -561,6 +579,18 @@ impl<H: Hw> Vcpu<H> {
             msr::TSC => {
                 self.tsc_offset = v.wrapping_sub(vm::now());
                 self.hw.set_tsc_offset(self.tsc_offset);
+                // kvmclock's TSC at its time 0 moves with the TSC.
+                self.publish_clock();
+                return true;
+            }
+            pvclock::MSR_SYSTEM_TIME => {
+                self.kvm_time = v;
+                self.publish_clock();
+                return true;
+            }
+            pvclock::MSR_WALL_CLOCK => {
+                self.kvm_wall = v;
+                self.publish_wall_clock();
                 return true;
             }
             lapic::MSR_TSC_DEADLINE | lapic::MSR_APIC_BASE | 0x800..=0x8ff => {
@@ -576,6 +606,34 @@ impl<H: Hw> Vcpu<H> {
             return ok;
         }
         self.msrs.write(m, v).is_some()
+    }
+
+    /// kvmclock: this vCPU's time info where the guest asked for it (bit
+    /// 0 of MSR_KVM_SYSTEM_TIME_NEW on), kvmclock time 0 at the VM's
+    /// clock base in this vCPU's TSC.  Written once: the TSC is invariant
+    /// and the same rate on every vCPU.  An address that is not RAM is
+    /// left, as KVM leaves it.
+    fn publish_clock(&mut self) {
+        if self.kvm_time & 1 == 0 {
+            return;
+        }
+        let vm = vm();
+        let (mul, shift) = vm.clock_scale;
+        self.kvm_version = self.kvm_version.wrapping_add(2) & !1;
+        let info = pvclock::time_info(self.kvm_version, vm.clock_base.wrapping_add(self.tsc_offset), 0, mul, shift, pvclock::TSC_STABLE);
+        let gpa = self.kvm_time & !1;
+        pvclock::publish(&info, |o, b| vm.mem.write_bytes(gpa + o as u64, b));
+    }
+
+    /// kvmclock's wall clock: the wall time at kvmclock time 0, which the
+    /// guest adds its kvmclock time to.
+    fn publish_wall_clock(&mut self) {
+        let vm = vm();
+        let ns = vm.wall_base_ns;
+        let gpa = self.kvm_wall;
+        self.kvm_version = self.kvm_version.wrapping_add(2) & !1;
+        let w = pvclock::wall_clock(self.kvm_version, (ns / 1_000_000_000) as u32, (ns % 1_000_000_000) as u32);
+        pvclock::publish(&w, |o, b| vm.mem.write_bytes(gpa + o as u64, b));
     }
 
     fn apic_effects(&mut self, fx: lapic::Effects) {

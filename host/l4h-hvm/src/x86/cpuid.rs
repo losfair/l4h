@@ -5,8 +5,9 @@
 //! MONITOR, the PMU, PKU, XSAVES, AVX-512, AMX, CET, LA57, RDTSCP and RDPID,
 //! the speculation-control MSRs, TSX's controls, SGX), with what our
 //! platform has: an x2APIC with the TSC-deadline timer and ARAT, an
-//! invariant TSC whose rate leaves 0x15 and 0x16 give, and a topology of
-//! one thread per core (leaves 0xb and 0x1f).  Free of seL4: the host's
+//! invariant TSC whose rate leaves 0x15 and 0x16 give (and kvmclock, under
+//! KVM's signature, on AMD too), and a topology of one thread per core
+//! (leaves 0xb and 0x1f).  Free of seL4: the host's
 //! CPUID is a function.
 
 /// What a vCPU's CPUID depends on besides the host.
@@ -164,9 +165,12 @@ pub fn cpuid(leaf: u32, sub: u32, ctx: &Ctx, host: &impl Fn(u32, u32) -> [u32; 4
             let mhz = (ctx.tsc_hz / 1_000_000).min(0xffff) as u32;
             [mhz, mhz, 100, 0]
         }
-        // Not KVM, nor any hypervisor Linux knows: our own signature.
-        0x4000_0000 => [0x4000_0001, u32::from_le_bytes(*b"L4HL"), u32::from_le_bytes(*b"4HL4"), u32::from_le_bytes(*b"HL4H")],
-        0x4000_0001..=0x4000_00ff => [0; 4],
+        // KVM's signature, for kvmclock alone (pvclock.rs): Linux on AMD
+        // has no other way to the TSC's rate than calibrating it, and its
+        // other KVM features stay off without their bits.
+        0x4000_0000 => [0x4000_0001, u32::from_le_bytes(*b"KVMK"), u32::from_le_bytes(*b"VMKV"), u32::from_le_bytes(*b"M\0\0\0")],
+        0x4000_0001 => [super::pvclock::FEATURES, 0, 0, 0],
+        0x4000_0002..=0x4000_00ff => [0; 4],
         0x8000_0000 => {
             let [_, b, c, d] = host(0x8000_0000, 0);
             [max_ext.min(0x8000_0008), b, c, d]
@@ -325,6 +329,10 @@ mod tests {
         assert!(xcr0_valid(7, 7) && xcr0_valid(3, 7) && xcr0_valid(1, 7));
         assert!(!xcr0_valid(0, 7) && !xcr0_valid(5, 7) && !xcr0_valid(0xf, 7) && !xcr0_valid(7, 3));
         let sig = cpuid(0x4000_0000, 0, &CTX, &host);
-        assert_eq!(&[sig[1].to_le_bytes(), sig[2].to_le_bytes(), sig[3].to_le_bytes()].concat(), b"L4HL4HL4HL4H");
+        assert_eq!(&[sig[1].to_le_bytes(), sig[2].to_le_bytes(), sig[3].to_le_bytes()].concat(), b"KVMKVMKVM\0\0\0");
+        assert_eq!(sig[0], 0x4000_0001);
+        // kvmclock (CLOCKSOURCE2) with the stable bit, and no other feature.
+        assert_eq!(cpuid(0x4000_0001, 0, &CTX, &host), [(1 << 3) | (1 << 24), 0, 0, 0]);
+        assert_eq!(cpuid(0x4000_0002, 0, &CTX, &host), [0; 4]);
     }
 }
