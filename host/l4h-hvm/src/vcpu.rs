@@ -106,6 +106,10 @@ pub struct Vcpu<H: Hw> {
     kvm_time: u64,
     kvm_wall: u64,
     kvm_version: u32,
+    /// MSR_KVM_PV_EOI_EN as written, and whether this entry's PV EOI flag
+    /// is set in the guest's word (pv_eoi_to_guest).
+    pv_eoi: u64,
+    pv_eoi_set: bool,
     halted: bool,
     wait_sipi: bool,
     nmis: u32,
@@ -137,7 +141,7 @@ impl<H: Hw> Vcpu<H> {
         let vm = vm();
         let mut c = Vcpu {
             id: v, hw, lapic: Lapic::new(v as u32, v == 0, vm.tsc_hz), msrs: msr::Msrs::new(vm.amd), tsc_offset: 0,
-            kvm_time: 0, kvm_wall: 0, kvm_version: 0,
+            kvm_time: 0, kvm_wall: 0, kvm_version: 0, pv_eoi: 0, pv_eoi_set: false,
             halted: false, wait_sipi: v != 0, nmis: 0, inject: None, dr: [0; 4], dr6: 0xffff_0ff0, dr7: 0x400, xcr0: 1, armed: 0,
         };
         c.lapic.init(shared(v));
@@ -178,6 +182,8 @@ impl<H: Hw> Vcpu<H> {
             self.halted = false;
             self.nmis = 0;
             self.inject = None;
+            // As KVM's reset: the guest names its PV EOI word again.
+            self.pv_eoi = 0;
         }
         if flags & PENDING_SIPI != 0 && self.wait_sipi {
             sh.clear_requests();
@@ -217,7 +223,9 @@ impl<H: Hw> Vcpu<H> {
         }
         let irq_window = self.lapic.pending(sh).is_some();
         let nmi_window = self.nmis != 0;
+        self.pv_eoi_to_guest(sh);
         let exit = self.hw.enter(ev, irq_window, nmi_window);
+        self.pv_eoi_from_guest();
         self.exit(exit);
     }
 
@@ -257,6 +265,37 @@ impl<H: Hw> Vcpu<H> {
                 return false;
             }
             core::hint::spin_loop();
+        }
+    }
+
+    /// KVM's PV EOI (KVM_FEATURE_PV_EOI): when the guest's EOI could do
+    /// nothing but end the one edge-triggered interrupt in service, the
+    /// entry sets bit 0 of the guest's word, and the guest's EOI clears it
+    /// instead of writing the APIC's EOI register (an exit per interrupt).
+    /// Only this vCPU's guest writes the word while it runs, only this
+    /// thread while it does not.
+    fn pv_eoi_to_guest(&mut self, sh: &crate::dev::apic::Shared) {
+        if self.pv_eoi & 1 != 0 && self.lapic.pv_eoi_ok(sh) {
+            vm().mem.write::<u8>(self.pv_eoi & !1, 1);
+            self.pv_eoi_set = true;
+        }
+    }
+
+    /// After the exit: the flag still set, the guest made no EOI (and
+    /// will write the register if it does, the flag now clear); clear,
+    /// it did.
+    fn pv_eoi_from_guest(&mut self) {
+        if !self.pv_eoi_set {
+            return;
+        }
+        self.pv_eoi_set = false;
+        let mem = &vm().mem;
+        let gpa = self.pv_eoi & !1;
+        if mem.read::<u8>(gpa) & 1 != 0 {
+            mem.write::<u8>(gpa, 0);
+        } else {
+            let fx = self.lapic.pv_eoi();
+            self.apic_effects(fx);
         }
     }
 
@@ -603,6 +642,7 @@ impl<H: Hw> Vcpu<H> {
             lapic::MSR_APIC_BASE | 0x800..=0x8ff => return self.lapic.rdmsr(sh, vm::now(), m),
             pvclock::MSR_SYSTEM_TIME => return Some(self.kvm_time),
             pvclock::MSR_WALL_CLOCK => return Some(self.kvm_wall),
+            pvclock::MSR_PV_EOI => return Some(self.pv_eoi),
             _ => {}
         }
         if let Some(r) = self.hw.rdmsr(m) {
@@ -633,6 +673,15 @@ impl<H: Hw> Vcpu<H> {
             pvclock::MSR_WALL_CLOCK => {
                 self.kvm_wall = v;
                 self.publish_wall_clock();
+                return true;
+            }
+            pvclock::MSR_PV_EOI => {
+                // As KVM: the word 4-byte aligned; on, it must be RAM.
+                let gpa = v & !1;
+                if gpa & 3 != 0 || (v & 1 != 0 && !vm().mem.valid(gpa, 4)) {
+                    return false;
+                }
+                self.pv_eoi = v;
                 return true;
             }
             lapic::MSR_TSC_DEADLINE | lapic::MSR_APIC_BASE | 0x800..=0x8ff => {

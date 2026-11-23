@@ -440,8 +440,9 @@ mod tests {
         let sig = cpuid(0x4000_0000, 0, &CTX, &host);
         assert_eq!(&[sig[1].to_le_bytes(), sig[2].to_le_bytes(), sig[3].to_le_bytes()].concat(), b"KVMKVMKVM\0\0\0");
         assert_eq!(sig[0], 0x4000_0001);
-        // kvmclock (CLOCKSOURCE2) with the stable bit, and no other feature.
-        assert_eq!(cpuid(0x4000_0001, 0, &CTX, &host), [(1 << 3) | (1 << 24), 0, 0, 0]);
+        // kvmclock (CLOCKSOURCE2) with the stable bit, PV EOI, and no
+        // other feature.
+        assert_eq!(cpuid(0x4000_0001, 0, &CTX, &host), [(1 << 3) | (1 << 6) | (1 << 24), 0, 0, 0]);
         assert_eq!(cpuid(0x4000_0002, 0, &CTX, &host), [0; 4]);
     }
 }

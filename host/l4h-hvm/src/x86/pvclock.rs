@@ -8,9 +8,12 @@
 /// MSR_KVM_WALL_CLOCK_NEW and MSR_KVM_SYSTEM_TIME_NEW.
 pub const MSR_WALL_CLOCK: u32 = 0x4b56_4d00;
 pub const MSR_SYSTEM_TIME: u32 = 0x4b56_4d01;
-/// CPUID 0x40000001 EAX: KVM_FEATURE_CLOCKSOURCE2 and
+/// MSR_KVM_PV_EOI_EN: bit 0 on, the rest a 4-byte aligned address of the
+/// guest's PV EOI word (Vcpu::pv_eoi_*).
+pub const MSR_PV_EOI: u32 = 0x4b56_4d04;
+/// CPUID 0x40000001 EAX: KVM_FEATURE_CLOCKSOURCE2, KVM_FEATURE_PV_EOI and
 /// KVM_FEATURE_CLOCKSOURCE_STABLE_BIT.
-pub const FEATURES: u32 = (1 << 3) | (1 << 24);
+pub const FEATURES: u32 = (1 << 3) | (1 << 6) | (1 << 24);
 /// pvclock_vcpu_time_info.flags: PVCLOCK_TSC_STABLE_BIT.
 pub const TSC_STABLE: u8 = 1;
 /// The size of pvclock_vcpu_time_info and of pvclock_wall_clock.
