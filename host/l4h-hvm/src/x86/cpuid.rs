@@ -67,7 +67,7 @@ pub fn cpuid(leaf: u32, sub: u32, ctx: &Ctx, host: &impl Fn(u32, u32) -> [u32; 4
     if leaf < 0x8000_0000 && leaf > max_std && !ours(leaf) {
         return [0; 4];
     }
-    if leaf >= 0x8000_0000 && leaf > max_ext.min(0x8000_0008) {
+    if leaf >= 0x8000_0000 && leaf > max_ext.min(max_ext_ours(amd)) {
         return [0; 4];
     }
     let log2 = 32 - (ctx.vcpus.max(1) - 1).leading_zeros();
@@ -173,7 +173,7 @@ pub fn cpuid(leaf: u32, sub: u32, ctx: &Ctx, host: &impl Fn(u32, u32) -> [u32; 4
         0x4000_0002..=0x4000_00ff => [0; 4],
         0x8000_0000 => {
             let [_, b, c, d] = host(0x8000_0000, 0);
-            [max_ext.min(0x8000_0008), b, c, d]
+            [max_ext.min(max_ext_ours(amd)), b, c, d]
         }
         0x8000_0001 => {
             let [a, b, c, d] = host(0x8000_0001, 0);
@@ -197,11 +197,27 @@ pub fn cpuid(leaf: u32, sub: u32, ctx: &Ctx, host: &impl Fn(u32, u32) -> [u32; 4
             let ecx = if amd { (ctx.vcpus.max(1) - 1) & 0xff | (log2 << 12) } else { 0 };
             [phys | virt << 8, b & (bit(0) | bit(2)), ecx, 0]
         }
+        // AMD's extended features 2: LFENCE always serializing, and
+        // Automatic IBRS, whose EFER.AIBRSE the VMCB holds for the guest
+        // (hw/svm.rs), so that Linux need not fall back to retpolines.
+        // Nothing of SRSO, TSA or the speculation controls' MSRs, which
+        // seL4's VCPUs do not switch.
+        0x8000_0021 if amd => [host(0x8000_0021, 0)[0] & (LFENCE_SERIAL | AUTO_IBRS), 0, 0, 0],
         // The legacy cache descriptors; any other leaf (SGX, PT, RDT, AMX,
         // key locker, hybrid, LBR, ...) is none.
         2 => host(2, 0),
         _ => [0; 4],
     }
+}
+
+/// CPUID 0x8000_0021 EAX: LFENCE always serializing, Automatic IBRS.
+pub const LFENCE_SERIAL: u32 = 1 << 2;
+pub const AUTO_IBRS: u32 = 1 << 8;
+
+/// The last extended leaf we give: AMD's 0x8000_0021 (the leaves between
+/// it and 0x8000_0008 are zero), Intel's 0x8000_0008.
+const fn max_ext_ours(amd: bool) -> u32 {
+    if amd { 0x8000_0021 } else { 0x8000_0008 }
 }
 
 /// The crystal clock CPUID 0x15 gives, which the local APIC timer runs at
@@ -253,6 +269,32 @@ mod tests {
     }
 
     const CTX: Ctx = Ctx { vcpu: 2, vcpus: 4, tsc_hz: 2_100_000_000, osxsave: false, xcr0: 1, invpcid: false };
+
+    /// An AMD host with everything set and extended leaves to 0x8000_0021.
+    fn amd_host(leaf: u32, sub: u32) -> [u32; 4] {
+        match leaf {
+            0 => [0x10, u32::from_le_bytes(*b"Auth"), u32::from_le_bytes(*b"cAMD"), u32::from_le_bytes(*b"enti")],
+            0x8000_0000 => [0x8000_0028, 0, 0, 0],
+            _ => host(leaf, sub),
+        }
+    }
+
+    #[test]
+    fn amd_extended_leaves_give_auto_ibrs_alone() {
+        assert_eq!(cpuid(0x8000_0000, 0, &CTX, &amd_host)[0], 0x8000_0021);
+        assert_eq!(cpuid(0x8000_0021, 0, &CTX, &amd_host), [AUTO_IBRS | LFENCE_SERIAL, 0, 0, 0]);
+        // SVM, SEV, the topology extensions, the TLB and cache leaves: none.
+        for leaf in [0x8000_000a, 0x8000_0019, 0x8000_001d, 0x8000_001e, 0x8000_001f, 0x8000_0020, 0x8000_0022] {
+            assert_eq!(cpuid(leaf, 0, &CTX, &amd_host), [0; 4], "{leaf:#x}");
+        }
+        // Without it on the host, the bit is off; Intel stops at 0x8000_0008.
+        let no = |l: u32, s: u32| if l == 0x8000_0021 { [0; 4] } else { amd_host(l, s) };
+        assert_eq!(cpuid(0x8000_0021, 0, &CTX, &no)[0] & AUTO_IBRS, 0);
+        assert_eq!(cpuid(0x8000_0021, 0, &CTX, &host), [0; 4]);
+        let h = crate::vm::Host::of(&amd_host);
+        assert!(h.auto_ibrs);
+        assert!(!crate::vm::Host::of(&no).auto_ibrs);
+    }
 
     #[test]
     fn filtering() {

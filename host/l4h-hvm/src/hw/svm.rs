@@ -49,6 +49,8 @@ const WORDS: usize = (END / 8) as usize;
 const CHUNKS: usize = WORDS.div_ceil(CHUNK);
 
 const EFER_SVME: u64 = 1 << 12;
+/// Automatic IBRS (CPUID 0x8000_0021 EAX bit 8).
+const EFER_AIBRSE: u64 = 1 << 21;
 // misc1 intercepts.
 const I1_VINTR: u64 = 1 << 4;
 const I1_CPUID: u64 = 1 << 18;
@@ -412,7 +414,8 @@ impl Hw for Svm {
         Some(match msr {
             crate::x86::msr::EFER => {
                 let cur = self.rd(EFER);
-                if v & !(1 | walk::EFER_LME | walk::EFER_LMA | walk::EFER_NXE) != 0
+                let aibrs = if crate::vm::vm().host.auto_ibrs { EFER_AIBRSE } else { 0 };
+                if v & !(1 | walk::EFER_LME | walk::EFER_LMA | walk::EFER_NXE | aibrs) != 0
                     || ((v ^ cur) & walk::EFER_LME != 0 && self.rd(CR0) & walk::CR0_PG != 0)
                 {
                     return Some(false);

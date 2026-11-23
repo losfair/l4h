@@ -36,6 +36,9 @@ pub struct Host {
     pub pcid: bool,
     /// Physical-address bits (CPUID 0x8000_0008, x86::cpuid's clamp).
     pub phys_bits: u32,
+    /// AMD's Automatic IBRS (CPUID 0x8000_0021 EAX bit 8): a guest may set
+    /// EFER.AIBRSE, which the VMCB holds for it.
+    pub auto_ibrs: bool,
 }
 
 impl Host {
@@ -48,6 +51,7 @@ impl Host {
             xcr0: crate::x86::cpuid::xcr0_supported(cpuid),
             pcid: cpuid(1, 0)[2] & (1 << 17) != 0,
             phys_bits: phys.min(crate::x86::cpuid::MAX_PHYS_BITS),
+            auto_ibrs: ext >= 0x8000_0021 && cpuid(0x8000_0021, 0)[0] & crate::x86::cpuid::AUTO_IBRS != 0,
         }
     }
 }

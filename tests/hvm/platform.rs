@@ -458,7 +458,7 @@ fn guest_boots_and_uses_the_machine() {
         cfg.devices[d].kind = host::VDEV_BLK_UNAVAILABLE;
     }
     let tsc_hz = 1_000_000_000;
-    let host = crate::vm::Host { amd: true, xcr0: 7, pcid: true, phys_bits: 40 };
+    let host = crate::vm::Host { amd: true, xcr0: 7, pcid: true, phys_bits: 40, auto_ibrs: true };
     crate::vm::build(cfg, tsc_hz, mem, host).expect("the machine");
     crate::io::init();
     let mem = &vm().mem;
