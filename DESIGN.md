@@ -1254,8 +1254,11 @@ create fails with `-ENODEV`. `l4hctl list` shows them as `hvm`.
   the timer expires. Linux reads leaf 0x15 only on Intel. On AMD it
   calibrates the TSC against the PIT or the PM timer, which fails when
   an exit takes longer than about 10 µs, as nested ones do.
-  So the hypervisor leaves carry KVM's signature with **kvmclock** alone
-  (`KVM_FEATURE_CLOCKSOURCE2` and the stable bit; no other KVM feature),
+  So the hypervisor leaves carry KVM's signature with **kvmclock**
+  (`KVM_FEATURE_CLOCKSOURCE2` and the stable bit) and `KVM_FEATURE_PV_EOI`
+  (an entry with one edge-triggered interrupt in service and none
+  requested sets a flag in the guest's word, and the guest's EOI clears it
+  instead of an x2APIC write that would exit), and no other KVM feature,
   which every distribution kernel uses (`CONFIG_KVM_GUEST`): a vCPU's
   `pvclock_vcpu_time_info` is written once, where the guest names it
   (`MSR_KVM_SYSTEM_TIME_NEW`), with the host TSC's rate, kvmclock time 0
