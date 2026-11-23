@@ -33,6 +33,22 @@ fi
 "$root/tools/mkinitramfs.sh" "$out/hvmbench.cpio.gz" "$root/tests/guest/init-hvmbench" \
     "$l4h_ctl" "$out/mstime" "$out/bzImage" "$out/vmcmp.cpio.gz" "$out/benchvm.cpio.gz" >/dev/null
 rm -f "$out/hvmbench.img" && truncate -s 1G "$out/hvmbench.img"
+if [ "${HB_MODE:-l4h}" = dom0kvm ]; then
+    # The guest under QEMU and KVM in l4h's dom0, on FL4's or seL4's VCPUs
+    # (DESIGN.md §5.10): which of l4h-hvm and the VCPU layer a difference
+    # comes from.
+    source "$root/tests/kvm-vmms.sh"
+    "$root/tools/mkinitramfs.sh" "$out/kvmbase.cpio.gz" "$root/tests/guest/init-kvmbase" \
+        "$out/mstime" "$out/netbench" "$out/bzImage" "$out/vmcmp.cpio.gz" >/dev/null
+    kvm_vmms_append "$out/kvmbase.cpio.gz" qemu
+    L4H_QEMU_CPU=${L4H_QEMU_CPU:-host,+invtsc} L4H_MEM=${L4H_MEM:-3G} L4H_DOM0_MEM_MB=2048 L4H_DOM0_VCPUS=2 L4H_DOM0_DISKS=0 L4H_SMP=${L4H_SMP:-4} \
+    L4H_QEMU_ARGS="-name l4h,debug-threads=on -mem-prealloc" \
+        "$root/tools/run-dom0.sh" "$out/kvmbase.cpio.gz" \
+        "console=hvc0 HB_MEM=${HB_MEM:-1024} HB_REPS=${HB_REPS:-1} HB_NONET=1${HB_SPIN:+ HB_SPIN=1}" \
+        ${HVMBENCH_TIMEOUT:-120} | grep -a "HVMBENCH" || true
+    grep -aq "HVMBENCH: done" "$root/build/qemu.log"
+    exit
+fi
 if [ "${HB_MODE:-l4h}" = kvm ]; then
     source "$root/tests/kvm-vmms.sh"
     "$root/tools/mkinitramfs.sh" "$out/kvmbase.cpio.gz" "$root/tests/guest/init-kvmbase" \
@@ -52,7 +68,7 @@ if [ "${HB_MODE:-l4h}" = kvm ]; then
         -smp "${L4H_SMP:-4}" -m "${L4H_MEM:-3G}" -name kvmbase,debug-threads=on -mem-prealloc -display none -vga none -nic none -no-reboot -monitor none \
         -drive file="$out/hvmbench.img",if=none,id=d0,format=raw,cache=none,aio=native -device virtio-blk-pci,drive=d0,disable-legacy=on \
         -serial "file:$log" -kernel "$kernel" -initrd "$out/kvmbase.cpio.gz" \
-        -append "console=ttyS0 quiet panic=-1 HB_MEM=${HB_MEM:-1024} HB_REPS=${HB_REPS:-1}${HB_SPIN:+ HB_SPIN=1}${HB_GUEST_ARGS:+ HB_GUEST_ARGS=$HB_GUEST_ARGS}${HB_KVMAMD_ARGS:+ HB_KVMAMD_ARGS=$HB_KVMAMD_ARGS}" </dev/null || true
+        -append "console=ttyS0 quiet panic=-1 HB_MEM=${HB_MEM:-1024} HB_REPS=${HB_REPS:-1}${HB_SPIN:+ HB_SPIN=1}${HB_GUEST_ARGS:+ HB_GUEST_ARGS=$HB_GUEST_ARGS}${HB_KVMAMD_ARGS:+ HB_KVMAMD_ARGS=$HB_KVMAMD_ARGS}${HB_L1_THP:+ HB_L1_THP=$HB_L1_THP}${HB_KVM_ARGS:+ HB_KVM_ARGS=$HB_KVM_ARGS}${HB_L2QEMU_ARGS:+ HB_L2QEMU_ARGS=$HB_L2QEMU_ARGS}" </dev/null || true
     grep -a "HVMBENCH" "$log" || true
     grep -aq "HVMBENCH: done" "$log"
     exit

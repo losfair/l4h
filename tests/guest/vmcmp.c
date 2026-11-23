@@ -232,11 +232,46 @@ static int spin(void)
 	return a + b + c + d + e + f + g + h == 42;
 }
 
+/* The 8-add loop copied into a fresh page: does the code's page matter? */
+static void bench_fresh_page(void)
+{
+	static const unsigned char code[] = {
+		0x48, 0x89, 0xf9,                                     /* mov %rdi,%rcx */
+		0x48, 0x83, 0xc0, 0x01, 0x48, 0x83, 0xc2, 0x01,       /* add $1,%rax; %rdx */
+		0x48, 0x83, 0xc6, 0x01, 0x48, 0x83, 0xc7, 0x01,       /* %rsi; %rdi */
+		0x49, 0x83, 0xc0, 0x01, 0x49, 0x83, 0xc1, 0x01,       /* %r8; %r9 */
+		0x49, 0x83, 0xc2, 0x01, 0x49, 0x83, 0xc3, 0x01,       /* %r10; %r11 */
+		0x48, 0xff, 0xc9,                                     /* dec %rcx */
+		0x75, 0xdb,                                           /* jnz -37 */
+		0xc3,                                                 /* ret */
+	};
+	unsigned char *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (p == MAP_FAILED)
+		return;
+	memcpy(p + 64, code, sizeof(code));
+	mprotect(p, 4096, PROT_READ | PROT_EXEC);
+	void (*f)(uint64_t) = (void (*)(uint64_t))(p + 64);
+	uint64_t n = 20000000, t = __builtin_ia32_rdtsc();
+	f(n);
+	printf("BENCH: 8 adds, fresh page     %10.2f tsc/iter\n", (double)(__builtin_ia32_rdtsc() - t) / n);
+	munmap(p, 4096);
+}
+
+static void print_xcr0(void)
+{
+	unsigned lo, hi, lo1, hi1;
+	__asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+	__asm__ volatile("xgetbv" : "=a"(lo1), "=d"(hi1) : "c"(1));
+	printf("BENCH: xcr0 %#x xinuse %#x\n", lo, lo1);
+}
+
 int main(int argc, char **argv)
 {
 	if (argc > 1 && !strcmp(argv[1], "spin"))
 		return spin();
+	print_xcr0();
 	bench_frontend();
+	bench_fresh_page();
 	bench_gaps();
 	bench_cache_bw();
 	bench_getpid_best();

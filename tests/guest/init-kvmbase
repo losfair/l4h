@@ -11,30 +11,39 @@ mount -t tmpfs tmp /tmp
 fail() { echo "HVMBENCH: FAIL: $*"; poweroff -f; }
 vendor=kvm-intel
 grep -qw svm /proc/cpuinfo && vendor="ccp kvm-amd"
-for m in irqbypass kvm $vendor virtio_blk tun tap vhost_iotlb vhost vhost_net; do
+# l4h's dom0 (HB_MODE=dom0kvm) has KVM built in and no modules.
+[ -d /lib/kvm ] && for m in irqbypass kvm $vendor virtio_blk tun tap vhost_iotlb vhost vhost_net; do
     args=
     [ "$m" = kvm-amd ] && args=$(echo "${HB_KVMAMD_ARGS:-}" | tr , ' ')
+    [ "$m" = kvm ] && args=$(echo "${HB_KVM_ARGS:-}" | tr , ' ')
     # shellcheck disable=SC2086
     insmod "/lib/kvm/$m.ko" $args 2>/dev/null || [ "$m" = ccp ] || fail "insmod $m"
 done
 mem=${HB_MEM:-1024} reps=${HB_REPS:-1}
-echo "HVMBENCH: start (kvm), guests ${mem} MiB, 1 vCPU"
+[ -n "${HB_L1_THP:-}" ] && echo "$HB_L1_THP" > /sys/kernel/mm/transparent_hugepage/enabled
+echo "HVMBENCH: start (kvm), guests ${mem} MiB, 1 vCPU, nx_huge_pages=$(cat /sys/module/kvm/parameters/nx_huge_pages 2>/dev/null)"
 ip link set lo up
 netbench recv 5001 &
+nic="-netdev tap,id=n0,ifname=tap0,script=no,downscript=no,vhost=on -device virtio-net-pci,netdev=n0,romfile="
+[ -n "${HB_NONET:-}" ] && nic="-nic none"
+disk=/dev/vda
+[ -b "$disk" ] || { truncate -s 512M /tmp/disk.img; disk=/tmp/disk.img; }
 for r in $(seq 1 "$reps"); do
     t0=$(mstime)
-    /usr/bin/qemu-system-x86_64 -accel kvm -cpu host -m "$mem" -smp 1 -nodefaults -no-user-config \
+    # shellcheck disable=SC2086
+    /usr/bin/qemu-system-x86_64 -accel kvm -cpu host -m "$mem" -smp 1 -nodefaults -no-user-config ${HB_L2QEMU_ARGS:-} \
         -display none -vga none -no-reboot -monitor none -serial stdio \
         -L /usr/share/seabios -L /usr/share/qemu \
         -kernel /bin/bzImage -initrd /bin/vmcmp.cpio.gz -append "console=ttyS0${HB_SPIN:+ spin}${HB_GUEST_ARGS:+ $HB_GUEST_ARGS}" \
-        -drive file=/dev/vda,if=none,id=d0,format=raw,cache=none,aio=native -device virtio-blk-pci,drive=d0 \
-        -netdev tap,id=n0,ifname=tap0,script=no,downscript=no,vhost=on -device virtio-net-pci,netdev=n0,romfile= \
-        </dev/null > /tmp/out 2>&1 &
+        -drive file=$disk,if=none,id=d0,format=raw,cache=none,aio=native -device virtio-blk-pci,drive=d0 \
+        $nic </dev/null > /tmp/out 2>&1 &
     q=$!
     # QEMU makes tap0 (TUNSETIFF); L1's end of it is the sink's address.
-    until [ -e /sys/class/net/tap0 ]; do kill -0 $q 2>/dev/null || { cat /tmp/out; fail "qemu exited"; }; sleep 0.01; done
-    ip addr add 192.168.9.2/24 dev tap0 2>/dev/null
-    ip link set tap0 up
+    if [ -z "${HB_NONET:-}" ]; then
+        until [ -e /sys/class/net/tap0 ]; do kill -0 $q 2>/dev/null || { cat /tmp/out; fail "qemu exited"; }; sleep 0.01; done
+        ip addr add 192.168.9.2/24 dev tap0 2>/dev/null
+        ip link set tap0 up
+    fi
     t1=
     i=0
     until grep -q "VMCMP: done" /tmp/out; do
