@@ -87,12 +87,17 @@ static int tls_set(struct task_struct *t, const struct user_regset *r,
 		   unsigned int pos, unsigned int count, const void *kbuf,
 		   const void __user *ubuf)
 {
+	unsigned long tls;
 	int err;
 	l4h_sync_seg(t);
-	err = user_regset_copyin(&pos, &count, &kbuf, &ubuf,
-				 &t->thread.regs.regs.gp[HOST_TLS], 0, 8);
-	if (!err)
+	/* A copy that faults part way must not leave a torn TPIDR_EL0 in gp[],
+	 * which l4h_user_sync_seg trusts once the registers are valid. */
+	tls = t->thread.regs.regs.gp[HOST_TLS];
+	err = user_regset_copyin(&pos, &count, &kbuf, &ubuf, &tls, 0, sizeof(tls));
+	if (!err) {
+		t->thread.regs.regs.gp[HOST_TLS] = tls;
 		l4h_seg_dirty(t);
+	}
 	return err;
 }
 static int fp_get(struct task_struct *t, const struct user_regset *r,

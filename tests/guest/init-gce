@@ -61,12 +61,19 @@ if udhcpc -i eth0 -n -q -t 10 -s /bin/udhcpc.script >/dev/null 2>&1; then
     [ -n "$name" ] && pass "metadata server: instance $name" || fail "metadata server"
     # A new instance reaches the internet some seconds after it starts
     # (the metadata server at once): l4h on C4A gets here within about a
-    # second of power-on. Allow a minute for the first connection.
-    tries=0
-    until wget -q -T 10 -O /tmp/idx http://deb.debian.org/debian/dists/trixie/Release 2>/dev/null; do
-        tries=$((tries + 1)); [ "$tries" -lt 6 ] || break
+    # second of power-on. Allow a minute for the first connection, however
+    # fast each attempt fails (DNS SERVFAIL, no route yet).
+    deadline=$(( $(cut -d. -f1 /proc/uptime) + 60 ))
+    tries=0; fetched=0
+    while :; do
+        if wget -q -T 10 -O /tmp/idx http://deb.debian.org/debian/dists/trixie/Release 2>/dev/null; then
+            fetched=1; break
+        fi
+        [ "$(cut -d. -f1 /proc/uptime)" -lt "$deadline" ] || break
+        tries=$((tries + 1))
+        sleep 2
     done
-    if [ "$tries" -lt 6 ]; then
+    if [ "$fetched" = 1 ]; then
         pass "internet: fetched $(wc -c < /tmp/idx) bytes from deb.debian.org (after $tries retries)"
     else
         fail "internet (DNS or NAT)"
@@ -115,9 +122,19 @@ for d in $(seq 0 $((n - 1))); do
     grep -q "^disk $d:.*owner -" /tmp/disks || continue
     vm=$(l4hctl create disk$d --initrd /disk.cpio.gz --mem 256 --disk $d) || { fail "disk $d guest"; continue; }
     l4hctl console "$vm" --until "reboot: Power down" --timeout 300 > /tmp/dt
-    sleep 1; l4hctl console "$vm" | grep DISKTEST | sed "s/^/GCETEST: disk $d: /"
-    l4hctl console "$vm" | grep -q "DISKTEST: PASS" && pass "disk $d pass-through"
-    l4hctl console "$vm" | grep -q "DISKTEST: FAIL" && fail "disk $d pass-through"
+    sleep 1; l4hctl console "$vm" > /tmp/dt
+    grep DISKTEST /tmp/dt | sed "s/^/GCETEST: disk $d: /"
+    # FAIL first; SKIP (the GPT boot disk, init-gcedisk) counts neither
+    # way; a guest that stops or times out without a verdict fails.
+    if grep -q "DISKTEST: FAIL" /tmp/dt; then
+        fail "disk $d pass-through"
+    elif grep -q "DISKTEST: PASS" /tmp/dt; then
+        pass "disk $d pass-through"
+    elif grep -q "DISKTEST: SKIP" /tmp/dt; then
+        :
+    else
+        fail "disk $d pass-through (no verdict)"
+    fi
     l4hctl destroy "$vm"
 done
 

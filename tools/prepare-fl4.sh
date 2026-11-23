@@ -16,8 +16,14 @@ else
     frozen=https://github.com/losfair/FL4.git
     base=$(cat "$root/kernel/fl4/REVISION")
 fi
-src=$root/build/FL4-src
+# A tree per revision ($base is a full commit ID), never changed once
+# made: builds of other revisions never touch it, and concurrent builds
+# of this one prepare it one at a time and then read the same tree.
+src=$root/build/FL4-src-$base
 stamp=$src/.git/l4h-source
+mkdir -p "$root/build"
+exec 8>"$root/build/.fl4-src-$base.lock"
+flock 8
 if [ ! -d "$src/.git" ]; then
     git clone -q "${clone_args[@]}" "$frozen" "$src"
     git -C "$src" checkout -q -B l4h "$base"
@@ -37,3 +43,5 @@ if [ "$(cat "$stamp" 2>/dev/null)" != "$base" ] ||
     git -c protocol.file.allow=always -C "$src" submodule update --init "${ref[@]}" -- vendor/seL4
     echo "$base" >"$stamp"
 fi
+flock -u 8
+exec 8>&-

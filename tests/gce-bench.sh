@@ -21,16 +21,30 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 export L4H_RELEASE=1 L4H_ARCH=x86_64 L4H_KERNEL_VARIANT=fl4 SEL4_PREFIX=$root/build/sel4-fl4
 source "$root/tools/host-profile.sh"
+usage() {
+    echo "Usage: gce-bench.sh [--sev-snp|--aarch64] [--scale] PROJECT [ZONE] [MACHINE_TYPE]" >&2
+    exit 2
+}
+# Options anywhere; after --, arguments only.
 snp= scale= arm=
-while :; do
-    case "${1:-}" in
+pos=()
+while [ $# -gt 0 ]; do
+    case $1 in
         --sev-snp) snp=1 ;;
         --aarch64) arm=1 ;;
         --scale) scale=1 ;;
-        *) break ;;
+        --) shift; pos+=("$@"); break ;;
+        -*) echo "gce-bench.sh: unknown option $1" >&2; usage ;;
+        *) pos+=("$1") ;;
     esac
     shift
 done
+if [ -n "$arm" ] && [ -n "$snp" ]; then
+    echo "gce-bench.sh: --aarch64 and --sev-snp cannot be combined" >&2
+    exit 2
+fi
+{ [ ${#pos[@]} -ge 1 ] && [ ${#pos[@]} -le 3 ]; } || usage
+set -- "${pos[@]}"
 project=$1
 zone=${2:-us-central1-a}
 machine=${3:-n4-standard-4}
@@ -55,66 +69,100 @@ if [ -n "$snp" ]; then
         --maintenance-policy=TERMINATE)
 fi
 region=${zone%-*}
-name=l4h-bench-$(date +%Y%m%d-%H%M%S)
 bucket=gs://$project-l4h-test
-out=$root/build/gce-bench; mkdir -p "$out"
+out=$root/build/gce-bench
+mkdir -p "$out"
+# This run's intermediate files, apart from any other run's: only the
+# serial log, the image and its .tar.gz (named after the run) are in $out.
+# Its directory is reserved by a plain mkdir, which fails if another run
+# has the name; the name (GCE's, too) comes from it.
+name=
+for _ in 1 2 3 4 5 6 7 8; do
+    try=$(printf 'l4h-bench-%s-%x-%04x' "$(date +%Y%m%d-%H%M%S)" "$$" "$RANDOM")
+    if mkdir "$out/$try" 2>/dev/null; then name=$try; break; fi
+done
+[ -n "$name" ] || { echo "gce-bench.sh: no free run directory in $out" >&2; exit 1; }
+work=$out/$name
+# The raw image too, left by a step that failed after it was made.
+remove_work() { [ "${KEEP:-0}" = 1 ] || rm -rf "$work" "$out/$name.raw"; }
+trap remove_work EXIT
 log=$out/$name.serial.log
+# A failed build step: the end of its log, and the log kept beside the
+# serial log ($work goes).
+fail_log() {
+    local saved
+    saved=$out/$name.$(basename "$1")
+    tail -30 "$1" >&2
+    cp "$1" "$saved"
+    echo "build log: $saved" >&2
+    exit 1
+}
+# Run a build step with its output in $work/STEP.log.
+build_step() {
+    local f=$work/$1.log
+    shift
+    "$@" >"$f" 2>&1 || fail_log "$f"
+}
 
 # ---- image
+# One run builds and packages at a time: the kernel, Linux and host
+# outputs in build/ and host/target are shared (VCPUS goes into
+# l4h-root.elf).  Released once the image is packaged; the cloud part of
+# runs goes on concurrently.
+exec 7>"$root/build/.image-build.lock"
+flock -n 7 || { echo "waiting for another run's image build" >&2; flock 7; }
 if [ -n "$arm" ]; then
-    "$root/tools/build-fl4-aarch64.sh" >"$out/kernel-build.log" 2>&1 \
-        || { tail -20 "$out/kernel-build.log"; exit 1; }
+    build_step kernel-build "$root/tools/build-fl4-aarch64.sh"
 else
-    "$root/tools/build-fl4.sh" >"$out/kernel-build.log" 2>&1 \
-        || { tail -20 "$out/kernel-build.log"; exit 1; }
+    build_step kernel-build "$root/tools/build-fl4.sh"
 fi
-"$root/tools/build-linux.sh" vmlinux >"$out/linux-build.log" 2>&1 \
-    || { grep -E "error|undefined" "$out/linux-build.log"; exit 1; }
+build_step linux-build "$root/tools/build-linux.sh" vmlinux
 if [ -n "$arm" ]; then
-    aarch64-linux-gnu-objcopy --strip-debug "$root/build/linux-l4h-aarch64/vmlinux" "$out/vmlinux"
+    aarch64-linux-gnu-objcopy --strip-debug "$root/build/linux-l4h-aarch64/vmlinux" "$work/vmlinux"
 else
-    objcopy --strip-debug "$root/build/linux-l4h/vmlinux" "$out/vmlinux"
+    objcopy --strip-debug "$root/build/linux-l4h/vmlinux" "$work/vmlinux"
 fi
-"$cc" -O2 -static -Wall -Wextra -Werror -o "$out/syscallbench" "$root/tests/guest/syscallbench.c"
+"$cc" -O2 -static -Wall -Wextra -Werror -o "$work/syscallbench" "$root/tests/guest/syscallbench.c"
 if [ -n "$scale" ]; then
-    "$cc" -O2 -static -Wall -Wextra -Werror -o "$out/smpbench" "$root/tests/guest/smpbench.c"
-    "$root/tools/mkinitramfs.sh" "$out/dom0.cpio.gz" "$root/tests/guest/init-smpscale" \
-        "$out/syscallbench" "$out/smpbench" >/dev/null
+    "$cc" -O2 -static -Wall -Wextra -Werror -o "$work/smpbench" "$root/tests/guest/smpbench.c"
+    "$root/tools/mkinitramfs.sh" "$work/dom0.cpio.gz" "$root/tests/guest/init-smpscale" \
+        "$work/syscallbench" "$work/smpbench" >/dev/null
     marker=SCALEBENCH
     vcpus=${VCPUS:-$(gcloud compute machine-types describe "$machine" --project="$project" \
         --zone="$zone" --format='value(guestCpus)')}
     mem_mb=8192
 else
-    "$root/tools/mkinitramfs.sh" "$out/dom0.cpio.gz" "$root/tests/guest/init-syscallbench" \
-        "$out/syscallbench" >/dev/null
+    "$root/tools/mkinitramfs.sh" "$work/dom0.cpio.gz" "$root/tests/guest/init-syscallbench" \
+        "$work/syscallbench" >/dev/null
     marker=SYSCALLBENCH
     vcpus=${VCPUS:-2}
     mem_mb=1024
 fi
 host_build=build-host.sh
 [ -n "$arm" ] && host_build=build-host-aarch64.sh
-L4H_DOM0_DISKS=0 L4H_DOM0_VCPUS=$vcpus L4H_DOM0_MEM_MB=$mem_mb L4H_DOM0_CMDLINE="console=hvc0 quiet" L4H_WATCHDOG_SECS=0 \
-    "$root/tools/$host_build" >"$out/host-build.log" 2>&1 \
-    || { tail -20 "$out/host-build.log"; exit 1; }
-export L4H_GUEST_KERNEL=$out/vmlinux L4H_GUEST_SDK=
+build_step host-build env L4H_DOM0_DISKS=0 L4H_DOM0_VCPUS="$vcpus" L4H_DOM0_MEM_MB="$mem_mb" \
+    L4H_DOM0_CMDLINE="console=hvc0 quiet" L4H_WATCHDOG_SECS=0 "$root/tools/$host_build"
+export L4H_GUEST_KERNEL=$work/vmlinux L4H_GUEST_SDK=
 if [ -n "$arm" ]; then
     # dom0's initramfs goes in the application.
     rootelf=$root/host/target/aarch64-sel4-roottask/$l4h_profile/l4h-root.elf
-    L4H_DOM0_INITRD=$out/dom0.cpio.gz "$root/tools/mkfl4-efi-aarch64.sh" "$out/$name.efi" "$rootelf" \
-        "$SEL4_PREFIX/bin/kernel.elf" >"$out/efi-build.log" 2>&1 || { tail -20 "$out/efi-build.log"; exit 1; }
-    "$root/tools/mkimage.sh" -e "$out/$name.efi" "$out/$name.raw" >/dev/null
+    build_step efi-build env L4H_DOM0_INITRD="$work/dom0.cpio.gz" "$root/tools/mkfl4-efi-aarch64.sh" "$work/$name.efi" "$rootelf" \
+        "$SEL4_PREFIX/bin/kernel.elf"
+    build_step image-build "$root/tools/mkimage.sh" -e "$work/$name.efi" "$out/$name.raw"
 else
     rootelf=$root/host/target/x86_64-sel4-roottask/$l4h_profile/l4h-root.elf
-    "$root/tools/mkfl4-release-efi.sh" "$out/$name.efi" "$rootelf" "$SEL4_PREFIX/bin/kernel.elf" >"$out/efi-build.log" 2>&1 \
-        || { tail -20 "$out/efi-build.log"; exit 1; }
-    "$root/tools/mkimage.sh" -e "$out/$name.efi" -i "$out/dom0.cpio.gz" "$out/$name.raw" >/dev/null
+    build_step efi-build "$root/tools/mkfl4-release-efi.sh" "$work/$name.efi" "$rootelf" "$SEL4_PREFIX/bin/kernel.elf"
+    build_step image-build "$root/tools/mkimage.sh" -e "$work/$name.efi" -i "$work/dom0.cpio.gz" "$out/$name.raw"
 fi
-rm -f "$out/$name.efi"
-"$root/tools/gce-image.sh" "$out/$name.raw" "$name" >/dev/null
+rm -f "$work/$name.efi"
+build_step gce-image "$root/tools/gce-image.sh" "$out/$name.raw" "$name"
 rm -f "$out/$name.raw"
+flock -u 7
+exec 7>&-
 
 # ---- cloud resources
 cleanup() {
+    remove_work
     [ "${KEEP:-0}" = 1 ] && { echo "kept instance and image $name"; return; }
     gcloud compute instances delete "$name" --project="$project" --zone="$zone" --quiet >/dev/null 2>&1 || true
     gcloud compute images delete "$name" --project="$project" --quiet >/dev/null 2>&1 || true
@@ -140,6 +188,6 @@ while [ $SECONDS -lt $end ]; do
         >"$log" 2>/dev/null || continue
     grep -aqE "$marker: (PASS|FAIL)" "$log" && break
 done
-grep -aE "$marker|SYSCALLBENCH|SMPBENCH|FL4: speculation|FL4: AMD SEV|FL4: [0-9]+ core|l4h-root: [0-9]+ core|panic|fault" "$log" || true
+grep -aE "$marker|SYSCALLBENCH|SMPBENCH|FL4: speculation|FL4: AMD SEV|FL4: ITS|l4h-root: MSIs through|no MSIs|FL4: [0-9]+ core|l4h-root: [0-9]+ core|panic|fault" "$log" || true
 echo "serial log: $log"
 grep -aqE "$marker: PASS" "$log"

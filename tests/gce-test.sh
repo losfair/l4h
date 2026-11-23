@@ -25,22 +25,42 @@
 # UEFI_EFI=app.efi boots that exact release application with the test dom0
 # and settings on its ESP, without rebuilding its kernel, host or SDK.
 # IMAGE_ONLY=1 stops once the image's .tar.gz is built, prints its path
-# and the deployment commands (tools/gce-image.sh), and uses no cloud
-# resources (PROJECT is then only a placeholder).
+# and the exact commands the test would run with it (the same bucket,
+# image and instance arguments), and uses no cloud resources.
 # Usage: gce-test.sh [--sev|--sev-snp|--tdx|--aarch64] PROJECT [ZONE] [MACHINE_TYPE]
 # e.g.   BOOT_DISK_INTERFACE=NVME NIC_TYPE=GVNIC gce-test.sh PROJECT us-west1-b c3-standard-4-lssd
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 source "$root/tools/host-profile.sh"
+usage() {
+    echo "Usage: gce-test.sh [--sev|--sev-snp|--tdx|--aarch64] PROJECT [ZONE] [MACHINE_TYPE]" >&2
+    exit 2
+}
+# Options anywhere; after --, arguments only.
+mode=
+pos=()
+while [ $# -gt 0 ]; do
+    case $1 in
+        --aarch64|--sev|--sev-snp|--tdx)
+            [ -z "$mode" ] || { echo "gce-test.sh: $mode and $1 cannot be combined" >&2; exit 2; }
+            mode=$1 ;;
+        --) shift; pos+=("$@"); break ;;
+        -*) echo "gce-test.sh: unknown option $1" >&2; usage ;;
+        *) pos+=("$1") ;;
+    esac
+    shift
+done
+{ [ ${#pos[@]} -ge 1 ] && [ ${#pos[@]} -le 3 ]; } || usage
+set -- "${pos[@]}"
 confidential=
 arch=x86_64
 default_zone=us-west1-b
 default_machine=n2-standard-4
-case "${1:-}" in
-    --aarch64) arch=aarch64; default_zone=us-central1-b; default_machine=c4a-standard-4; shift ;;
-    --sev) confidential=SEV; shift ;;
-    --sev-snp) confidential=SEV_SNP; default_zone=us-central1-a; shift ;;
-    --tdx) confidential=TDX; default_zone=us-central1-a; shift ;;
+case "$mode" in
+    --aarch64) arch=aarch64; default_zone=us-central1-b; default_machine=c4a-standard-4 ;;
+    --sev) confidential=SEV ;;
+    --sev-snp) confidential=SEV_SNP; default_zone=us-central1-a ;;
+    --tdx) confidential=TDX; default_zone=us-central1-a ;;
 esac
 project=$1
 zone=${2:-$default_zone}
@@ -58,9 +78,12 @@ fi
 features=UEFI_COMPATIBLE,GVNIC
 image_arch=()
 if [ "$arch" = aarch64 ]; then
-    # C4A: gVNIC, NVMe hyperdisks, no local SSD unless the type has them.
+    # C4A: gVNIC and NVMe hyperdisks.  Its -lssd shapes come with their
+    # local SSDs and the others take no --local-ssd; hyperdisk-balanced
+    # takes no --boot-disk-interface (an inherited NVME would fail).
     nic=GVNIC
-    case "$machine" in *-lssd) ;; *) ssd= ;; esac
+    ssd=
+    BOOT_DISK_INTERFACE=
     disk_args=(--boot-disk-type=hyperdisk-balanced --boot-disk-size=10GB
         --create-disk=size=10GB,type=hyperdisk-balanced,auto-delete=yes)
     image_arch=(--architecture=ARM64)
@@ -92,30 +115,61 @@ if [ -n "$confidential" ]; then
     fi
     export SEL4_PREFIX="$root/build/sel4-fl4" L4H_KERNEL_VARIANT=fl4
 fi
-name=l4h-test-$(date +%Y%m%d-%H%M%S)-$RANDOM
 bucket=gs://$project-l4h-test
-out=$root/build/gce; mkdir -p "$out"
+out=$root/build/gce
+mkdir -p "$out"
+# This run's intermediate files, apart from any other run's: only the
+# serial log, the image and its .tar.gz (named after the run) are in $out.
+# Its directory is reserved by a plain mkdir, which fails if another run
+# has the name; the name (GCE's, too) comes from it.
+name=
+for _ in 1 2 3 4 5 6 7 8; do
+    try=$(printf 'l4h-test-%s-%x-%04x' "$(date +%Y%m%d-%H%M%S)" "$$" "$RANDOM")
+    if mkdir "$out/$try" 2>/dev/null; then name=$try; break; fi
+done
+[ -n "$name" ] || { echo "gce-test.sh: no free run directory in $out" >&2; exit 1; }
+work=$out/$name
+# The raw image too, left by a step that failed after it was made.
+remove_work() { [ "${KEEP:-0}" = 1 ] || rm -rf "$work" "$out/$name.raw"; }
+trap remove_work EXIT
 log=$out/$name.serial.log
+# A failed build step: the end of its log, and the log kept beside the
+# serial log ($work goes).
+fail_log() {
+    local saved
+    saved=$out/$name.$(basename "$1")
+    tail -30 "$1" >&2
+    cp "$1" "$saved"
+    echo "build log: $saved" >&2
+    exit 1
+}
+# Run a build step with its output in $work/STEP.log.
+build_step() {
+    local f=$work/$1.log
+    shift
+    "$@" >"$f" 2>&1 || fail_log "$f"
+}
 
 # ---- image
+# One run builds and packages at a time: the kernel, Linux and host
+# outputs in build/ and host/target are shared.  Released once the
+# image is packaged; the cloud part of runs goes on concurrently.
+exec 7>"$root/build/.image-build.lock"
+flock -n 7 || { echo "waiting for another run's image build" >&2; flock 7; }
 efi=${UEFI_EFI:-}
 if [ "$arch" = aarch64 ]; then
     [ -z "$efi" ] || { echo "UEFI_EFI: not with --aarch64 (its application carries dom0)" >&2; exit 1; }
-    "$root/tools/build-fl4-aarch64.sh" >"$root/build/kernel-build.log" 2>&1 \
-        || { tail -20 "$root/build/kernel-build.log"; exit 1; }
-    "$root/tools/build-linux.sh" vmlinux >"$root/build/linux-build.log" 2>&1 \
-        || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
-    aarch64-linux-gnu-objcopy --strip-debug "$root/build/linux-l4h-aarch64/vmlinux" "$out/vmlinux"
+    build_step kernel-build "$root/tools/build-fl4-aarch64.sh"
+    build_step linux-build "$root/tools/build-linux.sh" vmlinux
+    aarch64-linux-gnu-objcopy --strip-debug "$root/build/linux-l4h-aarch64/vmlinux" "$work/vmlinux"
 elif [ -n "$efi" ]; then
     [ -f "$efi" ] || { echo "$efi: missing EFI application" >&2; exit 1; }
 else
     kernel_build=build-kernel.sh
     [ -n "$confidential" ] && kernel_build=build-fl4.sh
-    "$root/tools/$kernel_build" >"$root/build/kernel-build.log" 2>&1 \
-        || { tail -20 "$root/build/kernel-build.log"; exit 1; }
-    "$root/tools/build-linux.sh" vmlinux >"$root/build/linux-build.log" 2>&1 \
-        || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
-    objcopy --strip-debug "$root/build/linux-l4h/vmlinux" "$out/vmlinux"
+    build_step kernel-build "$root/tools/$kernel_build"
+    build_step linux-build "$root/tools/build-linux.sh" vmlinux
+    objcopy --strip-debug "$root/build/linux-l4h/vmlinux" "$work/vmlinux"
 fi
 cc=gcc
 l4hctl=$root/tools/l4hctl/target/release/l4hctl
@@ -126,55 +180,87 @@ if [ "$arch" = aarch64 ]; then
 else
     (cd "$root/tools/l4hctl" && cargo +stable build -q --release)
 fi
-"$cc" -O2 -static -pthread -o "$out/selftest" "$root/tests/guest/selftest.c"
-"$root/tools/mkinitramfs.sh" "$out/selftest.cpio.gz" "$root/tests/guest/init-selftest" "$out/selftest" >/dev/null
-"$root/tools/mkinitramfs.sh" "$out/disk.cpio.gz" "$root/tests/guest/init-gcedisk" >/dev/null
-"$root/tools/mkinitramfs.sh" "$out/vm.cpio.gz" "$root/tests/guest/init-vm" >/dev/null
-"$root/tools/mkinitramfs.sh" "$out/dom0.cpio.gz" "$root/tests/guest/init-gce" \
+"$cc" -O2 -static -pthread -o "$work/selftest" "$root/tests/guest/selftest.c"
+"$root/tools/mkinitramfs.sh" "$work/selftest.cpio.gz" "$root/tests/guest/init-selftest" "$work/selftest" >/dev/null
+"$root/tools/mkinitramfs.sh" "$work/disk.cpio.gz" "$root/tests/guest/init-gcedisk" >/dev/null
+"$root/tools/mkinitramfs.sh" "$work/vm.cpio.gz" "$root/tests/guest/init-vm" >/dev/null
+"$root/tools/mkinitramfs.sh" "$work/dom0.cpio.gz" "$root/tests/guest/init-gce" \
     "$l4hctl" "$root/tests/guest/udhcpc.script" \
-    "$out/selftest.cpio.gz" "$out/disk.cpio.gz" "$out/vm.cpio.gz" >/dev/null
-cat > "$out/$name.conf" <<CONF
+    "$work/selftest.cpio.gz" "$work/disk.cpio.gz" "$work/vm.cpio.gz" >/dev/null
+cat > "$work/$name.conf" <<CONF
 dom0_disks=0
 dom0_mem_mb=1024
 dom0_cmdline="console=hvc0"
 watchdog_secs=${L4H_WATCHDOG_SECS:-0}
 CONF
-image_args=(-i "$out/dom0.cpio.gz" -c "$out/$name.conf")
+image_args=(-i "$work/dom0.cpio.gz" -c "$work/$name.conf")
 if [ "$arch" = aarch64 ]; then
-    "$root/tools/build-host-aarch64.sh"
-    efi=$out/$name.efi
-    L4H_GUEST_KERNEL=$out/vmlinux L4H_DOM0_INITRD=$out/dom0.cpio.gz L4H_CONFIG=$out/$name.conf \
+    build_step host-build "$root/tools/build-host-aarch64.sh"
+    efi=$work/$name.efi
+    build_step efi-build env L4H_GUEST_KERNEL="$work/vmlinux" L4H_DOM0_INITRD="$work/dom0.cpio.gz" L4H_CONFIG="$work/$name.conf" \
         "$root/tools/mkfl4-efi-aarch64.sh" "$efi" \
-        "$root/host/target/aarch64-sel4-roottask/$l4h_profile/l4h-root.elf" "$SEL4_PREFIX/bin/kernel.elf" >/dev/null
+        "$root/host/target/aarch64-sel4-roottask/$l4h_profile/l4h-root.elf" "$SEL4_PREFIX/bin/kernel.elf"
     image_args=()
 elif [ -z "$efi" ]; then
-    "$root/tools/build-host.sh"
-    export L4H_GUEST_KERNEL=$out/vmlinux L4H_GUEST_SDK=
+    build_step host-build "$root/tools/build-host.sh"
+    export L4H_GUEST_KERNEL=$work/vmlinux L4H_GUEST_SDK=
     if [ -n "$confidential" ]; then
-        efi=$out/$name.efi
-        "$root/tools/mkfl4-release-efi.sh" "$efi" \
+        efi=$work/$name.efi
+        build_step efi-build "$root/tools/mkfl4-release-efi.sh" "$efi" \
             "$root/host/target/x86_64-sel4-roottask/$l4h_profile/l4h-root.elf" "$SEL4_PREFIX/bin/kernel.elf"
     fi
 fi
 [ -z "$efi" ] || image_args+=(-e "$efi")
-"$root/tools/mkimage.sh" "${image_args[@]}" "$out/$name.raw" >/dev/null
+build_step image-build "$root/tools/mkimage.sh" ${image_args[@]+"${image_args[@]}"} "$out/$name.raw"
+build_step gce-image "$root/tools/gce-image.sh" "$out/$name.raw" "$name"
+rm -f "$out/$name.raw"
+# The instance, as below and as IMAGE_ONLY=1 prints it.
+instance_args=(
+    ${gce_args[@]+"${gce_args[@]}"}
+    --machine-type="$machine"
+    --image="$name"
+    ${BOOT_DISK_INTERFACE:+--boot-disk-interface="$BOOT_DISK_INTERFACE"}
+    ${ssd:+"$ssd"}
+    --network-interface=nic-type="$nic"
+    ${disk_args[@]+"${disk_args[@]}"}
+    --metadata=serial-port-enable=TRUE
+    --no-shielded-secure-boot
+)
 if [ "${IMAGE_ONLY:-0}" = 1 ]; then
-    image_flag=()
-    case "$confidential" in
-        SEV) image_flag=(--sev) ;;
-        SEV_SNP) image_flag=(--sev-snp) ;;
-        TDX) image_flag=(--tdx); [ "${NO_VTPM:-0}" = 1 ] && image_flag+=(--no-vtpm) ;;
-    esac
-    "$root/tools/gce-image.sh" "${image_flag[@]}" "$out/$name.raw" "$name"
-    rm -f "$out/$name.raw"
+    # Shell-quoted, when it needs to be.
+    quote() {
+        case $1 in
+            *[!A-Za-z0-9=,._:/@+-]*) printf '%q' "$1" ;;
+            *) printf '%s' "$1" ;;
+        esac
+    }
+    quote_all() {
+        local a q=
+        for a; do q+=" $(quote "$a")"; done
+        printf '%s' "${q# }"
+    }
+    cat <<CMDS
+$out/$name.tar.gz: $(du -h "$out/$name.tar.gz" | cut -f1)
+
+To deploy as this test does (PROJECT as given, the bucket its):
+  gcloud storage buckets describe $(quote "$bucket") --project=$(quote "$project") >/dev/null 2>&1 \\
+      || gcloud storage buckets create $(quote "$bucket") --project=$(quote "$project") --location=$(quote "$region")
+  gcloud storage cp $(quote "$out/$name.tar.gz") $(quote "$bucket/") --project=$(quote "$project")
+  gcloud compute images create $name --project=$(quote "$project") \\
+      --source-uri=$(quote "$bucket/$name.tar.gz") --guest-os-features=$features${image_arch[@]+ $(quote_all "${image_arch[@]}")}
+  gcloud compute instances create $name --project=$(quote "$project") --zone=$(quote "$zone") \\
+      $(quote_all "${instance_args[@]}")
+  gcloud compute connect-to-serial-port $name --project=$(quote "$project") --zone=$(quote "$zone")
+CMDS
     echo "image: $out/$name.tar.gz"
     exit 0
 fi
-"$root/tools/gce-image.sh" "$out/$name.raw" "$name" >/dev/null
-rm -f "$out/$name.raw"
+flock -u 7
+exec 7>&-
 
 # ---- cloud resources
 cleanup() {
+    remove_work
     [ "${KEEP:-0}" = 1 ] && { echo "kept instance and image $name"; return; }
     gcloud compute instances delete "$name" --project="$project" --zone="$zone" --quiet >/dev/null 2>&1 || true
     gcloud compute images delete "$name" --project="$project" --quiet >/dev/null 2>&1 || true
@@ -187,11 +273,7 @@ gcloud storage cp "$out/$name.tar.gz" "$bucket/" --project="$project" --quiet
 rm -f "$out/$name.tar.gz"
 gcloud compute images create "$name" --project="$project" \
     --source-uri="$bucket/$name.tar.gz" --guest-os-features="$features" "${image_arch[@]}" --quiet
-gcloud compute instances create "$name" --project="$project" --zone="$zone" \
-    "${gce_args[@]}" --machine-type="$machine" --image="$name" ${BOOT_DISK_INTERFACE:+--boot-disk-interface=$BOOT_DISK_INTERFACE} \
-    $ssd --network-interface=nic-type="$nic" \
-    "${disk_args[@]}" \
-    --metadata=serial-port-enable=TRUE --no-shielded-secure-boot --quiet
+gcloud compute instances create "$name" --project="$project" --zone="$zone" "${instance_args[@]}" --quiet
 if [ -n "$confidential" ]; then
     actual=$(gcloud compute instances describe "$name" --project="$project" --zone="$zone" \
         --format='value(confidentialInstanceConfig.confidentialInstanceType)')
@@ -210,10 +292,17 @@ while [ $SECONDS -lt $end ]; do
     # Serial lines end in CR LF.
     grep -aqE 'GCETEST: (PASS|FAIL)[[:space:]]*$' "$log" && break
 done
-grep -aE 'GCETEST|Got framebuffer|AMD SEV(-SNP)? guest|Intel TDX guest|DMA memory shared|l4h-trustd|l4h-root: [0-9]+ core|panic|fault' "$log" \
+grep -aE 'GCETEST|Got framebuffer|AMD SEV(-SNP)? guest|Intel TDX guest|DMA memory shared|l4h-trustd|l4h-root: [0-9]+ core|FL4: ITS|l4h-root: MSIs through|no MSIs|panic|fault' "$log" \
     | grep -av 'GCETEST: blob ' || true
 echo "serial log: $log"
 grep -aqE 'GCETEST: PASS[[:space:]]*$' "$log"
+if [ "$arch" = aarch64 ]; then
+    # C4A's MSIs go through FL4's ITS: never a silent fall back to GICv2m.
+    for marker in "FL4: ITS at 0x[0-9a-f]+: [0-9]+ LPIs" "l4h-root: MSIs through the ITS" "GCETEST: ok: disk [0-9]+ pass-through"; do
+        grep -aqE "$marker" "$log" || { echo "Missing serial marker: $marker" >&2; exit 1; }
+    done
+    echo "GCE FL4 AArch64: PASS"
+fi
 if [ -n "$confidential" ]; then
     technology=${confidential/_/-}
     markers=("FL4: AMD $technology guest, C-bit [0-9]+")

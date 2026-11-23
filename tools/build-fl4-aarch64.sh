@@ -13,12 +13,28 @@ prefix=$root/build/sel4-fl4-aarch64
 export PATH=$root/.venv/bin:$PATH
 debug=ON
 [ "${L4H_RELEASE:-0}" = 1 ] && debug=OFF
+# One build at a time, through what it installs in $prefix (to the end).
+exec 9>"$root/build/.build-fl4-aarch64.lock"
+flock 9
 config=$root/kernel/configs/l4h-aarch64.cmake
 # NoKernelPrinting: FL4 on AArch64 gives the PL011's MMIO page to the root
 # task (for l4h-logd) only with KernelPrinting off.  It still prints its
 # whole boot log before it starts the root task, and then releases the
 # UART (serial::release()).  Debug builds keep their other checks.
 [ "$config" -nt "$out/CMakeCache.txt" ] && rm -rf "$out"
+# A tree configured from another FL4 source (another revision's) keeps
+# that source's paths in its cache: start again.  Its stamp (written once
+# cmake has configured it from $src), FL4_SOURCE and KERNEL_PATH must all
+# name $src, or a cache left half-switched by an older build is kept.
+cached_src=$(sed -n 's/^FL4_SOURCE:[^=]*=//p' "$out/CMakeCache.txt" 2>/dev/null || true)
+cached_kernel=$(sed -n 's/^KERNEL_PATH:[^=]*=//p' "$out/CMakeCache.txt" 2>/dev/null || true)
+if [ -f "$out/CMakeCache.txt" ] && {
+    [ "$(cat "$out/.fl4-source" 2>/dev/null)" != "$src" ] ||
+    [ "$cached_src" != "$src" ] ||
+    [[ $cached_kernel != "$src"/* ]]
+}; then
+    rm -rf "$out"
+fi
 cmake -DCMAKE_C_FLAGS="$l4h_prefix_map" -DCMAKE_ASM_FLAGS="$l4h_prefix_map" -G Ninja -S "$root/kernel/fl4" -B "$out" \
     -DFL4_SOURCE="$src" \
     -DCARGO="$root/tools/cargo-fl4.sh" \
@@ -28,6 +44,7 @@ cmake -DCMAKE_C_FLAGS="$l4h_prefix_map" -DCMAKE_ASM_FLAGS="$l4h_prefix_map" -G N
     -DNoKernelPrinting=ON \
     -DKernelRetypeFanOutLimit=256 \
     -DLibSel4PrintInvocationErrors=0
+printf '%s\n' "$src" >"$out/.fl4-source"
 ninja -C "$out"
 rm -rf "$prefix"
 mkdir -p "$prefix/bin" "$prefix/libsel4/include"
