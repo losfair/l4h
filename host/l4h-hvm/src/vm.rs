@@ -87,6 +87,9 @@ pub struct Vm {
     pub clock_base: u64,
     pub clock_scale: (u32, i8),
     pub wall_base_ns: u64,
+    /// The version of kvmclock's wall clock, one for the VM as Linux has
+    /// one structure (vcpu.rs, publish_wall_clock).
+    pub wall_version: SpinLock<u32>,
 }
 
 pub static VM: Global<Vm> = Global::new();
@@ -106,9 +109,6 @@ pub enum BuildError {
     Load(crate::boot::Error),
 }
 
-/// Make the machine (once, on the I/O thread, before any vCPU runs): load
-/// the kernel dom0 put in RAM with its boot parameters, write the ACPI
-/// tables, and publish the shared state as VM.
 /// The wall time at host TSC `t`, in ns since 1970: `epoch_ns` at TSC
 /// `epoch_ticks` (0 if unknown: 2000-01-01, as the RTC has it).
 pub fn wall_ns(epoch_ns: u64, epoch_ticks: u64, tsc_hz: u64, t: u64) -> u64 {
@@ -117,6 +117,9 @@ pub fn wall_ns(epoch_ns: u64, epoch_ticks: u64, tsc_hz: u64, t: u64) -> u64 {
     (epoch as i128 + d).max(0) as u64
 }
 
+/// Make the machine (once, on the I/O thread, before any vCPU runs): load
+/// the kernel dom0 put in RAM with its boot parameters, write the ACPI
+/// tables, and publish the shared state as VM.
 pub fn build(cfg: &'static HvmConfig, tsc_hz: u64, mem: GuestMem, host: Host) -> Result<(), BuildError> {
     let (amd, xcr0) = (host.amd, host.xcr0);
     let vcpus = (cfg.nr_vcpus as usize).clamp(1, hv::MAX_VCPUS);
@@ -155,6 +158,7 @@ pub fn build(cfg: &'static HvmConfig, tsc_hz: u64, mem: GuestMem, host: Host) ->
         clock_base: t0,
         clock_scale: crate::x86::pvclock::time_scale(tsc_hz),
         wall_base_ns: wall_ns(cfg.epoch_ns, cfg.epoch_ticks, tsc_hz, t0),
+        wall_version: SpinLock::new(0),
         pcid: AtomicBool::new(host.pcid),
     });
     Ok(())

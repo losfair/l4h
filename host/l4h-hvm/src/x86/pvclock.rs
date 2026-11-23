@@ -74,19 +74,21 @@ pub fn wall_clock(version: u32, sec: u32, nsec: u32) -> [u8; WALL_CLOCK_SIZE] {
     b
 }
 
-/// Write a pvclock structure as KVM does: an odd version first, then the
-/// rest, then the even version (`b[0..4]`), so that a guest reading it
-/// meanwhile retries.  `write(offset, bytes)` stores into guest RAM; false
-/// (not RAM) leaves it.
-pub fn publish(b: &[u8], mut write: impl FnMut(usize, &[u8]) -> bool) -> bool {
-    let version = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-    if !write(0, &(version | 1).to_le_bytes()) {
-        return false;
-    }
+/// Write a pvclock structure as KVM does, for its even version `v`
+/// (`b[0..4]`): `v - 1` first, then the rest, then `v`.  Linux's
+/// pvclock_read_begin() takes `version & ~1` and pvclock_read_retry()
+/// compares it with the version after: a reader that began before or
+/// during the write sees `v - 2` or `v - 1` there and retries.  The caller
+/// checks the whole structure is RAM first, so that nothing is left half
+/// written, and stores `version` as one aligned 32-bit word.
+pub fn publish(b: &[u8], mut version: impl FnMut(u32), mut body: impl FnMut(&[u8])) {
+    let v = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+    debug_assert!(v & 1 == 0);
+    version(v.wrapping_sub(1));
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-    let ok = write(4, &b[4..]);
+    body(&b[4..]);
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-    ok && write(0, &b[0..4])
+    version(v);
 }
 
 #[cfg(test)]
@@ -121,15 +123,24 @@ mod tests {
         assert_eq!((t[28], t[29]), (0xff, 1));
         let w = wall_clock(2, 1_700_000_000, 5);
         assert_eq!(w, [2, 0, 0, 0, 0, 0xf1, 0x53, 0x65, 5, 0, 0, 0]);
-        let mut mem = [0u8; 32];
-        let mut versions = std::vec::Vec::new();
-        assert!(publish(&t, |o, b| {
-            mem[o..o + b.len()].copy_from_slice(b);
-            versions.push(u32::from_le_bytes([mem[0], mem[1], mem[2], mem[3]]));
-            true
-        }));
-        assert_eq!(versions, [5, 5, 4]);
-        assert_eq!(mem, t);
-        assert!(!publish(&t, |_, _| false));
+        // v - 1, the body, v: a reader that began with v - 2 (or v - 1)
+        // finds `begin & !1 != end` and retries.
+        let mem = core::cell::RefCell::new([0u8; 32]);
+        let log = core::cell::RefCell::new(std::vec::Vec::new());
+        publish(&t, |v| {
+            mem.borrow_mut()[0..4].copy_from_slice(&v.to_le_bytes());
+            log.borrow_mut().push(std::format!("v{v}"));
+        }, |b| {
+            mem.borrow_mut()[4..4 + b.len()].copy_from_slice(b);
+            log.borrow_mut().push(std::format!("body{}", b.len()));
+        });
+        assert_eq!(*log.borrow(), ["v3", "body28", "v4"]);
+        assert_eq!(*mem.borrow(), t);
+        for begin in [2u32, 3] {
+            assert_ne!(begin & !1, 4, "a reader from before retries");
+        }
+        // Across the wrap: 0 - 1 is odd, and its & !1 is not 0.
+        assert_eq!(0u32.wrapping_sub(1) & 1, 1);
+        assert_ne!(0u32.wrapping_sub(1) & !1, 0);
     }
 }

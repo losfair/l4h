@@ -542,6 +542,18 @@ fn guest_boots_and_uses_the_machine() {
     let want = 1_767_225_600 * 1_000_000_000 + vm().clock_base * 1_000_000_000 / tsc_hz;
     assert!(wv != 0 && wv & 1 == 0);
     assert_eq!(sec as u64 * 1_000_000_000 + nsec as u64, want, "wall clock");
+    // One wall clock for the VM, so one version: the VM's, not the vCPU's.
+    assert_eq!(*vm().wall_version.lock(), wv);
+    wrmsr(&mut c0, 0x4b56_4d00, wall);
+    assert_eq!(mem.read::<u32>(wall), wv + 2);
+    assert_eq!(*vm().wall_version.lock(), wv + 2);
+    // A structure past the end of RAM is left whole: not a byte of it.
+    let edge = RAM - 8;
+    mem.write::<u64>(edge, 0x1234_5678_9abc_def0);
+    wrmsr(&mut c0, 0x4b56_4d01, edge | 1);
+    assert_eq!(mem.read::<u64>(edge), 0x1234_5678_9abc_def0, "no odd version at RAM's end");
+    wrmsr(&mut c0, 0x4b56_4d00, edge);
+    assert_eq!(mem.read::<u64>(edge), 0x1234_5678_9abc_def0);
     // Off: nothing more is written.
     wrmsr(&mut c0, 0x4b56_4d01, 0);
     mem.write_bytes(clock, &[0; 32]);
