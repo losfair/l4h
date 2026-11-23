@@ -5799,8 +5799,21 @@ runs on Apple Silicon macOS under QEMU/HVF with `kernel-irqchip=off`
 (`tools/run-image-aarch64.sh` selects HVF on macOS); 1/4-vCPU self-tests
 pass on an Apple M4.
 
-**Scope.** This targets QEMU `virt` with GICv2m. Other ARM boards need their
-own platform description and interrupt routing.
+**Cloud Arm (GCE C4A).** On FL4, the same image boots Google Axion C4A
+instances, which are laid out like QEMU `virt` (the same ECAM, PCI aperture,
+PL011 and GIC addresses, RAM from 1 GiB) but enter at EL1 with ACPI and
+deliver MSIs only through a GICv3 ITS (no GICv2m, no SMMU). FL4 drives the
+ITS and reports its doorbell (`SEL4_BOOTINFO_HEADER_AARCH64_MSI_INFO`);
+root then asks for each vector with `seL4_IRQControl_GetMSI` (event and
+LPI number = the vector, device ID = the function's requester ID) and
+gives drivers the doorbell and the event as MSI address and data.
+`tests/gce-test.sh --aarch64` and `tests/gce-bench.sh --aarch64` run on a
+c4a-standard-4; `L4H_QEMU_ACPI=on tools/run-fl4-aarch64.sh` with QEMU's
+ITS is the local equivalent.
+
+**Scope.** This targets QEMU `virt` (GICv2m or, on FL4, a GICv3 ITS) and
+machines laid out like it. Other ARM boards need their own platform
+description and interrupt routing.
 
 ---
 
@@ -6092,7 +6105,7 @@ tools/build-fl4.sh
 SEL4_PREFIX="$PWD/build/sel4-fl4" L4H_KERNEL_VARIANT=fl4 tests/run-selftest.sh 4
 ```
 
-The tested FL4 revision is `66c07cafd401848485de324f5dbc92f7394baa18`.
+The tested FL4 revision is `fcdc389c919ff3367aea567bb6586c919490e328`.
 `prepare-fl4.sh` clones the pinned public revision, or the frozen override,
 into `build/FL4-src` without applying any kernel patches. The source
 worktree is not edited.
