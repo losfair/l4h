@@ -7,6 +7,8 @@
 #   L4H_QEMU_CPU             default max (cortex-a57 has no VHE)
 #   L4H_SMP, L4H_MEM_MB      vCPUs (2) and RAM in MiB (2048)
 #   L4H_QEMU_EFI             the AArch64 UEFI firmware (QEMU_EFI.fd)
+#   L4H_QEMU_ACPI            on: the firmware's ACPI tables, as cloud Arm
+#                            instances have (default off: the device tree)
 # l4h-root finds PCI at QEMU virt's low ECAM and MMIO windows
 # (highmem-ecam=off, highmem-mmio=off), as with tools/run-image-aarch64.sh.
 # The ESP is a virtio-mmio disk: the firmware boots from it, and the host
@@ -32,7 +34,7 @@ trap 'rm -rf "$esp"' EXIT
 mkdir -p "$esp/EFI/BOOT"
 cp "$efi" "$esp/EFI/BOOT/BOOTAA64.EFI"
 qemu-system-aarch64 -accel tcg \
-    -machine "virt,acpi=off,gic-version=${L4H_QEMU_GIC_VERSION:-3},virtualization=${L4H_QEMU_VIRTUALIZATION:-on},highmem-ecam=off,highmem-mmio=off" \
+    -machine "virt,acpi=${L4H_QEMU_ACPI:-off},gic-version=${L4H_QEMU_GIC_VERSION:-3},virtualization=${L4H_QEMU_VIRTUALIZATION:-on},highmem-ecam=off,highmem-mmio=off" \
     -cpu "${L4H_QEMU_CPU:-max}" -smp "${L4H_SMP:-2}" -m "${L4H_MEM_MB:-2048}" \
     -nographic -serial mon:stdio -no-reboot \
     -bios "$efi_fw" -drive "if=none,id=esp,format=raw,file=fat:rw:$esp" -device virtio-blk-device,drive=esp "$@"

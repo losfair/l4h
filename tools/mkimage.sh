@@ -20,7 +20,9 @@
 #   -m  a multikernel configuration, copied into /l4h: l4h-mk.conf and
 #       each partition's pN/l4h.conf and pN/dom0/initrd (DESIGN.md §11.4)
 # L4H_SERIAL_PORT, L4H_FB_CONSOLE=1, L4H_GUEST_KERNEL and L4H_GUEST_SDK
-# go to tools/mkefi.sh and tools/mkbios.sh.  L4H_ESP_MB
+# go to tools/mkefi.sh and tools/mkbios.sh.  With L4H_ARCH=aarch64 the
+# -e application is the ESP's BOOTAA64.EFI (an AArch64 image boots under
+# UEFI only, so it needs -e).  L4H_ESP_MB
 # sizes the partition (default: the payload plus 64 MiB, room for larger
 # dom0 images later).
 set -euo pipefail
@@ -73,7 +75,10 @@ serial=$(od -An -N4 -tx4 /dev/urandom | tr -d ' ')
 dd if=/dev/zero of="$work/esp.img" bs=1M count="$esp_mb" status=none
 mformat -i "$work/esp.img" -F -N "$serial" -v L4HEFI ::
 mmd -i "$work/esp.img" ::/EFI ::/EFI/BOOT ::/l4h ::/l4h/dom0
-mcopy -i "$work/esp.img" "$efi" ::/EFI/BOOT/BOOTX64.EFI
+# The removable-media path of the firmware's architecture (L4H_ARCH).
+boot_efi=BOOTX64.EFI
+[ "${L4H_ARCH:-x86_64}" = aarch64 ] && boot_efi=BOOTAA64.EFI
+mcopy -i "$work/esp.img" "$efi" "::/EFI/BOOT/$boot_efi"
 if [ -n "$bios" ]; then
     mmd -i "$work/esp.img" ::/l4h/bios
     mcopy -s -i "$work/esp.img" "$bios"/* ::/l4h/bios/

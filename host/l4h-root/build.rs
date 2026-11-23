@@ -20,6 +20,13 @@ fn main() {
     }
     // FL4's AArch64 VCPUs and Stage-2 VSpaces, which a C seL4 built
     // without them does not name.
+    // FL4's seL4_IRQControl_GetMSI (MSIs through a GICv3 ITS) on AArch64;
+    // seL4 has GICv2m alone.
+    println!("cargo:rustc-check-cfg=cfg(l4h_kernel_its)");
+    let arm = env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64");
+    if arm && fs::read_to_string(&arch_xml).is_ok_and(|s| s.contains("id=\"ARMIRQIssueIRQHandlerMSI\"")) {
+        println!("cargo:rustc-cfg=l4h_kernel_its");
+    }
     println!("cargo:rustc-check-cfg=cfg(l4h_arm_virt)");
     let arm_objtype = prefix.join("libsel4/include/sel4/arch/objecttype.h");
     println!("cargo:rerun-if-changed={}", arm_objtype.display());
