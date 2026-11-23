@@ -29,6 +29,7 @@ extern const char fpu_start[], fpu_end[], xcr0_start[], xcr0_end[], smap_start[]
 extern const char state_start[], state_end[], rdpmc_start[], rdpmc_end[];
 extern const char nmiss_start[], nmiss_ud[], nmiss_nmi[], nmiss_end[];
 extern const char tpr_start[], tpr_end[], vintr_start[], vintr_ok[], vintr_v0[], vintr_end[];
+extern const char vintr_gp[];
 extern const char notify_start[], notify_spin[], notify_end[];
 __asm__(".pushsection .rodata\n"
 	/* Real mode: "OK" to port 0x3f8, then hlt. */
@@ -200,8 +201,8 @@ __asm__(".pushsection .rodata\n"
 	"  mov %rax, %cr8\n"
 	"  hlt\n"
 	"tpr_end:\n"
-	/* UD2 (with no IDT, a shutdown); then, after a reset, the normal path
-	 * to port 0x40, and a vector 0 handler that goes to port 0x41. */
+	/* UD2 with no IDT shuts down. After reset the normal path writes port
+	 * 0x40, vector 0 writes port 0x41, and #GP writes its error to 0x42. */
 	"vintr_start:\n"
 	"  ud2\n"
 	"vintr_ok:\n"
@@ -211,6 +212,10 @@ __asm__(".pushsection .rodata\n"
 	"vintr_v0:\n"
 	"  mov $0x41, %dx\n"
 	"  out %al, %dx\n"
+	"  hlt\n"
+	"vintr_gp:\n"
+	"  mov (%rsp), %eax\n"
+	"  out %eax, $0x42\n"
 	"  hlt\n"
 	"vintr_end:\n"
 	/* Stop in userspace once, then change R15 and CF without a VM exit. */
@@ -842,9 +847,12 @@ static int tpr_lowered(int kvm)
  */
 static int irq_window_reset(int kvm)
 {
+	const uint32_t gp_error = 0x28;
+	struct kvm_vcpu_events ev;
 	struct kvm_sregs sregs;
 	struct kvm_regs regs;
 	struct vm vm;
+	uint32_t received;
 
 	if (vm_create(&vm, kvm) || enter_long_mode(&vm, vintr_start, vintr_end, 0, 0))
 		return -1;
@@ -861,6 +869,7 @@ static int irq_window_reset(int kvm)
 	if (enter_long_mode(&vm, vintr_start, vintr_end, 0, 0))
 		return -1;
 	gate64(vm.mem + 0x20000, 0, 0x1000 + (vintr_v0 - vintr_start));
+	gate64(vm.mem + 0x20000, 13, 0x1000 + (vintr_gp - vintr_start));
 	((uint64_t *)(vm.mem + 0x21000))[1] = 0x00af9b000000ffff;
 	((uint64_t *)(vm.mem + 0x21000))[2] = 0x00cf93000000ffff;
 	CHECK(ioctl(vm.vcpu, KVM_GET_SREGS, &sregs) == 0, "KVM_GET_SREGS");
@@ -877,8 +886,23 @@ static int irq_window_reset(int kvm)
 	CHECK(ioctl(vm.vcpu, KVM_RUN, 0) == 0, "KVM_RUN");
 	CHECK(vm.run->exit_reason == KVM_EXIT_IO, "irq window reset: exit %u", vm.run->exit_reason);
 	CHECK(vm.run->io.port == 0x40, "irq window reset: an interrupt nobody queued reached the guest");
-	vm_destroy(&vm);
 	printf("KVMTEST: IRQ window across a reset ok\n");
+
+	/* The #GP handler reports the actual error word the guest received. */
+	CHECK(ioctl(vm.vcpu, KVM_GET_VCPU_EVENTS, &ev) == 0, "#GP: KVM_GET_VCPU_EVENTS");
+	ev.exception.injected = 1;
+	ev.exception.nr = 13;
+	ev.exception.has_error_code = 1;
+	ev.exception.error_code = gp_error;
+	ev.exception.pending = 0;
+	ev.flags = 0;
+	CHECK(ioctl(vm.vcpu, KVM_SET_VCPU_EVENTS, &ev) == 0, "#GP: KVM_SET_VCPU_EVENTS");
+	CHECK(ioctl(vm.vcpu, KVM_RUN, 0) == 0 && vm.run->exit_reason == KVM_EXIT_IO &&
+	      vm.run->io.port == 0x42 && vm.run->io.size == sizeof(received), "#GP: handler did not run");
+	memcpy(&received, (char *)vm.run + vm.run->io.data_offset, sizeof(received));
+	CHECK(received == gp_error, "#GP: injected %#x, handler received %#x", gp_error, received);
+	vm_destroy(&vm);
+	printf("KVMTEST: injected exception error code ok\n");
 	return 0;
 }
 

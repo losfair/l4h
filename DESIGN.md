@@ -6088,7 +6088,7 @@ tools/build-fl4.sh
 SEL4_PREFIX="$PWD/build/sel4-fl4" L4H_KERNEL_VARIANT=fl4 tests/run-selftest.sh 4
 ```
 
-The tested FL4 revision is `ec11fecb32ff1e13c89e12b8dc8345fc4e783f31`.
+The tested FL4 revision is `624600c954a06850de90170f1503ac2b0b243abe`.
 `prepare-fl4.sh` clones the pinned public revision, or the frozen override,
 into `build/FL4-src` without applying any kernel patches. The source
 worktree is not edited.
@@ -6159,9 +6159,11 @@ buffer, leaving 3 KiB for FL4's 2696-byte standard XSAVE image.
 FL4 enables `KernelVTX` and `KernelX86_64VTX64BitGuests` in its ABI and
 selects VT-x or AMD-V at boot. The existing KVM backends (§5.10) use its
 VCPU/EPT interface through the provider, including FL4's 32 KiB VCPU
-objects. l4h enables `KernelX86VmenterFullState` so KVM and l4h-hvm
-receive the guest registers when a notification ends `VMEnter`, including
-when the notification was pending before entry. Both KVM backends check
+objects. KVM and l4h-hvm request all 30 reply words from `VMEnter` so
+they receive the guest registers even when a notification was pending at
+entry. FL4 also accepts the stock seL4 call with a zero request word and
+its three-word notification reply. On l4h's patched seL4, `KernelVTX`
+already provides the full reply. Both KVM backends check
 the result before decoding a hardware exit. When hardware virtualization
 is unavailable, root's VCPU probe fails and Linux boots with KVM disabled,
 using the same host, provider and Linux binaries. Multikernel partitions remain

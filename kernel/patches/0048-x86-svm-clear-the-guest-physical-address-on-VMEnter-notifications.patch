@@ -1,0 +1,41 @@
+From a1604e0b0210b680b2a2f1f6b0782aa55f36e712 Mon Sep 17 00:00:00 2001
+From: l4h <l4h@localhost>
+Date: Mon, 23 Nov 2026 11:01:34 +0100
+Subject: [PATCH] x86/svm: clear the guest physical address on VMEnter
+ notifications
+
+A notification has no guest fault address. Leave EXITINFO2 available for hardware exits such as nested page faults and I/O exits.
+---
+ libsel4/arch_include/x86/sel4/arch/vmenter.h | 2 +-
+ src/arch/x86/object/svm.c                    | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/libsel4/arch_include/x86/sel4/arch/vmenter.h b/libsel4/arch_include/x86/sel4/arch/vmenter.h
+index de1f9f21b..49928e272 100644
+--- a/libsel4/arch_include/x86/sel4/arch/vmenter.h
++++ b/libsel4/arch_include/x86/sel4/arch/vmenter.h
+@@ -15,7 +15,7 @@
+  * CPU gave no NEXT_RIP), GUEST_INT_MR the interrupt state, CR3_MR the
+  * guest's CR3, and IDT_VECTOR_INFO and _ERROR EXITINTINFO.  EXIT_INTR_INFO
+  * and _ERROR are 0: an exception exit has its own exit code, and its error
+- * code in EXITINFO1.
++ * code in EXITINFO1. A notification returns 0 in GUEST_PHYSICAL_MR.
+  */
+ typedef enum kernel_fault_context {
+     /*
+diff --git a/src/arch/x86/object/svm.c b/src/arch/x86/object/svm.c
+index ada7e8ea0..11e5a386a 100644
+--- a/src/arch/x86/object/svm.c
++++ b/src/arch/x86/object/svm.c
+@@ -725,7 +725,7 @@ static void svm_setMRs(tcb_t *tcb, vcpu_t *vcpu, word_t reason, word_t qualifica
+     setMR(tcb, buffer, SEL4_VMENTER_FAULT_QUALIFICATION_MR, qualification);
+     setMR(tcb, buffer, SEL4_VMENTER_FAULT_INSTRUCTION_LEN_MR, exited ? vcpu->svm.instr_len : 0);
+     setMR(tcb, buffer, SEL4_VMENTER_FAULT_GUEST_PHYSICAL_MR,
+-          exited ? *vmcb_word(vcpu, VMCB_EXIT_INFO2) : 0);
++          exited && reason != SVM_EXIT_INTR ? *vmcb_word(vcpu, VMCB_EXIT_INFO2) : 0);
+     setMR(tcb, buffer, SEL4_VMENTER_FAULT_RFLAGS_MR, *vmcb_word(vcpu, VMCB_RFLAGS));
+     setMR(tcb, buffer, SEL4_VMENTER_FAULT_GUEST_INT_MR, *vmcb_u32(vcpu, VMCB_INT_STATE));
+     setMR(tcb, buffer, SEL4_VMENTER_FAULT_CR3_MR, *vmcb_word(vcpu, VMCB_CR3));
+-- 
+2.47.3
+
