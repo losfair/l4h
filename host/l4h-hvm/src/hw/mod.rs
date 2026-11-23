@@ -200,6 +200,28 @@ pub const SEL4_MSR_XCR0: u64 = 0xffff_fffe;
 #[cfg(not(test))]
 pub const SEL4_MSR_CR2: u64 = 0xffff_ffff;
 
+/// The XCR0 features the VCPUs take: `want` (the host's, cpuid.rs's
+/// XCR0_ALLOWED) if VCPU `vcpu` takes it, else x87, SSE and AVX (seL4's
+/// KernelXSaveFeatureSet 7).  Back to XCR0's reset value after.
+#[cfg(not(test))]
+pub fn probe_xcr0(vcpu: u64, want: u64) -> u64 {
+    // The whole set, then without one group, then without both: a kernel
+    // may allow AVX-512 without PKRU or the other way round.
+    let tries = [want, want & !crate::x86::cpuid::XCR0_PKRU, want & !crate::x86::cpuid::XCR0_AVX512, want & 7];
+    let got = tries.into_iter().find(|&x| vcpu_write_msr(vcpu, SEL4_MSR_XCR0, x)).unwrap_or(want & 7);
+    vcpu_write_msr(vcpu, SEL4_MSR_XCR0, 1);
+    got
+}
+
+/// FL4's VCPU MSR for leaving a VM exit's IBPB to the next switch to
+/// another address space.  This monitor's address space is its guest's
+/// alone (guest RAM, its I/O pool and rings, its own state), so guest
+/// branch predictions reaching it expose nothing of another domain;
+/// every other address space still gets the IBPB first.  An error (seL4,
+/// an FL4 without it) leaves the IBPB at every exit.
+#[cfg(not(test))]
+pub const FL4_MSR_VM_IBPB_DEFER: u64 = 0xffff_fffd;
+
 #[cfg(not(test))]
 pub fn vcpu_write_msr(vcpu: u64, msr: u64, v: u64) -> bool {
     sel4::with_ipc_buffer_mut(|b| b.inner_mut().seL4_X86_VCPU_WriteMSR(vcpu, msr, v)).error == 0

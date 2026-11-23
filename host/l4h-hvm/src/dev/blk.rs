@@ -421,22 +421,29 @@ impl Backend for Blk {
         }
         let queue = &mut queues[0];
         let before = queue.used_idx();
+        queue.disable_notify(mem);
         loop {
             let head = match self.stalled.take() {
                 Some(h) => h,
                 None => match queue.pop(mem) {
                     Some(h) => h,
+                    None if queue.enable_notify(mem) => {
+                        queue.disable_notify(mem);
+                        continue;
+                    }
                     None => break,
                 },
             };
             if !self.submit(mem, queue, head) {
                 self.stalled = Some(head);
                 self.more = true;
+                queue.enable_notify(mem);
                 break;
             }
             if self.flush_inflight {
                 // Later requests wait for the flush.
                 self.more = true;
+                queue.enable_notify(mem);
                 break;
             }
         }

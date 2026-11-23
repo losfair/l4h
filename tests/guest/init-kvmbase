@@ -1,0 +1,82 @@
+#!/bin/sh
+# L1 init for tests/run-hvmbench.sh kvm: the baseline, Linux KVM in the
+# place of FL4 and l4h.  The same HVM guest (bzImage, init-vmcmp) under
+# QEMU with 1 vCPU and HB_MEM MiB, its disk L1's virtio disk (cache=none,
+# as blkd's is), its NIC a vhost-net tap on a bridge with a second guest,
+# the TCP sink at 192.168.9.2 (init-benchvm, as l4h's PV sink), as l4h
+# has guest to guest.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mount -t tmpfs tmp /tmp
+fail() { echo "HVMBENCH: FAIL: $*"; poweroff -f; }
+vendor=kvm-intel
+grep -qw svm /proc/cpuinfo && vendor="ccp kvm-amd"
+# l4h's dom0 (HB_MODE=dom0kvm) has KVM built in and no modules.
+[ -d /lib/kvm ] && for m in irqbypass kvm $vendor virtio_blk tun tap vhost_iotlb vhost vhost_net llc stp bridge; do
+    args=
+    [ "$m" = kvm-amd ] && args=$(echo "${HB_KVMAMD_ARGS:-}" | tr , ' ')
+    [ "$m" = kvm ] && args=$(echo "${HB_KVM_ARGS:-}" | tr , ' ')
+    # shellcheck disable=SC2086
+    insmod "/lib/kvm/$m.ko" $args 2>/dev/null || [ "$m" = ccp ] || fail "insmod $m"
+done
+mem=${HB_MEM:-1024} reps=${HB_REPS:-1}
+[ -n "${HB_L1_THP:-}" ] && echo "$HB_L1_THP" > /sys/kernel/mm/transparent_hugepage/enabled
+echo "HVMBENCH: start (kvm), guests ${mem} MiB, 1 vCPU, nx_huge_pages=$(cat /sys/module/kvm/parameters/nx_huge_pages 2>/dev/null)"
+ip link set lo up
+qemu_guest() { # tap initrd mem cmdline
+    # shellcheck disable=SC2086
+    /usr/bin/qemu-system-x86_64 -accel kvm -cpu host -m "$3" -smp 1 -nodefaults -no-user-config ${HB_L2QEMU_ARGS:-} \
+        -display none -vga none -no-reboot -monitor none -serial stdio \
+        -L /usr/share/seabios -L /usr/share/qemu \
+        -kernel /bin/bzImage -initrd "$2" -append "$4" ${5:-} \
+        -netdev tap,id=n0,ifname="$1",script=no,downscript=no,vhost=on -device virtio-net-pci,netdev=n0,romfile=,mac=52:54:00:00:00:02
+}
+tap_up() { # tap pid
+    until [ -e "/sys/class/net/$1" ]; do kill -0 "$2" 2>/dev/null || return 1; sleep 0.01; done
+    brctl addif br0 "$1" && ip link set "$1" up
+}
+if [ -z "${HB_NONET:-}" ]; then
+    brctl addbr br0 && ip link set br0 up || fail "bridge"
+    qemu_guest tap1 /bin/benchvm.cpio.gz 256 "console=ttyS0" </dev/null > /tmp/sink 2>&1 &
+    sink=$!
+    tap_up tap1 $sink || { cat /tmp/sink; fail "sink"; }
+    i=0
+    until grep -q "BENCHVM: ready" /tmp/sink; do
+        i=$((i + 1)); [ $i -lt 3000 ] || { cat /tmp/sink; fail "sink not ready"; }; sleep 0.01
+    done
+fi
+nic="-netdev tap,id=n0,ifname=tap0,script=no,downscript=no,vhost=on -device virtio-net-pci,netdev=n0,romfile="
+[ -n "${HB_NONET:-}" ] && nic="-nic none"
+disk=/dev/vda
+[ -b "$disk" ] || { truncate -s 512M /tmp/disk.img; disk=/tmp/disk.img; }
+for r in $(seq 1 "$reps"); do
+    t0=$(mstime)
+    # shellcheck disable=SC2086
+    /usr/bin/qemu-system-x86_64 -accel kvm -cpu host -m "$mem" -smp 1 -nodefaults -no-user-config ${HB_L2QEMU_ARGS:-} \
+        -display none -vga none -no-reboot -monitor none -serial stdio \
+        -L /usr/share/seabios -L /usr/share/qemu \
+        -kernel /bin/bzImage -initrd /bin/vmcmp.cpio.gz -append "console=ttyS0${HB_SPIN:+ spin}${HB_CPUIDSPIN:+ cpuidspin}${HB_NETSPIN:+ netspin}${HB_GUEST_ARGS:+ $HB_GUEST_ARGS}" \
+        -drive file=$disk,if=none,id=d0,format=raw,cache=none,aio=native -device virtio-blk-pci,drive=d0 \
+        $nic </dev/null > /tmp/out 2>&1 &
+    q=$!
+    # QEMU makes tap0 (TUNSETIFF), on the bridge with the sink's.
+    if [ -z "${HB_NONET:-}" ]; then
+        tap_up tap0 $q || { cat /tmp/out; fail "qemu exited"; }
+    fi
+    t1=
+    i=0
+    until grep -q "VMCMP: done" /tmp/out; do
+        [ -z "$t1" ] && grep -q "VMCMP: up" /tmp/out && t1=$(mstime)
+        kill -0 $q 2>/dev/null || { cat /tmp/out; fail "qemu exited"; }
+        i=$((i + 1)); [ $i -lt 6000 ] || { cat /tmp/out; fail "timeout"; }
+        sleep 0.01
+    done
+    t2=$(mstime)
+    kill $q; wait $q 2>/dev/null
+    tr -d "\r" < /tmp/out | grep "VMCMP: \|BENCH:" | sed "s/^/HVMBENCH: [kvm] /"
+    echo "HVMBENCH: [kvm] BENCH: create to init          $((t1 - t0)) ms"
+    echo "HVMBENCH: [kvm] workload took $((t2 - t1)) ms"
+done
+echo "HVMBENCH: done"
+poweroff -f

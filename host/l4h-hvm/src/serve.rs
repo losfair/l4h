@@ -24,6 +24,9 @@ impl call::Server for Server {
 
 struct Loop;
 
+/// How long the I/O thread spins between kernel turns while it polls.
+const POLL_SPIN_US: u64 = 10;
+
 impl ipc::Server for Loop {
     const SIGNALS: u64 = recv::SIGNALS;
     type Sender = hv::Sender;
@@ -58,7 +61,17 @@ impl ipc::Server for Loop {
     }
 
     fn next(&mut self) -> ipc::Next {
-        if io::more() { ipc::Next::Poll } else { ipc::Next::Wait }
+        if io::more() {
+            // Polling: spin on the queues alone for a while (each turn
+            // through the kernel takes its lock, which every core's
+            // exits and IPC want), then let others on this core (another
+            // guest's I/O thread) go first.
+            io::poll_spin(crate::vm::vm().tsc_hz / 1_000_000 * POLL_SPIN_US);
+            sel4::r#yield();
+            ipc::Next::Poll
+        } else {
+            ipc::Next::Wait
+        }
     }
 }
 

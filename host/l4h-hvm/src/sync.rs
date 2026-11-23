@@ -78,6 +78,11 @@ impl<T> Global<T> {
         unsafe { (*self.0.get()).write(v) }
     }
 
+    /// Whether it has been set.
+    pub fn is_set(&'static self) -> bool {
+        self.1.load(Ordering::Acquire)
+    }
+
     pub fn get(&'static self) -> &'static T {
         debug_assert!(self.1.load(Ordering::Acquire));
         unsafe { (*self.0.get()).assume_init_ref() }

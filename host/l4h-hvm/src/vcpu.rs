@@ -48,6 +48,8 @@ pub fn with_addr(old: u64, v: u64, addr: u8) -> u64 {
 struct Span {
     parts: [(u64, u64); 2],
 }
+/// How long a halted vCPU polls before it blocks (Vcpu::halt_poll).
+const HALT_POLL_US: u64 = 100;
 /// Iterations of a REP string instruction one exit does.
 const STRING_BATCH: u64 = 4096;
 
@@ -55,11 +57,14 @@ const STRING_BATCH: u64 = 4096;
 /// without LA57, which CPUID hides.
 const CR4_ALLOWED: u64 = 0x0fff | (1 << 16) | (1 << 17) | (1 << 18) | (1 << 20) | (1 << 21);
 const CR4_PCIDE: u64 = 1 << 17;
+/// Protection keys: the guest's where its XSAVE state has PKRU
+/// (cpuid.rs).  The page walker (walk.rs) does not check them.
+const CR4_PKE: u64 = 1 << 22;
 const CR0_NW: u64 = 1 << 29;
 const CR0_CD: u64 = 1 << 30;
 /// CR0 bits whose change flushes the guest's TLB: PG, WP, CD, NW.
 const CR0_FLUSH: u64 = walk::CR0_PG | walk::CR0_WP | CR0_CD | CR0_NW;
-const CR4_FLUSH: u64 = (1 << 4) | (1 << 5) | (1 << 7) | (1 << 17) | (1 << 20) | (1 << 21);
+const CR4_FLUSH: u64 = (1 << 4) | (1 << 5) | (1 << 7) | (1 << 17) | (1 << 20) | (1 << 21) | (1 << 22);
 
 /// Guest RAM as the page walker reads it.
 struct Ram;
@@ -101,6 +106,10 @@ pub struct Vcpu<H: Hw> {
     kvm_time: u64,
     kvm_wall: u64,
     kvm_version: u32,
+    /// MSR_KVM_PV_EOI_EN as written, and whether this entry's PV EOI flag
+    /// is set in the guest's word (pv_eoi_to_guest).
+    pv_eoi: u64,
+    pv_eoi_set: bool,
     halted: bool,
     wait_sipi: bool,
     nmis: u32,
@@ -132,7 +141,7 @@ impl<H: Hw> Vcpu<H> {
         let vm = vm();
         let mut c = Vcpu {
             id: v, hw, lapic: Lapic::new(v as u32, v == 0, vm.tsc_hz), msrs: msr::Msrs::new(vm.amd), tsc_offset: 0,
-            kvm_time: 0, kvm_wall: 0, kvm_version: 0,
+            kvm_time: 0, kvm_wall: 0, kvm_version: 0, pv_eoi: 0, pv_eoi_set: false,
             halted: false, wait_sipi: v != 0, nmis: 0, inject: None, dr: [0; 4], dr6: 0xffff_0ff0, dr7: 0x400, xcr0: 1, armed: 0,
         };
         c.lapic.init(shared(v));
@@ -173,6 +182,8 @@ impl<H: Hw> Vcpu<H> {
             self.halted = false;
             self.nmis = 0;
             self.inject = None;
+            // As KVM's reset: the guest names its PV EOI word again.
+            self.pv_eoi = 0;
         }
         if flags & PENDING_SIPI != 0 && self.wait_sipi {
             sh.clear_requests();
@@ -212,19 +223,89 @@ impl<H: Hw> Vcpu<H> {
         }
         let irq_window = self.lapic.pending(sh).is_some();
         let nmi_window = self.nmis != 0;
+        self.pv_eoi_to_guest(sh);
         let exit = self.hw.enter(ev, irq_window, nmi_window);
+        self.pv_eoi_from_guest();
         self.exit(exit);
     }
 
     /// Wait for something to do: an interrupt, the timer, INIT or SIPI.
     fn block(&mut self) {
         self.arm_timer();
+        if self.halted && self.halt_poll(vm::now()) {
+            // What woke it may have signalled this thread too: taken now,
+            // so the next VMEnter does not return at once to say so (turn
+            // looks at the state itself).
+            crate::sys::poll(self.id);
+            return;
+        }
+        // Idle: the time blocked.  The poll ran on the vCPU's budget, as
+        // its run time (vmmgr's steal is wall - run - idle).
         let before = vm::now();
         crate::sys::wait(self.id);
         let page = host::vmm_event_page_va(self.id) as *mut abi::EventPage;
         unsafe {
             let p = core::ptr::addr_of_mut!((*page).idle_ticks);
             p.write_volatile(p.read_volatile().wrapping_add(vm::now() - before));
+        }
+    }
+
+    /// Halt polling, as KVM's halt_poll_ns: a halted vCPU watches, for a
+    /// while, for what would wake it (`turn`) before it blocks: an
+    /// interrupt it can take, an NMI, INIT or SIPI, its timer.  Each block
+    /// and wakeup costs host scheduling and, under a hypervisor, IPIs and
+    /// halts of its own; a guest waiting on I/O is often woken within tens
+    /// of microseconds.  vCPU 0 also runs the VM's I/O APIC and UART work
+    /// (Vm::pending_work).  Whether it was woken.
+    fn halt_poll(&self, start: u64) -> bool {
+        let vm = vm();
+        let sh = shared(self.id);
+        let ticks = vm.tsc_hz / 1_000_000 * HALT_POLL_US;
+        loop {
+            let now = vm::now();
+            if sh.flags.load(Ordering::Relaxed) != 0
+                || (self.lapic.pending(sh).is_some() && self.hw.rflags() & (1 << 9) != 0)
+                || (self.armed != 0 && now >= self.armed)
+                || (self.id == 0
+                    && (vm.ioapic_stale.load(Ordering::Relaxed) || vm.uart_stale.load(Ordering::Relaxed)))
+            {
+                return true;
+            }
+            if now.wrapping_sub(start) >= ticks {
+                return false;
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    /// KVM's PV EOI (KVM_FEATURE_PV_EOI): when the guest's EOI could do
+    /// nothing but end the one edge-triggered interrupt in service, the
+    /// entry sets bit 0 of the guest's word, and the guest's EOI clears it
+    /// instead of writing the APIC's EOI register (an exit per interrupt).
+    /// Only this vCPU's guest writes the word while it runs, only this
+    /// thread while it does not.
+    fn pv_eoi_to_guest(&mut self, sh: &crate::dev::apic::Shared) {
+        if self.pv_eoi & 1 != 0 && self.lapic.pv_eoi_ok(sh) {
+            vm().mem.write::<u8>(self.pv_eoi & !1, 1);
+            self.pv_eoi_set = true;
+        }
+    }
+
+    /// After the exit: the flag still set, the guest made no EOI (and
+    /// will write the register if it does, the flag now clear); clear,
+    /// it did.
+    fn pv_eoi_from_guest(&mut self) {
+        if !self.pv_eoi_set {
+            return;
+        }
+        self.pv_eoi_set = false;
+        let mem = &vm().mem;
+        let gpa = self.pv_eoi & !1;
+        if mem.read::<u8>(gpa) & 1 != 0 {
+            mem.write::<u8>(gpa, 0);
+        } else {
+            let fx = self.lapic.pv_eoi();
+            self.apic_effects(fx);
         }
     }
 
@@ -328,7 +409,8 @@ impl<H: Hw> Vcpu<H> {
                 let (leaf, sub) = (self.hw.gprs()[0] as u32, self.hw.gprs()[1] as u32);
                 let ctx = cpuid::Ctx {
                     vcpu: self.id as u32, vcpus: vm().vcpus as u32, tsc_hz: vm().tsc_hz,
-                    osxsave: self.hw.cr4() & CR4_OSXSAVE != 0, xcr0: self.xcr0, invpcid: vm().invpcid.load(Ordering::Relaxed),
+                    osxsave: self.hw.cr4() & CR4_OSXSAVE != 0, xcr0: self.xcr0, xcr0_max: vm().xcr0,
+                    pke: self.hw.cr4() & CR4_PKE != 0, invpcid: vm().invpcid.load(Ordering::Relaxed),
                 };
                 let [a, b, c, d] = cpuid::cpuid(leaf, sub, &ctx, &host_cpuid);
                 let g = self.hw.gprs();
@@ -486,7 +568,8 @@ impl<H: Hw> Vcpu<H> {
                 let p = self.hw.paging();
                 let lma = p.efer & walk::EFER_LMA != 0;
                 let pcide_on = old & CR4_PCIDE == 0 && v & CR4_PCIDE != 0;
-                if v & !CR4_ALLOWED != 0
+                let pke = if vm().xcr0 & cpuid::XCR0_PKRU != 0 { CR4_PKE } else { 0 };
+                if v & !(CR4_ALLOWED | pke) != 0
                     || (lma && v & walk::CR4_PAE == 0)
                     || (v & CR4_PCIDE != 0 && (!lma || !vm().pcid.load(Ordering::Relaxed)))
                     || (pcide_on && p.cr3 & 0xfff != 0)
@@ -569,6 +652,7 @@ impl<H: Hw> Vcpu<H> {
             lapic::MSR_APIC_BASE | 0x800..=0x8ff => return self.lapic.rdmsr(sh, vm::now(), m),
             pvclock::MSR_SYSTEM_TIME => return Some(self.kvm_time),
             pvclock::MSR_WALL_CLOCK => return Some(self.kvm_wall),
+            pvclock::MSR_PV_EOI => return Some(self.pv_eoi),
             _ => {}
         }
         if let Some(r) = self.hw.rdmsr(m) {
@@ -599,6 +683,20 @@ impl<H: Hw> Vcpu<H> {
             pvclock::MSR_WALL_CLOCK => {
                 self.kvm_wall = v;
                 self.publish_wall_clock();
+                return true;
+            }
+            pvclock::MSR_PV_EOI => {
+                // As KVM: the word 4-byte aligned; on, it must be RAM.
+                let gpa = v & !1;
+                if gpa & 3 != 0 || (v & 1 != 0 && !vm().mem.valid(gpa, 4)) {
+                    return false;
+                }
+                // As KVM: the word starts clear, so that nothing left in
+                // it passes for an EOI the entry offered.
+                if v & 1 != 0 {
+                    vm().mem.write::<u32>(gpa, 0);
+                }
+                self.pv_eoi = v;
                 return true;
             }
             lapic::MSR_TSC_DEADLINE | lapic::MSR_APIC_BASE | 0x800..=0x8ff => {
@@ -1038,9 +1136,50 @@ fn publish_at(gpa: u64, b: &[u8]) {
     });
 }
 
-pub fn host_cpuid(leaf: u32, sub: u32) -> [u32; 4] {
+/// The host's CPUID, read once by `read_host_cpuid` before any vCPU runs:
+/// under a hypervisor each CPUID is an exit, and emulating one guest
+/// CPUID took four (leaf 0, 0x8000_0000, the leaf...).  What differs from
+/// core to core (APIC IDs, OSXSAVE) the emulation makes itself.
+struct HostCpuid {
+    std: [[[u32; 4]; HOST_SUBS]; HOST_STD],
+    ext: [[u32; 4]; HOST_EXT],
+}
+const HOST_STD: usize = 0x21;
+const HOST_SUBS: usize = 16;
+const HOST_EXT: usize = 0x29;
+static HOST_CPUID: crate::sync::Global<HostCpuid> = crate::sync::Global::new();
+
+fn cpuid_insn(leaf: u32, sub: u32) -> [u32; 4] {
     let r = core::arch::x86_64::__cpuid_count(leaf, sub);
     [r.eax, r.ebx, r.ecx, r.edx]
+}
+
+/// Read the host's CPUID into the table (main.rs, once).
+pub fn read_host_cpuid() {
+    let mut t = HostCpuid { std: [[[0; 4]; HOST_SUBS]; HOST_STD], ext: [[0; 4]; HOST_EXT] };
+    for (l, subs) in t.std.iter_mut().enumerate() {
+        for (s, r) in subs.iter_mut().enumerate() {
+            *r = cpuid_insn(l as u32, s as u32);
+        }
+    }
+    for (l, r) in t.ext.iter_mut().enumerate() {
+        *r = cpuid_insn(0x8000_0000 + l as u32, 0);
+    }
+    HOST_CPUID.set(t);
+}
+
+pub fn host_cpuid(leaf: u32, sub: u32) -> [u32; 4] {
+    if HOST_CPUID.is_set() {
+        let t = HOST_CPUID.get();
+        if (leaf as usize) < HOST_STD && (sub as usize) < HOST_SUBS {
+            return t.std[leaf as usize][sub as usize];
+        }
+        // Subleaf 0 only: no extended leaf it caches has others.
+        if sub == 0 && (0x8000_0000..0x8000_0000 + HOST_EXT as u32).contains(&leaf) {
+            return t.ext[(leaf - 0x8000_0000) as usize];
+        }
+    }
+    cpuid_insn(leaf, sub)
 }
 
 /// The entry of vCPU thread `v` (l4h_rt::start_thread).
@@ -1049,6 +1188,7 @@ pub extern "C" fn entry(v: usize) -> ! {
     unsafe { l4h_rt::thread_init(hv::SLOT_VCPU_TCB + v as u64, hv::vcpu_ipcbuf_va(v)) };
     vm::set_me(v);
     let obj = hv::SLOT_VCPU_OBJ + v as u64;
+    crate::hw::vcpu_write_msr(obj, crate::hw::FL4_MSR_VM_IBPB_DEFER, 1);
     if vm().amd {
         run(v, crate::hw::svm::Svm::new(obj))
     } else {

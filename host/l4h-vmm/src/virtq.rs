@@ -10,6 +10,7 @@ pub const VIRTQ_DESC_F_NEXT: u16 = 1;
 pub const VIRTQ_DESC_F_WRITE: u16 = 2;
 pub const VIRTQ_DESC_F_INDIRECT: u16 = 4;
 const VIRTQ_AVAIL_F_NO_INTERRUPT: u16 = 1;
+const VIRTQ_USED_F_NO_NOTIFY: u16 = 1;
 
 /// One buffer of a descriptor chain.
 #[derive(Clone, Copy, Debug)]
@@ -29,6 +30,11 @@ pub struct Queue {
     last_avail: u16,
     used_idx: u16,
     published_used: u16,
+    /// VIRTIO_RING_F_EVENT_IDX negotiated (`set_event_idx`): the driver's
+    /// used_event decides interrupts, our avail_event its notifications.
+    event_idx: bool,
+    /// The used index at the last interrupt decision (event index).
+    signalled_used: Option<u16>,
 }
 
 #[derive(Debug)]
@@ -52,8 +58,17 @@ impl Queue {
         if !mem.valid(desc, 16 * n) || !mem.valid(avail, 6 + 2 * n) || !mem.valid(used, 6 + 8 * n) {
             return false;
         }
-        *self = Queue { ready: true, num: num as u16, desc, avail, used, last_avail: 0, used_idx: 0, published_used: 0 };
+        *self = Queue {
+            ready: true, num: num as u16, desc, avail, used, last_avail: 0, used_idx: 0, published_used: 0,
+            event_idx: false, signalled_used: None,
+        };
         true
+    }
+
+    /// Whether VIRTIO_RING_F_EVENT_IDX was negotiated for this queue.
+    pub fn set_event_idx(&mut self, on: bool) {
+        self.event_idx = on;
+        self.signalled_used = None;
     }
 
     pub fn reset(&mut self) {
@@ -74,6 +89,22 @@ impl Queue {
         let head = mem.read::<u16>(self.avail + 4 + 2 * slot);
         self.last_avail = self.last_avail.wrapping_add(1);
         Some(head)
+    }
+
+    /// The driver's avail index: how many chains it has added.
+    pub fn avail_idx(&self, mem: &GuestMem) -> u16 {
+        mem.read::<u16>(self.avail + 2)
+    }
+
+    /// Whether the driver added chains not yet popped.
+    pub fn has_avail(&self, mem: &GuestMem) -> bool {
+        self.ready && mem.read::<u16>(self.avail + 2) != self.last_avail
+    }
+
+    /// Give back the last `n` chains popped and not pushed: the driver
+    /// still owns none of them (vhost's vhost_discard_vq_desc).
+    pub fn unpop(&mut self, n: u16) {
+        self.last_avail = self.last_avail.wrapping_sub(n);
     }
 
     /// Collect the buffers of the chain starting at `head`.  A driver must
@@ -149,9 +180,95 @@ impl Queue {
         self.used_idx
     }
 
-    /// Whether the driver wants an interrupt for used buffers.
+    /// Whether the driver wants an interrupt for used buffers (without the
+    /// event index).
     pub fn wants_interrupt(&self, mem: &GuestMem) -> bool {
         fence(Ordering::SeqCst);
         mem.read::<u16>(self.avail) & VIRTQ_AVAIL_F_NO_INTERRUPT == 0
+    }
+
+    /// Whether the driver wants an interrupt for the used buffers published
+    /// since the last call: with the event index, when the used index has
+    /// passed its used_event since then (virtio 1.x, 2.7.10), as vhost's
+    /// signalled_used; otherwise unless it set NO_INTERRUPT.
+    pub fn should_interrupt(&mut self, mem: &GuestMem) -> bool {
+        if !self.event_idx {
+            return self.wants_interrupt(mem);
+        }
+        fence(Ordering::SeqCst);
+        let new = self.published_used;
+        let Some(old) = self.signalled_used.replace(new) else { return true };
+        let event = mem.read::<u16>(self.avail + 4 + 2 * self.num as u64);
+        need_event(event, new, old)
+    }
+
+    /// The device stops asking for notifications while it works through the
+    /// queue (without the event index: VIRTQ_USED_F_NO_NOTIFY; with it,
+    /// avail_event stays where it was, behind what the driver adds).
+    pub fn disable_notify(&mut self, mem: &GuestMem) {
+        if self.ready && !self.event_idx {
+            mem.write::<u16>(self.used, VIRTQ_USED_F_NO_NOTIFY);
+        }
+    }
+
+    /// The device is about to wait for a notification: ask for one at the
+    /// next available entry.  Whether entries came meanwhile, which the
+    /// caller then takes without one (they may have been added while
+    /// notifications were off).
+    pub fn enable_notify(&mut self, mem: &GuestMem) -> bool {
+        if !self.ready {
+            return false;
+        }
+        if self.event_idx {
+            mem.write::<u16>(self.used + 4 + 8 * self.num as u64, self.last_avail);
+        } else {
+            mem.write::<u16>(self.used, 0);
+        }
+        fence(Ordering::SeqCst);
+        mem.read::<u16>(self.avail + 2) != self.last_avail
+    }
+
+    /// Ask for a notification when the driver adds chains beyond its avail
+    /// index `seen`, the one the device last found too few at (vhost's,
+    /// armed at the avail index it saw): for a receive queue whose frame
+    /// spans more chains than there were.  `seen` is the caller's, not
+    /// read again here: chains added since are then reported, not asked
+    /// for.  Whether the driver is past `seen` (some came meanwhile).
+    pub fn enable_notify_more(&mut self, mem: &GuestMem, seen: u16) -> bool {
+        if !self.ready {
+            return false;
+        }
+        if self.event_idx {
+            mem.write::<u16>(self.used + 4 + 8 * self.num as u64, seen);
+        } else {
+            mem.write::<u16>(self.used, 0);
+        }
+        fence(Ordering::SeqCst);
+        mem.read::<u16>(self.avail + 2) != seen
+    }
+
+    /// The avail index this queue has taken chains up to.
+    pub fn last_avail(&self) -> u16 {
+        self.last_avail
+    }
+}
+
+/// virtio's vring_need_event: whether the index moving from `old` to `new`
+/// passed `event`.
+pub fn need_event(event: u16, new: u16, old: u16) -> bool {
+    new.wrapping_sub(event).wrapping_sub(1) < new.wrapping_sub(old)
+}
+
+#[cfg(test)]
+mod event_tests {
+    use super::need_event;
+
+    #[test]
+    fn need_event_matches_virtio() {
+        assert!(need_event(4, 5, 4), "passing it");
+        assert!(!need_event(9, 5, 4), "not yet");
+        assert!(need_event(4, 9, 1), "passed within a batch");
+        assert!(!need_event(0, 5, 4), "passed before");
+        assert!(need_event(0xffff, 1, 0xfffe), "across the wrap");
     }
 }

@@ -213,6 +213,22 @@ impl Lapic {
         }
     }
 
+    /// Whether an EOI may be left to the guest's PV EOI word (KVM's
+    /// apic_sync_pv_eoi_to_guest): one interrupt in service, edge-triggered
+    /// (no I/O APIC to tell), and none requested, which an EOI could let
+    /// in and the guest would not exit for.
+    pub fn pv_eoi_ok(&self, shared: &Shared) -> bool {
+        let n: u32 = self.isr.iter().map(|w| w.count_ones()).sum();
+        n == 1 && self.tmr.iter().zip(&self.isr).all(|(t, i)| t & i == 0) && shared.irr().iter().all(|&w| w == 0)
+    }
+
+    /// The EOI the guest made through its PV EOI word.
+    pub fn pv_eoi(&mut self) -> Effects {
+        let mut fx = Effects::default();
+        self.eoi(&mut fx);
+        fx
+    }
+
     fn eoi(&mut self, fx: &mut Effects) {
         if let Some(v) = Self::highest(&self.isr) {
             let (w, bit) = ((v / 64) as usize, 1u64 << (v % 64));
@@ -528,6 +544,32 @@ mod tests {
         s.request(0x50, false);
         l.write(&s, 0, SVR, 0xff);
         assert_eq!(l.pending(&s), None);
+    }
+
+    #[test]
+    fn pv_eoi_only_for_one_edge_interrupt_with_none_waiting() {
+        let (mut l, s) = setup();
+        assert!(!l.pv_eoi_ok(&s), "nothing in service");
+        s.request(0x41, false);
+        l.accept(&s, 0x41);
+        assert!(l.pv_eoi_ok(&s));
+        // Another requested: an EOI could let it in.
+        s.request(0x30, false);
+        assert!(!l.pv_eoi_ok(&s));
+        assert_eq!(l.pv_eoi().eoi_level, None);
+        assert_eq!(l.read(&s, 0, ISR + 0x40), 0);
+        // Two in service.
+        l.accept(&s, 0x30);
+        s.request(0x52, false);
+        l.accept(&s, 0x52);
+        assert!(!l.pv_eoi_ok(&s));
+        l.pv_eoi();
+        assert!(l.pv_eoi_ok(&s), "0x30 alone");
+        l.pv_eoi();
+        // Level-triggered: the I/O APIC must hear of its EOI.
+        s.request(0x92, true);
+        l.accept(&s, 0x92);
+        assert!(!l.pv_eoi_ok(&s));
     }
 
     #[test]

@@ -1254,8 +1254,11 @@ create fails with `-ENODEV`. `l4hctl list` shows them as `hvm`.
   the timer expires. Linux reads leaf 0x15 only on Intel. On AMD it
   calibrates the TSC against the PIT or the PM timer, which fails when
   an exit takes longer than about 10 µs, as nested ones do.
-  So the hypervisor leaves carry KVM's signature with **kvmclock** alone
-  (`KVM_FEATURE_CLOCKSOURCE2` and the stable bit; no other KVM feature),
+  So the hypervisor leaves carry KVM's signature with **kvmclock**
+  (`KVM_FEATURE_CLOCKSOURCE2` and the stable bit) and `KVM_FEATURE_PV_EOI`
+  (an entry with one edge-triggered interrupt in service and none
+  requested sets a flag in the guest's word, and the guest's EOI clears it
+  instead of an x2APIC write that would exit), and no other KVM feature,
   which every distribution kernel uses (`CONFIG_KVM_GUEST`): a vCPU's
   `pvclock_vcpu_time_info` is written once, where the guest names it
   (`MSR_KVM_SYSTEM_TIME_NEW`), with the host TSC's rate, kvmclock time 0
@@ -6108,7 +6111,7 @@ tools/build-fl4.sh
 SEL4_PREFIX="$PWD/build/sel4-fl4" L4H_KERNEL_VARIANT=fl4 tests/run-selftest.sh 4
 ```
 
-The tested FL4 revision is `11f54675a8b1bd22d07a13af9f0ec20c941f55a7`.
+The tested FL4 revision is `2e45b6d78ef244c27ab34ab03ed0d6507f1a89d3`.
 `prepare-fl4.sh` clones the pinned public revision, or the frozen override,
 into `build/FL4-src` without applying any kernel patches. The source
 worktree is not edited.
