@@ -264,11 +264,50 @@ pub fn msi_irq(d: &Device, vector: u64, dst: &sel4::AbsoluteCPtr) {
         .expect("MSI IRQ handler");
     #[cfg(target_arch = "aarch64")]
     {
-        let _ = d;
         assert!(vector < 64);
-        slot::IRQ_CONTROL.cap().irq_control_get_trigger_core(80 + vector, true, 0, dst)
-            .expect("GICv2m IRQ handler");
+        if its_doorbell() == 0 {
+            slot::IRQ_CONTROL.cap().irq_control_get_trigger_core(80 + vector, true, 0, dst)
+                .expect("GICv2m IRQ handler");
+            return;
+        }
+        // FL4's GetMSI: event `vector` of the function's requester ID
+        // (no SMMU: its ITS device ID), as LPI `vector`, to core 0.
+        let device = (d.bus as u64) << 8 | (d.dev as u64) << 3 | d.func as u64;
+        let r = sel4::with_ipc_buffer_mut(|ipc| {
+            ipc.inner_mut().seL4_IRQControl_GetMSI(slot::IRQ_CONTROL.cap().bits(), vector, device, vector,
+                dst.root().bits(), dst.path().bits(), dst.path().depth() as u8, 0)
+        });
+        assert!(r == 0, "ITS MSI handler for {:02x}:{:02x}.{} vector {}: error {}", d.bus, d.dev, d.func, vector, r);
     }
+}
+
+/// The ITS doorbell (GITS_TRANSLATER) FL4 drives MSIs through
+/// (SEL4_BOOTINFO_HEADER_AARCH64_MSI_INFO), or 0: QEMU virt's GICv2m.
+#[cfg(target_arch = "aarch64")]
+static ITS_DOORBELL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+#[cfg(target_arch = "aarch64")]
+fn its_doorbell() -> u64 {
+    ITS_DOORBELL.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Learn how MSIs reach the GIC, before any is set up: seL4_AArch64MsiInfo
+/// (doorbell, num_lpis, num_events, num_devices) when FL4 drives an ITS.
+#[cfg(target_arch = "aarch64")]
+pub fn msi_init(bootinfo: &sel4::BootInfoPtr) {
+    const MSI_INFO: u64 = 15;
+    let Some(c) = l4h_task::bootinfo::extra_chunk(bootinfo, MSI_INFO).filter(|c| c.len() >= 32) else {
+        log!("l4h-root: MSIs through QEMU virt's GICv2m");
+        return;
+    };
+    let w: [u64; 4] = core::array::from_fn(|i| u64::from_le_bytes(c[8 * i..8 * i + 8].try_into().unwrap()));
+    // Vectors are LPI numbers and events both.
+    if w[1] < VECTORS || w[2] < VECTORS || w[3] < MAX_FUNCTIONS as u64 {
+        log!("l4h-root: the ITS has too few LPIs, events or device IDs: MSIs through GICv2m");
+        return;
+    }
+    log!("l4h-root: MSIs through the ITS, doorbell {:#x}", w[0]);
+    ITS_DOORBELL.store(w[0], core::sync::atomic::Ordering::Relaxed);
 }
 
 /// The functions whose ECAM pages a partition mapped, a bit per BDF.
@@ -997,11 +1036,12 @@ pub fn msi_address() -> u64 {
     // when root has the machine to itself).  The shim gives no partition a
     // first CPU above APIC ID 255.
     #[cfg(target_arch = "x86_64")] { 0xfee0_0000 | (crate::partition::msi_dest() as u64 & 0xff) << 12 }
-    #[cfg(target_arch = "aarch64")] { 0x0802_0040 }
+    #[cfg(target_arch = "aarch64")] { if its_doorbell() != 0 { its_doorbell() } else { 0x0802_0040 } }
 }
-pub const fn msi_data(vector: u64) -> u32 {
+pub fn msi_data(vector: u64) -> u32 {
     #[cfg(target_arch = "x86_64")] { 0x30 + vector as u32 }
-    #[cfg(target_arch = "aarch64")] { 80 + vector as u32 }
+    // The ITS's event, or GICv2m's SPI.
+    #[cfg(target_arch = "aarch64")] { if its_doorbell() != 0 { vector as u32 } else { 80 + vector as u32 } }
 }
 
 #[cfg(target_arch = "aarch64")]

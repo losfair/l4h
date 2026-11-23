@@ -15,7 +15,10 @@ fn main() {
     if xml.contains("id=\"UntypedRetypeShared\"") {
         println!("cargo:rustc-cfg=l4h_kernel_shared_dma");
     }
-    if xml.contains("id=\"X86TdxControlGetReport\"") {
+    // FL4 lists its extensions in every architecture's interface; rust-sel4
+    // generates the x86 ones for x86_64 alone.
+    let x86 = env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64");
+    if x86 && xml.contains("id=\"X86TdxControlGetReport\"") {
         println!("cargo:rustc-cfg=l4h_kernel_tdx");
     }
 }

@@ -634,6 +634,8 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     iommu::shared::map(&mut alloc, &mut devmem, info.tsc_hz / 1000);
     // PCI devices: disks can be passed through to guests.
     #[allow(unused_mut)]
+    #[cfg(target_arch = "aarch64")]
+    pci::msi_init(bootinfo);
     let mut pci = pci::Pci::new(&mut alloc, &mut devmem);
     // The IOMMU before any device is enabled: from here on, a device
     // reaches only memory root gives it (iommu.rs).
