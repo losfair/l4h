@@ -425,27 +425,33 @@ impl<H: Hw> Vcpu<H> {
         let v = if long { v } else { v & 0xffff_ffff };
         match (cr, write) {
             (0, true) => {
-                // Reserved bits, PG without PE, NW without CD, and long
-                // mode's paging without PAE: #GP before anything changes.
+                // #GP before anything changes: reserved bits, PG without
+                // PE, NW without CD, long mode's paging without PAE, and
+                // paging off from 64-bit code or with PCIDE.
                 let p = self.hw.paging();
+                let old = self.hw.cr0();
+                let (pg, was_pg) = (v & walk::CR0_PG != 0, old & walk::CR0_PG != 0);
                 let bad = (v >> 32 != 0)
-                    || (v & walk::CR0_PG != 0 && v & 1 == 0)
+                    || (pg && v & 1 == 0)
                     || (v & CR0_NW != 0 && v & CR0_CD == 0)
-                    || (v & walk::CR0_PG != 0 && p.cr0 & walk::CR0_PG == 0 && p.efer & walk::EFER_LME != 0 && p.cr4 & walk::CR4_PAE == 0);
+                    || (pg && !was_pg && p.efer & walk::EFER_LME != 0 && p.cr4 & walk::CR4_PAE == 0)
+                    || (!pg && was_pg && (long || p.cr4 & CR4_PCIDE != 0));
                 if bad || !self.hw.set_cr0(v) {
                     return self.gp();
                 }
                 // Translations the guest's TLB holds change meaning (VPID
-                // keeps them across exits): flushed.
-                if (p.cr0 ^ v) & CR0_FLUSH != 0 {
+                // keeps them across exits): flushed, as the guest saw CR0.
+                if (old ^ v) & CR0_FLUSH != 0 {
                     self.hw.flush_tlb();
                 }
             }
             (4, true) => {
                 let old = self.hw.cr4();
                 // Nothing outside the allowed (no LA57: 4-level paging, as
-                // walk.rs has it); PAE kept and PCIDE only in long mode.
-                if v & !CR4_ALLOWED != 0 || (long && v & walk::CR4_PAE == 0) || (!long && v & CR4_PCIDE != 0) || !self.hw.set_cr4(v) {
+                // walk.rs has it); in IA-32e mode (EFER.LMA, compatibility
+                // mode too) PAE kept, and PCIDE only there.
+                let lma = self.hw.paging().efer & walk::EFER_LMA != 0;
+                if v & !CR4_ALLOWED != 0 || (lma && v & walk::CR4_PAE == 0) || (!lma && v & CR4_PCIDE != 0) || !self.hw.set_cr4(v) {
                     return self.gp();
                 }
                 if (old ^ v) & CR4_FLUSH != 0 {
@@ -757,7 +763,7 @@ impl<H: Hw> Vcpu<H> {
     /// (OUTS on AMD-V, which does not say).
     fn prefix_seg(&mut self) -> Option<Seg> {
         let (bytes, n) = self.fetch();
-        decode::prefix_seg(&bytes[..n])
+        decode::prefix_seg(&bytes[..n], self.hw.mode())
     }
 
     /// The instruction at CS:RIP, decoded (#UD if we cannot).

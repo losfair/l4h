@@ -915,7 +915,7 @@ pub fn hvm_layout(kernel: &[u8], initrd_len: u64, ram: u64) -> Result<(u64, u64)
     const MIB2: u64 = 2 << 20;
     const LOW_RAM_MAX: u64 = 3 << 30;
     let le = |off: usize, n: usize| -> Result<u64> {
-        let b = kernel.get(off..off + n).ok_or(Error("kernel: truncated header".into()))?;
+        let b = off.checked_add(n).and_then(|end| kernel.get(off..end)).ok_or(Error("kernel: truncated header".into()))?;
         Ok(b.iter().rev().fold(0, |v, &x| v << 8 | x as u64))
     };
     let end = if kernel.starts_with(b"\x7fELF") {
@@ -926,7 +926,7 @@ pub fn hvm_layout(kernel: &[u8], initrd_len: u64, ram: u64) -> Result<(u64, u64)
         let (phoff, phentsize, phnum) = (le(32, 8)? as usize, le(54, 2)? as usize, le(56, 2)? as usize);
         let mut end = 0u64;
         for i in 0..phnum {
-            let ph = phoff.checked_add(i * phentsize).ok_or(Error("kernel: bad program headers".into()))?;
+            let ph = i.checked_mul(phentsize).and_then(|o| phoff.checked_add(o)).ok_or(Error("kernel: bad program headers".into()))?;
             if le(ph, 4)? == 1 {
                 let e = le(ph + 24, 8)?.checked_add(le(ph + 40, 8)?).ok_or(Error("kernel: segment past the address space".into()))?;
                 end = end.max(e);
@@ -1961,6 +1961,22 @@ mod hvm_layout_tests {
         assert_eq!(hvm_layout(&k, 0, 256 * MIB).unwrap().0, 56 * MIB, "relocatable, misaligned: 16 MiB");
         k[0x258..0x260].copy_from_slice(&(64 * MIB).to_le_bytes());
         assert_eq!(hvm_layout(&k, 0, 256 * MIB).unwrap().0, 104 * MIB);
+    }
+
+    /// Program headers anywhere a hostile image puts them: errors.
+    #[test]
+    fn elf_program_headers_out_of_bounds() {
+        let mut k = vec![0u8; 4096];
+        k[..4].copy_from_slice(b"\x7fELF");
+        k[4] = 2;
+        k[5] = 1;
+        k[18] = 62;
+        k[56..58].copy_from_slice(&2u16.to_le_bytes());
+        for (phoff, phentsize) in [(u64::MAX - 8, 56u16), (u64::MAX - 100, 0xffff), (4090, 56), (1 << 40, 56)] {
+            k[32..40].copy_from_slice(&phoff.to_le_bytes());
+            k[54..56].copy_from_slice(&phentsize.to_le_bytes());
+            assert!(hvm_layout(&k, 0, 128 * MIB).is_err(), "{phoff:#x} {phentsize}");
+        }
     }
 
     /// Places that do not fit in 64 bits are errors, not overflows.

@@ -227,11 +227,15 @@ impl NmiStep {
         Some(rflags | RFLAGS_TF | RFLAGS_RF)
     }
 
-    /// After the exit: the guest's RFLAGS (its TF and RF back), and, if it
-    /// stepped, whether the guest had TF of its own.
+    /// After the exit: the guest's RFLAGS, without the TF and RF we added
+    /// (its own as the CPU left them: an instruction that ran cleared RF),
+    /// and, if it stepped, whether the guest had TF of its own.
     pub fn done(&mut self, rflags: u64) -> (u64, Option<bool>) {
         match self.guest.take() {
-            Some(g) => ((rflags & !(RFLAGS_TF | RFLAGS_RF)) | g, Some(g & RFLAGS_TF != 0)),
+            Some(g) => {
+                let ours = (RFLAGS_TF | RFLAGS_RF) & !g;
+                (rflags & !ours, Some(g & RFLAGS_TF != 0))
+            }
             None => (rflags, None),
         }
     }
@@ -333,8 +337,12 @@ mod tests {
         // The guest's own TF (and RF) kept.
         assert_eq!(s.arm(true, false, true, true, false, 0x202 | tf), Some(0x202 | tf | rf));
         assert_eq!(s.done(0x202 | tf), (0x202 | tf, Some(true)));
+        // The guest's own RF: as the CPU left it, cleared by an instruction
+        // that ran, kept by an exit before it.
         assert_eq!(s.arm(true, false, false, false, true, 0x202 | rf), Some(0x202 | tf | rf));
-        assert_eq!(s.done(0x202 | tf), (0x202 | rf, Some(false)));
+        assert_eq!(s.done(0x202 | tf), (0x202, Some(false)), "ran: RF cleared stays cleared");
+        assert_eq!(s.arm(true, false, false, false, true, 0x202 | rf), Some(0x202 | tf | rf));
+        assert_eq!(s.done(0x202 | tf | rf), (0x202 | rf, Some(false)), "did not run: RF kept");
         assert_eq!(s.guest, None);
         // Whose #DB: ours only without the guest's TF or breakpoints.
         assert!(svm_db_is_ours(false, 1 << 14));

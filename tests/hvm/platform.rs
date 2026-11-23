@@ -55,6 +55,8 @@ struct Guest {
     tpr: u8,
     fs_base: u64,
     flushes: u32,
+    /// IA-32e compatibility mode (CS.L clear).
+    compat: bool,
 }
 
 impl Hw for Guest {
@@ -102,7 +104,11 @@ impl Hw for Guest {
         Paging { cr0: self.cr0, cr3: self.cr3, cr4: self.cr4, efer: self.efer }
     }
     fn mode(&mut self) -> Mode {
-        if self.efer & walk::EFER_LMA != 0 { Mode::Bits64 } else { Mode::Bits16 }
+        match (self.efer & walk::EFER_LMA != 0, self.compat) {
+            (true, false) => Mode::Bits64,
+            (true, true) => Mode::Bits32,
+            _ => Mode::Bits16,
+        }
     }
     fn cpl(&mut self) -> u8 {
         0
@@ -759,23 +765,42 @@ fn guest_boots_and_uses_the_machine() {
         turn(c, 0);
         if c.hw().rip == rip { next_interrupt(c) } else { None }
     };
-    let (pe, pg, wp) = (walk::CR0_PE, walk::CR0_PG, walk::CR0_WP);
+    let (pe, pg, wp, cd, nw) = (walk::CR0_PE, walk::CR0_PG, walk::CR0_WP, 1u64 << 30, 1u64 << 29);
+    let (pae, pcide) = (walk::CR4_PAE, 1u64 << 17);
+    let gp = Some(Event::Exc(13, Some(0)));
+    // Paging off from 64-bit code: #GP; from compatibility mode with
+    // PCIDE: #GP; nor PAE off in compatibility mode.
+    assert_eq!(mov_cr(&mut c0, 0, pe | 0x10), gp, "paging off in 64-bit mode");
+    c0.hw().compat = true;
+    assert_eq!(mov_cr(&mut c0, 4, pae | pcide), None, "PCIDE in IA-32e mode");
+    assert_eq!(mov_cr(&mut c0, 0, pe | 0x10), gp, "paging off with PCIDE");
+    assert_eq!(mov_cr(&mut c0, 4, pcide), gp, "PAE off in compatibility mode");
+    assert_eq!(mov_cr(&mut c0, 4, pae), None);
     let flushes = c0.hw().flushes;
-    assert_eq!(mov_cr(&mut c0, 0, pe | 0x10), None, "paging off");
+    assert_eq!((c0.hw().cr0, c0.hw().cr4), (pe | pg, pae), "nothing changed but CR4.PCIDE, back");
+    assert_eq!(mov_cr(&mut c0, 0, pe | 0x10), None, "paging off from compatibility mode");
     assert_eq!(c0.hw().flushes, flushes + 1, "PG 1 to 0 flushes");
-    c0.hw().efer = walk::EFER_LME;
+    // Out of IA-32e mode now: PCIDE refused; long mode's paging needs PAE.
+    (c0.hw().efer, c0.hw().compat) = (walk::EFER_LME, false);
+    assert_eq!(mov_cr(&mut c0, 4, pae | pcide), gp, "PCIDE outside IA-32e mode");
     c0.hw().cr4 = 0;
-    assert_eq!(mov_cr(&mut c0, 0, pe | pg | 0x10), Some(Event::Exc(13, Some(0))), "long mode's paging without PAE");
+    assert_eq!(mov_cr(&mut c0, 0, pe | pg | 0x10), gp, "long mode's paging without PAE");
     assert_eq!((c0.hw().cr0, c0.hw().flushes), (pe | 0x10, flushes + 1), "nothing changed");
-    c0.hw().cr4 = walk::CR4_PAE;
+    c0.hw().cr4 = pae;
     assert_eq!(mov_cr(&mut c0, 0, pe | pg | 0x10), None);
     c0.hw().efer |= walk::EFER_LMA;
     assert_eq!(c0.hw().flushes, flushes + 2, "PG 0 to 1 flushes");
     assert_eq!(mov_cr(&mut c0, 0, pe | pg | wp | 0x10), None);
     assert_eq!(c0.hw().flushes, flushes + 3, "WP flushes");
-    assert_eq!(mov_cr(&mut c0, 0, pe | pg | wp | 0x10 | 1 << 29), Some(Event::Exc(13, Some(0))), "NW without CD");
-    assert_eq!(mov_cr(&mut c0, 4, walk::CR4_PAE | 1 << 12), Some(Event::Exc(13, Some(0))), "LA57");
-    assert_eq!(c0.hw().cr4, walk::CR4_PAE);
+    // CD and NW (VT-x keeps them in the shadow only): as the guest sees
+    // CR0, flushed too.
+    assert_eq!(mov_cr(&mut c0, 0, pe | pg | wp | 0x10 | cd), None);
+    assert_eq!(c0.hw().flushes, flushes + 4, "CD flushes");
+    assert_eq!(mov_cr(&mut c0, 0, pe | pg | wp | 0x10 | cd | nw), None);
+    assert_eq!(c0.hw().flushes, flushes + 5, "NW flushes");
+    assert_eq!(mov_cr(&mut c0, 0, pe | pg | wp | 0x10 | nw), gp, "NW without CD");
+    assert_eq!(mov_cr(&mut c0, 4, pae | 1 << 12), gp, "LA57");
+    assert_eq!(c0.hw().cr4, pae);
     c0.hw().cr0 = pe | pg | 0x10;
 
     // ---- String I/O and MMIO through the guest's own page tables: an
@@ -837,15 +862,15 @@ fn guest_boots_and_uses_the_machine() {
     // (VT-x), or the instruction's prefix (AMD-V).
     c0.hw().fs_base = 0x1000;
     mem.write_bytes(A + 0x10, &0x8000_1010u32.to_le_bytes());
-    for seg in [Some(Seg::Fs), None] {
+    for (seg, code) in [(Some(Seg::Fs), &[0x64u8, 0x6f][..]), (None, &[0x64, 0x6f]), (None, &[0x48, 0x64, 0x6f])] {
         pio(&mut c0, 0, 0xcf8, 4, Some(0));
-        assert!(mem.write_bytes(CODE, &[0x64, 0x6f]));
+        assert!(mem.write_bytes(CODE, code));
         let h = c0.hw();
         (h.rip, h.g[6], h.len) = (CODE, L + 0x10 - 0x1000, 2);
         h.rflags &= !(1 << 10);
         h.exits.push_back(Exit::Io { port: 0xcf8, size: 4, input: false, string: true, rep: false, addr: 8, seg });
         turn(&mut c0, 0);
-        assert_eq!(pio(&mut c0, 0, 0xcf8, 4, None), 0x8000_1010, "OUTSD from FS: ({seg:?})");
+        assert_eq!(pio(&mut c0, 0, 0xcf8, 4, None), 0x8000_1010, "OUTSD from FS: ({seg:?}, {code:x?})");
     }
     c0.hw().fs_base = 0;
     // A 32-bit address in 64-bit mode: rDI and rCX written back

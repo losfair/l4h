@@ -164,9 +164,13 @@ impl Kernel {
         }
         let mut k = Kernel { pieces: [(0, 0, 0, 0); 16], nr: 0, entry: le(h, 24, 8), setup: None };
         for i in 0..phnum {
-            let off = phoff.checked_add(i * phentsize).filter(|o| o + 56 <= len).ok_or(Error::Format)?;
+            let off = i
+                .checked_mul(phentsize)
+                .and_then(|o| phoff.checked_add(o))
+                .filter(|o| o.checked_add(56).is_some_and(|e| e <= len))
+                .ok_or(Error::Format)?;
             let mut ph = [0u8; 56];
-            if !mem.read_bytes(gpa + off, &mut ph) {
+            if !mem.read_bytes(gpa.checked_add(off).ok_or(Error::Layout)?, &mut ph) {
                 return Err(Error::Layout);
             }
             // PT_LOAD: offset, physical address, file and memory sizes.
@@ -538,6 +542,25 @@ mod tests {
         let m = MAPPED[0].load(Ordering::SeqCst);
         assert_eq!(m & (0b11 << 8), 0b11 << 8, "blocks 8 and 9 mapped as written");
         assert!(MAPS.load(Ordering::SeqCst) >= 2);
+    }
+
+    /// Program headers anywhere a hostile image puts them: refused.
+    #[test]
+    fn elf_program_headers_out_of_bounds() {
+        let (mem, _buf) = fake(16 << 20, 0);
+        let mut e = [0u8; 0x200];
+        e[..4].copy_from_slice(b"\x7fELF");
+        e[4] = 2;
+        e[5] = 1;
+        put(&mut e, 18, 2, 62);
+        put(&mut e, 54, 2, 56);
+        put(&mut e, 56, 2, 2);
+        for (phoff, phentsize) in [(u64::MAX - 8, 56), (u64::MAX - 100, 0xffff), (0x1f0, 56), (1 << 40, 56)] {
+            put(&mut e, 32, 8, phoff);
+            put(&mut e, 54, 2, phentsize);
+            assert!(mem.write_bytes(0x80_0000, &e));
+            assert_eq!(Kernel::parse(&mem, 0x80_0000, 0x200).err(), Some(Error::Format), "{phoff:#x} {phentsize}");
+        }
     }
 
     /// Addresses that do not fit in 64 bits are refused, not wrapped.

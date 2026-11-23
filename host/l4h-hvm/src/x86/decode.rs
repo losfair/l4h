@@ -209,42 +209,62 @@ fn modrm(c: &mut Cursor, rex: u8, addr: u8) -> Result<ModRm, Error> {
     Ok(ModRm { mem: true, reg, rm: rm | ((rex & 1) << 3) })
 }
 
+/// An instruction's prefixes: legacy ones, any number, repeated or not,
+/// and REX among them in 64-bit mode, which counts only right before the
+/// opcode (one before a legacy prefix is ignored); 15 bytes at most.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Prefixes {
+    pub opsize16: bool,
+    pub addrsize_ovr: bool,
+    pub rep: Rep,
+    /// The last segment override.
+    pub seg: Option<Seg>,
+    /// The REX right before the opcode (0: none).
+    pub rex: u8,
+    /// Bytes of them: where the opcode is.
+    pub len: usize,
+}
+
+/// The prefixes of the instruction in `bytes`, in `mode`: what decode(),
+/// length() and prefix_seg() all take them as.
+pub fn prefixes(bytes: &[u8], mode: Mode) -> Result<Prefixes, Error> {
+    let mut c = Cursor { bytes, at: 0 };
+    let mut p = Prefixes { opsize16: false, addrsize_ovr: false, rep: Rep::None, seg: None, rex: 0, len: 0 };
+    loop {
+        let at = c.at;
+        let b = c.byte()?;
+        match b {
+            0x66 => p.opsize16 = true,
+            0x67 => p.addrsize_ovr = true,
+            0xf3 => p.rep = Rep::Repe,
+            0xf2 => p.rep = Rep::Repne,
+            0xf0 => {}
+            0x26 => p.seg = Some(Seg::Es),
+            0x2e => p.seg = Some(Seg::Cs),
+            0x36 => p.seg = Some(Seg::Ss),
+            0x3e => p.seg = Some(Seg::Ds),
+            0x64 => p.seg = Some(Seg::Fs),
+            0x65 => p.seg = Some(Seg::Gs),
+            0x40..=0x4f if mode == Mode::Bits64 => {
+                p.rex = b;
+                continue;
+            }
+            _ => {
+                // The opcode: there must be one.
+                p.len = at;
+                return Ok(p);
+            }
+        }
+        p.rex = 0;
+    }
+}
+
 /// Decode the instruction at the start of `bytes` (at most 15 are read),
 /// in `mode`.
 pub fn decode(bytes: &[u8], mode: Mode) -> Result<Insn, Error> {
-    let mut c = Cursor { bytes, at: 0 };
-    let (mut opsize16, mut addrsize_ovr) = (false, false);
-    let mut rep = Rep::None;
-    let mut seg = None;
-    let mut rex = 0u8;
-    let mut op;
-    loop {
-        op = c.byte()?;
-        match op {
-            0x66 => opsize16 = true,
-            0x67 => addrsize_ovr = true,
-            0xf3 => rep = Rep::Repe,
-            0xf2 => rep = Rep::Repne,
-            0xf0 => {}
-            0x26 => seg = Some(Seg::Es),
-            0x2e => seg = Some(Seg::Cs),
-            0x36 => seg = Some(Seg::Ss),
-            0x3e => seg = Some(Seg::Ds),
-            0x64 => seg = Some(Seg::Fs),
-            0x65 => seg = Some(Seg::Gs),
-            _ => break,
-        }
-        // A REX prefix counts only right before the opcode.
-        rex = 0;
-    }
-    if mode == Mode::Bits64 && (0x40..0x50).contains(&op) {
-        rex = op;
-        op = c.byte()?;
-        if matches!(op, 0x66 | 0x67 | 0xf2 | 0xf3 | 0xf0 | 0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65) || (0x40..0x50).contains(&op) {
-            // A prefix after REX: REX is ignored, which we do not model.
-            return Err(Error::Unsupported);
-        }
-    }
+    let Prefixes { opsize16, addrsize_ovr, rep, seg, rex, len } = prefixes(bytes, mode)?;
+    let mut c = Cursor { bytes, at: len };
+    let op = c.byte()?;
     let has_rex = rex != 0;
     let w = rex & 8 != 0;
     // Operand size of a full-size operand, and address size.
@@ -398,23 +418,10 @@ pub fn decode(bytes: &[u8], mode: Mode) -> Result<Insn, Error> {
     }
 }
 
-/// The segment the last override among the legacy prefixes of the
-/// instruction in `bytes` names, if any.
-pub fn prefix_seg(bytes: &[u8]) -> Option<Seg> {
-    let mut seg = None;
-    for &b in bytes.iter().take(MAX_LEN) {
-        seg = match b {
-            0x26 => Some(Seg::Es),
-            0x2e => Some(Seg::Cs),
-            0x36 => Some(Seg::Ss),
-            0x3e => Some(Seg::Ds),
-            0x64 => Some(Seg::Fs),
-            0x65 => Some(Seg::Gs),
-            0x66 | 0x67 | 0xf0 | 0xf2 | 0xf3 => seg,
-            _ => break,
-        };
-    }
-    seg
+/// The segment the last override among the prefixes of the instruction
+/// in `bytes` names, if any.
+pub fn prefix_seg(bytes: &[u8], mode: Mode) -> Option<Seg> {
+    prefixes(bytes, mode).ok()?.seg
 }
 
 /// The length of the instruction in `bytes`, prefixes included: one that
@@ -427,25 +434,9 @@ pub fn length(bytes: &[u8], mode: Mode) -> Option<u8> {
     if let Ok(i) = decode(bytes, mode) {
         return Some(i.len);
     }
-    let mut c = Cursor { bytes, at: 0 };
-    let mut addrsize_ovr = false;
-    let mut rex = 0;
-    let mut op;
-    // Any number of legacy prefixes, repeated or not, and REX among them
-    // (which counts only right before the opcode), up to 15 bytes.
-    loop {
-        op = c.byte().ok()?;
-        match op {
-            0x67 => addrsize_ovr = true,
-            0x66 | 0xf3 | 0xf2 | 0xf0 | 0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 => {}
-            0x40..=0x4f if mode == Mode::Bits64 => {
-                rex = op;
-                continue;
-            }
-            _ => break,
-        }
-        rex = 0;
-    }
+    let Prefixes { addrsize_ovr, rex, len, .. } = prefixes(bytes, mode).ok()?;
+    let mut c = Cursor { bytes, at: len };
+    let op = c.byte().ok()?;
     let addr: u8 = match mode {
         Mode::Bits64 => if addrsize_ovr { 4 } else { 8 },
         Mode::Bits32 => if addrsize_ovr { 2 } else { 4 },
@@ -761,6 +752,17 @@ mod tests {
         assert_eq!(l(&long[..15]), Some(15));
         (long[14], long[15]) = (0x0f, 0xa2);
         assert_eq!(l(&long), None, "over 15 bytes");
+        // The same prefixes for all: a REX before a segment override.
+        assert_eq!(prefix_seg(&[0x48, 0x64, 0x6f], Mode::Bits64), Some(Seg::Fs));
+        assert_eq!(prefix_seg(&[0x64, 0x48, 0x6f], Mode::Bits64), Some(Seg::Fs));
+        assert_eq!(prefix_seg(&[0x6f], Mode::Bits64), None);
+        assert_eq!(l(&[0x48, 0x64, 0x6f]), Some(3));
+        let p = prefixes(&[0x48, 0x66, 0x41, 0x89, 0x03], Mode::Bits64).unwrap();
+        assert_eq!((p.rex, p.opsize16, p.len), (0x41, true, 3), "only the REX right before the opcode counts");
+        assert_eq!(prefixes(&[0x48, 0x6f], Mode::Bits32).unwrap().len, 0, "no REX outside 64-bit mode");
+        // decode() takes such an order too (it refused it before).
+        let i = decode(&[0x48, 0x66, 0x89, 0x03], Mode::Bits64).unwrap();
+        assert_eq!((i.len, i.size), (4, 2), "an ignored REX: 16-bit operand");
     }
 
     #[test]
@@ -777,7 +779,8 @@ mod tests {
         assert_eq!(decode(&[0x83, 0x00, 0x01], Mode::Bits64), Err(Error::Unsupported));
         assert_eq!(decode(&[0xc7, 0x08, 0, 0, 0, 0], Mode::Bits64), Err(Error::Unsupported));
         assert_eq!(decode(&[0x0f, 0x0b], Mode::Bits64), Err(Error::Unsupported));
-        assert_eq!(decode(&[0x48, 0x66, 0x89, 0x08], Mode::Bits64), Err(Error::Unsupported));
+        // A REX before a legacy prefix is ignored (not refused any more).
+        assert_eq!(decode(&[0x48, 0x66, 0x89, 0x08], Mode::Bits64).map(|i| i.size), Ok(2));
         assert_eq!(decode(&[], Mode::Bits64), Err(Error::Truncated));
     }
 
