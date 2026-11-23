@@ -98,7 +98,17 @@ pub struct Svm {
     /// INT_CTL as we last wrote it (the CPU does not change it under us:
     /// a VINTR exit comes before the virtual interrupt is taken).
     int_ctl: u64,
+    /// CR0, CR4 and EFER as we last read or wrote them: the guest changes
+    /// them only with an exit to us (CR4 and EFER writes always exit,
+    /// CR0's but for TS and MP alone: its selective write intercept,
+    /// which FL4 always has, and our own emulation otherwise), so each
+    /// exit need not read them again.  CR3 comes with every exit (MR9).
+    sticky: [Option<u64>; 3],
+    cr3: u64,
 }
+
+/// The VMCB words `Svm::sticky` keeps.
+const STICKY: [u64; 3] = [CR0, CR4, EFER];
 
 fn read_chunk(vcpu: u64, first: usize, out: &mut [u64]) {
     let n = out.len();
@@ -120,7 +130,7 @@ impl Svm {
         let mut s = Svm {
             vcpu, gp: [0; 16], gp_dirty: true, rip: 0, rflags: 2, int_state: 0, len: 0, pending: None,
             vmcb: [0; CHUNKS * CHUNK], valid: [false; CHUNKS], nmi_masked: false, iret_rip: None, tpr: 0, int_ctl: 0,
-            injected: None, step: exits::NmiStep::default(),
+            injected: None, step: exits::NmiStep::default(), sticky: [None; 3], cr3: 0,
         };
         s.int_ctl = s.rd(INT_CTL);
         s.wr(INTERCEPT_MISC2, I2_VMMCALL | I2_RDTSCP);
@@ -131,6 +141,18 @@ impl Svm {
     }
 
     fn rd(&mut self, off: u64) -> u64 {
+        let k = STICKY.iter().position(|&o| o == off);
+        if let Some(v) = k.and_then(|k| self.sticky[k]) {
+            return v;
+        }
+        let v = self.rd_vmcb(off);
+        if let Some(k) = k {
+            self.sticky[k] = Some(v);
+        }
+        v
+    }
+
+    fn rd_vmcb(&mut self, off: u64) -> u64 {
         let w = (off / 8) as usize;
         let c = w / CHUNK;
         if !self.valid[c] {
@@ -146,6 +168,12 @@ impl Svm {
         match write_word(self.vcpu, off, v) {
             Some(w) => {
                 self.vmcb[(off / 8) as usize] = w;
+                if let Some(k) = STICKY.iter().position(|&o| o == off) {
+                    self.sticky[k] = Some(w);
+                }
+                if off == CR3 {
+                    self.cr3 = w;
+                }
                 true
             }
             None => false,
@@ -228,6 +256,7 @@ impl Hw for Svm {
         let left = m[2];
         self.rflags = m[7];
         self.int_state = m[8];
+        self.cr3 = m[9];
         for (i, &x) in SEL4_ORDER.iter().enumerate() {
             self.gp[x] = m[10 + i];
         }
@@ -321,7 +350,15 @@ impl Hw for Svm {
 
     fn skip(&mut self, len: u64) {
         let rip = self.rip.wrapping_add(len);
-        self.rip = if self.mode() == Mode::Bits64 { rip } else { rip & 0xffff_ffff };
+        // Only outside 64-bit mode does RIP wrap at 4 GiB, and that needs
+        // CS (a VMCB read) only when a RIP below 4 GiB passes it with
+        // EFER.LMA set: above it is 64-bit code, below it nothing wraps.
+        let wraps = if self.rd(EFER) & walk::EFER_LMA == 0 {
+            true
+        } else {
+            self.rip <= 0xffff_ffff && rip > 0xffff_ffff && self.mode() != Mode::Bits64
+        };
+        self.rip = if wraps { rip & 0xffff_ffff } else { rip };
         if self.int_state & 1 != 0 {
             self.int_state = 0;
             self.wr(INT_STATE, 0);
@@ -337,7 +374,7 @@ impl Hw for Svm {
     }
 
     fn paging(&mut self) -> Paging {
-        Paging { cr0: self.rd(CR0), cr3: self.rd(CR3), cr4: self.rd(CR4), efer: self.rd(EFER) }
+        Paging { cr0: self.rd(CR0), cr3: self.cr3, cr4: self.rd(CR4), efer: self.rd(EFER) }
     }
 
     fn mode(&mut self) -> Mode {
