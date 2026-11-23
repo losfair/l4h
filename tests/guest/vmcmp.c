@@ -259,9 +259,15 @@ static void bench_fresh_page(void)
 
 static void print_xcr0(void)
 {
-	unsigned lo, hi, lo1, hi1;
+	unsigned a, b, c, d, lo, hi, lo1 = 0, hi1;
+	/* XGETBV needs OSXSAVE; its XINUSE form, CPUID.(0xd,1):EAX[2]. */
+	__asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1), "c"(0));
+	if (!(c & (1u << 27)))
+		return;
 	__asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
-	__asm__ volatile("xgetbv" : "=a"(lo1), "=d"(hi1) : "c"(1));
+	__asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0xd), "c"(1));
+	if (a & (1u << 2))
+		__asm__ volatile("xgetbv" : "=a"(lo1), "=d"(hi1) : "c"(1));
 	printf("BENCH: xcr0 %#x xinuse %#x\n", lo, lo1);
 }
 
