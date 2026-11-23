@@ -39,13 +39,18 @@ index 605a173..13dfbab 100644
      pub enum CcLog {
          /// From the protocol, with the final events table.
 diff --git a/crates/fl4-efi/src/firmware.rs b/crates/fl4-efi/src/firmware.rs
-index 3243853..b74d270 100644
+index 3243853..8543b08 100644
 --- a/crates/fl4-efi/src/firmware.rs
 +++ b/crates/fl4-efi/src/firmware.rs
-@@ -66,6 +66,15 @@ impl Firmware<'_> {
+@@ -66,6 +66,20 @@ impl Firmware<'_> {
          NonNull::new(protocol).ok_or(EFI_LOAD_ERROR)
      }
  
++    /// Whether the loader is running in an Intel TDX trust domain.
++    pub fn is_tdx(&self) -> bool {
++        x86::is_tdx()
++    }
++
 +    /// Measure caller-selected external bytes when running in a trust domain.
 +    /// The caller may return to EFI if the firmware cannot extend RTMR[2].
 +    pub fn measure_cc_file(&self, name: &[u8], bytes: &[u8]) -> Result<(), Status> {
@@ -58,7 +63,7 @@ index 3243853..b74d270 100644
      /// Enter an x86_64 FL4 ELF kernel. The first module is the root task.
      /// Subsequent modules are passed in the order given.
      ///
-@@ -75,6 +84,14 @@ impl Firmware<'_> {
+@@ -75,6 +89,14 @@ impl Firmware<'_> {
      /// handoff ABI. The loader writes the kernel's ELF segments to physical
      /// memory and transfers control to it after exiting boot services.
      pub unsafe fn boot(&self, kernel: &[u8], modules: &[(&[u8], &[u8])]) -> ! {
@@ -73,7 +78,7 @@ index 3243853..b74d270 100644
          let mut files = [(0, 0, &[][..]); 9];
          if modules.is_empty() || modules.len() > files.len() {
              fail("invalid number of boot modules");
-@@ -84,7 +101,7 @@ impl Firmware<'_> {
+@@ -84,7 +106,7 @@ impl Firmware<'_> {
              *len = bytes.len() as u64;
              *name = module_name;
          }
@@ -82,11 +87,112 @@ index 3243853..b74d270 100644
      }
  }
  
+diff --git a/crates/fl4-efi/src/tcg2.rs b/crates/fl4-efi/src/tcg2.rs
+index 70f3be8..18028f6 100644
+--- a/crates/fl4-efi/src/tcg2.rs
++++ b/crates/fl4-efi/src/tcg2.rs
+@@ -248,6 +248,12 @@ pub fn append_final(m: &(impl Mem + ?Sized), algs: &AlgTable, snap: &FinalSnapsh
+ pub const PCR_BOOT_FILES: u32 = 9;
+ /// `EV_IPL`: code or data the boot loader loaded.
+ pub const EV_IPL: u32 = 0xd;
++/// `EV_SEPARATOR`: separator event (0xffffffff indicates an error/poisoned state).
++pub const EV_SEPARATOR: u32 = 4;
++/// Error separator payload (TCG PC Client PFP §3.3.4): marks a PCR as unusable.
++pub const SEPARATOR_ERROR: [u8; 4] = [0xff; 4];
++/// Number of Locality-0 static PCRs poisoned in a TDX guest (PCRs 0..16).
++pub const POISON_PCR_COUNT: u32 = 16;
+ /// `EFI_VOLUME_FULL`: extended, but the log had no room for the event.
+ pub const VOLUME_FULL: u64 = (1 << 63) | 11;
+ /// `EFI_TCG2_EVENT_HEADER`, packed: header size, header version, PCR
+@@ -286,6 +292,15 @@ pub fn measure_status(status: u64) -> Result<(), &'static str> {
+     }
+ }
+ 
++/// Whether HashLogExtendEvent poisoned a PCR in a TDX guest: success, or
++/// `EFI_VOLUME_FULL` (only the log is full).
++pub fn poison_status(status: u64) -> Result<(), &'static str> {
++    match status {
++        0 | VOLUME_FULL => Ok(()),
++        _ => Err("cannot poison TPM PCRs in TDX"),
++    }
++}
++
+ /// The descriptor measured before a boot file's contents (tcg2.rs and
+ /// ccel.rs): `"fl4-efi\0" || role || "\0" || len (u64 LE) || path`, into
+ /// `buf` (at least the prefix, the role, 1 and 8 bytes); returns its
+@@ -363,6 +378,34 @@ mod efi {
+         Ok(())
+     }
+ 
++    /// In a TDX guest, if firmware exposes `EFI_TCG2_PROTOCOL` (e.g. a cloud
++    /// vTPM), poison all Locality-0 static PCRs (0..16) with an error
++    /// `EV_SEPARATOR` (`0xffffffff`) before ExitBootServices so no PCR remains
++    /// in a clean or unextended state. Ok without a TPM; fails closed if any
++    /// extend fails.
++    pub fn poison() -> Result<(), &'static str> {
++        let Some(tcg) = protocol() else {
++            return Ok(());
++        };
++        let sep = SEPARATOR_ERROR;
++        let mut event = [0u8; TCG2_EVENT_FIXED + 4];
++        for pcr in 0..POISON_PCR_COUNT {
++            tcg2_event(&mut event, pcr, EV_SEPARATOR, &sep);
++            let r = unsafe {
++                ((*tcg).hash_log_extend_event)(
++                    tcg,
++                    0,
++                    sep.as_ptr() as u64,
++                    sep.len() as u64,
++                    event.as_ptr(),
++                )
++            };
++            poison_status(r as u64)?;
++        }
++        say!("fl4-efi: TDX guest, poisoned TPM PCRs 0..15");
++        Ok(())
++    }
++
+     /// Firmware memory at `base`, read at most `limit` bytes in (boot
+     /// services memory or ACPI NVS, identity mapped while the loader runs).
+     pub struct Raw {
 diff --git a/crates/fl4-efi/src/x86.rs b/crates/fl4-efi/src/x86.rs
-index 10d7327..5349281 100644
+index 10d7327..cadcba0 100644
 --- a/crates/fl4-efi/src/x86.rs
 +++ b/crates/fl4-efi/src/x86.rs
-@@ -503,6 +503,10 @@ fn boot_files<'a>(li: &LoadedImage, opts: &'a Words, measure: bool) -> ([BootFil
+@@ -451,8 +451,8 @@ fn long_mode_entry(kernel: &[u8]) -> Option<u64> {
+ 
+ pub(super) type BootFile<'a> = (u64, u64, &'a [u8]);
+ 
+-/// The files from the options extend TPM PCR 9 when there is a TPM, and
+-/// (`measure`: this is a TD) RTMR[2].
++/// The files from the options extend RTMR[2] in a TD (`measure`), or
++/// TPM PCR 9 outside a TD when there is a TPM.
+ fn boot_files<'a>(li: &LoadedImage, opts: &'a Words, measure: bool) -> ([BootFile<'a>; 9], usize) {
+     let mut files = [(0, 0, &[][..]); 9];
+     let mut n = 1;
+@@ -461,8 +461,9 @@ fn boot_files<'a>(li: &LoadedImage, opts: &'a Words, measure: bool) -> ([BootFil
+             let (pa, len) = read_file(li, path);
+             if measure {
+                 ccel::measure_file(b"rootserver", path, pa, len);
++            } else {
++                tcg2::measure_file(b"rootserver", path, pa, len).unwrap_or_else(|e| fail(e));
+             }
+-            tcg2::measure_file(b"rootserver", path, pa, len).unwrap_or_else(|e| fail(e));
+             files[0] = (pa, len, path);
+         } else if let Some(path) = opt.strip_prefix(b"module=") {
+             if n == files.len() {
+@@ -471,8 +472,9 @@ fn boot_files<'a>(li: &LoadedImage, opts: &'a Words, measure: bool) -> ([BootFil
+             let (pa, len) = read_file(li, path);
+             if measure {
+                 ccel::measure_file(b"module", path, pa, len);
++            } else {
++                tcg2::measure_file(b"module", path, pa, len).unwrap_or_else(|e| fail(e));
+             }
+-            tcg2::measure_file(b"module", path, pa, len).unwrap_or_else(|e| fail(e));
+             files[n] = (pa, len, path);
+             n += 1;
+         }
+@@ -503,6 +505,10 @@ fn boot_files<'a>(li: &LoadedImage, opts: &'a Words, measure: bool) -> ([BootFil
      (files, n)
  }
  
@@ -97,7 +203,7 @@ index 10d7327..5349281 100644
  pub unsafe fn start_default(image: Handle, system: *mut SystemTable) -> Status {
      unsafe { ST = system };
      (bs().set_watchdog_timer)(0, 0, 0, core::ptr::null());
-@@ -514,12 +518,12 @@ pub unsafe fn start_default(image: Handle, system: *mut SystemTable) -> Status {
+@@ -514,12 +520,12 @@ pub unsafe fn start_default(image: Handle, system: *mut SystemTable) -> Status {
      let li = unsafe { &*(li as *const LoadedImage) };
      let opts = options(li);
      // As in `boot`: only a guest that is not SEV can be a TD.
@@ -113,7 +219,24 @@ index 10d7327..5349281 100644
      let cr4: u64;
      unsafe { asm!("mov {}, cr4", out(reg) cr4) };
      let (mask, cpuid, secrets) = sev();
-@@ -587,6 +591,10 @@ pub(super) fn boot(image: Handle, kernel: &[u8], files: &[BootFile<'_>]) -> ! {
+@@ -558,8 +564,14 @@ pub(super) fn boot(image: Handle, kernel: &[u8], files: &[BootFile<'_>]) -> ! {
+         .map(|&(_, len, _)| len.div_ceil(PAGE) * PAGE)
+         .sum();
+     // The TPM event log goes after the files, with room for the events
+-    // ExitBootServices adds.
+-    let tpm = tcg2::collect();
++    // ExitBootServices adds. In a TDX guest, poison all static TPM PCRs 0..15
++    // if firmware exposes EFI_TCG2_PROTOCOL, and do not collect a TPM event log.
++    let tpm = if shared == 0 {
++        tcg2::collect()
++    } else {
++        tcg2::poison().unwrap_or_else(|e| fail(e));
++        None
++    };
+     let tpm_cap = tpm.as_ref().map_or(0, |t| t.capacity().div_ceil(PAGE) * PAGE);
+     // The same for a TDX guest's RTMR log, independently of the TPM's.
+     let cc = if shared != 0 { ccel::collect() } else { None };
+@@ -587,6 +599,10 @@ pub(super) fn boot(image: Handle, kernel: &[u8], files: &[BootFile<'_>]) -> ! {
          base: root + TABLE_BYTES,
          used: 8,
      };

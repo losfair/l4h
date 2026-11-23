@@ -41,8 +41,8 @@ if [ -e /dev/l4h-attest ]; then
     blob tdx-event-log tdx-event-log
     blob tdx-quote tdx-quote "$nonce"
     echo "GCETEST: attest providers $(l4hctl attest providers 2>&1)"
-    # configfs-tsm: the report again, and the evidence (both providers
-    # together as {"v": 3, ...}).
+    # configfs-tsm: the report again, and the evidence (TDX alone on TDX
+    # guests, which ignore any vTPM; TPM alone on non-TDX guests).
     mount -t configfs none /sys/kernel/config 2>/dev/null
     r=/sys/kernel/config/tsm/report/g0
     if mkdir $r 2>/dev/null; then

@@ -11,9 +11,9 @@
 //! pages and the control channel (trust::RELAY_*).
 //!
 //! On an Intel TDX trust domain (FL4's BootInfo TDX_INFO, never with other
-//! partitions) trustd also gets the TdxControl capability, a private page
-//! for TDREPORTs and a 2 MiB frame shared with the VMM for GetQuote, and the
-//! CC event log: with a TPM or without, it binds its key to both.
+//! partitions) root ignores any TPM and gives trustd the TdxControl
+//! capability, a private page for TDREPORTs, a 2 MiB frame shared with the
+//! VMM for GetQuote, and the CC event log.
 #![cfg_attr(not(target_arch = "x86_64"), allow(dead_code, unused_imports))]
 
 
@@ -175,7 +175,7 @@ impl Extra {
 
     fn find(bootinfo: &sel4::BootInfoPtr, alloc: &mut Alloc, devmem: &mut DevMem, tdx_info: Option<&[u8]>) -> Extra {
         let in_td = tdx_info.is_some();
-        let ev = EventLog::find(bootinfo, alloc, devmem, TPM_EVENT_LOG);
+        let ev = if in_td { EventLog::NONE } else { EventLog::find(bootinfo, alloc, devmem, TPM_EVENT_LOG) };
         let tdx = tdx_info.and_then(|c| Tdx::find(c, alloc));
         // The CC event log is the TD's: without TDX nothing quotes it.
         let cc = if tdx.is_some() { EventLog::find(bootinfo, alloc, devmem, CC_EVENT_LOG) } else { EventLog::NONE };
@@ -399,21 +399,111 @@ impl Layout {
     }
 }
 
-/// The TPM, from its ACPI table (DESIGN.md §10.2).  In a TD (`in_td`),
-/// START_ACPI is refused as soon as the start method is decoded, before
-/// touching the CRB control area.
+/// Dedicated page table for TPM MMIO frames, isolated from `acpi::Frames`
+/// so TPM MMIO can never alias ACPI tables, IOMMU, reset or other
+/// already-carved device pages.
 #[cfg(target_arch = "x86_64")]
-fn find_tpm(bootinfo: &sel4::BootInfoPtr, phys: &mut crate::acpi::Phys, in_td: bool) -> Option<Layout> {
+struct TpmFrames {
+    pages: ArrayVec<(usize, cap::Granule), 64>,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl TpmFrames {
+    const fn new() -> Self {
+        TpmFrames { pages: ArrayVec::new() }
+    }
+
+    fn get(&self, page: usize) -> Option<cap::Granule> {
+        let i = self.pages.binary_search_by_key(&page, |&(p, _)| p).ok()?;
+        Some(self.pages[i].1)
+    }
+
+    fn frame(&mut self, alloc: &mut Alloc, devmem: &mut DevMem, paddr: usize) -> Option<cap::Granule> {
+        let page = paddr & !(PAGE - 1);
+        let i = match self.pages.binary_search_by_key(&page, |&(p, _)| p) {
+            Ok(i) => return Some(self.pages[i].1),
+            Err(i) => i,
+        };
+        if self.pages.is_full() {
+            return None;
+        }
+        let f = crate::devmem::granule(alloc.slots.global(|slots| devmem.frames(slots, page, PAGE))?.start);
+        let _ = self.pages.insert(i, (page, f));
+        Some(f)
+    }
+
+    fn read_into_attrs(
+        &mut self,
+        alloc: &mut Alloc,
+        devmem: &mut DevMem,
+        win: &mut Window,
+        paddr: usize,
+        buf: &mut [u8],
+        attrs: sel4::VmAttributes,
+    ) -> Option<()> {
+        let mut done = 0;
+        while done < buf.len() {
+            let at = paddr.checked_add(done)?;
+            let n = (PAGE - at % PAGE).min(buf.len() - done);
+            let f = self.frame(alloc, devmem, at)?;
+            let dst = &mut buf[done..done + n];
+            win.with_frame_attrs(&abs_of(f), attrs, |p| unsafe {
+                let src = p.add(at % PAGE);
+                for (i, b) in dst.iter_mut().enumerate() {
+                    *b = src.add(i).read_volatile();
+                }
+            });
+            done += n;
+        }
+        Some(())
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn tpm_range_ok(base: usize, size: usize, ctrls: &[crate::blkd::Controller], balloon: Option<&crate::pci::Device>) -> bool {
+    if !trust::tpm_range_allowed(base, size, &[]) {
+        return false;
+    }
+    !ctrls.iter().map(|c| &c.pci)
+        .chain(crate::nicd::nics().iter().map(|n| &n.pci))
+        .chain(crate::usb::ctrls().iter().map(|c| &c.pci))
+        .chain(balloon.into_iter())
+        .flat_map(|d| d.bars.iter())
+        .any(|b| b.size != 0 && !b.is_io && trust::hw_meets(base, size, b.addr, b.size))
+}
+
+/// The TPM, from its ACPI table (DESIGN.md §10.2).  Only called outside a TD.
+/// The ACPI `TPM2` table itself is read through `acpi_frames`; all TPM MMIO
+/// pages (including the CRB control area) are carved into the dedicated
+/// `tpm_frames` table so they can never alias `acpi_frames`.
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+fn find_tpm(
+    bootinfo: &sel4::BootInfoPtr,
+    alloc: &mut Alloc,
+    devmem: &mut DevMem,
+    win: &mut Window,
+    acpi_frames: &mut crate::acpi::Frames,
+    tpm_frames: &mut TpmFrames,
+    ctrls: &[crate::blkd::Controller],
+    balloon: Option<&crate::pci::Device>,
+    in_td: bool,
+) -> Option<Layout> {
     use crate::blkd::DEVICE_ATTRS;
     /// TPM 2.0 at its standard address (PC Client PTP), where the ACPI
     /// table gives none (FIFO interface).
     const TPM_DEFAULT_BASE: usize = 0xfed4_0000;
     // The TPM2 table, up to the Pluton doorbells (revision 4 is 76 bytes).
     let mut buf = [0; 76];
-    let Some(t) = crate::acpi::find(bootinfo, phys, b"TPM2", &mut buf).filter(|t| t.len() >= 52) else {
-        info!("l4h-root: no TPM, no attestation");
-        return None;
+    let t_len = {
+        let mut phys = crate::acpi::Phys::new(alloc, devmem, win, acpi_frames);
+        let Some(t) = crate::acpi::find(bootinfo, &mut phys, b"TPM2", &mut buf).filter(|t| t.len() >= 52) else {
+            info!("l4h-root: no TPM, no attestation");
+            return None;
+        };
+        t.len()
     };
+    let t = &buf[..t_len];
     let u64_at = |i: usize| u64::from_le_bytes(t[i..i + 8].try_into().unwrap()) as usize;
     let control = u64_at(40);
     let method = u32::from_le_bytes(t[48..52].try_into().unwrap());
@@ -423,9 +513,16 @@ fn find_tpm(bootinfo: &sel4::BootInfoPtr, phys: &mut crate::acpi::Phys, in_td: b
         None
     };
     if method == 6 {
+        if in_td {
+            log!("l4h-root: TDX guest: ignoring FIFO TPM");
+            return None;
+        }
         // FIFO ("TIS"): locality 0's registers.
         l.iface = trust::TPM_TIS;
         l.loc = l.range(if control != 0 { control & !(PAGE - 1) } else { TPM_DEFAULT_BASE }, PAGE);
+        if l.loc.is_none() || l.ranges.iter().any(|&(base, size)| !tpm_range_ok(base, size, ctrls, balloon)) {
+            return unusable("MMIO range overlaps system or PCI device memory");
+        }
         return Some(l);
     }
     l.iface = trust::TPM_CRB;
@@ -435,15 +532,20 @@ fn find_tpm(bootinfo: &sel4::BootInfoPtr, phys: &mut crate::acpi::Phys, in_td: b
         13 => trust::START_PLUTON,
         _ => return unusable("unsupported start method"),
     };
-    // The ACPI start method runs the firmware's AML with root's hardware
-    // access (Hw): in a TD that is the cloud's code, which the TD does not
-    // trust.  Refuse it before reading the CRB control area.
     if !trust::tpm_start_allowed(in_td, l.start) {
-        log!("l4h-root: refusing ACPI start TPM (AML) in a TDX guest");
+        log!("l4h-root: TDX guest: ignoring TPM (start method {})", method);
         return None;
     }
     if control == 0 {
         return unusable("no control area");
+    }
+    // Validate the CRB control area range before reading it.
+    let ctrl_base = control & !(PAGE - 1);
+    let Some(ctrl_size) = control.checked_add(0x30).and_then(|e| e.checked_next_multiple_of(PAGE)).map(|e| e - ctrl_base) else {
+        return unusable("control area wraps");
+    };
+    if !tpm_range_ok(ctrl_base, ctrl_size, ctrls, balloon) {
+        return unusable("control area overlaps system or PCI device memory");
     }
     // Only plain CRB has locality registers, the page the control area is
     // at 0x40 of (as Linux tpm_crb).
@@ -453,14 +555,17 @@ fn find_tpm(bootinfo: &sel4::BootInfoPtr, phys: &mut crate::acpi::Phys, in_td: b
         }
         l.loc = l.range(control & !(PAGE - 1), PAGE);
     }
-    // The control area and the buffers it names.
+    // The control area and the buffers it names, read through dedicated TPM frames.
     let mut regs = [0; 0x30];
-    phys.read_into_attrs(control, &mut regs, DEVICE_ATTRS)?;
+    tpm_frames.read_into_attrs(alloc, devmem, win, control, &mut regs, DEVICE_ATTRS)?;
     let w32 = |i: usize| u32::from_le_bytes(regs[i..i + 4].try_into().unwrap()) as usize;
     let (cmd, cmd_size) = (w32(0x1c) | w32(0x20) << 32, w32(0x18));
     let (rsp, rsp_size) = (w32(0x28) | w32(0x2c) << 32, w32(0x24));
     if cmd == 0 || rsp == 0 || cmd_size < 10 || rsp_size < 10 {
         return unusable("no command or response buffer");
+    }
+    if cmd_size > trust::TPM_CRB_BUF_MAX || rsp_size > trust::TPM_CRB_BUF_MAX {
+        return unusable("command or response buffer exceeds 64 KiB");
     }
     l.ctrl = l.range(control, 0x30);
     l.cmd = l.range(cmd, cmd_size).map(|(r, off)| (r, off, cmd_size));
@@ -478,10 +583,14 @@ fn find_tpm(bootinfo: &sel4::BootInfoPtr, phys: &mut crate::acpi::Phys, in_td: b
     if l.ctrl.is_none() || l.cmd.is_none() || l.rsp.is_none() || (method == 13 && l.reply_bell.is_none()) {
         return unusable("registers or buffers too large");
     }
+    if l.ranges.iter().any(|&(base, size)| !tpm_range_ok(base, size, ctrls, balloon)) {
+        return unusable("MMIO range overlaps system or PCI device memory");
+    }
     Some(l)
 }
 
 /// Start trustd whenever built in. Without a usable TPM it serves flags.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     bootinfo: &sel4::BootInfoPtr,
     alloc: &mut Alloc,
@@ -491,6 +600,10 @@ pub fn spawn(
     info: &HostInfo,
     #[cfg(target_arch = "x86_64")]
     frames: crate::acpi::Frames,
+    #[cfg(target_arch = "x86_64")]
+    ctrls: &[crate::blkd::Controller],
+    #[cfg(target_arch = "x86_64")]
+    balloon: Option<&crate::pci::Device>,
 ) -> Option<Trustd> {
     if TRUSTD_ELF.is_empty() {
         return None;
@@ -514,21 +627,25 @@ pub fn spawn(
         }
         // Whether or not the TPM below is usable.
         let ev = Extra::find(bootinfo, alloc, devmem, tdx_info);
-        if ev.in_td && ev.tdx.is_none() {
-            return flags_only(alloc, win, asids, info, &ev);
+        // In a TDX guest, completely ignore any TPM (do not parse ACPI TPM2 or
+        // map any TPM MMIO pages).
+        if ev.in_td {
+            info!("l4h-root: TDX guest: ignoring TPM");
+            return without_tpm(alloc, win, asids, info, trust::TPM_NONE, &ev);
         }
         let mut frames = frames;
-        let mut phys = crate::acpi::Phys::new(alloc, devmem, win, &mut frames);
-        let Some(l) = find_tpm(bootinfo, &mut phys, ev.in_td) else {
+        let mut tpm_frames = TpmFrames::new();
+        let Some(l) = find_tpm(bootinfo, alloc, devmem, win, &mut frames, &mut tpm_frames, ctrls, balloon, ev.in_td) else {
             return flags_only(alloc, win, asids, info, &ev);
         };
-        // The pages of each range, which stay in `frames`.
+        // Carve every page of each TPM range into `tpm_frames` (isolated from `frames`).
         for &(base, size) in &l.ranges {
-            if (0..size / PAGE).any(|p| phys.frame(base + p * PAGE).is_none()) {
-                log!("l4h-root: TPM at {:#x} is not device memory, no attestation", base);
+            if (0..size / PAGE).any(|p| tpm_frames.frame(alloc, devmem, base + p * PAGE).is_none()) {
+                log!("l4h-root: TPM at {:#x} is not free device memory, no attestation", base);
                 return flags_only(alloc, win, asids, info, &ev);
             }
         }
+        let mut phys = crate::acpi::Phys::new(alloc, devmem, win, &mut frames);
         // The AML's size.  Its pages are carved now, so that copying it
         // once trustd exists cannot fail for want of them.
         let aml_size = match l.start {
@@ -568,7 +685,7 @@ pub fn spawn(
         let mut arena = arena;
         for (r, &(base, size)) in l.ranges.iter().enumerate() {
             for p in 0..size / PAGE {
-                let f = frames.get(base + p * PAGE).expect("TPM page carved above");
+                let f = tpm_frames.get(base + p * PAGE).expect("TPM page carved above");
                 let va = trust::TPM_VA + r * trust::RANGE_STRIDE + p * PAGE;
                 comp.map_copy(alloc, &mut arena, &abs_of(f), va, CapRights::read_write(), crate::blkd::DEVICE_ATTRS, keep_slot());
             }

@@ -48,11 +48,34 @@ pub const fn tdx_mode(in_td: bool, has_tdx: bool) -> u32 {
     }
 }
 
-/// Whether a TPM2 ACPI start method is allowed: in a TD, START_ACPI (the
-/// cloud's AML with root hardware access) is refused before reading the
-/// CRB control area.
-pub const fn tpm_start_allowed(in_td: bool, start: u32) -> bool {
-    !(in_td && start == START_ACPI)
+/// Whether a TPM2 ACPI start method is allowed: in a TD, all TPM
+/// interfaces and start methods are ignored (TDX attestation alone).
+pub const fn tpm_start_allowed(in_td: bool, _start: u32) -> bool {
+    !in_td
+}
+
+/// Maximum size of a TPM CRB command or response buffer (64 KiB; TPM 2.0
+/// CRB buffers are 4 KiB in practice).
+pub const TPM_CRB_BUF_MAX: usize = 0x1_0000;
+
+/// Maximum page-aligned size of a single TPM MMIO range (64 KiB buffer plus
+/// up to one page when the buffer is not page-aligned).
+pub const TPM_RANGE_MAX: usize = TPM_CRB_BUF_MAX + 4096;
+
+/// Whether a non-TDX TPM MMIO range `[base, base + size)` is acceptable:
+/// non-empty, within `TPM_RANGE_MAX`, no overflow, and disjoint from the
+/// HPET, I/O APIC, local APIC / MSI window, and any caller-supplied
+/// forbidden ranges (such as PCI memory BARs).
+pub fn tpm_range_allowed(base: usize, size: usize, forbidden: &[(u64, u64)]) -> bool {
+    if size == 0 || size > TPM_RANGE_MAX || base.checked_add(size).is_none() {
+        return false;
+    }
+    for &(fbase, fsize) in [HPET_DEFAULT, IOAPIC_DEFAULT, LAPIC_MSI].iter().chain(forbidden.iter()) {
+        if fsize != 0 && hw_meets(base, size, fbase, fsize) {
+            return false;
+        }
+    }
+    true
 }
 
 /// A physical range trustd has mapped, at TPM_VA + i * RANGE_STRIDE for

@@ -758,6 +758,10 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         bootinfo, &mut alloc, &mut devmem, &mut wins.a, &mut asids, &info,
         #[cfg(target_arch = "x86_64")]
         acpi_frames,
+        #[cfg(target_arch = "x86_64")]
+        ctrls,
+        #[cfg(target_arch = "x86_64")]
+        balloon.as_ref(),
     );
     let netd = netd::spawn(&mut alloc, &mut wins.a, &mut asids, &info);
 
