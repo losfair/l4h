@@ -14,8 +14,7 @@ cmake -DCMAKE_C_FLAGS="$l4h_prefix_map" -DCMAKE_ASM_FLAGS="$l4h_prefix_map" -G N
     -DFL4_SOURCE="$src" \
     -DCARGO="$root/tools/cargo-fl4.sh" \
     -C "$root/kernel/configs/l4h-x86_64.cmake" \
-    -DKernelVTX=ON -DKernelX86_64VTX64BitGuests=ON \
-    -DKernelDebugBuild="$debug" \
+    -DKernelVTX=ON -DKernelX86_64VTX64BitGuests=ON -DKernelDebugBuild="$debug" \
     -DKernelRetypeFanOutLimit=256 \
     -DLibSel4PrintInvocationErrors=0
 ninja -C "$out"

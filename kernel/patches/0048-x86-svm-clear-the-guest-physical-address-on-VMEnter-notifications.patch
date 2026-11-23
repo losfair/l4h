@@ -36,6 +36,3 @@ index ada7e8ea0..11e5a386a 100644
      setMR(tcb, buffer, SEL4_VMENTER_FAULT_RFLAGS_MR, *vmcb_word(vcpu, VMCB_RFLAGS));
      setMR(tcb, buffer, SEL4_VMENTER_FAULT_GUEST_INT_MR, *vmcb_u32(vcpu, VMCB_INT_STATE));
      setMR(tcb, buffer, SEL4_VMENTER_FAULT_CR3_MR, *vmcb_word(vcpu, VMCB_CR3));
--- 
-2.47.3
-

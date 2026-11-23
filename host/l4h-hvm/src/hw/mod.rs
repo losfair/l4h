@@ -139,10 +139,9 @@ pub trait Hw {
 #[cfg(not(test))]
 const VM_ENTER_WORDS: usize = 30;
 
-/// seL4_VMEnterFull requests 30 reply words in the syscall's message info.
-/// MRs 0-2 (RIP, controls, event) in registers, the rest
-/// of the exit in the IPC buffer.  Whether it was an exit (else a
-/// notification), and the badge.
+/// Request the full VMEnter reply. The inputs are RIP, controls and event.
+/// The first four reply words return in registers and the rest in the IPC
+/// buffer. The syscall also returns the fault indicator and notification badge.
 #[cfg(not(test))]
 pub fn vmenter(rip: u64, controls: u64, event: u64) -> (bool, u64) {
     let (mut mr0, mut mr1, mut mr2, mut mr3) = (rip, controls, event, 0u64);
