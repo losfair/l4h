@@ -514,7 +514,7 @@ mod tests {
             true
         }
         let buf = std::vec![0u8; 32 << 20];
-        let mem = GuestMem { base: buf.as_ptr() as usize, low: 32 << 20, high: 0, mapped: &MAPPED, map };
+        let mem = GuestMem { base: buf.as_ptr() as usize, ram_base: 0, low: 32 << 20, high: 0, mapped: &MAPPED, map };
         // vmmgr filled the blocks up to the image (0 to 4 MiB): block 0,
         // the image's at 2 MiB.
         MAPPED[0].store(0b11, Ordering::SeqCst);

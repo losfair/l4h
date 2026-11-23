@@ -9,7 +9,6 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use super::apic::Message;
 use super::pci::{self, Config};
 use crate::guest::GuestMem;
 use crate::virtq::Queue;
@@ -129,8 +128,10 @@ struct MsixEntry {
 /// An interrupt the transport raises.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Irq {
-    Msi(Message),
-    /// INTx's level (its pin is pci::intx_gsi(slot, 1)).
+    /// An MSI-X message, as the guest wrote it: the machine's interrupt
+    /// controller (vm.rs) says what it means.
+    Msi { addr: u64, data: u32 },
+    /// INTx's level (slot's INTA#: vm.rs routes it).
     Intx(bool),
 }
 
@@ -170,8 +171,8 @@ fn vendor_cap(cfg_type: u8, bar: u8, offset: u32, len: u32, extra: Option<u32>) 
 
 impl<B: Backend> Transport<B> {
     /// The device in slot `slot` (1-31), with its BARs where the slot's
-    /// part of the window is.
-    pub fn new(slot: usize, backend: B) -> Self {
+    /// part of the PCI MMIO window from `mmio_base` is.
+    pub fn new(slot: usize, mmio_base: u64, backend: B) -> Self {
         let ty = backend.device_type();
         let class = match ty {
             1 => 0x02_0000,
@@ -179,7 +180,7 @@ impl<B: Backend> Transport<B> {
             _ => 0xff_0000,
         };
         let mut cfg = Config::new(0x1af4, 0x1040 + ty, 1, class, (0x1af4, 0x40 + ty), 1);
-        let base = pci::MMIO_BASE + slot as u64 * pci::SLOT_MMIO;
+        let base = mmio_base + slot as u64 * pci::SLOT_MMIO;
         cfg.bar64(0, BAR0_SIZE, base);
         cfg.bar64(2, BAR2_SIZE, base + BAR0_SIZE);
         let n = backend.num_queues().min(MAX_QUEUES);
@@ -513,9 +514,7 @@ impl<B: Backend> Transport<B> {
             self.pba |= 1 << v;
             return;
         }
-        if let Some(m) = Message::msi(e.addr, e.data) {
-            out(Irq::Msi(m));
-        }
+        out(Irq::Msi { addr: e.addr, data: e.data });
     }
 
     /// Deliver pending vectors that are no longer masked.
@@ -624,7 +623,7 @@ mod tests {
     }
 
     fn device() -> Transport<Echo> {
-        Transport::new(1, Echo { cfg: [1, 2, 3, 4, 5, 6, 7, 8], kicked: 0, resets: 0, accepted: 0 })
+        Transport::new(1, pci::MMIO_BASE, Echo { cfg: [1, 2, 3, 4, 5, 6, 7, 8], kicked: 0, resets: 0, accepted: 0 })
     }
 
     #[test]
@@ -701,7 +700,7 @@ mod tests {
         t.poll(&mem, 1 << 1, &mut out);
         assert_eq!(mem.read::<u16>(0x3000 + 2), 1, "used");
         assert_eq!(irqs.len(), 1);
-        assert!(matches!(irqs[0], Irq::Msi(m) if m.vector == 0x41 && m.dest == 1));
+        assert_eq!(irqs[0], Irq::Msi { addr: 0xfee0_1000, data: 0x41 });
         // Masked: pending, then delivered when unmasked.
         let mut irqs = Vec::new();
         t.write(&mem, 2, 28, 4, 1, &mut |i| irqs.push(i));

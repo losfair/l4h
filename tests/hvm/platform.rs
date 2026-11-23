@@ -411,7 +411,7 @@ fn guest_boots_and_uses_the_machine() {
     let ram = map(0, RAM as usize);
     let mapped: &'static [std::sync::atomic::AtomicU64] =
         Vec::leak((0..abi::MAX_BLOCKS / 64).map(|_| std::sync::atomic::AtomicU64::new(u64::MAX)).collect());
-    let mem = GuestMem { base: ram, low: RAM, high: 0, mapped, map: sys::map };
+    let mem = GuestMem { base: ram, ram_base: 0, low: RAM, high: 0, mapped, map: sys::map };
 
     // dom0 loaded a kernel at 40 MiB and an initrd at 48 MiB.
     let kernel = bzimage(b"payload!");

@@ -1,14 +1,17 @@
-//! PCI configuration space (DESIGN.md §5.11): bus 0, through ECAM at
-//! 0xe000_0000 (MCFG) and the legacy 0xcf8/0xcfc ports.  Its functions
-//! are the host bridge at 00:00.0 and a virtio device at each of 00:01.0
-//! and up, whose BARs the "firmware" (we) assigns in the 32-bit window
-//! [0xc000_0000, 0xe000_0000).  Only the I/O thread touches it.  Free of
-//! seL4.
+//! PCI configuration space (DESIGN.md §5.11): bus 0, through ECAM (on
+//! x86-64 at 0xe000_0000, in the MCFG, and the legacy 0xcf8/0xcfc ports; on
+//! AArch64 where hvm::arm has it).  Its functions are the host bridge at
+//! 00:00.0 and a virtio device at each of 00:01.0 and up, whose BARs the
+//! "firmware" (we) assigns in a 32-bit window.  Only the I/O thread
+//! touches it.  Free of seL4.
 
+#[cfg(target_arch = "x86_64")]
 pub const ECAM_BASE: u64 = 0xe000_0000;
 /// Bus 0's 32 devices of 8 functions, 4 KiB each.
 pub const ECAM_SIZE: u64 = 1 << 20;
+#[cfg(target_arch = "x86_64")]
 pub const MMIO_BASE: u64 = 0xc000_0000;
+#[cfg(target_arch = "x86_64")]
 pub const MMIO_SIZE: u64 = 0x2000_0000;
 /// Each device's share of the window: its BARs.
 pub const SLOT_MMIO: u64 = 0x10_0000;
@@ -27,6 +30,7 @@ const INT_PIN: usize = 0x3d;
 pub const CMD_MEM: u16 = 1 << 1;
 pub const CMD_INTX_DISABLE: u16 = 1 << 10;
 
+#[cfg(target_arch = "x86_64")]
 /// The legacy configuration address (0xcf8) as an ECAM offset of bus 0,
 /// with the byte `port` (0xcfc-0xcff) selects: None if it is disabled,
 /// or names another bus.
@@ -200,12 +204,14 @@ pub fn host_bridge() -> Config {
     Config::new(0x1b36, 0x0008, 0, 0x06_0000, (0x1af4, 0x1100), 0)
 }
 
+#[cfg(target_arch = "x86_64")]
 /// The GSI of slot `slot`'s INTx pin `pin` (1-4), as the DSDT's _PRT
 /// routes it: the I/O APIC's pins 16-23.
 pub const fn intx_gsi(slot: usize, pin: u8) -> usize {
     16 + (slot + pin as usize - 1) % 8
 }
 
+#[cfg(target_arch = "x86_64")]
 /// The level of GSI `gsi`, which the INTA# of every slot routed to it
 /// drives, wired-OR: `asserted` has a bit for each slot asserting it.
 pub fn intx_level(asserted: u32, gsi: usize) -> bool {

@@ -7,7 +7,7 @@
 //! queue notifications (KICK), backend completions (DONE), vmmgr's console
 //! input and power requests (CTL), console output and its timer (CONSOLE).
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::Ordering;
 
 use l4h_abi as abi;
 use l4h_rt::host::{self, hvm as hv};
@@ -73,11 +73,11 @@ pub fn init() {
                 } else {
                     (0, None)
                 };
-                Dev::Blk(Transport::new(slot, Blk::new(chan, kick, hv::IO_POOL_VA, cfg.io_pool_gpa, pool, cfg.guest_id, vm.tsc_hz, vm::now)))
+                Dev::Blk(Transport::new(slot, vm::PCI_MMIO_BASE, Blk::new(chan, kick, hv::IO_POOL_VA, cfg.io_pool_gpa, pool, cfg.guest_id, vm.tsc_hz, vm::now)))
             }
             host::VDEV_NET => {
                 let kick = sys::kick(d.chan_kick_slot);
-                Dev::Net(Transport::new(slot, Net::new(d.chan_va as usize, kick, d.mac[..6].try_into().unwrap(), vm.tsc_hz / 1_000_000 * NET_POLL_US)))
+                Dev::Net(Transport::new(slot, vm::PCI_MMIO_BASE, Net::new(d.chan_va as usize, kick, d.mac[..6].try_into().unwrap(), vm.tsc_hz / 1_000_000 * NET_POLL_US)))
             }
             k => panic!("l4h-hvm: device kind {}", k),
         };
@@ -88,20 +88,12 @@ pub fn init() {
 /// How long a network queue that ran dry is polled (Net::keep_polling).
 const NET_POLL_US: u64 = 50;
 
-/// The slots asserting INTA#, a bit each (the I/O thread's only).
-static INTX: AtomicU32 = AtomicU32::new(0);
-
 /// What a device's interrupt does: an MSI, or its INTA#, which shares a
-/// GSI with others (pci::intx_level).
+/// line with others'.  The machine (vm.rs) routes both.
 fn irq(slot: usize) -> impl FnMut(Irq) {
     move |i| match i {
-        Irq::Msi(m) => vm().deliver(&m),
-        Irq::Intx(level) => {
-            let bit = 1u32 << slot;
-            let asserted = if level { INTX.fetch_or(bit, Ordering::Relaxed) | bit } else { INTX.fetch_and(!bit, Ordering::Relaxed) & !bit };
-            let gsi = pci::intx_gsi(slot, 1);
-            vm().set_line(gsi, pci::intx_level(asserted, gsi));
-        }
+        Irq::Msi { addr, data } => vm().msi(addr, data),
+        Irq::Intx(level) => vm().set_intx(slot, level),
     }
 }
 
@@ -206,18 +198,12 @@ pub fn completed() {
 pub fn control() {
     let vm = vm();
     match console::power_request() {
-        Some(abi::POWER_OFF) => {
-            // The guest's ACPI shuts it down when it sees the button (it
-            // sees it once it enables the event).
-            if vm.pm.power_button() {
-                vm.sync_sci();
-            }
-        }
+        // The guest shuts down when it sees its power button.
+        Some(abi::POWER_OFF) => vm.power_button(),
         Some(_) => sys::power(abi::POWER_REBOOT),
         None => {}
     }
-    vm.uart_stale.store(true, Ordering::SeqCst);
-    vm::wake(0);
+    vm.console_input();
 }
 
 /// Console output to pass on, and the timer for a partial line.

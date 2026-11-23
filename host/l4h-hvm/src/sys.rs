@@ -43,6 +43,7 @@ pub fn signal_io(badge: u64) {
 }
 
 /// Take vCPU `v`'s notification if it is signalled, without waiting.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))] // x86-64's vCPU loop
 pub fn poll(v: usize) {
     let _ = cap::<cap_type::Notification>(hv::SLOT_VCPU_WAIT + v as u64).poll();
 }
@@ -89,6 +90,13 @@ pub fn map(b: usize) -> bool {
         None => crate::ept::map_block(b),
         Some(_) => io_thread().map(b).is_ok(),
     }
+}
+
+/// Make what l4h-hvm wrote at [gpa, gpa + len) of RAM visible to a guest
+/// with its caches off (arm/stage2.rs).
+#[cfg(target_arch = "aarch64")]
+pub fn clean_range(gpa: u64, len: u64) -> sel4::Result<()> {
+    crate::ept::clean_range(gpa, len)
 }
 
 /// The guest stops (abi::POWER_*): vmmgr stops every thread of ours, the

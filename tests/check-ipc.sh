@@ -17,8 +17,10 @@ if [ "$arch" = aarch64 ]; then
 fi
 lint=(-A clippy::all -D clippy::disallowed_methods)
 hvm=()
-# l4h-hvm only builds against a kernel with VT-x/AMD-V.
+# l4h-hvm only builds against a kernel with VT-x/AMD-V, or FL4's AArch64 VCPUs.
 if [ "$arch" = x86_64 ] && grep -q '^#define CONFIG_VTX  *1$' "${SEL4_PREFIX:-$root/build/sel4}/libsel4/include/kernel/gen_config.h" 2>/dev/null; then
+    hvm=(-p l4h-hvm)
+elif [ "$arch" = aarch64 ] && grep -q seL4_ARM_Stage2VSpaceObject "$SEL4_PREFIX/libsel4/include/sel4/arch/objecttype.h" 2>/dev/null; then
     hvm=(-p l4h-hvm)
 fi
 cargo clippy -q --target "$arch-sel4" -p l4h-ipc -p l4h-task -p l4h-rt -p l4h-vmm -p l4h-blkd -p l4h-netd \

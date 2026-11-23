@@ -70,6 +70,30 @@ mod aarch64 {
         }
     }
 
+    /// Make the tables a 2 MiB mapping at `vaddr` (1 GiB aligned) goes in,
+    /// in `vspace` (a VSpace or a Stage-2 root), for its owner to map 2 MiB
+    /// frames there without objects to make tables from (l4h-hvm's guest
+    /// RAM).  A table lands at the first level a walk finds empty, one too
+    /// many would be a last-level table where a block goes, so `probe` (a
+    /// large frame mapped nowhere) tries the mapping, and is unmapped.  No
+    /// leaf may be at `vaddr`: FL4 replaces one in a Stage-2 root.
+    pub fn ensure_large_page_tables(ctx: &mut ObjCtx, vspace: cap::VSpace, vaddr: usize, probe: cap::LargePage) {
+        loop {
+            match probe.frame_map(vspace, vaddr, CapRights::read_write(), VmAttributes::DEFAULT) {
+                Ok(()) => {
+                    probe.frame_unmap().unwrap_or_else(|e| panic!("probe unmap({:#x}) failed: {:?}", vaddr, e));
+                    return;
+                }
+                Err(e) if is_failed_lookup(e) => {
+                    let pt = ctx.cap::<cap_type::PT>(PT_BP);
+                    pt.pt_map(vspace, vaddr, VmAttributes::DEFAULT)
+                        .unwrap_or_else(|e| panic!("pt_map({:#x}) failed: {:?}", vaddr, e));
+                }
+                Err(e) => panic!("probe map({:#x}) failed: {:?}", vaddr, e),
+            }
+        }
+    }
+
     /// x86_64's TLB bitmaps have no counterpart: seL4 invalidates the
     /// TLBs of all cores with broadcast instructions, without IPIs.
     pub fn flush_tlb_bitmap(_vspace: cap::VSpace) {}

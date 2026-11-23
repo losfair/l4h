@@ -1,6 +1,6 @@
 #!/bin/sh
 # Init of the HVM guests tests/guest/init-hvmtest creates: an unmodified
-# x86-64 Linux with virtio-pci devices and a 16550 console.  Kernel
+# Linux with virtio-pci devices and its platform's UART.  Kernel
 # command line variables (init's environment):
 #   DISK   write: write a pattern to /dev/vda; check: find it there
 #   IP0    eth0's address/prefix; PING an address to ping on it
@@ -10,7 +10,7 @@ mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev 2>/dev/null
 echo "HVMVM: up, kernel $(uname -r), cpus $(grep -c ^processor /proc/cpuinfo)"
 echo "HVMVM: clock $(cat /sys/devices/system/clocksource/clocksource0/current_clocksource), date $(date -u +%Y)"
-# The ACPI power button (l4hctl shutdown): power off, as a distribution's
+# The power button (l4hctl shutdown; ACPI's, or gpio-keys'): power off, as a distribution's
 # logind or acpid would.
 for i in /sys/class/input/input*; do
     [ "$(cat "$i/name" 2>/dev/null)" = "Power Button" ] || continue

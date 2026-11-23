@@ -1167,12 +1167,14 @@ a backend in `arch/l4h/kvm/arm64` (patch `0019-kvm-arm64-on-l4h.patch`):
   MMIO, PSCI, dirty logging, ONE_REG, SMP, the vgic and the timer, then a
   2-vCPU Linux under Firecracker and cloud-hypervisor.
 
-### 5.11 HVM guests: unmodified x86-64 kernels
+### 5.11 HVM guests: unmodified kernels
 
 Where the CPU has VT-x or AMD-V, a VM can instead be an **HVM guest**:
 an unmodified x86-64 kernel (a distribution's bzImage, or an ELF
 `vmlinux`) in hardware guest mode, on a small virtual PC with standard
-devices. `l4hctl create NAME --hvm --kernel F [--initrd F] [--mem MB]
+devices. On AArch64, under FL4 at EL2, it is an unmodified arm64 kernel
+on a small `virt`-like board (*AArch64* below); what follows is
+x86-64's unless that section says otherwise. `l4hctl create NAME --hvm --kernel F [--initrd F] [--mem MB]
 [--vcpus N] [--cmdline S] [--disk ...] [--nic ...] [--io-pool MB]`
 (`CTL_VM_CREATE` args[5] `VM_CREATE_HVM`; the kernel is loaded with
 `CTL_VM_LOAD` and named by `CTL_VM_START` args[3..5]). HVM guests have no
@@ -1277,6 +1279,54 @@ create fails with `-ENODEV`. `l4hctl list` shows them as `hvm`.
   `hw/svm.rs`), chosen by CPUID's vendor, over seL4's VMCS and VMCB
   accessors; the guest's FPU state is seL4's (l4h-hvm itself never uses
   it), XCR0 goes through `VCPU_WriteMSR`.
+- **AArch64.** The same monitor (`l4h-hvm`: its I/O thread, RAM, virtio
+  and PCI are shared; `arm/` has the rest) on FL4's EL2 primitives, where
+  `vtx` is set and the GIC is v3, or v2 with its GICV frames; otherwise
+  `-ENODEV`.
+  - *vCPUs.* `seL4_ARM_VCPU_Run` refuses the VCPU's own thread as caller,
+    so each vCPU has two TCBs: the **runner**, a thread of l4h-hvm with
+    the vCPU's SC and notification, and the **guest TCB**, which vmmgr
+    keeps: bound to the VCPU, VSpace the Stage-2 root, an empty CSpace, FP
+    on, no SC, never resumed. l4h-hvm holds the runner and the VCPU
+    (`wiring::HVM_HELD`), not the guest TCB. Registers travel by group
+    through the state area of the runner's IPC buffer, only those that
+    changed.
+  - *Memory.* Device space below 1 GiB, RAM in one range from
+    `0x4000_0000` (`hvm::arm`), in 2 MiB Stage-2 blocks mapped on first
+    touch as on x86-64. FL4 replaces a Stage-2 leaf that is already
+    there, so vmmgr builds the intermediate tables by probing only where
+    no block is. What l4h-hvm loads is cleaned to the PoC for a guest
+    that starts with its caches off, and a new block is made coherent for
+    instruction fetch unless `CTR_EL0` has IDC and DIC.
+  - *Boot.* An arm64 `Image` or AArch64 ELF `vmlinux` runs from
+    `0x4020_0000` plus its text offset; a device tree built without a heap
+    sits in the first block. vCPU 0 starts at EL1h with x0 at the tree,
+    the others are off until PSCI's `CPU_ON`.
+  - *GIC.* A software distributor over the hardware's virtual CPU
+    interface: GICv3 (redistributors, MBI at `GICD_SETSPI_NSR`, SGIs by
+    the trapped `ICC_SGI1R_EL1`) or GICv2 (`ITARGETSR`, `SGIR`, GICv2m; the
+    host's GICV frames are mapped at the guest's GICC). The I/O thread
+    raises interrupts through atomics alone; the vCPU threads share the
+    rest under one leaf lock, never held across an entry, a wait or a
+    signal, and bring in what was raised each time they take it. Each vCPU
+    thread fills its own list registers: a level-sensitive interrupt asks
+    for a maintenance interrupt at EOI, to sample its line again; an edge
+    arriving while it is held sets its list register's pending state; when
+    list registers run out, the underflow interrupt brings the thread back.
+    A vCPU reading or changing pending or active state another's list
+    registers may hold first keeps that vCPU out of its guest. It waits
+    only for vCPUs in their guests, which a signal makes leave, so these
+    waits cannot form a cycle.
+  - *Platform.* PSCI 1.0 and SMCCC 1.1 over HVC or SMC, the virtual timer
+    (PPI 27, kept masked at the host's GIC while its line is high), WFI
+    trapped to wait on an seL4 timer, a PL011 console, a PL031 RTC, and a
+    PL061 whose pin 3 is the power button (`gpio-keys`): `l4hctl shutdown`
+    presses it, and the guest's PSCI `SYSTEM_OFF` ends it. `CPU_SUSPEND`
+    offers standby only (a power-down or reserved `power_state` is
+    `INVALID_PARAMS`); `SYSTEM_RESET2` is not offered; `SYSTEM_RESET` ends
+    the guest as a reboot (`POWER_REBOOT`), and what follows is
+    `l4h-vmmgr`'s policy for a guest that ended. `HCR_EL2.TID3` hides from
+    the ID registers what FL4 does not switch for a guest.
 - **Not yet.** HVM guests have no launch digest (§10.2): they are not
   measured, attested or sealed, and the l4h hypercalls are not theirs.
 - **Tests.** `tests/run-hvmunit.sh` tests the device models, the decoder,
@@ -1286,7 +1336,10 @@ create fails with `-ENODEV`. `l4hctl list` shows them as `hvm`.
   `tests/run-hvmtest.sh` boots an unmodified Linux (built by
   `tools/build-linux-hvm.sh`) with two vCPUs, a disk, a NIC and its
   console, shuts it down by ACPI and destroys a running one, checking the
-  host gets all its memory back.
+  host gets all its memory back. `tests/run-hvmtest-arm64.sh` does the
+  same on FL4 under QEMU's TCG, on GICv3 and on GICv2
+  (`L4H_QEMU_GIC_VERSION`), and checks that at EL1
+  (`L4H_QEMU_VIRTUALIZATION=off`) HVM guests are refused.
 
 ---
 
@@ -6316,8 +6369,9 @@ machine and guests of 256–512 MiB.
 | `tests/run-blktest.sh` (`BLKTEST_DEV=nvme`, `scsi`, `scsi-legacy`, `scsi-luns`, `virtio-legacy`, `ahci`, `ahci-disks`) | disk windows and data integrity; AHCI adds static ATA ports behind an ATAPI device, parallel I/O and independent disks |
 | `tests/run-sharedblk.sh` | shared controllers: concurrent clients, windows, provisioning, destroy during I/O |
 | `tests/run-lvmblk.sh` | LVM linear volumes as extent disks: dm-linear agreement, split requests, overlap and provisioning refusal (needs `lvm2` on the build host) |
-| `tests/run-hvmunit.sh` | HVM guests' device models without seL4: decoder (illegal encodings included), page walker, bzImage/ELF loading, zero page and E820, ACPI checksums, ECAM, virtio-pci and MSI-X, local APIC/x2APIC/I/O APIC, UART, RTC, PIT, CPUID, I/O pool bounce and backpressure, hostile queue addresses; and the whole machine (vCPU and I/O thread code, blkd and netd modelled) under a scripted guest: boot state, CPUID/MSRs, PCI enumeration, virtio-blk and virtio-net with MSI-X, INIT/SIPI, the UART both ways, the ACPI power button and S5 |
+| `tests/run-hvmunit.sh` | HVM guests' device models without seL4: decoder (illegal encodings included), page walker, bzImage/ELF loading, zero page and E820, ACPI checksums, ECAM, virtio-pci and MSI-X, local APIC/x2APIC/I/O APIC, UART, RTC, PIT, CPUID, I/O pool bounce and backpressure, hostile queue addresses; and the whole machine (vCPU and I/O thread code, blkd and netd modelled) under a scripted guest: boot state, CPUID/MSRs, PCI enumeration, virtio-blk and virtio-net with MSI-X, INIT/SIPI, the UART both ways, the ACPI power button and S5; on AArch64 (GICv3 and GICv2) the GIC, PSCI, system registers, PL011, PL031, PL061, the device tree and Image/ELF loading, and the whole machine likewise |
 | `tests/run-hvmtest.sh` | an unmodified x86-64 Linux as an HVM guest (§5.11): SMP, virtio-blk write and read back, virtio-net, console output and input, ACPI shutdown, destroy while running, memory reclaim; needs nested VT-x or AMD-V under KVM (QEMU's TCG SVM lacks the next-RIP saving seL4 requires), and otherwise checks that HVM guests are refused (`-ENODEV`) and skips |
+| `tests/run-hvmtest-arm64.sh` | the same on AArch64: an unmodified arm64 Linux on FL4 at EL2 under QEMU's TCG, with GICv3 or GICv2 (`L4H_QEMU_GIC_VERSION`), shutdown by the PL061 power button and PSCI; at EL1 (`L4H_QEMU_VIRTUALIZATION=off`), that HVM guests are refused (`-ENODEV`) |
 | `tests/run-ctltest.sh` | VM lifecycle, console, clean shutdown, disk re-attach, windows, reclaim |
 | `tests/run-devicelimit.sh` | 64 devices per guest |
 | `tests/run-gputest.sh` | virtio-gpu drawing, screenshots, size checks and reclaim |

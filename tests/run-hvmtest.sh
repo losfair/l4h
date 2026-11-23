@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# HVM guests (DESIGN.md §5.11): dom0 runs an unmodified x86-64 Linux
+# HVM guests (DESIGN.md §5.11; on AArch64, tests/run-hvmtest-arm64.sh):
+# dom0 runs an unmodified x86-64 Linux
 # (tools/build-linux-hvm.sh) in VT-x or AMD-V guest mode, with 2 vCPUs, a
 # virtio-blk disk (written, then read back by a second guest), a virtio-net
 # NIC (pinging a PV guest on its switch), its 16550 console (output and
@@ -16,7 +17,7 @@
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 source "$root/tools/guest-env.sh"
-[ "${L4H_ARCH:-x86_64}" = x86_64 ] || { echo "HVMTEST: x86_64 only"; exit 0; }
+[ "${L4H_ARCH:-x86_64}" = x86_64 ] || exec "$root/tests/run-hvmtest-arm64.sh" "$@"
 out=$root/build/guest
 mkdir -p "$out"
 "$root/tools/build-linux.sh" vmlinux >"$root/build/linux-build.log" 2>&1 \
@@ -50,7 +51,7 @@ L4H_QEMU_ARGS="-drive file=$out/hvm.img,if=none,id=d0,format=raw -device virtio-
     "$root/tools/run-dom0.sh" "$out/hvmtest.cpio.gz" "console=hvc0 L4H_TEST_SLOW=$slow" ${HVMTEST_TIMEOUT:-$((900 * slow))} \
     | grep -aE "HVMTEST|HVMVM|NETVM|l4hctl|vm [0-9]|l4h-hvm|panic|l4h-vmmgr: guest|svm|vmx" || true
 [ -s "$hvm_elf" ] || { echo "HVMTEST: FAIL: no l4h-hvm built into vmmgr ($hvm_elf)"; exit 1; }
-if grep -aq "HVMTEST: no VT-x or AMD-V" "$root/build/qemu.log"; then
+if grep -aq "HVMTEST: no hardware virtualization" "$root/build/qemu.log"; then
     if [ "$require_hw" = 1 ]; then
         echo "HVMTEST: FAIL: VT-x or AMD-V is there, but HVM guests were refused"
         exit 1

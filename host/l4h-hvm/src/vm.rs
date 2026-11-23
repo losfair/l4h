@@ -25,6 +25,9 @@ use crate::guest::GuestMem;
 use crate::sync::{Global, SpinLock};
 pub use crate::sys::{me, now, set_me, signal_io};
 
+/// Where the PCI devices' BARs start.
+pub const PCI_MMIO_BASE: u64 = hv::PCI_MMIO_BASE;
+
 /// What the host CPU gives the guest, as its CPUID shows it.
 #[derive(Clone, Copy, Debug)]
 pub struct Host {
@@ -71,6 +74,8 @@ pub struct Vm {
     pub bar0: [AtomicU64; 32],
     pub ioapic: SpinLock<IoApic>,
     pub lines: AtomicU32,
+    /// The slots asserting INTA#, a bit each (the I/O thread's only).
+    intx: AtomicU32,
     pub ioapic_stale: AtomicBool,
     pub uart: SpinLock<Uart>,
     pub uart_stale: AtomicBool,
@@ -148,6 +153,7 @@ pub fn build(cfg: &'static HvmConfig, tsc_hz: u64, mem: GuestMem, host: Host) ->
         bar0: [const { AtomicU64::new(0) }; 32],
         ioapic: SpinLock::new(IoApic::new()),
         lines: AtomicU32::new(0),
+        intx: AtomicU32::new(0),
         ioapic_stale: AtomicBool::new(false),
         uart: SpinLock::new(Uart::new()),
         uart_stale: AtomicBool::new(false),
@@ -172,6 +178,16 @@ pub fn vm() -> &'static Vm {
     VM.get()
 }
 
+/// What the guest runs on, for the log.
+pub fn platform() -> &'static str {
+    if vm().amd { "AMD-V" } else { "VT-x" }
+}
+
+/// Where vCPU 0 starts, for the log.
+pub fn entry_pc() -> u64 {
+    vm().entry.rip
+}
+
 /// Wake vCPU `v`'s thread: out of seL4_VMEnter, or out of HLT.
 pub fn wake(v: usize) {
     if me() != Some(v) {
@@ -183,6 +199,35 @@ impl Vm {
     /// Deliver an interrupt message.
     pub fn deliver(&self, m: &Message) {
         apic::deliver(&self.apics[..self.vcpus], m, me(), wake);
+    }
+
+    /// An MSI-X message a device sent (the I/O thread).
+    pub fn msi(&self, addr: u64, data: u32) {
+        if let Some(m) = Message::msi(addr, data) {
+            self.deliver(&m);
+        }
+    }
+
+    /// Slot `slot`'s INTA#, which shares a GSI with others (the I/O thread).
+    pub fn set_intx(&self, slot: usize, level: bool) {
+        let bit = 1u32 << slot;
+        let asserted = if level { self.intx.fetch_or(bit, Ordering::Relaxed) | bit } else { self.intx.fetch_and(!bit, Ordering::Relaxed) & !bit };
+        let gsi = crate::dev::pci::intx_gsi(slot, 1);
+        self.set_line(gsi, crate::dev::pci::intx_level(asserted, gsi));
+    }
+
+    /// dom0 asked to shut the guest down: its ACPI does when it sees the
+    /// power button (it sees it once it enables the event).
+    pub fn power_button(&self) {
+        if self.pm.power_button() {
+            self.sync_sci();
+        }
+    }
+
+    /// vmmgr wrote console input: vCPU 0 gives it to the UART.
+    pub fn console_input(&self) {
+        self.uart_stale.store(true, Ordering::SeqCst);
+        wake(0);
     }
 
     /// Set interrupt line (I/O APIC pin) `pin` to `level`.

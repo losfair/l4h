@@ -1,4 +1,5 @@
-//! An HVM guest's console is its UART (dev/uart.rs).  What it transmits a
+//! An HVM guest's console is its UART (dev/uart.rs on x86-64, arm/pl011.rs
+//! on AArch64, both over `ConsoleIo`).  What it transmits a
 //! vCPU thread writes into the console ring vmmgr reads (CTL_CONSOLE_READ),
 //! under a short lock, and the I/O thread passes on to the host's serial
 //! output by lines, a partial line after 100 ms (as l4h-vmm's console.rs).
@@ -11,7 +12,6 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
 use l4h_abi as abi;
 use l4h_rt::host::{self, badges, hvm as hv};
 
-use crate::dev::uart;
 use crate::sync::SpinLock;
 
 const LINE_SIZE: usize = 1024;
@@ -133,6 +133,15 @@ impl Serial {
     }
 }
 
+/// Where a UART's bytes go and come from.
+pub trait ConsoleIo {
+    fn transmit(&mut self, b: u8);
+    /// The next received byte, if any, without taking it.
+    fn peek(&mut self) -> Option<u8>;
+    /// Take the byte `peek` gave.
+    fn take(&mut self);
+}
+
 /// The UART's input: the console page, which vmmgr writes.
 pub struct Input;
 
@@ -140,7 +149,7 @@ fn page() -> *mut abi::ConsolePage {
     hv::CONSOLE_PAGE_VA as *mut abi::ConsolePage
 }
 
-impl uart::Io for Input {
+impl ConsoleIo for Input {
     fn transmit(&mut self, b: u8) {
         crate::vm::vm().console.put(b);
     }

@@ -1,7 +1,8 @@
 //! l4h-hvm: an HVM guest's machine monitor (DESIGN.md §5.11, l4h_host::hvm).
-//! It boots an unmodified x86-64 Linux kernel in VT-x or AMD-V guest mode
-//! on seL4 VCPUs, and gives it a PC: local APICs, an I/O APIC, a UART, an
-//! RTC, a PIT, ACPI, and virtio-blk and virtio-net devices on PCI over
+//! It boots an unmodified Linux kernel in hardware guest mode on seL4 VCPUs:
+//! on x86-64 (VT-x or AMD-V) with a PC's local APICs, I/O APIC, UART, RTC,
+//! PIT and ACPI, on AArch64 (FL4 at EL2) with a GIC, PSCI, PL011, PL031 and
+//! PL061 (arm/); on both with virtio-blk and virtio-net devices on PCI over
 //! blkd and netd.  Its main thread is the I/O thread (io.rs); each vCPU has
 //! a thread of its own (vcpu.rs).  No heap.
 
@@ -9,11 +10,15 @@
 #![no_main]
 #![feature(thread_local)]
 
+#[cfg(target_arch = "x86_64")]
 mod acpi;
+#[cfg(target_arch = "x86_64")]
 mod boot;
 mod console;
 mod dev;
+#[cfg(target_arch = "x86_64")]
 mod ept;
+#[cfg(target_arch = "x86_64")]
 mod hw;
 mod io;
 mod iopool;
@@ -21,9 +26,18 @@ mod mem;
 mod serve;
 mod sync;
 mod sys;
+#[cfg(target_arch = "x86_64")]
 mod vcpu;
+#[cfg(target_arch = "x86_64")]
 mod vm;
+#[cfg(target_arch = "x86_64")]
 mod x86;
+
+/// The AArch64 machine, under the names the shared code uses.
+#[cfg(target_arch = "aarch64")]
+mod arm;
+#[cfg(target_arch = "aarch64")]
+use arm::{stage2 as ept, vcpu, vm};
 
 /// l4h-vmm's virtqueues (l4h-vmm/src/virtq.rs), over guest RAM here: as
 /// l4h-vmm has them (its style is l4h-vmm's).
@@ -70,18 +84,26 @@ fn main(info: &'static Info) -> ! {
     for b in 0..(cfg.boot_blocks as usize).min(blocks) {
         MAPPED[b / 64].fetch_or(1 << (b % 64), Ordering::Relaxed);
     }
-    let mem = guest::GuestMem { base: hv::RAM_VA, low: cfg.low_ram, high: cfg.high_ram, mapped: &MAPPED, map: sys::map };
+    let mem = guest::GuestMem { base: hv::RAM_VA, ram_base: cfg.ram_base, low: cfg.low_ram, high: cfg.high_ram, mapped: &MAPPED, map: sys::map };
     // Mapping works before the machine is made: loading the kernel maps.
+    #[cfg(target_arch = "x86_64")]
     ept::init(mem, cfg.block_radix, cfg.guest_id);
-    vcpu::read_host_cpuid();
-    let mut host = vm::Host::of(&vcpu::host_cpuid);
-    host.xcr0 = hw::probe_xcr0(hv::SLOT_VCPU_OBJ, host.xcr0);
-    let amd = host.amd;
-    // The kernel, its boot parameters and the ACPI tables.
-    if let Err(e) = vm::build(cfg, tsc_hz, mem, host) {
+    #[cfg(target_arch = "aarch64")]
+    ept::init(mem, cfg.block_radix, cfg.guest_id, cfg.arm_virt.ctr_el0);
+    // The kernel, its boot parameters and the platform's description.
+    #[cfg(target_arch = "x86_64")]
+    let made = {
+        vcpu::read_host_cpuid();
+        let mut host = vm::Host::of(&vcpu::host_cpuid);
+        host.xcr0 = hw::probe_xcr0(hv::SLOT_VCPU_OBJ, host.xcr0);
+        vm::build(cfg, tsc_hz, mem, host)
+    };
+    #[cfg(target_arch = "aarch64")]
+    let made = vm::make(cfg, tsc_hz, mem);
+    if let Err(e) = made {
         stop(format_args!("guest {}: kernel image at {:#x}: {:?}", cfg.guest_id, cfg.kernel_gpa, e));
     }
-    l4h_rt::info!("l4h-hvm: guest {}: {} vCPU(s) on {}, entry {:#x}", cfg.guest_id, vcpus, if amd { "AMD-V" } else { "VT-x" }, vm::vm().entry.rip);
+    l4h_rt::info!("l4h-hvm: guest {}: {} vCPU(s) on {}, entry {:#x}", cfg.guest_id, vcpus, vm::platform(), vm::entry_pc());
 
     // Disk channels announce themselves ready (their capacity known), as
     // to a VMM.

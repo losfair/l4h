@@ -1,5 +1,5 @@
-//! No HVM guests: the kernel has no VT-x support, or is not x86_64
-//! (hvm.rs).  Nothing here is reached: `available` is false, so the
+//! No HVM guests: the kernel has no VT-x support, or is an AArch64 kernel
+//! without FL4's VCPUs (hvm.rs).  Nothing here is reached: `available` is false, so the
 //! control API refuses HVM guests (ENODEV), and no guest has `Hvm`.
 
 use l4h_host::errno::Errno;
