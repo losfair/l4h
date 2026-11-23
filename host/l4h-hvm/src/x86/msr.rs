@@ -3,7 +3,8 @@
 //! hw.rs) and the local APIC (APIC_BASE, TSC_DEADLINE, x2APIC): MTRRs
 //! (kept, with write-back the default; the EPT decides memory types),
 //! MISC_ENABLE, FEATURE_CONTROL, DEBUGCTL, microcode and machine-check
-//! registers that read as nothing, and AMD's HWCR, DE_CFG and VM_CR.  Any
+//! registers that read as nothing, and AMD's HWCR, DE_CFG and VM_CR; vcpu.rs
+//! has kvmclock's two (x86/pvclock.rs).  Any
 //! other MSR is #GP(0), as on a CPU without it (DESIGN.md §5.11).  Free of
 //! seL4.
 

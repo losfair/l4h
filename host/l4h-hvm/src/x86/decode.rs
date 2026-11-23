@@ -728,6 +728,8 @@ mod tests {
         assert_eq!(l(&[0xf4]), Some(1), "HLT");
         assert_eq!(l(&[0xf3, 0x90]), Some(2), "PAUSE");
         assert_eq!(l(&[0x0f, 0x01, 0xd1]), Some(3), "XSETBV");
+        assert_eq!(l(&[0x0f, 0x01, 0xd9]), Some(3), "VMMCALL");
+        assert_eq!(l(&[0x0f, 0x01, 0xc1]), Some(3), "VMCALL");
         assert_eq!(l(&[0x0f, 0x01, 0x3c, 0x24]), Some(4), "INVLPG [rsp]");
         assert_eq!(l(&[0x0f, 0x01, 0xb8, 0x44, 0x33, 0x22, 0x11]), Some(7), "INVLPG [rax+disp32]");
         assert_eq!(l(&[0x0f, 0x22, 0xd8]), Some(3), "MOV CR3, rax");

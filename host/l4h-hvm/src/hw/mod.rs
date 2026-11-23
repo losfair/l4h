@@ -64,8 +64,10 @@ pub enum Exit {
     Exception { vector: u8, error: Option<u32>, dr6: u64 },
     /// Triple fault (shutdown).
     Shutdown,
-    /// VMCALL or VMMCALL, MONITOR or MWAIT, RDTSCP, VMX or SVM
-    /// instructions: #UD for the guest.
+    /// VMCALL or VMMCALL: a KVM hypercall, none of which we have.
+    Hypercall,
+    /// MONITOR or MWAIT, RDTSCP, VMX or SVM instructions: #UD for the
+    /// guest.
     Undefined,
     /// INVD, WBINVD, PAUSE, INVLPG: nothing to do but skip.
     Nop,

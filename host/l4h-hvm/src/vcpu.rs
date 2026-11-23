@@ -19,7 +19,7 @@ use crate::dev::{ioapic, pci, pm, uart};
 use crate::hw::{Event, Exit, Hw};
 use crate::vm::{self, vm};
 use crate::x86::decode::{self, Kind, Mode, Seg};
-use crate::x86::{cpuid, msr, walk};
+use crate::x86::{cpuid, msr, pvclock, walk};
 
 const VEC_DB: u8 = 1;
 const VEC_UD: u8 = 6;
@@ -96,6 +96,11 @@ pub struct Vcpu<H: Hw> {
     lapic: Lapic,
     msrs: msr::Msrs,
     tsc_offset: u64,
+    /// MSR_KVM_SYSTEM_TIME_NEW and MSR_KVM_WALL_CLOCK_NEW as written
+    /// (x86/pvclock.rs), and the version of this vCPU's time info.
+    kvm_time: u64,
+    kvm_wall: u64,
+    kvm_version: u32,
     halted: bool,
     wait_sipi: bool,
     nmis: u32,
@@ -127,6 +132,7 @@ impl<H: Hw> Vcpu<H> {
         let vm = vm();
         let mut c = Vcpu {
             id: v, hw, lapic: Lapic::new(v as u32, v == 0, vm.tsc_hz), msrs: msr::Msrs::new(vm.amd), tsc_offset: 0,
+            kvm_time: 0, kvm_wall: 0, kvm_version: 0,
             halted: false, wait_sipi: v != 0, nmis: 0, inject: None, dr: [0; 4], dr6: 0xffff_0ff0, dr7: 0x400, xcr0: 1, armed: 0,
         };
         c.lapic.init(shared(v));
@@ -347,21 +353,28 @@ impl<H: Hw> Vcpu<H> {
                 self.skip();
             }
             Exit::Cr { cr, write, reg } => {
-                let Some(reg) = reg.or_else(|| self.decoded_reg(true)) else { return self.ud() };
+                let decoded = if reg.is_none() { self.fetch_decode().map(|i| i.kind) } else { None };
+                // AMD-V's selective CR0 write also stops an LMSW.
+                if let (0, true, Some(Kind::Lmsw { src: Some(r) })) = (cr, write, decoded) {
+                    let v = self.reg(r) as u16;
+                    return self.lmsw(v);
+                }
+                // The instruction as fetched now: the one that exited, unless
+                // the guest rewrote it meanwhile.
+                let reg = reg.or(match decoded {
+                    Some(Kind::MovCr { write: w, cr: c, reg }) if c == cr && w == write => Some(reg),
+                    _ => None,
+                });
+                let Some(reg) = reg else { return self.ud() };
                 self.cr(cr, write, reg);
             }
             Exit::Clts => {
                 let cr0 = self.hw.cr0() & !CR0_TS;
                 if self.hw.set_cr0(cr0) { self.skip() } else { self.gp() }
             }
-            Exit::Lmsw(v) => {
-                // PE can be set, not cleared.
-                let cr0 = self.hw.cr0();
-                let n = (cr0 & !0xe) | (v as u64 & 0xf) | (cr0 & 1);
-                if self.hw.set_cr0(n) { self.skip() } else { self.gp() }
-            }
+            Exit::Lmsw(v) => self.lmsw(v),
             Exit::Dr { dr, write, reg } => {
-                let Some(reg) = reg.or_else(|| self.decoded_reg(false)) else { return self.ud() };
+                let Some(reg) = reg.or_else(|| self.decoded_dr_reg()) else { return self.ud() };
                 self.dr(dr, write, reg);
             }
             Exit::Exception { vector, error, dr6 } => match vector {
@@ -376,6 +389,16 @@ impl<H: Hw> Vcpu<H> {
             Exit::Shutdown => {
                 l4h_rt::log!("l4h-hvm: guest {} vCPU {}: triple fault at rip {:#x}", vm().cfg.guest_id, self.id, self.hw.rip());
                 self.power(abi::POWER_REBOOT)
+            }
+            // kvmclock's KVM signature (x86/pvclock.rs) makes Linux try
+            // hypercalls whatever the feature bits say (ptp_kvm's
+            // KVM_HC_CLOCK_PAIRING): none is there, as KVM answers one it
+            // does not know (-KVM_ENOSYS; -KVM_EPERM outside ring 0).
+            Exit::Hypercall => {
+                let r: i64 = if self.hw.cpl() != 0 { -1 } else { -1000 };
+                self.hw.gprs()[0] = r as u64;
+                self.hw.mark_gprs();
+                self.skip();
             }
             Exit::Undefined => self.ud(),
             Exit::Nop => self.skip(),
@@ -392,13 +415,22 @@ impl<H: Hw> Vcpu<H> {
         }
     }
 
-    /// The register a MOV to or from CR (DR) names, decoding the
-    /// instruction (AMD-V without decode assists).
-    fn decoded_reg(&mut self, cr: bool) -> Option<u8> {
-        let insn = self.fetch_decode()?;
-        match insn.kind {
-            Kind::MovCr { reg, .. } if cr => Some(reg),
-            Kind::MovDr { reg, .. } if !cr => Some(reg),
+    /// LMSW: PE can be set, not cleared.  Ring 0 only, as cr() checks
+    /// (the CPU does so before the exit; this guards against a quirk).
+    fn lmsw(&mut self, v: u16) {
+        if self.hw.cpl() != 0 {
+            return self.gp();
+        }
+        let cr0 = self.hw.cr0();
+        let n = (cr0 & !0xe) | (v as u64 & 0xf) | (cr0 & 1);
+        if self.hw.set_cr0(n) { self.skip() } else { self.gp() }
+    }
+
+    /// The register a MOV to or from a DR names, decoding the instruction
+    /// (AMD-V without decode assists).  Exit::Cr decodes its own.
+    fn decoded_dr_reg(&mut self) -> Option<u8> {
+        match self.fetch_decode()?.kind {
+            Kind::MovDr { reg, .. } => Some(reg),
             _ => None,
         }
     }
@@ -535,6 +567,8 @@ impl<H: Hw> Vcpu<H> {
                 return Some(if d == 0 { 0 } else { d.wrapping_add(self.tsc_offset) });
             }
             lapic::MSR_APIC_BASE | 0x800..=0x8ff => return self.lapic.rdmsr(sh, vm::now(), m),
+            pvclock::MSR_SYSTEM_TIME => return Some(self.kvm_time),
+            pvclock::MSR_WALL_CLOCK => return Some(self.kvm_wall),
             _ => {}
         }
         if let Some(r) = self.hw.rdmsr(m) {
@@ -549,6 +583,22 @@ impl<H: Hw> Vcpu<H> {
             msr::TSC => {
                 self.tsc_offset = v.wrapping_sub(vm::now());
                 self.hw.set_tsc_offset(self.tsc_offset);
+                // kvmclock's TSC at its time 0 moves with the TSC.  The
+                // time info keeps PVCLOCK_TSC_STABLE_BIT: a guest that set
+                // its vCPUs' TSCs apart would break Linux's vDSO, which
+                // then reads vCPU 0's on every vCPU.  Linux does not, with
+                // the rate known and TSC_ADJUST hidden.
+                self.publish_clock();
+                return true;
+            }
+            pvclock::MSR_SYSTEM_TIME => {
+                self.kvm_time = v;
+                self.publish_clock();
+                return true;
+            }
+            pvclock::MSR_WALL_CLOCK => {
+                self.kvm_wall = v;
+                self.publish_wall_clock();
                 return true;
             }
             lapic::MSR_TSC_DEADLINE | lapic::MSR_APIC_BASE | 0x800..=0x8ff => {
@@ -564,6 +614,35 @@ impl<H: Hw> Vcpu<H> {
             return ok;
         }
         self.msrs.write(m, v).is_some()
+    }
+
+    /// kvmclock: this vCPU's time info where the guest asked for it (bit
+    /// 0 of MSR_KVM_SYSTEM_TIME_NEW on), kvmclock time 0 at the VM's
+    /// clock base in this vCPU's TSC.  Written once: the TSC is invariant
+    /// and the same rate on every vCPU.  An address that is not RAM is
+    /// left, as KVM leaves it.
+    fn publish_clock(&mut self) {
+        if self.kvm_time & 1 == 0 {
+            return;
+        }
+        let vm = vm();
+        let (mul, shift) = vm.clock_scale;
+        self.kvm_version = self.kvm_version.wrapping_add(2) & !1;
+        let info = pvclock::time_info(self.kvm_version, vm.clock_base.wrapping_add(self.tsc_offset), 0, mul, shift, pvclock::TSC_STABLE);
+        publish_at(self.kvm_time & !1, &info);
+    }
+
+    /// kvmclock's wall clock: the wall time at kvmclock time 0, which the
+    /// guest adds its kvmclock time to.  One structure in Linux for every
+    /// vCPU, so one version for the VM, under a lock: two vCPUs naming the
+    /// same address do not interleave.
+    fn publish_wall_clock(&mut self) {
+        let vm = vm();
+        let ns = vm.wall_base_ns;
+        let mut version = vm.wall_version.lock();
+        *version = version.wrapping_add(2) & !1;
+        let w = pvclock::wall_clock(*version, (ns / 1_000_000_000) as u32, (ns % 1_000_000_000) as u32);
+        publish_at(self.kvm_wall, &w);
     }
 
     fn apic_effects(&mut self, fx: lapic::Effects) {
@@ -945,6 +1024,20 @@ impl<H: Hw> Vcpu<H> {
 }
 
 /// The host's CPUID.
+/// A pvclock structure `b` at `gpa` (pvclock::publish), only if all of it
+/// is RAM: KVM leaves an address that is not, and a structure straddling
+/// RAM's end would otherwise keep an odd version.  The version is one
+/// 32-bit store when aligned (GuestMem::write).
+fn publish_at(gpa: u64, b: &[u8]) {
+    let mem = &vm().mem;
+    if !mem.valid(gpa, b.len() as u64) {
+        return;
+    }
+    pvclock::publish(b, |v| mem.write::<u32>(gpa, v), |body| {
+        mem.write_bytes(gpa + 4, body);
+    });
+}
+
 pub fn host_cpuid(leaf: u32, sub: u32) -> [u32; 4] {
     let r = core::arch::x86_64::__cpuid_count(leaf, sub);
     [r.eax, r.ebx, r.ecx, r.edx]
