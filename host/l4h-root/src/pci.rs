@@ -272,12 +272,21 @@ pub fn msi_irq(d: &Device, vector: u64, dst: &sel4::AbsoluteCPtr) {
         }
         // FL4's GetMSI: event `vector` of the function's requester ID
         // (no SMMU: its ITS device ID), as LPI `vector`, to core 0.
-        let device = (d.bus as u64) << 8 | (d.dev as u64) << 3 | d.func as u64;
-        let r = sel4::with_ipc_buffer_mut(|ipc| {
-            ipc.inner_mut().seL4_IRQControl_GetMSI(slot::IRQ_CONTROL.cap().bits(), vector, device, vector,
-                dst.root().bits(), dst.path().bits(), dst.path().depth() as u8, 0)
-        });
-        assert!(r == 0, "ITS MSI handler for {:02x}:{:02x}.{} vector {}: error {}", d.bus, d.dev, d.func, vector, r);
+        #[cfg(l4h_kernel_its)]
+        {
+            let device = (d.bus as u64) << 8 | (d.dev as u64) << 3 | d.func as u64;
+            let r = sel4::with_ipc_buffer_mut(|ipc| {
+                ipc.inner_mut().seL4_IRQControl_GetMSI(slot::IRQ_CONTROL.cap().bits(), vector, device, vector,
+                    dst.root().bits(), dst.path().bits(), dst.path().depth() as u8, 0)
+            });
+            assert!(r == 0, "ITS MSI handler for {:02x}:{:02x}.{} vector {}: error {}", d.bus, d.dev, d.func, vector, r);
+        }
+        // A kernel without GetMSI never reports an ITS (msi_init).
+        #[cfg(not(l4h_kernel_its))]
+        {
+            let _ = d;
+            unreachable!("ITS without seL4_IRQControl_GetMSI");
+        }
     }
 }
 
@@ -296,6 +305,10 @@ fn its_doorbell() -> u64 {
 #[cfg(target_arch = "aarch64")]
 pub fn msi_init(bootinfo: &sel4::BootInfoPtr) {
     const MSI_INFO: u64 = 15;
+    if !cfg!(l4h_kernel_its) {
+        log!("l4h-root: MSIs through QEMU virt's GICv2m");
+        return;
+    }
     let Some(c) = l4h_task::bootinfo::extra_chunk(bootinfo, MSI_INFO).filter(|c| c.len() >= 32) else {
         log!("l4h-root: MSIs through QEMU virt's GICv2m");
         return;
