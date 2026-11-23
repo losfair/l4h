@@ -6088,7 +6088,7 @@ tools/build-fl4.sh
 SEL4_PREFIX="$PWD/build/sel4-fl4" L4H_KERNEL_VARIANT=fl4 tests/run-selftest.sh 4
 ```
 
-The tested FL4 revision is `9c1c0c33eb8b81829fb2f35ced825560cabbe254`.
+The tested FL4 revision is `dd7d842a91c98ae5725a46c247dfbcd933810167`.
 `prepare-fl4.sh` clones the pinned public revision, or the frozen override,
 into `build/FL4-src` without applying any kernel patches. The source
 worktree is not edited.
@@ -6159,13 +6159,14 @@ buffer, leaving 3 KiB for FL4's 2696-byte standard XSAVE image.
 FL4 enables `KernelVTX` and `KernelX86_64VTX64BitGuests` in its ABI and
 selects VT-x or AMD-V at boot. The existing KVM backends (§5.10) use its
 VCPU/EPT interface through the provider, including FL4's 32 KiB VCPU
-objects. Both KVM backends check the `VMEnter` result before decoding an
-exit reason: a notification has no hardware exit to emulate, and FL4 may
-leave its reason zero. When hardware virtualization is unavailable, root's
-VCPU probe fails and Linux boots with KVM disabled, using the same host,
-provider and Linux binaries. Multikernel partitions remain unavailable on
-FL4. It detects the APIC, PCID, FS/GS and FPU features at boot, so the
-shipped seL4 CPU variants do not apply.
+objects. l4h enables `KernelX86VmenterFullState` so KVM and l4h-hvm
+receive the guest registers when a notification ends `VMEnter`, including
+when the notification was pending before entry. Both KVM backends check
+the result before decoding a hardware exit. When hardware virtualization
+is unavailable, root's VCPU probe fails and Linux boots with KVM disabled,
+using the same host, provider and Linux binaries. Multikernel partitions remain
+unavailable on FL4. It detects the APIC, PCID, FS/GS and FPU features at boot,
+so the shipped seL4 CPU variants do not apply.
 
 `L4H_RELEASE=1 tools/build-fl4-efi.sh` builds `build/efi/l4h-fl4.efi` and
 its matching `l4h-debug-fl4-x86_64.tar.xz`; `build-efi.sh` builds them after

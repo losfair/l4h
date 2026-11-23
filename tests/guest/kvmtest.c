@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <linux/kvm.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,6 +29,7 @@ extern const char fpu_start[], fpu_end[], xcr0_start[], xcr0_end[], smap_start[]
 extern const char state_start[], state_end[], rdpmc_start[], rdpmc_end[];
 extern const char nmiss_start[], nmiss_ud[], nmiss_nmi[], nmiss_end[];
 extern const char tpr_start[], tpr_end[], vintr_start[], vintr_ok[], vintr_v0[], vintr_end[];
+extern const char notify_start[], notify_spin[], notify_end[];
 __asm__(".pushsection .rodata\n"
 	/* Real mode: "OK" to port 0x3f8, then hlt. */
 	".code16\n"
@@ -211,6 +213,14 @@ __asm__(".pushsection .rodata\n"
 	"  out %al, %dx\n"
 	"  hlt\n"
 	"vintr_end:\n"
+	/* Stop in userspace once, then change R15 and CF without a VM exit. */
+	"notify_start:\n"
+	"  out %al, $0x40\n"
+	"  mov %rdi, %r15\n"
+	"  stc\n"
+	"notify_spin:\n"
+	"  jmp notify_spin\n"
+	"notify_end:\n"
 	".popsection\n");
 
 static int failures;
@@ -872,6 +882,54 @@ static int irq_window_reset(int kvm)
 	return 0;
 }
 
+static void alarm_handler(int sig)
+{
+	(void)sig;
+}
+
+static int check_interrupted_regs(struct vm *vm, uint64_t marker)
+{
+	uint64_t spin_rip = 0x1000 + (notify_spin - notify_start);
+	struct kvm_regs regs = { 0 };
+
+	CHECK(ualarm(100000, 100000) != (useconds_t)-1, "notification: arm timer");
+	for (int i = 0; i < 10; i++) {
+		CHECK(ioctl(vm->vcpu, KVM_RUN, 0) == -1 && errno == EINTR,
+		      "notification: KVM_RUN returned exit %u", vm->run->exit_reason);
+		CHECK(ioctl(vm->vcpu, KVM_GET_REGS, &regs) == 0, "notification: KVM_GET_REGS");
+		/* A signal may have arrived before the guest reached its loop. */
+		if (regs.rip == spin_rip)
+			break;
+	}
+	CHECK(regs.rip == spin_rip && regs.r15 == marker && (regs.rflags & 1),
+	      "notification: RIP %#llx R15 %#llx RFLAGS %#llx", regs.rip, regs.r15, regs.rflags);
+	return 0;
+}
+
+/* A timer interrupts KVM_RUN while the guest spins. The VMM must see
+ * the registers at that instruction, including changes since the OUT. */
+static int notification_regs(int kvm)
+{
+	const uint64_t marker = 0x123456789abcdef0ull;
+	struct sigaction action = { .sa_handler = alarm_handler }, old;
+	struct vm vm;
+	int ret;
+
+	if (vm_create(&vm, kvm) || enter_long_mode(&vm, notify_start, notify_end, marker, 0))
+		return -1;
+	CHECK(ioctl(vm.vcpu, KVM_RUN, 0) == 0 && vm.run->exit_reason == KVM_EXIT_IO &&
+	      vm.run->io.port == 0x40, "notification: missing initial OUT");
+	sigemptyset(&action.sa_mask);
+	CHECK(sigaction(SIGALRM, &action, &old) == 0, "notification: sigaction");
+	ret = check_interrupted_regs(&vm, marker);
+	CHECK(ualarm(0, 0) != (useconds_t)-1, "notification: disarm timer");
+	CHECK(sigaction(SIGALRM, &old, NULL) == 0, "notification: restore sigaction");
+	vm_destroy(&vm);
+	if (!ret)
+		printf("KVMTEST: registers across a notification ok\n");
+	return ret;
+}
+
 struct job {
 	int kvm, ret;
 };
@@ -911,6 +969,7 @@ int main(void)
 	nmi_singlestep_event(kvm);
 	tpr_lowered(kvm);
 	irq_window_reset(kvm);
+	notification_regs(kvm);
 	for (i = 0; i < 2; i++) {
 		jobs[i].kvm = kvm;
 		pthread_create(&t[i], NULL, parallel_vm, &jobs[i]);
