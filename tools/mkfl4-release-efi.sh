@@ -22,10 +22,9 @@ trap 'rm -rf "$work"' EXIT
 loader=$root/boot/l4h-fl4-efi
 library=$work/fl4
 mkdir -p "$library"
-# The EFI library exposes the kernel command line and TDX measurement here. Apply its
-# interface patch to a private copy; the kernel uses the original revision.
+# The loader links the EFI library of the pinned FL4 revision, the same one
+# the kernel is built from, extracted as is: l4h applies no patch to FL4.
 git -C "$src" archive "$base" -- crates/fl4-efi crates/fl4-bootinfo | tar -xC "$library"
-patch -s -d "$library" -p1 < "$loader/handoff.patch"
 cp -R "$loader"/{Cargo.toml,Cargo.lock,src} "$work/"
 objcopy --strip-debug "$kernel" "$work/kernel.elf"
 objcopy --strip-debug "$rootelf" "$work/root.elf"
