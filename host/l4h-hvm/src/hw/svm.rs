@@ -98,11 +98,13 @@ pub struct Svm {
     /// INT_CTL as we last wrote it (the CPU does not change it under us:
     /// a VINTR exit comes before the virtual interrupt is taken).
     int_ctl: u64,
-    /// CR0, CR4 and EFER as we last read or wrote them: the guest changes
-    /// them only with an exit to us (CR4 and EFER writes always exit,
-    /// CR0's but for TS and MP alone: its selective write intercept,
-    /// which FL4 always has, and our own emulation otherwise), so each
-    /// exit need not read them again.  CR3 comes with every exit (MR9).
+    /// CR0, CR4 and EFER as we last read or wrote them, so that each exit
+    /// need not read them again: the guest changes CR4 and EFER only with
+    /// an exit to us, and CR0 too but for TS and MP, which CLTS and a MOV
+    /// that changes only them set without one (the selective write
+    /// intercept, which FL4 always has, covers the rest).  Only paging()
+    /// and mode() read the copy of CR0 (PE, PG, WP); cr0() reads the VMCB.
+    /// CR3 comes with every exit (MR9).
     sticky: [Option<u64>; 3],
     cr3: u64,
 }
@@ -399,7 +401,10 @@ impl Hw for Svm {
     }
 
     fn cr0(&mut self) -> u64 {
-        self.rd(CR0)
+        // TS and MP may have changed without an exit.
+        let v = self.rd_vmcb(CR0);
+        self.sticky[0] = Some(v);
+        v
     }
 
     fn cr4(&mut self) -> u64 {
