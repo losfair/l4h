@@ -48,6 +48,8 @@ pub fn with_addr(old: u64, v: u64, addr: u8) -> u64 {
 struct Span {
     parts: [(u64, u64); 2],
 }
+/// How long a halted vCPU polls before it blocks (Vcpu::halt_poll).
+const HALT_POLL_US: u64 = 100;
 /// Iterations of a REP string instruction one exit does.
 const STRING_BATCH: u64 = 4096;
 
@@ -223,11 +225,38 @@ impl<H: Hw> Vcpu<H> {
     fn block(&mut self) {
         self.arm_timer();
         let before = vm::now();
+        if self.halted && self.halt_poll(before) {
+            return;
+        }
         crate::sys::wait(self.id);
         let page = host::vmm_event_page_va(self.id) as *mut abi::EventPage;
         unsafe {
             let p = core::ptr::addr_of_mut!((*page).idle_ticks);
             p.write_volatile(p.read_volatile().wrapping_add(vm::now() - before));
+        }
+    }
+
+    /// Halt polling, as KVM's halt_poll_ns: a halted vCPU watches, for a
+    /// while, for what would wake it (`turn`) before it blocks: an
+    /// interrupt it can take, an NMI, INIT or SIPI, its timer.  Each block
+    /// and wakeup costs host scheduling and, under a hypervisor, IPIs and
+    /// halts of its own; a guest waiting on I/O is often woken within tens
+    /// of microseconds.  Whether it was woken.
+    fn halt_poll(&self, start: u64) -> bool {
+        let sh = shared(self.id);
+        let end = start.wrapping_add(vm().tsc_hz / 1_000_000 * HALT_POLL_US);
+        loop {
+            let now = vm::now();
+            if sh.flags.load(Ordering::Relaxed) != 0
+                || (self.lapic.pending(sh).is_some() && self.hw.rflags() & (1 << 9) != 0)
+                || (self.armed != 0 && now >= self.armed)
+            {
+                return true;
+            }
+            if now >= end {
+                return false;
+            }
+            core::hint::spin_loop();
         }
     }
 
