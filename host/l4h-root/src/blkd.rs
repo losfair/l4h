@@ -137,7 +137,7 @@ enum BlkOp {
     Check { token: usize, id: usize, instance: u64, disk: usize, unit: u64, start: u64, n: usize, volatile: bool, claims: bool },
     Add { token: usize, chan: Channel, kick: cap::Notification },
     Remove { client: usize },
-    Write { token: usize },
+    Provision { token: usize, discard: bool },
     Extent { token: usize, vals: [u64; 6] },
 }
 
@@ -917,13 +917,22 @@ pub fn write(h: &mut Host, disk: usize, sector: u64, len: usize, from: Option<*c
     if ctrl.staging_busy || !ctrl.room() { return Err(ctl::EBUSY); }
     ctrl.stage(from, len, &mut h.wins.a);
     let r = if len == 0 {
-        ctrl.post(Request::Flush { unit: unit as usize }, BlkOp::Write { token })
+        ctrl.post(Request::Flush { unit: unit as usize }, BlkOp::Provision { token, discard: false })
     } else {
-        ctrl.post(Request::Write { sector, length: len, unit: unit as usize }, BlkOp::Write { token })
+        ctrl.post(Request::Write { sector, length: len, unit: unit as usize }, BlkOp::Provision { token, discard: false })
     };
     r.map_err(|_| ctl::EBUSY)?;
     ctrl.staging_busy = true;
     Ok(())
+}
+
+/// Ask blkd to discard a range. The request carries no staged data.
+pub fn discard(h: &mut Host, disk: usize, sector: u64, sectors: u64, token: usize) -> Result<(), Errno> {
+    let (c, unit) = (h.disks[disk].ctrl, h.disks[disk].unit);
+    let ctrl = &mut h.ctrls[c];
+    if ctrl.failed { return Err(ctl::EIO); }
+    ctrl.post(Request::Discard { sector, sectors, unit: unit as usize }, BlkOp::Provision { token, discard: true })
+        .map_err(|_| ctl::EBUSY)
 }
 
 /// Make controller `c`'s blkd stop answering, for tests/run-hangtest.sh,
@@ -990,12 +999,18 @@ fn complete(h: &mut Host, c: usize, op: BlkOp, w: host::mailbox::Reply) {
             }
             r => removed(h, c, client, r.is_ok()),
         },
-        BlkOp::Write { token } => {
+        BlkOp::Provision { token, discard } => {
             let ctrl = &mut h.ctrls[c];
-            ctrl.staging_busy = false;
-            // Flush's reply is write's.
-            let r = match wire::reply::<reply::Write>(&w) {
+            let status = if discard {
+                wire::reply::<reply::Discard>(&w)
+            } else {
+                ctrl.staging_busy = false;
+                // Flush's reply is write's.
+                wire::reply::<reply::Write>(&w)
+            };
+            let r = match status {
                 Ok(0) => Ok(OpResult::Vals(Default::default())),
+                Ok(s) if discard && s == blk::STATUS_UNSUPP as u64 => Ok(OpResult::Vals(Default::default())),
                 // The device failed, or blkd did.
                 Ok(u64::MAX) | Err(wire::FAILED) => {
                     quarantine(ctrl, &h.pci);

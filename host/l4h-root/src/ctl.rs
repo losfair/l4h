@@ -15,7 +15,7 @@ pub use l4h_host::errno::{EAGAIN, EBUSY, EEXIST, EINVAL, EIO, ENODEV, ENOENT, EN
 const _: () = assert!(usize::BITS == u64::BITS);
 
 /// Execute control op `op` with `a`: its vals, and its data into `data`;
-/// or later, for an op that waits for blkd (BLK_WRITE, BLK_INFO).
+/// or later, for an op that waits for blkd (BLK_WRITE, BLK_DISCARD, BLK_INFO).
 pub fn host_op(h: &mut Host, op: u32, a: &[u64; 6], data: &mut [u8; abi::CTL_DATA_MAX]) -> Result<Answer, Errno> {
     let mut vals = [0; 6];
     match op {
@@ -75,6 +75,16 @@ pub fn host_op(h: &mut Host, op: u32, a: &[u64; 6], data: &mut [u8; abi::CTL_DAT
             let from = (zero == 0).then_some(crate::vmmgr::CTL_DATA_VA as *const u8);
             let t = crate::vmmgr::op_new(h, None, h.disks[disk].ctrl)?;
             if let Err(e) = crate::blkd::write(h, disk, sector, len, from, t) {
+                h.ops[t] = None;
+                return Err(e);
+            }
+            return Ok(Answer::Later(t));
+        }
+        abi::CTL_BLK_DISCARD => {
+            let (disk, sector, sectors) = (a[0] as usize, a[1], a[2]);
+            h.ensure_disk(disk)?;
+            let t = crate::vmmgr::op_new(h, None, h.disks[disk].ctrl)?;
+            if let Err(e) = crate::blkd::discard(h, disk, sector, sectors, t) {
                 h.ops[t] = None;
                 return Err(e);
             }

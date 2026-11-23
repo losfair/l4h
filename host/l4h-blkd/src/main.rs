@@ -77,6 +77,11 @@ pub trait Driver {
     /// OP_FLUSH, `sector` in 512-byte units, already checked against the
     /// capacity and aligned to the block size.  Errors are blk::STATUS_*.
     fn start(&mut self, tag: u64, unit: usize, op: u32, sector: u64, data: &[Seg]) -> Result<(), u32>;
+    /// Maximum 512-byte sectors in one discard. Zero means unsupported.
+    fn discard_max(&self, _unit: usize) -> u32 { 0 }
+    fn start_discard(&mut self, _tag: u64, _unit: usize, _sector: u64, _sectors: u32) -> Result<(), u32> {
+        Err(blk::STATUS_UNSUPP)
+    }
     /// Tell the device about started requests.
     fn kick(&mut self);
     /// Report completed requests.
@@ -153,8 +158,24 @@ struct Carry {
     t: usize,
     unit: usize,
     op: u32,
+    piece: Piece,
+}
+
+#[derive(Default)]
+struct Piece {
     sector: u64,
+    discard_sectors: u32,
     segs: ArrayVec<Seg, MAX_PIECES>,
+}
+
+impl Piece {
+    fn start(&self, drv: &mut dyn Driver, tag: u64, unit: usize, op: u32) -> Result<(), u32> {
+        if op == blk::OP_DISCARD {
+            drv.start_discard(tag, unit, self.sector, self.discard_sectors)
+        } else {
+            drv.start(tag, unit, op, self.sector, &self.segs)
+        }
+    }
 }
 
 /// A piece of pending request `t` completed with `status`: the client gets
@@ -239,12 +260,14 @@ impl Client {
         self.notify_pending = true;
     }
 
-    /// Map a request to its device requests: their sectors and segments,
-    /// and how many there are (none for a flush).
-    fn prepare(&self, req: &blk::Req, block_size: u32, groups: &mut [ArrayVec<Seg, MAX_PIECES>; 2])
-        -> Result<([u64; 2], usize), u32> {
+    /// Map a request to its device pieces. A flush has one empty piece.
+    fn prepare(&self, req: &blk::Req, block_size: u32, groups: &mut [Piece; 2]) -> Result<usize, u32> {
         let (pieces, n) = self.vol.map(req, self.pool, block_size, self.read_only)?;
-        groups.iter_mut().for_each(|g| g.clear());
+        for (group, (sector, bytes)) in groups.iter_mut().zip(pieces) {
+            group.sector = sector;
+            group.discard_sectors = if req.op == blk::OP_DISCARD { (bytes / 512) as u32 } else { 0 };
+            group.segs.clear();
+        }
         // map allows at most MAX_SEGS segments; splitting the one that
         // crosses the boundary leaves each piece at most MAX_SEGS.
         let (mut k, mut left) = (0, pieces[0].1);
@@ -252,7 +275,7 @@ impl Client {
             let (mut pa, mut len) = (self.pool.translate(s.gpa, s.len as u64).unwrap(), s.len as u64);
             while len > 0 {
                 let take = len.min(left);
-                let _ = groups[k].push(Seg { pa, len: take as u32 });
+                let _ = groups[k].segs.push(Seg { pa, len: take as u32 });
                 (pa, len, left) = (pa + take, len - take, left - take);
                 if left == 0 && k + 1 < n {
                     k += 1;
@@ -260,7 +283,7 @@ impl Client {
                 }
             }
         }
-        Ok(([pieces[0].0, pieces[1].0], n))
+        Ok(n)
     }
 }
 
@@ -304,13 +327,13 @@ impl Blkd {
         }
         if !self.drv.can_start() { return false; }
         let c = self.carry.take().unwrap();
-        let r = self.drv.start((c.t as u64) << 1 | 1, c.unit, c.op, c.sector, &c.segs);
+        let r = c.piece.start(&mut *self.drv, (c.t as u64) << 1 | 1, c.unit, c.op);
         if let Err(status) = r { finish(&mut self.pending[..], &mut self.clients[..], c.t, status); }
         r.is_ok()
     }
 
     fn submit(&mut self) {
-        let mut groups = [ArrayVec::new(), ArrayVec::new()];
+        let mut groups = [Piece::default(), Piece::default()];
         let mut started = self.start_carry();
         // Bounded work per client and round-robin starting point. A busy
         // ring cannot occupy every hardware slot before others get a turn.
@@ -336,9 +359,9 @@ impl Blkd {
                     };
                     progress = true;
                     let dev = &self.dev[c.unit];
-                    let (sectors, n) = match c.prepare(&req, dev.block_size, &mut groups) {
+                    let n = match c.prepare(&req, dev.block_size, &mut groups) {
                         // A flush the device or the attachment does not need.
-                        Ok((_, 0)) if !dev.flush || c.volatile => {
+                        Ok(0) if !dev.flush || c.volatile => {
                             c.respond(req.id, blk::STATUS_OK);
                             continue;
                         }
@@ -349,7 +372,7 @@ impl Blkd {
                         }
                     };
                     // A flush is one device request without data.
-                    if let Err(status) = self.drv.start((t as u64) << 1, c.unit, req.op, sectors[0], &groups[0]) {
+                    if let Err(status) = groups[0].start(&mut *self.drv, (t as u64) << 1, c.unit, req.op) {
                         c.respond(req.id, status);
                         continue;
                     }
@@ -358,11 +381,11 @@ impl Blkd {
                     c.outstanding += 1;
                     started = true;
                     if n == 2 {
-                        let segs = core::mem::replace(&mut groups[1], ArrayVec::new());
-                        let carry = Carry { t, unit: c.unit, op: req.op, sector: sectors[1], segs };
+                        let piece = core::mem::take(&mut groups[1]);
+                        let carry = Carry { t, unit: c.unit, op: req.op, piece };
                         if !self.drv.can_start() {
                             self.carry = Some(carry);
-                        } else if let Err(status) = self.drv.start((t as u64) << 1 | 1, c.unit, req.op, carry.sector, &carry.segs) {
+                        } else if let Err(status) = carry.piece.start(&mut *self.drv, (t as u64) << 1 | 1, c.unit, req.op) {
                             // The first piece is still in flight.
                             let p = self.pending[t].as_mut().unwrap();
                             (p.status, p.left) = (status, 1);
@@ -443,29 +466,54 @@ impl Blkd {
     fn provision(&mut self, cfg: &BlkdConfig, unit: usize, sector: u64, len: usize, flush: bool) -> Result<u64, Errno> {
         let Some(&dev) = self.dev.get(unit) else { return Ok(u64::MAX) };
         if dev.read_only { return Err(errno::EPERM); }
-        if !flush {
-            // Whole 4 KiB blocks, which every block size divides.
-            let w = blk::DiskWindow::new(sector, (len / 512) as u64, dev.capacity)
-                .filter(|_| len != 0 && len <= blk::STAGING_SIZE && len % 4096 == 0).ok_or(errno::EINVAL)?;
-            if !self.reserved.unattached(&holds(&self.clients[..]), unit, w) { return Err(errno::EBUSY); }
+        if flush {
+            return Ok(if dev.flush {
+                self.provision_io(|drv| drv.start(u64::MAX, unit, blk::OP_FLUSH, 0, &[]))
+            } else {
+                blk::STATUS_OK as u64
+            });
         }
-        if flush && !dev.flush { return Ok(blk::STATUS_OK as u64); }
+        if len > blk::STAGING_SIZE || len % 512 != 0 { return Err(errno::EINVAL); }
+        self.provision_window(unit, sector, (len / 512) as u64, dev.capacity)?;
+        let data = [Seg { pa: cfg.dma_paddr + cfg.dma_size, len: len as u32 }];
+        Ok(self.provision_io(|drv| drv.start(u64::MAX, unit, blk::OP_WRITE, sector, &data)))
+    }
+
+    fn provision_window(&self, unit: usize, sector: u64, sectors: u64, capacity: u64) -> Result<(), Errno> {
+        self.reserved.check_provision_range(&holds(&self.clients[..]), unit, sector, sectors, capacity)
+    }
+
+    fn discard(&mut self, unit: usize, sector: u64, sectors: u64) -> Result<u64, Errno> {
+        let Some(&dev) = self.dev.get(unit) else { return Ok(u64::MAX) };
+        // Check the whole range before the device can discard any of it.
+        self.provision_window(unit, sector, sectors, dev.capacity)?;
+        if dev.read_only { return Err(errno::EPERM); }
+        let max = u64::from(self.drv.discard_max(unit));
+        if max == 0 { return Ok(blk::STATUS_UNSUPP as u64); }
+        let mut offset = 0;
+        while offset < sectors {
+            let count = (sectors - offset).min(max) as u32;
+            let status = self.provision_io(|drv| drv.start_discard(u64::MAX, unit, sector + offset, count));
+            if status != blk::STATUS_OK as u64 { return Ok(status); }
+            offset += u64::from(count);
+            self.submit();
+        }
+        Ok(blk::STATUS_OK as u64)
+    }
+
+    fn provision_io(&mut self, start: impl FnOnce(&mut dyn Driver) -> Result<(), u32>) -> u64 {
         // The device is given up only when it completes nothing for the
-        // bound.  Nothing else is started while this waits, so what the
-        // device has runs out, and the wait ends.
+        // bound. No new client requests are started while this waits.
         let (mut seen, mut end) = (self.reaped, self.deadline());
         while !self.drv.can_start() {
             self.reap();
-            if self.stopped(&mut seen, &mut end) { return Ok(u64::MAX); }
+            if self.stopped(&mut seen, &mut end) { return u64::MAX; }
         }
-        let data = [Seg { pa: cfg.dma_paddr + cfg.dma_size, len: len as u32 }];
-        let result = self.drv.start(u64::MAX, unit, if flush { blk::OP_FLUSH } else { blk::OP_WRITE },
-            sector, if flush { &[] } else { &data });
-        if let Err(status) = result { return Ok(status as u64); }
+        if let Err(status) = start(&mut *self.drv) { return status as u64; }
         self.drv.kick();
         loop {
-            if let Some(status) = self.reap() { return Ok(status as u64); }
-            if self.stopped(&mut seen, &mut end) { return Ok(u64::MAX); }
+            if let Some(status) = self.reap() { return status as u64; }
+            if self.stopped(&mut seen, &mut end) { return u64::MAX; }
             core::hint::spin_loop();
         }
     }
@@ -549,6 +597,9 @@ impl blk::call::Server for Requests<'_> {
                     // A request cut where two extents meet has no more
                     // pieces on either side than it had segments.
                     addr_of_mut!((*chan).seg_max).write_volatile(dev.seg_max.clamp(1, blk::SEG_MAX) as u32);
+                    addr_of_mut!((*chan).discard_max_sectors).write_volatile(
+                        b.drv.discard_max(unit).min(blk::MAX_DISCARD_SECTORS)
+                    );
                     fence(Ordering::Release);
                     addr_of_mut!((*chan).ready).write_volatile(1);
                 }
@@ -572,6 +623,10 @@ impl blk::call::Server for Requests<'_> {
 
     fn flush(&mut self, _: blk::Sender, unit: usize) -> Result<u64, Errno> {
         self.b.provision(self.cfg, unit, 0, 0, true)
+    }
+
+    fn discard(&mut self, _: blk::Sender, sector: u64, sectors: u64, unit: usize) -> Result<u64, Errno> {
+        self.b.discard(unit, sector, sectors)
     }
 
     fn reserve(&mut self, _: blk::Sender, unit: usize, start: u64, sectors: u64, read_only: bool) -> Result<usize, Errno> {

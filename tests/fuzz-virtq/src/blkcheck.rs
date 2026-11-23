@@ -105,7 +105,6 @@ pub fn blkd_run() {
 const NUM: u16 = 128;
 /// virtio-blk operations the VMM does not offer.
 const OP_GET_ID: u32 = 8;
-const OP_DISCARD: u32 = 11;
 const CHAINS: u16 = 64;
 /// The I/O pool, above the guest's RAM.
 const POOL: u64 = 0x4020_0000;
@@ -117,7 +116,7 @@ const STATUS: u64 = POOL + 0x4000;
 
 #[test]
 fn unavailable_disk_has_zero_capacity_and_completes_io_without_a_backend() {
-    for op in [chan::OP_READ, chan::OP_WRITE, chan::OP_FLUSH, OP_GET_ID, OP_DISCARD] {
+    for op in [chan::OP_READ, chan::OP_WRITE, chan::OP_FLUSH, OP_GET_ID, chan::OP_DISCARD] {
         let mut ram = vec![0u64; 0x8000 / 8];
         let mem = GuestMem { base: ram.as_mut_ptr() as usize, gpa: POOL, size: 0x8000 };
         let mut disk = Blk::unavailable(mem.size);
@@ -681,11 +680,58 @@ fn an_operation_that_is_not_offered_is_unsupported_and_never_reaches_blkd() {
     let mut disk = Blk::new(&mut *channel as *mut Channel as usize, crate::sel4::cap::Notification, mem.size, HZ);
     let mut queues = [Queue::default()];
     // GET_ID as Linux sends it (a 20-byte buffer for the id), and DISCARD.
-    for (op, data) in [(OP_GET_ID, (20, true)), (OP_DISCARD, (16, false))] {
+    for (op, data) in [(OP_GET_ID, (20, true)), (chan::OP_DISCARD, (16, false))] {
         offer_chain(&mem, &mut queues[0], op, 16, &[data], 1);
         assert!(disk.kick(&mem, &mut queues, 0));
         assert_eq!(channel.sq.head.load(Relaxed), 0, "operation {op} must not reach blkd");
         assert_eq!(mem.read::<u8>(STATUS), 2, "operation {op} is unsupported");
+    }
+}
+
+#[test]
+fn discard_uses_the_payload_range_and_never_sends_dma_segments() {
+    let mut ram = vec![0u64; 0x20000 / 8];
+    let mem = GuestMem { base: ram.as_mut_ptr() as usize, gpa: POOL, size: 0x20000 };
+    for (read_only, accept, sector, sectors, flags, status) in [
+        (false, true, 24, 16, 0, 0),
+        (false, false, 24, 16, 0, 2),
+        (true, true, 24, 16, 0, 1),
+        (false, true, 120, 16, 0, 1),
+        (false, true, 24, 17, 0, 1),
+        (false, true, 24, 16, 1, 2),
+    ] {
+        let mut channel: Box<Channel> = unsafe { Box::new_zeroed().assume_init() };
+        channel.capacity_sectors = 128;
+        channel.block_size = 4096;
+        channel.read_only = u32::from(read_only);
+        channel.discard_max_sectors = 16;
+        let mut disk = Blk::new(&mut *channel as *mut Channel as usize, crate::sel4::cap::Notification, mem.size, HZ);
+        let feature = 1 << 13;
+        assert_eq!(disk.features() & feature != 0, !read_only);
+        disk.features_accepted(if accept { feature } else { 0 });
+        let mut config = [0u8; 48];
+        disk.init_config(&mut config);
+        let expected = if read_only { (0, 0, 0) } else { (16, 1, 8) };
+        let word = |off: usize| u32::from_le_bytes(config[off..off + 4].try_into().unwrap());
+        assert_eq!((word(36), word(40), word(44)), expected);
+
+        let mut queues = [Queue::default()];
+        offer_chain(&mem, &mut queues[0], chan::OP_DISCARD, 24, &[(8, false)], 1);
+        mem.write::<u64>(HDR + 16, sector);
+        mem.write::<u32>(POOL + 0x10000, sectors);
+        mem.write::<u32>(POOL + 0x10004, flags);
+        assert_eq!(disk.kick(&mem, &mut queues, 0), status != 0);
+        if status == 0 {
+            assert_eq!(channel.sq.head.load(Relaxed), 1);
+            let req = channel.reqs[0];
+            assert_eq!((req.op, req.sector, req.discard_sectors, req.nr_segs),
+                (chan::OP_DISCARD, sector, sectors, 0));
+            reply(&mut channel, req.id);
+            assert!(disk.complete(&mem, &mut queues));
+        } else {
+            assert_eq!(channel.sq.head.load(Relaxed), 0);
+        }
+        assert_eq!(mem.read::<u8>(STATUS), status);
     }
 }
 

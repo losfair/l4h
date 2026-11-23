@@ -211,6 +211,14 @@ impl Driver for MockDriver {
         }
         Ok(())
     }
+    fn discard_max(&self, _: usize) -> u32 { 16 }
+    fn start_discard(&mut self, tag: u64, unit: usize, sector: u64, sectors: u32) -> Result<(), u32> {
+        assert!(sectors > 0 && sectors <= self.discard_max(unit));
+        if tag == u64::MAX {
+            KERNEL.with_borrow_mut(|k| k.started.push((tag, sector, u64::from(sectors) * 512)));
+        }
+        self.start(tag, unit, blk::OP_DISCARD, sector, &[Seg { pa: 0, len: sectors * 512 }])
+    }
     fn kick(&mut self) { self.notify(); }
     fn reap(&mut self, done: &mut dyn FnMut(u64, u32)) {
         if core::mem::take(&mut self.provisioning) {
@@ -353,15 +361,21 @@ fn refused_provisioning_reports_its_errno() {
 /// piece: `between` are root's requests after the one during which the
 /// client publishes it, then the client is removed.  The replies, the
 /// pieces started, and the client's completion.
-fn run_split(between: &[(u64, [u64; 6])]) -> (Vec<[u64; 5]>, Vec<(u64, u64, u64)>, (u32, u64, u32)) {
+fn run_split(op: u32, between: &[(u64, [u64; 6])]) -> (Vec<[u64; 5]>, Vec<(u64, u64, u64)>, (u32, u64, u32)) {
     let _lock = lock();
     map_client();
     // Guest sectors 0..8192 are disk sectors 40960.., then 8192...
     let staging: &'static [[u64; 2]] = Box::leak(Box::new([[40960, 8192], [8192, 8192]]));
     unsafe {
         (*channel()).pool = blk::Pool { gpa: 0x8000000, paddr: 0x10000000, size: 1 << 20 };
-        (*channel()).reqs[0] = blk::Req { id: 7, op: blk::OP_READ, nr_segs: 1, sector: 8184, ..Default::default() };
-        (*channel()).reqs[0].segs[0] = blk::Seg { gpa: 0x8000000, len: 8192, flags: blk::SEG_WRITE };
+        let mut req = blk::Req { id: 7, op, sector: 8184, ..Default::default() };
+        if op == blk::OP_DISCARD {
+            req.discard_sectors = 16;
+        } else {
+            req.nr_segs = 1;
+            req.segs[0] = blk::Seg { gpa: 0x8000000, len: 8192, flags: blk::SEG_WRITE };
+        }
+        (*channel()).reqs[0] = req;
     }
     KERNEL.with_borrow_mut(|k| {
         k.ipc.0.fill(0);
@@ -390,7 +404,7 @@ fn run_split(between: &[(u64, [u64; 6])]) -> (Vec<[u64; 5]>, Vec<(u64, u64, u64)
 fn a_split_request_waits_for_room() {
     // A flush waits for the device's room, which reaps the first piece;
     // the carried one then starts before anything else.
-    let (replies, started, done) = run_split(&[post(Request::Flush { unit: 0 })]);
+    let (replies, started, done) = run_split(blk::OP_READ, &[post(Request::Flush { unit: 0 })]);
     assert_eq!(replies[0][0], 0, "the extents attach");
     assert_eq!(replies.last().unwrap()[0], 0, "remove drains");
     // Pending slot 0: piece 0 at the end of the first extent, piece 1
@@ -400,11 +414,33 @@ fn a_split_request_waits_for_room() {
 }
 
 #[test]
+fn control_discard_refuses_live_and_reserved_sectors_before_issuing_io() {
+    let discard = |sector, sectors| post(Request::Discard { unit: 0, sector, sectors });
+    let requests = [
+        post(Request::Reserve { unit: 0, start: 64, sectors: 8, read_only: true }),
+        discard(32, 48),    // overlaps the boot reservation
+        discard(8176, 32),  // overlaps an active extent after an unattached prefix
+        discard(7, 8),
+        discard(0, 0),
+        discard(131064, 16),
+        discard(32, 32),    // ends at the reservation, in two device commands
+    ];
+    let (replies, started, done) = run_split(blk::OP_DISCARD, &requests);
+    let statuses: Vec<_> = replies[3..9].iter().map(|words| wire::reply::<reply::Discard>(words)).collect();
+    assert_eq!(statuses, [Err(errno::EBUSY), Err(errno::EBUSY), Err(errno::EINVAL),
+        Err(errno::EINVAL), Err(errno::EINVAL), Ok(blk::STATUS_OK as u64)]);
+    let (control, guest): (Vec<_>, Vec<_>) = started.into_iter().partition(|&(tag, _, _)| tag == u64::MAX);
+    assert_eq!(control, [(u64::MAX, 32, 8192), (u64::MAX, 48, 8192)]);
+    assert_eq!(guest, [(0, 49144, 4096), (1, 8192, 4096)]);
+    assert_eq!(done, (1, 7, blk::STATUS_OK));
+}
+
+#[test]
 fn a_removed_clients_carried_piece_never_starts() {
     // The client is removed while its second piece waits for room: root
     // has cut its pool off from the device, so the piece fails instead of
     // starting, and the request completes with the first.
-    let (replies, started, done) = run_split(&[]);
+    let (replies, started, done) = run_split(blk::OP_READ, &[]);
     assert_eq!(replies[0][0], 0, "the extents attach");
     assert_eq!(replies[2][0], 0, "remove drains");
     assert_eq!(started, [(0, 49144, 4096)]);

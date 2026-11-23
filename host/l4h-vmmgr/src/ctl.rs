@@ -173,6 +173,10 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
             resp.data = *root::result_data();
             Ok(())
         }
+        abi::CTL_BLK_DISCARD => {
+            resp.vals = host_op(h, req.op, a)?;
+            Ok(())
+        }
         abi::CTL_BLK_WRITE | abi::CTL_NIC_CTL | abi::CTL_DRIVER_LOAD | abi::CTL_FIRMWARE_LOAD => {
             // From dom0's control data area, which root maps too.
             if h.guest(caller).and_then(|g| g.ctl_data()).is_none() { return Err(EINVAL); }

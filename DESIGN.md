@@ -2365,7 +2365,7 @@ it waits ("carry") and starts before any new request; the guest gets one
 completion, with the first error. A carried piece of a client being removed
 never starts: its pool is already cut off from the device, so it fails. The overlap rule applies extent by
 extent: dom0 can only reattach the physical extents of a removed LV once no
-guest holds them, and provisioning (`BLK_WRITE`) refuses every attached
+guest holds them. Both `BLK_WRITE` and `BLK_DISCARD` refuse every attached
 extent.
 
 - **Where the list goes.** dom0 writes the list into its control data area.
@@ -2384,8 +2384,8 @@ extent.
   edit the VG, dom0 builds a device-mapper device of the PV's size from that
   window and an `error` target for the rest, and runs LVM with activation
   off and `lvcreate -Zn -Wn`; data written by mistake fails loudly.
-  `l4hctl disk-zero` and `disk-write` zero or seed an LV's extents while
-  it is unattached.
+  `l4hctl disk-zero`, `disk-write`, and `disk-discard` act on unattached
+  extents.
 - **Path.** Guest `virtio_blk` → l4h-vmm → per-client shared queue → blkd →
   device.
 - **Guest queues.** Volumes offer four request queues through
@@ -2424,9 +2424,12 @@ extent.
   whatever the client's VMM let through, so what a client can have in flight
   is bounded. A virtio-blk device that takes fewer than 14 data segments is
   given no more: blkd tells its clients (`Channel::seg_max`), whose VMMs offer
-  their guests that many, and refuses a request with more. Operations other
-  than read, write and flush (GET_ID among them) are answered unsupported by
-  the VMM.
+  their guests that many, and refuses a request with more.
+- **Discard.** An attached writable volume offers `VIRTIO_BLK_F_DISCARD` when
+  its backing device supports discard. The guest supplies one range in 512-byte
+  sectors. The VMM copies the range into the request, and blkd maps it through
+  the extent table. The device receives no guest buffer. Virtio-blk uses
+  `VIRTIO_BLK_T_DISCARD`. NVMe uses Dataset Management with Deallocate.
 - **Who may use which sectors.** blkd alone decides: the overlap rule
   (`DiskWindow::conflicts`), dom0's boot reservations and provisioning
   exclusion (`blk::Reservations`). Root only asks: `check` gives the
@@ -2464,15 +2467,17 @@ extent.
   blkd has said that the device stopped, root suspends
   the driver and quarantines the controller: its DMA memory stays
   allocated, without an IOMMU every affected guest pool is pinned, and no
-  new attachment or provisioning write is accepted until host reboot.
+  new attachment or provisioning operation is accepted until host reboot.
 - **Provisioning.** dom0 can seed or explicitly zero *unattached* ranges
   with `BLK_WRITE` and its ioctl staging buffer (up to 1 MiB per call); a
   zero-length call flushes the controller. Provisioning uses a private 1 MiB
-  DMA scratch area and never writes over a client, read-only clients
-  included.
-  It waits for a busy device as long as that completes requests; one that
-  completes nothing for five seconds fails the write, and root quarantines the
-  controller.
+  DMA scratch area for writes. `BLK_DISCARD` takes a disk index, a start
+  sector, and a sector count. blkd checks the full 4 KiB aligned range against
+  attached and reserved windows. It splits the discard at the device limit.
+  An unsupported discard succeeds without changing the disk. Reads after
+  discard return unspecified data. Reclamation depends on the device.
+  A device that completes nothing
+  for five seconds fails the operation, and root quarantines the controller.
 - **Legacy devices.** Every virtio device the host drives (virtio-blk,
   virtio-scsi, virtio-net and the balloon) may also be a legacy (0.9.5) one:
   transitional device ID, registers in I/O BAR 0, no virtio capabilities, as

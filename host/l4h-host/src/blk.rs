@@ -22,6 +22,9 @@ pub const MAX_REQUEST_BYTES: u64 = SEG_MAX as u64 * SEG_SIZE_MAX as u64;
 pub const OP_READ: u32 = 0;
 pub const OP_WRITE: u32 = 1;
 pub const OP_FLUSH: u32 = 4;
+pub const OP_DISCARD: u32 = 11;
+pub const DISCARD_RANGE_SIZE: usize = 16;
+pub const MAX_DISCARD_SECTORS: u32 = (MAX_REQUEST_BYTES / 512) as u32;
 
 pub const STATUS_OK: u32 = 0;
 pub const STATUS_IOERR: u32 = 1;
@@ -45,7 +48,19 @@ pub struct Req {
     pub op: u32,
     pub nr_segs: u32,
     pub sector: u64,
+    /// For OP_DISCARD only. A discard has no data segments.
+    pub discard_sectors: u32,
     pub segs: [Seg; MAX_SEGS],
+}
+
+impl Req {
+    fn bytes(&self) -> u64 {
+        if self.op == OP_DISCARD {
+            u64::from(self.discard_sectors) * 512
+        } else {
+            self.segs[..self.nr_segs as usize].iter().map(|s| s.len as u64).sum()
+        }
+    }
 }
 
 #[repr(C)]
@@ -75,7 +90,9 @@ pub struct Channel {
     /// request the device takes, 1 to SEG_MAX, which the VMM offers its
     /// guest as seg_max.
     pub seg_max: u32,
-    pub reserved: [u32; 9],
+    /// Maximum sectors in one discard, or zero if the device has no discard.
+    pub discard_max_sectors: u32,
+    pub reserved: [u32; 8],
     /// Written by l4h-root before `call::add`; copied into private driver state.
     pub lba_start: u64,
     pub pool: Pool,
@@ -139,6 +156,8 @@ crate::protocol! {
         Check / check = 7 from [Root] (unit: usize, start: u64, sectors: u64, read_only: bool, dom0: bool, n: usize) -> Checked;
         /// The start and sectors of a client's kth extent in guest order.
         Extent / extent = 8 from [Root] (client: usize, k: usize) -> (u64, u64);
+        /// Discard an unattached range of a unit: the same status as Write.
+        Discard / discard = 9 from [Root] (sector: u64, sectors: u64, unit: usize) -> u64;
         /// `crate::TEST_INJECT` only: stop for good without failing, as a
         /// compromised blkd might.
         TestHang / test_hang = 0x7e58 from [Root] () -> ();
@@ -337,11 +356,12 @@ impl DiskWindow {
         let device_writes = match req.op {
             OP_READ => true,
             OP_WRITE if !read_only => false,
+            OP_DISCARD if !read_only && req.nr_segs == 0 => false,
             OP_FLUSH if req.nr_segs == 0 => return Ok(0),
             _ => return Err(STATUS_IOERR),
         };
         let segs = &req.segs[..req.nr_segs as usize];
-        let bytes: u64 = segs.iter().map(|s| s.len as u64).sum();
+        let bytes = req.bytes();
         let sector = self.start.checked_add(req.sector).ok_or(STATUS_IOERR)?;
         if bytes == 0 || bytes > MAX_REQUEST_BYTES || bytes % block_size as u64 != 0 || sector % (block_size as u64 / 512) != 0
             || req.sector.checked_add(bytes / 512).is_none_or(|end| end > self.sectors) {
@@ -503,7 +523,7 @@ impl<'a> Volume<'a> {
         let whole = DiskWindow { start: 0, sectors: self.sectors() };
         let g = whole.check_request(req, pool, block_size, read_only)?;
         if req.op == OP_FLUSH { return Ok(([(0, 0); 2], 0)); }
-        let bytes: u64 = req.segs[..req.nr_segs as usize].iter().map(|s| s.len as u64).sum();
+        let bytes = req.bytes();
         let k = self.order.partition_point(|&o| self.extents[o as usize].offset <= g) - 1;
         let e = self.nth(k).unwrap();
         // Extents are as long as a unit's capacity, which the device
@@ -620,7 +640,15 @@ impl<const N: usize> Reservations<N> {
         Ok(i)
     }
 
-    /// Whether provisioning may write `window` of `unit`: no client and no
+    /// Check an explicit provisioning range. Zero sectors never means
+    /// "to the end" for a write or discard.
+    pub fn check_provision_range<'a>(&self, active: &impl Fn(usize) -> Option<Hold<'a>>,
+        unit: usize, start: u64, sectors: u64, capacity: u64) -> Result<(), Errno> {
+        let window = DiskWindow::new(start, sectors, capacity).filter(|_| sectors != 0).ok_or(EINVAL)?;
+        if self.unattached(active, unit, window) { Ok(()) } else { Err(EBUSY) }
+    }
+
+    /// Whether provisioning may modify `window` of `unit`: no client and no
     /// reservation touches it, read-only or not.
     pub fn unattached<'a>(&self, active: &impl Fn(usize) -> Option<Hold<'a>>, unit: usize, window: DiskWindow) -> bool {
         let w = [Extent { start: window.start, sectors: window.sectors, offset: 0 }];

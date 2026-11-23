@@ -535,6 +535,25 @@ fn requests_split_at_most_once_where_extents_meet() {
 }
 
 #[test]
+fn discard_crosses_extents_without_dma_and_respects_volume_bounds() {
+    let t = build(&[(40960, 8192), (8192, 8192)]).unwrap();
+    let v = vol(&t);
+    let discard = Req { op: OP_DISCARD, sector: 8184, discard_sectors: 16, ..Default::default() };
+    assert_eq!(v.map(&discard, pool(), 4096, false), Ok(([(49144, 4096), (8192, 4096)], 2)));
+    assert_eq!(v.map(&discard, pool(), 4096, true), Err(STATUS_IOERR));
+
+    for invalid in [
+        Req { sector: 16376, ..discard },
+        Req { sector: 8185, ..discard },
+        Req { discard_sectors: 0, ..discard },
+        Req { discard_sectors: MAX_DISCARD_SECTORS + 8, ..discard },
+        Req { nr_segs: 1, ..discard },
+    ] {
+        assert_eq!(v.map(&invalid, pool(), 4096, false), Err(STATUS_IOERR));
+    }
+}
+
+#[test]
 fn a_request_that_would_need_three_pieces_fails() {
     // A one-block middle extent is not allowed with several extents, so
     // build the table by hand: blkd's check would refuse it, and map must

@@ -755,6 +755,9 @@ enum l4h_ctl_op {
 	 * vals[2] = the VMM's CPU in the last 100 ms (permille of a core);
 	 * both VMM values ~0 without a running VMM */
 	L4H_CTL_VM_VCPU_STATS = 58,
+	/* args: disk, sector, sectors (512-byte units). Discard an unattached,
+	 * 4 KiB aligned range. Reads after discard return unspecified data. */
+	L4H_CTL_BLK_DISCARD = 59,
 };
 
 #define L4H_DASHBOARD_TITLE_MAX 32
