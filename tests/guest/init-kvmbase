@@ -1,0 +1,50 @@
+#!/bin/sh
+# L1 init for tests/run-hvmbench.sh kvm: the baseline, Linux KVM in the
+# place of FL4 and l4h.  The same HVM guest (bzImage, init-vmcmp) under
+# QEMU with 1 vCPU and HB_MEM MiB, its disk L1's virtio disk (cache=none,
+# as blkd's is), its NIC a vhost-net tap to a TCP sink in L1 at
+# 192.168.9.2.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mount -t tmpfs tmp /tmp
+fail() { echo "HVMBENCH: FAIL: $*"; poweroff -f; }
+vendor=kvm-intel
+grep -qw svm /proc/cpuinfo && vendor="ccp kvm-amd"
+for m in irqbypass kvm $vendor virtio_blk tun tap vhost_iotlb vhost vhost_net; do
+    insmod "/lib/kvm/$m.ko" 2>/dev/null || [ "$m" = ccp ] || fail "insmod $m"
+done
+mem=${HB_MEM:-1024} reps=${HB_REPS:-1}
+echo "HVMBENCH: start (kvm), guests ${mem} MiB, 1 vCPU"
+ip link set lo up
+netbench recv 5001 &
+for r in $(seq 1 "$reps"); do
+    t0=$(mstime)
+    /usr/bin/qemu-system-x86_64 -accel kvm -cpu host -m "$mem" -smp 1 -nodefaults -no-user-config \
+        -display none -vga none -no-reboot -monitor none -serial stdio \
+        -L /usr/share/seabios -L /usr/share/qemu \
+        -kernel /bin/bzImage -initrd /bin/vmcmp.cpio.gz -append "console=ttyS0${HB_SPIN:+ spin}" \
+        -drive file=/dev/vda,if=none,id=d0,format=raw,cache=none,aio=native -device virtio-blk-pci,drive=d0 \
+        -netdev tap,id=n0,ifname=tap0,script=no,downscript=no,vhost=on -device virtio-net-pci,netdev=n0,romfile= \
+        </dev/null > /tmp/out 2>&1 &
+    q=$!
+    # QEMU makes tap0 (TUNSETIFF); L1's end of it is the sink's address.
+    until [ -e /sys/class/net/tap0 ]; do kill -0 $q 2>/dev/null || { cat /tmp/out; fail "qemu exited"; }; sleep 0.01; done
+    ip addr add 192.168.9.2/24 dev tap0 2>/dev/null
+    ip link set tap0 up
+    t1=
+    i=0
+    until grep -q "VMCMP: done" /tmp/out; do
+        [ -z "$t1" ] && grep -q "VMCMP: up" /tmp/out && t1=$(mstime)
+        kill -0 $q 2>/dev/null || { cat /tmp/out; fail "qemu exited"; }
+        i=$((i + 1)); [ $i -lt 6000 ] || { cat /tmp/out; fail "timeout"; }
+        sleep 0.01
+    done
+    t2=$(mstime)
+    kill $q; wait $q 2>/dev/null
+    tr -d "\r" < /tmp/out | grep "VMCMP: \|BENCH:" | sed "s/^/HVMBENCH: [kvm] /"
+    echo "HVMBENCH: [kvm] BENCH: create to init          $((t1 - t0)) ms"
+    echo "HVMBENCH: [kvm] workload took $((t2 - t1)) ms"
+done
+echo "HVMBENCH: done"
+poweroff -f

@@ -1,0 +1,35 @@
+#!/bin/sh
+# Guest init for tests/run-hvmbench.sh, the same in a PV and an HVM guest:
+# CPU, memory and TLB (vmcmp), kernel paths and disk (bench /dev/vda),
+# then ping and TCP to the PV sink at 192.168.9.2.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev 2>/dev/null
+echo "VMCMP: up, cpus $(grep -c ^processor /proc/cpuinfo), clock $(cat /sys/devices/system/clocksource/clocksource0/current_clocksource)"
+echo always > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null
+echo "VMCMP: tsc $(dmesg | grep -m1 -o "tsc: Refined.*\|tsc: Detected.*\|kvm-clock: .*")"
+{
+    for f in /sys/devices/system/cpu/vulnerabilities/*; do echo "VMCMP: vuln ${f##*/}: $(cat "$f")"; done
+    echo "VMCMP: flags $(grep -m1 ^flags /proc/cpuinfo | cut -d: -f2)"
+    echo "VMCMP: cr4 $(dmesg | grep -m1 -i "cr4\|xsave\|fpu" )"
+    echo "VMCMP: cmdline $(cat /proc/cmdline); HZ timer irqs $(grep -m1 -E 'LOC|timer' /proc/interrupts | tr -s ' ')"
+}
+echo "VMCMP: thp $(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || echo none)"
+if grep -qw spin /proc/cmdline; then
+    echo "VMCMP: spin start"
+    /bin/vmcmp spin
+    echo "VMCMP: spin end"
+fi
+/bin/vmcmp
+/bin/bench /dev/vda
+ip link set lo up
+ip addr add 192.168.9.3/24 dev eth0
+ip link set eth0 up
+ping -c 1 -W 5 192.168.9.2 >/dev/null
+ping -c 20 -i 0.01 192.168.9.2 | sed -n 's/.*= \([0-9.]*\)\/\([0-9.]*\)\/.*/BENCH: ping to PV sink        \2 ms/p'
+s=$(cut -d' ' -f1 /proc/uptime)
+netbench send 192.168.9.2 5001 128
+e=$(cut -d' ' -f1 /proc/uptime)
+echo "$s $e" | awk '{ printf "BENCH: TCP to PV sink        %10.0f MB/s\n", 134.2 / ($2 - $1) }'
+echo "VMCMP: done"
+sleep 1000000
