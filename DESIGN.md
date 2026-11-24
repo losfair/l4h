@@ -5278,7 +5278,10 @@ whichever test looked for that line (`tests/run-selftest.sh` checks it).
   console by line, and sends what it has of one after 100 ms, so that
   prompts show. Panic text is gathered by line. The ring's timestamps are
   not printed.
-- **logd** wakes on a 10 ms timer, since writers cannot wake it. `Merge`
+- **logd** wakes on a timer, since writers cannot wake it: every 10 ms
+  while there is output, backing off to 50 ms, 250 ms and, after about 6 s
+  of silence, 1 s (`serial::idle_ms`), so an idle system wakes it once a
+  second. `Merge`
   (also in `l4h_host::serial`) prints the record with the lowest timestamp
   of any ring, then lines of kernel console rings. A record claimed and not
   committed gets 100 ms; `(N lines lost)` reports what was overwritten or
