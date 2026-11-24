@@ -121,6 +121,8 @@ jobs:
         run: tests/run-selftest.sh 1
       - name: Linux self-test, 4 vCPUs
         run: tests/run-selftest.sh 4
+      - name: Guest FUSE (shared mappings, locks, WAL)
+        run: tests/run-fusetest.sh 4
       # VCPUs exist only when the CPU has VT-x or AMD-V (SVM), which needs a
       # runner whose KVM allows nesting.  Hosted runners vary, so the step
       # runs where it can and says so where it cannot.
@@ -374,6 +376,8 @@ jobs:
         run: tests/run-selftest.sh 1
       - name: Linux self-test, 4 vCPUs
         run: tests/run-selftest.sh 4
+      - name: Guest FUSE (shared mappings, locks, WAL)
+        run: tests/run-fusetest.sh 4
       - name: Transparent huge pages, 4 vCPUs
         run: tests/run-thptest.sh 4
       - name: Kernel modules
