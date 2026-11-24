@@ -5,6 +5,16 @@
 pub const MIN_US: u64 = 200;
 pub const VMM_SHARE_INIT: u32 = 250;
 
+/// Each round-robin budget expiry takes FL4's serial gate for a timer
+/// interrupt. On 64 busy vCPUs (GCE n4a-standard-64), raising the guest
+/// timeslice from 5 ms to 20 ms cut those interrupts from 57k/s to 22k/s
+/// and raised total guest getpid throughput from 24M/s to 37M/s.
+const GUEST_TIMESLICE_US: u64 = 20_000;
+
+pub fn guest_timeslice(host_timeslice: u64) -> u64 {
+    host_timeslice.max(GUEST_TIMESLICE_US)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Plan {
     pub period: u64,
@@ -16,17 +26,19 @@ pub struct Plan {
 
 /// `vmm` is its share of vCPU 0's cap, in permille.
 /// `min_period` is the architecture's capped floor.
-pub fn plan(timeslice: u64, min_period: u64, cap: u32, kernel_share: u32, vmm: Option<u32>) -> Plan {
+pub fn plan(host_timeslice: u64, min_period: u64, cap: u32, kernel_share: u32, vmm: Option<u32>) -> Plan {
     let cap = cap.min(100);
     // K/U share a core, so 100% needs no split without a VMM. The VMM
     // may stay behind when vCPU 0 migrates: its time must still be paid.
     if cap == 0 || (cap == 100 && vmm.is_none()) {
-        let vmm_period = vmm.map_or(0, |_| timeslice);
-        return Plan { period: timeslice, kernel: timeslice, user: timeslice,
+        let period = guest_timeslice(host_timeslice);
+        // The VMM takes turns with other host threads at its priority.
+        let vmm_period = vmm.map_or(0, |_| host_timeslice);
+        return Plan { period, kernel: period, user: period,
             vmm_period, vmm: vmm_period };
     }
     let parts = if vmm.is_some() { 3 } else { 2 };
-    let period = timeslice.max(min_period).max((parts * MIN_US * 100).div_ceil(cap as u64));
+    let period = host_timeslice.max(min_period).max((parts * MIN_US * 100).div_ceil(cap as u64));
     let total = period * cap as u64 / 100;
     let vmm_budget = match vmm {
         Some(share) => (total * share.min(1000) as u64 / 1000)

@@ -1671,10 +1671,12 @@ another guest's user work, bounded by `SC_K` budgets.
 
 ### 7.2 Budgets and CPU caps
 
-- `SC_K` and `SC_U` of each vCPU have a period of 5 ms. Uncapped, each has
-  the full period as budget; sums across a core may exceed 100%
-  (overcommit), and threads with budget left are scheduled round-robin
-  within the guest band. CPU weights are not implemented.
+- An uncapped vCPU's `SC_K` and `SC_U` each get a full round-robin budget
+  of 20 ms or the host timeslice, whichever is longer. This also applies
+  at a 100% cap when the vCPU has the whole budget to itself. An uncapped
+  VMM uses the host timeslice (normally 5 ms) as its base period. Budgets
+  on a core can total more than 100% (overcommit), and threads with budget left
+  take turns within their priority band. CPU weights are not implemented.
 - **CPU caps** (`vm_set_sched`, `l4hctl sched`) give each vCPU one budget,
   a percentage of the period, split between SC_K and SC_U. vCPU 0 shares
   its budget with the guest's VMM. Thus the guest and its VMM together stay within the
