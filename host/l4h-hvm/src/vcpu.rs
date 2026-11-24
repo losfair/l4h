@@ -140,7 +140,7 @@ impl<H: Hw> Vcpu<H> {
     pub fn new(v: usize, hw: H) -> Self {
         let vm = vm();
         let mut c = Vcpu {
-            id: v, hw, lapic: Lapic::new(v as u32, v == 0, vm.tsc_hz), msrs: msr::Msrs::new(vm.amd), tsc_offset: 0,
+            id: v, hw, lapic: Lapic::new(vm.topology.apic_id[v], v == 0, vm.tsc_hz), msrs: msr::Msrs::new(vm.amd), tsc_offset: 0,
             kvm_time: 0, kvm_wall: 0, kvm_version: 0, pv_eoi: 0, pv_eoi_set: false,
             halted: false, wait_sipi: v != 0, nmis: 0, inject: None, dr: [0; 4], dr6: 0xffff_0ff0, dr7: 0x400, xcr0: 1, armed: 0,
         };
@@ -408,7 +408,7 @@ impl<H: Hw> Vcpu<H> {
             Exit::Cpuid => {
                 let (leaf, sub) = (self.hw.gprs()[0] as u32, self.hw.gprs()[1] as u32);
                 let ctx = cpuid::Ctx {
-                    vcpu: self.id as u32, vcpus: vm().vcpus as u32, tsc_hz: vm().tsc_hz,
+                    topo: vm().topology.place(self.id), tsc_hz: vm().tsc_hz,
                     osxsave: self.hw.cr4() & CR4_OSXSAVE != 0, xcr0: self.xcr0, xcr0_max: vm().xcr0,
                     pke: self.hw.cr4() & CR4_PKE != 0, invpcid: vm().invpcid.load(Ordering::Relaxed),
                 };

@@ -15,6 +15,7 @@ use l4h_rt::host::hvm::{self as hv, HvmConfig};
 
 use crate::console::Output;
 use crate::dev::apic::{self, Message};
+use crate::x86::cpuid::Topology;
 use crate::dev::ioapic::IoApic;
 use crate::dev::pit::Pit;
 use crate::dev::pm::Pm;
@@ -64,6 +65,8 @@ pub struct Vm {
     pub host: Host,
     pub tsc_hz: u64,
     pub vcpus: usize,
+    /// Its vCPUs' cores and threads, and their APIC IDs (x86::cpuid).
+    pub topology: Topology,
     /// AMD-V rather than VT-x (the host CPU's vendor, as seL4 chooses).
     pub amd: bool,
     pub mem: GuestMem,
@@ -132,9 +135,10 @@ pub fn wall_ns(epoch_ns: u64, epoch_ticks: u64, tsc_hz: u64, t: u64) -> u64 {
 pub fn build(cfg: &'static HvmConfig, tsc_hz: u64, mem: GuestMem, host: Host) -> Result<(), BuildError> {
     let (amd, xcr0) = (host.amd, host.xcr0);
     let vcpus = (cfg.nr_vcpus as usize).clamp(1, hv::MAX_VCPUS);
+    let topology = if cfg.topology != 0 { Topology::of(&cfg.vcpu_core[..vcpus]) } else { Topology::flat(vcpus) };
     let kernel = crate::boot::Kernel::parse(&mem, cfg.kernel_gpa, cfg.kernel_size).map_err(BuildError::Kernel)?;
     let tables = unsafe { ACPI.get() };
-    crate::acpi::build(vcpus, tables);
+    crate::acpi::build(&topology.apic_id[..vcpus], tables);
     if !mem.write_bytes(crate::acpi::RSDP, &tables[..]) {
         return Err(BuildError::Acpi);
     }
@@ -146,9 +150,10 @@ pub fn build(cfg: &'static HvmConfig, tsc_hz: u64, mem: GuestMem, host: Host) ->
         host,
         tsc_hz,
         vcpus,
+        topology,
         amd,
         mem,
-        apics: core::array::from_fn(|v| apic::Shared::new(v as u32)),
+        apics: core::array::from_fn(|v| apic::Shared::new(topology.apic_id[v])),
         kicks: Kicks::new(),
         bar0: [const { AtomicU64::new(0) }; 32],
         ioapic: SpinLock::new(IoApic::new()),

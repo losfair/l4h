@@ -255,8 +255,8 @@ fn dsdt_body(a: &mut Aml) {
 }
 
 /// Write every table into `out` (the bytes from RSDP to END, at RSDP),
-/// for `vcpus` vCPUs.
-pub fn build(vcpus: usize, out: &mut [u8; (END - RSDP) as usize]) {
+/// for vCPUs with APIC IDs `apic_ids` (below 0xff), the first the boot one.
+pub fn build(apic_ids: &[u32], out: &mut [u8; (END - RSDP) as usize]) {
     out.fill(0);
     let mut put = |at: u64, b: &[u8]| {
         let o = (at - RSDP) as usize;
@@ -310,8 +310,8 @@ pub fn build(vcpus: usize, out: &mut [u8; (END - RSDP) as usize]) {
     let mut m = Table::<1024>::new();
     m.header(b"APIC", 5);
     m.u32(crate::dev::lapic::BASE_ADDR as u32).u32(0);
-    for v in 0..vcpus {
-        m.u8(0).u8(8).u8(v as u8).u8(v as u8).u32(1);
+    for (v, &id) in apic_ids.iter().enumerate() {
+        m.u8(0).u8(8).u8(v as u8).u8(id as u8).u32(1);
     }
     m.u8(1).u8(12).u8(0).u8(0).u32(ioapic::BASE as u32).u32(0);
     // The SCI: ISA IRQ 9 is GSI 9, level-triggered, active high.
@@ -357,7 +357,7 @@ mod tests {
     #[test]
     fn tables_and_checksums() {
         let mut out = std::boxed::Box::new([0u8; (END - RSDP) as usize]);
-        build(4, &mut out);
+        build(&[0, 1, 2, 3], &mut out);
         // RSDP: both checksums, the XSDT.
         assert_eq!(&out[..8], b"RSD PTR ");
         assert_eq!(out[..20].iter().fold(0u8, |s, &b| s.wrapping_add(b)), 0);
@@ -395,6 +395,11 @@ mod tests {
         assert!(!has(b"PWRB") && !has(&[0x0c, 0x41, 0xd0, 0x0c, 0x0c]), "no PNP0C0C");
         let flags = u32::from_le_bytes(f[112..116].try_into().unwrap());
         assert_eq!(flags & (1 << 4), 0, "PWR_BUTTON clear: the fixed power button");
+        // Each vCPU's APIC ID (x86::cpuid::Topology's), its number the UID.
+        build(&[0, 2, 1, 4, 3], &mut out);
+        let m = table(&out[..], MADT);
+        let lapics: std::vec::Vec<(u8, u8)> = m[44..].chunks(8).take_while(|e| e[0] == 0).map(|e| (e[2], e[3])).collect();
+        assert_eq!(lapics, [(0, 0), (1, 2), (2, 1), (3, 4), (4, 3)]);
     }
 
     #[test]

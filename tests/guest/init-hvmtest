@@ -84,11 +84,17 @@ l4hctl destroy "$id" || fail "destroy hvm1"
 reclaim
 echo "HVMTEST: hvm1 reclaimed"
 
-# 2: the disk keeps what hvm1 wrote; destroyed while it runs.
-id=$(l4hctl create hvm2 --hvm --kernel "$kernel" --initrd /bin/hvmvm.cpio.gz --mem 192 --vcpus 1 \
-    --disk 0 --cmdline "console=$con DISK=check") || fail "create hvm2"
+# 2: the disk keeps what hvm1 wrote; destroyed while it runs.  On x86-64,
+# 6 vCPUs on the host's 4 single-thread cores: placement fills every core
+# once, then puts two of them on two cores a second time (DESIGN.md §7.3),
+# and the guest sees those vCores as cores of two SMT threads (§5.11).
+if [ "$con" = ttyS0 ]; then vcpus=6; else vcpus=1; fi
+id=$(l4hctl create hvm2 --hvm --kernel "$kernel" --initrd /bin/hvmvm.cpio.gz --mem 192 --vcpus $vcpus \
+    --disk 0 --cmdline "console=$con DISK=check TOPO=1") || fail "create hvm2"
 console "$id" "HVMVM: ready" 900
+grep "HVMVM: \(topo\|llc\)" /tmp/out
 expect "HVMVM: disk check ok" "disk persistence"
+[ "$vcpus" = 1 ] || expect "HVMVM: topo 4 cores, 2 with siblings" "the guest's SMT siblings"
 l4hctl destroy "$id" || fail "destroy hvm2"
 reclaim
 echo "HVMTEST: hvm2 destroyed running and reclaimed"

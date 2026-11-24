@@ -544,6 +544,12 @@ fn configure(g: &Guest, cfg: &mut hv::HvmConfig, host_info: &HostInfo) {
     cfg.serial = 1;
     cfg.cmdline = boot.cmdline;
     cfg.attest = h.attest.is_some() as u32;
+    // Its vCores, which the guest sees as SMT cores (CPUID and the MADT's
+    // APIC IDs): placement and balancing keep them whole (DESIGN.md §7.3).
+    cfg.topology = 1;
+    for (v, vcpu) in g.vcpus.iter().enumerate() {
+        cfg.vcpu_core[v] = vcpu.vcore as u8;
+    }
     let mut n = 0;
     for (d, b) in g.backends.iter() {
         let d = *d;
