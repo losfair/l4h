@@ -17,18 +17,24 @@ const PERIOD: u64 = 100_000;
 fn vmm_and_guest_share_caps_without_reserving_uncapped_cpu_time() {
     for has_vmm in [false, true] {
         for cap in 0..=100 {
-            for minimum in [0, 40_000] {
+            for (host_slice, minimum, guest_slice) in [
+                (5_000, 0, 20_000),
+                (5_000, 40_000, 20_000),
+                (25_000, 0, 25_000),
+            ] {
                 for k in [0, 1, 250, 500, 750, 999, 1000] {
                     for v in [0, 1, 250, 500, 750, 999, 1000] {
-                        let p = budget::plan(5000, minimum, cap, k, has_vmm.then_some(v));
+                        let p = budget::plan(host_slice, minimum, cap, k, has_vmm.then_some(v));
                         assert!(p.kernel >= budget::MIN_US && p.user >= budget::MIN_US);
                         assert!(if has_vmm { p.vmm >= budget::MIN_US } else { p.vmm == 0 });
                         if cap > 0 && (cap < 100 || has_vmm) {
                             if has_vmm { assert_eq!(p.period, p.vmm_period); }
+                            if cap == 100 { assert_eq!(p.period, host_slice.max(minimum)); }
                             assert_eq!(p.kernel + p.user + p.vmm, p.period * cap as u64 / 100);
                         } else {
-                            assert_eq!((p.period, p.kernel, p.user), (5000, 5000, 5000));
-                            assert_eq!(p.vmm, if has_vmm { 5000 } else { 0 });
+                            assert_eq!((p.period, p.kernel, p.user), (guest_slice, guest_slice, guest_slice));
+                            let vmm_slice = if has_vmm { host_slice } else { 0 };
+                            assert_eq!((p.vmm, p.vmm_period), (vmm_slice, vmm_slice));
                         }
                     }
                 }
