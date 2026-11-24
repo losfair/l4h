@@ -93,8 +93,7 @@ pub struct HostInfo {
     pub timeslice_us: u64,
     /// Wall clock at root's boot (ns since the epoch, 0 if unknown) and
     /// the tick count when it was read.
-    pub epoch_ns: u64,
-    pub epoch_ticks: u64,
+    pub clock_anchor: [u64; 2],
     /// New guests so far, to stagger their placement.
     placement: core::cell::Cell<usize>,
 }
@@ -461,6 +460,7 @@ impl Vmmgr {
     /// reserved `Guest::start_bytes`. A scheduling failure stops this
     /// guest and is reported to its caller without taking down vmmgr.
     pub fn spawn_vmm(&mut self, g: &mut Guest) -> Result<(), Errno> {
+        self.info.clock_anchor = root::clock_anchor()?;
         let limits = sched::prepare_vmm(self, g).ok_or(ctl::EIO)?;
         if g.attest {
             root::trust_register(g);
@@ -658,8 +658,7 @@ fn main(info: &'static Info) -> ! {
         has_gicv_frames: cfg.has_gicv_frames != 0,
         hyp_ep: cap::Endpoint::from_bits(host::SLOT_SERVICE_EP),
         timeslice_us: cfg.timeslice_us,
-        epoch_ns: cfg.epoch_ns,
-        epoch_ticks: cfg.epoch_ticks,
+        clock_anchor: [0; 2],
         placement: core::cell::Cell::new(0),
     };
     let modules = kimage::Modules::new(cfg.modules_radix as usize, cfg.modules_pages as usize);

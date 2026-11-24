@@ -225,8 +225,6 @@ pub fn spawn(h: &mut Host, modules: &Modules, plan: &Dom0Plan) -> Vmmgr {
         cfg.cores = h.info.cores as u64;
         cfg.tsc_hz = h.info.tsc_hz;
         cfg.timeslice_us = h.info.timeslice_us;
-        cfg.epoch_ns = h.info.epoch_ns;
-        cfg.epoch_ticks = h.info.epoch_ticks;
         cfg.cpu_id = h.info.cpu_id;
         let (cpus, physical, order) = h.info.topology.raw();
         (cfg.topo_cpus, cfg.topo_physical, cfg.topo_order) = (cpus as u64, physical, order);
@@ -450,6 +448,18 @@ impl root_call::Server for Calls<'_> {
 
     fn result(&mut self, _: Sender, token: usize) -> Result<RootVals, Errno> {
         result(self.0, token).map(|vals| RootVals::of(&vals))
+    }
+
+    fn clock_anchor(&mut self, _: Sender) -> Result<[u64; 2], Errno> {
+        let h = &mut self.0;
+        if !crate::partition::secondary() {
+            let ticks = host::ticks::now();
+            let ns = h.rtc.read_ns(&mut h.wins.a);
+            if ns != 0 {
+                return Ok([ns, ticks]);
+            }
+        }
+        Ok([h.info.epoch_ns, h.info.epoch_ticks])
     }
 
     fn usb_attach(&mut self, _: Sender, guest: usize, ctrl: usize) -> Result<u64, Errno> {

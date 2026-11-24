@@ -172,6 +172,8 @@ crate::protocol! {
         /// bit n.
         UsbAttach / usb_attach = 0x107 from [Vmmgr] (guest: usize, ctrl: usize)
             caps { Out QUEUE_FRAMES: CNode [0; 1], Out KICK: Notification [1; 1] } -> u64;
+        /// Wall time in nanoseconds and its counter tick, for a guest about to start.
+        ClockAnchor / clock_anchor = 0x108 from [Vmmgr] () -> [u64; 2];
     }
 }
 

@@ -34,6 +34,10 @@ fn root() -> Endpoint<l4h_host::root::call::Proto> {
     Endpoint::of(&wiring::VMMGR_ROOT, wiring::p::Vmmgr, 0)
 }
 
+pub fn clock_anchor() -> Result<[u64; 2], Errno> {
+    errno(root().clock_anchor())
+}
+
 /// Root's errno as ours: a failed root is EIO.
 use l4h_host::wire::eio_if_failed as errno;
 

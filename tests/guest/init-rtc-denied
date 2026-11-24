@@ -1,5 +1,10 @@
 #!/bin/sh
 mount -t devtmpfs dev /dev
+now=$(date +%s)
+if [ "$now" -lt "${L4H_RTC_EXPECT:?}" ] || [ "$now" -gt "$((L4H_RTC_EXPECT + 120))" ]; then
+    echo "RTCTEST: FAIL: new guest clock $now, expected $L4H_RTC_EXPECT"
+    poweroff -f
+fi
 if [ -e /dev/l4hctl ] || l4hctl rtc-set 951827696; then
     echo "RTCDENIED: FAIL"
 else

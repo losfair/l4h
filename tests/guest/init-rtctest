@@ -9,9 +9,6 @@ before=$(date +%s)
 # after SeaBIOS has finished initializing it.
 echo "RTCTEST: ready"
 sleep 5
-id=$(l4hctl create rtc-denied --initrd /bin/rtc-denied.cpio.gz --mem 128) || fail "create ordinary guest"
-l4hctl console "$id" --until 'RTCDENIED: PASS' --timeout 120 || fail "ordinary guest RTC access"
-l4hctl destroy "$id" || fail "destroy ordinary guest"
 case "$L4H_RTC_TEST" in
     explicit)
         target=951827696 # 2000-02-29 12:34:56 UTC
@@ -30,6 +27,10 @@ for seconds in "$L4H_RTC_INVALID" 18446744073709551615; do
     if l4hctl rtc-set "$seconds" >/tmp/err 2>&1; then fail "accepted $seconds"; fi
     grep -q 'invalid argument' /tmp/err || fail "range error"
 done
+id=$(l4hctl create rtc-denied --initrd /bin/rtc-denied.cpio.gz --mem 128 \
+    --cmdline "console=hvc0 L4H_RTC_EXPECT=$target") || fail "create ordinary guest"
+l4hctl console "$id" --until 'RTCDENIED: PASS' --timeout 120 || fail "ordinary guest RTC"
+l4hctl destroy "$id" || fail "destroy ordinary guest"
 after=$(date +%s)
 [ "$after" -ge "$before" ] && [ "$after" -lt "$((before + 120))" ] || fail "guest clock changed"
 echo "RTCTEST: PASS target=$target"
