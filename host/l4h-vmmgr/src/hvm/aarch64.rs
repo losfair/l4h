@@ -260,7 +260,7 @@ pub fn create(
         let guest_tcb = ctx.cap::<cap_type::Tcb>(ObjectBlueprint::Tcb);
         let event = ctx.cap::<cap_type::Granule>(FRAME_BP);
         host_info.sched_control(core)
-            .sched_control_configure_flags(sc_k, host_info.timeslice_us, host_info.timeslice_us, 0, 0, 0)
+            .sched_control_configure_flags(sc_k, crate::sched::guest_timeslice(host_info), crate::sched::guest_timeslice(host_info), 0, 0, 0)
             .expect("configure SC_K");
         let Some(vcpu) = g.arena.try_object_raw(alloc, VCPU_TYPE, VCPU_BITS) else {
             g.hvm = Some(h);

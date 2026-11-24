@@ -1516,10 +1516,10 @@ pub fn create(
 
         let sched_control = host_info.sched_control(core);
         sched_control
-            .sched_control_configure_flags(sc_k, host_info.timeslice_us, host_info.timeslice_us, 0, 0, 0)
+            .sched_control_configure_flags(sc_k, crate::sched::guest_timeslice(host_info), crate::sched::guest_timeslice(host_info), 0, 0, 0)
             .expect("configure SC_K");
         sched_control
-            .sched_control_configure_flags(sc_u, host_info.timeslice_us, host_info.timeslice_us, 0, 0, 0)
+            .sched_control_configure_flags(sc_u, crate::sched::guest_timeslice(host_info), crate::sched::guest_timeslice(host_info), 0, 0, 0)
             .expect("configure SC_U");
 
         ktcb.tcb_configure(g.cnode, CNodeCapData::new(0, abi::ROOT_GUARD_BITS), g.vspace, abi::vcpu_ipcbuf_va(v), ipcbuf)

@@ -226,7 +226,7 @@ pub fn create(
         let vcpu = ctx.cap::<cap_type::VCpu>(VCPU_BP);
         let event = ctx.cap::<cap_type::Granule>(FRAME_BP);
         host_info.sched_control(core)
-            .sched_control_configure_flags(sc_k, host_info.timeslice_us, host_info.timeslice_us, 0, 0, 0)
+            .sched_control_configure_flags(sc_k, crate::sched::guest_timeslice(host_info), crate::sched::guest_timeslice(host_info), 0, 0, 0)
             .expect("configure SC_K");
         h.vcpu_objs.must_push(vcpu);
         g.vcpus.must_push(Vcpu { ktcb, ntfn, event, sc_k, sc_u: None, core, vcore, host_cap: 1024, cooldown: 0, usage: 0,

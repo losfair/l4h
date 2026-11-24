@@ -1,0 +1,32 @@
+#!/bin/sh
+# Quick many-core probe for tests/gce-bench.sh --probe: getpid on one
+# process per CPU of each range (tests/guest/getpidscale), about a second
+# each.  The ranges come from the kernel command line (probe_ranges=, with
+# commas for spaces), or 1, 16, 32, ... and all guest CPUs.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+n=$(nproc)
+ranges=$(sed -n 's/.*probe_ranges=\([^ ]*\).*/\1/p' /proc/cmdline | tr , ' ')
+if [ -z "$ranges" ]; then
+    ranges=0
+    k=16
+    while [ "$k" -lt "$n" ]; do
+        ranges="$ranges 0-$((k - 1))"
+        k=$((k * 2))
+    done
+    ranges="$ranges 0-$((n - 1))"
+fi
+echo "PROBE: start online=$(cat /sys/devices/system/cpu/online)"
+# Let the boot log drain first: console output slows syscalls.
+sleep 2
+ok=1
+for r in $ranges; do
+    /bin/getpidscale "$r" || ok=
+done
+if [ -n "$ok" ]; then
+    echo 'PROBE: PASS'
+else
+    echo 'PROBE: FAIL getpidscale exit'
+fi
+poweroff -f

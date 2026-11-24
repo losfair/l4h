@@ -38,10 +38,30 @@ fn min_period() -> u64 {
     if cfg!(target_arch = "aarch64") { 40_000 } else { 0 }
 }
 
+/// An uncapped vCPU's scheduling contexts: round robin (budget = period),
+/// whose only effect is how often vCPUs sharing a core take turns. Each
+/// budget's end is a kernel timer interrupt, taken under FL4's serial gate:
+/// with the host's 5 ms timeslice, SC_K and SC_U on 64 busy vCPUs (GCE
+/// n4a-standard-64) made about 57k of them a second, and guest getpid
+/// reached 24M ops/s in all; with 20 ms, 22k and 37M. Capped vCPUs keep
+/// the host's timeslice, which sets how evenly their cap is spread.
+pub const GUEST_TIMESLICE_US: u64 = 20_000;
+
+/// The round-robin timeslice of an uncapped vCPU's contexts.
+pub fn guest_timeslice(info: &HostInfo) -> u64 {
+    info.timeslice_us.max(GUEST_TIMESLICE_US)
+}
+
 fn plan(info: &HostInfo, g: &Guest, v: usize, has_vmm: bool, backgrounds: usize) -> budget::Plan {
-    let p = budget::plan(info.timeslice_us, min_period(), g.cpu_cap_pct, g.vcpus[v].k_share,
+    let p = budget::plan(slice(info, g, has_vmm), min_period(), g.cpu_cap_pct, g.vcpus[v].k_share,
         has_vmm.then_some(g.vmm_share));
     if has_vmm && g.vmm_limited { budget::background(p, backgrounds) } else { p }
+}
+
+/// The timeslice `budget::plan` gets: the guest one where the plan is
+/// round robin (no cap, or 100% without a VMM), the host's otherwise.
+fn slice(info: &HostInfo, g: &Guest, has_vmm: bool) -> u64 {
+    if g.cpu_cap_pct == 0 || (g.cpu_cap_pct >= 100 && !has_vmm) { guest_timeslice(info) } else { info.timeslice_us }
 }
 
 fn pair(info: &HostInfo, gid: usize, v: usize, vcpu: &Vcpu, core: usize, p: budget::Plan) -> bool {
@@ -301,7 +321,7 @@ pub fn balance(h: &mut Vmmgr, elapsed_us: u64) {
                 if g.cpu_cap_pct > 0 {
                     if let Some((ks, vs)) = budget::adapt(old, g.vcpus[v].k_share, g.vmm_share,
                         [ck, cu, if has_vmm { cv } else { 0 }], elapsed_us) {
-                        let mut next = budget::plan(h.info.timeslice_us, min_period(), g.cpu_cap_pct, ks, has_vmm.then_some(vs));
+                        let mut next = budget::plan(slice(&h.info, g, has_vmm), min_period(), g.cpu_cap_pct, ks, has_vmm.then_some(vs));
                         if has_vmm && g.vmm_limited {
                             next = budget::background(next, backgrounds[g.vmm_limits.expect("VMM limits").0]);
                         }
