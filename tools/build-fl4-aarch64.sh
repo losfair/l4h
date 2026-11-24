@@ -42,7 +42,7 @@ cmake -DCMAKE_C_FLAGS="$l4h_prefix_map" -DCMAKE_ASM_FLAGS="$l4h_prefix_map" -G N
     -DCROSS_COMPILER_PREFIX=aarch64-linux-gnu- \
     -DKernelDebugBuild="$debug" \
     -DNoKernelPrinting=ON \
-    -DKernelMaxNumNodes=16 \
+    -DKernelMaxNumNodes=64 \
     -DQEMU_GIC_VERSION=3 \
     -DKernelRetypeFanOutLimit=256 \
     -DLibSel4PrintInvocationErrors=0

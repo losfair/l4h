@@ -13,32 +13,41 @@
 # --scale measures many-core scaling instead: syscallbench, then smpbench
 # at 1, 2, 4, ... and all dom0 vCPUs (tests/guest/init-smpscale), with dom0
 # on every host CPU (VCPUS defaults to the machine's) and 8 GiB of RAM.
+# --probe is a quick scaling check instead (about 10 s of benchmark):
+# getpid on one process per CPU for 1, 16, 32, ... and all dom0 vCPUs
+# (tests/guest/init-getpidscale; PROBE_RANGES="0 0-31 ..." picks others),
+# with dom0 on every host CPU as for --scale.
 # --aarch64 benchmarks L4H on FL4 for AArch64 on an Arm C4A (default
 # c4a-standard-4 in us-central1-b), dom0 in FL4's UEFI application.
-# Usage: gce-bench.sh [--sev-snp|--aarch64] [--scale] PROJECT [ZONE] [MACHINE_TYPE]
+# Usage: gce-bench.sh [--sev-snp|--aarch64] [--scale|--probe] PROJECT [ZONE] [MACHINE_TYPE]
 # e.g.   gce-bench.sh PROJECT us-central1-a n4-standard-4
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 export L4H_RELEASE=1 L4H_ARCH=x86_64 L4H_KERNEL_VARIANT=fl4 SEL4_PREFIX=$root/build/sel4-fl4
 source "$root/tools/host-profile.sh"
 usage() {
-    echo "Usage: gce-bench.sh [--sev-snp|--aarch64] [--scale] PROJECT [ZONE] [MACHINE_TYPE]" >&2
+    echo "Usage: gce-bench.sh [--sev-snp|--aarch64] [--scale|--probe] PROJECT [ZONE] [MACHINE_TYPE]" >&2
     exit 2
 }
 # Options anywhere; after --, arguments only.
-snp= scale= arm=
+snp= scale= arm= probe=
 pos=()
 while [ $# -gt 0 ]; do
     case $1 in
         --sev-snp) snp=1 ;;
         --aarch64) arm=1 ;;
         --scale) scale=1 ;;
+        --probe) probe=1 ;;
         --) shift; pos+=("$@"); break ;;
         -*) echo "gce-bench.sh: unknown option $1" >&2; usage ;;
         *) pos+=("$1") ;;
     esac
     shift
 done
+if [ -n "$scale" ] && [ -n "$probe" ]; then
+    echo "gce-bench.sh: --scale and --probe cannot be combined" >&2
+    exit 2
+fi
 if [ -n "$arm" ] && [ -n "$snp" ]; then
     echo "gce-bench.sh: --aarch64 and --sev-snp cannot be combined" >&2
     exit 2
@@ -123,7 +132,17 @@ else
     objcopy --strip-debug "$root/build/linux-l4h/vmlinux" "$work/vmlinux"
 fi
 "$cc" -O2 -static -Wall -Wextra -Werror -o "$work/syscallbench" "$root/tests/guest/syscallbench.c"
-if [ -n "$scale" ]; then
+cmdline="console=hvc0 quiet"
+if [ -n "$probe" ]; then
+    "$cc" -O2 -static -Wall -Wextra -Werror -o "$work/getpidscale" "$root/tests/guest/getpidscale.c"
+    "$root/tools/mkinitramfs.sh" "$work/dom0.cpio.gz" "$root/tests/guest/init-getpidscale" \
+        "$work/getpidscale" >/dev/null
+    marker=PROBE
+    [ -n "${PROBE_RANGES:-}" ] && cmdline+=" probe_ranges=$(echo "$PROBE_RANGES" | tr ' ' ,)"
+    vcpus=${VCPUS:-$(gcloud compute machine-types describe "$machine" --project="$project" \
+        --zone="$zone" --format='value(guestCpus)')}
+    mem_mb=4096
+elif [ -n "$scale" ]; then
     "$cc" -O2 -static -Wall -Wextra -Werror -o "$work/smpbench" "$root/tests/guest/smpbench.c"
     "$root/tools/mkinitramfs.sh" "$work/dom0.cpio.gz" "$root/tests/guest/init-smpscale" \
         "$work/syscallbench" "$work/smpbench" >/dev/null
@@ -141,7 +160,7 @@ fi
 host_build=build-host.sh
 [ -n "$arm" ] && host_build=build-host-aarch64.sh
 build_step host-build env L4H_DOM0_DISKS=0 L4H_DOM0_VCPUS="$vcpus" L4H_DOM0_MEM_MB="$mem_mb" \
-    L4H_DOM0_CMDLINE="console=hvc0 quiet" L4H_WATCHDOG_SECS=0 "$root/tools/$host_build"
+    L4H_DOM0_CMDLINE="$cmdline" L4H_WATCHDOG_SECS=0 "$root/tools/$host_build"
 export L4H_GUEST_KERNEL=$work/vmlinux L4H_GUEST_SDK=
 if [ -n "$arm" ]; then
     # dom0's initramfs goes in the application.
@@ -188,6 +207,6 @@ while [ $SECONDS -lt $end ]; do
         >"$log" 2>/dev/null || continue
     grep -aqE "$marker: (PASS|FAIL)" "$log" && break
 done
-grep -aE "$marker|SYSCALLBENCH|SMPBENCH|FL4: speculation|FL4: AMD SEV|FL4: ITS|l4h-root: MSIs through|no MSIs|FL4: [0-9]+ core|l4h-root: [0-9]+ core|panic|fault" "$log" || true
+grep -aE "$marker|SYSCALLBENCH|SMPBENCH|GETPIDSCALE|FL4: speculation|FL4: AMD SEV|FL4: ITS|l4h-root: MSIs through|no MSIs|FL4: [0-9]+ core|l4h-root: [0-9]+ core|panic|fault" "$log" || true
 echo "serial log: $log"
 grep -aqE "$marker: PASS" "$log"
