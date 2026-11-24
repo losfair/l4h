@@ -31,6 +31,7 @@ all: vmlinux
 archheaders:
 	$(Q)$(MAKE) -f $(srctree)/Makefile ARCH=arm64 asm-generic archheaders
 archprepare:
+	$(Q)mkdir -p arch/arm64/tools
 	$(Q)$(MAKE) $(build)=$(ARCH_DIR)/arm64 include/generated/user_constants.h
 	$(Q)$(MAKE) $(build)=arch/arm64/tools kapi
 export LDS_START := 0x60000000

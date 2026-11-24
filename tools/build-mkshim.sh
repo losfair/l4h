@@ -11,6 +11,13 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 source "$root/tools/reproducible-env.sh"
 n=${1:-8}
 out=$root/build/mkshim${L4H_KERNEL_VARIANT:+-$L4H_KERNEL_VARIANT}
+if [ "${L4H_PREBUILT:-0}" = 1 ] && [ -f "$out/l4h-mkshim.elf" ]; then
+    prebuilt_ok=1
+    for k in $(seq 0 $((n - 1))); do
+        [ -f "$out/kernel-s$k.elf" ] || { prebuilt_ok=0; break; }
+    done
+    [ "$prebuilt_ok" != 1 ] || exit 0
+fi
 mkdir -p "$out"
 base=${L4H_KERNEL_VARIANT:-}
 for k in $(seq 0 $((n - 1))); do

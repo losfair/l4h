@@ -12,6 +12,12 @@ cd "$root/host"
 # L4H_RELEASE=1 builds the shipped, optimised components (the cargo release
 # profile); otherwise the dev profile (tools/host-profile.sh).
 source "$root/tools/host-profile.sh"
+if [ "${L4H_PREBUILT:-0}" = 1 ] && [ "$#" -eq 0 ] && [ -z "${L4H_EXTRA_DRIVERS:-}" ] &&
+   [ "${L4H_TEST_VMM_BUSY:-0}" != 1 ] &&
+   { [ "${L4H_TEST_INJECT:-0}" != 1 ] || [ "${L4H_PREBUILT_INJECT:-0}" = 1 ]; } &&
+   [ -f "$root/host/target/x86_64-sel4-roottask/$l4h_profile/l4h-root.elf" ]; then
+    exit 0
+fi
 out=$root/host/target/x86_64-sel4/$l4h_profile
 mkdir -p "$out/stripped"
 strip() {

@@ -8,16 +8,19 @@ out=$root/build/guest
 mkdir -p "$out/ctlroot"
 "$root/tools/build-linux.sh" vmlinux >"$root/build/linux-build.log" 2>&1 \
     || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
-"$l4h_objcopy" --strip-debug "$l4h_linux_out/vmlinux" "$l4h_linux_out/vmlinux.stripped"
+if [ ! -f "$l4h_linux_out/vmlinux.stripped" ] || [ "$l4h_linux_out/vmlinux" -nt "$l4h_linux_out/vmlinux.stripped" ]; then
+    "$l4h_objcopy" --strip-debug "$l4h_linux_out/vmlinux" "$l4h_linux_out/vmlinux.stripped"
+fi
 "$root/tools/build-l4hctl.sh"
 "$root/tests/build-flagstest.sh"
+"$l4h_cc" -O2 -static -Wall -Wextra -Werror -o "$out/nonzero" "$root/tests/guest/nonzero.c"
 export L4H_VERSION=$("$root/tools/version.sh")
 prefix=${SEL4_PREFIX:-$root/build/sel4}
 [ "${L4H_ARCH:-x86_64}" != aarch64 ] || prefix=$root/build/sel4-aarch64
 kernel=seL4
 [ ! -f "$prefix/fl4-revision" ] || kernel=FL4
 printf '%s (%s)\n' "$L4H_VERSION" "$kernel" > "$out/host-version"
-"$root/tools/mkinitramfs.sh" "$out/vm.cpio.gz" "$root/tests/guest/init-vm" >/dev/null
+"$root/tools/mkinitramfs.sh" "$out/vm.cpio.gz" "$root/tests/guest/init-vm" "$out/nonzero" >/dev/null
 rm -rf "$out/ctlroot"/* && mkdir -p "$out/ctlroot"
 cp "$out/vm.cpio.gz" "$out/ctlroot/"
 rm -f "$out/ctl.img"

@@ -35,16 +35,19 @@ CONF
 rm -rf "$out/tpm" "$out/tpm-noek"
 tpm=$out/tpm
 attest=$root/tools/l4h-attest.py
-# Extra QEMU arguments, and environment for tools/mkimage.sh, of the next
-# boot.
-qemu_extra=() image_env=()
+# Extra QEMU arguments, and prebuilt UEFI application for tools/mkimage.sh,
+# of the next boot.  Each EFI variant is built once instead of once per boot,
+# and passing -e skips the unused BIOS image too.
+qemu_extra=()
+L4H_GUEST_KERNEL="$out/run/vmlinux" L4H_GUEST_SDK= L4H_MKSHIM= \
+    "$root/tools/mkefi.sh" "$out/run/default.efi" >/dev/null
+efi=$out/run/default.efi
 boot() {  # boot <name> <tpm-crb|tpm-tis> [extra initramfs files...]
     local name=$1 dev=$2
     shift 2
     "$root/tools/mkinitramfs.sh" "$out/run/$name.cpio.gz" "$root/tests/guest/init-attest" \
         "$l4h_ctl" "$out/run/vm.cpio.gz" "$@" >/dev/null
-    env "${image_env[@]}" L4H_GUEST_KERNEL="$out/run/vmlinux" L4H_GUEST_SDK= \
-        "$root/tools/mkimage.sh" -i "$out/run/$name.cpio.gz" -c "$out/run/l4h.conf" \
+    "$root/tools/mkimage.sh" -e "$efi" -i "$out/run/$name.cpio.gz" -c "$out/run/l4h.conf" \
         "$out/run/$name.raw" >/dev/null
     "$root/tools/swtpm.sh" "$tpm"
     local log=$out/$name.log  # build/*/*.log: kept by CI on failure
@@ -53,8 +56,8 @@ boot() {  # boot <name> <tpm-crb|tpm-tis> [extra initramfs files...]
         -device "$dev",tpmdev=tpm0 "${qemu_extra[@]}" </dev/null >"$log" 2>&1 &
     local qemu=$!
     while kill -0 "$qemu" 2>/dev/null; do
-        grep -aq "ATTEST: done\|l4h-vmmgr: all guests stopped" "$log" && { sleep 1; kill "$qemu"; break; }
-        sleep 1
+        grep -aq "ATTEST: done\|l4h-vmmgr: all guests stopped" "$log" && { sleep 0.2; kill "$qemu"; break; }
+        sleep 0.2
     done
     wait "$qemu" 2>/dev/null || true
     grep -aE "ATTEST|trustd|TPM|panic" "$log" | cut -c1-160 || true
@@ -198,7 +201,10 @@ for t in tpm2 ssdt; do
 done
 secret=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
 python3 "$attest" make-credential "$out/run/evidence1" "$secret" -o "$out/run/cred" --ek-ca "$ca" || fail "make-credential"
-image_env=(L4H_ACPI_TABLES="$out/run/tpm2.aml $out/run/ssdt.aml" L4H_ACPI_EXCLUDE=TPM2)
+L4H_ACPI_TABLES="$out/run/tpm2.aml $out/run/ssdt.aml" L4H_ACPI_EXCLUDE=TPM2 \
+    L4H_GUEST_KERNEL="$out/run/vmlinux" L4H_GUEST_SDK= L4H_MKSHIM= \
+    "$root/tools/mkefi.sh" "$out/run/ftpm.efi" >/dev/null
+efi=$out/run/ftpm.efi
 qemu_extra=(-chardev file,id=dbg,path="$out/run/debugcon" -device isa-debugcon,iobase=0x402,chardev=dbg)
 boot boot3 tpm-crb "$out/run/cred"
 log=$out/boot3.log

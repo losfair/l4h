@@ -5,9 +5,11 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 out=$root/build/vtdtest
 mkdir -p "$out"
-rustc +stable --edition=2024 --test "$root/tests/vtd.rs" -o "$out/unit-tests"
-"$out/unit-tests"
-if [ "${1:-}" = --qemu ]; then
+if [ "${1:-}" != --qemu-only ]; then
+    rustc +stable --edition=2024 --test "$root/tests/vtd.rs" -o "$out/unit-tests"
+    "$out/unit-tests"
+fi
+if [ "${1:-}" = --qemu ] || [ "${1:-}" = --qemu-only ]; then
     [ "${L4H_ARCH:-x86_64}" = x86_64 ] || { echo "VT-d QEMU tests require x86_64" >&2; exit 1; }
     export L4H_QEMU_IOMMU=intel
     "$root/tests/run-blktest.sh"

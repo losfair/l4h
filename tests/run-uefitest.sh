@@ -19,7 +19,7 @@ else
     "$root/tools/build-sdk.sh" >/dev/null
     env -u L4H_DOM0_DISKS -u L4H_DOM0_CMDLINE "$root/tools/build-host.sh"
 fi
-(cd "$root/tools/l4hctl" && cargo +stable build -q --release)
+"$root/tools/build-l4hctl.sh"
 "$root/tools/mkinitramfs.sh" "$out/uefi.cpio.gz" "$root/tests/guest/init-image" \
     "$root/tools/l4hctl/target/release/l4hctl" "$root/tests/guest/udhcpc.script" >/dev/null
 # The boot disk is a host disk too: keep it away from dom0.  fb_console=1:
@@ -36,8 +36,8 @@ log=$root/build/qemu-uefi.log
 timeout "${UEFITEST_TIMEOUT:-120}" "$root/tools/run-uefi.sh" "$root/build/l4h.raw" </dev/null >"$log" 2>&1 &
 qemu=$!
 while kill -0 "$qemu" 2>/dev/null; do
-    grep -aq "IMAGETEST: done\|l4h-vmmgr: all guests stopped" "$log" && { sleep 1; kill "$qemu"; break; }
-    sleep 1
+    grep -aq "IMAGETEST: done\|l4h-vmmgr: all guests stopped" "$log" && { sleep 0.2; kill "$qemu"; break; }
+    sleep 0.2
 done
 wait "$qemu" 2>/dev/null || true
 grep -aE "IMAGETEST|module '|disk [0-9]|nic [0-9]|memory:|cores:|l4h-root: [0-9]+ core|panic|Boot" "$log" || true

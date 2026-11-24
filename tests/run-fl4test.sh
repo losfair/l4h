@@ -34,25 +34,36 @@ if ! grep -q '^#define CONFIG_VTX  *1$' "$SEL4_PREFIX/libsel4/include/kernel/gen
     echo 'FL4TEST: FAIL (kernel ABI has no VT-x/AMD-V support)' >&2
     exit 1
 fi
-if [ "${L4H_RELEASE:-0}" != 1 ]; then
-    L4H_QEMU_CPU=host,-vmx,-svm,+invtsc "$root/tests/run-vtxtest.sh" off
+if [ "${L4H_FL4_ONLY:-all}" != kvm ]; then
+    if [ "${L4H_RELEASE:-0}" != 1 ]; then
+        L4H_QEMU_CPU=host,-vmx,-svm,+invtsc "$root/tests/run-vtxtest.sh" off
+    fi
+    for vcpus in 1 4; do
+        L4H_QEMU_CPU=host,-vmx,-svm,+invtsc "$root/tests/run-selftest.sh" "$vcpus"
+        grep -aq 'FL4: seL4 17.0 (MCS) API kernel' "$root/build/qemu.log"
+        grep -aq 'FL4: virtualization unavailable' "$root/build/qemu.log"
+        grep -aq 'no VT-x or AMD-V on this host' "$root/build/qemu.log"
+    done
+    "$root/tests/run-blktest.sh" 4
+    "$root/tests/run-nettest.sh"
+    "$root/tests/run-balloontest.sh"
+    if [ "${L4H_RELEASE:-0}" = 1 ]; then
+        "$root/tests/run-abitest.sh"
+    fi
+    # The boots above logged what FL4 found: without the mitigations it
+    # requires, no VM-exit path is enabled, whatever the CPU flags say.
+    if [ "${L4H_FL4_KVM:-auto}" = auto ] && grep -aq 'FL4: speculation mitigations: incomplete:' "$root/build/qemu.log"; then
+        kvm=0
+    fi
 fi
-for vcpus in 1 4; do
-    L4H_QEMU_CPU=host,-vmx,-svm,+invtsc "$root/tests/run-selftest.sh" "$vcpus"
-    grep -aq 'FL4: seL4 17.0 (MCS) API kernel' "$root/build/qemu.log"
-    grep -aq 'FL4: virtualization unavailable' "$root/build/qemu.log"
-    grep -aq 'no VT-x or AMD-V on this host' "$root/build/qemu.log"
-done
-"$root/tests/run-blktest.sh" 4
-"$root/tests/run-nettest.sh"
-"$root/tests/run-balloontest.sh"
-if [ "${L4H_RELEASE:-0}" = 1 ]; then
-    "$root/tests/run-abitest.sh"
-fi
-# The boots above logged what FL4 found: without the mitigations it
-# requires, no VM-exit path is enabled, whatever the CPU flags say.
-if [ "${L4H_FL4_KVM:-auto}" = auto ] && grep -aq 'FL4: speculation mitigations: incomplete:' "$root/build/qemu.log"; then
-    kvm=0
+if [ "$kvm" = 1 ]; then
+    if [ "${L4H_FL4_ONLY:-all}" = kvm ] && [ "${L4H_FL4_KVM:-auto}" = auto ]; then
+        # Probe once for speculation mitigations when running the KVM suite alone.
+        L4H_QEMU_CPU=host,-vmx,-svm,+invtsc "$root/tests/run-blktest.sh" 1 >/dev/null
+        if grep -aq 'FL4: speculation mitigations: incomplete:' "$root/build/qemu.log"; then
+            kvm=0
+        fi
+    fi
 fi
 if [ "$kvm" = 1 ]; then
     if [ "${L4H_RELEASE:-0}" != 1 ]; then

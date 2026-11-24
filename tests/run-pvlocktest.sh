@@ -10,11 +10,13 @@ out=$root/build/guest
 mkdir -p "$out"
 mod=$out/pvlock
 mkdir -p "$mod"
-cp "$root"/tests/guest/pvlock/* "$mod/"
-"$root/tools/build-linux.sh" vmlinux modules >"$root/build/linux-build.log" 2>&1 \
-    || { tail -80 "$root/build/linux-build.log"; exit 1; }
-"$root/tools/build-linux.sh" M="$mod" modules >"$root/build/pvlock-module.log" 2>&1 \
-    || { cat "$root/build/pvlock-module.log"; exit 1; }
+if [[ ${L4H_PREBUILT:-0} != 1 && ${L4H_PREBUILT:-0} != guest ]] || [ ! -f "$mod/l4h_pvlock.ko" ]; then
+    cp "$root"/tests/guest/pvlock/* "$mod/"
+    "$root/tools/build-linux.sh" vmlinux modules >"$root/build/linux-build.log" 2>&1 \
+        || { tail -80 "$root/build/linux-build.log"; exit 1; }
+    "$root/tools/build-linux.sh" M="$mod" modules >"$root/build/pvlock-module.log" 2>&1 \
+        || { cat "$root/build/pvlock-module.log"; exit 1; }
+fi
 "$root/tools/build-l4hctl.sh"
 "$root/tools/mkinitramfs.sh" "$out/pvlockvm.cpio.gz" "$root/tests/guest/init-pvlockvm" \
     "$mod/l4h_pvlock.ko" >/dev/null

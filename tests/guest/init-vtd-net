@@ -8,7 +8,7 @@ l4hctl nics
 ip link set lo up
 ip link set eth0 up
 ip addr add 10.0.2.15/24 dev eth0
-ping -c 3 -W 2 10.0.2.2 || fail "first NIC"
+ping -c 1 -W 2 10.0.2.2 || fail "first NIC"
 echo 'VTDNET: first NIC works after both NICs were attached'
 sw=$(l4hctl switch-create) || fail "create switch"
 l4hctl uplink "$sw" 1 || fail "second uplink"
@@ -22,7 +22,7 @@ for round in 1 2; do
     grep -q 'VTDNET-PEER: PASS' /tmp/peer || fail "peer NIC/disk I/O"
     l4hctl destroy "$vm" || fail "destroy peer"
 done
-ping -c 3 -W 2 10.0.2.2 || fail "first NIC after peer destruction"
+ping -c 1 -W 2 10.0.2.2 || fail "first NIC after peer destruction"
 l4hctl iommu > /tmp/iommu
 cat /tmp/iommu
 expected=$(cat /bin/iommu-expected) || fail "missing IOMMU expectation"

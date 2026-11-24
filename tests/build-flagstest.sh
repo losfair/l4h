@@ -3,6 +3,9 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 source "$root/tools/guest-env.sh"
 out=${1:-$root/build/guest}
+if [[ ${L4H_PREBUILT:-0} == 1 || ${L4H_PREBUILT:-0} == guest ]] && [ -x "$out/flags-test" ] && [ -f "$out/flagsvm.cpio.gz" ]; then
+    exit 0
+fi
 mkdir -p "$out"
 args=()
 if [ "${L4H_ARCH:-x86_64}" = aarch64 ]; then

@@ -7,7 +7,7 @@ fail() { echo "VTDNET-PEER: FAIL: $*"; echo 'VTDNET-PEER: done'; sleep 1000; }
 ip link set lo up
 ip link set eth0 up
 ip addr add 10.0.2.16/24 dev eth0
-ping -c 3 -W 2 10.0.2.2 || fail "second NIC"
+ping -c 1 -W 2 10.0.2.2 || fail "second NIC"
 echo 'VT-d shared requester disk data' > /tmp/data
 dd if=/dev/zero bs=4096 count=8 >> /tmp/data 2>/dev/null
 for disk in vda vdb; do

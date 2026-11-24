@@ -14,8 +14,25 @@ case "$arch" in
 esac
 out=$(realpath -m "${1:-$l4h_linux_out/sdk.erofs}")
 src=$root/build/linux-6.18
+if [[ ${L4H_PREBUILT:-0} == 1 || ${L4H_PREBUILT:-0} == guest ]] && [ -f "$out" ]; then
+    echo "$out: prebuilt, $(( $(stat -c %s "$out") >> 10 )) KiB"
+    exit 0
+fi
 "$root/tools/build-linux.sh" vmlinux modules >"$root/build/linux-build.log" 2>&1 \
     || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
+stamp=$out.stamp
+want=$(
+    printf 'arch=%s\n' "$arch"
+    stat -c '%n %s %Y' "$l4h_linux_out/vmlinux" "$l4h_linux_out/Module.symvers" "$l4h_linux_out/.config" "$root/tools/build-sdk.sh"
+    find "$root/include" -type f | sort | xargs stat -c '%n %s %Y'
+    find -L "$root/guest/linux/arch/l4h" \( -name 'Makefile*' -o -name '*.h' -o -name '*.lds' \) | sort | xargs stat -c '%n %s %Y'
+)
+want_hash=$(printf '%s\n' "$want" | sha256sum | cut -d' ' -f1)
+if [ "${L4H_REBUILD_SDK:-0}" != 1 ] && [ -f "$out" ] && [ "$(cat "$stamp" 2>/dev/null)" = "$want_hash" ]; then
+    release=$(cat "$l4h_linux_out/include/config/kernel.release")
+    echo "$out: $release, $(( $(stat -c %s "$out") >> 10 )) KiB"
+    exit 0
+fi
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
 release=$(cat "$l4h_linux_out/include/config/kernel.release")
@@ -52,4 +69,5 @@ SOURCE_DATE_EPOCH=0 mkfs.erofs --quiet --workers=1 -zlzma,level=6 -C1048576 -T0 
 fsck.erofs --extract="$stage/verify" "$out.new" >/dev/null
 diff -qr --no-dereference "$tree" "$stage/verify"
 mv "$out.new" "$out"
+printf '%s\n' "$want_hash" >"$stamp"
 echo "$out: $release, $(( $(stat -c %s "$out") >> 10 )) KiB"

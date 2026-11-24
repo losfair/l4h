@@ -13,7 +13,7 @@ mkdir -p "$out"
 "$l4h_objcopy" --strip-debug "$l4h_linux_out/vmlinux" "$l4h_linux_out/vmlinux.stripped"
 "$root/tools/mkinitramfs.sh" "$out/vm.cpio.gz" "$root/tests/guest/init-vm" >/dev/null
 export L4H_GUEST_KERNEL="$l4h_linux_out/vmlinux.stripped" L4H_DOM0_INITRD="$out/vm.cpio.gz"
-L4H_TEST_INJECT=1 L4H_DOM0_CMDLINE=console=hvc0 "$l4h_host_build"
+L4H_TEST_INJECT=1 "$l4h_host_build"
 log=$root/build/qemu-logd.log
 fifo=$(mktemp -u)
 mkfifo "$fifo"

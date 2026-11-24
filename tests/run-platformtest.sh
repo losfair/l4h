@@ -112,33 +112,79 @@ for i in $(seq 0 127); do
     printf -v addr '%x.%x' "$((i / 8))" "$((i % 8))"
     devices+=(-device "pci-testdev,bus=bulk,addr=$addr,multifunction=on")
 done
-qemu=
-tpm=()
-trap 'if [ -n "$qemu" ]; then kill "$qemu" 2>/dev/null || true; wait "$qemu" 2>/dev/null || true; fi' EXIT
-run() {
-    local name=$1 expected=$2 chain=$3 selector=$4 fault=${5:-}
+guards() {
+    python3 - "$1" <<'PY'
+import os, sys
+with open(sys.argv[1], 'r+b') as f:
+    capacity = os.fstat(f.fileno()).st_size // 512
+    for sector in [786432 - 8, (capacity - 2048) & ~7]:
+        f.seek(sector * 512)
+        f.write(b'\xa5' * 4096)
+PY
+}
+guards "$disk"
+cp "$out/B.conf" "$out/B-changed.conf"
+printf '# unchosen slot changed\n' >> "$out/B-changed.conf"
+printf 'unchosen initrd changed\n' > "$out/other-initrd"
+
+run_case() {
+    local name=$1 expected=$2 chain=$3 selector=$4 fault=${5:-} size=${6:-} with_tpm=${7:-0}
+    local case_dir=$out/case-$name
+    rm -rf "$case_dir" && mkdir -p "$case_dir"
+    local case_disk=$case_dir/disk.raw
+    cp --sparse=always --reflink=auto "$disk" "$case_disk"
+    if [ -n "$size" ]; then
+        truncate -s "$size" "$case_disk"
+        guards "$case_disk"
+    fi
+    local c_boot=$case_disk@@1048576
+    local c_slota=$case_disk@@68157440
+    local c_slotb=$case_disk@@202375168
     local retry=0
     if [ "$fault" = retry ]; then retry=1; fi
-    grub-editenv "$out/frontenv" create
-    grub-editenv "$out/frontenv" set "l4h_chain_uuid=$chain" "l4h_retry=$retry"
-    mcopy -o -i "$bootpart" "$out/frontenv" ::/EFI/L4H/frontenv
-    grub-editenv "$out/grubenv" create
-    grub-editenv "$out/grubenv" set "$selector"
-    if [ "$fault" = conflict ]; then grub-editenv "$out/grubenv" set l4h_esp_label=L4HSLOTB; fi
+    grub-editenv "$case_dir/frontenv" create
+    grub-editenv "$case_dir/frontenv" set "l4h_chain_uuid=$chain" "l4h_retry=$retry"
+    mcopy -o -i "$c_boot" "$case_dir/frontenv" ::/EFI/L4H/frontenv
+    grub-editenv "$case_dir/grubenv" create
+    grub-editenv "$case_dir/grubenv" set "$selector"
+    if [ "$fault" = conflict ]; then grub-editenv "$case_dir/grubenv" set l4h_esp_label=L4HSLOTB; fi
     if [ "$fault" = extra ]; then
-        grub-editenv "$out/grubenv" set l4h_boot_ok=0 esp=invalid serial_port=0
+        grub-editenv "$case_dir/grubenv" set l4h_boot_ok=0 esp=invalid serial_port=0
     fi
-    if [ "$fault" = corrupt ]; then printf 'invalid environment block\n' > "$out/grubenv"; fi
-    mcopy -o -i "$bootpart" "$out/grubenv" "::$runtime_env"
-    if [ "$fault" = missing ]; then mdel -i "$bootpart" "::$runtime_env"; fi
+    if [ "$fault" = corrupt ]; then printf 'invalid environment block\n' > "$case_dir/grubenv"; fi
+    mcopy -o -i "$c_boot" "$case_dir/grubenv" "::$runtime_env"
+    if [ "$fault" = missing ]; then mdel -i "$c_boot" "::$runtime_env"; fi
     if [ "$fault" = duplicate ] || [ "$fault" = slot ]; then
-        mcopy -o -i "$slota" "$out/grubenv" "::$runtime_env"
+        mcopy -o -i "$c_slota" "$case_dir/grubenv" "::$runtime_env"
     fi
-    if [ "$fault" = slot ]; then mdel -i "$bootpart" "::$runtime_env"; fi
-    if [ ${#tpm[@]} -ne 0 ]; then "$root/tools/swtpm.sh" "$out/tpm"; fi
+    if [ "$fault" = slot ]; then mdel -i "$c_boot" "::$runtime_env"; fi
+    if [ "$fault" = invalid-slot-config ]; then
+        mdel -i "$c_slota" ::/l4h/l4h.conf
+        mmd -i "$c_slota" ::/l4h/l4h.conf
+    fi
+    if [ "$fault" = other-slot ]; then
+        mcopy -o -i "$c_slotb" "$out/B-changed.conf" ::/l4h/l4h.conf
+        mcopy -o -i "$c_slotb" "$out/other-initrd" ::/l4h/dom0/initrd
+    fi
+    if [ "$fault" = return-success ]; then
+        mcopy -o -i "$c_slota" "$out/return-success.efi" ::/EFI/l4h.efi
+    fi
+    local tpm_dir= case_tpm=() qemu=
+    cleanup_case() {
+        if [ -n "$qemu" ]; then kill "$qemu" 2>/dev/null || true; wait "$qemu" 2>/dev/null || true; fi
+        [ -z "$tpm_dir" ] || rm -rf "$tpm_dir"
+        rm -f "$case_disk"
+    }
+    trap cleanup_case EXIT
+    if [ "$with_tpm" = 1 ]; then
+        tpm_dir=$(mktemp -d /tmp/l4h-ptpm.XXXXXX)
+        "$root/tools/swtpm.sh" "$tpm_dir"
+        case_tpm=(-chardev "socket,id=tpm,path=$tpm_dir/sock" -tpmdev emulator,id=tpm0,chardev=tpm -device tpm-crb,tpmdev=tpm0)
+    fi
     # Clear a previous run's completion marker before the child starts.
     : > "$out/$name.log"
-    timeout "${PLATFORMTEST_TIMEOUT:-120}" "$root/tools/run-uefi.sh" "$disk" "${devices[@]}" "${tpm[@]}" \
+    L4H_SMP=${PLATFORMTEST_SMP:-1} L4H_MEM=${PLATFORMTEST_MEM:-2G} \
+        timeout "${PLATFORMTEST_TIMEOUT:-120}" "$root/tools/run-uefi.sh" "$case_disk" "${devices[@]}" "${case_tpm[@]}" \
         >"$out/$name.log" 2>&1 </dev/null &
     qemu=$!
     while kill -0 "$qemu" 2>/dev/null; do
@@ -146,12 +192,11 @@ run() {
             kill "$qemu" 2>/dev/null || true
             break
         fi
-        sleep 1
+        sleep 0.2
     done
     wait "$qemu" || true
     qemu=
-    if [ "$fault" = duplicate ] || [ "$fault" = slot ]; then mdel -i "$slota" "::$runtime_env"; fi
-    python3 - "$out/$name.log" "$expected" "$disk" <<'PY'
+    python3 - "$out/$name.log" "$expected" "$case_disk" <<'PY'
 import json, pathlib, re, sys
 log, expected, disk = sys.argv[1:]
 text = pathlib.Path(log).read_text(errors='replace')
@@ -196,62 +241,64 @@ with open(disk, 'rb') as f:
 print(f'{pathlib.Path(log).stem}: slot {expected}, {capacity} sectors, {len(pci)} PCI functions: PASS')
 PY
 }
-guards() {
-    python3 - "$disk" <<'PY'
-import os, sys
-with open(sys.argv[1], 'r+b') as f:
-    capacity = os.fstat(f.fileno()).st_size // 512
-    for sector in [786432 - 8, (capacity - 2048) & ~7]:
-        f.seek(sector * 512)
-        f.write(b'\xa5' * 4096)
-PY
+
+jobs=${PLATFORMTEST_JOBS:-$(nproc)}
+[ "$jobs" -le 4 ] || jobs=4
+pids=() names=()
+trap 'for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done; wait 2>/dev/null || true' EXIT
+start_case() {
+    local name=$1
+    while [ "$(jobs -rp | wc -l)" -ge "$jobs" ]; do
+        sleep 0.1
+    done
+    ( run_case "$@" ) >"$out/$name.out" 2>&1 &
+    pids+=($!)
+    names+=("$name")
 }
-guards
-run runtime-a A 1111-1111 l4h_esp_uuid=1111-1111
-run runtime-b B 2222-2222 l4h_esp_label=L4HSLOTB
-run runtime-override B 1111-1111 l4h_esp_uuid=2222-2222
-run runtime-label-literal A 2222-2222 "l4h_esp_label=$slot_a_label"
+
+start_case runtime-a A 1111-1111 l4h_esp_uuid=1111-1111
+start_case runtime-b B 2222-2222 l4h_esp_label=L4HSLOTB
+start_case runtime-override B 1111-1111 l4h_esp_uuid=2222-2222
+start_case runtime-label-literal A 2222-2222 "l4h_esp_label=$slot_a_label"
 # Resize the raw disk, without rewriting either slot's settings.
-truncate -s 640M "$disk"
-guards
-run resized-a A 1111-1111 l4h_esp_uuid=1111-1111
-truncate -s $((640 * 1024 * 1024 + 512)) "$disk"
-guards
-run odd-sectors-a A 1111-1111 l4h_esp_uuid=1111-1111
-run runtime-on-slot A 2222-2222 l4h_esp_uuid=1111-1111 slot
-run runtime-whitelist A 1111-1111 l4h_esp_uuid=1111-1111 extra
-run runtime-retry retry 1111-1111 l4h_esp_uuid=3333-3333 retry
-run missing-slot fail 1111-1111 l4h_esp_uuid=3333-3333
-run missing-selector fail 1111-1111 ignored=1
-run conflicting-selector fail 1111-1111 l4h_esp_uuid=1111-1111 conflict
-run option-as-selector fail 1111-1111 l4h_esp_uuid=--set=root
-run corrupt-env fail 1111-1111 l4h_esp_uuid=1111-1111 corrupt
-run duplicate-env fail 1111-1111 l4h_esp_uuid=1111-1111 duplicate
+start_case resized-a A 1111-1111 l4h_esp_uuid=1111-1111 '' 640M
+start_case odd-sectors-a A 1111-1111 l4h_esp_uuid=1111-1111 '' $((640 * 1024 * 1024 + 512))
+start_case runtime-on-slot A 2222-2222 l4h_esp_uuid=1111-1111 slot
+start_case runtime-whitelist A 1111-1111 l4h_esp_uuid=1111-1111 extra
+start_case runtime-retry retry 1111-1111 l4h_esp_uuid=3333-3333 retry
+start_case missing-slot fail 1111-1111 l4h_esp_uuid=3333-3333
+start_case missing-selector fail 1111-1111 ignored=1
+start_case conflicting-selector fail 1111-1111 l4h_esp_uuid=1111-1111 conflict
+start_case option-as-selector fail 1111-1111 l4h_esp_uuid=--set=root
+start_case corrupt-env fail 1111-1111 l4h_esp_uuid=1111-1111 corrupt
+start_case duplicate-env fail 1111-1111 l4h_esp_uuid=1111-1111 duplicate
 # GRUB's no-device search finds B first in this fixture. The native
 # loader uses the filesystem device supplied by the front chainloader.
 if [ -n "${PLATFORM_FL4_EFI:-}" ]; then
-    run missing-env A 1111-1111 ignored=1 missing
-    mdel -i "$slota" ::/l4h/l4h.conf
-    mmd -i "$slota" ::/l4h/l4h.conf
-    run invalid-slot-config file-error 1111-1111 l4h_esp_uuid=1111-1111
-    mrd -i "$slota" ::/l4h/l4h.conf
-    mcopy -i "$slota" "$out/A.conf" ::/l4h/l4h.conf
+    start_case missing-env A 1111-1111 ignored=1 missing
+    start_case invalid-slot-config file-error 1111-1111 l4h_esp_uuid=1111-1111 invalid-slot-config
 else
-    run missing-env B 1111-1111 ignored=1 missing
+    start_case missing-env B 1111-1111 ignored=1 missing
 fi
 # Both loaders exclude the unchosen slot. GRUB also measures the selector
 # block, while the native loader measures only the selected slot's two
 # files, each as one event: its module name, NUL, `present`, NUL, then the
 # file's exact bytes (l4h-config, then dom0-initrd).
-tpm=(-chardev "socket,id=tpm,path=$out/tpm/sock" -tpmdev emulator,id=tpm0,chardev=tpm -device tpm-crb,tpmdev=tpm0)
-run measured-a A 1111-1111 l4h_esp_uuid=1111-1111
-cp "$out/B.conf" "$out/B-changed.conf"
-printf '# unchosen slot changed\n' >> "$out/B-changed.conf"
-printf 'unchosen initrd changed\n' > "$out/other-initrd"
-mcopy -o -i "$slotb" "$out/B-changed.conf" ::/l4h/l4h.conf
-mcopy -o -i "$slotb" "$out/other-initrd" ::/l4h/dom0/initrd
-run measured-other-slot A 1111-1111 l4h_esp_uuid=1111-1111
-run measured-selector A 1111-1111 l4h_esp_uuid=1111-1111 extra
+start_case measured-a A 1111-1111 l4h_esp_uuid=1111-1111 '' '' 1
+start_case measured-other-slot A 1111-1111 l4h_esp_uuid=1111-1111 other-slot '' 1
+start_case measured-selector A 1111-1111 l4h_esp_uuid=1111-1111 extra '' 1
+start_case exit-status-control success 1111-1111 ignored=1 return-success
+
+fail=0
+for i in "${!pids[@]}"; do
+    if ! wait "${pids[$i]}"; then
+        fail=1
+    fi
+    cat "$out/${names[$i]}.out"
+done
+trap - EXIT
+[ "$fail" = 0 ] || exit 1
+
 python3 - "$root" "$out" "${PLATFORM_FL4_EFI:-}" <<'PY'
 import hashlib, pathlib, re, runpy, sys
 root, out = map(pathlib.Path, sys.argv[1:3])
@@ -275,9 +322,4 @@ else:
     assert base != selector[9], 'selector not measured into PCR 9'
 print('selected slot PCR 9 measurements: PASS')
 PY
-tpm=()
-mcopy -o -i "$slotb" "$out/B.conf" ::/l4h/l4h.conf
-mcopy -o -i "$slotb" "$out/B.cpio.gz" ::/l4h/dom0/initrd
-mcopy -o -i "$slota" "$out/return-success.efi" ::/EFI/l4h.efi
-run exit-status-control success 1111-1111 ignored=1
 echo 'PLATFORMTEST: PASS'

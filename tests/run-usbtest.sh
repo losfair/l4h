@@ -33,11 +33,13 @@ devs="${USBTEST_QEMU_EXTRA:-} -device $hc -device usb-kbd,bus=xhci.0,port=1
     -drive file=$out/usb3.img,if=none,id=u3,format=raw -device usb-uas,bus=xhci.0,port=3,id=uas
     -device scsi-hd,bus=uas.0,scsi-id=0,lun=0,drive=u3"
 # The hostile driver, built against the local kernel tree.
-"$root/tools/build-linux.sh" vmlinux modules >"$root/build/linux-build.log" 2>&1 \
-    || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
 mkdir -p "$out/mod"
-cp "$root"/tests/guest/usbabuse/* "$out/mod/"
-"$root/tools/build-linux.sh" M="$out/mod" modules >"$out/build.log" 2>&1 || { cat "$out/build.log"; exit 1; }
+if [[ ${L4H_PREBUILT:-0} != 1 && ${L4H_PREBUILT:-0} != guest ]] || [ ! -f "$out/mod/usbabuse.ko" ]; then
+    "$root/tools/build-linux.sh" vmlinux modules >"$root/build/linux-build.log" 2>&1 \
+        || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
+    cp "$root"/tests/guest/usbabuse/* "$out/mod/"
+    "$root/tools/build-linux.sh" M="$out/mod" modules >"$out/build.log" 2>&1 || { cat "$out/build.log"; exit 1; }
+fi
 "$root/tools/mkinitramfs.sh" "$out/usbvm.cpio.gz" "$root/tests/guest/init-usbvm" "$out/mod/usbabuse.ko" >/dev/null
 "$root/tools/mkinitramfs.sh" "$out/usbtest.cpio.gz" "$root/tests/guest/init-usbtest" \
     "$l4h_ctl" "$out/usbvm.cpio.gz" >/dev/null
