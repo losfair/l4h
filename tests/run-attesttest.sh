@@ -8,7 +8,10 @@
 # runs for every command; GRUB swaps QEMU's TPM2 table for ours.  Boots
 # four and five do the same with a TPM that has no EK certificate in NV, as
 # AMD's fTPM: the evidence gives the EK's public area instead, and the
-# credential is made for that.
+# credential is made for that.  A sixth boot, where the build host's CPU has
+# VT-x or AMD-V for the host to use, runs an HVM guest (an unmodified Linux
+# under lockdown=confidentiality, tools/build-linux-hvm.sh) whose report,
+# asked through its attestation port, carries the launch digest `l4h-attest.py measure --hvm` computes.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 source "$root/tools/guest-env.sh"
@@ -240,4 +243,60 @@ python3 "$attest" verify "$out/run/dom0.report5" "$out/run/evidence5" --data "$n
 [ "$(json "$out/run/dom0.json5" 'd["host"]["ekpub"]')" = "$(json "$out/run/dom0.json4" 'd["host"]["ekpub"]')" ] \
     || fail "ekpub differs between boots"
 echo "ATTESTTEST: no EK certificate: ekpub $(json "$out/run/dom0.json4" 'd["host"]["ekpub"][:16]')..., the credential for it activates"
+
+# An HVM guest's report (DESIGN.md §5.11): the host needs the CPU's
+# virtualization, which KVM gives its guests only where it nests
+# (ATTESTTEST_HVM=1 or 0 says so for a KVM that does not tell).
+case "${ATTESTTEST_HVM:-}" in
+    1) hvm=1 ;;
+    0) hvm=0 ;;
+    *)
+        # Whichever vendor's module this machine has.
+        nested=
+        for p in /sys/module/kvm_intel/parameters/nested /sys/module/kvm_amd/parameters/nested; do
+            if [ -r "$p" ]; then read -r nested < "$p" || true; break; fi
+        done
+        hvm=0
+        if grep -qwE 'vmx|svm' /proc/cpuinfo && [ -r /dev/kvm ] && [ -w /dev/kvm ] && [[ $nested == [Y1] ]]; then hvm=1; fi
+        ;;
+esac
+if [ "$hvm" = 1 ]; then
+    bzimage=$("$root/tools/build-linux-hvm.sh" 2>"$root/build/linux-hvm-build.log") \
+        || { tail -20 "$root/build/linux-hvm-build.log"; exit 1; }
+    cp "$bzimage" "$out/run/bzImage"
+    "$root/tools/mkinitramfs.sh" "$out/run/hvmvm.cpio.gz" "$root/tests/guest/init-hvmvm" "$l4h_ctl" >/dev/null
+    tpm=$out/tpm
+    unset SWTPM_EK_CERT
+    L4H_QEMU_CPU=${L4H_QEMU_CPU:-host,+invtsc} boot boot6 tpm-crb "$out/run/bzImage" "$out/run/hvmvm.cpio.gz"
+    log=$out/boot6.log
+    ! grep -aq "ATTEST: no hvm" "$log" || fail "the host refused an HVM guest: $(grep -a 'ATTEST: no hvm' "$log")"
+    grep -aq "ATTEST: hvm lockdown .*\[confidentiality\]" "$log" || fail "HVM guest not under lockdown=confidentiality"
+    grep -aq "ATTEST: hvm attest providers tpm" "$log" || fail "HVM guest's attestation port"
+    field "$log" "ATTEST: hvm report" "$out/run/hvm.report"
+    field "$log" "ATTEST: evidence" "$out/run/evidence6"
+    hvm_cmdline=$(tr -d '\r' < "$log" | sed -n 's/^ATTEST: hvm cmdline //p' | head -1)
+    layout=$(tr -d '\r' < "$log" | sed -n 's/^ATTEST: hvm layout //p' | head -1)
+    kernel_gpa=$(echo "$layout" | sed -n 's/.*kernel-gpa=\(0x[0-9a-f]*\).*/\1/p')
+    initrd_gpa=$(echo "$layout" | sed -n 's/.*initrd-gpa=\(0x[0-9a-f]*\).*/\1/p')
+    [ -n "$kernel_gpa" ] && [ -n "$initrd_gpa" ] || fail "no HVM layout: '$layout'"
+    hvm_launch=$(python3 "$attest" measure "$out/run/bzImage" --hvm x86_64 --kernel-gpa "$kernel_gpa" \
+        --initrd "$out/run/hvmvm.cpio.gz" --initrd-gpa "$initrd_gpa" --cmdline "$hvm_cmdline")
+    python3 "$attest" verify "$out/run/hvm.report" "$out/run/evidence6" --data "$nonce" --launch "$hvm_launch" \
+        --ak-name "$ak" --insecure-unpinned-measurements > "$out/run/hvm.json" || fail "HVM guest's report"
+    [ "$(json "$out/run/hvm.json" 'd["guest"]["dom0"]')" = False ] || fail "HVM guest marked dom0"
+    [ "$(json "$out/run/hvm.json" 'd["guest"]["ram"]')" = $((192 << 20)) ] || fail "HVM guest RAM"
+    # Another command line, or the files elsewhere, is another digest; and
+    # no HVM guest passes for the l4h guest of the same initrd.
+    for other in "$(python3 "$attest" measure "$out/run/bzImage" --hvm x86_64 --kernel-gpa "$kernel_gpa" \
+            --initrd "$out/run/hvmvm.cpio.gz" --initrd-gpa "$initrd_gpa" --cmdline "$hvm_cmdline ")" \
+        "$(python3 "$attest" measure "$out/run/bzImage" --hvm x86_64 --kernel-gpa "$kernel_gpa" \
+            --initrd "$out/run/hvmvm.cpio.gz" --initrd-gpa $((initrd_gpa + 0x200000)) --cmdline "$hvm_cmdline")" \
+        "$(python3 "$attest" measure "$out/run/vmlinux" --initrd "$out/run/hvmvm.cpio.gz" --cmdline "$hvm_cmdline")"; do
+        ! python3 "$attest" verify "$out/run/hvm.report" "$out/run/evidence6" --data "$nonce" --launch "$other" \
+            --ak-name "$ak" --insecure-unpinned-measurements >/dev/null 2>&1 || fail "HVM report verified under another launch digest"
+    done
+    echo "ATTESTTEST: an HVM guest's report verifies: launch $hvm_launch"
+else
+    echo "ATTESTTEST: no nested VT-x or AMD-V here: an HVM guest's report is not checked"
+fi
 echo "ATTESTTEST: PASS"

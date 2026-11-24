@@ -1232,7 +1232,8 @@ create fails with `-ENODEV`. `l4hctl list` shows them as `hvm`.
   the debug syscalls' threshold, so a guest that took over its monitor
   has no more authority than a guest kernel. Its wiring is checked as
   every component's (`HVM_*` edges: vmmgr's `vmm_ready`/`guest_power`,
-  blkd and netd kicks, its own call endpoint and notifications), with
+  blkd and netd kicks, trustd's kick for the guest, its own call endpoint
+  and notifications), with
   what else it holds by slot and type (`wiring::HVM_HELD`: the EPT root,
   the block and keep CNodes, the vCPU TCBs and VCPUs); vmmgr audits its
   CSpace before it starts, as it cannot (debug syscalls need an MCP
@@ -1371,8 +1372,75 @@ create fails with `-ENODEV`. `l4hctl list` shows them as `hvm`.
     the guest as a reboot (`POWER_REBOOT`), and what follows is
     `l4h-vmmgr`'s policy for a guest that ended. `HCR_EL2.TID3` hides from
     the ID registers what FL4 does not switch for a guest.
-- **Not yet.** HVM guests have no launch digest (§10.2): they are not
-  measured, attested or sealed, and the l4h hypercalls are not theirs.
+- **Attestation.** An HVM guest is measured, attested and sealed as any
+  guest (§10.2), though it holds no capability and makes no hypercall.
+  - *Measured.* dom0 loads the kernel image and the initrd and names them
+    at `CTL_VM_START`. vmmgr, not l4h-hvm (which a guest that took it over
+    would speak through), measures them there, before l4h-hvm exists:
+    the launch digest is `SHA-256("l4h-launch-hvm-v1" ‖ arch ‖ boot flags
+    ‖ kernel GPA ‖ kernel size ‖ SHA-256(kernel image) ‖ initrd GPA ‖
+    initrd size ‖ SHA-256(initrd) ‖ cmdline length ‖ cmdline)`, with u64
+    little-endian integers, arch 1 for x86-64 and 2 for AArch64, the
+    initrd GPA 0 without an initrd, and the images hashed as guest RAM
+    has them. Its domain is not an l4h guest's (`l4h-launch-v2`): neither
+    passes for the other. `vm_start` fails (`-EINVAL`) if dom0 loaded
+    anything outside the two images, or names an image past the last
+    block it loaded: no unmeasured byte of RAM is dom0's. (vmmgr records
+    what was loaded as at most 16 ranges apart, and refuses a load that
+    would be a 17th.) What l4h-hvm
+    then makes (the kernel where it runs, the boot parameters, E820, ACPI
+    tables or device tree) is a function of the measured input, the RAM
+    and vCPUs a report carries, and l4h-hvm itself, which is in the
+    host's measurement with vmmgr. The addresses are in the digest as
+    the guest sees them (the initrd's in its boot parameters, the image
+    left where it was loaded): `l4hctl hvm-layout KERNEL [--initrd F]
+    --mem MB` prints the ones `l4hctl create --hvm` uses, and
+    `l4h-attest.py measure KERNEL --hvm ARCH --kernel-gpa N [--initrd F
+    --initrd-gpa N] [--cmdline S]` the digest.
+  - *The port.* The guest's kernel is not ours, and under lockdown its
+    userspace reaches no hardware but through that kernel's own drivers:
+    so attestation is a device every distribution kernel drives, a
+    virtio-console (PCI `00:1f.0`) with one port, named `l4h.attest`
+    (`/dev/virtio-ports/l4h.attest`; `abi.h`, `L4H_ATTEST_PORT_*`). There
+    is no driver of ours for an HVM guest, and no other way in. l4h-hvm
+    serves the port (`dev/attest.rs`) over what root makes for every
+    guest's attestation device: trustd's request page for the guest,
+    which only l4h-hvm maps, and its kick, badged with the guest's id
+    (`wiring::HVM_TRUSTD`). The port is a stream of requests and their
+    answers, one at a time: a header (`l4h_attest_port_req`: op, offset,
+    lengths) and its data, which l4h-hvm puts in trustd's page under a
+    sequence number of its own before it kicks trustd; and, once root's
+    notice of the answer has reached vmmgr and vmmgr has signalled
+    l4h-hvm (`VMMGR_HVM_ATTEST`), a header (`l4h_attest_port_resp`:
+    status, lengths, the host's state) and the answer's data. The next
+    request is read when the answer is with the guest: one written
+    meanwhile waits in its queue. A header that is none is answered
+    `-EINVAL`, and nothing is read after it, nor after bytes that follow
+    a request in its own buffer (that request is still answered), until
+    the port is opened again. Opening or closing it drops a request half
+    written, what was written and not yet read, an answer not yet read,
+    and the answer to a request trustd still has. The driver's open
+    waits for l4h-hvm to return its message's buffer, and what is
+    written from then on is the new opener's: l4h-hvm reads how far the
+    queue goes before it returns that buffer, and throws away no more.
+    The device offers no event index, so the guest
+    notifies every buffer, and a turn of the I/O thread takes at most a
+    queue's worth of them, and comes again for a queue it left some in.
+    If trustd has failed, l4h-hvm
+    answers `-EIO` itself, and never relies on the kick root then
+    revokes. trustd is unchanged and trusts none of this: its page was a
+    guest's to write before, and a guest that took over its l4h-hvm
+    reaches only its own page and kick.
+  - *Userspace, not the kernel.* Whoever has the port open is the
+    guest's userspace (root, by the device node's mode), so l4h-hvm
+    refuses `ACT` on bits 64–127, a guest kernel's: an HVM guest's
+    reports never carry those, which says nothing of its kernel's
+    taints. `l4hctl attest` uses the port where there is no
+    `/dev/l4h-attest`, with the same commands; there is no configfs-tsm
+    provider.
+  - *Seals.* `CONSOLE_IN` and `CONSOLE_OUT` gate dom0's console
+    operations on an HVM guest as on any (they are vmmgr's, by guest
+    instance).
 - **Tests.** `tests/run-hvmunit.sh` tests the device models, the decoder,
   the page walker, boot and ACPI against a model of guest RAM, and the
   vCPU and I/O threads' code together under a scripted guest, with
@@ -1380,7 +1448,11 @@ create fails with `-ENODEV`. `l4hctl list` shows them as `hvm`.
   `tests/run-hvmtest.sh` boots an unmodified Linux (built by
   `tools/build-linux-hvm.sh`) with two vCPUs, a disk, a NIC and its
   console, shuts it down by ACPI and destroys a running one, checking the
-  host gets all its memory back. `tests/run-hvmtest-arm64.sh` does the
+  host gets all its memory back, and one under `lockdown=confidentiality`
+  whose userspace acts on a flag and seals its console input through the
+  attestation port, which dom0 then cannot write
+  (`tests/run-attesttest.sh` verifies such a guest's report against
+  `measure --hvm`). `tests/run-hvmtest-arm64.sh` does the
   same on FL4 under QEMU's TCG, on GICv3 and on GICv2
   (`L4H_QEMU_GIC_VERSION`), and checks that at EL1
   (`L4H_QEMU_VIRTUALIZATION=off`) HVM guests are refused.
@@ -4511,9 +4583,12 @@ The chain has four links.
    them under the same digest. `l4h-attest.py measure` takes vmmgr's
    default, 1 MiB past the kernel's end, or `--initrd-gpa`. The immutable ABI
    provider is part of the host's EFI measurement, so the launch digest
-   identifies the same workload across approved host builds.
+   identifies the same workload across approved host builds. An HVM
+   guest, whose kernel is dom0's choice, has a digest of its own form
+   (§5.11).
    - vmmgr reads the image back from guest RAM before the guest starts, and
-     `vm_start` fails if dom0 loaded anything outside the initramfs. vmmgr is
+     `vm_start` fails if dom0 loaded anything outside the initramfs (an
+     HVM guest's rule is §5.11's). vmmgr is
      in the host TCB for this: whoever builds a guest can make it run
      anything.
    - vmmgr passes the digest to root (`TRUST_REGISTER`), which writes
@@ -4532,7 +4607,9 @@ The chain has four links.
      is root's to say, and there is one at a time. Root never waits for
      trustd's main thread, whose TPM
      commands can take seconds.
-   - Each guest has an attestation device (`L4H_DEV_ATTEST`). Requests are
+   - Each guest has an attestation device (`L4H_DEV_ATTEST`; an HVM
+     guest's is a virtio-console port its l4h-hvm serves over the same
+     page and kick, §5.11). Requests are
      asynchronous, so a vCPU never waits for trustd: the guest writes its
      request into the device page, then a new sequence number, and signals
      the kick, whose badge is the guest's id, so trustd answers a guest only
@@ -4573,9 +4650,10 @@ The chain has four links.
      activated, ties the AK to a real TPM (below). It is fixed at startup
      and comes in pieces: each request gives the offset its answer starts
      at.
-   - Linux exposes both as configfs-tsm reports (provider `l4h`: `inblob`,
-     `outblob`, and the evidence as `auxblob`) and through
-     `/dev/l4h-attest` (`l4hctl attest`).
+   - An l4h guest's Linux exposes both as configfs-tsm reports (provider
+     `l4h`: `inblob`, `outblob`, and the evidence as `auxblob`) and
+     through `/dev/l4h-attest` (`l4hctl attest`, which in an HVM guest
+     uses its attestation port, §5.11).
    - `L4H_ATTEST_EVENT_LOG` returns the firmware's UEFI TPM 2.0 event log
      as the boot loader passed it on, raw, in pieces like the evidence, or
      `-ENOENT` without one. Only FL4's own loader (`fl4-efi`) passes one,
@@ -4587,9 +4665,10 @@ The chain has four links.
      gets the same log until the host reboots. It is neither in the
      evidence nor signed: the verifier replays it and requires the quoted
      PCRs 0–14, which nothing extends after ExitBootServices (trustd quotes
-     before it extends PCR 15). Linux gives it as
+     before it extends PCR 15). An l4h guest's Linux gives it as
      `/sys/kernel/l4h/attest/event_log` (root only, read from the host a
-     piece at a time, not kept) and `l4hctl attest event-log`.
+     piece at a time, not kept); `l4hctl attest event-log` gives it in
+     any guest.
 4. **Verification.** `tools/l4h-attest.py verify` checks that:
    - the AK is a fixedTPM restricted signing key, and the quote verifies
      under it;
@@ -6420,8 +6499,8 @@ machine and guests of 256–512 MiB.
 | `tests/run-blktest.sh` (`BLKTEST_DEV=nvme`, `scsi`, `scsi-legacy`, `scsi-luns`, `virtio-legacy`, `ahci`, `ahci-disks`) | disk windows and data integrity; AHCI adds static ATA ports behind an ATAPI device, parallel I/O and independent disks |
 | `tests/run-sharedblk.sh` | shared controllers: concurrent clients, windows, provisioning, destroy during I/O |
 | `tests/run-lvmblk.sh` | LVM linear volumes as extent disks: dm-linear agreement, split requests, overlap and provisioning refusal (needs `lvm2` on the build host) |
-| `tests/run-hvmunit.sh` | HVM guests' device models without seL4: decoder (illegal encodings included), page walker, bzImage/ELF loading, zero page and E820, ACPI checksums, ECAM, virtio-pci and MSI-X, local APIC/x2APIC/I/O APIC, UART, RTC, PIT, CPUID, I/O pool bounce and backpressure, hostile queue addresses; and the whole machine (vCPU and I/O thread code, blkd and netd modelled) under a scripted guest: boot state, CPUID/MSRs, PCI enumeration, virtio-blk and virtio-net with MSI-X, INIT/SIPI, the UART both ways, the ACPI power button and S5; on AArch64 (GICv3 and GICv2) the GIC, PSCI, system registers, PL011, PL031, PL061, the device tree and Image/ELF loading, and the whole machine likewise |
-| `tests/run-hvmtest.sh` | an unmodified x86-64 Linux as an HVM guest (§5.11): SMP, virtio-blk write and read back, virtio-net, console output and input, ACPI shutdown, destroy while running, memory reclaim; needs nested VT-x or AMD-V under KVM (QEMU's TCG SVM lacks the next-RIP saving seL4 requires), and otherwise checks that HVM guests are refused (`-ENODEV`) and skips |
+| `tests/run-hvmunit.sh` | HVM guests' device models without seL4: decoder (illegal encodings included), page walker, bzImage/ELF loading, zero page and E820, ACPI checksums, ECAM, virtio-pci and MSI-X, the attestation port (its control messages, requests and answers in pieces, what is no request, closing it, trustd failing), local APIC/x2APIC/I/O APIC, UART, RTC, PIT, CPUID, I/O pool bounce and backpressure, hostile queue addresses; and the whole machine (vCPU and I/O thread code, blkd and netd modelled) under a scripted guest: boot state, CPUID/MSRs, PCI enumeration, virtio-blk and virtio-net with MSI-X, INIT/SIPI, the UART both ways, the ACPI power button and S5; on AArch64 (GICv3 and GICv2) the GIC, PSCI, system registers, PL011, PL031, PL061, the device tree and Image/ELF loading, and the whole machine likewise |
+| `tests/run-hvmtest.sh` | an unmodified x86-64 Linux as an HVM guest (§5.11): SMP, virtio-blk write and read back, virtio-net, console output and input, ACPI shutdown, destroy while running, memory reclaim, and under `lockdown=confidentiality` the host's flags through the attestation port and the console seal dom0 cannot pass; needs nested VT-x or AMD-V under KVM (QEMU's TCG SVM lacks the next-RIP saving seL4 requires), and otherwise checks that HVM guests are refused (`-ENODEV`) and skips |
 | `tests/run-hvmtest-arm64.sh` | the same on AArch64: an unmodified arm64 Linux on FL4 at EL2 under QEMU's TCG, with GICv3 or GICv2 (`L4H_QEMU_GIC_VERSION`), shutdown by the PL061 power button and PSCI; at EL1 (`L4H_QEMU_VIRTUALIZATION=off`), that HVM guests are refused (`-ENODEV`) |
 | `tests/run-ctltest.sh` | VM lifecycle, console, clean shutdown, disk re-attach, windows, reclaim |
 | `tests/run-devicelimit.sh` | 64 devices per guest |
@@ -6454,7 +6533,7 @@ machine and guests of 256–512 MiB.
 | `tests/run-biostest.sh` | the same image under SeaBIOS with virtio-blk, virtio-net and a VBE framebuffer, as on DigitalOcean |
 | `tests/run-mktest.sh` | two (`MK_PARTITIONS`) multikernel partitions on q35: each dom0 boots, gets DHCP and runs a VM; a secondary's host-reboot is refused (§11.4) |
 | `tests/run-xentest.sh` | two l4h partitions as Xen HVM guests, nested in KVM, each with a passed-through NIC, ping each other (§11.2) |
-| `tests/run-attesttest.sh` | attestation with swtpm over CRB, FIFO and the AMD fTPM ACPI start method: reports on dom0 and a guest, host evidence, AK credential |
+| `tests/run-attesttest.sh` | attestation with swtpm over CRB, FIFO and the AMD fTPM ACPI start method: reports on dom0 and a guest, host evidence, AK credential; where the CPU has VT-x or AMD-V, an HVM guest's report under `lockdown=confidentiality` against `measure --hvm` |
 | `tests/run-debian.sh`, `tests/run-workload.sh` | Debian + systemd, fio verify, parallel build, fsck (`tests/mkdebian.sh` first) |
 | `tests/run-bench.sh`, `tests/run-vmbench.sh`, `tests/run-startbench.sh` | micro-benchmarks, guest cost, start latency |
 | `tests/run-smpbench.py` | paired seL4/FL4 release comparison: identical Linux/payload images, pinned physical cores, concurrent CPU/syscall/fault/fork workloads and pinned pipe/futex handoffs; five boots per backend and 1/2/4 guest vCPUs by default; raw logs, CSV and image hashes (§13) |

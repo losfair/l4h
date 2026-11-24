@@ -3,7 +3,8 @@
 //! on x86-64 (VT-x or AMD-V) with a PC's local APICs, I/O APIC, UART, RTC,
 //! PIT and ACPI, on AArch64 (FL4 at EL2) with a GIC, PSCI, PL011, PL031 and
 //! PL061 (arm/); on both with virtio-blk and virtio-net devices on PCI over
-//! blkd and netd.  Its main thread is the I/O thread (io.rs); each vCPU has
+//! blkd and netd, and a virtio-console port for attestation over trustd's
+//! page.  Its main thread is the I/O thread (io.rs); each vCPU has
 //! a thread of its own (vcpu.rs).  No heap.
 
 #![no_std]

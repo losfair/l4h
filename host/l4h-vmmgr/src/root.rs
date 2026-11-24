@@ -90,7 +90,20 @@ pub fn guest_new(alloc: &mut Alloc, id: usize, pool: usize, pool_gpa: usize, dom
     use caps::guest_new::{ATTEST_KICK, ATTEST_PAGE, POOL_FRAMES, VMM_NTFN};
     let pool_frames = take(alloc, POOL_FRAMES, 0);
     let vmm_ntfn = take(alloc, VMM_NTFN, 0);
-    let attest = attest.then(|| (take(alloc, ATTEST_PAGE, 0), take(alloc, ATTEST_KICK, 0)));
+    // Root revokes the kick when trustd fails, which it may since it
+    // answered: the guest then has no attestation device, as one made
+    // after the failure.
+    let attest = attest.then(|| take(alloc, ATTEST_PAGE, 0)).and_then(|page: cap::Granule| {
+        let s = alloc.slots.alloc();
+        let kick = cap::Notification::from_bits(s as u64);
+        if abs_of(kick).move_(&xchg(ATTEST_KICK.passed_out(0, l4h_host::wire::Cap::Notification))).is_ok() {
+            return Some((page, kick));
+        }
+        alloc.slots.free(s);
+        let _ = abs_of(page).delete();
+        alloc.slots.free(page.bits() as _);
+        None
+    });
     Ok(NewGuest { instance, pool_frames, vmm_ntfn, attest })
 }
 

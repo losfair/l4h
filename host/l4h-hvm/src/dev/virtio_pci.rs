@@ -70,7 +70,7 @@ impl Default for Kicks {
 
 /// What a device type adds to the transport (blk.rs, net.rs).
 pub trait Backend {
-    /// The virtio device type (1 net, 2 block).
+    /// The virtio device type (1 net, 2 block, 3 console).
     fn device_type(&self) -> u16;
     /// Its feature bits (VERSION_1 and INDIRECT_DESC are the transport's).
     fn features(&self) -> u64;
@@ -79,6 +79,12 @@ pub trait Backend {
     /// Its configuration structure.
     fn config(&self) -> &[u8];
     fn features_accepted(&mut self, _features: u64) {}
+    /// Whether it offers VIRTIO_RING_F_EVENT_IDX: only one that asks for
+    /// its queues' notifications again once it has taken what they hold
+    /// (Queue::enable_notify) may; another is notified of every buffer.
+    fn event_idx(&self) -> bool {
+        true
+    }
     /// Take queue `q`'s new buffers: the queues it put used buffers in.
     fn kick(&mut self, mem: &GuestMem, queues: &mut [Queue], q: usize) -> u64;
     /// What its backend completed: the queues it put used buffers in.
@@ -177,6 +183,7 @@ impl<B: Backend> Transport<B> {
         let class = match ty {
             1 => 0x02_0000,
             2 => 0x01_8000,
+            3 => 0x07_8000,
             _ => 0xff_0000,
         };
         let mut cfg = Config::new(0x1af4, 0x1040 + ty, 1, class, (0x1af4, 0x40 + ty), 1);
@@ -223,7 +230,8 @@ impl<B: Backend> Transport<B> {
     }
 
     fn offered(&self) -> u64 {
-        self.backend.features() | VIRTIO_F_VERSION_1 | VIRTIO_RING_F_INDIRECT_DESC | VIRTIO_RING_F_EVENT_IDX
+        let event_idx = if self.backend.event_idx() { VIRTIO_RING_F_EVENT_IDX } else { 0 };
+        self.backend.features() | VIRTIO_F_VERSION_1 | VIRTIO_RING_F_INDIRECT_DESC | event_idx
     }
 
     fn reset_regs(&mut self) {

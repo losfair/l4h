@@ -1,5 +1,5 @@
 //! The I/O thread's loop (io.rs): the vCPU threads' calls, and the
-//! signals on its notification (KICK, DONE, CTL, CONSOLE).
+//! signals on its notification (KICK, DONE, CTL, CONSOLE, ATTEST).
 
 use l4h_rt::host::badges::hvm as recv;
 use l4h_rt::host::hvm::{self as hv, call};
@@ -48,6 +48,9 @@ impl ipc::Server for Loop {
         }
         if badge & recv::DONE != 0 {
             io::completed();
+        }
+        if badge & recv::ATTEST != 0 {
+            io::attested();
         }
         // Notified, or polled for work left (badge 0).
         io::kicked();

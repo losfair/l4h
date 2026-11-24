@@ -29,3 +29,33 @@ sel4::sel4_cfg_if! {
 }
 
 pub use imp::*;
+
+/// An HVM guest's launch digest (DESIGN.md §10.2): SHA-256 over what
+/// CTL_VM_START names, with the SHA-256 of each image as guest RAM has
+/// it: `"l4h-launch-hvm-v1" ‖ arch ‖ flags ‖ kernel gpa ‖ kernel size ‖
+/// SHA-256(kernel) ‖ initrd gpa ‖ initrd size ‖ SHA-256(initrd) ‖ cmdline
+/// length ‖ cmdline`, integers u64 little-endian, the initrd's gpa 0
+/// without one.  What l4h-hvm makes of them (the kernel where it runs,
+/// its boot parameters and the platform's tables) is a function of these,
+/// the guest's RAM and vCPUs (in its reports) and l4h-hvm itself, which
+/// the host's measurement covers.
+#[allow(dead_code)] // hvm/none.rs has no guests.
+pub fn launch_digest(flags: u64, kernel: ((u64, u64), [u8; 32]), initrd: ((u64, u64), [u8; 32]), cmdline: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let arch = if cfg!(target_arch = "aarch64") { l4h_host::hvm::LAUNCH_ARCH_AARCH64 } else { l4h_host::hvm::LAUNCH_ARCH_X86_64 };
+    let ((kernel_gpa, kernel_size), kernel_hash) = kernel;
+    let ((initrd_gpa, initrd_size), initrd_hash) = initrd;
+    let mut h = Sha256::new();
+    h.update(l4h_host::hvm::LAUNCH_DOMAIN);
+    for v in [arch, flags, kernel_gpa, kernel_size] {
+        h.update(v.to_le_bytes());
+    }
+    h.update(kernel_hash);
+    for v in [if initrd_size != 0 { initrd_gpa } else { 0 }, initrd_size] {
+        h.update(v.to_le_bytes());
+    }
+    h.update(initrd_hash);
+    h.update((cmdline.len() as u64).to_le_bytes());
+    h.update(cmdline);
+    h.finalize().into()
+}

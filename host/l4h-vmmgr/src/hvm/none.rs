@@ -60,3 +60,5 @@ pub fn spawn(_: &mut Guest, _: &mut Alloc, _: &mut crate::window::Window, _: &mu
 }
 
 pub fn signal(_: &Guest, _: &mut Alloc) {}
+
+pub fn signal_attest(_: &Guest, _: &mut Alloc) {}

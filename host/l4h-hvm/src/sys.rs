@@ -71,6 +71,14 @@ pub fn kick(slot: u64) -> crate::Kick {
     cap::<cap_type::Notification>(slot)
 }
 
+/// Kick trustd: the attestation port took a request into its page
+/// (wiring::HVM_TRUSTD).
+/// Root revokes the capability when trustd fails (its page then says so):
+/// a signal there is lost, where Signal on the empty slot would fault us.
+pub fn kick_trustd() {
+    l4h_rt::mailbox::notify(cap::<cap_type::Notification>(hv::SLOT_TRUSTD_KICK));
+}
+
 fn io_thread() -> Endpoint<call::Proto> {
     Endpoint::of(&wiring::HVM_CALL, wiring::p::Hvm, 0)
 }

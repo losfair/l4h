@@ -1330,6 +1330,47 @@ struct l4h_attest_page {
 	l4h_u8 data[L4H_ATTEST_PAGE_DATA];
 };
 
+/*
+ * An HVM guest's attestation port (DESIGN.md §5.11): the same requests,
+ * for a guest that holds no capability, through a virtio-console device
+ * of its machine with one port, named L4H_ATTEST_PORT_NAME (on Linux
+ * /dev/virtio-ports/l4h.attest, and the vport* whose sysfs `name` is
+ * that).  The port is a stream of requests and their answers, one at a
+ * time, little-endian:
+ *
+ * 1. The guest writes a struct l4h_attest_port_req and in_len bytes of
+ *    data (at most L4H_ATTEST_PAGE_DATA): op, offset, in_len, blob_len
+ *    and data as in struct l4h_attest_page.
+ * 2. It reads a struct l4h_attest_port_resp and out_len bytes of data:
+ *    status, total, out_len, state and data as there.
+ *
+ * Whoever has the port open is the guest's userspace: L4H_ATTEST_ACT on
+ * flag bits 64-127 (a guest kernel's) is refused, -EPERM.  A header
+ * without the magic, or with a longer in_len, is answered -EINVAL, and
+ * nothing more is read, nor after bytes that follow a request in the
+ * buffer it ends in, until the port is opened again.  A request written
+ * before the last one's answer is read waits.  Opening or closing the
+ * port drops a request half written, what was written before it and not
+ * yet taken, and an answer not yet read; nothing written after an open
+ * returns.
+ */
+#define L4H_ATTEST_PORT_NAME    "l4h.attest"
+#define L4H_ATTEST_PORT_MAGIC   0x4148344c /* "L4HA" */
+struct l4h_attest_port_req {
+	l4h_u32 magic;
+	l4h_u32 op;             /* enum l4h_attest_op */
+	l4h_u32 offset;
+	l4h_u32 in_len;
+	l4h_u32 blob_len;       /* L4H_ATTEST_ACTIVATE */
+};
+struct l4h_attest_port_resp {
+	l4h_u32 magic;
+	l4h_s32 status;
+	l4h_u32 total;
+	l4h_u32 out_len;
+	l4h_u32 state;          /* L4H_ATTEST_FAILED / NO_REPORTS / HAS_* bits */
+};
+
 enum l4h_power {
 	L4H_POWER_OFF = 0,
 	L4H_POWER_REBOOT = 1,

@@ -5,7 +5,8 @@
 //! vCPU threads' calls for the devices' registers and for RAM blocks to
 //! map, and signals on the notification root made for the guest's VMM:
 //! queue notifications (KICK), backend completions (DONE), vmmgr's console
-//! input and power requests (CTL), console output and its timer (CONSOLE).
+//! input and power requests (CTL), console output and its timer (CONSOLE),
+//! trustd's answers to the attestation port (ATTEST).
 
 use core::sync::atomic::Ordering;
 
@@ -13,6 +14,7 @@ use l4h_abi as abi;
 use l4h_rt::host::{self, hvm as hv};
 
 use crate::console::{self, Serial};
+use crate::dev::attest::Port;
 use crate::dev::blk::Blk;
 use crate::dev::net::Net;
 use crate::dev::pci::{self, Config};
@@ -27,6 +29,9 @@ use crate::vm::{self, vm};
 pub enum Dev {
     Blk(Transport<Blk>),
     Net(Transport<Net>),
+    /// The attestation port's console device (dev/attest.rs), in slot
+    /// hv::ATTEST_SLOT.
+    Attest(Transport<Port<TrustdKick>>),
 }
 
 macro_rules! each {
@@ -34,9 +39,13 @@ macro_rules! each {
         match $d {
             Dev::Blk($t) => $e,
             Dev::Net($t) => $e,
+            Dev::Attest($t) => $e,
         }
     };
 }
+
+/// trustd's kick for the guest.
+pub type TrustdKick = fn();
 
 pub struct Io {
     host_bridge: Option<Config>,
@@ -82,6 +91,10 @@ pub fn init() {
             k => panic!("l4h-hvm: device kind {}", k),
         };
         io.slots[slot] = Some(dev);
+    }
+    if cfg.attest != 0 {
+        let port = Port::new(hv::ATTEST_PAGE_VA as *mut abi::AttestPage, sys::kick_trustd as TrustdKick);
+        io.slots[hv::ATTEST_SLOT] = Some(Dev::Attest(Transport::new(hv::ATTEST_SLOT, vm::PCI_MMIO_BASE, port)));
     }
 }
 
@@ -191,6 +204,13 @@ pub fn completed() {
     for (slot, d) in io().slots.iter_mut().enumerate() {
         let Some(d) = d.as_mut() else { continue };
         each!(d, t => t.retry(&vm.mem, &mut irq(slot)));
+    }
+}
+
+/// trustd answered the attestation port's request (vmmgr's signal).
+pub fn attested() {
+    if let Some(Dev::Attest(t)) = io().slots[hv::ATTEST_SLOT].as_mut() {
+        t.complete(&vm().mem, &mut irq(hv::ATTEST_SLOT));
     }
 }
 

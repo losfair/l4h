@@ -1,7 +1,8 @@
 #!/bin/sh
 # dom0 init for tests/run-attesttest.sh: print a report on dom0 and on a
 # guest it starts, the host evidence, and (second boot) the secret of the
-# credential in /bin/cred.
+# credential in /bin/cred; with /bin/bzImage, a report on an HVM guest that
+# runs it.
 mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
@@ -51,6 +52,23 @@ if [ -f /bin/vm.cpio.gz ]; then
         --cmdline "console=hvc0 quiet attest_nonce=$nonce") && \
         l4hctl console "$id" --until "ATTESTVM: done" --timeout 60 >/dev/null
     sleep 1
+fi
+if [ -f /bin/bzImage ]; then
+    # An HVM guest (DESIGN.md §5.11): an unmodified Linux under
+    # lockdown=confidentiality, whose userspace gets a report as any
+    # guest's through the machine's attestation port.  What the host
+    # needs to compute its launch digest goes to the serial port.
+    hvm_cmdline="console=ttyS0 quiet lockdown=confidentiality ATTEST=$nonce"
+    if id=$(l4hctl create attesthvm --hvm --kernel /bin/bzImage --initrd /bin/hvmvm.cpio.gz --mem 192 \
+        --cmdline "$hvm_cmdline" 2>/tmp/err); then
+        echo "ATTEST: hvm cmdline $hvm_cmdline"
+        echo "ATTEST: hvm layout $(l4hctl hvm-layout /bin/bzImage --initrd /bin/hvmvm.cpio.gz --mem 192)"
+        l4hctl console "$id" --until "HVMVM: ready" --timeout 120 > /tmp/hvm.out
+        tr -d '\r' < /tmp/hvm.out | sed -n 's/^HVMVM: \(lockdown\|attest\|report\|no \)/ATTEST: hvm \1/p'
+        l4hctl destroy "$id"
+    else
+        echo "ATTEST: no hvm: $(cat /tmp/err)"
+    fi
 fi
 if [ -x /bin/flags-test ]; then
     /bin/flags-test dom0 || echo "FLAGS: FAIL"

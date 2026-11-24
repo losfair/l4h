@@ -170,6 +170,23 @@ impl Component {
         self.minted(e, idx);
     }
 
+    /// `pass_edge` of a capability its minter may have revoked meanwhile
+    /// (trustd's kick for a guest, once trustd has failed): false, and the
+    /// slot stays empty, if it is gone.
+    pub fn try_pass_edge<H, T, O, P>(&self, e: &E<H, T, O, P>, n: usize, minted: impl sel4::HasCPtrWithDepth) -> bool
+    where
+        H: p::IsParty,
+        T: p::IsParty,
+        O: o::IsObject,
+        P: Protocol,
+    {
+        let idx = self.held(e, n);
+        // Not looked at again as pass_edge's is (`minted`): it can be
+        // revoked at any time after the copy too, and the slot then reads
+        // as empty, which is no fault of the wiring.
+        self.slot(idx).copy(&self.local_cnode.absolute_cptr(minted), crate::edge::rights(e)).is_ok()
+    }
+
     /// The n-th slot of `e`, which this component must hold.
     fn held<H: p::IsParty, T, O, P>(&self, e: &E<H, T, O, P>, n: usize) -> u64 {
         assert!(H::PARTY.kind() == Some(self.kind), "component {} does not hold {}", self.id, e.name);

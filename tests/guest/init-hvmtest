@@ -92,6 +92,31 @@ expect "HVMVM: disk check ok" "disk persistence"
 l4hctl destroy "$id" || fail "destroy hvm2"
 reclaim
 echo "HVMTEST: hvm2 destroyed running and reclaimed"
+
+# 3: attestation (DESIGN.md §10.2).  The guest, with nothing of ours in
+# its kernel and under lockdown=confidentiality, reaches the host's flags
+# through its attestation port; what it seals holds for dom0.  Reports
+# themselves need a TPM, which this host has not: tests/run-attesttest.sh.
+nonce=$(cat /proc/sys/kernel/random/uuid /proc/sys/kernel/random/uuid /proc/sys/kernel/random/uuid \
+    /proc/sys/kernel/random/uuid | tr -d '\n-')
+id=$(l4hctl create hvm3 --hvm --kernel "$kernel" --initrd /bin/hvmvm.cpio.gz --mem 192 --vcpus 2 \
+    --cmdline "console=$con lockdown=confidentiality ATTEST=$nonce") || fail "create hvm3"
+console "$id" "HVMVM: ready" 900
+grep "HVMVM: \(lockdown\|attest\|no report\|report\)" /tmp/out | cut -c1-200
+expect "HVMVM: lockdown .*\[confidentiality\]" "lockdown=confidentiality"
+expect "HVMVM: attest providers none" "attestation providers without a TPM"
+expect "HVMVM: attest kernel bit: l4hctl: not permitted" "a kernel flag bit refused to userspace"
+expect "HVMVM: attest act taint=.*200 seal=" "a userspace flag bit in the host's flags"
+expect "HVMVM: attest seal taint=.* seal=0(console-in)" "console input sealed"
+expect "HVMVM: no report: .*no TPM" "a report without a TPM"
+# The host enforces the guest's seal: no input from dom0 any more, and
+# the seal shows in the list.
+if l4hctl send "$id" "sealed" 2>/tmp/err; then fail "input to a sealed HVM guest"; fi
+grep -q "sealed by the guest" /tmp/err || { cat /tmp/err; fail "why input to a sealed HVM guest was refused"; }
+l4hctl list | grep "hvm3 " | grep -q "console-in" || { l4hctl list; fail "list does not show hvm3's seal"; }
+l4hctl destroy "$id" || fail "destroy hvm3"
+reclaim
+echo "HVMTEST: hvm3 used its attestation port under lockdown and reclaimed"
 l4hctl destroy "$peer"
 echo "HVMTEST: PASS"
 poweroff -f

@@ -155,6 +155,10 @@ const USAGE: &str = "usage: l4hctl <command>
   host-reboot                  reset the machine (every guest stops; sync
                                dom0's disks first); on a multikernel
                                machine, partition 0's dom0 only
+  hvm-layout KERNEL [--initrd F] --mem MB
+                               where `create --hvm` loads these files in a
+                               VM of MB: the addresses in its launch digest
+                               (tools/l4h-attest.py measure --hvm)
   mk-check [L4H-MK.CONF]       check a multikernel split against this
                                machine, from native Linux (default
                                /boot/efi/l4h/l4h-mk.conf)
@@ -657,6 +661,32 @@ fn run(args: &[String]) -> Result<i32> {
     }
     if cmd == "mk-check" {
         return mkcheck::run(&args[1..]);
+    }
+    if cmd == "hvm-layout" {
+        // No host needed: where `create --hvm` loads the files, which a
+        // verifier computing the launch digest must know.
+        let usage = "hvm-layout KERNEL [--initrd F] --mem MB";
+        let (mut kernel, mut initrd, mut mem) = (None, None, None);
+        let mut it = args[1..].iter();
+        while let Some(a) = it.next() {
+            match a.as_str() {
+                "--initrd" => initrd = Some(it.next().ok_or(Error(usage.into()))?),
+                "--mem" => mem = Some(parse_mib(it.next().ok_or(Error(usage.into()))?)?),
+                k if kernel.is_none() && !k.starts_with("--") => kernel = Some(a),
+                _ => return err(usage),
+            }
+        }
+        let (Some(kernel), Some(mem)) = (kernel, mem) else { return err(usage) };
+        let image = std::fs::read(kernel).map_err(|e| Error(format!("{kernel}: {e}")))?;
+        let initrd_len = match initrd {
+            Some(f) => std::fs::metadata(f).map_err(|e| Error(format!("{f}: {e}")))?.len(),
+            None => 0,
+        };
+        let (kernel_gpa, initrd_gpa) = hvm_layout(&image, initrd_len, mem)?;
+        // As the launch digest has them: no initrd is nowhere.
+        let initrd_gpa = if initrd_len == 0 { 0 } else { initrd_gpa };
+        println!("kernel-gpa={kernel_gpa:#x} initrd-gpa={initrd_gpa:#x}");
+        return Ok(0);
     }
     if cmd == "lv-extents" {
         // Only the default PV start needs the host.
