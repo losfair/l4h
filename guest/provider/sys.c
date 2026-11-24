@@ -358,6 +358,47 @@ int l4h_tcb_suspend(unsigned long tcb)
 	return seL4_TCB_Suspend(tcb);
 }
 
+/* tcb 0: the calling vCPU's kernel thread. */
+static unsigned long tcb_or_self(unsigned long tcb)
+{
+	return tcb ? tcb : VCPU_CAP(l4h_this_vcpu_id(), L4H_VCPU_KTCB);
+}
+
+#ifdef L4H_ARM_PAC
+_Static_assert(L4H_PAC_EN_IA == seL4_ARM_PAC_EnIA && L4H_PAC_EN_IB == seL4_ARM_PAC_EnIB &&
+	       L4H_PAC_EN_DA == seL4_ARM_PAC_EnDA && L4H_PAC_EN_DB == seL4_ARM_PAC_EnDB,
+	       "l4h PAC enables are FL4's");
+#endif
+
+int l4h_tcb_set_pac(unsigned long tcb, unsigned long flags, const unsigned long *keys)
+{
+#ifdef L4H_ARM_PAC
+	unsigned long k[L4H_PAC_KEY_WORDS] = { 0 };
+	int i;
+
+	if (keys)
+		for (i = 0; i < L4H_PAC_KEY_WORDS; i++)
+			k[i] = keys[i];
+	if (flags & ~(L4H_PAC_EN_IA | L4H_PAC_EN_IB | L4H_PAC_EN_DA | L4H_PAC_EN_DB))
+		return seL4_InvalidArgument;
+	return seL4_TCB_SetPACKeys(tcb_or_self(tcb), flags, k[0], k[1], k[2], k[3], k[4],
+				   k[5], k[6], k[7], k[8], k[9]);
+#else
+	(void)tcb; (void)flags; (void)keys;
+	return seL4_IllegalOperation;
+#endif
+}
+
+int l4h_tcb_set_high_vspace(unsigned long tcb, unsigned long high_vspace)
+{
+#ifdef L4H_ARM_HIGH_VSPACE
+	return seL4_TCB_SetHighVSpace(tcb_or_self(tcb), high_vspace ? high_vspace : seL4_CapNull);
+#else
+	(void)tcb; (void)high_vspace;
+	return seL4_IllegalOperation;
+#endif
+}
+
 int l4h_tcb_bind_notification(unsigned long tcb, unsigned long ntfn)
 {
 	return seL4_TCB_BindNotification(tcb, ntfn);

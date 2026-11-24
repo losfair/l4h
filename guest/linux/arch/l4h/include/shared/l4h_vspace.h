@@ -14,6 +14,9 @@ unsigned long l4h_mm_large_mappings(struct mm_struct *mm, unsigned long start, u
 void l4h_vspace_init(void);
 /* The provider batches frame ops in the kernel (L4H_PROVIDER_FRAME_BATCH). */
 int l4h_provider_frame_batch(void);
+/* A pool VSpace, out of Linux's use until l4h_vspace_put(), or 0 if lending
+ * it would leave the pool fewer than nr_cpu_ids; l4h_vspace_put(0) does
+ * nothing. */
 unsigned long l4h_vspace_get(void);
 void l4h_vspace_put(unsigned long root);
 void *l4h_kernel_va_get(unsigned long size);

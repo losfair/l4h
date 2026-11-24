@@ -44,9 +44,18 @@ pub const RAM_MAX: u64 = (abi::MAX_BLOCKS * abi::BLOCK_SIZE) as u64;
 /// An HVM guest's default I/O pool: its disks bounce whole requests
 /// through it (DESIGN.md §5.11).
 pub const IO_POOL_DEFAULT: u64 = 8 << 20;
-/// Devices an HVM guest has at most: PCI slots 1 to 31 of bus 0 (slot 0 is
-/// the host bridge).
-pub const MAX_DEVICES: usize = 31;
+/// Devices an HVM guest has at most: PCI slots 1 to 30 of bus 0 (slot 0 is
+/// the host bridge, ATTEST_SLOT the attestation port's device).
+pub const MAX_DEVICES: usize = 30;
+/// The PCI slot of the virtio-console device with the attestation port
+/// (abi::ATTEST_PORT_*), of a guest that has one (HvmConfig::attest).
+pub const ATTEST_SLOT: usize = 31;
+const _: () = assert!(MAX_DEVICES < ATTEST_SLOT);
+/// The architecture in an HVM guest's launch digest (launch_arch).
+pub const LAUNCH_ARCH_X86_64: u64 = 1;
+pub const LAUNCH_ARCH_AARCH64: u64 = 2;
+/// What an HVM guest's launch digest starts with (DESIGN.md §10.2).
+pub const LAUNCH_DOMAIN: &[u8] = b"l4h-launch-hvm-v1";
 /// vCPUs at most: their APIC IDs fit xAPIC's 8 bits, and MSI and the I/O
 /// APIC can address every one in physical mode.
 pub const MAX_VCPUS: usize = abi::MAX_VCPUS;
@@ -175,7 +184,10 @@ const _: () = assert!(VCPU_VA >= crate::STACK_TOP && VCPU_VA + MAX_VCPUS * VCPU_
 /// power requests there.
 pub const CONSOLE_PAGE_VA: usize = crate::SHARED_VA + 0x90_0000;
 const _: () = assert!(CONSOLE_PAGE_VA >= crate::VMM_CONSOLE_RING_VA + crate::CONSOLE_RING_PAGES * 4096);
-const _: () = assert!(CONSOLE_PAGE_VA + 4096 <= crate::vmm_device_page_va(0));
+/// trustd's request page for the guest (abi::AttestPage), which the
+/// attestation port's requests go through.
+pub const ATTEST_PAGE_VA: usize = CONSOLE_PAGE_VA + 4096;
+const _: () = assert!(ATTEST_PAGE_VA + 4096 <= crate::vmm_device_page_va(0));
 
 // ---- Its CSpace, after the standard slots (crate::SLOT_*).  SLOT_ROOT_EP
 // calls vmmgr, as a VMM's does; SLOT_SERVICE_EP is the I/O thread's
@@ -201,6 +213,9 @@ pub const SLOT_SELF_KICK: u64 = 24;
 pub const SLOT_SELF_CONSOLE: u64 = 25;
 /// The vCPU threads' calls to the I/O thread (wiring::HVM_CALL, `call`).
 pub const SLOT_SELF_CALL: u64 = 26;
+/// trustd's kick for the guest (wiring::HVM_TRUSTD), if it has an
+/// attestation device.
+pub const SLOT_TRUSTD_KICK: u64 = 27;
 /// vCPU v's notification, to signal it (wiring::HVM_VCPU):
 /// crate::VCPU_NTFN_SLOT_BASE + v.  Backend kicks follow, as for a VMM,
 /// at crate::VMM_KICK_SLOT_BASE + device.
@@ -258,6 +273,10 @@ pub struct HvmConfig {
     /// guest reads of them is made from.  Zero on x86-64.
     pub arm_virt: abi::ArmVirtInfo,
     pub cpu_id: [u64; 5],
+    /// It has an attestation port (ATTEST_SLOT): trustd's page is at
+    /// ATTEST_PAGE_VA, its kick in SLOT_TRUSTD_KICK.
+    pub attest: u32,
+    pub reserved: u32,
 }
 const _: () = assert!(crate::CONFIG_OFFSET + core::mem::size_of::<HvmConfig>() <= crate::INFO_SIZE);
 
@@ -266,6 +285,22 @@ const _: () = assert!(crate::CONFIG_OFFSET + core::mem::size_of::<HvmConfig>() <
 pub const fn is_ram(low: u64, high: u64, gpa: u64, len: u64) -> bool {
     let Some(end) = gpa.checked_add(len) else { return false };
     (end <= low) || (gpa >= HIGH_RAM_BASE && end - HIGH_RAM_BASE <= high)
+}
+
+/// Whether range `r` lies within the union of ranges `a` and `b` (each
+/// (start, length), none past the address space): what dom0 loaded into
+/// an HVM guest must be in its kernel image or its initrd, which the
+/// launch digest covers.
+pub const fn covered(r: (usize, usize), a: (usize, usize), b: (usize, usize)) -> bool {
+    let (mut at, end) = (r.0, r.0 + r.1);
+    let (first, second) = if a.0 <= b.0 { (a, b) } else { (b, a) };
+    if first.0 <= at && at < first.0 + first.1 {
+        at = first.0 + first.1;
+    }
+    if second.0 <= at && at < second.0 + second.1 {
+        at = second.0 + second.1;
+    }
+    at >= end
 }
 
 crate::senders! {
@@ -313,6 +348,26 @@ mod tests {
         assert!(!is_ram(LOW_RAM_MAX, 1 << 30, HIGH_RAM_BASE, (1 << 30) + 1));
         assert!(!is_ram(LOW_RAM_MAX, 1 << 30, u64::MAX - 1, 4));
         assert_eq!(Sender::of_badge(recv::CALL), Some(Sender::Vcpu));
+    }
+
+    #[test]
+    fn loaded_ranges_are_covered() {
+        let (k, i) = ((0x100, 0x100), (0x300, 0x80));
+        assert!(covered((0x100, 0x100), k, i) && covered((0x180, 0x10), k, i) && covered((0x300, 0x80), i, k));
+        assert!(covered((0x400, 0), k, i), "nothing");
+        assert!(!covered((0xff, 2), k, i), "starts before");
+        assert!(!covered((0x1ff, 2), k, i), "ends after");
+        assert!(!covered((0x100, 0x280), k, i), "over the gap between them");
+        assert!(!covered((0x250, 0x10), k, i) && !covered((0x380, 1), k, i));
+        // Adjacent images, loaded as one range; in either order.
+        let (k, i) = ((0x100, 0x100), (0x200, 0x80));
+        assert!(covered((0x100, 0x180), k, i) && covered((0x100, 0x180), i, k));
+        assert!(!covered((0x100, 0x181), k, i));
+        // Overlapping ones, and one inside the other.
+        assert!(covered((0x100, 0x200), (0x100, 0x180), (0x200, 0x100)));
+        assert!(covered((0x100, 0x200), (0x100, 0x200), (0x180, 0x10)));
+        // No initrd.
+        assert!(covered((0x100, 0x100), k, (0x9000, 0)) && !covered((0x9000, 1), k, (0x9000, 0)));
     }
 
     #[test]

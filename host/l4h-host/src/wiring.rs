@@ -481,6 +481,8 @@ pub const NETD_LINK_RING: E<p::Netd, p::Root, o::Notification> = E::new(edge("NE
 // ---- Attestation.
 pub const GUEST_TRUSTD: E<p::Guest, p::Trustd, o::Kick> = E::new(shared(edge("GUEST_TRUSTD", Guest, Chosen, Trustd, Kick, Signal,
     Bit(badges::trustd_kick::GUEST), trust::MAX_RECORDS, Root, "guest g made a request in its attestation page")));
+pub const HVM_TRUSTD: E<p::Hvm, p::Trustd, o::Kick> = E::new(shared(copy(edge("HVM_TRUSTD", Hvm, Slots(hvm::SLOT_TRUSTD_KICK, 1), Trustd, Kick, Signal,
+    Bit(badges::trustd_kick::GUEST), trust::MAX_RECORDS, Root, "HVM guest g's attestation port took a request (GUEST_TRUSTD's copy, which vmmgr passes on)"), "GUEST_TRUSTD")));
 pub const ROOT_TRUSTD_RELAY: E<p::Root, p::Trustd, o::Kick> = E::new(shared(edge("ROOT_TRUSTD_RELAY", Root, Chosen, Trustd, Kick, Signal,
     Fixed(trust::RELAY_BADGE), 1, Root, "another partition's trustd answered or asked, or root's timer while trustd waits (trust::Status::wake; guest 63's bit too)")));
 
@@ -497,6 +499,8 @@ pub const VMMGR_VMM: E<p::Vmmgr, p::Vmm, o::Notification> = E::new(edge("VMMGR_V
     Fixed(badges::vmm::MEM), 1, Vmmgr, "the guest's hotplug target changed"));
 pub const VMMGR_HVM: E<p::Vmmgr, p::Hvm, o::Notification> = E::new(edge("VMMGR_HVM", Vmmgr, Chosen, Hvm, Notification, Signal,
     Fixed(badges::hvm::CTL), 1, Vmmgr, "console input or a power request for the guest (its console page)"));
+pub const VMMGR_HVM_ATTEST: E<p::Vmmgr, p::Hvm, o::Notification> = E::new(edge("VMMGR_HVM_ATTEST", Vmmgr, Chosen, Hvm, Notification, Signal,
+    Fixed(badges::hvm::ATTEST), 1, Vmmgr, "trustd answered the guest's attestation request (root's notice)"));
 pub const HVM_KICK: E<p::Hvm, p::Hvm, o::Notification> = E::new(edge("HVM_KICK", Hvm, Slots(hvm::SLOT_SELF_KICK, 1), Hvm, Notification, Signal,
     Fixed(badges::hvm::KICK), 1, Vmmgr, "a vCPU thread wrote a virtio queue notification"));
 pub const HVM_CONSOLE: E<p::Hvm, p::Hvm, o::Notification> = E::new(edge("HVM_CONSOLE", Hvm, Slots(hvm::SLOT_SELF_CONSOLE, 1), Hvm, Notification, Signal,
@@ -520,9 +524,9 @@ pub const EDGES: &[Edge] = &[
     NICD_DONE.0, VMMGR_DONE.0, NETD_NICD.0, NICD_NETD.0,
     VMM_BLKD_KICK.0, VMM_NETD_KICK.0, GUEST_USBD_KICK.0, BLKD_VMM_DONE.0, NETD_VMM_DONE.0, USBD_VMM.0,
     IRQ_BLKD.0, IRQ_NICD.0, ROOT_NICD_TIMER.0, IRQ_USBD.0, IRQ_MONITOR.0, DOORBELL_ROOT.0, DOORBELL_NETD.0, NETD_LINK_SELF.0, NETD_LINK_RING.0,
-    GUEST_TRUSTD.0, ROOT_TRUSTD_RELAY.0,
+    GUEST_TRUSTD.0, HVM_TRUSTD.0, ROOT_TRUSTD_RELAY.0,
     GUEST_CTL.0, GUEST_VMM_KICK.0, GUEST_VMM_MEM.0, GUEST_VMM_CONSOLE.0, VMMGR_VMM.0, VMM_VCPU.0, GUEST_IPI.0, VMMGR_VCPU.0,
-    HVM_VMMGR.0, HVM_CALL.0, HVM_FAULT.0, HVM_BLKD_KICK.0, HVM_NETD_KICK.0, VMMGR_HVM.0, HVM_KICK.0, HVM_CONSOLE.0, HVM_VCPU.0,
+    HVM_VMMGR.0, HVM_CALL.0, HVM_FAULT.0, HVM_BLKD_KICK.0, HVM_NETD_KICK.0, VMMGR_HVM.0, VMMGR_HVM_ATTEST.0, HVM_KICK.0, HVM_CONSOLE.0, HVM_VCPU.0,
 ];
 
 /// A slot where a component keeps an IPC object of its own, which no

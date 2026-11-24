@@ -20,6 +20,9 @@ int l4h_start_vcpu(int cpu, unsigned long sp, void (*fn)(int cpu), void *task)
 	regs.pc = (seL4_Word)l4h_provider_state()->secondary_entry;
 	regs.sp = sp;
 	regs.x0 = cpu;
+	/* Each kernel thread's vCPU id, for EL0 code to read without a
+	 * kernel entry (vCPU 0's is its initial 0). */
+	regs.tpidrro_el0 = cpu;
 #else
 	regs.rip = (seL4_Word)l4h_provider_state()->secondary_entry;
 	regs.rsp = sp;

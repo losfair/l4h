@@ -64,6 +64,8 @@ pub const SLOT_EPT_POOL: usize = 644;
 pub const MAX_EPT_ROOTS: usize = 8;
 pub const SLOT_GICV: usize = 645;
 pub const GICV_PAGES: usize = 2;
+/// With BOOT_HIGH_VSPACE: an ASID-assigned ArmHighVSpace (FL4, aarch64).
+pub const SLOT_HIGH_VSPACE: usize = 646;
 pub const SLOT_DYN_BASE: usize = 1024;
 
 pub const SPECIAL_BASE: u64 = 0x0000_7ff0_0000_0000;
@@ -215,6 +217,8 @@ pub struct BootInfo {
 
 pub const BOOT_DOM0: u64 = 1 << 0;
 pub const BOOT_TOPOLOGY: u64 = 1 << 1;
+/// SLOT_HIGH_VSPACE holds the guest's ArmHighVSpace.
+pub const BOOT_HIGH_VSPACE: u64 = 1 << 2;
 
 pub const VIRTIO_MAGIC: u32 = 0x7634_686c;
 pub const VIRTIO_MAX_QUEUES: usize = 16;
@@ -664,6 +668,31 @@ pub struct AttestPage {
     pub data: [u8; ATTEST_PAGE_DATA],
 }
 
+/// An HVM guest's attestation port (abi.h, L4H_ATTEST_PORT_*): the name
+/// of its virtio-console port, and the headers of a request and of its
+/// answer on it.
+pub const ATTEST_PORT_NAME: &[u8] = b"l4h.attest";
+pub const ATTEST_PORT_MAGIC: u32 = 0x4148_344c;
+
+#[repr(C)]
+pub struct AttestPortReq {
+    pub magic: u32,
+    pub op: u32,
+    pub offset: u32,
+    pub in_len: u32,
+    pub blob_len: u32,
+}
+
+#[repr(C)]
+pub struct AttestPortResp {
+    pub magic: u32,
+    pub status: i32,
+    pub total: u32,
+    pub out_len: u32,
+    pub state: u32,
+}
+const _: () = assert!(core::mem::size_of::<AttestPortReq>() == 20 && core::mem::size_of::<AttestPortResp>() == 20);
+
 pub const POWER_OFF: u64 = 0;
 pub const POWER_REBOOT: u64 = 1;
 pub const POWER_CRASH: u64 = 2;
@@ -1003,5 +1032,8 @@ mod tests {
         assert!(size_of::<BootInfo>() as u64 <= BOOTINFO_SIZE);
         assert_eq!(SLOT_GICV, SLOT_EPT_POOL + 1);
         assert!(SLOT_GICV < SLOT_DYN_BASE);
+        assert_eq!(SLOT_HIGH_VSPACE, SLOT_GICV + 1);
+        assert!(SLOT_HIGH_VSPACE < SLOT_DYN_BASE);
+        assert_eq!(BOOT_HIGH_VSPACE & (BOOT_DOM0 | BOOT_TOPOLOGY), 0);
     }
 }

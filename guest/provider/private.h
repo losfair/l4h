@@ -41,6 +41,22 @@
 #define L4H_PROVIDER_FEATURES_BATCH 0
 #endif
 
+/* FL4 AArch64's per-thread PAC keys and TTBR1 EL0 window, when this
+ * libsel4 has them. */
+#if defined(__aarch64__) && defined(seL4_ARM_PAC_EnIA)
+#define L4H_ARM_PAC 1
+#define L4H_PROVIDER_FEATURES_PAC L4H_PROVIDER_ARM_PAC
+#else
+#define L4H_PROVIDER_FEATURES_PAC 0
+#endif
+/* The FL4 that has the TTBR1 window (FL4 #90) also runs EL0 with TBI0. */
+#if defined(__aarch64__) && defined(seL4_ARM_HighVSpaceBits)
+#define L4H_ARM_HIGH_VSPACE 1
+#define L4H_PROVIDER_FEATURES_HIGH_VSPACE (L4H_PROVIDER_ARM_HIGH_VSPACE | L4H_PROVIDER_ARM_TBI0)
+#else
+#define L4H_PROVIDER_FEATURES_HIGH_VSPACE 0
+#endif
+
 /* Bind this vCPU's SC_U to the TCB of u (user.c). */
 struct l4h_vcpu;
 void l4h_bind_sc(struct l4h_vcpu *v, struct l4h_uctx *u);

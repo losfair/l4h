@@ -1228,6 +1228,11 @@ impl Ctl {
                 load(self, vm, initrd_gpa, o.initrd)?;
             }
             let mut cmdline = o.cmdline.as_bytes().to_vec();
+            // An HVM guest's launch digest is over the command line as
+            // given: one cut short here would be another guest's.
+            if o.kernel.is_some() && cmdline.len() > CTL_DATA_MAX - 1 {
+                return err(format!("--cmdline: {} bytes; at most {}", cmdline.len(), CTL_DATA_MAX - 1));
+            }
             cmdline.truncate(CTL_DATA_MAX - 1);
             let kernel_len = o.kernel.map_or(0, |k| k.len() as u64);
             self.call(CTL_VM_START, &[vm, initrd_gpa, o.initrd.len() as u64, kernel_gpa, kernel_len, 0], &cmdline, &[])?;
@@ -1611,10 +1616,14 @@ mod discard_tests {
     }
 }
 
-/// Attestation by the host (DESIGN.md §10.2) on /dev/l4h-attest, in any
-/// guest. ACT/SEAL work without a TPM.
+/// Attestation by the host (DESIGN.md §10.2), in any guest: on
+/// /dev/l4h-attest, an l4h guest's driver, or else on an HVM guest's
+/// attestation port (§5.11: the virtio-console port named l4h.attest).
+/// ACT/SEAL work without a TPM.
 pub mod attest {
     use super::*;
+    use std::io::{Read, Write};
+    use std::path::{Path, PathBuf};
 
     const REPORT: u32 = 1;
     const EVIDENCE: u32 = 2;
@@ -1643,12 +1652,115 @@ pub mod attest {
     // _IOWR('L', 2, struct l4h_attest_ioc)
     const IOC: u64 = (3 << 30) | ((std::mem::size_of::<Ioc>() as u64) << 16) | ((b'L' as u64) << 8) | 2;
 
+    /// The device of the virtio-console port named `name`, if the guest
+    /// has one: the vport whose sysfs `name` is that (udev's
+    /// /dev/virtio-ports link need not be there).
+    fn find_port(class: &Path, dev: &Path, name: &str) -> Option<PathBuf> {
+        let mut ports: Vec<_> = std::fs::read_dir(class).ok()?.flatten().map(|e| e.file_name()).collect();
+        ports.sort();
+        ports.into_iter().find(|p| std::fs::read_to_string(class.join(p).join("name")).is_ok_and(|n| n.trim_end() == name)).map(|p| dev.join(p))
+    }
+
+    const PORT_MAGIC: u32 = 0x4148_344c;
+    /// A request's data on the port, and the largest piece of a result
+    /// (abi.h, L4H_ATTEST_PAGE_DATA).
+    const PORT_DATA: usize = 4096 - 64;
+
+    /// One request on the port `f`: the answer's status (-errno), the
+    /// whole result's length, the host's state and this piece's data.
+    fn port_request(f: &mut (impl Read + Write), op: u32, offset: u32, data: &[u8], blob_len: usize) -> io::Result<(i32, u32, u32, Vec<u8>)> {
+        let mut req = Vec::with_capacity(20 + data.len());
+        for w in [PORT_MAGIC, op, offset, data.len() as u32, blob_len as u32] {
+            req.extend_from_slice(&w.to_le_bytes());
+        }
+        req.extend_from_slice(data);
+        // One write: a request is not interleaved with another's.
+        f.write_all(&req)?;
+        let mut head = [0u8; 20];
+        f.read_exact(&mut head)?;
+        let w = |i: usize| u32::from_le_bytes(head[4 * i..4 * i + 4].try_into().unwrap());
+        let bad = |what: &str| io::Error::new(io::ErrorKind::InvalidData, format!("attestation port: {what}"));
+        if w(0) != PORT_MAGIC {
+            return Err(bad("not an answer"));
+        }
+        let n = w(3) as usize;
+        if n > PORT_DATA {
+            return Err(bad("an answer longer than any"));
+        }
+        let mut out = vec![0u8; n];
+        f.read_exact(&mut out)?;
+        Ok((w(1) as i32, w(2), w(4), out))
+    }
+
+    /// A request and its whole result on the port `f`, piece by piece,
+    /// with the host's state at the last.
+    fn port_call(f: &mut (impl Read + Write), op: u32, data: &[u8], blob_len: usize) -> io::Result<(Vec<u8>, u32)> {
+        if data.len() > PORT_DATA {
+            return Err(io::Error::from_raw_os_error(22));
+        }
+        let mut out = Vec::new();
+        loop {
+            let (status, total, state, piece) = port_request(f, op, out.len() as u32, data, blob_len)?;
+            if status != 0 {
+                // An errno, as the driver gives one; anything else is the host's failure.
+                return Err(io::Error::from_raw_os_error(if (-4095..0).contains(&status) { -status } else { 5 }));
+            }
+            let total = total as usize;
+            if total > OUT_MAX || out.len() + piece.len() > total || (piece.is_empty() && out.len() < total) {
+                return Err(io::Error::from_raw_os_error(5));
+            }
+            out.extend_from_slice(&piece);
+            if out.len() >= total {
+                return Ok((out, state));
+            }
+        }
+    }
+
+    const PORT_NAME: &str = "l4h.attest";
+
+    /// How the guest reaches the host: an l4h guest's driver, or an HVM
+    /// guest's port.
+    enum Dev {
+        Driver(File),
+        Port(File),
+    }
+
+    const DRIVER: &str = "/dev/l4h-attest";
+
+    /// The guest's one way to the host, open: the driver where the guest
+    /// has it (whatever opening it says: no other way is tried then),
+    /// else its attestation port.  The kernel gives a port to one opener
+    /// at a time: another l4hctl's turn is waited for.
+    fn open_dev() -> Result<Dev> {
+        let rw = |p: &Path| File::options().read(true).write(true).open(p);
+        match rw(Path::new(DRIVER)) {
+            Ok(f) => return Ok(Dev::Driver(f)),
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return err(format!("{DRIVER}: {e}")),
+            Err(_) => {}
+        }
+        let Some(path) = find_port(Path::new("/sys/class/virtio-ports"), Path::new("/dev"), PORT_NAME) else {
+            return err(format!("{DRIVER}: not found, and no attestation port (does the host provide attestation/flags?)"));
+        };
+        let start = std::time::Instant::now();
+        loop {
+            match rw(&path) {
+                Ok(f) => return Ok(Dev::Port(f)),
+                // EBUSY: open elsewhere.
+                Err(e) if e.raw_os_error() == Some(16) && start.elapsed() < PORT_WAIT => std::thread::sleep(std::time::Duration::from_millis(20)),
+                Err(e) => return err(format!("attestation port ({}): {e}", path.display())),
+            }
+        }
+    }
+
+    /// How long another's use of the port is waited for: a TPM's slowest
+    /// request (ActivateCredential on first use) and some.
+    const PORT_WAIT: std::time::Duration = std::time::Duration::from_secs(180);
+
     fn call(op: u32, data: &[u8], blob_len: usize) -> Result<Vec<u8>> {
-        let dev = File::options()
-            .read(true)
-            .write(true)
-            .open("/dev/l4h-attest")
-            .map_err(|e| Error(format!("/dev/l4h-attest: {e} (does the host provide attestation/flags?)")))?;
+        let dev = match open_dev()? {
+            Dev::Driver(dev) => dev,
+            Dev::Port(mut port) => return port_call(&mut port, op, data, blob_len).map(|(out, _)| out).map_err(|e| failed(op, e)),
+        };
         let mut out = vec![0u8; 64 << 10];
         let mut c = Ioc {
             op,
@@ -1700,6 +1812,7 @@ pub mod attest {
             Some(2) => "no TPM event log available".into(),
             Some(19) => "no TPM: flags only".into(),
             Some(38) => "host has no taint/seal operations".into(),
+            Some(1) => "not permitted: a sealed flag, or one that is not userspace's to act on or seal".into(),
             _ => format!("attestation request {op} failed: {e}"),
         })
     }
@@ -1807,8 +1920,45 @@ pub mod attest {
 
     /// What reports are bound to: "tpm", "tdx", "tpm,tdx" or "none".
     pub fn providers() -> Result<String> {
-        let s = std::fs::read_to_string(PROVIDERS).map_err(|e| Error(format!("{PROVIDERS}: {e} (does the guest kernel know TDX?)")))?;
-        parse_providers(&s)
+        // An l4h guest's driver says, to anyone (the file is everyone's
+        // to read; the device node is not opened for it).
+        let sysfs = || {
+            let s = std::fs::read_to_string(PROVIDERS).map_err(|e| Error(format!("{PROVIDERS}: {e} (does the guest kernel know TDX?)")))?;
+            parse_providers(&s)
+        };
+        if says_driver(Path::new(DRIVER), Path::new("/sys/class/virtio-ports"), Path::new(PROVIDERS)) {
+            return sysfs();
+        }
+        match open_dev()? {
+            // A driver that came just now.
+            Dev::Driver(_) => sysfs(),
+            // An HVM guest has no driver to say: the host's state does,
+            // as its port gives it with an answer (to an empty ACT).
+            Dev::Port(mut port) => {
+                let (_, state) = port_call(&mut port, ACT, &[0; 32], 0).map_err(|e| failed(ACT, e))?;
+                Ok(state_providers(state).into())
+            }
+        }
+    }
+
+    /// Whether the driver is who says what reports are bound to: where
+    /// a request would go to it (its device node is there, `open_dev`),
+    /// or would go nowhere (no attestation port either) and it still
+    /// says in sysfs.  Nothing is opened, so anyone can ask.  Never the
+    /// driver for providers and the port for the report.
+    fn says_driver(node: &Path, ports: &Path, sysfs: &Path) -> bool {
+        node.metadata().is_ok() || (find_port(ports, Path::new("/dev"), PORT_NAME).is_none() && sysfs.symlink_metadata().is_ok())
+    }
+
+    /// What reports are bound to, by the host's state (abi.h,
+    /// L4H_ATTEST_HAS_TPM and L4H_ATTEST_HAS_TDX).
+    fn state_providers(state: u32) -> &'static str {
+        match (state & 4 != 0, state & 8 != 0) {
+            (true, true) => "tpm,tdx",
+            (true, false) => "tpm",
+            (false, true) => "tdx",
+            (false, false) => "none",
+        }
     }
 
     /// The driver's providers file, checked.
@@ -1841,6 +1991,118 @@ pub mod attest {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// The host's end of an attestation port: answers each request
+        /// with the next piece of `result` (pieces of `piece` bytes), or
+        /// with `status`.
+        struct Host {
+            result: Vec<u8>,
+            piece: usize,
+            status: i32,
+            state: u32,
+            asked: Vec<(u32, u32, Vec<u8>, u32)>,
+            answer: Vec<u8>,
+        }
+
+        impl Write for Host {
+            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+                let w = |i: usize| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap());
+                assert_eq!((w(0), w(3) as usize), (PORT_MAGIC, b.len() - 20), "one whole request a write");
+                let at = w(2) as usize;
+                self.asked.push((w(1), w(2), b[20..].to_vec(), w(4)));
+                let data = if self.status != 0 { &[][..] } else { &self.result[at.min(self.result.len())..][..self.piece.min(self.result.len().saturating_sub(at))] };
+                for v in [PORT_MAGIC, self.status as u32, self.result.len() as u32, data.len() as u32, self.state] {
+                    self.answer.extend_from_slice(&v.to_le_bytes());
+                }
+                self.answer.extend_from_slice(data);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl Read for Host {
+            // A byte or two at a time, as a port may give them.
+            fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+                let n = b.len().min(self.answer.len()).min(2);
+                b[..n].copy_from_slice(&self.answer[..n]);
+                self.answer.drain(..n);
+                Ok(n)
+            }
+        }
+
+        fn host(result: &[u8], piece: usize, status: i32) -> Host {
+            Host { result: result.to_vec(), piece, status, state: 4, asked: Vec::new(), answer: Vec::new() }
+        }
+
+        #[test]
+        fn port_requests_collect_a_result_in_pieces() {
+            let result: Vec<u8> = (0..10_000u32).map(|i| i as u8).collect();
+            let mut h = host(&result, 4032, 0);
+            let (out, state) = port_call(&mut h, EVENT_LOG, &[], 0).unwrap();
+            assert_eq!((out, state), (result, 4));
+            assert_eq!(h.asked.iter().map(|a| (a.0, a.1)).collect::<Vec<_>>(), [(EVENT_LOG, 0), (EVENT_LOG, 4032), (EVENT_LOG, 8064)]);
+            // The request's data and blob length go with every piece.
+            let mut h = host(b"secret", 4032, 0);
+            assert_eq!(port_call(&mut h, ACTIVATE, b"blobsecret", 4).unwrap().0, b"secret");
+            assert_eq!(h.asked, [(ACTIVATE, 0, b"blobsecret".to_vec(), 4)]);
+            // An empty result is one answer.
+            let mut h = host(b"", 4032, 0);
+            assert_eq!(port_call(&mut h, EVIDENCE, &[], 0).unwrap().0, b"");
+            assert_eq!(h.asked.len(), 1);
+        }
+
+        #[test]
+        fn port_failures() {
+            // The host's errno is the error, as the driver's ioctl gives it.
+            let mut h = host(b"", 4032, -19);
+            assert_eq!(port_call(&mut h, REPORT, &[0; 64], 0).unwrap_err().raw_os_error(), Some(19));
+            assert_eq!(failed(REPORT, port_call(&mut host(b"", 1, -19), REPORT, &[0; 64], 0).unwrap_err()).0, "no TPM: flags only");
+            // A status that is no errno, a host that gives no data of a
+            // result it says is longer, or one too long to be any: EIO.
+            for mut h in [host(b"", 1, 7), host(b"x", 0, 0), host(&vec![0; OUT_MAX + 1], 4032, 0)] {
+                assert_eq!(port_call(&mut h, EVIDENCE, &[], 0).unwrap_err().raw_os_error(), Some(5));
+            }
+            // More data than a request holds is not sent.
+            let mut h = host(b"", 1, 0);
+            assert_eq!(port_call(&mut h, ACTIVATE, &vec![0; PORT_DATA + 1], 0).unwrap_err().raw_os_error(), Some(22));
+            assert!(h.asked.is_empty());
+            // What is not an answer.
+            let mut h = host(b"", 1, 0);
+            h.answer = vec![0; 20];
+            assert!(port_request(&mut h, EVIDENCE, 0, &[], 0).is_err());
+        }
+
+        #[test]
+        fn port_is_found_by_its_name() {
+            let dir = std::env::temp_dir().join(format!("l4hctl-ports-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            for (port, name) in [("vport0p0", "org.qemu.guest_agent.0\n"), ("vport1p0", "l4h.attest\n"), ("vport2p0", "l4h.attest.other\n")] {
+                std::fs::create_dir_all(dir.join(port)).unwrap();
+                std::fs::write(dir.join(port).join("name"), name).unwrap();
+            }
+            std::fs::create_dir_all(dir.join("vport3p0")).unwrap();
+            assert_eq!(find_port(&dir, Path::new("/dev"), PORT_NAME), Some(PathBuf::from("/dev/vport1p0")));
+            assert_eq!(find_port(&dir, Path::new("/dev"), "none"), None);
+            assert_eq!(find_port(&dir.join("absent"), Path::new("/dev"), PORT_NAME), None);
+            // The driver is there by its node, which need not be ours to
+            // open (root's alone), or by what it says in sysfs.
+            use std::os::unix::fs::PermissionsExt;
+            let node = dir.join("l4h-attest");
+            let (sysfs, none) = (dir.join("vport0p0").join("name"), dir.join("absent"));
+            // Its sysfs file without its node, beside a port: requests
+            // go to the port, so the port says.  Without a port, sysfs.
+            assert!(!says_driver(&node, &dir, &sysfs));
+            assert!(says_driver(&node, &none, &sysfs));
+            assert!(!says_driver(&node, &none, &none));
+            std::fs::write(&node, "").unwrap();
+            std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0)).unwrap();
+            assert!(says_driver(&node, &dir, &sysfs));
+            assert!(says_driver(&node, &none, &none));
+            std::fs::remove_dir_all(&dir).unwrap();
+            assert_eq!([0, 4, 8, 12].map(state_providers), ["none", "tpm", "tdx", "tpm,tdx"]);
+        }
 
         #[test]
         fn retries_only_a_longer_result() {

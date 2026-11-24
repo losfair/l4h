@@ -83,6 +83,11 @@ pub mod sys {
     pub fn kick(_slot: u64) -> crate::Kick {
         crate::Kick
     }
+    /// trustd kicked: counted.
+    pub static TRUSTD_KICKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    pub fn kick_trustd() {
+        TRUSTD_KICKS.fetch_add(1, Ordering::SeqCst);
+    }
     pub fn call_access(space: u32, addr: u64, size: u8, write: bool, value: u64) -> u64 {
         as_thread(None, || crate::io::access(space, addr, size, write, value))
     }
@@ -107,6 +112,8 @@ pub mod guest {
 #[path = "../host/l4h-vmm/src/virtq.rs"]
 pub mod virtq;
 // The devices every architecture has, where the shared code finds them.
+#[path = "../host/l4h-hvm/src/dev/attest.rs"]
+pub mod attest;
 #[path = "../host/l4h-hvm/src/dev/blk.rs"]
 pub mod blk;
 #[path = "../host/l4h-hvm/src/dev/net.rs"]
@@ -116,7 +123,7 @@ pub mod pci;
 #[path = "../host/l4h-hvm/src/dev/virtio_pci.rs"]
 pub mod virtio_pci;
 pub mod dev {
-    pub use crate::{blk, net, pci, virtio_pci};
+    pub use crate::{attest, blk, net, pci, virtio_pci};
 }
 #[path = "../host/l4h-hvm/src/iopool.rs"]
 pub mod iopool;

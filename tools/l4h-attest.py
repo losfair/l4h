@@ -31,6 +31,11 @@
   l4h-attest.py measure KERNEL [--initrd F] [--cmdline S] [--initrd-gpa N]
       The launch digest of a guest booted with these files: what its
       reports carry as "launch".  The initrd's address is part of it.
+  l4h-attest.py measure KERNEL --hvm x86_64|aarch64 --kernel-gpa N
+                [--initrd F --initrd-gpa N] [--cmdline S]
+      The launch digest of an HVM guest: KERNEL is the image dom0 loads (a
+      bzImage, Image or ELF vmlinux), and the addresses are where it loads
+      the files (`l4hctl hvm-layout` prints l4hctl's).
   l4h-attest.py measure-host [--efi FILE] [--config FILE] [--initrd FILE]
       Expected host boot measurements: PCR 9 (SHA-256) and RTMR 2 (SHA-384)
       for l4h.conf and dom0 initrd (policy.rs domain separation), and with
@@ -622,6 +627,35 @@ def launch_digest(kernel, initrd, cmdline, initrd_gpa=None):
     h.update(image)
     h.update(struct.pack("<QQ", gpa, len(initrd)))
     h.update(initrd)
+    h.update(struct.pack("<Q", len(cmd)))
+    h.update(cmd)
+    return h.digest()
+
+
+HVM_ARCH = {"x86_64": 1, "aarch64": 2}
+
+
+def hvm_launch_digest(arch, kernel, initrd, cmdline, kernel_gpa, initrd_gpa, flags=0):
+    """The digest vmmgr computes when it starts an HVM guest (hvm.rs,
+    launch_digest): over the image files as dom0 loaded them, where it
+    loaded them, the boot flags and the command line."""
+    if arch not in HVM_ARCH:
+        raise Fail("--hvm: x86_64 or aarch64")
+    if not kernel:
+        raise Fail("kernel: empty")
+    if kernel_gpa is None or (initrd and initrd_gpa is None):
+        raise Fail("--hvm needs --kernel-gpa, and --initrd-gpa with an initrd (l4hctl hvm-layout prints them)")
+    # The command line as the host got it: a control request's data holds
+    # no more (abi.h, L4H_CTL_DATA_MAX), and l4hctl refuses a longer one
+    # rather than cut it.
+    cmd = cmdline.encode()
+    if len(cmd) > 1984:
+        raise Fail("--cmdline: %d bytes; an HVM guest's is at most 1984" % len(cmd))
+    h = hashlib.sha256(b"l4h-launch-hvm-v1")
+    h.update(struct.pack("<QQQQ", HVM_ARCH[arch], flags, kernel_gpa, len(kernel)))
+    h.update(hashlib.sha256(kernel).digest())
+    h.update(struct.pack("<QQ", initrd_gpa if initrd else 0, len(initrd)))
+    h.update(hashlib.sha256(initrd).digest())
     h.update(struct.pack("<Q", len(cmd)))
     h.update(cmd)
     return h.digest()
@@ -2070,6 +2104,8 @@ def main():
     m.add_argument("--cmdline", default="")
     m.add_argument("--initrd-gpa", type=lambda x: int(x, 0),
                    help="where dom0 loaded the initrd (default: 1 MiB past the kernel's end, as vmmgr does)")
+    m.add_argument("--hvm", metavar="ARCH", help="an HVM guest of this architecture (x86_64 or aarch64)")
+    m.add_argument("--kernel-gpa", type=lambda x: int(x, 0), help="--hvm: where dom0 loaded the kernel image")
     mh = sub.add_parser("measure-host")
     mh.add_argument("--efi", help="UEFI application (PE/COFF): also compute Authenticode SHA-256 and SHA-384 digests")
     mh.add_argument("--config", help="l4h.conf file (absent if omitted)")
@@ -2123,7 +2159,13 @@ def main():
     try:
         if a.cmd == "measure":
             initrd = open(a.initrd, "rb").read() if a.initrd else b""
-            print(launch_digest(open(a.kernel, "rb").read(), initrd, a.cmdline, a.initrd_gpa).hex())
+            kernel = open(a.kernel, "rb").read()
+            if a.hvm:
+                print(hvm_launch_digest(a.hvm, kernel, initrd, a.cmdline, a.kernel_gpa, a.initrd_gpa).hex())
+            elif a.kernel_gpa is not None:
+                raise Fail("--kernel-gpa is an HVM guest's (--hvm)")
+            else:
+                print(launch_digest(kernel, initrd, a.cmdline, a.initrd_gpa).hex())
         elif a.cmd == "measure-host":
             efi = read(a.efi) if a.efi else None
             config = read(a.config) if a.config else None

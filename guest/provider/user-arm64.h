@@ -40,7 +40,8 @@ static void ctx_to_gp(const seL4_UserContext *c, unsigned long *gp, int nwords)
 	gp[33] = c->spsr & 0xf0000000UL;
 	gp[HOST_TLS] = c->tpidr_el0;
 }
-static void gp_to_ctx(const unsigned long *gp, seL4_UserContext *c)
+/* TPIDRRO_EL0 is no gp[] word (provider version 1 has 37): `tls_ro`. */
+static void gp_to_ctx(const unsigned long *gp, seL4_UserContext *c, unsigned long tls_ro)
 {
 	c->x0 = gp[0];
 	c->x1 = gp[1];
@@ -77,7 +78,7 @@ static void gp_to_ctx(const unsigned long *gp, seL4_UserContext *c)
 	c->pc = gp[32];
 	c->spsr = gp[33];
 	c->tpidr_el0 = gp[HOST_TLS];
-	c->tpidrro_el0 = 0;
+	c->tpidrro_el0 = tls_ro;
 }
 /*
  * FL4 appends a trapping thread's x8-x30 and TPIDR_EL0 to its UnknownSyscall
@@ -122,11 +123,14 @@ static void syscall_msg_to_gp(struct l4h_uctx *u, unsigned long *gp, seL4_Word l
 	gp[36] = gp[0]; /* original x0 for restarted syscalls */
 }
 
-/* The reply to a syscall stop that sets every register but TPIDRRO_EL0
- * (always 0 here), when the stop's message had them all (DIRTY_FULL_MSG). */
+/* The reply to a syscall stop that sets every register but TPIDRRO_EL0,
+ * when the stop's message had them all (DIRTY_FULL_MSG).  TPIDRRO_EL0 is
+ * not in it: a caller of l4h_user_run_ex() that changes it passes
+ * L4H_USER_EXT_TLS_RO_UPDATE, which marks the segments dirty, and a full
+ * register write sets it. */
 static int gp_to_syscall_msg(const struct l4h_uctx *u, const unsigned long *gp)
 {
-	if (!(u->regs_dirty & DIRTY_FULL_MSG))
+	if (!(u->regs_dirty & DIRTY_FULL_MSG) || (u->regs_dirty & DIRTY_SEG))
 		return 0;
 	for (int i = 0; i < 8; i++)
 		seL4_SetMR(seL4_UnknownSyscall_X0 + i, gp[i]);

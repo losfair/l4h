@@ -74,8 +74,21 @@ pub const USB_BYTES: usize = host::map_tables(abi::usb::AREA_PAGES);
 /// Slots of ours either takes: the page, the guest's copy and the page
 /// tables (and, for USB, a copy of each page).
 pub const DEVICE_SLOTS: usize = 8;
-/// VSpaces of a guest's processes (the guest's VSpace pool), at most.
-pub const MAX_VSPACES: usize = 64;
+/// VSpaces of a guest's processes (the guest's VSpace pool), at most, and
+/// by default: each costs the host a page and an ASID, so guests get the
+/// default unless their config asks for more.
+pub const MAX_VSPACES: usize = 256;
+pub const DEFAULT_VSPACES: usize = 64;
+/// ArmHighVSpaces (abi::SLOT_HIGH_VSPACE) of a guest, each an ASID too:
+/// one on FL4 AArch64.
+#[cfg(all(target_arch = "aarch64", l4h_arm_high_vspace))]
+pub const HIGH_VSPACES: usize = 1;
+#[cfg(not(all(target_arch = "aarch64", l4h_arm_high_vspace)))]
+pub const HIGH_VSPACES: usize = 0;
+/// seL4_ARM_HighVSpaceBits: FL4's ArmHighVSpace, its TTBR1 level-0 table
+/// and the window's level-1 table.
+#[cfg(all(target_arch = "aarch64", l4h_arm_high_vspace))]
+const HIGH_VSPACE_BITS: usize = 13;
 
 
 /// Where vmmgr maps a guest's pages for itself (layout::GUEST_PAGES):
@@ -186,6 +199,12 @@ impl Ranges {
         let _ = self.0.insert(i, (lo, hi - lo));
     }
 
+    /// Whether `add` of this range would keep every range as loaded,
+    /// merging none across a gap: there is room for it, or it touches one.
+    pub fn fits(&self, gpa: usize, len: usize) -> bool {
+        !self.0.is_full() || self.0.iter().any(|&(g, l)| g <= gpa + len && gpa <= g + l)
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
         self.0.iter().copied()
     }
@@ -292,6 +311,8 @@ pub struct Guest {
     vspaces: ArrayVec<cap::VSpace, MAX_VSPACES>,
     /// EPT roots in its pool (abi::SLOT_EPT_POOL).
     nr_ept_roots: usize,
+    /// abi::SLOT_HIGH_VSPACE holds its ArmHighVSpace (abi::BOOT_HIGH_VSPACE).
+    high_vspace: bool,
     bootinfo: ArrayVec<cap::Granule, { abi::BOOTINFO_SIZE as usize / PAGE }>,
     entry: u64,
     /// Objects l4h-vmm serves the guest with: its endpoint (the guest's
@@ -328,8 +349,9 @@ pub struct Guest {
     pub attest: bool,
     /// Guest RAM ranges loaded before boot (`load_ram`: what dom0 loaded,
     /// and dom0's own initramfs), which must lie in what the launch digest
-    /// covers.  The kernel `boot` writes is not among them.
-    loaded: Ranges,
+    /// covers.  The kernel `boot` writes is not among them.  An HVM
+    /// guest's are its kernel image and initrd (hvm.rs).
+    pub(crate) loaded: Ranges,
     /// The launch digest, set at boot (DESIGN.md §10.2).
     pub launch: Option<[u8; 32]>,
     /// Bytes of the SDK image mapped at SDK_VA (kimage.rs), 0 if none.
@@ -398,6 +420,7 @@ impl Guest {
             ctl_taken: 0,
             vspaces: ArrayVec::new(),
             nr_ept_roots: 0,
+            high_vspace: false,
             bootinfo: ArrayVec::new(),
             entry: 0,
             vmm_ep: cap::Endpoint::from_bits(0),
@@ -1001,7 +1024,8 @@ impl Guest {
             bi.sdk_size = self.sdk_size as u64;
         }
 
-        bi.flags = if self.dom0 { abi::BOOT_DOM0 } else { 0 } | abi::BOOT_TOPOLOGY;
+        bi.flags = if self.dom0 { abi::BOOT_DOM0 } else { 0 } | abi::BOOT_TOPOLOGY
+            | if self.high_vspace { abi::BOOT_HIGH_VSPACE } else { 0 };
         for (v, vcpu) in self.vcpus.iter().enumerate() {
             bi.vcpu_core[v] = vcpu.vcore as u8;
         }
@@ -1208,7 +1232,9 @@ pub fn plan(cfg: &GuestConfig, host_info: &HostInfo, kernel: &Kernel) -> Option<
     if cfg.vcpus < 1 || cfg.vcpus > abi::MAX_VCPUS || cfg.ram < RAM_MIN || cfg.ram > RAM_MAX {
         return None;
     }
-    if cfg.vspaces > MAX_VSPACES {
+    // Each vCPU may run a thread of another process at once, each pinning
+    // a VSpace: fewer than that and the guest's kernel cannot go on.
+    if cfg.vspaces > MAX_VSPACES || cfg.vspaces < cfg.vcpus {
         return None;
     }
     if cfg.ram_base % PAGE != 0 || cfg.ram_base != kernel.ram_base {
@@ -1265,6 +1291,7 @@ pub fn plan(cfg: &GuestConfig, host_info: &HostInfo, kernel: &Kernel) -> Option<
         + (cfg.io_pool / 512 + 2 * PAGE)
         + cfg.vcpus * (16 << 10)
         + cfg.vspaces * PAGE
+        + high_vspace_bytes()
         + kvm_bytes(host_info)
         + abi::BOOTINFO_SIZE as usize
         + crate::provider::IMAGE.len().next_multiple_of(PAGE) + 3 * PAGE
@@ -1272,10 +1299,18 @@ pub fn plan(cfg: &GuestConfig, host_info: &HostInfo, kernel: &Kernel) -> Option<
         + vmm::arena_bytes(cfg.io_pool, cfg.vcpus, MAX_GUEST_DEVICES);
     // A slot each: the CNodes, VSpaces and EPT roots, the vCPUs' objects,
     // the boot info and provider frames, and page tables.
-    let slots = 64 + n_l1 + cfg.vspaces + abi::MAX_EPT_ROOTS + abi::GICV_PAGES + cfg.vcpus * 16
+    let slots = 64 + n_l1 + cfg.vspaces + HIGH_VSPACES + abi::MAX_EPT_ROOTS + abi::GICV_PAGES + cfg.vcpus * 16
         + (abi::BOOTINFO_SIZE as usize + crate::provider::IMAGE.len()).div_ceil(PAGE)
         + (pool_pages + nr_blocks.min(64) * BLOCK_FRAMES).div_ceil(512) + 3 * 16;
     Some(Plan { owned, shared, nr_blocks, pool_gpa, hp_gpa, hp_count, estimate, slots })
+}
+
+/// Host memory for the guest's ArmHighVSpace, if it gets one.
+const fn high_vspace_bytes() -> usize {
+    #[cfg(all(target_arch = "aarch64", l4h_arm_high_vspace))]
+    return 1 << HIGH_VSPACE_BITS;
+    #[cfg(not(all(target_arch = "aarch64", l4h_arm_high_vspace)))]
+    return 0;
 }
 
 /// Host memory for the guest's KVM: its EPT roots (4 KiB EPT PML4s on
@@ -1439,6 +1474,17 @@ pub fn create(
             .expect("vspace pool copy");
     }
     g.give_cnode(abi::SLOT_VSPACE_POOL, pool_cn, guard6.clone());
+
+    // ---- FL4 AArch64: the TTBR1 EL0 window its threads may bind
+    // (seL4_TCB_SetHighVSpace).  It needs no EL2, so no `vtx`.
+    #[cfg(all(target_arch = "aarch64", l4h_arm_high_vspace))]
+    {
+        let ty = sel4::sys::_object::seL4_ARM_HighVSpaceObject as u64;
+        let high = g.arena.object_cap_raw::<cap_type::VSpace>(alloc, ty, HIGH_VSPACE_BITS);
+        asids.assign(alloc, high);
+        g.give(abi::SLOT_HIGH_VSPACE, high, CapRights::all());
+        g.high_vspace = true;
+    }
 
     // ---- EPT roots for the guest's KVM.
     sel4::sel4_cfg_if! {

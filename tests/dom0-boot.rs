@@ -92,10 +92,13 @@ pub struct Vmmgr {
     usbs: Vec<usize>,
     fail_usbs: Vec<usize>,
     started: bool,
+    /// The configuration dom0 was created with: (vCPUs, VSpaces).
+    created: Option<(usize, usize)>,
 }
 
 impl Vmmgr {
-    fn create_guest(&mut self, _: &GuestConfig) -> Option<usize> {
+    fn create_guest(&mut self, cfg: &GuestConfig) -> Option<usize> {
+        self.created = Some((cfg.vcpus, cfg.vspaces));
         self.guest = Some(Guest { devices: vec![(); self.builtins], booted: false, instance: 1, reserved: 0 });
         Some(0)
     }
@@ -171,6 +174,7 @@ impl Vmmgr {
 
 mod guest {
     use super::*;
+    pub const DEFAULT_VSPACES: usize = 64;
     pub fn boot_with(g: &mut Guest, _: &mut Alloc, _: &mut (), _: &Info, _: &Kernel, _: &[u8], _: &[u8]) -> bool {
         assert_eq!(g.reserved, BOOT_BYTES, "boot blocks must be reserved before loading the image");
         g.booted = true;
@@ -202,7 +206,7 @@ fn fixture(builtins: usize, windows: usize, other_disks: usize, nics: usize) -> 
         wins: Windows { a: () }, info: Info { tsc_hz: 1000 }, guest: None, builtins,
         dom0_wait: None, dom0_usb_wait: None, busy_usbs: Vec::new(), usb_attempts: Vec::new(), pending: Vec::new(), busy_disks: Vec::new(), destroyed: false,
         disk_attempts: Vec::new(), disks: Vec::new(), nics: Vec::new(), fail_disks: Vec::new(),
-        usbs: Vec::new(), fail_usbs: Vec::new(), started: false,
+        usbs: Vec::new(), fail_usbs: Vec::new(), started: false, created: None,
     }
 }
 
@@ -394,4 +398,17 @@ fn a_busy_controller_is_waited_for_then_a_placeholder_taken() {
     boot(&mut h);
     assert!(h.started);
     assert_eq!(h.disks, [Some(h.disk_attempts[0]), None]);
+}
+
+#[test]
+fn dom0_vspaces_default_config_and_at_least_one_per_vcpu() {
+    for (vcpus, config, vspaces) in [(1, 0, guest::DEFAULT_VSPACES), (2, 200, 200), (8, 4, 8), (64, 0, 64)] {
+        let mut h = fixture(2, 0, 0, 0);
+        let mut cfg: Box<VmmgrConfig> = Box::new(unsafe { core::ptr::read(h.cfg) });
+        cfg.dom0_vcpus = vcpus as u64;
+        cfg.dom0_vspaces = config;
+        h.cfg = Box::leak(cfg);
+        boot(&mut h);
+        assert_eq!(h.created, Some((vcpus, vspaces)), "dom0_vspaces={config} with {vcpus} vCPUs");
+    }
 }

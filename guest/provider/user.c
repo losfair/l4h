@@ -58,8 +58,9 @@ static void ctx_to_gp(const seL4_UserContext *c, unsigned long *gp, int nwords)
 	}
 }
 
-static void gp_to_ctx(const unsigned long *gp, seL4_UserContext *c)
+static void gp_to_ctx(const unsigned long *gp, seL4_UserContext *c, unsigned long tls_ro)
 {
+	(void)tls_ro;
 	c->rip = gp[HOST_IP];
 	c->rsp = gp[HOST_SP];
 	c->rflags = gp[HOST_EFLAGS];
@@ -137,12 +138,59 @@ static void gp_to_syscall_msg(const unsigned long *gp)
 #endif
 
 
-static int write_regs(struct l4h_uctx *u, const unsigned long *gp, int resume)
+/*
+ * Which fields of an l4h_user_run_ex() caller's struct l4h_user_ext its
+ * size covers (ext NULL: version 1's l4h_user_run(), whose callers know of
+ * no struct l4h_user_ext).  The provider touches no others.
+ */
+#define EXT_HAS(ext, field) \
+	((ext) && (ext)->size >= offsetof(struct l4h_user_ext, field) + sizeof((ext)->field))
+
+/* The context's TPIDRRO_EL0 (arm64): 0 but for l4h_user_run_ex() callers
+ * with L4H_USER_EXT_TLS_RO. */
+static unsigned long user_tls_ro(const struct l4h_user_ext *ext)
+{
+	return EXT_HAS(ext, tls_ro) && (ext->flags & L4H_USER_EXT_TLS_RO) ? ext->tls_ro : 0;
+}
+
+/*
+ * L4H_USER_EXT_TLS_RO_UPDATE: the caller changed tls_ro since the last run.
+ * With gp[] current (or modified, which needs it current), the registers
+ * are written as usual, without FL4's full syscall reply, which leaves
+ * TPIDRRO_EL0 out.  Otherwise (after a page fault, an exception or an
+ * interrupt that did not read them) gp[] is stale: only TPIDRRO_EL0 is
+ * changed in the TCB, on a context that holds no scheduling context.
+ */
+static void update_tls_ro(struct l4h_uctx *u, const struct l4h_user_ext *ext)
+{
+#ifdef __aarch64__
+	seL4_UserContext c;
+
+	if (!EXT_HAS(ext, tls_ro) || !(ext->flags & L4H_USER_EXT_TLS_RO_UPDATE) ||
+	    u->state == L4H_UCTX_FRESH || u->state == L4H_UCTX_NONE)
+		return;
+	if (u->regs_valid || (u->regs_dirty & DIRTY_GP)) {
+		u->regs_dirty |= DIRTY_GP | DIRTY_SEG;
+		return;
+	}
+	if (u->sc_vcpu >= 0)
+		l4h_user_deschedule(u);
+	l4h_BUG_ON(seL4_TCB_ReadRegisters(u->tcb, 0, 0, CTX_WORDS_ALL, &c));
+	c.tpidrro_el0 = user_tls_ro(ext);
+	l4h_BUG_ON(seL4_TCB_WriteRegisters(u->tcb, 0, 0, CTX_WORDS_ALL, &c));
+#else
+	(void)u;
+	(void)ext;
+#endif
+}
+
+static int write_regs(struct l4h_uctx *u, const unsigned long *gp, int resume,
+		      const struct l4h_user_ext *ext)
 {
 	seL4_UserContext c;
 	int n = (u->regs_dirty & DIRTY_SEG) ? CTX_WORDS_ALL : CTX_WORDS_NOSEG;
 
-	gp_to_ctx(gp, &c);
+	gp_to_ctx(gp, &c, user_tls_ro(ext));
 	return seL4_TCB_WriteRegisters(u->tcb, resume, 0, n, &c);
 }
 
@@ -202,14 +250,16 @@ void l4h_user_deschedule(struct l4h_uctx *u)
 }
 
 
-int l4h_user_run(struct l4h_uctx *u, unsigned long *gp, int read_regs_on_interrupt)
+static int user_run(struct l4h_uctx *u, unsigned long *gp, int read_regs_on_interrupt,
+		    struct l4h_user_ext *ext)
 {
 	struct l4h_vcpu *v = l4h_this_vcpu();
 	seL4_MessageInfo_t info;
-	seL4_Word badge;
+	seL4_Word badge, raw_fsr = 0;
 	int err;
 
 	l4h_BUG_ON(u->fault_ep_vcpu != v->id);
+	update_tls_ro(u, ext);
 	/* gp[] may have been modified whenever it is valid: write it back. */
 	if (u->regs_valid)
 		u->regs_dirty |= DIRTY_GP;
@@ -228,7 +278,7 @@ int l4h_user_run(struct l4h_uctx *u, unsigned long *gp, int read_regs_on_interru
 	if (u->state == L4H_UCTX_PREEMPTED && u->regs_dirty) {
 		if (u->sc_vcpu >= 0)
 			l4h_user_deschedule(u);
-		err = write_regs(u, gp, 0);
+		err = write_regs(u, gp, 0, ext);
 		l4h_BUG_ON(err);
 	}
 	l4h_bind_sc(v, u);
@@ -237,7 +287,7 @@ int l4h_user_run(struct l4h_uctx *u, unsigned long *gp, int read_regs_on_interru
 	case L4H_UCTX_FRESH:
 		/* Inactive until resumed: it cannot run before this write. */
 		u->regs_dirty |= DIRTY_GP | DIRTY_SEG;
-		err = write_regs(u, gp, 1);
+		err = write_regs(u, gp, 1, ext);
 		l4h_BUG_ON(err);
 		info = seL4_Recv(v->ep, &badge, u->reply);
 		break;
@@ -269,7 +319,7 @@ int l4h_user_run(struct l4h_uctx *u, unsigned long *gp, int read_regs_on_interru
 					      &badge, u->reply);
 #endif
 		} else {
-			err = write_regs(u, gp, 0);
+			err = write_regs(u, gp, 0, ext);
 			l4h_BUG_ON(err);
 			info = seL4_ReplyRecv(v->ep, seL4_MessageInfo_new(0, 0, 0, 0), &badge, u->reply);
 		}
@@ -343,6 +393,7 @@ int l4h_user_run(struct l4h_uctx *u, unsigned long *gp, int read_regs_on_interru
 		u->fault_ip = seL4_GetMR(seL4_VMFault_IP);
 		u->fault_addr = seL4_GetMR(seL4_VMFault_Addr);
 		u->fault_code = seL4_GetMR(seL4_VMFault_FSR);
+		raw_fsr = u->fault_code;
 #ifdef __aarch64__
 		if ((u->fault_code & 0x3f) == 0x21) {
 			/* Alignment aborts cannot be repaired by mapping the page. */
@@ -360,6 +411,8 @@ int l4h_user_run(struct l4h_uctx *u, unsigned long *gp, int read_regs_on_interru
 			u->fault_code |= 0x10;	/* instruction fetch */
 		u->regs_valid = 0;
 		u->stop = L4H_STOP_PAGEFAULT;
+		if (EXT_HAS(ext, raw_fsr))
+			ext->raw_fsr = raw_fsr;
 		break;
 	case seL4_Fault_UserException:
 		u->fault_ip = seL4_GetMR(seL4_UserException_FaultIP);
@@ -374,6 +427,19 @@ int l4h_user_run(struct l4h_uctx *u, unsigned long *gp, int read_regs_on_interru
 	}
 
 	return u->stop;
+}
+
+int l4h_user_run(struct l4h_uctx *u, unsigned long *gp, int read_regs_on_interrupt)
+{
+	return user_run(u, gp, read_regs_on_interrupt, 0);
+}
+
+int l4h_user_run_ex(struct l4h_uctx *u, unsigned long *gp, int read_regs_on_interrupt,
+		    struct l4h_user_ext *ext)
+{
+	if (EXT_HAS(ext, raw_fsr))
+		ext->raw_fsr = 0;
+	return user_run(u, gp, read_regs_on_interrupt, ext);
 }
 
 void l4h_user_sync_seg(struct l4h_uctx *u, unsigned long *gp)
