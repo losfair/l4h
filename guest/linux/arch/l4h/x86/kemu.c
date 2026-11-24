@@ -84,7 +84,7 @@ int kemu_arch_cmpxchg(u64 addr, u32 size, const u64 *exp, const u64 *new, u64 *o
 	if (!size || (size & (size - 1)) || size > 16 || (addr & (size - 1)) ||
 	    !access_ok((void __user *)(unsigned long)addr, size))
 		return -EFAULT;
-	ret = get_user_pages_fast(addr & PAGE_MASK, 1, FOLL_WRITE, &page);
+	ret = pin_user_pages_fast(addr & PAGE_MASK, 1, FOLL_WRITE, &page);
 	if (ret != 1)
 		return -EFAULT;
 	base = kmap_local_page(page);
@@ -111,17 +111,10 @@ int kemu_arch_cmpxchg(u64 addr, u32 size, const u64 *exp, const u64 *new, u64 *o
 		old[1] = e >> 64;
 		break;
 	}
-	default:
-		ret = -EINVAL;
-		break;
 	}
 	kunmap_local(base);
-	if (ret < 0) {
-		put_page(page);
-		return ret;
-	}
-	set_page_dirty_lock(page);
-	put_page(page);
+	/* Only the low size bytes participate in the exchange on x86. */
+	unpin_user_pages_dirty_lock(&page, 1, !memcmp(old, exp, size));
 	return 0;
 }
 

@@ -351,6 +351,8 @@ static void handle_exception(struct uml_pt_regs *regs, struct l4h_uctx *u)
 #else
 	switch (u->exc_number) {
 	case 0:		/* #DE */
+		if (task_is_kemu(current) && kemu_user_de(&current->thread.regs))
+			return;
 		sig = SIGFPE;
 		code = FPE_INTDIV;
 		break;

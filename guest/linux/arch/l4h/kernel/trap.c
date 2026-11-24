@@ -173,7 +173,9 @@ retry:
 		flags |= FAULT_FLAG_WRITE;
 	} else if (is_exec) {
 		flags |= FAULT_FLAG_INSTRUCTION;
-		if (!(vma->vm_flags & VM_EXEC))
+		/* kemu keeps VM_EXEC on guest code translated from host-NX pages. */
+		if (!(vma->vm_flags & VM_EXEC) ||
+		    !(pgprot_val(vma->vm_page_prot) & _PAGE_EXEC))
 			goto out;
 	} else {
 		/* Don't require VM_READ|VM_EXEC for write faults! */
