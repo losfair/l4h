@@ -26,7 +26,7 @@ const BUDGET_US: u64 = 1000;
 const PERIOD_US: u64 = 5000;
 const PAGE: usize = 4096;
 /// How long a reset waits for logd, which may be dead or far behind.
-const DRAIN_SECS: u64 = 2;
+const DRAIN_SECS: u64 = 5;
 const DRAIN_POLL_MS: u64 = 10;
 
 /// The UART: an I/O port capability each for the monitor and logd on x86,
@@ -263,9 +263,11 @@ pub fn spawn(
 /// The machine is about to reset: let logd finish what is in the ring. Root
 /// outranks it on this core, so this sleeps, on the timer the main loop uses.
 pub fn before_reset(h: &Host) {
-    if h.logd.is_none() {
+    let Some(l) = &h.logd else {
         return;
-    }
+    };
+    // Wake logd at once if it backed off to its idle timer (serial::idle_ms).
+    l.comp.ntfn.signal();
     let tick = h.info.tsc_hz / 1000 * DRAIN_POLL_MS;
     let end = host::ticks::now() + h.info.tsc_hz * DRAIN_SECS;
     while !crate::SERIAL.is_drained() && host::ticks::now() < end {

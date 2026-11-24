@@ -14,27 +14,13 @@
 mod uart;
 
 use l4h_rt::host::font;
-use l4h_rt::host::serial::{self, LogdConfig, Merge, Ring, Sender};
+use l4h_rt::host::serial::{self, LogdConfig, Merge, Ring, Sender, idle_ms};
 use l4h_rt::{Info, cap, host, sel4};
 
 l4h_rt::component!(main, no_heap);
 
 /// A byte takes 87 us at 115200 baud.
 const BYTE_US: u64 = 90;
-const IDLE_MIN_MS: u64 = 10;
-const IDLE_MID_MS: u64 = 50;
-const IDLE_MAX_MS: u64 = 250;
-
-fn idle_ms(empty_polls: u32) -> u64 {
-    if empty_polls <= 20 {
-        IDLE_MIN_MS
-    } else if empty_polls <= 40 {
-        IDLE_MID_MS
-    } else {
-        IDLE_MAX_MS
-    }
-}
-
 
 fn sleep(ticks: u64) {
     let tcb = cap::<sel4::cap_type::Tcb>(host::SLOT_TCB);

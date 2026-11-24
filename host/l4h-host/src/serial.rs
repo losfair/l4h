@@ -82,6 +82,23 @@ pub trait Port {
 /// How long to wait for a port that does not get ready, in sleeps.
 const STUCK_WAITS: u32 = 32;
 
+/// How long logd sleeps after `empty_polls` passes in a row found nothing
+/// to print, in milliseconds: 10 ms while output may still follow, backing
+/// off to 50 and 250 ms, and after about 6 s of silence to 1 s (root's idle
+/// tick), so a quiet system wakes logd once a second. Any output starts
+/// over at 10 ms.
+pub fn idle_ms(empty_polls: u32) -> u64 {
+    if empty_polls <= 20 {
+        10
+    } else if empty_polls <= 40 {
+        50
+    } else if empty_polls <= 60 {
+        250
+    } else {
+        1000
+    }
+}
+
 /// Sends without spinning: a real UART takes 1.4 ms to send a burst, one in
 /// a VM often none at all.
 pub struct Sender<P> {
@@ -1047,6 +1064,16 @@ mod tests {
     use super::*;
     use core::cell::{Cell, RefCell};
     use std::{boxed::Box, collections::VecDeque, string::String, sync::Arc, thread, vec::Vec};
+
+    #[test]
+    fn logd_idle_backs_off_to_a_second() {
+        for (polls, ms) in [(0, 10), (20, 10), (21, 50), (40, 50), (41, 250), (60, 250), (61, 1000), (u32::MAX, 1000)] {
+            assert_eq!(idle_ms(polls), ms, "after {polls} empty polls");
+        }
+        // Silence reaches the 1 s sleep after 20×10 + 20×50 + 20×250 ms.
+        let quiet: u64 = (1..=60).map(idle_ms).sum::<u64>();
+        assert_eq!(quiet, 6_200);
+    }
 
     const GRACE: u64 = 100;
 
