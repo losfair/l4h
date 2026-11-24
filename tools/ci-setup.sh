@@ -44,7 +44,9 @@ if [ "$need_x86_runtime" = 1 ]; then
         swtpm swtpm-tools python3-cryptography acpica-tools)
 fi
 if [ "$need_arm_runtime" = 1 ]; then
-    pkgs+=(qemu-system-arm qemu-utils gdb-multiarch)
+    # qemu-system-arm only Recommends ipxe-qemu, which --no-install-recommends
+    # omits; virtio-net-pci needs efi-virtio.rom from it even when dumping DTBs.
+    pkgs+=(qemu-system-arm ipxe-qemu qemu-utils gdb-multiarch)
 fi
 if [ "$need_sel4_venv" = 1 ]; then
     pkgs+=(cmake ninja-build python3-venv libxml2-utils device-tree-compiler)
