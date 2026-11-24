@@ -271,6 +271,8 @@ struct GuestState {
     vmm_guard: budget::BoostGuard,
     vmm_runnable_until: u64,
     vmm_next_wake: u64,
+    /// Queue for work charged to SC_K (PV kernel or the entire HVM vCPU).
+    sc_k_prio: usize,
     fairness_group: u8,
     effective_work: u128,
     window_work: u128,
@@ -435,6 +437,7 @@ impl Sim {
             vmm_guard: budget::BoostGuard::default(),
             vmm_runnable_until: 0,
             vmm_next_wake,
+            sc_k_prio: PRIO_KERNEL as usize,
             fairness_group,
             effective_work: 0,
             window_work: 0,
@@ -775,7 +778,7 @@ impl Sim {
             }
             ThreadId::VcpuKernel(gid, v) => {
                 let g = self.guests[gid].as_ref()?;
-                Some((g.vcpus.get(v)?.core, PRIO_KERNEL as usize))
+                Some((g.vcpus.get(v)?.core, g.sc_k_prio))
             }
             ThreadId::VcpuUser(gid, v) => {
                 let g = self.guests[gid].as_ref()?;
@@ -800,7 +803,7 @@ impl Sim {
                 let has_u = g.tasks.iter().any(|t| t.on_vcpu == Some(v) && t.mode == TaskMode::User);
                 let core = g.vcpus[v].core;
                 if has_k && g.vcpus[v].sc_k.available(now) > 0 {
-                    want_present.push((core, PRIO_KERNEL as usize, ThreadId::VcpuKernel(gid, v)));
+                    want_present.push((core, g.sc_k_prio, ThreadId::VcpuKernel(gid, v)));
                 } else if has_u && g.vcpus[v].sc_u.available(now) > 0 {
                     want_present.push((core, PRIO_USER as usize, ThreadId::VcpuUser(gid, v)));
                 }
@@ -1468,6 +1471,28 @@ fn make_task(pattern: TaskPattern, last_vcpu: usize, pinned_vcpu: Option<usize>,
         effective_work: 0,
         wakeup_latencies: Vec::new(),
     }
+}
+
+#[test]
+fn hvm_vcpu_shares_a_core_with_a_waking_pv_user() {
+    let mut sim = Sim::new(STATIC, Topology::from_ids(&[0]), 0, 0);
+    let peer_wake = TIMESLICE_US / 2;
+    for (id, wake) in [(0, 0), (1, peer_wake)] {
+        let task = make_task(TaskPattern::SteadyHog, 0, None, wake);
+        sim.spawn_guest(id, 1, 0, VmmPattern::None, vec![task], 1);
+    }
+    sim.wake_tasks_and_vmms();
+    let hvm = sim.guests[0].as_mut().unwrap();
+    // A single runnable HVM thread uses SC_K even for guest userspace.
+    hvm.tasks[0].mode = TaskMode::Kernel;
+    hvm.sc_k_prio = (l4h_host::hvm::PRIO_VCPU - l4h_abi::PRIO_USER) as usize;
+
+    sim.run_until(3 * TIMESLICE_US);
+    let pv = &sim.guests[1].as_ref().unwrap().tasks[0];
+    assert!(pv.first_scheduled, "PV user never ran after waking");
+    assert!(pv.wakeup_latencies[0] <= TIMESLICE_US, "PV user waited {} us", pv.wakeup_latencies[0]);
+    let hvm_cpu = &sim.guests[0].as_ref().unwrap().vcpus[0];
+    assert!(hvm_cpu.sc_k.total_consumed > TIMESLICE_US, "HVM did not resume");
 }
 
 // ---- Scenarios ----

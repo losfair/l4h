@@ -1228,10 +1228,9 @@ create fails with `-ENODEV`. `l4hctl list` shows them as `hvm`.
 - **The monitor: `l4h-hvm`.** Each HVM guest gets its own component, as a
   PV guest gets an l4h-vmm (`KIND_HVM`, embedded in vmmgr as
   `L4H_HVM_ELF`, `no_std` without a heap). It is trusted by its guest only
-  and confined like it: every thread's MCP is `PRIO_KERNEL` (100), below
-  the debug syscalls' threshold, so a guest that took over its monitor
-  has no more authority than a guest kernel. Its wiring is checked as
-  every component's (`HVM_*` edges: vmmgr's `vmm_ready`/`guest_power`,
+  and confined like it: every thread's MCP is `PRIO_USER` (99), below
+  the debug syscalls' threshold. Only vmmgr can give the I/O thread its
+  higher priority. Its wiring is checked as every component's (`HVM_*` edges: vmmgr's `vmm_ready`/`guest_power`,
   blkd and netd kicks, trustd's kick for the guest, its own call endpoint
   and notifications), with
   what else it holds by slot and type (`wiring::HVM_HELD`: the EPT root,
@@ -1239,7 +1238,7 @@ create fails with `-ENODEV`. `l4hctl list` shows them as `hvm`.
   CSpace before it starts, as it cannot (debug syscalls need an MCP
   above its own).
 - **Threads.** One thread per vCPU, bound to its seL4 VCPU
-  (`VCPU_SetTCB`, `TCB_SetEPTRoot`), at `PRIO_KERNEL` on the vCPU's kernel
+  (`VCPU_SetTCB`, `TCB_SetEPTRoot`), at `PRIO_USER` on the vCPU's kernel
   SC (one SC: vmmgr's scheduler gives HVM vCPUs `sc_k` only), with its own
   64 KiB stack (and guard page), TLS and IPC buffer, and a bound
   notification that ends `VMEnter` or its wait in HLT. The I/O thread
@@ -1578,8 +1577,8 @@ Global on each core, with `P_K` = `PRIO_KERNEL` = 100:
 | `P_K + 3` | boosted l4h-vmm instances; l4h-trustd (last core, at most 5 ms per 20 ms) |
 | `P_K + 2` | l4h-logd (core 0, at most 1 ms per 5 ms), strictly above throttled VMMs |
 | `P_K + 1` | VMMs whose boost was withdrawn; their budgets are limited while other running guests have vCPUs assigned to their core, including blocked vCPUs |
-| `P_K` | guest kernel TCBs (`SC_K`) |
-| `P_U` = 99 | guest user TCBs (`SC_U`) |
+| `P_K` | PV guest kernel TCBs (`SC_K`) |
+| `P_U` = 99 | PV guest user TCBs (`SC_U`) and HVM vCPUs (`SC_K`) |
 
 Boosted, uncapped VMMs have full round-robin scheduling contexts. At each
 100 ms sample, vmmgr withdraws the boost only if VMMs consumed at least

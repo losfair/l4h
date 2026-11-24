@@ -1728,10 +1728,10 @@ x86\_64.
 \section{Scheduling}
 
 vCPUs are threads that seL4 schedules by priority, with a budget for each
-vCPU. Host components have priority over guests, and each guest's kernel
-over guest user code, so a guest that spins cannot delay another guest's
-I/O. CPU may be overcommitted: 30 guests on 4 cores work, though each gets
-a share of a core.
+vCPU. Host device services run above guest vCPUs. A PV guest kernel
+runs above PV user threads. An HVM vCPU executes its guest kernel and
+user code at the same priority as PV user threads. CPU may be overcommitted:
+30 guests on 4 cores work, though each gets a share of a core.
 
 New vCPUs are placed on physical cores in turn before filling their SMT
 siblings. Every 100~ms, \texttt{l4h-vmmgr} measures how busy each vCPU was.
