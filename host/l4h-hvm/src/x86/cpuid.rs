@@ -6,15 +6,109 @@
 //! the speculation-control MSRs, TSX's controls, SGX), with what our
 //! platform has: an x2APIC with the TSC-deadline timer and ARAT, an
 //! invariant TSC whose rate leaves 0x15 and 0x16 give (and kvmclock, under
-//! KVM's signature, on AMD too), and a topology of one thread per core
-//! (leaves 0xb and 0x1f).  Free of seL4: the host's
-//! CPUID is a function.
+//! KVM's signature, on AMD too), and vmmgr's vCores as SMT cores of one
+//! package (Topology: leaves 1, 4, 0xb and 0x1f, and AMD's 0x8000_0008,
+//! 0x8000_001d and 0x8000_001e).  Free of seL4: the host's CPUID is a
+//! function.
+
+/// The guest's topology: its vCPUs, one package, whose cores are
+/// vmmgr's vCores (HvmConfig::vcpu_core), each vCPU an SMT thread of its
+/// vCore's core.  vmmgr keeps a vCore on one physical core for the
+/// guest's life (DESIGN.md §7.3), so siblings here are siblings there.
+/// A vCPU's APIC ID is its vCore's number above `smt_shift` bits and its
+/// place among its vCore's vCPUs below; the MADT and the local APICs
+/// have the same.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Topology {
+    pub vcpus: u32,
+    pub apic_id: [u32; MAX_VCPUS],
+    /// APIC ID bits of the thread within its core, and of the core and
+    /// thread (the package's).
+    pub smt_shift: u32,
+    pub core_shift: u32,
+    /// The most vCPUs one core has.
+    pub threads: u32,
+}
+
+/// vCPUs we lay out (HvmConfig::vcpu_core's).
+pub const MAX_VCPUS: usize = l4h_rt::host::hvm::MAX_VCPUS;
+
+/// Bits that hold the numbers 0..n.
+fn bits(n: u32) -> u32 {
+    32 - (n.max(1) - 1).leading_zeros()
+}
+
+impl Topology {
+    /// Every vCPU a core of its own, its APIC ID its number.
+    pub fn flat(vcpus: usize) -> Topology {
+        let vcpus = vcpus.clamp(1, MAX_VCPUS) as u32;
+        let apic_id = core::array::from_fn(|v| if v < vcpus as usize { v as u32 } else { 0 });
+        Topology { vcpus, apic_id, smt_shift: 0, core_shift: bits(vcpus), threads: 1 }
+    }
+
+    /// vCPU v in vCore `vcore[v]` (numbered 0.., below the vCPUs); flat if
+    /// they are not that, or if an APIC ID would not fit the MADT's and
+    /// xAPIC's 8 bits (0xff is the broadcast).
+    pub fn of(vcore: &[u8]) -> Topology {
+        let n = vcore.len().clamp(1, MAX_VCPUS);
+        if vcore.len() > MAX_VCPUS || vcore.iter().any(|&c| c as usize >= n) {
+            return Topology::flat(n);
+        }
+        let mut threads = [0u32; MAX_VCPUS];
+        let mut apic_id = [0u32; MAX_VCPUS];
+        for (v, &c) in vcore.iter().enumerate() {
+            apic_id[v] = threads[c as usize];
+            threads[c as usize] += 1;
+        }
+        let most = threads.iter().copied().max().unwrap_or(1).max(1);
+        let cores = vcore.iter().copied().max().unwrap_or(0) as u32 + 1;
+        let smt_shift = bits(most);
+        let core_shift = smt_shift + bits(cores);
+        if ((cores - 1) << smt_shift) + most - 1 >= 0xff {
+            return Topology::flat(n);
+        }
+        for (v, &c) in vcore.iter().enumerate() {
+            apic_id[v] |= (c as u32) << smt_shift;
+        }
+        Topology { vcpus: n as u32, apic_id, smt_shift, core_shift, threads: most }
+    }
+
+    /// vCPU `v`'s place in it.
+    pub fn place(&self, v: usize) -> Place {
+        Place { apic_id: self.apic_id[v], vcpus: self.vcpus, smt_shift: self.smt_shift, core_shift: self.core_shift,
+            threads: self.threads }
+    }
+}
+
+/// A vCPU's place in the Topology, as its CPUID shows it.
+#[derive(Clone, Copy, Debug)]
+pub struct Place {
+    pub apic_id: u32,
+    pub vcpus: u32,
+    pub smt_shift: u32,
+    pub core_shift: u32,
+    pub threads: u32,
+}
+
+impl Place {
+    /// The vCPUs that share a cache of `level` (1.., in Intel's and AMD's
+    /// cache leaves), less one, as those leaves hold it: the L1 and L2 a
+    /// core's threads, the L3 the package's.  That L3 is what one-socket
+    /// hosts with one L3 have; on hosts with several (AMD's CCXs) the
+    /// vCPUs' physical cores may be under different ones, which vCore
+    /// swaps change at any time: the package's is what KVM's guests are
+    /// usually told too, and lets the guest's scheduler find an idle vCPU
+    /// on a wakeup (its LLC domain).
+    fn sharing(&self, level: u32) -> u32 {
+        let shift = if level <= 2 { self.smt_shift } else { self.core_shift };
+        ((1u32 << shift) - 1).min(0xfff)
+    }
+}
 
 /// What a vCPU's CPUID depends on besides the host.
 #[derive(Clone, Copy, Debug)]
 pub struct Ctx {
-    pub vcpu: u32,
-    pub vcpus: u32,
+    pub topo: Place,
     pub tsc_hz: u64,
     /// The guest's CR4.OSXSAVE, and XCR0.
     pub osxsave: bool,
@@ -96,7 +190,7 @@ pub fn cpuid(leaf: u32, sub: u32, ctx: &Ctx, host: &impl Fn(u32, u32) -> [u32; 4
     if leaf >= 0x8000_0000 && leaf > max_ext.min(max_ext_ours(amd)) {
         return [0; 4];
     }
-    let log2 = 32 - (ctx.vcpus.max(1) - 1).leading_zeros();
+    let t = &ctx.topo;
     match leaf {
         0 => {
             let [_, b, c, d] = host(0, 0);
@@ -104,9 +198,9 @@ pub fn cpuid(leaf: u32, sub: u32, ctx: &Ctx, host: &impl Fn(u32, u32) -> [u32; 4
         }
         1 => {
             let [a, b, c, d] = host(1, 0);
-            // EBX: CLFLUSH size and brand kept; logical processors and the
-            // initial APIC ID ours.
-            let b = (b & 0xffff) | (ctx.vcpus.min(255) << 16) | (ctx.vcpu << 24);
+            // EBX: CLFLUSH size and brand kept; the package's addressable
+            // APIC IDs and the initial APIC ID ours.
+            let b = (b & 0xffff) | ((1u32 << t.core_shift).min(255) << 16) | (t.apic_id << 24);
             // ECX: hide DTES64, MONITOR, DS-CPL, VMX, SMX, EST, TM2, CNXT-ID,
             // SDBG, xTPR, PDCM, DCA, and say: x2APIC, TSC-deadline, a
             // hypervisor; OSXSAVE follows the guest's CR4.
@@ -119,14 +213,16 @@ pub fn cpuid(leaf: u32, sub: u32, ctx: &Ctx, host: &impl Fn(u32, u32) -> [u32; 4
             // EDX: hide MCE and MCA (no banks), PN, DS, ACPI, TM, PBE; HTT
             // with more than one vCPU.
             let hide_d = bit(7) | bit(14) | bit(18) | bit(21) | bit(22) | bit(29) | bit(31);
-            let htt = if ctx.vcpus > 1 { bit(28) } else { 0 };
+            let htt = if t.vcpus > 1 { bit(28) } else { 0 };
             let d = (d & !hide_d & !bit(28)) | htt | bit(9);
             [a, b, c, d]
         }
-        // Cache parameters: no cores shared (topology is 0xb's).
+        // Cache parameters: the host's, shared as Place::sharing says, in
+        // a package of our cores (topology is 0xb's).
         4 => {
             let [a, b, c, d] = host(4, sub);
-            [a & 0x3ff, b, c, d]
+            let cores = ((1u32 << (t.core_shift - t.smt_shift)) - 1).min(63);
+            [if a & 0x1f == 0 { 0 } else { cache_sharing(a, t) | cores << 26 }, b, c, d]
         }
         // No MONITOR/MWAIT, no PMU.
         5 | 0xa => [0; 4],
@@ -166,12 +262,12 @@ pub fn cpuid(leaf: u32, sub: u32, ctx: &Ctx, host: &impl Fn(u32, u32) -> [u32; 4
             }
             _ => [0; 4],
         },
-        // Topology: one thread per core, every vCPU a core of one package.
+        // Topology: SMT threads of cores of one package (Topology).
         0xb | 0x1f => {
-            let x2apic = ctx.vcpu;
+            let x2apic = t.apic_id;
             match sub {
-                0 => [0, 1, 1 << 8, x2apic],
-                1 => [log2, ctx.vcpus, (2 << 8) | 1, x2apic],
+                0 => [t.smt_shift, t.threads, 1 << 8, x2apic],
+                1 => [t.core_shift, t.vcpus, (2 << 8) | 1, x2apic],
                 _ => [0, 0, sub, x2apic],
             }
         }
@@ -220,23 +316,34 @@ pub fn cpuid(leaf: u32, sub: u32, ctx: &Ctx, host: &impl Fn(u32, u32) -> [u32; 4
         0x8000_0001 => {
             let [a, b, c, d] = host(0x8000_0001, 0);
             // ECX: hide CMP_LEGACY, SVM, EXTAPIC, CR8_LEGACY, OSVW, IBS,
-            // SKINIT, WDT, LWP, NODEID, TOPOEXT, the performance counter
-            // extensions, DBX, PERFTSC, PCX_L2I, MWAITX.
+            // SKINIT, WDT, LWP, NODEID, the performance counter
+            // extensions, DBX, PERFTSC, PCX_L2I, MWAITX.  TOPOEXT (AMD's
+            // only way to SMT siblings in Linux) with its leaves, ours.
             let hide_c = bit(1) | bit(2) | bit(3) | bit(4) | bit(9) | bit(10) | bit(12) | bit(13) | bit(15) | bit(19)
-                | bit(22) | bit(23) | bit(24) | bit(26) | bit(27) | bit(28) | bit(29);
+                | bit(23) | bit(24) | bit(26) | bit(27) | bit(28) | bit(29) | if topoext(amd, host) { 0 } else { bit(22) };
             // EDX: hide RDTSCP.
             [a, b, c & !hide_c, d & !bit(27)]
         }
         0x8000_0002..=0x8000_0006 => host(leaf, 0),
+        // AMD's cache properties, as leaf 4 (with TOPOEXT): the host's,
+        // shared as ours.
+        0x8000_001d if topoext(amd, host) => {
+            let [a, b, c, d] = host(0x8000_001d, sub);
+            [cache_sharing(a, t), b, c, d]
+        }
+        // AMD's topology (with TOPOEXT): the extended APIC ID; the core's
+        // threads and number; one node.
+        0x8000_001e if topoext(amd, host) => [t.apic_id, ((t.threads - 1) << 8) | (t.apic_id >> t.smt_shift) & 0xff, 0, 0],
         // Invariant TSC, and nothing else of power management.
         0x8000_0007 => [0, 0, 0, bit(8)],
         0x8000_0008 => {
             let [a, b, _, _] = host(0x8000_0008, 0);
             // Address sizes: virtual 48 bits at most (no LA57), physical
             // below 2^47 (seL4's EPT); of EBX's features CLZERO and
-            // XSAVEERPTR (no speculation controls); a core per vCPU.
+            // XSAVEERPTR (no speculation controls); the package's threads
+            // and APIC ID bits.
             let (phys, virt) = ((a & 0xff).min(MAX_PHYS_BITS), ((a >> 8) & 0xff).min(48));
-            let ecx = if amd { (ctx.vcpus.max(1) - 1) & 0xff | (log2 << 12) } else { 0 };
+            let ecx = if amd { (t.vcpus.max(1) - 1) & 0xff | (t.core_shift << 12) } else { 0 };
             [phys | virt << 8, b & (bit(0) | bit(2)), ecx, 0]
         }
         // AMD's extended features 2: LFENCE always serializing, and
@@ -250,6 +357,21 @@ pub fn cpuid(leaf: u32, sub: u32, ctx: &Ctx, host: &impl Fn(u32, u32) -> [u32; 4
         2 => host(2, 0),
         _ => [0; 4],
     }
+}
+
+/// A cache leaf's EAX (Intel's 4, AMD's 0x8000_001d): its type, level and
+/// associativity the host's, the vCPUs sharing it ours.
+fn cache_sharing(a: u32, t: &Place) -> u32 {
+    if a & 0x1f == 0 {
+        return 0;
+    }
+    (a & 0x3ff) | t.sharing((a >> 5) & 7) << 14
+}
+
+/// AMD's topology extensions (TOPOEXT, 0x8000_0001 ECX bit 22) on the
+/// host: its 0x8000_001d cache leaves, which ours are made from.
+fn topoext(amd: bool, host: &impl Fn(u32, u32) -> [u32; 4]) -> bool {
+    amd && host(0x8000_0000, 0)[0] >= 0x8000_001e && host(0x8000_0001, 0)[2] & bit(22) != 0
 }
 
 /// CPUID 0x8000_0021 EAX: LFENCE always serializing, Automatic IBRS.
@@ -310,7 +432,8 @@ mod tests {
         }
     }
 
-    const CTX: Ctx = Ctx { vcpu: 2, vcpus: 4, tsc_hz: 2_100_000_000, osxsave: false, xcr0: 1, xcr0_max: 7, pke: false, invpcid: false };
+    const FLAT4: Place = Place { apic_id: 2, vcpus: 4, smt_shift: 0, core_shift: 2, threads: 1 };
+    const CTX: Ctx = Ctx { topo: FLAT4, tsc_hz: 2_100_000_000, osxsave: false, xcr0: 1, xcr0_max: 7, pke: false, invpcid: false };
 
     /// An AMD host with everything set and extended leaves to 0x8000_0021.
     fn amd_host(leaf: u32, sub: u32) -> [u32; 4] {
@@ -374,8 +497,8 @@ mod tests {
     fn amd_extended_leaves_give_auto_ibrs_alone() {
         assert_eq!(cpuid(0x8000_0000, 0, &CTX, &amd_host)[0], 0x8000_0021);
         assert_eq!(cpuid(0x8000_0021, 0, &CTX, &amd_host), [AUTO_IBRS | LFENCE_SERIAL, 0, 0, 0]);
-        // SVM, SEV, the topology extensions, the TLB and cache leaves: none.
-        for leaf in [0x8000_000a, 0x8000_0019, 0x8000_001d, 0x8000_001e, 0x8000_001f, 0x8000_0020, 0x8000_0022] {
+        // SVM, SEV, the TLB leaves: none.
+        for leaf in [0x8000_000a, 0x8000_0019, 0x8000_001f, 0x8000_0020, 0x8000_0022] {
             assert_eq!(cpuid(leaf, 0, &CTX, &amd_host), [0; 4], "{leaf:#x}");
         }
         // Without it on the host, the bit is off; Intel stops at 0x8000_0008.
@@ -444,6 +567,97 @@ mod tests {
             assert_eq!(cpuid(leaf, 0, &CTX, &host), [0; 4], "leaf {leaf:#x}");
         }
         assert_eq!(cpuid(2, 0, &CTX, &host), host(2, 0));
+    }
+
+    /// vmmgr's vCores: 0 and 2 on one, 1 and 4 on another, 3 alone.
+    #[test]
+    fn topology_from_vcores() {
+        let t = Topology::of(&[0, 1, 0, 2, 1]);
+        assert_eq!(&t.apic_id[..5], &[0, 2, 1, 4, 3]);
+        assert_eq!((t.vcpus, t.smt_shift, t.core_shift, t.threads), (5, 1, 3, 2));
+        // One vCPU a vCore (a guest no larger than the host's cores): flat.
+        let one = Topology::of(&[0, 1, 2, 3]);
+        assert_eq!(one, Topology::flat(4));
+        assert_eq!((one.smt_shift, one.core_shift, one.threads), (0, 2, 1));
+        assert_eq!(Topology::of(&[0]), Topology::flat(1));
+        assert_eq!(Topology::flat(1).core_shift, 0);
+        // Three on one core: two bits of thread.
+        let three = Topology::of(&[0, 0, 0, 1]);
+        assert_eq!(&three.apic_id[..4], &[0, 1, 2, 4]);
+        assert_eq!((three.smt_shift, three.core_shift, three.threads), (2, 3, 3));
+        // vCores that are not 0.. below the vCPUs, or APIC IDs past 0xfe:
+        // flat.
+        assert_eq!(Topology::of(&[0, 4, 0]), Topology::flat(3));
+        let mut big = [0u8; MAX_VCPUS];
+        for (v, c) in big.iter_mut().enumerate() {
+            *c = if v < 32 { 0 } else { (v - 31) as u8 };
+        }
+        assert_eq!(Topology::of(&big), Topology::flat(MAX_VCPUS));
+        let pairs: [u8; MAX_VCPUS] = core::array::from_fn(|v| (v / 2) as u8);
+        let p = Topology::of(&pairs);
+        assert_eq!((p.smt_shift, p.core_shift, p.apic_id[MAX_VCPUS - 1]), (1, 6, MAX_VCPUS as u32 - 1));
+    }
+
+    #[test]
+    fn smt_and_caches_in_cpuid() {
+        let t = Topology::of(&[0, 1, 0, 2, 1]);
+        let ctx = |v: usize| Ctx { topo: t.place(v), ..CTX };
+        // vCPU 4: thread 1 of core 1.
+        assert_eq!(cpuid(0xb, 0, &ctx(4), &host), [1, 2, 0x100, 3]);
+        assert_eq!(cpuid(0xb, 1, &ctx(4), &host), [3, 5, 0x201, 3]);
+        assert_eq!(cpuid(0x1f, 0, &ctx(3), &host), [1, 2, 0x100, 4]);
+        let [_, b, _, d] = cpuid(1, 0, &ctx(4), &host);
+        assert_eq!((b >> 24, (b >> 16) & 0xff, d & bit(28) != 0), (3, 8, true));
+        // Leaf 4: L1 and L2 the core's two threads, L3 the package's 8 IDs;
+        // 4 cores' IDs.
+        let cache = |level: u32| {
+            move |l: u32, s: u32| match (l, s) {
+                (4, 0) => [1 | level << 5 | 0x3ff << 14 | 0x3f << 26, 7, 8, 9],
+                (4, _) => [0; 4],
+                _ => host(l, s),
+            }
+        };
+        for (level, share) in [(1, 1), (2, 1), (3, 7)] {
+            let [a, b, c, d] = cpuid(4, 0, &ctx(0), &cache(level));
+            assert_eq!((a & 0x3ff, (a >> 14) & 0xfff, a >> 26, b, c, d), (1 | level << 5, share, 3, 7, 8, 9), "L{level}");
+        }
+        let none = |l: u32, s: u32| if l == 4 { [0, 0, 0, 0] } else { host(l, s) };
+        assert_eq!(cpuid(4, 1, &ctx(0), &none), [0; 4], "no more caches");
+        // Flat: nothing shared below L3.
+        let [a, ..] = cpuid(4, 0, &CTX, &cache(2));
+        assert_eq!(((a >> 14) & 0xfff, a >> 26), (0, 3));
+        let [a, ..] = cpuid(4, 0, &CTX, &cache(3));
+        assert_eq!((a >> 14) & 0xfff, 3);
+        // Intel: no TOPOEXT, no AMD leaves.
+        assert_eq!(cpuid(0x8000_0001, 0, &ctx(0), &host)[2] & bit(22), 0);
+        assert_eq!(cpuid(0x8000_001e, 0, &ctx(0), &host), [0; 4]);
+    }
+
+    #[test]
+    fn amd_topoext() {
+        let t = Topology::of(&[0, 1, 0, 2, 1]);
+        let ctx = |v: usize| Ctx { topo: t.place(v), ..CTX };
+        let l3 = |l: u32, s: u32| match (l, s) {
+            (0x8000_001d, 0) => [1 | 3 << 5 | 0xfff << 14, 7, 8, 9],
+            (0x8000_001d, _) => [0; 4],
+            _ => amd_host(l, s),
+        };
+        assert!(cpuid(0x8000_0001, 0, &ctx(4), &l3)[2] & bit(22) != 0, "TOPOEXT");
+        assert_eq!(cpuid(0x8000_001d, 0, &ctx(4), &l3), [1 | 3 << 5 | 7 << 14, 7, 8, 9]);
+        assert_eq!(cpuid(0x8000_001d, 1, &ctx(4), &l3), [0, 0, 0, 0]);
+        // vCPU 4: APIC ID 3, two threads a core, core 1, one node.
+        assert_eq!(cpuid(0x8000_001e, 0, &ctx(4), &l3), [3, (1 << 8) | 1, 0, 0]);
+        assert_eq!(cpuid(0x8000_001e, 0, &CTX, &l3), [2, 2, 0, 0], "flat: a thread a core");
+        let [_, _, c, _] = cpuid(0x8000_0008, 0, &ctx(4), &l3);
+        assert_eq!((c & 0xff, (c >> 12) & 0xf), (4, 3));
+        // A host without it: neither the bit nor its leaves.
+        let no = |l: u32, s: u32| {
+            let [a, b, c, d] = amd_host(l, s);
+            if l == 0x8000_0001 { [a, b, c & !bit(22), d] } else { [a, b, c, d] }
+        };
+        assert_eq!(cpuid(0x8000_0001, 0, &ctx(0), &no)[2] & bit(22), 0);
+        assert_eq!(cpuid(0x8000_001d, 0, &ctx(0), &no), [0; 4]);
+        assert_eq!(cpuid(0x8000_001e, 0, &ctx(0), &no), [0; 4]);
     }
 
     #[test]

@@ -1294,7 +1294,12 @@ create fails with `-ENODEV`. `l4hctl list` shows them as `hvm`.
   inside PV guests does, §5.10), with TSC and APIC timer frequencies
   (leaf 0x15: a 25 MHz crystal, which the local APIC timer runs at, and
   the TSC as a ratio Linux computes in 32 bits), invariant TSC, x2APIC,
-  TSC-deadline and the topology leaves; leaves it does not know are zero;
+  TSC-deadline and the topology leaves, which show the guest's vCores
+  (§7.3, `HvmConfig::vcpu_core`) as SMT cores of one package: a vCPU's
+  APIC ID (in CPUID, its local APIC and the MADT) is its vCore's number
+  above the thread bits and its place in the vCore below, leaf 4 (and on
+  AMD TOPOEXT's 0x8000_001d and 0x8000_001e) shares L1 and L2 within a
+  core and L3 across the package; leaves it does not know are zero;
   MSRs outside a fixed table raise `#GP`. An emulated TSC deadline has at
   least 1 ms of lead time from the WRMSR handler, so the guest can run
   between timer interrupts. The MSR reads back the requested value until
@@ -1740,6 +1745,8 @@ seL4 does no load balancing, so `l4h-vmmgr` runs a balancer every 100 ms.
   arch/l4h builds Linux's sibling masks from it (`CONFIG_SCHED_SMT`,
   `/sys/devices/system/cpu/cpu*/topology`), so the guest's scheduler fills
   idle cores before siblings; without the flag each vCPU is its own core.
+  HVM guests get the same from l4h-hvm's CPUID, local APIC IDs and MADT
+  (§5.11).
 - **Initial placement** (`policy::place`) fills one thread of every
   physical core with the new guest before a second, choosing among equal
   depths the core least loaded relative to its threads (each vCPU of a

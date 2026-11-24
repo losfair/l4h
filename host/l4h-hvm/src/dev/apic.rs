@@ -23,7 +23,7 @@ pub const PENDING_SIPI: u32 = 1 << 2;
 
 /// A local APIC's state that other threads read or write.
 pub struct Shared {
-    /// Its APIC ID (the vCPU's number).
+    /// Its APIC ID (x86::cpuid::Topology's).
     pub id: u32,
     /// Fixed interrupts requested, two bits a vector, so that a request
     /// and its trigger mode are set, taken and cleared at once: vector v's

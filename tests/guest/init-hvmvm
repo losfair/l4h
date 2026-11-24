@@ -5,6 +5,7 @@
 #   DISK   write: write a pattern to /dev/vda; check: find it there
 #   IP0    eth0's address/prefix; PING an address to ping on it
 #   BURN   seconds every vCPU spins (SMP under load)
+#   TOPO   say the cores (sets of SMT siblings) and what shares the L3
 #   ATTEST a nonce (hex): through the attestation port (l4hctl attest),
 #          the host's flags, a seal on console input and a report
 mount -t proc proc /proc
@@ -61,6 +62,11 @@ if [ -n "$IP0" ]; then
     ip addr add "$IP0" dev eth0
     ip link set eth0 up
     if ping -c 3 -W 5 "$PING" >/dev/null 2>&1; then echo "HVMVM: ping $PING ok"; else echo "HVMVM: ping $PING failed"; fi
+fi
+if [ -n "$TOPO" ]; then
+    cores=$(cat /sys/devices/system/cpu/cpu*/topology/thread_siblings_list | sort -u)
+    echo "HVMVM: topo $(echo "$cores" | wc -l) cores, $(echo "$cores" | grep -c '[,-]') with siblings:" $cores
+    echo "HVMVM: llc $(cat /sys/devices/system/cpu/cpu0/cache/index3/shared_cpu_list 2>/dev/null || echo none)"
 fi
 if [ -n "$ATTEST" ]; then
     mount -t securityfs securityfs /sys/kernel/security 2>/dev/null

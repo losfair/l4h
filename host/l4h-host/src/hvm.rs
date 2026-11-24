@@ -276,7 +276,11 @@ pub struct HvmConfig {
     /// It has an attestation port (ATTEST_SLOT): trustd's page is at
     /// ATTEST_PAGE_VA, its kick in SLOT_TRUSTD_KICK.
     pub attest: u32,
-    pub reserved: u32,
+    /// x86-64: `vcpu_core` holds each vCPU's virtual core (vmmgr's vCore,
+    /// abi::BootInfo::vcpu_core): equal ones are SMT siblings.  Zero:
+    /// every vCPU is a core of its own.
+    pub topology: u32,
+    pub vcpu_core: [u8; MAX_VCPUS],
 }
 const _: () = assert!(crate::CONFIG_OFFSET + core::mem::size_of::<HvmConfig>() <= crate::INFO_SIZE);
 
