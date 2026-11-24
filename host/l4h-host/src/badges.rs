@@ -164,6 +164,9 @@ crate::badge_space! {
         /// Console output to pass on; also the I/O thread's deadline
         /// timer.
         signal CONSOLE: 3;
+        /// From l4h-vmmgr: trustd answered the guest's attestation
+        /// request (root's notice, passed on).
+        signal ATTEST: 4;
     }
 }
 const _: () = assert!(hvm::DONE == vmm::DONE);

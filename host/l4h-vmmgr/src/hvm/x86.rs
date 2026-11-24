@@ -62,6 +62,10 @@ pub struct Hvm {
     vcpu_objs: ArrayVec<cap::VCpu, { hv::MAX_VCPUS }>,
     /// What CTL_VM_START gave, for l4h-hvm's configuration.
     boot: Option<Boot>,
+    /// Its attestation port (l4h_host::hvm::ATTEST_SLOT), which its
+    /// l4h-hvm serves: trustd's request page for it, and its kick
+    /// capability (badged by root), if trustd serves.
+    attest: Option<(cap::Granule, cap::Notification)>,
 }
 
 struct Boot {
@@ -177,7 +181,7 @@ pub fn create(
     };
     let mut h = Hvm {
         low_ram, high_ram: ram - low_ram, ept, block_cn: cap::CNode::from_bits(0), block_radix: radix,
-        keep_ept, keep_hvm, cspace, keep_pool, pool_radix, keep_small, vcpu_objs: ArrayVec::new(), boot: None,
+        keep_ept, keep_hvm, cspace, keep_pool, pool_radix, keep_small, vcpu_objs: ArrayVec::new(), boot: None, attest: None,
     };
     let Some(pdpt) = g.arena.try_object(alloc, EPT_PDPT_BP) else { return Err(Some(g)) };
     self_cap::<cap_type::EPTPDPT>(pdpt).eptpdpt_map(ept, 0, VmAttributes::EPT_DEFAULT).expect("EPT PDPT");
@@ -213,8 +217,10 @@ pub fn create(
     g.instance = new.instance;
     g.vmm_ntfn = new.vmm_ntfn;
     g.pool = guest::IoPool { gpa: hv::IO_POOL_GPA as usize, size: cfg.io_pool, frames: new.pool_frames, radix: pool_radix };
-    // An HVM guest has no attestation device: root's page and kick, if it
-    // made them, stay unused in our slots until destroy.
+    // Its attestation port is l4h-hvm's to serve, over trustd's page
+    // and kick (spawn gives them): the guest is measured at boot.
+    h.attest = new.attest;
+    g.attest = h.attest.is_some();
 
     // ---- vCPUs: a thread of l4h-hvm each, which spawn configures; its
     // VCPU, scheduling context, bound notification and event page.
@@ -325,6 +331,17 @@ pub fn load_ram(g: &mut Guest, alloc: &mut Alloc, gpa: usize, from: *const u8, l
     if load_cost(g, gpa, len).is_none() {
         return false;
     }
+    // Recorded before any of it is copied: a load that fails part way
+    // leaves bytes in RAM, which a later start must still account for.
+    // Exactly: a record that took in the gap between the two images
+    // would refuse their start, so a load in more pieces apart than it
+    // holds is refused here instead.
+    if len != 0 {
+        if !g.loaded.fits(gpa, len) {
+            return false;
+        }
+        g.loaded.add(gpa, len);
+    }
     let mut off = 0;
     while off < len {
         let at = gpa + off;
@@ -342,6 +359,25 @@ pub fn load_ram(g: &mut Guest, alloc: &mut Alloc, gpa: usize, from: *const u8, l
         off += n;
     }
     true
+}
+
+/// SHA-256 of guest RAM [gpa, gpa + len), all in filled blocks.
+fn hash_ram(g: &Guest, alloc: &mut Alloc, gpa: usize, len: usize) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let h = g.hvm.as_ref().expect("HVM guest");
+    let mut sha = Sha256::new();
+    let mut off = 0;
+    while off < len {
+        let at = gpa + off;
+        let b = h.block_of(at);
+        let in_block = at - h.block_gpa(b);
+        let n = (BLOCK - in_block).min(len - off);
+        with_block(alloc, &Hvm::keep(h.keep_ept, h.block_radix, b), |p| {
+            sha.update(unsafe { core::slice::from_raw_parts(p.add(in_block), n) });
+        });
+        off += n;
+    }
+    sha.finalize().into()
 }
 
 /// Map a copy of the 2 MiB frame `frame` at vmmgr's large window and run
@@ -364,8 +400,11 @@ fn with_block<R>(alloc: &mut Alloc, frame: &sel4::AbsoluteCPtr, f: impl FnOnce(*
 /// Boot an HVM guest (CTL_VM_START): its kernel at `kernel`, its initrd at
 /// `initrd`, both (gpa, len) in its RAM, with `flags` (abi::HVM_BOOT_*)
 /// and `cmdline`.  Fills block 0 and every block up to the last one
-/// loaded, and memd gives l4h-hvm the others.  Nothing changes for a
-/// start refused for its parameters.
+/// loaded, and memd gives l4h-hvm the others.  Everything dom0 loaded must
+/// be in the kernel image or the initrd, which are measured as RAM then
+/// has them (the launch digest, crate::hvm::launch_digest), if the guest
+/// has an attestation device.  Nothing changes for a start refused for
+/// its parameters.
 pub fn boot(g: &mut Guest, alloc: &mut Alloc, kernel: (u64, u64), initrd: (u64, u64), flags: u64, cmdline: &[u8]) -> Result<(), Errno> {
     {
         let Some(h) = g.hvm.as_ref() else { return Err(ctl::EINVAL) };
@@ -379,6 +418,17 @@ pub fn boot(g: &mut Guest, alloc: &mut Alloc, kernel: (u64, u64), initrd: (u64, 
         }
     }
     let boot = (0..g.nr_blocks).rev().find(|&b| g.is_filled(b)).map_or(1, |b| b + 1);
+    {
+        // What is measured is what was loaded: no more of RAM than the
+        // two images (nothing rides along unmeasured), and no image past
+        // the last block loaded (its blocks are filled below).
+        let h = g.hvm.as_ref().unwrap();
+        let (k, i) = ((kernel.0 as usize, kernel.1 as usize), (initrd.0 as usize, initrd.1 as usize));
+        let filled = |(gpa, len): (usize, usize)| len == 0 || h.block_of(gpa + len - 1) < boot;
+        if !g.loaded.iter().all(|r| hv::covered(r, k, i)) || !filled(k) || !filled(i) {
+            return Err(ctl::EINVAL);
+        }
+    }
     for b in 0..boot {
         if !fill_block(g, alloc, b) {
             return Err(ctl::EIO);
@@ -391,6 +441,11 @@ pub fn boot(g: &mut Guest, alloc: &mut Alloc, kernel: (u64, u64), initrd: (u64, 
     let n = cmdline.iter().position(|&c| c == 0).unwrap_or(cmdline.len()).min(abi::CMDLINE_SIZE - 1);
     let mut line = [0; abi::CMDLINE_SIZE];
     line[..n].copy_from_slice(&cmdline[..n]);
+    if g.attest {
+        let k = hash_ram(g, alloc, kernel.0 as usize, kernel.1 as usize);
+        let i = hash_ram(g, alloc, initrd.0 as usize, initrd.1 as usize);
+        g.launch = Some(crate::hvm::launch_digest(flags, (kernel, k), (initrd, i), &line[..n]));
+    }
     g.hvm.as_mut().unwrap().boot = Some(Boot { kernel, initrd, flags, cmdline: line });
     Ok(())
 }
@@ -488,6 +543,7 @@ fn configure(g: &Guest, cfg: &mut hv::HvmConfig, host_info: &HostInfo) {
     [cfg.epoch_ns, cfg.epoch_ticks] = host_info.clock_anchor;
     cfg.serial = 1;
     cfg.cmdline = boot.cmdline;
+    cfg.attest = h.attest.is_some() as u32;
     let mut n = 0;
     for (d, b) in g.backends.iter() {
         let d = *d;
@@ -546,6 +602,16 @@ fn map(g: &mut Guest, comp: &Component, alloc: &mut Alloc) {
     for (i, f) in g.console_ring.iter().enumerate() {
         let f = abs(*f);
         comp.map_copy(alloc, &mut g.arena, &f, host::VMM_CONSOLE_RING_VA + i * PAGE, rw.clone(), attrs, keep_slot());
+    }
+    // ---- The attestation port's side of trustd: its page and kick.
+    if let Some((page, kick)) = g.hvm.as_ref().unwrap().attest {
+        comp.map_copy(alloc, &mut g.arena, &abs(page), hv::ATTEST_PAGE_VA, rw.clone(), attrs, keep_slot());
+        // Root revokes the kick when trustd fails, which it may have
+        // since the guest was made: the port then has trustd's page,
+        // marked failed, and a slot it signals in vain (sys::kick_trustd).
+        if !comp.try_pass_edge(&wiring::HVM_TRUSTD, 0, kick) {
+            l4h_rt::log!("l4h-vmmgr: guest {}: no attestation (trustd failed)", g.id);
+        }
     }
     // ---- Backends: disk channels and netd ports, and their kicks.
     let backends = core::mem::take(&mut g.backends);
@@ -643,12 +709,22 @@ fn vcpus(g: &mut Guest, comp: &Component, alloc: &mut Alloc, host_info: &HostInf
 
 /// Tell the guest's l4h-hvm to look at its console page (wiring::VMMGR_HVM).
 pub fn signal(g: &Guest, alloc: &mut Alloc) {
+    signal_edge(g, alloc, &wiring::VMMGR_HVM);
+}
+
+/// Tell the guest's l4h-hvm that trustd answered its attestation port's
+/// request (wiring::VMMGR_HVM_ATTEST).
+pub fn signal_attest(g: &Guest, alloc: &mut Alloc) {
+    signal_edge(g, alloc, &wiring::VMMGR_HVM_ATTEST);
+}
+
+fn signal_edge(g: &Guest, alloc: &mut Alloc, edge: &wiring::E<p::Vmmgr, p::Hvm, o::Notification>) {
     if g.vmm.is_none() {
         return;
     }
     let s = alloc.slots.alloc();
     let badged = self_cap::<cap_type::Notification>(s);
-    mint_edge(&abs(badged), &wiring::VMMGR_HVM, 0, &Obj::claim(p::Hvm, o::Notification, abs(g.vmm_ntfn))).expect("HVM signal cap");
+    mint_edge(&abs(badged), edge, 0, &Obj::claim(p::Hvm, o::Notification, abs(g.vmm_ntfn))).expect("HVM signal cap");
     badged.signal();
     abs(badged).delete().expect("delete HVM signal cap");
     alloc.slots.free(s);

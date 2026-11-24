@@ -4,7 +4,9 @@
 # vCPUs, a virtio-blk disk (written, then read back by a second guest), a
 # virtio-net NIC (pinging a PV guest on its switch), its PL011 console
 # (output and input), the power button (PL061, gpio-keys, then PSCI's
-# SYSTEM_OFF), destroy while running, and all its memory back after each.
+# SYSTEM_OFF), destroy while running, and all its memory back after each;
+# and, under lockdown=confidentiality, the host's flags through its
+# attestation port.
 #   L4H_QEMU_GIC_VERSION     3 (default) or 2
 #   L4H_QEMU_VIRTUALIZATION  on (default), or off: FL4 at EL1, which has no
 #                            VCPUs, so HVM guests are refused (-ENODEV)
@@ -32,7 +34,8 @@ SEL4_PREFIX=$root/build/sel4-fl4-aarch64 "$root/tools/build-host-aarch64.sh" >"$
 image=$("$root/tools/build-linux-hvm.sh" 2>"$out/linux-hvm-build.log") \
     || { tail -20 "$out/linux-hvm-build.log"; exit 1; }
 cp "$image" "$out/Image"
-"$root/tools/mkinitramfs.sh" "$out/hvmvm.cpio.gz" "$root/tests/guest/init-hvmvm" >/dev/null
+# The guest's own l4hctl, for its attestation port.
+"$root/tools/mkinitramfs.sh" "$out/hvmvm.cpio.gz" "$root/tests/guest/init-hvmvm" "$l4h_ctl" >/dev/null
 "$root/tools/mkinitramfs.sh" "$out/netvm.cpio.gz" "$root/tests/guest/init-netvm" \
     "$root/tests/guest/udhcpc.script" >/dev/null
 "$root/tools/mkinitramfs.sh" "$out/hvmtest.cpio.gz" "$root/tests/guest/init-hvmtest" \

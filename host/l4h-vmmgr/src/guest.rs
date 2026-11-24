@@ -199,6 +199,12 @@ impl Ranges {
         let _ = self.0.insert(i, (lo, hi - lo));
     }
 
+    /// Whether `add` of this range would keep every range as loaded,
+    /// merging none across a gap: there is room for it, or it touches one.
+    pub fn fits(&self, gpa: usize, len: usize) -> bool {
+        !self.0.is_full() || self.0.iter().any(|&(g, l)| g <= gpa + len && gpa <= g + l)
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
         self.0.iter().copied()
     }
@@ -343,8 +349,9 @@ pub struct Guest {
     pub attest: bool,
     /// Guest RAM ranges loaded before boot (`load_ram`: what dom0 loaded,
     /// and dom0's own initramfs), which must lie in what the launch digest
-    /// covers.  The kernel `boot` writes is not among them.
-    loaded: Ranges,
+    /// covers.  The kernel `boot` writes is not among them.  An HVM
+    /// guest's are its kernel image and initrd (hvm.rs).
+    pub(crate) loaded: Ranges,
     /// The launch digest, set at boot (DESIGN.md §10.2).
     pub launch: Option<[u8; 32]>,
     /// Bytes of the SDK image mapped at SDK_VA (kimage.rs), 0 if none.

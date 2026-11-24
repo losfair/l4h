@@ -1187,7 +1187,12 @@ impl call::Server for VmmCalls<'_> {
     fn attest_done(&mut self, _: proto::Sender, guest: usize) -> Result<(), Errno> {
         let h = &mut *self.0;
         let g = h.guests.get(guest).and_then(|g| g.as_ref()).ok_or(EINVAL)?;
-        if let Some(d) = g.devices.iter().position(|d| d.kind == guest::DevKind::Attest) {
+        if g.hvm.is_some() {
+            // Its l4h-hvm has the device (hvm.rs).
+            if g.attest {
+                hvm::signal_attest(g, &mut h.alloc);
+            }
+        } else if let Some(d) = g.devices.iter().position(|d| d.kind == guest::DevKind::Attest) {
             g.raise_event(&mut h.alloc, guest::dev_event(d));
         }
         Ok(())

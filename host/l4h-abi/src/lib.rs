@@ -668,6 +668,31 @@ pub struct AttestPage {
     pub data: [u8; ATTEST_PAGE_DATA],
 }
 
+/// An HVM guest's attestation port (abi.h, L4H_ATTEST_PORT_*): the name
+/// of its virtio-console port, and the headers of a request and of its
+/// answer on it.
+pub const ATTEST_PORT_NAME: &[u8] = b"l4h.attest";
+pub const ATTEST_PORT_MAGIC: u32 = 0x4148_344c;
+
+#[repr(C)]
+pub struct AttestPortReq {
+    pub magic: u32,
+    pub op: u32,
+    pub offset: u32,
+    pub in_len: u32,
+    pub blob_len: u32,
+}
+
+#[repr(C)]
+pub struct AttestPortResp {
+    pub magic: u32,
+    pub status: i32,
+    pub total: u32,
+    pub out_len: u32,
+    pub state: u32,
+}
+const _: () = assert!(core::mem::size_of::<AttestPortReq>() == 20 && core::mem::size_of::<AttestPortResp>() == 20);
+
 pub const POWER_OFF: u64 = 0;
 pub const POWER_REBOOT: u64 = 1;
 pub const POWER_CRASH: u64 = 2;

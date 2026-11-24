@@ -5,7 +5,9 @@
 # virtio-blk disk (written, then read back by a second guest), a virtio-net
 # NIC (pinging a PV guest on its switch), its 16550 console (output and
 # input), the ACPI power button (l4hctl shutdown), destroy while running,
-# and all its memory back after each.
+# and all its memory back after each; and, under lockdown=confidentiality,
+# the host's flags through its attestation port (reports:
+# tests/run-attesttest.sh).
 # It needs KVM that nests (VT-x or AMD-V in /proc/cpuinfo, /dev/kvm
 # usable): QEMU gives the host the CPU's own.  QEMU's TCG cannot stand in:
 # its SVM has no next-RIP saving, which seL4 requires.  Without VT-x or
@@ -29,7 +31,8 @@ hvm_elf=$root/host/target/x86_64-sel4/$l4h_profile/stripped/l4h-hvm.elf
 bzimage=$("$root/tools/build-linux-hvm.sh" 2>"$root/build/linux-hvm-build.log") \
     || { tail -20 "$root/build/linux-hvm-build.log"; exit 1; }
 cp "$bzimage" "$out/bzImage"
-"$root/tools/mkinitramfs.sh" "$out/hvmvm.cpio.gz" "$root/tests/guest/init-hvmvm" >/dev/null
+# The guest's own l4hctl, for its attestation port.
+"$root/tools/mkinitramfs.sh" "$out/hvmvm.cpio.gz" "$root/tests/guest/init-hvmvm" "$l4h_ctl" >/dev/null
 "$root/tools/mkinitramfs.sh" "$out/netvm.cpio.gz" "$root/tests/guest/init-netvm" \
     "$root/tests/guest/udhcpc.script" >/dev/null
 "$root/tools/mkinitramfs.sh" "$out/hvmtest.cpio.gz" "$root/tests/guest/init-hvmtest" \

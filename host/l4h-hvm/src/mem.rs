@@ -154,6 +154,15 @@ pub mod tests {
         (GuestMem { base: buf.as_ptr() as usize, ram_base: 0, low, high, mapped, map: |_| false }, buf)
     }
 
+    /// One whose RAM starts at `ram_base`, as an AArch64 guest's: GPA 0
+    /// is not RAM.
+    pub fn fake_at(ram_base: u64, low: u64) -> (GuestMem, Vec<u8>) {
+        let (mut mem, buf) = fake(low, 0);
+        mem.ram_base = ram_base;
+        mem.base = mem.base.wrapping_sub(ram_base as usize);
+        (mem, buf)
+    }
+
     #[test]
     fn bounds_and_blocks() {
         let mapped: &'static [AtomicU64] = Vec::leak(std::vec![AtomicU64::new(0)]);

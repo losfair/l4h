@@ -1,8 +1,9 @@
 //! PCI configuration space (DESIGN.md §5.11): bus 0, through ECAM (on
 //! x86-64 at 0xe000_0000, in the MCFG, and the legacy 0xcf8/0xcfc ports; on
 //! AArch64 where hvm::arm has it).  Its functions are the host bridge at
-//! 00:00.0 and a virtio device at each of 00:01.0 and up, whose BARs the
-//! "firmware" (we) assigns in a 32-bit window.  Only the I/O thread
+//! 00:00.0 and a virtio device at each of 00:01.0 and up (the attestation
+//! port's, attest.rs, at 00:1f.0), whose BARs the "firmware" (we) assigns
+//! in a 32-bit window.  Only the I/O thread
 //! touches it.  Free of seL4.
 
 #[cfg(target_arch = "x86_64")]
