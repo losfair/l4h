@@ -54,7 +54,8 @@ fi
 if [ "$need_x86_linux" = 1 ] || [ "$need_arm_linux" = 1 ]; then
     pkgs+=(flex bison bc libssl-dev pahole ccache)
 fi
-if [ "$need_x86_linux" = 1 ]; then
+if [ "$need_x86_linux" = 1 ] || [ "$need_host_rust" = 1 ]; then
+    # sel4-sys uses the bindgen crate (libclang) when building the Rust host.
     pkgs+=(clang libclang-dev)
 fi
 [[ $want == *" debian "* ]] && pkgs+=(debootstrap debian-archive-keyring)

@@ -131,7 +131,9 @@ run_case() {
     local name=$1 expected=$2 chain=$3 selector=$4 fault=${5:-} size=${6:-} with_tpm=${7:-0}
     local case_dir=$out/case-$name
     rm -rf "$case_dir" && mkdir -p "$case_dir"
-    local case_disk=$case_dir/disk.raw
+    # Not local: run_case runs in its own subshell and its EXIT trap fires
+    # after run_case returns (when locals are already out of scope).
+    case_disk=$case_dir/disk.raw
     cp --sparse=always --reflink=auto "$disk" "$case_disk"
     if [ -n "$size" ]; then
         truncate -s "$size" "$case_disk"
@@ -169,11 +171,13 @@ run_case() {
     if [ "$fault" = return-success ]; then
         mcopy -o -i "$c_slota" "$out/return-success.efi" ::/EFI/l4h.efi
     fi
-    local tpm_dir= case_tpm=() qemu=
+    local case_tpm=()
+    tpm_dir=
+    qemu=
     cleanup_case() {
-        if [ -n "$qemu" ]; then kill "$qemu" 2>/dev/null || true; wait "$qemu" 2>/dev/null || true; fi
-        [ -z "$tpm_dir" ] || rm -rf "$tpm_dir"
-        rm -f "$case_disk"
+        if [ -n "${qemu:-}" ]; then kill "$qemu" 2>/dev/null || true; wait "$qemu" 2>/dev/null || true; fi
+        [ -z "${tpm_dir:-}" ] || rm -rf "$tpm_dir"
+        [ -z "${case_disk:-}" ] || rm -f "$case_disk"
     }
     trap cleanup_case EXIT
     if [ "$with_tpm" = 1 ]; then
