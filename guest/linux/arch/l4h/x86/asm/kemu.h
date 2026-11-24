@@ -2,6 +2,7 @@
 #ifndef _ASM_L4H_KEMU_H
 #define _ASM_L4H_KEMU_H
 
+#include <linux/mm_types.h>
 #include <linux/personality.h>
 #include <linux/ptrace.h>
 #include <linux/sched.h>
@@ -87,6 +88,8 @@ static inline unsigned long kemu_fault_error(void)
 static inline void kemu_set_personality(void)
 {
 	set_personality(PER_LINUX);
+	/* Apply host-NX protections to the new guest ELF and stack mappings. */
+	current->mm->kemu_guest = true;
 }
 
 #endif

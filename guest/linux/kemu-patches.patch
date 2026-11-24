@@ -1,6 +1,7 @@
 Refresh kemu patch context for Linux 6.18.y (exec.c gained futex.h;
 6.18.65 dup_mm() takes the mmap lock of oldmm around the memcpy and
 mm_init()).
+Guard the guest PC/SP accessors in proc stat when CONFIG_KEMU is off.
 
 --- a/0007-kemu-fork-exit-exec.patch
 +++ b/0007-kemu-fork-exit-exec.patch
@@ -34,3 +35,26 @@ mm_init()).
  @@ -1491,6 +1496,12 @@ static struct mm_struct *dup_mm(struct task_struct *tsk,
   		goto free_pt;
   	uprobe_end_dup_mmap();
+
+--- a/0011-kemu-proc.patch
++++ b/0011-kemu-proc.patch
+@@ -60,13 +60,13 @@
+ -				eip = KSTK_EIP(task);
+ -				esp = KSTK_ESP(task);
+-+				/*
+-+				 * For a kemu task the host IP/SP point into the
+-+				 * hidden code cache and return stack; report the
+-+				 * guest PC/SP instead (audit L-01).
+-+				 */
+++#ifdef CONFIG_KEMU
+++				/* Host IP/SP point into the translation cache and return
+++				 * stack. Report the AArch64 guest registers instead. */
+ +				if (task_is_kemu(task)) {
+ +					eip = kemu_user_pc(task);
+ +					esp = kemu_user_sp(task);
+-+				} else {
+++				} else
+++#endif
+++				{
+ +					eip = KSTK_EIP(task);
+ +					esp = KSTK_ESP(task);
