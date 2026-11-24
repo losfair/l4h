@@ -167,6 +167,7 @@ const USAGE: &str = "usage: l4hctl <command>
   pci [--json]                 host PCI functions, IDs, class and service owner
   usb [--json]                 host xHCI controllers: ports, state (firmware
                                until a VM is given one, then idle or vm N)
+  disk-discard DISK START SECTORS discard an unattached region
   disk-zero DISK START SECTORS zero an unattached region
   disk-write DISK START FILE   seed an unattached region, then flush
   lv-extents DISK VG/LV [--pv-start SECTOR]
@@ -801,6 +802,10 @@ fn run(args: &[String]) -> Result<i32> {
                         u.bdf >> 8, (u.bdf >> 3) & 0x1f, u.bdf & 7, u.vendor, u.device, u.refused);
                 }
             }
+        }
+        "disk-discard" => {
+            if args.len() != 4 { return err("disk-discard DISK START SECTORS"); }
+            ctl.blk_discard(parse_num(&args[1])?, parse_num(&args[2])?, parse_num(&args[3])?)?;
         }
         "disk-zero" => {
             if args.len() != 4 { return err("disk-zero DISK START SECTORS"); }

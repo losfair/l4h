@@ -64,6 +64,9 @@ const _: () = assert!(KERNEL_RINGS_VA + MAX_RINGS * KERNEL_RING_STRIDE <= LANES_
 pub const FB_VA: usize = crate::MMIO_VA;
 /// The UART's registers (aarch64).
 pub const UART_VA: usize = FB_VA + (1 << 30);
+/// Virtio-console PCI BARs and DMA buffer (for platforms without PL011, e.g. Apple VZ).
+pub const VIRTIO_MMIO_VA: usize = UART_VA + 0x100_0000;
+pub const VIRTIO_DMA_VA: usize = crate::DMA_VA;
 /// The capability to the UART's I/O ports (x86).
 pub const SLOT_UART: u64 = crate::SLOT_FIRST_FREE;
 
@@ -136,6 +139,15 @@ pub struct LogdConfig {
     pub lanes: u32,
     /// Forward to RELAY_VA instead of opening the UART (secondary only).
     pub relay: u32,
+    /// Optional modern virtio-console PCI device (Apple VZ).
+    pub virtio_common: crate::blk::PciRegion,
+    pub virtio_notify: crate::blk::PciRegion,
+    pub virtio_device: crate::blk::PciRegion,
+    pub virtio_notify_mult: u32,
+    pub _pad2: u32,
+    pub virtio_dma_va: u64,
+    pub virtio_dma_paddr: u64,
+    pub virtio_dma_size: u64,
 }
 const _: () = assert!(crate::CONFIG_OFFSET + core::mem::size_of::<LogdConfig>() <= crate::INFO_SIZE);
 

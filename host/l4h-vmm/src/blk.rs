@@ -21,6 +21,7 @@ const VIRTIO_BLK_F_RO: u64 = 1 << 5;
 const VIRTIO_BLK_F_BLK_SIZE: u64 = 1 << 6;
 const VIRTIO_BLK_F_FLUSH: u64 = 1 << 9;
 const VIRTIO_BLK_F_MQ: u64 = 1 << 12;
+const VIRTIO_BLK_F_DISCARD: u64 = 1 << 13;
 pub const MAX_QUEUES: usize = l4h_abi::VIRTIO_QUEUE_IRQS;
 
 const VIRTIO_BLK_S_OK: u8 = 0;
@@ -72,6 +73,8 @@ pub struct Blk {
     size_max: u32,
     /// Data segments of a request: SEG_MAX, or fewer if blkd says so.
     seg_max: u32,
+    discard_max_sectors: u32,
+    discard_accepted: bool,
     /// Requests submitted to blkd, by queue and chain head.
     inflight: [[Option<Inflight>; QUEUE_SIZE as usize]; MAX_QUEUES],
     nr_queues: usize,
@@ -98,6 +101,7 @@ impl Blk {
             chan: core::ptr::null_mut(), sq: Producer::new(blk::RING_SIZE), cq: Consumer::new(blk::RING_SIZE),
             kick: None, capacity: 0, read_only: true, volatile: false,
             block_size: 512, size_max: size_max(pool), seg_max: SEG_MAX,
+            discard_max_sectors: 0, discard_accepted: false,
             inflight: [[None; QUEUE_SIZE as usize]; MAX_QUEUES], nr_queues: 1, kick_pending: false,
             outstanding: 0, generation: 0, stalled: [None; MAX_QUEUES],
             fence: None, flush_inflight: false, deferred: 0, tsc_hz: 0,
@@ -108,7 +112,7 @@ impl Blk {
     /// pool, `tsc_hz` the rate of host::ticks.
     pub fn new(chan_va: usize, kick: sel4::cap::Notification, pool: u64, tsc_hz: u64) -> Self {
         let chan = chan_va as *mut Channel;
-        let (capacity, read_only, volatile, block_size, seg_max) = unsafe {
+        let (capacity, read_only, volatile, block_size, seg_max, discard_max_sectors) = unsafe {
             fence(Ordering::Acquire);
             (
                 addr_of!((*chan).capacity_sectors).read_volatile(),
@@ -116,6 +120,7 @@ impl Blk {
                 addr_of!((*chan).volatile).read_volatile() != 0,
                 addr_of!((*chan).block_size).read_volatile().max(512),
                 addr_of!((*chan).seg_max).read_volatile(),
+                addr_of!((*chan).discard_max_sectors).read_volatile(),
             )
         };
         Blk {
@@ -131,6 +136,8 @@ impl Blk {
             size_max: size_max(pool).max(block_size),
             // blkd's word, read once: never more than SEG_MAX.
             seg_max: if seg_max == 0 { SEG_MAX } else { seg_max.min(SEG_MAX) },
+            discard_max_sectors: if read_only { 0 } else { discard_max_sectors.min(blk::MAX_DISCARD_SECTORS) },
+            discard_accepted: false,
             inflight: [[None; QUEUE_SIZE as usize]; MAX_QUEUES],
             nr_queues: MAX_QUEUES,
             kick_pending: false,
@@ -200,6 +207,39 @@ impl Blk {
         self.submit_bufs(mem, q, qi, head, ok, &bufs)
     }
 
+    /// Read a single discard range. The payload can span readable
+    /// descriptors. Only the snapshotted sector and count reach blkd.
+    fn decode_discard(&self, mem: &GuestMem, req: &mut blk::Req, len: u64) -> Result<(), u8> {
+        if self.read_only { return Err(VIRTIO_BLK_S_IOERR); }
+        if !self.discard_accepted { return Err(VIRTIO_BLK_S_UNSUPP); }
+        let segs = &req.segs[..req.nr_segs as usize];
+        if len != blk::DISCARD_RANGE_SIZE as u64 || segs.iter().any(|s| s.flags & blk::SEG_WRITE != 0) {
+            return Err(VIRTIO_BLK_S_IOERR);
+        }
+        let mut payload = [0; blk::DISCARD_RANGE_SIZE];
+        let mut rest = &mut payload[..];
+        for s in segs {
+            let (bytes, tail) = rest.split_at_mut(s.len as usize);
+            for (i, byte) in bytes.iter_mut().enumerate() {
+                *byte = mem.read::<u8>(s.gpa + i as u64);
+            }
+            rest = tail;
+        }
+        let sector = u64::from_le_bytes(payload[..8].try_into().unwrap());
+        let sectors = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+        if payload[12..].iter().any(|&byte| byte != 0) { return Err(VIRTIO_BLK_S_UNSUPP); }
+        let align = self.block_size / 512;
+        if sectors == 0 || sectors > self.discard_max_sectors || sectors % align != 0
+            || sector % u64::from(align) != 0
+            || sector.checked_add(u64::from(sectors)).is_none_or(|end| end > self.capacity) {
+            return Err(VIRTIO_BLK_S_IOERR);
+        }
+        req.sector = sector;
+        req.discard_sectors = sectors;
+        req.nr_segs = 0;
+        Ok(())
+    }
+
     fn submit_bufs(&mut self, mem: &GuestMem, q: &mut Queue, qi: usize, head: u16, ok: bool, bufs: &[Buf]) -> bool {
         // Header first (16 bytes, readable), status byte last (writable).
         let last = bufs.last();
@@ -228,7 +268,7 @@ impl Blk {
         let ty = mem.read::<u32>(bufs[0].gpa);
         let sector = mem.read::<u64>(bufs[0].gpa + 8);
 
-        let mut req = blk::Req { id: 0, op: ty, nr_segs: 0, sector, segs: Default::default() };
+        let mut req = blk::Req { op: ty, sector, ..Default::default() };
         let mut data_len: u64 = 0;
         // Bytes the device writes, the status byte included (u64: a
         // hostile chain can describe more than 4 GiB).
@@ -280,8 +320,8 @@ impl Blk {
                 }
             }
             blk::OP_FLUSH => if req.nr_segs == 0 { None } else { Some(VIRTIO_BLK_S_IOERR) },
-            // Everything else (GET_ID, DISCARD, WRITE_ZEROES, ...): blkd
-            // takes reads, writes and flushes only.
+            blk::OP_DISCARD if fits => self.decode_discard(mem, &mut req, data_len).err(),
+            blk::OP_DISCARD => Some(VIRTIO_BLK_S_IOERR),
             _ => Some(VIRTIO_BLK_S_UNSUPP),
         };
         if let Some(s) = status {
@@ -363,6 +403,7 @@ impl Backend for Blk {
         if !self.volatile { f |= VIRTIO_BLK_F_FLUSH; }
         if self.read_only { f |= VIRTIO_BLK_F_RO; }
         if !self.chan.is_null() { f |= VIRTIO_BLK_F_MQ; }
+        if self.discard_max_sectors != 0 { f |= VIRTIO_BLK_F_DISCARD; }
         f
     }
 
@@ -372,6 +413,7 @@ impl Backend for Blk {
 
     fn features_accepted(&mut self, features: u64) {
         self.nr_queues = if features & VIRTIO_BLK_F_MQ != 0 { MAX_QUEUES } else { 1 };
+        self.discard_accepted = features & VIRTIO_BLK_F_DISCARD != 0 && self.discard_max_sectors != 0;
     }
 
     fn queue_max(&self, _q: usize) -> u32 {
@@ -385,6 +427,11 @@ impl Backend for Blk {
 
         config[20..24].copy_from_slice(&self.block_size.to_le_bytes());
         if !self.chan.is_null() { config[34..36].copy_from_slice(&(MAX_QUEUES as u16).to_le_bytes()); }
+        if self.discard_max_sectors != 0 {
+            config[36..40].copy_from_slice(&self.discard_max_sectors.to_le_bytes());
+            config[40..44].copy_from_slice(&1u32.to_le_bytes());
+            config[44..48].copy_from_slice(&(self.block_size / 512).to_le_bytes());
+        }
     }
 
     fn kick(&mut self, mem: &GuestMem, queues: &mut [Queue], q: usize) -> bool {
@@ -499,6 +546,7 @@ impl Backend for Blk {
         self.inflight = [[None; QUEUE_SIZE as usize]; MAX_QUEUES];
         self.outstanding = 0;
         self.nr_queues = if self.chan.is_null() { 1 } else { MAX_QUEUES };
+        self.discard_accepted = false;
         self.stalled = [None; MAX_QUEUES];
         self.fence = None;
         self.flush_inflight = false;

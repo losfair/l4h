@@ -21,7 +21,19 @@ l4h_rt::component!(main, no_heap);
 
 /// A byte takes 87 us at 115200 baud.
 const BYTE_US: u64 = 90;
-const IDLE_MS: u64 = 10;
+const IDLE_MIN_MS: u64 = 10;
+const IDLE_MID_MS: u64 = 50;
+const IDLE_MAX_MS: u64 = 250;
+
+fn idle_ms(empty_polls: u32) -> u64 {
+    if empty_polls <= 20 {
+        IDLE_MIN_MS
+    } else if empty_polls <= 40 {
+        IDLE_MID_MS
+    } else {
+        IDLE_MAX_MS
+    }
+}
 
 
 fn sleep(ticks: u64) {
@@ -35,9 +47,75 @@ fn sleep(ticks: u64) {
 
 /// The port, if it is there.
 fn open_port(cfg: &LogdConfig) -> Option<Sender<uart::Regs>> {
+    if cfg.virtio_common.len != 0 {
+        return None;
+    }
     let port = uart::Regs::new(cfg);
     let burst = port.open()?;
     Some(Sender { port, burst, byte_ticks: BYTE_US * (cfg.tsc_hz / 1_000_000) })
+}
+
+struct VirtioConsole {
+    vq: l4h_virtio::Virtq,
+    buf_va: usize,
+    buf_pa: u64,
+    buf_len: usize,
+}
+
+impl VirtioConsole {
+    fn open(cfg: &LogdConfig) -> Option<Self> {
+        use l4h_virtio::{Device, Dma, F_ACCESS_PLATFORM, F_VERSION_1, Mmio, NO_VECTOR};
+        if cfg.virtio_common.len == 0 || cfg.virtio_notify.len == 0 || cfg.virtio_dma_size == 0 {
+            return None;
+        }
+        let dev = Device {
+            common: Mmio(cfg.virtio_common.va as usize),
+            notify: Mmio(cfg.virtio_notify.va as usize),
+            notify_mult: cfg.virtio_notify_mult,
+            notify_len: cfg.virtio_notify.len as usize,
+            device: Mmio(cfg.virtio_device.va as usize),
+        };
+        if !dev.reset(l4h_rt::timeout_ms(l4h_virtio::RESET_MS)) {
+            return None;
+        }
+        let offered = dev.features();
+        let want = F_VERSION_1 | (offered & F_ACCESS_PLATFORM);
+        if offered & F_VERSION_1 == 0 || !dev.set_features(want) {
+            dev.fail();
+            return None;
+        }
+        let mut dma = Dma::new(cfg.virtio_dma_va as usize, cfg.virtio_dma_paddr, cfg.virtio_dma_size as usize);
+        // Initialize receiveq0 (queue 0) as well so Apple VZ's virtio-console backend sees both port 0 queues ready.
+        let _ = dev.setup_queue(&mut dma, 0, 16, NO_VECTOR);
+        // virtio-console queue 1 is transmitq0 (port 0 TX).
+        let vq = dev.setup_queue(&mut dma, 1, 16, NO_VECTOR)?;
+        let buf_len = 4096usize;
+        let (buf_va, buf_pa) = dma.alloc(buf_len, 64);
+        dev.driver_ok();
+        vq.set_interrupts(false);
+        Some(Self { vq, buf_va, buf_pa, buf_len })
+    }
+
+    fn send(&mut self, bytes: &[u8], wait_ticks: u64) {
+        use core::sync::atomic::Ordering;
+        for chunk in bytes.chunks(self.buf_len) {
+            if chunk.is_empty() {
+                continue;
+            }
+            unsafe {
+                core::ptr::copy_nonoverlapping(chunk.as_ptr(), self.buf_va as *mut u8, chunk.len());
+            }
+            l4h_virtio::dma_fence(Ordering::Release);
+            self.vq.set_desc(0, self.buf_pa, chunk.len() as u32, 0, 0);
+            self.vq.submit(0);
+            self.vq.notify();
+            let mut waits = 0u32;
+            while self.vq.pop_used().is_none() && waits < 32 {
+                sleep(wait_ticks);
+                waits += 1;
+            }
+        }
+    }
 }
 
 /// Host output on the lower half of the framebuffer (fb_console), as kernel
@@ -125,14 +203,21 @@ fn main(info: &'static Info) -> ! {
         // No UART authority in a secondary. The only writer of this
         // transport derives every record's provenance from its input lane.
         let outgoing = unsafe { &*(serial::RELAY_VA as *const Ring) };
+        let mut empty_polls = 0u32;
         loop {
-            if !merge.forward(host::ticks::now, outgoing) {
-                sleep(hz / 1000 * IDLE_MS);
+            if merge.forward(host::ticks::now, outgoing) {
+                empty_polls = 0;
+            } else {
+                empty_polls = empty_polls.saturating_add(1);
+                sleep((hz / 1000).max(1) * idle_ms(empty_polls));
             }
         }
     }
     let port = open_port(cfg);
+    let mut vcon = VirtioConsole::open(cfg);
     let mut screen = Screen::new(cfg);
+    let vcon_wait = (hz / 1000).max(1);
+    let mut empty_polls = 0u32;
     loop {
         let printed = merge.pass(host::ticks::now, |line| {
             if let Some(s) = &mut screen {
@@ -141,9 +226,15 @@ fn main(info: &'static Info) -> ! {
             if let Some(p) = &port {
                 p.send(line, sleep);
             }
+            if let Some(v) = &mut vcon {
+                v.send(line, vcon_wait);
+            }
         });
-        if !printed {
-            sleep(hz / 1000 * IDLE_MS);
+        if printed {
+            empty_polls = 0;
+        } else {
+            empty_polls = empty_polls.saturating_add(1);
+            sleep((hz / 1000).max(1) * idle_ms(empty_polls));
         }
     }
 }

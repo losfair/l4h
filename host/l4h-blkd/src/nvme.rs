@@ -39,6 +39,9 @@ const PRP_BYTES: usize = 1 << 20;
 const OP_FLUSH: u8 = 0x00;
 const OP_WRITE: u8 = 0x01;
 const OP_READ: u8 = 0x02;
+const OP_DATASET_MANAGEMENT: u8 = 0x09;
+const DSM_DEALLOCATE: u32 = 1 << 2;
+const ONCS_DSM: u16 = 1 << 2;
 const ADMIN_CREATE_SQ: u8 = 0x01;
 const ADMIN_CREATE_CQ: u8 = 0x05;
 const ADMIN_IDENTIFY: u8 = 0x06;
@@ -157,6 +160,7 @@ pub struct Nvme {
     /// Command ids a request of up to MAX_REQUEST bytes needs.
     max_cmds: usize,
     flush: bool,
+    discard: bool,
 }
 
 fn spin_until(what: &str, mut f: impl FnMut() -> bool) {
@@ -232,6 +236,7 @@ impl Nvme {
             cmd_pages: 0,
             max_cmds: 0,
             flush: false,
+            discard: false,
         };
 
         // Identify controller: transfer limit, volatile write cache.
@@ -244,6 +249,7 @@ impl Nvme {
             n.max_bytes = n.max_bytes.min(1 << mdts_shift);
         }
         n.flush = id_ctrl.r8(525) & 1 != 0;
+        n.discard = id_ctrl.r16(520) & ONCS_DSM != 0;
         // A command that starts mid-page spans one page more than it fills
         // (max_bytes is whole pages, at least two).
         let entries = (n.max_bytes / PAGE) as usize;
@@ -340,8 +346,7 @@ impl Nvme {
             return Err(blk::STATUS_IOERR);
         }
         let cid = self.free_cids.pop().ok_or(blk::STATUS_IOERR)?;
-        let off = cid as usize * self.prp_len;
-        let (list_va, list_pa) = (self.prp.0 + off, self.prp.1 + off as u64);
+        let (list_va, list_pa) = self.prp_slot(cid);
         // Page addresses after the first.
         let mut n = 0usize;
         let mut first = true;
@@ -363,7 +368,7 @@ impl Nvme {
             _ => list_pa,
         };
         let nlb = (bytes >> ns.lba_shift) as u32 - 1;
-        self.sq.push(&Cmd {
+        self.submit_io(req, Cmd {
             opcode,
             cid,
             nsid: ns.id,
@@ -373,9 +378,6 @@ impl Nvme {
             cdw11: (lba >> 32) as u32,
             cdw12: nlb,
         });
-        self.cmd_req[cid as usize] = req;
-        self.cid_busy[cid as usize] = true;
-        self.reqs[req as usize].pending += 1;
         Ok(())
     }
 }
@@ -445,6 +447,45 @@ impl Driver for Nvme {
                 Ok(())
             }
         }
+    }
+
+    fn discard_max(&self, unit: usize) -> u32 {
+        if !self.discard { return 0; }
+        let align = 1u32 << (self.namespaces[unit].lba_shift - 9);
+        u32::MAX & !(align - 1)
+    }
+
+    fn start_discard(&mut self, tag: u64, unit: usize, sector: u64, sectors: u32) -> Result<(), u32> {
+        if !self.discard { return Err(blk::STATUS_UNSUPP); }
+        let ns = *self.namespaces.get(unit).ok_or(blk::STATUS_IOERR)?;
+        let shift = ns.lba_shift - 9;
+        let align = (1u32 << shift) - 1;
+        if sectors == 0 || sectors & align != 0 || sector & u64::from(align) != 0 {
+            return Err(blk::STATUS_IOERR);
+        }
+        let req = self.free_reqs.pop().ok_or(blk::STATUS_IOERR)?;
+        let Some(cid) = self.free_cids.pop() else {
+            let _ = self.free_reqs.push(req);
+            return Err(blk::STATUS_IOERR);
+        };
+        self.reqs[req as usize] = Request { tag, pending: 0, status: blk::STATUS_OK };
+        // The list for this command is otherwise unused. The range is
+        // 16 bytes and stays pinned until the command completes.
+        let (va, pa) = self.prp_slot(cid);
+        let range = Mmio(va);
+        range.w32(0, 0);
+        range.w32(4, sectors >> shift);
+        range.w64(8, sector >> shift);
+        self.submit_io(req, Cmd {
+            opcode: OP_DATASET_MANAGEMENT,
+            cid,
+            nsid: ns.id,
+            prp1: pa,
+            cdw10: 0, // One range, zero-based.
+            cdw11: DSM_DEALLOCATE,
+            ..Default::default()
+        });
+        Ok(())
     }
 
     fn kick(&mut self) {
@@ -520,10 +561,19 @@ fn split(data: &[Seg], max_bytes: u64, cmd_pages: u64, mut f: impl FnMut(&[Seg])
 impl Nvme {
     fn issue_flush(&mut self, r: u16, nsid: u32) -> Result<(), u32> {
         let cid = self.free_cids.pop().ok_or(blk::STATUS_IOERR)?;
-        self.sq.push(&Cmd { opcode: OP_FLUSH, cid, nsid, ..Default::default() });
-        self.cmd_req[cid as usize] = r;
-        self.cid_busy[cid as usize] = true;
-        self.reqs[r as usize].pending += 1;
+        self.submit_io(r, Cmd { opcode: OP_FLUSH, cid, nsid, ..Default::default() });
         Ok(())
+    }
+
+    fn prp_slot(&self, cid: u16) -> (usize, u64) {
+        let off = cid as usize * self.prp_len;
+        (self.prp.0 + off, self.prp.1 + off as u64)
+    }
+
+    fn submit_io(&mut self, req: u16, cmd: Cmd) {
+        self.sq.push(&cmd);
+        self.cmd_req[cmd.cid as usize] = req;
+        self.cid_busy[cmd.cid as usize] = true;
+        self.reqs[req as usize].pending += 1;
     }
 }

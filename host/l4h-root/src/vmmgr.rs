@@ -122,6 +122,10 @@ impl Vmmgr {
         self.flush();
     }
 
+    pub fn attest_needs_tick(&self) -> bool {
+        self.attest.needs_tick()
+    }
+
     /// Have vmmgr run a monitor command (Notice::Destroy, RestartDom0);
     /// false if the last one still waits for room.
     pub fn monitor(&mut self, cmd: Notice) -> bool {
@@ -245,7 +249,7 @@ pub fn spawn(h: &mut Host, modules: &Modules, plan: &Dom0Plan) -> Vmmgr {
         (cfg.kernel, cfg.sdk, cfg.dom0_initrd) = (ranges[0], ranges[1], ranges[2]);
         // The config file's: vmmgr refuses what it cannot give.
         cfg.dom0_mem = (h.cfg.dom0_mem_mb as u64).saturating_mul(1 << 20);
-        cfg.dom0_vcpus = h.cfg.dom0_vcpus as u64;
+        cfg.dom0_vcpus = h.cfg.dom0_vcpus.min(h.info.cores).max(1) as u64;
         cfg.dom0_io_pool = plan.io_pool as u64;
         cfg.dom0_disks = plan.disks.len() as u64;
         cfg.dom0_disk[..plan.disks.len()].copy_from_slice(&plan.disks);

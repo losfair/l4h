@@ -153,7 +153,7 @@ crate::protocol! {
         /// A control op that root serves (abi::CTL_*: host, disks,
         /// switches, NICs): its vals; its data is in the result page.  The
         /// data area of dom0's control device is the source of
-        /// CTL_BLK_WRITE.  BLK_WRITE and BLK_INFO are answered later.
+        /// CTL_BLK_WRITE. BLK_WRITE, BLK_DISCARD and BLK_INFO are answered later.
         HostOp / host_op = 0x105 from [Vmmgr] (op: u32, args: [u64; 6]) -> Later<Vals>;
         /// The answer of a request answered later, which frees its token:
         /// its vals, and for DiskAttach the channel's frames and blkd's

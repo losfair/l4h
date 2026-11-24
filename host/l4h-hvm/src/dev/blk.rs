@@ -305,7 +305,7 @@ impl Blk {
             self.copy(mem, &bufs, first, bytes, true);
         }
         // The bounce pages, in segments of at most SEG_SIZE_MAX.
-        let mut req = blk::Req { id: ((self.generation as u64) << 32) | head as u64, op: ty, nr_segs: 0, sector, segs: Default::default() };
+        let mut req = blk::Req { id: ((self.generation as u64) << 32) | head as u64, op: ty, nr_segs: 0, sector, discard_sectors: 0, segs: Default::default() };
         let mut at = 0u64;
         while at < bytes {
             let n = (bytes - at).min(blk::SEG_SIZE_MAX as u64);

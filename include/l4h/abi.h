@@ -643,7 +643,9 @@ enum l4h_ctl_op {
 	 * guest plugs and unplugs as it can (DESIGN.md §8.5). */
 	L4H_CTL_VM_SET_MEM = 28,
 	/* args: vm -> vals: boot bytes, region bytes, target bytes, plugged
-	 * bytes (all host memory: a hotplug block counts L4H_HP_SIZE) */
+	 * bytes (all host memory: a hotplug block counts L4H_HP_SIZE); then
+	 * of the host's free memory, the same for every vm: bytes reported to
+	 * the hypervisor, bytes untouched since boot */
 	L4H_CTL_VM_MEM_INFO = 29,
 	/* vm -> taint bits 0-63, seal bits 0-63 (host actions only) */
 	L4H_CTL_VM_TRUST = 30,
@@ -755,6 +757,9 @@ enum l4h_ctl_op {
 	 * vals[2] = the VMM's CPU in the last 100 ms (permille of a core);
 	 * both VMM values ~0 without a running VMM */
 	L4H_CTL_VM_VCPU_STATS = 58,
+	/* args: disk, sector, sectors (512-byte units). Discard an unattached,
+	 * 4 KiB aligned range. Reads after discard return unspecified data. */
+	L4H_CTL_BLK_DISCARD = 59,
 };
 
 #define L4H_DASHBOARD_TITLE_MAX 32

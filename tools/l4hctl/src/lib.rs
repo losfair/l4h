@@ -79,6 +79,7 @@ pub const CTL_IP_DEL: u32 = 55;
 pub const CTL_IP_LIST: u32 = 56;
 pub const CTL_DASHBOARD_TITLE: u32 = 57;
 pub const CTL_VM_VCPU_STATS: u32 = 58;
+pub const CTL_BLK_DISCARD: u32 = 59;
 pub const DASHBOARD_TITLE_MAX: usize = 32;
 pub const PCI_OWNER_NONE: u16 = 0;
 pub const PCI_OWNER_BLKD: u16 = 1;
@@ -859,18 +860,23 @@ pub fn parse_mib(s: &str) -> Result<u64> {
 
 /// A VM's memory (CTL_VM_MEM_INFO), in bytes of host memory: boot RAM,
 /// its hotplug region, and the target and plugged part of the region.
+/// Then of the host's free memory, the same for every VM: what is reported
+/// to the hypervisor, and what is untouched since boot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemInfo {
     pub boot: u64,
     pub region: u64,
     pub target: u64,
     pub plugged: u64,
+    pub reported: u64,
+    pub clean: u64,
 }
 
 impl Ctl {
     pub fn mem_info(&self, vm: u64) -> Result<MemInfo> {
         let r = self.call(CTL_VM_MEM_INFO, &[vm], &[], &[])?;
-        Ok(MemInfo { boot: r.vals[0], region: r.vals[1], target: r.vals[2], plugged: r.vals[3] })
+        let v = r.vals;
+        Ok(MemInfo { boot: v[0], region: v[1], target: v[2], plugged: v[3], reported: v[4], clean: v[5] })
     }
 
     /// Plug or unplug memory until the VM has `bytes` (boot RAM included,
@@ -1545,6 +1551,25 @@ impl Ctl {
         Ok(())
     }
 
+    /// Discard an unattached 4 KiB aligned region, in 512-byte sectors.
+    /// Reads after discard return unspecified data. Reclamation depends on the device.
+    pub fn blk_discard(&self, disk: u64, sector: u64, sectors: u64) -> Result<()> {
+        self.call(CTL_BLK_DISCARD, &discard_args(disk, sector, sectors)?, &[], &[])?;
+        Ok(())
+    }
+
+    /// Discard each region in order. Earlier discards can succeed if a
+    /// later request fails.
+    pub fn blk_discard_extents(&self, disk: u64, extents: &[(u64, u64)]) -> Result<()> {
+        for &(sector, sectors) in extents {
+            discard_args(disk, sector, sectors)?;
+        }
+        for &(sector, sectors) in extents {
+            self.blk_discard(disk, sector, sectors)?;
+        }
+        Ok(())
+    }
+
     /// Explicit zero writes, including sparse image holes and recycled space.
     pub fn disk_zero(&self, disk: u64, sector: u64, sectors: u64) -> Result<()> {
         if sector % 8 != 0 || sectors == 0 || sectors % 8 != 0 || sector.checked_add(sectors).is_none() {
@@ -1562,6 +1587,27 @@ impl Ctl {
     pub fn disk_flush(&self, disk: u64) -> Result<()> {
         self.call(CTL_BLK_WRITE, &[disk, 0, 0, 0], &[], &[])?;
         Ok(())
+    }
+}
+
+fn discard_args(disk: u64, sector: u64, sectors: u64) -> Result<[u64; 3]> {
+    if sector % 8 != 0 || sectors == 0 || sectors % 8 != 0 || sector.checked_add(sectors).is_none() {
+        return err("disk discard must be a finite 4 KiB aligned range");
+    }
+    Ok([disk, sector, sectors])
+}
+
+#[cfg(test)]
+mod discard_tests {
+    use super::*;
+
+    #[test]
+    fn discard_uses_sector_count_in_the_control_abi() {
+        assert_eq!(CTL_BLK_DISCARD, 59);
+        assert_eq!(discard_args(6, 16384, 8192).unwrap(), [6, 16384, 8192]);
+        for (sector, sectors) in [(0, 0), (1, 8), (0, 7), (u64::MAX - 7, 8)] {
+            assert!(discard_args(6, sector, sectors).is_err());
+        }
     }
 }
 

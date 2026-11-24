@@ -432,6 +432,9 @@ pub const DASHBOARD_TITLE_MAX: usize = 32;
 /// balancer period (permille of a core); both u64::MAX without a running
 /// VMM.
 pub const CTL_VM_VCPU_STATS: u32 = 58;
+/// Discard an unattached, 4 KiB aligned range. Args: disk, sector,
+/// sectors (both in 512-byte units). Reads after discard return unspecified data.
+pub const CTL_BLK_DISCARD: u32 = 59;
 /// CTL_NIC_INFO: vals[0] BDF, [1] switch (u64::MAX: none), [2] MAC, [3]
 /// state | trust << 8 | driver << 16 (0xff: none) | restarts << 32 |
 /// isolation group size << 48, [4] vendor | device << 16, [5] the

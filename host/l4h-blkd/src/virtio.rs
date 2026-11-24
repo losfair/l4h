@@ -16,11 +16,15 @@ const VIRTIO_BLK_F_SEG_MAX: u64 = 1 << 2;
 const VIRTIO_BLK_F_RO: u64 = 1 << 5;
 const VIRTIO_BLK_F_BLK_SIZE: u64 = 1 << 6;
 const VIRTIO_BLK_F_FLUSH: u64 = 1 << 9;
+const VIRTIO_BLK_F_DISCARD: u64 = 1 << 13;
 /// Device configuration: capacity in sectors, data segments of a request,
 /// block size.
 const CFG_CAPACITY: u16 = 0;
 const CFG_SEG_MAX: u16 = 12;
 const CFG_BLK_SIZE: u16 = 20;
+const CFG_MAX_DISCARD_SECTORS: u16 = 36;
+const CFG_MAX_DISCARD_SEG: u16 = 40;
+const DISCARD_OFFSET: usize = 32;
 
 const MAX_DESCS: usize = 2 + MAX_PIECES;
 const SLOT_TABLE: usize = MAX_DESCS * 16;
@@ -49,19 +53,26 @@ pub struct VirtioBlk {
     /// states one): blkd's clients are told (blk::Channel::seg_max), and a
     /// request with more is refused.
     seg_max: usize,
+    discard_max: u32,
 }
 
 impl VirtioBlk {
     pub fn new(id: u32, cfg: &BlkdConfig) -> Self {
         let mut dma = Dma::new(cfg.dma_va as usize, cfg.dma_paddr, cfg.dma_size as usize);
-        // MSI-X table entry 0 -> our interrupt, unmasked.
-        let msix = Mmio(cfg.msix_table.va as usize);
-        msix.w32(0, cfg.msi_address as u32);
-        msix.w32(4, (cfg.msi_address >> 32) as u32);
-        msix.w32(8, cfg.msi_data);
-        msix.w32(12, 0);
+        // MSI-X table entry 0 -> our interrupt, unmasked (skip when using INTx).
+        let queue_vec = if cfg.msix_table.len > 0 {
+            let msix = Mmio(cfg.msix_table.va as usize);
+            msix.w32(0, cfg.msi_address as u32);
+            msix.w32(4, (cfg.msi_address >> 32) as u32);
+            msix.w32(8, cfg.msi_data);
+            msix.w32(12, 0);
+            0
+        } else {
+            NO_VECTOR
+        };
         let wanted = |offered: u64| {
-            offered & (VIRTIO_BLK_F_RO | VIRTIO_BLK_F_FLUSH | VIRTIO_BLK_F_BLK_SIZE | VIRTIO_BLK_F_SEG_MAX)
+            offered & (VIRTIO_BLK_F_RO | VIRTIO_BLK_F_FLUSH | VIRTIO_BLK_F_BLK_SIZE | VIRTIO_BLK_F_SEG_MAX
+                | VIRTIO_BLK_F_DISCARD)
         };
         // The device's seg_max `v`, if `features` has one.
         let seg_max = |features: u64, v: u32| {
@@ -74,7 +85,7 @@ impl VirtioBlk {
                 notify_len: cfg.notify.len as usize,
             device: Mmio(cfg.device.va as usize),
         });
-        let (vq, features, ports, capacity, block_size, seg_max) = if let Some(dev) = &modern {
+        let (vq, features, ports, capacity, block_size, seg_max, discard_max) = if let Some(dev) = &modern {
             if !dev.reset(l4h_rt::timeout_ms(l4h_virtio::RESET_MS)) {
                 panic!("blkd {:#x}: device did not reset", id);
             }
@@ -84,16 +95,21 @@ impl VirtioBlk {
                 dev.fail();
                 panic!("blkd {:#x}: device lacks VERSION_1/INDIRECT_DESC (features {:#x})", id, offered);
             }
-            let features = want | wanted(offered) | (offered & F_ACCESS_PLATFORM);
+            let mut features = want | wanted(offered) | (offered & F_ACCESS_PLATFORM);
+            if cfg.device.len < u64::from(CFG_MAX_DISCARD_SEG + 4) {
+                features &= !VIRTIO_BLK_F_DISCARD;
+            }
             if !dev.set_features(features) {
                 dev.fail();
                 panic!("blkd {:#x}: features rejected", id);
             }
-            let vq = dev.setup_queue(&mut dma, 0, blk::RING_SIZE as u16, 0).expect("blkd: queue 0");
+            let vq = dev.setup_queue(&mut dma, 0, blk::RING_SIZE as u16, queue_vec).expect("blkd: queue 0");
             let capacity = dev.device.r64(CFG_CAPACITY as usize);
             let block_size =
                 if features & VIRTIO_BLK_F_BLK_SIZE != 0 { dev.device.r32(CFG_BLK_SIZE as usize).max(512) } else { 512 };
-            (vq, features, None, capacity, block_size, seg_max(features, dev.device.r32(CFG_SEG_MAX as usize)))
+            let cfg32 = |off: u16| dev.device.r32(off as usize);
+            (vq, features, None, capacity, block_size, seg_max(features, cfg32(CFG_SEG_MAX)),
+                discard_limit(features, block_size, cfg32))
         } else {
             let p = Ports { cap: blk::BLKD_SLOT_IOPORT, base: cfg.legacy_io as u16 };
             p.out8(legacy::STATUS, 0);
@@ -120,7 +136,8 @@ impl VirtioBlk {
             let capacity = cfg32(CFG_CAPACITY) as u64 | (cfg32(CFG_CAPACITY + 4) as u64) << 32;
             let block_size = if features & VIRTIO_BLK_F_BLK_SIZE != 0 { cfg32(CFG_BLK_SIZE).max(512) } else { 512 };
             let seg_max = seg_max(features, cfg32(CFG_SEG_MAX));
-            (Virtq::legacy(0, num, va), features, Some(p), capacity, block_size, seg_max)
+            let discard_max = discard_limit(features, block_size, cfg32);
+            (Virtq::legacy(0, num, va), features, Some(p), capacity, block_size, seg_max, discard_max)
         };
         // A slot per queue entry, up to blk::RING_SIZE: a legacy queue may
         // be larger.
@@ -128,7 +145,7 @@ impl VirtioBlk {
         let (mut slots, mut free) = (ArrayVec::new(), ArrayVec::new());
         for s in 0..nslots {
             let (table_va, table_pa) = dma.alloc(SLOT_TABLE, 16);
-            let (hdr_va, hdr_pa) = dma.alloc(32, 32);
+            let (hdr_va, hdr_pa) = dma.alloc(DISCARD_OFFSET + blk::DISCARD_RANGE_SIZE, 32);
             let _ = slots.push(Slot { tag: 0, busy: false, table_va, table_pa, hdr_va, hdr_pa });
             let _ = free.push(nslots - 1 - s);
         }
@@ -138,8 +155,58 @@ impl VirtioBlk {
             p.out8(legacy::STATUS, STATUS_ACK | STATUS_DRIVER | STATUS_DRIVER_OK);
             l4h_rt::info!("blkd {:#x}: legacy virtio-blk, {} queue entries", id, vq.num);
         }
-        VirtioBlk { free, vq, ports, slots, features, capacity, block_size, seg_max }
+        VirtioBlk { free, vq, ports, slots, features, capacity, block_size, seg_max, discard_max }
     }
+
+    fn enqueue(&mut self, tag: u64, op: u32, sector: u64, data: &[Seg], discard: Option<u32>) -> Result<(), u32> {
+        // More pieces than the device said it takes: a client that
+        // ignored the seg_max it was given.
+        if data.len() > self.seg_max {
+            return Err(blk::STATUS_IOERR);
+        }
+        let s = self.free.pop().ok_or(blk::STATUS_IOERR)?;
+        let slot = &mut self.slots[s as usize];
+        let hdr = Mmio(slot.hdr_va);
+        hdr.w32(0, op);
+        hdr.w32(4, 0);
+        hdr.w64(8, if discard.is_some() { 0 } else { sector });
+        hdr.w8(16, 0xff);
+        let data_flags = if op == blk::OP_READ { DESC_F_WRITE } else { 0 };
+        let n = data.len() + 2 + usize::from(discard.is_some());
+        let desc = |i: usize, addr: u64, len: u32, flags: u16| {
+            let d = Mmio(slot.table_va + 16 * i);
+            let last = i + 1 == n;
+            d.w64(0, addr);
+            d.w32(8, len);
+            d.w16(12, if last { flags } else { flags | DESC_F_NEXT });
+            d.w16(14, if last { 0 } else { (i + 1) as u16 });
+        };
+        desc(0, slot.hdr_pa, 16, 0);
+        if let Some(sectors) = discard {
+            hdr.w64(DISCARD_OFFSET, sector);
+            hdr.w32(DISCARD_OFFSET + 8, sectors);
+            hdr.w32(DISCARD_OFFSET + 12, 0);
+            desc(1, slot.hdr_pa + DISCARD_OFFSET as u64, blk::DISCARD_RANGE_SIZE as u32, 0);
+        } else {
+            for (i, p) in data.iter().enumerate() {
+                desc(1 + i, p.pa, p.len, data_flags);
+            }
+        }
+        desc(n - 1, slot.hdr_pa + 16, 1, DESC_F_WRITE);
+        slot.tag = tag;
+        slot.busy = true;
+        self.vq.set_desc(s, slot.table_pa, (16 * n) as u32, DESC_F_INDIRECT, 0);
+        self.vq.submit(s);
+        Ok(())
+    }
+}
+
+fn discard_limit(features: u64, block_size: u32, cfg32: impl Fn(u16) -> u32) -> u32 {
+    if features & VIRTIO_BLK_F_DISCARD == 0 || !matches!(block_size, 512 | 4096)
+        || cfg32(CFG_MAX_DISCARD_SEG) == 0 { return 0; }
+    let limit = cfg32(CFG_MAX_DISCARD_SECTORS);
+    let block_sectors = block_size / 512;
+    limit - limit % block_sectors
 }
 
 impl Driver for VirtioBlk {
@@ -163,38 +230,17 @@ impl Driver for VirtioBlk {
     }
 
     fn start(&mut self, tag: u64, _unit: usize, op: u32, sector: u64, data: &[Seg]) -> Result<(), u32> {
-        // More pieces than the device said it takes: a client that
-        // ignored the seg_max it was given.
-        if data.len() > self.seg_max {
-            return Err(blk::STATUS_IOERR);
-        }
-        let s = self.free.pop().ok_or(blk::STATUS_IOERR)?;
-        let slot = &mut self.slots[s as usize];
-        let hdr = Mmio(slot.hdr_va);
-        hdr.w32(0, op);
-        hdr.w32(4, 0);
-        hdr.w64(8, sector);
-        hdr.w8(16, 0xff);
-        let data_flags = if op == blk::OP_READ { DESC_F_WRITE } else { 0 };
-        let n = data.len() + 2;
-        let desc = |i: usize, addr: u64, len: u32, flags: u16| {
-            let d = Mmio(slot.table_va + 16 * i);
-            let last = i + 1 == n;
-            d.w64(0, addr);
-            d.w32(8, len);
-            d.w16(12, if last { flags } else { flags | DESC_F_NEXT });
-            d.w16(14, if last { 0 } else { (i + 1) as u16 });
-        };
-        desc(0, slot.hdr_pa, 16, 0);
-        for (i, p) in data.iter().enumerate() {
-            desc(1 + i, p.pa, p.len, data_flags);
-        }
-        desc(n - 1, slot.hdr_pa + 16, 1, DESC_F_WRITE);
-        slot.tag = tag;
-        slot.busy = true;
-        self.vq.set_desc(s, slot.table_pa, (16 * n) as u32, DESC_F_INDIRECT, 0);
-        self.vq.submit(s);
-        Ok(())
+        self.enqueue(tag, op, sector, data, None)
+    }
+
+    fn discard_max(&self, _unit: usize) -> u32 {
+        self.discard_max
+    }
+
+    fn start_discard(&mut self, tag: u64, _unit: usize, sector: u64, sectors: u32) -> Result<(), u32> {
+        if self.discard_max == 0 { return Err(blk::STATUS_UNSUPP); }
+        if sectors == 0 || sectors > self.discard_max { return Err(blk::STATUS_IOERR); }
+        self.enqueue(tag, blk::OP_DISCARD, sector, &[], Some(sectors))
     }
 
     fn kick(&mut self) {

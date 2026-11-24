@@ -919,7 +919,7 @@ int l4h_hp_map(unsigned int m)
 	unsigned long gpa = hp_gpa(m), base = gpa >> L4H_BLOCK_SHIFT;
 	unsigned long objs = L4H_HP_BLOCK_CPTR(m, HP_OBJ_BLOCK);
 	unsigned long l1 = L4H_SLOT_RAM_L1_BASE + (gpa >> 30);
-	unsigned long *tables, *large, i, k, flags;
+	unsigned long *tables, *large, i, k;
 	int err = 0;
 
 	tables = kcalloc(HP_OBJ_BLOCK, sizeof(*tables), GFP_KERNEL);
@@ -944,23 +944,11 @@ int l4h_hp_map(unsigned int m)
 	}
 	for (i = 0; i < HP_OBJ_BLOCK && !err; i++) {
 		unsigned long bgpa = gpa + i * RAM_BLOCK, va = uml_physmem + bgpa;
-		unsigned long slot = l4h_slot_alloc();
-		int pt = l4h_pt_level_obj[0];
 
-		if (!slot) {
-			err = -ENOMEM;
-			break;
-		}
-		tables[i] = slot;
-		err = l4h_retype(objs, pt, 0, slot >> L4H_L2_INDEX_BITS, L4H_ROOT_DEPTH, slot & (L2_SLOTS - 1), 1);
-		while (!err && (err = l4h_pt_map(pt, slot, L4H_CPTR(L4H_SLOT_VSPACE), va)) == L4H_ERR_FAILED_LOOKUP) {
-			raw_spin_lock_irqsave(&caps_lock, flags);
-			err = __add_kernel_table(1, va);
-			raw_spin_unlock_irqrestore(&caps_lock, flags);
-		}
+		if (IS_ALIGNED(va, RAM_BLOCK) && !map_kernel_at(large[i], va, 1))
+			continue;
 		for (k = 0; k < RAM_BLOCK_PAGES && !err; k++)
-			err = l4h_page_map(L4H_FRAME_CPTR(bgpa + k * PAGE_SIZE), L4H_CPTR(L4H_SLOT_VSPACE),
-					   va + k * PAGE_SIZE, L4H_PROT_READ | L4H_PROT_WRITE);
+			err = map_kernel(L4H_FRAME_CPTR(bgpa + k * PAGE_SIZE), va + k * PAGE_SIZE);
 	}
 	if (!err)
 		WRITE_ONCE(hp_state[m], HP_MAPPED);

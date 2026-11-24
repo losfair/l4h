@@ -17,6 +17,7 @@ cmake -DCMAKE_C_FLAGS="$l4h_prefix_map" -DCMAKE_ASM_FLAGS="$l4h_prefix_map" -G N
     -C "$config" \
     -DKernelDebugBuild=$debug \
     -DQEMU_MEMORY="$l4h_memory_mb" \
+    -DQEMU_MACHINE="virt,secure=off,gic-version=2,highmem-ecam=off,highmem-mmio=off,dumpdtb=$out/qemu-arm-virt.dtb" \
     -DCMAKE_INSTALL_PREFIX="$prefix" \
     -DCROSS_COMPILER_PREFIX=aarch64-linux-gnu- >/dev/null
 ninja -C "$out" all

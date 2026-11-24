@@ -213,6 +213,8 @@ pub struct Status {
     pub free_bytes: u64,
     /// Of those, reported to the hypervisor.
     pub reported_bytes: u64,
+    /// And of those, untouched since the boot handover.
+    pub clean_bytes: u64,
     /// Free blocks, and the size of the largest.
     pub free_blocks: u64,
     pub largest_block: u64,
@@ -269,12 +271,13 @@ impl Status {
     }
 }
 
-/// The free page reporting device (a virtio-balloon on PCI): its BARs are
-/// mapped at BALLOON_VA + bar * BAR_STRIDE, three DMA pages at DMA_VA.
+/// The virtio-balloon device on PCI: its BARs are mapped at
+/// BALLOON_VA + bar * BAR_STRIDE, and DMA_PAGES pages at DMA_VA (two split
+/// virtqueues at 3 pages each plus 4 pages for the 4096-PFN buffer).
 pub const BALLOON_VA: usize = crate::MMIO_VA;
 pub const BAR_STRIDE: usize = 0x100_0000;
 pub const DMA_VA: usize = crate::DMA_VA;
-pub const DMA_PAGES: usize = 3;
+pub const DMA_PAGES: usize = 10;
 
 crate::wire_struct! {
     /// Where the device's capability structures are: (BAR, offset) of the

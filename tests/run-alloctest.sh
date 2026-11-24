@@ -16,6 +16,8 @@ rustc +stable --edition=2024 --test "$root/tests/memd.rs" -o "$root/build/alloct
 "$root/build/alloctest/memd-tests"
 rustc +stable --edition=2024 --test "$root/tests/devmem.rs" -o "$root/build/alloctest/devmem-tests"
 "$root/build/alloctest/devmem-tests"
+rustc +stable --edition=2024 --test "$root/host/l4h-root/src/fdt.rs" -o "$root/build/alloctest/fdt-tests"
+"$root/build/alloctest/fdt-tests"
 rustc +stable --edition=2024 --test "$root/host/l4h-host/src/iopool.rs" -o "$root/build/alloctest/iopool-tests"
 "$root/build/alloctest/iopool-tests"
 rustc +stable --edition=2024 --test "$root/host/l4h-host/src/gpu.rs" -o "$root/build/alloctest/gpu-tests"

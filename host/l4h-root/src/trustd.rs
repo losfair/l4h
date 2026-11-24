@@ -1404,3 +1404,27 @@ pub fn tick(h: &mut Host) {
         }
     }
 }
+
+/// Whether trustd or guest attestation notices need the fast 100 ms root timer tick.
+pub fn needs_fast_tick(h: &mut Host) -> bool {
+    if h.vmmgr.as_ref().is_some_and(|v| v.attest_needs_tick()) {
+        return true;
+    }
+    let Some(t) = h.trustd.as_ref().filter(|t| !t.failed) else { return false };
+    let (relay, wake, status) = (t.relay, t.wake, t.status);
+    if relay.is_some() {
+        let out = unsafe { &*(relay_va(0) as *const trust::RelaySlot) };
+        if out.wake.load(core::sync::atomic::Ordering::Relaxed) != 0 {
+            return true;
+        }
+    }
+    if wake.is_some() {
+        let asked = h.wins.a.with_frame(&abs_of(status), |p| unsafe {
+            (*(p as *const trust::Status)).wake.load(core::sync::atomic::Ordering::Relaxed)
+        });
+        if asked != 0 {
+            return true;
+        }
+    }
+    false
+}
