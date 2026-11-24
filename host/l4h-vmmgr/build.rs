@@ -16,6 +16,11 @@ fn main() {
     if fs::read_to_string(&arm_objtype).is_ok_and(|s| s.contains("seL4_ARM_Stage2VSpaceObject")) {
         println!("cargo:rustc-cfg=l4h_arm_virt");
     }
+    // FL4's ArmHighVSpace (the TTBR1 EL0 window), on AArch64 at EL1 or EL2.
+    println!("cargo:rustc-check-cfg=cfg(l4h_arm_high_vspace)");
+    if fs::read_to_string(&arm_objtype).is_ok_and(|s| s.contains("seL4_ARM_HighVSpaceObject")) {
+        println!("cargo:rustc-cfg=l4h_arm_high_vspace");
+    }
     let fl4 = prefix.join("fl4-revision");
     let kernel = if fl4.is_file() {
         println!("cargo:rerun-if-changed={}", fl4.display());

@@ -86,3 +86,12 @@ L4H_PROVIDER_OP(int, l4h_arm_vcpu_enter, (unsigned long vcpu, unsigned long in_m
 L4H_PROVIDER_OP(int, l4h_arm_vcpu_read_state_self, (unsigned long vcpu, unsigned long mask), (vcpu, mask))
 /* Runs `n` frame ops on `vspace` in as few kernel entries as their kinds allow; returns how many succeeded, *err the error of the next. */
 L4H_PROVIDER_OP(int, l4h_frame_batch, (const struct l4h_frame_op *ops, int n, unsigned long vspace, int *err), (ops, n, vspace, err))
+/* L4H_PROVIDER_ARM_PAC: set `tcb`'s (0: this vCPU's kernel thread's) pointer
+ * authentication enables (L4H_PAC_EN_*) and its ten key words (APIA, APIB,
+ * APDA, APDB, APGA, low word first; NULL: all zero).  Returns 0 or an error. */
+L4H_PROVIDER_OP(int, l4h_tcb_set_pac, (unsigned long tcb, unsigned long flags, const unsigned long *keys), (tcb, flags, keys))
+/* L4H_PROVIDER_ARM_HIGH_VSPACE: bind `high_vspace` (0: unbind) to `tcb`
+ * (0: this vCPU's kernel thread).  Returns 0 or an error. */
+L4H_PROVIDER_OP(int, l4h_tcb_set_high_vspace, (unsigned long tcb, unsigned long high_vspace), (tcb, high_vspace))
+/* l4h_user_run with struct l4h_user_ext (l4h/guest.h): TPIDRRO_EL0 and the raw fault syndrome. */
+L4H_PROVIDER_OP(int, l4h_user_run_ex, (struct l4h_uctx *u, unsigned long *gp, int read_regs_on_interrupt, struct l4h_user_ext *ext), (u, gp, read_regs_on_interrupt, ext))

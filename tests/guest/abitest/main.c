@@ -121,6 +121,10 @@ static int __init abitest_init(void)
 	t.dma = dma;
 	t.dma_gpa = dma_gpa;
 	t.vspace = l4h_vspace_get();
+	if (!t.vspace) {
+		err = -ENOMEM;
+		goto out;
+	}
 	t.large_ut = abitest_obj(L4H_OBJ_UNTYPED, L4H_BLOCK_SHIFT);
 
 	preempt_disable();

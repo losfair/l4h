@@ -723,6 +723,7 @@ static LIST_HEAD(vs_lru);		/* owned entries, least recently used first */
 static LIST_HEAD(vs_free);
 static DEFINE_RAW_SPINLOCK(vs_lock);
 static int nr_resetting;		/* detached entries not yet emptied */
+static int nr_lent;			/* out of the pool (l4h_vspace_get()) */
 static atomic64_t vs_generation = ATOMIC64_INIT(1);
 
 static struct l4h_mm *mm_l4h(struct mm_struct *mm)
@@ -897,13 +898,22 @@ void l4h_mm_release(struct mm_struct *mm, bool may_sleep)
  * A process VSpace for raw seL4 use, such as the tests of the host's ABI
  * (tests/guest/abitest): out of the pool, and empty, until
  * l4h_vspace_put().  The caller deletes what it mapped there before it
- * gives the VSpace back.
+ * gives the VSpace back.  0 if that would leave the pool fewer VSpaces than
+ * vCPUs: each may run a thread of a different process, and vs_take() has
+ * no way out when every VSpace is pinned by a running thread.
  */
 unsigned long l4h_vspace_get(void)
 {
 	unsigned long flags, root;
 	struct vs_slot *s;
 
+	raw_spin_lock_irqsave(&vs_lock, flags);
+	if (nr_vs - nr_lent - 1 < (int)nr_cpu_ids) {
+		raw_spin_unlock_irqrestore(&vs_lock, flags);
+		return 0;
+	}
+	nr_lent++;
+	raw_spin_unlock_irqrestore(&vs_lock, flags);
 	s = vs_take_wait(&flags);
 	list_del_init(&s->lru);
 	root = s->as.root;
@@ -917,8 +927,12 @@ void l4h_vspace_put(unsigned long root)
 	struct vs_slot *s = &vs_pool[root & ((1ul << L4H_L2_INDEX_BITS) - 1)];
 	unsigned long flags;
 
+	/* What a failed l4h_vspace_get() gave. */
+	if (!root)
+		return;
 	raw_spin_lock_irqsave(&vs_lock, flags);
 	list_add(&s->lru, &vs_free);
+	nr_lent--;
 	raw_spin_unlock_irqrestore(&vs_lock, flags);
 }
 EXPORT_SYMBOL_GPL(l4h_vspace_put);

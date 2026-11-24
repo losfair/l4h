@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # Boot an FL4 AArch64 UEFI image (tools/mkfl4-efi-aarch64.sh) on QEMU's virt
-# machine under TCG, from a FAT ESP directory.  By default the firmware
-# enters FL4 at EL2 with GICv3 (FL4 is then a VHE hypervisor host):
+# machine under TCG (or hvf on an Apple Silicon Mac), from a FAT ESP
+# directory.  By default the firmware enters FL4 at EL2 with GICv3 (FL4 is
+# then a VHE hypervisor host):
 #   L4H_QEMU_GIC_VERSION     2 or 3 (default 3)
 #   L4H_QEMU_VIRTUALIZATION  on (EL2) or off (EL1 only; default on)
 #   L4H_QEMU_CPU             default max (cortex-a57 has no VHE)
+#   L4H_QEMU_ACCEL           tcg (default) or hvf, with L4H_QEMU_CPU=host
+#                            (and virtualization off but on M3 and later)
 #   L4H_SMP, L4H_MEM_MB      vCPUs (2) and RAM in MiB (2048)
 #   L4H_QEMU_EFI             the AArch64 UEFI firmware (QEMU_EFI.fd)
 #   L4H_QEMU_ACPI            on: the firmware's ACPI tables, as cloud Arm
@@ -19,7 +22,8 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 efi=$1; shift
 efi_fw=
 for f in "${L4H_QEMU_EFI:-}" /usr/share/qemu-efi-aarch64/QEMU_EFI.fd /usr/share/AAVMF/AAVMF_CODE.fd \
-    "$root/build/QEMU_EFI.fd"; do
+    "$root/build/QEMU_EFI.fd" \
+    "$(dirname "$(command -v qemu-system-aarch64 || echo /x/x)")/../share/qemu/edk2-aarch64-code.fd"; do
     if [ -n "$f" ] && [ -f "$f" ]; then
         efi_fw=$f
         break
@@ -33,7 +37,7 @@ esp=$(mktemp -d)
 trap 'rm -rf "$esp"' EXIT
 mkdir -p "$esp/EFI/BOOT"
 cp "$efi" "$esp/EFI/BOOT/BOOTAA64.EFI"
-qemu-system-aarch64 -accel tcg \
+qemu-system-aarch64 -accel "${L4H_QEMU_ACCEL:-tcg}" \
     -machine "virt,acpi=${L4H_QEMU_ACPI:-off},gic-version=${L4H_QEMU_GIC_VERSION:-3},virtualization=${L4H_QEMU_VIRTUALIZATION:-on},highmem-ecam=off,highmem-mmio=off" \
     -cpu "${L4H_QEMU_CPU:-max}" -smp "${L4H_SMP:-2}" -m "${L4H_MEM_MB:-2048}" \
     -nographic -serial mon:stdio -no-reboot \

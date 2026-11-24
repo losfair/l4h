@@ -95,6 +95,36 @@ int l4h_page_test_and_clear_accessed(unsigned long frame, int *accessed);
 int l4h_vspace_flush(unsigned long vspace);
 int l4h_pt_map(int type, unsigned long table, unsigned long vspace, unsigned long va);
 
+/* ---- provider features (struct l4h_provider.features) */
+#define L4H_PROVIDER_VTX (1ull << 0)
+/* FL4 AArch64 at EL2: the l4h_arm_* operations work. */
+#define L4H_PROVIDER_ARM_VIRT (1ull << 1)
+/* l4h_frame_batch batches in the kernel (FL4's X86PML4FrameBatch); without
+ * it, it fails every op and the guest maps and unmaps one op at a time. */
+#define L4H_PROVIDER_FRAME_BATCH (1ull << 2)
+/* FL4 AArch64: l4h_tcb_set_pac gives threads their own pointer
+ * authentication keys (seL4_TCB_SetPACKeys); the CPU may still lack
+ * FEAT_PAuth, which its enables then fail on. */
+#define L4H_PROVIDER_ARM_PAC (1ull << 3)
+/* FL4 AArch64: l4h_tcb_set_high_vspace binds an ArmHighVSpace
+ * (L4H_SLOT_HIGH_VSPACE) to threads, whose tables l4h_pt_map and
+ * l4h_page_map fill. */
+#define L4H_PROVIDER_ARM_HIGH_VSPACE (1ull << 4)
+
+/* l4h_tcb_set_pac enables (SCTLR_EL1.EnIA, EnIB, EnDA, EnDB for the
+ * thread).  With none, the thread's PAC* instructions leave pointers as
+ * they are and PACGA uses an all-zero key. */
+/* FL4 AArch64: EL0 data accesses run with TCR_EL1.TBI0 (the MMU ignores
+ * the top byte of data pointers); whether instruction fetches do depends on
+ * the CPU (FL4 sets TBID0 with FEAT_PAuth). */
+#define L4H_PROVIDER_ARM_TBI0 (1ull << 5)
+
+#define L4H_PAC_EN_IA (1ul << 0)
+#define L4H_PAC_EN_IB (1ul << 1)
+#define L4H_PAC_EN_DA (1ul << 2)
+#define L4H_PAC_EN_DB (1ul << 3)
+#define L4H_PAC_KEY_WORDS 10
+
 /* ---- threads */
 int l4h_tcb_configure_user(unsigned long tcb, unsigned long cspace, unsigned long vspace);
 int l4h_tcb_set_space(unsigned long tcb, unsigned long fault_ep, unsigned long cspace,
@@ -105,6 +135,13 @@ int l4h_tcb_set_flags(unsigned long tcb, unsigned long clear, unsigned long set)
 int l4h_tcb_resume(unsigned long tcb);
 int l4h_tcb_suspend(unsigned long tcb);
 int l4h_tcb_bind_notification(unsigned long tcb, unsigned long ntfn);
+/* L4H_PROVIDER_ARM_PAC, L4H_PROVIDER_ARM_HIGH_VSPACE (l4h/provider.h); tcb 0
+ * is the calling vCPU's kernel thread. */
+int l4h_tcb_set_pac(unsigned long tcb, unsigned long flags, const unsigned long *keys);
+int l4h_tcb_set_high_vspace(unsigned long tcb, unsigned long high_vspace);
+/* Make the instruction cache see [start, end) of the kernel's VSpace (a no-op
+ * on x86_64). */
+void l4h_flush_icache(unsigned long start, unsigned long end);
 int l4h_sc_unbind(unsigned long sc);
 void l4h_signal(unsigned long ntfn);
 void l4h_yield(void);
@@ -198,9 +235,33 @@ struct l4h_uctx {
  * u->regs_valid (syscall stops, or interrupts with read_regs_on_interrupt).
  * The caller must have set u->fault_ep for this vCPU.  Returns u->stop. */
 int l4h_user_run(struct l4h_uctx *u, unsigned long *gp, int read_regs_on_interrupt);
+/* What l4h_user_run_ex() takes and gives beyond l4h_user_run().  Callers
+ * set `size` to the size they know; the provider reads and writes only the
+ * fields that size covers in full (none: as l4h_user_run()). */
+struct l4h_user_ext {
+	unsigned long size;	/* sizeof(struct l4h_user_ext) */
+	unsigned long flags;	/* in: L4H_USER_EXT_* */
+	/* in, arm64, with L4H_USER_EXT_TLS_RO: the context's TPIDRRO_EL0,
+	 * written whenever its registers are (0 otherwise, as for Linux's
+	 * tasks).  EL0 cannot change it.  After a change, run with
+	 * L4H_USER_EXT_TLS_RO_UPDATE too: that writes it without writing a
+	 * stale gp[] (after a page fault, gp[] is only current once
+	 * l4h_user_sync_regs() read it). */
+	unsigned long tls_ro;
+	/* out: for L4H_STOP_PAGEFAULT, the fault's syndrome before
+	 * fault_code's normalization (ESR_EL1 on arm64, the page fault
+	 * error code on x86_64); 0 for other stops, alignment faults
+	 * (L4H_STOP_EXCEPTION, exc_number) included. */
+	unsigned long raw_fsr;
+};
+#define L4H_USER_EXT_TLS_RO		1
+#define L4H_USER_EXT_TLS_RO_UPDATE	2	/* tls_ro changed since the last run */
+int l4h_user_run_ex(struct l4h_uctx *u, unsigned long *gp, int read_regs_on_interrupt,
+		    struct l4h_user_ext *ext);
 /* Make gp[] current if it is not (reads the TCB). */
 void l4h_user_sync_regs(struct l4h_uctx *u, unsigned long *gp);
-/* gp[] was modified by the kernel; seg != 0 if fs/gs base changed. */
+/* gp[] was modified by the kernel; seg != 0 if fs/gs base (arm64:
+ * TPIDR_EL0, TPIDRRO_EL0) changed. */
 void l4h_user_mark_dirty(struct l4h_uctx *u, int seg);
 /* Copy the TCB's fs/gs base into gp[] (they are not part of syscall
  * fault messages, and user code may change them with wrfsbase). */
