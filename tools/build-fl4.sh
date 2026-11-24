@@ -10,6 +10,22 @@ prefix=$root/build/sel4-fl4
 export PATH=$root/.venv/bin:$PATH
 debug=ON
 [ "${L4H_RELEASE:-0}" = 1 ] && debug=OFF
+# One build at a time, through what it installs in $prefix (to the end).
+exec 9>"$root/build/.build-fl4.lock"
+flock 9
+# A tree configured from another FL4 source (another revision's) keeps
+# that source's paths in its cache: start again.  Its stamp (written once
+# cmake has configured it from $src), FL4_SOURCE and KERNEL_PATH must all
+# name $src, or a cache left half-switched by an older build is kept.
+cached_src=$(sed -n 's/^FL4_SOURCE:[^=]*=//p' "$out/CMakeCache.txt" 2>/dev/null || true)
+cached_kernel=$(sed -n 's/^KERNEL_PATH:[^=]*=//p' "$out/CMakeCache.txt" 2>/dev/null || true)
+if [ -f "$out/CMakeCache.txt" ] && {
+    [ "$(cat "$out/.fl4-source" 2>/dev/null)" != "$src" ] ||
+    [ "$cached_src" != "$src" ] ||
+    [[ $cached_kernel != "$src"/* ]]
+}; then
+    rm -rf "$out"
+fi
 cmake -DCMAKE_C_FLAGS="$l4h_prefix_map" -DCMAKE_ASM_FLAGS="$l4h_prefix_map" -G Ninja -S "$root/kernel/fl4" -B "$out" \
     -DFL4_SOURCE="$src" \
     -DCARGO="$root/tools/cargo-fl4.sh" \
@@ -17,7 +33,10 @@ cmake -DCMAKE_C_FLAGS="$l4h_prefix_map" -DCMAKE_ASM_FLAGS="$l4h_prefix_map" -G N
     -DKernelVTX=ON -DKernelX86_64VTX64BitGuests=ON -DKernelDebugBuild="$debug" \
     -DKernelRetypeFanOutLimit=256 \
     -DLibSel4PrintInvocationErrors=0
+printf '%s\n' "$src" >"$out/.fl4-source"
 ninja -C "$out"
+# Its headers as this revision has them: none another left.
+rm -rf "$prefix/libsel4/include"
 mkdir -p "$prefix/bin" "$prefix/libsel4/include"
 cp "$out/kernel/kernel.elf" "$prefix/bin/kernel.elf"
 # Resolve FL4's relative interface/header symlinks into the installed tree.

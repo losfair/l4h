@@ -154,7 +154,8 @@ where
 }
 
 /// seL4 user interrupt vectors (CPU vector 0x30 + n, n < 108, on x86;
-/// GICv2m SPI 80 + n, n < 64, on aarch64), which root hands out from one
+/// on aarch64 n < 64, either GICv2m SPI 80 + n or, when FL4 drives a GICv3
+/// ITS, LPI n and ITS event n), which root hands out from one
 /// pool as it drives devices (`vector_alloc`): a disk controller's, an
 /// xHCI's, a NIC's, each keeping its own until reboot.  No kind of device
 /// has a share of its own, so a host with many NICs and few disks has
@@ -189,6 +190,13 @@ const fn reserved_vectors() -> u128 {
 }
 #[cfg(target_arch = "x86_64")]
 const _: () = assert!((l4h_partition::CONTROL_VECTOR_BASE as usize + l4h_partition::MAX_PARTITIONS) as u64 <= VECTORS);
+
+/// Give back a vector from vector_alloc that nothing uses.
+pub fn vector_free(v: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let word = &VECTORS_USED[v as usize / 64];
+    word.store(word.load(Relaxed) & !(1 << (v % 64)), Relaxed);
+}
 
 /// A free vector, now the caller's, lowest first; None when all are used.
 /// Root is one thread: a load and a store.
@@ -255,72 +263,132 @@ pub fn io_ports(_alloc: &mut Alloc, _base: u16, _len: u16) -> Option<sel4::cap::
     None
 }
 
-/// An IRQ handler for MSI vector `vector` of `d`, into `dst`.
-pub fn msi_irq(d: &Device, vector: u64, dst: &sel4::AbsoluteCPtr) {
+/// An IRQ handler for MSI vector `vector` of `d`, into `dst`; why not,
+/// with `dst` left empty.  Callers make it before anything else of the
+/// device's, so a controller that cannot have one stays disabled (the ITS
+/// may have too few LPIs, events or device IDs, or FL4 no room for
+/// another device's table) and root goes on.
+pub fn msi_irq(d: &Device, vector: u64, dst: &sel4::AbsoluteCPtr) -> Result<(), &'static str> {
     #[cfg(target_arch = "x86_64")]
-    sel4::init_thread::slot::IRQ_CONTROL
-        .cap()
-        .irq_control_get_msi(d.bus as u64, d.dev as u64, d.func as u64, 0, vector, dst)
-        .expect("MSI IRQ handler");
+    {
+        sel4::init_thread::slot::IRQ_CONTROL
+            .cap()
+            .irq_control_get_msi(d.bus as u64, d.dev as u64, d.func as u64, 0, vector, dst)
+            .map_err(|_| "MSI IRQ handler allocation failed")
+    }
     #[cfg(target_arch = "aarch64")]
     {
-        assert!(vector < 64);
-        if its_doorbell() == 0 {
-            slot::IRQ_CONTROL.cap().irq_control_get_trigger_core(80 + vector, true, 0, dst)
-                .expect("GICv2m IRQ handler");
-            return;
+        use core::sync::atomic::Ordering::Relaxed;
+        if vector >= VECTORS {
+            return Err("MSI vector out of range");
         }
-        // FL4's GetMSI: event `vector` of the function's requester ID
-        // (no SMMU: its ITS device ID), as LPI `vector`, to core 0.
-        #[cfg(l4h_kernel_its)]
-        {
-            let device = (d.bus as u64) << 8 | (d.dev as u64) << 3 | d.func as u64;
-            let r = sel4::with_ipc_buffer_mut(|ipc| {
-                ipc.inner_mut().seL4_IRQControl_GetMSI(slot::IRQ_CONTROL.cap().bits(), vector, device, vector,
-                    dst.root().bits(), dst.path().bits(), dst.path().depth() as u8, 0)
-            });
-            assert!(r == 0, "ITS MSI handler for {:02x}:{:02x}.{} vector {}: error {}", d.bus, d.dev, d.func, vector, r);
-        }
-        // A kernel without GetMSI never reports an ITS (msi_init).
-        #[cfg(not(l4h_kernel_its))]
-        {
-            let _ = d;
-            unreachable!("ITS without seL4_IRQControl_GetMSI");
+        match MSI_MODE.load(Relaxed) {
+            MSI_GICV2M => slot::IRQ_CONTROL.cap().irq_control_get_trigger_core(80 + vector, true, 0, dst)
+                .map_err(|_| "GICv2m IRQ handler allocation failed"),
+            // FL4's GetMSI: event `vector` of the function's requester ID
+            // (no SMMU: its ITS DeviceID), as LPI `vector`, to core 0.
+            #[cfg(l4h_kernel_its)]
+            MSI_ITS => {
+                let device = (d.bus as u64) << 8 | (d.dev as u64) << 3 | d.func as u64;
+                if vector >= ITS_NUM_LPIS.load(Relaxed) || vector >= ITS_NUM_EVENTS.load(Relaxed)
+                    || device >= ITS_NUM_DEVICES.load(Relaxed) {
+                    return Err("ITS MSI out of range");
+                }
+                let r = sel4::with_ipc_buffer_mut(|ipc| {
+                    ipc.inner_mut().seL4_IRQControl_GetMSI(slot::IRQ_CONTROL.cap().bits(), vector, device, vector,
+                        dst.root().bits(), dst.path().bits(), dst.path().depth() as u8, 0)
+                });
+                if r != 0 {
+                    log!("l4h-root: ITS MSI handler for {:02x}:{:02x}.{} vector {}: error {}", d.bus, d.dev, d.func, vector, r);
+                    return Err("ITS MSI handler allocation failed");
+                }
+                Ok(())
+            }
+            // MSI_UNAVAILABLE; a kernel without GetMSI never selects the ITS.
+            _ => {
+                let _ = d;
+                Err("no usable MSI controller")
+            }
         }
     }
 }
 
-/// The ITS doorbell (GITS_TRANSLATER) FL4 drives MSIs through
-/// (SEL4_BOOTINFO_HEADER_AARCH64_MSI_INFO), or 0: QEMU virt's GICv2m.
+/// How MSIs reach the GIC on aarch64 (msi_init): QEMU virt's GICv2m, FL4's
+/// GICv3 ITS, or neither.  Neither until msi_init finds positive evidence
+/// of one: a GICv2m that is not there (C4A has none) would take the
+/// devices' writes nowhere.
+#[cfg(target_arch = "aarch64")]
+const MSI_GICV2M: u8 = 0;
+#[cfg(target_arch = "aarch64")]
+const MSI_ITS: u8 = 1;
+#[cfg(target_arch = "aarch64")]
+const MSI_UNAVAILABLE: u8 = 2;
+#[cfg(target_arch = "aarch64")]
+static MSI_MODE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(MSI_UNAVAILABLE);
+/// With MSI_ITS: its doorbell (GITS_TRANSLATER) and what it has room for
+/// (SEL4_BOOTINFO_HEADER_AARCH64_MSI_INFO).
 #[cfg(target_arch = "aarch64")]
 static ITS_DOORBELL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
 #[cfg(target_arch = "aarch64")]
-fn its_doorbell() -> u64 {
-    ITS_DOORBELL.load(core::sync::atomic::Ordering::Relaxed)
-}
+static ITS_NUM_LPIS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(target_arch = "aarch64")]
+static ITS_NUM_EVENTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(target_arch = "aarch64")]
+static ITS_NUM_DEVICES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Learn how MSIs reach the GIC, before any is set up: seL4_AArch64MsiInfo
-/// (doorbell, num_lpis, num_events, num_devices) when FL4 drives an ITS.
+/// Learn how MSIs reach the GIC, before any is set up.  seL4 (QEMU virt
+/// alone): its GICv2m.  FL4: the ITS it drives, from seL4_AArch64MsiInfo
+/// (doorbell, num_lpis, num_events, num_devices), used as large as it is
+/// (msi_irq checks each vector and device); without that report, a GICv2m
+/// only on a GICv2 (seL4_AArch64VirtInfo) whose device tree has QEMU
+/// virt's, enabled (fdt::has_qemu_gicv2m).  FL4
+/// omits the report when its ITS failed or had no memory for its tables:
+/// there is no GICv2m then.
 #[cfg(target_arch = "aarch64")]
 pub fn msi_init(bootinfo: &sel4::BootInfoPtr) {
+    use core::sync::atomic::Ordering::Relaxed;
+    use l4h_task::bootinfo::extra_chunk;
+    const FDT: u64 = 6;
+    const VIRT_INFO: u64 = 11;
     const MSI_INFO: u64 = 15;
     if !cfg!(l4h_kernel_its) {
+        MSI_MODE.store(MSI_GICV2M, Relaxed);
         log!("l4h-root: MSIs through QEMU virt's GICv2m");
         return;
     }
-    let Some(c) = l4h_task::bootinfo::extra_chunk(bootinfo, MSI_INFO).filter(|c| c.len() >= 32) else {
-        log!("l4h-root: MSIs through QEMU virt's GICv2m");
+    let word = |c: &[u8], i: usize| u64::from_le_bytes(c[8 * i..8 * i + 8].try_into().unwrap());
+    let Some(c) = extra_chunk(bootinfo, MSI_INFO) else {
+        // seL4_AArch64VirtInfo: 13 words, gic_version the third.
+        let gic = extra_chunk(bootinfo, VIRT_INFO).filter(|c| c.len() >= 13 * 8).map(|c| word(c, 2));
+        let v2m = extra_chunk(bootinfo, FDT).is_some_and(crate::fdt::has_qemu_gicv2m);
+        match gic {
+            Some(2) if v2m => {
+                MSI_MODE.store(MSI_GICV2M, Relaxed);
+                log!("l4h-root: MSIs through QEMU virt's GICv2m (in the device tree)");
+            }
+            Some(2) => log!("l4h-root: warning: GICv2 without a GICv2m in the device tree: no MSIs"),
+            Some(v) => log!("l4h-root: warning: GICv{} without an ITS report: no MSIs", v),
+            None => log!("l4h-root: warning: no MSI controller reported: no MSIs"),
+        }
         return;
     };
-    let w: [u64; 4] = core::array::from_fn(|i| u64::from_le_bytes(c[8 * i..8 * i + 8].try_into().unwrap()));
-    // Vectors are LPI numbers and events both.
-    if w[1] < VECTORS || w[2] < VECTORS || w[3] < MAX_FUNCTIONS as u64 {
-        log!("l4h-root: the ITS has too few LPIs, events or device IDs: MSIs through GICv2m");
+    if c.len() != 32 {
+        log!("l4h-root: warning: the ITS report is {} bytes, not 32: no MSIs", c.len());
         return;
     }
-    log!("l4h-root: MSIs through the ITS, doorbell {:#x}", w[0]);
-    ITS_DOORBELL.store(w[0], core::sync::atomic::Ordering::Relaxed);
+    let [doorbell, lpis, events, devices]: [u64; 4] = core::array::from_fn(|i| word(c, i));
+    // GITS_TRANSLATER is a 32-bit register.
+    if doorbell == 0 || doorbell & 3 != 0 || lpis == 0 || events == 0 || devices == 0 {
+        log!("l4h-root: warning: the ITS reports doorbell {:#x}, {} LPIs, {} events, {} devices: no MSIs",
+            doorbell, lpis, events, devices);
+        return;
+    }
+    ITS_DOORBELL.store(doorbell, Relaxed);
+    ITS_NUM_LPIS.store(lpis, Relaxed);
+    ITS_NUM_EVENTS.store(events, Relaxed);
+    ITS_NUM_DEVICES.store(devices, Relaxed);
+    MSI_MODE.store(MSI_ITS, Relaxed);
+    log!("l4h-root: MSIs through the ITS, doorbell {:#x} ({} LPIs, {} events, {} devices)", doorbell, lpis, events, devices);
 }
 
 /// The functions whose ECAM pages a partition mapped, a bit per BDF.
@@ -949,6 +1017,12 @@ impl Pci {
     pub fn enable_msi(&self, d: &Device, address: u64, data: u32) {
         let Some(m) = d.msi else { return };
         let (b, dv, f, c) = (d.bus, d.dev, d.func, m.cap);
+        // A 32-bit MSI capability would truncate a doorbell above 4 GiB
+        // (an ITS's can be), sending the device's writes elsewhere.
+        if !m.is64 && address > u32::MAX as u64 {
+            log!("l4h-root: pci {:02x}:{:02x}.{}: 32-bit MSI cannot reach {:#x}", b, dv, f, address);
+            return;
+        }
         let ctrl = self.read16(b, dv, f, c + 2);
         // Disabled while it changes; one vector (Multiple Message Enable 0).
         self.write16(b, dv, f, c + 2, ctrl & !(1 | 0x70));
@@ -1049,12 +1123,24 @@ pub fn msi_address() -> u64 {
     // when root has the machine to itself).  The shim gives no partition a
     // first CPU above APIC ID 255.
     #[cfg(target_arch = "x86_64")] { 0xfee0_0000 | (crate::partition::msi_dest() as u64 & 0xff) << 12 }
-    #[cfg(target_arch = "aarch64")] { if its_doorbell() != 0 { its_doorbell() } else { 0x0802_0040 } }
+    // FL4's ITS doorbell, QEMU virt's GICv2m, or nothing (msi_irq fails).
+    #[cfg(target_arch = "aarch64")]
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        match MSI_MODE.load(Relaxed) {
+            MSI_ITS => ITS_DOORBELL.load(Relaxed),
+            MSI_GICV2M => 0x0802_0040,
+            _ => 0,
+        }
+    }
 }
 pub fn msi_data(vector: u64) -> u32 {
     #[cfg(target_arch = "x86_64")] { 0x30 + vector as u32 }
     // The ITS's event, or GICv2m's SPI.
-    #[cfg(target_arch = "aarch64")] { if its_doorbell() != 0 { vector as u32 } else { 80 + vector as u32 } }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if MSI_MODE.load(core::sync::atomic::Ordering::Relaxed) == MSI_GICV2M { 80 + vector as u32 } else { vector as u32 }
+    }
 }
 
 #[cfg(target_arch = "aarch64")]

@@ -5811,11 +5811,12 @@ PL011 and GIC addresses, RAM from 1 GiB) but enter at EL1 with ACPI and
 deliver MSIs only through a GICv3 ITS (no GICv2m, no SMMU). FL4 drives the
 ITS and reports its doorbell (`SEL4_BOOTINFO_HEADER_AARCH64_MSI_INFO`);
 root then asks for each vector with `seL4_IRQControl_GetMSI` (event and
-LPI number = the vector, device ID = the function's requester ID) and
-gives drivers the doorbell and the event as MSI address and data.
+LPI number = the vector, ITS DeviceID = the function's requester ID on
+identity-mapped platforms without an SMMU) and gives drivers the doorbell
+and the event as MSI address and data.
 `tests/gce-test.sh --aarch64` and `tests/gce-bench.sh --aarch64` run on a
-c4a-standard-4; `L4H_QEMU_ACPI=on tools/run-fl4-aarch64.sh` with QEMU's
-ITS is the local equivalent.
+c4a-standard-4; `L4H_QEMU_ACPI=on L4H_QEMU_VIRTUALIZATION=off
+tools/run-fl4-aarch64.sh` (EL1, with QEMU's ITS) is the local equivalent.
 
 **Scope.** This targets QEMU `virt` (GICv2m or, on FL4, a GICv3 ITS) and
 machines laid out like it. Other ARM boards need their own platform
@@ -6113,8 +6114,8 @@ SEL4_PREFIX="$PWD/build/sel4-fl4" L4H_KERNEL_VARIANT=fl4 tests/run-selftest.sh 4
 
 The tested FL4 revision is `2e45b6d78ef244c27ab34ab03ed0d6507f1a89d3`.
 `prepare-fl4.sh` clones the pinned public revision, or the frozen override,
-into `build/FL4-src` without applying any kernel patches. The source
-worktree is not edited.
+into `build/FL4-src-<revision>`, one tree per revision, without applying
+any kernel patches. The source worktree is not edited.
 `build-fl4.sh` builds the kernel and FL4's own libsel4 together, installs
 them in `build/sel4-fl4`, and records the source commit in `fl4-revision`.
 FL4's own syscall XML is installed unchanged; the bindings use FL4's

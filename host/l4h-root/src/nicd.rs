@@ -582,12 +582,24 @@ pub fn bind(h: &mut Host, i: usize, driver: Option<usize>) -> Result<(), &'stati
     if (0..6u8).filter(|b| bars & 1 << b != 0).any(|b| (crate::blkd::bar_frames(&n.bars, b).len() * PAGE) < w.bars[b as usize].size as usize) {
         return Err("its BARs were mapped for a driver with a smaller window: reboot to change");
     }
+    // Its vector and MSI handler, together and before anything that
+    // stays the NIC's (its channel and DMA region, spawn): kept until
+    // reboot, across its nicd's restarts.  Without them (no vector or
+    // MSI controller left, or the ITS is full) the bind fails, and the
+    // vector is free for another device.
     if n.msi.is_none() {
         let v = pci::vector_alloc().ok_or("no interrupt vector left")?;
+        let s = h.alloc.slots.global(|s| s.alloc());
+        if let Err(why) = pci::msi_irq(&n.pci, v, &abs_of(root_cap::<cap_type::Null>(s))) {
+            h.alloc.slots.global(|sl| sl.free(s));
+            pci::vector_free(v);
+            return Err(why);
+        }
         let dom = n.dom.unwrap();
         let n = &mut nics()[i];
         let (a, data) = h.iommu.msi(dom, v);
         n.msi = Some((v, a, data));
+        n.irq = Some(root_cap::<cap_type::IrqHandler>(s));
     }
     // Root's from now on: one the firmware left live is stopped first,
     // so that it is not left decoding and mastering the bus as the
@@ -803,7 +815,7 @@ fn spawn(h: &mut Host, i: usize) -> Result<(), &'static str> {
     nics()[i].dma_driver = Some(d);
     let n = &nics()[i];
     let pdev = n.pci;
-    let (vector, msi_address, msi_data) = n.msi.unwrap();
+    let (_, msi_address, msi_data) = n.msi.unwrap();
     let chan_bits = n.chan.as_ref().unwrap().data_bits;
 
     h.alloc.slots.track(slot_owner(i));
@@ -951,15 +963,9 @@ fn spawn(h: &mut Host, i: usize) -> Result<(), &'static str> {
         comp.map_copy(&mut h.alloc, &mut arena, &abs_of(cfg_page), nicd::CFG_VA, CapRights::read_only(), VmAttributes::DEFAULT, keep_slot());
         let mailbox = Mailbox::new(&comp, mailbox::nicd_mailbox(i), &wiring::ROOT_NICD_CALL, &wiring::NICD_DONE, &mut h.alloc, &mut arena, &mut keep_slot);
 
-        // The interrupt: one handler for the device, root's until reboot,
+        // The interrupt (bind made it): one handler for the device,
         // pointed at each instance's notification.
-        let n = &mut nics()[i];
-        if n.irq.is_none() {
-            let s = h.alloc.slots.global(|s| s.alloc());
-            pci::msi_irq(&pdev, vector, &abs_of(root_cap::<cap_type::Null>(s)));
-            n.irq = Some(root_cap::<cap_type::IrqHandler>(s));
-        }
-        let irq = n.irq.unwrap();
+        let irq = nics()[i].irq.unwrap();
         let irq_ntfn = root_cap::<cap_type::Notification>(h.alloc.slots.alloc());
         component::mint_edge(&abs_of(irq_ntfn), &wiring::IRQ_NICD, 0, &comp.obj()).expect("nicd IRQ notification");
         let _ = irq.irq_handler_clear();

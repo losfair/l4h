@@ -29,14 +29,15 @@ mkdir -p "$rebuild/build/tmp"
 # leaves one (branch l4h at the pinned revision, vendor/seL4, its stamp):
 # prepare-fl4.sh then takes it as is.
 fl4_rev=$(cat "$rebuild/kernel/fl4/REVISION")
-if [ -d "$root/build/FL4-src/.git" ]; then
-    git clone -q --shared --no-checkout "$root/build/FL4-src" "$rebuild/build/FL4-src"
-    git -C "$rebuild/build/FL4-src" checkout -q -B l4h "$fl4_rev"
+fl4_src=build/FL4-src-$fl4_rev
+if [ -d "$root/$fl4_src/.git" ]; then
+    git clone -q --shared --no-checkout "$root/$fl4_src" "$rebuild/$fl4_src"
+    git -C "$rebuild/$fl4_src" checkout -q -B l4h "$fl4_rev"
     git -c protocol.file.allow=always \
-        -c "submodule.vendor/seL4.url=$root/build/FL4-src/vendor/seL4" \
-        -C "$rebuild/build/FL4-src" submodule update --init \
-        --reference "$root/build/FL4-src/vendor/seL4" -- vendor/seL4
-    echo "$fl4_rev" >"$rebuild/build/FL4-src/.git/l4h-source"
+        -c "submodule.vendor/seL4.url=$root/$fl4_src/vendor/seL4" \
+        -C "$rebuild/$fl4_src" submodule update --init \
+        --reference "$root/$fl4_src/vendor/seL4" -- vendor/seL4
+    echo "$fl4_rev" >"$rebuild/$fl4_src/.git/l4h-source"
 fi
 tarball=$root/build/dl/linux-$LINUX_VERSION.tar.xz
 echo "$LINUX_SHA256  $tarball" | sha256sum -c --quiet

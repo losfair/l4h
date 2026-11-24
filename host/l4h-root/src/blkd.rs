@@ -103,8 +103,6 @@ const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
 pub struct Controller {
     pub pci: pci::Device,
     pub kind: u32,
-    /// MSI vector (seL4 delivers vector n at CPU vector 0x30 + n).
-    vector: u64,
     /// Frames of the BARs the driver uses, carved once.
     bars: BarCache,
     /// blkd's client channels, shared by the controller's disks: this
@@ -173,7 +171,7 @@ static CLIENT_ROWS: AtomicUsize = AtomicUsize::new(0);
 
 impl Controller {
     /// At most pci::MAX_DISK_CTRLS controllers can be made.
-    pub fn new(pci: pci::Device, vector: u64) -> Self {
+    pub fn new(pci: pci::Device) -> Self {
         let kind = if is_nvme(&pci) {
             blk::BLKD_NVME
         } else if is_ahci(&pci) {
@@ -187,7 +185,7 @@ impl Controller {
         assert!(row < pci::MAX_DISK_CTRLS, "more than {} disk controllers", pci::MAX_DISK_CTRLS);
         // Each row is handed out once, so this is its only reference.
         let clients = unsafe { &mut (*addr_of_mut!(CLIENTS))[row] };
-        Controller { pci, kind, vector, bars: [const { None }; 6], clients, failed: false, io: None, driver: None, dom: Domain::NONE,
+        Controller { pci, kind, bars: [const { None }; 6], clients, failed: false, io: None, driver: None, dom: Domain::NONE,
             ops: [const { None }; RING], staging_busy: false, backlog: false }
     }
 
@@ -373,10 +371,13 @@ pub fn is_nvme(d: &pci::Device) -> bool {
     d.class == 0x01 && d.subclass == 0x08 && d.prog_if == 0x02 && d.msix.is_some() && d.bars[0].size >= 0x2000
 }
 
-/// Standard AHCI SATA functions with a memory ABAR and plain MSI.
+/// Standard AHCI SATA functions with a memory ABAR and plain MSI that
+/// reaches the MSI doorbell (a 32-bit capability cannot reach an ITS's
+/// above 4 GiB).
 pub fn is_ahci(d: &pci::Device) -> bool {
     d.class == 0x01 && d.subclass == 0x06 && d.prog_if == 0x01
-        && d.msi.is_some() && !d.bars[5].is_io && d.bars[5].size >= 0x180
+        && d.msi.is_some_and(|m| m.is64 || pci::msi_address() <= u32::MAX as u64)
+        && !d.bars[5].is_io && d.bars[5].size >= 0x180
 }
 
 /// Disks l4h can pass through: also, the BARs `start` maps can be.
@@ -472,6 +473,31 @@ pub fn start(
         "l4h-root: cannot start disk {:02x}:{:02x}.{}: reset failed",
         disk.pci.bus, disk.pci.dev, disk.pci.func
     );
+    // The interrupt first, its vector (MSI vector n: CPU vector 0x30 + n
+    // on x86, ITS event and LPI n or GICv2m SPI 80 + n on aarch64) with
+    // it: without one (no vector or MSI controller left, or the ITS is
+    // full) the controller stays disabled, nothing else is made and the
+    // vector is free for another device.
+    let p = disk.pci;
+    let irq = pci::vector_alloc().ok_or("no interrupt vector left").and_then(|vector| {
+        let irq_slot = alloc.slots.global(|s| s.alloc());
+        match pci::msi_irq(&p, vector, &abs_of(sel4::init_thread::Slot::<cap_type::Null>::from_index(irq_slot).cap())) {
+            Ok(()) => Ok((vector, irq_slot)),
+            Err(why) => {
+                alloc.slots.global(|s| s.free(irq_slot));
+                pci::vector_free(vector);
+                Err(why)
+            }
+        }
+    });
+    let (vector, irq_slot) = match irq {
+        Ok(irq) => irq,
+        Err(why) => {
+            log!("l4h-root: disk {:02x}:{:02x}.{}: {}, leaving disabled", p.bus, p.dev, p.func, why);
+            disk.failed = true;
+            return;
+        }
+    };
     let io = disk.io_cap(alloc);
     let legacy_io = disk.legacy_io();
     let d = &disk.pci;
@@ -507,7 +533,6 @@ pub fn start(
     let register_bar = if disk.kind == blk::BLKD_AHCI { 5 } else { 0 };
     cfg.bar0 = blk::PciRegion { va: bar_va(register_bar) as u64, len: d.bars[register_bar as usize].size };
     cfg.pci_bdf = bdf(d);
-    let vector = disk.vector;
     (cfg.msi_address, cfg.msi_data) = iommu.msi(dom, vector);
     if let Some(VirtioRegions { common, notify, notify_mult, isr, device, .. }) = regions {
         cfg.common = common;
@@ -559,9 +584,7 @@ pub fn start(
         let f = sel4::init_thread::Slot::<cap_type::Granule>::from_index(dma_frames.start + i).cap();
         comp.map_copy(alloc, &mut arena, &abs_of(f), host::DMA_VA + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep_slot());
     }
-    // ---- Interrupt, notifications.
-    let irq_slot = alloc.slots.global(|s| s.alloc());
-    pci::msi_irq(d, vector, &abs_of(sel4::init_thread::Slot::<cap_type::Null>::from_index(irq_slot).cap()));
+    // ---- Interrupt (made above), notifications.
     let irq = sel4::init_thread::Slot::<cap_type::IrqHandler>::from_index(irq_slot).cap();
     let irq_ntfn_slot = alloc.slots.alloc();
     let irq_ntfn = sel4::init_thread::Slot::<cap_type::Notification>::from_index(irq_ntfn_slot).cap();

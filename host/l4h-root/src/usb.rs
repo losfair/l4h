@@ -362,9 +362,19 @@ fn claim(h: &mut Host, i: usize) -> Result<(), Errno> {
         h.alloc.release_objects(arena, &objects);
         return Err(ctl::ENOSPC);
     };
+    // The interrupt, before the device or a component is touched: without
+    // one (no MSI controller, or the ITS is full) the claim fails cleanly.
+    let d = ctrls()[i].pci;
+    let irq_slot = h.alloc.slots.global(|s| s.alloc());
+    if let Err(why) = pci::msi_irq(&d, vector, &abs_of(root_cap::<cap_type::Null>(irq_slot))) {
+        h.alloc.slots.global(|s| s.free(irq_slot));
+        pci::vector_free(vector);
+        h.alloc.release_objects(arena, &objects);
+        log!("l4h-root: xHCI {:02x}:{:02x}.{}: {}", d.bus, d.dev, d.func, why);
+        return Err(ctl::ENOSPC);
+    }
 
     let c = &mut ctrls()[i];
-    let d = c.pci;
     // The device reaches this memory, and an attached client's pool.
     let dom = h.iommu.attach(&mut h.alloc, &d);
     h.iommu.map(&mut h.alloc, dom, dma_paddr, dma, true);
@@ -412,9 +422,7 @@ fn claim(h: &mut Host, i: usize) -> Result<(), Errno> {
         comp.map_copy(&mut h.alloc, &mut arena, &f, host::DMA_VA + p * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep_slot());
     }
     let mbox = Mailbox::new(&comp, mailbox::usbd_mailbox(i), &wiring::ROOT_USBD_CALL, &wiring::USBD_DONE, &mut h.alloc, &mut arena, &mut keep_slot);
-    // The interrupt.
-    let irq_slot = h.alloc.slots.global(|s| s.alloc());
-    pci::msi_irq(&d, vector, &abs_of(root_cap::<cap_type::Null>(irq_slot)));
+    // The interrupt, made above.
     let irq = root_cap::<cap_type::IrqHandler>(irq_slot);
     let irq_ntfn = root_cap::<cap_type::Notification>(h.alloc.slots.alloc());
     component::mint_edge(&abs_of(irq_ntfn), &wiring::IRQ_USBD, 0, &comp.obj()).expect("usbd IRQ notification");

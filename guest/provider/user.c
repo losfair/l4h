@@ -384,6 +384,17 @@ void l4h_user_sync_seg(struct l4h_uctx *u, unsigned long *gp)
 	if (u->state == L4H_UCTX_NONE || u->state == L4H_UCTX_FRESH ||
 	    (u->regs_dirty & DIRTY_SEG))
 		return;
+#ifdef __aarch64__
+	/*
+	 * Every path that sets regs_valid (syscall_msg_to_gp from a full FL4
+	 * trap message, or l4h_user_sync_regs through ctx_to_gp) has already
+	 * filled gp[HOST_TLS] from TPIDR_EL0: no ReadRegisters, which keeps
+	 * fork()/clone() and ptrace(NT_ARM_TLS) off FL4's serial gate too.
+	 * x86_64's UnknownSyscall message has no fs_base/gs_base to rely on.
+	 */
+	if (u->regs_valid)
+		return;
+#endif
 	if (seL4_TCB_ReadRegisters(u->tcb, 0, 0, CTX_WORDS_ALL, &c) == 0) {
 #ifdef __aarch64__
 		gp[HOST_TLS] = c.tpidr_el0;

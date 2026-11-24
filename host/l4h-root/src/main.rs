@@ -33,6 +33,8 @@ mod ctl;
 mod dashboard;
 mod devmem;
 mod drivers;
+#[cfg(target_arch = "aarch64")]
+mod fdt;
 mod iommu;
 mod layout;
 mod logd;
@@ -410,7 +412,8 @@ impl Host {
 
     /// Start every controller's blkd.  The host fails to boot if it cannot
     /// start them all (each needs 4 MiB of physically contiguous DMA
-    /// memory), so no disk is ever missing its driver.
+    /// memory), so no disk is ever missing its driver; one that cannot
+    /// have an interrupt (blkd::start) is left disabled, as failed.
     fn start_disks(&mut self) {
         for c in 0..self.ctrls.len() {
             if !self.ctrls[c].failed {
@@ -633,9 +636,9 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     #[cfg(target_arch = "x86_64")]
     iommu::shared::map(&mut alloc, &mut devmem, info.tsc_hz / 1000);
     // PCI devices: disks can be passed through to guests.
-    #[allow(unused_mut)]
     #[cfg(target_arch = "aarch64")]
     pci::msi_init(bootinfo);
+    #[allow(unused_mut)]
     let mut pci = pci::Pci::new(&mut alloc, &mut devmem);
     // The IOMMU before any device is enabled: from here on, a device
     // reaches only memory root gives it (iommu.rs).
@@ -704,11 +707,8 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
             // memory it was given is not known), and a reset, since bus
             // mastering is enabled again on attach.
             pci.disable(&d);
-            let Some(v) = pci::vector_alloc() else {
-                log!("l4h-root: no interrupt vector left for disk controller {:02x}:{:02x}.{}; ignoring it", d.bus, d.dev, d.func);
-                continue;
-            };
-            let mut ctrl = Controller::new(d, v);
+            // Its interrupt vector comes with its MSI handler (blkd::start).
+            let mut ctrl = Controller::new(d);
             blkd::reset(&mut ctrl, &pci, &mut alloc, &mut devmem, &mut wins.a, info.tsc_hz / 1000);
             pci.disable(&ctrl.pci);
             // Below MAX_DISK_CTRLS: checked above.

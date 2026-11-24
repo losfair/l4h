@@ -43,6 +43,11 @@ while getopts e:b:i:c:m: o; do
 done
 shift $((OPTIND - 1))
 out=$1
+# An AArch64 image boots only the given BOOTAA64.EFI: never build x86's.
+if [ "${L4H_ARCH:-x86_64}" = aarch64 ]; then
+    [ -n "$efi" ] || { echo "mkimage.sh: L4H_ARCH=aarch64 requires -e <BOOTAA64.EFI>" >&2; exit 1; }
+    [ -z "$bios" ] || { echo "mkimage.sh: -b (BIOS) is not supported with L4H_ARCH=aarch64" >&2; exit 1; }
+fi
 source "$root/tools/host-profile.sh"
 rootserver=${2:-$root/host/target/x86_64-sel4-roottask/$l4h_profile/l4h-root.elf}
 work=$(mktemp -d)
@@ -66,7 +71,11 @@ fi
 
 # EFI system partition: FAT32, sized for the payload.
 payload=0
-for f in "$efi" $dom0_initrd $config ${bios:+"$bios"} ${mk:+"$mk"}; do
+payload_files=("$efi")
+for f in "$dom0_initrd" "$config" "$bios" "$mk"; do
+    [ -z "$f" ] || payload_files+=("$f")
+done
+for f in "${payload_files[@]}"; do
     payload=$(( payload + $(du -sb "$f" | cut -f1) ))
 done
 esp_mb=${L4H_ESP_MB:-$(( payload / 1048576 + 64 ))}

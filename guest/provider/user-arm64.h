@@ -88,6 +88,12 @@ static void gp_to_ctx(const unsigned long *gp, seL4_UserContext *c)
 #define L4H_TRAP_X8	seL4_UnknownSyscall_Length	/* x8-x30, then TLS */
 #define L4H_TRAP_TLS	(L4H_TRAP_X8 + 23)
 #define L4H_TRAP_LENGTH	(L4H_TRAP_TLS + 1)
+#ifdef seL4_UnknownSyscall_TrapLength
+/* An FL4 whose libsel4 names the layout: it must be the one above. */
+_Static_assert(L4H_TRAP_X8 == seL4_UnknownSyscall_TrapX8, "FL4 trap x8 offset");
+_Static_assert(L4H_TRAP_TLS == seL4_UnknownSyscall_TrapTPIDR_EL0, "FL4 trap TPIDR_EL0 offset");
+_Static_assert(L4H_TRAP_LENGTH == seL4_UnknownSyscall_TrapLength, "FL4 trap message length");
+#endif
 
 static void syscall_msg_to_gp(struct l4h_uctx *u, unsigned long *gp, seL4_Word length)
 {
