@@ -2,8 +2,9 @@
 //! §5.11): its configuration, address space and CSpace layout, and the
 //! calls its vCPU threads make to its I/O thread.
 //!
-//! An HVM guest runs an unmodified x86-64 kernel in VT-x or AMD-V guest
-//! mode, on seL4 VCPUs that l4h-hvm's own threads enter: one thread per
+//! An HVM guest runs an unmodified kernel in hardware guest mode (x86-64 on
+//! VT-x or AMD-V, AArch64 at EL1 under FL4 at EL2: its layout is `arm`), on
+//! seL4 VCPUs that l4h-hvm's own threads enter: one thread per
 //! vCPU, and one I/O thread that serves the devices' backends (blkd,
 //! netd), the console and the slow paths of the virtual platform.  Unlike
 //! l4h-vmm it maps its guest's RAM, which it reads to emulate devices and
@@ -57,6 +58,79 @@ const _: () = assert!(MAX_VCPUS < 255);
 pub const IO_POOL_GPA: u64 = 1 << 46;
 const _: () = assert!(IO_POOL_GPA >= HIGH_RAM_BASE + RAM_MAX);
 
+/// An AArch64 HVM guest's guest-physical layout: devices below 1 GiB, and
+/// its RAM in one range from RAM_BASE (no hole).  Nothing here is mapped
+/// but the RAM and, on GICv2, the GICC page: the host's GICV, which the
+/// guest uses directly.
+pub mod arm {
+    pub const GICD_BASE: u64 = 0x0800_0000;
+    pub const GICD_SIZE: u64 = 0x1_0000;
+    /// GICv2: the CPU interface, the host's two GICV frames.
+    pub const GICC_BASE: u64 = 0x0801_0000;
+    pub const GICC_SIZE: u64 = 0x2000;
+    /// GICv2: the GICv2m MSI frame.
+    pub const V2M_BASE: u64 = 0x0802_0000;
+    pub const V2M_SIZE: u64 = 0x1000;
+    /// GICv3: the redistributors, GICR_STRIDE each.
+    pub const GICR_BASE: u64 = 0x080a_0000;
+    pub const GICR_STRIDE: u64 = 0x2_0000;
+    pub const GICR_SIZE: u64 = super::MAX_VCPUS as u64 * GICR_STRIDE;
+    pub const UART_BASE: u64 = 0x0900_0000;
+    pub const RTC_BASE: u64 = 0x0901_0000;
+    pub const GPIO_BASE: u64 = 0x0903_0000;
+    pub const PRIMECELL_SIZE: u64 = 0x1000;
+    pub const PCI_MMIO_BASE: u64 = 0x1000_0000;
+    pub const PCI_MMIO_SIZE: u64 = 0x2000_0000;
+    pub const ECAM_BASE: u64 = 0x3f00_0000;
+    pub const ECAM_SIZE: u64 = 1 << 20;
+    pub const RAM_BASE: u64 = 0x4000_0000;
+
+    /// SPIs (INTID - 32) of the platform's devices, and of PCI's INTA#-INTD#
+    /// (QEMU virt's numbers for the first three).
+    pub const UART_SPI: u32 = 1;
+    pub const RTC_SPI: u32 = 2;
+    pub const GPIO_SPI: u32 = 3;
+    pub const PCI_INTX_SPI: u32 = 4;
+    pub const PCI_INTX_LINES: u32 = 4;
+    /// The SPIs MSIs may use (GICv3's MBI, GICv2m): INTIDs from MSI_BASE.
+    pub const MSI_BASE: u32 = 64;
+    pub const MSI_COUNT: u32 = NR_IRQS - MSI_BASE;
+    /// The INTIDs a guest's GIC has (GICD_TYPER.ITLinesNumber's granule).
+    pub const NR_IRQS: u32 = 512;
+    /// The most vCPUs GICv2 can target (ITARGETSR's 8 bits).
+    pub const GICV2_MAX_VCPUS: usize = 8;
+
+    /// The VCPU state area in a vCPU thread's IPC buffer frame
+    /// (seL4_ARM_VCPU_Run), after the message registers.
+    pub const VCPU_STATE_OFFSET: usize = 2048;
+    pub const VCPU_STATE_SIZE: usize = 1024;
+
+    /// vCPU `v`'s MPIDR affinity: Aff0 has 16 vCPUs, as GICv3's SGI target
+    /// lists do; Aff1 the rest.
+    pub const fn mpidr_aff(v: usize) -> u64 {
+        ((v as u64 >> 4) << 8) | (v as u64 & 0xf)
+    }
+
+    /// The vCPU whose MPIDR affinity is `aff`, if it has one (`nr` vCPUs).
+    pub const fn vcpu_of_aff(aff: u64, nr: usize) -> Option<usize> {
+        if aff & !0xffff != 0 || aff & 0xf0 != 0 {
+            return None;
+        }
+        let v = (((aff >> 8) & 0xff) << 4 | (aff & 0xf)) as usize;
+        if v < nr { Some(v) } else { None }
+    }
+
+    const _: () = assert!(GICD_BASE + GICD_SIZE <= GICC_BASE && GICC_BASE + GICC_SIZE <= V2M_BASE);
+    const _: () = assert!(V2M_BASE + V2M_SIZE <= GICR_BASE && GICR_BASE + GICR_SIZE <= UART_BASE);
+    const _: () = assert!(UART_BASE + PRIMECELL_SIZE <= RTC_BASE && RTC_BASE + PRIMECELL_SIZE <= GPIO_BASE);
+    const _: () = assert!(GPIO_BASE + PRIMECELL_SIZE <= PCI_MMIO_BASE);
+    const _: () = assert!(PCI_MMIO_BASE + PCI_MMIO_SIZE <= ECAM_BASE && ECAM_BASE + ECAM_SIZE <= RAM_BASE);
+    const _: () = assert!(RAM_BASE + super::RAM_MAX <= super::IO_POOL_GPA);
+    const _: () = assert!(RAM_BASE as usize + super::RAM_MAX as usize <= super::RAM_VA);
+    const _: () = assert!(VCPU_STATE_OFFSET + VCPU_STATE_SIZE <= 4096 && VCPU_STATE_OFFSET.is_multiple_of(64));
+    const _: () = assert!(MSI_BASE >= 32 + PCI_INTX_SPI + PCI_INTX_LINES && NR_IRQS <= 1020 && NR_IRQS.is_multiple_of(32));
+}
+
 /// The guest-physical address of RAM offset `off` (the RAM's byte `off`,
 /// in block order): low RAM first, the rest above 4 GiB.
 pub const fn ram_gpa(low_ram: u64, off: u64) -> u64 {
@@ -77,6 +151,7 @@ pub const fn low_ram(ram: u64) -> u64 {
 /// first touches them.
 pub const RAM_VA: usize = 0x5000_0000_0000;
 const _: () = assert!(RAM_VA as u64 + HIGH_RAM_BASE + RAM_MAX <= 0x6000_0000_0000);
+const _: () = assert!(RAM_VA as u64 + arm::RAM_BASE + RAM_MAX <= 0x6000_0000_0000);
 /// The I/O pool, for blkd's bounce buffers.
 pub const IO_POOL_VA: usize = crate::IO_POOL_VA;
 /// vCPU v's stack, TLS and IPC buffer: VCPU_VA + v * VCPU_STRIDE, a guard
@@ -176,6 +251,13 @@ pub struct HvmConfig {
     pub devices: [HvmDevice; MAX_DEVICES],
     /// The kernel command line, NUL-terminated.
     pub cmdline: [u8; abi::CMDLINE_SIZE],
+    /// The GPA of the RAM's first byte: 0 on x86-64, arm::RAM_BASE on
+    /// AArch64, whose RAM is all in `low_ram`.
+    pub ram_base: u64,
+    /// AArch64: the host's virtualization and ID registers, which what the
+    /// guest reads of them is made from.  Zero on x86-64.
+    pub arm_virt: abi::ArmVirtInfo,
+    pub cpu_id: [u64; 5],
 }
 const _: () = assert!(crate::CONFIG_OFFSET + core::mem::size_of::<HvmConfig>() <= crate::INFO_SIZE);
 
@@ -231,5 +313,16 @@ mod tests {
         assert!(!is_ram(LOW_RAM_MAX, 1 << 30, HIGH_RAM_BASE, (1 << 30) + 1));
         assert!(!is_ram(LOW_RAM_MAX, 1 << 30, u64::MAX - 1, 4));
         assert_eq!(Sender::of_badge(recv::CALL), Some(Sender::Vcpu));
+    }
+
+    #[test]
+    fn arm_affinity() {
+        for v in 0..MAX_VCPUS {
+            assert_eq!(arm::vcpu_of_aff(arm::mpidr_aff(v), MAX_VCPUS), Some(v));
+        }
+        assert_eq!(arm::mpidr_aff(17), 0x101);
+        assert_eq!(arm::vcpu_of_aff(0x101, 17), None, "past the last vCPU");
+        assert_eq!(arm::vcpu_of_aff(0x10, MAX_VCPUS), None, "Aff0 has 16");
+        assert_eq!(arm::vcpu_of_aff(1 << 16, MAX_VCPUS), None, "no Aff2");
     }
 }

@@ -1180,12 +1180,19 @@ impl Arena {
     /// `object_cap` for a raw seL4 type of 2^size_bits bytes
     /// (`UtRegion::retype_raw`).
     pub fn object_cap_raw<T: sel4::CapType>(&mut self, alloc: &mut Alloc, obj_type: u64, size_bits: usize) -> sel4::Cap<T> {
+        let s = self.try_object_raw(alloc, obj_type, size_bits)
+            .unwrap_or_else(|| panic!("out of host memory allocating object type {}", obj_type));
+        sel4::Cap::<T>::from_bits(s as u64)
+    }
+
+    /// `try_object` for a raw seL4 type of 2^size_bits bytes.
+    pub fn try_object_raw(&mut self, alloc: &mut Alloc, obj_type: u64, size_bits: usize) -> Option<Slot> {
         let s = alloc.slots.alloc();
         if self.retype_raw(alloc, obj_type, size_bits, 1, Dest::new(alloc.slots.cnode(), s)).is_none() {
             alloc.slots.free(s);
-            panic!("out of host memory allocating object type {}", obj_type);
+            return None;
         }
-        sel4::Cap::<T>::from_bits(s as u64)
+        Some(s)
     }
 }
 

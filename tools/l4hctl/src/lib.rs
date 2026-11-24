@@ -902,15 +902,17 @@ pub struct VmSpec<'a> {
     pub gpu: Option<(u64, u64)>,
     /// Whole USB controllers ([`Ctl::usb_info`] indices).
     pub usbs: Vec<u64>,
-    /// An HVM guest's kernel (a bzImage or an ELF vmlinux for x86-64),
+    /// An HVM guest's kernel (a bzImage or an ELF vmlinux for x86-64, an
+    /// `Image` or an ELF vmlinux for arm64),
     /// which it runs unmodified instead of the host's; None for an l4h
     /// guest.  HVM guests have no GPU or USB.
     pub kernel: Option<&'a [u8]>,
 }
 
 /// Where an HVM guest's kernel image and initrd go in its RAM (their
-/// GPAs): above where the kernel runs (from 16 MiB, or its ELF segments),
-/// each 2 MiB aligned, all in the RAM below the 3 GiB hole.
+/// GPAs): above where the kernel runs (on x86-64 from 16 MiB, or its ELF
+/// segments, all in the RAM below the 3 GiB hole; on arm64 from RAM_BASE +
+/// 2 MiB), each 2 MiB aligned.
 pub fn hvm_layout(kernel: &[u8], initrd_len: u64, ram: u64) -> Result<(u64, u64)> {
     const MIB2: u64 = 2 << 20;
     const LOW_RAM_MAX: u64 = 3 << 30;
@@ -918,6 +920,9 @@ pub fn hvm_layout(kernel: &[u8], initrd_len: u64, ram: u64) -> Result<(u64, u64)
         let b = off.checked_add(n).and_then(|end| kernel.get(off..end)).ok_or(Error("kernel: truncated header".into()))?;
         Ok(b.iter().rev().fold(0, |v, &x| v << 8 | x as u64))
     };
+    if let Some(run_end) = arm64_run_end(kernel, &le)? {
+        return arm64_layout(kernel.len() as u64, initrd_len, ram, run_end);
+    }
     let end = if kernel.starts_with(b"\x7fELF") {
         // ELF64 x86-64: its PT_LOAD segments' physical addresses.
         if le(4, 1)? != 2 || le(5, 1)? != 1 || le(18, 2)? != 62 {
@@ -964,6 +969,73 @@ pub fn hvm_layout(kernel: &[u8], initrd_len: u64, ram: u64) -> Result<(u64, u64)
     let top = ram.min(LOW_RAM_MAX);
     if need > top {
         return err(format!("kernel and initrd need {} MiB of RAM below 3 GiB; the VM has {} MiB there", need.div_ceil(1 << 20), top >> 20));
+    }
+    Ok((image, initrd))
+}
+
+/// An AArch64 HVM guest's RAM starts here (l4h_host::hvm::arm::RAM_BASE);
+/// its first 2 MiB hold the device tree, and its kernel runs from the next.
+const ARM64_RAM_BASE: u64 = 0x4000_0000;
+const ARM64_KERNEL_BASE: u64 = ARM64_RAM_BASE + (2 << 20);
+
+/// Where an arm64 `Image` or AArch64 ELF `vmlinux` ends as it runs, as
+/// l4h-hvm's boot.rs lays it out; None for any other image.
+fn arm64_run_end(kernel: &[u8], le: &impl Fn(usize, usize) -> Result<u64>) -> Result<Option<u64>> {
+    const EM_AARCH64: u64 = 183;
+    let past = || Error("kernel: placed past the address space".into());
+    if kernel.starts_with(b"\x7fELF") {
+        if le(18, 2)? != EM_AARCH64 {
+            return Ok(None);
+        }
+        if le(4, 1)? != 2 || le(5, 1)? != 1 {
+            return err("kernel: not a little-endian AArch64 ELF64 image");
+        }
+        let (phoff, phentsize, phnum) = (le(32, 8)? as usize, le(54, 2)? as usize, le(56, 2)? as usize);
+        let (mut low, mut high) = (u64::MAX, 0u64);
+        for i in 0..phnum {
+            let ph = i.checked_mul(phentsize).and_then(|o| phoff.checked_add(o)).ok_or(Error("kernel: bad program headers".into()))?;
+            if le(ph, 4)? == 1 && le(ph + 40, 8)? != 0 {
+                let vaddr = le(ph + 16, 8)?;
+                low = low.min(vaddr);
+                high = high.max(vaddr.checked_add(le(ph + 40, 8)?).ok_or_else(past)?);
+            }
+        }
+        if high == 0 {
+            return err("kernel: ELF image without loadable segments");
+        }
+        return ARM64_KERNEL_BASE.checked_add(high - low).map(Some).ok_or_else(past);
+    }
+    if kernel.len() < 64 || le(56, 4)? != 0x644d_5241 {
+        return Ok(None);
+    }
+    // Before Linux 3.17 image_size is 0: it runs at 512 KiB in 64 MiB or so.
+    let (text, size) = match le(16, 8)? {
+        0 => (0x8_0000, (64u64 << 20).max(kernel.len() as u64)),
+        size => (le(8, 8)?, size),
+    };
+    if text >= 2 << 20 {
+        return err("kernel: arm64 Image with a text offset past 2 MiB");
+    }
+    ARM64_KERNEL_BASE.checked_add(text).and_then(|a| a.checked_add(size)).map(Some).ok_or_else(past)
+}
+
+/// Stage an arm64 kernel and initrd above where it runs, each 2 MiB
+/// aligned, in the guest's one range of RAM.
+fn arm64_layout(kernel_len: u64, initrd_len: u64, ram: u64, run_end: u64) -> Result<(u64, u64)> {
+    const MIB2: u64 = 2 << 20;
+    let past = || Error("kernel: placed past the address space".into());
+    let image = run_end.checked_next_multiple_of(MIB2).ok_or_else(past)?;
+    let initrd = image.checked_add(kernel_len).and_then(|e| e.checked_next_multiple_of(MIB2)).ok_or_else(past)?;
+    let need = initrd.checked_add(initrd_len).ok_or_else(past)?;
+    let top = ARM64_RAM_BASE.checked_add(ram).ok_or_else(past)?;
+    if need > top {
+        return err(format!("kernel and initrd need {} MiB of RAM; the VM has {} MiB", (need - ARM64_RAM_BASE).div_ceil(1 << 20), ram >> 20));
+    }
+    // arm64/booting.rst: the initrd is in the 1 GiB-aligned 32 GiB window
+    // that has the kernel's start.
+    let window = ARM64_KERNEL_BASE & !((1u64 << 30) - 1);
+    if initrd_len != 0 && (initrd < window || need > window + (32u64 << 30)) {
+        return err("kernel: the initrd would end past the kernel's 32 GiB window");
     }
     Ok((image, initrd))
 }
@@ -2003,6 +2075,79 @@ mod hvm_layout_tests {
         assert!(hvm_layout(&k, 3 * 1024 * MIB, 8192 * MIB).is_err());
         assert!(hvm_layout(b"not a kernel", 0, 128 * MIB).is_err());
         assert!(hvm_layout(&[0u8; 16], 0, 128 * MIB).is_err());
+    }
+
+    /// An arm64 Image header.
+    fn image(len: usize, text: u64, size: u64) -> Vec<u8> {
+        let mut k = vec![0u8; len];
+        k[8..16].copy_from_slice(&text.to_le_bytes());
+        k[16..24].copy_from_slice(&size.to_le_bytes());
+        k[56..60].copy_from_slice(&0x644d_5241u32.to_le_bytes());
+        k
+    }
+
+    const ARM_RAM: u64 = 0x4000_0000;
+
+    #[test]
+    fn arm64_image_goes_above_where_it_runs() {
+        // It runs from RAM + 2 MiB + its text offset, for image_size.
+        let k = image(10 * MIB as usize, 0, 30 * MIB);
+        assert_eq!(hvm_layout(&k, 5 * MIB, 128 * MIB).unwrap(), (ARM_RAM + 32 * MIB, ARM_RAM + 42 * MIB));
+        let k = image(10 * MIB as usize, 0x8_0000, 30 * MIB);
+        assert_eq!(hvm_layout(&k, 0, 128 * MIB).unwrap().0, ARM_RAM + 34 * MIB, "rounded up to 2 MiB");
+        // An old Image, with no size: at 512 KiB, in 64 MiB.
+        let k = image(MIB as usize, 123, 0);
+        assert_eq!(hvm_layout(&k, 0, 128 * MIB).unwrap().0, (ARM_RAM + 2 * MIB + 0x8_0000 + 64 * MIB).next_multiple_of(2 * MIB));
+    }
+
+    #[test]
+    fn arm64_refused_layouts() {
+        let k = image(10 * MIB as usize, 0, 30 * MIB);
+        assert!(hvm_layout(&k, 100 * MIB, 128 * MIB).is_err(), "more than its RAM");
+        assert!(hvm_layout(&k, u64::MAX - 8, u64::MAX).is_err());
+        assert!(hvm_layout(&image(4096, 2 * MIB, MIB), 0, 128 * MIB).is_err(), "text offset past a block");
+        assert!(hvm_layout(&image(4096, 0, u64::MAX), 0, 128 * MIB).is_err());
+        // Anything else is still looked at as an x86-64 image.
+        assert!(hvm_layout(&[0u8; 64], 0, 128 * MIB).is_err());
+    }
+
+    #[test]
+    fn arm64_initrd_stays_in_the_kernels_window() {
+        const GIB: u64 = 1 << 30;
+        let run_end = ARM_RAM + 32 * MIB;
+        let ram = 64 * GIB;
+        // The kernel takes up to 2 MiB under the window's end.
+        let fits = 32 * GIB - 34 * MIB;
+        let (_, initrd) = arm64_layout(fits, MIB, ram, run_end).unwrap();
+        assert_eq!(initrd + MIB, ARM_RAM + 32 * GIB - MIB, "inside it");
+        assert!(arm64_layout(fits, 2 * MIB, ram, run_end).is_ok(), "up to its end");
+        assert!(arm64_layout(fits, 2 * MIB + 1, ram, run_end).is_err(), "across it");
+        assert!(arm64_layout(33 * GIB, 4096, ram, run_end).is_err(), "past it");
+        assert!(arm64_layout(33 * GIB, 0, ram, run_end).is_ok(), "no initrd: nothing to place");
+    }
+
+    #[test]
+    fn arm64_elf_goes_above_its_segments() {
+        let mut k = vec![0u8; 4096];
+        k[..4].copy_from_slice(b"\x7fELF");
+        k[4] = 2;
+        k[5] = 1;
+        k[18] = 183;
+        k[32..40].copy_from_slice(&64u64.to_le_bytes());
+        k[54..56].copy_from_slice(&56u16.to_le_bytes());
+        k[56..58].copy_from_slice(&2u16.to_le_bytes());
+        let base = 0xffff_8000_8000_0000u64;
+        for (i, (vaddr, memsz)) in [(base, 20 * MIB), (base + 24 * MIB, 3 * MIB)].into_iter().enumerate() {
+            let ph = 64 + 56 * i;
+            k[ph..ph + 4].copy_from_slice(&1u32.to_le_bytes());
+            k[ph + 16..ph + 24].copy_from_slice(&vaddr.to_le_bytes());
+            k[ph + 40..ph + 48].copy_from_slice(&memsz.to_le_bytes());
+        }
+        // 27 MiB of it, from RAM + 2 MiB.
+        assert_eq!(hvm_layout(&k, 0, 128 * MIB).unwrap().0, ARM_RAM + 30 * MIB);
+        // A big-endian one is refused.
+        k[5] = 2;
+        assert!(hvm_layout(&k, 0, 128 * MIB).is_err());
     }
 
     #[test]

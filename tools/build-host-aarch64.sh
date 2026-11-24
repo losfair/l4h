@@ -35,6 +35,12 @@ python3 "$root/tools/mkdrivers.py" "$out/stripped/l4h-drivers.bin.new" "${driver
 cmp -s "$out/stripped/l4h-drivers.bin.new" "$out/stripped/l4h-drivers.bin" \
     && rm "$out/stripped/l4h-drivers.bin.new" || mv "$out/stripped/l4h-drivers.bin.new" "$out/stripped/l4h-drivers.bin"
 export L4H_DRIVERS_BIN=$out/stripped/l4h-drivers.bin
+# HVM guests' monitor, built into vmmgr for a kernel with FL4's VCPUs and
+# Stage-2 roots (a C seL4 without them has no HVM guests).
+if grep -q seL4_ARM_Stage2VSpaceObject "$SEL4_PREFIX/libsel4/include/sel4/arch/objecttype.h" 2>/dev/null; then
+    "$root/tools/cargo.sh" build "${l4h_cargo[@]}" -q "${l4h_cargo_profile[@]}" --target aarch64-sel4 -p l4h-hvm
+    strip hvm
+fi
 "$root/tools/cargo.sh" build "${l4h_cargo[@]}" -q "${l4h_cargo_profile[@]}" --target aarch64-sel4 -p l4h-vmmgr
 strip vmmgr
 "$root/tools/cargo.sh" build "${l4h_cargo[@]}" -q "${l4h_cargo_profile[@]}" --target aarch64-sel4-roottask -p l4h-root "$@"

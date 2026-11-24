@@ -1,5 +1,6 @@
-//! An HVM guest's RAM as l4h-hvm sees it: GPA g at RAM_VA + g, low RAM and
-//! the RAM above 4 GiB (the hole between is never mapped).  A 2 MiB block
+//! An HVM guest's RAM as l4h-hvm sees it: GPA g at RAM_VA + g.  On x86-64,
+//! low RAM and the RAM above 4 GiB (the hole between is never mapped); on
+//! AArch64 one contiguous range from `ram_base`.  A 2 MiB block
 //! is mapped the first time anything here touches it (`map`): the RAM the
 //! guest has not touched yet need not be backed (DESIGN.md §5.11).  The
 //! virtqueue code of l4h-vmm (virtq.rs), which this crate shares, takes it
@@ -15,6 +16,9 @@ pub const HIGH_RAM_BASE: u64 = 4 << 30;
 pub struct GuestMem {
     /// Where GPA 0 is mapped.
     pub base: usize,
+    /// The GPA of the RAM's first byte: 0 on x86-64, hvm::arm::RAM_BASE on
+    /// AArch64 (which has all of its RAM in `low`).
+    pub ram_base: u64,
     /// Bytes of RAM below the hole, and from 4 GiB on.
     pub low: u64,
     pub high: u64,
@@ -27,14 +31,15 @@ pub struct GuestMem {
 impl GuestMem {
     /// The block holding RAM GPA `gpa`.
     pub fn block_of(&self, gpa: u64) -> usize {
-        let off = if gpa < self.low { gpa } else { gpa - HIGH_RAM_BASE + self.low };
+        let g = gpa - self.ram_base;
+        let off = if g < self.low { g } else { g - HIGH_RAM_BASE + self.low };
         (off >> BLOCK_SHIFT) as usize
     }
 
     /// The GPA of block `b`.
     pub fn block_gpa(&self, b: usize) -> u64 {
         let off = (b as u64) << BLOCK_SHIFT;
-        if off < self.low { off } else { off - self.low + HIGH_RAM_BASE }
+        self.ram_base + if off < self.low { off } else { off - self.low + HIGH_RAM_BASE }
     }
 
     pub fn blocks(&self) -> usize {
@@ -53,7 +58,9 @@ impl GuestMem {
     /// Whether [gpa, gpa + len) is RAM, all on one side of the hole.
     pub fn is_ram(&self, gpa: u64, len: u64) -> bool {
         let Some(end) = gpa.checked_add(len) else { return false };
-        end <= self.low || (gpa >= HIGH_RAM_BASE && end - HIGH_RAM_BASE <= self.high)
+        let Some(g) = gpa.checked_sub(self.ram_base) else { return false };
+        let end = end - self.ram_base;
+        end <= self.low || (self.high != 0 && g >= HIGH_RAM_BASE && end - HIGH_RAM_BASE <= self.high)
     }
 
     /// Whether [gpa, gpa + len) is RAM, mapping its blocks.
@@ -144,13 +151,13 @@ pub mod tests {
         let words = (((low + high) >> BLOCK_SHIFT) as usize).div_ceil(64).max(1);
         let mapped: &'static [AtomicU64] = Vec::leak((0..words).map(|_| AtomicU64::new(u64::MAX)).collect());
         // High RAM is only exercised in bounds checks: base is the buffer.
-        (GuestMem { base: buf.as_ptr() as usize, low, high, mapped, map: |_| false }, buf)
+        (GuestMem { base: buf.as_ptr() as usize, ram_base: 0, low, high, mapped, map: |_| false }, buf)
     }
 
     #[test]
     fn bounds_and_blocks() {
         let mapped: &'static [AtomicU64] = Vec::leak(std::vec![AtomicU64::new(0)]);
-        let m = GuestMem { base: 0, low: 3 << 30, high: 1 << 30, mapped, map: |b| b != 5 };
+        let m = GuestMem { base: 0, ram_base: 0, low: 3 << 30, high: 1 << 30, mapped, map: |b| b != 5 };
         assert!(m.is_ram(0, 3 << 30));
         assert!(!m.is_ram((3 << 30) - 1, 2), "into the hole");
         assert!(m.is_ram(4 << 30, 1 << 30));
@@ -164,5 +171,23 @@ pub mod tests {
         assert!(m.valid(0x40_0000, 0x20_0000));
         assert!(!m.valid(0xa0_0000, 1), "block 5");
         assert!(m.valid(0, 0));
+    }
+
+    /// AArch64's RAM: one range from `ram_base`, block 0 at its first byte.
+    #[test]
+    fn ram_from_a_base() {
+        let mapped: &'static [AtomicU64] = Vec::leak(std::vec![AtomicU64::new(u64::MAX)]);
+        let base = 0x4000_0000;
+        let m = GuestMem { base: 0, ram_base: base, low: 1 << 30, high: 0, mapped, map: |_| false };
+        assert!(m.is_ram(base, 1 << 30));
+        assert!(!m.is_ram(base - 1, 1), "below the RAM");
+        assert!(!m.is_ram(base - 1, 2), "across its start");
+        assert!(!m.is_ram(base + (1 << 30), 1), "past its end");
+        assert!(!m.is_ram(base + (4 << 30), 0), "no high RAM");
+        assert!(!m.is_ram(u64::MAX, 2));
+        assert_eq!(m.block_of(base), 0);
+        assert_eq!(m.block_of(base + 0x20_0000), 1);
+        assert_eq!(m.block_gpa(1), base + 0x20_0000);
+        assert_eq!(m.blocks(), 512);
     }
 }

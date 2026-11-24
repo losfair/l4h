@@ -1,28 +1,40 @@
 #!/bin/sh
 slow=${L4H_TEST_SLOW:-1}
-# dom0 init for tests/run-hvmtest.sh: HVM guests (DESIGN.md §5.11), an
-# unmodified x86-64 Linux, through l4hctl.
+# dom0 init for tests/run-hvmtest.sh and run-hvmtest-arm64.sh: HVM guests
+# (DESIGN.md §5.11), an unmodified Linux, through l4hctl.
 mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
 mount -t tmpfs tmp /tmp
 fail() { echo "HVMTEST: FAIL: $*"; l4hctl list; poweroff -f; }
-free() { l4hctl info | sed -n 's/memory: \([0-9]*\) MiB free.*/\1/p'; }
+free() { l4hctl info --free-bytes; }
+number() { case "$1" in ''|*[!0-9]*) fail "free memory: '$1'";; esac; }
+# All of it back within 10 s: root frees a destroyed guest's channels and
+# port memory only once blkd and netd have removed it (its Zombie), after
+# `destroy` has returned.
+reclaim() {
+    i=0
+    while now=$(free); number "$now"; [ "$now" != "$free0" ]; do
+        i=$((i + 1)); [ $i -lt $((50 * slow)) ] || fail "memory leak: $free0 -> $now bytes"; sleep 0.2
+    done
+}
 # console ID PATTERN SECS: the console until PATTERN, into /tmp/out.
 console() { l4hctl console "$1" --until "$2" --timeout "$(($3 * slow))" > /tmp/out || { cat /tmp/out; fail "vm $1: no '$2'"; }; }
 expect() { grep -q "$1" /tmp/out || { cat /tmp/out; fail "$2"; }; }
+# The guest's kernel, and the console of the machine it gets.
+if [ -e /bin/Image ]; then kernel=/bin/Image; con=ttyAMA0; else kernel=/bin/bzImage; con=ttyS0; fi
 echo "HVMTEST: start"
 l4hctl info
-# Without the CPU's virtualization, HVM guests are refused (-ENODEV) and
-# the test has nothing more to check.
-if ! l4hctl create probe --hvm --kernel /bin/bzImage --mem 256 --cmdline "console=ttyS0 HVM=probe" > /tmp/id 2>/tmp/err; then
+# Without the CPU's virtualization (VT-x, AMD-V, EL2), HVM guests are
+# refused (-ENODEV) and the test has nothing more to check.
+if ! l4hctl create probe --hvm --kernel "$kernel" --mem 256 --cmdline "console=$con HVM=probe" > /tmp/id 2>/tmp/err; then
     cat /tmp/err
-    grep -q "unsupported device" /tmp/err && { echo "HVMTEST: no VT-x or AMD-V"; poweroff -f; }
+    grep -q "unsupported device" /tmp/err && { echo "HVMTEST: no hardware virtualization"; poweroff -f; }
     fail "probe create"
 fi
 l4hctl destroy "$(cat /tmp/id)" || fail "destroy probe"
 # What HVM guests do not have.
-if l4hctl create nogpu --hvm --kernel /bin/bzImage --mem 256 --gpu 64x64 2>/tmp/err; then fail "HVM guest with a GPU"; fi
+if l4hctl create nogpu --hvm --kernel "$kernel" --mem 256 --gpu 64x64 2>/tmp/err; then fail "HVM guest with a GPU"; fi
 grep -q "not supported by this kind of VM" /tmp/err || { cat /tmp/err; fail "GPU refusal"; }
 l4hctl list | grep -q nogpu && fail "refused VM left behind"
 
@@ -31,17 +43,22 @@ sw=$(l4hctl switch-create) || fail "switch-create"
 peer=$(l4hctl create peer --initrd /bin/netvm.cpio.gz --mem 96 --nic "$sw" \
     --cmdline "console=hvc0 IP0=192.168.9.1/24") || fail "create peer"
 console "$peer" "NETVM: done" 120
+# Guest slot 2 is the first past a 2 MiB boundary of vmmgr's GUEST_PAGES: its
+# page table stays for good once made, so it is made before the baseline.
+warm=$(l4hctl create warm --hvm --kernel "$kernel" --mem 256 --cmdline "console=$con HVM=probe") || fail "warm create"
+l4hctl destroy "$warm" || fail "destroy warm"
 free0=$(free)
-echo "HVMTEST: $free0 MiB free"
+number "$free0"
+echo "HVMTEST: $free0 bytes free"
 # A marker in the disk's first 4 KiB (disk-write takes whole 4 KiB blocks).
 printf 'HVMMARK-l4h-disk' > /tmp/mark
 dd if=/dev/zero bs=1 count=$((4096 - 16)) >> /tmp/mark 2>/dev/null
 [ "$(wc -c < /tmp/mark)" -eq 4096 ] || fail "marker size"
 l4hctl disk-write 0 0 /tmp/mark || fail "disk-write"
 
-# 1: two vCPUs, disk, network, console, the ACPI power button.
-id=$(l4hctl create hvm1 --hvm --kernel /bin/bzImage --initrd /bin/hvmvm.cpio.gz --mem 256 --vcpus 2 \
-    --disk 0 --nic "$sw" --cmdline "console=ttyS0 DISK=write IP0=192.168.9.2/24 PING=192.168.9.1 BURN=3") \
+# 1: two vCPUs, disk, network, console, the power button.
+id=$(l4hctl create hvm1 --hvm --kernel "$kernel" --initrd /bin/hvmvm.cpio.gz --mem 256 --vcpus 2 \
+    --disk 0 --nic "$sw" --cmdline "console=$con DISK=write IP0=192.168.9.2/24 PING=192.168.9.1 BURN=3") \
     || fail "create hvm1"
 echo "HVMTEST: created vm $id"
 l4hctl list | grep -q "hvm1 .* hvm" || { l4hctl list; fail "list does not show hvm"; }
@@ -62,18 +79,18 @@ i=0
 until l4hctl list | grep -q "hvm1 .* stopped"; do
     i=$((i + 1)); [ $i -lt 600 ] || fail "hvm1 did not stop"; sleep 0.1
 done
-echo "HVMTEST: ACPI shutdown ok"
+echo "HVMTEST: power button shutdown ok"
 l4hctl destroy "$id" || fail "destroy hvm1"
-[ "$(free)" = "$free0" ] || fail "memory leak: $free0 -> $(free) MiB"
+reclaim
 echo "HVMTEST: hvm1 reclaimed"
 
 # 2: the disk keeps what hvm1 wrote; destroyed while it runs.
-id=$(l4hctl create hvm2 --hvm --kernel /bin/bzImage --initrd /bin/hvmvm.cpio.gz --mem 192 --vcpus 1 \
-    --disk 0 --cmdline "console=ttyS0 DISK=check") || fail "create hvm2"
+id=$(l4hctl create hvm2 --hvm --kernel "$kernel" --initrd /bin/hvmvm.cpio.gz --mem 192 --vcpus 1 \
+    --disk 0 --cmdline "console=$con DISK=check") || fail "create hvm2"
 console "$id" "HVMVM: ready" 900
 expect "HVMVM: disk check ok" "disk persistence"
 l4hctl destroy "$id" || fail "destroy hvm2"
-[ "$(free)" = "$free0" ] || fail "memory leak: $free0 -> $(free) MiB"
+reclaim
 echo "HVMTEST: hvm2 destroyed running and reclaimed"
 l4hctl destroy "$peer"
 echo "HVMTEST: PASS"

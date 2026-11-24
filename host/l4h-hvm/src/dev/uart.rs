@@ -28,14 +28,7 @@ const MCR_OUT2: u8 = 1 << 3;
 const FCR_ENABLE: u8 = 1 << 0;
 const FCR_CLEAR_RX: u8 = 1 << 1;
 
-/// Where the UART's bytes go and come from.
-pub trait Io {
-    fn transmit(&mut self, b: u8);
-    /// The next received byte, if any, without taking it.
-    fn peek(&mut self) -> Option<u8>;
-    /// Take the byte `peek` gave.
-    fn take(&mut self);
-}
+pub use crate::console::ConsoleIo as Io;
 
 pub struct Uart {
     ier: u8,

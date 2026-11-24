@@ -1,5 +1,5 @@
 // Embeds guests' l4h-vmm ($L4H_VMM_ELF) and HVM guests' l4h-hvm
-// ($L4H_HVM_ELF, x86_64 only), built by tools/build-host.sh: an empty
+// ($L4H_HVM_ELF), built by tools/build-host.sh: an empty
 // placeholder when unset (no HVM guests then).
 use std::{env, fs, path::PathBuf};
 

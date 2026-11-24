@@ -149,7 +149,7 @@ fn cmd_logs(ctl: &Ctl, follow: bool) -> Result<()> {
 const USAGE: &str = "usage: l4hctl <command>
   version                      running host's build version
   logs [--follow]              retained host diagnostics, faults and VM stops
-  info                         host resources
+  info [--free-bytes]          host resources (or only the free bytes)
   iommu                        IOMMU state: DMA and interrupts confined,
                                devices, logged faults
   host-reboot                  reset the machine (every guest stops; sync
@@ -683,7 +683,16 @@ fn run(args: &[String]) -> Result<i32> {
             cmd_logs(&ctl, follow)?;
         }
         "info" => {
+            let free_bytes = match &args[1..] {
+                [] => false,
+                [arg] if arg == "--free-bytes" => true,
+                _ => return err("info [--free-bytes]"),
+            };
             let info = ctl.host_info()?;
+            if free_bytes {
+                println!("{}", info.free);
+                return Ok(0);
+            }
             // install.py and the cloud test inits parse this line.
             println!("cores:  {}", info.cores);
             if info.physical_cores != info.cores {

@@ -79,6 +79,7 @@ impl<T> Global<T> {
     }
 
     /// Whether it has been set.
+    #[cfg_attr(target_arch = "aarch64", allow(dead_code))] // x86-64's vCPU loop
     pub fn is_set(&'static self) -> bool {
         self.1.load(Ordering::Acquire)
     }
