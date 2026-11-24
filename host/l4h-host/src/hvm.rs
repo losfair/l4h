@@ -9,19 +9,21 @@
 //! netd), the console and the slow paths of the virtual platform.  Unlike
 //! l4h-vmm it maps its guest's RAM, which it reads to emulate devices and
 //! instructions; it is trusted by its guest only, and confined like the
-//! guest: its threads have a maximum controlled priority of PRIO_KERNEL,
+//! guest: its threads have a maximum controlled priority of PRIO_USER,
 //! below the debug syscalls' threshold (DESIGN.md §4.1).
 
 use l4h_abi as abi;
 
 use crate::badges::hvm as recv;
 
-/// The I/O thread's priority (as a VMM's) and the maximum controlled
-/// priority of every thread of the component: a guest that took over its
-/// l4h-hvm gets no more authority than a guest kernel has.
+/// The I/O thread services devices at the priority of a VMM.
 pub const PRIO_IO: u64 = crate::PRIO_VMM;
-pub const MCP: u64 = abi::PRIO_KERNEL;
-const _: () = assert!(MCP == abi::PRIO_KERNEL && PRIO_IO > MCP);
+/// One vCPU executes both guest kernel and user code. It shares CPU time
+/// with runnable PV user threads on the same core.
+pub const PRIO_VCPU: u64 = abi::PRIO_USER;
+/// Only vmmgr can give an HVM thread a higher priority (for device I/O).
+pub const MCP: u64 = PRIO_VCPU;
+const _: () = assert!(MCP < abi::PRIO_KERNEL && PRIO_IO > abi::PRIO_KERNEL);
 
 /// Guest-physical layout.  RAM below the 32-bit hole, [0, LOW_RAM_MAX),
 /// and the rest from 4 GiB on; the hole holds the PCI MMIO window, ECAM,

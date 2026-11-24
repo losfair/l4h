@@ -515,7 +515,7 @@ pub fn spawn(
         component::try_create(&args, alloc, &mut g.arena, win, &mut |alloc, vspace| asids.assign(alloc, vspace),
             &host_info.spawn_context(core))
     })?;
-    // Its threads raise no priority above a guest kernel's.
+    // The I/O thread may only assign priorities up to the vCPU priority.
     comp.tcb.tcb_set_mc_priority(slot::TCB.cap(), hv::MCP)?;
     map(g, &comp, alloc);
     vcpus(g, &comp, alloc, host_info)?;
@@ -698,7 +698,7 @@ fn vcpus(g: &mut Guest, comp: &Component, alloc: &mut Alloc, host_info: &HostInf
         let fault = alloc.slots.alloc();
         mint_edge(&abs(self_cap::<cap_type::Null>(fault)), &wiring::HVM_FAULT, g.id,
             &Obj::claim(p::Vmmgr, o::Endpoint, abs(host_info.hyp_ep)))?;
-        let r = ktcb.tcb_set_sched_params(slot::TCB.cap(), hv::MCP, abi::PRIO_KERNEL, sc_k, self_cap::<cap_type::Endpoint>(fault));
+        let r = ktcb.tcb_set_sched_params(slot::TCB.cap(), hv::MCP, hv::PRIO_VCPU, sc_k, self_cap::<cap_type::Endpoint>(fault));
         let _ = abs(self_cap::<cap_type::Null>(fault)).delete();
         alloc.slots.free(fault);
         r?;
