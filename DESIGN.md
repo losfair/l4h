@@ -684,13 +684,13 @@ marked dirty, which reaches the uTCB through WriteRegisters. With `KernelFSGSBas
   guest takes the timer badge itself as the expiry, not only `rdtsc` past
   the deadline.
 - The wall clock at boot comes from `L4H_HC_GET_TIME`: root reads the CMOS
-  RTC (PL031 on aarch64) once at boot, and each VMM adds the TSC time
-  since; without an RTC it is the epoch. Guests may correct it with NTP.
+  RTC (PL031 on aarch64) when a VMM starts. Secondary partitions use the
+  latest RTC sample from partition 0. Each VMM adds elapsed counter time
+  to its sample. Guests may correct their clocks with NTP.
   dom0 can save its time to the machine RTC with `l4hctl rtc-set`
   (`CTL_RTC_SET`, UTC epoch seconds); on x86 root inhibits calendar updates
   while writing, preserves the data and hour modes, and writes a century
-  register only if the FADT advertises one. The write affects the next host
-  boot, not the running host's anchor or guests' clocks.
+  register only if the FADT advertises one. Running VMMs keep their anchors.
 
 **Signals.** The kernel builds the native `rt_sigframe` in user memory
 through the direct map, fetches FPU and XSAVE state with E2, and rewrites

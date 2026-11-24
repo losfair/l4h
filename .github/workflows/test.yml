@@ -103,6 +103,8 @@ jobs:
         run: tests/run-schedtest.sh
       - name: Build Linux
         run: tools/build-linux.sh vmlinux && ccache -s
+      - name: RTC updates and new guest clocks
+        run: tests/run-rtctest.sh --qemu
       - name: Console rings, hotplug scheduling and hypercalls under console load
         run: tests/run-devicetest.sh --qemu
       - name: Retained host logs and serial output in release mode

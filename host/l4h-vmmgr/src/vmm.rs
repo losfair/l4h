@@ -148,8 +148,7 @@ fn create(
     cfg.dom0 = g.dom0 as u32;
     // Guest console lines are queued for logd in every build.
     cfg.serial = 1;
-    cfg.epoch_ns = host_info.epoch_ns;
-    cfg.epoch_ticks = host_info.epoch_ticks;
+    [cfg.epoch_ns, cfg.epoch_ticks] = host_info.clock_anchor;
     cfg.mem_dev = g.mem_dev.map_or(0, |d| d as u32 + 1);
     cfg.hp_count = g.hp_count as u32;
     cfg.mem_event = g.mem_dev.map_or(0, dev_event);

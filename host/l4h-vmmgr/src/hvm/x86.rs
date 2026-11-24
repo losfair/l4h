@@ -485,8 +485,7 @@ fn configure(g: &Guest, cfg: &mut hv::HvmConfig, host_info: &HostInfo) {
     (cfg.kernel_gpa, cfg.kernel_size) = boot.kernel;
     (cfg.initrd_gpa, cfg.initrd_size) = boot.initrd;
     cfg.boot_flags = boot.flags;
-    cfg.epoch_ns = host_info.epoch_ns;
-    cfg.epoch_ticks = host_info.epoch_ticks;
+    [cfg.epoch_ns, cfg.epoch_ticks] = host_info.clock_anchor;
     cfg.serial = 1;
     cfg.cmdline = boot.cmdline;
     let mut n = 0;

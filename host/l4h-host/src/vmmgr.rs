@@ -244,8 +244,6 @@ pub struct VmmgrConfig {
     pub cores: u64,
     pub tsc_hz: u64,
     pub timeslice_us: u64,
-    pub epoch_ns: u64,
-    pub epoch_ticks: u64,
     pub cpu_id: [u64; 5],
     /// The topology (sched::topology::Topology): CPUs, each CPU's physical
     /// core, the placement order.

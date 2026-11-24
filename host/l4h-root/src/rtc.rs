@@ -52,7 +52,7 @@ impl Rtc {
             |p| unsafe { (p as *const u32).read_volatile() as u64 * 1_000_000_000 })) }
     }
 
-    /// Set the RTC only: the boot-time anchor used by VMMs is unchanged.
+    /// Set the hardware RTC. Running VMMs keep their clock anchors.
     pub fn set_secs(&self, _win: &mut Window, seconds: u64) -> Result<(), Errno> {
         #[cfg(target_arch = "x86_64")]
         {
