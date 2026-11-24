@@ -1,4 +1,6 @@
-Refresh kemu patch context for Linux 6.18.y (exec.c gained futex.h).
+Refresh kemu patch context for Linux 6.18.y (exec.c gained futex.h;
+6.18.65 dup_mm() takes the mmap lock of oldmm around the memcpy and
+mm_init()).
 
 --- a/0007-kemu-fork-exit-exec.patch
 +++ b/0007-kemu-fork-exit-exec.patch
@@ -11,3 +13,24 @@ Refresh kemu patch context for Linux 6.18.y (exec.c gained futex.h).
  @@ -869,6 +870,7 @@ static int exec_mmap(struct mm_struct *mm)
   			return ret;
   		}
+@@ -58,16 +58,16 @@
+  	mm_put_huge_zero_folio(mm);
+  	set_mm_exe_file(mm, NULL);
+  	if (!list_empty(&mm->mmlist)) {
+-@@ -1481,6 +1483,9 @@ static struct mm_struct *dup_mm(struct task_struct *tsk,
+- 		goto fail_nomem;
++@@ -1494,6 +1496,9 @@ static struct mm_struct *dup_mm(struct task_struct *tsk,
++ 	}
+  
+  	memcpy(mm, oldmm, sizeof(*mm));
+ +#ifdef CONFIG_KEMU
+ +	mm->kemu = NULL;
+ +#endif
+  
+- 	if (!mm_init(mm, tsk, mm->user_ns))
+- 		goto fail_nomem;
++ 	if (!mm_init(mm, tsk, mm->user_ns)) {
++ 		mmap_write_unlock(oldmm);
+ @@ -1491,6 +1496,12 @@ static struct mm_struct *dup_mm(struct task_struct *tsk,
+  		goto free_pt;
+  	uprobe_end_dup_mmap();

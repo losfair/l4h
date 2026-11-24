@@ -14,7 +14,8 @@ and l4h, whose guest kernel runs at EL0, does not have:
 - the upper half of the address space: emit_addr_mov_i64() assumes
   kernel addresses have their top 16 bits set;
 - arch_bpf_stack_walk(), for BPF exceptions;
-- set_memory_*(): guest-kernel memory is writable.
+- the text patching fixmap behind aarch64_insn_write_literal_u64():
+  guest-kernel memory is writable.
 
 insn.c gets ALIGN_DOWN from <linux/align.h> rather than through arm64's
 asm/esr.h.
@@ -44,7 +45,7 @@ asm/esr.h.
 +endif
 --- a/arch/arm64/net/bpf_jit_comp.c
 +++ b/arch/arm64/net/bpf_jit_comp.c
-@@ -191,7 +191,8 @@
+@@ -190,7 +190,8 @@
  /*
   * Kernel addresses in the vmalloc space use at most 48 bits, and the
   * remaining bits are guaranteed to be 0x1. So we can compose the address
@@ -54,7 +55,7 @@ asm/esr.h.
   */
  static inline void emit_addr_mov_i64(const int reg, const u64 val,
  				     struct jit_ctx *ctx)
-@@ -199,7 +200,11 @@
+@@ -198,7 +199,11 @@
  	u64 tmp = val;
  	int shift = 0;
  
@@ -66,7 +67,7 @@ asm/esr.h.
  	while (shift < 32) {
  		tmp >>= 16;
  		shift += 16;
-@@ -997,6 +1002,7 @@
+@@ -996,6 +1001,7 @@
  /* Clobbers BPF registers 1-4, aka x0-x3 */
  static void __maybe_unused build_bhb_mitigation(struct jit_ctx *ctx)
  {
@@ -74,7 +75,7 @@ asm/esr.h.
  	const u8 r1 = bpf2a64[BPF_REG_1]; /* aka x0 */
  	u8 k = get_spectre_bhb_loop_value();
  
-@@ -1036,6 +1042,7 @@
+@@ -1035,6 +1041,7 @@
  			pr_err_once("Firmware mitigation enabled with unknown conduit\n");
  		}
  	}
@@ -82,7 +83,7 @@ asm/esr.h.
  }
  
  static void build_epilogue(struct jit_ctx *ctx, bool was_classic)
-@@ -1094,6 +1101,7 @@
+@@ -1093,6 +1100,7 @@
  #define BPF_FIXUP_REG_MASK	GENMASK(31, 27)
  #define DONT_CLEAR 5 /* Unused ARM64 register from BPF's POV */
  
@@ -90,7 +91,7 @@ asm/esr.h.
  bool ex_handler_bpf(const struct exception_table_entry *ex,
  		    struct pt_regs *regs)
  {
-@@ -1204,6 +1212,27 @@
+@@ -1203,6 +1211,27 @@
  	ctx->exentry_idx++;
  	return 0;
  }
@@ -118,7 +119,7 @@ asm/esr.h.
  
  /* JITs an eBPF instruction.
   * Returns:
-@@ -1583,7 +1612,8 @@
+@@ -1582,7 +1611,8 @@
  		u32 cpu_offset;
  
  		/* Implement helper call to bpf_get_smp_processor_id() inline */
@@ -128,7 +129,7 @@ asm/esr.h.
  			cpu_offset = offsetof(struct thread_info, cpu);
  
  			emit(A64_MRS_SP_EL0(tmp), ctx);
-@@ -1597,7 +1627,8 @@
+@@ -1596,7 +1626,8 @@
  		}
  
  		/* Implement helper call to bpf_get_current_task/_btf() inline */
@@ -138,7 +139,7 @@ asm/esr.h.
  					   insn->imm == BPF_FUNC_get_current_task_btf)) {
  			emit(A64_MRS_SP_EL0(r0), ctx);
  			break;
-@@ -2253,7 +2284,8 @@
+@@ -2252,7 +2283,8 @@
  
  bool bpf_jit_supports_private_stack(void)
  {
@@ -148,23 +149,23 @@ asm/esr.h.
  }
  
  bool bpf_jit_supports_kfunc_call(void)
-@@ -2995,10 +3027,15 @@
- 		/* non-zero plt_target indicates we're patching a bpf prog,
- 		 * which is read only.
- 		 */
+@@ -3003,9 +3035,15 @@
+ 	 * it will be brought back by dummy_tramp, so no barrier is
+ 	 * required here.
+ 	 */
 +#ifdef CONFIG_L4H
-+		/* Guest-kernel memory is writable. */
++	/* Guest-kernel memory is writable. */
++	if (plt_target)
 +		WRITE_ONCE(plt->target, plt_target);
 +#else
- 		if (set_memory_rw(PAGE_MASK & ((uintptr_t)&plt->target), 1))
- 			return -EFAULT;
- 		WRITE_ONCE(plt->target, plt_target);
- 		set_memory_ro(PAGE_MASK & ((uintptr_t)&plt->target), 1);
+ 	if (plt_target &&
+ 	    aarch64_insn_write_literal_u64(&plt->target, plt_target))
+ 		return -EFAULT;
 +#endif
- 		/* since plt target points to either the new trampoline
- 		 * or dummy_tramp, even if another CPU reads the old plt
- 		 * target value before fetching the bl instruction to plt,
-@@ -3057,13 +3094,15 @@
+ 
+ 	/* if the old target and the new target are both long jumps, no
+ 	 * patching is required
+@@ -3057,13 +3095,15 @@
  	 * call and BPF frames. Therefore we require FP unwinder to be enabled
  	 * to walk kernel frames and reach BPF frames in the stack trace.
  	 * ARM64 kernel is aways compiled with CONFIG_FRAME_POINTER=y
@@ -182,7 +183,7 @@ asm/esr.h.
  }
  
  bool bpf_jit_supports_insn(struct bpf_insn *insn, bool in_arena)
-@@ -3082,7 +3121,7 @@
+@@ -3082,7 +3122,7 @@
  
  bool bpf_jit_supports_percpu_insn(void)
  {
@@ -191,7 +192,7 @@ asm/esr.h.
  }
  
  bool bpf_jit_bypass_spec_v4(void)
-@@ -3103,6 +3142,8 @@
+@@ -3103,6 +3143,8 @@
  
  bool bpf_jit_inlines_helper_call(s32 imm)
  {
