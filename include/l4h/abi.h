@@ -73,7 +73,7 @@ typedef int64_t l4h_s64;
 /* Per-vCPU objects: root slots L4H_SLOT_VCPU(v) + L4H_VCPU_* */
 #define L4H_SLOT_VCPU_BASE      64
 #define L4H_VCPU_STRIDE         8
-#define L4H_MAX_VCPUS           64
+#define L4H_MAX_VCPUS           128
 #define L4H_SLOT_VCPU(v)        (L4H_SLOT_VCPU_BASE + (v) * L4H_VCPU_STRIDE)
 #define L4H_VCPU_KTCB           0   /* kernel-context TCB */
 #define L4H_VCPU_EP             1   /* fault/IPC endpoint (receive side) */

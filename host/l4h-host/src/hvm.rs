@@ -62,9 +62,11 @@ pub const LAUNCH_ARCH_X86_64: u64 = 1;
 pub const LAUNCH_ARCH_AARCH64: u64 = 2;
 /// What an HVM guest's launch digest starts with (DESIGN.md §10.2).
 pub const LAUNCH_DOMAIN: &[u8] = b"l4h-launch-hvm-v1";
-/// vCPUs at most: their APIC IDs fit xAPIC's 8 bits, and MSI and the I/O
-/// APIC can address every one in physical mode.
-pub const MAX_VCPUS: usize = abi::MAX_VCPUS;
+/// vCPUs at most. x86-64: 64, their APIC IDs fit xAPIC's 8 bits, and MSI
+/// and the I/O APIC can address every one in physical mode. AArch64: every
+/// vCPU a GICv3 redistributor (`arm::GICV2_MAX_VCPUS` on GICv2).
+pub const MAX_VCPUS: usize = if cfg!(target_arch = "aarch64") { abi::MAX_VCPUS } else { 64 };
+const _: () = assert!(MAX_VCPUS <= abi::MAX_VCPUS);
 const _: () = assert!(MAX_VCPUS < 255);
 
 /// The guest-physical address an HVM guest's I/O pool has for blkd: outside
@@ -86,14 +88,16 @@ pub mod arm {
     /// GICv2: the GICv2m MSI frame.
     pub const V2M_BASE: u64 = 0x0802_0000;
     pub const V2M_SIZE: u64 = 0x1000;
-    /// GICv3: the redistributors, GICR_STRIDE each.
-    pub const GICR_BASE: u64 = 0x080a_0000;
-    pub const GICR_STRIDE: u64 = 0x2_0000;
-    pub const GICR_SIZE: u64 = super::MAX_VCPUS as u64 * GICR_STRIDE;
     pub const UART_BASE: u64 = 0x0900_0000;
     pub const RTC_BASE: u64 = 0x0901_0000;
     pub const GPIO_BASE: u64 = 0x0903_0000;
     pub const PRIMECELL_SIZE: u64 = 0x1000;
+    /// GICv3: the redistributors, GICR_STRIDE each: 16 MiB for 128 vCPUs,
+    /// past the PrimeCells (below them, as on QEMU virt, 123 fit).
+    pub const GICR_BASE: u64 = 0x0a00_0000;
+    pub const GICR_STRIDE: u64 = 0x2_0000;
+    pub const GICR_SIZE: u64 = super::MAX_VCPUS as u64 * GICR_STRIDE;
+    pub const GICR_END: u64 = GICR_BASE + GICR_SIZE;
     pub const PCI_MMIO_BASE: u64 = 0x1000_0000;
     pub const PCI_MMIO_SIZE: u64 = 0x2000_0000;
     pub const ECAM_BASE: u64 = 0x3f00_0000;
@@ -136,9 +140,9 @@ pub mod arm {
     }
 
     const _: () = assert!(GICD_BASE + GICD_SIZE <= GICC_BASE && GICC_BASE + GICC_SIZE <= V2M_BASE);
-    const _: () = assert!(V2M_BASE + V2M_SIZE <= GICR_BASE && GICR_BASE + GICR_SIZE <= UART_BASE);
+    const _: () = assert!(V2M_BASE + V2M_SIZE <= UART_BASE);
     const _: () = assert!(UART_BASE + PRIMECELL_SIZE <= RTC_BASE && RTC_BASE + PRIMECELL_SIZE <= GPIO_BASE);
-    const _: () = assert!(GPIO_BASE + PRIMECELL_SIZE <= PCI_MMIO_BASE);
+    const _: () = assert!(GPIO_BASE + PRIMECELL_SIZE <= GICR_BASE && GICR_BASE + GICR_SIZE <= PCI_MMIO_BASE);
     const _: () = assert!(PCI_MMIO_BASE + PCI_MMIO_SIZE <= ECAM_BASE && ECAM_BASE + ECAM_SIZE <= RAM_BASE);
     const _: () = assert!(RAM_BASE + super::RAM_MAX <= super::IO_POOL_GPA);
     const _: () = assert!(RAM_BASE as usize + super::RAM_MAX as usize <= super::RAM_VA);

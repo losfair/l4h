@@ -18,7 +18,6 @@ macro_rules! log {
     ($($arg:tt)*) => { l4h_task::print_log(format_args!($($arg)*)) };
 }
 
-#[cfg(target_arch = "x86_64")]
 mod acpi;
 #[cfg(target_arch = "x86_64")]
 mod acs;
@@ -528,9 +527,6 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     }
     let total_bytes = alloc.free_bytes();
     info!("l4h-root: {} core(s), {} MiB free memory", cores, total_bytes >> 20);
-    #[cfg(target_arch = "aarch64")]
-    fdt::init(bootinfo);
-
     let hyp_ep = alloc.object_cap::<cap_type::Endpoint>(ObjectBlueprint::Endpoint);
     // The watchdog timer signals a notification bound to the root TCB, which
     // wakes the serve loop out of its receive on hyp_ep.
@@ -546,6 +542,11 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         b: Window::new(&mut alloc, slot::VSPACE.cap(), layout::WINDOWS.base + 4096),
     };
     let mut devmem = devmem::DevMem::from_bootinfo(bootinfo);
+    // ACPI table frames are shared by RTC discovery, reset and trustd
+    // (x86), and by hardware discovery without a device tree (AArch64).
+    let mut acpi_frames = acpi::Frames::new();
+    #[cfg(target_arch = "aarch64")]
+    fdt::init(bootinfo, &mut acpi::Phys::new(&mut alloc, &mut devmem, &mut wins.a, &mut acpi_frames));
     let modules = bootmod::load(bootinfo, &mut alloc, &mut devmem);
     let module = |name: &str| modules.iter().find(|m| m.name == name).map(|m| m.data);
     partition::init(module("l4h-partition"));
@@ -557,9 +558,6 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     assert!(!partition::secondary() || outgoing.is_some(), "secondary serial relay ring");
     assert!(((&raw const SERIAL) as usize - layout::image_base()) / 4096 + host::serial::PAGES <= bootinfo.user_image_frames().len());
     let serial_frames = image_frame((&raw const SERIAL) as usize);
-    // ACPI table frames are shared by RTC discovery, reset and trustd.
-    #[cfg(target_arch = "x86_64")]
-    let mut acpi_frames = acpi::Frames::new();
     // The RTC is partition 0's; the others start from the shim's reading.
     #[allow(unused_mut)]
     let mut rtc = if partition::secondary() { rtc::Rtc::none() } else { rtc::Rtc::new(&mut alloc, &mut devmem) };

@@ -28,7 +28,7 @@ pub const SLOT_CONSOLE_KICK: usize = 5;
 
 pub const SLOT_VCPU_BASE: usize = 64;
 pub const VCPU_STRIDE: usize = 8;
-pub const MAX_VCPUS: usize = 64;
+pub const MAX_VCPUS: usize = 128;
 pub const fn slot_vcpu(v: usize) -> usize {
     SLOT_VCPU_BASE + v * VCPU_STRIDE
 }
@@ -762,7 +762,9 @@ const _: () = assert!(CTL_RESP_OFF + core::mem::size_of::<CtlResp>() <= 4096);
 const _: () = assert!(core::mem::size_of::<CtlVm>() == 56);
 const _: () = assert!(core::mem::offset_of!(CtlVm, flags) == 12 && core::mem::offset_of!(CtlVm, ram) == 16);
 const _: () = assert!(core::mem::size_of::<CtlVcpuStat>() == 16);
-const _: () = assert!(MAX_VCPUS * core::mem::size_of::<CtlVcpuStat>() <= CTL_DATA_MAX);
+// CTL_VM_VCPU_STATS pages its records (args[1] the first): one a call at
+// least, and a guest's in a few.
+const _: () = assert!(MAX_VCPUS * core::mem::size_of::<CtlVcpuStat>() <= 2 * CTL_DATA_MAX);
 const _: () = assert!(core::mem::size_of::<MemPage>() == 128);
 const _: () = assert!(HP_L1_GUARD == 3 && MAX_RAM_L1 << 30 >> HP_SHIFT == HP_MAX);
 

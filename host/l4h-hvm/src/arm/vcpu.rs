@@ -407,7 +407,7 @@ impl<H: Hw> Vcpu<H> {
                 g.dist_read_for(self.id, gpa - arm::GICD_BASE, size, &mut vm::wake)
             }
             arm::V2M_BASE..0x0802_1000 if !g.v3() => g.v2m_read(gpa - arm::V2M_BASE, size),
-            arm::GICR_BASE..0x0900_0000 if g.v3() => match g.redist_at(gpa - arm::GICR_BASE) {
+            arm::GICR_BASE..arm::GICR_END if g.v3() => match g.redist_at(gpa - arm::GICR_BASE) {
                 Some((c, off)) => g.redist_read_for(self.id, c, off, size, &mut vm::wake),
                 None => 0,
             },
@@ -432,7 +432,7 @@ impl<H: Hw> Vcpu<H> {
                     vm::wake(t);
                 }
             }
-            arm::GICR_BASE..0x0900_0000 if g.v3() => {
+            arm::GICR_BASE..arm::GICR_END if g.v3() => {
                 if let Some((c, off)) = g.redist_at(gpa - arm::GICR_BASE) {
                     g.redist_write(self.id, c, off, size, v, &mut vm::wake);
                 }

@@ -583,19 +583,82 @@ pub fn parse(dtb: &[u8]) -> Option<ArmHw> {
     Some(hw)
 }
 
+/// QEMU virt's PL011, where cloud Arm VMs (GCE's C4A) have theirs too.
+pub const QEMU_VIRT_UART: usize = 0x0900_0000;
+
+/// A machine with ACPI and no device tree (FL4 under UEFI): the console
+/// from the SPCR and PCI's ECAM from the MCFG (the tables, if found, whole
+/// or as much as was read).  QEMU virt's other defaults (the PL031, the
+/// PCI MMIO aperture) are kept only where the console is virt's: on other
+/// machines, bare metal ones, they could name another device, and the
+/// aperture root moves BARs into would be no bridge's.  Its ECAM is then
+/// none either, without an MCFG.
+pub fn from_acpi(spcr: Option<&[u8]>, mcfg: Option<&[u8]>) -> ArmHw {
+    let mut hw = ArmHw::qemu_virt_default();
+    if let Some(t) = spcr {
+        hw.pl011_base = spcr_uart(t);
+    }
+    let virt = hw.pl011_base == Some(QEMU_VIRT_UART);
+    if !virt {
+        hw.pl031_base = None;
+        hw.pci_mmio32 = (0, 0);
+        hw.gicv2m = None;
+        hw.pci_ecam = (0, 0);
+    }
+    if let Some(e) = mcfg.and_then(mcfg_ecam) {
+        hw.pci_ecam = e;
+    }
+    hw
+}
+
+/// The SPCR's console, if it is a PL011 or an SBSA generic UART in memory
+/// space (ACPI 6.5 SPCR: interface type at 36, its address at 40).
+fn spcr_uart(t: &[u8]) -> Option<usize> {
+    const PL011: u8 = 0x03;
+    const SBSA_32BIT: u8 = 0x0d;
+    const SBSA: u8 = 0x0e;
+    let ty = *t.get(36)?;
+    let space = *t.get(40)?;
+    let addr = u64::from_le_bytes(t.get(44..52)?.try_into().ok()?);
+    (matches!(ty, PL011 | SBSA_32BIT | SBSA) && space == 0 && addr != 0 && addr % 4096 == 0).then_some(addr as usize)
+}
+
+/// Segment 0's ECAM from the MCFG, if its window starts at bus 0: (address,
+/// size), at most the 16 buses root maps (layout::ECAM).
+fn mcfg_ecam(t: &[u8]) -> Option<(usize, usize)> {
+    const MAX_BUSES: usize = 16;
+    let mut off = 44;
+    while let Some(e) = t.get(off..off + 16) {
+        let base = u64::from_le_bytes(e[..8].try_into().ok()?);
+        let segment = u16::from_le_bytes([e[8], e[9]]);
+        let (start, end) = (e[10] as usize, e[11] as usize);
+        if segment == 0 && start == 0 && end >= start && base != 0 && base % 4096 == 0 {
+            return Some((base as usize, (end + 1).min(MAX_BUSES) << 20));
+        }
+        off += 16;
+    }
+    None
+}
+
 #[cfg(all(target_arch = "aarch64", not(test)))]
 mod runtime {
     use super::{ArmHw, parse};
 
-    // Single-threaded l4h-root writes HW once in init() before any reader.
+    // Single-threaded l4h-root writes HW in init() before any reader.
     static mut HW: ArmHw = ArmHw::qemu_virt_default();
 
-    pub fn init(bootinfo: &sel4::BootInfoPtr) {
+    /// What the device tree says, or with none what the ACPI tables do
+    /// (`super::from_acpi`), read through `phys`.
+    pub fn init(bootinfo: &sel4::BootInfoPtr, phys: &mut crate::acpi::Phys) {
         // SEL4_BOOTINFO_HEADER_FDT
         const FDT_CHUNK: u64 = 6;
-        let hw = l4h_task::bootinfo::extra_chunk(bootinfo, FDT_CHUNK)
-            .and_then(parse)
-            .unwrap_or_else(ArmHw::qemu_virt_default);
+        let fdt = l4h_task::bootinfo::extra_chunk(bootinfo, FDT_CHUNK).and_then(parse);
+        let hw = fdt.unwrap_or_else(|| {
+            let (mut spcr, mut mcfg) = ([0; 80], [0; 44 + 16 * 4]);
+            let spcr = crate::acpi::find(bootinfo, phys, b"SPCR", &mut spcr);
+            let mcfg = crate::acpi::find(bootinfo, phys, b"MCFG", &mut mcfg);
+            super::from_acpi(spcr.map(|t| &*t), mcfg.map(|t| &*t))
+        });
         unsafe { HW = hw };
         info!(
             "l4h-root: fdt: ecam {:#x}+{:#x}, mmio {:#x}..{:#x}, msi {:?}, uart {:?}, rtc {:?}",

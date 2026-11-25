@@ -258,3 +258,61 @@ fn unfinished_tree() {
     // With it: the same tree is good.
     assert!(has_qemu_gicv2m(&b.finish()));
 }
+
+/// An ACPI table: `sig`, its header's length field, then `body` at 36.
+fn acpi_table(sig: &[u8; 4], body: &[u8]) -> Vec<u8> {
+    let mut t = vec![0; 36];
+    t[..4].copy_from_slice(sig);
+    t.extend_from_slice(body);
+    let len = t.len() as u32;
+    t[4..8].copy_from_slice(&len.to_le_bytes());
+    t
+}
+
+/// An SPCR of interface type `ty` with its console at `addr` (space 0).
+fn spcr(ty: u8, addr: u64) -> Vec<u8> {
+    // At 36 the type; at 40 the address structure: space 0, 32 bits wide,
+    // dword accesses, the address at 44.
+    let mut b = vec![0; 44];
+    b[0] = ty;
+    b[4..8].copy_from_slice(&[0, 32, 0, 3]);
+    b[8..16].copy_from_slice(&addr.to_le_bytes());
+    acpi_table(b"SPCR", &b)
+}
+
+/// An MCFG of (base, segment, start bus, end bus) entries.
+fn mcfg(entries: &[(u64, u16, u8, u8)]) -> Vec<u8> {
+    let mut b = vec![0; 8];
+    for &(base, seg, start, end) in entries {
+        b.extend_from_slice(&base.to_le_bytes());
+        b.extend_from_slice(&seg.to_le_bytes());
+        b.extend_from_slice(&[start, end, 0, 0, 0, 0]);
+    }
+    acpi_table(b"MCFG", &b)
+}
+
+#[test]
+fn acpi_on_a_virt_like_vm_keeps_its_defaults() {
+    // GCE's C4A: virt's PL011, no MCFG read.
+    let hw = fdt::from_acpi(Some(&spcr(0x03, 0x0900_0000)), None);
+    assert_eq!(hw, fdt::ArmHw::qemu_virt_default());
+    // No SPCR at all: the defaults, as before.
+    assert_eq!(fdt::from_acpi(None, None), fdt::ArmHw::qemu_virt_default());
+}
+
+#[test]
+fn acpi_on_bare_metal_takes_its_console_and_ecam() {
+    let m = mcfg(&[(0x4000_0000_0000, 1, 0, 255), (0x3000_0000_0000, 0, 0, 255)]);
+    let hw = fdt::from_acpi(Some(&spcr(0x0e, 0x2_0000_0000)), Some(&m));
+    assert_eq!(hw.pl011_base, Some(0x2_0000_0000));
+    // Segment 0's, at most the 16 buses root maps.
+    assert_eq!(hw.pci_ecam, (0x3000_0000_0000, 16 << 20));
+    // Nothing of virt's that could be another device there.
+    assert_eq!((hw.pl031_base, hw.pci_mmio32, hw.gicv2m), (None, (0, 0), None));
+    // Without an MCFG, no ECAM; with a 16550 console, none.
+    let hw = fdt::from_acpi(Some(&spcr(0x00, 0x2_0000_0000)), None);
+    assert_eq!((hw.pl011_base, hw.pci_ecam), (None, (0, 0)));
+    // A window that starts past bus 0 is not one root can map.
+    let hw = fdt::from_acpi(Some(&spcr(0x03, 0x2_0000_0000)), Some(&mcfg(&[(0x3000_0000_0000, 0, 1, 255)])));
+    assert_eq!(hw.pci_ecam, (0, 0));
+}

@@ -12,8 +12,10 @@ fail() { echo "HVMSCALE: FAIL: $*"; l4hctl list; poweroff -f; }
 vcpus=${HVM_VCPUS:-$(nproc)} mem=${HVM_MEM:-8192}
 echo "HVMSCALE: start, dom0 cpus $(nproc), guest $vcpus vCPUs, $mem MiB"
 l4hctl info | sed 's/^/HVMSCALE: info /'
-id=$(l4hctl create hvmscale --hvm --kernel /bin/bzImage --initrd /bin/hvmscalevm.cpio.gz \
-    --mem "$mem" --vcpus "$vcpus" --cmdline "console=ttyS0 quiet $(echo "${HVM_ARGS:-}" | tr , ' ')") || fail "create"
+# The guest's kernel, and the console of the machine it gets.
+if [ -e /bin/Image ]; then kernel=/bin/Image con=ttyAMA0; else kernel=/bin/bzImage con=ttyS0; fi
+id=$(l4hctl create hvmscale --hvm --kernel "$kernel" --initrd /bin/hvmscalevm.cpio.gz \
+    --mem "$mem" --vcpus "$vcpus" --cmdline "console=$con quiet $(echo "${HVM_ARGS:-}" | tr , ' ')") || fail "create"
 # The guest's console is on the serial port too, as [vm1] lines.
 l4hctl console "$id" --until "HVMSCALE: guest done" --timeout 900 > /tmp/out || fail "guest did not finish"
 sleep 1

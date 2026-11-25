@@ -505,7 +505,7 @@ pub const HVM_KICK: E<p::Hvm, p::Hvm, o::Notification> = E::new(edge("HVM_KICK",
     Fixed(badges::hvm::KICK), 1, Vmmgr, "a vCPU thread wrote a virtio queue notification"));
 pub const HVM_CONSOLE: E<p::Hvm, p::Hvm, o::Notification> = E::new(edge("HVM_CONSOLE", Hvm, Slots(hvm::SLOT_SELF_CONSOLE, 1), Hvm, Notification, Signal,
     Fixed(badges::hvm::CONSOLE), 1, Vmmgr, "a vCPU thread wrote console output"));
-pub const HVM_VCPU: E<p::Hvm, p::Hvm, o::Vcpu> = E::new(edge("HVM_VCPU", Hvm, Slots(crate::VCPU_NTFN_SLOT_BASE, abi::MAX_VCPUS), Hvm, Vcpu, Signal,
+pub const HVM_VCPU: E<p::Hvm, p::Hvm, o::Vcpu> = E::new(edge("HVM_VCPU", Hvm, Slots(crate::VCPU_NTFN_SLOT_BASE, hvm::MAX_VCPUS), Hvm, Vcpu, Signal,
     Fixed(badges::hvm_vcpu::EVENT), 1, Vmmgr, "raise interrupts, IPIs, INIT and SIPI on vCPU v"));
 pub const VMM_VCPU: E<p::Vmm, p::Guest, o::Vcpu> = E::new(shared(edge("VMM_VCPU", Vmm, Slots(crate::VCPU_NTFN_SLOT_BASE, abi::MAX_VCPUS), Guest, Vcpu, Signal,
     Fixed(abi::BADGE_EVENT), 1, Vmmgr, "raise device events on vCPU v")));
@@ -549,7 +549,7 @@ pub const OWN: &[Own] = &[
     Own { kind: None, slot: crate::SLOT_SERVICE_EP, len: 1, object: Endpoint, what: "its endpoint" },
     Own { kind: None, slot: crate::SLOT_FAULT_EP, len: 1, object: Endpoint, what: "its keeper's: the main thread's faults" },
     Own { kind: Some(crate::KIND_TRUSTD), slot: trust::SLOT_KICK, len: 1, object: Kick, what: "its kick notification" },
-    Own { kind: Some(crate::KIND_HVM), slot: hvm::SLOT_VCPU_WAIT, len: abi::MAX_VCPUS, object: Vcpu,
+    Own { kind: Some(crate::KIND_HVM), slot: hvm::SLOT_VCPU_WAIT, len: hvm::MAX_VCPUS, object: Vcpu,
         what: "its vCPU threads' bound notifications, which they wait on" },
 ];
 
@@ -603,8 +603,8 @@ pub const HVM_HELD: [(u64, usize, Held, &str); 6] = [
     (hvm::SLOT_BLOCKS, 1, Held::CNode, "the CNode of its RAM blocks' Untypeds"),
     (hvm::SLOT_KEEP_EPT, 1, Held::CNode, "the CNode of its RAM blocks' EPT frames"),
     (hvm::SLOT_KEEP_HVM, 1, Held::CNode, "the CNode of its RAM blocks' own mappings"),
-    (hvm::SLOT_VCPU_TCB, abi::MAX_VCPUS, Held::Thread, "its vCPU threads"),
-    (hvm::SLOT_VCPU_OBJ, abi::MAX_VCPUS, Held::Vcpu, "its VCPUs"),
+    (hvm::SLOT_VCPU_TCB, hvm::MAX_VCPUS, Held::Thread, "its vCPU threads"),
+    (hvm::SLOT_VCPU_OBJ, hvm::MAX_VCPUS, Held::Vcpu, "its VCPUs"),
 ];
 
 /// The HVM_HELD entry slot `slot` is in.
