@@ -53,7 +53,7 @@ if [[ ${INSTALL_VM_SWAP_NAMES:-0} == 1 ]]; then
     sudo touch "$guest/opt/l4h-install-test/swap-names"
 fi
 sudo cp "$root/tools/install.sh" "$guest/opt/l4h-install-test/"
-boot_files=(l4h-generic.efi)
+boot_files=(l4h-fl4.efi)
 [[ $firmware == uefi ]] || boot_files=(l4h-bios-x86_64.tar.xz)
 for file in l4h-dom0-x86_64.tar.xz "${boot_files[@]}"; do
     sudo cp "$release/$file" "$guest/opt/l4h-install-test/release/"

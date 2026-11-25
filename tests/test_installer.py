@@ -380,7 +380,9 @@ class UpdateChecks:
 
     def test_skim_install_and_native_dom0_updates(self):
         self.machine.write("/sys/devices/system/cpu/vulnerabilities/meltdown", "Mitigation: PTI")
+        self.args.variant = "skim-xapic-nopcid"
         self.commit()
+        self.args.variant = None
         self.assertEqual(self.check()["variant"], "skim-xapic-nopcid")
         self.commit()
         self.args.variant = "xapic-nopcid"
@@ -427,7 +429,7 @@ class UpdateChecks:
         self.machine.dom0()
         plan = self.check()
         self.assertTrue(plan["dom0"])
-        self.assertEqual(plan["variant"], "generic")
+        self.assertEqual(plan["variant"], "fl4" if plan["firmware"] == "uefi" else "generic")
         with patch("sys.stdout", new_callable=io.StringIO) as output:
             self.commit(plan)
         self.assertIn("host-reboot", output.getvalue())
@@ -513,7 +515,7 @@ class InstallerTests(UpdateChecks, Harness):
     def test_supported_machine_and_read_only_preflight(self):
         before = sorted(str(p) for p in self.root.rglob("*"))
         plan = self.check()
-        self.assertEqual((plan["variant"], plan["root_uuid"]), ("generic", "1234-abcd"))
+        self.assertEqual((plan["variant"], plan["root_uuid"]), ("fl4", "1234-abcd"))
         self.assertEqual(plan["uplinks"], [dict(ifname="ens3", bdf="00:05.0", mac="52:54:00:12:34:56")])
         config = installer.configuration(plan)
         self.assertIn("root=UUID=1234-abcd", config)
@@ -534,6 +536,7 @@ class InstallerTests(UpdateChecks, Harness):
         self.rejected("Secure Boot")
 
     def test_affected_or_unknown_cpu_selects_skim(self):
+        self.machine.bios()  # UEFI installs FL4; seL4 auto-selection is for BIOS.
         path = "/sys/devices/system/cpu/vulnerabilities/meltdown"
         for status in ("Mitigation: PTI", "Vulnerable", "Unknown", ""):
             with self.subTest(status=status):
@@ -548,6 +551,7 @@ class InstallerTests(UpdateChecks, Harness):
         self.assertEqual(self.check()["variant"], "skim-xapic-nopcid")
 
     def test_intel_without_arch_capabilities_selects_skim(self):
+        self.machine.bios()  # UEFI installs FL4; seL4 auto-selection is for BIOS.
         cpu = self.machine.path("/proc/cpuinfo")
         cpu.write_text(cpu.read_text().replace("arch_capabilities", ""))
         self.assertEqual(self.check()["variant"], "skim-xapic-nopcid")
@@ -557,11 +561,58 @@ class InstallerTests(UpdateChecks, Harness):
         cpu.write_text(cpu.read_text().replace("GenuineIntel", "AuthenticAMD"))
         self.assertEqual(self.check()["variant"], "generic")
 
+    def test_uefi_defaults_to_fl4_on_any_supported_cpu(self):
+        cpu = self.machine.path("/proc/cpuinfo")
+        cpu.write_text(cpu.read_text().replace("arch_capabilities", "").replace("invpcid", ""))
+        self.machine.write("/sys/devices/system/cpu/vulnerabilities/meltdown", "Vulnerable")
+        self.assertEqual(self.check()["variant"], "fl4")
+        self.args.variant = "fl4"
+        self.assertEqual(self.check()["variant"], "fl4")
+        cpu.write_text(cpu.read_text().replace("xsaveopt", ""))
+        self.rejected("xsaveopt")
+
+    def test_partitions_select_sel4_and_reject_fl4(self):
+        self.args.partitions = 2
+        with patch.object(installer.platform, "system", return_value="Linux"), \
+             patch.object(installer.platform, "machine", return_value="x86_64"):
+            self.assertEqual(self.preflight.hardware()[0], "generic")
+        self.args.variant = "fl4"
+        self.rejected("multikernel partitions need an seL4 variant")
+
+    def test_dom0_switches_between_sel4_and_fl4(self):
+        self.args.variant = "generic"
+        self.commit()
+        self.machine.dom0()
+        self.args.variant = None
+        self.assertEqual(self.check()["variant"], "generic")
+        self.args.variant = "fl4"
+        self.commit()
+        self.args.variant = None
+        self.assertEqual(self.check()["variant"], "fl4")
+        self.args.variant = "generic"
+        self.rejected("requires native Linux")
+        self.args.variant = "skim-xapic-nopcid"
+        self.assertEqual(self.check()["variant"], "skim-xapic-nopcid")
+
+    def test_multikernel_update_rejects_fl4(self):
+        self.args.variant = "generic"
+        self.commit()
+        self.config().with_name("l4h-mk.conf").write_text("partitions = 2\n")
+        self.machine.calls.clear()
+        self.args.variant = None
+        self.assertEqual(self.check()["variant"], "generic")
+        self.args.variant = "fl4"
+        self.rejected("multikernel partitions need an seL4 variant")
+        self.machine.calls.clear()
+        self.machine.dom0()
+        self.rejected("multikernel partitions need an seL4 variant")
+
     def test_explicit_skim_on_unaffected_cpu(self):
         self.args.variant = "skim-xapic-nopcid"
         self.assertEqual(self.check()["variant"], "skim-xapic-nopcid")
 
     def test_pcid_without_invpcid_uses_fallback(self):
+        self.machine.bios()  # UEFI installs FL4; seL4 auto-selection is for BIOS.
         cpu = self.machine.path("/proc/cpuinfo")
         cpu.write_text(cpu.read_text().replace("invpcid", ""))
         self.assertEqual(self.check()["variant"], "xapic-nopcid")
@@ -603,6 +654,7 @@ class InstallerTests(UpdateChecks, Harness):
         self.assertEqual(err.getvalue(), "")
 
     def test_variant_fallback_and_invalid_override(self):
+        self.machine.bios()  # UEFI installs FL4; seL4 auto-selection is for BIOS.
         cpu = self.machine.path("/proc/cpuinfo")
         cpu.write_text(cpu.read_text().replace("pcid", ""))
         self.assertEqual(self.check()["variant"], "xapic-nopcid")
@@ -1190,7 +1242,7 @@ class InstallerTests(UpdateChecks, Harness):
     def test_bad_download_checksum(self):
         self.args.release = "vtest"
         self.args.checksums = self.root / "SHA256SUMS"
-        self.args.checksums.write_text("0" * 64 + "  l4h-generic.efi\n")
+        self.args.checksums.write_text("0" * 64 + "  l4h-fl4.efi\n")
         dest = self.root / "download.efi"
         dest.write_text("corrupt")
         with patch.object(installer, "run", return_value=""):
@@ -1247,7 +1299,7 @@ class BiosInstallerTests(UpdateChecks, Harness):
             self.machine.write("/bios/" + name, "release " + name)
         for name in ("l4h-root.elf", "vmlinux"):
             self.machine.write("/bios/" + name, elf())
-        for variant in installer.KERNEL_VARIANTS:
+        for variant in installer.SEL4_VARIANTS:
             self.machine.write("/bios/kernel-" + variant + ".elf", elf(True) + variant.encode())
         return bios
 
@@ -1459,6 +1511,17 @@ class BiosInstallerTests(UpdateChecks, Harness):
         self.assertTrue(custom.read_text().startswith(text))
         self.assertIn("set default=l4h", custom.read_text())
 
+    def test_fl4_is_uefi_only(self):
+        self.assertEqual(self.check()["variant"], "generic")
+        self.args.variant = "fl4"
+        self.rejected("FL4 release is UEFI-only")
+        self.args.variant = None
+        self.commit()
+        self.machine.calls.clear()
+        self.machine.dom0()
+        self.args.variant = "fl4"
+        self.rejected("FL4 release is UEFI-only")
+
     def test_legacy_bios_variant_matches_verified_archive(self):
         bios = self.bios_package()
         archive = self.root / "old.tar.xz"
@@ -1471,7 +1534,7 @@ class BiosInstallerTests(UpdateChecks, Harness):
             else:
                 shutil.copyfile(archive, dest)
         with patch.object(installer, "run", side_effect=download):
-            for variant in installer.KERNEL_VARIANTS:
+            for variant in installer.SEL4_VARIANTS:
                 with self.subTest(variant=variant):
                     checksum = installer.digest(bios / ("kernel-" + variant + ".elf"))
                     self.assertEqual(installer.installed_variant("vold", "bios", checksum), variant)
