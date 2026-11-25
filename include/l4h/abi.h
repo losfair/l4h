@@ -1385,6 +1385,38 @@ struct l4h_attest_port_resp {
 	l4h_u32 state;          /* L4H_ATTEST_FAILED / NO_REPORTS / HAS_* bits */
 };
 
+/*
+ * An HVM guest's kernel configuration port (DESIGN.md §5.11): what the
+ * host's microkernel found and chose at boot (FL4's seL4_KernelConfig,
+ * DESIGN.md §10.1), for a guest that holds no capability, through a
+ * virtio-console device of its machine with one port, named
+ * L4H_KCONFIG_PORT_NAME.  Every HVM guest has it.  The port is a stream
+ * of fixed-size requests and their answers, one at a time,
+ * little-endian: the guest writes a struct l4h_kconfig_port_req and
+ * reads a struct l4h_kconfig_port_resp.  status is 0 with the key's
+ * value, -ENOENT for a key the kernel does not know (or one of the other
+ * architecture), -ENOSYS on a kernel without seL4_KernelConfig (seL4),
+ * value then 0.  A header without the magic, or with reserved set, is
+ * answered -EINVAL, and nothing more is read until the port is opened
+ * again.  Opening or closing the port drops a request half written and
+ * an answer not yet read, as on the attestation port.
+ */
+#define L4H_KCONFIG_PORT_NAME   "l4h.kconfig"
+#define L4H_KCONFIG_PORT_MAGIC  0x4b48344c /* "L4HK" */
+struct l4h_kconfig_port_req {
+	l4h_u32 magic;
+	l4h_u32 reserved;       /* 0 */
+	l4h_u64 key;            /* seL4_KernelConfig_* */
+};
+struct l4h_kconfig_port_resp {
+	l4h_u32 magic;
+	l4h_s32 status;         /* 0 or -errno */
+	l4h_u64 value;
+	l4h_u64 reserved;
+};
+_Static_assert(sizeof(struct l4h_kconfig_port_req) == 16, "l4h_kconfig_port_req layout (host/l4h-abi)");
+_Static_assert(sizeof(struct l4h_kconfig_port_resp) == 24, "l4h_kconfig_port_resp layout (host/l4h-abi)");
+
 enum l4h_power {
 	L4H_POWER_OFF = 0,
 	L4H_POWER_REBOOT = 1,

@@ -93,6 +93,13 @@ pub fn kick_trustd() {
     l4h_rt::mailbox::notify(cap::<cap_type::Notification>(hv::SLOT_TRUSTD_KICK));
 }
 
+/// The kernel's value of `key` (l4h_rt::kconfig): for the kernel
+/// configuration port (dev/kconfig.rs) and, on x86-64, the MSRs the guest
+/// reads of the host's (vm::SpecMsrs).
+pub fn kconfig(key: u64) -> Result<u64, i32> {
+    l4h_rt::kconfig::get(key)
+}
+
 fn io_thread() -> Endpoint<call::Proto> {
     Endpoint::of(&wiring::HVM_CALL, wiring::p::Hvm, 0)
 }

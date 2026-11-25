@@ -97,6 +97,9 @@ fn main(info: &'static Info) -> ! {
         vcpu::read_host_cpuid();
         let mut host = vm::Host::of(&vcpu::host_cpuid);
         host.xcr0 = hw::probe_xcr0(hv::SLOT_VCPU_OBJ, host.xcr0);
+        // FL4 says the host's speculation-control MSRs; seL4 cannot, and
+        // the guest has none of them there.
+        host.spec = vm::SpecMsrs::of_kernel(sys::kconfig);
         vm::build(cfg, tsc_hz, mem, host)
     };
     #[cfg(target_arch = "aarch64")]

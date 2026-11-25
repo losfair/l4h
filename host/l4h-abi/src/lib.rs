@@ -710,6 +710,32 @@ pub struct AttestPortResp {
 }
 const _: () = assert!(core::mem::size_of::<AttestPortReq>() == 20 && core::mem::size_of::<AttestPortResp>() == 20);
 
+/// An HVM guest's kernel configuration port (abi.h, L4H_KCONFIG_PORT_*):
+/// the name of its virtio-console port, and the fixed-size request and
+/// answer on it (little-endian).
+pub const KCONFIG_PORT_NAME: &[u8] = b"l4h.kconfig";
+pub const KCONFIG_PORT_MAGIC: u32 = 0x4b48_344c;
+
+#[repr(C)]
+pub struct KconfigPortReq {
+    pub magic: u32,
+    /// 0.
+    pub reserved: u32,
+    /// A seL4_KernelConfig key.
+    pub key: u64,
+}
+
+#[repr(C)]
+pub struct KconfigPortResp {
+    pub magic: u32,
+    /// 0, or -errno (-ENOENT: no such key; -ENOSYS: no seL4_KernelConfig).
+    pub status: i32,
+    pub value: u64,
+    pub reserved: u64,
+}
+const _: () = assert!(core::mem::size_of::<KconfigPortReq>() == 16 && core::mem::size_of::<KconfigPortResp>() == 24);
+const _: () = assert!(core::mem::offset_of!(KconfigPortReq, key) == 8 && core::mem::offset_of!(KconfigPortResp, value) == 8);
+
 pub const POWER_OFF: u64 = 0;
 pub const POWER_REBOOT: u64 = 1;
 pub const POWER_CRASH: u64 = 2;

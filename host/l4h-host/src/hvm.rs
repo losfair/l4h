@@ -46,13 +46,17 @@ pub const RAM_MAX: u64 = (abi::MAX_BLOCKS * abi::BLOCK_SIZE) as u64;
 /// An HVM guest's default I/O pool: its disks bounce whole requests
 /// through it (DESIGN.md §5.11).
 pub const IO_POOL_DEFAULT: u64 = 8 << 20;
-/// Devices an HVM guest has at most: PCI slots 1 to 30 of bus 0 (slot 0 is
-/// the host bridge, ATTEST_SLOT the attestation port's device).
-pub const MAX_DEVICES: usize = 30;
+/// Devices an HVM guest has at most: PCI slots 1 to 29 of bus 0 (slot 0 is
+/// the host bridge, KCONFIG_SLOT the kernel configuration port's device,
+/// ATTEST_SLOT the attestation port's).
+pub const MAX_DEVICES: usize = 29;
+/// The PCI slot of the virtio-console device with the kernel configuration
+/// port (abi::KCONFIG_PORT_*), which every HVM guest has.
+pub const KCONFIG_SLOT: usize = 30;
 /// The PCI slot of the virtio-console device with the attestation port
 /// (abi::ATTEST_PORT_*), of a guest that has one (HvmConfig::attest).
 pub const ATTEST_SLOT: usize = 31;
-const _: () = assert!(MAX_DEVICES < ATTEST_SLOT);
+const _: () = assert!(MAX_DEVICES < KCONFIG_SLOT && KCONFIG_SLOT < ATTEST_SLOT);
 /// The architecture in an HVM guest's launch digest (launch_arch).
 pub const LAUNCH_ARCH_X86_64: u64 = 1;
 pub const LAUNCH_ARCH_AARCH64: u64 = 2;

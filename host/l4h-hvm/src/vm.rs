@@ -43,6 +43,49 @@ pub struct Host {
     /// AMD's Automatic IBRS (CPUID 0x8000_0021 EAX bit 8): a guest may set
     /// EFER.AIBRSE, which the VMCB holds for it.
     pub auto_ibrs: bool,
+    /// The speculation-control MSRs the guest reads of the host's.
+    pub spec: SpecMsrs,
+}
+
+/// The host's speculation-control MSRs that the guest may read (x86/msr.rs,
+/// DESIGN.md §5.11): the boot core's as the kernel left them at boot,
+/// which FL4's seL4_KernelConfig says (`of_kernel`); each None where the
+/// kernel did not read it, or (seL4) cannot say.  The guest sees them read
+/// only: none of them is switched for it on a VM entry, so what it runs
+/// with is the host's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SpecMsrs {
+    /// IA32_ARCH_CAPABILITIES (0x10a), as the hardware has it.
+    pub arch_capabilities: Option<u64>,
+    /// IA32_SPEC_CTRL (0x48), as the kernel set it (IBRS where it runs with
+    /// enhanced IBRS, which the guest then has too).
+    pub spec_ctrl: Option<u64>,
+    /// IA32_TSX_CTRL (0x122).
+    pub tsx_ctrl: Option<u64>,
+    /// IA32_MCU_OPT_CTRL (0x123).
+    pub mcu_opt_ctrl: Option<u64>,
+    /// AMD's DE_CFG (0xc001_1029).
+    pub amd_de_cfg: Option<u64>,
+    /// AMD's BP_CFG (0xc001_102e).
+    pub amd_bp_cfg: Option<u64>,
+}
+
+impl SpecMsrs {
+    /// What the kernel's configuration (l4h_rt::kconfig::get, `get`) says
+    /// of them: none on a kernel without it, or if any key fails.
+    pub fn of_kernel(get: impl Fn(u64) -> Result<u64, i32>) -> SpecMsrs {
+        use l4h_rt::kconfig::{keys, spec_msr_valid as v};
+        let Ok(valid) = get(keys::SPEC_MSR_VALID) else { return SpecMsrs::default() };
+        let msr = |bit: u64, key: u64| if valid & bit != 0 { get(key).ok() } else { None };
+        SpecMsrs {
+            arch_capabilities: msr(v::ARCH_CAPABILITIES, keys::X86_ARCH_CAPABILITIES),
+            spec_ctrl: msr(v::SPEC_CTRL, keys::SPEC_CTRL_MSR),
+            tsx_ctrl: msr(v::TSX_CTRL, keys::SPEC_TSX_CTRL_MSR),
+            mcu_opt_ctrl: msr(v::MCU_OPT_CTRL, keys::SPEC_MCU_OPT_CTRL_MSR),
+            amd_de_cfg: msr(v::AMD_DE_CFG, keys::SPEC_AMD_DE_CFG_MSR),
+            amd_bp_cfg: msr(v::AMD_BP_CFG, keys::SPEC_AMD_BP_CFG_MSR),
+        }
+    }
 }
 
 impl Host {
@@ -56,6 +99,7 @@ impl Host {
             pcid: cpuid(1, 0)[2] & (1 << 17) != 0,
             phys_bits: phys.min(crate::x86::cpuid::MAX_PHYS_BITS),
             auto_ibrs: ext >= 0x8000_0021 && cpuid(0x8000_0021, 0)[0] & crate::x86::cpuid::AUTO_IBRS != 0,
+            spec: SpecMsrs::default(),
         }
     }
 }

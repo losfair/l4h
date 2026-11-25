@@ -40,6 +40,7 @@ pub use sel4_runtime_common;
 
 mod failure;
 pub mod ioport;
+pub mod kconfig;
 pub mod mailbox;
 
 pub use failure::{FailureHandler, set_failure_handler};

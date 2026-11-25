@@ -595,6 +595,7 @@ fn guest_boots_and_uses_the_machine() {
     assert_eq!(cfg_read(&mut c0, 0, 0, 4), 0x0008_1b36, "the host bridge");
     assert_eq!(cfg_read(&mut c0, 1, 0, 4), 0x1042_1af4);
     assert_eq!(cfg_read(&mut c0, 2, 0, 2), 0xffff, "an empty slot");
+    assert_eq!(cfg_read(&mut c0, 30, 0, 4), 0x1043_1af4, "the kernel configuration port's console");
     let spi = arm::MSI_BASE;
     edge_spi(&mut c0, spi);
     edge_spi(&mut c0, spi + 1);
