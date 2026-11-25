@@ -6,7 +6,8 @@
 //! map, and signals on the notification root made for the guest's VMM:
 //! queue notifications (KICK), backend completions (DONE), vmmgr's console
 //! input and power requests (CTL), console output and its timer (CONSOLE),
-//! trustd's answers to the attestation port (ATTEST).
+//! trustd's answers to the attestation port (ATTEST).  The kernel
+//! configuration port answers in its turns, from the kernel.
 
 use core::sync::atomic::Ordering;
 
@@ -15,6 +16,7 @@ use l4h_rt::host::{self, hvm as hv};
 
 use crate::console::{self, Serial};
 use crate::dev::attest::Port;
+use crate::dev::kconfig::Port as KconfigPort;
 use crate::dev::blk::Blk;
 use crate::dev::net::Net;
 use crate::dev::pci::{self, Config};
@@ -32,6 +34,9 @@ pub enum Dev {
     /// The attestation port's console device (dev/attest.rs), in slot
     /// hv::ATTEST_SLOT.
     Attest(Transport<Port<TrustdKick>>),
+    /// The kernel configuration port's console device (dev/kconfig.rs),
+    /// in slot hv::KCONFIG_SLOT.
+    Kconfig(Transport<KconfigPort<KernelConfig>>),
 }
 
 macro_rules! each {
@@ -40,12 +45,15 @@ macro_rules! each {
             Dev::Blk($t) => $e,
             Dev::Net($t) => $e,
             Dev::Attest($t) => $e,
+            Dev::Kconfig($t) => $e,
         }
     };
 }
 
 /// trustd's kick for the guest.
 pub type TrustdKick = fn();
+/// The kernel's value of a key (sys::kconfig).
+pub type KernelConfig = fn(u64) -> Result<u64, i32>;
 
 pub struct Io {
     host_bridge: Option<Config>,
@@ -96,6 +104,9 @@ pub fn init() {
         let port = Port::new(hv::ATTEST_PAGE_VA as *mut abi::AttestPage, sys::kick_trustd as TrustdKick);
         io.slots[hv::ATTEST_SLOT] = Some(Dev::Attest(Transport::new(hv::ATTEST_SLOT, vm::PCI_MMIO_BASE, port)));
     }
+    // Every guest's, whatever its kernel: on seL4 each key is -ENOSYS.
+    let port = KconfigPort::new(sys::kconfig as KernelConfig);
+    io.slots[hv::KCONFIG_SLOT] = Some(Dev::Kconfig(Transport::new(hv::KCONFIG_SLOT, vm::PCI_MMIO_BASE, port)));
 }
 
 /// How long a network queue that ran dry is polled (Net::keep_polling).

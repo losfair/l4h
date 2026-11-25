@@ -16,6 +16,8 @@ EXPORT_SYMBOL_GPL(l4h_timer_arm);
 /* Kicks and device writes of host-device drivers (usb-l4h). */
 EXPORT_SYMBOL_GPL(l4h_signal);
 EXPORT_SYMBOL_GPL(l4h_hypercall);
+/* The host kernel's configuration (L4H_PROVIDER_KERNEL_CONFIG). */
+EXPORT_SYMBOL_GPL(l4h_kernel_config);
 /* Interrupt masking (asm/irqflags.h), which any module may use. */
 EXPORT_SYMBOL(um_set_signals);
 EXPORT_SYMBOL(um_set_signals_trace);

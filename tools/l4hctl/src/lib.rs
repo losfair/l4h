@@ -1620,6 +1620,8 @@ mod discard_tests {
 /// /dev/l4h-attest, an l4h guest's driver, or else on an HVM guest's
 /// attestation port (§5.11: the virtio-console port named l4h.attest).
 /// ACT/SEAL work without a TPM.
+pub mod kernel;
+
 pub mod attest {
     use super::*;
     use std::io::{Read, Write};
@@ -1655,7 +1657,7 @@ pub mod attest {
     /// The device of the virtio-console port named `name`, if the guest
     /// has one: the vport whose sysfs `name` is that (udev's
     /// /dev/virtio-ports link need not be there).
-    fn find_port(class: &Path, dev: &Path, name: &str) -> Option<PathBuf> {
+    pub(crate) fn find_port(class: &Path, dev: &Path, name: &str) -> Option<PathBuf> {
         let mut ports: Vec<_> = std::fs::read_dir(class).ok()?.flatten().map(|e| e.file_name()).collect();
         ports.sort();
         ports.into_iter().find(|p| std::fs::read_to_string(class.join(p).join("name")).is_ok_and(|n| n.trim_end() == name)).map(|p| dev.join(p))

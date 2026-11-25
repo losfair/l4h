@@ -3,7 +3,8 @@
 //! kernel's KVM hides it (l4h_kvm_set_cpu_caps() in arch/l4h/kvm/common.c,
 //! and what neither VT-x nor AMD-V offers a guest of ours: VMX, SVM,
 //! MONITOR, the PMU, PKU, XSAVES, AVX-512, AMX, CET, LA57, RDTSCP and RDPID,
-//! the speculation-control MSRs, TSX's controls, SGX), with what our
+//! the speculation-control MSRs, TSX's controls, SGX; IA32_ARCH_CAPABILITIES
+//! where the host's kernel says it, x86/msr.rs), with what our
 //! platform has: an x2APIC with the TSC-deadline timer and ARAT, an
 //! invariant TSC whose rate leaves 0x15 and 0x16 give (and kvmclock, under
 //! KVM's signature, on AMD too), and vmmgr's vCores as SMT cores of one
@@ -119,6 +120,8 @@ pub struct Ctx {
     pub pke: bool,
     /// INVPCID can be enabled for guests (VT-x's control stuck).
     pub invpcid: bool,
+    /// The guest reads IA32_ARCH_CAPABILITIES (vm::SpecMsrs).
+    pub arch_capabilities: bool,
 }
 
 const fn bit(n: u32) -> u32 {
@@ -249,10 +252,11 @@ pub fn cpuid(leaf: u32, sub: u32, ctx: &Ctx, host: &impl Fn(u32, u32) -> [u32; 4
                 let hide_c = bit(4) | bit(5) | bit(7) | bit(16) | bit(22) | bit(23) | bit(30) | bit(31)
                     | if avx512 { 0 } else { avx512_c } | if pku { 0 } else { bit(3) };
                 let c = (c & !hide_c) | if pku && ctx.pke { bit(4) } else { 0 };
-                // EDX: keep FSRM, MD_CLEAR, SERIALIZE: hide the rest (AVX-512,
-                // TSX controls, hybrid, PCONFIG, CET_IBT, AMX, speculation
-                // control and the capability MSRs).
-                let keep_d = bit(4) | bit(10) | bit(14);
+                // EDX: keep FSRM, MD_CLEAR, SERIALIZE, and ARCH_CAPABILITIES
+                // where the guest reads it: hide the rest (AVX-512, TSX
+                // controls, hybrid, PCONFIG, CET_IBT, AMX, speculation
+                // control and the core capabilities MSR).
+                let keep_d = bit(4) | bit(10) | bit(14) | if ctx.arch_capabilities { bit(29) } else { 0 };
                 [a.min(1), b & !hide_b, c, d & keep_d]
             }
             // AVX-VNNI, and AVX512_BF16 with AVX-512's state.
@@ -340,18 +344,22 @@ pub fn cpuid(leaf: u32, sub: u32, ctx: &Ctx, host: &impl Fn(u32, u32) -> [u32; 4
             let [a, b, _, _] = host(0x8000_0008, 0);
             // Address sizes: virtual 48 bits at most (no LA57), physical
             // below 2^47 (seL4's EPT); of EBX's features CLZERO and
-            // XSAVEERPTR (no speculation controls); the package's threads
-            // and APIC ID bits.
+            // XSAVEERPTR, and on AMD the hardware's BTC_NO (no
+            // speculation controls); the package's threads and APIC ID
+            // bits.
             let (phys, virt) = ((a & 0xff).min(MAX_PHYS_BITS), ((a >> 8) & 0xff).min(48));
             let ecx = if amd { (t.vcpus.max(1) - 1) & 0xff | (t.core_shift << 12) } else { 0 };
-            [phys | virt << 8, b & (bit(0) | bit(2)), ecx, 0]
+            let keep_b = bit(0) | bit(2) | if amd { BTC_NO } else { 0 };
+            [phys | virt << 8, b & keep_b, ecx, 0]
         }
         // AMD's extended features 2: LFENCE always serializing, and
         // Automatic IBRS, whose EFER.AIBRSE the VMCB holds for the guest
-        // (hw/svm.rs), so that Linux need not fall back to retpolines.
-        // Nothing of SRSO, TSA or the speculation controls' MSRs, which
-        // seL4's VCPUs do not switch.
-        0x8000_0021 if amd => [host(0x8000_0021, 0)[0] & (LFENCE_SERIAL | AUTO_IBRS), 0, 0, 0],
+        // (hw/svm.rs), so that Linux need not fall back to retpolines; and
+        // what the hardware is or is immune to (no nested data
+        // breakpoints, null selectors clearing the base, SRSO_NO and
+        // SRSO_USER_KERNEL_NO).  Nothing of TSA or the speculation
+        // controls' MSRs, which seL4's VCPUs do not switch.
+        0x8000_0021 if amd => [host(0x8000_0021, 0)[0] & EXT21_KEPT, 0, 0, 0],
         // The legacy cache descriptors; any other leaf (SGX, PT, RDT, AMX,
         // key locker, hybrid, LBR, ...) is none.
         2 => host(2, 0),
@@ -374,9 +382,17 @@ fn topoext(amd: bool, host: &impl Fn(u32, u32) -> [u32; 4]) -> bool {
     amd && host(0x8000_0000, 0)[0] >= 0x8000_001e && host(0x8000_0001, 0)[2] & bit(22) != 0
 }
 
-/// CPUID 0x8000_0021 EAX: LFENCE always serializing, Automatic IBRS.
+/// CPUID 0x8000_0021 EAX: LFENCE always serializing, Automatic IBRS, and
+/// what the guest is told of the hardware with them.
 pub const LFENCE_SERIAL: u32 = 1 << 2;
 pub const AUTO_IBRS: u32 = 1 << 8;
+pub const NO_NESTED_DATA_BP: u32 = 1 << 0;
+pub const NULL_SEL_CLR_BASE: u32 = 1 << 6;
+pub const SRSO_NO: u32 = 1 << 29;
+pub const SRSO_USER_KERNEL_NO: u32 = 1 << 30;
+const EXT21_KEPT: u32 = NO_NESTED_DATA_BP | LFENCE_SERIAL | NULL_SEL_CLR_BASE | AUTO_IBRS | SRSO_NO | SRSO_USER_KERNEL_NO;
+/// CPUID 0x8000_0008 EBX: AMD's branch type confusion immunity.
+pub const BTC_NO: u32 = 1 << 29;
 
 /// The last extended leaf we give: AMD's 0x8000_0021 (the leaves between
 /// it and 0x8000_0008 are zero), Intel's 0x8000_0008.
@@ -433,7 +449,9 @@ mod tests {
     }
 
     const FLAT4: Place = Place { apic_id: 2, vcpus: 4, smt_shift: 0, core_shift: 2, threads: 1 };
-    const CTX: Ctx = Ctx { topo: FLAT4, tsc_hz: 2_100_000_000, osxsave: false, xcr0: 1, xcr0_max: 7, pke: false, invpcid: false };
+    const CTX: Ctx = Ctx {
+        topo: FLAT4, tsc_hz: 2_100_000_000, osxsave: false, xcr0: 1, xcr0_max: 7, pke: false, invpcid: false, arch_capabilities: false,
+    };
 
     /// An AMD host with everything set and extended leaves to 0x8000_0021.
     fn amd_host(leaf: u32, sub: u32) -> [u32; 4] {
@@ -496,7 +514,14 @@ mod tests {
     #[test]
     fn amd_extended_leaves_give_auto_ibrs_alone() {
         assert_eq!(cpuid(0x8000_0000, 0, &CTX, &amd_host)[0], 0x8000_0021);
-        assert_eq!(cpuid(0x8000_0021, 0, &CTX, &amd_host), [AUTO_IBRS | LFENCE_SERIAL, 0, 0, 0]);
+        assert_eq!(cpuid(0x8000_0021, 0, &CTX, &amd_host), [EXT21_KEPT, 0, 0, 0]);
+        assert_eq!(EXT21_KEPT, (1 << 0) | (1 << 2) | (1 << 6) | (1 << 8) | (1 << 29) | (1 << 30));
+        // TSA's and the speculation controls' bits stay hidden (all set on
+        // the host): exactly those six.
+        assert_eq!(cpuid(0x8000_0021, 0, &CTX, &amd_host)[0].count_ones(), 6);
+        // BTC_NO with CLZERO and XSAVEERPTR on AMD; Intel has none.
+        assert_eq!(cpuid(0x8000_0008, 0, &CTX, &amd_host)[1], bit(0) | bit(2) | BTC_NO);
+        assert_eq!(cpuid(0x8000_0008, 0, &CTX, &host)[1], bit(0) | bit(2));
         // SVM, SEV, the TLB leaves: none.
         for leaf in [0x8000_000a, 0x8000_0019, 0x8000_001f, 0x8000_0020, 0x8000_0022] {
             assert_eq!(cpuid(leaf, 0, &CTX, &amd_host), [0; 4], "{leaf:#x}");
@@ -527,6 +552,8 @@ mod tests {
         assert!(b & bit(5) != 0, "AVX2 stays");
         assert_eq!(c & (bit(3) | bit(16) | bit(22)), 0, "PKU, LA57, RDPID");
         assert_eq!(d, bit(4) | bit(10) | bit(14));
+        // IA32_ARCH_CAPABILITIES where the guest reads it (x86/msr.rs).
+        assert_eq!(cpuid(7, 0, &Ctx { arch_capabilities: true, ..CTX }, &host)[3], bit(4) | bit(10) | bit(14) | bit(29));
         assert!(cpuid(7, 0, &Ctx { invpcid: true, ..CTX }, &host)[1] & bit(10) != 0);
         assert_eq!(cpuid(0x8000_0001, 0, &CTX, &host)[3] & bit(27), 0, "RDTSCP");
         assert_eq!(cpuid(0x8000_0001, 0, &CTX, &host)[2] & bit(2), 0, "SVM");

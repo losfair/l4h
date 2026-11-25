@@ -118,6 +118,9 @@ int l4h_pt_map(int type, unsigned long table, unsigned long vspace, unsigned lon
  * the top byte of data pointers); whether instruction fetches do depends on
  * the CPU (FL4 sets TBID0 with FEAT_PAuth). */
 #define L4H_PROVIDER_ARM_TBI0 (1ull << 5)
+/* FL4: l4h_kernel_config answers (seL4_KernelConfig); without it every
+ * key is -ENOSYS. */
+#define L4H_PROVIDER_KERNEL_CONFIG (1ull << 6)
 
 #define L4H_PAC_EN_IA (1ul << 0)
 #define L4H_PAC_EN_IB (1ul << 1)
@@ -506,6 +509,14 @@ unsigned int l4h_console_try_write(const char *s, unsigned int n);
 void __attribute__((noreturn)) l4h_power(int how);
 unsigned long long l4h_steal_ns(int cpu);
 unsigned long l4h_hypercall(unsigned long label, unsigned long *mrs, int n_in, int n_out);
+
+/* ---- the microkernel's configuration */
+/* L4H_PROVIDER_KERNEL_CONFIG: what the kernel found and chose at boot,
+ * one word per key (FL4's seL4_KernelConfig_* keys, DESIGN.md §10.1), in
+ * *value.  Returns 0, 1 (seL4_InvalidArgument: a key the kernel does not
+ * know, or one of the other architecture), or -ENOSYS (-38) on a kernel
+ * without the call. */
+int l4h_kernel_config(unsigned long key, unsigned long *value);
 
 /* ---- SMP */
 int l4h_start_vcpu(int cpu, unsigned long sp, void (*fn)(int cpu), void *task);

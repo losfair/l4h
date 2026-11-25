@@ -95,3 +95,5 @@ L4H_PROVIDER_OP(int, l4h_tcb_set_pac, (unsigned long tcb, unsigned long flags, c
 L4H_PROVIDER_OP(int, l4h_tcb_set_high_vspace, (unsigned long tcb, unsigned long high_vspace), (tcb, high_vspace))
 /* l4h_user_run with struct l4h_user_ext (l4h/guest.h): TPIDRRO_EL0 and the raw fault syndrome. */
 L4H_PROVIDER_OP(int, l4h_user_run_ex, (struct l4h_uctx *u, unsigned long *gp, int read_regs_on_interrupt, struct l4h_user_ext *ext), (u, gp, read_regs_on_interrupt, ext))
+/* L4H_PROVIDER_KERNEL_CONFIG: seL4_KernelConfig(key) (l4h/guest.h). */
+L4H_PROVIDER_OP(int, l4h_kernel_config, (unsigned long key, unsigned long *value), (key, value))

@@ -177,6 +177,15 @@ config L4H_ATTEST
 	  attests, as configfs-tsm reports (with VIRT_DRIVERS) and through
 	  /dev/l4h-attest.  Hosts without a TPM offer none.
 
+config L4H_KCONFIG
+	bool "The l4h host kernel's configuration"
+	default y
+	help
+	  What the host's microkernel found and chose at boot (FL4's
+	  seL4_KernelConfig: virtualization, mitigations, CPU features),
+	  one key at a time through /dev/l4h-kconfig, for l4hctl kernel.
+	  On a host kernel without it every key is -ENOSYS.
+
 config L4H_SDK
 	bool "Kernel build SDK from the l4h host"
 	default y

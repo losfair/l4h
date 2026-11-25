@@ -14,6 +14,10 @@ extern crate self as l4h_rt;
 pub mod host {
     pub use l4h_host::*;
 }
+/// l4h-rt's kernel configuration (seL4-free; seL4_KernelConfig is
+/// sys::kconfig's model here).
+#[path = "../host/l4h-rt/src/kconfig.rs"]
+pub mod kconfig;
 /// A backend's kick (a notification in l4h-hvm): counted.
 pub struct Kick;
 pub static KICKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -96,9 +100,14 @@ pub mod sys {
         crate::Kick
     }
     /// trustd kicked: counted.
+    pub const KCONFIG_ARCH: u64 = 1;
     pub static TRUSTD_KICKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     pub fn kick_trustd() {
         TRUSTD_KICKS.fetch_add(1, Ordering::SeqCst);
+    }
+    /// The kernel's configuration (FL4's seL4_KernelConfig): ARCH alone.
+    pub fn kconfig(key: u64) -> Result<u64, i32> {
+        if key == crate::kconfig::keys::ARCH { Ok(KCONFIG_ARCH) } else { Err(crate::kconfig::ENOENT) }
     }
     pub fn call_access(space: u32, addr: u64, size: u8, write: bool, value: u64) -> u64 {
         as_thread(None, || crate::io::access(space, addr, size, write, value))

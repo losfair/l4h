@@ -253,6 +253,12 @@ const USAGE: &str = "usage: l4hctl <command>
   send VM [--wait PAT [--timeout SECS]] TEXT
                                type TEXT (plus newline) on the VM's console;
                                with --wait, print the time until PAT appears
+In any guest:
+  kernel [--json] [--key KEY]  what the host's kernel found and chose at
+                               boot (FL4's seL4_KernelConfig): cores,
+                               virtualization, mitigations and their MSRs,
+                               CPU features; KEY one key, by its libsel4
+                               name (VirtBackend) or number (0x0100)
 In any guest (flags work without a TPM):
   attest flags                show taint and seal bit lists
   attest seal FLAG...         seal console-in, console-out or bits 128-255
@@ -285,6 +291,49 @@ fn unhex(s: &str) -> Result<Vec<u8>> {
         return err(format!("bad hex: {s}"));
     }
     (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| Error(format!("bad hex: {s}")))).collect()
+}
+
+/// `kernel [--json] [--key KEY]`: needs no /dev/l4hctl.
+fn cmd_kernel(args: &[String]) -> Result<i32> {
+    let usage = "kernel [--json] [--key KEY]";
+    let (mut json, mut key) = (false, None);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--json" => json = true,
+            "--key" => key = Some(kernel::parse_key(it.next().ok_or(Error(usage.into()))?)?),
+            _ => return err(usage),
+        }
+    }
+    let mut dev = kernel::Dev::open()?;
+    let Some(id) = key else {
+        let answers = dev.all()?;
+        if json {
+            println!("{}", kernel::render_json(&answers));
+        } else {
+            print!("{}", kernel::render(&answers));
+        }
+        return Ok(0);
+    };
+    let Some(v) = dev.get(id)? else {
+        return err(format!("the host's kernel has no key {id:#06x} (one it does not know, or of the other architecture)"));
+    };
+    // What decides how it reads: the architecture, the MSRs read.
+    let mut context = Vec::new();
+    for k in [0x0001, 0x030b] {
+        if let Some(c) = dev.get(k)? {
+            context.push((k, c));
+        }
+    }
+    if json {
+        println!("{}", kernel::json_key(id, v, &context));
+    } else {
+        match kernel::find(id) {
+            Some(k) => println!("{} {}", k.name, kernel::describe(k, v, &context)),
+            None => println!("{id:#06x} {v:#x}"),
+        }
+    }
+    Ok(0)
 }
 
 /// `attest ...`: these need no /dev/l4hctl.
@@ -659,6 +708,9 @@ fn run(args: &[String]) -> Result<i32> {
     if cmd == "attest" {
         return cmd_attest(&args[1..]);
     }
+    if cmd == "kernel" {
+        return cmd_kernel(&args[1..]);
+    }
     if cmd == "mk-check" {
         return mkcheck::run(&args[1..]);
     }
@@ -743,6 +795,13 @@ fn run(args: &[String]) -> Result<i32> {
                 if r.vals[1] > 1 {
                     let role = if r.vals[0] == 0 { "primary" } else { "secondary" };
                     println!("partition: {} of {} ({role}, first CPU APIC ID {})", r.vals[0], r.vals[1], r.vals[2]);
+                }
+            }
+            // What the host's kernel says of virtualization and its
+            // mitigations (FL4); seL4, or an older guest kernel: no lines.
+            if let Ok(answers) = kernel::Dev::open().and_then(|mut d| d.all()) {
+                for line in kernel::summary(&answers) {
+                    println!("{line}");
                 }
             }
         }

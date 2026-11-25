@@ -458,7 +458,7 @@ fn guest_boots_and_uses_the_machine() {
         cfg.devices[d].kind = host::VDEV_BLK_UNAVAILABLE;
     }
     let tsc_hz = 1_000_000_000;
-    let host = crate::vm::Host { amd: true, xcr0: 7, pcid: true, phys_bits: 40, auto_ibrs: true };
+    let host = crate::vm::Host { amd: true, xcr0: 7, pcid: true, phys_bits: 40, auto_ibrs: true, spec: Default::default() };
     crate::vm::build(cfg, tsc_hz, mem, host).expect("the machine");
     crate::io::init();
     let mem = &vm().mem;
@@ -637,11 +637,13 @@ fn guest_boots_and_uses_the_machine() {
 
     // ---- PCI: the host bridge and the devices by 0xcf8/0xcfc, then ECAM.
     let mut ids = vec![];
-    for slot in [0u32, 1, 2, 3, 9, 10] {
+    for slot in [0u32, 1, 2, 3, 9, 10, 30, 31] {
         pio(&mut c0, 0, 0xcf8, 4, Some(0x8000_0000 | slot << 11));
         ids.push(pio(&mut c0, 0, 0xcfc, 4, None));
     }
-    assert_eq!(ids, [0x0008_1b36, 0x1042_1af4, 0x1041_1af4, 0x1042_1af4, 0x1042_1af4, 0xffff_ffff]);
+    // Every guest's kernel configuration port (a console, slot 30); no
+    // attestation port without the host's (slot 31).
+    assert_eq!(ids, [0x0008_1b36, 0x1042_1af4, 0x1041_1af4, 0x1042_1af4, 0x1042_1af4, 0xffff_ffff, 0x1043_1af4, 0xffff_ffff]);
     assert_eq!(cfg_read(&mut c0, 1, 0, 4), 0x1042_1af4);
     assert_eq!(cfg_read(&mut c0, 10, 0, 2), 0xffff, "an empty slot");
 
