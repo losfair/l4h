@@ -506,6 +506,21 @@ void l4h_console_write(const char *s, unsigned int len)
 	console_out(s, len, 0);
 }
 
+int l4h_kernel_config(unsigned long key, unsigned long *value)
+{
+#ifdef L4H_KERNEL_CONFIG
+	seL4_KernelConfig_Result_t r = seL4_KernelConfig(key);
+
+	if (r.error != seL4_NoError)
+		return (int)r.error;
+	*value = r.value;
+	return 0;
+#else
+	(void)key; (void)value;
+	return -38; /* -ENOSYS */
+#endif
+}
+
 void l4h_power(int how)
 {
 	unsigned long mr = how;

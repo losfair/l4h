@@ -57,6 +57,14 @@
 #define L4H_PROVIDER_FEATURES_HIGH_VSPACE 0
 #endif
 
+/* FL4's seL4_KernelConfig, when this libsel4 has it (seL4's has not). */
+#ifdef seL4_KernelConfig_Arch
+#define L4H_KERNEL_CONFIG 1
+#define L4H_PROVIDER_FEATURES_KCONFIG L4H_PROVIDER_KERNEL_CONFIG
+#else
+#define L4H_PROVIDER_FEATURES_KCONFIG 0
+#endif
+
 /* Bind this vCPU's SC_U to the TCB of u (user.c). */
 struct l4h_vcpu;
 void l4h_bind_sc(struct l4h_vcpu *v, struct l4h_uctx *u);
