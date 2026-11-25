@@ -314,6 +314,20 @@ fn a_vcpu_starved_below_half_its_share_is_busy_by_what_it_waited() {
     assert_eq!(choose(&t, &split(0), PERIOD, &NO_VMM), None);
 }
 
+/// A wait on a CPU with time to spare is not demand: a vCPU that used 10%
+/// beside one that used 40%, whatever its steal estimate says, stays.
+#[test]
+fn a_wait_on_a_cpu_with_time_to_spare_does_not_make_a_vcpu_busy() {
+    let t = Topology::from_ids(&[0, 0, 1, 1]);
+    let mut s = vcores(&t, vec![vcpu(0, 0, 1, PERIOD * 40 / 100), vcpu(1, 0, 1, PERIOD * 10 / 100)]);
+    s[1].wanted = PERIOD;
+    assert_eq!(choose(&t, &s, PERIOD, &NO_VMM), None);
+    // The same vCPU beside one that used the rest of the CPU waited for it.
+    s[0].used = PERIOD * 88 / 100;
+    s[0].wanted = s[0].used;
+    assert!(matches!(choose(&t, &s, PERIOD, &NO_VMM), Some(Action::VcoreSwap { ps: 0, pd: 2, .. })));
+}
+
 #[test]
 fn use_an_available_source_when_the_busiest_cannot_move() {
     let t = Topology::flat(3);

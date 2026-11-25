@@ -17,6 +17,9 @@ const _: () = assert!(MAX_CPUS <= 64);
 
 const ACTIVE_PCT: u64 = 2;
 const LIGHT_PCT: u64 = 50;
+/// A CPU whose vCPUs and VMMs used this much of a period had no time to
+/// spare: what a vCPU waited there, it waited for the others (Census::busy).
+const FULL_PCT: u64 = 90;
 /// A CPU's VMMs (an HVM guest's monitor, or PV VMMs) using this much of it
 /// count as one busy vCPU there that cannot move: its vCPUs are crowded
 /// as by another busy vCPU, and others are not brought to it.
@@ -326,9 +329,16 @@ impl Census {
     /// on one CPU, one got 84% and the other 16%, for as long as they
     /// shared it), and the one left with less than half its share is the
     /// one that most needs another CPU.
+    ///
+    /// The wait counts only on a CPU that was in use for the whole period
+    /// (FULL_PCT): nothing kept a vCPU off a CPU that had time to spare,
+    /// and the steal estimate there is the tail of its wake-ups (a dom0
+    /// that ran a command beside an idle guest's vCPU was busy by it, and
+    /// was moved from CPU to CPU).
     fn busy(&self, s: &Sample) -> bool {
         let left = self.elapsed_us.saturating_sub(self.vmm[s.cpu]);
-        let wanted = s.wanted.clamp(s.used, self.elapsed_us.max(s.used));
+        let full = self.load[s.cpu] * 100 >= self.elapsed_us * FULL_PCT;
+        let wanted = if full { s.wanted.clamp(s.used, self.elapsed_us.max(s.used)) } else { s.used };
         s.used * 100 >= self.elapsed_us * ACTIVE_PCT && wanted * self.active[s.cpu] * 2 >= left
     }
 }
