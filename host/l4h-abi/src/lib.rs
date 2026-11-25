@@ -129,9 +129,26 @@ pub struct EventPage {
     pub idle_ticks: u64,
     /// Capacity other guests leave this vCPU, 128..=1024 (0: unknown).
     pub host_cap: u64,
-    pub reserved: [u64; 5],
+    /// Written by whoever runs the vCPU (the guest kernel, or an HVM
+    /// guest's monitor): the time-counter value when it last blocked idle,
+    /// 0 while it runs (and from one that does not say).  The host counts
+    /// a block in progress as idle, not steal, without waiting for its end
+    /// (idle_ticks is updated before this is cleared).
+    pub idle_since: u64,
+    /// Written by the host on an HVM guest's vCPU 0: EVENT_IO_*.
+    pub io_flags: u64,
+    /// A sequence count over idle_since and idle_ticks, by whoever writes
+    /// them: odd while it changes them, so the host reads both from one
+    /// moment (0 from one that does not say).
+    pub idle_seq: u64,
+    pub reserved: [u64; 2],
     pub console: ConsoleOut,
 }
+
+/// EventPage::io_flags: the HVM monitor is not to busy-poll its devices'
+/// queues once they run dry (its guest is capped, its boost withdrawn, or
+/// its core shared with other guests' vCPUs).
+pub const EVENT_IO_NO_POLL: u64 = 1 << 0;
 
 pub const BOOTINFO_MAGIC: u64 = 0x3154_4f4f_4248_344c;
 pub const MAX_DEVICES: usize = 64;

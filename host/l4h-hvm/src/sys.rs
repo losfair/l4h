@@ -31,6 +31,20 @@ pub fn now() -> u64 {
     host::ticks::now()
 }
 
+/// vCPU `v`'s event page (vmmgr's, mapped here too): steal time and the
+/// capacity hint from vmmgr, its idle time to vmmgr, and on vCPU 0 the
+/// I/O thread's flags (abi::EVENT_IO_*).
+pub fn event_page(v: usize) -> *mut l4h_abi::EventPage {
+    host::vmm_event_page_va(v) as *mut l4h_abi::EventPage
+}
+
+/// What vmmgr asks of the I/O thread (abi::EVENT_IO_*, in vCPU 0's event
+/// page; io::poll_allowed).
+pub fn io_flags() -> u64 {
+    let page = event_page(0);
+    unsafe { core::ptr::addr_of!((*page).io_flags).read_volatile() }
+}
+
 /// Signal vCPU `v`'s thread: out of seL4_VMEnter, or out of its wait.
 pub fn wake(v: usize) {
     cap::<cap_type::Notification>(hv::VCPU_NTFN_SLOT_BASE + v as u64).signal();
@@ -87,7 +101,18 @@ fn io_thread() -> Endpoint<call::Proto> {
 /// I/O thread owns.
 pub fn call_access(space: u32, addr: u64, size: u8, write: bool, value: u64) -> u64 {
     use call::Client as _;
-    io_thread().access(me().unwrap_or(0), space, addr, size, write, value).unwrap_or(u64::MAX)
+    blocked_on_io(|| io_thread().access(me().unwrap_or(0), space, addr, size, write, value).unwrap_or(u64::MAX))
+}
+
+/// A vCPU thread's call to the I/O thread, which answers for its own
+/// guest's devices: the vCPU is blocked meanwhile, not runnable, so the
+/// time is idle to vmmgr's steal estimate (wall - run - idle), as a wait
+/// is (sync::idle_begin).
+fn blocked_on_io<T>(f: impl FnOnce() -> T) -> T {
+    match me() {
+        Some(v) => unsafe { crate::sync::idle_during(event_page(v), now, f) },
+        None => f(),
+    }
 }
 
 /// GuestMem's `map`: RAM block `b`, which the I/O thread maps (a vCPU
@@ -96,7 +121,7 @@ pub fn map(b: usize) -> bool {
     use call::Client as _;
     match me() {
         None => crate::ept::map_block(b),
-        Some(_) => io_thread().map(b).is_ok(),
+        Some(_) => blocked_on_io(|| io_thread().map(b).is_ok()),
     }
 }
 

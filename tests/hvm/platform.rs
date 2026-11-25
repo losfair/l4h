@@ -559,6 +559,68 @@ fn guest_boots_and_uses_the_machine() {
     mem.write_bytes(clock, &[0; 32]);
     wrmsr(&mut c0, 0x10, crate::vm::now());
     assert_eq!(mem.read::<u64>(clock + 8), 0, "a disabled clock is left");
+
+    // ---- Steal time (KVM_FEATURE_STEAL_TIME): what vmmgr's steal_ns in
+    // the vCPU's event page grows by is added to the guest's
+    // kvm_steal_time, written before an entry when it changed; the
+    // structure's own steal and version go on, as KVM's.
+    let h = c0.hw();
+    (h.g[0], h.g[1], h.len) = (0x4000_0001, 0, 2);
+    h.exits.push_back(Exit::Cpuid);
+    turn(&mut c0, 0);
+    assert_ne!(c0.hw().g[0] & 1 << 5, 0, "KVM_FEATURE_STEAL_TIME");
+    let steal_ns = |ns: u64| unsafe { core::ptr::addr_of_mut!((*sys::event_page(0)).steal_ns).write_volatile(ns) };
+    let entry = |c: &mut Vcpu<Guest>| {
+        let h = c.hw();
+        (h.g[0], h.g[1], h.len) = (0, 0, 2);
+        h.exits.push_back(Exit::Cpuid);
+        turn(c, 0);
+    };
+    let st = 0x50_0200u64;
+    // (a) A fresh (zeroed, as Linux's per-CPU one) structure counts from 0.
+    mem.write_bytes(st, &[0; 64]);
+    steal_ns(7_000);
+    wrmsr(&mut c0, 0x4b56_4d03, st | 1);
+    let v0 = mem.read::<u32>(st + 8);
+    assert!(v0 != 0 && v0 & 1 == 0, "a stable version: {v0}");
+    assert_eq!(mem.read::<u64>(st), 0, "steal counts from when it was named");
+    assert!((12..64).all(|o| mem.read::<u8>(st + o) == 0), "flags and preempted clear");
+    let h = c0.hw();
+    (h.g[1], h.len) = (0x4b56_4d03, 2);
+    h.exits.push_back(Exit::Rdmsr);
+    turn(&mut c0, 0);
+    assert_eq!(c0.hw().g[0], st | 1, "the MSR reads back");
+    steal_ns(12_000);
+    entry(&mut c0);
+    assert_eq!((mem.read::<u64>(st), mem.read::<u32>(st + 8)), (5_000, v0 + 2), "the steal since, before the entry");
+    entry(&mut c0);
+    assert_eq!(mem.read::<u32>(st + 8), v0 + 2, "unchanged steal: not written again");
+    // (c) Naming the structure in use again changes nothing.
+    wrmsr(&mut c0, 0x4b56_4d03, st | 1);
+    assert_eq!((mem.read::<u64>(st), mem.read::<u32>(st + 8)), (5_000, v0 + 2), "not reset");
+    // Bits 5:1 are reserved: #GP, and the MSR is as it was.
+    let h = c0.hw();
+    let rip = h.rip;
+    (h.g[1], h.g[0], h.g[2], h.len) = (0x4b56_4d03, st | 3, 0, 2);
+    h.exits.push_back(Exit::Wrmsr);
+    turn(&mut c0, 0);
+    assert_eq!(c0.hw().rip, rip, "not done");
+    assert_eq!(next_interrupt(&mut c0), Some(Event::Exc(13, Some(0))));
+    // Off: nothing more is written.
+    wrmsr(&mut c0, 0x4b56_4d03, 0);
+    steal_ns(20_000);
+    entry(&mut c0);
+    assert_eq!(mem.read::<u64>(st), 5_000, "a disabled structure is left");
+    // (b) On again, the same structure: its steal goes on from what it
+    // held (never back, which the guest would take for a huge steal),
+    // its version above the last.
+    wrmsr(&mut c0, 0x4b56_4d03, st | 1);
+    assert_eq!((mem.read::<u64>(st), mem.read::<u32>(st + 8)), (5_000, v0 + 4));
+    steal_ns(21_000);
+    entry(&mut c0);
+    assert_eq!((mem.read::<u64>(st), mem.read::<u32>(st + 8)), (6_000, v0 + 6), "the time off is not counted");
+    wrmsr(&mut c0, 0x4b56_4d03, 0);
+    steal_ns(0);
     // A hypercall (ptp_kvm's KVM_HC_CLOCK_PAIRING): -KVM_ENOSYS.
     let h = c0.hw();
     (h.g[0], h.len) = (9, 3);
@@ -741,6 +803,19 @@ fn guest_boots_and_uses_the_machine() {
     assert_eq!(mem.read::<u16>(tx + 0x200 + 2), 1, "the frame's buffers returned");
     assert_eq!(next_interrupt(&mut c0), Some(Event::Ext(0x51)), "TX's vector");
     eoi(&mut c0);
+    // The queue that ran dry is polled on, as vmmgr allows (io_flags
+    // clear): its notifications left off, and no work left.  With
+    // EVENT_IO_NO_POLL the next turn asks for notifications instead, and
+    // nothing is left for the I/O thread to spin for.
+    assert!(crate::io::poll_allowed(0) && !crate::io::poll_allowed(abi::EVENT_IO_NO_POLL));
+    assert!(as_thread(None, crate::io::polling) && !as_thread(None, crate::io::more));
+    assert_eq!(mem.read::<u16>(tx + 0x200), 1, "VIRTQ_USED_F_NO_NOTIFY while polled");
+    let io_flags = |f: u64| unsafe { core::ptr::addr_of_mut!((*sys::event_page(0)).io_flags).write_volatile(f) };
+    io_flags(abi::EVENT_IO_NO_POLL);
+    as_thread(None, crate::io::kicked);
+    assert!(!as_thread(None, crate::io::polling));
+    assert_eq!(mem.read::<u16>(tx + 0x200), 0, "notifications on");
+    io_flags(0);
     desc(mem, rings, 0, 0x51_0000, 2048, 2, 0);
     post(mem, rings, 0, 1);
     notify(&mut c0, 2, bar0, 0);
@@ -781,6 +856,18 @@ fn guest_boots_and_uses_the_machine() {
     mmio(&mut c1, 1, LAPIC + 0x320, 4, Some(0x40));
     mmio(&mut c1, 1, LAPIC + 0x380, 4, Some(1_000_000));
     assert_ne!(sys::VCPU_TIMERS[1].load(Ordering::SeqCst), 0, "vCPU 1's timer armed");
+    // Its steal time named, at a structure the INIT leaves behind.
+    let st1 = 0x50_0300u64;
+    mem.write_bytes(st1, &[0; 64]);
+    let wrmsr1 = |c: &mut Vcpu<Guest>, msr: u32, v: u64| {
+        let h = c.hw();
+        (h.g[1], h.g[0], h.g[2], h.len) = (msr as u64, v & 0xffff_ffff, v >> 32, 2);
+        h.exits.push_back(Exit::Wrmsr);
+        turn(c, 1);
+    };
+    wrmsr1(&mut c1, 0x4b56_4d03, st1 | 1);
+    let st1_version = mem.read::<u32>(st1 + 8);
+    assert_ne!(st1_version, 0);
     mmio(&mut c0, 0, LAPIC + 0x310, 4, Some(1 << 24));
     mmio(&mut c0, 0, LAPIC + 0x300, 4, Some(0x4000 | 0x77));
     assert_ne!(vm().apics[1].irr()[1] & 1 << (0x77 - 64), 0);
@@ -795,6 +882,18 @@ fn guest_boots_and_uses_the_machine() {
     assert_eq!(vm().apics[1].irr(), [0; 4], "the old request is gone");
     assert_eq!(c1.hw().tpr, 0, "the TPR back to 0");
     assert!(!c1.hw().events[seen..].contains(&Event::Ext(0x77)));
+    // As KVM's reset: steal time off, and the old structure left alone.
+    unsafe { core::ptr::addr_of_mut!((*sys::event_page(1)).steal_ns).write_volatile(50_000) };
+    // Out of HLT by an NMI, to read the MSR.
+    mmio(&mut c0, 0, LAPIC + 0x310, 4, Some(1 << 24));
+    mmio(&mut c0, 0, LAPIC + 0x300, 4, Some(0x4400));
+    let h = c1.hw();
+    (h.g[0], h.g[1], h.len) = (0xdead, 0x4b56_4d03, 2);
+    h.exits.push_back(Exit::Rdmsr);
+    turn(&mut c1, 1);
+    assert_eq!(c1.hw().g[0], 0, "MSR_KVM_STEAL_TIME off after INIT");
+    assert_eq!((mem.read::<u64>(st1), mem.read::<u32>(st1 + 8)), (0, st1_version), "not written after INIT");
+    unsafe { core::ptr::addr_of_mut!((*sys::event_page(1)).steal_ns).write_volatile(0) };
 
     // ---- The UART: output into the console ring, input from the page.
     for &b in b"hi\n" {

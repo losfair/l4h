@@ -22,6 +22,7 @@ mod ipfilter;
 mod link;
 mod pool;
 mod steer;
+mod turns;
 mod uplink;
 
 use l4h_netcore::offload;
@@ -598,9 +599,10 @@ impl Netd {
     }
 
     /// Take the frames a guest port has queued for transmission. Return
+    /// whether there were any (a kick for room to receive has none), and
     /// whether the byte budget left any of this snapshot for the next turn.
-    fn port_tx(&mut self, i: usize) -> bool {
-        let Some(p) = self.ports[i].as_ref() else { return false };
+    fn port_tx(&mut self, i: usize) -> (bool, bool) {
+        let Some(p) = self.ports[i].as_ref() else { return (false, false) };
         let (chan, mut tx) = (p.chan, p.tx);
         let limited = self.links.iter().flatten().any(|link| link.switch == p.switch);
         // The head is the client's: at most one ring's worth per kick, and
@@ -609,7 +611,7 @@ impl Netd {
             if let Some(p) = self.ports[i].as_mut() {
                 p.drops += 1;
             }
-            return false;
+            return (false, false);
         };
         let frame = core::mem::take(&mut self.buf);
         let mut bytes = 0;
@@ -637,7 +639,12 @@ impl Netd {
             p.tx = tx;
             p.signal = true;
         }
-        more
+        (pending != 0, more)
+    }
+
+    /// Whether guest port `i` has frames waiting for room in its RX ring.
+    fn has_backlog(&self, i: usize) -> bool {
+        self.ports[i].as_ref().is_some_and(|p| !p.backlog.is_empty())
     }
 
     /// The uplink on `switch` (the first, if several).
@@ -969,22 +976,40 @@ fn main(info: &'static Info) -> ! {
     published.ready.store(1, Ordering::Release);
     l4h_rt::mailbox::signal();
     let (mut deferred_tx, mut deferred_rx) = (0u64, 0u32);
+    // Where each pass over the ports starts (turns::next): one for their
+    // transmits, one for their receive backlogs, each moved on by the
+    // ports it served, so that ports with only backlogs do not skew who
+    // transmits first.
+    let (mut tx_cursor, mut rx_cursor) = (0usize, 0usize);
     let mut badge = ntfn.wait().1;
     loop {
         // Notification: port kicks and uplink signals. Deferred slots and
         // new client kicks use the same drain path.
         let ports = badge | core::mem::take(&mut deferred_tx);
         let backlogs = ports | core::mem::take(&mut d.deferred_ports);
-        for i in 0..net::MAX_PORTS {
+        // A cursor moves on by the ports that had work of its kind (a kick
+        // for room to receive transmits nothing, a transmit kick may find
+        // no backlog).
+        let (mut tx_served, mut rx_served) = (0u64, 0u64);
+        for k in 0..net::MAX_PORTS {
+            let i = turns::nth(tx_cursor, k, net::MAX_PORTS);
             if ports & (1 << i) != 0 {
-                if d.port_tx(i) {
+                let (sent, more) = d.port_tx(i);
+                tx_served |= u64::from(sent) << i;
+                if more {
                     deferred_tx |= 1 << i;
                 }
             }
+        }
+        tx_cursor = turns::next(tx_cursor, tx_served, net::MAX_PORTS);
+        for k in 0..net::MAX_PORTS {
+            let i = turns::nth(rx_cursor, k, net::MAX_PORTS);
             if backlogs & (1 << i) != 0 {
+                rx_served |= u64::from(d.has_backlog(i)) << i;
                 d.rx_backlog(i);
             }
         }
+        rx_cursor = turns::next(rx_cursor, rx_served, net::MAX_PORTS);
         // Uplinks: any nicd's signal, and those whose last turn left
         // frames (bit n: uplink n).  A turn takes UPLINK_BUDGET at most.
         let rx = core::mem::take(&mut deferred_rx);

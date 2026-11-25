@@ -324,8 +324,9 @@ impl Hw for Vmx {
     }
 
     fn skip(&mut self, len: u64) {
-        let rip = self.rip.wrapping_add(len);
-        self.rip = if self.mode() == Mode::Bits64 { rip } else { rip & 0xffff_ffff };
+        // The mode (three VMCS reads) only when RIP crosses 4 GiB.
+        let rip = self.rip;
+        self.rip = exits::skip_rip(rip, len, || self.mode() == Mode::Bits64);
         if self.intr & 3 != 0 {
             self.intr &= !3;
             self.intr_dirty = true;

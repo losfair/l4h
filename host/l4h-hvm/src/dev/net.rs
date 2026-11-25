@@ -45,8 +45,14 @@ pub struct Net {
     kick: Kick,
     link: net::LinkState,
     tx_blocked: bool,
-    /// Queues whose turn ended with chains left.
+    /// Queues whose turn ended with chains left: work there now.
     more: u64,
+    /// Queues that ran dry and are polled on (keep_polling): work that may
+    /// come, which the I/O thread spins for instead of a notification.
+    polling: u64,
+    /// Whether that polling is allowed (not abi::EVENT_IO_NO_POLL): it
+    /// takes the CPU of the monitor's core at PRIO_VMM.
+    poll_allowed: bool,
     /// VIRTIO_NET_F_MRG_RXBUF: a frame may span several receive chains.
     mrg: bool,
     /// How long a queue that ran dry is polled, notifications off, before
@@ -69,7 +75,7 @@ impl Net {
         let mut config = [0u8; 32];
         config[0..6].copy_from_slice(&mac);
         config[10..12].copy_from_slice(&((net::MTU_FRAME - 14) as u16).to_le_bytes());
-        let mut n = Net { chan, tx: Producer::new(net::RING_SIZE), rx: Consumer::new(net::RING_SIZE), kick, link, tx_blocked: false, more: 0, mrg: false,
+        let mut n = Net { chan, tx: Producer::new(net::RING_SIZE), rx: Consumer::new(net::RING_SIZE), kick, link, tx_blocked: false, more: 0, polling: 0, poll_allowed: true, mrg: false,
             poll_ticks, last_work: [0; 2], rx_short: None, config };
         n.link_config();
         n
@@ -91,6 +97,7 @@ impl Net {
         let (mut returned, mut queued) = (false, false);
         self.tx_blocked = false;
         self.more &= !(1 << TX);
+        self.polling &= !(1 << TX);
         let mut left = BATCH;
         // No notifications while we take what is there: one ends the run.
         q.disable_notify(mem);
@@ -160,25 +167,33 @@ impl Net {
         (returned, queued)
     }
 
-    /// Whether queue `q`, out of entries now, is still polled (`more`),
-    /// its notifications left off; `worked`: this turn took entries (the
-    /// poll starts now, not at the last turn that did).
+    /// Whether queue `q`, out of entries now, is still polled
+    /// (`polling`), its notifications left off; `worked`: this turn took
+    /// entries (the poll starts now, not at the last turn that did).
+    /// Never while polling is not allowed: the queue's notifications are
+    /// then asked for again at once.
     fn keep_polling(&mut self, q: usize, worked: bool) -> bool {
         let now = l4h_rt::host::ticks::now();
         if worked {
             self.last_work[q] = now;
         }
-        if self.poll_ticks == 0 || now.wrapping_sub(self.last_work[q]) >= self.poll_ticks {
+        if !self.poll_allowed || self.poll_ticks == 0 || now.wrapping_sub(self.last_work[q]) >= self.poll_ticks {
             return false;
         }
-        self.more |= 1 << q;
+        self.polling |= 1 << q;
         true
+    }
+
+    /// The I/O thread's word on polling (abi::EVENT_IO_NO_POLL clear).
+    pub fn set_poll_allowed(&mut self, allowed: bool) {
+        self.poll_allowed = allowed;
     }
 
     /// Port -> guest, while both have entries.
     fn receive(&mut self, mem: &GuestMem, q: &mut Queue) -> bool {
         let mut returned = false;
         self.more &= !(1 << RX);
+        self.polling &= !(1 << RX);
         let mut left = BATCH;
         while left != 0 {
             if unsafe { self.rx.ready(&(*self.chan).rx) } == 0 {
@@ -342,7 +357,7 @@ impl Backend for Net {
         if queues[RX].ready && self.receive(mem, &mut queues[RX]) {
             used |= 1 << RX;
         }
-        if queues[TX].ready && (self.tx_blocked || self.more & (1 << TX) != 0) {
+        if queues[TX].ready && (self.tx_blocked || (self.more | self.polling) & (1 << TX) != 0) {
             let (returned, queued) = self.transmit(mem, &mut queues[TX]);
             if queued {
                 self.kick.signal();
@@ -355,11 +370,15 @@ impl Backend for Net {
     }
 
     fn retry(&self) -> u64 {
-        self.more
+        self.more | self.polling
     }
 
     fn more(&self) -> u64 {
         self.more
+    }
+
+    fn polling(&self) -> u64 {
+        self.polling
     }
 
     fn ready(&self, mem: &GuestMem, queues: &[Queue]) -> bool {
@@ -386,6 +405,7 @@ impl Backend for Net {
         // Nothing of the guest's is with netd: frames are copied.
         self.tx_blocked = false;
         self.more = 0;
+        self.polling = 0;
         self.mrg = false;
         self.last_work = [0; 2];
         self.rx_short = None;
@@ -464,6 +484,45 @@ mod tests {
         }
         assert_eq!(got.len(), 3000);
         assert!(got.iter().enumerate().all(|(i, &b)| b == i as u8));
+    }
+
+    /// A transmit queue that ran dry is polled on (notifications left
+    /// off, `polling`) only while vmmgr allows it; otherwise its
+    /// notifications are asked for again at once, and nothing is left for
+    /// the I/O thread to spin for.  Neither is work left (`more`).
+    #[test]
+    fn dry_queues_are_polled_only_while_allowed() {
+        for allowed in [true, false] {
+            let (mem, _buf) = fake(1 << 20, 0);
+            let port: &'static mut Port = unsafe { &mut *(std::alloc::alloc_zeroed(std::alloc::Layout::new::<Port>()) as *mut Port) };
+            // A poll window no test outlasts.
+            let mut n = Net::new(port as *mut Port as usize, Kick, [2, 0, 0, 0, 0, 1], u64::MAX / 4);
+            n.set_poll_allowed(allowed);
+            let mut qs: [Queue; 2] = Default::default();
+            assert!(qs[TX].setup(&mem, 16, 256, 0x4000, 0x5000, 0x6000));
+            mem.write_bytes(0x8000, &[0; HDR]);
+            mem.write_bytes(0x9000, &[0x11; 60]);
+            mem.write::<u64>(0x4000, 0x8000);
+            mem.write::<u32>(0x4008, HDR as u32);
+            mem.write::<u16>(0x400c, 1);
+            mem.write::<u16>(0x400e, 1);
+            mem.write::<u64>(0x4010, 0x9000);
+            mem.write::<u32>(0x4018, 60);
+            mem.write::<u16>(0x5004, 0);
+            mem.write::<u16>(0x5002, 1);
+            assert_eq!(n.kick(&mem, &mut qs, TX), 1 << TX);
+            assert_eq!(port.tx.head.load(Ordering::Relaxed), 1, "sent");
+            assert_eq!(n.more(), 0, "nothing left to take now");
+            if allowed {
+                assert_eq!((n.polling(), n.retry()), (1 << TX, 1 << TX), "polled on");
+                assert_eq!(mem.read::<u16>(0x6000), 1, "VIRTQ_USED_F_NO_NOTIFY while polled");
+                // vmmgr withdraws it: the next turn asks for notifications.
+                n.set_poll_allowed(false);
+                assert_eq!(n.kick(&mem, &mut qs, TX), 0);
+            }
+            assert_eq!((n.polling(), n.retry()), (0, 0), "not polled");
+            assert_eq!(mem.read::<u16>(0x6000), 0, "notifications on");
+        }
     }
 
     #[test]

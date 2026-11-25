@@ -236,7 +236,7 @@ pub fn create(
             .expect("configure SC_K");
         h.vcpu_objs.must_push(vcpu);
         g.vcpus.must_push(Vcpu { ktcb, ntfn, event, sc_k, sc_u: None, core, vcore, host_cap: 1024, cooldown: 0, usage: 0,
-            k_share: crate::sched::K_SHARE_INIT, wall_ticks: 0, run_ticks: 0, steal_ns: 0 });
+            k_share: crate::sched::K_SHARE_INIT, kernel_divisor: 0, wall_ticks: 0, run_ticks: 0, steal_ns: 0 });
     }
     for v in 0..g.vcpus.len() {
         let ev = g.vcpus[v].event;

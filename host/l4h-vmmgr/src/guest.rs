@@ -259,12 +259,19 @@ pub struct Vcpu {
     /// Under a CPU cap: SC_K's part of the vCPU's budget, in permille
     /// (sched::budget::plan, after reserving the VMM's part on vCPU 0).
     pub k_share: u32,
+    /// 0, or SC_K gets at most 1/kernel_divisor of its period: a PV vCPU
+    /// on a CPU with an HVM guest's vCPU, the PV kernels there sharing a
+    /// half or a quarter of it (sched::kernel_divisors, budget::limit_kernel).
+    pub kernel_divisor: u16,
     /// Steal-time bookkeeping (counter ticks): time since the vCPU first
     /// ran, CPU it consumed; steal published so far (ns).
     pub wall_ticks: u64,
     pub run_ticks: u64,
     pub steal_ns: u64,
 }
+
+/// A vCPU's event page, as the scheduler reads it (Guest::event_page).
+pub type EventPage = abi::EventPage;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -1573,9 +1580,13 @@ pub fn create(
         let fault_slot = alloc.slots.alloc();
         mint_edge(&abs(self_cap::<cap_type::Null>(fault_slot)), &wiring::GUEST_FAULT, wiring::guest_fault(id, v), &Obj::claim(p::Vmmgr, o::Endpoint, abs(host_info.hyp_ep)))
             .expect("fault ep");
+        // Priority P_K, but an MCP of P_U: the guest holds this TCB and
+        // uses it as the authority for its user TCBs, which must stay at
+        // P_U, below every guest's kernel (DESIGN.md §7.1).  seL4 checks a
+        // new priority against the authority's MCP, not the target's own.
         ktcb.tcb_set_sched_params(
             slot::TCB.cap(),
-            abi::PRIO_KERNEL,
+            abi::PRIO_USER,
             abi::PRIO_KERNEL,
             sc_k,
             self_cap::<cap_type::Endpoint>(fault_slot),
@@ -1592,7 +1603,7 @@ pub fn create(
         mint_edge(&g.guest_slot(base + abi::VCPU_IPI), &wiring::GUEST_IPI, 0, &Obj::claim(p::Guest, o::Vcpu, abs(ntfn))).expect("vCPU IPI cap");
         g.give(base + abi::VCPU_IPCBUF, ipcbuf, CapRights::read_write());
         g.give(base + abi::VCPU_EVENT, event, CapRights::read_write());
-        g.vcpus.must_push(Vcpu { ktcb, ntfn, event, sc_k, sc_u: Some(sc_u), core, vcore, host_cap: 1024, cooldown: 0, usage: 0, k_share: crate::sched::K_SHARE_INIT, wall_ticks: 0, run_ticks: 0, steal_ns: 0 });
+        g.vcpus.must_push(Vcpu { ktcb, ntfn, event, sc_k, sc_u: Some(sc_u), core, vcore, host_cap: 1024, cooldown: 0, usage: 0, k_share: crate::sched::K_SHARE_INIT, kernel_divisor: 0, wall_ticks: 0, run_ticks: 0, steal_ns: 0 });
     }
 
     // ---- Event pages in vmmgr too (steal time).

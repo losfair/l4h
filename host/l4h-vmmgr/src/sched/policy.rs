@@ -17,6 +17,15 @@ const _: () = assert!(MAX_CPUS <= 64);
 
 const ACTIVE_PCT: u64 = 2;
 const LIGHT_PCT: u64 = 50;
+/// A CPU's VMMs (an HVM guest's monitor, or PV VMMs) using this much of it
+/// count as one busy vCPU there that cannot move: its vCPUs are crowded
+/// as by another busy vCPU, and others are not brought to it.
+const VMM_BUSY_PCT: u64 = 25;
+
+/// Whether VMMs using `used` of a CPU over `elapsed_us` keep it busy.
+fn vmm_busy(used: u64, elapsed_us: u64) -> bool {
+    used * 100 >= elapsed_us * VMM_BUSY_PCT
+}
 
 pub struct Sample {
     pub guest: usize,
@@ -87,8 +96,10 @@ pub fn place(topology: &Topology, load: &[usize; MAX_CPUS], stagger: usize, out:
 /// Reduce contention between physical cores first, then between their
 /// logical CPUs, without breaking up a vCore. Each step strictly reduces
 /// the sum of squared busy counts per physical core, else per logical CPU,
-/// so equal loads do not trade vCPUs every cooldown.
-pub fn choose(topology: &Topology, sample: &[Sample], elapsed_us: u64) -> Option<Action> {
+/// so equal loads do not trade vCPUs every cooldown.  `vmm_load` is what
+/// VMMs used of each CPU over the period (their vCPUs' samples do not
+/// say): it is load there, and a busy unit that stays (vmm_busy).
+pub fn choose(topology: &Topology, sample: &[Sample], elapsed_us: u64, vmm_load: &[u64; MAX_CPUS]) -> Option<Action> {
     if elapsed_us == 0 {
         return None;
     }
@@ -97,12 +108,20 @@ pub fn choose(topology: &Topology, sample: &[Sample], elapsed_us: u64) -> Option
     for c in 0..cpus {
         threads[topology.core(c)] += 1;
     }
-    let census = Census::new(sample, elapsed_us);
+    let census = Census::new(sample, elapsed_us, vmm_load);
     let (load, is_busy) = (census.load, |s: &Sample| census.busy(s));
     let light = |c: usize| load[c] * 100 < elapsed_us * LIGHT_PCT;
     let mut busy = [0i64; MAX_CPUS];
     let mut physical_busy = [0i64; MAX_CPUS];
     let mut physical_load = [0u64; MAX_CPUS];
+    for c in 0..cpus {
+        let p = topology.core(c);
+        physical_load[p] += vmm_load[c];
+        if vmm_busy(vmm_load[c], elapsed_us) {
+            busy[c] += 1;
+            physical_busy[p] += 1;
+        }
+    }
     let mut guest_cpu = [0u64; MAX_GUESTS];
     let mut guests = 0u64;
     for s in sample {
@@ -226,12 +245,16 @@ pub fn choose(topology: &Topology, sample: &[Sample], elapsed_us: u64) -> Option
 /// on `ps`, busiest first, each to the CPU of `pd` with the fewest busy
 /// vCPUs (as `choose` assumed), then the least load; then those on `pd`
 /// to `ps` likewise.
-pub fn swap_moves(topology: &Topology, sample: &[Sample], elapsed_us: u64, guest: usize, ps: usize, pd: usize,
-    mut each: impl FnMut(usize, usize)) {
+pub fn swap_moves(topology: &Topology, sample: &[Sample], elapsed_us: u64, vmm_load: &[u64; MAX_CPUS], guest: usize,
+    ps: usize, pd: usize, mut each: impl FnMut(usize, usize)) {
     let cpus = topology.physical().len();
-    let census = Census::new(sample, elapsed_us);
+    let census = Census::new(sample, elapsed_us, vmm_load);
     let mut cpu_load = [0u64; MAX_CPUS];
     let mut busy = [0u64; MAX_CPUS];
+    for c in 0..cpus {
+        cpu_load[c] += vmm_load[c];
+        busy[c] += u64::from(vmm_busy(vmm_load[c], elapsed_us));
+    }
     for s in sample.iter().filter(|s| s.guest != guest || !on_either(topology, s.cpu, ps, pd)) {
         cpu_load[s.cpu] += s.used;
         busy[s.cpu] += u64::from(census.busy(s));
@@ -269,16 +292,18 @@ pub fn capacity(old: u32, same: u64, sibling: u64, elapsed_us: u64) -> u32 {
     (old + raw) / 2
 }
 
-/// Each CPU's load and active vCPUs over a period.
+/// Each CPU's load (its VMMs' included), active vCPUs and VMM use over a
+/// period.
 struct Census {
     load: [u64; MAX_CPUS],
     active: [u64; MAX_CPUS],
+    vmm: [u64; MAX_CPUS],
     elapsed_us: u64,
 }
 
 impl Census {
-    fn new(sample: &[Sample], elapsed_us: u64) -> Self {
-        let mut c = Census { load: [0; MAX_CPUS], active: [0; MAX_CPUS], elapsed_us };
+    fn new(sample: &[Sample], elapsed_us: u64, vmm_load: &[u64; MAX_CPUS]) -> Self {
+        let mut c = Census { load: *vmm_load, active: [0; MAX_CPUS], vmm: *vmm_load, elapsed_us };
         for s in sample {
             c.load[s.cpu] += s.used;
             if s.used * 100 >= elapsed_us * ACTIVE_PCT {
@@ -288,9 +313,12 @@ impl Census {
         c
     }
 
-    /// Half a fair share still recognizes a starved vCPU on a crowded CPU.
+    /// Half a fair share still recognizes a starved vCPU on a crowded CPU:
+    /// a share of what the CPU's VMMs left (a monitor that takes 76% of it
+    /// leaves a vCPU using the other 24% busy).
     fn busy(&self, s: &Sample) -> bool {
-        s.used * 100 >= self.elapsed_us * ACTIVE_PCT && s.used * self.active[s.cpu] * 2 >= self.elapsed_us
+        let left = self.elapsed_us.saturating_sub(self.vmm[s.cpu]);
+        s.used * 100 >= self.elapsed_us * ACTIVE_PCT && s.used * self.active[s.cpu] * 2 >= left
     }
 }
 

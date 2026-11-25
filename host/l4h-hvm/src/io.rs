@@ -175,14 +175,33 @@ pub fn access(space: u32, addr: u64, size: u8, write: bool, value: u64) -> u64 {
     }
 }
 
+/// Whether the network queues may be polled once they run dry, given
+/// vmmgr's `io_flags`: not with abi::EVENT_IO_NO_POLL (the guest is
+/// capped, this monitor's boost was withdrawn, or other guests' vCPUs
+/// share its core, whose CPU the polling would take at PRIO_VMM).
+pub fn poll_allowed(io_flags: u64) -> bool {
+    io_flags & abi::EVENT_IO_NO_POLL == 0
+}
+
+/// poll_allowed, for every network device, before each turn of them.
+fn refresh_polling() {
+    let allowed = poll_allowed(sys::io_flags());
+    for d in io().slots.iter_mut().flatten() {
+        if let Dev::Net(t) = d {
+            t.backend.set_poll_allowed(allowed);
+        }
+    }
+}
+
 /// Queue notifications, and work a device left for another turn.
 pub fn kicked() {
     let vm = vm();
+    refresh_polling();
     for (slot, d) in io().slots.iter_mut().enumerate() {
         let Some(d) = d.as_mut() else { continue };
         let bits = vm.kicks.take(slot);
         each!(d, t => {
-            let bits = bits | t.backend.more();
+            let bits = bits | t.backend.more() | t.backend.polling();
             if bits != 0 {
                 t.poll(&vm.mem, bits, &mut irq(slot));
             }
@@ -197,6 +216,7 @@ pub fn kicked() {
 /// never come).
 pub fn completed() {
     let vm = vm();
+    refresh_polling();
     for (slot, d) in io().slots.iter_mut().enumerate() {
         let Some(d) = d.as_mut() else { continue };
         each!(d, t => t.complete(&vm.mem, &mut irq(slot)));
@@ -261,8 +281,15 @@ pub fn poll_spin(spin: u64) {
     }
 }
 
-/// Whether a device left work for another turn.
+/// Whether a device left work for another turn: there now, to take at
+/// once.
 pub fn more() -> bool {
     io().slots.iter().flatten().any(|d| each!(d, t => t.backend.more() != 0))
+}
+
+/// Whether a device polls queues that ran dry (only while allowed:
+/// refresh_polling): work that may come, which the I/O thread spins for.
+pub fn polling() -> bool {
+    io().slots.iter().flatten().any(|d| each!(d, t => t.backend.polling() != 0))
 }
 
